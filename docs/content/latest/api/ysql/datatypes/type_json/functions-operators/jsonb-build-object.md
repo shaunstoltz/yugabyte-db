@@ -1,13 +1,12 @@
 ---
-title: jsonb_build_object() and json_build_object() [JSON]
-linkTitle: jsonb_build_object() 
-summary: jsonb_build_object() and json_build_object() 
+title: jsonb_build_object() and json_build_object()
 headerTitle: jsonb_build_object() and json_build_object()
-description: Create a JSON object from a variadic list that specifies keys with values of arbitrary SQL data type.
+linkTitle: jsonb_build_object() 
+description: Build a JSON object from a variadic list that specifies keys with values of arbitrary SQL data type.
 menu:
   latest:
     identifier: jsonb-build-object
-    parent: functions-operators
+    parent: json-functions-operators
     weight: 100
 isTocNested: true
 showAsideToc: true
@@ -24,7 +23,7 @@ return value:      jsonb
 
 **Notes:** The key names are given as SQL `text` values. The SQL data type of key's value argument must have a direct JSON equivalent or allow implicit conversion to such an equivalent.
 
-The `jsonb_build_object()` variadic function is the obvious counterpart to `jsonb_build_array()`.
+The `jsonb_build_object()` variadic function is the obvious counterpart to [`jsonb_build_array()`](../jsonb-build-array).
 
 The argument list has the form:
 
@@ -35,9 +34,9 @@ key1::text, value2::the_data_type2,
 keyN::text, valueN::the_data_typeN
 ```
 
-Use this _ysqlsh_ script to create the required type `t` and then to execute the `assert`.
+Use this `ysqlsh` script to create the required type _"t"_ and then to execute the `ASSERT`.
 
-```postgresql
+```plpgsql
 create type t as (a int, b text);
 
 do $body$
@@ -62,13 +61,12 @@ end;
 $body$;
 ```
 
-Just as with `jsonb_build_array())`, using `jsonb_build_object()` is straightforward when you know the structure of your target JSON value statically, and just discover the values dynamically. But again, it doesn't accommodate the case that you discover the desired structure dynamically.
+Just as with [`jsonb_build_array()`](../jsonb-build-array), using `jsonb_build_object()` is straightforward when you know the structure of your target JSON value statically, and just discover the values dynamically. But again, it doesn't accommodate the case that you discover the desired structure dynamically.
 
-The following _ysqlsh_ script shows a feasible general workaround for this use case. The helper function `f()` generates the variadic argument list as the text representation of a comma-separated list of manifest constants of various data types. Then it invokes `jsonb_build_object()` dynamically. Obviously this brings a performance cost. But you might not have an alternative.
+The following `ysqlsh` script shows a feasible general workaround for this use case. The helper function _"f()"_ generates the variadic argument list as the text representation of a comma-separated list of SQL literals of various data types. Then it invokes `jsonb_build_object()` dynamically. Obviously this brings a performance cost. But you might not have an alternative.
 
-```postgresql
+```plpgsql
 create function f(variadic_array_elements in text) returns jsonb
-  immutable
   language plpgsql
 as $body$
 declare

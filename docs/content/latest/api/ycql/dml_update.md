@@ -2,7 +2,6 @@
 title: UPDATE statement [YCQL]
 headerTitle: UPDATE
 linkTitle: UPDATE
-summary: Change values of a row in a table
 description: Use the UPDATE statement to update one or more column values for a row in table.
 menu:
   latest:
@@ -29,7 +28,7 @@ YugabyteDB can only update one row at a time. Updating multiple rows is currentl
 
 ### Diagram
 
-<svg class="rrdiagram" version="1.1" xmlns:xlink="http://www.w3.org/1999/xlink" xmlns="http://www.w3.org/2000/svg" width="614" height="175" viewbox="0 0 614 175"><path class="connector" d="M0 52h5m68 0h10m91 0h30m60 0h10m123 0h20m-228 0q5 0 5 5v8q0 5 5 5h203q5 0 5-5v-8q0-5 5-5m5 0h10m43 0h30m-5 0q-5 0-5-5v-20q0-5 5-5h37m24 0h38q5 0 5 5v20q0 5-5 5m-5 0h25m-614 50h5m65 0h10m128 0h30m32 0h50m45 0h20m-80 0q5 0 5 5v8q0 5 5 5h55q5 0 5-5v-8q0-5 5-5m5 0h10m64 0h20m-194 0q5 0 5 5v35q0 5 5 5h5m98 0h66q5 0 5-5v-35q0-5 5-5m5 0h20m-276 0q5 0 5 5v53q0 5 5 5h251q5 0 5-5v-53q0-5 5-5m5 0h5"/><rect class="literal" x="5" y="35" width="68" height="25" rx="7"/><text class="text" x="15" y="52">UPDATE</text><a xlink:href="../grammar_diagrams#table-name"><rect class="rule" x="83" y="35" width="91" height="25"/><text class="text" x="93" y="52">table_name</text></a><rect class="literal" x="204" y="35" width="60" height="25" rx="7"/><text class="text" x="214" y="52">USING</text><a xlink:href="../grammar_diagrams#using-expression"><rect class="rule" x="274" y="35" width="123" height="25"/><text class="text" x="284" y="52">using_expression</text></a><rect class="literal" x="427" y="35" width="43" height="25" rx="7"/><text class="text" x="437" y="52">SET</text><rect class="literal" x="532" y="5" width="24" height="25" rx="7"/><text class="text" x="542" y="22">,</text><a xlink:href="../grammar_diagrams#assignment"><rect class="rule" x="500" y="35" width="89" height="25"/><text class="text" x="510" y="52">assignment</text></a><rect class="literal" x="5" y="85" width="65" height="25" rx="7"/><text class="text" x="15" y="102">WHERE</text><a xlink:href="../grammar_diagrams#where-expression"><rect class="rule" x="80" y="85" width="128" height="25"/><text class="text" x="90" y="102">where_expression</text></a><rect class="literal" x="238" y="85" width="32" height="25" rx="7"/><text class="text" x="248" y="102">IF</text><rect class="literal" x="320" y="85" width="45" height="25" rx="7"/><text class="text" x="330" y="102">NOT</text><rect class="literal" x="395" y="85" width="64" height="25" rx="7"/><text class="text" x="405" y="102">EXISTS</text><a xlink:href="../grammar_diagrams#if-expression"><rect class="rule" x="300" y="130" width="98" height="25"/><text class="text" x="310" y="147">if_expression</text></a></svg>
+<svg class="rrdiagram" version="1.1" xmlns:xlink="http://www.w3.org/1999/xlink" xmlns="http://www.w3.org/2000/svg" width="755" height="175" viewbox="0 0 755 175"><path class="connector" d="M0 52h15m68 0h10m91 0h30m60 0h10m123 0h20m-228 0q5 0 5 5v8q0 5 5 5h203q5 0 5-5v-8q0-5 5-5m5 0h10m43 0h30m-5 0q-5 0-5-5v-20q0-5 5-5h37m24 0h38q5 0 5 5v20q0 5-5 5m-5 0h27m2 0h2m2 0h2m-634 50h2m2 0h2m2 0h7m65 0h10m128 0h30m32 0h50m45 0h20m-80 0q5 0 5 5v8q0 5 5 5h55q5 0 5-5v-8q0-5 5-5m5 0h10m64 0h20m-194 0q5 0 5 5v35q0 5 5 5h5m98 0h66q5 0 5-5v-35q0-5 5-5m5 0h20m-276 0q5 0 5 5v53q0 5 5 5h251q5 0 5-5v-53q0-5 5-5m5 0h30m181 0h20m-216 0q5 0 5 5v8q0 5 5 5h191q5 0 5-5v-8q0-5 5-5m5 0h15"/><polygon points="0,59 5,52 0,45" style="fill:black;stroke-width:0"/><rect class="literal" x="15" y="35" width="68" height="25" rx="7"/><text class="text" x="25" y="52">UPDATE</text><a xlink:href="../grammar_diagrams#table-name"><rect class="rule" x="93" y="35" width="91" height="25"/><text class="text" x="103" y="52">table_name</text></a><rect class="literal" x="214" y="35" width="60" height="25" rx="7"/><text class="text" x="224" y="52">USING</text><a xlink:href="../grammar_diagrams#using-expression"><rect class="rule" x="284" y="35" width="123" height="25"/><text class="text" x="294" y="52">using_expression</text></a><rect class="literal" x="437" y="35" width="43" height="25" rx="7"/><text class="text" x="447" y="52">SET</text><rect class="literal" x="542" y="5" width="24" height="25" rx="7"/><text class="text" x="552" y="22">,</text><a xlink:href="../grammar_diagrams#assignment"><rect class="rule" x="510" y="35" width="89" height="25"/><text class="text" x="520" y="52">assignment</text></a><rect class="literal" x="15" y="85" width="65" height="25" rx="7"/><text class="text" x="25" y="102">WHERE</text><a xlink:href="../grammar_diagrams#where-expression"><rect class="rule" x="90" y="85" width="128" height="25"/><text class="text" x="100" y="102">where_expression</text></a><rect class="literal" x="248" y="85" width="32" height="25" rx="7"/><text class="text" x="258" y="102">IF</text><rect class="literal" x="330" y="85" width="45" height="25" rx="7"/><text class="text" x="340" y="102">NOT</text><rect class="literal" x="405" y="85" width="64" height="25" rx="7"/><text class="text" x="415" y="102">EXISTS</text><a xlink:href="../grammar_diagrams#if-expression"><rect class="rule" x="310" y="130" width="98" height="25"/><text class="text" x="320" y="147">if_expression</text></a><rect class="literal" x="539" y="85" width="181" height="25" rx="7"/><text class="text" x="549" y="102">RETURNS STATUS AS ROW</text><polygon points="751,109 755,109 755,95 751,95" style="fill:black;stroke-width:0"/></svg>
 
 ### using_expression
 
@@ -47,11 +46,11 @@ ttl_or_timestamp_expression = 'TTL' ttl_expression | 'TIMESTAMP' timestamp_expre
 <svg class="rrdiagram" version="1.1" xmlns:xlink="http://www.w3.org/1999/xlink" xmlns="http://www.w3.org/2000/svg" width="305" height="65" viewbox="0 0 305 65"><path class="connector" d="M0 22h25m41 0h10m104 0h120m-290 0q5 0 5 5v20q0 5 5 5h5m90 0h10m155 0h5q5 0 5-5v-20q0-5 5-5m5 0h5"/><rect class="literal" x="25" y="5" width="41" height="25" rx="7"/><text class="text" x="35" y="22">TTL</text><a xlink:href="../grammar_diagrams#ttl-expression"><rect class="rule" x="76" y="5" width="104" height="25"/><text class="text" x="86" y="22">ttl_expression</text></a><rect class="literal" x="25" y="35" width="90" height="25" rx="7"/><text class="text" x="35" y="52">TIMESTAMP</text><a xlink:href="../grammar_diagrams#timestamp-expression"><rect class="rule" x="125" y="35" width="155" height="25"/><text class="text" x="135" y="52">timestamp_expression</text></a></svg>
 
 ```
-update ::= UPDATE table_name
-              [ USING using_expression ]
-              SET assignment [, assignment ...]
-              WHERE where_expression
-              [ IF { [ NOT ] EXISTS | if_expression } ]
+update ::= UPDATE table_name [ USING using_expression ] SET assignment 
+               [ , ... ]  WHERE where_expression 
+               [ IF { [ NOT ] EXISTS | if_expression } ] 
+               [ RETURNS STATUS AS ROW ]
+
 
 assignment ::= { column_name | column_name'['index_expression']' } '=' expression
 ```
@@ -66,11 +65,12 @@ Where
 
 - An error is raised if the specified `table_name` does not exist.
 - Update statement uses _upsert semantics_, meaning it inserts the row being updated if it does not already exists.
-- The `USING TIMESTAMP` clause indicates we would like to perform the UPDATE as if it was done at the
+- The `USING TIMESTAMP` clause indicates you would like to perform the UPDATE as if it was done at the
   timestamp provided by the user. The timestamp is the number of microseconds since epoch.
 - **NOTE**: You should either use the `USING TIMESTAMP` clause in all of your statements or none of
   them. Using a mix of statements where some have `USING TIMESTAMP` and others do not will lead to
   very confusing results.
+- Updating rows `USING TTL` is not supported on tables with [transactions enabled](./../ddl_create_table#table-properties-1). 
 
 ### `WHERE` clause
 
@@ -94,7 +94,7 @@ Where
 ### Update a value in a table
 
 ```sql
-cqlsh:example> CREATE TABLE employees(department_id INT, 
+ycqlsh:example> CREATE TABLE employees(department_id INT, 
                                       employee_id INT, 
                                       name TEXT, 
                                       age INT, 
@@ -102,23 +102,23 @@ cqlsh:example> CREATE TABLE employees(department_id INT,
 ```
 
 ```sql
-cqlsh:example> INSERT INTO employees(department_id, employee_id, name, age) VALUES (1, 1, 'John', 30);
+ycqlsh:example> INSERT INTO employees(department_id, employee_id, name, age) VALUES (1, 1, 'John', 30);
 ```
 
 Update the value of a non primary-key column.
 
 ```sql
-cqlsh:example> UPDATE employees SET name = 'Jack' WHERE department_id = 1 AND employee_id = 1;
+ycqlsh:example> UPDATE employees SET name = 'Jack' WHERE department_id = 1 AND employee_id = 1;
 ```
 
 Using upsert semantics to update a non-existent row (i.e. insert the row).
 
 ```sql
-cqlsh:example> UPDATE employees SET name = 'Jane', age = 40 WHERE department_id = 1 AND employee_id = 2;
+ycqlsh:example> UPDATE employees SET name = 'Jane', age = 40 WHERE department_id = 1 AND employee_id = 2;
 ```
 
 ```sql
-cqlsh:example> SELECT * FROM employees;
+ycqlsh:example> SELECT * FROM employees;
 ```
 
 ```
@@ -133,7 +133,7 @@ cqlsh:example> SELECT * FROM employees;
 The supported expressions are allowed in the 'SET' assignment targets.
 
 ```sql
-cqlsh:example> UPDATE employees SET age = age + 1 WHERE department_id = 1 AND employee_id = 1 IF name = 'Jack';
+ycqlsh:example> UPDATE employees SET age = age + 1 WHERE department_id = 1 AND employee_id = 1 IF name = 'Jack';
 ```
 
 ```
@@ -145,7 +145,7 @@ cqlsh:example> UPDATE employees SET age = age + 1 WHERE department_id = 1 AND em
 Using upsert semantics to add a row, age is not set so will be 'null'.
 
 ```sql
-cqlsh:example> UPDATE employees SET name = 'Joe' WHERE department_id = 2 AND employee_id = 1 IF NOT EXISTS;
+ycqlsh:example> UPDATE employees SET name = 'Joe' WHERE department_id = 2 AND employee_id = 1 IF NOT EXISTS;
 ```
 
 ```
@@ -155,7 +155,7 @@ cqlsh:example> UPDATE employees SET name = 'Joe' WHERE department_id = 2 AND emp
 ```
 
 ```sql
-cqlsh:example> SELECT * FROM employees;
+ycqlsh:example> SELECT * FROM employees;
 ```
 
 ```
@@ -168,14 +168,14 @@ cqlsh:example> SELECT * FROM employees;
 
 ### Update with expiration time using the `USING TTL` clause.
 
-The updated value(s) will persist for the TTL duration.
+The updated values will persist for the TTL duration.
 
 ```sql
-cqlsh:example> UPDATE employees USING TTL 10 SET age = 32 WHERE department_id = 1 AND employee_id = 1;
+ycqlsh:example> UPDATE employees USING TTL 10 SET age = 32 WHERE department_id = 1 AND employee_id = 1;
 ```
 
 ```sql
-cqlsh:example> SELECT * FROM employees WHERE department_id = 1 AND employee_id = 1;
+ycqlsh:example> SELECT * FROM employees WHERE department_id = 1 AND employee_id = 1;
 ```
 
 ```
@@ -187,7 +187,7 @@ cqlsh:example> SELECT * FROM employees WHERE department_id = 1 AND employee_id =
 11 seconds after the update (value will have expired).
 
 ```sql
-cqlsh:example> SELECT * FROM employees WHERE department_id = 1 AND employee_id = 1;
+ycqlsh:example> SELECT * FROM employees WHERE department_id = 1 AND employee_id = 1;
 ```
 
 ```
@@ -201,11 +201,11 @@ cqlsh:example> SELECT * FROM employees WHERE department_id = 1 AND employee_id =
 You can do this as shown below.
 
 ```sql
-cqlsh:foo> INSERT INTO employees(department_id, employee_id, name, age) VALUES (1, 4, 'Jeff', 20) USING TIMESTAMP 1000;
+ycqlsh:foo> INSERT INTO employees(department_id, employee_id, name, age) VALUES (1, 4, 'Jeff', 20) USING TIMESTAMP 1000;
 ```
 
 ```sql
-cqlsh:foo> SELECT * FROM employees;
+ycqlsh:foo> SELECT * FROM employees;
 ```
 
 ```
@@ -222,13 +222,13 @@ cqlsh:foo> SELECT * FROM employees;
 Now update the employees table.
 
 ```sql
-cqlsh:foo> UPDATE employees USING TIMESTAMP 500 SET age = 30 WHERE department_id = 1 AND employee_id = 4;
+ycqlsh:foo> UPDATE employees USING TIMESTAMP 500 SET age = 30 WHERE department_id = 1 AND employee_id = 4;
 ```
 
 Not applied since timestamp is lower than 1000.
 
 ```sql
-cqlsh:foo> SELECT * FROM employees;
+ycqlsh:foo> SELECT * FROM employees;
 ```
 
 ```
@@ -243,13 +243,13 @@ cqlsh:foo> SELECT * FROM employees;
 ```
 
 ```sql
-cqlsh:foo> UPDATE employees USING TIMESTAMP 1500 SET age = 30 WHERE department_id = 1 AND employee_id = 4;
+ycqlsh:foo> UPDATE employees USING TIMESTAMP 1500 SET age = 30 WHERE department_id = 1 AND employee_id = 4;
 ```
 
 Applied since timestamp is higher than 1000.
 
 ```sql
-cqlsh:foo> SELECT * FROM employees;
+ycqlsh:foo> SELECT * FROM employees;
 ```
 
 ```
@@ -262,6 +262,12 @@ cqlsh:foo> SELECT * FROM employees;
 
 (4 rows)
 ```
+
+### RETURNS STATUS AS ROW
+
+When executing a batch in YCQL, the protocol returns only one error or return status. The `RETURNS STATUS AS ROW` feature addresses this limitation and adds a status row for each statement.
+
+See examples in [batch docs](../batch#row-status).
 
 ## See also
 

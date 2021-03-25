@@ -1,10 +1,8 @@
 ---
-title: Scaling YCQL queries
+title: Benchmark scaling YCQL queries
 headerTitle: Scaling YCQL queries
 linkTitle: Scaling queries
 description: Benchmark scaling YCQL queries in YugabyteDB.
-image: /images/section_icons/explore/high_performance.png
-headcontent: Benchmark YugabyteDB using different queries
 menu:
   latest:
     identifier: scaling-queries-2-ycql
@@ -33,14 +31,14 @@ isTocNested: true
 
 </ul>
 
-As a part of our efforts to push the limits of the systems we build, Yugabyte ran some large cluster benchmarks to scale YugabyteDB to million of reads and writes per second while retaining low latencies. This topic covers the details about our 50-node cluster benchmarks. [Results of the earlier benchmark tests performed on a 25-node cluster](https://forum.yugabyte.com/t/large-cluster-perf-1-25-nodes/58) are available in the Yugabyte Community forum.
+As a part of our efforts to push the limits of the systems you build, Yugabyte ran some large cluster benchmarks to scale YugabyteDB to million of reads and writes per second while retaining low latencies. This topic covers the details about our 50-node cluster benchmarks. [Results of the earlier benchmark tests performed on a 25-node cluster](https://forum.yugabyte.com/t/large-cluster-perf-1-25-nodes/58) are available in the Yugabyte Community forum.
 
 ![YCQL key-value workload](/images/benchmark/scalability/key-value-workload-ycql.png)
 Writes are RF of `3` with strong consistency, reads are leader-only data strongly consistent reads.
 
 The graph above shows how you can achieve linear scalability with YugabyteDB. The read and write throughput doubles when the cluster size doubles from 25 to 50 nodes, while the latencies remain low in the order of couple milliseconds. For details about how reads and writes work, see [YugabyteDB architecture](../../../architecture/) and [YugabyteDB IO operations](../../../architecture/core-functions/).
 
-This test was performed in [Google Cloud Platform (GCP)](https://cloud.google.com/gcp/). Since YugabyteDB is a cloud-native database, it can deliver similar performance results on other public clouds and on-premise data centers.
+This test was performed in [Google Cloud Platform (GCP)](https://cloud.google.com/gcp/). Since YugabyteDB is a cloud-native database, it can deliver similar performance results on other public clouds and on-premises data centers.
 
 The sections below cover the experimental setup and the details of the read and write performance metrics.
 
@@ -53,7 +51,7 @@ The sections below cover the experimental setup and the details of the read and 
   - 60 GB RAM
   - 2 x 375 GB direct attached SSD
 - Replication factor (RF) = `3`
-- YugabyteDB version: `0.9.1.0`. All configuration options are default on the YugabyteDB nodes.
+- YugabyteDB version: `0.9.1.0`. All configuration flags are default on the YugabyteDB nodes.
 
 The workload was generated using a multi-threaded Cassandra key-value sample application that was run from `n1-highcpu-32` machines. The key and value sizes used were 40 and 16 bytes, respectively.
 
@@ -69,7 +67,7 @@ YugabyteDB performs strongly consistent reads by default. For details, see [Read
 
 The graphs below were captured for one hour of the run. The operations per second is the sum across all the nodes while the latency is the average. Note that the throughput and latency metrics are very steady over the entire time window.
 
-![Total CQL operations per second and CQL operations latency](/images/benchmark/scalability/total-cql-ops-per-sec-reads.png)
+![Total YCQL operations per second and YCQL operations latency](/images/benchmark/scalability/total-cql-ops-per-sec-reads.png)
 
 #### 50-node cluster   CPU and memory during the read benchmark
 
@@ -91,7 +89,7 @@ The graphs below are for twelve hours of the run. Note that this is a much longe
 
 The two graphs below are the corresponding CPU and RAM usage for those twelve hours, and are the average across all the YugaByte nodes.
 
-![Total CQL operations per second and CQL operation latency](/images/benchmark/scalability/total-cql-ops-per-sec-writes-ycql.png)
+![Total YCQL operations per second and YCQL operation latency](/images/benchmark/scalability/total-cql-ops-per-sec-writes-ycql.png)
 
 #### 50-node cluster — CPU and memory during the write benchmark
 

@@ -1,7 +1,8 @@
 ---
-title: nextval()
-summary: Get the next value from the session's sequence cache
-description: nextval()
+title: nextval() function [YSQL]
+headerTitle: nextval()
+linkTitle: nextval()
+description: Returns the next value from the sequence cache for the current session. 
 menu:
   latest:
     identifier: api-ysql-exprs-nextval
@@ -28,7 +29,7 @@ Specify the name of the sequence.
 
 ### Create a simple sequence that increments by 1 every time nextval() is called
 
-```postgresql
+```plpgsql
 yugabyte=# CREATE SEQUENCE s;
 ```
 
@@ -38,7 +39,7 @@ CREATE SEQUENCE
 
 Call nextval() a couple of times.
 
-```postgresql
+```plpgsql
 yugabyte=# SELECT nextval('s');
 ```
 
@@ -49,7 +50,7 @@ yugabyte=# SELECT nextval('s');
 (1 row)
 ```
 
-```postgresql
+```plpgsql
 yugabyte=# SELECT nextval('s');
 ```
 
@@ -62,7 +63,7 @@ yugabyte=# SELECT nextval('s');
 
 ### Create a sequence with a cache of 3 values
 
-```postgresql
+```plpgsql
 yugabyte=# CREATE SEQUENCE s2 CACHE 3;
 ```
 
@@ -72,7 +73,7 @@ CREATE SEQUENCE
 
 In the same session, call `nextval()`. The first time it's called, the session's cache will allocate numbers 1, 2, and 3. This means that the data for this sequence will have its `last_val` set to 3. This modification requires two RPC requests.
 
-```postgresql
+```plpgsql
 SELECT nextval('s2');
 ```
 
@@ -85,7 +86,7 @@ SELECT nextval('s2');
 
 The next call of `nextval()` in the same session will not generate new numbers for the sequence, so it is much faster than the first `nextval()` call because it will just use the next value available from the cache.
 
-```postgresql
+```plpgsql
 SELECT nextval('s2');
 ```
 
@@ -98,7 +99,7 @@ nextval
 
 ## See also
 
-- [`CREATE SEQUENCE`](../../commands/ddl_create_sequence)
-- [`DROP SEQUENCE`](../../commands/ddl_drop_sequence)
+- [`CREATE SEQUENCE`](../../the-sql-language/statements/ddl_create_sequence)
+- [`DROP SEQUENCE`](../../the-sql-language/statements/ddl_drop_sequence)
 - [`currval()`](../func_currval)
 - [`lastval()`](../func_lastval)

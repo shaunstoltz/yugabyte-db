@@ -37,6 +37,7 @@
 #include <glog/logging.h>
 #include <gtest/gtest.h>
 
+#include "yb/common/ql_expr.h"
 #include "yb/common/schema.h"
 #include "yb/gutil/strings/substitute.h"
 #include "yb/tablet/operations/change_metadata_operation.h"
@@ -141,7 +142,7 @@ TEST_F(TestTabletSchema, TestRenameProjection) {
   InsertRow(1);
 
   // Switch schema to s2
-  SchemaBuilder builder(tablet()->metadata()->schema());
+  SchemaBuilder builder(*tablet()->metadata()->schema());
   ASSERT_OK(builder.RenameColumn("c1", "c1_renamed"));
   AlterSchema(builder.Build());
   Schema s2 = builder.BuildWithoutIds();
@@ -182,7 +183,7 @@ TEST_F(TestTabletSchema, TestDeleteAndReAddColumn) {
   VerifyTabletRows(client_schema_, keys);
 
   // Switch schema to s2
-  SchemaBuilder builder(tablet()->metadata()->schema());
+  SchemaBuilder builder(*tablet()->metadata()->schema());
   ASSERT_OK(builder.RemoveColumn("c1"));
   // NOTE this new 'c1' will have a different id from the previous one
   //      so the data added to the previous 'c1' will not be visible.

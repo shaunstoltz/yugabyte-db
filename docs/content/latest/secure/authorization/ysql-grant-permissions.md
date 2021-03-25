@@ -5,7 +5,7 @@ linkTitle: Grant privileges
 description: Grant YSQL privileges in YugabyteDB
 menu:
   latest:
-    name: Grant privileges
+    name: Grant Privileges
     identifier: ysql-grant-permissions
     parent: authorization
     weight: 735  
@@ -29,9 +29,9 @@ showAsideToc: true
   </li>
 </ul>
 
-In this tutorial, we shall run through a scenario. Assume a company has an engineering organization, with three sub-teams - developers, qa and DB admins. We are going to create a role for each of these entities.
+In this tutorial, you will run through a scenario. Assume a company has an engineering organization, with three sub-teams - developers, qa and DB admins. We are going to create a role for each of these entities.
 
-Here is what we want to achieve from a role-based access control (RBAC) perspective.
+Here is what you want to achieve from a role-based access control (RBAC) perspective.
 
 + All members of engineering should be able to read data from any database and table.
 + Both developers and qa should be able to modify data in existing tables in the database `dev_database`.
@@ -40,7 +40,7 @@ Here is what we want to achieve from a role-based access control (RBAC) perspect
 
 ## 1. Create role hierarchy
 
-Connect to the cluster using a superuser role. Read more about [enabling authentication and connecting using a superuser role](../../../authentication/ysql-authentication/) in YugabyteDB clusters for YSQL. For this tutorial, we are using the default `yugabyte` user and connect to the cluster using `ysqlsh` as follows:
+Connect to the cluster using a superuser role. Read more about [enabling authentication and connecting using a superuser role](../../enable-authentication/ysql/) in YugabyteDB clusters for YSQL. For this tutorial, you are using the default `yugabyte` user and connect to the cluster using `ysqlsh` as follows:
 
 ```sh
 $ ysqlsh
@@ -48,7 +48,7 @@ $ ysqlsh
 
 Create a database `dev_database`.
 
-```postgresql
+```plpgsql
 yugabyte=# CREATE database dev_database;
 ```
 
@@ -60,7 +60,7 @@ yugabyte=# \c dev_database
 
 Create the `integration_tests` table:
 
-```postgresql
+```plpgsql
 dev_database=# CREATE TABLE integration_tests (
                  id UUID PRIMARY KEY,
                  time TIMESTAMP,
@@ -71,7 +71,7 @@ dev_database=# CREATE TABLE integration_tests (
 
 Next, create roles `engineering`, `developer`, `qa`, and `db_admin`.
 
-```postgresql
+```plpgsql
 dev_database=# CREATE ROLE engineering;
                  CREATE ROLE developer;
                  CREATE ROLE qa;
@@ -80,7 +80,7 @@ dev_database=# CREATE ROLE engineering;
 
 Grant the `engineering` role to `developer`, `qa`, and `db_admin` roles since they are all a part of the engineering organization.
 
-```postgresql
+```plpgsql
 dev_database=# GRANT engineering TO developer;
                  GRANT engineering TO qa;
                  GRANT engineering TO db_admin;
@@ -128,11 +128,11 @@ You should see something like the following output.
  yugabyte    | Superuser, Create role, Create DB, Replication, Bypass RLS | {}
 ```
 
-The above shows the various role attributes the `yugabyte` role has. Since `yugabyte` is a superuser, it has all privileges on all databases, including `ALTER`, `Create role` and `DROP` on the roles we created (`engineering`, `developer`, `qa` and `db_admin`).
+The above shows the various role attributes the `yugabyte` role has. Since `yugabyte` is a superuser, it has all privileges on all databases, including `ALTER`, `Create role` and `DROP` on the roles you created (`engineering`, `developer`, `qa` and `db_admin`).
 
 ## 3. Grant privileges to roles
 
-In this section, we will grant privileges to achieve the following as mentioned in the beginning of this tutorial:
+In this section, you will grant privileges to achieve the following as mentioned in the beginning of this tutorial:
 
 + All members of engineering should be able to read (`SELECT`) data from any database and table.
 + Both developers and qa should be able to modify (`INSERT`, `UPDATE`, and `DELETE`) data in existing tables in the database `dev_database`.
@@ -143,7 +143,7 @@ In this section, we will grant privileges to achieve the following as mentioned 
 
 All members of engineering should be able to read data from any database and table. Use the `GRANT` statement to grant `SELECT` (or read) access on the existing table (`integration_tests`) to the `engineering` role. This can be done as follows:
 
-```postgresql
+```plpgsql
 dev_database=# GRANT SELECT ON ALL TABLE integration_tests to engineering;
 dev_database=# GRANT USAGE ON SCHEMA public TO engineering;
 ```
@@ -154,7 +154,7 @@ You can now verify that the `engineering` role has `SELECT` privilege as follows
 dev_database=# \z
 ```
 
-The output should look similar to below, where we see that the `engineering` role has `SELECT` privilege on the `data` resource.
+The output should look similar to below, where you see that the `engineering` role has `SELECT` privilege on the `data` resource.
 
 ```
  Schema |       Name        | Type  |     Access privileges     | Column privileges | Policies
@@ -163,7 +163,7 @@ The output should look similar to below, where we see that the `engineering` rol
         |                   |       | engineering=r/yugabyte   +|                   |
 ```
 
-The access privileges "arwdDxt" include all privileges for the user `yugabyte` (superuser), while the role `engineering` has only "r" (read) privileges. For details on the `GRANT` statement and access privileges, see [GRANT](../../../api/ysql/commands/dcl_grant).
+The access privileges "arwdDxt" include all privileges for the user `yugabyte` (superuser), while the role `engineering` has only "r" (read) privileges. For details on the `GRANT` statement and access privileges, see [GRANT](../../../api/ysql/the-sql-language/statements/dcl_grant).
 
 Granting the role `engineering` to any other role will cause all those roles to inherit the specified privileges. Thus, `developer`, `qa` and `db_admin` will all inherit the `SELECT` and `USAGE` privileges, giving them read-access.
 
@@ -171,7 +171,7 @@ Granting the role `engineering` to any other role will cause all those roles to 
 
 Both `developers` and `qa` should be able to modify data existing tables in the database `dev_database`. They should be able to execute statements such as `INSERT`, `UPDATE`, `DELETE` or `TRUNCATE` in order to modify data on existing tables. This can be done as follows:
 
-```postgresql
+```plpgsql
 dev_database=# GRANT INSERT, UPDATE, DELETE, TRUNCATE ON table integration_tests TO developer;
 dev_database=# GRANT INSERT, UPDATE, DELETE, TRUNCATE ON table integration_tests TO qa;
 ```
@@ -198,13 +198,13 @@ Now `developer` and `qa` roles have the access privileges `awdD` (append/insert,
 
 QA (`qa`) should be able to alter the table `integration_tests` in the database `dev_database`. This can be done as follows.
 
-```postgresql
+```plpgsql
 yugabyte=# ALTER TABLE integration_tests OWNER TO qa;
 ```
 
 Once again, run the following command to verify the privileges.
 
-```postgresql
+```plpgsql
 yugabyte=# SELECT * FROM system_auth.role_privileges;
 ```
 
@@ -226,17 +226,17 @@ We should see that owner has changed from `yugabyte` to `qa` and `qa` has all ac
 
 DB admins should be able to perform all operations on any database. There are two ways to achieve this:
 
-1. The DB admins can be granted the superuser privilege. Read more about [granting the superuser privilege to roles](../authentication/#YSQL). Note that doing this will give the DB admin all the privileges over all the roles as well.
+1. The DB admins can be granted the superuser privilege. Read more about [granting the superuser privilege to roles](../../enable-authentication/ysql/). Note that doing this will give the DB admin all the privileges over all the roles as well.
 
 2. Grant `ALL` privileges to the `db_admin` role. This can be achieved as follows.
 
-```postgresql
+```plpgsql
 dev_database=# ALTER USER db_admin WITH SUPERUSER;
 ```
 
 Run the following command to verify the privileges:
 
-```postgresql
+```plpgsql
 dev_database=# \du
 ```
 
@@ -257,15 +257,15 @@ We should see the following, which grants the `Superuser` privileges on the  to 
 
 ## 4. Revoke privileges from roles
 
-Let us say we want to revoke the `Superuser` privilege from the DB admins so that they can no longer change privileges for other roles. This can be done as follows.
+Let us say you want to revoke the `Superuser` privilege from the DB admins so that they can no longer change privileges for other roles. This can be done as follows.
 
-```postgresql
+```plpgsql
 yugabyte=# ALTER USER db_admin WITH NOSUPERUSER;
 ```
 
 Run the following command to verify the privileges.
 
-```postgresql
+```plpgsql
 yugabyte=# \du
 ```
 

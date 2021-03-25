@@ -26,11 +26,6 @@ namespace pggate {
 
 class PgSelectIndex : public PgDmlRead {
  public:
-  // Public types.
-  typedef scoped_refptr<PgSelectIndex> ScopedRefPtr;
-  typedef std::shared_ptr<PgSelectIndex> SharedPtr;
-
-  // Constructors.
   PgSelectIndex(PgSession::ScopedRefPtr pg_session,
                 const PgObjectId& table_id,
                 const PgObjectId& index_id,
@@ -64,10 +59,6 @@ class PgSelectIndex : public PgDmlRead {
  private:
   // Collect ybctids from IndexTable.
   CHECKED_STATUS FetchYbctids();
-
-  // Result buffers that hold ybctid values. This field cannot be destroyed while the associated
-  // ybctid values are in used.
-  PgDocResult::SharedPtr ybctid_batch_;
 
   // This secondary query should be executed just one time.
   bool is_executed_ = false;

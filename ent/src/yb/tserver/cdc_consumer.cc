@@ -52,7 +52,6 @@ CDCClient::~CDCClient() {
 
 void CDCClient::Shutdown() {
   client->Shutdown();
-  rpcs->Shutdown();
 }
 
 Result<std::unique_ptr<CDCConsumer>> CDCConsumer::Create(
@@ -72,7 +71,7 @@ Result<std::unique_ptr<CDCConsumer>> CDCConsumer::Create(
     rpc::MessengerBuilder messenger_builder("cdc-consumer");
 
     local_client->secure_context = VERIFY_RESULT(server::SetupSecureContext(
-        "", "", server::SecureContextType::kServerToServer, &messenger_builder));
+        "", "", server::SecureContextType::kInternal, &messenger_builder));
 
     local_client->messenger = VERIFY_RESULT(messenger_builder.Build());
   }
@@ -100,6 +99,7 @@ CDCConsumer::CDCConsumer(std::function<bool(const std::string&)> is_leader_for_t
                          const string& ts_uuid,
                          std::unique_ptr<CDCClient> local_client) :
   is_leader_for_tablet_(std::move(is_leader_for_tablet)),
+  rpcs_(new rpc::Rpcs),
   log_prefix_(Format("[TS $0]: ", ts_uuid)),
   local_client_(std::move(local_client)) {}
 
@@ -115,6 +115,10 @@ void CDCConsumer::Shutdown() {
   }
   cond_.notify_all();
 
+  if (thread_pool_) {
+    thread_pool_->Shutdown();
+  }
+
   {
     std::lock_guard<rw_spinlock> write_lock(master_data_mutex_);
     producer_consumer_tablet_map_from_master_.clear();
@@ -124,16 +128,13 @@ void CDCConsumer::Shutdown() {
       for (auto &uuid_and_client : remote_clients_) {
         uuid_and_client.second->Shutdown();
       }
+      producer_pollers_map_.clear();
     }
     local_client_->client->Shutdown();
   }
 
   if (run_trigger_poll_thread_) {
     WARN_NOT_OK(ThreadJoiner(run_trigger_poll_thread_.get()).Join(), "Could not join thread");
-  }
-
-  if (thread_pool_) {
-    thread_pool_->Shutdown();
   }
 }
 
@@ -273,7 +274,7 @@ void CDCConsumer::TriggerPollForNewTablets() {
             }
 
             auto secure_context_result = server::SetupSecureContext(
-                dir, "", "", server::SecureContextType::kServerToServer, &messenger_builder);
+                dir, "", "", server::SecureContextType::kInternal, &messenger_builder);
             if (!secure_context_result.ok()) {
               LOG(WARNING) << "Could not create secure context for " << uuid
                          << ": " << secure_context_result.status().ToString();
@@ -291,7 +292,7 @@ void CDCConsumer::TriggerPollForNewTablets() {
           }
 
           auto client_result = yb::client::YBClientBuilder()
-              .set_client_name("CDCConsumerRemote::" + uuid)
+              .set_client_name("CDCConsumerRemote")
               .add_master_server_addr(uuid_master_addrs_[uuid])
               .skip_master_flagfile()
               .default_rpc_timeout(MonoDelta::FromMilliseconds(FLAGS_cdc_read_rpc_timeout_ms))
@@ -315,6 +316,7 @@ void CDCConsumer::TriggerPollForNewTablets() {
             std::bind(&CDCConsumer::ShouldContinuePolling, this, entry.first),
             std::bind(&CDCConsumer::RemoveFromPollersMap, this, entry.first),
             thread_pool_.get(),
+            rpcs_.get(),
             local_client_,
             remote_clients_[uuid],
             this,

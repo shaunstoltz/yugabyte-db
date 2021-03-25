@@ -234,7 +234,8 @@ TEST(TestMonoTime, ToCoarse) {
 TEST(TestMonoTime, TestOverFlow) {
   EXPECT_EXIT(MonoDelta::FromMilliseconds(std::numeric_limits<int64_t>::max()),
                                           ::testing::KilledBySignal(SIGABRT), "Check failed.*");
-  EXPECT_EXIT(MonoDelta::FromSeconds(std::numeric_limits<int64_t>::max()),
+  // We have to cast kint64max to double to avoid a warning on implicit cast that changes the value.
+  EXPECT_EXIT(MonoDelta::FromSeconds(static_cast<double>(std::numeric_limits<int64_t>::max())),
               ::testing::KilledBySignal(SIGABRT), "Check failed.*");
   EXPECT_EXIT(MonoDelta::FromMicroseconds(std::numeric_limits<int64_t>::max()),
               ::testing::KilledBySignal(SIGABRT), "Check failed.*");
@@ -261,6 +262,16 @@ TEST(TestMonoTime, TestCondition) {
     ASSERT_LE(end - start, kWaitTime + kAllowedError);
     break;
   }
+}
+
+TEST(TestMonoTime, TestSubtractDelta) {
+  MonoTime start = MonoTime::Now();
+  MonoDelta delta = MonoDelta::FromMilliseconds(100);
+  ASSERT_GT(start, start - delta);
+  MonoTime start_copy = start;
+  start_copy.SubtractDelta(delta);
+  ASSERT_EQ(start_copy, start - delta);
+  ASSERT_EQ(start_copy + delta, start);
 }
 
 } // namespace yb

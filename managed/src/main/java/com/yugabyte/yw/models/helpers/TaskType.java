@@ -27,6 +27,10 @@ public enum TaskType {
   CreateKubernetesUniverse("CreateKubernetesUniverse"),
 
   DestroyUniverse("DestroyUniverse"),
+  
+  PauseUniverse("PauseUniverse"),
+
+  ResumeUniverse("ResumeUniverse"),
 
   DestroyKubernetesUniverse("DestroyKubernetesUniverse"),
 
@@ -34,12 +38,15 @@ public enum TaskType {
 
   BackupUniverse("BackupUniverse"),
 
+  DeleteBackup("DeleteBackup"),
+
   MultiTableBackup("MultiTableBackup"),
 
   EditUniverse("EditUniverse"),
 
   EditKubernetesUniverse("EditKubernetesUniverse"),
 
+  @Deprecated
   KubernetesProvision("KubernetesProvision"),
 
   ImportIntoTable("ImportIntoTable"),
@@ -69,14 +76,24 @@ public enum TaskType {
 
   DeleteKMSConfig("DeleteKMSConfig"),
 
+  UpdateDiskSize("UpdateDiskSize"),
+
+  StartMasterOnNode("StartMasterOnNode"),
+
   // Tasks belonging to subtasks classpath
   AnsibleClusterServerCtl("subtasks.AnsibleClusterServerCtl"),
 
   AnsibleConfigureServers("subtasks.AnsibleConfigureServers"),
 
   AnsibleDestroyServer("subtasks.AnsibleDestroyServer"),
+  
+  PauseServer("subtasks.PauseServer"),
+
+  ResumeServer("subtasks.ResumeServer"),
 
   AnsibleSetupServer("subtasks.AnsibleSetupServer"),
+
+  PrecheckNode("subtasks.PrecheckNode"),
 
   AnsibleUpdateNodeInfo("subtasks.AnsibleUpdateNodeInfo"),
 
@@ -99,6 +116,8 @@ public enum TaskType {
   ManipulateDnsRecordTask("subtasks.ManipulateDnsRecordTask"),
 
   RemoveUniverseEntry("subtasks.RemoveUniverseEntry"),
+
+  SetFlagInMemory("subtasks.SetFlagInMemory"),
 
   SetNodeState("subtasks.SetNodeState"),
 
@@ -143,8 +162,11 @@ public enum TaskType {
 
   CloudSetup("subtasks.cloud.CloudSetup"),
 
-
   BackupTable("subtasks.BackupTable"),
+
+  BackupUniverseKeys("subtasks.BackupUniverseKeys"),
+
+  RestoreUniverseKeys("subtasks.RestoreUniverseKeys"),
 
   WaitForLeadersOnPreferredOnly("subtasks.WaitForLeadersOnPreferredOnly"),
 
@@ -158,10 +180,16 @@ public enum TaskType {
 
   KubernetesWaitForPod("subtasks.KubernetesWaitForPod"),
 
+  KubernetesCheckNumPod("subtasks.KubernetesCheckNumPod"),
+
   @Deprecated
   CopyEncryptionKeyFile("subtasks.CopyEncryptionKeyFile"),
 
-  WaitForEncryptionKeyInMemory("subtasks.WaitForEncryptionKeyInMemory");
+  WaitForEncryptionKeyInMemory("subtasks.WaitForEncryptionKeyInMemory"),
+
+  UnivSetCertificate("subtasks.UnivSetCertificate"),
+
+  CreateAlertDefinitions("subtasks.CreateAlertDefinitions");
 
   private String relativeClassPath;
 

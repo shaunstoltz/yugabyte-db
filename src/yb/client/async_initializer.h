@@ -41,8 +41,17 @@ class AsyncClientInitialiser {
 
   YBClient* client() const;
 
+
+  YBClientBuilder& builder() {
+    return client_builder_;
+  }
+
   const std::shared_future<client::YBClient*>& get_client_future() const {
     return client_future_;
+  }
+
+  void AddPostCreateHook(std::function<void(client::YBClient*)> functor) {
+    post_create_hooks_.push_back(std::move(functor));
   }
 
  private:
@@ -53,6 +62,7 @@ class AsyncClientInitialiser {
   std::promise<client::YBClient*> client_promise_;
   mutable std::shared_future<client::YBClient*> client_future_;
   AtomicUniquePtr<client::YBClient> client_holder_;
+  std::vector<std::function<void(client::YBClient*)>> post_create_hooks_;
 
   std::thread init_client_thread_;
   std::atomic<bool> stopping_ = {false};

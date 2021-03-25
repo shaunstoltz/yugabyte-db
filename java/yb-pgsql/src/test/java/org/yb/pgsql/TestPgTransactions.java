@@ -25,8 +25,10 @@ import org.yb.util.RandomNumberUtil;
 import org.yb.util.SanitizerUtil;
 import org.yb.util.YBTestRunnerNonTsanOnly;
 
+import java.sql.Array;
 import java.sql.Connection;
 import java.sql.ResultSet;
+import java.sql.SQLException;
 import java.sql.Statement;
 import java.sql.PreparedStatement;
 import java.util.HashSet;
@@ -74,8 +76,9 @@ public class TestPgTransactions extends BasePgSQLTest {
 
   @Test
   public void testTableWithoutPrimaryKey() throws Exception {
-    Statement statement = connection.createStatement();
-    statement.execute("CREATE TABLE t (thread_id TEXT, attempt_id TEXT, k INT, v INT)");
+    try (Statement statement = connection.createStatement()) {
+      statement.execute("CREATE TABLE t (thread_id TEXT, attempt_id TEXT, k INT, v INT)");
+    }
     final int NUM_THREADS = 4;
     final int NUM_INCREMENTS_PER_THREAD = 100;
     ExecutorService ecs = Executors.newFixedThreadPool(NUM_THREADS);
@@ -85,8 +88,10 @@ public class TestPgTransactions extends BasePgSQLTest {
       ecs.submit(() -> {
         LOG.info("Workload thread " + threadIndex + " starting");
         int numIncrements = 0;
-        try (Connection conn =
-                createConnection(IsolationLevel.REPEATABLE_READ, AutoCommit.ENABLED)) {
+        try (Connection conn = getConnectionBuilder()
+                .withIsolationLevel(IsolationLevel.REPEATABLE_READ)
+                .withAutoCommit(AutoCommit.ENABLED)
+                .connect()) {
           Statement stmt = conn.createStatement();
           int currentValue = 0x01010100 * threadIndex;
           stmt.execute("INSERT INTO t (thread_id, attempt_id, k, v) VALUES (" +
@@ -141,20 +146,22 @@ public class TestPgTransactions extends BasePgSQLTest {
     }
     ecs.shutdown();
     ecs.awaitTermination(30, TimeUnit.SECONDS);
-    ResultSet rsAll = statement.executeQuery("SELECT k, v FROM t");
-    while (rsAll.next()) {
-      LOG.info("Row found at the end: k=" + rsAll.getInt("k") + ", v=" + rsAll.getInt("v"));
-    }
+    try (Statement statement = connection.createStatement()) {
+      ResultSet rsAll = statement.executeQuery("SELECT k, v FROM t");
+      while (rsAll.next()) {
+        LOG.info("Row found at the end: k=" + rsAll.getInt("k") + ", v=" + rsAll.getInt("v"));
+      }
 
-    for (int i = 1; i <= NUM_THREADS; ++i) {
-      ResultSet rs = statement.executeQuery(
-          "SELECT v FROM t WHERE k = " + i);
-      assertTrue("Did not find any values with k=" + i, rs.next());
-      int v = rs.getInt("v");
-      LOG.info("Value for k=" + i + ": " + v);
-      assertEquals(0x01010100 * i + NUM_INCREMENTS_PER_THREAD, v);
+      for (int i = 1; i <= NUM_THREADS; ++i) {
+        ResultSet rs = statement.executeQuery(
+            "SELECT v FROM t WHERE k = " + i);
+        assertTrue("Did not find any values with k=" + i, rs.next());
+        int v = rs.getInt("v");
+        LOG.info("Value for k=" + i + ": " + v);
+        assertEquals(0x01010100 * i + NUM_INCREMENTS_PER_THREAD, v);
+      }
+      assertFalse("Test had errors, look for 'Exception in thread' above", hadErrors.get());
     }
-    assertFalse("Test had errors, look for 'Exception in thread' above", hadErrors.get());
   }
 
   @Test
@@ -168,8 +175,9 @@ public class TestPgTransactions extends BasePgSQLTest {
   }
 
   private void runReadDelayWriteTest(final IsolationLevel isolationLevel) throws Exception {
-    Statement statement = connection.createStatement();
-    statement.execute("CREATE TABLE counters (k INT PRIMARY KEY, v INT)");
+    try (Statement statement = connection.createStatement()) {
+      statement.execute("CREATE TABLE counters (k INT PRIMARY KEY, v INT)");
+    }
 
     final int INCREMENTS_PER_THREAD = 250;
     final int NUM_COUNTERS = 2;
@@ -199,10 +207,10 @@ public class TestPgTransactions extends BasePgSQLTest {
         LOG.info("Workload thread " + threadIndex + " is starting");
         Random rand = new Random(System.currentTimeMillis() * 137 + threadIndex);
         int numIncrementsDone = 0;
-        try (Connection conn = createPgConnectionToTServer(
-                threadIndex % numTServers,
-                isolationLevel,
-                AutoCommit.DISABLED)) {
+        try (Connection conn = getConnectionBuilder().withTServer(threadIndex % numTServers)
+                                                     .withIsolationLevel(isolationLevel)
+                                                     .withAutoCommit(AutoCommit.DISABLED)
+                                                     .connect()) {
           PreparedStatement selectStmt = conn.prepareStatement(
               "SELECT v FROM counters WHERE k = ?");
           PreparedStatement updateStmt = conn.prepareStatement(
@@ -327,106 +335,122 @@ public class TestPgTransactions extends BasePgSQLTest {
   public void testSerializableWholeHashVsScanConflict() throws Exception {
     createSimpleTable("test", "v", PartitioningMode.HASH);
     final IsolationLevel isolation = IsolationLevel.SERIALIZABLE;
-    Connection connection1 = createConnection(isolation, AutoCommit.DISABLED);
-    Statement statement1 = connection1.createStatement();
+    try (
+        Connection connection1 = getConnectionBuilder()
+            .withIsolationLevel(isolation)
+            .withAutoCommit(AutoCommit.DISABLED)
+            .connect();
+        Statement statement1 = connection1.createStatement();
 
-    Connection connection2 = createConnection(isolation, AutoCommit.ENABLED);
-    Statement statement2 = connection2.createStatement();
+        Connection connection2 = getConnectionBuilder()
+            .withIsolationLevel(isolation)
+            .withAutoCommit(AutoCommit.ENABLED)
+            .connect();
+        Statement statement2 = connection2.createStatement()) {
 
-    int numSuccess1 = 0;
-    int numSuccess2 = 0;
-    final int TOTAL_ITERATIONS = 100;
-    for (int i = 0; i < TOTAL_ITERATIONS; ++i) {
-      int h1 = i;
-      LOG.debug("Inserting the first row within a transaction but not committing yet");
-      statement1.execute("INSERT INTO test(h, r, v) VALUES (" + h1 + ", 2, 3)");
+      int numSuccess1 = 0;
+      int numSuccess2 = 0;
+      final int TOTAL_ITERATIONS = 100;
+      for (int i = 0; i < TOTAL_ITERATIONS; ++i) {
+        int h1 = i;
+        LOG.debug("Inserting the first row within a transaction but not committing yet");
+        statement1.execute("INSERT INTO test(h, r, v) VALUES (" + h1 + ", 2, 3)");
 
-      LOG.debug("Trying to read the first row from another connection");
+        LOG.debug("Trying to read the first row from another connection");
 
-      PSQLException ex2 = null;
-      try {
-        assertFalse(statement2.executeQuery("SELECT h, r, v FROM test WHERE h = " + h1).next());
-      } catch (PSQLException ex) {
-        ex2 = ex;
-      }
+        PSQLException ex2 = null;
+        try {
+          assertFalse(statement2.executeQuery("SELECT h, r, v FROM test WHERE h = " + h1).next());
+        } catch (PSQLException ex) {
+          ex2 = ex;
+        }
 
-      PSQLException ex1 = null;
-      try {
-        connection1.commit();
-      } catch (PSQLException ex) {
-        ex1 = ex;
-      }
+        PSQLException ex1 = null;
+        try {
+          connection1.commit();
+        } catch (PSQLException ex) {
+          ex1 = ex;
+        }
 
-      final boolean succeeded1 = ex1 == null;
-      final boolean succeeded2 = ex2 == null;
-      assertNotEquals("Expecting exactly one transaction to succeed", succeeded1, succeeded2);
-      LOG.info("ex1=" + ex1);
-      LOG.info("ex2=" + ex2);
-      if (ex1 != null) {
-        assertTrue(isYBTransactionError(ex1));
+        final boolean succeeded1 = ex1 == null;
+        final boolean succeeded2 = ex2 == null;
+        assertNotEquals("Expecting exactly one transaction to succeed", succeeded1, succeeded2);
+        LOG.info("ex1=" + ex1);
+        LOG.info("ex2=" + ex2);
+        if (ex1 != null) {
+          assertTrue(isYBTransactionError(ex1));
+        }
+        if (ex2 != null) {
+          assertTrue(isYBTransactionError(ex2));
+        }
+        if (succeeded1) {
+          numSuccess1++;
+        }
+        if (succeeded2) {
+          numSuccess2++;
+        }
       }
-      if (ex2 != null) {
-        assertTrue(isYBTransactionError(ex2));
-      }
-      if (succeeded1) {
-        numSuccess1++;
-      }
-      if (succeeded2) {
-        numSuccess2++;
-      }
+      LOG.info("INSERT succeeded " + numSuccess1 + " times, " +
+               "SELECT succeeded " + numSuccess2 + " times");
+      checkTransactionFairness(numSuccess1, numSuccess2, TOTAL_ITERATIONS);
     }
-    LOG.info("INSERT succeeded " + numSuccess1 + " times, " +
-             "SELECT succeeded " + numSuccess2 + " times");
-    checkTransactionFairness(numSuccess1, numSuccess2, TOTAL_ITERATIONS);
   }
 
   @Test
   public void testBasicTransaction() throws Exception {
     createSimpleTable("test", "v", PartitioningMode.HASH);
-    final IsolationLevel isolationLevel = IsolationLevel.REPEATABLE_READ;
-    Connection connection1 = createConnection(isolationLevel, AutoCommit.DISABLED);
-    Statement statement = connection1.createStatement();
+    final IsolationLevel isolation = IsolationLevel.REPEATABLE_READ;
+    try (
+        Connection connection1 = getConnectionBuilder()
+            .withIsolationLevel(isolation)
+            .withAutoCommit(AutoCommit.DISABLED)
+            .connect();
+        Statement statement = connection1.createStatement();
 
-    // For the second connection we still enable auto-commit, so that every new SELECT will see
-    // a new snapshot of the database.
-    Connection connection2 = createConnection(isolationLevel, AutoCommit.ENABLED);
-    Statement statement2 = connection2.createStatement();
+        // For the second connection we still enable auto-commit, so that every new SELECT will see
+        // a new snapshot of the database.
+        Connection connection2 = getConnectionBuilder()
+            .withIsolationLevel(isolation)
+            .withAutoCommit(AutoCommit.ENABLED)
+            .connect();
+        Statement statement2 = connection2.createStatement()) {
 
-    for (int i = 0; i < 100; ++i) {
-      try {
-        int h1 = i * 10;
-        int h2 = i * 10 + 1;
-        LOG.debug("Inserting the first row within a transaction but not committing yet");
-        statement.execute("INSERT INTO test(h, r, v) VALUES (" + h1 + ", 2, 3)");
+      for (int i = 0; i < 100; ++i) {
+        try {
+          int h1 = i * 10;
+          int h2 = i * 10 + 1;
+          LOG.debug("Inserting the first row within a transaction but not committing yet");
+          statement.execute("INSERT INTO test(h, r, v) VALUES (" + h1 + ", 2, 3)");
 
-        LOG.debug("Trying to read the first row from another connection");
-        assertFalse(statement2.executeQuery("SELECT h, r, v FROM test WHERE h = " + h1).next());
+          LOG.debug("Trying to read the first row from another connection");
+          assertFalse(statement2.executeQuery("SELECT h, r, v FROM test WHERE h = " + h1).next());
 
-        LOG.debug("Inserting the second row within a transaction but not committing yet");
-        statement.execute("INSERT INTO test(h, r, v) VALUES (" + h2 + ", 5, 6)");
+          LOG.debug("Inserting the second row within a transaction but not committing yet");
+          statement.execute("INSERT INTO test(h, r, v) VALUES (" + h2 + ", 5, 6)");
 
-        LOG.debug("Trying to read the second row from another connection");
-        assertFalse(statement2.executeQuery("SELECT h, r, v FROM test WHERE h = " + h2).next());
+          LOG.debug("Trying to read the second row from another connection");
+          assertFalse(statement2.executeQuery("SELECT h, r, v FROM test WHERE h = " + h2).next());
 
-        LOG.debug("Committing the transaction");
-        connection1.commit();
+          LOG.debug("Committing the transaction");
+          connection1.commit();
 
-        LOG.debug("Checking first row from the other connection");
-        ResultSet rs = statement2.executeQuery("SELECT h, r, v FROM test WHERE h = " + h1);
-        assertTrue(rs.next());
-        assertEquals(h1, rs.getInt("h"));
-        assertEquals(2, rs.getInt("r"));
-        assertEquals(3, rs.getInt("v"));
+          LOG.debug("Checking first row from the other connection");
+          ResultSet rs = statement2.executeQuery("SELECT h, r, v FROM test WHERE h = " + h1);
+          assertTrue(rs.next());
+          assertEquals(h1, rs.getInt("h"));
+          assertEquals(2, rs.getInt("r"));
+          assertEquals(3, rs.getInt("v"));
 
-        LOG.debug("Checking second row from the other connection");
-        rs = statement2.executeQuery("SELECT h, r, v FROM test WHERE h = " + h2);
-        assertTrue(rs.next());
-        assertEquals(h2, rs.getInt("h"));
-        assertEquals(5, rs.getInt("r"));
-        assertEquals(6, rs.getInt("v"));
-      } catch (PSQLException ex) {
-        LOG.error("Caught a PSQLException at iteration i=" + i, ex);
-        throw ex;
+          LOG.debug("Checking second row from the other connection");
+          rs = statement2.executeQuery("SELECT h, r, v FROM test WHERE h = " + h2);
+          assertTrue(rs.next());
+          assertEquals(h2, rs.getInt("h"));
+          assertEquals(5, rs.getInt("r"));
+          assertEquals(6, rs.getInt("v"));
+        } catch (PSQLException ex) {
+          LOG.error("Caught a PSQLException at iteration i=" + i, ex);
+          throw ex;
+        }
       }
     }
   }
@@ -440,102 +464,116 @@ public class TestPgTransactions extends BasePgSQLTest {
     createSimpleTable("test", "v");
     final IsolationLevel isolation = IsolationLevel.REPEATABLE_READ;
 
-    Connection connection1 = createConnection(isolation, AutoCommit.DISABLED);
-    Statement statement1 = connection1.createStatement();
+    try (
+        Connection srcConnection1 = getConnectionBuilder()
+            .withIsolationLevel(isolation)
+            .withAutoCommit(AutoCommit.DISABLED)
+            .connect();
+        Statement srcStatement1 = srcConnection1.createStatement();
 
-    Connection connection2 = createConnection(isolation, AutoCommit.DISABLED);
-    Statement statement2 = connection2.createStatement();
+        Connection srcConnection2 = getConnectionBuilder()
+            .withIsolationLevel(isolation)
+            .withAutoCommit(AutoCommit.DISABLED)
+            .connect();
+        Statement srcStatement2 = srcConnection2.createStatement()) {
+      // Declare and use local variables instead (so that they could be swapped),
+      // and keep the original references for an automatic cleanup.
+      Connection conn1 = srcConnection1;
+      Connection conn2 = srcConnection2;
+      Statement stmt1 = srcStatement1;
+      Statement stmt2 = srcStatement2;
 
-    int numFirstWinners = 0;
-    int numSecondWinners = 0;
-    final int totalIterations = SanitizerUtil.nonTsanVsTsan(300, 100);
-    for (int i = 1; i <= totalIterations; ++i) {
-      LOG.info("Starting iteration: i=" + i);
-      if (RandomUtils.nextBoolean()) {
-        // Shuffle the two connections between iterations.
-        Connection tmpConnection = connection1;
-        connection1 = connection2;
-        connection2 = tmpConnection;
+      int numFirstWinners = 0;
+      int numSecondWinners = 0;
+      final int totalIterations = SanitizerUtil.nonTsanVsTsan(300, 100);
+      for (int i = 1; i <= totalIterations; ++i) {
+        LOG.info("Starting iteration: i=" + i);
+        if (RandomUtils.nextBoolean()) {
+          // Shuffle the two connections between iterations.
+          Connection tmpConn = conn1;
+          conn1 = conn2;
+          conn2 = tmpConn;
 
-        Statement tmpStatement = statement1;
-        statement1 = statement2;
-        statement2 = tmpStatement;
+          Statement tmpStmt = stmt1;
+          stmt1 = stmt2;
+          stmt2 = tmpStmt;
+        }
+
+        executeWithTimeout(stmt1,
+            String.format("INSERT INTO test(h, r, v) VALUES (%d, %d, %d)", i, i, 100 * i));
+        boolean executed2 = false;
+        try {
+          executeWithTimeout(stmt2,
+              String.format("INSERT INTO test(h, r, v) VALUES (%d, %d, %d)", i, i, 200 * i));
+          executed2 = true;
+        } catch (PSQLException ex) {
+          // Not reporting a stack trace here on purpose, because this will happen a lot in a test.
+          // [#1289] Don't think this should ever be a isTransactionAbortedError
+          assertTrue(ex.getMessage(), isYBTransactionError(ex));
+        }
+        TransactionState txnState1BeforeCommit = getPgTxnState(conn1);
+        TransactionState txnState2BeforeCommit = getPgTxnState(conn2);
+
+        boolean committed1 = commitAndCatchException(conn1, "first connection");
+        TransactionState txnState1AfterCommit = getPgTxnState(conn1);
+
+        boolean committed2 = commitAndCatchException(conn2, "second connection");
+        TransactionState txnState2AfterCommit = getPgTxnState(conn2);
+
+        LOG.info("i=" + i +
+            " executed2=" + executed2 +
+            " committed1=" + committed1 +
+            " committed2=" + committed2 +
+            " txnState1BeforeCommit=" + txnState1BeforeCommit +
+            " txnState2BeforeCommit=" + txnState2BeforeCommit +
+            " txnState1AfterCommit=" + txnState1AfterCommit +
+            " txnState2AfterCommit=" + txnState2AfterCommit +
+            " numFirstWinners=" + numFirstWinners +
+            " numSecondWinners=" + numSecondWinners);
+
+        // Whether or not a transaction commits successfully, its state is changed to IDLE after the
+        // commit attempt.
+        assertEquals(TransactionState.IDLE, txnState1AfterCommit);
+        assertEquals(TransactionState.IDLE, txnState2AfterCommit);
+
+        if (!committed1 && !committed2) {
+          // TODO: if this happens, look at why two transactions could fail at the same time.
+          throw new AssertionError("Did not expect both transactions to fail!");
+        }
+
+        if (executed2) {
+          assertFalse(committed1);
+          assertTrue(committed2);
+          assertEquals(TransactionState.OPEN, txnState1BeforeCommit);
+          assertEquals(TransactionState.OPEN, txnState2BeforeCommit);
+          numSecondWinners++;
+        } else {
+          assertTrue(committed1);
+          // It looks like in case we get an error on an operation on the second connection, the
+          // commit on that connection succeeds. This makes sense in a way since the client already
+          // knows that the second transaction failed from the original operation failure. BTW the
+          // second transaction is already in a FAILED state before we successfully "commit" it:
+          //
+          // executed2=false
+          // committed1=true
+          // committed2=true
+          // txnState1BeforeCommit=OPEN
+          // txnState2BeforeCommit=FAILED
+          // txnState1AfterCommit=IDLE
+          // txnState2AfterCommit=IDLE
+          //
+          // TODO: verify if this is consistent with vanilla PostgreSQL behavior.
+          // assertFalse(committed2);
+          assertEquals(TransactionState.OPEN, txnState1BeforeCommit);
+          assertEquals(TransactionState.FAILED, txnState2BeforeCommit);
+
+          numFirstWinners++;
+        }
       }
-
-      executeWithTimeout(statement1,
-          String.format("INSERT INTO test(h, r, v) VALUES (%d, %d, %d)", i, i, 100 * i));
-      boolean executed2 = false;
-      try {
-        executeWithTimeout(statement2,
-            String.format("INSERT INTO test(h, r, v) VALUES (%d, %d, %d)", i, i, 200 * i));
-        executed2 = true;
-      } catch (PSQLException ex) {
-        // Not reporting a stack trace here on purpose, because this will happen a lot in a test.
-        // [#1289] Don't think this should ever be a isTransactionAbortedError
-        assertTrue(ex.getMessage(), isYBTransactionError(ex));
-      }
-      TransactionState txnState1BeforeCommit = getPgTxnState(connection1);
-      TransactionState txnState2BeforeCommit = getPgTxnState(connection2);
-
-      boolean committed1 = commitAndCatchException(connection1, "first connection");
-      TransactionState txnState1AfterCommit = getPgTxnState(connection1);
-
-      boolean committed2 = commitAndCatchException(connection2, "second connection");
-      TransactionState txnState2AfterCommit = getPgTxnState(connection2);
-
-      LOG.info("i=" + i +
-          " executed2=" + executed2 +
-          " committed1=" + committed1 +
-          " committed2=" + committed2 +
-          " txnState1BeforeCommit=" + txnState1BeforeCommit +
-          " txnState2BeforeCommit=" + txnState2BeforeCommit +
-          " txnState1AfterCommit=" + txnState1AfterCommit +
-          " txnState2AfterCommit=" + txnState2AfterCommit +
-          " numFirstWinners=" + numFirstWinners +
-          " numSecondWinners=" + numSecondWinners);
-
-      // Whether or not a transaction commits successfully, its state is changed to IDLE after the
-      // commit attempt.
-      assertEquals(TransactionState.IDLE, txnState1AfterCommit);
-      assertEquals(TransactionState.IDLE, txnState2AfterCommit);
-
-      if (!committed1 && !committed2) {
-        // TODO: if this happens, look at why two transactions could fail at the same time.
-        throw new AssertionError("Did not expect both transactions to fail!");
-      }
-
-      if (executed2) {
-        assertFalse(committed1);
-        assertTrue(committed2);
-        assertEquals(TransactionState.OPEN, txnState1BeforeCommit);
-        assertEquals(TransactionState.OPEN, txnState2BeforeCommit);
-        numSecondWinners++;
-      } else {
-        assertTrue(committed1);
-        // It looks like in case we get an error on an operation on the second connection, the
-        // commit on that connection succeeds. This makes sense in a way because the client already
-        // knows that the second transaction failed from the original operation failure. BTW the
-        // second transaction is already in a FAILED state before we successfully "commit" it:
-        //
-        // executed2=false
-        // committed1=true
-        // committed2=true
-        // txnState1BeforeCommit=OPEN
-        // txnState2BeforeCommit=FAILED
-        // txnState1AfterCommit=IDLE
-        // txnState2AfterCommit=IDLE
-        //
-        // TODO: verify if this is consistent with vanilla PostgreSQL behavior.
-        // assertFalse(committed2);
-        assertEquals(TransactionState.OPEN, txnState1BeforeCommit);
-        assertEquals(TransactionState.FAILED, txnState2BeforeCommit);
-
-        numFirstWinners++;
-      }
+      LOG.info(String.format(
+          "First txn won in %d cases, second won in %d cases", numFirstWinners, numSecondWinners));
+      checkTransactionFairness(numFirstWinners, numSecondWinners, totalIterations);
     }
-    LOG.info(String.format(
-        "First txn won in %d cases, second won in %d cases", numFirstWinners, numSecondWinners));
-    checkTransactionFairness(numFirstWinners, numSecondWinners, totalIterations);
   }
 
   @Test
@@ -543,10 +581,20 @@ public class TestPgTransactions extends BasePgSQLTest {
     createSimpleTable("test", "v");
     final IsolationLevel isolation = IsolationLevel.REPEATABLE_READ;
     try (
-         Connection connection1 = createConnection(isolation, AutoCommit.ENABLED);
-         Statement statement1 = connection1.createStatement();
-         Connection connection2 = createConnection(isolation, AutoCommit.DISABLED);
-         Statement statement2 = connection2.createStatement()) {
+        Connection connection1 = getConnectionBuilder()
+            .withIsolationLevel(isolation)
+            .withAutoCommit(AutoCommit.ENABLED)
+            .connect();
+        Statement statement1 = connection1.createStatement();
+
+        Connection connection2 = getConnectionBuilder()
+            .withIsolationLevel(isolation)
+            .withAutoCommit(AutoCommit.DISABLED)
+            .connect();
+        Statement statement2 = connection2.createStatement();
+
+        Statement statementQ = connection.createStatement()) {
+
       Set<Row> expectedRows = new HashSet<>();
       String scanQuery = "SELECT * FROM test";
 
@@ -556,7 +604,7 @@ public class TestPgTransactions extends BasePgSQLTest {
       runInvalidQuery(statement1,
                       "INSERT INTO test(h, r, v) VALUES (1, 1, 2)",
                       "Duplicate key");
-      assertRowSet(scanQuery, expectedRows);
+      assertRowSet(statementQ, scanQuery, expectedRows);
 
       // Check second op failure with no-auto-commit (both ops should get aborted).
       statement2.execute("INSERT INTO test(h, r, v) VALUES (1, 2, 1)");
@@ -564,35 +612,31 @@ public class TestPgTransactions extends BasePgSQLTest {
                       "INSERT INTO test(h, r, v) VALUES (1, 1, 2)",
                       "Duplicate key");
       connection2.commit(); // Overkill, transaction should already be aborted, this will be noop.
-      assertRowSet(scanQuery, expectedRows);
+      assertRowSet(statementQ, scanQuery, expectedRows);
 
       // Check failure for one value set -- primary key (1,1) already exists.
       runInvalidQuery(statement1,
                       "INSERT INTO test(h, r, v) VALUES (1, 2, 1), (1, 1, 2)",
                       "Duplicate key");
       // Entire query should get aborted.
-      assertRowSet(scanQuery, expectedRows);
+      assertRowSet(statementQ, scanQuery, expectedRows);
 
       // Check failure for query with WITH clause side-effect -- primary key (1,1) already exists.
       String query = "WITH ret AS (INSERT INTO test(h, r, v) VALUES (2, 2, 2) RETURNING h, r, v) " +
           "INSERT INTO test(h,r,v) SELECT h - 1, r - 1, v FROM ret";
       runInvalidQuery(statement1, query, "Duplicate key");
       // Entire query should get aborted (including the WITH clause INSERT).
-      assertRowSet(scanQuery, expectedRows);
+      assertRowSet(statementQ, scanQuery, expectedRows);
 
       // Check failure within function with side-effect -- primary key (1,1) already exists.
-      // TODO enable this test once functions are enabled in YSQL.
-      if (false) {
-        statement1.execute("CREATE FUNCTION bar(in int) RETURNS int AS $$ " +
-                              "INSERT INTO test(h,r,v) VALUES($1,$1,$1) RETURNING h - 1;$$" +
-                              "LANGUAGE SQL;");
-        runInvalidQuery(statement1,
-                        "INSERT INTO test(h, r, v) VALUES (bar(2), 1, 1)",
-                        "Duplicate key");
-        // Entire query should get aborted (including the function's side-effect).
-        assertRowSet(scanQuery, expectedRows);
-      }
-
+      statement1.execute("CREATE FUNCTION bar(in int) RETURNS int AS $$ " +
+          "INSERT INTO test(h,r,v) VALUES($1,$1,$1) RETURNING h - 1;$$" +
+          "LANGUAGE SQL;");
+      runInvalidQuery(statement1,
+                      "INSERT INTO test(h, r, v) VALUES (bar(2), 1, 1)",
+                      "Duplicate key");
+      // Entire query should get aborted (including the function's side-effect).
+      assertRowSet(statementQ, scanQuery, expectedRows);
     }
 
   }
@@ -696,7 +740,7 @@ public class TestPgTransactions extends BasePgSQLTest {
                              "UPDATE test SET v = 3 WHERE k = 1", 1);
 
     // Verify JDBC single-row prepared statements use non-txn path.
-    long oldTxnValue = getMetricCounter(TRANSACTIONS_METRIC);
+    long oldTxnValue = getMetricCounter(SINGLE_SHARD_TRANSACTIONS_METRIC);
 
     PreparedStatement insertStatement =
       connection.prepareStatement("INSERT INTO test VALUES (?, ?)");
@@ -715,7 +759,185 @@ public class TestPgTransactions extends BasePgSQLTest {
     updateStatement.setInt(2, 1);
     updateStatement.executeUpdate();
 
-    long newTxnValue = getMetricCounter(TRANSACTIONS_METRIC);
+    long newTxnValue = getMetricCounter(SINGLE_SHARD_TRANSACTIONS_METRIC);
     assertEquals(oldTxnValue, newTxnValue);
+  }
+
+  /*
+   * Execute a query and check that either is succeeds or it fails with a transaction (conflict)
+   * error. Returns whether the query succeeded.
+   */
+  private boolean checkTxnExecute(Statement statement, String query) throws SQLException {
+    try {
+      statement.execute(query);
+      return true;
+    } catch (PSQLException e) {
+      assertTrue(e.getMessage(), isYBTransactionError(e));
+    }
+    return false;
+  }
+
+  /*
+   * Run two queries in two different connections for the number of requested iterations and in
+   * varying order of operations. Check that exactly one succeeds each iteration.
+   * Returns the number of successes for query1 (implying the rest are the query2 successes due to
+   * the "exactly one succeeds" check above.
+   */
+  public int checkConflictingStatements(Statement statement1,
+                                        String query1,
+                                        Statement statement2,
+                                        String query2,
+                                        int totalIterations) throws SQLException {
+    int txn1Successes = 0;
+
+    for (int i = 0; i < totalIterations; i++) {
+      // Vary the execution order throughout the runs.
+
+      // Expect begin transaction to always succeed.
+      if (i % 2 == 0) {
+        statement1.execute("BEGIN");
+        statement2.execute("BEGIN");
+      } else {
+        statement2.execute("BEGIN");
+        statement1.execute("BEGIN");
+      }
+
+      boolean txn1_success;
+      boolean txn2_success;
+
+      // Run the queries.
+      if (i % 4 < 2) { // i % 4 = 0,1
+        txn1_success = checkTxnExecute(statement1, query1);
+        txn2_success = checkTxnExecute(statement2, query2);
+      } else { // i % 4 = 2,3
+        txn2_success = checkTxnExecute(statement2, query2);
+        txn1_success = checkTxnExecute(statement1, query1);
+      }
+
+      // End the transaction(s).
+      if (i % 8 < 4) { // i % 8 = 0,1,2,3
+        txn1_success = checkTxnExecute(statement1, "END") && txn1_success;
+        txn2_success = checkTxnExecute(statement2, "END") && txn2_success;
+      } else { // i % 8 = 4,5,6,7
+        txn2_success = checkTxnExecute(statement2, "END") && txn2_success;
+        txn1_success = checkTxnExecute(statement1, "END") && txn1_success;
+      }
+
+      // Check that exactly one txn succeeded.
+      assertTrue(txn1_success ^ txn2_success);
+      if (txn1_success) {
+        txn1Successes += 1;
+      }
+    }
+
+    return txn1Successes;
+  }
+
+  @Test
+  public void testExplicitLocking() throws Exception {
+    Statement statement = connection.createStatement();
+
+    // Set up a simple key-value table.
+    statement.execute("CREATE TABLE test (k int PRIMARY KEY, v int)");
+    statement.execute("INSERT INTO test VALUES (1,1), (2,2), (3,3)");
+
+    // Set up a key-value table with an index on the value.
+    statement.execute("CREATE TABLE idx_test (k int PRIMARY KEY, v int)");
+    statement.execute("CREATE INDEX idx_test_idx on idx_test(v)");
+    statement.execute("INSERT INTO idx_test VALUES (1,1), (2,2), (3,3)");
+
+    // Using a smaller number of iterations when expecting one txn to always win (i.e. explicit
+    // locking vs regular transaction) and a larger number when expecting a coin-toss
+    // (i.e. explicit locking vs explicit locking) to more accurately test for a fair
+    // distribution in the latter case.
+    int numItersSmall = 32;
+    int numItersLarge = 120;
+
+    try (Connection connection1 = getConnectionBuilder().withTServer(0).connect();
+         Connection connection2 = getConnectionBuilder().withTServer(1).connect();
+         Statement statement1 = connection1.createStatement();
+         Statement statement2 = connection2.createStatement()) {
+
+      //--------------------------------------------------------------------------------------------
+      // Test explicit locking on key columns.
+
+      // Check that explicit locking always wins against regular transactions.
+      String selectStmt = "SELECT * FROM test WHERE k = 1 %s";
+      int txn1_successes = checkConflictingStatements(statement1,
+                                                      String.format(selectStmt, "FOR UPDATE"),
+                                                      statement2,
+                                                      "UPDATE test SET v = 10 WHERE k = 1",
+                                                      numItersSmall);
+      assertEquals(numItersSmall, txn1_successes);
+
+      txn1_successes = checkConflictingStatements(statement1,
+                                                  String.format(selectStmt, "FOR NO KEY UPDATE"),
+                                                  statement2,
+                                                  "UPDATE test SET v = 10 WHERE k = 1",
+                                                  numItersSmall);
+      assertEquals(numItersSmall, txn1_successes);
+
+      txn1_successes = checkConflictingStatements(statement1,
+                                                  String.format(selectStmt, "FOR SHARE"),
+                                                  statement2,
+                                                  "UPDATE test SET v = 10 WHERE k = 1",
+                                                  numItersSmall);
+      assertEquals(numItersSmall, txn1_successes);
+
+      // Check that for two explicit-locking statements exactly one succeeds.
+      txn1_successes = checkConflictingStatements(statement1,
+                                                  String.format(selectStmt, "FOR UPDATE"),
+                                                  statement2,
+                                                  String.format(selectStmt, "FOR NO KEY UPDATE"),
+                                                  numItersLarge);
+      checkTransactionFairness(txn1_successes, numItersLarge - txn1_successes, numItersLarge);
+
+      //--------------------------------------------------------------------------------------------
+      // Test explicit locking on value columns (without index).
+
+      // Check that explicit locking always wins against regular transactions.
+      txn1_successes = checkConflictingStatements(statement1,
+                                                  "SELECT * FROM test WHERE v = 1 FOR UPDATE",
+                                                  statement2,
+                                                  "UPDATE test SET v = 10 WHERE k = 2",
+                                                  numItersSmall);
+      assertEquals(numItersSmall, txn1_successes);
+
+      // Check that for two explicit-locking statements exactly one succeeds.
+      txn1_successes = checkConflictingStatements(statement1,
+                                                  "SELECT * FROM test WHERE v = 1 FOR UPDATE",
+                                                  statement2,
+                                                  "SELECT * FROM test WHERE v = 1 FOR SHARE",
+                                                  numItersLarge);
+      checkTransactionFairness(txn1_successes, numItersLarge - txn1_successes, numItersLarge);
+
+      //--------------------------------------------------------------------------------------------
+      // Test explicit locking on index columns.
+
+      // Check that explicit locking always wins against regular transactions.
+      // Update with condition on key column.
+      txn1_successes = checkConflictingStatements(statement1,
+                                                  "SELECT * FROM idx_test WHERE v = 1 FOR UPDATE",
+                                                  statement2,
+                                                  "UPDATE idx_test SET v = 10 WHERE k = 1",
+                                                  numItersSmall);
+      assertEquals(numItersSmall, txn1_successes);
+
+      // Update with condition on value column.
+      txn1_successes = checkConflictingStatements(statement1,
+                                                  "SELECT * FROM idx_test WHERE v = 1 FOR UPDATE",
+                                                  statement2,
+                                                  "UPDATE idx_test SET v = 10 WHERE v = 1",
+                                                  numItersSmall);
+      assertEquals(numItersSmall, txn1_successes);
+
+      // Check that for two explicit-locking statements exactly one succeeds.
+      txn1_successes = checkConflictingStatements(statement1,
+                                                  "SELECT * FROM idx_test WHERE v = 1 FOR UPDATE",
+                                                  statement2,
+                                                  "SELECT * FROM idx_test WHERE v = 1 FOR SHARE",
+                                                  numItersLarge);
+      checkTransactionFairness(txn1_successes, numItersLarge - txn1_successes, numItersLarge);
+    }
   }
 }

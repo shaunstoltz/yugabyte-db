@@ -10,6 +10,7 @@ import com.yugabyte.yw.commissioner.tasks.subtasks.UpdatePlacementInfo.ModifyUni
 import com.yugabyte.yw.common.ApiUtils;
 import com.yugabyte.yw.common.PlacementInfoUtil;
 import com.yugabyte.yw.common.ShellProcessHandler;
+import com.yugabyte.yw.common.ShellResponse;
 import com.yugabyte.yw.forms.UniverseDefinitionTaskParams;
 import com.yugabyte.yw.forms.UniverseDefinitionTaskParams.Cluster;
 import com.yugabyte.yw.forms.UniverseDefinitionTaskParams.ClusterType;
@@ -46,7 +47,7 @@ public class ReadOnlyClusterDeleteTest extends CommissionerBaseTest {
   @InjectMocks
   Commissioner commissioner;
   Universe defaultUniverse;
-  ShellProcessHandler.ShellResponse dummyShellResponse;
+  ShellResponse dummyShellResponse;
   YBClient mockClient;
   ModifyUniverseConfig modifyUC;
   AbstractModifyMasterClusterConfig amuc;
@@ -84,19 +85,15 @@ public class ReadOnlyClusterDeleteTest extends CommissionerBaseTest {
     mockClient = mock(YBClient.class);
     when(mockYBClient.getClient(any(), any())).thenReturn(mockClient);
     when(mockClient.waitForServer(any(), anyLong())).thenReturn(true);
-    dummyShellResponse = new ShellProcessHandler.ShellResponse();
+    dummyShellResponse = new ShellResponse();
     dummyShellResponse.message = "true";
     when(mockNodeManager.nodeCommand(any(), any())).thenReturn(dummyShellResponse);
     modifyUC = mock(ModifyUniverseConfig.class);
     amuc = mock(AbstractModifyMasterClusterConfig.class);
     try {
-      doNothing().when(modifyUC).doCall();
-      when(modifyUC.modifyConfig(any())).thenReturn(null);
-      doNothing().when(amuc).doCall();
       GetMasterClusterConfigResponse gcr = new GetMasterClusterConfigResponse(0, "", null, null);
       when(mockClient.getMasterClusterConfig()).thenReturn(gcr);
       ChangeMasterClusterConfigResponse ccr = new ChangeMasterClusterConfigResponse(1111, "", null);
-      when(mockClient.changeMasterClusterConfig(any())).thenReturn(ccr);
     } catch (Exception e) {}
 
     UniverseDefinitionTaskParams taskParams = new UniverseDefinitionTaskParams();

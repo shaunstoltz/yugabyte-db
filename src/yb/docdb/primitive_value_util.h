@@ -30,11 +30,10 @@ CHECKED_STATUS QLKeyColumnValuesToPrimitiveValues(
     const Schema &schema, size_t column_idx, const size_t column_count,
     vector<PrimitiveValue> *components);
 
-CHECKED_STATUS InitKeyColumnPrimitiveValues(
+Result<vector<PrimitiveValue>> InitKeyColumnPrimitiveValues(
     const google::protobuf::RepeatedPtrField<PgsqlExpressionPB> &column_values,
     const Schema &schema,
-    size_t start_idx,
-    vector<PrimitiveValue> *components);
+    size_t start_idx);
 
 }  // namespace docdb
 }  // namespace yb

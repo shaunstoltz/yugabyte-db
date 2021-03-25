@@ -19,7 +19,10 @@
 
 #include "yb/master/ts_descriptor.h"
 #include "yb/master/ts_manager.h"
+#include "yb/master/catalog_entity_info.h"
 #include "yb/util/status.h"
+
+DECLARE_bool(transaction_tables_use_preferred_zones);
 
 // Utility functions that can be shared between test and code for catalog manager.
 namespace yb {
@@ -35,17 +38,37 @@ class CatalogManagerUtil {
 
   // For the given set of descriptors, checks if every tserver that shouldn't have leader load
   // actually has no leader load.
-  static CHECKED_STATUS AreLeadersOnPreferredOnly(const TSDescriptorVector& ts_descs,
-                                                  const ReplicationInfoPB& replication_info);
+  // If transaction_tables_use_preferred_zones = false, then we also check if txn status tablet
+  // leaders are spread evenly based on the information in `tables`.
+  static CHECKED_STATUS AreLeadersOnPreferredOnly(
+      const TSDescriptorVector& ts_descs,
+      const ReplicationInfoPB& replication_info,
+      const vector<scoped_refptr<TableInfo>>& tables = {});
+
+  // Creates a mapping from tserver uuid to the number of transaction leaders present.
+  static void CalculateTxnLeaderMap(std::map<std::string, int>* txn_map,
+                                    int* num_txn_tablets,
+                                    vector<scoped_refptr<TableInfo>> tables);
 
   // For the given set of descriptors, returns the map from each placement AZ to list of tservers
   // running in that zone.
   static CHECKED_STATUS GetPerZoneTSDesc(const TSDescriptorVector& ts_descs,
                                          ZoneToDescMap* zone_to_ts);
 
+  // Checks whether two given cloud infos are identical.
+  static bool IsCloudInfoEqual(const CloudInfoPB& lhs, const CloudInfoPB& rhs);
+
   // For the given placement info, checks whether a given cloud info is contained within it.
   static CHECKED_STATUS DoesPlacementInfoContainCloudInfo(const PlacementInfoPB& placement_info,
                                                           const CloudInfoPB& cloud_info);
+
+  // Called when registering a ts from raft, deduce a tservers placement from the peer's role
+  // and cloud info.
+  static Result<std::string> GetPlacementUuidFromRaftPeer(
+      const ReplicationInfoPB& replication_info, const consensus::RaftPeerPB& peer);
+
+  // Returns error if tablet partition is not covered by running inner tablets partitions.
+  static CHECKED_STATUS CheckIfCanDeleteSingleTablet(const scoped_refptr<TabletInfo>& tablet);
 
  private:
   CatalogManagerUtil();

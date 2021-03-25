@@ -142,7 +142,7 @@ class ServicePoolImpl final : public InboundCallHandler {
           rpcs_in_queue_ = entity->FindOrCreateGauge(
               std::unique_ptr<GaugePrototype<int64_t>>(new OwningGaugePrototype<int64_t>(
                   entity->prototype().name(), std::move(id),
-                  description, MetricUnit::kRequests, description)),
+                  description, MetricUnit::kRequests, description, MetricLevel::kInfo)),
               static_cast<int64>(0) /* initial_value */);
 
           LOG_WITH_PREFIX(INFO) << "yb::rpc::ServicePoolImpl created at " << this;
@@ -284,7 +284,7 @@ class ServicePoolImpl final : public InboundCallHandler {
     CoarseTimePoint last_backpressure_at(last_backpressure_at_.load(std::memory_order_acquire));
 
     // For testing purposes.
-    if (GetAtomicFlag(&FLAGS_enable_backpressure_mode_for_testing)) {
+    if (GetAtomicFlag(&FLAGS_TEST_enable_backpressure_mode_for_testing)) {
       last_backpressure_at = CoarseMonoClock::Now();
     }
 

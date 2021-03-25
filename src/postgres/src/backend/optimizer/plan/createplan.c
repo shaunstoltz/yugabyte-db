@@ -117,9 +117,9 @@ static RecursiveUnion *create_recursiveunion_plan(PlannerInfo *root, RecursiveUn
 static LockRows *create_lockrows_plan(PlannerInfo *root, LockRowsPath *best_path,
 					 int flags);
 static bool yb_single_row_update_or_delete_path(PlannerInfo *root, ModifyTablePath *path,
-												List **result_tlist, List **modify_tlist,
-												bool *no_index_update,
-												bool *no_row_trigger);
+				List **result_tlist, List **modify_tlist,
+				bool *no_row_trigger,
+				List **no_update_index_list);
 static ModifyTable *create_modifytable_plan(PlannerInfo *root, ModifyTablePath *best_path);
 static Limit *create_limit_plan(PlannerInfo *root, LimitPath *best_path,
 				  int flags);
@@ -2388,40 +2388,40 @@ static TargetEntry *make_dummy_tle(AttrNumber attr_num, bool is_null)
 	return dummy_tle;
 }
 
-static bool has_applicable_indexes(Relation relation, CmdType operation, Bitmapset *updated_attrs)
+static bool has_applicable_indices(Relation relation,
+                                   Bitmapset *updated_attrs,
+                                   List **no_update_index_list)
 {
 	if (!relation->rd_rel->relhasindex)
 		return false;
 
+	/* Get the list of all indices (including primary key) that is part of a relation */
 	bool	 has_indices = false;
 	List	 *indexlist = RelationGetIndexList(relation);
 	ListCell *lc = NULL;
-
-	foreach(lc, indexlist)
-	{
-		if (lfirst_oid(lc) == relation->rd_pkindex)
-			continue;
-		has_indices = true;
-		break;
-	}
-	list_free(indexlist);
+	AttrNumber attr_offset = YBGetFirstLowInvalidAttributeNumber(relation);
 
 	/*
-	 * Generally we can return here, but for updates on tables with indexes
-	 * we check if any referenced columns are actually modified (below).
+	 * Here we, iterate through list of all secondary indices and we check if the
+	 * update query had affected these indices. In other words, we check if any
+	 * referenced columns are actually modified (below). We do that by comparing
+	 * the attr bitmap for the specific index with updated_attrs. If it does not
+	 * affect the index, we add it to the no_update_index_list (skip list). This
+	 * is later being used while performing the actual update to filter out
+	 * updating unnecessary indices.
 	 */
-	if (!has_indices || operation != CMD_UPDATE)
+	foreach(lc, indexlist)
 	{
-		return has_indices;
+		Oid			index_oid = lfirst_oid(lc);
+		if (index_oid == relation->rd_pkindex )
+			continue;
+		if (no_update_index_list && !CheckIndexForUpdate(index_oid, updated_attrs, attr_offset))
+			*no_update_index_list = lappend_oid(*no_update_index_list, index_oid);
+		else
+			has_indices = true;
 	}
-
-	/* All columns indexed or included into an index */
-	Bitmapset *indexed_attrs = RelationGetIndexAttrBitmap(relation, INDEX_ATTR_BITMAP_HOT);
-	/* All columns used in an index expression */
-	Bitmapset *indexed_col_proj = RelationGetIndexAttrBitmap(relation, INDEX_ATTR_BITMAP_PROJ);
-
-	/* If update touches any index-referenced columns we need to update the index*/
-	return bms_overlap(updated_attrs, indexed_attrs) || bms_overlap(updated_attrs, indexed_col_proj);
+	list_free(indexlist);
+	return has_indices;
 }
 
 static bool has_applicable_triggers(Relation rel, CmdType operation, Bitmapset *updated_attrs)
@@ -2515,8 +2515,8 @@ yb_single_row_update_or_delete_path(PlannerInfo *root,
 									ModifyTablePath *path,
 									List **result_tlist,
 									List **modify_tlist,
-									bool *no_index_update,
-									bool *no_row_trigger)
+									bool *no_row_trigger,
+									List **no_update_index_list)
 {
 	RelOptInfo *relInfo;
 	Oid relid;
@@ -2617,6 +2617,8 @@ yb_single_row_update_or_delete_path(PlannerInfo *root,
 		 */
 		index_path = (IndexPath *) projection_path->subpath;
 
+		Bitmapset *primary_key_attrs = YBGetTablePrimaryKeyBms(relation);
+
 		/*
 		 * Iterate through projection_path tlist, identify true user write columns from unspecified
 		 * columns. If true user write expression is not a supported single row write expression
@@ -2653,9 +2655,18 @@ yb_single_row_update_or_delete_path(PlannerInfo *root,
 				return false;
 			}
 
+			/* Updates involving primary key columns are not single-row. */
+			if (bms_is_member(tle->resno - attr_offset, primary_key_attrs))
+			{
+				RelationClose(relation);
+				return false;
+			}
+
+
 			if (needs_pushdown)
 			{
-				pushdown_update_attrs = bms_add_member(pushdown_update_attrs, tle->resno);
+				pushdown_update_attrs = bms_add_member(
+				    pushdown_update_attrs, tle->resno - attr_offset);
 			}
 
 			subpath_tlist = lappend(subpath_tlist, tle);
@@ -2679,20 +2690,16 @@ yb_single_row_update_or_delete_path(PlannerInfo *root,
 	 * need to retrieve the row to get the old secondary index values to
 	 * update/delete from the index, requiring the scan.
 	 */
-	*no_index_update = !has_applicable_indexes(relation, path->operation, update_attrs);
-	if (!*no_index_update)
+	if (has_applicable_indices(relation, update_attrs, no_update_index_list))
 	{
 		RelationClose(relation);
 		return false;
 	}
 
-	/* Close the relation now in case we return early. */
-	RelationClose(relation);
-	relation = NULL;
-
 	/* Ensure the subpath is an index path. */
 	if (!IsA(index_path, IndexPath))
 	{
+		RelationClose(relation);
 		return false;
 	}
 
@@ -2703,6 +2710,7 @@ yb_single_row_update_or_delete_path(PlannerInfo *root,
 
 		if (!list_member_ptr(index_path->indexquals, rinfo))
 		{
+			RelationClose(relation);
 			return false;
 		}
 	}
@@ -2720,17 +2728,24 @@ yb_single_row_update_or_delete_path(PlannerInfo *root,
 		int			op_strategy;
 
 		if (!IsA(clause, OpExpr))
+		{
+			RelationClose(relation);
 			return false;
+		}
 
 		clause_op = qinfo->clause_op;
 		if (!OidIsValid(clause_op))
+		{
+			RelationClose(relation);
 			return false;
+		}
 
 		op_strategy = get_op_opfamily_strategy(clause_op, index_path->indexinfo->opfamily[qinfo->indexcol]);
 		Assert(op_strategy != 0);  /* not a member of opfamily?? */
 		/* Only pushdown equal operators. */
 		if (op_strategy != BTEqualStrategyNumber)
 		{
+			RelationClose(relation);
 			return false;
 		}
 	}
@@ -2755,7 +2770,10 @@ yb_single_row_update_or_delete_path(PlannerInfo *root,
 
 		/* Make sure we're an operator expression. */
 		if (!IsA(clause, OpExpr))
+		{
+			RelationClose(relation);
 			return false;
+		}
 
 		expr = (Expr *) get_rightop(clause);
 		var = castNode(Var, get_leftop(clause));
@@ -2763,6 +2781,7 @@ yb_single_row_update_or_delete_path(PlannerInfo *root,
 		/* Verify expression is supported. */
 		if (!YBCIsSupportedSingleRowModifyWhereExpr(expr))
 		{
+			RelationClose(relation);
 			return false;
 		}
 
@@ -2788,28 +2807,35 @@ yb_single_row_update_or_delete_path(PlannerInfo *root,
 		tle->resno = var->varoattno;
 		tle->resorigcol = 0;
 		indexquals[tle->resno - 1] = tle;
-		primary_key_attrs = bms_add_member(primary_key_attrs, tle->resno);
+		primary_key_attrs = bms_add_member(primary_key_attrs, tle->resno - attr_offset);
 	}
 
-	/* Verify RETURNING columns are either primary key columns or UPDATE's SET columns. */
+	/*
+	 * Verify RETURNING columns are either primary key or
+	 * UPDATE's SET and not pushed down columns.
+	 * TODO(dmitry): Remove restriction for pushed down columns on #5392 completion.
+	 */
 	if (list_length(path->returningLists) > 0)
 	{
 		foreach(values, linitial(path->returningLists))
 		{
-			TargetEntry *tle;
-
-			tle = lfirst_node(TargetEntry, values);
-			if (!bms_is_member(tle->resorigcol - attr_offset, update_attrs) &&
-				!bms_is_member(tle->resorigcol, primary_key_attrs))
+			int attr = lfirst_node(TargetEntry, values)->resorigcol - attr_offset;
+			if ((!bms_is_member(attr, update_attrs) &&
+				!bms_is_member(attr, primary_key_attrs)) ||
+				bms_is_member(attr, pushdown_update_attrs))
+			{
+				RelationClose(relation);
 				return false;
+			}
 		}
 	}
 
 	/*
 	 * Verify all YB primary keys are specified in the WHERE clause.
 	 */
-	if (!YBCAllPrimaryKeysProvided(relid, primary_key_attrs))
+	if (!YBCAllPrimaryKeysProvided(relation, primary_key_attrs))
 	{
+		RelationClose(relation);
 		return false;
 	}
 
@@ -2844,7 +2870,7 @@ yb_single_row_update_or_delete_path(PlannerInfo *root,
 		}
 		else if (subpath_tlist_values && subpath_tlist_tle->resno == attr_num)
 		{
-			if (bms_is_member(subpath_tlist_tle->resno, pushdown_update_attrs))
+			if (bms_is_member(subpath_tlist_tle->resno  - attr_offset, pushdown_update_attrs))
 			{
 				/*
 				 * If the expr needs pushdown bypass query-layer evaluation.
@@ -2878,6 +2904,7 @@ yb_single_row_update_or_delete_path(PlannerInfo *root,
 		}
 	}
 
+	RelationClose(relation);
 	return true;
 }
 
@@ -2897,8 +2924,8 @@ create_modifytable_plan(PlannerInfo *root, ModifyTablePath *best_path)
 
 	List        *result_tlist = NIL;
 	List        *modify_tlist = NIL;
-	bool        no_index_update = false;
 	bool        no_row_trigger = false;
+	List        *no_update_index_list = NIL;
 
 	/*
 	 * If we are a single row UPDATE/DELETE in a YB relation, add Result subplan
@@ -2907,8 +2934,9 @@ create_modifytable_plan(PlannerInfo *root, ModifyTablePath *best_path)
 	 * separately executed operation.
 	 */
 	if (yb_single_row_update_or_delete_path(root, best_path, &result_tlist,
-	                                        &modify_tlist, &no_index_update,
-	                                        &no_row_trigger))
+	                                        &modify_tlist, &no_row_trigger,
+	                                        best_path->operation == CMD_UPDATE ?
+	                                        &no_update_index_list : NULL))
 	{
 		Plan *subplan = (Plan *) make_result(result_tlist, NULL, NULL);
 		copy_generic_path_info(subplan, linitial(best_path->subpaths));
@@ -2961,7 +2989,7 @@ create_modifytable_plan(PlannerInfo *root, ModifyTablePath *best_path)
 							best_path->epqParam);
 
 	plan->ybPushdownTlist = modify_tlist;
-	plan->no_index_update = no_index_update;
+	plan->no_update_index_list = no_update_index_list;
 	plan->no_row_trigger = no_row_trigger;
 
 	copy_generic_path_info(&plan->plan, &best_path->path);
@@ -7030,7 +7058,7 @@ make_modifytable(PlannerInfo *root,
 
 	/* These are set separately only if needed. */
 	node->ybPushdownTlist = NULL;
-	node->no_index_update = false;
+	node->no_update_index_list = NULL;
 	node->no_row_trigger = false;
 	return node;
 }

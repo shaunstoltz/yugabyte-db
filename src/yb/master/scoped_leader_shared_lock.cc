@@ -39,6 +39,9 @@
 
 using namespace std::literals;
 
+DEFINE_int32(master_log_lock_warning_ms, 100,
+             "Print warnings if lock is held for longer than this amount of time.");
+
 using yb::consensus::Consensus;
 using yb::consensus::ConsensusStatePB;
 
@@ -51,14 +54,18 @@ ScopedLeaderSharedLock::ScopedLeaderSharedLock(CatalogManager* catalog)
     : catalog_(DCHECK_NOTNULL(catalog)),
       leader_shared_lock_(catalog->leader_lock_, std::try_to_lock),
       start_(std::chrono::steady_clock::now()) {
-
-  // Check if the catalog manager is running.
-  std::lock_guard<simple_spinlock> l(catalog_->state_lock_);
-  if (PREDICT_FALSE(catalog_->state_ != CatalogManager::kRunning)) {
-    catalog_status_ = STATUS_SUBSTITUTE(ServiceUnavailable,
-        "Catalog manager is not initialized. State: $0", catalog_->state_);
-    return;
+  int64_t catalog_leader_ready_term;
+  {
+    // Check if the catalog manager is running.
+    std::lock_guard<simple_spinlock> l(catalog_->state_lock_);
+    if (PREDICT_FALSE(catalog_->state_ != CatalogManager::kRunning)) {
+      catalog_status_ = STATUS_SUBSTITUTE(ServiceUnavailable,
+          "Catalog manager is not initialized. State: $0", catalog_->state_);
+      return;
+    }
+    catalog_leader_ready_term = catalog_->leader_ready_term_;
   }
+
   string uuid = catalog_->master_->fs_manager()->uuid();
   if (PREDICT_FALSE(catalog_->master_->IsShellMode())) {
     // Consensus and other internal fields should not be checked when in shell mode as they may be
@@ -83,21 +90,21 @@ ScopedLeaderSharedLock::ScopedLeaderSharedLock(CatalogManager* catalog)
     leader_status_ = s;
     return;
   }
-  if (PREDICT_FALSE(catalog_->leader_ready_term_ != cstate.current_term())) {
+  if (PREDICT_FALSE(catalog_leader_ready_term != cstate.current_term())) {
     // Normally we use LeaderNotReadyToServe to indicate that the leader has not replicated its
     // NO_OP entry or the previous leader's lease has not expired yet, and the handling logic is to
     // to retry on the same server.
     leader_status_ = STATUS_SUBSTITUTE(LeaderNotReadyToServe,
         "Leader not yet ready to serve requests: "
         "leader_ready_term_ = $0; cstate.current_term = $1",
-        catalog_->leader_ready_term_, cstate.current_term());
+        catalog_leader_ready_term, cstate.current_term());
     return;
   }
   if (PREDICT_FALSE(!leader_shared_lock_.owns_lock())) {
     leader_status_ = STATUS_SUBSTITUTE(ServiceUnavailable,
         "Couldn't get leader_lock_ in shared mode. Leader still loading catalog tables."
         "leader_ready_term_ = $0; cstate.current_term = $1",
-        catalog_->leader_ready_term_, cstate.current_term());
+        catalog_leader_ready_term, cstate.current_term());
     return;
   }
 }
@@ -109,7 +116,8 @@ void ScopedLeaderSharedLock::Unlock() {
       lock.swap(leader_shared_lock_);
     }
     auto finish = std::chrono::steady_clock::now();
-    static const auto kLongLockLimit = RegularBuildVsSanitizers(100ms, 750ms);
+    static const auto kLongLockLimit = RegularBuildVsSanitizers(
+        FLAGS_master_log_lock_warning_ms * 1ms, 750ms);
     if (finish > start_ + kLongLockLimit) {
       LOG(WARNING) << "Long lock of catalog manager: " << yb::ToString(finish - start_) << "\n"
                    << GetStackTrace();

@@ -15,10 +15,7 @@ import static org.hamcrest.CoreMatchers.*;
 import static org.hamcrest.MatcherAssert.assertThat;
 import static org.hamcrest.core.StringContains.containsString;
 import static org.junit.Assert.*;
-import static play.mvc.Http.Status.BAD_REQUEST;
-import static play.mvc.Http.Status.INTERNAL_SERVER_ERROR;
-import static play.mvc.Http.Status.OK;
-import static play.mvc.Http.Status.UNAUTHORIZED;
+import static play.mvc.Http.Status.*;
 import static play.test.Helpers.contentAsString;
 
 public class AssertHelper {
@@ -41,6 +38,16 @@ public class AssertHelper {
     assertErrorResponse(result, errorStr);
   }
 
+  public static void assertForbidden(Result result, String errorStr) {
+    assertEquals(FORBIDDEN, result.status());
+    assertEquals(errorStr, contentAsString(result));
+  }
+
+  public static void assertNotFound(Result result, String errorStr) {
+    assertEquals(NOT_FOUND, result.status());
+    assertErrorResponse(result, errorStr);
+  }
+
   public static void assertErrorResponse(Result result, String errorStr) {
     if (errorStr != null) {
         JsonNode json = Json.parse(contentAsString(result));
@@ -50,6 +57,18 @@ public class AssertHelper {
 
   public static void assertValue(JsonNode json, String key, String value) {
     JsonNode targetNode = json.path(key);
+    assertFalse(targetNode.isMissingNode());
+    if (targetNode.isObject()) {
+      assertEquals(value, targetNode.toString());
+    } else {
+      assertEquals(value, targetNode.asText());
+    }
+  }
+
+  // Allows specifying a JsonPath to the expected node.
+  // For example "/foo/bar" locates node bar within node foo in json.
+  public static void assertValueAtPath(JsonNode json, String key, String value) {
+    JsonNode targetNode = json.at(key);
     assertFalse(targetNode.isMissingNode());
     if (targetNode.isObject()) {
       assertEquals(value, targetNode.toString());

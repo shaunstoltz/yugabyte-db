@@ -5,15 +5,12 @@ package com.yugabyte.yw.commissioner.tasks;
 import com.fasterxml.jackson.databind.JsonNode;
 import com.google.common.collect.ImmutableList;
 import com.google.common.collect.ImmutableMap;
-import com.google.common.net.HostAndPort;
 import com.yugabyte.yw.commissioner.Commissioner;
 import com.yugabyte.yw.commissioner.tasks.UpgradeUniverse;
 import com.yugabyte.yw.commissioner.tasks.UpgradeUniverse.UpgradeTaskType;
 import com.yugabyte.yw.common.ApiUtils;
 import com.yugabyte.yw.common.RegexMatcher;
-import com.yugabyte.yw.common.ShellProcessHandler;
-import com.yugabyte.yw.common.ShellProcessHandler.ShellResponse;
-import com.yugabyte.yw.forms.UniverseDefinitionTaskParams;
+import com.yugabyte.yw.common.ShellResponse;
 import com.yugabyte.yw.forms.UniverseDefinitionTaskParams.UserIntent;
 import com.yugabyte.yw.models.AvailabilityZone;
 import com.yugabyte.yw.models.InstanceType;
@@ -29,6 +26,8 @@ import org.mockito.runners.MockitoJUnitRunner;
 import org.yb.Common;
 import org.yb.client.IsServerReadyResponse;
 import org.yb.client.YBClient;
+import org.yb.client.GetMasterClusterConfigResponse;
+import org.yb.master.Master;
 import play.libs.Json;
 
 import java.util.HashMap;
@@ -44,20 +43,17 @@ import static com.yugabyte.yw.commissioner.tasks.subtasks.KubernetesWaitForPod.C
 import static com.yugabyte.yw.common.ApiUtils.getTestUserIntent;
 import static com.yugabyte.yw.common.AssertHelper.assertJsonEqual;
 import static com.yugabyte.yw.common.ModelFactory.createUniverse;
-import static com.yugabyte.yw.models.TaskInfo.State.Failure;
 import static com.yugabyte.yw.models.TaskInfo.State.Success;
 
 import static org.junit.Assert.*;
 import static org.mockito.Matchers.any;
+import static org.mockito.Matchers.eq;
 import static org.mockito.Matchers.anyBoolean;
-import static org.mockito.Matchers.anyInt;
 import static org.mockito.Matchers.anyLong;
-import static org.mockito.Mockito.doNothing;
 import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.times;
 import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.when;
-
 
 @RunWith(MockitoJUnitRunner.class)
 public class UpgradeKubernetesUniverseTest extends CommissionerBaseTest {
@@ -90,23 +86,31 @@ public class UpgradeKubernetesUniverseTest extends CommissionerBaseTest {
     Universe.saveDetails(defaultUniverse.universeUUID,
         ApiUtils.mockUniverseUpdater(userIntent, nodePrefix, setMasters /* setMasters */));
     defaultUniverse = Universe.get(defaultUniverse.universeUUID);
+    defaultUniverse.setConfig(ImmutableMap.of(Universe.HELM2_LEGACY,
+                                              Universe.HelmLegacy.V3.toString()));
 
     ShellResponse responseEmpty = new ShellResponse();
     ShellResponse responsePod = new ShellResponse();
-    when(mockKubernetesManager.helmUpgrade(any(), any(), any())).thenReturn(responseEmpty);
-    
-    responsePod.message = 
+    when(mockKubernetesManager.helmUpgrade(any(), any(), any(), any())).thenReturn(responseEmpty);
+
+    Master.SysClusterConfigEntryPB.Builder configBuilder =
+      Master.SysClusterConfigEntryPB.newBuilder().setVersion(2);
+    GetMasterClusterConfigResponse mockConfigResponse =
+      new GetMasterClusterConfigResponse(1111, "", configBuilder.build(), null);
+
+    responsePod.message =
         "{\"status\": { \"phase\": \"Running\", \"conditions\": [{\"status\": \"True\"}]}}";
     when(mockKubernetesManager.getPodStatus(any(), any(), any())).thenReturn(responsePod);
 
     mockClient = mock(YBClient.class);
-    when(mockYBClient.getClient(any(), any())).thenReturn(mockClient);
-    when(mockClient.waitForServer(any(), anyInt())).thenReturn(true);
-
+    when(mockClient.waitForServer(any(), anyLong())).thenReturn(true);
     IsServerReadyResponse okReadyResp = new IsServerReadyResponse(0, "", null, 0, 0);
     try {
-      when(mockClient.isServerReady(any(HostAndPort.class), anyBoolean())).thenReturn(okReadyResp);
+      when(mockClient.getMasterClusterConfig()).thenReturn(mockConfigResponse);
+      when(mockClient.isServerReady(any(), anyBoolean())).thenReturn(okReadyResp);
     } catch (Exception ex) {}
+    when(mockYBClient.getClient(any(), any())).thenReturn(mockClient);
+
   }
 
   private void setupUniverseSingleAZ(boolean setMasters) {
@@ -119,53 +123,76 @@ public class UpgradeKubernetesUniverseTest extends CommissionerBaseTest {
     ShellResponse responsePods = new ShellResponse();
     responsePods.message =
         "{\"items\": [{\"status\": {\"startTime\": \"1234\", \"phase\": \"Running\", " +
-            "\"podIP\": \"1.2.3.1\"}, \"spec\": {\"hostname\": \"yb-master-0\"}}," +
+            "\"podIP\": \"1.2.3.1\"}, \"spec\": {\"hostname\": \"yb-master-0\"}," +
+            " \"metadata\": {\"namespace\": \"" + nodePrefix + "\"}}," +
             "{\"status\": {\"startTime\": \"1234\", \"phase\": \"Running\", " +
-            "\"podIP\": \"1.2.3.2\"}, \"spec\": {\"hostname\": \"yb-tserver-0\"}}," +
+            "\"podIP\": \"1.2.3.2\"}, \"spec\": {\"hostname\": \"yb-tserver-0\"}," +
+            " \"metadata\": {\"namespace\": \"" + nodePrefix + "\"}}," +
             "{\"status\": {\"startTime\": \"1234\", \"phase\": \"Running\", " +
-            "\"podIP\": \"1.2.3.3\"}, \"spec\": {\"hostname\": \"yb-master-1\"}}," +
+            "\"podIP\": \"1.2.3.3\"}, \"spec\": {\"hostname\": \"yb-master-1\"}," +
+            " \"metadata\": {\"namespace\": \"" + nodePrefix + "\"}}," +
             "{\"status\": {\"startTime\": \"1234\", \"phase\": \"Running\", " +
-            "\"podIP\": \"1.2.3.4\"}, \"spec\": {\"hostname\": \"yb-tserver-1\"}}," +
+            "\"podIP\": \"1.2.3.4\"}, \"spec\": {\"hostname\": \"yb-tserver-1\"}," +
+            " \"metadata\": {\"namespace\": \"" + nodePrefix + "\"}}," +
             "{\"status\": {\"startTime\": \"1234\", \"phase\": \"Running\", " +
-            "\"podIP\": \"1.2.3.5\"}, \"spec\": {\"hostname\": \"yb-master-2\"}}," +
+            "\"podIP\": \"1.2.3.5\"}, \"spec\": {\"hostname\": \"yb-master-2\"}," +
+            " \"metadata\": {\"namespace\": \"" + nodePrefix + "\"}}," +
             "{\"status\": {\"startTime\": \"1234\", \"phase\": \"Running\", " +
-            "\"podIP\": \"1.2.3.6\"}, \"spec\": {\"hostname\": \"yb-tserver-2\"}}]}";
-    when(mockKubernetesManager.getPodInfos(any(), any())).thenReturn(responsePods);
+            "\"podIP\": \"1.2.3.6\"}, \"spec\": {\"hostname\": \"yb-tserver-2\"}," +
+            " \"metadata\": {\"namespace\": \"" + nodePrefix + "\"}}]}";
+    when(mockKubernetesManager.getPodInfos(any(), any(), any())).thenReturn(responsePods);
   }
 
   private void setupUniverseMultiAZ(boolean setMasters) {
     Region r = Region.create(defaultProvider, "region-1", "PlacementRegion-1", "default-image");
-    AvailabilityZone.create(r, "az-1", "PlacementAZ-1", "subnet-1");
-    AvailabilityZone.create(r, "az-2", "PlacementAZ-2", "subnet-2");
-    AvailabilityZone.create(r, "az-3", "PlacementAZ-3", "subnet-3");
+    AvailabilityZone az1 = AvailabilityZone.create(r, "az-1", "PlacementAZ-1", "subnet-1");
+    AvailabilityZone az2 = AvailabilityZone.create(r, "az-2", "PlacementAZ-2", "subnet-2");
+    AvailabilityZone az3 = AvailabilityZone.create(r, "az-3", "PlacementAZ-3", "subnet-3");
     InstanceType i = InstanceType.upsert(defaultProvider.code, "c3.xlarge",
         10, 5.5, new InstanceType.InstanceTypeDetails());
     UserIntent userIntent = getTestUserIntent(r, defaultProvider, i, 3);
     setupUniverse(setMasters, userIntent);
-    ShellResponse responsePods = new ShellResponse();
-    responsePods.message =
+
+    String nodePrefix1 = String.format("%s-%s", nodePrefix, az1.code);
+    String nodePrefix2 = String.format("%s-%s", nodePrefix, az2.code);
+    String nodePrefix3 = String.format("%s-%s", nodePrefix, az3.code);
+
+    String podInfosMessage =
         "{\"items\": [{\"status\": {\"startTime\": \"1234\", \"phase\": \"Running\", " +
-            "\"podIP\": \"1.2.3.1\"}, \"spec\": {\"hostname\": \"yb-master-0\"}}," +
+            "\"podIP\": \"1.2.3.1\"}, \"spec\": {\"hostname\": \"yb-master-0\"}," +
+            " \"metadata\": {\"namespace\": \"%1$s\"}}," +
             "{\"status\": {\"startTime\": \"1234\", \"phase\": \"Running\", " +
-            "\"podIP\": \"1.2.3.2\"}, \"spec\": {\"hostname\": \"yb-tserver-0\"}}]}";
-    when(mockKubernetesManager.getPodInfos(any(), any())).thenReturn(responsePods);
+            "\"podIP\": \"1.2.3.2\"}, \"spec\": {\"hostname\": \"yb-tserver-0\"}," +
+            " \"metadata\": {\"namespace\": \"%1$s\"}}]}";
+    ShellResponse shellResponse1 =
+        ShellResponse.create(0, String.format(podInfosMessage, nodePrefix1));
+    when(mockKubernetesManager.getPodInfos(any(), eq(nodePrefix1), eq(nodePrefix1)))
+      .thenReturn(shellResponse1);
+    ShellResponse shellResponse2 =
+        ShellResponse.create(0, String.format(podInfosMessage, nodePrefix2));
+    when(mockKubernetesManager.getPodInfos(any(), eq(nodePrefix2), eq(nodePrefix2)))
+      .thenReturn(shellResponse2);
+    ShellResponse shellResponse3 =
+        ShellResponse.create(0, String.format(podInfosMessage, nodePrefix3));
+    when(mockKubernetesManager.getPodInfos(any(), eq(nodePrefix3), eq(nodePrefix3)))
+      .thenReturn(shellResponse3);
   }
 
   List<TaskType> KUBERNETES_UPGRADE_SOFTWARE_TASKS = ImmutableList.of(
       TaskType.KubernetesCommandExecutor,
+      TaskType.KubernetesCommandExecutor,
+      TaskType.KubernetesWaitForPod,
+      TaskType.WaitForServer,
+      TaskType.WaitForServerReady,
+      TaskType.KubernetesCommandExecutor,
+      TaskType.KubernetesWaitForPod,
+      TaskType.WaitForServer,
+      TaskType.WaitForServerReady,
+      TaskType.KubernetesCommandExecutor,
+      TaskType.KubernetesWaitForPod,
+      TaskType.WaitForServer,
+      TaskType.WaitForServerReady,
       TaskType.LoadBalancerStateChange,
-      TaskType.KubernetesCommandExecutor,
-      TaskType.KubernetesWaitForPod,
-      TaskType.WaitForServer,
-      TaskType.WaitForServerReady,
-      TaskType.KubernetesCommandExecutor,
-      TaskType.KubernetesWaitForPod,
-      TaskType.WaitForServer,
-      TaskType.WaitForServerReady,
-      TaskType.KubernetesCommandExecutor,
-      TaskType.KubernetesWaitForPod,
-      TaskType.WaitForServer,
-      TaskType.WaitForServerReady,
       TaskType.KubernetesCommandExecutor,
       TaskType.KubernetesWaitForPod,
       TaskType.WaitForServer,
@@ -185,7 +212,6 @@ public class UpgradeKubernetesUniverseTest extends CommissionerBaseTest {
 
   List<JsonNode> KUBERNETES_UPGRADE_SOFTWARE_RESULTS = ImmutableList.of(
       Json.toJson(ImmutableMap.of("commandType", POD_INFO.name())),
-      Json.toJson(ImmutableMap.of()),
       Json.toJson(ImmutableMap.of("commandType", HELM_UPGRADE.name(),
                                   "ybSoftwareVersion", "new-version")),
       Json.toJson(ImmutableMap.of("commandType", WAIT_FOR_POD.name())),
@@ -199,6 +225,7 @@ public class UpgradeKubernetesUniverseTest extends CommissionerBaseTest {
       Json.toJson(ImmutableMap.of("commandType", HELM_UPGRADE.name(),
                                   "ybSoftwareVersion", "new-version")),
       Json.toJson(ImmutableMap.of("commandType", WAIT_FOR_POD.name())),
+      Json.toJson(ImmutableMap.of()),
       Json.toJson(ImmutableMap.of()),
       Json.toJson(ImmutableMap.of()),
       Json.toJson(ImmutableMap.of("commandType", HELM_UPGRADE.name(),
@@ -224,19 +251,19 @@ public class UpgradeKubernetesUniverseTest extends CommissionerBaseTest {
   List<TaskType> KUBERNETES_UPGRADE_GFLAG_TASKS = ImmutableList.of(
       TaskType.UpdateAndPersistGFlags,
       TaskType.KubernetesCommandExecutor,
+      TaskType.KubernetesCommandExecutor,
+      TaskType.KubernetesWaitForPod,
+      TaskType.WaitForServer,
+      TaskType.WaitForServerReady,
+      TaskType.KubernetesCommandExecutor,
+      TaskType.KubernetesWaitForPod,
+      TaskType.WaitForServer,
+      TaskType.WaitForServerReady,
+      TaskType.KubernetesCommandExecutor,
+      TaskType.KubernetesWaitForPod,
+      TaskType.WaitForServer,
+      TaskType.WaitForServerReady,
       TaskType.LoadBalancerStateChange,
-      TaskType.KubernetesCommandExecutor,
-      TaskType.KubernetesWaitForPod,
-      TaskType.WaitForServer,
-      TaskType.WaitForServerReady,
-      TaskType.KubernetesCommandExecutor,
-      TaskType.KubernetesWaitForPod,
-      TaskType.WaitForServer,
-      TaskType.WaitForServerReady,
-      TaskType.KubernetesCommandExecutor,
-      TaskType.KubernetesWaitForPod,
-      TaskType.WaitForServer,
-      TaskType.WaitForServerReady,
       TaskType.KubernetesCommandExecutor,
       TaskType.KubernetesWaitForPod,
       TaskType.WaitForServer,
@@ -257,7 +284,6 @@ public class UpgradeKubernetesUniverseTest extends CommissionerBaseTest {
       Json.toJson(ImmutableMap.of("masterGFlags", Json.parse("{\"master-flag\":\"m1\"}"),
                                   "tserverGFlags", Json.parse("{\"tserver-flag\":\"t1\"}"))),
       Json.toJson(ImmutableMap.of("commandType", POD_INFO.name())),
-      Json.toJson(ImmutableMap.of()),
       Json.toJson(ImmutableMap.of("commandType", HELM_UPGRADE.name())),
       Json.toJson(ImmutableMap.of("commandType", WAIT_FOR_POD.name())),
       Json.toJson(ImmutableMap.of()),
@@ -268,6 +294,7 @@ public class UpgradeKubernetesUniverseTest extends CommissionerBaseTest {
       Json.toJson(ImmutableMap.of()),
       Json.toJson(ImmutableMap.of("commandType", HELM_UPGRADE.name())),
       Json.toJson(ImmutableMap.of("commandType", WAIT_FOR_POD.name())),
+      Json.toJson(ImmutableMap.of()),
       Json.toJson(ImmutableMap.of()),
       Json.toJson(ImmutableMap.of()),
       Json.toJson(ImmutableMap.of("commandType", HELM_UPGRADE.name())),
@@ -331,6 +358,7 @@ public class UpgradeKubernetesUniverseTest extends CommissionerBaseTest {
 
     ArgumentCaptor<UUID> expectedUniverseUUID = ArgumentCaptor.forClass(UUID.class);
     ArgumentCaptor<String> expectedNodePrefix = ArgumentCaptor.forClass(String.class);
+    ArgumentCaptor<String> expectedNamespace = ArgumentCaptor.forClass(String.class);
     ArgumentCaptor<String> expectedOverrideFile = ArgumentCaptor.forClass(String.class);
     ArgumentCaptor<String> expectedPodName = ArgumentCaptor.forClass(String.class);
     ArgumentCaptor<HashMap> expectedConfig = ArgumentCaptor.forClass(HashMap.class);
@@ -342,13 +370,15 @@ public class UpgradeKubernetesUniverseTest extends CommissionerBaseTest {
     TaskInfo taskInfo = submitTask(taskParams, UpgradeTaskType.Software);
 
     verify(mockKubernetesManager, times(6)).helmUpgrade(expectedConfig.capture(),
-        expectedNodePrefix.capture(), expectedOverrideFile.capture());
+        expectedNodePrefix.capture(), expectedNamespace.capture(), expectedOverrideFile.capture());
     verify(mockKubernetesManager, times(6)).getPodStatus(expectedConfig.capture(),
         expectedNodePrefix.capture(), expectedPodName.capture());
-    verify(mockKubernetesManager, times(1)).getPodInfos(expectedConfig.capture(), expectedNodePrefix.capture());
+    verify(mockKubernetesManager, times(1)).getPodInfos(expectedConfig.capture(),
+        expectedNodePrefix.capture(), expectedNamespace.capture());
 
     assertEquals(config, expectedConfig.getValue());
     assertEquals(nodePrefix, expectedNodePrefix.getValue());
+    assertEquals(nodePrefix, expectedNamespace.getValue());
     assertThat(expectedOverrideFile.getValue(), RegexMatcher.matchesRegex(overrideFileRegex));
 
     List<TaskInfo> subTasks = taskInfo.getSubTasks();
@@ -364,25 +394,28 @@ public class UpgradeKubernetesUniverseTest extends CommissionerBaseTest {
 
     ArgumentCaptor<UUID> expectedUniverseUUID = ArgumentCaptor.forClass(UUID.class);
     ArgumentCaptor<String> expectedNodePrefix = ArgumentCaptor.forClass(String.class);
+    ArgumentCaptor<String> expectedNamespace = ArgumentCaptor.forClass(String.class);
     ArgumentCaptor<String> expectedOverrideFile = ArgumentCaptor.forClass(String.class);
     ArgumentCaptor<String> expectedPodName = ArgumentCaptor.forClass(String.class);
     ArgumentCaptor<HashMap> expectedConfig = ArgumentCaptor.forClass(HashMap.class);
-    
+
     String overrideFileRegex = "(.*)" + defaultUniverse.universeUUID + "(.*).yml";
-    
+
     UpgradeKubernetesUniverse.Params taskParams = new UpgradeKubernetesUniverse.Params();
     taskParams.masterGFlags = ImmutableMap.of("master-flag", "m1");
     taskParams.tserverGFlags = ImmutableMap.of("tserver-flag", "t1");
     TaskInfo taskInfo = submitTask(taskParams, UpgradeTaskType.GFlags);
-    
+
     verify(mockKubernetesManager, times(6)).helmUpgrade(expectedConfig.capture(),
-        expectedNodePrefix.capture(), expectedOverrideFile.capture());
+        expectedNodePrefix.capture(), expectedNamespace.capture(), expectedOverrideFile.capture());
     verify(mockKubernetesManager, times(6)).getPodStatus(expectedConfig.capture(),
         expectedNodePrefix.capture(), expectedPodName.capture());
-    verify(mockKubernetesManager, times(1)).getPodInfos(expectedConfig.capture(), expectedNodePrefix.capture());
+    verify(mockKubernetesManager, times(1)).getPodInfos(expectedConfig.capture(),
+        expectedNodePrefix.capture(), expectedNamespace.capture());
 
     assertEquals(config, expectedConfig.getValue());
     assertEquals(nodePrefix, expectedNodePrefix.getValue());
+    assertEquals(nodePrefix, expectedNamespace.getValue());
     assertThat(expectedOverrideFile.getValue(), RegexMatcher.matchesRegex(overrideFileRegex));
 
     List<TaskInfo> subTasks = taskInfo.getSubTasks();
@@ -398,6 +431,7 @@ public class UpgradeKubernetesUniverseTest extends CommissionerBaseTest {
 
     ArgumentCaptor<UUID> expectedUniverseUUID = ArgumentCaptor.forClass(UUID.class);
     ArgumentCaptor<String> expectedNodePrefix = ArgumentCaptor.forClass(String.class);
+    ArgumentCaptor<String> expectedNamespace = ArgumentCaptor.forClass(String.class);
     ArgumentCaptor<String> expectedOverrideFile = ArgumentCaptor.forClass(String.class);
     ArgumentCaptor<String> expectedPodName = ArgumentCaptor.forClass(String.class);
     ArgumentCaptor<HashMap> expectedConfig = ArgumentCaptor.forClass(HashMap.class);
@@ -409,13 +443,15 @@ public class UpgradeKubernetesUniverseTest extends CommissionerBaseTest {
     TaskInfo taskInfo = submitTask(taskParams, UpgradeTaskType.Software);
 
     verify(mockKubernetesManager, times(6)).helmUpgrade(expectedConfig.capture(),
-        expectedNodePrefix.capture(), expectedOverrideFile.capture());
+        expectedNodePrefix.capture(), expectedNamespace.capture(), expectedOverrideFile.capture());
     verify(mockKubernetesManager, times(6)).getPodStatus(expectedConfig.capture(),
         expectedNodePrefix.capture(), expectedPodName.capture());
-    verify(mockKubernetesManager, times(3)).getPodInfos(expectedConfig.capture(), expectedNodePrefix.capture());
+    verify(mockKubernetesManager, times(3)).getPodInfos(expectedConfig.capture(),
+        expectedNodePrefix.capture(), expectedNamespace.capture());
 
     assertEquals(config, expectedConfig.getValue());
     assertTrue(expectedNodePrefix.getValue().contains(nodePrefix));
+    assertTrue(expectedNamespace.getValue().contains(nodePrefix));
     assertThat(expectedOverrideFile.getValue(), RegexMatcher.matchesRegex(overrideFileRegex));
 
     List<TaskInfo> subTasks = taskInfo.getSubTasks();
@@ -431,25 +467,28 @@ public class UpgradeKubernetesUniverseTest extends CommissionerBaseTest {
 
     ArgumentCaptor<UUID> expectedUniverseUUID = ArgumentCaptor.forClass(UUID.class);
     ArgumentCaptor<String> expectedNodePrefix = ArgumentCaptor.forClass(String.class);
+    ArgumentCaptor<String> expectedNamespace = ArgumentCaptor.forClass(String.class);
     ArgumentCaptor<String> expectedOverrideFile = ArgumentCaptor.forClass(String.class);
     ArgumentCaptor<String> expectedPodName = ArgumentCaptor.forClass(String.class);
     ArgumentCaptor<HashMap> expectedConfig = ArgumentCaptor.forClass(HashMap.class);
-    
+
     String overrideFileRegex = "(.*)" + defaultUniverse.universeUUID + "(.*).yml";
-    
+
     UpgradeKubernetesUniverse.Params taskParams = new UpgradeKubernetesUniverse.Params();
     taskParams.masterGFlags = ImmutableMap.of("master-flag", "m1");
     taskParams.tserverGFlags = ImmutableMap.of("tserver-flag", "t1");
     TaskInfo taskInfo = submitTask(taskParams, UpgradeTaskType.GFlags);
-    
+
     verify(mockKubernetesManager, times(6)).helmUpgrade(expectedConfig.capture(),
-        expectedNodePrefix.capture(), expectedOverrideFile.capture());
+        expectedNodePrefix.capture(), expectedNamespace.capture(), expectedOverrideFile.capture());
     verify(mockKubernetesManager, times(6)).getPodStatus(expectedConfig.capture(),
         expectedNodePrefix.capture(), expectedPodName.capture());
-    verify(mockKubernetesManager, times(3)).getPodInfos(expectedConfig.capture(), expectedNodePrefix.capture());
+    verify(mockKubernetesManager, times(3)).getPodInfos(expectedConfig.capture(),
+        expectedNodePrefix.capture(), expectedNamespace.capture());
 
     assertEquals(config, expectedConfig.getValue());
     assertTrue(expectedNodePrefix.getValue().contains(nodePrefix));
+    assertTrue(expectedNamespace.getValue().contains(nodePrefix));
     assertThat(expectedOverrideFile.getValue(), RegexMatcher.matchesRegex(overrideFileRegex));
 
     List<TaskInfo> subTasks = taskInfo.getSubTasks();

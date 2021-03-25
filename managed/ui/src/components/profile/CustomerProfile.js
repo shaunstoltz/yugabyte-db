@@ -2,29 +2,29 @@
 
 import React, { Component } from 'react';
 import { Tab } from 'react-bootstrap';
-import { browserHistory} from 'react-router';
-import { isNonAvailable, isDisabled, showOrRedirect, isNotHidden } from 'utils/LayoutUtils';
+import { browserHistory } from 'react-router';
+import { isNonAvailable, isDisabled, showOrRedirect, isNotHidden } from '../../utils/LayoutUtils';
 import { YBTabsWithLinksPanel } from '../panels';
-import { isDefinedNotNull } from 'utils/ObjectUtils';
+import { isDefinedNotNull } from '../../utils/ObjectUtils';
 import UserProfileForm from './UserProfileForm';
 import AlertProfileForm from './AlertProfileForm';
 import UserList from './UserList';
 import { YBLoading } from '../common/indicators';
-import { getPromiseState } from 'utils/PromiseUtils';
+import { getPromiseState } from '../../utils/PromiseUtils';
 
 export default class CustomerProfile extends Component {
   constructor(props) {
     super(props);
     this.state = {
       statusUpdated: false,
-      updateStatus: ""
+      updateStatus: ''
     };
   }
 
   componentDidMount() {
     const { customer } = this.props;
     this.props.getCustomerUsers();
-    if (isNonAvailable(customer.features, "main.profile")) browserHistory.push('/');
+    if (isNonAvailable(customer.features, 'main.profile')) browserHistory.push('/');
   }
 
   handleProfileUpdate = (status) => {
@@ -32,23 +32,18 @@ export default class CustomerProfile extends Component {
       statusUpdated: true,
       updateStatus: status
     });
-  }
+  };
 
   render() {
-    const {
-      customer = {},
-      apiToken,
-      customerProfile,
-      params
-    } = this.props;
+    const { customer = {}, apiToken, customerProfile, params } = this.props;
     if (getPromiseState(customer).isLoading() || getPromiseState(customer).isInit()) {
       return <YBLoading />;
     }
-    showOrRedirect(customer.data.features, "main.profile");
+    showOrRedirect(customer.data.features, 'main.profile');
 
-    let profileUpdateStatus = <span/>;
+    let profileUpdateStatus = <span />;
     if (this.state.statusUpdated) {
-      if (this.state.updateStatus === "updated-success") {
+      if (this.state.updateStatus === 'updated-success') {
         profileUpdateStatus = (
           <span className="pull-right request-status yb-success-color yb-dissapear">
             Profile Updated Successfully
@@ -62,53 +57,64 @@ export default class CustomerProfile extends Component {
         );
       }
       setTimeout(() => {
-        this.setState({statusUpdated: false});
+        this.setState({ statusUpdated: false });
       }, 2000);
     }
 
-    const defaultTab = isNotHidden(customer.data.features, "main.profile") ? "general" : "general";
+    const defaultTab = isNotHidden(customer.data.features, 'main.profile') ? 'general' : 'general';
     const activeTab = isDefinedNotNull(params) ? params.tab : defaultTab;
     return (
       <div className="bottom-bar-padding">
         <h2 className="content-title">Update Customer Profile {profileUpdateStatus}</h2>
-        <YBTabsWithLinksPanel defaultTab={defaultTab} activeTab={activeTab}
-          routePrefix={`/profile/`} id={"profile-tab-panel"} className="profile-detail">
+        <YBTabsWithLinksPanel
+          defaultTab={defaultTab}
+          activeTab={activeTab}
+          routePrefix={`/profile/`}
+          id={'profile-tab-panel'}
+          className="profile-detail"
+        >
           {[
             <Tab.Pane
-              eventKey={"general"}
-              title="General"
+              eventKey={'general'}
+              tabtitle="General"
               key="general-tab"
               mountOnEnter={true}
               unmountOnExit={true}
-              disabled={isDisabled(customer.data.features, "main.profile")}>
-              <UserProfileForm customer={this.props.customer}
+              disabled={isDisabled(customer.data.features, 'main.profile')}
+            >
+              <UserProfileForm
+                customer={this.props.customer}
                 customerProfile={customerProfile}
-                apiToken={apiToken} {...this.props}
-                handleProfileUpdate={this.handleProfileUpdate} />
+                apiToken={apiToken}
+                handleProfileUpdate={this.handleProfileUpdate}
+                {...this.props}
+              />
             </Tab.Pane>,
             <Tab.Pane
-              eventKey={"health-alerting"}
-              title="Health & Alerting"
+              eventKey={'health-alerting'}
+              tabtitle="Health & Alerting"
               key="health-alerting-tab"
               mountOnEnter={true}
               unmountOnExit={true}
-              disabled={isDisabled(customer.data.features, "main.profile")}>
-              <AlertProfileForm customer={this.props.customer}
+              disabled={isDisabled(customer.data.features, 'main.profile')}
+            >
+              <AlertProfileForm
+                customer={this.props.customer}
                 customerProfile={customerProfile}
-                apiToken={apiToken}  {...this.props}
-                handleProfileUpdate={this.handleProfileUpdate} />
+                apiToken={apiToken}
+                handleProfileUpdate={this.handleProfileUpdate}
+                {...this.props}
+              />
             </Tab.Pane>,
             <Tab.Pane
-              eventKey={"manage-users"}
-              title="Users"
+              eventKey={'manage-users'}
+              tabtitle="Users"
               key="manage-users"
               mountOnEnter={true}
               unmountOnExit={true}
-              disabled={isDisabled(customer.data.features, "main.profile")}>
-              <UserList customer={this.props.customer}
-                customerProfile={customerProfile}
-                apiToken={apiToken}  {...this.props}
-                handleProfileUpdate={this.handleProfileUpdate} />
+              disabled={isDisabled(customer.data.features, 'main.profile')}
+            >
+              <UserList {...this.props} />
             </Tab.Pane>
           ]}
         </YBTabsWithLinksPanel>

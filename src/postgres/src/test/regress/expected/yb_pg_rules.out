@@ -290,16 +290,56 @@ select * from rtest_v1 ORDER BY a, b;
 
 -- updates in a mergejoin
 update rtest_v1 set b = rtest_t2.b from rtest_t2 where rtest_v1.a = rtest_t2.a;
-ERROR:  FROM clause in UPDATE not supported yet
-HINT:  See https://github.com/YugaByte/yugabyte-db/issues/738. Click '+' on the description to raise its priority
--- TODO(jason): uncomment when issue #738 is closed or closing
--- select * from rtest_v1 ORDER BY a, b;
--- insert into rtest_v1 select * from rtest_t3;
--- select * from rtest_v1 ORDER BY a, b;
--- update rtest_t1 set a = a + 10 where b > 30;
--- select * from rtest_v1 ORDER BY a, b;
--- update rtest_v1 set a = rtest_t3.a + 20 from rtest_t3 where rtest_v1.b = rtest_t3.b;
--- select * from rtest_v1 ORDER BY a, b;
+select * from rtest_v1 ORDER BY a, b;
+ a | b
+---+----
+ 1 | 21
+ 2 | 22
+ 3 | 23
+(3 rows)
+
+insert into rtest_v1 select * from rtest_t3;
+select * from rtest_v1 ORDER BY a, b;
+ a | b
+---+----
+ 1 | 21
+ 1 | 31
+ 2 | 22
+ 2 | 32
+ 3 | 23
+ 3 | 33
+ 4 | 34
+ 5 | 35
+(8 rows)
+
+update rtest_t1 set a = a + 10 where b > 30;
+select * from rtest_v1 ORDER BY a, b;
+ a  | b
+----+----
+  1 | 21
+  2 | 22
+  3 | 23
+ 11 | 31
+ 12 | 32
+ 13 | 33
+ 14 | 34
+ 15 | 35
+(8 rows)
+
+update rtest_v1 set a = rtest_t3.a + 20 from rtest_t3 where rtest_v1.b = rtest_t3.b;
+select * from rtest_v1 ORDER BY a, b;
+ a  | b
+----+----
+  1 | 21
+  2 | 22
+  3 | 23
+ 21 | 31
+ 22 | 32
+ 23 | 33
+ 24 | 34
+ 25 | 35
+(8 rows)
+
 --
 -- Test for constraint updates/deletes
 --
@@ -398,38 +438,41 @@ select ename, who = current_user as "matches user", action, newsal, oldsal from 
 
 update rtest_empmass set salary = salary + '1000.00';
 update rtest_emp set salary = rtest_empmass.salary from rtest_empmass where rtest_emp.ename = rtest_empmass.ename;
-ERROR:  FROM clause in UPDATE not supported yet
-HINT:  See https://github.com/YugaByte/yugabyte-db/issues/738. Click '+' on the description to raise its priority
 select ename, who = current_user as "matches user", action, newsal, oldsal from rtest_emplog order by ename, action, newsal;
         ename         | matches user |   action   |   newsal   |   oldsal
 ----------------------+--------------+------------+------------+------------
  gates                | t            | fired      |      $0.00 | $80,000.00
  gates                | t            | hired      | $80,000.00 |      $0.00
  maier                | t            | hired      |  $5,000.00 |      $0.00
+ maier                | t            | honored    |  $6,000.00 |  $5,000.00
  mayr                 | t            | hired      |  $6,000.00 |      $0.00
+ mayr                 | t            | honored    |  $7,000.00 |  $6,000.00
  meyer                | t            | hired      |  $4,000.00 |      $0.00
+ meyer                | t            | honored    |  $5,000.00 |  $4,000.00
  wiecc                | t            | hired      |  $5,000.00 |      $0.00
  wieck                | t            | honored    |  $6,000.00 |  $5,000.00
  wieck                | t            | honored    |  $7,000.00 |  $6,000.00
-(8 rows)
+(11 rows)
 
 delete from rtest_emp using rtest_empmass where rtest_emp.ename = rtest_empmass.ename;
-ERROR:  USING clause in DELETE not supported yet
-LINE 1: delete from rtest_emp using rtest_empmass where rtest_emp.en...
-                              ^
-HINT:  See https://github.com/YugaByte/yugabyte-db/issues/738. Click '+' on the description to raise its priority
 select ename, who = current_user as "matches user", action, newsal, oldsal from rtest_emplog order by ename, action, newsal;
         ename         | matches user |   action   |   newsal   |   oldsal
 ----------------------+--------------+------------+------------+------------
  gates                | t            | fired      |      $0.00 | $80,000.00
  gates                | t            | hired      | $80,000.00 |      $0.00
+ maier                | t            | fired      |      $0.00 |  $6,000.00
  maier                | t            | hired      |  $5,000.00 |      $0.00
+ maier                | t            | honored    |  $6,000.00 |  $5,000.00
+ mayr                 | t            | fired      |      $0.00 |  $7,000.00
  mayr                 | t            | hired      |  $6,000.00 |      $0.00
+ mayr                 | t            | honored    |  $7,000.00 |  $6,000.00
+ meyer                | t            | fired      |      $0.00 |  $5,000.00
  meyer                | t            | hired      |  $4,000.00 |      $0.00
+ meyer                | t            | honored    |  $5,000.00 |  $4,000.00
  wiecc                | t            | hired      |  $5,000.00 |      $0.00
  wieck                | t            | honored    |  $6,000.00 |  $5,000.00
  wieck                | t            | honored    |  $7,000.00 |  $6,000.00
-(8 rows)
+(14 rows)
 
 --
 -- Multiple cascaded qualified instead rule test
@@ -1818,6 +1861,30 @@ pg_stat_ssl| SELECT s.pid,
     s.sslcompression AS compression,
     s.sslclientdn AS clientdn
    FROM pg_stat_get_activity(NULL::integer) s(datid, pid, usesysid, application_name, state, query, wait_event_type, wait_event, xact_start, query_start, backend_start, state_change, client_addr, client_hostname, client_port, backend_xid, backend_xmin, backend_type, ssl, sslversion, sslcipher, sslbits, sslcompression, sslclientdn);
+pg_stat_statements| SELECT pg_stat_statements.userid,
+    pg_stat_statements.dbid,
+    pg_stat_statements.queryid,
+    pg_stat_statements.query,
+    pg_stat_statements.calls,
+    pg_stat_statements.total_time,
+    pg_stat_statements.min_time,
+    pg_stat_statements.max_time,
+    pg_stat_statements.mean_time,
+    pg_stat_statements.stddev_time,
+    pg_stat_statements.rows,
+    pg_stat_statements.shared_blks_hit,
+    pg_stat_statements.shared_blks_read,
+    pg_stat_statements.shared_blks_dirtied,
+    pg_stat_statements.shared_blks_written,
+    pg_stat_statements.local_blks_hit,
+    pg_stat_statements.local_blks_read,
+    pg_stat_statements.local_blks_dirtied,
+    pg_stat_statements.local_blks_written,
+    pg_stat_statements.temp_blks_read,
+    pg_stat_statements.temp_blks_written,
+    pg_stat_statements.blk_read_time,
+    pg_stat_statements.blk_write_time
+   FROM pg_stat_statements(true) pg_stat_statements(userid, dbid, queryid, query, calls, total_time, min_time, max_time, mean_time, stddev_time, rows, shared_blks_hit, shared_blks_read, shared_blks_dirtied, shared_blks_written, local_blks_hit, local_blks_read, local_blks_dirtied, local_blks_written, temp_blks_read, temp_blks_written, blk_read_time, blk_write_time);
 pg_stat_subscription| SELECT su.oid AS subid,
     su.subname,
     st.pid,

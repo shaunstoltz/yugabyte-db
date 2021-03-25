@@ -130,7 +130,6 @@ class RpcServerBase {
   gscoped_ptr<RpcServer> rpc_server_;
   std::unique_ptr<rpc::Messenger> messenger_;
   std::unique_ptr<rpc::ProxyCache> proxy_cache_;
-  bool is_first_run_;
 
   scoped_refptr<Clock> clock_;
 
@@ -184,11 +183,11 @@ class RpcAndWebServerBase : public RpcServerBase {
       std::shared_ptr<MemTracker> mem_tracker);
   virtual ~RpcAndWebServerBase();
 
-  virtual Status HandleDebugPage(const Webserver::WebRequest& req, std::stringstream* output);
+  virtual Status HandleDebugPage(const Webserver::WebRequest& req, Webserver::WebResponse* resp);
 
   virtual void DisplayGeneralInfoIcons(std::stringstream* output);
 
-  virtual void DisplayRpcIcons(std::stringstream* output);
+  virtual CHECKED_STATUS DisplayRpcIcons(std::stringstream* output);
 
   static void DisplayIconTile(std::stringstream* output, const string icon, const string caption,
                               const string url);
@@ -219,7 +218,8 @@ std::string TEST_RpcBindEndpoint(int index, uint16_t port);
 
 // Sets up connectivity in test for specified messenger of server with index.
 void TEST_SetupConnectivity(rpc::Messenger* messenger, int index);
-// Isolates specific messenger, i.e. breaks connectivity with all other servers.
+// Isolates specific messenger, i.e. breaks any of this messengers connections with all other
+// servers.
 void TEST_Isolate(rpc::Messenger* messenger);
 
 } // namespace server

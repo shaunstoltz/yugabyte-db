@@ -22,10 +22,11 @@ setup(name='ybops',
           'ybops/cloud/common',
           'ybops/cloud/gcp',
           'ybops/cloud/onprem',
+          'ybops/cloud/azure',
           'ybops/common',
           'ybops/utils',
       ],
-      package_data={'ybops': ['data/*.yml', 'data/internal/*.yml', 'data/*.j2']},
+      package_data={'ybops': ['data/*.yml', 'data/internal/*.yml', 'data/*.j2', 'data/*.sh']},
       scripts=[
           'ybops/scripts/ybcloud.py'
       ],

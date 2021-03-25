@@ -166,13 +166,13 @@ set(TSERVER_SRCS
   tablet_server.cc
   tablet_server_options.cc
   tablet_service.cc
+  tablet_split_heartbeat_data_provider.cc
   ts_tablet_manager.cc
   tserver-path-handlers.cc
   tserver_metrics_heartbeat_data_provider.cc
   ${TSERVER_SRCS_EXTENSIONS})
 
-add_library(tserver ${TSERVER_SRCS})
-target_link_libraries(tserver
+set(TSERVER_DEPS
   protobuf
   backup_proto
   tserver_proto
@@ -192,6 +192,11 @@ target_link_libraries(tserver
   yb_client
   yb_pggate_flags
   ${TSERVER_LIB_EXTENSIONS})
+
+ADD_YB_LIBRARY(tserver
+  SRCS ${TSERVER_SRCS}
+  DEPS ${TSERVER_DEPS}
+  NONLINK_DEPS postgres)
 
 #########################################
 # yb-tserver
@@ -236,7 +241,7 @@ ADD_YB_TEST(ts_tablet_manager-test)
 ADD_YB_TEST(header_manager_impl-test)
 
 ADD_YB_TEST(encrypted_sstable-test)
-target_link_libraries(encrypted_sstable-test encryption_test_util tserver_test_util tserver)
+YB_TEST_TARGET_LINK_LIBRARIES(encrypted_sstable-test encryption_test_util tserver_test_util tserver)
 
 # -------------------------------------------------------------------------------------------------
 # Tests in the "ent" directory

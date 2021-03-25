@@ -2,18 +2,17 @@
 title: jsonb_extract_path() and json_extract_path() [JSON]
 headerTitle: jsonb_extract_path() and json_extract_path()
 linkTitle: jsonb_extract_path()
-description: Use these JSON functions to provide the identical functionality to the "#>" operator.
-summary: jsonb_extract_path() and json_extract_path()
+description: Provide identical functionality to the "#>" operator.
 menu:
   latest:
     identifier: jsonb-extract-path
-    parent: functions-operators
+    parent: json-functions-operators
     weight: 130
 isTocNested: true
 showAsideToc: true
 ---
 
-**Purpose:** Provide the identical functionality to the `#>` operator.
+**Purpose:** Provide the identical functionality to the [`#>`](../subvalue-operators/) operator.
 
 **Signature** For the `jsonb` variant:
 
@@ -22,13 +21,13 @@ input value:       jsonb, VARIADIC text
 return value:      jsonb
 ```
 
-The invocation of `#>` can be mechanically transformed to use `jsonb_extract_path()` by these steps:
+The invocation of [`#>`](../subvalue-operators/) can be mechanically transformed to use `jsonb_extract_path()` by these steps:
 
 - Add the function invocation with its required parentheses.
 - Replace `#>` with a comma.
 - Write the path as a comma-separated list of terms, where both integer array indexes and key-value keys are presented as `text` values, taking advantage of the fact that the function is variadic).
 
-This `DO` block shows the invocation of `#>` and `jsonb_extract_path()` vertically to make visual comparison easy.
+This `DO` block shows the invocation of `#>` and `jsonb_extract_path()` vertically to help visual comparison.
 
 ```
 do $body$

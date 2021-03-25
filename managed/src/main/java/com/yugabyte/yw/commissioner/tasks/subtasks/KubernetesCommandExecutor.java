@@ -12,19 +12,22 @@ package com.yugabyte.yw.commissioner.tasks.subtasks;
 
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.node.ObjectNode;
-import com.google.common.annotations.VisibleForTesting;
+import com.fasterxml.jackson.databind.ObjectMapper;
 import com.google.common.collect.ImmutableMap;
 import com.google.inject.Inject;
 import com.yugabyte.yw.commissioner.AbstractTaskBase;
 import com.yugabyte.yw.commissioner.UserTaskDetails;
 import com.yugabyte.yw.commissioner.tasks.UniverseDefinitionTaskBase.ServerType;
+import com.yugabyte.yw.commissioner.tasks.UniverseTaskBase;
 import com.yugabyte.yw.common.CertificateHelper;
 import com.yugabyte.yw.common.KubernetesManager;
 import com.yugabyte.yw.common.PlacementInfoUtil;
 import com.yugabyte.yw.common.ShellProcessHandler;
+import com.yugabyte.yw.common.ShellResponse;
 import com.yugabyte.yw.forms.AbstractTaskParams;
 import com.yugabyte.yw.forms.ITaskParams;
 import com.yugabyte.yw.forms.UniverseDefinitionTaskParams;
+import com.yugabyte.yw.forms.UniverseTaskParams;
 import com.yugabyte.yw.models.AvailabilityZone;
 import com.yugabyte.yw.models.InstanceType;
 import com.yugabyte.yw.models.Provider;
@@ -54,7 +57,9 @@ import java.util.UUID;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
 
-public class KubernetesCommandExecutor extends AbstractTaskBase {
+import static com.yugabyte.yw.forms.UniverseDefinitionTaskParams.ExposingServiceState;
+
+public class KubernetesCommandExecutor extends UniverseTaskBase {
   public enum CommandType {
     CREATE_NAMESPACE,
     APPLY_SECRET,
@@ -75,8 +80,6 @@ public class KubernetesCommandExecutor extends AbstractTaskBase {
           return UserTaskDetails.SubTaskGroupType.CreateNamespace.name();
         case APPLY_SECRET:
           return UserTaskDetails.SubTaskGroupType.ApplySecret.name();
-        case HELM_INIT:
-          return UserTaskDetails.SubTaskGroupType.HelmInit.name();
         case HELM_INSTALL:
           return UserTaskDetails.SubTaskGroupType.HelmInstall.name();
         case HELM_UPGRADE:
@@ -114,9 +117,6 @@ public class KubernetesCommandExecutor extends AbstractTaskBase {
 
   static final String defaultStorageClass = "standard";
 
-  @VisibleForTesting
-  static final String YSQL_PORT = "5433";
-
   @Override
   public void initialize(ITaskParams params) {
     this.kubernetesManager = Play.current().injector().instanceOf(KubernetesManager.class);
@@ -125,20 +125,20 @@ public class KubernetesCommandExecutor extends AbstractTaskBase {
     super.initialize(params);
   }
 
-  public static class Params extends AbstractTaskParams {
+  public static class Params extends UniverseTaskParams {
     public UUID providerUUID;
     public CommandType commandType;
-    public UUID universeUUID;
     // We use the nodePrefix as Helm Chart's release name,
     // so we would need that for any sort helm operations.
     public String nodePrefix;
+    public String namespace;
     public String ybSoftwareVersion = null;
-    public String encryptionKeyFilePath = null;
     public boolean enableNodeToNodeEncrypt = false;
     public boolean enableClientToNodeEncrypt = false;
     public UUID rootCA = null;
     public ServerType serverType = ServerType.EITHER;
-    public int rollingUpgradePartition = 0;
+    public int tserverPartition = 0;
+    public int masterPartition = 0;
 
     // Master addresses in multi-az case (to have control over different deployments).
     public String masterAddresses = null;
@@ -167,45 +167,48 @@ public class KubernetesCommandExecutor extends AbstractTaskBase {
     if (config == null) {
       config = Provider.get(taskParams().providerUUID).getConfig();
     }
+    if (taskParams().commandType != CommandType.POD_INFO && taskParams().namespace == null) {
+      throw new IllegalArgumentException("namespace can be null only in case of POD_INFO");
+    }
+
     // TODO: add checks for the shell process handler return values.
-    ShellProcessHandler.ShellResponse response = null;
+    ShellResponse response = null;
     switch (taskParams().commandType) {
       case CREATE_NAMESPACE:
-        response = kubernetesManager.createNamespace(config, taskParams().nodePrefix);
+        response = kubernetesManager.createNamespace(config, taskParams().namespace);
         break;
       case APPLY_SECRET:
         String pullSecret = this.getPullSecret();
         if (pullSecret != null) {
-          response = kubernetesManager.applySecret(config, taskParams().nodePrefix, pullSecret);
+          response = kubernetesManager.applySecret(config, taskParams().namespace, pullSecret);
         }
-        break;
-      case HELM_INIT:
-        response = kubernetesManager.helmInit(config, taskParams().providerUUID);
         break;
       case HELM_INSTALL:
         overridesFile = this.generateHelmOverride();
-        response = kubernetesManager.helmInstall(config, taskParams().providerUUID, taskParams().nodePrefix, overridesFile);
+        response = kubernetesManager.helmInstall(config, taskParams().providerUUID, taskParams().nodePrefix,taskParams().namespace,  overridesFile);
         flag = true;
         break;
       case HELM_UPGRADE:
         overridesFile = this.generateHelmOverride();
-        response = kubernetesManager.helmUpgrade(config, taskParams().nodePrefix, overridesFile);
+        response = kubernetesManager.helmUpgrade(config, taskParams().nodePrefix, taskParams().namespace,  overridesFile);
         flag = true;
         break;
       case UPDATE_NUM_NODES:
         int numNodes = this.getNumNodes();
         if (numNodes > 0) {
-          response = kubernetesManager.updateNumNodes(config, taskParams().nodePrefix, numNodes);
+          // TODO(bhavin192): we might also need nodePrefix later, so
+          // that we can have multiple releases in one namespace.
+          response = kubernetesManager.updateNumNodes(config, taskParams().namespace, numNodes);
         }
         break;
       case HELM_DELETE:
-        kubernetesManager.helmDelete(config, taskParams().nodePrefix);
+        kubernetesManager.helmDelete(config, taskParams().nodePrefix, taskParams().namespace);
         break;
       case VOLUME_DELETE:
-        kubernetesManager.deleteStorage(config, taskParams().nodePrefix);
+        kubernetesManager.deleteStorage(config, taskParams().nodePrefix, taskParams().namespace);
         break;
       case NAMESPACE_DELETE:
-        kubernetesManager.deleteNamespace(config, taskParams().nodePrefix);
+        kubernetesManager.deleteNamespace(config, taskParams().namespace);
         break;
       case POD_INFO:
         processNodeInfo();
@@ -215,14 +218,14 @@ public class KubernetesCommandExecutor extends AbstractTaskBase {
       if (response.code != 0 && flag) {
         response = getPodError(config);
       }
-      logShellResponse(response);
+      processShellResponse(response);
     }
   }
 
-  private ShellProcessHandler.ShellResponse getPodError(Map<String, String> config) {
-    ShellProcessHandler.ShellResponse response = new ShellProcessHandler.ShellResponse();
+  private ShellResponse getPodError(Map<String, String> config) {
+    ShellResponse response = new ShellResponse();
     response.code = -1;
-    ShellProcessHandler.ShellResponse podResponse = kubernetesManager.getPodInfos(config, taskParams().nodePrefix);
+    ShellResponse podResponse = kubernetesManager.getPodInfos(config, taskParams().nodePrefix, taskParams().namespace);
     JsonNode podInfos = parseShellResponseAsJson(podResponse);
     boolean flag = false;
     for (JsonNode podInfo: podInfos.path("items")) {
@@ -248,12 +251,49 @@ public class KubernetesCommandExecutor extends AbstractTaskBase {
       response.message = "No pods even scheduled. Previous step(s) incomplete";
     }
     else {
-      if (environment.isDev()) {
-        response.code = 0;
-      }
       response.message = "Pods are ready. Services still not running";
     }
     return response;
+  }
+
+  private Map<String, String> getClusterIpForLoadBalancer() {
+    Universe u = Universe.get(taskParams().universeUUID);
+    PlacementInfo pi = taskParams().placementInfo;
+
+    Map<UUID, Map<String, String>> azToConfig = PlacementInfoUtil.getConfigPerAZ(pi);
+    Map<UUID, String> azToDomain = PlacementInfoUtil.getDomainPerAZ(pi);
+    boolean isMultiAz = PlacementInfoUtil.isMultiAZ(Provider.get(taskParams().providerUUID));
+
+    Map<String, String> serviceToIP = new HashMap<String, String>();
+
+    for (Entry<UUID, Map<String, String>> entry : azToConfig.entrySet()) {
+      UUID azUUID = entry.getKey();
+      String azName = AvailabilityZone.get(azUUID).code;
+      String regionName = AvailabilityZone.get(azUUID).region.code;
+      Map<String, String> config = entry.getValue();
+
+      // TODO(bhavin192): we seem to be iterating over all the AZs
+      // here, and still selecting services for only one AZ governed
+      // by the taskParams().nodePrefix. Is it even required to
+      // iterate in that case?
+      ShellResponse svcResponse =
+        kubernetesManager.getServices(config, taskParams().nodePrefix, taskParams().namespace);
+      JsonNode svcInfos = parseShellResponseAsJson(svcResponse);
+
+      for (JsonNode svcInfo: svcInfos.path("items")) {
+        JsonNode serviceMetadata =  svcInfo.path("metadata");
+        JsonNode serviceSpec = svcInfo.path("spec");
+        String serviceType = serviceSpec.path("type").asText();
+        // TODO(bhavin192): this will need an update when we have
+        // multiple releases in one namespace, the generated service
+        // name will be different and not just yb-masters, yb-tservers
+        // etc. Values file will still have yb-masters, yb-tservers
+        // etc.
+        serviceToIP.put(serviceMetadata.path("name").asText(),
+                        serviceSpec.path("clusterIP").asText());
+      }
+    }
+    return serviceToIP;
   }
 
   private void processNodeInfo() {
@@ -272,11 +312,12 @@ public class KubernetesCommandExecutor extends AbstractTaskBase {
       String regionName = AvailabilityZone.get(azUUID).region.code;
       Map<String, String> config = entry.getValue();
 
-      String namespace = isMultiAz ?
+      String nodePrefix = isMultiAz ?
           String.format("%s-%s", taskParams().nodePrefix, azName) : taskParams().nodePrefix;
+      String namespace = PlacementInfoUtil.getKubernetesNamespace(isMultiAz, taskParams().nodePrefix, azName, config);
 
-      ShellProcessHandler.ShellResponse podResponse =
-          kubernetesManager.getPodInfos(config, namespace);
+      ShellResponse podResponse =
+          kubernetesManager.getPodInfos(config, nodePrefix, namespace);
       JsonNode podInfos = parseShellResponseAsJson(podResponse);
 
       for (JsonNode podInfo: podInfos.path("items")) {
@@ -293,6 +334,12 @@ public class KubernetesCommandExecutor extends AbstractTaskBase {
         String podName = isMultiAz ?
             String.format("%s_%s", podSpec.path("hostname").asText(), azName) :
             podSpec.path("hostname").asText();
+        String podNamespace = podInfo.path("metadata").path("namespace").asText();
+        if (podNamespace.isEmpty() || podNamespace == null) {
+          throw new IllegalArgumentException("metadata.namespace of pod " + podName
+                                             + " is empty. This shouldn't happen");
+        }
+        pod.put("namespace", podNamespace);
         pods.set(podName, pod);
       }
     }
@@ -307,13 +354,8 @@ public class KubernetesCommandExecutor extends AbstractTaskBase {
         NodeDetails nodeDetail = defaultNode.clone();
         Map.Entry<String, JsonNode> pod = iter.next();
         String hostname = pod.getKey();
-
-        // The namespace of the deployment in multi-az is constructed by appending
-        // the zone to the universe name.
-        String namespace = isMultiAz ?
-            PlacementInfoUtil.getKubernetesNamespace(taskParams().nodePrefix, hostname.split("_")[1]) :
-            taskParams().nodePrefix;
         JsonNode podVals = pod.getValue();
+        String namespace = podVals.get("namespace").asText();
         UUID azUUID = UUID.fromString(podVals.get("az_uuid").asText());
         String domain = azToDomain.get(azUUID);
         if (hostname.contains("master")) {
@@ -341,7 +383,7 @@ public class KubernetesCommandExecutor extends AbstractTaskBase {
       universeDetails.nodeDetailsSet = nodeDetailsSet;
       universe.setUniverseDetails(universeDetails);
     };
-    Universe.saveDetails(taskParams().universeUUID, updater);
+    saveUniverseDetails(updater);
   }
 
   private String nodeNameToPodName(String nodeName, boolean isMaster) {
@@ -385,10 +427,6 @@ public class KubernetesCommandExecutor extends AbstractTaskBase {
     overrides = (HashMap<String, Object>) yaml.load(
         application.resourceAsStream("k8s-expose-all.yml")
     );
-
-    if (environment.isDev()) {
-        overrides.put("enableLoadBalancer", false);
-    }
 
     Provider provider = Provider.get(taskParams().providerUUID);
     Map<String, String> config = provider.getConfig();
@@ -552,24 +590,23 @@ public class KubernetesCommandExecutor extends AbstractTaskBase {
     if (taskParams().rootCA != null) {
       Map<String, Object> tlsInfo = new HashMap<>();
       tlsInfo.put("enabled", true);
+      tlsInfo.put("nodeToNode", userIntent.enableNodeToNodeEncrypt);
+      tlsInfo.put("clientToServer", userIntent.enableClientToNodeEncrypt);
+      tlsInfo.put("insecure", u.getUniverseDetails().allowInsecure);
       Map<String, Object> rootCA = new HashMap<>();
       rootCA.put("cert", CertificateHelper.getCertPEM(taskParams().rootCA));
       rootCA.put("key", CertificateHelper.getKeyPEM(taskParams().rootCA));
       tlsInfo.put("rootCA", rootCA);
       overrides.put("tls", tlsInfo);
     }
+    if (userIntent.enableIPV6) {
+      overrides.put("ip_version_support", "v6_only");
+    }
+
     Map<String, Object> partition = new HashMap<>();
-    if (taskParams().serverType == ServerType.TSERVER) {
-      partition.put("tserver", taskParams().rollingUpgradePartition);
-      partition.put("master", replicationFactorZone);
-    }
-    else if (taskParams().serverType == ServerType.MASTER) {
-      partition.put("tserver", numNodes);
-      partition.put("master", taskParams().rollingUpgradePartition);
-    }
-    if (!partition.isEmpty()) {
-      overrides.put("partition", partition);
-    }
+    partition.put("tserver", taskParams().tserverPartition);
+    partition.put("master", taskParams().masterPartition);
+    overrides.put("partition", partition);
 
     UUID placementUuid = u.getUniverseDetails().getPrimaryCluster().uuid;
     Map<String, Object> gflagOverrides = new HashMap<>();
@@ -586,10 +623,6 @@ public class KubernetesCommandExecutor extends AbstractTaskBase {
     }
     if (placementUuid != null && masterOverrides.get("placement_uuid") == null) {
       masterOverrides.put("placement_uuid", placementUuid.toString());
-    }
-    if (taskParams().rootCA != null) {
-      masterOverrides.put("use_node_to_node_encryption", userIntent.enableNodeToNodeEncrypt);
-      masterOverrides.put("allow_insecure_connections", u.getUniverseDetails().allowInsecure);
     }
     if (!masterOverrides.isEmpty()) {
       gflagOverrides.put("master", masterOverrides);
@@ -608,11 +641,6 @@ public class KubernetesCommandExecutor extends AbstractTaskBase {
     if (placementUuid != null && tserverOverrides.get("placement_uuid") == null) {
       tserverOverrides.put("placement_uuid", placementUuid.toString());
     }
-    if (taskParams().rootCA != null) {
-      tserverOverrides.put("use_node_to_node_encryption", userIntent.enableNodeToNodeEncrypt);
-      tserverOverrides.put("use_client_to_server_encryption", userIntent.enableClientToNodeEncrypt);
-      tserverOverrides.put("allow_insecure_connections", u.getUniverseDetails().allowInsecure);
-    }
     if (!tserverOverrides.isEmpty()) {
       gflagOverrides.put("tserver", tserverOverrides);
     }
@@ -626,6 +654,17 @@ public class KubernetesCommandExecutor extends AbstractTaskBase {
     }
 
     overrides.put("disableYsql", !userIntent.enableYSQL);
+
+    // If the value is anything else, that means the loadbalancer service by
+    // default needed to be exposed.
+    // NOTE: Will still be overriden from the provider level overrides.
+    if (userIntent.enableExposingService == ExposingServiceState.UNEXPOSED) {
+      overrides.put("enableLoadBalancer", false);
+    } else {
+      // Even though the helm chart default is true, doing this from platform
+      // just to make it explicit.
+      overrides.put("enableLoadBalancer", true);
+    }
 
     // For now the assumption is the all deployments will have the same kind of
     // loadbalancers, so the annotations will be at the provider level.
@@ -648,7 +687,26 @@ public class KubernetesCommandExecutor extends AbstractTaskBase {
     if (overridesYAML != null) {
       annotations =(HashMap<String, Object>) yaml.load(overridesYAML);
       if (annotations != null ) {
-        overrides.putAll(annotations);
+        mergeYaml(overrides, annotations);
+      }
+    }
+
+
+    Map<String, String> universeConfig = u.getConfig();
+    boolean helmLegacy = Universe.HelmLegacy.valueOf(universeConfig.get(Universe.HELM2_LEGACY))
+        == Universe.HelmLegacy.V2TO3;
+
+    if (helmLegacy) {
+      overrides.put("helm2Legacy", helmLegacy);
+      Map<String, String> serviceToIP = getClusterIpForLoadBalancer();
+      ObjectMapper mapper = new ObjectMapper();
+      ArrayList<Object> serviceEndpoints = (ArrayList) overrides.get("serviceEndpoints");
+      for (Object serviceEndpoint: serviceEndpoints) {
+        Map<String, Object> endpoint = mapper.convertValue(serviceEndpoint, Map.class);
+        String endpointName = (String) endpoint.get("name");
+        if (serviceToIP.containsKey(endpointName)) {
+          endpoint.put("clusterIP", serviceToIP.get(endpointName));
+        }
       }
     }
 
@@ -660,6 +718,24 @@ public class KubernetesCommandExecutor extends AbstractTaskBase {
     } catch (IOException e) {
       LOG.error(e.getMessage());
       throw new RuntimeException("Error writing Helm Override file!");
+    }
+  }
+
+  // Recursively traverses the override map and updates or adds the
+  // keys to source map.
+  private void mergeYaml(Map<String, Object> source, Map<String, Object> override) {
+    for (Entry<String, Object> entry : override.entrySet()) {
+      String key = entry.getKey();
+      if (!source.containsKey(key)) {
+        source.put(key, override.get(key));
+        continue;
+      }
+      if (!(override.get(key) instanceof Map) || !(source.get(key) instanceof Map)) {
+        source.put(key, override.get(key));
+        continue;
+      }
+      mergeYaml((Map<String, Object>) source.get(key),
+                (Map<String, Object>) override.get(key));
     }
   }
 }

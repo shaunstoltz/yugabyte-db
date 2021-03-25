@@ -90,9 +90,29 @@ YBTableCreator& YBTableCreator::colocated(const bool colocated) {
   return *this;
 }
 
+YBTableCreator& YBTableCreator::tablegroup_id(const std::string& tablegroup_id) {
+  tablegroup_id_ = tablegroup_id;
+  return *this;
+}
+
+YBTableCreator& YBTableCreator::tablespace_id(const std::string& tablespace_id) {
+  tablespace_id_ = tablespace_id;
+  return *this;
+}
+
 YBTableCreator& YBTableCreator::schema(const YBSchema* schema) {
   schema_ = schema;
   return *this;
+}
+
+YBTableCreator& YBTableCreator::part_of_transaction(const TransactionMetadata* txn) {
+  txn_ = txn;
+  return *this;
+}
+
+YBTableCreator &YBTableCreator::add_partition(const Partition& partition) {
+    partitions_.push_back(partition);
+    return *this;
 }
 
 YBTableCreator& YBTableCreator::add_hash_partitions(const std::vector<std::string>& columns,
@@ -113,7 +133,8 @@ YBTableCreator& YBTableCreator::add_hash_partitions(const std::vector<std::strin
 }
 
 YBTableCreator& YBTableCreator::set_range_partition_columns(
-    const std::vector<std::string>& columns) {
+    const std::vector<std::string>& columns,
+    const std::vector<std::string>& split_rows) {
   PartitionSchemaPB::RangeSchemaPB* range_schema =
     partition_schema_.mutable_range_schema();
   range_schema->Clear();
@@ -121,6 +142,9 @@ YBTableCreator& YBTableCreator::set_range_partition_columns(
     range_schema->add_columns()->set_name(col_name);
   }
 
+  for (const auto& row : split_rows) {
+    range_schema->add_splits()->set_column_bounds(row);
+  }
   return *this;
 }
 
@@ -142,6 +166,11 @@ YBTableCreator& YBTableCreator::is_local_index(bool is_local_index) {
 
 YBTableCreator& YBTableCreator::is_unique_index(bool is_unique_index) {
   index_info_.set_is_unique(is_unique_index);
+  return *this;
+}
+
+YBTableCreator& YBTableCreator::skip_index_backfill(const bool skip_index_backfill) {
+  skip_index_backfill_ = skip_index_backfill;
   return *this;
 }
 
@@ -209,6 +238,14 @@ Status YBTableCreator::Create() {
     req.set_is_pg_shared_table(*is_pg_shared_table_);
   }
 
+  if (!tablegroup_id_.empty()) {
+    req.set_tablegroup_id(tablegroup_id_);
+  }
+
+  if (!tablespace_id_.empty()) {
+    req.set_tablespace_id(tablespace_id_);
+  }
+
   // Note that the check that the sum of min_num_replicas for each placement block being less or
   // equal than the overall placement info num_replicas is done on the master side and an error is
   // naturally returned if you try to create a table and the numbers mismatch. As such, it is the
@@ -218,6 +255,10 @@ Status YBTableCreator::Create() {
   }
 
   SchemaToPB(internal::GetSchema(*schema_), req.mutable_schema());
+
+  if (txn_) {
+    txn_->ToPB(req.mutable_transaction());
+  }
 
   // Setup the number splits (i.e. number of splits).
   if (num_tablets_ > 0) {
@@ -237,6 +278,13 @@ Status YBTableCreator::Create() {
 
   req.mutable_partition_schema()->CopyFrom(partition_schema_);
 
+  if (!partitions_.empty()) {
+    for (const auto& p : partitions_) {
+      auto * np = req.add_partitions();
+      p.ToPB(np);
+    }
+  }
+
   // Index mapping with data-table being indexed.
   if (index_info_.has_indexed_table_id()) {
     if (!TEST_use_old_style_create_request_) {
@@ -248,6 +296,7 @@ Status YBTableCreator::Create() {
     req.set_indexed_table_id(index_info_.indexed_table_id());
     req.set_is_local_index(index_info_.is_local());
     req.set_is_unique_index(index_info_.is_unique());
+    req.set_skip_index_backfill(skip_index_backfill_);
   }
 
   auto deadline = CoarseMonoClock::Now() +

@@ -15,7 +15,6 @@ import com.fasterxml.jackson.databind.node.ObjectNode;
 import com.google.inject.Inject;
 import com.google.inject.Singleton;
 
-import com.yugabyte.yw.common.ApiHelper;
 import com.yugabyte.yw.common.services.YBClientService;
 import com.yugabyte.yw.common.SslHelper;
 import com.yugabyte.yw.common.Util;
@@ -560,13 +559,13 @@ public class YBMetricQueryComponent {
             metricResults.add(String.format(
               NODE_METRIC_FORMAT,
               nodeUpMetric.getKey(),
-              SwamperHelper.TargetType.MASTER_EXPORT.getPort(),
+              universe.getUniverseDetails().communicationPorts.masterHttpPort,
               nodeUpMetric.getValue()
             ));
             metricResults.add(String.format(
               NODE_METRIC_FORMAT,
               nodeUpMetric.getKey(),
-              SwamperHelper.TargetType.TSERVER_EXPORT.getPort(),
+              universe.getUniverseDetails().communicationPorts.tserverHttpPort,
               nodeUpMetric.getValue()
             ));
             // Note that we are passing a List<String> to the %s parameter and expecting

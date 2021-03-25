@@ -21,33 +21,20 @@ import org.junit.Test;
 import static org.yb.AssertionWrappers.*;
 
 import org.yb.YBTestRunner;
+import org.yb.minicluster.BaseMiniClusterTest;
 
+import org.junit.BeforeClass;
 import org.junit.runner.RunWith;
 
 @RunWith(value=YBTestRunner.class)
-public class TestAuthentication extends BaseAuthenticationCQLTest {
+public class TestAuthentication extends BaseAuthenticationCommonCQLTest {
+
   @Test(timeout = 100000)
   public void testCreateRoles() throws Exception {
     testCreateRoleHelper("role1", "$!@$q1<>?", false, false);
     testCreateRoleHelper("role4", "$!@$q1<>?", false, true);
     testCreateRoleHelper("role2", "$!@$q1<>?", true, false);
     testCreateRoleHelper("role3", "$!@$q1<>?", true, true);
-  }
-
-  @Test(timeout = 100000)
-  public void testDeleteExistingRole() throws Exception {
-    // Create the role.
-    String roleName = "role_test";
-    String password = "adsfQ%T!qaewfa";
-    testCreateRoleHelper(roleName, password, true, false);
-
-    Session s = getDefaultSession();
-    // Delete the role.
-    String deleteStmt = String.format("DROP ROLE %s", roleName);
-    s.execute(deleteStmt);
-
-    // Verify that we cannot connect using the deleted role.
-    checkConnectivity(true, roleName, password, true);
   }
 
   @Test(timeout = 100000)
@@ -85,91 +72,6 @@ public class TestAuthentication extends BaseAuthenticationCQLTest {
     s2.execute(String.format("DROP ROLE %s", superuser));
   }
 
-  @Test
-  public void testSuperuserCanDeleteAnotherSuperuserRole() throws Exception {
-    String superuser1 = "superuser_1";
-    String superuser2 = "superuser_2";
-    String pwd = "password";
-
-    testCreateRoleHelper(superuser1, pwd, true, true);
-
-    Session s2 = getSession(superuser1, pwd);
-
-    // Create a new role using superuser1's session. This should grant all the permissions on role
-    // superuser2 to superuser1.
-    testCreateRoleHelperWithSession(superuser2, pwd, true, true, true, s2);
-
-    // Verify that superuser1 can delete superuser2.
-    s2.execute(String.format("DROP ROLE %s", superuser2));
-
-    // Verify that we can't connect using the deleted role.
-    checkConnectivity(true, superuser2, pwd, true);
-  }
-
-  @Test(timeout = 100000)
-  public void testAlterPasswordForExistingRole() throws Exception {
-    Session s = getDefaultSession();
-
-    String roleName = "alter_test_1";
-    String oldPassword = "!%^()(*~`";
-    testCreateRoleHelper(roleName, oldPassword, true, false);
-
-    // Change the role's password.
-    String newPassword = "%#^$%@$@";
-    String alterStmt = String.format("ALTER ROLE %s with PASSWORD = '%s'", roleName, newPassword);
-    s.execute(alterStmt);
-
-
-    // During the first iteration we check tha the changes were applied correctly to the
-    // in-memory structures. Then we restart the cluster to verify that the changes were saved
-    // to disk and are loaded correctly.
-    for (int i = 0; i < 2; i++) {
-      verifyRole(roleName, true, false);
-
-      // Verify that we cannot connect using the old password.
-      checkConnectivity(true, roleName, oldPassword, true);
-
-      // Verify that we can connect using the new password.
-      checkConnectivity(true, roleName, newPassword, false);
-
-      if (i == 0) {
-        miniCluster.restart();
-      }
-    }
-
-  }
-
-  @Test(timeout = 100000)
-  public void testAlterLoginForExistingRole() throws Exception {
-    Session s = getDefaultSession();
-
-    String roleName = "alter_test_2";
-    String password = "!%^()(*~`";
-    testCreateRoleHelper(roleName, password, true, false);
-
-    // Verify that we can login.
-    checkConnectivity(true, roleName, password, false);
-
-    // Change the role LOGIN from true to false.
-    String alterStmt = String.format("ALTER ROLE %s with LOGIN = false", roleName);
-    s.execute(alterStmt);
-
-    // During the first iteration we check tha the changes were applied correctly to the
-    // in-memory structures. Then we restart the cluster to verify that the changes were saved
-    // to disk and are loaded correctly.
-    for (int i = 0; i < 2; i++) {
-
-      verifyRole(roleName, false, false);
-
-      // Verify that we cannot longer login.
-      checkConnectivity(true, roleName, password, true);
-
-      if (i == 0) {
-        miniCluster.restart();
-      }
-    }
-  }
-
   @Test(timeout = 100000)
   public void testAlterSuperuserForExistingRole() throws Exception {
     Session s = getDefaultSession();
@@ -201,39 +103,6 @@ public class TestAuthentication extends BaseAuthenticationCQLTest {
   }
 
   @Test(timeout = 100000)
-  public void testAlterPasswordAndLoginAndSuperuserExistingRole() throws Exception {
-    Session s = getDefaultSession();
-
-    String roleName = "alter_test_4";
-    String oldPassword = "sdf$hgfaY13";
-    testCreateRoleHelper(roleName, oldPassword, false, false);
-
-    // Verify that we cannot login because the role was created with LOGIN = false.
-    checkConnectivity(true, roleName, oldPassword, true);
-
-    // Change the role's password, LOGIN from false to true, and SUPERUSER from false to true.
-    String newPassword = "*&oi2jr8OI";
-    String alterStmt = String.format(
-        "ALTER ROLE %s with PASSWORD = '%s' AND LOGIN = true AND SUPERUSER = true",
-        roleName, newPassword);
-    s.execute(alterStmt);
-
-    // During the first iteration we check tha the changes were applied correctly to the
-    // in-memory structures. Then we restart the cluster to verify that the changes were saved
-    // to disk and are loaded correctly.
-    for (int i = 0; i < 2; i++) {
-      verifyRole(roleName, true, true);
-
-      // Verify that we can login.
-      checkConnectivity(true, roleName, newPassword, false);
-
-      if (i == 0) {
-        miniCluster.restart();
-      }
-    }
-  }
-
-  @Test(timeout = 100000)
   public void testAlterNonExistingRole() throws Exception {
     Session s = getDefaultSession();
     String alterStmt = "ALTER ROLE alter_test_5 WITH LOGIN = false";
@@ -246,6 +115,41 @@ public class TestAuthentication extends BaseAuthenticationCQLTest {
   @Test(timeout = 100000)
   public void testConnectWithDefaultUserPass() throws Exception {
     checkConnectivity(true, "cassandra", "cassandra", false);
+  }
+
+  @Test(timeout = 100000)
+  public void testConnectWithWrongPass() throws Exception {
+    testCreateRoleHelper("someuser", "somepass", true, true);
+    checkConnectivity(true, "someuser", "wrongpass", true);
+  }
+
+  @Test(timeout = 100000)
+  public void testConnectWithNoLogin() throws Exception {
+    String createStmt = String.format("CREATE ROLE 'usernnologin' WITH PASSWORD='abc'");
+    Session s = getDefaultSession();
+    s.execute(createStmt);
+    checkConnectivityWithMessage(true, "usernnologin", "abc",
+        ProtocolOptions.Compression.NONE,true, "is not permitted to log in");
+  }
+
+  @Test(timeout = 100000)
+  public void testConnectWihtNoLoginAndNoPass() throws Exception {
+    String createStmt = String.format("CREATE ROLE 'usernnologinnopass'");
+    Session s = getDefaultSession();
+    s.execute(createStmt);
+    checkConnectivityWithMessage(true, "usernnologinnopass", "abc",
+        ProtocolOptions.Compression.NONE,true, "and/or password are incorrect");
+  }
+
+  // This tests fix for https://github.com/yugabyte/yugabyte-db/issues/4459.
+  // Before this fix, the tserver process would crash when trying to check the credentials because
+  // it couldn't handle roles that were created without a password.
+  @Test(timeout = 100000)
+    public void testConnectWithRoleThatHasNoPass() throws Exception {
+    String createStmt = String.format("CREATE ROLE 'usernopass' WITH LOGIN = true");
+    Session s = getDefaultSession();
+    s.execute(createStmt);
+    checkConnectivity(true, "usernopass", "abc", true);
   }
 
   @Test(timeout = 100000)
@@ -382,5 +286,52 @@ public class TestAuthentication extends BaseAuthenticationCQLTest {
     thrown.expect(com.datastax.driver.core.exceptions.InvalidQueryException.class);
     thrown.expectMessage("Cannot DROP primary role for current login");
     s2.execute(String.format("DROP ROLE %s", user));
+  }
+
+  @Test
+  public void testDuplicatePasswordIsValid() throws Exception {
+    String role1 = "duplicate_password_role1";
+    String role2 = "duplicate_password_role2";
+    String password = "abc";
+
+    testCreateRoleHelper(role1, password, true, false);
+    testCreateRoleHelper(role2, password, true, false);
+
+    Session s1 = getSession(role1, password);
+    Session s2 = getSession(role2, password);
+  }
+
+  @Test
+  public void testMultipleLoginWithinCache() throws Exception {
+    int roleCount = 4;
+    String password = "abc";
+
+    for (int i = 0; i < roleCount; i++) {
+      String role = String.format("cache_role%d", i);
+      testCreateRoleHelper(role, password, true, false);
+    }
+
+    for (int j = 0; j < 3; j++) {
+      for (int i = 0; i < roleCount; i++) {
+        String role = String.format("cache_role%d", i);
+        Session s = getSession(role, password);
+      }
+    }
+  }
+
+  @Test(timeout=500000)
+  public void testLoginExhaustCache() throws Exception {
+    int roleCount = 10;
+    String password = "abc";
+
+    for (int i = 0; i < roleCount; i++) {
+      String role = String.format("exhaust_role%d", i);
+      testCreateRoleHelper(role, password, true, false);
+    }
+
+    for (int i = 0; i < roleCount; i++) {
+      String role = String.format("exhaust_role%d", i);
+      Session s = getSession(role, password);
+    }
   }
 }

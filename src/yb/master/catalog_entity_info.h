@@ -37,15 +37,15 @@
 
 #include <mutex>
 
-#include "yb/master/ts_descriptor.h"
+#include "yb/common/entity_ids.h"
+#include "yb/common/index.h"
+#include "yb/common/schema.h"
 #include "yb/master/master.pb.h"
 #include "yb/master/tasks_tracker.h"
-#include "yb/util/cow_object.h"
-#include "yb/common/entity_ids.h"
-#include "yb/util/monotime.h"
+#include "yb/master/ts_descriptor.h"
 #include "yb/server/monitored_task.h"
-#include "yb/common/schema.h"
-#include "yb/common/index.h"
+#include "yb/util/cow_object.h"
+#include "yb/util/monotime.h"
 
 namespace yb {
 namespace master {
@@ -58,6 +58,11 @@ struct TabletReplica {
   consensus::RaftPeerPB::Role role;
   consensus::RaftPeerPB::MemberType member_type;
   MonoTime time_updated;
+
+  // Replica is reporting that load balancer moves should be disabled. This could happen in the case
+  // where a tablet has just been split and still refers to data from its parent which is no longer
+  // relevant, for example.
+  bool should_disable_lb_move = false;
 
   TabletReplica() : time_updated(MonoTime::Now()) {}
 
@@ -160,6 +165,7 @@ struct PersistentTabletInfo : public Persistent<SysTabletsEntryPB, SysRowEntry::
 };
 
 class TableInfo;
+typedef scoped_refptr<TableInfo> TableInfoPtr;
 
 typedef std::unordered_map<TabletServerId, MonoTime> LeaderStepDownFailureTimes;
 
@@ -189,13 +195,14 @@ class TabletInfo : public RefCountedThreadSafe<TabletInfo>,
   virtual const TabletId& id() const override { return tablet_id_; }
 
   const TabletId& tablet_id() const { return tablet_id_; }
-  const scoped_refptr<TableInfo>& table() const { return table_; }
+  scoped_refptr<const TableInfo> table() const { return table_; }
+  const scoped_refptr<TableInfo>& table() { return table_; }
 
   // Accessors for the latest known tablet replica locations.
   // These locations include only the members of the latest-reported Raft
   // configuration whose tablet servers have ever heartbeated to this Master.
-  void SetReplicaLocations(ReplicaMap replica_locations);
-  void GetReplicaLocations(ReplicaMap* replica_locations) const;
+  void SetReplicaLocations(std::shared_ptr<ReplicaMap> replica_locations);
+  std::shared_ptr<const ReplicaMap> GetReplicaLocations() const;
   Result<TSDescriptor*> GetLeader() const;
 
   // Replaces a replica in replica_locations_ map if it exists. Otherwise, it adds it to the map.
@@ -206,8 +213,8 @@ class TabletInfo : public RefCountedThreadSafe<TabletInfo>,
   MonoTime last_update_time() const;
 
   // Accessors for the last reported schema version.
-  bool set_reported_schema_version(uint32_t version);
-  uint32_t reported_schema_version() const;
+  bool set_reported_schema_version(const TableId& table_id, uint32_t version);
+  uint32_t reported_schema_version(const TableId& table_id);
 
   bool colocated() const;
 
@@ -225,6 +232,14 @@ class TabletInfo : public RefCountedThreadSafe<TabletInfo>,
   // failures that happened before a certain point in time.
   void GetLeaderStepDownFailureTimes(MonoTime forget_failures_before,
                                      LeaderStepDownFailureTimes* dest);
+
+  CHECKED_STATUS CheckRunning() const;
+
+  bool InitiateElection() {
+    bool expected = false;
+    return initiated_election_.compare_exchange_strong(expected, true);
+  }
+
  private:
   friend class RefCountedThreadSafe<TabletInfo>;
 
@@ -247,12 +262,14 @@ class TabletInfo : public RefCountedThreadSafe<TabletInfo>,
 
   // The locations in the latest Raft config where this tablet has been
   // reported. The map is keyed by tablet server UUID.
-  ReplicaMap replica_locations_;
+  std::shared_ptr<ReplicaMap> replica_locations_;
 
   // Reported schema version (in-memory only).
-  uint32_t reported_schema_version_ = 0;
+  std::unordered_map<TableId, uint32_t> reported_schema_version_ = {};
 
   LeaderStepDownFailureTimes leader_stepdown_failure_times_;
+
+  std::atomic<bool> initiated_election_{false};
 
   DISALLOW_COPY_AND_ASSIGN(TabletInfo);
 };
@@ -290,7 +307,9 @@ struct PersistentTableInfo : public Persistent<SysTablesEntryPB, SysRowEntry::TA
   }
 
   // Return the table's namespace id.
-  const NamespaceName& namespace_id() const { return pb.namespace_id(); }
+  const NamespaceId& namespace_id() const { return pb.namespace_id(); }
+  // Return the table's namespace name.
+  const NamespaceName& namespace_name() const { return pb.namespace_name(); }
 
   const SchemaPB& schema() const {
     return pb.schema();
@@ -324,6 +343,7 @@ class TableInfo : public RefCountedThreadSafe<TableInfo>,
   std::string ToStringWithState() const;
 
   const NamespaceId namespace_id() const;
+  const NamespaceName namespace_name() const;
 
   const CHECKED_STATUS GetSchema(Schema* schema) const;
 
@@ -335,9 +355,16 @@ class TableInfo : public RefCountedThreadSafe<TableInfo>,
   // Return the indexed table id if the table is an index table. Otherwise, return an empty string.
   const std::string indexed_table_id() const;
 
+  bool is_index() const {
+    return !indexed_table_id().empty();
+  }
+
   // For index table
   bool is_local_index() const;
   bool is_unique_index() const;
+
+  void set_is_system() { is_system_ = true; }
+  bool is_system() const { return is_system_; }
 
   // Return the table type of the table.
   TableType GetTableType() const;
@@ -349,6 +376,7 @@ class TableInfo : public RefCountedThreadSafe<TableInfo>,
 
   // Add a tablet to this table.
   void AddTablet(TabletInfo *tablet);
+
   // Add multiple tablets to this table.
   void AddTablets(const std::vector<TabletInfo*>& tablets);
 
@@ -358,6 +386,12 @@ class TableInfo : public RefCountedThreadSafe<TableInfo>,
 
   // This only returns tablets which are in RUNNING state.
   void GetTabletsInRange(const GetTableLocationsRequestPB* req, TabletInfos *ret) const;
+  void GetTabletsInRange(
+      const std::string& partition_key_start, const std::string& partition_key_end,
+      TabletInfos* ret,
+      int32_t max_returned_locations = std::numeric_limits<int32_t>::max()) const;
+
+  std::size_t NumTablets() const;
 
   // Get all tablets of the table.
   void GetAllTablets(TabletInfos *ret) const;
@@ -394,6 +428,7 @@ class TableInfo : public RefCountedThreadSafe<TableInfo>,
   // Get the Status of the last error from the current CreateTable.
   CHECKED_STATUS GetCreateTableErrorStatus() const;
 
+  std::size_t NumLBTasks() const;
   std::size_t NumTasks() const;
   bool HasTasks() const;
   bool HasTasks(MonitoredTask::Type type) const;
@@ -405,6 +440,19 @@ class TableInfo : public RefCountedThreadSafe<TableInfo>,
 
   // Allow for showing outstanding tasks in the master UI.
   std::unordered_set<std::shared_ptr<MonitoredTask>> GetTasks();
+
+  // Returns whether this is a type of table that will use tablespaces
+  // for placement.
+  bool UsesTablespacesForPlacement() const;
+
+  // Provides the ID of the tablespace that will be used to determine
+  // where the tablets for this table should be placed when the table
+  // is first being created.
+  TablespaceId TablespaceIdForTableCreation() const;
+
+  // Set the tablespace to use during table creation. This will determine
+  // where the tablets of the newly created table should reside.
+  void SetTablespaceIdForTableCreation(const TablespaceId& tablespace_id);
 
  private:
   friend class RefCountedThreadSafe<TableInfo>;
@@ -431,12 +479,21 @@ class TableInfo : public RefCountedThreadSafe<TableInfo>,
   // In memory state set during backfill to prevent multiple backfill jobs.
   bool is_backfilling_ = false;
 
+  std::atomic<bool> is_system_{false};
+
   // List of pending tasks (e.g. create/alter tablet requests).
   std::unordered_set<std::shared_ptr<MonitoredTask>> pending_tasks_;
 
   // The last error Status of the currently running CreateTable. Will be OK, if freshly constructed
   // object, or if the CreateTable was successful.
   Status create_table_error_;
+
+  // This field denotes the tablespace id that the user specified while
+  // creating the table. This will be used only to place tablets at the time
+  // of table creation. At all other times, this information needs to be fetched
+  // from PG catalog tables because the user may have used Alter Table to change
+  // the table's tablespace.
+  TablespaceId tablespace_id_for_table_creation_;
 
   DISALLOW_COPY_AND_ASSIGN(TableInfo);
 };
@@ -496,13 +553,15 @@ class NamespaceInfo : public RefCountedThreadSafe<NamespaceInfo>,
  public:
   explicit NamespaceInfo(NamespaceId ns_id);
 
-  virtual const std::string& id() const override { return namespace_id_; }
+  virtual const NamespaceId& id() const override { return namespace_id_; }
 
   const NamespaceName& name() const;
 
   YQLDatabase database_type() const;
 
   bool colocated() const;
+
+  ::yb::master::SysNamespaceEntryPB_State state() const;
 
   std::string ToString() const override;
 
@@ -516,6 +575,37 @@ class NamespaceInfo : public RefCountedThreadSafe<NamespaceInfo>,
   DISALLOW_COPY_AND_ASSIGN(NamespaceInfo);
 };
 
+// The information about a tablegroup.
+class TablegroupInfo : public RefCountedThreadSafe<TablegroupInfo>{
+ public:
+  explicit TablegroupInfo(TablegroupId tablegroup_id,
+                          NamespaceId namespace_id);
+
+  const std::string& id() const { return tablegroup_id_; }
+  const std::string& namespace_id() const { return namespace_id_; }
+
+  // Operations to track table_set_ information (what tables belong to the tablegroup)
+  void AddChildTable(const TableId& table_id);
+  void DeleteChildTable(const TableId& table_id);
+  bool HasChildTables() const;
+  std::size_t NumChildTables() const;
+
+ private:
+  friend class RefCountedThreadSafe<TablegroupInfo>;
+  ~TablegroupInfo() = default;
+
+  // The tablegroup ID is used in the catalog manager maps to look up the proper
+  // tablet to add user tables to.
+  const TablegroupId tablegroup_id_;
+  const NamespaceId namespace_id_;
+
+  // Protects table_set_.
+  mutable simple_spinlock lock_;
+  std::unordered_set<TableId> table_set_;
+
+  DISALLOW_COPY_AND_ASSIGN(TablegroupInfo);
+};
+
 // The data related to a User-Defined Type which is persisted on disk.
 // This portion of UDTypeInfo is managed via CowObject.
 // It wraps the underlying protobuf to add useful accessors.
@@ -526,7 +616,7 @@ struct PersistentUDTypeInfo : public Persistent<SysUDTypeEntryPB, SysRowEntry::U
   }
 
   // Return the table's namespace id.
-  const NamespaceName& namespace_id() const {
+  const NamespaceId& namespace_id() const {
     return pb.namespace_id();
   }
 
@@ -557,7 +647,7 @@ class UDTypeInfo : public RefCountedThreadSafe<UDTypeInfo>,
 
   const UDTypeName& name() const;
 
-  const NamespaceName& namespace_id() const;
+  const NamespaceId& namespace_id() const;
 
   int field_names_size() const;
 
@@ -659,8 +749,9 @@ class SysConfigInfo : public RefCountedThreadSafe<SysConfigInfo>,
 };
 
 // Convenience typedefs.
-typedef std::unordered_map<TabletId, scoped_refptr<TabletInfo>> TabletInfoMap;
-typedef std::unordered_map<TableId, scoped_refptr<TableInfo>> TableInfoMap;
+// Table(t)InfoMap ordered for deterministic locking.
+typedef std::map<TabletId, scoped_refptr<TabletInfo>> TabletInfoMap;
+typedef std::map<TableId, scoped_refptr<TableInfo>> TableInfoMap;
 typedef std::pair<NamespaceId, TableName> TableNameKey;
 typedef std::unordered_map<
     TableNameKey, scoped_refptr<TableInfo>, boost::hash<TableNameKey>> TableInfoByNameMap;

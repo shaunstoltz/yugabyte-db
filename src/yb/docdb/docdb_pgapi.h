@@ -28,7 +28,6 @@
 
 #include "yb/common/ql_value.h"
 #include "yb/common/schema.h"
-#include "yb/common/ql_expr.h"
 
 namespace yb {
 namespace docdb {
@@ -37,6 +36,16 @@ namespace docdb {
 // Types
 //-----------------------------------------------------------------------------
 
+struct DocPgParamDesc {
+    int32_t attno;
+    int32_t typid;
+    int32_t typmod;
+
+    DocPgParamDesc(int32_t attno, int32_t typid, int32_t typmod)
+        : attno(attno), typid(typid), typmod(typmod)
+    {}
+};
+
 const YBCPgTypeEntity* DocPgGetTypeEntity(YbgTypeDesc pg_type);
 
 //-----------------------------------------------------------------------------
@@ -44,12 +53,25 @@ const YBCPgTypeEntity* DocPgGetTypeEntity(YbgTypeDesc pg_type);
 //-----------------------------------------------------------------------------
 
 Status DocPgEvalExpr(const std::string& expr_str,
-                     int32_t col_attrno,
-                     int32_t ret_typeid,
-                     int32_t ret_typemod,
+                     std::vector<DocPgParamDesc> params,
                      const QLTableRow& table_row,
                      const Schema *schema,
                      QLValue* result);
+
+// Given a 'ql_value' with a binary value, interpret the binary value as a text
+// array, and store the individual elements in 'ql_value_vec';
+Status ExtractTextArrayFromQLBinaryValue(const QLValuePB& ql_value,
+                                         std::vector<QLValuePB> *const ql_value_vec);
+
+// Given a 'ql_value', interpret the binary value in it as an array of type
+// 'array_type' with elements of type 'elem_type' and store the individual
+// elements in 'result'. Here, 'array_type' and 'elem_type' are PG typoids
+// corresponding to the required array and element types.
+Status ExtractVectorFromQLBinaryValueHelper(
+    const QLValuePB& ql_value,
+    const int array_type,
+    const int elem_type,
+    std::vector<QLValuePB> *result);
 
 } // namespace docdb
 } // namespace yb

@@ -95,6 +95,7 @@ build_cpp_code() {
   set_yb_src_root "$1"
 
   heading "Building C++ code in $YB_SRC_ROOT."
+
   remote_opt=""
   if [[ ${YB_REMOTE_COMPILATION:-} == "1" ]]; then
     # This helps with our background script resizing the build cluster, because it looks at all
@@ -187,13 +188,8 @@ export YB_USE_NINJA=1
 set_cmake_build_type_and_compiler_type
 
 if [[ ${YB_DOWNLOAD_THIRDPARTY:-auto} == "auto" ]]; then
-  if is_linux; then
-    log "Setting YB_DOWNLOAD_THIRDPARTY=1 automatically on Linux"
-    export YB_DOWNLOAD_THIRDPARTY=1
-  else
-    log "Setting YB_DOWNLOAD_THIRDPARTY=0 automatically (not Linux)"
-    export YB_DOWNLOAD_THIRDPARTY=0
-  fi
+  log "Setting YB_DOWNLOAD_THIRDPARTY=1 automatically"
+  export YB_DOWNLOAD_THIRDPARTY=1
 fi
 log "YB_DOWNLOAD_THIRDPARTY=$YB_DOWNLOAD_THIRDPARTY"
 
@@ -262,9 +258,11 @@ export BUILD_ROOT
 # End of build root setup and build directory cleanup
 # -------------------------------------------------------------------------------------------------
 
+"$YB_SRC_ROOT/yb_build.sh" --cmake-unit-tests
+
 find_or_download_thirdparty
 validate_thirdparty_dir
-detect_brew
+detect_toolchain
 log_thirdparty_and_toolchain_details
 find_make_or_ninja_and_update_cmake_opts
 
@@ -566,18 +564,10 @@ random_build_id=$( date +%Y%m%dT%H%M%S )_$RANDOM$RANDOM$RANDOM
 # Java build
 # -------------------------------------------------------------------------------------------------
 
-if is_linux; then
-  export YB_MVN_LOCAL_REPO=$BUILD_ROOT/m2_repository
-fi
+export YB_MVN_LOCAL_REPO=$BUILD_ROOT/m2_repository
 
 java_build_failed=false
 if [[ $YB_BUILD_JAVA == "1" && $YB_SKIP_BUILD != "1" ]]; then
-  # This sets the proper NFS-shared directory for Maven's local repository on Jenkins.
-  # Use a unique version to avoid a race with other concurrent jobs on jar files that we install
-  # into ~/.m2/repository.
-  if is_mac; then
-    export YB_TMP_GROUP_ID=org.ybtmpgroupid$random_build_id
-  fi
   set_mvn_parameters
 
   heading "Building Java code..."
@@ -591,16 +581,6 @@ if [[ $YB_BUILD_JAVA == "1" && $YB_SKIP_BUILD != "1" ]]; then
 
   for java_project_dir in "${yb_java_project_dirs[@]}"; do
     pushd "$java_project_dir"
-    # For macs, we still need to do the custom java group id.
-    if is_mac; then
-      heading \
-        "Changing groupId from 'org.yb' to '$YB_TMP_GROUP_ID' in directory '$java_project_dir'"
-      find "$java_project_dir" -name "pom.xml" | \
-        while read pom_file_path; do
-          sed_i "s#<groupId>org[.]yb</groupId>#<groupId>$YB_TMP_GROUP_ID</groupId>#g" \
-                "$pom_file_path"
-        done
-    fi
     heading "Building Java code in directory '$java_project_dir'"
     if ! build_yb_java_code_with_retries -DskipTests clean install; then
       EXIT_STATUS=1
@@ -630,20 +610,6 @@ if [[ $YB_BUILD_JAVA == "1" && $YB_SKIP_BUILD != "1" ]]; then
   get_current_git_sha1
   export YB_VERSION_INFO_GIT_SHA1=$current_git_sha1
 
-  # For macs, we still need to do the custom java group id.
-  if is_mac; then
-    heading "Committing local changes (groupId update)"
-    commit_msg="Updating groupId to $YB_TMP_GROUP_ID during testing"
-
-    (
-      set -x
-      cd "$YB_SRC_ROOT"
-      git add -A .
-      git commit -m "$commit_msg"
-    )
-    unset commit_msg
-  fi
-
   collect_java_tests
 
   log "Finished building Java code (see timing information above)"
@@ -655,9 +621,14 @@ fi
 # Skip this in ASAN/TSAN, as there are still unresolved issues with dynamic libraries there
 # (conflicting versions of the same library coming from thirdparty vs. Linuxbrew) as of 12/04/2017.
 #
+# Also skip it for compiler types with a specific version at the end, e.g. clang11 or gcc9. These
+# build types are Linux builds that do not use Linuxbrew and we still need to significantly change
+# the logic in library_packager.py for packaging to work in those builds (as of 01/2021).
+
 if [[ ${YB_SKIP_CREATING_RELEASE_PACKAGE:-} != "1" &&
       $build_type != "tsan" &&
-      $build_type != "asan" ]]; then
+      $build_type != "asan" &&
+      $YB_COMPILER_TYPE != *[0-9] ]]; then
   heading "Creating a distribution package"
 
   package_path_file="$BUILD_ROOT/package_path.txt"
@@ -679,6 +650,9 @@ if [[ ${YB_SKIP_CREATING_RELEASE_PACKAGE:-} != "1" &&
   )
 
   if [[ ${YB_BUILD_YW:-0} == "1" ]]; then
+    # This is needed for build.sbt to use YB Client jars that we've built and installed to
+    # YB_MVN_LOCAL_REPO.
+    export USE_MAVEN_LOCAL=true
     yb_release_cmd+=( --yw )
   fi
 
@@ -743,9 +717,14 @@ if [[ $YB_COMPILE_ONLY != "1" ]]; then
         extra_args+=( "--test_conf" "$test_conf_path" )
         unset test_conf_path
       fi
-      if is_linux; then
+      if is_linux || (is_mac && ! is_src_root_on_nfs); then
         log "Will create an archive for Spark workers with all the code instead of using NFS."
         extra_args+=( "--send_archive_to_workers" )
+      fi
+      # Workers use /private path, which caused mis-match when check is done by yb_dist_tests that
+      # YB_MVN_LOCAL_REPO is in source tree. So unsetting value here to allow default.
+      if is_mac; then
+        unset YB_MVN_LOCAL_REPO
       fi
       set +u  # because extra_args can be empty
       if ! run_tests_on_spark "${extra_args[@]}"; then

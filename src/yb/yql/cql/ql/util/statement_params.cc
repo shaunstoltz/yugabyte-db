@@ -25,15 +25,15 @@ namespace ql {
 using std::string;
 
 StatementParameters::StatementParameters()
-  : page_size_(INT64_MAX),
-    yb_consistency_level_(YBConsistencyLevel::STRONG) {
+    : page_size_(INT64_MAX),
+      yb_consistency_level_(YBConsistencyLevel::STRONG) {
 }
 
 StatementParameters::StatementParameters(const StatementParameters& other)
-  : page_size_(other.page_size_),
-    paging_state_(
-      other.paging_state_ != nullptr ? new QLPagingStatePB(*other.paging_state_) : nullptr),
-    yb_consistency_level_(YBConsistencyLevel::STRONG) {
+    : page_size_(other.page_size_),
+      paging_state_(
+        other.paging_state_ != nullptr ? new QLPagingStatePB(*other.paging_state_) : nullptr),
+      yb_consistency_level_(YBConsistencyLevel::STRONG) {
 }
 
 StatementParameters::~StatementParameters() {
@@ -54,7 +54,7 @@ Status StatementParameters::SetPagingState(const std::string& paging_state) {
     paging_state_.reset(new QLPagingStatePB());
   }
   if (!paging_state_->ParseFromString(paging_state)) {
-    STATUS(Corruption, "Invalid paging state");
+    return STATUS(Corruption, "Invalid paging state");
   }
 
   if (paging_state_->has_original_request_id()) {

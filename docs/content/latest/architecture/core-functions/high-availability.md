@@ -2,9 +2,9 @@
 title: High availability
 headerTitle: High availability
 linkTitle: High availability
-description: Learn about how YugabyteDB maintains high availability using active replicas.
+description: Learn how YugabyteDB maintains continuous availability using multiple replicas.
 aliases:
-  - /architecture/core-functions/high-availability/
+  - latest/architecture/core-functions/high-availability/
 menu:
   latest:
     identifier: high-availability
@@ -16,7 +16,7 @@ showAsideToc: true
 
 As discussed before, YugabyteDB is a CP database (consistent and partition tolerant), but achieves very high availability (HA). It achieves this HA by having an active replica that is ready to take over as a new leader in a matter of seconds after the failure of the current leader and serve requests.
 
-If a node fails, it causes the outage of the processes running on it. These would be a YB-TServer and the YB-Master (if one was running on that node). Let us look at what happens in each of these cases.
+If a node fails, it causes the outage of the servers running on it. These would be a YB-TServer and the YB-Master (if one was running on that node). Let us look at what happens in each of these cases.
 
 ## YB-TServer failure
 

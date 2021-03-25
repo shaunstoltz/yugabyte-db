@@ -290,7 +290,7 @@ public class TestPgUniqueConstraint extends BasePgSQLTest {
       assertQuery(
           stmt,
           "EXPLAIN (COSTS OFF) SELECT * FROM test WHERE (i1, i2) < (4, 4)",
-          new Row("Foreign Scan on test"),
+          new Row("Seq Scan on test"),
           new Row("  Filter: (ROW(i1, i2) < ROW(4, 4))")
       );
 
@@ -303,7 +303,7 @@ public class TestPgUniqueConstraint extends BasePgSQLTest {
       assertQuery(
           stmt,
           "EXPLAIN (COSTS OFF) SELECT * FROM test WHERE (i1, i2) < (4, 4)",
-          new Row("Foreign Scan on test"),
+          new Row("Seq Scan on test"),
           new Row("  Filter: (ROW(i1, i2) < ROW(4, 4))")
       );
     }
@@ -332,25 +332,19 @@ public class TestPgUniqueConstraint extends BasePgSQLTest {
           stmt,
           "ALTER TABLE test ADD CONSTRAINT test_constr UNIQUE " +
               "USING INDEX test_idx DEFERRABLE INITIALLY DEFERRED",
-          "DEFERRABLE constraint not supported yet"
+          "DEFERRABLE unique constraints are not supported yet"
       );
       runInvalidQuery(
           stmt,
           "ALTER TABLE test ADD CONSTRAINT test_constr UNIQUE " +
               "USING INDEX test_idx DEFERRABLE INITIALLY IMMEDIATE",
-          "DEFERRABLE constraint not supported yet"
+          "DEFERRABLE unique constraints are not supported yet"
       );
       runInvalidQuery(
           stmt,
           "ALTER TABLE test ADD CONSTRAINT test_constr UNIQUE " +
               "USING INDEX test_idx INITIALLY DEFERRED",
-          "INITIALLY DEFERRED constraint not supported yet"
-      );
-      runInvalidQuery(
-          stmt,
-          "ALTER TABLE test ADD CONSTRAINT test_constr UNIQUE " +
-              "USING INDEX test_idx INITIALLY IMMEDIATE",
-          "INITIALLY IMMEDIATE constraint not supported yet"
+          "DEFERRABLE unique constraints are not supported yet"
       );
       stmt.execute("ALTER TABLE test ADD CONSTRAINT test_constr UNIQUE " +
           "USING INDEX test_idx NOT DEFERRABLE");
@@ -380,7 +374,11 @@ public class TestPgUniqueConstraint extends BasePgSQLTest {
       stmt.executeUpdate("INSERT INTO test VALUES (1, 1)");
       stmt.executeUpdate("INSERT INTO test VALUES (2, 1)");
 
-      runInvalidQuery(stmt, "CREATE UNIQUE INDEX test_v on test(v)", "duplicate key");
+      runInvalidQuery(
+          stmt,
+          "CREATE UNIQUE INDEX NONCONCURRENTLY test_v on test(v)",
+          "duplicate key"
+      );
 
       // Make sure index has no leftovers
       runInvalidQuery(stmt, "DROP INDEX test_v", "does not exist");

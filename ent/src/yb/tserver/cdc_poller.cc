@@ -24,8 +24,14 @@
 #include "yb/util/logging.h"
 #include "yb/util/threadpool.h"
 
+// Similar heuristic to heartbeat_interval in heartbeater.cc.
 DEFINE_int32(async_replication_polling_delay_ms, 0,
-             "How long to delay in ms between applying and repolling.");
+             "How long to delay in ms between applying and polling.");
+DEFINE_int32(async_replication_idle_delay_ms, 100,
+             "How long to delay between polling when we expect no data at the destination.");
+DEFINE_int32(async_replication_max_idle_wait, 3,
+             "Maximum number of consecutive empty GetChanges until the poller "
+             "backs off to the idle interval, rather than immediately retrying.");
 DEFINE_int32(replication_failure_delay_exponent, 16 /* ~ 2^16/1000 ~= 65 sec */,
              "Max number of failures (N) to use when calculating exponential backoff (2^N-1).");
 DEFINE_bool(cdc_consumer_use_proxy_forwarding, false,
@@ -43,6 +49,7 @@ CDCPoller::CDCPoller(const cdc::ProducerTabletInfo& producer_tablet_info,
                      std::function<bool(void)> should_continue_polling,
                      std::function<void(void)> remove_self_from_pollers_map,
                      ThreadPool* thread_pool,
+                     rpc::Rpcs* rpcs,
                      const std::shared_ptr<CDCClient>& local_client,
                      const std::shared_ptr<CDCClient>& producer_client,
                      CDCConsumer* cdc_consumer,
@@ -57,11 +64,18 @@ CDCPoller::CDCPoller(const cdc::ProducerTabletInfo& producer_tablet_info,
         cdc_consumer,
         consumer_tablet_info,
         local_client,
+        rpcs,
         std::bind(&CDCPoller::HandleApplyChanges, this, std::placeholders::_1),
         use_local_tserver)),
     producer_client_(producer_client),
     thread_pool_(thread_pool),
+    rpcs_(rpcs),
+    poll_handle_(rpcs_->InvalidHandle()),
     cdc_consumer_(cdc_consumer) {}
+
+CDCPoller::~CDCPoller() {
+  rpcs_->Abort({&poll_handle_});
+}
 
 std::string CDCPoller::LogPrefixUnlocked() const {
   return strings::Substitute("P [$0:$1] C [$2:$3]: ",
@@ -90,12 +104,18 @@ void CDCPoller::Poll() {
 void CDCPoller::DoPoll() {
   RETURN_WHEN_OFFLINE();
 
+  auto retained = shared_from_this();
   std::lock_guard<std::mutex> l(data_mutex_);
 
   // determine if we should delay our upcoming poll
-  if (FLAGS_async_replication_polling_delay_ms > 0 || poll_failures_ > 0) {
-    int64_t delay = max(FLAGS_async_replication_polling_delay_ms, // user setting
-                        (1 << poll_failures_) -1); // failure backoff
+  int64_t delay = FLAGS_async_replication_polling_delay_ms; // normal throttling.
+  if (idle_polls_ >= FLAGS_async_replication_max_idle_wait) {
+    delay = max(delay, (int64_t)FLAGS_async_replication_idle_delay_ms); // idle backoff.
+  }
+  if (poll_failures_ > 0) {
+    delay = max(delay, (int64_t)1 << poll_failures_); // exponential backoff for failures.
+  }
+  if (delay > 0) {
     SleepFor(MonoDelta::FromMilliseconds(delay));
   }
 
@@ -115,39 +135,37 @@ void CDCPoller::DoPoll() {
     *req.mutable_from_checkpoint() = checkpoint;
   }
 
-  auto rpcs = producer_client_->rpcs;
-  auto read_rpc_handle = rpcs->Prepare();
-  if (read_rpc_handle != rpcs->InvalidHandle()) {
-    *read_rpc_handle = CreateGetChangesCDCRpc(
-        CoarseMonoClock::now() + MonoDelta::FromMilliseconds(FLAGS_cdc_read_rpc_timeout_ms),
-        nullptr, /* RemoteTablet: will get this from 'req' */
-        producer_client_->client.get(),
-        &req,
-        [=](const Status &status, cdc::GetChangesResponsePB &&new_resp) {
-          auto retained = rpcs->Unregister(read_rpc_handle);
-          auto resp = std::make_shared<cdc::GetChangesResponsePB>(std::move(new_resp));
-          WARN_NOT_OK(thread_pool_->SubmitFunc(std::bind(&CDCPoller::HandlePoll, this,
-                                                         status, resp)),
-                      "Could not submit HandlePoll to thread pool");
-        });
-    (**read_rpc_handle).SendRpc();
-  } else {
-    // Handle the Poll as a failure so repeated invocations will incur backoff.
-    WARN_NOT_OK(thread_pool_->SubmitFunc(std::bind(&CDCPoller::HandlePoll, this,
-                  STATUS(Aborted, LogPrefixUnlocked() + "InvalidHandle for GetChangesCDCRpc"),
-                  resp_)),
-                "Could not submit HandlePoll to thread pool");
+  auto rpcs = rpcs_;
+  poll_handle_ = rpcs->Prepare();
+  if (poll_handle_ == rpcs->InvalidHandle()) {
+    return remove_self_from_pollers_map_();
   }
+
+  *poll_handle_ = CreateGetChangesCDCRpc(
+      CoarseMonoClock::now() + MonoDelta::FromMilliseconds(FLAGS_cdc_read_rpc_timeout_ms),
+      nullptr, /* RemoteTablet: will get this from 'req' */
+      producer_client_->client.get(),
+      &req,
+      [=](const Status &status, cdc::GetChangesResponsePB &&new_resp) {
+        auto retained = rpcs->Unregister(&poll_handle_);
+        auto resp = std::make_shared<cdc::GetChangesResponsePB>(std::move(new_resp));
+        WARN_NOT_OK(thread_pool_->SubmitFunc(std::bind(&CDCPoller::HandlePoll, this,
+                                                       status, resp)),
+                    "Could not submit HandlePoll to thread pool");
+      });
+  (**poll_handle_).SendRpc();
 }
 
 void CDCPoller::HandlePoll(yb::Status status,
                            std::shared_ptr<cdc::GetChangesResponsePB> resp) {
   RETURN_WHEN_OFFLINE();
+
+  auto retained = shared_from_this();
+  std::lock_guard<std::mutex> l(data_mutex_);
+
   if (!should_continue_polling_()) {
     return remove_self_from_pollers_map_();
   }
-
-  std::lock_guard<std::mutex> l(data_mutex_);
 
   status_ = status;
   resp_ = resp;
@@ -185,11 +203,13 @@ void CDCPoller::HandleApplyChanges(cdc::OutputClientResponse response) {
 
 void CDCPoller::DoHandleApplyChanges(cdc::OutputClientResponse response) {
   RETURN_WHEN_OFFLINE();
+
+  auto retained = shared_from_this();
+  std::lock_guard<std::mutex> l(data_mutex_);
+
   if (!should_continue_polling_()) {
     return remove_self_from_pollers_map_();
   }
-
-  std::lock_guard<std::mutex> l(data_mutex_);
 
   if (!response.status.ok()) {
     LOG_WITH_PREFIX_UNLOCKED(WARNING) << "ApplyChanges failure: " << response.status;
@@ -203,6 +223,8 @@ void CDCPoller::DoHandleApplyChanges(cdc::OutputClientResponse response) {
   apply_failures_ = max(apply_failures_ - 2, 0); // recover slowly if we've gotten congested
 
   op_id_ = response.last_applied_op_id;
+
+  idle_polls_ = (response.processed_record_count == 0) ? idle_polls_ + 1 : 0;
 
   Poll();
 }

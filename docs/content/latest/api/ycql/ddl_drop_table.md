@@ -2,7 +2,6 @@
 title: DROP TABLE statement [YCQL]
 headerTitle: DROP TABLE
 linkTitle: DROP TABLE
-summary: Remove a table
 description: Use the DROP TABLE statement to remove a table and all of its data from the database.
 menu:
   latest:
@@ -43,11 +42,11 @@ Where
 ## Examples
 
 ```sql
-cqlsh:example> CREATE TABLE users(id INT PRIMARY KEY, name TEXT);
+ycqlsh:example> CREATE TABLE users(id INT PRIMARY KEY, name TEXT);
 ```
 
 ```sql
-cqlsh:example> DROP TABLE users;
+ycqlsh:example> DROP TABLE users;
 ```
 
 ## See also

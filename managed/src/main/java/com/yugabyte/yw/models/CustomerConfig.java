@@ -2,10 +2,10 @@
 
 package com.yugabyte.yw.models;
 
-import com.avaje.ebean.Model;
-import com.avaje.ebean.annotation.DbJson;
-import com.avaje.ebean.annotation.EnumValue;
-import com.avaje.ebean.annotation.JsonIgnore;
+import io.ebean.*;
+import io.ebean.annotation.DbJson;
+import io.ebean.annotation.EnumValue;
+import io.ebean.annotation.JsonIgnore;
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.fasterxml.jackson.databind.node.ObjectNode;
@@ -29,6 +29,7 @@ import com.yugabyte.yw.common.CallHomeManager.CollectionLevel;
 public class CustomerConfig extends Model {
   public static final Logger LOG = LoggerFactory.getLogger(CustomerConfig.class);
   public static final String ALERTS_PREFERENCES = "preferences";
+  public static final String SMTP_INFO = "smtp info";
   public static final String CALLHOME_PREFERENCES = "callhome level";
 
   public enum ConfigType {
@@ -74,7 +75,8 @@ public class CustomerConfig extends Model {
   @JsonIgnore
   public JsonNode data;
 
-  public static final Find<UUID, CustomerConfig> find = new Find<UUID, CustomerConfig>(){};
+  public static final Finder<UUID, CustomerConfig> find =
+    new Finder<UUID, CustomerConfig>(CustomerConfig.class){};
 
   public Map<String, String> dataAsMap() {
     return new ObjectMapper().convertValue(data, Map.class);
@@ -85,11 +87,29 @@ public class CustomerConfig extends Model {
     JsonNode maskedData = data.deepCopy();
     for (Iterator<String> it = maskedData.fieldNames(); it.hasNext(); ) {
       String key = it.next();
-      if (key.contains("KEY") || key.contains("SECRET")) {
+      if (key.contains("KEY") || key.contains("SECRET") || key.contains("CREDENTIALS")) {
         ((ObjectNode) maskedData).put(key, maskedData.get(key).asText().replaceAll("(?<!^.?).(?!.?$)", "*"));
       }
     }
     return maskedData;
+  }
+
+  // Returns if there is an in use reference to the object.
+  public boolean getInUse() {
+    if (this.type == ConfigType.STORAGE) {
+      // Check if a backup or schedule currently has a reference.
+      return (Backup.existsStorageConfig(this.configUUID) ||
+              Schedule.existsStorageConfig(this.configUUID));
+    }
+    return false;
+  }
+
+  @Override
+  public boolean delete() {
+    if (!this.getInUse()) {
+      return super.delete();
+    }
+    return false;
   }
 
   public static CustomerConfig createWithFormData(UUID customerUUID, JsonNode formData) {
@@ -100,11 +120,18 @@ public class CustomerConfig extends Model {
   }
 
   public static List<CustomerConfig> getAll(UUID customerUUID) {
-    return CustomerConfig.find.where().eq("customer_uuid", customerUUID).findList();
+    return CustomerConfig.find.query().where().eq("customer_uuid", customerUUID).findList();
   }
 
   public static CustomerConfig get(UUID customerUUID, UUID configUUID) {
-    return CustomerConfig.find.where().eq("customer_uuid", customerUUID).idEq(configUUID).findUnique();
+    return CustomerConfig.find.query().where()
+      .eq("customer_uuid", customerUUID)
+      .idEq(configUUID)
+      .findOne();
+  }
+
+  public static CustomerConfig get(UUID configUUID) {
+    return CustomerConfig.find.query().where().idEq(configUUID).findOne();
   }
 
   public static CustomerConfig createAlertConfig(UUID customerUUID, JsonNode payload) {
@@ -117,12 +144,30 @@ public class CustomerConfig extends Model {
     return customerConfig;
   }
 
+  public static CustomerConfig createSmtpConfig(UUID customerUUID, JsonNode payload) {
+    CustomerConfig customerConfig = new CustomerConfig();
+    customerConfig.type = ConfigType.ALERTS;
+    customerConfig.name = SMTP_INFO;
+    customerConfig.customerUUID = customerUUID;
+    customerConfig.data = payload;
+    customerConfig.save();
+    return customerConfig;
+  }
+
   public static CustomerConfig getAlertConfig(UUID customerUUID) {
-    return CustomerConfig.find.where()
+    return CustomerConfig.find.query().where()
       .eq("customer_uuid", customerUUID)
       .eq("type", ConfigType.ALERTS.toString())
       .eq("name", ALERTS_PREFERENCES)
-      .findUnique();
+      .findOne();
+  }
+
+  public static CustomerConfig getSmtpConfig(UUID customerUUID) {
+    return CustomerConfig.find.query().where()
+      .eq("customer_uuid", customerUUID)
+      .eq("type", ConfigType.ALERTS.toString())
+      .eq("name", SMTP_INFO)
+      .findOne();
   }
 
   public static CustomerConfig createCallHomeConfig(UUID customerUUID) {
@@ -141,11 +186,11 @@ public class CustomerConfig extends Model {
   }
 
   public static CustomerConfig getCallhomeConfig(UUID customerUUID) {
-    return CustomerConfig.find.where()
+    return CustomerConfig.find.query().where()
       .eq("customer_uuid", customerUUID)
       .eq("type", ConfigType.CALLHOME.toString())
       .eq("name", CALLHOME_PREFERENCES)
-      .findUnique();
+      .findOne();
   }
 
   public static CollectionLevel getOrCreateCallhomeLevel(UUID customerUUID){

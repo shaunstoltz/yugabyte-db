@@ -2,7 +2,6 @@
 title: DROP TYPE statement [YCQL]
 headerTitle: DROP TYPE
 linkTitle: DROP TYPE
-summary: Drop a user-defined data type
 description: Use the DROP TYPE statement to remove an existing user-defined data type.
 menu:
   latest:
@@ -42,11 +41,11 @@ Where
 ## Examples
 
 ```sql
-cqlsh:example> CREATE TYPE person(first_name TEXT, last_name TEXT, email TEXT);
+ycqlsh:example> CREATE TYPE person(first_name TEXT, last_name TEXT, email TEXT);
 ```
 
 ```sql
-cqlsh:example> DROP TYPE person;
+ycqlsh:example> DROP TYPE person;
 ```
 
 ## See also

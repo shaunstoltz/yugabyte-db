@@ -1,4 +1,5 @@
-#!/usr/bin/env python2.7
+#!/usr/bin/env python3
+
 # Copyright (c) YugaByte, Inc.
 #
 # Licensed under the Apache License, Version 2.0 (the "License"); you may not use this file except
@@ -140,10 +141,11 @@ def main():
 
     build_cmd_list += [
         # This will build the exact set of targets that are needed for the release.
-        "packaged_targets",
-        # We do not need java code built for a release package
-        "--skip-java"
+        "packaged_targets"
     ]
+
+    if not args.yw:
+        build_cmd_list += ["--skip-java"]
 
     if args.skip_build:
         build_cmd_list += ["--skip-build"]
@@ -165,7 +167,13 @@ def main():
         for preliminary_target in ['protoc-gen-insertions', 'bfql_codegen']:
             preliminary_step_cmd_list = [
                     arg for arg in build_cmd_list if arg != 'packaged_targets'
-                ] + ['--target', preliminary_target, '--skip-java']
+                ] + ['--target', preliminary_target]
+
+            # Skipping Java in these "preliminary" builds whether or not we are building YugaWare.
+            # We will still build YBClient Java code needed for YugaWare as part of the final
+            # build step below.
+            preliminary_step_cmd_list += ["--skip-java"]
+
             logging.info(
                     "Running a preliminary step to build target %s: %s",
                     preliminary_target,
@@ -251,13 +259,13 @@ def main():
             os.path.join(managed_dir, "yb_release"),
             "--destination", yw_dir, "--unarchived"
         ]
-        logging.info("Creating YugaWare package with command: {}".format(package_yw_cmd))
+        logging.info(
+            "Creating YugaWare package with command '{}'".format(" ".join(package_yw_cmd)))
         try:
             subprocess.check_output(package_yw_cmd, cwd=managed_dir)
         except subprocess.CalledProcessError as e:
-            logging.error(
-                "Failed to build YugaWare package:\n{}\nOutput:\n{}".format(
-                    traceback.format_exc(), e.output))
+            logging.error("Failed to build YugaWare package:\n%s", traceback.format_exc())
+            logging.error("Output from YugaWare build:\n%s", e.output.decode('utf-8'))
             raise
         except OSError as e:
             logging.error("Failed to build YugaWare package: {}".format(e))

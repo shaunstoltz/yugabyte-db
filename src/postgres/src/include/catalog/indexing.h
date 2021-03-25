@@ -234,6 +234,9 @@ DECLARE_INDEX(pg_shdepend_reference_index, 1233, on pg_shdepend using btree(refc
 DECLARE_UNIQUE_INDEX(pg_statistic_relid_att_inh_index, 2696, on pg_statistic using btree(starelid oid_ops, staattnum int2_ops, stainherit bool_ops));
 #define StatisticRelidAttnumInhIndexId	2696
 
+DECLARE_UNIQUE_INDEX(pg_tablegroup_oid_index, 8001, on pg_tablegroup using btree(oid oid_ops));
+#define TablegroupOidIndexId  8001
+
 DECLARE_UNIQUE_INDEX(pg_tablespace_oid_index, 2697, on pg_tablespace using btree(oid oid_ops));
 #define TablespaceOidIndexId  2697
 DECLARE_UNIQUE_INDEX(pg_tablespace_spcname_index, 2698, on pg_tablespace using btree(spcname name_ops));
@@ -359,5 +362,8 @@ DECLARE_UNIQUE_INDEX(pg_subscription_subname_index, 6115, on pg_subscription usi
 
 DECLARE_UNIQUE_INDEX(pg_subscription_rel_srrelid_srsubid_index, 6117, on pg_subscription_rel using btree(srrelid oid_ops, srsubid oid_ops));
 #define SubscriptionRelSrrelidSrsubidIndexId 6117
+
+DECLARE_UNIQUE_INDEX(pg_yb_catalog_version_db_oid_index, 8012, on pg_yb_catalog_version using btree(db_oid oid_ops));
+#define YBCatalogVersionDbOidIndexId 8012
 
 #endif							/* INDEXING_H */

@@ -19,6 +19,8 @@
 #include "yb/master/master.pb.h"
 
 namespace yb {
+struct TransactionMetadata;
+
 namespace client {
 
 // Creates a new table with the desired options.
@@ -51,9 +53,21 @@ class YBTableCreator {
   // not colocated.
   YBTableCreator& colocated(const bool colocated);
 
+  // Tablegroup ID - will be ignored by catalog manager if the table is not in a tablegroup.
+  YBTableCreator& tablegroup_id(const std::string& tablegroup_id);
+
+  // Tablespace ID.
+  YBTableCreator& tablespace_id(const std::string& tablespace_id);
+
   // Sets the schema with which to create the table. Must remain valid for
   // the lifetime of the builder. Required.
   YBTableCreator& schema(const YBSchema* schema);
+
+  // The creation of this table is dependent upon the success of this higher-level transaction.
+  YBTableCreator& part_of_transaction(const TransactionMetadata* txn);
+
+  // Adds a partitions to the table.
+  YBTableCreator& add_partition(const Partition& partition);
 
   // Adds a set of hash partitions to the table.
   //
@@ -82,7 +96,9 @@ class YBTableCreator {
   // range partitioning.
   //
   // Optional.
-  YBTableCreator& set_range_partition_columns(const std::vector<std::string>& columns);
+  YBTableCreator& set_range_partition_columns(
+      const std::vector<std::string>& columns,
+      const std::vector<std::string>& split_rows = {});
 
   // For index table: sets the indexed table id of this index.
   YBTableCreator& indexed_table_id(const std::string& id);
@@ -95,6 +111,9 @@ class YBTableCreator {
 
   // For index table: sets whether this is a unique index.
   YBTableCreator& is_unique_index(bool is_unique_index);
+
+  // For index table: sets whether to do online schema migration when creating index.
+  YBTableCreator& skip_index_backfill(const bool skip_index_backfill);
 
   // For index table: indicates whether this index has mangled column name.
   // - Older index supports only ColumnRef, and its name is identical with colum name.
@@ -155,6 +174,8 @@ class YBTableCreator {
 
   PartitionSchemaPB partition_schema_;
 
+  std::vector<Partition> partitions_;
+
   int num_replicas_ = 0;
 
   master::ReplicationInfoPB replication_info_;
@@ -164,12 +185,22 @@ class YBTableCreator {
   // the data-table being indexed.
   IndexInfoPB index_info_;
 
+  bool skip_index_backfill_ = false;
+
   bool TEST_use_old_style_create_request_ = false;
 
   MonoDelta timeout_;
   bool wait_ = true;
 
   bool colocated_ = true;
+
+  const TransactionMetadata * txn_ = nullptr;
+
+  // The tablegroup id to assign (if a table is in a tablegroup).
+  std::string tablegroup_id_;
+
+  // The id of the tablespace to which this table is to be associated with.
+  std::string tablespace_id_;
 
   DISALLOW_COPY_AND_ASSIGN(YBTableCreator);
 };

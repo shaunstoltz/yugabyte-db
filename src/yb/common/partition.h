@@ -88,11 +88,11 @@ class Partition {
     return partition_key_end_;
   }
 
-  void TEST_set_partition_key_start(const std::string& partition_key_start) {
+  void set_partition_key_start(const std::string& partition_key_start) {
     partition_key_start_ = partition_key_start;
   }
 
-  void TEST_set_partition_key_end(const std::string& partition_key_end) {
+  void set_partition_key_end(const std::string& partition_key_end) {
     partition_key_end_ = partition_key_end;
   }
 
@@ -108,6 +108,36 @@ class Partition {
   bool ContainsKey(const std::string& partition_key) const {
     return partition_key >= partition_key_start() &&
         (partition_key_end().empty() || partition_key < partition_key_end());
+  }
+
+  // Checks if this partition is a superset or is exactly the same as another partition.
+  template <class T>
+  bool ContainsPartition(const T& other) const {
+    return other.partition_key_start() >= partition_key_start() &&
+           (partition_key_end().empty() || (!other.partition_key_end().empty() &&
+                                            other.partition_key_end() <= partition_key_end()));
+  }
+
+  // Checks if this and another partitions have equal bounds.
+  template <class T>
+  bool BoundsEqualToPartition(const T& other) const {
+    return partition_key_start() == other.partition_key_start() &&
+           partition_key_end() == other.partition_key_end();
+  }
+
+  // Checks if this partition is a strict superset of another partition (shouldn't be exactly the
+  // same).
+  template <class T>
+  bool ContainsPartitionStrict(const T& other) const {
+    return ContainsPartition(other) && !BoundsEqualToPartition(other);
+  }
+
+  std::string ToString() const {
+    return Format(
+        "{ partition_key_start: $0 partition_key_end: $1 hash_buckets: $2 }",
+        Slice(partition_key_start_).ToDebugString(),
+        Slice(partition_key_end_).ToDebugString(),
+        hash_buckets_);
   }
 
  private:
@@ -193,12 +223,6 @@ class PartitionSchema {
   CHECKED_STATUS EncodeKey(const ConstContiguousRow& row, std::string* buf) const
     WARN_UNUSED_RESULT;
 
-  // Creates the set of table partitions using multi column hash schema. In this schema, we divide
-  // the [0, max_partition_key] range equally into the requested number of intervals.
-  CHECKED_STATUS CreatePartitions(int32_t num_tablets,
-                                  std::vector<Partition>* partitions,
-                                  int32_t max_partition_key = kMaxPartitionKey) const;
-
   bool IsHashPartitioning() const {
     return hash_schema_ != boost::none;
   }
@@ -208,12 +232,38 @@ class PartitionSchema {
     return *hash_schema_;
   }
 
+  bool IsRangePartitioning() const {
+    return range_schema_.column_ids.size() > 0;
+  }
+
   // Encodes the given uint16 value into a 2 byte string.
   static std::string EncodeMultiColumnHashValue(uint16_t hash_value);
 
   // Decode the given partition_key to a 2-byte integer.
   static uint16_t DecodeMultiColumnHashValue(const string& partition_key);
 
+  // Does [partition_key_start, partition_key_end] form a valid range.
+  static CHECKED_STATUS IsValidHashPartitionRange(const string& partition_key_start,
+                                                  const string& partition_key_end);
+
+  static bool IsValidHashPartitionKeyBound(const string& partition_key);
+
+  // YugaByte partition creation
+  // Creates the set of table partitions using multi column hash schema. In this schema, we divide
+  // the [0, max_partition_key] range into the requested number of intervals.
+  // - Inputs are from SQL and CQL.
+  // - YugaByte methods are used for hash and range partitioning to create tablets.
+  //
+  // TODO(neil) Investigate partitions to support both hash and range schema.
+  // - First, use range schema to split the table.
+  // - Second, use hash schema to partition each split.
+  CHECKED_STATUS CreatePartitions(int32_t num_tablets, std::vector<Partition>* partitions) const;
+
+  // Kudu partition creation
+  // NOTE: The following function from Kudu is to support a C++ API instead of SQL or CQL. They
+  // also create partitions differently. There are code in this function that shouldn't be apply
+  // to YugaByte's database except for metadata in master, which is using Kudu's DB.
+  //
   // Creates the set of table partitions for a partition schema and collection
   // of split rows.
   //
@@ -237,6 +287,9 @@ class PartitionSchema {
   // Returns a text description of the partition suitable for debug printing.
   std::string PartitionDebugString(const Partition& partition, const Schema& schema) const;
 
+  // Returns a text description of a range partition suitable for debug printing.
+  std::string RangePartitionDebugString(const Partition& partition, const Schema& schema) const;
+
   // Returns a text description of the partial row's partition key suitable for debug printing.
   std::string RowDebugString(const YBPartialRow& row) const;
 
@@ -258,8 +311,15 @@ class PartitionSchema {
 
  private:
 
+  struct RangeSplit {
+    explicit RangeSplit(const std::string& bounds) : column_bounds(bounds) {}
+
+    std::string column_bounds;
+  };
+
   struct RangeSchema {
     std::vector<ColumnId> column_ids;
+    std::vector<RangeSplit> splits;
   };
 
   struct HashBucketSchema {
@@ -267,6 +327,22 @@ class PartitionSchema {
     int32_t num_buckets;
     uint32_t seed;
   };
+
+  // Convertion between PB and partition schema.
+  static CHECKED_STATUS KuduFromPB(const PartitionSchemaPB& pb,
+                                 const Schema& schema,
+                                 PartitionSchema* partition_schema);
+  void KuduToPB(PartitionSchemaPB* pb) const;
+
+  // Creates the set of table partitions using multi column hash schema. In this schema, we divide
+  // the [ hash(0), hash(max_partition_key) ] range equally into the requested number of intervals.
+  CHECKED_STATUS CreateHashPartitions(int32_t num_tablets,
+                                      std::vector<Partition>* partitions,
+                                      int32_t max_partition_key = kMaxPartitionKey) const;
+
+  // Creates the set of table partitions using primary-key range schema. In this schema, we divide
+  // the table by given ranges in the partitions vector.
+  CHECKED_STATUS CreateRangePartitions(std::vector<Partition>* partitions) const;
 
   // Encodes the specified columns of a row into lexicographic sort-order preserving format.
   static CHECKED_STATUS EncodeColumns(const YBPartialRow& row,

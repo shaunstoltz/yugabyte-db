@@ -19,15 +19,19 @@
 
 #include <vector>
 
+#include <boost/compute/detail/lru_cache.hpp>
+
 #include "yb/client/client_fwd.h"
 
-#include "yb/yql/cql/cqlserver/cql_message.h"
 #include "yb/yql/cql/cqlserver/cql_processor.h"
-#include "yb/yql/cql/cqlserver/cql_statement.h"
-#include "yb/yql/cql/cqlserver/cql_service.service.h"
 #include "yb/yql/cql/cqlserver/cql_server_options.h"
+#include "yb/yql/cql/cqlserver/cql_service.service.h"
+#include "yb/yql/cql/cqlserver/cql_statement.h"
+#include "yb/yql/cql/cqlserver/system_query_cache.h"
 #include "yb/yql/cql/ql/statement.h"
+#include "yb/yql/cql/ql/util/cql_message.h"
 
+#include "yb/util/object_pool.h"
 #include "yb/util/string_case.h"
 
 #include "yb/client/async_initializer.h"
@@ -48,8 +52,7 @@ class CQLServiceImpl : public CQLServerServiceIf,
                        public std::enable_shared_from_this<CQLServiceImpl> {
  public:
   // Constructor.
-  CQLServiceImpl(CQLServer* server, const CQLServerOptions& opts,
-                 ql::TransactionPoolProvider transaction_pool_provider);
+  CQLServiceImpl(CQLServer* server, const CQLServerOptions& opts);
   ~CQLServiceImpl();
 
   void CompleteInit();
@@ -59,24 +62,34 @@ class CQLServiceImpl : public CQLServerServiceIf,
   // Processing all incoming request from RPC and sending response back.
   void Handle(yb::rpc::InboundCallPtr call) override;
 
+  // Either gets an available processor or creates a new one.
+  Result<CQLProcessor*> GetProcessor();
+
   // Return CQL processor at pos as available.
   void ReturnProcessor(const CQLProcessorListPos& pos);
 
   // Allocate a prepared statement. If the statement already exists, return it instead.
   std::shared_ptr<CQLStatement> AllocatePreparedStatement(
-      const CQLMessage::QueryId& id, const std::string& keyspace, const std::string& query);
+      const ql::CQLMessage::QueryId& id, const std::string& keyspace, const std::string& query);
 
   // Look up a prepared statement by its id. Nullptr will be returned if the statement is not found.
-  std::shared_ptr<const CQLStatement> GetPreparedStatement(const CQLMessage::QueryId& id);
+  std::shared_ptr<const CQLStatement> GetPreparedStatement(const ql::CQLMessage::QueryId& id);
 
   std::shared_ptr<ql::Statement> GetAuthPreparedStatement() const { return auth_prepared_stmt_; }
 
   // Delete the prepared statement from the cache.
   void DeletePreparedStatement(const std::shared_ptr<const CQLStatement>& stmt);
 
+  // Check that the password and hash match.  Leverages shared LRU cache.
+  bool CheckPassword(const std::string plain, const std::string expected_bcrypt_hash);
+
   // Return the memory tracker for prepared statements.
   const MemTrackerPtr& prepared_stmts_mem_tracker() const {
     return prepared_stmts_mem_tracker_;
+  }
+
+  const MemTrackerPtr& processors_mem_tracker() const {
+    return processors_mem_tracker_;
   }
 
   // Return the YBClient to communicate with either master or tserver.
@@ -86,22 +99,21 @@ class CQLServiceImpl : public CQLServerServiceIf,
   const std::shared_ptr<client::YBMetaDataCache>& metadata_cache() const;
 
   // Return the CQL metrics.
-  std::shared_ptr<CQLMetrics> cql_metrics() const { return cql_metrics_; }
+  const std::shared_ptr<CQLMetrics>& cql_metrics() const { return cql_metrics_; }
+
+  ThreadSafeObjectPool<ql::Parser>& parser_pool() { return parser_pool_; }
 
   // Return the messenger.
   rpc::Messenger* messenger() { return messenger_; }
 
+  client::TransactionPool* TransactionPool();
+
   server::Clock* clock();
 
-  const ql::TransactionPoolProvider& transaction_pool_provider() const {
-    return transaction_pool_provider_;
-  }
+  std::shared_ptr<SystemQueryCache> system_cache() { return system_cache_; }
 
  private:
   constexpr static int kRpcTimeoutSec = 5;
-
-  // Either gets an available processor or creates a new one.
-  CQLProcessor *GetProcessor();
 
   // Insert a prepared statement at the front of the LRU list. "prepared_stmts_mutex_" needs to be
   // locked before this call.
@@ -120,9 +132,6 @@ class CQLServiceImpl : public CQLServerServiceIf,
 
   // CQLServer of this service.
   CQLServer* const server_;
-
-  // YBClient is to communicate with either master or tserver.
-  yb::client::AsyncClientInitialiser async_client_init_;
 
   // A cache to reduce opening tables or (user-defined) types again and again.
   mutable std::shared_ptr<client::YBMetaDataCache> metadata_cache_;
@@ -153,14 +162,27 @@ class CQLServiceImpl : public CQLServerServiceIf,
   // Tracker to measure and limit memory usage of prepared statements.
   MemTrackerPtr prepared_stmts_mem_tracker_;
 
+  MemTrackerPtr processors_mem_tracker_;
+
+  // Password and hash cache. Stores each password-hash pair as a compound key;
+  // see implementation for rationale.
+  boost::compute::detail::lru_cache<std::string, bool> password_cache_
+    GUARDED_BY(password_cache_mutex_);
+  std::mutex password_cache_mutex_;
+
+  std::shared_ptr<SystemQueryCache> system_cache_;
+
   // Metrics to be collected and reported.
   yb::rpc::RpcMethodMetrics metrics_;
 
   std::shared_ptr<CQLMetrics> cql_metrics_;
+
+  ThreadSafeObjectPool<ql::Parser> parser_pool_;
+
   // Used to requeue the cql_inbound call to handle the response callback(s).
   rpc::Messenger* messenger_ = nullptr;
 
-  ql::TransactionPoolProvider transaction_pool_provider_;
+  int64_t num_allocated_processors_ = 0;
 };
 
 }  // namespace cqlserver

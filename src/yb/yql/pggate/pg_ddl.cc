@@ -20,7 +20,16 @@
 #include "yb/client/namespace_alterer.h"
 #include "yb/client/yb_op.h"
 
+#include "yb/common/common.pb.h"
+#include "yb/common/common_flags.h"
 #include "yb/common/entity_ids.h"
+#include "yb/common/pg_system_attr.h"
+#include "yb/docdb/doc_key.h"
+#include "yb/docdb/primitive_value.h"
+#include "yb/util/flag_tags.h"
+
+DEFINE_test_flag(int32, user_ddl_operation_timeout_sec, 0,
+                 "Adjusts the timeout for a DDL operation from the YBClient default, if non-zero.");
 
 namespace yb {
 namespace pggate {
@@ -59,8 +68,12 @@ PgCreateDatabase::~PgCreateDatabase() {
 }
 
 Status PgCreateDatabase::Exec() {
+  boost::optional<TransactionMetadata> txn;
+  if (txn_future_) {
+    txn = VERIFY_RESULT((*txn_future_).get()); // Ensure the future has been executed by this time.
+  }
   return pg_session_->CreateDatabase(database_name_, database_oid_, source_database_oid_,
-                                     next_oid_, colocated_);
+                                     next_oid_, txn, colocated_);
 }
 
 PgDropDatabase::PgDropDatabase(PgSession::ScopedRefPtr pg_session,
@@ -99,6 +112,60 @@ Status PgAlterDatabase::RenameDatabase(const char *newname) {
 }
 
 //--------------------------------------------------------------------------------------------------
+// PgCreateTablegroup / PgDropTablegroup
+//--------------------------------------------------------------------------------------------------
+
+PgCreateTablegroup::PgCreateTablegroup(PgSession::ScopedRefPtr pg_session,
+                                       const char *database_name,
+                                       const PgOid database_oid,
+                                       const PgOid tablegroup_oid)
+    : PgDdl(pg_session),
+      database_name_(database_name),
+      database_oid_(database_oid),
+      tablegroup_oid_(tablegroup_oid) {
+}
+
+PgCreateTablegroup::~PgCreateTablegroup() {
+}
+
+Status PgCreateTablegroup::Exec() {
+  Status s = pg_session_->CreateTablegroup(database_name_, database_oid_, tablegroup_oid_);
+
+  if (PREDICT_FALSE(!s.ok())) {
+    if (s.IsAlreadyPresent()) {
+      return STATUS(InvalidArgument, "Duplicate tablegroup.");
+    }
+    if (s.IsNotFound()) {
+      return STATUS(InvalidArgument, "Database not found", database_name_);
+    }
+    return STATUS_FORMAT(
+        InvalidArgument, "Invalid table definition: $0",
+        s.ToString(false /* include_file_and_line */, false /* include_code */));
+  }
+
+  return Status::OK();
+}
+
+PgDropTablegroup::PgDropTablegroup(PgSession::ScopedRefPtr pg_session,
+                                   const PgOid database_oid,
+                                   const PgOid tablegroup_oid)
+    : PgDdl(pg_session),
+      database_oid_(database_oid),
+      tablegroup_oid_(tablegroup_oid) {
+}
+
+PgDropTablegroup::~PgDropTablegroup() {
+}
+
+Status PgDropTablegroup::Exec() {
+  Status s = pg_session_->DropTablegroup(database_oid_, tablegroup_oid_);
+  if (s.IsNotFound()) {
+    return Status::OK();
+  }
+  return s;
+}
+
+//--------------------------------------------------------------------------------------------------
 // PgCreateTable
 //--------------------------------------------------------------------------------------------------
 
@@ -110,7 +177,9 @@ PgCreateTable::PgCreateTable(PgSession::ScopedRefPtr pg_session,
                              bool is_shared_table,
                              bool if_not_exist,
                              bool add_primary_key,
-                             const bool colocated)
+                             const bool colocated,
+                             const PgObjectId& tablegroup_oid,
+                             const PgObjectId& tablespace_oid)
     : PgDdl(pg_session),
       table_name_(YQL_DATABASE_PGSQL,
                   GetPgsqlNamespaceId(table_id.database_oid),
@@ -122,19 +191,18 @@ PgCreateTable::PgCreateTable(PgSession::ScopedRefPtr pg_session,
                            strcmp(schema_name, "information_schema") == 0),
       is_shared_table_(is_shared_table),
       if_not_exist_(if_not_exist),
-      colocated_(colocated) {
+      colocated_(colocated),
+      tablegroup_oid_(tablegroup_oid),
+      tablespace_oid_(tablespace_oid) {
   // Add internal primary key column to a Postgres table without a user-specified primary key.
   if (add_primary_key) {
     // For regular user table, ybrowid should be a hash key because ybrowid is a random uuid.
-    // For sys catalog table, it should be a range key because sys catalog table is an
-    // unpartitioned table in a single tablet.
-    bool is_hash = !is_pg_catalog_table_;
+    // For colocated or sys catalog table, ybrowid should be a range key because they are
+    // unpartitioned tables in a single tablet.
+    bool is_hash = !(is_pg_catalog_table_ || colocated || tablegroup_oid.IsValid());
     CHECK_OK(AddColumn("ybrowid", static_cast<int32_t>(PgSystemAttrNum::kYBRowId),
                        YB_YQL_DATA_TYPE_BINARY, is_hash, true /* is_range */));
   }
-}
-
-PgCreateTable::~PgCreateTable() {
 }
 
 Status PgCreateTable::AddColumnImpl(const char *attr_name,
@@ -170,6 +238,66 @@ Status PgCreateTable::SetNumTablets(int32_t num_tablets) {
   return Status::OK();
 }
 
+size_t PgCreateTable::PrimaryKeyRangeColumnCount() const {
+  return range_columns_.size();
+}
+
+Status PgCreateTable::AddSplitBoundary(PgExpr **exprs, int expr_count) {
+  if (hash_schema_.is_initialized()) {
+    return STATUS(InvalidArgument,
+                  "SPLIT AT option is not yet supported for hash partitioned tables");
+  }
+  std::vector<QLValuePB> bounds(expr_count);
+  for (int i = 0; i < expr_count; ++i) {
+    RETURN_NOT_OK(exprs[i]->Eval(&bounds[i]));
+  }
+  split_rows_.push_back(std::move(bounds));
+  return Status::OK();
+}
+
+Result<std::vector<std::string>> PgCreateTable::BuildSplitRows(const client::YBSchema& schema) {
+  std::vector<std::string> rows;
+  rows.reserve(split_rows_.size());
+  docdb::DocKey prev_doc_key;
+  for (const auto& row : split_rows_) {
+    SCHECK_EQ(
+        row.size(), PrimaryKeyRangeColumnCount(),
+        IllegalState, "Number of split row values must be equal to number of primary key columns");
+    std::vector<docdb::PrimitiveValue> range_components;
+    range_components.reserve(row.size());
+    bool compare_columns = true;
+    for (const auto& row_value : row) {
+      const auto column_index = range_components.size();
+      range_components.push_back(row_value.value_case() == QLValuePB::VALUE_NOT_SET
+        ? docdb::PrimitiveValue(docdb::ValueType::kLowest)
+        : docdb::PrimitiveValue::FromQLValuePB(
+            row_value,
+            schema.Column(schema.FindColumn(range_columns_[column_index])).sorting_type()));
+
+      // Validate that split rows honor column ordering.
+      if (compare_columns && !prev_doc_key.empty()) {
+        const auto& prev_value = prev_doc_key.range_group()[column_index];
+        const auto compare = prev_value.CompareTo(range_components.back());
+        if (compare > 0) {
+          return STATUS(InvalidArgument, "Split rows ordering does not match column ordering");
+        } else if (compare < 0) {
+          // Don't need to compare further columns
+          compare_columns = false;
+        }
+      }
+    }
+    prev_doc_key = docdb::DocKey(std::move(range_components));
+    const auto keybytes = prev_doc_key.Encode();
+
+    // Validate that there are no duplicate split rows.
+    if (rows.size() > 0 && keybytes.AsSlice() == Slice(rows.back())) {
+      return STATUS(InvalidArgument, "Cannot have duplicate split rows");
+    }
+    rows.push_back(keybytes.ToStringBuffer());
+  }
+  return rows;
+}
+
 Status PgCreateTable::Exec() {
   // Construct schema.
   client::YBSchema schema;
@@ -187,6 +315,7 @@ Status PgCreateTable::Exec() {
   }
 
   RETURN_NOT_OK(schema_builder_.Build(&schema));
+  std::vector<std::string> split_rows = VERIFY_RESULT(BuildSplitRows(schema));
 
   // Create table.
   shared_ptr<client::YBTableCreator> table_creator(pg_session_->NewTableCreator());
@@ -204,15 +333,36 @@ Status PgCreateTable::Exec() {
   if (hash_schema_) {
     table_creator->hash_schema(*hash_schema_);
   } else if (!is_pg_catalog_table_) {
-    table_creator->set_range_partition_columns(range_columns_);
+    table_creator->set_range_partition_columns(range_columns_, split_rows);
+  }
+
+  if (tablegroup_oid_.IsValid()) {
+    table_creator->tablegroup_id(tablegroup_oid_.GetYBTablegroupId());
+  }
+
+  if (tablespace_oid_.IsValid()) {
+    table_creator->tablespace_id(tablespace_oid_.GetYBTablespaceId());
   }
 
   // For index, set indexed (base) table id.
   if (indexed_table_id()) {
     table_creator->indexed_table_id(indexed_table_id()->GetYBTableId());
+    if (is_unique_index()) {
+      table_creator->is_unique_index(true);
+    }
+    if (skip_index_backfill()) {
+      table_creator->skip_index_backfill(true);
+    }
   }
-  if (is_unique_index()) {
-    table_creator->is_unique_index(true);
+
+  boost::optional<TransactionMetadata> txn;
+  if (txn_future_) {
+    txn = VERIFY_RESULT((*txn_future_).get());
+    table_creator->part_of_transaction(&*txn);
+  }
+
+  if (PREDICT_FALSE(FLAGS_TEST_user_ddl_operation_timeout_sec > 0)) {
+    table_creator->timeout(MonoDelta::FromSeconds(FLAGS_TEST_user_ddl_operation_timeout_sec));
   }
 
   const Status s = table_creator->Create();
@@ -251,6 +401,7 @@ PgDropTable::~PgDropTable() {
 
 Status PgDropTable::Exec() {
   Status s = pg_session_->DropTable(table_id_);
+  pg_session_->InvalidateTableCache(table_id_);
   if (s.ok() || (s.IsNotFound() && if_exist_)) {
     return Status::OK();
   }
@@ -286,18 +437,26 @@ PgCreateIndex::PgCreateIndex(PgSession::ScopedRefPtr pg_session,
                              const PgObjectId& base_table_id,
                              bool is_shared_index,
                              bool is_unique_index,
-                             bool if_not_exist)
+                             const bool skip_index_backfill,
+                             bool if_not_exist,
+                             const PgObjectId& tablegroup_oid,
+                             const PgObjectId& tablespace_oid)
     : PgCreateTable(pg_session, database_name, schema_name, index_name, index_id,
                     is_shared_index, if_not_exist, false /* add_primary_key */,
-                    true /* colocated */),
+                    tablegroup_oid.IsValid() ? false : true /* colocated */, tablegroup_oid,
+                    tablespace_oid),
       base_table_id_(base_table_id),
-      is_unique_index_(is_unique_index) {
+      is_unique_index_(is_unique_index),
+      skip_index_backfill_(skip_index_backfill) {
 }
 
-PgCreateIndex::~PgCreateIndex() {
+size_t PgCreateIndex::PrimaryKeyRangeColumnCount() const {
+  return ybbasectid_added_ ? primary_key_range_column_count_
+                           : PgCreateTable::PrimaryKeyRangeColumnCount();
 }
 
 Status PgCreateIndex::AddYBbasectidColumn() {
+  primary_key_range_column_count_ = PgCreateTable::PrimaryKeyRangeColumnCount();
   // Add YBUniqueIdxKeySuffix column to store key suffix for handling multiple NULL values in column
   // with unique index.
   // Value of this column is set to ybctid (same as ybbasectid) for index row in case index
@@ -341,7 +500,9 @@ Status PgCreateIndex::Exec() {
   if (!ybbasectid_added_) {
     RETURN_NOT_OK(AddYBbasectidColumn());
   }
-  return PgCreateTable::Exec();
+  Status s = PgCreateTable::Exec();
+  pg_session_->InvalidateTableCache(base_table_id_);
+  return s;
 }
 
 //--------------------------------------------------------------------------------------------------
@@ -358,8 +519,14 @@ PgDropIndex::~PgDropIndex() {
 }
 
 Status PgDropIndex::Exec() {
-  Status s = pg_session_->DropIndex(table_id_);
+  client::YBTableName indexed_table_name;
+  Status s = pg_session_->DropIndex(table_id_, &indexed_table_name);
   if (s.ok() || (s.IsNotFound() && if_exist_)) {
+    RSTATUS_DCHECK(!indexed_table_name.empty(), Uninitialized, "indexed_table_name uninitialized");
+    PgObjectId indexed_table_id(indexed_table_name.table_id());
+
+    pg_session_->InvalidateTableCache(table_id_);
+    pg_session_->InvalidateTableCache(indexed_table_id);
     return Status::OK();
   }
   return s;
@@ -378,12 +545,10 @@ PgAlterTable::PgAlterTable(PgSession::ScopedRefPtr pg_session,
 
 Status PgAlterTable::AddColumn(const char *name,
                                const YBCPgTypeEntity *attr_type,
-                               int order,
-                               bool is_not_null) {
+                               int order) {
   shared_ptr<QLType> yb_type = QLType::Create(static_cast<DataType>(attr_type->yb_type));
-
-  client::YBColumnSpec* column = table_alterer->AddColumn(name)->Type(yb_type)->Order(order);
-  if (is_not_null) column->NotNull();
+  table_alterer->AddColumn(name)->Type(yb_type)->Order(order);
+  // Do not set 'nullable' attribute as PgCreateTable::AddColumn() does not do it.
 
   return Status::OK();
 }

@@ -1,8 +1,8 @@
 ---
-title: Use Go to build a YugabyteDB application
+title: Build a Go application that uses YSQL
 headerTitle: Build a Go application
-linkTitle: Build a Go application
-description: Use Go to build a simple YugabyteDB application that uses the PostgreSQL JDBC driver and performs basic database operations.
+linkTitle: Go
+description: Build a sample Go application with the Go PostgreSQL driver and perform basic database operations.
 aliases:
   - /develop/client-drivers/go/
   - /latest/develop/client-drivers/go/
@@ -64,7 +64,7 @@ To install the package locally, run the following command:
 $ go get github.com/lib/pq
 ```
 
-## Create the application
+## Create the sample Go application
 
 Create a file `ybsql_hello_world.go` and copy the contents below.
 
@@ -141,13 +141,13 @@ func main() {
 
 ## Run the application
 
-To execute the file, run the following command:
+To use the application, run the following command:
 
 ```sh
 $ go run ybsql_hello_world.go
 ```
 
-You should see the following as the output.
+You should see the following output.
 
 ```
 Created table employee

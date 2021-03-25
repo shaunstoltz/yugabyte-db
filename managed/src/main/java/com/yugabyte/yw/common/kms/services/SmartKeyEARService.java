@@ -16,6 +16,7 @@ import com.fasterxml.jackson.databind.node.ObjectNode;
 import com.google.common.collect.ImmutableMap;
 import com.yugabyte.yw.common.ApiHelper;
 import com.yugabyte.yw.common.Util;
+import com.yugabyte.yw.common.kms.algorithms.SmartKeyAlgorithm;
 import com.yugabyte.yw.common.kms.util.EncryptionAtRestUtil;
 import com.yugabyte.yw.common.kms.util.KeyProvider;
 import com.yugabyte.yw.forms.UniverseTaskParams.EncryptionAtRestConfig;
@@ -27,23 +28,7 @@ import java.util.UUID;
 import play.api.Play;
 import play.libs.Json;
 
-/**
- * The different encryption algorithms allowed and a mapping of
- * encryption algorithm -> valid encryption key sizes (bits)
- */
-enum SmartKeyAlgorithm implements SupportedAlgorithmInterface {
-    AES(Arrays.asList(128, 192, 256));
 
-    private List<Integer> keySizes;
-
-    public List<Integer> getKeySizes() {
-        return this.keySizes;
-    }
-
-    private SmartKeyAlgorithm(List<Integer> keySizes) {
-        this.keySizes = keySizes;
-    }
-}
 
 /**
  * An implementation of EncryptionAtRestService to communicate with Equinix SmartKey
@@ -51,7 +36,7 @@ enum SmartKeyAlgorithm implements SupportedAlgorithmInterface {
  */
 public class SmartKeyEARService extends EncryptionAtRestService<SmartKeyAlgorithm> {
 
-    private ApiHelper apiHelper;
+    private final ApiHelper apiHelper;
 
     public SmartKeyEARService() {
         super(KeyProvider.SMARTKEY);
@@ -73,7 +58,7 @@ public class SmartKeyEARService extends EncryptionAtRestService<SmartKeyAlgorith
                 "Authorization", String.format("Basic %s", apiToken)
         );
         final String url = Util.buildURL(baseUrl, endpoint);
-        final JsonNode response = this.apiHelper.postRequest(url, null, headers);
+        final JsonNode response = this.apiHelper.postRequest(url, Json.newObject(), headers);
         final JsonNode errors = response.get("error");
         if (errors != null) throw new RuntimeException(errors.toString());
         return String.format(

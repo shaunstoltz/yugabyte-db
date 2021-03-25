@@ -40,7 +40,7 @@ Result<std::shared_ptr<CDCRpcTasks>> CDCRpcTasks::CreateWithMasterAddrs(
       dir = JoinPathSegments(FLAGS_certs_for_cdc_dir, universe_id);
     }
     cdc_rpc_tasks->secure_context_ = VERIFY_RESULT(server::SetupSecureContext(
-        dir, "", "", server::SecureContextType::kServerToServer, &messenger_builder));
+        dir, "", "", server::SecureContextType::kInternal, &messenger_builder));
     cdc_rpc_tasks->messenger_ = VERIFY_RESULT(messenger_builder.Build());
   }
 
@@ -73,9 +73,14 @@ Result<google::protobuf::RepeatedPtrField<TabletLocationsPB>> CDCRpcTasks::GetTa
 }
 
 Result<std::vector<std::pair<TableId, client::YBTableName>>> CDCRpcTasks::ListTables() {
-  std::vector<std::pair<TableId, client::YBTableName>> tables;
-  RETURN_NOT_OK(yb_client_->ListTablesWithIds(&tables));
-  return tables;
+  auto tables = VERIFY_RESULT(yb_client_->ListTables());
+  std::vector<std::pair<TableId, client::YBTableName>> result;
+  result.reserve(tables.size());
+  for (auto& t : tables) {
+    auto table_id = t.table_id();
+    result.emplace_back(std::move(table_id), std::move(t));
+  }
+  return result;
 }
 
 } // namespace master

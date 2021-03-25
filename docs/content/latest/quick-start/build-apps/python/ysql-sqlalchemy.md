@@ -1,8 +1,8 @@
 ---
-title: Use Python and SQLAlchemy to build a YugabyteDB application
-headerTitle: Build a Python app
-linkTitle: Build a Python app
-description: Use Python and SQLAlchemy to build a YugabyteDB e-commerce application.
+title: Build a Python application that uses SQLAlchemy and YSQL
+headerTitle: Build a Python application
+linkTitle: Python
+description: Build a Python e-commerce application that uses SQLAlchemy and YSQL.
 menu:
   latest:
     parent: build-apps
@@ -14,22 +14,27 @@ isTocNested: true
 showAsideToc: true
 ---
 
-
 <ul class="nav nav-tabs-alt nav-tabs-yb">
   <li >
-    <a href="/latest/quick-start/build-apps/python/ysql-psycopg2" class="nav-link">
+    <a href="{{< relref "./ysql-psycopg2.md" >}}" class="nav-link">
       <i class="icon-postgres" aria-hidden="true"></i>
       YSQL - psycopg2
     </a>
   </li>
   <li >
-    <a href="/latest/quick-start/build-apps/python/ysql-sqlalchemy" class="nav-link active">
+    <a href="{{< relref "./ysql-aiopg.md" >}}" class="nav-link">
+      <i class="icon-postgres" aria-hidden="true"></i>
+      YSQL - aiopg
+    </a>
+  </li>
+  <li >
+    <a href="" class="nav-link active">
       <i class="icon-postgres" aria-hidden="true"></i>
       YSQL - SQL Alchemy
     </a>
   </li>
   <li>
-    <a href="/latest/quick-start/build-apps/python/ycql" class="nav-link">
+    <a href="{{< relref "./ycql.md" >}}" class="nav-link">
       <i class="icon-cassandra" aria-hidden="true"></i>
       YCQL
     </a>
@@ -62,7 +67,7 @@ Python 3 is installed
 Python packages (dependencies) are installed
 
 - [SQLAlchemy (`SQLAlchemy`)](https://www.sqlalchemy.org/)
-- [Psycopg2 (`psycopg2-binary`)](http://initd.org/psycopg/)
+- [psycopg2 (`psycopg2-binary`)](http://initd.org/psycopg/)
 - [JSONpickle (`jsonpickle`)](https://jsonpickle.github.io/)
 
 To quickly install these three packages, run the following command.
@@ -166,7 +171,7 @@ Type "help" for help.
 yugabyte=#
 ```
 
-```postgresql
+```plpgsql
 yugabyte=# SELECT count(*) FROM users;
 ```
 
@@ -177,7 +182,7 @@ yugabyte=# SELECT count(*) FROM users;
 (1 row)
 ```
 
-```postgresql
+```plpgsql
 yugabyte=# SELECT count(*) FROM products;
 ```
 
@@ -188,7 +193,7 @@ yugabyte=# SELECT count(*) FROM products;
 (1 row)
 ```
 
-```postgresql
+```plpgsql
 yugabyte=# SELECT count(*) FROM orders;
 ```
 

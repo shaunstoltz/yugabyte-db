@@ -17,16 +17,21 @@ import org.junit.Test;
 import org.junit.runner.RunWith;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
-import org.yb.YBTestRunner;
+import org.yb.util.YBTestRunnerNonTsanOnly;
 import org.yb.minicluster.MiniYBClusterBuilder;
 import org.yb.util.SanitizerUtil;
 
-@RunWith(value=YBTestRunner.class)
+@RunWith(value=YBTestRunnerNonTsanOnly.class)
 public class TestClusterWithHighLoadAndSlowSync extends TestClusterBase {
   private static final Logger LOG = LoggerFactory.getLogger(TestClusterBase.class);
 
   @Override
   protected void customizeMiniClusterBuilder(MiniYBClusterBuilder builder) {
+    super.customizeMiniClusterBuilder(builder);
+    // Tests hearbeat batching (initially disabled) which is very beneficial during slow sync.
+    builder.addMasterArgs(
+        "--catalog_manager_report_batch_size=10"
+    );
     builder.addCommonTServerArgs(
         "--log_inject_latency",
         "--log_inject_latency_ms_mean=100",

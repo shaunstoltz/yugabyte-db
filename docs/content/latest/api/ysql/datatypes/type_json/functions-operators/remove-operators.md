@@ -2,12 +2,11 @@
 title: "- and #- (remove operators) [JSON]"
 headerTitle: "- and #- (remove operators)"
 linkTitle: "- and #- (remove)"
-description: "- and #- (remove)"
-summary: "- and #- (remove)"
+description: Remove key-value pairs from an object or remove a single value from an array.
 menu:
   latest:
     identifier: remove-operators
-    parent: functions-operators
+    parent: json-functions-operators
     weight: 13
 isTocNested: true
 showAsideToc: true
@@ -17,7 +16,7 @@ showAsideToc: true
 
 **Notes:** Describing the behavior by using the term "remove" is a convenient shorthand. The actual effect of these operators is to create a _new_ `jsonb` value from the specified `jsonb` value according to the rule that the operator implements, parameterized by the SQL value on the right of the operator.
 
-### The `-` operator
+## The&#160; &#160;-&#160; &#160;operator
 
 **Purpose:** Remove key-value pairs from an _object_ or a single value from an _array_.
 
@@ -32,7 +31,7 @@ return value:       jsonb
 
 To remove a single key-value pair:
 
-```postgresql
+```plpgsql
 do $body$
 declare
   j_left constant jsonb := '{"a": "x", "b": "y"}';
@@ -48,7 +47,7 @@ $body$;
 
 To remove several key-value pairs:
 
-```postgresql
+```plpgsql
 do $body$
 declare
   j_left constant jsonb := '{"a": "p", "b": "q", "c": "r"}';
@@ -64,7 +63,7 @@ $body$;
 
 To remove a single value from an _array_:
 
-```postgresql
+```plpgsql
 do $body$
 declare
   j_left constant jsonb := '[1, 2, 3, 4]';
@@ -86,7 +85,7 @@ operator does not exist: jsonb - integer[]
 
 You can achieve the result thus:
 
-```postgresql
+```plpgsql
 do $body$
 declare
   j_left constant jsonb := '[1, 2, 3, 4, 5, 7]';
@@ -100,7 +99,7 @@ end;
 $body$;
 ```
 
-### The `#-` operator
+## The&#160; &#160;#-&#160; &#160;operator
 
 **Purpose:** Remove a single key-value pair from an _object_ or a single value from an _array_ at the specified path.
 
@@ -111,9 +110,9 @@ input values:       jsonb - text[]
 return value:       jsonb
 ```
 
-**Notes:** there is no `json` overload.
+**Notes:** There is no `json` overload.
 
-```postgresql
+```plpgsql
 do $body$
 declare
   j_left constant jsonb := '["a", {"b":17, "c": ["dog", "cat"]}]';
@@ -127,5 +126,4 @@ end;
 $body$;
 ```
 
-Just as with the `#>` and `#>>` operators, array index values are presented as convertible `text` values. Notice that the address of each JSON array element along the path is specified JSON-style, where the index starts at zero.
-ss
+Just as with the [`#>` and `#>>` operators](../subvalue-operators/), array index values are presented as convertible `text` values. Notice that the address of each JSON array element along the path is specified JSON-style, where the index starts at zero.

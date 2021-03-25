@@ -10,6 +10,7 @@ import com.yugabyte.yw.commissioner.Commissioner;
 import com.yugabyte.yw.commissioner.tasks.params.NodeTaskParams;
 import com.yugabyte.yw.common.ApiUtils;
 import com.yugabyte.yw.common.ShellProcessHandler;
+import com.yugabyte.yw.common.ShellResponse;
 import com.yugabyte.yw.forms.UniverseDefinitionTaskParams;
 import com.yugabyte.yw.models.AvailabilityZone;
 import com.yugabyte.yw.models.Region;
@@ -50,7 +51,7 @@ public class RemoveNodeFromUniverseTest extends CommissionerBaseTest {
   Commissioner commissioner;
   Universe defaultUniverse;
   YBClient mockClient;
-  ShellProcessHandler.ShellResponse dummyShellResponse;
+  ShellResponse dummyShellResponse;
 
   public void setUp(boolean withMaster, int numNodes, int replicationFactor, boolean multiZone) {
     super.setUp();
@@ -93,9 +94,19 @@ public class RemoveNodeFromUniverseTest extends CommissionerBaseTest {
     defaultUniverse = Universe.get(defaultUniverse.universeUUID);
 
     mockClient = mock(YBClient.class);
+    ShellResponse dummyShellResponse = new ShellResponse();
+    dummyShellResponse.message = "true";
+    when(mockNodeManager.nodeCommand(any(), any())).thenReturn(dummyShellResponse);
+    when(mockClient.waitForServer(any(), anyLong())).thenReturn(true);
+
+    try {
+      // WaitForTServerHeartBeats mock.
+      doNothing().when(mockClient).waitForMasterLeader(anyLong());
+    } catch (Exception e) {}
+
 
     when(mockYBClient.getClient(any(), any())).thenReturn(mockClient);
-    mockWaits(mockClient);
+    mockWaits(mockClient, 3);
   }
 
   private TaskInfo submitTask(NodeTaskParams taskParams, String nodeName) {
@@ -191,11 +202,12 @@ public class RemoveNodeFromUniverseTest extends CommissionerBaseTest {
     int taskPosition = 0;
     switch (type) {
       case WITH_MASTER:
-        for (TaskType taskType: REMOVE_NODE_WITH_MASTER) {
+        for (TaskType taskType : REMOVE_NODE_WITH_MASTER) {
           if (taskType.equals(TaskType.WaitForDataMove) && !moveData) {
             position++;
             continue;
           }
+
           List<TaskInfo> tasks = subTasksByPosition.get(taskPosition);
           assertEquals(1, tasks.size());
           assertEquals(taskType, tasks.get(0).getTaskType());
@@ -285,7 +297,7 @@ public class RemoveNodeFromUniverseTest extends CommissionerBaseTest {
     NodeTaskParams taskParams = new NodeTaskParams();
     taskParams.universeUUID = defaultUniverse.universeUUID;
     taskParams.expectedUniverseVersion = 3;
-    dummyShellResponse = new ShellProcessHandler.ShellResponse();
+    dummyShellResponse = new ShellResponse();
     dummyShellResponse.message = null;
     when(mockNodeManager.nodeCommand(any(), any())).thenReturn(dummyShellResponse);
     TaskInfo taskInfo = submitTask(taskParams, "host-n1");

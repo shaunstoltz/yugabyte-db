@@ -57,14 +57,58 @@ create or replace function unsupported1() returns void as $$
 declare a text collate "en_US";
 begin
 end$$ language plpgsql;
-create or replace function unsupported5() returns void as $$
-declare a refcursor;
-begin
-end$$ language plpgsql;
-create or replace function unsupported3() returns void as $$
-declare a cursor;
-begin
-end$$ language plpgsql;
 
--- TODO(jason): remove when issue #1721 is closed or closing.
-DISCARD TEMP;
+create table test(k int, v int);
+
+create procedure intermediate_commit() as $$
+begin
+  insert into test values(1, 1);
+  insert into test values(2, 2);
+  commit;
+  insert into test values(3, 3);
+end$$ LANGUAGE plpgsql;
+
+call intermediate_commit();
+
+select * from test order by k;
+
+do $$
+begin
+  insert into test values(4, 4);
+  commit;
+  insert into test values(5, 5);
+  insert into test values(6, 6);
+end $$;
+
+select * from test order by k;
+
+do $$
+begin
+  insert into test values(7, 7);
+  -- commit inserting (7, 7) row and start new transaction automatically.
+  commit;
+  insert into test values(8, 8);
+  rollback;
+  -- only insertion of (8, 8) row is rolled back.
+  -- new transaction is started automatically, next row will be inserted.
+  insert into test values(9, 9);
+end $$;
+
+select * from test order by k;
+
+create procedure p(a inout int)
+  language plpgsql
+as $body$
+begin
+  a := a + 1;
+end;
+$body$;
+
+do $body$
+declare
+  a int := 10;
+begin
+  call p(a);
+  raise info '%', a::text;
+end;
+$body$;

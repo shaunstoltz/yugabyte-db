@@ -20,15 +20,17 @@
 namespace yb {
 namespace master {
 
-YQLKeyspacesVTable::YQLKeyspacesVTable(const Master* const master)
-    : YQLVirtualTable(master::kSystemSchemaKeyspacesTableName, master, CreateSchema()) {
+YQLKeyspacesVTable::YQLKeyspacesVTable(const TableName& table_name,
+                                       const NamespaceName& namespace_name,
+                                       Master * const master)
+    : YQLVirtualTable(table_name, namespace_name, master, CreateSchema()) {
 }
 
 Result<std::shared_ptr<QLRowBlock>> YQLKeyspacesVTable::RetrieveData(
     const QLReadRequestPB& request) const {
   auto vtable = std::make_shared<QLRowBlock>(schema_);
   std::vector<scoped_refptr<NamespaceInfo> > namespaces;
-  master_->catalog_manager()->GetAllNamespaces(&namespaces);
+  master_->catalog_manager()->GetAllNamespaces(&namespaces, true);
   for (scoped_refptr<NamespaceInfo> ns : namespaces) {
     // Skip non-YQL namespace.
     if (!CatalogManager::IsYcqlNamespace(*ns)) {

@@ -16,9 +16,9 @@
 #define YB_YQL_PGGATE_PG_EXPR_H_
 
 #include "yb/client/client.h"
-#include "yb/common/ql_expr.h"
 #include "yb/yql/pggate/util/pg_doc_data.h"
 #include "yb/yql/pggate/util/pg_tuple.h"
+#include "yb/util/bfpg/tserver_opcodes.h"
 
 namespace yb {
 namespace pggate {
@@ -72,6 +72,7 @@ class PgExpr {
   // Convert this expression structure to PB format.
   virtual CHECKED_STATUS Eval(PgDml *pg_stmt, PgsqlExpressionPB *expr_pb);
   virtual CHECKED_STATUS Eval(PgDml *pg_stmt, QLValuePB *result);
+  virtual CHECKED_STATUS Eval(QLValuePB *result);
 
   // Access methods.
   Opcode opcode() const {
@@ -218,6 +219,8 @@ class PgConstant : public PgExpr {
   // Constructor.
   explicit PgConstant(const YBCPgTypeEntity *type_entity, uint64_t datum, bool is_null,
       PgExpr::Opcode opcode = PgExpr::Opcode::PG_EXPR_CONSTANT);
+  explicit PgConstant(const YBCPgTypeEntity *type_entity, PgDatumKind datum_kind,
+      PgExpr::Opcode opcode = PgExpr::Opcode::PG_EXPR_CONSTANT);
 
   // Destructor.
   virtual ~PgConstant();
@@ -237,6 +240,7 @@ class PgConstant : public PgExpr {
   // Expression to PB.
   CHECKED_STATUS Eval(PgDml *pg_stmt, PgsqlExpressionPB *expr_pb) override;
   CHECKED_STATUS Eval(PgDml *pg_stmt, QLValuePB *result) override;
+  CHECKED_STATUS Eval(QLValuePB *result) override;
 
   // Read binary value.
   const string &binary_value() {
@@ -262,15 +266,14 @@ class PgColumnRef : public PgExpr {
   virtual ~PgColumnRef();
 
   // Setup ColumnRef expression when constructing statement.
-  virtual CHECKED_STATUS PrepareForRead(PgDml *pg_stmt, PgsqlExpressionPB *expr_pb);
+  CHECKED_STATUS PrepareForRead(PgDml *pg_stmt, PgsqlExpressionPB *expr_pb) override;
 
   int attr_num() const {
     return attr_num_;
   }
 
-  virtual bool is_ybbasetid() const {
-    return attr_num_ == static_cast<int>(PgSystemAttrNum::kYBIdxBaseTupleId);
-  }
+  bool is_ybbasetid() const override;
+
  private:
   int attr_num_;
 };

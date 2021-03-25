@@ -36,6 +36,7 @@
 #include <gflags/gflags.h>
 #include <gtest/gtest.h>
 
+#include "yb/common/ql_expr.h"
 #include "yb/common/ql_protocol_util.h"
 
 #include "yb/docdb/doc_rowwise_iterator.h"
@@ -78,7 +79,7 @@ class VerifyRowsTabletTest : public TabletTestBase<SETUP> {
 
     // Warm up code cache with all the projections we'll be using.
     ASSERT_OK(tablet()->NewRowIterator(client_schema_, boost::none));
-    const Schema* schema = tablet()->schema();
+    const SchemaPtr schema = tablet()->schema();
     ColumnSchema valcol = schema->column(schema->find_column("val"));
     valcol_projection_ = Schema({ valcol }, 0);
     ASSERT_OK(tablet()->NewRowIterator(valcol_projection_, boost::none));

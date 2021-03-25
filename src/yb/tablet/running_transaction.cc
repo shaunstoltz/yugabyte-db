@@ -18,12 +18,20 @@
 #include "yb/common/pgsql_error.h"
 
 #include "yb/util/flag_tags.h"
+#include "yb/util/tsan_util.h"
 #include "yb/util/yb_pg_errcodes.h"
 
 using namespace std::placeholders;
+using namespace std::literals;
 
 DEFINE_test_flag(uint64, transaction_delay_status_reply_usec_in_tests, 0,
                  "For tests only. Delay handling status reply by specified amount of usec.");
+
+DEFINE_int64(transaction_abort_check_interval_ms, 5000 * yb::kTimeMultiplier,
+             "Interval to check whether running transaction was aborted.");
+
+DEFINE_int64(transaction_abort_check_timeout_ms, 30000 * yb::kTimeMultiplier,
+             "Timeout used when checking for aborted transactions.");
 
 namespace yb {
 namespace tablet {
@@ -31,6 +39,7 @@ namespace tablet {
 RunningTransaction::RunningTransaction(TransactionMetadata metadata,
                                        const TransactionalBatchData& last_batch_data,
                                        OneWayBitmap&& replicated_batches,
+                                       HybridTime base_time_for_abort_check_ht_calculation,
                                        RunningTransactionContext* context)
     : metadata_(std::move(metadata)),
       last_batch_data_(last_batch_data),
@@ -39,7 +48,10 @@ RunningTransaction::RunningTransaction(TransactionMetadata metadata,
       remove_intents_task_(&context->applier_, &context->participant_context_, context,
                            metadata_.transaction_id),
       get_status_handle_(context->rpcs_.InvalidHandle()),
-      abort_handle_(context->rpcs_.InvalidHandle()) {
+      abort_handle_(context->rpcs_.InvalidHandle()),
+      apply_intents_task_(&context->applier_, context, &apply_data_),
+      abort_check_ht_(base_time_for_abort_check_ht_calculation.AddDelta(
+                          1ms * FLAGS_transaction_abort_check_interval_ms)) {
 }
 
 RunningTransaction::~RunningTransaction() {
@@ -61,16 +73,20 @@ void RunningTransaction::BatchReplicated(const TransactionalBatchData& value) {
 
 void RunningTransaction::SetLocalCommitTime(HybridTime time) {
   local_commit_time_ = time;
+  last_known_status_hybrid_time_ = local_commit_time_;
+  last_known_status_ = TransactionStatus::COMMITTED;
 }
 
 void RunningTransaction::Aborted() {
+  VLOG_WITH_PREFIX(4) << __func__ << "()";
+
   last_known_status_ = TransactionStatus::ABORTED;
   last_known_status_hybrid_time_ = HybridTime::kMax;
 }
 
 void RunningTransaction::RequestStatusAt(const StatusRequest& request,
                                          std::unique_lock<std::mutex>* lock) {
-  DCHECK_LT(request.global_limit_ht, HybridTime::kMax);
+  DCHECK_LE(request.global_limit_ht, HybridTime::kMax);
   DCHECK_LE(request.read_ht, request.global_limit_ht);
 
   if (last_known_status_hybrid_time_ > HybridTime::kMin) {
@@ -155,7 +171,7 @@ std::string RunningTransaction::ToString() const {
 
 void RunningTransaction::ScheduleRemoveIntents(const RunningTransactionPtr& shared_self) {
   if (remove_intents_task_.Prepare(shared_self)) {
-    context_.participant_context_.Enqueue(&remove_intents_task_);
+    context_.participant_context_.StrandEnqueue(&remove_intents_task_);
     VLOG_WITH_PREFIX(1) << "Intents should be removed asynchronously";
   }
 }
@@ -203,7 +219,7 @@ void RunningTransaction::StatusReceived(
     const tserver::GetTransactionStatusResponsePB& response,
     int64_t serial_no,
     const RunningTransactionPtr& shared_self) {
-  auto delay_usec = FLAGS_transaction_delay_status_reply_usec_in_tests;
+  auto delay_usec = FLAGS_TEST_transaction_delay_status_reply_usec_in_tests;
   if (delay_usec > 0) {
     context_.delayer().Delay(
         MonoTime::Now() + MonoDelta::FromMicroseconds(delay_usec),
@@ -214,10 +230,32 @@ void RunningTransaction::StatusReceived(
   }
 }
 
+bool RunningTransaction::UpdateStatus(
+    TransactionStatus transaction_status, HybridTime time_of_status) {
+  // Check for local_commit_time_ is not required for correctness, but useful for optimization.
+  // So we could avoid unnecessary actions.
+  if (local_commit_time_) {
+    return false;
+  }
+
+  last_known_status_hybrid_time_ = time_of_status;
+
+  if (transaction_status == last_known_status_) {
+    return false;
+  }
+
+  last_known_status_ = transaction_status;
+
+  return transaction_status == TransactionStatus::ABORTED;
+}
+
 void RunningTransaction::DoStatusReceived(const Status& status,
                                           const tserver::GetTransactionStatusResponsePB& response,
                                           int64_t serial_no,
                                           const RunningTransactionPtr& shared_self) {
+  VLOG_WITH_PREFIX(4) << __func__ << "(" << status << ", " << response.ShortDebugString() << ", "
+                      << serial_no << ")";
+
   if (response.has_propagated_hybrid_time()) {
     context_.participant_context_.UpdateClock(HybridTime(response.propagated_hybrid_time()));
   }
@@ -248,22 +286,16 @@ void RunningTransaction::DoStatusReceived(const Status& status,
       time_of_status = HybridTime::kMin;
     }
 
-    // Check for local_commit_time_ is not required for correctness, but useful for optimization.
-    // So we could avoid unnecessary actions.
-    if (local_commit_time_.is_valid()) {
-      last_known_status_hybrid_time_ = local_commit_time_;
-      last_known_status_ = TransactionStatus::COMMITTED;
-    } else if (response.status().size() == 1) {
-      if (last_known_status_hybrid_time_ <= time_of_status) {
-        last_known_status_hybrid_time_ = time_of_status;
-        last_known_status_ = response.status(0);
-        if (response.status(0) == TransactionStatus::ABORTED) {
-          context_.EnqueueRemoveUnlocked(id(), &min_running_notifier);
-        }
-      }
+    if (response.status().size() == 1) {
+      transaction_status = response.status(0);
     } else {
       LOG(DFATAL) << "Wrong number of status entries, exactly one entry expected: "
                   << response.ShortDebugString();
+      transaction_status = TransactionStatus::PENDING;
+    }
+
+    if (UpdateStatus(transaction_status, time_of_status)) {
+      context_.EnqueueRemoveUnlocked(id(), &min_running_notifier);
     }
 
     time_of_status = last_known_status_hybrid_time_;
@@ -328,7 +360,7 @@ void RunningTransaction::NotifyWaiters(int64_t serial_no, HybridTime time_of_sta
           Format("Cannot determine transaction status with read_ht $0, and global_limit_ht $1, "
                  "last known: $2 at $3", waiter.read_ht, waiter.global_limit_ht,
                  TransactionStatus_Name(transaction_status), time_of_status), Slice(),
-          PgsqlError(YBPgErrorCode::YB_PG_IN_FAILED_SQL_TRANSACTION) ));
+          PgsqlError(YBPgErrorCode::YB_PG_T_R_SERIALIZATION_FAILURE) ));
     }
   }
 }
@@ -359,14 +391,20 @@ void RunningTransaction::AbortReceived(const Status& status,
   VLOG_WITH_PREFIX(3) << "AbortReceived: " << yb::ToString(result);
 
   {
+    MinRunningNotifier min_running_notifier(&context_.applier_);
     std::lock_guard<std::mutex> lock(context_.mutex_);
     context_.rpcs_.Unregister(&abort_handle_);
     abort_waiters_.swap(abort_waiters);
-    // kMax status_time means taht this status is not yet replicated and could be rejected.
+    // kMax status_time means that this status is not yet replicated and could be rejected.
     // So we could use it as reply to Abort, but cannot store it as transaction status.
     if (result.ok() && result->status_time != HybridTime::kMax) {
-      last_known_status_ = result->status;
       last_known_status_hybrid_time_ = result->status_time;
+      if (last_known_status_ != result->status) {
+        last_known_status_ = result->status;
+        if (result->status == TransactionStatus::ABORTED) {
+          context_.EnqueueRemoveUnlocked(id(), &min_running_notifier);
+        }
+      }
     }
   }
   for (const auto& waiter : abort_waiters) {
@@ -382,7 +420,54 @@ std::string RunningTransaction::LogPrefix() const {
 Status MakeAbortedStatus(const TransactionId& id) {
   return STATUS(
       TryAgain, Format("Transaction aborted: $0", id), Slice(),
-      PgsqlError(YBPgErrorCode::YB_PG_IN_FAILED_SQL_TRANSACTION));
+      PgsqlError(YBPgErrorCode::YB_PG_T_R_SERIALIZATION_FAILURE));
+}
+
+void RunningTransaction::SetApplyData(const docdb::ApplyTransactionState& apply_state,
+                                      const TransactionApplyData* data) {
+  apply_state_ = apply_state;
+  bool active = apply_state_.active();
+
+  if (data) {
+    apply_data_ = *data;
+    apply_data_.apply_state = &apply_state_;
+
+    LOG_IF_WITH_PREFIX(DFATAL, local_commit_time_ != data->commit_ht)
+        << "Commit time does not match: " << local_commit_time_ << " vs " << data->commit_ht;
+
+    if (apply_intents_task_.Prepare(shared_from_this())) {
+      context_.participant_context_.StrandEnqueue(&apply_intents_task_);
+    } else {
+      LOG_WITH_PREFIX(DFATAL) << "Unable to prepare apply intents task";
+    }
+  }
+
+  if (!active) {
+    VLOG_WITH_PREFIX(3) << "Finished applying intents";
+
+    MinRunningNotifier min_running_notifier(&context_.applier_);
+    std::lock_guard<std::mutex> lock(context_.mutex_);
+    context_.RemoveUnlocked(id(), "applied large"s, &min_running_notifier);
+  }
+}
+
+bool RunningTransaction::ProcessingApply() const {
+  return apply_state_.active();
+}
+
+void RunningTransaction::UpdateAbortCheckHT(HybridTime now, UpdateAbortCheckHTMode mode) {
+  if (last_known_status_ == TransactionStatus::ABORTED ||
+      last_known_status_ == TransactionStatus::COMMITTED) {
+    abort_check_ht_ = HybridTime::kMax;
+    return;
+  }
+  // When we send a status request, we schedule the transaction status to be re-checked around the
+  // same time the request is supposed to time out. When we get a status response (normal case, no
+  // timeout), we go back to the normal interval of re-checking the status of this transaction.
+  auto delta_ms = mode == UpdateAbortCheckHTMode::kStatusRequestSent
+      ? FLAGS_transaction_abort_check_timeout_ms
+      : FLAGS_transaction_abort_check_interval_ms;
+  abort_check_ht_ = now.AddDelta(1ms * delta_ms);
 }
 
 } // namespace tablet

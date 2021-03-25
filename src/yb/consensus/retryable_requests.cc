@@ -22,11 +22,13 @@
 #include "yb/consensus/consensus.h"
 
 #include "yb/util/atomic.h"
+#include "yb/util/flag_tags.h"
 #include "yb/util/metrics.h"
 #include "yb/util/opid.h"
 
 DEFINE_int32(retryable_request_timeout_secs, 120,
              "Amount of time to keep write request in index, to prevent duplicate writes.");
+TAG_FLAG(retryable_request_timeout_secs, runtime);
 
 // We use this limit to prevent request range from infinite grow, because it will block log
 // cleanup. I.e. even we have continous request range, it will be split by blocks, that could be
@@ -56,7 +58,7 @@ struct RunningRetryableRequest {
   mutable std::vector<ConsensusRoundPtr> duplicate_rounds;
 
   RunningRetryableRequest(
-      RetryableRequestId request_id_, const OpId& op_id_, RestartSafeCoarseTimePoint time_)
+      RetryableRequestId request_id_, const OpIdPB& op_id_, RestartSafeCoarseTimePoint time_)
       : request_id(request_id_), op_id(yb::OpId::FromPB(op_id_)), time(time_) {}
 
   std::string ToString() const {
@@ -227,8 +229,12 @@ class RetryableRequests::Impl {
 
     if (data.request_id() < client_retryable_requests.min_running_request_id) {
       round->NotifyReplicationFinished(
-          STATUS(Expired, "Request id is below than min running"), round->bound_term(),
-          nullptr /* applied_op_ids */);
+          STATUS_EC_FORMAT(
+              Expired,
+              MinRunningRequestIdStatusData(client_retryable_requests.min_running_request_id),
+              "Request id $0 is less than min running $1", data.request_id(),
+              client_retryable_requests.min_running_request_id),
+          round->bound_term(), nullptr /* applied_op_ids */);
       return false;
     }
 
@@ -379,6 +385,14 @@ class RetryableRequests::Impl {
       LOG_WITH_PREFIX(INFO) << "Replicated: " << yb::ToString(p.second.replicated);
     }
     return result;
+  }
+
+  Result<RetryableRequestId> MinRunningRequestId(const ClientId& client_id) const {
+    const auto it = clients_.find(client_id);
+    if (it == clients_.end()) {
+      return STATUS_FORMAT(NotFound, "Client requests data not found for client $0", client_id);
+    }
+    return it->second.min_running_request_id;
   }
 
  private:
@@ -572,6 +586,11 @@ RestartSafeCoarseMonoClock& RetryableRequests::Clock() {
 
 RetryableRequestsCounts RetryableRequests::TEST_Counts() {
   return impl_->TEST_Counts();
+}
+
+Result<RetryableRequestId> RetryableRequests::MinRunningRequestId(
+    const ClientId& client_id) const {
+  return impl_->MinRunningRequestId(client_id);
 }
 
 void RetryableRequests::SetMetricEntity(const scoped_refptr<MetricEntity>& metric_entity) {

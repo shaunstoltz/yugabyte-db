@@ -58,7 +58,7 @@ TEST_F(BackupServiceTest, TestCreateTabletSnapshot) {
 
   const string snapshot_id = "00000000000000000000000000000000";
   const string rocksdb_dir = tablet->tablet_metadata()->rocksdb_dir();
-  const string top_snapshots_dir = tablet::TabletSnapshots::SnapshotsDirName(rocksdb_dir);
+  const string top_snapshots_dir = tablet->tablet_metadata()->snapshots_dir();
   const string snapshot_dir = JoinPathSegments(top_snapshots_dir, snapshot_id);
 
   TabletSnapshotOpRequestPB req;
@@ -157,7 +157,7 @@ TEST_F(BackupServiceTest, TestSnapshotData) {
   VerifyRows(schema_, { KeyValue(1, 11), KeyValue(2, 22) });
 
   // Send the restore snapshot request.
-  req.set_operation(TabletSnapshotOpRequestPB::RESTORE);
+  req.set_operation(TabletSnapshotOpRequestPB::RESTORE_ON_TABLET);
   {
     RpcController rpc;
     SCOPED_TRACE(req.DebugString());

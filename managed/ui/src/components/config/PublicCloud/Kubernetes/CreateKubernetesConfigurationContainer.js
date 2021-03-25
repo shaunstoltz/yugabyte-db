@@ -3,9 +3,11 @@
 import { connect } from 'react-redux';
 import CreateKubernetesConfiguration from './CreateKubernetesConfiguration';
 
-import { createProviderResponse,
-         createMultiRegionKubernetesProvider,
-         fetchCloudMetadata } from 'actions/cloud';
+import {
+  createProviderResponse,
+  createMultiRegionKubernetesProvider,
+  fetchCloudMetadata
+} from '../../../../actions/cloud';
 import { openDialog, closeDialog } from '../../../../actions/modal';
 
 const mapStateToProps = (state) => {
@@ -19,12 +21,14 @@ const mapStateToProps = (state) => {
 const mapDispatchToProps = (dispatch) => {
   return {
     createKubernetesProvider: (providerName, providerConfig, regionData) => {
-      dispatch(createMultiRegionKubernetesProvider(providerName, providerConfig, regionData)).then((response) => {
-        dispatch(createProviderResponse(response.payload));
-        if (response.payload.status === 200) {
-          dispatch(fetchCloudMetadata());
+      dispatch(createMultiRegionKubernetesProvider(providerName, providerConfig, regionData)).then(
+        (response) => {
+          dispatch(createProviderResponse(response.payload));
+          if (response.payload.status === 200) {
+            dispatch(fetchCloudMetadata());
+          }
         }
-      });
+      );
     },
 
     showModal: (modalName) => {
@@ -32,9 +36,8 @@ const mapDispatchToProps = (dispatch) => {
     },
     closeModal: () => {
       dispatch(closeDialog());
-    },
+    }
   };
 };
-
 
 export default connect(mapStateToProps, mapDispatchToProps)(CreateKubernetesConfiguration);

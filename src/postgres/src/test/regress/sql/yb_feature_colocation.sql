@@ -2,19 +2,31 @@
 -- Colocation
 --
 
+-- CREATE TABLE on non-colocated database
+
+CREATE TABLE tab_colo (a INT) WITH (colocated = true);
+CREATE TABLE tab_noco (a INT) WITH (colocated = false);
+DROP TABLE tab_noco;
+
+-- CREATE DATABASE colocated
+
 CREATE DATABASE colocation_test colocated = true;
 \c colocation_test
 
 -- CREATE TABLE
 
--- TODO: This test should be changed once we complete issue #3034
-CREATE TABLE tab_nonkey (a INT); -- fail
+CREATE TABLE tab_nonkey (a INT);
+\d tab_nonkey
+CREATE TABLE tab_key (a INT PRIMARY KEY);
+\d tab_key
 CREATE TABLE tab_range (a INT, PRIMARY KEY (a ASC));
 CREATE TABLE tab_range_nonkey (a INT, b INT, PRIMARY KEY (a ASC));
 -- opt out of using colocated tablet
 CREATE TABLE tab_nonkey_noco (a INT) WITH (colocated = false);
+-- colocated tables with no primary keys should not be hash partitioned
+CREATE TABLE split_table ( a integer, b text ) SPLIT INTO 4 TABLETS;
 -- multi column primary key table
-CREATE TABLE tab_range_range (a INT, b INT, PRIMARY KEY (a ASC, b DESC));
+CREATE TABLE tab_range_range (a INT, b INT, PRIMARY KEY (a, b DESC));
 CREATE TABLE tab_range_colo (a INT, PRIMARY KEY (a ASC)) WITH (colocated = true);
 
 INSERT INTO tab_range (a) VALUES (0), (1), (2);
@@ -48,8 +60,9 @@ INSERT INTO tab_range_colo VALUES (6), (6);
 -- table with index
 CREATE TABLE tab_range_nonkey2 (a INT, b INT, PRIMARY KEY (a ASC));
 CREATE INDEX idx_range ON tab_range_nonkey2 (a);
+\d tab_range_nonkey2
 INSERT INTO tab_range_nonkey2 (a, b) VALUES (0, 0), (1, 1), (2, 2), (3, 3), (4, 4), (5, 5);
-EXPLAIN SELECT * FROM tab_range_nonkey2 WHERE a = 1;
+EXPLAIN (COSTS OFF) SELECT * FROM tab_range_nonkey2 WHERE a = 1;
 SELECT * FROM tab_range_nonkey2 WHERE a = 1;
 UPDATE tab_range_nonkey2 SET b = b + 1 WHERE a > 3;
 SELECT * FROM tab_range_nonkey2;
@@ -68,7 +81,7 @@ CREATE INDEX idx_range_noco ON tab_range_nonkey4 (a) WITH (colocated = false);
 CREATE TABLE tab_range_nonkey_noco (a INT, b INT, PRIMARY KEY (a ASC)) WITH (colocated = false);
 CREATE INDEX idx_range2 ON tab_range_nonkey_noco (a);
 INSERT INTO tab_range_nonkey_noco (a, b) VALUES (0, 0), (1, 1), (2, 2), (3, 3), (4, 4), (5, 5);
-EXPLAIN SELECT * FROM tab_range_nonkey_noco WHERE a = 1;
+EXPLAIN (COSTS OFF) SELECT * FROM tab_range_nonkey_noco WHERE a = 1;
 SELECT * FROM tab_range_nonkey_noco WHERE a = 1;
 UPDATE tab_range_nonkey_noco SET b = b + 1 WHERE a > 3;
 SELECT * FROM tab_range_nonkey_noco;
@@ -103,6 +116,8 @@ SELECT * FROM tab_range;
 INSERT INTO tab_range VALUES (2);
 SELECT * FROM tab_range;
 
+TRUNCATE TABLE tab_range;
+
 -- truncate non-colocated table without index
 TRUNCATE TABLE tab_nonkey_noco;
 SELECT * FROM tab_nonkey_noco;
@@ -118,6 +133,24 @@ SELECT * FROM tab_range_nonkey_noco2;
 \dt
 \di
 
+-- ALTER TABLE
+INSERT INTO tab_range (a) VALUES (0), (1), (2);
+INSERT INTO tab_range_nonkey2 (a, b) VALUES (0, 0), (1, 1);
+
+SELECT * FROM tab_range;
+SELECT * FROM tab_range_nonkey2;
+
+-- Alter colocated tables
+ALTER TABLE tab_range ADD COLUMN x INT;
+ALTER TABLE tab_range_nonkey2 DROP COLUMN b;
+
+SELECT * FROM tab_range;
+SELECT * FROM tab_range_nonkey2;
+
+ALTER TABLE tab_range_nonkey2 RENAME TO tab_range_nonkey2_renamed;
+SELECT * FROM tab_range_nonkey2_renamed;
+SELECT * FROM tab_range_nonkey2;
+
 -- DROP TABLE
 
 -- drop colocated table with default index
@@ -129,8 +162,8 @@ DROP TABLE tab_nonkey_noco;
 SELECT * FROM tab_nonkey_noco;
 
 --- drop colocated table with explicit index
-DROP TABLE tab_range_nonkey2;
-SELECT * FROM tab_range_nonkey2;
+DROP TABLE tab_range_nonkey2_renamed;
+SELECT * FROM tab_range_nonkey2_renamed;
 
 -- drop non-colocated table with explicit index
 DROP TABLE tab_range_nonkey_noco2;

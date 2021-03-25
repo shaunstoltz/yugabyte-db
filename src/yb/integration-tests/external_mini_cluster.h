@@ -149,7 +149,7 @@ struct ExternalMiniClusterOptions {
 
   bool enable_ysql = kDefaultEnableYsql;
 
-  // If true logs will be writen in both stderr and file
+  // If true logs will be written in both stderr and file
   bool log_to_file = false;
 
   // Use even IPs for cluster, like we have for MiniCluster.
@@ -172,6 +172,8 @@ struct ExternalMiniClusterOptions {
 // other hand, there is little access to inspect the internal state of the daemons.
 class ExternalMiniCluster : public MiniClusterBase {
  public:
+  typedef ExternalMiniClusterOptions Options;
+
   // Mode to which node types a certain action (like Shutdown()) should apply.
   enum NodeSelectionMode {
     TS_ONLY,
@@ -258,7 +260,7 @@ class ExternalMiniCluster : public MiniClusterBase {
   CHECKED_STATUS GetNumMastersAsSeenBy(ExternalMaster* master, int* num_peers);
 
   // Get the last committed opid for the current leader master.
-  CHECKED_STATUS GetLastOpIdForLeader(consensus::OpId* opid);
+  CHECKED_STATUS GetLastOpIdForLeader(OpIdPB* opid);
 
   // The leader master sometimes does not commit the config in time on first setup, causing
   // CheckHasCommittedOpInCurrentTermUnlocked check - that the current term should have had at least
@@ -298,7 +300,7 @@ class ExternalMiniCluster : public MiniClusterBase {
   int tablet_server_index_by_uuid(const std::string& uuid) const;
 
   // Return all masters.
-  std::vector<ExternalDaemon*> master_daemons() const;
+  std::vector<ExternalMaster*> master_daemons() const;
 
   // Return all tablet servers and masters.
   std::vector<ExternalDaemon*> daemons() const;
@@ -371,6 +373,8 @@ class ExternalMiniCluster : public MiniClusterBase {
                          const std::string& flag,
                          const std::string& value);
 
+  // Sets the given flag on all masters.
+  CHECKED_STATUS SetFlagOnMasters(const std::string& flag, const std::string& value);
   // Sets the given flag on all tablet servers.
   CHECKED_STATUS SetFlagOnTServers(const std::string& flag, const std::string& value);
 
@@ -380,6 +384,9 @@ class ExternalMiniCluster : public MiniClusterBase {
 
   // Step down the master leader. error_code tracks rpc error info that can be used by the caller.
   CHECKED_STATUS StepDownMasterLeader(tserver::TabletServerErrorPB::Code* error_code);
+
+  // Step down the master leader and wait for a new leader to be elected.
+  CHECKED_STATUS StepDownMasterLeaderAndWaitForNewLeader();
 
   // Find out if the master service considers itself ready. Return status OK() implies it is ready.
   CHECKED_STATUS GetIsMasterLeaderServiceReady(ExternalMaster* master);
@@ -431,16 +438,13 @@ class ExternalMiniCluster : public MiniClusterBase {
   CHECKED_STATUS GetLastOpIdForEachMasterPeer(
       const MonoDelta& timeout,
       consensus::OpIdType opid_type,
-      std::vector<consensus::OpId>* op_ids);
+      std::vector<OpIdPB>* op_ids);
 
   // Ensure that the leader server is allowed to process a config change (by having at least one
   // commit in the current term as leader).
   CHECKED_STATUS WaitForLeaderToAllowChangeConfig(
       const string& uuid,
       ConsensusServiceProxy* leader_proxy);
-
-  // Step down the master leader and wait for a new leader to be elected.
-  CHECKED_STATUS StepDownMasterLeaderAndWaitForNewLeader();
 
   // Return master address for specified port.
   std::string MasterAddressForPort(uint16_t port) const;

@@ -18,6 +18,7 @@
 #include "yb/gutil/map-util.h"
 #include "yb/common/ybc-internal.h"
 #include "yb/util/metrics.h"
+#include "yb/util/signal_util.h"
 
 DECLARE_string(metric_node_name);
 
@@ -30,12 +31,14 @@ static ybpgmEntry *ybpgm_table;
 static int ybpgm_num_entries;
 static int *num_backends;
 yb::MetricEntity::AttributeMap prometheus_attr;
-static void (*pullRpczEntries)();
 static void (*pullYsqlStatementStats)(void *);
-static void (*freeRpczEntries)();
+static void (*resetYsqlStatementStats)();
 static rpczEntry **rpczResultPointer;
 
-static void PgMetricsHandler(const Webserver::WebRequest& req, std::stringstream* output) {
+static postgresCallbacks pgCallbacks;
+static void PgMetricsHandler(const Webserver::WebRequest& req,
+                             Webserver::WebResponse* resp) {
+  std::stringstream *output = &resp->output;
   JsonWriter::Mode json_mode;
   string arg = FindWithDefault(req.parsed_args, "compact", "false");
   json_mode = ParseLeadingBoolValue(arg.c_str(), false) ?
@@ -51,14 +54,16 @@ static void PgMetricsHandler(const Webserver::WebRequest& req, std::stringstream
   writer.String("metrics");
   writer.StartArray();
 
-  for (int i = 0; i < ybpgm_num_entries; ++i) {
+  for (const auto* entry = ybpgm_table, *end = entry + ybpgm_num_entries; entry != end; ++entry) {
     writer.StartObject();
     writer.String("name");
-    writer.String(ybpgm_table[i].name);
+    writer.String(entry->name);
     writer.String("count");
-    writer.Int64(ybpgm_table[i].calls);
+    writer.Int64(entry->calls);
     writer.String("sum");
-    writer.Int64(ybpgm_table[i].total_time);
+    writer.Int64(entry->total_time);
+    writer.String("rows");
+    writer.Int64(entry->rows);
     writer.EndObject();
   }
 
@@ -96,7 +101,9 @@ static void DoWriteStatArrayElemToJson(JsonWriter* writer, YsqlStatementStat* st
   writer->Int64(stat->rows);
 }
 
-static void PgStatStatementsHandler(const Webserver::WebRequest& req, std::stringstream* output) {
+static void PgStatStatementsHandler(const Webserver::WebRequest& req,
+                                    Webserver::WebResponse* resp) {
+  std::stringstream *output = &resp->output;
   JsonWriter::Mode json_mode;
   string arg = FindWithDefault(req.parsed_args, "compact", "false");
   json_mode = ParseLeadingBoolValue(arg.c_str(), false) ?
@@ -117,65 +124,104 @@ static void PgStatStatementsHandler(const Webserver::WebRequest& req, std::strin
   writer.EndObject();
 }
 
-static void PgRpczHandler(const Webserver::WebRequest& req, std::stringstream* output) {
-  pullRpczEntries();
+static void PgStatStatementsResetHandler(const Webserver::WebRequest& req,
+                                         Webserver::WebResponse* resp) {
+  std::stringstream *output = &resp->output;
+  JsonWriter::Mode json_mode;
+  string arg = FindWithDefault(req.parsed_args, "compact", "false");
+  json_mode = ParseLeadingBoolValue(arg.c_str(), false) ?
+              JsonWriter::COMPACT : JsonWriter::PRETTY;
+  JsonWriter writer(output, json_mode);
+
+  writer.StartObject();
+
+  writer.String("statements");
+  if (resetYsqlStatementStats) {
+    resetYsqlStatementStats();
+    writer.String("PG Stat Statements reset.");
+  } else {
+    writer.String("PG Stat Statements module is disabled.");
+  }
+
+  writer.EndObject();
+}
+
+static void WriteAsJsonTimestampAndRunningForMs(JsonWriter *writer, const std::string& prefix,
+                                                int64 start_timestamp, int64 snapshot_timestamp,
+                                                bool active) {
+  writer->String(prefix + "_start_time");
+  writer->String(pgCallbacks.getTimestampTzToStr(start_timestamp));
+
+  if (!active) {
+    return;
+  }
+
+  writer->String(prefix + "_running_for_ms");
+  writer->Int64(pgCallbacks.getTimestampTzDiffMs(start_timestamp, snapshot_timestamp));
+}
+
+static void PgRpczHandler(const Webserver::WebRequest& req,
+                                Webserver::WebResponse* resp) {
+  std::stringstream *output = &resp->output;
+  pgCallbacks.pullRpczEntries();
+  int64 snapshot_timestamp = pgCallbacks.getTimestampTz();
 
   JsonWriter::Mode json_mode;
   string arg = FindWithDefault(req.parsed_args, "compact", "false");
   json_mode = ParseLeadingBoolValue(arg.c_str(), false) ?
               JsonWriter::COMPACT : JsonWriter::PRETTY;
   JsonWriter writer(output, json_mode);
-  rpczEntry *rpczResult = *rpczResultPointer;
+  rpczEntry *entry = *rpczResultPointer;
 
   writer.StartObject();
   writer.String("connections");
   writer.StartArray();
-  for (int i = 0; i < *num_backends; ++i) {
-    if (rpczResult[i].proc_id > 0) {
+  for (int i = 0; i < *num_backends; ++i, ++entry) {
+    if (entry->proc_id > 0) {
       writer.StartObject();
-      if (rpczResult[i].db_oid) {
+      if (entry->db_oid) {
         writer.String("db_oid");
-        writer.Int64(rpczResult[i].db_oid);
+        writer.Int64(entry->db_oid);
         writer.String("db_name");
-        writer.String(rpczResult[i].db_name);
+        writer.String(entry->db_name);
       }
 
-      if (strlen(rpczResult[i].query) > 0) {
+      if (strlen(entry->query) > 0) {
         writer.String("query");
-        writer.String(rpczResult[i].query);
+        writer.String(entry->query);
+      }
+
+      WriteAsJsonTimestampAndRunningForMs(&writer, "process",
+                                          entry->process_start_timestamp,
+                                          snapshot_timestamp, entry->backend_active);
+
+      if (entry->transaction_start_timestamp > 0) {
+        WriteAsJsonTimestampAndRunningForMs(&writer, "transaction",
+                                            entry->transaction_start_timestamp,
+                                            snapshot_timestamp, entry->backend_active);
+      }
+
+      if (entry->query_start_timestamp > 0) {
+        WriteAsJsonTimestampAndRunningForMs(&writer, "query",
+                                            entry->query_start_timestamp,
+                                            snapshot_timestamp, entry->backend_active);
       }
 
       writer.String("application_name");
-      writer.String(rpczResult[i].application_name);
-
-      writer.String("process_start_time");
-      writer.String(rpczResult[i].process_start_timestamp);
-
-      if (rpczResult[i].transaction_start_timestamp) {
-        writer.String("transaction_start_time");
-        writer.String(rpczResult[i].transaction_start_timestamp);
-      }
-
-      if (rpczResult[i].query_start_timestamp) {
-        writer.String("query_start_time");
-        writer.String(rpczResult[i].query_start_timestamp);
-      }
-
-      writer.String("application_name");
-      writer.String(rpczResult[i].application_name);
+      writer.String(entry->application_name);
       writer.String("backend_type");
-      writer.String(rpczResult[i].backend_type);
+      writer.String(entry->backend_type);
       writer.String("backend_status");
-      writer.String(rpczResult[i].backend_status);
+      writer.String(entry->backend_status);
 
-      if (rpczResult[i].host) {
+      if (entry->host) {
         writer.String("host");
-        writer.String(rpczResult[i].host);
+        writer.String(entry->host);
       }
 
-      if (rpczResult[i].port) {
+      if (entry->port) {
         writer.String("port");
-        writer.String(rpczResult[i].port);
+        writer.String(entry->port);
       }
 
       writer.EndObject();
@@ -183,12 +229,12 @@ static void PgRpczHandler(const Webserver::WebRequest& req, std::stringstream* o
   }
   writer.EndArray();
   writer.EndObject();
-  freeRpczEntries();
+  pgCallbacks.freeRpczEntries();
 }
 
 static void PgPrometheusMetricsHandler(const Webserver::WebRequest& req,
-                                       std::stringstream* output) {
-
+                                       Webserver::WebResponse* resp) {
+  std::stringstream *output = &resp->output;
   PrometheusWriter writer(output);
 
   // Max size of ybpgm_table name (100 incl \0 char) + max size of "_count"/"_sum" (6 excl \0).
@@ -221,6 +267,9 @@ extern "C" {
     yb::WebserverOptions opts;
     opts.bind_interface = listen_addresses;
     opts.port = port;
+    // Important! Since postgres functions aren't generally thread-safe,
+    // we shouldn't allow more than one worker thread at a time.
+    opts.num_worker_threads = 1;
     return reinterpret_cast<WebserverWrapper *> (new Webserver(opts, "Postgres webserver"));
   }
 
@@ -237,12 +286,15 @@ extern "C" {
     pullYsqlStatementStats = getYsqlStatementStats;
   }
 
-  void RegisterRpczEntries(void (*rpczFunction)(), void (*freerpczFunction)(),
-                           int *num_backends_ptr, rpczEntry **rpczEntriesPointer) {
-    rpczResultPointer = rpczEntriesPointer;
-    pullRpczEntries = rpczFunction;
-    freeRpczEntries = freerpczFunction;
+  void RegisterResetYsqlStatStatements(void (*fn)()) {
+    resetYsqlStatementStats = fn;
+  }
+
+  void RegisterRpczEntries(postgresCallbacks *callbacks, int *num_backends_ptr,
+                           rpczEntry **rpczEntriesPointer) {
+    pgCallbacks = *callbacks;
     num_backends = num_backends_ptr;
+    rpczResultPointer = rpczEntriesPointer;
   }
 
   YBCStatus StartWebserver(WebserverWrapper *webserver_wrapper) {
@@ -254,6 +306,10 @@ extern "C" {
     webserver->RegisterPathHandler("/rpcz", "RPCs in progress", PgRpczHandler, false, false);
     webserver->RegisterPathHandler("/statements", "PG Stat Statements", PgStatStatementsHandler,
         false, false);
-    return ToYBCStatus(webserver->Start());
+    webserver->RegisterPathHandler("/statements-reset", "Reset PG Stat Statements",
+        PgStatStatementsResetHandler, false, false);
+    return ToYBCStatus(yb::WithMaskedYsqlSignals([webserver]() {
+      return webserver->Start();
+    }));
   }
 };

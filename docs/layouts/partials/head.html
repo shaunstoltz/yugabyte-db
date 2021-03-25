@@ -17,18 +17,19 @@
     <meta name="author" content="{{ . }}">
     {{ end }}
 
-    {{ with .Site.Params.block_indexing }}
-    <meta name="robots" content="noindex">
-    <meta name="googlebot" content="noindex">
+    {{ with .Params.block_indexing }}
+    <meta name="robots" content="noindex, nofollow">
     {{ end }}
 
     <meta name="twitter:card" content="summary_large_image" />
     <meta name="twitter:site" content="@yugabyte" />
-    <meta property="og:url" content="{{ .Permalink }}">
-    <meta property="og:title" content="{{ .Title }}{{ if not .IsHome }} | {{ .Site.Title }}{{ end }}">
-    <meta property="og:description" content="The high-performance distributed SQL database for global, internet-scale apps.">
-    {{ with .Site.Params.logo }}<meta property="og:image" content="{{ . | absURL }}">{{ end }}
-    {{ with .Site.Title }}<meta name="apple-mobile-web-app-title" content="{{ . }}">{{ end }}
+    <meta property="og:url" content="{{ .Permalink }}" />
+    <meta property="og:title" content="{{ .Title }}{{ if not .IsHome }} | {{ .Site.Title }}{{ end }}" />
+    <meta property="og:description" content="{{ if .Description }}{{ .Description }}{{ else }}The high-performance distributed SQL database for global, internet-scale apps.{{ end }}" />
+    {{ with .Site.Params.logo }}<meta property="og:image" content="{{ . | absURL }}" />{{ end }}
+    {{ with .Site.Title }}<meta name="apple-mobile-web-app-title" content="{{ . }}" />{{ end }}
+    <meta property="og:type" content="website" />
+    <meta property="og:app_id" content="342998679454500" />
     <meta name="apple-mobile-web-app-capable" content="yes">
     <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
 
@@ -80,10 +81,10 @@
     <link rel="stylesheet" href="/css/temporary.css">
     <link rel="stylesheet" href="{{ with .Site.Params.highlight_css }}{{ . | absURL }}{{ else }}{{ "/css/highlight/highlight.css" }}{{ end }}">
 
-    {{ $text := or .Site.Params.font.text "Inter" }}
+    {{ $text := or .Site.Params.font.text "Source Sans Pro" }}
     {{ $code := or .Site.Params.font.code "Roboto Mono" }}
     <link href="https://fonts.googleapis.com/css?family=Rubik:300,400,500,600,700,800&amp;display=swap" rel="stylesheet">
-    <link href="https://rsms.me/inter/inter.css" rel="stylesheet">
+    <link href="https://fonts.googleapis.com/css2?family=Source+Sans+Pro:wght@300;400;600;700&display=swap" rel="stylesheet">
     <link href="https://fonts.googleapis.com/css?family=Inconsolata" rel="stylesheet">
     <style>
       body, input {

@@ -24,18 +24,22 @@
 #include "postgres.h"
 
 #include "miscadmin.h"
-#include "catalog/pg_attribute.h"
 #include "access/sysattr.h"
-#include "catalog/pg_class.h"
-#include "catalog/pg_namespace.h"
-#include "catalog/pg_type.h"
-#include "commands/dbcommands.h"
-#include "catalog/pg_database.h"
-#include "commands/ybccmds.h"
-#include "catalog/ybctype.h"
-
+#include "access/xact.h"
 #include "catalog/catalog.h"
 #include "catalog/index.h"
+#include "catalog/pg_am.h"
+#include "catalog/pg_attribute.h"
+#include "catalog/pg_class.h"
+#include "catalog/pg_database.h"
+#include "catalog/pg_namespace.h"
+#include "catalog/pg_type.h"
+#include "catalog/pg_type_d.h"
+#include "catalog/ybctype.h"
+#include "commands/dbcommands.h"
+#include "commands/ybccmds.h"
+#include "commands/tablegroup.h"
+
 #include "access/htup_details.h"
 #include "utils/lsyscache.h"
 #include "utils/relcache.h"
@@ -48,12 +52,12 @@
 #include "pg_yb_utils.h"
 
 #include "access/nbtree.h"
-#include "catalog/pg_am.h"
 #include "commands/defrem.h"
 #include "nodes/nodeFuncs.h"
 #include "parser/parser.h"
 #include "parser/parse_coerce.h"
 #include "parser/parse_type.h"
+#include "parser/parse_utilcmd.h"
 
 /* Utility function to calculate column sorting options */
 static void
@@ -91,8 +95,7 @@ YBCCreateDatabase(Oid dboid, const char *dbname, Oid src_dboid, Oid next_oid, bo
 										  next_oid,
 										  colocated,
 										  &handle));
-	HandleYBStmtStatus(YBCPgExecCreateDatabase(handle), handle);
-	HandleYBStatus(YBCPgDeleteStatement(handle));
+	HandleYBStatus(YBCPgExecCreateDatabase(handle));
 }
 
 void
@@ -103,8 +106,8 @@ YBCDropDatabase(Oid dboid, const char *dbname)
 	HandleYBStatus(YBCPgNewDropDatabase(dbname,
 										dboid,
 										&handle));
-	HandleYBStmtStatus(YBCPgExecDropDatabase(handle), handle);
-	HandleYBStatus(YBCPgDeleteStatement(handle));
+	bool not_found = false;
+	HandleYBStatusIgnoreNotFound(YBCPgExecDropDatabase(handle), &not_found);
 }
 
 void
@@ -117,336 +120,296 @@ YBCReserveOids(Oid dboid, Oid next_oid, uint32 count, Oid *begin_oid, Oid *end_o
 									end_oid));
 }
 
-/* ---------------------------------------------------------------------------------------------- */
+bool
+YBCIsDatabaseColocated(Oid dboid)
+{
+	bool colocated;
+	HandleYBStatus(YBCPgIsDatabaseColocated(dboid, &colocated));
+	return colocated;
+}
+
+/* ------------------------------------------------------------------------- */
+/*  Tablegroup Functions. */
+void
+YBCCreateTablegroup(Oid grpoid)
+{
+	YBCPgStatement handle;
+	char *db_name = get_database_name(MyDatabaseId);
+
+	HandleYBStatus(YBCPgNewCreateTablegroup(db_name, MyDatabaseId,
+											grpoid, &handle));
+	HandleYBStatus(YBCPgExecCreateTablegroup(handle));
+}
+
+void
+YBCDropTablegroup(Oid grpoid)
+{
+	YBCPgStatement handle;
+
+	HandleYBStatus(YBCPgNewDropTablegroup(MyDatabaseId, grpoid, &handle));
+	HandleYBStatus(YBCPgExecDropTablegroup(handle));
+}
+
+
+/* ------------------------------------------------------------------------- */
 /*  Table Functions. */
 
 static void CreateTableAddColumn(YBCPgStatement handle,
-								  Form_pg_attribute att,
-								  bool is_hash,
-								  bool is_primary,
-								  bool is_desc,
-								  bool is_nulls_first)
+								 Form_pg_attribute att,
+								 bool is_hash,
+								 bool is_primary,
+								 bool is_desc,
+								 bool is_nulls_first)
 {
-  const AttrNumber attnum = att->attnum;
-  const YBCPgTypeEntity *col_type = YBCDataTypeFromOidMod(attnum, att->atttypid);
-  HandleYBStmtStatus(YBCPgCreateTableAddColumn(handle,
-      NameStr(att->attname),
-      attnum,
-      col_type,
-      is_hash,
-      is_primary,
-      is_desc,
-      is_nulls_first), handle);
+	const AttrNumber attnum = att->attnum;
+	const YBCPgTypeEntity *col_type = YBCDataTypeFromOidMod(attnum,
+															att->atttypid);
+	HandleYBStatus(YBCPgCreateTableAddColumn(handle,
+											 NameStr(att->attname),
+											 attnum,
+											 col_type,
+											 is_hash,
+											 is_primary,
+											 is_desc,
+											 is_nulls_first));
 }
 
 /* Utility function to add columns to the YB create statement
- * Columns need to be sent in order first hash columns, then rest of primary key columns,
- * then regular columns.
+ * Columns need to be sent in order first hash columns, then rest of primary
+ * key columns, then regular columns.
  */
 static void CreateTableAddColumns(YBCPgStatement handle,
 								  TupleDesc desc,
-								  Constraint *primary_key)
+								  Constraint *primary_key,
+								  const bool colocated,
+								  Oid tablegroupId)
 {
-  /* Add all key columns first with respect to compound key order */
-  ListCell *cell;
-  if (primary_key != NULL)
-  {
-    foreach(cell, primary_key->yb_index_params)
-    {
-      IndexElem *index_elem = (IndexElem *)lfirst(cell);
-      bool column_found = false;
-      for (int i = 0; i < desc->natts; ++i)
-      {
-        Form_pg_attribute att = TupleDescAttr(desc, i);
-        if (strcmp(NameStr(att->attname), index_elem->name) == 0)
-        {
-          if (!YBCDataTypeIsValidForKey(att->atttypid))
-          {
-            ereport(ERROR,
-                    (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
-                        errmsg("PRIMARY KEY containing column of type '%s' not yet supported",
-                               YBPgTypeOidToStr(att->atttypid))));
-          }
-          SortByDir order = index_elem->ordering;
-          /* In YB mode first column defaults to HASH if not set */
-          const bool is_first_key = (cell == list_head(primary_key->yb_index_params));
-          bool is_hash = (order == SORTBY_HASH) || (is_first_key && order == SORTBY_DEFAULT);
-          bool is_desc = false;
-          bool is_nulls_first = false;
-          ColumnSortingOptions(order, index_elem->nulls_ordering, &is_desc, &is_nulls_first);
-          CreateTableAddColumn(handle, att, is_hash, true /* is_primary */, is_desc, is_nulls_first);
-          column_found = true;
-          break;
-        }
-      }
-      if (!column_found)
-      {
-        ereport(FATAL,
-                (errcode(ERRCODE_INTERNAL_ERROR),
-                    errmsg("Column '%s' not found in table", index_elem->name)));
-      }
-    }
-  }
+	/* Add all key columns first with respect to compound key order */
+	ListCell *cell;
+	if (primary_key != NULL)
+	{
+		foreach(cell, primary_key->yb_index_params)
+		{
+			IndexElem *index_elem = (IndexElem *)lfirst(cell);
+			bool column_found = false;
+			for (int i = 0; i < desc->natts; ++i)
+			{
+				Form_pg_attribute att = TupleDescAttr(desc, i);
+				if (strcmp(NameStr(att->attname), index_elem->name) == 0)
+				{
+					if (!YBCDataTypeIsValidForKey(att->atttypid))
+						ereport(ERROR,
+								(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+								 errmsg("PRIMARY KEY containing column of type"
+										" '%s' not yet supported",
+										YBPgTypeOidToStr(att->atttypid))));
+					SortByDir order = index_elem->ordering;
+					/* In YB mode, the first column defaults to HASH if it is
+					 * not set and its table is not colocated */
+					const bool is_first_key =
+						cell == list_head(primary_key->yb_index_params);
+					bool is_hash = (order == SORTBY_HASH ||
+									(is_first_key &&
+									 order == SORTBY_DEFAULT &&
+									 !colocated && tablegroupId == InvalidOid));
+					bool is_desc = false;
+					bool is_nulls_first = false;
+					ColumnSortingOptions(order,
+										 index_elem->nulls_ordering,
+										 &is_desc,
+										 &is_nulls_first);
+					CreateTableAddColumn(handle,
+										 att,
+										 is_hash,
+										 true /* is_primary */,
+										 is_desc,
+										 is_nulls_first);
+					column_found = true;
+					break;
+				}
+			}
+			if (!column_found)
+				ereport(FATAL,
+						(errcode(ERRCODE_INTERNAL_ERROR),
+						 errmsg("Column '%s' not found in table",
+								index_elem->name)));
+		}
+	}
 
-  /* Add all non-key columns */
-  for (int i = 0; i < desc->natts; ++i)
-  {
-    Form_pg_attribute att = TupleDescAttr(desc, i);
-    bool is_key = false;
-    if (primary_key)
-    {
-      foreach(cell, primary_key->yb_index_params)
-      {
-        IndexElem *index_elem = (IndexElem *) lfirst(cell);
-        if (strcmp(NameStr(att->attname), index_elem->name) == 0)
-        {
-          is_key = true;
-          break;
-        }
-      }
-    }
-    if (!is_key)
-    {
-      CreateTableAddColumn(handle,
-          att,
-          false /* is_hash */,
-          false /* is_primary */,
-          false /* is_desc */,
-          false /* is_nulls_first */);
-    }
-  }
+	/* Add all non-key columns */
+	for (int i = 0; i < desc->natts; ++i)
+	{
+		Form_pg_attribute att = TupleDescAttr(desc, i);
+		bool is_key = false;
+		if (primary_key)
+			foreach(cell, primary_key->yb_index_params)
+			{
+				IndexElem *index_elem = (IndexElem *) lfirst(cell);
+				if (strcmp(NameStr(att->attname), index_elem->name) == 0)
+				{
+					is_key = true;
+					break;
+				}
+			}
+		if (!is_key)
+			CreateTableAddColumn(handle,
+								 att,
+								 false /* is_hash */,
+								 false /* is_primary */,
+								 false /* is_desc */,
+								 false /* is_nulls_first */);
+	}
+}
+
+static void
+YBTransformPartitionSplitPoints(YBCPgStatement yb_stmt,
+								List *split_points,
+								Form_pg_attribute *attrs,
+								int attr_count)
+{
+	/* Parser state for type conversion and validation */
+	ParseState *pstate = make_parsestate(NULL);
+
+	/* Construct values */
+	PartitionRangeDatum *datums[INDEX_MAX_KEYS];
+	int datum_count = 0;
+	ListCell *lc;
+	foreach(lc, split_points) {
+		YBTransformPartitionSplitValue(pstate, castNode(List, lfirst(lc)), attrs, attr_count,
+										datums, &datum_count);
+
+		/* Convert the values to yugabyte format and bind to statement. */
+		YBCPgExpr exprs[INDEX_MAX_KEYS];
+		int idx;
+		for (idx = 0; idx < datum_count; idx++) {
+			switch (datums[idx]->kind)
+			{
+				case PARTITION_RANGE_DATUM_VALUE:
+				{
+					/* Given value is not null. Convert it to YugaByte format. */
+					Const *value = castNode(Const, datums[idx]->value);
+					exprs[idx] = YBCNewConstant(yb_stmt, value->consttype, value->constvalue,
+												false /* is_null */);
+					break;
+				}
+
+				case PARTITION_RANGE_DATUM_MAXVALUE:
+				{
+					/* Create MINVALUE in YugaByte format */
+					Form_pg_attribute attr = attrs[idx];
+					exprs[idx] = YBCNewConstantVirtual(yb_stmt, attr->atttypid,
+													   YB_YQL_DATUM_LIMIT_MAX);
+					break;
+				}
+
+				case PARTITION_RANGE_DATUM_MINVALUE:
+				{
+					/* Create MINVALUE in YugaByte format */
+					Form_pg_attribute attr = attrs[idx];
+					exprs[idx] = YBCNewConstantVirtual(yb_stmt, attr->atttypid,
+													   YB_YQL_DATUM_LIMIT_MIN);
+					break;
+				}
+			}
+		}
+
+		/* Defaulted to MINVALUE for the rest of the columns that are not assigned a value */
+		for (; idx < attr_count; idx++) {
+			Form_pg_attribute attr = attrs[idx];
+			exprs[idx] = YBCNewConstantVirtual(yb_stmt, attr->atttypid, YB_YQL_DATUM_LIMIT_MIN);
+		}
+
+		/* Add the split boundary to CREATE statement */
+		HandleYBStatus(YBCPgAddSplitBoundary(yb_stmt, exprs, attr_count));
+	}
 }
 
 /* Utility function to handle split points */
 static void CreateTableHandleSplitOptions(YBCPgStatement handle,
 										  TupleDesc desc,
 										  OptSplit *split_options,
-										  Constraint *primary_key)
+										  Constraint *primary_key,
+										  Oid namespaceId,
+										  const bool colocated,
+										  YBCPgOid tablegroup_id)
 {
 	/* Address both types of split options */
 	switch (split_options->split_type)
 	{
-		case NUM_TABLETS: ;
+		case NUM_TABLETS:
+		{
 			/* Make sure we have HASH columns */
-			ListCell *head = list_head(primary_key->yb_index_params);
-			IndexElem *index_elem = (IndexElem*) lfirst(head);
-			if (!index_elem ||
-				!(index_elem->ordering == SORTBY_HASH ||
-				  index_elem->ordering == SORTBY_DEFAULT))
-			{
-				ereport(ERROR, (errmsg("HASH columns must be present to "
-									   "split by number of tablets")));
+			bool hashable = true;
+			if (primary_key) {
+				/* If a primary key exists, we utilize it to check its ordering */
+				ListCell *head = list_head(primary_key->yb_index_params);
+				IndexElem *index_elem = (IndexElem*) lfirst(head);
+
+				if (!index_elem ||
+				   !(index_elem->ordering == SORTBY_HASH ||
+				   index_elem->ordering == SORTBY_DEFAULT))
+					hashable = false;
+			} else {
+				/* In the abscence of a primary key, we use ybrowid as the PK to hash partition */
+				bool is_pg_catalog_table_ =
+					IsSystemNamespace(namespaceId) && IsToastNamespace(namespaceId);
+				/*
+				 * Checking if  table_oid is valid simple means if the table is
+				 * part of a tablegroup.
+				 */
+				hashable = !is_pg_catalog_table_ && !colocated && tablegroup_id == kInvalidOid;
 			}
 
+			if (!hashable)
+				ereport(ERROR, (errmsg("HASH columns must be present to "
+							"split by number of tablets")));
 			/* Tell pggate about it */
-			YBCPgCreateTableSetNumTablets(handle, split_options->num_tablets);
+			HandleYBStatus(YBCPgCreateTableSetNumTablets(handle, split_options->num_tablets));
 			break;
-		case SPLIT_POINTS: ;
-			/* Number of columns used in the primary key */
-			int num_key_cols = list_length(primary_key->keys);
+		}
 
-			/* Get the type information on each column of the primary key,
-			 * and verify none are HASH columns */
-			Oid *col_attrtypes = palloc(sizeof(Oid) * num_key_cols);
-			int32 *col_attrtypmods = palloc(sizeof(int32) * num_key_cols);
-			ScanKeyData *col_comparators = palloc(sizeof(ScanKeyData) * num_key_cols);
+		case SPLIT_POINTS:
+		{
+			if (primary_key == NULL)
+				ereport(ERROR,
+						(errcode(ERRCODE_INVALID_OBJECT_DEFINITION),
+						 errmsg("Cannot split table that does not have primary key")));
 
-			bool *skips = palloc0(sizeof(bool) * desc->natts);
-			int col_num = 0;
-			ListCell *cell;
-			foreach(cell, primary_key->yb_index_params)
+			/* Find the column descriptions for primary key (split columns). */
+			Form_pg_attribute attrs[INDEX_MAX_KEYS];
+			ListCell *lc;
+			int attr_count = 0;
+			foreach(lc, primary_key->yb_index_params)
 			{
-				/* Column constraint for the primary key */
-				IndexElem *index_elem = (IndexElem *) lfirst(cell);
-
-				/* Locate the table column that matches */
+				const char *col_name = castNode(IndexElem, lfirst(lc))->name;
 				for (int i = 0; i < desc->natts; i++)
 				{
-					if (skips[i]) continue;
-
 					Form_pg_attribute att = TupleDescAttr(desc, i);
-					char *attname = NameStr(att->attname);
-
-					/* Found it */
-					if (strcmp(attname, index_elem->name) == 0)
+					if (strcmp(NameStr(att->attname), col_name) == 0)
 					{
-						/* Prohibit the use of HASH columns */
-						if (index_elem->ordering == SORTBY_HASH ||
-							(col_num == 0 && index_elem->ordering == SORTBY_DEFAULT))
-						{
-							ereport(ERROR, (errmsg("HASH columns cannot be used for "
-												   "split points")));
-						}
-
-						/* Record information on the attribute */
-						col_attrtypes[col_num] = att->atttypid;
-						col_attrtypmods[col_num] = att->atttypmod;
-
-						/* Get the comparator */
-						Oid opclass = GetDefaultOpClass(att->atttypid, BTREE_AM_OID);
-						Oid opfamily = get_opclass_family(opclass);
-						Oid type = att->atttypid;
-						RegProcedure cmp_proc = get_opfamily_proc(opfamily,
-																  type,
-																  type,
-																  BTORDER_PROC);
-						ScanKeyInit(&col_comparators[col_num], 0, BTEqualStrategyNumber,
-									cmp_proc, 0);
-
-						/* Know to skip this in any future searches */
-						skips[i] = true;
+						attrs[attr_count++] = att;
 						break;
 					}
 				}
-
-				/* Next primary key column */
-				col_num++;
 			}
 
-			/* Array of per-column splits from the previous split point */
-			PartitionRangeDatum **prev_splits = palloc0(sizeof(PartitionRangeDatum*)
-														* num_key_cols);
-
-			/* Parser state for type conversion and validation */
-			ParseState *pstate = make_parsestate(NULL);
-
-			/* Ensure that each split point matches the primary key columns
-			 * in number and type, and are in order */
-			ListCell *cell1;
-			foreach(cell1, split_options->split_points)
-			{
-				List *split_point = (List *) lfirst(cell1);
-				if (list_length(split_point) != num_key_cols)
-				{
-					ereport(ERROR, (errmsg("Split points must specify a split at "
-										   "each primary key column")));
-				}
-
-				/* So far, is the current split point less (-1), equal (0), or greater (1)
-				 * than the previous split point */
-				int curall_vs_prev = -1;
-
-				/* Within a split point, go through the splits for each column */
-				int split_num = 0;
-				ListCell *cell2;
-				foreach(cell2, split_point)
-				{
-					/* Get the column's split */
-					PartitionRangeDatum *split = (PartitionRangeDatum*) lfirst(cell2);
-
-					/* If it contains a value, convert that value */
-					if (split->kind == PARTITION_RANGE_DATUM_VALUE)
-					{
-						A_Const *aconst = (A_Const*) split->value;
-						Node *value = (Node *) make_const(pstate, &aconst->val, aconst->location);
-						value = coerce_to_target_type(pstate,
-													  value, exprType(value),
-													  col_attrtypes[split_num],
-													  col_attrtypmods[split_num],
-													  COERCION_ASSIGNMENT,
-													  COERCE_IMPLICIT_CAST,
-													  -1);
-						if (value == NULL || ((Const*)value)->consttype == 0)
-						{
-							ereport(ERROR, (errmsg("Type mismatch in split point")));
-						}
-
-						split->value = value;
-					}
-					/* TODO (george): maybe we'll allow MINVALUE/MAXVALUE in the future,
-					 * but for now it is illegal */
-					else
-					{
-						ereport(ERROR, (errmsg("Split points must specify finite values")));
-					}
-
-					/* Compare current value to previous value
-					 * If current split < previous corresponding split, could be a problem */
-					PartitionRangeDatum *prev_split = prev_splits[split_num];
-					int curcol_vs_prev = 1;
-					if (prev_split)
-					{
-						/* Comparing to MINIMUM */
-						if (prev_split->kind == PARTITION_RANGE_DATUM_MINVALUE)
-						{
-							curcol_vs_prev = (split->kind == PARTITION_RANGE_DATUM_MINVALUE) ?
-											 0 : 1;
-						}
-							/* Comparing to a specified value */
-						else if (prev_split->kind == PARTITION_RANGE_DATUM_VALUE)
-						{
-							if (split->kind == PARTITION_RANGE_DATUM_MINVALUE)
-							{
-								curcol_vs_prev = -1;
-							}
-							else if (split->kind == PARTITION_RANGE_DATUM_VALUE)
-							{
-								/* First check <, then ==, and if neither it is > */
-								ScanKey comparator = &col_comparators[split_num];
-								Datum cmp_op = ((Const*)(split->value))->constvalue;
-								Datum cmp_ref = ((Const*)(prev_split->value))->constvalue;
-								curcol_vs_prev = FunctionCall2Coll(&comparator->sk_func,
-																   comparator->sk_collation,
-																   cmp_op,
-																   cmp_ref);
-							}
-							else if (split->kind == PARTITION_RANGE_DATUM_MAXVALUE)
-							{
-								curcol_vs_prev = 1;
-							}
-						}
-							/* Comparing to MAXIMUM */
-						else if (prev_split->kind == PARTITION_RANGE_DATUM_MAXVALUE)
-						{
-							curcol_vs_prev = (split->kind == PARTITION_RANGE_DATUM_MAXVALUE) ?
-											 0 : -1;
-						}
-					}
-
-					/* Make sure we maintain sorted order */
-					if (curcol_vs_prev >= 0)
-					{
-						/* Haven't compared any columns yet */
-						if (curall_vs_prev == -1)
-						{
-							curall_vs_prev = curcol_vs_prev;
-						}
-
-						/* Equal so far, now greater */
-						if (curall_vs_prev == 0 && curcol_vs_prev == 1)
-						{
-							curall_vs_prev = 1;
-						}
-					}
-					else if (curcol_vs_prev == -1)
-					{
-						/* If greater so far, in earlier columns which take precedence, fine.
-						 * Otherwise we are out of order. */
-						if (curall_vs_prev != 1)
-						{
-							ereport(ERROR, (errmsg("Split points must be in sorted order")));
-						}
-					}
-
-					/* Finished handling this particular column split */
-					prev_splits[split_num++] = split;
-				}
-
-				/* TODO (george): Add split point with pggate */
-			}
-
-			ereport(WARNING, (errmsg("Range split points are not supported, ignoring")));
+			/* Analyze split_points and add them to CREATE statement */
+			YBTransformPartitionSplitPoints(handle, split_options->split_points, attrs, attr_count);
 			break;
+		}
+
 		default:
-			ereport(ERROR, (errmsg("Illegal memory state for SPLIT options")));
-			break;
+			ereport(ERROR,
+					(errcode(ERRCODE_INVALID_OBJECT_DEFINITION),
+					 errmsg("Invalid split options")));
 	}
 }
 
 void
-YBCCreateTable(CreateStmt *stmt, char relkind, TupleDesc desc, Oid relationId, Oid namespaceId)
+YBCCreateTable(CreateStmt *stmt, char relkind, TupleDesc desc,
+							 Oid relationId, Oid namespaceId, Oid tablegroupId, Oid tablespaceId)
 {
-	if (relkind != RELKIND_RELATION)
+	if (relkind != RELKIND_RELATION && relkind != RELKIND_PARTITIONED_TABLE)
 	{
 		return;
 	}
@@ -483,18 +446,34 @@ YBCCreateTable(CreateStmt *stmt, char relkind, TupleDesc desc, Oid relationId, O
 		}
 	}
 
-	ListCell	*opt_cell;
-	// Set the default option to true so that tables created in a colocated database will be
-	// colocated by default. For regular database, this argument will be ignored.
-	bool		colocated = true;
-	/* Scan list to see if colocated was included */
+	/* By default, inherit the colocated option from the database */
+	bool colocated = MyDatabaseColocated;
+
+	/* Handle user-supplied colocated reloption */
+	ListCell *opt_cell;
 	foreach(opt_cell, stmt->options)
 	{
 		DefElem *def = (DefElem *) lfirst(opt_cell);
 
 		if (strcmp(def->defname, "colocated") == 0)
 		{
-			colocated = defGetBoolean(def);
+			if (stmt->tablegroup)
+				ereport(ERROR,
+						(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+						 errmsg("cannot use \'colocated=true/false\' with tablegroup")));
+
+			bool colocated_relopt = defGetBoolean(def);
+			if (MyDatabaseColocated)
+				colocated = colocated_relopt;
+			else if (colocated_relopt)
+				ereport(ERROR,
+						(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+						 errmsg("cannot set colocated true on a non-colocated"
+								" database")));
+			/* The following break is fine because there should only be one
+			 * colocated reloption at this point due to checks in
+			 * parseRelOptions */
+			break;
 		}
 	}
 
@@ -507,69 +486,116 @@ YBCCreateTable(CreateStmt *stmt, char relkind, TupleDesc desc, Oid relationId, O
 									   false, /* if_not_exists */
 									   primary_key == NULL /* add_primary_key */,
 									   colocated,
+									   tablegroupId,
+									   tablespaceId,
 									   &handle));
 
-	CreateTableAddColumns(handle, desc, primary_key);
+	CreateTableAddColumns(handle, desc, primary_key, colocated, tablegroupId);
 
 	/* Handle SPLIT statement, if present */
 	OptSplit *split_options = stmt->split_options;
 	if (split_options)
-	{
-		/* Illegal without primary key */
-		if (primary_key == NULL)
-		{
-			ereport(ERROR, (errmsg("Cannot have SPLIT options in the absence of a primary key")));
-		}
-
-		CreateTableHandleSplitOptions(handle, desc, split_options, primary_key);
-	}
+		CreateTableHandleSplitOptions(
+			handle, desc, split_options, primary_key, namespaceId, colocated, tablegroupId);
 
 	/* Create the table. */
-	HandleYBStmtStatus(YBCPgExecCreateTable(handle), handle);
-
-	HandleYBStatus(YBCPgDeleteStatement(handle));
+	HandleYBStatus(YBCPgExecCreateTable(handle));
 }
 
 void
 YBCDropTable(Oid relationId)
 {
-	YBCPgStatement handle;
+	YBCPgStatement	handle = NULL;
+	bool			colocated = false;
 
-	/* Create table-level tombstone */
-	/* TODO(jason): do this only for colocated tables (issue #3387) */
-	HandleYBStatus(YBCPgNewTruncateColocated(MyDatabaseId, relationId, false, &handle));
-	HandleYBStmtStatus(YBCPgDmlBindTable(handle), handle);
-	int rows_affected_count = 0;
-	HandleYBStmtStatus(YBCPgDmlExecWriteOp(handle, &rows_affected_count),
-					   handle);
-	HandleYBStatus(YBCPgDeleteStatement(handle));
+	/* Determine if table is colocated */
+	if (MyDatabaseColocated)
+	{
+		bool not_found = false;
+		HandleYBStatusIgnoreNotFound(YBCPgIsTableColocated(MyDatabaseId,
+														   relationId,
+														   &colocated),
+									 &not_found);
+	}
+
+	/* Create table-level tombstone for colocated tables / tables in a tablegroup */
+	Oid tablegroupId = InvalidOid;
+	if (TablegroupCatalogExists)
+		tablegroupId = get_tablegroup_oid_by_table_oid(relationId);
+	if (colocated || tablegroupId != InvalidOid)
+	{
+		bool not_found = false;
+		HandleYBStatusIgnoreNotFound(YBCPgNewTruncateColocated(MyDatabaseId,
+															   relationId,
+															   false,
+															   &handle),
+									 &not_found);
+		/* Since the creation of the handle could return a 'NotFound' error,
+		 * execute the statement only if the handle is valid.
+		 */
+		const bool valid_handle = !not_found;
+		if (valid_handle)
+		{
+			HandleYBStatusIgnoreNotFound(YBCPgDmlBindTable(handle), &not_found);
+			int rows_affected_count = 0;
+			HandleYBStatusIgnoreNotFound(YBCPgDmlExecWriteOp(handle, &rows_affected_count),
+										 &not_found);
+		}
+	}
+
 	/* Drop the table */
-	HandleYBStatus(YBCPgNewDropTable(MyDatabaseId,
-									 relationId,
-									 false,    /* if_exists */
-									 &handle));
-	HandleYBStmtStatus(YBCPgExecDropTable(handle), handle);
-	HandleYBStatus(YBCPgDeleteStatement(handle));
+	{
+		bool not_found = false;
+		HandleYBStatusIgnoreNotFound(YBCPgNewDropTable(MyDatabaseId,
+													   relationId,
+													   false, /* if_exists */
+													   &handle),
+									 &not_found);
+		const bool valid_handle = !not_found;
+		if (valid_handle)
+		{
+			/*
+			 * We cannot abort drop in DocDB so postpone the execution until
+			 * the rest of the statement/txn is finished executing.
+			 */
+			YBSaveDdlHandle(handle);
+		}
+	}
 }
 
 void
 YBCTruncateTable(Relation rel) {
-	YBCPgStatement handle;
-	Oid relationId = RelationGetRelid(rel);
+	YBCPgStatement	handle;
+	Oid				relationId = RelationGetRelid(rel);
+	bool			colocated = false;
 
-	/* Truncate the base table */
-	/* TODO(jason): do this only for non-colocated tables (issue #3387) */
-	HandleYBStatus(YBCPgNewTruncateTable(MyDatabaseId, relationId, &handle));
-	HandleYBStmtStatus(YBCPgExecTruncateTable(handle), handle);
-	HandleYBStatus(YBCPgDeleteStatement(handle));
-	/* Create table-level tombstone */
-	/* TODO(jason): do this only for colocated tables (issue #3387) */
-	HandleYBStatus(YBCPgNewTruncateColocated(MyDatabaseId, relationId, false, &handle));
-	HandleYBStmtStatus(YBCPgDmlBindTable(handle), handle);
-	int rows_affected_count = 0;
-	HandleYBStmtStatus(YBCPgDmlExecWriteOp(handle, &rows_affected_count),
-					   handle);
-	HandleYBStatus(YBCPgDeleteStatement(handle));
+	/* Determine if table is colocated */
+	if (MyDatabaseColocated)
+		HandleYBStatus(YBCPgIsTableColocated(MyDatabaseId,
+											 relationId,
+											 &colocated));
+	Oid tablegroupId = InvalidOid;
+	if (TablegroupCatalogExists)
+		tablegroupId = get_tablegroup_oid_by_table_oid(relationId);
+	if (colocated || tablegroupId != InvalidOid)
+	{
+		/* Create table-level tombstone for colocated tables / tables in tablegroups */
+		HandleYBStatus(YBCPgNewTruncateColocated(MyDatabaseId,
+												 relationId,
+												 false,
+												 &handle));
+		HandleYBStatus(YBCPgDmlBindTable(handle));
+		int rows_affected_count = 0;
+		HandleYBStatus(YBCPgDmlExecWriteOp(handle, &rows_affected_count));
+	}
+	else
+	{
+		/* Send truncate table RPC to master for non-colocated tables */
+		HandleYBStatus(YBCPgNewTruncateTable(MyDatabaseId,
+											 relationId,
+											 &handle));
+		HandleYBStatus(YBCPgExecTruncateTable(handle));
+	}
 
 	if (!rel->rd_rel->relhasindex)
 		return;
@@ -585,21 +611,78 @@ YBCTruncateTable(Relation rel) {
 		if (indexId == rel->rd_pkindex)
 			continue;
 
-		/* Truncate the index table */
-		HandleYBStatus(YBCPgNewTruncateTable(MyDatabaseId, indexId, &handle));
-		HandleYBStmtStatus(YBCPgExecTruncateTable(handle), handle);
-		HandleYBStatus(YBCPgDeleteStatement(handle));
-		/* Create table-level tombstone */
-		/* TODO(jason): do this only for colocated tables (issue #3387) */
-		HandleYBStatus(YBCPgNewTruncateColocated(MyDatabaseId, relationId, false, &handle));
-		HandleYBStmtStatus(YBCPgDmlBindTable(handle), handle);
-		int rows_affected_count = 0;
-		HandleYBStmtStatus(YBCPgDmlExecWriteOp(handle, &rows_affected_count),
-						   handle);
-		HandleYBStatus(YBCPgDeleteStatement(handle));
+		/* Determine if table is colocated */
+		if (MyDatabaseColocated)
+			HandleYBStatus(YBCPgIsTableColocated(MyDatabaseId,
+												 relationId,
+												 &colocated));
+
+		tablegroupId = InvalidOid;
+		if (TablegroupCatalogExists)
+			tablegroupId = get_tablegroup_oid_by_table_oid(indexId);
+		if (colocated || tablegroupId != InvalidOid)
+		{
+			/* Create table-level tombstone for colocated tables / tables in tablegroups */
+			HandleYBStatus(YBCPgNewTruncateColocated(MyDatabaseId,
+													 relationId,
+													 false,
+													 &handle));
+			HandleYBStatus(YBCPgDmlBindTable(handle));
+			int rows_affected_count = 0;
+			HandleYBStatus(YBCPgDmlExecWriteOp(handle, &rows_affected_count));
+		}
+		else
+		{
+			/* Send truncate table RPC to master for non-colocated tables */
+			HandleYBStatus(YBCPgNewTruncateTable(MyDatabaseId,
+												 indexId,
+												 &handle));
+			HandleYBStatus(YBCPgExecTruncateTable(handle));
+		}
 	}
 
 	list_free(indexlist);
+}
+
+/* Utility function to handle split points */
+static void
+CreateIndexHandleSplitOptions(YBCPgStatement handle,
+                              TupleDesc desc,
+                              OptSplit *split_options,
+                              int16 * coloptions)
+{
+	/* Address both types of split options */
+	switch (split_options->split_type)
+	{
+		case NUM_TABLETS:
+			/* Make sure we have HASH columns */
+			if (!(coloptions[0] & INDOPTION_HASH))
+				ereport(ERROR,
+						(errcode(ERRCODE_INVALID_OBJECT_DEFINITION),
+						 errmsg("HASH columns must be present to split by number of tablets")));
+
+			HandleYBStatus(YBCPgCreateIndexSetNumTablets(handle, split_options->num_tablets));
+			break;
+
+		case SPLIT_POINTS:
+		{
+			/* Construct array to SPLIT column datatypes */
+			Form_pg_attribute attrs[INDEX_MAX_KEYS];
+			int attr_count;
+			for (attr_count = 0; attr_count < desc->natts; ++attr_count)
+			{
+				attrs[attr_count] = TupleDescAttr(desc, attr_count);
+			}
+
+			/* Analyze split_points and add them to CREATE statement */
+			YBTransformPartitionSplitPoints(handle, split_options->split_points, attrs, attr_count);
+			break;
+		}
+
+		default:
+			ereport(ERROR, (errmsg("Illegal memory state for SPLIT options")));
+			break;
+	}
 }
 
 void
@@ -607,9 +690,13 @@ YBCCreateIndex(const char *indexName,
 			   IndexInfo *indexInfo,
 			   TupleDesc indexTupleDesc,
 			   int16 *coloptions,
+			   Datum reloptions,
 			   Oid indexId,
 			   Relation rel,
-			   List *index_options)
+			   OptSplit *split_options,
+			   const bool skip_index_backfill,
+			   Oid tablegroupId,
+			   Oid tablespaceId)
 {
 	char *db_name	  = get_database_name(MyDatabaseId);
 	char *schema_name = get_namespace_name(RelationGetNamespace(rel));
@@ -619,21 +706,6 @@ YBCCreateIndex(const char *indexName,
 					 db_name,
 					 schema_name,
 					 indexName);
-
-	/* Check reloptions. */
-	ListCell	*opt_cell;
-	foreach(opt_cell, index_options)
-	{
-		DefElem *def = (DefElem *) lfirst(opt_cell);
-
-		if (strcmp(def->defname, "colocated") == 0)
-		{
-			ereport(ERROR,
-					(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
-					 errmsg("cannot set option \"%s\" on index",
-							def->defname)));
-		}
-	}
 
 	YBCPgStatement handle = NULL;
 
@@ -645,7 +717,10 @@ YBCCreateIndex(const char *indexName,
 									   RelationGetRelid(rel),
 									   rel->rd_rel->relisshared,
 									   indexInfo->ii_Unique,
+									   skip_index_backfill,
 									   false, /* if_not_exists */
+									   tablegroupId,
+									   tablespaceId,
 									   &handle));
 
 	for (int i = 0; i < indexTupleDesc->natts; i++)
@@ -670,25 +745,237 @@ YBCCreateIndex(const char *indexName,
 		const bool  is_desc        = options & INDOPTION_DESC;
 		const bool  is_nulls_first = options & INDOPTION_NULLS_FIRST;
 
-		HandleYBStmtStatus(YBCPgCreateIndexAddColumn(handle,
-													 attname,
-													 attnum,
-													 col_type,
-													 is_hash,
-													 is_key,
-													 is_desc,
-													 is_nulls_first), handle);
+		HandleYBStatus(YBCPgCreateIndexAddColumn(handle,
+												 attname,
+												 attnum,
+												 col_type,
+												 is_hash,
+												 is_key,
+												 is_desc,
+												 is_nulls_first));
 	}
 
-	/* Create the index. */
-	HandleYBStmtStatus(YBCPgExecCreateIndex(handle), handle);
+	/* Handle SPLIT statement, if present */
+	if (split_options)
+		CreateIndexHandleSplitOptions(handle, indexTupleDesc, split_options, coloptions);
 
-	HandleYBStatus(YBCPgDeleteStatement(handle));
+	/* Create the index. */
+	HandleYBStatus(YBCPgExecCreateIndex(handle));
+}
+
+static void
+YBCPrepareAlterTableCmd(AlterTableCmd* cmd, Relation rel, YBCPgStatement handle,
+                        int* col, bool* needsYBAlter,
+                        YBCPgStatement* rollbackHandle)
+{
+	Oid relationId = RelationGetRelid(rel);
+	switch (cmd->subtype)
+	{
+		case AT_AddColumn:
+		case AT_AddColumnToView:
+		case AT_AddColumnRecurse:
+		{
+			ColumnDef* colDef = (ColumnDef *) cmd->def;
+			Oid			typeOid;
+			int32		typmod;
+			HeapTuple	typeTuple;
+			int order;
+
+			/* Skip yb alter for IF NOT EXISTS with existing column */
+			if (cmd->missing_ok)
+			{
+				HeapTuple tuple = SearchSysCacheAttName(relationId, colDef->colname);
+				if (HeapTupleIsValid(tuple)) {
+					ReleaseSysCache(tuple);
+					break;
+				}
+			}
+
+			typeTuple = typenameType(NULL, colDef->typeName, &typmod);
+			typeOid = HeapTupleGetOid(typeTuple);
+			order = RelationGetNumberOfAttributes(rel) + *col;
+			const YBCPgTypeEntity *col_type = YBCDataTypeFromOidMod(order, typeOid);
+
+			HandleYBStatus(YBCPgAlterTableAddColumn(handle, colDef->colname,
+													order, col_type));
+			++(*col);
+			ReleaseSysCache(typeTuple);
+			*needsYBAlter = true;
+
+			/*
+			 * Prepare the handle that will be used to rollback
+			 * this change at the DocDB side. This is an add column
+			 * statement, thus the equivalent rollback operation
+			 * will be to drop the column.
+			 */
+			if (*rollbackHandle == NULL)
+			{
+				HandleYBStatus(YBCPgNewAlterTable(MyDatabaseId,
+												  relationId,
+												  rollbackHandle));
+			}
+			HandleYBStatus(YBCPgAlterTableDropColumn(*rollbackHandle,
+													 colDef->colname));
+			break;
+		}
+
+		case AT_DropColumn:
+		case AT_DropColumnRecurse:
+		{
+			/* Skip yb alter for IF EXISTS with non-existent column */
+			if (cmd->missing_ok)
+			{
+				HeapTuple tuple = SearchSysCacheAttName(relationId, cmd->name);
+				if (!HeapTupleIsValid(tuple))
+					break;
+				ReleaseSysCache(tuple);
+			}
+
+			HandleYBStatus(YBCPgAlterTableDropColumn(handle, cmd->name));
+			*needsYBAlter = true;
+
+			break;
+		}
+
+		case AT_AddIndex:
+		case AT_AddIndexConstraint:
+		{
+			IndexStmt *index = (IndexStmt *) cmd->def;
+			/* Only allow adding indexes when it is a unique or primary key constraint */
+			if (!(index->unique || index->primary) || !index->isconstraint)
+			{
+				ereport(ERROR, (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+						errmsg("This ALTER TABLE command is not yet supported.")));
+			}
+
+			break;
+		}
+
+		case AT_AlterColumnType:
+		{
+			/*
+			 * Only supports variants that don't require on-disk changes.
+			 * For now, that is just varchar and varbit.
+			 */
+			ColumnDef*			colDef = (ColumnDef *) cmd->def;
+			HeapTuple			typeTuple;
+			Form_pg_attribute	attTup;
+			Oid					curTypId;
+			Oid					newTypId;
+			int32				curTypMod;
+			int32				newTypMod;
+
+			/* Get current typid and typmod of the column. */
+			typeTuple = SearchSysCacheAttName(relationId, cmd->name);
+			if (!HeapTupleIsValid(typeTuple))
+			{
+				ereport(ERROR, (errcode(ERRCODE_UNDEFINED_COLUMN),
+						errmsg("column \"%s\" of relation \"%s\" does not exist",
+								cmd->name, RelationGetRelationName(rel))));
+			}
+			attTup = (Form_pg_attribute) GETSTRUCT(typeTuple);
+			curTypId = attTup->atttypid;
+			curTypMod = attTup->atttypmod;
+			ReleaseSysCache(typeTuple);
+
+			/* Get the new typid and typmod of the column. */
+			typenameTypeIdAndMod(NULL, colDef->typeName, &newTypId, &newTypMod);
+
+			/* Only varbit and varchar don't cause on-disk changes. */
+			switch (newTypId)
+			{
+				case VARCHAROID:
+				case VARBITOID:
+				{
+					/*
+					* Check for type equality, and that the new size is greater than or equal
+					* to the old size, unless the current size is infinite (-1).
+					*/
+					if (newTypId != curTypId ||
+						(newTypMod < curTypMod && newTypMod != -1) ||
+						(newTypMod > curTypMod && curTypMod == -1))
+					{
+						ereport(ERROR, (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+								errmsg("This ALTER TABLE command is not yet supported.")));
+					}
+					break;
+				}
+
+				default:
+				{
+					if (newTypId == curTypId && newTypMod == curTypMod)
+					{
+						/* Types are the same, no changes will occur. */
+						break;
+					}
+					/* timestamp <-> timestamptz type change is allowed
+						if no rewrite is needed */
+					if (curTypId == TIMESTAMPOID && newTypId == TIMESTAMPTZOID &&
+						!TimestampTimestampTzRequiresRewrite()) {
+						break;
+					}
+					if (curTypId == TIMESTAMPTZOID && newTypId == TIMESTAMPOID &&
+						!TimestampTimestampTzRequiresRewrite()) {
+						break;
+					}
+					ereport(ERROR, (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+							errmsg("This ALTER TABLE command is not yet supported.")));
+				}
+			}
+			break;
+		}
+
+		case AT_AddConstraint:
+		case AT_AddConstraintRecurse:
+		case AT_DropConstraint:
+		case AT_DropConstraintRecurse:
+		case AT_DropOids:
+		case AT_EnableTrig:
+		case AT_EnableAlwaysTrig:
+		case AT_EnableReplicaTrig:
+		case AT_EnableTrigAll:
+		case AT_EnableTrigUser:
+		case AT_DisableTrig:
+		case AT_DisableTrigAll:
+		case AT_DisableTrigUser:
+		case AT_ChangeOwner:
+		case AT_ColumnDefault:
+		case AT_DropNotNull:
+		case AT_SetNotNull:
+		case AT_AddIdentity:
+		case AT_SetIdentity:
+		case AT_DropIdentity:
+		case AT_EnableRowSecurity:
+		case AT_DisableRowSecurity:
+		case AT_ForceRowSecurity:
+		case AT_NoForceRowSecurity:
+		case AT_AttachPartition:
+		case AT_DetachPartition:
+			/* For these cases a YugaByte alter isn't required, so we do nothing. */
+			break;
+
+		default:
+			ereport(ERROR, (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+					errmsg("This ALTER TABLE command is not yet supported.")));
+			break;
+	}
 }
 
 YBCPgStatement
-YBCPrepareAlterTable(AlterTableStmt *stmt, Relation rel, Oid relationId)
+YBCPrepareAlterTable(List** subcmds,
+					 int subcmds_size,
+					 Oid relationId,
+					 YBCPgStatement *rollbackHandle)
 {
+	/* Appropriate lock was already taken */
+	Relation rel = relation_open(relationId, NoLock);
+
+	if (!IsYBRelation(rel))
+	{
+		relation_close(rel, NoLock);
+		return NULL;
+	}
+
 	YBCPgStatement handle = NULL;
 	HandleYBStatus(YBCPgNewAlterTable(MyDatabaseId,
 									  relationId,
@@ -698,108 +985,18 @@ YBCPrepareAlterTable(AlterTableStmt *stmt, Relation rel, Oid relationId)
 	int col = 1;
 	bool needsYBAlter = false;
 
-	foreach(lcmd, stmt->cmds)
+	for (int cmd_idx = 0; cmd_idx < subcmds_size; ++cmd_idx)
 	{
-		AlterTableCmd *cmd = (AlterTableCmd *) lfirst(lcmd);
-		switch (cmd->subtype)
+		foreach(lcmd, subcmds[cmd_idx])
 		{
-			case AT_AddColumn:
-			{
-				ColumnDef* colDef = (ColumnDef *) cmd->def;
-				Oid			typeOid;
-				int32		typmod;
-				HeapTuple	typeTuple;
-				int order;
-
-				/* Skip yb alter for IF NOT EXISTS with existing column */
-				if (cmd->missing_ok)
-				{
-					HeapTuple tuple = SearchSysCacheAttName(RelationGetRelid(rel), colDef->colname);
-					if (HeapTupleIsValid(tuple)) {
-						ReleaseSysCache(tuple);
-						break;
-					}
-				}
-
-				typeTuple = typenameType(NULL, colDef->typeName, &typmod);
-				typeOid = HeapTupleGetOid(typeTuple);
-				order = RelationGetNumberOfAttributes(rel) + col;
-				const YBCPgTypeEntity *col_type = YBCDataTypeFromOidMod(order, typeOid);
-
-				HandleYBStmtStatus(YBCPgAlterTableAddColumn(handle, colDef->colname,
-															order, col_type,
-															colDef->is_not_null), handle);
-
-				++col;
-				ReleaseSysCache(typeTuple);
-				needsYBAlter = true;
-
-				break;
-			}
-			case AT_DropColumn:
-			{
-				/* Skip yb alter for IF EXISTS with non-existent column */
-				if (cmd->missing_ok)
-				{
-					HeapTuple tuple = SearchSysCacheAttName(RelationGetRelid(rel), cmd->name);
-					if (!HeapTupleIsValid(tuple))
-						break;
-					ReleaseSysCache(tuple);
-				}
-
-				HandleYBStmtStatus(YBCPgAlterTableDropColumn(handle, cmd->name), handle);
-				needsYBAlter = true;
-
-				break;
-			}
-
-			case AT_AddIndex:
-			case AT_AddIndexConstraint: {
-				IndexStmt *index = (IndexStmt *) cmd->def;
-				// Only allow adding indexes when it is a unique non-primary-key constraint
-				if (!index->unique || index->primary || !index->isconstraint) {
-					ereport(ERROR, (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
-							errmsg("This ALTER TABLE command is not yet supported.")));
-				}
-
-				break;
-			}
-
-			case AT_AddConstraint:
-			case AT_DropConstraint:
-			case AT_DropOids:
-			case AT_EnableTrig:
-			case AT_EnableAlwaysTrig:
-			case AT_EnableReplicaTrig:
-			case AT_EnableTrigAll:
-			case AT_EnableTrigUser:
-			case AT_DisableTrig:
-			case AT_DisableTrigAll:
-			case AT_DisableTrigUser:
-			case AT_ChangeOwner:
-			case AT_ColumnDefault:
-			case AT_DropNotNull:
-			case AT_SetNotNull:
-			case AT_AddIdentity:
-			case AT_SetIdentity:
-			case AT_DropIdentity:
-			case AT_EnableRowSecurity:
-			case AT_DisableRowSecurity:
-			case AT_ForceRowSecurity:
-			case AT_NoForceRowSecurity:
-				/* For these cases a YugaByte alter isn't required, so we do nothing. */
-				break;
-
-			default:
-				ereport(ERROR, (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
-						errmsg("This ALTER TABLE command is not yet supported.")));
-				break;
+			YBCPrepareAlterTableCmd((AlterTableCmd *) lfirst(lcmd), rel, handle,
+			                        &col, &needsYBAlter, rollbackHandle);
 		}
 	}
+	relation_close(rel, NoLock);
 
 	if (!needsYBAlter)
 	{
-		HandleYBStatus(YBCPgDeleteStatement(handle));
 		return NULL;
 	}
 
@@ -812,9 +1009,8 @@ YBCExecAlterTable(YBCPgStatement handle, Oid relationId)
 	if (handle)
 	{
 		if (IsYBRelationById(relationId)) {
-			HandleYBStmtStatus(YBCPgExecAlterTable(handle), handle);
+			HandleYBStatus(YBCPgExecAlterTable(handle));
 		}
-		HandleYBStatus(YBCPgDeleteStatement(handle));
 	}
 }
 
@@ -830,7 +1026,7 @@ YBCRename(RenameStmt *stmt, Oid relationId)
 			HandleYBStatus(YBCPgNewAlterTable(MyDatabaseId,
 											  relationId,
 											  &handle));
-			HandleYBStmtStatus(YBCPgAlterTableRenameTable(handle, db_name, stmt->newname), handle);
+			HandleYBStatus(YBCPgAlterTableRenameTable(handle, db_name, stmt->newname));
 			break;
 
 		case OBJECT_COLUMN:
@@ -840,8 +1036,7 @@ YBCRename(RenameStmt *stmt, Oid relationId)
 											  relationId,
 											  &handle));
 
-			HandleYBStmtStatus(YBCPgAlterTableRenameColumn(handle,
-							   stmt->subname, stmt->newname), handle);
+			HandleYBStatus(YBCPgAlterTableRenameColumn(handle, stmt->subname, stmt->newname));
 			break;
 
 		default:
@@ -856,21 +1051,63 @@ YBCRename(RenameStmt *stmt, Oid relationId)
 void
 YBCDropIndex(Oid relationId)
 {
-	YBCPgStatement handle;
+	YBCPgStatement	handle;
+	bool			colocated = false;
 
-	/* Create table-level tombstone */
-	/* TODO(jason): do this only for colocated tables (issue #3387) */
-	HandleYBStatus(YBCPgNewTruncateColocated(MyDatabaseId, relationId, false, &handle));
-	HandleYBStmtStatus(YBCPgDmlBindTable(handle), handle);
-	int rows_affected_count = 0;
-	HandleYBStmtStatus(YBCPgDmlExecWriteOp(handle, &rows_affected_count),
-					   handle);
-	HandleYBStatus(YBCPgDeleteStatement(handle));
+	/* Determine if table is colocated */
+	if (MyDatabaseColocated)
+	{
+		bool not_found = false;
+		HandleYBStatusIgnoreNotFound(YBCPgIsTableColocated(MyDatabaseId,
+														   relationId,
+														   &colocated),
+									 &not_found);
+	}
+
+	/* Create table-level tombstone for colocated tables / tables in a tablegroup */
+	Oid tablegroupId = InvalidOid;
+	if (TablegroupCatalogExists)
+		tablegroupId = get_tablegroup_oid_by_table_oid(relationId);
+	if (colocated || tablegroupId != InvalidOid)
+	{
+		bool not_found = false;
+		HandleYBStatusIgnoreNotFound(YBCPgNewTruncateColocated(MyDatabaseId,
+															   relationId,
+															   false,
+															   &handle),
+									 &not_found);
+		const bool valid_handle = !not_found;
+		if (valid_handle) {
+			HandleYBStatusIgnoreNotFound(YBCPgDmlBindTable(handle), &not_found);
+			int rows_affected_count = 0;
+			HandleYBStatusIgnoreNotFound(YBCPgDmlExecWriteOp(handle, &rows_affected_count),
+										 &not_found);
+		}
+	}
+
 	/* Drop the index table */
-	HandleYBStatus(YBCPgNewDropIndex(MyDatabaseId,
-									 relationId,
-									 false,	   /* if_exists */
-									 &handle));
-	HandleYBStmtStatus(YBCPgExecDropIndex(handle), handle);
-	HandleYBStatus(YBCPgDeleteStatement(handle));
+	{
+		bool not_found = false;
+		HandleYBStatusIgnoreNotFound(YBCPgNewDropIndex(MyDatabaseId,
+													   relationId,
+													   false, /* if_exists */
+													   &handle),
+									 &not_found);
+		const bool valid_handle = !not_found;
+		if (valid_handle) {
+			/*
+			 * We cannot abort drop in DocDB so postpone the execution until
+			 * the rest of the statement/txn is finished executing.
+			 */
+			YBSaveDdlHandle(handle);
+		}
+	}
+}
+
+bool
+YBCIsTableColocated(Oid dboid, Oid relationId)
+{
+	bool colocated;
+	HandleYBStatus(YBCPgIsTableColocated(dboid, relationId, &colocated));
+	return colocated;
 }

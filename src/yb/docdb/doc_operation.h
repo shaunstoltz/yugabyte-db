@@ -33,6 +33,10 @@ struct DocOperationApplyData {
   CoarseTimePoint deadline;
   ReadHybridTime read_time;
   HybridTime* restart_read_ht;
+
+  std::string ToString() const {
+    return YB_STRUCT_TO_STRING(deadline, read_time, restart_read_ht);
+  }
 };
 
 // When specifiying the parent key, the constant -1 is used for the subkey index.
@@ -42,8 +46,7 @@ typedef boost::container::small_vector_base<RefCntPrefix> DocPathsToLock;
 
 YB_DEFINE_ENUM(GetDocPathsMode, (kLock)(kIntents));
 YB_DEFINE_ENUM(DocOperationType,
-               (PGSQL_WRITE_OPERATION)(PGSQL_READ_OPERATION)(QL_WRITE_OPERATION)
-                   (REDIS_WRITE_OPERATION));
+               (PGSQL_WRITE_OPERATION)(QL_WRITE_OPERATION)(REDIS_WRITE_OPERATION));
 
 class DocOperation {
  public:

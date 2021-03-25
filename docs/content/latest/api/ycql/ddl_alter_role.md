@@ -2,7 +2,6 @@
 title: ALTER ROLE statement [YCQL]
 headerTitle: ALTER ROLE
 linkTitle: ALTER ROLE
-summary: Change the properties of a role
 description: Use the ALTER ROLE statement to change the properties of an existing role.
 menu:
   latest:
@@ -20,7 +19,7 @@ showAsideToc: true
 Use the `ALTER ROLE` statement to change the properties of an existing role.
 It allows modifying properties `SUPERUSER`, `PASSWORD`, and `LOGIN`.
 
-This statement is enabled by setting the YB-TServer configuration option [`use_cassandra_authentication`](../../../reference/configuration/yb-tserver/#use-cassandra-authentication) to `true`.
+This statement is enabled by setting the YB-TServer flag [`--use_cassandra_authentication`](../../../reference/configuration/yb-tserver/#use-cassandra-authentication) to `true`.
 
 ## Syntax
 
@@ -42,26 +41,27 @@ Where
 - `role_name` is a text identifier.
 
 ## Semantics
-- An error is raised if `role_name` does not exist.
+
+An error is raised if `role_name` does not exist.
 
 ## Examples
 
 You can do this as shown below.
 
 ```sql
-cqlsh:example> CREATE ROLE finance;
+ycqlsh:example> CREATE ROLE finance;
 ```
 
 ```sql
-cqlsh:example> ALTER ROLE finance with LOGIN = true;
+ycqlsh:example> ALTER ROLE finance with LOGIN = true;
 ```
 
 ```sql
-cqlsh:example> ALTER ROLE finance with SUPERUSER = true;
+ycqlsh:example> ALTER ROLE finance with SUPERUSER = true;
 ```
 
 ```sql
-cqlsh:example> ALTER ROLE finance with PASSWORD = 'jsfp9ajhufans2' AND SUPERUSER = false;
+ycqlsh:example> ALTER ROLE finance with PASSWORD = 'jsfp9ajhufans2' AND SUPERUSER = false;
 ```
 
 ## See also

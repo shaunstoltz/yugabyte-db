@@ -33,6 +33,7 @@
 #define YB_CONSENSUS_CONSENSUS_H_
 
 #include <iosfwd>
+#include <ostream>
 #include <memory>
 #include <string>
 #include <vector>
@@ -95,10 +96,16 @@ struct ConsensusBootstrapInfo {
   ConsensusBootstrapInfo();
 
   // The id of the last operation in the log
-  OpId last_id;
+  OpIdPB last_id;
 
   // The id of the last committed operation in the log.
-  OpId last_committed_id;
+  OpIdPB last_committed_id;
+
+  // Parameters of the split operation added to Raft log and designated for this tablet (in general
+  // case Raft log the tablet could contain old split operations designated for it ancestor tablets,
+  // those are not reflected here).
+  // See comments for ReplicateState::split_op_with_tablet_ids_.
+  SplitOpInfo split_op_info;
 
   // REPLICATE messages which were in the log with no accompanying
   // COMMIT. These need to be passed along to consensus init in order
@@ -125,7 +132,7 @@ YB_DEFINE_ENUM(ElectionMode,
 
 // Arguments for StartElection.
 struct LeaderElectionData {
-  ElectionMode mode;
+  ElectionMode mode = ElectionMode::NORMAL_ELECTION;
 
   // pending_commit - we should start election only after we have specified entry committed.
   const bool pending_commit = false;
@@ -134,13 +141,17 @@ struct LeaderElectionData {
   //    If this is specified, we would wait until this entry is committed. If not specified
   //    (i.e. if this has the default OpId value) it is taken from the last call to StartElection
   //    with pending_commit = true.
-  OpId must_be_committed_opid = OpId::default_instance();
+  OpIdPB must_be_committed_opid = OpIdPB::default_instance();
 
   // originator_uuid - if election is initiated by an old leader as part of a stepdown procedure,
   //    this would contain the uuid of the old leader.
   std::string originator_uuid = std::string();
 
   TEST_SuppressVoteRequest suppress_vote_request = TEST_SuppressVoteRequest::kFalse;
+
+  bool initial_election = false;
+
+  std::string ToString() const;
 };
 
 // The external interface for a consensus peer.
@@ -323,9 +334,19 @@ class Consensus {
 
   virtual yb::OpId GetLastCommittedOpId() = 0;
 
+  virtual yb::OpId GetLastAppliedOpId() = 0;
+
+  // Return the ID of the split operation requesting to split this Raft group if it has been added
+  // to Raft log and uninitialized OpId otherwise.
+  virtual yb::OpId GetSplitOpId() = 0;
+
+  // Return split child tablet IDs if split operation has been added to Raft log and array of empty
+  // tablet IDs otherwise.
+  virtual std::array<TabletId, kNumSplitParts> GetSplitChildTabletIds() = 0;
+
   // Assuming we are the leader, wait until we have a valid leader lease (i.e. the old leader's
   // lease has expired, and we have replicated a new lease that has not expired yet).
-  virtual CHECKED_STATUS WaitForLeaderLeaseImprecise(MonoTime deadline) = 0;
+  virtual CHECKED_STATUS WaitForLeaderLeaseImprecise(CoarseTimePoint deadline) = 0;
 
   // Check that this Consensus is a leader and has lease, returns Status::OK in this case.
   // Otherwise error status is returned.
@@ -338,11 +359,8 @@ class Consensus {
   // it tries to wait until ht lease reaches this value or `deadline` happens.
   //
   // Returns 0 if timeout happened.
-  virtual MicrosTime MajorityReplicatedHtLeaseExpiration(
+  virtual Result<MicrosTime> MajorityReplicatedHtLeaseExpiration(
       MicrosTime min_allowed, CoarseTimePoint deadline) const = 0;
-
-  // This includes heartbeats too.
-  virtual MonoTime TimeSinceLastMessageFromLeader() = 0;
 
   // Read majority replicated messages for CDC producer.
   virtual Result<ReadOpsResult> ReadReplicatedMessagesForCDC(const yb::OpId& from,
@@ -502,7 +520,7 @@ class ConsensusRound : public RefCountedThreadSafe<ConsensusRound> {
 
   // Returns the id of the (replicate) operation this context
   // refers to. This is only set _after_ Consensus::Replicate(context).
-  OpId id() const {
+  OpIdPB id() const {
     return replicate_msg_->id();
   }
 

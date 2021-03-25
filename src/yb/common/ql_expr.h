@@ -8,38 +8,12 @@
 #define YB_COMMON_QL_EXPR_H_
 
 #include "yb/common/common_fwd.h"
+#include "yb/common/ql_value.h"
 #include "yb/common/schema.h"
 #include "yb/util/bfql/tserver_opcodes.h"
 #include "yb/util/bfpg/tserver_opcodes.h"
 
 namespace yb {
-
-// In addition to regular columns, YB support for postgres also have virtual columns.
-// Virtual columns are just expression that is evaluated by DocDB in "doc_expr.cc".
-enum class PgSystemAttrNum : int {
-  // Postgres system columns.
-  kSelfItemPointer      = -1, // ctid.
-  kObjectId             = -2, // oid.
-  kMinTransactionId     = -3, // xmin
-  kMinCommandId         = -4, // cmin
-  kMaxTransactionId     = -5, // xmax
-  kMaxCommandId         = -6, // cmax
-  kTableOid             = -7, // tableoid
-
-  // YugaByte system columns.
-  kYBTupleId            = -8, // ybctid: virtual column representing DocDB-encoded key.
-                              // YB analogue of Postgres's SelfItemPointer/ctid column.
-
-  // The following attribute numbers are stored persistently in the table schema. For this reason,
-  // they are chosen to avoid potential conflict with Postgres' own sys attributes now and future.
-  kYBRowId              = -100, // ybrowid: auto-generated key-column for tables without pkey.
-  kYBIdxBaseTupleId     = -101, // ybidxbasectid: for indexes ybctid of the indexed table row.
-  kYBUniqueIdxKeySuffix = -102, // ybuniqueidxkeysuffix: extra key column for unique indexes, used
-                                // to ensure SQL semantics for null (null != null) in DocDB
-                                // (where null == null). For each index row will be set to:
-                                //  - the base table ctid when one or more indexed cols are null
-                                //  - to null otherwise (all indexed cols are non-null).
-};
 
 // TODO(neil)
 // - This should be maping directly from "int32_t" to QLValue.
@@ -57,7 +31,7 @@ struct QLTableColumn {
   static constexpr int64_t kUninitializedWriteTime = std::numeric_limits<int64_t>::min();
 
   QLValuePB value;
-  int64_t ttl_seconds;
+  int64_t ttl_seconds = 0;
   int64_t write_time = kUninitializedWriteTime;
 
   std::string ToString() const {
@@ -67,29 +41,60 @@ struct QLTableColumn {
   }
 };
 
+class QLExprResultWriter;
+
+class QLExprResult {
+ public:
+  const QLValuePB& Value() const;
+
+  void MoveToJsonb(common::Jsonb* out);
+
+  void MoveTo(QLValuePB* out);
+
+  QLValue& ForceNewValue();
+
+  QLExprResultWriter Writer();
+
+  bool IsNull() const;
+
+ private:
+  friend class QLExprResultWriter;
+
+  QLValue value_;
+  const QLValuePB* existing_value_ = nullptr;
+};
+
+class QLExprResultWriter {
+ public:
+  explicit QLExprResultWriter(QLExprResult* result) : result_(result) {
+    result_->existing_value_ = nullptr;
+  }
+
+  void SetNull();
+
+  void SetExisting(const QLValuePB* existing_value);
+
+  QLValue& NewValue();
+ private:
+  QLExprResult* result_;
+};
+
 class QLTableRow {
  public:
   // Public types.
   typedef std::shared_ptr<QLTableRow> SharedPtr;
   typedef std::shared_ptr<const QLTableRow> SharedPtrConst;
 
-  static const QLTableRow& empty_row() {
-    static QLTableRow empty_row;
-    return empty_row;
-  }
+  static const QLTableRow& empty_row();
 
   // Check if row is empty (no column).
-  bool IsEmpty() const {
-    return col_map_.empty();
-  }
+  bool IsEmpty() const { return num_assigned_ == 0; }
 
   // Get column count.
-  size_t ColumnCount() const {
-    return col_map_.size();
-  }
+  size_t ColumnCount() const;
 
   // Clear the row.
-  void Clear() { col_map_.clear(); }
+  void Clear();
 
   // Compare column value between two rows.
   bool MatchColumn(ColumnIdRep col_id, const QLTableRow& source) const;
@@ -110,9 +115,14 @@ class QLTableRow {
     return AllocColumn(col.rep(), ql_value);
   }
 
+  QLTableColumn& AllocColumn(ColumnIdRep col_id, QLValuePB&& ql_value);
+  QLTableColumn& AllocColumn(const ColumnId& col, QLValuePB&& ql_value) {
+    return AllocColumn(col.rep(), std::move(ql_value));
+  }
+
   // Copy column-value from 'source' to the 'col_id' entry in the cached column-map.
-  CHECKED_STATUS CopyColumn(ColumnIdRep col_id, const QLTableRow& source);
-  CHECKED_STATUS CopyColumn(const ColumnId& col, const QLTableRow& source) {
+  void CopyColumn(ColumnIdRep col_id, const QLTableRow& source);
+  void CopyColumn(const ColumnId& col, const QLTableRow& source) {
     return CopyColumn(col.rep(), source);
   }
 
@@ -137,35 +147,57 @@ class QLTableRow {
   bool IsColumnSpecified(ColumnIdRep col_id) const;
 
   // Clear the column value.
-  void ClearValue(ColumnIdRep col_id);
-  void ClearValue(const ColumnId& col) {
-    return ClearValue(col.rep());
+  void MarkTombstoned(ColumnIdRep col_id);
+  void MarkTombstoned(const ColumnId& col) {
+    return MarkTombstoned(col.rep());
   }
 
   // Get the column value in PB format.
-  CHECKED_STATUS ReadColumn(
-      ColumnIdRep col_id, QLValue *col_value, const QLValuePB** direct_value) const;
+  CHECKED_STATUS ReadColumn(ColumnIdRep col_id, QLExprResultWriter result_writer) const;
   const QLValuePB* GetColumn(ColumnIdRep col_id) const;
   CHECKED_STATUS ReadSubscriptedColumn(const QLSubscriptedColPB& subcol,
-                                       const QLValue& index,
-                                       QLValue *col_value) const;
+                                       const QLValuePB& index,
+                                       QLExprResultWriter result_writer) const;
 
   // For testing only (no status check).
   const QLTableColumn& TestValue(ColumnIdRep col_id) const {
-    return col_map_.at(col_id);
+    return *FindColumn(col_id);
   }
   const QLTableColumn& TestValue(const ColumnId& col) const {
-    return col_map_.at(col.rep());
+    return *FindColumn(col.rep());
   }
 
-  std::string ToString() const {
-    return yb::ToString(col_map_);
-  }
-
+  std::string ToString() const;
   std::string ToString(const Schema& schema) const;
 
  private:
-  std::unordered_map<ColumnIdRep, QLTableColumn> col_map_;
+  // Return kInvalidIndex when column index is unknown.
+  size_t ColumnIndex(ColumnIdRep col_id) const;
+  const QLTableColumn* FindColumn(ColumnIdRep col_id) const;
+  Result<const QLTableColumn&> Column(ColumnIdRep col_id) const;
+  // Appends new entry to values_ and assigned_ fields.
+  QLTableColumn& AppendColumn();
+
+  // Map from column id to index in values_ and assigned_ vectors.
+  // For columns from [kFirstColumnId; kFirstColumnId + kPreallocatedSize) we don't use
+  // this field and map them directly.
+  // I.e. column with id kFirstColumnId will have index 0 etc.
+  // We are using unsigned int as map value and std::numeric_limits<size_t>::max() as invalid
+  // column.
+  // This way, the compiler would understand that this invalid value could never be stored in the
+  // map and optimize away the comparison with it when inlining the ColumnIndex function call.
+  std::unordered_map<ColumnIdRep, unsigned int> column_id_to_index_;
+
+  static constexpr size_t kPreallocatedSize = 8;
+  static constexpr size_t kFirstNonPreallocatedColumnId = kFirstColumnIdRep + kPreallocatedSize;
+
+  // The two following vectors will be of the same size.
+  // We use separate fields to achieve the following features:
+  // 1) Fast way to cleanup row, just by setting assigned to false with one call.
+  // 2) Avoid destroying values_, so they would be able to reuse allocated storage during row reuse.
+  boost::container::small_vector<QLTableColumn, kPreallocatedSize> values_;
+  boost::container::small_vector<bool, kPreallocatedSize> assigned_;
+  size_t num_assigned_ = 0;
 };
 
 class QLExprExecutor {
@@ -189,9 +221,8 @@ class QLExprExecutor {
   // Evaluate the given QLExpressionPB.
   CHECKED_STATUS EvalExpr(const QLExpressionPB& ql_expr,
                           const QLTableRow& table_row,
-                          QLValue *result,
-                          const Schema *schema = nullptr,
-                          const QLValuePB** result_ptr = nullptr);
+                          QLExprResultWriter result_writer,
+                          const Schema *schema = nullptr);
 
   // Evaluate the given QLExpressionPB (if needed) and replace its content with the result.
   CHECKED_STATUS EvalExpr(QLExpressionPB* ql_expr,
@@ -201,13 +232,12 @@ class QLExprExecutor {
   // Read evaluated value from an expression. This is only useful for aggregate function.
   CHECKED_STATUS ReadExprValue(const QLExpressionPB& ql_expr,
                                const QLTableRow& table_row,
-                               QLValue *result);
+                               QLExprResultWriter result_writer);
 
   // Evaluate column reference.
   virtual CHECKED_STATUS EvalColumnRef(ColumnIdRep col_id,
                                        const QLTableRow* table_row,
-                                       QLValue *result,
-                                       const QLValuePB** direct_value);
+                                       QLExprResultWriter result_writer);
 
   // Evaluate call to regular builtin operator.
   virtual CHECKED_STATUS EvalBFCall(const QLBCallPB& ql_expr,
@@ -222,7 +252,7 @@ class QLExprExecutor {
 
   virtual CHECKED_STATUS ReadTSCallValue(const QLBCallPB& ql_expr,
                                          const QLTableRow& table_row,
-                                         QLValue *result);
+                                         QLExprResultWriter result_writer);
 
   // Evaluate a boolean condition for the given row.
   virtual CHECKED_STATUS EvalCondition(const QLConditionPB& condition,
@@ -241,16 +271,14 @@ class QLExprExecutor {
   // Evaluate the given QLExpressionPB.
   CHECKED_STATUS EvalExpr(const PgsqlExpressionPB& ql_expr,
                           const QLTableRow* table_row,
-                          QLValue *result,
-                          const Schema *schema = nullptr,
-                          const QLValuePB** direct_value = nullptr);
+                          QLExprResultWriter result_writer,
+                          const Schema *schema = nullptr);
 
   CHECKED_STATUS EvalExpr(const PgsqlExpressionPB& ql_expr,
                           const QLTableRow& table_row,
-                          QLValue *result,
-                          const Schema *schema = nullptr,
-                          const QLValuePB** direct_value = nullptr) {
-    return EvalExpr(ql_expr, &table_row, result, schema, direct_value);
+                          QLExprResultWriter result_writer,
+                          const Schema *schema = nullptr) {
+    return EvalExpr(ql_expr, &table_row, result_writer, schema);
   }
 
   CHECKED_STATUS EvalExpr(const PgsqlExpressionPB& ql_expr,
@@ -261,7 +289,7 @@ class QLExprExecutor {
   // Read evaluated value from an expression. This is only useful for aggregate function.
   CHECKED_STATUS ReadExprValue(const PgsqlExpressionPB& ql_expr,
                                const QLTableRow& table_row,
-                               QLValue *result);
+                               QLExprResultWriter result_writer);
 
   // Evaluate call to regular builtin operator.
   virtual CHECKED_STATUS EvalBFCall(const PgsqlBCallPB& ql_expr,
@@ -276,7 +304,7 @@ class QLExprExecutor {
 
   virtual CHECKED_STATUS ReadTSCallValue(const PgsqlBCallPB& ql_expr,
                                          const QLTableRow& table_row,
-                                         QLValue *result);
+                                         QLExprResultWriter result_writer);
 
   // Evaluate a boolean condition for the given row.
   virtual CHECKED_STATUS EvalCondition(const PgsqlConditionPB& condition,
@@ -286,6 +314,32 @@ class QLExprExecutor {
                                        const QLTableRow& table_row,
                                        QLValue *result);
 };
+
+template <class Operands>
+CHECKED_STATUS EvalOperandsHelper(
+    QLExprExecutor* executor, const Operands& operands, const QLTableRow& table_row, size_t index) {
+  return Status::OK();
+}
+
+template <class Operands, class... Args>
+CHECKED_STATUS EvalOperandsHelper(
+    QLExprExecutor* executor, const Operands& operands, const QLTableRow& table_row, size_t index,
+    QLExprResultWriter arg0, Args&&... args) {
+  RETURN_NOT_OK(executor->EvalExpr(operands[index], table_row, arg0));
+  return EvalOperandsHelper(executor, operands, table_row, index + 1, std::forward<Args>(args)...);
+}
+
+template <class Operands, class... Args>
+CHECKED_STATUS EvalOperands(
+    QLExprExecutor* executor, const Operands& operands, const QLTableRow& table_row,
+    Args&&... args) {
+  if (operands.size() != sizeof...(Args)) {
+    return STATUS_FORMAT(InvalidArgument, "Wrong number of arguments, $0 expected but $1 found",
+                         sizeof...(Args), operands.size());
+  }
+
+  return EvalOperandsHelper(executor, operands, table_row,  0, std::forward<Args>(args)...);
+}
 
 } // namespace yb
 

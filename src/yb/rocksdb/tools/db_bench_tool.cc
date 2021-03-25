@@ -759,16 +759,12 @@ DEFINE_int64(keys_per_prefix, 0, "control average number of keys generated "
              "i.e. use the prefix comes with the generated random number.");
 DEFINE_bool(enable_io_prio, false, "Lower the background flush/compaction "
             "threads' IO priority");
-DEFINE_bool(identity_as_first_hash, false, "the first hash function of cuckoo "
-            "table becomes an identity function. This is only valid when key "
-            "is 8 bytes");
 
 enum RepFactory {
   kSkipList,
   kPrefixHash,
   kVectorRep,
-  kHashLinkedList,
-  kCuckoo
+  kHashLinkedList
 };
 
 enum RepFactory StringToRepFactory(const char* ctype) {
@@ -776,14 +772,15 @@ enum RepFactory StringToRepFactory(const char* ctype) {
 
   if (!strcasecmp(ctype, "skip_list"))
     return kSkipList;
-  else if (!strcasecmp(ctype, "prefix_hash"))
+
+  if (!strcasecmp(ctype, "prefix_hash"))
     return kPrefixHash;
-  else if (!strcasecmp(ctype, "vector"))
+
+  if (!strcasecmp(ctype, "vector"))
     return kVectorRep;
-  else if (!strcasecmp(ctype, "hash_linkedlist"))
+
+  if (!strcasecmp(ctype, "hash_linkedlist"))
     return kHashLinkedList;
-  else if (!strcasecmp(ctype, "cuckoo"))
-    return kCuckoo;
 
   fprintf(stdout, "Cannot parse memreptable %s\n", ctype);
   return kSkipList;
@@ -794,8 +791,6 @@ DEFINE_string(memtablerep, "skip_list", "");
 DEFINE_int64(hash_bucket_count, 1024 * 1024, "hash bucket count");
 DEFINE_bool(use_plain_table, false, "if use plain table "
             "instead of block-based table format");
-DEFINE_bool(use_cuckoo_table, false, "if use cuckoo table format");
-DEFINE_double(cuckoo_hash_ratio, 0.9, "Hash ratio for Cuckoo SST table.");
 DEFINE_bool(use_binary_search, false, "if use kBinarySearch "
             "instead of kMultiLevelBinarySearch. "
             "This is valid if only we use BlockTable");
@@ -1213,21 +1208,21 @@ static std::unordered_map<OperationType, std::string, std::hash<unsigned char>>
 
 class Stats {
  private:
-  int id_;
-  uint64_t start_;
-  uint64_t finish_;
-  double seconds_;
-  uint64_t done_;
-  uint64_t last_report_done_;
-  uint64_t next_report_;
-  uint64_t bytes_;
-  uint64_t last_op_finish_;
-  uint64_t last_report_finish_;
+  int id_ = 0;
+  uint64_t start_ = 0;
+  uint64_t finish_ = 0;
+  double seconds_ = 0.0;
+  uint64_t done_ = 0;
+  uint64_t last_report_done_ = 0;
+  uint64_t next_report_ = 0;
+  uint64_t bytes_ = 0;
+  uint64_t last_op_finish_ = 0;
+  uint64_t last_report_finish_ = 0;
   std::unordered_map<OperationType, HistogramImpl,
                      std::hash<unsigned char>> hist_;
   std::string message_;
-  bool exclude_from_merge_;
-  ReporterAgent* reporter_agent_;  // does not own
+  bool exclude_from_merge_ = false;
+  ReporterAgent* reporter_agent_ = nullptr;  // does not own
 
  public:
   Stats() { Start(-1); }
@@ -1287,36 +1282,6 @@ class Stats {
 
   void SetId(int id) { id_ = id; }
   void SetExcludeFromMerge() { exclude_from_merge_ = true; }
-
-  void PrintThreadStatus() {
-    std::vector<ThreadStatus> thread_list;
-    CHECK_OK(FLAGS_env->GetThreadList(&thread_list));
-
-    fprintf(stderr, "\n%18s %10s %12s %20s %13s %45s %12s %s\n",
-        "ThreadID", "ThreadType", "cfName", "Operation",
-        "ElapsedTime", "Stage", "State", "OperationProperties");
-
-    int64_t current_time = 0;
-    CHECK_OK(Env::Default()->GetCurrentTime(&current_time));
-    for (auto ts : thread_list) {
-      fprintf(stderr, "%18" PRIu64 " %10s %12s %20s %13s %45s %12s",
-          ts.thread_id,
-          ThreadStatus::GetThreadTypeName(ts.thread_type).c_str(),
-          ts.cf_name.c_str(),
-          ThreadStatus::GetOperationName(ts.operation_type).c_str(),
-          ThreadStatus::MicrosToString(ts.op_elapsed_micros).c_str(),
-          ThreadStatus::GetOperationStageName(ts.operation_stage).c_str(),
-          ThreadStatus::GetStateName(ts.state_type).c_str());
-
-      auto op_properties = ThreadStatus::InterpretOperationProperties(
-          ts.operation_type, ts.op_properties);
-      for (const auto& op_prop : op_properties) {
-        fprintf(stderr, " %s %" PRIu64" |",
-            op_prop.first.c_str(), op_prop.second);
-      }
-      fprintf(stderr, "\n");
-    }
-  }
 
   void ResetLastOpTime() {
     // Set to now to avoid latency from calls to SleepForMicroseconds
@@ -1428,9 +1393,6 @@ class Stats {
           last_report_finish_ = now;
           last_report_done_ = done_;
         }
-      }
-      if (id_ == 0 && FLAGS_thread_status_per_interval) {
-        PrintThreadStatus();
       }
       fflush(stderr);
     }
@@ -1673,9 +1635,6 @@ class Benchmark {
         break;
       case kHashLinkedList:
         fprintf(stdout, "Memtablerep: hash_linkedlist\n");
-        break;
-      case kCuckoo:
-        fprintf(stdout, "Memtablerep: cuckoo\n");
         break;
     }
     fprintf(stdout, "Perf Level: %d\n", FLAGS_perf_level);
@@ -2456,10 +2415,6 @@ class Benchmark {
           new VectorRepFactory
         );
         break;
-      case kCuckoo:
-        options.memtable_factory.reset(NewHashCuckooRepFactory(
-            options.write_buffer_size, FLAGS_key_size + FLAGS_value_size));
-        break;
 #else
       default:
         fprintf(stderr, "Only skip list is supported in lite mode\n");
@@ -2490,21 +2445,6 @@ class Benchmark {
           NewPlainTableFactory(plain_table_options));
 #else
       fprintf(stderr, "Plain table is not supported in lite mode\n");
-      exit(1);
-#endif  // ROCKSDB_LITE
-    } else if (FLAGS_use_cuckoo_table) {
-#ifndef ROCKSDB_LITE
-      if (FLAGS_cuckoo_hash_ratio > 1 || FLAGS_cuckoo_hash_ratio < 0) {
-        fprintf(stderr, "Invalid cuckoo_hash_ratio\n");
-        exit(1);
-      }
-      rocksdb::CuckooTableOptions table_options;
-      table_options.hash_table_ratio = FLAGS_cuckoo_hash_ratio;
-      table_options.identity_as_first_hash = FLAGS_identity_as_first_hash;
-      options.table_factory = std::shared_ptr<TableFactory>(
-          NewCuckooTableFactory(table_options));
-#else
-      fprintf(stderr, "Cuckoo table is not supported in lite mode\n");
       exit(1);
 #endif  // ROCKSDB_LITE
     } else {

@@ -60,8 +60,8 @@ DEFINE_test_flag(int32, tablet_inject_latency_on_apply_write_txn_ms, 0,
                  "How much latency to inject when a write operation is applied.");
 DEFINE_test_flag(bool, tablet_pause_apply_write_ops, false,
                  "Pause applying of write operations.");
-TAG_FLAG(tablet_inject_latency_on_apply_write_txn_ms, runtime);
-TAG_FLAG(tablet_pause_apply_write_ops, runtime);
+TAG_FLAG(TEST_tablet_inject_latency_on_apply_write_txn_ms, runtime);
+TAG_FLAG(TEST_tablet_pause_apply_write_ops, runtime);
 
 namespace yb {
 namespace tablet {
@@ -83,7 +83,7 @@ WriteOperation::WriteOperation(
     WriteOperationContext* context)
     : Operation(std::move(state), OperationType::kWrite),
       term_(term), preparing_token_(std::move(preparing_token)), deadline_(deadline),
-      context_(*context), start_time_(MonoTime::Now()) {
+      context_(context), start_time_(MonoTime::Now()) {
 }
 
 consensus::ReplicateMsgPtr WriteOperation::NewReplicateMsg() {
@@ -115,18 +115,18 @@ Status WriteOperation::DoReplicated(int64_t leader_term, Status* complete_status
   TRACE_EVENT0("txn", "WriteOperation::Complete");
   TRACE("APPLY: Starting");
 
-  auto injected_latency = GetAtomicFlag(&FLAGS_tablet_inject_latency_on_apply_write_txn_ms);
+  auto injected_latency = GetAtomicFlag(&FLAGS_TEST_tablet_inject_latency_on_apply_write_txn_ms);
   if (PREDICT_FALSE(injected_latency) > 0) {
-      TRACE("Injecting $0ms of latency due to --tablet_inject_latency_on_apply_write_txn_ms",
+      TRACE("Injecting $0ms of latency due to --TEST_tablet_inject_latency_on_apply_write_txn_ms",
             injected_latency);
       SleepFor(MonoDelta::FromMilliseconds(injected_latency));
   } else {
-    TEST_PAUSE_IF_FLAG(tablet_pause_apply_write_ops);
+    TEST_PAUSE_IF_FLAG(TEST_tablet_pause_apply_write_ops);
   }
 
   *complete_status = state()->tablet()->ApplyRowOperations(state());
   // Failure is regular case, since could happen because transaction was aborted, while
-  // replicating it's intents.
+  // replicating its intents.
   LOG_IF(INFO, !complete_status->ok()) << "Apply operation failed: " << *complete_status;
 
   // Now that all of the changes have been applied and the commit is durable
@@ -155,13 +155,20 @@ string WriteOperation::ToString() const {
 
 void WriteOperation::DoStartSynchronization(const Status& status) {
   std::unique_ptr<WriteOperation> self(this);
+  // Move submit_token_ so it is released after this function.
+  ScopedRWOperation submit_token(std::move(submit_token_));
   // If a restart read is required, then we return this fact to caller and don't perform the write
   // operation.
   if (restart_read_ht_.is_valid()) {
     auto restart_time = state()->response()->mutable_restart_read_time();
     restart_time->set_read_ht(restart_read_ht_.ToUint64());
-    auto local_limit = context_.ReportReadRestart();
-    restart_time->set_local_limit_ht(local_limit.ToUint64());
+    auto local_limit = context_->ReportReadRestart();
+    if (!local_limit.ok()) {
+      state()->CompleteWithStatus(local_limit.status());
+      return;
+    }
+    restart_time->set_deprecated_max_of_read_time_and_local_limit_ht(local_limit->ToUint64());
+    restart_time->set_local_limit_ht(local_limit->ToUint64());
     // Global limit is ignored by caller, so we don't set it.
     state()->CompleteWithStatus(Status::OK());
     return;
@@ -172,7 +179,7 @@ void WriteOperation::DoStartSynchronization(const Status& status) {
     return;
   }
 
-  context_.Submit(std::move(self), term_);
+  context_->Submit(std::move(self), term_);
 }
 
 WriteOperationState::WriteOperationState(Tablet* tablet,
@@ -253,6 +260,13 @@ HybridTime WriteOperationState::WriteHybridTime() const {
     return HybridTime(request_->external_hybrid_time());
   }
   return OperationState::WriteHybridTime();
+}
+
+void WriteOperationState::SetTablet(Tablet* tablet) {
+  OperationState::SetTablet(tablet);
+  if (!request_->has_tablet_id()) {
+    request_->set_tablet_id(tablet->tablet_id());
+  }
 }
 
 }  // namespace tablet

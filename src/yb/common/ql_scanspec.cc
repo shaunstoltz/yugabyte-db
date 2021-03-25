@@ -15,6 +15,7 @@
 
 #include "yb/common/ql_scanspec.h"
 
+#include "yb/common/ql_expr.h"
 #include "yb/common/pgsql_protocol.pb.h"
 #include "yb/common/ql_value.h"
 
@@ -386,15 +387,15 @@ QLScanRange& QLScanRange::operator&=(const QLScanRange& other) {
     // Intersect operation:
     // - min_value = max(min_value, other_min_value)
     // - max_value = min(max_value, other_max_value)
-    if (BothNotNull(range.min_value, other_range.min_value)) {
+    if (range.min_value && other_range.min_value) {
       range.min_value = std::max(range.min_value, other_range.min_value);
-    } else if (!IsNull(other_range.min_value)) {
+    } else if (other_range.min_value) {
       range.min_value = other_range.min_value;
     }
 
-    if (BothNotNull(range.max_value, other_range.max_value)) {
+    if (range.max_value && other_range.max_value) {
       range.max_value = std::min(range.max_value, other_range.max_value);
-    } else if (!IsNull(other_range.max_value)) {
+    } else if (other_range.max_value) {
       range.max_value = other_range.max_value;
     }
   }
@@ -411,16 +412,16 @@ QLScanRange& QLScanRange::operator|=(const QLScanRange& other) {
     // Union operation:
     // - min_value = min(min_value, other_min_value)
     // - max_value = max(max_value, other_max_value)
-    if (BothNotNull(range.min_value, other_range.min_value)) {
+    if (range.min_value && other_range.min_value) {
       range.min_value = std::min(range.min_value, other_range.min_value);
-    } else if (IsNull(other_range.min_value)) {
-      SetNull(&range.min_value);
+    } else if (!other_range.min_value) {
+      range.min_value = boost::none;
     }
 
-    if (BothNotNull(range.max_value, other_range.max_value)) {
+    if (range.max_value && other_range.max_value) {
       range.max_value = std::max(range.max_value, other_range.max_value);
-    } else if (IsNull(other_range.max_value)) {
-      SetNull(&range.max_value);
+    } else if (!other_range.max_value) {
+      range.max_value = boost::none;
     }
   }
   has_in_range_options_ = has_in_range_options_ && other.has_in_range_options_;
@@ -433,16 +434,17 @@ QLScanRange& QLScanRange::operator~() {
     auto& range = elem.second;
 
     // Complement operation:
-    if (BothNotNull(range.min_value, range.max_value)) {
+    if (range.min_value && range.max_value) {
       // If the condition's min and max values are defined, the negation of it will be
       // disjoint ranges at the two ends, which is not representable as a simple range. So
       // we will treat the result as unbounded.
-      SetNull(&range.min_value);
-      SetNull(&range.max_value);
+      range.min_value = boost::none;
+      range.max_value = boost::none;
     } else {
       // Otherwise, for one-sided range or unbounded range, the resulting min/max values are
       // just the reverse of the bounds.
-      range.min_value.Swap(&range.max_value);
+
+      range.min_value.swap(range.max_value);
     }
   }
   has_in_range_options_ = false;
@@ -455,38 +457,21 @@ QLScanRange& QLScanRange::operator=(QLScanRange&& other) {
   return *this;
 }
 
-// Return the lower/upper range components for the scan.
-vector<QLValuePB> QLScanRange::range_values(const bool lower_bound) const {
-  vector<QLValuePB> range_values;
-  range_values.reserve(schema_.num_range_key_columns());
-  for (size_t i = 0; i < schema_.num_key_columns(); i++) {
-    if (!schema_.column(i).is_hash_key()) {
-      const auto& range = ranges_.at(schema_.column_id(i));
-      bool desc_col = schema_.column(i).sorting_type() == ColumnSchema::kDescending;
-      // lower bound for ASC column and upper bound for DESC column -> min value
-      // otherwise -> max value
-      const auto& value = (lower_bound ^ desc_col) ? range.min_value : range.max_value;
-      range_values.emplace_back(value);
-    }
-  }
-  return range_values;
-}
-
 //-------------------------------------- QL scan spec ---------------------------------------
 
-QLScanSpec::QLScanSpec(QLExprExecutor::SharedPtr executor)
-    : QLScanSpec(nullptr, nullptr, true, executor) {
+QLScanSpec::QLScanSpec(QLExprExecutorPtr executor)
+    : QLScanSpec(nullptr, nullptr, true, std::move(executor)) {
 }
 
 QLScanSpec::QLScanSpec(const QLConditionPB* condition,
                        const QLConditionPB* if_condition,
                        const bool is_forward_scan,
-                       QLExprExecutor::SharedPtr executor)
+                       QLExprExecutorPtr executor)
     : YQLScanSpec(YQL_CLIENT_CQL),
       condition_(condition),
       if_condition_(if_condition),
       is_forward_scan_(is_forward_scan),
-      executor_(executor) {
+      executor_(std::move(executor)) {
   if (executor_ == nullptr) {
     executor_ = std::make_shared<QLExprExecutor>();
   }
@@ -508,10 +493,9 @@ CHECKED_STATUS QLScanSpec::Match(const QLTableRow& table_row, bool* match) const
 
 //-------------------------------------- QL scan spec ---------------------------------------
 // Pgsql scan specification.
-PgsqlScanSpec::PgsqlScanSpec(QLClient client_type,
-                             const PgsqlExpressionPB *where_expr,
+PgsqlScanSpec::PgsqlScanSpec(const PgsqlExpressionPB *where_expr,
                              QLExprExecutor::SharedPtr executor)
-    : YQLScanSpec(client_type),
+    : YQLScanSpec(YQL_CLIENT_PGSQL),
       where_expr_(where_expr),
       executor_(executor) {
   if (executor_ == nullptr) {

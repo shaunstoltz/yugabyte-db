@@ -33,7 +33,6 @@
 
 #include <iostream>
 #include <memory>
-#include <strstream>
 
 #include <gflags/gflags.h>
 #include <glog/logging.h>
@@ -43,48 +42,61 @@
 #include "yb/common/partition.h"
 #include "yb/common/schema.h"
 #include "yb/common/wire_protocol.h"
-#include "yb/gutil/strings/human_readable.h"
 #include "yb/server/server_base.proxy.h"
+#include "yb/server/secure.h"
 #include "yb/tserver/tserver.pb.h"
 #include "yb/tserver/tserver_admin.proxy.h"
 #include "yb/tserver/tserver_service.proxy.h"
+#include "yb/consensus/consensus.proxy.h"
 #include "yb/tserver/tablet_server.h"
 #include "yb/util/env.h"
 #include "yb/util/faststring.h"
 #include "yb/util/flags.h"
 #include "yb/util/logging.h"
+#include "yb/util/protobuf_util.h"
 #include "yb/util/net/net_util.h"
-#include "yb/util/net/sockaddr.h"
 #include "yb/rpc/messenger.h"
 #include "yb/rpc/rpc_controller.h"
+#include "yb/rpc/secure_stream.h"
 
+using std::ostringstream;
+using std::shared_ptr;
+using std::string;
+using std::vector;
 using yb::HostPort;
+using yb::consensus::ConsensusServiceProxy;
 using yb::rpc::Messenger;
 using yb::rpc::MessengerBuilder;
 using yb::rpc::RpcController;
 using yb::server::ServerStatusPB;
 using yb::tablet::TabletStatusPB;
-using yb::tserver::DeleteTabletRequestPB;
-using yb::tserver::DeleteTabletResponsePB;
-using yb::tserver::ListTabletsRequestPB;
-using yb::tserver::ListTabletsResponsePB;
+using yb::tserver::IsTabletServerReadyRequestPB;
+using yb::tserver::IsTabletServerReadyResponsePB;
 using yb::tserver::CountIntentsRequestPB;
 using yb::tserver::CountIntentsResponsePB;
+using yb::tserver::DeleteTabletRequestPB;
+using yb::tserver::DeleteTabletResponsePB;
+using yb::tserver::FlushTabletsRequestPB;
+using yb::tserver::FlushTabletsResponsePB;
+using yb::tserver::ListTabletsRequestPB;
+using yb::tserver::ListTabletsResponsePB;
 using yb::tserver::TabletServerAdminServiceProxy;
 using yb::tserver::TabletServerServiceProxy;
-using std::ostringstream;
-using std::shared_ptr;
-using std::string;
-using std::vector;
 
 const char* const kListTabletsOp = "list_tablets";
 const char* const kAreTabletsRunningOp = "are_tablets_running";
+const char* const kIsServerReadyOp = "is_server_ready";
 const char* const kSetFlagOp = "set_flag";
 const char* const kDumpTabletOp = "dump_tablet";
+const char* const kTabletStateOp = "get_tablet_state";
 const char* const kDeleteTabletOp = "delete_tablet";
 const char* const kCurrentHybridTime = "current_hybrid_time";
 const char* const kStatus = "status";
 const char* const kCountIntents = "count_intents";
+const char* const kFlushTabletOp = "flush_tablet";
+const char* const kFlushAllTabletsOp = "flush_all_tablets";
+const char* const kCompactTabletOp = "compact_tablet";
+const char* const kCompactAllTabletsOp = "compact_all_tablets";
 
 DEFINE_string(server_address, "localhost",
               "Address of server to run against");
@@ -93,6 +105,13 @@ DEFINE_int64(timeout_ms, 1000 * 60, "RPC timeout in milliseconds");
 DEFINE_bool(force, false, "If true, allows the set_flag command to set a flag "
             "which is not explicitly marked as runtime-settable. Such flag changes may be "
             "simply ignored on the server, or may cause the server to crash.");
+
+DEFINE_string(certs_dir_name, "",
+              "Directory with certificates to use for secure server connection.");
+
+DEFINE_string(client_node_name, "", "Client node name.");
+
+PB_ENUM_FORMATTERS(yb::consensus::LeaderLeaseStatus);
 
 // Check that the value of argc matches what's expected, otherwise return a
 // non-zero exit code. Should be used in main().
@@ -141,6 +160,8 @@ class TsAdminClient {
   // given tablet server.
   Status ListTablets(std::vector<StatusAndSchemaPB>* tablets);
 
+  // Gets the number of tablets waiting to be bootstrapped and prints to console.
+  Status GetNumUnbootstrappedTablets(int64_t* num_unbootstrapped_tablets);
 
   // Sets the gflag 'flag' to 'val' on the remote server via RPC.
   // If 'force' is true, allows setting flags even if they're not marked as
@@ -153,6 +174,9 @@ class TsAdminClient {
 
   // Dump the contents of the given tablet, in key order, to the console.
   Status DumpTablet(const std::string& tablet_id);
+
+  // Print the consensus state to the console.
+  Status PrintConsensusState(const std::string& tablet_id);
 
   // Delete a tablet replica from the specified peer.
   // The 'reason' string is passed to the tablet server, used for logging.
@@ -168,14 +192,20 @@ class TsAdminClient {
   // Count write intents on all tablets.
   Status CountIntents(int64_t* num_intents);
 
+  // Flush or compact a given tablet on a given tablet server.
+  // If 'tablet_id' is empty string, flush or compact all tablets.
+  Status FlushTablets(const std::string& tablet_id, bool is_compaction);
+
  private:
   std::string addr_;
   MonoDelta timeout_;
   bool initted_;
+  std::unique_ptr<rpc::SecureContext> secure_context_;
   std::unique_ptr<rpc::Messenger> messenger_;
   shared_ptr<server::GenericServiceProxy> generic_proxy_;
   gscoped_ptr<tserver::TabletServerServiceProxy> ts_proxy_;
   gscoped_ptr<tserver::TabletServerAdminServiceProxy> ts_admin_proxy_;
+  gscoped_ptr<consensus::ConsensusServiceProxy> cons_proxy_;
 
   DISALLOW_COPY_AND_ASSIGN(TsAdminClient);
 };
@@ -196,14 +226,21 @@ Status TsAdminClient::Init() {
 
   HostPort host_port;
   RETURN_NOT_OK(host_port.ParseString(addr_, tserver::TabletServer::kDefaultPort));
-  messenger_ = VERIFY_RESULT(MessengerBuilder("ts-cli").Build());
+  auto messenger_builder = MessengerBuilder("ts-cli");
+  if (!FLAGS_certs_dir_name.empty()) {
+    const std::string& cert_name = FLAGS_client_node_name;
+    secure_context_ = VERIFY_RESULT(server::CreateSecureContext(
+        FLAGS_certs_dir_name, server::UseClientCerts(!cert_name.empty()), cert_name));
+    server::ApplySecureContext(secure_context_.get(), &messenger_builder);
+  }
+  messenger_ = VERIFY_RESULT(messenger_builder.Build());
 
   rpc::ProxyCache proxy_cache(messenger_.get());
 
   generic_proxy_.reset(new server::GenericServiceProxy(&proxy_cache, host_port));
   ts_proxy_.reset(new TabletServerServiceProxy(&proxy_cache, host_port));
   ts_admin_proxy_.reset(new TabletServerAdminServiceProxy(&proxy_cache, host_port));
-
+  cons_proxy_.reset(new ConsensusServiceProxy(&proxy_cache, host_port));
   initted_ = true;
 
   VLOG(1) << "Connected to " << addr_;
@@ -225,6 +262,26 @@ Status TsAdminClient::ListTablets(vector<StatusAndSchemaPB>* tablets) {
   }
 
   tablets->assign(resp.status_and_schema().begin(), resp.status_and_schema().end());
+
+  return Status::OK();
+}
+
+Status TsAdminClient::GetNumUnbootstrappedTablets(int64_t* num_unbootstrapped_tablets) {
+  CHECK(initted_);
+
+  IsTabletServerReadyRequestPB req;
+  IsTabletServerReadyResponsePB resp;
+  RpcController rpc;
+
+  rpc.set_timeout(timeout_);
+  RETURN_NOT_OK(ts_proxy_->IsTabletServerReady(req, &resp, &rpc));
+  if (resp.has_error()) {
+    return StatusFromPB(resp.error().status());
+  }
+
+  std::cout << resp.num_tablets_not_running() << "/" << resp.total_tablets()
+            << " tablets are not yet bootstrapped" << std::endl;
+  *num_unbootstrapped_tablets = resp.num_tablets_not_running();
 
   return Status::OK();
 }
@@ -263,6 +320,28 @@ Status TsAdminClient::GetTabletSchema(const std::string& tablet_id,
     }
   }
   return STATUS(NotFound, "Cannot find tablet", tablet_id);
+}
+
+Status TsAdminClient::PrintConsensusState(const std::string& tablet_id) {
+  ServerStatusPB status_pb;
+  RETURN_NOT_OK(GetStatus(&status_pb));
+
+  consensus::GetConsensusStateRequestPB cons_reqpb;
+  cons_reqpb.set_dest_uuid(status_pb.node_instance().permanent_uuid());
+  cons_reqpb.set_tablet_id(tablet_id);
+
+  consensus::GetConsensusStateResponsePB cons_resp_pb;
+  RpcController rpc;
+  RETURN_NOT_OK_PREPEND(
+      cons_proxy_->GetConsensusState(cons_reqpb, &cons_resp_pb, &rpc),
+      "Failed to query tserver for consensus state");
+  std::cout << "Lease-Status"
+            << "\t\t"
+            << " Leader-UUID ";
+  std::cout << PBEnumToString(cons_resp_pb.leader_lease_status()) << "\t\t"
+            << cons_resp_pb.cstate().leader_uuid();
+
+  return Status::OK();
 }
 
 Status TsAdminClient::DumpTablet(const std::string& tablet_id) {
@@ -352,6 +431,33 @@ Status TsAdminClient::CountIntents(int64_t* num_intents) {
   return Status::OK();
 }
 
+Status TsAdminClient::FlushTablets(const std::string& tablet_id, bool is_compaction) {
+  ServerStatusPB status_pb;
+  RETURN_NOT_OK(GetStatus(&status_pb));
+
+  FlushTabletsRequestPB req;
+  FlushTabletsResponsePB resp;
+  RpcController rpc;
+
+  if (!tablet_id.empty()) {
+    req.add_tablet_ids(tablet_id);
+    req.set_all_tablets(false);
+  } else {
+    req.set_all_tablets(true);
+  }
+  req.set_dest_uuid(status_pb.node_instance().permanent_uuid());
+  req.set_is_compaction(is_compaction);
+  rpc.set_timeout(timeout_);
+  RETURN_NOT_OK_PREPEND(ts_admin_proxy_->FlushTablets(req, &resp, &rpc),
+                        "FlushTablets() failed");
+
+  if (resp.has_error()) {
+    return STATUS(IOError, "Failed to flush tablet: ",
+                           resp.error().ShortDebugString());
+  }
+  return Status::OK();
+}
+
 namespace {
 
 void SetUsage(const char* argv0) {
@@ -361,12 +467,18 @@ void SetUsage(const char* argv0) {
       << "<operation> must be one of:\n"
       << "  " << kListTabletsOp << "\n"
       << "  " << kAreTabletsRunningOp << "\n"
+      << "  " << kIsServerReadyOp << "\n"
       << "  " << kSetFlagOp << " [-force] <flag> <value>\n"
+      << "  " << kTabletStateOp << " <tablet_id>\n"
       << "  " << kDumpTabletOp << " <tablet_id>\n"
       << "  " << kDeleteTabletOp << " <tablet_id> <reason string>\n"
       << "  " << kCurrentHybridTime << "\n"
       << "  " << kStatus << "\n"
-      << "  " << kCountIntents << "\n";
+      << "  " << kCountIntents << "\n"
+      << "  " << kFlushTabletOp << " <tablet_id>\n"
+      << "  " << kFlushAllTabletsOp << "\n"
+      << "  " << kCompactTabletOp << " <tablet_id>\n"
+      << "  " << kCompactAllTabletsOp << "\n";
   google::SetUsageMessage(str.str());
 }
 
@@ -383,6 +495,7 @@ string GetOp(int argc, char** argv) {
 
 static int TsCliMain(int argc, char** argv) {
   FLAGS_logtostderr = 1;
+  FLAGS_minloglevel = 2;
   SetUsage(argv[0]);
   ParseCommandLineFlags(&argc, &argv, true);
   InitGoogleLoggingSafe(argv[0]);
@@ -447,12 +560,31 @@ static int TsCliMain(int argc, char** argv) {
       std::cout << "Not all tablets are running" << std::endl;
       return 1;
     }
+  } else if (op == kIsServerReadyOp) {
+    CHECK_ARGC_OR_RETURN_WITH_USAGE(op, 2);
+
+    int64_t unbootstrapped_tablets;
+    RETURN_NOT_OK_PREPEND_FROM_MAIN(
+        client.GetNumUnbootstrappedTablets(&unbootstrapped_tablets), "Unable to read server state");
+
+    if (unbootstrapped_tablets > 0) {
+      std::cout << "Tablet server is not ready" << std::endl;
+      return 1;
+    } else {
+      std::cout << "Tablet server is ready" << std::endl;
+    }
   } else if (op == kSetFlagOp) {
     CHECK_ARGC_OR_RETURN_WITH_USAGE(op, 4);
 
     RETURN_NOT_OK_PREPEND_FROM_MAIN(client.SetFlag(argv[2], argv[3], FLAGS_force),
                                     "Unable to set flag");
 
+  } else if (op == kTabletStateOp) {
+    CHECK_ARGC_OR_RETURN_WITH_USAGE(op, 3);
+
+    string tablet_id = argv[2];
+    RETURN_NOT_OK_PREPEND_FROM_MAIN(
+        client.PrintConsensusState(tablet_id), "Unable to print tablet state");
   } else if (op == kDumpTabletOp) {
     CHECK_ARGC_OR_RETURN_WITH_USAGE(op, 3);
 
@@ -489,6 +621,28 @@ static int TsCliMain(int argc, char** argv) {
                                     "Unable to count intents");
 
     std::cout << num_intents << std::endl;
+  } else if (op == kFlushTabletOp) {
+    CHECK_ARGC_OR_RETURN_WITH_USAGE(op, 3);
+
+    string tablet_id = argv[2];
+    RETURN_NOT_OK_PREPEND_FROM_MAIN(client.FlushTablets(tablet_id, false /* is_compaction */),
+                                    "Unable to flush tablet");
+  } else if (op == kFlushAllTabletsOp) {
+    CHECK_ARGC_OR_RETURN_WITH_USAGE(op, 2);
+
+    RETURN_NOT_OK_PREPEND_FROM_MAIN(client.FlushTablets(std::string(), false /* is_compaction */),
+                                    "Unable to flush all tablets");
+  } else if (op == kCompactTabletOp) {
+    CHECK_ARGC_OR_RETURN_WITH_USAGE(op, 3);
+
+    string tablet_id = argv[2];
+    RETURN_NOT_OK_PREPEND_FROM_MAIN(client.FlushTablets(tablet_id, true /* is_compaction */),
+                                    "Unable to compact tablet");
+  } else if (op == kCompactAllTabletsOp) {
+    CHECK_ARGC_OR_RETURN_WITH_USAGE(op, 2);
+
+    RETURN_NOT_OK_PREPEND_FROM_MAIN(client.FlushTablets(std::string(), true /* is_compaction */),
+                                    "Unable to compact all tablets");
   } else {
     std::cerr << "Invalid operation: " << op << std::endl;
     google::ShowUsageWithFlagsRestrict(argv[0], __FILE__);

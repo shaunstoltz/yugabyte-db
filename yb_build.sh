@@ -45,7 +45,7 @@ Options:
   --clean
     Remove the build directory before building.
   --clean-thirdparty
-    Remove previously built third-party dependencies and rebuild them. Does not imply --clean.
+    Remove previously built third-party dependencies and rebuild them. Implies --clean.
   --no-ccache
     Do not use ccache. Useful when debugging build scripts or compiler/linker options.
   --clang
@@ -70,9 +70,6 @@ Options:
     Do not use tcmalloc.
   --no-rebuild-thirdparty, --nbtp, --nb3p, --nrtp, --nr3p
     Skip building third-party libraries, even if the thirdparty directory has changed in git.
-  --use-shared-thirdparty, --ustp, --stp, --us3p, --s3p
-    Try to find and use a shared third-party directory (in Yugabyte's build environment these
-    third-party directories are under $NFS_PARENT_DIR_FOR_SHARED_THIRDPARTY)
   --show-compiler-cmd-line, --sccl
     Show compiler command line.
   --{no,skip}-{test-existence-check,check-test-existence}
@@ -162,9 +159,6 @@ Options:
     Do a clean build of the PostgreSQL subtree.
   --no-postgres, --skip-postgres, --np, --sp
     Skip PostgreSQL build
-  --gen-compilation-db, --gcdb
-    Generate the "compilation database" file, compile_commands.json, that can be used by editors
-    to provide better code assistance.
   --make-ninja-extra-args <extra_args>
     Extra arguments for the build tool such as Unix Make or Ninja.
   --run-java-test-methods-separately, --rjtms
@@ -181,16 +175,22 @@ Options:
     Disable the creation/overwriting of the "latest" symlink in the build directory.
   --static-analyzer
     Enable Clang static analyzer
-  --download-thirdparty, --dltp
+  --download-thirdparty, --dltp  (This is the default.)
     Use prebuilt third-party dependencies, downloadable e.g. from a GitHub release. Also records the
     third-party URL in the build root so that further invocations of yb_build.sh don't reqiure
-    this option (this could be reset by --clean). Only supported on CentOS.
+    this option (this could be reset by --clean).
+  --no-download-thirdparty|--ndltp)
+    Disable downloading pre-built third-party dependencies.
   --collect-java-tests
     Collect the set of Java test methods into a file
   --resolve-java-dependencies
     Force Maven to download all Java dependencies to the local repository
   --super-bash-debug
     Log the location of every command executed in this script
+  --no-tests
+    Do not build tests
+  --cmake-unit-tests
+    Run our unit tests for CMake code. This should be much faster than running the build.
   --
     Pass all arguments after -- to repeat_unit_test.
 
@@ -286,9 +286,6 @@ print_report() {
       if using_linuxbrew; then
         print_report_line "%s" "Linuxbrew dir" "${YB_LINUXBREW_DIR:-undefined}"
       fi
-      if using_custom_homebrew; then
-        print_report_line "%s" "Custom Homebrew dir" "${YB_CUSTOM_HOMEBREW_DIR:-undefined}"
-      fi
 
       set +u
       local make_targets_str="${make_targets[*]}"
@@ -339,10 +336,15 @@ EOT
     if using_linuxbrew; then
       echo "linuxbrew_dir: \"${YB_LINUXBREW_DIR:-}\"" >>"$build_descriptor_path"
     fi
-    if using_custom_homebrew; then
-      echo "custom_homebrew_dir: \"${YB_CUSTOM_HOMEBREW_DIR:-}\"" >>"$build_descriptor_path"
-    fi
     log "Created a build descriptor file at '$build_descriptor_path'"
+  fi
+}
+
+create_build_root_file() {
+  if [[ -n ${BUILD_ROOT:-} ]]; then
+    local latest_build_root_path=$YB_SRC_ROOT/build/latest_build_root
+    echo "Saving BUILD_ROOT to $latest_build_root_path"
+    echo "$BUILD_ROOT" > "$latest_build_root_path"
   fi
 }
 
@@ -448,8 +450,8 @@ run_repeat_unit_test() {
     --build-type "$build_type"
     --num-iter "$num_test_repetitions"
   )
-  if [[ -n ${test_parallelism:-} ]]; then
-    repeat_unit_test_args+=( --parallelism "$test_parallelism" )
+  if [[ -n ${YB_TEST_PARALLELISM:-} ]]; then
+    repeat_unit_test_args+=( --parallelism "$YB_TEST_PARALLELISM" )
   fi
   if "$verbose"; then
     repeat_unit_test_args+=( --verbose )
@@ -627,13 +629,14 @@ java_lint=false
 collect_java_tests=false
 reinitdb_when_packaging=false
 
-# use_nfs_shared_thirdparty and no_nfs_shared_thirdparty are defined in common-build-env.sh.
-
 # The default value of this parameter will be set based on whether we're running on Jenkins.
 reduce_log_output=""
 
 resolve_java_dependencies=false
 
+run_cmake_unit_tests=false
+
+export YB_DOWNLOAD_THIRDPARTY=${YB_DOWNLOAD_THIRDPARTY:-1}
 export YB_HOST_FOR_RUNNING_TESTS=${YB_HOST_FOR_RUNNING_TESTS:-}
 
 export YB_EXTRA_GTEST_FLAGS=""
@@ -682,6 +685,8 @@ while [[ $# -gt 0 ]]; do
     ;;
     --clean-thirdparty)
       clean_thirdparty=true
+      is_clean_build=true
+      clean_before_build=true
     ;;
     -f|--force|-y)
       force=true
@@ -698,6 +703,15 @@ while [[ $# -gt 0 ]]; do
     --gcc8)
       YB_COMPILER_TYPE="gcc8"
     ;;
+    --gcc9)
+      YB_COMPILER_TYPE="gcc9"
+    ;;
+    --clang10)
+      YB_COMPILER_TYPE="clang10"
+    ;;
+    --clang11)
+      YB_COMPILER_TYPE="clang11"
+    ;;
     --zapcc)
       YB_COMPILER_TYPE="zapcc"
     ;;
@@ -706,9 +720,6 @@ while [[ $# -gt 0 ]]; do
     ;;
     --run-java-tests|--java-tests)
       run_java_tests=true
-    ;;
-    --static)
-      YB_LINK=static
     ;;
     --save-log)
       save_log=true
@@ -743,12 +754,6 @@ while [[ $# -gt 0 ]]; do
     ;;
     --no-rebuild-thirdparty|--nrtp|--nr3p|--nbtp|--nb3p)
       export NO_REBUILD_THIRDPARTY=1
-    ;;
-    --use-nfs-shared-thirdparty)
-      use_nfs_shared_thirdparty=true
-    ;;
-    --no-nfs-shared-thirdparty)
-      no_nfs_shared_thirdparty=true
     ;;
     --show-compiler-cmd-line|--sccl)
       export YB_SHOW_COMPILER_COMMAND_LINE=1
@@ -819,9 +824,7 @@ while [[ $# -gt 0 ]]; do
     ;;
     --remote)
       export YB_REMOTE_COMPILATION=1
-      if [[ ! -f "$YB_BUILD_WORKERS_FILE" ]]; then
-        fatal "--remote specified but $YB_BUILD_WORKERS_FILE not found"
-      fi
+      get_build_worker_list
     ;;
     --no-remote)
       export YB_REMOTE_COMPILATION=0
@@ -939,8 +942,8 @@ while [[ $# -gt 0 ]]; do
     ;;
     --tp|--test-parallelism)
       ensure_option_has_arg "$@"
-      test_parallelism=$2
-      validate_numeric_arg_range "test-parallelism" "$test_parallelism" \
+      YB_TEST_PARALLELISM=$2
+      validate_numeric_arg_range "test-parallelism" "$YB_TEST_PARALLELISM" \
         "$MIN_REPEATED_TEST_PARALLELISM" "$MAX_REPEATED_TEST_PARALLELISM"
       shift
     ;;
@@ -992,6 +995,9 @@ while [[ $# -gt 0 ]]; do
     --download-thirdparty|--dltp)
       export YB_DOWNLOAD_THIRDPARTY=1
     ;;
+    --no-download-thirdparty|--ndltp)
+      export YB_DOWNLOAD_THIRDPARTY=0
+    ;;
     --super-bash-debug)
       # From https://wiki-dev.bash-hackers.org/scripting/debuggingtips
       export PS4='+(${BASH_SOURCE}:${LINENO}): ${FUNCNAME[0]:+${FUNCNAME[0]}(): }'
@@ -1004,7 +1010,14 @@ while [[ $# -gt 0 ]]; do
     --resolve-java-dependencies)
       resolve_java_dependencies=true
     ;;
+    --no-tests)
+      export YB_DO_NOT_BUILD_TESTS=1
+    ;;
+    --cmake-unit-tests)
+      run_cmake_unit_tests=true
+    ;;
     *)
+
       if [[ $1 =~ ^(YB_[A-Z0-9_]+|postgres_FLAGS_[a-zA-Z0-9_]+)=(.*)$ ]]; then
         env_var_name=${BASH_REMATCH[1]}
         # Use "the ultimate fix" from http://bit.ly/setenvvar to set a variable with the name stored
@@ -1028,14 +1041,26 @@ done
 # Finished parsing command-line arguments, post-processing them.
 # -------------------------------------------------------------------------------------------------
 
+if "$run_cmake_unit_tests"; then
+  # We don't even need the build root for these kinds of tests.
+  log "--cmake-unit-tests specified, only running CMake tests"
+  run_cmake_unit_tests
+
+  exit
+fi
+
 update_submodules
 
 if [[ -n $YB_GTEST_FILTER && -z $cxx_test_name ]]; then
   test_name=${YB_GTEST_FILTER%%.*}
+  # Fix tests with non standard naming.
+  if [[ $test_name == "CppCassandraDriverTest" ]]; then
+    test_name="cassandracppdrivertest";
+  fi
   set_cxx_test_name "GTEST_${test_name,,}"
 fi
 
-set_use_ninja
+decide_whether_to_use_ninja
 handle_predefined_build_root
 
 unset cmake_opts
@@ -1100,11 +1125,6 @@ fi
 if [[ ${YB_SKIP_BUILD:-} == "1" ]]; then
   log "YB_SKIP_BUILD is set, skipping all types of compilation"
   set_flags_to_skip_build
-fi
-
-if "$use_nfs_shared_thirdparty" && "$no_nfs_shared_thirdparty"; then
-  fatal "--use-nfs-shared-thirdparty and --no-nfs-shared-thirdparty cannot be specified" \
-        "at the same time"
 fi
 
 configure_remote_compilation
@@ -1178,9 +1198,8 @@ if "$verbose"; then
 fi
 
 set_build_root
-
 find_or_download_thirdparty
-detect_brew
+detect_toolchain
 find_make_or_ninja_and_update_cmake_opts
 
 if ! using_default_thirdparty_dir && [[ ${NO_REBUILD_THIRDPARTY:-0} != "1" ]]; then
@@ -1282,7 +1301,7 @@ if "$no_ccache"; then
 fi
 
 if "$no_tcmalloc"; then
-  cmake_opts+=( -DYB_TCMALLOC_AVAILABLE=0 )
+  cmake_opts+=( -DYB_TCMALLOC_ENABLED=0 )
 fi
 
 detect_num_cpus_and_set_make_parallelism
@@ -1295,15 +1314,18 @@ add_brew_bin_to_path
 
 create_build_descriptor_file
 
+create_build_root_file
+
 if [[ ${#make_targets[@]} -eq 0 && -n $java_test_name ]]; then
   # Only build yb-master / yb-tserver / postgres when we're only trying to run a Java test.
   make_targets+=( yb-master yb-tserver postgres )
 fi
 
 if [[ $build_type == "compilecmds" ]]; then
-  if [[ ${#make_targets[@]} -gt 0 ]]; then
-    fatal "Cannot specify custom Make targets for the 'compilecmds' build type, got: " \
-          "${make_targets[*]}"
+  if [[ ${#make_targets[@]} -eq 0 ]]; then
+    make_targets+=( gen_proto postgres yb_bfpg yb_bfql ql_parser_flex_bison_output)
+  else
+    log "Custom targets specified for a compilecmds build, not adding default targets"
   fi
   # We need to add anything that generates header files:
   # - Protobuf
@@ -1313,7 +1335,6 @@ if [[ $build_type == "compilecmds" ]]; then
   #
   # Also we need to add postgres as a dependency, because it goes through the build_postgres.py
   # script and that is where the top-level combined compile_commands.json file is created.
-  make_targets+=( gen_proto postgres yb_bfpg yb_bfql ql_parser_flex_bison_output)
   build_java=false
 fi
 

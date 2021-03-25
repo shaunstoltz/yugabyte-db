@@ -73,7 +73,7 @@ set(ROCKSDB_SRCS
     db/write_controller.cc
     db/write_thread.cc
     db/xfunc_test_points.cc
-    memtable/hash_cuckoo_rep.cc
+    db/db_iterator_wrapper.cc
     memtable/hash_linklist_rep.cc
     memtable/hash_skiplist_rep.cc
     memtable/skiplistrep.cc
@@ -90,9 +90,6 @@ set(ROCKSDB_SRCS
     table/block_hash_index.cc
     table/block_prefix_index.cc
     table/bloom_block.cc
-    table/cuckoo_table_builder.cc
-    table/cuckoo_table_factory.cc
-    table/cuckoo_table_reader.cc
     table/flush_block_policy.cc
     table/format.cc
     table/fixed_size_filter_block.cc
@@ -135,7 +132,6 @@ set(ROCKSDB_SRCS
     util/histogram.cc
     util/instrumented_mutex.cc
     util/timeout_error.cc
-    utilities/backupable/backupable_db.cc
     utilities/convenience/info_log_finder.cc
     utilities/checkpoint/checkpoint.cc
     utilities/compaction_filters/remove_emptyvalue_compactionfilter.cc
@@ -184,11 +180,6 @@ set(ROCKSDB_SRCS
     util/statistics.cc
     util/sync_point.cc
     util/thread_local.cc
-    util/thread_status_impl.cc
-    util/thread_status_updater.cc
-    util/thread_status_updater_debug.cc
-    util/thread_status_util.cc
-    util/thread_status_util_debug.cc
     util/xfunc.cc
     util/xxhash.cc
     ${ROCKSDB_PROTO_SRCS}
@@ -208,17 +199,12 @@ if (NOT APPLE)
   set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -DROCKSDB_FALLOCATE_PRESENT")
 endif()
 
-if (${YB_USE_TSAN})
-  set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -DROCKSDB_TSAN_RUN")
-endif()
-
-if (${YB_USE_ASAN})
+if ("${YB_BUILD_TYPE}" STREQUAL "asan")
   set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -DROCKSDB_MALLOC_USABLE_SIZE")
 endif()
 
 add_library(rocksdb ${ROCKSDB_SRCS})
-cotire(rocksdb)
-target_link_libraries(rocksdb gflags gutil snappy bz2 z yb_common yb_util opid_proto)
+target_link_libraries(rocksdb gflags gutil snappy z yb_common yb_util opid_proto)
 
 add_library(rocksdb_tools
   tools/ldb_cmd.cc
@@ -252,11 +238,8 @@ target_link_libraries(db_bench rocksdb)
 ADD_YB_ROCKSDB_TOOL(db_sanity_test)
 ADD_YB_ROCKSDB_TOOL(db_stress)
 ADD_YB_ROCKSDB_TOOL(write_stress)
-ADD_YB_ROCKSDB_TOOL(ldb)
 ADD_YB_ROCKSDB_TOOL(db_repl_stress)
 target_link_libraries(db_repl_stress rocksdb_test_util)
-add_executable(rocksdb_dump tools/dump/rocksdb_dump.cc)
-target_link_libraries(rocksdb_dump rocksdb_tools)
 add_executable(rocksdb_undump tools/dump/rocksdb_undump.cc)
 target_link_libraries(rocksdb_undump rocksdb_tools)
 
@@ -292,6 +275,7 @@ ADD_YB_TEST(table/fixed_size_filter_block_test)
 ADD_YB_TEST(table/merger_test)
 ADD_YB_TEST(table/table_test)
 ADD_YB_TEST(tools/sst_dump_test)
+YB_TEST_TARGET_LINK_LIBRARIES(sst_dump_test rocksdb_tools)
 ADD_YB_TEST(util/arena_test)
 ADD_YB_TEST(util/autovector_test)
 ADD_YB_TEST(util/bloom_test)
@@ -308,7 +292,6 @@ ADD_YB_TEST(util/mock_env_test)
 ADD_YB_TEST(util/options_test)
 ADD_YB_TEST(util/rate_limiter_test)
 ADD_YB_TEST(util/slice_transform_test)
-ADD_YB_TEST(util/thread_list_test)
 ADD_YB_TEST(utilities/document/document_db_test)
 ADD_YB_TEST(utilities/document/json_document_test)
 ADD_YB_TEST(utilities/geodb/geodb_test)
@@ -321,17 +304,12 @@ ADD_YB_TEST(utilities/transactions/optimistic_transaction_test)
 ADD_YB_TEST(utilities/ttl/ttl_test)
 ADD_YB_TEST(utilities/write_batch_with_index/write_batch_with_index_test)
 
-if(NOT NO_TESTS)
-  target_link_libraries(sst_dump_test rocksdb_tools)
-endif()
-
 if (NOT "${CMAKE_BUILD_TYPE}" STREQUAL "RELEASE")
 ADD_YB_TEST(db/auto_roll_logger_test)
 ADD_YB_TEST(db/column_family_test)
 ADD_YB_TEST(db/compact_files_test)
 ADD_YB_TEST(db/compaction_job_stats_test)
 ADD_YB_TEST(db/corruption_test)
-ADD_YB_TEST(db/cuckoo_table_db_test)
 ADD_YB_TEST(db/db_block_cache_test)
 ADD_YB_TEST(db/db_bloom_filter_test)
 ADD_YB_TEST(db/db_compaction_filter_test)
@@ -355,19 +333,13 @@ ADD_YB_TEST(db/listener_test)
 ADD_YB_TEST(db/plain_table_db_test)
 ADD_YB_TEST(db/version_edit_test)
 ADD_YB_TEST(db/write_callback_test)
-ADD_YB_TEST(table/cuckoo_table_builder_test)
-ADD_YB_TEST(table/cuckoo_table_reader_test)
 ADD_YB_TEST(tools/ldb_cmd_test)
 ADD_YB_TEST(tools/reduce_levels_test)
+YB_TEST_TARGET_LINK_LIBRARIES(reduce_levels_test rocksdb_tools)
 ADD_YB_TEST(util/delete_scheduler_test)
 ADD_YB_TEST(util/thread_local_test)
-ADD_YB_TEST(utilities/backupable/backupable_db_test)
 ADD_YB_TEST(utilities/checkpoint/checkpoint_test)
 ADD_YB_TEST(utilities/memory/memory_test)
 ADD_YB_TEST(utilities/transactions/transaction_test)
-
-if(NOT NO_TESTS)
-  target_link_libraries(reduce_levels_test rocksdb_tools)
-endif()
 
 endif()

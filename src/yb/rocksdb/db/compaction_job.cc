@@ -70,7 +70,6 @@
 #include "yb/rocksdb/util/perf_context_imp.h"
 #include "yb/rocksdb/util/stop_watch.h"
 #include "yb/rocksdb/util/sync_point.h"
-#include "yb/rocksdb/util/thread_status_util.h"
 
 #include "yb/util/stats/iostats_context_imp.h"
 #include "yb/util/string_util.h"
@@ -263,57 +262,24 @@ CompactionJob::CompactionJob(
       measure_io_stats_(measure_io_stats) {
   assert(log_buffer_ != nullptr);
   const auto* cfd = compact_->compaction->column_family_data();
-  ThreadStatusUtil::SetColumnFamily(cfd, cfd->ioptions()->env,
-                                    cfd->options()->enable_thread_tracking);
-  ThreadStatusUtil::SetThreadOperation(ThreadStatus::OP_COMPACTION);
   ReportStartedCompaction(compaction);
 }
 
 CompactionJob::~CompactionJob() {
   assert(compact_ == nullptr);
-  ThreadStatusUtil::ResetThreadStatus();
 }
 
 void CompactionJob::ReportStartedCompaction(
     Compaction* compaction) {
   const auto* cfd = compact_->compaction->column_family_data();
-  ThreadStatusUtil::SetColumnFamily(cfd, cfd->ioptions()->env,
-                                    cfd->options()->enable_thread_tracking);
-
-  ThreadStatusUtil::SetThreadOperationProperty(
-      ThreadStatus::COMPACTION_JOB_ID,
-      job_id_);
-
-  ThreadStatusUtil::SetThreadOperationProperty(
-      ThreadStatus::COMPACTION_INPUT_OUTPUT_LEVEL,
-      (static_cast<uint64_t>(compact_->compaction->start_level()) << 32) +
-          compact_->compaction->output_level());
 
   // In the current design, a CompactionJob is always created
   // for non-trivial compaction.
   assert(compaction->IsTrivialMove() == false ||
          compaction->is_manual_compaction() == true);
 
-  ThreadStatusUtil::SetThreadOperationProperty(
-      ThreadStatus::COMPACTION_PROP_FLAGS,
-      compaction->is_manual_compaction() +
-          (compaction->deletion_compaction() << 1));
-
-  ThreadStatusUtil::SetThreadOperationProperty(
-      ThreadStatus::COMPACTION_TOTAL_INPUT_BYTES,
-      compaction->CalculateTotalInputSize());
-
   IOSTATS_RESET(bytes_written);
   IOSTATS_RESET(bytes_read);
-  ThreadStatusUtil::SetThreadOperationProperty(
-      ThreadStatus::COMPACTION_BYTES_WRITTEN, 0);
-  ThreadStatusUtil::SetThreadOperationProperty(
-      ThreadStatus::COMPACTION_BYTES_READ, 0);
-
-  // Set the thread operation after operation properties
-  // to ensure GetThreadList() can always show them all together.
-  ThreadStatusUtil::SetThreadOperation(
-      ThreadStatus::OP_COMPACTION);
 
   if (compaction_job_stats_) {
     compaction_job_stats_->is_manual_compaction =
@@ -322,9 +288,6 @@ void CompactionJob::ReportStartedCompaction(
 }
 
 void CompactionJob::Prepare() {
-  AutoThreadOperationStageUpdater stage_updater(
-      ThreadStatus::STAGE_COMPACTION_PREPARE);
-
   // Generate file_levels_ for compaction berfore making Iterator
   auto* c = compact_->compaction;
   assert(c->column_family_data() != nullptr);
@@ -480,8 +443,6 @@ void CompactionJob::GenSubcompactionBoundaries() {
 }
 
 Result<FileNumbersHolder> CompactionJob::Run() {
-  AutoThreadOperationStageUpdater stage_updater(
-      ThreadStatus::STAGE_COMPACTION_RUN);
   TEST_SYNC_POINT("CompactionJob::Run():Start");
   log_buffer_->FlushBufferToLog();
   LogCompaction();
@@ -550,8 +511,6 @@ Result<FileNumbersHolder> CompactionJob::Run() {
 }
 
 Status CompactionJob::Install(const MutableCFOptions& mutable_cf_options) {
-  AutoThreadOperationStageUpdater stage_updater(
-      ThreadStatus::STAGE_COMPACTION_INSTALL);
   db_mutex_->AssertHeld();
   Status status = compact_->status;
   ColumnFamilyData* cfd = compact_->compaction->column_family_data();
@@ -629,9 +588,6 @@ void CompactionJob::ProcessKeyValueCompaction(
   std::unique_ptr<InternalIterator> input(
       versions_->MakeInputIterator(sub_compact->compaction));
 
-  AutoThreadOperationStageUpdater stage_updater(
-      ThreadStatus::STAGE_COMPACTION_PROCESS_KV);
-
   // I/O measurement variables
   PerfLevel prev_perf_level = PerfLevel::kEnableTime;
   const uint64_t kRecordStatsEvery = 1000;
@@ -686,7 +642,7 @@ void CompactionJob::ProcessKeyValueCompaction(
   Status status;
   sub_compact->c_iter.reset(new CompactionIterator(
       input.get(), cfd->user_comparator(), &merge, versions_->LastSequence(),
-      &existing_snapshots_, earliest_write_conflict_snapshot_, env_, false,
+      &existing_snapshots_, earliest_write_conflict_snapshot_, false,
       sub_compact->compaction, compaction_filter));
   auto c_iter = sub_compact->c_iter.get();
   c_iter->SeekToFirst();
@@ -765,8 +721,6 @@ void CompactionJob::ProcessKeyValueCompaction(
   sub_compact->compaction_job_stats.total_input_raw_value_bytes +=
       c_iter_stats.total_input_raw_value_bytes;
 
-  RecordTick(stats_, FILTER_OPERATION_TOTAL_TIME,
-             c_iter_stats.total_filter_time);
   RecordDroppedKeys(c_iter_stats, &sub_compact->compaction_job_stats);
   RecordCompactionIOStats();
 
@@ -799,6 +753,9 @@ void CompactionJob::ProcessKeyValueCompaction(
   sub_compact->c_iter.reset();
   input.reset();
   sub_compact->status = status;
+  if (compaction_filter) {
+    compaction_filter->CompactionFinished();
+  }
 }
 
 void CompactionJob::RecordDroppedKeys(
@@ -840,8 +797,6 @@ void CompactionJob::CloseFile(Status* status, std::unique_ptr<WritableFileWriter
 
 Status CompactionJob::FinishCompactionOutputFile(
     const Status& input_status, SubcompactionState* sub_compact) {
-  AutoThreadOperationStageUpdater stage_updater(
-      ThreadStatus::STAGE_COMPACTION_SYNC_FILE);
   assert(sub_compact != nullptr);
   assert(sub_compact->base_outfile);
   const bool is_split_sst = sub_compact->compaction->column_family_data()->ioptions()
@@ -987,12 +942,8 @@ Status CompactionJob::InstallCompactionResults(
 
 void CompactionJob::RecordCompactionIOStats() {
   RecordTick(stats_, COMPACT_READ_BYTES, IOSTATS(bytes_read));
-  ThreadStatusUtil::IncreaseThreadOperationProperty(
-      ThreadStatus::COMPACTION_BYTES_READ, IOSTATS(bytes_read));
   IOSTATS_RESET(bytes_read);
   RecordTick(stats_, COMPACT_WRITE_BYTES, IOSTATS(bytes_written));
-  ThreadStatusUtil::IncreaseThreadOperationProperty(
-      ThreadStatus::COMPACTION_BYTES_WRITTEN, IOSTATS(bytes_written));
   IOSTATS_RESET(bytes_written);
 }
 

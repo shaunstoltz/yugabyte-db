@@ -22,13 +22,13 @@
 #include "yb/gutil/strings/substitute.h"
 #include "yb/rocksutil/yb_rocksdb.h"
 #include "yb/util/bytes_formatter.h"
+#include "yb/util/net/net_util.h"
 #include "yb/util/test_macros.h"
 #include "yb/util/test_util.h"
 
 using std::unique_ptr;
 using strings::Substitute;
 using yb::util::ApplyEagerLineContinuation;
-using yb::FormatBytesAsStr;
 using yb::FormatSliceAsStr;
 using rocksdb::FilterBitsBuilder;
 using rocksdb::FilterBitsReader;
@@ -259,10 +259,9 @@ TEST_F(DocKeyTest, TestDocKeyEncoding) {
                I\x80\x00\x00\x00\x00\x00\x07\xd0\
                !"
           )#"),
-      FormatBytesAsStr(DocKey(PrimitiveValues("val1", 1000, "val2", 2000)).Encode().data()));
+      FormatSliceAsStr(DocKey(PrimitiveValues("val1", 1000, "val2", 2000)).Encode().AsSlice()));
 
-  InetAddress addr;
-  ASSERT_OK(addr.FromString("1.2.3.4"));
+  InetAddress addr(ASSERT_RESULT(ParseIpAddress("1.2.3.4")));
 
   // To get a descending sorting, we store the negative of a decimal type. 100.2 gets converted to
   // -100.2 which in the encoded form is equal to \x1c\xea\xfe\xd7.
@@ -279,7 +278,7 @@ TEST_F(DocKeyTest, TestDocKeyEncoding) {
              E\xdd\x14\
              !"
           )#"),
-      FormatBytesAsStr(DocKey({
+      FormatSliceAsStr(DocKey({
           PrimitiveValue("val1", SortOrder::kDescending),
           PrimitiveValue(1000),
           PrimitiveValue(1000, SortOrder::kDescending),
@@ -290,7 +289,7 @@ TEST_F(DocKeyTest, TestDocKeyEncoding) {
                                   SortOrder::kDescending),
           PrimitiveValue::Decimal(util::Decimal("0.001").EncodeToComparable(),
                                   SortOrder::kAscending),
-                              }).Encode().data()));
+                              }).Encode().AsSlice()));
 
   ASSERT_STR_EQ_VERBOSE_TRIMMED(
       ApplyEagerLineContinuation(
@@ -304,10 +303,10 @@ TEST_F(DocKeyTest, TestDocKeyEncoding) {
                Srange2\x00\x00\
                I\x80\x00\x00\x00\x00\x00\x07\xd0\
                !")#"),
-      FormatBytesAsStr(DocKey(
+      FormatSliceAsStr(DocKey(
           0xcafe,
           PrimitiveValues("hashed1", "hashed2"),
-          PrimitiveValues("range1", 1000, "range2", 2000)).Encode().data()));
+          PrimitiveValues("range1", 1000, "range2", 2000)).Encode().AsSlice()));
 }
 
 TEST_F(DocKeyTest, TestBasicSubDocKeyEncodingDecoding) {
@@ -332,7 +331,7 @@ TEST_F(DocKeyTest, TestBasicSubDocKeyEncodingDecoding) {
   SubDocKey decoded_subdoc_key;
   ASSERT_OK(decoded_subdoc_key.FullyDecodeFrom(encoded_subdoc_key.AsSlice()));
   ASSERT_EQ(subdoc_key, decoded_subdoc_key);
-  Slice source = encoded_subdoc_key.data();
+  Slice source = encoded_subdoc_key.AsSlice();
   boost::container::small_vector<Slice, 20> slices;
   ASSERT_OK(SubDocKey::PartiallyDecode(&source, &slices));
   const DocKey& dockey = subdoc_key.doc_key();
@@ -393,8 +392,8 @@ TEST_F(DocKeyTest, TestSubDocKeyStartsWith) {
 std::string EncodeSubDocKey(const std::string& hash_key,
     const std::string& range_key, const std::string& sub_key, uint64_t time) {
   DocKey dk(DocKey(0, PrimitiveValues(hash_key), PrimitiveValues(range_key)));
-  return SubDocKey(dk, PrimitiveValue(sub_key),
-      HybridTime::FromMicros(time)).Encode().AsStringRef();
+  return SubDocKey(
+      dk, PrimitiveValue(sub_key), HybridTime::FromMicros(time)).Encode().ToStringBuffer();
 }
 
 std::string EncodeSimpleSubDocKey(const std::string& hash_key) {
@@ -406,7 +405,7 @@ std::string EncodeSimpleSubDocKeyWithDifferentNonHashPart(const std::string& has
 }
 
 TEST_F(DocKeyTest, TestKeyMatching) {
-  DocDbAwareFilterPolicy policy(rocksdb::FilterPolicy::kDefaultFixedSizeFilterBits, nullptr);
+  DocDbAwareV2FilterPolicy policy(rocksdb::FilterPolicy::kDefaultFixedSizeFilterBits, nullptr);
   std::string keys[] = { "foo", "bar", "test" };
   std::string absent_key = "fake";
 
@@ -441,12 +440,13 @@ TEST_F(DocKeyTest, TestWriteId) {
 
 struct CollectedIntent {
   IntentStrength strength;
+  FullDocKey full_doc_key;
   KeyBytes intent_key;
   Slice value;
 
   std::string ToString() const {
-    return Format("{ strength: $0 intent_key: $1 value: $2 }",
-                  strength, SubDocKey::DebugSliceToString(intent_key.AsSlice()),
+    return Format("{ strength: $0 full_doc_key: $1 intent_key: $2 value: $3 }",
+                  strength, full_doc_key, SubDocKey::DebugSliceToString(intent_key.AsSlice()),
                   value.ToDebugHexString());
   }
 };
@@ -455,8 +455,14 @@ class IntentCollector {
  public:
   explicit IntentCollector(std::vector<CollectedIntent>* out) : out_(out) {}
 
-  Status operator()(IntentStrength strength, Slice value, KeyBytes* key, LastKey) {
-    out_->push_back({strength, *key, value});
+  Status operator()(
+      IntentStrength strength, FullDocKey full_doc_key, Slice value, KeyBytes* key, LastKey) {
+    out_->push_back(CollectedIntent{
+      .strength = strength,
+      .full_doc_key = full_doc_key,
+      .intent_key = *key,
+      .value = value
+    });
     return Status::OK();
   }
 
@@ -707,6 +713,7 @@ TEST_F(DocKeyTest, TestEnumerateIntents) {
         }
         VLOG(1) << "Subkeys match: " << (a.subkeys() == b.subkeys());
 
+        ASSERT_EQ(intent.full_doc_key, a.doc_key() == sub_doc_key.doc_key());
         ASSERT_EQ(expected_intents[i], decoded_intent_key);
         if (i < num_intents - 1) {
           ASSERT_EQ(IntentStrength::kWeak, intent.strength);

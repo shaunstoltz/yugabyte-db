@@ -10,29 +10,26 @@
 
 package com.yugabyte.yw.commissioner.tasks;
 
-import com.yugabyte.yw.commissioner.SubTaskGroup;
+import com.yugabyte.yw.commissioner.Common.CloudType;
 import com.yugabyte.yw.commissioner.SubTaskGroupQueue;
 import com.yugabyte.yw.commissioner.UserTaskDetails.SubTaskGroupType;
-import com.yugabyte.yw.commissioner.tasks.UniverseDefinitionTaskBase.ServerType;
-import com.yugabyte.yw.commissioner.tasks.UpgradeUniverse.UpgradeTaskType;
-import com.yugabyte.yw.commissioner.tasks.UpgradeUniverse.UpgradeTaskSubType;
 import com.yugabyte.yw.commissioner.tasks.params.NodeTaskParams;
-import com.yugabyte.yw.commissioner.tasks.subtasks.ChangeMasterConfig;
-import com.yugabyte.yw.commissioner.tasks.subtasks.ModifyBlackList;
-import com.yugabyte.yw.commissioner.tasks.subtasks.WaitForDataMove;
-import com.yugabyte.yw.commissioner.tasks.subtasks.WaitForLoadBalance;
 import com.yugabyte.yw.common.DnsManager;
-import com.yugabyte.yw.common.PlacementInfoUtil;
+import com.yugabyte.yw.forms.UniverseDefinitionTaskParams.Cluster;
 import com.yugabyte.yw.forms.UniverseDefinitionTaskParams.UserIntent;
+import com.yugabyte.yw.models.NodeInstance;
 import com.yugabyte.yw.models.Universe;
 import com.yugabyte.yw.models.helpers.NodeDetails;
 import com.yugabyte.yw.models.helpers.NodeDetails.NodeState;
 
+import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Collection;
-import java.util.HashSet;
+import java.util.Collections;
+import java.util.HashMap;
 import java.util.List;
-import java.util.Set;
+import java.util.Map;
+import java.util.UUID;
 
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -54,8 +51,10 @@ public class AddNodeToUniverse extends UniverseDefinitionTaskBase {
     LOG.info("Started {} task for node {} in univ uuid={}", getName(),
              taskParams().nodeName, taskParams().universeUUID);
     NodeDetails currentNode = null;
-    boolean hitException = false;
+    String errorString = null;
+
     try {
+      checkUniverseVersion();
       // Create the task list sequence.
       subTaskGroupQueue = new SubTaskGroupQueue(userTaskUUID);
 
@@ -77,132 +76,153 @@ public class AddNodeToUniverse extends UniverseDefinitionTaskBase {
         throw new RuntimeException(msg);
       }
 
-      // Update Node State to being added.
-      createSetNodeStateTask(currentNode, NodeState.Adding)
-          .setSubTaskGroupType(SubTaskGroupType.StartingNode);
+      Cluster cluster = taskParams().getClusterByUuid(currentNode.placementUuid);
+      Collection<NodeDetails> node = Collections.singletonList(currentNode);
 
-      Collection<NodeDetails> node = new HashSet<NodeDetails>(Arrays.asList(currentNode));
-
-      // First spawn an instance for Decommissioned node.
       boolean wasDecommissioned = currentNode.state == NodeState.Decommissioned;
-      if (wasDecommissioned) {
-        createSetupServerTasks(node)
-            .setSubTaskGroupType(SubTaskGroupType.Provisioning);
+      // For onprem universes, allocate an available node
+      // from the provider's node_instance table.
+      if (wasDecommissioned && cluster.userIntent.providerType.equals(CloudType.onprem)) {
+          Map<UUID, List<String>> onpremAzToNodes = new HashMap<UUID, List<String>>();
+          List<String> nodeNameList = new ArrayList<>();
+          nodeNameList.add(currentNode.nodeName);
+          onpremAzToNodes.put(currentNode.azUuid, nodeNameList);
+          String instanceType = currentNode.cloudInfo.instance_type;
 
-        createServerInfoTasks(node)
-            .setSubTaskGroupType(SubTaskGroupType.Provisioning);
+          Map<String, NodeInstance> nodeMap = NodeInstance.pickNodes(onpremAzToNodes, instanceType);
+          currentNode.nodeUuid = nodeMap.get(currentNode.nodeName).nodeUuid;
       }
 
-      // Bring up any masters, as needed.
-      boolean masterAdded = false;
-      if (areMastersUnderReplicated(currentNode, universe)) {
-        // Configures the master to start in shell mode.
+      NodeTaskParams nodeParams = new NodeTaskParams();
+      UserIntent userIntent = taskParams().getClusterByUuid(currentNode.placementUuid).userIntent;
+      nodeParams.nodeName = currentNode.nodeName;
+      nodeParams.deviceInfo = userIntent.deviceInfo;
+      nodeParams.azUuid = currentNode.azUuid;
+      nodeParams.universeUUID = taskParams().universeUUID;
+      nodeParams.extraDependencies.installNodeExporter =
+        taskParams().extraDependencies.installNodeExporter;
+
+      String preflightStatus = performPreflightCheck(currentNode, nodeParams);
+      if (preflightStatus != null) {
+        Map<NodeInstance, String> failedNodes = new HashMap<>();
+        failedNodes.put(NodeInstance.getByName(currentNode.nodeName), preflightStatus);
+        createFailedPrecheckTask(failedNodes)
+          .setSubTaskGroupType(SubTaskGroupType.PreflightChecks);
+        errorString = "Preflight checks failed.";
+      } else {
+        // Update Node State to being added.
+        createSetNodeStateTask(currentNode, NodeState.Adding)
+            .setSubTaskGroupType(SubTaskGroupType.StartingNode);
+
+        // First spawn an instance for Decommissioned node.
+        if (wasDecommissioned) {
+            createSetupServerTasks(node)
+                .setSubTaskGroupType(SubTaskGroupType.Provisioning);
+
+            createServerInfoTasks(node)
+                .setSubTaskGroupType(SubTaskGroupType.Provisioning);
+        }
+
+        // Re-install software.
         // TODO: Remove the need for version for existing instance, NodeManger needs changes.
         createConfigureServerTasks(node, true /* isShell */)
             .setSubTaskGroupType(SubTaskGroupType.InstallingSoftware);
 
-        createGFlagsOverrideTasks(node, ServerType.MASTER);
+        // Set default gflags
+        addDefaultGFlags(cluster.userIntent);
 
-        // Start a shell master process.
-        createStartMasterTasks(node)
+        // All necessary nodes are created. Data moving will coming soon.
+        createSetNodeStateTasks(node, NodeDetails.NodeState.ToJoinCluster)
+            .setSubTaskGroupType(SubTaskGroupType.Provisioning);
+
+        // Bring up any masters, as needed.
+        boolean masterAdded = false;
+        if (areMastersUnderReplicated(currentNode, universe)) {
+            LOG.info(
+            "Bringing up master for under replicated universe {} ({})",
+            universe.universeUUID, universe.name
+            );
+            // Set gflags for master.
+            createGFlagsOverrideTasks(node, ServerType.MASTER);
+
+            // Start a shell master process.
+            createStartMasterTasks(node)
+                .setSubTaskGroupType(SubTaskGroupType.StartingNodeProcesses);
+
+            // Mark node as a master in YW DB.
+            // Do this last so that master addresses does not pick up current node.
+            createUpdateNodeProcessTask(taskParams().nodeName, ServerType.MASTER, true)
+                .setSubTaskGroupType(SubTaskGroupType.StartingNodeProcesses);
+
+            // Wait for master to be responsive.
+            createWaitForServersTasks(node, ServerType.MASTER)
+                .setSubTaskGroupType(SubTaskGroupType.ConfigureUniverse);
+
+            // Add it into the master quorum.
+            createChangeConfigTask(currentNode, true, SubTaskGroupType.WaitForDataMigration);
+
+            masterAdded = true;
+        }
+
+        // Set gflags for the tserver.
+        createGFlagsOverrideTasks(node, ServerType.TSERVER);
+
+        // Add the tserver process start task.
+        createTServerTaskForNode(currentNode, "start")
             .setSubTaskGroupType(SubTaskGroupType.StartingNodeProcesses);
 
-        // Mark node as a master in YW DB.
-        // Do this last so that master addresses does not pick up current node.
-        createUpdateNodeProcessTask(taskParams().nodeName, ServerType.MASTER, true)
+        // Mark the node as tserver in the YW DB.
+        createUpdateNodeProcessTask(taskParams().nodeName, ServerType.TSERVER, true)
             .setSubTaskGroupType(SubTaskGroupType.StartingNodeProcesses);
 
-        // Wait for master to be responsive.
-        createWaitForServersTasks(node, ServerType.MASTER)
+        // Wait for new tablet servers to be responsive.
+        createWaitForServersTasks(node, ServerType.TSERVER)
             .setSubTaskGroupType(SubTaskGroupType.ConfigureUniverse);
 
-        // Add it into the master quorum.
-        createChangeConfigTask(currentNode, true, SubTaskGroupType.WaitForDataMigration);
+        // Update the swamper target file.
+        createSwamperTargetUpdateTask(false /* removeFile */);
 
-        masterAdded = true;
+        // Clear the host from master's blacklist.
+        if (currentNode.state == NodeState.Removed) {
+            createModifyBlackListTask(Arrays.asList(currentNode), false /* isAdd */)
+                .setSubTaskGroupType(SubTaskGroupType.ConfigureUniverse);
+        }
+
+        // Wait for load to balance.
+        createWaitForLoadBalanceTask()
+            .setSubTaskGroupType(SubTaskGroupType.WaitForDataMigration);
+
+        // Update all tserver conf files with new master information.
+        if (masterAdded) {
+            createMasterInfoUpdateTask(universe, currentNode);
+        }
+
+        // Update node state to live.
+        createSetNodeStateTask(currentNode, NodeState.Live)
+            .setSubTaskGroupType(SubTaskGroupType.StartingNode);
+
+        if (wasDecommissioned) {
+            // Update the DNS entry for this universe.
+            createDnsManipulationTask(DnsManager.DnsCommandType.Edit, false,
+                                      userIntent.providerType, userIntent.provider,
+                                      userIntent.universeName)
+                .setSubTaskGroupType(SubTaskGroupType.ConfigureUniverse);
+        }
+
+        // Mark universe task state to success.
+        createMarkUniverseUpdateSuccessTasks()
+            .setSubTaskGroupType(SubTaskGroupType.StartingNode);
       }
-
-      // Configure so that this tserver picks all the master nodes.
-      createConfigureServerTasks(node, false /* isShell */)
-          .setSubTaskGroupType(SubTaskGroupType.InstallingSoftware);
-
-      createGFlagsOverrideTasks(node, ServerType.TSERVER);
-
-      // Add the tserver process start task.
-      createTServerTaskForNode(currentNode, "start")
-          .setSubTaskGroupType(SubTaskGroupType.StartingNodeProcesses);
-
-      // Mark the node as tserver in the YW DB.
-      createUpdateNodeProcessTask(taskParams().nodeName, ServerType.TSERVER, true)
-          .setSubTaskGroupType(SubTaskGroupType.StartingNodeProcesses);
-
-      // Wait for new tablet servers to be responsive.
-      createWaitForServersTasks(node, ServerType.TSERVER)
-          .setSubTaskGroupType(SubTaskGroupType.ConfigureUniverse);
-
-      // Update the swamper target file.
-      createSwamperTargetUpdateTask(false /* removeFile */);
-
-      // Clear the host from master's blacklist.
-      if (currentNode.state == NodeState.Removed) {
-        createModifyBlackListTask(Arrays.asList(currentNode), false /* isAdd */)
-            .setSubTaskGroupType(SubTaskGroupType.ConfigureUniverse);
-      }
-
-      // Wait for load to balance.
-      createWaitForLoadBalanceTask()
-          .setSubTaskGroupType(SubTaskGroupType.WaitForDataMigration);
-
-      // Update all tserver conf files with new master information.
-      if (masterAdded) {
-        createMasterInfoUpdateTask(universe, currentNode);
-      }
-
-      // Update node state to live.
-      createSetNodeStateTask(currentNode, NodeState.Live)
-          .setSubTaskGroupType(SubTaskGroupType.StartingNode);
-
-      if (wasDecommissioned) {
-        UserIntent userIntent = universe.getUniverseDetails()
-                                        .getClusterByUuid(currentNode.placementUuid)
-                                        .userIntent;
-
-        // Update the DNS entry for this universe.
-        createDnsManipulationTask(DnsManager.DnsCommandType.Edit, false, userIntent.providerType,
-                                  userIntent.provider, userIntent.universeName)
-            .setSubTaskGroupType(SubTaskGroupType.ConfigureUniverse);
-      }
-
-      // Mark universe task state to success.
-      createMarkUniverseUpdateSuccessTasks()
-          .setSubTaskGroupType(SubTaskGroupType.StartingNode);
 
       // Run all the tasks.
       subTaskGroupQueue.run();
     } catch (Throwable t) {
       LOG.error("Error executing task {} with error='{}'.", getName(), t.getMessage(), t);
-      hitException = true;
       throw t;
     } finally {
-      // Reset the state, on any failure, so that the actions can be retried.
-      if (currentNode != null && hitException) {
-        setNodeState(taskParams().nodeName, currentNode.state);
-      }
-
       // Mark the update of the universe as done. This will allow future updates to the universe.
-      unlockUniverseForUpdate();
+      unlockUniverseForUpdate(errorString);
     }
     LOG.info("Finished {} task.", getName());
-  }
-
-  // Setup a configure task to update the new master list in the conf files of all tservers.
-  // Skip the newly added node as it would have gotten the new master list after provisioing.
-  private void createMasterInfoUpdateTask(Universe universe, NodeDetails skipNode) {
-    List<NodeDetails> nodes = universe.getTServers();
-    nodes.removeIf((NodeDetails node) ->
-                    node.cloudInfo.private_ip.equals(skipNode.cloudInfo.private_ip));
-    // Configure all tservers to pick the new master node ip as well.
-    createConfigureServerTasks(nodes, false /* isShell */, true /* updateMasterAddr */)
-        .setSubTaskGroupType(SubTaskGroupType.ConfigureUniverse);
   }
 }

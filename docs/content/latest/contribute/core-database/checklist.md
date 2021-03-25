@@ -2,7 +2,7 @@
 title: Contribution checklist
 headerTitle: Contribution checklist
 linkTitle: Contribution checklist
-description: Contribution checklist
+description: Review the steps to start contributing code and documentation.
 image: /images/section_icons/index/quick_start.png
 headcontent: Checklist for contributing to the core database.
 type: page
@@ -23,7 +23,7 @@ showAsideToc: true
 
 ## Step 2. Start a local cluster
 
-Having built the source, you can start a local cluster.
+Having built the source, you can [start a local cluster](../../../quick-start/create-local-cluster).
 
 ## Step 3. Make the change
 

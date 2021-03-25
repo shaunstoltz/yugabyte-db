@@ -1,20 +1,23 @@
 /* Copyright (c) YugaByte, Inc. */
 
-@import "_style/colors.scss";
+@import '../../../_style/colors.scss';
+
+$padding: 30px;
 
 .detail-label-small {
-  margin:0 0 12px 0px;
+  margin: 0 0 12px 0px;
   color: $YB_DARK_GRAY;
   padding-left: 0px;
   display: none;
-  a{
-    i{
+  a {
+    i {
       color: $YB_DARK_GRAY;
     }
   }
 }
 
-.primary-node-details, .async-node-details {
+.primary-node-details,
+.async-node-details {
   .react-bs-table table td {
     line-height: 22px !important;
     padding-top: 15px !important;
@@ -27,7 +30,7 @@
 }
 
 #universe-tab-panel-pane-nodes .x_title {
-  margin-bottom: 0px;
+  margin-bottom: 0;
   margin-top: 0;
 }
 
@@ -36,6 +39,10 @@
 
   .dropdown-menu-right {
     min-width: 235px;
+
+    .submenu-icon {
+      width: auto;
+    }
   }
 }
 
@@ -54,7 +61,7 @@
   width: 100%;
   padding-bottom: 6px;
   border-bottom: 1px solid $YB_GRAY_BORDER;
-  & > *{
+  & > * {
     flex: 1 100%;
   }
   @media (min-width: 992px) {
@@ -100,18 +107,20 @@
   position: fixed;
   z-index: 1031;
   top: 8px;
-  left: 120px;
+  left: $YB_SIDEBAR_WIDTH + $padding;
 
   em {
     font-style: normal;
     font-weight: 300;
     font-size: 20px;
-    letter-spacing: -.005em;
+    letter-spacing: -0.005em;
   }
   strong {
     margin: 0 3px;
   }
-  .form-group, .yb-field-group, input {
+  .form-group,
+  .yb-field-group,
+  input {
     display: inline-block;
     padding-bottom: 0;
     vertical-align: middle;
@@ -126,7 +135,10 @@
   }
 
   .btn-default.btn-edit-universe-name {
-    &, &:hover, &:focus, &:active {
+    &,
+    &:hover,
+    &:focus,
+    &:active {
       border: none;
       color: $YB_ORANGE;
       font-weight: 500;
@@ -151,7 +163,7 @@
     position: static;
     margin-right: 30px;
   }
-  .nav-tabs {
+  > .nav-tabs {
     background: white;
     z-index: 1020;
     height: 57px;
@@ -187,7 +199,8 @@
       > a {
         opacity: 1;
         border-bottom: 4px solid $YB_ORANGE;
-        &:focus, &:hover {
+        &:focus,
+        &:hover {
           color: inherit;
           border: none;
           border-bottom: 4px solid $YB_ORANGE;
@@ -197,8 +210,8 @@
       }
     }
   }
-  .tab-content {
-    padding: 30px;
+  > .tab-content {
+    padding: $padding;
     background-color: transparent;
     border: none;
     box-shadow: none;
@@ -225,8 +238,8 @@
 .page-action-buttons {
   position: absolute;
   z-index: 1021;
-  top: 60px;
-  right: 30px;
+  top: $YB_HEADER_HEIGHT;
+  right: $padding;
   padding: 0;
   padding-top: 9px;
   width: auto;
@@ -253,7 +266,7 @@
   z-index: 1031;
   white-space: nowrap;
   top: 8px;
-  left: 120px;
+  left: $YB_SIDEBAR_WIDTH + $padding;
   margin-bottom: 0;
 
   @media (max-width: 991px) {
@@ -265,14 +278,15 @@
   }
 }
 .sidebar-hidden .content-title {
-  left: 30px;
+  left: $padding;
 }
 
 h2 {
   a {
     color: $YB_TEXT_COLOR;
 
-    &:hover, &:active {
+    &:hover,
+    &:active {
       color: $YB_ORANGE;
     }
   }
@@ -283,7 +297,8 @@ h2 {
     a {
       color: $YB_DARK_GRAY;
 
-      &:hover, &:active {
+      &:hover,
+      &:active {
         color: $YB_ORANGE;
       }
     }
@@ -328,15 +343,17 @@ h2 {
     }
   }
   .readonly-node-details {
-      margin-top: 24px !important;
+    margin-top: 24px !important;
   }
 
-  .readonly-node-details, .primary-node-details {
+  .readonly-node-details,
+  .primary-node-details {
     .text-lightgray {
       margin-top: 2px;
     }
     .yb-node-status-cell {
-      .text-green, .text-red {
+      .text-green,
+      .text-red {
         font-weight: 500;
         font-size: 14px;
       }
@@ -345,9 +362,10 @@ h2 {
       font-weight: 500;
       font-size: 14px;
     }
+    .cloud-info-cell {
+      white-space: normal;
+    }
   }
-
-
 
   .yb-actions-cell {
     overflow: inherit !important;
@@ -374,7 +392,6 @@ h2 {
         display: block;
       }
     }
-
 
     .yb-resource-count {
       text-align: left;
@@ -419,19 +436,41 @@ h2 {
     .row {
       margin-left: -12px;
       margin-right: -12px;
-      div[class^=col-] {
+      div[class^='col-'] {
         padding: 0 12px;
       }
     }
   }
 
-  .alert {
+  > .alert {
     position: absolute;
     top: 10px;
     z-index: 4000;
     left: 40%;
     min-width: 300px;
   }
+
+  #queries-tab-panel {
+    .alert {
+      position: absolute;
+      top: 20px;
+      min-width: 300px;
+      left: 50%;
+      transform: translateX(-50%);
+      padding: 15px 28px 15px 15px;
+
+      .alert-close {
+        position: absolute;
+        top: 2px;
+        right: 5px;
+        cursor: pointer;
+      }
+    }
+  }
+}
+
+.toggle-universe-list {
+  list-style: disc;
 }
 
 .universe-details-new {
@@ -496,7 +535,6 @@ h2 {
     }
   }
 
-
   &.overview-widget-cost {
     .body .flex-cnt {
       height: 93px;
@@ -521,6 +559,16 @@ h2 {
     }
     .dl-inline {
       text-align: left;
+
+      // fix for <DescriptionList> on small screen sizes at the universe overview page
+      & > span {
+        display: flex;
+        padding: 3px 0;
+
+        & > dd {
+          margin-left: 10px;
+        }
+      }
     }
   }
 
@@ -575,7 +623,7 @@ h2 {
       stroke-linejoin: round;
     }
 
-    polyline{
+    polyline {
       stroke: $YB_SUCCESS_COLOR;
       stroke-width: 3px;
       stroke-linecap: round;
@@ -603,7 +651,7 @@ h2 {
       animation: droplet 3s forwards linear;
     }
 
-    path{
+    path {
       stroke: $YB_FAIL_COLOR;
       stroke-width: 3px;
       stroke-linecap: round;

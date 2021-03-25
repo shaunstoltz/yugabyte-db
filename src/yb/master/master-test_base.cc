@@ -87,7 +87,9 @@ void MasterTestBase::SetUp() {
 }
 
 void MasterTestBase::TearDown() {
-  client_messenger_->Shutdown();
+  if (client_messenger_) {
+    client_messenger_->Shutdown();
+  }
   mini_master_->Shutdown();
   YBTest::TearDown();
 }
@@ -116,6 +118,33 @@ Status MasterTestBase::CreatePgsqlTable(const NamespaceId& namespace_id,
   }
   request->mutable_partition_schema()->set_hash_schema(PartitionSchemaPB::PGSQL_HASH_SCHEMA);
   request->mutable_schema()->mutable_table_properties()->set_num_tablets(8);
+
+  // Dereferencing as the RPCs require const ref for request. Keeping request param as pointer
+  // though, as that helps with readability and standardization.
+  RETURN_NOT_OK(proxy_->CreateTable(*request, &resp, ResetAndGetController()));
+  if (resp.has_error()) {
+    RETURN_NOT_OK(StatusFromPB(resp.error().status()));
+  }
+  return Status::OK();
+}
+
+Status MasterTestBase::CreateTablegroupTable(const NamespaceId& namespace_id,
+                                             const TableName& table_name,
+                                             const TablegroupId& tablegroup_id,
+                                             const Schema& schema) {
+  CreateTableRequestPB req, *request;
+  request = &req;
+  CreateTableResponsePB resp;
+
+  request->set_table_type(TableType::PGSQL_TABLE_TYPE);
+  request->set_name(table_name);
+  request->set_colocated(true);
+  request->set_tablegroup_id(tablegroup_id);
+  SchemaToPB(schema, request->mutable_schema());
+
+  if (!namespace_id.empty()) {
+    request->mutable_namespace_()->set_id(namespace_id);
+  }
 
   // Dereferencing as the RPCs require const ref for request. Keeping request param as pointer
   // though, as that helps with readability and standardization.
@@ -195,6 +224,47 @@ Status MasterTestBase::DeleteTable(const NamespaceName& namespace_name,
   return Status::OK();
 }
 
+Status MasterTestBase::CreateTablegroup(const TablegroupId& tablegroup_id,
+                                        const NamespaceId& namespace_id,
+                                        const NamespaceName& namespace_name) {
+  CreateTablegroupRequestPB req, *request;
+  request = &req;
+  CreateTablegroupResponsePB resp;
+
+  request->set_id(tablegroup_id);
+  request->set_namespace_id(namespace_id);
+  request->set_namespace_name(namespace_name);
+
+  // Dereferencing as the RPCs require const ref for request. Keeping request param as pointer
+  // though, as that helps with readability and standardization.
+  RETURN_NOT_OK(proxy_->CreateTablegroup(*request, &resp, ResetAndGetController()));
+  if (resp.has_error()) {
+    RETURN_NOT_OK(StatusFromPB(resp.error().status()));
+  }
+  return Status::OK();
+}
+
+Status MasterTestBase::DeleteTablegroup(const TablegroupId& tablegroup_id,
+                                        const NamespaceId& namespace_id) {
+  DeleteTablegroupRequestPB req;
+  DeleteTablegroupResponsePB resp;
+  req.set_id(tablegroup_id);
+  req.set_namespace_id(namespace_id);
+
+  RETURN_NOT_OK(proxy_->DeleteTablegroup(req, &resp, ResetAndGetController()));
+  if (resp.has_error()) {
+    RETURN_NOT_OK(StatusFromPB(resp.error().status()));
+  }
+  return Status::OK();
+}
+
+void MasterTestBase::DoListTablegroups(const ListTablegroupsRequestPB& req,
+                                       ListTablegroupsResponsePB* resp) {
+  ASSERT_OK(proxy_->ListTablegroups(req, resp, ResetAndGetController()));
+  SCOPED_TRACE(resp->DebugString());
+  ASSERT_FALSE(resp->has_error());
+}
+
 void MasterTestBase::DoListAllNamespaces(ListNamespacesResponsePB* resp) {
   DoListAllNamespaces(boost::none, resp);
 }
@@ -219,6 +289,13 @@ Status MasterTestBase::CreateNamespace(const NamespaceName& ns_name,
 Status MasterTestBase::CreateNamespace(const NamespaceName& ns_name,
                                        const boost::optional<YQLDatabase>& database_type,
                                        CreateNamespaceResponsePB* resp) {
+  RETURN_NOT_OK(CreateNamespaceAsync(ns_name, database_type, resp));
+  return CreateNamespaceWait(resp->id(), database_type);
+}
+
+Status MasterTestBase::CreateNamespaceAsync(const NamespaceName& ns_name,
+                                            const boost::optional<YQLDatabase>& database_type,
+                                            CreateNamespaceResponsePB* resp) {
   CreateNamespaceRequestPB req;
   req.set_name(ns_name);
   if (database_type) {
@@ -230,6 +307,34 @@ Status MasterTestBase::CreateNamespace(const NamespaceName& ns_name,
     RETURN_NOT_OK(StatusFromPB(resp->error().status()));
   }
   return Status::OK();
+}
+
+Status MasterTestBase::CreateNamespaceWait(const NamespaceId& ns_id,
+                                           const boost::optional<YQLDatabase>& database_type) {
+  Status status = Status::OK();
+
+  IsCreateNamespaceDoneRequestPB is_req;
+  is_req.mutable_namespace_()->set_id(ns_id);
+  if (database_type) {
+    is_req.mutable_namespace_()->set_database_type(*database_type);
+  }
+
+  AssertLoggedWaitFor([&]() -> Result<bool> {
+    IsCreateNamespaceDoneResponsePB is_resp;
+    status = proxy_->IsCreateNamespaceDone(is_req, &is_resp, ResetAndGetController());
+    WARN_NOT_OK(status, "IsCreateNamespaceDone returned unexpected error");
+    if (status.ok()) {
+      if (is_resp.has_done() && is_resp.done()) {
+        if (is_resp.has_error()) {
+          status = StatusFromPB(is_resp.error().status());
+        }
+        return true;
+      }
+    }
+    return false;
+  }, MonoDelta::FromSeconds(60), "Wait for create namespace to finish async setup tasks.");
+
+  return status;
 }
 
 Status MasterTestBase::AlterNamespace(const NamespaceName& ns_name,
@@ -250,6 +355,29 @@ Status MasterTestBase::AlterNamespace(const NamespaceName& ns_name,
     RETURN_NOT_OK(StatusFromPB(resp->error().status()));
   }
   return Status::OK();
+}
+
+// PGSQL Namespaces are deleted asynchronously since they may delete a large number of tables.
+// CQL Namespaces don't need to call this function and return success if present.
+Status MasterTestBase::DeleteNamespaceWait(IsDeleteNamespaceDoneRequestPB const& del_req) {
+  Status status = Status::OK();
+  AssertLoggedWaitFor([&]() -> Result<bool> {
+    IsDeleteNamespaceDoneResponsePB del_resp;
+    status = proxy_->IsDeleteNamespaceDone(del_req, &del_resp, ResetAndGetController());
+    if (!status.ok()) {
+      WARN_NOT_OK(status, "IsDeleteNamespaceDone returned unexpected error");
+      return true;
+    }
+    if (del_resp.has_done() && del_resp.done()) {
+      if (del_resp.has_error()) {
+        status = StatusFromPB(del_resp.error().status());
+      }
+      return true;
+    }
+    return false;
+  }, MonoDelta::FromSeconds(10), "Wait for delete namespace to finish async cleanup tasks.");
+
+  return status;
 }
 
 Status MasterTestBase::DeleteTableSync(const NamespaceName& ns_name, const TableName& table_name,

@@ -129,6 +129,10 @@ void SchemaToColumnPBs(
   google::protobuf::RepeatedPtrField<ColumnSchemaPB>* cols,
   int flags = 0);
 
+// Extract the colocated table information of the given schema into a protobuf object.
+void SchemaToColocatedTableIdentifierPB(
+    const Schema& schema, ColocatedTableIdentifierPB* colocated_pb);
+
 YB_DEFINE_ENUM(UsePrivateIpMode, (cloud)(region)(zone)(never));
 
 // Returns mode for selecting between private and public IP.
@@ -293,6 +297,37 @@ static inline uint8_t Load8(const void* p) {
 
 YB_STRONGLY_TYPED_UUID(ClientId);
 typedef int64_t RetryableRequestId;
+
+// Special value which is used to initialize starting RetryableRequestId for the client and tablet
+// based on min running at server side.
+constexpr RetryableRequestId kInitializeFromMinRunning = -1;
+
+struct MinRunningRequestIdTag : yb::IntegralErrorTag<int64_t> {
+  // It is part of the wire protocol and should not be changed once released.
+  static constexpr uint8_t kCategory = 13;
+
+  static std::string ToMessage(Value value) {
+    return Format("Min running request ID: $0", value);
+  }
+};
+
+typedef yb::StatusErrorCodeImpl<MinRunningRequestIdTag> MinRunningRequestIdStatusData;
+
+template <class Resp>
+CHECKED_STATUS StatusFromResponse(const Resp& resp) {
+  return resp.has_error() ? StatusFromPB(resp.error().status()) : Status::OK();
+}
+
+struct SplitChildTabletIdsTag : yb::StringVectorBackedErrorTag {
+  // It is part of the wire protocol and should not be changed once released.
+  static constexpr uint8_t kCategory = 14;
+
+  static std::string ToMessage(Value value) {
+    return Format("Split child tablet IDs: $0", value);
+  }
+};
+
+typedef yb::StatusErrorCodeImpl<SplitChildTabletIdsTag> SplitChildTabletIdsData;
 
 } // namespace yb
 

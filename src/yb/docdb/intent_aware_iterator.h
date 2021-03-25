@@ -74,15 +74,15 @@ struct FetchKeyResult {
 // intents for (sub)key B.
 //
 // When seeking to some (sub)dockey, it will ignore values for this (sub)dockey
-// (except write intents written by the same transaction) with HT higher than high_ht.
+// (except write intents written by the same transaction) with HT higher than read_time.
 //
-// For intents from the same transaction, intent with maximum HT would be picked, ignoring high_ht.
-// And returned as key with time equals to high_ht.
+// For intents from the same transaction, intents with maximum HT would be picked -- ignoring
+// read_time for filtering purposes -- and returned as key with time equal to read_time.
 // Intent data format:
 //   SubDocKey (no HybridTime) + IntentType + HybridTime -> TxnId + value.
 // TxnId, IntentType, HybridTime are all prefixed with their respective value types.
 //
-// KeyBytes passed to Seek* methods should not contain hybrid time.
+// KeyBytes/Slice passed to Seek* methods should not contain hybrid time.
 // HybridTime of subdoc_key in Seek* methods would be ignored.
 class IntentAwareIterator {
  public:
@@ -134,36 +134,31 @@ class IntentAwareIterator {
   void PrevDocKey(const DocKey& doc_key);
   void PrevDocKey(const Slice& encoded_doc_key);
 
-  // Adds new value to prefix stack. The top value of this stack is used to filter returned entries.
-  void PushPrefix(const Slice& prefix);
-
-  // Removes top value from prefix stack. This iteration could became valid after poping prefix,
-  // if new top prefix is a prefix of currently pointed value.
-  void PopPrefix();
-
   // Fetches currently pointed key and also updates max_seen_ht to ht of this key. The key does not
   // contain the DocHybridTime but is returned separately and optionally.
   Result<FetchKeyResult> FetchKey();
 
   bool valid();
   Slice value();
-  ReadHybridTime read_time() { return read_time_; }
+  const ReadHybridTime& read_time() { return read_time_; }
   HybridTime max_seen_ht() { return max_seen_ht_; }
 
-  // Iterate through Next() until a row containing a full record (non merge record) is found.
-  // The key is not guaranteed to stay the same. The key without hybrid time and value of the
-  // merge record go in final_key (optionally), and result_value, while the write time of the
-  // merge record goes in latest_record_ht.
+  // Iterate through Next() until a row containing a full record (non merge record) is found, or the
+  // key changes.
+  //
+  // If a new full record with the same key is found, latest_record_ht is set to the write time of
+  // that record, result_value is set to the value, and final_key is set to the key.
+  //
+  // If the key changes, latest_record_ht is set to the write time of the last merge record seen,
+  // result_value is set to its value, and final_key is set to the key.
   CHECKED_STATUS NextFullValue(
       DocHybridTime* latest_record_ht,
       Slice* result_value,
       Slice* final_key = nullptr);
 
-  // Finds the latest record for a particular key, returns the overwrite
-  // time, and optionally also the result value. This latest record may not
-  // be a full record, but instead a merge record (e.g. a TTL row).
-  // This function used to be FindLastWriteTime, which has since been
-  // largely abstracted out into the docdb layer.
+  // Finds the latest record for a particular key after the provided max_overwrite_time, returns the
+  // write time of the found record, and optionally also the result value. This latest record may
+  // not be a full record, but instead a merge record (e.g. a TTL row).
   CHECKED_STATUS FindLatestRecord(
       const Slice& key_without_ht,
       DocHybridTime* max_overwrite_time,
@@ -184,6 +179,17 @@ class IntentAwareIterator {
   void DebugDump();
 
  private:
+  friend class IntentAwareIteratorPrefixScope;
+
+  // Adds new value to prefix stack. The top value of this stack is used to filter returned entries.
+  void PushPrefix(const Slice& prefix);
+
+  // Removes top value from prefix stack. This iteration could became valid after popping prefix,
+  // if new top prefix is a prefix of currently pointed value.
+  void PopPrefix();
+
+  Slice CurrentPrefix() const;
+
   // Seek forward on regular sub-iterator.
   void SeekForwardRegular(const Slice& slice);
 
@@ -210,11 +216,12 @@ class IntentAwareIterator {
   // Strong write intents which are either committed or written by the current
   // transaction (stored in txn_op_context) by considered time are considered as suitable.
 
-  // Seek intent sub-iterator to latest suitable intent starting with intent_key_prefix.
+  // Seek intent sub-iterator to latest suitable intent starting with seek_key_buffer_.
   // intent_iter_ will be positioned to first intent for the smallest key greater than
   // resolved_intent_sub_doc_key_encoded_.
   // If iterator already positioned far enough - does not perform seek.
-  void SeekForwardToSuitableIntent(const KeyBytes &intent_key_prefix);
+  // If we already resolved intent after seek_key_prefix_, then it will be used.
+  void SeekForwardToSuitableIntent();
 
   // Seek intent sub-iterator forward (backward) to latest suitable intent for first available
   // key. Updates resolved_intent_XXX fields.
@@ -244,8 +251,8 @@ class IntentAwareIterator {
 
   // Seeks to the appropriate intent-prefix and returns the associated
   // DocHybridTime.
-  Result<DocHybridTime> FindMatchingIntentRecordDocHybridTime(
-      const Slice& key_without_ht);
+  Result<DocHybridTime> FindMatchingIntentRecordDocHybridTime(const Slice& key_without_ht);
+
   // Returns the DocHybridTime associated with the current regular record
   // pointed to, if it matches the key that is passed as the argument.
   // If the current record does not match the passed key, invalid hybrid time
@@ -285,9 +292,24 @@ class IntentAwareIterator {
   // Returns true if iterator currently points to some record.
   bool HasCurrentEntry();
 
+  // Update seek_intent_iter_needed_, seek_key_prefix_ and seek_key_buffer_ to seek forward
+  // for key + suffix.
+  // If use_suffix_for_prefix then suffix is used in seek_key_prefix_, otherwise it will match key.
+  void UpdatePlannedIntentSeekForward(
+      const Slice& key, const Slice& suffix, bool use_suffix_for_prefix = true);
+
+  bool NextRegular(Direction direction);
+
   const ReadHybridTime read_time_;
-  const string encoded_read_time_local_limit_;
-  const string encoded_read_time_global_limit_;
+  const std::string encoded_read_time_read_;
+  const std::string encoded_read_time_local_limit_;
+  const std::string encoded_read_time_global_limit_;
+
+  // The encoded hybrid time to use to filter records in regular RocksDB. This is the maximum of
+  // read_time and local_limit (in terms of hybrid time comparison), and this slice points to
+  // one of the strings above.
+  Slice encoded_read_time_regular_limit_;
+
   const TransactionOperationContextOpt txn_op_context_;
   docdb::BoundedRocksDbIterator intent_iter_;
   docdb::BoundedRocksDbIterator iter_;
@@ -324,9 +346,9 @@ class IntentAwareIterator {
 
   // Reusable buffer to prepare seek key to avoid reallocating temporary buffers in critical paths.
   KeyBytes seek_key_buffer_;
+  Slice seek_key_prefix_;
 };
 
-// Utility class that controls stack of prefixes in IntentAwareIterator.
 class IntentAwareIteratorPrefixScope {
  public:
   IntentAwareIteratorPrefixScope(const Slice& prefix, IntentAwareIterator* iterator)

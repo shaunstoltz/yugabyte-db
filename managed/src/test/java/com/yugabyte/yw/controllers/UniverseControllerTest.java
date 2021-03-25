@@ -7,32 +7,29 @@ import static com.yugabyte.yw.common.ApiUtils.getTestUserIntent;
 import static com.yugabyte.yw.common.AssertHelper.*;
 import static com.yugabyte.yw.common.FakeApiHelper.doRequestWithAuthToken;
 import static com.yugabyte.yw.common.FakeApiHelper.doRequestWithAuthTokenAndBody;
-import static com.yugabyte.yw.common.PlacementInfoUtil.UNIVERSE_ALIVE_METRIC;
-import static com.yugabyte.yw.common.PlacementInfoUtil.getAzUuidToNumNodes;
-import static com.yugabyte.yw.common.PlacementInfoUtil.updateUniverseDefinition;
 import static com.yugabyte.yw.common.ModelFactory.createUniverse;
 
 import com.google.common.collect.ImmutableList;
 import com.yugabyte.yw.common.ShellProcessHandler;
+import com.yugabyte.yw.common.ShellResponse;
 import com.yugabyte.yw.forms.RunInShellFormData;
-import com.yugabyte.yw.forms.UniverseTaskParams.EncryptionAtRestConfig;
+
+import static com.yugabyte.yw.common.PlacementInfoUtil.*;
 import static com.yugabyte.yw.forms.UniverseDefinitionTaskParams.ClusterOperationType.CREATE;
 import static org.hamcrest.CoreMatchers.allOf;
 import static org.hamcrest.CoreMatchers.equalTo;
 import static org.hamcrest.CoreMatchers.notNullValue;
 import static org.junit.Assert.assertEquals;
+import static org.junit.Assert.assertNotEquals;
 import static org.junit.Assert.assertNotNull;
 import static org.junit.Assert.assertNull;
 import static org.junit.Assert.assertThat;
 import static org.junit.Assert.assertTrue;
-import static org.junit.Assert.assertFalse;
 import static org.mockito.Matchers.any;
-import static org.mockito.Matchers.anyBoolean;
 import static org.mockito.Matchers.eq;
 import static org.mockito.Matchers.anyList;
 import static org.mockito.Matchers.anyMap;
 import static org.mockito.Mockito.mock;
-import static org.mockito.Mockito.reset;
 import static org.mockito.Mockito.times;
 import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.when;
@@ -46,6 +43,7 @@ import java.util.*;
 
 import com.google.common.collect.ImmutableMap;
 import com.google.common.net.HostAndPort;
+import com.yugabyte.yw.cloud.PublicCloudConstants;
 import com.yugabyte.yw.common.ApiHelper;
 import com.yugabyte.yw.common.ConfigHelper;
 import com.yugabyte.yw.common.ModelFactory;
@@ -54,13 +52,15 @@ import com.yugabyte.yw.common.YsqlQueryExecutor;
 import com.yugabyte.yw.common.YcqlQueryExecutor;
 import com.yugabyte.yw.common.services.YBClientService;
 import com.yugabyte.yw.forms.NodeInstanceFormData;
-import com.yugabyte.yw.forms.RollingRestartParams;
+import com.yugabyte.yw.forms.UpgradeParams;
 import com.yugabyte.yw.forms.RunQueryFormData;
 import com.yugabyte.yw.metrics.MetricQueryHelper;
+import com.yugabyte.yw.models.AccessKey;
 import com.yugabyte.yw.models.AvailabilityZone;
 import com.yugabyte.yw.models.Customer;
 import com.yugabyte.yw.models.CustomerTask;
 import com.yugabyte.yw.models.InstanceType;
+import com.yugabyte.yw.models.KmsConfig;
 import com.yugabyte.yw.models.NodeInstance;
 import com.yugabyte.yw.models.Provider;
 import com.yugabyte.yw.models.Region;
@@ -71,10 +71,15 @@ import com.yugabyte.yw.models.helpers.NodeDetails;
 import com.yugabyte.yw.models.helpers.NodeDetails.NodeState;
 import com.yugabyte.yw.models.helpers.PlacementInfo;
 
+import junitparams.JUnitParamsRunner;
+import junitparams.Parameters;
+
 import com.yugabyte.yw.models.helpers.TaskType;
 import org.apache.commons.io.FileUtils;
+import org.apache.commons.lang3.StringUtils;
 import org.junit.After;
 import org.junit.Before;
+import org.junit.Rule;
 import org.junit.Test;
 import org.junit.runner.RunWith;
 import org.mockito.ArgumentCaptor;
@@ -83,12 +88,9 @@ import org.mockito.Matchers;
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.node.ArrayNode;
 import com.fasterxml.jackson.databind.node.ObjectNode;
-import com.yugabyte.yw.common.kms.services.SmartKeyEARService;
-import com.yugabyte.yw.common.kms.services.AwsEARService;
 import com.yugabyte.yw.common.kms.EncryptionAtRestManager;
 import com.yugabyte.yw.commissioner.CallHome;
 import com.yugabyte.yw.commissioner.Commissioner;
-import com.yugabyte.yw.commissioner.HealthChecker;
 import com.yugabyte.yw.commissioner.Common.CloudType;
 import com.yugabyte.yw.common.ApiUtils;
 import com.yugabyte.yw.forms.EncryptionAtRestKeyParams;
@@ -97,27 +99,34 @@ import com.yugabyte.yw.forms.UniverseDefinitionTaskParams.Cluster;
 import com.yugabyte.yw.forms.UniverseDefinitionTaskParams.UserIntent;
 import com.yugabyte.yw.forms.UniverseTaskParams;
 
+import org.pac4j.play.CallbackController;
+import org.pac4j.play.store.PlayCacheSessionStore;
+import org.pac4j.play.store.PlaySessionStore;
+
 import org.mockito.Mock;
 import org.mockito.Mockito;
-import org.mockito.runners.MockitoJUnitRunner;
+import org.mockito.junit.MockitoJUnit;
+import org.mockito.junit.MockitoRule;
 import org.yb.client.YBClient;
 import play.Application;
 import play.api.Play;
 import play.inject.guice.GuiceApplicationBuilder;
 import play.libs.Json;
+import play.mvc.Http;
 import play.mvc.Result;
 import play.test.Helpers;
 import play.test.WithApplication;
 
-import com.yugabyte.yw.models.KmsConfig;
-
-@RunWith(MockitoJUnitRunner.class)
+@RunWith(JUnitParamsRunner.class)
 public class UniverseControllerTest extends WithApplication {
   private static Commissioner mockCommissioner;
   private static MetricQueryHelper mockMetricQueryHelper;
 
+  @Rule
+  public MockitoRule rule = MockitoJUnit.rule();
+
   @Mock
-  play.Configuration mockAppConfig;
+  private play.Configuration mockAppConfig;
 
   private Customer customer;
   private Users user;
@@ -131,6 +140,8 @@ public class UniverseControllerTest extends WithApplication {
   private YsqlQueryExecutor mockYsqlQueryExecutor;
   private YcqlQueryExecutor mockYcqlQueryExecutor;
   private ShellProcessHandler mockShellProcessHandler;
+  protected CallbackController mockCallbackController;
+  protected PlayCacheSessionStore mockSessionStore;
 
   @Override
   protected Application provideApplication() {
@@ -144,6 +155,8 @@ public class UniverseControllerTest extends WithApplication {
     mockYsqlQueryExecutor = mock(YsqlQueryExecutor.class);
     mockYcqlQueryExecutor = mock(YcqlQueryExecutor.class);
     mockShellProcessHandler = mock(ShellProcessHandler.class);
+    mockCallbackController = mock(CallbackController.class);
+    mockSessionStore = mock(PlayCacheSessionStore.class);
     return new GuiceApplicationBuilder()
         .configure((Map) Helpers.inMemoryDatabase())
         .overrides(bind(Commissioner.class).toInstance(mockCommissioner))
@@ -154,6 +167,9 @@ public class UniverseControllerTest extends WithApplication {
         .overrides(bind(YsqlQueryExecutor.class).toInstance(mockYsqlQueryExecutor))
         .overrides(bind(YcqlQueryExecutor.class).toInstance(mockYcqlQueryExecutor))
         .overrides(bind(ShellProcessHandler.class).toInstance(mockShellProcessHandler))
+        .overrides(bind(CallbackController.class).toInstance(mockCallbackController))
+        .overrides(bind(PlaySessionStore.class).toInstance(mockSessionStore))
+        .overrides(bind(play.Configuration.class).toInstance(mockAppConfig))
         .build();
   }
 
@@ -220,8 +236,8 @@ public class UniverseControllerTest extends WithApplication {
             .put("api_key", "some_api_token");
     kmsConfig = ModelFactory.createKMSConfig(customer.uuid, "SMARTKEY", kmsConfigReq);
     authToken = user.createAuthToken();
-    when(mockEARManager.getServiceInstance("SMARTKEY")).thenReturn(new SmartKeyEARService());
-    when(mockEARManager.getServiceInstance("AWS")).thenReturn(new AwsEARService());
+
+    when(mockAppConfig.getString("yb.storage.path")).thenReturn("/tmp");
   }
 
   @After
@@ -311,9 +327,7 @@ public class UniverseControllerTest extends WithApplication {
     UUID invalidUUID = UUID.randomUUID();
     String url = "/api/customers/" + customer.uuid + "/universes/" + invalidUUID;
     Result result = doRequestWithAuthToken("GET", url, authToken);
-    String expectedResult = String.format("Universe UUID: %s doesn't belong " +
-                                          "to Customer UUID: %s", invalidUUID,
-                                          customer.uuid);
+    String expectedResult = String.format("No universe found with UUID: %s", invalidUUID);
     assertBadRequest(result, expectedResult);
     assertAuditEntry(0, customer.uuid);
   }
@@ -355,7 +369,7 @@ public class UniverseControllerTest extends WithApplication {
     String host = "1.2.3.4";
     HostAndPort hostAndPort = HostAndPort.fromParts(host, 9000);
     when(mockClient.getLeaderMasterHostAndPort()).thenReturn(hostAndPort);
-    when(mockService.getClient(any(String.class), any(String.class))).thenReturn(mockClient);
+    when(mockService.getClient(any(), any())).thenReturn(mockClient);
     UniverseController universeController = new UniverseController(mockService);
 
     Result result = universeController.getMasterLeaderIP(customer.uuid, universe.universeUUID);
@@ -371,7 +385,7 @@ public class UniverseControllerTest extends WithApplication {
     UniverseController universeController = new UniverseController(mockService);
     UUID invalidUUID = UUID.randomUUID();
     Result result = universeController.getMasterLeaderIP(invalidUUID, UUID.randomUUID());
-    assertBadRequest(result, "Invalid Customer UUID: " + invalidUUID);
+    assertBadRequest(result, "No customer found with UUID: " + invalidUUID);
     assertAuditEntry(0, customer.uuid);
   }
 
@@ -438,7 +452,7 @@ public class UniverseControllerTest extends WithApplication {
 
     String url = "/api/customers/" + customer.uuid + "/universe_configure";
     Result result = doRequestWithAuthTokenAndBody("POST", url, authToken, bodyJson);
-    assertInternalServerError(result, "No AZ found for region: " + r.uuid);
+    assertInternalServerError(result, "No AZ found across regions: [" + r.uuid + "]");
     assertAuditEntry(0, customer.uuid);
   }
 
@@ -449,6 +463,8 @@ public class UniverseControllerTest extends WithApplication {
         .thenReturn(fakeTaskUUID);
 
     Provider p = ModelFactory.awsProvider(customer);
+    String accessKeyCode = "someKeyCode";
+    AccessKey.create(p.uuid, accessKeyCode, new AccessKey.KeyInfo());
     Region r = Region.create(p, "region-1", "PlacementRegion 1", "default-image");
     AvailabilityZone.create(r, "az-1", "PlacementAZ 1", "subnet-1");
     AvailabilityZone.create(r, "az-2", "PlacementAZ 2", "subnet-2");
@@ -460,11 +476,13 @@ public class UniverseControllerTest extends WithApplication {
       .put("instanceType", i.getInstanceTypeCode())
       .put("replicationFactor", 3)
       .put("numNodes", 3)
-      .put("provider", p.uuid.toString());
+      .put("provider", p.uuid.toString())
+      .put("accessKeyCode", accessKeyCode);
     ArrayNode regionList = Json.newArray().add(r.uuid.toString());
     userIntentJson.set("regionList", regionList);
     ArrayNode clustersJsonArray = Json.newArray().add(Json.newObject().set("userIntent", userIntentJson));
     bodyJson.set("clusters", clustersJsonArray);
+    bodyJson.set("nodeDetailsSet", Json.newArray());
 
     String url = "/api/customers/" + customer.uuid + "/universes";
     Result result = doRequestWithAuthTokenAndBody("POST", url, authToken, bodyJson);
@@ -474,7 +492,7 @@ public class UniverseControllerTest extends WithApplication {
     assertNotNull(json.get("universeDetails"));
     assertNotNull(json.get("universeConfig"));
 
-    CustomerTask th = CustomerTask.find.where().eq("task_uuid", fakeTaskUUID).findUnique();
+    CustomerTask th = CustomerTask.find.query().where().eq("task_uuid", fakeTaskUUID).findOne();
     assertNotNull(th);
     assertThat(th.getCustomerUUID(), allOf(notNullValue(), equalTo(customer.uuid)));
     assertThat(th.getTargetName(), allOf(notNullValue(), equalTo("SingleUserUniverse")));
@@ -489,6 +507,8 @@ public class UniverseControllerTest extends WithApplication {
       .thenReturn(fakeTaskUUID);
 
     Provider p = ModelFactory.awsProvider(customer);
+    String accessKeyCode = "someKeyCode";
+    AccessKey.create(p.uuid, accessKeyCode, new AccessKey.KeyInfo());
     Region r = Region.create(p, "region-1", "PlacementRegion 1", "default-image");
     AvailabilityZone.create(r, "az-1", "PlacementAZ 1", "subnet-1");
     AvailabilityZone.create(r, "az-2", "PlacementAZ 2", "subnet-2");
@@ -501,14 +521,16 @@ public class UniverseControllerTest extends WithApplication {
       .put("enableClientToNodeEncrypt", true)
       .put("replicationFactor", 3)
       .put("numNodes", 3)
-      .put("provider", p.uuid.toString());
+      .put("provider", p.uuid.toString())
+      .put("accessKeyCode", accessKeyCode);
 
     ArrayNode regionList = Json.newArray().add(r.uuid.toString());
     userIntentJson.set("regionList", regionList);
     ArrayNode clustersJsonArray = Json.newArray().add(Json.newObject().set("userIntent", userIntentJson));
-    JsonNode bodyJson = Json.newObject()
-      .put("nodePrefix", "demo-node")
-      .set("clusters", clustersJsonArray);
+    ObjectNode bodyJson = Json.newObject()
+      .put("nodePrefix", "demo-node");
+    bodyJson.set("clusters", clustersJsonArray);
+    bodyJson.set("nodeDetailsSet", Json.newArray());
 
     String url = "/api/customers/" + customer.uuid + "/universes";
     Result result = doRequestWithAuthTokenAndBody("POST", url, authToken, bodyJson);
@@ -529,6 +551,8 @@ public class UniverseControllerTest extends WithApplication {
       .thenReturn(fakeTaskUUID);
 
     Provider p = ModelFactory.awsProvider(customer);
+    String accessKeyCode = "someKeyCode";
+    AccessKey.create(p.uuid, accessKeyCode, new AccessKey.KeyInfo());
     Region r = Region.create(p, "region-1", "PlacementRegion 1", "default-image");
     AvailabilityZone.create(r, "az-1", "PlacementAZ 1", "subnet-1");
     AvailabilityZone.create(r, "az-2", "PlacementAZ 2", "subnet-2");
@@ -542,12 +566,14 @@ public class UniverseControllerTest extends WithApplication {
       .put("enableClientToNodeEncrypt", false)
       .put("replicationFactor", 3)
       .put("numNodes", 3)
-      .put("provider", p.uuid.toString());
+      .put("provider", p.uuid.toString())
+      .put("accessKeyCode", accessKeyCode);
 
     ArrayNode regionList = Json.newArray().add(r.uuid.toString());
     userIntentJson.set("regionList", regionList);
     ArrayNode clustersJsonArray = Json.newArray().add(Json.newObject().set("userIntent", userIntentJson));
     bodyJson.set("clusters", clustersJsonArray);
+    bodyJson.set("nodeDetailsSet", Json.newArray());
 
     String url = "/api/customers/" + customer.uuid + "/universes";
     Result result = doRequestWithAuthTokenAndBody("POST", url, authToken, bodyJson);
@@ -559,6 +585,37 @@ public class UniverseControllerTest extends WithApplication {
     UniverseDefinitionTaskParams taskParam = (UniverseDefinitionTaskParams) taskParams.getValue();
     assertNull(taskParam.rootCA);
     assertAuditEntry(1, customer.uuid);
+  }
+
+  @Test
+  public void testK8sUniverseCreateOneClusterPerNamespacedProviderFailure() {
+    Provider p = ModelFactory.kubernetesProvider(customer);
+    Region r = Region.create(p, "region-1", "PlacementRegion 1", "default-image");
+    AvailabilityZone az1 = AvailabilityZone.create(r, "az-1", "PlacementAZ 1", "subnet-1");
+    AvailabilityZone.create(r, "az-2", "PlacementAZ 2", "subnet-2");
+    az1.setConfig(ImmutableMap.of("KUBENAMESPACE", "test-ns1"));
+    InstanceType i = InstanceType.upsert(p.code, "small", 10, 5.5,
+                                         new InstanceType.InstanceTypeDetails());
+
+    ModelFactory.createUniverse("K8sUniverse1", customer.getCustomerId(), CloudType.kubernetes);
+
+    ObjectNode bodyJson = Json.newObject();
+    ObjectNode userIntentJson = Json.newObject()
+      .put("universeName", "K8sUniverse2")
+      .put("instanceType", i.getInstanceTypeCode())
+      .put("replicationFactor", 3)
+      .put("numNodes", 3)
+      .put("provider", p.uuid.toString());
+    ArrayNode regionList = Json.newArray().add(r.uuid.toString());
+    userIntentJson.set("regionList", regionList);
+    ArrayNode clustersJsonArray = Json.newArray().add(Json.newObject().set("userIntent", userIntentJson));
+    bodyJson.set("clusters", clustersJsonArray);
+    bodyJson.set("nodeDetailsSet", Json.newArray());
+
+    String url = "/api/customers/" + customer.uuid + "/universes";
+    Result result = doRequestWithAuthTokenAndBody("POST", url, authToken, bodyJson);
+    assertBadRequest(result, "Only one universe can be created with providers having "
+                     + "KUBENAMESPACE set in the AZ config.");
   }
 
   @Test
@@ -577,6 +634,8 @@ public class UniverseControllerTest extends WithApplication {
         .thenReturn(fakeTaskUUID);
 
     Provider p = ModelFactory.awsProvider(customer);
+    String accessKeyCode = "someKeyCode";
+    AccessKey.create(p.uuid, accessKeyCode, new AccessKey.KeyInfo());
     Region r = Region.create(p, "region-1", "PlacementRegion 1", "default-image");
     AvailabilityZone.create(r, "az-1", "PlacementAZ 1", "subnet-1");
     AvailabilityZone.create(r, "az-2", "PlacementAZ 2", "subnet-2");
@@ -590,11 +649,13 @@ public class UniverseControllerTest extends WithApplication {
       .put("instanceType", i.getInstanceTypeCode())
       .put("replicationFactor", 3)
       .put("numNodes", 3)
-      .put("provider", p.uuid.toString());
+      .put("provider", p.uuid.toString())
+      .put("accessKeyCode", accessKeyCode);
     ArrayNode regionList = Json.newArray().add(r.uuid.toString());
     userIntentJson.set("regionList", regionList);
     ArrayNode clustersJsonArray = Json.newArray().add(Json.newObject().set("userIntent", userIntentJson));
     bodyJson.set("clusters", clustersJsonArray);
+    bodyJson.set("nodeDetailsSet", Json.newArray());
 
     String url = "/api/customers/" + customer.uuid + "/universes/" + u.universeUUID;
     Result result = doRequestWithAuthTokenAndBody("PUT", url, authToken, bodyJson);
@@ -604,7 +665,7 @@ public class UniverseControllerTest extends WithApplication {
     assertValue(json, "universeUUID", u.universeUUID.toString());
     assertNotNull(json.get("universeDetails"));
 
-    CustomerTask th = CustomerTask.find.where().eq("task_uuid", fakeTaskUUID).findUnique();
+    CustomerTask th = CustomerTask.find.query().where().eq("task_uuid", fakeTaskUUID).findOne();
     assertNotNull(th);
     assertThat(th.getCustomerUUID(), allOf(notNullValue(), equalTo(customer.uuid)));
     assertThat(th.getTargetName(), allOf(notNullValue(), equalTo("Test Universe")));
@@ -619,6 +680,8 @@ public class UniverseControllerTest extends WithApplication {
         .thenReturn(fakeTaskUUID);
 
     Provider p = ModelFactory.awsProvider(customer);
+    String accessKeyCode = "someKeyCode";
+    AccessKey.create(p.uuid, accessKeyCode, new AccessKey.KeyInfo());
     Region r = Region.create(p, "region-1", "PlacementRegion 1", "default-image");
     AvailabilityZone.create(r, "az-1", "PlacementAZ 1", "subnet-1");
     AvailabilityZone.create(r, "az-2", "PlacementAZ 2", "subnet-2");
@@ -633,11 +696,13 @@ public class UniverseControllerTest extends WithApplication {
       .put("instanceType", i.getInstanceTypeCode())
       .put("replicationFactor", 3)
       .put("numNodes", 3)
-      .put("provider", p.uuid.toString());
+      .put("provider", p.uuid.toString())
+      .put("accessKeyCode", accessKeyCode);
     ArrayNode regionList = Json.newArray().add(r.uuid.toString());
     userIntentJson.set("regionList", regionList);
     ArrayNode clustersJsonArray = Json.newArray().add(Json.newObject().set("userIntent", userIntentJson));
     bodyJson.set("clusters", clustersJsonArray);
+    bodyJson.set("nodeDetailsSet", Json.newArray());
 
     String url = "/api/customers/" + customer.uuid + "/universes/" + u.universeUUID;
     Result result = doRequestWithAuthTokenAndBody("PUT", url, authToken, bodyJson);
@@ -648,7 +713,7 @@ public class UniverseControllerTest extends WithApplication {
     assertNotNull(json.get("universeDetails"));
     assertNotNull(json.get("universeConfig"));
 
-    CustomerTask th = CustomerTask.find.where().eq("task_uuid", fakeTaskUUID).findUnique();
+    CustomerTask th = CustomerTask.find.query().where().eq("task_uuid", fakeTaskUUID).findOne();
     assertNotNull(th);
     assertThat(th.getCustomerUUID(), allOf(notNullValue(), equalTo(customer.uuid)));
     assertThat(th.getTargetName(), allOf(notNullValue(), equalTo("Test Universe")));
@@ -663,6 +728,8 @@ public class UniverseControllerTest extends WithApplication {
         .thenReturn(fakeTaskUUID);
 
     Provider p = ModelFactory.awsProvider(customer);
+    String accessKeyCode = "someKeyCode";
+    AccessKey.create(p.uuid, accessKeyCode, new AccessKey.KeyInfo());
     Region r = Region.create(p, "region-1", "PlacementRegion 1", "default-image");
     AvailabilityZone.create(r, "az-1", "PlacementAZ 1", "subnet-1");
     AvailabilityZone.create(r, "az-2", "PlacementAZ 2", "subnet-2");
@@ -676,11 +743,13 @@ public class UniverseControllerTest extends WithApplication {
       .put("numNodes", 5)
       .put("instanceType", i.getInstanceTypeCode())
       .put("replicationFactor", 3)
-      .put("provider", p.uuid.toString());
+      .put("provider", p.uuid.toString())
+      .put("accessKeyCode", accessKeyCode);
     ArrayNode regionList = Json.newArray().add(r.uuid.toString());
     userIntentJson.set("regionList", regionList);
     ArrayNode clustersJsonArray = Json.newArray().add(Json.newObject().set("userIntent", userIntentJson));
     bodyJson.set("clusters", clustersJsonArray);
+    bodyJson.set("nodeDetailsSet", Json.newArray());
 
     String url = "/api/customers/" + customer.uuid + "/universes/" + u.universeUUID;
     Result result = doRequestWithAuthTokenAndBody("PUT", url, authToken, bodyJson);
@@ -729,7 +798,7 @@ public class UniverseControllerTest extends WithApplication {
   @Test
   public void testUniverseDestroyValidUUID() {
     UUID fakeTaskUUID = UUID.randomUUID();
-    when(mockCommissioner.submit(Matchers.any(TaskType.class), Matchers.any(UniverseDefinitionTaskParams.class)))
+    when(mockCommissioner.submit(any(), any()))
         .thenReturn(fakeTaskUUID);
     Universe u = createUniverse(customer.getCustomerId());
 
@@ -753,7 +822,7 @@ public class UniverseControllerTest extends WithApplication {
     JsonNode json = Json.parse(contentAsString(result));
     assertValue(json, "taskUUID", fakeTaskUUID.toString());
 
-    CustomerTask th = CustomerTask.find.where().eq("task_uuid", fakeTaskUUID).findUnique();
+    CustomerTask th = CustomerTask.find.query().where().eq("task_uuid", fakeTaskUUID).findOne();
     assertNotNull(th);
     assertThat(th.getCustomerUUID(), allOf(notNullValue(), equalTo(customer.uuid)));
     assertThat(th.getTargetName(), allOf(notNullValue(), equalTo("Test Universe")));
@@ -766,13 +835,13 @@ public class UniverseControllerTest extends WithApplication {
   @Test
   public void testUniverseDestroyValidUUIDIsForceDelete() {
     UUID fakeTaskUUID = UUID.randomUUID();
-    when(mockCommissioner.submit(Matchers.any(TaskType.class), Matchers.any(UniverseDefinitionTaskParams.class)))
+    when(mockCommissioner.submit(any(), any()))
         .thenReturn(fakeTaskUUID);
     Universe u = createUniverse(customer.getCustomerId());
 
     UUID randUUID = UUID.randomUUID();
-    CustomerTask tt = CustomerTask.create(customer, u.universeUUID, randUUID,
-        CustomerTask.TargetType.Backup, CustomerTask.TaskType.Create, "test");
+    CustomerTask.create(customer, u.universeUUID, randUUID, CustomerTask.TargetType.Backup,
+        CustomerTask.TaskType.Create, "test");
 
     // Add the cloud info into the universe.
     Universe.UniverseUpdater updater = new Universe.UniverseUpdater() {
@@ -795,12 +864,11 @@ public class UniverseControllerTest extends WithApplication {
     JsonNode json = Json.parse(contentAsString(result));
     assertValue(json, "taskUUID", fakeTaskUUID.toString());
 
-    CustomerTask th = CustomerTask.find.where().eq("task_uuid", fakeTaskUUID).findUnique();
+    CustomerTask th = CustomerTask.find.query().where().eq("task_uuid", fakeTaskUUID).findOne();
     assertNotNull(th);
     assertThat(th.getCustomerUUID(), allOf(notNullValue(), equalTo(customer.uuid)));
     assertThat(th.getTargetName(), allOf(notNullValue(), equalTo("Test Universe")));
     assertThat(th.getType(), allOf(notNullValue(), equalTo(CustomerTask.TaskType.Delete)));
-
     assertNotNull(CustomerTask.findByTaskUUID(randUUID).getCompletionTime());
 
     assertTrue(customer.getUniverseUUIDs().isEmpty());
@@ -810,23 +878,21 @@ public class UniverseControllerTest extends WithApplication {
   @Test
   public void testUniverseUpgradeWithEmptyParams() {
     UUID fakeTaskUUID = UUID.randomUUID();
-    when(mockCommissioner.submit(any(TaskType.class), any(UniverseDefinitionTaskParams.class)))
-        .thenReturn(fakeTaskUUID);
     UUID uUUID = createUniverse(customer.getCustomerId()).universeUUID;
     Universe.saveDetails(uUUID, ApiUtils.mockUniverseUpdater());
 
     String url = "/api/customers/" + customer.uuid + "/universes/" + uUUID + "/upgrade";
     Result result = doRequestWithAuthTokenAndBody("POST", url, authToken, Json.newObject());
     assertBadRequest(result, "clusters: This field is required");
-    assertNull(CustomerTask.find.where().eq("task_uuid", fakeTaskUUID).findUnique());
+    assertNull(CustomerTask.find.query().where().eq("task_uuid", fakeTaskUUID).findOne());
     assertAuditEntry(0, customer.uuid);
   }
 
-  private ObjectNode getValidPayload(UUID univUUID, boolean isRolling) {
+  private ObjectNode getValidPayload(UUID univUUID, String upgradeOption) {
     ObjectNode bodyJson = Json.newObject()
                               .put("universeUUID", univUUID.toString())
                               .put("taskType", "Software")
-                              .put("rollingUpgrade", isRolling)
+                              .put("upgradeOption", upgradeOption)
                               .put("ybSoftwareVersion", "0.0.1");
     ObjectNode userIntentJson = Json.newObject()
        .put("universeName", "Single UserUniverse")
@@ -850,7 +916,7 @@ public class UniverseControllerTest extends WithApplication {
     Universe.saveDetails(universeUUID, updater);
   }
 
-  private void testUniverseUpgradeWithNodesInTransitHelper(boolean isRolling) {
+  private void testUniverseUpgradeWithNodesInTransitHelper(String upgradeOption) {
     UUID fakeTaskUUID = UUID.randomUUID();
     when(mockCommissioner.submit(any(TaskType.class), any(UniverseDefinitionTaskParams.class)))
         .thenReturn(fakeTaskUUID);
@@ -859,12 +925,12 @@ public class UniverseControllerTest extends WithApplication {
 
     setInTransitNode(uUUID);
 
-    ObjectNode bodyJson = getValidPayload(uUUID, isRolling);
+    ObjectNode bodyJson = getValidPayload(uUUID, upgradeOption);
     String url = "/api/customers/" + customer.uuid + "/universes/" + uUUID + "/upgrade";
     Result result = doRequestWithAuthTokenAndBody("POST", url, authToken, bodyJson);
-    if (isRolling) {
+    if (upgradeOption.equals("Rolling")) {
       assertBadRequest(result, "as it has nodes in one of");
-      assertNull(CustomerTask.find.where().eq("task_uuid", fakeTaskUUID).findUnique());
+      assertNull(CustomerTask.find.query().where().eq("task_uuid", fakeTaskUUID).findOne());
       assertAuditEntry(0, customer.uuid);
     } else {
       assertOk(result);
@@ -876,19 +942,22 @@ public class UniverseControllerTest extends WithApplication {
 
   @Test
   public void testUniverseUpgradeWithNodesInTransit() {
-    testUniverseUpgradeWithNodesInTransitHelper(true);
+    testUniverseUpgradeWithNodesInTransitHelper("Rolling");
   }
 
   @Test
   public void testUniverseUpgradeWithNodesInTransitNonRolling() {
-    testUniverseUpgradeWithNodesInTransitHelper(false);
+    testUniverseUpgradeWithNodesInTransitHelper("Non-Rolling");
+  }
+
+  @Test
+  public void testUniverseUpgradeWithNodesInTransitNonRestart() {
+    testUniverseUpgradeWithNodesInTransitHelper("Non-Restart");
   }
 
   @Test
   public void testUniverseExpandWithTransitNodes() {
     UUID fakeTaskUUID = UUID.randomUUID();
-    when(mockCommissioner.submit(Matchers.any(TaskType.class), Matchers.any(UniverseDefinitionTaskParams.class)))
-        .thenReturn(fakeTaskUUID);
 
     Provider p = ModelFactory.awsProvider(customer);
     Region r = Region.create(p, "region-1", "PlacementRegion 1", "default-image");
@@ -916,7 +985,7 @@ public class UniverseControllerTest extends WithApplication {
     String url = "/api/customers/" + customer.uuid + "/universes/" + u.universeUUID;
     Result result = doRequestWithAuthTokenAndBody("PUT", url, authToken, bodyJson);
     assertBadRequest(result, "as it has nodes in one of");
-    assertNull(CustomerTask.find.where().eq("task_uuid", fakeTaskUUID).findUnique());
+    assertNull(CustomerTask.find.query().where().eq("task_uuid", fakeTaskUUID).findOne());
     assertAuditEntry(0, customer.uuid);
   }
 
@@ -927,7 +996,7 @@ public class UniverseControllerTest extends WithApplication {
         .thenReturn(fakeTaskUUID);
     Universe u = createUniverse(customer.getCustomerId());
 
-    ObjectNode bodyJson = getValidPayload(u.universeUUID, true);
+    ObjectNode bodyJson = getValidPayload(u.universeUUID, "Rolling");
     String url = "/api/customers/" + customer.uuid + "/universes/" + u.universeUUID + "/upgrade";
     Result result = doRequestWithAuthTokenAndBody("POST", url, authToken, bodyJson);
 
@@ -937,7 +1006,7 @@ public class UniverseControllerTest extends WithApplication {
     JsonNode json = Json.parse(contentAsString(result));
     assertValue(json, "taskUUID", fakeTaskUUID.toString());
 
-    CustomerTask th = CustomerTask.find.where().eq("task_uuid", fakeTaskUUID).findUnique();
+    CustomerTask th = CustomerTask.find.query().where().eq("task_uuid", fakeTaskUUID).findOne();
     assertNotNull(th);
     assertThat(th.getCustomerUUID(), allOf(notNullValue(), equalTo(customer.uuid)));
     assertThat(th.getTargetName(), allOf(notNullValue(), equalTo("Test Universe")));
@@ -946,10 +1015,61 @@ public class UniverseControllerTest extends WithApplication {
   }
 
   @Test
-  public void testUniverseSoftwareUpgradeWithInvalidParams() {
+  public void testUniverseRollingRestartValidParams() {
     UUID fakeTaskUUID = UUID.randomUUID();
     when(mockCommissioner.submit(any(TaskType.class), any(UniverseDefinitionTaskParams.class)))
         .thenReturn(fakeTaskUUID);
+    Universe u = createUniverse(customer.getCustomerId());
+
+    ObjectNode bodyJson = Json.newObject()
+        .put("universeUUID", u.universeUUID.toString())
+        .put("taskType", "Restart")
+        .put("upgradeOption", "Rolling");
+    ObjectNode userIntentJson = Json.newObject().put("universeName", "Single UserUniverse");
+    ArrayNode clustersJsonArray = Json.newArray().add(Json.newObject()
+                                                 .set("userIntent", userIntentJson));
+    bodyJson.set("clusters", clustersJsonArray);
+    String url = "/api/customers/" + customer.uuid + "/universes/" + u.universeUUID + "/upgrade";
+    Result result = doRequestWithAuthTokenAndBody("POST", url, authToken, bodyJson);
+
+    verify(mockCommissioner).submit(eq(TaskType.UpgradeUniverse), any(UniverseTaskParams.class));
+
+    assertOk(result);
+    JsonNode json = Json.parse(contentAsString(result));
+    assertValue(json, "taskUUID", fakeTaskUUID.toString());
+
+    CustomerTask th = CustomerTask.find.query().where().eq("task_uuid", fakeTaskUUID).findOne();
+    assertNotNull(th);
+    assertThat(th.getCustomerUUID(), allOf(notNullValue(), equalTo(customer.uuid)));
+    assertThat(th.getTargetName(), allOf(notNullValue(), equalTo("Test Universe")));
+    assertThat(th.getType(), allOf(notNullValue(), equalTo(CustomerTask.TaskType.Restart)));
+    assertAuditEntry(1, customer.uuid);
+  }
+
+  @Test
+  public void testUniverseRollingRestartNonRolling() {
+    UUID fakeTaskUUID = UUID.randomUUID();
+    when(mockCommissioner.submit(any(TaskType.class), any(UniverseDefinitionTaskParams.class)))
+        .thenReturn(fakeTaskUUID);
+    Universe u = createUniverse(customer.getCustomerId());
+
+    ObjectNode bodyJson = Json.newObject()
+        .put("universeUUID", u.universeUUID.toString())
+        .put("taskType", "Restart")
+        .put("upgradeOption", "Non-Rolling");
+    ObjectNode userIntentJson = Json.newObject().put("universeName", "Single UserUniverse");
+    ArrayNode clustersJsonArray = Json.newArray().add(Json.newObject()
+                                                 .set("userIntent", userIntentJson));
+    bodyJson.set("clusters", clustersJsonArray);
+    String url = "/api/customers/" + customer.uuid + "/universes/" + u.universeUUID + "/upgrade";
+    Result result = doRequestWithAuthTokenAndBody("POST", url, authToken, bodyJson);
+
+    assertBadRequest(result, "Rolling restart has to be a ROLLING UPGRADE.");
+    assertAuditEntry(0, customer.uuid);
+  }
+
+  @Test
+  public void testUniverseSoftwareUpgradeWithInvalidParams() {
     Universe u = createUniverse(customer.getCustomerId());
 
     ObjectNode bodyJson = Json.newObject()
@@ -993,7 +1113,7 @@ public class UniverseControllerTest extends WithApplication {
     assertValue(json, "taskUUID", fakeTaskUUID.toString());
     verify(mockCommissioner).submit(eq(TaskType.UpgradeUniverse), any(UniverseTaskParams.class));
 
-    CustomerTask th = CustomerTask.find.where().eq("task_uuid", fakeTaskUUID).findUnique();
+    CustomerTask th = CustomerTask.find.query().where().eq("task_uuid", fakeTaskUUID).findOne();
     assertNotNull(th);
     assertThat(th.getCustomerUUID(), allOf(notNullValue(), equalTo(customer.uuid)));
     assertThat(th.getTargetName(), allOf(notNullValue(), equalTo("Test Universe")));
@@ -1003,9 +1123,6 @@ public class UniverseControllerTest extends WithApplication {
 
   @Test
   public void testUniverseGFlagsUpgradeWithInvalidParams() {
-    UUID fakeTaskUUID = UUID.randomUUID();
-    when(mockCommissioner.submit(any(TaskType.class), any(UniverseDefinitionTaskParams.class)))
-        .thenReturn(fakeTaskUUID);
     Universe u = createUniverse(customer.getCustomerId());
 
     ObjectNode bodyJson = Json.newObject()
@@ -1019,15 +1136,12 @@ public class UniverseControllerTest extends WithApplication {
     String url = "/api/customers/" + customer.uuid + "/universes/" + u.universeUUID + "/upgrade";
     Result result = doRequestWithAuthTokenAndBody("POST", url, authToken, bodyJson);
 
-    assertBadRequest(result, "gflags param is required for taskType: GFlags");
+    assertBadRequest(result, "Neither master nor tserver gflags changed.");
     assertAuditEntry(0, customer.uuid);
   }
 
   @Test
   public void testUniverseGFlagsUpgradeWithSameGFlags() {
-    UUID fakeTaskUUID = UUID.randomUUID();
-    when(mockCommissioner.submit(any(TaskType.class), any(UniverseDefinitionTaskParams.class)))
-        .thenReturn(fakeTaskUUID);
     Universe u = createUniverse(customer.getCustomerId());
 
     Universe.UniverseUpdater updater = new Universe.UniverseUpdater() {
@@ -1044,7 +1158,7 @@ public class UniverseControllerTest extends WithApplication {
     ObjectNode bodyJson = Json.newObject()
         .put("universeUUID", u.universeUUID.toString())
         .put("taskType", "GFlags")
-        .put("rollingUpgrade", false);
+        .put("upgradeOption", "Non-Rolling");
     ObjectNode userIntentJson = Json.newObject().put("universeName", u.name);
     ArrayNode clustersJsonArray =
         Json.newArray().add(Json.newObject().set("userIntent", userIntentJson));
@@ -1064,9 +1178,6 @@ public class UniverseControllerTest extends WithApplication {
 
   @Test
   public void testUniverseGFlagsUpgradeWithMissingGflags() {
-    UUID fakeTaskUUID = UUID.randomUUID();
-    when(mockCommissioner.submit(any(TaskType.class), any(UniverseDefinitionTaskParams.class)))
-        .thenReturn(fakeTaskUUID);
     Universe u = createUniverse(customer.getCustomerId());
 
     ObjectNode bodyJsonMissingGFlags = Json.newObject()
@@ -1079,15 +1190,12 @@ public class UniverseControllerTest extends WithApplication {
     String url = "/api/customers/" + customer.uuid + "/universes/" + u.universeUUID + "/upgrade";
     Result result = doRequestWithAuthTokenAndBody("POST", url, authToken, bodyJsonMissingGFlags);
 
-    assertBadRequest(result, "gflags param is required for taskType: GFlags");
+    assertBadRequest(result, "Neither master nor tserver gflags changed.");
     assertAuditEntry(0, customer.uuid);
   }
 
   @Test
   public void testUniverseGFlagsUpgradeWithMalformedTServerFlags() {
-    UUID fakeTaskUUID = UUID.randomUUID();
-    when(mockCommissioner.submit(any(TaskType.class), any(UniverseDefinitionTaskParams.class)))
-        .thenReturn(fakeTaskUUID);
     Universe u = createUniverse(customer.getCustomerId());
 
     ObjectNode bodyJson = Json.newObject()
@@ -1102,15 +1210,12 @@ public class UniverseControllerTest extends WithApplication {
     String url = "/api/customers/" + customer.uuid + "/universes/" + u.universeUUID + "/upgrade";
     Result result = doRequestWithAuthTokenAndBody("POST", url, authToken, bodyJson);
 
-    assertBadRequest(result, "gflags param is required for taskType: GFlags");
+    assertBadRequest(result, "Neither master nor tserver gflags changed.");
     assertAuditEntry(0, customer.uuid);
   }
 
   @Test
   public void testUniverseGFlagsUpgradeWithMalformedMasterGFlags() {
-    UUID fakeTaskUUID = UUID.randomUUID();
-    when(mockCommissioner.submit(any(TaskType.class), any(UniverseDefinitionTaskParams.class)))
-        .thenReturn(fakeTaskUUID);
     Universe u = createUniverse(customer.getCustomerId());
 
     ObjectNode bodyJson = Json.newObject()
@@ -1125,7 +1230,7 @@ public class UniverseControllerTest extends WithApplication {
     String url = "/api/customers/" + customer.uuid + "/universes/" + u.universeUUID + "/upgrade";
     Result result = doRequestWithAuthTokenAndBody("POST", url, authToken, bodyJson);
 
-    assertBadRequest(result, "gflags param is required for taskType: GFlags");
+    assertBadRequest(result, "Neither master nor tserver gflags changed.");
     assertAuditEntry(0, customer.uuid);
   }
 
@@ -1139,7 +1244,7 @@ public class UniverseControllerTest extends WithApplication {
     ObjectNode bodyJson = Json.newObject()
       .put("universeUUID", u.universeUUID.toString())
       .put("taskType", "GFlags")
-      .put("rollingUpgrade", false);
+      .put("upgradeOption", "Non-Rolling");
     ObjectNode userIntentJson = Json.newObject().put("universeName", "Single UserUniverse");
     ArrayNode clustersJsonArray = Json.newArray().add(Json.newObject().set("userIntent", userIntentJson));
     bodyJson.set("clusters", clustersJsonArray);
@@ -1157,8 +1262,8 @@ public class UniverseControllerTest extends WithApplication {
     JsonNode json = Json.parse(contentAsString(result));
     assertValue(json, "taskUUID", fakeTaskUUID.toString());
     verify(mockCommissioner).submit(eq(TaskType.UpgradeUniverse), taskParams.capture());
-    RollingRestartParams taskParam = (RollingRestartParams) taskParams.getValue();
-    assertFalse(taskParam.rollingUpgrade);
+    UpgradeParams taskParam = (UpgradeParams) taskParams.getValue();
+    assertEquals(taskParam.upgradeOption, UpgradeParams.UpgradeOption.NON_ROLLING_UPGRADE);
     assertEquals(taskParam.masterGFlags, ImmutableMap.of("master-flag", "123"));
     assertEquals(taskParam.tserverGFlags, ImmutableMap.of("tserver-flag", "456"));
     UserIntent primaryClusterIntent = taskParam.getPrimaryCluster().userIntent;
@@ -1177,7 +1282,7 @@ public class UniverseControllerTest extends WithApplication {
     ObjectNode bodyJson = Json.newObject()
       .put("universeUUID", u.universeUUID.toString())
       .put("taskType", "Software")
-      .put("rollingUpgrade", false)
+      .put("upgradeOption", "Non-Rolling")
       .put("ybSoftwareVersion", "new-version");
     ObjectNode userIntentJson = Json.newObject()
       .put("universeName", "Single UserUniverse")
@@ -1193,8 +1298,8 @@ public class UniverseControllerTest extends WithApplication {
     JsonNode json = Json.parse(contentAsString(result));
     assertValue(json, "taskUUID", fakeTaskUUID.toString());
     verify(mockCommissioner).submit(eq(TaskType.UpgradeUniverse), taskParams.capture());
-    RollingRestartParams taskParam = (RollingRestartParams) taskParams.getValue();
-    assertFalse(taskParam.rollingUpgrade);
+    UpgradeParams taskParam = (UpgradeParams) taskParams.getValue();
+    assertEquals(taskParam.upgradeOption, UpgradeParams.UpgradeOption.NON_ROLLING_UPGRADE);
     assertEquals("new-version", taskParam.ybSoftwareVersion);
     assertAuditEntry(1, customer.uuid);
   }
@@ -1241,6 +1346,26 @@ public class UniverseControllerTest extends WithApplication {
   }
 
   @Test
+  public void testResetVersionUniverseBadUUID() {
+    UUID universeUUID = UUID.randomUUID();
+    String url = "/api/customers/" + customer.uuid + "/universes/" +
+      universeUUID + "/setup_universe_2dc";
+    Result result = doRequestWithAuthToken("PUT", url, authToken);
+    assertBadRequest(result, "No universe found with UUID: " + universeUUID);
+  }
+
+  @Test
+  public void testResetVersionUniverse() {
+    Universe u = createUniverse("TestUniverse", customer.getCustomerId());
+    String url = "/api/customers/" + customer.uuid + "/universes/" +
+      u.universeUUID + "/setup_universe_2dc";
+    assertNotEquals(Universe.get(u.universeUUID).version, -1);
+    Result result = doRequestWithAuthToken("PUT", url, authToken);
+    assertOk(result);
+    assertEquals(Universe.get(u.universeUUID).version, -1);
+  }
+
+  @Test
   public void testFindByNameWithUniverseDoesNotExist() {
     createUniverse(customer.getCustomerId());
     String url = "/api/customers/" + customer.uuid + "/universes/find/FakeUniverse";
@@ -1251,10 +1376,6 @@ public class UniverseControllerTest extends WithApplication {
 
   @Test
   public void testCustomConfigureCreateWithMultiAZMultiRegion() {
-    UUID fakeTaskUUID = UUID.randomUUID();
-    when(mockCommissioner.submit(Matchers.any(TaskType.class),
-         Matchers.any(UniverseDefinitionTaskParams.class)))
-        .thenReturn(fakeTaskUUID);
     Provider p = ModelFactory.awsProvider(customer);
     Region r = Region.create(p, "region-1", "PlacementRegion 1", "default-image");
     AvailabilityZone.create(r, "az-1", "PlacementAZ 1", "subnet-1");
@@ -1305,9 +1426,6 @@ public class UniverseControllerTest extends WithApplication {
 
   @Test
   public void testConfigureCreateWithReadOnlyClusters() {
-    UUID fakeTaskUUID = UUID.randomUUID();
-    when(mockCommissioner.submit(Matchers.any(TaskType.class), Matchers.any(UniverseDefinitionTaskParams.class)))
-        .thenReturn(fakeTaskUUID);
     Provider p = ModelFactory.awsProvider(customer);
     Region r = Region.create(p, "region-1", "PlacementRegion 1", "default-image");
     AvailabilityZone.create(r, "az-1", "PlacementAZ 1", "subnet-1");
@@ -1383,10 +1501,6 @@ public class UniverseControllerTest extends WithApplication {
 
   @Test
   public void testCustomConfigureEditWithPureExpand() {
-    UUID fakeTaskUUID = UUID.randomUUID();
-    when(mockCommissioner.submit(Matchers.any(TaskType.class),
-        Matchers.any(UniverseDefinitionTaskParams.class)))
-        .thenReturn(fakeTaskUUID);
     Provider p = ModelFactory.awsProvider(customer);
     Universe u = createUniverse(customer.getCustomerId());
 
@@ -1484,9 +1598,6 @@ public class UniverseControllerTest extends WithApplication {
 
   @Test
   public void testOnPremConfigureCreateWithValidAZInstanceTypeComboNotEnoughNodes() {
-    UUID fakeTaskUUID = UUID.randomUUID();
-    when(mockCommissioner.submit(Matchers.any(TaskType.class), Matchers.any(UniverseDefinitionTaskParams.class)))
-      .thenReturn(fakeTaskUUID);
     Provider p = ModelFactory.newProvider(customer, CloudType.onprem);
     Region r = Region.create(p, "region-1", "PlacementRegion 1", "default-image");
     AvailabilityZone az1 = AvailabilityZone.create(r, "az-1", "PlacementAZ 1", "subnet-1");
@@ -1520,9 +1631,6 @@ public class UniverseControllerTest extends WithApplication {
 
   @Test
   public void testOnPremConfigureCreateInvalidAZNodeComboNonEmptyNodeDetailsSet() {
-    UUID fakeTaskUUID = UUID.randomUUID();
-    when(mockCommissioner.submit(Matchers.any(TaskType.class), Matchers.any(UniverseDefinitionTaskParams.class)))
-      .thenReturn(fakeTaskUUID);
     Provider p = ModelFactory.newProvider(customer, CloudType.onprem);
     Region r = Region.create(p, "region-1", "PlacementRegion 1", "default-image");
     AvailabilityZone az1 = AvailabilityZone.create(r, "az-1", "PlacementAZ 1", "subnet-1");
@@ -1566,10 +1674,6 @@ public class UniverseControllerTest extends WithApplication {
 
   @Test
   public void testOnPremConfigureValidAZNodeComboNonEmptyNodeDetailsSet() {
-
-    UUID fakeTaskUUID = UUID.randomUUID();
-    when(mockCommissioner.submit(Matchers.any(TaskType.class), Matchers.any(UniverseDefinitionTaskParams.class)))
-      .thenReturn(fakeTaskUUID);
     Provider p = ModelFactory.newProvider(customer, CloudType.onprem);
     Region r = Region.create(p, "region-1", "PlacementRegion 1", "default-image");
     AvailabilityZone az1 = AvailabilityZone.create(r, "az-1", "PlacementAZ 1", "subnet-1");
@@ -1594,9 +1698,6 @@ public class UniverseControllerTest extends WithApplication {
 
   @Test
   public void testConfigureEditOnPremInvalidNodeAZCombo() {
-    UUID fakeTaskUUID = UUID.randomUUID();
-    when(mockCommissioner.submit(Matchers.any(TaskType.class), Matchers.any(UniverseDefinitionTaskParams.class)))
-      .thenReturn(fakeTaskUUID);
     Provider p = ModelFactory.newProvider(customer, CloudType.onprem);
     Region r = Region.create(p, "region-1", "PlacementRegion 1", "default-image");
     AvailabilityZone az1 = AvailabilityZone.create(r, "az-1", "PlacementAZ 1", "subnet-1");
@@ -1659,8 +1760,9 @@ public class UniverseControllerTest extends WithApplication {
     when(mockCommissioner.submit(Matchers.any(TaskType.class),
             Matchers.any(UniverseDefinitionTaskParams.class)))
             .thenReturn(fakeTaskUUID);
-    when(mockAppConfig.getString("yb.storage.path")).thenReturn("/opt/yugaware");
     Provider p = ModelFactory.awsProvider(customer);
+    String accessKeyCode = "someKeyCode";
+    AccessKey.create(p.uuid, accessKeyCode, new AccessKey.KeyInfo());
 
     Region r = Region.create(p, "region-1", "PlacementRegion 1", "default-image");
     AvailabilityZone.create(r, "az-1", "PlacementAZ 1", "subnet-1");
@@ -1672,13 +1774,14 @@ public class UniverseControllerTest extends WithApplication {
     ObjectNode bodyJson = (ObjectNode) Json.toJson(taskParams);
 
     ObjectNode userIntentJson = Json.newObject()
-            .put("universeName", "encryptionAtRestUniverse")
-            .put("instanceType", i.getInstanceTypeCode())
-            .put("enableNodeToNodeEncrypt", true)
-            .put("enableClientToNodeEncrypt", true)
-            .put("replicationFactor", 3)
-            .put("numNodes", 3)
-            .put("provider", p.uuid.toString());
+      .put("universeName", "encryptionAtRestUniverse")
+      .put("instanceType", i.getInstanceTypeCode())
+      .put("enableNodeToNodeEncrypt", true)
+      .put("enableClientToNodeEncrypt", true)
+      .put("replicationFactor", 3)
+      .put("numNodes", 3)
+      .put("provider", p.uuid.toString())
+      .put("accessKeyCode", accessKeyCode);
 
     ArrayNode regionList = Json.newArray().add(r.uuid.toString());
     userIntentJson.set("regionList", regionList);
@@ -1693,7 +1796,6 @@ public class UniverseControllerTest extends WithApplication {
 
     String url = "/api/customers/" + customer.uuid + "/universes";
     Result result = doRequestWithAuthTokenAndBody("POST", url, authToken, bodyJson);
-    ArgumentCaptor<UniverseTaskParams> argCaptor = ArgumentCaptor.forClass(UniverseTaskParams.class);
     JsonNode json = Json.parse(contentAsString(result));
     assertOk(result);
 
@@ -1706,7 +1808,11 @@ public class UniverseControllerTest extends WithApplication {
     );
     assertTrue(!key.exists());
     assertValue(json, "taskUUID", fakeTaskUUID.toString());
+
+    ArgumentCaptor<UniverseTaskParams> argCaptor = ArgumentCaptor
+        .forClass(UniverseTaskParams.class);
     verify(mockCommissioner).submit(eq(TaskType.CreateUniverse), argCaptor.capture());
+
     // The KMS provider service should not begin to make any requests since there is no KMS config
     verify(mockApiHelper, times(0)).postRequest(any(String.class), any(JsonNode.class), anyMap());
     assertAuditEntry(1, customer.uuid);
@@ -1718,9 +1824,9 @@ public class UniverseControllerTest extends WithApplication {
     when(mockCommissioner.submit(Matchers.any(TaskType.class),
             Matchers.any(UniverseDefinitionTaskParams.class)))
             .thenReturn(fakeTaskUUID);
-    when(mockAppConfig.getString("yb.storage.path")).thenReturn("/opt/yugaware");
     Provider p = ModelFactory.awsProvider(customer);
-
+    String accessKeyCode = "someKeyCode";
+    AccessKey.create(p.uuid, accessKeyCode, new AccessKey.KeyInfo());
     Region r = Region.create(p, "region-1", "PlacementRegion 1", "default-image");
     AvailabilityZone.create(r, "az-1", "PlacementAZ 1", "subnet-1");
     AvailabilityZone.create(r, "az-2", "PlacementAZ 2", "subnet-2");
@@ -1731,13 +1837,14 @@ public class UniverseControllerTest extends WithApplication {
     ObjectNode bodyJson = (ObjectNode) Json.toJson(taskParams);
 
     ObjectNode userIntentJson = Json.newObject()
-            .put("universeName", "encryptionAtRestUniverse")
-            .put("instanceType", i.getInstanceTypeCode())
-            .put("enableNodeToNodeEncrypt", true)
-            .put("enableClientToNodeEncrypt", true)
-            .put("replicationFactor", 3)
-            .put("numNodes", 3)
-            .put("provider", p.uuid.toString());
+      .put("universeName", "encryptionAtRestUniverse")
+      .put("instanceType", i.getInstanceTypeCode())
+      .put("enableNodeToNodeEncrypt", true)
+      .put("enableClientToNodeEncrypt", true)
+      .put("replicationFactor", 3)
+      .put("numNodes", 3)
+      .put("provider", p.uuid.toString())
+      .put("accessKeyCode", accessKeyCode);
 
     ArrayNode regionList = Json.newArray().add(r.uuid.toString());
     userIntentJson.set("regionList", regionList);
@@ -1752,20 +1859,17 @@ public class UniverseControllerTest extends WithApplication {
                     .put("configUUID", kmsConfig.configUUID.toString())
                     .put("key_op", "ENABLE")
     );
-    when(mockEARManager.generateUniverseKey(
-            any(UUID.class),
-            any(UUID.class),
-            any(EncryptionAtRestConfig.class)
-    )).thenReturn(new String("some_universe_encryption_key").getBytes());
     String url = "/api/customers/" + customer.uuid + "/universes";
     Result result = doRequestWithAuthTokenAndBody("POST", url, authToken, bodyJson);
-    ArgumentCaptor<UniverseTaskParams> argCaptor = ArgumentCaptor.forClass(UniverseTaskParams.class);
     JsonNode json = Json.parse(contentAsString(result));
     assertOk(result);
 
     // Check that the encryption was enabled successfully
     JsonNode userIntent = json.get("universeDetails").get("clusters").get(0).get("userIntent");
     assertValue(json, "taskUUID", fakeTaskUUID.toString());
+
+    ArgumentCaptor<UniverseTaskParams> argCaptor = ArgumentCaptor
+        .forClass(UniverseTaskParams.class);
     verify(mockCommissioner).submit(eq(TaskType.CreateUniverse), argCaptor.capture());
     assertAuditEntry(1, customer.uuid);
   }
@@ -1773,13 +1877,12 @@ public class UniverseControllerTest extends WithApplication {
   @Test
   public void testUniverseSetKey() {
     UUID fakeTaskUUID = UUID.randomUUID();
-    when(mockCommissioner.submit(Matchers.any(TaskType.class),
-            Matchers.any(UniverseDefinitionTaskParams.class)))
-            .thenReturn(fakeTaskUUID);
-    when(mockAppConfig.getString("yb.storage.path")).thenReturn("/opt/yugaware");
+    when(mockCommissioner.submit(any(), any())).thenReturn(fakeTaskUUID);
 
     // Create the universe with encryption enabled through SMARTKEY KMS provider
     Provider p = ModelFactory.awsProvider(customer);
+    String accessKeyCode = "someKeyCode";
+    AccessKey.create(p.uuid, accessKeyCode, new AccessKey.KeyInfo());
     Region r = Region.create(p, "region-1", "PlacementRegion 1", "default-image");
     AvailabilityZone.create(r, "az-1", "PlacementAZ 1", "subnet-1");
     AvailabilityZone.create(r, "az-2", "PlacementAZ 2", "subnet-2");
@@ -1791,13 +1894,14 @@ public class UniverseControllerTest extends WithApplication {
     ObjectNode createBodyJson = (ObjectNode) Json.toJson(createTaskParams);
 
     ObjectNode userIntentJson = Json.newObject()
-            .put("universeName", "encryptionAtRestUniverse")
-            .put("instanceType", i.getInstanceTypeCode())
-            .put("enableNodeToNodeEncrypt", true)
-            .put("enableClientToNodeEncrypt", true)
-            .put("replicationFactor", 3)
-            .put("numNodes", 3)
-            .put("provider", p.uuid.toString());
+      .put("universeName", "encryptionAtRestUniverse")
+      .put("instanceType", i.getInstanceTypeCode())
+      .put("enableNodeToNodeEncrypt", true)
+      .put("enableClientToNodeEncrypt", true)
+      .put("replicationFactor", 3)
+      .put("numNodes", 3)
+      .put("provider", p.uuid.toString())
+      .put("accessKeyCode", accessKeyCode);
 
     ArrayNode regionList = Json.newArray().add(r.uuid.toString());
     userIntentJson.set("regionList", regionList);
@@ -1830,16 +1934,8 @@ public class UniverseControllerTest extends WithApplication {
     assertNotNull(json.get("universeUUID"));
     String testUniUUID = json.get("universeUUID").asText();
 
-    when(mockEARManager.generateUniverseKey(
-            eq(kmsConfig.configUUID),
-            eq(UUID.fromString(testUniUUID)),
-            any(EncryptionAtRestConfig.class)
-    )).thenReturn(new String("some_universe_encryption_key").getBytes());
-
     fakeTaskUUID = UUID.randomUUID();
-    when(mockCommissioner.submit(Matchers.any(TaskType.class),
-            Matchers.any(UniverseDefinitionTaskParams.class)))
-            .thenReturn(fakeTaskUUID);
+    when(mockCommissioner.submit(any(), any())).thenReturn(fakeTaskUUID);
     // Rotate the universe key
     EncryptionAtRestKeyParams taskParams = new EncryptionAtRestKeyParams();
     ObjectNode bodyJson = (ObjectNode) Json.toJson(taskParams);
@@ -1858,55 +1954,24 @@ public class UniverseControllerTest extends WithApplication {
 
   @Test
   public void testRunQueryWithInvalidUniverse() {
+    // Setting platform type as correct.
+    when(mockAppConfig.getString("yb.mode", "PLATFORM")).thenReturn("OSS");
+    // Setting insecure mode.
+    ConfigHelper configHelper = new ConfigHelper();
+    configHelper.loadConfigToDB(ConfigHelper.ConfigType.Security,
+        ImmutableMap.of("level", "insecure"));
+
     Customer c2 = ModelFactory.testCustomer("tc2", "Test Customer 2");
     Universe u = createUniverse(c2.getCustomerId());
     ObjectNode bodyJson = Json.newObject();
     String url = "/api/customers/" + customer.uuid + "/universes/" + u.universeUUID +
         "/run_query";
-    Result result = doRequestWithAuthTokenAndBody("POST", url, authToken, bodyJson);
+    Http.RequestBuilder request = Helpers.fakeRequest("POST", url).header("X-AUTH-TOKEN", authToken)
+        .bodyJson(bodyJson).header("Origin", "https://" + UniverseController.LEARN_DOMAIN_NAME);
+    Result result = Helpers.route(request);
     assertBadRequest(result, String.format("Universe UUID: %s doesn't belong to Customer UUID: %s",
         u.universeUUID, customer.uuid));
     assertAuditEntry(0, customer.uuid);
-  }
-
-  @Test
-  public void testRunQueryWithoutInsecureMode() {
-    Universe u = createUniverse(customer.getCustomerId());
-    customer.addUniverseUUID(u.universeUUID);
-    customer.save();
-    ObjectNode bodyJson = Json.newObject()
-        .put("query", "select * from product limit 1")
-        .put("db_name", "demo");
-    String url = "/api/customers/" + customer.uuid + "/universes/" + u.universeUUID +
-        "/run_query";
-    Result result = doRequestWithAuthTokenAndBody("POST", url, authToken, bodyJson);
-    assertBadRequest(result, "run_query not supported for this application");
-    assertAuditEntry(0, customer.uuid);
-  }
-
-  @Test
-  public void testRunQueryWithInsecureMode() {
-    Universe u = createUniverse(customer.getCustomerId());
-    customer.addUniverseUUID(u.universeUUID);
-    customer.save();
-
-    ConfigHelper configHelper = new ConfigHelper();
-    configHelper.loadConfigToDB(ConfigHelper.ConfigType.Security,
-        ImmutableMap.of("level", "insecure"));
-
-    ObjectNode bodyJson = Json.newObject()
-        .put("query", "select * from product limit 1")
-        .put("db_name", "demo");
-    String url = "/api/customers/" + customer.uuid + "/universes/" + u.universeUUID +
-        "/run_query";
-
-    when(mockYsqlQueryExecutor.executeQuery(any(), any()))
-        .thenReturn(Json.newObject().put("foo", "bar"));
-    Result result = doRequestWithAuthTokenAndBody("POST", url, authToken, bodyJson);
-    JsonNode json = Json.parse(contentAsString(result));
-    assertOk(result);
-    assertEquals("bar", json.get("foo").asText());
-    assertAuditEntry(1, customer.uuid);
   }
 
   @Test
@@ -1917,8 +1982,7 @@ public class UniverseControllerTest extends WithApplication {
     String url = "/api/customers/" + customer.uuid + "/universes/" + u.universeUUID +
         "/run_in_shell";
     Result result = doRequestWithAuthTokenAndBody("POST", url, authToken, bodyJson);
-    assertBadRequest(result, String.format("Universe UUID: %s doesn't belong to Customer UUID: %s",
-        u.universeUUID, customer.uuid));
+    assertBadRequest(result, UniverseController.DEPRECATED);
     assertAuditEntry(0, customer.uuid);
   }
 
@@ -1933,68 +1997,8 @@ public class UniverseControllerTest extends WithApplication {
     String url = "/api/customers/" + customer.uuid + "/universes/" + u.universeUUID +
         "/run_in_shell";
     Result result = doRequestWithAuthTokenAndBody("POST", url, authToken, bodyJson);
-    assertBadRequest(result, "run_in_shell not supported for this application");
+    assertBadRequest(result, UniverseController.DEPRECATED);
     assertAuditEntry(0, customer.uuid);
-  }
-
-  private void mockAndAssertRunInShell(Universe u,
-                                       RunInShellFormData.ShellType shellType,
-                                       String scriptLocation,
-                                       String commandFile) {
-    String url = "/api/customers/" + customer.uuid + "/universes/" + u.universeUUID +
-        "/run_in_shell";
-
-    ObjectNode bodyJson = Json.newObject()
-        .put("db_name", "demo")
-        .put("shell_type", shellType.name());
-
-    if (commandFile != null) {
-      bodyJson.put("command_file", commandFile);
-    } else {
-      bodyJson.put("command", "select * from product limit 1");
-    }
-
-    if (scriptLocation != null) {
-      bodyJson.put("shell_location", scriptLocation);
-    } else {
-      Application application = Play.current().injector().instanceOf(Application.class);
-      scriptLocation = application.path().getAbsolutePath() + "/../bin";
-    }
-
-    ShellProcessHandler.ShellResponse response = new ShellProcessHandler.ShellResponse();
-    response.message = "Some Response";
-    when(mockShellProcessHandler.run(anyList(), anyMap(), anyBoolean())).thenReturn(response);
-    Result result = doRequestWithAuthTokenAndBody("POST", url, authToken, bodyJson);
-    ArgumentCaptor<ArrayList> command = ArgumentCaptor.forClass(ArrayList.class);
-    ArgumentCaptor<HashMap> config = ArgumentCaptor.forClass(HashMap.class);
-    ArgumentCaptor<Boolean> logOutput = ArgumentCaptor.forClass(Boolean.class);
-    Mockito.verify(mockShellProcessHandler, times(1))
-        .run(command.capture(), (Map<String, String>) config.capture(), logOutput.capture());
-    List<String> shellCommand = new ArrayList<>();
-    if (shellType.equals(RunInShellFormData.ShellType.YSQLSH)) {
-      shellCommand.addAll(ImmutableList.of(scriptLocation + "/ysqlsh", "-h", "host-n1",
-          "-p", "5433", "-d", "demo"));
-      if (bodyJson.has("command_file")) {
-        shellCommand.addAll(ImmutableList.of("-f",
-            scriptLocation + "/" + bodyJson.get("command_file").asText()));
-      } else {
-        shellCommand.addAll(ImmutableList.of("-c", bodyJson.get("command").asText()));
-      }
-    } else if (shellType.equals(RunInShellFormData.ShellType.YCQLSH)) {
-      shellCommand.addAll(ImmutableList.of(scriptLocation + "/cqlsh", "host-n1",
-          "9042", "-k", "demo"));
-      if (bodyJson.has("command_file")) {
-        shellCommand.addAll(ImmutableList.of("-f",
-            scriptLocation + "/" + bodyJson.get("command_file").asText()));
-      } else {
-        shellCommand.addAll(ImmutableList.of("-e", bodyJson.get("command").asText()));
-      }
-    }
-    assertEquals(shellCommand, command.getValue());
-    assertFalse(logOutput.getValue());
-    assertTrue(config.getValue().isEmpty());
-    assertOk(result);
-    assertEquals("\"Some Response\"", contentAsString(result));
   }
 
   @Test
@@ -2008,48 +2012,57 @@ public class UniverseControllerTest extends WithApplication {
     configHelper.loadConfigToDB(ConfigHelper.ConfigType.Security,
         ImmutableMap.of("level", "insecure"));
 
-    for(RunInShellFormData.ShellType shellType: RunInShellFormData.ShellType.values()) {
-      mockAndAssertRunInShell(u, shellType, null, "/share/myscript.sql");
-      reset(mockShellProcessHandler);
-      mockAndAssertRunInShell(u, shellType, null, null);
-      reset(mockShellProcessHandler);
+    String url = "/api/customers/" + customer.uuid + "/universes/" + u.universeUUID
+        + "/run_in_shell";
+    for (RunInShellFormData.ShellType shellType : RunInShellFormData.ShellType.values()) {
+      ObjectNode bodyJson = Json.newObject().put("db_name", "demo")
+          .put("shell_type", shellType.name()).put("command", "select * from product limit 1");
+      Result result = doRequestWithAuthTokenAndBody("POST", url, authToken, bodyJson);
+      assertBadRequest(result, UniverseController.DEPRECATED);
+      assertAuditEntry(0, customer.uuid);
     }
-    assertAuditEntry(RunInShellFormData.ShellType.values().length * 2, customer.uuid);
   }
 
   @Test
-  public void testRunInShellWithInsecureModeAndScriptLocation() {
+  // @formatter:off
+  @Parameters({
+                // cloud customer, normal username
+                "true,  foo, foo, baz, baz, true, true,",
+                // not cloud customer
+                "false, foo, foo, baz, baz, false, false, Invalid Customer type",
+                // cloud customer, double quotes in username
+                "true,  foo, foo, ba\"z, baz, false, false, Invalid username",
+                // cloud customer, username surrounded by double quotes
+                "true,  foo, foo, \"baz\", baz, true, true,",
+                // cloud customer, username surrounded by double quotes + double quotes inside
+                "true,  foo, foo, \"ba\"z\", baz, false, false, Invalid username",
+                // cloud customer, backslash in username
+                "true,  foo, foo, ba\\z, baz, true, true,",
+                // cloud customer, only YSQL user
+                "true, foo,, baz, baz, true, false,",
+                // cloud customer, only YCQL user
+                "true,, foo, baz, baz, false, true,",
+                // cloud customer, neither YSQL nor YCQL user
+                "true,,, baz, baz, false, false, Need to provide YSQL and/or YCQL username.",
+              })
+  // @formatter:on
+  public void testCreateUserInDB(boolean isCloudCustomer, String ysqlAdminUsername,
+      String ycqlAdminUsername, String username, String password, boolean ysqlProcessed,
+      boolean ycqlProcessed, String responseError) {
     Universe u = createUniverse(customer.getCustomerId());
-    customer.addUniverseUUID(u.universeUUID);
-    customer.save();
-    u = Universe.saveDetails(u.universeUUID, ApiUtils.mockUniverseUpdaterWithYSQLNodes(true));
-
-    ConfigHelper configHelper = new ConfigHelper();
-    configHelper.loadConfigToDB(ConfigHelper.ConfigType.Security,
-        ImmutableMap.of("level", "insecure"));
-
-    for(RunInShellFormData.ShellType shellType: RunInShellFormData.ShellType.values()) {
-      mockAndAssertRunInShell(u, shellType, "/tmp/bin", "../share/myscript.sql");
-      reset(mockShellProcessHandler);
-      mockAndAssertRunInShell(u, shellType, "/tmp/bin", null);
-      reset(mockShellProcessHandler);
+    if (isCloudCustomer) {
+      customer.code = "cloud";
     }
-    assertAuditEntry(RunInShellFormData.ShellType.values().length * 2, customer.uuid);
-  }
-
-  @Test
-  public void testCreateUserInDB() {
-    Universe u = createUniverse(customer.getCustomerId());
     customer.addUniverseUUID(u.universeUUID);
     customer.save();
     ObjectNode bodyJson = Json.newObject()
-        .put("ycqlAdminUsername", "foo")
-        .put("ysqlAdminUsername", "foo")
+        .put("ycqlAdminUsername", ycqlAdminUsername)
+        .put("ysqlAdminUsername", ysqlAdminUsername)
         .put("ycqlAdminPassword", "bar")
         .put("ysqlAdminPassword", "bar")
         .put("dbName", "test")
-        .put("username", "baz")
-        .put("password", "baz");
+        .put("username", username)
+        .put("password", password);
     String url = "/api/customers/" + customer.uuid + "/universes/" + u.universeUUID +
         "/create_db_credentials";
     when(mockYsqlQueryExecutor.executeQuery(any(), any(), any(), any()))
@@ -2060,30 +2073,64 @@ public class UniverseControllerTest extends WithApplication {
     ArgumentCaptor<Universe> universe = ArgumentCaptor.forClass(Universe.class);
     ArgumentCaptor<RunQueryFormData> info = ArgumentCaptor.forClass(RunQueryFormData.class);
     ArgumentCaptor<Boolean> auth = ArgumentCaptor.forClass(Boolean.class);
-    ArgumentCaptor<String> username = ArgumentCaptor.forClass(String.class);
-    ArgumentCaptor<String> password = ArgumentCaptor.forClass(String.class);
-    Mockito.verify(mockYcqlQueryExecutor, times(1))
-        .executeQuery(universe.capture(), info.capture(), auth.capture(),
-                      username.capture(), password.capture());
-    Mockito.verify(mockYsqlQueryExecutor, times(1))
-        .executeQuery(universe.capture(), info.capture(),
-                      username.capture(), password.capture());
-    assertOk(result);
+    ArgumentCaptor<String> usernameCaptor = ArgumentCaptor.forClass(String.class);
+    ArgumentCaptor<String> passwordCaptor = ArgumentCaptor.forClass(String.class);
+    Mockito.verify(mockYcqlQueryExecutor, times(ycqlProcessed ? 1 : 0)).executeQuery(
+        universe.capture(), info.capture(), auth.capture(), usernameCaptor.capture(),
+        passwordCaptor.capture());
+    Mockito.verify(mockYsqlQueryExecutor, times(ysqlProcessed ? 1 : 0)).executeQuery(
+        universe.capture(), info.capture(), usernameCaptor.capture(), passwordCaptor.capture());
+    if (ycqlProcessed || ysqlProcessed) {
+      assertOk(result);
+    } else {
+      assertErrorResponse(result, responseError);
+    }
     assertAuditEntry(0, customer.uuid);
   }
 
   @Test
-  public void testSetDatabaseCredentials() {
+  // @formatter:off
+  @Parameters({
+                // cloud customer, normal username
+                "true,  baz, baz, baz, baz, true, true,",
+                // not cloud customer
+                "false, baz, baz, baz, baz, false, false, Invalid Customer type",
+                // cloud customer, double quotes in username
+                "true,  ba\"z, baz, baz, baz, false, false, Invalid username",
+                // cloud customer, usernames surrounded by double quotes
+                "true,  \"baz\", baz, \"baz\", baz, true, true,",
+                // cloud customer, double quotes in username which surrounded by double quotes
+                "true,  \"ba\"z\", baz, baz, baz, false, false, Invalid username",
+                // cloud customer, backslash in username
+                "true,  ba\\z, baz, baz, baz, true, true,",
+                // cloud customer, only YSQL user
+                "true,  baz, baz,,, true, false,",
+                // cloud customer, only YSQL user, YCQL user is set as ""
+                "true,  baz, baz, \"\", baz, true, false,",
+                // cloud customer, only YCQL user
+                "true,,, baz, baz, false, true,",
+                // cloud customer, only YCQL user, YSQL user is set as ""
+                "true, \"\", baz, baz, baz, false, true,",
+                // cloud customer, neither YSQL nor YCQL user
+                "true,,,,, false, false, Need to provide YSQL and/or YCQL username.",
+              })
+  // @formatter:on
+  public void testSetDatabaseCredentials(boolean isCloudCustomer, String ysqlAdminUsername,
+      String ysqlPassword, String ycqlAdminUsername, String ycqlPassword, boolean ysqlProcessed,
+      boolean ycqlProcessed, String responseError) {
     Universe u = createUniverse(customer.getCustomerId());
+    if (isCloudCustomer) {
+      customer.code = "cloud";
+    }
     customer.addUniverseUUID(u.universeUUID);
     customer.save();
     ObjectNode bodyJson = Json.newObject()
-        .put("ycqlAdminUsername", "foo")
-        .put("ysqlAdminUsername", "foo")
+        .put("ycqlAdminUsername", ycqlAdminUsername)
+        .put("ysqlAdminUsername", ysqlAdminUsername)
         .put("ycqlCurrAdminPassword", "foo")
         .put("ysqlCurrAdminPassword", "foo")
-        .put("ycqlAdminPassword", "bar")
-        .put("ysqlAdminPassword", "bar")
+        .put("ycqlAdminPassword", ycqlPassword)
+        .put("ysqlAdminPassword", ysqlPassword)
         .put("dbName", "test");
     String url = "/api/customers/" + customer.uuid + "/universes/" + u.universeUUID +
         "/update_db_credentials";
@@ -2095,15 +2142,320 @@ public class UniverseControllerTest extends WithApplication {
     ArgumentCaptor<Universe> universe = ArgumentCaptor.forClass(Universe.class);
     ArgumentCaptor<RunQueryFormData> info = ArgumentCaptor.forClass(RunQueryFormData.class);
     ArgumentCaptor<Boolean> auth = ArgumentCaptor.forClass(Boolean.class);
-    ArgumentCaptor<String> username = ArgumentCaptor.forClass(String.class);
-    ArgumentCaptor<String> password = ArgumentCaptor.forClass(String.class);
-    Mockito.verify(mockYcqlQueryExecutor, times(1))
-        .executeQuery(universe.capture(), info.capture(), auth.capture(),
-                      username.capture(), password.capture());
-    Mockito.verify(mockYsqlQueryExecutor, times(1))
-        .executeQuery(universe.capture(), info.capture(),
-                      username.capture(), password.capture());
+    ArgumentCaptor<String> usernameCaptor = ArgumentCaptor.forClass(String.class);
+    ArgumentCaptor<String> passwordCaptor = ArgumentCaptor.forClass(String.class);
+    Mockito.verify(mockYcqlQueryExecutor, times(ycqlProcessed ? 1 : 0)).executeQuery(
+        universe.capture(), info.capture(), auth.capture(), usernameCaptor.capture(),
+        passwordCaptor.capture());
+    Mockito.verify(mockYsqlQueryExecutor, times(ysqlProcessed ? 1 : 0)).executeQuery(
+        universe.capture(), info.capture(), usernameCaptor.capture(), passwordCaptor.capture());
+    if (ycqlProcessed || ysqlProcessed) {
+      assertOk(result);
+    } else {
+      assertErrorResponse(result, responseError);
+    }
+    assertAuditEntry(0, customer.uuid);
+  }
+
+  private void setupDiskUpdateTest(int diskSize, String instanceType,
+                                   PublicCloudConstants.StorageType storageType,
+                                   Universe u) {
+
+    Universe.UniverseUpdater updater = new Universe.UniverseUpdater() {
+      @Override
+      public void run(Universe universe) {
+        UniverseDefinitionTaskParams universeDetails = new UniverseDefinitionTaskParams();
+        UserIntent userIntent = new UserIntent();
+        userIntent.instanceType = instanceType;
+        userIntent.providerType = CloudType.aws;
+        DeviceInfo di = new DeviceInfo();
+        di.volumeSize = diskSize;
+        di.numVolumes = 2;
+        di.storageType = storageType;
+        userIntent.deviceInfo = di;
+        universeDetails.upsertPrimaryCluster(userIntent, null);
+        universe.setUniverseDetails(universeDetails);
+      }
+    };
+    // Save the updates to the universe.
+    Universe.saveDetails(u.universeUUID, updater);
+  }
+
+  @Test
+  public void testExpandDiskSizeFailureInvalidSize() {
+    Universe u = createUniverse(customer.getCustomerId());
+    customer.addUniverseUUID(u.universeUUID);
+    customer.save();
+    setupDiskUpdateTest(100, "c4.xlarge", PublicCloudConstants.StorageType.GP2, u);
+    u = Universe.get(u.universeUUID);
+
+    ObjectNode bodyJson = (ObjectNode) Json.toJson(u.getUniverseDetails());
+    bodyJson.put("size", 50);
+
+    String url = "/api/customers/" + customer.uuid + "/universes/" +
+                 u.universeUUID + "/disk_update";
+    Result result = doRequestWithAuthTokenAndBody("POST", url, authToken, bodyJson);
+    assertBadRequest(result, "Size can only be increased.");
+  }
+
+  @Test
+  public void testExpandDiskSizeFailureInvalidStorage() {
+    Universe u = createUniverse(customer.getCustomerId());
+    customer.addUniverseUUID(u.universeUUID);
+    customer.save();
+    setupDiskUpdateTest(100, "c4.xlarge", PublicCloudConstants.StorageType.Scratch, u);
+    u = Universe.get(u.universeUUID);
+
+    ObjectNode bodyJson = (ObjectNode) Json.toJson(u.getUniverseDetails());
+    bodyJson.put("size", 150);
+
+    String url = "/api/customers/" + customer.uuid + "/universes/" +
+                 u.universeUUID + "/disk_update";
+    Result result = doRequestWithAuthTokenAndBody("POST", url, authToken, bodyJson);
+    assertBadRequest(result, "Scratch type disk cannot be modified.");
+  }
+
+  @Test
+  public void testExpandDiskSizeFailureInvalidInstance() {
+    Universe u = createUniverse(customer.getCustomerId());
+    customer.addUniverseUUID(u.universeUUID);
+    customer.save();
+    setupDiskUpdateTest(100, "i3.xlarge", PublicCloudConstants.StorageType.GP2, u);
+    u = Universe.get(u.universeUUID);
+
+    ObjectNode bodyJson = (ObjectNode) Json.toJson(u.getUniverseDetails());
+    bodyJson.put("size", 150);
+
+    String url = "/api/customers/" + customer.uuid + "/universes/" +
+                 u.universeUUID + "/disk_update";
+    Result result = doRequestWithAuthTokenAndBody("POST", url, authToken, bodyJson);
+    assertBadRequest(result, "Cannot modify instance volumes.");
+  }
+
+  @Test
+  public void testExpandDiskSizeSuccess() {
+    UUID fakeTaskUUID = UUID.randomUUID();
+    when(mockCommissioner.submit(Matchers.any(TaskType.class),
+            Matchers.any(UniverseDefinitionTaskParams.class)))
+            .thenReturn(fakeTaskUUID);
+    Universe u = createUniverse(customer.getCustomerId());
+    customer.addUniverseUUID(u.universeUUID);
+    customer.save();
+    setupDiskUpdateTest(100, "c4.xlarge", PublicCloudConstants.StorageType.GP2, u);
+    u = Universe.get(u.universeUUID);
+
+    ObjectNode bodyJson = (ObjectNode) Json.toJson(u.getUniverseDetails());
+    bodyJson.put("size", 150);
+
+    String url = "/api/customers/" + customer.uuid + "/universes/" +
+                 u.universeUUID + "/disk_update";
+    Result result = doRequestWithAuthTokenAndBody("POST", url, authToken, bodyJson);
     assertOk(result);
+    ArgumentCaptor<UniverseTaskParams> argCaptor = ArgumentCaptor
+            .forClass(UniverseTaskParams.class);
+    verify(mockCommissioner).submit(eq(TaskType.UpdateDiskSize), argCaptor.capture());
+    assertAuditEntry(1, customer.uuid);
+  }
+
+  @Test
+  public void testUniverseCreateWithDisabledYedis() {
+    UUID fakeTaskUUID = UUID.randomUUID();
+    when(mockCommissioner.submit(Matchers.any(TaskType.class),
+        Matchers.any(UniverseDefinitionTaskParams.class))).thenReturn(fakeTaskUUID);
+
+    Provider p = ModelFactory.awsProvider(customer);
+    String accessKeyCode = "someKeyCode";
+    AccessKey.create(p.uuid, accessKeyCode, new AccessKey.KeyInfo());
+    Region r = Region.create(p, "region-1", "PlacementRegion 1", "default-image");
+    AvailabilityZone.create(r, "az-1", "PlacementAZ 1", "subnet-1");
+    InstanceType i = InstanceType.upsert(p.code, "c3.xlarge", 10, 5.5,
+        new InstanceType.InstanceTypeDetails());
+
+    ObjectNode bodyJson = Json.newObject();
+    ObjectNode userIntentJson = Json.newObject().put("universeName", "SingleUserUniverse")
+        .put("instanceType", i.getInstanceTypeCode()).put("replicationFactor", 3).put("numNodes", 3)
+        .put("enableYEDIS", "false").put("provider", p.uuid.toString());
+    ArrayNode regionList = Json.newArray().add(r.uuid.toString());
+    userIntentJson.set("regionList", regionList);
+    userIntentJson.put("accessKeyCode", accessKeyCode);
+    ArrayNode clustersJsonArray = Json.newArray()
+        .add(Json.newObject().set("userIntent", userIntentJson));
+    bodyJson.set("clusters", clustersJsonArray);
+    bodyJson.set("nodeDetailsSet", Json.newArray());
+
+    String url = "/api/customers/" + customer.uuid + "/universes";
+    Result result = doRequestWithAuthTokenAndBody("POST", url, authToken, bodyJson);
+    assertOk(result);
+
+    JsonNode json = Json.parse(contentAsString(result));
+    assertNotNull(json.get("universeUUID"));
+    assertNotNull(json.get("universeConfig"));
+
+    JsonNode universeDetails = json.get("universeDetails");
+    assertNotNull(universeDetails);
+    JsonNode clustersJson = universeDetails.get("clusters");
+    assertNotNull(clustersJson);
+    JsonNode primaryClusterJson = clustersJson.get(0);
+    assertNotNull(primaryClusterJson);
+    JsonNode userIntentJsonNode = primaryClusterJson.get("userIntent");
+    assertNotNull(userIntentJsonNode);
+
+    assertEquals("false", userIntentJsonNode.get("enableYEDIS").toString());
+  }
+
+  @Test
+  // @formatter:off
+  @Parameters({
+               // not insecure, wrong origin, wrong ybmode => failure
+               "false,,, false",
+               // insecure, wrong origin, wrong ybmode => failure
+               "true,,, false",
+               // insecure, correct origin, wrong ybmode => failure
+               "true, https://learn.yugabyte.com,, false",
+               // insecure, correct origin, wrong ybmode => failure
+               "true, https://learn.yugabyte.com, PLATFORM, false",
+               // insecure, correct origin, correct ybmode => success
+               "true, https://learn.yugabyte.com, OSS, true",
+              })
+  // @formatter:on
+  public void testRunQuery_ValidPlatform(boolean insecure, String origin, String ybmode,
+      boolean isGoodResult) {
+    Universe u = createUniverse(customer.getCustomerId());
+    customer.addUniverseUUID(u.universeUUID);
+    customer.save();
+
+    if (insecure) {
+      ConfigHelper configHelper = new ConfigHelper();
+      configHelper.loadConfigToDB(ConfigHelper.ConfigType.Security,
+          ImmutableMap.of("level", "insecure"));
+    }
+    when(mockAppConfig.getString("yb.mode", "PLATFORM")).thenReturn(ybmode == null ? "" : ybmode);
+
+    ObjectNode bodyJson = Json.newObject().put("query", "select * from product limit 1")
+        .put("db_name", "demo");
+    when(mockYsqlQueryExecutor.executeQuery(any(), any()))
+        .thenReturn(Json.newObject().put("foo", "bar"));
+
+    String url = "/api/customers/" + customer.uuid + "/universes/" + u.universeUUID + "/run_query";
+    Http.RequestBuilder request = Helpers.fakeRequest("POST", url).header("X-AUTH-TOKEN", authToken)
+        .bodyJson(bodyJson);
+    if (!StringUtils.isEmpty(origin)) {
+      request = request.header("Origin", origin);
+    }
+    Result result = Helpers.route(request);
+
+    JsonNode json = Json.parse(contentAsString(result));
+    if (isGoodResult) {
+      assertOk(result);
+      assertEquals("bar", json.get("foo").asText());
+      assertAuditEntry(1, customer.uuid);
+    } else {
+      assertBadRequest(result, UniverseController.RUN_QUERY_ISNT_ALLOWED);
+      assertAuditEntry(0, customer.uuid);
+    }
+  }
+
+  @Test
+  public void testRemoveEnclosingDoubleQuotes() {
+    // Removes, happy path.
+    assertEquals("baz", UniverseController.removeEnclosingDoubleQuotes("\"baz\""));
+    // Doesn't remove single internal quotes
+    assertEquals("ba\"z", UniverseController.removeEnclosingDoubleQuotes("\"ba\"z\""));
+    // Doesn't remove pair of internal quotes.
+    assertEquals("a\"ba\"z", UniverseController.removeEnclosingDoubleQuotes("a\"ba\"z"));
+    // Doesn't remove only starting quotes.
+    assertEquals("\"baz", UniverseController.removeEnclosingDoubleQuotes("\"baz"));
+    // Doesn't remove only ending quotes.
+    assertEquals("baz\"", UniverseController.removeEnclosingDoubleQuotes("baz\""));
+    // Empty string
+    assertEquals("", UniverseController.removeEnclosingDoubleQuotes(""));
+    // Null string
+    assertEquals(null, UniverseController.removeEnclosingDoubleQuotes(null));
+  }
+
+  @Test
+  public void testUniversePauseValidUUID() {
+    UUID fakeTaskUUID = UUID.randomUUID();
+    when(mockCommissioner.submit(any(), any())).thenReturn(fakeTaskUUID);
+    Universe u = createUniverse(customer.getCustomerId());
+
+    // Add the cloud info into the universe.
+    Universe.UniverseUpdater updater = new Universe.UniverseUpdater() {
+      @Override
+      public void run(Universe universe) {
+        UniverseDefinitionTaskParams universeDetails = new UniverseDefinitionTaskParams();
+        UserIntent userIntent = new UserIntent();
+        userIntent.providerType = CloudType.aws;
+        universeDetails.upsertPrimaryCluster(userIntent, null);
+        universe.setUniverseDetails(universeDetails);
+      }
+    };
+    // Save the updates to the universe.
+    Universe.saveDetails(u.universeUUID, updater);
+
+    String url = "/api/customers/" + customer.uuid + "/universes/" + u.universeUUID + "/pause";
+    Result result = doRequestWithAuthToken("POST", url, authToken);
+    assertOk(result);
+    JsonNode json = Json.parse(contentAsString(result));
+    assertValue(json, "taskUUID", fakeTaskUUID.toString());
+
+    CustomerTask th = CustomerTask.find.query().where().eq("task_uuid", fakeTaskUUID).findOne();
+    assertNotNull(th);
+    assertThat(th.getCustomerUUID(), allOf(notNullValue(), equalTo(customer.uuid)));
+    assertThat(th.getTargetName(), allOf(notNullValue(), equalTo("Test Universe")));
+    assertThat(th.getType(), allOf(notNullValue(), equalTo(CustomerTask.TaskType.Pause)));
+    assertAuditEntry(1, customer.uuid);
+  }
+
+  @Test
+  public void testUniversePauseInvalidUUID() {
+    UUID randomUUID = UUID.randomUUID();
+    String url = "/api/customers/" + customer.uuid + "/universes/" + randomUUID + "/pause";
+    Result result = doRequestWithAuthToken("POST", url, authToken);
+    assertBadRequest(result, "No universe found with UUID: " + randomUUID);
+    assertAuditEntry(0, customer.uuid);
+  }
+
+  @Test
+  public void testUniverseResumeValidUUID() {
+    UUID fakeTaskUUID = UUID.randomUUID();
+    when(mockCommissioner.submit(any(), any())).thenReturn(fakeTaskUUID);
+    Universe u = createUniverse(customer.getCustomerId());
+
+    // Add the cloud info into the universe.
+    Universe.UniverseUpdater updater = new Universe.UniverseUpdater() {
+      @Override
+      public void run(Universe universe) {
+        UniverseDefinitionTaskParams universeDetails = new UniverseDefinitionTaskParams();
+        UserIntent userIntent = new UserIntent();
+        userIntent.providerType = CloudType.aws;
+        universeDetails.upsertPrimaryCluster(userIntent, null);
+        universe.setUniverseDetails(universeDetails);
+      }
+    };
+    // Save the updates to the universe.
+    Universe.saveDetails(u.universeUUID, updater);
+
+    String url = "/api/customers/" + customer.uuid + "/universes/" + u.universeUUID + "/resume";
+    Result result = doRequestWithAuthToken("POST", url, authToken);
+    assertOk(result);
+    JsonNode json = Json.parse(contentAsString(result));
+    assertValue(json, "taskUUID", fakeTaskUUID.toString());
+
+    CustomerTask th = CustomerTask.find.query().where().eq("task_uuid", fakeTaskUUID).findOne();
+    assertNotNull(th);
+    assertThat(th.getCustomerUUID(), allOf(notNullValue(), equalTo(customer.uuid)));
+    assertThat(th.getTargetName(), allOf(notNullValue(), equalTo("Test Universe")));
+    assertThat(th.getType(), allOf(notNullValue(), equalTo(CustomerTask.TaskType.Resume)));
+    assertAuditEntry(1, customer.uuid);
+  }
+
+  @Test
+  public void testUniverseResumeInvalidUUID() {
+    UUID randomUUID = UUID.randomUUID();
+    String url = "/api/customers/" + customer.uuid + "/universes/" + randomUUID + "/resume";
+    Result result = doRequestWithAuthToken("POST", url, authToken);
+    assertBadRequest(result, "No universe found with UUID: " + randomUUID);
     assertAuditEntry(0, customer.uuid);
   }
 }

@@ -11,7 +11,8 @@
 from ybops.cloud.common.command import InstanceCommand, QueryCommand, AccessCommand, \
     NetworkCommand
 from ybops.cloud.common.method import ConfigureInstancesMethod, DestroyInstancesMethod, \
-    ListInstancesMethod, AccessCreateVaultMethod, InitYSQLMethod
+    ListInstancesMethod, AccessCreateVaultMethod, InitYSQLMethod, UpdateDiskMethod, \
+    CronCheckMethod, AccessEditVaultMethod
 from ybops.cloud.gcp.method import GcpCreateInstancesMethod, GcpProvisionInstancesMethod, \
     GcpQueryRegionsMethod, GcpQueryZonesMethod, GcpQueryInstanceTypesMethod, \
     GcpQueryCurrentHostMethod, GcpQueryPreemptibleInstanceMethod, GcpDestroyInstancesMethod, \
@@ -32,6 +33,8 @@ class GcpInstanceCommand(InstanceCommand):
         self.add_method(ListInstancesMethod(self))
         self.add_method(ConfigureInstancesMethod(self))
         self.add_method(InitYSQLMethod(self))
+        self.add_method(UpdateDiskMethod(self))
+        self.add_method(CronCheckMethod(self))
 
 
 class GcpQueryCommand(QueryCommand):
@@ -54,6 +57,7 @@ class GcpAccessCommand(AccessCommand):
     def add_methods(self):
         self.add_method(GcpAccessAddKeyMethod(self))
         self.add_method(AccessCreateVaultMethod(self))
+        self.add_method(AccessEditVaultMethod(self))
 
 
 class GcpNetworkCommand(NetworkCommand):

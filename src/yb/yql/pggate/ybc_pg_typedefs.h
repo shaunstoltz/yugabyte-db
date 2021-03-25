@@ -52,6 +52,9 @@ YB_DEFINE_HANDLE_TYPE(PgExpr);
 // Handle to a table description
 YB_DEFINE_HANDLE_TYPE(PgTableDesc);
 
+// Handle to a memory context.
+YB_DEFINE_HANDLE_TYPE(PgMemctx);
+
 //--------------------------------------------------------------------------------------------------
 // Other definitions are the same between C++ and C.
 //--------------------------------------------------------------------------------------------------
@@ -135,6 +138,19 @@ typedef struct PgTypeEntity {
   YBCPgDatumFromData yb_to_datum;
 } YBCPgTypeEntity;
 
+// Kind of a datum.
+// In addition to datatype, a "datum" is also specified by "kind".
+// - Standard value.
+// - MIN limit value, which can be infinite, represents an absolute mininum value of a datatype.
+// - MAX limit value, which can be infinite, represents an absolute maximum value of a datatype.
+//
+// NOTE: Currently Postgres use a separate boolean flag for null instead of datum.
+typedef enum PgDatumKind {
+  YB_YQL_DATUM_STANDARD_VALUE = 0,
+  YB_YQL_DATUM_LIMIT_MAX,
+  YB_YQL_DATUM_LIMIT_MIN,
+} YBCPgDatumKind;
+
 // API to read type information.
 const YBCPgTypeEntity *YBCPgFindTypeEntity(int type_oid);
 YBCPgDataType YBCPgGetType(const YBCPgTypeEntity *type_entity);
@@ -178,14 +194,15 @@ typedef struct PgSysColumns {
 //       index_only_scan = true if ROWID is wanted. Otherwise, regular rowset is wanted.
 //       use_secondary_index = false
 //
-// Attribute "querying_systable"
-//   - If 'true', SELECT from SQL system catalogs.
-//   - Note that these catalogs are specifically for Postgres API and not YugaByte system-tables.
+// Attribute "querying_colocated_table"
+//   - If 'true', SELECT from SQL system catalogs or colocated tables.
+//   - Note that the system catalogs are specifically for Postgres API and not Yugabyte
+//     system-tables.
 typedef struct PgPrepareParameters {
   YBCPgOid index_oid;
   bool index_only_scan;
   bool use_secondary_index;
-  bool querying_systable;
+  bool querying_colocated_table;
 } YBCPgPrepareParameters;
 
 // Structure to hold the execution-control parameters.
@@ -206,14 +223,23 @@ typedef struct PgExecParameters {
   //     for filtering before LIMIT is applied.
   //   o ORDER BY clause is not processed by YugaByte. Similarly all rows must be fetched and sent
   //     to Postgres code layer.
+  // For now we only support one rowmark.
+#ifdef __cplusplus
+  uint64_t limit_count = 0;
+  uint64_t limit_offset = 0;
+  bool limit_use_default = false;
+  int rowmark = -1;
+  uint64_t read_time = 0;
+  char *partition_key = NULL;
+  bool read_from_followers = false;
+#else
   uint64_t limit_count;
   uint64_t limit_offset;
   bool limit_use_default;
-  // For now we only support one rowmark.
-#ifdef __cplusplus
-  int rowmark = -1;
-#else
   int rowmark;
+  uint64_t read_time;
+  char *partition_key;
+  bool read_from_followers;
 #endif
 } YBCPgExecParameters;
 
@@ -226,7 +252,22 @@ typedef struct PgAttrValueDescriptor {
 
 typedef struct PgCallbacks {
   void (*FetchUniqueConstraintName)(YBCPgOid, char*, size_t);
+  YBCPgMemctx (*GetCurrentYbMemctx)();
+  const char* (*GetDebugQueryString)();
 } YBCPgCallbacks;
+
+typedef struct PgTableProperties {
+  uint32_t num_tablets;
+  uint32_t num_hash_key_columns;
+  bool is_colocated;
+} YBCPgTableProperties;
+
+typedef struct PgYBTupleIdDescriptor {
+  YBCPgOid database_oid;
+  YBCPgOid table_oid;
+  int32_t nattrs;
+  YBCPgAttrValueDescriptor *attrs;
+} YBCPgYBTupleIdDescriptor;
 
 #ifdef __cplusplus
 }  // extern "C"

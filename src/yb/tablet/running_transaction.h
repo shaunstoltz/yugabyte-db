@@ -16,6 +16,9 @@
 
 #include <memory>
 
+#include "yb/docdb/docdb.h"
+
+#include "yb/tablet/apply_intents_task.h"
 #include "yb/tablet/remove_intents_task.h"
 #include "yb/tablet/transaction_participant.h"
 
@@ -26,12 +29,15 @@
 namespace yb {
 namespace tablet {
 
+YB_DEFINE_ENUM(UpdateAbortCheckHTMode, (kStatusRequestSent)(kStatusResponseReceived));
+
 // Represents transaction running at transaction participant.
 class RunningTransaction : public std::enable_shared_from_this<RunningTransaction> {
  public:
   RunningTransaction(TransactionMetadata metadata,
                      const TransactionalBatchData& last_batch_data,
                      OneWayBitmap&& replicated_batches,
+                     HybridTime base_time_for_abort_check_ht_calculation,
                      RunningTransactionContext* context);
 
   ~RunningTransaction();
@@ -43,6 +49,15 @@ class RunningTransaction : public std::enable_shared_from_this<RunningTransactio
   HybridTime start_ht() const {
     return metadata_.start_time;
   }
+
+  HybridTime abort_check_ht() const {
+    return abort_check_ht_;
+  }
+
+  MUST_USE_RESULT bool UpdateStatus(
+      TransactionStatus transaction_status, HybridTime time_of_status);
+
+  void UpdateAbortCheckHT(HybridTime now, UpdateAbortCheckHTMode mode);
 
   const TransactionMetadata& metadata() const {
     return metadata_;
@@ -81,6 +96,16 @@ class RunningTransaction : public std::enable_shared_from_this<RunningTransactio
   std::string ToString() const;
   void ScheduleRemoveIntents(const RunningTransactionPtr& shared_self);
 
+  // Sets apply state for this transaction.
+  // If data is not null, then apply intents task will be initiated if was not previously started.
+  void SetApplyData(const docdb::ApplyTransactionState& apply_state,
+                    const TransactionApplyData* data = nullptr);
+
+  // Whether this transactions is currently applying intents.
+  bool ProcessingApply() const;
+
+  std::string LogPrefix() const;
+
  private:
   static boost::optional<TransactionStatus> GetStatusAt(
       HybridTime time,
@@ -117,8 +142,6 @@ class RunningTransaction : public std::enable_shared_from_this<RunningTransactio
                      const tserver::AbortTransactionResponsePB& response,
                      const RunningTransactionPtr& shared_self);
 
-  std::string LogPrefix() const;
-
   TransactionMetadata metadata_;
   TransactionalBatchData last_batch_data_;
   OneWayBitmap replicated_batches_;
@@ -132,6 +155,13 @@ class RunningTransaction : public std::enable_shared_from_this<RunningTransactio
   rpc::Rpcs::Handle get_status_handle_;
   rpc::Rpcs::Handle abort_handle_;
   std::vector<TransactionStatusCallback> abort_waiters_;
+
+  TransactionApplyData apply_data_;
+  docdb::ApplyTransactionState apply_state_;
+  ApplyIntentsTask apply_intents_task_;
+
+  // Time of the next check whether this transaction has been aborted.
+  HybridTime abort_check_ht_;
 };
 
 CHECKED_STATUS MakeAbortedStatus(const TransactionId& id);

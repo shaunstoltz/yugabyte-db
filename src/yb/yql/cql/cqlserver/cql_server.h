@@ -21,7 +21,7 @@
 #include <string>
 
 #include "yb/yql/cql/cqlserver/cql_server_options.h"
-#include "yb/yql/cql/cqlserver/cql_message.h"
+#include "yb/yql/cql/ql/util/cql_message.h"
 #include "yb/gutil/gscoped_ptr.h"
 #include "yb/gutil/macros.h"
 #include "yb/server/server_base.h"
@@ -37,8 +37,6 @@ namespace yb {
 
 namespace cqlserver {
 
-class EventResponse;
-
 class CQLServer : public server::RpcAndWebServerBase {
  public:
   static const uint16_t kDefaultPort = 9042;
@@ -52,7 +50,7 @@ class CQLServer : public server::RpcAndWebServerBase {
 
   void Shutdown();
 
-  const tserver::TabletServer* tserver() const { return tserver_; }
+  tserver::TabletServer* tserver() const { return tserver_; }
 
  private:
   CQLServerOptions opts_;
@@ -61,8 +59,8 @@ class CQLServer : public server::RpcAndWebServerBase {
   boost::asio::deadline_timer timer_;
   tserver::TabletServer* const tserver_;
 
-  std::unique_ptr<CQLServerEvent> BuildTopologyChangeEvent(const std::string& event_type,
-                                                           const Endpoint& addr);
+  std::unique_ptr<ql::CQLServerEvent> BuildTopologyChangeEvent(const std::string& event_type,
+                                                               const Endpoint& addr);
 
   DISALLOW_COPY_AND_ASSIGN(CQLServer);
 };

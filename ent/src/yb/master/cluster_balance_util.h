@@ -33,11 +33,12 @@ struct Options : yb::master::Options {
   string live_placement_uuid;
 };
 
-class ClusterLoadState : public yb::master::ClusterLoadState {
-  typedef yb::master::ClusterLoadState super;
+class PerTableLoadState : public yb::master::PerTableLoadState {
+  typedef yb::master::PerTableLoadState super;
  public:
-  ClusterLoadState() : super() {}
-  virtual ~ClusterLoadState() {}
+  explicit PerTableLoadState(yb::master::GlobalLoadState* global_load_state)
+      : super(global_load_state) {}
+  virtual ~PerTableLoadState() {}
 
   bool IsTsInLivePlacement(TSDescriptor* ts_desc) {
     return ts_desc->placement_uuid() == GetEntOptions()->live_placement_uuid;
@@ -98,23 +99,24 @@ class ClusterLoadState : public yb::master::ClusterLoadState {
     super::SortLeaderLoad();
   }
 
-  void GetReplicaLocations(TabletInfo* tablet, TabletInfo::ReplicaMap* replica_locations) override {
-    TabletInfo::ReplicaMap replica_map;
-    tablet->GetReplicaLocations(&replica_map);
+  std::shared_ptr<const TabletInfo::ReplicaMap> GetReplicaLocations(TabletInfo* tablet) override {
+    auto replica_locations = std::make_shared<TabletInfo::ReplicaMap>();
+    auto replica_map = tablet->GetReplicaLocations();
     const Options* options_ent = GetEntOptions();
-    for (auto it = replica_map.begin(); it != replica_map.end(); it++) {
-      const TabletReplica& replica = it->second;
+    for (const auto& it : *replica_map) {
+      const TabletReplica& replica = it.second;
       TSDescriptor* ts_desc_ent = down_cast<TSDescriptor*>(replica.ts_desc);
       bool is_replica_live =  IsTsInLivePlacement(ts_desc_ent);
       if (is_replica_live && options_ent->type == LIVE) {
-        InsertIfNotPresent(replica_locations, it->first, replica);
+        InsertIfNotPresent(replica_locations.get(), it.first, replica);
       } else if (!is_replica_live && options_ent->type  == READ_ONLY) {
         const string& placement_uuid = ts_desc_ent->placement_uuid();
         if (placement_uuid == options_ent->placement_uuid) {
-          InsertIfNotPresent(replica_locations, it->first, replica);
+          InsertIfNotPresent(replica_locations.get(), it.first, replica);
         }
       }
     }
+    return replica_locations;
   }
 
   const Options* GetEntOptions() const {

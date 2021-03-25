@@ -2,6 +2,7 @@
 title: Open Source Kubernetes 
 linkTitle: Open Source Kubernetes
 description: Open Source Kubernetes 
+block_indexing: true
 menu:
   v2.0:
     parent: deploy-kubernetes
@@ -235,7 +236,7 @@ NOTES:
   kubectl exec --namespace yb-demo -it yb-tserver-0 bash
 
 5. Run YSQL shell from inside of a tablet server:
-  kubectl exec --namespace yb-demo -it yb-tserver-0 /home/yugabyte/bin/ysqlsh -- -h yb-tserver-0.yb-tservers.yb-demo
+  kubectl exec --namespace yb-demo -it yb-tserver-0 -- /home/yugabyte/bin/ysqlsh -h yb-tserver-0.yb-tservers.yb-demo
 
 6. Cleanup YugabyteDB Pods
   helm delete yb-demo --purge
@@ -300,7 +301,7 @@ REVISION  UPDATED                   STATUS    CHART           APP VERSION   DESC
 To connect and use the YSQL Shell `ysqlsh`, run the following command.
 
 ```sh
-$ kubectl exec -n yb-demo -it yb-tserver-0 /home/yugabyte/bin/ysqlsh -- -h yb-tserver-0.yb-tservers.yb-demo
+$ kubectl exec -n yb-demo -it yb-tserver-0 -- /home/yugabyte/bin/ysqlsh -h yb-tserver-0.yb-tservers.yb-demo
 ```
 
 To connect and use the YCQL Shell `cqlsh`, run the following command.
@@ -391,7 +392,7 @@ You can also bring up an internal LoadBalancer (for either YB-Master or YB-TServ
 In case you want to use a storage class other than the standard class for your deployment, provision the storage class and then pass in the name of the class while running the helm install command.
 
 ```sh
-$ helm install yugabyte --namespace yb-demo --name yb-demo --set persistentVolume.storageClass=<name of provisioned storage> --wait
+$ helm install yugabyte --namespace yb-demo --name yb-demo --set storage.master.storageClass=<desired storage class>,storage.tserver.storageClass=<desired storage class> --wait
 ```
 
 ## Upgrade cluster

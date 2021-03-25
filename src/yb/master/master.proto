@@ -34,6 +34,7 @@ syntax = "proto2";
 package yb.master;
 
 option java_package = "org.yb.master";
+option cc_enable_arenas = true;
 
 import "yb/common/common.proto";
 import "yb/common/wire_protocol.proto";
@@ -130,6 +131,11 @@ message MasterErrorPB {
     LOAD_BALANCER_RECENTLY_ACTIVE = 33;
 
     INTERNAL_ERROR = 34;
+
+    // Client set some fields in the table replication info incorrectly.
+    INVALID_TABLE_REPLICATION_INFO = 35;
+
+    REACHED_SPLIT_LIMIT = 36;
   }
 
   // The error code.
@@ -168,6 +174,17 @@ message TableIdentifierPB {
 
   // The table namespace (if empty - using default namespace).
   optional NamespaceIdentifierPB namespace = 3;
+}
+
+message TablegroupIdentifierPB {
+  // The tablegroup ID to fetch info.
+  optional bytes id = 1;
+
+  // The tablegroup name to fetch info.
+  optional string name = 2;
+
+  // The namespace that the tablegroup is in
+  optional bytes namespace_id = 3;
 }
 
 // This represents one instance of a placement constraint for a table. It is
@@ -238,6 +255,7 @@ message SysRowEntry {
     SYS_CONFIG = 9;
     CDC_STREAM = 10;
     UNIVERSE_REPLICATION = 11;
+    SNAPSHOT_SCHEDULE = 12;
   }
 
   // The type of entry we are storing. Since the data is serialized, we cannot
@@ -296,10 +314,22 @@ message SysTabletsEntryPB {
   // True if the tablet is colocated.
   optional bool colocated = 9 [ default = false ];
 
+  // Replaced by the map below.
+  optional bytes DEPRECATED_backfilled_until = 10;
+
+  // For tablets that are results of splitting we set this to split parent split_depth + 1.
+  optional uint64 split_depth = 11;
+
+  optional bytes split_parent_tablet_id = 13;
+
   // If the tablet is in the backfilling state, this is used to keep track
-  // of how far along backfill has completed. Encoded as the DocKey for
-  // the next row to be backfilled.
-  optional bytes backfilled_until = 10;
+  // of how far along backfill has completed.
+  // Key corresponds to the table_id for the index table. Value is encoded as
+  // the DocKey for the next row to be backfilled.
+  map<string, bytes> backfilled_until = 12;
+
+  // Tablet IDs for this tablet split if they have been registered in master.
+  repeated bytes split_tablet_ids = 14;
 }
 
 // The on-disk entry in the sys.catalog table ("metadata" column) for
@@ -322,6 +352,8 @@ message SysTablesEntryPB {
 
   // The table namespace ID.
   optional bytes namespace_id = 11;
+  // The table namespace name.
+  optional bytes namespace_name = 30;
 
   // sequence-id for the table metadata.
   // Used on tablet-report to avoid sending "alter-table" notifications.
@@ -338,6 +370,9 @@ message SysTablesEntryPB {
 
   // The table's partitioning schema.
   optional PartitionSchemaPB partition_schema = 9;
+
+  // The table's partitions version. Incremented each time partitions change.
+  optional uint32 partition_list_version = 28;
 
   // The next column ID to assign to newly added columns in this table.
   // This prevents column ID reuse.
@@ -370,16 +405,32 @@ message SysTablesEntryPB {
 
   optional bool colocated = 25 [ default = false ]; // Is this a colocated table?
 
-  // For index backfill/schema related changes.
-  // When a schema change is going on, we want to make sure that the master returns the "older"
-  // fully applied version until all the tablets have moved on to the newer version.
   optional uint32 fully_applied_schema_version = 23;
   repeated IndexInfoPB fully_applied_indexes = 26;
   optional IndexInfoPB fully_applied_index_info = 27;
+
+  // Optional: Table dependent upon transaction success (abort removes table). Used by YSQL.
+  optional TransactionMetadataPB transaction = 29;
+
+  // During an alter table, which involves no schema change but only updating
+  // a permission, is it sometimes acceptable for a client's request (which is
+  // prepared with the current schema) to be accepted by a tserver which is
+  // still running the previous version.
+  // This is typically set during alters that are caused due to index
+  // permissions being changed, when the table is backfilled.
+  optional bool updates_only_index_permissions = 31 [ default = false ];
 }
 
 // The data part of a SysRowEntry in the sys.catalog table for a namespace.
 message SysNamespaceEntryPB {
+  enum State {
+    UNKNOWN = 0;    // Unset or bad data. Unexpected state.
+    PREPARING = 1;  // Creating. Transitive State. Possible Next States: [RUNNING, FAILED].
+    FAILED = 2;     // Creation Failed. Permanent State.
+    RUNNING = 3;    // Live. Permanent State. Possible Next States: [FAILED, DELETING].
+    DELETING = 4;   // Delete Requested. Transitive State. Possible Next States: [DELETED].
+    DELETED = 5;    // Delete Finished on TServers or Tombstone. Final State before erasure.
+  }
   // Note: The id of the namespace is not stored here as it is already part of
   // SysRowEntry's id component.
 
@@ -394,6 +445,11 @@ message SysNamespaceEntryPB {
 
   // True if the namespace is colocated.
   optional bool colocated = 4 [ default = false ];
+
+  // Optional: Namespace dependent upon transaction success (abort removes NS). Used by YSQL.
+  optional TransactionMetadataPB transaction = 6;
+
+  optional State state = 5 [ default = UNKNOWN ];
 }
 
 // The data part of a SysRowEntry in the sys.catalog table for a User Defined Type.
@@ -605,6 +661,9 @@ message ReportedTabletPB {
 
   optional AppStatusPB error = 4;
   optional uint32 schema_version = 5;
+
+  // Replica is reporting that load balancer moves should be disabled
+  optional bool should_disable_lb_move = 7;
 }
 
 // Sent by the tablet server to report the set of tablets hosted by that TS.
@@ -629,6 +688,10 @@ message TabletReportPB {
   // changes have not yet been reported to the master.
   // The first tablet report (non-incremental) is sequence number 0.
   required int32 sequence_number = 4;
+
+  // Number of tablets that could not be included in this heartbeat.
+  // If 0, then all tablets have been reported to the master.
+  optional int32 remaining_tablet_count = 5;
 }
 
 message ReportedTabletUpdatesPB {
@@ -639,6 +702,8 @@ message ReportedTabletUpdatesPB {
 // Sent by the Master in response to the TS tablet report (part of the heartbeats)
 message TabletReportUpdatesPB {
   repeated ReportedTabletUpdatesPB tablets = 1;
+  // Returns true if the tablet report had to be truncated because master ran out of time.
+  optional bool processing_truncated = 2 [ default = false ];
 }
 
 message TServerMetricsPB {
@@ -649,6 +714,21 @@ message TServerMetricsPB {
   optional int64 uncompressed_sst_file_size = 5;
   optional uint64 uptime_seconds = 6;
   optional uint64 num_sst_files = 7;
+}
+
+message TabletForSplitPB {
+  required bytes tablet_id = 1;
+  required bytes split_partition_key = 2;
+  required bytes split_encoded_key = 3;
+}
+
+message TSSnapshotScheduleInfoPB {
+  optional bytes id = 1;
+  optional fixed64 last_snapshot_hybrid_time = 2;
+}
+
+message TSSnapshotSchedulesInfoPB {
+  repeated TSSnapshotScheduleInfoPB schedules = 1;
 }
 
 // Heartbeat sent from the tablet-server to the master
@@ -681,6 +761,18 @@ message TSHeartbeatRequestPB {
   optional int32 leader_count = 7;
 
   optional int32 cluster_config_version = 8;
+
+  // List of candidate tablets for split based on tablet splitting strategy and settings.
+  repeated TabletForSplitPB tablets_for_split = 9;
+
+  // Physical time on tablet server
+  optional fixed64 ts_physical_time = 10;
+
+  // Hybrid time on tablet server
+  optional fixed64 ts_hybrid_time = 11;
+
+  // Roundtrip time for previous heartbeat in microseconds.
+  optional int64 rtt_us = 12;
 }
 
 message TSHeartbeatResponsePB {
@@ -718,11 +810,19 @@ message TSHeartbeatResponsePB {
   // Used by tservers and postgres backends to decide if a cache refresh is needed.
   optional uint64 ysql_catalog_version = 10;
 
+  optional uint64 ysql_last_breaking_catalog_version = 15;
+
   optional UniverseKeyRegistryPB universe_key_registry = 11;
 
   optional cdc.ConsumerRegistryPB consumer_registry = 12;
 
   optional int32 cluster_config_version = 13;
+
+  optional int64 tablet_split_size_threshold_bytes = 14;
+
+  optional int32 tablet_report_limit = 16;
+
+  optional TSSnapshotSchedulesInfoPB snapshot_schedules = 17;
 }
 
 message TSInformationPB {
@@ -760,6 +860,17 @@ message TabletLocationsPB {
   optional bytes table_id = 7;
   // Table ids for all the tables on this tablet.
   repeated bytes table_ids = 8;
+
+  // See SysTabletsEntryPB for fields with the same name.
+  optional uint64 split_depth = 9;
+  optional bytes split_parent_tablet_id = 12;
+  repeated bytes split_tablet_ids = 13;
+
+  // Number of expected live replicas.
+  optional int32 expected_live_replicas = 10;
+
+  // Number of expected read replicas.
+  optional int32 expected_read_replicas = 11;
 }
 
 // Info about a single tablet server, returned to the client as part
@@ -785,12 +896,19 @@ message TSInfoPB {
 message GetTabletLocationsRequestPB {
   // The tablet IDs about which to fetch info.
   repeated bytes tablet_ids = 1;
+
+  // If table ID is specified, table's partition_list_version will be included into response.
+  optional bytes table_id = 2;
 }
 
 message GetTabletLocationsResponsePB {
   optional MasterErrorPB error = 1;
 
   repeated TabletLocationsPB tablet_locations = 2;
+
+  // If GetTabletLocationsRequestPB::table_id is set we return table's partition_list_version for
+  // this table (see SysTablesEntryPB::partition_list_version).
+  optional uint32 partition_list_version = 4;
 
   message Error {
     required bytes tablet_id = 1;
@@ -820,6 +938,8 @@ message CreateTableRequestPB {
   optional bytes indexed_table_id = 9; // Indexed table id of this index.
   optional bool is_local_index = 10 [ default = false ];  // Is a local index?
   optional bool is_unique_index = 11 [ default = false ]; // Is a unique index?
+  optional bool skip_index_backfill = 18 [ default = false ]; // Skip online schema migration for
+                                                              // index?
 
   // For RBAC.
   optional string creator_role_name = 12;
@@ -831,6 +951,18 @@ message CreateTableRequestPB {
 
   // Is this a colocated table? This field is only applicable for a colocated database.
   optional bool colocated = 17 [ default = true ];
+
+  // This is only applicable for tablegroups. Eventually colocated will be deprecated.
+  optional bytes tablegroup_id = 19;
+
+  // DDL Dependent upon Transaction success (abort removes). Used by YSQL.
+  optional TransactionMetadataPB transaction = 20;
+
+  // For YSQL tables, this denotes the tablespace that this table is associated with.
+  optional bytes tablespace_id = 21;
+
+  // This field should be used to create or restore table with a fixed set of partitions.
+  repeated PartitionPB partitions = 22;
 }
 
 message CreateTableResponsePB {
@@ -871,6 +1003,19 @@ message IsTruncateTableDoneResponsePB {
 
   // true if the truncate operation is completed, false otherwise
   optional bool done = 2;
+}
+
+message BackfillIndexRequestPB {
+  // The index to backfill.
+  optional TableIdentifierPB index_identifier = 1;
+}
+
+message BackfillIndexResponsePB {
+  // The error, if an error occurred with this request.
+  optional MasterErrorPB error = 1;
+
+  // The indexed table to backfill.
+  optional TableIdentifierPB table_identifier = 2;
 }
 
 // Delete table request (including index table).
@@ -953,6 +1098,11 @@ message GetTableLocationsResponsePB {
 
   repeated TabletLocationsPB tablet_locations = 2;
   optional TableType table_type = 3;
+
+  // See SysTablesEntryPB for field with the same name.
+  optional uint32 partition_list_version = 4;
+
+  optional bool creating = 5;
 }
 
 message AlterTableRequestPB {
@@ -997,6 +1147,14 @@ message AlterTableRequestPB {
   optional NamespaceIdentifierPB new_namespace = 4;
   optional TablePropertiesPB alter_properties = 5;
   optional uint32 wal_retention_secs = 6;
+
+  // If set to true, SendAlterTableRequest will be sent even if no changes are specified in this
+  // request.
+  // This is useful to trigger index permissions update.
+  optional bool force_send_alter_request = 7 [default = false];
+
+  // Replication information for this table.
+  optional ReplicationInfoPB replication_info = 8;
 }
 
 message AlterTableResponsePB {
@@ -1060,6 +1218,23 @@ message GetTableSchemaResponsePB {
 
   // For index table: information about this index.
   optional IndexInfoPB index_info = 12;
+
+  // True if table is colocated.
+  optional bool colocated = 13;
+
+  optional bool is_compatible_with_previous_version = 14 [default = false];
+}
+
+message GetColocatedTabletSchemaRequestPB {
+  required TableIdentifierPB parent_colocated_table = 1;
+}
+
+message GetColocatedTabletSchemaResponsePB {
+  // The error, if an error occurred with this request.
+  optional MasterErrorPB error = 1;
+
+  // List of all colocated user tables in this colocated database.
+  repeated GetTableSchemaResponsePB get_table_schema_response_pbs = 2;
 }
 
 // ============================================================================
@@ -1078,6 +1253,8 @@ message ListTabletServersResponsePB {
     required NodeInstancePB instance_id = 1;
     optional TSRegistrationPB registration = 2;
     optional int32 millis_since_heartbeat = 3;
+    optional bool alive = 4;
+    optional TServerMetricsPB metrics = 5;
   }
   repeated Entry servers = 2;
 }
@@ -1161,6 +1338,14 @@ message ChangeLoadBalancerStateResponsePB {
   optional MasterErrorPB error = 1;
 }
 
+message GetLoadBalancerStateRequestPB {
+}
+
+message GetLoadBalancerStateResponsePB {
+  optional MasterErrorPB error = 1;
+  optional bool is_enabled = 2;
+}
+
 // Update an ex-peer about its removal from the cluster.
 message RemovedMasterUpdateRequestPB {
 }
@@ -1218,7 +1403,7 @@ message GetLoadMovePercentResponsePB {
 message IsLoadBalancerIdleRequestPB {
 }
 
-// When no errors, load balancer is active.
+// When no errors, load balancer is idle.
 message IsLoadBalancerIdleResponsePB {
   optional MasterErrorPB error = 1;
 }
@@ -1253,6 +1438,14 @@ message AreLeadersOnPreferredOnlyResponsePB {
   optional MasterErrorPB error = 1;
 }
 
+message AreTransactionLeadersSpreadRequestPB {
+}
+
+message AreTransactionLeadersSpreadResponsePB {
+  // Any error being set implies transaction leaders are incorrectly respecting preferred zones.
+  optional MasterErrorPB error = 1;
+}
+
 // ============================================================================
 //  Namespace  (default namespace = ANY placement)
 // ============================================================================
@@ -1273,6 +1466,8 @@ message CreateNamespaceRequestPB {
   optional bytes source_namespace_id = 5; // namespace id of the source database to copy from.
   optional uint32 next_pg_oid = 6; // Next oid to assign. Ignored when source_namespace_id is given
                                    // and the next_pg_oid from source namespace will be used.
+ // DDL Dependent upon Transaction success (abort removes). Used by YSQL.
+  optional TransactionMetadataPB transaction = 8;
 
   // True if the namespace is colocated.
   optional bool colocated = 7 [ default = false ];
@@ -1283,6 +1478,18 @@ message CreateNamespaceResponsePB {
   optional MasterErrorPB error = 1;
 
   optional bytes id = 2;
+}
+
+message IsCreateNamespaceDoneRequestPB {
+  optional NamespaceIdentifierPB namespace = 1;
+}
+
+message IsCreateNamespaceDoneResponsePB {
+  // The error, if an error occurred with this request.
+  optional MasterErrorPB error = 1;
+
+  // true if the create operation is completed, false otherwise
+  optional bool done = 2;
 }
 
 // Database type is added to metadata entries such that PGSQL clients cannot delete or connect to
@@ -1298,6 +1505,18 @@ message DeleteNamespaceRequestPB {
 message DeleteNamespaceResponsePB {
   // The error, if an error occurred with this request.
   optional MasterErrorPB error = 1;
+}
+
+message IsDeleteNamespaceDoneRequestPB {
+  optional NamespaceIdentifierPB namespace = 1;
+}
+
+message IsDeleteNamespaceDoneResponsePB {
+  // The error, if an error occurred with this request.
+  optional MasterErrorPB error = 1;
+
+  // true if the delete operation completed, false otherwise
+  optional bool done = 2;
 }
 
 message AlterNamespaceRequestPB {
@@ -1321,6 +1540,59 @@ message ListNamespacesResponsePB {
   optional MasterErrorPB error = 1;
 
   repeated NamespaceIdentifierPB namespaces = 2;
+}
+
+message GetNamespaceInfoRequestPB {
+  optional NamespaceIdentifierPB namespace = 1;
+}
+
+message GetNamespaceInfoResponsePB {
+  // The error, if an error occurred with this request.
+  optional MasterErrorPB error = 1;
+
+  optional NamespaceIdentifierPB namespace = 2;
+  optional bool colocated = 3;
+}
+
+// ============================================================================
+//  Tablegroup
+// ============================================================================
+
+message CreateTablegroupRequestPB {
+  required bytes id = 1;
+  required bytes namespace_id = 2;
+  optional string namespace_name = 3;
+}
+
+message CreateTablegroupResponsePB {
+  // The error, if an error occurred with this request.
+  optional MasterErrorPB error = 1;
+
+  optional bytes parent_table_id = 2;
+  optional bytes parent_table_name = 3;
+}
+
+message DeleteTablegroupRequestPB {
+  required bytes id = 1;
+  required bytes namespace_id = 2;
+}
+
+message DeleteTablegroupResponsePB {
+  // The error, if an error occurred with this request.
+  optional MasterErrorPB error = 1;
+
+  optional bytes parent_table_id = 2;
+}
+
+message ListTablegroupsRequestPB {
+  optional bytes namespace_id = 1;
+}
+
+message ListTablegroupsResponsePB {
+  // The error, if an error occurred with this request.
+  optional MasterErrorPB error = 1;
+
+  repeated TablegroupIdentifierPB tablegroups = 2;
 }
 
 // ============================================================================
@@ -1415,6 +1687,8 @@ message RolePermissionInfoPB {
   optional uint32 all_keyspaces_permissions = 2;
   optional uint32 all_roles_permissions = 3;
   repeated ResourcePermissionInfoPB resource_permissions = 4;
+  optional string salted_hash = 5;
+  optional bool can_login = 6;
 }
 
 message GetPermissionsResponsePB {
@@ -1574,6 +1848,10 @@ message FlushTablesRequestPB {
 
   // Whether we want to compact the tablets instead of flushing them.
   optional bool is_compaction = 2;
+
+  // Whether we want to include index tables in this flush. If there are index tables in the tables
+  // field this field must be set to false, otherwise the request will fail.
+  optional bool add_indexes = 3;
 }
 
 message FlushTablesResponsePB {
@@ -1685,6 +1963,22 @@ message GetUniverseReplicationResponsePB {
   optional SysUniverseReplicationEntryPB entry = 2;
 }
 
+message SplitTabletRequestPB {
+  required bytes tablet_id = 1;
+}
+
+message SplitTabletResponsePB {
+  optional MasterErrorPB error = 1;
+}
+
+message DeleteTabletRequestPB {
+  required bytes tablet_id = 1;
+}
+
+message DeleteTabletResponsePB {
+  optional MasterErrorPB error = 1;
+}
+
 service MasterService {
   // TS->Master RPCs
   rpc TSHeartbeat(TSHeartbeatRequestPB) returns (TSHeartbeatResponsePB);
@@ -1698,6 +1992,8 @@ service MasterService {
   rpc TruncateTable(TruncateTableRequestPB) returns (TruncateTableResponsePB);
   rpc IsTruncateTableDone(IsTruncateTableDoneRequestPB) returns (IsTruncateTableDoneResponsePB);
 
+  rpc BackfillIndex(BackfillIndexRequestPB) returns (BackfillIndexResponsePB);
+
   rpc DeleteTable(DeleteTableRequestPB) returns (DeleteTableResponsePB);
   rpc IsDeleteTableDone(IsDeleteTableDoneRequestPB) returns (IsDeleteTableDoneResponsePB);
 
@@ -1707,11 +2003,23 @@ service MasterService {
   rpc ListTables(ListTablesRequestPB) returns (ListTablesResponsePB);
   rpc GetTableLocations(GetTableLocationsRequestPB) returns (GetTableLocationsResponsePB);
   rpc GetTableSchema(GetTableSchemaRequestPB) returns (GetTableSchemaResponsePB);
+  rpc GetColocatedTabletSchema(GetColocatedTabletSchemaRequestPB)
+      returns (GetColocatedTabletSchemaResponsePB);
 
   rpc CreateNamespace(CreateNamespaceRequestPB) returns (CreateNamespaceResponsePB);
+  rpc IsCreateNamespaceDone(IsCreateNamespaceDoneRequestPB)
+      returns (IsCreateNamespaceDoneResponsePB);
   rpc DeleteNamespace(DeleteNamespaceRequestPB) returns (DeleteNamespaceResponsePB);
+  rpc IsDeleteNamespaceDone(IsDeleteNamespaceDoneRequestPB)
+      returns (IsDeleteNamespaceDoneResponsePB);
   rpc AlterNamespace(AlterNamespaceRequestPB) returns (AlterNamespaceResponsePB);
   rpc ListNamespaces(ListNamespacesRequestPB) returns (ListNamespacesResponsePB);
+  rpc GetNamespaceInfo(GetNamespaceInfoRequestPB) returns (GetNamespaceInfoResponsePB);
+
+  // For Tablegroup:
+  rpc CreateTablegroup(CreateTablegroupRequestPB) returns (CreateTablegroupResponsePB);
+  rpc DeleteTablegroup(DeleteTablegroupRequestPB) returns (DeleteTablegroupResponsePB);
+  rpc ListTablegroups(ListTablegroupsRequestPB) returns (ListTablegroupsResponsePB);
 
   // For Postgres:
   rpc ReservePgsqlOids(ReservePgsqlOidsRequestPB) returns (ReservePgsqlOidsResponsePB);
@@ -1758,6 +2066,7 @@ service MasterService {
 
   rpc ChangeLoadBalancerState(ChangeLoadBalancerStateRequestPB)
       returns (ChangeLoadBalancerStateResponsePB);
+  rpc GetLoadBalancerState(GetLoadBalancerStateRequestPB) returns (GetLoadBalancerStateResponsePB);
 
   rpc RemovedMasterUpdate(RemovedMasterUpdateRequestPB) returns (RemovedMasterUpdateResponsePB);
 
@@ -1801,4 +2110,7 @@ service MasterService {
       returns (GetUniverseKeyRegistryResponsePB);
   rpc HasUniverseKeyInMemory(HasUniverseKeyInMemoryRequestPB)
       returns (HasUniverseKeyInMemoryResponsePB);
+
+  rpc SplitTablet(SplitTabletRequestPB) returns (SplitTabletResponsePB);
+  rpc DeleteTablet(DeleteTabletRequestPB) returns (DeleteTabletResponsePB);
 }

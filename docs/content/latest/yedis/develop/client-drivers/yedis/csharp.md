@@ -4,7 +4,7 @@ headerTitle: Build an application using C#
 linkTitle: C#
 description: Use C# to build a YugabyteDB application that interacts with YEDIS
 aliases:
- - /latest/yedis/develop/client-drivers/csharp
+  - /latest/yedis/develop/client-drivers/csharp
 menu:
   latest:
     identifier: client-drivers-yedis-csharp
@@ -17,8 +17,8 @@ showAsideToc: true
 
 This tutorial assumes that you have:
 
-- installed YugabyteDB, created a universe, and are able to interact with it using the Redis shell. If not, please follow these steps in the [quick start guide](../../../quick-start).
-- installed Visual Studio
+- installed YugabyteDB, created a universe, and are able to interact with it using the Redis shell. If not, follow the steps in [Quick start](../../../../quick-start).
+- installed Visual Studio.
 
 ## Write a HelloWorld C# application
 

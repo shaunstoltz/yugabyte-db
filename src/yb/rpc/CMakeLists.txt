@@ -69,6 +69,7 @@ set(YRPC_SRCS
     local_call.cc
     rpc_call.cc
     periodic.cc
+    poller.cc
     proxy.cc
     reactor.cc
     remote_method.cc
@@ -84,6 +85,7 @@ set(YRPC_SRCS
     serialization.cc
     service_if.cc
     service_pool.cc
+    strand.cc
     tcp_stream.cc
     thread_pool.cc
     yb_rpc.cc

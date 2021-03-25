@@ -11,11 +11,13 @@
 import yaml
 import sys
 
+from six import iteritems
+
 
 def remove_leaf_items(root):
     if isinstance(root, dict):
         result = {}
-        for x, y in root.iteritems():
+        for x, y in iteritems(root):
             result[x] = remove_leaf_items(y)
         return result
     if isinstance(root, list):
@@ -25,4 +27,4 @@ def remove_leaf_items(root):
 
 if __name__ == '__main__':
     y = yaml.load(sys.stdin)
-    print yaml.dump(remove_leaf_items(y), default_flow_style=False)
+    print(yaml.dump(remove_leaf_items(y), default_flow_style=False))

@@ -1,8 +1,8 @@
 ---
-title: Check processes
-linkTitle: Check processes
-headerTitle: Check YugabyteDB processes
-description: How to check if your YugabyteDB processes are running
+title: Check servers
+linkTitle: Check servers
+headerTitle: Check YugabyteDB servers
+description: How to check if your YugabyteDB servers are running
 aliases:
   - /troubleshoot/nodes/check-processes/
 menu:
@@ -13,7 +13,7 @@ isTocNested: true
 showAsideToc: true
 ---
 
-## 1. Are the YugabyteDB processes running?
+## 1. Are the YugabyteDB servers running?
 
 Connect to the local node where YugabyteDB is running. 
 
@@ -23,42 +23,42 @@ On the local setup, this is your local machine (or a Docker instance running on 
 $ ps aux | grep yb-tserver
 ```
 
-If you are expecting a master process on this node, you can also do the following.
+If you are expecting a yb-master servers on this node, you can also do the following.
 
 ```sh
 $ ps aux | grep yb-master
 ```
 
-If the processes are not running you can start them with:
+If the servers are not running you can start them with:
 
 - `yb-ctl` when using a local cluster.
 
-- `bin/yb-tserver` and `bin/yb-master` binaries when using a multi-node cluster.
+- `bin/yb-tserver` and `bin/yb-master` servers when using a multi-node cluster.
 
-Once the processes are running, if they are not accessible from your client machine this may be a network issue (see below).
+Once the servers are running, if they are not accessible from your client machine this may be a network issue (see below).
 
 ## 2. Are the yb-master and yb-tserver endpoints accessible?
 
-Generally, the endpoints are: 
+Generally, the endpoints are:
 
 |      Description |                       URL |
 |------------------|---------------------------|
 | Master Web Page  | `<node-ip>:7000`          |
 | TServer Web Page | `<node-ip>:9000`          |
 | Redis Metrics    | `<node-ip>:11000/metrics` |
-| CQL Metrics      | `<node-ip>:12000/metrics` |
+| YCQL Metrics      | `<node-ip>:12000/metrics` |
 | Redis Server     | `<node-ip>:6379`          |
-| CQL Server       | `<node-ip>:9042`          |
+| YCQL Server       | `<node-ip>:9042`          |
 
 However, in some setups these endpoints may not be accessible, depending on the configuration on your physical machines or on your cloud-provider account.
 
 ### IP not accessible
 
-- Private vs Public IP: Consider setting up a VPN or using the node’s public IP (e.g. get it from the machine status on your cloud-provider account).
+- Private versus Public IP: Consider setting up a VPN or using the node’s public IP (for example, get it from the machine status on your cloud-provider account).
 
 ### Ports closed
 
-- Cloud Account Configuration: Open the relevant ports (see below),  for TCP traffic on your cloud-provider account (e.g. security group rules).
+- Cloud Account Configuration: Open the relevant ports (see below), for TCP traffic on your cloud-provider account (for example, security group rules).
 
 - SELinux turned on: If your host has SELinux turned on, run the following commands to open the ports using firewall exceptions.
 

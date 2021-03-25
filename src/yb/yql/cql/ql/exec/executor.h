@@ -23,6 +23,7 @@
 #include "yb/common/ql_rowblock.h"
 #include "yb/common/common.pb.h"
 #include "yb/rpc/thread_pool.h"
+#include "yb/yql/cql/ql/audit/audit_logger.h"
 #include "yb/yql/cql/ql/exec/exec_context.h"
 #include "yb/yql/cql/ql/ptree/pt_create_keyspace.h"
 #include "yb/yql/cql/ql/ptree/pt_use_keyspace.h"
@@ -68,7 +69,8 @@ class Executor : public QLExprExecutor {
 
   //------------------------------------------------------------------------------------------------
   // Constructor & destructor.
-  Executor(QLEnv *ql_env, Rescheduler* rescheduler, const QLMetrics* ql_metrics);
+  Executor(QLEnv *ql_env, audit::AuditLogger* audit_logger, Rescheduler* rescheduler,
+           const QLMetrics* ql_metrics);
   virtual ~Executor();
 
   // Execute the given statement (parse tree) or batch. The parse trees and the parameters must not
@@ -270,7 +272,6 @@ class Executor : public QLExprExecutor {
   CHECKED_STATUS PTExprToPB(const PTConstBool *const_pt, QLValuePB *const_pb);
   CHECKED_STATUS PTExprToPB(const PTConstUuid *const_pt, QLValuePB *const_pb);
   CHECKED_STATUS PTExprToPB(const PTConstBinary *const_pt, QLValuePB *const_pb);
-  CHECKED_STATUS PTExprToPB(const PTCollectionExpr *const_pt, QLValuePB *const_pb);
 
   // Bind variable.
   CHECKED_STATUS PTExprToPB(const PTBindVar *bind_pt, QLExpressionPB *bind_pb);
@@ -295,6 +296,10 @@ class Executor : public QLExprExecutor {
   CHECKED_STATUS PTExprToPB(const PTBcall *bcall_pt, QLExpressionPB *bcall_pb);
   CHECKED_STATUS BFCallToPB(const PTBcall *bcall_pt, QLExpressionPB *expr_pb);
   CHECKED_STATUS TSCallToPB(const PTBcall *bcall_pt, QLExpressionPB *expr_pb);
+
+  // Constructors for collection and UDT.
+  CHECKED_STATUS PTExprToPB(const PTCollectionExpr *const_pt, QLValuePB *const_pb);
+  CHECKED_STATUS PTExprToPB(const PTCollectionExpr *expr_pt, QLExpressionPB *expr_pb);
 
   // Logic expressions.
   CHECKED_STATUS PTExprToPB(const PTLogic1 *logic_pt, QLExpressionPB *logic_pb);
@@ -407,6 +412,9 @@ class Executor : public QLExprExecutor {
   //------------------------------------------------------------------------------------------------
   // Environment (YBClient) for executing statements.
   QLEnv *ql_env_;
+
+  // Used for logging audit records.
+  audit::AuditLogger& audit_logger_;
 
   // A rescheduler to reschedule the current call.
   Rescheduler* const rescheduler_;

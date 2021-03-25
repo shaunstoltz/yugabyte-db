@@ -27,8 +27,20 @@ static constexpr int kUuidVersion = 3; // Repurpose old name-based UUID v3 to em
 const uint32_t kTemplate1Oid = 1;  // Hardcoded for template1. (in initdb.c)
 const uint32_t kPgProcTableOid = 1255;  // Hardcoded for pg_proc. (in pg_proc.h)
 
+// This should match the value for pg_yb_catalog_version hardcoded in pg_yb_catalog_version.h.
+const uint32_t kPgYbCatalogVersionTableOid = 8010;
+
+// This should match the value for pg_tablespace hardcoded in pg_tablespace.h
+const uint32_t kPgTablespaceTableOid = 1213;
+
 // Static initialization is OK because this won't be used in another static initialization.
 const TableId kPgProcTableId = GetPgsqlTableId(kTemplate1Oid, kPgProcTableOid);
+const TableId kPgYbCatalogVersionTableId =
+    GetPgsqlTableId(kTemplate1Oid, kPgYbCatalogVersionTableOid);
+const TableId kPgTablespaceTableId =
+    GetPgsqlTableId(kTemplate1Oid, kPgTablespaceTableOid);
+
+
 
 //-------------------------------------------------------------------------------------------------
 
@@ -85,6 +97,17 @@ TableId GetPgsqlTableId(const uint32_t database_oid, const uint32_t table_oid) {
   return UuidToString(&id);
 }
 
+TablegroupId GetPgsqlTablegroupId(const uint32_t database_oid, const uint32_t tablegroup_oid) {
+  return GetPgsqlTableId(database_oid, tablegroup_oid);
+}
+
+TablespaceId GetPgsqlTablespaceId(const uint32_t tablespace_oid) {
+  uuid id = boost::uuids::nil_uuid();
+  // Tablespace is an entity across databases so this is better than UuidSetTableIds.
+  UuidSetDatabaseId(tablespace_oid, &id);
+  return UuidToString(&id);
+}
+
 bool IsPgsqlId(const string& id) {
   if (id.size() != 32) return false; // Ignore non-UUID id like "sys.catalog.uuid"
   try {
@@ -133,5 +156,60 @@ Result<uint32_t> GetPgsqlTableOid(const TableId& table_id) {
 
   return STATUS(InvalidArgument, "Invalid PostgreSQL table id", table_id);
 }
+
+Result<uint32_t> GetPgsqlTablegroupOid(const TablegroupId& tablegroup_id) {
+  DCHECK(IsPgsqlId(tablegroup_id));
+  try {
+    size_t pos = 0;
+    const uint32_t oid = stoul(tablegroup_id.substr(12 * 2, sizeof(uint32_t) * 2), &pos, 16);
+    if (pos == sizeof(uint32_t) * 2) {
+      return oid;
+    }
+  } catch(const std::invalid_argument&) {
+  } catch(const std::out_of_range&) {
+  }
+
+  return STATUS(InvalidArgument, "Invalid tablegroup id", tablegroup_id);
+}
+
+Result<uint32_t> GetPgsqlTablegroupOidByTableId(const TableId& table_id) {
+  if (table_id.size() < 32) {
+    return STATUS(InvalidArgument, "Invalid PostgreSQL table id for tablegroup", table_id);
+  }
+  TablegroupId tablegroup_id = table_id.substr(0, 32);
+
+  return GetPgsqlTablegroupOid(tablegroup_id);
+}
+
+Result<uint32_t> GetPgsqlDatabaseOidByTableId(const TableId& table_id) {
+  DCHECK(IsPgsqlId(table_id));
+  try {
+    size_t pos = 0;
+    const uint32_t oid = stoul(table_id.substr(0, sizeof(uint32_t) * 2), &pos, 16);
+    if (pos == sizeof(uint32_t) * 2) {
+      return oid;
+    }
+  } catch(const std::invalid_argument&) {
+  } catch(const std::out_of_range&) {
+  }
+
+  return STATUS(InvalidArgument, "Invalid PostgreSQL table id", table_id);
+}
+
+Result<uint32_t> GetPgsqlTablespaceOid(const TablespaceId& tablespace_id) {
+  DCHECK(IsPgsqlId(tablespace_id));
+  try {
+    size_t pos = 0;
+    const uint32_t oid = stoul(tablespace_id.substr(0, sizeof(uint32_t) * 2), &pos, 16);
+    if (pos == sizeof(uint32_t) * 2) {
+      return oid;
+    }
+  } catch(const std::invalid_argument&) {
+  } catch(const std::out_of_range&) {
+  }
+
+  return STATUS(InvalidArgument, "Invalid PostgreSQL tablespace id", tablespace_id);
+}
+
 
 }  // namespace yb

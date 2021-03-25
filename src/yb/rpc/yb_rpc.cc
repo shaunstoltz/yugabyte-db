@@ -48,7 +48,7 @@ DEFINE_bool(enable_rpc_keepalive, true, "Whether to enable RPC keepalive mechani
 
 DEFINE_uint64(min_sidecar_buffer_size, 16_KB, "Minimal buffer to allocate for sidecar");
 
-DEFINE_test_flag(int32, TEST_yb_inbound_big_calls_parse_delay_ms, false,
+DEFINE_test_flag(int32, yb_inbound_big_calls_parse_delay_ms, false,
     "Test flag for simulating slow parsing of inbound calls larger than "
     "rpc_throttle_threshold_bytes");
 
@@ -425,7 +425,7 @@ void YBInboundCall::LogTrace() const {
       // The traces may also be too large to fit in a log message.
       LOG(WARNING) << ToString() << " took " << total_time << "ms (client timeout "
                    << header_.timeout_millis() << "ms).";
-      std::string s = trace_->DumpToString(true);
+      std::string s = trace_->DumpToString("==>", true);
       if (!s.empty()) {
         LOG(WARNING) << "Trace:\n" << s;
       }
@@ -434,6 +434,7 @@ void YBInboundCall::LogTrace() const {
   }
 
   if (PREDICT_FALSE(
+          trace_->must_print() ||
           FLAGS_rpc_dump_all_traces ||
           total_time > FLAGS_rpc_slow_query_threshold_ms)) {
     LOG(INFO) << ToString() << " took " << total_time << "ms. Trace:";

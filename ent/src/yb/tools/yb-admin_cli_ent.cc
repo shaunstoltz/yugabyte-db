@@ -18,6 +18,7 @@
 
 #include "yb/tools/yb-admin_client.h"
 #include "yb/util/stol_utils.h"
+#include "yb/util/string_case.h"
 #include "yb/util/tostring.h"
 
 namespace yb {
@@ -36,50 +37,106 @@ void ClusterAdminCli::RegisterCommandHandlers(ClusterAdminClientClass* client) {
   super::RegisterCommandHandlers(client);
 
   Register(
-      "list_snapshots", "",
-      [client](const CLIArguments&) -> Status {
-        RETURN_NOT_OK_PREPEND(client->ListSnapshots(),
+      "list_snapshots", " [SHOW_DETAILS] [NOT_SHOW_RESTORED] [SHOW_DELETED]",
+      [client](const CLIArguments& args) -> Status {
+        bool show_details = false;
+        bool show_restored = true;
+        bool show_deleted = false;
+
+        if (args.size() > 4) {
+          return ClusterAdminCli::kInvalidArguments;
+        }
+        for (int i = 2; i < args.size(); ++i) {
+          string uppercase_flag;
+          ToUpperCase(args[i], &uppercase_flag);
+
+          if (uppercase_flag == "SHOW_DETAILS") {
+            show_details = true;
+          } else if (uppercase_flag == "NOT_SHOW_RESTORED") {
+            show_restored = false;
+          } else if (uppercase_flag == "SHOW_DELETED") {
+            show_deleted = true;
+          } else {
+            return ClusterAdminCli::kInvalidArguments;
+          }
+        }
+
+        RETURN_NOT_OK_PREPEND(client->ListSnapshots(show_details, show_restored, show_deleted),
                               "Unable to list snapshots");
         return Status::OK();
       });
 
   Register(
       "create_snapshot",
-      " <keyspace> <table_name> [<keyspace> <table_name>]... [flush_timeout_in_seconds]"
-      " (default 60, set 0 to skip flushing)",
+      " <table>"
+      " [<table>]..."
+      " [flush_timeout_in_seconds] (default 60, set 0 to skip flushing)",
       [client](const CLIArguments& args) -> Status {
-        if (args.size() < 4) {
-          return ClusterAdminCli::kInvalidArguments;
-        }
-
-        const int num_tables = (args.size() - 2)/2;
-        vector<YBTableName> tables;
-        tables.reserve(num_tables);
-
-        for (int i = 0; i < num_tables; ++i) {
-          tables.push_back(VERIFY_RESULT(ResolveTableName(client, args[2 + i*2], args[3 + i*2])));
-        }
-
         int timeout_secs = 60;
-        if (args.size() % 2 == 1) {
-          timeout_secs = VERIFY_RESULT(CheckedStoi(args[args.size() - 1]));
-        }
-
-        RETURN_NOT_OK_PREPEND(client->CreateSnapshot(tables, timeout_secs),
+        const auto tables = VERIFY_RESULT(ResolveTableNames(
+            client, args.begin() + 2, args.end(),
+            [&timeout_secs](auto i, const auto& end) -> Status {
+              if (std::next(i) == end) {
+                timeout_secs = VERIFY_RESULT(CheckedStoi(*i));
+                return Status::OK();
+              }
+              return ClusterAdminCli::kInvalidArguments;
+            }));
+        RETURN_NOT_OK_PREPEND(client->CreateSnapshot(tables, true, timeout_secs),
                               Substitute("Unable to create snapshot of tables: $0",
                                          yb::ToString(tables)));
         return Status::OK();
       });
 
   Register(
-      "restore_snapshot", " <snapshot_id>",
+      "create_keyspace_snapshot", " [ycql.]<keyspace_name>",
       [client](const CLIArguments& args) -> Status {
         if (args.size() != 3) {
           return ClusterAdminCli::kInvalidArguments;
         }
 
+        const TypedNamespaceName keyspace = VERIFY_RESULT(ParseNamespaceName(args[2]));
+        SCHECK_NE(
+            keyspace.db_type, YQL_DATABASE_PGSQL, InvalidArgument,
+            Format("Wrong keyspace type: $0", YQLDatabase_Name(keyspace.db_type)));
+
+        RETURN_NOT_OK_PREPEND(client->CreateNamespaceSnapshot(keyspace),
+                              Substitute("Unable to create snapshot of keyspace: $0",
+                                         keyspace.name));
+        return Status::OK();
+      });
+
+  Register(
+      "create_database_snapshot", " [ysql.]<database_name>",
+      [client](const CLIArguments& args) -> Status {
+        if (args.size() != 3) {
+          return ClusterAdminCli::kInvalidArguments;
+        }
+
+        const TypedNamespaceName database =
+            VERIFY_RESULT(ParseNamespaceName(args[2], YQL_DATABASE_PGSQL));
+        SCHECK_EQ(
+            database.db_type, YQL_DATABASE_PGSQL, InvalidArgument,
+            Format("Wrong database type: $0", YQLDatabase_Name(database.db_type)));
+
+        RETURN_NOT_OK_PREPEND(client->CreateNamespaceSnapshot(database),
+                              Substitute("Unable to create snapshot of database: $0",
+                                         database.name));
+        return Status::OK();
+      });
+
+  Register(
+      "restore_snapshot", " <snapshot_id> [{<timestamp> | minus {interval}]",
+      [client](const CLIArguments& args) -> Status {
+        if (args.size() < 3 || 5 < args.size()) {
+          return ClusterAdminCli::kInvalidArguments;
+        } else if (args.size() == 5 && args[3] != "minus") {
+          return ClusterAdminCli::kInvalidArguments;
+        }
         const string snapshot_id = args[2];
-        RETURN_NOT_OK_PREPEND(client->RestoreSnapshot(snapshot_id),
+        string timestamp = (args.size() == 4) ? args[3] : "";
+        if (args.size() == 5) timestamp = "-" + args[4];
+        RETURN_NOT_OK_PREPEND(client->RestoreSnapshot(snapshot_id, timestamp),
                               Substitute("Unable to restore snapshot $0", snapshot_id));
         return Status::OK();
       });
@@ -101,29 +158,37 @@ void ClusterAdminCli::RegisterCommandHandlers(ClusterAdminClientClass* client) {
       });
 
   Register(
-      "import_snapshot", " <file_name> [<keyspace> <table_name> [<keyspace> <table_name>]...]",
+      "import_snapshot", " <file_name> [<namespace> <table_name> [<table_name>]...]",
       [client](const CLIArguments& args) -> Status {
-        if (args.size() < 3 || args.size() % 2 != 1) {
+        if (args.size() < 3) {
           return ClusterAdminCli::kInvalidArguments;
         }
 
         const string file_name = args[2];
-        const int num_tables = (args.size() - 3)/2;
+        TypedNamespaceName keyspace;
+        int num_tables = 0;
         vector<YBTableName> tables;
-        tables.reserve(num_tables);
 
-        for (int i = 0; i < num_tables; ++i) {
-          const auto typed_namespace = VERIFY_RESULT(ParseNamespaceName(args[3 + i*2]));
-          tables.push_back(
-              YBTableName(typed_namespace.db_type, typed_namespace.name, args[4 + i*2]));
+        if (args.size() >= 4) {
+          keyspace = VERIFY_RESULT(ParseNamespaceName(args[3]));
+          num_tables = args.size() - 4;
+
+          if (num_tables > 0) {
+            LOG_IF(DFATAL, keyspace.name.empty()) << "Uninitialized keyspace: " << keyspace.name;
+            tables.reserve(num_tables);
+
+            for (int i = 0; i < num_tables; ++i) {
+              tables.push_back(YBTableName(keyspace.db_type, keyspace.name, args[4 + i]));
+            }
+          }
         }
 
-        string msg = num_tables > 0 ?
+        const string msg = num_tables > 0 ?
             Substitute("Unable to import tables $0 from snapshot meta file $1",
                        yb::ToString(tables), file_name) :
             Substitute("Unable to import snapshot meta file $0", file_name);
 
-        RETURN_NOT_OK_PREPEND(client->ImportSnapshotMetaFile(file_name, tables), msg);
+        RETURN_NOT_OK_PREPEND(client->ImportSnapshotMetaFile(file_name, keyspace, tables), msg);
         return Status::OK();
       });
 
@@ -141,12 +206,11 @@ void ClusterAdminCli::RegisterCommandHandlers(ClusterAdminClientClass* client) {
       });
 
   Register(
-      "list_replica_type_counts", " <keyspace> <table_name>",
+      "list_replica_type_counts",
+      " <table>",
       [client](const CLIArguments& args) -> Status {
-        if (args.size() != 4) {
-          return ClusterAdminCli::kInvalidArguments;
-        }
-        const auto table_name = VERIFY_RESULT(ResolveTableName(client, args[2], args[3]));
+        const auto table_name = VERIFY_RESULT(
+            ResolveSingleTableName(client, args.begin() + 2, args.end()));
         RETURN_NOT_OK_PREPEND(client->ListReplicaTypeCounts(table_name),
                               "Unable to list live and read-only replica counts");
         return Status::OK();

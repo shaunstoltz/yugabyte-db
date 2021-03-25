@@ -56,6 +56,8 @@ set(MASTER_PROTO_LIBS
   master_proto
   ${MASTER_PROTO_LIBS_EXTENSIONS})
 
+include_directories(${YB_BUILD_ROOT}/postgres/include/server)
+
 set(MASTER_SRCS
   async_flush_tablets_task.cc
   async_rpc_tasks.cc
@@ -72,7 +74,6 @@ set(MASTER_SRCS
   permissions_manager.cc
   flush_manager.cc
   master.cc
-  master_error.cc
   master_options.cc
   master_service_base.cc
   master_service.cc
@@ -81,6 +82,11 @@ set(MASTER_SRCS
   master-path-handlers.cc
   mini_master.cc
   master_snapshot_coordinator.cc
+  restoration_state.cc
+  snapshot_coordinator_context.cc
+  snapshot_schedule_state.cc
+  snapshot_state.cc
+  state_with_tablets.cc
   sys_catalog.cc
   sys_catalog_initialization.cc
   sys_catalog_writer.cc
@@ -108,10 +114,10 @@ set(MASTER_SRCS
   yql_types_vtable.cc
   yql_views_vtable.cc
   yql_partitions_vtable.cc
+  ysql_transaction_ddl.cc
   ${MASTER_SRCS_EXTENSIONS})
 
-add_library(master ${MASTER_SRCS})
-target_link_libraries(master
+set(MASTER_DEPS
   yb_common
   tablet
   server_common
@@ -125,7 +131,14 @@ target_link_libraries(master
   rpc_header_proto
   master_util
   version_info_proto
-  yb_pggate_flags)
+  yb_pggate_flags
+  yb_pggate
+)
+
+ADD_YB_LIBRARY(master
+  SRCS ${MASTER_SRCS}
+  DEPS ${MASTER_DEPS}
+  NONLINK_DEPS postgres)
 
 set(MASTER_RPC_SRCS
   master_rpc.cc)
@@ -140,11 +153,17 @@ ADD_YB_LIBRARY(master_rpc
   SRCS ${MASTER_RPC_SRCS}
   DEPS ${MASTER_RPC_LIBS})
 
+set(MASTER_ERROR_SRCS
+  master_error.cc)
+ADD_YB_LIBRARY(master_error
+  SRCS ${MASTER_ERROR_SRCS}
+  DEPS ${MASTER_RPC_LIBS})
+
 set(MASTER_UTIL_SRCS
   master_util.cc)
 ADD_YB_LIBRARY(master_util
   SRCS ${MASTER_UTIL_SRCS}
-  DEPS ${MASTER_RPC_LIBS})
+  DEPS master_error ${MASTER_RPC_LIBS})
 
 # A library with common code shared between master tests.
 set(MASTER_TEST_COMMON_SRCS
@@ -154,8 +173,16 @@ target_link_libraries(master_test_common
   master ${MASTER_PROTO_LIBS} yb_client ${YB_MIN_TEST_LIBS})
 
 # Tests
-set(YB_TEST_LINK_LIBS master ${MASTER_PROTO_LIBS} master_test_common yb_client ${YB_MIN_TEST_LIBS})
+set(YB_TEST_LINK_LIBS master
+  ${MASTER_PROTO_LIBS}
+  integration-tests
+  master_test_common
+  cql_test_util
+  yb_client
+  yb_tools_util
+  ${YB_MIN_TEST_LIBS})
 ADD_YB_TEST(catalog_manager-test)
+ADD_YB_TEST(flush_manager-test)
 ADD_YB_TEST(master-test)
 ADD_YB_TEST(sys_catalog-test)
 

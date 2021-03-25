@@ -43,8 +43,17 @@
 #include "yb/master/master.pb.h"
 #include "yb/tserver/tserver_admin.proxy.h"
 #include "yb/tserver/tserver_service.proxy.h"
+#include "yb/util/flag_tags.h"
 #include "yb/util/net/net_util.h"
 #include "yb/util/shared_lock.h"
+
+
+DEFINE_int32(tserver_unresponsive_timeout_ms, 60 * 1000,
+             "The period of time that a Master can go without receiving a heartbeat from a "
+             "tablet server before considering it unresponsive. Unresponsive servers are not "
+             "selected when assigning replicas during table creation or re-replication.");
+TAG_FLAG(tserver_unresponsive_timeout_ms, advanced);
+
 
 namespace yb {
 namespace master {
@@ -53,9 +62,16 @@ Result<TSDescriptorPtr> TSDescriptor::RegisterNew(
     const NodeInstancePB& instance,
     const TSRegistrationPB& registration,
     CloudInfoPB local_cloud_info,
-    rpc::ProxyCache* proxy_cache) {
+    rpc::ProxyCache* proxy_cache,
+    RegisteredThroughHeartbeat registered_through_heartbeat) {
   auto result = std::make_shared<enterprise::TSDescriptor>(
       instance.permanent_uuid());
+  if (!registered_through_heartbeat) {
+    // This tserver hasn't actually heartbeated, so register using a last_heartbeat_ time of 0.
+    std::lock_guard<decltype(result->lock_)> l(result->lock_);
+    result->last_heartbeat_ = MonoTime::kMin;
+    result->registered_through_heartbeat_ = RegisteredThroughHeartbeat::kFalse;
+  }
   RETURN_NOT_OK(result->Register(instance, registration, std::move(local_cloud_info), proxy_cache));
   return std::move(result);
 }
@@ -123,6 +139,9 @@ Status TSDescriptor::RegisterUnlocked(
   local_cloud_info_ = std::move(local_cloud_info);
   proxy_cache_ = proxy_cache;
 
+  capabilities_.clear();
+  capabilities_.insert(registration.capabilities().begin(), registration.capabilities().end());
+
   return Status::OK();
 }
 
@@ -165,6 +184,11 @@ bool TSDescriptor::has_tablet_report() const {
 void TSDescriptor::set_has_tablet_report(bool has_report) {
   std::lock_guard<decltype(lock_)> l(lock_);
   has_tablet_report_ = has_report;
+}
+
+bool TSDescriptor::registered_through_heartbeat() const {
+  SharedLock<decltype(lock_)> l(lock_);
+  return registered_through_heartbeat_;
 }
 
 void TSDescriptor::DecayRecentReplicaCreationsUnlocked() {
@@ -259,6 +283,18 @@ void TSDescriptor::UpdateMetrics(const TServerMetricsPB& metrics) {
   ts_metrics_.uptime_seconds = metrics.uptime_seconds();
 }
 
+void TSDescriptor::GetMetrics(TServerMetricsPB* metrics) {
+  CHECK(metrics);
+  SharedLock<decltype(lock_)> l(lock_);
+  metrics->set_total_ram_usage(ts_metrics_.total_memory_usage);
+  metrics->set_total_sst_file_size(ts_metrics_.total_sst_file_size);
+  metrics->set_uncompressed_sst_file_size(ts_metrics_.uncompressed_sst_file_size);
+  metrics->set_num_sst_files(ts_metrics_.num_sst_files);
+  metrics->set_read_ops_per_sec(ts_metrics_.read_ops_per_sec);
+  metrics->set_write_ops_per_sec(ts_metrics_.write_ops_per_sec);
+  metrics->set_uptime_seconds(ts_metrics_.uptime_seconds);
+}
+
 bool TSDescriptor::HasTabletDeletePending() const {
   SharedLock<decltype(lock_)> l(lock_);
   return !tablets_pending_delete_.empty();
@@ -287,6 +323,11 @@ void TSDescriptor::ClearPendingTabletDelete(const std::string& tablet_id) {
 std::size_t TSDescriptor::NumTasks() const {
   SharedLock<decltype(lock_)> l(lock_);
   return tablets_pending_delete_.size();
+}
+
+bool TSDescriptor::IsLive() const {
+  return TimeSinceHeartbeat().ToMilliseconds() <
+         GetAtomicFlag(&FLAGS_tserver_unresponsive_timeout_ms) && !IsRemoved();
 }
 
 std::string TSDescriptor::ToString() const {

@@ -21,6 +21,8 @@
 #include "yb/common/index.h"
 #include "yb/common/partition.h"
 
+#include "yb/util/locks.h"
+
 DECLARE_int32(max_num_tablets_for_table);
 
 namespace yb {
@@ -44,7 +46,17 @@ struct YBTableInfo {
   IndexMap index_map;
   boost::optional<IndexInfo> index_info;
   YBTableType table_type;
+  bool colocated;
+  boost::optional<master::ReplicationInfoPB> replication_info;
 };
+
+struct VersionedTablePartitionList {
+  TablePartitionList keys;
+  // See SysTablesEntryPB::partition_list_version.
+  PartitionListVersion version;
+};
+
+typedef std::shared_ptr<const VersionedTablePartitionList> VersionedTablePartitionListPtr;
 
 // A YBTable represents a table on a particular cluster. It holds the current
 // schema of the table. Any given YBTable instance belongs to a specific YBClient
@@ -77,10 +89,17 @@ class YBTable : public std::enable_shared_from_this<YBTable> {
   const YBSchema& schema() const;
   const Schema& InternalSchema() const;
   const PartitionSchema& partition_schema() const;
+  bool IsHashPartitioned() const;
+  bool IsRangePartitioned() const;
 
-  const std::vector<std::string>& GetPartitions() const;
-
+  // Note that table partitions are mutable could change at any time because of tablet splitting.
+  // So it is not safe to rely on following Get*Partition* functions to return information that
+  // is consistent across subsequent calls.
+  std::shared_ptr<const TablePartitionList> GetPartitionsShared() const;
+  VersionedTablePartitionListPtr GetVersionedPartitions() const;
+  TablePartitionList GetPartitionsCopy() const;
   int32_t GetPartitionCount() const;
+  int32_t GetPartitionListVersion() const;
 
   // Indexes available on the table.
   const IndexMap& index_map() const;
@@ -92,6 +111,12 @@ class YBTable : public std::enable_shared_from_this<YBTable> {
 
   // For index table: information about this index.
   const IndexInfo& index_info() const;
+
+  // Is the table colocated?
+  const bool colocated() const;
+
+  // Returns the replication info for the table.
+  const boost::optional<master::ReplicationInfoPB>& replication_info() const;
 
   std::string ToString() const;
   //------------------------------------------------------------------------------------------------
@@ -106,10 +131,15 @@ class YBTable : public std::enable_shared_from_this<YBTable> {
   std::unique_ptr<YBqlReadOp> NewQLSelect();
 
   // Finds partition start for specified partition_key.
-  // Partitions could be groupped by group_by bunches, in this case start of such bunch is returned.
-  size_t FindPartitionStartIndex(const std::string& partition_key, size_t group_by = 1) const;
-  const std::string& FindPartitionStart(
-      const std::string& partition_key, size_t group_by = 1) const;
+  // Partitions could be grouped by group_by bunches, in this case start of such bunch is returned.
+  PartitionKeyPtr FindPartitionStart(const PartitionKey& partition_key, size_t group_by = 1) const;
+
+  void MarkPartitionsAsStale();
+  bool ArePartitionsStale() const;
+
+  // Refreshes table partitions if stale.
+  // Returns whether table partitions have been refreshed.
+  Result<bool> MaybeRefreshPartitions();
 
   //------------------------------------------------------------------------------------------------
   // Postgres support
@@ -126,18 +156,37 @@ class YBTable : public std::enable_shared_from_this<YBTable> {
  private:
   friend class YBClient;
   friend class internal::GetTableSchemaRpc;
+  friend class internal::GetColocatedTabletSchemaRpc;
 
   YBTable(client::YBClient* client, const YBTableInfo& info);
 
   CHECKED_STATUS Open();
 
+  // Fetches tablet partitions from master using GetTableLocations RPC.
+  Result<VersionedTablePartitionListPtr> FetchPartitions();
+
+  size_t FindPartitionStartIndex(const std::string& partition_key, size_t group_by = 1) const;
+
   client::YBClient* const client_;
   YBTableType table_type_;
   YBTableInfo info_;
-  std::vector<std::string> partitions_;
+
+  // Mutex protecting partitions_.
+  mutable rw_spinlock mutex_;
+  VersionedTablePartitionListPtr partitions_ GUARDED_BY(mutex_);
+
+  std::atomic<bool> partitions_are_stale_{false};
+  std::mutex partitions_refresh_mutex_;
 
   DISALLOW_COPY_AND_ASSIGN(YBTable);
 };
+
+size_t FindPartitionStartIndex(
+    const TablePartitionList& partitions, const PartitionKey& partition_key, size_t group_by = 1);
+
+PartitionKeyPtr FindPartitionStart(
+    const VersionedTablePartitionListPtr& versioned_partitions, const PartitionKey& partition_key,
+    size_t group_by = 1);
 
 } // namespace client
 } // namespace yb

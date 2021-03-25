@@ -31,6 +31,7 @@
 #include "commands/trigger.h"
 #include "executor/execPartition.h"
 #include "executor/executor.h"
+#include "executor/tuptable.h"
 #include "foreign/fdwapi.h"
 #include "libpq/libpq.h"
 #include "libpq/pqformat.h"
@@ -119,6 +120,7 @@ typedef struct CopyStateData
 	List	   *attnumlist;		/* integer list of attnums to copy */
 	char	   *filename;		/* filename, or NULL for STDIN/STDOUT */
 	bool		is_program;		/* is 'filename' a program to popen? */
+	int			batch_size;		/* copy from executes in batch sizes */
 	copy_data_source_cb data_source_cb; /* function for reading data */
 	bool		binary;			/* binary format? */
 	bool		oids;			/* include OIDs? */
@@ -293,6 +295,7 @@ if (1) \
 
 static const char BinarySignature[11] = "PGCOPY\n\377\r\n\0";
 
+int yb_default_copy_from_rows_per_transaction = DEFAULT_BATCH_ROWS_PER_TRANSACTION;
 
 /* non-export function prototypes */
 static CopyState BeginCopy(ParseState *pstate, bool is_from, Relation rel,
@@ -1055,6 +1058,8 @@ ProcessCopyOptions(ParseState *pstate,
 
 	cstate->file_encoding = -1;
 
+	cstate->batch_size = -1;
+
 	/* Extract options from the statement node tree */
 	foreach(option, options)
 	{
@@ -1108,6 +1113,17 @@ ProcessCopyOptions(ParseState *pstate,
 						 errmsg("conflicting or redundant options"),
 						 parser_errposition(pstate, defel->location)));
 			cstate->delim = defGetString(defel);
+		}
+		else if (strcmp(defel->defname, "rows_per_transaction") == 0)
+		{
+			int rows = defGetInt32(defel);
+			if (rows >= 0)
+				cstate->batch_size = rows;
+			else
+				ereport(ERROR,
+						(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+						 errmsg("argument to option \"%s\" must be a positive integer", defel->defname),
+						 parser_errposition(pstate, defel->location)));
 		}
 		else if (strcmp(defel->defname, "null") == 0)
 		{
@@ -2072,11 +2088,27 @@ CopyTo(CopyState cstate)
 		bool	   *nulls;
 		HeapScanDesc scandesc;
 		HeapTuple	tuple;
+		bool		is_yb_relation;
+		MemoryContext oldcontext;
+		MemoryContext yb_context;
 
 		values = (Datum *) palloc(num_phys_attrs * sizeof(Datum));
 		nulls = (bool *) palloc(num_phys_attrs * sizeof(bool));
 
 		scandesc = heap_beginscan(cstate->rel, GetActiveSnapshot(), 0, NULL);
+		is_yb_relation = IsYBRelation(cstate->rel);
+
+		/*
+		 * Create and switch to a temporary memory context that we can reset
+		 * once per row to recover Yugabyte palloc'd memory.
+		 */
+		if (is_yb_relation)
+		{
+			yb_context = AllocSetContextCreate(GetCurrentMemoryContext(),
+											   "COPY TO (YB)",
+											   ALLOCSET_DEFAULT_SIZES);
+			oldcontext = MemoryContextSwitchTo(yb_context);
+		}
 
 		processed = 0;
 		while ((tuple = heap_getnext(scandesc, ForwardScanDirection)) != NULL)
@@ -2089,6 +2121,20 @@ CopyTo(CopyState cstate)
 			/* Format and send the data */
 			CopyOneRowTo(cstate, HeapTupleGetOid(tuple), values, nulls);
 			processed++;
+
+			/* Free Yugabyte memory for this row */
+			if (is_yb_relation)
+				MemoryContextReset(yb_context);
+		}
+
+		/*
+		 * Switch out of and delete the temporary memory context for Yugabyte
+		 * palloc'd memory.
+		 */
+		if (is_yb_relation)
+		{
+			MemoryContextSwitchTo(oldcontext);
+			MemoryContextDelete(yb_context);
 		}
 
 		heap_endscan(scandesc);
@@ -2348,6 +2394,17 @@ CopyFrom(CopyState cstate)
 	int			nBufferedTuples = 0;
 	int			prev_leaf_part_index = -1;
 	bool		useNonTxnInsert;
+	bool		isBatchTxnCopy;
+
+	/*
+	 * If the batch size is not explicitly set in the query by the user,
+	 * use the session variable value.
+	 */
+	if (cstate->batch_size < 0)
+	{
+		cstate->batch_size = yb_default_copy_from_rows_per_transaction;
+	}
+	isBatchTxnCopy = cstate->batch_size > 0;
 
 #define MAX_BUFFERED_TUPLES 1000
 	HeapTuple  *bufferedTuples = NULL;	/* initialize to silence warning */
@@ -2579,6 +2636,38 @@ CopyFrom(CopyState cstate)
 			ExecSetupChildParentMapForLeaf(proute);
 	}
 
+	if (isBatchTxnCopy)
+	{
+		/*
+		 * Batched copy is not supported
+		 * under the following use cases in which case
+		 * all rows will be copied over in a single transaction.
+		 */
+		int batch_size = 0;
+
+		if (!IsYBRelation(cstate->rel))
+			ereport(WARNING,
+				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+			 	 errmsg("Batched COPY is not supported on temporary tables. "
+						"Defaulting to using one transaction for the entire copy."),
+				 errhint("Either copy onto non-temporary table or set rows_per_transaction "
+						 "option to `0` to disable batching and remove this warning.")));
+		else if (YBIsDataSent())
+			ereport(WARNING,
+				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+				 errmsg("Batched COPY is not supported in transaction blocks. "
+						"Defaulting to using one transaction for the entire copy."),
+				 errhint("Either run this COPY outside of a transaction block or set "
+						 "rows_per_transaction option to `0` to disable batching and "
+						 "remove this warning.")));
+
+		else
+		{
+			batch_size = cstate->batch_size;
+		}
+		cstate->batch_size = batch_size;
+	}
+
 	/*
 	 * It's more efficient to prepare a bunch of tuples for insertion, and
 	 * insert them in one heap_multi_insert() call, than call heap_insert()
@@ -2654,283 +2743,338 @@ CopyFrom(CopyState cstate)
 				 errhint("Non-transactional COPY is not supported on relations with "
 						 "secondary indices or triggers.")));
 
-	for (;;)
+	bool has_more_tuples = true;
+	while (has_more_tuples)
 	{
-		TupleTableSlot *slot;
-		bool		skip_tuple;
-		Oid			loaded_oid = InvalidOid;
-
-		CHECK_FOR_INTERRUPTS();
-
-		if (nBufferedTuples == 0)
-		{
-			/*
-			 * Reset the per-tuple exprcontext. We can only do this if the
-			 * tuple buffer is empty. (Calling the context the per-tuple
-			 * memory context is a bit of a misnomer now.)
-			 */
-			ResetPerTupleExprContext(estate);
-		}
-
-		/* Switch into its memory context */
-		MemoryContextSwitchTo(GetPerTupleMemoryContext(estate));
-
-		if (!NextCopyFrom(cstate, econtext, values, nulls, &loaded_oid))
-			break;
-
-		/* And now we can form the input tuple. */
-		tuple = heap_form_tuple(tupDesc, values, nulls);
-
-		if (loaded_oid != InvalidOid)
-			HeapTupleSetOid(tuple, loaded_oid);
-
 		/*
-		 * Constraints might reference the tableoid column, so initialize
-		 * t_tableOid before evaluating them.
+		 * When batch size is not provided from the query option,
+		 * default behavior is to read each line from the file
+		 * until no more lines are left. If batch size is provided,
+		 * lines will be read in batch sizes at a time.
 		 */
-		tuple->t_tableOid = RelationGetRelid(resultRelInfo->ri_RelationDesc);
-
-		/* Triggers and stuff need to be invoked in query context. */
-		MemoryContextSwitchTo(oldcontext);
-
-		/* Place tuple in tuple slot --- but slot shouldn't free it */
-		slot = myslot;
-		ExecStoreTuple(tuple, slot, InvalidBuffer, false);
-
-		/* Determine the partition to heap_insert the tuple into */
-		if (cstate->partition_tuple_routing)
+		for (int i = 0; cstate->batch_size == 0 || i < cstate->batch_size; i++)
 		{
-			int			leaf_part_index;
-			PartitionTupleRouting *proute = cstate->partition_tuple_routing;
+			if (IsYBRelation(cstate->rel))
+				MemoryContextSwitchTo(GetPerTupleMemoryContext(estate));
 
-			/*
-			 * Away we go ... If we end up not finding a partition after all,
-			 * ExecFindPartition() does not return and errors out instead.
-			 * Otherwise, the returned value is to be used as an index into
-			 * arrays mt_partitions[] and mt_partition_tupconv_maps[] that
-			 * will get us the ResultRelInfo and TupleConversionMap for the
-			 * partition, respectively.
-			 */
-			leaf_part_index = ExecFindPartition(resultRelInfo,
-												proute->partition_dispatch_info,
-												slot,
-												estate);
-			Assert(leaf_part_index >= 0 &&
-				   leaf_part_index < proute->num_partitions);
+			TupleTableSlot *slot;
+			bool		skip_tuple;
+			Oid			loaded_oid = InvalidOid;
 
-			/*
-			 * If this tuple is mapped to a partition that is not same as the
-			 * previous one, we'd better make the bulk insert mechanism gets a
-			 * new buffer.
-			 */
-			if (prev_leaf_part_index != leaf_part_index)
+			CHECK_FOR_INTERRUPTS();
+
+			if (!IsYBRelation(cstate->rel) && nBufferedTuples == 0)
 			{
-				ReleaseBulkInsertStatePin(bistate);
-				prev_leaf_part_index = leaf_part_index;
+				/*
+				 * Reset the per-tuple exprcontext. We can only do this if the
+				 * tuple buffer is empty. (Calling the context the per-tuple
+				 * memory context is a bit of a misnomer now.)
+				 */
+				ResetPerTupleExprContext(estate);
 			}
 
-			/*
-			 * Save the old ResultRelInfo and switch to the one corresponding
-			 * to the selected partition.
-			 */
-			saved_resultRelInfo = resultRelInfo;
-			resultRelInfo = proute->partitions[leaf_part_index];
-			if (resultRelInfo == NULL)
-			{
-				resultRelInfo = ExecInitPartitionInfo(mtstate,
-													  saved_resultRelInfo,
-													  proute, estate,
-													  leaf_part_index);
-				Assert(resultRelInfo != NULL);
-			}
+			/* Switch into its memory context */
+			if (!IsYBRelation(cstate->rel))
+				MemoryContextSwitchTo(GetPerTupleMemoryContext(estate));
+
+			has_more_tuples = NextCopyFrom(cstate, econtext, values, nulls, &loaded_oid);
+			if (!has_more_tuples)
+				break;
+
+			/* And now we can form the input tuple. */
+			tuple = heap_form_tuple(tupDesc, values, nulls);
+
+			if (loaded_oid != InvalidOid)
+				HeapTupleSetOid(tuple, loaded_oid);
 
 			/*
-			 * For ExecInsertIndexTuples() to work on the partition's indexes
+			 * Constraints might reference the tableoid column, so initialize
+			 * t_tableOid before evaluating them.
 			 */
-			estate->es_result_relation_info = resultRelInfo;
-
-			/*
-			 * If we're capturing transition tuples, we might need to convert
-			 * from the partition rowtype to parent rowtype.
-			 */
-			if (cstate->transition_capture != NULL)
-			{
-				if (resultRelInfo->ri_TrigDesc &&
-					resultRelInfo->ri_TrigDesc->trig_insert_before_row)
-				{
-					/*
-					 * If there are any BEFORE triggers on the partition,
-					 * we'll have to be ready to convert their result back to
-					 * tuplestore format.
-					 */
-					cstate->transition_capture->tcs_original_insert_tuple = NULL;
-					cstate->transition_capture->tcs_map =
-						TupConvMapForLeaf(proute, saved_resultRelInfo,
-										  leaf_part_index);
-				}
-				else
-				{
-					/*
-					 * Otherwise, just remember the original unconverted
-					 * tuple, to avoid a needless round trip conversion.
-					 */
-					cstate->transition_capture->tcs_original_insert_tuple = tuple;
-					cstate->transition_capture->tcs_map = NULL;
-				}
-			}
-
-			/*
-			 * We might need to convert from the parent rowtype to the
-			 * partition rowtype.
-			 */
-			tuple = ConvertPartitionTupleSlot(proute->parent_child_tupconv_maps[leaf_part_index],
-											  tuple,
-											  proute->partition_tuple_slot,
-											  &slot);
-
 			tuple->t_tableOid = RelationGetRelid(resultRelInfo->ri_RelationDesc);
-		}
 
-		skip_tuple = false;
+			/* Triggers and stuff need to be invoked in query context. */
+			if (!IsYBRelation(cstate->rel))
+				MemoryContextSwitchTo(oldcontext);
 
-		/* BEFORE ROW INSERT Triggers */
-		if (resultRelInfo->ri_TrigDesc &&
-			resultRelInfo->ri_TrigDesc->trig_insert_before_row)
-		{
-			slot = ExecBRInsertTriggers(estate, resultRelInfo, slot);
+			/* Place tuple in tuple slot --- but slot shouldn't free it */
+			slot = myslot;
+			ExecStoreHeapTuple(tuple, slot, false);
 
-			if (slot == NULL)	/* "do nothing" */
-				skip_tuple = true;
-			else				/* trigger might have changed tuple */
-				tuple = ExecMaterializeSlot(slot);
-		}
-
-		if (!skip_tuple)
-		{
-			if (resultRelInfo->ri_TrigDesc &&
-				resultRelInfo->ri_TrigDesc->trig_insert_instead_row)
+			/* Determine the partition to heap_insert the tuple into */
+			if (cstate->partition_tuple_routing)
 			{
-				/* Pass the data to the INSTEAD ROW INSERT trigger */
-				ExecIRInsertTriggers(estate, resultRelInfo, slot);
-			}
-			else
-			{
-				/*
-				 * If the target is a plain table, check the constraints of
-				 * the tuple.
-				 */
-				if (resultRelInfo->ri_FdwRoutine == NULL &&
-					resultRelInfo->ri_RelationDesc->rd_att->constr)
-					ExecConstraints(resultRelInfo, slot, estate, mtstate);
+				int			leaf_part_index;
+				TupleConversionMap *map;
+				PartitionTupleRouting *proute = cstate->partition_tuple_routing;
 
 				/*
-				 * Also check the tuple against the partition constraint, if
-				 * there is one; except that if we got here via tuple-routing,
-				 * we don't need to if there's no BR trigger defined on the
-				 * partition.
+				 * Away we go ... If we end up not finding a partition after all,
+				 * ExecFindPartition() does not return and errors out instead.
+				 * Otherwise, the returned value is to be used as an index into
+				 * arrays mt_partitions[] and mt_partition_tupconv_maps[] that
+				 * will get us the ResultRelInfo and TupleConversionMap for the
+				 * partition, respectively.
 				 */
-				if (resultRelInfo->ri_PartitionCheck &&
-					(saved_resultRelInfo == NULL ||
-					 (resultRelInfo->ri_TrigDesc &&
-					  resultRelInfo->ri_TrigDesc->trig_insert_before_row)))
-					ExecPartitionCheck(resultRelInfo, slot, estate, true);
+				leaf_part_index = ExecFindPartition(resultRelInfo,
+													proute->partition_dispatch_info,
+													slot,
+													estate);
+				Assert(leaf_part_index >= 0 &&
+					   leaf_part_index < proute->num_partitions);
 
-				if (useHeapMultiInsert)
+				/*
+				 * If this tuple is mapped to a partition that is not same as the
+				 * previous one, we'd better make the bulk insert mechanism gets a
+				 * new buffer.
+				 */
+				if (prev_leaf_part_index != leaf_part_index)
 				{
-					/* Add this tuple to the tuple buffer */
-					if (nBufferedTuples == 0)
-						firstBufferedLineNo = cstate->cur_lineno;
-					bufferedTuples[nBufferedTuples++] = tuple;
-					bufferedTuplesSize += tuple->t_len;
-
-					/*
-					 * If the buffer filled up, flush it.  Also flush if the
-					 * total size of all the tuples in the buffer becomes
-					 * large, to avoid using large amounts of memory for the
-					 * buffer when the tuples are exceptionally wide.
-					 */
-					if (nBufferedTuples == MAX_BUFFERED_TUPLES ||
-						bufferedTuplesSize > 65535)
-					{
-						CopyFromInsertBatch(cstate, estate, mycid, hi_options,
-											resultRelInfo, myslot, bistate,
-											nBufferedTuples, bufferedTuples,
-											firstBufferedLineNo);
-						nBufferedTuples = 0;
-						bufferedTuplesSize = 0;
-					}
+					ReleaseBulkInsertStatePin(bistate);
+					prev_leaf_part_index = leaf_part_index;
 				}
-				else
+
+				/*
+				 * Save the old ResultRelInfo and switch to the one corresponding
+				 * to the selected partition.
+				 */
+				saved_resultRelInfo = resultRelInfo;
+				resultRelInfo = proute->partitions[leaf_part_index];
+				if (resultRelInfo == NULL)
 				{
-					List	   *recheckIndexes = NIL;
+					resultRelInfo = ExecInitPartitionInfo(mtstate,
+														  saved_resultRelInfo,
+														  proute, estate,
+														  leaf_part_index);
+					Assert(resultRelInfo != NULL);
+				}
 
-					/* OK, store the tuple and create index entries for it */
-					if (IsYBRelation(resultRelInfo->ri_RelationDesc))
+				/*
+				 * For ExecInsertIndexTuples() to work on the partition's indexes
+				 */
+				estate->es_result_relation_info = resultRelInfo;
+
+				/*
+				 * If we're capturing transition tuples, we might need to convert
+				 * from the partition rowtype to parent rowtype.
+				 */
+				if (cstate->transition_capture != NULL)
+				{
+					if (resultRelInfo->ri_TrigDesc &&
+						resultRelInfo->ri_TrigDesc->trig_insert_before_row)
 					{
-						if (useNonTxnInsert)
-						{
-							YBCExecuteNonTxnInsert(cstate->rel, tupDesc, tuple);
-						}
-						else
-						{
-							YBCExecuteInsert(cstate->rel, tupDesc, tuple);
-						}
-					}
-					else if (resultRelInfo->ri_FdwRoutine != NULL)
-					{
-						slot = resultRelInfo->ri_FdwRoutine->ExecForeignInsert(estate,
-																			   resultRelInfo,
-																			   slot,
-																			   NULL);
-
-						if (slot == NULL)	/* "do nothing" */
-							goto next_tuple;
-
-						/* FDW might have changed tuple */
-						tuple = ExecMaterializeSlot(slot);
-
 						/*
-						 * AFTER ROW Triggers might reference the tableoid
-						 * column, so initialize t_tableOid before evaluating
-						 * them.
+						 * If there are any BEFORE triggers on the partition,
+						 * we'll have to be ready to convert their result back to
+						 * tuplestore format.
 						 */
-						tuple->t_tableOid = RelationGetRelid(resultRelInfo->ri_RelationDesc);
+						cstate->transition_capture->tcs_original_insert_tuple = NULL;
+						cstate->transition_capture->tcs_map =
+							TupConvMapForLeaf(proute, saved_resultRelInfo,
+											  leaf_part_index);
 					}
 					else
-						heap_insert(resultRelInfo->ri_RelationDesc, tuple,
-									mycid, hi_options, bistate);
-
-					/* And create index entries for it */
-					if (resultRelInfo->ri_NumIndices > 0)
-						recheckIndexes = ExecInsertIndexTuples(slot,
-															   tuple,
-															   estate,
-															   false,
-															   NULL,
-															   NIL);
-
-					/* AFTER ROW INSERT Triggers */
-					ExecARInsertTriggers(estate, resultRelInfo, tuple,
-										 recheckIndexes, cstate->transition_capture);
-
-					list_free(recheckIndexes);
+					{
+						/*
+						 * Otherwise, just remember the original unconverted
+						 * tuple, to avoid a needless round trip conversion.
+						 */
+						cstate->transition_capture->tcs_original_insert_tuple = tuple;
+						cstate->transition_capture->tcs_map = NULL;
+					}
 				}
+
+				/*
+				 * We might need to convert from the parent rowtype to the
+				 * partition rowtype.
+				 */
+           map = proute->parent_child_tupconv_maps[leaf_part_index];
+           if (map != NULL)
+           {
+               TupleTableSlot *new_slot;
+               MemoryContext oldcontext;
+
+               Assert(proute->partition_tuple_slots != NULL &&
+                      proute->partition_tuple_slots[leaf_part_index] != NULL);
+               new_slot = proute->partition_tuple_slots[leaf_part_index];
+               slot = execute_attr_map_slot(map->attrMap, slot, new_slot);
+
+               /*
+                * Get the tuple in the per-tuple context, so that it will be
+                * freed after each batch insert.
+                */
+               oldcontext = MemoryContextSwitchTo(GetPerTupleMemoryContext(estate));
+               tuple = ExecCopySlotTuple(slot);
+               MemoryContextSwitchTo(oldcontext);
+           }
+				/*
+				 * Tuple memory will be allocated to per row memory context
+				 * which will be cleaned up after every row gets processed.
+				 * Thus there is no need to clean the tuple memory.
+				 */
+				if (IsYBRelation(cstate->rel))
+					slot->tts_shouldFree = false;
+
+				tuple->t_tableOid = RelationGetRelid(resultRelInfo->ri_RelationDesc);
+			}
+
+			skip_tuple = false;
+
+			/* BEFORE ROW INSERT Triggers */
+			if (resultRelInfo->ri_TrigDesc &&
+				resultRelInfo->ri_TrigDesc->trig_insert_before_row)
+			{
+				slot = ExecBRInsertTriggers(estate, resultRelInfo, slot);
+
+				if (slot == NULL)	/* "do nothing" */
+					skip_tuple = true;
+				else				/* trigger might have changed tuple */
+					tuple = ExecMaterializeSlot(slot);
+			}
+
+			if (!skip_tuple)
+			{
+				if (resultRelInfo->ri_TrigDesc &&
+					resultRelInfo->ri_TrigDesc->trig_insert_instead_row)
+				{
+					/* Pass the data to the INSTEAD ROW INSERT trigger */
+					ExecIRInsertTriggers(estate, resultRelInfo, slot);
+				}
+				else
+				{
+					/*
+					 * If the target is a plain table, check the constraints of
+					 * the tuple.
+					 */
+					if (resultRelInfo->ri_FdwRoutine == NULL &&
+						resultRelInfo->ri_RelationDesc->rd_att->constr)
+						ExecConstraints(resultRelInfo, slot, estate, mtstate);
+
+					/*
+					 * Also check the tuple against the partition constraint, if
+					 * there is one; except that if we got here via tuple-routing,
+					 * we don't need to if there's no BR trigger defined on the
+					 * partition.
+					 */
+					if (resultRelInfo->ri_PartitionCheck &&
+						(saved_resultRelInfo == NULL ||
+						 (resultRelInfo->ri_TrigDesc &&
+						  resultRelInfo->ri_TrigDesc->trig_insert_before_row)))
+						ExecPartitionCheck(resultRelInfo, slot, estate, true);
+
+					if (useHeapMultiInsert)
+					{
+						/* Add this tuple to the tuple buffer */
+						if (nBufferedTuples == 0)
+							firstBufferedLineNo = cstate->cur_lineno;
+						bufferedTuples[nBufferedTuples++] = tuple;
+						bufferedTuplesSize += tuple->t_len;
+
+						/*
+						 * If the buffer filled up, flush it.  Also flush if the
+						 * total size of all the tuples in the buffer becomes
+						 * large, to avoid using large amounts of memory for the
+						 * buffer when the tuples are exceptionally wide.
+						 */
+						if (nBufferedTuples == MAX_BUFFERED_TUPLES ||
+							bufferedTuplesSize > 65535)
+						{
+							CopyFromInsertBatch(cstate, estate, mycid, hi_options,
+												resultRelInfo, myslot, bistate,
+												nBufferedTuples, bufferedTuples,
+												firstBufferedLineNo);
+							nBufferedTuples = 0;
+							bufferedTuplesSize = 0;
+						}
+					}
+					else
+					{
+						List	   *recheckIndexes = NIL;
+
+						/* OK, store the tuple and create index entries for it */
+						if (IsYBRelation(resultRelInfo->ri_RelationDesc))
+						{
+							if (useNonTxnInsert)
+							{
+								YBCExecuteNonTxnInsert(cstate->rel, tupDesc, tuple);
+							}
+							else
+							{
+								YBCExecuteInsert(cstate->rel, tupDesc, tuple);
+							}
+						}
+						else if (resultRelInfo->ri_FdwRoutine != NULL)
+						{
+							slot = resultRelInfo->ri_FdwRoutine->ExecForeignInsert(estate,
+																				   resultRelInfo,
+																				   slot,
+																				   NULL);
+
+							if (slot == NULL)	/* "do nothing" */
+								goto next_tuple;
+
+							/* FDW might have changed tuple */
+							tuple = ExecMaterializeSlot(slot);
+
+							/*
+							 * AFTER ROW Triggers might reference the tableoid
+							 * column, so initialize t_tableOid before evaluating
+							 * them.
+							 */
+							tuple->t_tableOid = RelationGetRelid(resultRelInfo->ri_RelationDesc);
+						}
+						else
+							heap_insert(resultRelInfo->ri_RelationDesc, tuple,
+										mycid, hi_options, bistate);
+
+						/* And create index entries for it */
+						if (resultRelInfo->ri_NumIndices > 0)
+							recheckIndexes = ExecInsertIndexTuples(slot,
+																   tuple,
+																   estate,
+																   false,
+																   NULL,
+																   NIL);
+
+						/* AFTER ROW INSERT Triggers */
+						ExecARInsertTriggers(estate, resultRelInfo, tuple,
+											 recheckIndexes, cstate->transition_capture);
+
+						list_free(recheckIndexes);
+					}
+				}
+
+				/*
+				 * We count only tuples not suppressed by a BEFORE INSERT trigger
+				 * or FDW; this is the same definition used by nodeModifyTable.c
+				 * for counting tuples inserted by an INSERT command.
+				 */
+				processed++;
+			}
+
+		next_tuple:
+			/* Restore the saved ResultRelInfo */
+			if (saved_resultRelInfo)
+			{
+				resultRelInfo = saved_resultRelInfo;
+				estate->es_result_relation_info = resultRelInfo;
 			}
 
 			/*
-			 * We count only tuples not suppressed by a BEFORE INSERT trigger
-			 * or FDW; this is the same definition used by nodeModifyTable.c
-			 * for counting tuples inserted by an INSERT command.
+			 * Free context per row.
 			 */
-			processed++;
+			if (IsYBRelation(cstate->rel))
+				ResetPerTupleExprContext(estate);
 		}
-
-	next_tuple:
-		/* Restore the saved ResultRelInfo */
-		if (saved_resultRelInfo)
+		/*
+		 * Commit transaction per batch.
+		 * When CopyFrom method is called, we are already inside a transaction block
+		 * and relevant transaction state properties have been previously set.
+		 */
+		if (isBatchTxnCopy)
 		{
-			resultRelInfo = saved_resultRelInfo;
-			estate->es_result_relation_info = resultRelInfo;
+			YBCCommitTransaction();
+			YBInitializeTransaction();
 		}
 	}
 
@@ -3040,7 +3184,7 @@ CopyFromInsertBatch(CopyState cstate, EState *estate, CommandId mycid,
 			List	   *recheckIndexes;
 
 			cstate->cur_lineno = firstBufferedLineNo + i;
-			ExecStoreTuple(bufferedTuples[i], myslot, InvalidBuffer, false);
+			ExecStoreHeapTuple(bufferedTuples[i], myslot, false);
 			recheckIndexes =
 				ExecInsertIndexTuples(myslot, bufferedTuples[i],
 									  estate, false, NULL, NIL);
@@ -3215,9 +3359,21 @@ BeginCopyFrom(ParseState *pstate,
 	{
 		Assert(!is_program);	/* the grammar does not allow this */
 		if (whereToSendOutput == DestRemote)
+		{
+			bool isDataSent = YBIsDataSent();
 			ReceiveCopyBegin(cstate);
-		else
+			/*
+			 * ReceiveCopyBegin sends a message back to the client
+			 * with the expected format of the copy data.
+			 * This implicitly causes YB data to be marked as sent
+			 * although the message does not contain any data from YB.
+			 * So we can safely roll back YBIsDataSent to its previous value.
+			 */
+			if (!isDataSent) YBMarkDataNotSent();
+		}
+		else {
 			cstate->copy_file = stdin;
+		}
 	}
 	else
 	{

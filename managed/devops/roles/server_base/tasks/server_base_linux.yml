@@ -90,25 +90,10 @@
     become: yes
     when: ansible_os_family == "RedHat" and update_yum_cache
 
-  - name: Set Backup packages to Install
+  - name: Set Azure packages to Install
     set_fact:
-      linux_packages: "{{ linux_packages + backup_packages }}"
-    when: install_backup_packages
-
-  - name: Set Dev packages to Install
-    set_fact:
-      linux_packages: "{{ linux_packages + dev_packages }}"
-    when: install_dev_packages
-
-  - name: Set Debian packages to Install
-    set_fact:
-      linux_packages: "{{ linux_packages + debian_packages }}"
-    when: install_dev_packages and ansible_os_family == "Debian"
-
-  - name: Set RedHat packages to Install
-    set_fact:
-      linux_packages: "{{ linux_packages + redhat_packages }}"
-    when: install_dev_packages and ansible_os_family == "RedHat"
+      linux_packages: "{{ linux_packages + azure_packages }}"
+    when: cloud_type == "azu"
 
   - block:
     - name: Find all yum repos
@@ -139,18 +124,6 @@
 
     when: ansible_os_family == "RedHat" and (cloud_type is not defined or cloud_type != "onprem")
 
-  - name: Install epel-release if RedHat.
-    become: yes
-    become_method: sudo
-    yum:
-      name: epel-release
-      state: latest
-      update_cache: yes
-    register: result
-    until: result is succeeded
-    retries: "{{ yum_retry_count }}"
-    when: ansible_os_family == "RedHat"
-
   - name: Install linux packages we need on our YugaByte clusters on CentOS
     become: yes
     become_method: sudo
@@ -179,16 +152,3 @@
     when: ansible_os_family != "RedHat"
 
   when: not air_gap
-
-- name: Register our custom SSH port "{{ custom_ssh_port }}" with SELinux
-  become: yes
-  become_method: sudo
-  seport:
-    ports: "{{ custom_ssh_port }}"
-    proto: tcp
-    setype: ssh_port_t
-    state: present
-  when: custom_ssh_port is defined and
-        ansible_port is defined and
-        custom_ssh_port == ansible_port and
-        ansible_os_family == "RedHat"

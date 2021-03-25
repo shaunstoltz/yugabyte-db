@@ -18,12 +18,15 @@ INSERT INTO ybaggtest
     SELECT series, t.int_2, t.int_4, t.int_8, t.float_4, t.float_8
     FROM ybaggtest as t CROSS JOIN generate_series(2, 100) as series;
 
--- Verify COUNT(*) returns proper value.
+-- Verify COUNT(...) returns proper value.
 SELECT COUNT(*) FROM ybaggtest;
+SELECT COUNT(0) FROM ybaggtest;
+SELECT COUNT(NULL) FROM ybaggtest;
 
--- Delete row, verify COUNT(*) returns proper value.
+-- Delete row, verify COUNT(...) returns proper value.
 DELETE FROM ybaggtest WHERE id = 100;
 SELECT COUNT(*) FROM ybaggtest;
+SELECT COUNT(0) FROM ybaggtest;
 
 -- Verify selecting different aggs for same column works.
 SELECT SUM(int_4), MAX(int_4), MIN(int_4), SUM(int_2), MAX(int_2), MIN(int_2) FROM ybaggtest;
@@ -60,3 +63,39 @@ SELECT COUNT(*), COUNT(a) FROM ybaggtest2;
 
 -- Verify MAX/MIN respect NULL values.
 SELECT MAX(a), MIN(a) FROM ybaggtest2;
+
+-- Verify SUM/MAX/MIN work as expected with constant arguments.
+SELECT SUM(2), MAX(2), MIN(2) FROM ybaggtest2;
+SELECT SUM(NULL::int), MAX(NULL), MIN(NULL) FROM ybaggtest2;
+
+CREATE TABLE digit(k INT PRIMARY KEY, v TEXT NOT NULL);
+INSERT INTO digit VALUES(1, 'one'), (2, 'two'), (3, 'three'), (4, 'four'), (5, 'five'), (6, 'six');
+CREATE TABLE test(k INT PRIMARY KEY);
+ALTER TABLE test ADD v1 int DEFAULT 5;
+ALTER TABLE test ADD v2 int DEFAULT 10;
+INSERT INTO test VALUES(1), (2), (3);
+SELECT COUNT(*) FROM test;
+SELECT COUNT(k) FROM test;
+SELECT COUNT(v1) FROM test;
+SELECT COUNT(v2) FROM test;
+SELECT * FROM digit AS d INNER JOIN (SELECT COUNT(v2) AS count FROM test) AS c ON (d.k = c.count);
+INSERT INTO test VALUES(4, NULL, 10), (5, 5, NULL), (6, 5, NULL);
+SELECT COUNT(*) FROM test;
+SELECT COUNT(k) FROM test;
+SELECT COUNT(v1) FROM test;
+SELECT COUNT(v2) FROM test;
+SELECT * FROM digit AS d INNER JOIN (SELECT COUNT(*) AS count FROM test) AS c ON (d.k = c.count);
+SELECT * FROM digit AS d INNER JOIN (SELECT COUNT(k) AS count FROM test) AS c ON (d.k = c.count);
+SELECT * FROM digit AS d INNER JOIN (SELECT COUNT(v1) AS count FROM test) AS c ON (d.k = c.count);
+SELECT * FROM digit AS d INNER JOIN (SELECT COUNT(v2) AS count FROM test) AS c ON (d.k = c.count);
+
+DROP TABLE test;
+DROP TABLE digit;
+
+CREATE TABLE test(K INT PRIMARY KEY, v1 INT NOT NULL, v2 INT NOT NULL);
+INSERT INTO test VALUES(1, 1, 1), (2, 2, 2), (3, 3, 3);
+AlTER TABLE test DROP v1;
+SELECT MIN(v2) FROM test;
+SELECT MAX(v2) FROM test;
+SELECT SUM(v2) FROM test;
+SELECT COUNT(v2) FROM test;

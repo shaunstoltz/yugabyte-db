@@ -70,9 +70,10 @@ class QLRocksDBStorage : public common::YQLStorageIf {
                              const TransactionOperationContextOpt& txn_op_context,
                              CoarseTimePoint deadline,
                              const ReadHybridTime& read_time,
+                             const DocKey& start_doc_key,
                              common::YQLRowwiseIteratorIf::UniPtr* iter) const override;
 
-  CHECKED_STATUS GetIterator(const PgsqlReadRequestPB& request,
+  CHECKED_STATUS GetIterator(uint64 stmt_id,
                              const Schema& projection,
                              const Schema& schema,
                              const TransactionOperationContextOpt& txn_op_context,

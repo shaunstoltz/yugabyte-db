@@ -11,6 +11,9 @@
 // under the License.
 //
 
+#include <string>
+#include <utility>
+
 #include <boost/preprocessor/seq/for_each.hpp>
 
 #include "yb/yql/pgwrapper/libpq_utils.h"
@@ -22,6 +25,7 @@
 #include "yb/util/enums.h"
 #include "yb/util/logging.h"
 #include "yb/util/monotime.h"
+
 
 using namespace std::literals;
 
@@ -81,6 +85,16 @@ YBPgErrorCode GetSqlState(PGresult* result) {
   return static_cast<YBPgErrorCode>(sqlstate);
 }
 
+// Taken from <https://stackoverflow.com/a/24315631> by Gauthier Boaglio.
+inline void ReplaceAll(std::string* str, const std::string& from, const std::string& to) {
+  CHECK(str);
+  size_t start_pos = 0;
+  while ((start_pos = str->find(from, start_pos)) != std::string::npos) {
+    str->replace(start_pos, from.length(), to);
+    start_pos += to.length(); // Handles case where 'to' is a substring of 'from'
+  }
+}
+
 }  // anonymous namespace
 
 
@@ -125,20 +139,33 @@ struct PGConn::CopyData {
   }
 };
 
-Result<PGConn> PGConn::Connect(const HostPort& host_port, const std::string& db_name) {
+Result<PGConn> PGConn::Connect(
+    const HostPort& host_port,
+    const std::string& db_name,
+    const std::string& user,
+    bool simple_query_protocol) {
+  auto conn_info = Format(
+      "host=$0 port=$1 user=$2",
+      host_port.host(),
+      host_port.port(),
+      PqEscapeLiteral(user));
+  if (!db_name.empty()) {
+    conn_info = Format("dbname=$0 $1", PqEscapeLiteral(db_name), conn_info);
+  }
+  return Connect(conn_info, simple_query_protocol);
+}
+
+Result<PGConn> PGConn::Connect(const std::string& conn_str,
+                               CoarseTimePoint deadline,
+                               bool simple_query_protocol) {
   auto start = CoarseMonoClock::now();
-  auto deadline = start + 60s;
   for (;;) {
-    auto conn_info = Format("host=$0 port=$1 user=postgres", host_port.host(), host_port.port());
-    if (!db_name.empty()) {
-      conn_info = Format("$0 dbname=$1", conn_info, db_name);
-    }
-    PGConnPtr result(PQconnectdb(conn_info.c_str()));
+    PGConnPtr result(PQconnectdb(conn_str.c_str()));
     auto status = PQstatus(result.get());
     if (status == ConnStatusType::CONNECTION_OK) {
-      LOG(INFO) << "Connected to PG: " << host_port << ", time taken: "
+      LOG(INFO) << "Connected to PG (" << conn_str << "), time taken: "
                 << MonoDelta(CoarseMonoClock::Now() - start);
-      return PGConn(std::move(result));
+      return PGConn(std::move(result), simple_query_protocol);
     }
     auto now = CoarseMonoClock::now();
     if (now >= deadline) {
@@ -148,17 +175,20 @@ Result<PGConn> PGConn::Connect(const HostPort& host_port, const std::string& db_
   }
 }
 
-PGConn::PGConn(PGConnPtr ptr) : impl_(std::move(ptr)) {
+PGConn::PGConn(PGConnPtr ptr, bool simple_query_protocol)
+    : impl_(std::move(ptr)), simple_query_protocol_(simple_query_protocol) {
 }
 
 PGConn::~PGConn() {
 }
 
-PGConn::PGConn(PGConn&& rhs) : impl_(std::move(rhs.impl_)) {
+PGConn::PGConn(PGConn&& rhs)
+    : impl_(std::move(rhs.impl_)), simple_query_protocol_(rhs.simple_query_protocol_) {
 }
 
 PGConn& PGConn::operator=(PGConn&& rhs) {
   impl_ = std::move(rhs.impl_);
+  simple_query_protocol_ = rhs.simple_query_protocol_;
   return *this;
 }
 
@@ -170,9 +200,13 @@ Status PGConn::Execute(const std::string& command) {
   PGResultPtr res(PQexec(impl_.get(), command.c_str()));
   auto status = PQresultStatus(res.get());
   if (ExecStatusType::PGRES_COMMAND_OK != status) {
+    if (status == ExecStatusType::PGRES_TUPLES_OK) {
+      return STATUS(IllegalState, "Tuples received in Execute");
+    }
     return STATUS(NetworkError,
                   Format("Execute '$0' failed: $1, message: $2",
-                         command, status, PQresultErrorMessage(res.get())), Slice(),
+                         command, status, PQresultErrorMessage(res.get())),
+                  Slice() /* msg2 */,
                   PgsqlError(GetSqlState(res.get())));
   }
   return Status::OK();
@@ -183,7 +217,8 @@ Result<PGResultPtr> CheckResult(PGResultPtr result, const std::string& command) 
   if (ExecStatusType::PGRES_TUPLES_OK != status && ExecStatusType::PGRES_COPY_IN != status) {
     return STATUS(NetworkError,
                   Format("Fetch '$0' failed: $1, message: $2",
-                         command, status, PQresultErrorMessage(result.get())), Slice(),
+                         command, status, PQresultErrorMessage(result.get())),
+                  Slice() /* msg2 */,
                   PgsqlError(GetSqlState(result.get())));
   }
   return std::move(result);
@@ -191,8 +226,9 @@ Result<PGResultPtr> CheckResult(PGResultPtr result, const std::string& command) 
 
 Result<PGResultPtr> PGConn::Fetch(const std::string& command) {
   return CheckResult(
-      PGResultPtr(
-          PQexecParams(impl_.get(), command.c_str(), 0, nullptr, nullptr, nullptr, nullptr, 1)),
+      PGResultPtr(simple_query_protocol_
+          ? PQexec(impl_.get(), command.c_str())
+          : PQexecParams(impl_.get(), command.c_str(), 0, nullptr, nullptr, nullptr, nullptr, 1)),
       command);
 }
 
@@ -234,6 +270,30 @@ CHECKED_STATUS PGConn::CommitTransaction() {
 CHECKED_STATUS PGConn::RollbackTransaction() {
   return Execute("ROLLBACK");
 }
+
+Result<bool> PGConn::HasIndexScan(const std::string& query) {
+  constexpr int kExpectedColumns = 1;
+  auto res = VERIFY_RESULT(FetchFormat("EXPLAIN $0", query));
+
+  {
+    int fetched_columns = PQnfields(res.get());
+    if (fetched_columns != kExpectedColumns) {
+      return STATUS_FORMAT(
+          InternalError, "Fetched $0 columns, expected $1", fetched_columns, kExpectedColumns);
+    }
+  }
+
+  for (int line = 0; line < PQntuples(res.get()); ++line) {
+    std::string value = VERIFY_RESULT(GetString(res.get(), line, 0));
+    if (value.find("Index Scan") != std::string::npos) {
+      return true;
+    } else if (value.find("Index Only Scan") != std::string::npos) {
+      return true;
+    }
+  }
+  return false;
+}
+
 
 Status PGConn::CopyBegin(const std::string& command) {
   auto result = VERIFY_RESULT(CheckResult(
@@ -354,6 +414,10 @@ Result<char*> GetValueWithLength(PGresult* result, int row, int column, size_t s
   return PQgetvalue(result, row, column);
 }
 
+Result<bool> GetBool(PGresult* result, int row, int column) {
+  return *VERIFY_RESULT(GetValueWithLength(result, row, column, sizeof(bool)));
+}
+
 Result<int32_t> GetInt32(PGresult* result, int row, int column) {
   return BigEndian::Load32(VERIFY_RESULT(GetValueWithLength(result, row, column, sizeof(int32_t))));
 }
@@ -374,7 +438,7 @@ Result<std::string> GetString(PGresult* result, int row, int column) {
   return std::string(value, len);
 }
 
-Result<std::string> AsString(PGresult* result, int row, int column) {
+Result<std::string> ToString(PGresult* result, int row, int column) {
   constexpr Oid INT8OID = 20;
   constexpr Oid INT4OID = 23;
   constexpr Oid TEXTOID = 25;
@@ -408,10 +472,41 @@ void LogResult(PGresult* result) {
       if (col) {
         line += ", ";
       }
-      line += CHECK_RESULT(AsString(result, row, col));
+      line += CHECK_RESULT(ToString(result, row, col));
     }
     LOG(INFO) << line;
   }
+}
+
+// Escape literals in postgres (e.g. to make a libpq connection to a database named
+// `this->'\<-this`, use `dbname='this->\'\\<-this'`).
+//
+// This should behave like `PQescapeLiteral` except that it doesn't need an existing connection
+// passed in.
+std::string PqEscapeLiteral(const std::string& input) {
+  std::string output = input;
+  // Escape certain characters.
+  ReplaceAll(&output, "\\", "\\\\");
+  ReplaceAll(&output, "'", "\\'");
+  // Quote.
+  output.insert(0, 1, '\'');
+  output.push_back('\'');
+  return output;
+}
+
+// Escape identifiers in postgres (e.g. to create a database named `this->"\<-this`, use `CREATE
+// DATABASE "this->""\<-this"`).
+//
+// This should behave like `PQescapeIdentifier` except that it doesn't need an existing connection
+// passed in.
+std::string PqEscapeIdentifier(const std::string& input) {
+  std::string output = input;
+  // Escape certain characters.
+  ReplaceAll(&output, "\"", "\"\"");
+  // Quote.
+  output.insert(0, 1, '"');
+  output.push_back('"');
+  return output;
 }
 
 } // namespace pgwrapper

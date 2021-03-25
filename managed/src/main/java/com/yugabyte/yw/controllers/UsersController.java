@@ -98,9 +98,7 @@ public class UsersController extends AuthenticatedController {
     try {
       user = Users.create(formData.get().email, formData.get().password,
                           formData.get().role, customerUUID);
-      if (formData.get().role == Role.ReadOnly) {
-        updateFeatures(user);
-      }
+      updateFeatures(user);
     } catch (Exception e) {
       return ApiResponse.error(INTERNAL_SERVER_ERROR, "Could not create user");
     }
@@ -166,14 +164,13 @@ public class UsersController extends AuthenticatedController {
     }
     if (request().getQueryString("role") != null) {
         String role = request().getQueryString("role");
+        if (Role.SuperAdmin == user.getRole()) {
+          return ApiResponse.error(BAD_REQUEST, "Can't change super admin role.");
+        }
         try {
           user.setRole(Role.valueOf(role));
           user.save();
-          if (user.getRole() == Role.ReadOnly) {
-            updateFeatures(user);
-          } else {
-            user.setFeatures(Json.newObject());
-          }
+          updateFeatures(user);
         } catch (Exception e) {
           return ApiResponse.error(BAD_REQUEST, "Incorrect Role Specified");
         }
@@ -220,9 +217,14 @@ public class UsersController extends AuthenticatedController {
   private void updateFeatures(Users user) {
     try {
       Customer customer = Customer.get(user.customerUUID);
-      String configFile = "readOnlyFeatureConfig.json";
+      String configFile = user.getRole().getFeaturesFile();
       if (customer.code.equals("cloud")) {
         configFile = "cloudFeatureConfig.json";
+      }
+      if (configFile == null) {
+        user.setFeatures(Json.newObject());
+        user.save();
+        return;
       }
       InputStream featureStream = environment.resourceAsStream(configFile);
       ObjectMapper mapper = new ObjectMapper();

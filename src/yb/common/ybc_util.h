@@ -26,6 +26,12 @@ struct varlena;
 
 #endif
 
+/*
+ * Guc variable to log the protobuf string for every outgoing (DocDB) read/write request.
+ * See the "YB Debug utils" section in pg_yb_utils.h (as well as guc.c) for more information.
+ */
+extern bool yb_debug_log_docdb_requests;
+
 typedef struct YBCStatusStruct* YBCStatus;
 
 extern YBCStatus YBCStatusOK;
@@ -39,8 +45,11 @@ void YBCFreeStatus(YBCStatus s);
 size_t YBCStatusMessageLen(YBCStatus s);
 const char* YBCStatusMessageBegin(YBCStatus s);
 const char* YBCStatusCodeAsCString(YBCStatus s);
+char* DupYBStatusMessage(YBCStatus status, bool message_only);
 
 bool YBCIsRestartReadError(uint16_t txn_errcode);
+
+bool YBCIsTxnConflictError(uint16_t txn_errcode);
 
 void YBCResolveHostname();
 
@@ -55,6 +64,8 @@ CHECKED_YBCSTATUS YBCInit(
     const char* argv0,
     YBCPAllocFn palloc_fn,
     YBCCStringToTextWithLenFn cstring_to_text_with_len_fn);
+
+CHECKED_YBCSTATUS YBCInitGFlags(const char* argv0);
 
 // From glog's log_severity.h:
 // const int GLOG_INFO = 0, GLOG_WARNING = 1, GLOG_ERROR = 2, GLOG_FATAL = 3;
@@ -107,6 +118,9 @@ void YBCLogImpl(int severity,
 const char* YBCFormatBytesAsStr(const char* data, size_t size);
 
 const char* YBCGetStackTrace();
+
+// Initializes global state needed for thread management, including CDS library initialization.
+void YBCInitThreading();
 
 #ifdef __cplusplus
 } // extern "C"

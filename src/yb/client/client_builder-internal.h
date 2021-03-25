@@ -32,6 +32,7 @@
 #ifndef YB_CLIENT_CLIENT_BUILDER_INTERNAL_H_
 #define YB_CLIENT_CLIENT_BUILDER_INTERNAL_H_
 
+#include <functional>
 #include <string>
 #include <vector>
 
@@ -49,6 +50,9 @@ class YBClientBuilder::Data {
   Data();
   ~Data();
 
+  // Flag name to fetch master addresses from flagfile.
+  std::string master_address_flag_name_;
+
   // This is a REST endpoint from which the list of master hosts and ports can be queried. This
   // takes precedence over both 'master_server_addrs_file_' and 'master_server_addrs_'.
   std::string master_server_endpoint_;
@@ -60,7 +64,7 @@ class YBClientBuilder::Data {
   // This bool determines whether to use FLAGS_flagfile as an override of client-entered data.
   bool skip_master_flagfile_ = false;
 
-  int32_t num_reactors_;
+  int32_t num_reactors_ = 0;
 
   MonoDelta default_admin_operation_timeout_;
   MonoDelta default_rpc_timeout_;
@@ -74,6 +78,11 @@ class YBClientBuilder::Data {
   // The size of the threadpool to use for calling callbacks.
   size_t threadpool_size_ = 0;
 
+  // If all masters are available but no leader is present on client init,
+  // this flag determines if the client returns failure right away
+  // or waits for a leader to be elected.
+  bool wait_for_leader_election_on_init_ = true;
+
   // Placement information for the client.
   CloudInfoPB cloud_info_pb_;
 
@@ -84,6 +93,9 @@ class YBClientBuilder::Data {
   std::shared_ptr<MemTracker> parent_mem_tracker_;
 
   bool skip_master_leader_resolution_ = false;
+
+  // See YBClient::Data::master_address_sources_
+  std::vector<MasterAddressSource> master_address_sources_;
  private:
   DISALLOW_COPY_AND_ASSIGN(Data);
 };

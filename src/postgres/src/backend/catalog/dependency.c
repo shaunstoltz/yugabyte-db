@@ -50,6 +50,7 @@
 #include "catalog/pg_rewrite.h"
 #include "catalog/pg_statistic_ext.h"
 #include "catalog/pg_subscription.h"
+#include "catalog/pg_tablegroup.h"
 #include "catalog/pg_tablespace.h"
 #include "catalog/pg_transform.h"
 #include "catalog/pg_trigger.h"
@@ -69,6 +70,7 @@
 #include "commands/schemacmds.h"
 #include "commands/seclabel.h"
 #include "commands/sequence.h"
+#include "commands/tablegroup.h"
 #include "commands/trigger.h"
 #include "commands/typecmds.h"
 #include "nodes/nodeFuncs.h"
@@ -161,6 +163,7 @@ static const Oid object_classes[] = {
 	TSConfigRelationId,			/* OCLASS_TSCONFIG */
 	AuthIdRelationId,			/* OCLASS_ROLE */
 	DatabaseRelationId,			/* OCLASS_DATABASE */
+	TableGroupRelationId,		/* OCLASS_TBLGROUP */
 	TableSpaceRelationId,		/* OCLASS_TBLSPACE */
 	ForeignDataWrapperRelationId,	/* OCLASS_FDW */
 	ForeignServerRelationId,	/* OCLASS_FOREIGN_SERVER */
@@ -578,9 +581,10 @@ findDependentObjects(const ObjectAddress *object,
 					break;
 
 				/* Otherwise, treat this like an internal dependency */
-				/* FALL THRU */
+				switch_fallthrough();
 
 			case DEPENDENCY_INTERNAL:
+				switch_fallthrough();
 			case DEPENDENCY_INTERNAL_AUTO:
 
 				/*
@@ -1298,6 +1302,10 @@ doDeletion(const ObjectAddress *object, int flags)
 
 		case OCLASS_TRANSFORM:
 			DropTransformById(object->objectId);
+			break;
+
+		case OCLASS_TBLGROUP:
+			RemoveTableGroupById(object->objectId);
 			break;
 
 			/*
@@ -2521,6 +2529,9 @@ getObjectClass(const ObjectAddress *object)
 
 		case DatabaseRelationId:
 			return OCLASS_DATABASE;
+
+		case TableGroupRelationId:
+			return OCLASS_TBLGROUP;
 
 		case TableSpaceRelationId:
 			return OCLASS_TBLSPACE;

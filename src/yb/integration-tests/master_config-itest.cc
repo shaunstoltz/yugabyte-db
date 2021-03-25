@@ -40,6 +40,8 @@ using yb::master::ListMastersRequestPB;
 using yb::master::ListMastersResponsePB;
 using yb::tserver::TabletServerErrorPB;
 
+using namespace std::chrono_literals;
+
 namespace yb {
 namespace master {
 
@@ -152,8 +154,15 @@ void MasterChangeConfigTest::VerifyNonLeaderMastersPeerCount() {
     LOG(INFO) << "Checking non_leader " << i << " at port "
               << non_leader_master->bound_rpc_hostport().port();
     num_peers = 0;
-    Status s = cluster_->GetNumMastersAsSeenBy(non_leader_master, &num_peers);
-    ASSERT_OK_PREPEND(s, "Non-leader master number of peers lookup returned error");
+    Status s;
+    ASSERT_OK_PREPEND(
+        WaitFor(
+            [&] {
+              s = cluster_->GetNumMastersAsSeenBy(non_leader_master, &num_peers);
+              return s.ok();
+            },
+            5s * kTimeMultiplier, "Waiting master is initialized"),
+        Format("Non-leader master number of peers lookup returned error: $0", s));
     EXPECT_EQ(num_peers, num_masters_);
   }
 }
@@ -186,7 +195,7 @@ Status MasterChangeConfigTest::WaitForMasterLeaderToBeReady(
 }
 
 void MasterChangeConfigTest::SetCurLogIndex() {
-  consensus::OpId op_id;
+  OpIdPB op_id;
   ASSERT_OK(cluster_->GetLastOpIdForLeader(&op_id));
   cur_log_index_ = op_id.index();
   LOG(INFO) << "cur_log_index_ " << cur_log_index_;
@@ -215,7 +224,7 @@ TEST_F(MasterChangeConfigTest, TestAddMaster) {
 TEST_F(MasterChangeConfigTest, TestSlowRemoteBootstrapDoesNotCrashMaster) {
   ExternalMaster* new_master = nullptr;
   cluster_->StartShellMaster(&new_master);
-  ASSERT_OK(cluster_->SetFlag(new_master, "inject_latency_during_remote_bootstrap_secs", "8"));
+  ASSERT_OK(cluster_->SetFlag(new_master, "TEST_inject_latency_during_remote_bootstrap_secs", "8"));
 
   SetCurLogIndex();
 
@@ -321,9 +330,9 @@ TEST_F(MasterChangeConfigTest, TestNewLeaderWithPendingConfigLoadsSysCatalog) {
   SetCurLogIndex();
 
   // This will disable new elections on the old masters.
-  vector<ExternalDaemon*> masters = cluster_->master_daemons();
+  vector<ExternalMaster*> masters = cluster_->master_daemons();
   for (auto master : masters) {
-    ASSERT_OK(cluster_->SetFlag(master, "do_not_start_election_test_only", "true"));
+    ASSERT_OK(cluster_->SetFlag(master, "TEST_do_not_start_election_test_only", "true"));
     // Do not let the followers commit change role - to keep their opid same as the new master,
     // and hence will vote for it.
     ASSERT_OK(cluster_->SetFlag(master, "inject_delay_commit_pre_voter_to_voter_secs", "5"));
@@ -335,7 +344,7 @@ TEST_F(MasterChangeConfigTest, TestNewLeaderWithPendingConfigLoadsSysCatalog) {
   // would need to get that pending config committed for load to progress.
   ASSERT_OK(cluster_->SetFlag(new_master, "inject_delay_commit_pre_voter_to_voter_secs", "5"));
   // And don't let it start an election too soon.
-  ASSERT_OK(cluster_->SetFlag(new_master, "do_not_start_election_test_only", "true"));
+  ASSERT_OK(cluster_->SetFlag(new_master, "TEST_do_not_start_election_test_only", "true"));
 
   Status s = cluster_->ChangeConfig(new_master, consensus::ADD_SERVER);
   ASSERT_OK_PREPEND(s, "Change Config returned error");
@@ -352,7 +361,7 @@ TEST_F(MasterChangeConfigTest, TestNewLeaderWithPendingConfigLoadsSysCatalog) {
   s = cluster_->StepDownMasterLeader(&dummy_err);
 
   // Now the new master should start the election process.
-  ASSERT_OK(cluster_->SetFlag(new_master, "do_not_start_election_test_only", "false"));
+  ASSERT_OK(cluster_->SetFlag(new_master, "TEST_do_not_start_election_test_only", "false"));
 
   // Leader stepdown might not succeed as PRE_VOTER could still be uncommitted. Let it go through
   // as new master should get the other votes anyway once it starts the election.
@@ -426,12 +435,12 @@ TEST_F(MasterChangeConfigTest, TestWaitForChangeRoleCompletion) {
   for (int idx = 0; idx <= 2; idx++) {
     ExternalMaster* master = cluster_->master(idx);
     if (master->bound_rpc_hostport().port() != leader->bound_rpc_hostport().port()) {
-      ASSERT_OK(cluster_->SetFlag(master, "do_not_start_election_test_only", "false"));
+      ASSERT_OK(cluster_->SetFlag(master, "TEST_do_not_start_election_test_only", "false"));
     }
   }
 
   ASSERT_OK(cluster_->SetFlag(leader,
-            "inject_delay_leader_change_role_append_secs", "8"));
+            "TEST_inject_delay_leader_change_role_append_secs", "8"));
   SetCurLogIndex();
   ASSERT_OK_PREPEND(cluster_->ChangeConfig(new_master, consensus::ADD_SERVER),
                     "Add Change Config returned error");

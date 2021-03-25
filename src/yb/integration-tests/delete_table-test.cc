@@ -265,7 +265,7 @@ TEST_F(DeleteTableTest, TestPendingDeleteStateClearedOnFailure) {
   vector<string> tserver_flags, master_flags;
   master_flags.push_back("--unresponsive_ts_rpc_timeout_ms=5000");
   // Disable tablet delete operations.
-  tserver_flags.push_back("--rpc_delete_tablet_fail=true");
+  tserver_flags.push_back("--TEST_rpc_delete_tablet_fail=true");
   ASSERT_NO_FATALS(StartCluster(tserver_flags, master_flags, 3));
   // Create a table on the cluster. We're just using TestWorkload
   // as a convenient way to create it.
@@ -315,9 +315,8 @@ TEST_F(DeleteTableTest, TestDeleteEmptyTable) {
   // Check that the master no longer exposes the table in any way:
 
   // 1) Should not list it in ListTables.
-  vector<YBTableName> table_names;
-  ASSERT_OK(client_->ListTables(&table_names, /* filter */ "", /* exclude_ysql */ true));
-  ASSERT_EQ(master::kNumSystemTables, table_names.size());
+  const auto tables = ASSERT_RESULT(client_->ListTables(/* filter */ "", /* exclude_ysql */ true));
+  ASSERT_EQ(master::kNumSystemTables, tables.size());
 
   // 2) Should respond to GetTableSchema with a NotFound error.
   YBSchema schema;
@@ -336,8 +335,7 @@ TEST_F(DeleteTableTest, TestDeleteEmptyTable) {
     ASSERT_OK(cluster_->master_proxy()->GetTabletLocations(req, &resp, &rpc));
     SCOPED_TRACE(resp.DebugString());
     ASSERT_EQ(1, resp.errors_size());
-    ASSERT_STR_CONTAINS(resp.errors(0).ShortDebugString(),
-                        "code: NOT_FOUND message: \"Tablet deleted: Table deleted");
+    ASSERT_STR_CONTAINS(resp.errors(0).ShortDebugString(), "code: NOT_FOUND");
   }
 
   // 4) The master 'dump-entities' page should not list the deleted table or tablets.
@@ -518,7 +516,7 @@ TEST_F(DeleteTableTest, TestAutoTombstoneAfterCrashDuringRemoteBootstrap) {
   vector<string> tserver_flags, master_flags;
   master_flags.push_back("--replication_factor=2");
   ASSERT_NO_FATALS(StartCluster(tserver_flags, master_flags));
-  const MonoDelta timeout = MonoDelta::FromSeconds(10);
+  const MonoDelta timeout = MonoDelta::FromSeconds(40);
   const int kTsIndex = 0;  // We'll test with the first TS.
 
   // We'll do a config change to remote bootstrap a replica here later. For
@@ -545,7 +543,7 @@ TEST_F(DeleteTableTest, TestAutoTombstoneAfterCrashDuringRemoteBootstrap) {
 
   // Enable a fault crash when remote bootstrap occurs on TS 0.
   ASSERT_OK(cluster_->tablet_server(kTsIndex)->Restart());
-  const string& kFaultFlag = "fault_crash_after_rb_files_fetched";
+  const string& kFaultFlag = "TEST_fault_crash_after_rb_files_fetched";
   ASSERT_OK(cluster_->SetFlag(cluster_->tablet_server(kTsIndex), kFaultFlag, "1.0"));
 
   // Figure out the tablet id to remote bootstrap.
@@ -629,7 +627,7 @@ TEST_F(DeleteTableTest, TestAutoTombstoneAfterRemoteBootstrapRemoteFails) {
   workload.StopAndJoin();
 
   // Cause the leader to crash when a follower tries to remotely bootstrap from it.
-  const string& fault_flag = "fault_crash_on_handle_rb_fetch_data";
+  const string& fault_flag = "TEST_fault_crash_on_handle_rb_fetch_data";
   ASSERT_OK(cluster_->SetFlag(cluster_->tablet_server(leader_index), fault_flag, "1.0"));
 
   // Add our TS 0 to the config and wait for the leader to crash.
@@ -710,7 +708,8 @@ TEST_F(DeleteTableTest, TestMergeConsensusMetadata) {
   };
 
   std::vector<std::string> master_flags = {
-    "--catalog_manager_wait_for_new_tablets_to_elect_leader=false"
+    "--catalog_manager_wait_for_new_tablets_to_elect_leader=false"s,
+    "--use_create_table_leader_hint=false"s,
   };
   ASSERT_NO_FATALS(StartCluster(ts_flags, master_flags));
   const MonoDelta timeout = MonoDelta::FromSeconds(10);
@@ -828,10 +827,14 @@ TEST_F(DeleteTableTest, TestDeleteFollowerWithReplicatingOperation) {
   const MonoDelta timeout = MonoDelta::FromSeconds(10);
 
   const int kNumTabletServers = 5;
-  vector<string> ts_flags, master_flags;
-  ts_flags.push_back("--enable_leader_failure_detection=false");
-  ts_flags.push_back("--maintenance_manager_polling_interval_ms=100");
-  master_flags.push_back("--catalog_manager_wait_for_new_tablets_to_elect_leader=false");
+  std::vector<std::string> ts_flags = {
+    "--enable_leader_failure_detection=false"s,
+    "--maintenance_manager_polling_interval_ms=100"s,
+  };
+  std::vector<std::string> master_flags = {
+    "--catalog_manager_wait_for_new_tablets_to_elect_leader=false"s,
+    "--use_create_table_leader_hint=false"s,
+  };
   ASSERT_NO_FATALS(StartCluster(ts_flags, master_flags, kNumTabletServers));
 
   const int kTsIndex = 0;  // We'll test with the first TS.
@@ -939,11 +942,14 @@ TEST_F(DeleteTableTest, TestMemtableNoFlushOnTabletDelete) {
 // Test that orphaned blocks are cleared from the superblock when a tablet is tombstoned.
 TEST_F(DeleteTableTest, TestOrphanedBlocksClearedOnDelete) {
   const MonoDelta timeout = MonoDelta::FromSeconds(30);
-  vector<string> ts_flags, master_flags;
-  ts_flags.push_back("--enable_leader_failure_detection=false");
-  // Flush quickly since we wait for a flush to occur.
-  ts_flags.push_back("--maintenance_manager_polling_interval_ms=100");
-  master_flags.push_back("--catalog_manager_wait_for_new_tablets_to_elect_leader=false");
+  std::vector<std::string> ts_flags = {
+    "--enable_leader_failure_detection=false"s,
+    "--maintenance_manager_polling_interval_ms=100"s,
+  };
+  std::vector<std::string> master_flags = {
+    "--catalog_manager_wait_for_new_tablets_to_elect_leader=false"s,
+    "--use_create_table_leader_hint=false"s,
+  };
   ASSERT_NO_FATALS(StartCluster(ts_flags, master_flags));
 
   const int kFollowerIndex = 0;
@@ -1102,9 +1108,9 @@ TEST_P(DeleteTableDeletedParamTest, TestRollForwardDelete) {
 }
 
 // Faults appropriate for the TABLET_DATA_DELETED case.
-const char* deleted_faults[] = {"fault_crash_after_blocks_deleted",
-                                "fault_crash_after_wal_deleted",
-                                "fault_crash_after_cmeta_deleted"};
+const char* deleted_faults[] = {"TEST_fault_crash_after_blocks_deleted",
+                                "TEST_fault_crash_after_wal_deleted",
+                                "TEST_fault_crash_after_cmeta_deleted"};
 
 INSTANTIATE_TEST_CASE_P(FaultFlags, DeleteTableDeletedParamTest,
                         ::testing::ValuesIn(deleted_faults));
@@ -1218,6 +1224,16 @@ TEST_P(DeleteTableTombstonedParamTest, TestTabletTombstone) {
         << t.tablet_status().tablet_id() << " not tombstoned";
   }
 
+  // Check that, upon restart of the tablet server with a tombstoned tablet,
+  // we don't unnecessary "roll forward" and rewrite the tablet metadata file
+  // when it is already fully deleted.
+  int64_t orig_mtime = inspect_->GetTabletSuperBlockMTimeOrDie(kTsIndex, tablet_id);
+  cluster_->tablet_server(kTsIndex)->Shutdown();
+  ASSERT_OK(cluster_->tablet_server(kTsIndex)->Restart());
+  int64_t new_mtime = inspect_->GetTabletSuperBlockMTimeOrDie(kTsIndex, tablet_id);
+  ASSERT_EQ(orig_mtime, new_mtime)
+                << "Tablet superblock should not have been re-flushed unnecessarily";
+
   // Finally, delete all tablets on the TS, and wait for all data to be gone.
   LOG(INFO) << "Deleting all tablets...";
   for (const ListTabletsResponsePB::StatusAndSchemaPB& tablet : tablets) {
@@ -1237,8 +1253,8 @@ TEST_P(DeleteTableTombstonedParamTest, TestTabletTombstone) {
 
 // Faults appropriate for the TABLET_DATA_TOMBSTONED case.
 // Tombstoning a tablet does not delete the consensus metadata.
-const char* tombstoned_faults[] = {"fault_crash_after_blocks_deleted",
-                                   "fault_crash_after_wal_deleted"};
+const char* tombstoned_faults[] = {"TEST_fault_crash_after_blocks_deleted",
+                                   "TEST_fault_crash_after_wal_deleted"};
 
 INSTANTIATE_TEST_CASE_P(FaultFlags, DeleteTableTombstonedParamTest,
                         ::testing::ValuesIn(tombstoned_faults));

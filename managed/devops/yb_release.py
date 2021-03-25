@@ -1,4 +1,4 @@
-#!/usr/bin/env python
+#!/usr/bin/env python3
 #
 # Copyright 2019 YugaByte, Inc. and Contributors
 #
@@ -30,9 +30,6 @@ args = parser.parse_args()
 try:
     init_env(logging.INFO)
     script_dir = os.path.dirname(os.path.realpath(__file__))
-    check_call(['./bin/install_python_requirements.sh'], cwd=script_dir)
-    check_call(['./bin/install_ansible_requirements.sh', '--force'],
-               cwd=script_dir)
     options = {
         "repository": script_dir,
         "name": "devops",

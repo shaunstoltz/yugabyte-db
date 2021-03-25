@@ -1,8 +1,8 @@
 ---
-title: Use Go to build a YugabyteDB application
+title: Build a Go application that uses GORM and YSQL
 headerTitle: Build a Go application
-linkTitle: Build a Go application
-description: Follow this tutorial to build an e-commerce YugabyteDB application that uses Go and GORM.
+linkTitle: Go
+description: Build an Go application that uses GORM and YSQL.
 menu:
   latest:
     parent: build-apps
@@ -162,7 +162,7 @@ Type "help" for help.
 yugabyte=#
 ```
 
-```postgresql
+```plpgsql
 yugabyte=# SELECT count(*) FROM users;
 ```
 
@@ -173,7 +173,7 @@ yugabyte=# SELECT count(*) FROM users;
 (1 row)
 ```
 
-```postgresql
+```plpgsql
 yugabyte=# SELECT count(*) FROM products;
 ```
 
@@ -184,7 +184,7 @@ yugabyte=# SELECT count(*) FROM products;
 (1 row)
 ```
 
-```postgresql
+```plpgsql
 yugabyte=# SELECT count(*) FROM orders;
 ```
 

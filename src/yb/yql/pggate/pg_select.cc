@@ -29,8 +29,7 @@ using std::make_shared;
 
 PgSelect::PgSelect(PgSession::ScopedRefPtr pg_session, const PgObjectId& table_id,
                    const PgObjectId& index_id, const PgPrepareParameters *prepare_params)
-    : PgDmlRead(pg_session, table_id, index_id, prepare_params) {
-}
+    : PgDmlRead(pg_session, table_id, index_id, prepare_params) {}
 
 PgSelect::~PgSelect() {
 }
@@ -45,14 +44,13 @@ Status PgSelect::Prepare() {
 
     // Create secondary index query.
     secondary_index_query_ =
-      make_scoped_refptr<PgSelectIndex>(pg_session_, table_id_, index_id_, &prepare_params_);
+      std::make_unique<PgSelectIndex>(pg_session_, table_id_, index_id_, &prepare_params_);
   }
 
   // Allocate READ requests to send to DocDB.
   auto read_op = target_desc_->NewPgsqlSelect();
   read_req_ = read_op->mutable_request();
-  auto doc_op = make_shared<PgDocReadOp>(pg_session_, target_desc_,
-                                         target_desc_->num_hash_key_columns(), std::move(read_op));
+  auto doc_op = make_shared<PgDocReadOp>(pg_session_, target_desc_, std::move(read_op));
 
   // Prepare the index selection if this operation is using the index.
   RETURN_NOT_OK(PrepareSecondaryIndex());
@@ -73,8 +71,9 @@ Status PgSelect::PrepareSecondaryIndex() {
 
   // Prepare the index operation to read ybctids from the index table. There are two different
   // scenarios on how ybctids are requested.
-  // - Due to an optimization in DocDB, for system catalog (colocated tables), index request is sent
-  //   as a part of the actual read request using protobuf field "PgsqlReadRequestPB::index_request"
+  // - Due to an optimization in DocDB, for colocated tables (both system and user colocated), index
+  //   request is sent as a part of the actual read request using protobuf field
+  //   "PgsqlReadRequestPB::index_request"
   //
   //   For this case, "mutable_index_request" is allocated here and passed to PgSelectIndex node to
   //   fill in with bind-values when necessary.
@@ -82,7 +81,7 @@ Status PgSelect::PrepareSecondaryIndex() {
   // - For regular tables, the index subquery will send separate request to tablet servers collect
   //   batches of ybctids which is then used by 'this' outer select to query actual data.
   PgsqlReadRequestPB *index_req = nullptr;
-  if (prepare_params_.querying_systable) {
+  if (prepare_params_.querying_colocated_table) {
     // Allocate "index_request" and pass to PgSelectIndex.
     index_req = read_req_->mutable_index_request();
   }

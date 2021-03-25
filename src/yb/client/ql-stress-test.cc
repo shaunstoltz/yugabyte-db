@@ -46,14 +46,14 @@
 #include "yb/util/scope_exit.h"
 #include "yb/util/size_literals.h"
 
+#include "yb/util/tsan_util.h"
 #include "yb/yql/cql/ql/util/statement_result.h"
 
-DECLARE_double(respond_write_failed_probability);
+DECLARE_double(TEST_respond_write_failed_probability);
 DECLARE_bool(allow_preempting_compactions);
 DECLARE_bool(detect_duplicates_for_retryable_requests);
 DECLARE_bool(enable_ondisk_compression);
-DECLARE_int32(raft_heartbeat_interval_ms);
-DECLARE_bool(combine_batcher_errors);
+DECLARE_bool(TEST_combine_batcher_errors);
 DECLARE_int64(transaction_rpc_timeout_ms);
 DECLARE_double(transaction_max_missed_heartbeat_periods);
 DECLARE_int32(retryable_request_range_time_limit_secs);
@@ -63,6 +63,7 @@ DECLARE_int32(rocksdb_level0_slowdown_writes_trigger);
 DECLARE_int32(rocksdb_max_background_compactions);
 DECLARE_int32(rocksdb_universal_compaction_min_merge_width);
 DECLARE_int32(rocksdb_universal_compaction_size_ratio);
+DECLARE_int32(TEST_max_write_waiters);
 DECLARE_uint64(log_segment_size_bytes);
 DECLARE_uint64(sst_files_soft_limit);
 DECLARE_uint64(sst_files_hard_limit);
@@ -91,7 +92,7 @@ const std::string kValueColumn = "v";
 
 }
 
-class QLStressTest : public QLDmlTestBase {
+class QLStressTest : public QLDmlTestBase<MiniCluster> {
  public:
   QLStressTest() {
   }
@@ -107,6 +108,7 @@ class QLStressTest : public QLDmlTestBase {
     CompleteSchemaBuilder(&b);
 
     ASSERT_OK(table_.Create(kTableName, NumTablets(), client_.get(), &b));
+    ASSERT_OK(WaitForTabletLeaders());
   }
 
   virtual void CompleteSchemaBuilder(YBSchemaBuilder* b) {}
@@ -118,6 +120,14 @@ class QLStressTest : public QLDmlTestBase {
   virtual void InitSchemaBuilder(YBSchemaBuilder* builder) {
     builder->AddColumn("h")->Type(INT32)->HashPrimaryKey()->NotNull();
     builder->AddColumn(kValueColumn)->Type(STRING);
+  }
+
+  CHECKED_STATUS WaitForTabletLeaders() {
+    const MonoTime deadline = MonoTime::Now() + 10s * kTimeMultiplier;
+    for (const auto& tablet_id : ListTabletIdsForTable(cluster_.get(), table_->id())) {
+      RETURN_NOT_OK(WaitUntilTabletHasLeader(cluster_.get(), tablet_id, deadline));
+    }
+    return Status::OK();
   }
 
   YBqlWriteOpPtr InsertRow(const YBSessionPtr& session,
@@ -190,16 +200,19 @@ class QLStressTest : public QLDmlTestBase {
     return QLStressTest::ReadRow(session, table_, key);
   }
 
+  TransactionManager CreateTxnManager();
+
   void VerifyFlushedFrontiers();
 
   void TestRetryWrites(bool restarts);
 
-  bool CheckRetryableRequestsCounts(size_t* total_entries, size_t* total_leaders);
+  bool CheckRetryableRequestsCountsAndLeaders(size_t total_leaders, size_t* total_entries);
 
   void AddWriter(
       std::string value_prefix, std::atomic<int>* key, TestThreadHolder* thread_holder,
       const std::chrono::nanoseconds& sleep_duration = std::chrono::nanoseconds(),
-      bool allow_failures = false);
+      bool allow_failures = false, TransactionManager* txn_manager = nullptr,
+      double transactional_write_probability = 0.0);
 
   void TestWriteRejection();
 
@@ -235,9 +248,10 @@ TEST_F(QLStressTest, LargeNumberOfTables) {
   }
 }
 
-bool QLStressTest::CheckRetryableRequestsCounts(size_t* total_entries, size_t* total_leaders) {
+bool QLStressTest::CheckRetryableRequestsCountsAndLeaders(
+      size_t expected_leaders, size_t* total_entries) {
+  size_t total_leaders = 0;
   *total_entries = 0;
-  *total_leaders = 0;
   bool result = true;
   size_t replicated_limit = FLAGS_detect_duplicates_for_retryable_requests ? 1 : 0;
   auto peers = ListTabletPeers(cluster_.get(), ListPeersFilter::kAll);
@@ -253,16 +267,22 @@ bool QLStressTest::CheckRetryableRequestsCounts(size_t* total_entries, size_t* t
               << ", entries: " << tablet_entries
               << ", running: " << request_counts.running
               << ", replicated: " << request_counts.replicated
-              << ", leader: " << leader;
+              << ", leader: " << leader
+              << ", term: " << raft_consensus->LeaderTerm();
     if (leader) {
       *total_entries += tablet_entries;
-      ++*total_leaders;
+      ++total_leaders;
     }
     // Last write request could be rejected as duplicate, so followers would not be able to
     // cleanup replicated requests.
     if (request_counts.running != 0 || (leader && request_counts.replicated > replicated_limit)) {
       result = false;
     }
+  }
+
+  if (total_leaders != expected_leaders) {
+    LOG(INFO) << "Expected " << expected_leaders << " leaders, found " << total_leaders;
+    return false;
   }
 
   if (result && FLAGS_detect_duplicates_for_retryable_requests) {
@@ -293,19 +313,23 @@ bool QLStressTest::CheckRetryableRequestsCounts(size_t* total_entries, size_t* t
   return result;
 }
 
+TransactionManager QLStressTest::CreateTxnManager() {
+  server::ClockPtr clock(new server::HybridClock(WallClock()));
+  EXPECT_OK(clock->Init());
+  return TransactionManager(client_.get(), clock, client::LocalTabletFilter());
+}
+
 void QLStressTest::TestRetryWrites(bool restarts) {
   const size_t kConcurrentWrites = 5;
   // Used only when table is transactional.
   const double kTransactionalWriteProbability = 0.5;
 
-  SetAtomicFlag(0.25, &FLAGS_respond_write_failed_probability);
+  SetAtomicFlag(0.25, &FLAGS_TEST_respond_write_failed_probability);
 
   const bool transactional = table_.table()->schema().table_properties().is_transactional();
   boost::optional<TransactionManager> txn_manager;
   if (transactional) {
-    server::ClockPtr clock(new server::HybridClock(WallClock()));
-    ASSERT_OK(clock->Init());
-    txn_manager.emplace(client_.get(), clock, client::LocalTabletFilter());
+    txn_manager = CreateTxnManager();
   }
 
   TestThreadHolder thread_holder;
@@ -314,7 +338,6 @@ void QLStressTest::TestRetryWrites(bool restarts) {
     thread_holder.AddThreadFunctor(
         [this, &key_source, &stop_requested = thread_holder.stop_flag(),
          &txn_manager, kTransactionalWriteProbability] {
-      CDSAttacher attacher;
       auto session = NewSession();
       while (!stop_requested.load(std::memory_order_acquire)) {
         int32_t key = key_source.fetch_add(1, std::memory_order_acq_rel);
@@ -365,12 +388,11 @@ void QLStressTest::TestRetryWrites(bool restarts) {
   }
 
   size_t total_entries = 0;
-  size_t total_leaders = 0;
+  size_t expected_leaders = table_.table()->GetPartitionCount();
   ASSERT_OK(WaitFor(
-      std::bind(&QLStressTest::CheckRetryableRequestsCounts, this, &total_entries, &total_leaders),
-      15s, "Retryable requests cleanup"));
-
-  ASSERT_EQ(total_leaders, table_.table()->GetPartitions().size());
+      std::bind(&QLStressTest::CheckRetryableRequestsCountsAndLeaders, this,
+                expected_leaders, &total_entries),
+      15s, "Retryable requests cleanup and leader wait"));
 
   // We have 2 entries per row.
   if (FLAGS_detect_duplicates_for_retryable_requests) {
@@ -394,6 +416,12 @@ TEST_F(QLStressTest, RetryWritesWithRestarts) {
   TestRetryWrites(true /* restarts */);
 }
 
+void SetTransactional(YBSchemaBuilder* builder) {
+  TableProperties table_properties;
+  table_properties.SetTransactional(true);
+  builder->SetTableProperties(table_properties);
+}
+
 class QLTransactionalStressTest : public QLStressTest {
  public:
   void SetUp() override {
@@ -404,10 +432,8 @@ class QLTransactionalStressTest : public QLStressTest {
     ASSERT_NO_FATALS(QLStressTest::SetUp());
   }
 
-  void CompleteSchemaBuilder(YBSchemaBuilder* b) override {
-    TableProperties table_properties;
-    table_properties.SetTransactional(true);
-    b->SetTableProperties(table_properties);
+  void CompleteSchemaBuilder(YBSchemaBuilder* builder) override {
+    SetTransactional(builder);
   }
 };
 
@@ -547,9 +573,9 @@ TEST_F_EX(QLStressTest, ShortTimeLeaderDoesNotReplicateNoOp, QLStressTestSingleT
   // Give new leader some time to request lease.
   // TODO wait for specific event.
   std::this_thread::sleep_for(3s);
-  auto temp_leader_safe_time = temp_leader->tablet()->SafeTime(tablet::RequireLease::kTrue);
+  auto temp_leader_safe_time = ASSERT_RESULT(
+      temp_leader->tablet()->SafeTime(tablet::RequireLease::kTrue));
   LOG(INFO) << "Safe time: " << temp_leader_safe_time;
-  ASSERT_FALSE(temp_leader_safe_time.is_valid());
 
   LOG(INFO) << "Transferring leadership from " << temp_leader->permanent_uuid()
             << " back to " << old_leader->permanent_uuid();
@@ -645,7 +671,7 @@ TEST_F_EX(QLStressTest, FlushCompact, QLStressTestSingleTablet) {
 // Restore connectivity.
 // Check that old leader was able to catch up after the partition is healed.
 TEST_F_EX(QLStressTest, OldLeaderCatchUpAfterNetworkPartition, QLStressTestSingleTablet) {
-  FLAGS_combine_batcher_errors = true;
+  FLAGS_TEST_combine_batcher_errors = true;
 
   tablet::TabletPeer* leader_peer = nullptr;
   std::atomic<int> key(0);
@@ -653,6 +679,8 @@ TEST_F_EX(QLStressTest, OldLeaderCatchUpAfterNetworkPartition, QLStressTestSingl
     TestThreadHolder thread_holder;
 
     AddWriter("value_", &key, &thread_holder);
+
+    std::this_thread::sleep_for(5s * yb::kTimeMultiplier);
 
     tserver::MiniTabletServer* leader = nullptr;
     for (int i = 0; i != cluster_->num_tablet_servers(); ++i) {
@@ -668,21 +696,19 @@ TEST_F_EX(QLStressTest, OldLeaderCatchUpAfterNetworkPartition, QLStressTestSingl
 
     ASSERT_NE(leader, nullptr);
 
-    std::this_thread::sleep_for(5s * yb::kTimeMultiplier);
-
     auto pre_isolate_op_id = leader_peer->GetLatestLogEntryOpId();
     LOG(INFO) << "Isolate, last op id: " << pre_isolate_op_id << ", key: " << key;
-    ASSERT_EQ(pre_isolate_op_id.term, 1);
+    ASSERT_GE(pre_isolate_op_id.term, 1);
     ASSERT_GT(pre_isolate_op_id.index, key);
-    leader->SetIsolated(true);
+    leader->Isolate();
     std::this_thread::sleep_for(10s * yb::kTimeMultiplier);
 
     auto pre_restore_op_id = leader_peer->GetLatestLogEntryOpId();
     LOG(INFO) << "Restore, last op id: " << pre_restore_op_id << ", key: " << key;
-    ASSERT_EQ(pre_restore_op_id.term, 1);
+    ASSERT_EQ(pre_restore_op_id.term, pre_isolate_op_id.term);
     ASSERT_GE(pre_restore_op_id.index, pre_isolate_op_id.index);
     ASSERT_LE(pre_restore_op_id.index, pre_isolate_op_id.index + 10);
-    leader->SetIsolated(false);
+    ASSERT_OK(leader->Reconnect());
 
     thread_holder.WaitAndStop(5s * yb::kTimeMultiplier);
   }
@@ -746,30 +772,46 @@ class QLStressTestDelayWrite : public QLStressTestSingleTablet {
 void QLStressTest::AddWriter(
     std::string value_prefix, std::atomic<int>* key, TestThreadHolder* thread_holder,
     const std::chrono::nanoseconds& sleep_duration,
-    bool allow_failures) {
+    bool allow_failures, TransactionManager* txn_manager, double transactional_write_probability) {
   thread_holder->AddThreadFunctor([this, &stop = thread_holder->stop_flag(), key, sleep_duration,
-                                   value_prefix = std::move(value_prefix), allow_failures] {
+                                   value_prefix = std::move(value_prefix), allow_failures,
+                                   txn_manager, transactional_write_probability] {
     auto session = NewSession();
+    session->SetRejectionScoreSource(std::make_shared<RejectionScoreSource>());
+    ASSERT_TRUE(txn_manager || transactional_write_probability == 0.0);
+
     while (!stop.load(std::memory_order_acquire)) {
+      YBTransactionPtr txn;
+      if (txn_manager && RandomActWithProbability(transactional_write_probability)) {
+        txn = std::make_shared<YBTransaction>(txn_manager);
+        ASSERT_OK(txn->Init(IsolationLevel::SNAPSHOT_ISOLATION));
+        session->SetTransaction(txn);
+      } else {
+        session->SetTransaction(nullptr);
+      }
       auto new_key = *key + 1;
-      session->SetRejectionScoreSource(std::make_shared<RejectionScoreSource>());
-      auto write_status = WriteRow(session, new_key, value_prefix + std::to_string(new_key));
+      auto status = WriteRow(session, new_key, value_prefix + std::to_string(new_key));
+      if (status.ok() && txn) {
+        status = txn->CommitFuture().get();
+      }
+
       if (!allow_failures) {
-        ASSERT_OK(write_status);
-      } else if (!write_status.ok()) {
-        LOG(WARNING) << "Write failed: " << write_status;
-        continue;
+        ASSERT_OK(status);
+      } else if (!status.ok()) {
+        LOG(WARNING) << "Write failed: " << status;
+      }
+      if (status.ok()) {
+        ++*key;
       }
       if (sleep_duration.count() > 0) {
         std::this_thread::sleep_for(sleep_duration);
       }
-      ++*key;
     }
   });
 }
 
 void QLStressTest::TestWriteRejection() {
-  constexpr int kWriters = 10;
+  constexpr int kWriters = IsDebug() ? 10 : 20;
   constexpr int kKeyBase = 10000;
 
   std::array<std::atomic<int>, kWriters> keys;
@@ -842,6 +884,8 @@ void QLStressTest::TestWriteRejection() {
       break;
     }
   }
+
+  thread_holder.Stop();
 
   ASSERT_OK(WaitFor([cluster = cluster_.get()] {
     auto peers = ListTabletPeers(cluster, ListPeersFilter::kAll);
@@ -1021,6 +1065,33 @@ TEST_F_EX(QLStressTest, DynamicCompactionPriority, QLStressDynamicCompactionPrio
   MonoDelta delete_time(CoarseMonoClock::now() - delete_start);
   LOG(INFO) << "Delete time: " << delete_time;
   ASSERT_LE(delete_time, 10s);
+}
+
+class QLStressTestTransactionalSingleTablet : public QLStressTestSingleTablet {
+  void CompleteSchemaBuilder(YBSchemaBuilder* builder) override {
+    SetTransactional(builder);
+  }
+};
+
+// Verify that we don't have too many write waiters.
+// Uses FLAGS_TEST_max_write_waiters to fail debug check when there are too many waiters.
+TEST_F_EX(QLStressTest, RemoveIntentsDuringWrite, QLStressTestTransactionalSingleTablet) {
+  FLAGS_TEST_max_write_waiters = 5;
+
+  constexpr int kWriters = 10;
+  constexpr int kKeyBase = 10000;
+
+  std::array<std::atomic<int>, kWriters> keys;
+
+  auto txn_manager = CreateTxnManager();
+  TestThreadHolder thread_holder;
+  for (int i = 0; i != kWriters; ++i) {
+    keys[i] = i * kKeyBase;
+    AddWriter(
+        "value_", &keys[i], &thread_holder, 0s, false /* allow_failures */, &txn_manager, 1.0);
+  }
+
+  thread_holder.WaitAndStop(3s);
 }
 
 } // namespace client

@@ -28,19 +28,6 @@
 #include "yb/util/enums.h"
 #include "yb/util/strongly_typed_bool.h"
 
-namespace boost {
-namespace asio {
-
-#if BOOST_VERSION >= 106600
-class io_context;
-typedef io_context io_service;
-#else
-class io_service;
-#endif
-
-} // namespace asio
-} // namespace boost
-
 namespace yb {
 namespace rpc {
 
@@ -58,10 +45,13 @@ class RpcContext;
 class RpcController;
 class RpcService;
 class Rpcs;
+class Poller;
 class Protocol;
 class Scheduler;
 class SecureContext;
 class ServicePoolImpl;
+class Strand;
+class StrandTask;
 class Stream;
 class StreamReadBuffer;
 class ThreadPool;
@@ -99,8 +89,6 @@ class ServiceIf;
 typedef std::shared_ptr<ServiceIf> ServiceIfPtr;
 
 class ErrorStatusPB;
-
-typedef boost::asio::io_service IoService;
 
 typedef std::function<int(const std::string&, const std::string&)> Publisher;
 

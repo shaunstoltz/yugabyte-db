@@ -17,7 +17,7 @@ import com.google.inject.Inject;
 import com.yugabyte.yw.commissioner.AbstractTaskBase;
 import com.yugabyte.yw.commissioner.UserTaskDetails;
 import com.yugabyte.yw.common.KubernetesManager;
-import com.yugabyte.yw.common.ShellProcessHandler.ShellResponse;
+import com.yugabyte.yw.common.ShellResponse;
 import com.yugabyte.yw.forms.AbstractTaskParams;
 import com.yugabyte.yw.forms.ITaskParams;
 import com.yugabyte.yw.forms.UniverseDefinitionTaskParams;
@@ -75,9 +75,14 @@ public class KubernetesWaitForPod extends AbstractTaskBase {
     public UUID providerUUID;
     public CommandType commandType;
     public UUID universeUUID;
+    // TODO(bhavin192): nodePrefix can be removed as we are not doing
+    // any sort of Helm operation here. Or we might want to use it for
+    // some sort of label based selection.
+
     // We use the nodePrefix as Helm Chart's release name,
     // so we would need that for any sort helm operations.
     public String nodePrefix;
+    public String namespace;
     public String podName = null;
     public Map<String, String> config = null;
   }
@@ -105,7 +110,7 @@ public class KubernetesWaitForPod extends AbstractTaskBase {
             // Do nothing
           }
         } while (!status.equals("Running") && iters < MAX_ITERS);
-        if (MAX_ITERS > 10) {
+        if (iters > MAX_ITERS) {
           throw new RuntimeException("Pod " + taskParams().podName + " creation taking too long.");
         }
         break;
@@ -118,7 +123,7 @@ public class KubernetesWaitForPod extends AbstractTaskBase {
     if (taskParams().config == null) {
       config = Provider.get(taskParams().providerUUID).getConfig();
     }
-    ShellResponse podResponse = kubernetesManager.getPodStatus(config, taskParams().nodePrefix,
+    ShellResponse podResponse = kubernetesManager.getPodStatus(config, taskParams().namespace,
         taskParams().podName);
     JsonNode podInfo = parseShellResponseAsJson(podResponse);
     JsonNode statusNode = podInfo.path("status");

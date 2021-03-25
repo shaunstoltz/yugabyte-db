@@ -47,6 +47,9 @@ class TabletRpc {
 
   // attempt_num starts with 1.
   virtual void SendRpcToTserver(int attempt_num) = 0;
+
+  virtual bool ShouldRetryExpiredRequest() { return false; }
+
  protected:
   ~TabletRpc() {}
 };
@@ -54,12 +57,15 @@ class TabletRpc {
 tserver::TabletServerErrorPB_Code ErrorCode(const tserver::TabletServerErrorPB* error);
 class TabletInvoker {
  public:
+  // If table is specified, TabletInvoker can detect that table partitions are stale in case tablet
+  // is no longer available and return ClientErrorCode::kTablePartitionListIsStale.
   explicit TabletInvoker(const bool local_tserver_only,
                          const bool consistent_prefix,
                          YBClient* client,
                          rpc::RpcCommand* command,
                          TabletRpc* rpc,
                          RemoteTablet* tablet,
+                         const std::shared_ptr<const YBTable>& table,
                          rpc::RpcRetrier* retrier,
                          Trace* trace);
 
@@ -78,6 +84,8 @@ class TabletInvoker {
   YBClient& client() const { return *client_; }
   const RemoteTabletServer& current_ts() { return *current_ts_; }
   bool local_tserver_only() const { return local_tserver_only_; }
+
+  bool is_consistent_prefix() const { return consistent_prefix_; }
 
  private:
   friend class TabletRpcTest;
@@ -124,6 +132,8 @@ class TabletInvoker {
 
   std::string tablet_id_;
 
+  const std::shared_ptr<const YBTable> table_;
+
   rpc::RpcRetrier* const retrier_;
 
   // Trace is provided externally and owner of this object should guarantee that it will be alive
@@ -133,7 +143,18 @@ class TabletInvoker {
   // Used to retry some failed RPCs.
   // Tablet servers that refused the write because they were followers at the time.
   // Cleared when new consensus configuration information arrives from the master.
-  std::unordered_set<RemoteTabletServer*> followers_;
+  struct FollowerData {
+    // Last replica error, i.e. reason why it was marked as follower.
+    Status status;
+    // Error time.
+    CoarseTimePoint time;
+
+    std::string ToString() const {
+      return Format("{ status: $0 time: $1 }", status, CoarseMonoClock::now() - time);
+    }
+  };
+
+  std::unordered_map<RemoteTabletServer*, FollowerData> followers_;
 
   const bool local_tserver_only_;
 
@@ -143,6 +164,9 @@ class TabletInvoker {
   // RemoteTabletServer is taken from YBClient cache, so it is guaranteed that those objects are
   // alive while YBClient is alive. Because we don't delete them, but only add and update.
   RemoteTabletServer* current_ts_ = nullptr;
+
+  // Should we assign new leader in meta cache when successful response is received.
+  bool assign_new_leader_ = false;
 };
 
 CHECKED_STATUS ErrorStatus(const tserver::TabletServerErrorPB* error);

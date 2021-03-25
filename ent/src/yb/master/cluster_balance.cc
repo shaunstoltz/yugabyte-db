@@ -19,9 +19,16 @@ namespace yb {
 namespace master {
 namespace enterprise {
 
-Result<bool> ClusterLoadBalancer::HandleLeaderMoves(
-    TabletId* out_tablet_id, TabletServerId* out_from_ts, TabletServerId* out_to_ts) {
-  if (VERIFY_RESULT(HandleLeaderLoadIfNonAffinitized(out_tablet_id, out_from_ts, out_to_ts))) {
+Result<bool> ClusterLoadBalancer::HandleLeaderMoves(TabletId* out_tablet_id,
+                                                    TabletServerId* out_from_ts,
+                                                    TabletServerId* out_to_ts) {
+
+  // If the user sets 'transaction_tables_use_preferred_zones' gflag to 0 and the tablet
+  // being balanced is a transaction tablet, then logical flow will be changed to ignore
+  // preferred zones and instead proceed to normal leader balancing.
+  PerTableLoadState* ent_state = GetEntState();
+  if (ent_state->use_preferred_zones_ &&
+    VERIFY_RESULT(HandleLeaderLoadIfNonAffinitized(out_tablet_id, out_from_ts, out_to_ts))) {
     RETURN_NOT_OK(MoveLeader(*out_tablet_id, *out_from_ts, *out_to_ts));
     return true;
   }
@@ -29,10 +36,12 @@ Result<bool> ClusterLoadBalancer::HandleLeaderMoves(
   return super::HandleLeaderMoves(out_tablet_id, out_from_ts, out_to_ts);
 }
 
-Status ClusterLoadBalancer::AnalyzeTablets(const TableId& table_uuid) {
-  ClusterLoadState* ent_state = GetEntState();
-  GetAllAffinitizedZones(&ent_state->affinitized_zones_);
-  return super::AnalyzeTablets(table_uuid);
+void ClusterLoadBalancer::InitializeTSDescriptors() {
+  PerTableLoadState* ent_state = GetEntState();
+  if (ent_state->use_preferred_zones_) {
+    GetAllAffinitizedZones(&ent_state->affinitized_zones_);
+  }
+  super::InitializeTSDescriptors();
 }
 
 void ClusterLoadBalancer::GetAllAffinitizedZones(AffinitizedZonesSet* affinitized_zones) const {
@@ -46,8 +55,8 @@ void ClusterLoadBalancer::GetAllAffinitizedZones(AffinitizedZonesSet* affinitize
 }
 
 Result<bool> ClusterLoadBalancer::HandleLeaderLoadIfNonAffinitized(TabletId* moving_tablet_id,
-                                                           TabletServerId* from_ts,
-                                                           TabletServerId* to_ts) {
+                                                                   TabletServerId* from_ts,
+                                                                   TabletServerId* to_ts) {
   // Similar to normal leader balancing, we double iterate from most loaded to least loaded
   // non-affinitized nodes and least to most affinitized nodes. For each pair, we check whether
   // there is any tablet intersection and if so, there is a match and we return true.
@@ -55,7 +64,7 @@ Result<bool> ClusterLoadBalancer::HandleLeaderLoadIfNonAffinitized(TabletId* mov
   // If we go through all the node pairs or we see that the current non-affinitized
   // leader load is 0, we know that there is no match from non-affinitized to affinitized nodes
   // and we return false.
-  ClusterLoadState* ent_state = GetEntState();
+  PerTableLoadState* ent_state = GetEntState();
   const int non_affinitized_last_pos = ent_state->sorted_non_affinitized_leader_load_.size() - 1;
 
   for (int non_affinitized_idx = non_affinitized_last_pos;
@@ -85,20 +94,22 @@ Result<bool> ClusterLoadBalancer::HandleLeaderLoadIfNonAffinitized(TabletId* mov
   return false;
 }
 
-void ClusterLoadBalancer::PopulatePlacementInfo(TabletInfo* tablet, PlacementInfoPB* pb) {
-  auto l = tablet->table()->LockForRead();
+Status ClusterLoadBalancer::PopulatePlacementInfo(TabletInfo* tablet, PlacementInfoPB* pb) {
   const Options* options_ent = GetEntState()->GetEntOptions();
-  if (options_ent->type == LIVE &&
-      l->data().pb.has_replication_info() &&
-      l->data().pb.replication_info().has_live_replicas()) {
-    pb->CopyFrom(l->data().pb.replication_info().live_replicas());
-  } else if (options_ent->type == READ_ONLY &&
+  if (options_ent->type == LIVE) {
+    const auto& replication_info = VERIFY_RESULT(GetTableReplicationInfo(tablet->table()));
+    pb->CopyFrom(replication_info.live_replicas());
+    return Status::OK();
+  }
+  auto l = tablet->table()->LockForRead();
+  if (options_ent->type == READ_ONLY &&
       l->data().pb.has_replication_info() &&
       !l->data().pb.replication_info().read_replicas().empty()) {
     pb->CopyFrom(GetReadOnlyPlacementFromUuid(l->data().pb.replication_info()));
   } else {
     pb->CopyFrom(GetClusterPlacementInfo());
   }
+  return Status::OK();
 }
 
 Status ClusterLoadBalancer::UpdateTabletInfo(TabletInfo* tablet) {
@@ -107,7 +118,7 @@ Status ClusterLoadBalancer::UpdateTabletInfo(TabletInfo* tablet) {
   if (!state_->placement_by_table_.count(table_id)) {
     PlacementInfoPB pb;
     {
-      PopulatePlacementInfo(tablet, &pb);
+      RETURN_NOT_OK(PopulatePlacementInfo(tablet, &pb));
     }
     state_->placement_by_table_[table_id] = std::move(pb);
   }
@@ -182,8 +193,8 @@ consensus::RaftPeerPB::MemberType ClusterLoadBalancer::GetDefaultMemberType() {
   }
 }
 
-ClusterLoadState* ClusterLoadBalancer::GetEntState() const {
-  return down_cast<ClusterLoadState*>(state_.get());
+PerTableLoadState* ClusterLoadBalancer::GetEntState() const {
+  return down_cast<enterprise::PerTableLoadState*>(state_);
 }
 
 } // namespace enterprise

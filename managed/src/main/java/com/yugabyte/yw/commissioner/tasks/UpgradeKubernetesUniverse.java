@@ -10,52 +10,37 @@
 
 package com.yugabyte.yw.commissioner.tasks;
 
-import com.yugabyte.yw.commissioner.Common;
-import com.yugabyte.yw.commissioner.SubTaskGroup;
-import com.yugabyte.yw.commissioner.UserTaskDetails;
 import com.yugabyte.yw.commissioner.UserTaskDetails.SubTaskGroupType;
-import com.yugabyte.yw.commissioner.tasks.subtasks.KubernetesCommandExecutor;
 import com.yugabyte.yw.commissioner.tasks.subtasks.KubernetesCommandExecutor.CommandType;
-import com.yugabyte.yw.commissioner.tasks.subtasks.KubernetesWaitForPod;
-import com.yugabyte.yw.commissioner.tasks.UniverseDefinitionTaskBase;
-import com.yugabyte.yw.commissioner.tasks.subtasks.LoadBalancerStateChange;
 import com.yugabyte.yw.commissioner.tasks.UpgradeUniverse.UpgradeTaskType;
 import com.yugabyte.yw.common.PlacementInfoUtil;
-import com.yugabyte.yw.forms.RollingRestartParams;
+import com.yugabyte.yw.forms.UpgradeParams;
 import com.yugabyte.yw.forms.UniverseDefinitionTaskParams;
 import com.yugabyte.yw.forms.UniverseDefinitionTaskParams.UserIntent;
-import com.yugabyte.yw.models.helpers.NodeDetails;
 import com.yugabyte.yw.models.helpers.PlacementInfo;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 import com.yugabyte.yw.commissioner.SubTaskGroupQueue;
-import com.yugabyte.yw.models.AvailabilityZone;
 import com.yugabyte.yw.models.Provider;
-import com.yugabyte.yw.models.Region;
 import com.yugabyte.yw.models.Universe;
 
-import java.util.Map;
-import java.util.Map.Entry;
-import java.util.List;
 import java.util.UUID;
-
-import static com.yugabyte.yw.models.helpers.NodeDetails.NodeState.UpgradeSoftware;
-import static com.yugabyte.yw.models.helpers.NodeDetails.NodeState.UpdateGFlags;
 
 public class UpgradeKubernetesUniverse extends KubernetesTaskBase {
   public static final Logger LOG = LoggerFactory.getLogger(UpgradeKubernetesUniverse.class);
 
-  public static class Params extends RollingRestartParams {}
+  public static class Params extends UpgradeParams {}
 
   @Override
-  protected RollingRestartParams taskParams() {
-    return (RollingRestartParams)taskParams;
+  protected UpgradeParams taskParams() {
+    return (UpgradeParams)taskParams;
   }
 
   @Override
   public void run() {
     try {
+      checkUniverseVersion();
       // Create the task list sequence.
       subTaskGroupQueue = new SubTaskGroupQueue(userTaskUUID);
 
@@ -136,38 +121,52 @@ public class UpgradeKubernetesUniverse extends KubernetesTaskBase {
 
   private void createUpgradeTask(UserIntent userIntent, Universe universe, PlacementInfo pi) {
     String version = null;
-    boolean flag = true;
+    boolean masterChanged = false;
+    boolean tserverChanged = false;
     if (taskParams().taskType == UpgradeTaskType.Software) {
       version = taskParams().ybSoftwareVersion;
-      flag = false;
+      masterChanged = true;
+      tserverChanged = true;
+    } else {
+      if (!taskParams().masterGFlags.equals(userIntent.masterGFlags)) {
+        masterChanged = true;
+      }
+      if (!taskParams().tserverGFlags.equals(userIntent.tserverGFlags)) {
+        tserverChanged = true;
+      }
     }
-    
+
     createSingleKubernetesExecutorTask(CommandType.POD_INFO, pi);
-    
+
     KubernetesPlacement placement = new KubernetesPlacement(pi);
 
     Provider provider = Provider.get(UUID.fromString(
           taskParams().getPrimaryCluster().userIntent.provider));
 
+    UniverseDefinitionTaskParams universeDetails = universe.getUniverseDetails();
+
     String masterAddresses = PlacementInfoUtil.computeMasterAddresses(pi, placement.masters,
-        taskParams().nodePrefix, provider);
+        taskParams().nodePrefix, provider, universeDetails.communicationPorts.masterRpcPort);
     boolean isMultiAz = PlacementInfoUtil.isMultiAZ(provider);
 
-    createLoadBalancerStateChangeTask(false /*enable*/)
-        .setSubTaskGroupType(getTaskSubGroupType());
-
-    if (!taskParams().masterGFlags.isEmpty() || !flag) {
+    if (masterChanged) {
       userIntent.masterGFlags = taskParams().masterGFlags;
       upgradePodsTask(placement, masterAddresses, null, ServerType.MASTER,
-                      version, taskParams().sleepAfterMasterRestartMillis);
+                      version, taskParams().sleepAfterMasterRestartMillis, masterChanged,
+                      tserverChanged);
     }
-    if (!taskParams().tserverGFlags.isEmpty() || !flag) {
+    if (tserverChanged) {
+      createLoadBalancerStateChangeTask(false /*enable*/)
+          .setSubTaskGroupType(getTaskSubGroupType());
+
       userIntent.tserverGFlags = taskParams().tserverGFlags;
       upgradePodsTask(placement, masterAddresses, null, ServerType.TSERVER,
-                      version, taskParams().sleepAfterTServerRestartMillis);
-    }
+                      version, taskParams().sleepAfterTServerRestartMillis,
+                      false /* master change is false since it has already been upgraded.*/,
+                      tserverChanged);
 
-    createLoadBalancerStateChangeTask(true /*enable*/)
-        .setSubTaskGroupType(getTaskSubGroupType());
+      createLoadBalancerStateChangeTask(true /*enable*/)
+          .setSubTaskGroupType(getTaskSubGroupType());
+    }
   }
 }

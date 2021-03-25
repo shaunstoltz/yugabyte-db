@@ -9,14 +9,13 @@
 # https://github.com/YugaByte/yugabyte-db/blob/master/licenses/POLYFORM-FREE-TRIAL-LICENSE-1.0.0.txt
 
 import json
+import logging
 
-from ybops.common.exceptions import YBOpsRuntimeError
+from ybops.common.exceptions import YBOpsRuntimeError, get_exception_message
 from ybops.cloud.common.cloud import AbstractCloud
 from ybops.cloud.gcp.command import GcpInstanceCommand, GcpQueryCommand, GcpAccessCommand, \
     GcpNetworkCommand
-from ybops.cloud.gcp.utils import GCP_PERSISTENT, GCP_SCRATCH
-
-from utils import GoogleCloudAdmin, GcpMetadata
+from ybops.cloud.gcp.utils import GCP_PERSISTENT, GCP_SCRATCH, GoogleCloudAdmin, GcpMetadata
 
 
 class GcpCloud(AbstractCloud):
@@ -54,7 +53,7 @@ class GcpCloud(AbstractCloud):
 
     def query_vpc(self, args):
         result = {}
-        regions = [args.region] if args.region else self.get_regions(args.network)
+        regions = [args.region] if args.region else self.get_regions(args)
         for region in regions:
             result[region] = self.get_admin().query_vpc(region)
             result[region]["default_image"] = self.get_image(region)["selfLink"]
@@ -70,43 +69,44 @@ class GcpCloud(AbstractCloud):
         self.get_admin().mount_disk(args.zone, instance, body)
 
     def delete_instance(self, args):
+        host_info = self.get_host_info(args)
+        if args.node_ip is None or host_info['private_ip'] != args.node_ip:
+            logging.error("Host {} IP does not match.".format(args.search_pattern))
+            return
         self.get_admin().delete_instance(args.zone, args.search_pattern)
 
-    def get_regions(self, network_name=None):
+    def get_regions(self, args):
         regions_we_know_of = self.get_admin().get_regions()
-        if network_name is None:
+        if args.network is None:
             return regions_we_know_of
         else:
-            user_regions = self.get_admin().network().get_network_data(
-                network_name)["regions"].keys()
-            return list(set(regions_we_know_of) & set(user_regions))
+            # TODO(WESLEY): CHECK ON WHY THIS WASN"T RETURNING ANYTHING
+            return list(self.get_admin().network(
+                per_region_meta=self.get_per_region_meta(args)).get_network_data(
+                    args.network)["regions"].keys())
 
     def get_zones(self, args):
         """This method returns a map of regions to zones.
         If region is passed in args, the map has exactly one key: args.region.
         """
-        regions = [args.region] if args.region else self.get_regions()
+        regions = [args.region] if args.region else self.get_regions(args)
 
         result = {}
+        metadata = self.get_per_region_meta(args)
         for region in regions:
             result[region] = {}
             result[region]["zones"] = self.get_admin().get_zones(region)
-            subnets = self.get_admin().network(args.dest_vpc_id).get_subnetworks(region)
+            subnets = self.get_admin().network(
+                args.dest_vpc_id, per_region_meta=metadata).get_subnetworks(
+                    region)
             result[region]["subnetworks"] = subnets
-        return result
-
-    def get_first_zone_per_region(self, region=None):
-        regions = [region] if region else self.get_regions()
-        result = {}
-        for r in regions:
-            result[r] = self.get_admin().get_zones(r, 1)
         return result
 
     def get_current_host_info(self):
         try:
             return GoogleCloudAdmin.get_current_host_info()
         except YBOpsRuntimeError as e:
-            return {"error": e.message}
+            return {"error": get_exception_message(e)}
 
     def get_instance_types_map(self, args):
         """This method returns a dictionary mapping regions to a dictionary of zones
@@ -114,13 +114,13 @@ class GcpCloud(AbstractCloud):
         descriptions. If region is passed in, we restrict results to the region and if
         both region and zone are passed in, we restrict to zone.
         """
-        regions = args.regions if args.regions else self.get_regions()
+        regions = args.regions if args.regions else self.get_regions(args)
         region_zones_map = {}
         for r in regions:
             region_zones_map[r] = self.get_admin().get_zones(r)
 
         result = {}
-        for region, zones in region_zones_map.iteritems():
+        for region, zones in region_zones_map.items():
             result[region] = {}
             for zone in zones:
                 result[region][zone] = self.get_admin().get_instance_types_by_zone(zone)
@@ -145,7 +145,7 @@ class GcpCloud(AbstractCloud):
                 price_per_hour = pricing_map[name_key][region]
             else:
                 price_per_hour = pricing_map[name_key][region[:-1]]
-        except Exception, e:
+        except Exception as e:
             raise YBOpsRuntimeError(e)
         return price_per_hour
 
@@ -166,8 +166,8 @@ class GcpCloud(AbstractCloud):
         pricing_map = self.get_pricing_map()
 
         result = {}
-        for region, zone_instances_map in region_zones_instances_map.iteritems():
-            for zone, instances in zone_instances_map.iteritems():
+        for region, zone_instances_map in region_zones_instances_map.items():
+            for zone, instances in zone_instances_map.items():
                 for instance in instances:
                     name = instance["name"]
                     if name not in result:
@@ -219,7 +219,8 @@ class GcpCloud(AbstractCloud):
         custom_payload = json.loads(args.custom_payload)
         dest_vpc_id = custom_payload.get("destVpcId")
         host_vpc_id = custom_payload.get("hostVpcId")
-        self.get_admin().network(dest_vpc_id, host_vpc_id).cleanup()
+        self.get_admin().network(
+            dest_vpc_id, host_vpc_id, per_region_meta=self.get_per_region_meta(args)).cleanup()
         return {"success": "VPC deleted."}
 
     def get_host_info(self, args, get_all=False):
@@ -242,4 +243,15 @@ class GcpCloud(AbstractCloud):
             disk_name = "persistent-disk"
             first_disk = 1
         return ["disk/by-id/google-{}-{}".format(
-            disk_name, first_disk + i) for i in xrange(args.num_volumes)]
+            disk_name, first_disk + i) for i in range(args.num_volumes)]
+
+    def update_disk(self, args):
+        instance = self.get_host_info(args)
+        self.get_admin().update_disk(args, instance['id'])
+
+    def get_per_region_meta(self, args):
+        if hasattr(args, "custom_payload") and args.custom_payload:
+            metadata = json.loads(args.custom_payload).get("perRegionMetadata")
+            if metadata:
+                return metadata
+        return {}

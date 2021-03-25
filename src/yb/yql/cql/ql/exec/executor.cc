@@ -45,6 +45,9 @@ using std::string;
 using std::shared_ptr;
 using namespace std::placeholders;
 
+using audit::AuditLogger;
+using audit::IsPrepare;
+using audit::ErrorIsFormatted;
 using client::YBColumnSpec;
 using client::YBOperation;
 using client::YBqlOpPtr;
@@ -68,8 +71,10 @@ using strings::Substitute;
 
 //--------------------------------------------------------------------------------------------------
 
-Executor::Executor(QLEnv *ql_env, Rescheduler* rescheduler, const QLMetrics* ql_metrics)
+Executor::Executor(QLEnv* ql_env, AuditLogger* audit_logger, Rescheduler* rescheduler,
+                   const QLMetrics* ql_metrics)
     : ql_env_(ql_env),
+      audit_logger_(*audit_logger),
       rescheduler_(rescheduler),
       session_(ql_env_->NewSession()),
       ql_metrics_(ql_metrics) {
@@ -166,6 +171,8 @@ void Executor::ExecuteAsync(const StatementBatch& batch, StatementExecutedCallba
     RETURN_STMT_NOT_OK(Execute(parse_tree, params));
   }
 
+  RETURN_STMT_NOT_OK(audit_logger_.EndBatchRequest());
+
   FlushAsync();
 }
 
@@ -177,7 +184,14 @@ Status Executor::Execute(const ParseTree& parse_tree, const StatementParameters&
   exec_context_ = &exec_contexts_.back();
   auto root_node = parse_tree.root().get();
   RETURN_NOT_OK(PreExecTreeNode(root_node));
-  return ProcessStatementStatus(parse_tree, ExecTreeNode(root_node));
+  RETURN_NOT_OK(audit_logger_.LogStatement(root_node, exec_context_->stmt(),
+                                           IsPrepare::kFalse));
+  Status s = ExecTreeNode(root_node);
+  if (!s.ok()) {
+    RETURN_NOT_OK(audit_logger_.LogStatementError(root_node, exec_context_->stmt(), s,
+                                                  ErrorIsFormatted::kFalse));
+  }
+  return ProcessStatementStatus(parse_tree, s);
 }
 
 //--------------------------------------------------------------------------------------------------
@@ -385,7 +399,7 @@ Status Executor::ExecPTNode(const PTCreateType *tnode) {
   std::vector<std::string> field_names;
   std::vector<std::shared_ptr<QLType>> field_types;
 
-  for (const PTTypeField::SharedPtr field : tnode->fields()->node_list()) {
+  for (const PTTypeField::SharedPtr& field : tnode->fields()->node_list()) {
     field_names.emplace_back(field->yb_name());
     field_types.push_back(field->ql_type());
   }
@@ -811,12 +825,27 @@ Status Executor::ExecPTNode(const PTSelectStmt *tnode, TnodeContext* tnode_conte
 
   // If there is an index to select from, execute it.
   if (tnode->child_select()) {
+    LOG_IF(DFATAL, result_) << "Expecting result is not yet initialized";
     const PTSelectStmt* child_select = tnode->child_select().get();
     TnodeContext* child_context = tnode_context->AddChildTnode(child_select);
     RETURN_NOT_OK(ExecPTNode(child_select, child_context));
     // If the index covers the SELECT query fully, we are done. Otherwise, continue to prepare
     // the SELECT from the table using the primary key to be returned from the index select.
     if (child_select->covers_fully()) {
+      return Status::OK();
+    }
+    // If the child uncovered index select has set result_ already it must have been able
+    // to guarantee an empty result (i.e. if WHERE clause guarantees no rows could match)
+    // so we can just return.
+    if (result_) {
+      LOG_IF(DFATAL, result_->type() != ExecutedResult::Type::ROWS)
+          << "Expecting result type is ROWS=" << static_cast<int>(ExecutedResult::Type::ROWS)
+          << ", got result type=" << static_cast<int>(result_->type());
+      auto rows_result = std::static_pointer_cast<RowsResult>(result_);
+      RSTATUS_DCHECK(rows_result->paging_state().empty(),
+                     Corruption, "Expecting result_ to be empty with empty paging state");
+      RSTATUS_DCHECK(rows_result->rows_data() == string(4, '\0'), // Encoded row_count == 0.
+                     Corruption, "Expecting result_ to be empty with result row_count equals 0");
       return Status::OK();
     }
   }
@@ -1060,6 +1089,7 @@ Result<bool> Executor::FetchMoreRows(const PTSelectStmt* tnode,
     if (op->request().return_paging_state()) {
       QLPagingStatePB paging_state;
       paging_state.set_total_num_rows_read(total_row_count);
+      paging_state.set_total_rows_skipped(total_rows_skipped);
       paging_state.set_total_rows_skipped(total_rows_skipped);
       paging_state.set_table_id(tnode->table()->id());
 
@@ -1487,6 +1517,14 @@ Status ProcessTnodeContexts(ExecContext* exec_context,
   return Status::OK();
 }
 
+bool NeedsFlush(const client::YBSessionPtr& session) {
+  // We need to flush session even if there are no buffered operations, but there are pending
+  // errors, since some errors are only checked during Session flush and inside flush callback.
+  // And buffered operations could be removed asynchronously after adding and replaced with pending
+  // errors as a result of asynchronous tablet lookup failures for these operations.
+  return session->CountBufferedOperations() + session->CountPendingErrors() > 0;
+}
+
 } // namespace
 
 void Executor::FlushAsync() {
@@ -1504,13 +1542,13 @@ void Executor::FlushAsync() {
   write_batch_.Clear();
   std::vector<std::pair<YBSessionPtr, ExecContext*>> flush_sessions;
   std::vector<ExecContext*> commit_contexts;
-  if (session_->CountBufferedOperations() > 0) {
+  if (NeedsFlush(session_)) {
     flush_sessions.push_back({session_, nullptr});
   }
   for (ExecContext& exec_context : exec_contexts_) {
     if (exec_context.HasTransaction()) {
       auto transactional_session = exec_context.transactional_session();
-      if (transactional_session->CountBufferedOperations() > 0) {
+      if (NeedsFlush(transactional_session)) {
         // In case or retry we should ignore values that could be written by previous attempts
         // of retried operation.
         transactional_session->SetInTxnLimit(transactional_session->read_point()->Now());
@@ -1583,9 +1621,14 @@ void Executor::FlushAsyncDone(Status s, ExecContext* exec_context) {
 
   // When any error occurs during the dispatching of YBOperation, YBSession saves the error and
   // returns IOError. When it happens, retrieves the errors and discard the IOError.
+
+  // We need temp variable here to have ownership of failed ops, so they don't get released
+  // concurrently.
+  client::CollectedErrors pending_errors;
   OpErrors op_errors;
   if (s.IsIOError()) {
-    for (const auto& error : session->GetPendingErrors()) {
+    pending_errors = session->GetAndClearPendingErrors();
+    for (const auto& error : pending_errors) {
       op_errors[static_cast<const client::YBqlOp*>(&error->failed_op())] = error->status();
     }
     s = Status::OK();
@@ -1657,7 +1700,7 @@ void Executor::ProcessAsyncResults(const bool rescheduled) {
   RETURN_STMT_NOT_OK(async_status_);
 
   // Go through each ExecContext and process async results.
-  bool has_buffered_ops = false;
+  bool need_flush = false;
   bool has_restart = false;
   const MonoTime now = (ql_metrics_ != nullptr) ? MonoTime::Now() : MonoTime();
   for (auto exec_itr = exec_contexts_.begin(); exec_itr != exec_contexts_.end(); ) {
@@ -1684,9 +1727,7 @@ void Executor::ProcessAsyncResults(const bool rescheduled) {
       YBSessionPtr session = GetSession(exec_context_);
       session->SetReadPoint(client::Restart::kTrue);
       RETURN_STMT_NOT_OK(ExecTreeNode(root));
-      if (session->CountBufferedOperations() > 0) {
-        has_buffered_ops = true;
-      }
+      need_flush |= NeedsFlush(session);
       exec_itr++;
       continue;
     }
@@ -1699,7 +1740,7 @@ void Executor::ProcessAsyncResults(const bool rescheduled) {
       const Result<bool> result = ProcessTnodeResults(&tnode_context);
       RETURN_STMT_NOT_OK(result);
       if (*result) {
-        has_buffered_ops = true;
+        need_flush = true;
       }
 
       // If this statement is restarted, stop traversing the rest of the statement tnodes.
@@ -1778,7 +1819,7 @@ void Executor::ProcessAsyncResults(const bool rescheduled) {
   // Since restart could happen multiple times, it is possible that we will do it recursively,
   // when local call is enabled.
   // So to avoid stack overflow we use reschedule in this case.
-  if ((has_buffered_ops || has_restart) && !rescheduled) {
+  if ((need_flush || has_restart) && !rescheduled) {
     rescheduler_->Reschedule(&flush_async_task_.Bind(this));
   } else {
     FlushAsync();
@@ -2074,8 +2115,10 @@ Status Executor::AddIndexWriteOps(const PTDmlStmt *tnode,
   for (const auto& index_table : tnode->pk_only_indexes()) {
     const IndexInfo* index =
         VERIFY_RESULT(tnode->table()->index_map().FindIndex(index_table->id()));
-    const bool index_ready_to_accept = (is_upsert ? index->AllowWrites() : index->AllowDelete());
+    const bool index_ready_to_accept = (is_upsert ? index->HasWritePermission()
+                                                  : index->HasDeletePermission());
     if (!index_ready_to_accept) {
+      VLOG(2) << "Index not ready to apply operaton " << index->ToString();
       // We are in the process of backfilling the index. It should not be updated with a
       // write/delete yet. The backfill stage will update the index for such entries.
       continue;
@@ -2225,7 +2268,10 @@ Status Executor::ProcessOpStatus(const PTDmlStmt* stmt,
   }
 
   if (resp.status() == QLResponsePB::YQL_STATUS_RESTART_REQUIRED_ERROR) {
-    return STATUS(TryAgain, resp.error_message());
+    auto s = STATUS(TryAgain, resp.error_message());
+    RETURN_NOT_OK(audit_logger_.LogStatementError(stmt, exec_context_->stmt(), s,
+                                                  ErrorIsFormatted::kFalse));
+    return s;
   }
 
   // If we got an error we need to manually produce a result in the op.
@@ -2255,7 +2301,10 @@ Status Executor::ProcessOpStatus(const PTDmlStmt* stmt,
   }
 
   const ErrorCode errcode = QLStatusToErrorCode(resp.status());
-  return exec_context->Error(stmt, resp.error_message().c_str(), errcode);
+  auto s = exec_context->Error(stmt, resp.error_message().c_str(), errcode);
+  RETURN_NOT_OK(audit_logger_.LogStatementError(stmt, exec_context_->stmt(), s,
+                                                ErrorIsFormatted::kTrue));
+  return s;
 }
 
 Status Executor::ProcessAsyncStatus(const OpErrors& op_errors, ExecContext* exec_context) {
@@ -2347,7 +2396,7 @@ void Executor::Reset() {
   exec_context_ = nullptr;
   exec_contexts_.clear();
   write_batch_.Clear();
-  session_->Abort();
+  session_->Reset();
   num_flushes_ = 0;
   result_ = nullptr;
   cb_.Reset();

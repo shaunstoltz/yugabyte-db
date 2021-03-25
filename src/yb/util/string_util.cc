@@ -58,16 +58,9 @@ vector<string> StringSplit(const string& arg, char delim) {
   stringstream ss(arg);
   string item;
   while (getline(ss, item, delim)) {
-    splits.push_back(item);
+    splits.push_back(std::move(item));
   }
   return splits;
-}
-
-std::string RightPadToWidth(const string& s, int w) {
-  int padding = w - s.size();
-  if (padding <= 0)
-    return s;
-  return s + string(padding, ' ');
 }
 
 bool StringEndsWith(const string& s, const char* end, size_t end_len, string* left) {

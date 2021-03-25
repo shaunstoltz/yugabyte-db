@@ -22,6 +22,7 @@
 
 #include "yb/common/hybrid_time.h"
 #include "yb/docdb/doc_key.h"
+#include "yb/docdb/doc_reader.h"
 #include "yb/docdb/docdb-internal.h"
 #include "yb/docdb/docdb.h"
 #include "yb/docdb/docdb_compaction_filter.h"
@@ -99,6 +100,10 @@ class NonTransactionalStatusProvider: public TransactionStatusManager {
   void FillPriorities(
       boost::container::small_vector_base<std::pair<TransactionId, uint64_t>>* inout) override {
     Fail();
+  }
+
+  HybridTime MinRunningHybridTime() const override {
+    return HybridTime::kMax;
   }
 
  private:
@@ -416,28 +421,26 @@ void DocDBLoadGenerator::PerformOperation(bool compact_history) {
       fixture_->FullyCompactHistoryBefore(hybrid_time);
     }
     SubDocKey sub_doc_key(doc_key);
-    SubDocument doc_from_rocksdb;
-    bool doc_found_in_rocksdb = false;
     auto encoded_sub_doc_key = sub_doc_key.EncodeWithoutHt();
-    GetSubDocumentData data = { encoded_sub_doc_key, &doc_from_rocksdb, &doc_found_in_rocksdb };
-    ASSERT_OK(GetSubDocument(doc_db(), data, rocksdb::kDefaultQueryId,
-                             txn_op_context, CoarseTimePoint::max() /* deadline */));
+    auto doc_from_rocksdb_opt = ASSERT_RESULT(TEST_GetSubDocument(
+      encoded_sub_doc_key, doc_db(), rocksdb::kDefaultQueryId, txn_op_context,
+      CoarseTimePoint::max() /* deadline */));
     if (is_deletion && (
             doc_path.num_subkeys() == 0 ||  // Deleted the entire sub-document,
             !doc_already_exists_in_mem)) {  // or the document did not exist in the first place.
       // In this case, after performing the deletion operation, we definitely should not see the
       // top-level document in RocksDB or in the in-memory database.
-      ASSERT_FALSE(doc_found_in_rocksdb);
+      ASSERT_FALSE(doc_from_rocksdb_opt);
       ASSERT_EQ(nullptr, subdoc_from_mem);
     } else {
       // This is not a deletion, or we've deleted a sub-key from a document, but the top-level
       // document should still be there in RocksDB.
-      ASSERT_TRUE(doc_found_in_rocksdb);
+      ASSERT_TRUE(doc_from_rocksdb_opt);
       ASSERT_NE(nullptr, subdoc_from_mem);
 
-      ASSERT_EQ(*subdoc_from_mem, doc_from_rocksdb);
-      DOCDB_DEBUG_LOG("Retrieved a document from RocksDB: $0", doc_from_rocksdb.ToString());
-      ASSERT_STR_EQ_VERBOSE_TRIMMED(subdoc_from_mem->ToString(), doc_from_rocksdb.ToString());
+      ASSERT_EQ(*subdoc_from_mem, *doc_from_rocksdb_opt);
+      DOCDB_DEBUG_LOG("Retrieved a document from RocksDB: $0", doc_from_rocksdb_opt->ToString());
+      ASSERT_STR_EQ_VERBOSE_TRIMMED(subdoc_from_mem->ToString(), doc_from_rocksdb_opt->ToString());
     }
   }
 
@@ -611,7 +614,7 @@ void DocDBRocksDBFixture::FullyCompactHistoryBefore(HybridTime history_cutoff) {
   });
 
   ASSERT_OK(FlushRocksDbAndWait());
-  ASSERT_OK(FullyCompactDB(rocksdb_.get()));
+  ASSERT_OK(FullyCompactDB(regular_db_.get()));
 }
 
 void DocDBRocksDBFixture::MinorCompaction(
@@ -626,7 +629,7 @@ void DocDBRocksDBFixture::MinorCompaction(
   });
 
   rocksdb::ColumnFamilyMetaData cf_meta;
-  rocksdb_->GetColumnFamilyMetaData(&cf_meta);
+  regular_db_->GetColumnFamilyMetaData(&cf_meta);
 
   vector<string> compaction_input_file_names;
   vector<string> remaining_file_names;
@@ -663,7 +666,7 @@ void DocDBRocksDBFixture::MinorCompaction(
               << "  files being compacted: " << yb::ToString(compaction_input_file_names) << "\n"
               << "  other files: " << yb::ToString(remaining_file_names);
 
-    ASSERT_OK(rocksdb_->CompactFiles(
+    ASSERT_OK(regular_db_->CompactFiles(
         rocksdb::CompactionOptions(),
         compaction_input_file_names,
         /* output_level */ 0));
@@ -680,7 +683,7 @@ void DocDBRocksDBFixture::MinorCompaction(
     }
   }
 
-  rocksdb_->GetColumnFamilyMetaData(&cf_meta);
+  regular_db_->GetColumnFamilyMetaData(&cf_meta);
   vector<string> files_after_compaction;
   for (const auto& sst_meta : cf_meta.levels[0].files) {
     files_after_compaction.push_back(sst_meta.name);
@@ -693,13 +696,13 @@ void DocDBRocksDBFixture::MinorCompaction(
 
 int DocDBRocksDBFixture::NumSSTableFiles() {
   rocksdb::ColumnFamilyMetaData cf_meta;
-  rocksdb_->GetColumnFamilyMetaData(&cf_meta);
+  regular_db_->GetColumnFamilyMetaData(&cf_meta);
   return cf_meta.levels[0].files.size();
 }
 
 StringVector DocDBRocksDBFixture::SSTableFileNames() {
   rocksdb::ColumnFamilyMetaData cf_meta;
-  rocksdb_->GetColumnFamilyMetaData(&cf_meta);
+  regular_db_->GetColumnFamilyMetaData(&cf_meta);
   StringVector files;
   for (const auto& sstable_meta : cf_meta.levels[0].files) {
     files.push_back(sstable_meta.name);

@@ -10,11 +10,11 @@
 
 package com.yugabyte.yw.commissioner.tasks;
 
+import com.yugabyte.yw.commissioner.Common.CloudType;
 import com.yugabyte.yw.commissioner.SubTaskGroupQueue;
 import com.yugabyte.yw.commissioner.UserTaskDetails.SubTaskGroupType;
 import com.yugabyte.yw.commissioner.tasks.params.NodeTaskParams;
 import com.yugabyte.yw.commissioner.tasks.subtasks.ChangeMasterConfig;
-import com.yugabyte.yw.commissioner.tasks.subtasks.WaitForDataMove;
 import com.yugabyte.yw.commissioner.tasks.subtasks.WaitForLoadBalance;
 import com.yugabyte.yw.common.DnsManager;
 import com.yugabyte.yw.common.PlacementInfoUtil;
@@ -22,8 +22,10 @@ import com.yugabyte.yw.forms.UniverseDefinitionTaskParams.UserIntent;
 import com.yugabyte.yw.models.Universe;
 import com.yugabyte.yw.models.helpers.NodeDetails;
 import com.yugabyte.yw.models.helpers.NodeDetails.NodeState;
+import com.yugabyte.yw.models.NodeInstance;
 
 import java.util.Arrays;
+import java.util.Collection;
 import java.util.HashSet;
 
 import org.slf4j.Logger;
@@ -46,6 +48,7 @@ public class ReleaseInstanceFromUniverse extends UniverseTaskBase {
     NodeDetails currentNode = null;
     boolean hitException = false;
     try {
+      checkUniverseVersion();
       // Create the task list sequence.
       subTaskGroupQueue = new SubTaskGroupQueue(userTaskUUID);
 
@@ -85,10 +88,23 @@ public class ReleaseInstanceFromUniverse extends UniverseTaskBase {
       createModifyBlackListTask(Arrays.asList(currentNode), false /* isAdd */)
           .setSubTaskGroupType(SubTaskGroupType.ReleasingInstance);
 
-      if (instanceExists(taskParams())) {
-        // Create tasks to terminate that instance.
-        createDestroyServerTasks(new HashSet<NodeDetails>(Arrays.asList(currentNode)), false, false)
-            .setSubTaskGroupType(SubTaskGroupType.ReleasingInstance);
+      boolean isOnprem = userIntent.providerType.equals(CloudType.onprem);
+      if (instanceExists(taskParams()) || isOnprem) {
+        Collection<NodeDetails> currentNodeDetails = new HashSet<>(Arrays.asList(currentNode));
+        if (isOnprem) {
+          // Stop master and tservers.
+          createStopServerTasks(currentNodeDetails, "master", true /* isForceDelete */)
+              .setSubTaskGroupType(SubTaskGroupType.StoppingNodeProcesses);
+          createStopServerTasks(currentNodeDetails, "tserver", true /* isForceDelete */)
+              .setSubTaskGroupType(SubTaskGroupType.StoppingNodeProcesses);
+        }
+
+        // Create tasks to terminate that instance. Force delete and ignore errors.
+        createDestroyServerTasks(
+          currentNodeDetails,
+          true /* isForceDelete */,
+          false /* deleteNode */
+        ).setSubTaskGroupType(SubTaskGroupType.ReleasingInstance);
       }
 
       // Update Node State to Decommissioned.

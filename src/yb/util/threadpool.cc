@@ -45,7 +45,10 @@
 #include "yb/gutil/stl_util.h"
 #include "yb/gutil/strings/substitute.h"
 #include "yb/gutil/sysinfo.h"
+
+#include "yb/util/debug/long_operation_tracker.h"
 #include "yb/util/errno.h"
+#include "yb/util/logging.h"
 #include "yb/util/metrics.h"
 #include "yb/util/stopwatch.h"
 #include "yb/util/thread.h"
@@ -325,6 +328,12 @@ Status ThreadPool::Init() {
   for (int i = 0; i < min_threads_; i++) {
     Status status = CreateThreadUnlocked();
     if (!status.ok()) {
+      if (i != 0) {
+        YB_LOG_EVERY_N_SECS(WARNING, 5) << "Cannot create thread: " << status << ", will try later";
+        // Cannot create enough threads now, will try later.
+        break;
+      }
+      unique_lock.Unlock();
       Shutdown();
       return status;
     }
@@ -474,14 +483,14 @@ Status ThreadPool::DoSubmit(const std::shared_ptr<Runnable> task, ThreadPoolToke
   if (additional_threads > 0 && num_threads_ < max_threads_) {
     Status status = CreateThreadUnlocked();
     if (!status.ok()) {
+      // If we failed to create a thread, but there are still some other
+      // worker threads, log a warning message and continue.
+      LOG(WARNING) << "Thread pool failed to create thread: " << status << ", num_threads: "
+                   << num_threads_ << ", max_threads: " << max_threads_;
       if (num_threads_ == 0) {
         // If we have no threads, we can't do any work.
         return status;
       }
-      // If we failed to create a thread, but there are still some other
-      // worker threads, log a warning message and continue.
-      LOG(WARNING) << "Thread pool failed to create thread: "
-                   << status.ToString();
     }
   }
 

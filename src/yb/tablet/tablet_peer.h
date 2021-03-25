@@ -44,10 +44,12 @@
 #include "yb/consensus/consensus_fwd.h"
 #include "yb/consensus/consensus_context.h"
 #include "yb/consensus/consensus_meta.h"
+#include "yb/consensus/consensus_types.h"
 #include "yb/consensus/log.h"
 #include "yb/gutil/callback.h"
 #include "yb/gutil/ref_counted.h"
 #include "yb/gutil/strings/substitute.h"
+#include "yb/gutil/thread_annotations.h"
 #include "yb/rpc/rpc_fwd.h"
 
 #include "yb/tablet/mvcc.h"
@@ -67,10 +69,6 @@ using yb::consensus::StateChangeContext;
 
 namespace yb {
 
-namespace consensus {
-class RaftConsensus;
-}
-
 namespace log {
 class LogAnchorRegistry;
 }
@@ -86,9 +84,50 @@ class ThreadPool;
 
 namespace tablet {
 
-class Operation;
+struct TabletOnDiskSizeInfo {
+  int64_t consensus_metadata_disk_size = 0;
+  int64_t wal_files_disk_size = 0;
+  int64_t sst_files_disk_size = 0;
+  int64_t uncompressed_sst_files_disk_size = 0;
+  int64_t sum_on_disk_size = 0;
 
-// A peer in a tablet consensus configuration, which coordinates writes to tablets.
+  template <class PB>
+  static TabletOnDiskSizeInfo FromPB(const PB& pb) {
+    return {
+      .consensus_metadata_disk_size = pb.consensus_metadata_disk_size(),
+      .wal_files_disk_size = pb.wal_files_disk_size(),
+      .sst_files_disk_size = pb.sst_files_disk_size(),
+      .uncompressed_sst_files_disk_size = pb.uncompressed_sst_files_disk_size(),
+      .sum_on_disk_size = pb.estimated_on_disk_size()
+    };
+  }
+
+  template <class PB>
+  void ToPB(PB* pb) const {
+    pb->set_consensus_metadata_disk_size(consensus_metadata_disk_size);
+    pb->set_wal_files_disk_size(wal_files_disk_size);
+    pb->set_sst_files_disk_size(sst_files_disk_size);
+    pb->set_uncompressed_sst_files_disk_size(uncompressed_sst_files_disk_size);
+    pb->set_estimated_on_disk_size(sum_on_disk_size);
+  }
+
+  void operator+=(const TabletOnDiskSizeInfo& other) {
+    consensus_metadata_disk_size += other.consensus_metadata_disk_size;
+    wal_files_disk_size += other.wal_files_disk_size;
+    sst_files_disk_size += other.sst_files_disk_size;
+    uncompressed_sst_files_disk_size += other.uncompressed_sst_files_disk_size;
+    sum_on_disk_size += other.sum_on_disk_size;
+  }
+
+  void RecomputeTotalSize() {
+    sum_on_disk_size =
+        consensus_metadata_disk_size +
+        sst_files_disk_size +
+        wal_files_disk_size;
+  }
+};
+
+// A peer is a tablet consensus configuration, which coordinates writes to tablets.
 // Each time Write() is called this class appends a new entry to a replicated
 // state machine through a consensus algorithm, which makes sure that other
 // peers see the same updates in the same order. In addition to this, this
@@ -100,27 +139,34 @@ class TabletPeer : public consensus::ConsensusContext,
  public:
   typedef std::map<int64_t, int64_t> MaxIdxToSegmentSizeMap;
 
-  TabletPeer(const RaftGroupMetadataPtr& meta,
-             const consensus::RaftPeerPB& local_peer_pb,
-             const scoped_refptr<server::Clock> &clock,
-             const std::string& permanent_uuid,
-             Callback<void(std::shared_ptr<StateChangeContext> context)> mark_dirty_clbk,
-             MetricRegistry* metric_registry);
+  // Creates TabletPeer.
+  // `tablet_splitter` will be used for applying split tablet Raft operation.
+  TabletPeer(
+      const RaftGroupMetadataPtr& meta,
+      const consensus::RaftPeerPB& local_peer_pb,
+      const scoped_refptr<server::Clock>& clock,
+      const std::string& permanent_uuid,
+      Callback<void(std::shared_ptr<StateChangeContext> context)> mark_dirty_clbk,
+      MetricRegistry* metric_registry,
+      TabletSplitter* tablet_splitter,
+      const std::shared_future<client::YBClient*>& client_future);
 
   ~TabletPeer();
 
   // Initializes the TabletPeer, namely creating the Log and initializing
   // Consensus.
-  CHECKED_STATUS InitTabletPeer(const TabletPtr& tablet,
-                                const std::shared_future<client::YBClient*>& client_future,
-                                const std::shared_ptr<MemTracker>& server_mem_tracker,
-                                rpc::Messenger* messenger,
-                                rpc::ProxyCache* proxy_cache,
-                                const scoped_refptr<log::Log> &log,
-                                const scoped_refptr<MetricEntity> &metric_entity,
-                                ThreadPool* raft_pool,
-                                ThreadPool* tablet_prepare_pool,
-                                consensus::RetryableRequests* retryable_requests);
+  // split_op_id is the ID of split tablet Raft operation requesting split of this tablet or unset.
+  CHECKED_STATUS InitTabletPeer(
+      const TabletPtr& tablet,
+      const std::shared_ptr<MemTracker>& server_mem_tracker,
+      rpc::Messenger* messenger,
+      rpc::ProxyCache* proxy_cache,
+      const scoped_refptr<log::Log>& log,
+      const scoped_refptr<MetricEntity>& metric_entity,
+      ThreadPool* raft_pool,
+      ThreadPool* tablet_prepare_pool,
+      consensus::RetryableRequests* retryable_requests,
+      const consensus::SplitOpInfo& split_op_info);
 
   // Starts the TabletPeer, making it available for Write()s. If this
   // TabletPeer is part of a consensus configuration this will connect it to other peers
@@ -155,8 +201,6 @@ class TabletPeer : public consensus::ConsensusContext,
 
   void Submit(std::unique_ptr<Operation> operation, int64_t term) override;
 
-  HybridTime Now() override;
-
   void UpdateClock(HybridTime hybrid_time) override;
 
   std::unique_ptr<UpdateTxnOperationState> CreateUpdateTransactionState(
@@ -169,7 +213,7 @@ class TabletPeer : public consensus::ConsensusContext,
 
   void GetLastReplicatedData(RemoveIntentsData* data) override;
 
-  void GetTabletStatusPB(TabletStatusPB* status_pb_out) const;
+  void GetTabletStatusPB(TabletStatusPB* status_pb_out);
 
   // Used by consensus to create and start a new ReplicaOperation.
   CHECKED_STATUS StartReplicaOperation(
@@ -280,7 +324,8 @@ class TabletPeer : public consensus::ConsensusContext,
     return clock_;
   }
 
-  bool Enqueue(rpc::ThreadPoolTask* task) override;
+  void Enqueue(rpc::ThreadPoolTask* task);
+  void StrandEnqueue(rpc::StrandTask* task) override;
 
   const std::shared_future<client::YBClient*>& client_future() const override {
     return client_future_;
@@ -338,12 +383,14 @@ class TabletPeer : public consensus::ConsensusContext,
 
   TableType table_type();
 
-  // Return the total on-disk size of this tablet replica, in bytes.
-  // Caller should hold the lock_.
-  uint64_t OnDiskSize() const;
+  // Return granular types of on-disk size of this tablet replica, in bytes.
+  TabletOnDiskSizeInfo GetOnDiskSizeInfo() const REQUIRES(lock_);
 
   // Returns the number of segments in log_.
   int GetNumLogSegments() const;
+
+  // Might update the can_be_deleted_.
+  bool CanBeDeleted();
 
   std::string LogPrefix() const;
 
@@ -425,6 +472,7 @@ class TabletPeer : public consensus::ConsensusContext,
   const std::string permanent_uuid_;
 
   std::atomic<rpc::ThreadPool*> service_thread_pool_{nullptr};
+  AtomicUniquePtr<rpc::Strand> strand_;
 
   OperationCounter preparing_operations_counter_;
 
@@ -434,14 +482,15 @@ class TabletPeer : public consensus::ConsensusContext,
   MonoTime cdc_min_replicated_index_refresh_time_ = MonoTime::Min();
 
  private:
-  HybridTime ReportReadRestart() override;
+  Result<HybridTime> ReportReadRestart() override;
 
-  FixedHybridTimeLease HybridTimeLease(MicrosTime min_allowed, CoarseTimePoint deadline);
-  HybridTime PreparePeerRequest() override;
+  Result<FixedHybridTimeLease> HybridTimeLease(HybridTime min_allowed, CoarseTimePoint deadline);
+  Result<HybridTime> PreparePeerRequest() override;
   void MajorityReplicated() override;
   void ChangeConfigReplicated(const consensus::RaftConfigPB& config) override;
   uint64_t NumSSTFiles() override;
   void ListenNumSSTFilesChanged(std::function<void()> listener) override;
+  rpc::Scheduler& scheduler() const override;
 
   MetricRegistry* metric_registry_;
 
@@ -449,7 +498,16 @@ class TabletPeer : public consensus::ConsensusContext,
     return LeaderTerm() != OpId::kUnknownTerm;
   }
 
+  TabletSplitter* tablet_splitter_;
+
+  // can_be_deleted_ is set to true if tablet can be deleted (all replicas have been split and
+  // tablet is no longer needed). After setting to true it will stay that way forever until
+  // TabletPeer is destroyed.
+  std::atomic<bool> can_be_deleted_ = {false};
+
   std::shared_future<client::YBClient*> client_future_;
+
+  rpc::Messenger* messenger_;
 
   DISALLOW_COPY_AND_ASSIGN(TabletPeer);
 };

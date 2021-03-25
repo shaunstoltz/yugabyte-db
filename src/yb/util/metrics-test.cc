@@ -66,6 +66,28 @@ class MetricsTest : public YBTest {
   }
 
  protected:
+  template <class LagType>
+  void DoLagTest(const MillisLagPrototype& metric) {
+    scoped_refptr<LagType> lag = new LagType(&metric);
+    ASSERT_EQ(metric.description(), lag->prototype()->description());
+    SleepFor(MonoDelta::FromMilliseconds(500));
+    // Internal timestamp is set to the time when the metric was created.
+    // So this lag is measure of the time elapsed since the metric was
+    // created and the check time.
+    ASSERT_GE(lag->lag_ms(), 500);
+    auto now_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+        std::chrono::system_clock::now().time_since_epoch()).count();
+    lag->UpdateTimestampInMilliseconds(now_ms);
+    // Verify that the update happened correctly. The lag time should
+    // be close to 0, but giving it extra time to account for slow
+    // tests.
+    ASSERT_LT(lag->lag_ms(), 200);
+    // Set the timestamp to some time in the future to verify that the
+    // metric can correctly deal with this case.
+    lag->UpdateTimestampInMilliseconds(now_ms * 2);
+    ASSERT_EQ(0, lag->lag_ms());
+  }
+
   MetricRegistry registry_;
   scoped_refptr<MetricEntity> entity_;
 };
@@ -82,6 +104,17 @@ TEST_F(MetricsTest, SimpleCounterTest) {
   ASSERT_EQ(1, requests->value());
   requests->IncrementBy(2);
   ASSERT_EQ(3, requests->value());
+}
+
+METRIC_DEFINE_lag(test_entity, lag_simple, "Test MillisLag", "Test MillisLag Description");
+TEST_F(MetricsTest, SimpleLagTest) {
+  ASSERT_NO_FATALS(DoLagTest<MillisLag>(METRIC_lag_simple));
+}
+
+METRIC_DEFINE_lag(test_entity, atomic_lag_simple, "Test Atomic MillisLag",
+                  "Test Atomic MillisLag Description");
+TEST_F(MetricsTest, SimpleAtomicLagTest) {
+  ASSERT_NO_FATALS(DoLagTest<AtomicMillisLag>(METRIC_atomic_lag_simple));
 }
 
 METRIC_DEFINE_gauge_uint64(test_entity, fake_memory_usage, "Memory Usage",
@@ -345,6 +378,7 @@ TEST_F(MetricsTest, TestDumpJsonPrototypes) {
     "            \"type\": \"gauge\",\n"
     "            \"unit\": \"bytes\",\n"
     "            \"description\": \"Test Gauge 2\",\n"
+    "            \"level\": \"info\",\n"
     "            \"entity_type\": \"test_entity\"\n"
     "        }";
   ASSERT_STR_CONTAINS(json, expected);

@@ -47,6 +47,7 @@
 #include "yb/client/callbacks.h"
 #include "yb/client/client.h"
 #include "yb/client/client-internal.h"
+#include "yb/client/client_error.h"
 #include "yb/client/error_collector.h"
 #include "yb/client/in_flight_op.h"
 #include "yb/client/meta_cache.h"
@@ -69,6 +70,9 @@
 // status of batch. Useful in tests, when we don't need complex error analysis.
 DEFINE_test_flag(bool, combine_batcher_errors, false,
                  "Whether combine errors into batcher status.");
+DEFINE_test_flag(double, simulate_tablet_lookup_does_not_match_partition_key_probability, 0.0,
+                 "Probability for simulating the error that happens when a key is not in the key "
+                 "range of the resolved tablet's partition.");
 
 using std::pair;
 using std::set;
@@ -91,7 +95,7 @@ namespace internal {
 // TODO: instead of using a string error message, make Batcher return a status other than IOError.
 // (https://github.com/YugaByte/yugabyte-db/issues/702)
 const std::string Batcher::kErrorReachingOutToTServersMsg(
-    "Errors occured while reaching out to the tablet servers");
+    "Errors occurred while reaching out to the tablet servers");
 
 // About lock ordering in this file:
 // ------------------------------
@@ -136,7 +140,7 @@ void Batcher::Abort(const Status& status) {
     }
 
     for (auto& op : to_abort) {
-      VLOG(1) << "Aborting op: " << op->ToString();
+      VLOG_WITH_PREFIX(1) << "Aborting op: " << op->ToString();
       MarkInFlightOpFailedUnlocked(op, status);
     }
 
@@ -151,9 +155,9 @@ void Batcher::Abort(const Status& status) {
 Batcher::~Batcher() {
   if (PREDICT_FALSE(!ops_.empty())) {
     for (auto& op : ops_) {
-      LOG(ERROR) << "Orphaned op: " << op->ToString();
+      LOG_WITH_PREFIX(ERROR) << "Orphaned op: " << op->ToString();
     }
-    LOG(FATAL) << "ops_ not empty";
+    LOG_WITH_PREFIX(FATAL) << "ops_ not empty";
   }
   CHECK(state_ == BatcherState::kComplete || state_ == BatcherState::kAborted)
       << "Bad state: " << state_;
@@ -200,7 +204,8 @@ void Batcher::CheckForFinishedFlush() {
 
     if (state_ != BatcherState::kResolvingTablets &&
         state_ != BatcherState::kTransactionReady) {
-      LOG(DFATAL) << "Batcher finished in a wrong state: " << state_;
+      LOG_WITH_PREFIX(DFATAL) << "Batcher finished in a wrong state: " << AsString(state_) << "\n"
+                              << GetStackTrace();
       return;
     }
 
@@ -277,10 +282,20 @@ void Batcher::FlushAsync(StatusFunctor callback) {
 }
 
 Status Batcher::Add(shared_ptr<YBOperation> yb_op) {
+  if (state() != BatcherState::kGatheringOps) {
+    const auto error =
+        STATUS_FORMAT(InternalError, "Adding op to batcher in a wrong state: $0", state_);
+    LOG(DFATAL) << error << "\n" << GetStackTrace();
+    return error;
+  }
   // As soon as we get the op, start looking up where it belongs,
   // so that when the user calls Flush, we are ready to go.
   auto in_flight_op = std::make_shared<InFlightOp>(yb_op);
   RETURN_NOT_OK(yb_op->GetPartitionKey(&in_flight_op->partition_key));
+
+  if (VERIFY_RESULT(yb_op->MaybeRefreshTablePartitionList())) {
+    client_->data_->meta_cache_->InvalidateTableCache(*yb_op->table());
+  }
 
   if (yb_op->table()->partition_schema().IsHashPartitioning()) {
     switch (yb_op->type()) {
@@ -316,7 +331,9 @@ Status Batcher::Add(shared_ptr<YBOperation> yb_op) {
   }
 
   AddInFlightOp(in_flight_op);
-  VLOG(3) << "Looking up tablet for " << in_flight_op->yb_op->ToString();
+  VLOG_WITH_PREFIX(3) << "Looking up tablet for " << in_flight_op->yb_op->ToString()
+                      << " partition key: "
+                      << Slice(in_flight_op->partition_key).ToDebugHexString();
 
   if (yb_op->tablet()) {
     TabletLookupFinished(std::move(in_flight_op), yb_op->tablet());
@@ -348,7 +365,7 @@ bool Batcher::IsAbortedUnlocked() const {
 
 void Batcher::CombineErrorUnlocked(const InFlightOpPtr& in_flight_op, const Status& status) {
   error_collector_->AddError(in_flight_op->yb_op, status);
-  if (FLAGS_combine_batcher_errors) {
+  if (FLAGS_TEST_combine_batcher_errors) {
     if (combined_error_.ok()) {
       combined_error_ = status.CloneAndPrepend(in_flight_op->ToString());
     } else if (!combined_error_.IsCombined() && combined_error_.code() != status.code()) {
@@ -361,12 +378,20 @@ void Batcher::CombineErrorUnlocked(const InFlightOpPtr& in_flight_op, const Stat
 void Batcher::MarkInFlightOpFailedUnlocked(const InFlightOpPtr& in_flight_op, const Status& s) {
   CHECK_EQ(1, ops_.erase(in_flight_op)) << "Could not remove op " << in_flight_op->ToString()
                                         << " from in-flight list";
-
+  if (ClientError(s) == ClientErrorCode::kTablePartitionListIsStale) {
+    // MetaCache returns ClientErrorCode::kTablePartitionListIsStale error for tablet lookup request
+    // in case GetTabletLocations from master returns newer version of table partitions.
+    // Since MetaCache has no write access to YBTable, it just returns an error which we receive
+    // here and mark the table partitions as stale, so they will be refetched on retry.
+    // TODO(tsplit): handle splitting-related retries on YB level instead of returning back to
+    // client app/driver.
+    in_flight_op->yb_op->MarkTablePartitionListAsStale();
+  }
   CombineErrorUnlocked(in_flight_op, s);
 }
 
 void Batcher::TabletLookupFinished(
-    InFlightOpPtr op, const Result<internal::RemoteTabletPtr>& lookup_result) {
+    InFlightOpPtr op, Result<internal::RemoteTabletPtr> lookup_result) {
   // Acquire the batcher lock early to atomically:
   // 1. Test if the batcher was aborted, and
   // 2. Change the op state.
@@ -379,24 +404,24 @@ void Batcher::TabletLookupFinished(
     all_lookups_finished = outstanding_lookups_ == 0;
 
     if (IsAbortedUnlocked()) {
-      VLOG(1) << "Aborted batch: TabletLookupFinished for " << op->yb_op->ToString();
+      VLOG_WITH_PREFIX(1) << "Aborted batch: TabletLookupFinished for " << op->yb_op->ToString();
       MarkInFlightOpFailedUnlocked(op, STATUS(Aborted, "Batch aborted"));
       // 'op' is deleted by above function.
       return;
     }
 
     if (state_ != BatcherState::kResolvingTablets && state_ != BatcherState::kGatheringOps) {
-      LOG(DFATAL) << "Lookup finished in wrong state: " << ToString(state_);
+      LOG_WITH_PREFIX(DFATAL) << "Lookup finished in wrong state: " << ToString(state_);
       return;
     }
 
     if (lookup_result.ok()) {
       op->tablet = *lookup_result;
-#ifndef NDEBUG
+
       const Partition& partition = op->tablet->partition();
 
       bool partition_contains_row = false;
-      std::string partition_key;
+      const auto& partition_key = op->partition_key;
       switch (op->yb_op->type()) {
         case YBOperation::QL_READ: FALLTHROUGH_INTENDED;
         case YBOperation::QL_WRITE: FALLTHROUGH_INTENDED;
@@ -404,25 +429,30 @@ void Batcher::TabletLookupFinished(
         case YBOperation::PGSQL_WRITE: FALLTHROUGH_INTENDED;
         case YBOperation::REDIS_READ: FALLTHROUGH_INTENDED;
         case YBOperation::REDIS_WRITE: {
-          CHECK_OK(op->yb_op->GetPartitionKey(&partition_key));
           partition_contains_row = partition.ContainsKey(partition_key);
           break;
         }
       }
 
-      if (!partition_contains_row) {
+      if (!partition_contains_row ||
+          (PREDICT_FALSE(
+              RandomActWithProbability(
+                  FLAGS_TEST_simulate_tablet_lookup_does_not_match_partition_key_probability) &&
+              op->yb_op->table()->name().namespace_name() == "yb_test"))) {
         const Schema& schema = GetSchema(op->yb_op->table()->schema());
         const PartitionSchema& partition_schema = op->yb_op->table()->partition_schema();
-        LOG(DFATAL)
-            << "Row " << op->yb_op->ToString()
-            << " not in partition " << partition_schema.PartitionDebugString(partition, schema)
-            << " partition_key: '" << Slice(partition_key).ToDebugHexString() << "'";
+        const auto msg = Format(
+            "Row $0 not in partition $1, partition key: $2",
+            op->yb_op->ToString(),
+            partition_schema.PartitionDebugString(partition, schema),
+            Slice(partition_key).ToDebugHexString());
+        LOG_WITH_PREFIX(DFATAL) << msg;
+        lookup_result = STATUS(InternalError, msg);
       }
-#endif
     }
 
-    VLOG(3) << "TabletLookupFinished for " << op->yb_op->ToString() << ": " << lookup_result
-            << ", outstanding lookups: " << outstanding_lookups_;
+    VLOG_WITH_PREFIX(3) << "TabletLookupFinished for " << op->yb_op->ToString() << ": "
+                        << lookup_result << ", outstanding lookups: " << outstanding_lookups_;
 
     if (lookup_result.ok()) {
       CHECK(*lookup_result);
@@ -432,7 +462,8 @@ void Batcher::TabletLookupFinished(
           expected_state, InFlightOpState::kBufferedToTabletServer, std::memory_order_acq_rel)) {
         ops_queue_.push_back(op);
       } else {
-        LOG(DFATAL) << "Finished lookup for operation in a bad state: " << ToString(expected_state);
+        LOG_WITH_PREFIX(DFATAL) << "Finished lookup for operation in a bad state: "
+                                << ToString(expected_state);
       }
     } else {
       MarkInFlightOpFailedUnlocked(op, lookup_result.status());
@@ -467,11 +498,18 @@ void Batcher::FlushBuffersIfReady() {
     if (outstanding_lookups_ != 0) {
       // FlushBuffersIfReady is also invoked when all lookups finished, so it ok to just return
       // here.
-      VLOG(3) << "FlushBuffersIfReady: " << outstanding_lookups_ << " ops still in lookup";
+      VLOG_WITH_PREFIX(3) << "FlushBuffersIfReady: " << outstanding_lookups_
+                          << " ops still in lookup";
       return;
     }
 
     if (state_ != BatcherState::kResolvingTablets) {
+      return;
+    }
+
+    if (ops_queue_.empty()) {
+      // Nothing to prepare.
+      state_ = BatcherState::kTransactionReady;
       return;
     }
 
@@ -494,6 +532,21 @@ void Batcher::FlushBuffersIfReady() {
     return lhs->tablet.get() < rhs->tablet.get();
   });
 
+  auto group_start = ops_queue_.begin();
+  auto current_group = (**group_start).yb_op->group();
+  const auto* current_tablet = (**group_start).tablet.get();
+  for (auto it = group_start; it != ops_queue_.end(); ++it) {
+    const auto it_group = (**it).yb_op->group();
+    const auto* it_tablet = (**it).tablet.get();
+    if (current_tablet != it_tablet || current_group != it_group) {
+      ops_info_.groups.emplace_back(group_start, it);
+      group_start = it;
+      current_group = it_group;
+      current_tablet = it_tablet;
+    }
+  }
+  ops_info_.groups.emplace_back(group_start, ops_queue_.end());
+
   ExecuteOperations(Initial::kTrue);
 }
 
@@ -505,12 +558,11 @@ void Batcher::ExecuteOperations(Initial initial) {
     //
     // If transaction is not yet ready to do it, then it will notify as via provided when
     // it could be done.
-    if (!transaction->Prepare(ops_queue_,
+    if (!transaction->Prepare(&ops_info_,
                               force_consistent_read_,
                               deadline_,
                               initial,
-                              std::bind(&Batcher::TransactionReady, this, _1, BatcherPtr(this)),
-                              &transaction_metadata_)) {
+                              std::bind(&Batcher::TransactionReady, this, _1, BatcherPtr(this)))) {
       return;
     }
   }
@@ -536,39 +588,30 @@ void Batcher::ExecuteOperations(Initial initial) {
   const size_t ops_number = ops_queue_.size();
 
   // Use big enough value for preallocated storage, to avoid unnecessary allocations.
-  boost::container::small_vector<std::shared_ptr<AsyncRpc>, 40> rpcs;
+  boost::container::small_vector<std::shared_ptr<AsyncRpc>,
+                                 InFlightOpsGroupsWithMetadata::kPreallocatedCapacity> rpcs;
+  rpcs.reserve(ops_info_.groups.size());
 
-  // Now flush the ops for each tablet.
-  auto start = ops_queue_.begin();
-  auto start_group = (**start).yb_op->group();
-  for (auto it = start; it != ops_queue_.end(); ++it) {
-    auto it_group = (**it).yb_op->group();
-    // Aggregate and flush the ops so far if either:
-    //   - we reached the next tablet or group
-    if ((**it).tablet.get() != (**start).tablet.get() ||
-        start_group != it_group) {
-      // Consistent read is not required when whole batch fits into one command.
-      bool need_consistent_read = force_consistent_read || start != ops_queue_.begin() ||
-                                  it != ops_queue_.end();
-      rpcs.push_back(CreateRpc(
-          start->get()->tablet.get(), start, it, /* allow_local_calls_in_curr_thread */ false,
-          need_consistent_read));
-      start = it;
-      start_group = it_group;
-    }
-  }
-
+  // Now flush the ops for each group.
   // Consistent read is not required when whole batch fits into one command.
-  bool need_consistent_read = force_consistent_read || start != ops_queue_.begin();
-  rpcs.push_back(CreateRpc(
-      start->get()->tablet.get(), start, ops_queue_.end(),
-      allow_local_calls_in_curr_thread_, need_consistent_read));
+  const auto need_consistent_read = force_consistent_read || ops_info_.groups.size() > 1;
+
+  for (const auto& group : ops_info_.groups) {
+    // Allow local calls for last group only.
+    const auto allow_local_calls =
+        allow_local_calls_in_curr_thread_ && (&group == &ops_info_.groups.back());
+    rpcs.push_back(CreateRpc(
+        group.begin->get()->tablet.get(), group, allow_local_calls, need_consistent_read));
+  }
 
   LOG_IF(DFATAL, ops_number != ops_queue_.size())
     << "Ops queue was modified while creating RPCs";
   ops_queue_.clear();
 
   for (const auto& rpc : rpcs) {
+    if (transaction) {
+      transaction->trace()->AddChildTrace(rpc->trace());
+    }
     rpc->SendRpc();
   }
 }
@@ -603,12 +646,12 @@ void Batcher::RequestFinished(const TabletId& tablet_id, RetryableRequestId requ
 }
 
 std::shared_ptr<AsyncRpc> Batcher::CreateRpc(
-    RemoteTablet* tablet, InFlightOps::const_iterator begin, InFlightOps::const_iterator end,
+    RemoteTablet* tablet, const InFlightOpsGroup& group,
     const bool allow_local_calls_in_curr_thread, const bool need_consistent_read) {
-  VLOG(3) << "FlushBuffersIfReady: already in flushing state, immediately flushing to "
-          << tablet->tablet_id();
+  VLOG_WITH_PREFIX(3) << "FlushBuffersIfReady: already in flushing state, immediately flushing to "
+                      << tablet->tablet_id();
 
-  CHECK(begin != end);
+  CHECK(group.begin != group.end);
 
   // Create and send an RPC that aggregates the ops. The RPC is freed when
   // its callback completes.
@@ -618,15 +661,22 @@ std::shared_ptr<AsyncRpc> Batcher::CreateRpc(
 
   // Split the read operations according to consistency levels since based on consistency
   // levels the read algorithm would differ.
-  InFlightOps ops(begin, end);
-  auto op_group = (**begin).yb_op->group();
-  AsyncRpcData data{this, tablet, allow_local_calls_in_curr_thread, need_consistent_read,
-                    write_with_hybrid_time_, std::move(ops)};
+  const auto op_group = (**group.begin).yb_op->group();
+  AsyncRpcData data {
+    .batcher = this,
+    .tablet = tablet,
+    .allow_local_calls_in_curr_thread = allow_local_calls_in_curr_thread,
+    .need_consistent_read = need_consistent_read,
+    .write_time_for_backfill_ = hybrid_time_for_write_,
+    .ops = InFlightOps(group.begin, group.end),
+    .need_metadata = group.need_metadata
+  };
+
   switch (op_group) {
     case OpGroup::kWrite:
       return std::make_shared<WriteRpc>(&data);
     case OpGroup::kLeaderRead:
-      return std::make_shared<ReadRpc>(&data);
+      return std::make_shared<ReadRpc>(&data, YBConsistencyLevel::STRONG);
     case OpGroup::kConsistentPrefixRead:
       return std::make_shared<ReadRpc>(&data, YBConsistencyLevel::CONSISTENT_PREFIX);
   }
@@ -639,7 +689,7 @@ void Batcher::AddOpCountMismatchError() {
   // TODO: how to handle this kind of error where the array of response PB's don't match
   //       the size of the array of requests. We don't have a specific YBOperation to
   //       create an error with, because there are multiple YBOps in one Rpc.
-  LOG(DFATAL) << "Received wrong number of responses compared to request(s) sent.";
+  LOG_WITH_PREFIX(DFATAL) << "Received wrong number of responses compared to request(s) sent.";
 }
 
 void Batcher::RemoveInFlightOpsAfterFlushing(
@@ -666,8 +716,8 @@ void Batcher::ProcessRpcStatus(const AsyncRpc &rpc, const Status &s) {
   // "aborted" state.
   std::lock_guard<decltype(mutex_)> lock(mutex_);
   if (state_ != BatcherState::kTransactionReady) {
-    LOG(DFATAL) << "ProcessRpcStatus in wrong state " << ToString(state_) << ": " << rpc.ToString()
-                << ", " << s;
+    LOG_WITH_PREFIX(DFATAL) << "ProcessRpcStatus in wrong state " << ToString(state_) << ": "
+                            << rpc.ToString() << ", " << s;
     return;
   }
 
@@ -696,15 +746,16 @@ void Batcher::ProcessWriteResponse(const WriteRpc &rpc, const Status &s) {
     // like the tablet not being hosted?
 
     if (err_pb.row_index() >= rpc.ops().size()) {
-      LOG(ERROR) << "Received a per_row_error for an out-of-bound op index "
-                 << err_pb.row_index() << " (sent only "
-                 << rpc.ops().size() << " ops)";
-      LOG(ERROR) << "Response from tablet " << rpc.tablet().tablet_id() << ":\n"
+      LOG_WITH_PREFIX(ERROR) << "Received a per_row_error for an out-of-bound op index "
+                             << err_pb.row_index() << " (sent only "
+                             << rpc.ops().size() << " ops)";
+      LOG_WITH_PREFIX(ERROR) << "Response from tablet " << rpc.tablet().tablet_id() << ":\n"
                  << rpc.resp().DebugString();
       continue;
     }
     shared_ptr<YBOperation> yb_op = rpc.ops()[err_pb.row_index()]->yb_op;
-    VLOG(1) << "Error on op " << yb_op->ToString() << ": " << err_pb.error().ShortDebugString();
+    VLOG_WITH_PREFIX(1) << "Error on op " << yb_op->ToString() << ": "
+                        << err_pb.error().ShortDebugString();
     std::lock_guard<decltype(mutex_)> lock(mutex_);
     CombineErrorUnlocked(rpc.ops()[err_pb.row_index()], StatusFromPB(err_pb.error()));
   }
@@ -716,6 +767,16 @@ double Batcher::RejectionScore(int attempt_num) {
   }
 
   return rejection_score_source_->Get(attempt_num);
+}
+
+std::string Batcher::LogPrefix() const {
+  const void* self = this;
+  return Format("Batcher ($0): ", self);
+}
+
+BatcherState Batcher::state() const {
+  std::lock_guard<decltype(mutex_)> lock(mutex_);
+  return state_;
 }
 
 }  // namespace internal

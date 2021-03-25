@@ -92,6 +92,12 @@ void YBSession::Abort() {
   }
 }
 
+void YBSession::Reset() {
+  Abort();
+  error_collector_->ClearErrors();
+  is_failed_ = false;
+}
+
 Status YBSession::Close(bool force) {
   if (batcher_) {
     if (batcher_->HasPendingOperations() && !force) {
@@ -112,6 +118,7 @@ void YBSession::SetTimeout(MonoDelta timeout) {
 }
 
 Status YBSession::Flush() {
+  RETURN_NOT_OK(CheckIfFailed());
   Synchronizer s;
   FlushAsync(s.AsStatusFunctor());
   return s.Wait();
@@ -186,10 +193,10 @@ ConsistentReadPoint* YBSession::read_point() {
   return transaction_ ? &transaction_->read_point() : read_point_.get();
 }
 
-void YBSession::WriteWithHybridTime(HybridTime ht) {
+void YBSession::SetHybridTimeForWrite(const HybridTime ht) {
   hybrid_time_for_write_ = ht;
   if (batcher_) {
-    batcher_->WriteWithHybridTime(hybrid_time_for_write_);
+    batcher_->SetHybridTimeForWrite(hybrid_time_for_write_);
   }
 }
 
@@ -203,15 +210,21 @@ internal::Batcher& YBSession::Batcher() {
     }
     batcher_->SetRejectionScoreSource(rejection_score_source_);
     if (hybrid_time_for_write_.is_valid()) {
-      batcher_->WriteWithHybridTime(hybrid_time_for_write_);
+      batcher_->SetHybridTimeForWrite(hybrid_time_for_write_);
     }
   }
   return *batcher_;
 }
 
+Status YBSession::CheckIfFailed() {
+  return is_failed_ ? STATUS(IllegalState, "Session failed") : Status::OK();
+}
+
 Status YBSession::Apply(YBOperationPtr yb_op) {
+  RETURN_NOT_OK(CheckIfFailed());
   Status s = Batcher().Add(yb_op);
   if (!PREDICT_FALSE(s.ok())) {
+    is_failed_ = true;
     error_collector_->AddError(yb_op, s);
     return s;
   }
@@ -226,10 +239,12 @@ Status YBSession::ApplyAndFlush(YBOperationPtr yb_op) {
 }
 
 Status YBSession::Apply(const std::vector<YBOperationPtr>& ops) {
+  RETURN_NOT_OK(CheckIfFailed());
   auto& batcher = Batcher();
   for (const auto& op : ops) {
     Status s = batcher.Add(op);
     if (!PREDICT_FALSE(s.ok())) {
+      is_failed_ = true;
       error_collector_->AddError(op, s);
       return s;
     }
@@ -274,8 +289,8 @@ int YBSession::CountPendingErrors() const {
   return error_collector_->CountErrors();
 }
 
-CollectedErrors YBSession::GetPendingErrors() {
-  return error_collector_->GetErrors();
+CollectedErrors YBSession::GetAndClearPendingErrors() {
+  return error_collector_->GetAndClearErrors();
 }
 
 void YBSession::SetForceConsistentRead(ForceConsistentRead value) {

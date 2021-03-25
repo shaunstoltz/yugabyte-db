@@ -36,7 +36,6 @@
 #include "yb/rocksdb/metadata.h"
 #include "yb/rocksdb/options.h"
 #include "yb/rocksdb/snapshot.h"
-#include "yb/rocksdb/thread_status.h"
 #include "yb/rocksdb/transaction_log.h"
 #include "yb/rocksdb/types.h"
 #include "yb/util/result.h"
@@ -901,6 +900,9 @@ class DB {
   }
 
   virtual bool NeedsDelay() { return false; }
+
+  // Returns approximate middle key (see Version::GetMiddleKey).
+  virtual yb::Result<std::string> GetMiddleKey() = 0;
 
   // Used in testing to make the old memtable immutable and start writing to a new one.
   virtual void TEST_SwitchMemtable() {}

@@ -142,6 +142,11 @@ class MasterTestBase : public YBTest {
                           const TableName& table_name,
                           const Schema& schema);
 
+  Status CreateTablegroupTable(const NamespaceId& namespace_id,
+                               const TableName& table_name,
+                               const TablegroupId& tablegroup_id,
+                               const Schema& schema);
+
   Status DoCreateTable(const NamespaceName& namespace_name,
                        const TableName& table_name,
                        const Schema& schema,
@@ -167,6 +172,16 @@ class MasterTestBase : public YBTest {
                          const TableName& table_name,
                          TableId* table_id);
 
+  Status CreateTablegroup(const TablegroupId& tablegroup_id,
+                          const NamespaceId& namespace_id,
+                          const NamespaceName& namespace_name);
+
+  Status DeleteTablegroup(const TablegroupId& tablegroup_id,
+                          const NamespaceId& namespace_id);
+
+  void DoListTablegroups(const ListTablegroupsRequestPB& req,
+                         ListTablegroupsResponsePB* resp);
+
   void DoListAllNamespaces(ListNamespacesResponsePB* resp);
   void DoListAllNamespaces(const boost::optional<YQLDatabase>& database_type,
                            ListNamespacesResponsePB* resp);
@@ -175,12 +190,19 @@ class MasterTestBase : public YBTest {
   Status CreateNamespace(const NamespaceName& ns_name,
                          const boost::optional<YQLDatabase>& database_type,
                          CreateNamespaceResponsePB* resp);
+  Status CreateNamespaceAsync(const NamespaceName& ns_name,
+                              const boost::optional<YQLDatabase>& database_type,
+                              CreateNamespaceResponsePB* resp);
+  Status CreateNamespaceWait(const NamespaceId& ns_id,
+                             const boost::optional<YQLDatabase>& database_type);
 
   Status AlterNamespace(const NamespaceName& ns_name,
                         const NamespaceId& ns_id,
                         const boost::optional<YQLDatabase>& database_type,
                         const std::string& new_name,
                         AlterNamespaceResponsePB* resp);
+
+  Status DeleteNamespaceWait(IsDeleteNamespaceDoneRequestPB const& del_req);
 
   RpcController* ResetAndGetController() {
     controller_->Reset();
@@ -198,6 +220,18 @@ class MasterTestBase : public YBTest {
     }
 
     ASSERT_EQ(namespaces.namespaces_size(), namespace_info.size());
+  }
+
+  bool FindNamespace(const std::tuple<NamespaceName, NamespaceId>& namespace_info,
+                     const ListNamespacesResponsePB& namespaces) {
+    for (int i = 0; i < namespaces.namespaces_size(); i++) {
+      auto cur_ns = std::make_tuple(namespaces.namespaces(i).name(),
+                                    namespaces.namespaces(i).id());
+      if (cur_ns == namespace_info) {
+        return true; // found!
+      }
+    }
+    return false; // namespace not found.
   }
 
   void CheckTables(

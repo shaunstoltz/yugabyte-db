@@ -97,6 +97,8 @@ DEFINE_test_flag(int32, simulate_long_remote_bootstrap_sec, 0,
                  "We use this for testing a scenario where a remote bootstrap takes longer than "
                  "follower_unavailable_considered_failed_sec seconds.");
 
+DEFINE_test_flag(bool, download_partial_wal_segments, false, "");
+
 DECLARE_int32(bytes_remote_bootstrap_durable_write_mb);
 
 namespace yb {
@@ -104,7 +106,6 @@ namespace tserver {
 
 using consensus::ConsensusMetadata;
 using consensus::ConsensusStatePB;
-using consensus::OpId;
 using consensus::RaftConfigPB;
 using consensus::RaftPeerPB;
 using env_util::CopyFile;
@@ -216,7 +217,8 @@ Status RemoteBootstrapClient::Start(const string& bootstrap_peer_uuid,
     return status;
   }
 
-  if (resp.superblock().tablet_data_state() != tablet::TABLET_DATA_READY) {
+  remote_tablet_data_state_ = resp.superblock().tablet_data_state();
+  if (!CanServeTabletData(remote_tablet_data_state_)) {
     Status s = STATUS(IllegalState, "Remote peer (" + bootstrap_peer_uuid + ")" +
                                     " is currently remotely bootstrapping itself!",
                                     resp.superblock().ShortDebugString());
@@ -312,7 +314,6 @@ Status RemoteBootstrapClient::Start(const string& bootstrap_peer_uuid,
       ts_manager->RegisterDataAndWalDir(&fs_manager(),
                                         table_id,
                                         meta_->raft_group_id(),
-                                        meta_->table_type(),
                                         data_root_dir,
                                         wal_root_dir);
     }
@@ -326,35 +327,26 @@ Status RemoteBootstrapClient::Start(const string& bootstrap_peer_uuid,
       ts_manager->GetAndRegisterDataAndWalDir(&fs_manager(),
                                               table_id,
                                               tablet_id_,
-                                              table.table_type(),
                                               &data_root_dir,
                                               &wal_root_dir);
     }
-    Status create_status = RaftGroupMetadata::CreateNew(
-        &fs_manager(),
-        table_id,
-        tablet_id_,
-        table.table_name(),
-        table.table_type(),
-        schema,
+    auto table_info = std::make_shared<tablet::TableInfo>(
+        table_id, table.namespace_name(), table.table_name(), table.table_type(), schema,
         IndexMap(table.indexes()),
-        partition_schema,
-        partition,
         table.has_index_info() ? boost::optional<IndexInfo>(table.index_info()) : boost::none,
-        table.schema_version(),
-        tablet::TABLET_DATA_COPYING,
-        &meta_,
-        data_root_dir,
-        wal_root_dir,
-        colocated);
-    if (ts_manager != nullptr && !create_status.ok()) {
-      ts_manager->UnregisterDataWalDir(table_id,
-                                       tablet_id_,
-                                       table.table_type(),
-                                       data_root_dir,
-                                       wal_root_dir);
+        table.schema_version(), partition_schema);
+    auto create_result = RaftGroupMetadata::CreateNew(tablet::RaftGroupMetadataData {
+        .fs_manager = &fs_manager(),
+        .table_info = table_info,
+        .raft_group_id = tablet_id_,
+        .partition = partition,
+        .tablet_data_state = tablet::TABLET_DATA_COPYING,
+        .colocated = colocated }, data_root_dir, wal_root_dir);
+    if (ts_manager != nullptr && !create_result.ok()) {
+      ts_manager->UnregisterDataWalDir(table_id, tablet_id_, data_root_dir, wal_root_dir);
     }
-    RETURN_NOT_OK(create_status);
+    RETURN_NOT_OK(create_result);
+    meta_ = std::move(*create_result);
 
     vector<DeletedColumn> deleted_cols;
     for (const DeletedColumnPB& col_pb : table.deleted_cols()) {
@@ -404,10 +396,10 @@ Status RemoteBootstrapClient::FetchAll(TabletStatusListener* status_listener) {
   }
 
   // We sleep here to simulate the transfer of very large files.
-  if (PREDICT_FALSE(FLAGS_simulate_long_remote_bootstrap_sec > 0)) {
-    LOG_WITH_PREFIX(INFO) << "Sleeping " << FLAGS_simulate_long_remote_bootstrap_sec
+  if (PREDICT_FALSE(FLAGS_TEST_simulate_long_remote_bootstrap_sec > 0)) {
+    LOG_WITH_PREFIX(INFO) << "Sleeping " << FLAGS_TEST_simulate_long_remote_bootstrap_sec
                           << " seconds to simulate the transfer of very large files";
-    SleepFor(MonoDelta::FromSeconds(FLAGS_simulate_long_remote_bootstrap_sec));
+    SleepFor(MonoDelta::FromSeconds(FLAGS_TEST_simulate_long_remote_bootstrap_sec));
   }
   return Status::OK();
 }
@@ -417,16 +409,15 @@ Status RemoteBootstrapClient::Finish() {
   CHECK(started_);
 
   CHECK(downloaded_wal_);
-  CHECK(downloaded_rocksdb_files_);
+  CHECK(downloaded_rocksdb_files_) << "files not downloaded";;
 
   RETURN_NOT_OK(WriteConsensusMetadata());
 
   // Replace tablet metadata superblock. This will set the tablet metadata state
-  // to TABLET_DATA_READY, since we checked above that the response
-  // superblock is in a valid state to bootstrap from.
+  // to remote_tablet_data_state_.
   LOG_WITH_PREFIX(INFO) << "Remote bootstrap complete. Replacing tablet superblock.";
   UpdateStatusMessage("Replacing tablet superblock");
-  new_superblock_.set_tablet_data_state(tablet::TABLET_DATA_READY);
+  new_superblock_.set_tablet_data_state(remote_tablet_data_state_);
   RETURN_NOT_OK(meta_->ReplaceSuperBlock(new_superblock_));
 
   if (FLAGS_remote_bootstrap_save_downloaded_metadata) {
@@ -439,7 +430,7 @@ Status RemoteBootstrapClient::Finish() {
 
   succeeded_ = true;
 
-  MAYBE_FAULT(FLAGS_fault_crash_bootstrap_client_before_changing_role);
+  MAYBE_FAULT(FLAGS_TEST_fault_crash_bootstrap_client_before_changing_role);
 
   RETURN_NOT_OK_PREPEND(
       EndRemoteSession(), "Error closing remote bootstrap session " + session_id());
@@ -601,6 +592,11 @@ Status RemoteBootstrapClient::DownloadWALs() {
         return download_status;
       }
       ++counter;
+      if (PREDICT_FALSE(FLAGS_TEST_download_partial_wal_segments) && counter > 0) {
+        LOG(INFO) << "Flag TEST_download_partial_wal_segments set to true. "
+                  << "Stopping WAL files download after one file has been downloaded.";
+        break;
+      }
     }
   } else {
     int num_segments = wal_seqnos_.size();
@@ -676,7 +672,7 @@ Status RemoteBootstrapClient::DownloadWAL(uint64_t wal_segment_seqno) {
   DataIdPB data_id;
   data_id.set_type(DataIdPB::LOG_SEGMENT);
   data_id.set_wal_segment_seqno(wal_segment_seqno);
-  const string dest_path = fs_manager().GetWalSegmentFileName(meta_->wal_dir(), wal_segment_seqno);
+  const string dest_path = fs_manager().GetWalSegmentFilePath(meta_->wal_dir(), wal_segment_seqno);
   const auto temp_dest_path = dest_path + ".tmp";
   bool ok = false;
   auto se = ScopeExit([this, &temp_dest_path, &ok] {

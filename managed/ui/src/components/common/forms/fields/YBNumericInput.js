@@ -3,28 +3,49 @@
 import React, { Component } from 'react';
 import NumericInput from 'react-numeric-input';
 import { isFunction } from 'lodash';
-import { YBLabel } from 'components/common/descriptors';
+import { YBLabel } from '../../../../components/common/descriptors';
 
 // TODO: Rename to YBNumericInput after changing prior YBNumericInput references.
 // TODO: Make default export after checking all corresponding imports.
 
 export class YBControlledNumericInput extends Component {
   static defaultProps = {
-    minVal: 0,
+    minVal: 0
   };
   render() {
-    const {input, val, className, onInputChanged, onInputSelect, onInputBlur, disabled, onInputFocus, valueFormat, minVal, readOnly} = this.props;
+    const {
+      input,
+      val,
+      className,
+      onInputChanged,
+      onInputSelect,
+      onInputBlur,
+      disabled,
+      onInputFocus,
+      valueFormat,
+      minVal,
+      readOnly
+    } = this.props;
     return (
-      <NumericInput {...input} className={`form-control ${className}`} value={val} onChange={onInputChanged}
-                    onSelect={onInputSelect} onFocus={onInputFocus} onBlur={onInputBlur} format={valueFormat}
-                    min={minVal} readOnly={readOnly} disabled={disabled}/>
+      <NumericInput
+        {...input}
+        className={`form-control ${className}`}
+        value={val}
+        onChange={onInputChanged}
+        onSelect={onInputSelect}
+        onFocus={onInputFocus}
+        onBlur={onInputBlur}
+        format={valueFormat}
+        min={minVal}
+        readOnly={readOnly}
+        disabled={disabled}
+      />
     );
   }
 }
 export class YBUnControlledNumericInput extends Component {
   static defaultProps = {
-    minVal: 0,
-
+    minVal: 0
   };
 
   render() {
@@ -38,16 +59,22 @@ export class YBUnControlledNumericInput extends Component {
     }
 
     return (
-      <NumericInput {...input} className="form-control" min={minVal} onChange={onChange} readOnly={readOnly}/>
+      <NumericInput
+        {...input}
+        className="form-control"
+        min={minVal}
+        onChange={onChange}
+        readOnly={readOnly}
+      />
     );
   }
 }
 
 export default class YBNumericInputWithLabel extends Component {
   render() {
-    const { label, meta, ...otherProps } = this.props;
+    const { label, meta, infoContent, infoTitle, ...otherProps } = this.props;
     return (
-      <YBLabel label={label} meta={meta}>
+      <YBLabel label={label} meta={meta} infoContent={infoContent} infoTitle={infoTitle}>
         <YBUnControlledNumericInput {...otherProps} />
       </YBLabel>
     );

@@ -6,6 +6,8 @@ import com.google.common.collect.ImmutableList;
 import com.yugabyte.yw.common.ApiHelper;
 import com.yugabyte.yw.common.FakeDBApplication;
 import com.yugabyte.yw.models.MetricConfig;
+import com.yugabyte.yw.metrics.MetricQueryResponse;
+
 import org.joda.time.DateTime;
 import org.junit.Before;
 import org.junit.Test;
@@ -26,9 +28,12 @@ import static junit.framework.TestCase.assertTrue;
 import static org.hamcrest.CoreMatchers.equalTo;
 import static org.hamcrest.CoreMatchers.notNullValue;
 import static org.hamcrest.CoreMatchers.instanceOf;
+import org.hamcrest.core.*;
 import static org.hamcrest.core.AllOf.allOf;
 import static org.hamcrest.core.Is.is;
 import static org.junit.Assert.assertThat;
+import static org.junit.Assert.assertEquals;
+import static org.mockito.Matchers.any;
 import static org.mockito.Matchers.anyMap;
 import static org.mockito.Matchers.anyString;
 import static org.mockito.Mockito.times;
@@ -44,9 +49,6 @@ public class MetricQueryHelperTest extends FakeDBApplication {
 
   @Mock
   play.Configuration mockAppConfig;
-
-  @Mock
-  ApiHelper mockApiHelper;
 
   MetricConfig validMetric;
 
@@ -98,7 +100,10 @@ public class MetricQueryHelperTest extends FakeDBApplication {
     verify(mockApiHelper).getRequest(queryUrl.capture(), anyMap(), (Map<String, String>) queryParam.capture());
 
     assertThat(queryUrl.getValue(), allOf(notNullValue(), equalTo("foo://bar/query")));
-    assertThat(queryParam.getValue(), allOf(notNullValue(), instanceOf(Map.class)));
+    assertThat(
+      queryParam.getValue(),
+      allOf(notNullValue(), IsInstanceOf.instanceOf(HashMap.class))
+    );
 
     Map<String, String> graphQueryParam = queryParam.getValue();
     assertThat(graphQueryParam.get("query"), allOf(notNullValue(), equalTo("sum(my_valid_metric)")));
@@ -127,13 +132,53 @@ public class MetricQueryHelperTest extends FakeDBApplication {
     verify(mockApiHelper).getRequest(queryUrl.capture(), anyMap(), (Map<String, String>) queryParam.capture());
 
     assertThat(queryUrl.getValue(), allOf(notNullValue(), equalTo("foo://bar/query_range")));
-    assertThat(queryParam.getValue(), allOf(notNullValue(), instanceOf(Map.class)));
+    assertThat(
+      queryParam.getValue(),
+      allOf(notNullValue(), IsInstanceOf.instanceOf(HashMap.class))
+    );
 
     Map<String, String> graphQueryParam = queryParam.getValue();
     assertThat(graphQueryParam.get("query"), allOf(notNullValue(), equalTo("sum(my_valid_metric)")));
     assertThat(Integer.parseInt(graphQueryParam.get("start")), allOf(notNullValue(), equalTo(startTimestamp)));
     assertThat(Integer.parseInt(graphQueryParam.get("end")), allOf(notNullValue(), equalTo(endTimestamp)));
     assertThat(Integer.parseInt(graphQueryParam.get("step")), allOf(notNullValue(), equalTo(6)));
+  }
+
+  @Test
+  public void testDirectQuerySingleValue() {
+
+    JsonNode responseJson = Json.parse("{\"status\":\"success\",\"data\":{\"resultType\":\"vector\",\"result\":[{\"metric\":\n" +
+    " {\"__name__\":\"foobar\", \"node_prefix\":\"yb-test-1\"},\"value\":[1479278137,\"0.027751899056199826\"]}]}}");
+
+    when(mockApiHelper.getRequest(anyString(), anyMap(), anyMap())).thenReturn(responseJson);
+
+    ArrayList<MetricQueryResponse.Entry> results = metricQueryHelper.queryDirect("foobar");
+    assertEquals(results.size(), 1);
+    assertEquals(results.get(0).labels.size(), 2);
+    assertEquals(results.get(0).labels.get("node_prefix"), "yb-test-1");
+    assertEquals(results.get(0).values.size(), 1);
+    assertEquals(results.get(0).values.get(0).getLeft().intValue(), 1479278137);
+    assertEquals(results.get(0).values.get(0).getRight().doubleValue(), 0.028, 0.005);
+  }
+
+  @Test
+  public void testDirectQueryMultipleValues() {
+
+    JsonNode responseJson = Json.parse("{\"status\":\"success\",\"data\":{\"resultType\":\"vector\",\"result\":[{\"metric\":\n" +
+    " {\"__name__\":\"foobar\", \"node_prefix\":\"yb-test-1\"},\"values\":[[1479278132,\"0.037751899056199826\"], [1479278137,\"0.027751899056199826\"]]}]}}");
+
+    when(mockApiHelper.getRequest(anyString(), anyMap(), anyMap())).thenReturn(responseJson);
+
+    ArrayList<MetricQueryResponse.Entry> results = metricQueryHelper.queryDirect("foobar");
+    assertEquals(results.size(), 1);
+    assertEquals(results.get(0).labels.size(), 2);
+    assertEquals(results.get(0).labels.get("node_prefix"), "yb-test-1");
+    assertEquals(results.get(0).values.size(), 2);
+    assertEquals(results.get(0).values.get(0).getLeft().intValue(), 1479278132);
+    assertEquals(results.get(0).values.get(1).getLeft().intValue(), 1479278137);
+    assertEquals(results.get(0).values.get(0).getRight().doubleValue(), 0.038, 0.005);
+    assertEquals(results.get(0).values.get(1).getRight().doubleValue(), 0.028, 0.005);
+
   }
 
   @Test
@@ -157,11 +202,14 @@ public class MetricQueryHelperTest extends FakeDBApplication {
     JsonNode result = metricQueryHelper.query(metricKeys, params);
     verify(mockApiHelper, times(2)).getRequest(queryUrl.capture(), anyMap(), (Map<String, String>) queryParam.capture());
     assertThat(queryUrl.getValue(), allOf(notNullValue(), equalTo("foo://bar/query_range")));
-    assertThat(queryParam.getValue(), allOf(notNullValue(), instanceOf(Map.class)));
+    assertThat(
+      queryParam.getValue(),
+      allOf(notNullValue(), IsInstanceOf.instanceOf(HashMap.class))
+    );
 
     List<String> expectedQueryStrings = new ArrayList<>();
-    expectedQueryStrings.add(validMetric.getQuery(new HashMap<>()));
-    expectedQueryStrings.add(validMetric2.getQuery(new HashMap<>()));
+    expectedQueryStrings.add(validMetric.getQuery(new HashMap<>(), 60 /* queryRangeSecs */));
+    expectedQueryStrings.add(validMetric2.getQuery(new HashMap<>(), 60 /* queryRangeSecs */));
 
     for (Map<String, String> capturedQueryParam: queryParam.getAllValues()) {
       assertTrue(expectedQueryStrings.contains(capturedQueryParam.get("query")));

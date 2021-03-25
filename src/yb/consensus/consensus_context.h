@@ -18,6 +18,8 @@
 
 #include "yb/consensus/consensus_fwd.h"
 
+#include "yb/util/result.h"
+
 namespace yb {
 namespace consensus {
 
@@ -47,7 +49,7 @@ class ConsensusContext {
   // For instance it could enqueue some operations to the Raft.
   //
   // Returns the current safe time, so we can send it from leaders to followers.
-  virtual HybridTime PreparePeerRequest() = 0;
+  virtual Result<HybridTime> PreparePeerRequest() = 0;
 
   // This is called every time majority-replicated watermarks (OpId / leader leases) change. This is
   // used for updating the "propagated safe time" value in MvccManager and unblocking readers

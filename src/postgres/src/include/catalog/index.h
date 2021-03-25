@@ -66,12 +66,14 @@ extern Oid index_create(Relation heapRelation,
 			 Oid *classObjectId,
 			 int16 *coloptions,
 			 Datum reloptions,
-			 List *index_options,
 			 bits16 flags,
 			 bits16 constr_flags,
 			 bool allow_system_table_mods,
 			 bool is_internal,
-			 Oid *constraintId);
+			 Oid *constraintId,
+			 OptSplit *split_options,
+			 const bool skip_index_backfill,
+			 Oid tablegroupId);
 
 #define	INDEX_CONSTR_CREATE_MARK_AS_PRIMARY	(1 << 0)
 #define	INDEX_CONSTR_CREATE_DEFERRABLE		(1 << 1)
@@ -113,6 +115,13 @@ extern void index_build(Relation heapRelation,
 			bool isreindex,
 			bool parallel);
 
+extern void index_backfill(Relation heapRelation,
+						   Relation indexRelation,
+						   IndexInfo *indexInfo,
+						   bool isprimary,
+						   uint64_t *read_time,
+						   RowBounds *row_bounds);
+
 extern double IndexBuildHeapScan(Relation heapRelation,
 				   Relation indexRelation,
 				   IndexInfo *indexInfo,
@@ -130,6 +139,13 @@ extern double IndexBuildHeapRangeScan(Relation heapRelation,
 						IndexBuildCallback callback,
 						void *callback_state,
 						HeapScanDesc scan);
+extern double IndexBackfillHeapRangeScan(Relation heapRelation,
+										 Relation indexRelation,
+										 IndexInfo *indexInfo,
+										 IndexBuildCallback callback,
+										 void *callback_state,
+										 uint64_t *read_time,
+										 RowBounds *row_bounds);
 
 extern void validate_index(Oid heapId, Oid indexId, Snapshot snapshot);
 
@@ -156,5 +172,20 @@ extern void SerializeReindexState(Size maxsize, char *start_address);
 extern void RestoreReindexState(void *reindexstate);
 
 extern void IndexSetParentIndex(Relation idx, Oid parentOid);
+
+/*
+ * This should exactly match the IndexPermissions enum in
+ * src/yb/common/common.proto.  See the definition there for details.
+ */
+typedef enum
+{
+	YB_INDEX_PERM_DELETE_ONLY = 0,
+	YB_INDEX_PERM_WRITE_AND_DELETE = 2,
+	YB_INDEX_PERM_DO_BACKFILL = 4,
+	YB_INDEX_PERM_READ_WRITE_AND_DELETE = 6,
+	YB_INDEX_PERM_WRITE_AND_DELETE_WHILE_REMOVING = 8,
+	YB_INDEX_PERM_DELETE_ONLY_WHILE_REMOVING = 10,
+	YB_INDEX_PERM_INDEX_UNUSED = 12,
+} YBIndexPermissions;
 
 #endif							/* INDEX_H */

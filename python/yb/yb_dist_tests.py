@@ -12,7 +12,6 @@
 #
 
 import collections
-import command_util
 import copy
 import logging
 import os
@@ -25,7 +24,9 @@ import sys
 import tempfile
 import atexit
 
+from functools import total_ordering
 
+from yb import command_util
 from yb.common_util import get_build_type_from_build_root, \
                            get_compiler_type_from_build_root, \
                            is_macos  # nopep8
@@ -50,6 +51,7 @@ CLOCK_SYNC_WAIT_LOGGING_INTERVAL_SEC = 10
 MAX_TIME_TO_WAIT_FOR_CLOCK_SYNC_SEC = 60
 
 
+@total_ordering
 class TestDescriptor:
     """
     A "test descriptor" identifies a particular test we could run on a distributed test worker.
@@ -78,6 +80,7 @@ class TestDescriptor:
 
         self.is_jvm_based = False
         is_mvn_compatible_descriptor = False
+
         if len(self.descriptor_str.split('#')) == 2:
             self.is_jvm_based = True
             # Could be Scala, but as of 08/2018 we only have Java tests in the repository.
@@ -139,6 +142,15 @@ class TestDescriptor:
             self.attempt_index
             ]
 
+    def __eq__(self, other):
+        return self.descriptor_str == other.descriptor_str
+
+    def __ne__(self, other):
+        return not (self == other)
+
+    def __lt__(self, other):
+        return self.descriptor_str < other.descriptor_str
+
     def with_attempt_index(self, attempt_index):
         assert attempt_index >= 1
         copied = copy.copy(self)
@@ -178,7 +190,7 @@ class GlobalTestConfig:
         os.environ['YB_COMPILER_TYPE'] = self.compiler_type
         # This is how we tell run-test.sh what set of C++ binaries to use for mini-clusters in Java
         # tests.
-        for env_var_name, env_var_value in propagated_env_vars.iteritems():
+        for env_var_name, env_var_value in propagated_env_vars.items():
             os.environ[env_var_name] = env_var_value
 
 
@@ -278,6 +290,7 @@ ARCHIVED_PATHS_IN_BUILD_DIR = [
 ARCHIVED_PATHS_IN_SRC_DIR = [
     'bin',
     'build-support',
+    'managed/devops/bin/yb_backup.py',
     'managed/src/main/resources/version.txt',
     'managed/version.txt',
     'python',
@@ -285,8 +298,9 @@ ARCHIVED_PATHS_IN_SRC_DIR = [
     'version.txt',
     'www',
     'yb_build.sh',
-    'build/python_virtual_env',
-    'python_requirements_frozen.txt',
+    'build/venv',
+    'requirements.txt',
+    'requirements_frozen.txt',
 ]
 
 
@@ -316,6 +330,7 @@ def create_archive_for_workers():
     start_time_sec = time.time()
     try:
         build_root = os.path.abspath(global_conf.build_root)
+        compiler_type = get_compiler_type_from_build_root(build_root)
         yb_src_root = os.path.abspath(global_conf.yb_src_root)
         build_root_parent = os.path.join(yb_src_root, 'build')
         rel_build_root = global_conf.rel_build_root
@@ -338,7 +353,10 @@ def create_archive_for_workers():
                 mvn_local_repo, build_root_parent))
 
         files_that_must_exist_in_build_dir = ['thirdparty_path.txt']
-        if sys.platform == 'linux':
+
+        # This will not include version-specific compiler types like clang11 or gcc9.
+        # We will eventually get rid of Linuxbrew and simplify this.
+        if sys.platform == 'linux' and compiler_type in ['gcc', 'clang']:
             files_that_must_exist_in_build_dir.append('linuxbrew_path.txt')
 
         for rel_file_path in files_that_must_exist_in_build_dir:
@@ -400,7 +418,7 @@ def compute_sha256sum(file_path):
     else:
         raise ValueError("Don't know how to compute SHA256 checksum on platform %s" % sys.platform)
 
-    checksum_str = subprocess.check_output(cmd_line).strip().split()[0]
+    checksum_str = subprocess.check_output(cmd_line).strip().split()[0].decode('utf-8')
     validate_sha256sum(checksum_str)
     return checksum_str
 

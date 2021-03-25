@@ -2,21 +2,25 @@
 
 package com.yugabyte.yw.common;
 
+import akka.stream.javadsl.Source;
+import akka.util.ByteString;
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.node.ObjectNode;
+import com.google.common.collect.ImmutableList;
 import com.google.inject.Inject;
 import com.google.inject.Singleton;
 import play.libs.Json;
 import play.libs.ws.WSClient;
 import play.libs.ws.WSRequest;
 import play.libs.ws.WSResponse;
+import play.mvc.Http;
 
-import java.net.URL;
 import java.net.HttpURLConnection;
-import java.util.Collection;
+import java.net.URL;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.UUID;
 import java.util.concurrent.CompletionStage;
 import java.util.concurrent.ExecutionException;
 
@@ -37,6 +41,12 @@ public class ApiHelper {
   public JsonNode postRequest(String url, JsonNode data, Map<String, String> headers) {
     WSRequest request = requestWithHeaders(url, headers);
     CompletionStage<JsonNode> jsonPromise = request.post(data).thenApply(WSResponse::asJson);
+    return handleJSONPromise(jsonPromise);
+  }
+
+  public JsonNode putRequest(String url, JsonNode data, Map<String, String> headers) {
+    WSRequest request = requestWithHeaders(url, headers);
+    CompletionStage<JsonNode> jsonPromise = request.put(data).thenApply(WSResponse::asJson);
     return handleJSONPromise(jsonPromise);
   }
 
@@ -116,5 +126,44 @@ public class ApiHelper {
       }
     }
     return request;
+  }
+
+  public String buildUrl(String baseUrl, Map<String, String[]> queryParams) {
+    if (queryParams.size() > 0) {
+      baseUrl += "?";
+      StringBuilder requestUrlBuilder = new StringBuilder(baseUrl);
+      for (Map.Entry<String, String[]> entry : queryParams.entrySet()) {
+        requestUrlBuilder
+          .append(entry.getKey()).append("=")
+          .append(entry.getValue()[0])
+          .append("&");
+      }
+
+      baseUrl = requestUrlBuilder.toString();
+      baseUrl = baseUrl.substring(0, baseUrl.length() - 1);
+    }
+
+    return baseUrl;
+  }
+
+  public String replaceProxyLinks(String responseBody, UUID universeUUID, String proxyAddr) {
+    String prefix = String.format("/universes/%s/proxy/%s/", universeUUID.toString(), proxyAddr);
+    return responseBody.replaceAll("src='/", String.format("src='%s", prefix))
+      .replaceAll("src=\"/", String.format("src=\"%s", prefix))
+      .replaceAll("href=\"/", String.format("href=\"%s", prefix))
+      .replaceAll("href='/", String.format("href='%s", prefix))
+      .replaceAll("http://", String.format("/universes/%s/proxy/", universeUUID.toString()));
+  }
+
+  public JsonNode multipartRequest(
+    String url,
+    Map<String, String> headers,
+    List<Http.MultipartFormData.Part<Source<ByteString, ?>>> partsList) {
+    WSRequest request = wsClient.url(url);
+    headers.forEach(request::addHeader);
+    CompletionStage<JsonNode> post = request
+      .post(Source.from(partsList))
+      .thenApply(WSResponse::asJson);
+    return handleJSONPromise(post);
   }
 }

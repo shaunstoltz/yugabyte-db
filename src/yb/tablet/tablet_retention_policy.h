@@ -22,11 +22,15 @@
 namespace yb {
 namespace tablet {
 
+using AllowedHistoryCutoffProvider = std::function<HybridTime(const RaftGroupMetadata&)>;
+
 // History retention policy used by a tablet. It is based on pending reads and a fixed retention
 // interval configured by the user.
 class TabletRetentionPolicy : public docdb::HistoryRetentionPolicy {
  public:
-  explicit TabletRetentionPolicy(server::ClockPtr clock, const RaftGroupMetadata* metadata);
+  explicit TabletRetentionPolicy(
+      server::ClockPtr clock, const AllowedHistoryCutoffProvider& allowed_history_cutoff_provider,
+      const RaftGroupMetadata* metadata);
 
   docdb::HistoryRetentionDirective GetRetentionDirective() override;
 
@@ -46,6 +50,8 @@ class TabletRetentionPolicy : public docdb::HistoryRetentionPolicy {
   CHECKED_STATUS RegisterReaderTimestamp(HybridTime timestamp);
   void UnregisterReaderTimestamp(HybridTime timestamp);
 
+  void EnableHistoryCutoffPropagation(bool value);
+
  private:
   bool ShouldRetainDeleteMarkersInMajorCompaction() const;
   HybridTime EffectiveHistoryCutoff() REQUIRES(mutex_);
@@ -59,6 +65,7 @@ class TabletRetentionPolicy : public docdb::HistoryRetentionPolicy {
   }
 
   const server::ClockPtr clock_;
+  const AllowedHistoryCutoffProvider allowed_history_cutoff_provider_;
   const RaftGroupMetadata& metadata_;
   const std::string log_prefix_;
 
@@ -67,6 +74,21 @@ class TabletRetentionPolicy : public docdb::HistoryRetentionPolicy {
   std::multiset<HybridTime> active_readers_ GUARDED_BY(mutex_);
   HybridTime committed_history_cutoff_ GUARDED_BY(mutex_) = HybridTime::kMin;
   CoarseTimePoint next_history_cutoff_propagation_ GUARDED_BY(mutex_) = CoarseTimePoint::min();
+  int disable_counter_ GUARDED_BY(mutex_) = 0;
+};
+
+class HistoryCutoffPropagationDisabler {
+ public:
+  explicit HistoryCutoffPropagationDisabler(TabletRetentionPolicy* policy) : policy_(policy) {
+    policy_->EnableHistoryCutoffPropagation(false);
+  }
+
+  ~HistoryCutoffPropagationDisabler() {
+    policy_->EnableHistoryCutoffPropagation(true);
+  }
+
+ private:
+  TabletRetentionPolicy* policy_;
 };
 
 }  // namespace tablet

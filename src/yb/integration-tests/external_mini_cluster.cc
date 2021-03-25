@@ -71,10 +71,11 @@
 #include "yb/util/net/socket.h"
 #include "yb/util/path_util.h"
 #include "yb/util/pb_util.h"
+#include "yb/util/size_literals.h"
 #include "yb/util/stopwatch.h"
 #include "yb/util/subprocess.h"
 #include "yb/util/test_util.h"
-#include "yb/util/size_literals.h"
+#include "yb/util/tsan_util.h"
 #include "yb/yql/pgwrapper/pg_wrapper.h"
 
 using namespace std::literals;  // NOLINT
@@ -147,7 +148,7 @@ DEFINE_bool(external_daemon_safe_shutdown, false,
 DECLARE_int64(outbound_rpc_block_size);
 DECLARE_int64(outbound_rpc_memory_limit);
 
-DEFINE_int64(external_mini_cluster_max_log_bytes, 50_MB,
+DEFINE_int64(external_mini_cluster_max_log_bytes, 50_MB * 100,
              "Max total size of log bytes produced by all external mini-cluster daemons. "
              "The test is shut down if this limit is exceeded.");
 
@@ -156,7 +157,7 @@ namespace yb {
 static const char* const kMasterBinaryName = "yb-master";
 static const char* const kTabletServerBinaryName = "yb-tserver";
 static double kProcessStartTimeoutSeconds = 60.0;
-static MonoDelta kTabletServerRegistrationTimeout = 10s;
+static MonoDelta kTabletServerRegistrationTimeout = 60s;
 
 static const int kHeapProfileSignal = SIGUSR1;
 
@@ -249,7 +250,9 @@ ExternalMiniCluster::ExternalMiniCluster(const ExternalMiniClusterOptions& opts)
   const auto common_extra_flags = {
       "--enable_tracing"s,
       Substitute("--memory_limit_hard_bytes=$0", kDefaultMemoryLimitHardBytes),
-      (opts.log_to_file ? "--alsologtostderr"s : "--logtostderr"s)
+      (opts.log_to_file ? "--alsologtostderr"s : "--logtostderr"s),
+      (IsTsan() ? "--rpc_slow_query_threshold_ms=20000"s :
+          "--rpc_slow_query_threshold_ms=10000"s)
   };
   for (auto* extra_flags : {&opts_.extra_master_flags, &opts_.extra_tserver_flags}) {
     // Common default extra flags are inserted in the beginning so that they can be overridden by
@@ -791,7 +794,7 @@ Status ExternalMiniCluster::GetNumMastersAsSeenBy(ExternalMaster* master, int* n
 }
 
 Status ExternalMiniCluster::WaitForLeaderCommitTermAdvance() {
-  consensus::OpId start_opid;
+  OpIdPB start_opid;
   RETURN_NOT_OK(GetLastOpIdForLeader(&start_opid));
   LOG(INFO) << "Start OPID : " << start_opid.ShortDebugString();
 
@@ -822,7 +825,7 @@ Status ExternalMiniCluster::WaitForLeaderCommitTermAdvance() {
 Status ExternalMiniCluster::GetLastOpIdForEachMasterPeer(
     const MonoDelta& timeout,
     consensus::OpIdType opid_type,
-    vector<consensus::OpId>* op_ids) {
+    vector<OpIdPB>* op_ids) {
   GetLastOpIdRequestPB opid_req;
   GetLastOpIdResponsePB opid_resp;
   opid_req.set_tablet_id(yb::master::kSysCatalogTabletId);
@@ -846,8 +849,8 @@ Status ExternalMiniCluster::GetLastOpIdForEachMasterPeer(
 Status ExternalMiniCluster::WaitForMastersToCommitUpTo(int target_index) {
   auto deadline = CoarseMonoClock::Now() + opts_.timeout.ToSteadyDuration();
 
-  for (int i = 1; CoarseMonoClock::Now() < deadline; i++) {
-    vector<consensus::OpId> ids;
+  for (int i = 1;; i++) {
+    vector<OpIdPB> ids;
     Status s = GetLastOpIdForEachMasterPeer(opts_.timeout, consensus::COMMITTED_OPID, &ids);
 
     if (s.ok()) {
@@ -866,13 +869,19 @@ Status ExternalMiniCluster::WaitForMastersToCommitUpTo(int target_index) {
       LOG(WARNING) << "Got error getting last opid for each replica: " << s.ToString();
     }
 
+    if (CoarseMonoClock::Now() >= deadline) {
+      if (!s.ok()) {
+        return s;
+      }
+
+      return STATUS_FORMAT(TimedOut,
+                           "Index $0 not available on all replicas after $1. ",
+                           target_index,
+                           opts_.timeout);
+    }
+
     SleepFor(MonoDelta::FromMilliseconds(min(i * 100, 1000)));
   }
-
-  return STATUS_FORMAT(TimedOut,
-                       "Index $0 not available on all replicas after $1. ",
-                       target_index,
-                       opts_.timeout);
 }
 
 Status ExternalMiniCluster::GetIsMasterLeaderServiceReady(ExternalMaster* master) {
@@ -898,7 +907,7 @@ Status ExternalMiniCluster::GetIsMasterLeaderServiceReady(ExternalMaster* master
   return Status::OK();
 }
 
-Status ExternalMiniCluster::GetLastOpIdForLeader(consensus::OpId* opid) {
+Status ExternalMiniCluster::GetLastOpIdForLeader(OpIdPB* opid) {
   ExternalMaster* leader = GetLeaderMaster();
   auto leader_master_sock = leader->bound_rpc_addr();
   std::shared_ptr<ConsensusServiceProxy> leader_proxy =
@@ -932,7 +941,7 @@ string ExternalMiniCluster::GetTabletServerAddresses() const {
     if (!peer_addrs.empty()) {
       peer_addrs += ",";
     }
-    peer_addrs += Format("$0:$1", ts->bind_host(), ts->rpc_port());
+    peer_addrs += HostPortToString(ts->bind_host(), ts->rpc_port());
   }
   return peer_addrs;
 }
@@ -961,6 +970,11 @@ Status ExternalMiniCluster::StartMasters() {
   string peer_addrs_str = JoinStrings(peer_addrs, ",");
   vector<string> flags = opts_.extra_master_flags;
   flags.push_back("--enable_leader_failure_detection=true");
+  // For sanitizer builds, it is easy to overload the master, leading to quorum changes.
+  // This could end up breaking ever trivial DDLs like creating an initial table in the cluster.
+  if (IsSanitizer()) {
+    flags.push_back("--leader_failure_max_missed_heartbeat_periods=10");
+  }
   if (opts_.enable_ysql) {
     flags.push_back("--enable_ysql=true");
     flags.push_back("--master_auto_run_initdb");
@@ -997,6 +1011,8 @@ Status ExternalMiniCluster::StartMasters() {
 Status ExternalMiniCluster::WaitForInitDb() {
   const auto start_time = std::chrono::steady_clock::now();
   const auto kTimeout = NonTsanVsTsan(900s, 1800s);
+  int num_timeouts = 0;
+  const int kMaxTimeouts = 10;
   while (true) {
     for (int i = 0; i < opts_.num_masters; i++) {
       auto elapsed_time = std::chrono::steady_clock::now() - start_time;
@@ -1011,7 +1027,16 @@ Status ExternalMiniCluster::WaitForInitDb() {
       rpc.set_timeout(opts_.timeout);
       IsInitDbDoneRequestPB req;
       IsInitDbDoneResponsePB resp;
-      RETURN_NOT_OK(proxy->IsInitDbDone(req, &resp, &rpc));
+      Status status = proxy->IsInitDbDone(req, &resp, &rpc);
+      if (status.IsTimedOut()) {
+        num_timeouts++;
+        LOG(WARNING) << status << " (seen " << num_timeouts << " timeouts so far)";
+        if (num_timeouts == kMaxTimeouts) {
+          LOG(ERROR) << "Reached " << kMaxTimeouts << " timeouts: " << status;
+          return status;
+        }
+        continue;
+      }
       if (resp.has_error() &&
           resp.error().code() != master::MasterErrorPB::NOT_THE_LEADER) {
 
@@ -1099,12 +1124,10 @@ Status ExternalMiniCluster::AddTabletServer(
   flags.insert(flags.end(), extra_flags.begin(), extra_flags.end());
 
   scoped_refptr<ExternalTabletServer> ts = new ExternalTabletServer(
-      idx, messenger_, proxy_cache_.get(),
-      exe, GetDataPath(Substitute("ts-$0", idx)), GetBindIpForTabletServer(idx),
-      ts_rpc_port, ts_http_port, redis_rpc_port, redis_http_port,
-      cql_rpc_port, cql_http_port,
-      pgsql_rpc_port, pgsql_http_port,
-      master_hostports, SubstituteInFlags(flags, idx));
+      idx, messenger_, proxy_cache_.get(), exe, GetDataPath(Substitute("ts-$0", idx + 1)),
+      GetBindIpForTabletServer(idx), ts_rpc_port, ts_http_port, redis_rpc_port, redis_http_port,
+      cql_rpc_port, cql_http_port, pgsql_rpc_port, pgsql_http_port, master_hostports,
+      SubstituteInFlags(flags, idx));
   RETURN_NOT_OK(ts->Start(start_cql_proxy));
   tablet_servers_.push_back(ts);
   return Status::OK();
@@ -1281,7 +1304,12 @@ Status ExternalMiniCluster::GetPeerMasterIndex(int* idx, bool is_leader) {
   *idx = 0;  // default to 0'th index, even in case of errors.
 
   for (const scoped_refptr<ExternalMaster>& master : masters_) {
-    addrs.push_back({master->bound_rpc_addr()});
+    if (master->IsProcessAlive()) {
+      addrs.push_back({ master->bound_rpc_addr() });
+    }
+  }
+  if (addrs.empty()) {
+    return STATUS(IllegalState, "No running masters");
   }
   rpc::Rpcs rpcs;
   auto rpc = rpc::StartRpc<GetLeaderMasterRpc>(
@@ -1356,8 +1384,8 @@ int ExternalMiniCluster::tablet_server_index_by_uuid(const std::string& uuid) co
   return -1;
 }
 
-vector<ExternalDaemon*> ExternalMiniCluster::master_daemons() const {
-  vector<ExternalDaemon*> results;
+vector<ExternalMaster*> ExternalMiniCluster::master_daemons() const {
+  vector<ExternalMaster*> results;
   for (const scoped_refptr<ExternalMaster>& master : masters_) {
     results.push_back(master.get());
   }
@@ -1448,6 +1476,13 @@ Status ExternalMiniCluster::SetFlag(ExternalDaemon* daemon,
   if (resp.result() != server::SetFlagResponsePB::SUCCESS) {
     return STATUS(RemoteError, "failed to set flag",
                                resp.ShortDebugString());
+  }
+  return Status::OK();
+}
+
+Status ExternalMiniCluster::SetFlagOnMasters(const string& flag, const string& value) {
+  for (const auto& master : masters_) {
+    RETURN_NOT_OK(SetFlag(master.get(), flag, value));
   }
   return Status::OK();
 }
@@ -1672,10 +1707,12 @@ Status ExternalDaemon::StartProcess(const vector<string>& user_flags) {
   // Disable callhome.
   argv.push_back("--callhome_enabled=false");
 
-  // Enable metrics logging.
+  // Disabled due to #4507.
+  // TODO: Enable metrics logging after #4507 is fixed.
+  //
   // Even though we set -logtostderr down below, metrics logs end up being written
   // based on -log_dir. So, we have to set that too.
-  argv.push_back("--metrics_log_interval_ms=1000");
+  argv.push_back("--metrics_log_interval_ms=0");
 
   // Force set log_dir to empty value, process will chose default destination inside fs_data_dir
   // In other case log_dir value will be extracted from TEST_TMPDIR env variable but it is
@@ -1755,13 +1792,13 @@ Status ExternalDaemon::StartProcess(const vector<string>& user_flags) {
   RETURN_NOT_OK_PREPEND(p->Start(),
                         Substitute("Failed to start subprocess $0", exe_));
 
-  stdout_tailer_thread_ = unique_ptr<LogTailerThread>(new LogTailerThread(
-      Substitute("[$0 stdout]", daemon_id_), p->ReleaseChildStdoutFd(), &std::cout));
+  stdout_tailer_thread_ = std::make_unique<LogTailerThread>(
+      Substitute("[$0 stdout]", daemon_id_), p->ReleaseChildStdoutFd(), &std::cout);
 
   // We will mostly see stderr output from the child process (because of --logtostderr), so we'll
   // assume that by default in the output prefix.
-  stderr_tailer_thread_ = unique_ptr<LogTailerThread>(new LogTailerThread(
-      default_output_prefix, p->ReleaseChildStderrFd(), &std::cerr));
+  stderr_tailer_thread_ = std::make_unique<LogTailerThread>(
+      default_output_prefix, p->ReleaseChildStderrFd(), &std::cerr);
 
   // The process is now starting -- wait for the bound port info to show up.
   Stopwatch sw;
@@ -2125,6 +2162,9 @@ Status ExternalMaster::Start(bool shell_mode) {
   flags.Add("rpc_bind_addresses", rpc_bind_address_);
   flags.Add("webserver_interface", "localhost");
   flags.Add("webserver_port", http_port_);
+  // Default master args to make sure we don't wait to trigger new LB tasks upon master leader
+  // failover.
+  flags.Add("load_balancer_initial_delay_secs", 0);
   // On first start, we need to tell the masters their list of expected peers.
   // For 'shell' master, there is no master addresses.
   if (!shell_mode) {

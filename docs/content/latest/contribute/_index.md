@@ -1,12 +1,12 @@
 ---
-title: Get involved with YugabyteDB
-headerTitle: Get involved with YugabyteDB
-linkTitle: Get involved
-description: Get involved with YugabyteDB
+title: Contribute to YugabyteDB
+headerTitle: Contribute to YugabyteDB
+linkTitle: Contribute
+description: Contribute to the YugabyteDB code and documentation.
 image: /images/section_icons/index/quick_start.png
 headcontent: Contribute code and docs to improve YugabyteDB.
 type: page
-section: CONTRIBUTOR GUIDES
+section: YUGABYTEDB CORE
 menu:
   latest:
     identifier: contribute
@@ -35,21 +35,21 @@ This is the C++ code and the unit tests that comprise the core of YugabyteDB. Yo
 
 ### Docs
 
-[YugabyteDB documentation](/) uses the Hugo framework. There are two types of docs issues - infrastructure enhancements and adding content. You can [follow the steps outlined here](https://github.com/yugabyte/docs) to run a local version of the docs site. Next, look at the [contributing guide](https://github.com/yugabyte/docs/blob/master/CONTRIBUTING.md) to make your changes and contribute them.
+[YugabyteDB documentation](/) uses the Hugo framework. There are two types of docs issues - infrastructure enhancements and adding content. You can [follow the steps outlined here](https://github.com/yugabyte/yugabyte-db/tree/master/docs) to run a local version of the docs site. Next, look at the [contributing guide](https://github.com/yugabyte/yugabyte-db/blob/master/docs/CONTRIBUTING.md) to make your changes and contribute them.
 
 ## Find an issue
 
 Issues are tagged with other useful labels as described below.
 
-| Key labels         |  Comments      |
-| ------------------ | -------------- |
-| `bug`              | Bugs can have a small or large scope, so make sure to understand the bug. |
-| `docs`             | An issue related to the docs infrastructure, or content that needs to be added to the docs. |
-| `enhancement`      | An enhancement is often done to an existing feature, and is usually limited in scope. |
-| `good first issue` | A great first issue to work on as your initial contribution to YugabyteDB. |
-| `help wanted`      | Issues that are very useful and relatively standalone, but not actively being worked on. |
-| `new feature`      | An new feature does not exist. New features can be complex additions to the existing system, or standalone pieces. |
-| `question`         | A question that needs to be answered. |
+| Key labels           |  Comments      |
+| -------------------- | -------------- |
+| `kind/bug`           | Bugs can have a small or large scope, so make sure to understand the bug. |
+| `area/documentation` | An issue related to the docs infrastructure, or content that needs to be added to the docs. |
+| `kind/enhancement`   | An enhancement is often done to an existing feature, and is usually limited in scope. |
+| `good first issue`   | A great first issue to work on as your initial contribution to YugabyteDB. |
+| `help wanted`        | Issues that are very useful and relatively standalone, but not actively being worked on. |
+| `kind/new-feature`   | An new feature does not exist. New features can be complex additions to the existing system, or standalone pieces. |
+| `kind/question`      | A question that needs to be answered. |
 
 * If you are just starting out contributing to YugabyteDB, first off welcome and thanks! Look for issues labelled [good first issue](https://github.com/yugabyte/yugabyte-db/issues?q=is%3Aopen+is%3Aissue+label%3A%22good+first+issue%22).
 

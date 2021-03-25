@@ -24,6 +24,8 @@ import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.yb.BaseYBTest;
 import org.yb.client.TestUtils;
+import org.yb.util.SanitizerUtil;
+import org.yb.util.Timeouts;
 
 import java.net.MalformedURLException;
 import java.net.URL;
@@ -35,6 +37,7 @@ import java.util.Map;
 import java.util.Scanner;
 import java.util.Set;
 import java.util.TreeMap;
+import java.util.Arrays;
 
 import static org.yb.AssertionWrappers.fail;
 
@@ -50,26 +53,39 @@ public class BaseMiniClusterTest extends BaseYBTest {
   protected static final int NUM_TABLET_SERVERS = 3;
 
   protected static final int STANDARD_DEVIATION_FACTOR = 2;
-  protected static final int DEFAULT_TIMEOUT_MS = 50000;
+  protected static final int DEFAULT_TIMEOUT_MS =
+          (int) Timeouts.adjustTimeoutSecForBuildType(50000);
 
   /**
    * This is used as the default timeout when calling YB Java client's async API.
    */
-  protected static final int DEFAULT_SLEEP = 50000;
+  protected static final int DEFAULT_SLEEP = (int) Timeouts.adjustTimeoutSecForBuildType(50000);
 
   /**
    * A mini-cluster shared between invocations of multiple test methods.
    */
   protected static MiniYBCluster miniCluster;
 
-  protected static List<String> masterArgs = new ArrayList<String>();
+  // Default master args to make sure we don't wait to trigger new LB tasks upon master leader
+  // failover.
+  protected static List<String> masterArgs = new ArrayList<>(
+          Arrays.asList("--load_balancer_initial_delay_secs=0"));
   protected static List<String> tserverArgs = new ArrayList<String>();
 
   protected static Map<String, String> tserverEnvVars = new TreeMap<>();
 
-  protected boolean useIpWithCertificate = MiniYBCluster.DEFAULT_USE_IP_WITH_CERTIFICATE;
+  protected boolean useIpWithCertificate = MiniYBClusterParameters.DEFAULT_USE_IP_WITH_CERTIFICATE;
 
   protected String certFile = null;
+
+  // The client cert files for mTLS.
+  protected String clientCertFile = null;
+  protected String clientKeyFile = null;
+
+  // This is used as the default bind address (Used only for mTLS verification).
+  protected String clientHost = null;
+  protected int clientPort = 0;
+
 
   // Comma separate describing the master addresses and ports.
   protected static String masterAddresses;
@@ -89,7 +105,7 @@ public class BaseMiniClusterTest extends BaseYBTest {
 
   // Subclasses can override this to set the number of shards per tablet server.
   protected int overridableNumShardsPerTServer() {
-    return MiniYBCluster.DEFAULT_NUM_SHARDS_PER_TSERVER;
+    return MiniYBClusterParameters.DEFAULT_NUM_SHARDS_PER_TSERVER;
   }
 
   /** This allows subclasses to optionally skip the usage of a mini-cluster in a test. */
@@ -99,6 +115,11 @@ public class BaseMiniClusterTest extends BaseYBTest {
 
   protected void customizeMiniClusterBuilder(MiniYBClusterBuilder builder) {
     Preconditions.checkNotNull(builder);
+    // For sanitizer builds, it is easy to overload the master, leading to quorum changes.
+    // This could end up breaking ever trivial DDLs like creating an initial table in the cluster.
+    if (SanitizerUtil.isSanitizerBuild()) {
+      builder.addMasterArgs("--leader_failure_max_missed_heartbeat_periods=10");
+    }
   }
 
   /**
@@ -120,7 +141,14 @@ public class BaseMiniClusterTest extends BaseYBTest {
     TestUtils.clearReservedPorts();
     if (miniCluster == null) {
       createMiniCluster();
+    } else if (shouldRestartMiniClusterBetweenTests()) {
+      LOG.info("Restarting the MiniCluster");
+      miniCluster.restart();
     }
+  }
+
+  protected boolean shouldRestartMiniClusterBetweenTests() {
+    return false;
   }
 
   /**
@@ -144,9 +172,10 @@ public class BaseMiniClusterTest extends BaseYBTest {
     final int replicationFactor = getReplicationFactor();
     createMiniCluster(
         TestUtils.getFirstPositiveNumber(
-            getInitialNumMasters(), replicationFactor, MiniYBCluster.DEFAULT_NUM_MASTERS),
+            getInitialNumMasters(), replicationFactor, MiniYBClusterParameters.DEFAULT_NUM_MASTERS),
         TestUtils.getFirstPositiveNumber(
-            getInitialNumTServers(), replicationFactor, MiniYBCluster.DEFAULT_NUM_TSERVERS)
+            getInitialNumTServers(), replicationFactor,
+            MiniYBClusterParameters.DEFAULT_NUM_TSERVERS)
     );
   }
 
@@ -182,7 +211,9 @@ public class BaseMiniClusterTest extends BaseYBTest {
                       .numShardsPerTServer(overridableNumShardsPerTServer())
                       .useIpWithCertificate(useIpWithCertificate)
                       .replicationFactor(getReplicationFactor())
-                      .sslCertFile(certFile);
+                      .sslCertFile(certFile)
+                      .sslClientCertFiles(clientCertFile, clientKeyFile)
+                      .bindHostAddress(clientHost, clientPort);
 
     if (tserverEnvVars != null) {
       clusterBuilder.addEnvironmentVariables(tserverEnvVars);
@@ -194,7 +225,7 @@ public class BaseMiniClusterTest extends BaseYBTest {
     masterHostPorts = miniCluster.getMasterHostPorts();
 
     LOG.info("Started cluster with {} masters and {} tservers. " +
-             "Waiting for all tablet servers to hearbeat to masters...",
+             "Waiting for all tablet servers to heartbeat to masters...",
              numMasters, numTservers);
     if (!miniCluster.waitForTabletServers(numTservers)) {
       fail("Couldn't get " + numTservers + " tablet servers running, aborting.");
@@ -206,26 +237,38 @@ public class BaseMiniClusterTest extends BaseYBTest {
   public void createMiniCluster(int numMasters, List<String> masterArgs,
                                 List<List<String>> tserverArgs)
       throws Exception {
+    createMiniCluster(numMasters, masterArgs, tserverArgs, false);
+  }
+
+  public void createMiniCluster(int numMasters, List<String> masterArgs,
+                                List<List<String>> tserverArgs,
+                                boolean enablePgTransactions)
+      throws Exception {
     if (!miniClusterEnabled()) {
       return;
     }
     LOG.info("BaseMiniClusterTest.createMiniCluster is running");
     int numTservers = tserverArgs.size();
+    List<String> allMasterArgs = new ArrayList<>(masterArgs);
+    allMasterArgs.addAll(this.masterArgs);
     miniCluster = new MiniYBClusterBuilder()
                       .numMasters(numMasters)
                       .numTservers(numTservers)
                       .defaultTimeoutMs(DEFAULT_SLEEP)
                       .testClassName(getClass().getName())
-                      .masterArgs(masterArgs)
+                      .masterArgs(allMasterArgs)
                       .useIpWithCertificate(useIpWithCertificate)
                       .perTServerArgs(tserverArgs)
                       .sslCertFile(certFile)
+                      .sslClientCertFiles(clientCertFile, clientKeyFile)
+                      .bindHostAddress(clientHost, clientPort)
+                      .enablePgTransactions(enablePgTransactions)
                       .build();
     masterAddresses = miniCluster.getMasterAddresses();
     masterHostPorts = miniCluster.getMasterHostPorts();
 
     LOG.info("Started cluster with {} masters and {} tservers. " +
-             "Waiting for all tablet servers to hearbeat to masters...",
+             "Waiting for all tablet servers to heartbeat to masters...",
              numMasters, numTservers);
     if (!miniCluster.waitForTabletServers(numTservers)) {
       fail("Couldn't get " + numTservers + " tablet servers running, aborting.");
@@ -260,14 +303,15 @@ public class BaseMiniClusterTest extends BaseYBTest {
     return initialMetrics;
   }
 
+  protected IOMetrics createIOMetrics(MiniYBDaemon ts) throws Exception {
+    return new IOMetrics(new Metrics(ts.getLocalhostIP(), ts.getWebPort(), "server"));
+  }
+
   // Get IO metrics of all tservers.
   protected Map<MiniYBDaemon, IOMetrics> getTSMetrics() throws Exception {
     Map<MiniYBDaemon, IOMetrics> initialMetrics = new HashMap<>();
     for (MiniYBDaemon ts : miniCluster.getTabletServers().values()) {
-      IOMetrics metrics = new IOMetrics(new Metrics(ts.getLocalhostIP(),
-          ts.getCqlWebPort(),
-          "server"));
-      initialMetrics.put(ts, metrics);
+      initialMetrics.put(ts, createIOMetrics(ts));
     }
     return initialMetrics;
   }
@@ -277,10 +321,7 @@ public class BaseMiniClusterTest extends BaseYBTest {
       throws Exception {
     IOMetrics totalMetrics = new IOMetrics();
     for (MiniYBDaemon ts : miniCluster.getTabletServers().values()) {
-      IOMetrics metrics = new IOMetrics(new Metrics(ts.getLocalhostIP(),
-          ts.getCqlWebPort(),
-          "server"))
-          .subtract(initialMetrics.get(ts));
+      IOMetrics metrics = createIOMetrics(ts).subtract(initialMetrics.get(ts));
       LOG.info("Metrics of " + ts.toString() + ": " + metrics.toString());
       totalMetrics.add(metrics);
     }
@@ -349,6 +390,7 @@ public class BaseMiniClusterTest extends BaseYBTest {
   public static void tearDownAfterClass() throws Exception {
     LOG.info("BaseMiniClusterTest.tearDownAfterClass is running");
     destroyMiniCluster();
+    LOG.info("BaseMiniClusterTest.tearDownAfterClass completed");
   }
 
 }

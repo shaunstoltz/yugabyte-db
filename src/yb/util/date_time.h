@@ -53,6 +53,9 @@ class DateTime {
   static const InputFormat CqlInputFormat;
   static const OutputFormat CqlOutputFormat;
 
+  // Human readable format.
+  static const OutputFormat HumanReadableOutputFormat;
+
   //----------------------------------------------------------------------------------------------
   static Result<Timestamp> TimestampFromString(const std::string& str,
                                                const InputFormat& input_format = CqlInputFormat);
@@ -80,6 +83,12 @@ class DateTime {
   static Result<int64_t> TimeFromString(const std::string& str);
   static Result<std::string> TimeToString(int64_t time);
   static int64_t TimeNow();
+
+  //----------------------------------------------------------------------------------------------
+  // Interval represents a relative span of time, in microseconds.
+  // This is normally utilized relative to the current HybridTime.
+
+  static Result<int64_t> IntervalFromString(const std::string& str);
 
   //----------------------------------------------------------------------------------------------
   static int64_t AdjustPrecision(int64_t val, int input_precision, int output_precision);

@@ -2,7 +2,6 @@
 title: Integer and counter data types [YCQL]
 headerTitle: Integer and counter data types
 linkTitle: Integer and counter
-summary: Signed integers of different ranges
 description: There are several different data types for integers of different value ranges. Integers can be set, inserted, incremented, and decremented.
 menu:
   latest:
@@ -59,27 +58,27 @@ integer_literal ::= [ + | - ] digit [ { digit | , } ... ]
 ### Using integer data types
 
 ```sql
-cqlsh:example> CREATE TABLE items(id INT PRIMARY KEY, item_count BIGINT);
+example> CREATE TABLE items(id INT PRIMARY KEY, item_count BIGINT);
 ```
 
 ```sql
-cqlsh:example> INSERT INTO items(id, item_count) VALUES(1, 1);
+example> INSERT INTO items(id, item_count) VALUES(1, 1);
 ```
 
 ```sql
-cqlsh:example> INSERT INTO items(id, item_count) VALUES(2, 2);
+example> INSERT INTO items(id, item_count) VALUES(2, 2);
 ```
 
 ```sql
-cqlsh:example> UPDATE items SET item_count = 5 WHERE id = 1;
+example> UPDATE items SET item_count = 5 WHERE id = 1;
 ```
 
 ```sql
-cqlsh:example> UPDATE items SET item_count = item_count + 1 WHERE id = 2;
+example> UPDATE items SET item_count = item_count + 1 WHERE id = 2;
 ```
 
 ```sql
-cqlsh:example> SELECT * FROM items;
+example> SELECT * FROM items;
 ```
 
 ```
@@ -92,17 +91,17 @@ cqlsh:example> SELECT * FROM items;
 ### Using `COUNTER` data type
 
 ```sql
-cqlsh:example> CREATE TABLE item_counters(id INT PRIMARY KEY, item_counter COUNTER);
+example> CREATE TABLE item_counters(id INT PRIMARY KEY, item_counter COUNTER);
 ```
 
 For counter type, null values are treated as 0.
 
 ```sql
-cqlsh:example> UPDATE item_counters SET item_counter = item_counter + 1 WHERE id = 1;
+example> UPDATE item_counters SET item_counter = item_counter + 1 WHERE id = 1;
 ```
 
 ```sql
-cqlsh:example> SELECT * FROM item_counters;
+example> SELECT * FROM item_counters;
 ```
 
 ```

@@ -155,6 +155,10 @@ class HybridTime {
     return AddMicroseconds(millis * MonoTime::kMicrosecondsPerMillisecond);
   }
 
+  HybridTime AddSeconds(int64_t seconds) const {
+    return AddMicroseconds(seconds * MonoTime::kMicrosecondsPerSecond);
+  }
+
   HybridTime AddDelta(MonoDelta delta) const {
     return AddMicroseconds(delta.ToMicroseconds());
   }
@@ -201,6 +205,8 @@ class HybridTime {
   inline MicrosTime GetPhysicalValueMicros() const {
     return v >> kBitsForLogicalComponent;
   }
+
+  MicrosTime CeilPhysicalValueMicros() const;
 
   inline int64_t PhysicalDiff(const HybridTime& other) const {
     return static_cast<int64_t>(GetPhysicalValueMicros() - other.GetPhysicalValueMicros());

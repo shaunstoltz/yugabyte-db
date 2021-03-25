@@ -51,6 +51,9 @@ string FpToString(Fprint fp);
 // Formats a uint128 as a 32-digit hex string.
 string Uint128ToHexString(uint128 ui128);
 
+// Formats a uint16 as a 4-digit hex string.
+string Uint16ToHexString(uint16_t ui16);
+
 // Convert strings to numeric values, with strict error checking.
 // Leading and trailing spaces are allowed.
 // Negative inputs are not allowed for unsigned ints (unlike strtoul).
@@ -585,5 +588,7 @@ inline string Int64ToString(int64 i64) {
 inline string UInt64ToString(uint64 ui64) {
   return StringPrintf("%7" PRIu64, ui64);
 }
+
+string HumanizeBytes(uint64_t bytes, int precision = 2);
 
 #endif // YB_GUTIL_STRINGS_NUMBERS_H

@@ -18,10 +18,12 @@
 #include <string>
 #include <random>
 #include <fstream>
+#include <regex>
 
 #include <gflags/gflags.h>
 #include <boost/algorithm/string.hpp>
 
+#include "yb/common/common_flags.h"
 #include "yb/util/errno.h"
 #include "yb/util/flag_tags.h"
 #include "yb/util/logging.h"
@@ -29,6 +31,7 @@
 #include "yb/util/env_util.h"
 #include "yb/util/net/net_util.h"
 #include "yb/util/path_util.h"
+#include "yb/util/pg_util.h"
 #include "yb/util/scope_exit.h"
 
 DEFINE_string(pg_proxy_bind_address, "", "Address for the PostgreSQL proxy to bind to");
@@ -62,11 +65,22 @@ DEFINE_string(ysql_log_statement, "",
               "Sets which types of ysql statements should be logged");
 DEFINE_string(ysql_log_min_messages, "",
               "Sets the lowest ysql message level to log");
+DEFINE_string(ysql_log_min_duration_statement, "",
+              "Sets the duration of each completed ysql statement to be logged if the statement" \
+              " ran for at least the specified number of milliseconds.");
+
 
 // Catch-all postgres configuration flags.
+DEFINE_string(ysql_pg_conf_csv, "",
+              "CSV formatted line represented list of postgres setting assignments");
+DEFINE_string(ysql_hba_conf_csv, "",
+              "CSV formatted line represented list of postgres hba rules (in order)");
+
 DEFINE_string(ysql_pg_conf, "",
+              "Deprecated, use the `ysql_pg_conf_csv` flag instead. " \
               "Comma separated list of postgres setting assignments");
 DEFINE_string(ysql_hba_conf, "",
+              "Deprecated, use `ysql_hba_conf_csv` flag instead. " \
               "Comma separated list of postgres hba rules (in order)");
 
 using std::vector;
@@ -101,10 +115,44 @@ Status WriteConfigFile(const string& path, const vector<string>& lines) {
   return Status::OK();
 }
 
-void ReadCSVConfigValues(const string& csv, vector<string>* lines) {
-  vector<string> csv_lines;
-  boost::split(csv_lines, csv, boost::is_any_of(","));
-  lines->insert(lines->end(), csv_lines.begin(), csv_lines.end());
+void ReadCommaSeparatedValues(const string& src, vector<string>* lines) {
+  vector<string> new_lines;
+  boost::split(new_lines, src, boost::is_any_of(","));
+  lines->insert(lines->end(), new_lines.begin(), new_lines.end());
+}
+
+CHECKED_STATUS ReadCSVValues(const string& csv, vector<string>* lines) {
+  // Function reads CSV string in the following format:
+  // - fields are divided with comma (,)
+  // - fields with comma (,) or double-quote (") are quoted with double-quote (")
+  // - pair of double-quote ("") in quoted field represents single double-quote (")
+  //
+  // Examples:
+  // 1,"two, 2","three ""3""", four , -> ['1', 'two, 2', 'three "3"', ' four ', '']
+  // 1,"two                           -> Malformed CSV (quoted field 'two' is not closed)
+  // 1, "two"                         -> Malformed CSV (quoted field 'two' has leading spaces)
+  // 1,two "2"                        -> Malformed CSV (field with " must be quoted)
+  // 1,"tw"o"                         -> Malformed CSV (no separator after quoted field 'tw')
+
+  const std::regex exp(R"(^(?:([^,"]+)|(?:"((?:[^"]|(?:""))*)\"))(?:(?:,)|(?:$)))");
+  auto i = csv.begin();
+  const auto end = csv.end();
+  std::smatch match;
+  while (i != end && std::regex_search(i, end, match, exp)) {
+    // Replace pair of double-quote ("") with single double-quote (") in quoted field.
+    if (match[2].length() > 0) {
+      lines->emplace_back(match[2].first, match[2].second);
+      boost::algorithm::replace_all(lines->back(), "\"\"", "\"");
+    } else {
+      lines->emplace_back(match[1].first, match[1].second);
+    }
+    i += match.length();
+  }
+  SCHECK(i == end, InvalidArgument, Format("Malformed CSV '$0'", csv));
+  if (!csv.empty() && csv.back() == ',') {
+    lines->emplace_back();
+  }
+  return Status::OK();
 }
 
 Result<string> WritePostgresConfig(const PgProcessConf& conf) {
@@ -127,8 +175,10 @@ Result<string> WritePostgresConfig(const PgProcessConf& conf) {
     lines.push_back(line);
   }
 
-  if (!FLAGS_ysql_pg_conf.empty()) {
-    ReadCSVConfigValues(FLAGS_ysql_pg_conf, &lines);
+  if (!FLAGS_ysql_pg_conf_csv.empty()) {
+    RETURN_NOT_OK(ReadCSVValues(FLAGS_ysql_pg_conf_csv, &lines));
+  } else if (!FLAGS_ysql_pg_conf.empty()) {
+    ReadCommaSeparatedValues(FLAGS_ysql_pg_conf, &lines);
   }
 
   if (conf.enable_tls) {
@@ -166,6 +216,10 @@ Result<string> WritePostgresConfig(const PgProcessConf& conf) {
     lines.push_back("log_min_messages=" + FLAGS_ysql_log_min_messages);
   }
 
+  if (!FLAGS_ysql_log_min_duration_statement.empty()) {
+    lines.push_back("log_min_duration_statement=" + FLAGS_ysql_log_min_duration_statement);
+  }
+
   string conf_path = JoinPathSegments(conf.data_dir, "ysql_pg.conf");
   RETURN_NOT_OK(WriteConfigFile(conf_path, lines));
   return "config_file=" + conf_path;
@@ -174,27 +228,36 @@ Result<string> WritePostgresConfig(const PgProcessConf& conf) {
 Result<string> WritePgHbaConfig(const PgProcessConf& conf) {
   vector<string> lines;
 
+  // Add the user-defined custom configuration lines if any.
+  // Put this first so that it can be used to override the auto-generated config below.
+  if (!FLAGS_ysql_hba_conf_csv.empty()) {
+    RETURN_NOT_OK(ReadCSVValues(FLAGS_ysql_hba_conf_csv, &lines));
+  } else if (!FLAGS_ysql_hba_conf.empty()) {
+    ReadCommaSeparatedValues(FLAGS_ysql_hba_conf, &lines);
+  }
+
+  // Add auto-generated config for the enable auth and enable_tls flags.
   if (FLAGS_ysql_enable_auth || conf.enable_tls) {
     const auto host_type =  conf.enable_tls ? "hostssl" : "host";
-    const auto auth_method = FLAGS_ysql_enable_auth ? (conf.enable_tls ? "md5 clientcert=1" : "md5")
-                                                    : "cert";
-
-    for (const auto addr : {"0.0.0.0/0", "::0/0"}) {
-      lines.push_back(Format("$0 all all $1 $2", host_type, addr, auth_method));
-    }
+    const auto auth_method = FLAGS_ysql_enable_auth ? "md5" : "trust";
+    lines.push_back(Format("$0 all all all $1", host_type, auth_method));
   }
 
-  if (!FLAGS_ysql_hba_conf.empty()) {
-    ReadCSVConfigValues(FLAGS_ysql_hba_conf, &lines);
-  }
-
-  // Enforce a default hba configuration, so users don't lock themselves out.
+  // Enforce a default hba configuration so users don't lock themselves out.
   if (lines.empty()) {
-    lines.push_back("host all all 0.0.0.0/0 trust");
-    lines.push_back("host all all ::0/0 trust");
+    LOG(WARNING) << "No hba configuration lines found, defaulting to trust all configuration.";
+    lines.push_back("host all all all trust");
   }
 
-  string conf_path = JoinPathSegments(conf.data_dir, "ysql_hba.conf");
+  // Add comments to the hba config file noting the internally hardcoded config line.
+  if (!FLAGS_ysql_disable_index_backfill) {
+    lines.insert(lines.begin(), {
+          "# Internal configuration:",
+          "# local all postgres yb-tserver-key",
+        });
+  }
+
+  const auto conf_path = JoinPathSegments(conf.data_dir, "ysql_hba.conf");
   RETURN_NOT_OK(WriteConfigFile(conf_path, lines));
   return "hba_file=" + conf_path;
 }
@@ -257,8 +320,6 @@ Status PgWrapper::Start() {
     "-D", conf_.data_dir,
     "-p", std::to_string(conf_.pg_port),
     "-h", conf_.listen_addresses,
-    // Disable listening on a UNIX domain socket
-    "-k", ""
   };
 
   bool log_to_file = !FLAGS_logtostderr && !FLAGS_log_dir.empty() && !conf_.force_disable_log_file;
@@ -267,6 +328,17 @@ Status PgWrapper::Start() {
           << EXPR_VALUE_FOR_LOG(FLAGS_log_dir.empty()) << ", "
           << EXPR_VALUE_FOR_LOG(conf_.force_disable_log_file) << ": "
           << EXPR_VALUE_FOR_LOG(log_to_file);
+
+  // Configure UNIX domain socket for index backfill tserver-postgres communication and for
+  // Yugabyte Platform backups.
+  argv.push_back("-k");
+  const std::string& socket_dir = PgDeriveSocketDir(conf_.listen_addresses);
+  RETURN_NOT_OK(Env::Default()->CreateDirs(socket_dir));
+  argv.push_back(socket_dir);
+
+  // Also tighten permissions on the socket.
+  argv.push_back("-c");
+  argv.push_back("unix_socket_permissions=0700");
 
   if (log_to_file) {
     argv.push_back("-c");
@@ -280,9 +352,10 @@ Status PgWrapper::Start() {
   // TODO: we should probably load the metrics library in a different way once we let
   // users change the shared_preload_libraries conf parameter.
   if (FLAGS_pg_stat_statements_enabled) {
-    argv.push_back("shared_preload_libraries=pg_stat_statements,yb_pg_metrics");
+    argv.push_back("shared_preload_libraries=pg_stat_statements,yb_pg_metrics,pgaudit,"
+      "pg_hint_plan");
   } else {
-    argv.push_back("shared_preload_libraries=yb_pg_metrics");
+    argv.push_back("shared_preload_libraries=yb_pg_metrics,pgaudit,pg_hint_plan");
   }
   argv.push_back("-c");
   argv.push_back("yb_pg_metrics.node_name=" + FLAGS_metric_node_name);
@@ -320,6 +393,8 @@ Status PgWrapper::InitDb(bool yb_enabled) {
   }
 
   vector<string> initdb_args { initdb_program_path, "-D", conf_.data_dir, "-U", "postgres" };
+  LOG(INFO) << "Launching initdb: " << AsString(initdb_args);
+
   Subprocess initdb_subprocess(initdb_program_path, initdb_args);
   SetCommonEnv(&initdb_subprocess, yb_enabled);
   int exit_code = 0;

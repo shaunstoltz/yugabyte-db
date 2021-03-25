@@ -44,7 +44,7 @@ using namespace std::literals;
 
 DECLARE_uint64(log_segment_size_bytes);
 DECLARE_int32(log_min_seconds_to_retain);
-DECLARE_bool(tablet_verify_flushed_frontier_after_modifying);
+DECLARE_bool(TEST_tablet_verify_flushed_frontier_after_modifying);
 DECLARE_bool(enable_ysql);
 
 namespace yb {
@@ -80,8 +80,6 @@ using master::ImportSnapshotMetaResponsePB;
 using master::ImportSnapshotMetaResponsePB_TableMetaPB;
 using master::IsCreateTableDoneRequestPB;
 using master::IsCreateTableDoneResponsePB;
-using master::IsSnapshotOpDoneRequestPB;
-using master::IsSnapshotOpDoneResponsePB;
 using master::ListTablesRequestPB;
 using master::ListTablesResponsePB;
 using master::ListSnapshotsRequestPB;
@@ -103,7 +101,7 @@ class SnapshotTest : public YBMiniClusterTestBase<MiniCluster> {
     YBMiniClusterTestBase::SetUp();
 
     FLAGS_log_min_seconds_to_retain = 5;
-    FLAGS_tablet_verify_flushed_frontier_after_modifying = true;
+    FLAGS_TEST_tablet_verify_flushed_frontier_after_modifying = true;
     FLAGS_enable_ysql = false;
 
     MiniClusterOptions opts;
@@ -190,38 +188,34 @@ class SnapshotTest : public YBMiniClusterTestBase<MiniCluster> {
     ASSERT_OK(WaitFor(handler, 30s, handler_name, 100ms, 1.5));
   }
 
-  template <typename TReq, typename TResp, typename TProxy>
-  auto ProxyCallLambda(
-      const TReq* req, TResp* resp, TProxy* proxy,
-      Status (TProxy::*call)(const TReq&, TResp*, rpc::RpcController* controller)) {
-    return [=]() -> bool {
-      EXPECT_OK((proxy->*call)(*req, resp, ResetAndGetController()));
-      EXPECT_FALSE(resp->has_error());
-      EXPECT_TRUE(resp->has_done());
-      return resp->done();
-    };
-  }
-
   void WaitForSnapshotOpDone(const string& op_name, const string& snapshot_id) {
-    IsSnapshotOpDoneRequestPB is_snapshot_done_req;
-    IsSnapshotOpDoneResponsePB is_snapshot_done_resp;
-    is_snapshot_done_req.set_snapshot_id(snapshot_id);
-
     WaitTillComplete(
-        op_name, ProxyCallLambda(
-            &is_snapshot_done_req, &is_snapshot_done_resp,
-            proxy_backup_.get(), &MasterBackupServiceProxy::IsSnapshotOpDone));
+        op_name,
+        [this, &snapshot_id]() -> bool {
+          ListSnapshotsRequestPB list_req;
+          ListSnapshotsResponsePB list_resp;
+          list_req.set_snapshot_id(snapshot_id);
+
+          EXPECT_OK(proxy_backup_->ListSnapshots(list_req, &list_resp, ResetAndGetController()));
+          EXPECT_FALSE(list_resp.has_error());
+          EXPECT_EQ(list_resp.snapshots_size(), 1);
+          return list_resp.snapshots(0).entry().state() == SysSnapshotEntryPB::COMPLETE;
+        });
   }
 
   void WaitForCreateTableDone(const YBTableName& table_name) {
-    IsCreateTableDoneRequestPB is_create_done_req;
-    IsCreateTableDoneResponsePB is_create_done_resp;
-    table_name.SetIntoTableIdentifierPB(is_create_done_req.mutable_table());
-
     WaitTillComplete(
-        "IsCreateTableDone", ProxyCallLambda(
-            &is_create_done_req, &is_create_done_resp,
-            proxy_.get(), &MasterServiceProxy::IsCreateTableDone));
+        "IsCreateTableDone",
+        [this, &table_name]() -> bool {
+          IsCreateTableDoneRequestPB req;
+          IsCreateTableDoneResponsePB resp;
+          table_name.SetIntoTableIdentifierPB(req.mutable_table());
+
+          EXPECT_OK(proxy_->IsCreateTableDone(req, &resp, ResetAndGetController()));
+          EXPECT_FALSE(resp.has_error());
+          EXPECT_TRUE(resp.has_done());
+          return resp.done();
+        });
   }
 
   SnapshotId CreateSnapshot() {
@@ -266,6 +260,7 @@ class SnapshotTest : public YBMiniClusterTestBase<MiniCluster> {
       auto ts_tablet_peers = ts->server()->tablet_manager()->GetTabletPeers();
       max_tablets = std::max(max_tablets, ts_tablet_peers.size());
       for (const auto& tablet_peer : ts_tablet_peers) {
+        EXPECT_OK(tablet_peer->WaitUntilConsensusRunning(15s));
         last_tablet_op[tablet_peer->tablet_id()].MakeAtLeast(
             tablet_peer->consensus()->GetLastReceivedOpId());
       }
@@ -299,7 +294,7 @@ class SnapshotTest : public YBMiniClusterTestBase<MiniCluster> {
         ));
         FsManager* const fs = tablet_peer->tablet_metadata()->fs_manager();
         const auto rocksdb_dir = tablet_peer->tablet_metadata()->rocksdb_dir();
-        const auto top_snapshots_dir = tablet::TabletSnapshots::SnapshotsDirName(rocksdb_dir);
+        const auto top_snapshots_dir = tablet_peer->tablet_metadata()->snapshots_dir();
         const auto snapshot_dir = JoinPathSegments(top_snapshots_dir, snapshot_id);
 
         LOG(INFO) << "Checking tablet snapshot folder: " << snapshot_dir;
@@ -363,7 +358,7 @@ TEST_F(SnapshotTest, CreateSnapshot) {
     for (std::shared_ptr<TabletPeer>& tablet_peer : ts_tablet_peers) {
       FsManager* const fs = tablet_peer->tablet_metadata()->fs_manager();
       const string rocksdb_dir = tablet_peer->tablet_metadata()->rocksdb_dir();
-      const string top_snapshots_dir = tablet::TabletSnapshots::SnapshotsDirName(rocksdb_dir);
+      const string top_snapshots_dir = tablet_peer->tablet_metadata()->snapshots_dir();
 
       ASSERT_TRUE(fs->Exists(rocksdb_dir));
       ASSERT_TRUE(fs->Exists(top_snapshots_dir));

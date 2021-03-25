@@ -150,8 +150,6 @@ UPDATE atest2 SET col2 = NULL; -- ok
 UPDATE atest2 SET col2 = NOT col2; -- fails; requires SELECT on atest2
 ERROR:  permission denied for table atest2
 UPDATE atest2 SET col2 = true FROM atest1 WHERE atest1.a = 5; -- ok
-ERROR:  FROM clause in UPDATE not supported yet
-HINT:  See https://github.com/YugaByte/yugabyte-db/issues/738. Click '+' on the description to raise its priority
 SELECT * FROM atest1 FOR UPDATE; -- fail
 ERROR:  permission denied for table atest1
 SELECT * FROM atest2 FOR UPDATE; -- fail
@@ -197,30 +195,30 @@ GRANT SELECT ON atest12v TO PUBLIC;
 -- This plan should use nestloop, knowing that few rows will be selected.
 -- TODO(jason): fix expected output when issue #1420 is closed or closing.
 EXPLAIN (COSTS OFF) SELECT * FROM atest12v x, atest12v y WHERE x.a = y.b;
-                   QUERY PLAN
--------------------------------------------------
- Merge Join
-   Merge Cond: (atest12.a = atest12_1.b)
-   ->  Index Scan using atest12_a_idx on atest12
+                QUERY PLAN
+-------------------------------------------
+ Hash Join
+   Hash Cond: (atest12.a = atest12_1.b)
+   ->  Seq Scan on atest12
          Filter: (b <<< 5)
-   ->  Sort
-         Sort Key: atest12_1.b
-         ->  Foreign Scan on atest12 atest12_1
+   ->  Hash
+         ->  Seq Scan on atest12 atest12_1
                Filter: (b <<< 5)
-(8 rows)
+(7 rows)
 
 -- And this one.
 -- TODO(jason): fix expected output when issue #2076 is closed or closing.
 EXPLAIN (COSTS OFF) SELECT * FROM atest12 x, atest12 y
   WHERE x.a = y.b and abs(y.a) <<< 5;
-                    QUERY PLAN
----------------------------------------------------
- Nested Loop
-   ->  Foreign Scan on atest12 y
+            QUERY PLAN
+-----------------------------------
+ Hash Join
+   Hash Cond: (y.b = x.a)
+   ->  Seq Scan on atest12 y
          Filter: (abs(a) <<< 5)
-   ->  Index Scan using atest12_a_idx on atest12 x
-         Index Cond: (a = y.b)
-(5 rows)
+   ->  Hash
+         ->  Seq Scan on atest12 x
+(6 rows)
 
 -- Check if regress_priv_user2 can break security.
 SET SESSION AUTHORIZATION regress_priv_user2;
@@ -235,17 +233,16 @@ ERROR:  permission denied for table atest12
 -- This plan should use hashjoin, as it will expect many rows to be selected.
 -- TODO(jason): fix expected output when issue #1420 is closed or closing.
 EXPLAIN (COSTS OFF) SELECT * FROM atest12v x, atest12v y WHERE x.a = y.b;
-                   QUERY PLAN
--------------------------------------------------
- Merge Join
-   Merge Cond: (atest12.a = atest12_1.b)
-   ->  Index Scan using atest12_a_idx on atest12
+                QUERY PLAN
+-------------------------------------------
+ Hash Join
+   Hash Cond: (atest12.a = atest12_1.b)
+   ->  Seq Scan on atest12
          Filter: (b <<< 5)
-   ->  Sort
-         Sort Key: atest12_1.b
-         ->  Foreign Scan on atest12 atest12_1
+   ->  Hash
+         ->  Seq Scan on atest12 atest12_1
                Filter: (b <<< 5)
-(8 rows)
+(7 rows)
 
 -- Now regress_priv_user1 grants sufficient access to regress_priv_user2.
 SET SESSION AUTHORIZATION regress_priv_user1;
@@ -254,31 +251,31 @@ SET SESSION AUTHORIZATION regress_priv_user2;
 -- Now regress_priv_user2 will also get a good row estimate.
 -- TODO(jason): fix expected output when issue #1420 is closed or closing.
 EXPLAIN (COSTS OFF) SELECT * FROM atest12v x, atest12v y WHERE x.a = y.b;
-                   QUERY PLAN
--------------------------------------------------
- Merge Join
-   Merge Cond: (atest12.a = atest12_1.b)
-   ->  Index Scan using atest12_a_idx on atest12
+                QUERY PLAN
+-------------------------------------------
+ Hash Join
+   Hash Cond: (atest12.a = atest12_1.b)
+   ->  Seq Scan on atest12
          Filter: (b <<< 5)
-   ->  Sort
-         Sort Key: atest12_1.b
-         ->  Foreign Scan on atest12 atest12_1
+   ->  Hash
+         ->  Seq Scan on atest12 atest12_1
                Filter: (b <<< 5)
-(8 rows)
+(7 rows)
 
 -- But not for this, due to lack of table-wide permissions needed
 -- to make use of the expression index's statistics.
 -- TODO(jason): fix expected output when issue #1420 is closed or closing.
 EXPLAIN (COSTS OFF) SELECT * FROM atest12 x, atest12 y
   WHERE x.a = y.b and abs(y.a) <<< 5;
-                    QUERY PLAN
----------------------------------------------------
- Nested Loop
-   ->  Foreign Scan on atest12 y
+            QUERY PLAN
+-----------------------------------
+ Hash Join
+   Hash Cond: (y.b = x.a)
+   ->  Seq Scan on atest12 y
          Filter: (abs(a) <<< 5)
-   ->  Index Scan using atest12_a_idx on atest12 x
-         Index Cond: (a = y.b)
-(5 rows)
+   ->  Hash
+         ->  Seq Scan on atest12 x
+(6 rows)
 
 -- clean up (regress_priv_user1's objects are all dropped later)
 DROP FUNCTION leak2(integer, integer) CASCADE;
@@ -546,8 +543,7 @@ SET SESSION AUTHORIZATION regress_priv_user2;
 INSERT INTO t1 (c1, c2) VALUES (1, 1); -- fail, but row not shown
 ERROR:  duplicate key value violates unique constraint "t1_pkey"
 UPDATE t1 SET c2 = 1; -- fail, but row not shown
-ERROR:  Update PRIMARY KEY columns are not yet supported
-HINT:  See https://github.com/YugaByte/yugabyte-db/issues/659. Click '+' on the description to raise its priority
+ERROR:  duplicate key value violates unique constraint "t1_pkey"
 INSERT INTO t1 (c1, c2) VALUES (null, null); -- fail, but see columns being inserted
 ERROR:  null value in column "c1" violates not-null constraint
 DETAIL:  Failing row contains (c1, c2) = (null, null).
@@ -1500,7 +1496,8 @@ SELECT has_table_privilege('regress_priv_user1', 'testns.acltest1', 'INSERT'); -
  f
 (1 row)
 
-ALTER DEFAULT PRIVILEGES IN SCHEMA testns GRANT SELECT ON TABLES TO public;
+-- placeholder for test with duplicated schema and role names
+ALTER DEFAULT PRIVILEGES IN SCHEMA testns,testns GRANT SELECT ON TABLES TO public,public;
 SELECT has_table_privilege('regress_priv_user1', 'testns.acltest1', 'SELECT'); -- no
  has_table_privilege
 ---------------------
@@ -2016,5 +2013,3 @@ HINT:  Please report the issue on https://github.com/YugaByte/yugabyte-db/issues
 -- DROP TABLE lock_table;
 -- DROP USER regress_locktable_user;
 --
--- TODO(jason): remove when issue #1721 is closed or closing.
-DISCARD TEMP;

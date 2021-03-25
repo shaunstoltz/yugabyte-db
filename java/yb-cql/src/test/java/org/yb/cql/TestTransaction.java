@@ -25,11 +25,14 @@ import com.datastax.driver.core.PreparedStatement;
 import com.datastax.driver.core.ResultSetFuture;
 
 import org.yb.YBTestRunner;
-
+import org.yb.util.SanitizerUtil;
 import org.junit.runner.RunWith;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 
 @RunWith(value=YBTestRunner.class)
 public class TestTransaction extends BaseCQLTest {
+  private static final Logger LOG = LoggerFactory.getLogger(TestTransaction.class);
 
   public int getTestMethodTimeoutSec() {
     // Extend timeout for testBasicReadWrite stress test.
@@ -431,8 +434,8 @@ public class TestTransaction extends BaseCQLTest {
       LOG.info("Initial restarts = {}, retries = {}", initialRestarts, initialRetries);
 
       // Keep reading until we have the desired number of restart requests and retries.
-      final int TOTAL_RESTARTS = 10;
-      final int TOTAL_RETRIES = 10;
+      final int TOTAL_RESTARTS = SanitizerUtil.nonTsanVsTsan(10, 5);
+      final int TOTAL_RETRIES = SanitizerUtil.nonTsanVsTsan(10, 5);
       int i = 0;
       while (true) {
         i++;

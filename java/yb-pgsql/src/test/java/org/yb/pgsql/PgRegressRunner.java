@@ -19,7 +19,6 @@ import org.slf4j.LoggerFactory;
 import org.yb.client.TestUtils;
 import org.yb.minicluster.ExternalDaemonLogErrorListener;
 import org.yb.minicluster.LogErrorListener;
-import org.yb.minicluster.LogErrorListenerWrapper;
 import org.yb.minicluster.LogPrinter;
 import org.yb.util.*;
 
@@ -99,6 +98,12 @@ public class PgRegressRunner {
           scheduleWriter.println(line);
         }
       }
+      // TODO(dmitry): Workaround for #1721, remove after fix.
+      for (File f : (new File(pgRegressOutputDir, "sql")).listFiles()) {
+        try (FileWriter fr = new FileWriter(f, true)) {
+          fr.write("\n-- YB_DATA_END\nROLLBACK;DISCARD TEMP;");
+        }
+      }
     } catch (IOException ex) {
       LOG.error("Failed to copy pgregress data from " + pgRegressDir + " to " + pgRegressOutputDir);
       throw new RuntimeException(ex);
@@ -122,8 +127,7 @@ public class PgRegressRunner {
       Pattern.compile("^test\\s+([a-zA-Z0-9_-]+)\\s+[.]+\\s+FAILED\\s*$");
 
   private LogErrorListener createLogErrorListener() {
-    return new LogErrorListenerWrapper(
-        new ExternalDaemonLogErrorListener("pg_regress with pid " + pgRegressPid)) {
+    return new ExternalDaemonLogErrorListener("pg_regress with pid " + pgRegressPid) {
       @Override
       public void handleLine(String line) {
         super.handleLine(line);

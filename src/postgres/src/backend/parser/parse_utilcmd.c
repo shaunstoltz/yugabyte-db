@@ -97,6 +97,12 @@ typedef struct
 	bool		ispartitioned;	/* true if table is partitioned */
 	PartitionBoundSpec *partbound;	/* transformed FOR VALUES */
 	bool		ofType;			/* true if statement contains OF typename */
+
+	/* TODO(neil) For completeness, we should process "split_options" here to cache partitioning
+	 * information in Postgres relation objects. This is important for choosing query plan.
+	 *
+	 * OptSplit   *split_options;
+	 */
 } CreateStmtContext;
 
 /* State shared by transformCreateSchemaStmt and its subroutines */
@@ -143,7 +149,6 @@ static void transformPartitionCmd(CreateStmtContext *cxt, PartitionCmd *cmd);
 static void validateInfiniteBounds(ParseState *pstate, List *blist);
 static Const *transformPartitionBoundValue(ParseState *pstate, A_Const *con,
 							 const char *colName, Oid colType, int32 colTypmod);
-
 
 /*
  * transformCreateStmt -
@@ -248,6 +253,11 @@ transformCreateStmt(CreateStmt *stmt, const char *queryString)
 	cxt.ispartitioned = stmt->partspec != NULL;
 	cxt.partbound = stmt->partbound;
 	cxt.ofType = (stmt->ofTypename != NULL);
+	/* TODO(neil) For completeness, we should process "split_options" here to cache partitioning
+	 * information in Postgres relation objects. This is important for choosing query plan.
+	 *
+	 * cxt.split_options = stmt->split_options;
+	 */
 
 	/*
 	 * Notice that we allow OIDs here only for plain tables, even though
@@ -339,8 +349,29 @@ transformCreateStmt(CreateStmt *stmt, const char *queryString)
 						(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
 							errmsg("Users cannot create system catalog tables.")));
 		}
+		else if (strcmp(def->defname, "tablegroup") == 0)
+		{
+			ereport(ERROR,
+					(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+					 errmsg("Cannot supply tablegroup through WITH clause.")));
+		}
 		else if (strcmp(def->defname, "colocated") == 0)
 			(void) defGetBoolean(def);
+		else if (strcmp(def->defname, "table_oid") == 0)
+		{
+			if (!yb_enable_create_with_table_oid)
+			{
+				ereport(ERROR, (errcode(ERRCODE_INVALID_TABLE_DEFINITION),
+					errmsg("Create table with oid is not allowed."),
+					errhint("Try enabling the session variable yb_enable_create_with_table_oid.")));
+			}
+			Oid table_oid = strtol(defGetString(def), NULL, 10);
+			if (table_oid < FirstNormalObjectId)
+			{
+				elog(ERROR, "User tables must have an OID >= %d.",
+					 FirstNormalObjectId);
+			}
+		}
 		else
 			ereport(WARNING,
 					(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
@@ -750,7 +781,17 @@ transformColumnDefinition(CreateStmtContext *cxt, ColumnDef *column)
 
 					column->identity = constraint->generated_when;
 					saw_identity = true;
+
+					/* An identity column is implicitly NOT NULL */
+					if (saw_nullable && !column->is_not_null)
+						ereport(ERROR,
+								(errcode(ERRCODE_SYNTAX_ERROR),
+								 errmsg("conflicting NULL/NOT NULL declarations for column \"%s\" of table \"%s\"",
+										column->colname, cxt->relation->relname),
+								 parser_errposition(cxt->pstate,
+													constraint->location)));
 					column->is_not_null = true;
+					saw_nullable = true;
 					break;
 				}
 
@@ -765,7 +806,7 @@ transformColumnDefinition(CreateStmtContext *cxt, ColumnDef *column)
 							 errmsg("primary key constraints are not supported on foreign tables"),
 							 parser_errposition(cxt->pstate,
 												constraint->location)));
-				/* FALL THRU */
+				switch_fallthrough();
 
 			case CONSTR_UNIQUE:
 				if (cxt->isforeign)
@@ -863,6 +904,59 @@ transformColumnDefinition(CreateStmtContext *cxt, ColumnDef *column)
 	}
 }
 
+static void
+YBCheckDeferrableConstraint(CreateStmtContext *cxt, Constraint *constraint)
+{
+	if (!constraint->deferrable || cxt->relation->relpersistence == RELPERSISTENCE_TEMP)
+		return;
+	const char* message = NULL;
+	switch (constraint->contype)
+	{
+		case CONSTR_PRIMARY:
+			message = "DEFERRABLE primary key constraints are not supported yet";
+			break;
+
+		case CONSTR_UNIQUE:
+			message = "DEFERRABLE unique constraints are not supported yet";
+			break;
+
+		case CONSTR_EXCLUSION:
+			message = "DEFERRABLE exclusion constraints are not supported yet";
+			break;
+
+		case CONSTR_CHECK:
+			message = "DEFERRABLE check constraints are not supported yet";
+			break;
+
+		case CONSTR_FOREIGN:
+			/* DEFERRABLE foreign key constraints are supported */
+			return;
+
+		case CONSTR_NULL:
+		case CONSTR_NOTNULL:
+		case CONSTR_DEFAULT:
+		case CONSTR_ATTR_DEFERRABLE:
+		case CONSTR_ATTR_NOT_DEFERRABLE:
+		case CONSTR_ATTR_DEFERRED:
+		case CONSTR_ATTR_IMMEDIATE:
+			elog(ERROR, "invalid context for constraint type %d",
+				 constraint->contype);
+			return;
+
+		default:
+			elog(ERROR, "unrecognized constraint type: %d",
+				 constraint->contype);
+			return;
+	}
+
+	ereport(ERROR,
+			 (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+			 errmsg("%s", message),
+			 errhint("See https://github.com/YugaByte/yugabyte-db/issues/1129. "
+			         "Click '+' on the description to raise its priority"),
+			 parser_errposition(cxt->pstate, constraint->location)));
+}
+
 /*
  * transformTableConstraint
  *		transform a Constraint node within CREATE TABLE or ALTER TABLE
@@ -938,6 +1032,9 @@ transformTableConstraint(CreateStmtContext *cxt, Constraint *constraint)
 				 constraint->contype);
 			break;
 	}
+
+	if (IsYugaByteEnabled())
+		YBCheckDeferrableConstraint(cxt, constraint);
 }
 
 /*
@@ -1587,7 +1684,11 @@ generateClonedIndexStmt(RangeVar *heapRel, Oid heapRelid, Relation source_idx,
 		/* Add the operator class name, if non-default */
 		iparam->opclass = get_opclass(indclass->values[keyno], keycoltype);
 
-		iparam->ordering = SORTBY_DEFAULT;
+		if (opt & INDOPTION_HASH)
+			iparam->ordering = SORTBY_HASH;
+		else
+			iparam->ordering = SORTBY_DEFAULT;
+
 		iparam->nulls_ordering = SORTBY_NULLS_DEFAULT;
 
 		/* Adjust options if necessary */
@@ -2592,6 +2693,39 @@ transformIndexStmt(Oid relid, IndexStmt *stmt, const char *queryString)
 	pstate->p_sourcetext = queryString;
 
 	/*
+	 * We must ensure that no tablegroup option was supplied in the WITH clause.
+	 * Tablegroups cannot be supplied directly for indexes. We check here instead
+	 * of ybccmds as we supply the reloption for the tablegroup of the indexed table
+	 * in DefineIndex(.) if there exists one.
+	 */
+	ListCell *cell;
+	foreach(cell, stmt->options)
+	{
+		DefElem *def = (DefElem*) lfirst(cell);
+		if (strcmp(def->defname, "tablegroup") == 0)
+		{
+			ereport(ERROR,
+					(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+					 errmsg("Cannot supply tablegroup through WITH clause.")));
+		}
+		else if (strcmp(def->defname, "table_oid") == 0)
+		{
+			if (!yb_enable_create_with_table_oid)
+			{
+				ereport(ERROR, (errcode(ERRCODE_INVALID_TABLE_DEFINITION),
+					errmsg("Create index with oid is not allowed."),
+					errhint("Try enabling the session variable yb_enable_create_with_table_oid.")));
+			}
+			Oid table_oid = strtol(defGetString(def), NULL, 10);
+			if (table_oid < FirstNormalObjectId)
+			{
+				elog(ERROR, "User tables must have an OID >= %d.",
+					 FirstNormalObjectId);
+			}
+		}
+	}
+
+	/*
 	 * Put the parent table into the rtable so that the expressions can refer
 	 * to its fields without qualification.  Caller is responsible for locking
 	 * relation, but we still need to open it.
@@ -3043,6 +3177,11 @@ transformAlterTableStmt(Oid relid, AlterTableStmt *stmt,
 	cxt.ispartitioned = (rel->rd_rel->relkind == RELKIND_PARTITIONED_TABLE);
 	cxt.partbound = NULL;
 	cxt.ofType = false;
+	/* TODO(neil) For completeness, we should process "split_options" here to cache partitioning
+	 * information in Postgres relation objects. This is important for choosing query plan.
+	 *
+	 * cxt.split_options = NULL;
+	 */
 
 	/*
 	 * The only subtypes that currently require parse transformation handling
@@ -3060,6 +3199,8 @@ transformAlterTableStmt(Oid relid, AlterTableStmt *stmt,
 				{
 					ColumnDef  *def = castNode(ColumnDef, cmd->def);
 
+					transformColumnDefinition(&cxt, def);
+
 					/*
 					 * Report an error for constraint types which YB does not yet support in
 					 * ALTER TABLE ... ADD COLUMN statements.
@@ -3073,17 +3214,28 @@ transformAlterTableStmt(Oid relid, AlterTableStmt *stmt,
 						{
 							case CONSTR_IDENTITY:
 							case CONSTR_PRIMARY:
-							case CONSTR_UNIQUE:
 								ereport(ERROR, (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
 											errmsg("This ALTER TABLE command is not yet supported.")));
+								break;
+
+							case CONSTR_UNIQUE:
+								// TODO(alex): Since we can't transactionally rollback adding column
+								//             on DocDB side yet, only support the simplest form
+								//             of this for now - the one that can't fail because of
+								//             some constraint violation.
+								//             While FKs ignore NULL values, they may still error
+								//             out if referenced column has no unique constraint
+								//             so we disallow them too.
+								if (def->is_not_null || def->raw_default
+								    || cxt.ckconstraints || cxt.fkconstraints)
+									ereport(ERROR, (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+												errmsg("This ALTER TABLE command is not yet supported.")));
 								break;
 
 							default:
 								break;
 						}
 					}
-
-					transformColumnDefinition(&cxt, def);
 
 					/*
 					 * If the column has a non-null default, we can't skip
@@ -3979,4 +4131,51 @@ transformPartitionBoundValue(ParseState *pstate, A_Const *con,
 				 parser_errposition(pstate, con->location)));
 
 	return (Const *) value;
+}
+
+void
+YBTransformPartitionSplitValue(ParseState *pstate,
+							   List *split_point,
+							   Form_pg_attribute *attrs,
+							   int attr_count,
+							   PartitionRangeDatum **datums,
+							   int *datum_count)
+{
+	/*
+	 * Number of column values in a split should equal number of primary key columns.
+	 * - When value count is less than column count, default value MINVALUE is used to fill the
+	 *   given the missing split value.
+	 * - When number of given values is greater than column count, this is an error.
+	 */
+	if (list_length(split_point) > attr_count)
+	{
+		ereport(ERROR,
+				(errcode(ERRCODE_INVALID_OBJECT_DEFINITION),
+				 errmsg("Number of SPLIT values cannot be greater than number of SPLIT columns")));
+	}
+
+	ListCell *lc;
+	int idx = 0;
+	foreach(lc, split_point) {
+		/* Find the constant value for the given column */
+		PartitionRangeDatum *datum = (PartitionRangeDatum *)lfirst(lc);
+		if (datum->value) {
+			Const *value = transformPartitionBoundValue(pstate,
+														castNode(A_Const, datum->value),
+														NameStr(attrs[idx]->attname),
+														attrs[idx]->atttypid,
+														attrs[idx]->atttypmod);
+			if (value->constisnull)
+				ereport(ERROR,
+						(errcode(ERRCODE_INVALID_OBJECT_DEFINITION),
+						 errmsg("cannot specify NULL in range bound")));
+
+			datum = copyObject(datum); /* don't scribble on input */
+			datum->value = (Node *) value;
+		}
+
+		datums[idx] = datum;
+		idx++;
+	}
+	*datum_count = idx;
 }

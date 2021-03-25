@@ -42,13 +42,13 @@ SELECT * FROM test_index WHERE v1 IN (1, 2, 3);
 
 CREATE TABLE test_sys_catalog_update (k int primary key, v int);
 
-EXPLAIN SELECT relname FROM pg_class WHERE relname = 'test_sys_catalog_update';
+EXPLAIN (COSTS OFF) SELECT relname FROM pg_class WHERE relname = 'test_sys_catalog_update';
 SELECT relname  FROM pg_class WHERE relname = 'test_sys_catalog_update';
 
-EXPLAIN SELECT typname FROM pg_type WHERE typname = 'test_sys_catalog_update';
+EXPLAIN (COSTS OFF) SELECT typname FROM pg_type WHERE typname = 'test_sys_catalog_update';
 SELECT typname FROM pg_type WHERE typname = 'test_sys_catalog_update';
 
-EXPLAIN SELECT attname, atttypid FROM pg_attribute WHERE attname = 'v';
+EXPLAIN (COSTS OFF) SELECT attname, atttypid FROM pg_attribute WHERE attname = 'v';
 SELECT attname, atttypid FROM pg_attribute WHERE attname = 'v';
 
 ALTER TABLE test_sys_catalog_update RENAME TO test_sys_catalog_update_new;
@@ -71,7 +71,7 @@ CREATE TABLE t2 (h INT, r INT, v1 INT, v2 INT, PRIMARY KEY (h hash, r));
 \d t1
 \d t2
 
-INSERT INTO t1 VALUES (1, 1, 11, 11), (1, 2, 11, 12); 
+INSERT INTO t1 VALUES (1, 1, 11, 11), (1, 2, 11, 12);
 INSERT INTO t2 VALUES (1, 1, 21, 21);
 
 -- The following 2 inserts should produce error due to duplicate primary key / unique index value
@@ -173,7 +173,7 @@ CREATE UNIQUE INDEX test_truncate_index ON test_truncate (b);
 INSERT INTO test_truncate VALUES (1, 2);
 INSERT INTO test_truncate VALUES (2, 2);
 
-EXPLAIN SELECT b FROM test_truncate WHERE b = 2;
+EXPLAIN (COSTS OFF) SELECT b FROM test_truncate WHERE b = 2;
 SELECT b FROM test_truncate WHERE b = 2;
 
 TRUNCATE test_truncate;
@@ -197,17 +197,19 @@ CREATE TABLE test_include (c1 int, c2 int, c3 int);
 INSERT INTO test_include VALUES (1, 1, 1), (1, 2, 2), (2, 2, 2), (3, 3, 3);
 -- Expect duplicate key error
 CREATE UNIQUE INDEX ON test_include (c1) include (c2);
+\d test_include
+DROP INDEX test_include_c1_c2_idx;
 DELETE FROM test_include WHERE c1 = 1 AND c2 = 2;
 CREATE UNIQUE INDEX ON test_include (c1) include (c2);
-EXPLAIN SELECT c1, c2 FROM test_include WHERE c1 = 1;
+EXPLAIN (COSTS OFF) SELECT c1, c2 FROM test_include WHERE c1 = 1;
 SELECT c1, c2 FROM test_include WHERE c1 = 1;
 \d test_include
 -- Verify the included column is updated in both the base table and the index. Use WHERE condition
 -- on c1 below to force the scan on the index vs. base table. Select the non-included column c3 in
 -- the other case to force the use of sequential scan on the base table.
 UPDATE test_include SET c2 = 22 WHERE c1 = 2;
-EXPLAIN SELECT c1, c2 FROM test_include WHERE c1 > 0 ORDER BY c2;
-EXPLAIN SELECT * FROM test_include ORDER BY c2;
+EXPLAIN (COSTS OFF) SELECT c1, c2 FROM test_include WHERE c1 > 0 ORDER BY c2;
+EXPLAIN (COSTS OFF) SELECT * FROM test_include ORDER BY c2;
 SELECT c1, c2 FROM test_include WHERE c1 > 0 ORDER BY c2;
 SELECT * FROM test_include ORDER BY c2;
 UPDATE test_include SET c2 = NULL WHERE c1 = 1;
@@ -216,6 +218,20 @@ UPDATE test_include SET c2 = NULL WHERE c1 = 1;
 DELETE FROM test_include WHERE c1 = 2;
 SELECT c1, c2 FROM test_include WHERE c1 > 0 ORDER BY c2;
 SELECT * FROM test_include ORDER BY c2;
+
+-- Test SPLIT INTO
+CREATE TABLE test_split (
+  h1 int, h2 int, r1 int, r2 int, v1 int, v2 int,
+  PRIMARY KEY ((h1, h2) HASH, r1, r2));
+CREATE INDEX ON test_split (h2 HASH, r2, r1) SPLIT INTO 20 TABLETS;
+CREATE INDEX ON test_split ((r1,r2) HASH) SPLIT INTO 20 TABLETS;
+CREATE INDEX ON test_split (h2) SPLIT INTO 20 TABLETS;
+\d test_split
+
+-- These should fail
+CREATE INDEX ON test_split (r1 ASC) SPLIT INTO 20 TABLETS;
+CREATE INDEX ON test_split (h2 ASC, r1) SPLIT INTO 20 TABLETS;
+CREATE INDEX ON test_split (h1 HASH) SPLIT INTO 10000 TABLETS;
 
 -- Test hash methods
 CREATE TABLE test_method (
@@ -243,17 +259,17 @@ INSERT INTO test_method VALUES
   (2, 1, 1, 2, 10, 20);
 
 -- Test scans using different indexes. Verify order by.
-EXPLAIN SELECT * FROM test_method ORDER BY h1, h2;
+EXPLAIN (COSTS OFF) SELECT * FROM test_method ORDER BY h1, h2;
 SELECT * FROM test_method ORDER BY h1, h2;
-EXPLAIN SELECT * FROM test_method WHERE h1 = 1 AND h2 = 1 ORDER BY r1, r2;
+EXPLAIN (COSTS OFF) SELECT * FROM test_method WHERE h1 = 1 AND h2 = 1 ORDER BY r1, r2;
 SELECT * FROM test_method WHERE h1 = 1 AND h2 = 1 ORDER BY r1, r2;
-EXPLAIN SELECT * FROM test_method ORDER BY r1, r2;
+EXPLAIN (COSTS OFF) SELECT * FROM test_method ORDER BY r1, r2;
 SELECT * FROM test_method ORDER BY r1, r2;
-EXPLAIN SELECT * FROM test_method WHERE v1 > 5ORDER BY v1, v2;
+EXPLAIN (COSTS OFF) SELECT * FROM test_method WHERE v1 > 5ORDER BY v1, v2;
 SELECT * FROM test_method WHERE v1 > 5ORDER BY v1, v2;
-EXPLAIN SELECT * FROM test_method WHERE h2 = 2 ORDER BY r1, r2;
+EXPLAIN (COSTS OFF) SELECT * FROM test_method WHERE h2 = 2 ORDER BY r1, r2;
 SELECT * FROM test_method WHERE h2 = 2 ORDER BY r1, r2;
-EXPLAIN UPDATE test_method SET v2 = v2 + 10 WHERE h2 = 2;
+EXPLAIN (COSTS OFF) UPDATE test_method SET v2 = v2 + 10 WHERE h2 = 2;
 
 -- Test update using a hash index
 UPDATE test_method SET v2 = v2 + 10 WHERE h2 = 2;
@@ -261,11 +277,79 @@ SELECT * FROM test_method ORDER BY h1, h2;
 SELECT * FROM test_method ORDER BY r1, r2;
 
 -- Test delete using a unique index
-EXPLAIN DELETE FROM test_method WHERE v1 = 5 AND v2 = 25;
+EXPLAIN (COSTS OFF) DELETE FROM test_method WHERE v1 = 5 AND v2 = 25;
 DELETE FROM test_method WHERE v1 = 5 AND v2 = 25;
 
 -- Test delete using the primary key
-EXPLAIN DELETE FROM test_method WHERE h1 = 2 AND h2 = 0;
+EXPLAIN (COSTS OFF) DELETE FROM test_method WHERE h1 = 2 AND h2 = 0;
 DELETE FROM test_method WHERE h1 = 2 AND h2 = 0;
 
 SELECT * FROM test_method ORDER BY h1, h2;
+
+-- Test ordering on split indexes
+CREATE TABLE tbl(k SERIAL PRIMARY KEY, v INT);
+CREATE INDEX ON tbl(v ASC) SPLIT AT VALUES((10), (20), (30));
+INSERT INTO tbl(v) VALUES
+    (5), (6), (16), (15), (25), (26), (36), (35), (46), (10), (20), (30), (40), (6), (16), (26);
+EXPLAIN (COSTS OFF) SELECT * FROM tbl ORDER BY v ASC;
+SELECT * FROM tbl ORDER BY v ASC;
+EXPLAIN (COSTS OFF) SELECT * FROM tbl ORDER BY v DESC;
+SELECT * FROM tbl ORDER BY v DESC;
+EXPLAIN (COSTS OFF) SELECT v FROM tbl WHERE v > 10 and v <= 40 ORDER BY v DESC;
+SELECT v FROM tbl WHERE v > 10 and v <= 40 ORDER BY v DESC;
+EXPLAIN (COSTS OFF) SELECT v FROM tbl WHERE v > 10 and v <= 40 ORDER BY v ASC;
+SELECT v FROM tbl WHERE v > 10 and v <= 40 ORDER BY v ASC;
+
+DROP TABLE tbl;
+CREATE TABLE tbl(k SERIAL PRIMARY KEY, v INT);
+CREATE UNIQUE INDEX ON tbl(v DESC) SPLIT AT VALUES((30), (20), (10));
+INSERT INTO tbl(v) VALUES
+    (5), (6), (16), (15), (25), (26), (36), (35), (46), (10), (20), (30), (40);
+EXPLAIN (COSTS OFF) SELECT * FROM tbl ORDER BY v ASC;
+SELECT * FROM tbl ORDER BY v ASC;
+EXPLAIN (COSTS OFF) SELECT * FROM tbl ORDER BY v DESC;
+SELECT * FROM tbl ORDER BY v DESC;
+EXPLAIN (COSTS OFF) SELECT v FROM tbl WHERE v >= 10 and v < 40 ORDER BY v ASC;
+SELECT v FROM tbl WHERE v >= 10 and v < 40 ORDER BY v ASC;
+EXPLAIN (COSTS OFF) SELECT v FROM tbl WHERE v >= 10 and v < 40 ORDER BY v DESC;
+SELECT v FROM tbl WHERE v >= 10 and v < 40 ORDER BY v DESC;
+
+-- Test creating indexes with (table_oid = x)
+CREATE TABLE test_index_with_oids (v1 INT, v2 INT, v3 INT);
+INSERT INTO test_index_with_oids VALUES (1, 11, 21), (2, 12, 22), (3, 13, 23), (4, 14, 24), (5, 15, 25);
+
+-- Test with variable = false
+CREATE INDEX index_with_table_oid ON test_index_with_oids (v1) with (table_oid = 1111111);
+-- Turn on variable and test
+set yb_enable_create_with_table_oid=1;
+CREATE INDEX index_with_invalid_oid ON test_index_with_oids (v1) with (table_oid = 0);
+CREATE INDEX index_with_invalid_oid ON test_index_with_oids (v1) with (table_oid = -1);
+CREATE INDEX index_with_invalid_oid ON test_index_with_oids (v1) with (table_oid = 123);
+CREATE INDEX index_with_invalid_oid ON test_index_with_oids (v1) with (table_oid = 'test');
+
+CREATE INDEX index_with_table_oid ON test_index_with_oids (v1) with (table_oid = 1111111);
+select relname, oid from pg_class where relname = 'index_with_table_oid';
+SELECT * FROM test_index_with_oids ORDER BY v1;
+
+CREATE INDEX index_with_duplicate_table_oid ON test_index_with_oids (v1) with (table_oid = 1111111);
+set yb_enable_create_with_table_oid=0;
+
+-- Test creating index nonconcurrently (i.e. without index backfill, without
+-- online schema migration)
+CREATE TABLE test_index_nonconcurrently (i INT, t TEXT);
+INSERT INTO test_index_nonconcurrently VALUES (generate_series(1, 10), 'a');
+
+CREATE INDEX NONCONCURRENTLY ON test_index_nonconcurrently (i);
+EXPLAIN (COSTS OFF) SELECT i FROM test_index_nonconcurrently WHERE i = 1;
+SELECT * FROM test_index_nonconcurrently WHERE i = 1;
+DROP INDEX test_index_nonconcurrently_i_idx;
+
+CREATE UNIQUE INDEX NONCONCURRENTLY ON test_index_nonconcurrently (i);
+EXPLAIN (COSTS OFF) SELECT i FROM test_index_nonconcurrently WHERE i = 1;
+INSERT INTO test_index_nonconcurrently VALUES (1, 'b');
+DROP INDEX test_index_nonconcurrently_i_idx;
+
+INSERT INTO test_index_nonconcurrently VALUES (1, 'b');
+CREATE UNIQUE INDEX NONCONCURRENTLY ON test_index_nonconcurrently (i);
+
+DROP TABLE test_index_nonconcurrently;

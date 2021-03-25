@@ -1,19 +1,18 @@
 ---
-title: jsonb_array_length() and json_array_length() [JSON]
+title: jsonb_array_length() and json_array_length()
 linkTitle: jsonb_array_length()
-summary: jsonb_array_length() and json_array_length()
 headerTitle: jsonb_array_length() and json_array_length()
-description: Use these JSON functions return the count of values in an array.
+description: Return the count of values in an array using jsonb_array_length() and json_array_length().
 menu:
   latest:
     identifier: jsonb-array-length
-    parent: functions-operators
+    parent: json-functions-operators
     weight: 80
 isTocNested: true
 showAsideToc: true
 ---
 
-**Purpose:** Return the count of values (primitive or compound) in the array. You can use this to iterate over the elements of a JSON _array_ using the  `->` operator.
+**Purpose:** Return the count of values (primitive or compound) in the array. You can use this to iterate over the elements of a JSON _array_ using the [`->`](../subvalue-operators/) operator.
 
 **Signature** For the `jsonb` variant:
 
@@ -22,9 +21,9 @@ input value:       jsonb
 return value:      integer
 ```
 
-**Notes:** The functions in this pair require that the supplied JSON value is an _array_.
+**Notes:** Each function in this pair requires that the supplied JSON value is an _array_.
 
-```postgresql
+```plpgsql
 do $body$
 declare
   j constant jsonb := '["a", 42, true, null]';
@@ -42,8 +41,8 @@ end;
 $body$;
 ```
 
-This example uses the `jsonb_typeof()` function.
+This example uses the [`jsonb_typeof()`](../jsonb-typeof) function.
 
 Reading the values themselves would need to use a `case` statement that tests the emergent JSON data type and that selects the leg whose assignment target has the right SQL data type. This is straightforward only for primitive JSON values. If a compound JSON value is encountered, then it must be decomposed, recursively, until the ultimate JSON primitive value leaves are reached.
 
-This complexity reflects the underlying impedance mismatch between JSON's type system and SQL's type system. Introspecting a JSON value when you have no _a priori_ understanding of its structure is tricky.
+This complexity reflects the underlying impedance mismatch between the JSON type system and the SQL type system. Introspecting a JSON value when you have no _a priori_ understanding of its structure is tricky.

@@ -18,15 +18,17 @@
 
 #include "ybgate/ybgate_api.h"
 
-#include "nodes/primnodes.h"
-#include "nodes/makefuncs.h"
-#include "utils/numeric.h"
-#include "utils/memutils.h"
+#include "catalog/pg_type.h"
+#include "catalog/pg_type_d.h"
 #include "catalog/ybctype.h"
 #include "common/int.h"
-#include "nodes/execnodes.h"
-#include "executor/executor.h"
 #include "executor/execExpr.h"
+#include "executor/executor.h"
+#include "nodes/execnodes.h"
+#include "nodes/makefuncs.h"
+#include "nodes/primnodes.h"
+#include "utils/memutils.h"
+#include "utils/numeric.h"
 
 //-----------------------------------------------------------------------------
 // Memory Context
@@ -47,6 +49,15 @@ YbgStatus YbgResetMemoryContext()
 	PG_SETUP_ERROR_REPORTING();
 
 	ResetThreadLocalCurrentMemoryContext();
+
+	return PG_STATUS_OK;
+}
+
+YbgStatus YbgDeleteMemoryContext()
+{
+	PG_SETUP_ERROR_REPORTING();
+
+	DeleteThreadLocalCurrentMemoryContext();
 
 	return PG_STATUS_OK;
 }
@@ -115,10 +126,10 @@ static Datum evalExpr(YbgExprContext ctx, Expr* expr, bool *is_null)
 			}
 
 			FmgrInfo *flinfo = palloc0(sizeof(FmgrInfo));
-			FunctionCallInfoData fcinfo;
+			FunctionCallInfo fcinfo = palloc0(SizeForFunctionCallInfo(args->length));
 
 			fmgr_info(funcid, flinfo);
-			InitFunctionCallInfoData(fcinfo,
+			InitFunctionCallInfoData(*fcinfo,
 			                         flinfo,
 			                         args->length,
 			                         InvalidOid,
@@ -128,19 +139,19 @@ static Datum evalExpr(YbgExprContext ctx, Expr* expr, bool *is_null)
 			foreach(lc, args)
 			{
 				Expr *arg = (Expr *) lfirst(lc);
-				fcinfo.arg[i] = evalExpr(ctx, arg, &fcinfo.argnull[i]);
+				fcinfo->args[i].value = evalExpr(ctx, arg, &fcinfo->args[i].isnull);
 				/*
 				 * Strict functions are guaranteed to return NULL if any of
 				 * their arguments are NULL.
 				 */
-				if (flinfo->fn_strict && fcinfo.argnull[i]) {
+				if (flinfo->fn_strict && fcinfo->args[i].isnull) {
 					*is_null = true;
 					return (Datum) 0;
 				}
 				i++;
 			}
-			Datum result = FunctionCallInvoke(&fcinfo);
-			*is_null = fcinfo.isnull;
+			Datum result = FunctionCallInvoke(fcinfo);
+			*is_null = fcinfo->isnull;
 			return result;
 		}
 		case T_RelabelType:
@@ -188,9 +199,9 @@ YbgStatus YbgExprContextCreate(int32_t min_attno, int32_t max_attno, YbgExprCont
 }
 
 YbgStatus YbgExprContextAddColValue(YbgExprContext expr_ctx,
-                               int32_t attno,
-                               uint64_t datum,
-                               bool is_null)
+                                    int32_t attno,
+                                    uint64_t datum,
+                                    bool is_null)
 {
 	PG_SETUP_ERROR_REPORTING();
 
@@ -213,3 +224,37 @@ YbgStatus YbgEvalExpr(char* expr_cstring, YbgExprContext expr_ctx, uint64_t *dat
 	*datum = (uint64_t) evalExpr(expr_ctx, expr, is_null);
 	return PG_STATUS_OK;
 }
+
+YbgStatus YbgSplitArrayDatum(uint64_t datum,
+			     const int type,
+			     uint64_t **result_datum_array,
+			     int *const nelems)
+{
+	PG_SETUP_ERROR_REPORTING();
+	ArrayType  *arr = DatumGetArrayTypeP((Datum)datum);
+
+	if (ARR_NDIM(arr) != 1 || ARR_HASNULL(arr) || ARR_ELEMTYPE(arr) != type)
+		return PG_STATUS(ERROR, "Type of given datum array does not match the given type");
+
+	int elmlen;
+	bool elmbyval;
+	char elmalign;
+	/*
+	 * Ideally this information should come from pg_type or from caller instead of hardcoding
+	 * here. However this could be okay as PG also has this harcoded in few places.
+	 */
+	switch (type) {
+		case TEXTOID:
+			elmlen = -1;
+			elmbyval = false;
+			elmalign = 'i';
+			break;
+		/* TODO: Extend support to other types as well. */
+		default:
+			return PG_STATUS(ERROR, "Only Text type supported for split of datum of array types");
+	}
+	deconstruct_array(arr, type, elmlen, elmbyval, elmalign,
+			  (Datum**)result_datum_array, NULL /* nullsp */, nelems);
+	return PG_STATUS_OK;
+}
+

@@ -16,8 +16,8 @@ package org.yb.cql;
 import java.nio.ByteBuffer;
 import java.net.InetAddress;
 import java.net.InetSocketAddress;
-import java.util.ArrayList;
 import java.util.Arrays;
+import java.util.Collections;
 import java.util.HashSet;
 import java.util.Iterator;
 import java.util.List;
@@ -28,6 +28,7 @@ import java.util.stream.Collectors;
 
 import com.datastax.driver.core.SimpleStatement;
 import com.datastax.driver.core.exceptions.ServerError;
+import com.google.common.base.Stopwatch;
 import com.google.common.net.HostAndPort;
 import org.junit.After;
 import org.junit.BeforeClass;
@@ -35,12 +36,10 @@ import org.junit.Test;
 import com.datastax.driver.core.ResultSet;
 import com.datastax.driver.core.Row;
 import org.yb.client.YBClient;
-import org.yb.minicluster.BaseMiniClusterTest;
-import org.yb.minicluster.Metrics;
-import org.yb.minicluster.MiniYBCluster;
+import org.yb.minicluster.*;
 import org.yb.master.Master;
-import org.yb.minicluster.MiniYBDaemon;
 
+import static java.util.concurrent.TimeUnit.SECONDS;
 import static org.yb.AssertionWrappers.assertEquals;
 import static org.yb.AssertionWrappers.assertFalse;
 import static org.yb.AssertionWrappers.assertTrue;
@@ -51,15 +50,32 @@ import static org.yb.AssertionWrappers.assertNotNull;
 import org.yb.YBTestRunner;
 
 import org.junit.runner.RunWith;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 
 @RunWith(value=YBTestRunner.class)
 public class TestSystemTables extends BaseCQLTest {
+  private static final Logger LOG = LoggerFactory.getLogger(TestSystemTables.class);
 
   private static final String DEFAULT_SCHEMA_VERSION = "00000000-0000-0000-0000-000000000000";
   private static final String MURMUR_PARTITIONER = "org.apache.cassandra.dht.Murmur3Partitioner";
   private static final String RELEASE_VERSION = "3.9-SNAPSHOT";
   private static final String PLACEMENT_REGION = "region1";
   private static final String PLACEMENT_ZONE = "zone1";
+  private static final int SYSTEM_PARTITIONS_REFRESH_SECS = 10;
+
+  @Override
+  protected void customizeMiniClusterBuilder(MiniYBClusterBuilder builder) {
+    super.customizeMiniClusterBuilder(builder);
+    builder.tserverHeartbeatTimeoutMs(5000);
+    builder.yqlSystemPartitionsVtableRefreshSecs(SYSTEM_PARTITIONS_REFRESH_SECS);
+  }
+
+  @Override
+  protected int systemQueryCacheMsecs() {
+    // Disable the system query cache for spark tests.
+    return 0;
+  }
 
   @After
   public void verifyMasterReads() throws Exception {
@@ -68,7 +84,7 @@ public class TestSystemTables extends BaseCQLTest {
     HostAndPort leaderMaster = client.getLeaderMasterHostAndPort();
     Map<HostAndPort, MiniYBDaemon> masters = miniCluster.getMasters();
     for (Map.Entry<HostAndPort, MiniYBDaemon> master : masters.entrySet()) {
-      Metrics metrics = new Metrics(master.getKey().getHostText(),master.getValue().getWebPort(),
+      Metrics metrics = new Metrics(master.getKey().getHost(),master.getValue().getWebPort(),
         "server");
       long numOps = metrics.getHistogram(TSERVER_READ_METRIC).totalCount;
       if (leaderMaster.equals(master.getKey())) {
@@ -96,6 +112,7 @@ public class TestSystemTables extends BaseCQLTest {
         assertNotNull(row.getUUID("host_id"));
         assertNotNull(row.getString("data_center"));
         assertNotNull(row.getString("rack"));
+        assertEquals(row.getString("release_version"), RELEASE_VERSION);
       }
       assertTrue(found);
     }
@@ -176,7 +193,7 @@ public class TestSystemTables extends BaseCQLTest {
         miniCluster.getTabletServers().keySet().iterator().next());
 
     // Wait for TServer to timeout.
-    Thread.sleep(2 * MiniYBCluster.TSERVER_HEARTBEAT_TIMEOUT_MS);
+    Thread.sleep(2 * miniCluster.getClusterParameters().getTServerHeartbeatTimeoutMs());
 
     // Now verify one tserver is missing.
     long start = System.currentTimeMillis();
@@ -462,16 +479,24 @@ public class TestSystemTables extends BaseCQLTest {
     assertNull(cluster.getMetadata().getKeyspace("test_keyspace"));
   }
 
-  @Test
-  public void testSystemSchemaPartitionsTable() throws Exception {
+  private void testSystemSchemaPartitionsTable(int vtable_refresh_secs) throws Exception {
     // Create test table.
     session.execute("CREATE KEYSPACE test_keyspace;");
     session.execute("CREATE TABLE test_keyspace.test_table (k int PRIMARY KEY);");
 
     // Select partitions of test table.
-    List<Row> partitions = session.execute("SELECT * FROM system.partitions WHERE " +
-                                           "keyspace_name = 'test_keyspace' AND " +
-                                           "table_name = 'test_table';").all();
+    // Due to the cache being refreshed every vtable_refresh_secs, need to wait for that.
+    final Stopwatch stopwatch = Stopwatch.createStarted();
+    boolean success = false;
+    List<Row> partitions = Collections.emptyList();
+    // Run at least once (in case vtable_refresh_secs is 0).
+    do {
+      Thread.sleep(1000);
+      partitions = session.execute("SELECT * FROM system.partitions WHERE " +
+                                             "keyspace_name = 'test_keyspace' AND " +
+                                             "table_name = 'test_table';").all();
+      success = miniCluster.getNumShardsPerTserver() * NUM_TABLET_SERVERS == partitions.size();
+    } while (!success && stopwatch.elapsed(SECONDS) < vtable_refresh_secs);
     assertEquals(miniCluster.getNumShardsPerTserver() * NUM_TABLET_SERVERS,
                  partitions.size());
 
@@ -515,6 +540,24 @@ public class TestSystemTables extends BaseCQLTest {
     }
     // Verify the last end_key is empty.
     assertFalse(endKey.hasRemaining());
+  }
+
+  @Test
+  public void testSystemSchemaPartitionsTableWithVtableRefresh() throws Exception {
+    testSystemSchemaPartitionsTable(SYSTEM_PARTITIONS_REFRESH_SECS /* vtable_refresh_secs */);
+  }
+
+  @Test
+  public void testSystemSchemaPartitionsTableWithoutVtableRefresh() throws Exception {
+    destroyMiniCluster();
+    // Testing with partitions_vtable_cache_refresh_secs flag disabled.
+    masterArgs.add("--partitions_vtable_cache_refresh_secs=0");
+    createMiniCluster();
+    setUpCqlClient();
+
+    testSystemSchemaPartitionsTable(0 /* vtable_refresh_secs */);
+
+    masterArgs.remove("--partitions_vtable_cache_refresh_secs=0");
   }
 
   private List<String> getRowsAsStringList(ResultSet rs) {

@@ -3,6 +3,7 @@ title: TPC-C
 linkTitle: TPC-C
 description: TPC-C
 headcontent: Benchmark YugabyteDB using TPC-C
+block_indexing: true
 menu:
   v2.0:
     identifier: tpcc-ysql
@@ -38,7 +39,7 @@ $ cd tpcc
 
 ## Step 2. Start your database
 
-Start the database using steps mentioned here: https://docs.yugabyte.com/latest/quick-start/explore-ysql/.
+Start the database using steps mentioned here: /latest/quick-start/explore-ysql/.
 
 ## Step 3. Configure connection properties
 

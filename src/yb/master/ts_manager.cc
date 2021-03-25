@@ -42,12 +42,6 @@
 #include "yb/common/wire_protocol.h"
 #include "yb/util/shared_lock.h"
 
-DEFINE_int32(tserver_unresponsive_timeout_ms, 60 * 1000,
-             "The period of time that a Master can go without receiving a heartbeat from a "
-             "tablet server before considering it unresponsive. Unresponsive servers are not "
-             "selected when assigning replicas during table creation or re-replication.");
-TAG_FLAG(tserver_unresponsive_timeout_ms, advanced);
-
 using std::shared_ptr;
 using std::string;
 using std::vector;
@@ -106,7 +100,8 @@ bool HasSameHostPort(const google::protobuf::RepeatedPtrField<HostPortPB>& old_a
 Status TSManager::RegisterTS(const NodeInstancePB& instance,
                              const TSRegistrationPB& registration,
                              CloudInfoPB local_cloud_info,
-                             rpc::ProxyCache* proxy_cache) {
+                             rpc::ProxyCache* proxy_cache,
+                             RegisteredThroughHeartbeat registered_through_heartbeat) {
   TSCountCallback callback_to_call;
 
   {
@@ -141,7 +136,8 @@ Status TSManager::RegisterTS(const NodeInstancePB& instance,
       }
 
       auto new_desc = VERIFY_RESULT(TSDescriptor::RegisterNew(
-          instance, registration, std::move(local_cloud_info), proxy_cache));
+          instance, registration, std::move(local_cloud_info), proxy_cache,
+          registered_through_heartbeat));
       InsertOrDie(&servers_by_id_, uuid, std::move(new_desc));
       LOG(INFO) << "Registered new tablet server { " << instance.ShortDebugString()
                 << " } with Master, full list: " << yb::ToString(servers_by_id_);
@@ -171,8 +167,13 @@ Status TSManager::RegisterTS(const NodeInstancePB& instance,
 
 void TSManager::GetDescriptors(std::function<bool(const TSDescriptorPtr&)> condition,
                                TSDescriptorVector* descs) const {
-  descs->clear();
   SharedLock<decltype(lock_)> l(lock_);
+  GetDescriptorsUnlocked(condition, descs);
+}
+
+void TSManager::GetDescriptorsUnlocked(
+    std::function<bool(const TSDescriptorPtr&)> condition, TSDescriptorVector* descs) const {
+  descs->clear();
 
   descs->reserve(servers_by_id_.size());
   for (const TSDescriptorMap::value_type& entry : servers_by_id_) {
@@ -187,23 +188,29 @@ void TSManager::GetDescriptors(std::function<bool(const TSDescriptorPtr&)> condi
 }
 
 void TSManager::GetAllDescriptors(TSDescriptorVector* descs) const {
-  GetDescriptors([](const TSDescriptorPtr& ts) -> bool { return !ts->IsRemoved(); }, descs);
+  SharedLock<decltype(lock_)> l(lock_);
+  GetAllDescriptorsUnlocked(descs);
 }
 
-bool TSManager::IsTSLive(const TSDescriptorPtr& ts) {
-  return ts->TimeSinceHeartbeat().ToMilliseconds() <
-         GetAtomicFlag(&FLAGS_tserver_unresponsive_timeout_ms) && !ts->IsRemoved();
+TSDescriptorVector TSManager::GetAllDescriptors() const {
+  TSDescriptorVector descs;
+  GetAllDescriptors(&descs);
+  return descs;
+}
+
+void TSManager::GetAllDescriptorsUnlocked(TSDescriptorVector* descs) const {
+  GetDescriptorsUnlocked([](const TSDescriptorPtr& ts) -> bool { return !ts->IsRemoved(); }, descs);
 }
 
 void TSManager::GetAllLiveDescriptors(TSDescriptorVector* descs,
     const BlacklistSet blacklist) const {
   GetDescriptors([blacklist](const TSDescriptorPtr& ts) -> bool {
-    return IsTSLive(ts) && !IsTsBlacklisted(ts, blacklist); }, descs);
+    return ts->IsLive() && !IsTsBlacklisted(ts, blacklist); }, descs);
 }
 
 void TSManager::GetAllReportedDescriptors(TSDescriptorVector* descs) const {
   GetDescriptors([](const TSDescriptorPtr& ts)
-                   -> bool { return IsTSLive(ts) && ts->has_tablet_report(); }, descs);
+                   -> bool { return ts->IsLive() && ts->has_tablet_report(); }, descs);
 }
 
 bool TSManager::IsTsInCluster(const TSDescriptorPtr& ts, string cluster_uuid) {
@@ -215,7 +222,7 @@ bool TSManager::IsTsBlacklisted(const TSDescriptorPtr& ts,
   if (blacklist.empty()) {
     return false;
   }
-  for (const auto tserver : blacklist) {
+  for (const auto& tserver : blacklist) {
     HostPortPB hp;
     HostPortToPB(tserver, &hp);
     if (ts->IsRunningOn(hp)) {
@@ -239,7 +246,7 @@ void TSManager::GetAllLiveDescriptorsInCluster(TSDescriptorVector* descs,
     // if we're getting primary nodes and the tserver placement uuid is empty.
     bool ts_in_cluster = (IsTsInCluster(ts, placement_uuid) ||
                          (primary_cluster && ts->placement_uuid().empty()));
-    if (IsTSLive(ts) && !IsTsBlacklisted(ts, blacklist) && ts_in_cluster) {
+    if (ts->IsLive() && !IsTsBlacklisted(ts, blacklist) && ts_in_cluster) {
       descs->push_back(ts);
     }
   }
@@ -250,7 +257,7 @@ const TSDescriptorPtr TSManager::GetTSDescriptor(const HostPortPB& host_port) co
 
   for (const TSDescriptorMap::value_type& entry : servers_by_id_) {
     const TSDescriptorPtr& ts = entry.second;
-    if (IsTSLive(ts) && ts->IsRunningOn(host_port)) {
+    if (ts->IsLive() && ts->IsRunningOn(host_port)) {
       return ts;
     }
   }
@@ -258,20 +265,10 @@ const TSDescriptorPtr TSManager::GetTSDescriptor(const HostPortPB& host_port) co
   return nullptr;
 }
 
-int TSManager::GetCount() const {
-  SharedLock<decltype(lock_)> l(lock_);
-
-  return GetCountUnlocked();
-}
-
 int TSManager::GetCountUnlocked() const {
-  size_t count = 0;
-  for (const auto& map_entry : servers_by_id_) {
-    if (!map_entry.second->IsRemoved()) {
-      count++;
-    }
-  }
-  return count;
+  TSDescriptorVector descs;
+  GetAllDescriptorsUnlocked(&descs);
+  return descs.size();
 }
 
 // Register a callback to be called when the number of tablet servers reaches a certain number.

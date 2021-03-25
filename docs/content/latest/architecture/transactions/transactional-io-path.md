@@ -9,7 +9,7 @@ menu:
   latest:
     identifier: architecture-transactional-io-path
     parent: architecture-acid-transactions
-    weight: 1154
+    weight: 1156
 isTocNested: true
 showAsideToc: true
 ---
@@ -37,9 +37,8 @@ any conflict resolution.
 
 ### 1. Client requests transaction
 
-The client sends a request to a YugabyteDB tablet server that requires a distributed transaction. We
-currently only support transactions that can be expressed by a single client request.  Here is an
-example using our extension to CQL:
+The client sends a request to a YugabyteDB tablet server that requires a distributed transaction. 
+Here is an example using our extension to CQL:
 
  ```sql
  START TRANSACTION;

@@ -28,7 +28,12 @@ class ClusterLoadBalancerMocked : public ClusterLoadBalancer {
     options->kMaxConcurrentRemovals = kHighNumber;
     options->kAllowLimitStartingTablets = false;
     options->kAllowLimitOverReplicatedTablets = false;
-    state_->options_ = options;
+
+    auto table_state = std::make_unique<enterprise::PerTableLoadState>(global_state_.get());
+    table_state->options_ = options;
+    state_ = table_state.get();
+    per_table_states_[""] = std::move(table_state);
+
     SetEntOptions(LIVE, "");
   }
 
@@ -53,6 +58,10 @@ class ClusterLoadBalancerMocked : public ClusterLoadBalancer {
     return replication_info_.live_replicas();
   }
 
+  const ReplicationInfoPB& GetClusterReplicationInfo() const override {
+    return replication_info_;
+  }
+
   const PlacementInfoPB& GetClusterPlacementInfo() const override {
     return GetEntState()->GetEntOptions()->type == LIVE ?
         replication_info_.live_replicas() : replication_info_.read_replicas(0);
@@ -61,10 +70,11 @@ class ClusterLoadBalancerMocked : public ClusterLoadBalancer {
   const BlacklistPB& GetServerBlacklist() const override { return blacklist_; }
   const BlacklistPB& GetLeaderBlacklist() const override { return leader_blacklist_; }
 
-  void SendReplicaChanges(scoped_refptr<TabletInfo> tablet, const TabletServerId& ts_uuid,
+  Status SendReplicaChanges(scoped_refptr<TabletInfo> tablet, const TabletServerId& ts_uuid,
                           const bool is_add, const bool should_remove,
                           const TabletServerId& new_leader_uuid) override {
     // Do nothing.
+    return Status::OK();
   }
 
   void GetPendingTasks(const TableId& table_uuid,
@@ -87,13 +97,17 @@ class ClusterLoadBalancerMocked : public ClusterLoadBalancer {
     down_cast<Options*>(GetEntState()->options_)->placement_uuid = placement_uuid;
   }
 
-  void ResetState() override {
-    yb::master::Options* options = nullptr;
+  void ResetTableStatePtr(const TableId& table_id, yb::master::Options* options) override {
     if (state_) {
       options = state_->options_;
     }
-    state_ = std::make_unique<enterprise::ClusterLoadState>();
-    state_->options_ = options;
+    auto table_state = std::make_unique<enterprise::PerTableLoadState>(global_state_.get());
+    table_state->options_ = options;
+
+    state_ = table_state.get();
+
+    per_table_states_[table_id] = std::move(table_state);
+
   }
 
   TSDescriptorVector ts_descs_;

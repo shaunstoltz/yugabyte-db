@@ -49,6 +49,9 @@ public class DestroyKubernetesUniverse extends DestroyUniverse {
           universe.getUniverseDetails().getPrimaryCluster().userIntent;
       UUID providerUUID = UUID.fromString(userIntent.provider);
 
+      Map<String, String> universeConfig = universe.getConfig();
+      boolean runHelmDelete = universeConfig.containsKey(Universe.HELM2_LEGACY);
+
       PlacementInfo pi = universe.getUniverseDetails().getPrimaryCluster().placementInfo;
 
       Provider provider = Provider.get(UUID.fromString(userIntent.provider));
@@ -65,9 +68,11 @@ public class DestroyKubernetesUniverse extends DestroyUniverse {
       SubTaskGroup helmDeletes = new SubTaskGroup(
           KubernetesCommandExecutor.CommandType.HELM_DELETE.getSubTaskGroupName(), executor);
       helmDeletes.setSubTaskGroupType(UserTaskDetails.SubTaskGroupType.RemovingUnusedServers);
+
       SubTaskGroup volumeDeletes = new SubTaskGroup(
           KubernetesCommandExecutor.CommandType.VOLUME_DELETE.getSubTaskGroupName(), executor);
       volumeDeletes.setSubTaskGroupType(UserTaskDetails.SubTaskGroupType.RemovingUnusedServers);
+
       SubTaskGroup namespaceDeletes = new SubTaskGroup(
           KubernetesCommandExecutor.CommandType.NAMESPACE_DELETE.getSubTaskGroupName(), executor);
       namespaceDeletes.setSubTaskGroupType(UserTaskDetails.SubTaskGroupType.RemovingUnusedServers);
@@ -78,24 +83,40 @@ public class DestroyKubernetesUniverse extends DestroyUniverse {
 
         Map<String, String> config = entry.getValue();
 
-        // Delete the helm deployments.
-        helmDeletes.addTask(createDestroyKubernetesTask(
-            universe.getUniverseDetails().nodePrefix, azName, config,
-            KubernetesCommandExecutor.CommandType.HELM_DELETE,
-            providerUUID));
-            
-        // Delete the PVs created for the deployments.
+        String namespace = config.get("KUBENAMESPACE");
+
+        if (runHelmDelete || namespace != null) {
+          // Delete the helm deployments.
+          helmDeletes.addTask(createDestroyKubernetesTask(
+              universe.getUniverseDetails().nodePrefix, azName, config,
+              KubernetesCommandExecutor.CommandType.HELM_DELETE,
+              providerUUID));
+        }
+
+        // Delete the PVCs created for this AZ.
         volumeDeletes.addTask(createDestroyKubernetesTask(
             universe.getUniverseDetails().nodePrefix, azName, config,
             KubernetesCommandExecutor.CommandType.VOLUME_DELETE,
             providerUUID));
-        
-        // Delete the namespaces of the deployments.
-        namespaceDeletes.addTask(createDestroyKubernetesTask(
-            universe.getUniverseDetails().nodePrefix, azName, config,
-            KubernetesCommandExecutor.CommandType.NAMESPACE_DELETE,
-            providerUUID));
 
+        // TODO(bhavin192): delete the pull secret as well? As of now,
+        // we depend on the fact that, deleting the namespace will
+        // delete the pull secret. That won't be the case with
+        // providers which have KUBENAMESPACE paramter in the AZ
+        // config. How to find the pull secret name? Should we delete
+        // it when we have multiple releases in one namespace?. It is
+        // possible that same provider is creating multiple releases
+        // in one namespace. Tracked here:
+        // https://github.com/yugabyte/yugabyte-db/issues/7012
+
+        // Delete the namespaces of the deployments only if those were
+        // created by us.
+        if (namespace == null) {
+          namespaceDeletes.addTask(createDestroyKubernetesTask(
+              universe.getUniverseDetails().nodePrefix, azName, config,
+              KubernetesCommandExecutor.CommandType.NAMESPACE_DELETE,
+              providerUUID));
+        }
       }
 
       subTaskGroupQueue.add(helmDeletes);
@@ -137,6 +158,10 @@ public class DestroyKubernetesUniverse extends DestroyUniverse {
     }
     if (config != null) {
       params.config = config;
+      // This assumes that the config is az config. It is true in this
+      // particular case, all callers just pass az config.
+      // params.namespace remains null if config is not passed.
+      params.namespace = PlacementInfoUtil.getKubernetesNamespace(nodePrefix, az, config);
     }
     params.universeUUID = taskParams().universeUUID;
     KubernetesCommandExecutor task = new KubernetesCommandExecutor();

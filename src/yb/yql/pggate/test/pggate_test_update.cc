@@ -35,6 +35,8 @@ TEST_F(PggateTestDelete, TestDelete) {
                                        kDefaultDatabaseOid, tab_oid,
                                        false /* is_shared_table */, true /* if_not_exist */,
                                        false /* add_primary_key */, true /* colocated */,
+                                       kInvalidOid /* tablegroup_id */,
+                                       kInvalidOid /* tablespace_id */,
                                        &pg_stmt));
   CHECK_YBC_STATUS(YBCTestCreateTableAddColumn(pg_stmt, "hash_key", ++col_count,
                                                DataType::INT64, true, true));
@@ -49,7 +51,6 @@ TEST_F(PggateTestDelete, TestDelete) {
   CHECK_YBC_STATUS(YBCTestCreateTableAddColumn(pg_stmt, "job", ++col_count,
                                                DataType::STRING, false, false));
   CHECK_YBC_STATUS(YBCPgExecCreateTable(pg_stmt));
-  CHECK_YBC_STATUS(YBCPgDeleteStatement(pg_stmt));
   pg_stmt = nullptr;
 
   // INSERT ----------------------------------------------------------------------------------------
@@ -102,7 +103,6 @@ TEST_F(PggateTestDelete, TestDelete) {
     YBCPgUpdateConstChar(expr_job, job.c_str(), job.size(), false);
   }
 
-  CHECK_YBC_STATUS(YBCPgDeleteStatement(pg_stmt));
   pg_stmt = nullptr;
 
   // UPDATE ----------------------------------------------------------------------------------------
@@ -153,7 +153,6 @@ TEST_F(PggateTestDelete, TestDelete) {
     YBCPgUpdateConstChar(expr_job, job.c_str(), job.size(), false);
   }
 
-  CHECK_YBC_STATUS(YBCPgDeleteStatement(pg_stmt));
   pg_stmt = nullptr;
 
   // SELECT ----------------------------------------------------------------------------------------
@@ -236,7 +235,6 @@ TEST_F(PggateTestDelete, TestDelete) {
   }
   CHECK_EQ(select_row_count, insert_row_count) << "Unexpected row count";
 
-  CHECK_YBC_STATUS(YBCPgDeleteStatement(pg_stmt));
   pg_stmt = nullptr;
 }
 

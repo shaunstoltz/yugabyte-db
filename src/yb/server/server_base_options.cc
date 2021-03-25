@@ -88,16 +88,19 @@ TAG_FLAG(metrics_log_interval_ms, advanced);
 
 DEFINE_string(server_broadcast_addresses, "", "Broadcast addresses for this server.");
 
-ServerBaseOptions::ServerBaseOptions()
+ServerBaseOptions::ServerBaseOptions(int default_port)
     : env(Env::Default()),
       dump_info_path(FLAGS_server_dump_info_path),
       dump_info_format(FLAGS_server_dump_info_format),
       metrics_log_interval_ms(FLAGS_metrics_log_interval_ms),
-      placement_uuid(FLAGS_placement_uuid) {
+      placement_uuid(FLAGS_placement_uuid),
+      server_broadcast_addresses(FLAGS_server_broadcast_addresses) {
+  rpc_opts.default_port = default_port;
   if (!FLAGS_server_broadcast_addresses.empty()) {
-    auto status = HostPort::ParseStrings(FLAGS_server_broadcast_addresses, 0, &broadcast_addresses);
-    LOG_IF(DFATAL, !status.ok()) << "Bad public IPs " << FLAGS_server_broadcast_addresses << ": "
-                                 << status;
+    auto status = HostPort::ParseStrings(FLAGS_server_broadcast_addresses, default_port,
+                                         &broadcast_addresses);
+    LOG_IF(DFATAL, !status.ok()) << "Bad public IPs " << FLAGS_server_broadcast_addresses
+                                 << ": " << status;
   }
 }
 
@@ -112,14 +115,28 @@ ServerBaseOptions::ServerBaseOptions(const ServerBaseOptions& options)
       metrics_log_interval_ms(options.metrics_log_interval_ms),
       placement_uuid(options.placement_uuid),
       master_addresses_flag(options.master_addresses_flag),
+      server_broadcast_addresses(options.server_broadcast_addresses),
       broadcast_addresses(options.broadcast_addresses),
       placement_cloud_(options.placement_cloud_),
       placement_region_(options.placement_region_),
       placement_zone_(options.placement_zone_) {
+  if (options.webserver_opts.bind_interface.empty()) {
+    std::vector<HostPort> bind_addresses;
+    auto status = HostPort::ParseStrings(options.rpc_opts.rpc_bind_addresses, 0, &bind_addresses);
+    LOG_IF(DFATAL, !status.ok()) << "Invalid rpc_bind_address "
+                                 << options.rpc_opts.rpc_bind_addresses << ": " << status;
+    if (!bind_addresses.empty()) {
+      webserver_opts.bind_interface = bind_addresses.at(0).host();
+    }
+  }
   SetMasterAddressesNoValidation(options.GetMasterAddresses());
 }
 
 void ServerBaseOptions::SetMasterAddressesNoValidation(MasterAddressesPtr master_addresses) {
+  if (master_addresses) {
+    LOG(INFO) << "Updating master addrs to " << MasterAddressesToString(*master_addresses);
+  }
+
   std::lock_guard<std::mutex> l(master_addresses_mtx_);
   master_addresses_ = master_addresses;
 }

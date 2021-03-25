@@ -18,9 +18,11 @@ import org.junit.BeforeClass;
 import org.junit.Test;
 
 import com.datastax.driver.core.BatchStatement;
+import com.datastax.driver.core.BoundStatement;
 import com.datastax.driver.core.ColumnDefinitions;
 import com.datastax.driver.core.ColumnDefinitions.Definition;
 import com.datastax.driver.core.PreparedStatement;
+import com.datastax.driver.core.ResultSet;
 import com.datastax.driver.core.ResultSetFuture;
 import com.datastax.driver.core.Row;
 import com.datastax.driver.core.Session;
@@ -31,6 +33,8 @@ import com.datastax.driver.core.exceptions.InvalidQueryException;
 import org.yb.minicluster.BaseMiniClusterTest;
 import org.yb.minicluster.MiniYBCluster;
 import org.yb.minicluster.RocksDBMetrics;
+import org.yb.util.SanitizerUtil;
+import org.yb.util.TableProperties;
 
 import static org.yb.AssertionWrappers.assertEquals;
 import static org.yb.AssertionWrappers.assertFalse;
@@ -42,13 +46,26 @@ import static org.yb.AssertionWrappers.fail;
 import org.yb.YBTestRunner;
 
 import org.junit.runner.RunWith;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 
 @RunWith(value=YBTestRunner.class)
 public class TestIndex extends BaseCQLTest {
+  private static final Logger LOG = LoggerFactory.getLogger(TestIndex.class);
+
+  @Override
+  public int getTestMethodTimeoutSec() {
+    // Usual time for a test ~90 seconds. But can be much more on Jenkins.
+    return super.getTestMethodTimeoutSec()*10;
+  }
 
   @BeforeClass
   public static void SetUpBeforeClass() throws Exception {
     BaseMiniClusterTest.tserverArgs.add("--allow_index_table_read_write");
+    BaseMiniClusterTest.tserverArgs.add(
+        "--index_backfill_upperbound_for_user_enforced_txn_duration_ms=1000");
+    BaseMiniClusterTest.tserverArgs.add(
+        "--index_backfill_wait_for_old_txns_ms=100");
     BaseCQLTest.setUpBeforeClass();
   }
 
@@ -107,6 +124,8 @@ public class TestIndex extends BaseCQLTest {
 
     // Test retrieving non-existent index.
     assertNull(table.getIndex("i3"));
+
+    runInvalidStmt("CREATE INDEX i1 ON cql_test_keyspace.test_create_index (r1) where r1 = 5;");
 
     // Test create index with duplicate name.
     try {
@@ -348,16 +367,25 @@ public class TestIndex extends BaseCQLTest {
     return rows;
   }
 
+  private void checkIndexColumns(Map<String, String> tableColumnMap,
+                                 Map<String, String> indexColumnMap,
+                                 String query) throws Exception {
+    LOG.info("Check Indexes after query: " + query);
+    for (Map.Entry<String, String> entry : tableColumnMap.entrySet()) {
+      String iValue = indexColumnMap.get(entry.getKey());
+      Set<String> table_result = queryTable("test_update", entry.getValue());
+      LOG.debug("In table test_update [" + entry.getValue() + "]: " + table_result);
+      Set<String> index_result = queryTable(entry.getKey(), iValue);
+      LOG.debug("In index " + entry.getKey() + " [" + iValue + "]: " + index_result);
+      assertEquals("Index " + entry.getKey() + " after " + query, table_result, index_result);
+    }
+  }
+
   private void assertIndexUpdate(Map<String, String> tableColumnMap,
                                  Map<String, String> indexColumnMap,
                                  String query) throws Exception {
     session.execute(query);
-    for (Map.Entry<String, String> entry : tableColumnMap.entrySet()) {
-      String iValue = indexColumnMap.get(entry.getKey());
-      assertEquals("Index " + entry.getKey() + " after " + query,
-                   queryTable("test_update", entry.getValue()),
-                   queryTable(entry.getKey(), iValue));
-    }
+    checkIndexColumns(tableColumnMap, indexColumnMap, query);
   }
 
   private void testIndexUpdate(boolean strongConsistency) throws Exception {
@@ -613,6 +641,27 @@ public class TestIndex extends BaseCQLTest {
                            Arrays.asList("i5.c2"),
                            new Object[] {"c"},
                            "Row[1, a, 2, b, 3, c]");
+  }
+
+  @Test
+  public void testCreateIndexWithWhereClause() throws Exception {
+    LOG.info("Start test: " + getCurrentTestMethodName());
+    destroyMiniCluster();
+    BaseMiniClusterTest.tserverArgs.add("--cql_raise_index_where_clause_error=false");
+    createMiniCluster();
+    setUpCqlClient();
+
+    // Create test table.
+    LOG.info("create test table");
+    session.execute("create table test_create_index " +
+                    "(h1 int, h2 text, r1 int, r2 text, " +
+                    "c1 int, c2 text, c3 decimal, c4 timestamp, c5 boolean, " +
+                    "primary key ((h1, h2), r1, r2)) " +
+                    "with transactions = {'enabled' : true};");
+    LOG.info("create test index");
+    session.execute("CREATE INDEX i1 ON test_create_index (r1) where r1 = 5;");
+    BaseMiniClusterTest.tserverArgs.remove("--cql_raise_index_where_clause_error=false");
+    LOG.info("End test: " + getCurrentTestMethodName());
   }
 
   @Test
@@ -911,7 +960,7 @@ public class TestIndex extends BaseCQLTest {
                                                   "Row[4, 3, v333, 333]",
                                                   "Row[5, 3, v333, 333]")));
 
-    // Also verfiy select with limit and offset.
+    // Also verify select with limit and offset.
     assertQuery("select * from test_uncovered where v1 = 'v333' offset 1 limit 3;",
                 new HashSet<String>(Arrays.asList("Row[2, 3, v333, 333]",
                                                   "Row[3, 3, v333, 333]",
@@ -1064,18 +1113,22 @@ public class TestIndex extends BaseCQLTest {
 
   @Test
   public void testDropDuringWrite() throws Exception {
-    for (int i = 0; i != 5; ++i) {
-      String table_name = "index_test_" + i;
-      String index_name = "index_" + i;
+    int numTables = SanitizerUtil.nonTsanVsTsan(5, 2);
+    int numTablets = SanitizerUtil.nonTsanVsTsan(6, 3);
+    int numThreads = SanitizerUtil.nonTsanVsTsan(10, 4);
+    for (int i = 0; i != numTables; ++i) {
+      String tableName = "index_test_" + i;
+      String indexName = "index_" + i;
       session.execute(String.format(
           "create table %s (h int, c int, primary key ((h))) " +
-          "with transactions = { 'enabled' : true };", table_name));
-      session.execute(String.format("create index %s on %s (c);", index_name, table_name));
+          "with transactions = { 'enabled' : true } and tablets = %d;", tableName, numTablets));
+      session.execute(String.format(
+            "create index %s on %s (c) with tablets = %d;", indexName, tableName, numTablets));
       final PreparedStatement statement = session.prepare(String.format(
-          "insert into %s (h, c) values (?, ?);", table_name));
+          "insert into %s (h, c) values (?, ?);", tableName));
 
       List<Thread> threads = new ArrayList<Thread>();
-      while (threads.size() != 10) {
+      while (threads.size() != numThreads) {
         Thread thread = new Thread(() -> {
           int key = 0;
           while (!Thread.interrupted()) {
@@ -1088,7 +1141,7 @@ public class TestIndex extends BaseCQLTest {
       }
       try {
         Thread.sleep(5000);
-        session.execute(String.format("drop table %s;", table_name));
+        session.execute(String.format("drop table %s;", tableName));
       } finally {
         for (Thread thread : threads) {
           thread.interrupt();
@@ -1220,5 +1273,684 @@ public class TestIndex extends BaseCQLTest {
     session.execute("drop table test_reg_tbl;");
 
     LOG.info("End test: " + getCurrentTestMethodName());
+  }
+
+  @Test
+  public void testCreateInvalidOrderBy() throws Exception {
+    // This test makes sure that server does not crash for invalid query such as those with
+    // invalid ORDER BY expression.
+    LOG.info("Start test: " + getCurrentTestMethodName());
+
+    // Test scalar index against ORDER BY non existing column.
+    session.execute("CREATE TABLE test_order_by(a INT PRIMARY KEY, b INT, c INT," +
+                    "  non_index_column INT, non_index_cluster_column INT)" +
+                    "  WITH TRANSACTIONS = {'enabled' : true};");
+    session.execute("CREATE INDEX test_order_by_idx ON test_order_by(b, c)" +
+                    "  INCLUDE (non_index_cluster_column);");
+    // Run one valid query to make sure the setup is correct.
+    runValidSelect("SELECT * FROM test_order_by WHERE b = 3 ORDER BY c;");
+    // Test invalid ORDER BY for non-existing column.
+    runInvalidQuery("SELECT * FROM test_order_by WHERE b = 3 ORDER BY non_existent_column;");
+    // Test invalid ORDER BY for column "non_index_column" that exists in TABLE but not in INDEX.
+    runInvalidQuery("SELECT * FROM test_order_by WHERE b = 3 ORDER BY non_index_column;");
+    // Test invalid ORDER BY for column that is not an INDEX clustering column.
+    runInvalidQuery("SELECT * FROM test_order_by WHERE b = 3 ORDER BY non_index_cluster_column;");
+
+    // Test jsonb index against ORDER BY non existing field.
+    session.execute("CREATE TABLE test_jsonb_order_by(i INT, j JSONB, k INT, PRIMARY KEY (i, k))" +
+                    "  WITH TRANSACTIONS = { 'enabled' : true };");
+    session.execute("CREATE INDEX test_jsonb_order_by_idx ON test_jsonb_order_by(k, j->>'x');");
+    // Run one valid query to make sure the setup is correct.
+    runValidSelect("SELECT * FROM test_jsonb_order_by WHERE k = 1 ORDER BY j->>'x';");
+    // Test invalid ORDER BY non existing column "j->>'y'".
+    runInvalidQuery("SELECT * FROM test_jsonb_order_by WHERE k = 1 ORDER BY j->>'y';");
+    // Test invalid ORDER BY column "j" that exists in the TABLE but not the INDEX.
+    runInvalidQuery("SELECT * FROM test_jsonb_order_by WHERE k = 1 ORDER BY j;");
+  }
+
+  @Test
+  public void testColumnCoverage() throws Exception {
+    // Create test table.
+    session.execute("CREATE TABLE test_coverage" +
+                    "  ( h INT, r INT, v INT, vv INT, PRIMARY KEY (h, r) )" +
+                    "  WITH transactions = {'enabled' : true};");
+
+    // Create test index.
+    session.execute("CREATE INDEX vidx ON test_coverage (v);");
+    assertIndexOptions("test_coverage", "vidx", "v, h, r", null);
+
+    // Use INSERT & SELECT to check for coverage.
+    int h = 7;
+    int r = h * 2;
+    int v = h * 3;
+    int vv = h * 4;
+    String stmt = String.format("INSERT INTO test_coverage(h, r, v, vv)" +
+                                "  VALUES (%d, %d, %d, %d);", h, r, v, vv);
+    session.execute(stmt);
+
+    String query = String.format("SELECT vv FROM test_coverage WHERE v = %d;", v);
+    assertEquals(1, session.execute(query).all().size());
+
+    query = String.format("SELECT * FROM test_coverage WHERE v = %d;", v);
+    assertEquals(1, session.execute(query).all().size());
+
+    query = String.format("SELECT h FROM test_coverage WHERE v = %d AND vv = %d;", v, vv);
+    assertEquals(1, session.execute(query).all().size());
+
+    query = String.format("SELECT * FROM test_coverage WHERE v = %d AND vv = %d;", v, vv);
+    assertEquals(1, session.execute(query).all().size());
+  }
+
+  @Test
+  public void testIndexUpdateWithChangeInExpressionResult() throws Exception {
+    // Create test table and indexes.
+    session.execute("CREATE TABLE test_update (h int PRIMARY KEY, j JSONB) " +
+                    "WITH transactions = {'enabled' : true};");
+    // Note: indexed expression is "j->>'x'", but it will be NULL if we set j={"a":n}.
+    session.execute("CREATE INDEX i1 on test_update (j->>'x');");
+
+    // test_update: Row[1, {"a":1}]
+    session.execute("insert into test_update (h, j) values (1, '{\"a\":1}');");
+    assertQuery("select * from test_update;", "Row[1, {\"a\":1}]");
+    assertQuery("select * from " + DEFAULT_TEST_KEYSPACE + ".i1;", "Row[1, NULL]");
+
+    // Note: in the following UPDATE the value of column 'j' in the main table is CHANGED,
+    // but the EXPR(j) = j->>'x' is still UNCHANGED and equal NULL.
+    // test_update: Row[1, {"a":2}]
+    session.execute("update test_update set j = '{\"a\":2}' where h = 1;");
+    assertQuery("select * from test_update;", "Row[1, {\"a\":2}]");
+    assertQuery("select * from " + DEFAULT_TEST_KEYSPACE + ".i1;", "Row[1, NULL]");
+
+    // test_update: Row[1, {"x":3}]
+    session.execute("update test_update set j = '{\"x\":3}' where h = 1;");
+    assertQuery("select * from test_update;", "Row[1, {\"x\":3}]");
+    assertQuery("select * from " + DEFAULT_TEST_KEYSPACE + ".i1;", "Row[1, 3]");
+
+    // test_update: Row[1, {"x":3}], Row[2, {"a":1}]
+    session.execute("insert into test_update (h, j) values (2, '{\"a\":1}');");
+    assertQuery("select * from test_update;", "Row[1, {\"x\":3}]Row[2, {\"a\":1}]");
+    assertQuery("select * from " + DEFAULT_TEST_KEYSPACE + ".i1;", "Row[1, 3]Row[2, NULL]");
+
+    session.execute("update test_update set j = '{\"x\":3}' where h = 1;");
+    assertQuery("select * from test_update;", "Row[1, {\"x\":3}]Row[2, {\"a\":1}]");
+    assertQuery("select * from " + DEFAULT_TEST_KEYSPACE + ".i1;", "Row[1, 3]Row[2, NULL]");
+
+    // test_update: Row[1, {"x":3}], Row[2, {"x":3}]
+    session.execute("update test_update set j = '{\"x\":3}' where h = 2;");
+    assertQuery("select * from test_update;", "Row[1, {\"x\":3}]Row[2, {\"x\":3}]");
+    assertQuery("select * from " + DEFAULT_TEST_KEYSPACE + ".i1;", "Row[1, 3]Row[2, 3]");
+
+    // test_update: Row[1, '{"x":3, "z":7}'], Row[2, {"x":3}]
+    session.execute("update test_update set j = '{\"x\":3, \"z\":7}' where h = 1;");
+    assertQuery("select * from test_update;", "Row[1, {\"x\":3,\"z\":7}]Row[2, {\"x\":3}]");
+    assertQuery("select * from " + DEFAULT_TEST_KEYSPACE + ".i1;", "Row[1, 3]Row[2, 3]");
+  }
+
+  private Map<String, RocksDBMetrics> initRocksDBMetrics(String tableName,
+                                                        Map<String, String> indexColumnMap)
+                                                        throws Exception {
+    Map<String, RocksDBMetrics> metrics = new HashMap<String, RocksDBMetrics>();
+    metrics.put(tableName, getRocksDBMetric(tableName));
+    for (Map.Entry<String, String> entry : indexColumnMap.entrySet()) {
+      String indexName = entry.getKey();
+      metrics.put(indexName, getRocksDBMetric(indexName));
+    }
+    return metrics;
+  }
+
+  private void checkRocksDBMetricsChanges(TableProperties tp,
+                                          Map<String, RocksDBMetrics> metrics,
+                                          String query,
+                                          String... notUpdatedTableNames) throws Exception {
+    LOG.info("Check table metrics after query: " + query);
+    Set<String> notUpdatedTables = new HashSet<String>(Arrays.asList(notUpdatedTableNames));
+    for (Map.Entry<String, RocksDBMetrics> entry : metrics.entrySet()) {
+      String tableName = entry.getKey();
+      RocksDBMetrics metric = entry.getValue();
+      RocksDBMetrics updatedMetric = getRocksDBMetric(tableName);
+
+      if (notUpdatedTables.contains(tableName)) {
+        // Check that the NOT updated table metric was not changed.
+        assertTrue("Unexpected update of table/index " + tableName + " after: " + query,
+                   updatedMetric.equals(metric));
+      } else {
+        // Note: user-enforced index metric is not changed even if the index was updated.
+        if (tp.isTransactional() || tableName == "test_update") {
+          // Expecting the table metric is updated.
+          assertTrue("Expected update of table/index " + tableName + " after: " + query,
+                     !updatedMetric.equals(metric));
+        } else {
+          LOG.info("Skipping metric check for user-enforced index {}: {} - {}",
+                   tableName, metric, updatedMetric);
+        }
+      }
+      metrics.put(tableName, updatedMetric);
+    }
+  }
+
+  private Object strToObject(String value, boolean quoteStr) throws Exception {
+    if (value.toLowerCase().equals("null"))
+      return null;
+
+    if (value.charAt(0) == '\'')
+      if  (value.charAt(1) == '{') // JSONB
+        return value.substring(1, value.length() - 1);
+      else if (quoteStr)
+        return value; // Text as "'str'"
+      else return value.substring(1, value.length() - 1); // Text as "str"
+
+    return Integer.valueOf(value);
+  }
+
+  private ResultSet runQuery(String query, boolean runPrepared) throws Exception {
+    if (!runPrepared) {
+      LOG.info("Run query: " + query);
+      return session.execute(query);
+    }
+
+    query = query.replaceAll("=", " = ")
+                 .replaceAll(",", " , ")
+                 .replaceAll("\\(", " ( ")
+                 .replaceAll("\\)", " ) ");
+    List<String> words = new ArrayList<String>(Arrays.asList(query.split("\\s")));
+    words.removeAll(Arrays.asList("", null));
+
+    final String command = words.get(0).toLowerCase();
+    String statement = "";
+    List<Object> bindValues = new ArrayList<Object>();
+
+    if (command.equals("insert")) {
+      String[] parts = query.split("[\\(\\)]");
+      String[] names = parts[1].replaceAll("\\s+", "").split(",");
+      String[] values = parts[3].replaceAll("\\s+", "").split(",");
+      assertEquals(names.length, values.length);
+      statement = parts[0] + "(" + parts[1] + ")" + parts[2] + "(";
+      for (int i = 0; i < values.length; ++i) {
+        bindValues.add(strToObject(values[i], true));
+        statement += (i == 0 ? "?" : ", ?");
+      }
+      statement += ")";
+    } else if (command.equals("update") || command.equals("delete") || command.equals("select")) {
+      for (int i = 0; i <  words.size(); ++i) {
+        if (words.get(i).equals("=")) {
+          bindValues.add(strToObject(words.get(i+1), true));
+          words.set(i+1, "?");
+        } else if (words.get(i).toLowerCase().equals("in")){
+          assertEquals(words.get(i+1), "(");
+          words.set(i+1, "?");
+          List<Object> inValues = new ArrayList<Object>();
+          for (int j = i+2; j <  words.size(); ++j) {
+            if (words.get(j).equals(")")) {
+              bindValues.add(inValues);
+              words.set(j, "");
+              break;
+            }
+            inValues.add(strToObject(words.get(j), false));
+            words.set(j, "");
+          }
+        }
+        statement += " " + words.get(i);
+      }
+    } else {
+      fail("Unknown statement type: " + command);
+    }
+
+    LOG.info("Run prepared query: " + statement);
+    assertFalse(statement.isEmpty());
+    PreparedStatement prepared = session.prepare(statement);
+    return session.execute(prepared.bind(bindValues.toArray()));
+  }
+
+  protected void assertQuery(TableProperties tp,
+                             String query,
+                             String expectedResult) throws Exception {
+    assertEquals(expectedResult, resultSetToString(runQuery(query, tp.usePreparedQueries())));
+  }
+
+  private void assertIndexDataAndMetrics(TableProperties tp,
+                                         Map<String, String> tableColumnMap,
+                                         Map<String, String> indexColumnMap,
+                                         String query,
+                                         String... notUpdatedTableNames) throws Exception {
+    Map<String, RocksDBMetrics> metrics = initRocksDBMetrics("test_update", indexColumnMap);
+    runQuery(query, tp.usePreparedQueries());
+    checkRocksDBMetricsChanges(tp, metrics, query, notUpdatedTableNames);
+    checkIndexColumns(tableColumnMap, indexColumnMap, query);
+  }
+
+  public void doTestOptimizedIndexUpdate(TableProperties tp) throws Exception {
+    // Create test table and indexes.
+    session.execute("CREATE TABLE test_update " +
+                    "(h1 int, h2 text, r1 int, r2 text, c1 int, c2 text, " +
+                    "PRIMARY KEY ((h1, h2), r1, r2))" + tp.getWithOptTransEnabledStr());
+    // PK-only indexes.
+    session.execute("CREATE INDEX i1 on test_update (h1)" + tp.getWithOptUserEnforcedStr());
+    session.execute("CREATE INDEX i2 on test_update (r1)" + tp.getWithOptUserEnforcedStr());
+    session.execute("CREATE INDEX i3 on test_update ((r2))" + tp.getWithOptUserEnforcedStr());
+    session.execute("CREATE INDEX i4 on test_update ((h2, r2))" + tp.getWithOptUserEnforcedStr());
+    session.execute("CREATE INDEX i5 on test_update ((r1, r2)) include (c2)" +
+                    tp.getWithOptUserEnforcedStr());
+    session.execute("CREATE INDEX i6 on test_update (r2, r1) include (c1, c2)" +
+                    tp.getWithOptUserEnforcedStr());
+    // Non-PK-only indexes.
+    session.execute("CREATE INDEX i7 on test_update (c1)" + tp.getWithOptUserEnforcedStr());
+    session.execute("CREATE INDEX i8 on test_update (c2) include (c1)" +
+                    tp.getWithOptUserEnforcedStr());
+    session.execute("CREATE INDEX i9 on test_update (c2, c1)" + tp.getWithOptUserEnforcedStr());
+    session.execute("CREATE INDEX i10 on test_update (h1, c1) include (c2, r1)" +
+                    tp.getWithOptUserEnforcedStr());
+    session.execute("CREATE INDEX i11 on test_update (c2, r2) include (h1, c1)" +
+                    tp.getWithOptUserEnforcedStr());
+    session.execute("CREATE INDEX i12 on test_update (c2)" + tp.getWithOptUserEnforcedStr());
+
+    Map<String, String> tableColumnMap = new HashMap<String, String>() {{
+        put("i1", "h1, h2, r1, r2");
+        put("i2", "r1, h1, h2, r2");
+        put("i3", "r2, h1, h2, r1");
+        put("i4", "h2, r2, h1, r1");
+        put("i5", "r1, r2, h1, h2, c2");
+        put("i6", "r2, r1, h1, h2, c1, c2");
+        put("i7", "c1, h1, h2, r1, r2");
+        put("i8", "c2, h1, h2, r1, r2, c1");
+        put("i9", "c2, c1, h1, h2, r1, r2");
+        put("i10", "h1, c1, h2, r1, r2, c2");
+        put("i11", "c2, r2, h1, h2, r1, c1");
+        put("i12", "c2, h1, h2, r1, r2");
+      }};
+
+    Map<String, String> indexColumnMap = new HashMap<String, String>() {{
+        put("i1", "\"C$_h1\", \"C$_h2\", \"C$_r1\", \"C$_r2\"");
+        put("i2", "\"C$_r1\", \"C$_h1\", \"C$_h2\", \"C$_r2\"");
+        put("i3", "\"C$_r2\", \"C$_h1\", \"C$_h2\", \"C$_r1\"");
+        put("i4", "\"C$_h2\", \"C$_r2\", \"C$_h1\", \"C$_r1\"");
+        put("i5", "\"C$_r1\", \"C$_r2\", \"C$_h1\", \"C$_h2\", \"C$_c2\"");
+        put("i6", "\"C$_r2\", \"C$_r1\", \"C$_h1\", \"C$_h2\", \"C$_c1\", \"C$_c2\"");
+        put("i7", "\"C$_c1\", \"C$_h1\", \"C$_h2\", \"C$_r1\", \"C$_r2\"");
+        put("i8", "\"C$_c2\", \"C$_h1\", \"C$_h2\", \"C$_r1\", \"C$_r2\", \"C$_c1\"");
+        put("i9", "\"C$_c2\", \"C$_c1\", \"C$_h1\", \"C$_h2\", \"C$_r1\", \"C$_r2\"");
+        put("i10", "\"C$_h1\", \"C$_c1\", \"C$_h2\", \"C$_r1\", \"C$_r2\", \"C$_c2\"");
+        put("i11", "\"C$_c2\", \"C$_r2\", \"C$_h1\", \"C$_h2\", \"C$_r1\", \"C$_c1\"");
+        put("i12", "\"C$_c2\", \"C$_h1\", \"C$_h2\", \"C$_r1\", \"C$_r2\"");
+      }};
+
+    // test_update: Row[1, a, 2, b, 3]
+    // Added NEW row: PK + set c1, NOT set c2 (updating all indexes)
+    assertIndexDataAndMetrics(tp, tableColumnMap, indexColumnMap,
+        "insert into test_update (h1, h2, r1, r2, c1) values (1, 'a', 2, 'b', 3)");
+
+    // test_update: Row[1, a, 2, b, 3, c]
+    // Update: not changed c1, set c2
+    assertIndexDataAndMetrics(tp, tableColumnMap, indexColumnMap,
+        "update test_update set c2 = 'c' " +
+        "where h1 = 1 and h2 = 'a' and r1 = 2 and r2 = 'b'",
+        // not updated indexes:
+        "i7");
+    // Update: not changed c1, touch c2
+    assertIndexDataAndMetrics(tp, tableColumnMap, indexColumnMap,
+        "update test_update set c2 = 'c' " +
+        "where h1 = 1 and h2 = 'a' and r1 = 2 and r2 = 'b'",
+        // not updated indexes:
+        "i7", "i8", "i9", "i10", "i11", "i12");
+
+    // test_update: Row[1, a, 2, b, 4, c]
+    // Update: modify c1, not changed c2
+    assertIndexDataAndMetrics(tp, tableColumnMap, indexColumnMap,
+        "update test_update set c1 = 4 " +
+        "where h1 = 1 and h2 = 'a' and r1 = 2 and r2 = 'b'",
+        // not updated indexes:
+        "i12");
+    // Update: touch c1, not changed c2
+    assertIndexDataAndMetrics(tp, tableColumnMap, indexColumnMap,
+        "update test_update set c1 = 4 " +
+        "where h1 = 1 and h2 = 'a' and r1 = 2 and r2 = 'b'",
+        // not updated indexes:
+        "i7", "i8", "i9", "i10", "i11", "i12");
+
+    // test_update: Row[1, a, 2, b, 5, d]
+    // Update: modify c1, modify c2 (updating all indexes)
+    assertIndexDataAndMetrics(tp, tableColumnMap, indexColumnMap,
+        "update test_update set c1 = 5, c2 = 'd' " +
+        "where h1 = 1 and h2 = 'a' and r1 = 2 and r2 = 'b'");
+    // Update: touch c1, touch c2
+    assertIndexDataAndMetrics(tp, tableColumnMap, indexColumnMap,
+        "update test_update set c1 = 5, c2 = 'd' " +
+        "where h1 = 1 and h2 = 'a' and r1 = 2 and r2 = 'b'",
+        // not updated indexes:
+        "i7", "i8", "i9", "i10", "i11", "i12");
+
+    // test_update: Row[1, a, 2, b, 5, e]
+    // Update: not changed c1, modify c2
+    assertIndexDataAndMetrics(tp, tableColumnMap, indexColumnMap,
+        "update test_update set c2 = 'e' " +
+        "where h1 = 1 and h2 = 'a' and r1 = 2 and r2 = 'b'",
+        // not updated indexes:
+        "i7");
+
+    // test_update: Row[1, a,  2,  b, 5, e]
+    //              Row[1, a, 12, bb, 6   ]
+    // Added NEW row: PK + set c1, NOT set c2 (updating all indexes)
+    assertIndexDataAndMetrics(tp, tableColumnMap, indexColumnMap,
+        "insert into test_update (h1, h2, r1, r2, c1) values (1, 'a', 12, 'bb', 6)");
+
+    // test_update: Row[1, a,  2,  b, 5, e]
+    //              Row[1, a, 12, bb, null]
+    // In existing row: delete c1, not changed null c2.
+    assertIndexDataAndMetrics(tp, tableColumnMap, indexColumnMap,
+        "delete c1 from test_update " +
+        "where h1 = 1 and h2 = 'a' and r1 = 12 and r2 = 'bb'",
+        // not updated indexes:
+        "i1", "i2", "i3", "i4", "i5", "i12");
+    // In existing row: not changed null c1, delete NULL c2.
+    assertIndexDataAndMetrics(tp, tableColumnMap, indexColumnMap,
+        "delete c2 from test_update " +
+        "where h1 = 1 and h2 = 'a' and r1 = 12 and r2 = 'bb'",
+        // not updated indexes:
+        "i1", "i2", "i3", "i4", "i5", "i6", "i7", "i8", "i9", "i10", "i11", "i12");
+
+    // test_update: Row[1, a, 12, bb, null, null]
+    // Delete first row by PK. (updating all indexes)
+    assertIndexDataAndMetrics(tp, tableColumnMap, indexColumnMap,
+        "delete from test_update " +
+        "where h1 = 1 and h2 = 'a' and r1 = 2 and r2 = 'b'");
+
+    // test_update: empty
+    // Delete all existing rows. (updating all indexes)
+    assertIndexDataAndMetrics(tp, tableColumnMap, indexColumnMap,
+        "delete from test_update where h1 = 1 and h2 = 'a'");
+
+    // test_update: Row[11, aa, 22, bb, 3]
+    // UPsert: PK + set c1, not set c2. (updating all indexes)
+    assertIndexDataAndMetrics(tp, tableColumnMap, indexColumnMap,
+        "update test_update set c1 = 3 " +
+        "where h1 = 11 and h2 = 'aa' and r1 = 22 and r2 = 'bb'");
+
+    // test_update: Row[11, aa, 22, bb, null]
+    // Update: set c1 = NULL, not set c2. (updating all indexes)
+    assertIndexDataAndMetrics(tp, tableColumnMap, indexColumnMap,
+        "update test_update set c1 = null " +
+        "where h1 = 11 and h2 = 'aa' and r1 = 22 and r2 = 'bb'");
+
+    // test_update: Row[11, aa, 222, bbb, 3, c]
+    // UPsert: PK + set c1, set c2. (updating all indexes)
+    assertIndexDataAndMetrics(tp, tableColumnMap, indexColumnMap,
+        "update test_update set c1 = 3, c2 = 'c' " +
+        "where h1 = 11 and h2 = 'aa' and r1 = 222 and r2 = 'bbb'");
+
+    // test_update: Row[11, aa, 222, bbb, null, null]
+    // In existing row: delete c1, delete c2. (updating all indexes)
+    assertIndexDataAndMetrics(tp, tableColumnMap, indexColumnMap,
+        "delete c1, c2 from test_update " +
+        "where h1 = 11 and h2 = 'aa' and r1 = 222 and r2 = 'bbb'");
+  }
+
+  @Test
+  public void testOptimizedIndexUpdate() throws Exception {
+    doTestOptimizedIndexUpdate(new TableProperties(TableProperties.TP_NON_TRANSACTIONAL));
+  }
+
+  @Test
+  public void testOptimizedIndexUpdate_Transactional() throws Exception {
+    doTestOptimizedIndexUpdate(new TableProperties(TableProperties.TP_TRANSACTIONAL));
+  }
+
+  @Test
+  public void testPreparedOptimizedIndexUpdate() throws Exception {
+    doTestOptimizedIndexUpdate(new TableProperties(
+        TableProperties.TP_NON_TRANSACTIONAL | TableProperties.TP_PREPARED_QUERY));
+  }
+
+  @Test
+  public void testPreparedOptimizedIndexUpdate_Transactional() throws Exception {
+    doTestOptimizedIndexUpdate(new TableProperties(
+        TableProperties.TP_TRANSACTIONAL | TableProperties.TP_PREPARED_QUERY));
+  }
+
+  public void doTestOptimizedJsonIndexUpdate(TableProperties tp) throws Exception {
+    // Create test table and indexes.
+    session.execute("CREATE TABLE test_update " +
+                    "(h int, r int, c int, j JSONB, PRIMARY KEY ((h), r)) " +
+                    tp.getWithOptTransEnabledStr());
+
+    session.execute("CREATE INDEX i1 on test_update (j->>'a')" + tp.getWithOptUserEnforcedStr());
+    session.execute("CREATE INDEX i2 on test_update ((j->'a'->>'b'))" +
+                    tp.getWithOptUserEnforcedStr());
+    session.execute("CREATE INDEX i3 on test_update (j->'a'->>'b') include (c)" +
+                    tp.getWithOptUserEnforcedStr());
+    session.execute("CREATE INDEX i4 on test_update ((j->>'a')) include (c)" +
+                    tp.getWithOptUserEnforcedStr());
+    session.execute("CREATE INDEX i5 on test_update (c)" + tp.getWithOptUserEnforcedStr());
+    session.execute("CREATE INDEX i6 on test_update ((c))" + tp.getWithOptUserEnforcedStr());
+
+    Map<String, String> tableColumnMap = new HashMap<String, String>() {{
+        put("i1", "j->>'a', h, r");
+        put("i2", "j->'a'->>'b', h, r");
+        put("i3", "j->'a'->>'b', h, r, c");
+        put("i4", "j->>'a', h, r, c");
+        put("i5", "c, h, r");
+        put("i6", "c, h, r");
+      }};
+
+    Map<String, String> indexColumnMap = new HashMap<String, String>() {{
+        put("i1", "\"C$_j->>\'J$_a\'\", \"C$_h\", \"C$_r\"");
+        put("i2", "\"C$_j->\'J$_a\'->>\'J$_b\'\", \"C$_h\", \"C$_r\"");
+        put("i3", "\"C$_j->\'J$_a\'->>\'J$_b\'\", \"C$_h\", \"C$_r\", \"C$_c\"");
+        put("i4", "\"C$_j->>\'J$_a\'\", \"C$_h\", \"C$_r\", \"C$_c\"");
+        put("i5", "\"C$_c\", \"C$_h\", \"C$_r\"");
+        put("i6", "\"C$_c\", \"C$_h\", \"C$_r\"");
+      }};
+
+    // test_update: Row[1, 2, 3, {"a":1}] (updating all indexes)
+    assertIndexDataAndMetrics(tp, tableColumnMap, indexColumnMap,
+        "insert into test_update (h, r, c, j) values (1, 2, 3, '{\"a\":1}')");
+
+    // test_update: Row[1, 2, 9, {"a":1}]
+    assertIndexDataAndMetrics(tp, tableColumnMap, indexColumnMap,
+        "update test_update set c = 9 where h = 1 and r = 2",
+        // not updated indexes:
+        "i1", "i2");
+    assertIndexDataAndMetrics(tp, tableColumnMap, indexColumnMap,
+        "update test_update set c = 9 where h = 1 and r = 2",
+        // not updated indexes:
+        "i1", "i2", "i3", "i4", "i5", "i6");
+    assertIndexDataAndMetrics(tp, tableColumnMap, indexColumnMap,
+        "update test_update set j = '{\"a\":1}' where h = 1 and r = 2",
+        // not updated indexes:
+        "i1", "i2", "i3", "i4", "i5", "i6");
+
+    // test_update: Row[1, 2, 9, {"a":2}]
+    assertIndexDataAndMetrics(tp, tableColumnMap, indexColumnMap,
+        "update test_update set j = '{\"a\":2}' where h = 1 and r = 2",
+        // not updated indexes:
+        "i2", "i3", "i5", "i6");
+    assertQuery("select * from " + DEFAULT_TEST_KEYSPACE + ".i2;", "Row[1, 2, NULL]");
+
+    // test_update: empty (updating all indexes)
+    assertIndexDataAndMetrics(tp, tableColumnMap, indexColumnMap,
+        "delete from test_update where h = 1 and r = 2");
+
+    // test_update: Row[4, 5, 6, {"a":{"b":2}}] (updating all indexes)
+    assertIndexDataAndMetrics(tp, tableColumnMap, indexColumnMap,
+        "insert into test_update (h, r, c, j) values " +
+        "(4, 5, 6, '{\"a\":{\"b\":2}}')");
+
+    // test_update: Row[4, 5, 6, {"a":{"b":3}}]
+    assertIndexDataAndMetrics(tp, tableColumnMap, indexColumnMap,
+        "update test_update set j = '{\"a\":{\"b\":3}}' where h = 4 and r = 5",
+        // not updated indexes:
+        "i5", "i6");
+
+    // test_update: Row[4, 5, null, {"a":{"b":3}}]
+    assertIndexDataAndMetrics(tp, tableColumnMap, indexColumnMap,
+        "delete c from test_update where h = 4 and r = 5",
+        // not updated indexes:
+        "i1", "i2");
+
+    // test_update: Row[4, 5, null, null] (updating all indexes)
+    //TODO: If JSONB value == NULL: Error - Execution Error. Not enough data to process
+    //      https://github.com/yugabyte/yugabyte-db/issues/5899
+    //      [YCQL] Incorrect 'null' value handling with secondary indexes based on JSONB column.
+/*
+    assertIndexDataAndMetrics(tp, tableColumnMap, indexColumnMap,
+        "delete j from test_update where h = 4 and r = 5");
+
+    // test_update: Row[11, 22, 33, null] (updating all indexes)
+    assertIndexDataAndMetrics(tp, tableColumnMap, indexColumnMap,
+        "update test_update set c = 33 where h = 11 and r = 22");
+
+    // test_update: Row[11, 22, null, null] (updating all indexes)
+    assertIndexDataAndMetrics(tp, tableColumnMap, indexColumnMap,
+        "update test_update set c = null where h = 11 and r = 22");
+*/
+    // test_update: Row[44, 55, null, {"a":1}] (updating all indexes)
+    assertIndexDataAndMetrics(tp, tableColumnMap, indexColumnMap,
+        "update test_update set j = '{\"a\":1}' where h = 44 and r = 55");
+
+    // test_update: Row[44, 55, null, null] (updating all indexes)
+    //TODO: If JSONB value == NULL: Error - Execution Error. Not enough data to process
+    //      https://github.com/yugabyte/yugabyte-db/issues/5899
+    //      [YCQL] Incorrect 'null' value handling with secondary indexes based on JSONB column.
+/*
+    assertIndexDataAndMetrics(tp, tableColumnMap, indexColumnMap,
+        "update test_update set j = null where h = 44 and r = 55");
+*/
+    // test_update: Row[66, 77, 1, {"a":1}] (updating all indexes)
+    assertIndexDataAndMetrics(tp, tableColumnMap, indexColumnMap,
+        "update test_update set c = 1, j = '{\"a\":1}' where h = 66 and r = 77");
+
+    // test_update: Row[66, 77, null, null] (updating all indexes)
+    //TODO: If JSONB value == NULL: Error - Execution Error. Not enough data to process
+    //      https://github.com/yugabyte/yugabyte-db/issues/5899
+    //      [YCQL] Incorrect 'null' value handling with secondary indexes based on JSONB column.
+/*
+    assertIndexDataAndMetrics(tp, tableColumnMap, indexColumnMap,
+        "update test_update set c = null, j = null where h = 66 and r = 77");
+*/
+    assertIndexDataAndMetrics(tp, tableColumnMap, indexColumnMap,
+        "delete c from test_update where h = 66 and r = 77",
+        // not updated indexes:
+        "i1", "i2");
+    // (updating all indexes)
+    assertIndexDataAndMetrics(tp, tableColumnMap, indexColumnMap,
+        "delete j from test_update where h = 66 and r = 77");
+
+    //TODO: If JSONB value == NULL: Error - Execution Error. Not enough data to process
+    //      https://github.com/yugabyte/yugabyte-db/issues/5899
+    //      [YCQL] Incorrect 'null' value handling with secondary indexes based on JSONB column.
+/*
+    // (updating all indexes)
+    assertIndexDataAndMetrics(tp, tableColumnMap, indexColumnMap,
+        "delete c, j from test_update where h = 66 and r = 77");
+*/
+  }
+
+  @Test
+  public void testOptimizedJsonIndexUpdate() throws Exception {
+    doTestOptimizedIndexUpdate(new TableProperties(TableProperties.TP_NON_TRANSACTIONAL));
+  }
+
+  @Test
+  public void testOptimizedJsonIndexUpdate_Transactional() throws Exception {
+    doTestOptimizedJsonIndexUpdate(new TableProperties(TableProperties.TP_TRANSACTIONAL));
+  }
+
+  @Test
+  public void testPreparedOptimizedJsonIndexUpdate() throws Exception {
+    doTestOptimizedIndexUpdate(new TableProperties(
+        TableProperties.TP_NON_TRANSACTIONAL | TableProperties.TP_PREPARED_QUERY));
+  }
+
+  @Test
+  public void testPreparedOptimizedJsonIndexUpdate_Transactional() throws Exception {
+    doTestOptimizedJsonIndexUpdate(new TableProperties(
+        TableProperties.TP_TRANSACTIONAL | TableProperties.TP_PREPARED_QUERY));
+  }
+
+  public void doTestInKeyword(TableProperties tp) throws Exception {
+    // Create test table and index.
+    session.execute("CREATE TABLE test_in (id uuid PRIMARY KEY, name text, size text) " +
+                    tp.getWithOptTransEnabledStr());
+    session.execute("CREATE INDEX i1 ON test_in (name)" + tp.getWithOptUserEnforcedStr());
+    // Insert test values.
+    session.execute("INSERT INTO test_in (id, name, size) VALUES " +
+                    "(5b6962dd-3f90-4c93-8f61-eabfa4a803e3, '', '')");
+    session.execute("INSERT INTO test_in (id, name, size) VALUES " +
+                    "(5b6962dd-3f90-4c93-8f61-eabfa4a803e2, 'first', 'second')");
+    session.execute("INSERT INTO test_in (id, name, size) VALUES " +
+                    "(5b6962dd-3f90-4c93-8f61-eabfa4a80310, NULL, NULL)");
+
+    assertQuery("SELECT * FROM test_in",
+                "Row[5b6962dd-3f90-4c93-8f61-eabfa4a803e3, , ]" +
+                "Row[5b6962dd-3f90-4c93-8f61-eabfa4a803e2, first, second]" +
+                "Row[5b6962dd-3f90-4c93-8f61-eabfa4a80310, NULL, NULL]");
+
+    assertQuery(tp, "SELECT * FROM test_in WHERE name IN ('first')",
+                "Row[5b6962dd-3f90-4c93-8f61-eabfa4a803e2, first, second]");
+
+    assertQuery(tp, "SELECT * FROM test_in WHERE name IN ('')",
+                "Row[5b6962dd-3f90-4c93-8f61-eabfa4a803e3, , ]");
+
+    assertQuery(tp, "SELECT * FROM test_in WHERE name IN ()", "");
+
+    assertQuery(tp, "SELECT * FROM test_in WHERE name NOT IN ()",
+                "Row[5b6962dd-3f90-4c93-8f61-eabfa4a803e3, , ]" +
+                "Row[5b6962dd-3f90-4c93-8f61-eabfa4a803e2, first, second]" +
+                "Row[5b6962dd-3f90-4c93-8f61-eabfa4a80310, NULL, NULL]");
+
+    // Cannot pass NULL into IN-list via PreparedStatement API.
+    if (!tp.usePreparedQueries()) {
+      assertQuery(tp, "SELECT * FROM test_in WHERE name IN (null)",
+                  "Row[5b6962dd-3f90-4c93-8f61-eabfa4a80310, NULL, NULL]");
+
+      assertQuery(tp, "SELECT * FROM test_in WHERE name NOT IN ('', null)",
+                  "Row[5b6962dd-3f90-4c93-8f61-eabfa4a803e2, first, second]");
+
+      assertQuery(tp, "SELECT * FROM test_in WHERE name NOT IN (null)",
+                  "Row[5b6962dd-3f90-4c93-8f61-eabfa4a803e3, , ]" +
+                  "Row[5b6962dd-3f90-4c93-8f61-eabfa4a803e2, first, second]");
+    }
+
+    // Create test table and index.
+    session.execute("CREATE TABLE test_in2 (h text, r text, v1 text, v2 text, PRIMARY KEY(h,r)) " +
+                    tp.getWithOptTransEnabledStr());
+    session.execute("CREATE INDEX i2 ON test_in2 (v1, r) INCLUDE (v2)" +
+                    tp.getWithOptUserEnforcedStr());
+    // Insert a row.
+    session.execute("INSERT INTO test_in2 (h, r, v1, v2) VALUES ('foo', 'bar', 'v1', 'v2')");
+
+    // Main table: Hash key column.
+    assertQuery(tp, "SELECT * FROM test_in2 WHERE h IN ()", "");
+    // Main table: Range key column.
+    assertQuery(tp, "SELECT * FROM test_in2 WHERE h = 'foo' AND r IN ()", "");
+    // Main table: Non-key column.
+    assertQuery(tp, "SELECT * FROM test_in2 WHERE h = 'foo' AND r = 'bar' AND v2 IN ()", "");
+
+    // Index table: Hash key column.
+    assertQuery(tp, "SELECT * FROM test_in2 WHERE v1 IN ()", "");
+    // Index table: Range key column.
+    assertQuery(tp, "SELECT * FROM test_in2 WHERE v1 = 'v1' AND r IN ()", "");
+    // Index table: Non-key column.
+    assertQuery(tp, "SELECT * FROM test_in2 WHERE v1 = 'v1' AND r = 'bar' AND v2 IN ()", "");
+  }
+
+  @Test
+  public void testInKeyword() throws Exception {
+    doTestInKeyword(new TableProperties(TableProperties.TP_NON_TRANSACTIONAL));
+  }
+
+  @Test
+  public void testInKeyword_Transactional() throws Exception {
+    doTestInKeyword(new TableProperties(TableProperties.TP_TRANSACTIONAL));
+  }
+
+  @Test
+  public void testInKeywordInPrepared() throws Exception {
+    doTestInKeyword(new TableProperties(
+        TableProperties.TP_NON_TRANSACTIONAL | TableProperties.TP_PREPARED_QUERY));
+  }
+
+  @Test
+  public void testInKeywordInPrepared_Transactional() throws Exception {
+    doTestInKeyword(new TableProperties(
+        TableProperties.TP_TRANSACTIONAL | TableProperties.TP_PREPARED_QUERY));
   }
 }

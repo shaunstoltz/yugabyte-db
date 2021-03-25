@@ -62,7 +62,6 @@ typedef struct YbScanDescData
 
 	/* The handle for the internal YB Select statement. */
 	YBCPgStatement handle;
-	ResourceOwner stmt_owner;
 	bool is_exec_done;
 
 	Relation index;
@@ -88,6 +87,15 @@ typedef struct YbScanDescData
 	 *   execution in YB tablet server.
 	 */
 	YBCPgExecParameters *exec_params;
+	/*
+	 * Flag used for bailing out from scan early. Currently used to bail out from scans where
+	 * one of the bind conditions is a search array and is empty.
+	 * Consider an example query,
+	 * select c1,c2 from test where c1 = XYZ AND c2 = ANY(ARRAY[]::integer[]);
+	 * The second bind condition c2 = ANY(ARRAY[]::integer[]) will never be satisfied. Hence when,
+	 * this is detected, we bail out from creating and sending a request to docDB
+	 */
+	bool quit_scan;
 } YbScanDescData;
 
 typedef struct YbScanDescData *YbScanDesc;
@@ -132,16 +140,36 @@ YbScanDesc ybcBeginScan(Relation relation,
 HeapTuple ybc_getnext_heaptuple(YbScanDesc ybScan, bool is_forward_scan, bool *recheck);
 IndexTuple ybc_getnext_indextuple(YbScanDesc ybScan, bool is_forward_scan, bool *recheck);
 
-void ybcEndScan(YbScanDesc ybScan);
-
 /* Number of rows assumed for a YB table if no size estimates exist */
 #define YBC_DEFAULT_NUM_ROWS  1000
 
-#define YBC_SINGLE_KEY_SELECTIVITY	(1.0 / YBC_DEFAULT_NUM_ROWS)
-#define YBC_HASH_SCAN_SELECTIVITY	(10.0 / YBC_DEFAULT_NUM_ROWS)
+#define YBC_SINGLE_ROW_SELECTIVITY	(1.0 / YBC_DEFAULT_NUM_ROWS)
+#define YBC_SINGLE_KEY_SELECTIVITY	(10.0 / YBC_DEFAULT_NUM_ROWS)
+#define YBC_HASH_SCAN_SELECTIVITY	(100.0 / YBC_DEFAULT_NUM_ROWS)
 #define YBC_FULL_SCAN_SELECTIVITY	1.0
 
+/*
+ * For a partial index the index predicate will filter away some rows.
+ * TODO: Evaluate this based on the predicate itself and table stats.
+ */
+#define YBC_PARTIAL_IDX_PRED_SELECTIVITY 0.8
+
+/*
+ * Backwards scans are more expensive in DocDB.
+ * TODO: the ysql_backward_prefetch_scale_factor gflag is correlated to this
+ * but is too low (1/16 implying 16x slower) to be used here.
+ */
+#define YBC_BACKWARDS_SCAN_COST_FACTOR 1.1
+
+/*
+ * Uncovered indexes will require extra RPCs to the main table to retrieve the
+ * values for all required columns. These requests are now batched in PgGate
+ * so the extra cost should be relatively low in general.
+ */
+#define YBC_UNCOVERED_INDEX_COST_FACTOR 1.1
+
 extern void ybcCostEstimate(RelOptInfo *baserel, Selectivity selectivity,
+                            bool is_backwards_scan, bool is_uncovered_idx_scan,
 							Cost *startup_cost, Cost *total_cost);
 extern void ybcIndexCostEstimate(IndexPath *path, Selectivity *selectivity,
 								 Cost *startup_cost, Cost *total_cost);
@@ -150,6 +178,5 @@ extern void ybcIndexCostEstimate(IndexPath *path, Selectivity *selectivity,
  * Fetch a single tuple by the ybctid.
  */
 extern HeapTuple YBCFetchTuple(Relation relation, Datum ybctid);
-
 
 #endif							/* YBCAM_H */

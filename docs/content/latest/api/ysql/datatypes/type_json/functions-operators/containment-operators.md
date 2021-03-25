@@ -2,12 +2,11 @@
 title: "@> and <@ (containment operators) [JSON]"
 headerTitle: "@> and <@ (containment operators)"
 linkTitle: "@> and <@ (containment)"
-summary: Containment (@> & <@)
-description: Use the JSON containment operators (@> and <@) to test whether one jsonb value contains another jsonb value.
+description:  Test whether one jsonb value contains another jsonb value using the JSON containment operators (@> and <@).
 menu:
   latest:
     identifier: containment-operators
-    parent: functions-operators
+    parent: json-functions-operators
     weight: 16
 isTocNested: true
 showAsideToc: true
@@ -27,9 +26,9 @@ input values:       jsonb <@ jsonb
 return value:       boolean
 ```
 
-**Notes:** these operators require that the inputs are presented as `jsonb` values. They don't have overloads for `json`.
+**Notes:** Each of these operators requires that the inputs are presented as `jsonb` values. There are no `json` overloads.
 
-```postgresql
+```plpgsql
 do $body$
 declare
   j_left  constant jsonb := '{"a": 1, "b": 2}';

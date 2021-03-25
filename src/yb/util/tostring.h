@@ -24,6 +24,7 @@
 #include <boost/mpl/and.hpp>
 
 #include <boost/preprocessor/facilities/apply.hpp>
+#include <boost/preprocessor/seq/for_each.hpp>
 #include <boost/preprocessor/variadic/to_seq.hpp>
 
 #include "yb/gutil/strings/numbers.h"
@@ -58,7 +59,7 @@ HAS_FREE_FUNCTION(to_string);
 
 } // namespace yb_tostring
 
-// This utility actively use SFINAE (http://en.cppreference.com/w/cpp/language/sfinae)
+// This utility actively uses SFINAE (http://en.cppreference.com/w/cpp/language/sfinae)
 // technique to route ToString to correct implementation.
 namespace yb {
 
@@ -167,6 +168,9 @@ std::string ToString(const std::pair<First, Second>& pair);
 template <class Collection>
 std::string CollectionToString(const Collection& collection);
 
+template <class Collection, class Transform>
+std::string CollectionToString(const Collection& collection, const Transform& transform);
+
 template <class T>
 typename std::enable_if<yb_tostring::HasFreeFunction_to_string<T>::value,
                         std::string>::type ToString(const T& value) {
@@ -174,9 +178,19 @@ typename std::enable_if<yb_tostring::HasFreeFunction_to_string<T>::value,
 }
 
 template <class T>
-typename std::enable_if<IsCollection<T>::value && !yb_tostring::HasFreeFunction_to_string<T>::value,
+typename std::enable_if<IsCollection<T>::value &&
+                            !yb_tostring::HasFreeFunction_to_string<T>::value &&
+                            !HasMemberFunction_ToString<T>::value,
                         std::string>::type ToString(const T& value) {
   return CollectionToString(value);
+}
+
+template <class T, class Transform>
+typename std::enable_if<IsCollection<T>::value &&
+                            !yb_tostring::HasFreeFunction_to_string<T>::value &&
+                            !HasMemberFunction_ToString<T>::value,
+                        std::string>::type ToString(const T& value, const Transform& transform) {
+  return CollectionToString(value, transform);
 }
 
 template <class T>
@@ -255,25 +269,49 @@ std::string ToString(const std::chrono::duration<Rep, Period>& duration) {
 std::string ToString(const std::chrono::steady_clock::time_point& time_point);
 std::string ToString(const std::chrono::system_clock::time_point& time_point);
 
+struct Identity {
+  template <class T>
+  const T& operator()(const T& t) const {
+    return t;
+  }
+};
+
 template <class Collection>
 std::string CollectionToString(const Collection& collection) {
+  return CollectionToString(collection, Identity());
+}
+
+template <class Collection, class Transform>
+std::string CollectionToString(const Collection& collection, const Transform& transform) {
   std::string result = "[";
   auto first = true;
+
+// Range loop analysis flags copying of objects in a range loop by suggesting the use of
+// references. It however prevents the use of references for trivial entities like 'bool'. Given
+// that this function is templatized, we have both the cases happening in the following loop.
+// Ignore the range-loop-analysis in this part of the code.
+#if defined(__clang__)
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Wrange-loop-analysis"
+#endif
   for (const auto& item : collection) {
     if (first) {
       first = false;
     } else {
       result += ", ";
     }
-    result += ToString(item);
+    result += ToString(transform(item));
   }
+#if defined(__clang__)
+#pragma clang diagnostic pop
+#endif
   result += "]";
   return result;
 }
 
-template <class T>
-std::string AsString(const T& t) {
-  return ToString(t);
+template <class... T>
+std::string AsString(T&&... t) {
+  return ToString(std::forward<T>(t)...);
 }
 
 } // namespace yb
@@ -284,13 +322,32 @@ std::string AsString(const T& t) {
     " " BOOST_PP_STRINGIZE(elem) ": " + AsString(BOOST_PP_CAT(elem, BOOST_PP_APPLY(data))) +
 #define YB_FIELDS_TO_STRING(data, ...) \
     BOOST_PP_SEQ_FOR_EACH(YB_FIELD_TO_STRING, data(), BOOST_PP_VARIADIC_TO_SEQ(__VA_ARGS__))
+
+// This can be used to simplify ToString function implementations in structs where field names do
+// not end with an underscore. Suppose we have a struct with fields a and b. If we implement
+// ToString as
+//
+// std::string ToString() const {
+//   return YB_STRUCT_TO_STRING(a, b);
+// }
+//
+// we will get ToString return values of the form "{ a: value_for_a b: value_for_b }".
 #define YB_STRUCT_TO_STRING(...) \
     "{" YB_FIELDS_TO_STRING(BOOST_PP_NIL, __VA_ARGS__) " }"
+
+// This can be used to simplify ToString function implementations in classes where field names end
+// with an underscore. Suppose we have a class with fields a_ and b_. If we implement ToString as
+//
+// std::string ToString() const {
+//   return YB_CLASS_TO_STRING(a, b);
+// }
+//
+// we will get ToString return values of the form "{ a: value_for_a b: value_for_b }".
 #define YB_CLASS_TO_STRING(...) \
     "{" YB_FIELDS_TO_STRING((BOOST_PP_IDENTITY(_)), __VA_ARGS__) " }"
 
 #else
-#error Compiler not supported
+#error "Compiler not supported -- BOOST_PP_VARIADICS is not set. See https://bit.ly/2ZF7rTu."
 #endif
 
 #endif // YB_UTIL_TOSTRING_H

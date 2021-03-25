@@ -67,31 +67,33 @@ namespace tablet {
 
 struct TransactionApplyData {
   int64_t leader_term = -1;
-  TransactionId transaction_id;
-  consensus::OpId op_id;
+  TransactionId transaction_id = TransactionId::Nil();
+  OpIdPB op_id;
   HybridTime commit_ht;
   HybridTime log_ht;
   bool sealed = false;
   TabletId status_tablet;
+  // Owned by running transaction if non-null.
+  const docdb::ApplyTransactionState* apply_state = nullptr;
 
   std::string ToString() const;
 };
 
 struct RemoveIntentsData {
-  consensus::OpId op_id;
+  OpIdPB op_id;
   HybridTime log_ht;
 };
 
 // Interface to object that should apply intents in RocksDB when transaction is applying.
 class TransactionIntentApplier {
  public:
-  virtual CHECKED_STATUS ApplyIntents(const TransactionApplyData& data) = 0;
+  virtual Result<docdb::ApplyTransactionState> ApplyIntents(const TransactionApplyData& data) = 0;
   virtual CHECKED_STATUS RemoveIntents(
       const RemoveIntentsData& data, const TransactionId& transaction_id) = 0;
   virtual CHECKED_STATUS RemoveIntents(
       const RemoveIntentsData& data, const TransactionIdSet& transactions) = 0;
 
-  virtual HybridTime ApplierSafeTime(HybridTime min_allowed, CoarseTimePoint deadline) = 0;
+  virtual Result<HybridTime> ApplierSafeTime(HybridTime min_allowed, CoarseTimePoint deadline) = 0;
 
   // See TransactionParticipant::WaitMinRunningHybridTime below
   virtual void MinRunningHybridTimeSatisfied() = 0;
@@ -106,12 +108,13 @@ class TransactionParticipantContext {
   virtual const std::string& tablet_id() const = 0;
   virtual const std::shared_future<client::YBClient*>& client_future() const = 0;
   virtual const server::ClockPtr& clock_ptr() const = 0;
+  virtual rpc::Scheduler& scheduler() const = 0;
 
   // Fills RemoveIntentsData with information about replicated state.
   virtual void GetLastReplicatedData(RemoveIntentsData* data) = 0;
 
-  virtual bool Enqueue(rpc::ThreadPoolTask* task) = 0;
-  virtual HybridTime Now() = 0;
+  // Enqueue task to participant context strand.
+  virtual void StrandEnqueue(rpc::StrandTask* task) = 0;
   virtual void UpdateClock(HybridTime hybrid_time) = 0;
   virtual bool IsLeader() = 0;
   virtual void SubmitUpdateTransaction(
@@ -122,19 +125,21 @@ class TransactionParticipantContext {
 
   std::string LogPrefix() const;
 
+  HybridTime Now();
+
  protected:
   ~TransactionParticipantContext() {}
 };
 
 struct TransactionalBatchData {
   // Write id of last strong write intent in transaction.
-  IntraTxnWriteId write_id = 0;
+  IntraTxnWriteId next_write_id = 0;
 
   // Hybrid time of last replicated write in transaction.
   HybridTime hybrid_time;
 
   std::string ToString() const {
-    return Format("{ write_id: $0 hybrid_time: $1 }", write_id, hybrid_time);
+    return YB_STRUCT_TO_STRING(next_write_id, hybrid_time);
   }
 };
 
@@ -183,10 +188,10 @@ class TransactionParticipant : public TransactionStatusManager {
   struct ReplicatedData {
     int64_t leader_term = -1;
     const tserver::TransactionStatePB& state;
-    const consensus::OpId& op_id;
+    const OpIdPB& op_id;
     HybridTime hybrid_time;
     bool sealed = false;
-    AlreadyApplied already_applied;
+    AlreadyAppliedToRegularDB already_applied_to_regular_db;
 
     std::string ToString() const;
   };
@@ -194,7 +199,7 @@ class TransactionParticipant : public TransactionStatusManager {
   CHECKED_STATUS ProcessReplicated(const ReplicatedData& data);
 
   void SetDB(
-      rocksdb::DB* db, const docdb::KeyBounds* key_bounds,
+      const docdb::DocDB& db, const docdb::KeyBounds* key_bounds,
       RWOperationCounter* pending_op_counter);
 
   CHECKED_STATUS CheckAborted(const TransactionId& id);
@@ -210,7 +215,7 @@ class TransactionParticipant : public TransactionStatusManager {
 
   TransactionParticipantContext* context() const;
 
-  HybridTime MinRunningHybridTime() const;
+  HybridTime MinRunningHybridTime() const override;
 
   // When minimal start hybrid time of running transaction will be at least `ht` applier
   // method `MinRunningHybridTimeSatisfied` will be invoked.
@@ -225,6 +230,12 @@ class TransactionParticipant : public TransactionStatusManager {
   // - All intents of committed transactions will have been applied.
   // - No transactions can be committed with commit time <= resolve_at from that point on..
   CHECKED_STATUS ResolveIntents(HybridTime resolve_at, CoarseTimePoint deadline);
+
+  // Attempts to abort all transactions that started prior to cutoff time.
+  // Waits until deadline, for txns to abort. If not, it returns a TimedOut.
+  // After this call, there should be no active (non-aborted/committed) txn that
+  // started before cutoff which is active on this tablet.
+  CHECKED_STATUS StopActiveTxnsPriorTo(HybridTime cutoff, CoarseTimePoint deadline);
 
   std::string DumpTransactions() const;
 

@@ -1,9 +1,8 @@
 ---
-title: CDC to Kafka
-headerTitle: CDC to Kafka
-linkTitle: CDC to Kafka
+title: Use change data capture (CDC) to Kafka
 headerTitle: Change data capture (CDC) to Kafka
-description: Learn how to use Change data capture (CDC) API to send data changes to Apache Kafka
+linkTitle: CDC to Kafka
+description: Learn how to use change data capture (CDC) API to send data changes to Apache Kafka.
 beta: /latest/faq/general/#what-is-the-definition-of-the-beta-feature-tag
 menu:
   latest:
@@ -43,7 +42,7 @@ To get a local Confluent Platform (with Apache Kafka) up and running quickly, fo
 
 With your local YugabyteDB cluster running, create a table, called `users`, in the default database (`yugabyte`).
 
-```postgresql
+```plpgsql
 CREATE TABLE users (name text, pass text, id int, primary key (id));
 ```
 

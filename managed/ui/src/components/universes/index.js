@@ -2,6 +2,8 @@
 
 export { default as DeleteUniverse } from './DeleteUniverse/DeleteUniverse';
 export { default as DeleteUniverseContainer } from './DeleteUniverse/DeleteUniverseContainer';
+export { ToggleUniverseState } from './ToggleUniverseState/ToggleUniverseState';
+export { default as ToggleUniverseStateContainer } from './ToggleUniverseState/ToggleUniverseStateContainer';
 export { default as ListUniverse } from './ListUniverse/ListUniverse';
 export { default as ListUniverseContainer } from './ListUniverse/ListUniverseContainer';
 export { default as NodeDetails } from './NodeDetails/NodeDetails';
@@ -22,10 +24,8 @@ export { default as UniverseTable } from './UniverseTable/UniverseTable';
 export { default as UniverseTableContainer } from './UniverseTable/UniverseTableContainer';
 export { default as UniverseAppsModal } from './UniverseAppsModal/UniverseAppsModal';
 export { default as UniverseConnectModal } from './UniverseConnectModal/UniverseConnectModal';
-export { default as UniverseOverview } from './UniverseOverview/UniverseOverview';
 export { default as UniverseOverviewNew } from './UniverseOverview/UniverseOverviewNew';
 export { default as UniverseOverviewContainerNew } from './UniverseOverview/UniverseOverviewContainerNew';
-export { default as UniverseOverviewContainer } from './UniverseOverview/UniverseOverviewContainer';
 export { default as EncryptionKeyModal } from './SecurityModal/EncryptionKeyModal';
 export { default as EncryptionKeyModalContainer } from './SecurityModal/EncryptionKeyModalContainer';
 export { default as UniverseAction } from './UniverseAction/UniverseAction';

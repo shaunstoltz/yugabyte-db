@@ -21,6 +21,8 @@
 
 #include "yb/master/master_fwd.h"
 
+#include "yb/rpc/rpc_fwd.h"
+
 #include "yb/tablet/operations/operation.h"
 #include "yb/tablet/snapshot_coordinator.h"
 
@@ -31,55 +33,58 @@
 namespace yb {
 namespace master {
 
-using TabletSnapshotOperationCallback =
-    std::function<void(Result<const tserver::TabletSnapshotOpResponsePB&>)>;
-
-// Context class for MasterSnapshotCoordinator.
-class SnapshotCoordinatorContext {
- public:
-  // Return tablet infos for specified tablet ids.
-  // The returned vector is always of the same length as the input vector,
-  // with null entries returned for unknown tablet ids.
-  virtual TabletInfos GetTabletInfos(const std::vector<TabletId>& id) = 0;
-
-  virtual void SendCreateTabletSnapshotRequest(
-      const scoped_refptr<TabletInfo>& tablet, const std::string& snapshot_id,
-      HybridTime snapshot_hybrid_time, TabletSnapshotOperationCallback callback) = 0;
-
-  virtual void SendRestoreTabletSnapshotRequest(
-      const scoped_refptr<TabletInfo>& tablet, const std::string& snapshot_id,
-      TabletSnapshotOperationCallback callback) = 0;
-
-  virtual Result<ColumnId> MetadataColumnId() = 0;
-
-  virtual CHECKED_STATUS ApplyOperationState(
-      const tablet::OperationState& operation_state, int64_t batch_idx,
-      const docdb::KeyValueWriteBatchPB& write_batch) = 0;
-
-  virtual void SubmitWrite(const docdb::KeyValueWriteBatchPB& write_batch) = 0;
-
-  virtual ~SnapshotCoordinatorContext() = default;
-};
-
 // Class that coordinates transaction aware snapshots at master.
 class MasterSnapshotCoordinator : public tablet::SnapshotCoordinator {
  public:
   explicit MasterSnapshotCoordinator(SnapshotCoordinatorContext* context);
   ~MasterSnapshotCoordinator();
 
+  Result<TxnSnapshotId> Create(
+      const SysRowEntries& entries, bool imported, CoarseTimePoint deadline);
+
+  CHECKED_STATUS Delete(const TxnSnapshotId& snapshot_id, CoarseTimePoint deadline);
+
   // As usual negative leader_term means that this operation was replicated at the follower.
-  CHECKED_STATUS Replicated(
+  CHECKED_STATUS CreateReplicated(
       int64_t leader_term, const tablet::SnapshotOperationState& state) override;
 
-  CHECKED_STATUS ListSnapshots(const TxnSnapshotId& snapshot_id, ListSnapshotsResponsePB* resp);
+  CHECKED_STATUS DeleteReplicated(
+      int64_t leader_term, const tablet::SnapshotOperationState& state) override;
 
-  Result<TxnSnapshotRestorationId> Restore(const TxnSnapshotId& snapshot_id);
+  CHECKED_STATUS RestoreSysCatalogReplicated(
+      int64_t leader_term, const tablet::SnapshotOperationState& state) override;
+
+  CHECKED_STATUS ListSnapshots(
+      const TxnSnapshotId& snapshot_id, bool list_deleted, ListSnapshotsResponsePB* resp);
+
+  Result<TxnSnapshotRestorationId> Restore(const TxnSnapshotId& snapshot_id, HybridTime restore_at);
 
   CHECKED_STATUS ListRestorations(
-      const TxnSnapshotRestorationId& snapshot_id, ListSnapshotRestorationsResponsePB* resp);
+      const TxnSnapshotRestorationId& restoration_id, const TxnSnapshotId& snapshot_id,
+      ListSnapshotRestorationsResponsePB* resp);
 
-  // Load snapshot data from system catalog RocksDB entry.
-  CHECKED_STATUS Load(const TxnSnapshotId& snapshot_id, const SysSnapshotEntryPB& data);
+  Result<SnapshotScheduleId> CreateSchedule(
+      const CreateSnapshotScheduleRequestPB& request, CoarseTimePoint deadline);
+
+  CHECKED_STATUS ListSnapshotSchedules(
+      const SnapshotScheduleId& snapshot_schedule_id, ListSnapshotSchedulesResponsePB* resp);
+
+  // Load snapshots data from system catalog.
+  CHECKED_STATUS Load(tablet::Tablet* tablet) override;
+
+  // Check whether we have write request for snapshot while replaying write request during
+  // bootstrap. And upsert snapshot from it in this case.
+  // key and value are entry from the write batch.
+  CHECKED_STATUS ApplyWritePair(const Slice& key, const Slice& value) override;
+
+  CHECKED_STATUS FillHeartbeatResponse(TSHeartbeatResponsePB* resp);
+
+  // For each returns map from schedule id to sorted vectors of tablets id in this schedule.
+  Result<SnapshotSchedulesToTabletsMap> MakeSnapshotSchedulesToTabletsMap();
+
+  void Start();
+
+  void Shutdown();
 
  private:
   class Impl;

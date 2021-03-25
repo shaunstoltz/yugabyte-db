@@ -81,6 +81,7 @@ class MonoDelta {
   bool IsNegative() const;
   std::string ToString() const;
   double ToSeconds() const;
+  double ToMinutes() const;
   int64_t ToMilliseconds() const;
   int64_t ToMicroseconds() const;
   int64_t ToNanoseconds() const;
@@ -145,6 +146,7 @@ class MonoTime {
   static constexpr int64_t kNanosecondsPerMicrosecond = 1000L;
   static constexpr int64_t kMicrosecondsPerMillisecond = 1000L;
   static constexpr int64_t kMillisecondsPerSecond = 1000L;
+  static constexpr int64_t kSecondsPerMinute = 60L;
 
   static constexpr int64_t kNanosecondsPerMillisecond =
       kNanosecondsPerMicrosecond * kMicrosecondsPerMillisecond;
@@ -236,7 +238,7 @@ inline MonoTime& operator-=(MonoTime& lhs, const MonoDelta& rhs) { // NOLINT
 inline MonoTime operator-(const MonoTime& lhs, const MonoDelta& rhs) {
   MonoTime result = lhs;
   result.AddDelta(-rhs);
-  return MonoTime(lhs);
+  return MonoTime(result);
 }
 
 inline bool operator<(const MonoTime& lhs, const MonoTime& rhs) {
@@ -263,6 +265,8 @@ class CoarseMonoClock {
   typedef duration Duration;
   typedef std::chrono::time_point<CoarseMonoClock> time_point;
   typedef time_point TimePoint;
+
+  static constexpr bool is_steady = true;
 
   static time_point now();
   static TimePoint Now() { return now(); }

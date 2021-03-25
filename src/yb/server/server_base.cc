@@ -67,6 +67,7 @@
 #include "yb/util/monotime.h"
 #include "yb/util/net/sockaddr.h"
 #include "yb/util/net/net_util.h"
+#include "yb/util/status.h"
 #include "yb/util/user.h"
 #include "yb/util/pb_util.h"
 #include "yb/util/rolling_log.h"
@@ -96,6 +97,14 @@ DEFINE_string(yb_test_name, "",
 DEFINE_bool(TEST_check_broadcast_address, true, "Break connectivity in test mini cluster to "
             "check broadcast address.");
 
+DEFINE_test_flag(string, public_hostname_suffix, ".ip.yugabyte", "Suffix for public hostnames.");
+
+DEFINE_test_flag(bool, simulate_port_conflict_error, false,
+                 "Simulate a port conflict error during initialization.");
+
+DEFINE_test_flag(int32, nodes_per_cloud, 2,
+                 "Number of nodes per cloud to test private and public addresses.");
+
 using namespace std::literals;
 using namespace std::placeholders;
 
@@ -107,8 +116,6 @@ using strings::Substitute;
 
 namespace yb {
 namespace server {
-
-static const string kWildCardHostAddress = "0.0.0.0";
 
 namespace {
 
@@ -157,7 +164,6 @@ RpcServerBase::RpcServerBase(string name, const ServerBaseOptions& options,
       metric_registry_(new MetricRegistry()),
       metric_entity_(METRIC_ENTITY_server.Instantiate(metric_registry_.get(),
                                                       metric_namespace)),
-      is_first_run_(false),
       options_(options),
       initialized_(false),
       stop_metrics_logging_latch_(1) {
@@ -461,12 +467,15 @@ Status RpcAndWebServerBase::Init() {
   if (s.IsNotFound() || (!s.ok() && fs_manager_->HasAnyLockFiles())) {
     LOG(INFO) << "Could not load existing FS layout: " << s.ToString();
     LOG(INFO) << "Creating new FS layout";
-    is_first_run_ = true;
     RETURN_NOT_OK_PREPEND(fs_manager_->CreateInitialFileSystemLayout(true),
                           "Could not create new FS layout");
     s = fs_manager_->Open();
   }
   RETURN_NOT_OK_PREPEND(s, "Failed to load FS layout");
+
+  if (PREDICT_FALSE(FLAGS_TEST_simulate_port_conflict_error)) {
+    return STATUS(NetworkError, "Simulated port conflict error");
+  }
 
   RETURN_NOT_OK(RpcServerBase::Init());
 
@@ -490,27 +499,45 @@ void RpcAndWebServerBase::GetStatusPB(ServerStatusPB* status) const {
 
 Status RpcAndWebServerBase::GetRegistration(ServerRegistrationPB* reg, RpcOnly rpc_only) const {
   std::vector<HostPort> addrs = CHECK_NOTNULL(rpc_server())->GetRpcHostPort();
+  DCHECK_GE(addrs.size(), 1);
 
   // Fall back to hostname resolution if the rpc hostname is a wildcard.
-  if (addrs.size() > 1 || addrs[0].host() == kWildCardHostAddress || addrs[0].port() == 0) {
-    auto addrs = CHECK_NOTNULL(rpc_server())->GetBoundAddresses();
-    RETURN_NOT_OK_PREPEND(AddHostPortPBs(addrs, reg->mutable_private_rpc_addresses()),
-                          "Failed to add RPC endpoints to registration");
+  if (addrs.size() != 1 || IsWildcardAddress(addrs[0].host()) || addrs[0].port() == 0) {
+    vector<Endpoint> endpoints =
+        CHECK_NOTNULL(rpc_server())->GetBoundAddresses();
+    RETURN_NOT_OK_PREPEND(
+        AddHostPortPBs(endpoints, reg->mutable_private_rpc_addresses()),
+        "Failed to add RPC endpoints to registration");
+    for (const auto &addr : reg->private_rpc_addresses()) {
+      LOG(INFO) << " Using private rpc addresses: ( " << addr.ShortDebugString()
+                << " )";
+    }
   } else {
     HostPortsToPBs(addrs, reg->mutable_private_rpc_addresses());
-    LOG(INFO) << "Using private ip address " << reg->private_rpc_addresses(0).host();
+    LOG(INFO) << "Using private rpc address "
+              << reg->private_rpc_addresses(0).host();
   }
 
   HostPortsToPBs(options_.broadcast_addresses, reg->mutable_broadcast_addresses());
 
   if (!rpc_only) {
-    std::vector<Endpoint> web_addrs;
-    RETURN_NOT_OK_PREPEND(
-        CHECK_NOTNULL(web_server())->GetBoundAddresses(&web_addrs),
-        "Unable to get bound HTTP addresses");
-    RETURN_NOT_OK_PREPEND(AddHostPortPBs(
-        web_addrs, reg->mutable_http_addresses()),
-        "Failed to add HTTP addresses to registration");
+    HostPort web_input_hp;
+    RETURN_NOT_OK(CHECK_NOTNULL(web_server())->GetInputHostPort(&web_input_hp));
+    if (IsWildcardAddress(web_input_hp.host()) || web_input_hp.port() == 0) {
+      std::vector<Endpoint> web_addrs;
+      RETURN_NOT_OK_PREPEND(
+          CHECK_NOTNULL(web_server())->GetBoundAddresses(&web_addrs),
+          "Unable to get bound HTTP addresses");
+      RETURN_NOT_OK_PREPEND(AddHostPortPBs(
+          web_addrs, reg->mutable_http_addresses()),
+          "Failed to add HTTP addresses to registration");
+      for (const auto &addr : reg->http_addresses()) {
+        LOG(INFO) << "Using http addresses: ( " << addr.ShortDebugString() << " )";
+      }
+    } else {
+      HostPortsToPBs({ web_input_hp }, reg->mutable_http_addresses());
+      LOG(INFO) << "Using http address " << reg->http_addresses(0).host();
+    }
   }
   reg->mutable_cloud_info()->set_placement_cloud(options_.placement_cloud());
   reg->mutable_cloud_info()->set_placement_region(options_.placement_region());
@@ -561,17 +588,18 @@ void RpcAndWebServerBase::DisplayGeneralInfoIcons(std::stringstream* output) {
   // Metrics.
   DisplayIconTile(output, "fa-line-chart", "Metrics", "/metrics");
   // Threads.
-  DisplayIconTile(output, "fa-list-ul", "Threads", "/threadz");
+  DisplayIconTile(output, "fa-microchip", "Threads", "/threadz");
 }
 
-
-void RpcAndWebServerBase::DisplayRpcIcons(std::stringstream* output) {
+Status RpcAndWebServerBase::DisplayRpcIcons(std::stringstream* output) {
   // RPCs in Progress.
   DisplayIconTile(output, "fa-tasks", "Server RPCs", "/rpcz");
+  return Status::OK();
 }
 
 Status RpcAndWebServerBase::HandleDebugPage(const Webserver::WebRequest& req,
-                                            stringstream* output) {
+                                            Webserver::WebResponse* resp) {
+  std::stringstream *output = &resp->output;
   *output << "<h1>Debug Utilities</h1>\n";
 
   *output << "<div class='row debug-tiles'>\n";
@@ -580,7 +608,7 @@ Status RpcAndWebServerBase::HandleDebugPage(const Webserver::WebRequest& req,
   *output << "</div> <!-- row -->\n";
   *output << "<h2> RPCs In Progress </h2>";
   *output << "<div class='row debug-tiles'>\n";
-  DisplayRpcIcons(output);
+  RETURN_NOT_OK(DisplayRpcIcons(output));
   *output << "</div> <!-- row -->\n";
   return Status::OK();
 }
@@ -609,43 +637,54 @@ void RpcAndWebServerBase::Shutdown() {
 }
 
 std::string TEST_RpcAddress(int index, Private priv) {
-  return Format("127.0.0.$0$1", index * 2 + (priv ? 0 : 1), priv ? "" : ".ip.yugabyte");
+  return Format("127.0.0.$0$1",
+                index * 2 + (priv ? 0 : 1), priv ? "" : FLAGS_TEST_public_hostname_suffix);
 }
 
 string TEST_RpcBindEndpoint(int index, uint16_t port) {
-  return Format("$0:$1", TEST_RpcAddress(index, Private::kTrue), port);
+  return HostPortToString(TEST_RpcAddress(index, Private::kTrue), port);
 }
 
 constexpr int kMaxServers = 20;
+constexpr int kMinServerIdx = 1;
+
+// We group servers by two. Servers in the same group communciate via private connection. Servers in
+// different groups communicate via public connection.
+int ServerGroupNum(int server_idx) {
+  return (server_idx - 1) / FLAGS_TEST_nodes_per_cloud;
+}
 
 void TEST_SetupConnectivity(rpc::Messenger* messenger, int index) {
   if (!FLAGS_TEST_check_broadcast_address) {
     return;
   }
 
-  CHECK_GE(index, 1);
+  CHECK_GE(index, kMinServerIdx);
   CHECK_LE(index, kMaxServers);
 
   messenger->TEST_SetOutboundIpBase(
       CHECK_RESULT(HostToAddress(TEST_RpcAddress(index, Private::kTrue))));
-  for (int i = 1; i <= kMaxServers; ++i) {
+  auto server_group = ServerGroupNum(index);
+  for (int other_server_idx = kMinServerIdx; other_server_idx <= kMaxServers; ++other_server_idx) {
     // We group servers by 2. When servers belongs to the same group, they should use
     // private ip for communication, otherwise public ip should be used.
-    bool same_group = (i - 1) / 2 == (index - 1) / 2;
-    auto broken_address = CHECK_RESULT(HostToAddress(TEST_RpcAddress(i, Private(!same_group))));
+    bool same_group = ServerGroupNum(other_server_idx) == server_group;
+    auto broken_address = CHECK_RESULT(
+        HostToAddress(TEST_RpcAddress(other_server_idx, Private(!same_group))));
     LOG(INFO) << "Break " << index << " => " << broken_address;
     messenger->BreakConnectivityWith(broken_address);
-    auto working_address = CHECK_RESULT(HostToAddress(TEST_RpcAddress(i, Private(same_group))));
+    auto working_address = CHECK_RESULT(
+        HostToAddress(TEST_RpcAddress(other_server_idx, Private(same_group))));
     messenger->RestoreConnectivityWith(working_address);
   }
 }
 
 void TEST_Isolate(rpc::Messenger* messenger) {
-  for (int i = 1; i <= kMaxServers; ++i) {
+  for (int other_server_idx = kMinServerIdx; other_server_idx <= kMaxServers; ++other_server_idx) {
     messenger->BreakConnectivityWith(
-        CHECK_RESULT(HostToAddress(TEST_RpcAddress(i, Private::kFalse))));
+        CHECK_RESULT(HostToAddress(TEST_RpcAddress(other_server_idx, Private::kTrue))));
     messenger->BreakConnectivityWith(
-        CHECK_RESULT(HostToAddress(TEST_RpcAddress(i, Private::kTrue))));
+        CHECK_RESULT(HostToAddress(TEST_RpcAddress(other_server_idx, Private::kFalse))));
   }
 }
 

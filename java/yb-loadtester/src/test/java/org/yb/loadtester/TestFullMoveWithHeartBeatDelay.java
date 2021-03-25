@@ -19,8 +19,7 @@ import static org.yb.AssertionWrappers.assertTrue;
 import com.google.common.net.HostAndPort;
 import org.junit.Test;
 import org.junit.runner.RunWith;
-import org.yb.YBTestRunner;
-import org.yb.minicluster.MiniYBCluster;
+import org.yb.util.YBTestRunnerNonTsanOnly;
 
 import java.util.HashSet;
 import java.util.Iterator;
@@ -31,7 +30,7 @@ import java.util.Set;
  * (with injected heartbeat delays) without any significant impact to a running load test.
  */
 
-@RunWith(value=YBTestRunner.class)
+@RunWith(value=YBTestRunnerNonTsanOnly.class)
 public class TestFullMoveWithHeartBeatDelay extends TestClusterBase {
 
   @Test(timeout = TEST_TIMEOUT_SEC * 1000) // 20 minutes.
@@ -53,7 +52,7 @@ public class TestFullMoveWithHeartBeatDelay extends TestClusterBase {
     addMaster(newMaster);
 
     // Prevent this master from becoming leader.
-    boolean status = client.setFlag(newMaster, "do_not_start_election_test_only", "true");
+    boolean status = client.setFlag(newMaster, "TEST_do_not_start_election_test_only", "true");
     assertTrue(status);
 
     // Disable heartbeats for all tservers.
@@ -72,18 +71,18 @@ public class TestFullMoveWithHeartBeatDelay extends TestClusterBase {
     }
 
     // Wait for tservers to get heartbeat from new master.
-    Thread.sleep(MiniYBCluster.TSERVER_HEARTBEAT_TIMEOUT_MS * 2);
+    Thread.sleep(miniCluster.getClusterParameters().getTServerHeartbeatTimeoutMs() * 4);
 
     for (HostAndPort hp : miniCluster.getTabletServers().keySet()) {
       String masters = client.getMasterAddresses(hp);
       // Assert each tserver knows about the final list of 3 masters.
-      assertEquals(3, masters.split(",").length);
+      assertEquals("Masters: " + masters, 3, masters.split(",").length);
       // Ensure old masters not present and new masters are present.
       for (HostAndPort master : newMasters) {
-        assertTrue(masters.contains(master.getHostText()));
+        assertTrue(masters.contains(master.getHost()));
       }
       for (HostAndPort master : oldMasters) {
-        assertFalse(masters.contains(master.getHostText()));
+        assertFalse(masters.contains(master.getHost()));
       }
     }
 

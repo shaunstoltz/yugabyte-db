@@ -397,34 +397,36 @@ CREATE TABLE client (
 CREATE TABLE tbl1 (
 	a			int4 primary key
 ) SPLIT (INTO 20 TABLETS);
+CREATE TABLE tbl1_5 (
+	a       int4,
+ 	primary key(a asc)
+) SPLIT (INTO 20 TABLETS);
+ERROR:  HASH columns must be present to split by number of tablets
 CREATE TABLE tbl2 (
 	a			int4,
 	primary key (a asc)
 ) SPLIT AT VALUES ((4), (25), (100));
-WARNING:  Range split points are not supported, ignoring
 CREATE TABLE tbl3 (
 	a			int4,
 	primary key (a asc)
 ) SPLIT AT VALUES ((25), (100), (4));
-ERROR:  Split points must be in sorted order
+ERROR:  Invalid argument: Split rows ordering does not match column ordering
 CREATE TABLE tbl4 (
 	a			int4,
 	b			text,
 	primary key (a asc, b)
 ) SPLIT AT VALUES ((1, 'c'), (1, 'cb'), (2, 'a'));
-WARNING:  Range split points are not supported, ignoring
 CREATE TABLE tbl5 (
 	a			int4,
 	b			text,
 	primary key (b asc)
 ) SPLIT AT VALUES (('a'), ('aba'), ('ac'));
-WARNING:  Range split points are not supported, ignoring
 CREATE TABLE tbl6 (
 	a			int4,
 	b			text,
 	primary key (b asc)
 ) SPLIT AT VALUES (('a'), (2, 'aba'), ('ac'));
-ERROR:  Split points must specify a split at each primary key column
+ERROR:  Number of SPLIT values cannot be greater than number of SPLIT columns
 CREATE TABLE tbl7 (
 	a			int4,
 	primary key (a asc)
@@ -434,12 +436,11 @@ CREATE TABLE tbl8 (
 	a			text,
 	primary key (a asc)
 ) SPLIT AT VALUES ((100), (1000), (10000));
-ERROR:  Type mismatch in split point
 CREATE TABLE tbl9 (
 	a			int4,
 	primary key (a hash)
 ) SPLIT AT VALUES ((100), (1000), (10000));
-ERROR:  HASH columns cannot be used for split points
+ERROR:  Invalid argument: SPLIT AT option is not yet supported for hash partitioned tables
 CREATE TEMPORARY TABLE tbl10 (
 	a			int4 primary key
 ) SPLIT INTO 20 TABLETS;
@@ -450,23 +451,258 @@ CREATE TABLE tbl11 (
 	c			int4,
 	primary key (a asc, b desc)
 ) SPLIT AT VALUES ((-7, 1), (0, 0), (23, 4));
-WARNING:  Range split points are not supported, ignoring
 CREATE TABLE tbl12 (
 	a			int4,
 	b			text,
 	primary key (b desc)
 ) SPLIT AT VALUES (('bienvenidos'), ('goodbye'), ('hello'), ('hola'));
-WARNING:  Range split points are not supported, ignoring
-CREATE TABLE tbl12 (
+ERROR:  Invalid argument: Split rows ordering does not match column ordering
+CREATE TABLE tbl13 (
 	a			text,
 	b			date,
 	c			time
 ) SPLIT INTO 9 TABLETS;
-ERROR:  Cannot have SPLIT options in the absence of a primary key
-CREATE TABLE tbl13 (
+CREATE TABLE tbl14 (
 	a			int4,
 	primary key (a asc)
 ) SPLIT AT VALUES ((MINVALUE), (0), (MAXVALUE));
-ERROR:  Split points must specify finite values
--- TODO(jason): remove when issue #1721 is closed or closing.
-DISCARD TEMP;
+CREATE TABLE tbl15 (
+	a			int4,
+	b			int4,
+	c			int4,
+	primary key (a asc, b desc)
+) SPLIT AT VALUES ((-10), (0, 0), (23, 4), (50));
+-- This is invalid because split rows do not honor column b's ordering
+CREATE TABLE tbl16(
+  a int,
+  b int,
+  primary key(a asc, b asc)
+) SPLIT AT VALUES((100), (200, 5), (200));
+ERROR:  Invalid argument: Split rows ordering does not match column ordering
+-- This is invalid because split rows do not honor column b's ordering
+CREATE TABLE tbl16(
+  a int,
+  b int,
+  primary key(a asc, b asc nulls first)
+) SPLIT AT VALUES((100), (200, 5), (200));
+ERROR:  Invalid argument: Split rows ordering does not match column ordering
+-- This is invalid because split rows do not honor column b's ordering
+CREATE TABLE tbl16(
+  a int,
+  b int,
+  primary key(a asc, b asc nulls last)
+) SPLIT AT VALUES((100), (200, 5), (200));
+ERROR:  Invalid argument: Split rows ordering does not match column ordering
+CREATE TABLE tbl16(
+  a int,
+  b int,
+  primary key(a asc, b desc)
+) SPLIT AT VALUES((100), (200), (200, 5));
+CREATE TABLE tbl17(
+  a int,
+  b int,
+  primary key(a asc, b desc nulls first)
+) SPLIT AT VALUES((100), (200), (200, 5));
+CREATE TABLE tbl18(
+  a int,
+  b int,
+  primary key(a asc, b desc nulls last)
+) SPLIT AT VALUES((100), (200), (200, 5));
+-- This is invalid because we cannot have duplicate split rows
+CREATE TABLE tbl19(
+  a int,
+  b int,
+  primary key(a asc, b desc nulls last)
+) SPLIT AT VALUES((100), (200, 5), (200, 5));
+ERROR:  Invalid argument: Cannot have duplicate split rows
+-- Test ordering on splitted tables
+CREATE TABLE ordered_asc(
+    k INT,
+    PRIMARY KEY(k ASC)
+) SPLIT AT VALUES((10), (20), (30));
+INSERT INTO ordered_asc VALUES
+    (5), (6), (16), (15), (25), (26), (36), (35), (46), (10), (20), (30);
+EXPLAIN (COSTS OFF) SELECT * FROM ordered_asc ORDER BY k ASC;
+                    QUERY PLAN
+--------------------------------------------------
+ Index Scan using ordered_asc_pkey on ordered_asc
+(1 row)
+
+SELECT * FROM ordered_asc ORDER BY k ASC;
+ k
+----
+  5
+  6
+ 10
+ 15
+ 16
+ 20
+ 25
+ 26
+ 30
+ 35
+ 36
+ 46
+(12 rows)
+
+EXPLAIN (COSTS OFF) SELECT * FROM ordered_asc ORDER BY k DESC;
+                        QUERY PLAN
+-----------------------------------------------------------
+ Index Scan Backward using ordered_asc_pkey on ordered_asc
+(1 row)
+
+SELECT * FROM ordered_asc ORDER BY k DESC;
+ k
+----
+ 46
+ 36
+ 35
+ 30
+ 26
+ 25
+ 20
+ 16
+ 15
+ 10
+  6
+  5
+(12 rows)
+
+EXPLAIN (COSTS OFF) SELECT k FROM ordered_asc WHERE k > 10 and k < 40 ORDER BY k DESC;
+                        QUERY PLAN
+-----------------------------------------------------------
+ Index Scan Backward using ordered_asc_pkey on ordered_asc
+   Index Cond: ((k > 10) AND (k < 40))
+(2 rows)
+
+SELECT k FROM ordered_asc WHERE k > 10 and k < 40 ORDER BY k DESC;
+ k
+----
+ 36
+ 35
+ 30
+ 26
+ 25
+ 20
+ 16
+ 15
+(8 rows)
+
+CREATE TABLE ordered_desc(
+    k INT,
+    PRIMARY KEY(k DESC)
+) SPLIT AT VALUES((30), (20), (10));
+INSERT INTO ordered_desc VALUES
+    (5), (6), (16), (15), (25), (26), (36), (35), (46), (10), (20), (30);
+EXPLAIN (COSTS OFF) SELECT * FROM ordered_desc ORDER BY k ASC;
+                         QUERY PLAN
+-------------------------------------------------------------
+ Index Scan Backward using ordered_desc_pkey on ordered_desc
+(1 row)
+
+SELECT * FROM ordered_desc ORDER BY k ASC;
+ k
+----
+  5
+  6
+ 10
+ 15
+ 16
+ 20
+ 25
+ 26
+ 30
+ 35
+ 36
+ 46
+(12 rows)
+
+EXPLAIN (COSTS OFF) SELECT * FROM ordered_desc ORDER BY k DESC;
+                     QUERY PLAN
+----------------------------------------------------
+ Index Scan using ordered_desc_pkey on ordered_desc
+(1 row)
+
+SELECT * FROM ordered_desc ORDER BY k DESC;
+ k
+----
+ 46
+ 36
+ 35
+ 30
+ 26
+ 25
+ 20
+ 16
+ 15
+ 10
+  6
+  5
+(12 rows)
+
+EXPLAIN (COSTS OFF) SELECT k FROM ordered_desc WHERE k > 10 and k < 40 ORDER BY k ASC;
+                         QUERY PLAN
+-------------------------------------------------------------
+ Index Scan Backward using ordered_desc_pkey on ordered_desc
+   Index Cond: ((k > 10) AND (k < 40))
+(2 rows)
+
+SELECT k FROM ordered_desc WHERE k > 10 and k < 40 ORDER BY k ASC;
+ k
+----
+ 15
+ 16
+ 20
+ 25
+ 26
+ 30
+ 35
+ 36
+(8 rows)
+
+-- Test create ... with (table_oid = x)
+set yb_enable_create_with_table_oid=1;
+create table with_invalid_table_oid (a int) with (table_oid = 0);
+ERROR:  User tables must have an OID >= 16384.
+create table with_invalid_table_oid (a int) with (table_oid = -1);
+ERROR:  value -1 out of bounds for option "table_oid"
+DETAIL:  Valid values are between "16384" and "2147483647".
+create table with_invalid_table_oid (a int) with (table_oid = 123);
+ERROR:  User tables must have an OID >= 16384.
+create table with_invalid_table_oid (a int) with (table_oid = 'test');
+ERROR:  User tables must have an OID >= 16384.
+create table with_table_oid (a int) with (table_oid = 1234567);
+select relname, oid from pg_class where relname = 'with_table_oid';
+    relname     |   oid
+----------------+---------
+ with_table_oid | 1234567
+(1 row)
+
+create table with_table_oid_duplicate (a int) with (table_oid = 1234567);
+ERROR:  Oid 1234567 is in use.
+-- Test temp tables with (table_oid = x)
+begin;
+create temp table with_table_oid_temp (a int) with (table_oid = 1234568) on commit drop;
+select relname, oid from pg_class where relname = 'with_table_oid_temp';
+       relname       |   oid
+---------------------+---------
+ with_table_oid_temp | 1234568
+(1 row)
+
+end;
+-- Creating a new temp table with that oid will fail
+create temp table with_table_oid_temp_2 (a int) with (table_oid = 1234568);
+ERROR:  Oid 1234568 is in use.
+-- But creating a regular table with that oid should succeed
+create table with_table_oid_2 (a int) with (table_oid = 1234568);
+select relname, oid from pg_class where relname = 'with_table_oid_2';
+     relname      |   oid
+------------------+---------
+ with_table_oid_2 | 1234568
+(1 row)
+
+-- Test with session variable off
+set yb_enable_create_with_table_oid=0;
+create table with_table_oid_variable_false (a int) with (table_oid = 55555);
+ERROR:  Create table with oid is not allowed.
+HINT:  Try enabling the session variable yb_enable_create_with_table_oid.

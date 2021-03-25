@@ -403,10 +403,10 @@ public class YBClient implements AutoCloseable {
 
     long start = System.currentTimeMillis();
     while (System.currentTimeMillis() - start < timeoutMS &&
-      getMasterUUID(hp.getHostText(), hp.getPort()) == null) {
+      getMasterUUID(hp.getHost(), hp.getPort()) == null) {
       Thread.sleep(AsyncYBClient.SLEEP_TIME);
     }
-    return getMasterUUID(hp.getHostText(), hp.getPort()) != null;
+    return getMasterUUID(hp.getHost(), hp.getPort()) != null;
   }
 
   /**
@@ -499,14 +499,17 @@ public class YBClient implements AutoCloseable {
    * @return Master leader uuid on success, null otherwise.
    */
   private String waitAndGetLeaderMasterUUID(long timeoutMs) throws Exception {
+    LOG.info("Waiting for master leader (timeout: " + timeoutMs + " ms)");
     long start = System.currentTimeMillis();
-
     // Retry till we get a valid UUID (or timeout) for the new leader.
     do {
       String leaderUuid = getLeaderMasterUUID();
 
+      long elapsedTimeMs = System.currentTimeMillis() - start;
       // Done if we got a valid one.
       if (leaderUuid != null) {
+        LOG.info("Fininshed waiting for master leader in " + elapsedTimeMs + " ms. Leader UUID: " +
+                 leaderUuid);
         return leaderUuid;
       }
 
@@ -774,11 +777,24 @@ public class YBClient implements AutoCloseable {
    * @return true if the server successfully set the flag
    */
   public boolean setFlag(HostAndPort hp, String flag, String value) throws Exception {
+    return setFlag(hp, flag, value, false);
+  }
+
+  /**
+   * Set a gflag of a given server.
+   * @param hp the host and port of the server
+   * @param flag the flag to be set.
+   * @param value the value to set the flag to
+   * @param force if the flag needs to be set even if it is not marked runtime safe
+   * @return true if the server successfully set the flag
+   */
+  public boolean setFlag(HostAndPort hp, String flag, String value,
+                         boolean force) throws Exception {
     if (flag == null || flag.isEmpty() || value == null || value.isEmpty() || hp == null) {
       LOG.warn("Invalid arguments for hp: {}, flag {}, or value: {}", hp.toString(), flag, value);
       return false;
     }
-    Deferred<SetFlagResponse> d = asyncClient.setFlag(hp, flag, value);
+    Deferred<SetFlagResponse> d = asyncClient.setFlag(hp, flag, value, force);
     return !d.join(getDefaultAdminOperationTimeoutMs()).hasError();
   }
 
@@ -818,7 +834,7 @@ public class YBClient implements AutoCloseable {
     }
     @Override
     public boolean get() throws Exception {
-      return ping(hp.getHostText(), hp.getPort());
+      return ping(hp.getHost(), hp.getPort());
     }
   }
 
@@ -849,6 +865,27 @@ public class YBClient implements AutoCloseable {
       return !resp.hasError();
     }
   }
+
+  /**
+   * Checks whether the LoadBalancer is currently running.
+   */
+  private class LoadBalancerActiveCondition implements Condition {
+    public LoadBalancerActiveCondition() {
+    }
+    @Override
+    public boolean get() throws Exception {
+      try {
+        IsLoadBalancerIdleResponse resp = getIsLoadBalancerIdle();
+      } catch (MasterErrorException e) {
+        // TODO (deepthi.srinivasan) Instead of writing if-else
+        // with Exceptions, find a way to receive the error code
+        // neatly.
+        return e.toString().contains("LOAD_BALANCER_RECENTLY_ACTIVE");
+      }
+      return false;
+    }
+  }
+
 
   private class AreLeadersOnPreferredOnlyCondition implements Condition {
     @Override
@@ -981,6 +1018,16 @@ public class YBClient implements AutoCloseable {
   public boolean waitForLoadBalance(final long timeoutMs, int numServers) {
     Condition loadBalanceCondition = new LoadBalanceCondition(numServers);
     return waitForCondition(loadBalanceCondition, timeoutMs);
+  }
+
+  /**
+  * Wait for the Load Balancer to become active.
+  * @param timeoutMs the amount of time, in MS, to wait
+  * @return true if the load balancer is currently running.
+  */
+  public boolean waitForLoadBalancerActive(final long timeoutMs) {
+    Condition loadBalancerActiveCondition = new LoadBalancerActiveCondition();
+    return waitForCondition(loadBalancerActiveCondition, timeoutMs);
   }
 
   /**
@@ -1310,6 +1357,33 @@ public class YBClient implements AutoCloseable {
      */
     public YBClientBuilder sslCertFile(String certFile) {
       clientBuilder.sslCertFile(certFile);
+      return this;
+    }
+
+    /**
+     * Sets the client cert and key files if mutual auth is enabled.
+     * Optional.
+     * If not provided, defaults to null.
+     * A value of null disables an mTLS connection.
+     * @param certFile the path to the client certificate.
+     * @param keyFile the path to the client private key file.
+     * @return this builder
+     */
+    public YBClientBuilder sslClientCertFiles(String certFile, String keyFile) {
+      clientBuilder.sslClientCertFiles(certFile, keyFile);
+      return this;
+    }
+
+    /**
+     * Sets the outbound client host:port on which the socket binds.
+     * Optional.
+     * If not provided, defaults to null.
+     * @param host the address to bind to.
+     * @param port the port to bind to (0 means any free port).
+     * @return this builder
+     */
+    public YBClientBuilder bindHostAddress(String host, int port) {
+      clientBuilder.bindHostAddress(host, port);
       return this;
     }
 

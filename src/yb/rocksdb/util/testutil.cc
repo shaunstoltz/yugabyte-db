@@ -157,19 +157,13 @@ BlockBasedTableOptions RandomBlockBasedTableOptions(Random* rnd) {
 }
 
 TableFactory* RandomTableFactory(Random* rnd, int pre_defined) {
-#ifndef ROCKSDB_LITE
-  int random_num = pre_defined >= 0 ? pre_defined : rnd->Uniform(4);
+  int random_num = pre_defined >= 0 ? pre_defined : rnd->Uniform(2);
   switch (random_num) {
     case 0:
       return NewPlainTableFactory();
-    case 1:
-      return NewCuckooTableFactory();
     default:
       return NewBlockBasedTableFactory();
   }
-#else
-  return NewBlockBasedTableFactory();
-#endif  // !ROCKSDB_LITE
 }
 
 MergeOperator* RandomMergeOperator(Random* rnd) {
@@ -193,7 +187,7 @@ void RandomInitDBOptions(DBOptions* db_opt, Random* rnd) {
   db_opt->create_if_missing = rnd->Uniform(2);
   db_opt->create_missing_column_families = rnd->Uniform(2);
   db_opt->disableDataSync = rnd->Uniform(2);
-  db_opt->enable_thread_tracking = rnd->Uniform(2);
+  db_opt->enable_thread_tracking = false;
   db_opt->error_if_exists = rnd->Uniform(2);
   db_opt->is_fd_close_on_exec = rnd->Uniform(2);
   db_opt->paranoid_checks = rnd->Uniform(2);

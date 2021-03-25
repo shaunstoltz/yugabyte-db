@@ -41,6 +41,8 @@
 #include <glog/logging.h>
 
 #include "yb/common/wire_protocol.h"
+#include "yb/consensus/raft_consensus.h"
+#include "yb/gutil/strings/join.h"
 #include "yb/gutil/strings/substitute.h"
 #include "yb/master/catalog_manager.h"
 #include "yb/master/flush_manager.h"
@@ -51,6 +53,7 @@
 #include "yb/master/master_service.h"
 #include "yb/master/master_tablet_service.h"
 #include "yb/master/master-path-handlers.h"
+#include "yb/master/sys_catalog.h"
 #include "yb/master/ts_manager.h"
 #include "yb/rpc/messenger.h"
 #include "yb/rpc/service_if.h"
@@ -117,6 +120,9 @@ DEFINE_int32(master_remote_bootstrap_svc_queue_length, 50,
              "RPC queue length for master remote bootstrap service");
 TAG_FLAG(master_remote_bootstrap_svc_queue_length, advanced);
 
+DEFINE_test_flag(string, master_extra_list_host_port, "",
+                 "Additional host port used in list masters");
+
 DECLARE_int64(inbound_rpc_memory_limit);
 
 namespace yb {
@@ -174,6 +180,33 @@ Status Master::Init() {
       metric_entity(),
       mem_tracker(),
       messenger());
+  async_client_init_->builder()
+      .set_master_address_flag_name("master_addresses")
+      .default_admin_operation_timeout(MonoDelta::FromMilliseconds(FLAGS_master_rpc_timeout_ms))
+      .AddMasterAddressSource([this] {
+    std::vector<std::string> result;
+    consensus::ConsensusStatePB state;
+    auto status = catalog_manager_->CheckOnline();
+    if (status.ok()) {
+      status = catalog_manager_->GetCurrentConfig(&state);
+    }
+    if (!status.ok()) {
+      LOG(WARNING) << "Failed to get current config: " << status;
+      return result;
+    }
+    for (const auto& peer : state.config().peers()) {
+      std::vector<std::string> peer_addresses;
+      for (const auto& list : {peer.last_known_private_addr(), peer.last_known_broadcast_addr()}) {
+        for (const auto& entry : list) {
+          peer_addresses.push_back(HostPort::FromPB(entry).ToString());
+        }
+      }
+      if (!peer_addresses.empty()) {
+        result.push_back(JoinStrings(peer_addresses, ","));
+      }
+    }
+    return result;
+  });
   async_client_init_->Start();
 
   state_ = kInitialized;
@@ -214,7 +247,9 @@ Status Master::RegisterServices() {
 void Master::DisplayGeneralInfoIcons(std::stringstream* output) {
   server::RpcAndWebServerBase::DisplayGeneralInfoIcons(output);
   // Tasks.
-  DisplayIconTile(output, "fa-list-ul", "Tasks", "/tasks");
+  DisplayIconTile(output, "fa-check", "Tasks", "/tasks");
+  DisplayIconTile(output, "fa-clone", "Replica Info", "/tablet-replication");
+  DisplayIconTile(output, "fa-check", "TServer Clocks", "/tablet-server-clocks");
 }
 
 Status Master::StartAsync() {
@@ -247,7 +282,7 @@ Status Master::InitCatalogManager() {
   if (catalog_manager_->IsInitialized()) {
     return STATUS(IllegalState, "Catalog manager is already initialized");
   }
-  RETURN_NOT_OK_PREPEND(catalog_manager_->Init(is_first_run_),
+  RETURN_NOT_OK_PREPEND(catalog_manager_->Init(),
                         "Unable to initialize catalog manager");
   return Status::OK();
 }
@@ -287,8 +322,11 @@ void Master::Shutdown() {
     // before shutting down catalog manager. This is needed to prevent async calls callbacks
     // (running on reactor threads) from trying to use catalog manager thread pool which would be
     // already shutdown.
+    auto started = catalog_manager_->StartShutdown();
+    LOG_IF(DFATAL, !started) << name << " catalog manager shutdown already in progress";
+    async_client_init_->Shutdown();
     RpcAndWebServerBase::Shutdown();
-    catalog_manager_->Shutdown();
+    catalog_manager_->CompleteShutdown();
     LOG(INFO) << name << " shutdown complete.";
   } else {
     LOG(INFO) << ToString() << " did not start, shutting down all that started...";
@@ -374,21 +412,44 @@ Status Master::ListMasters(std::vector<ServerEntryPB>* masters) const {
     return Status::OK();
   }
 
-  // ENG-285: Hold on to the shared pointer while iterating over master addresses. Previously, we
-  // would iterate over *opts_.GetMasterAddresses() directly without bumping the refcount, and the
-  // vector would sometimes get deallocated by another thread in the middle of that iteration.
-  auto master_addresses_shared_ptr = opts_.GetMasterAddresses();
+  consensus::ConsensusStatePB cpb;
+  RETURN_NOT_OK(catalog_manager_->GetCurrentConfig(&cpb));
+  if (!cpb.has_config()) {
+      return STATUS(NotFound, "No raft config found.");
+  }
 
-  for (const auto& peer_addr : *master_addresses_shared_ptr) {
+  for (const RaftPeerPB& peer : cpb.config().peers()) {
+    // Get all network addresses associated with this peer master
+    std::vector<HostPort> addrs;
+    for (const auto& hp : peer.last_known_private_addr()) {
+      addrs.push_back(HostPortFromPB(hp));
+    }
+    for (const auto& hp : peer.last_known_broadcast_addr()) {
+      addrs.push_back(HostPortFromPB(hp));
+    }
+    if (!FLAGS_TEST_master_extra_list_host_port.empty()) {
+      addrs.push_back(VERIFY_RESULT(HostPort::FromString(
+          FLAGS_TEST_master_extra_list_host_port, 0)));
+    }
+
+    // Make GetMasterRegistration calls for peer master info.
     ServerEntryPB peer_entry;
     Status s = GetMasterEntryForHosts(
-        proxy_cache_.get(), peer_addr, MonoDelta::FromMilliseconds(FLAGS_master_rpc_timeout_ms),
+        proxy_cache_.get(), addrs, MonoDelta::FromMilliseconds(FLAGS_master_rpc_timeout_ms),
         &peer_entry);
     if (!s.ok()) {
+      // In case of errors talking to the peer master,
+      // fill in fields from our catalog best as we can.
       s = s.CloneAndPrepend(
-        Format("Unable to get registration information for peer ($0)", peer_addr));
-      LOG(WARNING) << s;
+        Format("Unable to get registration information for peer ($0) id ($1)",
+              addrs, peer.permanent_uuid()));
+      LOG(WARNING) << "ListMasters: " << s;
       StatusToPB(s, peer_entry.mutable_error());
+      peer_entry.mutable_instance_id()->set_permanent_uuid(peer.permanent_uuid());
+      peer_entry.mutable_instance_id()->set_instance_seqno(0);
+      auto reg = peer_entry.mutable_registration();
+      reg->mutable_private_rpc_addresses()->CopyFrom(peer.last_known_private_addr());
+      reg->mutable_broadcast_addresses()->CopyFrom(peer.last_known_broadcast_addr());
     }
     masters->push_back(peer_entry);
   }

@@ -2,7 +2,6 @@
 title: CREATE ROLE statement [YCQL]
 headerTitle: CREATE ROLE
 linkTitle: CREATE ROLE
-summary: Create a new role
 description: Use the `CREATE ROLE` statement to create a new role that is used to authenticate into YCQL and as a group of permissions used to restrict operations on the database objects.
 menu:
   latest:
@@ -19,7 +18,7 @@ showAsideToc: true
 
 Use the `CREATE ROLE` statement to create a new role that is used to authenticate into YCQL and as a group of permissions is used to restrict operations on the database objects. Note that users are specific roles that are login enabled. There is no explicit `CREATE USER` command in YCQL.
 
-This statement is enabled by setting the YB-TServer configuration option [`use_cassandra_authentication`](../../../reference/configuration/yb-tserver/#use-cassandra-authentication) to `true`.
+This statement is enabled by setting the YB-TServer flag [`--use_cassandra_authentication`](../../../reference/configuration/yb-tserver/#use-cassandra-authentication) to `true`.
 
 ## Syntax
 
@@ -59,13 +58,13 @@ Where
 ### Create a simple role with no properties
 
 ```sql
-cqlsh:example> CREATE ROLE role1;
+ycqlsh:example> CREATE ROLE role1;
 ```
 
 ### Create a `SUPERUSER` role
 
 ```sql
-cqlsh:example> CREATE ROLE role2 WITH SUPERUSER = true;
+ycqlsh:example> CREATE ROLE role2 WITH SUPERUSER = true;
 ```
 
 ### Create a regular user with ability to login
@@ -73,7 +72,7 @@ cqlsh:example> CREATE ROLE role2 WITH SUPERUSER = true;
 You can create a regular user with login privileges as shown below. Note the `SUPERUSER` set to `false`.
 
 ```sql
-cqlsh:example> CREATE ROLE role3 WITH SUPERUSER = false AND LOGIN = true AND PASSWORD = 'aid8134'
+ycqlsh:example> CREATE ROLE role3 WITH SUPERUSER = false AND LOGIN = true AND PASSWORD = 'aid8134'
 ```
 
 ## See also

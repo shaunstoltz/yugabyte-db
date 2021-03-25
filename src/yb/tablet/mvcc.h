@@ -37,6 +37,7 @@
 #include <deque>
 #include <queue>
 #include <vector>
+#include <iostream>
 
 #include "yb/server/clock.h"
 #include "yb/util/debug-util.h"
@@ -149,6 +150,11 @@ class MvccManager {
   // Returns time of last replicated operation.
   HybridTime LastReplicatedHybridTime() const;
 
+  class MvccOpTrace;
+
+  void TEST_DumpTrace(std::ostream* out);
+
+
  private:
   HybridTime DoGetSafeTime(HybridTime min_allowed,
                            CoarseTimePoint deadline,
@@ -156,6 +162,13 @@ class MvccManager {
                            std::unique_lock<std::mutex>* lock) const;
 
   const std::string& LogPrefix() const { return prefix_; }
+
+  struct InvariantViolationLoggingHelper;
+  InvariantViolationLoggingHelper InvariantViolationLogPrefix() const;
+
+  friend std::ostream& operator<<(
+      std::ostream& out, const InvariantViolationLoggingHelper& helper);
+
   void PopFront(std::lock_guard<std::mutex>* lock);
 
   std::string prefix_;
@@ -179,16 +192,10 @@ class MvccManager {
   // Special flag for RF==1 mode when propagated_safe_time_ can be not up-to-date.
   bool leader_only_mode_ = false;
 
-  // Because different calls that have current hybrid time leader lease as an argument can come to
-  // us out of order, we might see an older value of hybrid time leader lease expiration after a
-  // newer value. We mitigate this by always using the highest value we've seen.
-  mutable HybridTime max_ht_lease_seen_ = HybridTime::kMin;
-
   mutable SafeTimeWithSource max_safe_time_returned_with_lease_;
   mutable SafeTimeWithSource max_safe_time_returned_without_lease_;
   mutable SafeTimeWithSource max_safe_time_returned_for_follower_ { HybridTime::kMin };
 
-  class MvccOpTrace;
   std::unique_ptr<MvccOpTrace> op_trace_ GUARDED_BY(mutex_);
 };
 

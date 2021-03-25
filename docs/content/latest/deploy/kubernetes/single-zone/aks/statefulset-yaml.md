@@ -1,7 +1,8 @@
 ---
-title: Azure Kubernetes Service (AKS)
+title: Deploy on Azure Kubernetes Service (AKS) using StatefulSet YAML
+headerTitle: Azure Kubernetes Service (AKS)
 linkTitle: Azure Kubernetes Service (AKS)
-description: Azure Kubernetes Service (AKS)
+description: Use StatefulSet YAML to deploy a single-zone Kubernetes cluster on Azure Kubernetes Service (AKS).
 menu:
   latest:
     parent: deploy-kubernetes-sz
@@ -54,7 +55,7 @@ az configure --defaults location=eastus
 
 - Create an Azure resource
 
-An Azure resource group is a logical group in which Azure resources are deployed and managed. You need to specify a default location or pass the location parameter to create the resource. The resources we create for the AKS cluster will live in this Azure resource.
+An Azure resource group is a logical group in which Azure resources are deployed and managed. You need to specify a default location or pass the location parameter to create the resource. The resources you create for the AKS cluster will live in this Azure resource.
 
 ```sh
 $ az group create --name yb-eastus-resource
@@ -92,7 +93,7 @@ aks-nodepool1-25019584-2   Ready     agent     4h        v1.7.9
 Create a YugabyteDB cluster by running the following.
 
 ```sh
-$ kubectl create -f https://raw.githubusercontent.com/yugabyte/yugabyte-db/master/cloud/kubernetes/yugabyte-statefulset.yaml
+$ curl -s "https://raw.githubusercontent.com/yugabyte/yugabyte-db/master/cloud/kubernetes/yugabyte-statefulset.yaml" | sed "s/storageClassName: standard/storageClassName: default/g" | kubectl create -f -
 ```
 
 ```
@@ -151,17 +152,17 @@ yb-tservers   ClusterIP   None         <none>        9000/TCP,9100/TCP,9042/TCP,
 
 ## 4. Connect to the cluster
 
-You can connect to the YCQL API by running the following.
+To open the YCQL shell (`ycqlsh`), run the following command:
 
 ```sh
-$ kubectl exec -it yb-tserver-0 bin/cqlsh
+$ kubectl exec -it yb-tserver-0 -- ycqlsh yb-tserver-0
 ```
 
 ```
 Connected to local cluster at 127.0.0.1:9042.
-[cqlsh 5.0.1 | Cassandra 3.9-SNAPSHOT | CQL spec 3.4.2 | Native protocol v4]
+[ycqlsh 5.0.1 | Cassandra 3.9-SNAPSHOT | CQL spec 3.4.2 | Native protocol v4]
 Use HELP for help.
-cqlsh> DESCRIBE KEYSPACES;
+ycqlsh> DESCRIBE KEYSPACES;
 
 system_schema  system_auth  system
 ```
@@ -190,9 +191,8 @@ $ kubectl delete pvc -l app=yb-tserver
 
 ## 6. Destroy the AKS cluster (optional)
 
-To destroy the resource we created for the AKS cluster, run the following.
+To destroy the resource you created for the AKS cluster, run the following.
 
 ```sh
 $ az group delete --name yb-eastus-resource
 ```
-

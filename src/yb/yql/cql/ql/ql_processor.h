@@ -1,4 +1,3 @@
-//--------------------------------------------------------------------------------------------------
 // Copyright (c) YugaByte, Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License"); you may not use this file except
@@ -13,20 +12,23 @@
 //
 //
 // Entry to SQL module. It takes SQL statements and uses the given YBClient to execute them. Each
-// QLProcessor runs on one and only one thread, so all function in SQL modules don't need to be
-// thread-safe.
+// QLProcessor runs on one and only one thread.
+// Notably, this does NOT apply to Reschedule implementation methods, which are called from
+// different ExecContexts, so non-thread-safe fields should not be referenced there.
 //--------------------------------------------------------------------------------------------------
 #ifndef YB_YQL_CQL_QL_QL_PROCESSOR_H_
 #define YB_YQL_CQL_QL_QL_PROCESSOR_H_
 
 #include "yb/client/callbacks.h"
 
+#include "yb/yql/cql/ql/ql_fwd.h"
 #include "yb/yql/cql/ql/exec/executor.h"
 #include "yb/yql/cql/ql/parser/parser.h"
 #include "yb/yql/cql/ql/sem/analyzer.h"
 #include "yb/yql/cql/ql/util/ql_env.h"
 
 #include "yb/util/metrics.h"
+#include "yb/util/object_pool.h"
 
 namespace yb {
 namespace ql {
@@ -62,6 +64,7 @@ class QLProcessor : public Rescheduler {
   QLProcessor(client::YBClient* client,
               std::shared_ptr<client::YBMetaDataCache> cache,
               QLMetrics* ql_metrics,
+              ThreadSafeObjectPool<Parser>* parser_pool,
               const server::ClockPtr& clock,
               TransactionPoolProvider transaction_pool_provider);
   virtual ~QLProcessor();
@@ -101,8 +104,8 @@ class QLProcessor : public Rescheduler {
   // Environment (YBClient) that processor uses to execute statement.
   QLEnv ql_env_;
 
-  // Parsing processor.
-  Parser parser_;
+  // Used for logging audit records.
+  audit::AuditLogger audit_logger_;
 
   // Semantic analysis processor.
   Analyzer analyzer_;
@@ -112,6 +115,11 @@ class QLProcessor : public Rescheduler {
 
   // SQL metrics.
   QLMetrics* const ql_metrics_;
+
+  ThreadSafeObjectPool<Parser>* parser_pool_;
+
+  // Whether the execution was rescheduled.
+  std::atomic<IsRescheduled> is_rescheduled_{IsRescheduled::kFalse};
 
  private:
   friend class QLTestBase;
@@ -152,8 +160,8 @@ class QLProcessor : public Rescheduler {
     void Done(const Status& status) override {}
 
     QLProcessor* processor_ = nullptr;
-    const std::string* stmt_;
-    const StatementParameters* params_;
+    const std::string* stmt_ = nullptr;
+    const StatementParameters* params_ = nullptr;
     StatementExecutedCallback cb_;
   };
 

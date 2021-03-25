@@ -60,7 +60,11 @@ public class TestTserverHealthChecks extends BaseYBClientTest {
 
   @Override
   public void setUpBefore() throws Exception {
-    tserverArgs.add("--force_single_tablet_failure=true");
+    tserverArgs.add("--TEST_force_single_tablet_failure=true");
+    tserverArgs.add("--TEST_delay_removing_peer_with_failed_tablet_secs=120");
+    // Without this flag, we'll end up deleting the failed tablet, and the count of failed_tablets
+    // will be 0.
+    masterArgs.add("--TEST_disable_tablet_deletion=true");
     super.setUpBefore();
   }
 
@@ -99,14 +103,14 @@ public class TestTserverHealthChecks extends BaseYBClientTest {
     HostAndPort tserver = entry.getKey();
     int port = tservers.get(tserver).getWebPort();
 
-    return getTserverHealthValue(tserver.getHostText(), port, key);
+    return getTserverHealthValue(tserver.getHost(), port, key);
   }
 
   @Test(timeout = 60000)
   public void testTserverHealthChecks() throws Exception {
     int countMasters = masterHostPorts.size();
-    assertEquals(countMasters, 3);
+    assertEquals(3, countMasters);
     JsonArray deadTablets = getTserverHealthValue("failed_tablets").getAsJsonArray();
-    assertEquals(deadTablets.size(), 1);
+    assertEquals(1, deadTablets.size());
   }
 }

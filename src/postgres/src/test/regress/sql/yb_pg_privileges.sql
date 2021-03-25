@@ -918,7 +918,8 @@ CREATE TABLE testns.acltest1 (x int);
 SELECT has_table_privilege('regress_priv_user1', 'testns.acltest1', 'SELECT'); -- no
 SELECT has_table_privilege('regress_priv_user1', 'testns.acltest1', 'INSERT'); -- no
 
-ALTER DEFAULT PRIVILEGES IN SCHEMA testns GRANT SELECT ON TABLES TO public;
+-- placeholder for test with duplicated schema and role names
+ALTER DEFAULT PRIVILEGES IN SCHEMA testns,testns GRANT SELECT ON TABLES TO public,public;
 
 SELECT has_table_privilege('regress_priv_user1', 'testns.acltest1', 'SELECT'); -- no
 SELECT has_table_privilege('regress_priv_user1', 'testns.acltest1', 'INSERT'); -- no
@@ -1257,6 +1258,3 @@ LOCK TABLE lock_table IN ROW EXCLUSIVE MODE; -- should fail
 -- DROP TABLE lock_table;
 -- DROP USER regress_locktable_user;
 --
-
--- TODO(jason): remove when issue #1721 is closed or closing.
-DISCARD TEMP;

@@ -2,7 +2,6 @@
 title: ALTER KEYSPACE statement [YCQL]
 headerTitle: ALTER KEYSPACE
 linkTitle: ALTER KEYSPACE
-summary: Alter a keyspace
 description: Use the ALTER KEYSPACE statement to change the properties of an existing keyspace.
 menu:
   latest:
@@ -54,24 +53,24 @@ Where
 
 - An error is raised if the specified `keyspace_name` does not exist.
 - An error is raised if the user (used role) has no ALTER permission for this specified keyspace and no ALTER permission for ALL KEYSPACES.
-- CQL keyspace properties are supported in the syntax but have no effect internally (where YugabyteDB defaults are used instead).
+- YCQL keyspace properties are supported in the syntax but have no effect internally (where YugabyteDB defaults are used instead).
 
 ## Examples
 
 ```sql
-cqlsh> ALTER KEYSPACE example;
+ycqlsh> ALTER KEYSPACE example;
 ```
 
 ```sql
-cqlsh> ALTER KEYSPACE example WITH DURABLE_WRITES = true;
+ycqlsh> ALTER KEYSPACE example WITH DURABLE_WRITES = true;
 ```
 
 ```sql
-cqlsh> ALTER KEYSPACE example WITH REPLICATION = {'class': 'SimpleStrategy', 'replication_factor': '3'} AND DURABLE_WRITES = true;
+ycqlsh> ALTER KEYSPACE example WITH REPLICATION = {'class': 'SimpleStrategy', 'replication_factor': '3'} AND DURABLE_WRITES = true;
 ```
 
 ```sql
-cqlsh> ALTER SCHEMA keyspace_example;
+ycqlsh> ALTER SCHEMA keyspace_example;
 ```
 
 ```
@@ -81,7 +80,7 @@ ALTER SCHEMA keyspace_example;
 ```
 
 ```sql
-cqlsh> ALTER KEYSPACE example;
+ycqlsh> ALTER KEYSPACE example;
 ```
 
 ```

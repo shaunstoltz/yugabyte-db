@@ -4,7 +4,7 @@ headerTitle: Third party software
 linkTitle: Third party software
 description: Learn about the third party software contained in YugabyteDB.
 aliases:
- - /latest/
+  - /latest/
 menu:
   latest:
     parent: legal
@@ -20,8 +20,8 @@ Yugabyte proudly participates in the open source community and appreciates all o
 
 - PostgreSQL stateless language layer for implementing YSQL.
 - PostgreSQL scanner and parser modules (`.y` and `.l` files) were used as a starting point for implementing the YCQL scanner and parser in C++.
-- The DocDB document store uses a customized and enhanced version of [RocksDB](https://github.com/facebook/rocksdb). Some of the customizations and enhancements are described in [DocDB store](https://docs.yugabyte.com/latest/architecture/docdb/).
-- The Apache Kudu Raft implementation and server framework were used as a starting point. Since then, we have implemented several enhancements, such as leader leases and pre-voting state during learner mode for correctness, improvements to the network stack, auto balancing of tablets on failures, zone/DC aware data placement, leader-balancing, ability to do full cluster moves in a online manner, and more.
+- The DocDB document store uses a customized and enhanced version of [RocksDB](https://github.com/facebook/rocksdb). Some of the customizations and enhancements are described in [DocDB store](/latest/architecture/docdb/).
+- The Apache Kudu Raft implementation and server framework were used as a starting point. Since then, Yugabyte has implemented several enhancements, such as leader leases and pre-voting state during learner mode for correctness, improvements to the network stack, auto balancing of tablets on failures, zone/DC aware data placement, leader-balancing, ability to do full cluster moves in a online manner, and more.
 - Google libraries (`glog`, `gflags`, `protocol buffers`, `snappy`, `gperftools`, `gtest`, `gmock`).
 
 ## Third party software components
@@ -54,7 +54,7 @@ Yugabyte products incorporate third party software, which includes the copyright
 |  zlib compression | 1.2.11 | Zlib |
 |  RocksDB (significantly modified) | Based on version e8e6cf0173849ee323cf6972121a179d085505b1 | Apache-2.0 |
 |  Apache Kudu (significantly modified) | Based on version 1ad16aa0b742a75b86152cd7034f150674070606 | Apache-2.0 |
-|  Cassandra (DataStax) Java driver with Yugabyte modifications | 3.2.0-yb-17 | Apache-2.0 |
+|  Cassandra (DataStax) Java driver with Yugabyte modifications | 3.9.0-yb-5 | Apache-2.0 |
 |  autoconf | 2.69 | GPL-2.0 |
 |  automake | 1.15.1 | GPL-2.0 |
 |  flex | 2.6.4 | BSD-2-Clause |
@@ -68,6 +68,7 @@ Yugabyte products incorporate third party software, which includes the copyright
 |  gpatch | 2.7.5 | GPL-3.0 |
 |  help2man | 1.47.5 | GPL-3.0 |
 |  isl | 0.18 | MIT |
+|  libedit | 20191231-3.1 | BSD-3-Clause |
 |  libmpc | 1.0.3.1 | LGPL-3.0 |
 |  libtool | 2.4.6.2 | GPL-2.0 |
 |  libuuid | 1.0.3 | BSD-3-Clause |
@@ -79,7 +80,6 @@ Yugabyte products incorporate third party software, which includes the copyright
 |  openssl | 1.0.2n | OpenSSL |
 |  patchelf | 0.9.1 | GPL-3.0 |
 |  pkg-config | 0.29.2_1 | GPL-2.0 |
-|  readline | 7.0.3_1 | GPL-3.0 |
 |  sqlite | 3.21.0 | CC0-1.0 |
 |  unzip | 6.0.3 | Info-ZIP |
 |  zlib | 1.2.11 | Zlib |
@@ -162,7 +162,7 @@ Yugabyte products incorporate third party software, which includes the copyright
 |  jsr166e | 1.1.0 | CC0-1.0 |
 |  netty-reactive-streams | 1.0.5 | Apache-2.0 |
 |  netty-reactive-streams-http | 1.0.5 | Apache-2.0 |
-|  spark-cassandra-connector_2.10 | 2.0.5-yb-7 | Apache-2.0 |
+|  spark-cassandra-connector_2.10 | 2.4-yb-3 | Apache-2.0 |
 |  commons-beanutils-core | 1.8.0 | Apache-2.0 |
 |  metrics-core | 3.1.2 | Apache-2.0 |
 |  metrics-graphite | 3.1.2 | Apache-2.0 |

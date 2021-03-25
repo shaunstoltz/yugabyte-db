@@ -2,7 +2,6 @@
 title: DROP KEYSPACE statement [YCQL]
 headerTitle: DROP KEYSPACE
 linkTitle: DROP KEYSPACE
-summary: Removes a keyspace
 description: Use the DROP KEYSPACE statement to remove a keyspace from the system.
 menu:
   latest:
@@ -45,15 +44,15 @@ Where
 You can do this as shown below.
 
 ```sql
-cqlsh> CREATE KEYSPACE example;
+ycqlsh> CREATE KEYSPACE example;
 ```
 
 ```sql
-cqlsh> DROP KEYSPACE example;
+ycqlsh> DROP KEYSPACE example;
 ```
 
 ```sql
-cqlsh> DROP KEYSPACE IF EXISTS example;
+ycqlsh> DROP KEYSPACE IF EXISTS example;
 ```
 
 ## See also

@@ -440,11 +440,13 @@ YBSchema& YBSchema::operator=(YBSchema&& other) {
 void YBSchema::CopyFrom(const YBSchema& other) {
   schema_.reset(new Schema(*other.schema_));
   version_ = other.version();
+  is_compatible_with_previous_version_ = other.is_compatible_with_previous_version();
 }
 
 void YBSchema::MoveFrom(YBSchema&& other) {
   schema_ = std::move(other.schema_);
   version_ = other.version();
+  is_compatible_with_previous_version_ = other.is_compatible_with_previous_version();
 }
 
 void YBSchema::Reset(std::unique_ptr<Schema> schema) {
@@ -469,12 +471,25 @@ bool YBSchema::Equals(const YBSchema& other) const {
          (schema_.get() && other.schema_.get() && schema_->Equals(*other.schema_));
 }
 
+bool YBSchema::EquivalentForDataCopy(const YBSchema& other) const {
+  return this == &other ||
+      (schema_.get() && other.schema_.get() && schema_->EquivalentForDataCopy(*other.schema_));
+}
+
 Result<bool> YBSchema::Equals(const SchemaPB& other) const {
   Schema schema;
   RETURN_NOT_OK(SchemaFromPB(other, &schema));
 
   YBSchema yb_schema(schema);
   return Equals(yb_schema);
+}
+
+Result<bool> YBSchema::EquivalentForDataCopy(const SchemaPB& other) const {
+  Schema schema;
+  RETURN_NOT_OK(SchemaFromPB(other, &schema));
+
+  YBSchema yb_schema(schema);
+  return EquivalentForDataCopy(yb_schema);
 }
 
 const TableProperties& YBSchema::table_properties() const {
@@ -517,6 +532,14 @@ size_t YBSchema::num_hash_key_columns() const {
 
 size_t YBSchema::num_range_key_columns() const {
   return schema_->num_range_key_columns();
+}
+
+bool YBSchema::is_compatible_with_previous_version() const {
+  return is_compatible_with_previous_version_;
+}
+
+void YBSchema::set_is_compatible_with_previous_version(bool is_compatible) {
+  is_compatible_with_previous_version_ = is_compatible;
 }
 
 uint32_t YBSchema::version() const {

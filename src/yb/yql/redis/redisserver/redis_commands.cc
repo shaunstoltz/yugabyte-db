@@ -314,9 +314,9 @@ void GetTabletLocations(LocalCommandData data, RedisArrayPB* array_response) {
   vector<string> tablets, partitions;
   vector<master::TabletLocationsPB> locations;
   const auto table_name = RedisServiceData::GetYBTableNameForRedisDatabase(
-                              data.call()->connection_context().redis_db_to_use());
-  auto s = data.client()->GetTablets(table_name, 0, &tablets, &partitions, &locations,
-                                     true /* update tablets cache */);
+      data.call()->connection_context().redis_db_to_use());
+  auto s = data.client()->GetTabletsAndUpdateCache(
+      table_name, 0, &tablets, &partitions, &locations);
   if (!s.ok()) {
     LOG(ERROR) << "Error getting tablets: " << s.message();
     return;
@@ -630,8 +630,8 @@ class RenameData : public std::enable_shared_from_this<RenameData> {
     }
 
     auto table = data_.context()->table();
-    const std::string src_partition_start = table->FindPartitionStart(src_partition_key);
-    const std::string dest_partition_start = table->FindPartitionStart(dest_partition_key);
+    const std::string src_partition_start = *table->FindPartitionStart(src_partition_key);
+    const std::string dest_partition_start = *table->FindPartitionStart(dest_partition_key);
     if (src_partition_start == dest_partition_start) {
       num_tablets_.store(1, std::memory_order_release);
     } else {
@@ -881,7 +881,7 @@ class KeysProcessor : public std::enable_shared_from_this<KeysProcessor> {
  public:
   explicit KeysProcessor(const LocalCommandData& data)
       : data_(data),
-        partitions_(data.table()->GetPartitions()), sessions_(partitions_.size()),
+        partitions_(data.table()->GetPartitionsCopy()), sessions_(partitions_.size()),
         callbacks_(partitions_.size()) {
     resp_.set_code(RedisResponsePB::OK);
   }
@@ -1095,22 +1095,22 @@ void HandleFlushDB(LocalCommandData data) {
 }
 
 void HandleFlushAll(LocalCommandData data) {
-  vector<yb::client::YBTableName> table_names;
   const string prefix = common::kRedisTableName;
-  Status s = data.client()->ListTables(&table_names, prefix);
-  if (!s.ok()) {
+  auto result = data.client()->ListTables(prefix);
+  if (!result.ok()) {
     RedisResponsePB resp;
-    const Slice message = s.message();
+    const Slice message = result.status().message();
     resp.set_code(RedisResponsePB_RedisStatusCode_SERVER_ERROR);
     resp.set_error_message(message.data(), message.size());
     data.Respond(&resp);
     return;
   }
+  const auto& table_names = *result;
   // Gather table ids.
   vector<string> table_ids;
   for (const auto& name : table_names) {
     std::shared_ptr<client::YBTable> table;
-    s = data.client()->OpenTable(name, &table);
+    const auto s = data.client()->OpenTable(name, &table);
     if (!s.ok()) {
       RedisResponsePB resp;
       const Slice message = s.message();
@@ -1161,18 +1161,17 @@ void HandleCreateDB(LocalCommandData data) {
 void HandleListDB(LocalCommandData data) {
   RedisResponsePB resp;
   // Figure out the redis table name that we should be using.
-  vector<yb::client::YBTableName> table_names;
   const string prefix = common::kRedisTableName;
   const size_t prefix_len = strlen(common::kRedisTableName);
-  Status s = data.client()->ListTables(&table_names, prefix);
-  if (!s.ok()) {
-    const Slice message = s.message();
+  const auto result = data.client()->ListTables(prefix);
+  if (!result.ok()) {
+    const Slice message = result.status().message();
     resp.set_code(RedisResponsePB_RedisStatusCode_SERVER_ERROR);
     resp.set_error_message(message.data(), message.size());
     data.Respond(&resp);
     return;
   }
-
+  const auto& table_names = *result;
   auto array_response = resp.mutable_array_response();
   vector<string> dbs;
   for (const auto& ybname : table_names) {

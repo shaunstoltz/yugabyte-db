@@ -25,7 +25,7 @@ If YugabyteDB is installed, run the following `yb-ctl create` command to start a
 ./bin/yb-ctl create --tserver_flags=ysql_pg_conf="default_transaction_isolation=serializable"
 ```
 
-If you are new to YugabyteDB, you can be up and running with YugabyteDB in under five minutes by following the steps in [Quick start](https://docs.yugabyte.com/latest/quick-start/). After installing YugabyteDB, make sure to follow the step mentioned above.
+If you are new to YugabyteDB, you can be up and running with YugabyteDB in under five minutes by following the steps in [Quick start](/latest/quick-start/). After installing YugabyteDB, make sure to follow the step mentioned above.
 
 ### Prisma
 
@@ -50,7 +50,7 @@ To set up a Prisma project, named `prisma-yb`, run the following command.
 prisma init prisma-yb
 ```
 
-In order to quickly explore using Prisma with YugabyteDB, we will use the default database and user in the PostgreSQL-compatible YugabyteDB.
+In order to quickly explore using Prisma with YugabyteDB, you will use the default database and user in the PostgreSQL-compatible YugabyteDB.
 
 When prompted, enter or select the following values:
 
@@ -270,7 +270,7 @@ touch index.js
 ```js
 const { prisma } = require('./generated/prisma-client')
 
-// A `main` function so that we can use async/await
+// A `main` function so that you can use async/await
 async function main() {
 
   // Create a new user called `Alice`

@@ -333,7 +333,7 @@ public class NodeInstanceControllerTest extends FakeDBApplication {
       assertOk(r);
       JsonNode json = Json.parse(contentAsString(r));
       assertValue(json, "taskUUID", fakeTaskUUID.toString());
-      CustomerTask ct = CustomerTask.find.where().eq("task_uuid", fakeTaskUUID).findUnique();
+      CustomerTask ct = CustomerTask.find.query().where().eq("task_uuid", fakeTaskUUID).findOne();
       assertNotNull(ct);
       assertEquals(CustomerTask.TargetType.Node, ct.getTarget());
       assertEquals(nodeActionType.getCustomerTask(), ct.getType());
@@ -365,5 +365,30 @@ public class NodeInstanceControllerTest extends FakeDBApplication {
                                            NodeActionType.STOP, false);
     assertBadRequest(invalidStop, "Cannot STOP " + curNode.nodeName + " as it will under replicate the masters.");
     assertAuditEntry(0, customer.uuid);
+  }
+
+  @Test
+  public void testStartNodeActionPassesClustersAndRootCAInTaskParams() {
+    NodeActionType nodeActionType = NodeActionType.START;
+    UUID fakeTaskUUID = UUID.randomUUID();
+    when(mockCommissioner.submit(any(TaskType.class), any(UniverseDefinitionTaskParams.class)))
+        .thenReturn(fakeTaskUUID);
+    Universe u = ModelFactory.createUniverse(nodeActionType.name(), customer.getCustomerId());
+    assertNotNull(u.getUniverseDetails().clusters);
+    u.getUniverseDetails().rootCA = UUID.randomUUID();
+
+    u = Universe.saveDetails(u.universeUUID, ApiUtils.mockUniverseUpdater());
+    customer.addUniverseUUID(u.universeUUID);
+    customer.save();
+    Result r = performNodeAction(customer.uuid, u.universeUUID, "host-n1", nodeActionType, false);
+    verify(mockCommissioner, times(1)).submit(taskType.capture(), taskParams.capture());
+    assertEquals(nodeActionType.getCommissionerTask(), taskType.getValue());
+    assertOk(r);
+    assertEquals(u.getUniverseDetails().clusters.size(), taskParams.getValue().clusters.size());
+    assertTrue(taskParams.getValue().clusters.size() > 0);
+    assertTrue(
+        u.getUniverseDetails().clusters.get(0).equals(taskParams.getValue().clusters.get(0)));
+    assertEquals(u.getUniverseDetails().rootCA, taskParams.getValue().rootCA);
+    Mockito.reset(mockCommissioner);
   }
 }

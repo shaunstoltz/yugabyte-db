@@ -13,6 +13,8 @@ import java.util.Set;
 import java.util.UUID;
 import java.util.stream.Collectors;
 
+import javax.persistence.Column;
+
 import com.fasterxml.jackson.annotation.JsonIgnore;
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.node.ObjectNode;
@@ -20,12 +22,13 @@ import com.google.common.collect.Iterables;
 import com.yugabyte.yw.commissioner.Common;
 import com.yugabyte.yw.commissioner.Common.CloudType;
 import com.yugabyte.yw.commissioner.tasks.UniverseDefinitionTaskBase;
-import com.yugabyte.yw.common.PlacementInfoUtil;
+import com.yugabyte.yw.models.Provider;
 import com.yugabyte.yw.models.Region;
 import com.yugabyte.yw.models.helpers.DeviceInfo;
 import com.yugabyte.yw.models.helpers.NodeDetails;
 import com.yugabyte.yw.models.helpers.PlacementInfo;
 
+import io.ebean.annotation.DbJson;
 import play.data.validation.Constraints;
 import play.libs.Json;
 
@@ -52,6 +55,11 @@ public class UniverseDefinitionTaskParams extends UniverseTaskParams {
   @Constraints.Required()
   @Constraints.MinLength(1)
   public List<Cluster> clusters = new LinkedList<>();
+
+  @Constraints.Required()
+  @DbJson
+  @Column(nullable = false, columnDefinition = "TEXT")
+  public JsonNode preflight_checks;
 
   @JsonIgnore
   // This is set during configure to figure out which cluster type is intended to be modified.
@@ -89,6 +97,9 @@ public class UniverseDefinitionTaskParams extends UniverseTaskParams {
   // operation.
   public boolean updateSucceeded = true;
 
+  // This tracks whether the universe is in the paused state or not.
+  public boolean universePaused = false;
+
   // The next cluster index to be used when a new read-only cluster is added.
   public int nextClusterIndex = 1;
 
@@ -100,6 +111,7 @@ public class UniverseDefinitionTaskParams extends UniverseTaskParams {
 
   // Development flag to download package from s3 bucket.
   public String itestS3PackagePath = "";
+  public String remotePackagePath = "";
 
   /**
    * Allowed states for an imported universe.
@@ -131,6 +143,15 @@ public class UniverseDefinitionTaskParams extends UniverseTaskParams {
    */
   public enum ClusterType {
     PRIMARY, ASYNC
+  }
+
+  /**
+   * Allowed states for an exposing service of a universe
+   */
+  public enum ExposingServiceState {
+    NONE, // Default, and means the universe was created before addition of the flag.
+    EXPOSED,
+    UNEXPOSED
   }
 
   /**
@@ -178,7 +199,7 @@ public class UniverseDefinitionTaskParams extends UniverseTaskParams {
       }
       ObjectNode clusterJson = (ObjectNode) Json.toJson(this);
       if (userIntent.regionList != null && !userIntent.regionList.isEmpty()) {
-        List<Region> regions = Region.find.where().idIn(userIntent.regionList).findList();
+        List<Region> regions = Region.find.query().where().idIn(userIntent.regionList).findList();
         if (!regions.isEmpty()) {
           clusterJson.set("regions", Json.toJson(regions));
         }
@@ -207,7 +228,7 @@ public class UniverseDefinitionTaskParams extends UniverseTaskParams {
       }
 
       // We only deal with AWS instance tags.
-      if (!userIntent.providerType.equals(CloudType.aws) ||
+      if (!Provider.InstanceTagsEnabledProviders.contains(userIntent.providerType) ||
           userIntent.instanceTags.equals(cluster.userIntent.instanceTags)) {
         return true;
       }
@@ -265,11 +286,31 @@ public class UniverseDefinitionTaskParams extends UniverseTaskParams {
 
     public boolean enableYSQL = false;
 
+    public boolean enableYEDIS = true;
+
     public boolean enableNodeToNodeEncrypt = false;
 
     public boolean enableClientToNodeEncrypt = false;
 
     public boolean enableVolumeEncryption = false;
+
+    public boolean enableIPV6 = false;
+
+    // Flag to use if we need to deploy a loadbalancer/some kind of
+    // exposing service for the cluster.
+    // Defaults to NONE since that was the behavior before.
+    // NONE for k8s means it was enabled, NONE for VMs means disabled.
+    // Can eventually be used when we create loadbalancer services for
+    // our cluster deployments.
+    // Setting at user intent level since it can be unique across types of clusters.
+    public ExposingServiceState enableExposingService = ExposingServiceState.NONE;
+
+    public String awsArnString;
+
+    // When this is set to true, YW will setup the universe to communicate by way of hostnames
+    // instead of ip addresses. These hostnames will have been provided during on-prem provider
+    // setup and will be in-place of privateIP
+    public boolean useHostname = false;
 
     // Info of all the gflags that the user would like to save to the universe. These will be
     // used during edit universe, for example, to set the flags on new nodes to match
@@ -308,6 +349,7 @@ public class UniverseDefinitionTaskParams extends UniverseTaskParams {
       newUserIntent.assignPublicIP = assignPublicIP;
       newUserIntent.useTimeSync = useTimeSync;
       newUserIntent.enableYSQL = enableYSQL;
+      newUserIntent.enableYEDIS = enableYEDIS;
       newUserIntent.enableNodeToNodeEncrypt = enableNodeToNodeEncrypt;
       newUserIntent.enableClientToNodeEncrypt = enableClientToNodeEncrypt;
       newUserIntent.instanceTags = new HashMap<>(instanceTags);
@@ -376,12 +418,15 @@ public class UniverseDefinitionTaskParams extends UniverseTaskParams {
     @JsonIgnore
     public Map<String, String> getInstanceTagsForInstanceOps() {
       Map<String, String> retTags = new HashMap<String, String>();
-      if (!providerType.equals(Common.CloudType.aws)) {
+      if (!Provider.InstanceTagsEnabledProviders.contains(providerType)) {
         return retTags;
       }
 
       retTags.putAll(instanceTags);
-      retTags.remove(UniverseDefinitionTaskBase.NODE_NAME_KEY);
+      if (providerType.equals(Common.CloudType.aws)) {
+        // Do not allow users to overwrite the node name. Only AWS uses tags to set it.
+        retTags.remove(UniverseDefinitionTaskBase.NODE_NAME_KEY);
+      }
 
       return retTags;
     }
@@ -531,13 +576,16 @@ public class UniverseDefinitionTaskParams extends UniverseTaskParams {
     if (uuid == null) {
       return getPrimaryCluster();
     }
+
     List<Cluster> foundClusters =  clusters.stream()
-                                           .filter(c -> c.uuid.equals(uuid))
-                                           .collect(Collectors.toList());
+      .filter(c -> c.uuid.equals(uuid))
+      .collect(Collectors.toList());
+
     if (foundClusters.size() > 1) {
       throw new RuntimeException("Multiple clusters with uuid " + uuid.toString() +
           " found in params for universe " + universeUUID.toString());
     }
+
     return Iterables.getOnlyElement(foundClusters, null);
   }
 

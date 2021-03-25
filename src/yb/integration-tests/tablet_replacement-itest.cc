@@ -70,9 +70,11 @@ TEST_F(TabletReplacementITest, TestMasterTombstoneEvictedReplica) {
   MonoDelta timeout = MonoDelta::FromSeconds(30);
   vector<string> ts_flags = { "--enable_leader_failure_detection=false" };
   int num_tservers = 5;
-  vector<string> master_flags;
-  master_flags.push_back("--catalog_manager_wait_for_new_tablets_to_elect_leader=false");
-  master_flags.push_back("--replication_factor=5");
+  vector<string> master_flags = {
+    "--catalog_manager_wait_for_new_tablets_to_elect_leader=false"s,
+    "--replication_factor=5",
+    "--use_create_table_leader_hint=false"s,
+  };
   ASSERT_NO_FATALS(StartCluster(ts_flags, master_flags, num_tservers));
 
   TestWorkload workload(cluster_.get());
@@ -141,8 +143,10 @@ TEST_F(TabletReplacementITest, TestMasterTombstoneEvictedReplica) {
 TEST_F(TabletReplacementITest, TestMasterTombstoneOldReplicaOnReport) {
   MonoDelta timeout = MonoDelta::FromSeconds(30);
   vector<string> ts_flags = { "--enable_leader_failure_detection=false" };
-  vector<string> master_flags;
-  master_flags.push_back("--catalog_manager_wait_for_new_tablets_to_elect_leader=false");
+  vector<string> master_flags = {
+    "--catalog_manager_wait_for_new_tablets_to_elect_leader=false"s,
+    "--use_create_table_leader_hint=false"s,
+  };
   ASSERT_NO_FATALS(StartCluster(ts_flags, master_flags));
 
   TestWorkload workload(cluster_.get());
@@ -201,7 +205,10 @@ TEST_F(TabletReplacementITest, TestEvictAndReplaceDeadFollower) {
   MonoDelta timeout = MonoDelta::FromSeconds(30);
   vector<string> ts_flags = { "--enable_leader_failure_detection=false",
                               "--follower_unavailable_considered_failed_sec=5" };
-  vector<string> master_flags = { "--catalog_manager_wait_for_new_tablets_to_elect_leader=false" };
+  vector<string> master_flags = {
+    "--catalog_manager_wait_for_new_tablets_to_elect_leader=false"s,
+    "--use_create_table_leader_hint=false"s,
+  };
   ASSERT_NO_FATALS(StartCluster(ts_flags, master_flags));
 
   TestWorkload workload(cluster_.get());
@@ -254,13 +261,16 @@ TEST_F(TabletReplacementITest, TestRemoteBoostrapWithPendingConfigChangeCommits)
   }
 
   MonoDelta timeout = MonoDelta::FromSeconds(30);
-  vector<string> ts_flags;
-  ts_flags.push_back("--enable_leader_failure_detection=false");
-  vector<string> master_flags;
+  vector<string> ts_flags = {
+    "--enable_leader_failure_detection=false"s,
+  };
   // We will manage doing the AddServer() manually, in order to make this test
   // more deterministic.
-  master_flags.push_back("--master_tombstone_evicted_tablet_replicas=false");
-  master_flags.push_back("--catalog_manager_wait_for_new_tablets_to_elect_leader=false");
+  vector<string> master_flags = {
+    "--master_tombstone_evicted_tablet_replicas=false"s,
+    "--catalog_manager_wait_for_new_tablets_to_elect_leader=false"s,
+    "--use_create_table_leader_hint=false"s,
+  };
   ASSERT_NO_FATALS(StartCluster(ts_flags, master_flags));
 
   TestWorkload workload(cluster_.get());
@@ -292,7 +302,7 @@ TEST_F(TabletReplacementITest, TestRemoteBoostrapWithPendingConfigChangeCommits)
   // Delay tablet applies in order to delay COMMIT messages to trigger KUDU-1233.
   // Then insert another row.
   ASSERT_OK(cluster_->SetFlag(cluster_->tablet_server_by_uuid(leader_ts->uuid()),
-                              "tablet_inject_latency_on_apply_write_txn_ms", "5000"));
+                              "TEST_tablet_inject_latency_on_apply_write_txn_ms", "5000"));
 
   // Kick off an async insert, which will be delayed for 5 seconds. This is
   // normally enough time to evict a replica, tombstone it, add it back, and

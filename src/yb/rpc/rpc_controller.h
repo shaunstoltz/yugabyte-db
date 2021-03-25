@@ -53,7 +53,8 @@ YB_DEFINE_ENUM(InvokeCallbackMode,
     // On reactor thread.
     (kReactorThread)
     // On thread pool.
-    (kThreadPool));
+    (kThreadPoolNormal)
+    (kThreadPoolHigh));
 
 // Controller for managing properties of a single RPC call, on the client side.
 //
@@ -101,6 +102,8 @@ class RpcController {
   //   down
   // * the call timed out
   CHECKED_STATUS status() const;
+
+  CHECKED_STATUS thread_pool_failure() const;
 
   // If status() returns a RemoteError object, then this function returns
   // the error response provided by the server. Service implementors may
@@ -154,6 +157,8 @@ class RpcController {
   // May fail if index is invalid.
   Result<Slice> GetSidecar(int idx) const;
 
+  int32_t call_id() const;
+
  private:
   friend class OutboundCall;
   friend class Proxy;
@@ -165,7 +170,7 @@ class RpcController {
   // Once the call is sent, it is tracked here.
   OutboundCallPtr call_;
   bool allow_local_calls_in_curr_thread_ = false;
-  InvokeCallbackMode invoke_callback_mode_ = InvokeCallbackMode::kThreadPool;
+  InvokeCallbackMode invoke_callback_mode_ = InvokeCallbackMode::kThreadPoolNormal;
 
   DISALLOW_COPY_AND_ASSIGN(RpcController);
 };

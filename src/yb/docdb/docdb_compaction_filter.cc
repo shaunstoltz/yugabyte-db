@@ -54,14 +54,17 @@ DocDBCompactionFilter::~DocDBCompactionFilter() {
 FilterDecision DocDBCompactionFilter::Filter(
     int level, const Slice& key, const Slice& existing_value, std::string* new_value,
     bool* value_changed) {
-  auto result = CHECK_RESULT(const_cast<DocDBCompactionFilter*>(this)->DoFilter(
-      level, key, existing_value, new_value, value_changed));
-  if (result != FilterDecision::kKeep) {
+  auto result = const_cast<DocDBCompactionFilter*>(this)->DoFilter(
+      level, key, existing_value, new_value, value_changed);
+  if (!result.ok()) {
+    LOG(FATAL) << "Error filtering " << key.ToDebugString() << ": " << result.status();
+  }
+  if (*result != FilterDecision::kKeep) {
     VLOG(3) << "Discarding key: " << BestEffortDocDBKeyToStr(key);
   } else {
     VLOG(4) << "Keeping key: " << BestEffortDocDBKeyToStr(key);
   }
-  return result;
+  return *result;
 }
 
 Result<FilterDecision> DocDBCompactionFilter::DoFilter(
@@ -79,6 +82,12 @@ Result<FilterDecision> DocDBCompactionFilter::DoFilter(
 
   // Remove regular keys which are not related to this RocksDB anymore (due to split of the tablet).
   if (key_bounds_ && !key_bounds_->IsWithinBounds(key)) {
+    // Given the addition of logic in the compaction iterator which looks at DropKeysLessThan()
+    // and DropKeysGreaterOrEqual(), we expect the compaction iterator to never pass this component
+    // a key in that range. If this invariant is violated, we LOG(DFATAL)
+    LOG(DFATAL) << "Unexpectedly filtered out-of-bounds key during compaction: "
+        << SubDocKey::DebugSliceToString(key)
+        << " with bounds: " << key_bounds_->ToString();
     return FilterDecision::kDiscard;
   }
 
@@ -204,10 +213,12 @@ Result<FilterDecision> DocDBCompactionFilter::DoFilter(
 
   auto overwrite_ht = isTtlRow ? prev_overwrite_ht : max(prev_overwrite_ht, ht);
 
-  ValueType value_type;
-  MonoDelta ttl;
-  RETURN_NOT_OK(Value::DecodePrimitiveValueType(existing_value, &value_type, nullptr, &ttl));
-  const Expiration curr_exp(ht.hybrid_time(), ttl);
+  Value value;
+  Slice value_slice = existing_value;
+  RETURN_NOT_OK(value.DecodeControlFields(&value_slice));
+  const auto value_type = static_cast<ValueType>(
+      value_slice.FirstByteOr(ValueTypeAsChar::kInvalid));
+  const Expiration curr_exp(ht.hybrid_time(), value.ttl());
 
   // If within the merge block.
   //     If the row is a TTL row, delete it.
@@ -240,15 +251,13 @@ Result<FilterDecision> DocDBCompactionFilter::DoFilter(
     return FilterDecision::kDiscard;
   }
 
-  // If the value expires by the time of history cutoff, it is treated as deleted and filtered out.
-  bool has_expired = false;
-
   // Only check for expiration if the current hybrid time is at or below history cutoff.
   // The key could not have possibly expired by history_cutoff_ otherwise.
   MonoDelta true_ttl = ComputeTTL(expiration.ttl, retention_.table_ttl);
-  RETURN_NOT_OK(HasExpiredTTL(true_ttl == expiration.ttl ?
-                              expiration.write_ht : ht.hybrid_time(),
-                              true_ttl, history_cutoff, &has_expired));
+  const auto has_expired = HasExpiredTTL(
+      true_ttl == expiration.ttl ? expiration.write_ht : ht.hybrid_time(),
+      true_ttl,
+      history_cutoff);
   // As of 02/2017, we don't have init markers for top level documents in QL. As a result, we can
   // compact away each column if it has expired, including the liveness system column. The init
   // markers in Redis wouldn't be affected since they don't have any TTL associated with them and
@@ -266,9 +275,6 @@ Result<FilterDecision> DocDBCompactionFilter::DoFilter(
     *new_value = Value::EncodedTombstone();
   } else if (within_merge_block_) {
     *value_changed = true;
-    Value value;
-    Slice value_slice = existing_value;
-    RETURN_NOT_OK(value.DecodeControlFields(&value_slice));
 
     if (expiration.ttl != Value::kMaxTtl) {
       expiration.ttl += MonoDelta::FromMicroseconds(
@@ -282,6 +288,15 @@ Result<FilterDecision> DocDBCompactionFilter::DoFilter(
     // We are reusing the existing encoded value without decoding/encoding it.
     value.EncodeAndAppend(new_value, &value_slice);
     within_merge_block_ = false;
+  } else if (value.intent_doc_ht().is_valid() && ht.hybrid_time() < history_cutoff) {
+    // Cleanup intent doc hybrid time when we don't need it anymore.
+    // See https://github.com/yugabyte/yugabyte-db/issues/4535 for details.
+    value.ClearIntentDocHt();
+
+    new_value->clear();
+
+    // We are reusing the existing encoded value without decoding/encoding it.
+    value.EncodeAndAppend(new_value, &value_slice);
   }
 
   // If we are backfilling an index table, we want to preserve the delete markers in the table
@@ -316,6 +331,14 @@ rocksdb::UserFrontierPtr DocDBCompactionFilter::GetLargestUserFrontier() const {
 
 const char* DocDBCompactionFilter::Name() const {
   return "DocDBCompactionFilter";
+}
+
+Slice DocDBCompactionFilter::DropKeysLessThan() const {
+  return key_bounds_ ? key_bounds_->lower.AsSlice() : Slice();
+}
+
+Slice DocDBCompactionFilter::DropKeysGreaterOrEqual() const {
+  return key_bounds_ ? key_bounds_->upper.AsSlice() : Slice();
 }
 
 // ------------------------------------------------------------------------------------------------

@@ -11,8 +11,7 @@ allowed_cloud_types:
   - aws
   - gcp
   - onprem
-
-custom_ssh_port: 54422
+  - azu
 
 cloud_region: us-west-2
 

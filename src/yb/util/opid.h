@@ -41,16 +41,16 @@ struct OpId {
     return OpId(std::numeric_limits<int64_t>::max(), std::numeric_limits<int64_t>::max());
   }
 
+  static OpId Min() {
+    return OpId();
+  }
+
   bool valid() const {
     return term >= 0 && index >= 0;
   }
 
   bool empty() const {
     return term == 0 && index == 0;
-  }
-
-  explicit operator bool() const {
-    return !empty();
   }
 
   bool operator!() const {

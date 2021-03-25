@@ -13,18 +13,22 @@
 
 #include <thread>
 
+#include "yb/common/common.pb.h"
 #include "yb/rocksdb/statistics.h"
 #include "yb/rocksdb/db/column_family.h"
 #include "yb/rocksdb/db/internal_stats.h"
 
 #include "yb/common/partial_row.h"
+#include "yb/common/ql_protocol_util.h"
 #include "yb/common/ql_resultset.h"
 #include "yb/common/ql_value.h"
 #include "yb/common/transaction-test-util.h"
 
 #include "yb/docdb/cql_operation.h"
+#include "yb/docdb/docdb_debug.h"
 #include "yb/docdb/docdb_rocksdb_util.h"
 #include "yb/docdb/docdb_test_base.h"
+#include "yb/docdb/docdb_test_util.h"
 #include "yb/docdb/doc_rowwise_iterator.h"
 #include "yb/docdb/doc_ql_scanspec.h"
 #include "yb/docdb/ql_rocksdb_storage.h"
@@ -103,12 +107,14 @@ class DocOperationTest : public DocDBTestBase {
                const HybridTime& hybrid_time = HybridTime::kMax,
                const TransactionOperationContextOpt& txn_op_context =
                    kNonTransactionalOperationContext) {
-    QLWriteOperation ql_write_op(schema, IndexMap(), nullptr /* unique_index_key_schema */,
-                                 txn_op_context);
+    QLWriteOperation ql_write_op(std::shared_ptr<const Schema>(&schema, [](const Schema*){}),
+                                 IndexMap(), nullptr /* unique_index_key_schema */, txn_op_context);
     ASSERT_OK(ql_write_op.Init(ql_writereq_pb, ql_writeresp_pb));
     auto doc_write_batch = MakeDocWriteBatch();
+    HybridTime restart_read_ht;
     ASSERT_OK(ql_write_op.Apply(
-        {&doc_write_batch, CoarseTimePoint::max() /* deadline */, ReadHybridTime()}));
+        {&doc_write_batch, CoarseTimePoint::max() /* deadline */, ReadHybridTime(),
+         &restart_read_ht}));
     ASSERT_OK(WriteToRocksDB(doc_write_batch, hybrid_time));
   }
 
@@ -174,12 +180,11 @@ SubDocKey(DocKey(0x0000, [1], []), [ColumnId(3); HT{ <max> w: 2 }]) -> 4
     }
   }
 
-  void WriteQLRow(QLWriteRequestPB_QLStmtType stmt_type, const Schema& schema,
-                  const vector<int32_t>& column_values, int64_t ttl, const HybridTime& hybrid_time,
+  yb::QLWriteRequestPB WriteQLRowReq(QLWriteRequestPB_QLStmtType stmt_type, const Schema& schema,
+                  const vector<int32_t>& column_values, const HybridTime& hybrid_time,
                   const TransactionOperationContextOpt& txn_op_content =
                       kNonTransactionalOperationContext) {
     yb::QLWriteRequestPB ql_writereq_pb;
-    yb::QLResponsePB ql_writeresp_pb;
     ql_writereq_pb.set_type(stmt_type);
 
     // Add primary key column.
@@ -194,8 +199,28 @@ SubDocKey(DocKey(0x0000, [1], []), [ColumnId(3); HT{ <max> w: 2 }]) -> 4
     std::vector<int32_t> values(column_values.begin() + schema.num_key_columns(),
                                 column_values.end());
     AddColumnValues(schema, values, &ql_writereq_pb);
-    ql_writereq_pb.set_ttl(ttl);
+    return ql_writereq_pb;
+  }
 
+  void WriteQLRow(QLWriteRequestPB_QLStmtType stmt_type, const Schema& schema,
+                  const vector<int32_t>& column_values, int64_t ttl, const HybridTime& hybrid_time,
+                  const TransactionOperationContextOpt& txn_op_content =
+                      kNonTransactionalOperationContext) {
+    yb::QLWriteRequestPB ql_writereq_pb = WriteQLRowReq(
+        stmt_type, schema, column_values, hybrid_time, txn_op_content);
+    ql_writereq_pb.set_ttl(ttl);
+    yb::QLResponsePB ql_writeresp_pb;
+    // Write to docdb.
+    WriteQL(&ql_writereq_pb, schema, &ql_writeresp_pb, hybrid_time, txn_op_content);
+  }
+
+  void WriteQLRow(QLWriteRequestPB_QLStmtType stmt_type, const Schema& schema,
+                  const vector<int32_t>& column_values, const HybridTime& hybrid_time,
+                  const TransactionOperationContextOpt& txn_op_content =
+                      kNonTransactionalOperationContext) {
+    yb::QLWriteRequestPB ql_writereq_pb = WriteQLRowReq(
+        stmt_type, schema, column_values, hybrid_time, txn_op_content);
+    yb::QLResponsePB ql_writeresp_pb;
     // Write to docdb.
     WriteQL(&ql_writereq_pb, schema, &ql_writeresp_pb, hybrid_time, txn_op_content);
   }
@@ -344,6 +369,67 @@ SubDocKey(DocKey(0x0000, [1], []), [ColumnId(3); HT{ physical: 1000 w: 3 }]) -> 
   EXPECT_EQ(3, row_block.row(0).column(3).int32_value());
 }
 
+TEST_F(DocOperationTest, TestQLRangeDeleteWithStaticColumnAvoidsFullPartitionKeyScan) {
+  constexpr int kNumRows = 10000;
+  constexpr int kDeleteRangeLow = 100;
+  constexpr int kDeleteRangeHigh = 200;
+
+  // Define the schema with a partition key, range key, static column, and value.
+  SchemaBuilder builder;
+  builder.set_next_column_id(ColumnId(0));
+  ASSERT_OK(builder.AddHashKeyColumn("k", INT32));
+  ASSERT_OK(builder.AddKeyColumn("r", INT32));
+  ASSERT_OK(builder.AddColumn(ColumnSchema("s", INT32, false, false, true), false));
+  ASSERT_OK(builder.AddColumn(ColumnSchema("v", INT32), false));
+  auto schema = builder.Build();
+
+  // Write rows with the same partition key but different range key
+  for (int row_num = 0; row_num < kNumRows; ++row_num) {
+    WriteQLRow(
+        QLWriteRequestPB_QLStmtType_QL_STMT_INSERT,
+        schema,
+        vector<int>({1, row_num, 0, row_num}),
+        HybridClock::HybridTimeFromMicrosecondsAndLogicalValue(1000, 0));
+  }
+  auto get_num_rocksdb_iter_moves = [&]() {
+    auto num_next = regular_db_options().statistics->getTickerCount(
+      rocksdb::Tickers::NUMBER_DB_NEXT);
+    auto num_seek = regular_db_options().statistics->getTickerCount(
+      rocksdb::Tickers::NUMBER_DB_SEEK);
+    return num_next + num_seek;
+  };
+
+  auto rocksdb_iter_moves_before_delete = get_num_rocksdb_iter_moves();
+
+  // Delete a subset of the partition
+  yb::QLWriteRequestPB ql_writereq_pb;
+  yb::QLResponsePB ql_writeresp_pb;
+  ql_writereq_pb.set_type(QLWriteRequestPB_QLStmtType_QL_STMT_DELETE);
+  AddPrimaryKeyColumn(&ql_writereq_pb, 1);
+
+  auto where_clause_and = ql_writereq_pb.mutable_where_expr()->mutable_condition();
+  where_clause_and->set_op(QLOperator::QL_OP_AND);
+  QLAddInt32Condition(where_clause_and, 1, QL_OP_GREATER_THAN_EQUAL, kDeleteRangeLow);
+  QLAddInt32Condition(where_clause_and, 1, QL_OP_LESS_THAN_EQUAL, kDeleteRangeHigh);
+  ql_writereq_pb.set_hash_code(0);
+
+  WriteQL(&ql_writereq_pb, schema, &ql_writeresp_pb,
+          HybridClock::HybridTimeFromMicrosecondsAndLogicalValue(2000, 0),
+          kNonTransactionalOperationContext);
+
+  // During deletion, we expect to move the RocksDB iterator *at most* once per docdb row in range,
+  // plus once for the first docdb row out of range. We say *at most*, because it's possible to have
+  // various combinations of Next() vs. Seek() calls. This simply tests that we do not have more
+  // than the maximum allowed based on the schema and the restriction that we should not scan
+  // outside the boundaries of the relevant deletion range.
+  auto num_cql_rows_in_range = kDeleteRangeHigh - kDeleteRangeLow + 1;
+  auto max_num_rocksdb_moves_per_cql_row = 3;
+  auto max_num_rocksdb_iter_moves = num_cql_rows_in_range * max_num_rocksdb_moves_per_cql_row;
+  ASSERT_LE(
+      get_num_rocksdb_iter_moves() - rocksdb_iter_moves_before_delete,
+      max_num_rocksdb_iter_moves + 1);
+}
+
 TEST_F(DocOperationTest, TestQLReadWithoutLivenessColumn) {
   const DocKey doc_key(kFixedHashCode, PrimitiveValues(PrimitiveValue::Int32(100)),
                        PrimitiveValues());
@@ -392,7 +478,7 @@ SubDocKey(DocKey(0x0000, [100], []), [ColumnId(3); HT{ physical: 0 logical: 3000
   DocRowwiseIterator iter(schema, schema, kNonTransactionalOperationContext,
                           doc_db(), CoarseTimePoint::max() /* deadline */,
                           ReadHybridTime::FromUint64(3000));
-  ASSERT_OK(iter.Init());
+  ASSERT_OK(iter.Init(YQL_TABLE_TYPE));
   ASSERT_FALSE(ASSERT_RESULT(iter.HasNext()));
 
   // Now verify row exists even with one valid column.
@@ -655,7 +741,9 @@ class DocOperationScanTest : public DocOperationTest {
 
       ASSERT_OK(FlushRocksDbAndWait());
     }
-    LOG(INFO) << "Dump:\n" << DocDBDebugDumpToStr();
+
+    DumpRocksDBToLog(rocksdb(), StorageDbType::kRegular);
+    DumpRocksDBToLog(intents_db(), StorageDbType::kIntents);
   }
 
   void PerformScans(const bool is_forward_scan,
@@ -1022,7 +1110,8 @@ TEST_F(DocOperationTest, MaxFileSizeWithWritesTrigger) {
   rocksdb()->GetLiveFilesMetaData(&files);
   ASSERT_GE(files.size(), 3);
 
-  auto handle_impl = down_cast<rocksdb::ColumnFamilyHandleImpl*>(rocksdb_->DefaultColumnFamily());
+  auto handle_impl = down_cast<rocksdb::ColumnFamilyHandleImpl*>(
+      regular_db_->DefaultColumnFamily());
   auto stats = handle_impl->cfd()->internal_stats();
   ASSERT_EQ(0, stats->GetCFStats(rocksdb::InternalStats::LEVEL0_NUM_FILES_TOTAL));
   ASSERT_EQ(0, stats->GetCFStats(rocksdb::InternalStats::LEVEL0_SLOWDOWN_TOTAL));

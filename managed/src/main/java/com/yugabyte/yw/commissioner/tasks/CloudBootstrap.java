@@ -83,9 +83,12 @@ public class CloudBootstrap extends CloudTaskBase {
     // Default: created and managed by YB.
     public String sshUser = null;
 
-    // TODO(bogdan): custom SSH port??
-    // This requires changing the AccessKey to store SSH port, defaulting to 22 for backwards compat,
-    // ensuring devops can take port across all commands, etc..
+    // Whether provider should use airgapped install.
+    // Default: false.
+    public boolean airGapInstall = false;
+
+    // Port to open for connections on the instance.
+    public Integer sshPort = 54422;
 
     public String hostVpcId = null;
     public String hostVpcRegion = null;
@@ -102,7 +105,8 @@ public class CloudBootstrap extends CloudTaskBase {
     subTaskGroupQueue = new SubTaskGroupQueue(userTaskUUID);
     Provider p = Provider.get(taskParams().providerUUID);
     if (p.code.equals(Common.CloudType.gcp.toString())
-        || p.code.equals(Common.CloudType.aws.toString())) {
+        || p.code.equals(Common.CloudType.aws.toString())
+        || p.code.equals(Common.CloudType.azu.toString())) {
       createCloudSetupTask()
         .setSubTaskGroupType(UserTaskDetails.SubTaskGroupType.BootstrappingCloud);
     }
@@ -158,6 +162,8 @@ public class CloudBootstrap extends CloudTaskBase {
     params.keyPairName = taskParams().keyPairName;
     params.sshPrivateKeyContent = taskParams().sshPrivateKeyContent;
     params.sshUser = taskParams().sshUser;
+    params.sshPort = taskParams().sshPort;
+    params.airGapInstall = taskParams().airGapInstall;
     CloudAccessKeySetup task = new CloudAccessKeySetup();
     task.initialize(params);
     subTaskGroup.addTask(task);

@@ -35,6 +35,7 @@
 
 #include <memory>
 #include <string>
+#include <unordered_set>
 #include <vector>
 
 #include "yb/gutil/macros.h"
@@ -104,6 +105,7 @@ class MiniCluster : public MiniClusterBase {
   typedef std::vector<std::shared_ptr<master::MiniMaster> > MiniMasters;
   typedef std::vector<std::shared_ptr<tserver::MiniTabletServer> > MiniTabletServers;
   typedef std::vector<uint16_t> Ports;
+  typedef MiniClusterOptions Options;
 
   MiniCluster(Env* env, const MiniClusterOptions& options);
   ~MiniCluster();
@@ -145,6 +147,9 @@ class MiniCluster : public MiniClusterBase {
   // Same as above, but get options from flags.
   CHECKED_STATUS AddTabletServer();
 
+  // Add a Tablet Server to the blacklist
+  CHECKED_STATUS AddTServerToBlacklist(master::MiniMaster* master, tserver::MiniTabletServer* ts);
+
   // If this cluster is configured for a single non-distributed
   // master, return the single master. Exits with a CHECK failure if
   // there are multiple masters.
@@ -156,6 +161,8 @@ class MiniCluster : public MiniClusterBase {
   // Returns the leader Master for this MiniCluster or NULL if none can be
   // found. May block until a leader Master is ready.
   master::MiniMaster* leader_mini_master();
+
+  int LeaderMasterIdx();
 
   // Returns the Master at index 'idx' for this MiniCluster.
   master::MiniMaster* mini_master(int idx);
@@ -202,6 +209,10 @@ class MiniCluster : public MiniClusterBase {
   CHECKED_STATUS WaitForTabletServerCount(int count,
                                   std::vector<std::shared_ptr<master::TSDescriptor> >* descs);
 
+  // Wait for all tablet servers to be registered. Returns Status::TimedOut if the desired count is
+  // not achieved within kRegistrationWaitTimeSeconds.
+  CHECKED_STATUS WaitForAllTabletServers();
+
   uint16_t AllocateFreePort() {
     return port_picker_.AllocateFreePort();
   }
@@ -238,7 +249,6 @@ class MiniCluster : public MiniClusterBase {
   Ports master_web_ports_;
   Ports tserver_rpc_ports_;
   Ports tserver_web_ports_;
-  uint16_t next_port_ = 0;
 
   MiniMasters mini_masters_;
   MiniTabletServers mini_tablet_servers_;
@@ -254,6 +264,8 @@ void StepDownRandomTablet(MiniCluster* cluster);
 
 YB_DEFINE_ENUM(ListPeersFilter, (kAll)(kLeaders)(kNonLeaders));
 
+std::unordered_set<string> ListTabletIdsForTable(MiniCluster* cluster, const string& table_id);
+
 std::vector<std::shared_ptr<tablet::TabletPeer>> ListTabletPeers(
     MiniCluster* cluster, ListPeersFilter filter);
 
@@ -261,9 +273,22 @@ std::vector<std::shared_ptr<tablet::TabletPeer>> ListTabletPeers(
     MiniCluster* cluster,
     const std::function<bool(const std::shared_ptr<tablet::TabletPeer>&)>& filter);
 
+std::vector<tablet::TabletPeerPtr> ListTableActiveTabletLeadersPeers(
+    MiniCluster* cluster, const TableId& table_id);
+
+std::vector<tablet::TabletPeerPtr> ListTableActiveTabletPeers(
+    MiniCluster* cluster, const TableId& table_id);
+std::vector<tablet::TabletPeerPtr> ListTableInactiveSplitTabletPeers(
+    MiniCluster* cluster, const TableId& table_id);
+
+CHECKED_STATUS WaitUntilTabletHasLeader(
+    MiniCluster* cluster, const string& tablet_id, MonoTime deadline);
+
 CHECKED_STATUS WaitForLeaderOfSingleTablet(
     MiniCluster* cluster, tablet::TabletPeerPtr leader, MonoDelta duration,
     const std::string& description);
+
+CHECKED_STATUS WaitUntilMasterHasLeader(MiniCluster* cluster, MonoDelta deadline);
 
 YB_STRONGLY_TYPED_BOOL(ForceStepDown);
 
@@ -297,6 +322,14 @@ using TabletPeerFilter = std::function<bool(const tablet::TabletPeer*)>;
 size_t CountIntents(MiniCluster* cluster, const TabletPeerFilter& filter = TabletPeerFilter());
 
 tserver::MiniTabletServer* FindTabletLeader(MiniCluster* cluster, const TabletId& tablet_id);
+
+void ShutdownAllTServers(MiniCluster* cluster);
+CHECKED_STATUS StartAllTServers(MiniCluster* cluster);
+void ShutdownAllMasters(MiniCluster* cluster);
+CHECKED_STATUS StartAllMasters(MiniCluster* cluster);
+
+CHECKED_STATUS BreakConnectivity(MiniCluster* cluster, int idx1, int idx2);
+Result<int> ServerWithLeaders(MiniCluster* cluster);
 
 }  // namespace yb
 

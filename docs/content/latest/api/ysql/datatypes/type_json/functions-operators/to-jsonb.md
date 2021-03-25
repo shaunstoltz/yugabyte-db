@@ -1,13 +1,12 @@
 ---
-title: to_jsonb() and to_json() [JSON]
+title: to_jsonb() and to_json()
 headerTitle: to_jsonb()
 linkTitle: to_jsonb()
-summary: to_jsonb() 
-description: Use these JSON functions to convert a single SQL value of any primitive or compound data type, that allows a JSON representation, to a semantically equivalent jsonb value.
+description: Convert a single SQL value of any primitive or compound data type, that allows a JSON representation, to a semantically equivalent jsonb value.
 menu:
   latest:
     identifier: to-jsonb
-    parent: functions-operators
+    parent: json-functions-operators
 isTocNested: true
 showAsideToc: true
 ---
@@ -21,9 +20,9 @@ input value:       anyelement
 return value:      jsonb
 ```
 
-Use this _ysqlsh_ script to create types `t1` and `t2` and then to execute the `do` block that asserts that the behavior is as expected. For an arbitrary nest of SQL `record` and SQL `array` values, readability is improved by building the compound value from the bottom up.
+Use this `ysqlsh` script to create types _"t1"_ and _"t2"_ and then to execute the `DO` block that asserts that the behavior is as expected. For an arbitrary nest of SQL `record` and SQL array values, readability is improved by building the compound value from the bottom up.
 
-```postgresql
+```plpgsql
 create type t1 as(a int, b text);
 create type t2 as(x text, y boolean, z t1[]);
 

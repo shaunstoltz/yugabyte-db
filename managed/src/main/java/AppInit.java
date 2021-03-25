@@ -1,28 +1,25 @@
 // Copyright (c) YugaByte, Inc.
 
-import java.util.ArrayList;
+import java.lang.ReflectiveOperationException;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.UUID;
 
-import com.avaje.ebean.Ebean;
+import com.yugabyte.yw.commissioner.TaskGarbageCollector;
+import com.yugabyte.yw.common.*;
+import com.yugabyte.yw.common.ha.PlatformReplicationManager;
+import com.yugabyte.yw.models.*;
+import io.ebean.Ebean;
 import com.google.common.collect.ImmutableMap;
 import com.google.inject.Inject;
 import com.google.inject.Singleton;
 import com.yugabyte.yw.cloud.AWSInitializer;
-import com.yugabyte.yw.common.ConfigHelper;
-import com.yugabyte.yw.common.ReleaseManager;
-import com.yugabyte.yw.models.Customer;
-import com.yugabyte.yw.models.InstanceType;
-import com.yugabyte.yw.models.MetricConfig;
-import com.yugabyte.yw.models.Provider;
 
 import play.Application;
 import play.Configuration;
 import play.Environment;
 import play.Logger;
-import play.libs.Yaml;
 
 import io.prometheus.client.hotspot.DefaultExports;
 
@@ -40,19 +37,22 @@ public class AppInit {
   @Inject
   public AppInit(Environment environment, Application application,
                  ConfigHelper configHelper, ReleaseManager releaseManager,
-                 AWSInitializer awsInitializer) {
+                 AWSInitializer awsInitializer, CustomerTaskManager taskManager,
+                 YamlWrapper yaml, ExtraMigrationManager extraMigrationManager,
+                 TaskGarbageCollector taskGC, PlatformReplicationManager replicationManager
+  ) throws ReflectiveOperationException {
     Logger.info("Yugaware Application has started");
     Configuration appConfig = application.configuration();
     String mode = appConfig.getString("yb.mode", "PLATFORM");
 
     if (!environment.isTest()) {
       // Check if we have provider data, if not, we need to seed the database
-      if (Customer.find.where().findRowCount() == 0 &&
+      if (Customer.find.query().where().findCount() == 0 &&
           appConfig.getBoolean("yb.seedData", false)) {
         Logger.debug("Seed the Yugaware DB");
 
-        List<?> all = (ArrayList<?>) Yaml.load(
-            application.resourceAsStream("db_seed.yml"),
+        List<?> all = yaml.load(
+            environment.resourceAsStream("db_seed.yml"),
             application.classloader()
         );
         Ebean.saveAll(all);
@@ -71,10 +71,10 @@ public class AppInit {
       }
 
       // TODO: Version added to Yugaware metadata, now slowly decomission SoftwareVersion property
-      Object version = Yaml.load(application.resourceAsStream("version.txt"),
+      String version = yaml.load(environment.resourceAsStream("version.txt"),
                                   application.classloader());
       configHelper.loadConfigToDB(SoftwareVersion, ImmutableMap.of("version", version));
-      Map <String, Object> ywMetadata = new HashMap<String, Object>();
+      Map <String, Object> ywMetadata = new HashMap<>();
       // Assign a new Yugaware UUID if not already present in the DB i.e. first install
       Object ywUUID = configHelper.getConfig(YugawareMetadata)
                                   .getOrDefault("yugaware_uuid", UUID.randomUUID());
@@ -83,13 +83,13 @@ public class AppInit {
       configHelper.loadConfigToDB(YugawareMetadata, ywMetadata);
 
       // Initialize AWS if any of its instance types have an empty volumeDetailsList
-      List<Provider> providerList = Provider.find.where().findList();
+      List<Provider> providerList = Provider.find.query().where().findList();
       for (Provider provider : providerList) {
         if (provider.code.equals("aws")) {
-          for (InstanceType instanceType : InstanceType.findByProvider(provider)) {
+          for (InstanceType instanceType : InstanceType.findByProvider(provider,
+            application.config())) {
             if (instanceType.instanceTypeDetails != null &&
-                (instanceType.instanceTypeDetails.volumeDetailsList == null ||
-                    instanceType.instanceTypeDetails.volumeDetailsList.isEmpty())) {
+              (instanceType.instanceTypeDetails.volumeDetailsList == null)) {
               awsInitializer.initialize(provider.customerUUID, provider.uuid);
               break;
             }
@@ -99,8 +99,8 @@ public class AppInit {
       }
 
       // Load metrics configurations.
-      Map<String, Object> configs = (HashMap<String, Object>) Yaml.load(
-          application.resourceAsStream("metrics.yml"),
+      Map<String, Object> configs = yaml.load(
+          environment.resourceAsStream("metrics.yml"),
           application.classloader()
       );
       MetricConfig.loadConfig(configs);
@@ -109,11 +109,28 @@ public class AppInit {
       // done as the other init steps may depend on this data.
       configHelper.loadConfigsToDB(application);
 
+      // Run and delete any extra migrations.
+      for (ExtraMigration m: ExtraMigration.getAll()) {
+        m.run(extraMigrationManager);
+      }
+
       // Import new local releases into release metadata
       releaseManager.importLocalReleases();
 
       // initialize prometheus exports
       DefaultExports.initialize();
+
+      // Fail incomplete tasks
+      taskManager.failAllPendingTasks();
+
+      // Schedule garbage collection of old completed tasks in database.
+      taskGC.start();
+
+      // Startup platform HA.
+      replicationManager.init();
+
+      // Add checksums for all certificates that don't have a checksum.
+      CertificateHelper.createChecksums();
 
       Logger.info("AppInit completed");
    }

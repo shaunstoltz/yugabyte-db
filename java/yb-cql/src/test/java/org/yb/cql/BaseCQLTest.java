@@ -52,7 +52,8 @@ import java.util.concurrent.atomic.AtomicLong;
 import java.util.stream.Collectors;
 
 public class BaseCQLTest extends BaseMiniClusterTest {
-  protected static final Logger LOG = LoggerFactory.getLogger(BaseCQLTest.class);
+
+  private static final Logger LOG = LoggerFactory.getLogger(BaseCQLTest.class);
 
   // Integer.MAX_VALUE seconds is the maximum allowed TTL by Cassandra.
   protected static final int MAX_TTL_SEC = Integer.MAX_VALUE;
@@ -71,6 +72,8 @@ public class BaseCQLTest extends BaseMiniClusterTest {
   // CQL and Redis settings.
   protected static boolean startCqlProxy = true;
   protected static boolean startRedisProxy = false;
+  protected static boolean systemQueryCacheEmptyResponses = false;
+  protected static int cqlClientTimeoutMs = 120 * 1000;
 
   protected Cluster cluster;
   protected Session session;
@@ -106,13 +109,24 @@ public class BaseCQLTest extends BaseMiniClusterTest {
     return Double.longBitsToDouble((sign << 63) | (exp << 52) | fraction);
   }
 
+  protected int systemQueryCacheMsecs() {
+    return 4000;
+  }
+
   protected Map<String, String> getTServerFlags() {
     Map<String, String> flagMap = new TreeMap<>();
 
     flagMap.put("start_cql_proxy", Boolean.toString(startCqlProxy));
     flagMap.put("start_redis_proxy", Boolean.toString(startRedisProxy));
+    flagMap.put("cql_update_system_query_cache_msecs", Integer.toString(systemQueryCacheMsecs()));
+    flagMap.put("cql_system_query_cache_empty_responses",
+        Boolean.toString(systemQueryCacheEmptyResponses));
 
     return flagMap;
+  }
+
+  protected Map<String, String> getMasterFlags() {
+    return new TreeMap<>();
   }
 
   @Override
@@ -121,7 +135,14 @@ public class BaseCQLTest extends BaseMiniClusterTest {
     for (Map.Entry<String, String> entry : getTServerFlags().entrySet()) {
       builder.addCommonTServerArgs("--" + entry.getKey() + "=" + entry.getValue());
     }
+    for (Map.Entry<String, String> entry : getMasterFlags().entrySet()) {
+      builder.addMasterArgs("--" + entry.getKey() + "=" + entry.getValue());
+    }
     builder.enablePostgres(false);
+    // Prevent YB server processes from closing connections which are idle for less than client
+    // timeout period.
+    builder.addCommonArgs(String.format(
+        "--rpc_default_keepalive_time_ms=%d", cqlClientTimeoutMs + 5000));
   }
 
   @BeforeClass
@@ -140,8 +161,8 @@ public class BaseCQLTest extends BaseMiniClusterTest {
     // Set a long timeout for CQL queries since build servers might be really slow (especially Mac
     // Mini).
     SocketOptions socketOptions = new SocketOptions();
-    socketOptions.setReadTimeoutMillis(120 * 1000);
-    socketOptions.setConnectTimeoutMillis(120 * 1000);
+    socketOptions.setReadTimeoutMillis(cqlClientTimeoutMs);
+    socketOptions.setConnectTimeoutMillis(cqlClientTimeoutMs);
     return Cluster.builder()
               .addContactPointsWithPorts(miniCluster.getCQLContactPoints())
               .withQueryOptions(queryOptions)
@@ -224,6 +245,7 @@ public class BaseCQLTest extends BaseMiniClusterTest {
   @After
   public void tearDownAfter() throws Exception {
     final String logPrefix = "BaseCQLTest.tearDownAfter: ";
+    LOG.info(logPrefix + "End test: " + getCurrentTestMethodName());
 
     if (miniCluster == null) {
       LOG.info(logPrefix + "mini cluster has been destroyed");
@@ -507,13 +529,16 @@ public class BaseCQLTest extends BaseMiniClusterTest {
     assertFalse(iter.hasNext());
   }
 
-  protected void assertQuery(Statement stmt, String expectedResult) {
-    ResultSet rs = session.execute(stmt);
-    String actualResult = "";
+  protected static String resultSetToString(ResultSet rs) {
+    String result = "";
     for (Row row : rs) {
-      actualResult += row.toString();
+      result += row.toString();
     }
-    assertEquals(expectedResult, actualResult);
+    return result;
+  }
+
+  protected void assertQuery(Statement stmt, String expectedResult) {
+    assertEquals(expectedResult, resultSetToString(session.execute(stmt)));
   }
 
   protected void assertQuery(String stmt, String expectedResult) {
@@ -523,11 +548,7 @@ public class BaseCQLTest extends BaseMiniClusterTest {
   protected void assertQuery(Statement stmt, String expectedColumns, String expectedResult) {
     ResultSet rs = session.execute(stmt);
     assertEquals(expectedColumns, rs.getColumnDefinitions().toString());
-    String actualResult = "";
-    for (Row row : rs) {
-      actualResult += row.toString();
-    }
-    assertEquals(expectedResult, actualResult);
+    assertEquals(expectedResult, resultSetToString(rs));
   }
 
   protected void assertQuery(String stmt, String expectedColumns, String expectedResult) {

@@ -31,22 +31,32 @@ namespace client {
 Status TableHandle::Create(const YBTableName& table_name,
                            int num_tablets,
                            YBClient* client,
-                           YBSchemaBuilder* builder) {
+                           YBSchemaBuilder* builder,
+                           IndexInfoPB* index_info) {
   YBSchema schema;
   RETURN_NOT_OK(builder->Build(&schema));
-  return Create(table_name, num_tablets, schema, client);
+  return Create(table_name, num_tablets, schema, client, index_info);
 }
 
 Status TableHandle::Create(const YBTableName& table_name,
                            int num_tablets,
                            const YBSchema& schema,
-                           YBClient* client) {
+                           YBClient* client,
+                           IndexInfoPB* index_info) {
   std::unique_ptr<YBTableCreator> table_creator(client->NewTableCreator());
-  RETURN_NOT_OK(table_creator->table_name(table_name)
+  table_creator->table_name(table_name)
       .schema(&schema)
-      .num_tablets(num_tablets)
-      .Create());
+      .num_tablets(num_tablets);
 
+  // Setup Index properties.
+  if (index_info) {
+    table_creator->indexed_table_id(index_info->indexed_table_id())
+        .is_local_index(index_info->is_local())
+        .is_unique_index(index_info->is_unique())
+        .mutable_index_info()->CopyFrom(*index_info);
+  }
+
+  RETURN_NOT_OK(table_creator->Create());
   return Open(table_name, client);
 }
 
@@ -61,6 +71,10 @@ Status TableHandle::Open(const YBTableName& table_name, YBClient* client) {
   }
 
   return Status::OK();
+}
+
+Status TableHandle::Reopen() {
+  return Open(name(), table_->client());
 }
 
 const YBTableName& TableHandle::name() const {
@@ -89,6 +103,7 @@ auto SetupRequest(const T& op, const YBSchema& schema) {
   req->set_request_id(0);
   req->set_query_id(reinterpret_cast<int64_t>(op.get()));
   req->set_schema_version(schema.version());
+  req->set_is_compatible_with_previous_version(schema.is_compatible_with_previous_version());
   return req;
 }
 
@@ -170,15 +185,21 @@ TableIterator::TableIterator() : table_(nullptr) {}
     if (!status.ok()) { HandleError(MoveStatus(status)); return; } \
   } while (false) \
 
+#define REPORT_AND_RETURN_FALSE_IF_NOT_OK(expr) \
+  do { \
+    auto&& status = (expr); \
+    if (!status.ok()) { HandleError(MoveStatus(status)); return false; } \
+  } while (false) \
+
 TableIterator::TableIterator(const TableHandle* table, const TableIteratorOptions& options)
     : table_(table), error_handler_(options.error_handler) {
   auto client = (*table)->client();
 
   session_ = client->NewSession();
-  session_->SetTimeout(60s);
 
   google::protobuf::RepeatedPtrField<master::TabletLocationsPB> tablets;
-  REPORT_AND_RETURN_IF_NOT_OK(client->GetTablets(table->name(), 0, &tablets));
+  REPORT_AND_RETURN_IF_NOT_OK(client->GetTablets(
+      table->name(), /* max_tablets = */ 0, &tablets, /* partition_list_version =*/nullptr));
   if (tablets.size() == 0) {
     table_ = nullptr;
     return;
@@ -213,18 +234,19 @@ TableIterator::TableIterator(const TableHandle* table, const TableIteratorOption
     partition_key_ends_.push_back(tablet.partition().partition_key_end());
   }
 
-  ExecuteOps();
-  Move();
+  if (ExecuteOps()) {
+    Move();
+  }
 }
 
-void TableIterator::ExecuteOps() {
+bool TableIterator::ExecuteOps() {
   constexpr size_t kMaxConcurrentOps = 5;
   const size_t new_executed_ops = std::min(ops_.size(), executed_ops_ + kMaxConcurrentOps);
   for (size_t i = executed_ops_; i != new_executed_ops; ++i) {
-    REPORT_AND_RETURN_IF_NOT_OK(session_->Apply(ops_[i]));
+    REPORT_AND_RETURN_FALSE_IF_NOT_OK(session_->Apply(ops_[i]));
   }
 
-  REPORT_AND_RETURN_IF_NOT_OK(session_->Flush());
+  REPORT_AND_RETURN_FALSE_IF_NOT_OK(session_->Flush());
 
   for (size_t i = executed_ops_; i != new_executed_ops; ++i) {
     const auto& op = ops_[i];
@@ -234,6 +256,7 @@ void TableIterator::ExecuteOps() {
   }
 
   executed_ops_ = new_executed_ops;
+  return true;
 }
 
 bool TableIterator::Equals(const TableIterator& rhs) const {
@@ -263,7 +286,10 @@ void TableIterator::Move() {
       } else {
         ++ops_index_;
         if (ops_index_ >= executed_ops_ && executed_ops_ < ops_.size()) {
-          ExecuteOps();
+          if (!ExecuteOps()) {
+            // Error occurred. exit out early.
+            return;
+          }
         }
       }
     }
@@ -291,7 +317,7 @@ void TableIterator::HandleError(const Status& status) {
   if (error_handler_) {
     error_handler_(status);
   } else {
-    CollectedErrors errors = session_->GetPendingErrors();
+    CollectedErrors errors = session_->GetAndClearPendingErrors();
     for (const auto& error : errors) {
       LOG(ERROR) << "Failed operation: " << error->failed_op().ToString()
                  << ", status: " << error->status();
@@ -299,6 +325,8 @@ void TableIterator::HandleError(const Status& status) {
 
     LOG(FATAL) << "Failed: " << status;
   }
+  // Makes this iterator == end().
+  table_ = nullptr;
 }
 
 template <>

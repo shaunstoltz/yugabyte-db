@@ -2,17 +2,15 @@
 
 package com.yugabyte.yw.controllers;
 
+import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.node.ObjectNode;
 import com.google.inject.Inject;
 import com.yugabyte.yw.commissioner.Commissioner;
+import com.yugabyte.yw.commissioner.tasks.DeleteBackup;
 import com.yugabyte.yw.common.ApiResponse;
 import com.yugabyte.yw.forms.BackupTableParams;
-import com.yugabyte.yw.models.Audit;
-import com.yugabyte.yw.models.Backup;
-import com.yugabyte.yw.models.Customer;
-import com.yugabyte.yw.models.CustomerConfig;
-import com.yugabyte.yw.models.CustomerTask;
-import com.yugabyte.yw.models.Universe;
+import com.yugabyte.yw.models.*;
+import com.yugabyte.yw.models.helpers.CommonUtils;
 import com.yugabyte.yw.models.helpers.TaskType;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -35,6 +33,32 @@ public class BackupsController extends AuthenticatedController {
 
   public Result list(UUID customerUUID, UUID universeUUID) {
     List<Backup> backups = Backup.fetchByUniverseUUID(customerUUID, universeUUID);
+    JsonNode custStorageLoc = CommonUtils.getNodeProperty(
+      Customer.get(customerUUID).getFeatures(),
+      "universes.details.backups.storageLocation"
+    );
+    boolean isStorageLocMasked = custStorageLoc != null && custStorageLoc.asText().equals("hidden");
+    if (!isStorageLocMasked) {
+      Users user = (Users) ctx().args.get("user");
+      JsonNode userStorageLoc = CommonUtils.getNodeProperty(
+        user.getFeatures(),
+        "universes.details.backups.storageLocation"
+      );
+      isStorageLocMasked = userStorageLoc != null && userStorageLoc.asText().equals("hidden");
+    }
+
+    // If either customer or user featureConfig has storageLocation hidden,
+    // mask the string in each backup
+    if (isStorageLocMasked) {
+      for (Backup backup : backups) {
+        BackupTableParams params = backup.getBackupInfo();
+        String loc = params.storageLocation;
+        if (!loc.isEmpty()) {
+          params.storageLocation = "**********";
+        }
+        backup.setBackupInfo(params);
+      }
+    }
     return ApiResponse.success(backups);
   }
 
@@ -44,9 +68,9 @@ public class BackupsController extends AuthenticatedController {
       String errMsg = "Invalid Customer UUID: " + customerUUID;
       return ApiResponse.error(BAD_REQUEST, errMsg);
     }
-
+    Universe universe;
     try {
-      Universe.get(universeUUID);
+      universe = Universe.get(universeUUID);
     } catch (RuntimeException re) {
       String errMsg = "Invalid Universe UUID: " + universeUUID;
       return ApiResponse.error(BAD_REQUEST, errMsg);
@@ -61,35 +85,115 @@ public class BackupsController extends AuthenticatedController {
     BackupTableParams taskParams = formData.get();
     // Since we hit the restore endpoint, lets default the action type to RESTORE
     taskParams.actionType = BackupTableParams.ActionType.RESTORE;
-    if (taskParams.storageLocation == null) {
+    if (taskParams.storageLocation == null && taskParams.backupList == null) {
       String errMsg = "Storage Location is required";
       return ApiResponse.error(BAD_REQUEST, errMsg);
     }
 
+    taskParams.universeUUID = universeUUID;
+
+    // Change the BackupTableParams in list to be "RESTORE" action type
+    if (taskParams.backupList != null) {
+      for (BackupTableParams subParams: taskParams.backupList) {
+        // Override default CREATE action type that we inherited from backup flow
+        subParams.actionType = BackupTableParams.ActionType.RESTORE;
+        // Assume no renaming of keyspaces or tables
+        subParams.tableUUIDList = null;
+        subParams.tableNameList = null;
+        subParams.tableUUID = null;
+        subParams.tableName = null;
+        subParams.keyspace = null;
+        subParams.universeUUID = universeUUID;
+        subParams.parallelism = taskParams.parallelism;;
+      }
+    }
     CustomerConfig storageConfig = CustomerConfig.get(customerUUID, taskParams.storageConfigUUID);
     if (storageConfig == null) {
       String errMsg = "Invalid StorageConfig UUID: " + taskParams.storageConfigUUID;
       return ApiResponse.error(BAD_REQUEST, errMsg);
     }
-    taskParams.universeUUID = universeUUID;
+    if (taskParams.tableName != null && taskParams.keyspace == null) {
+      String errMsg = "Restore table request must specify keyspace.";
+      return ApiResponse.error(BAD_REQUEST, errMsg);
+    }
 
     Backup newBackup = Backup.create(customerUUID, taskParams);
     UUID taskUUID = commissioner.submit(TaskType.BackupUniverse, taskParams);
     LOG.info("Submitted task to restore table backup to {}.{}, task uuid = {}.",
         taskParams.keyspace, taskParams.tableName, taskUUID);
     newBackup.setTaskUUID(taskUUID);
-    CustomerTask.create(customer,
+    if (taskParams.tableName != null) {
+      CustomerTask.create(customer,
         universeUUID,
         taskUUID,
         CustomerTask.TargetType.Backup,
         CustomerTask.TaskType.Restore,
         taskParams.tableName);
-    LOG.info("Saved task uuid {} in customer tasks table for table {}.{}", taskUUID,
+      LOG.info("Saved task uuid {} in customer tasks table for table {}.{}", taskUUID,
         taskParams.keyspace, taskParams.tableName);
+    } else if (taskParams.keyspace != null) {
+      CustomerTask.create(customer,
+        universeUUID,
+        taskUUID,
+        CustomerTask.TargetType.Backup,
+        CustomerTask.TaskType.Restore,
+        taskParams.keyspace);
+      LOG.info("Saved task uuid {} in customer tasks table for keyspace {}", taskUUID,
+        taskParams.keyspace);
+    } else {
+      CustomerTask.create(customer,
+        universeUUID,
+        taskUUID,
+        CustomerTask.TargetType.Backup,
+        CustomerTask.TaskType.Restore,
+        universe.name);
+      if (taskParams.backupList != null) {
+        LOG.info("Saved task uuid {} in customer tasks table for universe backup {}", taskUUID,
+          universe.name);
+      } else {
+        LOG.info("Saved task uuid {} in customer tasks table for restore identical " +
+                 "keyspace & tables in universe {}", taskUUID,
+                 universe.name);
+      }
+    }
 
     ObjectNode resultNode = Json.newObject();
     resultNode.put("taskUUID", taskUUID.toString());
     Audit.createAuditEntry(ctx(), request(), Json.toJson(formData.data()), taskUUID);
+    return ApiResponse.success(resultNode);
+  }
+
+  public Result delete(UUID customerUUID, UUID backupUUID) {
+    Customer customer = Customer.get(customerUUID);
+    if (customer == null) {
+      String errMsg = "Invalid Customer UUID: " + customerUUID;
+      return ApiResponse.error(BAD_REQUEST, errMsg);
+    }
+    Backup backup = Backup.get(customerUUID, backupUUID);
+    if (backup == null) {
+      String errMsg = "Invalid Backup UUID: " + customerUUID;
+      return ApiResponse.error(BAD_REQUEST, errMsg);
+    }
+    if (backup.state != Backup.BackupState.Completed) {
+      String errMsg = String.format("Cannot delete backup %s since it hasn't been completed",
+                                    backupUUID.toString());
+      return ApiResponse.error(BAD_REQUEST, errMsg);
+    }
+    DeleteBackup.Params taskParams = new DeleteBackup.Params();
+    taskParams.customerUUID = customerUUID;
+    taskParams.backupUUID = backupUUID;
+    UUID taskUUID = commissioner.submit(TaskType.DeleteBackup, taskParams);
+    LOG.info("Saved task uuid {} in customer tasks for backup {}.",
+             taskUUID, backupUUID);
+    CustomerTask.create(customer,
+        backupUUID,
+        taskUUID,
+        CustomerTask.TargetType.Backup,
+        CustomerTask.TaskType.Delete,
+        "Backup");
+    ObjectNode resultNode = Json.newObject();
+    resultNode.put("taskUUID", taskUUID.toString());
+    Audit.createAuditEntry(ctx(), request(), taskUUID);
     return ApiResponse.success(resultNode);
   }
 }

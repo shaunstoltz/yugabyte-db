@@ -22,27 +22,38 @@ import platform
 import shutil
 import subprocess
 import logging
+import shlex
 
 from collections import namedtuple
 
 
-ProgramResult = namedtuple('ProgramResult',
-                           ['cmd_line',
-                            'returncode',
-                            'stdout',
-                            'stderr',
-                            'error_msg',
-                            'program_path'])
+class ProgramResult:
+    def __init__(
+            self,
+            cmd_line,
+            returncode,
+            stdout,
+            stderr,
+            error_msg,
+            program_path):
+        self.cmd_line = cmd_line
+        self.returncode = returncode
+        self.stdout = stdout
+        self.stderr = stderr
+        self.error_msg = error_msg
+        self.program_path = program_path
 
 
 def trim_output(output, max_lines):
+    if isinstance(output, bytes):
+        output = output.decode('utf-8')
     lines = output.split("\n")
     if len(lines) <= max_lines:
         return output
     return "\n".join(lines[:max_lines] + ['({} lines skipped)'.format(len(lines) - max_lines)])
 
 
-def run_program(args, error_ok=False, max_error_lines=100, cwd=None):
+def run_program(args, error_ok=False, max_error_lines=100, cwd=None, log_command=False):
     """
     Run the given program identified by its argument list, and return a ProgramResult object.
 
@@ -50,6 +61,8 @@ def run_program(args, error_ok=False, max_error_lines=100, cwd=None):
     """
     if not isinstance(args, list):
         args = [args]
+    if log_command:
+        logging.info("Running command: %s", args)
     try:
         program_subprocess = subprocess.Popen(
             args,
@@ -70,12 +83,14 @@ def run_program(args, error_ok=False, max_error_lines=100, cwd=None):
                 trim_output(program_stderr.strip(), max_error_lines))
         if not error_ok:
             raise RuntimeError(error_msg)
-    return ProgramResult(cmd_line=args,
-                         program_path=os.path.realpath(args[0]),
-                         returncode=program_subprocess.returncode,
-                         stdout=program_stdout.strip(),
-                         stderr=program_stderr.strip(),
-                         error_msg=error_msg)
+    return ProgramResult(
+        cmd_line=args,
+        returncode=program_subprocess.returncode,
+        stdout=program_stdout.strip().decode('utf-8'),
+        stderr=program_stderr.strip().decode('utf-8'),
+        error_msg=error_msg,
+        program_path=os.path.realpath(args[0])
+    )
 
 
 def mkdir_p(d):
@@ -87,7 +102,7 @@ def mkdir_p(d):
         return
     try:
         os.makedirs(d)
-    except OSError, e:
+    except OSError as e:
         if os.path.isdir(d):
             return
         raise e

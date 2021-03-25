@@ -81,8 +81,8 @@ YB_DEFINE_ENUM(
     (kTransactionPrepare) // Preparing associated transaction for flushing operations of this
                           // batcher, for instance it picks status tablet and fills
                           // transaction metadata for this batcher.
-                          // When there is no associated transaction move to the next state
-                          // immediately.
+                          // When there is no associated transaction or no operations moves to the
+                          // next state immediately.
     (kTransactionReady)   // Transaction is ready, sending operations to appropriate tablets and
                           // wait for response. When there is no transaction - we still sending
                           // operations marking transaction as auto ready.
@@ -166,14 +166,14 @@ class Batcher : public RefCountedThreadSafe<Batcher> {
     force_consistent_read_ = value;
   }
 
-  void WriteWithHybridTime(HybridTime ht) {
-    write_with_hybrid_time_ = ht;
+  void SetHybridTimeForWrite(const HybridTime ht) {
+    hybrid_time_for_write_ = ht;
   }
 
   YBTransactionPtr transaction() const;
 
   const TransactionMetadata& transaction_metadata() const {
-    return transaction_metadata_;
+    return ops_info_.metadata;
   }
 
   void set_allow_local_calls_in_curr_thread(bool flag) { allow_local_calls_in_curr_thread_ = flag; }
@@ -193,6 +193,8 @@ class Batcher : public RefCountedThreadSafe<Batcher> {
   }
 
   double RejectionScore(int attempt_num);
+
+  std::string LogPrefix() const;
 
   // This is a status error string used when there are multiple errors that need to be fetched
   // from the error collector.
@@ -229,7 +231,7 @@ class Batcher : public RefCountedThreadSafe<Batcher> {
   void CheckForFinishedFlush();
   void FlushBuffersIfReady();
   std::shared_ptr<AsyncRpc> CreateRpc(
-      RemoteTablet* tablet, InFlightOps::const_iterator begin, InFlightOps::const_iterator end,
+      RemoteTablet* tablet, const InFlightOpsGroup& group,
       bool allow_local_calls_in_curr_thread, bool need_consistent_read);
 
   // Calls/Schedules flush_callback_ and resets it to free resources.
@@ -247,7 +249,7 @@ class Batcher : public RefCountedThreadSafe<Batcher> {
   void ProcessRpcStatus(const AsyncRpc &rpc, const Status &s);
 
   // Async Callbacks.
-  void TabletLookupFinished(InFlightOpPtr op, const Result<internal::RemoteTabletPtr>& result);
+  void TabletLookupFinished(InFlightOpPtr op, Result<internal::RemoteTabletPtr> result);
 
   // Compute a new deadline based on timeout_. If no timeout_ has been set,
   // uses a hard-coded default and issues periodic warnings.
@@ -257,6 +259,8 @@ class Batcher : public RefCountedThreadSafe<Batcher> {
 
   // initial - whether this method is called first time for this batch.
   void ExecuteOperations(Initial initial);
+
+  BatcherState state() const;
 
   // See note about lock ordering in batcher.cc
   mutable simple_spinlock mutex_;
@@ -281,8 +285,9 @@ class Batcher : public RefCountedThreadSafe<Batcher> {
 
   // All buffered or in-flight ops.
   // Added to this set during apply, removed during Finished of AsyncRpc.
-  std::unordered_set<InFlightOpPtr> ops_;
+  std::unordered_set<InFlightOpPtr> ops_ GUARDED_BY(mutex_);
   InFlightOps ops_queue_;
+  InFlightOpsGroupsWithMetadata ops_info_;
 
   // When each operation is added to the batcher, it is assigned a sequence number
   // which preserves the user's intended order. Preserving order is critical when
@@ -308,13 +313,11 @@ class Batcher : public RefCountedThreadSafe<Batcher> {
 
   YBTransactionPtr transaction_;
 
-  TransactionMetadata transaction_metadata_;
-
   // The consistent read point for this batch if it is specified.
   ConsistentReadPoint* read_point_ = nullptr;
 
   // Used for backfilling at a historic timestamp.
-  HybridTime write_with_hybrid_time_ = HybridTime::kInvalid;
+  HybridTime hybrid_time_for_write_ = HybridTime::kInvalid;
 
   // Force consistent read on transactional table, even we have only single shard commands.
   ForceConsistentRead force_consistent_read_;

@@ -43,8 +43,10 @@ using docdb::TableTTL;
 using docdb::HistoryRetentionDirective;
 
 TabletRetentionPolicy::TabletRetentionPolicy(
-    server::ClockPtr clock, const RaftGroupMetadata* metadata)
-    : clock_(std::move(clock)), metadata_(*metadata), log_prefix_(metadata->LogPrefix()) {
+    server::ClockPtr clock, const AllowedHistoryCutoffProvider& allowed_history_cutoff_provider,
+    const RaftGroupMetadata* metadata)
+    : clock_(std::move(clock)), allowed_history_cutoff_provider_(allowed_history_cutoff_provider),
+      metadata_(*metadata), log_prefix_(metadata->LogPrefix()) {
 }
 
 HybridTime TabletRetentionPolicy::UpdateCommittedHistoryCutoff(HybridTime value) {
@@ -72,14 +74,14 @@ HistoryRetentionDirective TabletRetentionPolicy::GetRetentionDirective() {
   }
 
   std::shared_ptr<ColumnIds> deleted_before_history_cutoff = std::make_shared<ColumnIds>();
-  for (const auto& deleted_col : metadata_.deleted_cols()) {
+  for (const auto& deleted_col : *metadata_.deleted_cols()) {
     if (deleted_col.ht < history_cutoff) {
       deleted_before_history_cutoff->insert(deleted_col.id);
     }
   }
 
   return {history_cutoff, std::move(deleted_before_history_cutoff),
-          TableTTL(metadata_.schema()),
+          TableTTL(*metadata_.schema()),
           docdb::ShouldRetainDeleteMarkersInMajorCompaction(
               ShouldRetainDeleteMarkersInMajorCompaction())};
 }
@@ -108,7 +110,7 @@ void TabletRetentionPolicy::UnregisterReaderTimestamp(HybridTime timestamp) {
 bool TabletRetentionPolicy::ShouldRetainDeleteMarkersInMajorCompaction() const {
   // If the index table is in the process of being backfilled, then we
   // want to retain delete markers until the backfill process is complete.
-  return !metadata_.schema().table_properties().IsBackfilling();
+  return metadata_.schema()->table_properties().retain_delete_markers();
 }
 
 HybridTime TabletRetentionPolicy::HistoryCutoffToPropagate(HybridTime last_write_ht) {
@@ -119,8 +121,8 @@ HybridTime TabletRetentionPolicy::HistoryCutoffToPropagate(HybridTime last_write
   VLOG_WITH_PREFIX(4) << __func__ << "(" << last_write_ht << "), left to wait: "
                       << MonoDelta(next_history_cutoff_propagation_ - now);
 
-  if (!FLAGS_enable_history_cutoff_propagation || now < next_history_cutoff_propagation_ ||
-      last_write_ht <= committed_history_cutoff_) {
+  if (disable_counter_ != 0 || !FLAGS_enable_history_cutoff_propagation ||
+      now < next_history_cutoff_propagation_ || last_write_ht <= committed_history_cutoff_) {
     return HybridTime();
   }
 
@@ -147,10 +149,27 @@ HybridTime TabletRetentionPolicy::SanitizeHistoryCutoff(HybridTime proposed_cuto
     allowed_cutoff = std::min(proposed_cutoff, *active_readers_.begin());
   }
 
-  VLOG_WITH_PREFIX(4) << __func__ << ", result: " << allowed_cutoff << ", active readers: "
-                      << active_readers_.size();
+  HybridTime provided_allowed_cutoff;
+  if (allowed_history_cutoff_provider_) {
+    provided_allowed_cutoff = allowed_history_cutoff_provider_(metadata_);
+    allowed_cutoff = std::min(provided_allowed_cutoff, allowed_cutoff);
+  }
+
+  VLOG_WITH_PREFIX(4) << __func__ << ", result: " << allowed_cutoff
+                      << ", active readers: " << active_readers_.size()
+                      << ", provided_allowed_cutoff: " << provided_allowed_cutoff
+                      << ", schedules: " << AsString(metadata_.SnapshotSchedules());
 
   return allowed_cutoff;
+}
+
+void TabletRetentionPolicy::EnableHistoryCutoffPropagation(bool value) {
+  std::lock_guard<std::mutex> lock(mutex_);
+  if (value) {
+    --disable_counter_;
+  } else {
+    ++disable_counter_;
+  }
 }
 
 }  // namespace tablet

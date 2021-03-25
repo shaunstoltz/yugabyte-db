@@ -100,6 +100,9 @@ class QLRowBlock {
   // Extend row block by 1 emtpy row and return the new row.
   QLRow& Extend();
 
+  // Optimization to reserve memory for up to this many rows.
+  void Reserve(size_t size);
+
   // Add a row to the rowblock.
   CHECKED_STATUS AddRow(const QLRow& row);
 
@@ -123,7 +126,7 @@ class QLRowBlock {
 
  private:
   // Schema of the selected columns. (Note: this schema has no key column definitions)
-  std::shared_ptr<Schema> schema_;
+  SchemaPtr schema_;
   // Rows in this block.
   std::vector<QLRow> rows_;
 };

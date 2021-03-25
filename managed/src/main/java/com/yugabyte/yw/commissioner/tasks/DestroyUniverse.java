@@ -14,13 +14,18 @@ import com.yugabyte.yw.forms.UniverseTaskParams;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
+import com.yugabyte.yw.commissioner.Common.CloudType;
 import com.yugabyte.yw.commissioner.SubTaskGroup;
 import com.yugabyte.yw.commissioner.SubTaskGroupQueue;
 import com.yugabyte.yw.commissioner.UserTaskDetails.SubTaskGroupType;
 import com.yugabyte.yw.commissioner.tasks.subtasks.RemoveUniverseEntry;
+import com.yugabyte.yw.common.AlertManager;
 import com.yugabyte.yw.common.DnsManager;
 import com.yugabyte.yw.forms.UniverseDefinitionTaskParams.Cluster;
 import com.yugabyte.yw.models.Universe;
+
+import play.api.Play;
+
 import java.util.UUID;
 
 public class DestroyUniverse extends UniverseTaskBase {
@@ -45,9 +50,9 @@ public class DestroyUniverse extends UniverseTaskBase {
       // to prevent other updates from happening.
       Universe universe = null;
       if (params().isForceDelete) {
-        universe = forceLockUniverseForUpdate(-1);
+        universe = forceLockUniverseForUpdate(-1, true);
       } else {
-        universe = lockUniverseForUpdate(-1 /* expectedUniverseVersion */);
+        universe = lockUniverseForUpdate(-1 , true);
       }
 
       // Cleanup the kms_history table
@@ -62,9 +67,20 @@ public class DestroyUniverse extends UniverseTaskBase {
                                   primaryCluster.userIntent.universeName)
             .setSubTaskGroupType(SubTaskGroupType.RemovingUnusedServers);
 
+        if (primaryCluster.userIntent.providerType.equals(CloudType.onprem)) {
+          // Stop master and tservers.
+          createStopServerTasks(universe.getNodes(), "master", params().isForceDelete)
+              .setSubTaskGroupType(SubTaskGroupType.StoppingNodeProcesses);
+          createStopServerTasks(universe.getNodes(), "tserver", params().isForceDelete)
+              .setSubTaskGroupType(SubTaskGroupType.StoppingNodeProcesses);
+        }
+
         // Create tasks to destroy the existing nodes.
-        createDestroyServerTasks(universe.getNodes(), params().isForceDelete, true)
-            .setSubTaskGroupType(SubTaskGroupType.RemovingUnusedServers);
+        createDestroyServerTasks(
+          universe.getNodes(),
+          params().isForceDelete,
+          true /* delete node */
+        ).setSubTaskGroupType(SubTaskGroupType.RemovingUnusedServers);
       }
 
       // Create tasks to remove the universe entry from the Universe table.
@@ -76,6 +92,10 @@ public class DestroyUniverse extends UniverseTaskBase {
 
       // Run all the tasks.
       subTaskGroupQueue.run();
+
+      AlertManager alertManager = Play.current().injector().instanceOf(AlertManager.class);
+      alertManager.resolveAlerts(params().customerUUID, params().universeUUID, "%");
+
     } catch (Throwable t) {
       // If for any reason destroy fails we would just unlock the universe for update
       try {

@@ -1,6 +1,6 @@
 --
 -- ALTER_TABLE
--- add, rename, drop attribute
+-- add, rename, drop, alter type of attribute
 --
 
 CREATE TABLE tmp (initial int4);
@@ -154,6 +154,31 @@ select * from atacc1;
 
 drop table atacc1;
 
+-- test dropping primary key constraints
+CREATE TABLE with_simple_pk_i (i int PRIMARY KEY);
+ALTER TABLE with_simple_pk_i DROP CONSTRAINT with_simple_pk_i_pkey;
+INSERT INTO with_simple_pk_i VALUES (1);
+INSERT INTO with_simple_pk_i VALUES (1);
+DROP TABLE with_simple_pk_i;
+--
+CREATE TABLE with_simple_pk_ij (i int, j int, PRIMARY KEY(i, j));
+ALTER TABLE with_simple_pk_ij DROP CONSTRAINT with_simple_pk_ij_pkey;
+INSERT INTO with_simple_pk_ij VALUES (1, 1);
+INSERT INTO with_simple_pk_ij VALUES (1, 1);
+DROP TABLE with_simple_pk_ij;
+--
+CREATE TABLE with_named_pk_i (i int CONSTRAINT named_pk_i PRIMARY KEY);
+ALTER TABLE with_named_pk_i DROP CONSTRAINT named_pk_i;
+INSERT INTO with_named_pk_i VALUES (1);
+INSERT INTO with_named_pk_i VALUES (1);
+DROP TABLE with_named_pk_i;
+--
+CREATE TABLE with_named_pk_ij (i int, j int, CONSTRAINT named_pk_ij PRIMARY KEY (i HASH, j ASC));
+ALTER TABLE with_named_pk_ij DROP CONSTRAINT named_pk_ij;
+INSERT INTO with_named_pk_ij VALUES (1, 1);
+INSERT INTO with_named_pk_ij VALUES (1, 1);
+DROP TABLE with_named_pk_ij;
+
 --
 -- rename
 --
@@ -250,6 +275,15 @@ drop rule def_view_test_ins on def_view_test;
 drop view def_view_test;
 drop table def_test;
 
+-- test CREATE or REPLACE VIEW
+create or replace view v as select 17 as c1;
+select * from v;
+create or replace view v as select 42 as c1;
+select * from v;
+create or replace view v as select 11 as
+	c1, 12 AS c2, 13 AS c3; -- testing replace/alter view by adding columns
+select * from v;
+drop view v;
 -- test ADD COLUMN IF NOT EXISTS
 CREATE TABLE test_add_column(c1 integer);
 \d test_add_column
@@ -355,3 +389,83 @@ delete from test_delete_dropped where a = 1 returning *;
 \d test_delete_dropped;
 select * from test_delete_dropped;
 DROP TABLE test_delete_dropped;
+
+-- Test ALTER TABLE _ ALTER COLUMN _ TYPE _
+create table test_alter_column_type(a varchar(1));
+alter table test_alter_column_type add column b name;
+alter table test_alter_column_type add column c text;
+alter table test_alter_column_type add column d char(1);
+alter table test_alter_column_type add column e varbit(1);
+alter table test_alter_column_type add column f int;
+alter table test_alter_column_type add column g varchar;
+alter table test_alter_column_type add column h varbit;
+insert into test_alter_column_type values ('a', 'b', 'c', 'd', B'1', 1, 'g', B'1');
+select * from test_alter_column_type;
+\d test_alter_column_type
+
+alter table test_alter_column_type alter column a type varchar(1);
+alter table test_alter_column_type alter column a type varchar(5);
+alter table test_alter_column_type alter column a type varchar(1); --fails
+alter table test_alter_column_type alter column a type char(10); --fails
+
+alter table test_alter_column_type alter column b type name;
+alter table test_alter_column_type alter column b type varchar(100); --fails
+
+alter table test_alter_column_type alter column c type text;
+alter table test_alter_column_type alter column c type varchar(100); --fails
+
+alter table test_alter_column_type alter column d type char(1);
+alter table test_alter_column_type alter column d type varchar(100); --fails
+alter table test_alter_column_type alter column d type char(100); --fails
+
+alter table test_alter_column_type alter column e type varbit(1);
+alter table test_alter_column_type alter column e type varbit(5);
+alter table test_alter_column_type alter column e type varbit(1); --fails
+
+alter table test_alter_column_type alter column f type varchar(100); --fails
+alter table test_alter_column_type alter column f type varbit(100); --fails
+alter table test_alter_column_type alter column f type int;
+
+alter table test_alter_column_type alter column g type varchar;
+alter table test_alter_column_type alter column g type varchar(5); --fails
+alter table test_alter_column_type alter column g type text; --fails
+
+alter table test_alter_column_type alter column h type varbit;
+alter table test_alter_column_type alter column h type varbit(5); --fails
+
+insert into test_alter_column_type values ('abcde', '-', '-', '-', B'10101', 0, '-', B'0');
+
+select * from test_alter_column_type order by a;
+\d test_alter_column_type
+
+alter table test_alter_column_type alter column a type varchar;
+alter table test_alter_column_type alter column e type varbit;
+
+\d test_alter_column_type
+
+DROP TABLE test_alter_column_type;
+
+
+-- Test ALTER TABLE _ ALTER COLUMN _ TYPE _ with an index (Issue #6113)
+create table test_alter_column_type_with_index(i int primary key, a varchar(50));
+
+alter table test_alter_column_type_with_index alter column a type varchar(100);
+insert into test_alter_column_type_with_index values (1, 'abcde'), (2, 'fghij');
+
+create index on test_alter_column_type_with_index(a);
+
+alter table test_alter_column_type_with_index alter column a type varchar(100);
+alter table test_alter_column_type_with_index alter column a type varchar(200);
+
+insert into test_alter_column_type_with_index values (3, 'klmno'), (4, 'pqrst');
+select * from test_alter_column_type_with_index order by a;
+\d test_alter_column_type_with_index
+
+DROP TABLE test_alter_column_type_with_index;
+-- Test #5543 by exercising cases where ALTER command fails due to constraint
+-- check validation, causing rollback of ALTER operation on DocDB.
+CREATE TABLE foobar (key text, value text);
+INSERT INTO foobar VALUES ('key', 'value');
+ALTER TABLE foobar ADD COLUMN v2 text not null; -- fails due to not null constraint
+ALTER TABLE foobar ADD COLUMN v2 text not null DEFAULT 'abc'; -- passes
+DROP TABLE foobar;

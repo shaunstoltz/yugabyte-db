@@ -90,6 +90,10 @@ extern void PrepareThreadLocalCurrentMemoryContext();
 
 extern void ResetThreadLocalCurrentMemoryContext();
 
+extern void DeleteThreadLocalCurrentMemoryContext();
+
+struct PgMemctx *GetCurrentYbMemctx();
+
 /*
  * Flags for MemoryContextAllocExtended.
  */

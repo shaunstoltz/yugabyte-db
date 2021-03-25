@@ -51,6 +51,7 @@
 #include <boost/thread/shared_mutex.hpp>
 #include "yb/server/webserver_options.h"
 #include "yb/util/net/sockaddr.h"
+#include "yb/util/net/net_util.h"
 #include "yb/util/status.h"
 #include "yb/util/web_callback_registry.h"
 
@@ -80,6 +81,9 @@ class Webserver : public WebCallbackRegistry {
   // Return the addresses that this server has successfully
   // bound to. Requires that the server has been Start()ed.
   CHECKED_STATUS GetBoundAddresses(std::vector<Endpoint>* addrs) const;
+
+  // Return the single HostPort that this server was asked to bind on
+  CHECKED_STATUS GetInputHostPort(HostPort* hp) const;
 
   virtual void RegisterPathHandler(const std::string& path, const std::string& alias,
                                    const PathHandlerCallback& callback,
@@ -142,6 +146,9 @@ class Webserver : public WebCallbackRegistry {
   // BootstrapPageHeader.
   void BootstrapPageFooter(std::stringstream* output);
 
+  static void EnterWorkerThreadCallbackStatic();
+  static void LeaveWorkerThreadCallbackStatic();
+
   // Dispatch point for all incoming requests.
   // Static so that it can act as a function pointer, and then call the next method
   static int BeginRequestCallbackStatic(struct sq_connection* connection);
@@ -157,7 +164,7 @@ class Webserver : public WebCallbackRegistry {
                                       const char* message);
 
   // Registered to handle "/", and prints a list of available URIs
-  void RootHandler(const WebRequest& args, std::stringstream* output);
+  void RootHandler(const WebRequest& args, Webserver::WebResponse* resp);
 
   // Builds a map of argument name to argument value from a typical URL argument
   // string (that is, "key1=value1&key2=value2.."). If no value is given for a

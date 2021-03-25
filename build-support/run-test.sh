@@ -60,6 +60,7 @@ cleanup() {
     touch "$YB_COMPLETED_TEST_FLAG_DIR/$YB_TEST_INVOCATION_ID"
   fi
   if [[ $exit_code -eq 0 ]] && "$killed_stuck_processes"; then
+    log "Failing test because we had to kill stuck process."
     exit_code=1
   fi
   rm -rf "$TEST_TMPDIR"
@@ -72,6 +73,8 @@ if [[ ${YB_DEBUG_RUN_TEST:-} == "1" ]]; then
   set -x
 fi
 
+# This must be set before including common-build-env.sh as it will set this variable to false by
+# default.
 is_run_test_script=true
 
 . "${BASH_SOURCE%/*}/common-build-env.sh"
@@ -112,7 +115,7 @@ if [[ -z ${BUILD_ROOT:-} ]]; then
   handle_build_root_from_current_dir
 fi
 
-yb_ninja_not_needed=true
+yb_ninja_executable_not_needed=true
 if [[ -z ${BUILD_ROOT:-} ]]; then
   set_build_root
 else
@@ -129,7 +132,7 @@ fi
 
 find_or_download_thirdparty
 log_thirdparty_and_toolchain_details
-detect_brew
+detect_toolchain
 
 set_common_test_paths
 add_brew_bin_to_path
@@ -278,7 +281,7 @@ fi
 for test_descriptor in "${tests[@]}"; do
   for (( test_attempt=$min_test_attempt_index;
          test_attempt <= $max_test_attempt_index;
-         test_attempt++ )); do
+         test_attempt+=1 )); do
     if [[ $max_test_attempt_index -gt 1 ]]; then
       log "Starting test attempt $test_attempt ($test_descriptor)"
       test_attempt_index=$test_attempt

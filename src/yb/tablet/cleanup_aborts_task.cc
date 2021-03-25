@@ -54,12 +54,13 @@ void CleanupAbortsTask::Run() {
   // Wait for the propagated time to reach the current hybrid time.
   const MonoDelta kMaxTotalSleep = 10s;
   auto safetime = applier_->ApplierSafeTime(now, CoarseMonoClock::now() + kMaxTotalSleep);
-  if (!safetime) {
-    LOG_WITH_PREFIX(WARNING) << "Tablet application did not catch up in: " << kMaxTotalSleep;
+  if (!safetime.ok()) {
+    LOG_WITH_PREFIX(WARNING) << "Tablet application did not catch up in " << kMaxTotalSleep << ": "
+                             << safetime.status();
     return;
   }
 
-  for (const TransactionId transaction_id : transactions_to_cleanup_) {
+  for (const TransactionId& transaction_id : transactions_to_cleanup_) {
     // If transaction is committed, no action required
     // TODO(dtxn) : Do batch processing of transactions,
     // because LocalCommitTime will acquire lock per each call.

@@ -293,8 +293,8 @@ SELECT * FROM temptest;
 ERROR:  relation "temptest" does not exist
 LINE 1: SELECT * FROM temptest;
                       ^
--- Sleep a second as a wokaround due to bug github #1469.
-SELECT pg_sleep(1);
+-- Sleep a second as a workaround due to bug github #1469.
+SELECT pg_sleep(10);
  pg_sleep
 ----------
 
@@ -313,8 +313,8 @@ SELECT * FROM temptest;
 ERROR:  relation "temptest" does not exist
 LINE 1: SELECT * FROM temptest;
                       ^
--- Sleep a second as a wokaround due to bug github #1469.
-SELECT pg_sleep(1);
+-- Sleep a second as a workaround due to bug github #1469.
+SELECT pg_sleep(10);
  pg_sleep
 ----------
 
@@ -362,6 +362,12 @@ SELECT * FROM temptest WHERE k IN (1, 4) ORDER BY k;
  1 |  0 |  3
 (1 row)
 
+-- test temp table primary key duplicate error.
+INSERT INTO temptest VALUES (100, 200, 300);
+INSERT INTO temptest VALUES (100, 200, 300);
+ERROR:  duplicate key value violates unique constraint "temptest_pkey"
+DETAIL:  Key (k)=(100) already exists.
+INSERT INTO temptest VALUES (101, 201, 301), (101, 201, 301);
+ERROR:  duplicate key value violates unique constraint "temptest_pkey"
+DETAIL:  Key (k)=(101) already exists.
 DROP TABLE temptest;
--- TODO(jason): remove when issue #1721 is closed or closing.
-DISCARD TEMP;

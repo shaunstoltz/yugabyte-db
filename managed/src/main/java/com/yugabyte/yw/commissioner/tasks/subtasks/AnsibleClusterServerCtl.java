@@ -12,6 +12,7 @@ package com.yugabyte.yw.commissioner.tasks.subtasks;
 
 import com.yugabyte.yw.common.NodeManager;
 import com.yugabyte.yw.common.ShellProcessHandler;
+import com.yugabyte.yw.common.ShellResponse;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -25,6 +26,7 @@ public class AnsibleClusterServerCtl extends NodeTaskBase {
     public String process;
     public String command;
     public int sleepAfterCmdMills = 0;
+    public boolean isForceDelete = false;
   }
 
   @Override
@@ -40,10 +42,18 @@ public class AnsibleClusterServerCtl extends NodeTaskBase {
 
   @Override
   public void run() {
-    // Execute the ansible command.
-    ShellProcessHandler.ShellResponse response = getNodeManager().nodeCommand(
-        NodeManager.NodeCommandType.Control, taskParams());
-    logShellResponse(response);
+    try {
+      // Execute the ansible command.
+      ShellResponse response = getNodeManager().nodeCommand(
+          NodeManager.NodeCommandType.Control, taskParams());
+      processShellResponse(response);
+    } catch (Exception e) {
+      if (!taskParams().isForceDelete) {
+        throw e;
+      } else {
+        LOG.debug("Ignoring error: {}", e.getMessage());
+      }
+    }
 
     if (taskParams().sleepAfterCmdMills > 0) {
       try {

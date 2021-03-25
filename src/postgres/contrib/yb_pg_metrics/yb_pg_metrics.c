@@ -51,14 +51,42 @@ typedef enum statementType
 	Insert,
 	Delete,
 	Update,
+	Begin,
+	Commit,
+	Rollback,
 	Other,
+	Single_Shard_Transaction,
 	Transaction,
 	AggregatePushdown,
 	kMaxStatementType
 } statementType;
 int num_entries = kMaxStatementType;
 ybpgmEntry *ybpgm_table = NULL;
+
+/* Statement nesting level is used when setting up dml statements.
+ * - Some state variables are set up for the top-level query but not the nested query.
+ * - Time recorder is initialized and used for top-level query only.
+ */
 static int statement_nesting_level = 0;
+
+/* Block nesting level is used when setting up execution block such as "DO $$ ... END $$;".
+ * - Some state variables are set up for the top level block but not the nested blocks.
+ */
+static int block_nesting_level = 0;
+
+/*
+ * Flag to determine whether a transaction block has been entered.
+ */
+static bool is_inside_transaction_block = false;
+
+/*
+ * Flag to determine whether a DML or Other statement type has been executed.
+ * Multiple statements will count as a single transaction within a transaction block.
+ * DDL statements which are autonomous will be counted as its own transaction
+ * even within a transaction block.
+ */
+static bool is_statement_executed = false;
+
 char *metric_node_name = NULL;
 struct WebserverWrapper *webserver = NULL;
 int port = 0;
@@ -91,7 +119,7 @@ static void ybpgm_ProcessUtility(PlannedStmt *pstmt, const char *queryString,
                                  ProcessUtilityContext context,
                                  ParamListInfo params, QueryEnvironment *queryEnv,
                                  DestReceiver *dest, char *completionTag);
-static void ybpgm_Store();
+static void ybpgm_Store(statementType type, uint64_t time, uint64_t rows);
 
 /*
  * Function used for checking if the current statement is a top level statement.
@@ -102,6 +130,36 @@ isTopLevelStatement(void)
   return statement_nesting_level == 0;
 }
 
+static void
+IncStatementNestingLevel(void)
+{
+  statement_nesting_level++;
+}
+
+static void
+DecStatementNestingLevel(void)
+{
+  statement_nesting_level--;
+}
+
+bool
+isTopLevelBlock(void)
+{
+  return block_nesting_level == 0;
+}
+
+static void
+IncBlockNestingLevel(void)
+{
+  block_nesting_level++;
+}
+
+static void
+DecBlockNestingLevel(void)
+{
+  block_nesting_level--;
+}
+
 void
 set_metric_names(void)
 {
@@ -109,9 +167,29 @@ set_metric_names(void)
   strcpy(ybpgm_table[Insert].name, YSQL_METRIC_PREFIX "InsertStmt");
   strcpy(ybpgm_table[Delete].name, YSQL_METRIC_PREFIX "DeleteStmt");
   strcpy(ybpgm_table[Update].name, YSQL_METRIC_PREFIX "UpdateStmt");
+  strcpy(ybpgm_table[Begin].name, YSQL_METRIC_PREFIX "BeginStmt");
+  strcpy(ybpgm_table[Commit].name, YSQL_METRIC_PREFIX "CommitStmt");
+  strcpy(ybpgm_table[Rollback].name, YSQL_METRIC_PREFIX "RollbackStmt");
   strcpy(ybpgm_table[Other].name, YSQL_METRIC_PREFIX "OtherStmts");
+  strcpy(ybpgm_table[Single_Shard_Transaction].name,
+         YSQL_METRIC_PREFIX "Single_Shard_Transactions");
   strcpy(ybpgm_table[Transaction].name, YSQL_METRIC_PREFIX "Transactions");
   strcpy(ybpgm_table[AggregatePushdown].name, YSQL_METRIC_PREFIX "AggregatePushdowns");
+}
+
+/*
+ * Function to calculate milliseconds elapsed from start_time to stop_time.
+ */
+int64
+getElapsedMs(TimestampTz start_time, TimestampTz stop_time)
+{
+  long secs;
+  int microsecs;
+
+  TimestampDifference(start_time, stop_time, &secs, &microsecs);
+
+  long millisecs = (secs * 1000) + (microsecs / 1000);
+  return millisecs;
 }
 
 void
@@ -165,46 +243,28 @@ pullRpczEntries(void)
       rpcz[i].db_name = (char *) palloc(NAMEDATALEN);
       strcpy(rpcz[i].db_name, beentry->st_databasename);
 
-      rpcz[i].process_start_timestamp = (char *) palloc(MAXDATELEN + 1);
-      strcpy(rpcz[i].process_start_timestamp, timestamptz_to_str(beentry->st_proc_start_timestamp));
-
-      if (beentry->st_xact_start_timestamp)
-      {
-        rpcz[i].transaction_start_timestamp = (char *) palloc(MAXDATELEN + 1);
-        strcpy(rpcz[i].transaction_start_timestamp,
-               timestamptz_to_str(beentry->st_xact_start_timestamp));
-      }
-      else
-      {
-        rpcz[i].transaction_start_timestamp = NULL;
-      }
-
-      if (beentry->st_activity_start_timestamp)
-      {
-        rpcz[i].query_start_timestamp = (char *) palloc(MAXDATELEN + 1);
-        strcpy(rpcz[i].query_start_timestamp,
-               timestamptz_to_str(beentry->st_activity_start_timestamp));
-      }
-      else
-      {
-        rpcz[i].query_start_timestamp = NULL;
-      }
+      rpcz[i].process_start_timestamp = beentry->st_proc_start_timestamp;
+      rpcz[i].transaction_start_timestamp = beentry->st_xact_start_timestamp;
+      rpcz[i].query_start_timestamp = beentry->st_activity_start_timestamp;
 
       rpcz[i].backend_type = (char *) palloc(40);
       strcpy(rpcz[i].backend_type, pgstat_get_backend_desc(beentry->st_backendType));
 
+      rpcz[i].backend_active = 0;
       rpcz[i].backend_status = (char *) palloc(30);
       switch (beentry->st_state) {
         case STATE_IDLE:
           strcpy(rpcz[i].backend_status, "idle");
           break;
         case STATE_RUNNING:
+          rpcz[i].backend_active = 1;
           strcpy(rpcz[i].backend_status, "active");
           break;
         case STATE_IDLEINTRANSACTION:
           strcpy(rpcz[i].backend_status, "idle in transaction");
           break;
         case STATE_FASTPATH:
+          rpcz[i].backend_active = 1;
           strcpy(rpcz[i].backend_status, "fastpath function call");
           break;
         case STATE_IDLEINTRANSACTION_ABORTED:
@@ -273,15 +333,27 @@ webserver_worker_main(Datum unused)
    * is not allocated when we enter this function. The memory is allocated after the background
    * works are registered.
    */
+
+  YBCInitThreading();
+
   backendStatusArrayPointer = getBackendStatusArrayPointer();
 
   BackgroundWorkerUnblockSignals();
+
+  HandleYBStatus(YBCInitGFlags(NULL /* argv[0] */));
 
   webserver = CreateWebserver(ListenAddresses, port);
 
   RegisterMetrics(ybpgm_table, num_entries, metric_node_name);
 
-  RegisterRpczEntries(&pullRpczEntries, &freeRpczEntries, &num_backends, &rpcz);
+  postgresCallbacks callbacks;
+  callbacks.pullRpczEntries      = pullRpczEntries;
+  callbacks.freeRpczEntries      = freeRpczEntries;
+  callbacks.getTimestampTz       = GetCurrentTimestamp;
+  callbacks.getTimestampTzDiffMs = getElapsedMs;
+  callbacks.getTimestampTzToStr  = timestamptz_to_str;
+
+  RegisterRpczEntries(&callbacks, &num_backends, &rpcz);
 
   HandleYBStatus(StartWebserver(webserver));
 
@@ -380,15 +452,29 @@ ybpgm_startup_hook(void)
 static void
 ybpgm_ExecutorStart(QueryDesc *queryDesc, int eflags)
 {
+  /* Each PORTAL execution will run the following steps.
+   * 1- ExecutorStart()
+   * 2- Execute statements in the portal.
+   *    Some statement execution (CURSOR execution) can open a nested PORTAL. Our metric routines
+   *    will ignore the nested PORTAL for now.
+   * 3- ExecutorEnd()
+   */
   if (prev_ExecutorStart)
     prev_ExecutorStart(queryDesc, eflags);
   else
     standard_ExecutorStart(queryDesc, eflags);
 
-  if (isTopLevelStatement() && queryDesc->totaltime == NULL)
+  /* PORTAL run can be nested inside another PORTAL, and we only run metric routines for the top
+   * level portal statement. The current design of using global variable "statement_nesting_level"
+   * is very flawed as it cannot find the starting and ending point of a top statement execution.
+   * For now, as a workaround, "queryDesc" attribute is used as an indicator for logging metric.
+   * Whenever "time value" is not null, it is logged at the end of a portal run.
+   * - When starting, we allocate "queryDesc->totaltime".
+   * - When ending, we check for "queryDesc->totaltime". If not null, its metric is log.
+   */
+  if (isTopLevelStatement() && !queryDesc->totaltime)
   {
     MemoryContext oldcxt;
-
     oldcxt = MemoryContextSwitchTo(queryDesc->estate->es_query_cxt);
     queryDesc->totaltime = InstrAlloc(1, INSTRUMENT_TIMER);
     MemoryContextSwitchTo(oldcxt);
@@ -399,18 +485,18 @@ static void
 ybpgm_ExecutorRun(QueryDesc *queryDesc, ScanDirection direction, uint64 count,
                  bool execute_once)
 {
-  statement_nesting_level++;
+  IncStatementNestingLevel();
   PG_TRY();
   {
     if (prev_ExecutorRun)
       prev_ExecutorRun(queryDesc, direction, count, execute_once);
     else
       standard_ExecutorRun(queryDesc, direction, count, execute_once);
-    statement_nesting_level--;
+    DecStatementNestingLevel();
   }
   PG_CATCH();
   {
-    statement_nesting_level--;
+    DecStatementNestingLevel();
     PG_RE_THROW();
   }
   PG_END_TRY();
@@ -419,18 +505,18 @@ ybpgm_ExecutorRun(QueryDesc *queryDesc, ScanDirection direction, uint64 count,
 static void
 ybpgm_ExecutorFinish(QueryDesc *queryDesc)
 {
-  statement_nesting_level++;
+  IncStatementNestingLevel();
   PG_TRY();
   {
     if (prev_ExecutorFinish)
       prev_ExecutorFinish(queryDesc);
     else
       standard_ExecutorFinish(queryDesc);
-    statement_nesting_level--;
+    DecStatementNestingLevel();
   }
   PG_CATCH();
   {
-    statement_nesting_level--;
+    DecStatementNestingLevel();
     PG_RE_THROW();
   }
   PG_END_TRY();
@@ -459,34 +545,47 @@ ybpgm_ExecutorEnd(QueryDesc *queryDesc)
       break;
   }
 
-  if (isTopLevelStatement()) {
-	uint64_t time;
+  is_statement_executed = true;
 
+  /* Collecting metric.
+   * - Only processing metric for top level statement in top level portal.
+   *   For example, CURSOR execution can have many nested portal and nested statement. The metric
+   *   for all of the nested items are not processed.
+   * - However, it's difficult to know the starting and ending point of a statement, we check for
+   *   not null "queryDesc->totaltime".
+   * - The design for this metric module for using global state variables is very flawed, so we
+   *   use this not-null check for now.
+   */
+  if (isTopLevelStatement() && queryDesc->totaltime) {
 	InstrEndLoop(queryDesc->totaltime);
-	time = (uint64_t) (queryDesc->totaltime->total * 1000000.0);
+	const uint64_t time = (uint64_t) (queryDesc->totaltime->total * 1000000.0);
+	const uint64 rows_count = queryDesc->estate->es_processed;
 
-	ybpgm_Store(type, time);
+	ybpgm_Store(type, time, rows_count);
 
 	if (!queryDesc->estate->es_yb_is_single_row_modify_txn)
-	  ybpgm_Store(Transaction, time);
+	  ybpgm_Store(Single_Shard_Transaction, time, rows_count);
+
+	if (!is_inside_transaction_block)
+	  ybpgm_Store(Transaction, time, rows_count);
 
 	if (IsA(queryDesc->planstate, AggState) &&
 		castNode(AggState, queryDesc->planstate)->yb_pushdown_supported)
-	  ybpgm_Store(AggregatePushdown, time);
+	  ybpgm_Store(AggregatePushdown, time, rows_count);
   }
 
-  statement_nesting_level++;
+  IncStatementNestingLevel();
   PG_TRY();
   {
     if (prev_ExecutorEnd)
       prev_ExecutorEnd(queryDesc);
     else
       standard_ExecutorEnd(queryDesc);
-    statement_nesting_level--;
+    DecStatementNestingLevel();
   }
   PG_CATCH();
   {
-    statement_nesting_level--;
+    DecStatementNestingLevel();
     PG_RE_THROW();
   }
   PG_END_TRY();
@@ -506,6 +605,36 @@ ybpgm_memsize(void)
 }
 
 /*
+ * Get the statement type for a transactional statement.
+ */
+static statementType ybpgm_getStatementType(TransactionStmt *stmt) {
+  statementType type = Other;
+  switch (stmt->kind) {
+    case TRANS_STMT_BEGIN:
+    case TRANS_STMT_START:
+      type = Begin;
+      break;
+    case TRANS_STMT_COMMIT:
+    case TRANS_STMT_COMMIT_PREPARED:
+      type = Commit;
+      break;
+    case TRANS_STMT_ROLLBACK:
+    case TRANS_STMT_ROLLBACK_TO:
+    case TRANS_STMT_ROLLBACK_PREPARED:
+      type = Rollback;
+      break;
+    case TRANS_STMT_SAVEPOINT:
+    case TRANS_STMT_RELEASE:
+    case TRANS_STMT_PREPARE:
+      type = Other;
+      break;
+    default:
+      elog(ERROR, "unrecognized statement kind: %d", stmt->kind);
+  }
+  return type;
+}
+
+/*
  * Hook used for tracking "Other" statements.
  */
 static void
@@ -514,14 +643,23 @@ ybpgm_ProcessUtility(PlannedStmt *pstmt, const char *queryString,
                      ParamListInfo params, QueryEnvironment *queryEnv,
                      DestReceiver *dest, char *completionTag)
 {
-  if (isTopLevelStatement() && !IsA(pstmt->utilityStmt, ExecuteStmt) &&
+  if (isTopLevelBlock() && !IsA(pstmt->utilityStmt, ExecuteStmt) &&
       !IsA(pstmt->utilityStmt, PrepareStmt) && !IsA(pstmt->utilityStmt, DeallocateStmt))
   {
     instr_time start;
     instr_time end;
+    statementType type;
+
+    if (IsA(pstmt->utilityStmt, TransactionStmt)) {
+      TransactionStmt *stmt = (TransactionStmt *)(pstmt->utilityStmt);
+      type = ybpgm_getStatementType(stmt);
+    } else {
+      type = Other;
+    }
+
     INSTR_TIME_SET_CURRENT(start);
 
-    ++statement_nesting_level;
+    IncBlockNestingLevel();
     PG_TRY();
     {
       if (prev_ProcessUtility)
@@ -532,18 +670,59 @@ ybpgm_ProcessUtility(PlannedStmt *pstmt, const char *queryString,
         standard_ProcessUtility(pstmt, queryString,
                                 context, params, queryEnv,
                                 dest, completionTag);
-      --statement_nesting_level;
+      DecBlockNestingLevel();
     }
     PG_CATCH();
     {
-      --statement_nesting_level;
+      DecBlockNestingLevel();
       PG_RE_THROW();
     }
     PG_END_TRY();
 
     INSTR_TIME_SET_CURRENT(end);
     INSTR_TIME_SUBTRACT(end, start);
-    ybpgm_Store(Other, INSTR_TIME_GET_MICROSEC(end));
+
+    bool is_catalog_version_increment = false;
+    bool is_breaking_catalog_change = false;
+    if (IsTransactionalDdlStatement(pstmt,
+                                    &is_catalog_version_increment,
+                                    &is_breaking_catalog_change))
+    {
+      ybpgm_Store(Transaction, INSTR_TIME_GET_MICROSEC(end), 0);
+    }
+    else if (type == Other)
+    {
+      is_statement_executed = true;
+    }
+
+    if (type == Begin && !is_inside_transaction_block)
+    {
+      is_inside_transaction_block = true;
+      is_statement_executed = false;
+    }
+    if (type == Rollback)
+    {
+      is_inside_transaction_block = false;
+      is_statement_executed = false;
+    }
+    /*
+     * TODO: Once savepoint and rollback to specific transaction are supported,
+     * transaction block counter needs to be revisited.
+     * Current logic is to increment non-empty transaction block by 1
+     * if non-DDL statement types executed prior to committing.
+     */
+    if (type == Commit) {
+      if (strcmp(completionTag, "ROLLBACK") != 0 &&
+          is_inside_transaction_block &&
+          is_statement_executed)
+      {
+        ybpgm_Store(Transaction, INSTR_TIME_GET_MICROSEC(end), 0);
+      }
+      is_inside_transaction_block = false;
+      is_statement_executed = false;
+    }
+
+    ybpgm_Store(type, INSTR_TIME_GET_MICROSEC(end), 0 /* rows */);
   }
   else
   {
@@ -559,7 +738,9 @@ ybpgm_ProcessUtility(PlannedStmt *pstmt, const char *queryString,
 }
 
 static void
-ybpgm_Store(statementType type, uint64_t time){
-  ybpgm_table[type].calls++;
-  ybpgm_table[type].total_time += time;
+ybpgm_Store(statementType type, uint64_t time, uint64_t rows) {
+  struct ybpgmEntry *entry = &ybpgm_table[type];
+  entry->total_time += time;
+  entry->calls += 1;
+  entry->rows += rows;
 }

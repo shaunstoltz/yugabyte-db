@@ -1,4 +1,4 @@
-#!/usr/bin/env python2.7
+#!/usr/bin/env python3
 
 # Copyright (c) YugaByte, Inc.
 #
@@ -19,17 +19,34 @@ Run YugaByte tests on Spark using PySpark.
 Example (mostly useful during testing this script):
 
 cd ~/code/yugabyte
-spark-submit --driver-cores 8 \
-  build-support/run_tests_on_spark.py \
-  --build-root build/debug-gcc-dynamic-community \
-  --cpp \
-  --verbose \
-  --reports-dir /tmp \
-  --cpp_test_program_regexp '.*redisserver.*' \
-  --write_report \
-  --save_report_to_build_dir
 
-Also adding --spark-master-url=local helps with local debugging.
+Run all C++ tests:
+
+"$SPARK_INSTALLATION_DIR/bin/spark-submit" \
+    build-support/run_tests_on_spark.py \
+    --spark-master-url=spark://$SPARK_HOST:$SPARK_PORT \
+    --build-root "$PWD/build/release-gcc-dynamic-ninja" \
+    --verbose \
+    --reports-dir /tmp \
+    --write_report \
+    --save_report_to_build_dir \
+    --cpp \
+    --recreate_archive_for_workers
+
+Run Java tests satisfying a particular regex:
+
+"$SPARK_INSTALLATION_DIR/bin/spark-submit" \
+    build-support/run_tests_on_spark.py \
+    --spark-master-url=spark://$SPARK_HOST:$SPARK_PORT \
+    --build-root "$PWD/build/release-gcc-dynamic-ninja" \
+    --verbose \
+    --reports-dir=/tmp \
+    --write_report \
+    --save_report_to_build_dir \
+    --java \
+    --test_filter_re=org[.]yb[.].*Pg.* \
+    --send_archive_to_workers \
+    --recreate_archive_for_workers
 """
 
 import argparse
@@ -50,7 +67,10 @@ import traceback
 import tempfile
 import errno
 import signal
+
 from collections import defaultdict
+
+from typing import List
 
 BUILD_SUPPORT_DIR = os.path.dirname(os.path.realpath(__file__))
 
@@ -62,7 +82,7 @@ TEST_TIMEOUT_UPPER_BOUND_SEC = 35 * 60
 # created by the about_to_start_running_test in common-test-env.sh. If this does not happen within
 # this amount of time, we terminate the run-test.sh script. This should prevent tests getting stuck
 # for a long time in macOS builds.
-TIME_SEC_TO_START_RUNNING_TEST = 30
+TIME_SEC_TO_START_RUNNING_TEST = 5 * 60
 
 
 def wait_for_path_to_exist(target_path):
@@ -94,7 +114,7 @@ sys.path.append(os.path.join(os.path.dirname(__file__), '..', 'python'))
 from yb import yb_dist_tests  # noqa
 from yb import command_util  # noqa
 from yb.common_util import set_to_comma_sep_str, get_bool_env_var, is_macos  # noqa
-
+from yb.yb_dist_tests import TestDescriptor  # noqa
 
 # Special Jenkins environment variables. They are propagated to tasks running in a distributed way
 # on Spark.
@@ -120,21 +140,15 @@ JENKINS_ENV_VARS = [
 # In addition, all variables with names starting with the following prefix are propagated.
 PROPAGATED_ENV_VAR_PREFIX = 'YB_'
 
-# This directory inside $BUILD_ROOT contains files listing all C++ tests (one file per test
-# program).
-#
-# This must match the constant with the same name in common-test-env.sh.
-LIST_OF_TESTS_DIR_NAME = 'list_of_tests'
-
 SPARK_URLS = {
     'linux_default': os.getenv(
-        'YB_LINUX_SPARK_URL',
+        'YB_LINUX_PY3_SPARK_URL',
         'spark://spark-for-yugabyte-linux-default.example.com:7077'),
     'linux_asan_tsan': os.getenv(
-        'YB_ASAN_TSAN_SPARK_URL',
+        'YB_ASAN_TSAN_PY3_SPARK_URL',
         'spark://spark-for-yugabyte-linux-asan-tsan.example.com:7077'),
     'macos': os.getenv(
-        'YB_MACOS_SPARK_URL',
+        'YB_MACOS_PY3_SPARK_URL',
         'spark://spark-for-yugabyte-macos.example.com:7077'),
 }
 
@@ -189,7 +203,7 @@ def delete_if_exists_log_errors(file_path):
     if os.path.exists(file_path):
         try:
             os.remove(file_path)
-        except OSError, os_error:
+        except OSError as os_error:
             logging.error("Error deleting file %s: %s", file_path, os_error)
 
 
@@ -231,6 +245,7 @@ def init_spark_context(details=[]):
     if 'BUILD_URL' in os.environ:
         details.append('URL: {}'.format(os.environ['BUILD_URL']))
 
+    SparkContext.setSystemProperty("spark.pyspark.python", "/usr/local/bin/python3")
     spark_context = SparkContext(spark_master_url, "YB tests: {}".format(' '.join(details)))
     yb_python_zip_path = yb_dist_tests.get_tmp_filename(
             prefix='yb_python_module_for_spark_workers_', suffix='.zip', auto_remove=True)
@@ -338,7 +353,7 @@ def parallel_run_test(test_descriptor_str):
                 logging.info(error_msg)
                 try:
                     os.kill(process.pid, signal.SIGKILL)
-                except OSError, os_error:
+                except OSError as os_error:
                     if os_error.errno == errno.ESRCH:
                         logging.info(
                             "Process with pid %d disappeared suddenly, that's OK",
@@ -398,25 +413,31 @@ def parallel_run_test(test_descriptor_str):
             else:
                 logging.warning("Artifact list does not exist: '%s'", artifact_list_path)
 
-            num_artifacts_copied = 0
-            for artifact_path in artifact_paths:
-                if not os.path.exists(artifact_path):
-                    logging.warning("Build artifact file does not exist: '%s'", artifact_path)
-                    continue
-                dest_path = yb_dist_tests.to_real_nfs_path(artifact_path)
-                dest_dir = os.path.dirname(dest_path)
-                if not os.path.exists(dest_dir):
-                    logging.info("Creating directory %s", dest_dir)
-                    subprocess.check_call(['mkdir', '-p', dest_dir])
-                logging.info("Copying %s to %s", artifact_path, dest_path)
-                try:
-                    subprocess.check_call(['cp', '-f', artifact_path, dest_path])
-                except CalledProcessError as ex:
-                    logging.error("Error copying %s to %s: %s", artifact_path, dest_path, ex)
-                    num_errors_copying_artifacts = 1
+            if is_macos() and socket.gethostname() == os.environ.get('YB_BUILD_HOST'):
+                logging.info("Files already local to build host. Skipping artifact copy.")
+            else:
+                num_artifacts_copied = 0
+                for artifact_path in artifact_paths:
+                    if not os.path.exists(artifact_path):
+                        logging.warning("Build artifact file does not exist: '%s'", artifact_path)
+                        continue
+                    if is_macos():
+                        dest_path = get_mac_shared_nfs(artifact_path)
+                    else:
+                        dest_path = yb_dist_tests.to_real_nfs_path(artifact_path)
+                    dest_dir = os.path.dirname(dest_path)
+                    if not os.path.exists(dest_dir):
+                        logging.info("Creating directory %s", dest_dir)
+                        subprocess.check_call(['mkdir', '-p', dest_dir])
+                    logging.info("Copying %s to %s", artifact_path, dest_path)
+                    try:
+                        subprocess.check_call(['cp', '-f', artifact_path, dest_path])
+                    except subprocess.CalledProcessError as ex:
+                        logging.error("Error copying %s to %s: %s", artifact_path, dest_path, ex)
+                        num_errors_copying_artifacts = 1
 
-                num_artifacts_copied += 1
-            logging.info("Number of build artifact files copied: %d", num_artifacts_copied)
+                    num_artifacts_copied += 1
+                logging.info("Number of build artifact files copied: %d", num_artifacts_copied)
 
             rel_artifact_paths = [
                     os.path.relpath(os.path.abspath(artifact_path), global_conf.yb_src_root)
@@ -435,6 +456,13 @@ def parallel_run_test(test_descriptor_str):
         os.umask(old_umask)
 
 
+def get_bash_shebang():
+    # Prefer /usr/local/bin/bash as we install Bash 4+ there on macOS.
+    if os.path.exists('/usr/local/bin/bash'):
+        return '/usr/local/bin/bash'
+    return '/usr/bin/env bash'
+
+
 def initialize_remote_task():
     configure_logging()
 
@@ -446,6 +474,8 @@ def initialize_remote_task():
     from pyspark import SparkFiles
     archive_name = os.path.basename(SparkFiles.get(global_conf.archive_for_workers))
     expected_archive_sha256sum = global_conf.archive_sha256sum
+    assert expected_archive_sha256sum is not None
+
     worker_tmp_dir = os.path.abspath(SparkFiles.getRootDirectory())
     archive_path = os.path.join(worker_tmp_dir, archive_name)
     if not os.path.exists(archive_path):
@@ -467,12 +497,16 @@ def initialize_remote_task():
                 worker_tmp_dir, 'untar_archive_once.sh')
         lock_path = '/tmp/yb_dist_tests_update_archive%s.lock' % (
                 global_conf.yb_src_root.replace('/', '__'))
+        bash_shebang = get_bash_shebang()
         with open(untar_script_path, 'w') as untar_script_file:
             # Do the locking using the flock command in Bash -- file locking in Python is painful.
             # Some curly braces in the script template are escaped as "{{" and }}".
-            untar_script_file.write("""#!/usr/bin/env bash
+
+            # TODO: rewrite this shell script in Python, except for the flock part.
+            untar_script_file.write("""#!{bash_shebang}
 set -euo pipefail
 (
+    PATH=/usr/local/bin:$PATH
     flock -w 60 200
     if [[ -d '{remote_yb_src_root}' ]]; then
         previous_sha256_file_path='{remote_yb_src_root}/extracted_from_archive.sha256'
@@ -499,7 +533,7 @@ set -euo pipefail
         fi
         actual_archive_sha256sum=$( (
             [[ $OSTYPE == linux* ]] && sha256sum '{archive_path}' ||
-            shasum --portable --algorithm 256
+            shasum --portable --algorithm 256 '{archive_path}'
         ) | awk '{{ print $1 }}' )
         if [[ $actual_archive_sha256sum != '{expected_archive_sha256sum}' ]]; then
           echo "Archive SHA256 sum of '{archive_path}' is $actual_archive_sha256sum, which" \
@@ -521,11 +555,12 @@ set -euo pipefail
     fi
 )  200>'{lock_path}'
 """.format(**locals()))
-        os.chmod(untar_script_path, 0755)
+        os.chmod(untar_script_path, 0o755)
         subprocess.check_call(untar_script_path)
     finally:
         if os.path.exists(untar_script_path):
             os.remove(untar_script_path)
+
     return global_conf
 
 
@@ -539,13 +574,17 @@ def parallel_list_test_descriptors(rel_test_path):
     from yb import yb_dist_tests, command_util
     global_conf = initialize_remote_task()
 
+    find_or_download_thirdparty_script_path = os.path.join(
+        global_conf.yb_src_root, 'build-support', 'find_or_download_thirdparty.sh')
+    subprocess.check_call(find_or_download_thirdparty_script_path)
+
     wait_for_path_to_exist(global_conf.build_root)
     list_tests_cmd_line = [
             os.path.join(global_conf.build_root, rel_test_path), '--gtest_list_tests']
 
     try:
         prog_result = command_util.run_program(list_tests_cmd_line)
-    except OSError, ex:
+    except OSError as ex:
         logging.error("Failed running the command: %s", list_tests_cmd_line)
         raise
 
@@ -590,13 +629,13 @@ def parallel_list_test_descriptors(rel_test_path):
 def get_username():
     try:
         return os.getlogin()
-    except OSError, ex:
+    except OSError as ex:
         logging.warning(("Got an OSError trying to get the current user name, " +
                          "trying a workaround: {}").format(ex))
         # https://github.com/gitpython-developers/gitpython/issues/39
         try:
             return pwd.getpwuid(os.getuid()).pw_name
-        except KeyError, ex:
+        except KeyError as ex:
             user_from_env = os.getenv('USER')
             if user_from_env:
                 return user_from_env
@@ -609,6 +648,15 @@ def get_username():
                 "Could not get user name from the environment, and could not parse 'id' output: %s",
                 id_output)
             raise ex
+
+
+def get_mac_shared_nfs(path):
+    LOCAL_PATH = "/Volumes/share"
+    if not path.startswith(LOCAL_PATH):
+        raise ValueError("Local path %s does not start with expected prefix '%s'.\n" %
+                         (path, LOCAL_PATH))
+    relpath = path[len(LOCAL_PATH):]
+    return "/Volumes/net/v1/" + os.environ.get('YB_BUILD_HOST') + relpath
 
 
 def get_jenkins_job_name():
@@ -650,7 +698,7 @@ def save_json_to_paths(short_description, json_data, output_paths, should_gzip=F
         logging.info("Saving {} to {}".format(short_description, final_output_path))
         if should_gzip:
             with gzip.open(final_output_path, 'wb') as output_file:
-                output_file.write(json_data_str)
+                output_file.write(json_data_str.encode('utf-8'))
         else:
             with open(final_output_path, 'w') as output_file:
                 output_file.write(json_data_str)
@@ -737,13 +785,10 @@ def is_one_shot_test(rel_binary_path):
     return False
 
 
-def collect_cpp_tests(max_tests, cpp_test_program_filter, cpp_test_program_re_str):
+def collect_cpp_tests(cpp_test_program_filter: List[str]) -> List[yb_dist_tests.TestDescriptor]:
     """
     Collect C++ test programs to run.
-    @param max_tests: maximum number of tests to run. Used in debugging.
-    @param cpp_test_program_filter: a collection of C++ test program names to be used as a filter
-    @param cpp_test_program_re_str: a regular expression string to be used as a filter for the set
-                                    of C++ test programs.
+    @param cpp_test_program_filter: a list of C++ test program names to be used as a filter
     """
 
     global_conf = yb_dist_tests.global_conf
@@ -777,13 +822,6 @@ def collect_cpp_tests(max_tests, cpp_test_program_filter, cpp_test_program_re_st
     logging.info("Collected %d test programs in %.2f sec" % (
         len(test_programs), elapsed_time_sec))
 
-    if cpp_test_program_re_str:
-        cpp_test_program_re = re.compile(cpp_test_program_re_str)
-        test_programs = [test_program for test_program in test_programs
-                         if cpp_test_program_re.search(test_program)]
-        logging.info("Filtered down to %d test programs using regular expression '%s'" %
-                     (len(test_programs), cpp_test_program_re_str))
-
     if cpp_test_program_filter:
         cpp_test_program_filter = set(cpp_test_program_filter)
         unfiltered_test_programs = test_programs
@@ -804,12 +842,6 @@ def collect_cpp_tests(max_tests, cpp_test_program_filter, cpp_test_program_re_st
                      "collected from ctest before filtering: {}").format(
                          set_to_comma_sep_str(cpp_test_program_filter),
                          set_to_comma_sep_str(unfiltered_test_programs)))
-
-    if max_tests and len(test_programs) > max_tests:
-        logging.info("Randomly selecting {} test programs out of {} possible".format(
-                max_tests, len(test_programs)))
-        random.shuffle(test_programs)
-        test_programs = test_programs[:max_tests]
 
     if not test_programs:
         logging.info("Found no test programs")
@@ -857,6 +889,16 @@ def collect_cpp_tests(max_tests, cpp_test_program_filter, cpp_test_program_re_st
         for test_descriptor_str in test_descriptor_str_list]
     logging.info("Collected the list of %d gtest tests in %.2f sec" % (
         len(test_descriptor_strs), elapsed_time_sec))
+    for test_descriptor_str in test_descriptor_strs:
+        if 'YB_DISABLE_TEST_IN_' in test_descriptor_str:
+            raise RuntimeError(
+                f"For test descriptor '{test_descriptor_str}': " +
+                "YB_DISABLE_TEST_IN_... is not allowed in final C++ test names, i.e. test names " +
+                "reported using --gtest_list_test. This could happen when trying to use " +
+                "YB_DISABLE_TEST_IN_TSAN or YB_DISABLE_TEST_IN_SANITIZERS in a parameterized " +
+                "test with TEST_P. For parameterized tests, please use " +
+                "YB_SKIP_TEST_IN_TSAN() as the first line of the test instead."
+            )
 
     return [yb_dist_tests.TestDescriptor(s) for s in test_descriptor_strs]
 
@@ -874,26 +916,27 @@ def fatal_error(msg):
     raise RuntimeError(msg)
 
 
-def collect_java_tests():
+def get_java_test_descriptors():
     java_test_list_path = os.path.join(yb_dist_tests.global_conf.build_root, 'java_test_list.txt')
     if not os.path.exists(java_test_list_path):
-        raise IOError("Java test list not found at '%s'" % java_test_list_path)
+        raise IOError(
+            "Java test list not found at '%s'. Please run ./yb_build.sh --collect-java-tests to "
+            "generate the test list file." % java_test_list_path)
     with open(java_test_list_path) as java_test_list_file:
-        java_test_descriptors = [
-            yb_dist_tests.TestDescriptor(java_test_str.strip())
-            for java_test_str in java_test_list_file.read().split("\n")
-            if java_test_str.strip()
-        ]
+        java_test_descriptors = []
+        for line in java_test_list_file:
+            line = line.strip()
+            if not line:
+                continue
+            java_test_descriptors.append(yb_dist_tests.TestDescriptor(line))
     if not java_test_descriptors:
-        raise RuntimeError("Could not find any Java tests listed in '%s'" % java_test_list_path)
+        raise RuntimeError("Could not find any Java tests in '%s'" % java_test_list_path)
+
+    logging.info("Found %d Java tests", len(java_test_descriptors))
     return java_test_descriptors
 
 
 def collect_tests(args):
-    if args.cpp_test_program_regexp and args.test_conf:
-        raise RuntimeException(
-            "--cpp_test_program_regexp and --test_conf cannot both be specified at the same time.")
-
     test_conf = {}
     if args.test_conf:
         with open(args.test_conf) as test_conf_file:
@@ -901,37 +944,49 @@ def collect_tests(args):
         if args.run_cpp_tests and not test_conf['run_cpp_tests']:
             logging.info("The test configuration file says that C++ tests should be skipped")
             args.run_cpp_tests = False
-        if not test_conf['run_java_tests']:
-            logging.info("The test configuration file says that Java tests should be skipped")
+        if args.run_java_tests and not test_conf['run_java_tests']:
+            logging.info(
+                "The test configuration file says that Java tests should be skipped")
             args.run_java_tests = False
+        if 'test_filter_re' in test_conf:
+            args.test_filter_re = test_conf['test_filter_re']
 
     cpp_test_descriptors = []
     if args.run_cpp_tests:
         cpp_test_programs = test_conf.get('cpp_test_programs')
-        if args.cpp_test_program_regexp and cpp_test_programs:
-            logging.warning(
-                    ("Ignoring the C++ test program regular expression specified on the "
-                     "command line: {}").format(args.cpp_test_program_regexp))
-
-        cpp_test_descriptors = collect_cpp_tests(
-                args.max_tests,
-                cpp_test_programs,
-                args.cpp_test_program_regexp)
+        cpp_test_descriptors = collect_cpp_tests(cpp_test_programs)
 
     java_test_descriptors = []
     if args.run_java_tests:
-        java_test_descriptors = collect_java_tests()
-        logging.info("Found %d Java tests", len(java_test_descriptors))
-    return sorted(java_test_descriptors) + sorted(cpp_test_descriptors)
+        java_test_descriptors = get_java_test_descriptors()
+
+    test_descriptors = sorted(java_test_descriptors) + sorted(cpp_test_descriptors)
+
+    if args.test_filter_re:
+        test_filter_re_compiled = re.compile(args.test_filter_re)
+        num_tests_before_filtering = len(test_descriptors)
+        test_descriptors = [
+            test_descriptor for test_descriptor in test_descriptors
+            if test_filter_re_compiled.match(test_descriptor.descriptor_str_without_attempt_index)
+        ]
+        logging.info(
+            "Filtered %d tests using regular expression %s to %d tests",
+            num_tests_before_filtering,
+            args.test_filter_re,
+            len(test_descriptors)
+        )
+
+    return test_descriptors
 
 
 def load_test_list(test_list_path):
+    logging.info("Loading the list of tests to run from %s", test_list_path)
     test_descriptors = []
     with open(test_list_path, 'r') as input_file:
         for line in input_file:
             line = line.strip()
             if line:
-                test_descriptors.append(yb_dist_tests.TestDescriptor())
+                test_descriptors.append(yb_dist_tests.TestDescriptor(line))
     return test_descriptors
 
 
@@ -942,7 +997,7 @@ def propagate_env_vars():
             propagated_env_vars[env_var_name] = os.environ[env_var_name]
             num_propagated += 1
 
-    for env_var_name, env_var_value in os.environ.iteritems():
+    for env_var_name, env_var_value in os.environ.items():
         if env_var_name.startswith(PROPAGATED_ENV_VAR_PREFIX):
             propagated_env_vars[env_var_name] = env_var_value
             logging.info("Propagating env var %s (value: %s) to Spark workers",
@@ -996,8 +1051,8 @@ def main():
                         help='Save a test report to the build directory directly, in addition '
                              'to any reports saved in the common reports directory. This should '
                              'work even if neither --reports-dir or --write_report are specified.')
-    parser.add_argument('--cpp_test_program_regexp',
-                        help='A regular expression to filter C++ test program names on.')
+    parser.add_argument('--test_filter_re',
+                        help='A regular expression to filter tests')
     parser.add_argument('--test_conf',
                         help='A file with a JSON configuration describing what tests to run, '
                              'produced by dependency_graph.py')
@@ -1070,18 +1125,22 @@ def main():
         fatal_error("File specified by --test_list does not exist or is not a file: '{}'".format(
             test_list_path))
 
-    if not args.send_archive_to_workers and args.recreate_archive_for_workers:
-        fatal_error("Specify --send_archive_to_workers to use --recreate_archive_for_workers")
-
     if ('YB_MVN_LOCAL_REPO' not in os.environ and
             args.run_java_tests and
             args.send_archive_to_workers):
         os.environ['YB_MVN_LOCAL_REPO'] = os.path.join(
-                yb_dist_tests.global_conf.yb_src_root, 'build', 'm2_repository')
+                yb_dist_tests.global_conf.build_root, 'm2_repository')
         logging.info("Automatically setting YB_MVN_LOCAL_REPO to %s",
                      os.environ['YB_MVN_LOCAL_REPO'])
 
+    if not args.send_archive_to_workers and args.recreate_archive_for_workers:
+        fatal_error("Specify --send_archive_to_workers to use --recreate_archive_for_workers")
+
+    # ---------------------------------------------------------------------------------------------
     # End of argument validation.
+    # ---------------------------------------------------------------------------------------------
+
+    os.environ['YB_BUILD_HOST'] = socket.gethostname()
 
     # ---------------------------------------------------------------------------------------------
     # Start the timer.
@@ -1090,10 +1149,22 @@ def main():
     # This needs to be done before Spark context initialization, which will happen as we try to
     # collect all gtest tests in all C++ test programs.
     if args.send_archive_to_workers:
-        if (args.recreate_archive_for_workers or
-                not os.path.exists(yb_dist_tests.global_conf.archive_for_workers)):
+        archive_exists = os.path.exists(yb_dist_tests.global_conf.archive_for_workers)
+        if args.recreate_archive_for_workers or not archive_exists:
+            archive_sha_path = os.path.join(yb_dist_tests.global_conf.yb_src_root,
+                                            'extracted_from_archive.sha256')
+            if os.path.exists(archive_sha_path):
+                os.remove(archive_sha_path)
+
             yb_dist_tests.create_archive_for_workers()
-        yb_dist_tests.compute_archive_sha256sum()
+
+            yb_dist_tests.compute_archive_sha256sum()
+
+            # Local host may also be worker, so leave expected checksum here after archive created.
+            with open(archive_sha_path, 'w') as archive_sha:
+                archive_sha.write(yb_dist_tests.global_conf.archive_sha256sum)
+        else:
+            yb_dist_tests.compute_archive_sha256sum()
 
     if test_list_path:
         test_descriptors = load_test_list(test_list_path)
@@ -1128,7 +1199,7 @@ def main():
         test_descriptors = [
             test_descriptor.with_attempt_index(i)
             for test_descriptor in test_descriptors
-            for i in xrange(1, num_repetitions + 1)
+            for i in range(1, num_repetitions + 1)
         ]
 
     app_name_details = ['{} tests total'.format(total_num_tests)]
@@ -1192,10 +1263,10 @@ def main():
         with open(failed_test_list_path, 'w') as failed_test_file:
             failed_test_file.write("\n".join(failed_test_desc_strs) + "\n")
 
-    for language, num_tests in sorted(num_tests_by_language.iteritems()):
+    for language, num_tests in sorted(num_tests_by_language.items()):
         logging.info("Total tests we ran in {}: {}".format(language, num_tests))
 
-    for language, num_failures in sorted(failures_by_language.iteritems()):
+    for language, num_failures in sorted(failures_by_language.items()):
         logging.info("Failures in {} tests: {}".format(language, num_failures))
 
     total_elapsed_time_sec = time.time() - global_start_time

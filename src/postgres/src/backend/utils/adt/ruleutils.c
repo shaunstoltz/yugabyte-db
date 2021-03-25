@@ -54,6 +54,7 @@
 #include "parser/parse_oper.h"
 #include "parser/parser.h"
 #include "parser/parsetree.h"
+#include "pg_yb_utils.h"
 #include "rewrite/rewriteHandler.h"
 #include "rewrite/rewriteManip.h"
 #include "rewrite/rewriteSupport.h"
@@ -322,7 +323,8 @@ static char *pg_get_indexdef_worker(Oid indexrelid, int colno,
 					   const Oid *excludeOps,
 					   bool attrsOnly, bool keysOnly,
 					   bool showTblSpc, bool inherits,
-					   int prettyFlags, bool missing_ok);
+					   int prettyFlags, bool missing_ok,
+					   bool useNonconcurrently);
 static char *pg_get_statisticsobj_worker(Oid statextid, bool missing_ok);
 static char *pg_get_partkeydef_worker(Oid relid, int prettyFlags,
 						 bool attrsOnly, bool missing_ok);
@@ -1103,7 +1105,8 @@ pg_get_indexdef(PG_FUNCTION_ARGS)
 	res = pg_get_indexdef_worker(indexrelid, 0, NULL,
 								 false, false,
 								 false, false,
-								 prettyFlags, true);
+								 prettyFlags, true,
+								 false);
 
 	if (res == NULL)
 		PG_RETURN_NULL();
@@ -1125,7 +1128,8 @@ pg_get_indexdef_ext(PG_FUNCTION_ARGS)
 	res = pg_get_indexdef_worker(indexrelid, colno, NULL,
 								 colno != 0, false,
 								 false, false,
-								 prettyFlags, true);
+								 prettyFlags, true,
+								 false);
 
 	if (res == NULL)
 		PG_RETURN_NULL();
@@ -1136,6 +1140,8 @@ pg_get_indexdef_ext(PG_FUNCTION_ARGS)
 /*
  * Internal version for use by ALTER TABLE.
  * Includes a tablespace clause in the result.
+ * TODO - We also currently add NONCONCURRENTLY here, but this can be removed with #6703.
+ *
  * Returns a palloc'd C string; no pretty-printing.
  */
 char *
@@ -1144,7 +1150,8 @@ pg_get_indexdef_string(Oid indexrelid)
 	return pg_get_indexdef_worker(indexrelid, 0, NULL,
 								  false, false,
 								  true, true,
-								  0, false);
+								  0, false,
+								  IsYugaByteEnabled() /* useNonconcurrently */);
 }
 
 /* Internal version that just reports the key-column definitions */
@@ -1158,7 +1165,8 @@ pg_get_indexdef_columns(Oid indexrelid, bool pretty)
 	return pg_get_indexdef_worker(indexrelid, 0, NULL,
 								  true, true,
 								  false, false,
-								  prettyFlags, false);
+								  prettyFlags, false,
+								  false);
 }
 
 /*
@@ -1166,13 +1174,16 @@ pg_get_indexdef_columns(Oid indexrelid, bool pretty)
  *
  * This is now used for exclusion constraints as well: if excludeOps is not
  * NULL then it points to an array of exclusion operator OIDs.
+ *
+ * TODO, can remove useNonconcurrently when we support #6703.
  */
 static char *
 pg_get_indexdef_worker(Oid indexrelid, int colno,
 					   const Oid *excludeOps,
 					   bool attrsOnly, bool keysOnly,
 					   bool showTblSpc, bool inherits,
-					   int prettyFlags, bool missing_ok)
+					   int prettyFlags, bool missing_ok,
+					   bool useNonconcurrently)
 {
 	/* might want a separate isConstraint parameter later */
 	bool		isConstraint = (excludeOps != NULL);
@@ -1284,8 +1295,9 @@ pg_get_indexdef_worker(Oid indexrelid, int colno,
 	if (!attrsOnly)
 	{
 		if (!isConstraint)
-			appendStringInfo(&buf, "CREATE %sINDEX %s ON %s%s USING %s (",
+			appendStringInfo(&buf, "CREATE %sINDEX %s%s ON %s%s USING %s (",
 							 idxrec->indisunique ? "UNIQUE " : "",
+							 useNonconcurrently ? "NONCONCURRENTLY " : "",
 							 quote_identifier(NameStr(idxrelrec->relname)),
 							 idxrelrec->relkind == RELKIND_PARTITIONED_INDEX
 							 && !inherits ? "ONLY " : "",
@@ -1432,7 +1444,7 @@ pg_get_indexdef_worker(Oid indexrelid, int colno,
 		 * If it has options, append "WITH (options)"
 		 */
 		str = flatten_reloptions(indexrelid);
-		if (str)
+		if (str && strcmp(str,"") != 0)
 		{
 			appendStringInfo(&buf, " WITH (%s)", str);
 			pfree(str);
@@ -2258,6 +2270,7 @@ pg_get_constraintdef_worker(Oid constraintId, bool fullCommand,
 															  false,
 															  false,
 															  prettyFlags,
+															  false,
 															  false));
 				break;
 			}
@@ -7570,7 +7583,7 @@ isSimpleNode(Node *node, Node *parentNode, int prettyFlags)
 				}
 				/* else do the same stuff as for T_SubLink et al. */
 			}
-			/* FALLTHROUGH */
+			switch_fallthrough();
 
 		case T_SubLink:
 		case T_NullTest:
@@ -11177,6 +11190,16 @@ flatten_reloptions(Oid relid)
 			}
 			else
 				value = "";
+
+			/*
+			 * We ignore the reloption for tablegroup.
+			 * It is parsed seperately in describe.c.
+			 */
+			if (strcmp(name, "tablegroup") == 0)
+			{
+				pfree(option);
+				continue;
+			}
 
 			if (i > 0)
 				appendStringInfoString(&buf, ", ");

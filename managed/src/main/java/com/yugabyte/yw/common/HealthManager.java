@@ -4,7 +4,6 @@ package com.yugabyte.yw.common;
 
 import com.yugabyte.yw.models.Provider;
 
-import com.google.inject.Inject;
 import com.google.inject.Singleton;
 
 import java.util.ArrayList;
@@ -12,12 +11,14 @@ import java.util.HashMap;
 import java.util.Map;
 import java.util.List;
 
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
 import play.libs.Json;
 
 @Singleton
 public class HealthManager extends DevopsBase {
-  @Inject
-  play.Configuration appConfig;
+  public static final Logger LOG = LoggerFactory.getLogger(HealthManager.class);
 
   public static final String HEALTH_CHECK_SCRIPT = "bin/cluster_health.py";
 
@@ -30,64 +31,50 @@ public class HealthManager extends DevopsBase {
     // TODO: this is to be used by k8s.
     // Note: this is the same across all clusters, so maybe we should pull it out one level above.
     public Map<String, String> namespaceToConfig = new HashMap<>();
-    public List<String> masterNodes = new ArrayList<>();
-    public List<String> tserverNodes = new ArrayList<>();
+    public Map<String, String> masterNodes = new HashMap<>();
+    public Map<String, String> tserverNodes = new HashMap<>();
     public String ybSoftwareVersion = null;
     public boolean enableTlsClient = false;
+    public String sslProtocol = "";
     public boolean enableYSQL = false;
-    public int ysqlPort = 0;
+    public int ysqlPort = 5433;
+    public int ycqlPort = 9042;
+    public boolean enableYEDIS = false;
+    public int redisPort = 6379;
+    public boolean enableYSQLAuth = false;
   }
 
-  public ShellProcessHandler.ShellResponse runCommand(
-      Provider provider,
-      List<ClusterInfo> clusters,
-      String universeName,
-      String customerTag,
-      String destination,
-      Long potentialStartTimeMs,
-      Boolean sendMailAlways,
-      Boolean reportOnlyErrors) {
+  public ShellResponse runCommand(
+    Provider provider,
+    List<ClusterInfo> clusters,
+    Long potentialStartTimeMs
+  ) {
     List<String> commandArgs = new ArrayList<>();
 
     commandArgs.add(PY_WRAPPER);
     commandArgs.add(HEALTH_CHECK_SCRIPT);
-    commandArgs.add("--cluster_payload");
-    commandArgs.add(Json.stringify(Json.toJson(clusters)));
-    commandArgs.add("--universe_name");
-    commandArgs.add(universeName);
-    commandArgs.add("--customer_tag");
-    commandArgs.add(customerTag);
-    if (destination != null) {
-      commandArgs.add("--destination");
-      commandArgs.add(destination);
+
+    String description = String.join(" ", commandArgs);
+
+    if (clusters != null) {
+      commandArgs.add("--cluster_payload");
+      commandArgs.add(Json.stringify(Json.toJson(clusters)));
     }
+
     if (potentialStartTimeMs > 0) {
       commandArgs.add("--start_time_ms");
       commandArgs.add(String.valueOf(potentialStartTimeMs));
     }
-    if (sendMailAlways) {
-      commandArgs.add("--send_status");
-    }
-    // Start with a copy of the cloud config env vars.
-    HashMap extraEnvVars = new HashMap<>(provider.getConfig());
-    String emailUsername = appConfig.getString("yb.health.ses_email_username");
-    if (emailUsername != null) {
-      extraEnvVars.put("YB_ALERTS_USERNAME", emailUsername);
-    }
-    String emailPassword = appConfig.getString("yb.health.ses_email_password");
-    if (emailPassword != null) {
-      extraEnvVars.put("YB_ALERTS_PASSWORD", emailPassword);
-    }
-    String email = appConfig.getString("yb.health.default_email");
-    if (email != null) {
-      extraEnvVars.put("YB_ALERTS_EMAIL", email);
-    }
-    if (reportOnlyErrors) {
-      commandArgs.add("--report_only_errors");
+
+    if (!provider.code.equals("onprem")) {
+      commandArgs.add("--check_clock");
     }
 
-    LOG.info("Command to run: [" + String.join(" ", commandArgs) + "]");
-    return shellProcessHandler.run(commandArgs, extraEnvVars, false /*logCmdOutput*/);
+    // Start with a copy of the cloud config env vars.
+    HashMap<String, String> extraEnvVars = provider == null ?
+      new HashMap<>() : new HashMap<>(provider.getConfig());
+
+    return shellProcessHandler.run(commandArgs, extraEnvVars, false /*logCmdOutput*/, description);
   }
 
   @Override

@@ -3,9 +3,15 @@
 import { connect } from 'react-redux';
 import { KeyManagementConfiguration } from '../../config';
 import { fetchCustomerConfigs, fetchCustomerConfigsResponse } from '../../../actions/customers';
-import { createKMSProviderConfig, createKMSProviderConfigResponse,
-  fetchAuthConfigList, fetchAuthConfigListResponse,
-  deleteKMSProviderConfig, deleteKMSProviderConfigResponse } from '../../../actions/cloud';
+import {
+  createKMSProviderConfig,
+  createKMSProviderConfigResponse,
+  fetchAuthConfigList,
+  fetchAuthConfigListResponse,
+  deleteKMSProviderConfig,
+  deleteKMSProviderConfigResponse
+} from '../../../actions/cloud';
+import { toast } from 'react-toastify';
 
 const mapStateToProps = (state) => {
   return {
@@ -18,7 +24,6 @@ const mapStateToProps = (state) => {
 
 const mapDispatchToProps = (dispatch) => {
   return {
-
     fetchCustomerConfigs: () => {
       return dispatch(fetchCustomerConfigs()).then((response) =>
         dispatch(fetchCustomerConfigsResponse(response.payload))
@@ -28,25 +33,32 @@ const mapDispatchToProps = (dispatch) => {
     fetchKMSConfigList: () => {
       return dispatch(fetchAuthConfigList()).then((response) =>
         dispatch(fetchAuthConfigListResponse(response.payload))
-      );
+      )
+      .catch(() => toast.error('Error occurred while fetching config.'));
     },
 
     setKMSConfig: (provider, body) => {
       return dispatch(createKMSProviderConfig(provider, body))
-        .then((response) => {
-          return dispatch(createKMSProviderConfigResponse(response.payload));
+        .then?.((response) => {
+          return dispatch(createKMSProviderConfigResponse(response.payload)).then?.(
+            () => toast.success('Successfully added the configuration')
+          );
         })
-        .catch(err => console.err('Error submitting KMS configuration: ', err));
+        .catch((err) => toast.error(`Error submitting KMS configuration: ${err}`));
     },
 
     deleteKMSConfig: (configUUID) => {
-      dispatch(deleteKMSProviderConfig(configUUID)).then((response) => {
-        if (response.payload.status === 200) {
-          return dispatch(deleteKMSProviderConfigResponse(configUUID));
-        }
-        console.warn('Warning: Deleting configuration returned unsuccessful response.');
-      })
-      .catch(err => console.error(err));
+      dispatch(deleteKMSProviderConfig(configUUID))
+        .then((response) => {
+          if (response.payload.status === 200) {
+            toast.success('Successfully deleted KMS configuration');
+            return dispatch(deleteKMSProviderConfigResponse(configUUID));
+          }
+          toast.warn('Warning: Deleting configuration returned unsuccessful response.');
+        })
+        .catch((err) => {
+          console.error(err)
+        });
     }
   };
 };

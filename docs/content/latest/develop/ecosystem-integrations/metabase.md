@@ -62,15 +62,15 @@ yugabyte=#
 
 ### Create a database
 
-```postgresql
+```plpgsql
 yugabyte=# CREATE DATABASE yb-demo;
 ```
 
-```postgresql
+```plpgsql
 yugabyte=# GRANT ALL ON DATABASE yb-demo to yugabyte;
 ```
 
-```postgresql
+```plpgsql
 yugabyte=# \c yb-demo;
 ```
 
@@ -78,25 +78,25 @@ yugabyte=# \c yb-demo;
 
 First create the 4 tables necessary to store the data.
 
-```postgresql
+```plpgsql
 yugabyte=# \i 'schema.sql';
 ```
 
 Now load the data into the tables.
 
-```postgresql
+```plpgsql
 yugabyte=# \i 'data/products.sql'
 ```
 
-```postgresql
+```plpgsql
 yugabyte=# \i 'data/users.sql'
 ```
 
-```postgresql
+```plpgsql
 yugabyte=# \i 'data/orders.sql'
 ```
 
-```postgresql
+```plpgsql
 yugabyte=# \i 'data/reviews.sql'
 ```
 
@@ -116,11 +116,11 @@ Go to http://localhost:3000 to configure your Metabase server and point it to th
 
 ## 4. Run complex queries with Metabase
 
-Detailed steps on how to use Metabase are available [here](https://www.metabase.com/docs/latest/getting-started.html). For this doc, we will specifically focus on asking questions that require RDBMS capabilities.
+Detailed steps on how to use Metabase are available [here](https://www.metabase.com/docs/latest/getting-started.html). For this doc, you will specifically focus on asking questions that require RDBMS capabilities.
 
 - Filter data using WHERE clauses
 - Join data between tables
 - Perform data aggregation using GROUP BY
 - Use built-in functions such as SUM, MIN, MAX, etc.
 
-You can click on Ask a Question -> Custom Query. Choose the database we just setup, and enter the SQL queries noted in the [Retail Analytics](../../realworld-apps/retail-analytics/) section.
+You can click on Ask a Question -> Custom Query. Choose the database you just setup, and enter the SQL queries noted in the [Retail Analytics](../../realworld-apps/retail-analytics/) section.

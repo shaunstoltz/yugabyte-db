@@ -42,6 +42,8 @@
 #include "yb/tablet/tablet_peer.h"
 #include "yb/tablet/tablet_metrics.h"
 #include "yb/tserver/tserver.pb.h"
+
+#include "yb/util/scope_exit.h"
 #include "yb/util/trace.h"
 
 namespace yb {
@@ -62,24 +64,12 @@ void ChangeMetadataOperationState::SetIndexes(const RepeatedPtrField<IndexInfoPB
 }
 
 string ChangeMetadataOperationState::ToString() const {
-  return Format("ChangeMetadataOperationState {hybrid_time: $0 schema: $1 request: $2 }",
-                hybrid_time_even_if_unset(), schema_, request_);
-}
-
-void ChangeMetadataOperationState::AcquireSchemaLock(rw_semaphore* l) {
-  TRACE("Acquiring schema lock in exclusive mode");
-  schema_lock_ = std::unique_lock<rw_semaphore>(*l);
-  TRACE("Acquired schema lock");
-}
-
-void ChangeMetadataOperationState::ReleaseSchemaLock() {
-  CHECK(schema_lock_.owns_lock());
-  schema_lock_ = std::unique_lock<rw_semaphore>();
-  TRACE("Released schema lock");
+  return Format("ChangeMetadataOperationState { hybrid_time: $0 schema: $1 request: $2 }",
+                hybrid_time_even_if_unset(), schema_, request());
 }
 
 void ChangeMetadataOperationState::UpdateRequestFromConsensusRound() {
-  request_ = consensus_round()->replicate_msg()->mutable_change_metadata_request();
+  UseRequest(consensus_round()->replicate_msg()->mutable_change_metadata_request());
 }
 
 ChangeMetadataOperation::ChangeMetadataOperation(
@@ -130,15 +120,29 @@ void ChangeMetadataOperation::DoStart() {
 Status ChangeMetadataOperation::DoReplicated(int64_t leader_term, Status* complete_status) {
   TRACE("APPLY CHANGE-METADATA: Starting");
 
+  auto se = ScopeExit([this] {
+    state()->Finish();
+  });
+
   Tablet* tablet = state()->tablet();
   log::Log* log = state()->mutable_log();
   size_t num_operations = 0;
+
+  if (state()->request()->has_wal_retention_secs()) {
+    // We don't consider wal retention changes as another operation because this value is always
+    // sent together with the schema, as long as it has been changed in the master's sys-catalog.
+    auto s = tablet->AlterWalRetentionSecs(state());
+    if (s.ok()) {
+      log->set_wal_retention_secs(state()->request()->wal_retention_secs());
+    } else {
+      LOG(WARNING) << "T " << tablet->tablet_id() << ": Unable to alter wal retention secs";
+    }
+  }
 
   // Only perform one operation.
   enum MetadataChange {
     NONE,
     SCHEMA,
-    WAL_RETENTION_SECS,
     ADD_TABLE,
     REMOVE_TABLE,
     BACKFILL_DONE,
@@ -151,13 +155,6 @@ Status ChangeMetadataOperation::DoReplicated(int64_t leader_term, Status* comple
     request_has_newer_schema = tablet->metadata()->schema_version() < state()->schema_version();
     if (request_has_newer_schema) {
       ++num_operations;
-    }
-  }
-
-  if (state()->request()->has_wal_retention_secs()) {
-    metadata_change = MetadataChange::NONE;
-    if (++num_operations == 1) {
-      metadata_change = MetadataChange::WAL_RETENTION_SECS;
     }
   }
 
@@ -175,7 +172,7 @@ Status ChangeMetadataOperation::DoReplicated(int64_t leader_term, Status* comple
     }
   }
 
-  if (state()->request()->has_is_backfilling()) {
+  if (state()->request()->has_mark_backfill_done()) {
     metadata_change = MetadataChange::NONE;
     if (++num_operations == 1) {
       metadata_change = MetadataChange::BACKFILL_DONE;
@@ -200,12 +197,6 @@ Status ChangeMetadataOperation::DoReplicated(int64_t leader_term, Status* comple
       log->SetSchemaForNextLogSegment(*DCHECK_NOTNULL(state()->schema()),
                                       state()->schema_version());
       break;
-    case MetadataChange::WAL_RETENTION_SECS:
-      DCHECK_EQ(1, num_operations) << "Invalid number of change metadata operations: "
-                                   << num_operations;
-      RETURN_NOT_OK(tablet->AlterWalRetentionSecs(state()));
-      log->set_wal_retention_secs(state()->request()->wal_retention_secs());
-      break;
     case MetadataChange::ADD_TABLE:
       DCHECK_EQ(1, num_operations) << "Invalid number of change metadata operations: "
                                    << num_operations;
@@ -219,22 +210,13 @@ Status ChangeMetadataOperation::DoReplicated(int64_t leader_term, Status* comple
     case MetadataChange::BACKFILL_DONE:
       DCHECK_EQ(1, num_operations) << "Invalid number of change metadata operations: "
                                    << num_operations;
-      RETURN_NOT_OK(tablet->MarkBackfillDone(state()->request()->is_backfilling()));
+      RETURN_NOT_OK(tablet->MarkBackfillDone(state()->request()->backfill_done_table_id()));
       break;
   }
-
-  // The schema lock was acquired by Tablet::CreatePreparedChangeMetadata.
-  // Normally, we would release it in tablet.cc after applying the operation,
-  // but currently we need to wait until after the COMMIT message is logged
-  // to release this lock as a workaround for KUDU-915. See the TODO in
-  // Tablet::AlterSchema().
-  state()->ReleaseSchemaLock();
 
   // Now that all of the changes have been applied and the commit is durable
   // make the changes visible to readers.
   TRACE("AlterSchemaCommitCallback: making alter schema visible");
-  state()->Finish();
-
   return Status::OK();
 }
 

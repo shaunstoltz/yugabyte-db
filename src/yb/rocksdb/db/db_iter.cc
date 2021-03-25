@@ -181,6 +181,13 @@ class DBIter: public Iterator {
   void SeekToFirst() override;
   void SeekToLast() override;
 
+  void RevalidateAfterUpperBoundChange() override {
+    if (iter_->Valid() && direction_ == kForward) {
+      valid_ = true;
+      FindNextUserEntry(/* skipping= */ false);
+    }
+  }
+
  private:
   void ReverseToBackward();
   void PrevInternal();
@@ -642,6 +649,8 @@ bool DBIter::FindValueForCurrentKeyUsingSeek() {
   // kTypeMerge. We need to collect all kTypeMerge values and save them
   // in operands
   std::deque<std::string> operands;
+  // TODO: we dont need rocksdb level merge records and only use RocksDB level tombstones in
+  // intentsdb, so maybe we can be more efficient here.
   while (iter_->Valid() &&
          user_comparator_->Equal(ikey.user_key, saved_key_.GetKey()) &&
          ikey.type == kTypeMerge) {
@@ -895,6 +904,10 @@ inline Status ArenaWrappedDBIter::ReleasePinnedData() {
 void ArenaWrappedDBIter::RegisterCleanup(CleanupFunction function, void* arg1,
                                          void* arg2) {
   db_iter_->RegisterCleanup(function, arg1, arg2);
+}
+
+void ArenaWrappedDBIter::RevalidateAfterUpperBoundChange() {
+  db_iter_->RevalidateAfterUpperBoundChange();
 }
 
 ArenaWrappedDBIter* NewArenaWrappedDbIterator(

@@ -1,8 +1,8 @@
 ---
-title: Build the source code on CentOS
+title: Build from source code on CentOS
 headerTitle: Build the source code
 linkTitle: Build the source
-description: Build the source code
+description: Build YugabyteDB from source code on CentOS.
 image: /images/section_icons/index/quick_start.png
 headcontent: Build the source code.
 type: page
@@ -18,21 +18,21 @@ showAsideToc: true
 <ul class="nav nav-tabs-alt nav-tabs-yb">
 
   <li >
-    <a href="/latest/contribute/core-database/build-from-src-macos" class="nav-link">
+    <a href="{{< relref "./build-from-src-macos.md" >}}" class="nav-link">
       <i class="fab fa-apple" aria-hidden="true"></i>
       macOS
     </a>
   </li>
 
   <li >
-    <a href="/latest/contribute/core-database/build-from-src-centos" class="nav-link active">
+    <a href="{{< relref "./build-from-src-centos.md" >}}" class="nav-link active">
       <i class="fab fa-linux" aria-hidden="true"></i>
       CentOS
     </a>
   </li>
 
   <li >
-    <a href="/latest/contribute/core-database/build-from-src-ubuntu" class="nav-link">
+    <a href="{{< relref "./build-from-src-ubuntu.md" >}}" class="nav-link">
       <i class="fab fa-linux" aria-hidden="true"></i>
       Ubuntu
     </a>
@@ -53,7 +53,7 @@ Update packages on your system, install development tools and additional package
 ```sh
 sudo yum update
 sudo yum groupinstall -y 'Development Tools'
-sudo yum install -y ruby perl-Digest epel-release ccache git python2-pip
+sudo yum install -y ruby perl-Digest epel-release ccache git python2-pip python-devel python3 python3-pip python3-devel
 sudo yum install -y cmake3 ctest3
 ```
 
@@ -87,7 +87,14 @@ cd ~/code/yugabyte-db
 ./yb_build.sh release
 ```
 
-The above command will build the release configuration, put the C++ binaries in `build/release-gcc-dynamic-community`, and will also create the `build/latest` symlink to that directory.
+{{< note title="Note" >}}
+
+If you see errors, such as `g++: internal compiler error: Killed`, the system has probably run out of memory.
+Try again by running the build script with less concurrency, for example, `-j1`.
+
+{{< /note >}}
+
+The command above will build the release configuration, add the C++ binaries into the `build/release-gcc-dynamic-ninja` directory, and create a `build/latest` symlink to that directory.
 
 {{< tip title="Tip" >}}
 
@@ -104,10 +111,19 @@ YugabyteDB core is written in C++, but the repository contains Java code needed 
 * JDK 8
 * [Apache Maven](https://maven.apache.org/).
 
-Also make sure Maven's bin directory is added to your `PATH` (for example, by adding to your `~/.bashrc`). See the example below (if you've installed Maven into `~/tools/apache-maven-3.5.0`)
+Also make sure Maven's bin directory is added to your `PATH` (for example, by adding to your `~/.bashrc`). See the example below (if you've installed Maven into `~/tools/apache-maven-3.6.3`)
 
 ```sh
-export PATH=$HOME/tools/apache-maven-3.5.0/bin:$PATH
+export PATH=$HOME/tools/apache-maven-3.6.3/bin:$PATH
 ```
 
 For building YugabyteDB Java code, you'll need to install Java and Apache Maven.
+
+## Build release package
+You can build a release package by executing:
+
+```shell
+$ ./yb_release
+......
+2020-10-27 20:52:27,978 [yb_release.py:283 INFO] Generated a package at '/home/user/code/yugabyte-db/build/yugabyte-2.5.1.0-8696bc05a97c4907b53d6446b5bfa7acb28ceef5-release-centos-x86_64.tar.gz'
+```

@@ -130,7 +130,7 @@ struct ThreadStackEntry : public MPSCQueueEntry<ThreadStackEntry> {
   StackTrace stack;
 };
 
-#if !defined(__APPLE__) && !THREAD_SANITIZER
+#if !defined(__APPLE__) && !defined(THREAD_SANITIZER) && !defined(ADDRESS_SANITIZER)
 #define USE_FUTEX 1
 #else
 #define USE_FUTEX 0
@@ -209,7 +209,7 @@ struct ThreadStackHelper {
   size_t allocated_entries = 0;
 
   // Incremented by each signal handler.
-  std::atomic<int64_t> left_to_collect;
+  std::atomic<int64_t> left_to_collect{0};
 
   std::vector<std::unique_ptr<ThreadStackEntry[]>> allocated_chunks;
 
@@ -253,14 +253,14 @@ struct ThreadStackHelper {
 
   void RecordStackTrace(const StackTrace& stack_trace) {
     auto* entry = allocated.Pop();
-    if (!entry) { // Not enough allocated entries, don't write log since we are in signal handler.
-      return;
+    if (entry) {
+      // Not enough allocated entries, don't write log since we are in signal handler.
+      entry->tid = Thread::CurrentThreadIdForStack();
+      entry->stack = stack_trace;
+      collected.Push(entry);
     }
-    entry->tid = Thread::CurrentThreadIdForStack();
-    entry->stack = stack_trace;
-    collected.Push(entry);
 
-    if (left_to_collect.fetch_sub(1, std::memory_order_acq_rel) - 1 == 0) {
+    if (left_to_collect.fetch_sub(1, std::memory_order_acq_rel) - 1 <= 0) {
       completion_flag.Signal();
     }
   }
@@ -408,11 +408,6 @@ class GlobalBacktraceState {
         /* threaded = */ 0,
         BacktraceErrorCallback,
         /* data */ nullptr);
-
-    // To complete initialization we should call backtrace, otherwise it could fail in case of
-    // concurrent initialization.
-    backtrace_full(bt_state_, /* skip = */ 1, DummyCallback,
-                   BacktraceErrorCallback, nullptr);
   }
 
   backtrace_state* GetState() { return bt_state_; }
@@ -539,6 +534,31 @@ int BacktraceFullCallback(void *const data, const uintptr_t pc,
 }
 #endif  // __linux__
 
+bool IsDoubleUnderscoredAndInList(
+    const char* symbol, const std::initializer_list<const char*>& list) {
+  if (symbol[0] != '_' || symbol[1] != '_') {
+    return false;
+  }
+  for (const auto* idle_function : list) {
+    if (!strcmp(symbol, idle_function)) {
+      return true;
+    }
+  }
+  return false;
+}
+
+bool IsIdle(const char* symbol) {
+  return IsDoubleUnderscoredAndInList(symbol,
+                                      { "__GI_epoll_wait",
+                                        "__pthread_cond_timedwait",
+                                        "__pthread_cond_wait" });
+}
+
+bool IsWaiting(const char* symbol) {
+  return IsDoubleUnderscoredAndInList(symbol,
+                                      { "__GI___pthread_mutex_lock" });
+}
+
 }  // anonymous namespace
 
 Status SetStackTraceSignal(int signum) {
@@ -625,6 +645,14 @@ Status ListThreads(std::vector<pid_t> *tids) {
   return Status::OK();
 }
 
+void InitLibBackTrace() {
+#ifdef __linux__
+  if (FLAGS_use_libbacktrace) {
+    Singleton<GlobalBacktraceState>::get();
+  }
+#endif
+}
+
 std::string GetStackTrace(StackTraceLineFormat stack_trace_line_format,
                           int num_top_frames_to_skip) {
   std::string buf;
@@ -643,6 +671,15 @@ std::string GetStackTrace(StackTraceLineFormat stack_trace_line_format,
 
     // TODO: https://yugabyte.atlassian.net/browse/ENG-4729
 
+    // Note that first call to backtrace_full finishes libbacktrace state initialization, so
+    // if we find a way to use backtrace_full concurrently we will need to add the following code
+    // back to GlobalBacktraceState() constructor or use some other approach so first call to
+    // backtrace_full is executed without other concurrent calls of backtrace_full:
+    //   backtrace_full(bt_state_, /* skip = */ 1, DummyCallback, BacktraceErrorCallback, nullptr);
+    // See: https://github.com/yugabyte/yugabyte-db/commit/bf6b7e9d4ba11123cd6c7eb68ca94b2f171921d9
+    // As of 2021-03-20 this call was removed from GlobalBacktraceState() in order to avoid
+    // binaries execution slowdown for 1-2 seconds that slows down tests and scripts using some
+    // YB tools extensively (for example yb_backup.py do a lot of executions of yb-admin).
     const int backtrace_full_rv = backtrace_full(
         backtrace_state, /* skip = */ num_top_frames_to_skip + 1, BacktraceFullCallback,
         BacktraceErrorCallback, &context);
@@ -675,7 +712,7 @@ string GetLogFormatStackTraceHex() {
 }
 
 void StackTrace::Collect(int skip_frames) {
-#if THREAD_SANITIZER
+#if THREAD_SANITIZER || ADDRESS_SANITIZER
   num_frames_ = google::GetStackTrace(frames_, arraysize(frames_), skip_frames);
 #else
   int max_frames = skip_frames + arraysize(frames_);
@@ -720,10 +757,12 @@ string StackTrace::ToHexString(int flags) const {
   return string(buf);
 }
 
+// If group is specified it is filled with value corresponding to this stack trace.
 void SymbolizeAddress(
     const StackTraceLineFormat stack_trace_line_format,
     void* pc,
-    string* buf
+    string* buf,
+    StackTraceGroup* group = nullptr
 #ifdef __linux__
     , GlobalBacktraceState* global_backtrace_state = nullptr
 #endif
@@ -777,7 +816,15 @@ void SymbolizeAddress(
 
   if (google::Symbolize(pc, tmp, sizeof(tmp))) {
     symbol = tmp;
+    if (group) {
+      if (IsWaiting(symbol)) {
+        *group = StackTraceGroup::kWaiting;
+      } else if (IsIdle(symbol)) {
+        *group = StackTraceGroup::kIdle;
+      }
+    }
   }
+
   StringAppendF(buf, kStackTraceEntryFormat, kPrintfPointerFieldWidth, pc, symbol);
   // We are appending the end-of-line character separately because we want to reuse the same
   // format string for libbacktrace callback and glog-based symbolization, and we have an extra
@@ -786,7 +833,8 @@ void SymbolizeAddress(
 }
 
 // Symbolization function borrowed from glog and modified to use libbacktrace on Linux.
-string StackTrace::Symbolize(const StackTraceLineFormat stack_trace_line_format) const {
+string StackTrace::Symbolize(
+    const StackTraceLineFormat stack_trace_line_format, StackTraceGroup* group) const {
   string buf;
 #ifdef __linux__
   // Use libbacktrace for symbolization.
@@ -794,10 +842,14 @@ string StackTrace::Symbolize(const StackTraceLineFormat stack_trace_line_format)
       FLAGS_use_libbacktrace ? Singleton<GlobalBacktraceState>::get() : nullptr;
 #endif
 
+  if (group) {
+    *group = StackTraceGroup::kActive;
+  }
+
   for (int i = 0; i < num_frames_; i++) {
     void* const pc = frames_[i];
 
-    SymbolizeAddress(stack_trace_line_format, pc, &buf
+    SymbolizeAddress(stack_trace_line_format, pc, &buf, group
 #ifdef __linux__
         , global_backtrace_state
 #endif
@@ -864,198 +916,11 @@ string SymbolizeAddress(void *pc, const StackTraceLineFormat stack_trace_line_fo
 
 namespace {
 
-const char* GetEnvVar(const char* name) {
-  const char* value = getenv(name);
-  if (value && strlen(value) == 0) {
-    // Treat empty values as undefined.
-    return nullptr;
-  }
-  return value;
-}
-
-struct FunctionTraceConf {
-
-  bool enabled = false;
-
-  // Auto-blacklist functions that have done more than this number of calls per second.
-  int32_t blacklist_calls_per_sec = 1000;
-
-  std::unordered_set<std::string> fn_name_blacklist;
-
-  FunctionTraceConf() {
-    enabled = GetEnvVar("YB_FN_TRACE");
-    if (!enabled) {
-      return;
-    }
-    auto blacklist_calls_per_sec_str = GetEnvVar("YB_FN_TRACE_BLACKLIST_CALLS_PER_SEC");
-    if (blacklist_calls_per_sec_str) {
-      blacklist_calls_per_sec = atoi32(blacklist_calls_per_sec_str);
-    }
-
-    static const char* kBlacklistFileEnvVarName = "YB_FN_TRACE_BLACKLIST_FILE";
-    auto blacklist_file_path = GetEnvVar(kBlacklistFileEnvVarName);
-    if (blacklist_file_path) {
-      LOG(INFO) << "Reading blacklist from " << blacklist_file_path;
-      std::ifstream blacklist_file(blacklist_file_path);
-      if (!blacklist_file) {
-        LOG(FATAL) << "Could not read function trace blacklist file from '"
-                   << blacklist_file_path << "' as specified by " << kBlacklistFileEnvVarName;
-      }
-      string fn_name;
-      while (std::getline(blacklist_file, fn_name)) {
-        fn_name = util::TrimStr(fn_name);
-        if (fn_name.size()) {
-          fn_name_blacklist.insert(fn_name);
-        }
-      }
-
-      if (blacklist_file.bad()) {
-        LOG(FATAL) << "Error reading blacklist file '" << blacklist_file_path << "': "
-                   << strerror(errno);
-      }
-    }
-  }
-};
-
-const FunctionTraceConf& GetFunctionTraceConf() {
-  static const FunctionTraceConf conf;
-  return conf;
-}
-
-enum class EventType : uint8_t {
-  kEnter,
-  kLeave
-};
-
-struct FunctionTraceEvent {
-  EventType event_type;
-  void* this_fn;
-  void* call_site;
-  int64_t thread_id;
-  CoarseMonoClock::time_point time;
-
-  FunctionTraceEvent(
-      EventType type_,
-      void* this_fn_,
-      void* call_site_)
-      : event_type(type_),
-        this_fn(this_fn_),
-        call_site(call_site_),
-        thread_id(Thread::CurrentThreadId()),
-        time(CoarseMonoClock::Now()) {
-  }
-};
-
-class FunctionTracer {
- public:
-  FunctionTracer() {
-  }
-
-  void RecordEvent(EventType event_type, void* this_fn, void* call_site) {
-    if (blacklisted_fns_.count(this_fn)) {
-      return;
-    }
-    const auto& conf = GetFunctionTraceConf();
-
-    FunctionTraceEvent event(event_type, this_fn, call_site);
-    auto& time_queue = func_event_times_[this_fn];
-    while (!time_queue.empty() && time_queue.back() - time_queue.front() > 1000ms) {
-      time_queue.pop();
-    }
-    time_queue.push(event.time);
-    if (conf.blacklist_calls_per_sec > 0 &&
-        time_queue.size() >= conf.blacklist_calls_per_sec) {
-      std::cerr << "Auto-blacklisting " << Symbolize(this_fn) << ": repeated "
-                << time_queue.size() << " times per sec" << std::endl;
-      blacklisted_fns_.insert(this_fn);
-      func_event_times_.erase(this_fn);
-      return;
-    }
-    const string& symbol = Symbolize(event.this_fn);
-    if (!conf.fn_name_blacklist.empty()) {
-      // User specified a file listing functions that should not be traced. Match the symbolized
-      // function name to that file.
-      const char* symbol_str = symbol.c_str();
-      const char* space_ptr = strchr(symbol_str, ' ');
-      if (conf.fn_name_blacklist.count(space_ptr ? std::string(symbol_str, space_ptr)
-                                                 : symbol)) {
-        // Remember to avoid tracing this function pointer from now on.
-        blacklisted_fns_.insert(event.this_fn);
-        return;
-      }
-    }
-    const char* event_type_str = event.event_type == EventType::kEnter ? "->" : "<-";
-    if (!first_event_) {
-      auto delay_ms = ToMilliseconds(event.time - last_event_time_);
-      if (delay_ms > 1000) {
-        std::ostringstream ss;
-        ss << "\n" << std::string(80, '-') << "\n";
-        ss << "No events for " << delay_ms << " ms (thread id: " << event.thread_id << ")";
-        ss << "\n" << std::string(80, '-') << "\n";
-        std::cout << ss.str() << std::endl;
-      }
-      last_event_time_ = event.time;
-    }
-    first_event_ = false;
-    std::ostringstream ss;
-    ss << ToMicroseconds(event.time.time_since_epoch())
-       << " " << event.thread_id << " " << event_type_str << " " << symbol
-       << ", called from: " << Symbolize(event.call_site);
-    std::cerr << ss.str() << std::endl;
-  }
-
- private:
-  const std::string& Symbolize(void* pc) {
-    {
-      auto iter = symbol_cache_.find(pc);
-      if (iter != symbol_cache_.end()) {
-        return iter->second;
-      }
-    }
-    string buf;
-    SymbolizeAddress(StackTraceLineFormat::SYMBOL_ONLY, pc, &buf);
-    if (!buf.empty() && buf.back() == '\n') {
-      buf.pop_back();
-    }
-    return symbol_cache_.emplace(pc, buf).first->second;
-  }
-
-  std::unordered_map<void*, std::queue<CoarseMonoClock::time_point>> func_event_times_;
-  std::unordered_set<void*> blacklisted_fns_;
-  CoarseMonoClock::time_point last_event_time_;
-  bool first_event_ = true;
-
-  std::unordered_map<void*, std::string> symbol_cache_;
-};
-
-FunctionTracer& GetFunctionTracer() {
-  static FunctionTracer function_tracer;
-  return function_tracer;
-}
-
-} // anonymous namespace
-
 // List the load addresses of dynamic libraries once on process startup if required.
 const bool  __attribute__((unused)) kPrintedLoadedDynamicLibraries =
     PrintLoadedDynamicLibrariesOnceHelper();
 
-extern "C" {
-
-void __cyg_profile_func_enter(void*, void*) __attribute__((no_instrument_function));
-void __cyg_profile_func_enter(void *this_fn, void *call_site) {
-  if (GetFunctionTraceConf().enabled) {
-    GetFunctionTracer().RecordEvent(EventType::kEnter, this_fn, call_site);
-  }
-}
-
-void __cyg_profile_func_exit(void*, void*) __attribute__((no_instrument_function));
-void __cyg_profile_func_exit (void *this_fn, void *call_site) {
-  if (GetFunctionTraceConf().enabled) {
-    GetFunctionTracer().RecordEvent(EventType::kLeave, this_fn, call_site);
-  }
-}
-
-}  // extern "C"
+}  // namespace
 
 std::string DemangleName(const char* mangled_name) {
   int demangle_status = 0;

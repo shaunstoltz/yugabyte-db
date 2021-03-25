@@ -24,8 +24,12 @@ import java.math.BigDecimal;
 import java.sql.ResultSet;
 import java.sql.SQLException;
 import java.sql.Statement;
+import java.util.ArrayList;
 import java.util.Arrays;
+import java.util.HashSet;
 import java.util.List;
+import java.util.Objects;
+import java.util.Set;
 import java.util.stream.Collectors;
 
 import static org.yb.AssertionWrappers.*;
@@ -44,7 +48,7 @@ public class TestPgSelect extends BasePgSQLTest {
       try (ResultSet rs = statement.executeQuery(query)) {
         assertEquals(allRows, getSortedRowList(rs));
       }
-      assertFalse(useIndex(query, PRIMARY_KEY));
+      assertFalse(isIndexScan(statement, query, PRIMARY_KEY));
 
       // Test fixed hash key.
       query = "SELECT * FROM test_where WHERE h = 2";
@@ -55,7 +59,7 @@ public class TestPgSelect extends BasePgSQLTest {
         assertEquals(10, expectedRows.size());
         assertEquals(expectedRows, getSortedRowList(rs));
       }
-      assertTrue(useIndex(query, PRIMARY_KEY));
+      assertTrue(isIndexScan(statement, query, PRIMARY_KEY));
 
       // Test fixed primary key.
       query = "SELECT * FROM test_where WHERE h = 2 AND r = 3.5";
@@ -67,7 +71,7 @@ public class TestPgSelect extends BasePgSQLTest {
         assertEquals(1, expectedRows.size());
         assertEquals(expectedRows, getSortedRowList(rs));
       }
-      assertTrue(useIndex(query, PRIMARY_KEY));
+      assertTrue(isIndexScan(statement, query, PRIMARY_KEY));
 
       // Test fixed range key without fixed hash key.
       query = "SELECT * FROM test_where WHERE r = 6.5";
@@ -78,7 +82,7 @@ public class TestPgSelect extends BasePgSQLTest {
         assertEquals(10, expectedRows.size());
         assertEquals(expectedRows, getSortedRowList(rs));
       }
-      assertFalse(useIndex(query, PRIMARY_KEY));
+      assertFalse(isIndexScan(statement, query, PRIMARY_KEY));
 
       // Test range scan.
       query = "SELECT * FROM test_where WHERE h = 2 AND r >= 3.5 AND r < 8.5";
@@ -91,7 +95,7 @@ public class TestPgSelect extends BasePgSQLTest {
         assertEquals(5, expectedRows.size());
         assertEquals(expectedRows, getSortedRowList(rs));
       }
-      assertTrue(useIndex(query, PRIMARY_KEY));
+      assertTrue(isIndexScan(statement, query, PRIMARY_KEY));
 
       // Test conditions on regular (non-primary-key) columns.
       query = "SELECT * FROM test_where WHERE vi < 14 AND vs != 'v09'";
@@ -104,7 +108,7 @@ public class TestPgSelect extends BasePgSQLTest {
         assertEquals(13, expectedRows.size());
         assertEquals(expectedRows, getSortedRowList(rs));
       }
-      assertFalse(useIndex(query, PRIMARY_KEY));
+      assertFalse(isIndexScan(statement, query, PRIMARY_KEY));
 
       // Test other WHERE operators (IN, OR, LIKE).
       query = "SELECT * FROM test_where WHERE h = 2 OR h = 3 OR vs LIKE 'v_2'";
@@ -118,7 +122,7 @@ public class TestPgSelect extends BasePgSQLTest {
         assertEquals(28, expectedRows.size());
         assertEquals(expectedRows, getSortedRowList(rs));
       }
-      assertFalse(useIndex(query, PRIMARY_KEY));
+      assertFalse(isIndexScan(statement, query, PRIMARY_KEY));
     }
   }
 
@@ -144,9 +148,9 @@ public class TestPgSelect extends BasePgSQLTest {
     }
 
     // Test aggregates.
-    assertOneRow("SELECT avg(r) FROM test_target", 5.0D);
-    assertOneRow("SELECT count(*) FROM test_target", 100L);
-    assertOneRow("SELECT count(test_target.*) FROM test_target", 100L);
+    assertOneRow(statement, "SELECT avg(r) FROM test_target", 5.0D);
+    assertOneRow(statement, "SELECT count(*) FROM test_target", 100L);
+    assertOneRow(statement, "SELECT count(test_target.*) FROM test_target", 100L);
 
     // Test distinct.
     try (ResultSet rs = statement.executeQuery("SELECT distinct(h) FROM test_target")) {
@@ -158,19 +162,19 @@ public class TestPgSelect extends BasePgSQLTest {
     }
 
     // Test selecting non-existent column.
-    runInvalidQuery(statement, "SELECT v FROM test_target");
+    runInvalidQuery(statement, "SELECT v FROM test_target", "column \"v\" does not exist");
 
     // Test mistyped function.
-    runInvalidQuery(statement, "SELECT vs * r FROM test_target");
+    runInvalidQuery(statement, "SELECT vs * r FROM test_target", "operator does not exist");
 
     // Test aggregates from table without primary key.
     statement.execute("CREATE TABLE test_target_no_pkey(v1 int, v2 int)");
     statement.execute("INSERT INTO test_target_no_pkey(v1, v2) VALUES (1,2)");
     statement.execute("INSERT INTO test_target_no_pkey(v1, v2) VALUES (2,3)");
     statement.execute("INSERT INTO test_target_no_pkey(v1, v2) VALUES (3,4)");
-    assertOneRow("SELECT sum(v1) FROM test_target_no_pkey", 6L);
-    assertOneRow("SELECT count(*) FROM test_target_no_pkey", 3L);
-    assertOneRow("SELECT sum(test_target_no_pkey.v2) FROM test_target_no_pkey", 9L);
+    assertOneRow(statement, "SELECT sum(v1) FROM test_target_no_pkey", 6L);
+    assertOneRow(statement, "SELECT count(*) FROM test_target_no_pkey", 3L);
+    assertOneRow(statement, "SELECT sum(test_target_no_pkey.v2) FROM test_target_no_pkey", 9L);
   }
 
   @Test
@@ -198,7 +202,8 @@ public class TestPgSelect extends BasePgSQLTest {
     }
 
     // Test WITH clause (with RECURSIVE modifier).
-    assertOneRow("WITH RECURSIVE t(n) AS (" +
+    assertOneRow(statement,
+                 "WITH RECURSIVE t(n) AS (" +
                      "    VALUES (1)" +
                      "  UNION ALL" +
                      "    SELECT n+1 FROM t WHERE n < 100" +
@@ -240,7 +245,7 @@ public class TestPgSelect extends BasePgSQLTest {
 
       // Test views from join.
       statement.execute("CREATE VIEW t1_and_t2 AS " + joinStmt);
-      assertOneRow("SELECT * FROM t1_and_t2 WHERE r > 3", 1L, 3.5D, "def", null);
+      assertOneRow(statement, "SELECT * FROM t1_and_t2 WHERE r > 3", 1L, 3.5D, "def", null);
     }
   }
 
@@ -282,14 +287,16 @@ public class TestPgSelect extends BasePgSQLTest {
 
       // Insert a sample row: Row[2, 3.0, 4, 'abc'].
       statement.execute("INSERT INTO test_expr(h, r, vi, vs) VALUES (2, 3.0, 4, 'abc')");
-      assertOneRow("SELECT * FROM test_expr", 2L, 3.0D, 4, "abc");
+      assertOneRow(statement, "SELECT * FROM test_expr", 2L, 3.0D, 4, "abc");
 
       // Test expressions in SELECT targets.
-      assertOneRow("SELECT h + 1.5, pow(r, 2), vi * h, 7 FROM test_expr WHERE h = 2",
+      assertOneRow(statement,
+                   "SELECT h + 1.5, pow(r, 2), vi * h, 7 FROM test_expr WHERE h = 2",
                    new BigDecimal(3.5), 9.0D, 8L, 7);
 
       // Test expressions in SELECT WHERE clause.
-      assertOneRow("SELECT * FROM test_expr WHERE h + r <= 10 AND substring(vs from 2) = 'bc'",
+      assertOneRow(statement,
+                   "SELECT * FROM test_expr WHERE h + r <= 10 AND substring(vs from 2) = 'bc'",
                    2L, 3.0D, 4, "abc");
     }
   }
@@ -316,7 +323,212 @@ public class TestPgSelect extends BasePgSQLTest {
                                              String stmt,
                                              boolean pushdown_expected) throws Exception {
     verifyStatementMetric(statement, stmt, AGGREGATE_PUSHDOWNS_METRIC,
-                          pushdown_expected ? 1 : 0, 1, true);
+                          pushdown_expected ? 1 : 0, 1, 1, true);
+  }
+
+  private Long getCountForTable(String metricName, String tableName) throws Exception {
+    return getTserverMetricCountForTable(metricName, tableName);
+  }
+
+  /*
+   * TODO: move this test to a different file. For now it makes sense for them to be here
+   * because they are related to the consistent prefix tests
+   */
+  @Test
+  public void testSetIsolationLevelsWithReadFromFollowersSessionVariable() throws Exception {
+    try (Statement statement = connection.createStatement()) {
+      final String CANT_CHANGE_TXN_LEVEL =
+          "ERROR: cannot use this transaction isolation level with yb_read_from_followers enabled";
+      final String CANT_CHANGE_YB_READ_FROM_FOLLOWERS =
+          "ERROR: cannot enable yb_read_from_followers with the current transaction isolation mode";
+
+      // READ UNCOMMITTED with yb_read_from_followers enabled -> ok.
+      statement.execute(
+          "SET SESSION CHARACTERISTICS AS TRANSACTION ISOLATION LEVEL READ UNCOMMITTED");
+      statement.execute("SET yb_read_from_followers = true");
+
+      // Reset session variable.
+      statement.execute("SET yb_read_from_followers = false");
+
+      // READ COMMITTED with yb_read_from_followers enabled -> ok.
+      statement.execute(
+          "SET SESSION CHARACTERISTICS AS TRANSACTION ISOLATION LEVEL READ COMMITTED");
+      statement.execute("SET yb_read_from_followers = true");
+
+      // Reset session variable.
+      statement.execute("SET yb_read_from_followers = false");
+
+      // REPEATABLE READ with yb_read_from_followers enabled -> error.
+      statement.execute(
+          "SET SESSION CHARACTERISTICS AS TRANSACTION ISOLATION LEVEL REPEATABLE READ");
+
+      runInvalidQuery(statement, "SET yb_read_from_followers = true",
+          CANT_CHANGE_YB_READ_FROM_FOLLOWERS);
+
+      // SERIALIZABLE with yb_read_from_followers enabled -> error.
+      statement.execute(
+          "SET SESSION CHARACTERISTICS AS TRANSACTION ISOLATION LEVEL SERIALIZABLE");
+      runInvalidQuery(statement, "SET yb_read_from_followers = true",
+          CANT_CHANGE_YB_READ_FROM_FOLLOWERS);
+
+      // Reset the isolation level to the lowest possible.
+      statement.execute(
+          "SET SESSION CHARACTERISTICS AS TRANSACTION ISOLATION LEVEL READ UNCOMMITTED");
+
+      statement.execute("SET yb_read_from_followers = true");
+
+      // yb_read_from_followers enabled with READ UNCOMMITTED -> ok.
+      statement.execute(
+          "SET SESSION CHARACTERISTICS AS TRANSACTION ISOLATION LEVEL READ UNCOMMITTED");
+
+      // yb_read_from_followers enabled with READ COMMITTED -> ok.
+      statement.execute(
+          "SET SESSION CHARACTERISTICS AS TRANSACTION ISOLATION LEVEL READ COMMITTED");
+
+      // yb_read_from_followers enabled with REPEATABLE READ -> error.
+      runInvalidQuery(statement,
+          "SET SESSION CHARACTERISTICS AS TRANSACTION ISOLATION LEVEL REPEATABLE READ",
+          CANT_CHANGE_TXN_LEVEL);
+
+      // yb_read_from_followers enabled with SERIALIZABLE -> error.
+      runInvalidQuery(statement,
+          "SET SESSION CHARACTERISTICS AS TRANSACTION ISOLATION LEVEL SERIALIZABLE",
+          CANT_CHANGE_TXN_LEVEL);
+
+      // Reset the isolation level to the lowest possible.
+      statement.execute(
+          "SET SESSION CHARACTERISTICS AS TRANSACTION ISOLATION LEVEL READ UNCOMMITTED");
+
+      // yb_read_from_followers enabled with START TRANSACTION ISOLATION LEVEL READ UNCOMMITTED
+      // -> ok.
+      statement.execute("SET yb_read_from_followers = true");
+      statement.execute("START TRANSACTION ISOLATION LEVEL READ UNCOMMITTED");
+      statement.execute("ABORT");
+
+      // yb_read_from_followers enabled with START TRANSACTION ISOLATION LEVEL READ COMMITTED
+      // -> ok.
+      statement.execute("START TRANSACTION ISOLATION LEVEL READ COMMITTED");
+      statement.execute("ABORT");
+
+
+      // yb_read_from_followers enabled with START TRANSACTION ISOLATION LEVEL REPEATABLE READ
+      // -> error.
+      runInvalidQuery(statement, "START TRANSACTION ISOLATION LEVEL REPEATABLE READ",
+          CANT_CHANGE_TXN_LEVEL);
+
+      // yb_read_from_followers enabled with START TRANSACTION ISOLATION LEVEL SERIALIZABLE
+      // -> error.
+      runInvalidQuery(statement, "START TRANSACTION ISOLATION LEVEL SERIALIZABLE",
+          CANT_CHANGE_TXN_LEVEL);
+
+      // Reset session variable.
+      statement.execute("SET yb_read_from_followers = false");
+
+      // START TRANSACTION ISOLATION LEVEL READ UNCOMMITTED with yb_read_from_followers enabled
+      // -> ok.
+      statement.execute("START TRANSACTION ISOLATION LEVEL READ UNCOMMITTED");
+      statement.execute("SET yb_read_from_followers = true");
+      statement.execute("ABORT");
+
+      // Reset session variable.
+      statement.execute("SET yb_read_from_followers = false");
+
+      // START TRANSACTION ISOLATION LEVEL READ COMMITTED with yb_read_from_followers enabled
+      // -> ok.
+      statement.execute("START TRANSACTION ISOLATION LEVEL READ COMMITTED");
+      statement.execute("SET yb_read_from_followers = true");
+      statement.execute("ABORT");
+
+      // Reset session variable.
+      statement.execute("SET yb_read_from_followers = false");
+      // START TRANSACTION ISOLATION LEVEL REPEATABLE READ with yb_read_from_followers enabled
+      // -> error.
+      statement.execute("START TRANSACTION ISOLATION LEVEL REPEATABLE READ");
+      runInvalidQuery(statement, "SET yb_read_from_followers = true",
+          CANT_CHANGE_YB_READ_FROM_FOLLOWERS);
+      statement.execute("ABORT");
+
+      // Reset session variable.
+      statement.execute("SET yb_read_from_followers = false");
+      // START TRANSACTION ISOLATION LEVEL SERIALIZABLE with yb_read_from_followers enabled
+      // -> error.
+      statement.execute("START TRANSACTION ISOLATION LEVEL SERIALIZABLE");
+      runInvalidQuery(statement, "SET yb_read_from_followers = true",
+          CANT_CHANGE_YB_READ_FROM_FOLLOWERS);
+      statement.execute("ABORT");
+    }
+  }
+
+  @Test
+  public void testCountConsistentPrefix() throws Exception {
+    try (Statement statement = connection.createStatement()) {
+      statement.execute("CREATE TABLE consistentprefixcount(k int primary key)");
+      for (int i = 0; i < 100; i++) {
+        statement.execute(String.format("INSERT INTO consistentprefixcount(k) VALUES(%d)", i));
+      }
+
+      statement.execute(
+          "SET SESSION CHARACTERISTICS AS TRANSACTION ISOLATION LEVEL READ COMMITTED");
+      statement.execute("SET yb_read_from_followers = true;");
+      assertOneRow(statement, "SELECT count(*) FROM consistentprefixcount", 100L);
+
+      long count = getCountForTable("consistent_prefix_read_requests", "consistentprefixcount");
+      assertEquals(count, 3); // 3 tablets, 3 consistent prefix requests.
+    }
+  }
+
+  @Test
+  public void testOrderedSelectConsistentPrefix() throws Exception {
+    List<Row> expected_rows = new ArrayList<>();
+    try (Statement statement = connection.createStatement()) {
+      statement.execute("CREATE TABLE consistentprefixorderedselect(k int primary key)");
+      for (int i = 0; i < 5000; i++) {
+        statement.execute(String.format(
+            "INSERT INTO consistentprefixorderedselect(k) VALUES(%d)", i));
+        expected_rows.add(new Row(i));
+      }
+
+      statement.execute(
+          "SET SESSION CHARACTERISTICS AS TRANSACTION ISOLATION LEVEL READ COMMITTED");
+      statement.execute("SET yb_read_from_followers = true;");
+      assertRowList(statement,
+          "SELECT * FROM consistentprefixorderedselect ORDER BY k", expected_rows);
+
+      long count = getCountForTable("consistent_prefix_read_requests",
+          "consistentprefixorderedselect");
+      // Max number of records per request is 1024, so we will need to issue two requests per
+      // tablet.
+      assertEquals(6, count);
+
+      count = getCountForTable("pgsql_consistent_prefix_read_rows",
+          "consistentprefixorderedselect");
+      assertEquals(5000, count);
+    }
+  }
+
+  @Test
+  public void testSelectConsistentPrefix() throws Exception {
+    List<Row> expected_rows = new ArrayList<>();
+    try (Statement statement = connection.createStatement()) {
+      statement.execute("CREATE TABLE consistentprefixselect(k int primary key)");
+      for (int i = 0; i < 7000; i++) {
+        statement.execute(String.format("INSERT INTO consistentprefixselect(k) VALUES(%d)", i));
+        expected_rows.add(new Row(i));
+      }
+
+      statement.execute(
+          "SET SESSION CHARACTERISTICS AS TRANSACTION ISOLATION LEVEL READ COMMITTED");
+      statement.execute("SET yb_read_from_followers = true;");
+      statement.executeQuery("SELECT * from consistentprefixselect");
+
+      long count = getCountForTable("consistent_prefix_read_requests", "consistentprefixselect");
+      // Max number of records per request is 1024, so we will need to issue three requests per
+      // tablet.
+      assertEquals(9, count);
+
+      count = getCountForTable("pgsql_consistent_prefix_read_rows", "consistentprefixselect");
+      assertEquals(7000, count);
+    }
   }
 
   @Test
@@ -443,4 +655,286 @@ public class TestPgSelect extends BasePgSQLTest {
       assertFalse(rs.next());
     }
   }
+
+  public void testNullPushdownUtil(String colOrder) throws Exception {
+    String createTable = "CREATE TABLE %s(a int, b int, PRIMARY KEY(a %s))";
+    String createIndex = "CREATE INDEX ON %s(b %s)";
+
+    try (Statement statement = connection.createStatement()) {
+      statement.execute(String.format(createTable, "t1", colOrder));
+      statement.execute(String.format(createTable, "t2", colOrder));
+      statement.execute("insert into t1 values (1,1), (2,2), (3,3)");
+      statement.execute("insert into t2 values (1,1), (2,2), (3,null)");
+
+      //--------------------------------------------------------------------------------------------
+      // Test join where one join column is null.
+
+      // Inner join, expect no rows.
+      String query = "select * from t2 inner join t1 on t2.b = t1.a where t2.a = 3";
+      assertNoRows(statement, query);
+      String explainOutput = getExplainAnalyzeOutput(statement, query);
+      assertTrue("Expect pushdown for t1 pkey",
+                 explainOutput.contains("Index Cond: (a = 3)"));
+      assertTrue("Expect pushdown for t2 pkey",
+                 explainOutput.contains("Index Cond: (a = t2.b)"));
+      assertFalse("Expect DocDB to filter fully",
+                  explainOutput.contains("Rows Removed by"));
+
+      // Outer join, expect one row.
+      query = "select * from t2 full outer join t1 on t2.b = t1.a where t2.a = 3";
+      assertOneRow(statement, query, 3, null, null, null);
+      explainOutput = getExplainAnalyzeOutput(statement, query);
+      assertTrue("Expect pushdown for t1 pkey",
+                 explainOutput.contains("Index Cond: (a = 3)"));
+      assertTrue("Expect pushdown for t2 pkey",
+                 explainOutput.contains("Index Cond: (t2.b = a)"));
+      assertFalse("Expect DocDB to filter fully",
+                  explainOutput.contains("Rows Removed by"));
+
+      // -------------------------------------------------------------------------------------------
+      // Test IS NULL and IS NOT NULL.
+
+      // Add an index on t1.b that contains null value in its key.
+      statement.execute("insert into t1 values (4,null), (5,null)");
+      statement.execute(String.format(createIndex, "t1", colOrder));
+
+      // Test IS NULL on pkey column.
+      query = "select * from t1 where a IS NULL";
+      assertNoRows(statement, query);
+
+      explainOutput = getExplainAnalyzeOutput(statement, query);
+      assertTrue("Expect pushdown for IS NULL",
+                 explainOutput.contains("Index Cond: (a IS NULL)"));
+      assertFalse("Expect DocDB to filter fully",
+                  explainOutput.contains("Rows Removed by"));
+
+      // Test IS NULL on index column.
+      query = "select * from t1 where b IS NULL";
+      Set<Row> expectedRows = new HashSet<>();
+      expectedRows.add(new Row(4, null));
+      expectedRows.add(new Row(5, null));
+      assertRowSet(statement, query, expectedRows);
+
+      explainOutput = getExplainAnalyzeOutput(statement, query);
+      assertTrue("Expect pushdown for IS NULL",
+                 explainOutput.contains("Index Cond: (b IS NULL)"));
+      assertFalse("Expect DocDB to filter fully",
+                  explainOutput.contains("Rows Removed by"));
+
+      // Test IS NOT NULL.
+      query = "select * from t1 where b IS NOT NULL";
+      expectedRows.clear();
+      expectedRows.add(new Row(1, 1));
+      expectedRows.add(new Row(2, 2));
+      expectedRows.add(new Row(3, 3));
+      assertRowSet(statement, query, expectedRows);
+
+      explainOutput = getExplainAnalyzeOutput(statement, query);
+      assertTrue("Expect no pushdown for IS NOT NULL",
+                 explainOutput.contains("Filter: (b IS NOT NULL)"));
+      assertTrue("Expect YSQL-level filter",
+                  explainOutput.contains("Rows Removed by Filter: 2"));
+
+      // Test IN with NULL (should not match null row because null == null is not true).
+      query = "select * from t1 where b IN (NULL, 2, 3)";
+      expectedRows.clear();
+      expectedRows.add(new Row(2, 2));
+      expectedRows.add(new Row(3, 3));
+      assertRowSet(statement, query, expectedRows);
+
+      explainOutput = getExplainAnalyzeOutput(statement, query);
+      assertTrue("Expect pushdown for IN condition",
+                 explainOutput.contains("Index Cond: (b = ANY ('{NULL,2,3}'::integer[]))"));
+      assertFalse("Expect DocDB to filter fully",
+                 explainOutput.contains("Rows Removed by"));
+
+      // Test NOT IN with NULL (should not match anything because v1 != null is never true).
+      query = "select * from t1 where b NOT IN (NULL, 2)";
+      expectedRows.clear();
+      assertRowSet(statement, query, expectedRows);
+
+      explainOutput = getExplainAnalyzeOutput(statement, query);
+      assertTrue("Expect no pushdown for NOT IN condition",
+                 explainOutput.contains("Filter: (b <> ALL ('{NULL,2}'::integer[]))"));
+      assertTrue("Expect YSQL-level filtering",
+                 explainOutput.contains("Rows Removed by Filter: 5"));
+
+      // Test BETWEEN.
+      query = "select * from t1 where b between 1 and 3";
+      expectedRows.clear();
+      expectedRows.add(new Row(1, 1));
+      expectedRows.add(new Row(2, 2));
+      expectedRows.add(new Row(3, 3));
+      explainOutput = getExplainAnalyzeOutput(statement, query);
+      assertRowSet(statement, query, expectedRows);
+
+      if (colOrder.equals("HASH")) {
+        assertTrue("Expect no pushdown for BETWEEN condition on HASH",
+                   explainOutput.contains("Filter: ((b >= 1) AND (b <= 3))"));
+        assertTrue("Expect YSQL-level filtering for HASH",
+                    explainOutput.contains("Rows Removed by Filter: 2"));
+      } else {
+        assertTrue("Expect pushdown for BETWEEN condition on ASC/DESC",
+                   explainOutput.contains("Index Cond: ((b >= 1) AND (b <= 3))"));
+        assertFalse("Expect no YSQL-level filtering for ASC/DESC",
+                    explainOutput.contains("Rows Removed by"));
+      }
+
+      // Test BETWEEN with NULL.
+      query = "select * from t1 where b BETWEEN 1 AND NULL";
+      expectedRows.clear();
+      explainOutput = getExplainAnalyzeOutput(statement, query);
+      assertRowSet(statement, query, expectedRows);
+      assertTrue("YSQL will auto-eval condition to false",
+                 explainOutput.contains("One-Time Filter: false"));
+      assertFalse("Expect no YSQL-level filtering",
+                  explainOutput.contains("Rows Removed by"));
+
+      //--------------------------------------------------------------------------------------------
+      // Test join where one join column is null *and* the other table has null rows for it.
+      // TODO This should not matter because null == null is false per SQL semantics, but in DocDB
+      //      null == null is true, so we still require filtering here (but only for rows where the
+      //      respective column is null, not for the rest.
+
+      // Inner join (on t1.b this time), expect no rows.
+      query = "select * from t2 inner join t1 on t2.b = t1.b where t2.a = 3";
+      assertNoRows(statement, query);
+      explainOutput = getExplainAnalyzeOutput(statement, query);
+      assertTrue("Expect pushdown for t1 pkey",
+                 explainOutput.contains("Index Cond: (a = 3)"));
+      assertTrue("Expect pushdown for t2 pkey",
+                 explainOutput.contains("Index Cond: (b = t2.b)"));
+      assertTrue("Expect to filter only the 2 null rows",
+                 explainOutput.contains("Rows Removed by Index Recheck: 2"));
+
+      // Outer join (on t1.b this time), expect one row.
+      query = "select * from t2 full outer join t1 on t2.b = t1.b where t2.a = 3";
+      assertOneRow(statement, query, 3, null, null, null);
+      explainOutput = getExplainAnalyzeOutput(statement, query);
+      assertTrue("Expect pushdown for t1 pkey",
+                 explainOutput.contains("Index Cond: (a = 3)"));
+      assertTrue("Expect pushdown for t2 pkey",
+                 explainOutput.contains("Index Cond: (t2.b = b)"));
+      assertTrue("Expect to filter only the 2 null rows",
+                  explainOutput.contains("Rows Removed by Index Recheck: 2"));
+
+      statement.execute("DROP TABLE t1");
+      statement.execute("DROP TABLE t2");
+    }
+  }
+
+  @Test
+  public void testNullPushdown() throws Exception {
+    testNullPushdownUtil("ASC");
+    testNullPushdownUtil("HASH");
+    testNullPushdownUtil("DESC");
+  }
+
+  @Test
+  public void testMulticolumnNullPushdown() throws Exception {
+    try (Statement statement = connection.createStatement()) {
+
+      statement.execute("CREATE TABLE test(h int, r int, vh1 int, vh2 int, vr1 int, vr2 int)");
+      statement.execute("CREATE INDEX on test((vh1, vh2) HASH, vr1 ASC, vr2 ASC)");
+      statement.execute("INSERT INTO test values (1,1,1,1,1,1)");
+      statement.execute("INSERT INTO test values (2,2,null,2,2,2)");
+      statement.execute("INSERT INTO test values (3,3,3,null,3,3)");
+      statement.execute("INSERT INTO test values (4,4,4,4,null,4)");
+      statement.execute("INSERT INTO test values (5,5,5,5,5,null)");
+      statement.execute("INSERT INTO test values (6,6,null,null,6,6)");
+      statement.execute("INSERT INTO test values (7,7,7,7,null,null)");
+      statement.execute("INSERT INTO test values (8,8,null,8,8,null)");
+      statement.execute("INSERT INTO test values (9,9,null,null,null,null)");
+      statement.execute("INSERT INTO test values (10,10,10,10,10,10)");
+
+      Set<Row> allRows = new HashSet<>();
+      allRows.add(new Row(1, 1, 1, 1, 1, 1));
+      allRows.add(new Row(2, 2, null, 2, 2, 2));
+      allRows.add(new Row(3, 3, 3, null, 3, 3));
+      allRows.add(new Row(4, 4, 4, 4, null, 4));
+      allRows.add(new Row(5, 5, 5, 5, 5, null));
+      allRows.add(new Row(6, 6, null, null, 6, 6));
+      allRows.add(new Row(7, 7, 7, 7, null, null));
+      allRows.add(new Row(8, 8, null, 8, 8, null));
+      allRows.add(new Row(9, 9, null, null, null, null));
+      allRows.add(new Row(10, 10, 10, 10, 10, 10));
+
+      // Test null conditions on both hash columns.
+      String query = "SELECT * FROM test WHERE vh1 IS NULL AND vh2 IS NULL";
+      Set<Row> expectedRows = allRows.stream()
+                                     .filter(r -> r.get(2) == null && r.get(3) == null)
+                                     .collect(Collectors.toSet());
+      assertRowSet(statement, query, expectedRows);
+
+      String explainOutput = getExplainAnalyzeOutput(statement, query);
+      assertTrue("Expect pushdown for IS NULL" + explainOutput,
+                 explainOutput.contains("Index Cond: ((vh1 IS NULL) AND (vh2 IS NULL))"));
+      assertFalse("Expect DocDB to filter fully",
+                  explainOutput.contains("Rows Removed by"));
+
+      // Test null conditions on all hash+range columns.
+      query = "SELECT * FROM test WHERE vh1 IS NULL AND vh2 IS NULL" +
+              " AND vr1 IS NULL and vr2 IS NULL";
+      expectedRows = allRows.stream()
+                                       .filter(r -> r.get(2) == null && r.get(3) == null &&
+                                               r.get(4) == null && r.get(5) == null)
+                                       .collect(Collectors.toSet());
+      assertRowSet(statement, query, expectedRows);
+
+      explainOutput = getExplainAnalyzeOutput(statement, query);
+      assertTrue("Expect pushdown for IS NULL" + explainOutput,
+                 explainOutput.contains("Index Cond: ((vh1 IS NULL) AND (vh2 IS NULL)" +
+                                                " AND (vr1 IS NULL) AND (vr2 IS NULL))"));
+      assertFalse("Expect DocDB to filter fully",
+                  explainOutput.contains("Rows Removed by"));
+
+      // Test null/value condition mix columns.
+      query = "SELECT * FROM test WHERE vh1 IS NULL AND vh2 = 8" +
+              " AND vr1 = 8 and vr2 IS NULL";
+      expectedRows = allRows.stream()
+                              .filter(r -> r.get(2) == null && Objects.equals(r.get(3), 8) &&
+                                      Objects.equals(r.get(3), 8) && r.get(5) == null)
+                              .collect(Collectors.toSet());
+      assertRowSet(statement, query, expectedRows);
+
+      explainOutput = getExplainAnalyzeOutput(statement, query);
+      assertTrue("Expect pushdown for IS NULL" + explainOutput,
+                 explainOutput.contains("Index Cond: ((vh1 IS NULL) AND (vh2 = 8)" +
+                                                " AND (vr1 = 8) AND (vr2 IS NULL))"));
+      assertFalse("Expect DocDB to filter fully",
+                  explainOutput.contains("Rows Removed by"));
+
+      // Test partly set hash key (should not push down).
+      query = "SELECT * FROM test WHERE vh1 IS NULL AND vr1 IS NULL and vr2 IS NULL";
+      expectedRows = allRows.stream()
+                              .filter(r -> r.get(2) == null &&
+                                      r.get(4) == null && r.get(5) == null)
+                              .collect(Collectors.toSet());
+      assertRowSet(statement, query, expectedRows);
+
+      explainOutput = getExplainAnalyzeOutput(statement, query);
+      assertTrue("Expect pushdown for IS NULL" + explainOutput,
+                 explainOutput.contains("Filter: ((vh1 IS NULL) AND (vr1 IS NULL) " +
+                                                "AND (vr2 IS NULL))"));
+      assertTrue("Expect YSQL-layer filtering",
+                  explainOutput.contains("Rows Removed by Filter: 9"));
+
+      // Test hash key + partly set range key (should push down).
+      query = "SELECT * FROM test WHERE vh1 IS NULL AND vh2 IS NULL" +
+              " AND vr1 IS NULL";
+      expectedRows = allRows.stream()
+                              .filter(r -> r.get(2) == null && r.get(3) == null &&
+                                      r.get(4) == null)
+                              .collect(Collectors.toSet());
+      assertRowSet(statement, query, expectedRows);
+
+      explainOutput = getExplainAnalyzeOutput(statement, query);
+      assertTrue("Expect pushdown for IS NULL" + explainOutput,
+                 explainOutput.contains("Index Cond: ((vh1 IS NULL) AND (vh2 IS NULL)" +
+                                                " AND (vr1 IS NULL))"));
+      assertFalse("Expect DocDB to filter fully",
+                  explainOutput.contains("Rows Removed by"));
+    }
+  }
+
 }

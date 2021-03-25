@@ -946,7 +946,7 @@ PostmasterMain(int argc, char *argv[])
 	YBReportIfYugaByteEnabled();
 #ifdef __APPLE__
 	if (YBIsEnabledInPostgresEnvVar()) {
-		/* 
+		/*
 		 * Resolve local hostname to initialize macOS network libraries. If we
 		 * don't do this, there might be a lot of segmentation faults in
 		 * PostgreSQL backend processes in tests on macOS (especially debug
@@ -1940,13 +1940,31 @@ ProcessStartupPacket(Port *port, bool SSLdone)
 	MemoryContext oldcontext;
 
 	pq_startmsgread();
-	if (pq_getbytes((char *) &len, 4) == EOF)
+
+	/*
+	 * Grab the first byte of the length word separately, so that we can tell
+	 * whether we have no data at all or an incomplete packet.  (This might
+	 * sound inefficient, but it's not really, because of buffering in
+	 * pqcomm.c.)
+	 */
+	if (pq_getbytes((char *) &len, 1) == EOF)
 	{
 		/*
-		 * EOF after SSLdone probably means the client didn't like our
-		 * response to NEGOTIATE_SSL_CODE.  That's not an error condition, so
-		 * don't clutter the log with a complaint.
+		 * If we get no data at all, don't clutter the log with a complaint;
+		 * such cases often occur for legitimate reasons.  An example is that
+		 * we might be here after responding to NEGOTIATE_SSL_CODE, and if the
+		 * client didn't like our response, it'll probably just drop the
+		 * connection.  Service-monitoring software also often just opens and
+		 * closes a connection without sending anything.  (So do port
+		 * scanners, which may be less benign, but it's not really our job to
+		 * notice those.)
 		 */
+		return STATUS_ERROR;
+	}
+
+	if (pq_getbytes(((char *) &len) + 1, 3) == EOF)
+	{
+		/* Got a partial length word, so bleat about that */
 		if (!SSLdone)
 			ereport(COMMERROR,
 					(errcode(ERRCODE_PROTOCOL_VIOLATION),
@@ -2547,7 +2565,7 @@ reset_shared(int port)
 	 * determine IPC keys.  This helps ensure that we will clean up dead IPC
 	 * objects if the postmaster crashes and is restarted.
 	 */
-	CreateSharedMemoryAndSemaphores(false, port);
+	CreateSharedMemoryAndSemaphores(port);
 }
 
 
@@ -4927,7 +4945,7 @@ SubPostmasterMain(int argc, char *argv[])
 		InitProcess();
 
 		/* Attach process to shared data structures */
-		CreateSharedMemoryAndSemaphores(false, 0);
+		CreateSharedMemoryAndSemaphores(0);
 
 		/* And run the backend */
 		BackendRun(&port);		/* does not return */
@@ -4941,7 +4959,7 @@ SubPostmasterMain(int argc, char *argv[])
 		InitAuxiliaryProcess();
 
 		/* Attach process to shared data structures */
-		CreateSharedMemoryAndSemaphores(false, 0);
+		CreateSharedMemoryAndSemaphores(0);
 
 		AuxiliaryProcessMain(argc - 2, argv + 2);	/* does not return */
 	}
@@ -4954,7 +4972,7 @@ SubPostmasterMain(int argc, char *argv[])
 		InitProcess();
 
 		/* Attach process to shared data structures */
-		CreateSharedMemoryAndSemaphores(false, 0);
+		CreateSharedMemoryAndSemaphores(0);
 
 		AutoVacLauncherMain(argc - 2, argv + 2);	/* does not return */
 	}
@@ -4967,7 +4985,7 @@ SubPostmasterMain(int argc, char *argv[])
 		InitProcess();
 
 		/* Attach process to shared data structures */
-		CreateSharedMemoryAndSemaphores(false, 0);
+		CreateSharedMemoryAndSemaphores(0);
 
 		AutoVacWorkerMain(argc - 2, argv + 2);	/* does not return */
 	}
@@ -4985,7 +5003,7 @@ SubPostmasterMain(int argc, char *argv[])
 		InitProcess();
 
 		/* Attach process to shared data structures */
-		CreateSharedMemoryAndSemaphores(false, 0);
+		CreateSharedMemoryAndSemaphores(0);
 
 		/* Fetch MyBgworkerEntry from shared memory */
 		shmem_slot = atoi(argv[1] + 15);
@@ -5796,12 +5814,12 @@ bgworker_should_start_now(BgWorkerStartTime start_time)
 		case PM_RUN:
 			if (start_time == BgWorkerStart_RecoveryFinished)
 				return true;
-			/* fall through */
+			switch_fallthrough();
 
 		case PM_HOT_STANDBY:
 			if (start_time == BgWorkerStart_ConsistentState)
 				return true;
-			/* fall through */
+			switch_fallthrough();
 
 		case PM_RECOVERY:
 		case PM_STARTUP:

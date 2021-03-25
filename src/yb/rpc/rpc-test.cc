@@ -72,8 +72,10 @@ DECLARE_uint64(rpc_connection_timeout_ms);
 DECLARE_int32(num_connections_to_server);
 DECLARE_bool(enable_rpc_keepalive);
 DECLARE_int64(memory_limit_hard_bytes);
+DECLARE_int32(rpc_throttle_threshold_bytes);
 DECLARE_bool(TEST_pause_calculator_echo_request);
 DECLARE_bool(binary_call_parser_reject_on_mem_tracker_hard_limit);
+DECLARE_string(vmodule);
 
 using namespace std::chrono_literals;
 using std::string;
@@ -315,7 +317,11 @@ TEST_F(TestRpc, TestConnectionKeepalive) {
   // rpc_connection_timeout less than kGcTimeout.
   FLAGS_rpc_connection_timeout_ms = MonoDelta(kGcTimeout).ToMilliseconds() / 2;
   FLAGS_enable_rpc_keepalive = true;
-
+  if (!FLAGS_vmodule.empty()) {
+    FLAGS_vmodule = FLAGS_vmodule + ",yb_rpc=5";
+  } else {
+    FLAGS_vmodule = "yb_rpc=5";
+  }
   // Set up server.
   HostPort server_addr;
   StartTestServer(&server_addr, options);
@@ -898,6 +904,7 @@ constexpr auto kMemoryLimitHardBytes = 100_MB;
 TestServerOptions SetupServerForTestCantAllocateReadBuffer() {
   FLAGS_binary_call_parser_reject_on_mem_tracker_hard_limit = true;
   FLAGS_memory_limit_hard_bytes = kMemoryLimitHardBytes;
+  FLAGS_rpc_throttle_threshold_bytes = -1;
   TestServerOptions options;
   options.messenger_options.n_reactors = 1;
   options.messenger_options.num_connections_to_server = 1;
@@ -907,7 +914,11 @@ TestServerOptions SetupServerForTestCantAllocateReadBuffer() {
 
 void TestCantAllocateReadBuffer(Messenger* client_messenger, const HostPort& server_addr) {
   const MonoDelta kTimeToWaitForOom = 20s;
-  const MonoDelta kCallsTimeout = NonTsanVsTsan(3s, 10s);
+  // Reactor threads are blocked by pauses injected into calls processing by the test and also we
+  // can have other random slow downs in this tests due to large requests processing in reactor
+  // thread, so we turn off application level RPC keepalive mechanism to prevent connections from
+  // being closed.
+  FLAGS_enable_rpc_keepalive = false;
 
   Proxy p(client_messenger, server_addr);
 
@@ -927,7 +938,9 @@ void TestCantAllocateReadBuffer(Messenger* client_messenger, const HostPort& ser
     req.set_data(std::string(10_MB + i, 'X'));
     auto controller = new RpcController();
     controllers.push_back(std::unique_ptr<RpcController>(controller));
-    controller->set_timeout(kCallsTimeout);
+    // No need to wait more than kTimeToWaitForOom + some delay, because we only need these
+    // calls to cause hitting hard memory limit.
+    controller->set_timeout(kTimeToWaitForOom + 5s);
     p.AsyncRequest(CalculatorServiceMethods::EchoMethod(), req, &resp, controller, [&latch]() {
       latch.CountDown();
     });
@@ -973,7 +986,7 @@ void TestCantAllocateReadBuffer(Messenger* client_messenger, const HostPort& ser
 #endif
           LOG(INFO) << "Memory consumption: " << HumanReadableNumBytes::ToString(consumption);
           return consumption < target_memory_consumption;
-        }, 10s,
+        }, 10s * kTimeMultiplier,
         Format("Waiting until memory consumption is less than $0 ...", target_memory_consumption));
     LOG(INFO) << DumpMemoryUsage();
     ASSERT_OK(wait_status);
@@ -981,6 +994,7 @@ void TestCantAllocateReadBuffer(Messenger* client_messenger, const HostPort& ser
 
   // Further calls should be processed successfully since memory consumption is now under limit.
   n_calls = 20;
+  const MonoDelta kCallsTimeout = 60s * kTimeMultiplier;
   LOG(INFO) << "Start sending more calls...";
   latch.Reset(n_calls);
   for (int i = 0; i < n_calls; i++) {

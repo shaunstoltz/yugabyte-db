@@ -2,7 +2,7 @@
 
 package com.yugabyte.yw.models.helpers;
 
-
+import com.fasterxml.jackson.annotation.JsonIgnoreProperties;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.UUID;
@@ -50,12 +50,13 @@ public class PlacementInfo {
     }
   }
 
+  @JsonIgnoreProperties(ignoreUnknown = true)
   public static class PlacementAZ {
     // The AZ provider id.
     public UUID uuid;
     // The AZ name.
     public String name;
-    // The number of copies of data we should place into this AZ.
+    // The minimum number of copies of data we should place into this AZ.
     public int replicationFactor;
     // The subnet in the AZ.
     public String subnet;
@@ -75,7 +76,7 @@ public class PlacementInfo {
   @Override
   public String toString() {
     String ret = "";
-	for (PlacementCloud cloud : cloudList) {
+    for (PlacementCloud cloud : cloudList) {
       ret += cloud;
     }
     return ret;

@@ -15,6 +15,7 @@
 #include "yb/tablet/tablet_peer.h"
 #include "yb/tablet/tablet_metrics.h"
 #include "yb/tserver/backup.pb.h"
+#include "yb/tserver/tserver_error.h"
 #include "yb/util/trace.h"
 
 namespace yb {
@@ -26,59 +27,100 @@ using consensus::ReplicateMsg;
 using consensus::SNAPSHOT_OP;
 using consensus::DriverType;
 using strings::Substitute;
+using yb::tserver::TabletServerError;
 using yb::tserver::TabletServerErrorPB;
 using yb::tserver::TabletSnapshotOpRequestPB;
-using yb::tserver::TabletSnapshotOpResponsePB;
 
 // ------------------------------------------------------------------------------------------------
 // SnapshotOperationState
 // ------------------------------------------------------------------------------------------------
 
 string SnapshotOperationState::ToString() const {
-  return Substitute("SnapshotOperationState "
-                    "[hybrid_time=$0, request=$1]",
-                    hybrid_time().ToString(),
-                    request_ == nullptr ? "(none)" : request_->ShortDebugString());
+  return Format("SnapshotOperationState { hybrid_time: $0 request: $1 }",
+                hybrid_time(), request());
 }
 
-std::string SnapshotOperationState::GetSnapshotDir(const string& top_snapshots_dir) const {
-  if (!request_->snapshot_dir_override().empty()) {
-    return request_->snapshot_dir_override();
+Result<std::string> SnapshotOperationState::GetSnapshotDir() const {
+  auto& request = *this->request();
+  if (!request.snapshot_dir_override().empty()) {
+    return request.snapshot_dir_override();
   }
   std::string snapshot_id_str;
-  auto txn_snapshot_id = TryFullyDecodeTxnSnapshotId(request_->snapshot_id());
-  if (!txn_snapshot_id.IsNil()) {
+  auto txn_snapshot_id = TryFullyDecodeTxnSnapshotId(request.snapshot_id());
+  if (txn_snapshot_id) {
     snapshot_id_str = txn_snapshot_id.ToString();
   } else {
-    snapshot_id_str = request_->snapshot_id();
+    snapshot_id_str = request.snapshot_id();
   }
 
-  return JoinPathSegments(top_snapshots_dir, snapshot_id_str);
+  return JoinPathSegments(VERIFY_RESULT(TopSnapshotsDir()), snapshot_id_str);
 }
 
-tserver::TabletSnapshotOpRequestPB* SnapshotOperationState::AllocateRequest() {
-  request_holder_ = std::make_unique<tserver::TabletSnapshotOpRequestPB>();
-  request_ = request_holder_.get();
-  return request_holder_.get();
+Result<std::string> SnapshotOperationState::TopSnapshotsDir() const {
+  const string top_snapshots_dir = tablet()->metadata()->snapshots_dir();
+  RETURN_NOT_OK_PREPEND(
+      tablet()->metadata()->fs_manager()->CreateDirIfMissingAndSync(top_snapshots_dir),
+      Format("Unable to create snapshots directory $0", top_snapshots_dir));
+  return top_snapshots_dir;
+}
+
+Status SnapshotOperationState::DoCheckOperationRequirements() {
+  if (operation() != TabletSnapshotOpRequestPB::RESTORE_ON_TABLET) {
+    return Status::OK();
+  }
+
+  const string snapshot_dir = VERIFY_RESULT(GetSnapshotDir());
+  Status s = tablet()->rocksdb_env().FileExists(snapshot_dir);
+
+  if (!s.ok()) {
+    return s.CloneAndAddErrorCode(TabletServerError(TabletServerErrorPB::INVALID_SNAPSHOT)).
+             CloneAndPrepend(Format("Snapshot dir: $0", snapshot_dir));
+  }
+
+  return Status::OK();
+}
+
+bool SnapshotOperationState::CheckOperationRequirements() {
+  auto status = DoCheckOperationRequirements();
+  if (status.ok()) {
+    return true;
+  }
+
+  // LogPrefix() calls ToString() which needs correct hybrid_time.
+  TrySetHybridTimeFromClock();
+  LOG_WITH_PREFIX(WARNING) << status;
+  TRACE("Requirements was not satisfied for snapshot operation: $0", operation());
+  // Run the callback, finish RPC and return the error to the sender.
+  CompleteWithStatus(status);
+  Finish();
+  return false;
+}
+
+Result<SnapshotCoordinator&> GetSnapshotCoordinator(SnapshotOperationState* state) {
+  auto snapshot_coordinator = state->tablet()->snapshot_coordinator();
+  if (!snapshot_coordinator) {
+    return STATUS_FORMAT(IllegalState, "Replicated $0 to tablet without snapshot coordinator",
+                         TabletSnapshotOpRequestPB::Operation_Name(state->request()->operation()));
+  }
+  return *snapshot_coordinator;
 }
 
 Status SnapshotOperationState::Apply(int64_t leader_term) {
   TRACE("APPLY SNAPSHOT: Starting");
   auto operation = request()->operation();
   switch (operation) {
-    case TabletSnapshotOpRequestPB::CREATE_ON_MASTER: {
-      auto snapshot_coordinator = tablet()->snapshot_coordinator();
-      if (!snapshot_coordinator) {
-        return STATUS_FORMAT(IllegalState, "Replicated $0 to tablet without snapshot coordinator",
-                             TabletSnapshotOpRequestPB::Operation_Name(operation));
-      }
-      return snapshot_coordinator->Replicated(leader_term, *this);
-    }
+    case TabletSnapshotOpRequestPB::CREATE_ON_MASTER:
+      return VERIFY_RESULT(GetSnapshotCoordinator(this)).get().CreateReplicated(leader_term, *this);
+    case TabletSnapshotOpRequestPB::DELETE_ON_MASTER:
+      return VERIFY_RESULT(GetSnapshotCoordinator(this)).get().DeleteReplicated(leader_term, *this);
+    case TabletSnapshotOpRequestPB::RESTORE_SYS_CATALOG:
+      return VERIFY_RESULT(GetSnapshotCoordinator(this)).get().RestoreSysCatalogReplicated(
+          leader_term, *this);
     case TabletSnapshotOpRequestPB::CREATE_ON_TABLET:
       return tablet()->snapshots().Create(this);
-    case TabletSnapshotOpRequestPB::RESTORE:
+    case TabletSnapshotOpRequestPB::RESTORE_ON_TABLET:
       return tablet()->snapshots().Restore(this);
-    case TabletSnapshotOpRequestPB::DELETE:
+    case TabletSnapshotOpRequestPB::DELETE_ON_TABLET:
       return tablet()->snapshots().Delete(this);
     case google::protobuf::kint32min: FALLTHROUGH_INTENDED;
     case google::protobuf::kint32max: FALLTHROUGH_INTENDED;
@@ -96,13 +138,18 @@ SnapshotOperation::SnapshotOperation(std::unique_ptr<SnapshotOperationState> sta
     : Operation(std::move(state), OperationType::kSnapshot) {}
 
 void SnapshotOperationState::UpdateRequestFromConsensusRound() {
-  request_ = consensus_round()->replicate_msg()->mutable_snapshot_request();
+  UseRequest(consensus_round()->replicate_msg()->mutable_snapshot_request());
 }
 
 consensus::ReplicateMsgPtr SnapshotOperation::NewReplicateMsg() {
   auto result = std::make_shared<ReplicateMsg>();
   result->set_op_type(SNAPSHOT_OP);
-  result->mutable_snapshot_request()->CopyFrom(*state()->request());
+  auto request = state()->ReleaseRequest();
+  if (request) {
+    result->set_allocated_snapshot_request(request);
+  } else {
+    *result->mutable_snapshot_request() = *state()->request();
+  }
   return result;
 }
 
@@ -128,24 +175,9 @@ Status SnapshotOperation::DoAborted(const Status& status) {
 }
 
 Status SnapshotOperation::DoReplicated(int64_t leader_term, Status* complete_status) {
-  RETURN_NOT_OK(state()->Apply(leader_term));
-
-  ReleaseSchemaLock();
+  auto status = state()->Apply(leader_term);
   state()->Finish();
-
-  return Status::OK();
-}
-
-void SnapshotOperation::AcquireSchemaLock(rw_semaphore* l) {
-  TRACE("Acquiring schema lock in exclusive mode");
-  schema_lock_ = std::unique_lock<rw_semaphore>(*l);
-  TRACE("Acquired schema lock");
-}
-
-void SnapshotOperation::ReleaseSchemaLock() {
-  CHECK(schema_lock_.owns_lock());
-  schema_lock_ = std::unique_lock<rw_semaphore>();
-  TRACE("Released schema lock");
+  return status;
 }
 
 string SnapshotOperation::ToString() const {

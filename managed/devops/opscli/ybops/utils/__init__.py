@@ -1,4 +1,4 @@
-# !/usr/bin/python
+# !/usr/bin/env python
 #
 # Copyright 2019 YugaByte, Inc. and Contributors
 #
@@ -8,9 +8,12 @@
 #
 # https://github.com/YugaByte/yugabyte-db/blob/master/licenses/POLYFORM-FREE-TRIAL-LICENSE-1.0.0.txt
 
+from __future__ import print_function
+
 import atexit
 import boto3
 import botocore
+import distro
 import datetime
 import glob
 import hashlib
@@ -23,6 +26,7 @@ import platform
 import random
 import re
 import shutil
+import six
 import socket
 import string
 import stat
@@ -37,14 +41,15 @@ from enum import Enum
 
 from ybops.common.colors import Colors
 from ybops.common.exceptions import YBOpsRuntimeError
-from replicated import Replicated
+from ybops.utils.remote_shell import RemoteShell
 
 BLOCK_SIZE = 4096
 HOME_FOLDER = os.environ["HOME"]
 YB_FOLDER_PATH = os.path.join(HOME_FOLDER, ".yugabyte")
-SSH_RETRY_LIMIT = 60
+SSH_RETRY_LIMIT = 20
 DEFAULT_SSH_PORT = 22
-SSH_TIMEOUT = 16
+# Timeout in seconds.
+SSH_TIMEOUT = 45
 
 RSA_KEY_LENGTH = 2048
 RELEASE_VERSION_FILENAME = "version.txt"
@@ -52,7 +57,16 @@ RELEASE_VERSION_PATTERN = "\d+.\d+.\d+.\d+"
 RELEASE_REPOS = set(["devops", "yugaware", "yugabyte"])
 
 # Home directory of node instances. Try to read home dir from env, else assume it's /home/yugabyte.
-YB_HOME_DIR = os.environ.get("YB_HOME_DIR", "/home/yugabyte")
+YB_HOME_DIR = os.environ.get("YB_HOME_DIR") or "/home/yugabyte"
+# Sudo password for remote host.
+YB_SUDO_PASS = os.environ.get("YB_SUDO_PASS")
+
+# TTL in seconds for how long DNS records will be cached.
+DNS_RECORD_SET_TTL = 5
+
+# Minimum required resources on a VM.
+MIN_MEM_SIZE_GB = 2
+MIN_NUM_CORES = 2
 
 
 class ReleasePackage(object):
@@ -74,7 +88,7 @@ class ReleasePackage(object):
         obj.build_type = build_type
         obj.system = platform.system().lower()
         if obj.system == "linux":
-            obj.system = platform.linux_distribution(full_distribution_name=False)[0].lower()
+            obj.system = distro.linux_distribution(full_distribution_name=False)[0].lower()
         if len(obj.system) == 0:
             raise YBOpsRuntimeError("Cannot release on this system type: " + platform.system())
         obj.machine = platform.machine().lower()
@@ -167,7 +181,7 @@ def init_logging(log_level):
     """
     logging.basicConfig(
         level=log_level,
-        format="%(asctime)s %(levelname)s: %(message)s")
+        format="%(asctime)s %(levelname)s %(funcName)s:%(filename)s:%(lineno)d: %(message)s")
 
 
 def is_devops_root_dir(devops_home):
@@ -245,10 +259,11 @@ def confirm_prompt(prompt):
         (boolean): Prompt response
     """
     if not os.isatty((sys.stdout.fileno())):
-        print >> sys.stderr, "Not running interactively. Assuming 'N'."
+        print("Not running interactively. Assuming 'N'.", file=sys.stderr)
         return False
 
-    prompt_input = raw_input("{} [Y/n]: ".format(prompt)).strip().lower()
+    # str(input) for py2-py3 compatbility.
+    prompt_input = str(input("{} [Y/n]: ".format(prompt)).strip().lower())
     if prompt_input not in ['y', 'yes', '']:
         sys.exit(1)
 
@@ -259,9 +274,9 @@ def get_checksum(file_path, hasher):
     Returns:
         (string): hex digest based on the hasher provided
     """
-    with file(file_path, "rb") as f:
+    with open(file_path, "rb") as f:
         # Read the file in 4KB chunks until EOF.
-        for chunk in iter(lambda: f.read(BLOCK_SIZE), ""):
+        for chunk in iter(lambda: f.read(BLOCK_SIZE), b''):
             hasher.update(chunk)
         return hasher.hexdigest()
 
@@ -306,24 +321,6 @@ def can_ssh(host_name, port, username, ssh_key_file):
         return False
     finally:
         ssh_client.close()
-
-
-def get_custom_ssh_port():
-    """This method reads the group variables file and returns
-    yugabyte custom ssh port.
-
-    Returns:
-        (int): custom SSH port number.
-    """
-    group_vars_file = os.path.join(YB_DEVOPS_HOME, "group_vars", "all")
-    with open(group_vars_file, 'r') as stream:
-        try:
-            group_vars = yaml.load(stream)
-            return group_vars["custom_ssh_port"]
-        except yaml.YAMLError as e:
-            raise YBOpsRuntimeError("Reading group vars: {}, {}".format(group_vars_file, e))
-
-    return None
 
 
 def get_internal_datafile_path(file_name):
@@ -386,7 +383,7 @@ def get_release_file(repository, release_name, build_type=None):
         # TODO: why are we mkdir-ing during a function that's supposed to return a path...
         os.makedirs(build_dir)
 
-    cur_commit = subprocess.check_output(["git", "rev-parse", "HEAD"]).strip()
+    cur_commit = str(subprocess.check_output(["git", "rev-parse", "HEAD"]).strip().decode('utf-8'))
     release = ReleasePackage.from_pieces(release_name, base_version, cur_commit, build_type)
     file_name = release.get_release_package_name()
     return os.path.join(build_dir, file_name)
@@ -406,7 +403,7 @@ def is_valid_ip_address(ip_addr):
         return False
 
 
-def get_ssh_host_port(host_info, default_port=False):
+def get_ssh_host_port(host_info, custom_port, default_port=False):
     """This method would return ssh_host and port which we should use for ansible. If host_info
     includes a ssh_port key, then we return its value. Otherwise, if the default_port param is
     True, then we return a Default SSH port (22) else, we return a custom ssh port.
@@ -419,7 +416,7 @@ def get_ssh_host_port(host_info, default_port=False):
     """
     ssh_port = host_info.get("ssh_port")
     if ssh_port is None:
-        ssh_port = (DEFAULT_SSH_PORT if default_port else get_custom_ssh_port())
+        ssh_port = (DEFAULT_SSH_PORT if default_port else custom_port)
     return {
         "ssh_port": ssh_port,
         "ssh_host": host_info["private_ip"]
@@ -443,8 +440,6 @@ def wait_for_ssh(host_ip, ssh_port, ssh_user, ssh_key):
         if can_ssh(host_ip, ssh_port, ssh_user, ssh_key):
             return True
 
-        sys.stdout.write('.')
-        sys.stdout.flush()
         time.sleep(1)
 
         if retry_count > SSH_RETRY_LIMIT:
@@ -462,9 +457,9 @@ def format_rsa_key(key, public_key):
         key (str): Encoded key in OpenSSH or PEM format based on the flag (public key or not).
     """
     if public_key:
-        return key.publickey().exportKey("OpenSSH")
+        return str(key.publickey().exportKey("OpenSSH"))
     else:
-        return key.exportKey("PEM")
+        return str(key.exportKey("PEM"))
 
 
 def validated_key_file(key_file):
@@ -479,7 +474,7 @@ def validated_key_file(key_file):
     if not os.path.exists(key_file):
         raise YBOpsRuntimeError("Key file {} not found.".format(key_file))
 
-    with file(key_file) as f:
+    with open(key_file) as f:
         return RSA.importKey(f.read())
 
 
@@ -504,10 +499,10 @@ def generate_rsa_keypair(key_name, destination='/tmp'):
     if os.path.exists(private_key_filename):
         raise YBOpsRuntimeError("Private key file {} already exists".format(private_key_filename))
 
-    with file(public_key_filename, "w") as f:
+    with open(public_key_filename, "w") as f:
         f.write(format_rsa_key(new_key, public_key=True))
         os.chmod(f.name, stat.S_IRUSR)
-    with file(private_key_filename, "w") as f:
+    with open(private_key_filename, "w") as f:
         f.write(format_rsa_key(new_key, public_key=False))
         os.chmod(f.name, stat.S_IRUSR)
 
@@ -521,7 +516,7 @@ def generate_random_password(size=32):
     Returns:
         password(str): Random alpha numeric password string.
     """
-    return ''.join([random.choice(string.ascii_letters + string.digits) for _ in xrange(size)])
+    return ''.join([random.choice(string.ascii_letters + string.digits) for _ in range(size)])
 
 
 class ValidationResult(Enum):
@@ -590,12 +585,84 @@ def validate_instance(host_name, port, username, ssh_key_file, mount_paths):
         ssh_client.close()
 
 
-def scp_package_to_tmp(package, host, user, port, private_key):
-    dest_path = os.path.join("/tmp", os.path.basename(package))
-    logging.info("Copying package from local '{}' to remote '{}'".format(
-        package, dest_path))
+def validate_cron_status(host_name, port, username, ssh_key_file):
+    """This method tries to ssh to the host with the username provided on the port, checks if
+    our expected cronjobs are present, and returns true if they are. Any failure, including SSH
+    issues will cause it to return false.
+    Args:
+        host_name (str): SSH host IP address
+        port (int): SSH port
+        username (str): SSH username
+        ssh_key_file (str): SSH key file
+    Returns:
+        bool: true if all cronjobs are present, false otherwise (or if errored)
+    """
+    ssh_key = paramiko.RSAKey.from_private_key_file(ssh_key_file)
+    ssh_client = get_ssh_client()
+
+    try:
+        # Try to connect via SSH
+        ssh_client.connect(hostname=host_name,
+                           username=username,
+                           pkey=ssh_key,
+                           port=port,
+                           timeout=SSH_TIMEOUT,
+                           banner_timeout=SSH_TIMEOUT)
+
+        _, stdout, stderr = ssh_client.exec_command("crontab -l")
+        cronjobs = ["clean_cores.sh", "zip_purge_yb_logs.sh", "yb-server-ctl.sh tserver"]
+        stdout = stdout.read()
+        return len(stderr.readlines()) == 0 and all(c in stdout for c in cronjobs)
+    except (paramiko.ssh_exception.NoValidConnectionsError,
+            paramiko.ssh_exception.AuthenticationException,
+            paramiko.ssh_exception.SSHException,
+            socket.timeout, socket.error) as e:
+        logging.error("Failed to validate cronjobs: {}".format(e))
+        return False
+    finally:
+        ssh_client.close()
+
+
+def remote_exec_command(host_name, port, username, ssh_key_file, cmd, timeout=SSH_TIMEOUT):
+    """This method will execute the given cmd on remote host and return the output.
+    Args:
+        host_name (str): SSH host IP address
+        port (int): SSH port
+        username (str): SSH username
+        ssh_key_file (str): SSH key file
+        cmd (str): Command to run
+        timetout (int): Time in seconds to wait before erroring
+    Returns:
+        rc (int): returncode
+        stdout (str): output log
+        stderr (str): error logs
+    """
+    ssh_key = paramiko.RSAKey.from_private_key_file(ssh_key_file)
+    ssh_client = get_ssh_client()
+
+    try:
+        ssh_client.connect(hostname=host_name,
+                           username=username,
+                           pkey=ssh_key,
+                           port=port,
+                           timeout=timeout,
+                           banner_timeout=timeout)
+
+        _, stdout, stderr = ssh_client.exec_command(cmd)
+        return stdout.channel.recv_exit_status(), stdout.readlines(), stderr.readlines()
+    except (paramiko.ssh_exception, socket.timeout, socket.error) as e:
+        logging.error("Failed to execute remote command: {}".format(e))
+        return False
+    finally:
+        ssh_client.close()
+
+
+def scp_to_tmp(filepath, host, user, port, private_key):
+    dest_path = os.path.join("/tmp", os.path.basename(filepath))
+    logging.info("[app] Copying local '{}' to remote '{}'".format(
+        filepath, dest_path))
     scp_cmd = [
-        "scp", "-i", private_key, "-P", str(port),
+        "scp", "-i", private_key, "-P", str(port), "-p",
         "-o", "stricthostkeychecking=no",
         "-o", "ServerAliveInterval=30",
         "-o", "ServerAliveCountMax=20",
@@ -603,7 +670,7 @@ def scp_package_to_tmp(package, host, user, port, private_key):
         "-o", "ControlPersist=600s",
         "-o", "IPQoS=throughput",
         "-vvvv",
-        package, "{}@{}:{}".format(user, host, dest_path)
+        filepath, "{}@{}:{}".format(user, host, dest_path)
     ]
     # Save the debug output to temp files.
     out_fd, out_name = tempfile.mkstemp(text=True)
@@ -622,6 +689,7 @@ def scp_package_to_tmp(package, host, user, port, private_key):
     # Cleanup the temp files now that they are clearly not needed.
     os.remove(out_name)
     os.remove(err_name)
+    return proc.returncode
 
 
 def get_or_create(getter):
@@ -679,4 +747,22 @@ def is_mac():
 def linux_get_ip_address(ifname):
     """Get the inet ip address of this machine (as shown by ifconfig). Assumes linux env.
     """
-    return subprocess.check_output(["hostname", "--ip-address"]).strip()
+    return str(subprocess.check_output(["hostname", "--ip-address"]).decode("utf-8").strip())
+
+
+# Given a comma separated string of paths on a remote host
+# and ssh_options to connect to the remote host
+# returns a comma separated string of the root mount paths for those paths
+def get_mount_roots(ssh_options, paths):
+    remote_shell = RemoteShell(ssh_options)
+    remote_cmd = 'df --output=target {}'.format(" ".join(paths.split(",")))
+    # Example output of the df cmd
+    # $ df --output=target /bar/foo/rnd /storage/abc
+    # Mounted on
+    # /bar
+    # /storage
+
+    mount_roots = remote_shell.run_command(remote_cmd).stdout.split('\n')[1:]
+    return ",".join(
+        [mroot.strip() for mroot in mount_roots if mroot.strip()]
+    )

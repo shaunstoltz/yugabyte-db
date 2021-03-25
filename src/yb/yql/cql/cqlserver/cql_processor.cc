@@ -23,8 +23,6 @@
 #include "yb/rpc/messenger.h"
 #include "yb/rpc/rpc_context.h"
 
-#include "yb/util/crypt.h"
-
 #include "yb/yql/cql/cqlserver/cql_service.h"
 
 METRIC_DEFINE_histogram_with_percentiles(
@@ -71,15 +69,21 @@ METRIC_DEFINE_counter(server, cql_processors_created,
                       yb::MetricUnit::kUnits,
                       "Number of created CQL Processors.");
 
+METRIC_DEFINE_gauge_int64(server, cql_parsers_alive,
+                          "Number of alive CQL Parsers.",
+                          yb::MetricUnit::kUnits,
+                          "Number of alive CQL Parsers.");
+
+METRIC_DEFINE_counter(server, cql_parsers_created,
+                      "Number of created CQL Parsers.",
+                      yb::MetricUnit::kUnits,
+                      "Number of created CQL Parsers.");
+
 DECLARE_bool(use_cassandra_authentication);
+DECLARE_bool(ycql_cache_login_info);
 
 namespace yb {
 namespace cqlserver {
-
-const unordered_map<string, vector<string>> kSupportedOptions = {
-  {CQLMessage::kCQLVersionOption, {"3.0.0" /* minimum */, "3.4.2" /* current */} },
-  {CQLMessage::kCompressionOption, {CQLMessage::kLZ4Compression, CQLMessage::kSnappyCompression} }
-};
 
 constexpr const char* const kCassandraPasswordAuthenticator =
     "org.apache.cassandra.auth.PasswordAuthenticator";
@@ -87,6 +91,9 @@ constexpr const char* const kCassandraPasswordAuthenticator =
 extern const char* const kRoleColumnNameSaltedHash;
 extern const char* const kRoleColumnNameCanLogin;
 
+using namespace yb::ql; // NOLINT
+
+using std::make_unique;
 using std::shared_ptr;
 using std::unique_ptr;
 
@@ -101,10 +108,14 @@ using ql::QLProcessor;
 using ql::ParseTree;
 using ql::Statement;
 using ql::StatementBatch;
-using ql::StatementExecutedCallback;
 using ql::ErrorCode;
 using ql::GetErrorCode;
+
+using ql::audit::IsPrepare;
+using ql::audit::ErrorIsFormatted;
+
 using strings::Substitute;
+
 using yb::util::bcrypt_checkpw;
 
 //------------------------------------------------------------------------------------------------
@@ -128,18 +139,22 @@ CQLMetrics::CQLMetrics(const scoped_refptr<yb::MetricEntity>& metric_entity)
       METRIC_yb_cqlserver_CQLServerService_ParsingErrors.Instantiate(metric_entity);
   cql_processors_alive_ = METRIC_cql_processors_alive.Instantiate(metric_entity, 0);
   cql_processors_created_ = METRIC_cql_processors_created.Instantiate(metric_entity);
+  parsers_alive_ = METRIC_cql_parsers_alive.Instantiate(metric_entity, 0);
+  parsers_created_ = METRIC_cql_parsers_created.Instantiate(metric_entity);
 }
 
 //------------------------------------------------------------------------------------------------
 CQLProcessor::CQLProcessor(CQLServiceImpl* service_impl, const CQLProcessorListPos& pos)
     : QLProcessor(service_impl->client(), service_impl->metadata_cache(),
                   service_impl->cql_metrics().get(),
+                  &service_impl->parser_pool(),
                   service_impl->clock(),
-                  service_impl->transaction_pool_provider()),
+                  std::bind(&CQLServiceImpl::TransactionPool, service_impl)),
       service_impl_(service_impl),
       cql_metrics_(service_impl->cql_metrics()),
       pos_(pos),
-      statement_executed_cb_(Bind(&CQLProcessor::StatementExecuted, Unretained(this))) {
+      statement_executed_cb_(Bind(&CQLProcessor::StatementExecuted, Unretained(this))),
+      consumption_(service_impl->processors_mem_tracker(), sizeof(*this)) {
   IncrementCounter(cql_metrics_->cql_processors_created_);
   IncrementGauge(cql_metrics_->cql_processors_alive_);
 }
@@ -148,8 +163,18 @@ CQLProcessor::~CQLProcessor() {
   DecrementGauge(cql_metrics_->cql_processors_alive_);
 }
 
+void CQLProcessor::Shutdown() {
+  auto call = std::move(call_);
+  if (call) {
+    call->RespondFailure(
+        rpc::ErrorStatusPB::FATAL_SERVER_SHUTTING_DOWN, STATUS(Aborted, "Aborted"));
+  }
+}
+
 void CQLProcessor::ProcessCall(rpc::InboundCallPtr call) {
   call_ = std::dynamic_pointer_cast<CQLInboundCall>(std::move(call));
+  is_rescheduled_.store(IsRescheduled::kFalse, std::memory_order_release);
+  audit_logger_.SetConnection(call_->connection());
   unique_ptr<CQLRequest> request;
   unique_ptr<CQLResponse> response;
 
@@ -173,8 +198,19 @@ void CQLProcessor::ProcessCall(rpc::InboundCallPtr call) {
   request_ = std::move(request);
   call_->SetRequest(request_, service_impl_);
   retry_count_ = 0;
-  response.reset(ProcessRequest(*request_));
+  response = ProcessRequest(*request_);
   PrepareAndSendResponse(response);
+}
+
+void CQLProcessor::Release() {
+  call_ = nullptr;
+  request_ = nullptr;
+  stmts_.clear();
+  parse_trees_.clear();
+  SetCurrentSession(nullptr);
+  is_rescheduled_.store(IsRescheduled::kFalse, std::memory_order_release);
+  audit_logger_.SetConnection(nullptr);
+  service_impl_->ReturnProcessor(pos_);
 }
 
 void CQLProcessor::PrepareAndSendResponse(const unique_ptr<CQLResponse>& response) {
@@ -206,16 +242,26 @@ void CQLProcessor::SendResponse(const CQLResponse& response) {
   cql_metrics_->time_to_queue_cql_response_->Increment(
       response_done.GetDeltaSince(response_begin).ToMicroseconds());
 
-  // Release the processor.
-  call_ = nullptr;
-  request_ = nullptr;
-  stmts_.clear();
-  parse_trees_.clear();
-  SetCurrentSession(nullptr);
-  service_impl_->ReturnProcessor(pos_);
+  Release();
 }
 
-CQLResponse* CQLProcessor::ProcessRequest(const CQLRequest& req) {
+bool CQLProcessor::CheckAuthentication(const CQLRequest& req) const {
+  return call_->ql_session()->is_user_authenticated() ||
+      // CQL requests which do not need authorization.
+      req.opcode() == CQLMessage::Opcode::STARTUP ||
+      // Some drivers issue OPTIONS prior to AUTHENTICATE
+      req.opcode() == CQLMessage::Opcode::OPTIONS ||
+      req.opcode() == CQLMessage::Opcode::AUTH_RESPONSE;
+}
+
+unique_ptr<CQLResponse> CQLProcessor::ProcessRequest(const CQLRequest& req) {
+  if (FLAGS_use_cassandra_authentication && !CheckAuthentication(req)) {
+    LOG(ERROR) << "Could not execute statement by not authenticated user!";
+    return make_unique<ErrorResponse>(
+        req, ErrorResponse::Code::SERVER_ERROR,
+        "Could not execute statement by not authenticated user");
+  }
+
   switch (req.opcode()) {
     case CQLMessage::Opcode::OPTIONS:
       return ProcessRequest(static_cast<const OptionsRequest&>(req));
@@ -249,11 +295,11 @@ CQLResponse* CQLProcessor::ProcessRequest(const CQLRequest& req) {
   return nullptr;
 }
 
-CQLResponse* CQLProcessor::ProcessRequest(const OptionsRequest& req) {
-  return new SupportedResponse(req, &kSupportedOptions);
+unique_ptr<CQLResponse> CQLProcessor::ProcessRequest(const OptionsRequest& req) {
+  return make_unique<SupportedResponse>(req, &kSupportedOptions);
 }
 
-CQLResponse* CQLProcessor::ProcessRequest(const StartupRequest& req) {
+unique_ptr<CQLResponse> CQLProcessor::ProcessRequest(const StartupRequest& req) {
   for (const auto& option : req.options()) {
     const auto& name = option.first;
     const auto& value = option.second;
@@ -269,20 +315,20 @@ CQLResponse* CQLProcessor::ProcessRequest(const StartupRequest& req) {
       } else if (value == CQLMessage::kSnappyCompression) {
         context.set_compression_scheme(CQLMessage::CompressionScheme::kSnappy);
       } else {
-        return new ErrorResponse(
+        return make_unique<ErrorResponse>(
             req, ErrorResponse::Code::PROTOCOL_ERROR,
             Substitute("Unsupported compression scheme $0", value));
       }
     }
   }
   if (FLAGS_use_cassandra_authentication) {
-    return new AuthenticateResponse(req, kCassandraPasswordAuthenticator);
+    return make_unique<AuthenticateResponse>(req, kCassandraPasswordAuthenticator);
   } else {
-    return new ReadyResponse(req);
+    return make_unique<ReadyResponse>(req);
   }
 }
 
-CQLResponse* CQLProcessor::ProcessRequest(const PrepareRequest& req) {
+unique_ptr<CQLResponse> CQLProcessor::ProcessRequest(const PrepareRequest& req) {
   VLOG(1) << "PREPARE " << req.query();
   const CQLMessage::QueryId query_id = CQLStatement::GetQueryId(
       ql_env_.CurrentKeyspace(), req.query());
@@ -295,18 +341,33 @@ CQLResponse* CQLProcessor::ProcessRequest(const PrepareRequest& req) {
   shared_ptr<CQLStatement> stmt = service_impl_->AllocatePreparedStatement(
       query_id, ql_env_.CurrentKeyspace(), req.query());
   PreparedResult::UniPtr result;
-  const Status s = stmt->Prepare(this, service_impl_->prepared_stmts_mem_tracker(),
-                                 false /* internal */, &result);
+  Status s = stmt->Prepare(this, service_impl_->prepared_stmts_mem_tracker(),
+                           false /* internal */, &result);
+
+  if (s.ok()) {
+    auto pt_result = stmt->GetParseTree();
+    if (pt_result.ok()) {
+      s = audit_logger_.LogStatement(pt_result->root().get(), req.query(),
+                                     IsPrepare::kTrue);
+    } else {
+      s = pt_result.status();
+    }
+  } else {
+    WARN_NOT_OK(audit_logger_.LogStatementError(req.query(), s,
+                                                ErrorIsFormatted::kTrue),
+                "Failed to log an audit record");
+  }
+
   if (!s.ok()) {
     service_impl_->DeletePreparedStatement(stmt);
     return ProcessError(s, stmt->query_id());
   }
 
-  return (result != nullptr) ? new PreparedResultResponse(req, query_id, *result)
-                             : new PreparedResultResponse(req, query_id);
+  return (result != nullptr) ? make_unique<PreparedResultResponse>(req, query_id, *result)
+                             : make_unique<PreparedResultResponse>(req, query_id);
 }
 
-CQLResponse* CQLProcessor::ProcessRequest(const ExecuteRequest& req) {
+unique_ptr<CQLResponse> CQLProcessor::ProcessRequest(const ExecuteRequest& req) {
   VLOG(1) << "EXECUTE " << b2a_hex(req.query_id());
   const shared_ptr<const CQLStatement> stmt = GetPreparedStatement(req.query_id());
   if (stmt == nullptr) {
@@ -316,18 +377,36 @@ CQLResponse* CQLProcessor::ProcessRequest(const ExecuteRequest& req) {
   return s.ok() ? nullptr : ProcessError(s, stmt->query_id());
 }
 
-CQLResponse* CQLProcessor::ProcessRequest(const QueryRequest& req) {
+unique_ptr<CQLResponse> CQLProcessor::ProcessRequest(const QueryRequest& req) {
   VLOG(1) << "QUERY " << req.query();
+  if (service_impl_->system_cache() != nullptr) {
+    auto cached_response = service_impl_->system_cache()->Lookup(req.query());
+    if (cached_response) {
+      VLOG(1) << "Using cached response for " << req.query();
+      statement_executed_cb_.Run(
+          Status::OK(),
+          std::static_pointer_cast<ExecutedResult>(*cached_response));
+      return nullptr;
+    }
+  }
   RunAsync(req.query(), req.params(), statement_executed_cb_);
   return nullptr;
 }
 
-CQLResponse* CQLProcessor::ProcessRequest(const BatchRequest& req) {
+unique_ptr<CQLResponse> CQLProcessor::ProcessRequest(const BatchRequest& req) {
   VLOG(1) << "BATCH " << req.queries().size();
 
   StatementBatch batch;
   batch.reserve(req.queries().size());
 
+  // If no errors happen, batch request started here will be ended by the executor.
+  Status s = audit_logger_.StartBatchRequest(req.queries().size(),
+                                             is_rescheduled_.load(std::memory_order_acquire));
+  if (PREDICT_FALSE(!s.ok())) {
+    return ProcessError(s);
+  }
+
+  unique_ptr<CQLResponse> result;
   // For each query in the batch, look up the query id if it is a prepared statement, or prepare the
   // query if it is not prepared. Then execute the parse trees with the parameters.
   for (const BatchRequest::Query& query : req.queries()) {
@@ -335,23 +414,35 @@ CQLResponse* CQLProcessor::ProcessRequest(const BatchRequest& req) {
       VLOG(1) << "BATCH EXECUTE " << b2a_hex(query.query_id);
       const shared_ptr<const CQLStatement> stmt = GetPreparedStatement(query.query_id);
       if (stmt == nullptr) {
-        return ProcessError(ErrorStatus(ErrorCode::UNPREPARED_STATEMENT), query.query_id);
+        result = ProcessError(ErrorStatus(ErrorCode::UNPREPARED_STATEMENT), query.query_id);
+        break;
       }
       const Result<const ParseTree&> parse_tree = stmt->GetParseTree();
       if (!parse_tree) {
-        return ProcessError(parse_tree.status(), query.query_id);
+        result = ProcessError(parse_tree.status(), query.query_id);
+        break;
       }
       batch.emplace_back(*parse_tree, query.params);
     } else {
       VLOG(1) << "BATCH QUERY " << query.query;
       ParseTree::UniPtr parse_tree;
-      const Status s = Prepare(query.query, &parse_tree);
+      s = Prepare(query.query, &parse_tree);
       if (PREDICT_FALSE(!s.ok())) {
-        return ProcessError(s);
+        result = ProcessError(s);
+        break;
       }
       batch.emplace_back(*parse_tree, query.params);
       parse_trees_.insert(std::move(parse_tree));
     }
+  }
+
+  if (result) {
+    s = audit_logger_.EndBatchRequest();
+    // Otherwise, batch request will be ended by the executor or when processing an error.
+    if (PREDICT_FALSE(!s.ok())) {
+      result = ProcessError(s);
+    }
+    return result;
   }
 
   ExecuteAsync(batch, statement_executed_cb_);
@@ -359,28 +450,47 @@ CQLResponse* CQLProcessor::ProcessRequest(const BatchRequest& req) {
   return nullptr;
 }
 
-CQLResponse* CQLProcessor::ProcessRequest(const AuthResponseRequest& req) {
+unique_ptr<CQLResponse> CQLProcessor::ProcessRequest(const AuthResponseRequest& req) {
   const auto& params = req.params();
+  if (FLAGS_ycql_cache_login_info) {
+    auto salted_hash_result = ql_env_.RoleSaltedHash(params.username);
+    if (salted_hash_result.ok()) {
+      auto can_login_result = ql_env_.RoleCanLogin(params.username);
+      if (can_login_result.ok()) {
+        unique_ptr<CQLResponse> response =
+          ProcessAuthResult(*salted_hash_result, *can_login_result);
+        VLOG(1) << "Used cached authentication";
+        Status s = audit_logger_.LogAuthResponse(*response);
+        return response;
+      } else {
+        VLOG(1) << "Unable to get can_login for user " << params.username << ": "
+                  << can_login_result;
+      }
+    } else {
+      VLOG(1) << "Unable to get salted hash for user " << params.username << ": "
+                << salted_hash_result;
+    }
+  }
   shared_ptr<Statement> stmt = service_impl_->GetAuthPreparedStatement();
   if (!stmt->Prepare(this, nullptr /* memtracker */, true /* internal */).ok()) {
-    return new ErrorResponse(
+    return make_unique<ErrorResponse>(
         req, ErrorResponse::Code::SERVER_ERROR,
         "Could not prepare statement for querying user " + params.username);
   }
   if (!stmt->ExecuteAsync(this, params, statement_executed_cb_).ok()) {
     LOG(ERROR) << "Could not execute prepared statement to fetch login info!";
-    return new ErrorResponse(
+    return make_unique<ErrorResponse>(
         req, ErrorResponse::Code::SERVER_ERROR,
         "Could not execute prepared statement for querying roles for user " + params.username);
   }
   return nullptr;
 }
 
-CQLResponse* CQLProcessor::ProcessRequest(const RegisterRequest& req) {
+unique_ptr<CQLResponse> CQLProcessor::ProcessRequest(const RegisterRequest& req) {
   CQLConnectionContext& context =
       static_cast<CQLConnectionContext&>(call_->connection()->context());
   context.add_registered_events(req.events());
-  return new ReadyResponse(req);
+  return make_unique<ReadyResponse>(req);
 }
 
 shared_ptr<const CQLStatement> CQLProcessor::GetPreparedStatement(const CQLMessage::QueryId& id) {
@@ -394,11 +504,15 @@ shared_ptr<const CQLStatement> CQLProcessor::GetPreparedStatement(const CQLMessa
 
 void CQLProcessor::StatementExecuted(const Status& s, const ExecutedResult::SharedPtr& result) {
   unique_ptr<CQLResponse> response(s.ok() ? ProcessResult(result) : ProcessError(s));
+  if (response && !s.ok()) {
+    // Error response means we're not going to be transparently restarting a query.
+    WARN_NOT_OK(audit_logger_.EndBatchRequest(), "Failed to end batch request");
+  }
   PrepareAndSendResponse(response);
 }
 
-CQLResponse* CQLProcessor::ProcessError(const Status& s,
-                                        boost::optional<CQLMessage::QueryId> query_id) {
+unique_ptr<CQLResponse> CQLProcessor::ProcessError(const Status& s,
+                                                   boost::optional<CQLMessage::QueryId> query_id) {
   if (s.IsQLError()) {
     ErrorCode ql_errcode = GetErrorCode(s);
     if (ql_errcode == ErrorCode::UNPREPARED_STATEMENT ||
@@ -415,7 +529,7 @@ CQLResponse* CQLProcessor::ProcessError(const Status& s,
         }
       }
       if (query_id) {
-        return new UnpreparedErrorResponse(*request_, *query_id);
+        return make_unique<UnpreparedErrorResponse>(*request_, *query_id);
       }
       // When no unprepared query id is found, it means all statements we executed were queries
       // (non-prepared statements). In that case, just retry the request (once only). The retry
@@ -427,40 +541,77 @@ CQLResponse* CQLProcessor::ProcessError(const Status& s,
         Reschedule(&process_request_task_.Bind(this));
         return nullptr;
       }
-      return new ErrorResponse(*request_, ErrorResponse::Code::INVALID,
-                               "Query failed to execute due to stale metadata cache");
+      return make_unique<ErrorResponse>(*request_, ErrorResponse::Code::INVALID,
+                                        "Query failed to execute due to stale metadata cache");
     } else if (ql_errcode < ErrorCode::SUCCESS) {
       if (ql_errcode == ErrorCode::UNAUTHORIZED) {
-        return new ErrorResponse(*request_, ErrorResponse::Code::UNAUTHORIZED, s.ToUserMessage());
+        return make_unique<ErrorResponse>(*request_, ErrorResponse::Code::UNAUTHORIZED,
+                                          s.ToUserMessage());
       } else if (ql_errcode > ErrorCode::LIMITATION_ERROR) {
         // System errors, internal errors, or crashes.
-        return new ErrorResponse(*request_, ErrorResponse::Code::SERVER_ERROR, s.ToUserMessage());
+        return make_unique<ErrorResponse>(*request_, ErrorResponse::Code::SERVER_ERROR,
+                                          s.ToUserMessage());
       } else if (ql_errcode > ErrorCode::SEM_ERROR) {
         // Limitation, lexical, or parsing errors.
-        return new ErrorResponse(*request_, ErrorResponse::Code::SYNTAX_ERROR, s.ToUserMessage());
+        return make_unique<ErrorResponse>(*request_, ErrorResponse::Code::SYNTAX_ERROR,
+                                          s.ToUserMessage());
       } else {
         // Semantic or execution errors.
-        return new ErrorResponse(*request_, ErrorResponse::Code::INVALID, s.ToUserMessage());
+        return make_unique<ErrorResponse>(*request_, ErrorResponse::Code::INVALID,
+                                          s.ToUserMessage());
       }
     }
 
     LOG(ERROR) << "Internal error: invalid error code " << static_cast<int64_t>(GetErrorCode(s));
-    return new ErrorResponse(*request_, ErrorResponse::Code::SERVER_ERROR, "Invalid error code");
+    return make_unique<ErrorResponse>(*request_, ErrorResponse::Code::SERVER_ERROR,
+                                      "Invalid error code");
   } else if (s.IsNotAuthorized()) {
-    return new ErrorResponse(*request_, ErrorResponse::Code::UNAUTHORIZED, s.ToUserMessage());
+    return make_unique<ErrorResponse>(*request_, ErrorResponse::Code::UNAUTHORIZED,
+                                      s.ToUserMessage());
   }
 
-  return new ErrorResponse(*request_, ErrorResponse::Code::SERVER_ERROR, s.ToUserMessage());
+  return make_unique<ErrorResponse>(*request_, ErrorResponse::Code::SERVER_ERROR,
+                                    s.ToUserMessage());
 }
 
-CQLResponse* CQLProcessor::ProcessResult(const ExecutedResult::SharedPtr& result) {
+unique_ptr<CQLResponse> CQLProcessor::ProcessAuthResult(const string& saved_hash, bool can_login) {
+  const auto& req = down_cast<const AuthResponseRequest&>(*request_);
+  const auto& params = req.params();
+  unique_ptr<CQLResponse> response = nullptr;
+  bool authenticated = false;
+  // Username doesn't have a password, but one is required for authentication. Return an error.
+  if (saved_hash.empty()) {
+    response = make_unique<ErrorResponse>(*request_,
+        ErrorResponse::Code::BAD_CREDENTIALS,
+        "Provided username " + params.username + " and/or password are incorrect");
+  } else {
+    if (!service_impl_->CheckPassword(params.password, saved_hash)) {
+      response = make_unique<ErrorResponse>(*request_,
+          ErrorResponse::Code::BAD_CREDENTIALS,
+          "Provided username " + params.username + " and/or password are incorrect");
+    } else if (!can_login) {
+      response = make_unique<ErrorResponse>(*request_,
+          ErrorResponse::Code::BAD_CREDENTIALS,
+          params.username + " is not permitted to log in");
+    } else {
+      call_->ql_session()->set_current_role_name(params.username);
+      response = make_unique<AuthSuccessResponse>(*request_,
+                                                  "" /* this does not matter */);
+      authenticated = true;
+    }
+  }
+  call_->ql_session()->set_user_authenticated(authenticated);
+  return response;
+}
+
+unique_ptr<CQLResponse> CQLProcessor::ProcessResult(const ExecutedResult::SharedPtr& result) {
   if (result == nullptr) {
-    return new VoidResultResponse(*request_);
+    return make_unique<VoidResultResponse>(*request_);
   }
   switch (result->type()) {
     case ExecutedResult::Type::SET_KEYSPACE: {
       const auto& set_keyspace_result = static_cast<const SetKeyspaceResult&>(*result);
-      return new SetKeyspaceResultResponse(*request_, set_keyspace_result);
+      return make_unique<SetKeyspaceResultResponse>(*request_, set_keyspace_result);
     }
     case ExecutedResult::Type::ROWS: {
       const RowsResult::SharedPtr& rows_result = std::static_pointer_cast<RowsResult>(result);
@@ -469,38 +620,45 @@ CQLResponse* CQLProcessor::ProcessResult(const ExecutedResult::SharedPtr& result
       }
       switch (request_->opcode()) {
         case CQLMessage::Opcode::EXECUTE:
-          return new RowsResultResponse(down_cast<const ExecuteRequest&>(*request_), rows_result);
+          return make_unique<RowsResultResponse>(down_cast<const ExecuteRequest&>(*request_),
+                                                 rows_result);
         case CQLMessage::Opcode::QUERY:
-          return new RowsResultResponse(down_cast<const QueryRequest&>(*request_), rows_result);
+          return make_unique<RowsResultResponse>(down_cast<const QueryRequest&>(*request_),
+                                                 rows_result);
         case CQLMessage::Opcode::BATCH:
-          return new RowsResultResponse(down_cast<const BatchRequest&>(*request_), rows_result);
+          return make_unique<RowsResultResponse>(down_cast<const BatchRequest&>(*request_),
+                                                 rows_result);
 
         case CQLMessage::Opcode::AUTH_RESPONSE: {
           const auto& req = down_cast<const AuthResponseRequest&>(*request_);
           const auto& params = req.params();
           const auto row_block = rows_result->GetRowBlock();
+          unique_ptr<CQLResponse> response = nullptr;
           if (row_block->row_count() != 1) {
-            return new ErrorResponse(*request_, ErrorResponse::Code::SERVER_ERROR,
-                                     "Could not get data for " + params.username);
+            response = make_unique<ErrorResponse>(*request_,
+                ErrorResponse::Code::BAD_CREDENTIALS,
+                "Provided username " + params.username + " and/or password are incorrect");
           } else {
             const auto& row = row_block->row(0);
             const auto& schema = row_block->schema();
-            const auto& saved_hash =
-                row.column(schema.find_column(kRoleColumnNameSaltedHash)).string_value();
+
+            const QLValue& salted_hash_value =
+                row.column(schema.find_column(kRoleColumnNameSaltedHash));
             const auto& can_login =
                 row.column(schema.find_column(kRoleColumnNameCanLogin)).bool_value();
-            if (!can_login) {
-              return new ErrorResponse(*request_, ErrorResponse::Code::BAD_CREDENTIALS,
-                  params.username + " is not permitted to log in");
-            } else if (bcrypt_checkpw(params.password.c_str(), saved_hash.c_str())) {
-              return new ErrorResponse(*request_, ErrorResponse::Code::BAD_CREDENTIALS,
-                  "Provided username " + params.username + " and/or password are incorrect");
-            } else {
-              call_->ql_session()->set_current_role_name(params.username);
-              return new AuthSuccessResponse(*request_, "" /* this does not matter */);
-            }
+            // Returning empty string is fine since it would error out as expected,
+            // if the hash is empty
+            const string saved_hash = salted_hash_value.IsNull() ?
+                "" : salted_hash_value.string_value();
+            response = ProcessAuthResult(saved_hash, can_login);
           }
-          break;
+          Status s = audit_logger_.LogAuthResponse(*response);
+          if (!s.ok()) {
+            return make_unique<ErrorResponse>(*request_, ErrorResponse::Code::SERVER_ERROR,
+                                              "Failed to write an audit log record");
+          }
+
+          return response;
         }
         case CQLMessage::Opcode::ERROR:   FALLTHROUGH_INTENDED;
         case CQLMessage::Opcode::STARTUP: FALLTHROUGH_INTENDED;
@@ -523,13 +681,13 @@ CQLResponse* CQLProcessor::ProcessResult(const ExecutedResult::SharedPtr& result
     }
     case ExecutedResult::Type::SCHEMA_CHANGE: {
       const auto& schema_change_result = static_cast<const SchemaChangeResult&>(*result);
-      return new SchemaChangeResultResponse(*request_, schema_change_result);
+      return make_unique<SchemaChangeResultResponse>(*request_, schema_change_result);
     }
 
     // default: fall through.
   }
   LOG(ERROR) << "Internal error: unknown result type " << static_cast<int>(result->type());
-  return new ErrorResponse(
+  return make_unique<ErrorResponse>(
       *request_, ErrorResponse::Code::SERVER_ERROR, "Internal error: unknown result type");
 }
 
@@ -542,6 +700,7 @@ bool CQLProcessor::NeedReschedule() {
 }
 
 void CQLProcessor::Reschedule(rpc::ThreadPoolTask* task) {
+  is_rescheduled_.store(IsRescheduled::kTrue, std::memory_order_release);
   auto messenger = service_impl_->messenger();
   DCHECK(messenger != nullptr) << "No messenger to reschedule CQL call";
   messenger->ThreadPool(rpc::ServicePriority::kNormal).Enqueue(task);

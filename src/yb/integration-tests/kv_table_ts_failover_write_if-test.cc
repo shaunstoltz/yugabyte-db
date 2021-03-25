@@ -32,7 +32,7 @@
 
 #include "yb/yql/cql/ql/util/statement_result.h"
 
-DECLARE_bool(combine_batcher_errors);
+DECLARE_bool(TEST_combine_batcher_errors);
 
 namespace yb {
 
@@ -109,20 +109,6 @@ class KVTableTsFailoverWriteIfTest : public integration_tests::YBTableTestBase {
     });
   }
 
-  shared_ptr<YBqlReadOp> CreateReadOp(int32_t key) {
-    const auto op = table_.NewReadOp();
-    auto* const req = op->mutable_request();
-    QLAddInt32HashValue(req, key);
-    auto value_column_id = table_.ColumnId(kValueColumnName);
-    req->add_selected_exprs()->set_column_id(value_column_id);
-    req->mutable_column_refs()->add_ids(value_column_id);
-
-    QLRSColDescPB* rscol_desc = req->mutable_rsrow_desc()->add_rscol_descs();
-    rscol_desc->set_name(kValueColumnName);
-    table_.ColumnType(kValueColumnName)->ToQLTypePB(rscol_desc->mutable_ql_type());
-    return op;
-  }
-
   shared_ptr<YBqlWriteOp> CreateWriteIfOp(int32_t key, int32_t old_value, int32_t new_value) {
     const auto op = table_.NewWriteOp(QLWriteRequestPB::QL_STMT_UPDATE);
     auto* const req = op->mutable_request();
@@ -138,7 +124,7 @@ class KVTableTsFailoverWriteIfTest : public integration_tests::YBTableTestBase {
   }
 
   boost::optional<int32_t> GetValue(const YBSessionPtr& session, int32_t key) {
-    const auto op = CreateReadOp(key);
+    const auto op = client::CreateReadOp(key, table_, kValueColumnName);
     Status s = session->ApplyAndFlush(op);
     if (!s.ok()) {
       return boost::none;
@@ -223,7 +209,7 @@ class KVTableTsFailoverWriteIfTest : public integration_tests::YBTableTestBase {
 
 // Test for ENG-3471 - shouldn't run write-if when leader hasn't yet committed all pendings ops.
 TEST_F(KVTableTsFailoverWriteIfTest, KillTabletServerDuringReplication) {
-  FLAGS_combine_batcher_errors = true;
+  FLAGS_TEST_combine_batcher_errors = true;
 
   const int32_t key = 0;
   const int32_t initial_value = 10000;
@@ -280,14 +266,14 @@ TEST_F(KVTableTsFailoverWriteIfTest, KillTabletServerDuringReplication) {
       "Waiting to read initial value...", small_delay);
 
   // Prevent follower_replica_ts_idx from being elected as a new leader.
-  SetBoolFlag(follower_replica_ts_idx, "follower_reject_update_consensus_requests", true);
+  SetBoolFlag(follower_replica_ts_idx, "TEST_follower_reject_update_consensus_requests", true);
 
   {
-    LogWaiter log_waiter(new_leader_ts, "Pausing due to flag pause_update_replica");
+    LogWaiter log_waiter(new_leader_ts, "Pausing due to flag TEST_pause_update_replica");
 
     // Pause Consensus Update RPC processing on new_leader_ts to delay initial_value + 2 replication
     // till new_leader_ts is elected as a new leader.
-    SetBoolFlag(new_leader_ts_idx, "pause_update_replica", true);
+    SetBoolFlag(new_leader_ts_idx, "TEST_pause_update_replica", true);
 
     // Send write initial_value + 2, it won't be fully replicated until we resume UpdateReplica and
     // UpdateMajorityReplicated.
@@ -309,17 +295,18 @@ TEST_F(KVTableTsFailoverWriteIfTest, KillTabletServerDuringReplication) {
   }
 
   {
-    LogWaiter log_waiter(new_leader_ts, "Pausing due to flag pause_update_majority_replicated");
+    LogWaiter log_waiter(
+        new_leader_ts, "Pausing due to flag TEST_pause_update_majority_replicated");
 
     // Pause applying write ops on new_leader_ts_idx, so initial_value + 2 won't be applied to DocDB
     // yet after going to RAFT log.
-    SetBoolFlag(new_leader_ts_idx, "pause_update_majority_replicated", true);
+    SetBoolFlag(new_leader_ts_idx, "TEST_pause_update_majority_replicated", true);
 
     // Resume UpdateReplica on new_leader_ts_idx, so it can:
     // 1 - Trigger election (RaftConsensus::ReportFailureDetectedTask is waiting on lock inside
     // LOG_WITH_PREFIX).
     // 2 - Append initial_value + 2 to RAFT log.
-    SetBoolFlag(new_leader_ts_idx, "pause_update_replica", false);
+    SetBoolFlag(new_leader_ts_idx, "TEST_pause_update_replica", false);
 
     // new_leader_ts_idx will become leader, but might not be ready to serve due to pending write
     // ops to apply.
@@ -329,7 +316,7 @@ TEST_F(KVTableTsFailoverWriteIfTest, KillTabletServerDuringReplication) {
     }
 
     // We need follower_replica_ts_idx to be able to process Consensus Update RPC from new leader.
-    SetBoolFlag(follower_replica_ts_idx, "follower_reject_update_consensus_requests", false);
+    SetBoolFlag(follower_replica_ts_idx, "TEST_follower_reject_update_consensus_requests", false);
 
     LOG(INFO) << Format(
         "Waiting for $0 to append to RAFT log on $1...", initial_value + 2, new_leader_name);
@@ -337,7 +324,7 @@ TEST_F(KVTableTsFailoverWriteIfTest, KillTabletServerDuringReplication) {
   }
 
   // Make following CAS to pause after doing read and evaluating if part.
-  SetBoolFlag(new_leader_ts_idx, "pause_write_apply_after_if", true);
+  SetBoolFlag(new_leader_ts_idx, "TEST_pause_write_apply_after_if", true);
 
   // Send CAS initial_value -> initial_value + 1.
   std::atomic<bool> cas_completed(false);
@@ -367,7 +354,7 @@ TEST_F(KVTableTsFailoverWriteIfTest, KillTabletServerDuringReplication) {
   SleepFor(3s);
 
   // Let write (initial_value + 2) to be applied to DocDB.
-  SetBoolFlag(new_leader_ts_idx, "pause_update_majority_replicated", false);
+  SetBoolFlag(new_leader_ts_idx, "TEST_pause_update_majority_replicated", false);
 
   // Waiting to read (initial_value + 2) from new leader.
   {
@@ -379,7 +366,7 @@ TEST_F(KVTableTsFailoverWriteIfTest, KillTabletServerDuringReplication) {
   }
 
   // Resume CAS processing.
-  SetBoolFlag(new_leader_ts_idx, "pause_write_apply_after_if", false);
+  SetBoolFlag(new_leader_ts_idx, "TEST_pause_write_apply_after_if", false);
 
   {
     const auto desc = "Waiting for CAS to complete...";

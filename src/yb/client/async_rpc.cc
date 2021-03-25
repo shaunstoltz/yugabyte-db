@@ -14,6 +14,7 @@
 #include "yb/client/async_rpc.h"
 #include "yb/client/batcher.h"
 #include "yb/client/client.h"
+#include "yb/client/client_error.h"
 #include "yb/client/client-internal.h"
 #include "yb/client/in_flight_op.h"
 #include "yb/client/meta_cache.h"
@@ -29,6 +30,7 @@
 
 #include "yb/util/cast.h"
 #include "yb/util/debug-util.h"
+#include "yb/util/flag_tags.h"
 #include "yb/util/logging.h"
 #include "yb/util/yb_pg_errcodes.h"
 
@@ -50,8 +52,24 @@ METRIC_DEFINE_histogram(
     server, handler_latency_yb_client_time_to_send,
     "Time taken for a Write/Read rpc to be sent to the server", yb::MetricUnit::kMicroseconds,
     "Microseconds spent before sending the request to the server", 60000000LU, 2);
-DECLARE_bool(rpc_dump_all_traces);
+
+METRIC_DEFINE_counter(server, consistent_prefix_successful_reads,
+    "Number of consistent prefix reads that were served by the closest replica.",
+    yb::MetricUnit::kRequests,
+    "Number of consistent prefix reads that were served by the closest replica.");
+
+METRIC_DEFINE_counter(server, consistent_prefix_failed_reads,
+    "Number of consistent prefix reads that failed to be served by the closest replica.",
+    yb::MetricUnit::kRequests,
+    "Number of consistent prefix reads that failed to be served by the closest replica.");
+
 DECLARE_bool(collect_end_to_end_traces);
+
+DEFINE_int32(ybclient_print_trace_every_n, 0,
+             "Controls the rate at which traces from ybclient are printed. Setting this to 0 "
+             "disables printing the collected traces.");
+TAG_FLAG(ybclient_print_trace_every_n, advanced);
+TAG_FLAG(ybclient_print_trace_every_n, runtime);
 
 DEFINE_bool(forward_redis_requests, true, "If false, the redis op will not be served if it's not "
             "a local request. The op response will be set to the redis error "
@@ -102,24 +120,29 @@ AsyncRpcMetrics::AsyncRpcMetrics(const scoped_refptr<yb::MetricEntity>& entity)
       remote_read_rpc_time(METRIC_handler_latency_yb_client_read_remote.Instantiate(entity)),
       local_write_rpc_time(METRIC_handler_latency_yb_client_write_local.Instantiate(entity)),
       local_read_rpc_time(METRIC_handler_latency_yb_client_read_local.Instantiate(entity)),
-      time_to_send(METRIC_handler_latency_yb_client_time_to_send.Instantiate(entity)) {
+      time_to_send(METRIC_handler_latency_yb_client_time_to_send.Instantiate(entity)),
+      consistent_prefix_successful_reads(
+          METRIC_consistent_prefix_successful_reads.Instantiate(entity)),
+      consistent_prefix_failed_reads(METRIC_consistent_prefix_failed_reads.Instantiate(entity)) {
 }
 
 AsyncRpc::AsyncRpc(AsyncRpcData* data, YBConsistencyLevel yb_consistency_level)
     : Rpc(data->batcher->deadline(), data->batcher->messenger(), &data->batcher->proxy_cache()),
       batcher_(data->batcher),
       trace_(new Trace),
-      tablet_invoker_(LocalTabletServerOnly(data->ops),
+      ops_(std::move(data->ops)),
+      tablet_invoker_(LocalTabletServerOnly(ops_),
                       yb_consistency_level == YBConsistencyLevel::CONSISTENT_PREFIX,
                       data->batcher->client_,
                       this,
                       this,
                       data->tablet,
+                      table(),
                       mutable_retrier(),
                       trace_.get()),
-      ops_(std::move(data->ops)),
-      start_(MonoTime::Now()),
+      start_(CoarseMonoClock::Now()),
       async_rpc_metrics_(data->batcher->async_rpc_metrics()) {
+
   mutable_retrier()->mutable_controller()->set_allow_local_calls_in_curr_thread(
       data->allow_local_calls_in_curr_thread);
   if (Trace::CurrentTrace()) {
@@ -128,11 +151,16 @@ AsyncRpc::AsyncRpc(AsyncRpcData* data, YBConsistencyLevel yb_consistency_level)
 }
 
 AsyncRpc::~AsyncRpc() {
-  if (PREDICT_FALSE(FLAGS_rpc_dump_all_traces)) {
-    LOG(INFO) << ToString() << " took "
-              << MonoTime::Now().GetDeltaSince(start_).ToMicroseconds()
-              << "us. Trace:";
-    trace_->Dump(&LOG(INFO), true);
+  const auto end_time = CoarseMonoClock::Now();
+  if (trace_->must_print()) {
+    LOG(INFO) << ToString() << " took " << ToMicroseconds(end_time - start_)
+              << "us. Trace:\n" << trace_->DumpToString(true);
+  } else {
+    const auto kPrintTraceEveryN = GetAtomicFlag(&FLAGS_ybclient_print_trace_every_n);
+    YB_LOG_IF_EVERY_N(INFO, kPrintTraceEveryN > 0, kPrintTraceEveryN)
+        << ToString() << " took "
+        << ToMicroseconds(end_time - start_)
+        << "us. Trace:\n" << trace_->DumpToString(true);
   }
 }
 
@@ -145,6 +173,9 @@ void AsyncRpc::SendRpc() {
   // FLAGS_redis_allow_reads_from_followers is set to true.
   // TODO(hector): Temporarily blacklist the follower that couldn't serve the read so we can retry
   // on another follower.
+  if (async_rpc_metrics_ && num_attempts() > 1 && tablet_invoker_.is_consistent_prefix()) {
+    IncrementCounter(async_rpc_metrics_->consistent_prefix_failed_reads);
+  }
   tablet_invoker_.Execute(std::string(), num_attempts() > 1);
 }
 
@@ -155,7 +186,7 @@ std::string AsyncRpc::ToString() const {
                 batcher_->transaction_metadata().transaction_id);
 }
 
-const YBTable* AsyncRpc::table() const {
+std::shared_ptr<const YBTable> AsyncRpc::table() const {
   // All of the ops for a given tablet obviously correspond to the same table,
   // so we'll just grab the table from the first.
   return ops_[0]->yb_op->table();
@@ -164,6 +195,13 @@ const YBTable* AsyncRpc::table() const {
 void AsyncRpc::Finished(const Status& status) {
   Status new_status = status;
   if (tablet_invoker_.Done(&new_status)) {
+    if (tablet().is_split() ||
+        ClientError(new_status) == ClientErrorCode::kTablePartitionListIsStale) {
+      ops_[0]->yb_op->MarkTablePartitionListAsStale();
+    }
+    if (async_rpc_metrics_ && status.ok() && tablet_invoker_.is_consistent_prefix()) {
+      IncrementCounter(async_rpc_metrics_->consistent_prefix_successful_reads);
+    }
     ProcessResponseFromTserver(new_status);
     batcher_->RemoveInFlightOpsAfterFlushing(ops_, new_status, MakeFlushExtraResult());
     batcher_->CheckForFinishedFlush();
@@ -242,31 +280,41 @@ bool AsyncRpc::IsLocalCall() const {
 
 namespace {
 
-void SetTransactionMetadata(const TransactionMetadata& metadata, tserver::WriteRequestPB* req) {
-  auto& write_batch = *req->mutable_write_batch();
-  metadata.ToPB(write_batch.mutable_transaction());
-  write_batch.set_deprecated_may_have_metadata(true);
+template<class T>
+void SetTransactionMetadata(const TransactionMetadata& metadata,
+                            bool need_full_metadata,
+                            T* dest) {
+  auto* transaction = dest->mutable_transaction();
+  if (need_full_metadata) {
+    metadata.ToPB(transaction);
+  } else {
+    metadata.TransactionIdToPB(transaction);
+  }
+  dest->set_deprecated_may_have_metadata(true);
 }
 
-void SetTransactionMetadata(const TransactionMetadata& metadata, tserver::ReadRequestPB* req) {
-  metadata.ToPB(req->mutable_transaction());
-  req->set_deprecated_may_have_metadata(true);
+void SetTransactionMetadata(const TransactionMetadata& metadata,
+                            bool need_full_metadata,
+                            tserver::WriteRequestPB* req) {
+  SetTransactionMetadata(metadata, need_full_metadata, req->mutable_write_batch());
 }
 
 } // namespace
 
 void AsyncRpc::SendRpcToTserver(int attempt_num) {
-  MonoTime end_time = MonoTime::Now();
+  const auto end_time = CoarseMonoClock::Now();
   if (async_rpc_metrics_) {
-    async_rpc_metrics_->time_to_send->Increment(end_time.GetDeltaSince(start_).ToMicroseconds());
+    async_rpc_metrics_->time_to_send->Increment(ToMicroseconds(end_time - start_));
   }
 
   CallRemoteMethod();
 }
 
 template <class Req, class Resp>
-AsyncRpcBase<Req, Resp>::AsyncRpcBase(AsyncRpcData* data, YBConsistencyLevel consistency_level)
+AsyncRpcBase<Req, Resp>::AsyncRpcBase(AsyncRpcData* data,
+                                      YBConsistencyLevel consistency_level)
     : AsyncRpc(data, consistency_level) {
+
   req_.set_tablet_id(tablet_invoker_.tablet()->tablet_id());
   req_.set_include_trace(IsTracingEnabled());
   const ConsistentReadPoint* read_point = batcher_->read_point();
@@ -289,7 +337,7 @@ AsyncRpcBase<Req, Resp>::AsyncRpcBase(AsyncRpcData* data, YBConsistencyLevel con
   }
   auto& transaction_metadata = batcher_->transaction_metadata();
   if (!transaction_metadata.transaction_id.IsNil()) {
-    SetTransactionMetadata(transaction_metadata, &req_);
+    SetTransactionMetadata(transaction_metadata, data->need_metadata, &req_);
     bool serializable = transaction_metadata.isolation == IsolationLevel::SERIALIZABLE_ISOLATION;
     LOG_IF(DFATAL, has_read_time && serializable)
         << "Read time should NOT be specified for serializable isolation: "
@@ -320,6 +368,13 @@ bool AsyncRpcBase<Req, Resp>::CommonResponseCheck(const Status& status) {
                   TransactionError(TransactionErrorCode::kReadRestartRequired)));
     return false;
   }
+  auto local_limit_ht = resp_.local_limit_ht();
+  if (local_limit_ht) {
+    auto read_point = batcher_->read_point();
+    if (read_point) {
+      read_point->UpdateLocalLimit(req_.tablet_id(), HybridTime(local_limit_ht));
+    }
+  }
   return true;
 }
 
@@ -344,7 +399,9 @@ void AsyncRpcBase<Req, Resp>::SendRpcToTserver(int attempt_num) {
 
 WriteRpc::WriteRpc(AsyncRpcData* data)
     : AsyncRpcBase(data, YBConsistencyLevel::STRONG) {
-  TRACE_TO(trace_, "WriteRpc initiated to $0", data->tablet->tablet_id());
+
+  TRACE_TO(trace_, "WriteRpc initiated");
+  VTRACE_TO(1, trace_, "Tablet $0 table $1", data->tablet->tablet_id(), table()->name().ToString());
 
   if (data->write_time_for_backfill_.is_valid()) {
     req_.set_external_hybrid_time(data->write_time_for_backfill_.ToUint64());
@@ -372,6 +429,9 @@ WriteRpc::WriteRpc(AsyncRpcData* data)
         CHECK_EQ(table()->table_type(), YBTableType::PGSQL_TABLE_TYPE);
         auto* pgsql_op = down_cast<YBPgsqlWriteOp*>(op->yb_op.get());
         req_.add_pgsql_write_batch()->Swap(pgsql_op->mutable_request());
+        if (pgsql_op->write_time()) {
+          req_.set_external_hybrid_time(pgsql_op->write_time().ToUint64());
+        }
         break;
       }
       case YBOperation::Type::PGSQL_READ: FALLTHROUGH_INTENDED;
@@ -414,12 +474,12 @@ WriteRpc::~WriteRpc() {
     batcher_->RequestFinished(tablet().tablet_id(), req_.request_id());
   }
 
-  MonoTime end_time = MonoTime::Now();
+  const auto end_time = CoarseMonoClock::Now();
   if (async_rpc_metrics_) {
     scoped_refptr<Histogram> write_rpc_time = IsLocalCall() ?
                                               async_rpc_metrics_->local_write_rpc_time :
                                               async_rpc_metrics_->remote_write_rpc_time;
-    write_rpc_time->Increment(end_time.GetDeltaSince(start_).ToMicroseconds());
+    write_rpc_time->Increment(ToMicroseconds(end_time - start_));
   }
 }
 
@@ -558,7 +618,7 @@ void WriteRpc::SwapRequestsAndResponses(bool skip_responses = false) {
 void WriteRpc::ProcessResponseFromTserver(const Status& status) {
   TRACE_TO(trace_, "ProcessResponseFromTserver($0)", status.ToString(false));
   if (resp_.has_trace_buffer()) {
-    TRACE_TO(trace_, "Received from server: $0", resp_.trace_buffer());
+    TRACE_TO(trace_, "Received from server: \n$0", resp_.trace_buffer());
   }
   batcher_->ProcessWriteResponse(*this, status);
   if (!CommonResponseCheck(status)) {
@@ -569,9 +629,15 @@ void WriteRpc::ProcessResponseFromTserver(const Status& status) {
   SwapRequestsAndResponses(false);
 }
 
+bool WriteRpc::ShouldRetryExpiredRequest() {
+  return req_.min_running_request_id() == kInitializeFromMinRunning;
+}
+
 ReadRpc::ReadRpc(AsyncRpcData* data, YBConsistencyLevel yb_consistency_level)
     : AsyncRpcBase(data, yb_consistency_level) {
-  TRACE_TO(trace_, "ReadRpc initiated to $0", data->tablet->tablet_id());
+
+  TRACE_TO(trace_, "ReadRpc initiated");
+  VTRACE_TO(1, trace_, "Tablet $0 table $1", data->tablet->tablet_id(), table()->name().ToString());
   req_.set_consistency_level(yb_consistency_level);
   req_.set_proxy_uuid(data->batcher->proxy_uuid());
 
@@ -626,7 +692,7 @@ ReadRpc::ReadRpc(AsyncRpcData* data, YBConsistencyLevel yb_consistency_level)
 }
 
 ReadRpc::~ReadRpc() {
-  MonoTime end_time = MonoTime::Now();
+  const auto end_time = CoarseMonoClock::Now();
 
   // Get locality metrics if enabled, but skip for system tables as those go to the master.
   if (async_rpc_metrics_ && !table()->name().is_system()) {
@@ -634,7 +700,7 @@ ReadRpc::~ReadRpc() {
                                              async_rpc_metrics_->local_read_rpc_time :
                                              async_rpc_metrics_->remote_read_rpc_time;
 
-    read_rpc_time->Increment(end_time.GetDeltaSince(start_).ToMicroseconds());
+    read_rpc_time->Increment(ToMicroseconds(end_time - start_));
   }
 }
 

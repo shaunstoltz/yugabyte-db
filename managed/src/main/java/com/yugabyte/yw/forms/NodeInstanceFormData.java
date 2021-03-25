@@ -18,8 +18,6 @@ public class NodeInstanceFormData {
     @Constraints.Required()
     public String ip;
 
-    public int sshPort = 22;
-
     @Constraints.Required()
     public String sshUser;
 
@@ -31,6 +29,9 @@ public class NodeInstanceFormData {
 
     @Constraints.Required()
     public String instanceType;
+
+    @Constraints.Required()
+    public String instanceName;
 
     public String nodeName;
   }

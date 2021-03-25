@@ -52,7 +52,6 @@
 
 #include "yb/util/concurrent_value.h"
 #include "yb/util/flag_tags.h"
-#include "yb/util/kernel_stack_watchdog.h"
 #include "yb/util/memory/memory.h"
 #include "yb/util/pb_util.h"
 #include "yb/util/trace.h"
@@ -171,6 +170,7 @@ void InvokeCallbackTask::Done(const Status& status) {
     LOG(WARNING) << Format(
         "Failed to schedule invoking callback on response for request $0 to $1: $2",
         call_->remote_method(), call_->hostname(), status);
+    call_->SetThreadPoolFailure(status);
     call_->InvokeCallbackSync();
   }
   // Clear the call, since it holds OutboundCall object.

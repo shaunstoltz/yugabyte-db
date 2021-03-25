@@ -15,7 +15,6 @@
 #ifndef YB_YQL_PGGATE_PG_DML_H_
 #define YB_YQL_PGGATE_PG_DML_H_
 
-#include "yb/docdb/primitive_value.h"
 #include "yb/yql/pggate/pg_session.h"
 #include "yb/yql/pggate/pg_statement.h"
 #include "yb/yql/pggate/pg_doc_op.h"
@@ -46,16 +45,13 @@ class PgDml : public PgStatement {
   // - For a secondary-index-scan, this bind specify the value of the secondary key which is used to
   //   query a row.
   // - For a primary-index-scan, this bind specify the value of the keys of the table.
-  virtual CHECKED_STATUS BindColumn(int attnum, PgExpr *attr_value);
+  CHECKED_STATUS BindColumn(int attnum, PgExpr *attr_value);
 
   // Bind the whole table.
   CHECKED_STATUS BindTable();
 
   // Assign an expression to a column.
   CHECKED_STATUS AssignColumn(int attnum, PgExpr *attr_value);
-
-  // This function is not yet working and might not be needed.
-  virtual CHECKED_STATUS ClearBinds();
 
   // Process the secondary index request if it is nested within this statement.
   Result<bool> ProcessSecondaryIndexRequest(const PgExecParameters *exec_params);
@@ -72,9 +68,6 @@ class PgDml : public PgStatement {
 
   // Returns TRUE if desired row is found.
   Result<bool> GetNextRow(PgTuple *pg_tuple);
-
-  // Build tuple id (ybctid) of the given Postgres tuple.
-  Result<std::string> BuildYBTupleId(const PgAttrValueDescriptor *attrs, int32_t nattrs);
 
   virtual void SetCatalogCacheVersion(uint64_t catalog_cache_version) = 0;
 
@@ -149,10 +142,10 @@ class PgDml : public PgStatement {
   PgTableDesc::ScopedRefPtr bind_desc_;
 
   // Prepare control parameters.
-  PgPrepareParameters prepare_params_ = { kInvalidOid /* index_oid */,
-                                          false /* index_only_scan */,
-                                          false /* use_secondary_index */,
-                                          false /* querying_systable */ };
+  PgPrepareParameters prepare_params_ = { .index_oid = kInvalidOid,
+                                          .index_only_scan = false,
+                                          .use_secondary_index = false,
+                                          .querying_colocated_table = false };
 
   // -----------------------------------------------------------------------------------------------
   // Data members for nested query: This is used for an optimization in PgGate.
@@ -162,7 +155,7 @@ class PgDml : public PgStatement {
   // - In most cases, the Postgres layer processes the subquery "SELECT ybctid from INDEX".
   // - Under certain conditions, to optimize the performance, the PgGate layer might operate on
   //   the INDEX subquery itself.
-  scoped_refptr<PgSelectIndex> secondary_index_query_;
+  std::unique_ptr<PgSelectIndex> secondary_index_query_;
 
   // -----------------------------------------------------------------------------------------------
   // Data members for generated protobuf.
@@ -190,7 +183,7 @@ class PgDml : public PgStatement {
 
   //------------------------------------------------------------------------------------------------
   // Data members for navigating the output / result-set from either seleted or returned targets.
-  std::list<PgDocResult::SharedPtr> rowsets_;
+  std::list<PgDocResult> rowsets_;
   int64_t current_row_order_ = 0;
 
   //------------------------------------------------------------------------------------------------

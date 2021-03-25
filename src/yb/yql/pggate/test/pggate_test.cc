@@ -18,6 +18,7 @@
 #include <gflags/gflags.h>
 
 #include "yb/yql/pggate/pg_session.h"
+#include "yb/yql/pggate/pg_memctx.h"
 #include "yb/yql/pggate/pggate_flags.h"
 
 DECLARE_string(pggate_master_addresses);
@@ -27,8 +28,30 @@ namespace yb {
 namespace pggate {
 namespace {
 
-extern "C" void FetchUniqueConstraintName(PgOid relation_id, char* dest, size_t max_size) {
+void FetchUniqueConstraintName(PgOid relation_id, char* dest, size_t max_size) {
   CHECK(false) << "Not implemented";
+}
+
+YBCPgMemctx global_test_memctx = nullptr;
+
+YBCPgMemctx GetCurrentTestYbMemctx() {
+  if (!global_test_memctx) {
+    global_test_memctx = YBCPgCreateMemctx();
+  }
+  return global_test_memctx;
+}
+
+void ClearCurrentTestYbMemctx() {
+  if (global_test_memctx != nullptr) {
+    CHECK_YBC_STATUS(YBCPgDestroyMemctx(global_test_memctx));
+
+    // We assume the memory context has actually already been deleted.
+    global_test_memctx = nullptr;
+  }
+}
+
+const char* GetDebugQueryStringStub() {
+  return "GetDebugQueryString not implemented in test";
 }
 
 } // namespace
@@ -72,6 +95,9 @@ void PggateTest::SetUp() {
 }
 
 void PggateTest::TearDown() {
+  // It is important to destroy the memory context before destroying PgGate.
+  ClearCurrentTestYbMemctx();
+
   // Destroy the client before shutting down servers.
   YBCDestroyPgGate();
 
@@ -95,10 +121,12 @@ Status PggateTest::Init(const char *test_name, int num_tablet_servers) {
   YBCTestGetTypeTable(&type_table, &count);
   YBCPgCallbacks callbacks;
   callbacks.FetchUniqueConstraintName = &FetchUniqueConstraintName;
+  callbacks.GetCurrentYbMemctx = &GetCurrentTestYbMemctx;
+  callbacks.GetDebugQueryString = &GetDebugQueryStringStub;
   YBCInitPgGate(type_table, count, callbacks);
 
   // Don't try to connect to tserver shared memory in pggate tests.
-  FLAGS_pggate_ignore_tserver_shm = true;
+  FLAGS_TEST_pggate_ignore_tserver_shm = true;
 
   // Setup session.
   CHECK_YBC_STATUS(YBCPgInitSession(nullptr /* pg_env */, nullptr /* database_name */));
@@ -137,7 +165,6 @@ void PggateTest::CreateDB(const string& db_name, const YBCPgOid db_oid) {
       db_name.c_str(), db_oid, 0 /* source_database_oid */, 0 /* next_oid */, false /* colocated */,
       &pg_stmt));
   CHECK_YBC_STATUS(YBCPgExecCreateDatabase(pg_stmt));
-  CHECK_YBC_STATUS(YBCPgDeleteStatement(pg_stmt));
 }
 
 void PggateTest::ConnectDB(const string& db_name) {

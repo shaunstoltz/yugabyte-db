@@ -3,6 +3,7 @@ title: Default ports
 linkTitle: Default ports
 description: Default ports reference
 section: REFERENCE
+block_indexing: true
 menu:
   v2.0:
     identifier: default-ports
@@ -27,8 +28,10 @@ Application clients connect to these addresses.
 Use the following targets to configure [Prometheus](https://prometheus.io/) to scrape available metrics (in [Prometheus exposition format](https://prometheus.io/docs/instrumenting/exposition_formats/#text-based-format)) from the YugabyteDB HTTP endpoint:
 
 ```
-/prometheus-metrics
+<target>/prometheus-metrics
 ```
+
+You can access the Prometheus server on port `9090` of the Platform node, and you can see the list of targets at the `http://<yugaware-ip>:9090/targets`. In particular, note port `9300` for node level metrics.
 
 For a quick tutorial on using Prometheus with YugabyteDB, see [Observability with Prometheus](../../../explore/observability).
 
@@ -69,4 +72,14 @@ Admin web server UI can be viewed at these addresses.
 | yb-master  | 7000  |  [`--webserver_interface 0.0.0.0`](../yb-master/#webserver-interface)<br >[`--webserver_port 7000`](../yb-master/#webserver-port) |
 | yb-tserver | 9000  |  [`--webserver_interface 0.0.0.0`](../yb-master/#webserver-interface)<br >[`--webserver_port 9000`](../yb-master/#webserver-port) |
 
+### Firewall Rules
 
+Along with the above, include the following common ports in firewall rules. 
+
+| Service     | Port
+| ------- | ------------------------- |
+| SSH    | 22 |
+| HTTP for Platform  | 80 |
+| HTTP for Platform (alternate) | 8080 |
+| HTTPS for Platform  | 443 |
+| HTTP for Replicated | 8800 |

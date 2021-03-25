@@ -20,6 +20,8 @@ import java.io.BufferedReader;
 import java.io.IOException;
 import java.io.InputStream;
 import java.io.InputStreamReader;
+import java.util.ArrayList;
+import java.util.List;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicLong;
 
@@ -33,14 +35,17 @@ public class LogPrinter {
 
   private static final Logger LOG = LoggerFactory.getLogger(MiniYBDaemon.class);
 
+  private static final AtomicLong totalLoggedSize = new AtomicLong();
+  private static final AtomicBoolean logSizeExceededThrown = new AtomicBoolean(false);
+
   private final String logPrefix;
   private final InputStream stream;
   private final Thread thread;
   private final AtomicBoolean stopRequested = new AtomicBoolean(false);
   private final Object stopper = new Object();
 
-  private static final AtomicLong totalLoggedSize = new AtomicLong();
-  private static final AtomicBoolean logSizeExceededThrown = new AtomicBoolean(false);
+  /** A mechanism to wait for a line in the log that says that the server is starting. */
+  private final List<LogErrorListener> errorListeners = new ArrayList<>();
 
   private boolean stopped = false;
   private String errorMessage;
@@ -52,9 +57,6 @@ public class LogPrinter {
           "YB_JAVA_TEST_MAX_ALLOWED_LOG_BYTES",
           512 * 1024 * 1024);
 
-  // A mechanism to wait for a line in the log that says that the server is starting.
-  private LogErrorListener errorListener;
-
   public LogPrinter(InputStream stream, String logPrefix) {
     this(stream, logPrefix, null);
   }
@@ -64,14 +66,39 @@ public class LogPrinter {
 
     this.logPrefix = logPrefix;
     this.thread = new Thread(() -> runThread());
-    this.errorListener = errorListener;
     if (errorListener != null) {
-      errorListener.associateWithLogPrinter(this);
+      addErrorListener(errorListener);
     }
 
     thread.setDaemon(true);
-    thread.setName("Log printer for " + logPrefix.trim());
+    thread.setName(logPrinterName());
     thread.start();
+  }
+
+  public void addErrorListener(LogErrorListener errorListener) {
+    if (stopRequested.get()) {
+      return;
+    }
+    synchronized (errorListeners) {
+      this.errorListeners.add(errorListener);
+    }
+  }
+
+  private String logPrinterName() {
+    return "Log printer for '" + logPrefix.trim() + "'";
+  }
+
+  /**
+   * To be used for logging with prefix.
+   * Returns message prefixed with logPrinterName() if called not from log printer thread.
+   * No need to have a prefix when called from log printer thread, since thread name is included
+   * in log anyway.
+   */
+  private String withPrefix(String message) {
+    if (Thread.currentThread().equals(thread)) {
+      return message;
+    }
+    return logPrinterName() + ": " + message;
   }
 
   private void runThread() {
@@ -80,26 +107,27 @@ public class LogPrinter {
       BufferedReader in = new BufferedReader(new InputStreamReader(stream));
       try {
         if (LOG_PRINTER_DEBUG) {
-          LOG.info("Starting log printer with prefix '" + logPrefix +
-                   "', total log size limit: " + MAX_ALLOWED_LOGGED_BYTES +
-                   ", used log size: " + totalLoggedSize.get());
+          LOG.info(withPrefix("Starting thread, total log size limit: " +
+                   MAX_ALLOWED_LOGGED_BYTES + ", used log size: " + totalLoggedSize.get()));
         }
         try {
           while (!stopRequested.get()) {
             while ((line = in.readLine()) != null) {
-              if (errorListener != null) {
-                errorListener.handleLine(line);
+              synchronized (errorListeners) {
+                for (LogErrorListener l : errorListeners) {
+                  l.handleLine(line);
+                }
               }
               System.out.println(logPrefix + line);
               if (totalLoggedSize.addAndGet(line.length() + 1) > MAX_ALLOWED_LOGGED_BYTES) {
                 if (errorMessage == null) {
                   errorMessage = "Max total log size exceeded: " + MAX_ALLOWED_LOGGED_BYTES;
                   // Show the error once per LogPrinter instance.
-                  LOG.warn(errorMessage + " in log printer with prefix " + logPrefix);
+                  LOG.warn(withPrefix(errorMessage));
                 }
 
                 if (logSizeExceededThrown.compareAndSet(false, true)) {
-                  LOG.warn(errorMessage);
+                  LOG.warn(withPrefix(errorMessage));
                   throw new AssertionError(errorMessage);
                 }
                 return;
@@ -111,13 +139,16 @@ public class LogPrinter {
           }
         } catch (InterruptedException iex) {
           // This probably means we're stopping, OK to ignore.
+          LOG.info(withPrefix(iex.getMessage()), iex);
+        } catch (Throwable t) {
+          LOG.warn(withPrefix(t.getMessage()), t);
         }
         if (LOG_PRINTER_DEBUG) {
-          LOG.info("Finished log printer with prefix " + logPrefix);
+          LOG.info(withPrefix("Finished"));
         }
       } finally {
         if (LOG_PRINTER_DEBUG) {
-          LOG.info("Closing input stream for log printer with prefix " + logPrefix);
+          LOG.info(withPrefix("Closing input stream"));
         }
 
         in.close();
@@ -125,11 +156,11 @@ public class LogPrinter {
     } catch (Exception e) {
       String msg = e.getMessage();
       if (msg == null || !msg.contains("Stream closed")) {
-        LOG.error("Caught error while reading a process's output", e);
+        LOG.error(withPrefix("Caught error while reading a process's output"), e);
       }
     } finally {
       if (LOG_PRINTER_DEBUG) {
-        LOG.info("Closing process output stream with prefix " + logPrefix);
+        LOG.info(withPrefix("Closing process output stream ..."));
       }
 
       try {
@@ -137,14 +168,17 @@ public class LogPrinter {
       } catch (IOException ex) {
         // Ignore, we're stopping anyway.
       }
+      LOG.info(withPrefix("Closed process output stream"));
       synchronized (stopper) {
         stopped = true;
         stopper.notifyAll();
       }
+      LOG.info(withPrefix("Finished thread"));
     }
   }
 
   public void stop() throws InterruptedException {
+    LOG.info(withPrefix("Stop requested"));
     stopRequested.set(true);
     thread.interrupt();
     synchronized (stopper) {
@@ -152,8 +186,11 @@ public class LogPrinter {
         stopper.wait();
       }
     }
-    if (errorListener != null) {
-      errorListener.reportErrorsAtEnd();
+
+    synchronized (errorListeners) {
+      for (LogErrorListener l : errorListeners) {
+        l.reportErrorsAtEnd();
+      }
     }
   }
 

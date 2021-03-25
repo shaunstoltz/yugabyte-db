@@ -16,6 +16,8 @@
 #include <memory>
 #include <sstream>
 
+#include <boost/algorithm/string.hpp>
+
 #include "yb/util/string_util.h"
 
 #include "yb/common/partition.h"
@@ -62,12 +64,16 @@ Result<bool> HasPrimitiveValue(Slice* slice, AllowSpecial allow_special) {
   return STATUS_FORMAT(Corruption, "Expected a primitive value type, got $0", current_value_type);
 }
 
-// Consumes all primitive values from key until group end is found.
+constexpr auto kNumValuesNoLimit = std::numeric_limits<int>::max();
+
+// Consumes up to n_values_limit primitive values from key until group end is found.
 // Callback is called for each value and responsible for consuming this single value from slice.
 template<class Callback>
-Status ConsumePrimitiveValuesFromKey(Slice* slice, AllowSpecial allow_special, Callback callback) {
+Status ConsumePrimitiveValuesFromKey(
+    Slice* slice, AllowSpecial allow_special, Callback callback,
+    int n_values_limit = kNumValuesNoLimit) {
   const auto initial_slice(*slice);  // For error reporting.
-  while (true) {
+  for (; n_values_limit > 0; --n_values_limit) {
     if (!VERIFY_RESULT(HasPrimitiveValue(slice, allow_special))) {
       return Status::OK();
     }
@@ -76,10 +82,12 @@ Status ConsumePrimitiveValuesFromKey(Slice* slice, AllowSpecial allow_special, C
         Substitute("while consuming primitive values from $0",
                    initial_slice.ToDebugHexString()));
   }
+  return Status::OK();
 }
 
 Status ConsumePrimitiveValuesFromKey(Slice* slice, AllowSpecial allow_special,
-                                     boost::container::small_vector_base<Slice>* result) {
+                                     boost::container::small_vector_base<Slice>* result,
+                                     int n_values_limit = kNumValuesNoLimit) {
   return ConsumePrimitiveValuesFromKey(slice, allow_special, [slice, result]() -> Status {
     auto begin = slice->data();
     RETURN_NOT_OK(PrimitiveValue::DecodeKey(slice, /* out */ nullptr));
@@ -87,15 +95,16 @@ Status ConsumePrimitiveValuesFromKey(Slice* slice, AllowSpecial allow_special,
       result->emplace_back(begin, slice->data());
     }
     return Status::OK();
-  });
+  }, n_values_limit);
 }
 
 Status ConsumePrimitiveValuesFromKey(
-    Slice* slice, AllowSpecial allow_special, std::vector<PrimitiveValue>* result) {
+    Slice* slice, AllowSpecial allow_special, std::vector<PrimitiveValue>* result,
+    int n_values_limit = kNumValuesNoLimit) {
   return ConsumePrimitiveValuesFromKey(slice, allow_special, [slice, result] {
     result->emplace_back();
     return result->back().DecodeFromKey(slice);
-  });
+  }, n_values_limit);
 }
 
 } // namespace
@@ -116,13 +125,18 @@ Status ConsumePrimitiveValuesFromKey(Slice* slice, std::vector<PrimitiveValue>* 
 // DocKey
 // ------------------------------------------------------------------------------------------------
 
-DocKey::DocKey() : cotable_id_(boost::uuids::nil_uuid()), pgtable_id_(0), hash_present_(false) {
+DocKey::DocKey()
+    : cotable_id_(boost::uuids::nil_uuid()),
+      pgtable_id_(0),
+      hash_present_(false),
+      hash_(0) {
 }
 
 DocKey::DocKey(std::vector<PrimitiveValue> range_components)
     : cotable_id_(boost::uuids::nil_uuid()),
       pgtable_id_(0),
       hash_present_(false),
+      hash_(0),
       range_group_(std::move(range_components)) {
 }
 
@@ -178,7 +192,8 @@ DocKey::DocKey(const PgTableOid pgtable_id)
 DocKey::DocKey(const Schema& schema)
     : cotable_id_(schema.cotable_id()),
       pgtable_id_(schema.pgtable_id()),
-      hash_present_(false) {
+      hash_present_(false),
+      hash_(0) {
 }
 
 DocKey::DocKey(const Schema& schema, DocKeyHash hash)
@@ -192,6 +207,7 @@ DocKey::DocKey(const Schema& schema, std::vector<PrimitiveValue> range_component
     : cotable_id_(schema.cotable_id()),
       pgtable_id_(schema.pgtable_id()),
       hash_present_(false),
+      hash_(0),
       range_group_(std::move(range_components)) {
 }
 
@@ -227,7 +243,7 @@ RefCntPrefix DocKey::EncodeAsRefCntPrefix() const {
   }
   encode_buffer->Clear();
   AppendTo(encode_buffer);
-  return RefCntPrefix(encode_buffer->AsStringRef());
+  return RefCntPrefix(encode_buffer->AsSlice());
 }
 
 void DocKey::AppendTo(KeyBytes* out) const {
@@ -338,7 +354,7 @@ yb::Status DocKey::PartiallyDecode(Slice *slice,
   CHECK_NOTNULL(out);
   DocKeyDecoder decoder(*slice);
   RETURN_NOT_OK(DoDecode(
-      &decoder, DocKeyPart::WHOLE_DOC_KEY, AllowSpecial::kFalse, DecodeDocKeyCallback(out)));
+      &decoder, DocKeyPart::kWholeDocKey, AllowSpecial::kFalse, DecodeDocKeyCallback(out)));
   *slice = decoder.left_input();
   return Status::OK();
 }
@@ -366,7 +382,7 @@ Result<std::pair<size_t, size_t>> DocKey::EncodedHashPartAndDocKeySizes(
   DocKeyDecoder decoder(slice);
   EncodedSizesCallback callback(&decoder);
   RETURN_NOT_OK(DoDecode(
-      &decoder, DocKeyPart::WHOLE_DOC_KEY, allow_special, callback));
+      &decoder, DocKeyPart::kWholeDocKey, allow_special, callback));
   return std::make_pair(callback.range_group_start() - initial_begin,
                         decoder.left_input().data() - initial_begin);
 }
@@ -417,6 +433,27 @@ Result<size_t> DocKey::DecodeFrom(
   return slice.size() - copy.size();
 }
 
+namespace {
+
+// Return limit on number of range components to decode based on part_to_decode and whether hash
+// component are present in key (hash_present).
+int MaxRangeComponentsToDecode(const DocKeyPart part_to_decode, const bool hash_present) {
+  switch (part_to_decode) {
+    case DocKeyPart::kUpToId:
+      LOG(FATAL) << "Internal error: unexpected to have DocKeyPart::kUpToId here";
+    case DocKeyPart::kWholeDocKey:
+      return kNumValuesNoLimit;
+    case DocKeyPart::kUpToHashCode: FALLTHROUGH_INTENDED;
+    case DocKeyPart::kUpToHash:
+      return 0;
+    case DocKeyPart::kUpToHashOrFirstRange:
+      return hash_present ? 0 : 1;
+  }
+  FATAL_INVALID_ENUM_VALUE(DocKeyPart, part_to_decode);
+}
+
+} // namespace
+
 template<class Callback>
 yb::Status DocKey::DoDecode(DocKeyDecoder* decoder,
                             DocKeyPart part_to_decode,
@@ -431,13 +468,19 @@ yb::Status DocKey::DoDecode(DocKeyDecoder* decoder,
   }
 
   switch (part_to_decode) {
-    case DocKeyPart::UP_TO_ID:
+    case DocKeyPart::kUpToId:
       return Status::OK();
-    case DocKeyPart::UP_TO_HASH: FALLTHROUGH_INTENDED;
-    case DocKeyPart::WHOLE_DOC_KEY:
+    case DocKeyPart::kUpToHashCode: FALLTHROUGH_INTENDED;
+    case DocKeyPart::kUpToHash: FALLTHROUGH_INTENDED;
+    case DocKeyPart::kUpToHashOrFirstRange: FALLTHROUGH_INTENDED;
+    case DocKeyPart::kWholeDocKey:
       uint16_t hash_code;
-      if (VERIFY_RESULT(decoder->DecodeHashCode(&hash_code, allow_special))) {
+      const auto hash_present = VERIFY_RESULT(decoder->DecodeHashCode(&hash_code, allow_special));
+      if (hash_present) {
         callback.SetHash(/* present */ true, hash_code);
+        if (part_to_decode == DocKeyPart::kUpToHashCode) {
+          return Status::OK();
+        }
         RETURN_NOT_OK_PREPEND(
             ConsumePrimitiveValuesFromKey(
                 decoder->mutable_input(), allow_special, callback.hashed_group()),
@@ -445,13 +488,18 @@ yb::Status DocKey::DoDecode(DocKeyDecoder* decoder,
       } else {
         callback.SetHash(/* present */ false);
       }
-      if (part_to_decode == DocKeyPart::WHOLE_DOC_KEY) {
-        if (!decoder->left_input().empty()) {
-          RETURN_NOT_OK_PREPEND(
-              ConsumePrimitiveValuesFromKey(
-                  decoder->mutable_input(), allow_special, callback.range_group()),
-              "Error when decoding range components of a document key");
-        }
+      if (decoder->left_input().empty()) {
+        return Status::OK();
+      }
+      // The rest are range components.
+      const auto max_components_to_decode =
+          MaxRangeComponentsToDecode(part_to_decode, hash_present);
+      if (max_components_to_decode > 0) {
+        RETURN_NOT_OK_PREPEND(
+            ConsumePrimitiveValuesFromKey(
+                decoder->mutable_input(), allow_special, callback.range_group(),
+                max_components_to_decode),
+            "Error when decoding range components of a document key");
       }
       return Status::OK();
   }
@@ -469,7 +517,36 @@ yb::Status DocKey::FullyDecodeFrom(const rocksdb::Slice& slice) {
   return status;
 }
 
-string DocKey::ToString() const {
+namespace {
+
+// We need a special implementation of converting a vector to string because we need to pass the
+// auto_decode_keys flag to PrimitiveValue::ToString.
+void AppendVectorToString(
+    std::string* dest,
+    const std::vector<PrimitiveValue>& vec,
+    AutoDecodeKeys auto_decode_keys) {
+  bool need_comma = false;
+  for (const auto& pv : vec) {
+    if (need_comma) {
+      dest->append(", ");
+    }
+    need_comma = true;
+    dest->append(pv.ToString(auto_decode_keys));
+  }
+}
+
+void AppendVectorToStringWithBrackets(
+    std::string* dest,
+    const std::vector<PrimitiveValue>& vec,
+    AutoDecodeKeys auto_decode_keys) {
+  dest->push_back('[');
+  AppendVectorToString(dest, vec, auto_decode_keys);
+  dest->push_back(']');
+}
+
+}  // namespace
+
+string DocKey::ToString(AutoDecodeKeys auto_decode_keys) const {
   string result = "DocKey(";
   if (!cotable_id_.IsNil()) {
     result += "CoTableId=";
@@ -486,9 +563,9 @@ string DocKey::ToString() const {
     result += ", ";
   }
 
-  result += rocksdb::VectorToString(hashed_group_);
+  AppendVectorToStringWithBrackets(&result, hashed_group_, auto_decode_keys);
   result += ", ";
-  result += rocksdb::VectorToString(range_group_);
+  AppendVectorToStringWithBrackets(&result, range_group_, auto_decode_keys);
   result.push_back(')');
   return result;
 }
@@ -552,13 +629,13 @@ KeyBytes DocKey::EncodedFromRedisKey(uint16_t hash, const std::string &key) {
   result.AppendString(key);
   result.AppendValueType(ValueType::kGroupEnd);
   result.AppendValueType(ValueType::kGroupEnd);
-  DCHECK_EQ(result.data(), FromRedisKey(hash, key).Encode().data());
+  DCHECK_EQ(result, FromRedisKey(hash, key).Encode());
   return result;
 }
 
 std::string DocKey::DebugSliceToString(Slice slice) {
   DocKey key;
-  auto decoded_size = key.DecodeFrom(slice, DocKeyPart::WHOLE_DOC_KEY, AllowSpecial::kTrue);
+  auto decoded_size = key.DecodeFrom(slice, DocKeyPart::kWholeDocKey, AllowSpecial::kTrue);
   if (!decoded_size.ok()) {
     return decoded_size.status().ToString() + ": " + slice.ToDebugHexString();
   }
@@ -617,7 +694,8 @@ class DecodeSubDocKeyCallback {
 
 Status SubDocKey::PartiallyDecode(Slice* slice, boost::container::small_vector_base<Slice>* out) {
   CHECK_NOTNULL(out);
-  return DoDecode(slice, HybridTimeRequired::kTrue, DecodeSubDocKeyCallback(out));
+  return DoDecode(slice, HybridTimeRequired::kTrue, AllowSpecial::kFalse,
+                  DecodeSubDocKeyCallback(out));
 }
 
 class SubDocKey::DecodeCallback {
@@ -643,9 +721,10 @@ class SubDocKey::DecodeCallback {
   SubDocKey* key_;
 };
 
-Status SubDocKey::DecodeFrom(Slice* slice, HybridTimeRequired require_hybrid_time) {
+Status SubDocKey::DecodeFrom(
+    Slice* slice, HybridTimeRequired require_hybrid_time, AllowSpecial allow_special) {
   Clear();
-  return DoDecode(slice, require_hybrid_time, DecodeCallback(this));
+  return DoDecode(slice, require_hybrid_time, allow_special, DecodeCallback(this));
 }
 
 Result<bool> SubDocKey::DecodeSubkey(Slice* slice) {
@@ -664,11 +743,21 @@ Result<bool> SubDocKey::DecodeSubkey(Slice* slice, const Callback& callback) {
 template<class Callback>
 Status SubDocKey::DoDecode(rocksdb::Slice* slice,
                            const HybridTimeRequired require_hybrid_time,
+                           AllowSpecial allow_special,
                            const Callback& callback) {
+  if (allow_special && require_hybrid_time) {
+    return STATUS(NotSupported,
+                  "Not supported to have both require_hybrid_time and allow_special");
+  }
   const rocksdb::Slice original_bytes(*slice);
 
   RETURN_NOT_OK(callback.DecodeDocKey(slice));
   for (;;) {
+    if (allow_special && !slice->empty() &&
+        IsSpecialValueType(static_cast<ValueType>(slice->cdata()[0]))) {
+      callback.doc_hybrid_time() = DocHybridTime::kInvalid;
+      return Status::OK();
+    }
     auto decode_result = DecodeSubkey(slice, callback);
     RETURN_NOT_OK_PREPEND(
         decode_result,
@@ -703,19 +792,19 @@ Status SubDocKey::DoDecode(rocksdb::Slice* slice,
 Status SubDocKey::FullyDecodeFrom(const rocksdb::Slice& slice,
                                   HybridTimeRequired require_hybrid_time) {
   rocksdb::Slice mutable_slice = slice;
-  Status status = DecodeFrom(&mutable_slice, require_hybrid_time);
+  RETURN_NOT_OK(DecodeFrom(&mutable_slice, require_hybrid_time));
   if (!mutable_slice.empty()) {
     return STATUS_SUBSTITUTE(InvalidArgument,
         "Expected all bytes of the slice to be decoded into SubDocKey, found $0 extra bytes: $1",
         mutable_slice.size(), mutable_slice.ToDebugHexString());
   }
-  return status;
+  return Status::OK();
 }
 
 Status SubDocKey::DecodePrefixLengths(
     Slice slice, boost::container::small_vector_base<size_t>* out) {
   auto begin = slice.data();
-  auto hashed_part_size = VERIFY_RESULT(DocKey::EncodedSize(slice, DocKeyPart::UP_TO_HASH));
+  auto hashed_part_size = VERIFY_RESULT(DocKey::EncodedSize(slice, DocKeyPart::kUpToHash));
   if (hashed_part_size != 0) {
     slice.remove_prefix(hashed_part_size);
     out->push_back(hashed_part_size);
@@ -741,7 +830,7 @@ Status SubDocKey::DecodeDocKeyAndSubKeyEnds(
     Slice slice, boost::container::small_vector_base<size_t>* out) {
   auto begin = slice.data();
   if (out->empty()) {
-    auto id_size = VERIFY_RESULT(DocKey::EncodedSize(slice, DocKeyPart::UP_TO_ID));
+    auto id_size = VERIFY_RESULT(DocKey::EncodedSize(slice, DocKeyPart::kUpToId));
     out->push_back(id_size);
   }
   if (out->size() == 1) {
@@ -758,7 +847,7 @@ Status SubDocKey::DecodeDocKeyAndSubKeyEnds(
       // shouldn't count as an end.
       slice.remove_prefix(id_size + 1);
     } else {
-      auto doc_key_size = VERIFY_RESULT(DocKey::EncodedSize(slice, DocKeyPart::WHOLE_DOC_KEY));
+      auto doc_key_size = VERIFY_RESULT(DocKey::EncodedSize(slice, DocKeyPart::kWholeDocKey));
       slice.remove_prefix(doc_key_size);
       out->push_back(doc_key_size);
     }
@@ -782,34 +871,31 @@ std::string SubDocKey::DebugSliceToString(Slice slice) {
 
 Result<std::string> SubDocKey::DebugSliceToStringAsResult(Slice slice) {
   SubDocKey key;
-  auto status = key.FullyDecodeFrom(slice, HybridTimeRequired::kFalse);
+  auto status = key.DecodeFrom(&slice, HybridTimeRequired::kFalse, AllowSpecial::kTrue);
   if (status.ok()) {
-    return key.ToString();
+    if (slice.empty()) {
+      return key.ToString();
+    }
+    return key.ToString() + "+" + slice.ToDebugHexString();
   }
   return status;
 }
 
-string SubDocKey::ToString() const {
-  std::stringstream result;
-  result << "SubDocKey(" << doc_key_.ToString() << ", [";
+string SubDocKey::ToString(AutoDecodeKeys auto_decode_keys) const {
+  std::string result("SubDocKey(");
+  result.append(doc_key_.ToString(auto_decode_keys));
+  result.append(", [");
 
-  bool need_comma = false;
-  for (const auto& subkey : subkeys_) {
-    if (need_comma) {
-      result << ", ";
-    }
-    need_comma = true;
-    result << subkey.ToString();
-  }
+  AppendVectorToString(&result, subkeys_, auto_decode_keys);
 
   if (has_hybrid_time()) {
-    if (need_comma) {
-      result << "; ";
+    if (!subkeys_.empty()) {
+      result.append("; ");
     }
-    result << doc_ht_.ToString();
+    result.append(doc_ht_.ToString());
   }
-  result << "])";
-  return result.str();
+  result.append("])");
+  return result;
 }
 
 Status SubDocKey::FromDocPath(const DocPath& doc_path) {
@@ -895,7 +981,8 @@ int SubDocKey::CompareToIgnoreHt(const SubDocKey& other) const {
 string BestEffortDocDBKeyToStr(const KeyBytes &key_bytes) {
   rocksdb::Slice mutable_slice(key_bytes.AsSlice());
   SubDocKey subdoc_key;
-  Status decode_status = subdoc_key.DecodeFrom(&mutable_slice, HybridTimeRequired::kFalse);
+  Status decode_status = subdoc_key.DecodeFrom(
+      &mutable_slice, HybridTimeRequired::kFalse, AllowSpecial::kTrue);
   if (decode_status.ok()) {
     ostringstream ss;
     if (!subdoc_key.has_hybrid_time() && subdoc_key.num_subkeys() == 0) {
@@ -905,7 +992,7 @@ string BestEffortDocDBKeyToStr(const KeyBytes &key_bytes) {
       ss << subdoc_key.ToString();
     }
     if (mutable_slice.size() > 0) {
-      ss << " followed by raw bytes " << FormatSliceAsStr(mutable_slice);
+      ss << "+" << mutable_slice.ToDebugString();
       // Can append the above status of why we could not decode a SubDocKey, if needed.
     }
     return ss.str();
@@ -960,52 +1047,71 @@ KeyBytes SubDocKey::AdvanceOutOfDocKeyPrefix() const {
 
 namespace {
 
-class HashedComponentsExtractor : public rocksdb::FilterPolicy::KeyTransformer {
+template<DocKeyPart doc_key_part>
+class DocKeyComponentsExtractor : public rocksdb::FilterPolicy::KeyTransformer {
  public:
-  HashedComponentsExtractor() {}
-  HashedComponentsExtractor(const HashedComponentsExtractor&) = delete;
-  HashedComponentsExtractor& operator=(const HashedComponentsExtractor&) = delete;
+  DocKeyComponentsExtractor(const DocKeyComponentsExtractor&) = delete;
+  DocKeyComponentsExtractor& operator=(const DocKeyComponentsExtractor&) = delete;
 
-  static HashedComponentsExtractor& GetInstance() {
-    static HashedComponentsExtractor instance;
+  static DocKeyComponentsExtractor& GetInstance() {
+    static DocKeyComponentsExtractor<doc_key_part> instance;
     return instance;
   }
 
+  // For encoded DocKey extracts specified part, for non-DocKey returns empty key, so they will
+  // always match the filter (this is correct, but might be optimized for performance if/when
+  // needed).
+  // As of 2020-05-12 intents DB could contain keys in non-DocKey format.
   Slice Transform(Slice key) const override {
-    auto size = CHECK_RESULT(DocKey::EncodedSize(key, DocKeyPart::UP_TO_HASH));
-    return Slice(key.data(), size);
+    auto size_result = DocKey::EncodedSize(key, doc_key_part);
+    return size_result.ok() ? Slice(key.data(), *size_result) : Slice();
   }
+
+ private:
+  DocKeyComponentsExtractor() = default;
 };
 
 } // namespace
 
-
-void DocDbAwareFilterPolicy::CreateFilter(
+void DocDbAwareFilterPolicyBase::CreateFilter(
     const rocksdb::Slice* keys, int n, std::string* dst) const {
   CHECK_GT(n, 0);
   return builtin_policy_->CreateFilter(keys, n, dst);
 }
 
-bool DocDbAwareFilterPolicy::KeyMayMatch(
+bool DocDbAwareFilterPolicyBase::KeyMayMatch(
     const rocksdb::Slice& key, const rocksdb::Slice& filter) const {
   return builtin_policy_->KeyMayMatch(key, filter);
 }
 
-rocksdb::FilterBitsBuilder* DocDbAwareFilterPolicy::GetFilterBitsBuilder() const {
+rocksdb::FilterBitsBuilder* DocDbAwareFilterPolicyBase::GetFilterBitsBuilder() const {
   return builtin_policy_->GetFilterBitsBuilder();
 }
 
-rocksdb::FilterBitsReader* DocDbAwareFilterPolicy::GetFilterBitsReader(
+rocksdb::FilterBitsReader* DocDbAwareFilterPolicyBase::GetFilterBitsReader(
     const rocksdb::Slice& contents) const {
   return builtin_policy_->GetFilterBitsReader(contents);
 }
 
-rocksdb::FilterPolicy::FilterType DocDbAwareFilterPolicy::GetFilterType() const {
+rocksdb::FilterPolicy::FilterType DocDbAwareFilterPolicyBase::GetFilterType() const {
   return builtin_policy_->GetFilterType();
 }
 
-const rocksdb::FilterPolicy::KeyTransformer* DocDbAwareFilterPolicy::GetKeyTransformer() const {
-  return &HashedComponentsExtractor::GetInstance();
+const rocksdb::FilterPolicy::KeyTransformer*
+DocDbAwareHashedComponentsFilterPolicy::GetKeyTransformer() const {
+  return &DocKeyComponentsExtractor<DocKeyPart::kUpToHash>::GetInstance();
+}
+
+const rocksdb::FilterPolicy::KeyTransformer*
+DocDbAwareV2FilterPolicy::GetKeyTransformer() const {
+  // We want for DocDbAwareV2FilterPolicy to disable bloom filtering during read path for
+  // range-partitioned tablets (see https://github.com/yugabyte/yugabyte-db/issues/6435).
+  return &DocKeyComponentsExtractor<DocKeyPart::kUpToHash>::GetInstance();
+}
+
+const rocksdb::FilterPolicy::KeyTransformer*
+DocDbAwareV3FilterPolicy::GetKeyTransformer() const {
+  return &DocKeyComponentsExtractor<DocKeyPart::kUpToHashOrFirstRange>::GetInstance();
 }
 
 DocKeyEncoderAfterTableIdStep DocKeyEncoder::CotableId(const Uuid& cotable_id) {
@@ -1035,11 +1141,9 @@ DocKeyEncoderAfterTableIdStep DocKeyEncoder::Schema(const class Schema& schema) 
 }
 
 Result<bool> DocKeyDecoder::DecodeCotableId(Uuid* uuid) {
-  if (input_.empty() || input_[0] != ValueTypeAsChar::kTableId) {
+  if (!input_.TryConsumeByte(ValueTypeAsChar::kTableId)) {
     return false;
   }
-
-  input_.consume_byte();
 
   if (input_.size() < kUuidSize) {
     return STATUS_FORMAT(
@@ -1118,11 +1222,11 @@ Result<bool> DocKeyDecoder::DecodeHashCode(uint16_t* out, AllowSpecial allow_spe
 }
 
 Status DocKeyDecoder::DecodePrimitiveValue(PrimitiveValue* out, AllowSpecial allow_special) {
-  if (allow_special && !input_.empty()) {
-    if (input_[0] == ValueTypeAsChar::kLowest && input_[0] == ValueTypeAsChar::kHighest) {
-      input_.consume_byte();
-      return Status::OK();
-    }
+  if (allow_special &&
+      !input_.empty() &&
+      (input_[0] == ValueTypeAsChar::kLowest || input_[0] == ValueTypeAsChar::kHighest)) {
+    input_.consume_byte();
+    return Status::OK();
   }
   return PrimitiveValue::DecodeKey(&input_, out);
 }
@@ -1157,21 +1261,21 @@ Status DocKeyDecoder::DecodeToRangeGroup() {
 
 Result<bool> ClearRangeComponents(KeyBytes* out, AllowSpecial allow_special) {
   auto prefix_size = VERIFY_RESULT(
-      DocKey::EncodedSize(out->AsSlice(), DocKeyPart::UP_TO_HASH, allow_special));
+      DocKey::EncodedSize(out->AsSlice(), DocKeyPart::kUpToHash, allow_special));
   auto& str = *out->mutable_data();
   if (str.size() == prefix_size + 1 && str[prefix_size] == ValueTypeAsChar::kGroupEnd) {
     return false;
   }
   if (str.size() > prefix_size) {
     str[prefix_size] = ValueTypeAsChar::kGroupEnd;
-    str.resize(prefix_size + 1);
+    str.Truncate(prefix_size + 1);
   } else {
-    str.push_back(ValueTypeAsChar::kGroupEnd);
+    str.PushBack(ValueTypeAsChar::kGroupEnd);
   }
   return true;
 }
 
-Result<bool> HashedComponentsEqual(const Slice& lhs, const Slice& rhs) {
+Result<bool> HashedOrFirstRangeComponentsEqual(const Slice& lhs, const Slice& rhs) {
   DocKeyDecoder lhs_decoder(lhs);
   DocKeyDecoder rhs_decoder(rhs);
   RETURN_NOT_OK(lhs_decoder.DecodeCotableId());
@@ -1179,19 +1283,21 @@ Result<bool> HashedComponentsEqual(const Slice& lhs, const Slice& rhs) {
   RETURN_NOT_OK(lhs_decoder.DecodePgtableId());
   RETURN_NOT_OK(rhs_decoder.DecodePgtableId());
 
-  bool hash_present = VERIFY_RESULT(lhs_decoder.DecodeHashCode(AllowSpecial::kTrue));
-  RETURN_NOT_OK(rhs_decoder.DecodeHashCode(AllowSpecial::kTrue));
+  const bool hash_present = VERIFY_RESULT(lhs_decoder.DecodeHashCode(AllowSpecial::kTrue));
+  if (hash_present != VERIFY_RESULT(rhs_decoder.DecodeHashCode(AllowSpecial::kTrue))) {
+    return false;
+  }
 
   size_t consumed = lhs_decoder.ConsumedSizeFrom(lhs.data());
   if (consumed != rhs_decoder.ConsumedSizeFrom(rhs.data()) ||
       !strings::memeq(lhs.data(), rhs.data(), consumed)) {
     return false;
   }
-  if (!hash_present) {
-    return true;
-  }
 
-  while (!lhs_decoder.GroupEnded()) {
+  // Check all hashed components if present or first range component otherwise.
+  int num_components_to_check = hash_present ? kNumValuesNoLimit : 1;
+
+  while (!lhs_decoder.GroupEnded() && num_components_to_check > 0) {
     auto lhs_start = lhs_decoder.left_input().data();
     auto rhs_start = rhs_decoder.left_input().data();
     auto value_type = lhs_start[0];
@@ -1210,6 +1316,11 @@ Result<bool> HashedComponentsEqual(const Slice& lhs, const Slice& rhs) {
         !strings::memeq(lhs_start, rhs_start, consumed)) {
       return false;
     }
+    --num_components_to_check;
+  }
+  if (num_components_to_check == 0) {
+    // We don't care about difference in rest of range components.
+    return true;
   }
 
   return rhs_decoder.GroupEnded();
@@ -1240,6 +1351,12 @@ bool DocKeyBelongsTo(Slice doc_key, const Schema& schema) {
     BigEndian::Store32(buf, schema.pgtable_id());
     return doc_key.starts_with(Slice(buf, sizeof(PgTableOid)));
   }
+}
+
+Result<boost::optional<DocKeyHash>> DecodeDocKeyHash(const Slice& encoded_key) {
+  DocKey key;
+  RETURN_NOT_OK(key.DecodeFrom(encoded_key, DocKeyPart::kUpToHashCode));
+  return key.has_hash() ? key.hash() : boost::optional<DocKeyHash>();
 }
 
 const KeyBounds KeyBounds::kNoBounds;

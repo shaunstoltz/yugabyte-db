@@ -2,14 +2,27 @@
 
 import { NodeDetails } from '../../universes';
 import { connect } from 'react-redux';
-import { getUniversePerNodeStatus, getUniversePerNodeStatusResponse,
-  getUniversePerNodeMetrics, getUniversePerNodeMetricsResponse,
-  getMasterLeader, getMasterLeaderResponse, resetMasterLeader } from '../../../actions/universe';
+import {
+  getUniversePerNodeStatus,
+  getUniversePerNodeStatusResponse,
+  getUniversePerNodeMetrics,
+  getUniversePerNodeMetricsResponse,
+  getMasterLeader,
+  getMasterLeaderResponse,
+  resetMasterLeader
+} from '../../../actions/universe';
+import {
+  getNodeInstancesForProvider,
+  getNodeInstancesForReadReplicaProvider,
+  getNodesInstancesForProviderResponse,
+  getNodesInstancesForReadReplicaProviderResponse
+} from '../../../actions/cloud';
 
 function mapStateToProps(state) {
   return {
     universe: state.universe,
-    customer: state.customer
+    customer: state.customer,
+    providers: state.cloud.providers
   };
 }
 
@@ -36,12 +49,23 @@ const mapDispatchToProps = (dispatch) => {
       });
     },
 
-
     getUniversePerNodeMetrics: (uuid) => {
       dispatch(getUniversePerNodeMetrics(uuid)).then((perNodeResponse) => {
         dispatch(getUniversePerNodeMetricsResponse(perNodeResponse.payload));
       });
     },
+
+    fetchNodeListByProvider: (pUUID) => {
+      dispatch(getNodeInstancesForProvider(pUUID)).then((response) => {
+        dispatch(getNodesInstancesForProviderResponse(response.payload));
+      });
+    },
+
+    fetchNodeListByReplicaProvider: (pUUID) => {
+      dispatch(getNodeInstancesForReadReplicaProvider(pUUID)).then((response) => {
+        dispatch(getNodesInstancesForReadReplicaProviderResponse(response.payload));
+      });
+    }
   };
 };
 

@@ -68,7 +68,8 @@ class PTKeyspaceProperty : public PTProperty {
   }
 
  protected:
-  KeyspacePropertyType property_type_;
+  // Just need an arbitrary default value here.
+  KeyspacePropertyType property_type_ = KeyspacePropertyType::kKVProperty;
 
  private:
   TreeListNode<PTKeyspaceProperty>::SharedPtr map_elements_;
@@ -96,7 +97,7 @@ class PTKeyspacePropertyListNode : public TreeListNode<PTKeyspaceProperty> {
     if (tnode_list == nullptr) {
       return;
     }
-    for (const auto tnode : tnode_list->node_list()) {
+    for (const auto& tnode : tnode_list->node_list()) {
       Append(tnode);
     }
   }

@@ -358,6 +358,11 @@ CREATE TABLE tbl1 (
 	a			int4 primary key
 ) SPLIT (INTO 20 TABLETS);
 
+CREATE TABLE tbl1_5 (
+	a       int4,
+ 	primary key(a asc)
+) SPLIT (INTO 20 TABLETS);
+
 CREATE TABLE tbl2 (
 	a			int4,
 	primary key (a asc)
@@ -418,16 +423,120 @@ CREATE TABLE tbl12 (
 	primary key (b desc)
 ) SPLIT AT VALUES (('bienvenidos'), ('goodbye'), ('hello'), ('hola'));
 
-CREATE TABLE tbl12 (
+CREATE TABLE tbl13 (
 	a			text,
 	b			date,
 	c			time
 ) SPLIT INTO 9 TABLETS;
 
-CREATE TABLE tbl13 (
+CREATE TABLE tbl14 (
 	a			int4,
 	primary key (a asc)
 ) SPLIT AT VALUES ((MINVALUE), (0), (MAXVALUE));
 
--- TODO(jason): remove when issue #1721 is closed or closing.
-DISCARD TEMP;
+CREATE TABLE tbl15 (
+	a			int4,
+	b			int4,
+	c			int4,
+	primary key (a asc, b desc)
+) SPLIT AT VALUES ((-10), (0, 0), (23, 4), (50));
+
+-- This is invalid because split rows do not honor column b's ordering
+CREATE TABLE tbl16(
+  a int,
+  b int,
+  primary key(a asc, b asc)
+) SPLIT AT VALUES((100), (200, 5), (200));
+
+-- This is invalid because split rows do not honor column b's ordering
+CREATE TABLE tbl16(
+  a int,
+  b int,
+  primary key(a asc, b asc nulls first)
+) SPLIT AT VALUES((100), (200, 5), (200));
+
+-- This is invalid because split rows do not honor column b's ordering
+CREATE TABLE tbl16(
+  a int,
+  b int,
+  primary key(a asc, b asc nulls last)
+) SPLIT AT VALUES((100), (200, 5), (200));
+
+CREATE TABLE tbl16(
+  a int,
+  b int,
+  primary key(a asc, b desc)
+) SPLIT AT VALUES((100), (200), (200, 5));
+
+CREATE TABLE tbl17(
+  a int,
+  b int,
+  primary key(a asc, b desc nulls first)
+) SPLIT AT VALUES((100), (200), (200, 5));
+
+CREATE TABLE tbl18(
+  a int,
+  b int,
+  primary key(a asc, b desc nulls last)
+) SPLIT AT VALUES((100), (200), (200, 5));
+
+-- This is invalid because we cannot have duplicate split rows
+CREATE TABLE tbl19(
+  a int,
+  b int,
+  primary key(a asc, b desc nulls last)
+) SPLIT AT VALUES((100), (200, 5), (200, 5));
+
+-- Test ordering on splitted tables
+CREATE TABLE ordered_asc(
+    k INT,
+    PRIMARY KEY(k ASC)
+) SPLIT AT VALUES((10), (20), (30));
+INSERT INTO ordered_asc VALUES
+    (5), (6), (16), (15), (25), (26), (36), (35), (46), (10), (20), (30);
+EXPLAIN (COSTS OFF) SELECT * FROM ordered_asc ORDER BY k ASC;
+SELECT * FROM ordered_asc ORDER BY k ASC;
+EXPLAIN (COSTS OFF) SELECT * FROM ordered_asc ORDER BY k DESC;
+SELECT * FROM ordered_asc ORDER BY k DESC;
+EXPLAIN (COSTS OFF) SELECT k FROM ordered_asc WHERE k > 10 and k < 40 ORDER BY k DESC;
+SELECT k FROM ordered_asc WHERE k > 10 and k < 40 ORDER BY k DESC;
+
+CREATE TABLE ordered_desc(
+    k INT,
+    PRIMARY KEY(k DESC)
+) SPLIT AT VALUES((30), (20), (10));
+INSERT INTO ordered_desc VALUES
+    (5), (6), (16), (15), (25), (26), (36), (35), (46), (10), (20), (30);
+EXPLAIN (COSTS OFF) SELECT * FROM ordered_desc ORDER BY k ASC;
+SELECT * FROM ordered_desc ORDER BY k ASC;
+EXPLAIN (COSTS OFF) SELECT * FROM ordered_desc ORDER BY k DESC;
+SELECT * FROM ordered_desc ORDER BY k DESC;
+EXPLAIN (COSTS OFF) SELECT k FROM ordered_desc WHERE k > 10 and k < 40 ORDER BY k ASC;
+SELECT k FROM ordered_desc WHERE k > 10 and k < 40 ORDER BY k ASC;
+
+-- Test create ... with (table_oid = x)
+set yb_enable_create_with_table_oid=1;
+create table with_invalid_table_oid (a int) with (table_oid = 0);
+create table with_invalid_table_oid (a int) with (table_oid = -1);
+create table with_invalid_table_oid (a int) with (table_oid = 123);
+create table with_invalid_table_oid (a int) with (table_oid = 'test');
+
+create table with_table_oid (a int) with (table_oid = 1234567);
+select relname, oid from pg_class where relname = 'with_table_oid';
+
+create table with_table_oid_duplicate (a int) with (table_oid = 1234567);
+
+-- Test temp tables with (table_oid = x)
+begin;
+create temp table with_table_oid_temp (a int) with (table_oid = 1234568) on commit drop;
+select relname, oid from pg_class where relname = 'with_table_oid_temp';
+end;
+-- Creating a new temp table with that oid will fail
+create temp table with_table_oid_temp_2 (a int) with (table_oid = 1234568);
+-- But creating a regular table with that oid should succeed
+create table with_table_oid_2 (a int) with (table_oid = 1234568);
+select relname, oid from pg_class where relname = 'with_table_oid_2';
+
+-- Test with session variable off
+set yb_enable_create_with_table_oid=0;
+create table with_table_oid_variable_false (a int) with (table_oid = 55555);

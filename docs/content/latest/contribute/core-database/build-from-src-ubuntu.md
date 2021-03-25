@@ -1,8 +1,8 @@
 ---
-title: Build the source code on Ubuntu
+title: Build from source code on Ubuntu
 headerTitle: Build the source code
 linkTitle: Build the source
-description: Build the source code
+description: Build YugabyteDB from source code on Ubuntu.
 image: /images/section_icons/index/quick_start.png
 headcontent: Build the source code.
 type: page
@@ -18,21 +18,21 @@ showAsideToc: true
 <ul class="nav nav-tabs-alt nav-tabs-yb">
 
   <li >
-    <a href="/latest/contribute/core-database/build-from-src-macos" class="nav-link">
+    <a href="{{< relref "./build-from-src-macos.md" >}}" class="nav-link">
       <i class="fab fa-apple" aria-hidden="true"></i>
       macOS
     </a>
   </li>
 
   <li >
-    <a href="/latest/contribute/core-database/build-from-src-centos" class="nav-link">
+    <a href="{{< relref "./build-from-src-centos.md" >}}" class="nav-link">
       <i class="fab fa-linux" aria-hidden="true"></i>
       CentOS
     </a>
   </li>
 
   <li >
-    <a href="/latest/contribute/core-database/build-from-src-ubuntu" class="nav-link active">
+    <a href="{{< relref "./build-from-src-ubuntu.md" >}}" class="nav-link active">
       <i class="fab fa-linux" aria-hidden="true"></i>
       Ubuntu
     </a>
@@ -46,38 +46,17 @@ CentOS 7 is the recommended Linux development and production platform for Yugaby
 
 {{< /note >}}
 
-## Installing necessary packages
+## Install necessary packages
 
 Update packages on your system, install development tools and additional packages:
 
 ```sh
 sudo apt-get update
-sudo apt-get install uuid-dev libbz2-dev libreadline-dev maven ninja-build
+sudo apt-get install uuid-dev libbz2-dev libreadline-dev maven ninja-build \
+                     cmake curl rsync python3-pip python3-venv zip autoconf libtool \
+                     pkg-config libssl1.0-dev libicu-dev bison flex \
+                     libncurses5-dev 
 ```
-
-## Getting build tools ready
-
-Make sure `cmake` / `ctest` binaries are at least version 3. On Ubuntu, one way to achieve this is to symlink them into `/usr/local/bin`.
-
-```sh
-sudo ln -s /usr/bin/cmake3 /usr/local/bin/cmake
-sudo ln -s /usr/bin/ctest3 /usr/local/bin/ctest
-```
-
-You could also symlink them into another directory that is on your `PATH`.
-
-{{< note title="Note" >}}
-
-We also use [Linuxbrew](https://github.com/linuxbrew/brew) to provide some of the third-party dependencies on Ubuntu.
-
-During the build we install Linuxbrew in a separate directory, `~/.linuxbrew-yb-build/linuxbrew-<version>`, so that it does not conflict with any other Linuxbrew installation on your workstation, and does not contain any unnecessary packages that would interfere with the build.
-
-We don't need to add `~/.linuxbrew-yb-build/linuxbrew-<version>/bin` to `PATH`. The build scripts will automatically discover this Linuxbrew installation.
-
-{{< /note >}}
-
-
-## Building the code
 
 Assuming this repository is checked out in `~/code/yugabyte-db`, do the following:
 
@@ -86,15 +65,35 @@ cd ~/code/yugabyte-db
 ./yb_build.sh release
 ```
 
-The above command will build the release configuration, put the C++ binaries in `build/release-gcc-dynamic-community`, and will also create the `build/latest` symlink to that directory.
+{{< note title="Note" >}}
+
+If you see errors, such as `g++: internal compiler error: Killed`, the system has probably run out of memory.
+Try again by running the build script with less concurrency, for example, `-j1`.
+
+{{< /note >}}
+
+The command above will build the release configuration, add the C++ binaries into the `build/release-gcc-dynamic-ninja` directory, and create a `build/latest` symlink to that directory.
+
+
+{{< note title="Note" >}}
+If you are getting errors in the form of:
+```
+uild/release-gcc-dynamic-ninja/postgres_build/src/backend/libpq/be-secure-openssl.o: In function `my_sock_read':
+src/postgres/src/backend/libpq/be-secure-openssl.c:665: undefined reference to `BIO_get_data'
+build/release-gcc-dynamic-ninja/postgres_build/src/backend/libpq/be-secure-openssl.o: In function `my_sock_write':
+src/postgres/src/backend/libpq/be-secure-openssl.c:685: undefined reference to `BIO_get_data'
+```
+The code is probably not finding the right path for libssl1.0. Try a clean build `./yb_build.sh --clean release`.  
+If that doesn't work, look into your $PATH if some other openssl version path is being used.  
+{{< /note >}}
+
+
 
 {{< tip title="Tip" >}}
 
 You can find the binaries you just built in `build/latest` directory.
 
 {{< /tip >}}
-
-For Linux, it will first make sure our custom Linuxbrew distribution is installed into `~/.linuxbrew-yb-build/linuxbrew-<version>`.
 
 ## Build Java code
 
@@ -103,10 +102,14 @@ YugabyteDB core is written in C++, but the repository contains Java code needed 
 * JDK 8
 * [Apache Maven](https://maven.apache.org/).
 
-Also make sure Maven's bin directory is added to your `PATH` (for example, by adding to your `~/.bashrc`). See the example below (if you've installed Maven into `~/tools/apache-maven-3.5.0`)
+Also make sure Maven's bin directory is added to your `PATH` (for example, by adding to your `~/.bashrc`). See the example below (if you've installed Maven into `~/tools/apache-maven-3.6.3`)
 
 ```sh
-export PATH=$HOME/tools/apache-maven-3.5.0/bin:$PATH
+export PATH=$HOME/tools/apache-maven-3.6.3/bin:$PATH
 ```
 
 For building YugabyteDB Java code, you'll need to install Java and Apache Maven.
+
+## Build release package
+
+Currently a release package can only be built in [CentOS](../build-from-src-centos) & [MacOS](../build-from-src-macos).

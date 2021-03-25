@@ -34,10 +34,12 @@
 #include "yb/common/transaction_error.h"
 #include "yb/common/pgsql_error.h"
 
+#include "yb/consensus/consensus.h"
 #include "yb/consensus/consensus_util.h"
 #include "yb/consensus/opid_util.h"
 
 #include "yb/rpc/messenger.h"
+#include "yb/rpc/poller.h"
 #include "yb/rpc/rpc.h"
 
 #include "yb/server/clock.h"
@@ -50,7 +52,7 @@
 #include "yb/tserver/tserver_service.pb.h"
 
 #include "yb/util/enums.h"
-#include "yb/util/kernel_stack_watchdog.h"
+#include "yb/util/flag_tags.h"
 #include "yb/util/metrics.h"
 #include "yb/util/random_util.h"
 #include "yb/util/result.h"
@@ -73,6 +75,9 @@ DEFINE_int64(avoid_abort_after_sealing_ms, 20,
              "If transaction was only sealed, we will try to abort it not earlier than this "
                  "period in milliseconds.");
 
+DEFINE_test_flag(uint64, inject_txn_get_status_delay_ms, 0,
+                 "Inject specified delay to transaction get status requests.");
+
 using namespace std::literals;
 using namespace std::placeholders;
 
@@ -82,7 +87,8 @@ namespace tablet {
 std::chrono::microseconds GetTransactionTimeout() {
   const double timeout = GetAtomicFlag(&FLAGS_transaction_max_missed_heartbeat_periods) *
                          GetAtomicFlag(&FLAGS_transaction_heartbeat_usec);
-  return timeout >= std::chrono::microseconds::max().count()
+  // Cast to avoid -Wimplicit-int-float-conversion.
+  return timeout >= static_cast<double>(std::chrono::microseconds::max().count())
       ? std::chrono::microseconds::max()
       : std::chrono::microseconds(static_cast<int64_t>(timeout));
 }
@@ -182,7 +188,7 @@ class TransactionState {
   }
 
   std::string ToString() const {
-    return Format("{ id: $0 last_touch: $1 status: $2 unnotified_tablets: $3 replicating: $4 "
+    return Format("{ id: $0 last_touch: $1 status: $2 involved_tablets: $3 replicating: $4 "
                       " request_queue: $5 first_entry_raft_index: $6 }",
                   id_, last_touch_, TransactionStatus_Name(status_),
                   involved_tablets_, replicating_, request_queue_, first_entry_raft_index_);
@@ -212,8 +218,24 @@ class TransactionState {
     VLOG_WITH_PREFIX(4)
         << Format("ProcessReplicated: $0, replicating: $1", data, replicating_);
 
-    DCHECK(replicating_ == nullptr || consensus::OpIdEquals(replicating_->op_id(), data.op_id));
-    replicating_ = nullptr;
+    if (replicating_ != nullptr) {
+      auto replicating_op_id = replicating_->consensus_round()->id();
+      if (replicating_op_id.IsInitialized()) {
+        if (!consensus::OpIdEquals(replicating_->consensus_round()->id(), data.op_id)) {
+          LOG_WITH_PREFIX(DFATAL)
+              << "Replicated unexpected operation, replicating: " << AsString(replicating_)
+              << ", replicated: " << AsString(data);
+        }
+      } else if (data.leader_term != OpId::kUnknownTerm) {
+        LOG_WITH_PREFIX(DFATAL)
+            << "Leader replicated operation without op id, replicating: " << AsString(replicating_)
+            << ", replicated: " << AsString(data);
+      } else {
+        LOG_WITH_PREFIX(INFO) << "Cancel replicating without id: " << AsString(replicating_)
+                              << ", because " << AsString(data) << " was replicated";
+      }
+      replicating_ = nullptr;
+    }
 
     auto status = DoProcessReplicated(data);
 
@@ -235,7 +257,8 @@ class TransactionState {
         case TransactionStatus::COMMITTED: FALLTHROUGH_INTENDED;
         case TransactionStatus::APPLYING: FALLTHROUGH_INTENDED;
         case TransactionStatus::APPLIED_IN_ONE_OF_INVOLVED_TABLETS: FALLTHROUGH_INTENDED;
-        case TransactionStatus::CLEANUP:
+        case TransactionStatus::IMMEDIATE_CLEANUP: FALLTHROUGH_INTENDED;
+        case TransactionStatus::GRACEFUL_CLEANUP:
           ProcessQueue();
           break;
       }
@@ -259,7 +282,7 @@ class TransactionState {
   void ClearRequests(const Status& status) {
     VLOG_WITH_PREFIX(4) << Format("ClearRequests: $0, replicating: $1", status, replicating_);
     if (replicating_ != nullptr) {
-      context_.CompleteWithStatus(std::move(replicating_), status);
+      context_.CompleteWithStatus(replicating_, status);
       replicating_ = nullptr;
     }
 
@@ -322,7 +345,8 @@ class TransactionState {
       case TransactionStatus::CREATED: FALLTHROUGH_INTENDED;
       case TransactionStatus::APPLYING: FALLTHROUGH_INTENDED;
       case TransactionStatus::APPLIED_IN_ONE_OF_INVOLVED_TABLETS: FALLTHROUGH_INTENDED;
-      case TransactionStatus::CLEANUP:
+      case TransactionStatus::IMMEDIATE_CLEANUP: FALLTHROUGH_INTENDED;
+      case TransactionStatus::GRACEFUL_CLEANUP:
         return STATUS_FORMAT(Corruption, "Transaction has unexpected status: $0",
                              TransactionStatus_Name(status_));
     }
@@ -415,6 +439,25 @@ class TransactionState {
     }
   }
 
+  void AddInvolvedTablets(
+      const TabletId& source_tablet_id, const std::vector<TabletId>& tablet_ids) {
+    auto source_it = involved_tablets_.find(source_tablet_id);
+    if (source_it == involved_tablets_.end()) {
+      LOG(FATAL) << "Unknown involved tablet: " << source_tablet_id;
+      return;
+    }
+    for (const auto& tablet_id : tablet_ids) {
+      if (involved_tablets_.emplace(tablet_id, source_it->second).second) {
+        ++tablets_with_not_applied_intents_;
+      }
+    }
+    if (!source_it->second.all_intents_applied) {
+      // Mark source tablet as if intents have been applied for it.
+      --tablets_with_not_applied_intents_;
+      source_it->second.all_intents_applied = true;
+    }
+  }
+
   CHECKED_STATUS AppliedInOneOfInvolvedTablets(const tserver::TransactionStatePB& state) {
     if (status_ != TransactionStatus::COMMITTED && status_ != TransactionStatus::SEALED) {
       // We could ignore this request, because it will be re-send if required.
@@ -499,7 +542,8 @@ class TransactionState {
         FATAL_INVALID_ENUM_VALUE(TransactionStatus, data.state.status());
       case TransactionStatus::APPLIED_IN_ALL_INVOLVED_TABLETS:
         return AppliedInAllInvolvedTabletsReplicationFinished(data);
-      case TransactionStatus::CLEANUP:
+      case TransactionStatus::IMMEDIATE_CLEANUP: FALLTHROUGH_INTENDED;
+      case TransactionStatus::GRACEFUL_CLEANUP:
         // CLEANUP is handled separately, because it is received for transactions not managed by
         // this tablet as a transaction status tablet, but tablets that are involved in the data
         // path (receive write intents) for this transactions
@@ -512,9 +556,10 @@ class TransactionState {
     const auto& state = *request->request();
 
     Status status;
-    if (state.status() == TransactionStatus::COMMITTED) {
+    auto txn_status = state.status();
+    if (txn_status == TransactionStatus::COMMITTED) {
       status = HandleCommit();
-    } else if (state.status() == TransactionStatus::PENDING) {
+    } else if (txn_status == TransactionStatus::PENDING) {
       if (status_ != TransactionStatus::PENDING) {
         status = STATUS_FORMAT(IllegalState,
             "Transaction in wrong state during heartbeat: $0",
@@ -534,7 +579,8 @@ class TransactionState {
     VLOG_WITH_PREFIX(4) << Format("DoHandle, replicating = $0", replicating_);
     replicating_ = request.get();
     auto submitted = context_.SubmitUpdateTransaction(std::move(request));
-    CHECK(submitted);
+    // Should always succeed, since we execute this code only on the leader.
+    CHECK(submitted) << "Status: " << TransactionStatus_Name(txn_status);
   }
 
   CHECKED_STATUS HandleCommit() {
@@ -686,8 +732,8 @@ class TransactionState {
       return Status::OK();
     }
     if (status_ != TransactionStatus::PENDING) {
-      LOG_WITH_PREFIX(DFATAL) << "Bad status during PendingReplicationFinished: "
-                              << TransactionStatus_Name(status_);
+      LOG_WITH_PREFIX(DFATAL) << "Bad status during " << __func__ << "(" << data.ToString()
+                              << "): " << ToString();
       return Status::OK();
     }
     last_touch_ = data.hybrid_time;
@@ -821,7 +867,8 @@ class TransactionCoordinator::Impl : public TransactionStateContext {
        Counter* expired_metric)
       : context_(*context),
         expired_metric_(*expired_metric),
-        log_prefix_(consensus::MakeTabletLogPrefix(context->tablet_id(), permanent_uuid)) {
+        log_prefix_(consensus::MakeTabletLogPrefix(context->tablet_id(), permanent_uuid)),
+        poller_(log_prefix_, std::bind(&Impl::Poll, this)) {
   }
 
   virtual ~Impl() {
@@ -829,27 +876,14 @@ class TransactionCoordinator::Impl : public TransactionStateContext {
   }
 
   void Shutdown() {
-    {
-      std::unique_lock<std::mutex> lock(managed_mutex_);
-      if (!closing_) {
-        closing_ = true;
-        if (poll_task_id_ != rpc::kUninitializedScheduledTaskId) {
-          context_.client_future().get()->messenger()->scheduler().Abort(poll_task_id_);
-        }
-      }
-      cond_.wait(lock, [this] { return poll_task_id_ == rpc::kUninitializedScheduledTaskId; });
-      // There could be rare case when poll left mutex and is executing postponed actions.
-      // So we should wait that it also completed.
-      while (running_polls_ != 0) {
-        std::this_thread::sleep_for(10ms);
-      }
-    }
+    poller_.Shutdown();
     rpcs_.Shutdown();
   }
 
   CHECKED_STATUS GetStatus(const google::protobuf::RepeatedPtrField<std::string>& transaction_ids,
                            CoarseTimePoint deadline,
                            tserver::GetTransactionStatusResponsePB* response) {
+    AtomicFlagSleepMs(&FLAGS_TEST_inject_txn_get_status_delay_ms);
     auto leader_term = context_.LeaderTerm();
     PostponedLeaderActions postponed_leader_actions;
     {
@@ -984,6 +1018,8 @@ class TransactionCoordinator::Impl : public TransactionStateContext {
   }
 
   void Abort(const std::string& transaction_id, int64_t term, TransactionAbortCallback callback) {
+    AtomicFlagSleepMs(&FLAGS_TEST_inject_txn_get_status_delay_ms);
+
     auto id = FullyDecodeTransactionId(transaction_id);
     if (!id.ok()) {
       callback(id.status());
@@ -1078,10 +1114,9 @@ class TransactionCoordinator::Impl : public TransactionStateContext {
   }
 
   void Start() {
-    std::lock_guard<std::mutex> lock(managed_mutex_);
-    if (!closing_) {
-      SchedulePoll();
-    }
+    poller_.Start(
+        &context_.client_future().get()->messenger()->scheduler(),
+        std::chrono::microseconds(kTimeMultiplier * FLAGS_transaction_check_interval_usec));
   }
 
   void Handle(std::unique_ptr<tablet::UpdateTxnOperationState> request, int64_t term) {
@@ -1107,9 +1142,10 @@ class TransactionCoordinator::Impl : public TransactionStateContext {
           YB_LOG_HIGHER_SEVERITY_WHEN_TOO_MANY(INFO, WARNING, 1s, 50)
               << LogPrefix() << "Request to unknown transaction " << id << ": "
               << state.ShortDebugString();
-          request->CompleteWithStatus(
-              STATUS(Expired, "Transaction expired or aborted by a conflict",
-                     PgsqlError(YBPgErrorCode::YB_PG_T_R_SERIALIZATION_FAILURE)));
+          auto status = STATUS(Expired, "Transaction expired or aborted by a conflict",
+                               PgsqlError(YBPgErrorCode::YB_PG_T_R_SERIALIZATION_FAILURE));
+          status = status.CloneAndAddErrorCode(TransactionError(TransactionErrorCode::kAborted));
+          request->CompleteWithStatus(status);
           return;
         }
       }
@@ -1176,6 +1212,77 @@ class TransactionCoordinator::Impl : public TransactionStateContext {
       >
   > ManagedTransactions;
 
+  void SendUpdateTransactionRequest(
+      const NotifyApplyingData& action, const CoarseTimePoint& deadline) {
+    VLOG_WITH_PREFIX(3) << "Notify applying: " << action.ToString();
+
+    tserver::UpdateTransactionRequestPB req;
+    req.set_tablet_id(action.tablet);
+    auto& state = *req.mutable_state();
+    state.set_transaction_id(action.transaction.data(), action.transaction.size());
+    state.set_status(TransactionStatus::APPLYING);
+    state.add_tablets(context_.tablet_id());
+    state.set_commit_hybrid_time(action.commit_time.ToUint64());
+    state.set_sealed(action.sealed);
+
+    auto handle = rpcs_.Prepare();
+    if (handle != rpcs_.InvalidHandle()) {
+      *handle = UpdateTransaction(
+          deadline,
+          nullptr /* remote_tablet */,
+          context_.client_future().get(),
+          &req,
+          [this, handle, action]
+              (const Status& status, const tserver::UpdateTransactionResponsePB& resp) {
+            client::UpdateClock(resp, &context_);
+            rpcs_.Unregister(handle);
+            if (status.ok()) {
+              return;
+            }
+            LOG_WITH_PREFIX(WARNING)
+                << "Failed to send apply for transaction: " << action.transaction << ": "
+                << status;
+            const auto split_child_tablet_ids = SplitChildTabletIdsData(status).value();
+            const bool tablet_has_been_split = !split_child_tablet_ids.empty();
+            if (status.IsNotFound() || tablet_has_been_split) {
+              std::lock_guard<std::mutex> lock(managed_mutex_);
+              auto it = managed_transactions_.find(action.transaction);
+              if (it == managed_transactions_.end()) {
+                return;
+              }
+              managed_transactions_.modify(
+                  it, [this, &action, &split_child_tablet_ids,
+                       tablet_has_been_split](TransactionState& state) {
+                    if (tablet_has_been_split) {
+                      // We need to update involved tablets map.
+                      LOG_WITH_PREFIX(INFO) << Format(
+                          "Tablet $0 has been split into: $1", action.tablet,
+                          split_child_tablet_ids);
+                      state.AddInvolvedTablets(action.tablet, split_child_tablet_ids);
+                    } else {
+                      // Tablet has been deleted (not split), so we should mark it as applied to
+                      // be able to cleanup the transaction.
+                      tserver::TransactionStatePB transaction_state;
+                      transaction_state.add_tablets(action.tablet);
+                      WARN_NOT_OK(
+                          state.AppliedInOneOfInvolvedTablets(transaction_state),
+                          "AppliedInOneOfInvolvedTablets for removed tabled failed: ");
+                    }
+                  });
+              if (tablet_has_been_split) {
+                const auto new_deadline = TransactionRpcDeadline();
+                NotifyApplyingData new_action = action;
+                for (const auto& split_child_tablet_id : split_child_tablet_ids) {
+                  new_action.tablet = split_child_tablet_id;
+                  SendUpdateTransactionRequest(new_action, new_deadline);
+                }
+              }
+            }
+          });
+      (**handle).SendRpc();
+    }
+  }
+
   void ExecutePostponedLeaderActions(PostponedLeaderActions* actions) {
     for (const auto& p : actions->complete_with_status) {
       p.request->CompleteWithStatus(p.status);
@@ -1188,45 +1295,7 @@ class TransactionCoordinator::Impl : public TransactionStateContext {
     if (!actions->notify_applying.empty()) {
       auto deadline = TransactionRpcDeadline();
       for (const auto& action : actions->notify_applying) {
-        VLOG_WITH_PREFIX(3) << "Notify applying: " << action.ToString();
-
-        tserver::UpdateTransactionRequestPB req;
-        req.set_tablet_id(action.tablet);
-        auto& state = *req.mutable_state();
-        state.set_transaction_id(action.transaction.data(), action.transaction.size());
-        state.set_status(TransactionStatus::APPLYING);
-        state.add_tablets(context_.tablet_id());
-        state.set_commit_hybrid_time(action.commit_time.ToUint64());
-        state.set_sealed(action.sealed);
-
-        auto handle = rpcs_.Prepare();
-        if (handle != rpcs_.InvalidHandle()) {
-          *handle = UpdateTransaction(
-              deadline,
-              nullptr /* remote_tablet */,
-              context_.client_future().get(),
-              &req,
-              [this, handle, txn_id = action.transaction, tablet = action.tablet]
-                  (const Status& status, const tserver::UpdateTransactionResponsePB& resp) {
-                client::UpdateClock(resp, &context_);
-                rpcs_.Unregister(handle);
-                LOG_IF_WITH_PREFIX(WARNING, !status.ok()) << "Failed to send apply: " << status;
-                // Tablet was deleted, so we should mark it as applied to cleanup transaction.
-                if (status.IsNotFound()) {
-                  std::lock_guard<std::mutex> lock(managed_mutex_);
-                  auto it = managed_transactions_.find(txn_id);
-                  if (it != managed_transactions_.end()) {
-                    managed_transactions_.modify(it, [&tablet](TransactionState& state) {
-                      tserver::TransactionStatePB transaction_state;
-                      transaction_state.add_tablets(tablet);
-                      WARN_NOT_OK(state.AppliedInOneOfInvolvedTablets(transaction_state),
-                                  "AppliedInOneOfInvolvedTablets for removed tabled failed: ");
-                    });
-                  }
-                }
-              });
-          (**handle).SendRpc();
-        }
+        SendUpdateTransactionRequest(action, deadline);
       }
     }
 
@@ -1262,15 +1331,15 @@ class TransactionCoordinator::Impl : public TransactionStateContext {
 
   MUST_USE_RESULT bool SubmitUpdateTransaction(
       std::unique_ptr<UpdateTxnOperationState> state) override {
-    if (postponed_leader_actions_.leader()) {
-      postponed_leader_actions_.updates.push_back(std::move(state));
-      return true;
-    } else {
+    if (!postponed_leader_actions_.leader()) {
       auto status = STATUS(IllegalState, "Submit update transaction on non leader");
       VLOG_WITH_PREFIX(1) << status;
       state->CompleteWithStatus(status);
       return false;
     }
+
+    postponed_leader_actions_.updates.push_back(std::move(state));
+    return true;
   }
 
   void CompleteWithStatus(
@@ -1293,29 +1362,13 @@ class TransactionCoordinator::Impl : public TransactionStateContext {
     return expired_metric_;
   }
 
-  void SchedulePoll() {
-    poll_task_id_ = context_.client_future().get()->messenger()->scheduler().Schedule(
-        std::bind(&Impl::Poll, this, _1),
-        std::chrono::microseconds(NonTsanVsTsan(1, 4) * FLAGS_transaction_check_interval_usec));
-  }
-
-  void Poll(const Status& status) {
-    ++running_polls_;
-    auto se = ScopeExit([this] {
-      --running_polls_;
-    });
+  void Poll() {
     auto now = context_.clock().Now();
 
     auto leader_term = context_.LeaderTerm();
     PostponedLeaderActions actions;
     {
       std::lock_guard<std::mutex> lock(managed_mutex_);
-      if (!status.ok() || closing_) {
-        LOG_WITH_PREFIX(INFO) << "Poll stopped: " << status;
-        poll_task_id_ = rpc::kUninitializedScheduledTaskId;
-        cond_.notify_one();
-        return;
-      }
       postponed_leader_actions_.leader_term = leader_term;
 
       auto& index = managed_transactions_.get<LastTouchTag>();
@@ -1338,8 +1391,6 @@ class TransactionCoordinator::Impl : public TransactionStateContext {
             leader_term != OpId::kUnknownTerm, now_physical);
       }
       postponed_leader_actions_.Swap(&actions);
-
-      SchedulePoll();
     }
     ExecutePostponedLeaderActions(&actions);
   }
@@ -1365,11 +1416,7 @@ class TransactionCoordinator::Impl : public TransactionStateContext {
   // Actions that should be executed after mutex is unlocked.
   PostponedLeaderActions postponed_leader_actions_;
 
-  bool closing_ = false;
-  rpc::ScheduledTaskId poll_task_id_ = rpc::kUninitializedScheduledTaskId;
-  std::atomic<int64_t> running_polls_{0};
-  std::condition_variable cond_;
-
+  rpc::Poller poller_;
   rpc::Rpcs rpcs_;
 };
 

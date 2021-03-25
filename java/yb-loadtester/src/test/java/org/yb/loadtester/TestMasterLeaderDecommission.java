@@ -19,20 +19,17 @@ import static org.yb.AssertionWrappers.assertTrue;
 import com.google.common.net.HostAndPort;
 
 import org.junit.Test;
-import org.slf4j.Logger;
-import org.slf4j.LoggerFactory;
-import org.yb.minicluster.MiniYBCluster;
 
 import java.util.*;
 
 /**
  * This is an integration test that ensures we can do a master decommission.
  */
-import org.yb.YBTestRunner;
+import org.yb.util.YBTestRunnerNonTsanOnly;
 
 import org.junit.runner.RunWith;
 
-@RunWith(value=YBTestRunner.class)
+@RunWith(value=YBTestRunnerNonTsanOnly.class)
 public class TestMasterLeaderDecommission extends TestClusterBase {
   @Test(timeout = TEST_TIMEOUT_SEC * 1000) // 20 minutes.
   public void testMasterLeaderDecommission() throws Exception {
@@ -47,7 +44,7 @@ public class TestMasterLeaderDecommission extends TestClusterBase {
     HostAndPort leaderMasterHp = client.getLeaderMasterHostAndPort();
     for (HostAndPort hp : miniCluster.getMasters().keySet()) {
       if (!hp.equals(leaderMasterHp)) {
-        assertTrue(client.setFlag(hp, "do_not_start_election_test_only", "true"));
+        assertTrue(client.setFlag(hp, "TEST_do_not_start_election_test_only", "true"));
       }
     }
 
@@ -63,15 +60,15 @@ public class TestMasterLeaderDecommission extends TestClusterBase {
     }
 
     // Wait for tservers to find and heartbeat to new master.
-    Thread.sleep(MiniYBCluster.TSERVER_HEARTBEAT_TIMEOUT_MS * 5);
+    Thread.sleep(miniCluster.getClusterParameters().getTServerHeartbeatTimeoutMs() * 5);
 
     for (HostAndPort hp : miniCluster.getTabletServers().keySet()) {
       String masters = client.getMasterAddresses(hp);
       // Assert each tserver knows only the list of all 3 masters
       // as it should have heartbeated to master leader.
       assertEquals(3, masters.split(",").length);
-      assertFalse(masters.contains(leaderMasterHp.getHostText()));
-      assertTrue(masters.contains(newMaster.iterator().next().getHostText()));
+      assertFalse(masters.contains(leaderMasterHp.getHost()));
+      assertTrue(masters.contains(newMaster.iterator().next().getHost()));
     }
 
     // Wait for some ops and verify no failures in load tester.

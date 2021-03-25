@@ -64,6 +64,7 @@
 #include "catalog/pg_type.h"
 #include "catalog/schemapg.h"
 #include "catalog/storage.h"
+#include "catalog/ybc_catalog_version.h"
 #include "commands/dbcommands.h"
 #include "commands/policy.h"
 #include "commands/trigger.h"
@@ -1268,12 +1269,16 @@ equalPartitionDescs(PartitionKey key, PartitionDesc partdesc1,
  * to minimize the number on YB-master queries needed.
  * It is based on (and similar to) RelationBuildDesc but does all relations
  * at once.
- * It works in two steps:
+ * It works in three steps:
  *  1. Load up all the data pg_class using one full scan iteration. The
  *  relations after this point will all be loaded but incomplete (e.g. no
  *  attribute info set).
- *  2. Load all all the data from pg_attribute using one full scan. Then update
- *  each the corresponding relation once all attributes for it were retrieved.
+ *  2. Load all the data from pg_attribute using one full scan. Then update
+ *  each corresponding relation once all attributes for it were retrieved.
+ *  3. Load all the data from pg_partitioned_table using one full scan. Then
+ *  update each corresponding relation with the attributes fetched during
+ *  the second phase. This is because updating the partition information requires attribute
+ *  information to be loaded for pg_partitioned_table, pg_type etc.
  *
  *  Note: We assume that any error happening here will fatal so as to not end
  *  up with partial information in the cache.
@@ -1400,19 +1405,13 @@ void YBPreloadRelCache()
 		relation->rd_fkeylist  = NIL;
 		relation->rd_fkeyvalid = false;
 
-		/* if a partitioned table, initialize key and partition descriptor info */
-		if (relation->rd_rel->relkind == RELKIND_PARTITIONED_TABLE)
-		{
-			RelationBuildPartitionKey(relation);
-			RelationBuildPartitionDesc(relation);
-		}
-		else
-		{
-			relation->rd_partkeycxt = NULL;
-			relation->rd_partkey    = NULL;
-			relation->rd_partdesc   = NULL;
-			relation->rd_pdcxt      = NULL;
-		}
+		/* For now, update all partition information to be null, this will
+ 		 * be populated later for partitioned tables
+ 		 */
+		relation->rd_partkeycxt = NULL;
+		relation->rd_partkey    = NULL;
+		relation->rd_partdesc   = NULL;
+		relation->rd_pdcxt      = NULL;
 
 		/*
 		 * if it's an index, initialize index-related information
@@ -1534,6 +1533,7 @@ void YBPreloadRelCache()
 				need = relation->rd_rel->relnatts;
 				ndef = 0;
 				attrdef = NULL;
+				attrmiss = NULL;
 				constr = (TupleConstr*) MemoryContextAlloc(CacheMemoryContext, sizeof(TupleConstr));
 				constr->has_not_null = false;
 			}
@@ -1672,7 +1672,8 @@ void YBPreloadRelCache()
 			/*
 			 * Set up constraint/default info
 			 */
-			if (constr->has_not_null || ndef > 0 || relation->rd_rel->relchecks)
+			if (constr->has_not_null || ndef > 0 ||
+				attrmiss || relation->rd_rel->relchecks)
 			{
 				relation->rd_att->constr = constr;
 
@@ -1737,9 +1738,48 @@ void YBPreloadRelCache()
 	}
 
 	/*
-	 * end the scan and close the attribute relation
+	 * end the scan.
 	 */
 	systable_endscan(scandesc);
+
+	/* Start scan for pg_partitioned_table */
+	Relation pg_partitioned_table_desc;
+	pg_partitioned_table_desc = heap_open(PartitionedRelationId, AccessShareLock);
+
+	scandesc = systable_beginscan(pg_partitioned_table_desc,
+	                              PartitionedRelationId,
+	                              false /* indexOk */,
+	                              NULL,
+	                              0,
+	                              NULL);
+
+	HeapTuple pg_partition_tuple;
+	while (HeapTupleIsValid(pg_partition_tuple = systable_getnext(scandesc)))
+	{
+		pg_partition_tuple = heap_copytuple(pg_partition_tuple);
+		Form_pg_partitioned_table part_table_form;
+
+		part_table_form = (Form_pg_partitioned_table) GETSTRUCT(pg_partition_tuple);
+
+		Relation relation;
+		RelationIdCacheLookup(part_table_form->partrelid, relation);
+
+		if (!relation) {
+			continue;
+		}
+
+		/* Initialize key and partition descriptor info */
+		if (relation->rd_rel->relkind == RELKIND_PARTITIONED_TABLE)
+		{
+			RelationBuildPartitionKey(relation);
+			RelationBuildPartitionDesc(relation);
+		}
+	}
+
+	systable_endscan(scandesc);
+
+	/* Close all the three relations that were opened */
+	heap_close(pg_partitioned_table_desc, AccessShareLock);
 
 	heap_close(pg_attribute_desc, AccessShareLock);
 
@@ -4290,6 +4330,15 @@ RelationCacheInitializePhase3(void)
 		return;
 
 	/*
+	 * In YugaByte mode initialize the catalog cache version to the latest
+	 * version from the master (except during initdb).
+	 */
+	if (IsYugaByteEnabled())
+	{
+		YBCGetMasterCatalogVersion(&yb_catalog_cache_version);
+	}
+
+	/*
 	 * In YB mode initialize the relache at the beginning so that we need
 	 * fewer cache lookups in steady state.
 	 */
@@ -4544,9 +4593,12 @@ RelationCacheInitializePhase3(void)
 	 * During initdb also preload catalog caches (not just relation cache) as
 	 * they will be used heavily.
 	 */
-	if (IsYugaByteEnabled() && YBIsPreparingTemplates())
+	if (IsYugaByteEnabled())
 	{
-		YBPreloadCatalogCaches();
+		if (YBIsPreparingTemplates())
+			YBPreloadCatalogCaches();
+
+		YBLoadPinnedObjectsCache();
 	}
 }
 
@@ -5484,6 +5536,60 @@ IsProjectionFunctionalIndex(Relation index)
 	return is_projection;
 }
 
+bool
+CheckUpdateExprOrPred(const Bitmapset *updated_attrs,
+                      Relation indexDesc,
+                      const int Anum_pg_index,
+                      AttrNumber attr_offset)
+{
+  bool      isnull = false;
+  Datum datum = heap_getattr(
+      indexDesc->rd_indextuple, Anum_pg_index, GetPgIndexDescriptor(), &isnull);
+  if (isnull)
+    return false;
+
+  Node *indexNode = stringToNode(TextDatumGetCString(datum));
+  Bitmapset *indexattrs = NULL;
+  pull_varattnos_min_attr(indexNode, 1, &indexattrs, attr_offset + 1);
+  return bms_overlap(updated_attrs, indexattrs);
+}
+/*
+ * CheckIndexForUpdate -- Given Oid of an Index corresponding to a specific
+ * relation and the set of attributes that are updated because of an SQL
+ * statement, this function returns true of the Index needs to be updated and
+ * vice versa.
+ */
+bool
+CheckIndexForUpdate(Oid indexOid, const Bitmapset *updated_attrs, AttrNumber attr_offset)
+{
+  Relation  indexDesc          = index_open(indexOid, AccessShareLock);
+  Bitmapset *indexattrs        = NULL;
+  bool need_update = false;
+
+  /*
+   * We first check updates affect the current index by iterating over the
+   * columns associated with an index to see if the updated attributes affects
+   * the index. If it does, we return true.
+   */
+  for (int i = 0; i < indexDesc->rd_index->indnatts; ++i)
+  {
+    const int attrnum = indexDesc->rd_index->indkey.values[i];
+    if (attrnum != 0 && bms_is_member(attrnum - attr_offset, updated_attrs))
+    {
+      need_update = true;
+      break;
+    }
+  }
+  /* If none of the columns are affected, we check for IndexExpressions and IndexPredicates */
+  need_update = need_update
+                || CheckUpdateExprOrPred(updated_attrs, indexDesc, Anum_pg_index_indexprs, attr_offset)
+                || CheckUpdateExprOrPred(updated_attrs, indexDesc, Anum_pg_index_indpred, attr_offset);
+
+  bms_free(indexattrs);
+  index_close(indexDesc, AccessShareLock);
+  return need_update;
+}
+
 /*
  * RelationGetIndexAttrBitmap -- get a bitmap of index attribute numbers
  *
@@ -5669,15 +5775,15 @@ restart:
 		if (IsProjectionFunctionalIndex(indexDesc))
 		{
 			projindexes = bms_add_member(projindexes, indexno);
-			pull_varattnos(indexExpressions, 1, &projindexattrs);
+			pull_varattnos_min_attr(indexExpressions, 1, &projindexattrs, attr_offset + 1);
 		}
 		else
 		{
 			/* Collect all attributes used in expressions, too */
-			pull_varattnos(indexExpressions, 1, &indexattrs);
+			pull_varattnos_min_attr(indexExpressions, 1, &indexattrs, attr_offset + 1);
 		}
 		/* Collect all attributes in the index predicate, too */
-		pull_varattnos(indexPredicate, 1, &indexattrs);
+		pull_varattnos_min_attr(indexPredicate, 1, &indexattrs, attr_offset + 1);
 
 		index_close(indexDesc, AccessShareLock);
 		indexno += 1;
@@ -6145,7 +6251,7 @@ load_relcache_init_file(bool shared)
 
 		/* Else, still need to check with the master version to be sure. */
 		uint64_t catalog_master_version = 0;
-		YBCPgGetCatalogMasterVersion(&catalog_master_version);
+		YBCGetMasterCatalogVersion(&catalog_master_version);
 
 		/* File version does not match actual master version (i.e. too old) */
 		if (ybc_stored_cache_version != catalog_master_version)

@@ -13,6 +13,9 @@
 
 #include "yb/tablet/remove_intents_task.h"
 
+#include "yb/tablet/running_transaction.h"
+#include "yb/util/logging.h"
+
 namespace yb {
 namespace tablet {
 
@@ -30,24 +33,31 @@ bool RemoveIntentsTask::Prepare(RunningTransactionPtr transaction) {
   }
 
   transaction_ = std::move(transaction);
+  LOG_IF_WITH_PREFIX(DFATAL, transaction_->ProcessingApply())
+      << "Remove intents for transaction that is processing apply";
   return true;
 }
 
 void RemoveIntentsTask::Run() {
+  VLOG_WITH_PREFIX(2) << "Remove intents";
+
   RemoveIntentsData data;
   participant_context_.GetLastReplicatedData(&data);
   auto status = applier_.RemoveIntents(data, id_);
   LOG_IF_WITH_PREFIX(WARNING, !status.ok())
-      << "Failed to remove intents of aborted transaction " << id_ << ": " << status;
-  VLOG_WITH_PREFIX(2) << "Removed intents for: " << id_;
+      << "Failed to remove intents of aborted transaction : " << status;
+  VLOG_WITH_PREFIX(2) << "Removed intents";
 }
 
 void RemoveIntentsTask::Done(const Status& status) {
+  if (!status.ok()) {
+    YB_LOG_EVERY_N_SECS(WARNING, 1) << "Remove intents task failed: " << status;
+  }
   transaction_.reset();
 }
 
-const std::string& RemoveIntentsTask::LogPrefix() const {
-  return running_transaction_context_.LogPrefix();
+std::string RemoveIntentsTask::LogPrefix() const {
+  return transaction_ ? transaction_->LogPrefix() : running_transaction_context_.LogPrefix();
 }
 
 } // namespace tablet

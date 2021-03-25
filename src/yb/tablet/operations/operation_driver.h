@@ -167,7 +167,7 @@ class OperationDriver : public RefCountedThreadSafe<OperationDriver>,
 
   Trace* trace() { return trace_.get(); }
 
-  void HandleConsensusAppend() override;
+  void HandleConsensusAppend(const yb::OpId& op_id, const yb::OpId& committed_op_id) override;
 
   bool is_leader_side() {
     // TODO: switch state to an atomic.
@@ -231,7 +231,7 @@ class OperationDriver : public RefCountedThreadSafe<OperationDriver>,
     PREPARED
   };
 
-  ~OperationDriver() override {}
+  ~OperationDriver();
 
   // Starts operation, returns false is we should NOT continue processing the operation.
   bool StartOperation();
@@ -282,7 +282,7 @@ class OperationDriver : public RefCountedThreadSafe<OperationDriver>,
 
   // The system monotonic time when the operation was prepared.
   // This is used for debugging only, not any actual operation ordering.
-  MicrosecondsInt64 prepare_physical_hybrid_time_;
+  MicrosecondsInt64 prepare_physical_hybrid_time_ = 0;
 
   TableType table_type_;
 

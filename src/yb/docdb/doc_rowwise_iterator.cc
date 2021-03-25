@@ -13,15 +13,18 @@
 
 #include "yb/docdb/doc_rowwise_iterator.h"
 
+#include "yb/common/common.pb.h"
 #include "yb/common/partition.h"
 #include "yb/common/transaction.h"
+#include "yb/common/ql_expr.h"
 #include "yb/common/ql_scanspec.h"
 #include "yb/common/ql_value.h"
 
 #include "yb/docdb/doc_key.h"
 #include "yb/docdb/doc_ql_scanspec.h"
+#include "yb/docdb/doc_reader.h"
+#include "yb/docdb/doc_scanspec_util.h"
 #include "yb/docdb/doc_ttl_util.h"
-#include "yb/docdb/docdb.h"
 #include "yb/docdb/docdb-internal.h"
 #include "yb/docdb/docdb_rocksdb_util.h"
 #include "yb/docdb/intent_aware_iterator.h"
@@ -42,7 +45,7 @@ class ScanChoices {
   explicit ScanChoices(bool is_forward_scan) : is_forward_scan_(is_forward_scan) {}
   virtual ~ScanChoices() {}
 
-  bool CurrentIteratorPositionMatchesCurrentTarget(const Slice& curr) {
+  bool CurrentTargetMatchesKey(const Slice& curr) {
     VLOG(3) << __PRETTY_FUNCTION__ << " checking if acceptable ? "
             << (curr == current_scan_target_ ? "YEP" : "NOPE")
             << ": " << DocKey::DebugSliceToString(curr)
@@ -176,8 +179,8 @@ Status DiscreteScanChoices::IncrementScanTargetAtColumn(size_t start_col) {
     RETURN_NOT_OK(decoder.DecodePrimitiveValue());
   }
 
-  current_scan_target_.mutable_data()->resize(
-      decoder.left_input().cdata() - current_scan_target_.data().data());
+  current_scan_target_.Truncate(
+      decoder.left_input().cdata() - current_scan_target_.AsSlice().cdata());
 
   for (size_t i = col_idx; i <= start_col; ++i) {
     current_scan_target_idxs_[i]->AppendToKey(&current_scan_target_);
@@ -304,17 +307,10 @@ class RangeBasedScanChoices : public ScanChoices {
       const ColumnId col_idx = schema.column_id(idx);
       const auto col_sort_type = schema.column(idx).sorting_type();
       const common::QLScanRange::QLRange range = doc_spec.range_bounds()->RangeFor(col_idx);
-      const bool desc_col = col_sort_type == ColumnSchema::kDescending;
-      // for ASC col: lower -> min_value; upper -> max_value
-      // for DESC   :       -> max_value;       -> min_value
-      const auto& lower = (desc_col ? range.max_value : range.min_value);
-      lower_.emplace_back(
-          IsNull(lower) ? PrimitiveValue(ValueType::kLowest)
-                        : PrimitiveValue::FromQLValuePB(lower, col_sort_type));
-      const auto& upper = (desc_col ? range.min_value : range.max_value);
-      upper_.emplace_back(
-          IsNull(upper) ? PrimitiveValue(ValueType::kHighest)
-                        : PrimitiveValue::FromQLValuePB(upper, schema.column(idx).sorting_type()));
+      const auto lower = GetQLRangeBoundAsPVal(range, col_sort_type, true /* lower_bound */);
+      const auto upper = GetQLRangeBoundAsPVal(range, col_sort_type, false /* upper_bound */);
+      lower_.emplace_back(lower);
+      upper_.emplace_back(upper);
     }
   }
 
@@ -328,18 +324,10 @@ class RangeBasedScanChoices : public ScanChoices {
       const ColumnId col_idx = schema.column_id(idx);
       const auto col_sort_type = schema.column(idx).sorting_type();
       const common::QLScanRange::QLRange range = doc_spec.range_bounds()->RangeFor(col_idx);
-      const bool desc_col = (col_sort_type == ColumnSchema::kDescending ||
-          col_sort_type == ColumnSchema::kDescendingNullsLast);
-      // for ASC col: lower -> min_value; upper -> max_value
-      // for DESC   :       -> max_value;       -> min_value
-      const auto& lower = (desc_col ? range.max_value : range.min_value);
-      lower_.emplace_back(
-          IsNull(lower) ? PrimitiveValue(ValueType::kLowest)
-                        : PrimitiveValue::FromQLValuePB(lower, col_sort_type));
-      const auto& upper = (desc_col ? range.min_value : range.max_value);
-      upper_.emplace_back(
-          IsNull(upper) ? PrimitiveValue(ValueType::kHighest)
-                        : PrimitiveValue::FromQLValuePB(upper, schema.column(idx).sorting_type()));
+      const auto lower = GetQLRangeBoundAsPVal(range, col_sort_type, true /* lower_bound */);
+      const auto upper = GetQLRangeBoundAsPVal(range, col_sort_type, false /* upper_bound */);
+      lower_.emplace_back(lower);
+      upper_.emplace_back(upper);
     }
   }
 
@@ -365,14 +353,14 @@ Status RangeBasedScanChoices::SkipTargetsUpTo(const Slice& new_target) {
     l_c < C < u_c
      4        6
 
-    a b  0 d  -> a  b l_c  l_d
+    a b  0 d  -> a  b l_c  d
 
-    a b  5 d  -> a  b  5    d
-                  [ Will subsequently week out of document on reading the subdoc]
+    a b  5 d  -> a  b  5   d
+                  [ Will subsequently seek out of document on reading the subdoc]
 
     a b  7 d  -> a <b> MAX
                 [ This will seek to <b_next> and on the next invocation update:
-                   a <b_next> ? ? -> a <b_next> l_c l_d ]
+                   a <b_next> ? ? -> a <b_next> l_c d ]
   */
   DocKeyDecoder decoder(new_target);
   RETURN_NOT_OK(decoder.DecodeToRangeGroup());
@@ -485,13 +473,12 @@ DocRowwiseIterator::DocRowwiseIterator(
     projection_subkeys_.emplace_back(projection.column_id(i));
   }
   std::sort(projection_subkeys_.begin(), projection_subkeys_.end());
-  deadline_info_.emplace(deadline);
 }
 
 DocRowwiseIterator::~DocRowwiseIterator() {
 }
 
-Status DocRowwiseIterator::Init() {
+Status DocRowwiseIterator::Init(TableType table_type) {
   db_iter_ = CreateIntentAwareIterator(
       doc_db_,
       BloomFilterMode::DONT_USE_BLOOM_FILTER,
@@ -500,7 +487,6 @@ Status DocRowwiseIterator::Init() {
       txn_op_context_,
       deadline_,
       read_time_);
-
   DocKeyEncoder(&iter_key_).Schema(schema_);
   row_key_ = iter_key_;
   row_hash_key_ = row_key_;
@@ -508,6 +494,9 @@ Status DocRowwiseIterator::Init() {
   db_iter_->Seek(row_key_);
   row_ready_ = false;
   has_bound_key_ = false;
+  if (table_type == TableType::PGSQL_TABLE_TYPE) {
+    ignore_ttl_ = true;
+  }
 
   return Status::OK();
 }
@@ -559,7 +548,7 @@ Status DocRowwiseIterator::DoInit(const T& doc_spec) {
   // TODO(bogdan): decide if this is a good enough heuristic for using blooms for scans.
   const bool is_fixed_point_get =
       !lower_doc_key.empty() &&
-      VERIFY_RESULT(HashedComponentsEqual(lower_doc_key, upper_doc_key));
+      VERIFY_RESULT(HashedOrFirstRangeComponentsEqual(lower_doc_key, upper_doc_key));
   const auto mode = is_fixed_point_get ? BloomFilterMode::USE_BLOOM_FILTER
                                        : BloomFilterMode::DONT_USE_BLOOM_FILTER;
 
@@ -604,13 +593,14 @@ Status DocRowwiseIterator::Init(const common::QLScanSpec& spec) {
 }
 
 Status DocRowwiseIterator::Init(const common::PgsqlScanSpec& spec) {
+  ignore_ttl_ = true;
   return DoInit(dynamic_cast<const DocPgsqlScanSpec&>(spec));
 }
 
 Status DocRowwiseIterator::AdvanceIteratorToNextDesiredRow() const {
   if (scan_choices_) {
     if (!IsNextStaticColumn()
-        && !scan_choices_->CurrentIteratorPositionMatchesCurrentTarget(row_key_)) {
+        && !scan_choices_->CurrentTargetMatchesKey(row_key_)) {
       return scan_choices_->SeekToCurrentTarget(db_iter_.get());
     }
   } else {
@@ -661,6 +651,7 @@ Result<bool> DocRowwiseIterator::HasNext() const {
     if (!iter_key_.data().empty() &&
         (is_forward_scan_ ? iter_key_.CompareTo(key_data->key) >= 0
                           : iter_key_.CompareTo(key_data->key) <= 0)) {
+      // TODO -- could turn this check off in TPCC?
       has_next_status_ = STATUS_SUBSTITUTE(Corruption, "Infinite loop detected at $0",
                                            FormatSliceAsStr(key_data->key));
       return has_next_status_;
@@ -673,10 +664,10 @@ Result<bool> DocRowwiseIterator::HasNext() const {
       has_next_status_ = dockey_sizes.status();
       return has_next_status_;
     }
-    row_hash_key_ = Slice(iter_key_.data().data(), dockey_sizes->first);
-    row_key_ = Slice(iter_key_.data().data(), dockey_sizes->second);
+    row_hash_key_ = iter_key_.AsSlice().Prefix(dockey_sizes->first);
+    row_key_ = iter_key_.AsSlice().Prefix(dockey_sizes->second);
 
-    if (!DocKeyBelongsTo(row_key_, schema_) ||
+    if (!DocKeyBelongsTo(row_key_, schema_) || // e.g in cotable, row may point outside table bounds
         (has_bound_key_ && is_forward_scan_ == (row_key_.compare(bound_key_) >= 0))) {
       done_ = true;
       return false;
@@ -688,7 +679,7 @@ Result<bool> DocRowwiseIterator::HasNext() const {
 
     bool is_static_column = IsNextStaticColumn();
     if (scan_choices_ && !is_static_column) {
-      if (!scan_choices_->CurrentIteratorPositionMatchesCurrentTarget(row_key_)) {
+      if (!scan_choices_->CurrentTargetMatchesKey(row_key_)) {
         // We must have seeked past the target key we are looking for (no result) so we can safely
         // skip all scan targets between the current target and row key (excluding row_key_ itself).
         // Update the target key and iterator and call HasNext again to try the next target.
@@ -696,7 +687,7 @@ Result<bool> DocRowwiseIterator::HasNext() const {
 
         // We updated scan target above, if it goes past the row_key_ we will seek again, and
         // process the found key in the next loop.
-        if (!scan_choices_->CurrentIteratorPositionMatchesCurrentTarget(row_key_)) {
+        if (!scan_choices_->CurrentTargetMatchesKey(row_key_)) {
           RETURN_NOT_OK(scan_choices_->SeekToCurrentTarget(db_iter_.get()));
           continue;
         }
@@ -704,28 +695,21 @@ Result<bool> DocRowwiseIterator::HasNext() const {
       // We found a match for the target key or a static column, so we move on to getting the
       // SubDocument.
     }
+    if (doc_reader_ == nullptr) {
+      doc_reader_ = std::make_unique<DocDBTableReader>(db_iter_.get(), deadline_);
+      RETURN_NOT_OK(doc_reader_->UpdateTableTombstoneTime(sub_doc_key));
+      if (!ignore_ttl_) {
+        doc_reader_->SetTableTtl(schema_);
+      }
+    }
 
-    GetSubDocumentData data = {
-      sub_doc_key,
-      &row_,
-      &doc_found,
-      TableTTL(schema_),
-      &table_tombstone_time_,
-    };
-    data.deadline_info = deadline_info_.get_ptr();
-    has_next_status_ = GetSubDocument(db_iter_.get(), data, &projection_subkeys_);
-    RETURN_NOT_OK(has_next_status_);
-    // After this, the iter should be positioned right after the subdocument.
-
-    if (!doc_found) {
-      SubDocument full_row;
-      // If doc is not found, decide if some non-projection column exists.
-      // Currently we read the whole doc here,
-      // may be optimized by exiting on the first column in future.
-      db_iter_->Seek(row_key_);  // Position it for GetSubDocument.
-      data.result = &full_row;
-      has_next_status_ = GetSubDocument(db_iter_.get(), data);
-      RETURN_NOT_OK(has_next_status_);
+    row_ = SubDocument();
+    auto doc_found_res = doc_reader_->Get(sub_doc_key, &projection_subkeys_, &row_);
+    if (!doc_found_res.ok()) {
+      has_next_status_ = doc_found_res.status();
+      return has_next_status_;
+    } else {
+      doc_found = VERIFY_RESULT(doc_found_res);
     }
     if (scan_choices_ && !is_static_column) {
       has_next_status_ = scan_choices_->DoneWithCurrentTarget();

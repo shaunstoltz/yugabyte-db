@@ -68,7 +68,7 @@ class ClientFailoverITest : public ExternalMiniClusterITestBase {
 TEST_F(ClientFailoverITest, TestDeleteLeaderWhileScanning) {
   const MonoDelta kTimeout = MonoDelta::FromSeconds(30);
 
-  vector<string> ts_flags = { "--enable_remote_bootstrap=false" };
+  vector<string> ts_flags = { "--TEST_enable_remote_bootstrap=false" };
   vector<string> master_flags = {"--catalog_manager_wait_for_new_tablets_to_elect_leader=false"};
 
   // Start up with 4 tablet servers.
@@ -232,7 +232,7 @@ TEST_F(ClientFailoverITest, TestDeleteLeaderWhileScanning) {
   ASSERT_EQ(workload.rows_inserted(), CountTableRows(table));
 
   // Rotate leaders among the replicas and verify the new leader is the designated one each time.
-  for (const auto ts_map : active_ts_map) {
+  for (const auto& ts_map : active_ts_map) {
     for (auto retries_left = kNumberOfRetries; ; --retries_left) {
       TServerDetails* current_leader = nullptr;
       TServerDetails* new_leader = ts_map.second;

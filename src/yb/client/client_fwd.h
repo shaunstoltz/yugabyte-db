@@ -62,6 +62,12 @@ typedef std::shared_ptr<YBSession> YBSessionPtr;
 
 class YBTable;
 typedef std::shared_ptr<YBTable> YBTablePtr;
+typedef std::string PartitionKey;
+typedef std::shared_ptr<const PartitionKey> PartitionKeyPtr;
+typedef std::vector<PartitionKey> TablePartitionList;
+typedef uint32_t PartitionListVersion;
+struct VersionedTablePartitionList;
+struct VersionedPartitionStartKey;
 
 class YBOperation;
 typedef std::shared_ptr<YBOperation> YBOperationPtr;
@@ -110,6 +116,8 @@ typedef std::shared_ptr<AsyncRpcMetrics> AsyncRpcMetricsPtr;
 } // namespace internal
 
 typedef std::function<void(const Result<internal::RemoteTabletPtr>&)> LookupTabletCallback;
+typedef std::function<void(const Result<std::vector<internal::RemoteTabletPtr>>&)>
+        LookupTabletRangeCallback;
 typedef std::function<void(const Result<CDCStreamId>&)> CreateCDCStreamCallback;
 
 class AsyncClientInitialiser;

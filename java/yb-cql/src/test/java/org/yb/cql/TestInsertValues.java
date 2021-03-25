@@ -30,9 +30,12 @@ import static org.yb.AssertionWrappers.assertEquals;
 import org.yb.YBTestRunner;
 
 import org.junit.runner.RunWith;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 
 @RunWith(value=YBTestRunner.class)
 public class TestInsertValues extends BaseCQLTest {
+  private static final Logger LOG = LoggerFactory.getLogger(TestInsertValues.class);
 
   @Override
   public int getTestMethodTimeoutSec() {
@@ -448,5 +451,16 @@ public class TestInsertValues extends BaseCQLTest {
 
     // Verify the value is inserted.
     assertQuery("SELECT * FROM t;", "Row[1, hello]");
+  }
+
+  @Test
+  public void testInsertNewlineCharacter() throws Exception {
+    // Create table with a TIMESTAMP column and insert a value.
+    session.execute("CREATE TABLE tab (t text PRIMARY KEY);");
+    session.execute(String.format("INSERT INTO tab (t) VALUES ('\n');"));
+
+    // Verify the value.
+    Row row = runSelect("SELECT * FROM tab;").next();
+    assertEquals("\n", row.getString(0));
   }
 }

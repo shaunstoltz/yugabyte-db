@@ -2,7 +2,6 @@
 title: Subscripted expressions [YCQL]
 headerTitle: Subscripted expressions
 linkTitle: Subscripted expressions
-summary: Subscripted columns
 description: Use subscripted expressions to access elements in a multi-element value, such as a map collection by using the [] operator.
 menu:
   latest:
@@ -25,11 +24,11 @@ Use subscripted expressions to access elements in a multi-element value, such as
 ## Examples
 
 ```sql
-cqlsh:yugaspace> CREATE TABLE t(id INT PRIMARY KEY,yugamap MAP<TEXT, TEXT>);
+ycqlsh:yugaspace> CREATE TABLE t(id INT PRIMARY KEY,yugamap MAP<TEXT, TEXT>);
 ```
 
 ```sql
-cqlsh:yugaspace> UPDATE yugatab SET map_value['key_value'] = 'yuga_string' WHERE id = 7;
+ycqlsh:yugaspace> UPDATE yugatab SET map_value['key_value'] = 'yuga_string' WHERE id = 7;
 ```
 
 ## See also

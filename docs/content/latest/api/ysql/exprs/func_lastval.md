@@ -1,7 +1,8 @@
 ---
-title: lastval()
-summary: Get the value returned from the last call to `nextval()`
-description: lastval()
+title: lastval() function [YSQL]
+headerTitle: lastval()
+linkTitle: lastval()
+description: Returns the value returned from the last call to nextval(), for any sequence, in the current session.
 menu:
   latest:
     identifier: api-ysql-exprs-lastval
@@ -24,7 +25,7 @@ Use the `lastval()` function to return the value returned from the last call to 
 
 Create two sequences and call `nextval()` for each of them.
 
-```postgresql
+```plpgsql
 yugabyte=# CREATE SEQUENCE s1;
 ```
 
@@ -32,7 +33,7 @@ yugabyte=# CREATE SEQUENCE s1;
 CREATE SEQUENCE
 ```
 
-```postgresql
+```plpgsql
 yugabyte=# CREATE SEQUENCE s2 START -100 MINVALUE -100;
 ```
 
@@ -40,7 +41,7 @@ yugabyte=# CREATE SEQUENCE s2 START -100 MINVALUE -100;
 CREATE SEQUENCE
 ```
 
-```postgresql
+```plpgsql
 yugabyte=# SELECT nextval('s1');
 ```
 
@@ -51,7 +52,7 @@ yugabyte=# SELECT nextval('s1');
 (1 row)
 ```
 
-```postgresql
+```plpgsql
 yugabyte=# SELECT nextval('s2');
 ```
 
@@ -64,7 +65,7 @@ yugabyte=# SELECT nextval('s2');
 
 Call `lastval()`.
 
-```postgresql
+```plpgsql
 yugabyte=# SELECT lastval()
 ```
 
@@ -78,7 +79,7 @@ yugabyte=# SELECT lastval()
 
 ## See also
 
-[`CREATE SEQUENCE`](../../commands/ddl_create_sequence)
-[`DROP SEQUENCE`](../../commands/ddl_drop_sequence)
+[`CREATE SEQUENCE`](../../the-sql-language/statements/ddl_create_sequence)
+[`DROP SEQUENCE`](../../the-sql-language/statements/ddl_drop_sequence)
 [`currval()`](../func_currval)
 [`nextval()`](../func_nextval)

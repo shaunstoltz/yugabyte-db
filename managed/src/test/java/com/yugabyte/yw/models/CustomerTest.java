@@ -7,7 +7,6 @@ import com.yugabyte.yw.common.ApiUtils;
 import com.yugabyte.yw.common.ModelFactory;
 import com.yugabyte.yw.forms.UniverseDefinitionTaskParams;
 import org.apache.commons.lang3.RandomStringUtils;
-import org.h2.jdbc.JdbcSQLException;
 import org.junit.Test;
 import org.mindrot.jbcrypt.BCrypt;
 import play.libs.Json;
@@ -28,11 +27,14 @@ public class CustomerTest extends FakeDBApplication {
 
   @Test
   public void testCreate() {
-    Customer customer = Customer.create("tc","Test Customer");
-    customer.save();
-    assertNotNull(customer.uuid);
-    assertEquals("Test Customer", customer.name);
-    assertNotNull(customer.creationDate);
+    for (long i = 0; i < 2; i++) {
+      Customer customer = Customer.create("tc", "Test Customer");
+      customer.save();
+      assertSame(i+1, customer.getCustomerId());
+      assertNotNull(customer.uuid);
+      assertEquals("Test Customer", customer.name);
+      assertNotNull(customer.creationDate);
+    }
   }
 
   @Test

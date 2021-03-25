@@ -2,19 +2,19 @@
 title: YB-Master Service
 headerTitle: YB-Master Service
 linkTitle: YB-Master Service
-description: Learn about how the YB-Master Service and nodes manage tablet (shard) metadata and coordinate configuration changes.
+description: Learn how the YB-Master service manages tablet (aka shard) metadata and coordinates cluster configuration changes.
 aliases:
   - /latest/architecture/concepts/yb-master/
 menu:
   latest:
     identifier: architecture-concepts-yb-master
-    parent: architecture-concepts
+    parent: key-concepts
     weight: 1126
 isTocNested: true
 showAsideToc: true
 ---
 
-The YB-Master is the keeper of system metadata and records such as what tables exist in the system, where their tablets live, what users and roles exist, the permissions associated with them, and so on.
+The YB-Master Service is the keeper of system metadata and records such as what tables exist in the system, where their tablets live, what users and roles exist, the permissions associated with them, and so on.
 
 It is also responsible for coordinating background operations (such as load-balancing or initiating re-replication of under-replicated data) and performing a variety of administrative operations such as creating, altering, and dropping tables.
 
@@ -30,7 +30,7 @@ Examples of such operations are user-issued `CREATE TABLE`, `ALTER TABLE`, and `
 
 ### Storage of system metadata
 
-The master store system metadata such as the information about all the namespaces, tables, roles, permissions, and assignment of tablets to YB-TServers. These system records are replicated across the YB-Masters for redundancy using Raft as well. The system metadata is also stored as a DocDB table by the YB-Masters.
+Each YB-Master stores system metadata, including information about namespaces, tables, roles, permissions, and assignments of tablets to YB-TServers. These system records are replicated across the YB-Masters for redundancy using Raft as well. The system metadata is also stored as a DocDB table by the YB-Masters.
 
 ### Authoritative source of tablet assignments to YB-TServers
 
@@ -38,7 +38,7 @@ The YB-Master stores all tablets and the corresponding YB-TServers that currentl
 
 ### Background operations
 
-These operations performed throughout the lifetime of the universe in the background without impacting foreground read and write performance.
+These operations are performed throughout the lifetime of the universe, in the background, without impacting foreground read and write performance.
 
 #### Data placement and load balancing
 

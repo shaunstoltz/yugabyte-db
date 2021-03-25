@@ -160,6 +160,8 @@ class WriteOperationState : public OperationState {
     return force_txn_path_;
   }
 
+  void SetTablet(Tablet* tablet) override;
+
  private:
   // Reset the response, and row_ops_ (which refers to data
   // from the request). Request is owned by WriteOperation using a unique_ptr.
@@ -200,7 +202,7 @@ class WriteOperationContext {
  public:
   // When operation completes, its callback is executed.
   virtual void Submit(std::unique_ptr<Operation> operation, int64_t term) = 0;
-  virtual HybridTime ReportReadRestart() = 0;
+  virtual Result<HybridTime> ReportReadRestart() = 0;
 
   virtual ~WriteOperationContext() {}
 };
@@ -270,6 +272,10 @@ class WriteOperation : public Operation {
     return state()->force_txn_path();
   }
 
+  void UseSubmitToken(ScopedRWOperation&& token) {
+    submit_token_ = std::move(token);
+  }
+
  private:
   friend class DelayedApplyOperation;
 
@@ -307,8 +313,9 @@ class WriteOperation : public Operation {
 
   const int64_t term_;
   ScopedOperation preparing_token_;
+  ScopedRWOperation submit_token_;
   const CoarseTimePoint deadline_;
-  WriteOperationContext& context_;
+  WriteOperationContext* const context_;
 
   // this transaction's start time
   MonoTime start_time_;

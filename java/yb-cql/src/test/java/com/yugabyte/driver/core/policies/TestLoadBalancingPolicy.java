@@ -27,6 +27,7 @@ import com.datastax.driver.core.utils.UUIDs;
 import org.yb.cql.BaseCQLTest;
 import org.yb.minicluster.IOMetrics;
 import org.yb.minicluster.MiniYBCluster;
+import org.yb.minicluster.MiniYBClusterBuilder;
 import org.yb.minicluster.MiniYBDaemon;
 
 import org.apache.commons.lang3.RandomStringUtils;
@@ -51,9 +52,19 @@ import java.util.UUID;
 import org.yb.YBTestRunner;
 
 import org.junit.runner.RunWith;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 
 @RunWith(value=YBTestRunner.class)
 public class TestLoadBalancingPolicy extends BaseCQLTest {
+  private static final Logger LOG = LoggerFactory.getLogger(TestLoadBalancingPolicy.class);
+
+  private static final int SYSTEM_PARTITIONS_REFRESH_SECS = 10;
+  @Override
+  protected void customizeMiniClusterBuilder(MiniYBClusterBuilder builder) {
+    super.customizeMiniClusterBuilder(builder);
+    builder.yqlSystemPartitionsVtableRefreshSecs(SYSTEM_PARTITIONS_REFRESH_SECS);
+  }
 
   // Test hash-key function in PartitionAwarePolicy to verify it is consistent with the hash
   // function used in YB (the token() function).
@@ -323,7 +334,7 @@ public class TestLoadBalancingPolicy extends BaseCQLTest {
     // Since partition metadata is refreshed asynchronously after a new table is created, let's
     // wait for a little or else the initial statements will be executed without the partition
     // metadata and will be dispatched to a random node.
-    Thread.sleep(10000);
+    Thread.sleep((long) (1.5 * SYSTEM_PARTITIONS_REFRESH_SECS * 1000));
   }
 
   // Test load-balancing policy with DMLs.
@@ -443,10 +454,11 @@ public class TestLoadBalancingPolicy extends BaseCQLTest {
                totalMetrics.localWriteCount >= NUM_KEYS * 0.7);
 
     // Should use percentage to check? Remove the following check if it fails.
-    // Use 60% as limit (Assuming 100% local write for UserTable and 50% for each IndexTable).
+    // Use 40% as limit (Assuming 100% local write for UserTable, 50% for each IndexTable,
+    // and 50% for TServer initiated index updates).
     double fraction = (1.0 * totalMetrics.localWriteCount) /
                       (totalMetrics.localWriteCount + totalMetrics.remoteWriteCount);
-    assertTrue("Local/total write: " + fraction, fraction > 0.60);
+    assertTrue("Local/total write: " + fraction, fraction > 0.40);
   }
 
   // Test load-balancing policy with BatchStatement

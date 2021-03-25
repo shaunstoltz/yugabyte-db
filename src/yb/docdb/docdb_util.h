@@ -24,6 +24,12 @@
 
 namespace yb {
 namespace docdb {
+
+struct ExternalIntent {
+  DocPath doc_path;
+  Value value;
+};
+
 // A wrapper around a RocksDB instance and provides utility functions on top of it, such as
 // compacting the history until a certain point. This is used in the bulk load tool. This is also
 // convenient base class for GTest test classes, because it exposes member functions such as
@@ -55,7 +61,7 @@ class DocDBRocksDBUtil {
 
   const rocksdb::WriteOptions& write_options() const { return write_options_; }
 
-  const rocksdb::Options& options() const { return rocksdb_options_; }
+  const rocksdb::Options& regular_db_options() const { return regular_db_options_; }
 
   CHECKED_STATUS OpenRocksDB();
 
@@ -110,6 +116,12 @@ class DocDBRocksDBUtil {
       HybridTime hybrid_time,
       const ReadHybridTime& read_ht = ReadHybridTime::Max());
 
+  CHECKED_STATUS AddExternalIntents(
+      const TransactionId& txn_id,
+      const std::vector<ExternalIntent>& intents,
+      const Uuid& involved_tablet,
+      HybridTime hybrid_time);
+
   CHECKED_STATUS InsertSubDocument(
       const DocPath& doc_path,
       const SubDocument& value,
@@ -132,8 +144,8 @@ class DocDBRocksDBUtil {
 
   CHECKED_STATUS ReplaceInList(
       const DocPath &doc_path,
-      const std::vector<int>& indexes,
-      const std::vector<SubDocument>& values,
+      const int target_cql_index,
+      const SubDocument& value,
       const ReadHybridTime& read_ht,
       const HybridTime& hybrid_time,
       const rocksdb::QueryId query_id,
@@ -165,7 +177,8 @@ class DocDBRocksDBUtil {
   }
 
   CHECKED_STATUS DisableCompactions() {
-    rocksdb_options_.compaction_style = rocksdb::kCompactionStyleNone;
+    regular_db_options_.compaction_style = rocksdb::kCompactionStyleNone;
+    intents_db_options_.compaction_style = rocksdb::kCompactionStyleNone;
     return ReopenRocksDB();
   }
 
@@ -187,9 +200,10 @@ class DocDBRocksDBUtil {
  protected:
   std::string IntentsDBDir();
 
-  std::unique_ptr<rocksdb::DB> rocksdb_;
+  std::unique_ptr<rocksdb::DB> regular_db_;
   std::unique_ptr<rocksdb::DB> intents_db_;
-  rocksdb::Options rocksdb_options_;
+  rocksdb::Options regular_db_options_;
+  rocksdb::Options intents_db_options_;
   std::string rocksdb_dir_;
 
   // This is used for auto-assigning op ids to RocksDB write batches to emulate what a tablet would
@@ -210,30 +224,6 @@ class DocDBRocksDBUtil {
  private:
   std::atomic<int64_t> monotonic_counter_{0};
   boost::optional<DocWriteBatch> doc_write_batch_;
-};
-
-// An implementation of the document node visitor interface that dumps all events (document
-// start/end, object keys and values, etc.) to a string as separate lines.
-class DebugDocVisitor : public DocVisitor {
- public:
-  DebugDocVisitor();
-  virtual ~DebugDocVisitor();
-
-  CHECKED_STATUS StartSubDocument(const SubDocKey &key) override;
-
-  CHECKED_STATUS VisitKey(const PrimitiveValue& key) override;
-  CHECKED_STATUS VisitValue(const PrimitiveValue& value) override;
-
-  CHECKED_STATUS EndSubDocument() override;
-  CHECKED_STATUS StartObject() override;
-  CHECKED_STATUS EndObject() override;
-  CHECKED_STATUS StartArray() override;
-  CHECKED_STATUS EndArray() override;
-
-  std::string ToString();
-
- private:
-  std::stringstream out_;
 };
 
 }  // namespace docdb

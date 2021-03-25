@@ -62,6 +62,8 @@
 #include "yb/tserver/tserver_admin.proxy.h"
 #include "yb/tserver/tserver_service.proxy.h"
 
+using namespace std::literals;
+
 namespace yb {
 class HostPort;
 class MonoDelta;
@@ -124,21 +126,22 @@ Status GetLastOpIdForEachReplica(const TabletId& tablet_id,
                                  const std::vector<TServerDetails*>& replicas,
                                  consensus::OpIdType opid_type,
                                  const MonoDelta& timeout,
-                                 std::vector<consensus::OpId>* op_ids);
+                                 std::vector<OpIdPB>* op_ids);
 
 // Like the above, but for a single replica.
 Status GetLastOpIdForReplica(const TabletId& tablet_id,
                              TServerDetails* replica,
                              consensus::OpIdType opid_type,
                              const MonoDelta& timeout,
-                             consensus::OpId* op_id);
+                             OpIdPB* op_id);
 
 // Creates server vector from map.
 vector<TServerDetails*> TServerDetailsVector(const TabletServerMap& tablet_servers);
 vector<TServerDetails*> TServerDetailsVector(const TabletServerMapUnowned& tablet_servers);
 
 // Creates copy of tablet server map, which does not own TServerDetails.
-TabletServerMapUnowned CreateTabletServerMapUnowned(const TabletServerMap& tablet_servers);
+TabletServerMapUnowned CreateTabletServerMapUnowned(const TabletServerMap& tablet_servers,
+                                                    const std::set<std::string>& exclude = {});
 
 // Wait until all of the servers have converged on the same log index.
 // The converged index must be at least equal to 'minimum_index'.
@@ -180,7 +183,8 @@ Status WaitForServersToAgree(const MonoDelta& timeout,
 Status WaitUntilAllReplicasHaveOp(const int64_t log_index,
                                   const TabletId& tablet_id,
                                   const std::vector<TServerDetails*>& replicas,
-                                  const MonoDelta& timeout);
+                                  const MonoDelta& timeout,
+                                  int64_t* actual_minimum_index = nullptr);
 
 // Wait until the number of alive tservers is equal to n_tservers. An alive tserver is a tserver
 // that has heartbeated the master at least once in the last FLAGS_raft_heartbeat_interval_ms
@@ -293,17 +297,31 @@ Status StartElection(
     consensus::TEST_SuppressVoteRequest suppress_vote_request =
         consensus::TEST_SuppressVoteRequest::kFalse);
 
+// Request the given replica to vote. This is thin wrapper around
+// RequestConsensusVote(). See the definition of VoteRequestPB in
+// consensus.proto for parameter details.
+Status RequestVote(const TServerDetails* replica,
+                   const std::string& tablet_id,
+                   const std::string& candidate_uuid,
+                   int64_t candidate_term,
+                   const OpIdPB& last_logged_opid,
+                   boost::optional<bool> ignore_live_leader,
+                   boost::optional<bool> is_pre_election,
+                   const MonoDelta& timeout);
+
 // Cause a leader to step down on the specified server.
 // 'timeout' refers to the RPC timeout waiting synchronously for stepdown to
 // complete on the leader side. Since that does not require communication with
 // other nodes at this time, this call is rather quick.
 // 'new_leader', if not null, is the replica that should start the election to
 // become the new leader.
-Status LeaderStepDown(const TServerDetails* replica,
-                      const TabletId& tablet_id,
-                      const TServerDetails* new_leader,
-                      const MonoDelta& timeout,
-                      tserver::TabletServerErrorPB* error = nullptr);
+Status LeaderStepDown(
+    const TServerDetails* replica,
+    const TabletId& tablet_id,
+    const TServerDetails* new_leader,
+    const MonoDelta& timeout,
+    const bool disable_graceful_transition = false,
+    tserver::TabletServerErrorPB* error = nullptr);
 
 // Write a "simple test schema" row to the specified tablet on the given
 // replica. This schema is commonly used by tests and is defined in
@@ -380,7 +398,8 @@ Status WaitForNumTabletsOnTS(
 Status WaitUntilTabletInState(TServerDetails* ts,
                               const TabletId& tablet_id,
                               tablet::RaftGroupStatePB state,
-                              const MonoDelta& timeout);
+                              const MonoDelta& timeout,
+                              const MonoDelta& list_tablets_timeout = 10s);
 
 // Wait until the specified tablet is in RUNNING state.
 Status WaitUntilTabletRunning(TServerDetails* ts,
@@ -411,7 +430,7 @@ Status GetLastOpIdForMasterReplica(const std::shared_ptr<ConsensusServiceProxy>&
                                    const std::string& dest_uuid,
                                    const OpIdType opid_type,
                                    const MonoDelta& timeout,
-                                   consensus::OpId* op_id);
+                                   OpIdPB* op_id);
 
 } // namespace itest
 } // namespace yb

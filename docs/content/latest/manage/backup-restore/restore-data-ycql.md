@@ -1,9 +1,8 @@
 ---
-title: Restore data
+title: Restore data for YCQL
+headerTitle: Restore data
 linkTitle: Restore data
-description: Restore data
-image: /images/section_icons/manage/enterprise.png
-headcontent: Restore data in YugabyteDB.
+description: Restore data in YugabyteDB for YCQL
 aliases:
   - /manage/backup-restore/backing-up-data
 menu:
@@ -11,6 +10,8 @@ menu:
     identifier: restore-data-ycql
     parent: backup-restore
     weight: 703
+isTocNested: true
+showAsideToc: true
 ---
 
 <ul class="nav nav-tabs-alt nav-tabs-yb">
@@ -28,13 +29,12 @@ menu:
   </li>
 </ul>
 
-
 ## Restore the schema
 
 In order to restore the schema, run the following command.
 
 ```sh
-$ cqlsh -e "source 'schema.cql'"
+$ ycqlsh -e "source 'schema.cql'"
 ```
 
 ### Restoring data from a backup
@@ -42,7 +42,7 @@ $ cqlsh -e "source 'schema.cql'"
 To restore data from a backup, run the following command.
 
 ```sh
-$ cqlsh -e "COPY <keyspace name>.<table name> FROM 'data.csv' WITH HEADER = TRUE ;"
+$ ycqlsh -e "COPY <keyspace name>.<table name> FROM 'data.csv' WITH HEADER = TRUE ;"
 ```
 
 You can restore data from a backup that has a subset of columns as well.
@@ -78,19 +78,19 @@ There are a number of useful options in the `COPY FROM` command used to perform 
 
 ## Example
 
-Let us restore the backup we had performed in the [example section of backing up data](/manage/backup-restore/backing-up-data/#example), 
-where we had walked through how to create the `myapp_schema.cql` schema backup and the `myapp_data.csv` data backup files. 
+Let us restore the backup you had performed in the [example section of backing up data](/manage/backup-restore/backing-up-data/#example), 
+where you had walked through how to create the `myapp_schema.cql` schema backup and the `myapp_data.csv` data backup files. 
 
 If you have created the keyspace and the table with the data, remember to drop them using cqlsh. You can drop the table by running the following query:
 
 ```sql
-cqlsh> DROP TABLE myapp.stock_market;
+ycqlsh> DROP TABLE myapp.stock_market;
 ```
 
 You can drop the keyspace by running the following:
 
 ```sql
-cqlsh> DROP KEYSPACE myapp;
+ycqlsh> DROP KEYSPACE myapp;
 ```
 
 
@@ -99,7 +99,7 @@ cqlsh> DROP KEYSPACE myapp;
 You can import the schema from the `myapp_schema.cql` schema backup file by running the following:
 
 ```sh
-$ cqlsh -f myapp_schema.cql
+$ ycqlsh -f myapp_schema.cql
 ```
 
 The schema backup file `myapp_schema.cql` should look as show below:
@@ -107,6 +107,7 @@ The schema backup file `myapp_schema.cql` should look as show below:
 ```sh
 $ cat myapp_schema.cql
 ```
+
 ```
 CREATE KEYSPACE myapp WITH replication = {'class': 'SimpleStrategy', 'replication_factor': '3'}  AND durable_writes = true;
 
@@ -119,10 +120,12 @@ CREATE TABLE myapp.stock_market (
     AND default_time_to_live = 0;
 ```
 
-You can verify that the table was created by connecting to the cluster using `cqlsh` and running the following :
+You can verify that the table was created by connecting to the cluster using `ycqlsh` and running the following :
+
 ```sql
-cqlsh> DESC myapp.stock_market;
+ycqlsh> DESC myapp.stock_market;
 ```
+
 ```
 CREATE TABLE myapp.stock_market (
     stock_symbol text,
@@ -136,10 +139,10 @@ CREATE TABLE myapp.stock_market (
 ### Restore the data
 
 You can restore the data from the `myapp_data.csv` data backup file as follows:
-```sh
-$ cqlsh -e "COPY myapp.stock_market FROM 'myapp_data.csv' WITH HEADER = TRUE ;"
-```
 
+```sh
+$ ycqlsh -e "COPY myapp.stock_market FROM 'myapp_data.csv' WITH HEADER = TRUE ;"
+```
 
 The data backup file `myapp_data.csv` should look as follows:
 
@@ -155,11 +158,12 @@ GOOG,2017-10-26 10:00:00,971.90997
 ```
 
 Note that the procedure to import data from a partial backup is identical. You can verify that the data has been restored by connecting 
-to the cluster using `cqlsh` and running the following query:
+to the cluster using `ycqlsh` and running the following query:
 
 ```sql
-cqlsh> SELECT * FROM myapp.stock_market;
+ycqlsh> SELECT * FROM myapp.stock_market;
 ```
+
 ```
  stock_symbol | ts                  | current_price
 --------------+---------------------+---------------

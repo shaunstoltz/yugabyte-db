@@ -41,7 +41,7 @@ import org.junit.runner.RunWith;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.yb.YBTestRunner;
-import org.yb.minicluster.MiniYBCluster;
+import org.yb.minicluster.MiniYBClusterBuilder;
 import org.yb.minicluster.MiniYBDaemon;
 import org.yb.util.ServerInfo;
 
@@ -57,6 +57,12 @@ public class TestHealthChecks extends BaseYBClientTest {
   private static final Logger LOG = LoggerFactory.getLogger(TestHealthChecks.class);
   private static final String TABLE_NAME =
       TestMasterFailover.class.getName() + "-" + System.currentTimeMillis();
+
+  @Override
+  protected void customizeMiniClusterBuilder(MiniYBClusterBuilder builder) {
+    super.customizeMiniClusterBuilder(builder);
+    builder.tserverHeartbeatTimeoutMs(5000);
+  }
 
   @Override
   protected void afterStartingMiniCluster() throws Exception {
@@ -97,7 +103,7 @@ public class TestHealthChecks extends BaseYBClientTest {
       // call the health-check JSON endpoint
       URL url =
         new URL(String.format("http://%s:%d/api/v1/health-check?tserver_death_interval_msecs=%d",
-                masterHostAndPort.getHostText(), masterLeaderWebPort, tserver_death_interval_msecs));
+                masterHostAndPort.getHost(), masterLeaderWebPort, tserver_death_interval_msecs));
       Scanner scanner = new Scanner(url.openConnection().getInputStream());
       JsonParser parser = new JsonParser();
       JsonElement tree = parser.parse(scanner.useDelimiter("\\A").next());
@@ -119,13 +125,14 @@ public class TestHealthChecks extends BaseYBClientTest {
       return;
     }
 
-    final int HEARTBEAT_SEC = MiniYBCluster.TSERVER_HEARTBEAT_TIMEOUT_MS / 1000;
+    final int HEARTBEAT_SEC =
+        miniCluster.getClusterParameters().getTServerHeartbeatTimeoutMs() / 1000;
 
     // create a 4th TServer so we can kill a server and maintain normal replication
     addNewTServers(1);
 
     // verify all servers have stayed up for at least one heartbeat
-    Thread.sleep(MiniYBCluster.TSERVER_HEARTBEAT_TIMEOUT_MS + 1000);
+    Thread.sleep((HEARTBEAT_SEC + 1) * 1000);
     assertGreaterThanOrEqualTo(getHealthValue("most_recent_uptime").getAsInt(), HEARTBEAT_SEC);
 
     // kill (don't stop) a TServer.
@@ -140,7 +147,7 @@ public class TestHealthChecks extends BaseYBClientTest {
         HostAndPort.fromParts(tServer.getHost(), tServer.getPort()) );
 
     // ensure that it shows up in the 'dead_nodes'.
-    Thread.sleep(2 * MiniYBCluster.TSERVER_HEARTBEAT_TIMEOUT_MS );
+    Thread.sleep(2 * HEARTBEAT_SEC * 1000);
     deadNodes = getHealthValue("dead_nodes").getAsJsonArray();
     assertEquals(deadNodes.size(), 1);
     LOG.info("Dead Nodes: " + deadNodes.get(0) + " && " + tServer.getUuid());

@@ -1,9 +1,7 @@
 // Copyright (c) YugaByte, Inc.
 package com.yugabyte.yw.models.helpers;
 
-import com.google.common.collect.ImmutableSet;
 import com.yugabyte.yw.common.ApiUtils;
-import com.yugabyte.yw.common.NodeActionType;
 import org.junit.Before;
 import org.junit.Test;
 
@@ -36,10 +34,12 @@ public class NodeDetailsTest {
   public void testIsActive() {
     Set<NodeDetails.NodeState> activeStates = new HashSet<>();
     activeStates.add(NodeDetails.NodeState.ToBeAdded);
+    activeStates.add(NodeDetails.NodeState.ToJoinCluster);
     activeStates.add(NodeDetails.NodeState.Provisioned);
     activeStates.add(NodeDetails.NodeState.SoftwareInstalled);
     activeStates.add(NodeDetails.NodeState.UpgradeSoftware);
     activeStates.add(NodeDetails.NodeState.UpdateGFlags);
+    activeStates.add(NodeDetails.NodeState.UpdateCert);
     activeStates.add(NodeDetails.NodeState.Live);
     activeStates.add(NodeDetails.NodeState.Stopping);
     for (NodeDetails.NodeState state : NodeDetails.NodeState.values()) {
@@ -57,6 +57,7 @@ public class NodeDetailsTest {
     Set<NodeDetails.NodeState> queryableStates = new HashSet<>();
     queryableStates.add(NodeDetails.NodeState.UpgradeSoftware);
     queryableStates.add(NodeDetails.NodeState.UpdateGFlags);
+    queryableStates.add(NodeDetails.NodeState.UpdateCert);
     queryableStates.add(NodeDetails.NodeState.Live);
     queryableStates.add(NodeDetails.NodeState.ToBeRemoved);
     queryableStates.add(NodeDetails.NodeState.Removing);
@@ -67,29 +68,6 @@ public class NodeDetailsTest {
         assertTrue(nd.isQueryable());
       } else {
         assertFalse(nd.isQueryable());
-      }
-    }
-  }
-
-  @Test
-  public void testGetAllowedActions() {
-    for (NodeDetails.NodeState nodeState : NodeDetails.NodeState.values()) {
-      nd.state = nodeState;
-      if (nodeState == NodeDetails.NodeState.ToBeAdded) {
-        assertEquals(ImmutableSet.of(NodeActionType.DELETE), nd.getAllowedActions());
-      } else if (nodeState == NodeDetails.NodeState.Live) {
-        assertEquals(ImmutableSet.of(NodeActionType.STOP, NodeActionType.REMOVE),
-                     nd.getAllowedActions());
-      } else if (nodeState == NodeDetails.NodeState.Stopped) {
-        assertEquals(ImmutableSet.of(NodeActionType.START, NodeActionType.RELEASE),
-            nd.getAllowedActions());
-      } else if (nodeState == NodeDetails.NodeState.Removed) {
-        assertEquals(ImmutableSet.of(NodeActionType.ADD, NodeActionType.RELEASE),
-            nd.getAllowedActions());
-      } else if (nodeState == NodeDetails.NodeState.Decommissioned) {
-        assertEquals(ImmutableSet.of(NodeActionType.ADD), nd.getAllowedActions());
-      } else {
-        assertTrue(nd.getAllowedActions().isEmpty());
       }
     }
   }

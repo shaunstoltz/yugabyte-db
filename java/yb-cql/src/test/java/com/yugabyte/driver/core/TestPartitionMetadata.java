@@ -17,6 +17,7 @@ import org.junit.Test;
 import com.datastax.driver.core.TableMetadata;
 
 import org.yb.cql.BaseCQLTest;
+import org.yb.minicluster.MiniYBClusterBuilder;
 
 import static org.yb.AssertionWrappers.assertFalse;
 import static org.yb.AssertionWrappers.assertTrue;
@@ -24,9 +25,20 @@ import static org.yb.AssertionWrappers.assertTrue;
 import org.yb.YBTestRunner;
 
 import org.junit.runner.RunWith;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 
 @RunWith(value=YBTestRunner.class)
 public class TestPartitionMetadata extends BaseCQLTest {
+  private static final Logger LOG = LoggerFactory.getLogger(TestPartitionMetadata.class);
+
+  @Override
+  protected void customizeMiniClusterBuilder(MiniYBClusterBuilder builder) {
+    super.customizeMiniClusterBuilder(builder);
+    // Due to how getTableSplitMetadata() works, we need to generate the system.partitions vtable
+    // on queries.
+    builder.yqlSystemPartitionsVtableRefreshSecs(0);
+  }
 
   private TableSplitMetadata getPartitionMap(TableMetadata table) {
     return cluster.getMetadata().getTableSplitMetadata(table.getKeyspace().getName(),

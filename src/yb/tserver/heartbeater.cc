@@ -79,6 +79,8 @@ TAG_FLAG(tserver_disable_heartbeat_test_only, unsafe);
 TAG_FLAG(tserver_disable_heartbeat_test_only, hidden);
 TAG_FLAG(tserver_disable_heartbeat_test_only, runtime);
 
+DEFINE_CAPABILITY(TabletReportLimit, 0xb1a2a020);
+
 using google::protobuf::RepeatedPtrField;
 using yb::HostPortPB;
 using yb::consensus::RaftPeerPB;
@@ -151,6 +153,9 @@ class Heartbeater::Thread {
   // The server for which we are heartbeating.
   TabletServer* const server_;
 
+  // Roundtrip time of previous heartbeat to yb-master.
+  MonoDelta heartbeat_rtt_ = MonoDelta::kZero;
+
   // The actual running thread (NULL before it is started)
   scoped_refptr<yb::Thread> thread_;
 
@@ -163,8 +168,9 @@ class Heartbeater::Thread {
   // The most recent response from a heartbeat.
   master::TSHeartbeatResponsePB last_hb_response_;
 
-  // True once at least one heartbeat has been sent.
-  bool has_heartbeated_ = false;
+  // Full reports can take multiple heartbeats.
+  // Flag to indicate if next heartbeat is part of a full report.
+  bool sending_full_report_ = false;
 
   // The number of heartbeats which have failed in a row.
   // This is tracked so as to back-off heartbeating.
@@ -225,14 +231,19 @@ Heartbeater::Thread::Thread(
 
 namespace {
 
-void LeaderMasterCallback(HostPort* dst_hostport,
-                          Synchronizer* sync,
+struct FindLeaderMasterData {
+  HostPort result;
+  Synchronizer sync;
+  std::shared_ptr<GetLeaderMasterRpc> rpc;
+};
+
+void LeaderMasterCallback(const std::shared_ptr<FindLeaderMasterData>& data,
                           const Status& status,
                           const HostPort& result) {
   if (status.ok()) {
-    *dst_hostport = result;
+    data->result = result;
   }
-  sync->StatusCB(status);
+  data->sync.StatusCB(status);
 }
 
 } // anonymous namespace
@@ -247,20 +258,24 @@ Status Heartbeater::Thread::FindLeaderMaster(CoarseTimePoint deadline, HostPort*
   }
   auto master_sock_addrs = *master_addresses;
   if (master_sock_addrs.empty()) {
-    return STATUS(NotFound, "unable to resolve any of the master addresses!");
+    return STATUS(NotFound, "Unable to resolve any of the master addresses!");
   }
-  Synchronizer sync;
-  auto rpc = rpc::StartRpc<GetLeaderMasterRpc>(
-      Bind(&LeaderMasterCallback, leader_hostport, &sync),
+  auto data = std::make_shared<FindLeaderMasterData>();
+  data->rpc = std::make_shared<GetLeaderMasterRpc>(
+      Bind(&LeaderMasterCallback, data),
       master_sock_addrs,
       deadline,
       server_->messenger(),
       &server_->proxy_cache(),
       &rpcs_,
       true /* should_timeout_to_follower_ */);
-  auto result = sync.Wait();
+  data->rpc->SendRpc();
+  auto status = data->sync.WaitFor(deadline - CoarseMonoClock::Now() + 1s);
+  if (status.ok()) {
+    *leader_hostport = data->result;
+  }
   rpcs_.RequestAbortAll();
-  return result;
+  return status;
 }
 
 Status Heartbeater::Thread::ConnectToMaster() {
@@ -272,6 +287,9 @@ Status Heartbeater::Thread::ConnectToMaster() {
                           << " hit error " << s;
     return s;
   }
+
+  // Reset report state if we have master failover.
+  sending_full_report_ = false;
 
   // Pings are common for both Master and Tserver.
   auto new_proxy = std::make_unique<server::GenericServiceProxy>(
@@ -315,14 +333,10 @@ int Heartbeater::Thread::GetMinimumHeartbeatMillis() const {
 }
 
 int Heartbeater::Thread::GetMillisUntilNextHeartbeat() const {
-  // When we first start up, heartbeat immediately.
-  if (!has_heartbeated_) {
-    return GetMinimumHeartbeatMillis();
-  }
-
   // If the master needs something from us, we should immediately
   // send another heartbeat with that info, rather than waiting for the interval.
-  if (last_hb_response_.needs_reregister() ||
+  if (sending_full_report_ ||
+      last_hb_response_.needs_reregister() ||
       last_hb_response_.needs_full_tablet_report()) {
     return GetMinimumHeartbeatMillis();
   }
@@ -346,18 +360,23 @@ Status Heartbeater::Thread::TryHeartbeat() {
 
   if (last_hb_response_.needs_full_tablet_report()) {
     LOG_WITH_PREFIX(INFO) << "Sending a full tablet report to master...";
-    server_->tablet_manager()->GenerateFullTabletReport(
-      req.mutable_tablet_report());
+    server_->tablet_manager()->StartFullTabletReport(req.mutable_tablet_report());
+    sending_full_report_ = true;
   } else {
-    VLOG_WITH_PREFIX(2) << "Sending an incremental tablet report to master...";
-    server_->tablet_manager()->GenerateIncrementalTabletReport(
-      req.mutable_tablet_report());
+    if (sending_full_report_) {
+      LOG_WITH_PREFIX(INFO) << "Continuing full tablet report to master...";
+    } else {
+      VLOG_WITH_PREFIX(2) << "Sending an incremental tablet report to master...";
+    }
+    server_->tablet_manager()->GenerateTabletReport(req.mutable_tablet_report(),
+                                                    !sending_full_report_ /* include_bootstrap */);
   }
+  req.mutable_tablet_report()->set_is_incremental(!sending_full_report_);
   req.set_num_live_tablets(server_->tablet_manager()->GetNumLiveTablets());
   req.set_leader_count(server_->tablet_manager()->GetLeaderCount());
 
   for (auto& data_provider : data_providers_) {
-    data_provider->AddData(&req);
+    data_provider->AddData(last_hb_response_, &req);
   }
 
   RpcController rpc;
@@ -365,12 +384,33 @@ Status Heartbeater::Thread::TryHeartbeat() {
 
   req.set_config_index(server_->GetCurrentMasterIndex());
   req.set_cluster_config_version(server_->cluster_config_version());
+  req.set_rtt_us(heartbeat_rtt_.ToMicroseconds());
+
+  // Include the hybrid time of this tablet server in the heartbeat.
+  auto* hybrid_clock = dynamic_cast<server::HybridClock*>(server_->Clock());
+  if (hybrid_clock) {
+    req.set_ts_hybrid_time(hybrid_clock->Now().ToUint64());
+    // Also include the physical clock time of this tablet server in the heartbeat.
+    Result<PhysicalTime> now = hybrid_clock->physical_clock()->Now();
+    if (!now.ok()) {
+      YB_LOG_EVERY_N_SECS(WARNING, 10) << "Failed to read clock: " << now.status();
+      req.set_ts_physical_time(0);
+    } else {
+      req.set_ts_physical_time(now->time_point);
+    }
+  } else {
+    req.set_ts_hybrid_time(0);
+    req.set_ts_physical_time(0);
+  }
 
   {
     VLOG_WITH_PREFIX(2) << "Sending heartbeat:\n" << req.DebugString();
+    heartbeat_rtt_ = MonoDelta::kZero;
+    MonoTime start_time = MonoTime::Now();
     master::TSHeartbeatResponsePB resp;
     RETURN_NOT_OK_PREPEND(proxy_->TSHeartbeat(req, &resp, &rpc),
                           "Failed to send heartbeat");
+    MonoTime end_time = MonoTime::Now();
     if (resp.has_error()) {
       if (resp.error().code() != master::MasterErrorPB::NOT_THE_LEADER) {
         return StatusFromPB(resp.error().status());
@@ -397,7 +437,7 @@ Status Heartbeater::Thread::TryHeartbeat() {
       // determine the master and attempt to heartbeat during in the
       // next heartbeat interval.
       proxy_.reset();
-      return STATUS(ServiceUnavailable, "master is no longer the leader");
+      return STATUS_FORMAT(ServiceUnavailable, "Master is no longer the leader: $0", resp.error());
     }
 
     // Check for a universe key registry for encryption.
@@ -425,23 +465,45 @@ Status Heartbeater::Thread::TryHeartbeat() {
     // the last heartbeat response. This invalidates resp so we should use last_hb_response_ instead
     // below (hence using the nested scope for resp until here).
     last_hb_response_.Swap(&resp);
-  }
-
-  if (last_hb_response_.needs_full_tablet_report()) {
-    return STATUS(TryAgain, "");
+    heartbeat_rtt_ = end_time.GetDeltaSince(start_time);
   }
 
   if (last_hb_response_.has_cluster_uuid() && !last_hb_response_.cluster_uuid().empty()) {
     server_->set_cluster_uuid(last_hb_response_.cluster_uuid());
   }
 
-  // TODO: Handle TSHeartbeatResponsePB (e.g. deleted tablets and schema changes)
-  server_->tablet_manager()->MarkTabletReportAcknowledged(req.tablet_report());
+  // The Master responds with the max entries for a single Tablet Report to avoid overwhelming it.
+  if (last_hb_response_.has_tablet_report_limit()) {
+    server_->tablet_manager()->SetReportLimit(last_hb_response_.tablet_report_limit());
+  }
+
+  if (last_hb_response_.needs_full_tablet_report()) {
+    return STATUS(TryAgain, "");
+  }
+
+  // Handle TSHeartbeatResponsePB (e.g. tablets ack'd by master as processed)
+  bool all_processed = req.tablet_report().remaining_tablet_count() == 0 &&
+                       !last_hb_response_.tablet_report().processing_truncated();
+  server_->tablet_manager()->MarkTabletReportAcknowledged(
+      req.tablet_report().sequence_number(), last_hb_response_.tablet_report(), all_processed);
+
+  // Trigger another heartbeat ASAP if we didn't process all tablets on this request.
+  sending_full_report_ = sending_full_report_ && !all_processed;
 
   // Update the master's YSQL catalog version (i.e. if there were schema changes for YSQL objects).
   if (last_hb_response_.has_ysql_catalog_version()) {
-    server_->SetYSQLCatalogVersion(last_hb_response_.ysql_catalog_version());
+    if (last_hb_response_.has_ysql_last_breaking_catalog_version()) {
+      server_->SetYSQLCatalogVersion(last_hb_response_.ysql_catalog_version(),
+                                     last_hb_response_.ysql_last_breaking_catalog_version());
+    } else {
+      /* Assuming all changes are breaking if last breaking version not explicitly set. */
+      server_->SetYSQLCatalogVersion(last_hb_response_.ysql_catalog_version(),
+                                     last_hb_response_.ysql_catalog_version());
+    }
   }
+
+  RETURN_NOT_OK(server_->tablet_manager()->UpdateSnapshotSchedules(
+      last_hb_response_.snapshot_schedules()));
 
   // Update the live tserver list.
   return server_->PopulateLiveTServers(last_hb_response_);
@@ -480,12 +542,11 @@ void Heartbeater::Thread::RunThread() {
   CHECK(IsCurrentThread());
   VLOG_WITH_PREFIX(1) << "Heartbeat thread starting";
 
-  // Set up a fake "last heartbeat response" which indicates that we
-  // need to register -- since we've never registered before, we know
-  // this to be true.  This avoids an extra
-  // heartbeat/response/heartbeat cycle.
+  // Config the "last heartbeat response" to indicate that we need to register
+  // -- since we've never registered before, we know this to be true.
   last_hb_response_.set_needs_reregister(true);
-  last_hb_response_.set_needs_full_tablet_report(true);
+  // Have the Master request a full tablet report on 2nd HB, once it knows our capabilities.
+  last_hb_response_.set_needs_full_tablet_report(false);
 
   while (true) {
     MonoTime next_heartbeat = MonoTime::Now();
@@ -523,11 +584,12 @@ void Heartbeater::Thread::RunThread() {
           << ", masters=" << yb::ToString(master_addresses)
           << ", code=" << s.CodeAsString();
       consecutive_failed_heartbeats_++;
+      // If there's multiple masters...
       if (master_addresses->size() > 1 || (*master_addresses)[0].size() > 1) {
-        // If we encountered a network error (e.g., connection
-        // refused) or timed out and there's more than one master available, try
-        // determining the leader master again.
-        if (s.IsNetworkError() || s.IsTimedOut() ||
+        // If we encountered a network error (e.g., connection refused) or reached our failure
+        // threshold.  Try determining the leader master again.  Heartbeats function as a watchdog,
+        // so timeouts should be considered normal failures.
+        if (s.IsNetworkError() ||
             consecutive_failed_heartbeats_ == FLAGS_heartbeat_max_failures_before_backoff) {
           proxy_.reset();
         }
@@ -535,7 +597,6 @@ void Heartbeater::Thread::RunThread() {
       continue;
     }
     consecutive_failed_heartbeats_ = 0;
-    has_heartbeated_ = true;
   }
 }
 
@@ -577,9 +638,10 @@ const std::string& HeartbeatDataProvider::LogPrefix() const {
   return server_.LogPrefix();
 }
 
-void PeriodicalHeartbeatDataProvider::AddData(master::TSHeartbeatRequestPB* req) {
+void PeriodicalHeartbeatDataProvider::AddData(
+    const master::TSHeartbeatResponsePB& last_resp, master::TSHeartbeatRequestPB* req) {
   if (prev_run_time_ + period_ < CoarseMonoClock::Now()) {
-    DoAddData(req);
+    DoAddData(last_resp, req);
     prev_run_time_ = CoarseMonoClock::Now();
   }
 }

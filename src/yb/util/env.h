@@ -37,6 +37,7 @@
 #include "yb/util/result.h"
 #include "yb/util/status.h"
 #include "yb/util/strongly_typed_bool.h"
+#include "yb/util/ulimit.h"
 
 namespace yb {
 
@@ -270,6 +271,9 @@ class Env {
   // Returns true iff the named file exists.
   virtual bool FileExists(const std::string& fname) = 0;
 
+  // Returns true if the named directory exists and is a directory.
+  virtual bool DirExists(const std::string& dname) = 0;
+
   // Store in *result the names of the children of the specified directory.
   // The names are relative to "dir".
   // Original contents of *results are dropped.
@@ -454,11 +458,31 @@ class Env {
   // All directory entries in 'path' must exist on the filesystem.
   virtual CHECKED_STATUS Canonicalize(const std::string& path, std::string* result) = 0;
 
+  Result<std::string> Canonicalize(const std::string& path) {
+    string result;
+    RETURN_NOT_OK(Canonicalize(path, &result));
+    return result;
+  }
+
   // Get the total amount of RAM installed on this machine.
   virtual CHECKED_STATUS GetTotalRAMBytes(int64_t* ram) = 0;
 
   // Get free space available on the path's filesystem.
   virtual Result<uint64_t> GetFreeSpaceBytes(const std::string& path) = 0;
+
+  // Get ulimit
+  virtual Result<ResourceLimits> GetUlimit(int resource) = 0;
+
+  // Set ulimit
+  // Note that if running on macOS, the semantics of this API are a bit inconsistent across
+  // versions. Namely, setrlimit in some versions for some resources will return success even if
+  // the call did not change the resource limit to the desired value. This is specifically observed
+  // on at least RLIM_NPROC, where constraints around number of processes are a bit more restrictive
+  // than other POSIX systems.
+  // See: https://apple.stackexchange.com/questions/373063/why-is-macos-limited-to-1064-processes
+  virtual CHECKED_STATUS SetUlimit(int resource, ResourceLimit value) = 0;
+  virtual CHECKED_STATUS SetUlimit(
+      int resource, ResourceLimit value, const std::string& resource_name) = 0;
  private:
   // No copying allowed
   Env(const Env&);
@@ -710,6 +734,7 @@ class EnvWrapper : public Env {
     return target_->NewRWFile(o, f, r);
   }
   bool FileExists(const std::string& f) override { return target_->FileExists(f); }
+  bool DirExists(const std::string& d) override { return target_->DirExists(d); }
   CHECKED_STATUS GetChildren(
       const std::string& dir, ExcludeDots exclude_dots, std::vector<std::string>* r) override {
     return target_->GetChildren(dir, exclude_dots, r);
@@ -784,6 +809,16 @@ class EnvWrapper : public Env {
   Result<uint64_t> GetFreeSpaceBytes(const std::string& path) override {
     return target_->GetFreeSpaceBytes(path);
   }
+  Result<ResourceLimits> GetUlimit(int resource) override {
+    return target_->GetUlimit(resource);
+  }
+  CHECKED_STATUS SetUlimit(int resource, ResourceLimit value) override {
+    return target_->SetUlimit(resource, value);
+  };
+  CHECKED_STATUS SetUlimit(
+      int resource, ResourceLimit value, const std::string& resource_name) override {
+    return target_->SetUlimit(resource, value, resource_name);
+  };
  private:
   Env* target_;
 };

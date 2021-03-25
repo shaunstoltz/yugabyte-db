@@ -49,6 +49,7 @@
 
 #include "yb/server/metadata.h"
 #include "yb/server/rpc_server.h"
+#include "yb/server/server_base.h"
 #include "yb/server/webserver.h"
 
 #include "yb/tablet/maintenance_manager.h"
@@ -58,6 +59,7 @@
 #include "yb/tserver/tablet_server.h"
 #include "yb/tserver/ts_tablet_manager.h"
 
+#include "yb/util/flag_tags.h"
 #include "yb/util/net/sockaddr.h"
 #include "yb/util/net/tunnel.h"
 #include "yb/util/scope_exit.h"
@@ -67,7 +69,6 @@ using std::pair;
 
 using yb::consensus::Consensus;
 using yb::consensus::ConsensusOptions;
-using yb::consensus::OpId;
 using yb::consensus::RaftPeerPB;
 using yb::consensus::RaftConfigPB;
 using yb::log::Log;
@@ -77,6 +78,10 @@ using yb::tablet::TabletPeer;
 
 DECLARE_bool(rpc_server_allow_ephemeral_ports);
 DECLARE_double(leader_failure_max_missed_heartbeat_periods);
+DECLARE_int32(TEST_nodes_per_cloud);
+
+DEFINE_test_flag(bool, private_broadcast_address, false,
+                 "Use private address for broadcast address in tests.");
 
 namespace yb {
 namespace tserver {
@@ -93,12 +98,14 @@ MiniTabletServer::MiniTabletServer(const string& fs_root,
   FLAGS_rpc_server_allow_ephemeral_ports = true;
   opts_.rpc_opts.rpc_bind_addresses = server::TEST_RpcBindEndpoint(index_, rpc_port);
   // A.B.C.D.xip.io resolves to A.B.C.D so it is very useful for testing.
-  opts_.broadcast_addresses = {
-      HostPort(server::TEST_RpcAddress(index_, server::Private::kFalse), rpc_port) };
+  opts_.broadcast_addresses = { HostPort(
+      server::TEST_RpcAddress(index_, server::Private(FLAGS_TEST_private_broadcast_address)),
+      rpc_port) };
   opts_.webserver_opts.port = 0;
   opts_.webserver_opts.bind_interface = opts_.broadcast_addresses.front().host();
   if (!opts_.has_placement_cloud()) {
-    opts_.SetPlacement(Format("cloud$0", (index_ + 1) / 2), Format("rack$0", index_), "zone");
+    opts_.SetPlacement(Format("cloud$0", (index_ + 1) / FLAGS_TEST_nodes_per_cloud),
+                       Format("rack$0", index_), "zone");
   }
   opts_.fs_opts.wal_paths = { fs_root };
   opts_.fs_opts.data_paths = { fs_root };
@@ -120,15 +127,32 @@ Status MiniTabletServer::Start() {
   gscoped_ptr<TabletServer> server(new enterprise::TabletServer(opts_));
   RETURN_NOT_OK(server->Init());
 
-  server::TEST_SetupConnectivity(server->messenger(), index_);
-
   RETURN_NOT_OK(server->Start());
 
   server_.swap(server);
 
+  RETURN_NOT_OK(Reconnect());
+
+  started_ = true;
+  return Status::OK();
+}
+
+void MiniTabletServer::Isolate() {
+  server::TEST_Isolate(server_->messenger());
+  tunnel_->Shutdown();
+}
+
+Status MiniTabletServer::Reconnect() {
+  server::TEST_SetupConnectivity(server_->messenger(), index_);
+
+  if (FLAGS_TEST_private_broadcast_address) {
+    return Status::OK();
+  }
+
   tunnel_ = std::make_unique<Tunnel>(&server_->messenger()->io_service());
-  auto se = ScopeExit([this] {
-    if (!started_) {
+  auto started_tunnel = false;
+  auto se = ScopeExit([this, &started_tunnel] {
+    if (!started_tunnel) {
       tunnel_->Shutdown();
     }
   });
@@ -140,17 +164,8 @@ Status MiniTabletServer::Start() {
       local.front(), remote, [messenger = server_->messenger()](const IpAddress& address) {
     return !messenger->TEST_ShouldArtificiallyRejectIncomingCallsFrom(address);
   }));
-
-  started_ = true;
+  started_tunnel = true;
   return Status::OK();
-}
-
-void MiniTabletServer::SetIsolated(bool isolated) {
-  if (isolated) {
-    server::TEST_Isolate(server_->messenger());
-  } else {
-    server::TEST_SetupConnectivity(server_->messenger(), index_);
-  }
 }
 
 Status MiniTabletServer::WaitStarted() {
@@ -253,14 +268,16 @@ RaftConfigPB MiniTabletServer::CreateLocalConfig() const {
   return config;
 }
 
-Status MiniTabletServer::AddTestTablet(const std::string& table_id,
+Status MiniTabletServer::AddTestTablet(const std::string& ns_id,
+                                       const std::string& table_id,
                                        const std::string& tablet_id,
                                        const Schema& schema,
                                        TableType table_type) {
-  return AddTestTablet(table_id, tablet_id, schema, CreateLocalConfig(), table_type);
+  return AddTestTablet(ns_id, table_id, tablet_id, schema, CreateLocalConfig(), table_type);
 }
 
-Status MiniTabletServer::AddTestTablet(const std::string& table_id,
+Status MiniTabletServer::AddTestTablet(const std::string& ns_id,
+                                       const std::string& table_id,
                                        const std::string& tablet_id,
                                        const Schema& schema,
                                        const RaftConfigPB& config,
@@ -269,12 +286,16 @@ Status MiniTabletServer::AddTestTablet(const std::string& table_id,
   Schema schema_with_ids = SchemaBuilder(schema).Build();
   pair<PartitionSchema, Partition> partition = tablet::CreateDefaultPartition(schema_with_ids);
 
-  return server_->tablet_manager()->CreateNewTablet(table_id, tablet_id, partition.second, table_id,
-    table_type, schema_with_ids, partition.first, boost::none /* index_info */, config, nullptr);
+  auto table_info = std::make_shared<tablet::TableInfo>(
+      table_id, ns_id, table_id, table_type, schema_with_ids, IndexMap(),
+      boost::none /* index_info */, 0 /* schema_version */, partition.first);
+
+  return ResultToStatus(server_->tablet_manager()->CreateNewTablet(
+      table_info, tablet_id, partition.second, config));
 }
 
-void MiniTabletServer::FailHeartbeats() {
-  server_->set_fail_heartbeats_for_tests(true);
+void MiniTabletServer::FailHeartbeats(bool fail_heartbeats_for_tests) {
+  server_->set_fail_heartbeats_for_tests(fail_heartbeats_for_tests);
 }
 
 Endpoint MiniTabletServer::bound_rpc_addr() const {

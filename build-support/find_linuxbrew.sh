@@ -15,11 +15,13 @@
 #
 . "${BASH_SOURCE%/*}/../build-support/common-build-env.sh"
 
+if [[ -n ${BUILD_ROOT:-} ]]; then
+  handle_predefined_build_root_quietly=true
+  predefined_build_root=$BUILD_ROOT
+  handle_predefined_build_root
+fi
 detect_brew
 
 if using_linuxbrew; then
   echo "$YB_LINUXBREW_DIR"
-fi
-if using_custom_homebrew; then
-  echo "$YB_CUSTOM_HOMEBREW_DIR"
 fi

@@ -32,9 +32,11 @@
 #include <algorithm>
 #include <memory>
 #include <sstream>
+#include <string>
 #include <tuple>
 #include <vector>
 
+#include <gmock/internal/gmock-internal-utils.h>
 #include <gtest/gtest.h>
 
 #include "yb/common/partial_row.h"
@@ -52,17 +54,28 @@
 #include "yb/rpc/messenger.h"
 #include "yb/server/rpc_server.h"
 #include "yb/server/server_base.proxy.h"
+#include "yb/util/capabilities.h"
+#include "yb/util/countdown_latch.h"
 #include "yb/util/jsonreader.h"
+#include "yb/util/monotime.h"
+#include "yb/util/random_util.h"
 #include "yb/util/status.h"
 #include "yb/util/test_util.h"
+#include "yb/util/tsan_util.h"
 
 DECLARE_string(callhome_collection_level);
 DECLARE_string(callhome_tag);
 DECLARE_string(callhome_url);
+DECLARE_bool(callhome_enabled);
+DECLARE_int32(callhome_interval_secs);
 DECLARE_double(leader_failure_max_missed_heartbeat_periods);
-DECLARE_int32(simulate_slow_table_create_secs);
-DECLARE_bool(return_error_if_namespace_not_found);
-DECLARE_bool(simulate_crash_after_table_marked_deleting);
+DECLARE_int32(TEST_simulate_slow_table_create_secs);
+DECLARE_bool(TEST_return_error_if_namespace_not_found);
+DECLARE_bool(TEST_hang_on_namespace_transition);
+DECLARE_bool(TEST_simulate_crash_after_table_marked_deleting);
+DECLARE_int32(TEST_sys_catalog_write_rejection_percentage);
+DECLARE_bool(TEST_tablegroup_master_only);
+DECLARE_bool(TEST_simulate_port_conflict_error);
 
 namespace yb {
 namespace master {
@@ -113,7 +126,7 @@ TEST_F(MasterTest, TestCallHome) {
   ASSERT_EQ(addrs.size(), 1);
   auto addr = addrs[0];
 
-  auto handler = [&json, &latch] (const Webserver::WebRequest& req, std::stringstream* output) {
+  auto handler = [&json, &latch] (const Webserver::WebRequest& req, Webserver::WebResponse* resp) {
     ASSERT_EQ(req.request_method, "POST");
     ASSERT_EQ(json, req.post_data);
     latch.CountDown();
@@ -128,8 +141,9 @@ TEST_F(MasterTest, TestCallHome) {
   std::unordered_map<string, set<string>> collection_levels;
   collection_levels["low"] = low;
   collection_levels["medium"] = low;
-  collection_levels["medium"].insert({"metrics", "rpcs", "hostname", "current_user"});
+  collection_levels["medium"].insert({"hostname", "current_user"});
   collection_levels["high"] = collection_levels["medium"];
+  collection_levels["high"].insert({"metrics", "rpcs"});
 
   for (const auto& collection_level : collection_levels) {
     LOG(INFO) << "Collection level: " << collection_level.first;
@@ -173,6 +187,65 @@ TEST_F(MasterTest, TestCallHome) {
   }
 }
 
+// This tests whether the enabling/disabling of callhome is happening dynamically
+// during runtime.
+TEST_F(MasterTest, TestCallHomeFlag) {
+  CountDownLatch latch(1);
+  const char* tag_value = "callhome-test";
+  bool disabled = false;
+
+  // Set up the webserver.
+  auto webserver_dir = GetTestPath("webserver-docroot");
+  CHECK_OK(env_->CreateDir(webserver_dir));
+
+  WebserverOptions opts;
+  opts.port = 0;
+  opts.doc_root = webserver_dir;
+  Webserver webserver(opts, "WebserverTest");
+  ASSERT_OK(webserver.Start());
+
+  std::vector<Endpoint> addrs;
+  ASSERT_OK(webserver.GetBoundAddresses(&addrs));
+  ASSERT_EQ(addrs.size(), 1);
+  auto addr = addrs[0];
+
+  // By default callhome is enabled. This handler is expected to be called
+  // before disabling the flag. Once the flag is disabled, there shouldn't be any http posts.
+  auto handler = [&latch, &disabled] (const Webserver::WebRequest& req,
+                                        Webserver::WebResponse* resp) {
+    ASSERT_EQ(req.request_method, "POST");
+    // After callhome is disabled, assert if we get any more POST.
+    ASSERT_FALSE(disabled);
+    LOG(INFO) << "Received callhome data\n" << req.post_data;
+    latch.CountDown();
+  };
+
+  webserver.RegisterPathHandler("/callhome", "callhome", handler);
+  LOG(INFO) << "Started webserver to listen for callhome post requests.";
+
+  FLAGS_callhome_tag = tag_value;
+  FLAGS_callhome_url = strings::Substitute("http://$0/callhome", ToString(addr));
+  // Set the interval to 3 secs.
+  FLAGS_callhome_interval_secs = 3 * kTimeMultiplier;
+  // Start with the default value i.e. callhome enabled.
+  disabled = false;
+
+  CallHome call_home(mini_master_->master(), ServerType::MASTER);
+  call_home.ScheduleCallHome(1 * kTimeMultiplier);
+
+  // Wait for at least one non-empty response.
+  ASSERT_TRUE(latch.WaitFor(MonoDelta::FromSeconds(10 * kTimeMultiplier)));
+
+  // Disable the callhome flag now.
+  disabled = true;
+  ANNOTATE_UNPROTECTED_WRITE(FLAGS_callhome_enabled) = false;
+  LOG(INFO) << "Callhome disabled. No more traffic";
+
+  // Wait for 3 cycles for no callhome posts. The handler is expected to assert
+  // if it gets any new HTTP POST now.
+  SleepFor(MonoDelta::FromSeconds(3 * FLAGS_callhome_interval_secs * kTimeMultiplier));
+}
+
 TEST_F(MasterTest, TestRegisterAndHeartbeat) {
   const char *kTsUUID = "my-ts-uuid";
 
@@ -212,6 +285,7 @@ TEST_F(MasterTest, TestRegisterAndHeartbeat) {
 
     ASSERT_FALSE(resp.needs_reregister());
     ASSERT_TRUE(resp.needs_full_tablet_report());
+    ASSERT_FALSE(resp.has_tablet_report_limit()); // No limit unless capability registered.
   }
 
   descs.clear();
@@ -222,6 +296,11 @@ TEST_F(MasterTest, TestRegisterAndHeartbeat) {
 
   ASSERT_TRUE(mini_master_->master()->ts_manager()->LookupTSByUUID(kTsUUID, &ts_desc));
   ASSERT_EQ(ts_desc, descs[0]);
+
+  // Add capabilities in next registration.
+  auto cap = Capabilities();
+  *fake_reg.mutable_capabilities() =
+      google::protobuf::RepeatedField<CapabilityId>(cap.begin(), cap.end());
 
   // If the tablet server somehow lost the response to its registration RPC, it would
   // attempt to register again. In that case, we shouldn't reject it -- we should
@@ -235,9 +314,10 @@ TEST_F(MasterTest, TestRegisterAndHeartbeat) {
 
     ASSERT_FALSE(resp.needs_reregister());
     ASSERT_TRUE(resp.needs_full_tablet_report());
+    ASSERT_TRUE(resp.has_tablet_report_limit()); // Limit given, since TS capability registered.
   }
 
-  // Now send a tablet report
+  // Now begin sending full tablet report
   {
     TSHeartbeatRequestPB req;
     TSHeartbeatResponsePB resp;
@@ -245,6 +325,22 @@ TEST_F(MasterTest, TestRegisterAndHeartbeat) {
     TabletReportPB* tr = req.mutable_tablet_report();
     tr->set_is_incremental(false);
     tr->set_sequence_number(0);
+    tr->set_remaining_tablet_count(1);
+    ASSERT_OK(proxy_->TSHeartbeat(req, &resp, ResetAndGetController()));
+
+    ASSERT_FALSE(resp.needs_reregister());
+    ASSERT_FALSE(resp.needs_full_tablet_report());
+  }
+
+  // ...and finish the full tablet report.
+  {
+    TSHeartbeatRequestPB req;
+    TSHeartbeatResponsePB resp;
+    req.mutable_common()->CopyFrom(common);
+    TabletReportPB* tr = req.mutable_tablet_report();
+    tr->set_is_incremental(false);
+    tr->set_sequence_number(0);
+    tr->set_remaining_tablet_count(0);
     ASSERT_OK(proxy_->TSHeartbeat(req, &resp, ResetAndGetController()));
 
     ASSERT_FALSE(resp.needs_reregister());
@@ -271,7 +367,7 @@ TEST_F(MasterTest, TestRegisterAndHeartbeat) {
 }
 
 TEST_F(MasterTest, TestListTablesWithoutMasterCrash) {
-  FLAGS_simulate_slow_table_create_secs = 10;
+  FLAGS_TEST_simulate_slow_table_create_secs = 10;
 
   const char *kNamespaceName = "testnamespace";
   CreateNamespaceResponsePB resp;
@@ -283,7 +379,7 @@ TEST_F(MasterTest, TestListTablesWithoutMasterCrash) {
     shared_ptr<RpcController> controller;
     // Set an RPC timeout for the controllers.
     controller = make_shared<RpcController>();
-    controller->set_timeout(MonoDelta::FromSeconds(FLAGS_simulate_slow_table_create_secs * 2));
+    controller->set_timeout(MonoDelta::FromSeconds(FLAGS_TEST_simulate_slow_table_create_secs * 2));
 
     CreateTableRequestPB req;
     CreateTableResponsePB resp;
@@ -303,7 +399,7 @@ TEST_F(MasterTest, TestListTablesWithoutMasterCrash) {
   // Delete the namespace (by NAME).
   {
     // Give the CreateTable request some time to start and find the namespace.
-    SleepFor(MonoDelta::FromSeconds(FLAGS_simulate_slow_table_create_secs / 2));
+    SleepFor(MonoDelta::FromSeconds(FLAGS_TEST_simulate_slow_table_create_secs / 2));
     DeleteNamespaceRequestPB req;
     DeleteNamespaceResponsePB resp;
     req.mutable_namespace_()->set_name(kNamespaceName);
@@ -315,7 +411,7 @@ TEST_F(MasterTest, TestListTablesWithoutMasterCrash) {
   t.join();
 
   {
-    FLAGS_return_error_if_namespace_not_found = true;
+    FLAGS_TEST_return_error_if_namespace_not_found = true;
     ListTablesRequestPB req;
     ListTablesResponsePB resp;
     ASSERT_OK(proxy_->ListTables(req, &resp, ResetAndGetController()));
@@ -325,7 +421,7 @@ TEST_F(MasterTest, TestListTablesWithoutMasterCrash) {
     ASSERT_TRUE(msg.find("Keyspace identifier not found") != string::npos);
 
     // After turning off this flag, ListTables should skip the table with the error.
-    FLAGS_return_error_if_namespace_not_found = false;
+    FLAGS_TEST_return_error_if_namespace_not_found = false;
     ASSERT_OK(proxy_->ListTables(req, &resp, ResetAndGetController()));
     LOG(INFO) << "Finished second ListTables request";
     ASSERT_FALSE(resp.has_error());
@@ -458,6 +554,71 @@ TEST_F(MasterTest, TestCatalog) {
   }
 }
 
+TEST_F(MasterTest, TestTablegroups) {
+  // Tablegroup ID must be 32 characters in length
+  const char *kTablegroupId = "test_tablegroup00000000000000000";
+  const char *kTableName = "test_table";
+  const Schema kTableSchema({ ColumnSchema("key", INT32) }, 1);
+  const NamespaceName ns_name = "test_tablegroup_ns";
+
+  // Create a new namespace.
+  NamespaceId ns_id;
+  ListNamespacesResponsePB namespaces;
+  {
+    CreateNamespaceResponsePB resp;
+    ASSERT_OK(CreateNamespace(ns_name, YQL_DATABASE_PGSQL, &resp));
+    ns_id = resp.id();
+  }
+  {
+    ASSERT_NO_FATALS(DoListAllNamespaces(&namespaces));
+    ASSERT_EQ(2 + kNumSystemNamespaces, namespaces.namespaces_size());
+    CheckNamespaces(
+        {
+            EXPECTED_DEFAULT_AND_SYSTEM_NAMESPACES,
+            std::make_tuple(ns_name, ns_id)
+        }, namespaces);
+  }
+
+  SetAtomicFlag(true, &FLAGS_TEST_tablegroup_master_only);
+  // Create tablegroup and ensure it exists in catalog manager maps.
+  ASSERT_OK(CreateTablegroup(kTablegroupId, ns_id, ns_name));
+  SetAtomicFlag(false, &FLAGS_TEST_tablegroup_master_only);
+
+  ListTablegroupsRequestPB req;
+  ListTablegroupsResponsePB resp;
+  req.set_namespace_id(ns_id);
+  ASSERT_NO_FATALS(DoListTablegroups(req, &resp));
+
+  bool tablegroup_found = false;
+  for (auto& tg : *resp.mutable_tablegroups()) {
+    if (tg.id().compare(kTablegroupId) == 0) {
+      tablegroup_found = true;
+    }
+  }
+  ASSERT_TRUE(tablegroup_found);
+
+  // Restart the master, verify the tablegroup still shows up
+  ASSERT_OK(mini_master_->Restart());
+  ASSERT_OK(mini_master_->master()->WaitUntilCatalogManagerIsLeaderAndReadyForTests());
+
+  ListTablegroupsResponsePB new_resp;
+  ASSERT_NO_FATALS(DoListTablegroups(req, &new_resp));
+
+  tablegroup_found = false;
+  for (auto& tg : *new_resp.mutable_tablegroups()) {
+    if (tg.id().compare(kTablegroupId) == 0) {
+      tablegroup_found = true;
+    }
+  }
+  ASSERT_TRUE(tablegroup_found);
+
+  // Now ensure that a table can be created in the tablegroup.
+  ASSERT_OK(CreateTablegroupTable(ns_id, kTableName, kTablegroupId, kTableSchema));
+
+  // Delete the tablegroup
+  ASSERT_OK(DeleteTablegroup(kTablegroupId, ns_id));
+}
+
 // Regression test for KUDU-253/KUDU-592: crash if the schema passed to CreateTable
 // is invalid.
 TEST_F(MasterTest, TestCreateTableInvalidSchema) {
@@ -481,17 +642,20 @@ TEST_F(MasterTest, TestCreateTableInvalidSchema) {
 }
 
 TEST_F(MasterTest, TestTabletsDeletedWhenTableInDeletingState) {
-  FLAGS_simulate_crash_after_table_marked_deleting = true;
+  FLAGS_TEST_simulate_crash_after_table_marked_deleting = true;
   const char *kTableName = "testtb";
   const Schema kTableSchema({ ColumnSchema("key", INT32)},
                             1);
 
   ASSERT_OK(CreateTable(kTableName, kTableSchema));
   vector<TabletId> tablet_ids;
-  for (auto elem : *mini_master_->master()->catalog_manager()->tablet_map_) {
-    auto tablet = elem.second;
-    if (tablet->table()->name() == kTableName) {
-      tablet_ids.push_back(elem.first);
+  {
+    SharedLock<CatalogManager::LockType> l(mini_master_->master()->catalog_manager()->lock_);
+    for (auto elem : *mini_master_->master()->catalog_manager()->tablet_map_) {
+      auto tablet = elem.second;
+      if (tablet->table()->name() == kTableName) {
+        tablet_ids.push_back(elem.first);
+      }
     }
   }
 
@@ -504,11 +668,14 @@ TEST_F(MasterTest, TestTabletsDeletedWhenTableInDeletingState) {
   ASSERT_OK(mini_master_->master()->WaitUntilCatalogManagerIsLeaderAndReadyForTests());
 
   // Verify that the test table's tablets are in the DELETED state.
-  for (const auto& tablet_id : tablet_ids) {
-    auto iter = mini_master_->master()->catalog_manager()->tablet_map_->find(tablet_id);
-    ASSERT_NE(iter, mini_master_->master()->catalog_manager()->tablet_map_->end());
-    auto l = iter->second->LockForRead();
-    ASSERT_EQ(l->data().pb.state(), SysTabletsEntryPB::DELETED);
+  {
+    SharedLock<CatalogManager::LockType> l(mini_master_->master()->catalog_manager()->lock_);
+    for (const auto& tablet_id : tablet_ids) {
+      auto iter = mini_master_->master()->catalog_manager()->tablet_map_->find(tablet_id);
+      ASSERT_NE(iter, mini_master_->master()->catalog_manager()->tablet_map_->end());
+      auto l = iter->second->LockForRead();
+      ASSERT_EQ(l->data().pb.state(), SysTabletsEntryPB::DELETED);
+    }
   }
 }
 
@@ -868,6 +1035,12 @@ TEST_F(MasterTest, TestDeletingNonEmptyNamespace) {
     ASSERT_OK(proxy_->DeleteNamespace(req, &resp, ResetAndGetController()));
     SCOPED_TRACE(resp.DebugString());
     ASSERT_FALSE(resp.has_error());
+
+    // Must wait for IsDeleteNamespaceDone with PGSQL Namespaces.
+    IsDeleteNamespaceDoneRequestPB del_req;
+    del_req.mutable_namespace_()->set_id(other_ns_pgsql_id);
+    del_req.mutable_namespace_()->set_database_type(YQLDatabase::YQL_DATABASE_PGSQL);
+    ASSERT_OK(DeleteNamespaceWait(del_req));
   }
   {
     ASSERT_NO_FATALS(DoListAllNamespaces(&namespaces));
@@ -1162,6 +1335,290 @@ TEST_F(MasterTest, TestTablesWithNamespace) {
   }
 }
 
+TEST_F(MasterTest, TestNamespaceCreateStates) {
+  NamespaceName test_name = "test_pgsql";
+
+  // Don't allow the BG thread to process namespaces.
+  SetAtomicFlag(true, &FLAGS_TEST_hang_on_namespace_transition);
+
+  // Create a new PGSQL namespace.
+  CreateNamespaceResponsePB resp;
+  NamespaceId nsid;
+  ASSERT_OK(CreateNamespaceAsync(test_name, YQLDatabase::YQL_DATABASE_PGSQL, &resp));
+  nsid = resp.id();
+
+  // ListNamespaces should not yet show the Namespace, because it's in the PREPARING state.
+  ListNamespacesResponsePB namespaces;
+  ASSERT_NO_FATALS(DoListAllNamespaces(&namespaces));
+  ASSERT_FALSE(FindNamespace(std::make_tuple(test_name, nsid), namespaces));
+
+  // Test that Basic Access is not allowed to a Namespace while INITIALIZING.
+  // 1. CANNOT Create a Table on the namespace.
+  const Schema kTableSchema({ ColumnSchema("key", INT32) }, 1);
+  ASSERT_NOK(CreatePgsqlTable(nsid, "test_table", kTableSchema));
+  // 2. CANNOT Alter the namespace.
+  {
+    AlterNamespaceResponsePB alter_resp;
+    ASSERT_NOK(AlterNamespace(test_name, nsid, YQLDatabase::YQL_DATABASE_PGSQL,
+                              "new_" + test_name, &alter_resp));
+    ASSERT_TRUE(alter_resp.has_error());
+    ASSERT_EQ(alter_resp.error().code(), MasterErrorPB::IN_TRANSITION_CAN_RETRY);
+  }
+  // 3. CANNOT Delete the namespace.
+  {
+    DeleteNamespaceRequestPB req;
+    DeleteNamespaceResponsePB resp;
+    req.mutable_namespace_()->set_name(test_name);
+    req.mutable_namespace_()->set_database_type(YQLDatabase::YQL_DATABASE_PGSQL);
+    ASSERT_OK(proxy_->DeleteNamespace(req, &resp, ResetAndGetController()));
+    ASSERT_TRUE(resp.has_error());
+    ASSERT_EQ(resp.error().code(), MasterErrorPB::IN_TRANSITION_CAN_RETRY);
+  }
+
+  // Finish Namespace create.
+  SetAtomicFlag(false, &FLAGS_TEST_hang_on_namespace_transition);
+  CreateNamespaceWait(nsid, YQLDatabase::YQL_DATABASE_PGSQL);
+
+  // Verify that Basic Access to a Namespace is now available.
+  // 1. Create a Table within the Schema.
+  ASSERT_OK(CreatePgsqlTable(nsid, "test_table", kTableSchema));
+  // 2. Alter the namespace.
+  {
+    AlterNamespaceResponsePB alter_resp;
+    ASSERT_OK(AlterNamespace(test_name, nsid, YQLDatabase::YQL_DATABASE_PGSQL,
+                             "new_" + test_name, &alter_resp) );
+    ASSERT_FALSE(alter_resp.has_error());
+  }
+  // 3. Delete the namespace.
+  {
+    SetAtomicFlag(true, &FLAGS_TEST_hang_on_namespace_transition);
+
+    DeleteNamespaceRequestPB del_req;
+    DeleteNamespaceResponsePB del_resp;
+    del_req.mutable_namespace_()->set_name("new_" + test_name);
+    del_req.mutable_namespace_()->set_database_type(YQLDatabase::YQL_DATABASE_PGSQL);
+    ASSERT_OK(proxy_->DeleteNamespace(del_req, &del_resp, ResetAndGetController()));
+    ASSERT_FALSE(del_resp.has_error());
+
+    // ListNamespaces should not show the Namespace, because it's in the DELETING state.
+    ListNamespacesResponsePB namespaces;
+    ASSERT_NO_FATALS(DoListAllNamespaces(&namespaces));
+    ASSERT_FALSE(FindNamespace(std::make_tuple("new_" + test_name, nsid), namespaces));
+
+    // Resume finishing both [1] the delete and [2] the create.
+    SetAtomicFlag(false, &FLAGS_TEST_hang_on_namespace_transition);
+
+    // Verify the old namespace finishes deletion.
+    IsDeleteNamespaceDoneRequestPB is_del_req;
+    is_del_req.mutable_namespace_()->set_id(nsid);
+    is_del_req.mutable_namespace_()->set_database_type(YQLDatabase::YQL_DATABASE_PGSQL);
+    ASSERT_OK(DeleteNamespaceWait(is_del_req));
+
+    // We should be able to create a namespace with the same NAME at this time.
+    ASSERT_OK(CreateNamespaceAsync("new_" + test_name, YQLDatabase::YQL_DATABASE_PGSQL, &resp));
+    CreateNamespaceWait(resp.id(), YQLDatabase::YQL_DATABASE_PGSQL);
+  }
+}
+
+
+TEST_F(MasterTest, TestNamespaceCreateFailure) {
+  NamespaceName test_name = "test_pgsql";
+
+  // Don't allow the BG thread to process namespaces.
+  SetAtomicFlag(true, &FLAGS_TEST_hang_on_namespace_transition);
+
+  // Create a new PGSQL namespace.
+  CreateNamespaceResponsePB resp;
+  NamespaceId nsid;
+  ASSERT_OK(CreateNamespaceAsync(test_name, YQLDatabase::YQL_DATABASE_PGSQL, &resp));
+  nsid = resp.id();
+
+  {
+    // Public ListNamespaces should not show the Namespace, because it's in the PREPARING state.
+    ListNamespacesResponsePB namespace_pb;
+    ASSERT_NO_FATALS(DoListAllNamespaces(&namespace_pb));
+    ASSERT_FALSE(FindNamespace(std::make_tuple(test_name, nsid), namespace_pb));
+
+    // Internal search of CatalogManager should reveal it's state (debug UI uses this function).
+    std::vector<scoped_refptr<NamespaceInfo>> namespace_internal;
+    mini_master_->master()->catalog_manager()->GetAllNamespaces(&namespace_internal, false);
+    auto pos = std::find_if(namespace_internal.begin(), namespace_internal.end(),
+                 [&nsid](const scoped_refptr<NamespaceInfo>& ns) {
+                   return ns && ns->id() == nsid;
+                 });
+    ASSERT_NE(pos, namespace_internal.end());
+    ASSERT_EQ((*pos)->state(), SysNamespaceEntryPB::PREPARING);
+  }
+
+  // Restart the master (Shutdown kills Namespace BG Thread).
+  ASSERT_OK(mini_master_->Restart());
+  ASSERT_OK(mini_master_->master()->WaitUntilCatalogManagerIsLeaderAndReadyForTests());
+
+  {
+    // ListNamespaces should not show the Namespace on restart because it didn't finish.
+    ListNamespacesResponsePB namespaces;
+    ASSERT_NO_FATALS(DoListAllNamespaces(&namespaces));
+    ASSERT_FALSE(FindNamespace(std::make_tuple(test_name, nsid), namespaces));
+
+    // Internal search of CatalogManager should reveal it's DELETING to cleanup any partial apply.
+    std::vector<scoped_refptr<NamespaceInfo>> namespace_internal;
+    mini_master_->master()->catalog_manager()->GetAllNamespaces(&namespace_internal, false);
+    auto pos = std::find_if(namespace_internal.begin(), namespace_internal.end(),
+        [&nsid](const scoped_refptr<NamespaceInfo>& ns) {
+          return ns && ns->id() == nsid;
+        });
+    ASSERT_NE(pos, namespace_internal.end());
+    ASSERT_EQ((*pos)->state(), SysNamespaceEntryPB::DELETING);
+  }
+
+  // Resume BG thread work and verify that the Namespace is eventually DELETED internally.
+  SetAtomicFlag(false, &FLAGS_TEST_hang_on_namespace_transition);
+
+  ASSERT_OK(LoggedWaitFor([&]() -> Result<bool> {
+    std::vector<scoped_refptr<NamespaceInfo>> namespace_internal;
+    mini_master_->master()->catalog_manager()->GetAllNamespaces(&namespace_internal, false);
+    auto pos = std::find_if(namespace_internal.begin(), namespace_internal.end(),
+        [&nsid](const scoped_refptr<NamespaceInfo>& ns) {
+          return ns && ns->id() == nsid;
+        });
+    return pos != namespace_internal.end() && (*pos)->state() == SysNamespaceEntryPB::DELETED;
+  }, MonoDelta::FromSeconds(10), "Verify Namespace was DELETED"));
+
+  // Restart the master #2, this round should completely remove the Namespace from memory.
+  ASSERT_OK(mini_master_->Restart());
+  ASSERT_OK(mini_master_->master()->WaitUntilCatalogManagerIsLeaderAndReadyForTests());
+
+  ASSERT_OK(LoggedWaitFor([&]() -> Result<bool> {
+    std::vector<scoped_refptr<NamespaceInfo>> namespace_internal;
+    mini_master_->master()->catalog_manager()->GetAllNamespaces(&namespace_internal, false);
+    auto pos = std::find_if(namespace_internal.begin(), namespace_internal.end(),
+        [&nsid](const scoped_refptr<NamespaceInfo>& ns) {
+          return ns && ns->id() == nsid;
+        });
+    return pos == namespace_internal.end();
+  }, MonoDelta::FromSeconds(10), "Verify Namespace was completely removed"));
+}
+
+class LoopedMasterTest : public MasterTest, public testing::WithParamInterface<int> {};
+INSTANTIATE_TEST_CASE_P(Loops, LoopedMasterTest, ::testing::Values(10));
+
+TEST_P(LoopedMasterTest, TestNamespaceCreateSysCatalogFailure) {
+  NamespaceName test_name = "test_pgsql"; // Reuse name to find errors with delete cleanup.
+  CreateNamespaceResponsePB resp;
+  DeleteNamespaceRequestPB del_req;
+  del_req.mutable_namespace_()->set_name(test_name);
+  del_req.mutable_namespace_()->set_database_type(YQLDatabase::YQL_DATABASE_PGSQL);
+  IsDeleteNamespaceDoneRequestPB is_del_req;
+  is_del_req.mutable_namespace_()->set_name(test_name);
+  is_del_req.mutable_namespace_()->set_database_type(YQLDatabase::YQL_DATABASE_PGSQL);
+
+  int failures = 0, created = 0, iter = 0;
+  int loops = GetParam();
+  LOG(INFO) << "Loops = " << loops;
+
+  // Loop this to cover a spread of random failure situations.
+  while (failures < loops) {
+    // Inject Frequent failures into sys catalog commit.
+    // The below code should eventually succeed but require a lot of restarts.
+    FLAGS_TEST_sys_catalog_write_rejection_percentage = 50;
+
+    // CreateNamespace : Inject IO Errors.
+    LOG(INFO) << "Iteration " << ++iter;
+    Status s = CreateNamespace(test_name, YQLDatabase::YQL_DATABASE_PGSQL, &resp);
+    if (!s.ok()) {
+      WARN_NOT_OK(s, "CreateNamespace with injected failures");
+      ++failures;
+    }
+
+    // Turn off random failures.
+    FLAGS_TEST_sys_catalog_write_rejection_percentage = 0;
+
+    // Internal search of CatalogManager should reveal whether it was partially created.
+    std::vector<scoped_refptr<NamespaceInfo>> namespace_internal;
+    mini_master_->master()->catalog_manager()->GetAllNamespaces(&namespace_internal, false);
+    auto was_internally_created = std::any_of(namespace_internal.begin(), namespace_internal.end(),
+        [&test_name](const scoped_refptr<NamespaceInfo>& ns) {
+          if (ns && ns->name() == test_name && ns->state() != SysNamespaceEntryPB::DELETED) {
+            LOG(INFO) << "Namespace " << ns->name() << " = " << ns->state();
+            return true;
+          }
+          return false;
+        });
+
+    if (was_internally_created) {
+      ++created;
+      // Ensure we can delete the failed namespace.
+      DeleteNamespaceResponsePB del_resp;
+      ASSERT_OK(proxy_->DeleteNamespace(del_req, &del_resp, ResetAndGetController()));
+      if (del_resp.has_error()) {
+        LOG(INFO) << del_resp.error().DebugString();
+      }
+      ASSERT_FALSE(del_resp.has_error());
+      ASSERT_OK(DeleteNamespaceWait(is_del_req));
+    }
+  }
+  ASSERT_EQ(failures, loops);
+  LOG(INFO) << "created = " << created;
+}
+
+TEST_P(LoopedMasterTest, TestNamespaceDeleteSysCatalogFailure) {
+  NamespaceName test_name = "test_pgsql";
+  CreateNamespaceResponsePB resp;
+  DeleteNamespaceRequestPB del_req;
+  DeleteNamespaceResponsePB del_resp;
+  del_req.mutable_namespace_()->set_name(test_name);
+  del_req.mutable_namespace_()->set_database_type(YQLDatabase::YQL_DATABASE_PGSQL);
+  IsDeleteNamespaceDoneRequestPB is_del_req;
+  is_del_req.mutable_namespace_()->set_name(test_name);
+  is_del_req.mutable_namespace_()->set_database_type(YQLDatabase::YQL_DATABASE_PGSQL);
+  int failures = 0, iter = 0;
+  int loops = GetParam();
+  LOG(INFO) << "Loops = " << loops;
+
+// Loop this to cover a spread of random failure situations.
+  while (failures < loops) {
+    // CreateNamespace to setup test
+    CreateNamespaceResponsePB resp;
+    NamespaceId nsid;
+    ASSERT_OK(CreateNamespaceAsync(test_name, YQLDatabase::YQL_DATABASE_PGSQL, &resp));
+    nsid = resp.id();
+
+    // The below code should eventually succeed but require a lot of restarts.
+    FLAGS_TEST_sys_catalog_write_rejection_percentage = 50;
+
+    // DeleteNamespace : Inject IO Errors.
+    LOG(INFO) << "Iteration " << ++iter;
+    bool delete_failed = false;
+
+    ASSERT_OK(proxy_->DeleteNamespace(del_req, &del_resp, ResetAndGetController()));
+
+    delete_failed = del_resp.has_error();
+    if (del_resp.has_error()) {
+      LOG(INFO) << "Expected failure: " << del_resp.error().DebugString();
+    }
+
+    if (!del_resp.has_error()) {
+      Status s = DeleteNamespaceWait(is_del_req);
+      WARN_NOT_OK(s, "Expected failure");
+      delete_failed = !s.ok();
+    }
+
+    // Turn off random failures.
+    FLAGS_TEST_sys_catalog_write_rejection_percentage = 0;
+
+    if (delete_failed) {
+      ++failures;
+      LOG(INFO) << "Next Delete should succeed";
+
+      // If the namespace delete fails, Ensure that we can restart the delete and it succeeds.
+      ASSERT_OK(proxy_->DeleteNamespace(del_req, &del_resp, ResetAndGetController()));
+      ASSERT_FALSE(del_resp.has_error());
+      ASSERT_OK(DeleteNamespaceWait(is_del_req));
+    }
+  }
+  ASSERT_EQ(failures, loops);
+}
+
 TEST_F(MasterTest, TestFullTableName) {
   const TableName kTableName = "testtb";
   const Schema kTableSchema({ ColumnSchema("key", INT32) }, 1);
@@ -1384,7 +1841,6 @@ TEST_F(MasterTest, TestGetTableSchema) {
     ASSERT_EQ(1, resp.schema().columns(0).sorting_type());
     // PartitionSchemaPB partition_schema.
     ASSERT_TRUE(resp.has_partition_schema());
-    ASSERT_TRUE(resp.partition_schema().has_range_schema());
     ASSERT_EQ(resp.partition_schema().hash_schema(), PartitionSchemaPB::MULTI_COLUMN_HASH_SCHEMA);
     // TableIdentifierPB identifier.
     ASSERT_TRUE(resp.has_identifier());
@@ -1436,6 +1892,18 @@ TEST_F(MasterTest, TestFailedMasterRestart) {
                                     AllocateFreePort(), AllocateFreePort(), 0));
   ASSERT_NOK(mini_master_->Start(true));
   // Restart master should succeed.
+  ASSERT_OK(mini_master_->Start());
+}
+
+TEST_F(MasterTest, TestNetworkErrorOnFirstRun) {
+  TearDown();
+  mini_master_.reset(new MiniMaster(Env::Default(), GetTestPath("Master-test"),
+                                    AllocateFreePort(), AllocateFreePort(), 0));
+  FLAGS_TEST_simulate_port_conflict_error = true;
+  ASSERT_NOK(mini_master_->Start());
+  // Instance file should be properly initialized, but consensus metadata is not initialized.
+  FLAGS_TEST_simulate_port_conflict_error = false;
+  // Restarting master should succeed.
   ASSERT_OK(mini_master_->Start());
 }
 

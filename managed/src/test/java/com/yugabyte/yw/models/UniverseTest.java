@@ -2,26 +2,39 @@
 package com.yugabyte.yw.models;
 
 import com.fasterxml.jackson.databind.JsonNode;
+import com.fasterxml.jackson.databind.node.ArrayNode;
+import com.fasterxml.jackson.databind.node.ObjectNode;
 import com.google.common.collect.ImmutableMap;
+import com.google.common.collect.ImmutableSet;
 import com.google.common.collect.Sets;
 import com.yugabyte.yw.cloud.PublicCloudConstants;
 import com.yugabyte.yw.cloud.UniverseResourceDetails;
 import com.yugabyte.yw.common.ApiUtils;
 import com.yugabyte.yw.common.FakeDBApplication;
 import com.yugabyte.yw.common.ModelFactory;
+import com.yugabyte.yw.common.NodeActionType;
+import com.yugabyte.yw.common.Util;
 import com.yugabyte.yw.commissioner.Common;
 import com.yugabyte.yw.commissioner.Common.CloudType;
 import com.yugabyte.yw.models.helpers.CloudSpecificInfo;
 import com.yugabyte.yw.models.helpers.DeviceInfo;
 import com.yugabyte.yw.models.helpers.NodeDetails;
+import com.yugabyte.yw.models.helpers.NodeDetails.NodeState;
+
+import junitparams.JUnitParamsRunner;
+import junitparams.Parameters;
+
 import com.yugabyte.yw.forms.UniverseDefinitionTaskParams;
 import com.yugabyte.yw.forms.UniverseDefinitionTaskParams.Cluster;
 import com.yugabyte.yw.forms.UniverseDefinitionTaskParams.ClusterType;
 import com.yugabyte.yw.forms.UniverseDefinitionTaskParams.UserIntent;
 import com.google.common.util.concurrent.ThreadFactoryBuilder;
+
+import org.apache.commons.lang3.StringUtils;
 import org.junit.Before;
-import org.junit.Ignore;
 import org.junit.Test;
+import org.junit.runner.RunWith;
+
 import play.libs.Json;
 
 import java.util.*;
@@ -35,6 +48,7 @@ import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.spy;
 import static org.mockito.Mockito.when;
 
+@RunWith(JUnitParamsRunner.class)
 public class UniverseTest extends FakeDBApplication {
   private Provider defaultProvider;
   private Customer defaultCustomer;
@@ -396,16 +410,7 @@ public class UniverseTest extends FakeDBApplication {
 
   @Test
   public void testToJSONWithEmptyRegionList() {
-    Universe u = createUniverse(defaultCustomer.getCustomerId());
-    u = Universe.saveDetails(u.universeUUID, ApiUtils.mockUniverseUpdater());
-
-    UserIntent userIntent = new UserIntent();
-    userIntent.replicationFactor = 3;
-    userIntent.regionList = new ArrayList<>();
-    userIntent.provider = Provider.get(defaultCustomer.uuid, Common.CloudType.aws).uuid.toString();
-
-    u = Universe.saveDetails(u.universeUUID, ApiUtils.mockUniverseUpdater(userIntent));
-
+    Universe u = createUniverseWithNodes(3 /* rf */, 3 /* numNodes */, true /* setMasters */);
     JsonNode universeJson = u.toJson();
     assertThat(universeJson.get("universeUUID").asText(), allOf(notNullValue(), equalTo(u.universeUUID.toString())));
     JsonNode clusterJson = universeJson.get("universeDetails").get("clusters").get(0);
@@ -541,5 +546,172 @@ public class UniverseTest extends FakeDBApplication {
     userIntent.deviceInfo.diskIops = 1000;
     userIntent.deviceInfo.volumeSize = 100;
     return userIntent;
+  }
+
+  @Test
+  public void testUpdateNodesDynamicActions_UnderReplicatedMaster_WithoutReadOnlyCluster() {
+    // All nodes are created with t-server only. So they are all
+    // areMastersUnderReplicated.
+    Universe u = createUniverseWithNodes(3 /* rf */, 3 /* numNodes */, false /* setMasters */);
+
+    ObjectNode json = (ObjectNode) Json.toJson(u.getUniverseDetails());
+    u.addNodesActions(json, u.getNodes());
+
+    JsonNode nodeDetailsSet = json.get("nodeDetailsSet");
+    assertNotNull(nodeDetailsSet);
+    assertTrue(nodeDetailsSet.isArray());
+    for (int i = 0; i < nodeDetailsSet.size(); i++) {
+      assertTrue(jsonArrayHasItem(nodeDetailsSet.get(i).get("allowedActions"),
+          NodeActionType.START_MASTER.name()));
+    }
+  }
+
+  @Test
+  // @formatter:off
+  @Parameters({ "host-n4,      true,  true",  // underReplicated, node from primary cluster
+                "yb-tserver-0, true,  false", // underReplicated, node from read only cluster
+                "host-n4,      false, false", // not underReplicated, node from primary cluster
+                "yb-tserver-0, false, false"  // not underReplicated, node from read only cluster
+              })
+  // @formatter:on
+  public void testUpdateNodesDynamicActions_WithReadOnlyCluster(String nodeToTest,
+      boolean isMasterUnderReplicated, boolean expectedResult) {
+    Universe u = createUniverse(defaultCustomer.getCustomerId());
+    UserIntent userIntent = new UserIntent();
+    userIntent.replicationFactor = 3;
+    userIntent.regionList = new ArrayList<>();
+    userIntent.provider = Provider.get(defaultCustomer.uuid, Common.CloudType.aws).uuid.toString();
+    userIntent.numNodes = 3;
+    u = Universe.saveDetails(u.universeUUID,
+        ApiUtils.mockUniverseUpdaterWithInactiveAndReadReplicaNodes(true, 3));
+
+    if (isMasterUnderReplicated) {
+      // Stopping master.
+      updateNode(u, "host-n1", NodeState.Stopped, false);
+      // One t-server is alive.
+      updateNode(u, "host-n4", NodeState.Live, false);
+      assertTrue(Util.areMastersUnderReplicated(u.getNode("host-n4"), u));
+    }
+
+    ObjectNode json = (ObjectNode) Json.toJson(u.getUniverseDetails());
+    u.addNodesActions(json, u.getUniverseDetails().nodeDetailsSet);
+
+    JsonNode nodeDetailsSet = json.get("nodeDetailsSet");
+    assertNotNull(nodeDetailsSet);
+    assertTrue(nodeDetailsSet.isArray());
+    assertEquals(expectedResult,
+        nodeHasAction(nodeDetailsSet, nodeToTest, NodeActionType.START_MASTER.name()));
+    assertEquals(expectedResult, u.isNodeActionAllowed(nodeToTest, NodeActionType.START_MASTER));
+  }
+
+  // Updates the node state
+  private void updateNode(Universe u, String nodeName, NodeState newState, boolean newIsMaster) {
+    Universe.UniverseUpdater updater = new Universe.UniverseUpdater() {
+      @Override
+      public void run(Universe universe) {
+        for (NodeDetails node : u.getUniverseDetails().nodeDetailsSet) {
+          if (StringUtils.equals(node.nodeName, nodeName)) {
+            node.state = newState;
+            node.isMaster = newIsMaster;
+            break;
+          }
+        }
+      }
+    };
+    Universe.saveDetails(u.universeUUID, updater);
+  }
+
+  private static boolean nodeHasAction(JsonNode nodeDetailsSet, String nodeName,
+      String actionName) {
+    boolean nodeFound = false;
+    boolean actionFound = false;
+    for (int i = 0; i < nodeDetailsSet.size(); i++) {
+      JsonNode jsonNode = nodeDetailsSet.get(i);
+      assertNotNull(jsonNode.get("nodeName"));
+      if (StringUtils.equals(jsonNode.get("nodeName").asText(), nodeName)) {
+        nodeFound = true;
+        actionFound = jsonArrayHasItem(jsonNode.get("allowedActions"), actionName);
+      }
+    }
+    assertTrue(nodeFound);
+    return actionFound;
+  }
+
+  private static boolean jsonArrayHasItem(JsonNode arr, String value) {
+    assertNotNull(arr);
+    assertTrue(arr.isArray());
+    for (JsonNode item : (ArrayNode) arr) {
+      if (StringUtils.equals(item.asText(), value)) {
+        return true;
+      }
+    }
+    return false;
+  }
+
+  @Test
+  public void testGetNodeActions() {
+    Universe u = createUniverseWithNodes(3 /* rf */, 3 /* numNodes */, true /* setMasters */);
+    NodeDetails nd = u.getNodes().iterator().next();
+
+    for (NodeDetails.NodeState nodeState : NodeDetails.NodeState.values()) {
+      nd.state = nodeState;
+      Set<NodeActionType> allowedActions = u.getNodeActions(nd, u.getNodes());
+
+      if (nodeState == NodeDetails.NodeState.ToBeAdded) {
+        assertEquals(ImmutableSet.of(NodeActionType.DELETE), allowedActions);
+      } else if (nodeState == NodeDetails.NodeState.Adding) {
+        assertEquals(ImmutableSet.of(NodeActionType.DELETE), allowedActions);
+      } else if (nodeState == NodeDetails.NodeState.ToJoinCluster) {
+        assertEquals(ImmutableSet.of(NodeActionType.REMOVE), allowedActions);
+      } else if (nodeState == NodeDetails.NodeState.SoftwareInstalled) {
+        assertEquals(ImmutableSet.of(NodeActionType.START, NodeActionType.DELETE), allowedActions);
+      } else if (nodeState == NodeDetails.NodeState.ToBeRemoved) {
+        assertEquals(ImmutableSet.of(NodeActionType.REMOVE), allowedActions);
+      } else if (nodeState == NodeDetails.NodeState.Live) {
+        assertEquals(ImmutableSet.of(NodeActionType.STOP, NodeActionType.REMOVE), allowedActions);
+      } else if (nodeState == NodeDetails.NodeState.Stopped) {
+        assertEquals(ImmutableSet.of(NodeActionType.START, NodeActionType.RELEASE), allowedActions);
+      } else if (nodeState == NodeDetails.NodeState.Removed) {
+        assertEquals(
+            ImmutableSet.of(NodeActionType.ADD, NodeActionType.RELEASE, NodeActionType.DELETE),
+            allowedActions);
+      } else if (nodeState == NodeDetails.NodeState.Decommissioned) {
+        assertEquals(ImmutableSet.of(NodeActionType.ADD, NodeActionType.DELETE), allowedActions);
+      } else {
+        assertTrue(allowedActions.isEmpty());
+      }
+    }
+  }
+
+  private Universe createUniverseWithNodes(int rf, int numNodes, boolean setMasters) {
+    Universe u = createUniverse(defaultCustomer.getCustomerId());
+    UserIntent userIntent = new UserIntent();
+    userIntent.replicationFactor = rf;
+    userIntent.regionList = new ArrayList<>();
+    userIntent.provider = Provider.get(defaultCustomer.uuid, Common.CloudType.aws).uuid.toString();
+    userIntent.numNodes = numNodes;
+    u = Universe.saveDetails(u.universeUUID, ApiUtils.mockUniverseUpdater(userIntent, setMasters));
+    return u;
+  }
+
+  @Test
+  public void testGetNodeActions_AllDeletesAllowed() {
+    Universe u = createUniverseWithNodes(3 /* rf */, 3 /* numNodes */, true /* setMasters */);
+    NodeDetails nd = u.getNodes().iterator().next();
+
+    for (NodeDetails.NodeState nodeState : NodeDetails.NodeState.values()) {
+      nd.state = nodeState;
+      Set<NodeActionType> actions = u.getNodeActions(nd, u.getNodes());
+      assertEquals(nd.isRemovable(), actions.contains(NodeActionType.DELETE));
+    }
+  }
+
+  @Test
+  public void testGetNodeActions_NoStopAndRemoveForOneNodeUniverse() {
+    Universe u = createUniverseWithNodes(1 /* rf */, 1 /* numNodes */, true /* setMasters */);
+    NodeDetails nd = u.getNodes().iterator().next();
+    Set<NodeActionType> actions = u.getNodeActions(nd, u.getNodes());
+    assertFalse(actions.contains(NodeActionType.REMOVE));
+    assertFalse(actions.contains(NodeActionType.STOP));
   }
 }

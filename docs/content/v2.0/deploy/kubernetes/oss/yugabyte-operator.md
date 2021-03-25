@@ -2,6 +2,7 @@
 title: Open Source Kubernetes 
 linkTitle: Open Source Kubernetes
 description: Open Source Kubernetes 
+block_indexing: true
 menu:
   v2.0:
     parent: deploy-kubernetes
@@ -83,7 +84,7 @@ kubectl get po,sts,svc
 Once the cluster is up and running, you may start the PostgreQL-compatible YSQL API and start executing relational queries.
 
 ```sh
-kubectl exec -it yb-tserver-0 /home/yugabyte/bin/ysqlsh -- -h yb-tserver-0 --echo-queries
+kubectl exec -it yb-tserver-0 -- /home/yugabyte/bin/ysqlsh -h yb-tserver-0 --echo-queries
 ```
 
 You may choose to start the Cassandra-compatible YCQL api and start storing data in NoSQL format.
@@ -92,7 +93,7 @@ You may choose to start the Cassandra-compatible YCQL api and start storing data
 kubectl exec -it yb-tserver-0 /home/yugabyte/bin/cqlsh yb-tserver-0
 ```
 
-You can read more about the YSQL and YCQL APIs in [Yugabyte documentation](https://docs.yugabyte.com/latest/api/)
+You can read more about the YSQL and YCQL APIs in [Yugabyte documentation](/latest/api/)
 
 ## Configuration options
 
@@ -106,7 +107,7 @@ Specify the required data replication factor. This is a **required** field.
 
 ### TLS
 
-Enable TLS encryption for YugabyteDB, if desired. It is disabled by default. You can use the TLS encryption with 3 GFlags, explained later. If you have set `enabled` to true, then you need to generate root certificate and key. Specify the two under `rootCA.cert` & `rootCA.key`. Refer to  [YugabyteDB docs](https://docs.yugabyte.com/latest/secure/tls-encryption/prepare-nodes/#create-the-openssl-ca-configuration) (till [generate root configuration](https://docs.yugabyte.com/latest/secure/tls-encryption/prepare-nodes/#generate-root-configuration) section) for an idea on how to generate the certificate & key files.
+Enable TLS encryption for YugabyteDB, if desired. It is disabled by default. You can use the TLS encryption with 3 GFlags, explained later. If you have set `enabled` to true, then you need to generate root certificate and key. Specify the two under `rootCA.cert` & `rootCA.key`. Refer to  [YugabyteDB docs](/latest/secure/tls-encryption/prepare-nodes/#create-the-openssl-ca-configuration) (till [generate root configuration](/latest/secure/tls-encryption/prepare-nodes/#generate-root-configuration) section) for an idea on how to generate the certificate & key files.
 
 ### YB-Master and YB-TServer
 

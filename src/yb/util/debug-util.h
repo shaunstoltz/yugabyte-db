@@ -38,6 +38,7 @@
 #include <vector>
 
 #include "yb/gutil/strings/fastmem.h"
+#include "yb/util/enums.h"
 #include "yb/util/result.h"
 #include "yb/util/thread.h"
 
@@ -71,6 +72,9 @@ Status SetStackTraceSignal(int signum);
 // This function is thread-safe but coarsely synchronized: only one "dumper" thread
 // may be active at a time.
 std::string DumpThreadStack(ThreadIdForStack tid);
+
+// Initializes libbacktrace if it is enabled and not yet initialized.
+void InitLibBackTrace();
 
 // Return the current stack trace, stringified.
 std::string GetStackTrace(
@@ -112,11 +116,18 @@ std::string GetLogFormatStackTraceHex();
 // may invoke the dynamic loader.
 void HexStackTraceToString(char* buf, size_t size);
 
+// Active - thread is performing execution.
+// Waiting - thread is waiting on mutex.
+// Idle - thread is waiting on condition or epoll.
+YB_DEFINE_ENUM(StackTraceGroup, (kActive)(kWaiting)(kIdle));
+
 // Efficient class for collecting and later stringifying a stack trace.
 //
 // Requires external synchronization.
 class StackTrace {
  public:
+  // It is OK that frames_ is uninitialized.
+  //-V:frames_:V730
   StackTrace() : num_frames_(0) {
   }
 
@@ -155,8 +166,10 @@ class StackTrace {
   // Return a string with a symbolized backtrace in a format suitable for
   // printing to a log file.
   // This is not async-safe.
+  // If group is specified it is filled with value corresponding to this stack trace.
   std::string Symbolize(
-      StackTraceLineFormat source_file_path_format = StackTraceLineFormat::DEFAULT) const;
+      StackTraceLineFormat source_file_path_format = StackTraceLineFormat::DEFAULT,
+      StackTraceGroup* group = nullptr) const;
 
   // Return a string with a hex-only backtrace in the format typically used in
   // log files. Similar to the format given by Symbolize(), but symbols are not

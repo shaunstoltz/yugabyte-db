@@ -24,6 +24,7 @@ import java.net.URL;
 import java.net.URLConnection;
 import java.net.URLStreamHandler;
 import java.util.HashMap;
+import java.util.Map;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CompletionStage;
 
@@ -121,7 +122,6 @@ public class ApiHelperTest {
     ObjectNode jsonResponse = Json.newObject();
     jsonResponse.put("Success", true);
 
-    when(mockRequest.get()).thenReturn(mockCompletion);
     when(mockRequest.post(Matchers.any(JsonNode.class))).thenReturn(mockCompletion);
     when(mockResponse.asJson()).thenReturn(jsonResponse);
     JsonNode result = apiHelper.postRequest("http://foo.com/test", postData);
@@ -167,5 +167,18 @@ public class ApiHelperTest {
   @Test
   public void testGetHeaderRequestWithInvalidURL() {
     testGetHeaderRequestHelper("file:///my/yugabyte/com", false);
+  }
+
+  @Test
+  public void testBuildUrl() {
+    ApiHelper mockApiHelper = spy(apiHelper);
+    String baseUrl = "http://test.com";
+    String expectedResult = String.format("%s?testKey2=test2&testKey1=test1", baseUrl);
+    String[] values1 = {"test1"};
+    String[] values2 = {"test2"};
+    Map<String, String[]> queryParams = new HashMap<>();
+    queryParams.put("testKey1", values1);
+    queryParams.put("testKey2", values2);
+    assertEquals(mockApiHelper.buildUrl(baseUrl, queryParams), expectedResult);
   }
 }

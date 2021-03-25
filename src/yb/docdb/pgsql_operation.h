@@ -19,6 +19,7 @@
 #include "yb/docdb/doc_expr.h"
 #include "yb/docdb/doc_key.h"
 #include "yb/docdb/doc_operation.h"
+#include "yb/docdb/intent_aware_iterator.h"
 
 namespace yb {
 
@@ -46,7 +47,12 @@ class PgsqlWriteOperation :
 
   // Initialize PgsqlWriteOperation. Content of request will be swapped out by the constructor.
   CHECKED_STATUS Init(PgsqlWriteRequestPB* request, PgsqlResponsePB* response);
-  bool RequireReadSnapshot() const override { return request_.has_column_refs(); }
+  bool RequireReadSnapshot() const override {
+    // For YSQL the the standard operations (INSERT/UPDATE/DELETE) will read/check the primary key.
+    // We use UPSERT stmt type for specific requests when we can guarantee we can skip the read.
+    return request_.stmt_type() != PgsqlWriteRequestPB::PGSQL_UPSERT;
+  }
+
   const PgsqlWriteRequestPB& request() const { return request_; }
   PgsqlResponsePB* response() const { return response_; }
 
@@ -55,6 +61,18 @@ class PgsqlWriteOperation :
   bool result_is_single_empty_row() const {
     return result_rows_ == 1 && result_buffer_.size() == sizeof(int64_t);
   }
+
+  Result<bool> HasDuplicateUniqueIndexValue(const DocOperationApplyData& data);
+  Result<bool> HasDuplicateUniqueIndexValue(
+      const DocOperationApplyData& data,
+      yb::docdb::Direction direction);
+  Result<bool> HasDuplicateUniqueIndexValue(
+      const DocOperationApplyData& data,
+      ReadHybridTime read_time);
+  Result<HybridTime> FindOldestOverwrittenTimestamp(
+      IntentAwareIterator* iter,
+      const SubDocKey& sub_doc_key,
+      HybridTime min_hybrid_time);
 
   // Execute write.
   CHECKED_STATUS Apply(const DocOperationApplyData& data) override;
@@ -70,7 +88,7 @@ class PgsqlWriteOperation :
   CHECKED_STATUS ApplyInsert(
       const DocOperationApplyData& data, IsUpsert is_upsert = IsUpsert::kFalse);
   CHECKED_STATUS ApplyUpdate(const DocOperationApplyData& data);
-  CHECKED_STATUS ApplyDelete(const DocOperationApplyData& data);
+  CHECKED_STATUS ApplyDelete(const DocOperationApplyData& data, const bool is_persist_needed);
   CHECKED_STATUS ApplyTruncateColocated(const DocOperationApplyData& data);
 
   CHECKED_STATUS DeleteRow(const DocPath& row_path, DocWriteBatch* doc_write_batch,
@@ -118,9 +136,21 @@ class PgsqlReadOperation : public DocExprExecutor {
   const PgsqlReadRequestPB& request() const { return request_; }
   PgsqlResponsePB& response() { return response_; }
 
+  // Driver of the execution for READ operators for the given conditions in Protobuf request.
+  // The protobuf request carries two different types of arguments.
+  // - Scalar argument: The query condition is represented by one set of values. For example, each
+  //   of the following scalar protobuf requests will carry one "ybctid" (ROWID).
+  //     SELECT ... WHERE ybctid = y1;
+  //     SELECT ... WHERE ybctid = y2;
+  //     SELECT ... WHERE ybctid = y3;
+  //
+  // - Batch argument: The query condition is representd by many sets of values. For example, a
+  //   batch protobuf will carry many ybctids.
+  //     SELECT ... WHERE ybctid IN (y1, y2, y3)
   Result<size_t> Execute(const common::YQLStorageIf& ql_storage,
                          CoarseTimePoint deadline,
                          const ReadHybridTime& read_time,
+                         bool is_explicit_request_read_time,
                          const Schema& schema,
                          const Schema *index_schema,
                          faststring *result_buffer,
@@ -131,12 +161,25 @@ class PgsqlReadOperation : public DocExprExecutor {
   CHECKED_STATUS GetIntents(const Schema& schema, KeyValueWriteBatchPB* out);
 
  private:
-  Result<size_t> ExecuteBatch(const common::YQLStorageIf& ql_storage,
-                              CoarseTimePoint deadline,
-                              const ReadHybridTime& read_time,
-                              const Schema& schema,
-                              faststring *result_buffer,
-                              HybridTime *restart_read_ht);
+  // Execute a READ operator for a given scalar argument.
+  Result<size_t> ExecuteScalar(const common::YQLStorageIf& ql_storage,
+                               CoarseTimePoint deadline,
+                               const ReadHybridTime& read_time,
+                               bool is_explicit_request_read_time,
+                               const Schema& schema,
+                               const Schema *index_schema,
+                               faststring *result_buffer,
+                               HybridTime *restart_read_ht,
+                               bool *has_paging_state);
+
+  // Execute a READ operator for a given batch of ybctids.
+  Result<size_t> ExecuteBatchYbctid(const common::YQLStorageIf& ql_storage,
+                                    CoarseTimePoint deadline,
+                                    const ReadHybridTime& read_time,
+                                    const Schema& schema,
+                                    bool unknown_ybctid_allowed,
+                                    faststring *result_buffer,
+                                    HybridTime *restart_read_ht);
 
   CHECKED_STATUS PopulateResultSet(const QLTableRow& table_row,
                                    faststring *result_buffer);
@@ -151,7 +194,10 @@ class PgsqlReadOperation : public DocExprExecutor {
   CHECKED_STATUS SetPagingStateIfNecessary(const common::YQLRowwiseIteratorIf* iter,
                                            size_t fetched_rows,
                                            const size_t row_count_limit,
-                                           const bool scan_time_exceeded);
+                                           const bool scan_time_exceeded,
+                                           const Schema* schema,
+                                           const ReadHybridTime& read_time,
+                                           bool *has_paging_state);
 
   //------------------------------------------------------------------------------------------------
   const PgsqlReadRequestPB& request_;

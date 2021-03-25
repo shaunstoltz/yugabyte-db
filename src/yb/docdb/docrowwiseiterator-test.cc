@@ -14,11 +14,15 @@
 #include <memory>
 #include <string>
 
+#include "yb/common/common.pb.h"
+#include "yb/common/ql_expr.h"
 #include "yb/common/ql_value.h"
+#include "yb/common/read_hybrid_time.h"
 #include "yb/common/transaction-test-util.h"
 
 #include "yb/docdb/doc_rowwise_iterator.h"
 #include "yb/docdb/docdb.h"
+#include "yb/docdb/docdb_debug.h"
 #include "yb/docdb/docdb_rocksdb_util.h"
 #include "yb/docdb/docdb_test_base.h"
 #include "yb/docdb/docdb_test_util.h"
@@ -30,7 +34,7 @@
 #include "yb/util/test_macros.h"
 #include "yb/util/test_util.h"
 
-DECLARE_bool(docdb_sort_weak_intents_in_tests);
+DECLARE_bool(TEST_docdb_sort_weak_intents_in_tests);
 
 namespace yb {
 namespace docdb {
@@ -49,7 +53,7 @@ class DocRowwiseIteratorTest : public DocDBTestBase {
   static Schema kProjectionForIteratorTests;
 
   void SetUp() override {
-    FLAGS_docdb_sort_weak_intents_in_tests = true;
+    FLAGS_TEST_docdb_sort_weak_intents_in_tests = true;
     DocDBTestBase::SetUp();
   }
 
@@ -142,7 +146,7 @@ TEST_F(DocRowwiseIteratorTest, DocRowwiseIteratorTest) {
     DocRowwiseIterator iter(
         projection, schema, kNonTransactionalOperationContext, doc_db(),
         CoarseTimePoint::max() /* deadline */, ReadHybridTime::FromMicros(2000));
-    ASSERT_OK(iter.Init());
+    ASSERT_OK(iter.Init(YQL_TABLE_TYPE));
 
     ASSERT_TRUE(ASSERT_RESULT(iter.HasNext()));
     ASSERT_OK(iter.NextRow(&row));
@@ -182,7 +186,7 @@ TEST_F(DocRowwiseIteratorTest, DocRowwiseIteratorTest) {
     DocRowwiseIterator iter(
         projection, schema, kNonTransactionalOperationContext, doc_db(),
         CoarseTimePoint::max() /* deadline */, ReadHybridTime::FromMicros(5000));
-    ASSERT_OK(iter.Init());
+    ASSERT_OK(iter.Init(YQL_TABLE_TYPE));
 
     ASSERT_TRUE(ASSERT_RESULT(iter.HasNext()));
     ASSERT_OK(iter.NextRow(&row));
@@ -255,7 +259,7 @@ TEST_F(DocRowwiseIteratorTest, DocRowwiseIteratorDeletedDocumentTest) {
     DocRowwiseIterator iter(
         projection, schema, kNonTransactionalOperationContext, doc_db(),
         CoarseTimePoint::max() /* deadline */, ReadHybridTime::FromMicros(2500));
-    ASSERT_OK(iter.Init());
+    ASSERT_OK(iter.Init(YQL_TABLE_TYPE));
 
     QLTableRow row;
     QLValue value;
@@ -312,7 +316,7 @@ SubDocKey(DocKey([], ["row2", 22222]), [ColumnId(40); HT{ physical: 2800 w: 1 }]
     DocRowwiseIterator iter(
         projection, schema, kNonTransactionalOperationContext, doc_db(),
         CoarseTimePoint::max() /* deadline */, ReadHybridTime::FromMicros(2800));
-    ASSERT_OK(iter.Init());
+    ASSERT_OK(iter.Init(YQL_TABLE_TYPE));
 
     QLTableRow row;
     QLValue value;
@@ -527,7 +531,7 @@ SubDocKey(DocKey([], ["row1", 11111]), [ColumnId(50); HT{ physical: 2800 }]) -> 
     DocRowwiseIterator iter(
         projection, schema, kNonTransactionalOperationContext, doc_db(),
         CoarseTimePoint::max() /* deadline */, ReadHybridTime::FromMicros(2800));
-    ASSERT_OK(iter.Init());
+    ASSERT_OK(iter.Init(YQL_TABLE_TYPE));
 
     QLTableRow row;
     QLValue value;
@@ -577,7 +581,7 @@ TEST_F(DocRowwiseIteratorTest, DocRowwiseIteratorIncompleteProjection) {
     DocRowwiseIterator iter(
         projection, schema, kNonTransactionalOperationContext, doc_db(),
         CoarseTimePoint::max() /* deadline */, ReadHybridTime::FromMicros(2800));
-    ASSERT_OK(iter.Init());
+    ASSERT_OK(iter.Init(YQL_TABLE_TYPE));
 
     QLTableRow row;
     QLValue value;
@@ -603,6 +607,52 @@ TEST_F(DocRowwiseIteratorTest, DocRowwiseIteratorIncompleteProjection) {
     ASSERT_FALSE(value.IsNull());
     ASSERT_EQ(20000, value.int64_value());
 
+    ASSERT_FALSE(ASSERT_RESULT(iter.HasNext()));
+  }
+}
+
+TEST_F(DocRowwiseIteratorTest, ColocatedTableTombstoneTest) {
+  constexpr PgTableOid pgtable_id(0x4001);
+  auto dwb = MakeDocWriteBatch();
+
+  DocKey encoded_1_with_tableid;
+
+  ASSERT_OK(encoded_1_with_tableid.FullyDecodeFrom(kEncodedDocKey1));
+  encoded_1_with_tableid.set_pgtable_id(pgtable_id);
+
+  ASSERT_OK(dwb.SetPrimitive(
+      DocPath(
+        encoded_1_with_tableid.Encode(),
+        PrimitiveValue::SystemColumnId(SystemColumnIds::kLivenessColumn)),
+      PrimitiveValue(ValueType::kNullLow)));
+  ASSERT_OK(WriteToRocksDBAndClear(&dwb, HybridTime::FromMicros(1000)));
+
+  DocKey table_id(pgtable_id);
+  ASSERT_OK(dwb.DeleteSubDoc(DocPath(table_id.Encode())));
+  ASSERT_OK(WriteToRocksDBAndClear(&dwb, HybridTime::FromMicros(2000)));
+
+  ASSERT_DOCDB_DEBUG_DUMP_STR_EQ(R"#(
+SubDocKey(DocKey(PgTableId=16385, [], []), [HT{ physical: 2000 }]) -> DEL
+SubDocKey(DocKey(PgTableId=16385, [], ["row1", 11111]), [SystemColumnId(0); HT{ physical: 1000 }]) \
+    -> null
+      )#");
+  Schema schema_copy = kSchemaForIteratorTests;
+  schema_copy.set_pgtable_id(pgtable_id);
+  Schema projection;
+  // Read should have results before delete...
+  {
+    DocRowwiseIterator iter(
+        projection, schema_copy, kNonTransactionalOperationContext, doc_db(),
+        CoarseTimePoint::max() /* deadline */, ReadHybridTime::FromMicros(1500));
+    ASSERT_OK(iter.Init(YQL_TABLE_TYPE));
+    ASSERT_TRUE(ASSERT_RESULT(iter.HasNext()));
+  }
+  // ...but there should be no results after delete.
+  {
+    DocRowwiseIterator iter(
+        projection, schema_copy, kNonTransactionalOperationContext, doc_db(),
+        CoarseTimePoint::max() /* deadline */, ReadHybridTime::Max());
+    ASSERT_OK(iter.Init(YQL_TABLE_TYPE));
     ASSERT_FALSE(ASSERT_RESULT(iter.HasNext()));
   }
 }
@@ -661,7 +711,7 @@ SubDocKey(DocKey([], ["row2", 22222]), [ColumnId(50); HT{ physical: 2800 w: 3 }]
     DocRowwiseIterator iter(
         projection, schema, kNonTransactionalOperationContext, doc_db(),
         CoarseTimePoint::max() /* deadline */, read_time);
-    ASSERT_OK(iter.Init());
+    ASSERT_OK(iter.Init(YQL_TABLE_TYPE));
 
     QLTableRow row;
     QLValue value;
@@ -722,7 +772,7 @@ TEST_F(DocRowwiseIteratorTest, DocRowwiseIteratorValidColumnNotInProjection) {
     DocRowwiseIterator iter(
         projection, schema, kNonTransactionalOperationContext, doc_db(),
         CoarseTimePoint::max() /* deadline */, ReadHybridTime::FromMicros(2800));
-    ASSERT_OK(iter.Init());
+    ASSERT_OK(iter.Init(YQL_TABLE_TYPE));
 
     QLTableRow row;
     QLValue value;
@@ -776,7 +826,7 @@ SubDocKey(DocKey([], ["row1", 11111]), [ColumnId(50); HT{ physical: 1000 w: 1 }]
     DocRowwiseIterator iter(
         projection, schema, kNonTransactionalOperationContext, doc_db(),
         CoarseTimePoint::max() /* deadline */, ReadHybridTime::FromMicros(2800));
-    ASSERT_OK(iter.Init());
+    ASSERT_OK(iter.Init(YQL_TABLE_TYPE));
 
     QLTableRow row;
     QLValue value;
@@ -935,7 +985,7 @@ TXN REV 30303030-3030-3030-3030-303030303032 HT{ physical: 4000 w: 3 } -> \
     DocRowwiseIterator iter(
         projection, schema, txn_context, doc_db(),
         CoarseTimePoint::max() /* deadline */, ReadHybridTime::FromMicros(2000));
-    ASSERT_OK(iter.Init());
+    ASSERT_OK(iter.Init(YQL_TABLE_TYPE));
 
     QLTableRow row;
     QLValue value;
@@ -979,7 +1029,7 @@ TXN REV 30303030-3030-3030-3030-303030303032 HT{ physical: 4000 w: 3 } -> \
     DocRowwiseIterator iter(
         projection, schema, txn_context, doc_db(),
         CoarseTimePoint::max() /* deadline */, ReadHybridTime::FromMicros(5000));
-    ASSERT_OK(iter.Init());
+    ASSERT_OK(iter.Init(YQL_TABLE_TYPE));
     QLTableRow row;
     QLValue value;
 
@@ -1021,7 +1071,7 @@ TXN REV 30303030-3030-3030-3030-303030303032 HT{ physical: 4000 w: 3 } -> \
     DocRowwiseIterator iter(
         projection, schema, txn_context, doc_db(),
         CoarseTimePoint::max() /* deadline */, ReadHybridTime::FromMicros(6000));
-    ASSERT_OK(iter.Init());
+    ASSERT_OK(iter.Init(YQL_TABLE_TYPE));
 
     QLTableRow row;
     QLValue value;
@@ -1183,7 +1233,7 @@ TEST_F(DocRowwiseIteratorTest, ScanWithinTheSameTxn) {
   DocRowwiseIterator iter(
       projection, kSchemaForIteratorTests, txn_context, doc_db(),
       CoarseTimePoint::max() /* deadline */, ReadHybridTime::FromMicros(1000));
-  ASSERT_OK(iter.Init());
+  ASSERT_OK(iter.Init(YQL_TABLE_TYPE));
 
   QLTableRow row;
   QLValue value;
@@ -1215,6 +1265,11 @@ TEST_F(DocRowwiseIteratorTest, ScanWithinTheSameTxn) {
   ASSERT_TRUE(value.IsNull());
 
   ASSERT_FALSE(ASSERT_RESULT(iter.HasNext()));
+
+  // Empirically we require 3 seeks to perform this test.
+  // If this number increased, then something got broken and should be fixed.
+  // IF this number decreased because of optimization, then we should adjust this check.
+  ASSERT_EQ(intents_db_options_.statistics->getTickerCount(rocksdb::Tickers::NUMBER_DB_SEEK), 3);
 }
 
 }  // namespace docdb

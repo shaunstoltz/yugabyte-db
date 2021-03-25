@@ -37,6 +37,8 @@
 #include <map>
 #include <unordered_set>
 
+#include <boost/algorithm/string/predicate.hpp>
+
 #include <glog/logging.h>
 #include <glog/stl_logging.h>
 #include <google/protobuf/message.h>
@@ -120,25 +122,25 @@ FsManagerOpts::~FsManagerOpts() {
 }
 
 FsManager::FsManager(Env* env, const string& root_path, const std::string& server_type)
-  : env_(DCHECK_NOTNULL(env)),
-    read_only_(false),
-    wal_fs_roots_({ root_path }),
-    data_fs_roots_({ root_path }),
-    server_type_(server_type),
-    metric_entity_(nullptr),
-    initted_(false) {
+    : env_(DCHECK_NOTNULL(env)),
+      read_only_(false),
+      wal_fs_roots_({ root_path }),
+      data_fs_roots_({ root_path }),
+      server_type_(server_type),
+      metric_entity_(nullptr),
+      initted_(false) {
 }
 
 FsManager::FsManager(Env* env,
                      const FsManagerOpts& opts)
-  : env_(DCHECK_NOTNULL(env)),
-    read_only_(opts.read_only),
-    wal_fs_roots_(opts.wal_paths),
-    data_fs_roots_(opts.data_paths),
-    server_type_(opts.server_type),
-    metric_entity_(opts.metric_entity),
-    parent_mem_tracker_(opts.parent_mem_tracker),
-    initted_(false) {
+    : env_(DCHECK_NOTNULL(env)),
+      read_only_(opts.read_only),
+      wal_fs_roots_(opts.wal_paths),
+      data_fs_roots_(opts.data_paths),
+      server_type_(opts.server_type),
+      metric_entity_(opts.metric_entity),
+      parent_mem_tracker_(opts.parent_mem_tracker),
+      initted_(false) {
 }
 
 FsManager::~FsManager() {
@@ -279,10 +281,10 @@ Status FsManager::DeleteLockFiles() {
   return Status::OK();
 }
 
-Status FsManager::DeleteFileSystemLayout(bool delete_logs_also) {
+Status FsManager::DeleteFileSystemLayout(ShouldDeleteLogs also_delete_logs) {
   CHECK(!read_only_);
   set<string> removal_set;
-  if (delete_logs_also) {
+  if (also_delete_logs) {
     removal_set = canonicalized_all_fs_roots_;
   } else {
     auto removal_list = GetWalRootDirs();
@@ -419,7 +421,7 @@ Status FsManager::CreateInitialFileSystemLayout(bool delete_fs_if_lock_found) {
     }
   }
 
-  if (FLAGS_simulate_fs_create_failure) {
+  if (FLAGS_TEST_simulate_fs_create_failure) {
     return STATUS(IOError, "Simulated fs creation error");
   }
 
@@ -594,12 +596,18 @@ std::string FsManager::GetTabletWalRecoveryDir(const string& tablet_wal_path) {
   return tablet_wal_path + kWalsRecoveryDirSuffix;
 }
 
-std::string FsManager::GetWalSegmentFileName(const string& tablet_wal_path,
-                                             uint64_t sequence_number) {
-  return JoinPathSegments(tablet_wal_path,
-                          strings::Substitute("$0-$1",
-                                              kWalFileNamePrefix,
-                                              StringPrintf("%09" PRIu64, sequence_number)));
+namespace {
+
+const auto kWalFileNameFullPrefix = std::string(FsManager::kWalFileNamePrefix) + "-";
+
+} // namespace
+
+std::string FsManager::GetWalSegmentFileName(uint64_t sequence_number) {
+  return Format("$0$1", kWalFileNameFullPrefix, StringPrintf("%09" PRIu64, sequence_number));
+}
+
+bool FsManager::IsWalSegmentFileName(const std::string& file_name) {
+  return boost::starts_with(file_name, kWalFileNameFullPrefix);
 }
 
 // ==========================================================================

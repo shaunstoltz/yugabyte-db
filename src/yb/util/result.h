@@ -160,14 +160,16 @@ class NODISCARD_CLASS Result {
 
   bool ok() const {
 #ifndef NDEBUG
+    ANNOTATE_IGNORE_WRITES_BEGIN();
     success_checked_ = true;
+    ANNOTATE_IGNORE_WRITES_END();
 #endif
     return success_;
   }
 
   const Status& status() const& {
 #ifndef NDEBUG
-    CHECK(success_checked_);
+    CHECK(ANNOTATE_UNPROTECTED_READ(success_checked_));
 #endif
     CHECK(!success_);
     return status_;
@@ -175,7 +177,7 @@ class NODISCARD_CLASS Result {
 
   Status& status() & {
 #ifndef NDEBUG
-    CHECK(success_checked_);
+    CHECK(ANNOTATE_UNPROTECTED_READ(success_checked_));
 #endif
     CHECK(!success_);
     return status_;
@@ -183,7 +185,7 @@ class NODISCARD_CLASS Result {
 
   Status&& status() && {
 #ifndef NDEBUG
-    CHECK(success_checked_);
+    CHECK(ANNOTATE_UNPROTECTED_READ(success_checked_));
 #endif
     CHECK(!success_);
     return std::move(status_);
@@ -195,7 +197,7 @@ class NODISCARD_CLASS Result {
 
   TValue&& operator*() && {
 #ifndef NDEBUG
-    CHECK(success_checked_);
+    CHECK(ANNOTATE_UNPROTECTED_READ(success_checked_));
 #endif
     CHECK(success_);
     return value_;
@@ -206,7 +208,7 @@ class NODISCARD_CLASS Result {
 
   auto get_ptr() const {
 #ifndef NDEBUG
-    CHECK(success_checked_);
+    CHECK(ANNOTATE_UNPROTECTED_READ(success_checked_));
 #endif
     CHECK(success_);
     return Traits::GetPtr(&value_);
@@ -214,7 +216,7 @@ class NODISCARD_CLASS Result {
 
   auto get_ptr() {
 #ifndef NDEBUG
-    CHECK(success_checked_);
+    CHECK(ANNOTATE_UNPROTECTED_READ(success_checked_));
 #endif
     CHECK(success_);
     return Traits::GetPtr(&value_);
@@ -340,7 +342,7 @@ std::reference_wrapper<T> WrapMove(const Result<T&>& result) {
 #define CHECK_RESULT(expr) \
   RESULT_CHECKER_HELPER(expr, CHECK_OK(__result))
 
-// Returns if result is not ok, extracts result value is case of success.
+// Returns if result is not ok, extracts result value in case of success.
 #define VERIFY_RESULT(expr) \
   RESULT_CHECKER_HELPER(expr, RETURN_NOT_OK(__result))
 

@@ -3,7 +3,9 @@ package com.yugabyte.yw.controllers;
 
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.node.ArrayNode;
+import com.typesafe.config.Config;
 import com.yugabyte.yw.cloud.AWSInitializer;
+import com.yugabyte.yw.cloud.AZUInitializer;
 import com.yugabyte.yw.cloud.GCPInitializer;
 import com.yugabyte.yw.commissioner.Commissioner;
 import com.yugabyte.yw.commissioner.Common;
@@ -17,6 +19,7 @@ import com.yugabyte.yw.common.ConfigHelper;
 import com.yugabyte.yw.common.AccessManager;
 import com.yugabyte.yw.common.DnsManager;
 import com.yugabyte.yw.common.ShellProcessHandler;
+import com.yugabyte.yw.common.ShellResponse;
 import com.yugabyte.yw.forms.CloudProviderFormData;
 import com.yugabyte.yw.forms.CloudBootstrapFormData;
 import com.yugabyte.yw.forms.KubernetesProviderFormData;
@@ -54,6 +57,13 @@ import static com.yugabyte.yw.common.ConfigHelper.ConfigType.DockerRegionMetadat
 import static com.yugabyte.yw.models.helpers.CommonUtils.DEFAULT_YB_HOME_DIR;
 
 public class CloudProviderController extends AuthenticatedController {
+  private final Config config;
+
+  @Inject
+  public CloudProviderController(Config config) {
+    this.config = config;
+  }
+
   public static final Logger LOG = LoggerFactory.getLogger(CloudProviderController.class);
 
 
@@ -76,6 +86,9 @@ public class CloudProviderController extends AuthenticatedController {
 
   @Inject
   GCPInitializer gcpInitializer;
+
+  @Inject
+  AZUInitializer azuInitializer;
 
   @Inject
   Commissioner commissioner;
@@ -133,6 +146,13 @@ public class CloudProviderController extends AuthenticatedController {
         accessKey.delete();
       }
       NodeInstance.deleteByProvider(providerUUID);
+
+      int providersCount = Provider.getByCode(provider.code).size();
+      // Instance type has been shared across providers.
+      // We can’t delete instance types if multiple providers exist with the same provider code.
+      if (providersCount == 1) {
+        InstanceType.deleteInstanceTypesForProvider(provider, config);
+      }
       provider.delete();
       Audit.createAuditEntry(ctx(), request());
       return ApiResponse.success("Deleted provider: " + providerUUID);
@@ -169,11 +189,11 @@ public class CloudProviderController extends AuthenticatedController {
     try {
       Provider provider = Provider.create(customerUUID, providerCode, formData.get().name, config);
       if (!config.isEmpty()) {
+        String hostedZoneId = provider.getHostedZoneId();
         switch (provider.code) {
           case "aws":
-            String hostedZoneId = provider.getAwsHostedZoneId();
             if (hostedZoneId != null) {
-              return validateAwsHostedZoneUpdate(provider, hostedZoneId);
+              return validateHostedZoneUpdate(provider, hostedZoneId);
             }
             break;
           case "gcp":
@@ -186,7 +206,11 @@ public class CloudProviderController extends AuthenticatedController {
             } catch (javax.persistence.PersistenceException ex) {
               // TODO: make instance types more multi-tenant friendly...
             }
-            kubernetesProvision(provider, provider.getConfig(), customerUUID);
+            break;
+          case "azu":
+            if (hostedZoneId != null) {
+              return validateHostedZoneUpdate(provider, hostedZoneId);
+            }
             break;
         }
       }
@@ -252,7 +276,6 @@ public class CloudProviderController extends AuthenticatedController {
       provider = Provider.create(customerUUID, providerCode, formData.name);
       boolean isConfigInProvider = updateKubeConfig(provider, config, false);
       if (isConfigInProvider) {
-        kubernetesProvision(provider, config, customerUUID);
       }
       List<RegionData> regionList = formData.regionList;
       for (RegionData rd : regionList) {
@@ -260,14 +283,12 @@ public class CloudProviderController extends AuthenticatedController {
         Region region = Region.create(provider, rd.code, rd.name, null, rd.latitude, rd.longitude);
         boolean isConfigInRegion = updateKubeConfig(provider, region, regionConfig, false);
         if (isConfigInRegion) {
-          kubernetesProvision(provider, regionConfig, customerUUID);
         }
         for (ZoneData zd : rd.zoneList) {
           Map<String, String> zoneConfig = zd.config;
           AvailabilityZone az = AvailabilityZone.create(region, zd.code, zd.name, null);
           boolean isConfigInZone = updateKubeConfig(provider, region, az, zoneConfig, false);
           if (isConfigInZone) {
-            kubernetesProvision(provider, zoneConfig, customerUUID);
           }
         }
       }
@@ -363,10 +384,13 @@ public class CloudProviderController extends AuthenticatedController {
   }
 
   private void updateGCPConfig(Provider provider, Map<String, String> config) {
+    // Remove the key to avoid generating a credentials file unnecessarily.
+    config.remove("GCE_HOST_PROJECT");
     // If we were not given a config file, then no need to do anything here.
     if (config.isEmpty()) {
       return;
     }
+
     String gcpCredentialsFile = null;
     try {
       gcpCredentialsFile = accessManager.createCredentialsFile(
@@ -377,10 +401,15 @@ public class CloudProviderController extends AuthenticatedController {
     }
 
     Map<String, String> newConfig = new HashMap<String, String>();
-    newConfig.put("GCE_EMAIL", config.get("client_email"));
-    newConfig.put("GCE_PROJECT", config.get("project_id"));
-    newConfig.put("GOOGLE_APPLICATION_CREDENTIALS", gcpCredentialsFile);
-
+    if (config.get("project_id") != null) {
+      newConfig.put("GCE_PROJECT", config.get("project_id"));
+    }
+    if (config.get("client_email") != null) {
+      newConfig.put("GCE_EMAIL", config.get("client_email"));
+    }
+    if (gcpCredentialsFile != null) {
+      newConfig.put("GOOGLE_APPLICATION_CREDENTIALS", gcpCredentialsFile);
+    }
     provider.setConfig(newConfig);
     provider.save();
   }
@@ -417,24 +446,6 @@ public class CloudProviderController extends AuthenticatedController {
           idt
       );
     }
-  }
-
-  /* Function to create Commissioner task for provisioning K8s providers
-  // Will also be helpful to provision regions/AZs in the future
-  */
-  private void kubernetesProvision(Provider provider, Map<String, String> config, UUID customerUUID) {
-    KubernetesClusterInitParams taskParams = new KubernetesClusterInitParams();
-    taskParams.config = config;
-    taskParams.providerUUID = provider.uuid;
-    Customer customer = Customer.get(customerUUID);
-    UUID taskUUID = commissioner.submit(TaskType.KubernetesProvision, taskParams);
-    CustomerTask.create(customer,
-      provider.uuid,
-      taskUUID,
-      CustomerTask.TargetType.Provider,
-      CustomerTask.TaskType.Create,
-      provider.name);
-
   }
 
   // TODO: This is temporary endpoint, so we can setup docker, will move this
@@ -477,6 +488,8 @@ public class CloudProviderController extends AuthenticatedController {
     }
     if (provider.code.equals("gcp")) {
       return gcpInitializer.initialize(customerUUID, providerUUID);
+    } else if (provider.code.equals("azu")) {
+      return azuInitializer.initialize(customerUUID, providerUUID);
     }
     return awsInitializer.initialize(customerUUID, providerUUID);
   }
@@ -579,12 +592,12 @@ public class CloudProviderController extends AuthenticatedController {
       return ApiResponse.error(BAD_REQUEST, "Invalid Provider UUID: " + providerUUID);
     }
 
-    if (provider.code.equals("aws")) {
+    if (Provider.HostedZoneEnabledProviders.contains(provider.code)) {
       String hostedZoneId = formData.get("hostedZoneId").asText();
       if (hostedZoneId == null || hostedZoneId.length() == 0) {
         return ApiResponse.error(BAD_REQUEST, "Required field hosted zone id");
       }
-      return validateAwsHostedZoneUpdate(provider, hostedZoneId);
+      return validateHostedZoneUpdate(provider, hostedZoneId);
     } else if (provider.code.equals("kubernetes")) {
       Map<String, String> config = processConfig(formData, Common.CloudType.kubernetes);
       if (config != null) {
@@ -600,9 +613,9 @@ public class CloudProviderController extends AuthenticatedController {
     }
   }
 
-  private Result validateAwsHostedZoneUpdate(Provider provider, String hostedZoneId) {
+  private Result validateHostedZoneUpdate(Provider provider, String hostedZoneId) {
     // TODO: do we have a good abstraction to inspect this AND know that it's an error outside?
-    ShellProcessHandler.ShellResponse response = dnsManager.listDnsRecord(
+    ShellResponse response = dnsManager.listDnsRecord(
         provider.uuid, hostedZoneId);
     if (response.code != 0) {
       return ApiResponse.error(INTERNAL_SERVER_ERROR, "Invalid devops API response: " + response.message);
@@ -632,13 +645,22 @@ public class CloudProviderController extends AuthenticatedController {
     if (configNode != null && !configNode.isNull()) {
       if (providerCode.equals(Common.CloudType.gcp)) {
         // We may receive a config file, or we may be asked to use the local service account.
+        // Default to using config file.
+        boolean shouldUseHostCredentials = configNode.has("use_host_credentials")
+                                             && configNode.get("use_host_credentials").asBoolean();
         JsonNode contents = configNode.get("config_file_contents");
-        if (contents != null) {
+        if (!shouldUseHostCredentials && contents != null) {
           config = Json.fromJson(contents, Map.class);
         }
-        contents = configNode.get("project_id");
+
+        contents = configNode.get("host_project_id");
         if (contents != null && !contents.textValue().isEmpty()) {
-          config.put("project_id", contents.textValue());
+          config.put("GCE_HOST_PROJECT", contents.textValue());
+        }
+
+        contents = configNode.get("YB_FIREWALL_TAGS");
+        if (contents != null && !contents.textValue().isEmpty()) {
+          config.put("YB_FIREWALL_TAGS", contents.textValue());
         }
       } else {
         config = Json.fromJson(configNode, Map.class);

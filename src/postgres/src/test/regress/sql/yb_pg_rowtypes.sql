@@ -319,13 +319,12 @@ $$ LANGUAGE SQL;
 
 insert into price values (1,false,42), (10,false,100), (11,true,17.99);
 
--- TODO(jason): uncomment when issue #738 is closed or closing.
--- UPDATE price
---     SET active = true, price = input_prices.price
---     FROM unnest(ARRAY[(10, 123.00), (11, 99.99)]::price_input[]) input_prices
---     WHERE price_key_from_table(price.*) = price_key_from_input(input_prices.*);
---
--- select * from price;
+UPDATE price
+    SET active = true, price = input_prices.price
+    FROM unnest(ARRAY[(10, 123.00), (11, 99.99)]::price_input[]) input_prices
+    WHERE price_key_from_table(price.*) = price_key_from_input(input_prices.*);
+
+select * from price order by id;
 
 rollback;
 
@@ -495,6 +494,3 @@ SELECT (NULL::compositetable).a;
 SELECT (NULL::compositetable).oid;
 
 DROP TABLE compositetable;
-
--- TODO(jason): remove when issue #1721 is closed or closing.
-DISCARD TEMP;

@@ -1,18 +1,17 @@
 ---
-title: jsonb_array_elements() and  json_array_elements() [JSON]
+title: jsonb_array_elements() and  json_array_elements()
 linkTitle: jsonb_array_elements()
-summary: jsonb_array_elements() and json_array_elements()
 headerTitle: jsonb_array_elements() and json_array_elements()
-description: Use these JSON functions to transform JSON values of a JSON array into a SQL table of jsonb values.
+description: Transform JSON values of a JSON array into a SQL table of jsonb values using jsonb_array_elements() and  json_array_elements().
 menu:
   latest:
     identifier: jsonb-array-elements
-    parent: functions-operators
+    parent: json-functions-operators
     weight: 60
 isTocNested: true
 showAsideToc: true
 ---
-**Purpose:** Transform the JSON values of a JSON _array_ into a SQL table of (i.e., `setof`) `jsonb` values.
+**Purpose:** Transform the JSON values of a JSON _array_ into a SQL table of (i.e., `SETOF`) `jsonb` values.
 
 **Signature:** For the `jsonb` variant:
 
@@ -21,9 +20,11 @@ input value:       jsonb
 return value:      SETOF jsonb
 ```
 
-**Notes:** The functions in this pair require that the supplied JSON value is an _array_. They are the counterparts, for an _array_, to `jsonb_populate_recordset()` for a JSON _object_.
+**Notes:** Each function in this pair requires that the supplied JSON value is an _array_. They are the counterparts, for an _array_, to [`jsonb_populate_recordset()`](../jsonb-populate-recordset) for a JSON _object_.
 
-```postgresql
+Notice that the JSON value _null_ becomes a genuine SQL `NULL`. However, SQL array comparison and `record` comparison use `IS NOT DISTINCT FROM` semantics, and not the semantics that the comparison of scalars uses. So the simple `ASSERT` that `elements = expected_elements` is `TRUE` is sufficient. See the section [Operators for comparing two arrays](../../..//type_array/functions-operators/comparison/).
+
+```plpgsql
 do $body$
 declare
   j_array constant jsonb := '["cat", "dog house", 42, true, {"x": 17}, null]';

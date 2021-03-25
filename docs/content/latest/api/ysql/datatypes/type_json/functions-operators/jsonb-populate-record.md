@@ -1,13 +1,12 @@
 ---
-title: jsonb_populate_record()
-linkTitle: jsonb_populate_record()
-summary: jsonb_populate_record() and json_populate_record() 
+title: jsonb_populate_record() and json_populate_record() 
 headerTitle: jsonb_populate_record() and json_populate_record()
-description: jsonb_populate_record()  and json_populate_record() 
+linkTitle: jsonb_populate_record()
+description: Convert a JSON object into the equivalent SQL record.
 menu:
   latest:
     identifier: jsonb-populate-record
-    parent: functions-operators
+    parent: json-functions-operators
     weight: 180
 isTocNested: true
 showAsideToc: true
@@ -22,9 +21,9 @@ input value:       anyelement, jsonb
 return value:      anyelement
 ```
 
-**Notes:** Require that the supplied JSON value is an _object_. The data type of the `record` must be defined as a schema-level `type` whose name is passed via the function's first formal parameter using the locution `null:type_identifier`. The JSON value is passed via the second formal parameter.
+**Notes:** Each function in this pair requires that the supplied JSON value is an _object_. The data type of the `record` must be defined as a schema-level `type` whose name is passed via the function's first formal parameter using the locution `NULL:type_identifier`. The JSON value is passed using the second formal parameter.
 
-Use this _ysqlsh_ script to create the required types `t1` and `t2`, and then to execute the `assert`.
+Use this `ysqlsh` script to create the required types _"t1"_ and _"t2"_, and then to execute the `ASSERT`.
 
 ```
 create type t1 as ( d int, e text);

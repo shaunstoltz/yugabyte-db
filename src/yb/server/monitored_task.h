@@ -38,6 +38,7 @@
 #include "yb/gutil/ref_counted.h"
 #include "yb/util/enums.h"
 #include "yb/util/monotime.h"
+#include "yb/util/status.h"
 
 namespace yb {
 
@@ -56,7 +57,7 @@ class MonitoredTask : public std::enable_shared_from_this<MonitoredTask> {
 
   // Abort this task and return its value before it was successfully aborted. If the task entered
   // a different terminal state before we were able to abort it, return that state.
-  virtual MonitoredTaskState AbortAndReturnPrevState() = 0;
+  virtual MonitoredTaskState AbortAndReturnPrevState(const Status& status) = 0;
 
   // Task State.
   virtual MonitoredTaskState state() const = 0;
@@ -79,6 +80,8 @@ class MonitoredTask : public std::enable_shared_from_this<MonitoredTask> {
     ASYNC_BACKFILL_TABLET_CHUNK,
     ASYNC_BACKFILL_DONE,
     BACKFILL_TABLE,
+    ASYNC_SPLIT_TABLET,
+    START_ELECTION,
   };
 
   virtual Type type() const = 0;
@@ -94,6 +97,11 @@ class MonitoredTask : public std::enable_shared_from_this<MonitoredTask> {
 
   // Task completion time, may be !Initialized().
   virtual MonoTime completion_timestamp() const = 0;
+
+  // Whether task was started by the LB.
+  virtual bool started_by_lb() const {
+    return false;
+  }
 
  protected:
   static bool IsStateTerminal(MonitoredTaskState state) {

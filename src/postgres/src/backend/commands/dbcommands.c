@@ -147,7 +147,7 @@ createdb(ParseState *pstate, const CreatedbStmt *stmt)
 	DefElem    *distemplate = NULL;
 	DefElem    *dallowconnections = NULL;
 	DefElem    *dconnlimit = NULL;
-	DefElem    **default_options[] = {&dctype, &dcollate, &dtablespacename};
+	DefElem    **default_options[] = {&dtablespacename};
 	char	   *dbname = stmt->dbname;
 	char	   *dbowner = NULL;
 	const char *dbtemplate = NULL;
@@ -404,6 +404,24 @@ createdb(ParseState *pstate, const CreatedbStmt *stmt)
 					 errhint("Please report the issue on "
 							 "https://github.com/yugabyte/yugabyte-db/issues"),
 					 parser_errposition(pstate, dencoding->location)));
+
+		if (dcollate && dbcollate && strcmp(dbcollate, "C") != 0)
+			ereport(YBUnsupportedFeatureSignalLevel(),
+					(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+					 errmsg("Value other than 'C' for lc_collate "
+							"option is not yet supported"),
+					 errhint("Please report the issue on "
+							 "https://github.com/YugaByte/yugabyte-db/issues"),
+					 parser_errposition(pstate, dcollate->location)));
+
+		if (dctype && dbctype && strcmp(dbctype, "en_US.UTF-8") != 0)
+			ereport(YBUnsupportedFeatureSignalLevel(),
+					(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+					 errmsg("Value other than 'en_US.UTF-8' for lc_ctype "
+							"option is not yet supported"),
+					 errhint("Please report the issue on "
+							 "https://github.com/YugaByte/yugabyte-db/issues"),
+					 parser_errposition(pstate, dctype->location)));
 	}
 
 	if (!get_db_info(dbtemplate, ShareLock,
@@ -866,7 +884,7 @@ createdb_failure_callback(int code, Datum arg)
  * DROP DATABASE
  */
 void
-dropdb(const char *dbname, bool missing_ok)
+dropdb(const char *dbname, bool missing_ok, bool force)
 {
 	Oid			db_id;
 	bool		db_istemplate;
@@ -959,19 +977,6 @@ dropdb(const char *dbname, bool missing_ok)
 	}
 
 	/*
-	 * Check for other backends in the target database.  (Because we hold the
-	 * database lock, no new ones can start after this.)
-	 *
-	 * As in CREATE DATABASE, check this after other error conditions.
-	 */
-	if (CountOtherDBBackends(db_id, &notherbackends, &npreparedxacts))
-		ereport(ERROR,
-				(errcode(ERRCODE_OBJECT_IN_USE),
-				 errmsg("database \"%s\" is being accessed by other users",
-						dbname),
-				 errdetail_busy_db(notherbackends, npreparedxacts)));
-
-	/*
 	 * Check if there are subscriptions defined in the target database.
 	 *
 	 * We can't drop them automatically because they might be holding
@@ -987,6 +992,26 @@ dropdb(const char *dbname, bool missing_ok)
 								  nsubscriptions, nsubscriptions)));
 
 removing_database_from_system:
+	/*
+	 * Attempt to terminate all existing connections to the target database if
+	 * the user has requested to do so.
+	 */
+	if (force)
+		TerminateOtherDBBackends(db_id);
+
+	/*
+	 * Check for other backends in the target database.  (Because we hold the
+	 * database lock, no new ones can start after this.)
+	 *
+	 * As in CREATE DATABASE, check this after other error conditions.
+	 */
+	if (CountOtherDBBackends(db_id, &notherbackends, &npreparedxacts))
+		ereport(ERROR,
+				(errcode(ERRCODE_OBJECT_IN_USE),
+				 errmsg("database \"%s\" is being accessed by other users",
+						dbname),
+				 errdetail_busy_db(notherbackends, npreparedxacts)));
+
 	/*
 	 * Remove the database's tuple from pg_database.
 	 */
@@ -1154,9 +1179,8 @@ RenameDatabase(const char *oldname, const char *newname)
 	if (IsYugaByteEnabled()) {
 		YBCPgStatement handle = NULL;
 		HandleYBStatus(YBCPgNewAlterDatabase(oldname, db_id, &handle));
-		HandleYBStmtStatus(YBCPgAlterDatabaseRenameDatabase(handle, newname), handle);
-		HandleYBStmtStatus(YBCPgExecAlterDatabase(handle), handle);
-		HandleYBStatus(YBCPgDeleteStatement(handle));
+		HandleYBStatus(YBCPgAlterDatabaseRenameDatabase(handle, newname));
+		HandleYBStatus(YBCPgExecAlterDatabase(handle));
 	}
 
 	InvokeObjectPostAlterHook(DatabaseRelationId, db_id, 0);
@@ -1502,6 +1526,30 @@ movedb_failure_callback(int code, Datum arg)
 	(void) rmtree(dstpath, true);
 }
 
+/*
+ * Process options and call dropdb function.
+ */
+void
+DropDatabase(ParseState *pstate, DropdbStmt *stmt)
+{
+	bool		force = false;
+	ListCell   *lc;
+
+	foreach(lc, stmt->options)
+	{
+		DefElem    *opt = (DefElem *) lfirst(lc);
+
+		if (strcmp(opt->defname, "force") == 0)
+			force = true;
+		else
+			ereport(ERROR,
+					(errcode(ERRCODE_SYNTAX_ERROR),
+					 errmsg("unrecognized DROP DATABASE option \"%s\"", opt->defname),
+					 parser_errposition(pstate, opt->location)));
+	}
+
+	dropdb(stmt->dbname, stmt->missing_ok, force);
+}
 
 /*
  * ALTER DATABASE name ...

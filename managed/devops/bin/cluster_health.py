@@ -12,17 +12,20 @@ import argparse
 import json
 import logging
 import os
-import smtplib
+import re
 import subprocess
 import sys
 import time
 
-from email.mime.multipart import MIMEMultipart
-from email.mime.text import MIMEText
-from exceptions import RuntimeError
+try:
+    from builtins import RuntimeError
+except Exception as e:
+    from exceptions import RuntimeError
 from datetime import datetime
 from dateutil import tz
 from multiprocessing import Pool
+from six import string_types, PY2, PY3
+
 
 # Try to read home dir from environment variable, else assume it's /home/yugabyte.
 YB_HOME_DIR = os.environ.get("YB_HOME_DIR", "/home/yugabyte")
@@ -37,28 +40,31 @@ FATAL_TIME_THRESHOLD_MINUTES = 12
 DISK_UTILIZATION_THRESHOLD_PCT = 80
 FD_THRESHOLD_PCT = 50
 SSH_TIMEOUT_SEC = 10
+CMD_TIMEOUT_SEC = 20
 MAX_CONCURRENT_PROCESSES = 10
 MAX_TRIES = 2
 
-# This hardcoded as the ses:FromAddress in the IAM policy.
-EMAIL_SERVER = "email-smtp.us-west-2.amazonaws.com"
-EMAIL_PORT = 465
-# These need to be setup as env vars from YW or in the env if running manually. If not specified
-# then sending the email will fail, but reporting the status will still work just fine.
-EMAIL_FROM = os.environ.get("YB_ALERTS_EMAIL")
-EMAIL_USERNAME = os.environ.get("YB_ALERTS_USERNAME")
-EMAIL_PASSWORD = os.environ.get("YB_ALERTS_PASSWORD")
-
+DEFAULT_SSL_VERSION = "TLSv1_2"
+SSL_PROTOCOL_TO_SSL_VERSION = {
+    "ssl2": "SSLv23",
+    "ssl3": "SSLv23",
+    "tls10": "TLSv1",
+    "tls11": "TLSv1_1",
+    "tls12": "TLSv1_2"
+}
 
 ###################################################################################################
 # Reporting
 ###################################################################################################
+
+
 def generate_ts():
     return local_time().strftime('%Y-%m-%d %H:%M:%S')
 
 
 class EntryType:
     NODE = "node"
+    NODE_NAME = "node_name"
     TIMESTAMP = "timestamp"
     MESSAGE = "message"
     DETAILS = "details"
@@ -67,10 +73,11 @@ class EntryType:
 
 
 class Entry:
-    def __init__(self, message, node, process=None):
+    def __init__(self, message, node, process=None, node_name=None):
         self.timestamp = generate_ts()
         self.message = message
         self.node = node
+        self.node_name = node_name
         self.process = process
         # To be filled in.
         self.details = None
@@ -84,6 +91,7 @@ class Entry:
     def as_json(self):
         j = {
             EntryType.NODE: self.node,
+            EntryType.NODE_NAME: self.node_name or "",
             EntryType.TIMESTAMP: self.timestamp,
             EntryType.MESSAGE: self.message,
             EntryType.DETAILS: self.details,
@@ -138,10 +146,24 @@ class Report:
 ###################################################################################################
 def check_output(cmd, env):
     try:
-        bytes = subprocess.check_output(cmd, stderr=subprocess.STDOUT, env=env)
-        return bytes.decode('utf-8')
+        timeout = CMD_TIMEOUT_SEC
+        command = subprocess.Popen(cmd, stderr=subprocess.PIPE, stdout=subprocess.PIPE, env=env)
+        while command.poll() is None and timeout > 0:
+            time.sleep(1)
+            timeout -= 1
+        if command.poll() is None and timeout <= 0:
+            command.kill()
+            command.wait()
+            return 'Error executing command {}: timeout occurred'.format(cmd)
+
+        output, stderr = command.communicate()
+        if not stderr:
+            return output.decode('utf-8').encode("ascii", "ignore").decode("ascii")
+        else:
+            return 'Error executing command {}: {}'.format(cmd, stderr)
     except subprocess.CalledProcessError as e:
-        return 'Error executing command {}: {}'.format(cmd, e.output)
+        return 'Error executing command {}: {}'.format(
+            cmd, e.output.decode("utf-8").encode("ascii", "ignore"))
 
 
 def safe_pipe(command_str):
@@ -159,19 +181,27 @@ class KubernetesDetails():
         self.pod_name = node_fqdn.split('.')[0]
         # The pod names are yb-master-n/yb-tserver-n where n is the pod number
         # and yb-master/yb-tserver are the container names.
+
+        # TODO(bhavin192): need to change in case of multiple releases
+        # in one namespace. Something like find the word 'master' in
+        # the name.
+
         self.container = self.pod_name.rsplit('-', 1)[0]
         self.config = config_map[self.namespace]
 
 
 class NodeChecker():
 
-    def __init__(self, node, identity_file, ssh_port, start_time_ms,
-                 namespace_to_config, ysql_port, enable_tls_client):
+    def __init__(self, node, node_name, identity_file, ssh_port, start_time_ms,
+                 namespace_to_config, ysql_port, ycql_port, redis_port, enable_tls_client,
+                 ssl_protocol, enable_ysql_auth):
         self.node = node
+        self.node_name = node_name
         self.identity_file = identity_file
         self.ssh_port = ssh_port
         self.start_time_ms = start_time_ms
         self.enable_tls_client = enable_tls_client
+        self.ssl_protocol = ssl_protocol
         # TODO: best way to do mark that this is a k8s deployment?
         self.is_k8s = ssh_port == 0 and not self.identity_file
         self.k8s_details = None
@@ -182,13 +212,16 @@ class NodeChecker():
         if not self.is_k8s and not os.path.isfile(self.identity_file):
             raise RuntimeError('Error: cannot find identity file {}'.format(self.identity_file))
         self.ysql_port = ysql_port
+        self.ycql_port = ycql_port
+        self.redis_port = redis_port
+        self.enable_ysql_auth = enable_ysql_auth
 
     def _new_entry(self, message, process=None):
-        return Entry(message, self.node, process)
+        return Entry(message, self.node, process, self.node_name)
 
     def _remote_check_output(self, command):
         cmd_to_run = []
-        command = safe_pipe(command) if isinstance(command, basestring) else command
+        command = safe_pipe(command) if isinstance(command, string_types) else command
         env_conf = os.environ.copy()
         if self.is_k8s:
             env_conf["KUBECONFIG"] = self.k8s_details.config
@@ -223,7 +256,7 @@ class NodeChecker():
         return output
 
     def get_disk_utilization(self):
-        remote_cmd = 'df -h'
+        remote_cmd = 'df -hl 2>/dev/null'
         return self._remote_check_output(remote_cmd)
 
     def check_disk_utilization(self):
@@ -237,6 +270,9 @@ class NodeChecker():
 
         # Do not process the headers.
         lines = output.split('\n')
+        if len(lines) < 2:
+            return e.fill_and_return_entry([output], True)
+
         msgs.append(lines[0])
         for line in lines[1:]:
             msgs.append(line)
@@ -256,7 +292,7 @@ class NodeChecker():
         remote_cmd = (
             'find {} {} -name "*FATAL*" -type f -printf "%T@ %p\\n" | sort -rn'.format(
                 search_dir,
-                '-cmin -{}'.format(FATAL_TIME_THRESHOLD_MINUTES)))
+                '-mmin -{}'.format(FATAL_TIME_THRESHOLD_MINUTES)))
         output = self._remote_check_output(remote_cmd)
         if has_errors(output):
             return e.fill_and_return_entry([output], True)
@@ -283,7 +319,7 @@ class NodeChecker():
         e = self._new_entry("Core files")
         remote_cmd = 'if [ -d {} ]; then find {} {} -name "core_*"; fi'.format(
             YB_CORES_DIR, YB_CORES_DIR,
-            '-cmin -{}'.format(FATAL_TIME_THRESHOLD_MINUTES))
+            '-mmin -{}'.format(FATAL_TIME_THRESHOLD_MINUTES))
         output = self._remote_check_output(remote_cmd)
         if has_errors(output):
             return e.fill_and_return_entry([output], True)
@@ -356,16 +392,25 @@ class NodeChecker():
         e = self._new_entry("Connectivity with cqlsh")
 
         cqlsh = '{}/bin/cqlsh'.format(YB_TSERVER_DIR)
-        remote_cmd = '{} {} -e "SHOW HOST"'.format(cqlsh, self.node)
+        remote_cmd = '{} {} {} -e "SHOW HOST"'.format(cqlsh, self.node, self.ycql_port)
         if self.enable_tls_client:
             cert_file = K8S_CERT_FILE_PATH if self.is_k8s else VM_CERT_FILE_PATH
+            protocols = re.split('\\W+', self.ssl_protocol or "")
+            ssl_version = DEFAULT_SSL_VERSION
+            for protocol in protocols:
+                cur_version = SSL_PROTOCOL_TO_SSL_VERSION.get(protocol)
+                if cur_version is not None:
+                    ssl_version = cur_version
+                    break
 
-            remote_cmd = 'SSL_CERTFILE={} {} {}'.format(cert_file, remote_cmd, '--ssl')
+            remote_cmd = 'SSL_VERSION={} SSL_CERTFILE={} {} {}'.format(
+                ssl_version, cert_file, remote_cmd, '--ssl')
 
         output = self._remote_check_output(remote_cmd).strip()
 
         errors = []
-        if not (output.startswith('Connected to local cluster at {}:9042'.format(self.node)) or
+        if not ('Connected to local cluster at {}:{}'
+                .format(self.node, self.ycql_port) in output or
                 "AuthenticationFailed('Remote end requires authentication.'" in output):
             errors = [output]
         return e.fill_and_return_entry(errors, len(errors) > 0)
@@ -374,7 +419,7 @@ class NodeChecker():
         logging.info("Checking redis cli works for node {}".format(self.node))
         e = self._new_entry("Connectivity with redis-cli")
         redis_cli = '{}/bin/redis-cli'.format(YB_TSERVER_DIR)
-        remote_cmd = 'echo "ping" | {} -h {}'.format(redis_cli, self.node)
+        remote_cmd = 'echo "ping" | {} -h {} -p {}'.format(redis_cli, self.node, self.redis_port)
 
         output = self._remote_check_output(remote_cmd).strip()
 
@@ -384,25 +429,77 @@ class NodeChecker():
 
         return e.fill_and_return_entry(errors, len(errors) > 0)
 
-    def check_psql(self):
-        logging.info("Checking psql works for node {}".format(self.node))
-        e = self._new_entry("Connectivity with psql")
+    def check_ysqlsh(self):
+        logging.info("Checking ysqlsh works for node {}".format(self.node))
+        e = self._new_entry("Connectivity with ysqlsh")
 
-        psql = '{}/bin/psql'.format(YB_TSERVER_DIR)
-        if not self.enable_tls_client:
-            user = "postgres"
-            remote_cmd = r'echo "\conninfo" | {} -h {} -p {} -U {}'.format(
-                psql, self.node, self.ysql_port, user)
-        else:
-            user = "yugabyte"
-            remote_cmd = r'echo "\conninfo" | {} -h {} -p {} -U {} {}'.format(
-                psql, self.node, self.ysql_port, user, '"sslmode=require"')
-
+        ysqlsh = '{}/bin/ysqlsh'.format(YB_TSERVER_DIR)
+        port_args = "-p {}".format(self.ysql_port)
+        host = self.node
         errors = []
+        # If YSQL-auth is enabled, we'll try connecting over the UNIX domain socket in the hopes
+        # that we can circumvent md5 authentication (assumption made:
+        # "local all yugabyte trust" is in the hba file)
+        if self.enable_ysql_auth:
+            socket_fds_output = self._remote_check_output("ls /tmp/.yb.*/.s.PGSQL.*").strip()
+            socket_fds = socket_fds_output.split()
+            if ("Error" not in socket_fds_output) and len(socket_fds):
+                host = os.path.dirname(socket_fds[0])
+                port_args = ""
+            else:
+                errors = ["Could not find local socket"]
+                return e.fill_and_return_entry(errors, True)
+
+        if not self.enable_tls_client:
+            remote_cmd = "{} -h {} {} -U yugabyte -c \"\conninfo\"".format(
+                ysqlsh, host, port_args)
+        else:
+            remote_cmd = "{} -h {} {} -U yugabyte {} -c \"\conninfo\"".format(
+                ysqlsh, host, port_args, '"sslmode=require"')
+
         output = self._remote_check_output(remote_cmd).strip()
-        if not (output.startswith('You are connected to database "{}"'.format(user)) or
-                "Password for user {}:".format(user)):
+        if not (output.startswith('You are connected to database')):
             errors = [output]
+        return e.fill_and_return_entry(errors, len(errors) > 0)
+
+    def check_clock_skew(self):
+        logging.info("Checking clock synchronization on node {}".format(self.node))
+        e = self._new_entry("Clock synchronization")
+        errors = []
+
+        remote_cmd = "timedatectl status"
+        output = self._remote_check_output(remote_cmd).strip()
+
+        clock_re = re.match(r'((.|\n)*)((NTP enabled: )|(NTP service: )|(Network time on: )|' +
+                            r'(systemd-timesyncd\.service active: ))(.*)$', output, re.MULTILINE)
+        if clock_re:
+            ntp_enabled_answer = clock_re.group(8)
+        else:
+            return e.fill_and_return_entry(["Error getting NTP state - incorrect answer format"],
+                                           True)
+
+        if ntp_enabled_answer not in ("yes", "active"):
+            if ntp_enabled_answer in ("no", "inactive"):
+                return e.fill_and_return_entry(["NTP disabled"], True)
+
+            return e.fill_and_return_entry(["Error getting NTP state {}"
+                                            .format(ntp_enabled_answer)], True)
+
+        clock_re = re.match(r'((.|\n)*)((NTP synchronized: )|(System clock synchronized: ))(.*)$',
+                            output, re.MULTILINE)
+        if clock_re:
+            ntp_synchronized_answer = clock_re.group(6)
+        else:
+            return e.fill_and_return_entry([
+                "Error getting NTP synchronization state - incorrect answer format"], True)
+
+        if ntp_synchronized_answer != "yes":
+            if ntp_synchronized_answer == "no":
+                errors = ["NTP desynchronized"]
+            else:
+                errors = ["Error getting NTP synchronization state {}"
+                          .format(ntp_synchronized_answer)]
+
         return e.fill_and_return_entry(errors, len(errors) > 0)
 
 
@@ -416,182 +513,8 @@ def seconds_to_human_readable_time(seconds):
     return ['{} days {:d}:{:02d}:{:02d}'.format(d, h, m, s)]
 
 
-def assemble_mail_row(data, is_first_check, timestamp):
-    ts_span = '''<div style="
-        color:#ffffff;
-        font-size:5px;">{}</div>'''.format(timestamp) if is_first_check else ''
-    process = ''
-    if 'process' in data:
-        process = data['process']
-
-    border_color = 'transparent' if is_first_check else '#e5e5e9'
-
-    def td_element(padding, weight, content): return '''<td style="
-        border-top: 1px solid {};
-        padding:{};
-        {}
-        vertical-align:top;">{}</td>'''.format(border_color, padding, weight, content)
-    badge = ''
-    if data['has_error'] is True:
-        badge = '''<span style="
-            font-size:0.8em;
-            background-color:#E8473F;
-            color:#ffffff;
-            border-radius:2px;
-            margin-right:8px;
-            padding:2px 4px;
-            font-weight:400;">Failed</span>'''
-
-    def pre_element(content): return '''<pre style="
-        background-color:#f7f7f7;
-        border: 1px solid #e5e5e9;
-        padding:10px;
-        white-space: pre-wrap;
-        border-radius:5px;">{}</pre>'''.format(content)
-
-    details_content_ok = '<div style="padding:11px 0;">Ok</div>'
-    dat_det = data['details']
-    details_content = details_content_ok if dat_det == [] else pre_element(
-        '\n'.join(dat_det) if data['message'] == 'Disk utilization' else ' '.join(dat_det))
-    return '<tr>{}{}{}</tr>'.format(
-        td_element(
-            '10px 20px 10px 0',
-            'font-weight:700;font-size:1.2em;',
-            badge+data['message']+ts_span),
-        td_element('10px 20px 10px 0', '', process),
-        td_element('0', '', details_content))
-
-
-def send_mail(report, subject, destination, nodes, universe_name, report_only_errors):
-    logging.info("Sending email: '{}' to '{}'".format(subject, destination))
-    style_font = "font-family: SF Pro Display, SF Pro, Helvetica Neue, Helvetica, sans-serif;"
-    json_object = json.loads(str(report))
-
-    def make_subtitle(content):
-        return '<span style="color:#8D8F9D;font-weight:400;">{}:</span>'.format(content)
-
-    email_content_data = []
-
-    for node in nodes:
-        node_has_error = False
-        is_first_check = True
-        node_content_data = []
-        for node_check_data_row in json_object["data"]:
-            if node == node_check_data_row["node"]:
-                if node_check_data_row["has_error"]:
-                    node_has_error = True
-                elif report_only_errors:
-                    continue
-                node_content_data.append(assemble_mail_row(
-                    node_check_data_row,
-                    is_first_check,
-                    json_object["timestamp"])
-                )
-                is_first_check = False
-
-        if report_only_errors and not node_has_error:
-            continue
-
-        node_header_style_colors_color = '#ffffff;' if node_has_error else '#289b42;'
-        node_header_style_colors_back = '#E8473F;' if node_has_error else '#ffffff'
-        node_header_style_colors = 'background-color:{};color:{}'.format(
-            node_header_style_colors_back, node_header_style_colors_color)
-        badge_caption = 'Error' if node_has_error else 'Running fine'
-
-        def th_element(style, content): return '<th style="{}">{}</th>'.format(style, content)
-
-        def tr_element(content): return '''<tr style="
-            text-transform:uppercase;
-            font-weight:500;">{}</tr>'''.format(content)
-
-        def table_element(content): return '''<table
-            cellspacing="0"
-            style="width:auto;text-align:left;font-size:12px;">{}</table>'''.format(content)
-
-        badge_style = '''style="font-weight:400;
-            margin-left:10px;
-            font-size:0.6em;
-            vertical-align:middle;
-            {}
-            border-radius:4px;
-            padding:2px 6px;"'''.format(node_header_style_colors)
-        node_header_title = str(node)+'<span {}>{}</span>'.format(badge_style, badge_caption)
-        h2_style = '''font-weight:700;
-            line-height:1em;
-            color:#202951;
-            font-size:2.5em;
-            margin:0;{}'''.format(style_font)
-        node_header = '{}<h2 style="{}">{}</h2>'.format(
-            make_subtitle('Cluster'), h2_style, node_header_title)
-        table_container_style = '''background-color:#ffffff;
-            padding:15px 20px 7px;
-            border-radius:10px;
-            margin-top:30px;
-            margin-bottom:50px;'''
-
-        def table_container(content): return table_element(
-            tr_element(
-                th_element('width:15%;padding:0 30px 10px 0;', 'Check type') +
-                th_element('width:15%;white-space:nowrap;padding:0 30px 10px 0;', 'Details') +
-                th_element('', '')) +
-            content)
-        email_content_data.append('{}<div style="{}">{}</div>'.format(
-            node_header,
-            table_container_style,
-            table_container(''.join(node_content_data))))
-
-    if not email_content_data:
-        email_content_data = "<b>No errors to report.</b>"
-    sender = EMAIL_FROM
-    msg = MIMEMultipart('alternative')
-    msg['Subject'] = subject
-    msg['From'] = sender
-    # TODO(bogdan): AWS recommends doing one sendmail per address:
-    # https://docs.aws.amazon.com/ses/latest/DeveloperGuide/manage-sending-limits.html
-    msg['To'] = destination
-    style = "{}font-size: 14px;background-color:#f7f7f7;padding:25px 30px 5px;".format(style_font)
-    # add timestamp to avoid gmail collapsing
-    timestamp = '<span style="color:black;font-size:10px;">{}</span>'.format(
-        json_object["timestamp"])
-
-    def make_header_left(title, content):
-        return '''{}<h1 style="
-            {}
-            line-height:1em;
-            color:#202951;
-            font-weight:700;
-            font-size:1.85em;
-            padding-bottom:15px;
-            margin:0;">{}</h1>'''.format(make_subtitle(title), style_font, content)
-    header = '''<table width="100%">
-        <tr>
-            <td style="text-align:left">{name}</td>
-            <td style="text-align:right">{ts}</td>
-        </tr>
-        <tr>
-            <td style="text-align:left">{version}</td>
-        </tr>
-    </table>'''.format(
-        name=make_header_left("Universe name", universe_name),
-        ts=timestamp,
-        version=make_header_left("Universe version", report.yb_version))
-    body = '<html><body><pre style="{}">{}\n{} {}</pre></body></html>\n'.format(
-        style, header, ''.join(email_content_data), timestamp)
-
-    msg.attach(MIMEText(report.as_json(report_only_errors), 'plain'))
-    # the last part of a multipart MIME message is the preferred part
-    msg.attach(MIMEText(body, 'html'))
-
-    s = smtplib.SMTP_SSL(EMAIL_SERVER, EMAIL_PORT)
-    s.ehlo()
-    s.login(EMAIL_USERNAME, EMAIL_PASSWORD)
-    dest_list = destination.split(',')
-    s.sendmail(sender, dest_list, msg.as_string())
-    s.quit()
-
-
 def local_time():
-    return datetime.utcnow().replace(tzinfo=tz.tzutc()).astimezone(tz.gettz('America/Los_Angeles'))
+    return datetime.utcnow().replace(tzinfo=tz.tzutc())
 
 
 ###################################################################################################
@@ -611,7 +534,10 @@ class CheckCoordinator:
     class CheckRunInfo:
         def __init__(self, instance, func_name, yb_process):
             self.instance = instance
-            self.func_name = func_name
+            if PY3:
+                self.__name__ = func_name
+            else:
+                self.func_name = func_name
             self.yb_process = yb_process
             self.result = None
             self.entry = None
@@ -638,19 +564,20 @@ class CheckCoordinator:
                     checks_remaining += 1
                     sleep_interval = self.retry_interval_secs if check.tries > 0 else 0
 
+                    check_func_name = check.__name__ if PY3 else check.func_name
                     if check.tries > 0:
                         logging.info("Retry # " + str(check.tries) +
-                                     " for check " + check.func_name)
+                                     " for check " + check_func_name)
 
                     if check.yb_process is None:
                         check.result = self.pool.apply_async(
                                             multithreaded_caller,
-                                            (check.instance, check.func_name, sleep_interval))
+                                            (check.instance, check_func_name, sleep_interval))
                     else:
                         check.result = self.pool.apply_async(
                                             multithreaded_caller,
                                             (check.instance,
-                                                check.func_name,
+                                                check_func_name,
                                                 sleep_interval,
                                                 (check.yb_process,)))
 
@@ -675,8 +602,13 @@ class Cluster():
         self.tserver_nodes = data["tserverNodes"]
         self.yb_version = data["ybSoftwareVersion"]
         self.namespace_to_config = data["namespaceToConfig"]
+        self.ssl_protocol = data["sslProtocol"]
         self.enable_ysql = data["enableYSQL"]
         self.ysql_port = data["ysqlPort"]
+        self.ycql_port = data["ycqlPort"]
+        self.enable_yedis = data["enableYEDIS"]
+        self.redis_port = data["redisPort"]
+        self.enable_ysql_auth = data["enableYSQLAuth"]
 
 
 class UniverseDefinition():
@@ -687,83 +619,72 @@ class UniverseDefinition():
 
 def main():
     parser = argparse.ArgumentParser(prog=sys.argv[0])
-    parser.add_argument('--cluster_payload', type=str, default=None, required=True,
+    parser.add_argument('--cluster_payload', type=str, default=None, required=False,
                         help='JSON serialized payload of cluster data: IPs, pem files, etc.')
-    parser.add_argument('--ssh_port', type=str, default='22',
-                        help='SSH server port number')
-    parser.add_argument('--universe_name', type=str, default=None, required=True,
-                        help='Universe name to use in the email report')
-    parser.add_argument('--customer_tag', type=str, default=None,
-                        help='Customer name/env info to use in the email report')
-    parser.add_argument('--destination', type=str, default=None, required=False,
-                        help='CSV of email addresses to send the report to')
+    # TODO (Sergey P.): extract the next functionality to Java layer
     parser.add_argument('--log_file', type=str, default=None, required=False,
-                        help='Log file to which the report will be written to')
-    parser.add_argument('--send_status', action="store_true",
-                        help='Send email even if no errors')
+                        help='Log file to which the report will be written to.')
     parser.add_argument('--start_time_ms', type=int, required=False, default=None,
                         help='Potential start time of the universe, to prevent uptime confusion.')
     parser.add_argument('--retry_interval_secs', type=int, required=False, default=30,
-                        help='Time to wait between retries of failed checks')
-    parser.add_argument('--report_only_errors', action="store_true",
-                        help='Only report nodes with errors')
+                        help='Time to wait between retries of failed checks.')
+    parser.add_argument('--check_clock', action="store_true",
+                        help='Include NTP synchronization check into actions.')
     args = parser.parse_args()
-    universe = UniverseDefinition(args.cluster_payload)
-    # Technically, each cluster can have its own version, but in practice, we disallow that in YW.
-    universe_version = universe.clusters[0].yb_version if universe.clusters else None
-    report = Report(universe_version)
-    coordinator = CheckCoordinator(args.retry_interval_secs)
-    summary_nodes = []
-    for c in universe.clusters:
-        master_nodes = c.master_nodes
-        tserver_nodes = c.tserver_nodes
-        all_nodes = set(master_nodes + tserver_nodes)
-        summary_nodes += all_nodes
-        for node in all_nodes:
-            checker = NodeChecker(
-                    node, c.identity_file, c.ssh_port,
-                    args.start_time_ms, c.namespace_to_config, c.ysql_port,
-                    c.enable_tls_client)
-            # TODO: use paramiko to establish ssh connection to the nodes.
-            if node in master_nodes:
-                coordinator.add_check(
-                    checker, "check_uptime_for_process", "yb-master")
-                coordinator.add_check(checker, "check_for_fatal_logs", "yb-master")
-            if node in tserver_nodes:
-                coordinator.add_check(
-                    checker, "check_uptime_for_process", "yb-tserver")
-                coordinator.add_check(checker, "check_for_fatal_logs", "yb-tserver")
-                # Only need to check redis-cli/cqlsh for tserver nodes, to be docker/k8s friendly.
-                coordinator.add_check(checker, "check_cqlsh")
-                coordinator.add_check(checker, "check_redis_cli")
-                # TODO: Enable check after addressing issue #1845.
-                if c.enable_ysql:
-                    coordinator.add_check(checker, "check_psql")
-            coordinator.add_check(checker, "check_disk_utilization")
-            coordinator.add_check(checker, "check_for_core_files")
-            coordinator.add_check(checker, "check_file_descriptors")
+    if args.cluster_payload is not None:
+        universe = UniverseDefinition(args.cluster_payload)
+        coordinator = CheckCoordinator(args.retry_interval_secs)
+        summary_nodes = {}
+        # Technically, each cluster can have its own version, but in practice,
+        # we disallow that in YW.
+        universe_version = universe.clusters[0].yb_version if universe.clusters else None
+        report = Report(universe_version)
+        for c in universe.clusters:
+            master_nodes = c.master_nodes
+            tserver_nodes = c.tserver_nodes
+            all_nodes = dict(master_nodes)
+            all_nodes.update(dict(tserver_nodes))
+            summary_nodes.update(dict(all_nodes))
+            for (node, node_name) in all_nodes.items():
+                checker = NodeChecker(
+                        node, node_name, c.identity_file, c.ssh_port,
+                        args.start_time_ms, c.namespace_to_config, c.ysql_port,
+                        c.ycql_port, c.redis_port, c.enable_tls_client, c.ssl_protocol,
+                        c.enable_ysql_auth)
+                # TODO: use paramiko to establish ssh connection to the nodes.
+                if node in master_nodes:
+                    coordinator.add_check(
+                        checker, "check_uptime_for_process", "yb-master")
+                    coordinator.add_check(checker, "check_for_fatal_logs", "yb-master")
+                if node in tserver_nodes:
+                    coordinator.add_check(
+                        checker, "check_uptime_for_process", "yb-tserver")
+                    coordinator.add_check(checker, "check_for_fatal_logs", "yb-tserver")
+                    # Only need to check redis-cli/cqlsh for tserver nodes
+                    # to be docker/k8s friendly.
+                    coordinator.add_check(checker, "check_cqlsh")
+                    if c.enable_yedis:
+                        coordinator.add_check(checker, "check_redis_cli")
+                    # TODO: Enable check after addressing issue #1845.
+                    if c.enable_ysql:
+                        coordinator.add_check(checker, "check_ysqlsh")
+                coordinator.add_check(checker, "check_disk_utilization")
+                coordinator.add_check(checker, "check_for_core_files")
+                coordinator.add_check(checker, "check_file_descriptors")
+                if args.check_clock:
+                    coordinator.add_check(checker, "check_clock_skew")
 
-    entries = coordinator.run()
-    for e in entries:
-        report.add_entry(e)
+        entries = coordinator.run()
+        for e in entries:
+            report.add_entry(e)
 
-    state = "ERROR" if report.has_errors() else "OK"
-    subject = "{} - <{}> {}".format(state, args.customer_tag, args.universe_name)
-    # If we have errors or were asked to send email with status update, then send the email.
-    #
-    # NOTE: We only send emails if we are provided a destination, which can be a CSV of addresses.
-    if args.destination and (args.send_status or report.has_errors()):
-        try:
-            send_mail(
-                report, subject, args.destination, summary_nodes,
-                args.universe_name, args.report_only_errors
-            )
-        except Exception as e:
-            logging.error("Sending email failed with: {}".format(str(e)))
-    report.write_to_log(args.log_file)
+        report.write_to_log(args.log_file)
 
-    # Write to stdout to be caught by YW subprocess.
-    print(report)
+        # Write to stdout to be caught by YW subprocess.
+        print(report)
+    else:
+        logging.error("Invalid argument combination")
+        sys.exit(1)
 
 
 if __name__ == '__main__':

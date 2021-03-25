@@ -39,6 +39,8 @@ TEST_F(PggateTestCatalog, TestDml) {
                                        kDefaultDatabaseOid, tab_oid,
                                        false /* is_shared_table */, true /* if_not_exist */,
                                        false /* add_primary_key */, true /* colocated */,
+                                       kInvalidOid /* tablegroup_id */,
+                                       kInvalidOid /* tablespace_id */,
                                        &pg_stmt));
   CHECK_YBC_STATUS(YBCTestCreateTableAddColumn(pg_stmt, "company_id", ++col_count,
                                              DataType::INT64, false, true));
@@ -53,7 +55,6 @@ TEST_F(PggateTestCatalog, TestDml) {
   CHECK_YBC_STATUS(YBCTestCreateTableAddColumn(pg_stmt, "job", ++col_count,
                                              DataType::STRING, false, false));
   CHECK_YBC_STATUS(YBCPgExecCreateTable(pg_stmt));
-  CHECK_YBC_STATUS(YBCPgDeleteStatement(pg_stmt));
   pg_stmt = nullptr;
 
   // INSERT ----------------------------------------------------------------------------------------
@@ -105,7 +106,6 @@ TEST_F(PggateTestCatalog, TestDml) {
     YBCPgUpdateConstChar(expr_job, job.c_str(), job.size(), false);
   }
 
-  CHECK_YBC_STATUS(YBCPgDeleteStatement(pg_stmt));
   pg_stmt = nullptr;
 
   // SELECT ----------------------------------------------------------------------------------------
@@ -174,7 +174,6 @@ TEST_F(PggateTestCatalog, TestDml) {
   YBCPgDmlFetch(pg_stmt, col_count, values, isnulls, nullptr, &has_data);
   CHECK(!has_data);
 
-  CHECK_YBC_STATUS(YBCPgDeleteStatement(pg_stmt));
   pg_stmt = nullptr;
 
   // SELECT ----------------------------------------------------------------------------------------
@@ -233,7 +232,6 @@ TEST_F(PggateTestCatalog, TestDml) {
     CHECK_EQ(selected_job_name, expected_job_name);
   }
 
-  CHECK_YBC_STATUS(YBCPgDeleteStatement(pg_stmt));
   pg_stmt = nullptr;
 
   // UPDATE ----------------------------------------------------------------------------------------
@@ -285,7 +283,6 @@ TEST_F(PggateTestCatalog, TestDml) {
     YBCPgUpdateConstChar(expr_job, job.c_str(), job.size(), false);
   }
 
-  CHECK_YBC_STATUS(YBCPgDeleteStatement(pg_stmt));
   pg_stmt = nullptr;
 
   // SELECT ----------------------------------------------------------------------------------------
@@ -365,7 +362,6 @@ TEST_F(PggateTestCatalog, TestDml) {
   }
   CHECK_EQ(select_row_count, kInsertRowCount) << "Unexpected row count";
 
-  CHECK_YBC_STATUS(YBCPgDeleteStatement(pg_stmt));
   pg_stmt = nullptr;
 }
 
@@ -384,11 +380,12 @@ TEST_F(PggateTestCatalog, TestCopydb) {
                                        kDefaultDatabaseOid, tab_oid,
                                        false /* is_shared_table */, true /* if_not_exist */,
                                        false /* add_primary_key */, true /* colocated */,
+                                       kInvalidOid /* tablegroup_id */,
+                                       kInvalidOid /* tablespace_id */,
                                        &pg_stmt));
   CHECK_YBC_STATUS(YBCTestCreateTableAddColumn(pg_stmt, "key", 1, DataType::INT32, false, true));
   CHECK_YBC_STATUS(YBCTestCreateTableAddColumn(pg_stmt, "value", 2, DataType::INT32, false, false));
   CHECK_YBC_STATUS(YBCPgExecCreateTable(pg_stmt));
-  CHECK_YBC_STATUS(YBCPgDeleteStatement(pg_stmt));
   pg_stmt = nullptr;
 
   CHECK_YBC_STATUS(YBCPgNewInsert(kDefaultDatabaseOid, tab_oid,
@@ -410,7 +407,6 @@ TEST_F(PggateTestCatalog, TestCopydb) {
     YBCPgUpdateConstInt4(expr_key, i+1, false);
     YBCPgUpdateConstInt4(expr_value, i+11, false);
   }
-  CHECK_YBC_STATUS(YBCPgDeleteStatement(pg_stmt));
   pg_stmt = nullptr;
 
   // COPYDB ----------------------------------------------------------------------------------------
@@ -420,7 +416,6 @@ TEST_F(PggateTestCatalog, TestCopydb) {
                                           false /* colocated */,
                                           &pg_stmt));
   CHECK_YBC_STATUS(YBCPgExecCreateDatabase(pg_stmt));
-  CHECK_YBC_STATUS(YBCPgDeleteStatement(pg_stmt));
   pg_stmt = nullptr;
 
   // SELECT ----------------------------------------------------------------------------------------
@@ -454,7 +449,6 @@ TEST_F(PggateTestCatalog, TestCopydb) {
     EXPECT_EQ(values[1], i + 10);  // value : int32
   }
 
-  CHECK_YBC_STATUS(YBCPgDeleteStatement(pg_stmt));
   pg_stmt = nullptr;
 }
 
@@ -471,7 +465,6 @@ TEST_F(PggateTestCatalog, TestReserveOids) {
                                           kInvalidOid /* source_database_oid */,
                                           100 /* next_oid */, false /* colocated */, &pg_stmt));
   CHECK_YBC_STATUS(YBCPgExecCreateDatabase(pg_stmt));
-  CHECK_YBC_STATUS(YBCPgDeleteStatement(pg_stmt));
   pg_stmt = nullptr;
 
   // RESERVE OIDS ---------------------------------------------------------------------------------

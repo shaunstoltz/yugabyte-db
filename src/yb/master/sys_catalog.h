@@ -88,7 +88,8 @@ class SysCatalogTable {
   ~SysCatalogTable();
 
   // Allow for orderly shutdown of tablet peer, etc.
-  void Shutdown();
+  void StartShutdown();
+  void CompleteShutdown();
 
   // Load the Metadata from disk, and initialize the TabletPeer for the sys-table
   CHECKED_STATUS Load(FsManager *fs_manager);
@@ -156,6 +157,27 @@ class SysCatalogTable {
 
   CHECKED_STATUS Visit(VisitorBase* visitor);
 
+  // Read the ysql catalog version info from the pg_yb_catalog_version catalog table.
+  Status ReadYsqlCatalogVersion(TableId ysql_catalog_table_id,
+                                uint64_t *catalog_version,
+                                uint64_t *last_breaking_version);
+
+  // Read the pg_class catalog table. There is a separate pg_class table in each
+  // YSQL database, read the information in the pg_class table for the database
+  // 'database_oid' and load this information into 'table_to_tablespace_map'.
+  Status ReadPgClassInfo(
+      const uint32_t database_oid,
+      TableToTablespaceIdMap *table_to_tablespace_map);
+
+  // Read the pg_tablespace catalog table and return a map with all the tablespaces and their
+  // respective placement information.
+  Result<std::shared_ptr<TablespaceIdToReplicationInfoMap>> ReadPgTablespaceInfo();
+
+  // Parse the binary value present in ql_value into ReplicationInfoPB.
+  Result<boost::optional<ReplicationInfoPB>> ParseReplicationInfo(
+      const TablespaceId& tablespace_id,
+      const vector<QLValuePB>& options);
+
   // Copy the content of co-located tables in sys catalog as a batch.
   CHECKED_STATUS CopyPgsqlTables(const std::vector<TableId>& source_table_ids,
                                  const std::vector<TableId>& target_table_ids,
@@ -164,7 +186,9 @@ class SysCatalogTable {
   // Drop YSQL table by removing the table metadata in sys-catalog.
   CHECKED_STATUS DeleteYsqlSystemTable(const string& table_id);
 
-  Result<ColumnId> MetadataColumnId();
+  const Schema& schema();
+
+  const scoped_refptr<MetricEntity>& GetMetricEntity() const { return metric_entity_; }
 
  private:
   friend class CatalogManager;
@@ -215,11 +239,8 @@ class SysCatalogTable {
   // Crashes due to an invariant check if the rpc server is not running.
   void InitLocalRaftPeerPB();
 
-  // Table schema, without IDs, used to send messages to the TabletPeer
-  Schema schema_;
-
   // Table schema, with IDs, used for the YQL write path.
-  Schema schema_with_ids_;
+  Schema schema_;
 
   MetricRegistry* metric_registry_;
 
@@ -236,6 +257,8 @@ class SysCatalogTable {
   // Thread pool for appender tasks
   gscoped_ptr<ThreadPool> append_pool_;
 
+  std::unique_ptr<ThreadPool> allocation_pool_;
+
   std::shared_ptr<tablet::TabletPeer> tablet_peer_;
 
   Master* master_;
@@ -245,6 +268,8 @@ class SysCatalogTable {
   consensus::RaftPeerPB local_peer_pb_;
 
   scoped_refptr<Histogram> setup_config_dns_histogram_;
+
+  scoped_refptr<Counter> peer_write_count;
 
   std::unordered_map<std::string, scoped_refptr<AtomicGauge<uint64>>> visitor_duration_metrics_;
 

@@ -50,7 +50,7 @@ void SetupClusterConfigEnt(const vector<string>& az_list,
                            const vector<string>& affinitized_leader_list,
                            ReplicationInfoPB* replication_info) {
   PlacementInfoPB* placement_info = replication_info->mutable_live_replicas();
-  placement_info->set_num_replicas(kNumReplicas);
+  placement_info->set_num_replicas(kDefaultNumReplicas);
 
   for (const string& az : az_list) {
     auto pb = placement_info->add_placement_blocks();
@@ -119,7 +119,7 @@ class TestLoadBalancerEnterprise : public TestLoadBalancerBase<ClusterLoadBalanc
   void TestAlreadyBalancedAffinitizedLeaders() {
     LOG(INFO) << "Starting TestAlreadyBalancedAffinitizedLeaders";
     // Move all leaders to ts0.
-    for (const auto tablet : tablets_) {
+    for (const auto& tablet : tablets_) {
       MoveTabletLeader(tablet.get(), ts_descs_[0]);
     }
     LOG(INFO) << "Leader distribution: 4 0 0";
@@ -134,7 +134,7 @@ class TestLoadBalancerEnterprise : public TestLoadBalancerBase<ClusterLoadBalanc
   void TestBalancingOneAffinitizedLeader() {
     LOG(INFO) << "Starting TestBalancingOneAffinitizedLeader";
     int i = 0;
-    for (const auto tablet : tablets_) {
+    for (const auto& tablet : tablets_) {
       MoveTabletLeader(tablet.get(), ts_descs_[(i % 2) + 1]);
       i++;
     }
@@ -194,7 +194,7 @@ class TestLoadBalancerEnterprise : public TestLoadBalancerBase<ClusterLoadBalanc
   void TestBalancingTwoAffinitizedLeaders() {
     LOG(INFO) << "Starting TestBalancingTwoAffinitizedLeaders";
 
-    for (const auto tablet : tablets_) {
+    for (const auto& tablet : tablets_) {
       MoveTabletLeader(tablet.get(), ts_descs_[0]);
     }
     LOG(INFO) << "Leader distribution: 4 0 0";
@@ -262,7 +262,7 @@ class TestLoadBalancerEnterprise : public TestLoadBalancerBase<ClusterLoadBalanc
     ts_descs_.push_back(SetupTSEnt("4444", "a", read_only_placement_uuid /* placement_uuid */));
 
     // Adding all read_only replicas.
-    for (const auto tablet : tablets_) {
+    for (const auto& tablet : tablets_) {
       AddRunningReplicaEnt(tablet.get(), ts_descs_[3], false /* is live */);
     }
 
@@ -307,7 +307,7 @@ class TestLoadBalancerEnterprise : public TestLoadBalancerBase<ClusterLoadBalanc
     ts_descs_.push_back(SetupTSEnt("3333", "a", read_only_placement_uuid));
 
     // Adding all read_only replicas.
-    for (const auto tablet : tablets_) {
+    for (const auto& tablet : tablets_) {
       AddRunningReplicaEnt(tablet.get(), ts_descs_[3], false /* is live */);
     }
 
@@ -335,15 +335,15 @@ class TestLoadBalancerEnterprise : public TestLoadBalancerBase<ClusterLoadBalanc
 
   void AddRunningReplicaEnt(TabletInfo* tablet, std::shared_ptr<yb::master::TSDescriptor> ts_desc,
                             bool is_live) {
-    TabletInfo::ReplicaMap replicas;
-    tablet->GetReplicaLocations(&replicas);
+    std::shared_ptr<TabletInfo::ReplicaMap> replicas =
+      std::const_pointer_cast<TabletInfo::ReplicaMap>(tablet->GetReplicaLocations());
 
     TabletReplica replica;
     consensus::RaftPeerPB::Role role = is_live ?
         consensus::RaftPeerPB::FOLLOWER :
         consensus::RaftPeerPB::LEARNER;
     NewReplica(ts_desc.get(), tablet::RaftGroupStatePB::RUNNING, role, &replica);
-    InsertOrDie(&replicas, ts_desc->permanent_uuid(), replica);
+    InsertOrDie(replicas.get(), ts_desc->permanent_uuid(), replica);
     tablet->SetReplicaLocations(replicas);
   }
 };
@@ -358,6 +358,7 @@ TEST(TestLoadBalancerEnterprise, TestLoadBalancerAlgorithm) {
 
 
 TEST(TestCatalogManagerEnterprise, TestLeaderLoadBalancedAffinitizedLeaders) {
+  // Note that this is essentially using transaction_tables_use_preferred_zones = true
   ReplicationInfoPB replication_info;
   SetupClusterConfigEnt({"a", "b", "c"} /* az list */, {} /* read only */,
                         {"a"} /* affinitized leaders */, &replication_info);
@@ -392,6 +393,7 @@ TEST(TestCatalogManagerEnterprise, TestLeaderLoadBalancedAffinitizedLeaders) {
 }
 
 TEST(TestCatalogManagerEnterprise, TestLeaderLoadBalancedReadOnly) {
+  // Note that this is essentially using transaction_tables_use_preferred_zones = true
   ReplicationInfoPB replication_info;
   SetupClusterConfigEnt({"a", "b", "c"} /* az list */, {"d"} /* read only */,
                         {} /* affinitized leaders */, &replication_info);

@@ -33,6 +33,7 @@
 #include "yb/util/decimal.h"
 #include "yb/util/timestamp.h"
 #include "yb/util/algorithm_util.h"
+#include "yb/util/strongly_typed_bool.h"
 
 namespace yb {
 namespace docdb {
@@ -40,7 +41,11 @@ namespace docdb {
 // Used for extending a list.
 // PREPEND prepends the arguments one by one (PREPEND a b c) will prepend [c b a] to the list,
 // while PREPEND_BLOCK prepends the arguments together, so it will prepend [a b c] to the list.
-  YB_DEFINE_ENUM(ListExtendOrder, (APPEND)(PREPEND_BLOCK)(PREPEND))
+YB_DEFINE_ENUM(ListExtendOrder, (APPEND)(PREPEND_BLOCK)(PREPEND))
+
+// Automatically decode keys that are stored in string-typed PrimitiveValues when converting a
+// PrimitiveValue to string. This is useful when displaying write batches for secondary indexes.
+YB_STRONGLY_TYPED_BOOL(AutoDecodeKeys);
 
 // A necessary use of a forward declaration to avoid circular inclusion.
 class SubDocument;
@@ -107,6 +112,15 @@ class PrimitiveValue {
     this->~PrimitiveValue();
     MoveFrom(&other);
     return *this;
+  }
+
+  explicit PrimitiveValue(const Slice& s, SortOrder sort_order = SortOrder::kAscending) {
+    if (sort_order == SortOrder::kDescending) {
+      type_ = ValueType::kStringDescending;
+    } else {
+      type_ = ValueType::kString;
+    }
+    new(&str_val_) std::string(s.cdata(), s.cend());
   }
 
   explicit PrimitiveValue(const std::string& s, SortOrder sort_order = SortOrder::kAscending) {
@@ -181,6 +195,8 @@ class PrimitiveValue {
     column_id_val_ = column_id;
   }
 
+  static PrimitiveValue NullValue(ColumnSchema::SortingType sorting);
+
   // Converts a ColumnSchema::SortingType to its SortOrder equivalent.
   // ColumnSchema::SortingType::kAscending and ColumnSchema::SortingType::kNotSpecified get
   // converted to SortOrder::kAscending.
@@ -203,7 +219,7 @@ class PrimitiveValue {
   std::string ToValue() const;
 
   // Convert this value to a human-readable string for logging / debugging.
-  std::string ToString() const;
+  std::string ToString(AutoDecodeKeys auto_decode_keys = AutoDecodeKeys::kFalse) const;
 
   ~PrimitiveValue() {
     if (type_ == ValueType::kString || type_ == ValueType::kStringDescending) {

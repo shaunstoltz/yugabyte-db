@@ -13,6 +13,7 @@ package com.yugabyte.yw.commissioner.tasks.subtasks;
 import com.fasterxml.jackson.databind.JsonNode;
 import com.yugabyte.yw.commissioner.AbstractTaskBase;
 import com.yugabyte.yw.common.ShellProcessHandler;
+import com.yugabyte.yw.common.ShellResponse;
 import com.yugabyte.yw.common.TableManager;
 import com.yugabyte.yw.forms.BackupTableParams;
 import com.yugabyte.yw.forms.ITaskParams;
@@ -26,7 +27,7 @@ import java.util.Map;
 
 public class BackupTable extends AbstractTaskBase {
 
-  Backup backup = null;
+  Backup backup;
 
   public BackupTable(Backup backup) {
     this.backup = backup;
@@ -50,19 +51,36 @@ public class BackupTable extends AbstractTaskBase {
     if (backup == null) {
       backup = Backup.fetchByTaskUUID(userTaskUUID);
     }
+
     try {
       Universe universe = Universe.get(taskParams().universeUUID);
       Map<String, String> config = universe.getConfig();
       if (config.isEmpty() || config.getOrDefault(Universe.TAKE_BACKUPS, "true").equals("true")) {
-        ShellProcessHandler.ShellResponse response = tableManager.createBackup(taskParams());
-        JsonNode jsonNode = Json.parse(response.message);
-        if (response.code != 0 || jsonNode.has("error")) {
-          LOG.error("Response code={}, hasError={}.", response.code, jsonNode.has("error"));
-          backup.transitionState(Backup.BackupState.Failed);
-          throw new RuntimeException(response.message);
-        } else {
-          LOG.info("[" + getName() + "] STDOUT: " + response.message);
+        if (taskParams().backupList != null) {
+          for (BackupTableParams backupParams : taskParams().backupList) {
+            ShellResponse response = tableManager.createBackup(backupParams);
+            JsonNode jsonNode = Json.parse(response.message);
+            if (response.code != 0 || jsonNode.has("error")) {
+              LOG.error("Response code={}, hasError={}.", response.code, jsonNode.has("error"));
+
+              throw new RuntimeException(response.message);
+            } else {
+              LOG.info("[" + getName() + "] STDOUT: " + response.message);
+            }
+          }
+
           backup.transitionState(Backup.BackupState.Completed);
+        } else {
+          ShellResponse response = tableManager.createBackup(taskParams());
+          JsonNode jsonNode = Json.parse(response.message);
+          if (response.code != 0 || jsonNode.has("error")) {
+            LOG.error("Response code={}, hasError={}.", response.code, jsonNode.has("error"));
+            backup.transitionState(Backup.BackupState.Failed);
+            throw new RuntimeException(response.message);
+          } else {
+            LOG.info("[" + getName() + "] STDOUT: " + response.message);
+            backup.transitionState(Backup.BackupState.Completed);
+          }
         }
       } else {
         LOG.info("Skipping table {}:{}", taskParams().keyspace, taskParams().tableName);

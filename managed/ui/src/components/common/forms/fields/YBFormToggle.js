@@ -2,12 +2,11 @@
 
 import React, { Component } from 'react';
 import Toggle from 'react-toggle';
-import { YBLabel, DescriptionItem } from 'components/common/descriptors';
+import { YBLabel, DescriptionItem } from '../../../../components/common/descriptors';
 import 'react-toggle/style.css';
 import './stylesheets/YBToggle.scss';
 
 export default class YBFormToggle extends Component {
-
   render() {
     const {
       label,
@@ -25,10 +24,21 @@ export default class YBFormToggle extends Component {
       }
     };
     return (
-      <YBLabel label={label} meta={meta} insetError={insetError} infoContent={infoContent} infoTitle={infoTitle}>
+      <YBLabel
+        label={label}
+        meta={meta}
+        insetError={insetError}
+        infoContent={infoContent}
+        infoTitle={infoTitle}
+      >
         <DescriptionItem title={subLabel}>
-          <Toggle checked={field.value} name={field.name} className="yb-toggle" onChange={onChange}
-                  disabled={isReadOnly} />
+          <Toggle
+            checked={field.value}
+            name={field.name}
+            className="yb-toggle"
+            onChange={onChange}
+            disabled={isReadOnly}
+          />
         </DescriptionItem>
       </YBLabel>
     );

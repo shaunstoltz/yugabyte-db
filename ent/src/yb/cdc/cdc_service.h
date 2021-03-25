@@ -113,6 +113,9 @@ class CDCServiceImpl : public CDCServiceIf {
     return server_metrics_;
   }
 
+  // Returns true if this server has received a GetChanges call.
+  bool CDCEnabled();
+
  private:
   template <class ReqType, class RespType>
   bool CheckOnline(const ReqType* req, RespType* resp, rpc::RpcContext* rpc);
@@ -167,9 +170,17 @@ class CDCServiceImpl : public CDCServiceIf {
 
   void UpdatePeersCdcMinReplicatedIndex(const TabletId& tablet_id, int64_t min_index);
 
+  // Update metrics async_replication_sent_lag_micros and async_replication_committed_lag_micros.
+  // Called periodically default 1s.
+  void UpdateLagMetrics();
+
   // This method is used to read the cdc_state table to find the minimum replicated index for each
-  // tablet and then update the peers' log objects.
-  void ReadCdcMinReplicatedIndexForAllTabletsAndUpdatePeers();
+  // tablet and then update the peers' log objects. Also used to update lag metrics.
+  void UpdatePeersAndMetrics();
+
+  MicrosTime GetLastReplicatedTime(const std::shared_ptr<tablet::TabletPeer>& tablet_peer);
+
+  bool ShouldUpdateLagMetrics(MonoTime time_since_update_metrics);
 
   yb::rpc::Rpcs rpcs_;
 
@@ -247,17 +258,25 @@ class CDCServiceImpl : public CDCServiceIf {
   // CDC service proxy.
   CDCServiceProxyMap cdc_service_map_ GUARDED_BY(mutex_);
 
-  // Thread used to read the cdc_state table and get the minimum checkpoint for each tablet
+  // Thread with a few functions:
+  //
+  // Read the cdc_state table and get the minimum checkpoint for each tablet
   // and then, for each tablet this tserver is a leader, update the log minimum cdc replicated
   // index so we can use this information to correctly keep log files that are needed so we
-  // can continue replicating cdc records. This thread runs periodically to handle leadership
-  // changes. The interval is controlled by flag FLAGS_update_min_cdc_indices_interval_secs.
+  // can continue replicating cdc records. This runs periodically to handle
+  // leadership changes (FLAGS_update_min_cdc_indices_interval_secs).
   // TODO(hector): It would be better to do this update only when a local peer becomes a leader.
-  std::unique_ptr<std::thread> get_minimum_checkpoints_and_update_peers_thread_;
+  //
+  // Periodically update lag metrics (FLAGS_update_metrics_interval_ms).
+  std::unique_ptr<std::thread> update_peers_and_metrics_thread_;
 
   // True when this service is stopped. Used to inform
   // get_minimum_checkpoints_and_update_peers_thread_ that it should exit.
   std::atomic<bool> cdc_service_stopped_{false};
+
+  // True when this service has received a GetChanges request on a valid replication stream.
+  std::atomic<bool> cdc_enabled_{false};
+
 };
 
 }  // namespace cdc

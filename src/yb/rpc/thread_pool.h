@@ -21,6 +21,8 @@
 
 #include "yb/gutil/port.h"
 
+#include "yb/util/tostring.h"
+
 namespace yb {
 
 class Status;
@@ -40,10 +42,44 @@ class ThreadPoolTask {
   ~ThreadPoolTask() {}
 };
 
+template <class F, class Base = ThreadPoolTask>
+class FunctorThreadPoolTask : public Base {
+ public:
+  explicit FunctorThreadPoolTask(const F& f) : f_(f) {}
+  explicit FunctorThreadPoolTask(F&& f) : f_(std::move(f)) {}
+
+  virtual ~FunctorThreadPoolTask() = default;
+
+ private:
+  void Run() override {
+    f_();
+  }
+
+  void Done(const Status& status) override {
+    delete this;
+  }
+
+  F f_;
+};
+
+template <class F>
+FunctorThreadPoolTask<F>* MakeFunctorThreadPoolTask(const F& f) {
+  return new FunctorThreadPoolTask<F>(f);
+}
+
+template <class F>
+FunctorThreadPoolTask<F>* MakeFunctorThreadPoolTask(F&& f) {
+  return new FunctorThreadPoolTask<F>(std::move(f));
+}
+
 struct ThreadPoolOptions {
   std::string name;
   size_t queue_limit;
   size_t max_workers;
+
+  std::string ToString() const {
+    return YB_STRUCT_TO_STRING(name, queue_limit, max_workers);
+  }
 };
 
 class ThreadPool {
@@ -58,12 +94,23 @@ class ThreadPool {
 
   ~ThreadPool();
 
-  ThreadPool(ThreadPool&& rhs);
-  ThreadPool& operator=(ThreadPool&& rhs);
+  ThreadPool(ThreadPool&& rhs) noexcept;
+  ThreadPool& operator=(ThreadPool&& rhs) noexcept;
 
   const ThreadPoolOptions& options() const;
 
   bool Enqueue(ThreadPoolTask* task);
+
+  template <class F>
+  void EnqueueFunctor(const F& f) {
+    Enqueue(MakeFunctorThreadPoolTask(f));
+  }
+
+  template <class F>
+  void EnqueueFunctor(F&& f) {
+    Enqueue(MakeFunctorThreadPoolTask(std::move(f)));
+  }
+
   void Shutdown();
 
   static bool IsCurrentThreadRpcWorker();

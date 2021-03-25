@@ -1,19 +1,18 @@
 ---
-title: jsonb_strip_nulls() and json_strip_nulls() [JSON]
+title: jsonb_strip_nulls() and json_strip_nulls()
 headerTitle: jsonb_strip_nulls and json_strip_nulls
 linkTitle: jsonb_strip_nulls()
-description: Use these JSON functions to find all key-value pairs, at any depth in the hierarchy of the supplied JSON compound value (such a pair can occur only as an element of an object), and return a JSON value where each pair whose value is null has been removed.
-summary: jsonb_strip_nulls() and json_strip_nulls()
+description: Find all key-value pairs in the hierarchy of the supplied JSON compound value and return a JSON value where each null pair has been removed.
 menu:
   latest:
     identifier: jsonb-strip-nulls
-    parent: functions-operators
+    parent: json-functions-operators
     weight: 220
 isTocNested: true
 showAsideToc: true
 ---
 
-**Purpose:** Find all key-value pairs, at any depth in the hierarchy of the supplied JSON compound value (such a pair can occur only as an element of an _object_), and return a JSON value where each pair whose value is null has been removed.
+**Purpose:** Find all key-value pairs at any depth in the hierarchy of the supplied JSON compound value (such a pair can occur only as an element of an _object_), and return a JSON value where each pair whose value is the JSON _null_ has been removed.
 
 **Signature** For the `jsonb` variant:
 
@@ -24,7 +23,7 @@ return value:      jsonb
 
 **Notes:** By definition, these functions leave _null_ values within _arrays_ untouched.
 
-```postgresql
+```plpgsql
 do $body$
 declare
   j constant jsonb :=

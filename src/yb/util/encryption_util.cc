@@ -116,7 +116,7 @@ EncryptionParamsPtr EncryptionParams::NewEncryptionParams() {
   }
   encryption_params->key_size = kDefaultKeySize;
   encryption_params->openssl_compatible_counter_overflow =
-      FLAGS_encryption_use_openssl_compatible_counter_overflow;
+      FLAGS_TEST_encryption_use_openssl_compatible_counter_overflow;
   return encryption_params;
 }
 
@@ -181,9 +181,9 @@ __attribute__((unused)) void NO_THREAD_SAFETY_ANALYSIS LockingCallback(
     crypto_mutexes[n]->unlock();
   }
 }
+
 __attribute__((unused)) void NO_THREAD_SAFETY_ANALYSIS ThreadId(CRYPTO_THREADID *tid) {
-  auto id = Thread::CurrentThreadId();
-  CRYPTO_THREADID_set_numeric(tid, id);
+  CRYPTO_THREADID_set_numeric(tid, Thread::CurrentThreadId());
 }
 
 class OpenSSLInitializer {

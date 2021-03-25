@@ -21,6 +21,7 @@
 
 #include "yb/util/size_literals.h"
 #include "yb/util/env_util.h"
+#include "yb/util/subprocess.h"
 
 #include "yb/yql/cql/ql/util/errcodes.h"
 #include "yb/yql/cql/ql/util/statement_result.h"
@@ -30,6 +31,7 @@
 DECLARE_bool(use_client_to_server_encryption);
 DECLARE_bool(use_node_to_node_encryption);
 DECLARE_bool(allow_insecure_connections);
+DECLARE_bool(node_to_node_encryption_use_client_certificates);
 DECLARE_string(certs_dir);
 
 namespace yb {
@@ -68,7 +70,7 @@ class ExternalMiniClusterSecureTest :
 };
 
 TEST_F(ExternalMiniClusterSecureTest, Simple) {
-  client::KeyValueTableTest::CreateTable(
+  client::kv_table_test::CreateTable(
       client::Transactional::kFalse, CalcNumTablets(3), client_.get(), &table_);
 
   const int32_t kKey = 1;
@@ -76,14 +78,38 @@ TEST_F(ExternalMiniClusterSecureTest, Simple) {
 
   {
     auto session = NewSession();
-    auto op = ASSERT_RESULT(client::KeyValueTableTest::WriteRow(&table_, session, kKey, kValue));
+    auto op = ASSERT_RESULT(client::kv_table_test::WriteRow(
+        &table_, session, kKey, kValue));
     ASSERT_EQ(op->response().status(), QLResponsePB::YQL_STATUS_OK);
   }
 
   {
-    auto value = ASSERT_RESULT(client::KeyValueTableTest::SelectRow(&table_, NewSession(), kKey));
+    auto value = ASSERT_RESULT(client::kv_table_test::SelectRow(
+        &table_, NewSession(), kKey));
     ASSERT_EQ(kValue, value);
   }
+}
+
+class ExternalMiniClusterSecureWithClientCertsTest : public ExternalMiniClusterSecureTest {
+  void SetUp() override {
+    FLAGS_node_to_node_encryption_use_client_certificates = true;
+    ExternalMiniClusterSecureTest::SetUp();
+  }
+};
+
+TEST_F_EX(ExternalMiniClusterSecureTest, YbAdmin, ExternalMiniClusterSecureWithClientCertsTest) {
+  ASSERT_OK(Subprocess::Call(ToStringVector(
+      GetToolPath("yb-admin"), "--master_addresses", cluster_->GetMasterAddresses(),
+      "--certs_dir_name", GetToolPath("../ent/test_certs"),
+      "--client_node_name=127.0.0.100", "list_tables")));
+}
+
+TEST_F_EX(ExternalMiniClusterSecureTest, YbTsCli, ExternalMiniClusterSecureWithClientCertsTest) {
+  ASSERT_OK(Subprocess::Call(ToStringVector(
+      GetToolPath("yb-ts-cli"),
+      "--server_address", cluster_->tablet_server(0)->bound_rpc_addr(),
+      "--certs_dir_name", GetToolPath("../ent/test_certs"),
+      "--client_node_name=127.0.0.100", "list_tablets")));
 }
 
 } // namespace yb

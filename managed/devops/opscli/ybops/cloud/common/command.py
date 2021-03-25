@@ -12,7 +12,8 @@
 from ybops.cloud.common.base import AbstractPerCloudCommand
 from ybops.cloud.common.method import CreateInstancesMethod, ProvisionInstancesMethod, \
     DestroyInstancesMethod, ListInstancesMethod, ConfigureInstancesMethod, \
-    ControlInstanceMethod, AbstractMethod, AccessCreateVaultMethod, InitYSQLMethod
+    ControlInstanceMethod, AbstractMethod, AccessCreateVaultMethod, InitYSQLMethod, \
+    UpdateDiskMethod, CronCheckMethod, AccessEditVaultMethod
 
 
 class InstanceCommand(AbstractPerCloudCommand):
@@ -33,6 +34,8 @@ class InstanceCommand(AbstractPerCloudCommand):
         self.add_method(ListInstancesMethod(self))
         self.add_method(ConfigureInstancesMethod(self))
         self.add_method(InitYSQLMethod(self))
+        self.add_method(UpdateDiskMethod(self))
+        self.add_method(CronCheckMethod(self))
 
 
 class NetworkCommand(AbstractPerCloudCommand):
@@ -59,7 +62,7 @@ class ControlInstanceCommand(AbstractPerCloudCommand):
             }
 
     def add_subcommands(self):
-        for node, commands in self.commands_per_server_type.iteritems():
+        for node, commands in self.commands_per_server_type.items():
             self.add_subcommand(ServerControlInstanceCommand(node, commands))
 
 
@@ -81,6 +84,7 @@ class AccessCommand(AbstractPerCloudCommand):
 
     def add_methods(self):
         self.add_method(AccessCreateVaultMethod(self))
+        self.add_method(AccessEditVaultMethod(self))
 
 
 class QueryCommand(AbstractPerCloudCommand):

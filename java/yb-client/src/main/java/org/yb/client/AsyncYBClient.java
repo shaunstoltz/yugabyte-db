@@ -52,7 +52,9 @@ import com.google.protobuf.Message;
 import com.stumbleupon.async.Callback;
 import com.stumbleupon.async.Deferred;
 
-import org.jboss.netty.buffer.ChannelBuffer;
+import org.bouncycastle.jce.provider.BouncyCastleProvider;
+import org.bouncycastle.util.io.pem.PemObject;
+import org.bouncycastle.util.io.pem.PemReader;
 import org.yb.Common;
 import org.yb.Common.YQLDatabase;
 import org.yb.Schema;
@@ -66,6 +68,7 @@ import org.yb.util.AsyncUtil;
 import org.yb.util.NetUtil;
 import org.yb.util.Pair;
 import org.yb.util.Slice;
+import org.jboss.netty.buffer.ChannelBuffer;
 import org.jboss.netty.channel.ChannelEvent;
 import org.jboss.netty.channel.ChannelStateEvent;
 import org.jboss.netty.channel.DefaultChannelPipeline;
@@ -83,14 +86,21 @@ import org.slf4j.LoggerFactory;
 
 import javax.net.ssl.SSLContext;
 import javax.net.ssl.SSLEngine;
-import javax.net.ssl.TrustManager;
+import javax.net.ssl.KeyManagerFactory;
 import javax.net.ssl.TrustManagerFactory;
 
 import java.security.cert.CertificateFactory;
+import java.security.cert.Certificate;
 import java.security.cert.X509Certificate;
 import java.security.KeyStore;
+import java.security.KeyFactory;
+import java.security.PrivateKey;
+import java.security.Security;
+import java.security.spec.InvalidKeySpecException;
+import java.security.spec.PKCS8EncodedKeySpec;
 
 import java.io.FileInputStream;
+import java.io.FileReader;
 
 import javax.annotation.concurrent.GuardedBy;
 import java.net.InetAddress;
@@ -262,6 +272,12 @@ public class AsyncYBClient implements AutoCloseable {
 
   private final String certFile;
 
+  private final String clientCertFile;
+  private final String clientKeyFile;
+
+  private final String clientHost;
+  private final int clientPort;
+
   private volatile boolean closed;
 
   private AsyncYBClient(AsyncYBClientBuilder b) {
@@ -272,6 +288,10 @@ public class AsyncYBClient implements AutoCloseable {
     this.defaultOperationTimeoutMs = b.defaultOperationTimeoutMs;
     this.defaultAdminOperationTimeoutMs = b.defaultAdminOperationTimeoutMs;
     this.certFile = b.certFile;
+    this.clientCertFile = b.clientCertFile;
+    this.clientKeyFile = b.clientKeyFile;
+    this.clientHost = b.clientHost;
+    this.clientPort = b.clientPort;
     this.defaultSocketReadTimeoutMs = b.defaultSocketReadTimeoutMs;
   }
 
@@ -310,12 +330,17 @@ public class AsyncYBClient implements AutoCloseable {
   }
 
   public Deferred<SetFlagResponse> setFlag(final HostAndPort hp, String flag, String value) {
+   return this.setFlag(hp, flag, value, false);
+  }
+
+  public Deferred<SetFlagResponse> setFlag(final HostAndPort hp, String flag, String value,
+                                           boolean force) {
     checkIsClosed();
     TabletClient client = newSimpleClient(hp);
     if (client == null) {
       throw new IllegalStateException("Could not create a client to " + hp.toString());
     }
-    SetFlagRequest rpc = new SetFlagRequest(flag, value);
+    SetFlagRequest rpc = new SetFlagRequest(flag, value, force);
     rpc.setTimeoutMillis(defaultAdminOperationTimeoutMs);
     Deferred<SetFlagResponse> d = rpc.getDeferred();
     rpc.attempt++;
@@ -1005,6 +1030,7 @@ public class AsyncYBClient implements AutoCloseable {
     }
   }
 
+// TODO(NIC): Do we need a similar pattern for IsCreateNamespaceDone?
   /**
    * This callback will be repeatedly used when opening a table until it is done being created.
    */
@@ -1749,7 +1775,7 @@ public class AsyncYBClient implements AutoCloseable {
    * @return A live and initialized client for the specified master server.
    */
   TabletClient newMasterClient(HostAndPort masterHostPort) {
-    String ip = getIP(masterHostPort.getHostText());
+    String ip = getIP(masterHostPort.getHost());
     if (ip == null) {
       return null;
     }
@@ -1766,7 +1792,7 @@ public class AsyncYBClient implements AutoCloseable {
   // clients that are not explicitly bound to tablets, but tservers/masters for admin-style ops.
   TabletClient newSimpleClient(final HostAndPort hp) {
     String uuid = "fakeUUID -> " + hp.toString();
-    return newClient(uuid, hp.getHostText(), hp.getPort());
+    return newClient(uuid, hp.getHost(), hp.getPort());
   }
 
   TabletClient newClient(String uuid, final String host, final int port) {
@@ -1791,6 +1817,9 @@ public class AsyncYBClient implements AutoCloseable {
     // Java since the JRE doesn't expose any way to call setsockopt() with
     // TCP_KEEPIDLE.  And of course the default timeout is >2h. Sigh.
     config.setKeepAlive(true);
+    if (clientHost != null) {
+      chan.bind(new InetSocketAddress(clientHost, clientPort));
+    }
     chan.connect(new InetSocketAddress(host, port));  // Won't block.
     return client;
   }
@@ -1802,6 +1831,7 @@ public class AsyncYBClient implements AutoCloseable {
    */
   @Override
   public void close() throws Exception {
+    if (closed) return;
     shutdown().join(defaultAdminOperationTimeoutMs);
   }
 
@@ -2048,7 +2078,7 @@ public class AsyncYBClient implements AutoCloseable {
     TabletClient init(String uuid) {
       final TabletClient client = new TabletClient(AsyncYBClient.this, uuid);
       if (certFile != null) {
-        SslHandler sslHandler = this.createSslHandler(certFile);
+        SslHandler sslHandler = this.createSslHandler(certFile, clientCertFile, clientKeyFile);
         if (sslHandler != null) {
           sslHandler.setIssueHandshake(true);
           super.addFirst("ssl", sslHandler);
@@ -2081,16 +2111,36 @@ public class AsyncYBClient implements AutoCloseable {
       super.sendUpstream(event);
     }
 
-    private SslHandler createSslHandler(String certfile) {
+    private PrivateKey getPrivateKey(String keyFile) {
       try {
+        PemReader pemReader = new PemReader(new FileReader(keyFile));
+        PemObject pemObject = pemReader.readPemObject();
+        byte[] bytes = pemObject.getContent();
+        PKCS8EncodedKeySpec spec = new PKCS8EncodedKeySpec(bytes);
+        KeyFactory kf = KeyFactory.getInstance("RSA");
+        PrivateKey pk = kf.generatePrivate(spec);
+        return pk;
+      } catch (InvalidKeySpecException e) {
+        log.error("Could not read the private key file.", e);
+        throw new RuntimeException("InvalidKeySpecException while reading key: " + keyFile);
+      } catch (Exception e) {
+        log.error("Issue reading pem file.", e);
+        throw new RuntimeException("IOException reading key: " + keyFile);
+      }
+    }
+
+    private SslHandler createSslHandler(String certfile, String clientCertFile,
+                                        String clientKeyFile) {
+      try {
+        Security.addProvider(new BouncyCastleProvider());
         CertificateFactory cf = CertificateFactory.getInstance("X.509");
         FileInputStream fis = new FileInputStream(certFile);
         X509Certificate ca;
         try {
           ca = (X509Certificate) cf.generateCertificate(fis);
         } catch (Exception e) {
-          log.error("Exception generating certificate from input file: ", e);
-          return null;
+          log.error("Exception generating CA certificate from input file: ", e);
+          throw e;
         } finally {
           fis.close();
         }
@@ -2106,14 +2156,52 @@ public class AsyncYBClient implements AutoCloseable {
         TrustManagerFactory tmf = TrustManagerFactory.getInstance(tmfAlgorithm);
         tmf.init(keyStore);
 
+        X509Certificate clientCert = null;
+        KeyStore clientKeyStore = null;
+        KeyManagerFactory kmf = null;
+        if (clientCertFile != null) {
+          if (clientKeyFile == null) {
+            log.error("Both client cert and key needed for mutual auth.");
+            return null;
+          }
+          fis = new FileInputStream(clientCertFile);
+          try {
+            clientCert = (X509Certificate) cf.generateCertificate(fis);
+          } catch (Exception e) {
+            log.error("Exception generating CA certificate from input file: ", e);
+            throw e;
+          } finally {
+            fis.close();
+          }
+          PrivateKey pk = getPrivateKey(clientKeyFile);
+          Certificate[] chain = new Certificate[2];
+          chain[0] = clientCert;
+          chain[1] = ca;
+
+          clientKeyStore = KeyStore.getInstance(keyStoreType);
+          clientKeyStore.load(null, null);
+          clientKeyStore.setCertificateEntry("node_crt", clientCert);
+          String password = "password";
+          char[] ksPass = password.toCharArray();
+          clientKeyStore.setKeyEntry("node_key", pk, ksPass, chain);
+
+          kmf = KeyManagerFactory.getInstance(KeyManagerFactory.getDefaultAlgorithm());
+          kmf.init(clientKeyStore, ksPass);
+        }
+
         SSLContext sslContext = SSLContext.getInstance("TLS");
-        sslContext.init(null, tmf.getTrustManagers(), null);
+        // mTLS is enabled.
+        if (kmf != null) {
+          sslContext.init(kmf.getKeyManagers(), tmf.getTrustManagers(), null);
+        } else {
+          sslContext.init(null, tmf.getTrustManagers(), null);
+        }
         SSLEngine sslEngine = sslContext.createSSLEngine();
         sslEngine.setUseClientMode(true);
         return new SslHandler(sslEngine);
       } catch (Exception e) {
         log.error("Exception creating sslContext: ", e);
-        return null;
+        throw new RuntimeException("SSLContext creation failed: " + e.toString());
       }
     }
 
@@ -2463,6 +2551,10 @@ public class AsyncYBClient implements AutoCloseable {
     private long defaultSocketReadTimeoutMs = DEFAULT_SOCKET_READ_TIMEOUT_MS;
 
     private String certFile = null;
+    private String clientCertFile = null;
+    private String clientKeyFile = null;
+    private String clientHost = null;
+    private int clientPort = 0;
 
     private Executor bossExecutor;
     private Executor workerExecutor;
@@ -2548,11 +2640,40 @@ public class AsyncYBClient implements AutoCloseable {
      * Optional.
      * If not provided, defaults to null.
      * A value of null disables an SSL connection.
-     * @param certFile the path to the certificate.
+     * @param certFile the path to the certificate (PEM Encoded).
      * @return this builder
      */
     public AsyncYBClientBuilder sslCertFile(String certFile) {
       this.certFile = certFile;
+      return this;
+    }
+
+    /**
+     * Sets the client cert and key files if mutual auth is enabled.
+     * Optional.
+     * If not provided, defaults to null.
+     * A value of null disables an mTLS connection.
+     * @param certFile the path to the client certificate (PEM Encoded).
+     * @param keyFile the path to the client private key file.
+     * @return this builder
+     */
+    public AsyncYBClientBuilder sslClientCertFiles(String certFile, String keyFile) {
+      this.clientCertFile = certFile;
+      this.clientKeyFile = keyFile;
+      return this;
+    }
+
+    /**
+     * Sets the outbond client host:port on which the socket binds.
+     * Optional.
+     * If not provided, defaults to null.
+     * @param clientHost the address to bind to.
+     * @param clientPort the port to bind to (0 means any free port).
+     * @return this builder
+     */
+    public AsyncYBClientBuilder bindHostAddress(String clientHost, int clientPort) {
+      this.clientHost = clientHost;
+      this.clientPort = clientPort;
       return this;
     }
 

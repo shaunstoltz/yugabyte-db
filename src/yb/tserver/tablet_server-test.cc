@@ -202,6 +202,10 @@ TEST_F(TabletServerTest, TestSetFlagsAndCheckWebPages) {
   ASSERT_STR_CONTAINS(buf.ToString(), "<th>key</th>");
   ASSERT_STR_CONTAINS(buf.ToString(), "<td>string NULLABLE NOT A PARTITION KEY</td>");
 
+  ASSERT_OK(c.FetchURL(Substitute("http://$0/tablet-consensus-status?id=$1",
+                       addr, kTabletId), &buf));
+  ASSERT_STR_CONTAINS(buf.ToString(), kTabletId);
+
   // Test fetching metrics.
   // Fetching metrics has the side effect of retiring metrics, but not in a single pass.
   // So, we check a couple of times in a loop -- thus, if we had a bug where one of these
@@ -610,7 +614,7 @@ TEST_F(TabletServerTest, TestDeleteTablet) {
   EasyCurl c;
   faststring buf;
   ASSERT_OK(c.FetchURL(strings::Substitute("http://$0/jsonmetricz",
-                                           ToString(mini_server_->bound_http_addr())),
+                                           AsString(mini_server_->bound_http_addr())),
                                            &buf));
 
   // Verify that after restarting the TS, the tablet is still not in the tablet manager.
@@ -800,10 +804,11 @@ TEST_F(TabletServerTest, TestWriteOutOfBounds) {
   CHECK_OK(PartitionSchema::FromPB(PartitionSchemaPB(), schema, &partition_schema));
 
   Partition partition;
-  ASSERT_OK(
-    mini_server_->server()->tablet_manager()->CreateNewTablet("TestWriteOutOfBoundsTable", tabletId,
-      partition, tabletId, YQL_TABLE_TYPE, schema, partition_schema, boost::none /* index_info */,
-      mini_server_->CreateLocalConfig(), nullptr));
+  auto table_info = std::make_shared<tablet::TableInfo>(
+      "TestWriteOutOfBoundsTable", "test_ns", tabletId, YQL_TABLE_TYPE, schema, IndexMap(),
+      boost::none /* index_info */, 0 /* schema_version */, partition_schema);
+  ASSERT_OK(mini_server_->server()->tablet_manager()->CreateNewTablet(
+      table_info, tabletId, partition, mini_server_->CreateLocalConfig()));
 
   ASSERT_OK(WaitForTabletRunning(tabletId));
 

@@ -60,6 +60,8 @@ class TabletServer;
 
 struct ReadContext;
 
+YB_STRONGLY_TYPED_BOOL(AllowSplitTablet);
+
 class TabletServiceImpl : public TabletServerServiceIf {
  public:
   typedef std::vector<tablet::TabletPeerPtr> TabletPeers;
@@ -137,21 +139,25 @@ class TabletServiceImpl : public TabletServerServiceIf {
  private:
   friend class ReadCompletionTask;
 
-  // Check if the tablet peer is the leader and is in ready state for servicing IOs.
-  CHECKED_STATUS CheckPeerIsLeaderAndReady(const tablet::TabletPeer& tablet_peer);
-
   CHECKED_STATUS CheckPeerIsLeader(const tablet::TabletPeer& tablet_peer);
 
-  CHECKED_STATUS CheckPeerIsReady(const tablet::TabletPeer& tablet_peer);
+  // Checks if the peer is ready for servicing IOs.
+  // allow_split_tablet specifies whether to reject requests to tablets which have been already
+  // split.
+  CHECKED_STATUS CheckPeerIsReady(
+      const tablet::TabletPeer& tablet_peer, AllowSplitTablet allow_split_tablet);
 
   // If tablet_peer is already set, we assume that LookupTabletPeerOrRespond has already been
   // called, and only perform additional checks, such as readiness, leadership, bounded staleness,
   // etc.
+  // allow_split_tablet specifies whether to reject requests to tablets which have been already
+  // split.
   template <class Req, class Resp>
   bool DoGetTabletOrRespond(
       const Req* req, Resp* resp, rpc::RpcContext* context,
       std::shared_ptr<tablet::AbstractTablet>* tablet,
-      tablet::TabletPeerPtr tablet_peer = nullptr);
+      tablet::TabletPeerPtr tablet_peer = nullptr,
+      AllowSplitTablet allow_split_tablet = AllowSplitTablet::kFalse);
 
   virtual WARN_UNUSED_RESULT bool GetTabletOrRespond(
       const ReadRequestPB* req,
@@ -170,9 +176,12 @@ class TabletServiceImpl : public TabletServerServiceIf {
   // Read implementation. If restart is required returns restart time, in case of success
   // returns invalid ReadHybridTime. Otherwise returns error status.
   Result<ReadHybridTime> DoRead(ReadContext* read_context);
+  Result<ReadHybridTime> DoReadImpl(ReadContext* read_context);
   // Completes read, invokes DoRead in loop, adjusting read time due to read restart time.
   // Sends response, etc.
   void CompleteRead(ReadContext* read_context);
+
+  void UpdateConsistentPrefixMetrics(ReadContext* read_context);
 
   TabletServerIf *const server_;
 };
@@ -229,8 +238,17 @@ class TabletServiceAdminImpl : public TabletServerAdminServiceIf {
       const ChangeMetadataRequestPB* req, ChangeMetadataResponsePB* resp,
       rpc::RpcContext context) override;
 
+  // Starts tablet splitting by adding split tablet Raft operation into Raft log of the source
+  // tablet.
+  void SplitTablet(
+      const SplitTabletRequestPB* req,
+      SplitTabletResponsePB* resp,
+      rpc::RpcContext context) override;
+
  private:
   TabletServer* server_;
+
+  CHECKED_STATUS DoCreateTablet(const CreateTabletRequestPB* req, CreateTabletResponsePB* resp);
 
   // Used to implement wait/signal mechanism for backfill requests.
   // Since the number of concurrently allowed backfill requests is

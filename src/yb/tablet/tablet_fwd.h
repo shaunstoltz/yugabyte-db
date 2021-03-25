@@ -32,12 +32,18 @@ typedef scoped_refptr<RaftGroupMetadata> RaftGroupMetadataPtr;
 class Tablet;
 typedef std::shared_ptr<Tablet> TabletPtr;
 
+struct TableInfo;
+typedef std::shared_ptr<TableInfo> TableInfoPtr;
+
 class TabletPeer;
 typedef std::shared_ptr<TabletPeer> TabletPeerPtr;
 
+class Operation;
 class SnapshotCoordinator;
 class SnapshotOperationState;
+class SplitOperationState;
 class TabletSnapshots;
+class TabletSplitter;
 class TabletStatusPB;
 class TabletStatusListener;
 class TransactionIntentApplier;
@@ -48,10 +54,16 @@ class TransactionParticipantContext;
 class UpdateTxnOperationState;
 class WriteOperationState;
 
+struct CreateSnapshotData;
+
 YB_STRONGLY_TYPED_BOOL(RequireLease);
 YB_STRONGLY_TYPED_BOOL(IsSysCatalogTablet);
 YB_STRONGLY_TYPED_BOOL(TransactionsEnabled);
-YB_STRONGLY_TYPED_BOOL(AlreadyApplied);
+
+// Used to indicate that a transaction-related operation has already been applied to regular RocksDB
+// (which was flushed) but the corresponding deletion of intents from the intents RocksDB has not
+// been flushed and was therefore lost.
+YB_STRONGLY_TYPED_BOOL(AlreadyAppliedToRegularDB);
 
 }  // namespace tablet
 }  // namespace yb

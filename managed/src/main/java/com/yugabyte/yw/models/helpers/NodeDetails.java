@@ -3,17 +3,15 @@
 package com.yugabyte.yw.models.helpers;
 
 import com.fasterxml.jackson.annotation.JsonIgnore;
+import com.fasterxml.jackson.annotation.JsonIgnoreProperties;
 import com.google.common.collect.ImmutableSet;
-import com.yugabyte.yw.common.NodeActionType;
-
-import java.util.Arrays;
-import java.util.HashSet;
 import java.util.Set;
 import java.util.UUID;
 
 /**
  * Represents all the details of a cloud node that are of interest.
  */
+@JsonIgnoreProperties(ignoreUnknown = true)
 public class NodeDetails {
   // The id of the node. This is usually present in the node name.
   public int nodeIdx = -1;
@@ -36,6 +34,9 @@ public class NodeDetails {
   public enum NodeState {
     // Set when a new node needs to be added into a Universe and has not yet been created.
     ToBeAdded,
+    // Set when a new node is provisioned and configured but before it is added into
+    // the existing cluster.
+    ToJoinCluster,
     // Set after the node (without any configuration) is created using the IaaS provider at the
     // end of the provision step.
     Provisioned,
@@ -67,7 +68,9 @@ public class NodeDetails {
     // Set when a stopped/removed node is about to enter the Decommissioned state.
     BeingDecommissioned,
     // After a stopped/removed node is returned back to the IaaS.
-    Decommissioned
+    Decommissioned,
+    // Set when the cert is being updated.
+    UpdateCert
   }
 
   // The current state of the node.
@@ -97,6 +100,12 @@ public class NodeDetails {
   public boolean isYsqlServer = true;
   public int ysqlServerHttpPort = 13000;
   public int ysqlServerRpcPort = 5433;
+
+  // Which port node_exporter is running on.
+  public int nodeExporterPort = 9300;
+
+  // True if cronjobs were properly configured for this node.
+  public boolean cronsActive = true;
 
   // List of states which are considered in-transit and ops such as upgrade should not be allowed.
   public static final Set<NodeState> IN_TRANSIT_STATES =
@@ -153,7 +162,8 @@ public class NodeDetails {
       state == NodeState.Live ||
       state == NodeState.ToBeRemoved ||
       state == NodeState.Removing ||
-      state == NodeState.Stopping);
+      state == NodeState.Stopping ||
+      state == NodeState.UpdateCert);
   }
 
   @JsonIgnore
@@ -161,29 +171,11 @@ public class NodeDetails {
     return IN_TRANSIT_STATES.contains(state);
   }
 
-  public Set<NodeActionType> getAllowedActions() {
-    if (state == null) {
-      return new HashSet<>();
-    }
-    switch (state) {
-      case ToBeAdded:
-        return new HashSet<>(Arrays.asList(NodeActionType.DELETE));
-      case Live:
-        return new HashSet<>(Arrays.asList(NodeActionType.STOP, NodeActionType.REMOVE));
-      case Stopped:
-        return new HashSet<>(Arrays.asList(NodeActionType.START, NodeActionType.RELEASE));
-      case Removed:
-        return new HashSet<>(Arrays.asList(NodeActionType.ADD, NodeActionType.RELEASE));
-      case Decommissioned:
-        return new HashSet<>(Arrays.asList(NodeActionType.ADD));
-      default:
-        return new HashSet<>();
-    }
-  }
-
   @JsonIgnore
   public boolean isRemovable() {
-    return state == NodeState.ToBeAdded || state == NodeState.Removed;
+    return state == NodeState.ToBeAdded || state == NodeState.Adding
+        || state == NodeState.SoftwareInstalled || state == NodeState.Removed
+        || state == NodeState.Decommissioned;
   }
 
   @JsonIgnore
@@ -199,5 +191,9 @@ public class NodeDetails {
   @JsonIgnore
   public String getZone() {
     return this.cloudInfo.az;
+  }
+
+  public int getNodeIdx() {
+    return this.nodeIdx;
   }
 }

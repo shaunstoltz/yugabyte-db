@@ -34,12 +34,24 @@ class rw_semaphore;
 
 namespace tablet {
 
+YB_DEFINE_ENUM(CreateIntentsCheckpointIn, (kSubDir)(kUseIntentsDbSuffix));
+
+struct CreateSnapshotData {
+  HybridTime snapshot_hybrid_time;
+  HybridTime hybrid_time;
+  OpId op_id;
+  std::string snapshot_dir;
+  SnapshotScheduleId schedule_id;
+};
+
 class TabletSnapshots : public TabletComponent {
  public:
   explicit TabletSnapshots(Tablet* tablet);
 
   // Create snapshot for this tablet.
   CHECKED_STATUS Create(SnapshotOperationState* tx_state);
+
+  CHECKED_STATUS Create(const CreateSnapshotData& data);
 
   // Restore snapshot for this tablet. In addition to backup/restore, this is used for initial
   // syscatalog RocksDB creation without the initdb overhead.
@@ -54,7 +66,12 @@ class TabletSnapshots : public TabletComponent {
   //------------------------------------------------------------------------------------------------
   // Create a RocksDB checkpoint in the provided directory. Only used when table_type_ ==
   // YQL_TABLE_TYPE.
-  CHECKED_STATUS CreateCheckpoint(const std::string& dir);
+  // use_subdir_for_intents specifies whether to create intents DB checkpoint inside
+  // <dir>/<kIntentsSubdir> or <dir>.<kIntentsDBSuffix>
+  CHECKED_STATUS CreateCheckpoint(
+      const std::string& dir,
+      CreateIntentsCheckpointIn create_intents_checkpoint_in =
+          CreateIntentsCheckpointIn::kUseIntentsDbSuffix);
 
   // Returns the location of the last rocksdb checkpoint. Used for tests only.
   std::string TEST_LastRocksDBCheckpointDir() { return TEST_last_rocksdb_checkpoint_dir_; }
@@ -69,10 +86,13 @@ class TabletSnapshots : public TabletComponent {
   // Restore the RocksDB checkpoint from the provided directory.
   // Only used when table_type_ == YQL_TABLE_TYPE.
   CHECKED_STATUS RestoreCheckpoint(
-      const std::string& dir, const docdb::ConsensusFrontier& frontier);
+      const std::string& dir, HybridTime restore_at, const docdb::ConsensusFrontier& frontier);
 
   // Applies specified snapshot operation.
   CHECKED_STATUS Apply(SnapshotOperationState* tx_state);
+
+  CHECKED_STATUS CleanupSnapshotDir(const std::string& dir);
+  Env& env();
 
   std::string TEST_last_rocksdb_checkpoint_dir_;
 };

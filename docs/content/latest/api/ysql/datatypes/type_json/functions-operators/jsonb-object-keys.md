@@ -2,18 +2,17 @@
 title: jsonb_object_keys() and json_object_keys() [JSON]
 headerTitle: jsonb_object_keys() and json_object_keys()
 linkTitle: jsonb_object_keys() 
-description: Use these functions to transform the list of key names int the supplied JSON object into a set (i.e., table) of text values.
-summary: jsonb_object_keys() and json_object_keys()
+description: Transform the list of key names in the supplied JSON object into a set (that is, table) of text values.
 menu:
   latest:
     identifier: jsonb-object-keys
-    parent: functions-operators
+    parent: json-functions-operators
     weight: 160
 isTocNested: true
 showAsideToc: true
 ---
 
-**Purpose:** Transform the list of key names int the supplied JSON _object_ into a set (i.e. table) of `text` values.
+**Purpose:** Transform the list of key names in the supplied JSON _object_ into a set (that is, table) of `text` values.
 
 **Signature** For the `jsonb` variant:
 
@@ -22,9 +21,9 @@ input value:       jsonb
 return value:      SETOF text
 ```
 
-**Notes:** The functions in this pair require that the supplied JSON value is an _object_. The returned keys are ordered alphabetically.
+**Notes:** Each function in this pair requires that the supplied JSON value is an _object_. The returned keys are ordered alphabetically.
 
-```postgresql
+```plpgsql
 do $body$
 declare
   object constant jsonb :=

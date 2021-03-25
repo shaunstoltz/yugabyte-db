@@ -1,0 +1,8 @@
+PyYAML
+six
+yugabyte_pycommon
+compiledb
+psutil
+distro
+boto
+overrides

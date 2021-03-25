@@ -9,6 +9,7 @@ import java.util.HashMap;
 import java.util.Map;
 import java.util.UUID;
 
+import com.yugabyte.yw.common.ha.PlatformReplicationManager;
 import com.yugabyte.yw.models.helpers.TaskType;
 import com.yugabyte.yw.models.ScheduleTask;
 import com.yugabyte.yw.models.CustomerTask;
@@ -17,6 +18,7 @@ import org.slf4j.LoggerFactory;
 
 import com.yugabyte.yw.forms.ITaskParams;
 import com.yugabyte.yw.models.TaskInfo;
+import play.api.Play;
 
 /**
  * This class is responsible for creating and running a task. It provides all the common
@@ -36,6 +38,9 @@ public class TaskRunner implements Runnable {
   // The task object that will run the current task.
   private ITask task;
 
+  // A utility for Platform HA.
+  private final PlatformReplicationManager replicationManager;
+
   static {
     // Initialize the map which holds the task types to their task class.
     Map<TaskType, Class<? extends ITask>> typeMap = new HashMap<TaskType, Class<? extends ITask>>();
@@ -46,13 +51,13 @@ public class TaskRunner implements Runnable {
       try {
         taskClass = Class.forName(className).asSubclass(ITask.class);
         typeMap.put(taskType, taskClass);
-        LOG.info("Found task: " + className);
+        LOG.debug("Found task: " + className);
       } catch (ClassNotFoundException e) {
         LOG.error("Could not find task for task type " + taskType, e);
       }
     }
     taskTypeToTaskClassMap = Collections.unmodifiableMap(typeMap);
-    LOG.info("Done loading tasks.");
+    LOG.debug("Done loading tasks.");
   }
 
   /**
@@ -75,6 +80,7 @@ public class TaskRunner implements Runnable {
     // Persist the task in the queue.
     taskRunner.save();
     LOG.info("Created task, details: " + taskRunner.toString());
+    LOG.debug("Created task, details: " + taskRunner.toDebugString());
 
     return taskRunner;
   }
@@ -98,6 +104,7 @@ public class TaskRunner implements Runnable {
       LOG.error("Could not determine the hostname", e);
     }
     taskInfo.setOwner(hostname);
+    replicationManager = Play.current().injector().instanceOf(PlatformReplicationManager.class);
   }
 
   public UUID getTaskUUID() {
@@ -135,7 +142,7 @@ public class TaskRunner implements Runnable {
 
   @Override
   public void run() {
-    LOG.info("Running task");
+    LOG.debug("Running task {}", getTaskUUID());
     task.setUserTaskUUID(getTaskUUID());
     updateTaskState(TaskInfo.State.Running);
     try {
@@ -147,7 +154,7 @@ public class TaskRunner implements Runnable {
 
     } catch (Throwable t) {
       LOG.error("Error running task", t);
-
+      if (task.shouldSendNotification()) task.sendNotification();
       // Update the task state to failure and checkpoint it.
       updateTaskState(TaskInfo.State.Failure);
 
@@ -163,6 +170,9 @@ public class TaskRunner implements Runnable {
       if (scheduleTask != null) {
         scheduleTask.setCompletedTime();
       }
+
+      // Run a one-off Platform HA sync every time a task finishes.
+      replicationManager.oneOffSync();
     }
   }
 
@@ -182,6 +192,14 @@ public class TaskRunner implements Runnable {
 
   @Override
   public String toString() {
+    StringBuilder sb = new StringBuilder();
+    sb.append("task-info {" + taskInfo.toString() + "}");
+    sb.append(", ");
+    sb.append("task {" + task.getName() + "}");
+    return sb.toString();
+  }
+
+  public String toDebugString() {
     StringBuilder sb = new StringBuilder();
     sb.append("task-info {" + taskInfo.toString() + "}");
     sb.append(", ");

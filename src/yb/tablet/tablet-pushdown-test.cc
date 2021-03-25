@@ -36,6 +36,7 @@
 #include <glog/logging.h>
 #include <gtest/gtest.h>
 
+#include "yb/common/ql_expr.h"
 #include "yb/common/ql_protocol_util.h"
 #include "yb/common/schema.h"
 
@@ -83,7 +84,7 @@ class TabletPushdownTest : public YBTabletTest {
   // the same set of rows. Run the scan and verify that the
   // expected rows are returned.
   void TestScanYieldsExpectedResults(int column_id, int lower, int upper) {
-    ReadHybridTime read_time = ReadHybridTime::SingleTime(tablet()->SafeTime());
+    ReadHybridTime read_time = ReadHybridTime::SingleTime(CHECK_RESULT(tablet()->SafeTime()));
     QLReadRequestPB req;
     auto* condition = req.mutable_where_expr()->mutable_condition();
     condition->set_op(QLOperator::QL_OP_AND);

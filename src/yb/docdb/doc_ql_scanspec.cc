@@ -13,6 +13,7 @@
 
 #include "yb/docdb/doc_ql_scanspec.h"
 
+#include "yb/docdb/doc_scanspec_util.h"
 #include "yb/common/ql_value.h"
 
 #include "yb/docdb/doc_expr.h"
@@ -36,22 +37,23 @@ DocQLScanSpec::DocQLScanSpec(const Schema& schema,
       query_id_(query_id) {
 }
 
-DocQLScanSpec::DocQLScanSpec(const Schema& schema,
-                             const boost::optional<int32_t> hash_code,
-                             const boost::optional<int32_t> max_hash_code,
-                             const std::vector<PrimitiveValue>& hashed_components,
-                             const QLConditionPB* condition,
-                             const QLConditionPB* if_condition,
-                             const rocksdb::QueryId query_id,
-                             const bool is_forward_scan,
-                             const bool include_static_columns,
-                             const DocKey& start_doc_key)
+DocQLScanSpec::DocQLScanSpec(
+    const Schema& schema,
+    const boost::optional<int32_t> hash_code,
+    const boost::optional<int32_t> max_hash_code,
+    std::reference_wrapper<const std::vector<PrimitiveValue>> hashed_components,
+    const QLConditionPB* condition,
+    const QLConditionPB* if_condition,
+    const rocksdb::QueryId query_id,
+    const bool is_forward_scan,
+    const bool include_static_columns,
+    const DocKey& start_doc_key)
     : QLScanSpec(condition, if_condition, is_forward_scan, std::make_shared<DocExprExecutor>()),
       range_bounds_(condition ? new common::QLScanRange(schema, *condition) : nullptr),
       schema_(schema),
       hash_code_(hash_code),
       max_hash_code_(max_hash_code),
-      hashed_components_(&hashed_components),
+      hashed_components_(&hashed_components.get()),
       include_static_columns_(include_static_columns),
       start_doc_key_(start_doc_key.empty() ? KeyBytes() : start_doc_key.Encode()),
       lower_doc_key_(bound_key(true)),
@@ -166,34 +168,9 @@ KeyBytes DocQLScanSpec::bound_key(const bool lower_bound) const {
 }
 
 std::vector<PrimitiveValue> DocQLScanSpec::range_components(const bool lower_bound) const {
-  std::vector<PrimitiveValue> result;
-
-  if (range_bounds_ != nullptr) {
-    const std::vector<QLValuePB> range_values = range_bounds_->range_values(lower_bound);
-    result.reserve(range_values.size());
-    size_t column_idx = schema_.num_hash_key_columns();
-    for (const auto& value : range_values) {
-      const auto& column = schema_.column(column_idx);
-      if (IsNull(value)) {
-        result.emplace_back(lower_bound ? ValueType::kLowest : ValueType::kHighest);
-      } else {
-        result.emplace_back(PrimitiveValue::FromQLValuePB(value, column.sorting_type()));
-      }
-      column_idx++;
-    }
-  }
-
-  if (!lower_bound) {
-    // We add +inf as an extra component to make sure this is greater than all keys in range.
-    // For lower bound, this is true already, because dockey + suffix is > dockey
-    result.emplace_back(ValueType::kHighest);
-  } else if (schema_.has_statics() && !include_static_columns_ && result.empty()) {
-    // If we want to skip static columns, make sure the range components are non-empty.
-    // We use kMinPrimitiveValueType instead of kLowest because it compares as higher than
-    // kHybridTime in RocksDB.
-    result.emplace_back(kMinPrimitiveValueType);
-  }
-  return result;
+  return GetRangeKeyScanSpec(
+      schema_, nullptr /* prefixed_range_components */,
+      range_bounds_.get(), lower_bound, include_static_columns_);
 }
 
 namespace {

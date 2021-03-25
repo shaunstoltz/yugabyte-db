@@ -2063,6 +2063,27 @@ std::string Version::DebugString(bool hex) const {
   return r;
 }
 
+Result<std::string> Version::GetMiddleKey() {
+  // Largest files are at lowest level.
+  const auto level = storage_info_.num_levels_ - 1;
+  const FileMetaData* largest_sst_meta = nullptr;
+  for (const auto* file : storage_info_.files_[level]) {
+    if (!largest_sst_meta ||
+        file->fd.GetTotalFileSize() > largest_sst_meta->fd.GetTotalFileSize()) {
+      largest_sst_meta = file;
+    }
+  }
+  if (!largest_sst_meta) {
+    return STATUS(Incomplete, "No SST files.");
+  }
+
+  const auto trwh = VERIFY_RESULT(table_cache_->GetTableReader(
+      vset_->env_options_, cfd_->internal_comparator(), largest_sst_meta->fd, kDefaultQueryId,
+      /* no_io =*/ false, cfd_->internal_stats()->GetFileReadHist(level),
+      IsFilterSkipped(level, /* is_file_last_in_level =*/ true)));
+  return trwh.table_reader->GetMiddleKey();
+}
+
 // this is used to batch writes to the manifest file
 struct VersionSet::ManifestWriter {
   Status status;
@@ -3359,12 +3380,9 @@ Status VersionSet::WriteSnapshot(log::Writer* log, UserFrontierPtr flushed_front
       VersionEdit edit;
       edit.SetColumnFamily(cfd->GetID());
 
-      const bool frontier_overridden = !!flushed_frontier_override;
       for (int level = 0; level < cfd->NumberLevels(); level++) {
-        for (const auto& f :
-             cfd->current()->storage_info()->LevelFiles(level)) {
-
-          edit.AddCleanedFile(level, *f, /* suppress_frontiers */ frontier_overridden);
+        for (const auto& f : cfd->current()->storage_info()->LevelFiles(level)) {
+          edit.AddCleanedFile(level, *f);
         }
       }
       edit.SetLogNumber(cfd->GetLogNumber());

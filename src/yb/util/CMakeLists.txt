@@ -165,7 +165,9 @@ set(UTIL_SRCS
   encrypted_file.cc
   encrypted_file_factory.cc
   encryption_util.cc
-  env.cc env_posix.cc env_util.cc
+  env.cc
+  env_posix.cc
+  env_util.cc
   errno.cc
   ev_util.cc
   failure_detector.cc
@@ -183,7 +185,6 @@ set(UTIL_SRCS
   init.cc
   jsonreader.cc
   jsonwriter.cc
-  kernel_stack_watchdog.cc
   locks.cc
   logging.cc
   malloc.cc
@@ -213,6 +214,7 @@ set(UTIL_SRCS
   path_util.cc
   pb_util-internal.cc
   pb_util.cc
+  pg_util.cc
   physical_time.cc
   port_picker.cc
   priority_thread_pool.cc
@@ -224,6 +226,7 @@ set(UTIL_SRCS
   rw_mutex.cc
   rwc_lock.cc
   shared_mem.cc
+  signal_util.cc
   slice.cc
   spinlock_profiling.cc
   split.cc
@@ -247,6 +250,8 @@ set(UTIL_SRCS
   timestamp.cc
   trace.cc
   trilean.cc
+  ulimit.cc
+  ulimit_util.cc
   universe_key_manager.cc
   url-coding.cc
   user.cc
@@ -254,7 +259,6 @@ set(UTIL_SRCS
   varint.cc
   version_info.cc
   async_util.cc
-  ${UTIL_SRCS_EXTENSIONS}
   )
 
 set(UTIL_LIBS
@@ -276,8 +280,7 @@ set(UTIL_LIBS
   encryption_proto
   zlib
   ${OPENSSL_CRYPTO_LIBRARY}
-  ${OPENSSL_SSL_LIBRARY}
-  ${UTIL_LIBS_EXTENSIONS})
+  ${OPENSSL_SSL_LIBRARY})
 
 if (NOT APPLE AND NOT USING_LINUXBREW)
   set(UTIL_LIBS ${UTIL_LIBS} atomic)
@@ -290,8 +293,11 @@ if(NOT APPLE)
     libbacktrace)
 endif()
 
-if(${YB_TCMALLOC_AVAILABLE})
+if("${YB_TCMALLOC_ENABLED}" STREQUAL "1")
+  message("Adding tcmalloc as a dependency of yb_util")
   list(APPEND UTIL_LIBS tcmalloc)
+else()
+  message("Not adding tcmalloc as a dependency of yb_util")
 endif()
 
 # We need libdl for accessing library load addresses.
@@ -300,8 +306,6 @@ list(APPEND UTIL_LIBS curl dl)
 ADD_YB_LIBRARY(yb_util
   SRCS ${UTIL_SRCS}
   DEPS ${UTIL_LIBS})
-
-cotire(yb_util)
 
 add_dependencies(yb_util gen_version_info)
 
@@ -349,6 +353,7 @@ ADD_YB_TEST(bit-util-test)
 ADD_YB_TEST(bitmap-test)
 ADD_YB_TEST(blocking_queue-test)
 ADD_YB_TEST(bloom_filter-test)
+ADD_YB_TEST(byte_buffer-test)
 ADD_YB_TEST(callback_bind-test)
 ADD_YB_TEST(countdown_latch-test)
 ADD_YB_TEST(crc-test RUN_SERIAL true) # has a benchmark
@@ -365,6 +370,7 @@ ADD_YB_TEST(hdr_histogram-test)
 ADD_YB_TEST(inline_slice-test)
 ADD_YB_TEST(jsonreader-test)
 ADD_YB_TEST(lockfree-test)
+ADD_YB_TEST(lru_cache-test)
 ADD_YB_TEST(map-util-test)
 ADD_YB_TEST(memcmpable_varint-test LABELS no_tsan)
 ADD_YB_TEST(memenv/memenv-test)
@@ -396,7 +402,7 @@ ADD_YB_TEST(rolling_log-test)
 ADD_YB_TEST(rw_mutex-test)
 ADD_YB_TEST(rw_semaphore-test)
 ADD_YB_TEST(rwc_lock-test)
-if (NOT YB_USE_UBSAN)
+if (NOT "${YB_BUILD_TYPE}" STREQUAL "asan")
   # We disable this test when Undefined Behavior Sanitizer turned on (which is enabled in ASAN
   # builds). This test involves some integer overflows.
   ADD_YB_TEST(safe_math-test)
@@ -404,7 +410,6 @@ endif()
 ADD_YB_TEST(slice-test)
 ADD_YB_TEST(spinlock_profiling-test)
 ADD_YB_TEST(split-test)
-ADD_YB_TEST(stack_watchdog-test)
 ADD_YB_TEST(stats/iostats_context_test)
 ADD_YB_TEST(status-test)
 ADD_YB_TEST(stol_utils-test)
@@ -424,6 +429,7 @@ ADD_YB_TEST(bytes_formatter-test)
 ADD_YB_TEST(string_trim-test)
 ADD_YB_TEST(varint-test)
 ADD_YB_TEST(decimal-test)
+ADD_YB_TEST(date_time-test)
 ADD_YB_TEST(net/inetaddress-test)
 ADD_YB_TEST(uuid-test)
 ADD_YB_TEST(fast_varint-test)
@@ -447,10 +453,7 @@ target_link_libraries(jsonwriter_test_proto
 #######################################
 
 ADD_YB_TEST(jsonwriter-test)
-if(NOT "${NO_TESTS}")
-  target_link_libraries(jsonwriter-test
-    jsonwriter_test_proto)
-endif()
+YB_TEST_TARGET_LINK_LIBRARIES(jsonwriter-test jsonwriter_test_proto)
 
 #######################################
 # proto_container_test_proto
@@ -480,13 +483,10 @@ target_link_libraries(proto_container_test_proto
 #######################################
 
 ADD_YB_TEST(pb_util-test)
-if(NOT "${NO_TESTS}")
-  target_link_libraries(pb_util-test
-    proto_container_test_proto)
-endif()
+YB_TEST_TARGET_LINK_LIBRARIES(pb_util-test proto_container_test_proto)
 
 ADD_YB_TEST(encrypted_env-test)
-target_link_libraries(encrypted_env-test encryption_test_util)
+YB_TEST_TARGET_LINK_LIBRARIES(encrypted_env-test encryption_test_util)
 
 ADD_YB_TEST(ctr_cipher_stream-test)
-target_link_libraries(ctr_cipher_stream-test encryption_test_util)
+YB_TEST_TARGET_LINK_LIBRARIES(ctr_cipher_stream-test encryption_test_util)

@@ -36,6 +36,7 @@
 #include "catalog/namespace.h"
 #include "catalog/pg_authid.h"
 #include "commands/async.h"
+#include "commands/copy.h"
 #include "commands/prepare.h"
 #include "commands/user.h"
 #include "commands/vacuum.h"
@@ -80,6 +81,7 @@
 #include "utils/builtins.h"
 #include "utils/bytea.h"
 #include "utils/guc_tables.h"
+#include "utils/float.h"
 #include "utils/memutils.h"
 #include "utils/pg_locale.h"
 #include "utils/plancache.h"
@@ -200,8 +202,14 @@ static const char *show_unix_socket_permissions(void);
 static const char *show_log_file_mode(void);
 static const char *show_data_directory_mode(void);
 
+static bool check_transaction_priority_lower_bound(double *newval, void **extra, GucSource source);
 extern void YBCAssignTransactionPriorityLowerBound(double newval, void* extra);
+static bool check_transaction_priority_upper_bound(double *newval, void **extra, GucSource source);
 extern void YBCAssignTransactionPriorityUpperBound(double newval, void* extra);
+
+static bool check_max_backoff(int *max_backoff_msecs, void **extra, GucSource source);
+static bool check_min_backoff(int *min_backoff_msecs, void **extra, GucSource source);
+static bool check_backoff_multiplier(double *multiplier, void **extra, GucSource source);
 
 /* Private functions in guc-file.l that need to be called from guc.c */
 static ConfigVariable *ProcessConfigFileInternal(GucContext context,
@@ -426,6 +434,28 @@ static const struct config_enum_entry password_encryption_options[] = {
 	{"true", PASSWORD_TYPE_MD5, true},
 	{"yes", PASSWORD_TYPE_MD5, true},
 	{"1", PASSWORD_TYPE_MD5, true},
+	{NULL, 0, false}
+};
+
+const struct config_enum_entry ssl_protocol_versions_info[] = {
+	{"", PG_TLS_ANY, false},
+	{"TLSv1", PG_TLS1_VERSION, false},
+	{"TLSv1.1", PG_TLS1_1_VERSION, false},
+	{"TLSv1.2", PG_TLS1_2_VERSION, false},
+	{"TLSv1.3", PG_TLS1_3_VERSION, false},
+	{NULL, 0, false}
+};
+
+static struct config_enum_entry shared_memory_options[] = {
+#ifndef WIN32
+	{ "sysv", SHMEM_TYPE_SYSV, false},
+#endif
+#ifndef EXEC_BACKEND
+	{ "mmap", SHMEM_TYPE_MMAP, false},
+#endif
+#ifdef WIN32
+	{ "windows", SHMEM_TYPE_WINDOWS, false},
+#endif
 	{NULL, 0, false}
 };
 
@@ -1833,12 +1863,56 @@ static struct config_bool ConfigureNamesBool[] =
 	},
 
 	{
-		{"yb_debug_mode", PGC_USERSET, DEVELOPER_OPTIONS,
-			gettext_noop("Enable yb debugging."),
+		{"yb_debug_report_error_stacktrace", PGC_USERSET, DEVELOPER_OPTIONS,
+			gettext_noop("Append stacktrace information for error messages."),
 			NULL,
 			GUC_NOT_IN_SAMPLE
 		},
-		&yb_debug_mode,
+		&yb_debug_report_error_stacktrace,
+		false,
+		NULL, NULL, NULL
+	},
+
+	{
+		{"yb_debug_log_catcache_events", PGC_USERSET, DEVELOPER_OPTIONS,
+			gettext_noop("Log details for every catalog cache event such as a cache miss or cache invalidation/refresh."),
+			NULL,
+			GUC_NOT_IN_SAMPLE
+		},
+		&yb_debug_log_catcache_events,
+		false,
+		NULL, NULL, NULL
+	},
+
+	{
+		{"yb_debug_log_internal_restarts", PGC_USERSET, DEVELOPER_OPTIONS,
+			gettext_noop("Log details for internal restarts such as read-restarts, cache-invalidation restarts, or txn restarts."),
+			NULL,
+			GUC_NOT_IN_SAMPLE
+		},
+		&yb_debug_log_internal_restarts,
+		false,
+		NULL, NULL, NULL
+	},
+
+	{
+		{"yb_debug_log_docdb_requests", PGC_USERSET, DEVELOPER_OPTIONS,
+			gettext_noop("Log the contents of all internal (protobuf) requests to DocDB."),
+			NULL,
+			GUC_NOT_IN_SAMPLE
+		},
+		&yb_debug_log_docdb_requests,
+		false,
+		NULL, NULL, NULL
+	},
+
+	{
+		{"yb_enable_create_with_table_oid", PGC_USERSET, CUSTOM_OPTIONS,
+			gettext_noop("Enables the ability to set table oids when creating tables or indexes."),
+			NULL,
+			GUC_NOT_IN_SAMPLE
+		},
+		&yb_enable_create_with_table_oid,
 		false,
 		NULL, NULL, NULL
 	},
@@ -1850,6 +1924,17 @@ static struct config_bool ConfigureNamesBool[] =
 		&data_sync_retry,
 		false,
 		NULL, NULL, NULL
+	},
+
+	{
+		{"yb_read_from_followers", PGC_USERSET, CLIENT_CONN_STATEMENT,
+			gettext_noop("Allow any statement that generates a read request to go to any node."),
+			NULL,
+			GUC_NOT_IN_SAMPLE
+		},
+		&yb_read_from_followers,
+		false,
+		check_follower_reads, NULL, NULL
 	},
 
 	/* End-of-list marker */
@@ -2287,7 +2372,30 @@ static struct config_int ConfigureNamesInt[] =
 		},
 		&StatementTimeout,
 		0, 0, INT_MAX,
-		NULL, NULL, NULL
+		NULL, YBCSetTimeout, NULL
+	},
+
+
+	{
+		{"retry_min_backoff", PGC_USERSET, CLIENT_CONN_STATEMENT,
+			gettext_noop("Sets the minimum backoff in milliseconds between retries."),
+			NULL,
+			GUC_UNIT_MS
+		},
+		&RetryMinBackoffMsecs,
+		100, 0, INT_MAX,
+		check_min_backoff, NULL, NULL
+	},
+
+	{
+		{"retry_max_backoff", PGC_USERSET, CLIENT_CONN_STATEMENT,
+			gettext_noop("Sets the maximum backoff in milliseconds between retries."),
+			NULL,
+			GUC_UNIT_MS
+		},
+		&RetryMaxBackoffMsecs,
+		1000, 0, INT_MAX,
+		check_max_backoff, NULL, NULL
 	},
 
 	{
@@ -3085,6 +3193,17 @@ static struct config_int ConfigureNamesInt[] =
 		NULL, NULL, NULL
 	},
 
+	{
+		{"yb_default_copy_from_rows_per_transaction", PGC_USERSET, CLIENT_CONN_STATEMENT,
+			gettext_noop("Sets the batch number of rows to copy from the source to table."),
+			NULL,
+			0
+		},
+		&yb_default_copy_from_rows_per_transaction,
+		DEFAULT_BATCH_ROWS_PER_TRANSACTION, 0, INT_MAX,
+		NULL, NULL, NULL
+	},
+
 	/* End-of-list marker */
 	{
 		{NULL, 0, 0, NULL, NULL}, NULL, 0, 0, 0, NULL, NULL, NULL
@@ -3292,7 +3411,7 @@ static struct config_real ConfigureNamesReal[] =
 		},
 		&yb_transaction_priority_lower_bound,
 		0.0, 0.0, 1.0,
-		NULL, YBCAssignTransactionPriorityLowerBound, NULL
+		check_transaction_priority_lower_bound, YBCAssignTransactionPriorityLowerBound, NULL
 	},
 	{
 		{"yb_transaction_priority_upper_bound", PGC_USERSET, CLIENT_CONN_STATEMENT,
@@ -3301,7 +3420,18 @@ static struct config_real ConfigureNamesReal[] =
 		},
 		&yb_transaction_priority_upper_bound,
 		1.0, 0.0, 1.0,
-		NULL, YBCAssignTransactionPriorityUpperBound, NULL
+		check_transaction_priority_upper_bound, YBCAssignTransactionPriorityUpperBound, NULL
+	},
+
+	{
+		{"retry_backoff_multiplier", PGC_USERSET, CLIENT_CONN_STATEMENT,
+			gettext_noop("Sets the multiplier used to calculate the retry backoff."),
+			NULL,
+			GUC_UNIT_MS
+		},
+		&RetryBackoffMultiplier,
+		2.0, 1.0, 1e10,
+		check_backoff_multiplier, NULL, NULL
 	},
 
 	/* End-of-list marker */
@@ -3987,7 +4117,7 @@ static struct config_enum ConfigureNamesEnum[] =
 		},
 		&DefaultXactIsoLevel,
 		XACT_READ_COMMITTED, isolation_level_options,
-		NULL, NULL, NULL
+		check_default_XactIsoLevel, NULL, NULL
 	},
 
 	{
@@ -4135,6 +4265,16 @@ static struct config_enum ConfigureNamesEnum[] =
 	},
 
 	{
+		{"shared_memory_type", PGC_POSTMASTER, RESOURCES_MEM,
+			gettext_noop("Selects the shared memory implementation used for the main shared memory region."),
+			NULL
+		},
+		&shared_memory_type,
+		DEFAULT_SHARED_MEMORY_TYPE, shared_memory_options,
+		NULL, NULL, NULL
+	},
+
+	{
 		{"wal_sync_method", PGC_SIGHUP, WAL_SETTINGS,
 			gettext_noop("Selects the method used for forcing WAL updates to disk."),
 			NULL
@@ -4194,6 +4334,30 @@ static struct config_enum ConfigureNamesEnum[] =
 		},
 		&Password_encryption,
 		PASSWORD_TYPE_MD5, password_encryption_options,
+		NULL, NULL, NULL
+	},
+
+	{
+		{"ssl_min_protocol_version", PGC_SIGHUP, CONN_AUTH_SSL,
+			gettext_noop("Sets the minimum SSL/TLS protocol version to use."),
+			NULL,
+			GUC_SUPERUSER_ONLY
+		},
+		&ssl_min_protocol_version,
+		PG_TLS1_VERSION,
+		ssl_protocol_versions_info + 1 /* don't allow PG_TLS_ANY */,
+		NULL, NULL, NULL
+	},
+
+	{
+		{"ssl_max_protocol_version", PGC_SIGHUP, CONN_AUTH_SSL,
+			gettext_noop("Sets the maximum SSL/TLS protocol version to use."),
+			NULL,
+			GUC_SUPERUSER_ONLY
+		},
+		&ssl_max_protocol_version,
+		PG_TLS_ANY,
+		ssl_protocol_versions_info,
 		NULL, NULL, NULL
 	},
 
@@ -6316,7 +6480,7 @@ set_config_option(const char *name, const char *value,
 				return 0;
 			}
 			/* fall through to process the same as PGC_BACKEND */
-			/* FALLTHROUGH */
+			switch_fallthrough();
 		case PGC_BACKEND:
 			if (context == PGC_SIGHUP)
 			{
@@ -7697,7 +7861,7 @@ ExecSetVariableStmt(VariableSetStmt *stmt, bool isTopLevel)
 		case VAR_SET_DEFAULT:
 			if (stmt->is_local)
 				WarnNoTransactionBlock(isTopLevel, "SET LOCAL");
-			/* fall through */
+			switch_fallthrough();
 		case VAR_RESET:
 			if (strcmp(stmt->name, "transaction_isolation") == 0)
 				WarnNoTransactionBlock(isTopLevel, "RESET TRANSACTION");
@@ -9751,6 +9915,8 @@ ProcessGUCArray(ArrayType *array,
 		char	   *s;
 		char	   *name;
 		char	   *value;
+		char	   *namecopy;
+		char	   *valuecopy;
 
 		d = array_ref(array, 1, &i,
 					  -1 /* varlenarray */ ,
@@ -9775,13 +9941,18 @@ ProcessGUCArray(ArrayType *array,
 			continue;
 		}
 
-		(void) set_config_option(name, value,
+		/* free malloc'd strings immediately to avoid leak upon error */
+		namecopy = pstrdup(name);
+		free(name);
+		valuecopy = pstrdup(value);
+		free(value);
+
+		(void) set_config_option(namecopy, valuecopy,
 								 context, source,
 								 action, true, 0, false);
 
-		free(name);
-		if (value)
-			free(value);
+		pfree(namecopy);
+		pfree(valuecopy);
 		pfree(s);
 	}
 }
@@ -10213,34 +10384,50 @@ static bool
 call_string_check_hook(struct config_string *conf, char **newval, void **extra,
 					   GucSource source, int elevel)
 {
+	volatile bool result = true;
+
 	/* Quick success if no hook */
 	if (!conf->check_hook)
 		return true;
 
-	/* Reset variables that might be set by hook */
-	GUC_check_errcode_value = ERRCODE_INVALID_PARAMETER_VALUE;
-	GUC_check_errmsg_string = NULL;
-	GUC_check_errdetail_string = NULL;
-	GUC_check_errhint_string = NULL;
-
-	if (!conf->check_hook(newval, extra, source))
+	/*
+	 * If elevel is ERROR, or if the check_hook itself throws an elog
+	 * (undesirable, but not always avoidable), make sure we don't leak the
+	 * already-malloc'd newval string.
+	 */
+	PG_TRY();
 	{
-		ereport(elevel,
-				(errcode(GUC_check_errcode_value),
-				 GUC_check_errmsg_string ?
-				 errmsg_internal("%s", GUC_check_errmsg_string) :
-				 errmsg("invalid value for parameter \"%s\": \"%s\"",
-						conf->gen.name, *newval ? *newval : ""),
-				 GUC_check_errdetail_string ?
-				 errdetail_internal("%s", GUC_check_errdetail_string) : 0,
-				 GUC_check_errhint_string ?
-				 errhint("%s", GUC_check_errhint_string) : 0));
-		/* Flush any strings created in ErrorContext */
-		FlushErrorState();
-		return false;
-	}
+		/* Reset variables that might be set by hook */
+		GUC_check_errcode_value = ERRCODE_INVALID_PARAMETER_VALUE;
+		GUC_check_errmsg_string = NULL;
+		GUC_check_errdetail_string = NULL;
+		GUC_check_errhint_string = NULL;
 
-	return true;
+		if (!conf->check_hook(newval, extra, source))
+		{
+			ereport(elevel,
+					(errcode(GUC_check_errcode_value),
+					 GUC_check_errmsg_string ?
+					 errmsg_internal("%s", GUC_check_errmsg_string) :
+					 errmsg("invalid value for parameter \"%s\": \"%s\"",
+							conf->gen.name, *newval ? *newval : ""),
+					 GUC_check_errdetail_string ?
+					 errdetail_internal("%s", GUC_check_errdetail_string) : 0,
+					 GUC_check_errhint_string ?
+					 errhint("%s", GUC_check_errhint_string) : 0));
+			/* Flush any strings created in ErrorContext */
+			FlushErrorState();
+			result = false;
+		}
+	}
+	PG_CATCH();
+	{
+		free(*newval);
+		PG_RE_THROW();
+	}
+	PG_END_TRY();
+
+	return result;
 }
 
 static bool
@@ -10850,6 +11037,65 @@ show_data_directory_mode(void)
 
 	snprintf(buf, sizeof(buf), "%04o", data_directory_mode);
 	return buf;
+}
+
+static bool
+check_transaction_priority_lower_bound(double *newval, void **extra, GucSource source)
+{
+	if (*newval > yb_transaction_priority_upper_bound) {
+		GUC_check_errdetail("must be less than or equal to yb_transaction_priority_upper_bound (%f)",
+		                    yb_transaction_priority_upper_bound);
+		return false;
+	}
+
+	return true;
+}
+
+static bool
+check_transaction_priority_upper_bound(double *newval, void **extra, GucSource source)
+{
+	if (*newval < yb_transaction_priority_lower_bound) {
+		GUC_check_errdetail("must be greater than or equal to yb_transaction_priority_lower_bound (%f)",
+		                    yb_transaction_priority_lower_bound);
+		return false;
+	}
+
+	return true;
+}
+
+static bool
+check_max_backoff(int *max_backoff_msecs, void **extra, GucSource source)
+{
+	if (*max_backoff_msecs < 0)
+	{
+		GUC_check_errdetail("must be greater than or equal to 0");
+		return false;
+	}
+
+	return true;
+}
+
+static bool
+check_min_backoff(int *min_backoff_msecs, void **extra, GucSource source)
+{
+	if (*min_backoff_msecs < 0)
+	{
+		GUC_check_errdetail("must be greater than or equal to 0");
+		return false;
+	}
+
+	return true;
+}
+
+static bool
+check_backoff_multiplier(double *multiplier, void **extra, GucSource source)
+{
+	if (*multiplier < 1)
+	{
+		GUC_check_errdetail("must be greater than or equal to 1");
+		return false;
+	}
+	return true;
 }
 
 #include "guc-file.c"

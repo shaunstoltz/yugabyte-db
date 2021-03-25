@@ -29,7 +29,7 @@ class SystemTablet : public tablet::AbstractTablet {
   SystemTablet(const Schema& schema, std::unique_ptr<YQLVirtualTable> yql_virtual_table,
                const TabletId& tablet_id);
 
-  const Schema& SchemaRef(const std::string& table_id = "") const override;
+  yb::SchemaPtr GetSchema(const std::string& table_id = "") const override;
 
   const common::YQLStorageIf& QLStorage() const override;
 
@@ -60,9 +60,11 @@ class SystemTablet : public tablet::AbstractTablet {
 
   CHECKED_STATUS HandlePgsqlReadRequest(CoarseTimePoint deadline,
                                         const ReadHybridTime& read_time,
+                                        bool is_explicit_request_read_time,
                                         const PgsqlReadRequestPB& pgsql_read_request,
                                         const TransactionMetadataPB& transaction_metadata,
-                                        tablet::PgsqlReadRequestResult* result) override {
+                                        tablet::PgsqlReadRequestResult* result,
+                                        size_t* num_rows_read) override {
     return STATUS(NotSupported, "Postgres system table is not yet supported");
   }
 
@@ -83,11 +85,11 @@ class SystemTablet : public tablet::AbstractTablet {
   bool IsTransactionalRequest(bool is_ysql_request) const override { return false; }
 
  private:
-  HybridTime DoGetSafeTime(
+  Result<HybridTime> DoGetSafeTime(
       tablet::RequireLease require_lease, HybridTime min_allowed,
       CoarseTimePoint deadline) const override;
 
-  Schema schema_;
+  yb::SchemaPtr schema_;
   std::unique_ptr<YQLVirtualTable> yql_virtual_table_;
   TabletId tablet_id_;
 };

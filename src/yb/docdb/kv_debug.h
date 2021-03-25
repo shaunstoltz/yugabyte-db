@@ -24,8 +24,9 @@
 namespace yb {
 namespace docdb {
 
-Result<std::string> DocDBKeyToDebugStr(Slice key_slice, StorageDbType db_type, KeyType* key_type);
-Result<std::string> DocDBValueToDebugStr(KeyType key_type, const std::string& key_str, Slice value);
+Result<std::string> DocDBKeyToDebugStr(Slice key_slice, StorageDbType db_type);
+
+Result<std::string> DocDBValueToDebugStr(KeyType key_type, Slice key, Slice value);
 
 }  // namespace docdb
 }  // namespace yb

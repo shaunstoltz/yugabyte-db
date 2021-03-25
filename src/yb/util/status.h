@@ -32,6 +32,7 @@
 #include <string>
 
 #include <boost/intrusive_ptr.hpp>
+#include <boost/optional.hpp>
 
 #include <boost/preprocessor/cat.hpp>
 #include <boost/preprocessor/seq/for_each.hpp>
@@ -222,6 +223,8 @@ class StatusErrorCodeImpl : public StatusErrorCode {
 
   explicit StatusErrorCodeImpl(const Status& status);
 
+  static boost::optional<StatusErrorCodeImpl> FromStatus(const Status& status);
+
   uint8_t Category() const override {
     return kCategory;
   }
@@ -306,6 +309,26 @@ class IntegralBackedErrorTag {
 
   static std::string DecodeToString(const uint8_t* source) {
     return Traits::ToString(Decode(source));
+  }
+};
+
+class StringVectorBackedErrorTag {
+ public:
+  typedef typename std::vector<std::string> Value;
+  typedef uint64_t SizeType;
+
+  static Value Decode(const uint8_t* source);
+
+  static size_t DecodeSize(const uint8_t* source) {
+    return Load<SizeType, LittleEndian>(source);
+  }
+
+  static size_t EncodedSize(const Value& value);
+
+  static uint8_t* Encode(const Value& value, uint8_t* out);
+
+  static std::string DecodeToString(const uint8_t* source) {
+    return AsString(Decode(source));
   }
 };
 
@@ -448,6 +471,9 @@ class STATUS_NODISCARD_CLASS Status {
     // TODO: Move error codes into an error_code.proto or something similar.
   };
 
+  // Return a new Status object with the same state except status code.
+  Status CloneAndReplaceCode(Code code) const;
+
   Status(Code code,
          const char* file_name,
          int line_number,
@@ -534,6 +560,16 @@ template <class Tag>
 StatusErrorCodeImpl<Tag>::StatusErrorCodeImpl(const Status& status)
     : value_(Tag::Decode(status.ErrorData(Tag::kCategory))) {}
 
+template <class Tag>
+boost::optional<StatusErrorCodeImpl<Tag>> StatusErrorCodeImpl<Tag>::FromStatus(
+    const Status& status) {
+  const auto* error_data = status.ErrorData(Tag::kCategory);
+  if (!error_data) {
+    return boost::none;
+  }
+  return StatusErrorCodeImpl<Tag>(Tag::Decode(error_data));
+}
+
 inline Status&& MoveStatus(Status&& status) {
   return std::move(status);
 }
@@ -566,47 +602,67 @@ inline std::ostream& operator<<(std::ostream& out, const Status& status) {
             __LINE__, \
             ::yb::Format(__VA_ARGS__)))
 
-// Utility macros to perform the appropriate check. If the check fails,
-// returns the specified (error) Status, with the given message.
-#define SCHECK_OP(var1, op, var2, type, msg) \
+#define STATUS_EC_FORMAT(status_type, error_code, ...) \
+    (::yb::Status(::yb::Status::BOOST_PP_CAT(k, status_type), \
+            __FILE__, \
+            __LINE__, \
+            ::yb::Format(__VA_ARGS__), error_code))
+
+// Utility macros to perform the appropriate check. If the check fails, returns the specified
+// (error) Status, with the given message.
+#define SCHECK(expr, status_type, msg) do { \
+    if (PREDICT_FALSE(!(expr))) return STATUS(status_type, (msg)); \
+  } while (0)
+
+#define SCHECK_FORMAT(expr, status_type, msg, ...) do { \
+    if (PREDICT_FALSE(!(expr))) return STATUS_FORMAT(status_type, (msg), __VA_ARGS__); \
+  } while (0)
+
+#define SCHECK_OP(var1, op, var2, status_type, msg) \
   do { \
     auto v1_tmp = (var1); \
     auto v2_tmp = (var2); \
-    if (PREDICT_FALSE(!((v1_tmp)op(v2_tmp)))) return STATUS(type, \
+    if (PREDICT_FALSE(!((v1_tmp) op (v2_tmp)))) return STATUS(status_type, \
       yb::Format("$0: $1 vs. $2", (msg), v1_tmp, v2_tmp)); \
   } while (0)
-#define SCHECK(expr, type, msg) SCHECK_OP(expr, ==, true, type, msg)
-#define SCHECK_EQ(var1, var2, type, msg) SCHECK_OP(var1, ==, var2, type, msg)
-#define SCHECK_NE(var1, var2, type, msg) SCHECK_OP(var1, !=, var2, type, msg)
-#define SCHECK_GT(var1, var2, type, msg) SCHECK_OP(var1, >, var2, type, msg)  // NOLINT.
-#define SCHECK_GE(var1, var2, type, msg) SCHECK_OP(var1, >=, var2, type, msg)
-#define SCHECK_LT(var1, var2, type, msg) SCHECK_OP(var1, <, var2, type, msg)  // NOLINT.
-#define SCHECK_LE(var1, var2, type, msg) SCHECK_OP(var1, <=, var2, type, msg)
-#define SCHECK_BOUNDS(var1, lbound, rbound, type, msg) \
+
+#define SCHECK_EQ(var1, var2, status_type, msg) SCHECK_OP(var1, ==, var2, status_type, msg)
+#define SCHECK_NE(var1, var2, status_type, msg) SCHECK_OP(var1, !=, var2, status_type, msg)
+#define SCHECK_GT(var1, var2, status_type, msg) SCHECK_OP(var1, >, var2, status_type, msg)
+#define SCHECK_GE(var1, var2, status_type, msg) SCHECK_OP(var1, >=, var2, status_type, msg)
+#define SCHECK_LT(var1, var2, status_type, msg) SCHECK_OP(var1, <, var2, status_type, msg)
+#define SCHECK_LE(var1, var2, status_type, msg) SCHECK_OP(var1, <=, var2, status_type, msg)
+#define SCHECK_BOUNDS(var1, lbound, rbound, status_type, msg) \
     do { \
-      SCHECK_GE(var1, lbound, type, msg); \
-      SCHECK_LE(var1, rbound, type, msg); \
+      SCHECK_GE(var1, lbound, status_type, msg); \
+      SCHECK_LE(var1, rbound, status_type, msg); \
     } while(false)
 
 #ifndef NDEBUG
 
-#define DSCHECK(expr, type, msg) SCHECK(expr, type, msg)
-#define DSCHECK_EQ(var1, var2, type, msg) SCHECK_EQ(var1, var2, type, msg)
-#define DSCHECK_NE(var1, var2, type, msg) SCHECK_NE(var1, var2, type, msg)
-#define DSCHECK_GT(var1, var2, type, msg) SCHECK_GT(var1, var2, type, msg)
-#define DSCHECK_GE(var1, var2, type, msg) SCHECK_GE(var1, var2, type, msg)
-#define DSCHECK_LT(var1, var2, type, msg) SCHECK_LT(var1, var2, type, msg)
-#define DSCHECK_LE(var1, var2, type, msg) SCHECK_LE(var1, var2, type, msg)
+// Debug mode ("not defined NDEBUG (non-debug-mode)" means "debug mode").
+// In case the check condition is false, we will crash with a CHECK failure.
+
+#define RSTATUS_DCHECK(expr, type, msg) DCHECK(expr) << msg
+#define RSTATUS_DCHECK_EQ(var1, var2, type, msg) DCHECK_EQ(var1, var2) << msg
+#define RSTATUS_DCHECK_NE(var1, var2, type, msg) DCHECK_NE(var1, var2) << msg
+#define RSTATUS_DCHECK_GT(var1, var2, type, msg) DCHECK_GT(var1, var2) << msg
+#define RSTATUS_DCHECK_GE(var1, var2, type, msg) DCHECK_GE(var1, var2) << msg
+#define RSTATUS_DCHECK_LT(var1, var2, type, msg) DCHECK_LT(var1, var2) << msg
+#define RSTATUS_DCHECK_LE(var1, var2, type, msg) DCHECK_LE(var1, var2) << msg
 
 #else
 
-#define DSCHECK(expr, type, msg) DCHECK(expr) << msg
-#define DSCHECK_EQ(var1, var2, type, msg) DCHECK_EQ(var1, var2) << msg
-#define DSCHECK_NE(var1, var2, type, msg) DCHECK_NE(var1, var2) << msg
-#define DSCHECK_GT(var1, var2, type, msg) DCHECK_GT(var1, var2) << msg
-#define DSCHECK_GE(var1, var2, type, msg) DCHECK_GE(var1, var2) << msg
-#define DSCHECK_LT(var1, var2, type, msg) DCHECK_LT(var1, var2) << msg
-#define DSCHECK_LE(var1, var2, type, msg) DCHECK_LE(var1, var2) << msg
+// Release mode.
+// In case the check condition is false, we will return an error status.
+
+#define RSTATUS_DCHECK(expr, type, msg) SCHECK(expr, type, msg)
+#define RSTATUS_DCHECK_EQ(var1, var2, type, msg) SCHECK_EQ(var1, var2, type, msg)
+#define RSTATUS_DCHECK_NE(var1, var2, type, msg) SCHECK_NE(var1, var2, type, msg)
+#define RSTATUS_DCHECK_GT(var1, var2, type, msg) SCHECK_GT(var1, var2, type, msg)
+#define RSTATUS_DCHECK_GE(var1, var2, type, msg) SCHECK_GE(var1, var2, type, msg)
+#define RSTATUS_DCHECK_LT(var1, var2, type, msg) SCHECK_LT(var1, var2, type, msg)
+#define RSTATUS_DCHECK_LE(var1, var2, type, msg) SCHECK_LE(var1, var2, type, msg)
 
 #endif
 

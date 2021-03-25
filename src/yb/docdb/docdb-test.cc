@@ -16,6 +16,11 @@
 #include <memory>
 #include <string>
 
+#include "yb/common/doc_hybrid_time.h"
+#include "yb/common/ql_value.h"
+#include "yb/docdb/doc_key.h"
+#include "yb/docdb/primitive_value.h"
+#include "yb/rocksdb/cache.h"
 #include "yb/rocksdb/db.h"
 #include "yb/rocksdb/db/db_impl.h"
 #include "yb/rocksdb/db/version_set.h"
@@ -23,6 +28,9 @@
 #include "yb/rocksdb/util/statistics.h"
 
 #include "yb/common/hybrid_time.h"
+#include "yb/docdb/doc_reader.h"
+#include "yb/docdb/doc_reader_redis.h"
+#include "yb/docdb/docdb_debug.h"
 #include "yb/docdb/docdb-internal.h"
 #include "yb/docdb/docdb_compaction_filter.h"
 #include "yb/docdb/docdb_test_base.h"
@@ -30,6 +38,7 @@
 #include "yb/docdb/in_mem_docdb.h"
 #include "yb/docdb/intent.h"
 #include "yb/gutil/stringprintf.h"
+#include "yb/gutil/walltime.h"
 #include "yb/rocksutil/yb_rocksdb.h"
 #include "yb/tablet/tablet_options.h"
 #include "yb/server/hybrid_clock.h"
@@ -37,12 +46,15 @@
 #include "yb/docdb/docdb_rocksdb_util.h"
 
 #include "yb/util/minmax.h"
+#include "yb/util/net/net_util.h"
 #include "yb/util/path_util.h"
+#include "yb/util/random_util.h"
 #include "yb/util/size_literals.h"
 #include "yb/util/string_trim.h"
 #include "yb/util/test_macros.h"
 #include "yb/util/test_util.h"
 #include "yb/util/strongly_typed_bool.h"
+#include "yb/util/yb_partition.h"
 
 using std::cout;
 using std::endl;
@@ -62,7 +74,7 @@ using namespace std::chrono_literals;
 
 DECLARE_bool(use_docdb_aware_bloom_filter);
 DECLARE_int32(max_nexts_to_avoid_seek);
-DECLARE_bool(docdb_sort_weak_intents_in_tests);
+DECLARE_bool(TEST_docdb_sort_weak_intents_in_tests);
 
 #define ASSERT_DOC_DB_DEBUG_DUMP_STR_EQ(str) ASSERT_NO_FATALS(AssertDocDbDebugDumpStrEq(str))
 
@@ -85,6 +97,11 @@ class DocDBTest : public DocDBTestBase {
 
   ~DocDBTest() override {
   }
+
+  virtual void GetSubDoc(
+      const KeyBytes& subdoc_key, SubDocument* result, bool* found_result,
+      const TransactionOperationContextOpt& txn_op_context = boost::none,
+      const ReadHybridTime& read_time = ReadHybridTime::Max()) = 0;
 
   // This is the baseline state of the database that we set up and come back to as we test various
   // operations.
@@ -223,18 +240,15 @@ SubDocKey(DocKey([], ["mydockey", 123456]), ["subkey_b", "subkey_d"; HT{ physica
     // TODO(dtxn) - check both transaction and non-transaction path?
     // https://yugabyte.atlassian.net/browse/ENG-2177
     auto encoded_subdoc_key = subdoc_key.EncodeWithoutHt();
-    GetSubDocumentData data = { encoded_subdoc_key, &doc_from_rocksdb, &subdoc_found_in_rocksdb };
-    EXPECT_OK(GetSubDocument(
-        doc_db(), data, rocksdb::kDefaultQueryId,
-        kNonTransactionalOperationContext, CoarseTimePoint::max() /* deadline */,
-        ReadHybridTime::SingleTime(ht)));
+    GetSubDoc(
+        encoded_subdoc_key, &doc_from_rocksdb, &subdoc_found_in_rocksdb,
+        kNonTransactionalOperationContext, ReadHybridTime::SingleTime(ht));
     if (subdoc_string.empty()) {
       EXPECT_FALSE(subdoc_found_in_rocksdb);
       return;
     }
     EXPECT_TRUE(subdoc_found_in_rocksdb);
     EXPECT_STR_EQ_VERBOSE_TRIMMED(subdoc_string, doc_from_rocksdb.ToString());
-
   }
 
   // Tries to read some documents from the DB that is assumed to be in a state described by
@@ -250,9 +264,9 @@ SubDocKey(DocKey([], ["mydockey", 123456]), ["subkey_b", "subkey_d"; HT{ physica
       const int expected_num_iterators_increment, int *total_iterators) {
     if (FLAGS_use_docdb_aware_bloom_filter) {
       const auto total_useful_updated =
-          options().statistics->getTickerCount(rocksdb::BLOOM_FILTER_USEFUL);
+          regular_db_options().statistics->getTickerCount(rocksdb::BLOOM_FILTER_USEFUL);
       const auto total_iterators_updated =
-          options().statistics->getTickerCount(rocksdb::NO_TABLE_CACHE_ITERATORS);
+          regular_db_options().statistics->getTickerCount(rocksdb::NO_TABLE_CACHE_ITERATORS);
       if (expected_max_increment > 0) {
         ASSERT_GT(total_useful_updated, *total_useful);
         ASSERT_LE(total_useful_updated, *total_useful + expected_max_increment);
@@ -266,9 +280,7 @@ SubDocKey(DocKey([], ["mydockey", 123456]), ["subkey_b", "subkey_d"; HT{ physica
   }
 
   InetAddress GetInetAddress(const std::string &strval) {
-    InetAddress addr;
-    CHECK_OK(addr.FromString(strval));
-    return addr;
+    return InetAddress(CHECK_RESULT(ParseIpAddress(strval)));
   }
 
   void InsertInet(const std::string strval) {
@@ -405,12 +417,80 @@ SubDocKey(DocKey([], ["mydockey", 123456]), ["subkey_b", "subkey_d"; HT{ physica
     ++*time_iter;
 
   }
-
 };
 
-class DocDBTestWithoutBlockCache: public DocDBTest {
- protected:
-  size_t block_cache_size() const override { return 0; }
+void GetSubDocQl(
+      const DocDB& doc_db, const KeyBytes& subdoc_key, SubDocument* result, bool* found_result,
+      const TransactionOperationContextOpt& txn_op_context, const ReadHybridTime& read_time,
+      const vector<PrimitiveValue>* projection = nullptr) {
+  auto doc_from_rocksdb_opt = ASSERT_RESULT(TEST_GetSubDocument(
+    subdoc_key, doc_db, rocksdb::kDefaultQueryId, txn_op_context,
+    CoarseTimePoint::max() /* deadline */, read_time, projection));
+  if (doc_from_rocksdb_opt) {
+    *found_result = true;
+    *result = *doc_from_rocksdb_opt;
+  } else {
+    *found_result = false;
+    *result = SubDocument();
+  }
+}
+
+void GetSubDocRedis(
+      const DocDB& doc_db, const KeyBytes& subdoc_key, SubDocument* result, bool* found_result,
+      const TransactionOperationContextOpt& txn_op_context, const ReadHybridTime& read_time) {
+  GetRedisSubDocumentData data = { subdoc_key, result, found_result };
+  ASSERT_OK(GetRedisSubDocument(
+      doc_db, data, rocksdb::kDefaultQueryId,
+      txn_op_context, CoarseTimePoint::max() /* deadline */,
+      read_time));
+}
+
+// The list of types we want to test.
+YB_DEFINE_ENUM(TestDocDb, (kQlReader)(kRedisReader));
+
+class DocDBTestWrapper : public DocDBTest, public testing::WithParamInterface<TestDocDb>  {
+ public:
+  void GetSubDoc(
+      const KeyBytes& subdoc_key, SubDocument* result, bool* found_result,
+      const TransactionOperationContextOpt& txn_op_context = boost::none,
+      const ReadHybridTime& read_time = ReadHybridTime::Max()) override {
+    switch (GetParam()) {
+      case TestDocDb::kQlReader: {
+        GetSubDocQl(doc_db(), subdoc_key, result, found_result, txn_op_context, read_time);
+        break;
+      }
+      case TestDocDb::kRedisReader: {
+        GetSubDocRedis(
+            doc_db(), subdoc_key, result, found_result, txn_op_context, read_time);
+        break;
+      }
+    }
+  }
+};
+
+INSTANTIATE_TEST_CASE_P(DocDBTests,
+                        DocDBTestWrapper,
+                        testing::Values(TestDocDb::kQlReader, TestDocDb::kRedisReader));
+
+class DocDBTestQl : public DocDBTest {
+ public:
+  void GetSubDoc(
+      const KeyBytes& subdoc_key, SubDocument* result, bool* found_result,
+      const TransactionOperationContextOpt& txn_op_context = boost::none,
+      const ReadHybridTime& read_time = ReadHybridTime::Max()) override {
+    GetSubDocQl(doc_db(), subdoc_key, result, found_result, txn_op_context, read_time);
+  }
+};
+
+class DocDBTestRedis : public DocDBTest {
+ public:
+  void GetSubDoc(
+      const KeyBytes& subdoc_key, SubDocument* result, bool* found_result,
+      const TransactionOperationContextOpt& txn_op_context = boost::none,
+      const ReadHybridTime& read_time = ReadHybridTime::Max()) override {
+    GetSubDocRedis(
+        doc_db(), subdoc_key, result, found_result, txn_op_context, read_time);
+  }
 };
 
 // Static constant initialization should be completely independent (cannot initialize one using the
@@ -456,10 +536,9 @@ void DocDBTest::CheckExpectedLatestDBState() {
   bool doc_found = false;
   // TODO(dtxn) - check both transaction and non-transaction path?
   auto encoded_subdoc_key = subdoc_key.EncodeWithoutHt();
-  GetSubDocumentData data = { encoded_subdoc_key, &subdoc, &doc_found };
-  ASSERT_OK(GetSubDocument(
-      doc_db(), data, rocksdb::kDefaultQueryId,
-      kNonTransactionalOperationContext, CoarseTimePoint::max() /* deadline */));
+  GetSubDoc(
+      encoded_subdoc_key, &subdoc, &doc_found,
+      kNonTransactionalOperationContext);
   ASSERT_TRUE(doc_found);
   ASSERT_STR_EQ_VERBOSE_TRIMMED(
       R"#(
@@ -476,7 +555,7 @@ void DocDBTest::CheckExpectedLatestDBState() {
 
 // ------------------------------------------------------------------------------------------------
 
-TEST_F(DocDBTest, DocPathTest) {
+TEST_P(DocDBTestWrapper, DocPathTest) {
   DocKey doc_key(PrimitiveValues("mydockey", 10, "mydockey", 20));
   DocPath doc_path(doc_key.Encode(), "first_subkey", 123);
   ASSERT_EQ(2, doc_path.num_subkeys());
@@ -484,7 +563,129 @@ TEST_F(DocDBTest, DocPathTest) {
   ASSERT_EQ("123", doc_path.subkey(1).ToString());
 }
 
-TEST_F(DocDBTest, HistoryCompactionFirstRowHandlingRegression) {
+TEST_P(DocDBTestWrapper, KeyAsEmptyObjectIsNotMasked) {
+  const DocKey doc_key(PrimitiveValues(DocKeyHash(1234)));
+  KeyBytes encoded_doc_key(doc_key.Encode());
+  ASSERT_OK(SetPrimitive(
+      DocPath(encoded_doc_key), PrimitiveValue::kObject, 252_usec_ht));
+  ASSERT_OK(SetPrimitive(
+      DocPath(encoded_doc_key, PrimitiveValue()), PrimitiveValue::kObject, 617_usec_ht));
+  ASSERT_OK(DeleteSubDoc(
+      DocPath(encoded_doc_key, PrimitiveValue(), PrimitiveValue(ValueType::kFalse)), 675_usec_ht));
+  ASSERT_OK(SetPrimitive(
+      DocPath(encoded_doc_key, PrimitiveValue(), PrimitiveValue(ValueType::kFalse)),
+      PrimitiveValue(12345), 617_usec_ht));
+  ASSERT_OK(SetPrimitive(
+      DocPath(encoded_doc_key, "later"), PrimitiveValue(1), 336_usec_ht));
+  ASSERT_DOC_DB_DEBUG_DUMP_STR_EQ(R"#(
+      SubDocKey(DocKey([], [1234]), [HT{ physical: 252 }]) -> {}
+      SubDocKey(DocKey([], [1234]), [null; HT{ physical: 617 }]) -> {}
+      SubDocKey(DocKey([], [1234]), [null, false; HT{ physical: 675 }]) -> DEL
+      SubDocKey(DocKey([], [1234]), [null, false; HT{ physical: 617 }]) -> 12345
+      SubDocKey(DocKey([], [1234]), ["later"; HT{ physical: 336 }]) -> 1
+      )#");
+  VerifySubDocument(SubDocKey(doc_key), 4000_usec_ht,
+                    R"#(
+{
+  null: {},
+  "later": 1
+}
+      )#");
+}
+
+TEST_P(DocDBTestWrapper, NullChildObjectShouldMaskValues) {
+  const DocKey doc_key(PrimitiveValues("mydockey", 123456));
+  KeyBytes encoded_doc_key(doc_key.Encode());
+  ASSERT_OK(SetPrimitive(
+      DocPath(encoded_doc_key), PrimitiveValue::kObject, 1000_usec_ht));
+  ASSERT_OK(SetPrimitive(
+      DocPath(encoded_doc_key, "obj"), PrimitiveValue::kObject, 2000_usec_ht));
+  ASSERT_OK(SetPrimitive(
+      DocPath(encoded_doc_key, "obj", "key"), PrimitiveValue("value"), 2000_usec_ht));
+  ASSERT_OK(SetPrimitive(
+      DocPath(encoded_doc_key, "obj"), PrimitiveValue(ValueType::kNullHigh), 3000_usec_ht));
+  ASSERT_DOC_DB_DEBUG_DUMP_STR_EQ(R"#(
+      SubDocKey(DocKey([], ["mydockey", 123456]), [HT{ physical: 1000 }]) -> {}
+      SubDocKey(DocKey([], ["mydockey", 123456]), ["obj"; HT{ physical: 3000 }]) -> null
+      SubDocKey(DocKey([], ["mydockey", 123456]), ["obj"; HT{ physical: 2000 }]) -> {}
+      SubDocKey(DocKey([], ["mydockey", 123456]), ["obj", "key"; HT{ physical: 2000 }]) -> "value"
+      )#");
+  VerifySubDocument(SubDocKey(doc_key), 4000_usec_ht,
+                    R"#(
+{
+  "obj": null
+}
+      )#");
+}
+
+// This test confirms that we return the appropriate value for doc_found in the case that the last
+// projection we look at is not present. Previously we had a bug where we would set doc_found to
+// true if the last projection was present, and false otherwise, reguardless of other projections
+// considered. This test ensures we have the correct behavior, returning true as long as any
+// projection is present, even if the last one is absent.
+TEST_F(DocDBTestQl, LastProjectionIsNull) {
+  const DocKey doc_key(PrimitiveValues("mydockey", 123456));
+  KeyBytes encoded_doc_key(doc_key.Encode());
+  ASSERT_OK(SetPrimitive(
+      DocPath(encoded_doc_key), PrimitiveValue::kObject, 1000_usec_ht));
+  ASSERT_OK(SetPrimitive(
+      DocPath(encoded_doc_key, "p1"), PrimitiveValue("value"), 2000_usec_ht));
+  ASSERT_OK(SetPrimitive(
+      DocPath(encoded_doc_key, "p2"), PrimitiveValue(ValueType::kTombstone), 2000_usec_ht));
+  ASSERT_DOC_DB_DEBUG_DUMP_STR_EQ(R"#(
+      SubDocKey(DocKey([], ["mydockey", 123456]), [HT{ physical: 1000 }]) -> {}
+      SubDocKey(DocKey([], ["mydockey", 123456]), ["p1"; HT{ physical: 2000 }]) -> "value"
+      SubDocKey(DocKey([], ["mydockey", 123456]), ["p2"; HT{ physical: 2000 }]) -> DEL
+      )#");
+
+  auto subdoc_key = SubDocKey(doc_key);
+  auto encoded_subdoc_key = subdoc_key.EncodeWithoutHt();
+  SubDocument doc_from_rocksdb;
+  bool subdoc_found_in_rocksdb = false;
+  const vector<PrimitiveValue> projection = {
+    PrimitiveValue("p1"),
+    PrimitiveValue("p2")
+  };
+
+  GetSubDocQl(
+      doc_db(), encoded_subdoc_key, &doc_from_rocksdb, &subdoc_found_in_rocksdb,
+      kNonTransactionalOperationContext, ReadHybridTime::SingleTime(4000_usec_ht),
+      &projection);
+  EXPECT_TRUE(subdoc_found_in_rocksdb);
+  EXPECT_STR_EQ_VERBOSE_TRIMMED(R"#(
+{
+  "p1": "value",
+  "p2": DEL
+}
+  )#", doc_from_rocksdb.ToString());
+}
+
+TEST_F(DocDBTestQl, ColocatedTableTombstoneTest) {
+  constexpr PgTableOid pgtable_id(0x4001);
+  DocKey doc_key_1(PrimitiveValues("mydockey", 123456));
+  doc_key_1.set_pgtable_id(pgtable_id);
+  DocKey doc_key_2(PrimitiveValues("mydockey", 789123));
+  doc_key_2.set_pgtable_id(pgtable_id);
+  ASSERT_OK(SetPrimitive(
+      doc_key_1.Encode(), PrimitiveValue(1), 1000_usec_ht));
+  ASSERT_OK(SetPrimitive(
+      doc_key_2.Encode(), PrimitiveValue(2), 1000_usec_ht));
+
+  DocKey doc_key_table;
+  doc_key_table.set_pgtable_id(pgtable_id);
+  ASSERT_OK(DeleteSubDoc(
+      doc_key_table.Encode(), 2000_usec_ht));
+
+  ASSERT_DOC_DB_DEBUG_DUMP_STR_EQ(R"#(
+      SubDocKey(DocKey(PgTableId=16385, [], []), [HT{ physical: 2000 }]) -> DEL
+      SubDocKey(DocKey(PgTableId=16385, [], ["mydockey", 123456]), [HT{ physical: 1000 }]) -> 1
+      SubDocKey(DocKey(PgTableId=16385, [], ["mydockey", 789123]), [HT{ physical: 1000 }]) -> 2
+      )#");
+  VerifySubDocument(SubDocKey(doc_key_1), 4000_usec_ht, "");
+  VerifySubDocument(SubDocKey(doc_key_1), 1500_usec_ht, "1");
+}
+
+TEST_P(DocDBTestWrapper, HistoryCompactionFirstRowHandlingRegression) {
   // A regression test for a bug in an initial version of compaction cleanup.
   const DocKey doc_key(PrimitiveValues("mydockey", 123456));
   KeyBytes encoded_doc_key(doc_key.Encode());
@@ -520,7 +721,7 @@ SubDocKey(DocKey([], ["mydockey", 123456]), ["subkey1"; HT{ physical: 3000 }]) -
       )#");
 }
 
-TEST_F(DocDBTest, SetPrimitiveQL) {
+TEST_P(DocDBTestWrapper, SetPrimitiveQL) {
   const DocKey doc_key(PrimitiveValues("mydockey", 123456));
   SetupRocksDBState(doc_key.Encode());
   ASSERT_DOC_DB_DEBUG_DUMP_STR_EQ(
@@ -543,8 +744,8 @@ SubDocKey(DocKey([], ["mydockey", 123456]), ["u"; HT{ physical: 1000 w: 6 }]) ->
      )#");
 }
 
-// This tests GetSubDocument without init markers. Basic Test tests with init markers.
-TEST_F(DocDBTest, GetSubDocumentTest) {
+// This tests reads on data without init markers. Basic Test tests with init markers.
+TEST_P(DocDBTestWrapper, GetSubDocumentTest) {
   const DocKey doc_key(PrimitiveValues("mydockey", 123456));
   SetupRocksDBState(doc_key.Encode());
 
@@ -700,7 +901,7 @@ TEST_F(DocDBTest, GetSubDocumentTest) {
 
 }
 
-TEST_F(DocDBTest, ListInsertAndGetTest) {
+TEST_P(DocDBTestWrapper, ListInsertAndGetTest) {
   SubDocument parent;
   SubDocument list({PrimitiveValue(10), PrimitiveValue(2)});
   DocKey doc_key(PrimitiveValues("list_test", 231));
@@ -709,7 +910,6 @@ TEST_F(DocDBTest, ListInsertAndGetTest) {
   parent.SetChild(PrimitiveValue("list2"), SubDocument(list));
   ASSERT_OK(InsertSubDocument(DocPath(encoded_doc_key), parent, HybridTime(100)));
 
-  // GetSubDocument Doesn't know that this is an array so it is returned as an object for now.
   VerifySubDocument(SubDocKey(doc_key), HybridTime(250),
       R"#(
   {
@@ -826,13 +1026,14 @@ SubDocKey(DocKey([], ["list_test", 231]), ["other"; \
   }
         )#");
 
-  vector<int> indexes = {2, 4};
   ReadHybridTime read_ht;
   read_ht.read = HybridTime(460);
-  vector<SubDocument> values = {
-      SubDocument(PrimitiveValue::kTombstone), SubDocument(PrimitiveValue(17))};
-  ASSERT_OK(ReplaceInList(DocPath(encoded_doc_key, PrimitiveValue("list2")),
-    indexes, values, read_ht, HybridTime(500), rocksdb::kDefaultQueryId));
+  ASSERT_OK(ReplaceInList(
+      DocPath(encoded_doc_key, PrimitiveValue("list2")), 1, SubDocument(PrimitiveValue::kTombstone),
+      read_ht, HybridTime(500), rocksdb::kDefaultQueryId));
+  ASSERT_OK(ReplaceInList(
+      DocPath(encoded_doc_key, PrimitiveValue("list2")), 2, SubDocument(PrimitiveValue(17)),
+      read_ht, HybridTime(500), rocksdb::kDefaultQueryId));
 
   ASSERT_DOC_DB_DEBUG_DUMP_STR_EQ(
       R"#(
@@ -854,7 +1055,7 @@ SubDocKey(DocKey([], ["list_test", 231]), ["list2", ArrayIndex(-7); \
 SubDocKey(DocKey([], ["list_test", 231]), ["list2", ArrayIndex(1); \
     HT{ physical: 0 logical: 100 w: 1 }]) -> 10
 SubDocKey(DocKey([], ["list_test", 231]), ["list2", ArrayIndex(2); \
-    HT{ physical: 0 logical: 500 w: 1 }]) -> 17
+    HT{ physical: 0 logical: 500 }]) -> 17
 SubDocKey(DocKey([], ["list_test", 231]), ["list2", ArrayIndex(2); \
     HT{ physical: 0 logical: 100 w: 2 }]) -> 2
 SubDocKey(DocKey([], ["list_test", 231]), ["list2", ArrayIndex(9); \
@@ -911,7 +1112,7 @@ SubDocKey(DocKey([], ["list_test", 231]), ["list2", ArrayIndex(-7); \
 SubDocKey(DocKey([], ["list_test", 231]), ["list2", ArrayIndex(1); \
     HT{ physical: 0 logical: 100 w: 1 }]) -> 10
 SubDocKey(DocKey([], ["list_test", 231]), ["list2", ArrayIndex(2); \
-    HT{ physical: 0 logical: 500 w: 1 }]) -> 17
+    HT{ physical: 0 logical: 500 }]) -> 17
 SubDocKey(DocKey([], ["list_test", 231]), ["list2", ArrayIndex(2); \
     HT{ physical: 0 logical: 100 w: 2 }]) -> 2
 SubDocKey(DocKey([], ["list_test", 231]), ["list2", ArrayIndex(9); \
@@ -952,7 +1153,79 @@ SubDocKey(DocKey([], ["list_test", 231]), ["other"; \
         )#");
 }
 
-TEST_F(DocDBTest, ExpiredValueCompactionTest) {
+TEST_P(DocDBTestWrapper, ListOverwriteAndInsertTest) {
+  SubDocument parent;
+  DocKey doc_key(PrimitiveValues("list_test", 231));
+  KeyBytes encoded_doc_key = doc_key.Encode();
+  ASSERT_OK(InsertSubDocument(DocPath(encoded_doc_key), parent, HybridTime(100)));
+
+  auto write_list = [&](const std::vector<PrimitiveValue>& children, const int logical_time) {
+    SubDocument list;
+    int idx = 1;
+    for (const auto& child : children) {
+      list.SetChild(PrimitiveValue::ArrayIndex(idx++), SubDocument(child));
+    }
+    ASSERT_OK(InsertSubDocument(DocPath(encoded_doc_key, "list"), list, HybridTime(logical_time)));
+  };
+
+  write_list(PrimitiveValues(1, 2, 3, 4, 5), 200);
+  write_list(PrimitiveValues(6, 7, 8), 300);
+
+  VerifySubDocument(SubDocKey(doc_key), HybridTime(350),
+      R"#(
+  {
+    "list": {
+      ArrayIndex(1): 6,
+      ArrayIndex(2): 7,
+      ArrayIndex(3): 8
+    }
+  }
+        )#");
+
+  ASSERT_DOC_DB_DEBUG_DUMP_STR_EQ(
+      R"#(
+SubDocKey(DocKey([], ["list_test", 231]), [HT{ physical: 0 logical: 100 }]) -> {}
+SubDocKey(DocKey([], ["list_test", 231]), ["list"; HT{ physical: 0 logical: 300 }]) -> {}
+SubDocKey(DocKey([], ["list_test", 231]), ["list"; HT{ physical: 0 logical: 200 }]) -> {}
+SubDocKey(DocKey([], ["list_test", 231]), ["list", ArrayIndex(1); \
+    HT{ physical: 0 logical: 300 w: 1 }]) -> 6
+SubDocKey(DocKey([], ["list_test", 231]), ["list", ArrayIndex(1); \
+    HT{ physical: 0 logical: 200 w: 1 }]) -> 1
+SubDocKey(DocKey([], ["list_test", 231]), ["list", ArrayIndex(2); \
+    HT{ physical: 0 logical: 300 w: 2 }]) -> 7
+SubDocKey(DocKey([], ["list_test", 231]), ["list", ArrayIndex(2); \
+    HT{ physical: 0 logical: 200 w: 2 }]) -> 2
+SubDocKey(DocKey([], ["list_test", 231]), ["list", ArrayIndex(3); \
+    HT{ physical: 0 logical: 300 w: 3 }]) -> 8
+SubDocKey(DocKey([], ["list_test", 231]), ["list", ArrayIndex(3); \
+    HT{ physical: 0 logical: 200 w: 3 }]) -> 3
+SubDocKey(DocKey([], ["list_test", 231]), ["list", ArrayIndex(4); \
+    HT{ physical: 0 logical: 200 w: 4 }]) -> 4
+SubDocKey(DocKey([], ["list_test", 231]), ["list", ArrayIndex(5); \
+    HT{ physical: 0 logical: 200 w: 5 }]) -> 5
+        )#");
+
+  // Replacing cql index 1 with 17 should work as expected, ignoring overwritten DocDB entries
+  ASSERT_OK(ReplaceInList(
+      DocPath(encoded_doc_key, PrimitiveValue("list")), 1, SubDocument(PrimitiveValue(17)),
+      ReadHybridTime::SingleTime(HybridTime(400)), HybridTime(500), rocksdb::kDefaultQueryId));
+  // Replacing cql index 3 should fail, rather than overwrite an old overwritten index
+  ASSERT_NOK(ReplaceInList(
+      DocPath(encoded_doc_key, PrimitiveValue("list")), 3, SubDocument(PrimitiveValue(17)),
+      ReadHybridTime::SingleTime(HybridTime(400)), HybridTime(500), rocksdb::kDefaultQueryId));
+  VerifySubDocument(SubDocKey(doc_key), HybridTime(500),
+      R"#(
+  {
+    "list": {
+      ArrayIndex(1): 6,
+      ArrayIndex(2): 17,
+      ArrayIndex(3): 8
+    }
+  }
+        )#");
+}
+
+TEST_P(DocDBTestWrapper, ExpiredValueCompactionTest) {
   const DocKey doc_key(PrimitiveValues("k1"));
   const MonoDelta one_ms = 1ms;
   const MonoDelta two_ms = 2ms;
@@ -985,10 +1258,55 @@ SubDocKey(DocKey([], ["k1"]), ["s2"; HT{ physical: 1000 }]) -> "v21"; ttl: 0.003
       )#");
 }
 
+TEST_P(DocDBTestWrapper, GetDocTwoLists) {
+  SubDocument parent;
+  SubDocument list1({PrimitiveValue(10), PrimitiveValue(2)});
+  DocKey doc_key(PrimitiveValues("foo", 231));
+
+  KeyBytes encoded_doc_key = doc_key.Encode();
+  parent.SetChild(PrimitiveValue("key1"), SubDocument(list1));
+  ASSERT_OK(InsertSubDocument(DocPath(encoded_doc_key), parent, HybridTime(100)));
+
+  SubDocKey sub_doc_key(doc_key, PrimitiveValue("key2"));
+  KeyBytes encoded_sub_doc_key = sub_doc_key.Encode();
+  SubDocument list2({PrimitiveValue(31), PrimitiveValue(32)});
+
+  ASSERT_OK(InsertSubDocument(DocPath(encoded_sub_doc_key), list2, HybridTime(100)));
+
+  ASSERT_DOC_DB_DEBUG_DUMP_STR_EQ(
+      R"#(
+SubDocKey(DocKey([], ["foo", 231]), [HT{ physical: 0 logical: 100 }]) -> {}
+SubDocKey(DocKey([], ["foo", 231]), ["key1", ArrayIndex(1); HT{ physical: 0 logical: 100 w: 1 }]) \
+-> 10
+SubDocKey(DocKey([], ["foo", 231]), ["key1", ArrayIndex(2); HT{ physical: 0 logical: 100 w: 2 }]) \
+-> 2
+SubDocKey(DocKey([], ["foo", 231]), ["key2"; HT{ physical: 0 logical: 100 }]) -> []
+SubDocKey(DocKey([], ["foo", 231]), ["key2", ArrayIndex(3); HT{ physical: 0 logical: 100 w: 1 }]) \
+-> 31
+SubDocKey(DocKey([], ["foo", 231]), ["key2", ArrayIndex(4); HT{ physical: 0 logical: 100 w: 2 }]) \
+-> 32
+      )#");
+
+  VerifySubDocument(SubDocKey(doc_key), HybridTime(550),
+      R"#(
+  {
+    "key1": {
+      ArrayIndex(1): 10,
+      ArrayIndex(2): 2
+    },
+    "key2": {
+      ArrayIndex(3): 31,
+      ArrayIndex(4): 32
+    }
+  }
+      )#");
+}
+
+
 // Compaction testing with TTL merge records for generic Redis collections.
 // Observe that because only collection-level merge records are supported,
 // all tests begin with initializing a vanilla collection and adding TTL over it.
-TEST_F(DocDBTest, RedisCollectionTTLCompactionTest) {
+TEST_P(DocDBTestWrapper, RedisCollectionTTLCompactionTest) {
   const MonoDelta one_ms = 1ms;
   string key_string = "k0";
   string val_string = "v0";
@@ -1573,7 +1891,7 @@ SubDocKey(DocKey([], ["k3"]), ["sk3"; HT{ physical: 7000 w: 2 }]) -> "vY"
 }
 
 // Basic compaction testing for TTL in Redis.
-TEST_F(DocDBTest, RedisTTLCompactionTest) {
+TEST_P(DocDBTestWrapper, RedisTTLCompactionTest) {
   const MonoDelta one_ms = 1ms;
   string key_string = "k0";
   string val_string = "v0";
@@ -1778,7 +2096,7 @@ SubDocKey(DocKey([], ["k6"]), [HT{ physical: 9000 }]) -> "v6"; ttl: 0.009s
       )#");
 }
 
-TEST_F(DocDBTest, TTLCompactionTest) {
+TEST_P(DocDBTestWrapper, TTLCompactionTest) {
   const DocKey doc_key(PrimitiveValues("k1"));
   const MonoDelta one_ms = 1ms;
   const HybridTime t0 = 1000_usec_ht;
@@ -1885,7 +2203,7 @@ SubDocKey(DocKey([], ["k1"]), [ColumnId(3); HT{ physical: 1000 }]) -> "v4"
       )#");
 }
 
-TEST_F(DocDBTest, TableTTLCompactionTest) {
+TEST_P(DocDBTestWrapper, TableTTLCompactionTest) {
   const DocKey doc_key(PrimitiveValues("k1"));
   const HybridTime t1 = 1000_usec_ht;
   const HybridTime t2 = 2000_usec_ht;
@@ -1938,7 +2256,7 @@ SubDocKey(DocKey([], ["k1"]), ["s3"; HT{ physical: 2000 }]) -> "v3"; ttl: 0.000s
 }
 
 // Test table tombstones for colocated tables.
-TEST_F(DocDBTest, TableTombstoneCompaction) {
+TEST_P(DocDBTestWrapper, TableTombstoneCompaction) {
   constexpr PgTableOid pgtable_id(0x4001);
   HybridTime t = 1000_usec_ht;
 
@@ -2040,7 +2358,7 @@ SubDocKey(DocKey(PgTableId=16385, [], ["r1"]), [SystemColumnId(0); HT{ physical:
       )#");
 }
 
-TEST_F(DocDBTest, MinorCompactionNoDeletions) {
+TEST_P(DocDBTestWrapper, MinorCompactionNoDeletions) {
   ASSERT_OK(DisableCompactions());
   const DocKey doc_key(PrimitiveValues("k"));
   KeyBytes encoded_doc_key(doc_key.Encode());
@@ -2114,7 +2432,7 @@ SubDocKey(DocKey([], ["k"]), [HT{ physical: 5000 }]) -> "v5"  // file 11
       )#");
 }
 
-TEST_F(DocDBTest, MinorCompactionWithDeletions) {
+TEST_P(DocDBTestWrapper, MinorCompactionWithDeletions) {
   ASSERT_OK(DisableCompactions());
   const DocKey doc_key(PrimitiveValues("k"));
   KeyBytes encoded_doc_key(doc_key.Encode());
@@ -2189,7 +2507,7 @@ SubDocKey(DocKey([], ["k"]), [HT{ physical: 6000 }]) -> "v6"  // file 11
       )#");
 }
 
-TEST_F(DocDBTest, BasicTest) {
+TEST_P(DocDBTestWrapper, BasicTest) {
   // A few points to make it easier to understand the expected binary representations here:
   // - Initial bytes such as 'S' (kString), 'I' (kInt64) correspond to members of the enum
   //   ValueType.
@@ -2434,7 +2752,7 @@ SubDocKey(DocKey([], ["mydockey", 123456]), [HT{ physical: 8000 }]) -> {}
   }
 }
 
-TEST_F(DocDBTest, MultiOperationDocWriteBatch) {
+TEST_P(DocDBTestWrapper, MultiOperationDocWriteBatch) {
   const auto encoded_doc_key = DocKey(PrimitiveValues("a")).Encode();
   auto dwb = MakeDocWriteBatch();
   ASSERT_OK(dwb.SetPrimitive(DocPath(encoded_doc_key, "b"), PrimitiveValue("v1")));
@@ -2459,7 +2777,7 @@ TEST_F(DocDBTest, MultiOperationDocWriteBatch) {
       )#", dwb_str);
 }
 
-class DocDBTestBoundaryValues: public DocDBTest {
+class DocDBTestBoundaryValues: public DocDBTestWrapper {
  protected:
   void TestBoundaryValues(size_t flush_rate) {
     struct Trackers {
@@ -2549,7 +2867,7 @@ TEST_F_EX(DocDBTest, BoundaryValuesMultiFiles, DocDBTestBoundaryValues) {
   TestBoundaryValues(350);
 }
 
-TEST_F(DocDBTest, BloomFilterTest) {
+TEST_P(DocDBTestWrapper, BloomFilterTest) {
   // Turn off "next instead of seek" optimization, because this test rely on DocDB to do seeks.
   FLAGS_max_nexts_to_avoid_seek = 0;
   // Write batch and flush options.
@@ -2569,7 +2887,7 @@ TEST_F(DocDBTest, BloomFilterTest) {
   auto flush_rocksdb = [this, &total_table_iterators]() {
     ASSERT_OK(FlushRocksDbAndWait());
     total_table_iterators =
-        options().statistics->getTickerCount(rocksdb::NO_TABLE_CACHE_ITERATORS);
+        regular_db_options().statistics->getTickerCount(rocksdb::NO_TABLE_CACHE_ITERATORS);
   };
 
   // The following code will set 2/3 keys at a time and flush those 2 writes in a new file. That
@@ -2599,10 +2917,7 @@ TEST_F(DocDBTest, BloomFilterTest) {
 
   auto get_doc = [this, &doc_from_rocksdb, &subdoc_found_in_rocksdb](const DocKey &key) {
     auto encoded_subdoc_key = SubDocKey(key).EncodeWithoutHt();
-    GetSubDocumentData data = { encoded_subdoc_key, &doc_from_rocksdb, &subdoc_found_in_rocksdb };
-    ASSERT_OK(GetSubDocument(
-        doc_db(), data, rocksdb::kDefaultQueryId,
-        boost::none /* txn_op_context */, CoarseTimePoint::max() /* deadline */));
+    GetSubDoc(encoded_subdoc_key, &doc_from_rocksdb, &subdoc_found_in_rocksdb);
   };
 
   ASSERT_NO_FATALS(CheckBloom(0, &total_bloom_useful, 0, &total_table_iterators));
@@ -2613,8 +2928,8 @@ TEST_F(DocDBTest, BloomFilterTest) {
   ASSERT_NO_FATALS(get_doc(key2));
   ASSERT_TRUE(!subdoc_found_in_rocksdb);
   // Bloom filter excluded this file.
-  // docdb::GetSubDocument sometimes seeks twice - first time on key2 and second time to advance
-  // out of it, because key2 was found.
+  // docdb::TEST_GetSubDocument sometimes seeks twice - first time on key2 and second time to
+  // advance out of it, because key2 was found.
   ASSERT_NO_FATALS(CheckBloom(2, &total_bloom_useful, 0, &total_table_iterators));
 
   ASSERT_NO_FATALS(get_doc(key3));
@@ -2648,7 +2963,76 @@ TEST_F(DocDBTest, BloomFilterTest) {
   ASSERT_NO_FATALS(CheckBloom(2, &total_bloom_useful, 2, &total_table_iterators));
 }
 
-TEST_F(DocDBTest, MergingIterator) {
+TEST_P(DocDBTestWrapper, BloomFilterCorrectness) {
+  // Write batch and flush options.
+  auto dwb = MakeDocWriteBatch();
+  ASSERT_OK(FlushRocksDbAndWait());
+
+  // We need to write enough keys for fixed-size bloom filter to have more than one block.
+  constexpr auto kNumKeys = 100000;
+  const ColumnId kColumnId(11);
+  const HybridTime ht(1000);
+
+  const auto get_value = [](const int32_t i) {
+    return PrimitiveValue::Int32(i);
+  };
+
+  const auto get_doc_key = [&](const int32_t i, const bool is_range_key) {
+    if (is_range_key) {
+      return DocKey({ PrimitiveValue::Int32(i) });
+    }
+    const auto hash_component = PrimitiveValue::Int32(i);
+    auto doc_key = DocKey(i, { hash_component });
+    {
+      std::string hash_components_buf;
+      QLValuePB hash_component_pb;
+      PrimitiveValue::ToQLValuePB(
+          hash_component, QLType::Create(DataType::INT32), &hash_component_pb);
+      AppendToKey(hash_component_pb, &hash_components_buf);
+      doc_key.set_hash(YBPartition::HashColumnCompoundValue(hash_components_buf));
+    }
+    return doc_key;
+  };
+
+  const auto get_sub_doc_key = [&](const int32_t i, const bool is_range_key) {
+    return SubDocKey(get_doc_key(i, is_range_key), PrimitiveValue(kColumnId));
+  };
+
+  for (const auto is_range_key : { false, true }) {
+    for (int32_t i = 0; i < kNumKeys; ++i) {
+      const auto sub_doc_key = get_sub_doc_key(i, is_range_key);
+      const auto value = get_value(i);
+      dwb.Clear();
+      ASSERT_OK(
+          dwb.SetPrimitive(DocPath(sub_doc_key.doc_key().Encode(), sub_doc_key.subkeys()), value));
+      ASSERT_OK(WriteToRocksDB(dwb, ht));
+    }
+    ASSERT_OK(FlushRocksDbAndWait());
+
+    for (int32_t i = 0; i < kNumKeys; ++i) {
+      const auto sub_doc_key = get_sub_doc_key(i, is_range_key);
+      const auto value = get_value(i);
+      const auto encoded_subdoc_key = sub_doc_key.EncodeWithoutHt();
+      SubDocument sub_doc;
+      bool sub_doc_found;
+      GetSubDoc(encoded_subdoc_key, &sub_doc, &sub_doc_found);
+      ASSERT_TRUE(sub_doc_found) << "Entry for key #" << i
+                                 << " not found, is_range_key: " << is_range_key;
+      ASSERT_EQ(static_cast<PrimitiveValue>(sub_doc), value);
+    }
+  }
+
+  rocksdb::TablePropertiesCollection props;
+  rocksdb()->GetPropertiesOfAllTables(&props);
+  for (const auto& prop : props) {
+    ASSERT_GE(prop.second->num_filter_blocks, 2) << Format(
+        "To test rolling over filter block we need at least 2 filter blocks, but got $0 for $1. "
+        "Increase kNumKeys in this test.",
+        prop.second->num_filter_blocks, prop.first);
+  }
+}
+
+TEST_P(DocDBTestWrapper, MergingIterator) {
   // Test for the case described in https://yugabyte.atlassian.net/browse/ENG-1677.
 
   // Turn off "next instead of seek" optimization, because this test rely on DocDB to do seeks.
@@ -2675,7 +3059,7 @@ TEST_F(DocDBTest, MergingIterator) {
   VerifySubDocument(SubDocKey(key2), ht, "\"value2\"");
 }
 
-TEST_F(DocDBTest, SetPrimitiveWithInitMarker) {
+TEST_P(DocDBTestWrapper, SetPrimitiveWithInitMarker) {
   // Both required and optional init marker should be ok.
   for (auto init_marker_behavior : kInitMarkerBehaviorList) {
     auto dwb = MakeDocWriteBatch(init_marker_behavior);
@@ -2683,7 +3067,7 @@ TEST_F(DocDBTest, SetPrimitiveWithInitMarker) {
   }
 }
 
-TEST_F(DocDBTest, TestInetSortOrder) {
+TEST_P(DocDBTestWrapper, TestInetSortOrder) {
   InsertInet("1.2.3.4");
   InsertInet("2.2.3.4");
   InsertInet("::1");
@@ -2709,7 +3093,7 @@ SubDocKey(DocKey([], ["mydockey"]), [ffff:ffff:ffff:ffff:ffff:ffff:ffff:ffff; \
       )#");
 }
 
-TEST_F(DocDBTest, TestDisambiguationOnWriteId) {
+TEST_P(DocDBTestWrapper, TestDisambiguationOnWriteId) {
   // Set a column and then delete the entire row in the same write batch. The row disappears.
   auto dwb = MakeDocWriteBatch();
   ASSERT_OK(dwb.SetPrimitive(
@@ -2724,9 +3108,7 @@ TEST_F(DocDBTest, TestDisambiguationOnWriteId) {
   bool doc_found = false;
   // TODO(dtxn) - check both transaction and non-transaction path?
   auto encoded_subdoc_key = subdoc_key.EncodeWithoutHt();
-  GetSubDocumentData data = { encoded_subdoc_key, &subdoc, &doc_found };
-  GetSubDocument(doc_db(), data, rocksdb::kDefaultQueryId,
-                 kNonTransactionalOperationContext, CoarseTimePoint::max() /* deadline */);
+  GetSubDoc(encoded_subdoc_key, &subdoc, &doc_found, kNonTransactionalOperationContext);
   ASSERT_FALSE(doc_found);
 
   CaptureLogicalSnapshot();
@@ -2736,8 +3118,7 @@ TEST_F(DocDBTest, TestDisambiguationOnWriteId) {
     // The row should still be absent after a compaction.
     // TODO(dtxn) - check both transaction and non-transaction path?
     FullyCompactHistoryBefore(HybridTime::FromMicros(cutoff_time_ms));
-    GetSubDocument(doc_db(), data, rocksdb::kDefaultQueryId,
-                   kNonTransactionalOperationContext, CoarseTimePoint::max() /* deadline */);
+    GetSubDoc(encoded_subdoc_key, &subdoc, &doc_found, kNonTransactionalOperationContext);
     ASSERT_FALSE(doc_found);
     ASSERT_DOC_DB_DEBUG_DUMP_STR_EQ("");
   }
@@ -2752,9 +3133,7 @@ TEST_F(DocDBTest, TestDisambiguationOnWriteId) {
   // TODO(dtxn) - check both transaction and non-transaction path?
   SubDocKey subdoc_key2(kDocKey2);
   auto encoded_subdoc_key2 = subdoc_key2.EncodeWithoutHt();
-  data.subdocument_key = encoded_subdoc_key2;
-  GetSubDocument(doc_db(), data, rocksdb::kDefaultQueryId,
-                 kNonTransactionalOperationContext, CoarseTimePoint::max() /* deadline */);
+  GetSubDoc(encoded_subdoc_key2, &subdoc, &doc_found, kNonTransactionalOperationContext);
   ASSERT_TRUE(doc_found);
 
   // The row should still exist after a compaction. The deletion marker should be compacted away.
@@ -2763,8 +3142,7 @@ TEST_F(DocDBTest, TestDisambiguationOnWriteId) {
     RestoreToLastLogicalRocksDBSnapshot();
     FullyCompactHistoryBefore(HybridTime::FromMicros(cutoff_time_ms));
     // TODO(dtxn) - check both transaction and non-transaction path?
-    GetSubDocument(doc_db(), data, rocksdb::kDefaultQueryId,
-                   kNonTransactionalOperationContext, CoarseTimePoint::max() /* deadline */);
+    GetSubDoc(encoded_subdoc_key2, &subdoc, &doc_found, kNonTransactionalOperationContext);
     ASSERT_TRUE(doc_found);
     ASSERT_DOC_DB_DEBUG_DUMP_STR_EQ(R"#(
 SubDocKey(DocKey([], ["row2", 22222]), [ColumnId(10); HT{ physical: 2000 w: 1 }]) -> "value2"
@@ -2772,7 +3150,7 @@ SubDocKey(DocKey([], ["row2", 22222]), [ColumnId(10); HT{ physical: 2000 w: 1 }]
   }
 }
 
-TEST_F(DocDBTest, StaticColumnCompaction) {
+TEST_P(DocDBTestWrapper, StaticColumnCompaction) {
   const DocKey hk(0, PrimitiveValues("h1")); // hash key
   const DocKey pk1(hk.hash(), hk.hashed_group(), PrimitiveValues("r1")); // primary key
   const DocKey pk2(hk.hash(), hk.hashed_group(), PrimitiveValues("r2")); //   "      "
@@ -2873,7 +3251,7 @@ SubDocKey(DocKey(0x0000, ["h1"], ["r2"]), ["c8"; HT{ physical: 1000 }]) -> "v82"
       )#");
 }
 
-TEST_F(DocDBTest, TestUserTimestamp) {
+TEST_P(DocDBTestWrapper, TestUserTimestamp) {
   const DocKey doc_key(PrimitiveValues("k1"));
   KeyBytes encoded_doc_key(doc_key.Encode());
 
@@ -2937,7 +3315,7 @@ SubDocKey(DocKey([], ["k1"]), ["s3", "s5"; HT{ physical: 10000 w: 1 }]) -> "v1";
       )#");
 }
 
-TEST_F(DocDBTest, TestCompactionWithUserTimestamp) {
+TEST_P(DocDBTestWrapper, TestCompactionWithUserTimestamp) {
   const DocKey doc_key(PrimitiveValues("k1"));
   HybridTime t3000 = 3000_usec_ht;
   HybridTime t5000 = 5000_usec_ht;
@@ -3025,10 +3403,10 @@ void QueryBounds(const DocKey& doc_key, int lower, int upper, int base, const Do
       SubDocKey(doc_key, PrimitiveValue("subkey" + std::to_string(base + upper))).EncodeWithoutHt();
   SliceKeyBound upper_bound(upper_key, BoundType::kInclusiveUpper);
   auto encoded_subdoc_to_search = subdoc_to_search.EncodeWithoutHt();
-  GetSubDocumentData data = { encoded_subdoc_to_search, doc_from_rocksdb, subdoc_found };
+  GetRedisSubDocumentData data = { encoded_subdoc_to_search, doc_from_rocksdb, subdoc_found };
   data.low_subkey = &lower_bound;
   data.high_subkey = &upper_bound;
-  EXPECT_OK(GetSubDocument(
+  EXPECT_OK(GetRedisSubDocument(
       doc_db, data, rocksdb::kDefaultQueryId,
       kNonTransactionalOperationContext, CoarseTimePoint::max() /* deadline */,
       ReadHybridTime::SingleTime(ht)));
@@ -3055,7 +3433,7 @@ void QueryBoundsAndVerify(const DocKey& doc_key, int lower, int upper, int base,
   VerifyBounds(&doc_from_rocksdb, lower, upper, base);
 }
 
-TEST_F(DocDBTest, TestBuildSubDocumentBounds) {
+TEST_F(DocDBTestRedis, TestBuildSubDocumentBounds) {
   const DocKey doc_key(PrimitiveValues("key"));
   KeyBytes encoded_doc_key(doc_key.Encode());
   const int nsubkeys = 100;
@@ -3114,7 +3492,7 @@ TEST_F(DocDBTest, TestBuildSubDocumentBounds) {
   EXPECT_FALSE(subdoc_found);
 }
 
-TEST_F(DocDBTest, TestCompactionForCollectionsWithTTL) {
+TEST_P(DocDBTestWrapper, TestCompactionForCollectionsWithTTL) {
   DocKey collection_key(PrimitiveValues("collection"));
   SetUpCollectionWithTTL(collection_key, UseIntermediateFlushes::kFalse);
 
@@ -3128,11 +3506,9 @@ TEST_F(DocDBTest, TestCompactionForCollectionsWithTTL) {
   const auto subdoc_key = SubDocKey(collection_key).EncodeWithoutHt();
   SubDocument doc_from_rocksdb;
   bool subdoc_found_in_rocksdb = false;
-  GetSubDocumentData data = { subdoc_key, &doc_from_rocksdb, &subdoc_found_in_rocksdb };
-  EXPECT_OK(GetSubDocument(
-      doc_db(), data, rocksdb::kDefaultQueryId,
-      kNonTransactionalOperationContext, CoarseTimePoint::max() /* deadline */,
-      ReadHybridTime::FromMicros(1200)));
+  GetSubDoc(
+      subdoc_key, &doc_from_rocksdb, &subdoc_found_in_rocksdb, kNonTransactionalOperationContext,
+      ReadHybridTime::FromMicros(1200));
   ASSERT_TRUE(subdoc_found_in_rocksdb);
 
   for (int i = 0; i < kNumSubKeysForCollectionsWithTTL * 2; i++) {
@@ -3143,7 +3519,7 @@ TEST_F(DocDBTest, TestCompactionForCollectionsWithTTL) {
   }
 }
 
-TEST_F(DocDBTest, MinorCompactionsForCollectionsWithTTL) {
+TEST_P(DocDBTestWrapper, MinorCompactionsForCollectionsWithTTL) {
   ASSERT_OK(DisableCompactions());
   DocKey collection_key(PrimitiveValues("c"));
   SetUpCollectionWithTTL(collection_key, UseIntermediateFlushes::kTrue);
@@ -3187,8 +3563,8 @@ SubDocKey(DocKey([], ["c"]), ["k5"; HT{ physical: 1100 }]) -> "vv5"; ttl: 25.000
 
 }
 
-TEST_F(DocDBTest, CompactionWithTransactions) {
-  FLAGS_docdb_sort_weak_intents_in_tests = true;
+TEST_P(DocDBTestWrapper, CompactionWithTransactions) {
+  FLAGS_TEST_docdb_sort_weak_intents_in_tests = true;
 
   const DocKey doc_key(PrimitiveValues("mydockey", 123456));
   KeyBytes encoded_doc_key(doc_key.Encode());
@@ -3223,12 +3599,27 @@ TEST_F(DocDBTest, CompactionWithTransactions) {
   ASSERT_OK(SetPrimitive(
       DocPath(encoded_doc_key, "subkey2"), PrimitiveValue("value5"), kTxn2HT));
 
+  ResetCurrentTransactionId();
+  TransactionId txn3 = ASSERT_RESULT(FullyDecodeTransactionId("0000000000000003"));
+  const auto kTxn3HT = 7000_usec_ht;
+  std::vector<ExternalIntent> intents = {
+    { DocPath(encoded_doc_key, "subkey3"), Value(PrimitiveValue("value6")) },
+    { DocPath(encoded_doc_key, "subkey4"), Value(PrimitiveValue("value7")) }
+  };
+  Uuid status_tablet;
+  ASSERT_OK(status_tablet.FromString("4c3e1d91-5ea7-4449-8bb3-8b0a3f9ae903"));
+  ASSERT_OK(AddExternalIntents(txn3, intents, status_tablet, kTxn3HT));
+
   ASSERT_DOC_DB_DEBUG_DUMP_STR_EQ(R"#(
 SubDocKey(DocKey([], ["mydockey", 123456]), [HT{ physical: 4000 }]) -> {}
 SubDocKey(DocKey([], ["mydockey", 123456]), [HT{ physical: 1000 }]) -> {}
 SubDocKey(DocKey([], ["mydockey", 123456]), ["subkey1"; HT{ physical: 3000 }]) -> "value3"
 SubDocKey(DocKey([], ["mydockey", 123456]), ["subkey1"; HT{ physical: 2000 }]) -> "value2"
 SubDocKey(DocKey([], ["mydockey", 123456]), ["subkey1"; HT{ physical: 1000 }]) -> "value1"
+TXN EXT 30303030-3030-3030-3030-303030303033 HT{ physical: 7000 } -> \
+    IT 03e99a3f0a8bb38b4944a75e911d3e4c [\
+    SubDocKey(DocKey([], ["mydockey", 123456]), ["subkey3"]) -> "value6", \
+    SubDocKey(DocKey([], ["mydockey", 123456]), ["subkey4"]) -> "value7"]
 SubDocKey(DocKey([], []), []) [kWeakRead, kWeakWrite] HT{ physical: 6000 w: 1 } -> \
     TransactionId(30303030-3030-3030-3030-303030303032) none
 SubDocKey(DocKey([], []), []) [kWeakRead, kWeakWrite] HT{ physical: 5000 w: 1 } -> \
@@ -3276,6 +3667,10 @@ TXN REV 30303030-3030-3030-3030-303030303032 HT{ physical: 6000 w: 3 } -> \
 SubDocKey(DocKey([], ["mydockey", 123456]), [HT{ physical: 4000 }]) -> {}
 SubDocKey(DocKey([], ["mydockey", 123456]), [HT{ physical: 1000 }]) -> {}
 SubDocKey(DocKey([], ["mydockey", 123456]), ["subkey1"; HT{ physical: 3000 }]) -> "value3"
+TXN EXT 30303030-3030-3030-3030-303030303033 HT{ physical: 7000 } -> \
+    IT 03e99a3f0a8bb38b4944a75e911d3e4c [\
+    SubDocKey(DocKey([], ["mydockey", 123456]), ["subkey3"]) -> "value6", \
+    SubDocKey(DocKey([], ["mydockey", 123456]), ["subkey4"]) -> "value7"]
 SubDocKey(DocKey([], []), []) [kWeakRead, kWeakWrite] HT{ physical: 6000 w: 1 } -> \
     TransactionId(30303030-3030-3030-3030-303030303032) none
 SubDocKey(DocKey([], []), []) [kWeakRead, kWeakWrite] HT{ physical: 5000 w: 1 } -> \
@@ -3319,7 +3714,7 @@ TXN REV 30303030-3030-3030-3030-303030303032 HT{ physical: 6000 w: 3 } -> \
     )#");
 }
 
-TEST_F(DocDBTest, ForceFlushedFrontier) {
+TEST_P(DocDBTestWrapper, ForceFlushedFrontier) {
   // We run with compactions disabled, because they may interefere with force-setting the OpId.
   ASSERT_OK(DisableCompactions());
   op_id_ = {1, 1};
@@ -3349,20 +3744,20 @@ TEST_F(DocDBTest, ForceFlushedFrontier) {
 
   LOG(INFO) << "Attempting to change flushed frontier from " << consensus_frontier
             << " to " << new_consensus_frontier;
-  ASSERT_OK(rocksdb_->ModifyFlushedFrontier(
+  ASSERT_OK(regular_db_->ModifyFlushedFrontier(
       new_user_frontier_ptr, rocksdb::FrontierModificationMode::kForce));
   LOG(INFO) << "Checking that flushed froniter was set to " << new_consensus_frontier;
-  ASSERT_EQ(*new_user_frontier_ptr, *rocksdb_->GetFlushedFrontier());
+  ASSERT_EQ(*new_user_frontier_ptr, *regular_db_->GetFlushedFrontier());
 
   LOG(INFO) << "Reopening RocksDB";
   ASSERT_OK(ReopenRocksDB());
   LOG(INFO) << "Checking that flushed frontier is still set to "
-            << rocksdb_->GetFlushedFrontier()->ToString();
-  ASSERT_EQ(*new_user_frontier_ptr, *rocksdb_->GetFlushedFrontier());
+            << regular_db_->GetFlushedFrontier()->ToString();
+  ASSERT_EQ(*new_user_frontier_ptr, *regular_db_->GetFlushedFrontier());
 }
 
 // Handy code to analyze some DB.
-TEST_F(DocDBTest, DISABLED_DumpDB) {
+TEST_P(DocDBTestWrapper, DISABLED_DumpDB) {
   tablet::TabletOptions tablet_options;
   rocksdb::Options options;
   docdb::InitRocksDBOptions(
@@ -3397,7 +3792,7 @@ TEST_F(DocDBTest, DISABLED_DumpDB) {
   LOG(INFO) << "TXN meta: " << txn_meta << ", rev key: " << rev_key << ", intents: " << intent;
 }
 
-TEST_F(DocDBTest, SetHybridTimeFilter) {
+TEST_P(DocDBTestWrapper, SetHybridTimeFilter) {
   auto dwb = MakeDocWriteBatch();
   for (int i = 1; i <= 4; ++i) {
     ASSERT_OK(WriteSimple(i));
@@ -3407,7 +3802,7 @@ TEST_F(DocDBTest, SetHybridTimeFilter) {
 
   CloseRocksDB();
 
-  RocksDBPatcher patcher(rocksdb_dir_, rocksdb_options_);
+  RocksDBPatcher patcher(rocksdb_dir_, regular_db_options_);
 
   ASSERT_OK(patcher.Load());
   ASSERT_OK(patcher.SetHybridTimeFilter(HybridTime::FromMicros(2000)));
@@ -3433,10 +3828,91 @@ TEST_F(DocDBTest, SetHybridTimeFilter) {
     if (j == 0) {
       ASSERT_OK(FlushRocksDbAndWait());
     } else if (j == 1) {
-      ForceRocksDBCompact(rocksdb());
+      ASSERT_OK(ForceRocksDBCompact(rocksdb()));
     }
   }
 
+}
+
+void Append(const char* a, const char* b, std::string* out) {
+  out->append(a, b);
+}
+
+void PushBack(const std::string& value, std::vector<std::string>* out) {
+  out->push_back(value);
+}
+
+void Append(const char* a, const char* b, faststring* out) {
+  out->append(a, b - a);
+}
+
+void PushBack(const faststring& value, std::vector<std::string>* out) {
+  out->emplace_back(value.c_str(), value.size());
+}
+
+void Append(const char* a, const char* b, boost::container::small_vector_base<char>* out) {
+  out->insert(out->end(), a, b);
+}
+
+void PushBack(
+    const boost::container::small_vector_base<char>& value, std::vector<std::string>* out) {
+  out->emplace_back(value.begin(), value.end());
+}
+
+template <size_t SmallLen>
+void Append(const char* a, const char* b, ByteBuffer<SmallLen>* out) {
+  out->Append(a, b);
+}
+
+template <size_t SmallLen>
+void PushBack(const ByteBuffer<SmallLen>& value, std::vector<std::string>* out) {
+  out->push_back(value.ToString());
+}
+
+constexpr size_t kSourceLen = 32;
+const std::string kSource = RandomHumanReadableString(kSourceLen);
+
+template <class T>
+void TestKeyBytes(const char* title, std::vector<std::string>* out = nullptr) {
+#ifdef NDEBUG
+  constexpr size_t kIterations = 100000000;
+#else
+  constexpr size_t kIterations = RegularBuildVsSanitizers(10000000, 100000);
+#endif
+  const char* source_start = kSource.c_str();
+
+  auto start = GetThreadCpuTimeMicros();
+  T key_bytes;
+  for (size_t i = kIterations; i-- > 0;) {
+    key_bytes.clear();
+    const char* a = source_start + ((i * 102191ULL) & (kSourceLen - 1ULL));
+    const char* b = source_start + ((i * 99191ULL) & (kSourceLen - 1ULL));
+    Append(std::min(a, b), std::max(a, b) + 1, &key_bytes);
+    a = source_start + ((i * 88937ULL) & (kSourceLen - 1ULL));
+    b = source_start + ((i * 74231ULL) & (kSourceLen - 1ULL));
+    Append(std::min(a, b), std::max(a, b) + 1, &key_bytes);
+    a = source_start + ((i * 75983ULL) & (kSourceLen - 1ULL));
+    b = source_start + ((i * 72977ULL) & (kSourceLen - 1ULL));
+    Append(std::min(a, b), std::max(a, b) + 1, &key_bytes);
+    if (out) {
+      PushBack(key_bytes, out);
+    }
+  }
+  auto time = MonoDelta::FromMicroseconds(GetThreadCpuTimeMicros() - start);
+  LOG(INFO) << title << ": " << time;
+}
+
+TEST_P(DocDBTestWrapper, DISABLED_KeyBuffer) {
+  TestKeyBytes<std::string>("std::string");
+  TestKeyBytes<faststring>("faststring");
+  TestKeyBytes<boost::container::small_vector<char, 8>>("small_vector<char, 8>");
+  TestKeyBytes<boost::container::small_vector<char, 16>>("small_vector<char, 16>");
+  TestKeyBytes<boost::container::small_vector<char, 32>>("small_vector<char, 32>");
+  TestKeyBytes<boost::container::small_vector<char, 64>>("small_vector<char, 64>");
+  TestKeyBytes<ByteBuffer<8>>("ByteBuffer<8>");
+  TestKeyBytes<ByteBuffer<16>>("ByteBuffer<16>");
+  TestKeyBytes<ByteBuffer<32>>("ByteBuffer<32>");
+  TestKeyBytes<ByteBuffer<64>>("ByteBuffer<64>");
 }
 
 }  // namespace docdb

@@ -19,6 +19,7 @@
 #include "yb/common/ql_value.h"
 
 #include "yb/docdb/docdb.h"
+#include "yb/docdb/docdb_debug.h"
 
 #include "yb/tablet/tablet-test-util.h"
 #include "yb/tablet/tablet.h"
@@ -58,7 +59,7 @@ class TabletSplitTest : public YBTabletTest {
   }
 
   Result<std::vector<QLRow>> SelectAll(Tablet* tablet) {
-    ReadHybridTime read_time = ReadHybridTime::SingleTime(tablet->SafeTime());
+    ReadHybridTime read_time = ReadHybridTime::SingleTime(VERIFY_RESULT(tablet->SafeTime()));
     QLReadRequestPB req;
     QLAddColumns(schema_, {}, &req);
     QLReadRequestResult result;
@@ -70,10 +71,28 @@ class TabletSplitTest : public YBTabletTest {
     return CreateRowBlock(QLClient::YQL_CLIENT_CQL, schema_, result.rows_data)->rows();
   }
 
+  docdb::DocKeyHash GetRowHashCode(const QLRow& row) {
+    std::string tmp;
+    AppendToKey(row.column(0).value(), &tmp);
+    return YBPartition::HashColumnCompoundValue(tmp);
+  }
+
   std::unique_ptr<LocalTabletWriter> writer_;
 };
 
-TEST_F(TabletSplitTest,  v) {
+namespace {
+
+boost::optional<docdb::DocKeyHash> PartitionKeyToHash(const std::string& partition_key) {
+  if (partition_key.empty()) {
+    return boost::none;
+  } else {
+    return PartitionSchema::DecodeMultiColumnHashValue(partition_key);
+  }
+}
+
+} // namespace
+
+TEST_F(TabletSplitTest, SplitTablet) {
   constexpr auto kNumRows = 10000;
   constexpr auto kValuePrefixLength = 1024;
   constexpr auto kRowsPerSourceFlush = kNumRows / 7;
@@ -113,7 +132,7 @@ TEST_F(TabletSplitTest,  v) {
 
   std::vector<TabletPtr> split_tablets;
 
-  Partition partition = tablet()->metadata()->partition();
+  std::shared_ptr<Partition> partition = tablet()->metadata()->partition();
   docdb::KeyBounds key_bounds;
   for (auto i = 1; i <= kNumSplits + 1; ++i) {
     const auto subtablet_id = Format("$0-sub-$1", tablet()->tablet_id(), yb::ToString(i));
@@ -127,17 +146,19 @@ TEST_F(TabletSplitTest,  v) {
       docdb::KeyBytes encoded_doc_key;
       docdb::DocKeyEncoderAfterTableIdStep(&encoded_doc_key).Hash(
           split_hash_code, std::vector<docdb::PrimitiveValue>());
-      partition.TEST_set_partition_key_end(partition_key);
+      partition->set_partition_key_end(partition_key);
       key_bounds.upper = encoded_doc_key;
     } else {
-      partition.TEST_set_partition_key_end("");
+      partition->set_partition_key_end("");
       key_bounds.upper.Clear();
     }
 
-    ASSERT_OK(tablet()->CreateSubtablet(subtablet_id, partition, key_bounds));
+    ASSERT_OK(tablet()->CreateSubtablet(
+        subtablet_id, *partition, key_bounds, yb::OpId() /* split_op_id */,
+        HybridTime() /* split_hybrid_time */));
     split_tablets.push_back(ASSERT_RESULT(harness_->OpenTablet(subtablet_id)));
 
-    partition.TEST_set_partition_key_start(partition.partition_key_end());
+    partition->set_partition_key_start(partition->partition_key_end());
     key_bounds.lower = key_bounds.upper;
   }
 
@@ -148,7 +169,18 @@ TEST_F(TabletSplitTest,  v) {
     ASSERT_EQ(source_docdb_dump_str, split_docdb_dump_str);
 
     // But split tablets should only return relevant data without overlap and no unexpected data.
+    const auto& split_partition = split_tablet->metadata()->partition();
+    const auto start_hash = PartitionKeyToHash(split_partition->partition_key_start());
+    const auto end_hash = PartitionKeyToHash(split_partition->partition_key_end());
+
     for (const auto& row : ASSERT_RESULT(SelectAll(split_tablet.get()))) {
+      const auto hash_code = GetRowHashCode(row);
+      if (start_hash) {
+        ASSERT_GE(hash_code, *start_hash);
+      }
+      if (end_hash) {
+        ASSERT_LT(hash_code, *end_hash);
+      }
       ASSERT_EQ(source_rows.erase(row.ToString()), 1);
     }
 

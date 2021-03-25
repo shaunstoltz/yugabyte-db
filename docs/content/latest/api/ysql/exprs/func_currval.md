@@ -1,7 +1,8 @@
 ---
-title: currval()
-summary: Get the last value returned by `nextval()` in the current session
-description: currval()
+title: currval() function [YSQL]
+headerTitle: currval()
+linkTitle: currval()
+description: Returns the last value returned by the nextval() function for the specified sequence in the current session.
 menu:
   latest:
     identifier: api-ysql-exprs-currval
@@ -28,7 +29,7 @@ Specify the name of the sequence.
 
 ### Create a sequence
 
-```postgresql
+```plpgsql
 yugabyte=# CREATE SEQUENCE s;
 ```
 
@@ -38,7 +39,7 @@ CREATE SEQUENCE
 
 Call `nextval()`.
 
-```postgresql
+```plpgsql
 yugabyte=# SELECT nextval('s');
 ```
 
@@ -49,7 +50,7 @@ yugabyte=# SELECT nextval('s');
 (1 row)
 ```
 
-```postgresql
+```plpgsql
 yugabyte=# SELECT currval('s');
 ```
 
@@ -62,7 +63,7 @@ yugabyte=# SELECT currval('s');
 
 Call `currval()` before `nextval()` is called.
 
-```postgresql
+```plpgsql
 yugabyte=# CREATE SEQUENCE s2;
 ```
 
@@ -70,7 +71,7 @@ yugabyte=# CREATE SEQUENCE s2;
 CREATE SEQUENCE
 ```
 
-```postgresql
+```plpgsql
 SELECT currval('s2');
 ```
 
@@ -80,7 +81,7 @@ ERROR:  currval of sequence "s2" is not yet defined in this session
 
 ## See also
 
-- [`CREATE SEQUENCE`](../../commands/ddl_create_sequence)
-- [`DROP SEQUENCE`](../../commands/drop_sequence)
+- [`CREATE SEQUENCE`](../../the-sql-language/statements/ddl_create_sequence)
+- [`DROP SEQUENCE`](../../the-sql-language/statements/ddl_drop_sequence/)
 - [`lastval()`](../func_lastval)
 - [`nextval()`](../func_nextval)

@@ -5610,7 +5610,7 @@ get_actual_variable_range(PlannerInfo *root, VariableStatData *vardata,
 										 indexscandir)) != NULL)
 				{
 					/* Extract the index column values from the heap tuple */
-					ExecStoreTuple(tup, slot, InvalidBuffer, false);
+					ExecStoreHeapTuple(tup, slot, false);
 					FormIndexDatum(indexInfo, slot, estate,
 								   values, isnull);
 
@@ -5643,7 +5643,7 @@ get_actual_variable_range(PlannerInfo *root, VariableStatData *vardata,
 										 -indexscandir)) != NULL)
 				{
 					/* Extract the index column values from the heap tuple */
-					ExecStoreTuple(tup, slot, InvalidBuffer, false);
+					ExecStoreHeapTuple(tup, slot, false);
 					FormIndexDatum(indexInfo, slot, estate,
 								   values, isnull);
 
@@ -6260,9 +6260,18 @@ regex_selectivity(const char *patt, int pattlen, bool case_insensitive,
 		sel *= FULL_WILDCARD_SEL;
 	}
 
-	/* If there's a fixed prefix, discount its selectivity */
+	/*
+	 * If there's a fixed prefix, discount its selectivity.  We have to be
+	 * careful here since a very long prefix could result in pow's result
+	 * underflowing to zero (in which case "sel" probably has as well).
+	 */
 	if (fixed_prefix_len > 0)
-		sel /= pow(FIXED_CHAR_SEL, fixed_prefix_len);
+	{
+		double		prefixsel = pow(FIXED_CHAR_SEL, fixed_prefix_len);
+
+		if (prefixsel > 0.0)
+			sel /= prefixsel;
+	}
 
 	/* Make sure result stays in range */
 	CLAMP_PROBABILITY(sel);

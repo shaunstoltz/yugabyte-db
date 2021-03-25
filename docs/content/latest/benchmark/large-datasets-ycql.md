@@ -1,8 +1,8 @@
 ---
-title: Benchmark YugabyteDB YCQL performance with large datasets
+title: Benchmark YCQL performance with large datasets
 headerTitle: Large datasets
 linkTitle: Large datasets
-description: Benchmark YugabyteDB YCQL performance with large datasets
+description: Benchmark YCQL performance with large datasets
 image: /images/section_icons/architecture/concepts.png
 headcontent: Benchmark YugabyteDB with large data sets.
 menu:
@@ -19,14 +19,14 @@ isTocNested: true
 <ul class="nav nav-tabs-alt nav-tabs-yb">
 
   <li >
-    <a href="/latest/benchmark/large-datasets-ysql" class="nav-link">
+    <a href="{{< relref "./large-datasets-ysql.md" >}}" class="nav-link">
       <i class="icon-postgres" aria-hidden="true"></i>
       YSQL
     </a>
   </li>
 
   <li >
-    <a href="/latest/benchmark/large-datasets-ycql" class="nav-link active">
+    <a href="{{< relref "./large-datasets-ycql.md" >}}" class="nav-link active">
       <i class="icon-cassandra" aria-hidden="true"></i>
       YCQL
     </a>
@@ -34,7 +34,7 @@ isTocNested: true
 
 </ul>
 
-Use this benchmark to understand the performance, failure, and scaling characteristics of YugabyteDB with a massive dataset (multiple TB per node). In order to accomplish that, we will do the following:
+Use this benchmark to understand the performance, failure, and scaling characteristics of YugabyteDB with a massive dataset (multiple TB per node). In order to accomplish that, you will do the following:
 
 - Load 30 billion key-value records
 - Each write operation inserts a single record

@@ -17,6 +17,7 @@
 #include "yb/common/ql_value.h"
 
 #include "yb/docdb/doc_expr.h"
+#include "yb/docdb/doc_scanspec_util.h"
 #include "yb/rocksdb/db/compaction.h"
 
 namespace yb {
@@ -86,10 +87,11 @@ DocPgsqlScanSpec::DocPgsqlScanSpec(const Schema& schema,
                                    const DocKey& doc_key,
                                    const DocKey& start_doc_key,
                                    bool is_forward_scan)
-    : PgsqlScanSpec(YQL_CLIENT_PGSQL, nullptr),
+    : PgsqlScanSpec(nullptr),
       schema_(schema),
       query_id_(query_id),
       hashed_components_(nullptr),
+      range_components_(nullptr),
       start_doc_key_(start_doc_key.empty() ? KeyBytes() : start_doc_key.Encode()),
       lower_doc_key_(doc_key.Encode()),
       is_forward_scan_(is_forward_scan) {
@@ -101,20 +103,23 @@ DocPgsqlScanSpec::DocPgsqlScanSpec(const Schema& schema,
   upper_doc_key_.AppendValueTypeBeforeGroupEnd(ValueType::kHighest);
 }
 
-DocPgsqlScanSpec::DocPgsqlScanSpec(const Schema& schema,
-                                   const rocksdb::QueryId query_id,
-                                   const std::vector<PrimitiveValue>& hashed_components,
-                                   const PgsqlConditionPB* condition,
-                                   const boost::optional<int32_t> hash_code,
-                                   const boost::optional<int32_t> max_hash_code,
-                                   const PgsqlExpressionPB *where_expr,
-                                   const DocKey& start_doc_key,
-                                   bool is_forward_scan)
-    : PgsqlScanSpec(YQL_CLIENT_PGSQL, where_expr),
+DocPgsqlScanSpec::DocPgsqlScanSpec(
+    const Schema& schema,
+    const rocksdb::QueryId query_id,
+    std::reference_wrapper<const std::vector<PrimitiveValue>> hashed_components,
+    std::reference_wrapper<const std::vector<PrimitiveValue>> range_components,
+    const PgsqlConditionPB* condition,
+    const boost::optional<int32_t> hash_code,
+    const boost::optional<int32_t> max_hash_code,
+    const PgsqlExpressionPB *where_expr,
+    const DocKey& start_doc_key,
+    bool is_forward_scan)
+    : PgsqlScanSpec(where_expr),
       range_bounds_(condition ? new common::QLScanRange(schema, *condition) : nullptr),
       schema_(schema),
       query_id_(query_id),
-      hashed_components_(&hashed_components),
+      hashed_components_(&hashed_components.get()),
+      range_components_(&range_components.get()),
       hash_code_(hash_code),
       max_hash_code_(max_hash_code),
       start_doc_key_(start_doc_key.empty() ? KeyBytes() : start_doc_key.Encode()),
@@ -128,7 +133,8 @@ DocPgsqlScanSpec::DocPgsqlScanSpec(const Schema& schema,
 
   // If the hash key is fixed and we have range columns with IN condition, try to construct the
   // exact list of range options to scan for.
-  if (!hashed_components_->empty() && schema_.num_range_key_columns() > 0 &&
+  if ((!hashed_components_->empty() || schema_.num_hash_key_columns() == 0) &&
+      schema_.num_range_key_columns() > 0 &&
       range_bounds_ && range_bounds_->has_in_range_options()) {
     DCHECK(condition);
     range_options_ =
@@ -211,8 +217,9 @@ KeyBytes DocPgsqlScanSpec::bound_key(const Schema& schema, const bool lower_boun
   KeyBytes result;
   auto encoder = DocKeyEncoder(&result).Schema(schema);
 
-  // If no hashed_component use hash lower/upper bounds if set.
-  if (hashed_components_->empty()) {
+  bool has_hash_columns = schema_.num_hash_key_columns() > 0;
+  bool hash_components_unset = has_hash_columns && hashed_components_->empty();
+  if (hash_components_unset) {
     // use lower bound hash code if set in request (for scans using token)
     if (lower_bound && hash_code_) {
       encoder.HashAndRange(*hash_code_, { PrimitiveValue(ValueType::kLowest) }, {});
@@ -228,42 +235,24 @@ KeyBytes DocPgsqlScanSpec::bound_key(const Schema& schema, const bool lower_boun
     return result;
   }
 
-  DocKeyHash min_hash = hash_code_ ?
-      static_cast<DocKeyHash> (*hash_code_) : std::numeric_limits<DocKeyHash>::min();
-  DocKeyHash max_hash = max_hash_code_ ?
-      static_cast<DocKeyHash> (*max_hash_code_) : std::numeric_limits<DocKeyHash>::max();
+  if (has_hash_columns) {
+    DocKeyHash min_hash = hash_code_ ?
+        static_cast<DocKeyHash> (*hash_code_) : std::numeric_limits<DocKeyHash>::min();
+    DocKeyHash max_hash = max_hash_code_ ?
+        static_cast<DocKeyHash> (*max_hash_code_) : std::numeric_limits<DocKeyHash>::max();
 
-  encoder.HashAndRange(lower_bound ? min_hash : max_hash,
-                       *hashed_components_,
-                       range_components(lower_bound));
-
+    encoder.HashAndRange(lower_bound ? min_hash : max_hash,
+                         *hashed_components_,
+                         range_components(lower_bound));
+  } else {
+    // If no hash columns use default hash code (0).
+    encoder.Hash(false, 0, *hashed_components_).Range(range_components(lower_bound));
+  }
   return result;
 }
 
 std::vector<PrimitiveValue> DocPgsqlScanSpec::range_components(const bool lower_bound) const {
-  std::vector<PrimitiveValue> result;
-
-  if (range_bounds_ != nullptr) {
-    const std::vector<QLValuePB> range_values = range_bounds_->range_values(lower_bound);
-    result.reserve(range_values.size());
-    size_t column_idx = schema_.num_hash_key_columns();
-    for (const auto& value : range_values) {
-      const auto& column = schema_.column(column_idx);
-      if (IsNull(value)) {
-        result.emplace_back(lower_bound ? ValueType::kLowest : ValueType::kHighest);
-      } else {
-        result.emplace_back(PrimitiveValue::FromQLValuePB(value, column.sorting_type()));
-      }
-      column_idx++;
-    }
-  }
-
-  if (!lower_bound) {
-    // We add +inf as an extra component to make sure this is greater than all keys in range.
-    // For lower bound, this is true already, because dockey + suffix is > dockey
-    result.emplace_back(PrimitiveValue(ValueType::kHighest));
-  }
-  return result;
+  return GetRangeKeyScanSpec(schema_, range_components_, range_bounds_.get(), lower_bound);
 }
 
 // Return inclusive lower/upper range doc key considering the start_doc_key.

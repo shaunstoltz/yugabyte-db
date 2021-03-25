@@ -1,13 +1,12 @@
 ---
-title: jsonb_typeof() and json_typeof() [JSON]
-linkTitle: jsonb_typeof()
-summary: jsonb_typeof() and json_typeof()
+title: jsonb_typeof() and json_typeof()
 headerTitle: jsonb_typeof() and json_typeof()
-description: Use these functions to return the data type of the JSON value as a SQL text value.
+linkTitle: jsonb_typeof()
+description: Return the data type of the JSON value as a SQL text value.
 menu:
   latest:
     identifier: jsonb-typeof
-    parent: functions-operators
+    parent: json-functions-operators
     weight: 250
 isTocNested: true
 showAsideToc: true
@@ -22,9 +21,9 @@ input value:       jsonb
 return value:      text
 ```
 
-**Notes:** Possible return values are _string_, _number_, _boolean_, _null_,  _object_, and _array_ — as follows.
+**Notes:** Possible return values are _string_, _number_, _boolean_, _null_,  _object_, and _array_, as follows.
 
-```postgresql
+```plpgsql
 do $body$
 declare
   j_string   constant jsonb := '"dog"';

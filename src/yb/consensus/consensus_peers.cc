@@ -45,25 +45,26 @@
 #include "yb/common/wire_protocol.h"
 #include "yb/consensus/consensus.h"
 #include "yb/consensus/consensus.proxy.h"
+#include "yb/consensus/consensus_error.h"
 #include "yb/consensus/consensus_meta.h"
 #include "yb/consensus/consensus_queue.h"
 #include "yb/consensus/log.h"
 #include "yb/consensus/replicate_msgs_holder.h"
 
-#include "yb/gutil/map-util.h"
-#include "yb/gutil/stl_util.h"
 #include "yb/gutil/strings/substitute.h"
 #include "yb/rpc/messenger.h"
 #include "yb/rpc/periodic.h"
+#include "yb/tablet/tablet_error.h"
 #include "yb/tserver/tserver.pb.h"
+#include "yb/tserver/tserver_error.h"
 
 #include "yb/util/backoff_waiter.h"
 #include "yb/util/fault_injection.h"
 #include "yb/util/flag_tags.h"
 #include "yb/util/logging.h"
 #include "yb/util/monotime.h"
-#include "yb/util/net/dns_resolver.h"
 #include "yb/util/net/net_util.h"
+#include "yb/util/scope_exit.h"
 #include "yb/util/status_callback.h"
 #include "yb/util/threadpool.h"
 #include "yb/util/tsan_util.h"
@@ -87,6 +88,11 @@ DEFINE_test_flag(double, fault_crash_on_leader_request_fraction, 0.0,
                  "Fraction of the time when the leader will crash just before sending an "
                  "UpdateConsensus RPC.");
 
+DEFINE_test_flag(int32, delay_removing_peer_with_failed_tablet_secs, 0,
+                 "If greater than 0, Peer::ProcessResponse will sleep after receiving a response "
+                 "indicating that a tablet is in the FAILED state, and before marking this peer "
+                 "as failed.");
+
 // Allow for disabling remote bootstrap in unit tests where we want to test
 // certain scenarios without triggering bootstrap of a remote peer.
 DEFINE_test_flag(bool, enable_remote_bootstrap, true,
@@ -94,7 +100,7 @@ DEFINE_test_flag(bool, enable_remote_bootstrap, true,
                  "detects that a follower is out of date or does not have a tablet "
                  "replica.");
 
-DECLARE_int32(log_change_config_every_n);
+DECLARE_int32(TEST_log_change_config_every_n);
 
 namespace yb {
 namespace consensus {
@@ -197,6 +203,15 @@ void Peer::SendNextRequest(RequestTriggerMode trigger_mode) {
   if (!processing_lock.owns_lock()) {
     return;
   }
+  // Since there's a couple of return paths from this function, setup a cleanup, in case we fill in
+  // ops inside request_, but do not get to use them.
+  bool needs_cleanup = true;
+  ScopeExit([&needs_cleanup, this](){
+    if (needs_cleanup) {
+      // Since we will not be using request_, we should cleanup the reserved ops.
+      CleanRequestOps();
+    }
+  });
 
   // The peer has no pending request nor is sending: send the request.
   bool needs_remote_bootstrap = false;
@@ -218,7 +233,7 @@ void Peer::SendNextRequest(RequestTriggerMode trigger_mode) {
 
   if (PREDICT_FALSE(needs_remote_bootstrap)) {
     Status status;
-    if (!FLAGS_enable_remote_bootstrap) {
+    if (!FLAGS_TEST_enable_remote_bootstrap) {
       failed_attempts_++;
       status = STATUS(NotSupported, "remote bootstrap is disabled");
     } else {
@@ -245,6 +260,9 @@ void Peer::SendNextRequest(RequestTriggerMode trigger_mode) {
       (member_type == RaftPeerPB::PRE_VOTER || member_type == RaftPeerPB::PRE_OBSERVER)) {
     if (PREDICT_TRUE(consensus_)) {
       auto uuid = peer_pb_.permanent_uuid();
+      // Remove these here, before we drop the locks.
+      needs_cleanup = false;
+      CleanRequestOps();
       processing_lock.unlock();
       performing_lock.unlock();
       consensus::ChangeConfigRequestPB req;
@@ -258,11 +276,11 @@ void Peer::SendNextRequest(RequestTriggerMode trigger_mode) {
       boost::optional<tserver::TabletServerErrorPB::Code> error_code;
 
       // If another ChangeConfig is being processed, our request will be rejected.
-      YB_LOG_EVERY_N(INFO, FLAGS_log_change_config_every_n)
+      YB_LOG_EVERY_N(INFO, FLAGS_TEST_log_change_config_every_n)
           << "Sending ChangeConfig request to promote peer";
       auto status = consensus_->ChangeConfig(req, &DoNothingStatusCB, &error_code);
       if (PREDICT_FALSE(!status.ok())) {
-        YB_LOG_EVERY_N(INFO, FLAGS_log_change_config_every_n)
+        YB_LOG_EVERY_N(INFO, FLAGS_TEST_log_change_config_every_n)
             << "Unable to change role for peer " << uuid << ": " << status;
         // Since we released the semaphore, we need to call SignalRequest again to send a message
         status = SignalRequest(RequestTriggerMode::kAlwaysSend);
@@ -286,6 +304,7 @@ void Peer::SendNextRequest(RequestTriggerMode trigger_mode) {
   // If the queue is empty, check if we were told to send a status-only message (which is what
   // happens during heartbeats). If not, just return.
   if (PREDICT_FALSE(!req_has_ops && trigger_mode == RequestTriggerMode::kNonEmptyOnly)) {
+    queue_->RequestWasNotSent(peer_pb_.permanent_uuid());
     return;
   }
 
@@ -294,15 +313,17 @@ void Peer::SendNextRequest(RequestTriggerMode trigger_mode) {
     heartbeater_->Snooze();
   }
 
-  MAYBE_FAULT(FLAGS_fault_crash_on_leader_request_fraction);
+  MAYBE_FAULT(FLAGS_TEST_fault_crash_on_leader_request_fraction);
 
   processing_lock.unlock();
   performing_lock.release();
 
   // We will cleanup ops from request in ProcessResponse, because otherwise there could be race
   // condition. When rest of this function is running in parallel to ProcessResponse.
+  needs_cleanup = false;
   msgs_holder.ReleaseOps();
 
+  controller_.set_invoke_callback_mode(rpc::InvokeCallbackMode::kThreadPoolHigh);
   proxy_->UpdateAsync(&request_, trigger_mode, &response_, &controller_,
                       std::bind(&Peer::ProcessResponse, retain_self));
 }
@@ -318,10 +339,14 @@ std::unique_lock<simple_spinlock> Peer::StartProcessingUnlocked() {
 }
 
 void Peer::ProcessResponse() {
-  request_.mutable_ops()->ExtractSubrange(0, request_.ops().size(), nullptr /* elements */);
-
   DCHECK(performing_mutex_.is_locked()) << "Got a response when nothing was pending";
+
+  CleanRequestOps();
+
   Status status = controller_.status();
+  if (status.ok()) {
+    status = controller_.thread_pool_failure();
+  }
   controller_.Reset();
 
   auto performing_lock = LockPerforming(std::adopt_lock);
@@ -360,6 +385,22 @@ void Peer::ProcessResponse() {
     return;
   }
 
+  auto s = StatusFromResponse(response_);
+  if (!s.ok() &&
+      tserver::TabletServerError(s) == tserver::TabletServerErrorPB::TABLET_NOT_RUNNING &&
+      tablet::RaftGroupStateError(s) == tablet::RaftGroupStatePB::FAILED) {
+    if (PREDICT_FALSE(FLAGS_TEST_delay_removing_peer_with_failed_tablet_secs > 0)) {
+      LOG(INFO) << "TEST: Sleeping for " << FLAGS_TEST_delay_removing_peer_with_failed_tablet_secs
+                << " seconds";
+      SleepFor(MonoDelta::FromSeconds(FLAGS_TEST_delay_removing_peer_with_failed_tablet_secs));
+    }
+    queue_->NotifyObserversOfFailedFollower(
+        peer_pb_.permanent_uuid(),
+        Format("Tablet in peer $0 is in FAILED state, will try to evict peer",
+               peer_pb_.permanent_uuid()));
+    ProcessResponseError(StatusFromPB(response_.error().status()));
+  }
+
   // Response should be either error or status.
   LOG_IF(DFATAL, response_.has_error() == response_.has_status())
     << "Invalid response: " << response_.ShortDebugString();
@@ -389,6 +430,7 @@ void Peer::ProcessResponse() {
 
 Status Peer::SendRemoteBootstrapRequest() {
   YB_LOG_WITH_PREFIX_EVERY_N_SECS(INFO, 30) << "Sending request to remotely bootstrap";
+  controller_.set_invoke_callback_mode(rpc::InvokeCallbackMode::kThreadPoolNormal);
   return raft_pool_token_->SubmitFunc([retain_self = shared_from_this()]() {
     retain_self->proxy_->StartRemoteBootstrap(
       &retain_self->rb_request_, &retain_self->rb_response_, &retain_self->controller_,
@@ -474,6 +516,10 @@ void Peer::Close() {
 Peer::~Peer() {
   std::lock_guard<simple_spinlock> processing_lock(peer_lock_);
   CHECK_EQ(state_, kPeerClosed) << "Peer cannot be implicitly closed";
+}
+
+void Peer::CleanRequestOps() {
+  request_.mutable_ops()->ExtractSubrange(0, request_.ops().size(), nullptr /* elements */);
 }
 
 RpcPeerProxy::RpcPeerProxy(HostPort hostport, ConsensusServiceProxyPtr consensus_proxy)

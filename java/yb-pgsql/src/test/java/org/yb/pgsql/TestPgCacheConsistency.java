@@ -21,11 +21,13 @@ import org.postgresql.util.PSQLException;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.yb.minicluster.MiniYBCluster;
+import org.yb.util.MiscUtil.ThrowingRunnable;
 import org.yb.util.YBTestRunnerNonTsanOnly;
 
 import java.sql.Connection;
 import java.sql.ResultSet;
 import java.sql.Statement;
+import java.util.Arrays;
 import java.util.HashSet;
 import java.util.List;
 import java.util.Optional;
@@ -41,8 +43,8 @@ public class TestPgCacheConsistency extends BasePgSQLTest {
 
   @Test
   public void testBasicDDLOperations() throws Exception {
-    try (Connection connection1 = createConnection(0);
-         Connection connection2 = createConnection(1);
+    try (Connection connection1 = getConnectionBuilder().withTServer(0).connect();
+         Connection connection2 = getConnectionBuilder().withTServer(1).connect();
          Statement statement1 = connection1.createStatement();
          Statement statement2 = connection2.createStatement()) {
       Set<Row> expectedRows = new HashSet<>();
@@ -65,7 +67,7 @@ public class TestPgCacheConsistency extends BasePgSQLTest {
       // Drop table from connection 2.
       statement2.execute("DROP TABLE cache_test1");
 
-      // Check that insert now fails on both tables.
+      // Check that insert now fails on both connections.
       runInvalidQuery(statement1, "INSERT INTO cache_test1(a) VALUES (3)", "does not exist");
       runInvalidQuery(statement2, "INSERT INTO cache_test1(a) VALUES (4)", "does not exist");
 
@@ -193,13 +195,13 @@ public class TestPgCacheConsistency extends BasePgSQLTest {
 
   @Test
   public void testNoDDLRetry() throws Exception {
-    try (Connection connection1 = createConnection(0);
-         Connection connection2 = createConnection(1);
+    try (Connection connection1 = getConnectionBuilder().withTServer(0).connect();
+         Connection connection2 = getConnectionBuilder().withTServer(1).connect();
          Statement statement1 = connection1.createStatement();
          Statement statement2 = connection2.createStatement()) {
       // Create a table with connection 1.
       statement1.execute("CREATE TABLE a(id int primary key)");
-
+      statement1.execute("ALTER TABLE a ADD b int");
       // Create a table with connection 2 (should fail)
       runInvalidQuery(statement2, "CREATE TABLE b(id int primary key)",
           "Catalog Version Mismatch");
@@ -208,8 +210,8 @@ public class TestPgCacheConsistency extends BasePgSQLTest {
 
   @Test
   public void testVersionMismatchWithoutRetry() throws Exception {
-    try (Connection connection1 = newConnectionBuilder().setTServer(0).connect();
-         Connection connection2 = newConnectionBuilder().setTServer(1).connect();
+    try (Connection connection1 = getConnectionBuilder().withTServer(0).connect();
+         Connection connection2 = getConnectionBuilder().withTServer(1).connect();
          Statement statement1 = connection1.createStatement();
          Statement statement2 = connection2.createStatement()) {
       statement1.execute("CREATE TABLE test_table(id int, PRIMARY KEY (id))");
@@ -263,8 +265,8 @@ public class TestPgCacheConsistency extends BasePgSQLTest {
 
   @Test
   public void testVersionMismatchWithFailedRetry() throws Exception {
-    try (Connection connection1 = newConnectionBuilder().setTServer(0).connect();
-         Connection connection2 = newConnectionBuilder().setTServer(1).connect();
+    try (Connection connection1 = getConnectionBuilder().withTServer(0).connect();
+         Connection connection2 = getConnectionBuilder().withTServer(1).connect();
          Statement statement1 = connection1.createStatement();
          Statement statement2 = connection2.createStatement()) {
       // Create table from connection 1.
@@ -316,8 +318,8 @@ public class TestPgCacheConsistency extends BasePgSQLTest {
 
   @Ignore // TODO enable after #1502
   public void testUndetectedSelectVersionMismatch() throws Exception {
-    try (Connection connection1 = newConnectionBuilder().setTServer(0).connect();
-         Connection connection2 = newConnectionBuilder().setTServer(1).connect();
+    try (Connection connection1 = getConnectionBuilder().withTServer(0).connect();
+         Connection connection2 = getConnectionBuilder().withTServer(1).connect();
          Statement statement1 = connection1.createStatement();
          Statement statement2 = connection2.createStatement()) {
       // Create table from connection 1.
@@ -339,8 +341,8 @@ public class TestPgCacheConsistency extends BasePgSQLTest {
 
   @Test
   public void testConsistentNonRetryableTransactions() throws Exception {
-    try (Connection connection1 = newConnectionBuilder().setTServer(0).connect();
-         Connection connection2 = newConnectionBuilder().setTServer(1).connect();
+    try (Connection connection1 = getConnectionBuilder().withTServer(0).connect();
+         Connection connection2 = getConnectionBuilder().withTServer(1).connect();
          Statement statement1 = connection1.createStatement();
          Statement statement2 = connection2.createStatement()) {
       // Create table from connection 1.
@@ -352,24 +354,28 @@ public class TestPgCacheConsistency extends BasePgSQLTest {
       // Perform a DDL operation, which cannot (as of 07/01/2019) be rolled back.
       statement2.execute("CREATE TABLE other_table(id int)");
 
+      statement2.execute("SELECT * FROM test_table");
+
       // Modify table from connection 2.
       statement1.execute("ALTER TABLE test_table ADD COLUMN c int");
 
       waitForTServerHeartbeat();
 
-      // Select does not fail, so rollback is not needed.
-      statement2.execute("SELECT * FROM test_table");
+      // Select should fail because the alter modified the table (catalog version mismatch).
+      runInvalidQuery(statement2,"SELECT * FROM test_table", "Catalog Version Mismatch");
+
+      // COMMIT will succeed as a command but will rollback the transaction due to the error above.
       statement2.execute("COMMIT");
 
-      // Check that the table was created.
+      // Check that the other table was created.
       statement2.execute("SELECT * FROM other_table");
     }
   }
 
   @Test
   public void testConsistentPreparedStatements() throws Exception {
-    try (Connection connection1 = newConnectionBuilder().setTServer(0).connect();
-         Connection connection2 = newConnectionBuilder().setTServer(1).connect();
+    try (Connection connection1 = getConnectionBuilder().withTServer(0).connect();
+         Connection connection2 = getConnectionBuilder().withTServer(1).connect();
          Statement statement1 = connection1.createStatement();
          Statement statement2 = connection2.createStatement()) {
       // Create table from connection 1.
@@ -412,8 +418,8 @@ public class TestPgCacheConsistency extends BasePgSQLTest {
 
   @Test
   public void testConsistentExplain() throws Exception {
-    try (Connection connection1 = newConnectionBuilder().setTServer(0).connect();
-         Connection connection2 = newConnectionBuilder().setTServer(1).connect();
+    try (Connection connection1 = getConnectionBuilder().withTServer(0).connect();
+         Connection connection2 = getConnectionBuilder().withTServer(1).connect();
          Statement statement1 = connection1.createStatement();
          Statement statement2 = connection2.createStatement()) {
       // Create table with unique column from connection 1.
@@ -441,7 +447,7 @@ public class TestPgCacheConsistency extends BasePgSQLTest {
       assertQuery(
           statement2,
           "EXPLAIN (COSTS OFF) SELECT u FROM test_table WHERE u = 1",
-          new Row("Foreign Scan on test_table"),
+          new Row("Seq Scan on test_table"),
           new Row("  Filter: (u = 1)")
       );
     }
@@ -449,8 +455,8 @@ public class TestPgCacheConsistency extends BasePgSQLTest {
 
   @Test
   public void testConsistentGUCWrites() throws Exception {
-    try (Connection connection1 = newConnectionBuilder().setTServer(0).connect();
-         Connection connection2 = newConnectionBuilder().setTServer(1).connect();
+    try (Connection connection1 = getConnectionBuilder().withTServer(0).connect();
+         Connection connection2 = getConnectionBuilder().withTServer(1).connect();
          Statement statement1 = connection1.createStatement();
          Statement statement2 = connection2.createStatement()) {
       statement1.execute("CREATE ROLE some_role");
@@ -470,8 +476,8 @@ public class TestPgCacheConsistency extends BasePgSQLTest {
 
   @Test
   public void testInvalidationCallbacksWhenInsertingIntoList() throws Exception {
-    try (Connection connection1 = newConnectionBuilder().setTServer(0).connect();
-         Connection connection2 = newConnectionBuilder().setTServer(1).connect();
+    try (Connection connection1 = getConnectionBuilder().withTServer(0).connect();
+         Connection connection2 = getConnectionBuilder().withTServer(1).connect();
          Statement statement1 = connection1.createStatement();
          Statement statement2 = connection2.createStatement()) {
       statement1.execute("CREATE ROLE some_role CREATEROLE");
@@ -492,8 +498,64 @@ public class TestPgCacheConsistency extends BasePgSQLTest {
     }
   }
 
-  private interface ThrowingRunnable {
-    void run() throws Throwable;
+  /** Test case inspired by #6317 and #6352, this caused SIGSERV crash. */
+  @Test
+  public void testAddedDefaults1() throws Exception {
+    try (Connection conn1 = getConnectionBuilder().connect();
+         Connection conn2 = getConnectionBuilder().connect();
+         Statement stmt1 = conn1.createStatement();
+         Statement stmt2 = conn2.createStatement()) {
+      stmt1.executeUpdate("CREATE ROLE application");
+
+      stmt1.executeUpdate("CREATE TABLE with_default(id int PRIMARY KEY)");
+
+      // This sequence just needs to exist, we don't even have to use it.
+      stmt1.executeUpdate("CREATE SEQUENCE some_seq");
+
+      stmt1.executeUpdate("INSERT INTO with_default(id) VALUES (1)");
+      stmt1.executeUpdate("ALTER TABLE with_default ADD COLUMN def1 int DEFAULT 10");
+
+      // Mixing in some "concurrent" DDLs to invalidate cache.
+      stmt2.executeUpdate("CREATE TABLE t()");
+      stmt2.executeUpdate("DROP TABLE t");
+
+      stmt1.executeUpdate("GRANT SELECT, INSERT, UPDATE, DELETE ON with_default TO application");
+
+      // Default on existing rows isn't properly set, see #4415
+      for (Statement stmt : Arrays.asList(stmt1, stmt2)) {
+        assertQuery(stmt, "SELECT COUNT(*) FROM with_default", new Row(1));
+      }
+    }
+  }
+
+  /** Test case inspired by #6317 and #6352, this caused SIGSERV crash. */
+  @Test
+  public void testAddedDefaults2() throws Exception {
+    try (Connection conn1 = getConnectionBuilder().connect();
+         Connection conn2 = getConnectionBuilder().connect();
+         Statement stmt1 = conn1.createStatement();
+         Statement stmt2 = conn2.createStatement()) {
+      stmt1.executeUpdate("CREATE TABLE with_default(id int PRIMARY KEY)");
+
+      stmt1.executeUpdate("CREATE SEQUENCE some_seq");
+      stmt1.executeUpdate("ALTER SEQUENCE some_seq OWNED BY with_default.id");
+
+      stmt1.executeUpdate("INSERT INTO with_default(id) VALUES (1)");
+      stmt1.executeUpdate("ALTER TABLE with_default ADD COLUMN def1 int DEFAULT 10");
+
+      // Mixing in some "concurrent" DDLs to invalidate cache.
+      stmt2.executeUpdate("CREATE TABLE t()");
+      stmt2.executeUpdate("DROP TABLE t");
+
+      stmt1.executeUpdate("DROP TABLE with_default");
+
+      for (Statement stmt : Arrays.asList(stmt1, stmt2)) {
+        runInvalidQuery(stmt, "SELECT * FROM with_default",
+            "relation \"with_default\" does not exist");
+        runInvalidQuery(stmt, "SELECT nextval('some_seq'::regclass)",
+            "relation \"some_seq\" does not exist");
+      }
+    }
   }
 
   private static Optional<Throwable> captureThrow(ThrowingRunnable action) {

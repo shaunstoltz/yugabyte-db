@@ -26,6 +26,7 @@ import org.yb.client.*;
 import org.yb.cql.BaseCQLTest;
 import org.yb.minicluster.Metrics;
 import org.yb.minicluster.MiniYBCluster;
+import org.yb.minicluster.MiniYBClusterBuilder;
 import org.yb.minicluster.MiniYBDaemon;
 
 import java.util.*;
@@ -88,6 +89,42 @@ public class TestClusterBase extends BaseCQLTest {
   public int getTestMethodTimeoutSec() {
     // No need to adjust for TSAN vs. non-TSAN here, it will be done automatically.
     return TEST_TIMEOUT_SEC;
+  }
+
+  @Override
+  protected void customizeMiniClusterBuilder(MiniYBClusterBuilder builder) {
+    super.customizeMiniClusterBuilder(builder);
+    builder.tserverHeartbeatTimeoutMs(5000);
+  }
+
+  void updateMiniClusterClient() throws Exception {
+    miniCluster.startSyncClient(true /* waitForMasterLeader */);
+    client = miniCluster.getClient();
+  }
+
+  @Override
+  protected Map<String, String> getMasterFlags() {
+    Map<String, String> flags = super.getMasterFlags();
+    // Speed up the load balancer.
+    flags.put("load_balancer_max_concurrent_adds", "5");
+    // TODO(bogdan): commented out until we figure out #4412.
+    /*
+    flags.put("load_balancer_max_over_replicated_tablets", "5");
+    flags.put("load_balancer_max_concurrent_removals", "5");
+    flags.put("load_balancer_max_concurrent_moves", "5");
+    */
+    // Disable caching for system.partitions.
+    flags.put("partitions_vtable_cache_refresh_secs", "0");
+    flags.put("load_balancer_initial_delay_secs", "0");
+    return flags;
+  }
+
+  @Override
+  protected Map<String, String> getTServerFlags() {
+    Map<String, String> flags = super.getTServerFlags();
+    // Disable the cql query cache for now
+    flags.put("cql_update_system_query_cache_msecs", "0");
+    return flags;
   }
 
   @Override
@@ -246,7 +283,7 @@ public class TestClusterBase extends BaseCQLTest {
       assertTrue(String.format("Couldn't find master %s in list %s", masterHostAndPort,
         masters.keySet().toString()), masters.containsKey(masterHostAndPort));
       int masterLeaderWebPort = masters.get(masterHostAndPort).getWebPort();
-      Metrics metrics = new Metrics(masterHostAndPort.getHostText(), masterLeaderWebPort,
+      Metrics metrics = new Metrics(masterHostAndPort.getHost(), masterLeaderWebPort,
         "cluster");
       int live_tservers = metrics.getCounter("num_tablet_servers_live").value;
       LOG.info("Live tservers: " + live_tservers + ", expected: " + expected_live);
@@ -268,13 +305,13 @@ public class TestClusterBase extends BaseCQLTest {
       LOG.info("New master online: " + masterRpcHostPort.toString());
 
       // Add new master to the config.
-      ChangeConfigResponse response = client.changeMasterConfig(masterRpcHostPort.getHostText(),
+      ChangeConfigResponse response = client.changeMasterConfig(masterRpcHostPort.getHost(),
         masterRpcHostPort.getPort(), true);
       assertFalse("ChangeConfig has error: " + response.errorMessage(), response.hasError());
 
       LOG.info("Added new master to config: " + masterRpcHostPort.toString());
 
-      // Wait for hearbeat interval to ensure tservers pick up the new masters.
+      // Wait for heartbeat interval to ensure tservers pick up the new masters.
       Thread.sleep(2 * MiniYBCluster.TSERVER_HEARTBEAT_INTERVAL_MS);
 
       LOG.info("Done waiting for new leader");
@@ -291,40 +328,8 @@ public class TestClusterBase extends BaseCQLTest {
     for (HostAndPort originalMaster : originalMasters.keySet()) {
       // Add new master.
       HostAndPort masterRpcHostPort = miniCluster.startShellMaster();
-
-      // Wait for new master to be online.
-      assertTrue(client.waitForMaster(masterRpcHostPort, NEW_MASTER_TIMEOUT_MS));
-
-      LOG.info("New master online: " + masterRpcHostPort.toString());
-
-      // Add new master to the config.
-      ChangeConfigResponse response = client.changeMasterConfig(masterRpcHostPort.getHostText(),
-        masterRpcHostPort.getPort(), true);
-      assertFalse("ChangeConfig has error: " + response.errorMessage(), response.hasError());
-
-      LOG.info("Added new master to config: " + masterRpcHostPort.toString());
-
-      // Wait for heartbeat interval to ensure tservers pick up the new masters.
-      Thread.sleep(2 * MiniYBCluster.TSERVER_HEARTBEAT_INTERVAL_MS);
-
-      // Remove old master.
-      response = client.changeMasterConfig(originalMaster.getHostText(), originalMaster.getPort(),
-                                           false);
-      assertFalse("ChangeConfig has error: " + response.errorMessage(), response.hasError());
-
-      LOG.info("Removed old master from config: " + originalMaster.toString());
-
-      // Wait for the new leader to be online.
-      client.waitForMasterLeader(NEW_MASTER_TIMEOUT_MS);
-      LOG.info("Done waiting for new leader");
-
-      // Kill the old master.
-      miniCluster.killMasterOnHostPort(originalMaster);
-
-      LOG.info("Killed old master: " + originalMaster.toString());
-
-      // Verify no load tester errors.
-      loadTesterRunnable.verifyNumExceptions();
+      addMaster(masterRpcHostPort);
+      removeMaster(originalMaster);
     }
   }
 
@@ -352,20 +357,22 @@ public class TestClusterBase extends BaseCQLTest {
   }
 
   protected void addMaster(HostAndPort newMaster) throws Exception {
-    ChangeConfigResponse response = client.changeMasterConfig(newMaster.getHostText(),
+    ChangeConfigResponse response = client.changeMasterConfig(newMaster.getHost(),
         newMaster.getPort(), true);
     assertFalse("ChangeConfig has error: " + response.errorMessage(), response.hasError());
 
     LOG.info("Added new master to config: " + newMaster.toString());
 
-    // Wait for hearbeat interval to ensure tservers pick up the new masters.
+    updateMiniClusterClient();
+
+    // Wait for heartbeat interval to ensure tservers pick up the new masters.
     Thread.sleep(4 * MiniYBCluster.TSERVER_HEARTBEAT_INTERVAL_MS);
   }
 
   protected void removeMaster(HostAndPort oldMaster) throws Exception {
     // Remove old master.
     ChangeConfigResponse response =
-        client.changeMasterConfig(oldMaster.getHostText(), oldMaster.getPort(), false);
+        client.changeMasterConfig(oldMaster.getHost(), oldMaster.getPort(), false);
     assertFalse("ChangeConfig has error: " + response.errorMessage(), response.hasError());
 
     LOG.info("Removed old master from config: " + oldMaster.toString());
@@ -376,6 +383,8 @@ public class TestClusterBase extends BaseCQLTest {
 
     // Kill the old master.
     miniCluster.killMasterOnHostPort(oldMaster);
+
+    updateMiniClusterClient();
 
     LOG.info("Killed old master: " + oldMaster.toString());
 
@@ -430,7 +439,7 @@ public class TestClusterBase extends BaseCQLTest {
     List<Common.HostPortPB> blacklisted_hosts = new ArrayList<>();
     for (Map.Entry<HostAndPort, MiniYBDaemon> ts : originalTServers.entrySet()) {
       Common.HostPortPB hostPortPB = Common.HostPortPB.newBuilder()
-        .setHost(ts.getKey().getHostText())
+        .setHost(ts.getKey().getHost())
         .setPort(ts.getKey().getPort())
         .build();
       blacklisted_hosts.add(hostPortPB);
@@ -463,12 +472,23 @@ public class TestClusterBase extends BaseCQLTest {
       removeMaster(leaderHostPort);
 
       long totalAfterKillMaster = client.getLoadMoveCompletion().getTotal();
+      long remainingAfterKillMaster = client.getLoadMoveCompletion().getRemaining();
 
-      // Killing master leader should reset the total count to be the same as remaining.
-      // Hence the new total should be strictly less than old total.
-      assertLessThan(totalAfterKillMaster, totalBeforeKillMaster);
+      // TODO(sanket): We should ideally ensure here that there has been at least
+      // one TS HB to the new leader master otherwise remaining load could be 0.
+      // After failover, the remaining load should be less than the initial load.
+      assertLessThan(remainingAfterKillMaster, totalAfterKillMaster);
+
+      // Killing master leader will set the total count to be the same as the
+      // initial total count during failover.
+      assertEquals(totalAfterKillMaster, totalBeforeKillMaster);
+
+      // The remaining work in the new leader will be less than the total
+      // in the original leader.
+      assertLessThan(remainingAfterKillMaster, totalBeforeKillMaster);
+
       // And there should be work remaining to do.
-      assertLessThan((long)0, client.getLoadMoveCompletion().getRemaining());
+      assertLessThan((long)0, remainingAfterKillMaster);
     }
 
     // Wait for the move to complete.
@@ -496,7 +516,7 @@ public class TestClusterBase extends BaseCQLTest {
     }
 
     // Wait for heartbeats to expire.
-    Thread.sleep(MiniYBCluster.TSERVER_HEARTBEAT_TIMEOUT_MS * 2);
+    Thread.sleep(miniCluster.getClusterParameters().getTServerHeartbeatTimeoutMs() * 2);
 
     // Verify live tservers.
     verifyExpectedLiveTServers(NUM_TABLET_SERVERS);
@@ -507,7 +527,7 @@ public class TestClusterBase extends BaseCQLTest {
     List<Common.HostPortPB> leader_blacklist_hosts = new ArrayList<>();
     HostAndPort hp = hps[offset];
     Common.HostPortPB hostPortPB = Common.HostPortPB.newBuilder()
-      .setHost(hp.getHostText())
+      .setHost(hp.getHost())
       .setPort(hp.getPort())
       .build();
     leader_blacklist_hosts.add(hostPortPB);
@@ -600,7 +620,7 @@ public class TestClusterBase extends BaseCQLTest {
     List<Common.HostPortPB> leader_blacklist_hosts = new ArrayList<>();
     HostAndPort hp = hps[offset];
     Common.HostPortPB hostPortPB = Common.HostPortPB.newBuilder()
-      .setHost(hp.getHostText())
+      .setHost(hp.getHost())
       .setPort(hp.getPort())
       .build();
     leader_blacklist_hosts.add(hostPortPB);
@@ -692,7 +712,7 @@ public class TestClusterBase extends BaseCQLTest {
     verifyMetrics(NUM_OPS_INCREMENT / numTabletServers);
 
     // Wait for heartbeats to expire.
-    Thread.sleep(MiniYBCluster.TSERVER_HEARTBEAT_TIMEOUT_MS * 2);
+    Thread.sleep(miniCluster.getClusterParameters().getTServerHeartbeatTimeoutMs() * 2);
 
     // Verify live tservers.
     verifyExpectedLiveTServers(numTabletServers);
@@ -742,7 +762,7 @@ public class TestClusterBase extends BaseCQLTest {
     int num_tablets_moved_to_new_tserver = 12;
 
     int rbs_delay_sec = 15;
-    addNewTServers(1, Arrays.asList("--simulate_long_remote_bootstrap_sec=" + rbs_delay_sec));
+    addNewTServers(1, Arrays.asList("--TEST_simulate_long_remote_bootstrap_sec=" + rbs_delay_sec));
 
     // Load balancer should not become idle while long RBS is half-way.
     assertFalse(client.waitForLoadBalancerIdle(

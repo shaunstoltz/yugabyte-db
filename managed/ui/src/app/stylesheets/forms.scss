@@ -1,6 +1,7 @@
 /* Copyright (c) YugaByte, Inc. */
 
-@import "_style/mixins.scss";
+@import '../../_style/mixins.scss';
+@import '../../_style/colors.scss';
 
 .form-section-title {
   font-size: 1.2em;
@@ -61,7 +62,6 @@
   input {
     font-weight: 400;
     font-size: 16px;
-
 
     &::-webkit-input-placeholder,
     &::-webkit-placeholder {
@@ -128,7 +128,7 @@
 
     &:focus {
       @include transition(0.35s);
-      border: 0.5px solid rgba($YB_ORANGE, .6);
+      border: 0.5px solid rgba($YB_ORANGE, 0.6);
       background-color: lighten($YB_VIOLET_DARK, 3%);
       box-shadow: inset 0 2px 3px black;
     }
@@ -224,7 +224,7 @@
       min-height: 42px;
       padding-bottom: 4px;
       border-color: $YB_GRAY;
-      box-shadow: inset 0 1px 1px rgba(0, 0, 0, .075);
+      box-shadow: inset 0 1px 1px rgba(0, 0, 0, 0.075);
       .Select-arrow {
         border-color: #555 transparent transparent;
       }
@@ -258,7 +258,7 @@
         top: 3px;
       }
     }
-    [class$=singleValue] b {
+    [class$='singleValue'] b {
       font-weight: 400;
       font-size: 1em;
     }
@@ -266,7 +266,6 @@
   .Select-placeholder {
     line-height: 40px;
   }
-
 
   .Select-menu-outer {
     z-index: 2;
@@ -299,40 +298,40 @@
   margin-bottom: 0;
 }
 
-  .form-group {
-    margin-bottom: 0px;
-  }
+.form-group {
+  margin-bottom: 0px;
+}
 
-  .form-group-hidden {
-    height: 0;
-    overflow: hidden;
-    opacity: 0;
-    pointer-events: none;
-  }
+.form-group-hidden {
+  height: 0;
+  overflow: hidden;
+  opacity: 0;
+  pointer-events: none;
+}
 
-  .form-control {
-    border-radius: 7px;
-    height: 42px;
-    padding: 0 12px;
-    border-color: $YB_GRAY;
+.form-control {
+  border-radius: 7px;
+  height: 42px;
+  padding: 0 12px;
+  border-color: $YB_GRAY;
 
-    &select:after {
-      content: '';
-      width: 2px;
-      height: 2px;
-      background: #000;
-    }
-    &:focus {
-      border-color: rgba($YB_ORANGE, .5);
-      box-shadow: inset 0 1px 1px rgba(0,0,0,.075), 0 0 8px rgba($YB_ORANGE, .2);
-    }
+  &select:after {
+    content: '';
+    width: 2px;
+    height: 2px;
+    background: #000;
   }
+  &:focus {
+    border-color: rgba($YB_ORANGE, 0.5);
+    box-shadow: inset 0 1px 1px rgba(0, 0, 0, 0.075), 0 0 8px rgba($YB_ORANGE, 0.2);
+  }
+}
 
-  .form-item-label {
-    * {
-      display: inline;
-    }
+.form-item-label {
+  * {
+    display: inline;
   }
+}
 
 .page-register {
   height: auto;
@@ -354,7 +353,6 @@
   }
 
   .form-register {
-
     .form-item-label {
       padding-right: 50px;
       font-size: 14px;
@@ -392,8 +390,8 @@
       text-align: left;
     }
 
-    @media screen and (max-width: 600px)  {
-      button.btn[type="submit"] {
+    @media screen and (max-width: 600px) {
+      button.btn[type='submit'] {
         margin: 20px auto 0;
         float: none !important;
       }
@@ -414,19 +412,18 @@
     pointer-events: none;
     background-color: #eeeeee;
   }
-  input.readonly + b, input.readonly + b + b {
+  input.readonly + b,
+  input.readonly + b + b {
     display: none;
   }
 }
 
 .Select {
-
   #react-select-3-group-1-heading {
     padding-left: 10px;
   }
 
   .input-select__option {
-
     .input-select__option-icon {
       color: $YB_ORANGE;
       font-size: 1.4em;
@@ -449,11 +446,97 @@
     top: -1px;
   }
 
-  [class$=control] {
+  [class$='control'] {
     & > div:first-child {
       padding-top: 6px;
       padding-left: 7px;
       padding-bottom: 6px;
     }
   }
+}
+
+.yb-form-radio {
+  display: flex;
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  overflow: auto;
+  width: fit-content;
+
+  li {
+    position: relative;
+  }
+
+  li input[type='radio'] {
+    position: absolute;
+    visibility: hidden;
+    top: 0;
+    left: 0;
+    z-index: 600;
+  }
+
+  label {
+    display: block;
+    position: relative;
+    padding: 25px;
+    margin: 10px auto;
+    height: 30px;
+    z-index: 9;
+    cursor: pointer;
+    -webkit-transition: all 0.25s linear;
+  }
+
+  li:hover {
+    label {
+      color: $YB_ORANGE;
+    }
+
+    .check {
+      border: 2px solid $YB_ORANGE;
+    }
+  }
+
+  .check {
+    position: absolute;
+    left: 45%;
+    margin: 0 auto;
+    border: 2px solid $YB_DARK_GRAY;
+    background: #ffffff;
+    border-radius: 100%;
+    height: 20px;
+    width: 20px;
+    z-index: 5;
+    transition: border 0.25s linear;
+    -webkit-transition: border 0.25s linear;
+  }
+
+  li .check::before {
+    display: block;
+    position: absolute;
+    content: '';
+    border-radius: 100%;
+    height: 10px;
+    width: 10px;
+    top: 3px;
+    left: 3px;
+    margin: auto;
+    transition: background 0.25s linear;
+    -webkit-transition: background 0.25s linear;
+  }
+
+  input[type='radio']:checked ~ .check::before {
+    background: $YB_ORANGE;
+  }
+}
+
+.connecting-line {
+  height: 1px;
+  background: #aaa;
+  position: absolute;
+  top: 10px;
+  z-index: 1;
+}
+
+.radio-bar.form-group {
+  display: flex;
 }

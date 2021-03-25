@@ -13,6 +13,13 @@
 
 #include "yb/docdb/cql_operation.h"
 
+#include <limits>
+#include <memory>
+#include <string>
+#include <unordered_set>
+#include <utility>
+#include <vector>
+
 #include "yb/common/index.h"
 #include "yb/common/jsonb.h"
 #include "yb/common/partition.h"
@@ -22,6 +29,7 @@
 #include "yb/common/ql_value.h"
 
 #include "yb/docdb/doc_ql_scanspec.h"
+#include "yb/docdb/docdb_debug.h"
 #include "yb/docdb/docdb_rocksdb_util.h"
 #include "yb/docdb/docdb_util.h"
 #include "yb/docdb/primitive_value_util.h"
@@ -42,10 +50,18 @@ DEFINE_bool(ycql_consistent_transactional_paging, false,
             "be stale. The latter is preferable for long scans. The data returned for the first "
             "page of results is never stale regardless of this flag.");
 
-DECLARE_bool(trace_docdb_calls);
+DEFINE_bool(ycql_disable_index_updating_optimization, false,
+            "If true all secondary indexes must be updated even if the update does not change "
+            "the index data.");
+TAG_FLAG(ycql_disable_index_updating_optimization, advanced);
 
 namespace yb {
 namespace docdb {
+
+using std::pair;
+using std::unordered_map;
+using std::unordered_set;
+using std::vector;
 
 namespace {
 
@@ -136,7 +152,7 @@ bool JoinStaticRow(
 
   // Join the static columns in the static row into the non-static row.
   for (size_t i = 0; i < static_projection.num_columns(); i++) {
-    CHECK_OK(non_static_row->CopyColumn(static_projection.column_id(i), static_row));
+    non_static_row->CopyColumn(static_projection.column_id(i), static_row);
   }
 
   return true;
@@ -163,7 +179,7 @@ bool JoinNonStaticRow(
     }
 
     for (size_t i = 0; i < schema.num_hash_key_columns(); i++) {
-      CHECK_OK(static_row->CopyColumn(schema.column_id(i), non_static_row));
+      static_row->CopyColumn(schema.column_id(i), non_static_row);
     }
   }
   return join_successful;
@@ -225,19 +241,33 @@ CHECKED_STATUS CheckUserTimestampForCollections(const UserTimeMicros user_timest
 
 } // namespace
 
+QLWriteOperation::QLWriteOperation(std::shared_ptr<const Schema> schema,
+                                   const IndexMap& index_map,
+                                   const Schema* unique_index_key_schema,
+                                   const TransactionOperationContextOpt& txn_op_context)
+    : schema_(std::move(schema)),
+      index_map_(index_map),
+      unique_index_key_schema_(unique_index_key_schema),
+      txn_op_context_(txn_op_context)
+{}
+
 Status QLWriteOperation::Init(QLWriteRequestPB* request, QLResponsePB* response) {
   request_.Swap(request);
   response_ = response;
   insert_into_unique_index_ = request_.type() == QLWriteRequestPB::QL_STMT_INSERT &&
                               unique_index_key_schema_ != nullptr;
-  require_read_ = RequireRead(request_, schema_) || insert_into_unique_index_;
+  require_read_ = RequireRead(request_, *schema_) || insert_into_unique_index_;
   update_indexes_ = !request_.update_index_ids().empty();
 
   // Determine if static / non-static columns are being written.
   bool write_static_columns = false;
   bool write_non_static_columns = false;
+  // TODO(Amit): Remove the DVLOGS after backfill features stabilize.
+  DVLOG(4) << "Processing request " << yb::ToString(*request);
   for (const auto& column : request_.column_values()) {
-    auto schema_column = schema_.column_by_id(ColumnId(column.column_id()));
+    DVLOG(4) << "Looking at column : " << yb::ToString(column);
+    auto schema_column = schema_->column_by_id(ColumnId(column.column_id()));
+    DVLOG(4) << "schema column : " << yb::ToString(schema_column);
     RETURN_NOT_OK(schema_column);
     if (schema_column->is_static()) {
       write_static_columns = true;
@@ -249,7 +279,7 @@ Status QLWriteOperation::Init(QLWriteRequestPB* request, QLResponsePB* response)
     }
   }
 
-  bool is_range_operation = IsRangeOperation(request_, schema_);
+  bool is_range_operation = IsRangeOperation(request_, *schema_);
 
   // We need the hashed key if writing to the static columns, and need primary key if writing to
   // non-static columns or writing the full primary key (i.e. range columns are present or table
@@ -257,7 +287,7 @@ Status QLWriteOperation::Init(QLWriteRequestPB* request, QLResponsePB* response)
   return InitializeKeys(
       write_static_columns || is_range_operation,
       write_non_static_columns || !request_.range_column_values().empty() ||
-          schema_.num_range_key_columns() == 0);
+      schema_->num_range_key_columns() == 0);
 }
 
 Status QLWriteOperation::InitializeKeys(const bool hashed_key, const bool primary_key) {
@@ -267,11 +297,11 @@ Status QLWriteOperation::InitializeKeys(const bool hashed_key, const bool primar
   std::vector<PrimitiveValue> hashed_components;
   std::vector<PrimitiveValue> range_components;
   RETURN_NOT_OK(QLKeyColumnValuesToPrimitiveValues(
-      hashed_column_values, schema_, 0,
-      schema_.num_hash_key_columns(), &hashed_components));
+      hashed_column_values, *schema_, 0,
+      schema_->num_hash_key_columns(), &hashed_components));
   RETURN_NOT_OK(QLKeyColumnValuesToPrimitiveValues(
-      range_column_values, schema_, schema_.num_hash_key_columns(),
-      schema_.num_range_key_columns(), &range_components));
+      range_column_values, *schema_, schema_->num_hash_key_columns(),
+      schema_->num_range_key_columns(), &range_components));
 
   // need_pk - true is we should construct pk_key_key_
   const bool need_pk = primary_key && !pk_doc_key_;
@@ -315,7 +345,7 @@ Status QLWriteOperation::GetDocPaths(
     KeyBytes buffer;
     for (const auto& column_value : request_.column_values()) {
       ColumnId column_id(column_value.column_id());
-      const ColumnSchema& column = VERIFY_RESULT(schema_.column_by_id(column_id));
+      const ColumnSchema& column = VERIFY_RESULT(schema_->column_by_id(column_id));
 
       Slice doc_key = column.is_static() ? encoded_hashed_doc_key_.as_slice()
                                          : encoded_pk_doc_key_.as_slice();
@@ -324,7 +354,7 @@ Status QLWriteOperation::GetDocPaths(
       buffer.AppendColumnId(column_id);
       RefCntBuffer path(doc_key.size() + buffer.size());
       memcpy(path.data(), doc_key.data(), doc_key.size());
-      memcpy(path.data() + doc_key.size(), buffer.data().c_str(), buffer.size());
+      buffer.AsSlice().CopyTo(path.data() + doc_key.size());
       paths->push_back(RefCntPrefix(path));
     }
   }
@@ -358,7 +388,7 @@ Status QLWriteOperation::ReadColumns(const DocOperationApplyData& data,
   }
 
   // Create projections to scan docdb.
-  RETURN_NOT_OK(CreateProjections(schema_, request_.column_refs(),
+  RETURN_NOT_OK(CreateProjections(*schema_, request_.column_refs(),
                                   static_projection, non_static_projection));
 
   // Generate hashed / primary key depending on if static / non-static columns are referenced in
@@ -369,7 +399,7 @@ Status QLWriteOperation::ReadColumns(const DocOperationApplyData& data,
   // Scan docdb for the static and non-static columns of the row using the hashed / primary key.
   if (hashed_doc_key_) {
     DocQLScanSpec spec(*static_projection, *hashed_doc_key_, request_.query_id());
-    DocRowwiseIterator iterator(*static_projection, schema_, txn_op_context_,
+    DocRowwiseIterator iterator(*static_projection, *schema_, txn_op_context_,
                                 data.doc_write_batch->doc_db(),
                                 data.deadline, data.read_time);
     RETURN_NOT_OK(iterator.Init(spec));
@@ -380,7 +410,7 @@ Status QLWriteOperation::ReadColumns(const DocOperationApplyData& data,
   }
   if (pk_doc_key_) {
     DocQLScanSpec spec(*non_static_projection, *pk_doc_key_, request_.query_id());
-    DocRowwiseIterator iterator(*non_static_projection, schema_, txn_op_context_,
+    DocRowwiseIterator iterator(*non_static_projection, *schema_, txn_op_context_,
                                 data.doc_write_batch->doc_db(),
                                 data.deadline, data.read_time);
     RETURN_NOT_OK(iterator.Init(spec));
@@ -414,24 +444,24 @@ Status QLWriteOperation::PopulateConditionalDmlRow(const DocOperationApplyData& 
   // and the present column values if the condition is not satisfied and the row does exist
   // (value_map is not empty).
   const bool return_present_values = !should_apply && !table_row.IsEmpty();
-  const size_t num_key_columns = pk_doc_key_ ? schema_.num_key_columns()
-      : schema_.num_hash_key_columns();
+  const size_t num_key_columns =
+      pk_doc_key_ ? schema_->num_key_columns() : schema_->num_hash_key_columns();
   std::vector<ColumnSchema> columns;
   columns.emplace_back(ColumnSchema("[applied]", BOOL));
   if (return_present_values) {
-    columns.insert(columns.end(), schema_.columns().begin(),
-        schema_.columns().begin() + num_key_columns);
+    columns.insert(columns.end(), schema_->columns().begin(),
+                   schema_->columns().begin() + num_key_columns);
     columns.insert(columns.end(), static_projection.columns().begin(),
-        static_projection.columns().end());
+                   static_projection.columns().end());
     columns.insert(columns.end(), non_static_projection.columns().begin(),
-        non_static_projection.columns().end());
+                   non_static_projection.columns().end());
   }
   rowblock->reset(new QLRowBlock(Schema(columns, 0)));
   QLRow& row = rowblock->get()->Extend();
   row.mutable_column(0)->set_bool_value(should_apply);
   size_t col_idx = 1;
   if (return_present_values) {
-    RETURN_NOT_OK(PopulateRow(table_row, schema_, 0, num_key_columns, &row, &col_idx));
+    RETURN_NOT_OK(PopulateRow(table_row, *schema_, 0, num_key_columns, &row, &col_idx));
     RETURN_NOT_OK(PopulateRow(table_row, static_projection, &row, &col_idx));
     RETURN_NOT_OK(PopulateRow(table_row, non_static_projection, &row, &col_idx));
   }
@@ -443,11 +473,10 @@ Status QLWriteOperation::PopulateStatusRow(const DocOperationApplyData& data,
                                            const bool should_apply,
                                            const QLTableRow& table_row,
                                            std::unique_ptr<QLRowBlock>* rowblock) {
-
   std::vector<ColumnSchema> columns;
   columns.emplace_back(ColumnSchema("[applied]", BOOL));
   columns.emplace_back(ColumnSchema("[message]", STRING));
-  columns.insert(columns.end(), schema_.columns().begin(), schema_.columns().end());
+  columns.insert(columns.end(), schema_->columns().begin(), schema_->columns().end());
 
   rowblock->reset(new QLRowBlock(Schema(columns, 0)));
   QLRow& row = rowblock->get()->Extend();
@@ -456,8 +485,8 @@ Status QLWriteOperation::PopulateStatusRow(const DocOperationApplyData& data,
 
   // If not applied report the existing row values as for regular if clause.
   if (!should_apply) {
-    for (size_t i = 0; i < schema_.num_columns(); i++) {
-      boost::optional<const QLValuePB&> col_val = table_row.GetValue(schema_.column_id(i));
+    for (size_t i = 0; i < schema_->num_columns(); i++) {
+      boost::optional<const QLValuePB&> col_val = table_row.GetValue(schema_->column_id(i));
       if (col_val.is_initialized()) {
         *(row.mutable_column(i + 2)) = *col_val;
       }
@@ -468,38 +497,69 @@ Status QLWriteOperation::PopulateStatusRow(const DocOperationApplyData& data,
 }
 
 // Check if a duplicate value is inserted into a unique index.
-Result<bool> QLWriteOperation::DuplicateUniqueIndexValue(const DocOperationApplyData& data) {
-  VLOG(3) << "Looking for collisions in \n"
+Result<bool> QLWriteOperation::HasDuplicateUniqueIndexValue(const DocOperationApplyData& data) {
+  VLOG(3) << "Looking for collisions in\n"
           << docdb::DocDBDebugDumpToStr(data.doc_write_batch->doc_db());
-  // We only need to check backwards for backfilled entries.
-  return VERIFY_RESULT(DuplicateUniqueIndexValue(data, Direction::kForward)) ||
-         (request_.is_backfilling() &&
-          VERIFY_RESULT(DuplicateUniqueIndexValue(data, Direction::kBackward)));
+  // We need to check backwards only for backfilled entries.
+  bool ret =
+      VERIFY_RESULT(HasDuplicateUniqueIndexValue(data, Direction::kForward)) ||
+      (request_.is_backfill() &&
+       VERIFY_RESULT(HasDuplicateUniqueIndexValue(data, Direction::kBackward)));
+  if (!ret) {
+    VLOG(3) << "No collisions found";
+  }
+  return ret;
 }
 
-Result<bool> QLWriteOperation::DuplicateUniqueIndexValue(
+Result<bool> QLWriteOperation::HasDuplicateUniqueIndexValue(
     const DocOperationApplyData& data, Direction direction) {
-  VLOG(2) << "Looking for collision while going " << yb::ToString(direction);
+  VLOG(2) << "Looking for collision while going " << yb::ToString(direction)
+          << ". Trying to insert " << *pk_doc_key_;
   auto requested_read_time = data.read_time;
   if (direction == Direction::kForward) {
-    return DuplicateUniqueIndexValue(data, requested_read_time);
+    return HasDuplicateUniqueIndexValue(data, requested_read_time);
   }
 
-  // TODO: Handle Unique Index conflicts during backfill.
-  return false;
+  auto iter = CreateIntentAwareIterator(
+      data.doc_write_batch->doc_db(),
+      BloomFilterMode::USE_BLOOM_FILTER,
+      pk_doc_key_->Encode().AsSlice(),
+      request_.query_id(),
+      txn_op_context_,
+      data.deadline,
+      ReadHybridTime::Max());
+
+  HybridTime oldest_past_min_ht = VERIFY_RESULT(FindOldestOverwrittenTimestamp(
+      iter.get(), SubDocKey(*pk_doc_key_), requested_read_time.read));
+  const HybridTime oldest_past_min_ht_liveness =
+      VERIFY_RESULT(FindOldestOverwrittenTimestamp(
+          iter.get(),
+          SubDocKey(*pk_doc_key_,
+                    PrimitiveValue::SystemColumnId(SystemColumnIds::kLivenessColumn)),
+          requested_read_time.read));
+  oldest_past_min_ht.MakeAtMost(oldest_past_min_ht_liveness);
+  if (!oldest_past_min_ht.is_valid()) {
+    return false;
+  }
+  return HasDuplicateUniqueIndexValue(
+      data, ReadHybridTime::SingleTime(oldest_past_min_ht));
 }
 
-Result<bool> QLWriteOperation::DuplicateUniqueIndexValue(
+Result<bool> QLWriteOperation::HasDuplicateUniqueIndexValue(
     const DocOperationApplyData& data, ReadHybridTime read_time) {
   // Set up the iterator to read the current primary key associated with the index key.
   DocQLScanSpec spec(*unique_index_key_schema_, *pk_doc_key_, request_.query_id(), true);
   DocRowwiseIterator iterator(
-      *unique_index_key_schema_, schema_, txn_op_context_, data.doc_write_batch->doc_db(),
-      data.deadline, read_time);
+      *unique_index_key_schema_,
+      *schema_,
+      txn_op_context_,
+      data.doc_write_batch->doc_db(),
+      data.deadline,
+      read_time);
   RETURN_NOT_OK(iterator.Init(spec));
 
-  // It is a duplicate value if the index key exist already and the associated indexed primary key
-  // is not the same.
+  // It is a duplicate value if the index key exists already and the index value (corresponding to
+  // the indexed table's primary key) is not the same.
   if (!VERIFY_RESULT(iterator.HasNext())) {
     VLOG(2) << "No collision found while checking at " << yb::ToString(read_time);
     return false;
@@ -511,13 +571,15 @@ Result<bool> QLWriteOperation::DuplicateUniqueIndexValue(
   for (const auto& column_value : request_.column_values()) {
     ColumnId column_id(column_value.column_id());
     if (key_column_ids.count(column_id) > 0) {
-      auto value = table_row.GetValue(column_id);
-      if (value && *value != column_value.expr().value()) {
+      boost::optional<const QLValuePB&> existing_value = table_row.GetValue(column_id);
+      const QLValuePB& new_value = column_value.expr().value();
+      if (existing_value && *existing_value != new_value) {
         VLOG(2) << "Found collision while checking at " << yb::ToString(read_time)
-                << " Existing :" << yb::ToString(*value)
-                << " vs New :" << yb::ToString(column_value.expr().value()) << " used read time as "
-                << yb::ToString(data.read_time) << " data is now :\n"
-                << docdb::DocDBDebugDumpToStr(data.doc_write_batch->doc_db());
+                << "\nExisting: " << yb::ToString(*existing_value)
+                << " vs New: " << yb::ToString(new_value)
+                << "\nUsed read time as " << yb::ToString(data.read_time);
+        DVLOG(3) << "DocDB is now:\n"
+                 << docdb::DocDBDebugDumpToStr(data.doc_write_batch->doc_db());
         return true;
       }
     }
@@ -525,6 +587,26 @@ Result<bool> QLWriteOperation::DuplicateUniqueIndexValue(
 
   VLOG(2) << "No collision while checking at " << yb::ToString(read_time);
   return false;
+}
+
+Result<HybridTime> QLWriteOperation::FindOldestOverwrittenTimestamp(
+    IntentAwareIterator* iter,
+    const SubDocKey& sub_doc_key,
+    HybridTime min_read_time) {
+  HybridTime result;
+  VLOG(3) << "Doing iter->Seek " << *pk_doc_key_;
+  iter->Seek(*pk_doc_key_);
+  if (iter->valid()) {
+    const KeyBytes bytes = sub_doc_key.EncodeWithoutHt();
+    const Slice& sub_key_slice = bytes.AsSlice();
+    result = VERIFY_RESULT(
+        iter->FindOldestRecord(sub_key_slice, min_read_time));
+    VLOG(2) << "iter->FindOldestRecord returned " << result << " for "
+            << SubDocKey::DebugSliceToString(sub_key_slice);
+  } else {
+    VLOG(3) << "iter->Seek " << *pk_doc_key_ << " turned out to be invalid";
+  }
+  return result;
 }
 
 Status QLWriteOperation::ApplyForJsonOperators(const QLColumnValuePB& column_value,
@@ -536,9 +618,10 @@ Status QLWriteOperation::ApplyForJsonOperators(const QLColumnValuePB& column_val
                                                bool is_insert) {
   using common::Jsonb;
   // Read the json column value inorder to perform a read modify write.
-  QLValue ql_value;
-  RETURN_NOT_OK(existing_row->ReadColumn(column_value.column_id(), &ql_value, nullptr));
-  if (ql_value.IsNull()) {
+  QLExprResult temp;
+  RETURN_NOT_OK(existing_row->ReadColumn(column_value.column_id(), temp.Writer()));
+  const auto& ql_value = temp.Value();
+  if (IsNull(ql_value)) {
     return STATUS_SUBSTITUTE(QLError, "Invalid Json value: ", column_value.ShortDebugString());
   }
   Jsonb jsonb(std::move(ql_value.jsonb_value()));
@@ -612,11 +695,11 @@ Status QLWriteOperation::ApplyForSubscriptArgs(const QLColumnValuePB& column_val
                                                const UserTimeMicros& user_timestamp,
                                                const ColumnSchema& column,
                                                DocPath* sub_path) {
-  QLValue expr_result;
-  RETURN_NOT_OK(EvalExpr(column_value.expr(), existing_row, &expr_result));
+  QLExprResult expr_result;
+  RETURN_NOT_OK(EvalExpr(column_value.expr(), existing_row, expr_result.Writer()));
   const yb::bfql::TSOpcode write_instr = GetTSWriteInstruction(column_value.expr());
   const SubDocument& sub_doc =
-      SubDocument::FromQLValuePB(expr_result.value(), column.sorting_type(), write_instr);
+      SubDocument::FromQLValuePB(expr_result.Value(), column.sorting_type(), write_instr);
   RETURN_NOT_OK(CheckUserTimestampForCollections(user_timestamp));
 
   // Setting the value for a sub-column
@@ -637,14 +720,13 @@ Status QLWriteOperation::ApplyForSubscriptArgs(const QLColumnValuePB& column_val
       break;
     }
     case LIST: {
-      MonoDelta default_ttl = schema_.table_properties().HasDefaultTimeToLive() ?
-          MonoDelta::FromMilliseconds(schema_.table_properties().DefaultTimeToLive()) :
+      MonoDelta default_ttl = schema_->table_properties().HasDefaultTimeToLive() ?
+          MonoDelta::FromMilliseconds(schema_->table_properties().DefaultTimeToLive()) :
           MonoDelta::kMax;
 
-      // At YQL layer list indexes start at 0, but internally we start at 1.
-      int index = column_value.subscript_args(0).value().int32_value() + 1;
+      int target_cql_index = column_value.subscript_args(0).value().int32_value();
       RETURN_NOT_OK(data.doc_write_batch->ReplaceCqlInList(
-          *sub_path, {index}, {sub_doc}, data.read_time, data.deadline, request_.query_id(),
+          *sub_path, target_cql_index, sub_doc, data.read_time, data.deadline, request_.query_id(),
           default_ttl, ttl));
       break;
     }
@@ -667,11 +749,11 @@ Status QLWriteOperation::ApplyForRegularColumns(const QLColumnValuePB& column_va
   using yb::bfql::TSOpcode;
 
   // Typical case, setting a columns value
-  QLValue expr_result;
-  RETURN_NOT_OK(EvalExpr(column_value.expr(), existing_row, &expr_result));
+  QLExprResult expr_result;
+  RETURN_NOT_OK(EvalExpr(column_value.expr(), existing_row, expr_result.Writer()));
   const TSOpcode write_instr = GetTSWriteInstruction(column_value.expr());
   const SubDocument& sub_doc =
-      SubDocument::FromQLValuePB(expr_result.value(), column.sorting_type(), write_instr);
+      SubDocument::FromQLValuePB(expr_result.Value(), column.sorting_type(), write_instr);
   switch (write_instr) {
     case TSOpcode::kToJson: FALLTHROUGH_INTENDED;
     case TSOpcode::kScalarInsert:
@@ -711,7 +793,7 @@ Status QLWriteOperation::ApplyForRegularColumns(const QLColumnValuePB& column_va
   }
 
   if (update_indexes_) {
-    new_row->AllocColumn(column_id, expr_result);
+    new_row->AllocColumn(column_id, expr_result.Value());
   }
   return Status::OK();
 }
@@ -745,7 +827,7 @@ Status QLWriteOperation::Apply(const DocOperationApplyData& data) {
       return Status::OK();
     }
 
-    TEST_PAUSE_IF_FLAG(pause_write_apply_after_if);
+    TEST_PAUSE_IF_FLAG(TEST_pause_write_apply_after_if);
   } else if (RequireReadForExpressions(request_) || request_.returns_status()) {
     RETURN_NOT_OK(ReadColumns(data, nullptr, nullptr, &existing_row));
     if (request_.returns_status()) {
@@ -753,7 +835,8 @@ Status QLWriteOperation::Apply(const DocOperationApplyData& data) {
     }
   }
 
-  if (insert_into_unique_index_ && VERIFY_RESULT(DuplicateUniqueIndexValue(data))) {
+  VLOG(3) << "insert_into_unique_index_ is " << insert_into_unique_index_;
+  if (insert_into_unique_index_ && VERIFY_RESULT(HasDuplicateUniqueIndexValue(data))) {
     VLOG(3) << "set_applied is set to " << false << " for over " << yb::ToString(existing_row);
     response_->set_applied(false);
     response_->set_status(QLResponsePB::YQL_STATUS_OK);
@@ -774,11 +857,11 @@ Status QLWriteOperation::Apply(const DocOperationApplyData& data) {
   } else {
     size_t idx = 0;
     for (const QLExpressionPB& expr : request_.hashed_column_values()) {
-      new_row.AllocColumn(schema_.column_id(idx), expr.value());
+      new_row.AllocColumn(schema_->column_id(idx), expr.value());
       idx++;
     }
     for (const QLExpressionPB& expr : request_.range_column_values()) {
-      new_row.AllocColumn(schema_.column_id(idx), expr.value());
+      new_row.AllocColumn(schema_->column_id(idx), expr.value());
       idx++;
     }
   }
@@ -808,7 +891,7 @@ Status QLWriteOperation::Apply(const DocOperationApplyData& data) {
                                column_value.DebugString());
         }
         const ColumnId column_id(column_value.column_id());
-        const auto maybe_column = schema_.column_by_id(column_id);
+        const auto maybe_column = schema_->column_by_id(column_id);
         RETURN_NOT_OK(maybe_column);
         const ColumnSchema& column = *maybe_column;
 
@@ -848,7 +931,7 @@ Status QLWriteOperation::Apply(const DocOperationApplyData& data) {
           CHECK(column_value.has_column_id())
               << "column id missing: " << column_value.DebugString();
           const ColumnId column_id(column_value.column_id());
-          const auto& column = VERIFY_RESULT_REF(schema_.column_by_id(column_id));
+          const auto& column = VERIFY_RESULT_REF(schema_->column_by_id(column_id));
           const DocPath sub_path(
               column.is_static() ?
                 encoded_hashed_doc_key_.as_slice() : encoded_pk_doc_key_.as_slice(),
@@ -856,13 +939,13 @@ Status QLWriteOperation::Apply(const DocOperationApplyData& data) {
           RETURN_NOT_OK(data.doc_write_batch->DeleteSubDoc(sub_path,
               data.read_time, data.deadline, request_.query_id(), user_timestamp));
           if (update_indexes_) {
-            new_row.ClearValue(column_id);
+            new_row.MarkTombstoned(column_id);
           }
         }
         if (update_indexes_) {
           RETURN_NOT_OK(UpdateIndexes(existing_row, new_row));
         }
-      } else if (IsRangeOperation(request_, schema_)) {
+      } else if (IsRangeOperation(request_, *schema_)) {
         // If the range columns are not specified, we read everything and delete all rows for
         // which the where condition matches.
 
@@ -870,36 +953,41 @@ Status QLWriteOperation::Apply(const DocOperationApplyData& data) {
         // so the non-static projection is all we need, it should contain all referenced columns.
         Schema static_projection;
         Schema projection;
-        RETURN_NOT_OK(CreateProjections(schema_, request_.column_refs(),
+        RETURN_NOT_OK(CreateProjections(*schema_, request_.column_refs(),
             &static_projection, &projection));
 
         // Construct the scan spec basing on the WHERE condition.
         vector<PrimitiveValue> hashed_components;
         RETURN_NOT_OK(QLKeyColumnValuesToPrimitiveValues(
-            request_.hashed_column_values(), schema_, 0,
-            schema_.num_hash_key_columns(), &hashed_components));
+            request_.hashed_column_values(), *schema_, 0,
+            schema_->num_hash_key_columns(), &hashed_components));
 
         boost::optional<int32_t> hash_code = request_.has_hash_code()
                                              ? boost::make_optional<int32_t>(request_.hash_code())
                                              : boost::none;
-        DocQLScanSpec spec(projection,
+        const auto range_covers_whole_partition_key = !request_.has_where_expr();
+        const auto include_static_columns_in_scan = range_covers_whole_partition_key &&
+                                                    schema_->has_statics();
+        DocQLScanSpec spec(*schema_,
                            hash_code,
                            hash_code, // max hash code.
                            hashed_components,
                            request_.has_where_expr() ? &request_.where_expr().condition() : nullptr,
                            nullptr,
-                           request_.query_id());
+                           request_.query_id(),
+                           true /* is_forward_scan */,
+                           include_static_columns_in_scan);
 
         // Create iterator.
         DocRowwiseIterator iterator(
-            projection, schema_, txn_op_context_,
+            projection, *schema_, txn_op_context_,
             data.doc_write_batch->doc_db(),
             data.deadline, data.read_time);
         RETURN_NOT_OK(iterator.Init(spec));
 
         // Iterate through rows and delete those that match the condition.
-        // TODO We do not lock here, so other write transactions coming in might appear partially
-        // applied if they happen in the middle of a ranged delete.
+        // TODO(mihnea): We do not lock here, so other write transactions coming in might appear
+        // partially applied if they happen in the middle of a ranged delete.
         while (VERIFY_RESULT(iterator.HasNext())) {
           existing_row.Clear();
           RETURN_NOT_OK(iterator.NextRow(&existing_row));
@@ -939,9 +1027,9 @@ Status QLWriteOperation::DeleteRow(const DocPath& row_path, DocWriteBatch* doc_w
   if (request_.has_user_timestamp_usec()) {
     // If user_timestamp is provided, we need to add a tombstone for each individual
     // column in the schema since we don't want to analyze this on the read path.
-    for (int i = schema_.num_key_columns(); i < schema_.num_columns(); i++) {
+    for (int i = schema_->num_key_columns(); i < schema_->num_columns(); i++) {
       const DocPath sub_path(row_path.encoded_doc_key(),
-                             PrimitiveValue(schema_.column_id(i)));
+                             PrimitiveValue(schema_->column_id(i)));
       RETURN_NOT_OK(doc_write_batch->DeleteSubDoc(sub_path,
                                                   read_ht,
                                                   deadline,
@@ -988,11 +1076,11 @@ bool QLWriteOperation::IsRowDeleted(const QLTableRow& existing_row,
   if ((request_.type() == QLWriteRequestPB::QL_STMT_UPDATE ||
        request_.type() == QLWriteRequestPB::QL_STMT_DELETE) &&
       !liveness_column_exists_) {
-    for (size_t idx = schema_.num_key_columns(); idx < schema_.num_columns(); idx++) {
-      if (schema_.column(idx).is_static()) {
+    for (size_t idx = schema_->num_key_columns(); idx < schema_->num_columns(); idx++) {
+      if (schema_->column(idx).is_static()) {
         continue;
       }
-      const ColumnId column_id = schema_.column_id(idx);
+      const ColumnId column_id = schema_->column_id(idx);
       switch (GetValueState(new_row, column_id)) {
         case ValueState::kNull: continue;
         case ValueState::kNotNull: return false;
@@ -1018,20 +1106,22 @@ QLExpressionPB* NewKeyColumn(QLWriteRequestPB* request, const IndexInfo& index, 
           : request->add_range_column_values());
 }
 
-} // namespace
-
-QLWriteRequestPB* QLWriteOperation::NewIndexRequest(const IndexInfo* index,
-                                                    const QLWriteRequestPB::QLStmtType type,
-                                                    const QLTableRow& new_row) {
-  index_requests_.emplace_back(index, QLWriteRequestPB());
-  QLWriteRequestPB* request = &index_requests_.back().second;
+QLWriteRequestPB* NewIndexRequest(
+    const IndexInfo& index,
+    QLWriteRequestPB::QLStmtType type,
+    vector<pair<const IndexInfo*, QLWriteRequestPB>>* index_requests) {
+  index_requests->emplace_back(&index, QLWriteRequestPB());
+  QLWriteRequestPB* const request = &index_requests->back().second;
   request->set_type(type);
   return request;
 }
 
+} // namespace
+
 Status QLWriteOperation::UpdateIndexes(const QLTableRow& existing_row, const QLTableRow& new_row) {
   // Prepare the write requests to update the indexes. There should be at most 2 requests for each
   // index (one insert and one delete).
+  VLOG(2) << "Updating indexes";
   const auto& index_ids = request_.update_index_ids();
   index_requests_.reserve(index_ids.size() * 2);
   for (const TableId& index_id : index_ids) {
@@ -1040,17 +1130,15 @@ Status QLWriteOperation::UpdateIndexes(const QLTableRow& existing_row, const QLT
     if (IsRowDeleted(existing_row, new_row)) {
       index_key_changed = true;
     } else {
-      QLWriteRequestPB* index_request =
-          (index->AllowWrites() ? NewIndexRequest(index, QLWriteRequestPB::QL_STMT_INSERT, new_row)
-                                : nullptr);
-      RETURN_NOT_OK(PrepareIndexWriteAndCheckIfIndexKeyChanged(
-          this, existing_row, new_row, index, index_request, &index_key_changed));
+      VERIFY_RESULT(CreateAndSetupIndexInsertRequest(
+          this, index->HasWritePermission(), existing_row, new_row, index,
+          &index_requests_, &index_key_changed));
     }
 
     // If the index key is changed, delete the current key.
-    if (index_key_changed && index->AllowDelete()) {
-      QLWriteRequestPB* index_request =
-          NewIndexRequest(index, QLWriteRequestPB::QL_STMT_DELETE, new_row);
+    if (index_key_changed && index->HasDeletePermission()) {
+      QLWriteRequestPB* const index_request =
+          NewIndexRequest(*index, QLWriteRequestPB::QL_STMT_DELETE, &index_requests_);
       for (size_t idx = 0; idx < index->key_column_count(); idx++) {
         const IndexInfo::IndexColumn& index_column = index->column(idx);
         QLExpressionPB *key_column = NewKeyColumn(index_request, *index, idx);
@@ -1059,9 +1147,9 @@ Status QLWriteOperation::UpdateIndexes(const QLTableRow& existing_row, const QLT
         // For new message expr_case == kColumnId when indexing expression is a column-ref.
         if (index_column.colexpr.expr_case() != QLExpressionPB::ExprCase::EXPR_NOT_SET &&
             index_column.colexpr.expr_case() != QLExpressionPB::ExprCase::kColumnId) {
-          QLValue result;
-          RETURN_NOT_OK(EvalExpr(index_column.colexpr, existing_row, &result));
-          key_column->mutable_value()->CopyFrom(result.value());
+          QLExprResult result;
+          RETURN_NOT_OK(EvalExpr(index_column.colexpr, existing_row, result.Writer()));
+          result.MoveTo(key_column->mutable_value());
         } else {
           auto result = existing_row.GetValue(index_column.indexed_column_id);
           if (result) {
@@ -1075,15 +1163,22 @@ Status QLWriteOperation::UpdateIndexes(const QLTableRow& existing_row, const QLT
   return Status::OK();
 }
 
-Status PrepareIndexWriteAndCheckIfIndexKeyChanged(
-    QLExprExecutor* expr_executor, const QLTableRow& existing_row, const QLTableRow& new_row,
-    const IndexInfo* index, QLWriteRequestPB* index_request, bool* has_index_key_changed) {
+Result<QLWriteRequestPB*> CreateAndSetupIndexInsertRequest(
+    QLExprExecutor* expr_executor,
+    bool index_has_write_permission,
+    const QLTableRow& existing_row,
+    const QLTableRow& new_row,
+    const IndexInfo* index,
+    vector<pair<const IndexInfo*, QLWriteRequestPB>>* index_requests,
+    bool* has_index_key_changed) {
   bool index_key_changed = false;
+  bool update_this_index = false;
+  unordered_map<size_t, QLValuePB> values;
+
   // Prepare the new index key.
   for (size_t idx = 0; idx < index->key_column_count(); idx++) {
     const IndexInfo::IndexColumn& index_column = index->column(idx);
-    QLExpressionPB *key_column =
-        (index_request ? NewKeyColumn(index_request, *index, idx) : nullptr);
+    bool column_changed = true;
 
     // Column_id should be used without executing "colexpr" for the following cases (we want
     // to avoid executing colexpr as it is less efficient).
@@ -1096,36 +1191,48 @@ Status PrepareIndexWriteAndCheckIfIndexKeyChanged(
         // For each column in the index key, if there is a new value, see if the value is
         // changed from the current value. Else, use the current value.
         if (result) {
-          if (!new_row.MatchColumn(index_column.indexed_column_id, existing_row)) {
+          if (new_row.MatchColumn(index_column.indexed_column_id, existing_row)) {
+            column_changed = false;
+          } else {
             index_key_changed = true;
           }
         } else {
           result = existing_row.GetValue(index_column.indexed_column_id);
         }
       }
-      if (result && key_column) {
-        key_column->mutable_value()->CopyFrom(*result);
+      if (result) {
+        values[idx] = std::move(*result);
       }
     } else {
-      QLValue result;
+      QLExprResult result;
       if (existing_row.IsEmpty()) {
-        RETURN_NOT_OK(expr_executor->EvalExpr(index_column.colexpr, new_row, &result));
+        RETURN_NOT_OK(expr_executor->EvalExpr(index_column.colexpr, new_row, result.Writer()));
       } else {
-        // The following code needs to be updated to support various expression including JSONB.
         // For each column in the index key, if there is a new value, see if the value is
         // specified in the new value. Otherwise, use the current value.
         if (new_row.IsColumnSpecified(index_column.indexed_column_id)) {
-          RETURN_NOT_OK(expr_executor->EvalExpr(index_column.colexpr, new_row, &result));
-          if (!new_row.MatchColumn(index_column.indexed_column_id, existing_row)) {
+          RETURN_NOT_OK(expr_executor->EvalExpr(index_column.colexpr, new_row, result.Writer()));
+          // Compare new and existing results of the expression, if the results are equal
+          // that means the key is NOT changed in fact even if the column value is changed.
+          QLExprResult existing_result;
+          RETURN_NOT_OK(expr_executor->EvalExpr(
+              index_column.colexpr, existing_row, existing_result.Writer()));
+          if (result.Value() == existing_result.Value()) {
+            column_changed = false;
+          } else {
             index_key_changed = true;
           }
         } else {
-          RETURN_NOT_OK(expr_executor->EvalExpr(index_column.colexpr, existing_row, &result));
+          RETURN_NOT_OK(expr_executor->EvalExpr(
+              index_column.colexpr, existing_row, result.Writer()));
         }
       }
-      if (key_column) {
-        key_column->mutable_value()->CopyFrom(result.value());
-      }
+
+      result.MoveTo(&values[idx]);
+    }
+
+    if (column_changed) {
+      update_this_index = true;
     }
   }
 
@@ -1133,22 +1240,60 @@ Status PrepareIndexWriteAndCheckIfIndexKeyChanged(
   for (size_t idx = index->key_column_count(); idx < index->columns().size(); idx++) {
     const IndexInfo::IndexColumn& index_column = index->column(idx);
     auto result = new_row.GetValue(index_column.indexed_column_id);
+    bool column_changed = true;
+
     // If the index value is changed and there is no new covering column value set, use the
     // current value.
-    if (index_key_changed && !result) {
-      result = existing_row.GetValue(index_column.indexed_column_id);
+    if (index_key_changed) {
+      if (!result) {
+        result = existing_row.GetValue(index_column.indexed_column_id);
+      }
+    } else if (!FLAGS_ycql_disable_index_updating_optimization &&
+        result && new_row.MatchColumn(index_column.indexed_column_id, existing_row)) {
+      column_changed = false;
     }
-    if (result && index_request) {
-      QLColumnValuePB* covering_column = index_request->add_column_values();
-      covering_column->set_column_id(index_column.column_id);
-      covering_column->mutable_expr()->mutable_value()->CopyFrom(*result);
+    if (result) {
+      values[idx] = std::move(*result);
+    }
+
+    if (column_changed) {
+      update_this_index = true;
     }
   }
 
   if (has_index_key_changed) {
     *has_index_key_changed = index_key_changed;
   }
-  return Status::OK();
+
+  if (index_has_write_permission &&
+      (update_this_index || FLAGS_ycql_disable_index_updating_optimization)) {
+    QLWriteRequestPB* const index_request =
+        NewIndexRequest(*index, QLWriteRequestPB::QL_STMT_INSERT, index_requests);
+
+    // Setup the key columns.
+    for (size_t idx = 0; idx < index->key_column_count(); idx++) {
+      QLExpressionPB* const key_column = NewKeyColumn(index_request, *index, idx);
+      auto it = values.find(idx);
+      if (it != values.end()) {
+        *key_column->mutable_value() = std::move(it->second);
+      }
+    }
+
+    // Setup the covering columns.
+    for (size_t idx = index->key_column_count(); idx < index->columns().size(); idx++) {
+      auto it = values.find(idx);
+      if (it != values.end()) {
+        const IndexInfo::IndexColumn& index_column = index->column(idx);
+        QLColumnValuePB* const covering_column = index_request->add_column_values();
+        covering_column->set_column_id(index_column.column_id);
+        *covering_column->mutable_expr()->mutable_value() = std::move(it->second);
+      }
+    }
+
+    return index_request;
+  }
+
+  return nullptr; // The index updating was skipped.
 }
 
 Status QLReadOperation::Execute(const common::YQLStorageIf& ql_storage,
@@ -1189,9 +1334,7 @@ Status QLReadOperation::Execute(const common::YQLStorageIf& ql_storage,
       &static_row_spec));
   RETURN_NOT_OK(ql_storage.GetIterator(request_, projection, schema, txn_op_context_,
                                        deadline, read_time, *spec, &iter));
-  if (FLAGS_trace_docdb_calls) {
-    TRACE("Initialized iterator");
-  }
+  VTRACE(1, "Initialized iterator");
 
   QLTableRow static_row;
   QLTableRow non_static_row;
@@ -1225,7 +1368,6 @@ Status QLReadOperation::Execute(const common::YQLStorageIf& ql_storage,
       static_row.Clear();
       RETURN_NOT_OK(iter->NextRow(static_projection, &static_row));
     } else { // Reading a regular row that contains non-static columns.
-
       // Read this regular row.
       // TODO(omer): this is quite inefficient if read_distinct_column. A better way to do this
       // would be to only read the first non-static column for each hash key, and skip the rest
@@ -1253,7 +1395,6 @@ Status QLReadOperation::Execute(const common::YQLStorageIf& ql_storage,
       }
     } else {
       if (last_read_static) {
-
         // If the next row to be read is not static, deal with it later, as we do not know whether
         // the non-static row corresponds to this static row; if the non-static row doesn't
         // correspond to this static row, we will have to add it later, so set static_dealt_with to
@@ -1295,9 +1436,7 @@ Status QLReadOperation::Execute(const common::YQLStorageIf& ql_storage,
     RETURN_NOT_OK(PopulateAggregate(selected_row, resultset));
   }
 
-  if (FLAGS_trace_docdb_calls) {
-    TRACE("Fetched $0 rows.", resultset->rsrow_count());
-  }
+  VTRACE(1, "Fetched $0 rows.", resultset->rsrow_count());
 
   RETURN_NOT_OK(SetPagingStateIfNecessary(
       iter.get(), resultset, row_count_limit, num_rows_skipped, read_time));
@@ -1326,7 +1465,7 @@ Status QLReadOperation::SetPagingStateIfNecessary(const common::YQLRowwiseIterat
         QLPagingStatePB* paging_state = response_.mutable_paging_state();
         paging_state->set_next_partition_key(
             PartitionSchema::EncodeMultiColumnHashValue(next_row_key.doc_key().hash()));
-        paging_state->set_next_row_key(next_row_key.Encode().data());
+        paging_state->set_next_row_key(next_row_key.Encode().ToStringBuffer());
         paging_state->set_total_rows_skipped(request_.paging_state().total_rows_skipped() +
             num_rows_skipped);
       } else if (request_.has_offset()) {
@@ -1363,7 +1502,7 @@ Status QLReadOperation::GetIntents(const Schema& schema, KeyValueWriteBatchPB* o
     pair->set_key(std::string(1, ValueTypeAsChar::kGroupEnd));
   } else {
     DocKey doc_key(request_.hash_code(), hashed_components);
-    pair->set_key(doc_key.Encode().data());
+    pair->set_key(doc_key.Encode().ToStringBuffer());
   }
   pair->set_value(std::string(1, ValueTypeAsChar::kNullLow));
   return Status::OK();
@@ -1375,14 +1514,9 @@ Status QLReadOperation::PopulateResultSet(const std::unique_ptr<common::QLScanSp
   resultset->AllocateRow();
   int rscol_index = 0;
   for (const QLExpressionPB& expr : request_.selected_exprs()) {
-    QLValue value;
-    const QLValuePB* value_ptr = nullptr;
-    RETURN_NOT_OK(EvalExpr(expr, table_row, &value, spec->schema(), &value_ptr));
-    if (value_ptr) {
-      resultset->AppendColumn(rscol_index, *value_ptr);
-    } else {
-      resultset->AppendColumn(rscol_index, value);
-    }
+    QLExprResult value;
+    RETURN_NOT_OK(EvalExpr(expr, table_row, value.Writer(), spec->schema()));
+    resultset->AppendColumn(rscol_index, value.Value());
     rscol_index++;
   }
 
@@ -1397,8 +1531,7 @@ Status QLReadOperation::EvalAggregate(const QLTableRow& table_row) {
 
   int aggr_index = 0;
   for (const QLExpressionPB& expr : request_.selected_exprs()) {
-    RETURN_NOT_OK(EvalExpr(expr, table_row, &aggr_result_[aggr_index]));
-    aggr_index++;
+    RETURN_NOT_OK(EvalExpr(expr, table_row, aggr_result_[aggr_index++].Writer()));
   }
   return Status::OK();
 }
@@ -1407,7 +1540,7 @@ Status QLReadOperation::PopulateAggregate(const QLTableRow& table_row, QLResultS
   resultset->AllocateRow();
   int column_count = request_.selected_exprs().size();
   for (int rscol_index = 0; rscol_index < column_count; rscol_index++) {
-    resultset->AppendColumn(rscol_index, aggr_result_[rscol_index]);
+    resultset->AppendColumn(rscol_index, aggr_result_[rscol_index].Value());
   }
   return Status::OK();
 }

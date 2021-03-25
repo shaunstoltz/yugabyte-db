@@ -97,6 +97,7 @@
 #include "postgres.h"
 
 #include <limits.h>
+#include <unistd.h>
 
 #include "access/htup_details.h"
 #include "access/xact.h"
@@ -113,6 +114,7 @@
 #include "utils/relmapper.h"
 #include "utils/snapmgr.h"
 #include "utils/syscache.h"
+#include "pg_yb_utils.h"
 
 
 /*
@@ -259,7 +261,9 @@ AddInvalidationMessage(InvalidationChunk **listHdr,
 		*listHdr = chunk;
 	}
 	/* Okay, add message to current chunk */
-	chunk->msgs[chunk->nitems] = *msg;
+	SharedInvalidationMessage *dest = &chunk->msgs[chunk->nitems];
+	*dest = *msg;
+	dest->yb_header.sender_pid = getpid();
 	chunk->nitems++;
 }
 
@@ -555,6 +559,10 @@ RegisterSnapshotInvalidation(Oid dbId, Oid relId)
 void
 LocalExecuteInvalidationMessage(SharedInvalidationMessage *msg)
 {
+	/* In YB mode all messages originated by other processes are silently ignored */
+	if (IsYugaByteEnabled() && msg->yb_header.sender_pid != getpid())
+		return;
+
 	if (msg->id >= 0)
 	{
 		if (msg->cc.dbId == MyDatabaseId || msg->cc.dbId == InvalidOid)
@@ -669,6 +677,13 @@ CallSystemCacheCallbacks(void)
 void
 InvalidateSystemCaches(void)
 {
+	if (IsYugaByteEnabled()) {
+		// In case of YugaByte it is necessary to refresh YB caches by calling 'YBRefreshCache'.
+		// But it can't be done here as 'YBRefreshCache' can't be called from within the transaction.
+		// Resetting catalog version will force cache refresh as soon as possible.
+		YBResetCatalogVersion();
+		return;
+	}
 	InvalidateCatalogSnapshot();
 	ResetCatalogCaches();
 	RelationCacheInvalidate();	/* gets smgr and relmap too */

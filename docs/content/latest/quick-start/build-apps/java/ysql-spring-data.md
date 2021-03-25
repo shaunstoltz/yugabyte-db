@@ -1,8 +1,8 @@
 ---
-title: Use Java to build a YugabyteDB application
-headerTitle: Build a Java app
-linkTitle: Build a Java app
-description: Use Java and Spring Boot to build a simple YugabyteDB e-commerce application.
+title: Build a Java application that uses Spring Boot and YSQL
+headerTitle: Build a Java application
+linkTitle: Java
+description: Build a simple Java e-commerce application that uses Spring Boot and YSQL.
 menu:
   latest:
     parent: build-apps
@@ -13,7 +13,6 @@ type: page
 isTocNested: true
 showAsideToc: true
 ---
-
 
 <ul class="nav nav-tabs-alt nav-tabs-yb">
   <li >
@@ -32,6 +31,12 @@ showAsideToc: true
     <a href="/latest/quick-start/build-apps/java/ycql" class="nav-link">
       <i class="icon-cassandra" aria-hidden="true"></i>
       YCQL
+    </a>
+  </li>
+  <li>
+    <a href="/latest/quick-start/build-apps/java/ycql-4.6" class="nav-link">
+      <i class="icon-cassandra" aria-hidden="true"></i>
+      YCQL (4.6)
     </a>
   </li>
 </ul>
@@ -137,7 +142,7 @@ yugabyte=#
 
 List the tables created by the app.
 
-```postgresql
+```plpgsql
 yugabyte=# \d
 ```
 
@@ -157,7 +162,7 @@ List of relations
 
 Note the 4 tables and 3 sequences in the list above.
 
-```postgresql
+```plpgsql
 yugabyte=# SELECT count(*) FROM users;
 ```
 
@@ -168,7 +173,7 @@ yugabyte=# SELECT count(*) FROM users;
 (1 row)
 ```
 
-```postgresql
+```plpgsql
 yugabyte=# SELECT count(*) FROM products;
 ```
 
@@ -179,7 +184,7 @@ yugabyte=# SELECT count(*) FROM products;
 (1 row)
 ```
 
-```postgresql
+```plpgsql
 yugabyte=# SELECT count(*) FROM orders;
 ```
 
@@ -190,7 +195,7 @@ yugabyte=# SELECT count(*) FROM orders;
 (1 row)
 ```
 
-```postgresql
+```plpgsql
 yugabyte=# SELECT * FROM orderline;
 ```
 

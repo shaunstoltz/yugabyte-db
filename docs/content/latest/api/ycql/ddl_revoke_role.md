@@ -2,7 +2,6 @@
 title: REVOKE ROLE statement [YCQL]
 headerTitle: REVOKE ROLE
 linkTitle: REVOKE ROLE
-summary: Revoke a role to another role
 description: Use the `REVOKE ROLE` statement to revoke a role (which represents a group of permissions and the SUPERUSER status) from another role.
 menu:
   latest:
@@ -19,7 +18,7 @@ showAsideToc: true
 
 Use the `REVOKE ROLE` statement to revoke a role (which represents a group of permissions and the SUPERUSER status) from another role.
 
-This statement is enabled by setting the YB-TServer configuration option [`use_cassandra_authentication`](../../../reference/configuration/yb-tserver/#config-flags) to `true`.
+This statement is enabled by setting the YB-TServer flag [`--use_cassandra_authentication`](../../../reference/configuration/yb-tserver/#config-flags) to `true`.
 
 ## Syntax
 
@@ -48,7 +47,7 @@ Where
 ## Examples
 
 ```sql
-cqlsh:example> REVOKE ROLE project_y from diana;
+ycqlsh:example> REVOKE ROLE project_y from diana;
 ```
 
 ## See also

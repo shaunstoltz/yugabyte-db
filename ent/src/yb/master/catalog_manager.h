@@ -26,6 +26,8 @@ class UniverseKeyRegistryPB;
 namespace master {
 namespace enterprise {
 
+YB_DEFINE_ENUM(CreateObjects, (kOnlyTables)(kOnlyIndexes));
+
 class CatalogManager : public yb::master::CatalogManager, SnapshotCoordinatorContext {
   typedef yb::master::CatalogManager super;
  public:
@@ -33,18 +35,14 @@ class CatalogManager : public yb::master::CatalogManager, SnapshotCoordinatorCon
       : super(master), snapshot_coordinator_(this) {}
 
   virtual ~CatalogManager();
-  void Shutdown();
+  void CompleteShutdown();
 
-  CHECKED_STATUS RunLoaders(int64_t term) override;
+  CHECKED_STATUS RunLoaders(int64_t term) override REQUIRES(lock_);
 
   // API to start a snapshot creation.
   CHECKED_STATUS CreateSnapshot(const CreateSnapshotRequestPB* req,
                                 CreateSnapshotResponsePB* resp,
                                 rpc::RpcContext* rpc);
-
-  // API to check if this snapshot creation operation has finished.
-  CHECKED_STATUS IsSnapshotOpDone(const IsSnapshotOpDoneRequestPB* req,
-                                  IsSnapshotOpDoneResponsePB* resp);
 
   // API to list all available snapshots.
   CHECKED_STATUS ListSnapshots(const ListSnapshotsRequestPB* req,
@@ -59,10 +57,19 @@ class CatalogManager : public yb::master::CatalogManager, SnapshotCoordinatorCon
 
   // API to delete a snapshot.
   CHECKED_STATUS DeleteSnapshot(const DeleteSnapshotRequestPB* req,
-                                DeleteSnapshotResponsePB* resp);
+                                DeleteSnapshotResponsePB* resp,
+                                rpc::RpcContext* rpc);
 
   CHECKED_STATUS ImportSnapshotMeta(const ImportSnapshotMetaRequestPB* req,
                                     ImportSnapshotMetaResponsePB* resp);
+
+  CHECKED_STATUS CreateSnapshotSchedule(const CreateSnapshotScheduleRequestPB* req,
+                                        CreateSnapshotScheduleResponsePB* resp,
+                                        rpc::RpcContext* rpc);
+
+  CHECKED_STATUS ListSnapshotSchedules(const ListSnapshotSchedulesRequestPB* req,
+                                       ListSnapshotSchedulesResponsePB* resp,
+                                       rpc::RpcContext* rpc);
 
   CHECKED_STATUS ChangeEncryptionInfo(const ChangeEncryptionInfoRequestPB* req,
                                       ChangeEncryptionInfoResponsePB* resp) override;
@@ -75,7 +82,8 @@ class CatalogManager : public yb::master::CatalogManager, SnapshotCoordinatorCon
 
   void HandleRestoreTabletSnapshotResponse(TabletInfo *tablet, bool error);
 
-  void HandleDeleteTabletSnapshotResponse(SnapshotId snapshot_id, TabletInfo *tablet, bool error);
+  void HandleDeleteTabletSnapshotResponse(
+      const SnapshotId& snapshot_id, TabletInfo *tablet, bool error);
 
   void DumpState(std::ostream* out, bool on_disk_dump = false) const override;
 
@@ -165,21 +173,27 @@ class CatalogManager : public yb::master::CatalogManager, SnapshotCoordinatorCon
   friend class CDCStreamLoader;
   friend class UniverseReplicationLoader;
 
-  CHECKED_STATUS RestoreEntry(const SysRowEntry& entry, const SnapshotId& snapshot_id);
-
-  Result<TxnSnapshotRestorationId> DoRestoreSnapshot(const std::string& snapshot_id);
+  CHECKED_STATUS RestoreEntry(const SysRowEntry& entry, const SnapshotId& snapshot_id)
+      REQUIRES(lock_);
 
   // Per table structure for external cluster snapshot importing to this cluster.
   // Old IDs mean IDs on external cluster, new IDs - IDs on this cluster.
   struct ExternalTableSnapshotData {
     ExternalTableSnapshotData() : num_tablets(0), tablet_id_map(nullptr), table_meta(nullptr) {}
 
+    bool is_index() const {
+      return !table_entry_pb.indexed_table_id().empty();
+    }
+
     NamespaceId old_namespace_id;
     TableId old_table_id;
     TableId new_table_id;
+    SysTablesEntryPB table_entry_pb;
     int num_tablets;
     typedef std::pair<std::string, std::string> PartitionKeys;
     typedef std::map<PartitionKeys, TabletId> PartitionToIdMap;
+    typedef std::vector<PartitionPB> Partitions;
+    Partitions partitions;
     PartitionToIdMap new_tablets_map;
     // Mapping: Old tablet ID -> New tablet ID.
     google::protobuf::RepeatedPtrField<IdPairPB>* tablet_id_map;
@@ -187,39 +201,78 @@ class CatalogManager : public yb::master::CatalogManager, SnapshotCoordinatorCon
     ImportSnapshotMetaResponsePB_TableMetaPB* table_meta;
   };
 
-  // Map: old_namespace_id (key) -> new_namespace_id (value).
-  typedef std::map<NamespaceId, NamespaceId> NamespaceMap;
+  // Map: old_namespace_id (key) -> new_namespace_id (value) + db_type.
+  typedef std::pair<NamespaceId, YQLDatabase> NamespaceData;
+  typedef std::map<NamespaceId, NamespaceData> NamespaceMap;
   typedef std::map<TableId, ExternalTableSnapshotData> ExternalTableSnapshotDataMap;
 
-  CHECKED_STATUS ImportNamespaceEntry(const SysRowEntry& entry, NamespaceMap* ns_map);
-  CHECKED_STATUS ImportTableEntry(
-      const SysRowEntry& entry, const NamespaceMap& ns_map, ExternalTableSnapshotData* s_data);
-  CHECKED_STATUS PreprocessTabletEntry(
-      const SysRowEntry& entry, ExternalTableSnapshotDataMap* table_map);
-  CHECKED_STATUS ImportTabletEntry(
-      const SysRowEntry& entry, ExternalTableSnapshotDataMap* table_map);
+  CHECKED_STATUS ImportSnapshotPreprocess(const SysSnapshotEntryPB& snapshot_pb,
+                                          ImportSnapshotMetaResponsePB* resp,
+                                          NamespaceMap* namespace_map,
+                                          ExternalTableSnapshotDataMap* tables_data);
+  CHECKED_STATUS ImportSnapshotCreateObject(const SysSnapshotEntryPB& snapshot_pb,
+                                            ImportSnapshotMetaResponsePB* resp,
+                                            NamespaceMap* namespace_map,
+                                            ExternalTableSnapshotDataMap* tables_data,
+                                            CreateObjects create_objects);
+  CHECKED_STATUS ImportSnapshotWaitForTables(const SysSnapshotEntryPB& snapshot_pb,
+                                             ImportSnapshotMetaResponsePB* resp,
+                                             ExternalTableSnapshotDataMap* tables_data);
+  CHECKED_STATUS ImportSnapshotProcessTablets(const SysSnapshotEntryPB& snapshot_pb,
+                                              ImportSnapshotMetaResponsePB* resp,
+                                              ExternalTableSnapshotDataMap* tables_data);
+  void DeleteNewSnapshotObjects(const NamespaceMap& namespace_map,
+                                const ExternalTableSnapshotDataMap& tables_data);
+
+  CHECKED_STATUS ImportNamespaceEntry(const SysRowEntry& entry,
+                                      NamespaceMap* namespace_map);
+  CHECKED_STATUS RecreateTable(const NamespaceId& new_namespace_id,
+                               const ExternalTableSnapshotDataMap& table_map,
+                               ExternalTableSnapshotData* table_data);
+  CHECKED_STATUS ImportTableEntry(const NamespaceMap& namespace_map,
+                                  const ExternalTableSnapshotDataMap& table_map,
+                                  ExternalTableSnapshotData* s_data);
+  CHECKED_STATUS PreprocessTabletEntry(const SysRowEntry& entry,
+                                       ExternalTableSnapshotDataMap* table_map);
+  CHECKED_STATUS ImportTabletEntry(const SysRowEntry& entry,
+                                   ExternalTableSnapshotDataMap* table_map);
 
   TabletInfos GetTabletInfos(const std::vector<TabletId>& ids) override;
 
-  Result<ColumnId> MetadataColumnId() override;
+  Result<SysRowEntries> CollectEntries(
+      const google::protobuf::RepeatedPtrField<TableIdentifierPB>& tables,
+      bool add_indexes,
+      bool include_parent_colocated_table,
+      bool succeed_if_create_in_progress) override;
 
-  CHECKED_STATUS ApplyOperationState(
-      const tablet::OperationState& operation_state, int64_t batch_idx,
-      const docdb::KeyValueWriteBatchPB& write_batch) override;
+  server::Clock* Clock() override;
 
-  void SubmitWrite(const docdb::KeyValueWriteBatchPB& write_batch) override;
+  const Schema& schema() override;
+
+  void Submit(std::unique_ptr<tablet::Operation> operation) override;
 
   void SendCreateTabletSnapshotRequest(const scoped_refptr<TabletInfo>& tablet,
                                        const std::string& snapshot_id,
+                                       const SnapshotScheduleId& schedule_id,
                                        HybridTime snapshot_hybrid_time,
                                        TabletSnapshotOperationCallback callback) override;
 
   void SendRestoreTabletSnapshotRequest(const scoped_refptr<TabletInfo>& tablet,
                                         const std::string& snapshot_id,
+                                        HybridTime restore_at,
                                         TabletSnapshotOperationCallback callback) override;
 
   void SendDeleteTabletSnapshotRequest(const scoped_refptr<TabletInfo>& tablet,
-                                       const std::string& snapshot_id);
+                                       const std::string& snapshot_id,
+                                       TabletSnapshotOperationCallback callback) override;
+
+  CHECKED_STATUS CreateSysCatalogSnapshot(const tablet::CreateSnapshotData& data) override;
+
+  rpc::Scheduler& Scheduler() override;
+
+  bool IsLeader() override;
+
+  Result<SnapshotSchedulesToTabletsMap> MakeSnapshotSchedulesToTabletsMap() override;
 
   static void SetTabletSnapshotsState(SysSnapshotEntryPB::State state,
                                       SysSnapshotEntryPB* snapshot_pb);
@@ -251,20 +304,30 @@ class CatalogManager : public yb::master::CatalogManager, SnapshotCoordinatorCon
                                           const TSHeartbeatRequestPB* req,
                                           TSHeartbeatResponsePB* resp);
 
-  template <class Collection>
-  typename Collection::value_type::second_type LockAndFindPtrOrNull(
-      const Collection& collection, const typename Collection::value_type::first_type& key) {
-    std::lock_guard<LockType> l(lock_);
-    TRACE("Acquired catalog manager lock");
-    return FindPtrOrNull(collection, key);
-  }
-
   scoped_refptr<ClusterConfigInfo> GetClusterConfigInfo() const {
     return cluster_config_;
   }
 
+  // Helper functions for GetTableSchemaCallback and GetColocatedTabletSchemaCallback:
+  // Validates a single table's schema with the corresponding table on the consumer side, and
+  // updates consumer_table_id with the new table id.
+  CHECKED_STATUS ValidateTableSchema(
+      const std::shared_ptr<client::YBTableInfo>& info,
+      const std::unordered_map<TableId, std::string>& table_bootstrap_ids,
+      TableId* consumer_table_id);
+  // Adds a validated table to the sys catalog table map for the given universe, and if all tables
+  // have been validated, creates a CDC stream for each table.
+  CHECKED_STATUS AddValidatedTableAndCreateCdcStreams(
+      scoped_refptr<UniverseReplicationInfo> universe,
+      const std::unordered_map<TableId, std::string>& table_bootstrap_ids,
+      const TableId& producer_table,
+      const TableId& consumer_table);
+
   void GetTableSchemaCallback(
       const std::string& universe_id, const std::shared_ptr<client::YBTableInfo>& info,
+      const std::unordered_map<TableId, std::string>& producer_bootstrap_ids, const Status& s);
+  void GetColocatedTabletSchemaCallback(
+      const std::string& universe_id, const std::shared_ptr<std::vector<client::YBTableInfo>>& info,
       const std::unordered_map<TableId, std::string>& producer_bootstrap_ids, const Status& s);
   void GetCDCStreamCallback(const CDCStreamId& bootstrap_id,
                             std::shared_ptr<TableId> table_id,
@@ -285,9 +348,11 @@ class CatalogManager : public yb::master::CatalogManager, SnapshotCoordinatorCon
   CHECKED_STATUS CreateNonTransactionAwareSnapshot(
       const CreateSnapshotRequestPB* req, CreateSnapshotResponsePB* resp, rpc::RpcContext* rpc);
 
-  Result<bool> IsNonTransactionAwareSnapshotDone(const SnapshotId& snapshot_id);
-
   CHECKED_STATUS RestoreNonTransactionAwareSnapshot(const SnapshotId& snapshot_id);
+
+  CHECKED_STATUS DeleteNonTransactionAwareSnapshot(const SnapshotId& snapshot_id);
+
+  void Started() override;
 
   // Snapshot map: snapshot-id -> SnapshotInfo.
   typedef std::unordered_map<SnapshotId, scoped_refptr<SnapshotInfo>> SnapshotInfoMap;
@@ -313,9 +378,6 @@ class CatalogManager : public yb::master::CatalogManager, SnapshotCoordinatorCon
   // Should catalog manager resend latest consumer registry to tserver.
   std::unordered_map<TabletServerId, bool> should_send_consumer_registry_
   GUARDED_BY(should_send_consumer_registry_mutex_);
-
-  // YBClient used to modify the cdc_state table from the master.
-  std::unique_ptr<client::YBClient> cdc_ybclient_;
 
   MasterSnapshotCoordinator snapshot_coordinator_;
 

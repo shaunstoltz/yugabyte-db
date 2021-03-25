@@ -474,6 +474,8 @@ class DBImpl : public DB {
   bool AreWritesStopped();
   bool NeedsDelay() override;
 
+  Result<std::string> GetMiddleKey() override;
+
   // Used in testing to make the old memtable immutable and start writing to a new one.
   void TEST_SwitchMemtable() override;
 
@@ -509,12 +511,6 @@ class DBImpl : public DB {
                                    Compaction *c, const Status &st,
                                    const CompactionJobStats& job_stats,
                                    int job_id);
-
-  void NewThreadStatusCfInfo(ColumnFamilyData* cfd) const;
-
-  void EraseThreadStatusCfInfo(ColumnFamilyData* cfd) const;
-
-  void EraseThreadStatusDbInfo() const;
 
   Status WriteImpl(const WriteOptions& options, WriteBatch* updates,
                    WriteCallback* callback);
@@ -681,6 +677,10 @@ class DBImpl : public DB {
 
   void ListenFilesChanged(std::function<void()> listener) override;
 
+  std::function<void()> GetFilesChangedListener() const;
+
+  bool HasFilesChangedListener() const;
+
   void FilesChanged();
 
   struct TaskPriorityChange {
@@ -813,6 +813,10 @@ class DBImpl : public DB {
   WriteBuffer write_buffer_;
 
   WriteThread write_thread_;
+
+#ifndef NDEBUG
+  std::atomic<int> write_waiters_{0};
+#endif
 
   WriteBatch tmp_batch_;
 
@@ -979,7 +983,9 @@ class DBImpl : public DB {
   // Whether DB should be flushed on shutdown.
   bool disable_flush_on_shutdown_ = false;
 
-  std::function<void()> files_changed_listener_;
+  mutable std::mutex files_changed_listener_mutex_;
+
+  std::function<void()> files_changed_listener_ GUARDED_BY(files_changed_listener_mutex_);
 
   // No copying allowed
   DBImpl(const DBImpl&) = delete;

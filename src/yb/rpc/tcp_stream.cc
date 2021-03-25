@@ -25,7 +25,7 @@
 using namespace std::literals;
 
 DECLARE_uint64(rpc_connection_timeout_ms);
-DEFINE_test_flag(int32, TEST_delay_connect_ms, 0,
+DEFINE_test_flag(int32, delay_connect_ms, 0,
                  "Delay connect in tests for specified amount of milliseconds.");
 
 namespace yb {
@@ -440,7 +440,7 @@ void TcpStream::ClearSending(const Status& status) {
   queued_bytes_to_send_ = 0;
 }
 
-size_t TcpStream::Send(OutboundDataPtr data) {
+Result<size_t> TcpStream::Send(OutboundDataPtr data) {
   // In case of TcpStream handle is absolute index of data block, since stream start.
   // So it could be cacluated as index in sending_ plus number of data blocks that were already
   // transferred.

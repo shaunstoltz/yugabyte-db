@@ -93,7 +93,7 @@ class LogCache {
   // 'preceding_op' is the current latest op. The next AppendOperation() call must follow this op.
   //
   // Requires that the cache is empty.
-  void Init(const OpId& preceding_op);
+  void Init(const OpIdPB& preceding_op);
 
   // Read operations from the log, following 'after_op_index'.
   // If such an op exists in the log, an OK result will always include at least one operation.
@@ -170,6 +170,10 @@ class LogCache {
   // Start memory tracking of following operations in case they are still present in cache.
   void TrackOperationsMemory(const OpIds& op_ids);
 
+  CHECKED_STATUS FlushIndex();
+
+  CHECKED_STATUS CopyLogTo(const std::string& dest_dir);
+
  private:
   FRIEND_TEST(LogCacheTest, TestAppendAndGetMessages);
   FRIEND_TEST(LogCacheTest, TestGlobalMemoryLimit);
@@ -181,7 +185,7 @@ class LogCache {
     ReplicateMsgPtr msg;
     // The cached value of msg->SpaceUsedLong(). This method is expensive
     // to compute, so we compute it only once upon insertion.
-    int64_t mem_usage;
+    int64_t mem_usage = 0;
 
     // Did we start memory tracking for this entry.
     bool tracked = false;

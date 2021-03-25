@@ -51,8 +51,8 @@ DECLARE_uint64(redis_max_queued_bytes);
 DECLARE_int64(redis_rpc_block_size);
 DECLARE_bool(redis_safe_batch);
 DECLARE_bool(emulate_redis_responses);
-DECLARE_bool(test_tserver_timeout);
-DECLARE_bool(enable_backpressure_mode_for_testing);
+DECLARE_bool(TEST_tserver_timeout);
+DECLARE_bool(TEST_enable_backpressure_mode_for_testing);
 DECLARE_bool(yedis_enable_flush);
 DECLARE_int32(redis_service_yb_client_timeout_millis);
 DECLARE_int32(redis_max_value_size);
@@ -459,7 +459,8 @@ class TestRedisService : public RedisTableTestBase {
   RedisClient& client() {
     if (!test_client_) {
       io_thread_pool_.emplace("test", 1);
-      test_client_ = std::make_shared<RedisClient>("127.0.0.1", server_port());
+      auto endpoint = RedisProxyEndpoint();
+      test_client_ = std::make_shared<RedisClient>(endpoint.address().to_string(), endpoint.port());
     }
     return *test_client_;
   }
@@ -770,6 +771,11 @@ void TestRedisService::SetUp() {
 }
 
 void TestRedisService::StartServer() {
+  if (use_external_mini_cluster()) {
+    redis_server_port_ = external_mini_cluster()->tablet_server(0)->redis_rpc_port();
+    return;
+  }
+
   redis_server_port_ = GetFreePort(&redis_port_lock_);
   RedisServerOptions opts;
   opts.rpc_opts.rpc_bind_addresses = strings::Substitute("0.0.0.0:$0", redis_server_port_);
@@ -782,13 +788,16 @@ void TestRedisService::StartServer() {
   auto master_rpc_addrs = master_rpc_addresses_as_strings();
   opts.master_addresses_flag = JoinStrings(master_rpc_addrs, ",");
 
-  server_.reset(new RedisServer(opts, nullptr /* tserver */));
+  server_ = std::make_unique<RedisServer>(opts, mini_cluster()->mini_tablet_server(0)->server());
   LOG(INFO) << "Starting redis server...";
   CHECK_OK(server_->Start());
   LOG(INFO) << "Redis server successfully started.";
 }
 
 void TestRedisService::StopServer() {
+  if (!server_) {
+    return;
+  }
   LOG(INFO) << "Shut down redis server...";
   server_->Shutdown();
   server_.reset();
@@ -827,13 +836,15 @@ void TestRedisService::CloseRedisClient() {
 }
 
 void TestRedisService::TearDown() {
-  size_t allocated_sessions = CountSessions(METRIC_redis_allocated_sessions);
-  if (!expected_no_sessions_) {
-    EXPECT_GT(allocated_sessions, 0); // Check that metric is sane.
-  } else {
-    EXPECT_EQ(0, allocated_sessions);
+  if (!use_external_mini_cluster()) {
+    size_t allocated_sessions = CountSessions(METRIC_redis_allocated_sessions);
+    if (!expected_no_sessions_) {
+      EXPECT_GT(allocated_sessions, 0); // Check that metric is sane.
+    } else {
+      EXPECT_EQ(0, allocated_sessions);
+    }
+    EXPECT_EQ(allocated_sessions, CountSessions(METRIC_redis_available_sessions));
   }
-  EXPECT_EQ(allocated_sessions, CountSessions(METRIC_redis_available_sessions));
 
   CloseRedisClient();
   StopServer();
@@ -1105,7 +1116,7 @@ TEST_F(TestRedisService, BatchedCommandsInline) {
 
 TEST_F(TestRedisService, TestTimedoutInQueue) {
   FLAGS_redis_max_batch = 1;
-  SetAtomicFlag(true, &FLAGS_enable_backpressure_mode_for_testing);
+  SetAtomicFlag(true, &FLAGS_TEST_enable_backpressure_mode_for_testing);
 
   DoRedisTestOk(__LINE__, {"SET", "foo", "value"});
   DoRedisTestBulkString(__LINE__, {"GET", "foo"}, "value");
@@ -5205,11 +5216,11 @@ TEST_F(TestRedisService, RangeScanTimeout) {
   DoRedisTestArray(__LINE__, {"ZRANGEBYSCORE", "z_key", "-inf", "+inf"}, {"v1"});
   SyncClient();
 
-  FLAGS_test_tserver_timeout = true;
+  FLAGS_TEST_tserver_timeout = true;
   DoRedisTestExpectError(__LINE__, {"ZRANGEBYSCORE", "z_key", "-inf", "+inf"},
                          "Deadline for query passed.");
   SyncClient();
-  FLAGS_test_tserver_timeout = false;
+  FLAGS_TEST_tserver_timeout = false;
 
   // Test TimeSeries.
   DoRedisTestOk(__LINE__, {"TSADD", "ts_key", "1", "v1"});
@@ -5217,11 +5228,11 @@ TEST_F(TestRedisService, RangeScanTimeout) {
   DoRedisTestArray(__LINE__, {"TSRANGEBYTIME", "ts_key", "-inf", "+inf"}, {"1", "v1"});
   SyncClient();
 
-  FLAGS_test_tserver_timeout = true;
+  FLAGS_TEST_tserver_timeout = true;
   DoRedisTestExpectError(__LINE__, {"TSRANGEBYTIME", "ts_key", "-inf", "+inf"},
                          "Deadline for query passed.");
   SyncClient();
-  FLAGS_test_tserver_timeout = false;
+  FLAGS_TEST_tserver_timeout = false;
 
   // Test a point read doesn't time out.
   DoRedisTestOk(__LINE__, {"SET", "k", "v"});
@@ -5229,7 +5240,7 @@ TEST_F(TestRedisService, RangeScanTimeout) {
   DoRedisTestBulkString(__LINE__, {"GET", "k"}, "v");
   SyncClient();
 
-  FLAGS_test_tserver_timeout = true;
+  FLAGS_TEST_tserver_timeout = true;
   DoRedisTestBulkString(__LINE__, {"GET", "k"}, "v");
 
   SyncClient();
@@ -5239,11 +5250,11 @@ TEST_F(TestRedisService, RangeScanTimeout) {
 TEST_F(TestRedisService, KeysTimeout) {
   DoRedisTestInt(__LINE__, {"ZADD", "z_key", "1.0", "v1"}, 1);
   SyncClient();
-  FLAGS_test_tserver_timeout = true;
+  FLAGS_TEST_tserver_timeout = true;
   DoRedisTestExpectError(__LINE__, {"KEYS", "*"},
-                         "Errors occured while reaching out to the tablet servers");
+                         "Errors occurred while reaching out to the tablet servers");
   SyncClient();
-  FLAGS_test_tserver_timeout = false;
+  FLAGS_TEST_tserver_timeout = false;
   DoRedisTestArray(__LINE__, {"KEYS", "*"}, {"z_key"});
   SyncClient();
   VerifyCallbacks();
@@ -5259,6 +5270,16 @@ TEST_F(TestRedisService, KeysWithFlush) {
   DoRedisTestArray(__LINE__, {"KEYS", "*"}, {"k0", "k1"});
   SyncClient();
   VerifyCallbacks();
+}
+
+TEST_F(TestRedisService, SortedSetsIncr) {
+  DoRedisTestInt(__LINE__, {"ZADD", "z_key", "1", "v1"}, 1);
+  SyncClient();
+  DoRedisTestInt(__LINE__, {"ZADD", "z_key", "incr", "1", "v1"}, 0);
+  SyncClient();
+  DoRedisTestScoreValueArray(__LINE__, {"ZRANGEBYSCORE", "z_key", "-inf", "+inf", "WITHSCORES"},
+                                       {2}, {"v1"});
+  SyncClient();
 }
 
 }  // namespace redisserver

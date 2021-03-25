@@ -11,6 +11,9 @@
 // under the License.
 
 
+#include <string>
+
+#include "yb/util/monotime.h"
 #include "yb/util/random_util.h"
 #include "yb/util/scope_exit.h"
 #include "yb/util/size_literals.h"
@@ -35,12 +38,25 @@ void LibPqTestBase::SetUp() {
   PgWrapperTestBase::SetUp();
 }
 
-Result<PGConn> LibPqTestBase::Connect() {
-  return PGConn::Connect(HostPort(pg_ts->bind_host(), pg_ts->pgsql_rpc_port()));
+Result<PGConn> LibPqTestBase::Connect(bool simple_query_protocol) {
+  return PGConn::Connect(
+      HostPort(pg_ts->bind_host(), pg_ts->pgsql_rpc_port()), simple_query_protocol);
 }
 
-Result<PGConn> LibPqTestBase::ConnectToDB(const string& db_name) {
-  return PGConn::Connect(HostPort(pg_ts->bind_host(), pg_ts->pgsql_rpc_port()), db_name);
+Result<PGConn> LibPqTestBase::ConnectToDB(const string& db_name, bool simple_query_protocol) {
+  return PGConn::Connect(
+      HostPort(pg_ts->bind_host(), pg_ts->pgsql_rpc_port()), db_name, simple_query_protocol);
+}
+
+Result<PGConn> LibPqTestBase::ConnectToDBAsUser(
+    const string& db_name, const string& user, bool simple_query_protocol) {
+  return PGConn::Connect(
+      HostPort(pg_ts->bind_host(), pg_ts->pgsql_rpc_port()), db_name, user, simple_query_protocol);
+}
+
+Result<PGConn> LibPqTestBase::ConnectUsingString(
+    const string& conn_str, CoarseTimePoint deadline, bool simple_query_protocol) {
+  return PGConn::Connect(conn_str, deadline, simple_query_protocol);
 }
 
 bool LibPqTestBase::TransactionalFailure(const Status& status) {
@@ -49,8 +65,7 @@ bool LibPqTestBase::TransactionalFailure(const Status& status) {
     return false;
   }
   YBPgErrorCode code = PgsqlErrorTag::Decode(pgerr);
-  return code == YBPgErrorCode::YB_PG_T_R_SERIALIZATION_FAILURE ||
-         code == YBPgErrorCode::YB_PG_IN_FAILED_SQL_TRANSACTION;
+  return code == YBPgErrorCode::YB_PG_T_R_SERIALIZATION_FAILURE;
 }
 
 } // namespace pgwrapper

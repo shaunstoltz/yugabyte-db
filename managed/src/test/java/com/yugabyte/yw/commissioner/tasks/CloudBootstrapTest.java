@@ -67,6 +67,8 @@ public class CloudBootstrapTest extends CommissionerBaseTest {
     taskParams.hostVpcRegion = hostVpcRegion;
     taskParams.hostVpcId = hostVpcId;
     taskParams.destVpcId = destVpcId;
+    taskParams.sshPort = 12345;
+    taskParams.airGapInstall = false;
     return taskParams;
   }
 
@@ -83,9 +85,11 @@ public class CloudBootstrapTest extends CommissionerBaseTest {
     // Mock region metadata.
     mockRegionMetadata(Common.CloudType.valueOf(provider.code));
     // TODO(bogdan): we don't really care about the output now..
-    when(mockNetworkManager.bootstrap(any(UUID.class), any(UUID.class), anyString()))
+    when(mockNetworkManager.bootstrap(any(), any(), anyString()))
         .thenReturn(Json.parse("{}"));
     when(mockCloudQueryHelper.getZones(any(UUID.class), anyString()))
+        .thenReturn(zoneInfo);
+    when(mockCloudQueryHelper.getZones(any(UUID.class), anyString(), anyString()))
         .thenReturn(zoneInfo);
     String defaultImage = "test_image_id";
     when(mockCloudQueryHelper.getDefaultImage(any(Region.class)))
@@ -119,11 +123,14 @@ public class CloudBootstrapTest extends CommissionerBaseTest {
       if (customAccessKey) {
         // TODO: might need to add port here.
         verify(mockAccessManager, times(1)).addKey(
-            eq(r.uuid), eq(taskParams.keyPairName), any(), eq(taskParams.sshUser));
+            eq(r.uuid), eq(taskParams.keyPairName), any(), eq(taskParams.sshUser),
+            eq(taskParams.sshPort), eq(taskParams.airGapInstall), eq(false));
       } else {
         String expectedAccessKeyCode = String.format(
             "yb-%s-%s-key", defaultCustomer.code, provider.name.toLowerCase());
-        verify(mockAccessManager, times(1)).addKey(r.uuid, expectedAccessKeyCode);
+        verify(mockAccessManager, times(1)).addKey(eq(r.uuid), eq(expectedAccessKeyCode),
+               any(),eq(taskParams.sshUser), eq(taskParams.sshPort), eq(taskParams.airGapInstall),
+               eq(false));
       }
       // Check AZ info.
       Set<AvailabilityZone> zones = r.zones;
@@ -269,7 +276,7 @@ public class CloudBootstrapTest extends CommissionerBaseTest {
   @Test
   public void testCloudBootstrapWithNetworkBootstrapError() throws InterruptedException {
     JsonNode vpcInfo = Json.parse("{\"error\": \"Something failed\"}");
-    when(mockNetworkManager.bootstrap(any(UUID.class), any(UUID.class), anyString()))
+    when(mockNetworkManager.bootstrap(any(), any(), anyString()))
         .thenReturn(vpcInfo);
     CloudBootstrap.Params taskParams = getBaseTaskParams();
     taskParams.perRegionMetadata.put("us-west-1", new CloudBootstrap.Params.PerRegionMetadata());

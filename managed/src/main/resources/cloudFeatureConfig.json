@@ -1,8 +1,7 @@
 {
   "universe": {
-      "import": "disabled",
-      "create": "disabled",
-      "backup": "hidden"
+    "import": "disabled",
+    "create": "disabled"
   },
   "config": {
     "infra": "disabled",
@@ -13,6 +12,7 @@
   },
   "menu": {
     "config": "disabled",
+    "administration": "disabled",
     "sidebar": "hidden"
   },
   "universes": {
@@ -23,12 +23,22 @@
         "readReplica": "hidden",
         "editUniverse": "hidden",
         "manageEncryption": "hidden",
-        "deleteUniverse": "hidden"
+        "restartUniverse": "hidden",
+        "deleteUniverse": "hidden",
+        "costs": "hidden"
+      },
+      "replication": "hidden",
+      "health": {
+        "alerts": "hidden"
       },
       "pageActions": "hidden",
-      "universeStatus": "hidden"
+      "universeStatus": "hidden",
+      "backups": {
+        "storageLocation": "hidden"
+      }
     },
     "proxyIp": "hidden",
-    "tableActions": "disabled"
+    "tableActions": "hidden",
+    "backup": "hidden"
   }
 }

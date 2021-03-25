@@ -21,6 +21,7 @@
 #include "yb/master/master.proxy.h"
 
 #include "yb/util/backoff_waiter.h"
+#include "yb/util/status.h"
 
 DEFINE_int32(
     max_num_tablets_for_table, 5000,
@@ -126,6 +127,14 @@ const IndexInfo& YBTable::index_info() const {
   return kEmptyIndexInfo;
 }
 
+const bool YBTable::colocated() const {
+  return info_.colocated;
+}
+
+const boost::optional<master::ReplicationInfoPB>& YBTable::replication_info() const {
+  return info_.replication_info;
+}
+
 std::string YBTable::ToString() const {
   return strings::Substitute(
       "$0 $1 IndexInfo: $2 IndexMap $3", (IsIndex() ? "Index Table" : "Normal Table"), id(),
@@ -136,12 +145,47 @@ const PartitionSchema& YBTable::partition_schema() const {
   return info_.partition_schema;
 }
 
-const std::vector<std::string>& YBTable::GetPartitions() const {
+bool YBTable::IsHashPartitioned() const {
+  // TODO(neil) After fixing github #5832, "partition_schema" must be used here.
+  // return info_.partition_schema.IsHashPartitioning();
+  return info_.schema.num_hash_key_columns() > 0;
+}
+
+bool YBTable::IsRangePartitioned() const {
+  // TODO(neil) After fixing github #5832, "partition_schema" must be used here.
+  // return info_.partition_schema.IsRangePartitioning();
+  return info_.schema.num_hash_key_columns() == 0;
+}
+
+std::shared_ptr<const TablePartitionList> YBTable::GetPartitionsShared() const {
+  SharedLock<decltype(mutex_)> lock(mutex_);
+  return std::shared_ptr<const TablePartitionList>(partitions_, &partitions_->keys);
+}
+
+VersionedTablePartitionListPtr YBTable::GetVersionedPartitions() const {
+  SharedLock<decltype(mutex_)> lock(mutex_);
   return partitions_;
 }
 
+TablePartitionList YBTable::GetPartitionsCopy() const {
+  TablePartitionList result;
+
+  SharedLock<decltype(mutex_)> lock(mutex_);
+  result.reserve(partitions_->keys.size());
+  for (const auto& key : partitions_->keys) {
+    result.push_back(key);
+  }
+  return result;
+}
+
 int32_t YBTable::GetPartitionCount() const {
-  return partitions_.size();
+  SharedLock<decltype(mutex_)> lock(mutex_);
+  return partitions_->keys.size();
+}
+
+int32_t YBTable::GetPartitionListVersion() const {
+  SharedLock<decltype(mutex_)> lock(mutex_);
+  return partitions_->version;
 }
 
 //--------------------------------------------------------------------------------------------------
@@ -170,26 +214,57 @@ std::unique_ptr<YBqlReadOp> YBTable::NewQLRead() {
   return std::unique_ptr<YBqlReadOp>(new YBqlReadOp(shared_from_this()));
 }
 
-size_t YBTable::FindPartitionStartIndex(const std::string& partition_key, size_t group_by) const {
-  auto it = std::lower_bound(partitions_.begin(), partitions_.end(), partition_key);
-  if (it == partitions_.end() || *it > partition_key) {
-    DCHECK(it != partitions_.begin());
-    --it;
-  }
-  if (group_by <= 1) {
-    return it - partitions_.begin();
-  }
-  return (it - partitions_.begin()) / group_by * group_by;
+size_t YBTable::FindPartitionStartIndex(const PartitionKey& partition_key, size_t group_by) const {
+  SharedLock<decltype(mutex_)> lock(mutex_);
+  return client::FindPartitionStartIndex(partitions_->keys, partition_key, group_by);
 }
 
-const std::string& YBTable::FindPartitionStart(
-    const std::string& partition_key, size_t group_by) const {
+PartitionKeyPtr YBTable::FindPartitionStart(
+    const PartitionKey& partition_key, size_t group_by) const {
+  SharedLock<decltype(mutex_)> lock(mutex_);
   size_t idx = FindPartitionStartIndex(partition_key, group_by);
-  return partitions_[idx];
+  return std::shared_ptr<const std::string>(partitions_, &partitions_->keys[idx]);
 }
 
-Status YBTable::Open() {
+Result<bool> YBTable::MaybeRefreshPartitions() {
+  if (!partitions_are_stale_) {
+    return false;
+  }
+  std::unique_lock<decltype(partitions_refresh_mutex_)> refresh_lock(partitions_refresh_mutex_);
+  if (!partitions_are_stale_) {
+    // Has been refreshed by concurrent thread.
+    return true;
+  }
+  const auto partitions_result = FetchPartitions();
+  if (!partitions_result.ok()) {
+    return partitions_result.status();
+  }
+  const auto& partitions = *partitions_result;
+  {
+    std::lock_guard<rw_spinlock> partitions_lock(mutex_);
+    if (partitions->version < partitions_->version) {
+      return STATUS_FORMAT(
+          TryAgain, "Received table $0 partitions version: $1, ours is: $2", id(),
+          partitions->version, partitions_->version);
+    }
+    partitions_ = partitions;
+  }
+  partitions_are_stale_ = false;
+  return true;
+}
+
+void YBTable::MarkPartitionsAsStale() {
+  partitions_are_stale_ = true;
+}
+
+bool YBTable::ArePartitionsStale() const {
+  return partitions_are_stale_;
+}
+
+Result<std::shared_ptr<const VersionedTablePartitionList>> YBTable::FetchPartitions() {
   // TODO: fetch the schema from the master here once catalog is available.
+  auto partitions = std::make_shared<VersionedTablePartitionList>();
+
   master::GetTableLocationsRequestPB req;
   req.set_max_returned_locations(std::numeric_limits<int32_t>::max());
   master::GetTableLocationsResponsePB resp;
@@ -197,6 +272,8 @@ Status YBTable::Open() {
   auto deadline = CoarseMonoClock::Now() + client_->default_admin_operation_timeout();
 
   req.mutable_table()->set_table_id(info_.table_id);
+  // TODO(tsplit): consider optimizing this to not wait for all tablets to be running in case
+  // of some tablet has been split and post-split tablets are not yet running.
   req.set_require_tablets_running(true);
   Status s;
 
@@ -265,13 +342,12 @@ Status YBTable::Open() {
     if (!s.ok()) {
       YB_LOG_EVERY_N_SECS(WARNING, 10) << "Error getting table locations: " << s << ", retrying.";
     } else if (resp.tablet_locations_size() > 0) {
-      DCHECK(partitions_.empty());
-      partitions_.clear();
-      partitions_.reserve(resp.tablet_locations().size());
+      partitions->version = resp.partition_list_version();
+      partitions->keys.reserve(resp.tablet_locations().size());
       for (const auto& tablet_location : resp.tablet_locations()) {
-        partitions_.push_back(tablet_location.partition().partition_key_start());
+        partitions->keys.push_back(tablet_location.partition().partition_key_start());
       }
-      std::sort(partitions_.begin(), partitions_.end());
+      std::sort(partitions->keys.begin(), partitions->keys.end());
       break;
     }
 
@@ -286,8 +362,15 @@ Status YBTable::Open() {
   RETURN_NOT_OK_PREPEND(PBToClientTableType(resp.table_type(), &table_type_),
     strings::Substitute("Invalid table type for table '$0'", info_.table_name.ToString()));
 
-  VLOG(1) << "Open Table " << info_.table_name.ToString() << ", found "
+  VLOG(2) << "Fetched partitions for table " << info_.table_name.ToString() << ", found "
           << resp.tablet_locations_size() << " tablets";
+  return partitions;
+}
+
+Status YBTable::Open() {
+  std::lock_guard<rw_spinlock> partitions_lock(mutex_);
+  partitions_ = VERIFY_RESULT(FetchPartitions());
+  partitions_are_stale_ = false;
   return Status::OK();
 }
 
@@ -320,6 +403,27 @@ std::unique_ptr<YBPgsqlReadOp> YBTable::NewPgsqlSelect() {
 std::unique_ptr<YBPgsqlReadOp> YBTable::NewPgsqlRead() {
   return std::unique_ptr<YBPgsqlReadOp>(new YBPgsqlReadOp(shared_from_this()));
 }
+
+size_t FindPartitionStartIndex(const TablePartitionList& partitions,
+                               const PartitionKey& partition_key,
+                               size_t group_by) {
+  auto it = std::lower_bound(partitions.begin(), partitions.end(), partition_key);
+  if (it == partitions.end() || *it > partition_key) {
+    DCHECK(it != partitions.begin()) << "Could not find partition start while looking for "
+        << partition_key << " in " << yb::ToString(partitions);
+    --it;
+  }
+  return group_by <= 1 ? it - partitions.begin() :
+                         (it - partitions.begin()) / group_by * group_by;
+}
+
+PartitionKeyPtr FindPartitionStart(
+    const VersionedTablePartitionListPtr& versioned_partitions, const PartitionKey& partition_key,
+    size_t group_by) {
+  const auto idx = FindPartitionStartIndex(versioned_partitions->keys, partition_key, group_by);
+  return PartitionKeyPtr(versioned_partitions, &versioned_partitions->keys[idx]);
+}
+
 
 } // namespace client
 } // namespace yb

@@ -2,7 +2,7 @@
 title: Compare Apache Cassandra with YugabyteDB
 headerTitle: Apache Cassandra
 linkTitle: Apache Cassandra
-description: Learn about how Apache Cassandra compares with YugabyteDB.
+description: Compare Apache Cassandra with YugabyteDB.
 aliases:
   - /comparisons/cassandra/
 menu:
@@ -59,7 +59,7 @@ Local secondary indexes in Apache Cassandra ([see blog](https://pantheon.io/blog
 
 Apache Cassandra is a flexi-schema database that supports single key data modeling. On the other hand, YugabyteDB is a multi-model and multi-API database that supports multiple different types of data modeling including flexi-schema and document data (with the native JSON data type support in the Cassandra-compatible YCQL API). Additionally, YugabyteDB supports key-value (with the Redis-compatible YEDIS API) and relational (with the PostgreSQL-compatible YSQL API) data modeling.
 
-Some further details on the document data modeling of both databases is warranted. Apache Cassandra's JSON support can be misleading for many developers. CQL allows SELECT and INSERT statements to include the JSON keyword. The SELECT output will now be available in the JSON format and the INSERT inputs can now be specified in the JSON format. However, this “JSON” support is simply an ease-of-use abstraction in the CQL layer that the underlying database engine is unaware of. Since there is no native JSON data type in CQL, the schema doesn’t have any knowledge of the JSON provided by the user. This means the schema definition doesn’t change nor does the schema enforcement. Cassandra developers needing native JSON support previously had no choice but to add a new document database such as MongoDB or Couchbase into their data tier.
+Some further details on the document data modeling of both databases is warranted. Apache Cassandra's JSON support can be misleading for many developers. YCQL allows SELECT and INSERT statements to include the JSON keyword. The SELECT output will now be available in the JSON format and the INSERT inputs can now be specified in the JSON format. However, this “JSON” support is simply an ease-of-use abstraction in the CQL layer that the underlying database engine is unaware of. Since there is no native JSON data type in CQL, the schema doesn’t have any knowledge of the JSON provided by the user. This means the schema definition doesn’t change nor does the schema enforcement. Cassandra developers needing native JSON support previously had no choice but to add a new document database such as MongoDB or Couchbase into their data tier.
 
 With YugabyteDB’s native JSON support, developers can now benefit from the structured query language of Cassandra and the document data modeling of MongoDB in a single database.
 
@@ -72,6 +72,10 @@ With YugabyteDB’s native JSON support, developers can now benefit from the str
 3. Operations like anti-entropy and read-pair hurt steady-state stability of cluster as they consume additional system resources. With Yugabyte, which does replication using distributed consensus, these operations are not needed since the replicas stay in sync using RAFT or catch up the deltas cleanly from the transaction log of the current leader.
 
 4. Apache Cassandra needs constant tuning of compactions (because of Java implementation, non-scalable, non-partitioned bloom filters and index-metadata, lack of scan-resistant caches, and so on.).
+
+5. Adding a node when the cluster is at risk of running out of disk space can give relief in steps over time. The new server will 
+start serving requests as soon as 1 tablet has been transferred. While in Cassandra the old nodes get no benefit until after adding node and then doing `nodetool cleanup` which could take many hours each.
+
 
 ## Operational flexibility
 

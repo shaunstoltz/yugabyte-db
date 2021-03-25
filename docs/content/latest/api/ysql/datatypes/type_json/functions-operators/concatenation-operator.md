@@ -2,29 +2,30 @@
 title: "|| (concatenation operator) [JSON]"
 headerTitle:  "|| (concatenation)"
 linkTitle: "|| (concatenation)"
-description: Use the JSON concatenation operator ("||") to concatenate two jsonb values.
+description: Concatenate two jsonb values using the JSON concatenation operator ("||").
 menu:
   latest:
     identifier: concatenation-operator
-    parent: functions-operators
+    parent: json-functions-operators
     weight: 14
 isTocNested: true
 showAsideToc: true
 ---
 
-**Purpose:** concatenate two `jsonb` values. The rule for deriving the output value depends upon the JSON data types of the operands. 
+**Purpose:** Concatenate two `jsonb` values. The rule for deriving the output value depends upon the JSON data types of the operands.
 
 **Signature:**
+
 ```
 input values:       jsonb || jsonb
 return value:       jsonb
 ```
 
-**Notes:** this operator doesn't have an overload for `json`.
+**Notes:** There is no `json` overload.
 
 If both sides of the operator are primitive JSON values, then the result is an _array_ of these values:
 
-```postgresql
+```plpgsql
 do $body$
 declare
   j_left constant jsonb := '17';
@@ -40,7 +41,7 @@ $body$;
 
 If one side is a primitive JSON value and the other is an  _array_ , then the result is an _array_:
 
-```postgresql
+```plpgsql
 do $body$
 declare
   j_left constant jsonb := '17';
@@ -56,7 +57,7 @@ $body$;
 
 If each side is an _object_, then the results is an _object_ with all the key-value pairs present:
 
-```postgresql
+```plpgsql
 do $body$
 declare
   j_left constant jsonb := '{"a": 1, "b": 2}';
@@ -72,7 +73,7 @@ $body$;
 
 If the keys of key-value pairs collide, then the last-mentioned one wins, just as when the keys of such pairs collide in a single _object_:
 
-```postgresql
+```plpgsql
 do $body$
 declare
   j_left constant jsonb := '{"a": 1, "b": 2}';
@@ -88,7 +89,7 @@ $body$;
 
 If one side is an _object_ and the other is an _array_, then the _object_ is absorbed as a value in the _array_:
 
-```postgresql
+```plpgsql
 do $body$
 declare
   j_left constant jsonb := '{"a": 1, "b": 2}';

@@ -20,7 +20,21 @@ public class AccessKeyFormData {
 
     public String sshUser;
 
+    // Normally cloud access keys are created on provider creation, so default to 22 for onprem
+    // providers.
+    public Integer sshPort = 22;
+
+    // Not used anymore. This field should be passed directly to the pre-provision script.
+    @Deprecated
     public boolean passwordlessSudoAccess = true;
 
     public boolean airGapInstall = false;
+
+    public boolean installNodeExporter = true;
+
+    public String nodeExporterUser = "prometheus";
+
+    public Integer nodeExporterPort = 9300;
+
+    public boolean skipProvisioning = false;
 }

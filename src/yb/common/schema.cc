@@ -96,7 +96,7 @@ void TableProperties::ToTablePropertiesPB(TablePropertiesPB *pb) const {
     pb->set_num_tablets(num_tablets_);
   }
   pb->set_is_ysql_catalog_table(is_ysql_catalog_table_);
-  pb->set_is_backfilling(is_backfilling_);
+  pb->set_retain_delete_markers(retain_delete_markers_);
 }
 
 TableProperties TableProperties::FromTablePropertiesPB(const TablePropertiesPB& pb) {
@@ -125,8 +125,8 @@ TableProperties TableProperties::FromTablePropertiesPB(const TablePropertiesPB& 
   if (pb.has_is_ysql_catalog_table()) {
     table_properties.set_is_ysql_catalog_table(pb.is_ysql_catalog_table());
   }
-  if (pb.has_is_backfilling()) {
-    table_properties.SetIsBackfilling(pb.is_backfilling());
+  if (pb.has_retain_delete_markers()) {
+    table_properties.SetRetainDeleteMarkers(pb.retain_delete_markers());
   }
   return table_properties;
 }
@@ -153,8 +153,8 @@ void TableProperties::AlterFromTablePropertiesPB(const TablePropertiesPB& pb) {
   if (pb.has_is_ysql_catalog_table()) {
     set_is_ysql_catalog_table(pb.is_ysql_catalog_table());
   }
-  if (pb.has_is_backfilling()) {
-    SetIsBackfilling(pb.is_backfilling());
+  if (pb.has_retain_delete_markers()) {
+    SetRetainDeleteMarkers(pb.retain_delete_markers());
   }
 }
 
@@ -167,7 +167,7 @@ void TableProperties::Reset() {
   use_mangled_column_name_ = false;
   num_tablets_ = 0;
   is_ysql_catalog_table_ = false;
-  is_backfilling_ = false;
+  retain_delete_markers_ = false;
 }
 
 string TableProperties::ToString() const {
@@ -252,9 +252,22 @@ void Schema::swap(Schema& other) {
   DCHECK(cotable_id_.IsNil() || pgtable_id_ == 0);
 }
 
+void Schema::ResetColumnIds(const vector<ColumnId>& ids) {
+  // Initialize IDs mapping.
+  col_ids_ = ids;
+  id_to_index_.clear();
+  max_col_id_ = 0;
+  for (int i = 0; i < ids.size(); ++i) {
+    if (ids[i] > max_col_id_) {
+      max_col_id_ = ids[i];
+    }
+    id_to_index_.set(ids[i], i);
+  }
+}
+
 Status Schema::Reset(const vector<ColumnSchema>& cols,
                      const vector<ColumnId>& ids,
-                     int key_columns,
+                     size_t key_columns,
                      const TableProperties& table_properties,
                      const Uuid& cotable_id,
                      const PgTableOid pgtable_id) {
@@ -269,7 +282,7 @@ Status Schema::Reset(const vector<ColumnSchema>& cols,
   has_nullables_ = false;
   has_statics_ = false;
   for (const ColumnSchema& col : cols_) {
-    if (col.is_hash_key()) {
+    if (col.is_hash_key() && num_hash_key_columns_ < key_columns) {
       num_hash_key_columns_++;
     }
     if (col.is_nullable()) {
@@ -283,11 +296,6 @@ Status Schema::Reset(const vector<ColumnSchema>& cols,
   if (PREDICT_FALSE(key_columns > cols_.size())) {
     return STATUS(InvalidArgument,
       "Bad schema", "More key columns than columns");
-  }
-
-  if (PREDICT_FALSE(key_columns < 0)) {
-    return STATUS(InvalidArgument,
-      "Bad schema", "Cannot specify a negative number of key columns");
   }
 
   if (PREDICT_FALSE(!ids.empty() && ids.size() != cols_.size())) {
@@ -339,24 +347,15 @@ Status Schema::Reset(const vector<ColumnSchema>& cols,
   col_offsets_.push_back(off);
 
   // Initialize IDs mapping
-  col_ids_ = ids;
-  id_to_index_.clear();
-  max_col_id_ = 0;
-  for (int i = 0; i < ids.size(); ++i) {
-    if (ids[i] > max_col_id_) {
-      max_col_id_ = ids[i];
-    }
-    id_to_index_.set(ids[i], i);
-  }
+  ResetColumnIds(ids);
 
   // Ensure clustering columns have a default sorting type of 'ASC' if not specified.
-  for (int i = num_hash_key_columns_; i < num_key_columns(); i++) {
+  for (auto i = num_hash_key_columns_; i < num_key_columns(); ++i) {
     ColumnSchema& col = cols_[i];
     if (col.sorting_type() == ColumnSchema::SortingType::kNotSpecified) {
       col.set_sorting_type(ColumnSchema::SortingType::kAscending);
     }
   }
-
   return Status::OK();
 }
 
@@ -392,13 +391,19 @@ Status Schema::CreateProjectionByIdsIgnoreMissing(const std::vector<ColumnId>& c
   return out->Reset(cols, filtered_col_ids, 0, TableProperties(), cotable_id_, pgtable_id_);
 }
 
-Schema Schema::CopyWithColumnIds() const {
-  CHECK(!has_column_ids());
+namespace {
+vector<ColumnId> DefaultColumnIds(size_t num_columns) {
   vector<ColumnId> ids;
-  for (int32_t i = 0; i < num_columns(); i++) {
+  for (int32_t i = 0; i < num_columns; ++i) {
     ids.push_back(ColumnId(kFirstColumnId + i));
   }
-  return Schema(cols_, ids, num_key_columns_, table_properties_, cotable_id_, pgtable_id_);
+  return ids;
+}
+}  // namespace
+
+void Schema::InitColumnIdsByDefault() {
+  CHECK(!has_column_ids());
+  ResetColumnIds(DefaultColumnIds(cols_.size()));
 }
 
 Schema Schema::CopyWithoutColumnIds() const {
@@ -543,6 +548,14 @@ size_t Schema::memory_footprint_including_this() const {
   return malloc_usable_size(this) + memory_footprint_excluding_this();
 }
 
+Result<int> Schema::ColumnIndexByName(GStringPiece col_name) const {
+  auto index = find_column(col_name);
+  if (index == kColumnNotFound) {
+    return STATUS_FORMAT(Corruption, "$0 not found in schema $1", col_name, name_to_index_);
+  }
+  return index;
+}
+
 Result<ColumnId> Schema::ColumnIdByName(const std::string& column_name) const {
   size_t column_index = find_column(column_name);
   if (column_index == Schema::kColumnNotFound) {
@@ -565,6 +578,8 @@ void SchemaBuilder::Reset() {
   num_key_columns_ = 0;
   next_id_ = kFirstColumnId;
   table_properties_.Reset();
+  pgtable_id_ = 0;
+  cotable_id_ = Uuid(boost::uuids::nil_uuid());
 }
 
 void SchemaBuilder::Reset(const Schema& schema) {
@@ -586,6 +601,8 @@ void SchemaBuilder::Reset(const Schema& schema) {
     next_id_ = *std::max_element(col_ids_.begin(), col_ids_.end()) + 1;
   }
   table_properties_ = schema.table_properties_;
+  pgtable_id_ = schema.pgtable_id_;
+  cotable_id_ = schema.cotable_id_;
 }
 
 Status SchemaBuilder::AddKeyColumn(const string& name, const shared_ptr<QLType>& type) {

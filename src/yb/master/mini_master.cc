@@ -43,15 +43,17 @@
 #include "yb/master/catalog_manager.h"
 #include "yb/master/master.h"
 #include "yb/rpc/messenger.h"
+#include "yb/util/flag_tags.h"
 #include "yb/util/net/sockaddr.h"
 #include "yb/util/net/tunnel.h"
 #include "yb/util/status.h"
 
 using strings::Substitute;
 
-DECLARE_bool(simulate_fs_create_failure);
+DECLARE_bool(TEST_simulate_fs_create_failure);
 DECLARE_bool(rpc_server_allow_ephemeral_ports);
 DECLARE_double(leader_failure_max_missed_heartbeat_periods);
+DECLARE_int32(TEST_nodes_per_cloud);
 
 namespace yb {
 namespace master {
@@ -71,10 +73,10 @@ MiniMaster::~MiniMaster() {
   }
 }
 
-Status MiniMaster::Start(bool simulate_fs_create_failure) {
+Status MiniMaster::Start(bool TEST_simulate_fs_create_failure) {
   CHECK(!running_);
   FLAGS_rpc_server_allow_ephemeral_ports = true;
-  FLAGS_simulate_fs_create_failure = simulate_fs_create_failure;
+  FLAGS_TEST_simulate_fs_create_failure = TEST_simulate_fs_create_failure;
   RETURN_NOT_OK(StartOnPorts(rpc_port_, web_port_));
   return master_->WaitForCatalogManagerInit();
 }
@@ -101,11 +103,13 @@ Status MiniMaster::StartOnPorts(uint16_t rpc_port, uint16_t web_port) {
   CHECK(!running_);
   CHECK(!master_);
 
-  HostPort local_host_port;
-  RETURN_NOT_OK(local_host_port.ParseString(
-      server::TEST_RpcBindEndpoint(index_, rpc_port), rpc_port));
   auto master_addresses = std::make_shared<server::MasterAddresses>();
-  master_addresses->push_back({local_host_port});
+  if (pass_master_addresses_) {
+    HostPort local_host_port;
+    RETURN_NOT_OK(local_host_port.ParseString(
+        server::TEST_RpcBindEndpoint(index_, rpc_port), rpc_port));
+    master_addresses->push_back({local_host_port});
+  }
   MasterOptions opts(master_addresses);
 
   Status start_status = StartOnPorts(rpc_port, web_port, &opts);
@@ -128,7 +132,9 @@ Status MiniMaster::StartOnPorts(uint16_t rpc_port, uint16_t web_port,
       HostPort(server::TEST_RpcAddress(index_, server::Private::kFalse), rpc_port) };
 
   if (!opts->has_placement_cloud()) {
-    opts->SetPlacement(Format("cloud$0", (index_ + 1) / 2), Format("rack$0", index_), "zone");
+    opts->SetPlacement(
+        Format("cloud$0", (index_ + 1) / FLAGS_TEST_nodes_per_cloud),
+        Format("rack$0", index_), "zone");
   }
 
   gscoped_ptr<Master> server(new enterprise::Master(*opts));
@@ -157,16 +163,18 @@ Status MiniMaster::StartDistributedMasterOnPorts(uint16_t rpc_port, uint16_t web
   CHECK(!master_);
 
   auto peer_addresses = std::make_shared<server::MasterAddresses>();
-  peer_addresses->resize(peer_ports.size());
+  if (pass_master_addresses_) {
+    peer_addresses->resize(peer_ports.size());
 
-  int index = 0;
-  for (uint16_t peer_port : peer_ports) {
-    auto& addresses = (*peer_addresses)[index];
-    ++index;
-    addresses.push_back(VERIFY_RESULT(HostPort::FromString(
-        server::TEST_RpcBindEndpoint(index, peer_port), peer_port)));
-    addresses.push_back(VERIFY_RESULT(HostPort::FromString(
-        server::TEST_RpcAddress(index, server::Private::kFalse), peer_port)));
+    int index = 0;
+    for (uint16_t peer_port : peer_ports) {
+      auto& addresses = (*peer_addresses)[index];
+      ++index;
+      addresses.push_back(VERIFY_RESULT(HostPort::FromString(
+          server::TEST_RpcBindEndpoint(index, peer_port), peer_port)));
+      addresses.push_back(VERIFY_RESULT(HostPort::FromString(
+          server::TEST_RpcAddress(index, server::Private::kFalse), peer_port)));
+    }
   }
   MasterOptions opts(peer_addresses);
 

@@ -13,6 +13,7 @@
 
 #include "yb/docdb/redis_operation.h"
 
+#include "yb/docdb/doc_reader_redis.h"
 #include "yb/docdb/doc_ttl_util.h"
 #include "yb/docdb/doc_write_batch.h"
 #include "yb/docdb/doc_write_batch_cache.h"
@@ -163,10 +164,10 @@ Result<RedisDataType> GetRedisValueType(
   } else {
     // TODO(dtxn) - pass correct transaction context when we implement cross-shard transactions
     // support for Redis.
-    GetSubDocumentData data = { encoded_subdoc_key, &doc, &doc_found };
+    GetRedisSubDocumentData data = { encoded_subdoc_key, &doc, &doc_found };
     data.return_type_only = true;
     data.exp.always_override = always_override;
-    RETURN_NOT_OK(GetSubDocument(iterator, data, /* projection */ nullptr,
+    RETURN_NOT_OK(GetRedisSubDocument(iterator, data, /* projection */ nullptr,
                                  SeekFwdSuffices::kFalse));
   }
 
@@ -226,18 +227,17 @@ Result<RedisValue> GetRedisValue(
 
   // TODO(dtxn) - pass correct transaction context when we implement cross-shard transactions
   // support for Redis.
-  GetSubDocumentData data = { encoded_doc_key, &doc, &doc_found };
+  GetRedisSubDocumentData data = { encoded_doc_key, &doc, &doc_found };
   data.exp.always_override = always_override;
-  RETURN_NOT_OK(GetSubDocument(iterator, data, /* projection */ nullptr, SeekFwdSuffices::kFalse));
+  RETURN_NOT_OK(GetRedisSubDocument(
+      iterator, data, /* projection */ nullptr, SeekFwdSuffices::kFalse));
   if (!doc_found) {
     return RedisValue{REDIS_TYPE_NONE};
   }
 
-  bool has_expired = false;
-  CHECK_OK(HasExpiredTTL(data.exp.write_ht, data.exp.ttl,
-                         iterator->read_time().read, &has_expired));
-  if (has_expired)
+  if (HasExpiredTTL(data.exp.write_ht, data.exp.ttl, iterator->read_time().read)) {
     return RedisValue{REDIS_TYPE_NONE};
+  }
 
   if (exp)
     *exp = data.exp;
@@ -421,9 +421,10 @@ Result<int64_t> GetCardinality(IntentAwareIterator* iterator, const RedisKeyValu
   SubDocument subdoc_card;
 
   bool subdoc_card_found = false;
-  GetSubDocumentData data = { encoded_key_card, &subdoc_card, &subdoc_card_found };
+  GetRedisSubDocumentData data = { encoded_key_card, &subdoc_card, &subdoc_card_found };
 
-  RETURN_NOT_OK(GetSubDocument(iterator, data, /* projection */ nullptr, SeekFwdSuffices::kFalse));
+  RETURN_NOT_OK(GetRedisSubDocument(
+      iterator, data, /* projection */ nullptr, SeekFwdSuffices::kFalse));
 
   return subdoc_card_found ? subdoc_card.GetInt64() : 0;
 }
@@ -432,13 +433,14 @@ template <typename AddResponseValues>
 CHECKED_STATUS GetAndPopulateResponseValues(
     IntentAwareIterator* iterator,
     AddResponseValues add_response_values,
-    const GetSubDocumentData& data,
+    const GetRedisSubDocumentData& data,
     ValueType expected_type,
     const RedisReadRequestPB& request,
     RedisResponsePB* response,
     bool add_keys, bool add_values, bool reverse) {
 
-  RETURN_NOT_OK(GetSubDocument(iterator, data, /* projection */ nullptr, SeekFwdSuffices::kFalse));
+  RETURN_NOT_OK(GetRedisSubDocument(
+      iterator, data, /* projection */ nullptr, SeekFwdSuffices::kFalse));
 
   // Validate and populate response.
   response->set_allocated_array_response(new RedisArrayPB());
@@ -621,9 +623,9 @@ Status RedisWriteOperation::ApplySet(const DocOperationApplyData& data) {
           SubDocument subdoc_reverse;
           bool subdoc_reverse_found = false;
           auto encoded_key_reverse = key_reverse.EncodeWithoutHt();
-          GetSubDocumentData get_data = { encoded_key_reverse, &subdoc_reverse,
-                                          &subdoc_reverse_found };
-          RETURN_NOT_OK(GetSubDocument(
+          GetRedisSubDocumentData get_data = { encoded_key_reverse, &subdoc_reverse,
+                                               &subdoc_reverse_found };
+          RETURN_NOT_OK(GetRedisSubDocument(
               data.doc_write_batch->doc_db(),
               get_data, redis_query_id(), boost::none /* txn_op_context */, data.deadline,
               data.read_time));
@@ -661,7 +663,10 @@ Status RedisWriteOperation::ApplySet(const DocOperationApplyData& data) {
                 // should_remove_existing_entry to true, and if the CH flag is on (return both
                 // elements changed and elements added), increment return_value.
                 double score_to_remove = subdoc_reverse.GetDouble();
-                if (score_to_remove != kv.subkey(i).double_subkey()) {
+                // If incr option is set, we add the increment to the existing score.
+                double score_to_add = request_.set_request().sorted_set_options().incr() ?
+                    score_to_remove + kv.subkey(i).double_subkey() : kv.subkey(i).double_subkey();
+                if (score_to_remove != score_to_add) {
                   should_remove_existing_entry = true;
                   if (request_.set_request().sorted_set_options().ch()) {
                     return_value++;
@@ -810,15 +815,14 @@ Status RedisWriteOperation::ApplySetTtl(const DocOperationApplyData& data) {
   }
 
   Expiration exp;
-  auto value = GetValue(data, kNilSubkeyIndex, &exp);
-  RETURN_NOT_OK(value);
+  auto value = VERIFY_RESULT(GetValue(data, kNilSubkeyIndex, &exp));
 
-  if (value->type == REDIS_TYPE_TIMESERIES) { // This command is not supported.
+  if (value.type == REDIS_TYPE_TIMESERIES) { // This command is not supported.
     return STATUS_SUBSTITUTE(InvalidCommand,
-        "Redis data type $0 not supported in EXPIRE and PERSIST commands", value->type);
+        "Redis data type $0 not supported in EXPIRE and PERSIST commands", value.type);
   }
 
-  if (value->type == REDIS_TYPE_NONE) { // Key does not exist.
+  if (value.type == REDIS_TYPE_NONE) { // Key does not exist.
     VLOG(1) << "TTL cannot be set because the key does not exist";
     response_.set_int_response(0);
     return Status::OK();
@@ -838,7 +842,7 @@ Status RedisWriteOperation::ApplySetTtl(const DocOperationApplyData& data) {
       MonoDelta::FromMilliseconds(request_.set_ttl_request().ttl());
   }
 
-  ValueType v_type = ValueTypeFromRedisType(value->type);
+  ValueType v_type = ValueTypeFromRedisType(value.type);
   if (v_type == ValueType::kInvalid)
     return STATUS(Corruption, "Invalid value type.");
 
@@ -954,9 +958,9 @@ Status RedisWriteOperation::ApplyDel(const DocOperationApplyData& data) {
         // As of now, we only check to see if a value is in rocksdb, and we should also check
         // the write batch.
         auto encoded_subdoc_key_reverse = subdoc_key_reverse.EncodeWithoutHt();
-        GetSubDocumentData get_data = { encoded_subdoc_key_reverse, &doc_reverse,
-                                        &doc_reverse_found };
-        RETURN_NOT_OK(GetSubDocument(
+        GetRedisSubDocumentData get_data = { encoded_subdoc_key_reverse, &doc_reverse,
+                                             &doc_reverse_found };
+        RETURN_NOT_OK(GetRedisSubDocument(
             data.doc_write_batch->doc_db(),
             get_data, redis_query_id(), boost::none /* txn_op_context */, data.deadline,
             data.read_time));
@@ -1184,11 +1188,11 @@ Status RedisWriteOperation::ApplyPop(const DocOperationApplyData& data) {
 
   if (request_.pop_request().side() == REDIS_SIDE_LEFT) {
     indices.push_back(1);
-    RETURN_NOT_OK(data.doc_write_batch->ReplaceInList(doc_path, indices, new_value,
+    RETURN_NOT_OK(data.doc_write_batch->ReplaceRedisInList(doc_path, indices, new_value,
         data.read_time, data.deadline, redis_query_id(), Direction::kForward, 0, &value));
   } else {
     indices.push_back(card);
-    RETURN_NOT_OK(data.doc_write_batch->ReplaceInList(doc_path, indices, new_value,
+    RETURN_NOT_OK(data.doc_write_batch->ReplaceRedisInList(doc_path, indices, new_value,
         data.read_time, data.deadline, redis_query_id(), Direction::kBackward, card + 1, &value));
   }
 
@@ -1319,7 +1323,7 @@ Status RedisReadOperation::ExecuteHGetAllLikeCommands(ValueType value_type,
 
   // TODO(dtxn) - pass correct transaction context when we implement cross-shard transactions
   // support for Redis.
-  GetSubDocumentData data = { encoded_doc_key, &doc, &doc_found };
+  GetRedisSubDocumentData data = { encoded_doc_key, &doc, &doc_found };
   data.deadline_info = deadline_info_.get_ptr();
 
   bool has_cardinality_subkey = value_type == ValueType::kRedisSortedSet ||
@@ -1332,7 +1336,7 @@ Status RedisReadOperation::ExecuteHGetAllLikeCommands(ValueType value_type,
     data.count_only = !return_array_response;
   }
 
-  RETURN_NOT_OK(GetSubDocument(iterator_.get(), data, /* projection */ nullptr,
+  RETURN_NOT_OK(GetRedisSubDocument(iterator_.get(), data, /* projection */ nullptr,
                                SeekFwdSuffices::kFalse));
   if (return_array_response)
     response_.set_allocated_array_response(new RedisArrayPB());
@@ -1413,7 +1417,7 @@ Status RedisReadOperation::ExecuteCollectionGetRangeByBounds(
 
     SubDocument doc;
     bool doc_found = false;
-    GetSubDocumentData data = {encoded_doc_key, &doc, &doc_found};
+    GetRedisSubDocumentData data = {encoded_doc_key, &doc, &doc_found};
     data.deadline_info = deadline_info_.get_ptr();
     data.low_subkey = &low_subkey;
     data.high_subkey = &high_subkey;
@@ -1470,7 +1474,7 @@ Status RedisReadOperation::ExecuteCollectionGetRangeByBounds(
 
     SubDocument doc;
     bool doc_found = false;
-    GetSubDocumentData data = {encoded_doc_key, &doc, &doc_found};
+    GetRedisSubDocumentData data = {encoded_doc_key, &doc, &doc_found};
     data.deadline_info = deadline_info_.get_ptr();
     data.low_subkey = &low_subkey;
     data.high_subkey = &high_subkey;
@@ -1560,7 +1564,7 @@ Status RedisReadOperation::ExecuteCollectionGetRange() {
 
       SubDocument doc;
       bool doc_found = false;
-      GetSubDocumentData data = { encoded_doc_key, &doc, &doc_found};
+      GetRedisSubDocumentData data = { encoded_doc_key, &doc, &doc_found};
       data.deadline_info = deadline_info_.get_ptr();
       data.low_index = &low_bound;
       data.high_index = &high_bound;
@@ -1591,6 +1595,33 @@ Result<RedisValue> RedisReadOperation::GetValue(int subkey_index) {
     return GetRedisValue(iterator_.get(), request_.key_value(), subkey_index);
 }
 
+namespace {
+
+// Note: Do not use if also retrieving other value, as some work will be repeated.
+// Assumes every value has a TTL, and the TTL is stored in the row with this key.
+// Also observe that tombstone checking only works because we assume the key has
+// no ancestors.
+Result<boost::optional<Expiration>> GetTtl(
+    const Slice& encoded_subdoc_key, IntentAwareIterator* iter) {
+  auto dockey_size =
+    VERIFY_RESULT(DocKey::EncodedSize(encoded_subdoc_key, DocKeyPart::kWholeDocKey));
+  Slice key_slice(encoded_subdoc_key.data(), dockey_size);
+  iter->Seek(key_slice);
+  if (!iter->valid())
+    return boost::none;
+  auto key_data = VERIFY_RESULT(iter->FetchKey());
+  if (!key_data.key.compare(key_slice)) {
+    Value doc_value = Value(PrimitiveValue(ValueType::kInvalid));
+    RETURN_NOT_OK(doc_value.Decode(iter->value()));
+    if (doc_value.value_type() != ValueType::kTombstone) {
+      return Expiration(key_data.write_time.hybrid_time(), doc_value.ttl());
+    }
+  }
+  return boost::none;
+}
+
+} // namespace
+
 Status RedisReadOperation::ExecuteGetTtl() {
   const RedisKeyValuePB& kv = request_.key_value();
   if (!kv.has_key()) {
@@ -1602,16 +1633,15 @@ Status RedisReadOperation::ExecuteGetTtl() {
                              "Expected no subkeys, got $0", kv.subkey().size());
   }
 
-  bool doc_found = false;
-  Expiration exp;
   auto encoded_doc_key = DocKey::EncodedFromRedisKey(kv.hash_code(), kv.key());
-  RETURN_NOT_OK(GetTtl(encoded_doc_key.AsSlice(), iterator_.get(), &doc_found, &exp));
+  auto maybe_ttl_exp = VERIFY_RESULT(GetTtl(encoded_doc_key.AsSlice(), iterator_.get()));
 
-  if (!doc_found) {
+  if (!maybe_ttl_exp.has_value()) {
     response_.set_int_response(-2);
     return Status::OK();
   }
 
+  auto exp = maybe_ttl_exp.get();
   if (exp.ttl.Equals(Value::kMaxTtl)) {
     response_.set_int_response(-1);
     return Status::OK();
@@ -1733,9 +1763,10 @@ Status RedisReadOperation::ExecuteGet(const RedisGetRequestPB& get_request) {
       SubDocument subdoc_reverse;
       bool subdoc_reverse_found = false;
       auto encoded_key_reverse = key_reverse.EncodeWithoutHt();
-      GetSubDocumentData get_data = { encoded_key_reverse, &subdoc_reverse, &subdoc_reverse_found };
-      RETURN_NOT_OK(GetSubDocument(doc_db_, get_data, redis_query_id(),
-                                   boost::none /* txn_op_context */, deadline_, read_time_));
+      GetRedisSubDocumentData get_data = {
+          encoded_key_reverse, &subdoc_reverse, &subdoc_reverse_found };
+      RETURN_NOT_OK(GetRedisSubDocument(doc_db_, get_data, redis_query_id(),
+                                        boost::none /* txn_op_context */, deadline_, read_time_));
       if (subdoc_reverse_found) {
         double score = subdoc_reverse.GetDouble();
         response_.set_string_response(std::to_string(score));
@@ -1918,11 +1949,11 @@ Status RedisReadOperation::ExecuteKeys() {
       continue;
     }
 
-    GetSubDocumentData data = {key, &result, &doc_found};
+    GetRedisSubDocumentData data = {key, &result, &doc_found};
     data.deadline_info = deadline_info_.get_ptr();
     data.return_type_only = true;
-    RETURN_NOT_OK(GetSubDocument(iterator_.get(), data, /* projection */ nullptr,
-                                 SeekFwdSuffices::kFalse));
+    RETURN_NOT_OK(GetRedisSubDocument(iterator_.get(), data, /* projection */ nullptr,
+                                      SeekFwdSuffices::kFalse));
 
     if (doc_found) {
       if (--threshold < 0) {

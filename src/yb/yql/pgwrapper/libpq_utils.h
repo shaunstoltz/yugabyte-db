@@ -20,6 +20,7 @@
 
 #include "yb/common/common.pb.h"
 
+#include "yb/util/monotime.h"
 #include "yb/util/net/net_util.h"
 #include "yb/util/result.h"
 
@@ -34,7 +35,10 @@ struct PGResultClear {
   void operator()(PGresult* result) const;
 };
 
+typedef std::unique_ptr<PGconn, PGConnClose> PGConnPtr;
 typedef std::unique_ptr<PGresult, PGResultClear> PGResultPtr;
+
+Result<bool> GetBool(PGresult* result, int row, int column);
 
 Result<int32_t> GetInt32(PGresult* result, int row, int column);
 
@@ -62,8 +66,11 @@ Result<T> GetValue(PGresult* result, int row, int column) {
   return GetValueImpl(result, row, column, static_cast<T*>(nullptr));
 }
 
-Result<std::string> AsString(PGresult* result, int row, int column);
+Result<std::string> ToString(PGresult* result, int row, int column);
 void LogResult(PGresult* result);
+
+std::string PqEscapeLiteral(const std::string& input);
+std::string PqEscapeIdentifier(const std::string& input);
 
 class PGConn {
  public:
@@ -72,7 +79,33 @@ class PGConn {
   PGConn(PGConn&& rhs);
   PGConn& operator=(PGConn&& rhs);
 
-  static Result<PGConn> Connect(const HostPort& host_port, const std::string& db_name = "");
+  static Result<PGConn> Connect(
+      const HostPort& host_port,
+      bool simple_query_protocol = false) {
+    return Connect(host_port, "" /* db_name */, simple_query_protocol);
+  }
+  static Result<PGConn> Connect(
+      const HostPort& host_port,
+      const std::string& db_name,
+      bool simple_query_protocol = false) {
+    return Connect(host_port, db_name, "postgres" /* user */, simple_query_protocol);
+  }
+  static Result<PGConn> Connect(
+      const HostPort& host_port,
+      const std::string& db_name,
+      const std::string& user,
+      bool simple_query_protocol = false);
+  static Result<PGConn> Connect(
+      const std::string& conn_str,
+      bool simple_query_protocol = false) {
+    return Connect(conn_str,
+                   CoarseMonoClock::Now() + MonoDelta::FromSeconds(60) /* deadline */,
+                   simple_query_protocol);
+  }
+  static Result<PGConn> Connect(
+      const std::string& conn_str,
+      CoarseTimePoint deadline,
+      bool simple_query_protocol = false);
 
   CHECKED_STATUS Execute(const std::string& command);
 
@@ -101,6 +134,9 @@ class PGConn {
   CHECKED_STATUS CommitTransaction();
   CHECKED_STATUS RollbackTransaction();
 
+  // Would this query use an index [only] scan?
+  Result<bool> HasIndexScan(const std::string& query);
+
   CHECKED_STATUS CopyBegin(const std::string& command);
   Result<PGResultPtr> CopyEnd();
 
@@ -115,16 +151,20 @@ class PGConn {
     CopyPut(value.c_str(), value.length());
   }
 
+  PGconn* get() {
+    return impl_.get();
+  }
+
  private:
-  typedef std::unique_ptr<PGconn, PGConnClose> PGConnPtr;
   struct CopyData;
 
-  explicit PGConn(PGConnPtr ptr);
+  PGConn(PGConnPtr ptr, bool simple_query_protocol);
 
   bool CopyEnsureBuffer(size_t len);
   bool CopyFlushBuffer();
 
   PGConnPtr impl_;
+  bool simple_query_protocol_;
   std::unique_ptr<CopyData> copy_data_;
 };
 

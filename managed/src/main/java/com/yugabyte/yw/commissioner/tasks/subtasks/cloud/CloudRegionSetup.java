@@ -11,12 +11,12 @@
 package com.yugabyte.yw.commissioner.tasks.subtasks.cloud;
 
 import com.fasterxml.jackson.databind.JsonNode;
+import com.fasterxml.jackson.databind.node.ObjectNode;
 import com.yugabyte.yw.commissioner.Common;
 import com.yugabyte.yw.commissioner.tasks.CloudTaskBase;
 import com.yugabyte.yw.commissioner.tasks.CloudBootstrap;
 import com.yugabyte.yw.commissioner.tasks.params.CloudTaskParams;
 import com.yugabyte.yw.common.CloudQueryHelper;
-import com.yugabyte.yw.common.NetworkManager;
 import com.yugabyte.yw.models.AvailabilityZone;
 import com.yugabyte.yw.models.Provider;
 import com.yugabyte.yw.models.Region;
@@ -65,6 +65,7 @@ public class CloudRegionSetup extends CloudTaskBase {
         // Intentional fallthrough as both AWS and GCP should be covered the same way.
         case aws:
         case gcp:
+        case azu:
           // Setup default image, if no custom one was specified.
           String defaultImage = queryHelper.getDefaultImage(region);
           if (defaultImage == null || defaultImage.isEmpty()) {
@@ -100,8 +101,33 @@ public class CloudRegionSetup extends CloudTaskBase {
         zoneSubnets.forEach((zone, subnet) ->
             region.zones.add(AvailabilityZone.create(region, zone, zone, subnet)));
         break;
+      case azu:
+        Map<String, String> zoneNets = taskParams().metadata.azToSubnetIds;
+        String vnet = taskParams().metadata.vpcId;
+        if (vnet == null || vnet.isEmpty()) {
+          vnet = queryHelper.getVnet(region);
+        }
+        region.setVnetName(vnet);
+        if (zoneNets == null || zoneNets.size() == 0) {
+          zoneInfo =  queryHelper.getZones(region.uuid, vnet);
+          if (zoneInfo.has("error") || !zoneInfo.has(regionCode)) {
+            region.delete();
+            String errMsg = "Region Bootstrap failed. Unable to fetch zones for " + regionCode;
+            throw new RuntimeException(errMsg);
+          }
+          zoneNets = Json.fromJson(zoneInfo.get(regionCode), Map.class);
+        }
+        region.zones = new HashSet<>();
+        zoneNets.forEach((zone, subnet) ->
+          region.zones.add(AvailabilityZone.create(region, zone, zone, subnet)));
+        break;
       case gcp:
-        zoneInfo =  queryHelper.getZones(region.uuid, taskParams().destVpcId);
+        ObjectNode customPayload = Json.newObject();
+        ObjectNode perRegionMetadata = Json.newObject();
+        perRegionMetadata.put(regionCode, Json.toJson(taskParams().metadata));
+        customPayload.put("perRegionMetadata", perRegionMetadata);
+        zoneInfo = queryHelper.getZones(
+          region.uuid, taskParams().destVpcId, Json.stringify(customPayload));
         if (zoneInfo.has("error") || !zoneInfo.has(regionCode)) {
           region.delete();
           String errMsg = "Region Bootstrap failed. Unable to fetch zones for " + regionCode;

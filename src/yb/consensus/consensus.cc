@@ -45,6 +45,10 @@ namespace consensus {
 using std::shared_ptr;
 using strings::Substitute;
 
+std::string LeaderElectionData::ToString() const {
+  return YB_STRUCT_TO_STRING(mode, originator_uuid, pending_commit, must_be_committed_opid);
+}
+
 ConsensusBootstrapInfo::ConsensusBootstrapInfo()
   : last_id(MinimumOpId()),
     last_committed_id(MinimumOpId()) {
@@ -71,12 +75,14 @@ void ConsensusRound::NotifyReplicationFinished(
 }
 
 Status ConsensusRound::CheckBoundTerm(int64_t current_term) const {
-  if (PREDICT_FALSE(bound_term_ != kUnboundTerm &&
-                    bound_term_ != current_term)) {
-    return STATUS(Aborted,
-      strings::Substitute(
-        "Operation submitted in term $0 cannot be replicated in term $1",
-        bound_term_, current_term));
+  if (PREDICT_FALSE(bound_term_ != current_term)) {
+    if (bound_term_ == kUnboundTerm) {
+      return STATUS_FORMAT(
+          Aborted, "Attempt to submit operation with unbound term, current term: $0", current_term);
+    }
+    return STATUS_FORMAT(Aborted,
+                         "Operation submitted in term $0 cannot be replicated in term $1",
+                         bound_term_, current_term);
   }
   return Status::OK();
 }

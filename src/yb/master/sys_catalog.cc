@@ -33,6 +33,8 @@
 #include "yb/master/sys_catalog.h"
 
 #include <cmath>
+#include <memory>
+#include <rapidjson/document.h>
 
 #include <gflags/gflags.h>
 #include <glog/logging.h>
@@ -53,27 +55,33 @@
 #include "yb/consensus/quorum_util.h"
 
 #include "yb/docdb/doc_rowwise_iterator.h"
+#include "yb/docdb/docdb_pgapi.h"
 
 #include "yb/fs/fs_manager.h"
+#include "yb/gutil/strings/split.h"
 #include "yb/master/catalog_manager.h"
 #include "yb/master/master.h"
 #include "yb/master/master.pb.h"
+#include "yb/master/sys_catalog_writer.h"
 #include "yb/rpc/rpc_context.h"
-#include "yb/tablet/tablet_bootstrap_if.h"
+#include "yb/tablet/operations/write_operation.h"
 #include "yb/tablet/tablet.h"
+#include "yb/tablet/tablet_bootstrap_if.h"
 #include "yb/tablet/tablet_fwd.h"
 #include "yb/tablet/tablet_options.h"
-#include "yb/tablet/operations/write_operation.h"
 
 #include "yb/tserver/ts_tablet_manager.h"
 
 #include "yb/util/flag_tags.h"
 #include "yb/util/logging.h"
 #include "yb/util/net/dns_resolver.h"
+#include "yb/util/random_util.h"
 #include "yb/util/size_literals.h"
+#include "yb/util/string_util.h"
 #include "yb/util/threadpool.h"
 
 using namespace std::literals; // NOLINT
+using namespace yb::size_literals;
 
 using std::shared_ptr;
 using std::unique_ptr;
@@ -104,12 +112,19 @@ METRIC_DEFINE_histogram(
   yb::MetricUnit::kMicroseconds,
   "Microseconds spent resolving DNS requests during SysCatalogTable::SetupConfig",
   60000000LU, 2);
+METRIC_DEFINE_counter(
+  server, sys_catalog_peer_write_count,
+  "yb.master.SysCatalogTable Count of Writes",
+  yb::MetricUnit::kRequests,
+  "Number of writes to disk handled by the system catalog.");
 
 DECLARE_int32(master_discovery_timeout_ms);
 
-DEFINE_int32(copy_table_batch_size, -1, "Batch size for copy pg sql tables");
-
 DEFINE_int32(sys_catalog_write_timeout_ms, 60000, "Timeout for writes into system catalog");
+DEFINE_int32(copy_tables_batch_bytes, 500_KB, "Max bytes per batch for copy pg sql tables");
+
+DEFINE_test_flag(int32, sys_catalog_write_rejection_percentage, 0,
+  "Reject specified percentage of sys catalog writes.");
 
 namespace yb {
 namespace master {
@@ -122,7 +137,8 @@ std::string SysCatalogTable::schema_column_metadata() { return kSysCatalogTableC
 
 SysCatalogTable::SysCatalogTable(Master* master, MetricRegistry* metrics,
                                  ElectedLeaderCallback leader_cb)
-    : metric_registry_(metrics),
+    : schema_(BuildTableSchema()),
+      metric_registry_(metrics),
       metric_entity_(METRIC_ENTITY_server.Instantiate(metric_registry_, "yb.master")),
       master_(master),
       leader_cb_(std::move(leader_cb)) {
@@ -130,17 +146,25 @@ SysCatalogTable::SysCatalogTable(Master* master, MetricRegistry* metrics,
   CHECK_OK(ThreadPoolBuilder("raft").Build(&raft_pool_));
   CHECK_OK(ThreadPoolBuilder("prepare").set_min_threads(1).Build(&tablet_prepare_pool_));
   CHECK_OK(ThreadPoolBuilder("append").set_min_threads(1).Build(&append_pool_));
+  CHECK_OK(ThreadPoolBuilder("log-alloc").set_min_threads(1).Build(&allocation_pool_));
 
   setup_config_dns_histogram_ = METRIC_dns_resolve_latency_during_sys_catalog_setup.Instantiate(
       metric_entity_);
+  peer_write_count = METRIC_sys_catalog_peer_write_count.Instantiate(metric_entity_);
 }
 
 SysCatalogTable::~SysCatalogTable() {
 }
 
-void SysCatalogTable::Shutdown() {
+void SysCatalogTable::StartShutdown() {
   if (tablet_peer()) {
-    std::atomic_load(&tablet_peer_)->Shutdown();
+    CHECK(std::atomic_load(&tablet_peer_)->StartShutdown());
+  }
+}
+
+void SysCatalogTable::CompleteShutdown() {
+  if (tablet_peer()) {
+    std::atomic_load(&tablet_peer_)->CompleteShutdown();
   }
   inform_removed_master_pool_->Shutdown();
   raft_pool_->Shutdown();
@@ -197,20 +221,19 @@ Status SysCatalogTable::CreateAndFlushConsensusMeta(
 Status SysCatalogTable::Load(FsManager* fs_manager) {
   LOG(INFO) << "Trying to load previous SysCatalogTable data from disk";
   // Load Metadata Information from disk
-  scoped_refptr<tablet::RaftGroupMetadata> metadata;
-  RETURN_NOT_OK(tablet::RaftGroupMetadata::Load(fs_manager, kSysCatalogTabletId, &metadata));
+  auto metadata = VERIFY_RESULT(tablet::RaftGroupMetadata::Load(fs_manager, kSysCatalogTabletId));
 
   // Verify that the schema is the current one
-  if (!metadata->schema().Equals(BuildTableSchema())) {
+  if (!metadata->schema()->Equals(schema_)) {
     // TODO: In this case we probably should execute the migration step.
-    return(STATUS(Corruption, "Unexpected schema", metadata->schema().ToString()));
+    return(STATUS(Corruption, "Unexpected schema", metadata->schema()->ToString()));
   }
 
   // Update partition schema of old SysCatalogTable. SysCatalogTable should be non-partitioned.
-  if (metadata->partition_schema().IsHashPartitioning()) {
+  if (metadata->partition_schema()->IsHashPartitioning()) {
     LOG(INFO) << "Updating partition schema of SysCatalogTable ...";
     PartitionSchema partition_schema;
-    RETURN_NOT_OK(PartitionSchema::FromPB(PartitionSchemaPB(), metadata->schema(),
+    RETURN_NOT_OK(PartitionSchema::FromPB(PartitionSchemaPB(), *metadata->schema(),
                                           &partition_schema));
     metadata->SetPartitionSchema(partition_schema);
     RETURN_NOT_OK(metadata->Flush());
@@ -263,7 +286,6 @@ Status SysCatalogTable::Load(FsManager* fs_manager) {
 Status SysCatalogTable::CreateNew(FsManager *fs_manager) {
   LOG(INFO) << "Creating new SysCatalogTable data";
   // Create the new Metadata
-  scoped_refptr<tablet::RaftGroupMetadata> metadata;
   Schema schema = BuildTableSchema();
   PartitionSchema partition_schema;
   RETURN_NOT_OK(PartitionSchema::FromPB(PartitionSchemaPB(), schema, &partition_schema));
@@ -273,20 +295,16 @@ Status SysCatalogTable::CreateNew(FsManager *fs_manager) {
   RETURN_NOT_OK(partition_schema.CreatePartitions(split_rows, schema, &partitions));
   DCHECK_EQ(1, partitions.size());
 
-  RETURN_NOT_OK(tablet::RaftGroupMetadata::CreateNew(
-    fs_manager,
-    kSysCatalogTableId,
-    kSysCatalogTabletId,
-    table_name(),
-    TableType::YQL_TABLE_TYPE,
-    schema,
-    IndexMap(),
-    partition_schema,
-    partitions[0],
-    boost::none /* index_info */,
-    0 /* schema_version */,
-    tablet::TABLET_DATA_READY,
-    &metadata));
+  auto table_info = std::make_shared<tablet::TableInfo>(
+      kSysCatalogTableId, "", table_name(), TableType::YQL_TABLE_TYPE, schema, IndexMap(),
+      boost::none /* index_info */, 0 /* schema_version */, partition_schema);
+  auto metadata = VERIFY_RESULT(tablet::RaftGroupMetadata::CreateNew(tablet::RaftGroupMetadataData {
+    .fs_manager = fs_manager,
+    .table_info = table_info,
+    .raft_group_id = kSysCatalogTabletId,
+    .partition = partitions[0],
+    .tablet_data_state = tablet::TABLET_DATA_READY,
+  }));
 
   RaftConfigPB config;
   RETURN_NOT_OK_PREPEND(SetupConfig(master_->opts(), &config),
@@ -441,7 +459,8 @@ void SysCatalogTable::SysCatalogStateChanged(
 
 Status SysCatalogTable::GoIntoShellMode() {
   CHECK(tablet_peer());
-  Shutdown();
+  StartShutdown();
+  CompleteShutdown();
 
   // Remove on-disk log, cmeta and tablet superblocks.
   RETURN_NOT_OK(tserver::DeleteTabletData(tablet_peer()->tablet_metadata(),
@@ -465,10 +484,14 @@ void SysCatalogTable::SetupTabletPeer(const scoped_refptr<tablet::RaftGroupMetad
   // TODO: handle crash mid-creation of tablet? do we ever end up with a
   // partially created tablet here?
   auto tablet_peer = std::make_shared<tablet::TabletPeer>(
-      metadata, local_peer_pb_, scoped_refptr<server::Clock>(master_->clock()),
+      metadata,
+      local_peer_pb_,
+      scoped_refptr<server::Clock>(master_->clock()),
       metadata->fs_manager()->uuid(),
       Bind(&SysCatalogTable::SysCatalogStateChanged, Unretained(this), metadata->raft_group_id()),
-      metric_registry_);
+      metric_registry_,
+      nullptr /* tablet_splitter */,
+      master_->async_client_initializer().get_client_future());
 
   std::atomic_store(&tablet_peer_, tablet_peer);
 }
@@ -512,11 +535,13 @@ Status SysCatalogTable::OpenTablet(const scoped_refptr<tablet::RaftGroupMetadata
       .txns_enabled = tablet::TransactionsEnabled(!FLAGS_create_initial_sys_catalog_snapshot),
       .is_sys_catalog = tablet::IsSysCatalogTablet::kTrue,
       .snapshot_coordinator = &master_->catalog_manager()->snapshot_coordinator(),
+      .tablet_splitter = nullptr,
   };
   tablet::BootstrapTabletData data = {
       .tablet_init_data = tablet_init_data,
       .listener = tablet_peer()->status_listener(),
       .append_pool = append_pool(),
+      .allocation_pool = allocation_pool_.get(),
       .retryable_requests = nullptr,
   };
   RETURN_NOT_OK(BootstrapTablet(data, &tablet, &log, &consensus_info));
@@ -524,9 +549,9 @@ Status SysCatalogTable::OpenTablet(const scoped_refptr<tablet::RaftGroupMetadata
   // TODO: Do we have a setSplittable(false) or something from the outside is
   // handling split in the TS?
 
-  RETURN_NOT_OK_PREPEND(tablet_peer()->InitTabletPeer(
+  RETURN_NOT_OK_PREPEND(
+      tablet_peer()->InitTabletPeer(
           tablet,
-          master_->async_client_initializer().get_client_future(),
           master_->mem_tracker(),
           master_->messenger(),
           &master_->proxy_cache(),
@@ -534,7 +559,8 @@ Status SysCatalogTable::OpenTablet(const scoped_refptr<tablet::RaftGroupMetadata
           tablet->GetMetricEntity(),
           raft_pool(),
           tablet_prepare_pool(),
-          nullptr /* retryable_requests */),
+          nullptr /* retryable_requests */,
+          consensus::SplitOpInfo()),
       "Failed to Init() TabletPeer");
 
   RETURN_NOT_OK_PREPEND(tablet_peer()->Start(consensus_info),
@@ -542,9 +568,9 @@ Status SysCatalogTable::OpenTablet(const scoped_refptr<tablet::RaftGroupMetadata
 
   tablet_peer()->RegisterMaintenanceOps(master_->maintenance_manager());
 
-  const Schema* schema = tablet->schema();
-  schema_ = SchemaBuilder(*schema).BuildWithoutIds();
-  schema_with_ids_ = SchemaBuilder(*schema).Build();
+  if (!tablet->schema()->Equals(schema_)) {
+    return STATUS(Corruption, "Unexpected schema", tablet->schema()->ToString());
+  }
   return Status::OK();
 }
 
@@ -577,6 +603,11 @@ Status SysCatalogTable::WaitUntilRunning() {
 }
 
 CHECKED_STATUS SysCatalogTable::SyncWrite(SysCatalogWriter* writer) {
+  if (PREDICT_FALSE(FLAGS_TEST_sys_catalog_write_rejection_percentage > 0) &&
+      RandomUniformInt(1, 99) <= FLAGS_TEST_sys_catalog_write_rejection_percentage) {
+    return STATUS(InternalError, "Injected random failure for testing.");
+  }
+
   auto resp = std::make_shared<tserver::WriteResponsePB>();
   // If this is a PG write, them the pgsql write batch is not empty.
   //
@@ -595,6 +626,7 @@ CHECKED_STATUS SysCatalogTable::SyncWrite(SysCatalogWriter* writer) {
 
   tablet_peer()->WriteAsync(
       std::move(operation_state), writer->leader_term(), CoarseTimePoint::max() /* deadline */);
+  peer_write_count->Increment();
 
   {
     int num_iterations = 0;
@@ -663,66 +695,351 @@ void SysCatalogTable::InitLocalRaftPeerPB() {
 Status SysCatalogTable::Visit(VisitorBase* visitor) {
   TRACE_EVENT0("master", "Visitor::VisitAll");
 
-  const int8_t tables_entry = visitor->entry_type();
-  const int type_col_idx = schema_.find_column(kSysCatalogTableColType);
-  const int entry_id_col_idx = schema_.find_column(kSysCatalogTableColId);
-  const int metadata_col_idx = schema_.find_column(kSysCatalogTableColMetadata);
-  CHECK(type_col_idx != Schema::kColumnNotFound);
-
   auto tablet = tablet_peer()->shared_tablet();
   if (!tablet) {
     return STATUS(ShutdownInProgress, "SysConfig is shutting down.");
   }
-  auto iter = tablet->NewRowIterator(schema_, boost::none);
-  RETURN_NOT_OK(iter);
 
-  auto doc_iter = dynamic_cast<yb::docdb::DocRowwiseIterator*>(iter->get());
-  CHECK(doc_iter != nullptr);
-  QLConditionPB cond;
-  cond.set_op(QL_OP_AND);
-  QLAddInt8Condition(&cond, schema_with_ids_.column_id(type_col_idx), QL_OP_EQUAL, tables_entry);
-  yb::docdb::DocQLScanSpec spec(
-      schema_with_ids_, boost::none /* hash_code */, boost::none /* max_hash_code */,
-      {} /* hashed_components */, &cond, nullptr /* if_req */, rocksdb::kDefaultQueryId);
-  RETURN_NOT_OK(doc_iter->Init(spec));
-
-  QLTableRow value_map;
-  QLValue entry_type, entry_id, metadata;
-  uint64_t count = 0;
   auto start = CoarseMonoClock::Now();
-  while (VERIFY_RESULT((**iter).HasNext())) {
+
+  uint64_t count = 0;
+  RETURN_NOT_OK(EnumerateSysCatalog(tablet.get(), schema_, visitor->entry_type(),
+                                    [visitor, &count](const Slice& id, const Slice& data) {
     ++count;
-    RETURN_NOT_OK((**iter).NextRow(&value_map));
-    RETURN_NOT_OK(value_map.GetValue(schema_with_ids_.column_id(type_col_idx), &entry_type));
-    CHECK_EQ(entry_type.int8_value(), tables_entry);
-    RETURN_NOT_OK(value_map.GetValue(schema_with_ids_.column_id(entry_id_col_idx), &entry_id));
-    RETURN_NOT_OK(value_map.GetValue(schema_with_ids_.column_id(metadata_col_idx), &metadata));
-    RETURN_NOT_OK(visitor->Visit(entry_id.binary_value(), metadata.binary_value()));
-  }
+    return visitor->Visit(id, data);
+  }));
+
   auto duration = CoarseMonoClock::Now() - start;
-  string id = Format("num_entries_with_type_$0_loaded", std::to_string(tables_entry));
+  string id = Format("num_entries_with_type_$0_loaded", std::to_string(visitor->entry_type()));
   if (visitor_duration_metrics_.find(id) == visitor_duration_metrics_.end()) {
     string description = id + " metric for SysCatalogTable::Visit";
     std::unique_ptr<GaugePrototype<uint64>> counter_gauge =
         std::make_unique<OwningGaugePrototype<uint64>>(
             "server", id, description, yb::MetricUnit::kEntries, description,
-            yb::EXPOSE_AS_COUNTER);
+            yb::MetricLevel::kInfo, yb::EXPOSE_AS_COUNTER);
     visitor_duration_metrics_[id] = metric_entity_->FindOrCreateGauge(
         std::move(counter_gauge), static_cast<uint64>(0) /* initial_value */);
   }
   visitor_duration_metrics_[id]->IncrementBy(count);
 
-  id = Format("duration_ms_loading_entries_with_type_$0", std::to_string(tables_entry));
+  id = Format("duration_ms_loading_entries_with_type_$0", std::to_string(visitor->entry_type()));
   if (visitor_duration_metrics_.find(id) == visitor_duration_metrics_.end()) {
     string description = id + " metric for SysCatalogTable::Visit";
     std::unique_ptr<GaugePrototype<uint64>> duration_gauge =
         std::make_unique<OwningGaugePrototype<uint64>>(
-            "server", id, description, yb::MetricUnit::kMilliseconds, description);
+            "server", id, description, yb::MetricUnit::kMilliseconds, description,
+            yb::MetricLevel::kInfo);
     visitor_duration_metrics_[id] = metric_entity_->FindOrCreateGauge(
         std::move(duration_gauge), static_cast<uint64>(0) /* initial_value */);
   }
   visitor_duration_metrics_[id]->IncrementBy(ToMilliseconds(duration));
   return Status::OK();
+}
+
+Status SysCatalogTable::ReadYsqlCatalogVersion(TableId ysql_catalog_table_id,
+                                               uint64_t *catalog_version,
+                                               uint64_t *last_breaking_version) {
+  TRACE_EVENT0("master", "ReadYsqlCatalogVersion");
+  const auto* tablet = tablet_peer()->tablet();
+  const auto* meta = tablet->metadata();
+  const std::shared_ptr<tablet::TableInfo> ysql_catalog_table_info =
+      VERIFY_RESULT(meta->GetTableInfo(ysql_catalog_table_id));
+  const Schema& schema = ysql_catalog_table_info->schema;
+  auto iter = VERIFY_RESULT(tablet->NewRowIterator(schema.CopyWithoutColumnIds(),
+                                                   boost::none /* transaction_id */,
+                                                   {} /* read_hybrid_time */,
+                                                   ysql_catalog_table_id));
+  QLTableRow source_row;
+  ColumnId version_col_id = VERIFY_RESULT(schema.ColumnIdByName("current_version"));
+  ColumnId last_breaking_version_col_id =
+      VERIFY_RESULT(schema.ColumnIdByName("last_breaking_version"));
+
+  if (VERIFY_RESULT(iter->HasNext())) {
+    RETURN_NOT_OK(iter->NextRow(&source_row));
+    if (catalog_version) {
+      auto version_col_value = source_row.GetValue(version_col_id);
+      if (version_col_value) {
+        *catalog_version = version_col_value->int64_value();
+      } else {
+        return STATUS(Corruption, "Could not read syscatalog version");
+      }
+    }
+    // last_breaking_version is the last version (change) that invalidated ongoing transactions.
+    if (last_breaking_version) {
+      auto last_breaking_version_col_value = source_row.GetValue(last_breaking_version_col_id);
+      if (last_breaking_version_col_value) {
+        *last_breaking_version = last_breaking_version_col_value->int64_value();
+      } else {
+        return STATUS(Corruption, "Could not read syscatalog version");
+      }
+    }
+  } else {
+    // If no row it means version is 0 (not initialized yet).
+    if (catalog_version) {
+      *catalog_version = 0;
+    }
+    if (last_breaking_version) {
+      *last_breaking_version = 0;
+    }
+  }
+
+  return Status::OK();
+}
+
+Result<shared_ptr<TablespaceIdToReplicationInfoMap>> SysCatalogTable::ReadPgTablespaceInfo() {
+  TRACE_EVENT0("master", "ReadPgTablespaceInfo");
+
+  const auto* tablet = tablet_peer()->tablet();
+
+  const auto& pg_tablespace_info =
+      VERIFY_RESULT(tablet->metadata()->GetTableInfo(kPgTablespaceTableId));
+  const Schema& schema = pg_tablespace_info->schema;
+  auto iter = VERIFY_RESULT(tablet->NewRowIterator(schema.CopyWithoutColumnIds(),
+                                                   boost::none /* transaction_id */,
+                                                   {} /* read_hybrid_time */,
+                                                   kPgTablespaceTableId));
+  QLTableRow source_row;
+  ColumnId oid_col_id = VERIFY_RESULT(schema.ColumnIdByName("oid"));
+  ColumnId options_id =
+      VERIFY_RESULT(schema.ColumnIdByName("spcoptions"));
+
+  // Loop through the pg_tablespace catalog table. Each row in this table represents
+  // a tablespace. Populate 'tablespace_map' with the tablespace id and corresponding
+  // placement info for each tablespace encountered in this catalog table.
+  auto tablespace_map = std::make_shared<TablespaceIdToReplicationInfoMap>();
+  while (VERIFY_RESULT(iter->HasNext())) {
+    RETURN_NOT_OK(iter->NextRow(&source_row));
+    // Fetch the oid.
+    auto oid = source_row.GetValue(oid_col_id);
+    if (!oid) {
+      return STATUS(Corruption, "Could not read oid column from pg_tablespace");
+    }
+
+    // Get the tablespace id.
+    const TablespaceId tablespace_id = GetPgsqlTablespaceId(oid->uint32_value());
+
+    // Fetch the options specified for the tablespace.
+    const auto& options = source_row.GetValue(options_id);
+    if (!options) {
+      return STATUS(Corruption, "Could not read spcoptions column from pg_tablespace");
+    }
+
+    VLOG(2) << "Tablespace " << tablespace_id << " -> " << options.value().DebugString();
+
+    // If no spcoptions found, then this tablespace has no placement info
+    // associated with it. Tables associated with this tablespace will not
+    // have any custom placement policy.
+    if (options->binary_value().empty()) {
+      // Storing boost::none lets the client know that the tables associated with
+      // this tablespace will not have any custom placement policy for them.
+      const auto& ret = tablespace_map->emplace(tablespace_id, boost::none);
+      // This map should not have already had an element associated with this
+      // tablespace.
+      DCHECK(ret.second);
+      continue;
+    }
+
+    // Parse the reloptions array associated with this tablespace and construct
+    // the ReplicationInfoPB. The ql_value is just the raw value read from the pg_tablespace
+    // catalog table. This was stored in postgres as a text array, but processed by DocDB as
+    // a binary value. So first process this binary value and convert it to text array of options.
+    vector<QLValuePB> placement_options;
+    RETURN_NOT_OK(yb::docdb::ExtractTextArrayFromQLBinaryValue(
+          options.value(), &placement_options));
+
+    // Fetch the status and print the tablespace option along with the status.
+    const auto& replication_info = VERIFY_RESULT(ParseReplicationInfo(
+          tablespace_id, placement_options));
+    const auto& ret = tablespace_map->emplace(tablespace_id, replication_info);
+    // This map should not have already had an element associated with this
+    // tablespace.
+    DCHECK(ret.second);
+  }
+
+  return tablespace_map;
+}
+
+Status SysCatalogTable::ReadPgClassInfo(
+    const uint32_t database_oid,
+    TableToTablespaceIdMap *const table_to_tablespace_map) {
+
+  TRACE_EVENT0("master", "ReadPgClass");
+
+  if (!table_to_tablespace_map) {
+    return STATUS(InternalError, "table_to_tablespace_map not initialized");
+  }
+
+  const auto* tablet = tablet_peer()->tablet();
+
+  const auto& pg_table_id = GetPgsqlTableId(database_oid, kPgClassTableOid);
+  const auto& table_info = VERIFY_RESULT(
+      tablet->metadata()->GetTableInfo(pg_table_id));
+  const Schema& schema = table_info->schema;
+
+  Schema projection;
+  RETURN_NOT_OK(schema.CreateProjectionByNames({"oid", "reltablespace", "relkind"}, &projection,
+                schema.num_key_columns()));
+  const auto oid_col_id = VERIFY_RESULT(projection.ColumnIdByName("oid")).rep();
+  const auto relkind_col_id = VERIFY_RESULT(projection.ColumnIdByName("relkind")).rep();
+  const auto tablespace_col_id = VERIFY_RESULT(projection.ColumnIdByName("reltablespace")).rep();
+  auto iter = VERIFY_RESULT(tablet->NewRowIterator(
+    projection.CopyWithoutColumnIds(), boost::none /* transaction_id */,
+    {} /* read_hybrid_time */, pg_table_id));
+
+  QLTableRow row;
+  // Pg_class table contains a row for every database object (tables/indexes/
+  // composite types etc). Each such row contains a lot of information about the
+  // database object itself. But here, we are trying to fetch table->tablespace
+  // information. We iterate through every row in the catalog table and try to build
+  // the table/index->placement info.
+  while (VERIFY_RESULT(iter->HasNext())) {
+    RETURN_NOT_OK(iter->NextRow(&row));
+
+    // First process the oid of the object corresponding to the current row.
+    const auto& oid_col = row.GetValue(oid_col_id);
+    if (!oid_col) {
+      return STATUS(Corruption, "Could not read oid column from pg_class");
+    }
+
+    const uint32_t oid = oid_col->uint32_value();
+    if (oid < kPgFirstNormalObjectId) {
+      // This is some system level object. We are interested only in user created
+      // tables and indexes whose oids are always higher than kPgFirstNormalObjectId.
+      // Skip this row and move onto the next row in pg_class table.
+      continue;
+    }
+
+    // Now look at the relkind of the database object.
+    const auto& relkind_col = row.GetValue(relkind_col_id);
+    if (!relkind_col) {
+      return STATUS(Corruption, "Could not read relkind column from pg_class for oid " +
+          std::to_string(oid));
+    }
+
+    const char relkind = relkind_col->int8_value();
+    // From PostgreSQL docs: r = ordinary table, i = index, S = sequence, t = TOAST table,
+    // v = view, m = materialized view, c = composite type, f = foreign table,
+    // p = partitioned table, I = partitioned index
+    if (relkind != 'r' && relkind != 'i' && relkind != 'p' && relkind != 'I') {
+      // This database object is not a table/index/partitioned table/partitioned index.
+      // Skip this.
+      continue;
+    }
+
+    // Now process the tablespace oid for this database object.
+    const auto& tablespace_oid_col = row.GetValue(tablespace_col_id);
+    if (!tablespace_oid_col) {
+      return STATUS(Corruption, "Could not read tablespace column from pg_class");
+    }
+
+    const uint32 tablespace_oid = tablespace_oid_col->uint32_value();
+    VLOG(5) << "Table oid: " << oid << " Tablespace oid: " << tablespace_oid;
+
+    boost::optional<TablespaceId> tablespace_id = boost::none;
+    // If the tablespace oid is kInvalidOid then it means this table was created
+    // without a custom tablespace and its properties just default to cluster level
+    // policies.
+    if (tablespace_oid != kInvalidOid) {
+      tablespace_id = GetPgsqlTablespaceId(tablespace_oid);
+    }
+    const auto& ret = table_to_tablespace_map->emplace(
+        GetPgsqlTableId(database_oid, oid), tablespace_id);
+    // The map should not have a duplicate entry with the same oid.
+    DCHECK(ret.second);
+  }
+  return Status::OK();
+
+}
+
+Result<boost::optional<ReplicationInfoPB>> SysCatalogTable::ParseReplicationInfo(
+  const TablespaceId& tablespace_id,
+  const vector<QLValuePB>& options) {
+
+  // Today only one option is supported, so this array should have only one option.
+  if (options.size() != 1) {
+    return STATUS(Corruption, "Unexpected number of options: " + std::to_string(options.size()) +
+        " for tablespace with ID:" + tablespace_id);
+  }
+
+  const string& option = options[0].string_value();
+  // The only option supported today is "replica_placement" that allows specification
+  // of placement policies encoded as a JSON array. Example value:
+  // replica_placement=
+  //   '{"num_replicas":3, "placement_blocks": [
+  //         {"cloud":"c1", "region":"r1", "zone":"z1", "min_num_replicas":1},
+  //         {"cloud":"c2", "region":"r2", "zone":"z2", "min_num_replicas":1},
+  //         {"cloud":"c3", "region":"r3", "zone":"z3", "min_num_replicas":1}]}'
+  if (option.find("replica_placement") == string::npos) {
+    return STATUS(Corruption, "Invalid option found in spcoptions for tablespace with ID:" +
+        tablespace_id);
+  }
+
+  // First split the string and get only the json value in a string.
+  vector<string> split;
+  split = strings::Split(option, "replica_placement=", strings::SkipEmpty());
+  if (split.size() != 1) {
+    return STATUS(Corruption, "replica_placement option illformed: " + option +
+        " for tablespace with ID:" + tablespace_id);
+  }
+
+  const string& placement_info = split[0];
+  rapidjson::Document document;
+  if (document.Parse(placement_info.c_str()).HasParseError() || !document.IsObject()) {
+    return STATUS(Corruption, "Json parsing of replica placement option failed: " +
+          placement_info + " for tablespace with ID:" + tablespace_id);
+  }
+
+  if (!document.HasMember("num_replicas") || !document["num_replicas"].IsInt()) {
+    return STATUS(Corruption, "Invalid value found for \"num_replicas\" field in the placement "
+            "policy for tablespace with ID:" + tablespace_id + " Placement policy: " +
+            placement_info);
+  }
+  const int num_replicas = document["num_replicas"].GetInt();
+
+  // Parse the placement blocks.
+  if (!document.HasMember("placement_blocks") || !document["placement_blocks"].IsArray()) {
+    return STATUS(Corruption, "\"placement_blocks\" field not found in the placement "
+              "policy for tablespace with ID:" + tablespace_id + " Placement policy: " +
+              placement_info);
+  }
+
+  const rapidjson::Value& pb = document["placement_blocks"];
+  if (pb.Size() < 1) {
+    return STATUS(Corruption, "\"placement_blocks\" field has empty value in the placement "
+                "policy for tablespace with ID:" + tablespace_id + " Placement policy: " +
+                placement_info);
+  }
+
+  ReplicationInfoPB replication_info_pb;
+  master::PlacementInfoPB* live_replicas = replication_info_pb.mutable_live_replicas();
+  int64 total_min_replicas = 0;
+  for (int64 ii = 0; ii < pb.Size(); ++ii) {
+    const rapidjson::Value& placement = pb[ii];
+    auto pb = live_replicas->add_placement_blocks();
+    if (!placement.HasMember("cloud") || !placement.HasMember("region") ||
+        !placement.HasMember("zone") || !placement.HasMember("min_num_replicas")) {
+      return STATUS(Corruption, "Missing keys in replica placement option: " +
+          placement_info + " for tablespace with ID:" + tablespace_id);
+    }
+    if (!placement["cloud"].IsString() || !placement["region"].IsString() ||
+        !placement["zone"].IsString() || !placement["min_num_replicas"].IsInt()) {
+      return STATUS(Corruption, "Invalid value for replica_placement option: " +
+          placement_info + " for tablespace with ID:" + tablespace_id);
+    }
+    pb->mutable_cloud_info()->set_placement_cloud(placement["cloud"].GetString());
+    pb->mutable_cloud_info()->set_placement_region(placement["region"].GetString());
+    pb->mutable_cloud_info()->set_placement_zone(placement["zone"].GetString());
+    const int min_rf = placement["min_num_replicas"].GetInt();
+    pb->set_min_num_replicas(min_rf);
+    total_min_replicas += min_rf;
+  }
+  if (total_min_replicas > num_replicas) {
+    return STATUS(Corruption, "Sum of min_num_replicas fields exceeds the total replication factor "
+                  "in the placement policy for tablespace with ID:" + tablespace_id +
+                  " Placement policy: " + placement_info);
+  }
+  live_replicas->set_num_replicas(num_replicas);
+  return replication_info_pb;
 }
 
 Status SysCatalogTable::CopyPgsqlTables(
@@ -732,7 +1049,7 @@ Status SysCatalogTable::CopyPgsqlTables(
 
   std::unique_ptr<SysCatalogWriter> writer = NewWriter(leader_term);
 
-  DSCHECK_EQ(
+  RSTATUS_DCHECK_EQ(
       source_table_ids.size(), target_table_ids.size(), InvalidArgument,
       "size mismatch between source tables and target tables");
 
@@ -743,9 +1060,10 @@ Status SysCatalogTable::CopyPgsqlTables(
 
     const auto* tablet = tablet_peer()->tablet();
     const auto* meta = tablet->metadata();
-    const tablet::TableInfo* source_table_info = VERIFY_RESULT(meta->GetTableInfo(source_table_id));
-    const tablet::TableInfo* target_table_info = VERIFY_RESULT(meta->GetTableInfo(target_table_id));
-
+    const std::shared_ptr<tablet::TableInfo> source_table_info =
+        VERIFY_RESULT(meta->GetTableInfo(source_table_id));
+    const std::shared_ptr<tablet::TableInfo> target_table_info =
+        VERIFY_RESULT(meta->GetTableInfo(target_table_id));
     const Schema source_projection = source_table_info->schema.CopyWithoutColumnIds();
     std::unique_ptr<common::YQLRowwiseIteratorIf> iter = VERIFY_RESULT(
         tablet->NewRowIterator(source_projection, boost::none, {}, source_table_id));
@@ -758,33 +1076,41 @@ Status SysCatalogTable::CopyPgsqlTables(
           source_table_info->schema, source_row, target_table_id, target_table_info->schema,
           target_table_info->schema_version, true /* is_upsert */));
 
-      if (FLAGS_copy_table_batch_size > 0 &&
-          writer->req().pgsql_write_batch_size() >= FLAGS_copy_table_batch_size) {
-        RETURN_NOT_OK(SyncWrite(writer.get()));
+      ++total_count;
+      if (FLAGS_copy_tables_batch_bytes > 0 && 0 == (total_count % 128)) {
+          // Break up the write into batches of roughly the same serialized size
+          // in order to avoid uncontrolled large network writes.
+          // ByteSizeLong is an expensive calculation so do not perform it each time
 
-        total_bytes += writer->req().SpaceUsedLong();
-        total_count += writer->req().pgsql_write_batch_size();
-        ++batch_count;
-        LOG(INFO) << Format("CopyPgsqlTables: Batch# $0 copied $1 rows with $2 bytes",
-          batch_count, writer->req().pgsql_write_batch_size(), writer->req().SpaceUsedLong());
+        size_t batch_bytes = writer->req().ByteSizeLong();
+        if (batch_bytes > FLAGS_copy_tables_batch_bytes) {
+          RETURN_NOT_OK(SyncWrite(writer.get()));
 
-        writer = NewWriter(leader_term);
+          total_bytes += batch_bytes;
+          ++batch_count;
+          LOG(INFO) << Format(
+              "CopyPgsqlTables: Batch# $0 copied $1 rows with $2 bytes", batch_count,
+              writer->req().pgsql_write_batch_size(), HumanizeBytes(batch_bytes));
+
+          writer = NewWriter(leader_term);
+        }
       }
     }
   }
 
   if (writer->req().pgsql_write_batch_size() > 0) {
     RETURN_NOT_OK(SyncWrite(writer.get()));
-
-    total_bytes += writer->req().SpaceUsedLong();
-    total_count += writer->req().pgsql_write_batch_size();
+    size_t batch_bytes = writer->req().ByteSizeLong();
+    total_bytes += batch_bytes;
     ++batch_count;
-    LOG(INFO) << Format("CopyPgsqlTables: Batch# $0 copied $1 rows with $2 bytes",
-      batch_count, writer->req().pgsql_write_batch_size(), writer->req().SpaceUsedLong());
+    LOG(INFO) << Format(
+        "CopyPgsqlTables: Batch# $0 copied $1 rows with $2 bytes", batch_count,
+        writer->req().pgsql_write_batch_size(), HumanizeBytes(batch_bytes));
   }
 
-  LOG(INFO) << Format("CopyPgsqlTables: Copied total $0 rows, total $1 bytes in $2 batches",
-    total_count, total_bytes, batch_count);
+  LOG(INFO) << Format(
+      "CopyPgsqlTables: Copied total $0 rows, total $1 bytes in $2 batches", total_count,
+      HumanizeBytes(total_bytes), batch_count);
   return Status::OK();
 }
 
@@ -793,8 +1119,8 @@ Status SysCatalogTable::DeleteYsqlSystemTable(const string& table_id) {
   return Status::OK();
 }
 
-Result<ColumnId> SysCatalogTable::MetadataColumnId() {
-  return schema_with_ids_.ColumnIdByName(kSysCatalogTableColMetadata);
+const Schema& SysCatalogTable::schema() {
+  return schema_;
 }
 
 } // namespace master

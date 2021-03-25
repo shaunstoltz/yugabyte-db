@@ -10,6 +10,7 @@ import com.fasterxml.jackson.databind.node.ObjectNode;
 import com.yugabyte.yw.commissioner.Common;
 import com.yugabyte.yw.common.AccessManager;
 import com.yugabyte.yw.common.FakeApiHelper;
+import com.yugabyte.yw.common.FakeDBApplication;
 import com.yugabyte.yw.common.ModelFactory;
 import com.yugabyte.yw.common.TemplateManager;
 import com.yugabyte.yw.common.TestHelper;
@@ -66,24 +67,13 @@ import static play.mvc.Http.Status.BAD_REQUEST;
 import static play.mvc.Http.Status.OK;
 import static play.test.Helpers.contentAsString;
 
-public class AccessKeyControllerTest extends WithApplication {
+public class AccessKeyControllerTest extends FakeDBApplication {
   Provider defaultProvider;
   Customer defaultCustomer;
   Users defaultUser;
   Region defaultRegion;
-  AccessManager mockAccessManager;
-  TemplateManager mockTemplateManager;
 
-  @Override
-  protected Application provideApplication() {
-    mockAccessManager = mock(AccessManager.class);
-    mockTemplateManager = mock(TemplateManager.class);
-    return new GuiceApplicationBuilder()
-        .configure((Map) Helpers.inMemoryDatabase())
-        .overrides(bind(AccessManager.class).toInstance(mockAccessManager))
-        .overrides(bind(TemplateManager.class).toInstance(mockTemplateManager))
-        .build();
-  }
+  final static Integer SSH_PORT = 12345;
 
   @Before
   public void before() {
@@ -114,11 +104,13 @@ public class AccessKeyControllerTest extends WithApplication {
 
   private Result createAccessKey(UUID providerUUID, String keyCode, boolean uploadFile,
                                  boolean useRawString) {
-    return createAccessKey(providerUUID, keyCode, uploadFile, useRawString, defaultRegion, true, true);
+    return createAccessKey(
+      providerUUID, keyCode, uploadFile, useRawString, defaultRegion, true, true, false);
   }
 
-  private Result createAccessKey(UUID providerUUID, String keyCode, boolean uploadFile, boolean useRawString,
-                                 Region region, boolean airGapInstall, boolean passwordlessSudoAccess) {
+  private Result createAccessKey(UUID providerUUID, String keyCode, boolean uploadFile,
+                                 boolean useRawString, Region region, boolean airGapInstall,
+                                 boolean passwordlessSudoAccess, boolean skipProvisioning) {
     String uri = "/api/customers/" + defaultCustomer.uuid + "/providers/" + providerUUID + "/access_keys";
 
     if (uploadFile) {
@@ -128,6 +120,8 @@ public class AccessKeyControllerTest extends WithApplication {
         bodyData.add(new Http.MultipartFormData.DataPart("regionUUID", region.uuid.toString()));
         bodyData.add(new Http.MultipartFormData.DataPart("keyType", "PRIVATE"));
         bodyData.add(new Http.MultipartFormData.DataPart("sshUser", "ssh-user"));
+        bodyData.add(new Http.MultipartFormData.DataPart("sshPort", SSH_PORT.toString()));
+        bodyData.add(new Http.MultipartFormData.DataPart("airGapInstall", "false"));
         String tmpFile = createTempFile("PRIVATE KEY DATA");
         Source<ByteString, ?> keyFile = FileIO.fromFile(new File(tmpFile));
         bodyData.add(new Http.MultipartFormData.FilePart("keyFile", "test.pem",
@@ -149,7 +143,9 @@ public class AccessKeyControllerTest extends WithApplication {
         bodyJson.put("keyContent", "PRIVATE KEY DATA");
       }
       bodyJson.put("airGapInstall", airGapInstall);
+      bodyJson.put("sshPort", SSH_PORT);
       bodyJson.put("passwordlessSudoAccess", passwordlessSudoAccess);
+      bodyJson.put("skipProvisioning", skipProvisioning);
       return FakeApiHelper.doRequestWithAuthTokenAndBody("POST", uri,
           defaultUser.createAuthToken(), bodyJson);
     }
@@ -249,7 +245,8 @@ public class AccessKeyControllerTest extends WithApplication {
   @Test
   public void testCreateAccessKeyInDifferentRegion() {
     AccessKey accessKey = AccessKey.create(defaultProvider.uuid, "key-code", new AccessKey.KeyInfo());
-    when(mockAccessManager.addKey(defaultRegion.uuid, "key-code")).thenReturn(accessKey);
+    when(mockAccessManager.addKey(defaultRegion.uuid, "key-code", SSH_PORT, true, false))
+        .thenReturn(accessKey);
     Result result = createAccessKey(defaultProvider.uuid, "key-code", false, false);
     JsonNode json = Json.parse(contentAsString(result));
     assertOk(result);
@@ -261,7 +258,8 @@ public class AccessKeyControllerTest extends WithApplication {
   @Test
   public void testCreateAccessKeyWithoutKeyFile() {
     AccessKey accessKey = AccessKey.create(defaultProvider.uuid, "key-code-1", new AccessKey.KeyInfo());
-    when(mockAccessManager.addKey(defaultRegion.uuid, "key-code-1")).thenReturn(accessKey);
+    when(mockAccessManager.addKey(defaultRegion.uuid, "key-code-1", SSH_PORT, true, false))
+        .thenReturn(accessKey);
     Result result = createAccessKey(defaultProvider.uuid, "key-code-1", false, false);
     JsonNode json = Json.parse(contentAsString(result));
     assertOk(result);
@@ -278,10 +276,12 @@ public class AccessKeyControllerTest extends WithApplication {
     AccessKey accessKey = AccessKey.create(defaultProvider.uuid, "key-code-1", keyInfo);
     ArgumentCaptor<File> updatedFile = ArgumentCaptor.forClass(File.class);
     when(mockAccessManager.uploadKeyFile(eq(defaultRegion.uuid), any(File.class),
-        eq("key-code-1"), eq(AccessManager.KeyType.PRIVATE), eq("ssh-user"))).thenReturn(accessKey);
+        eq("key-code-1"), eq(AccessManager.KeyType.PRIVATE), eq("ssh-user"), eq(SSH_PORT),
+        eq(false), eq(false))).thenReturn(accessKey);
     Result result = createAccessKey(defaultProvider.uuid, "key-code-1", true, false);
     verify(mockAccessManager, times(1)).uploadKeyFile(eq(defaultRegion.uuid),
-        updatedFile.capture(), eq("key-code-1"), eq(AccessManager.KeyType.PRIVATE), eq("ssh-user"));
+        updatedFile.capture(), eq("key-code-1"), eq(AccessManager.KeyType.PRIVATE), eq("ssh-user"),
+        eq(SSH_PORT), eq(false), eq(false));
     JsonNode json = Json.parse(contentAsString(result));
     assertOk(result);
     assertAuditEntry(1, defaultCustomer.uuid);
@@ -303,10 +303,12 @@ public class AccessKeyControllerTest extends WithApplication {
     AccessKey accessKey = AccessKey.create(defaultProvider.uuid, "key-code-1", keyInfo);
     ArgumentCaptor<File> updatedFile = ArgumentCaptor.forClass(File.class);
     when(mockAccessManager.uploadKeyFile(eq(defaultRegion.uuid), any(File.class),
-        eq("key-code-1"), eq(AccessManager.KeyType.PRIVATE), eq(null))).thenReturn(accessKey);
+        eq("key-code-1"), eq(AccessManager.KeyType.PRIVATE), eq(null), eq(SSH_PORT),
+        eq(true), eq(false))).thenReturn(accessKey);
     Result result = createAccessKey(defaultProvider.uuid, "key-code-1", false, true);
     verify(mockAccessManager, times(1)).uploadKeyFile(eq(defaultRegion.uuid),
-        updatedFile.capture(), eq("key-code-1"), eq(AccessManager.KeyType.PRIVATE), eq(null));
+        updatedFile.capture(), eq("key-code-1"), eq(AccessManager.KeyType.PRIVATE), eq(null),
+        eq(SSH_PORT), eq(true), eq(false));
     JsonNode json = Json.parse(contentAsString(result));
     assertOk(result);
     assertAuditEntry(1, defaultCustomer.uuid);
@@ -322,7 +324,7 @@ public class AccessKeyControllerTest extends WithApplication {
 
   @Test
   public void testCreateAccessKeyWithException() {
-    when(mockAccessManager.addKey(defaultRegion.uuid, "key-code-1"))
+    when(mockAccessManager.addKey(defaultRegion.uuid, "key-code-1", SSH_PORT, true, false))
         .thenThrow(new RuntimeException("Something went wrong!!"));
     Result result = createAccessKey(defaultProvider.uuid, "key-code-1", false, false);
     assertErrorResponse(result, "Unable to create access key: key-code-1");
@@ -334,11 +336,14 @@ public class AccessKeyControllerTest extends WithApplication {
     Provider onpremProvider = ModelFactory.newProvider(defaultCustomer, Common.CloudType.onprem);
     Region onpremRegion = Region.create(onpremProvider, "onprem-a", "onprem-a", "yb-image");
     AccessKey accessKey = AccessKey.create(onpremProvider.uuid, "key-code-1", new AccessKey.KeyInfo());
-    when(mockAccessManager.addKey(onpremRegion.uuid, "key-code-1")).thenReturn(accessKey);
-    Result result = createAccessKey(onpremProvider.uuid, "key-code-1", false, false, onpremRegion, true, false);
+    when(mockAccessManager.addKey(onpremRegion.uuid, "key-code-1", SSH_PORT, true, false))
+        .thenReturn(accessKey);
+    Result result = createAccessKey(onpremProvider.uuid, "key-code-1", false, false, onpremRegion,
+                                    true, false, false);
     assertOk(result);
     assertAuditEntry(1, defaultCustomer.uuid);
-    verify(mockTemplateManager, times(1)).createProvisionTemplate(accessKey, true, false);
+    verify(mockTemplateManager, times(1))
+      .createProvisionTemplate(accessKey, true, false, true, 9300, "prometheus");
   }
 
   @Test
@@ -346,11 +351,30 @@ public class AccessKeyControllerTest extends WithApplication {
     Provider onpremProvider = ModelFactory.newProvider(defaultCustomer, Common.CloudType.onprem);
     Region onpremRegion = Region.create(onpremProvider, "onprem-a", "onprem-a", "yb-image");
     AccessKey accessKey = AccessKey.create(onpremProvider.uuid, "key-code-1", new AccessKey.KeyInfo());
-    when(mockAccessManager.addKey(onpremRegion.uuid, "key-code-1")).thenReturn(accessKey);
-    doThrow(new RuntimeException("foobar")).when(mockTemplateManager).createProvisionTemplate(accessKey, false, false);
-    Result result = createAccessKey(onpremProvider.uuid, "key-code-1", false, false, onpremRegion, false, false);
+    when(mockAccessManager.addKey(onpremRegion.uuid, "key-code-1", SSH_PORT, false, false))
+        .thenReturn(accessKey);
+    doThrow(new RuntimeException("foobar")).when(mockTemplateManager)
+      .createProvisionTemplate(accessKey, false, false, true, 9300, "prometheus");
+    Result result = createAccessKey(onpremProvider.uuid, "key-code-1", false, false, onpremRegion,
+                                    false, false, false);
     assertErrorResponse(result, "Unable to create access key: key-code-1");
     assertAuditEntry(0, defaultCustomer.uuid);
+  }
+
+  @Test
+  public void testCreateAccessKeySkipProvisioning() {
+    Provider onpremProvider = ModelFactory.newProvider(defaultCustomer, Common.CloudType.onprem);
+    Region onpremRegion = Region.create(onpremProvider, "onprem-a", "onprem-a", "yb-image");
+    AccessKey accessKey = AccessKey.create(onpremProvider.uuid, "key-code-1",
+                                           new AccessKey.KeyInfo());
+    when(mockAccessManager.addKey(onpremRegion.uuid, "key-code-1", SSH_PORT, true, true))
+        .thenReturn(accessKey);
+    Result result = createAccessKey(onpremProvider.uuid, "key-code-1", false, false, onpremRegion,
+                                    true, false, true);
+    assertOk(result);
+    assertAuditEntry(1, defaultCustomer.uuid);
+    verify(mockTemplateManager, times(1))
+      .createProvisionTemplate(accessKey, true, false, true, 9300, "prometheus");
   }
 
   @Test

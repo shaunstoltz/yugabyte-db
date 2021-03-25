@@ -1,7 +1,8 @@
 ---
-title: Google Kubernetes Engine (GKE)
+title: Deploy on Google Kubernetes Engine (GKE) using YAML (remote disk)
+headerTitle: Google Kubernetes Engine (GKE)
 linkTitle: Google Kubernetes Engine (GKE)
-description: Google Kubernetes Engine (GKE)
+description: Deploy a single-zone YugabyteDB cluster on Google Kubernetes Engine (GKE) using YAML (remote disk).
 menu:
   latest:
     parent: deploy-kubernetes-sz
@@ -15,7 +16,6 @@ isTocNested: true
 showAsideToc: true
 ---
 
-
 <ul class="nav nav-tabs-alt nav-tabs-yb">
   <li >
     <a href="/latest/deploy/kubernetes/single-zone/gke/helm-chart" class="nav-link">
@@ -26,13 +26,13 @@ showAsideToc: true
   <li >
     <a href="/latest/deploy/kubernetes/single-zone/gke/statefulset-yaml" class="nav-link active">
       <i class="fas fa-cubes" aria-hidden="true"></i>
-      YAML (Remote Disk)
+      YAML (remote disk)
     </a>
   </li>
   <li >
     <a href="/latest/deploy/kubernetes/single-zone/gke/statefulset-yaml-local-ssd" class="nav-link">
       <i class="fas fa-cubes" aria-hidden="true"></i>
-      YAML (Local Disk)
+      YAML (local disk)
     </a>
   </li>
 </ul>
@@ -140,14 +140,14 @@ yb-tservers   ClusterIP   None         <none>        9000/TCP,9100/TCP,9042/TCP,
 You can connect to the YCQL API by running the following.
 
 ```sh
-$ kubectl exec -it yb-tserver-0 bin/cqlsh
+$ kubectl exec -it yb-tserver-0 -- ycqlsh yb-tserver-0
 ```
 
 ```
 Connected to local cluster at 127.0.0.1:9042.
 [cqlsh 5.0.1 | Cassandra 3.9-SNAPSHOT | CQL spec 3.4.2 | Native protocol v4]
 Use HELP for help.
-cqlsh> DESCRIBE KEYSPACES;
+ycqlsh> DESCRIBE KEYSPACES;
 
 system_schema  system_auth  system
 ```

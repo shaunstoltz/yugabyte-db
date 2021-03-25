@@ -126,7 +126,9 @@ Real RandomUniformReal(std::mt19937_64* rng = nullptr) {
 }
 
 inline bool RandomActWithProbability(double probability, std::mt19937_64* rng = nullptr) {
-  return probability <= 0 ? false : RandomUniformReal<double>(rng) < probability;
+  return probability <= 0 ? false
+                          : probability >= 1.0 ? true
+                                               : RandomUniformReal<double>(rng) < probability;
 }
 
 template <class Collection>
@@ -134,7 +136,9 @@ typename Collection::const_reference RandomElement(const Collection& collection,
                                                    std::mt19937_64* rng = nullptr) {
   CHECK(!collection.empty());
   size_t index = RandomUniformInt<size_t>(0, collection.size() - 1, rng);
-  return collection[index];
+  auto it = collection.begin();
+  std::advance(it, index);
+  return *it;
 }
 
 std::string RandomHumanReadableString(size_t len, std::mt19937_64* rng = nullptr);

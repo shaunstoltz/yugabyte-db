@@ -15,6 +15,7 @@
 
 #include "yb/client/table.h"
 #include "yb/client/yb_op.h"
+#include "yb/common/pg_system_attr.h"
 #include "yb/docdb/doc_key.h"
 #include "yb/util/debug-util.h"
 #include "yb/yql/pggate/pg_dml.h"
@@ -23,9 +24,6 @@
 
 namespace yb {
 namespace pggate {
-
-using docdb::PrimitiveValue;
-using docdb::ValueType;
 
 using namespace std::literals;  // NOLINT
 using std::list;
@@ -57,10 +55,6 @@ PgDml::PgDml(PgSession::ScopedRefPtr pg_session,
 }
 
 PgDml::~PgDml() {
-}
-
-Status PgDml::ClearBinds() {
-  return STATUS(NotSupported, "Clearing binds for prepared statement is not yet implemented");
 }
 
 //--------------------------------------------------------------------------------------------------
@@ -162,9 +156,6 @@ Status PgDml::BindColumn(int attr_num, PgExpr *attr_value) {
       LOG(WARNING) << strings::Substitute("Column $0 is already bound to another value.", attr_num);
     }
   }
-
-  // Link the expression and protobuf. During execution, expr will write result to the pb.
-  RETURN_NOT_OK(attr_value->PrepareForRead(this, bind_pb));
 
   // Link the given expression "attr_value" with the allocated protobuf. Note that except for
   // constants and place_holders, all other expressions can be setup just one time during prepare.
@@ -280,7 +271,7 @@ Result<bool> PgDml::ProcessSecondaryIndexRequest(const PgExecParameters *exec_pa
   }
 
   // Update request with the new batch of ybctids to fetch the next batch of rows.
-  RETURN_NOT_OK(doc_op_->SetBatchArgYbctid(ybctids, target_desc_.get()));
+  RETURN_NOT_OK(doc_op_->PopulateDmlByYbctidOps(ybctids));
   return true;
 }
 
@@ -329,20 +320,20 @@ Result<bool> PgDml::FetchDataFromServer() {
     // Execute doc_op_ again for the new set of WHERE condition from the nested query.
     SCHECK_EQ(VERIFY_RESULT(doc_op_->Execute()), RequestSent::kTrue, IllegalState,
               "YSQL read operation was not sent");
+
+    // Get the rowsets from doc-operator.
+    RETURN_NOT_OK(doc_op_->GetResult(&rowsets_));
   }
 
-  // Get the rowsets from doc-operator.
-  RETURN_NOT_OK(doc_op_->GetResult(&rowsets_));
   return true;
 }
 
 Result<bool> PgDml::GetNextRow(PgTuple *pg_tuple) {
-  list<PgDocResult::SharedPtr>::iterator rowset_iter = rowsets_.begin();
-  while (rowset_iter != rowsets_.end()) {
+  for (auto rowset_iter = rowsets_.begin(); rowset_iter != rowsets_.end();) {
     // Check if the rowset has any data.
-    const PgDocResult::SharedPtr& rowset = *rowset_iter;
-    if (rowset->is_eof()) {
-      rowsets_.erase(rowset_iter++);
+    auto& rowset = *rowset_iter;
+    if (rowset.is_eof()) {
+      rowset_iter = rowsets_.erase(rowset_iter);
       continue;
     }
 
@@ -353,10 +344,10 @@ Result<bool> PgDml::GetNextRow(PgTuple *pg_tuple) {
     //   DML <Table> WHERE ybctid IN (SELECT base_ybctid FROM <Index> ORDER BY <Index Range>)
     // The nested subquery should return rows in indexing order, but the ybctids are then grouped
     // by hash-code for BATCH-DML-REQUEST, so the response here are out-of-order.
-    if (rowset->NextRowOrder() <= current_row_order_) {
+    if (rowset.NextRowOrder() <= current_row_order_) {
       // Write row to postgres tuple.
       int64_t row_order = -1;
-      RETURN_NOT_OK(rowset->WritePgTuple(targets_, pg_tuple, &row_order));
+      RETURN_NOT_OK(rowset.WritePgTuple(targets_, pg_tuple, &row_order));
       SCHECK(row_order == -1 || row_order == current_row_order_, InternalError,
              "The resulting row are not arranged in indexing order");
 
@@ -369,76 +360,6 @@ Result<bool> PgDml::GetNextRow(PgTuple *pg_tuple) {
   }
 
   return false;
-}
-
-Result<string> PgDml::BuildYBTupleId(const PgAttrValueDescriptor *attrs, int32_t nattrs) {
-  SCHECK_EQ(nattrs, target_desc_->num_key_columns(), Corruption,
-      "Number of key components does not match column description");
-  vector<PrimitiveValue> *values = nullptr;
-  PgsqlExpressionPB *expr_pb;
-  PgsqlExpressionPB temp_expr_pb;
-  google::protobuf::RepeatedPtrField<PgsqlExpressionPB> hashed_values;
-  vector<docdb::PrimitiveValue> hashed_components, range_components;
-
-  size_t remain_attr = nattrs;
-  auto attrs_end = attrs + nattrs;
-  // DocDB API requires that partition columns must be listed in their created-order.
-  // Order from target_desc_ should be used as attributes sequence may have different order.
-  for (const auto& c : target_desc_->columns()) {
-    for (auto attr = attrs; attr != attrs_end; ++attr) {
-      if (attr->attr_num == c.attr_num()) {
-        if (!c.desc()->is_primary()) {
-          return STATUS_SUBSTITUTE(InvalidArgument, "Attribute number $0 not a primary attribute",
-                                   attr->attr_num);
-        }
-        if (c.desc()->is_partition()) {
-          // Hashed component.
-          values = &hashed_components;
-          expr_pb = hashed_values.Add();
-        } else {
-          // Range component.
-          values = &range_components;
-          expr_pb = &temp_expr_pb;
-        }
-
-        if (attr->is_null) {
-          values->emplace_back(ValueType::kNullLow);
-        } else {
-          if (attr->attr_num == to_underlying(PgSystemAttrNum::kYBRowId)) {
-            expr_pb->mutable_value()->set_binary_value(pg_session()->GenerateNewRowid());
-          } else {
-            RETURN_NOT_OK(PgConstant(attr->type_entity, attr->datum, false).Eval(this, expr_pb));
-          }
-          values->push_back(PrimitiveValue::FromQLValuePB(expr_pb->value(),
-                                                          c.desc()->sorting_type()));
-        }
-
-        if (--remain_attr == 0) {
-          SCHECK_EQ(hashed_values.size(), target_desc_->num_hash_key_columns(), Corruption,
-                    "Number of hashed values does not match column description");
-          SCHECK_EQ(hashed_components.size(), target_desc_->num_hash_key_columns(), Corruption,
-                    "Number of hashed components does not match column description");
-          SCHECK_EQ(range_components.size(),
-                    target_desc_->num_key_columns() - target_desc_->num_hash_key_columns(),
-                    Corruption, "Number of range components does not match column description");
-          if (hashed_values.empty()) {
-            return docdb::DocKey(move(range_components)).Encode().data();
-          }
-          string partition_key;
-          const PartitionSchema& partition_schema = target_desc_->table()->partition_schema();
-          RETURN_NOT_OK(partition_schema.EncodeKey(hashed_values, &partition_key));
-          const uint16_t hash = PartitionSchema::DecodeMultiColumnHashValue(partition_key);
-
-          return docdb::DocKey(hash,
-              move(hashed_components),
-              move(range_components)).Encode().data();
-        }
-        break;
-      }
-    }
-  }
-
-  return STATUS_FORMAT(Corruption, "Not all attributes ($0) were resolved", remain_attr);
 }
 
 bool PgDml::has_aggregate_targets() {

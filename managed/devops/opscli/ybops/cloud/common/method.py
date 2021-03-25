@@ -22,9 +22,10 @@ from texttable import Texttable
 
 from ybops.common.exceptions import YBOpsRuntimeError
 from ybops.utils import get_ssh_host_port, wait_for_ssh, get_path_from_yb, \
-    generate_random_password, validated_key_file, format_rsa_key
+    generate_random_password, validated_key_file, format_rsa_key, validate_cron_status, \
+    YB_HOME_DIR, YB_SUDO_PASS
 from ansible_vault import Vault
-from ybops.utils import generate_rsa_keypair, scp_package_to_tmp
+from ybops.utils import generate_rsa_keypair, get_datafile_path, scp_to_tmp
 
 
 class AbstractMethod(object):
@@ -120,9 +121,14 @@ class AbstractInstancesMethod(AbstractMethod):
         self.parser.add_argument("--ssh_user",
                                  required=False,
                                  help="The username for ssh")
+        self.parser.add_argument("--custom_ssh_port",
+                                 required=False,
+                                 help="The ssh port to connect to.")
         self.parser.add_argument("--instance_tags",
                                  required=False,
                                  help="Tags for instances being created.")
+        self.parser.add_argument("--vpcId", required=False,
+                                 help="name of the virtual network associated with the subnet")
 
         mutex_group = self.parser.add_mutually_exclusive_group()
         mutex_group.add_argument("--num_volumes", type=int, default=0,
@@ -166,17 +172,20 @@ class AbstractInstancesMethod(AbstractMethod):
         if args.instance_type:
             updated_args["instance_type"] = args.instance_type
 
+        # Handle all ssh defaults in update. Then use self.extra_vars
         if args.ssh_user:
             updated_args["ssh_user"] = args.ssh_user
         elif self.get_ssh_user():
             updated_args["ssh_user"] = self.get_ssh_user()
+        else:
+            updated_args["ssh_user"] = self.SSH_USER
 
         if args.instance_tags:
             updated_args["instance_tags"] = json.loads(args.instance_tags)
 
         self.extra_vars.update(updated_args)
 
-    def update_ansible_vars_with_host_info(self, host_info):
+    def update_ansible_vars_with_host_info(self, host_info, custom_ssh_port):
         """Hook for subclasses to update Ansible extra-vars with host specifics before calling out.
         """
         self.extra_vars.update({
@@ -188,7 +197,7 @@ class AbstractInstancesMethod(AbstractMethod):
             "instance_name": host_info["name"],
             "instance_type": host_info["instance_type"]
         })
-        self.extra_vars.update(get_ssh_host_port(host_info))
+        self.extra_vars.update(get_ssh_host_port(host_info, custom_ssh_port))
 
 
 class DestroyInstancesMethod(AbstractInstancesMethod):
@@ -197,6 +206,11 @@ class DestroyInstancesMethod(AbstractInstancesMethod):
 
     def __init__(self, base_command):
         super(DestroyInstancesMethod, self).__init__(base_command, "destroy")
+
+    def add_extra_args(self):
+        super(DestroyInstancesMethod, self).add_extra_args()
+        self.parser.add_argument("--node_ip", default=None,
+                                 help="The ip of the instance to delete.")
 
     def callback(self, args):
         self.update_ansible_vars_with_args(args)
@@ -257,8 +271,8 @@ class CreateInstancesMethod(AbstractInstancesMethod):
         self.run_ansible_create(args)
 
         if self.can_ssh and not args.disable_custom_ssh:
-            host_info = self.wait_for_host(args)
             self.update_ansible_vars(args)
+            host_info = self.wait_for_host(args)
             self.cloud.setup_ansible(args).run("use_custom_ssh_port.yml",
                                                self.extra_vars, host_info)
 
@@ -294,10 +308,11 @@ class CreateInstancesMethod(AbstractInstancesMethod):
             if not host_info:
                 host_info = self.cloud.get_host_info(args)
             if host_info:
-                self.extra_vars.update(get_ssh_host_port(host_info, default_port=default_port))
+                self.extra_vars.update(
+                    get_ssh_host_port(host_info, args.custom_ssh_port, default_port=default_port))
                 if wait_for_ssh(self.extra_vars["ssh_host"],
                                 self.extra_vars["ssh_port"],
-                                self.SSH_USER,
+                                self.extra_vars["ssh_user"],
                                 args.private_key_file):
                     return host_info
             sys.stdout.write('.')
@@ -325,6 +340,7 @@ class ProvisionInstancesMethod(AbstractInstancesMethod):
         self.create_method = CreateInstancesMethod(self.base_command)
 
     def preprocess_args(self, args):
+        super(ProvisionInstancesMethod, self).preprocess_args(args)
         self.create_method.preprocess_args(args)
 
     def add_extra_args(self):
@@ -339,10 +355,18 @@ class ProvisionInstancesMethod(AbstractInstancesMethod):
         # Actually call the Create method function for setting up extra options.
         self.create_method.add_extra_args()
         # Add extra options on top of the Create method ones.
+        self.parser.add_argument("--air_gap", action="store_true", help="Run airgapped install.")
         self.parser.add_argument("--reuse_host", action="store_true", default=False)
         self.parser.add_argument("--local_package_path",
                                  required=False,
                                  help="Path to local directory with the prometheus tarball.")
+        self.parser.add_argument("--node_exporter_port", type=int, default=9300,
+                                 help="The port for node_exporter to bind to")
+        self.parser.add_argument("--node_exporter_user", default="prometheus")
+        self.parser.add_argument("--install_node_exporter", action="store_true")
+        self.parser.add_argument('--remote_package_path', default=None,
+                                 help="Path to download thirdparty packages "
+                                      "for itest. Only for AWS/onprem")
 
     def callback(self, args):
         host_info = self.cloud.get_host_info(args)
@@ -358,9 +382,19 @@ class ProvisionInstancesMethod(AbstractInstancesMethod):
         self.update_ansible_vars_with_args(args)
 
         if host_info:
-            self.extra_vars.update(get_ssh_host_port(host_info))
+            self.extra_vars.update(get_ssh_host_port(host_info, args.custom_ssh_port))
         if args.local_package_path:
             self.extra_vars.update({"local_package_path": args.local_package_path})
+        if args.air_gap:
+            self.extra_vars.update({"air_gap": args.air_gap})
+        if args.node_exporter_port:
+            self.extra_vars.update({"node_exporter_port": args.node_exporter_port})
+        if args.install_node_exporter:
+            self.extra_vars.update({"install_node_exporter": args.install_node_exporter})
+        if args.node_exporter_user:
+            self.extra_vars.update({"node_exporter_user": args.node_exporter_user})
+        if args.remote_package_path:
+            self.extra_vars.update({"remote_package_path": args.remote_package_path})
         self.extra_vars.update({"instance_type": args.instance_type})
         self.extra_vars["device_names"] = self.cloud.get_device_names(args)
         self.cloud.setup_ansible(args).run("yb-server-provision.yml", self.extra_vars, host_info)
@@ -390,9 +424,57 @@ class ListInstancesMethod(AbstractInstancesMethod):
             del host_info['server_type']
 
         if args.as_json:
-            print json.dumps(host_info)
+            print(json.dumps(host_info))
         else:
-            print '\n'.join(["{}={}".format(k, v) for k, v in host_info.iteritems()])
+            print('\n'.join(["{}={}".format(k, v) for k, v in host_info.items()]))
+
+
+class UpdateDiskMethod(AbstractInstancesMethod):
+    """Superclass for updating the size of the disks associated with instances in
+    the given pattern.
+
+    """
+
+    def __init__(self, base_command):
+        super(UpdateDiskMethod, self).__init__(base_command, "disk_update")
+
+    def prepare(self):
+        super(UpdateDiskMethod, self).prepare()
+
+    def callback(self, args):
+        self.cloud.update_disk(args)
+        host_info = self.cloud.get_host_info(args)
+        ssh_options = {
+            # TODO: replace with args.ssh_user when it's setup in the flow
+            "ssh_user": self.SSH_USER,
+            "private_key_file": args.private_key_file
+        }
+        ssh_options.update(get_ssh_host_port(host_info, args.custom_ssh_port))
+        self.cloud.expand_file_system(args, ssh_options)
+
+
+class CronCheckMethod(AbstractInstancesMethod):
+    """Superclass for checking cronjob status on specified node.
+    """
+    def __init__(self, base_command):
+        super(CronCheckMethod, self).__init__(base_command, "croncheck")
+
+    def get_ssh_user(self):
+        # Force croncheck to be done on yugabyte user.
+        return "yugabyte"
+
+    def callback(self, args):
+        host_info = self.cloud.get_host_info(args)
+        ssh_options = {
+            "ssh_user": self.get_ssh_user(),
+            "private_key_file": args.private_key_file
+        }
+        ssh_options.update(get_ssh_host_port(host_info, args.custom_ssh_port))
+        if not validate_cron_status(
+                ssh_options['ssh_host'], ssh_options['ssh_port'], ssh_options['ssh_user'],
+                ssh_options['private_key_file']):
+            raise YBOpsRuntimeError(
+                'Failed to find cronjobs on host {}'.format(ssh_options['ssh_host']))
 
 
 class ConfigureInstancesMethod(AbstractInstancesMethod):
@@ -411,17 +493,28 @@ class ConfigureInstancesMethod(AbstractInstancesMethod):
         self.parser.add_argument('--extra_gflags', default=None)
         self.parser.add_argument('--gflags', default=None)
         self.parser.add_argument('--replace_gflags', action="store_true")
+        self.parser.add_argument('--gflags_to_remove', default=None)
         self.parser.add_argument('--master_addresses_for_tserver')
         self.parser.add_argument('--master_addresses_for_master')
+        self.parser.add_argument('--server_broadcast_addresses')
         self.parser.add_argument('--rootCA_cert')
         self.parser.add_argument('--rootCA_key')
         self.parser.add_argument('--client_key')
         self.parser.add_argument('--client_cert')
+        self.parser.add_argument('--use_custom_certs', action="store_true")
+        self.parser.add_argument('--rotating_certs', action="store_true")
+        self.parser.add_argument('--root_cert_path')
+        self.parser.add_argument('--node_cert_path')
+        self.parser.add_argument('--node_key_path')
+        self.parser.add_argument('--client_cert_path')
+        self.parser.add_argument('--client_key_path')
         self.parser.add_argument('--cert_valid_duration', default=365)
         self.parser.add_argument('--org_name', default="example.com")
-        self.parser.add_argument('--certs_node_dir', default="yugabyte-tls-config")
+        self.parser.add_argument('--certs_node_dir',
+                                 default=os.path.join(YB_HOME_DIR, "yugabyte-tls-config"))
         self.parser.add_argument('--encryption_key_source_file')
-        self.parser.add_argument('--encryption_key_target_dir', default="yugabyte-encryption-files")
+        self.parser.add_argument('--encryption_key_target_dir',
+                                 default="yugabyte-encryption-files")
 
         self.parser.add_argument('--master_http_port', default=7000)
         self.parser.add_argument('--master_rpc_port', default=7100)
@@ -463,6 +556,9 @@ class ConfigureInstancesMethod(AbstractInstancesMethod):
             if args.master_addresses_for_master is not None:
                 self.extra_vars["master_addresses_for_master"] = args.master_addresses_for_master
 
+            if args.server_broadcast_addresses is not None:
+                self.extra_vars["server_broadcast_addresses"] = args.server_broadcast_addresses
+
             if args.yb_process_type:
                 self.extra_vars["yb_process_type"] = args.yb_process_type.lower()
         else:
@@ -483,17 +579,35 @@ class ConfigureInstancesMethod(AbstractInstancesMethod):
         if args.extra_gflags is not None:
             self.extra_vars["extra_gflags"] = json.loads(args.extra_gflags)
 
+        if args.gflags_to_remove is not None:
+            self.extra_vars["gflags_to_remove"] = json.loads(args.gflags_to_remove)
+
         if args.rootCA_cert is not None:
-            self.extra_vars["rootCA_cert"] = args.rootCA_cert
+            self.extra_vars["rootCA_cert"] = args.rootCA_cert.strip()
 
         if args.rootCA_key is not None:
-            self.extra_vars["rootCA_key"] = args.rootCA_key
+            self.extra_vars["rootCA_key"] = args.rootCA_key.strip()
 
         if args.client_cert is not None:
-            self.extra_vars["client_cert"] = args.client_cert
+            self.extra_vars["client_cert"] = args.client_cert.strip()
 
         if args.client_key is not None:
-            self.extra_vars["client_key"] = args.client_key
+            self.extra_vars["client_key"] = args.client_key.strip()
+
+        if args.root_cert_path is not None:
+            self.extra_vars["root_cert_path"] = args.root_cert_path.strip()
+
+        if args.node_cert_path is not None:
+            self.extra_vars["node_cert_path"] = args.node_cert_path.strip()
+
+        if args.node_key_path is not None:
+            self.extra_vars["node_key_path"] = args.node_key_path.strip()
+
+        if args.client_cert_path is not None:
+            self.extra_vars["client_cert_path"] = args.client_cert_path.strip()
+
+        if args.client_key_path is not None:
+            self.extra_vars["client_key_path"] = args.client_key_path.strip()
 
         host_info = None
         if args.search_pattern != 'localhost':
@@ -507,7 +621,7 @@ class ConfigureInstancesMethod(AbstractInstancesMethod):
                                         .format(args.search_pattern,
                                                 host_info['server_type'],
                                                 args.type))
-            self.update_ansible_vars_with_host_info(host_info)
+            self.update_ansible_vars_with_host_info(host_info, args.custom_ssh_port)
             # If we have a package, then manually copy it over using scp instead of going over
             # ansible, so we do not have issues such as ENG-3424.
             # Python based paramiko seemed to have the same problems as ansible copy module!
@@ -515,6 +629,7 @@ class ConfigureInstancesMethod(AbstractInstancesMethod):
             # NOTE: we should only do this if we have to download the package...
             # NOTE 2: itest should download package from s3 to improve speed for instances in AWS.
             # TODO: Add a variable to specify itest ssh_user depending on VM users.
+            start_time = time.time()
             if args.package and (args.tags is None or args.tags == "download-software"):
                 if args.itest_s3_package_path and args.type == self.YB_SERVER_TYPE:
                     itest_extra_vars = self.extra_vars.copy()
@@ -524,13 +639,19 @@ class ConfigureInstancesMethod(AbstractInstancesMethod):
                     itest_extra_vars["tags"] = "itest"
                     self.cloud.setup_ansible(args).run(
                         "configure-{}.yml".format(args.type), itest_extra_vars, host_info)
+                    logging.info(("[app] Running itest tasks including S3 " +
+                                  "package download {} to {} took {:.3f} sec").format(
+                                args.itest_s3_package_path,
+                                args.search_pattern, time.time() - start_time))
                 else:
-                    scp_package_to_tmp(
+                    scp_to_tmp(
                         args.package,
                         self.extra_vars["private_ip"],
                         self.extra_vars["ssh_user"],
                         self.extra_vars["ssh_port"],
                         args.private_key_file)
+                    logging.info("[app] Copying package {} to {} took {:.3f} sec".format(
+                        args.package, args.search_pattern, time.time() - start_time))
 
         logging.info("Configuring Instance: {}".format(args.search_pattern))
         ssh_options = {
@@ -538,19 +659,29 @@ class ConfigureInstancesMethod(AbstractInstancesMethod):
             "ssh_user": self.get_ssh_user(),
             "private_key_file": args.private_key_file
         }
-        ssh_options.update(get_ssh_host_port(host_info))
+        ssh_options.update(get_ssh_host_port(host_info, args.custom_ssh_port))
 
-        if args.rootCA_cert and args.rootCA_key is not None:
-            logging.info("Creating and copying over client TLS certificate")
-            self.cloud.generate_client_cert(self.extra_vars, ssh_options)
+        if args.use_custom_certs:
+            if args.rotating_certs:
+                logging.info("Verifying root certs are the same.")
+                self.cloud.compare_root_certs(self.extra_vars, ssh_options)
+            logging.info("Copying custom certificates to {}.".format(args.search_pattern))
+            self.cloud.copy_certs(self.extra_vars, ssh_options)
+        else:
+            if args.rootCA_cert and args.rootCA_key is not None:
+                logging.info("Creating and copying over client TLS certificate to {}".format(
+                    args.search_pattern))
+                self.cloud.generate_client_cert(self.extra_vars, ssh_options)
         if args.encryption_key_source_file is not None:
             self.extra_vars["encryption_key_file"] = args.encryption_key_source_file
             logging.info("Copying over encryption-at-rest certificate from {} to {}".format(
                 args.encryption_key_source_file, args.encryption_key_target_dir))
             self.cloud.create_encryption_at_rest_file(self.extra_vars, ssh_options)
 
-        self.cloud.setup_ansible(args).run(
-            "configure-{}.yml".format(args.type), self.extra_vars, host_info)
+        # If we are just rotating certs, we don't need to do any configuration changes.
+        if not args.rotating_certs:
+            self.cloud.setup_ansible(args).run(
+                "configure-{}.yml".format(args.type), self.extra_vars, host_info)
 
 
 class InitYSQLMethod(AbstractInstancesMethod):
@@ -573,7 +704,7 @@ class InitYSQLMethod(AbstractInstancesMethod):
         if not host_info:
             raise YBOpsRuntimeError("Instance: {} does not exists, cannot call initysql".format(
                                     args.search_pattern))
-        ssh_options.update(get_ssh_host_port(host_info))
+        ssh_options.update(get_ssh_host_port(host_info, args.custom_ssh_port))
         logging.info("Initializing YSQL on Instance: {}".format(args.search_pattern))
         self.cloud.initYSQL(args.master_addresses, ssh_options)
 
@@ -586,7 +717,7 @@ class ControlInstanceMethod(AbstractInstancesMethod):
     def callback(self, args):
         host_info = self.cloud.get_host_info(args)
         if not host_info:
-            raise YBOpsRuntimeError("Instance: {} does not exists, cannot run ctl commands"
+            raise YBOpsRuntimeError("Instance: {} does not exist, cannot run ctl commands"
                                     .format(args.search_pattern))
 
         if host_info['server_type'] != self.YB_SERVER_TYPE:
@@ -602,31 +733,35 @@ class ControlInstanceMethod(AbstractInstancesMethod):
             self.base_command.name, self.name, args, self.extra_vars, host_info)
 
 
-class AccessCreateVaultMethod(AbstractMethod):
-    def __init__(self, base_command):
-        super(AccessCreateVaultMethod, self).__init__(base_command, "create-vault")
+class AbstractVaultMethod(AbstractMethod):
+    def __init__(self, base_command, method_name):
+        super(AbstractVaultMethod, self).__init__(base_command, method_name)
         self.cluster_vault = dict()
 
     def add_extra_args(self):
-        super(AccessCreateVaultMethod, self).add_extra_args()
+        super(AbstractVaultMethod, self).add_extra_args()
         self.parser.add_argument("--private_key_file", required=True, help="Private key filename")
         self.parser.add_argument("--has_sudo_password", action="store_true", help="sudo password")
         self.parser.add_argument("--vault_file", required=False, help="Vault filename")
-        self.parser.add_argument("--vault_password", required=False, help="Vault password filename")
+
+
+class AccessCreateVaultMethod(AbstractVaultMethod):
+    def __init__(self, base_command):
+        super(AccessCreateVaultMethod, self).__init__(base_command, "create-vault")
 
     def callback(self, args):
         file_prefix = os.path.splitext(args.private_key_file)[0]
-        if args.vault_password is None:
+        if args.vault_password_file is None:
             vault_password = generate_random_password()
-            args.vault_password = "{}.vault_password".format(file_prefix)
-            with file(args.vault_password, "w") as f:
+            args.vault_password_file = "{}.vault_password".format(file_prefix)
+            with open(args.vault_password_file, "w") as f:
                 f.write(vault_password)
-        elif os.path.exists(args.vault_password):
-            with file(args.vault_password) as f:
+        elif os.path.exists(args.vault_password_file):
+            with open(args.vault_password_file, "r") as f:
                 vault_password = f.read().strip()
 
             if vault_password is None:
-                raise YBOpsRuntimeError("Unable to read {}".format(args.vault_password))
+                raise YBOpsRuntimeError("Unable to read {}".format(args.vault_password_file))
         else:
             raise YBOpsRuntimeError("Vault password file doesn't exists.")
 
@@ -659,7 +794,45 @@ class AccessCreateVaultMethod(AbstractMethod):
 
         vault = Vault(vault_password)
         vault.dump(vault_data, open(args.vault_file, 'w'))
-        print json.dumps({"vault_file": args.vault_file, "vault_password": args.vault_password})
+        print(json.dumps({
+            "vault_file": args.vault_file,
+            "vault_password": args.vault_password_file
+        }))
+
+
+class AccessEditVaultMethod(AbstractVaultMethod):
+    def __init__(self, base_command):
+        super(AccessEditVaultMethod, self).__init__(base_command, "edit-vault")
+
+    def callback(self, args):
+        file_prefix = os.path.splitext(args.private_key_file)[0]
+        args.vault_password_file = args.vault_password_file or \
+            "{}.vault_password".format(file_prefix)
+        if os.path.exists(args.vault_password_file):
+            with open(args.vault_password_file, "r") as f:
+                vault_password = f.read().strip()
+
+            if vault_password is None:
+                raise YBOpsRuntimeError("Unable to read {}".format(args.vault_password_file))
+        else:
+            raise YBOpsRuntimeError("Vault password file doesn't exists.")
+
+        if args.vault_file is None:
+            args.vault_file = "{}.vault".format(file_prefix)
+
+        vault = Vault(vault_password)
+        data = vault.load(open(args.vault_file).read())
+
+        if args.has_sudo_password:
+            if not YB_SUDO_PASS:
+                raise YBOpsRuntimeError("Did not find sudo password.")
+            data['ansible_become_pass'] = YB_SUDO_PASS
+
+        vault.dump(data, open(args.vault_file, 'w'))
+        print(json.dumps({
+            "vault_file": args.vault_file,
+            "vault_password": args.vault_password_file
+        }))
 
 
 class AbstractAccessMethod(AbstractMethod):

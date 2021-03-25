@@ -14,9 +14,11 @@
 #ifndef YB_CONSENSUS_RETRYABLE_REQUESTS_H
 #define YB_CONSENSUS_RETRYABLE_REQUESTS_H
 
+#include "yb/common/wire_protocol.h"
 #include "yb/consensus/consensus_fwd.h"
 
 #include "yb/util/restart_safe_clock.h"
+#include "yb/util/status.h"
 
 namespace yb {
 
@@ -39,8 +41,8 @@ class RetryableRequests {
   RetryableRequests(RetryableRequests&& rhs);
   void operator=(RetryableRequests&& rhs);
 
-  // Tries to registers a new running request.
-  // Returns false if request with such id already present.
+  // Tries to register a new running retryable request.
+  // Returns false if request with such id is already present.
   bool Register(const ConsensusRoundPtr& round,
                 RestartSafeCoarseTimePoint entry_time = RestartSafeCoarseTimePoint());
 
@@ -59,6 +61,8 @@ class RetryableRequests {
 
   // Returns number or running requests and number of ranges of replicated requests.
   RetryableRequestsCounts TEST_Counts();
+
+  Result<RetryableRequestId> MinRunningRequestId(const ClientId& client_id) const;
 
   void SetMetricEntity(const scoped_refptr<MetricEntity>& metric_entity);
 

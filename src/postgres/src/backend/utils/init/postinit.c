@@ -46,7 +46,9 @@
 #include "catalog/pg_authid.h"
 #include "catalog/pg_database.h"
 #include "catalog/pg_db_role_setting.h"
+#include "catalog/pg_tablegroup.h"
 #include "catalog/pg_tablespace.h"
+#include "catalog/ybc_catalog_version.h"
 #include "libpq/auth.h"
 #include "libpq/libpq-be.h"
 #include "mb/pg_wchar.h"
@@ -438,9 +440,11 @@ InitCommunication(void)
 	{
 		/*
 		 * We're running a postgres bootstrap process or a standalone backend.
-		 * Create private "shmem" and semaphores.
+		 * Though we won't listen on PostPortNumber, use it to select a shmem
+		 * key.  This increases the chance of detecting a leftover live
+		 * backend of this DataDir.
 		 */
-		CreateSharedMemoryAndSemaphores(true, 0);
+		CreateSharedMemoryAndSemaphores(PostPortNumber);
 	}
 }
 
@@ -1020,15 +1024,25 @@ InitPostgres(const char *in_dbname, Oid dboid, const char *username,
 	 *
 	 * Load relcache entries for the system catalogs.  This must create at
 	 * least the minimum set of "nailed-in" cache entries.
-	 *
-	 * In YugaByte mode initialize the catalog cache version to the latest
-	 * version from the master (except during initdb).
+	 */
+	// See if tablegroup catalog exists - needs to happen before cache fully initialized.
+	if (IsYugaByteEnabled())
+	{
+		HandleYBStatus(YBCPgTableExists(MyDatabaseId,
+										TableGroupRelationId,
+										&TablegroupCatalogExists));
+	}
+
+	RelationCacheInitializePhase3();
+
+	/*
+	 * Also cache whather the database is colocated for optimization purposes.
 	 */
 	if (IsYugaByteEnabled() && !IsBootstrapProcessingMode())
 	{
-		YBCPgGetCatalogMasterVersion(&yb_catalog_cache_version);
+		HandleYBStatus(YBCPgIsDatabaseColocated(MyDatabaseId,
+												&MyDatabaseColocated));
 	}
-	RelationCacheInitializePhase3();
 
 	/* set up ACL framework (so CheckMyDatabase can check permissions) */
 	initialize_acl();

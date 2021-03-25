@@ -21,8 +21,11 @@
 #include <gflags/gflags.h>
 
 #include "yb/consensus/consensus.h"
+#include "yb/gutil/macros.h"
 #include "yb/tablet/preparer.h"
 #include "yb/tablet/operations/operation_driver.h"
+
+#include "yb/util/flag_tags.h"
 #include "yb/util/logging.h"
 #include "yb/util/threadpool.h"
 #include "yb/util/lockfree.h"
@@ -30,6 +33,10 @@
 DEFINE_int32(max_group_replicate_batch_size, 16,
              "Maximum number of operations to submit to consensus for replication in a batch.");
 
+DEFINE_test_flag(int32, preparer_batch_inject_latency_ms, 0,
+                 "Inject latency before replicating batch.");
+
+using namespace std::literals;
 using std::vector;
 
 namespace yb {
@@ -76,6 +83,13 @@ class PreparerImpl {
   // So it always greater than or equal to number of entries in queue.
   std::atomic<int64_t> active_tasks_{0};
 
+  // This flag is used in a sanity check to ensure that after this server becomes a follower,
+  // the earlier leader-side operations that are still in the preparer's queue should fail to get
+  // prepared due to old term. This sanity check will only be performed when an UpdateConsensus
+  // with follower-side operations is received while earlier leader-side operations still have not
+  // been processed, e.g. in an overloaded tablet server with lots of leader changes.
+  std::atomic<bool> prepare_should_fail_{false};
+
   MPSCQueue<OperationDriver> queue_;
 
   // This mutex/condition combination is used in Stop() in case multiple threads are calling that
@@ -103,8 +117,7 @@ class PreparerImpl {
                          OperationDrivers::iterator end);
 };
 
-PreparerImpl::PreparerImpl(consensus::Consensus* consensus,
-                                     ThreadPool* tablet_prepare_pool)
+PreparerImpl::PreparerImpl(consensus::Consensus* consensus, ThreadPool* tablet_prepare_pool)
     : consensus_(consensus),
       tablet_prepare_pool_token_(tablet_prepare_pool
                                      ->NewToken(ThreadPool::ExecutionMode::SERIAL)) {
@@ -138,8 +151,23 @@ Status PreparerImpl::Submit(OperationDriver* operation_driver) {
     return STATUS(IllegalState, "Tablet is shutting down");
   }
 
-  active_tasks_.fetch_add(1, std::memory_order_release);
-  queue_.Push(operation_driver);
+  const bool leader_side = operation_driver->is_leader_side();
+
+  // When a leader becomes a follower, we expect the leader-side operations still in the preparer's
+  // queue to fail to be prepared because their term will be too old as we try to add them to the
+  // Raft queue.
+  prepare_should_fail_.store(!leader_side, std::memory_order_release);
+
+  if (leader_side) {
+    // Prepare leader-side operations on the "preparer thread" so we can only acquire the
+    // ReplicaState lock once and append multiple operations.
+    active_tasks_.fetch_add(1, std::memory_order_release);
+    queue_.Push(operation_driver);
+  } else {
+    // For follower-side operations, there would be no benefit in preparing them on the preparer
+    // thread.
+    operation_driver->PrepareAndStartTask();
+  }
 
   auto expected = false;
   if (!running_.compare_exchange_strong(expected, true, std::memory_order_acq_rel)) {
@@ -162,7 +190,7 @@ void PreparerImpl::Run() {
     ProcessAndClearLeaderSideBatch();
     std::unique_lock<std::mutex> stop_lock(stop_mtx_);
     running_.store(false, std::memory_order_release);
-    // Check whether tasks we added while we were setting running to false.
+    // Check whether tasks were added while we were setting running to false.
     if (active_tasks_.load(std::memory_order_acquire)) {
       // Got more operations, try stay in the loop.
       bool expected = false;
@@ -181,35 +209,55 @@ void PreparerImpl::Run() {
   }
 }
 
+namespace {
+
+bool ShouldApplySeparately(OperationType operation_type) {
+  switch (operation_type) {
+    // For certain operations types we have to apply them in a batch of their own.
+    // E.g. ChangeMetadataOperation::Prepare calls Tablet::CreatePreparedChangeMetadata, which
+    // acquires the schema lock. Because of this, we must not attempt to process two
+    // ChangeMetadataOperations in one batch, otherwise we'll deadlock.
+    //
+    // Also, for infrequently occuring operations batching has little performance benefit in
+    // general.
+    case OperationType::kChangeMetadata: FALLTHROUGH_INTENDED;
+    case OperationType::kSnapshot: FALLTHROUGH_INTENDED;
+    case OperationType::kTruncate: FALLTHROUGH_INTENDED;
+    case OperationType::kSplit: FALLTHROUGH_INTENDED;
+    case OperationType::kEmpty: FALLTHROUGH_INTENDED;
+    case OperationType::kHistoryCutoff:
+      return true;
+
+    case OperationType::kWrite: FALLTHROUGH_INTENDED;
+    case OperationType::kUpdateTransaction:
+      return false;
+  }
+  FATAL_INVALID_ENUM_VALUE(OperationType, operation_type);
+}
+
+}  // anonymous namespace
+
 void PreparerImpl::ProcessItem(OperationDriver* item) {
   CHECK_NOTNULL(item);
 
-  if (item->is_leader_side()) {
-    // ChangeMetadataOperation::Prepare calls Tablet::CreatePreparedChangeMetadata, which acquires
-    // the schema lock. Because of this, we must not attempt to process two ChangeMetadataOperations
-    // in one batch, otherwise we'll deadlock.
-    auto operation_type = item->operation_type();
-    const bool apply_separately = operation_type == OperationType::kChangeMetadata ||
-                                  operation_type == OperationType::kEmpty;
-    const int64_t bound_term = apply_separately ? -1 : item->consensus_round()->bound_term();
+  LOG_IF(DFATAL, !item->is_leader_side()) << "Processing follower-side item";
 
-    // Don't add more than the max number of operations to a batch, and also don't add
-    // operations bound to different terms, so as not to fail unrelated operations
-    // unnecessarily in case of a bound term mismatch.
-    if (leader_side_batch_.size() >= FLAGS_max_group_replicate_batch_size ||
-        (!leader_side_batch_.empty() &&
-            bound_term != leader_side_batch_.back()->consensus_round()->bound_term())) {
-      ProcessAndClearLeaderSideBatch();
-    }
-    leader_side_batch_.push_back(item);
-    if (apply_separately) {
-      ProcessAndClearLeaderSideBatch();
-    }
-  } else {
-    // We found a non-leader-side operation. We need to process the accumulated batch of
-    // leader-side operations first, and then process this other operation.
+  auto operation_type = item->operation_type();
+
+  const bool apply_separately = ShouldApplySeparately(operation_type);
+  const int64_t bound_term = apply_separately ? -1 : item->consensus_round()->bound_term();
+
+  // Don't add more than the max number of operations to a batch, and also don't add
+  // operations bound to different terms, so as not to fail unrelated operations
+  // unnecessarily in case of a bound term mismatch.
+  if (leader_side_batch_.size() >= FLAGS_max_group_replicate_batch_size ||
+      (!leader_side_batch_.empty() &&
+          bound_term != leader_side_batch_.back()->consensus_round()->bound_term())) {
     ProcessAndClearLeaderSideBatch();
-    item->PrepareAndStartTask();
+  }
+  leader_side_batch_.push_back(item);
+  if (apply_separately) {
+    ProcessAndClearLeaderSideBatch();
   }
 }
 
@@ -275,17 +323,26 @@ void PreparerImpl::ReplicateSubBatch(
     rounds_to_replicate_.push_back((*batch_iter)->consensus_round());
   }
 
+  AtomicFlagSleepMs(&FLAGS_TEST_preparer_batch_inject_latency_ms);
+  // Have to save this value before calling replicate batch.
+  // Because the following scenario is legal:
+  // Operation successfully processed by ReplicateBatch, but ReplicateBatch did not return yet.
+  // Submit of follower side operation is called from another thread.
+  bool should_fail = prepare_should_fail_.load(std::memory_order_acquire);
   const Status s = consensus_->ReplicateBatch(&rounds_to_replicate_);
   rounds_to_replicate_.clear();
 
   if (PREDICT_FALSE(!s.ok())) {
-    VLOG(2) << "ReplicateBatch failed with status " << s.ToString()
+    VLOG(1) << "ReplicateBatch failed with status " << s.ToString()
             << ", treating all " << std::distance(batch_begin, batch_end) << " operations as "
             << "failed with that status";
     // Treat all the operations in the batch as failed.
     for (auto batch_iter = batch_begin; batch_iter != batch_end; ++batch_iter) {
       (*batch_iter)->ReplicationFailed(s);
     }
+  } else if (should_fail) {
+    LOG(DFATAL) << "Operations should fail, but was successfully prepared: "
+                << AsString(boost::make_iterator_range(batch_begin, batch_end));
   }
 }
 

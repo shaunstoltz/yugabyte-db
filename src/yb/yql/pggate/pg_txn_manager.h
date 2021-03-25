@@ -25,6 +25,8 @@
 #include "yb/gutil/ref_counted.h"
 #include "yb/tserver/tserver_util_fwd.h"
 #include "yb/util/result.h"
+#include "yb/util/enums.h"
+#include "yb/yql/pggate/pg_callbacks.h"
 
 namespace yb {
 namespace tserver {
@@ -36,23 +38,26 @@ class TabletServerServiceProxy;
 namespace pggate {
 
 // These should match XACT_READ_UNCOMMITED, XACT_READ_COMMITED, XACT_REPEATABLE_READ,
-// XACT_SERIALIZABLE from xact.h.
-enum class PgIsolationLevel {
-  READ_UNCOMMITED = 0,
-  READ_COMMITED = 1,
-  REPEATABLE_READ = 2,
-  SERIALIZABLE = 3,
-};
+// XACT_SERIALIZABLE from xact.h. Please do not change this enum.
+YB_DEFINE_ENUM(
+  PgIsolationLevel,
+  ((READ_UNCOMMITED, 0))
+  ((READ_COMMITTED, 1))
+  ((REPEATABLE_READ, 2))
+  ((SERIALIZABLE, 3))
+);
 
 class PgTxnManager : public RefCountedThreadSafe<PgTxnManager> {
  public:
   PgTxnManager(client::AsyncClientInitialiser* async_client_init,
                scoped_refptr<ClockBase> clock,
-               const tserver::TServerSharedObject* tserver_shared_object);
+               const tserver::TServerSharedObject* tserver_shared_object,
+               PgCallbacks pg_callbacks);
 
   virtual ~PgTxnManager();
 
   CHECKED_STATUS BeginTransaction();
+  CHECKED_STATUS RecreateTransaction();
   CHECKED_STATUS RestartTransaction();
   CHECKED_STATUS CommitTransaction();
   CHECKED_STATUS AbortTransaction();
@@ -65,17 +70,30 @@ class PgTxnManager : public RefCountedThreadSafe<PgTxnManager> {
   // Returns the transactional session, starting a new transaction if necessary.
   yb::Result<client::YBSession*> GetTransactionalSession();
 
-  CHECKED_STATUS BeginWriteTransactionIfNecessary(bool read_only_op);
+  std::shared_future<Result<TransactionMetadata>> GetDdlTxnMetadata() const;
+
+  CHECKED_STATUS BeginWriteTransactionIfNecessary(bool read_only_op,
+                                                  bool needs_pessimistic_locking = false);
 
   bool CanRestart() { return can_restart_.load(std::memory_order_acquire); }
 
   bool IsDdlMode() const { return ddl_session_.get() != nullptr; }
+  bool IsTxnInProgress() const { return txn_in_progress_; }
 
  private:
+  YB_STRONGLY_TYPED_BOOL(NeedsPessimisticLocking);
+  YB_STRONGLY_TYPED_BOOL(SavePriority);
 
   client::TransactionManager* GetOrCreateTransactionManager();
   void ResetTxnAndSession();
   void StartNewSession();
+  Status RecreateTransaction(SavePriority save_priority);
+
+  uint64_t GetPriority(NeedsPessimisticLocking needs_pessimistic_locking);
+
+  std::string TxnStateDebugStr() const;
+
+  // ----------------------------------------------------------------------------------------------
 
   client::AsyncClientInitialiser* async_client_init_ = nullptr;
   scoped_refptr<ClockBase> clock_;
@@ -90,7 +108,7 @@ class PgTxnManager : public RefCountedThreadSafe<PgTxnManager> {
   std::unique_ptr<client::TransactionManager> transaction_manager_holder_;
 
   // Postgres transaction characteristics.
-  PgIsolationLevel isolation_level_ = PgIsolationLevel::REPEATABLE_READ;
+  PgIsolationLevel pg_isolation_level_ = PgIsolationLevel::REPEATABLE_READ;
   bool read_only_ = false;
   bool deferrable_ = false;
 
@@ -99,7 +117,15 @@ class PgTxnManager : public RefCountedThreadSafe<PgTxnManager> {
 
   std::atomic<bool> can_restart_{true};
 
+  // On a transaction conflict error we want to recreate the transaction with the same priority as
+  // the last transaction. This avoids the case where the current transaction gets a higher priority
+  // and cancels the other transaction.
+  uint64_t saved_priority_ = 0;
+  SavePriority use_saved_priority_ = SavePriority::kFalse;
+
   std::unique_ptr<tserver::TabletServerServiceProxy> tablet_server_proxy_;
+
+  PgCallbacks pg_callbacks_;
 
   DISALLOW_COPY_AND_ASSIGN(PgTxnManager);
 };

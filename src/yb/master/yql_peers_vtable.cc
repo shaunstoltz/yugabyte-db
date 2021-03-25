@@ -19,6 +19,8 @@
 
 #include "yb/rpc/messenger.h"
 
+#include "yb/util/net/dns_resolver.h"
+
 namespace yb {
 namespace master {
 
@@ -41,9 +43,10 @@ const std::string kTokens = "tokens";
 
 } // namespace
 
-PeersVTable::PeersVTable(const Master* const master)
-    : YQLVirtualTable(master::kSystemPeersTableName, master, CreateSchema()),
-      resolver_(new Resolver(master->messenger()->io_service())) {
+PeersVTable::PeersVTable(const TableName& table_name,
+                         const NamespaceName& namespace_name,
+                         Master* const master)
+    : YQLVirtualTable(table_name, namespace_name, master, CreateSchema()) {
 }
 
 Result<std::shared_ptr<QLRowBlock>> PeersVTable::RetrieveData(
@@ -57,9 +60,10 @@ Result<std::shared_ptr<QLRowBlock>> PeersVTable::RetrieveData(
   vector<shared_ptr<TSDescriptor> > descs;
   GetSortedLiveDescriptors(&descs);
 
+  auto& resolver = master_->messenger()->resolver();
+
   // Collect all unique ip addresses.
-  InetAddress remote_endpoint;
-  RETURN_NOT_OK(remote_endpoint.FromString(request.remote_endpoint().host()));
+  InetAddress remote_endpoint(VERIFY_RESULT(resolver.Resolve(request.remote_endpoint().host())));
 
   const auto& proxy_uuid = request.proxy_uuid();
 
@@ -95,7 +99,7 @@ Result<std::shared_ptr<QLRowBlock>> PeersVTable::RetrieveData(
 
     entries.push_back({current_index, std::move(ts_info)});
     auto& entry = entries.back();
-    entry.ts_ips = util::GetPublicPrivateIPFutures(entry.ts_info, resolver_.get());
+    entry.ts_ips = util::GetPublicPrivateIPFutures(entry.ts_info, &resolver);
   }
 
   for (const auto& entry : entries) {
@@ -120,9 +124,9 @@ Result<std::shared_ptr<QLRowBlock>> PeersVTable::RetrieveData(
     // Need to use only 1 rpc address per node since system.peers has only 1 entry for each host,
     // so pick the first one.
     QLRow &row = vtable->Extend();
-    RETURN_NOT_OK(SetColumnValue(kPeer, *public_ip, &row));
-    RETURN_NOT_OK(SetColumnValue(kRPCAddress, *public_ip, &row));
-    RETURN_NOT_OK(SetColumnValue(kPreferredIp, *private_ip, &row));
+    RETURN_NOT_OK(SetColumnValue(kPeer, InetAddress(*public_ip), &row));
+    RETURN_NOT_OK(SetColumnValue(kRPCAddress, InetAddress(*public_ip), &row));
+    RETURN_NOT_OK(SetColumnValue(kPreferredIp, InetAddress(*private_ip), &row));
 
     // Datacenter and rack.
     CloudInfoPB cloud_info = entry.ts_info.registration().common().cloud_info();
@@ -133,6 +137,8 @@ Result<std::shared_ptr<QLRowBlock>> PeersVTable::RetrieveData(
     Uuid host_id;
     RETURN_NOT_OK(host_id.FromHexString(entry.ts_info.tserver_instance().permanent_uuid()));
     RETURN_NOT_OK(SetColumnValue(kHostId, host_id, &row));
+    RETURN_NOT_OK(SetColumnValue(yb::master::kSystemTablesReleaseVersionColumn,
+        yb::master::kSystemTablesReleaseVersion, &row));
 
     // schema_version.
     Uuid schema_version;
