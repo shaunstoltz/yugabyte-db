@@ -16,7 +16,8 @@ import {
   UniverseConnectModal,
   UniverseOverviewContainerNew,
   EncryptionKeyModalContainer,
-  ToggleUniverseStateContainer
+  ToggleUniverseStateContainer,
+  ToggleBackupStateContainer
 } from '../../universes';
 import { YBLabelWithIcon } from '../../common/descriptors';
 import { YBTabsWithLinksPanel } from '../../panels';
@@ -45,7 +46,13 @@ import {
 } from '../../../utils/LayoutUtils';
 import './UniverseDetail.scss';
 
-export const INSTANCE_WITH_EPHEMERAL_STORAGE_ONLY = ['i3', 'c5d'];
+const INSTANCE_WITH_EPHEMERAL_STORAGE_ONLY = ['i3', 'c5d'];
+
+export const isEphemeralAwsStorageInstance = (instanceType) => {
+  return INSTANCE_WITH_EPHEMERAL_STORAGE_ONLY.includes(
+    instanceType?.split?.('.')[0]
+  );
+}
 
 class UniverseDetail extends Component {
   constructor(props) {
@@ -126,13 +133,13 @@ class UniverseDetail extends Component {
 
   isCurrentUniverseDeleteTask = (uuid) => {
     return this.props.tasks.customerTaskList.filter(
-      (task) => task.targetUUID == uuid && task.type === 'Delete'
+      (task) => task.targetUUID === uuid && task.type === 'Delete'
     );
   };
 
   getUniverseInfo = () => {
     const universeUUID = this.props.universe.currentUniverse.data.universeUUID;
-    let currentUniverseTasks = this.isCurrentUniverseDeleteTask(universeUUID);
+    const currentUniverseTasks = this.isCurrentUniverseDeleteTask(universeUUID);
     if (currentUniverseTasks.length > 0) {
       browserHistory.push('/');
     } else {
@@ -207,6 +214,8 @@ class UniverseDetail extends Component {
       showManageKeyModal,
       showDeleteUniverseModal,
       showToggleUniverseStateModal,
+      showToggleBackupModal,
+      updateBackupState,
       closeModal,
       customer,
       customer: { currentCustomer },
@@ -455,12 +464,24 @@ class UniverseDetail extends Component {
       }
     } = currentUniverse;
 
-    const isEphemeralStorage =
+    const isEphemeralAwsStorage =
       nodeDetailsSet.find?.((node) => {
-        return INSTANCE_WITH_EPHEMERAL_STORAGE_ONLY.includes(
-          node.cloudInfo?.instance_type?.split?.('.')[0]
-        );
+        return isEphemeralAwsStorageInstance(node.cloudInfo?.instance_type);
       }) !== undefined;
+
+    /**
+     * Handle the backup state toggle.
+     * i.e open the confirmation model if backup is to be disabled.
+     * else, Enable the backups.
+     */
+    const handleBackupToggle = () => {
+      const takeBackups =
+        currentUniverse.data.universeConfig &&
+        currentUniverse.data.universeConfig?.takeBackups === 'true';
+      takeBackups
+        ? showToggleBackupModal()
+        : updateBackupState(currentUniverse.data.universeUUID, !takeBackups);
+    };
 
     return (
       <Grid id="page-wrapper" fluid={true} className={`universe-details universe-details-new`}>
@@ -611,6 +632,30 @@ class UniverseDetail extends Component {
                         />
                       )}
 
+                      {!universePaused && (
+                        <YBMenuItem
+                          disabled={updateInProgress}
+                          onClick={handleBackupToggle}
+                          availability={getFeatureState(
+                            currentCustomer.data.features,
+                            'universes.backup'
+                          )}
+                        >
+                          <YBLabelWithIcon
+                            icon={
+                              currentUniverse.data.universeConfig.takeBackups === 'true'
+                                ? 'fa fa-pause'
+                                : 'fa fa-play'
+                            }
+                          >
+                            {currentUniverse.data.universeConfig &&
+                            currentUniverse.data.universeConfig.takeBackups === 'true'
+                              ? 'Disable Backup'
+                              : 'Enable Backup'}
+                          </YBLabelWithIcon>
+                        </YBMenuItem>
+                      )}
+
                       <MenuItem divider />
 
                       {/* TODO:
@@ -621,7 +666,7 @@ class UniverseDetail extends Component {
                       current status of the universe. */}
 
                       {isAWSUniverse(currentUniverse?.data) &&
-                        !isEphemeralStorage &&
+                        !isEphemeralAwsStorage &&
                         (featureFlags.test['pausedUniverse'] ||
                           featureFlags.released['pausedUniverse']) && (
                           <YBMenuItem onClick={showToggleUniverseStateModal}>
@@ -699,7 +744,12 @@ class UniverseDetail extends Component {
           type="primary"
           universePaused={universePaused}
         />
-
+        <ToggleBackupStateContainer
+          visible={showModal && visibleModal === 'toggleBackupModalForm'}
+          onHide={closeModal}
+          universe={currentUniverse.data}
+          type="primary"
+        />
         <EncryptionKeyModalContainer
           modalVisible={showModal && visibleModal === 'manageKeyModal'}
           onHide={closeModal}

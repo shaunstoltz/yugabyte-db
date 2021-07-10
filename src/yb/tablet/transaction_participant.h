@@ -68,7 +68,7 @@ namespace tablet {
 struct TransactionApplyData {
   int64_t leader_term = -1;
   TransactionId transaction_id = TransactionId::Nil();
-  OpIdPB op_id;
+  OpId op_id;
   HybridTime commit_ht;
   HybridTime log_ht;
   bool sealed = false;
@@ -80,7 +80,7 @@ struct TransactionApplyData {
 };
 
 struct RemoveIntentsData {
-  OpIdPB op_id;
+  OpId op_id;
   HybridTime log_ht;
 };
 
@@ -118,7 +118,7 @@ class TransactionParticipantContext {
   virtual void UpdateClock(HybridTime hybrid_time) = 0;
   virtual bool IsLeader() = 0;
   virtual void SubmitUpdateTransaction(
-      std::unique_ptr<UpdateTxnOperationState> state, int64_t term) = 0;
+      std::unique_ptr<UpdateTxnOperation> state, int64_t term) = 0;
 
   // Returns hybrid time that lower than any future transaction apply record.
   virtual HybridTime SafeTimeForTransactionParticipant() = 0;
@@ -182,7 +182,7 @@ class TransactionParticipant : public TransactionStatusManager {
 
   void Abort(const TransactionId& id, TransactionStatusCallback callback) override;
 
-  void Handle(std::unique_ptr<tablet::UpdateTxnOperationState> request, int64_t term);
+  void Handle(std::unique_ptr<tablet::UpdateTxnOperation> request, int64_t term);
 
   void Cleanup(TransactionIdSet&& set) override;
 
@@ -190,7 +190,7 @@ class TransactionParticipant : public TransactionStatusManager {
   struct ReplicatedData {
     int64_t leader_term = -1;
     const tserver::TransactionStatePB& state;
-    const OpIdPB& op_id;
+    const OpId& op_id;
     HybridTime hybrid_time;
     bool sealed = false;
     AlreadyAppliedToRegularDB already_applied_to_regular_db;
@@ -240,6 +240,8 @@ class TransactionParticipant : public TransactionStatusManager {
   // After this call, there should be no active (non-aborted/committed) txn that
   // started before cutoff which is active on this tablet.
   CHECKED_STATUS StopActiveTxnsPriorTo(HybridTime cutoff, CoarseTimePoint deadline);
+
+  void IgnoreAllTransactionsStartedBefore(HybridTime limit);
 
   std::string DumpTransactions() const;
 

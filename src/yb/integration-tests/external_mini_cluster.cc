@@ -551,16 +551,18 @@ Status ExternalMiniCluster::RemoveMaster(ExternalMaster* master) {
 }
 
 std::shared_ptr<ConsensusServiceProxy> ExternalMiniCluster::GetLeaderConsensusProxy() {
+  return GetConsensusProxy(GetLeaderMaster());
+}
+
+std::shared_ptr<MasterServiceProxy> ExternalMiniCluster::GetLeaderMasterProxy() {
   auto leader_master_sock = GetLeaderMaster()->bound_rpc_addr();
 
-  return std::make_shared<ConsensusServiceProxy>(proxy_cache_.get(), leader_master_sock);
+  return std::make_shared<MasterServiceProxy>(proxy_cache_.get(), leader_master_sock);
 }
 
 std::shared_ptr<ConsensusServiceProxy> ExternalMiniCluster::GetConsensusProxy(
-    scoped_refptr<ExternalMaster> master) {
-  auto master_sock = master->bound_rpc_addr();
-
-  return std::make_shared<ConsensusServiceProxy>(proxy_cache_.get(), master_sock);
+    ExternalDaemon* external_deamon) {
+  return GetProxy<ConsensusServiceProxy>(external_deamon);
 }
 
 Status ExternalMiniCluster::StepDownMasterLeader(TabletServerErrorPB::Code* error_code) {
@@ -840,6 +842,91 @@ Status ExternalMiniCluster::GetMinReplicaCountForPlacementBlock(
   return Status::OK();
 }
 
+Status ExternalMiniCluster::AddTServerToLeaderBlacklist(
+    ExternalMaster* master,
+    ExternalTabletServer* ts) {
+  GetMasterClusterConfigRequestPB config_req;
+  GetMasterClusterConfigResponsePB config_resp;
+  int index = GetIndexOfMaster(master);
+
+  if (index == -1) {
+    return STATUS(InvalidArgument, Substitute(
+        "Given master '$0' not in the current list of $1 masters.",
+        master->bound_rpc_hostport().ToString(), masters_.size()));
+  }
+
+  std::shared_ptr<MasterServiceProxy> proxy = master_proxy(index);
+  rpc::RpcController rpc;
+  rpc.set_timeout(opts_.timeout);
+  RETURN_NOT_OK(proxy->GetMasterClusterConfig(config_req, &config_resp, &rpc));
+  if (config_resp.has_error()) {
+    return STATUS(RuntimeError, Substitute(
+        "GetMasterClusterConfig RPC response hit error: $0",
+        config_resp.error().ShortDebugString()));
+  }
+  // Get current config
+  ChangeMasterClusterConfigRequestPB change_req;
+  SysClusterConfigEntryPB config = *config_resp.mutable_cluster_config();
+  // add tserver to blacklist
+  HostPortToPB(ts->bound_rpc_hostport(), config.mutable_leader_blacklist()->mutable_hosts()->Add());
+  *change_req.mutable_cluster_config() = config;
+  ChangeMasterClusterConfigResponsePB change_resp;
+  rpc.Reset();
+  RETURN_NOT_OK(proxy->ChangeMasterClusterConfig(change_req, &change_resp, &rpc));
+  if (change_resp.has_error()) {
+    return STATUS(RuntimeError, Substitute(
+        "ChangeMasterClusterConfig RPC response hit error: $0",
+        change_resp.error().ShortDebugString()));
+  }
+
+  LOG(INFO) << "TServer at " << ts->bound_rpc_hostport().ToString()
+  << " was added to the leader blacklist";
+
+  return Status::OK();
+}
+
+Status ExternalMiniCluster::EmptyBlacklist(
+    ExternalMaster* master) {
+  GetMasterClusterConfigRequestPB config_req;
+  GetMasterClusterConfigResponsePB config_resp;
+  int index = GetIndexOfMaster(master);
+
+  if (index == -1) {
+    return STATUS(InvalidArgument, Substitute(
+        "Given master '$0' not in the current list of $1 masters.",
+        master->bound_rpc_hostport().ToString(), masters_.size()));
+  }
+
+  std::shared_ptr<MasterServiceProxy> proxy = master_proxy(index);
+  rpc::RpcController rpc;
+  rpc.set_timeout(opts_.timeout);
+  RETURN_NOT_OK(proxy->GetMasterClusterConfig(config_req, &config_resp, &rpc));
+  if (config_resp.has_error()) {
+    return STATUS(RuntimeError, Substitute(
+        "GetMasterClusterConfig RPC response hit error: $0",
+        config_resp.error().ShortDebugString()));
+  }
+  // Get current config.
+  ChangeMasterClusterConfigRequestPB change_req;
+  SysClusterConfigEntryPB config = *config_resp.mutable_cluster_config();
+  // Clear blacklist.
+  config.mutable_server_blacklist()->mutable_hosts()->Clear();
+  config.mutable_leader_blacklist()->mutable_hosts()->Clear();
+  *change_req.mutable_cluster_config() = config;
+  ChangeMasterClusterConfigResponsePB change_resp;
+  rpc.Reset();
+  RETURN_NOT_OK(proxy->ChangeMasterClusterConfig(change_req, &change_resp, &rpc));
+  if (change_resp.has_error()) {
+    return STATUS(RuntimeError, Substitute(
+        "ChangeMasterClusterConfig RPC response hit error: $0",
+        change_resp.error().ShortDebugString()));
+  }
+
+  LOG(INFO) << "Blacklist cleared successfully";
+
+  return Status::OK();
+}
+
 Status ExternalMiniCluster::GetNumMastersAsSeenBy(ExternalMaster* master, int* num_peers) {
   ListMastersRequestPB list_req;
   ListMastersResponsePB list_resp;
@@ -912,7 +999,7 @@ Status ExternalMiniCluster::GetLastOpIdForEachMasterPeer(
     opid_req.set_dest_uuid(master->uuid());
     opid_req.set_opid_type(opid_type);
     RETURN_NOT_OK_PREPEND(
-        GetConsensusProxy(master)->GetLastOpId(opid_req, &opid_resp, &controller),
+        GetConsensusProxy(master.get())->GetLastOpId(opid_req, &opid_resp, &controller),
         Substitute("Failed to fetch last op id from $0", master->bound_rpc_hostport().port()));
     op_ids->push_back(opid_resp.opid());
     controller.Reset();
@@ -1132,6 +1219,46 @@ Status ExternalMiniCluster::WaitForInitDb() {
   }
 }
 
+Result<bool> ExternalMiniCluster::is_ts_stale(int ts_idx) {
+  std::shared_ptr<master::MasterServiceProxy> proxy = master_proxy();
+  std::shared_ptr<rpc::RpcController> controller = std::make_shared<rpc::RpcController>();
+  master::ListTabletServersRequestPB req;
+  master::ListTabletServersResponsePB resp;
+  controller->Reset();
+
+  RETURN_NOT_OK(proxy->ListTabletServers(req, &resp, controller.get()));
+
+  bool is_stale = false, is_ts_found = false;
+  for (int i = 0; i < resp.servers_size(); i++) {
+    if (!resp.servers(i).has_instance_id()) {
+      return STATUS_SUBSTITUTE(
+        Uninitialized,
+        "ListTabletServers RPC returned a TS with uninitialized instance id."
+      );
+    }
+
+    if (!resp.servers(i).instance_id().has_permanent_uuid()) {
+      return STATUS_SUBSTITUTE(
+        Uninitialized,
+        "ListTabletServers RPC returned a TS with uninitialized UUIDs."
+      );
+    }
+
+    if (resp.servers(i).instance_id().permanent_uuid() == tablet_server(ts_idx)->uuid()) {
+      is_ts_found = true;
+      is_stale = !resp.servers(i).alive();
+    }
+  }
+
+  if (!is_ts_found) {
+    return STATUS_SUBSTITUTE(
+        NotFound,
+        "Given TS not found in ListTabletServers RPC."
+    );
+  }
+  return is_stale;
+}
+
 string ExternalMiniCluster::GetBindIpForTabletServer(int index) const {
   if (opts_.use_even_ips) {
     return Substitute("127.0.0.$0", (index + 1) * 2);
@@ -1285,7 +1412,7 @@ Result<std::vector<ListTabletsForTabletServerResponsePB::Entry>> ExternalMiniClu
   ListTabletsForTabletServerResponsePB resp;
 
   rpc::RpcController rpc;
-  rpc.set_timeout(MonoDelta::FromSeconds(10));
+  rpc.set_timeout(10s * kTimeMultiplier);
   RETURN_NOT_OK(proxy.ListTabletsForTabletServer(req, &resp, &rpc));
 
   std::vector<ListTabletsForTabletServerResponsePB::Entry> result;
@@ -1445,6 +1572,22 @@ ExternalMaster* ExternalMiniCluster::GetLeaderMaster() {
   } while (!s.ok());
 
   return master(idx);
+}
+
+Result<int> ExternalMiniCluster::GetTabletLeaderIndex(const std::string& tablet_id) {
+  for (int i = 0; i < num_tablet_servers(); ++i) {
+    auto tserver = tablet_server(i);
+    if (tserver->IsProcessAlive()) {
+      auto tablets = VERIFY_RESULT(GetTablets(tserver));
+      for (const auto& tablet : tablets) {
+        if (tablet.tablet_id() == tablet_id && tablet.is_leader()) {
+          return i;
+        }
+      }
+    }
+  }
+  return STATUS(
+      NotFound, Format("Could not find leader of tablet $0 among live tservers.", tablet_id));
 }
 
 ExternalTabletServer* ExternalMiniCluster::tablet_server_by_uuid(const std::string& uuid) const {
@@ -1858,7 +2001,7 @@ Status ExternalDaemon::StartProcess(const vector<string>& user_flags) {
 
   AddExtraFlagsFromEnvVar("YB_EXTRA_DAEMON_FLAGS", &argv);
 
-  gscoped_ptr<Subprocess> p(new Subprocess(exe_, argv));
+  std::unique_ptr<Subprocess> p(new Subprocess(exe_, argv));
   p->ShareParentStdout(false);
   p->ShareParentStderr(false);
   auto default_output_prefix = Substitute("[$0]", daemon_id_);
@@ -2296,7 +2439,9 @@ ExternalTabletServer::ExternalTabletServer(
 ExternalTabletServer::~ExternalTabletServer() {
 }
 
-Status ExternalTabletServer::Start(bool start_cql_proxy, bool set_proxy_addrs) {
+Status ExternalTabletServer::Start(
+    bool start_cql_proxy, bool set_proxy_addrs,
+    std::vector<std::pair<string, string>> extra_flags) {
   start_cql_proxy_ = start_cql_proxy;
   Flags flags;
   flags.Add("fs_data_dirs", data_dir_);
@@ -2320,6 +2465,10 @@ Status ExternalTabletServer::Start(bool start_cql_proxy, bool set_proxy_addrs) {
   // where several unit tests tend to run in parallel.
   flags.Add("tablet_server_svc_num_threads", "64");
   flags.Add("ts_consensus_svc_num_threads", "20");
+
+  for (const auto& flag_value : extra_flags) {
+    flags.Add(flag_value.first, flag_value.second);
+  }
 
   RETURN_NOT_OK(StartProcess(flags.value()));
 
@@ -2356,7 +2505,8 @@ Status ExternalTabletServer::DeleteServerInfoPaths() {
   return Status::OK();
 }
 
-Status ExternalTabletServer::Restart(bool start_cql_proxy) {
+Status ExternalTabletServer::Restart(
+    bool start_cql_proxy, std::vector<std::pair<string, string>> flags) {
   LOG_WITH_PREFIX(INFO) << "Restart: start_cql_proxy=" << start_cql_proxy;
   if (!IsProcessAlive()) {
     // Make sure this function could be safely called if the process has already crashed.
@@ -2366,7 +2516,18 @@ Status ExternalTabletServer::Restart(bool start_cql_proxy) {
   if (bound_rpc_.port() == 0) {
     return STATUS(IllegalState, "Tablet server cannot be restarted. Must call Shutdown() first.");
   }
-  return Start(start_cql_proxy);
+  return Start(start_cql_proxy, true /* set_proxy_addrs */, flags);
+}
+
+Status RestartAllMasters(ExternalMiniCluster* cluster) {
+  for (int i = 0; i != cluster->num_masters(); ++i) {
+    cluster->master(i)->Shutdown();
+  }
+  for (int i = 0; i != cluster->num_masters(); ++i) {
+    RETURN_NOT_OK(cluster->master(i)->Restart());
+  }
+
+  return Status::OK();
 }
 
 }  // namespace yb

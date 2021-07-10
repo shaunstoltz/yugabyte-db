@@ -71,11 +71,6 @@ class CDCServiceTestMinSpace_TestLogRetentionByOpId_MinSpace_Test;
 
 namespace log {
 
-struct LogMetrics;
-class LogEntryBatch;
-class LogIndex;
-class LogReader;
-
 YB_STRONGLY_TYPED_BOOL(CreateNewSegment);
 
 // Log interface, inspired by Raft's (logcabin) Log. Provides durability to YugaByte as a normal
@@ -130,9 +125,7 @@ class Log : public RefCountedThreadSafe<Log> {
   //
   // WARNING: the caller _must_ call AsyncAppend() or else the log will "stall" and will never be
   // able to make forward progress.
-  CHECKED_STATUS Reserve(LogEntryTypePB type,
-                         LogEntryBatchPB* entry_batch,
-                         LogEntryBatch** reserved_entry);
+  void Reserve(LogEntryTypePB type, LogEntryBatchPB* entry_batch, LogEntryBatch** reserved_entry);
 
   // Asynchronously appends 'entry' to the log. Once the append completes and is synced, 'callback'
   // will be invoked.
@@ -234,7 +227,8 @@ class Log : public RefCountedThreadSafe<Log> {
   }
 
   // Forces the Log to allocate a new segment and roll over.  This can be used to make sure all
-  // entries appended up to this point are available in closed, readable segments.
+  // entries appended up to this point are available in closed, readable segments. Note that this
+  // assumes there is already a valid active_segment_.
   CHECKED_STATUS AllocateSegmentAndRollOver();
 
   // For a log created with CreateNewSegment::kFalse, this is used to finish log initialization by
@@ -281,6 +275,10 @@ class Log : public RefCountedThreadSafe<Log> {
 
   const std::string& LogPrefix() const {
     return log_prefix_;
+  }
+
+  std::string wal_dir() const {
+    return wal_dir_;
   }
 
   void set_cdc_min_replicated_index(int64_t cdc_min_replicated_index) {
@@ -348,7 +346,8 @@ class Log : public RefCountedThreadSafe<Log> {
   // Initializes a new one or continues an existing log.
   CHECKED_STATUS Init();
 
-  // Make segments roll over.
+  // Make segments roll over. Note this assumes there was an existing valid active_segment_ we are
+  // rolling over from.
   CHECKED_STATUS RollOver();
 
   // Writes the footer and closes the current segment.
@@ -429,7 +428,7 @@ class Log : public RefCountedThreadSafe<Log> {
   uint32_t schema_version_;
 
   // The currently active segment being written.
-  gscoped_ptr<WritableLogSegment> active_segment_;
+  std::unique_ptr<WritableLogSegment> active_segment_;
 
   // The current (active) segment sequence number. Initialized in the Log constructor based on
   // LogOptions.
@@ -516,7 +515,7 @@ class Log : public RefCountedThreadSafe<Log> {
 
   scoped_refptr<MetricEntity> table_metric_entity_;
   scoped_refptr<MetricEntity> tablet_metric_entity_;
-  gscoped_ptr<LogMetrics> metrics_;
+  std::unique_ptr<LogMetrics> metrics_;
 
   // The cached on-disk size of the log, used to track its size even if it has been closed.
   std::atomic<uint64_t> on_disk_size_;

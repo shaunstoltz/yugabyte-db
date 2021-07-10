@@ -306,7 +306,7 @@ void RunningTransaction::DoStatusReceived(const Status& status,
     auto coordinator_safe_time = response.coordinator_safe_time().size() == 1
         ? HybridTime::FromPB(response.coordinator_safe_time(0)) : HybridTime();
     if (UpdateStatus(transaction_status, time_of_status, coordinator_safe_time)) {
-      context_.EnqueueRemoveUnlocked(id(), &min_running_notifier);
+      context_.EnqueueRemoveUnlocked(id(), RemoveReason::kStatusReceived, &min_running_notifier);
     }
 
     time_of_status = last_known_status_hybrid_time_;
@@ -411,7 +411,7 @@ void RunningTransaction::AbortReceived(const Status& status,
     if (result.ok() && result->status_time != HybridTime::kMax) {
       auto coordinator_safe_time = HybridTime::FromPB(response.coordinator_safe_time());
       if (UpdateStatus(result->status, result->status_time, coordinator_safe_time)) {
-        context_.EnqueueRemoveUnlocked(id(), &min_running_notifier);
+        context_.EnqueueRemoveUnlocked(id(), RemoveReason::kAbortReceived, &min_running_notifier);
       }
     }
   }
@@ -436,8 +436,19 @@ void RunningTransaction::SetApplyData(const docdb::ApplyTransactionState& apply_
                                       ScopedRWOperation* operation) {
   apply_state_ = apply_state;
   bool active = apply_state_.active();
+  if (active) {
+    // We are trying to assign set processing apply before starting actual process, and unset
+    // after we complete processing.
+    processing_apply_.store(true, std::memory_order_release);
+  }
 
   if (data) {
+    if (!active) {
+      LOG_WITH_PREFIX(DFATAL)
+          << "Starting processing apply, but provided data in inactive state: " << data->ToString();
+      return;
+    }
+
     apply_data_ = *data;
     apply_data_.apply_state = &apply_state_;
 
@@ -452,16 +463,18 @@ void RunningTransaction::SetApplyData(const docdb::ApplyTransactionState& apply_
   }
 
   if (!active) {
+    processing_apply_.store(false, std::memory_order_release);
+
     VLOG_WITH_PREFIX(3) << "Finished applying intents";
 
     MinRunningNotifier min_running_notifier(&context_.applier_);
     std::lock_guard<std::mutex> lock(context_.mutex_);
-    context_.RemoveUnlocked(id(), "applied large"s, &min_running_notifier);
+    context_.RemoveUnlocked(id(), RemoveReason::kLargeApplied, &min_running_notifier);
   }
 }
 
 bool RunningTransaction::ProcessingApply() const {
-  return apply_state_.active();
+  return processing_apply_.load(std::memory_order_acquire);
 }
 
 void RunningTransaction::UpdateAbortCheckHT(HybridTime now, UpdateAbortCheckHTMode mode) {

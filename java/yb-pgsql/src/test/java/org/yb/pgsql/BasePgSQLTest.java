@@ -12,11 +12,12 @@
 //
 package org.yb.pgsql;
 
-import static com.google.common.base.Preconditions.checkNotNull;
+import static com.google.common.base.Preconditions.*;
 import static org.yb.AssertionWrappers.*;
 import static org.yb.util.SanitizerUtil.isASAN;
 import static org.yb.util.SanitizerUtil.isTSAN;
 
+import com.google.common.collect.ImmutableMap;
 import com.google.common.net.HostAndPort;
 import com.google.gson.JsonArray;
 import com.google.gson.JsonElement;
@@ -40,6 +41,7 @@ import org.yb.client.TestUtils;
 import org.yb.minicluster.*;
 import org.yb.minicluster.Metrics.YSQLStat;
 import org.yb.util.EnvAndSysPropertyUtil;
+import org.yb.util.MiscUtil.ThrowingCallable;
 import org.yb.util.SanitizerUtil;
 import org.yb.master.Master;
 
@@ -71,7 +73,6 @@ public class BasePgSQLTest extends BaseMiniClusterTest {
 
   // Postgres flags.
   private static final String MASTERS_FLAG = "FLAGS_pggate_master_addresses";
-  private static final String PG_DATA_FLAG = "PGDATA";
   private static final String YB_ENABLED_IN_PG_ENV_VAR_NAME = "YB_ENABLED_IN_POSTGRES";
 
   // Metric names.
@@ -172,10 +173,6 @@ public class BasePgSQLTest extends BaseMiniClusterTest {
     }
   }
 
-  protected Map<String, String> getMasterAndTServerFlags() {
-    return new TreeMap<>();
-  }
-
   protected Integer getYsqlPrefetchLimit() {
     return null;
   }
@@ -187,8 +184,9 @@ public class BasePgSQLTest extends BaseMiniClusterTest {
   /**
    * @return flags shared between tablet server and initdb
    */
+  @Override
   protected Map<String, String> getTServerFlags() {
-    Map<String, String> flagMap = new TreeMap<>();
+    Map<String, String> flagMap = super.getTServerFlags();
 
     if (isTSAN() || isASAN()) {
       flagMap.put("pggate_rpc_timeout_secs", "120");
@@ -212,10 +210,11 @@ public class BasePgSQLTest extends BaseMiniClusterTest {
     return flagMap;
   }
 
+  @Override
   protected Map<String, String> getMasterFlags() {
-    Map<String, String> flagMap = new TreeMap<>();
+    Map<String, String> flagMap = super.getMasterFlags();
     flagMap.put("client_read_write_timeout_ms",
-                String.valueOf(SanitizerUtil.adjustTimeout(120000)));
+        String.valueOf(SanitizerUtil.adjustTimeout(120000)));
     flagMap.put("memory_limit_hard_bytes", String.valueOf(2L * 1024 * 1024 * 1024));
     return flagMap;
   }
@@ -233,18 +232,6 @@ public class BasePgSQLTest extends BaseMiniClusterTest {
   @Override
   protected void customizeMiniClusterBuilder(MiniYBClusterBuilder builder) {
     super.customizeMiniClusterBuilder(builder);
-    for (Map.Entry<String, String> entry : getTServerFlags().entrySet()) {
-      builder.addCommonTServerArgs("--" + entry.getKey() + "=" + entry.getValue());
-    }
-    for (Map.Entry<String, String> entry : getMasterFlags().entrySet()) {
-      builder.addMasterArgs("--" + entry.getKey() + "=" + entry.getValue());
-    }
-
-    for (Map.Entry<String, String> entry : getMasterAndTServerFlags().entrySet()) {
-      String flagStr = "--" + entry.getKey() + "=" + entry.getValue();
-      builder.addCommonTServerArgs(flagStr);
-      builder.addMasterArgs(flagStr);
-    }
     builder.enablePostgres(true);
   }
 
@@ -296,7 +283,6 @@ public class BasePgSQLTest extends BaseMiniClusterTest {
   @Override
   protected void resetSettings() {
     super.resetSettings();
-    // TODO(alex): Move to a superclass
     startCqlProxy = false;
     startRedisProxy = false;
   }
@@ -368,18 +354,28 @@ public class BasePgSQLTest extends BaseMiniClusterTest {
   private void cleanUpCustomDatabases() throws Exception {
     LOG.info("Cleaning up custom databases");
     try (Statement stmt = connection.createStatement()) {
-      List<String> databases = getRowList(stmt,
-          "SELECT datname FROM pg_database" +
-              " WHERE datname <> 'template0'" +
-              " AND datname <> 'template1'" +
-              " AND datname <> 'postgres'" +
-              " AND datname <> 'yugabyte'" +
-              " AND datname <> 'system_platform'").stream().map(r -> r.getString(0))
-                  .collect(Collectors.toList());
+      for (int i = 0; i < 2; i++) {
+        try {
+        List<String> databases = getRowList(stmt,
+            "SELECT datname FROM pg_database" +
+                " WHERE datname <> 'template0'" +
+                " AND datname <> 'template1'" +
+                " AND datname <> 'postgres'" +
+                " AND datname <> 'yugabyte'" +
+                " AND datname <> 'system_platform'").stream().map(r -> r.getString(0))
+                    .collect(Collectors.toList());
 
-      for (String database : databases) {
-        LOG.info("Dropping database '{}'", database);
-        stmt.execute("DROP DATABASE " + database);
+        for (String database : databases) {
+          LOG.info("Dropping database '{}'", database);
+          stmt.execute("DROP DATABASE " + database);
+        }
+        } catch (Exception e) {
+          if (e.toString().contains("Catalog Version Mismatch: A DDL occurred while processing")) {
+            continue;
+          } else {
+            throw e;
+          }
+        }
       }
     }
   }
@@ -389,17 +385,27 @@ public class BasePgSQLTest extends BaseMiniClusterTest {
     LOG.info("Cleaning up roles");
     List<String> persistentUsers = Arrays.asList(DEFAULT_PG_USER, TEST_PG_USER);
     try (Statement stmt = connection.createStatement()) {
-      List<String> roles = getRowList(stmt, "SELECT rolname FROM pg_roles"
-          + " WHERE rolname <> 'postgres' AND rolname NOT LIKE 'pg_%'").stream()
-              .map(r -> r.getString(0))
-              .collect(Collectors.toList());
+      for (int i = 0; i < 2; i++) {
+        try {
+        List<String> roles = getRowList(stmt, "SELECT rolname FROM pg_roles"
+            + " WHERE rolname <> 'postgres' AND rolname NOT LIKE 'pg_%'").stream()
+                .map(r -> r.getString(0))
+                .collect(Collectors.toList());
 
-      for (String role : roles) {
-        boolean isPersistent = persistentUsers.contains(role);
-        LOG.info("Cleaning up role {} (persistent? {})", role, isPersistent);
-        stmt.execute("DROP OWNED BY " + role + " CASCADE");
-        if (!isPersistent) {
-          stmt.execute("DROP ROLE " + role);
+        for (String role : roles) {
+          boolean isPersistent = persistentUsers.contains(role);
+          LOG.info("Cleaning up role {} (persistent? {})", role, isPersistent);
+          stmt.execute("DROP OWNED BY " + role + " CASCADE");
+          if (!isPersistent) {
+            stmt.execute("DROP ROLE " + role);
+          }
+        }
+        } catch (Exception e) {
+          if (e.toString().contains("Catalog Version Mismatch: A DDL occurred while processing")) {
+            continue;
+          } else {
+            throw e;
+          }
         }
       }
     }
@@ -836,17 +842,37 @@ public class BasePgSQLTest extends BaseMiniClusterTest {
 
   protected static class Row implements Comparable<Row>, Cloneable {
     static Row fromResultSet(ResultSet rs) throws SQLException {
-      Object[] elems = new Object[rs.getMetaData().getColumnCount()];
-      for (int i = 0; i < elems.length; i++) {
-        elems[i] = rs.getObject(i + 1); // Column index starts from 1.
+      List<Object> elems = new ArrayList<>();
+      List<String> columnNames = new ArrayList<>();
+      for (int i = 1; i <= rs.getMetaData().getColumnCount(); i++) {
+        elems.add(rs.getObject(i));
+        columnNames.add(rs.getMetaData().getColumnLabel(i));
       }
-      return new Row(elems);
+      return new Row(elems, columnNames);
     }
 
-    ArrayList<Object> elems = new ArrayList<>();
+    List<Object> elems = new ArrayList<>();
+
+    /**
+     * List of column names, should have the same size as {@link #elems}.
+     * <p>
+     * Not used for equality, hash code and comparison.
+     */
+    List<String> columnNames = new ArrayList<>();
 
     Row(Object... elems) {
       Collections.addAll(this.elems, elems);
+    }
+
+    Row(List<Object> elems, List<String> columnNames) {
+      checkArgument(elems.size() == columnNames.size());
+      this.elems = elems;
+      this.columnNames = columnNames;
+    }
+
+    /** Returns a column name if available, or {@code null} otherwise. */
+    String getColumnName(int index) {
+      return columnNames.size() > 0 ? columnNames.get(index) : null;
     }
 
     Object get(int index) {
@@ -905,10 +931,18 @@ public class BasePgSQLTest extends BaseMiniClusterTest {
 
     @Override
     public String toString() {
+      return toString(false /* printColumnNames */);
+    }
+
+    public String toString(boolean printColumnNames) {
       StringBuilder sb = new StringBuilder();
       sb.append("Row[");
       for (int i = 0; i < elems.size(); i++) {
         if (i > 0) sb.append(',');
+        if (printColumnNames) {
+          String columnNameOrNull = getColumnName(i);
+          sb.append((columnNameOrNull != null ? columnNameOrNull : i) + "=");
+        }
         if (elems.get(i) == null) {
           sb.append("null");
         } else {
@@ -922,11 +956,9 @@ public class BasePgSQLTest extends BaseMiniClusterTest {
 
     @Override
     public Row clone() throws CloneNotSupportedException {
-      Row clone = (Row)super.clone();
-      clone.elems = new ArrayList<>(elems.size());
-      for (Object e : elems) {
-        clone.elems.add(e);
-      }
+      Row clone = (Row) super.clone();
+      clone.elems = new ArrayList<>(this.elems);
+      clone.columnNames = new ArrayList<>(this.columnNames);
       return clone;
     }
 
@@ -1075,7 +1107,37 @@ public class BasePgSQLTest extends BaseMiniClusterTest {
     }
   }
 
-  protected List<Row> getRowList(ResultSet rs) throws SQLException {
+  protected static boolean runSystemTableQuery(Statement stmt, String query) throws SQLException {
+    return systemTableQueryHelper(stmt, () -> stmt.execute(query));
+  }
+
+  protected static List<Row> executeSystemTableQuery(
+        Statement stmt, String query) throws SQLException {
+    return systemTableQueryHelper(stmt, () -> {
+      try (ResultSet result = stmt.executeQuery(query)){
+        return getRowList(result);
+      }
+    });
+  }
+
+  private  static <T> T systemTableQueryHelper(
+      Statement stmt, ThrowingCallable<T, SQLException> callable) throws SQLException {
+    String allow_non_ddl_pattern = "SET yb_non_ddl_txn_for_sys_tables_allowed=%d";
+    stmt.execute(String.format(allow_non_ddl_pattern, 1));
+    try {
+      return callable.call();
+    } finally {
+      stmt.execute(String.format(allow_non_ddl_pattern, 0));
+    }
+  }
+
+  protected Row getSingleRow(Statement stmt, String query) throws SQLException {
+    try (ResultSet rs = stmt.executeQuery(query)) {
+      return getSingleRow(rs);
+    }
+  }
+
+  protected static List<Row> getRowList(ResultSet rs) throws SQLException {
     List<Row> rows = new ArrayList<>();
     while (rs.next()) {
       rows.add(Row.fromResultSet(rs));
@@ -1090,12 +1152,17 @@ public class BasePgSQLTest extends BaseMiniClusterTest {
     return rows;
   }
 
-  /** Better alternative to assertEquals, which provides more mismatch details. */
+  /** Better alternative to assertEquals that provides more mismatch details. */
   protected void assertRows(List<Row> expected, List<Row> actual) {
-    assertEquals("Collection length mismatch: expected " + expected.size()
-        + ", but was ", expected.size(), actual.size());
+    assertRows(null, expected, actual);
+  }
+
+  /** Better alternative to assertEquals that provides more mismatch details. */
+  protected void assertRows(String messagePrefix, List<Row> expected, List<Row> actual) {
+    String fullPrefix = StringUtils.isEmpty(messagePrefix) ? "" : (messagePrefix + ": ");
+    assertEquals(fullPrefix + "Collection length mismatch:", expected.size(), actual.size());
     for (int i = 0; i < expected.size(); ++i) {
-      assertRow("Mismatch at row " + (i + 1) + ": ", expected.get(i), actual.get(i));
+      assertRow(fullPrefix + "Mismatch at row " + (i + 1) + ": ", expected.get(i), actual.get(i));
     }
   }
 
@@ -1108,11 +1175,14 @@ public class BasePgSQLTest extends BaseMiniClusterTest {
         + "\nActual row:   " + actual,
         expected.elems.size(), actual.elems.size());
     for (int i = 0; i < expected.elems.size(); ++i) {
+      String columnNameOrNull = expected.getColumnName(i);
       assertTrue(messagePrefix
-          + "Column " + (i + 1) + " mismatch: expected:<" + expected.elems.get(i)
+          + "Column #" + (i + 1)
+          + (columnNameOrNull != null ? " (" + columnNameOrNull + ") " : " ")
+          + "mismatch: expected:<" + expected.elems.get(i)
           + "> but was:<" + actual.elems.get(i) + ">"
-          + "\nExpected row: " + expected
-          + "\nActual row:   " + actual,
+          + "\nExpected row: " + expected.toString(true /* printColumnNames */)
+          + "\nActual row:   " + actual.toString(true /* printColumnNames */),
           expected.elementEquals(i, actual.elems.get(i)));
     }
   }
@@ -1547,6 +1617,24 @@ public class BasePgSQLTest extends BaseMiniClusterTest {
       }
       return sb.toString().trim();
     }
+  }
+
+  protected int spawnTServerWithFlags(Map<String, String> additionalFlags) throws Exception {
+    Map<String, String> tserverFlags = getTServerFlags();
+    tserverFlags.putAll(additionalFlags);
+    int tserver = miniCluster.getNumTServers();
+    miniCluster.startTServer(tserverFlags);
+    return tserver;
+  }
+
+  /**
+   * Simple helper for {@link #spawnTServerWithFlags(Map)}.
+   * <p>
+   * Please use {@code ImmutableMap.of} for more arguments!
+   */
+  protected int spawnTServerWithFlags(
+      String additionalFlagKey, String additionalFlagValue) throws Exception {
+    return spawnTServerWithFlags(ImmutableMap.of(additionalFlagKey, additionalFlagValue));
   }
 
   /** Run a process, returning output lines. */

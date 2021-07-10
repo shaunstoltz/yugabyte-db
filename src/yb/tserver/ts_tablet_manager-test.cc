@@ -40,7 +40,7 @@
 
 #include "yb/common/partition.h"
 #include "yb/common/schema.h"
-#include "yb/consensus/consensus.h"
+#include "yb/consensus/consensus_round.h"
 #include "yb/consensus/consensus.pb.h"
 #include "yb/consensus/metadata.pb.h"
 #include "yb/consensus/raft_consensus.h"
@@ -50,6 +50,7 @@
 #include "yb/tablet/tablet-test-util.h"
 #include "yb/tserver/mini_tablet_server.h"
 #include "yb/tserver/tablet_server.h"
+#include "yb/tserver/tablet_memory_manager.h"
 #include "yb/util/test_util.h"
 #include "yb/util/format.h"
 
@@ -231,6 +232,7 @@ TEST_F(TsTabletManagerTest, TestTombstonedTabletsAreUnregistered) {
   ASSERT_OK(tablet_manager_->DeleteTablet(kTabletId1,
       tablet::TABLET_DATA_TOMBSTONED,
       cas_config_opid_index_less_or_equal,
+      false,
       &error_code));
 
   assert_tablet_assignment_count(kTabletId1, 0);
@@ -244,6 +246,7 @@ TEST_F(TsTabletManagerTest, TestTombstonedTabletsAreUnregistered) {
   ASSERT_OK(tablet_manager_->DeleteTablet(kTabletId1,
                                           tablet::TABLET_DATA_DELETED,
                                           cas_config_opid_index_less_or_equal,
+                                          false,
                                           &error_code));
 
   assert_tablet_assignment_count(kTabletId1, 0);
@@ -278,6 +281,7 @@ TEST_F(TsTabletManagerTest, TestProperBackgroundFlushOnStartup) {
     ConsensusRoundPtr round(new ConsensusRound(peer->consensus(), std::move(replicate_ptr)));
     consensus_rounds.emplace_back(round);
     round->BindToTerm(peer->raft_consensus()->TEST_LeaderTerm());
+    round->SetCallback(consensus::MakeNonTrackedRoundCallback(round.get(), [](const Status&){}));
     ASSERT_OK(peer->consensus()->TEST_Replicate(round));
   }
 
@@ -289,7 +293,7 @@ TEST_F(TsTabletManagerTest, TestProperBackgroundFlushOnStartup) {
     ASSERT_OK(mini_server_->Start());
     auto* tablet_manager = mini_server_->server()->tablet_manager();
     ASSERT_NE(nullptr, tablet_manager);
-    tablet_manager->MaybeFlushTablet();
+    tablet_manager->tablet_memory_manager()->FlushTabletIfLimitExceeded();
     ASSERT_OK(mini_server_->WaitStarted());
     for (auto& tablet_id : tablet_ids) {
       std::shared_ptr<TabletPeer> peer;

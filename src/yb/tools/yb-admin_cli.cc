@@ -218,7 +218,7 @@ Status ClusterAdminCli::Run(int argc, char** argv) {
   CLIArguments command_args(args.begin() + 2, args.end());
   s = commands_[cmd->second].action_(command_args);
   if (!s.ok()) {
-    cerr << "Error: " << s.ToString() << endl;
+    cerr << "Error running " << cmd->first << ": " << s << endl;
     return STATUS(RuntimeError, "Error running command");
   }
   return Status::OK();
@@ -259,6 +259,12 @@ void ClusterAdminCli::SetUsage(const string& prog_name) {
   google::SetUsageMessage(str.str());
 }
 
+Result<rapidjson::Document> DdlLog(
+    ClusterAdminClientClass* client, const ClusterAdminCli::CLIArguments& args) {
+  RETURN_NOT_OK(CheckArgumentsCount(args.size(), 0, 0));
+  return client->DdlLog();
+}
+
 void ClusterAdminCli::RegisterCommandHandlers(ClusterAdminClientClass* client) {
   DCHECK_ONLY_NOTNULL(client);
 
@@ -290,6 +296,17 @@ void ClusterAdminCli::RegisterCommandHandlers(ClusterAdminClientClass* client) {
         const string tablet_id = args[0];
         RETURN_NOT_OK_PREPEND(client->ListPerTabletTabletServers(tablet_id),
                               Substitute("Unable to list tablet servers of tablet $0", tablet_id));
+        return Status::OK();
+      });
+
+  Register(
+      "backfill_indexes_for_table", " <table>",
+      [client](const CLIArguments& args) -> Status {
+        const auto table_name = VERIFY_RESULT(
+            ResolveSingleTableName(client, args.begin(), args.end()));
+        RETURN_NOT_OK_PREPEND(client->LaunchBackfillIndexForTable(table_name),
+                              yb::Format("Unable to launch backfill for indexes in $0",
+                                         table_name));
         return Status::OK();
       });
 
@@ -802,12 +819,16 @@ void ClusterAdminCli::RegisterCommandHandlers(ClusterAdminClientClass* client) {
                               "Unable to get catalog version");
         return Status::OK();
       });
+
+  RegisterJson("ddl_log", "", std::bind(&DdlLog, client, _1));
 }
 
-Result<std::vector<client::YBTableName>> ResolveTableNames(ClusterAdminClientClass* client,
-                                                           CLIArgumentsIterator i,
-                                                           const CLIArgumentsIterator& end,
-                                                           TailArgumentsProcessor tail_processor) {
+Result<std::vector<client::YBTableName>> ResolveTableNames(
+    ClusterAdminClientClass* client,
+    CLIArgumentsIterator i,
+    const CLIArgumentsIterator& end,
+    const TailArgumentsProcessor& tail_processor,
+    bool allow_namespace_only) {
   auto resolver = VERIFY_RESULT(client->BuildTableNameResolver());
   auto tail = i;
   // Greedy algorithm of taking as much tables as possible.
@@ -825,19 +846,28 @@ Result<std::vector<client::YBTableName>> ResolveTableNames(ClusterAdminClientCla
       tail = std::next(i);
     }
   }
+
+  auto& tables = resolver.values();
   // Handle case when no table name is followed keyspace.
   if (tail != end) {
     if (tail_processor) {
       RETURN_NOT_OK(tail_processor(tail, end));
     } else {
+      if (allow_namespace_only && tables.empty()) {
+        auto last_namespace = resolver.last_namespace();
+        if (!last_namespace.name().empty()) {
+          client::YBTableName table_name;
+          table_name.GetFromNamespaceIdentifierPB(last_namespace);
+          return std::vector<client::YBTableName>{table_name};
+        }
+      }
       return STATUS(InvalidArgument, "Table name is missed");
     }
   }
-  auto tables = std::move(resolver.values());
   if (tables.empty()) {
     return STATUS(InvalidArgument, "Empty list of tables");
   }
-  return tables;
+  return std::move(tables);
 }
 
 Result<client::YBTableName> ResolveSingleTableName(ClusterAdminClientClass* client,
@@ -849,6 +879,20 @@ Result<client::YBTableName> ResolveSingleTableName(ClusterAdminClientClass* clie
     return STATUS_FORMAT(InvalidArgument, "Single table expected, $0 found", tables.size());
   }
   return std::move(tables.front());
+}
+
+Status CheckArgumentsCount(int count, int min, int max) {
+  if (count < min) {
+    return STATUS_FORMAT(
+        InvalidArgument, "Too few arguments $0, should be in range [$1, $2]", count, min, max);
+  }
+
+  if (count > max) {
+    return STATUS_FORMAT(
+        InvalidArgument, "Too many arguments $0, should be in range [$1, $2]", count, min, max);
+  }
+
+  return Status::OK();
 }
 
 }  // namespace tools

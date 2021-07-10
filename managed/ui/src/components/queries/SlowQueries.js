@@ -94,10 +94,11 @@ const SlowQueriesComponent = () => {
     console.warn('Invalid column header data detected, defaulting to initial values.');
   }
   const isQueryMonitoringEnabled = localStorage.getItem('__yb_query_monitoring__') === 'true';
-  const [queryMonitoring, setQueryMonitoring] = useState(isQueryMonitoringEnabled)
+  const [queryMonitoring, setQueryMonitoring] = useState(isQueryMonitoringEnabled);
   const [columns, setColumns] = useState(initialColumns);
   const currentUniverse = useSelector((state) => state.universe.currentUniverse);
   const universeUUID = currentUniverse?.data?.universeUUID;
+  const universePaused = currentUniverse?.data?.universeDetails?.universePaused;
   const { ysqlQueries, loading, errors, getSlowQueries } = useSlowQueriesApi({
     universeUUID,
     enabled: queryMonitoring
@@ -118,7 +119,7 @@ const SlowQueriesComponent = () => {
     if (loading && selectedRow.length) {
       setSelectedRow([]);
     }
-  }, [loading]);
+  }, [loading]); // eslint-disable-line react-hooks/exhaustive-deps
 
   const getQueryStatement = (cell) => {
     const truncatedText = cell.length > 200 ? `${cell.substring(0, 200)}...` : cell;
@@ -163,18 +164,18 @@ const SlowQueriesComponent = () => {
   const handleToggleMonitoring = (ev) => {
     localStorage.setItem('__yb_query_monitoring__', ev.target.checked);
     setQueryMonitoring(ev.target.checked);
-  }
+  };
 
   const handleResetQueries = () => {
     resetSlowQueries(universeUUID).then((response) => {
       if (response.status === 200) {
         toast.success('Successfully reset slow queries!');
-      } else {        
+      } else {
         toast.error('Error resetting slow queries.');
-      }      
+      }
       if (queryMonitoring) getSlowQueries();
-    })
-  }
+    });
+  };
 
   const formatMillisNumber = (cell) => {
     if (!Number.isInteger(cell)) {
@@ -262,21 +263,23 @@ const SlowQueriesComponent = () => {
                 </Alert>
               )
             )}
-            <div className="slow-queries__actions">
-              <YBButtonLink
-                btnIcon="fa fa-undo"
-                btnClass="btn btn-default"
-                btnText="Reset Stats"
-                onClick={handleResetQueries}
-              />
-              <YBToggle
-                label="Query Monitoring"
-                input={{
-                  value: queryMonitoring,
-                  onChange: handleToggleMonitoring
-                }}
-              />
-            </div>
+            {!universePaused && (
+              <div className="slow-queries__actions">
+                <YBButtonLink
+                  btnIcon="fa fa-undo"
+                  btnClass="btn btn-default"
+                  btnText="Reset Stats"
+                  onClick={handleResetQueries}
+                />
+                <YBToggle
+                  label="Query Monitoring"
+                  input={{
+                    value: queryMonitoring,
+                    onChange: handleToggleMonitoring
+                  }}
+                />
+              </div>
+            )}
           </div>
         }
         leftPanel={
@@ -288,7 +291,10 @@ const SlowQueriesComponent = () => {
                 panelState === PANEL_STATE.MAXIMIZED && 'maximized'
               )}
             >
-              <span className="panel-close-icon" onClick={() => setPanelState(PANEL_STATE.MINIMIZED)}>
+              <span
+                className="panel-close-icon"
+                onClick={() => setPanelState(PANEL_STATE.MINIMIZED)}
+              >
                 <i className="fa fa-window-minimize" />
               </span>
               <div className="slow-queries__column-selector">
@@ -313,7 +319,8 @@ const SlowQueriesComponent = () => {
                 </ul>
               </div>
             </div>
-          )}
+          )
+        }
         bodyClassName={clsx(
           panelState === PANEL_STATE.MINIMIZED && 'expand',
           panelState === PANEL_STATE.MAXIMIZED && 'shrink',
@@ -343,9 +350,7 @@ const SlowQueriesComponent = () => {
                 {tableColHeaders}
               </BootstrapTable>
             ) : (
-              <>
-                Enable query monitoring to see slow queries.
-              </>
+              <>Enable query monitoring to see slow queries.</>
             )}
           </div>
         }

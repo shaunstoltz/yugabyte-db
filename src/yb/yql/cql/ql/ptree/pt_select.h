@@ -236,10 +236,19 @@ class SelectScanSpec {
     is_forward_scan_ = val;
   }
 
+  void set_prefix_length(int prefix_length) {
+    prefix_length_ = prefix_length;
+  }
+
+  int prefix_length() const {
+    return prefix_length_;
+  }
+
  private:
   TableId index_id_;
   bool covers_fully_ = false;
   bool is_forward_scan_ = true;
+  int prefix_length_ = 0;
 };
 
 //--------------------------------------------------------------------------------------------------
@@ -300,7 +309,8 @@ class PTSelectStmt : public PTDmlStmt {
   // in CQL, so we will keep it that way for now to avoid new bugs and extra work. If the CQL
   // language is extended further toward SQL, we can change this design.
   virtual CHECKED_STATUS Analyze(SemContext *sem_context) override;
-  bool CoversFully(const IndexInfo& index_info) const;
+  bool CoversFully(const IndexInfo& index_info,
+                   const MCUnorderedMap<int32, uint16> &column_ref_cnts) const;
 
   // Explain scan path.
   void PrintSemanticAnalysisResult(SemContext *sem_context);
@@ -391,6 +401,10 @@ class PTSelectStmt : public PTDmlStmt {
     return child_select_ ? child_select_->bind_table() : PTDmlStmt::bind_table();
   }
 
+  const std::shared_ptr<client::YBTable>& table() const {
+    return PTDmlStmt::bind_table();
+  }
+
   const MCVector<PTBindVar*> &bind_variables() const override {
     return child_select_ ? child_select_->bind_variables() : PTDmlStmt::bind_variables();
   }
@@ -400,6 +414,23 @@ class PTSelectStmt : public PTDmlStmt {
 
   std::vector<int64_t> hash_col_indices() const override {
     return child_select_ ? child_select_->hash_col_indices() : PTDmlStmt::hash_col_indices();
+  }
+
+  // CQL does not have nested DML statement, but YugaByte processes INDEX query as a nested DML.
+  // - Returns true by default for all SELECT nodes.
+  // - Returns false for index query node nested inside SELECT node. Because the data from the
+  //   INDEX nested node is used for another READ, it is not the top level READ node where all
+  //   READ operations end.
+  //     SELECT * FROM table WHERE primary_keys IN (SELECT primary_keys FROM index);
+  //   The data from INDEX query (i.e. primary key) is used for another READ from PRIMARY table.
+  // - There is one exception when nested node is promoted to become the top level READ node.
+  //   Due to an optimization, when an INDEX fully-covers a SELECT statement, all data will be
+  //   read from the INDEX.
+  //     SELECT all-requested-data FROM <index>;
+  //   In this case, the nested index node is the top treenode to query data from server. It is not
+  //   the top level SELECT in this case.
+  bool IsTopLevelReadNode() const override {
+    return is_top_level_ || covers_fully_;
   }
 
  private:

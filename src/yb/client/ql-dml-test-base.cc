@@ -46,7 +46,13 @@ template<class MiniClusterType>
 const std::string KeyValueTableTest<MiniClusterType>::kValueColumn = kv_table_test::kValueColumn;
 
 template <>
-QLDmlTestBase<MiniCluster>::QLDmlTestBase() : mini_cluster_opt_(1, 3) {}
+QLDmlTestBase<MiniCluster>::QLDmlTestBase()
+  : mini_cluster_opt_(MiniClusterOptions {
+                      .num_masters = 1,
+                      .num_tablet_servers = 3,
+                      .num_drives = 1,
+                      .master_env = env_.get(),
+                      }) {}
 
 template <>
 QLDmlTestBase<ExternalMiniCluster>::QLDmlTestBase() {
@@ -66,7 +72,7 @@ void QLDmlTestBase<ExternalMiniCluster>::SetFlags() {
 
 template <>
 void QLDmlTestBase<MiniCluster>::StartCluster() {
-  cluster_.reset(new MiniCluster(env_.get(), mini_cluster_opt_));
+  cluster_.reset(new MiniCluster(mini_cluster_opt_));
   ASSERT_OK(cluster_->Start());
 }
 
@@ -129,7 +135,8 @@ QLWriteRequestPB::QLStmtType GetQlStatementType(const WriteOpType op_type) {
 } // namespace
 
 Result<YBqlWriteOpPtr> Increment(
-    TableHandle* table, const YBSessionPtr& session, int32_t key, int32_t delta) {
+    TableHandle* table, const YBSessionPtr& session, int32_t key, int32_t delta,
+    Flush flush) {
   auto op = table->NewWriteOp(QLWriteRequestPB::QL_STMT_UPDATE);
   auto value_column_id = table->ColumnId(kValueColumn);
 
@@ -149,6 +156,10 @@ Result<YBqlWriteOpPtr> Increment(
   bfcall->add_operands()->mutable_value()->set_int64_value(delta);
 
   RETURN_NOT_OK(session->Apply(op));
+  if (flush) {
+    RETURN_NOT_OK(session->Flush());
+    RETURN_NOT_OK(CheckOp(op.get()));
+  }
 
   return op;
 }
@@ -312,13 +323,13 @@ Result<int32_t> SelectRow(
   auto* const req = op->mutable_request();
   QLAddInt32HashValue(req, key);
   table->AddColumns({column}, req);
-  auto status = session->ApplyAndFlush(op);
-  if (status.IsIOError()) {
-    for (const auto& error : session->GetAndClearPendingErrors()) {
+  RETURN_NOT_OK(session->Apply(op));
+  auto flush_status = session->FlushAndGetOpsErrors();
+  if (flush_status.status.IsIOError()) {
+    for (const auto& error : flush_status.errors) {
       LOG(WARNING) << "Error: " << error->status() << ", op: " << error->failed_op().ToString();
     }
   }
-  RETURN_NOT_OK(status);
   RETURN_NOT_OK(CheckOp(op.get()));
   auto rowblock = yb::ql::RowsResult(op.get()).GetRowBlock();
   if (rowblock->row_count() == 0) {

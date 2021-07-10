@@ -121,6 +121,8 @@ using master::ListMasterRaftPeersRequestPB;
 using master::ListMasterRaftPeersResponsePB;
 using master::ListTabletServersRequestPB;
 using master::ListTabletServersResponsePB;
+using master::ListLiveTabletServersRequestPB;
+using master::ListLiveTabletServersResponsePB;
 using master::MasterServiceProxy;
 using master::TabletLocationsPB;
 using master::TSInfoPB;
@@ -309,6 +311,13 @@ class TableNameResolver::Impl {
     return values_;
   }
 
+  master::NamespaceIdentifierPB last_namespace() {
+    if (!current_namespace_) {
+      return master::NamespaceIdentifierPB();
+    }
+    return *current_namespace_;
+  }
+
  private:
   Result<bool> FeedImpl(const std::string& str) {
     auto parts = SplitByDot(str);
@@ -429,6 +438,10 @@ std::vector<client::YBTableName>& TableNameResolver::values() {
   return impl_->values();
 }
 
+master::NamespaceIdentifierPB TableNameResolver::last_namespace() {
+  return impl_->last_namespace();
+}
+
 ClusterAdminClient::ClusterAdminClient(string addrs, MonoDelta timeout)
     : master_addr_list_(std::move(addrs)),
       timeout_(timeout),
@@ -518,8 +531,8 @@ Status ClusterAdminClient::Init() {
   leader_addr_ = yb_client_->GetMasterLeaderAddress();
   master_proxy_.reset(new MasterServiceProxy(proxy_cache_.get(), leader_addr_));
 
-  rpc::ProxyCache proxy_cache(messenger_.get());
-  master_backup_proxy_.reset(new master::MasterBackupServiceProxy(&proxy_cache, leader_addr_));
+  master_backup_proxy_.reset(new master::MasterBackupServiceProxy(
+      proxy_cache_.get(), leader_addr_));
 
   initted_ = true;
   return Status::OK();
@@ -685,7 +698,7 @@ Status ClusterAdminClient::ChangeConfig(
           leader_uuid, tablet_id, /* new_leader_uuid */ std::string(), &consensus_proxy));
     sleep(5);  // TODO - election completion timing is not known accurately
     RETURN_NOT_OK(SetTabletPeerInfo(tablet_id, LEADER, &leader_uuid, &leader_addr));
-    if (leader_uuid != old_leader_uuid) {
+    if (leader_uuid == old_leader_uuid) {
       return STATUS(ConfigurationError,
                     "Old tablet server leader same as new even after re-election!");
     }
@@ -1207,6 +1220,17 @@ Status ClusterAdminClient::ListTablets(const YBTableName& table_name, int max_ta
     cout << tablet_uuid << kColumnSep << RightPadToWidth(ranges[i], kPartitionRangeColWidth)
          << kColumnSep << RightPadToWidth(leader_host_port, kLongColWidth) << kColumnSep
          << leader_uuid << endl;
+  }
+  return Status::OK();
+}
+
+Status ClusterAdminClient::LaunchBackfillIndexForTable(const YBTableName& table_name) {
+  master::LaunchBackfillIndexForTableRequestPB req;
+  table_name.SetIntoTableIdentifierPB(req.mutable_table_identifier());
+  const auto resp = VERIFY_RESULT(InvokeRpc(&MasterServiceProxy::LaunchBackfillIndexForTable,
+                                            master_proxy_.get(), req));
+  if (resp.has_error()) {
+    return STATUS(RemoteError, resp.error().DebugString());
   }
   return Status::OK();
 }
@@ -1751,6 +1775,36 @@ Status ClusterAdminClient::GetYsqlCatalogVersion() {
   return Status::OK();
 }
 
+Result<rapidjson::Document> ClusterAdminClient::DdlLog() {
+  RpcController rpc;
+  rpc.set_timeout(timeout_);
+  master::DdlLogRequestPB req;
+  master::DdlLogResponsePB resp;
+
+  RETURN_NOT_OK(master_proxy_->DdlLog(req, &resp, &rpc));
+
+  if (resp.has_error()) {
+    return StatusFromPB(resp.error().status());
+  }
+
+  rapidjson::Document result;
+  result.SetObject();
+  rapidjson::Value json_entries(rapidjson::kArrayType);
+  for (const auto& entry : resp.entries()) {
+    rapidjson::Value json_entry(rapidjson::kObjectType);
+    AddStringField("table_type", TableType_Name(entry.table_type()), &json_entry,
+                   &result.GetAllocator());
+    AddStringField("namespace", entry.namespace_name(), &json_entry, &result.GetAllocator());
+    AddStringField("table", entry.table_name(), &json_entry, &result.GetAllocator());
+    AddStringField("action", entry.action(), &json_entry, &result.GetAllocator());
+    AddStringField("time", HybridTimeToString(HybridTime(entry.time())),
+                   &json_entry, &result.GetAllocator());
+    json_entries.PushBack(json_entry, result.GetAllocator());
+  }
+  result.AddMember("log", json_entries, result.GetAllocator());
+  return result;
+}
+
 Status ClusterAdminClient::ChangeBlacklist(const std::vector<HostPort>& servers, bool add,
     bool blacklist_leader) {
   auto config = VERIFY_RESULT(GetMasterClusterConfig());
@@ -1860,6 +1914,17 @@ Result<TypedNamespaceName> ParseNamespaceName(const std::string& full_namespace_
                                               const YQLDatabase default_if_no_prefix) {
   const auto parts = SplitByDot(full_namespace_name);
   return ResolveNamespaceName(parts.prefix, parts.value, default_if_no_prefix);
+}
+
+void AddStringField(
+    const char* name, const std::string& value, rapidjson::Value* out,
+    rapidjson::Value::AllocatorType* allocator) {
+  rapidjson::Value json_value(value.c_str(), *allocator);
+  out->AddMember(rapidjson::StringRef(name), json_value, *allocator);
+}
+
+string HybridTimeToString(HybridTime ht) {
+  return Timestamp(ht.GetPhysicalValueMicros()).ToHumanReadableTime();
 }
 
 }  // namespace tools
