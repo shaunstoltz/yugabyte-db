@@ -10,11 +10,31 @@
 
 package com.yugabyte.yw.cloud;
 
+import static com.yugabyte.yw.cloud.PublicCloudConstants.GP2_SIZE;
+import static com.yugabyte.yw.cloud.PublicCloudConstants.GP3_PIOPS;
+import static com.yugabyte.yw.cloud.PublicCloudConstants.GP3_SIZE;
+import static com.yugabyte.yw.cloud.PublicCloudConstants.GP3_THROUGHPUT;
+import static com.yugabyte.yw.cloud.PublicCloudConstants.GROUP_EBS_IOPS;
+import static com.yugabyte.yw.cloud.PublicCloudConstants.GROUP_EBS_THROUGHPUT;
+import static com.yugabyte.yw.cloud.PublicCloudConstants.IO1_PIOPS;
+import static com.yugabyte.yw.cloud.PublicCloudConstants.IO1_SIZE;
+import static com.yugabyte.yw.cloud.PublicCloudConstants.PRODUCT_FAMILY_COMPUTE_INSTANCE;
+import static com.yugabyte.yw.cloud.PublicCloudConstants.PRODUCT_FAMILY_PROVISIONED_THROUGHPUT;
+import static com.yugabyte.yw.cloud.PublicCloudConstants.PRODUCT_FAMILY_STORAGE;
+import static com.yugabyte.yw.cloud.PublicCloudConstants.PRODUCT_FAMILY_SYSTEM_OPERATION;
+import static com.yugabyte.yw.cloud.PublicCloudConstants.VOLUME_API_GENERAL_PURPOSE;
+import static com.yugabyte.yw.cloud.PublicCloudConstants.VOLUME_API_NAME_GP2;
+import static com.yugabyte.yw.cloud.PublicCloudConstants.VOLUME_API_NAME_GP3;
+import static com.yugabyte.yw.cloud.PublicCloudConstants.VOLUME_API_NAME_IO1;
+import static com.yugabyte.yw.cloud.PublicCloudConstants.VOLUME_TYPE_PROVISIONED_IOPS;
+import static play.mvc.Http.Status.INTERNAL_SERVER_ERROR;
+
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.google.inject.Inject;
 import com.google.inject.Singleton;
 import com.yugabyte.yw.common.ApiResponse;
+import com.yugabyte.yw.common.ConfigHelper;
 import com.yugabyte.yw.forms.YWResults;
 import com.yugabyte.yw.models.InstanceType;
 import com.yugabyte.yw.models.InstanceType.InstanceTypeDetails;
@@ -22,22 +42,19 @@ import com.yugabyte.yw.models.InstanceType.VolumeType;
 import com.yugabyte.yw.models.PriceComponent;
 import com.yugabyte.yw.models.Provider;
 import com.yugabyte.yw.models.Region;
-import org.apache.commons.compress.archivers.tar.TarArchiveEntry;
-import org.apache.commons.compress.archivers.tar.TarArchiveInputStream;
-import org.apache.commons.compress.compressors.gzip.GzipCompressorInputStream;
-import play.Environment;
-import play.libs.Json;
-import play.mvc.Result;
-
 import java.io.IOException;
 import java.io.InputStream;
 import java.util.HashMap;
 import java.util.Iterator;
 import java.util.Map;
 import java.util.UUID;
+import org.apache.commons.compress.archivers.tar.TarArchiveEntry;
+import org.apache.commons.compress.archivers.tar.TarArchiveInputStream;
+import org.apache.commons.compress.compressors.gzip.GzipCompressorInputStream;
 
-import static com.yugabyte.yw.cloud.PublicCloudConstants.*;
-import static play.mvc.Http.Status.INTERNAL_SERVER_ERROR;
+import play.Environment;
+import play.libs.Json;
+import play.mvc.Result;
 
 // TODO: move pricing data fetch to ybcloud.
 @Singleton
@@ -45,6 +62,8 @@ public class AWSInitializer extends AbstractInitializer {
   private static final boolean enableVerboseLogging = false;
 
   @Inject Environment environment;
+
+  @Inject ConfigHelper configHelper;
 
   /**
    * Entry point to initialize AWS. This will create the various InstanceTypes and their
@@ -597,7 +616,8 @@ public class AWSInitializer extends AbstractInitializer {
   }
 
   private boolean isInstanceTypeSupported(Map<String, String> productAttributes) {
-    return InstanceType.AWS_INSTANCE_PREFIXES_SUPPORTED
+    return configHelper
+        .getAWSInstancePrefixesSupported()
         .stream()
         .anyMatch(productAttributes.getOrDefault("instanceType", "")::startsWith);
   }

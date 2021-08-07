@@ -34,6 +34,21 @@
 namespace yb {
 namespace master {
 
+YB_DEFINE_ENUM(TableModificationType, (kCreate)(kDrop)(kAlter))
+
+struct ModifiedTable {
+  TableName name;
+  TableType type;
+  TableModificationType modification;
+};
+
+struct ModifiedPgCatalogTable {
+  TableName name = "";
+  uint32_t num_inserts = 0;
+  uint32_t num_deletes = 0;
+  uint32_t num_updates = 0;
+};
+
 struct SnapshotScheduleRestoration {
   TxnSnapshotId snapshot_id;
   HybridTime restore_at;
@@ -42,9 +57,14 @@ struct SnapshotScheduleRestoration {
   HybridTime write_time;
   int64_t term;
   SnapshotScheduleFilterPB filter;
-  std::vector<TabletId> obsolete_tablets;
-  std::vector<TableId> obsolete_tables;
-  std::unordered_map<std::string, SysRowEntry::Type> objects_to_restore;
+  std::vector<TabletId> non_system_obsolete_tablets;
+  std::vector<TableId> non_system_obsolete_tables;
+  std::vector<ModifiedTable> non_system_modified_tables;
+  std::unordered_map<std::string, SysRowEntry::Type> non_system_objects_to_restore;
+  // pg_catalog_tables to restore for YSQL tables.
+  std::unordered_map<TableId, TableName> system_tables_to_restore;
+  // Counts of Insert/Delete/Updates to the pg_catalog tables.
+  std::unordered_map<TableId, ModifiedPgCatalogTable> pg_catalog_modification_details;
 };
 
 // Class that coordinates transaction aware snapshots at master.
@@ -70,7 +90,8 @@ class MasterSnapshotCoordinator : public tablet::SnapshotCoordinator {
       int64_t leader_term, const tablet::SnapshotOperation& operation) override;
 
   CHECKED_STATUS RestoreSysCatalogReplicated(
-      int64_t leader_term, const tablet::SnapshotOperation& operation) override;
+      int64_t leader_term, const tablet::SnapshotOperation& operation,
+      Status* complete_status) override;
 
   CHECKED_STATUS ListSnapshots(
       const TxnSnapshotId& snapshot_id, bool list_deleted, ListSnapshotsResponsePB* resp);

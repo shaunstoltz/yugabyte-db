@@ -210,12 +210,6 @@ class CatalogManager :
                              CreateTableResponsePB* resp,
                              rpc::RpcContext* rpc);
 
-  // Analyze a table and provide estimates of pertinent statistics needed by a postgres ANALYZE
-  // command.
-  CHECKED_STATUS AnalyzeTable(const AnalyzeTableRequestPB* req,
-                              AnalyzeTableResponsePB* resp,
-                              rpc::RpcContext* rpc);
-
   // Create the transaction status table if needed (i.e. if it does not exist already).
   //
   // This is called at the end of CreateTable if the table has transactions enabled.
@@ -468,6 +462,9 @@ class CatalogManager :
                                                TSHeartbeatResponsePB* resp);
 
   SysCatalogTable* sys_catalog() { return sys_catalog_.get(); }
+
+  // Tablet peer for the sys catalog tablet's peer.
+  const std::shared_ptr<tablet::TabletPeer> tablet_peer() const;
 
   ClusterLoadBalancer* load_balancer() { return load_balance_policy_.get(); }
 
@@ -1096,8 +1093,8 @@ class CatalogManager :
   // updated to INDEX_PERM_WRITE_AND_DELETE state; followed by backfilling. Once
   // all the tablets have completed backfilling, the index will be updated
   // to be in INDEX_PERM_READ_WRITE_AND_DELETE state.
-  void SendAlterTableRequest(const scoped_refptr<TableInfo>& table,
-                             const AlterTableRequestPB* req = nullptr);
+  CHECKED_STATUS SendAlterTableRequest(const scoped_refptr<TableInfo>& table,
+                                       const AlterTableRequestPB* req = nullptr);
 
   // Start the background task to send the CopartitionTable() RPC to the leader for this
   // tablet.
@@ -1105,7 +1102,7 @@ class CatalogManager :
                                     const scoped_refptr<TableInfo>& table);
 
   // Starts the background task to send the SplitTablet RPC to the leader for the specified tablet.
-  void SendSplitTabletRequest(
+  CHECKED_STATUS SendSplitTabletRequest(
       const scoped_refptr<TabletInfo>& tablet, std::array<TabletId, kNumSplitParts> new_tablet_ids,
       const std::string& split_encoded_key, const std::string& split_partition_key);
 
@@ -1285,6 +1282,10 @@ class CatalogManager :
     return false;
   }
 
+  virtual bool IsCdcEnabled(const TableInfo& table_info) const {
+    return false;
+  }
+
   virtual Result<SnapshotSchedulesToObjectIdsMap> MakeSnapshotSchedulesToObjectIdsMap(
       SysRowEntry::Type type) {
     return SnapshotSchedulesToObjectIdsMap();
@@ -1416,9 +1417,6 @@ class CatalogManager :
 
   // Policy for load balancing tablets on tablet servers.
   std::unique_ptr<ClusterLoadBalancer> load_balance_policy_;
-
-  // Tablet peer for the sys catalog tablet's peer.
-  const std::shared_ptr<tablet::TabletPeer> tablet_peer() const;
 
   // Use the Raft config that has been bootstrapped to update the in-memory state of master options
   // and also the on-disk state of the consensus meta object.

@@ -82,7 +82,6 @@
 template<class T> class scoped_refptr;
 
 YB_DEFINE_ENUM(GrantRevokeStatementType, (GRANT)(REVOKE));
-YB_STRONGLY_TYPED_BOOL(RequireTabletsRunning);
 
 namespace yb {
 
@@ -105,6 +104,9 @@ namespace internal {
 template <class Req, class Resp>
 class ClientMasterRpc;
 }
+
+using GetTableLocationsCallback =
+    std::function<void(const Result<master::GetTableLocationsResponsePB*>&)>;
 
 // This needs to be called by a client app before performing any operations that could result in
 // logging.
@@ -286,8 +288,6 @@ class YBClient {
   // Set 'wait' to true if the call must wait for the table to be fully truncated before returning.
   CHECKED_STATUS TruncateTable(const std::string& table_id, bool wait = true);
   CHECKED_STATUS TruncateTables(const std::vector<std::string>& table_ids, bool wait = true);
-
-  Result<master::AnalyzeTableResponsePB> AnalyzeTable(const std::string& table_id);
 
   // Backfill the specified index table.  This is only supported for YSQL at the moment.
   CHECKED_STATUS BackfillIndex(const TableId& table_id, bool wait = true);
@@ -548,6 +548,10 @@ class YBClient {
                     StdStatusCallback callback);
 
   void DeleteTablet(const TabletId& tablet_id, StdStatusCallback callback);
+
+  void GetTableLocations(
+      const TableId& table_id, int32_t max_tablets, RequireTabletsRunning require_tablets_running,
+      GetTableLocationsCallback callback);
 
   // Find the number of tservers. This function should not be called frequently for reading or
   // writing actual data. Currently, it is called only for SQL DDL statements.

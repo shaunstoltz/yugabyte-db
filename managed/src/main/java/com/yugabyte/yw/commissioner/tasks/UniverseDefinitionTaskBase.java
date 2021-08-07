@@ -7,9 +7,16 @@ import com.yugabyte.yw.commissioner.BaseTaskDependencies;
 import com.yugabyte.yw.commissioner.Common.CloudType;
 import com.yugabyte.yw.commissioner.SubTaskGroup;
 import com.yugabyte.yw.commissioner.UserTaskDetails.SubTaskGroupType;
-import com.yugabyte.yw.commissioner.tasks.UpgradeUniverse.UpgradeTaskType;
 import com.yugabyte.yw.commissioner.tasks.params.NodeTaskParams;
-import com.yugabyte.yw.commissioner.tasks.subtasks.*;
+import com.yugabyte.yw.commissioner.tasks.subtasks.AnsibleClusterServerCtl;
+import com.yugabyte.yw.commissioner.tasks.subtasks.AnsibleConfigureServers;
+import com.yugabyte.yw.commissioner.tasks.subtasks.AnsibleSetupServer;
+import com.yugabyte.yw.commissioner.tasks.subtasks.AnsibleUpdateNodeInfo;
+import com.yugabyte.yw.commissioner.tasks.subtasks.InstanceActions;
+import com.yugabyte.yw.commissioner.tasks.subtasks.PrecheckNode;
+import com.yugabyte.yw.commissioner.tasks.subtasks.WaitForMasterLeader;
+import com.yugabyte.yw.commissioner.tasks.subtasks.WaitForTServerHeartBeats;
+import com.yugabyte.yw.common.CertificateHelper;
 import com.yugabyte.yw.common.NodeManager;
 import com.yugabyte.yw.common.PlacementInfoUtil;
 import com.yugabyte.yw.forms.UniverseDefinitionTaskParams;
@@ -17,6 +24,7 @@ import com.yugabyte.yw.forms.UniverseDefinitionTaskParams.Cluster;
 import com.yugabyte.yw.forms.UniverseDefinitionTaskParams.ClusterType;
 import com.yugabyte.yw.forms.UniverseDefinitionTaskParams.UserIntent;
 import com.yugabyte.yw.forms.UniverseTaskParams;
+import com.yugabyte.yw.forms.UpgradeTaskParams;
 import com.yugabyte.yw.models.Customer;
 import com.yugabyte.yw.models.CustomerConfig;
 import com.yugabyte.yw.models.NodeInstance;
@@ -25,16 +33,21 @@ import com.yugabyte.yw.models.Universe.UniverseUpdater;
 import com.yugabyte.yw.models.helpers.CloudSpecificInfo;
 import com.yugabyte.yw.models.helpers.NodeDetails;
 import com.yugabyte.yw.models.helpers.PlacementInfo;
-import lombok.extern.slf4j.Slf4j;
-import org.apache.commons.lang3.StringUtils;
-import play.Configuration;
-
-import javax.inject.Inject;
-import java.time.Duration;
-import java.util.*;
+import java.util.ArrayList;
+import java.util.Collection;
+import java.util.HashMap;
+import java.util.HashSet;
+import java.util.List;
+import java.util.Map;
+import java.util.Set;
+import java.util.UUID;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
 import java.util.stream.Collectors;
+import javax.inject.Inject;
+import lombok.extern.slf4j.Slf4j;
+import org.apache.commons.lang3.StringUtils;
+import play.Configuration;
 
 /**
  * Abstract base class for all tasks that create/edit the universe definition. These include the
@@ -114,49 +127,51 @@ public abstract class UniverseDefinitionTaskBase extends UniverseTaskBase {
   public Universe writeUserIntentToUniverse(boolean isReadOnlyCreate, boolean updateOnpremNodes) {
     // Create the update lambda.
     UniverseUpdater updater =
-        new UniverseUpdater() {
-          @Override
-          public void run(Universe universe) {
-            // Persist the updated information about the universe.
-            // It should have been marked as being edited in lockUniverseForUpdate().
-            UniverseDefinitionTaskParams universeDetails = universe.getUniverseDetails();
-            if (!universeDetails.updateInProgress) {
-              String msg =
-                  "Universe "
-                      + taskParams().universeUUID
-                      + " has not been marked as being updated.";
-              log.error(msg);
-              throw new RuntimeException(msg);
-            }
-            if (!isReadOnlyCreate) {
-              universeDetails.nodeDetailsSet = taskParams().nodeDetailsSet;
-              universeDetails.nodePrefix = taskParams().nodePrefix;
-              universeDetails.universeUUID = taskParams().universeUUID;
-              universeDetails.rootCA = taskParams().rootCA;
-              universeDetails.clientRootCA = taskParams().clientRootCA;
-              universeDetails.allowInsecure = taskParams().allowInsecure;
-              Cluster cluster = taskParams().getPrimaryCluster();
-              if (cluster != null) {
-                universeDetails.upsertPrimaryCluster(cluster.userIntent, cluster.placementInfo);
-              } // else read only cluster edit mode.
-            } else {
-              // Combine the existing nodes with new read only cluster nodes.
-              universeDetails.nodeDetailsSet.addAll(taskParams().nodeDetailsSet);
-            }
-            taskParams()
-                .getReadOnlyClusters()
-                .forEach(
-                    (async) -> {
-                      // Update read replica cluster TLS params to be same as primary cluster
-                      async.userIntent.enableNodeToNodeEncrypt =
-                          universeDetails.getPrimaryCluster().userIntent.enableNodeToNodeEncrypt;
-                      async.userIntent.enableClientToNodeEncrypt =
-                          universeDetails.getPrimaryCluster().userIntent.enableClientToNodeEncrypt;
-                      universeDetails.upsertCluster(
-                          async.userIntent, async.placementInfo, async.uuid);
-                    });
-            universe.setUniverseDetails(universeDetails);
+        universe -> {
+          // Persist the updated information about the universe.
+          // It should have been marked as being edited in lockUniverseForUpdate().
+          UniverseDefinitionTaskParams universeDetails = universe.getUniverseDetails();
+          if (!universeDetails.updateInProgress) {
+            String msg =
+                "Universe " + taskParams().universeUUID + " has not been marked as being updated.";
+            log.error(msg);
+            throw new RuntimeException(msg);
           }
+          if (!isReadOnlyCreate) {
+            universeDetails.nodeDetailsSet = taskParams().nodeDetailsSet;
+            universeDetails.nodePrefix = taskParams().nodePrefix;
+            universeDetails.universeUUID = taskParams().universeUUID;
+            universeDetails.allowInsecure = taskParams().allowInsecure;
+            universeDetails.rootAndClientRootCASame = taskParams().rootAndClientRootCASame;
+            Cluster cluster = taskParams().getPrimaryCluster();
+            if (cluster != null) {
+              universeDetails.rootCA = null;
+              universeDetails.clientRootCA = null;
+              if (CertificateHelper.isRootCARequired(taskParams())) {
+                universeDetails.rootCA = taskParams().rootCA;
+              }
+              if (CertificateHelper.isClientRootCARequired(taskParams())) {
+                universeDetails.clientRootCA = taskParams().clientRootCA;
+              }
+              universeDetails.upsertPrimaryCluster(cluster.userIntent, cluster.placementInfo);
+            } // else read only cluster edit mode.
+          } else {
+            // Combine the existing nodes with new read only cluster nodes.
+            universeDetails.nodeDetailsSet.addAll(taskParams().nodeDetailsSet);
+          }
+          taskParams()
+              .getReadOnlyClusters()
+              .forEach(
+                  (async) -> {
+                    // Update read replica cluster TLS params to be same as primary cluster
+                    async.userIntent.enableNodeToNodeEncrypt =
+                        universeDetails.getPrimaryCluster().userIntent.enableNodeToNodeEncrypt;
+                    async.userIntent.enableClientToNodeEncrypt =
+                        universeDetails.getPrimaryCluster().userIntent.enableClientToNodeEncrypt;
+                    universeDetails.upsertCluster(
+                        async.userIntent, async.placementInfo, async.uuid);
+                  });
+          universe.setUniverseDetails(universeDetails);
         };
     // Perform the update. If unsuccessful, this will throw a runtime exception which we do not
     // catch as we want to fail.
@@ -470,9 +485,10 @@ public abstract class UniverseDefinitionTaskBase extends UniverseTaskBase {
       params.azUuid = node.azUuid;
       params.placementUuid = node.placementUuid;
       // Add task type
-      params.type = UpgradeUniverse.UpgradeTaskType.GFlags;
+      params.type = UpgradeTaskParams.UpgradeTaskType.GFlags;
       params.setProperty("processType", taskType.toString());
       params.gflags = gflags;
+      params.useSystemd = userIntent.useSystemd;
       AnsibleConfigureServers task = createTask(AnsibleConfigureServers.class);
       task.initialize(params);
       task.setUserTaskUUID(userTaskUUID);
@@ -565,6 +581,7 @@ public abstract class UniverseDefinitionTaskBase extends UniverseTaskBase {
     SubTaskGroup subTaskGroup = new SubTaskGroup("AnsibleClusterServerCtl", executor);
     for (NodeDetails node : nodes) {
       AnsibleClusterServerCtl.Params params = new AnsibleClusterServerCtl.Params();
+      UserIntent userIntent = taskParams().getClusterByUuid(node.placementUuid).userIntent;
       // Add the node name.
       params.nodeName = node.nodeName;
       // Add the universe uuid.
@@ -577,6 +594,7 @@ public abstract class UniverseDefinitionTaskBase extends UniverseTaskBase {
       params.placementUuid = node.placementUuid;
       // Set the InstanceType
       params.instanceType = node.cloudInfo.instance_type;
+      params.useSystemd = userIntent.useSystemd;
       // Create the Ansible task to get the server info.
       AnsibleClusterServerCtl task = createTask(AnsibleClusterServerCtl.class);
       task.initialize(params);
@@ -684,6 +702,7 @@ public abstract class UniverseDefinitionTaskBase extends UniverseTaskBase {
       UserIntent userIntent = taskParams().getClusterByUuid(node.placementUuid).userIntent;
       AnsibleSetupServer.Params params = new AnsibleSetupServer.Params();
       fillSetupParamsForNode(params, userIntent, node);
+      params.useSystemd = userIntent.useSystemd;
       params.reprovision = reprovision;
 
       // Create the Ansible task to setup the server.
@@ -758,6 +777,7 @@ public abstract class UniverseDefinitionTaskBase extends UniverseTaskBase {
       params.rootCA = taskParams().rootCA;
       params.clientRootCA = taskParams().clientRootCA;
       params.enableYEDIS = userIntent.enableYEDIS;
+      params.useSystemd = userIntent.useSystemd;
 
       // Development testing variable.
       params.itestS3PackagePath = taskParams().itestS3PackagePath;
@@ -769,7 +789,7 @@ public abstract class UniverseDefinitionTaskBase extends UniverseTaskBase {
       // Set if updating master addresses only.
       params.updateMasterAddrsOnly = updateMasterAddrsOnly;
       if (updateMasterAddrsOnly) {
-        params.type = UpgradeTaskType.GFlags;
+        params.type = UpgradeTaskParams.UpgradeTaskType.GFlags;
         if (isMaster) {
           params.setProperty("processType", ServerType.MASTER.toString());
         } else {

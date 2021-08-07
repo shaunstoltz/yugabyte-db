@@ -75,7 +75,7 @@ const DEFAULT_PORTS = {
 };
 
 const DEFAULT_STORAGE_TYPES = {
-  AWS: 'GP2',
+  AWS: 'GP3',
   GCP: 'Persistent',
   AZU: 'Premium_LRS'
 };
@@ -125,6 +125,7 @@ const initialState = {
   enableNodeToNodeEncrypt: true,
   enableClientToNodeEncrypt: true,
   enableEncryptionAtRest: false,
+  useSystemd: false,
   customizePorts: false
 };
 
@@ -161,6 +162,7 @@ export default class ClusterFields extends Component {
     this.accessKeyChanged = this.accessKeyChanged.bind(this);
     this.hasFieldChanged = this.hasFieldChanged.bind(this);
     this.toggleCustomizePorts = this.toggleCustomizePorts.bind(this);
+    this.toggleUseSystemd = this.toggleUseSystemd.bind(this);
     this.validateUserTags = this.validateUserTags.bind(this);
 
     this.currentInstanceType = _.get(
@@ -212,7 +214,7 @@ export default class ClusterFields extends Component {
           data: { universeDetails }
         }
       }
-    } = this.props;    
+    } = this.props;
 
     // Set default software version in case of create
     if (
@@ -844,7 +846,7 @@ export default class ClusterFields extends Component {
     if (clusterType === 'primary') {
       updateFormField('primary.enableEncryptionAtRest', toggleValue);
       this.setState({ enableEncryptionAtRest: toggleValue });
-      /* 
+      /*
        * Check if toggle is set to true and fetch list of KMS configs if
        * the PromiseState is not success. Note that if returned data is
        * an empty array, it is considered EMPTY and not SUCCESS, so if
@@ -858,6 +860,12 @@ export default class ClusterFields extends Component {
 
   toggleCustomizePorts(event) {
     this.setState({ customizePorts: event.target.checked });
+  }
+
+  toggleUseSystemd(event) {
+    const { updateFormField, clusterType } = this.props;
+    updateFormField(`${clusterType}.useSystemd`, event.target.checked);
+    this.setState({ useSystemd: event.target.checked });
   }
 
   handleAwsArnChange(event) {
@@ -2114,6 +2122,24 @@ export default class ClusterFields extends Component {
                     onToggle={this.toggleEnableExposingService}
                     label="Enable Public Network Access"
                     subLabel="Assign a load balancer or nodeport for connecting to the DB endpoints over the internet."
+                  />
+                </div>
+              </Col>
+            </Row>
+          )}
+          {isDefinedNotNull(currentProvider) && (
+            <Row>
+              <Col md={12}>
+                <div className="form-right-aligned-labels">
+                  <Field
+                    name={`${clusterType}.useSystemd`}
+                    component={YBToggle}
+                    defaultChecked={false}
+                    disableOnChange={disableToggleOnChange}
+                    checkedVal={this.state.useSystemd}
+                    onToggle={this.toggleUseSystemd}
+                    label="Enable Systemd Services"
+                    isReadOnly={isFieldReadOnly}
                   />
                 </div>
               </Col>

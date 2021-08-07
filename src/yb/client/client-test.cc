@@ -560,7 +560,7 @@ TEST_P(ClientTestForceMasterLookup, TestConcurrentLookups) {
   std::shared_ptr<YBTable> table;
   ASSERT_OK(client_->OpenTable(kTable3Name, &table));
 
-  ASSERT_OK(cluster_->leader_mini_master()->master()->
+  ASSERT_OK(ASSERT_RESULT(cluster_->GetLeaderMiniMaster())->master()->
             WaitUntilCatalogManagerIsLeaderAndReadyForTests());
 
   auto t1 = std::thread([&]() { ASSERT_NO_FATALS(
@@ -578,7 +578,7 @@ TEST_F(ClientTest, TestLookupAllTablets) {
   std::shared_ptr<YBTable> table;
   ASSERT_OK(client_->OpenTable(kTable3Name, &table));
 
-  ASSERT_OK(cluster_->leader_mini_master()->master()->
+  ASSERT_OK(ASSERT_RESULT(cluster_->GetLeaderMiniMaster())->master()->
             WaitUntilCatalogManagerIsLeaderAndReadyForTests());
 
   auto future = client_->LookupAllTabletsFuture(
@@ -594,7 +594,7 @@ TEST_F(ClientTest, TestPointThenRangeLookup) {
   std::shared_ptr<YBTable> table;
   ASSERT_OK(client_->OpenTable(kTable3Name, &table));
 
-  ASSERT_OK(cluster_->leader_mini_master()->master()->
+  ASSERT_OK(ASSERT_RESULT(cluster_->GetLeaderMiniMaster())->master()->
             WaitUntilCatalogManagerIsLeaderAndReadyForTests());
 
   auto key_rt = ASSERT_RESULT(LookupFirstTabletFuture(table).get());
@@ -612,7 +612,7 @@ TEST_F(ClientTest, TestKeyRangeFiltering) {
   std::shared_ptr<YBTable> table;
   ASSERT_OK(client_->OpenTable(kTable3Name, &table));
 
-  ASSERT_OK(cluster_->leader_mini_master()->master()->
+  ASSERT_OK(ASSERT_RESULT(cluster_->GetLeaderMiniMaster())->master()->
             WaitUntilCatalogManagerIsLeaderAndReadyForTests());
 
   auto tablets = ASSERT_RESULT(client_->LookupAllTabletsFuture(
@@ -2519,9 +2519,12 @@ TEST_F(ClientTest, RefreshPartitions) {
     while(!stop_requested) {
       const auto table = client_table_.table();
       table->MarkPartitionsAsStale();
-      const auto result = table->MaybeRefreshPartitions();
-      if (!result.ok()) {
-        LOG(INFO) << AsString(result.status());
+
+      Synchronizer synchronizer;
+      table->RefreshPartitions(synchronizer.AsStdStatusCallback());
+      const auto status = synchronizer.Wait();
+      if (!status.ok()) {
+        LOG(INFO) << status;
       }
     }
   };
@@ -2600,10 +2603,10 @@ TEST_F(ClientTest, ColocatedTablesLookupTablet) {
   TabletId colocated_tablet_id;
   for (const auto& table_name : table_names) {
     auto table = ASSERT_RESULT(client_->OpenTable(table_name));
-    const auto tablet_result = client_->LookupTabletByKeyFuture(
+    auto tablet = ASSERT_RESULT(client_->LookupTabletByKeyFuture(
         table, /* partition_key =*/ "",
-        CoarseMonoClock::now() + kTabletLookupTimeout).get();
-    const auto tablet_id = ASSERT_RESULT(tablet_result)->tablet_id();
+        CoarseMonoClock::now() + kTabletLookupTimeout).get());
+    const auto tablet_id = tablet->tablet_id();
     if (colocated_tablet_id.empty()) {
       colocated_tablet_id = tablet_id;
     } else {

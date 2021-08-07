@@ -299,7 +299,7 @@ class CppCassandraDriverTestIndexMultipleChunksWithLeaderMoves
         ASSERT_OK(cluster_->AddTServerToLeaderBlacklist(
             cluster_->master(), cluster_->tablet_server(tserver_id)));
         SleepFor(MonoDelta::FromMilliseconds(kSleepTimeMs));
-        ASSERT_OK(cluster_->EmptyBlacklist(cluster_->master()));
+        ASSERT_OK(cluster_->ClearBlacklist(cluster_->master()));
       }
     });
   }
@@ -1750,13 +1750,13 @@ TEST_F_EX(
       // Retry.
       result = GetTableSize(&session_, "test_table");
     }
-    const int64_t main_table_size = ASSERT_RESULT(result);
+    const int64_t main_table_size = *result;
     result = GetTableSize(&session_, "test_table_index_by_v");
 
     ASSERT_EQ(main_table_size, 2);
     if (is_index_created) {
       // This is to demonstrate issue #5811.  These statements should not fail.
-      const int64_t index_table_size = ASSERT_RESULT(result);
+      const int64_t index_table_size = ASSERT_RESULT(std::move(result));
       ASSERT_EQ(index_table_size, 1);
       // Since the main table has two rows while the index has one row, the index is inconsistent.
       ASSERT_TRUE(false) << "index was created and is inconsistent with its indexed table";
@@ -2945,20 +2945,25 @@ TEST_F_EX(CppCassandraDriverTest, Rejection, CppCassandraDriverRejectionTest) {
     thread_holder.AddThreadFunctor(
         [this, &stop = thread_holder.stop_flag(), &table, &key, &pending_writes,
          &max_pending_writes] {
-      SetFlagOnExit set_flag_on_exit(&stop);
       auto session = ASSERT_RESULT(EstablishSession());
-      while (!stop.load()) {
-        CassandraBatch batch(CassBatchType::CASS_BATCH_TYPE_LOGGED);
-        auto prepared = table.PrepareInsert(&session);
-        if (!prepared.ok()) {
+      CassandraPrepared prepared;
+      ASSERT_OK(WaitFor([&table, &session, &prepared] {
+        auto prepared_result = table.PrepareInsert(&session);
+        if (!prepared_result.ok()) {
           // Prepare could be failed because cluster has heavy load.
           // It is ok to just retry in this case, because we expect total number of writes.
-          continue;
+          LOG(INFO) << "Prepare failed: " << prepared_result.status();
+          return false;
         }
+        prepared = std::move(*prepared_result);
+        return true;
+      }, kCassandraTimeOut * 5, "Prepare statement"));
+      while (!stop.load()) {
+        CassandraBatch batch(CassBatchType::CASS_BATCH_TYPE_LOGGED);
         for (int i = 0; i != kBatchSize; ++i) {
           auto current_key = key++;
           ColumnsType tuple(current_key, -current_key);
-          auto statement = prepared->Bind();
+          auto statement = prepared.Bind();
           table.BindInsert(&statement, tuple);
           batch.Add(&statement);
         }
@@ -2969,8 +2974,6 @@ TEST_F_EX(CppCassandraDriverTest, Rejection, CppCassandraDriverRejectionTest) {
           auto mpw = max_pending_writes.load();
           while (pw > mpw) {
             if (max_pending_writes.compare_exchange_weak(mpw, pw)) {
-              // Assert that we don't have too many pending writers.
-              ASSERT_LE(pw, kWriters / 3);
               break;
             }
           }
@@ -2986,6 +2989,8 @@ TEST_F_EX(CppCassandraDriverTest, Rejection, CppCassandraDriverRejectionTest) {
 
   thread_holder.WaitAndStop(30s);
   LOG(INFO) << "Max pending writes: " << max_pending_writes.load();
+  // Assert that we don't have too many pending writers.
+  ASSERT_LE(max_pending_writes.load(), kWriters / 3);
 }
 
 TEST_F(CppCassandraDriverTest, BigQueryExpr) {

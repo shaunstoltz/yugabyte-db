@@ -11,27 +11,26 @@
 package com.yugabyte.yw.commissioner.tasks.subtasks;
 
 import com.yugabyte.yw.commissioner.BaseTaskDependencies;
-import com.yugabyte.yw.commissioner.tasks.UpgradeUniverse;
 import com.yugabyte.yw.commissioner.tasks.params.NodeTaskParams;
 import com.yugabyte.yw.common.CallHomeManager.CollectionLevel;
 import com.yugabyte.yw.common.NodeManager;
 import com.yugabyte.yw.common.ShellResponse;
-import com.yugabyte.yw.common.alerts.AlertDefinitionLabelsBuilder;
-import com.yugabyte.yw.forms.UniverseDefinitionTaskParams;
-import com.yugabyte.yw.models.Alert;
-import com.yugabyte.yw.models.AlertDefinitionGroup;
-import com.yugabyte.yw.models.Customer;
+import com.yugabyte.yw.forms.UpgradeTaskParams;
+import com.yugabyte.yw.forms.UpgradeTaskParams.UpgradeTaskType;
 import com.yugabyte.yw.models.Universe;
 import com.yugabyte.yw.models.Universe.UniverseUpdater;
-import com.yugabyte.yw.models.filters.AlertFilter;
-import com.yugabyte.yw.models.helpers.KnownAlertCodes;
-import com.yugabyte.yw.models.helpers.KnownAlertLabels;
 import com.yugabyte.yw.models.helpers.NodeDetails;
-import lombok.extern.slf4j.Slf4j;
+import com.yugabyte.yw.models.helpers.PlatformMetrics;
+import java.util.HashMap;
+import java.util.HashSet;
+import java.util.Map;
+import java.util.Set;
+import com.yugabyte.yw.models.Universe;
 
 import javax.inject.Inject;
 import java.util.*;
 import java.util.stream.Collectors;
+import lombok.extern.slf4j.Slf4j;
 
 @Slf4j
 public class AnsibleConfigureServers extends NodeTaskBase {
@@ -43,7 +42,7 @@ public class AnsibleConfigureServers extends NodeTaskBase {
   }
 
   public static class Params extends NodeTaskParams {
-    public UpgradeUniverse.UpgradeTaskType type = UpgradeUniverse.UpgradeTaskType.Everything;
+    public UpgradeTaskType type = UpgradeTaskParams.UpgradeTaskType.Everything;
     public String ybSoftwareVersion = null;
 
     // Optional params.
@@ -65,6 +64,9 @@ public class AnsibleConfigureServers extends NodeTaskBase {
     // > 0 => node-to-node encryption is enabled
     // < 0 => node-to-node encryption is disabled
     public int nodeToNodeChange = 0;
+
+    // Systemd vs Cron Option (Default: Cron)
+    public boolean useSystemd = false;
   }
 
   @Override
@@ -74,31 +76,29 @@ public class AnsibleConfigureServers extends NodeTaskBase {
 
   @Override
   public void run() {
+    Universe universe_temp = Universe.getOrBadRequest(taskParams().universeUUID);
+    taskParams().useSystemd =
+        universe_temp.getUniverseDetails().getPrimaryCluster().userIntent.useSystemd;
     // Execute the ansible command.
     ShellResponse response =
         getNodeManager().nodeCommand(NodeManager.NodeCommandType.Configure, taskParams());
     processShellResponse(response);
 
-    if (taskParams().type == UpgradeUniverse.UpgradeTaskType.Everything
+    if (taskParams().type == UpgradeTaskParams.UpgradeTaskType.Everything
         && !taskParams().updateMasterAddrsOnly) {
       // Check cronjob status if installing software.
       response = getNodeManager().nodeCommand(NodeManager.NodeCommandType.CronCheck, taskParams());
 
       // Create an alert if the cronjobs failed to be created on this node.
+      Universe universe = Universe.getOrBadRequest(taskParams().universeUUID);
       if (response.code != 0) {
-        Universe universe = Universe.getOrBadRequest(taskParams().universeUUID);
-        Customer cust = Customer.get(universe.customerId);
         String nodeName = taskParams().nodeName;
-        String alertMsg =
-            "Universe %s was successfully created but failed to "
-                + "create cronjobs on some nodes (%s)";
 
         // Persist node cronjob status into the DB.
         UniverseUpdater updater =
             new UniverseUpdater() {
               @Override
               public void run(Universe universe) {
-                UniverseDefinitionTaskParams universeDetails = universe.getUniverseDetails();
                 NodeDetails node = universe.getNode(nodeName);
                 node.cronsActive = false;
                 log.info(
@@ -109,41 +109,13 @@ public class AnsibleConfigureServers extends NodeTaskBase {
               }
             };
         saveUniverseDetails(updater);
-
-        AlertFilter filter =
-            AlertFilter.builder()
-                .customerUuid(cust.uuid)
-                .errorCode(KnownAlertCodes.CRON_CREATION_FAILURE)
-                .label(KnownAlertLabels.TARGET_UUID, universe.universeUUID.toString())
-                .build();
-        Alert alert =
-            alertService
-                .listNotResolved(filter)
-                .stream()
-                .findFirst()
-                .orElse(
-                    new Alert()
-                        .setCustomerUUID(cust.uuid)
-                        .setErrCode(KnownAlertCodes.CRON_CREATION_FAILURE)
-                        .setSeverity(AlertDefinitionGroup.Severity.WARNING)
-                        .setLabels(
-                            AlertDefinitionLabelsBuilder.create()
-                                .appendTarget(universe)
-                                .getAlertLabels()));
-        if (alert.isNew()) {
-          alert.setMessage(String.format(alertMsg, universe.name, nodeName));
-        } else {
-          List<String> failedNodesList =
-              universe
-                  .getNodes()
-                  .stream()
-                  .map(nodeDetail -> nodeDetail.nodeName)
-                  .collect(Collectors.toList());
-          String failedNodesString = String.join(", ", failedNodesList);
-          alert.setMessage(String.format(alertMsg, universe.name, failedNodesString));
-        }
-        alertService.save(alert);
       }
+
+      long inactiveCronNodes =
+          universe.getNodes().stream().filter(node -> !node.cronsActive).count();
+      metricService.setMetric(
+          metricService.buildMetricTemplate(PlatformMetrics.UNIVERSE_INACTIVE_CRON_NODES, universe),
+          inactiveCronNodes);
 
       // We set the node state to SoftwareInstalled when configuration type is Everything.
       // TODO: Why is upgrade task type used to map to node state update?

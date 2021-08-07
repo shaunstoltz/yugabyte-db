@@ -358,7 +358,7 @@ Status Batcher::DoAdd(shared_ptr<YBOperation> yb_op) {
   }
 
   AddInFlightOp(in_flight_op);
-  VLOG_WITH_PREFIX(3) << "Looking up tablet for " << in_flight_op->yb_op->ToString()
+  VLOG_WITH_PREFIX(4) << "Looking up tablet for " << in_flight_op->yb_op->ToString()
                       << " partition key: "
                       << Slice(in_flight_op->partition_key).ToDebugHexString();
 
@@ -489,7 +489,7 @@ void Batcher::TabletLookupFinished(
       }
     }
 
-    VLOG_WITH_PREFIX(lookup_result.ok() ? 3 : 2)
+    VLOG_WITH_PREFIX(lookup_result.ok() ? 4 : 3)
         << "TabletLookupFinished for " << op->yb_op->ToString() << ": " << lookup_result
         << ", outstanding lookups: " << outstanding_lookups_;
     if (lookup_result.ok()) {
@@ -536,18 +536,12 @@ void Batcher::FlushBuffersIfReady() {
     if (outstanding_lookups_ != 0) {
       // FlushBuffersIfReady is also invoked when all lookups finished, so it ok to just return
       // here.
-      VLOG_WITH_PREFIX(3) << "FlushBuffersIfReady: " << outstanding_lookups_
+      VLOG_WITH_PREFIX(4) << "FlushBuffersIfReady: " << outstanding_lookups_
                           << " ops still in lookup";
       return;
     }
 
     if (state_ != BatcherState::kResolvingTablets) {
-      return;
-    }
-
-    if (ops_queue_.empty()) {
-      // Nothing to prepare.
-      state_ = BatcherState::kTransactionReady;
       return;
     }
 
@@ -581,6 +575,17 @@ void Batcher::FlushBuffersIfReady() {
         }
       }
     }
+  }
+
+  // Checking if ops_queue_ is empty after processing potential errors, because if some operation
+  // tablet lookup failed, ops_queue_ could become empty inside `if (had_errors_) { ... }` block
+  // above.
+  if (ops_queue_.empty()) {
+    std::lock_guard<decltype(mutex_)> lock(mutex_);
+
+    // Nothing to prepare.
+    state_ = BatcherState::kTransactionReady;
+    return;
   }
 
   // All operations were added, and tablets for them were resolved.
@@ -628,6 +633,7 @@ void Batcher::FlushBuffersIfReady() {
 }
 
 void Batcher::ExecuteOperations(Initial initial) {
+  VLOG_WITH_PREFIX(3) << "initial: " << initial;
   auto transaction = this->transaction();
   if (transaction) {
     // If this Batcher is executed in context of transaction,

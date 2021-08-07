@@ -885,7 +885,7 @@ Status ExternalMiniCluster::AddTServerToLeaderBlacklist(
   return Status::OK();
 }
 
-Status ExternalMiniCluster::EmptyBlacklist(
+Status ExternalMiniCluster::ClearBlacklist(
     ExternalMaster* master) {
   GetMasterClusterConfigRequestPB config_req;
   GetMasterClusterConfigResponsePB config_resp;
@@ -1172,7 +1172,7 @@ Status ExternalMiniCluster::StartMasters() {
 
 Status ExternalMiniCluster::WaitForInitDb() {
   const auto start_time = std::chrono::steady_clock::now();
-  const auto kTimeout = NonTsanVsTsan(900s, 1800s);
+  const auto kTimeout = NonTsanVsTsan(1200s, 1800s);
   int num_timeouts = 0;
   const int kMaxTimeouts = 10;
   while (true) {
@@ -1679,7 +1679,7 @@ void ExternalMiniCluster::ConfigureClientBuilder(client::YBClientBuilder* builde
   }
 }
 
-HostPort ExternalMiniCluster::DoGetLeaderMasterBoundRpcAddr() {
+Result<HostPort> ExternalMiniCluster::DoGetLeaderMasterBoundRpcAddr() {
   return GetLeaderMaster()->bound_rpc_addr();
 }
 
@@ -2071,6 +2071,12 @@ Status ExternalDaemon::Resume() {
   if (!process_) return Status::OK();
   VLOG(1) << "Resuming " << ProcessNameAndPidStr();
   return process_->Kill(SIGCONT);
+}
+
+Status ExternalDaemon::Kill(int signal) {
+  if (!process_) return Status::OK();
+  VLOG(1) << "Kill " << ProcessNameAndPidStr() << " with " << signal;
+  return process_->Kill(signal);
 }
 
 bool ExternalDaemon::IsShutdown() const {

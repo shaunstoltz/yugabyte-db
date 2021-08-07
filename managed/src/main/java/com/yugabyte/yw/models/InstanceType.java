@@ -1,12 +1,15 @@
 // Copyright (c) YugaByte, Inc.
 package com.yugabyte.yw.models;
 
-import com.fasterxml.jackson.annotation.JsonBackReference;
+import static io.swagger.annotations.ApiModelProperty.AccessMode.READ_ONLY;
+import static io.swagger.annotations.ApiModelProperty.AccessMode.READ_WRITE;
+import static play.mvc.Http.Status.BAD_REQUEST;
+
 import com.fasterxml.jackson.databind.JsonNode;
-import com.google.common.collect.ImmutableList;
 import com.typesafe.config.Config;
-import com.yugabyte.yw.common.YWServiceException;
 import com.yugabyte.yw.cloud.PublicCloudConstants;
+import com.yugabyte.yw.common.ConfigHelper;
+import com.yugabyte.yw.common.YWServiceException;
 import io.ebean.Ebean;
 import io.ebean.Finder;
 import io.ebean.Model;
@@ -14,29 +17,26 @@ import io.ebean.SqlUpdate;
 import io.ebean.annotation.EnumValue;
 import io.swagger.annotations.ApiModel;
 import io.swagger.annotations.ApiModelProperty;
-
-import org.slf4j.Logger;
-import org.slf4j.LoggerFactory;
-import play.data.validation.Constraints;
-import play.libs.Json;
-
-import javax.persistence.*;
 import java.util.LinkedList;
 import java.util.List;
 import java.util.UUID;
 import java.util.function.Predicate;
 import java.util.stream.Collectors;
-
-import static play.mvc.Http.Status.BAD_REQUEST;
-import static io.swagger.annotations.ApiModelProperty.AccessMode.*;
+import javax.persistence.Column;
+import javax.persistence.EmbeddedId;
+import javax.persistence.Entity;
+import javax.persistence.JoinColumn;
+import javax.persistence.ManyToOne;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+import play.data.validation.Constraints;
+import play.libs.Json;
 
 @ApiModel(description = "Instance type model which holds the information about the instance.")
 @Entity
 public class InstanceType extends Model {
   public static final Logger LOG = LoggerFactory.getLogger(InstanceType.class);
 
-  public static List<String> AWS_INSTANCE_PREFIXES_SUPPORTED =
-      ImmutableList.of("m3.", "c5.", "c5d.", "c4.", "c3.", "i3.");
   static final String YB_AWS_DEFAULT_VOLUME_COUNT_KEY = "yb.aws.default_volume_count";
   static final String YB_AWS_DEFAULT_VOLUME_SIZE_GB_KEY = "yb.aws.default_volume_size_gb";
 
@@ -229,8 +229,9 @@ public class InstanceType extends Model {
   }
 
   /** Delete Instance Types corresponding to given provider */
-  public static void deleteInstanceTypesForProvider(Provider provider, Config config) {
-    for (InstanceType instanceType : findByProvider(provider, config)) {
+  public static void deleteInstanceTypesForProvider(
+      Provider provider, Config config, ConfigHelper configHelper) {
+    for (InstanceType instanceType : findByProvider(provider, config, configHelper)) {
       instanceType.delete();
     }
   }
@@ -241,12 +242,12 @@ public class InstanceType extends Model {
   }
 
   private static List<InstanceType> populateDefaultsIfEmpty(
-      List<InstanceType> entries, Config config) {
+      List<InstanceType> entries, Config config, ConfigHelper configHelper) {
     // For AWS, we would filter and show only supported instance prefixes
     entries =
         entries
             .stream()
-            .filter(supportedInstanceTypes(AWS_INSTANCE_PREFIXES_SUPPORTED))
+            .filter(supportedInstanceTypes(configHelper.getAWSInstancePrefixesSupported()))
             .collect(Collectors.toList());
     for (InstanceType instanceType : entries) {
       JsonNode parsedJson = Json.parse(instanceType.instanceTypeDetailsJson);
@@ -266,7 +267,8 @@ public class InstanceType extends Model {
   }
 
   /** Query Helper to find supported instance types for a given cloud provider. */
-  public static List<InstanceType> findByProvider(Provider provider, Config config) {
+  public static List<InstanceType> findByProvider(
+      Provider provider, Config config, ConfigHelper configHelper) {
     List<InstanceType> entries =
         InstanceType.find
             .query()
@@ -275,7 +277,7 @@ public class InstanceType extends Model {
             .eq("active", true)
             .findList();
     if (provider.code.equals("aws")) {
-      return populateDefaultsIfEmpty(entries, config);
+      return populateDefaultsIfEmpty(entries, config, configHelper);
     } else {
       return entries
           .stream()

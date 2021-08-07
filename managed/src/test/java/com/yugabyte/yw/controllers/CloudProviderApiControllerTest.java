@@ -10,6 +10,27 @@
 
 package com.yugabyte.yw.controllers;
 
+import static com.yugabyte.yw.common.AssertHelper.assertAuditEntry;
+import static com.yugabyte.yw.common.AssertHelper.assertBadRequest;
+import static com.yugabyte.yw.common.AssertHelper.assertInternalServerError;
+import static com.yugabyte.yw.common.AssertHelper.assertOk;
+import static com.yugabyte.yw.common.AssertHelper.assertValue;
+import static com.yugabyte.yw.common.AssertHelper.assertValues;
+import static com.yugabyte.yw.common.AssertHelper.assertYWSE;
+import static com.yugabyte.yw.common.AssertHelper.assertYWSuccess;
+import static com.yugabyte.yw.common.ModelFactory.createUniverse;
+import static com.yugabyte.yw.common.TestHelper.createTempFile;
+import static junit.framework.TestCase.assertNull;
+import static junit.framework.TestCase.assertTrue;
+import static org.junit.Assert.assertEquals;
+import static org.junit.Assert.assertFalse;
+import static org.mockito.Mockito.any;
+import static org.mockito.Mockito.mock;
+import static org.mockito.Mockito.times;
+import static org.mockito.Mockito.verify;
+import static org.mockito.Mockito.when;
+import static play.test.Helpers.contentAsString;
+
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.node.ObjectNode;
 import com.google.common.collect.ImmutableList;
@@ -18,11 +39,30 @@ import com.typesafe.config.Config;
 import com.yugabyte.yw.cloud.CloudAPI;
 import com.yugabyte.yw.commissioner.Common;
 import com.yugabyte.yw.commissioner.tasks.CloudBootstrap;
-import com.yugabyte.yw.common.*;
+import com.yugabyte.yw.common.ApiUtils;
+import com.yugabyte.yw.common.ConfigHelper;
+import com.yugabyte.yw.common.FakeApiHelper;
+import com.yugabyte.yw.common.FakeDBApplication;
+import com.yugabyte.yw.common.ModelFactory;
+import com.yugabyte.yw.common.ShellResponse;
+import com.yugabyte.yw.common.TestHelper;
 import com.yugabyte.yw.forms.UniverseDefinitionTaskParams;
 import com.yugabyte.yw.forms.YWResults;
-import com.yugabyte.yw.models.*;
+import com.yugabyte.yw.models.AccessKey;
+import com.yugabyte.yw.models.AvailabilityZone;
+import com.yugabyte.yw.models.Customer;
+import com.yugabyte.yw.models.InstanceType;
+import com.yugabyte.yw.models.Provider;
+import com.yugabyte.yw.models.Region;
+import com.yugabyte.yw.models.Universe;
+import com.yugabyte.yw.models.Users;
 import com.yugabyte.yw.models.helpers.TaskType;
+import java.io.File;
+import java.io.IOException;
+import java.util.ArrayList;
+import java.util.HashMap;
+import java.util.Map;
+import java.util.UUID;
 import junitparams.JUnitParamsRunner;
 import junitparams.Parameters;
 import org.apache.commons.io.FileUtils;
@@ -36,23 +76,6 @@ import org.slf4j.LoggerFactory;
 import play.libs.Json;
 import play.mvc.Result;
 
-import java.io.File;
-import java.io.IOException;
-import java.util.ArrayList;
-import java.util.HashMap;
-import java.util.Map;
-import java.util.UUID;
-
-import static com.yugabyte.yw.common.AssertHelper.*;
-import static com.yugabyte.yw.common.ModelFactory.createUniverse;
-import static com.yugabyte.yw.common.TestHelper.createTempFile;
-import static junit.framework.TestCase.assertNull;
-import static junit.framework.TestCase.assertTrue;
-import static org.junit.Assert.assertEquals;
-import static org.junit.Assert.assertFalse;
-import static org.mockito.Mockito.*;
-import static play.test.Helpers.contentAsString;
-
 @RunWith(JUnitParamsRunner.class)
 public class CloudProviderApiControllerTest extends FakeDBApplication {
   public static final Logger LOG = LoggerFactory.getLogger(CloudProviderApiControllerTest.class);
@@ -60,7 +83,7 @@ public class CloudProviderApiControllerTest extends FakeDBApplication {
       ImmutableList.of("region1", "region2");
 
   @Mock Config mockConfig;
-
+  @Mock ConfigHelper mockConfigHelper;
   @Mock private play.Configuration appConfig;
 
   Customer customer;
@@ -92,10 +115,7 @@ public class CloudProviderApiControllerTest extends FakeDBApplication {
 
   private Result createProvider(JsonNode bodyJson) {
     return FakeApiHelper.doRequestWithAuthTokenAndBody(
-        "POST",
-        "/api/customers/" + customer.uuid + "/providers1",
-        user.createAuthToken(),
-        bodyJson);
+        "POST", "/api/customers/" + customer.uuid + "/providers", user.createAuthToken(), bodyJson);
   }
 
   private Result createKubernetesProvider(JsonNode bodyJson) {
@@ -352,6 +372,8 @@ public class CloudProviderApiControllerTest extends FakeDBApplication {
   public void testDeleteProviderWithInstanceType() {
     Provider p = ModelFactory.onpremProvider(customer);
 
+    when(mockConfigHelper.getAWSInstancePrefixesSupported())
+        .thenReturn(ImmutableList.of("m3.", "c5.", "c5d.", "c4.", "c3.", "i3."));
     ObjectNode metaData = Json.newObject();
     metaData.put("numCores", 4);
     metaData.put("memSizeGB", 300);
@@ -370,7 +392,7 @@ public class CloudProviderApiControllerTest extends FakeDBApplication {
     Result result = deleteProvider(p.uuid);
     assertYWSuccess(result, "Deleted provider: " + p.uuid);
 
-    assertEquals(0, InstanceType.findByProvider(p, mockConfig).size());
+    assertEquals(0, InstanceType.findByProvider(p, mockConfig, mockConfigHelper).size());
     assertNull(Provider.get(p.uuid));
   }
 

@@ -359,7 +359,6 @@ BOOST_PP_SEQ_FOR_EACH(
     MASTER_SERVICE_IMPL_ON_LEADER_WITH_LOCK, CatalogManager,
     (CreateTable)
     (IsCreateTableDone)
-    (AnalyzeTable)
     (TruncateTable)
     (IsTruncateTableDone)
     (BackfillIndex)
@@ -700,6 +699,7 @@ BOOST_PP_SEQ_FOR_EACH(
     (AlterUniverseReplication)
     (SetUniverseReplicationEnabled)
     (GetUniverseReplication)
+    (IsSetupUniverseReplicationDone)
     (ChangeEncryptionInfo)
     (IsEncryptionEnabled));
 

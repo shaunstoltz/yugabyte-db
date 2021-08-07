@@ -239,7 +239,7 @@ Status PgTxnManager::BeginWriteTransactionIfNecessary(bool read_only_op,
   } else {
     if (tserver_shared_object_) {
       if (!tablet_server_proxy_) {
-        boost::optional<MonoDelta> resolve_cache_timeout;
+        MonoDelta resolve_cache_timeout;
         const auto& tserver_shared_data_ = **tserver_shared_object_;
         HostPort host_port(tserver_shared_data_.endpoint());
         if (FLAGS_use_node_hostname_for_local_tserver) {
@@ -273,6 +273,7 @@ Status PgTxnManager::BeginWriteTransactionIfNecessary(bool read_only_op,
       DCHECK_EQ(docdb_isolation, IsolationLevel::SERIALIZABLE_ISOLATION);
       RETURN_NOT_OK(txn_->Init(docdb_isolation));
     }
+    txn_->SetSubTransactionMetadata(sub_txn_);
     session_->SetTransaction(txn_);
 
     VLOG_TXN_STATE(2) << "effective isolation level: "
@@ -282,7 +283,26 @@ Status PgTxnManager::BeginWriteTransactionIfNecessary(bool read_only_op,
   return Status::OK();
 }
 
+void PgTxnManager::SetActiveSubTransaction(SubTransactionId id) {
+  sub_txn_.subtransaction_id = id;
+  sub_txn_.highest_subtransaction_id = std::max(sub_txn_.highest_subtransaction_id, id);
+}
+
+Status PgTxnManager::RollbackSubTransaction(SubTransactionId id) {
+  // We should abort the range [id, sub_txn_.highest_subtransaction_id]. It's possible that we have
+  // created and released savepoints, such that there have been writes with a subtransaction_id
+  // greater than sub_txn_.subtransaction_id, and those should be aborted as well.
+  SCHECK_GE(
+    sub_txn_.highest_subtransaction_id, id,
+    InternalError,
+    "Attempted to rollback to non-existent savepoint.");
+  return sub_txn_.aborted.SetRange(id, sub_txn_.highest_subtransaction_id);
+}
+
 Status PgTxnManager::RestartTransaction() {
+  if (!sub_txn_.IsDefaultState()) {
+    return STATUS(IllegalState, "Attempted to restart when session has established savepoints");
+  }
   if (!txn_in_progress_ || !txn_) {
     CHECK_NOTNULL(session_);
     if (!session_->IsRestartRequired()) {
@@ -295,6 +315,7 @@ Status PgTxnManager::RestartTransaction() {
     return STATUS(IllegalState, "Attempted to restart when transaction does not require restart");
   }
   txn_ = VERIFY_RESULT(txn_->CreateRestartedTransaction());
+  txn_->SetSubTransactionMetadata(sub_txn_);
   session_->SetTransaction(txn_);
 
   DCHECK(can_restart_.load(std::memory_order_acquire));
@@ -381,6 +402,7 @@ void PgTxnManager::ResetTxnAndSession() {
   txn_in_progress_ = false;
   session_ = nullptr;
   txn_ = nullptr;
+  sub_txn_ = SubTransactionMetadata();
   can_restart_.store(true, std::memory_order_release);
 }
 

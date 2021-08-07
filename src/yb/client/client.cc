@@ -530,13 +530,6 @@ Status YBClient::TruncateTables(const vector<string>& table_ids, bool wait) {
   return data_->TruncateTables(this, table_ids, deadline, wait);
 }
 
-Result<master::AnalyzeTableResponsePB> YBClient::AnalyzeTable(const std::string& table_id) {
-  master::AnalyzeTableRequestPB req;
-  auto deadline = CoarseMonoClock::Now() + default_admin_operation_timeout();
-  req.mutable_table()->set_table_id(table_id);
-  return data_->AnalyzeTable(this, req, deadline);
-}
-
 Status YBClient::BackfillIndex(const TableId& table_id, bool wait) {
   auto deadline = (CoarseMonoClock::Now()
                    + MonoDelta::FromMilliseconds(FLAGS_backfill_index_client_rpc_timeout_ms));
@@ -810,9 +803,10 @@ Status YBClient::CreateNamespaceIfNotExists(const std::string& namespace_name,
                                             const std::string& source_namespace_id,
                                             const boost::optional<uint32_t>& next_pg_oid,
                                             const bool colocated) {
-  Result<bool> namespace_exists = (!namespace_id.empty() ? NamespaceIdExists(namespace_id)
-                                                         : NamespaceExists(namespace_name));
-  if (VERIFY_RESULT(namespace_exists)) {
+  const auto namespace_exists = VERIFY_RESULT(
+      !namespace_id.empty() ? NamespaceIdExists(namespace_id)
+                            : NamespaceExists(namespace_name));
+  if (namespace_exists) {
     // Verify that the namespace we found is running so that, once this request returns,
     // the client can send operations without receiving a "namespace not found" error.
     return data_->WaitForCreateNamespaceToFinish(this, namespace_name, database_type, namespace_id,
@@ -1457,6 +1451,14 @@ void YBClient::DeleteTablet(const TabletId& tablet_id, StdStatusCallback callbac
   data_->DeleteTablet(this, tablet_id, deadline, callback);
 }
 
+void YBClient::GetTableLocations(
+    const TableId& table_id, int32_t max_tablets, RequireTabletsRunning require_tablets_running,
+    GetTableLocationsCallback callback) {
+  auto deadline = CoarseMonoClock::Now() + default_admin_operation_timeout();
+  data_->GetTableLocations(
+      this, table_id, max_tablets, require_tablets_running, deadline, std::move(callback));
+}
+
 Status YBClient::TabletServerCount(int *tserver_count, bool primary_only, bool use_cache) {
   int tserver_count_cached = data_->tserver_count_cached_.load(std::memory_order_acquire);
   if (use_cache && tserver_count_cached > 0) {
@@ -1522,7 +1524,8 @@ Status YBClient::ListLiveTabletServers(
     auto ts = std::make_unique<YBTabletServerPlacementInfo>(
         entry.instance_id().permanent_uuid(),
         DesiredHostPort(entry.registration().common(), data_->cloud_info_pb_).host(),
-        entry.registration().common().placement_uuid(), cloud, region, zone, isPrimary, publicIp);
+        entry.registration().common().placement_uuid(), cloud, region, zone, isPrimary,
+        publicIp, entry.registration().common().pg_port());
     tablet_servers->push_back(std::move(ts));
   }
   return Status::OK();

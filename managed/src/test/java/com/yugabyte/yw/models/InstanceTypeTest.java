@@ -2,30 +2,34 @@
 
 package com.yugabyte.yw.models;
 
+import static com.yugabyte.yw.common.AssertHelper.assertValue;
+import static org.hamcrest.CoreMatchers.equalTo;
+import static org.hamcrest.CoreMatchers.notNullValue;
+import static org.hamcrest.core.AllOf.allOf;
+import static org.junit.Assert.assertEquals;
+import static org.junit.Assert.assertNotNull;
+import static org.junit.Assert.assertThat;
+import static org.junit.Assert.assertTrue;
+import static org.mockito.Mockito.when;
+
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.node.ObjectNode;
+import com.google.common.collect.ImmutableList;
 import com.typesafe.config.Config;
+import com.yugabyte.yw.common.ConfigHelper;
 import com.yugabyte.yw.common.FakeDBApplication;
 import com.yugabyte.yw.common.ModelFactory;
 import com.yugabyte.yw.models.InstanceType.VolumeType;
+import java.util.ArrayList;
+import java.util.HashSet;
+import java.util.List;
+import java.util.Set;
 import org.junit.Before;
 import org.junit.Test;
 import org.junit.runner.RunWith;
 import org.mockito.Mock;
 import org.mockito.junit.MockitoJUnitRunner;
 import play.libs.Json;
-
-import java.util.ArrayList;
-import java.util.HashSet;
-import java.util.List;
-import java.util.Set;
-
-import static com.yugabyte.yw.common.AssertHelper.assertValue;
-import static org.hamcrest.CoreMatchers.equalTo;
-import static org.hamcrest.CoreMatchers.notNullValue;
-import static org.hamcrest.core.AllOf.allOf;
-import static org.junit.Assert.*;
-import static org.mockito.Mockito.when;
 
 @RunWith(MockitoJUnitRunner.class)
 public class InstanceTypeTest extends FakeDBApplication {
@@ -35,6 +39,7 @@ public class InstanceTypeTest extends FakeDBApplication {
   private InstanceType.InstanceTypeDetails defaultDetails;
 
   @Mock Config mockConfig;
+  @Mock ConfigHelper mockConfigHelper;
 
   @Before
   public void setUp() {
@@ -91,6 +96,8 @@ public class InstanceTypeTest extends FakeDBApplication {
   @Test
   public void testFindByProvider() {
     Provider newProvider = ModelFactory.gcpProvider(defaultCustomer);
+    when(mockConfigHelper.getAWSInstancePrefixesSupported())
+        .thenReturn(ImmutableList.of("m3.", "c5.", "c5d.", "c4.", "c3.", "i3."));
     InstanceType.upsert(defaultProvider.uuid, "c3.medium", 3, 10.0, defaultDetails);
     InstanceType.upsert(defaultProvider.uuid, "c3.large", 3, 10.0, defaultDetails);
     InstanceType.upsert(defaultProvider.uuid, "c3.xlarge", 3, 10.0, defaultDetails);
@@ -98,7 +105,8 @@ public class InstanceTypeTest extends FakeDBApplication {
     instanceType.setActive(false);
     instanceType.save();
     InstanceType.upsert(newProvider.uuid, "bar", 2, 10.0, defaultDetails);
-    List<InstanceType> instanceTypeList = InstanceType.findByProvider(defaultProvider, mockConfig);
+    List<InstanceType> instanceTypeList =
+        InstanceType.findByProvider(defaultProvider, mockConfig, mockConfigHelper);
     assertNotNull(instanceTypeList);
     assertEquals(2, instanceTypeList.size());
     Set<String> possibleTypes = new HashSet<>();
@@ -113,7 +121,8 @@ public class InstanceTypeTest extends FakeDBApplication {
   @Test
   public void testFindByProviderOnprem() {
     InstanceType.upsert(onpremProvider.uuid, "bar", 2, 10.0, defaultDetails);
-    List<InstanceType> instanceTypeList = InstanceType.findByProvider(onpremProvider, mockConfig);
+    List<InstanceType> instanceTypeList =
+        InstanceType.findByProvider(onpremProvider, mockConfig, mockConfigHelper);
     assertEquals(1, instanceTypeList.size());
 
     InstanceType it = instanceTypeList.get(0);
@@ -123,9 +132,12 @@ public class InstanceTypeTest extends FakeDBApplication {
 
   @Test
   public void testFindByProviderWithUnSupportedInstances() {
+    when(mockConfigHelper.getAWSInstancePrefixesSupported())
+        .thenReturn(ImmutableList.of("m3.", "c5.", "c5d.", "c4.", "c3.", "i3."));
     InstanceType.upsert(defaultProvider.uuid, "t2.medium", 3, 10.0, defaultDetails);
     InstanceType.upsert(defaultProvider.uuid, "c3.medium", 2, 10.0, defaultDetails);
-    List<InstanceType> instanceTypeList = InstanceType.findByProvider(defaultProvider, mockConfig);
+    List<InstanceType> instanceTypeList =
+        InstanceType.findByProvider(defaultProvider, mockConfig, mockConfigHelper);
     assertNotNull(instanceTypeList);
     assertEquals(1, instanceTypeList.size());
     assertThat(
@@ -138,7 +150,10 @@ public class InstanceTypeTest extends FakeDBApplication {
         defaultProvider.uuid, "c5.medium", 3, 10.0, new InstanceType.InstanceTypeDetails());
     when(mockConfig.getInt(InstanceType.YB_AWS_DEFAULT_VOLUME_COUNT_KEY)).thenReturn(1);
     when(mockConfig.getInt(InstanceType.YB_AWS_DEFAULT_VOLUME_SIZE_GB_KEY)).thenReturn(250);
-    List<InstanceType> instanceTypeList = InstanceType.findByProvider(defaultProvider, mockConfig);
+    when(mockConfigHelper.getAWSInstancePrefixesSupported())
+        .thenReturn(ImmutableList.of("m3.", "c5.", "c5d.", "c4.", "c3.", "i3."));
+    List<InstanceType> instanceTypeList =
+        InstanceType.findByProvider(defaultProvider, mockConfig, mockConfigHelper);
     assertNotNull(instanceTypeList);
     InstanceType.VolumeDetails volumeDetails =
         instanceTypeList.get(0).instanceTypeDetails.volumeDetailsList.get(0);
@@ -155,7 +170,10 @@ public class InstanceTypeTest extends FakeDBApplication {
     InstanceType.upsert(defaultProvider.uuid, "c5.medium", 3, 10.0, null);
     when(mockConfig.getInt(InstanceType.YB_AWS_DEFAULT_VOLUME_COUNT_KEY)).thenReturn(1);
     when(mockConfig.getInt(InstanceType.YB_AWS_DEFAULT_VOLUME_SIZE_GB_KEY)).thenReturn(250);
-    List<InstanceType> instanceTypeList = InstanceType.findByProvider(defaultProvider, mockConfig);
+    when(mockConfigHelper.getAWSInstancePrefixesSupported())
+        .thenReturn(ImmutableList.of("m3.", "c5.", "c5d.", "c4.", "c3.", "i3."));
+    List<InstanceType> instanceTypeList =
+        InstanceType.findByProvider(defaultProvider, mockConfig, mockConfigHelper);
     assertNotNull(instanceTypeList);
     InstanceType.VolumeDetails volumeDetails =
         instanceTypeList.get(0).instanceTypeDetails.volumeDetailsList.get(0);
@@ -171,9 +189,24 @@ public class InstanceTypeTest extends FakeDBApplication {
   public void testDeleteByProvider() {
     Provider newProvider = ModelFactory.gcpProvider(defaultCustomer);
     InstanceType.upsert(newProvider.uuid, "bar", 2, 10.0, defaultDetails);
-    InstanceType.deleteInstanceTypesForProvider(newProvider, mockConfig);
-    List<InstanceType> instanceTypeList = InstanceType.findByProvider(newProvider, mockConfig);
+    InstanceType.deleteInstanceTypesForProvider(newProvider, mockConfig, mockConfigHelper);
+    List<InstanceType> instanceTypeList =
+        InstanceType.findByProvider(newProvider, mockConfig, mockConfigHelper);
     assertEquals(0, instanceTypeList.size());
+  }
+
+  @Test
+  public void testGravitonProvider() {
+    when(mockConfigHelper.getAWSInstancePrefixesSupported())
+        .thenReturn(ImmutableList.of("m3.", "c5.", "c5d.", "c4.", "c3.", "i3.", "m6g."));
+    InstanceType.upsert(defaultProvider.uuid, "t2.medium", 3, 10.0, defaultDetails);
+    InstanceType.upsert(defaultProvider.uuid, "m6g.small", 2, 10.0, defaultDetails);
+    List<InstanceType> instanceTypeList =
+        InstanceType.findByProvider(defaultProvider, mockConfig, mockConfigHelper);
+    assertNotNull(instanceTypeList);
+    assertEquals(1, instanceTypeList.size());
+    assertThat(
+        instanceTypeList.get(0).getInstanceTypeCode(), allOf(notNullValue(), equalTo("m6g.small")));
   }
 
   @Test

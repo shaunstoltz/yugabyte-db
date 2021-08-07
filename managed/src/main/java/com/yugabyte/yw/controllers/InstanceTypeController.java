@@ -2,37 +2,44 @@
 
 package com.yugabyte.yw.controllers;
 
+import static com.yugabyte.yw.commissioner.Common.CloudType.onprem;
+import static java.util.function.Function.identity;
+import static java.util.stream.Collectors.groupingBy;
+import static java.util.stream.Collectors.mapping;
+import static java.util.stream.Collectors.toMap;
+import static java.util.stream.Collectors.toSet;
+
 import com.google.inject.Inject;
 import com.typesafe.config.Config;
 import com.yugabyte.yw.cloud.CloudAPI;
 import com.yugabyte.yw.cloud.PublicCloudConstants;
 import com.yugabyte.yw.cloud.PublicCloudConstants.StorageType;
 import com.yugabyte.yw.commissioner.Common;
+import com.yugabyte.yw.common.ConfigHelper;
 import com.yugabyte.yw.forms.YWResults;
 import com.yugabyte.yw.forms.YWResults.YWError;
 import com.yugabyte.yw.models.AvailabilityZone;
 import com.yugabyte.yw.models.InstanceType;
 import com.yugabyte.yw.models.Provider;
 import com.yugabyte.yw.models.Region;
-import org.slf4j.Logger;
-import org.slf4j.LoggerFactory;
-
 import io.swagger.annotations.Api;
 import io.swagger.annotations.ApiImplicitParam;
 import io.swagger.annotations.ApiImplicitParams;
 import io.swagger.annotations.ApiOperation;
 import io.swagger.annotations.ApiResponses;
 import io.swagger.annotations.Authorization;
+import java.util.Arrays;
+import java.util.HashSet;
+import java.util.List;
+import java.util.Map;
+import java.util.Set;
+import java.util.UUID;
+import java.util.stream.Collectors;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 import play.data.Form;
 import play.libs.Json;
 import play.mvc.Result;
-
-import java.util.*;
-import java.util.stream.Collectors;
-
-import static com.yugabyte.yw.commissioner.Common.CloudType.onprem;
-import static java.util.function.Function.identity;
-import static java.util.stream.Collectors.*;
 
 @Api(
     value = "Instance Type",
@@ -50,6 +57,8 @@ public class InstanceTypeController extends AuthenticatedController {
     this.cloudAPIFactory = cloudAPIFactory;
   }
 
+  @Inject ConfigHelper configHelper;
+
   /**
    * GET endpoint for listing instance types
    *
@@ -60,7 +69,8 @@ public class InstanceTypeController extends AuthenticatedController {
   @ApiOperation(
       value = "list Instance Types for specific provider.",
       response = YWResults.class,
-      responseContainer = "List")
+      responseContainer = "List",
+      nickname = "listOfInstanceType")
   @ApiResponses(
       @io.swagger.annotations.ApiResponse(
           code = 500,
@@ -71,7 +81,7 @@ public class InstanceTypeController extends AuthenticatedController {
     Provider provider = Provider.getOrBadRequest(customerUUID, providerUUID);
     Map<String, InstanceType> instanceTypesMap;
     instanceTypesMap =
-        InstanceType.findByProvider(provider, config)
+        InstanceType.findByProvider(provider, config, configHelper)
             .stream()
             .collect(toMap(InstanceType::getInstanceTypeCode, identity()));
 
@@ -141,7 +151,10 @@ public class InstanceTypeController extends AuthenticatedController {
    * @param providerUUID, UUID of provider
    * @return JSON response of newly created instance type
    */
-  @ApiOperation(value = "create Instance type", response = InstanceType.class)
+  @ApiOperation(
+      value = "create Instance type",
+      response = InstanceType.class,
+      nickname = "createInstanceType")
   @ApiImplicitParams(
       @ApiImplicitParam(
           name = "instance type",
@@ -172,7 +185,10 @@ public class InstanceTypeController extends AuthenticatedController {
    * @param instanceTypeCode, Instance TaskType code.
    * @return JSON response to denote if the delete was successful or not.
    */
-  @ApiOperation(value = "delete", response = YWResults.YWSuccess.class)
+  @ApiOperation(
+      value = "delete",
+      response = YWResults.YWSuccess.class,
+      nickname = "deleteInstanceType")
   public Result delete(UUID customerUUID, UUID providerUUID, String instanceTypeCode) {
     Provider provider = Provider.getOrBadRequest(customerUUID, providerUUID);
     InstanceType instanceType = InstanceType.getOrBadRequest(provider.uuid, instanceTypeCode);
@@ -192,7 +208,8 @@ public class InstanceTypeController extends AuthenticatedController {
    */
   @ApiOperation(
       value = "get instance type through instance type code.",
-      response = InstanceType.class)
+      response = InstanceType.class,
+      nickname = "instanceTypeDetail")
   public Result index(UUID customerUUID, UUID providerUUID, String instanceTypeCode) {
     Provider provider = Provider.getOrBadRequest(customerUUID, providerUUID);
 
