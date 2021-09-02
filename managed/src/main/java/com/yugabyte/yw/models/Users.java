@@ -9,7 +9,7 @@ import com.fasterxml.jackson.annotation.JsonFormat;
 import com.fasterxml.jackson.annotation.JsonIgnore;
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.node.ObjectNode;
-import com.yugabyte.yw.common.YWServiceException;
+import com.yugabyte.yw.common.PlatformServiceException;
 import io.ebean.Finder;
 import io.ebean.Model;
 import io.ebean.annotation.EnumValue;
@@ -84,7 +84,7 @@ public class Users extends Model {
   @Column(length = 256, unique = true, nullable = false)
   @Constraints.Required
   @Constraints.Email
-  @ApiModelProperty(value = "User email id", example = "username1@email.com", required = true)
+  @ApiModelProperty(value = "User email id", example = "username1@example.com", required = true)
   public String email;
 
   public String getEmail() {
@@ -163,7 +163,7 @@ public class Users extends Model {
   public static Users getOrBadRequest(UUID userUUID) {
     Users user = get(userUUID);
     if (user == null) {
-      throw new YWServiceException(BAD_REQUEST, "Invalid User UUID:" + userUUID);
+      throw new PlatformServiceException(BAD_REQUEST, "Invalid User UUID:" + userUUID);
     }
     return user;
   }
@@ -272,7 +272,7 @@ public class Users extends Model {
     if (apiToken == null) {
       return null;
     }
-    return apiToken.toString();
+    return apiToken;
   }
 
   /**

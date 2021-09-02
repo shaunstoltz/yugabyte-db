@@ -47,8 +47,8 @@ import com.yugabyte.yw.common.ApiUtils;
 import com.yugabyte.yw.common.FakeApiHelper;
 import com.yugabyte.yw.common.FakeDBApplication;
 import com.yugabyte.yw.common.ModelFactory;
+import com.yugabyte.yw.common.PlatformServiceException;
 import com.yugabyte.yw.common.RegexMatcher;
-import com.yugabyte.yw.common.YWServiceException;
 import com.yugabyte.yw.common.audit.AuditService;
 import com.yugabyte.yw.common.services.YBClientService;
 import com.yugabyte.yw.forms.BackupTableParams;
@@ -611,7 +611,7 @@ public class TablesControllerTest extends FakeDBApplication {
     Users user = ModelFactory.testUser(customer, Users.Role.BackupAdmin);
     Universe universe = ModelFactory.createUniverse(customer.getCustomerId());
     UUID tableUUID = UUID.randomUUID();
-    CustomerConfig customerConfig = ModelFactory.createS3StorageConfig(customer);
+    CustomerConfig customerConfig = ModelFactory.createS3StorageConfig(customer, "TEST17");
     String url =
         "/api/customers/"
             + customer.uuid
@@ -668,7 +668,7 @@ public class TablesControllerTest extends FakeDBApplication {
             + tableUUID
             + "/create_backup";
     ObjectNode bodyJson = Json.newObject();
-    CustomerConfig customerConfig = ModelFactory.createS3StorageConfig(customer);
+    CustomerConfig customerConfig = ModelFactory.createS3StorageConfig(customer, "TEST18");
     bodyJson.put("keyspace", "foo");
     bodyJson.put("tableName", "bar");
     bodyJson.put("actionType", "CREATE");
@@ -711,7 +711,7 @@ public class TablesControllerTest extends FakeDBApplication {
 
     TablesController mockTablesController = spy(tablesController);
 
-    doThrow(new YWServiceException(BAD_REQUEST, "bad request"))
+    doThrow(new PlatformServiceException(BAD_REQUEST, "bad request"))
         .when(mockTablesController)
         .validateTables(any(), any());
     UUID uuid = UUID.randomUUID();
@@ -741,7 +741,7 @@ public class TablesControllerTest extends FakeDBApplication {
             + tableUUID
             + "/create_backup";
     ObjectNode bodyJson = Json.newObject();
-    CustomerConfig customerConfig = ModelFactory.createS3StorageConfig(customer);
+    CustomerConfig customerConfig = ModelFactory.createS3StorageConfig(customer, "TEST19");
     bodyJson.put("keyspace", "foo");
     bodyJson.put("tableName", "bar");
     bodyJson.put("actionType", "CREATE");
@@ -775,7 +775,7 @@ public class TablesControllerTest extends FakeDBApplication {
             + tableUUID
             + "/create_backup";
     ObjectNode bodyJson = Json.newObject();
-    CustomerConfig customerConfig = ModelFactory.createS3StorageConfig(customer);
+    CustomerConfig customerConfig = ModelFactory.createS3StorageConfig(customer, "TEST20");
     bodyJson.put("keyspace", "foo");
     bodyJson.put("tableName", "bar");
     bodyJson.put("actionType", "CREATE");
@@ -804,7 +804,7 @@ public class TablesControllerTest extends FakeDBApplication {
             + universe.universeUUID
             + "/multi_table_backup";
     ObjectNode bodyJson = Json.newObject();
-    CustomerConfig customerConfig = ModelFactory.createS3StorageConfig(customer);
+    CustomerConfig customerConfig = ModelFactory.createS3StorageConfig(customer, "TEST21");
     bodyJson.put("actionType", "CREATE");
     bodyJson.put("storageConfigUUID", customerConfig.configUUID.toString());
 
@@ -844,7 +844,7 @@ public class TablesControllerTest extends FakeDBApplication {
             + universe.universeUUID
             + "/multi_table_backup";
     ObjectNode bodyJson = Json.newObject();
-    CustomerConfig customerConfig = ModelFactory.createS3StorageConfig(customer);
+    CustomerConfig customerConfig = ModelFactory.createS3StorageConfig(customer, "TEST22");
     bodyJson.put("actionType", "CREATE");
     bodyJson.put("storageConfigUUID", customerConfig.configUUID.toString());
 
@@ -872,7 +872,7 @@ public class TablesControllerTest extends FakeDBApplication {
             + universe.universeUUID
             + "/multi_table_backup";
     ObjectNode bodyJson = Json.newObject();
-    CustomerConfig customerConfig = ModelFactory.createS3StorageConfig(customer);
+    CustomerConfig customerConfig = ModelFactory.createS3StorageConfig(customer, "TEST23");
     bodyJson.put("actionType", "CREATE");
     bodyJson.put("storageConfigUUID", customerConfig.configUUID.toString());
     bodyJson.put("cronExpression", "5 * * * *");
@@ -900,7 +900,7 @@ public class TablesControllerTest extends FakeDBApplication {
             + universe.universeUUID
             + "/multi_table_backup";
     ObjectNode bodyJson = Json.newObject();
-    CustomerConfig customerConfig = ModelFactory.createS3StorageConfig(customer);
+    CustomerConfig customerConfig = ModelFactory.createS3StorageConfig(customer, "TEST24");
     bodyJson.put("actionType", "CREATE");
     bodyJson.put("storageConfigUUID", customerConfig.configUUID.toString());
     bodyJson.put("schedulingFrequency", "6000");

@@ -41,6 +41,8 @@ public enum TaskType {
 
   EditKubernetesUniverse("EditKubernetesUniverse"),
 
+  ExternalScript("ExternalScript"),
+
   @Deprecated
   KubernetesProvision("KubernetesProvision"),
 
@@ -127,6 +129,8 @@ public enum TaskType {
 
   AnsibleSetupServer("subtasks.AnsibleSetupServer"),
 
+  AnsibleCreateServer("subtasks.AnsibleCreateServer"),
+
   PrecheckNode("subtasks.PrecheckNode"),
 
   AnsibleUpdateNodeInfo("subtasks.AnsibleUpdateNodeInfo"),
@@ -182,6 +186,8 @@ public enum TaskType {
   InstanceActions("subtasks.InstanceActions"),
 
   WaitForServerReady("subtasks.WaitForServerReady"),
+
+  RunExternalScript("subtasks.RunExternalScript"),
 
   // Tasks belonging to subtasks.cloud classpath
   CloudAccessKeyCleanup("subtasks.cloud.CloudAccessKeyCleanup"),
@@ -242,7 +248,9 @@ public enum TaskType {
   AlterXClusterReplicationChangeMasterAddresses(
       "subtasks.AlterXClusterReplicationChangeMasterAddresses"),
 
-  XClusterReplicationSetActive("subtasks.XClusterReplicationSetActive");
+  XClusterReplicationSetActive("subtasks.XClusterReplicationSetActive"),
+
+  DeleteCertificate("subtasks.DeleteCertificate");
 
   private String relativeClassPath;
 

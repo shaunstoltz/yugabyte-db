@@ -2,8 +2,8 @@
 
 package com.yugabyte.yw.controllers;
 
-import com.yugabyte.yw.common.YWServiceException;
-import com.yugabyte.yw.common.alerts.MetricService;
+import com.yugabyte.yw.common.PlatformServiceException;
+import com.yugabyte.yw.common.metrics.MetricService;
 import com.yugabyte.yw.models.Metric;
 import com.yugabyte.yw.models.MetricLabel;
 import com.yugabyte.yw.models.filters.MetricFilter;
@@ -38,7 +38,10 @@ public class MetricsController extends Controller {
 
   @Inject private MetricService metricService;
 
-  @ApiOperation(value = "index", response = String.class, nickname = "MetricsDetail")
+  @ApiOperation(
+      value = "Get Prometheus metrics",
+      response = String.class,
+      nickname = "MetricsDetail")
   public Result index() {
     final ByteArrayOutputStream response = new ByteArrayOutputStream(1 << 20);
     try {
@@ -53,7 +56,7 @@ public class MetricsController extends Controller {
       response.flush();
       response.close();
     } catch (Exception e) {
-      throw new YWServiceException(INTERNAL_SERVER_ERROR, e.getMessage());
+      throw new PlatformServiceException(INTERNAL_SERVER_ERROR, e.getMessage());
     }
 
     return Results.status(OK, response.toString());

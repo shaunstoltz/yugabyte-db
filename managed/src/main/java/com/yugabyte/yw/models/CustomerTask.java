@@ -2,13 +2,10 @@
 
 package com.yugabyte.yw.models;
 
-import static io.swagger.annotations.ApiModelProperty.AccessMode.READ_ONLY;
-import static play.mvc.Http.Status.BAD_REQUEST;
-
 import com.fasterxml.jackson.annotation.JsonFormat;
 import com.google.common.annotations.VisibleForTesting;
 import com.google.common.base.Preconditions;
-import com.yugabyte.yw.common.YWServiceException;
+import com.yugabyte.yw.common.PlatformServiceException;
 import io.ebean.Finder;
 import io.ebean.Model;
 import io.ebean.annotation.EnumValue;
@@ -31,6 +28,8 @@ import javax.persistence.Id;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import play.data.validation.Constraints;
+import static io.swagger.annotations.ApiModelProperty.AccessMode.READ_ONLY;
+import static play.mvc.Http.Status.BAD_REQUEST;
 
 @Entity
 @ApiModel(description = "Customers Task Information.")
@@ -178,7 +177,25 @@ public class CustomerTask extends Model {
     StartMaster,
 
     @EnumValue("CreateAlertDefinitions")
-    CreateAlertDefinitions;
+    CreateAlertDefinitions,
+
+    @EnumValue("ExternalScript")
+    ExternalScript,
+
+    @EnumValue("CreateXClusterReplication")
+    CreateXClusterReplication,
+
+    @EnumValue("DeleteXClusterReplication")
+    DeleteXClusterReplication,
+
+    @EnumValue("EditXClusterReplication")
+    EditXClusterReplication,
+
+    @EnumValue("PauseXClusterReplication")
+    PauseXClusterReplication,
+
+    @EnumValue("ResumeXClusterReplication")
+    ResumeXClusterReplication;
 
     public String toString(boolean completed) {
       switch (this) {
@@ -236,6 +253,18 @@ public class CustomerTask extends Model {
           return completed ? "Started Master process on " : "Starting Master process on ";
         case CreateAlertDefinitions:
           return completed ? "Created alert definitions " : "Creating alert definitions ";
+        case ExternalScript:
+          return completed ? "Script execution completed " : "Script execution is running";
+        case CreateXClusterReplication:
+          return completed ? "Created xCluster replication " : "Creating xCluster replication ";
+        case DeleteXClusterReplication:
+          return completed ? "Deleted xCluster replication " : "Deleting xCluster replication ";
+        case EditXClusterReplication:
+          return completed ? "Edited xCluster replication " : "Editing xCluster replication ";
+        case PauseXClusterReplication:
+          return completed ? "Paused xCluster replication " : "Pausing xCluster replication ";
+        case ResumeXClusterReplication:
+          return completed ? "Resumed xCluster replication " : "Resuming xCluster replication ";
         default:
           return null;
       }
@@ -403,7 +432,7 @@ public class CustomerTask extends Model {
   public static CustomerTask getOrBadRequest(UUID customerUUID, UUID taskUUID) {
     CustomerTask customerTask = get(customerUUID, taskUUID);
     if (customerTask == null) {
-      throw new YWServiceException(BAD_REQUEST, "Invalid Customer Task UUID: " + taskUUID);
+      throw new PlatformServiceException(BAD_REQUEST, "Invalid Customer Task UUID: " + taskUUID);
     }
     return customerTask;
   }

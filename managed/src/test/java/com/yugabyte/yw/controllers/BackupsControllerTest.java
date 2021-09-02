@@ -32,7 +32,7 @@ import com.yugabyte.yw.common.FakeApiHelper;
 import com.yugabyte.yw.common.FakeDBApplication;
 import com.yugabyte.yw.common.ModelFactory;
 import com.yugabyte.yw.common.Util;
-import com.yugabyte.yw.common.YWServiceException;
+import com.yugabyte.yw.common.PlatformServiceException;
 import com.yugabyte.yw.forms.BackupTableParams;
 import com.yugabyte.yw.models.Backup;
 import com.yugabyte.yw.models.Backup.BackupState;
@@ -79,7 +79,7 @@ public class BackupsControllerTest extends FakeDBApplication {
 
     backupTableParams = new BackupTableParams();
     backupTableParams.universeUUID = defaultUniverse.universeUUID;
-    customerConfig = ModelFactory.createS3StorageConfig(defaultCustomer);
+    customerConfig = ModelFactory.createS3StorageConfig(defaultCustomer, "TEST105");
     backupTableParams.storageConfigUUID = customerConfig.configUUID;
     defaultBackup = Backup.create(defaultCustomer.uuid, backupTableParams);
     defaultBackup.setTaskUUID(taskUUID);
@@ -222,7 +222,7 @@ public class BackupsControllerTest extends FakeDBApplication {
 
   @Test
   public void testRestoreBackupWithoutStorageLocation() {
-    CustomerConfig customerConfig = ModelFactory.createS3StorageConfig(defaultCustomer);
+    CustomerConfig customerConfig = ModelFactory.createS3StorageConfig(defaultCustomer, "TEST2");
     BackupTableParams bp = new BackupTableParams();
     bp.storageConfigUUID = customerConfig.configUUID;
     Backup.create(defaultCustomer.uuid, bp);
@@ -276,7 +276,7 @@ public class BackupsControllerTest extends FakeDBApplication {
 
   @Test
   public void testRestoreBackupWithValidParams() {
-    CustomerConfig customerConfig = ModelFactory.createS3StorageConfig(defaultCustomer);
+    CustomerConfig customerConfig = ModelFactory.createS3StorageConfig(defaultCustomer, "TEST3");
     BackupTableParams bp = new BackupTableParams();
     bp.storageConfigUUID = customerConfig.configUUID;
     Backup b = Backup.create(defaultCustomer.uuid, bp);
@@ -327,7 +327,7 @@ public class BackupsControllerTest extends FakeDBApplication {
   // cause us to return
   @Test
   public void testRestoreBackupRequestTooLarge() {
-    CustomerConfig customerConfig = ModelFactory.createS3StorageConfig(defaultCustomer);
+    CustomerConfig customerConfig = ModelFactory.createS3StorageConfig(defaultCustomer, "TEST5");
     BackupTableParams bp = new BackupTableParams();
     bp.storageConfigUUID = customerConfig.configUUID;
     Backup.create(defaultCustomer.uuid, bp);
@@ -355,7 +355,7 @@ public class BackupsControllerTest extends FakeDBApplication {
 
   @Test
   public void testDeleteBackup() {
-    CustomerConfig customerConfig = ModelFactory.createS3StorageConfig(defaultCustomer);
+    CustomerConfig customerConfig = ModelFactory.createS3StorageConfig(defaultCustomer, "TEST6");
     BackupTableParams bp = new BackupTableParams();
     bp.storageConfigUUID = customerConfig.configUUID;
     bp.universeUUID = defaultUniverse.universeUUID;
@@ -413,7 +413,8 @@ public class BackupsControllerTest extends FakeDBApplication {
       throws IOException, InterruptedException, ExecutionException {
     defaultBackup.transitionState(BackupState.Completed);
     Result result =
-        assertThrows(YWServiceException.class, () -> stopBackup(null, defaultBackup.backupUUID))
+        assertThrows(
+                PlatformServiceException.class, () -> stopBackup(null, defaultBackup.backupUUID))
             .getResult();
     assertEquals(400, result.status());
     JsonNode json = Json.parse(contentAsString(result));
@@ -435,7 +436,8 @@ public class BackupsControllerTest extends FakeDBApplication {
 
     defaultBackup.setTaskUUID(taskUUID);
     Result result =
-        assertThrows(YWServiceException.class, () -> stopBackup(null, defaultBackup.backupUUID))
+        assertThrows(
+                PlatformServiceException.class, () -> stopBackup(null, defaultBackup.backupUUID))
             .getResult();
     taskInfo.save();
 
