@@ -18,6 +18,7 @@ import static com.yugabyte.yw.models.helpers.EntityOperation.DELETE;
 import static com.yugabyte.yw.models.helpers.EntityOperation.UPDATE;
 import static play.mvc.Http.Status.BAD_REQUEST;
 
+import com.google.common.collect.ImmutableSet;
 import com.yugabyte.yw.common.AlertTemplate;
 import com.yugabyte.yw.common.PlatformServiceException;
 import com.yugabyte.yw.common.alerts.impl.AlertConfigurationTemplate;
@@ -41,6 +42,7 @@ import com.yugabyte.yw.models.paging.PagedQuery.SortDirection;
 import io.ebean.Query;
 import io.ebean.annotation.Transactional;
 import java.util.ArrayList;
+import java.util.Arrays;
 import java.util.Collection;
 import java.util.Collections;
 import java.util.Comparator;
@@ -230,6 +232,7 @@ public class AlertConfigurationService {
     }
   }
 
+  // TODO: Remove many of these validations as annotations work now
   private void validate(AlertConfiguration configuration, AlertConfiguration before) {
     if (configuration.getCustomerUUID() == null) {
       throw new PlatformServiceException(BAD_REQUEST, "Customer UUID field is mandatory");
@@ -260,7 +263,8 @@ public class AlertConfigurationService {
       switch (configuration.getTargetType()) {
         case UNIVERSE:
           Set<UUID> existingUuids =
-              Universe.getAllWithoutResources(configuration.getTarget().getUuids())
+              Universe.getAllWithoutResources(
+                      ImmutableSet.copyOf(configuration.getTarget().getUuids()))
                   .stream()
                   .map(Universe::getUniverseUUID)
                   .collect(Collectors.toSet());
@@ -289,11 +293,16 @@ public class AlertConfigurationService {
     if (MapUtils.isEmpty(configuration.getThresholds())) {
       throw new PlatformServiceException(BAD_REQUEST, "Query thresholds are mandatory");
     }
-    if (configuration.getDestinationUUID() != null
-        && AlertDestination.get(configuration.getCustomerUUID(), configuration.getDestinationUUID())
-            == null) {
-      throw new PlatformServiceException(
-          BAD_REQUEST, "Alert destination " + configuration.getDestinationUUID() + " is missing");
+    if (configuration.getDestinationUUID() != null) {
+      if (AlertDestination.get(configuration.getCustomerUUID(), configuration.getDestinationUUID())
+          == null) {
+        throw new PlatformServiceException(
+            BAD_REQUEST, "Alert destination " + configuration.getDestinationUUID() + " is missing");
+      }
+      if (configuration.isDefaultDestination()) {
+        throw new PlatformServiceException(
+            BAD_REQUEST, "Destination can't be filled in case default destination is selected");
+      }
     }
     if (configuration.getThresholdUnit() == null) {
       throw new PlatformServiceException(BAD_REQUEST, "Threshold unit is mandatory");
@@ -332,19 +341,22 @@ public class AlertConfigurationService {
     if (before != null) {
       if (!configuration.getCustomerUUID().equals(before.getCustomerUUID())) {
         throw new PlatformServiceException(
-            BAD_REQUEST, "Can't change customer UUID for configuration " + configuration.getUuid());
+            BAD_REQUEST,
+            "Can't change customer UUID for configuration '" + configuration.getName() + "'");
       }
       if (!configuration.getTargetType().equals(before.getTargetType())) {
         throw new PlatformServiceException(
-            BAD_REQUEST, "Can't change target type for configuration " + configuration.getUuid());
+            BAD_REQUEST,
+            "Can't change target type for configuration '" + configuration.getName() + "'");
       }
       if (!configuration.getCreateTime().equals(before.getCreateTime())) {
         throw new PlatformServiceException(
-            BAD_REQUEST, "Can't change create time for configuration " + configuration.getUuid());
+            BAD_REQUEST,
+            "Can't change create time for configuration '" + configuration.getName() + "'");
       }
     } else if (!configuration.isNew()) {
       throw new PlatformServiceException(
-          BAD_REQUEST, "Can't update missing configuration " + configuration.getUuid());
+          BAD_REQUEST, "Can't update missing configuration '" + configuration.getName() + "'");
     }
   }
 
@@ -579,12 +591,26 @@ public class AlertConfigurationService {
                                             : e.getValue().getThreshold()))))
             .setThresholdUnit(template.getDefaultThresholdUnit())
             .setTemplate(template)
-            .setDurationSec(template.getDefaultDurationSec());
+            .setDurationSec(template.getDefaultDurationSec())
+            .setDefaultDestination(true);
     return new AlertConfigurationTemplate()
         .setDefaultConfiguration(configuration)
         .setThresholdMinValue(template.getThresholdMinValue())
         .setThresholdMaxValue(template.getThresholdMaxValue())
-        .setThresholdInteger(template.getDefaultThresholdUnit().isInteger());
+        .setThresholdInteger(template.getDefaultThresholdUnit().isInteger())
+        .setThresholdReadOnly(template.isThresholdReadOnly())
+        .setThresholdConditionReadOnly(template.isThresholdConditionReadOnly())
+        .setThresholdUnitName(template.getThresholdUnitName());
+  }
+
+  public void createDefaultConfigs(Customer customer) {
+    List<AlertConfiguration> alertConfigurations =
+        Arrays.stream(AlertTemplate.values())
+            .filter(AlertTemplate::isCreateForNewCustomer)
+            .map(template -> createConfigurationTemplate(customer, template))
+            .map(AlertConfigurationTemplate::getDefaultConfiguration)
+            .collect(Collectors.toList());
+    save(alertConfigurations);
   }
 
   private AlertDefinition createEmptyDefinition(AlertConfiguration configuration) {

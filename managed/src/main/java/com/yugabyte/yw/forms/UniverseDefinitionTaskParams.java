@@ -23,6 +23,8 @@ import com.yugabyte.yw.models.Region;
 import com.yugabyte.yw.models.helpers.DeviceInfo;
 import com.yugabyte.yw.models.helpers.NodeDetails;
 import com.yugabyte.yw.models.helpers.PlacementInfo;
+import com.yugabyte.yw.models.helpers.TaskType;
+import io.swagger.annotations.ApiModelProperty;
 import java.util.ArrayList;
 import java.util.HashMap;
 import java.util.HashSet;
@@ -33,8 +35,6 @@ import java.util.Objects;
 import java.util.Set;
 import java.util.UUID;
 import java.util.stream.Collectors;
-
-import io.swagger.annotations.ApiModelProperty;
 import org.apache.commons.lang3.StringUtils;
 import play.data.validation.Constraints;
 
@@ -97,6 +97,9 @@ public class UniverseDefinitionTaskParams extends UniverseTaskParams {
   // TODO: Add a version number to prevent stale updates.
   // Set to true when an create/edit/destroy intent on the universe is started.
   @ApiModelProperty public boolean updateInProgress = false;
+
+  // Type of task which set updateInProgress flag.
+  @ApiModelProperty public TaskType updatingTask = null;
 
   @ApiModelProperty public boolean backupInProgress = false;
 
@@ -356,7 +359,17 @@ public class UniverseDefinitionTaskParams extends UniverseTaskParams {
 
     @ApiModelProperty() public boolean useTimeSync = false;
 
-    @ApiModelProperty() public boolean enableYSQL = false;
+    @ApiModelProperty() public boolean enableYCQL = true;
+
+    @ApiModelProperty() public String ysqlPassword;
+
+    @ApiModelProperty() public String ycqlPassword;
+
+    @ApiModelProperty() public boolean enableYSQLAuth = false;
+
+    @ApiModelProperty() public boolean enableYCQLAuth = false;
+
+    @ApiModelProperty() public boolean enableYSQL = true;
 
     @ApiModelProperty(notes = "default: true")
     public boolean enableYEDIS = true;
@@ -451,6 +464,11 @@ public class UniverseDefinitionTaskParams extends UniverseTaskParams {
       newUserIntent.tserverGFlags = new HashMap<>(tserverGFlags);
       newUserIntent.useTimeSync = useTimeSync;
       newUserIntent.enableYSQL = enableYSQL;
+      newUserIntent.enableYCQL = enableYCQL;
+      newUserIntent.enableYSQLAuth = enableYSQLAuth;
+      newUserIntent.enableYCQLAuth = enableYCQLAuth;
+      newUserIntent.ysqlPassword = ysqlPassword;
+      newUserIntent.ycqlPassword = ycqlPassword;
       newUserIntent.enableYEDIS = enableYEDIS;
       newUserIntent.enableNodeToNodeEncrypt = enableNodeToNodeEncrypt;
       newUserIntent.enableClientToNodeEncrypt = enableClientToNodeEncrypt;

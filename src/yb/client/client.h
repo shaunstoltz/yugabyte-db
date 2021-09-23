@@ -368,9 +368,6 @@ class YBClient {
       const CoarseTimePoint deadline,
       const CoarseDuration max_wait = std::chrono::seconds(2));
 
-  // Trigger an async index permissions update after new YSQL index permissions are committed.
-  Status AsyncUpdateIndexPermissions(const TableId& indexed_table_id);
-
   // Namespace related methods.
 
   // Create a new namespace with the given name.
@@ -535,7 +532,9 @@ class YBClient {
                        CreateCDCStreamCallback callback);
 
   // Delete multiple CDC streams.
-  CHECKED_STATUS DeleteCDCStream(const vector<CDCStreamId>& streams);
+  CHECKED_STATUS DeleteCDCStream(const vector<CDCStreamId>& streams,
+                                 bool force = false,
+                                 master::DeleteCDCStreamResponsePB* resp = nullptr);
 
   // Delete a CDC stream.
   CHECKED_STATUS DeleteCDCStream(const CDCStreamId& stream_id);
@@ -652,7 +651,8 @@ class YBClient {
   // TODO: should we offer an async version of this as well?
   // TODO: probably should have a configurable timeout in YBClientBuilder?
   CHECKED_STATUS OpenTable(const YBTableName& table_name, std::shared_ptr<YBTable>* table);
-  CHECKED_STATUS OpenTable(const TableId& table_id, std::shared_ptr<YBTable>* table);
+  CHECKED_STATUS OpenTable(const TableId& table_id, std::shared_ptr<YBTable>* table,
+                           master::GetTableSchemaResponsePB* resp = nullptr);
 
   Result<YBTablePtr> OpenTable(const TableId& table_id) {
     YBTablePtr result;
@@ -810,8 +810,10 @@ class YBClient {
   FRIEND_TEST(MasterFailoverTest, DISABLED_TestPauseAfterCreateTableIssued);
   FRIEND_TEST(MasterFailoverTestIndexCreation, TestPauseAfterCreateIndexIssued);
 
+  Result<YBTablePtr> CompleteTable(const YBTableInfo& info);
+
   friend std::future<Result<internal::RemoteTabletPtr>> LookupFirstTabletFuture(
-      const std::shared_ptr<const YBTable>& table);
+      YBClient* client, const YBTablePtr& table);
 
   YBClient();
 
