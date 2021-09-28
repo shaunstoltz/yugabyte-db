@@ -479,10 +479,11 @@ Result<TxnSnapshotId> ClusterAdminClient::SuitableSnapshotId(
           return VERIFY_RESULT(FullyDecodeTxnSnapshotId(snapshot.id()));
         }
       }
-    }
-    if (last_snapshot_time > restore_at) {
-      return STATUS_FORMAT(
-          IllegalState, "Cannot restore at $0, last snapshot: $1", restore_at, last_snapshot_time);
+      if (last_snapshot_time > restore_at) {
+        return STATUS_FORMAT(
+            IllegalState, "Cannot restore at $0, last snapshot: $1, snapshots: $2",
+            restore_at, last_snapshot_time, resp.schedules()[0].snapshots());
+      }
     }
     RpcController rpc;
     rpc.set_deadline(deadline);
@@ -1007,6 +1008,9 @@ Status ClusterAdminClient::AllMastersHaveUniverseKeyInMemory(const std::string& 
 
     if (resp.has_error()) {
       return StatusFromPB(resp.error().status());
+    }
+    if (!resp.has_key()) {
+      return STATUS_FORMAT(TryAgain, "Node $0 does not have universe key in memory", hp);
     }
 
     std::cout << Format("Node $0 has universe key in memory: $1\n", hp.ToString(), resp.has_key());

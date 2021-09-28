@@ -284,11 +284,6 @@ YBClientBuilder& YBClientBuilder::add_master_server_addr(const string& addr) {
   return *this;
 }
 
-YBClientBuilder& YBClientBuilder::add_master_server_endpoint(const string& endpoint) {
-  data_->master_server_endpoint_ = endpoint;
-  return *this;
-}
-
 YBClientBuilder& YBClientBuilder::skip_master_flagfile(bool should_skip) {
   data_->skip_master_flagfile_ = should_skip;
   return *this;
@@ -380,7 +375,6 @@ Status YBClientBuilder::DoBuild(rpc::Messenger* messenger, std::unique_ptr<YBCli
   c->data_->metric_entity_ = data_->metric_entity_;
 
   c->data_->master_address_flag_name_ = data_->master_address_flag_name_;
-  c->data_->master_server_endpoint_ = data_->master_server_endpoint_;
   c->data_->master_address_sources_ = data_->master_address_sources_;
   c->data_->master_server_addrs_ = data_->master_server_addrs_;
   c->data_->skip_master_flagfile_ = data_->skip_master_flagfile_;
@@ -723,8 +717,9 @@ Status YBClient::CreateNamespace(const std::string& namespace_name,
                                  const std::string& namespace_id,
                                  const std::string& source_namespace_id,
                                  const boost::optional<uint32_t>& next_pg_oid,
-                                 const boost::optional<TransactionMetadata>& txn,
-                                 const bool colocated) {
+                                 const TransactionMetadata* txn,
+                                 const bool colocated,
+                                 CoarseTimePoint deadline) {
   CreateNamespaceRequestPB req;
   CreateNamespaceResponsePB resp;
   req.set_name(namespace_name);
@@ -747,7 +742,9 @@ Status YBClient::CreateNamespace(const std::string& namespace_name,
     txn->ToPB(req.mutable_transaction());
   }
   req.set_colocated(colocated);
-  auto deadline = CoarseMonoClock::Now() + default_admin_operation_timeout();
+  if (deadline == CoarseTimePoint()) {
+    deadline = CoarseMonoClock::Now() + default_admin_operation_timeout();
+  }
   Status s = data_->SyncLeaderMasterRpc<CreateNamespaceRequestPB, CreateNamespaceResponsePB>(
         deadline, req, &resp, nullptr, "CreateNamespace", &MasterServiceProxy::CreateNamespace);
   if (resp.has_error()) {
@@ -758,8 +755,8 @@ Status YBClient::CreateNamespace(const std::string& namespace_name,
 
   // Verify that the namespace we found is running so that, once this request returns,
   // the client can send operations without receiving a "namespace not found" error.
-  RETURN_NOT_OK(data_->WaitForCreateNamespaceToFinish(this, namespace_name, database_type, cur_id,
-      CoarseMonoClock::Now() + default_admin_operation_timeout()));
+  RETURN_NOT_OK(data_->WaitForCreateNamespaceToFinish(
+      this, namespace_name, database_type, cur_id, deadline));
 
   return Status::OK();
 }
@@ -782,7 +779,7 @@ Status YBClient::CreateNamespaceIfNotExists(const std::string& namespace_name,
   }
 
   Status s = CreateNamespace(namespace_name, database_type, creator_role_name, namespace_id,
-                             source_namespace_id, next_pg_oid, boost::none /* txn */, colocated);
+                             source_namespace_id, next_pg_oid, nullptr /* txn */, colocated);
   if (s.IsAlreadyPresent() && database_type && *database_type == YQLDatabase::YQL_DATABASE_CQL) {
     return Status::OK();
   }

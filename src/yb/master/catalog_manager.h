@@ -51,6 +51,7 @@
 #include "yb/common/partition.h"
 #include "yb/common/transaction.h"
 #include "yb/consensus/consensus.pb.h"
+#include "yb/client/client_fwd.h"
 #include "yb/gutil/macros.h"
 #include "yb/gutil/ref_counted.h"
 #include "yb/gutil/strings/substitute.h"
@@ -754,6 +755,10 @@ class CatalogManager :
     return *encryption_manager_;
   }
 
+  client::UniverseKeyClient& universe_key_client() {
+    return *universe_key_client_;
+  }
+
   CHECKED_STATUS SplitTablet(const TabletId& tablet_id) override;
 
   // Splits tablet specified in the request using middle of the partition as a split point.
@@ -933,17 +938,16 @@ class CatalogManager :
   CHECKED_STATUS CreateTableInMemory(const CreateTableRequestPB& req,
                                      const Schema& schema,
                                      const PartitionSchema& partition_schema,
-                                     const bool create_tablets,
                                      const NamespaceId& namespace_id,
                                      const NamespaceName& namespace_name,
                                      const vector<Partition>& partitions,
                                      IndexInfoPB* index_info,
-                                     vector<TabletInfo*>* tablets,
+                                     TabletInfos* tablets,
                                      CreateTableResponsePB* resp,
                                      scoped_refptr<TableInfo>* table) REQUIRES(mutex_);
-  CHECKED_STATUS CreateTabletsFromTable(const vector<Partition>& partitions,
-                                        const scoped_refptr<TableInfo>& table,
-                                        std::vector<TabletInfo*>* tablets) REQUIRES(mutex_);
+
+  Result<TabletInfos> CreateTabletsFromTable(const vector<Partition>& partitions,
+                                             const TableInfoPtr& table) REQUIRES(mutex_);
 
   // Helper for creating copartitioned table.
   CHECKED_STATUS CreateCopartitionedTable(const CreateTableRequestPB& req,
@@ -979,8 +983,8 @@ class CatalogManager :
   // Helper for creating the initial TabletInfo state.
   // Leaves the tablet "write locked" with the new info in the
   // "dirty" state field.
-  TabletInfo *CreateTabletInfo(TableInfo* table,
-                               const PartitionPB& partition) REQUIRES(mutex_);
+  TabletInfoPtr CreateTabletInfo(TableInfo* table,
+                                 const PartitionPB& partition) REQUIRES(mutex_);
 
   // Remove the specified entries from the protobuf field table_ids of a TabletInfo.
   Status RemoveTableIdsFromTabletInfo(
@@ -1213,7 +1217,7 @@ class CatalogManager :
   // the table we failed to create from the in-memory maps
   // ('table_names_map_', 'table_ids_map_', 'tablet_map_' below).
   CHECKED_STATUS AbortTableCreation(TableInfo* table,
-                                    const std::vector<TabletInfo*>& tablets,
+                                    const TabletInfos& tablets,
                                     const Status& s,
                                     CreateTableResponsePB* resp);
 
@@ -1249,7 +1253,7 @@ class CatalogManager :
   // Registers new split tablet with `partition` for the same table as `source_tablet_info` tablet.
   // Does not change any other tablets and their partitions.
   // Returns TabletInfo for registered tablet.
-  Result<TabletInfo*> RegisterNewTabletForSplit(
+  Result<TabletInfoPtr> RegisterNewTabletForSplit(
       TabletInfo* source_tablet_info, const PartitionPB& partition,
       TableInfo::WriteLock* table_write_lock);
 
@@ -1474,6 +1478,8 @@ class CatalogManager :
   scoped_refptr<TasksTracker> jobs_tracker_;
 
   std::unique_ptr<EncryptionManager> encryption_manager_;
+
+  std::unique_ptr<client::UniverseKeyClient> universe_key_client_;
 
   // A pointer to the system.partitions tablet for the RebuildYQLSystemPartitions bg task.
   std::shared_ptr<SystemTablet> system_partitions_tablet_ = nullptr;

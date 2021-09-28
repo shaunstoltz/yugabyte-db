@@ -164,11 +164,6 @@ class YBClientBuilder {
   // Add RPC addresses of multiple masters.
   YBClientBuilder& master_server_addrs(const std::vector<std::string>& addrs);
 
-  // Add a REST endpoint from which the address of the masters can be queried initially, and
-  // refreshed in case of retries. Note that the endpoint mechanism overrides
-  // both 'add_master_server_addr_file' and 'add_master_server_addr'.
-  YBClientBuilder& add_master_server_endpoint(const std::string& endpoint);
-
   // Add an RPC address of a master. At least one master is required.
   YBClientBuilder& add_master_server_addr(const std::string& addr);
 
@@ -379,8 +374,9 @@ class YBClient {
                                  const std::string& namespace_id = "",
                                  const std::string& source_namespace_id = "",
                                  const boost::optional<uint32_t>& next_pg_oid = boost::none,
-                                 const boost::optional<TransactionMetadata>& txn = boost::none,
-                                 const bool colocated = false);
+                                 const TransactionMetadata* txn = nullptr,
+                                 const bool colocated = false,
+                                 CoarseTimePoint deadline = CoarseTimePoint());
 
   // It calls CreateNamespace(), but before it checks that the namespace has NOT been yet
   // created. So, it prevents error 'namespace already exists'.
