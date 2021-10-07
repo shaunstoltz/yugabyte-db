@@ -185,7 +185,8 @@ libraryDependencies ++= Seq(
   "org.projectlombok" % "lombok" % "1.18.20",
   "com.squareup.okhttp3" % "mockwebserver" % "4.9.1" % Test,
   "io.kamon" %% "kamon-bundle" % "2.2.2",
-  "io.kamon" %% "kamon-prometheus" % "2.2.2"
+  "io.kamon" %% "kamon-prometheus" % "2.2.2",
+  "org.unix4j" % "unix4j-command" % "0.6"
 )
 // Clear default resolvers.
 appResolvers := None
@@ -341,7 +342,7 @@ runPlatform := {
   Project.extract(newState).runTask(runPlatformTask, newState)
 }
 
-libraryDependencies += "org.yb" % "yb-client" % "0.8.6-SNAPSHOT"
+libraryDependencies += "org.yb" % "yb-client" % "0.8.8-SNAPSHOT"
 
 libraryDependencies ++= Seq(
   // We wont use swagger-ui jar since we want to change some of the assets:

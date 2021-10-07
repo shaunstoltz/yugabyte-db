@@ -549,6 +549,28 @@ TEST_F_EX(YbAdminSnapshotScheduleTest, YB_DISABLE_TEST_IN_TSAN(PgsqlCreateTable)
   auto restore_status = RestoreSnapshotSchedule(schedule_id, time);
   ASSERT_OK(restore_status);
 
+  // Wait for Restore to complete.
+  ASSERT_OK(WaitFor([this]() -> Result<bool> {
+    bool all_tablets_hidden = true;
+    for (int i = 0; i < cluster_->num_tablet_servers(); i++) {
+      auto proxy = cluster_->GetTServerProxy<tserver::TabletServerServiceProxy>(i);
+      tserver::ListTabletsRequestPB req;
+      tserver::ListTabletsResponsePB resp;
+      rpc::RpcController controller;
+      controller.set_timeout(30s);
+      RETURN_NOT_OK(proxy->ListTablets(req, &resp, &controller));
+      for (const auto& tablet : resp.status_and_schema()) {
+        if (tablet.tablet_status().namespace_name() == client::kTableName.namespace_name()) {
+          LOG(INFO) << "Tablet " << tablet.tablet_status().tablet_id() << " of table "
+                    << tablet.tablet_status().table_name() << ", hidden status "
+                    << tablet.tablet_status().is_hidden();
+          all_tablets_hidden = all_tablets_hidden && tablet.tablet_status().is_hidden();
+        }
+      }
+    }
+    return all_tablets_hidden;
+  }, 30s, "Restore failed."));
+
   ASSERT_NOK(conn.Execute("INSERT INTO test_table VALUES (2, 'now')"));
   ASSERT_OK(conn.Execute("CREATE TABLE test_table (key INT PRIMARY KEY, value TEXT)"));
   ASSERT_OK(conn.Execute("INSERT INTO test_table VALUES (1, 'after')"));
@@ -775,7 +797,7 @@ TEST_F(YbAdminSnapshotScheduleTest, TestVerifyRestorationLogic) {
 
 TEST_F(YbAdminSnapshotScheduleTest, TestGCHiddenTables) {
   const auto interval = 15s;
-  const auto retention = 30s;
+  const auto retention = 30s * kTimeMultiplier;
   auto schedule_id = ASSERT_RESULT(PrepareQl(interval, retention));
 
   auto session = client_->NewSession();
@@ -1173,7 +1195,8 @@ TEST_F(YbAdminSnapshotScheduleTest, RestoreAfterSplit) {
   ASSERT_OK(conn.ExecuteQueryFormat(insert_pattern, "after"));
 
   {
-    auto tablets = ASSERT_RESULT(ListTablets()).GetArray();
+    auto tablets_obj = ASSERT_RESULT(ListTablets());
+    auto tablets = tablets_obj.GetArray();
     ASSERT_EQ(tablets.Size(), 1);
     auto tablet_id = ASSERT_RESULT(Get(tablets[0], "id")).get().GetString();
     LOG(INFO) << "Tablet id: " << tablet_id;
@@ -1193,12 +1216,12 @@ TEST_F(YbAdminSnapshotScheduleTest, RestoreAfterSplit) {
   rows = ASSERT_RESULT(conn.ExecuteAndRenderToString(select_expr));
   ASSERT_EQ(rows, "1,final");
 
-    auto tablets = ASSERT_RESULT(ListTablets()).GetArray();
-  ASSERT_EQ(tablets.Size(), 1);
+  auto tablets_size = ASSERT_RESULT(ListTablets()).GetArray().Size();
+  ASSERT_EQ(tablets_size, 1);
 }
 
 TEST_F(YbAdminSnapshotScheduleTest, ConsecutiveRestore) {
-  const auto retention = kInterval * 2;
+  const auto retention = kInterval * 5 * kTimeMultiplier;
   auto schedule_id = ASSERT_RESULT(PrepareCql(kInterval, retention));
 
   auto conn = ASSERT_RESULT(CqlConnect(client::kTableName.namespace_name()));

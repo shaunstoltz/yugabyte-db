@@ -396,6 +396,7 @@ class PgApiImpl {
   CHECKED_STATUS StartOperationsBuffering();
   CHECKED_STATUS StopOperationsBuffering();
   void ResetOperationsBuffering();
+  CHECKED_STATUS FlushBufferedOperations();
 
   //------------------------------------------------------------------------------------------------
   // Insert.
@@ -528,7 +529,7 @@ class PgApiImpl {
   // Sets the specified timeout in the rpc service.
   void SetTimeout(int timeout_ms);
 
-  Result<client::YBClient::TabletServersInfo> ListTabletServers();
+  Result<client::TabletServersInfo> ListTabletServers();
 
  private:
   // Control variables.

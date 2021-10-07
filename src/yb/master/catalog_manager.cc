@@ -2125,7 +2125,7 @@ Status CatalogManager::CreateCopartitionedTable(const CreateTableRequestPB& req,
   // Update the on-disk table state to "running".
   this_table_info->AddTablets(tablets);
   this_table_info->mutable_metadata()->mutable_dirty()->pb.set_state(SysTablesEntryPB::RUNNING);
-  s = sys_catalog_->Upsert(leader_ready_term(), this_table_info);;
+  s = sys_catalog_->Upsert(leader_ready_term(), this_table_info);
   if (PREDICT_FALSE(!s.ok())) {
     return AbortTableCreation(this_table_info.get(), tablets, s.CloneAndPrepend(
         Substitute("An error occurred while inserting to sys-tablets: $0",
@@ -2569,7 +2569,7 @@ Status CatalogManager::CreateYsqlSysTable(const CreateTableRequestPB* req,
     auto tablet_lock = sys_catalog_tablet->LockForWrite();
     tablet_lock.mutable_data()->pb.add_table_ids(table->id());
 
-    Status s = sys_catalog_->Upsert(leader_ready_term(), sys_catalog_tablet);;
+    Status s = sys_catalog_->Upsert(leader_ready_term(), sys_catalog_tablet);
     if (PREDICT_FALSE(!s.ok())) {
       return AbortTableCreation(table.get(), {}, s.CloneAndPrepend(
         "An error occurred while inserting to sys-tablets: "), resp);
@@ -2582,7 +2582,7 @@ Status CatalogManager::CreateYsqlSysTable(const CreateTableRequestPB* req,
 
   // Update the on-disk table state to "running".
   table->mutable_metadata()->mutable_dirty()->pb.set_state(SysTablesEntryPB::RUNNING);
-  Status s = sys_catalog_->Upsert(leader_ready_term(), table);;
+  Status s = sys_catalog_->Upsert(leader_ready_term(), table);
   if (PREDICT_FALSE(!s.ok())) {
     return AbortTableCreation(table.get(), {}, s.CloneAndPrepend(
       "An error occurred while inserting to sys-tablets: "), resp);
@@ -2663,7 +2663,7 @@ Status CatalogManager::ReservePgsqlOids(const ReservePgsqlOidsRequestPB* req,
   l.mutable_data()->pb.set_next_pg_oid(end_oid);
 
   // Update the on-disk state.
-  const Status s = sys_catalog_->Upsert(leader_ready_term(), ns);;
+  const Status s = sys_catalog_->Upsert(leader_ready_term(), ns);
   if (!s.ok()) {
     return SetupError(resp->mutable_error(), MasterErrorPB::UNKNOWN_ERROR, s);
   }
@@ -3173,22 +3173,14 @@ Status CatalogManager::CreateTable(const CreateTableRequestPB* orig_req,
       CHECK_EQ(SysTabletsEntryPB::PREPARING, tablet->metadata().dirty().pb.state());
     }
   }
+
   s = sys_catalog_->Upsert(leader_ready_term(), table, tablets);
-
   if (PREDICT_FALSE(!s.ok())) {
     return AbortTableCreation(
         table.get(), tablets, s.CloneAndPrepend("An error occurred while inserting to sys-tablets"),
         resp);
   }
-  TRACE("Wrote tablets to system table");
-
-  s = sys_catalog_->Upsert(leader_ready_term(), table);;
-  if (PREDICT_FALSE(!s.ok())) {
-    return AbortTableCreation(
-        table.get(), tablets, s.CloneAndPrepend("An error occurred while inserting to sys-tablets"),
-        resp);
-  }
-  TRACE("Wrote table to system table");
+  TRACE("Wrote table and tablets to system table");
 
   // For index table, insert index info in the indexed table.
   if ((req.has_index_info() || req.has_indexed_table_id())) {
@@ -4612,7 +4604,7 @@ void CatalogManager::CleanUpDeletedTables() {
     }
   }
   if (tables_to_update_on_disk.size() > 0) {
-    Status s = sys_catalog_->Upsert(leader_ready_term(), tables_to_update_on_disk);;
+    Status s = sys_catalog_->Upsert(leader_ready_term(), tables_to_update_on_disk);
     if (!s.ok()) {
       LOG(WARNING) << "Error marking tables as DELETED: " << s.ToString();
       return;
@@ -5849,6 +5841,21 @@ Status CatalogManager::ProcessTabletReportBatch(
       continue;
     }
 
+    // Hide the tablet if it (or its table) has been hidden and the tablet hasn't.
+    if ((tablet_lock->is_hidden() ||
+        table_lock->started_hiding()) &&
+        report.has_is_hidden() &&
+        !report.is_hidden()) {
+      const string msg = tablet_lock->pb.state_msg();
+      LOG(INFO) << "Got report from hidden tablet " << tablet->ToString()
+                << " (" << msg << "): Sending hide request for this tablet";
+      auto task = std::make_shared<AsyncDeleteReplica>(
+          master_, AsyncTaskPool(), ts_desc->permanent_uuid(), table, tablet_id,
+          TABLET_DATA_DELETED, boost::none, msg);
+      task->set_hide_only(true);
+      rpcs->push_back(task);
+    }
+
     // 5. Process the report's consensus state.
     // The report will not have a committed_consensus_state if it is in the
     // middle of starting up, such as during tablet bootstrap.
@@ -6295,7 +6302,7 @@ Status CatalogManager::CreateNamespace(const CreateNamespaceRequestPB* req,
   TRACE("Inserted new keyspace info into CatalogManager maps");
 
   // Update the on-disk system catalog.
-  return_status = sys_catalog_->Upsert(leader_ready_term(), ns);;
+  return_status = sys_catalog_->Upsert(leader_ready_term(), ns);
   if (!return_status.ok()) {
     LOG(WARNING) << "Keyspace creation failed:" << return_status.ToString();
     {
@@ -6373,7 +6380,7 @@ Status CatalogManager::CreateNamespace(const CreateNamespaceRequestPB* req,
     SysNamespaceEntryPB& metadata = ns->mutable_metadata()->mutable_dirty()->pb;
     if (metadata.state() == SysNamespaceEntryPB::PREPARING) {
       metadata.set_state(SysNamespaceEntryPB::RUNNING);
-      return_status = sys_catalog_->Upsert(leader_ready_term(), ns);;
+      return_status = sys_catalog_->Upsert(leader_ready_term(), ns);
       if (!return_status.ok()) {
         // Diverging in-memory state from disk so the user can issue a delete if no new leader.
         LOG(WARNING) << "Keyspace creation failed:" << return_status.ToString();
@@ -6447,7 +6454,7 @@ void CatalogManager::ProcessPendingNamespace(
     SysNamespaceEntryPB& metadata = ns->mutable_metadata()->mutable_dirty()->pb;
     if (metadata.state() == SysNamespaceEntryPB::PREPARING) {
       metadata.set_state(success ? SysNamespaceEntryPB::RUNNING : SysNamespaceEntryPB::FAILED);
-      auto s = sys_catalog_->Upsert(leader_ready_term(), ns);;
+      auto s = sys_catalog_->Upsert(leader_ready_term(), ns);
       if (s.ok()) {
         TRACE("Done processing keyspace");
         LOG(INFO) << (success ? "Processed" : "Failed") << " keyspace: " << ns->ToString();
@@ -6859,7 +6866,7 @@ void CatalogManager::DeleteYsqlDatabaseAsync(scoped_refptr<NamespaceInfo> databa
 
     // Once all user-facing data has been offlined, move the Namespace to DELETED state.
     metadata.set_state(SysNamespaceEntryPB::DELETED);
-    s = sys_catalog_->Upsert(leader_ready_term(), database);;
+    s = sys_catalog_->Upsert(leader_ready_term(), database);
     WARN_NOT_OK(s, "SysCatalog Update for Namespace");
     if (!s.ok()) {
       // Move to FAILED so DeleteNamespace can be reissued by the user.
@@ -6905,8 +6912,11 @@ Status CatalogManager::DeleteYsqlDBTables(const scoped_refptr<NamespaceInfo>& da
     // Populate tables and sys_table_ids.
     for (const TableInfoMap::value_type& entry : *table_ids_map_) {
       scoped_refptr<TableInfo> table = entry.second;
+      if (table->namespace_id() != database->id()) {
+        continue;
+      }
       auto l = table->LockForWrite();
-      if (l->namespace_id() != database->id() || l->started_deleting()) {
+      if (l->started_deleting()) {
         continue;
       }
       RSTATUS_DCHECK(
@@ -6955,7 +6965,7 @@ Status CatalogManager::DeleteYsqlDBTables(const scoped_refptr<NamespaceInfo>& da
         Substitute("Started deleting at $0", LocalTimeAsString()));
   }
   // Update all the table states in raft in bulk.
-  Status s = sys_catalog_->Upsert(leader_ready_term(), tables_rpc);;
+  Status s = sys_catalog_->Upsert(leader_ready_term(), tables_rpc);
   if (!s.ok()) {
     // The mutation will be aborted when 'l' exits the scope on early return.
     s = s.CloneAndPrepend(Substitute("An error occurred while updating sys tables: $0",
@@ -7246,7 +7256,7 @@ Status CatalogManager::CreateUDType(const CreateUDTypeRequestPB* req,
   TRACE("Inserted new user-defined type info into CatalogManager maps");
 
   // Update the on-disk system catalog.
-  s = sys_catalog_->Upsert(leader_ready_term(), tp);;
+  s = sys_catalog_->Upsert(leader_ready_term(), tp);
   if (!s.ok()) {
     s = s.CloneAndPrepend(Substitute(
         "An error occurred while inserting user-defined type to sys-catalog: $0", s.ToString()));
@@ -7957,7 +7967,7 @@ Status CatalogManager::SendSplitTabletRequest(
 }
 
 void CatalogManager::DeleteTabletReplicas(
-    TabletInfo* tablet, const std::string& msg, bool hide_only) {
+    TabletInfo* tablet, const std::string& msg, HideOnly hide_only) {
   auto locations = tablet->GetReplicaLocations();
   LOG(INFO) << "Sending DeleteTablet for " << locations->size()
             << " replicas of tablet " << tablet->tablet_id();
@@ -8341,44 +8351,6 @@ Status CatalogManager::HandleTabletSchemaVersionReport(
   return MultiStageAlterTable::LaunchNextTableInfoVersionIfNecessary(this, table, version);
 }
 
-// Helper class to commit TabletInfo mutations at the end of a scope.
-namespace {
-
-class ScopedTabletInfoCommitter {
- public:
-  explicit ScopedTabletInfoCommitter(const TabletInfos* tablets)
-    : tablets_(DCHECK_NOTNULL(tablets)),
-      aborted_(false) {
-  }
-
-  // This method is not thread safe. Must be called by the same thread
-  // that would destroy this instance.
-  void Abort() {
-    for (const scoped_refptr<TabletInfo>& tablet : *tablets_) {
-      tablet->mutable_metadata()->AbortMutation();
-    }
-    aborted_ = true;
-  }
-
-  void Commit() {
-    if (PREDICT_TRUE(!aborted_)) {
-      for (const scoped_refptr<TabletInfo>& tablet : *tablets_) {
-        tablet->mutable_metadata()->CommitMutation();
-      }
-    }
-  }
-
-  // Commit the transactions.
-  ~ScopedTabletInfoCommitter() {
-    Commit();
-  }
-
- private:
-  const TabletInfos* tablets_;
-  bool aborted_;
-};
-}  // anonymous namespace
-
 Status CatalogManager::ProcessPendingAssignments(const TabletInfos& tablets) {
   VLOG(1) << "Processing pending assignments";
 
@@ -8387,13 +8359,13 @@ Status CatalogManager::ProcessPendingAssignments(const TabletInfos& tablets) {
   for (const scoped_refptr<TabletInfo>& tablet : tablets) {
     tablet->mutable_metadata()->StartMutation();
   }
-  ScopedTabletInfoCommitter unlocker_in(&tablets);
+  ScopedInfoCommitter<TabletInfo> unlocker_in(&tablets);
 
   // Any tablets created by the helper functions will also be created in a
   // locked state, so we must ensure they are unlocked before we return to
   // avoid deadlocks.
   TabletInfos new_tablets;
-  ScopedTabletInfoCommitter unlocker_out(&new_tablets);
+  ScopedInfoCommitter<TabletInfo> unlocker_out(&new_tablets);
 
   DeferredAssignmentActions deferred;
 
@@ -9415,7 +9387,7 @@ Status CatalogManager::SetPreferredZones(
 
   LOG(INFO) << "Updating cluster config to " << l.mutable_data()->pb.version();
 
-  s = sys_catalog_->Upsert(leader_ready_term(), cluster_config_);;
+  s = sys_catalog_->Upsert(leader_ready_term(), cluster_config_);
   if (!s.ok()) {
     return SetupError(resp->mutable_error(), MasterErrorPB::INVALID_CLUSTER_CONFIG, s);
   }
@@ -9966,7 +9938,7 @@ void CatalogManager::CheckTableDeleted(const TableInfoPtr& table) {
   if (!lock.locked()) {
     return;
   }
-  Status s = sys_catalog_->Upsert(leader_ready_term(), table);;
+  Status s = sys_catalog_->Upsert(leader_ready_term(), table);
   if (!s.ok()) {
     LOG_WITH_PREFIX(WARNING)
         << "Error marking table as "

@@ -29,6 +29,8 @@ import java.util.Map;
 import java.util.Optional;
 import java.util.Set;
 import java.util.UUID;
+import java.util.function.Function;
+import java.util.stream.Collectors;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import play.libs.Json;
@@ -73,7 +75,7 @@ public class CustomerTaskController extends AuthenticatedController {
   }
 
   private CustomerTaskFormData buildCustomerTaskFromData(
-      CustomerTask task, ObjectNode taskProgress) {
+      CustomerTask task, ObjectNode taskProgress, TaskInfo taskInfo) {
     try {
       CustomerTaskFormData taskData = new CustomerTaskFormData();
       taskData.percentComplete = taskProgress.get("percent").asInt();
@@ -83,9 +85,9 @@ public class CustomerTaskController extends AuthenticatedController {
       taskData.createTime = task.getCreateTime();
       taskData.completionTime = task.getCompletionTime();
       taskData.target = task.getTarget().name();
-      taskData.type = task.getType().getFriendlyName();
+      taskData.type = task.getType().name();
+      taskData.typeName = task.getType().getFriendlyName();
       taskData.targetUUID = task.getTargetUUID();
-      TaskInfo taskInfo = TaskInfo.getOrBadRequest(task.getTaskUUID());
       ObjectNode versionNumbers = Json.newObject();
       JsonNode taskDetails = taskInfo.getTaskDetails();
       if (taskData.type == "UpgradeSoftware" && taskDetails.has(YB_PREV_SOFTWARE_VERSION)) {
@@ -128,6 +130,12 @@ public class CustomerTaskController extends AuthenticatedController {
 
     Map<UUID, List<CustomerTaskFormData>> taskListMap = new HashMap<>();
 
+    Set<UUID> taskUuids =
+        customerTaskList.stream().map(CustomerTask::getTaskUUID).collect(Collectors.toSet());
+    Map<UUID, TaskInfo> taskInfoMap =
+        TaskInfo.find(taskUuids)
+            .stream()
+            .collect(Collectors.toMap(TaskInfo::getTaskUUID, Function.identity()));
     for (CustomerTask task : customerTaskList) {
       Optional<ObjectNode> optTaskProgress = commissioner.mayGetStatus(task.getTaskUUID());
       // If the task progress API returns error, we will log it and not add that task
@@ -141,7 +149,8 @@ public class CustomerTaskController extends AuthenticatedController {
                   + ", Error: "
                   + taskProgress.get("error"));
         } else {
-          CustomerTaskFormData taskData = buildCustomerTaskFromData(task, taskProgress);
+          CustomerTaskFormData taskData =
+              buildCustomerTaskFromData(task, taskProgress, taskInfoMap.get(task.getTaskUUID()));
           if (taskData != null) {
             List<CustomerTaskFormData> taskList =
                 taskListMap.getOrDefault(task.getTargetUUID(), new ArrayList<>());
