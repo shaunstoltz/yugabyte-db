@@ -7,7 +7,7 @@ menu:
   latest:
     parent: cloud-develop
     identifier: connect-ycql-application
-    weight: 550
+    weight: 200
 type: page
 isTocNested: true
 showAsideToc: true
@@ -37,7 +37,7 @@ This tutorial assumes that you have the following:
 - JDK version 1.8 or later
 - Maven 3.3 or later
 
-Add your computer to the cluster IP allow list. Refer to [Assign IP allow lists](../../cloud-basics/add-connections).
+Add your computer to the cluster IP allow list. Refer to [Assign IP allow lists](../../cloud-secure-clusters/add-connections).
 
 You also need to download and install your Yugabyte Cloud cluster CA certificate and obtain the cluster connection parameters as follows:
 
@@ -49,7 +49,7 @@ You also need to download and install your Yugabyte Cloud cluster CA certificate
 
 1. Click **YCQL** to display the connection parameters. These include:
 
-    - LocalDatacenter - The name of the local datacenter for the cluster. 
+    - LocalDatacenter - The name of the local datacenter for the cluster.
     - Host - The cluster host name.
     - Port - The port number of the YCQL client API on the YugabyteDB database (9042).
 

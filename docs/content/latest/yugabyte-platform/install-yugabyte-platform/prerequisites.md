@@ -18,18 +18,19 @@ Yugabyte Platform first needs to be installed on a host computer, and then you c
 
 You can install Yugabyte Platform on the following Linux distributions:
 
-- Ubuntu 16.04 or 18.04 LTS.
-- Red Hat Enterprise Linux (RHEL) 7 or later.
-- CentOS 7 or later.
-- Amazon Linux (AMI) 2014.03, 2014.09, 2015.03, 2015.09, 2016.03, 2016.09, 2017.03, 2017.09, 2018.03, 2.0
+- Ubuntu 16.04, 18.04, or 20.04 LTS
+- Red Hat Enterprise Linux (RHEL) 7.x
+- Oracle Linux 7.x
+- CentOS 7
+- Amazon Linux (AMI) 2014.03, 2014.09, 2015.03, 2015.09, 2016.03, 2016.09, 2017.03, 2017.09, 2018.03, or 2.0
 - Other [operating systems supported by Replicated](https://www.replicated.com/docs/distributing-an-application/supported-operating-systems/)
 
 ## Hardware Requirements
 
-The node running Yugabyte Platform should meet the following requirements:
+A node running Yugabyte Platform is expected to meet the following requirements:
 
-- 4 cores or more
-- 8 GB RAM or more
+- 4 cores (minimum) or 8 cores (recommended)
+- 8 GB RAM (minimum) or 10 GB RAM (recommended)
 - 100 GB SSD disk or more
 - 64-bit CPU architecture
 
@@ -59,5 +60,3 @@ Installing Yugabyte Platform on Airgapped hosts, without access to any Internet 
 - Ensuring that attached disk storage (such as persistent EBS volumes on AWS) is 100 GB minimum
 - Having Yugabyte Platform airgapped install package. Contact Yugabyte Support for more information.
 - Signing the Yugabyte Enterprise Platform license agreement. Contact Yugabyte Support for more information.
-
-  

@@ -29,21 +29,24 @@
 // or implied.  See the License for the specific language governing permissions and limitations
 // under the License.
 //
+
 #include "yb/tools/yb-admin_cli.h"
 
-#include <iostream>
 #include <memory>
 #include <utility>
 
 #include <boost/lexical_cast.hpp>
-#include <boost/range.hpp>
 
 #include "yb/common/json_util.h"
-#include "yb/rpc/messenger.h"
-#include "yb/tools/yb-admin_client.h"
-#include "yb/util/flags.h"
-#include "yb/util/stol_utils.h"
+
 #include "yb/master/master_defaults.h"
+
+#include "yb/tools/yb-admin_client.h"
+
+#include "yb/util/flags.h"
+#include "yb/util/logging.h"
+#include "yb/util/status_format.h"
+#include "yb/util/stol_utils.h"
 #include "yb/util/string_case.h"
 
 DEFINE_string(master_addresses, "localhost:7100",
@@ -596,6 +599,20 @@ void ClusterAdminCli::RegisterCommandHandlers(ClusterAdminClientClass* client) {
       });
 
   Register(
+      "flush_sys_catalog", "",
+      [client](const CLIArguments& args) -> Status {
+        RETURN_NOT_OK_PREPEND(client->FlushSysCatalog(), "Unable to flush table sys_catalog");
+        return Status::OK();
+      });
+
+  Register(
+      "compact_sys_catalog", "",
+      [client](const CLIArguments& args) -> Status {
+        RETURN_NOT_OK_PREPEND(client->CompactSysCatalog(), "Unable to compact table sys_catalog");
+        return Status::OK();
+      });
+
+  Register(
       "compact_table",
       " <table> [timeout_in_seconds] (default 20)"
       " [ADD_INDEXES] (default false)",
@@ -655,12 +672,12 @@ void ClusterAdminCli::RegisterCommandHandlers(ClusterAdminClientClass* client) {
       });
 
   Register(
-      "change_master_config", " <ADD_SERVER|REMOVE_SERVER> <ip_addr> <port> <0|1>",
+      "change_master_config", " <ADD_SERVER|REMOVE_SERVER> <ip_addr> <port> [<uuid>]",
       [client](const CLIArguments& args) -> Status {
-        int16 new_port = 0;
+        uint16_t new_port = 0;
         string new_host;
 
-        if (args.size() != 3 && args.size() != 4) {
+        if (args.size() < 3 || args.size() > 4) {
           return ClusterAdminCli::kInvalidArguments;
         }
 
@@ -672,15 +689,13 @@ void ClusterAdminCli::RegisterCommandHandlers(ClusterAdminClientClass* client) {
         new_host = args[1];
         new_port = VERIFY_RESULT(CheckedStoi(args[2]));
 
-        // For REMOVE_SERVER, default to using host:port to identify server
-        // to make it easier to remove down hosts
-        bool use_hostport = (change_type == "REMOVE_SERVER");
+        string given_uuid;
         if (args.size() == 4) {
-          use_hostport = VERIFY_RESULT(CheckedStoi(args[3])) != 0;
+          given_uuid = args[3];
         }
-        RETURN_NOT_OK_PREPEND(client->ChangeMasterConfig(change_type, new_host, new_port,
-                                                         use_hostport),
-                              "Unable to change master config");
+        RETURN_NOT_OK_PREPEND(
+            client->ChangeMasterConfig(change_type, new_host, new_port, given_uuid),
+            "Unable to change master config");
         return Status::OK();
       });
 
@@ -830,6 +845,18 @@ void ClusterAdminCli::RegisterCommandHandlers(ClusterAdminClientClass* client) {
       });
 
   Register(
+      "create_transaction_table", " <table_name>",
+      [client](const CLIArguments& args) -> Status {
+        if (args.size() < 1) {
+          return ClusterAdminCli::kInvalidArguments;
+        }
+        const string table_name = args[0];
+        RETURN_NOT_OK_PREPEND(client->CreateTransactionsStatusTable(table_name),
+                              Format("Unable to create transaction table named $0", table_name));
+        return Status::OK();
+      });
+
+  Register(
       "ysql_catalog_version", "",
       [client](const CLIArguments&) -> Status {
         RETURN_NOT_OK_PREPEND(client->GetYsqlCatalogVersion(),
@@ -838,7 +865,15 @@ void ClusterAdminCli::RegisterCommandHandlers(ClusterAdminClientClass* client) {
       });
 
   RegisterJson("ddl_log", "", std::bind(&DdlLog, client, _1));
-}
+
+  Register(
+      "upgrade_ysql", "",
+      [client](const CLIArguments&) -> Status {
+        RETURN_NOT_OK_PREPEND(client->UpgradeYsql(),
+                              "Unable to upgrade YSQL cluster");
+        return Status::OK();
+      });
+} // NOLINT, prevents long function message
 
 Result<std::vector<client::YBTableName>> ResolveTableNames(
     ClusterAdminClientClass* client,
@@ -898,7 +933,7 @@ Result<client::YBTableName> ResolveSingleTableName(ClusterAdminClientClass* clie
   return std::move(tables.front());
 }
 
-Status CheckArgumentsCount(int count, int min, int max) {
+Status CheckArgumentsCount(size_t count, size_t min, size_t max) {
   if (count < min) {
     return STATUS_FORMAT(
         InvalidArgument, "Too few arguments $0, should be in range [$1, $2]", count, min, max);

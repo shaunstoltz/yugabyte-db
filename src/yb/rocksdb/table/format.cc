@@ -28,7 +28,6 @@
 #include <string>
 
 #include "yb/rocksdb/env.h"
-#include "yb/rocksdb/table/block.h"
 #include "yb/rocksdb/util/coding.h"
 #include "yb/rocksdb/util/compression.h"
 #include "yb/rocksdb/util/crc32c.h"
@@ -36,10 +35,12 @@
 #include "yb/rocksdb/util/perf_context_imp.h"
 #include "yb/rocksdb/util/xxhash.h"
 
-#include "yb/util/encryption_util.h"
-#include "yb/util/encrypted_file.h"
-#include "yb/util/format.h"
+#include "yb/util/debug-util.h"
+#include "yb/util/env.h"
 #include "yb/util/mem_tracker.h"
+#include "yb/util/result.h"
+#include "yb/util/stats/perf_step_timer.h"
+#include "yb/util/status_format.h"
 #include "yb/util/std_util.h"
 #include "yb/util/string_util.h"
 
@@ -277,9 +278,10 @@ Status ReadFooterFromFile(
       RETURN_NOT_OK(footer->DecodeFrom(&mutable_read_result));
       if (enforce_table_magic_number != 0 &&
           enforce_table_magic_number != footer->table_magic_number()) {
-        return STATUS_FORMAT(Corruption, "Bad table magic number: $0, expected: $1",
-                              footer->table_magic_number(),
-                              enforce_table_magic_number);
+        return STATUS_FORMAT(
+            Corruption, "Bad table magic number: 0x$0, expected: 0x$1",
+            FastHex64ToString(footer->table_magic_number()),
+            FastHex64ToString(enforce_table_magic_number));
       }
       return Status::OK();
     }

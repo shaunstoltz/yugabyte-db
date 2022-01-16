@@ -36,24 +36,30 @@
 #include <vector>
 #include <unordered_map>
 
-#include "yb/master/catalog_manager.h"
-#include "yb/master/master.pb.h"
+#include "yb/common/ql_protocol.pb.h"
+
+#include "yb/consensus/consensus_fwd.h"
+#include "yb/consensus/metadata.pb.h"
+
+#include "yb/gutil/callback.h"
+
+#include "yb/master/master_fwd.h"
 #include "yb/master/sys_catalog_constants.h"
-#include "yb/server/metadata.h"
 
 #include "yb/tablet/snapshot_coordinator.h"
-#include "yb/tablet/tablet_peer.h"
 
 #include "yb/tserver/tablet_memory_manager.h"
 
 #include "yb/util/mem_tracker.h"
+#include "yb/util/metrics_fwd.h"
 #include "yb/util/pb_util.h"
-#include "yb/util/status.h"
+#include "yb/util/status_fwd.h"
 
 namespace yb {
 
 class Schema;
 class FsManager;
+class ThreadPool;
 
 namespace tserver {
 class WriteRequestPB;
@@ -156,6 +162,10 @@ class SysCatalogTable {
   CHECKED_STATUS ReadPgClassInfo(const uint32_t database_oid,
                                  TableToTablespaceIdMap* table_to_tablespace_map);
 
+  CHECKED_STATUS ReadTablespaceInfoFromPgYbTablegroup(
+    const uint32_t database_oid,
+    TableToTablespaceIdMap *table_tablespace_map);
+
   // Read relnamespace OID from the pg_class catalog table.
   Result<uint32_t> ReadPgClassRelnamespace(const uint32_t database_oid,
                                            const uint32_t table_oid);
@@ -167,11 +177,6 @@ class SysCatalogTable {
   // Read the pg_tablespace catalog table and return a map with all the tablespaces and their
   // respective placement information.
   Result<std::shared_ptr<TablespaceIdToReplicationInfoMap>> ReadPgTablespaceInfo();
-
-  // Parse the binary value present in ql_value into ReplicationInfoPB.
-  Result<boost::optional<ReplicationInfoPB>> ParseReplicationInfo(
-      const TablespaceId& tablespace_id,
-      const vector<QLValuePB>& options);
 
   // Copy the content of co-located tables in sys catalog as a batch.
   CHECKED_STATUS CopyPgsqlTables(const std::vector<TableId>& source_table_ids,
@@ -189,6 +194,7 @@ class SysCatalogTable {
 
  private:
   friend class CatalogManager;
+  friend class enterprise::CatalogManager;
 
   inline std::unique_ptr<SysCatalogWriter> NewWriter(int64_t leader_term);
 
@@ -213,9 +219,7 @@ class SysCatalogTable {
   CHECKED_STATUS SetupConfig(const MasterOptions& options,
                              consensus::RaftConfigPB* committed_config);
 
-  std::string tablet_id() const {
-    return tablet_peer()->tablet_id();
-  }
+  std::string tablet_id() const;
 
   // Conventional "T xxx P xxxx..." prefix for logging.
   std::string LogPrefix() const;
@@ -237,7 +241,7 @@ class SysCatalogTable {
   void InitLocalRaftPeerPB();
 
   // Table schema, with IDs, used for the YQL write path.
-  Schema schema_;
+  std::unique_ptr<Schema> schema_;
 
   MetricRegistry* metric_registry_;
 
@@ -271,6 +275,8 @@ class SysCatalogTable {
   std::unordered_map<std::string, scoped_refptr<AtomicGauge<uint64>>> visitor_duration_metrics_;
 
   std::shared_ptr<tserver::TabletMemoryManager> mem_manager_;
+
+  std::unique_ptr<consensus::MultiRaftManager> multi_raft_manager_;
 
   DISALLOW_COPY_AND_ASSIGN(SysCatalogTable);
 };

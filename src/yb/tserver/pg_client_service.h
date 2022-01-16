@@ -14,6 +14,8 @@
 #ifndef YB_TSERVER_PG_CLIENT_SERVICE_H
 #define YB_TSERVER_PG_CLIENT_SERVICE_H
 
+#include <future>
+
 #include "yb/client/client_fwd.h"
 
 #include "yb/rpc/rpc_fwd.h"
@@ -27,7 +29,8 @@ namespace tserver {
     (Heartbeat)(AlterDatabase)(AlterTable)(BackfillIndex)(CreateDatabase) \
     (CreateSequencesDataTable)(CreateTable)(CreateTablegroup)(DropDatabase)(DropTable) \
     (DropTablegroup)(GetCatalogMasterVersion)(GetDatabaseInfo)(IsInitDbDone) \
-    (ListLiveTabletServers)(OpenTable)(ReserveOids)(TabletServerCount)(TruncateTable)
+    (ListLiveTabletServers)(OpenTable)(ReserveOids)(TabletServerCount)(TruncateTable) \
+    (ValidatePlacement)
 
 using TransactionPoolProvider = std::function<client::TransactionPool*()>;
 

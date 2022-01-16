@@ -15,12 +15,31 @@
 
 #include "yb/yql/pggate/test/pggate_test.h"
 
+#include <memory>
+#include <string>
+#include <unordered_set>
+
+#include <boost/optional.hpp>
 #include <gflags/gflags.h>
 
-#include "yb/yql/pggate/pg_session.h"
-#include "yb/yql/pggate/pg_memctx.h"
-#include "yb/yql/pggate/pggate_flags.h"
+#include "yb/common/entity_ids.h"
+#include "yb/common/pg_types.h"
+
+#include "yb/gutil/ref_counted.h"
+
+#include "yb/rpc/rpc_controller.h"
+
+#include "yb/tserver/tserver_util_fwd.h"
+#include "yb/tserver/tserver_service.proxy.h"
 #include "yb/tserver/tserver_shared_mem.h"
+
+#include "yb/util/memory/arena.h"
+#include "yb/util/memory/mc_types.h"
+#include "yb/util/result.h"
+#include "yb/util/status_log.h"
+
+#include "yb/yql/pggate/pggate_flags.h"
+#include "yb/yql/pggate/ybc_pggate.h"
 
 using namespace std::literals;
 
@@ -134,7 +153,7 @@ Status PggateTest::Init(const char *test_name, int num_tablet_servers) {
     tserver::GetSharedDataResponsePB resp;
     rpc::RpcController controller;
     controller.set_timeout(30s);
-    CHECK_OK(proxy->GetSharedData(req, &resp, &controller));
+    CHECK_OK(proxy.GetSharedData(req, &resp, &controller));
     CHECK_EQ(resp.data().size(), sizeof(*tserver_shared_object_));
     memcpy(pointer_cast<char*>(&*tserver_shared_object_), resp.data().c_str(), resp.data().size());
   }
@@ -190,7 +209,7 @@ void PggateTest::BeginDDLTransaction() {
 }
 
 void PggateTest::CommitDDLTransaction() {
-  CHECK_YBC_STATUS(YBCPgExitSeparateDdlTxnMode(true /* success */));
+  CHECK_YBC_STATUS(YBCPgExitSeparateDdlTxnMode());
 }
 
 void PggateTest::BeginTransaction() {

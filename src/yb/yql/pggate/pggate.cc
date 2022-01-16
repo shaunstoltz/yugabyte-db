@@ -12,42 +12,51 @@
 // under the License.
 //--------------------------------------------------------------------------------------------------
 
+#include "yb/yql/pggate/pggate.h"
+
 #include <boost/optional.hpp>
 
+#include "yb/client/client_fwd.h"
+#include "yb/client/client.h"
+#include "yb/client/client_utils.h"
 #include "yb/client/tablet_server.h"
-#include "yb/client/yb_table_name.h"
 
+#include "yb/common/partition.h"
 #include "yb/common/pg_system_attr.h"
+#include "yb/common/schema.h"
 
 #include "yb/docdb/doc_key.h"
 #include "yb/docdb/primitive_value.h"
+#include "yb/docdb/value_type.h"
 
-#include "yb/yql/pggate/pg_sample.h"
-#include "yb/yql/pggate/pggate.h"
-#include "yb/yql/pggate/pggate_flags.h"
-#include "yb/yql/pggate/pg_memctx.h"
-#include "yb/yql/pggate/pg_ddl.h"
-#include "yb/yql/pggate/pg_insert.h"
-#include "yb/yql/pggate/pg_update.h"
-#include "yb/yql/pggate/pg_delete.h"
-#include "yb/yql/pggate/pg_truncate_colocated.h"
-#include "yb/yql/pggate/pg_select.h"
-#include "yb/yql/pggate/pg_txn_manager.h"
-#include "yb/yql/pggate/ybc_pggate.h"
+#include "yb/gutil/casts.h"
 
-#include "yb/util/flag_tags.h"
-#include "yb/util/range.h"
-
-#include "yb/client/client.h"
-#include "yb/client/client_fwd.h"
-#include "yb/client/client_utils.h"
-#include "yb/client/table.h"
 #include "yb/rpc/messenger.h"
+#include "yb/rpc/proxy.h"
 #include "yb/rpc/secure_stream.h"
+
 #include "yb/server/secure.h"
 
-#include "yb/tserver/tserver_shared_mem.h"
 #include "yb/tserver/tserver_forward_service.proxy.h"
+#include "yb/tserver/tserver_shared_mem.h"
+
+#include "yb/util/format.h"
+#include "yb/util/range.h"
+#include "yb/util/shared_mem.h"
+#include "yb/util/status_format.h"
+#include "yb/util/status_log.h"
+
+#include "yb/yql/pggate/pg_ddl.h"
+#include "yb/yql/pggate/pg_delete.h"
+#include "yb/yql/pggate/pg_insert.h"
+#include "yb/yql/pggate/pg_memctx.h"
+#include "yb/yql/pggate/pg_sample.h"
+#include "yb/yql/pggate/pg_select.h"
+#include "yb/yql/pggate/pg_truncate_colocated.h"
+#include "yb/yql/pggate/pg_txn_manager.h"
+#include "yb/yql/pggate/pg_update.h"
+#include "yb/yql/pggate/pggate_flags.h"
+#include "yb/yql/pggate/ybc_pggate.h"
 
 DECLARE_string(rpc_bind_addresses);
 DECLARE_bool(use_node_to_node_encryption);
@@ -67,7 +76,7 @@ namespace {
 CHECKED_STATUS AddColumn(PgCreateTable* pg_stmt, const char *attr_name, int attr_num,
                          const YBCPgTypeEntity *attr_type, bool is_hash, bool is_range,
                          bool is_desc, bool is_nulls_first) {
-  using SortingType = ColumnSchema::SortingType;
+  using SortingType = SortingType;
   SortingType sorting_type = SortingType::kNotSpecified;
 
   if (!is_hash && is_range) {
@@ -196,6 +205,10 @@ PgApiContext::PgApiContext()
                                                    mem_tracker))),
       proxy_cache(std::make_unique<rpc::ProxyCache>(messenger_holder.messenger.get())) {
 }
+
+PgApiContext::PgApiContext(PgApiContext&&) = default;
+
+PgApiContext::~PgApiContext() = default;
 
 //--------------------------------------------------------------------------------------------------
 
@@ -719,11 +732,9 @@ Status PgApiImpl::GetTableDesc(const PgObjectId& table_id,
   return Status::OK();
 }
 
-Status PgApiImpl::GetColumnInfo(YBCPgTableDesc table_desc,
-                                int16_t attr_number,
-                                bool *is_primary,
-                                bool *is_hash) {
-  return table_desc->GetColumnInfo(attr_number, is_primary, is_hash);
+Result<YBCPgColumnInfo> PgApiImpl::GetColumnInfo(YBCPgTableDesc table_desc,
+                                                 int16_t attr_number) {
+  return table_desc->GetColumnInfo(attr_number);
 }
 
 Status PgApiImpl::DmlModifiesRow(PgStatement *handle, bool *modifies_row) {
@@ -891,6 +902,15 @@ Status PgApiImpl::DmlBindColumnCondIn(PgStatement *handle, int attr_num, int n_a
   return down_cast<PgDmlRead*>(handle)->BindColumnCondIn(attr_num, n_attr_values, attr_values);
 }
 
+Status PgApiImpl::DmlBindHashCode(PgStatement *handle, bool start_valid,
+                                    bool start_inclusive,
+                                    uint64_t start_hash_val, bool end_valid,
+                                    bool end_inclusive, uint64_t end_hash_val) {
+  return down_cast<PgDmlRead*>(handle)
+                  ->BindHashCode(start_valid, start_inclusive, start_hash_val,
+                                  end_valid, end_inclusive, end_hash_val);
+}
+
 Status PgApiImpl::DmlBindTable(PgStatement *handle) {
   return down_cast<PgDml*>(handle)->BindTable();
 }
@@ -920,8 +940,7 @@ Status PgApiImpl::ProcessYBTupleId(const YBCPgYBTupleIdDescriptor& descr,
   google::protobuf::RepeatedPtrField<PgsqlExpressionPB> hashed_values;
   vector<docdb::PrimitiveValue> hashed_components, range_components;
   hashed_components.reserve(target_desc->num_hash_key_columns());
-  range_components.reserve(
-      target_desc->num_hash_key_columns() - target_desc->num_hash_key_columns());
+  range_components.reserve(target_desc->num_key_columns() - target_desc->num_hash_key_columns());
   size_t remain_attr = descr.nattrs;
   // DocDB API requires that partition columns must be listed in their created-order.
   // Order from target_desc should be used as attributes sequence may have different order.
@@ -1377,16 +1396,20 @@ Status PgApiImpl::RestartTransaction() {
   return pg_txn_manager_->RestartTransaction();
 }
 
+Status PgApiImpl::MaybeResetTransactionReadPoint() {
+  return pg_txn_manager_->MaybeResetTransactionReadPoint();
+}
+
 Status PgApiImpl::CommitTransaction() {
   pg_session_->InvalidateForeignKeyReferenceCache();
   RETURN_NOT_OK(pg_session_->FlushBufferedOperations());
   return pg_txn_manager_->CommitTransaction();
 }
 
-Status PgApiImpl::AbortTransaction() {
+void PgApiImpl::AbortTransaction() {
   pg_session_->InvalidateForeignKeyReferenceCache();
   pg_session_->DropBufferedOperations();
-  return pg_txn_manager_->AbortTransaction();
+  pg_txn_manager_->AbortTransaction();
 }
 
 Status PgApiImpl::SetTransactionIsolationLevel(int isolation) {
@@ -1395,6 +1418,10 @@ Status PgApiImpl::SetTransactionIsolationLevel(int isolation) {
 
 Status PgApiImpl::SetTransactionReadOnly(bool read_only) {
   return pg_txn_manager_->SetReadOnly(read_only);
+}
+
+Status PgApiImpl::EnableFollowerReads(bool enable_follower_reads, int32_t staleness_ms) {
+  return pg_txn_manager_->EnableFollowerReads(enable_follower_reads, staleness_ms);
 }
 
 Status PgApiImpl::SetTransactionDeferrable(bool deferrable) {
@@ -1407,29 +1434,28 @@ Status PgApiImpl::EnterSeparateDdlTxnMode() {
   return pg_txn_manager_->EnterSeparateDdlTxnMode();
 }
 
-Status PgApiImpl::ExitSeparateDdlTxnMode(bool success) {
+Status PgApiImpl::ExitSeparateDdlTxnMode() {
   // Flush all buffered operations as ddl txn use its own transaction session.
-  if (success) {
-    RETURN_NOT_OK(pg_session_->FlushBufferedOperations());
-  } else {
-    pg_session_->DropBufferedOperations();
-  }
-
-  RETURN_NOT_OK(pg_txn_manager_->ExitSeparateDdlTxnMode(success));
-  ReadHybridTime read_time;
-  if (success) {
-    // Next reads from catalog tables have to see changes made by the DDL transaction.
-    ResetCatalogReadTime();
-  }
+  RETURN_NOT_OK(pg_session_->FlushBufferedOperations());
+  RETURN_NOT_OK(pg_txn_manager_->ExitSeparateDdlTxnMode());
+  // Next reads from catalog tables have to see changes made by the DDL transaction.
+  ResetCatalogReadTime();
   return Status::OK();
 }
 
+void PgApiImpl::ClearSeparateDdlTxnMode() {
+  pg_session_->DropBufferedOperations();
+  pg_txn_manager_->ClearSeparateDdlTxnMode();
+}
+
 Status PgApiImpl::SetActiveSubTransaction(SubTransactionId id) {
-  return pg_session_->SetActiveSubTransaction(id);
+  RETURN_NOT_OK(pg_session_->FlushBufferedOperations());
+  return pg_txn_manager_->SetActiveSubTransaction(id);
 }
 
 Status PgApiImpl::RollbackSubTransaction(SubTransactionId id) {
-  return pg_session_->RollbackSubTransaction(id);
+  pg_session_->DropBufferedOperations();
+  return pg_txn_manager_->RollbackSubTransaction(id);
 }
 
 void PgApiImpl::ResetCatalogReadTime() {
@@ -1464,6 +1490,10 @@ void PgApiImpl::SetTimeout(const int timeout_ms) {
 
 Result<client::TabletServersInfo> PgApiImpl::ListTabletServers() {
   return pg_session_->ListTabletServers();
+}
+
+Status PgApiImpl::ValidatePlacement(const char *placement_info) {
+  return pg_session_->ValidatePlacement(placement_info);
 }
 
 } // namespace pggate

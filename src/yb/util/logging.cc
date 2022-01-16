@@ -46,23 +46,21 @@
 #include <signal.h>
 #include <stdio.h>
 
-#include <sstream>
-#include <iostream>
 #include <fstream>
+#include <iostream>
 #include <regex>
 
-#include <boost/uuid/uuid.hpp>
-#include <boost/uuid/uuid_io.hpp>
 #include <boost/uuid/uuid_generators.hpp>
-
+#include <boost/uuid/uuid_io.hpp>
 #include <glog/logging.h>
 
 #include "yb/gutil/callback.h"
-#include "yb/gutil/spinlock.h"
 #include "yb/gutil/ref_counted.h"
+#include "yb/gutil/spinlock.h"
 
 #include "yb/util/debug-util.h"
 #include "yb/util/flag_tags.h"
+#include "yb/util/format.h"
 
 DEFINE_string(log_filename, "",
     "Prefix of log filename - "
@@ -205,8 +203,8 @@ void CustomGlogFailureWriter(const char* data, int size) {
 void ReportRefCountedDebugEvent(
     const char* type_name,
     const void* this_ptr,
-    int32_t current_refcount,
-    int ref_delta) {
+    int64_t current_refcount,
+    int64_t ref_delta) {
   std::string demangled_type = DemangleName(type_name);
   LOG(INFO) << demangled_type << "::" << (ref_delta == 1 ? "AddRef" : "Release")
             << "(this=" << this_ptr << ", ref_count_=" << current_refcount << "):\n"

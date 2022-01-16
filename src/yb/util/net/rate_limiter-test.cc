@@ -12,12 +12,12 @@
 //
 
 #include <chrono>
-#include <cmath>
 #include <random>
 
 #include "yb/util/net/rate_limiter.h"
 #include "yb/util/random_util.h"
 #include "yb/util/size_literals.h"
+#include "yb/util/status.h"
 #include "yb/util/test_macros.h"
 
 #include <gtest/gtest.h>
@@ -41,7 +41,7 @@ TEST(RateLimiter, TestRate) {
     RateLimiter rate_limiter([rate]() { return rate; });
     auto min_rate = std::max(rate, static_cast<uint64_t>(FLAGS_rate_limiter_min_rate));
     ASSERT_EQ(rate_limiter.GetMaxSizeForNextTransmission(),
-              min_rate * rate_limiter.time_slot_ms_ / MonoTime::kMillisecondsPerSecond);
+              min_rate * rate_limiter.time_slot_ms() / MonoTime::kMillisecondsPerSecond);
   }
 }
 

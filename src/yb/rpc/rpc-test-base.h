@@ -51,6 +51,7 @@
 #include "yb/rpc/service_pool.h"
 #include "yb/util/faststring.h"
 #include "yb/util/net/sockaddr.h"
+#include "yb/util/metrics.h"
 #include "yb/util/random.h"
 #include "yb/util/random_util.h"
 #include "yb/util/stopwatch.h"
@@ -58,9 +59,6 @@
 #include "yb/util/trace.h"
 
 namespace yb { namespace rpc {
-
-std::unique_ptr<ServiceIf> CreateCalculatorService(
-  const scoped_refptr<MetricEntity>& metric_entity, std::string name = std::string());
 
 class CalculatorServiceMethods {
  public:
@@ -113,6 +111,7 @@ class GenericCalculatorService : public ServiceIf {
     // this test doesn't generate metrics, so we ignore the argument.
   }
 
+  void FillEndpoints(const RpcServicePtr& service, RpcEndpointMap* map) override;
   void Handle(InboundCallPtr incoming) override;
 
   std::string service_name() const override {
@@ -120,15 +119,21 @@ class GenericCalculatorService : public ServiceIf {
   }
 
  private:
+  typedef void (GenericCalculatorService::*Method)(InboundCall*);
+
   void DoAdd(InboundCall *incoming);
   void DoSendStrings(InboundCall* incoming);
   void DoSleep(InboundCall *incoming);
   void DoEcho(InboundCall *incoming);
+  void AddMethodToMap(
+      const RpcServicePtr& service, RpcEndpointMap* map, const char* method_name, Method method);
+
+  std::deque<std::pair<RemoteMethod, Method>> methods_;
 };
 
 struct MessengerOptions {
   MessengerOptions() = delete;
-  size_t n_reactors;
+  int n_reactors;
   std::chrono::milliseconds keep_alive_timeout;
   int num_connections_to_server = -1;
 };
@@ -144,17 +149,10 @@ struct TestServerOptions {
 
 class TestServer {
  public:
-  TestServer(std::unique_ptr<ServiceIf> service,
-             std::unique_ptr<Messenger>&& messenger,
+  TestServer(std::unique_ptr<Messenger>&& messenger,
              const TestServerOptions& options = TestServerOptions());
 
-  TestServer(TestServer&& rhs)
-      : service_name_(std::move(rhs.service_name_)),
-        messenger_(std::move(rhs.messenger_)),
-        thread_pool_(std::move(rhs.thread_pool_)),
-        service_pool_(std::move(rhs.service_pool_)),
-        bound_endpoint_(std::move(rhs.bound_endpoint_)) {
-  }
+  TestServer(TestServer&& rhs) = default;
 
   ~TestServer();
 
@@ -164,10 +162,13 @@ class TestServer {
   Messenger* messenger() const { return messenger_.get(); }
   ServicePool& service_pool() const { return *service_pool_; }
 
+  CHECKED_STATUS Start();
+
+  CHECKED_STATUS RegisterService(std::unique_ptr<ServiceIf> service);
+
  private:
-  string service_name_;
   std::unique_ptr<Messenger> messenger_;
-  ThreadPool thread_pool_;
+  std::unique_ptr<ThreadPool> thread_pool_;
   scoped_refptr<ServicePool> service_pool_;
   Endpoint bound_endpoint_;
 };
@@ -203,7 +204,9 @@ class RpcTestBase : public YBTest {
                        const TestServerOptions& options = TestServerOptions());
   void StartTestServer(Endpoint* server_endpoint,
                        const TestServerOptions& options = TestServerOptions());
-  TestServer StartTestServer(const std::string& name, const IpAddress& address);
+  TestServer StartTestServer(
+      const TestServerOptions& options, const std::string& name = std::string(),
+      std::unique_ptr<Messenger> messenger = nullptr);
   void StartTestServerWithGeneratedCode(HostPort* server_hostport,
                                         const TestServerOptions& options = TestServerOptions());
   void StartTestServerWithGeneratedCode(std::unique_ptr<Messenger>&& messenger,

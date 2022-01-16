@@ -22,32 +22,54 @@
 #include "yb/cdc/cdc_service.proxy.h"
 #include "yb/cdc/cdc_rpc.h"
 
+#include "yb/client/client.h"
+
 #include "yb/common/entity_ids.h"
 #include "yb/common/ql_expr.h"
 #include "yb/common/ql_value.h"
 #include "yb/common/pg_system_attr.h"
+#include "yb/common/schema.h"
 #include "yb/common/wire_protocol.h"
 
+#include "yb/consensus/log.h"
 #include "yb/consensus/raft_consensus.h"
 #include "yb/consensus/replicate_msgs_holder.h"
 
 #include "yb/client/meta_cache.h"
+#include "yb/client/schema.h"
+#include "yb/client/session.h"
 #include "yb/client/table.h"
 #include "yb/client/table_alterer.h"
 #include "yb/client/table_handle.h"
-#include "yb/client/session.h"
-#include "yb/client/yb_table_name.h"
 #include "yb/client/yb_op.h"
+#include "yb/client/yb_table_name.h"
+
+#include "yb/gutil/dynamic_annotations.h"
 #include "yb/gutil/strings/join.h"
+#include "yb/master/master_client.pb.h"
+#include "yb/master/master_defaults.h"
+#include "yb/rpc/rpc_context.h"
+#include "yb/rpc/rpc_controller.h"
+
 #include "yb/tablet/tablet.h"
+#include "yb/tablet/tablet_metadata.h"
 #include "yb/tablet/tablet_peer.h"
+#include "yb/tablet/transaction_participant.h"
+
 #include "yb/tserver/tablet_server.h"
 #include "yb/tserver/ts_tablet_manager.h"
 #include "yb/tserver/service_util.h"
 #include "yb/util/debug/trace_event.h"
 #include "yb/util/flag_tags.h"
+#include "yb/util/format.h"
+#include "yb/util/logging.h"
+#include "yb/util/metrics.h"
+#include "yb/util/monotime.h"
 #include "yb/util/scope_exit.h"
 #include "yb/util/shared_lock.h"
+#include "yb/util/status_format.h"
+#include "yb/util/status_log.h"
+#include "yb/util/trace.h"
 #include "yb/yql/cql/ql/util/statement_result.h"
 
 constexpr uint32_t kUpdateIntervalMs = 15 * 1000;
@@ -69,7 +91,10 @@ DEFINE_int32(cdc_state_checkpoint_update_interval_ms, kUpdateIntervalMs,
              "Rate at which CDC state's checkpoint is updated.");
 
 DEFINE_string(certs_for_cdc_dir, "",
-              "Directory that contains certificate authorities for CDC producer universes.");
+              "The parent directory of where all certificates for xCluster producer universes will "
+              "be stored, for when the producer and consumer clusters use different certificates. "
+              "Place the certificates for each producer cluster in "
+              "<certs_for_cdc_dir>/<producer_cluster_id>/*.");
 
 DEFINE_int32(update_min_cdc_indices_interval_secs, 60,
              "How often to read cdc_state table to get the minimum applied index for each tablet "
@@ -84,6 +109,10 @@ DEFINE_int32(update_metrics_interval_ms, kUpdateIntervalMs,
 DEFINE_bool(enable_cdc_state_table_caching, true, "Enable caching the cdc_state table schema.");
 
 DEFINE_bool(enable_collect_cdc_metrics, true, "Enable collecting cdc metrics.");
+
+DEFINE_double(cdc_read_safe_deadline_ratio, .10,
+              "When the heartbeat deadline has this percentage of time remaining, "
+              "the master should halt tablet report processing so it can respond in time.");
 
 DECLARE_bool(enable_log_retention_by_op_idx);
 
@@ -127,6 +156,7 @@ CDCServiceImpl::~CDCServiceImpl() {
 }
 
 namespace {
+
 bool YsqlTableHasPrimaryKey(const client::YBSchema& schema) {
   for (const auto& col : schema.columns()) {
       if (col.order() == static_cast<int32_t>(PgSystemAttrNum::kYBRowId)) {
@@ -255,7 +285,7 @@ void CDCServiceImpl::ListTablets(const ListTabletsRequestPB* req,
     // Filter local tablets if needed.
     if (req->local_only()) {
       bool is_local = false;
-      for (const auto& replica :  tablet.replicas()) {
+      for (const auto& replica : tablet.replicas()) {
         if (replica.ts_info().permanent_uuid() == tablet_manager_->server()->permanent_uuid()) {
           is_local = true;
           break;
@@ -291,7 +321,9 @@ Result<google::protobuf::RepeatedPtrField<master::TabletLocationsPB>> CDCService
   table_name.set_table_id(stream_metadata->table_id);
   google::protobuf::RepeatedPtrField<master::TabletLocationsPB> tablets;
   RETURN_NOT_OK(async_client_init_->client()->GetTablets(
-      table_name, 0, &tablets, /* partition_list_version =*/ nullptr));
+      table_name, 0,
+      &tablets, /* partition_list_version =*/ nullptr,
+      RequireTabletsRunning::kFalse, master::IncludeInactive::kTrue));
   return tablets;
 }
 
@@ -301,7 +333,6 @@ void CDCServiceImpl::GetChanges(const GetChangesRequestPB* req,
   if (!CheckOnline(req, resp, &context)) {
     return;
   }
-
   YB_LOG_EVERY_N_SECS(INFO, 300) << "Received GetChanges request " << req->ShortDebugString();
 
   RPC_CHECK_AND_RETURN_ERROR(req->has_tablet_id(),
@@ -374,10 +405,29 @@ void CDCServiceImpl::GetChanges(const GetChangesRequestPB* req,
   consensus::ReplicateMsgsHolder msgs_holder;
   MemTrackerPtr mem_tracker = GetMemTracker(tablet_peer, producer_tablet);
 
+  // Calculate deadline to be passed to GetChanges.
+  CoarseTimePoint get_changes_deadline = CoarseTimePoint::max();
+  if (deadline != CoarseTimePoint::max()) {
+    // Check if we are too close to calculate a safe deadline.
+    RPC_CHECK_AND_RETURN_ERROR(
+      deadline - CoarseMonoClock::Now() > 1ms,
+      STATUS(TimedOut, "Too close to rpc timeout to call GetChanges."),
+      resp->mutable_error(),
+      CDCErrorPB::INTERNAL_ERROR, context);
+
+    // Calculate a safe deadline so that CdcProducer::GetChanges times out
+    // 20% faster than CdcServiceImpl::GetChanges. This gives enough
+    // time (unless timeouts are unrealistically small) for CdcServiceImpl::GetChanges
+    // to finish post-processing and return the partial results without itself timing out.
+    const auto safe_deadline = deadline -
+      (FLAGS_cdc_read_rpc_timeout_ms * 1ms * FLAGS_cdc_read_safe_deadline_ratio);
+    get_changes_deadline = ToCoarse(MonoTime::FromUint64(safe_deadline.time_since_epoch().count()));
+  }
+
   // Read the latest changes from the Log.
   s = cdc::GetChanges(
       req->stream_id(), req->tablet_id(), op_id, *record->get(), tablet_peer, mem_tracker,
-      &msgs_holder, resp, &last_readable_index);
+      &msgs_holder, resp, &last_readable_index, get_changes_deadline);
   RPC_STATUS_RETURN_ERROR(
       s,
       resp->mutable_error(),
@@ -788,8 +838,9 @@ Result<client::internal::RemoteTabletPtr> CDCServiceImpl::GetRemoteTablet(
   auto start = CoarseMonoClock::Now();
   async_client_init_->client()->LookupTabletById(
       tablet_id,
-      // TODO(tsplit): decide whether we need to get info about stale table partitions here.
       /* table =*/ nullptr,
+      // In case this is a split parent tablet, it will be hidden so we need this flag to access it.
+      master::IncludeInactive::kTrue,
       CoarseMonoClock::Now() + MonoDelta::FromMilliseconds(FLAGS_cdc_read_rpc_timeout_ms),
       callback, client::UseCache::kFalse);
   future.wait();
@@ -1120,8 +1171,7 @@ void CDCServiceImpl::BootstrapProducer(const BootstrapProducerRequestPB* req,
     options.emplace(cdc::kRecordFormat, CDCRecordFormat_Name(cdc::CDCRecordFormat::WAL));
 
     // Mark this stream as being bootstrapped, to help in finding dangling streams.
-    auto result = async_client_init_->client()->CreateCDCStream(
-        table_id, options, master::SysCDCStreamEntryPB::INITIATED);
+    auto result = async_client_init_->client()->CreateCDCStream(table_id, options, false);
     RPC_CHECK_AND_RETURN_ERROR(result.ok(), result.status(), resp->mutable_error(),
                                CDCErrorPB::INTERNAL_ERROR, context);
     const std::string& bootstrap_id = *result;
@@ -1299,20 +1349,25 @@ Status CDCServiceImpl::UpdateCheckpoint(const ProducerTabletInfo& producer_table
   }
 
   if (update_cdc_state) {
-    auto res = GetCdcStateTable();
-    RETURN_NOT_OK(res);
-    const auto op = (*res)->NewUpdateOp();
+    auto cdc_state = VERIFY_RESULT(GetCdcStateTable());
+    const auto op = cdc_state->NewUpdateOp();
     auto* const req = op->mutable_request();
     DCHECK(!producer_tablet.stream_id.empty() && !producer_tablet.tablet_id.empty());
     QLAddStringHashValue(req, producer_tablet.tablet_id);
     QLAddStringRangeValue(req, producer_tablet.stream_id);
-    (*res)->AddStringColumnValue(req, master::kCdcCheckpoint, commit_op_id.ToString());
+
+    cdc_state->AddStringColumnValue(req, master::kCdcCheckpoint, commit_op_id.ToString());
     // If we have a last record hybrid time, use that for physical time. If not, it means we're
     // caught up, so the current time.
     uint64_t last_replication_time_micros = last_record_hybrid_time != 0 ?
         HybridTime(last_record_hybrid_time).GetPhysicalValueMicros() : GetCurrentTimeMicros();
-    (*res)->AddTimestampColumnValue(req, master::kCdcLastReplicationTime,
-                                                last_replication_time_micros);
+    cdc_state->AddTimestampColumnValue(req, master::kCdcLastReplicationTime,
+                                       last_replication_time_micros);
+    // Only perform the update if we have a row in cdc_state to prevent a race condition where
+    // a stream is deleted and then this logic inserts entries in cdc_state from that deleted
+    // stream.
+    auto* condition = req->mutable_if_expr()->mutable_condition();
+    condition->set_op(QL_OP_EXISTS);
     RETURN_NOT_OK(RefreshCacheOnFail(session->ApplyAndFlush(op)));
   }
 

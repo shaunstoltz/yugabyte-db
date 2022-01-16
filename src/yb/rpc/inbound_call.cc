@@ -32,29 +32,23 @@
 
 #include "yb/rpc/inbound_call.h"
 
-#include "yb/common/redis_protocol.pb.h"
-
 #include "yb/gutil/strings/substitute.h"
 
 #include "yb/rpc/connection.h"
 #include "yb/rpc/connection_context.h"
 #include "yb/rpc/rpc_introspection.pb.h"
 #include "yb/rpc/rpc_metrics.h"
-#include "yb/rpc/serialization.h"
 #include "yb/rpc/service_if.h"
-#include "yb/rpc/service_pool.h"
 
 #include "yb/util/debug/trace_event.h"
 #include "yb/util/flag_tags.h"
 #include "yb/util/logging.h"
 #include "yb/util/metrics.h"
 #include "yb/util/trace.h"
-#include "yb/util/memory/memory.h"
 
 using std::shared_ptr;
 using std::vector;
 using strings::Substitute;
-using yb::RedisResponsePB;
 
 DEFINE_bool(rpc_dump_all_traces, false,
             "If true, dump all RPC traces at INFO level");
@@ -159,6 +153,16 @@ MonoDelta InboundCall::GetTimeInQueue() const {
   return timing_.time_handled.GetDeltaSince(timing_.time_received);
 }
 
+ThreadPoolTask* InboundCall::BindTask(InboundCallHandler* handler) {
+  auto shared_this = shared_from(this);
+  if (!handler->CallQueued()) {
+    return nullptr;
+  }
+  tracker_ = handler;
+  task_.Bind(handler, shared_this);
+  return &task_;
+}
+
 void InboundCall::RecordHandlingCompleted() {
   // Protect against multiple calls.
   LOG_IF_WITH_PREFIX(DFATAL, timing_.time_completed.Initialized()) << "Already marked as completed";
@@ -199,8 +203,8 @@ bool InboundCall::RespondTimedOutIfPending(const char* message) {
     return false;
   }
 
-  Clear();
   RespondFailure(ErrorStatusPB::ERROR_SERVER_TOO_BUSY, STATUS(TimedOut, message));
+  Clear();
 
   return true;
 }
@@ -208,10 +212,11 @@ bool InboundCall::RespondTimedOutIfPending(const char* message) {
 void InboundCall::Clear() {
   serialized_request_.clear();
   request_data_.Reset();
+  request_data_memory_usage_.store(0, std::memory_order_release);
 }
 
 size_t InboundCall::DynamicMemoryUsage() const {
-  return DynamicMemoryUsageOf(request_data_, trace_);
+  return request_data_memory_usage_.load(std::memory_order_acquire) + DynamicMemoryUsageOf(trace_);
 }
 
 void InboundCall::InboundCallTask::Run() {

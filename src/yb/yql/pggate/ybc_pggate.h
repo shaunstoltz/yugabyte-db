@@ -224,8 +224,7 @@ YBCStatus YBCPgGetTableDesc(YBCPgOid database_oid,
 
 YBCStatus YBCPgGetColumnInfo(YBCPgTableDesc table_desc,
                              int16_t attr_number,
-                             bool *is_primary,
-                             bool *is_hash);
+                             YBCPgColumnInfo *column_info);
 
 YBCStatus YBCPgGetTableProperties(YBCPgTableDesc table_desc,
                                   YBCPgTableProperties *properties);
@@ -320,6 +319,11 @@ YBCStatus YBCPgDmlBindColumnCondBetween(YBCPgStatement handle, int attr_num, YBC
 YBCStatus YBCPgDmlBindColumnCondIn(YBCPgStatement handle, int attr_num, int n_attr_values,
     YBCPgExpr *attr_values);
 YBCStatus YBCPgDmlGetColumnInfo(YBCPgStatement handle, int attr_num, YBCPgColumnInfo* info);
+
+YBCStatus YBCPgDmlBindHashCodes(YBCPgStatement handle, bool start_valid,
+                                bool start_inclusive, uint64_t start_hash_val,
+                                bool end_valid, bool end_inclusive,
+                                uint64_t end_hash_val);
 
 // Binding Tables: Bind the whole table in a statement.  Do not use with BindColumn.
 YBCStatus YBCPgDmlBindTable(YBCPgStatement handle);
@@ -428,15 +432,22 @@ YBCStatus YBCPgExecSelect(YBCPgStatement handle, const YBCPgExecParameters *exec
 YBCStatus YBCPgBeginTransaction();
 YBCStatus YBCPgRecreateTransaction();
 YBCStatus YBCPgRestartTransaction();
+YBCStatus YBCPgMaybeResetTransactionReadPoint();
 YBCStatus YBCPgCommitTransaction();
-YBCStatus YBCPgAbortTransaction();
+void YBCPgAbortTransaction();
 YBCStatus YBCPgSetTransactionIsolationLevel(int isolation);
 YBCStatus YBCPgSetTransactionReadOnly(bool read_only);
 YBCStatus YBCPgSetTransactionDeferrable(bool deferrable);
+YBCStatus YBCPgEnableFollowerReads(bool enable_follower_reads, int32_t staleness_ms);
 YBCStatus YBCPgEnterSeparateDdlTxnMode();
-YBCStatus YBCPgExitSeparateDdlTxnMode(bool success);
+YBCStatus YBCPgExitSeparateDdlTxnMode();
+void YBCPgClearSeparateDdlTxnMode();
 YBCStatus YBCPgSetActiveSubTransaction(uint32_t id);
 YBCStatus YBCPgRollbackSubTransaction(uint32_t id);
+
+// System validation -------------------------------------------------------------------------------
+// Validate placement information
+YBCStatus YBCPgValidatePlacement(const char *placement_info);
 
 //--------------------------------------------------------------------------------------------------
 // Expressions.
@@ -545,7 +556,7 @@ const void* YBCPgGetThreadLocalErrMsg();
 
 void YBCPgResetCatalogReadTime();
 
-YBCStatus YBCGetTabletServerHosts(YBCServerDescriptor **tablet_servers, int* numservers);
+YBCStatus YBCGetTabletServerHosts(YBCServerDescriptor **tablet_servers, size_t* numservers);
 
 #ifdef __cplusplus
 }  // extern "C"

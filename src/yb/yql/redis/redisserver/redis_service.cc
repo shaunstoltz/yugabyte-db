@@ -13,55 +13,47 @@
 
 #include "yb/yql/redis/redisserver/redis_service.h"
 
-#include <iostream>
 #include <thread>
 
 #include <boost/algorithm/string/case_conv.hpp>
-
 #include <boost/lockfree/queue.hpp>
-
-#include <boost/logic/tribool.hpp>
-
 #include <gflags/gflags.h>
 
-#include "yb/gutil/strings/join.h"
-#include "yb/gutil/strings/substitute.h"
-
-#include "yb/client/async_rpc.h"
-#include "yb/client/callbacks.h"
 #include "yb/client/client.h"
-#include "yb/client/client_builder-internal.h"
-#include "yb/client/client-internal.h"
 #include "yb/client/error.h"
-#include "yb/client/meta_data_cache.h"
 #include "yb/client/meta_cache.h"
+#include "yb/client/meta_data_cache.h"
 #include "yb/client/session.h"
 #include "yb/client/table.h"
 #include "yb/client/yb_op.h"
+#include "yb/client/yb_table_name.h"
 
 #include "yb/common/redis_protocol.pb.h"
 
-#include "yb/yql/redis/redisserver/redis_commands.h"
-#include "yb/yql/redis/redisserver/redis_constants.h"
-#include "yb/yql/redis/redisserver/redis_encoding.h"
-#include "yb/yql/redis/redisserver/redis_parser.h"
-#include "yb/yql/redis/redisserver/redis_rpc.h"
+#include "yb/gutil/casts.h"
+#include "yb/gutil/strings/join.h"
+
+#include "yb/master/master_heartbeat.pb.h"
 
 #include "yb/rpc/connection.h"
-#include "yb/rpc/rpc_context.h"
+#include "yb/rpc/rpc_controller.h"
 #include "yb/rpc/rpc_introspection.pb.h"
 
-#include "yb/tserver/tablet_server.h"
+#include "yb/tserver/tablet_server_interface.h"
 #include "yb/tserver/tserver_service.proxy.h"
 
-#include "yb/util/bytes_formatter.h"
 #include "yb/util/locks.h"
 #include "yb/util/logging.h"
 #include "yb/util/memory/mc_types.h"
+#include "yb/util/metrics.h"
 #include "yb/util/redis_util.h"
-#include "yb/util/size_literals.h"
-#include "yb/util/stol_utils.h"
+#include "yb/util/result.h"
 #include "yb/util/shared_lock.h"
+#include "yb/util/size_literals.h"
+
+#include "yb/yql/redis/redisserver/redis_commands.h"
+#include "yb/yql/redis/redisserver/redis_encoding.h"
+#include "yb/yql/redis/redisserver/redis_rpc.h"
 
 using yb::operator"" _MB;
 using namespace std::literals;
@@ -288,11 +280,7 @@ class Operation {
       return functor(session, callback);
     }
 
-    auto status = session->Apply(operation_);
-    if (!status.ok()) {
-      Respond(status);
-      return false;
-    }
+    session->Apply(operation_);
     *applied_operations = true;
     return true;
   }
@@ -772,12 +760,12 @@ struct RedisServiceImplData : public RedisServiceData {
 
   void AppendToSubscribers(
       AsPattern type, const std::vector<std::string>& channels, rpc::Connection* conn,
-      std::vector<int>* subs) override;
+      std::vector<size_t>* subs) override;
   void RemoveFromSubscribers(
       AsPattern type, const std::vector<std::string>& channels, rpc::Connection* conn,
-      std::vector<int>* subs) override;
+      std::vector<size_t>* subs) override;
   void CleanUpSubscriptions(Connection* conn) override;
-  int NumSubscribers(AsPattern type, const std::string& channel) override;
+  size_t NumSubscribers(AsPattern type, const std::string& channel) override;
   std::unordered_set<std::string> GetSubscriptions(AsPattern type, rpc::Connection* conn) override;
   std::unordered_set<std::string> GetAllSubscriptions(AsPattern type) override;
   int Publish(const string& channel, const string& message);
@@ -785,7 +773,7 @@ struct RedisServiceImplData : public RedisServiceData {
       const string& channel, const string& message, const IntFunctor& f) override;
   int PublishToLocalClients(IsMonitorMessage mode, const string& channel, const string& message);
   Result<vector<HostPortPB>> GetServerAddrsForChannel(const string& channel);
-  int NumSubscriptionsUnlocked(Connection* conn);
+  size_t NumSubscriptionsUnlocked(Connection* conn);
 
   CHECKED_STATUS GetRedisPasswords(vector<string>* passwords) override;
   CHECKED_STATUS Initialize();
@@ -1089,14 +1077,14 @@ void RedisServiceImplData::RemoveFromMonitors(Connection* conn) {
   }
 }
 
-int RedisServiceImplData::NumSubscriptionsUnlocked(Connection* conn) {
+size_t RedisServiceImplData::NumSubscriptionsUnlocked(Connection* conn) {
   return clients_to_subscriptions_[conn].channels.size() +
          clients_to_subscriptions_[conn].patterns.size();
 }
 
 void RedisServiceImplData::AppendToSubscribers(
     AsPattern type, const std::vector<std::string>& channels, rpc::Connection* conn,
-    std::vector<int>* subs) {
+    std::vector<size_t>* subs) {
   boost::lock_guard<decltype(pubsub_mutex_)> lock(pubsub_mutex_);
   subs->clear();
   for (const auto& channel : channels) {
@@ -1119,7 +1107,7 @@ void RedisServiceImplData::AppendToSubscribers(
 
 void RedisServiceImplData::RemoveFromSubscribers(
     AsPattern type, const std::vector<std::string>& channels, rpc::Connection* conn,
-    std::vector<int>* subs) {
+    std::vector<size_t>* subs) {
   boost::lock_guard<decltype(pubsub_mutex_)> lock(pubsub_mutex_);
   auto& map_to_clients = (type == AsPattern::kTrue ? patterns_to_clients_ : channels_to_clients_);
   auto& map_from_clients =
@@ -1147,7 +1135,7 @@ std::unordered_set<string> RedisServiceImplData::GetSubscriptions(
 
 // ENG-4199: Consider getting all the cluster-wide subscriptions?
 std::unordered_set<string> RedisServiceImplData::GetAllSubscriptions(AsPattern type) {
-  unordered_set<string> ret;
+  std::unordered_set<string> ret;
   SharedLock<decltype(pubsub_mutex_)> lock(pubsub_mutex_);
   for (const auto& element :
        (type == AsPattern::kTrue ? patterns_to_clients_ : channels_to_clients_)) {
@@ -1157,7 +1145,7 @@ std::unordered_set<string> RedisServiceImplData::GetAllSubscriptions(AsPattern t
 }
 
 // ENG-4199: Consider getting all the cluster-wide subscribers?
-int RedisServiceImplData::NumSubscribers(AsPattern type, const std::string& channel) {
+size_t RedisServiceImplData::NumSubscribers(AsPattern type, const std::string& channel) {
   SharedLock<decltype(pubsub_mutex_)> lock(pubsub_mutex_);
   const auto& look_in = (type ? patterns_to_clients_ : channels_to_clients_);
   const auto& iter = look_in.find(channel);
@@ -1322,7 +1310,7 @@ int RedisServiceImplData::PublishToLocalClients(
     for (auto& entry : patterns_to_clients_) {
       auto& pattern = entry.first;
       auto& clients_subscribed_to_pattern = entry.second;
-      if (!RedisUtil::RedisPatternMatch(pattern, channel, /* ignore case */ false)) {
+      if (!RedisPatternMatch(pattern, channel, /* ignore case */ false)) {
         continue;
       }
 
@@ -1550,6 +1538,10 @@ RedisServiceImpl::~RedisServiceImpl() {
 
 void RedisServiceImpl::Handle(yb::rpc::InboundCallPtr call) {
   impl_->Handle(std::move(call));
+}
+
+void RedisServiceImpl::FillEndpoints(const rpc::RpcServicePtr& service, rpc::RpcEndpointMap* map) {
+  map->emplace(RedisInboundCall::static_serialized_remote_method(), std::make_pair(service, 0ULL));
 }
 
 }  // namespace redisserver

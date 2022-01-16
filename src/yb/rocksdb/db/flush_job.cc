@@ -34,16 +34,15 @@
 #include <chrono>
 
 #include "yb/rocksdb/db/builder.h"
-#include "yb/rocksdb/db/db_iter.h"
 #include "yb/rocksdb/db/dbformat.h"
 #include "yb/rocksdb/db/event_helpers.h"
 #include "yb/rocksdb/db/filename.h"
 #include "yb/rocksdb/db/file_numbers.h"
+#include "yb/rocksdb/db/internal_stats.h"
 #include "yb/rocksdb/db/log_reader.h"
 #include "yb/rocksdb/db/log_writer.h"
 #include "yb/rocksdb/db/memtable.h"
 #include "yb/rocksdb/db/memtable_list.h"
-#include "yb/rocksdb/db/merge_context.h"
 #include "yb/rocksdb/db/version_set.h"
 #include "yb/rocksdb/port/likely.h"
 #include "yb/rocksdb/port/port.h"
@@ -52,24 +51,21 @@
 #include "yb/rocksdb/statistics.h"
 #include "yb/rocksdb/status.h"
 #include "yb/rocksdb/table.h"
-#include "yb/rocksdb/table/block.h"
-#include "yb/rocksdb/table/block_based_table_factory.h"
 #include "yb/rocksdb/table/merger.h"
-#include "yb/rocksdb/table/table_builder.h"
-#include "yb/rocksdb/table/two_level_iterator.h"
+#include "yb/rocksdb/table/scoped_arena_iterator.h"
 #include "yb/rocksdb/util/coding.h"
 #include "yb/rocksdb/util/event_logger.h"
-#include "yb/rocksdb/util/file_util.h"
 #include "yb/rocksdb/util/log_buffer.h"
 #include "yb/rocksdb/util/logging.h"
 #include "yb/rocksdb/util/mutexlock.h"
-#include "yb/rocksdb/util/perf_context_imp.h"
+#include "yb/rocksdb/util/statistics.h"
 #include "yb/rocksdb/util/stop_watch.h"
 #include "yb/rocksdb/util/sync_point.h"
 
 #include "yb/util/atomic.h"
 #include "yb/util/flag_tags.h"
 #include "yb/util/logging.h"
+#include "yb/util/result.h"
 #include "yb/util/stats/iostats_context_imp.h"
 
 DEFINE_int32(rocksdb_nothing_in_memtable_to_flush_sleep_ms, 10,
@@ -78,6 +74,10 @@ DEFINE_int32(rocksdb_nothing_in_memtable_to_flush_sleep_ms, 10,
 
 DEFINE_test_flag(bool, rocksdb_crash_on_flush, false,
                  "When set, memtable flush in rocksdb crashes.");
+
+DEFINE_bool(rocksdb_release_mutex_during_wait_for_memtables_to_flush, true,
+            "When a flush is scheduled, but there isn't a memtable eligible yet, release "
+            "the mutex before going to sleep and reacquire it post sleep.");
 
 namespace rocksdb {
 
@@ -153,11 +153,24 @@ Result<FileNumbersHolder> FlushJob::Run(FileMetaData* file_meta) {
     // the provisional records RocksDB.
     //
     // See https://github.com/yugabyte/yugabyte-db/issues/437 for more details.
-    YB_LOG_EVERY_N_SECS(WARNING, 1)
+    YB_LOG_EVERY_N_SECS(INFO, 1)
         << db_options_.log_prefix
-        << "[" << cfd_->GetName() << "] Nothing in memtable to flush.";
-    std::this_thread::sleep_for(std::chrono::milliseconds(
+        << "[" << cfd_->GetName() << "] No eligible memtables to flush.";
+
+    bool release_mutex = FLAGS_rocksdb_release_mutex_during_wait_for_memtables_to_flush;
+
+    if (release_mutex) {
+      // Release the mutex before the sleep, so as to unblock writers.
+      db_mutex_->Unlock();
+    }
+
+      std::this_thread::sleep_for(std::chrono::milliseconds(
         FLAGS_rocksdb_nothing_in_memtable_to_flush_sleep_ms));
+
+    if (release_mutex) {
+      db_mutex_->Lock();
+    }
+
     return FileNumbersHolder();
   }
 
@@ -296,11 +309,11 @@ Result<FileNumbersHolder> FlushJob::WriteLevel0Table(
     }
     RLOG(InfoLogLevel::INFO_LEVEL, db_options_.info_log,
         "[%s] [JOB %d] Level-0 flush table #%" PRIu64 ": %" PRIu64
-        " bytes %s"
-        "%s",
+        " bytes %s%s %s",
         cfd_->GetName().c_str(), job_context_->job_id, meta->fd.GetNumber(),
         meta->fd.GetTotalFileSize(), s.ToString().c_str(),
-        meta->marked_for_compaction ? " (needs compaction)" : "");
+        meta->marked_for_compaction ? " (needs compaction)" : "",
+        meta->FrontiersToString().c_str());
 
     // output to event logger
     if (s.ok()) {

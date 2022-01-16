@@ -57,6 +57,7 @@ $ ./bin/yb-admin --help
 * [Change data capture (CDC)](#change-data-capture-cdc-commands)
 * [Decommissioning](#decommissioning-commands)
 * [Rebalancing](#rebalancing-commands)
+* [Upgrade YSQL system catalog](#upgrade-ysql-system-catalog)
 
 ---
 
@@ -278,11 +279,11 @@ yb-admin \
 
 #### split_tablet
 
-Splits the specified hash-partitioned tablet and computes the split point as the middle of tablet's partition range.
+Splits the specified hash-sharded tablet and computes the split point as the middle of tablet's sharding range.
 
 {{< note title="Note" >}}
 
-The `yb-admin split_tablet` command is not yet supported for use with range-partitioned tablets. To follow plans on this, see [GitHub #5166](https://github.com/yugabyte/yugabyte-db/issues/5166)
+The `yb-admin split_tablet` command is not yet supported for use with range-sharded tablets. To follow plans on this, see [GitHub #5166](https://github.com/yugabyte/yugabyte-db/issues/5166)
 
 {{< /note >}}
 
@@ -1191,32 +1192,43 @@ To display a list of tables and their UUID (`table_id`) values, open the **YB-Ma
 
 Changes the universe replication for the specified producer universe. Use this command to:
 
-* Add or remove tables in an existing replication UUID.
-* Modify the master addresses.
+* Add or remove tables in an existing replication UUID
+* Modify the producer master addresses
 
 If no tables have been configured for replication, use [`setup_universe_replication`](#setup-universe-replication).
 
-To verify if any tables are already configured for replication, use [`list_cdc_streams`](#list-cdc-streams).
+To check if any tables are configured for replication, use [`list_cdc_streams`](#list-cdc-streams).
 
 **Syntax**
+
+Use the `set_master_addresses` subcommand to replace the producer master address list. Use this if the set of masters on the producer changes:
 
 ```sh
 yb-admin -master_addresses <master-addresses> \
     alter_universe_replication <producer_universe_uuid> \
-    { \
-      set_master_addresses <producer_master_addresses> | \
-      add_table <table_id>[, <table_id>...] | \
-      remove_table <table_id>[, <table_id>...] \
-    }
+    set_master_addresses <producer_master_addresses>
+```
+
+Use the `add_table` subcommand to add one or more tables to the existing list:
+
+```sh
+yb-admin -master_addresses <master-addresses> \
+    alter_universe_replication <producer_universe_uuid> \
+    add_table <table_id>[, <table_id>...]
+```
+
+Use the `remove_table` subcommand to remove one or more tables from the existing list:
+
+```sh
+yb-admin -master_addresses <master-addresses> \
+    alter_universe_replication <producer_universe_uuid> \
+    remove_table <table_id>[, <table_id>...]
 ```
 
 * _master-addresses_: Comma-separated list of YB-Master hosts and ports. Default value is `localhost:7100`.
-* *producer_universe_uuid*: The UUID of the producer universe.
-* set_master_addresses: Use this subcommand to modify master addresses.
-* *producer_master_addresses*: Comma-separated list of new producer master addresses.
-* add_table: Subcommand to add a table.
-* remove_table: Subcommand to remove a table.
-* *table_id*: The identifier (ID) of the table.
+* _producer_universe_uuid_: The UUID of the producer universe.
+* _producer_master_addresses_: Comma-separated list of new producer master addresses.
+* _table_id_: The identifier (ID) of the table.
 
 #### delete_universe_replication <producer_universe_uuid>
 
@@ -1664,3 +1676,45 @@ yb-admin \
     -master_addresses ip1:7100,ip2:7100,ip3:7100 \
     get_is_load_balancer_idle
 ```
+
+---
+
+### Upgrade YSQL system catalog
+
+#### upgrade_ysql
+
+Upgrades the YSQL system catalog after a successful [YugabyteDB cluster upgrade](../../manage/upgrade-deployment/).
+
+**Syntax**
+
+```sh
+yb-admin upgrade_ysql
+```
+
+**Example**
+
+```sh
+./bin/yb-admin upgrade_ysql
+```
+
+A successful upgrade returns the following message:
+
+```output
+YSQL successfully upgraded to the latest version
+```
+
+In certain scenarios, a YSQL upgrade can take longer than 60 seconds, which is the default timeout value for `yb-admin`. To account for that, run the command with a higher timeout value:
+
+```sh
+$ ./bin/yb-admin \
+      -timeout_ms 180000 \
+      upgrade_ysql
+```
+
+Running the above command is an online operation and doesn't require stopping a running cluster. This command is idempotent and can be run multiple times without any side effects.
+
+{{< note title="Note" >}}
+Concurrent operations in a cluster can lead to various transactional conflicts, catalog version mismatches, and read restart errors. This is expected, and should be addressed by rerunning the upgrade command.
+{{< /note >}}
+
+Refer [Upgrade a deployment](../../manage/upgrade-deployment/) to learn about YB-Master and YB-Tserver upgrades, followed by YSQL system catalog upgrades.

@@ -25,7 +25,6 @@
 #include "yb/common/transaction.h"
 #include "yb/gutil/ref_counted.h"
 #include "yb/tserver/tserver_util_fwd.h"
-#include "yb/util/result.h"
 #include "yb/util/enums.h"
 #include "yb/yql/pggate/pg_callbacks.h"
 
@@ -64,13 +63,16 @@ class PgTxnManager : public RefCountedThreadSafe<PgTxnManager> {
   CHECKED_STATUS BeginTransaction();
   CHECKED_STATUS RecreateTransaction();
   CHECKED_STATUS RestartTransaction();
+  CHECKED_STATUS MaybeResetTransactionReadPoint();
   CHECKED_STATUS CommitTransaction();
-  CHECKED_STATUS AbortTransaction();
+  void AbortTransaction();
   CHECKED_STATUS SetIsolationLevel(int isolation);
   CHECKED_STATUS SetReadOnly(bool read_only);
+  CHECKED_STATUS EnableFollowerReads(bool enable_follower_reads, int32_t staleness);
   CHECKED_STATUS SetDeferrable(bool deferrable);
   CHECKED_STATUS EnterSeparateDdlTxnMode();
-  CHECKED_STATUS ExitSeparateDdlTxnMode(bool success);
+  CHECKED_STATUS ExitSeparateDdlTxnMode();
+  void ClearSeparateDdlTxnMode();
 
   // Returns the transactional session, starting a new transaction if necessary.
   yb::Result<client::YBSession*> GetTransactionalSession();
@@ -88,6 +90,7 @@ class PgTxnManager : public RefCountedThreadSafe<PgTxnManager> {
 
   bool IsDdlMode() const { return ddl_session_.get() != nullptr; }
   bool IsTxnInProgress() const { return txn_in_progress_; }
+  bool ShouldUseFollowerReads() const { return updated_read_time_for_follower_reads_; }
 
  private:
   YB_STRONGLY_TYPED_BOOL(NeedsPessimisticLocking);
@@ -96,6 +99,7 @@ class PgTxnManager : public RefCountedThreadSafe<PgTxnManager> {
   client::TransactionManager* GetOrCreateTransactionManager();
   void ResetTxnAndSession();
   void StartNewSession();
+  Status UpdateReadTimeForFollowerReadsIfRequired();
   Status RecreateTransaction(SavePriority save_priority);
 
   uint64_t GetPriority(NeedsPessimisticLocking needs_pessimistic_locking);
@@ -119,6 +123,9 @@ class PgTxnManager : public RefCountedThreadSafe<PgTxnManager> {
   // Postgres transaction characteristics.
   PgIsolationLevel pg_isolation_level_ = PgIsolationLevel::REPEATABLE_READ;
   bool read_only_ = false;
+  bool enable_follower_reads_ = false;
+  int32_t follower_read_staleness_ms_ = 0;
+  bool updated_read_time_for_follower_reads_ = false;
   bool deferrable_ = false;
 
   client::YBTransactionPtr ddl_txn_;

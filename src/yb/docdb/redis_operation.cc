@@ -13,16 +13,20 @@
 
 #include "yb/docdb/redis_operation.h"
 
+#include "yb/docdb/doc_key.h"
+#include "yb/docdb/doc_path.h"
 #include "yb/docdb/doc_reader_redis.h"
 #include "yb/docdb/doc_ttl_util.h"
 #include "yb/docdb/doc_write_batch.h"
 #include "yb/docdb/doc_write_batch_cache.h"
-#include "yb/docdb/docdb.h"
 #include "yb/docdb/docdb_rocksdb_util.h"
 #include "yb/docdb/subdocument.h"
 
-#include "yb/util/stol_utils.h"
+#include "yb/server/hybrid_clock.h"
+
 #include "yb/util/redis_util.h"
+#include "yb/util/status_format.h"
+#include "yb/util/stol_utils.h"
 
 DEFINE_bool(emulate_redis_responses,
     true,
@@ -495,7 +499,7 @@ void RedisWriteOperation::InitializeIterator(const DocOperationApplyData& data) 
   auto iter = CreateIntentAwareIterator(
       data.doc_write_batch->doc_db(),
       BloomFilterMode::USE_BLOOM_FILTER, subdoc_key.Encode().AsSlice(),
-      redis_query_id(), /* txn_op_context */ boost::none, data.deadline, data.read_time);
+      redis_query_id(), TransactionOperationContext(), data.deadline, data.read_time);
 
   iterator_ = std::move(iter);
 }
@@ -627,7 +631,7 @@ Status RedisWriteOperation::ApplySet(const DocOperationApplyData& data) {
                                                &subdoc_reverse_found };
           RETURN_NOT_OK(GetRedisSubDocument(
               data.doc_write_batch->doc_db(),
-              get_data, redis_query_id(), boost::none /* txn_op_context */, data.deadline,
+              get_data, redis_query_id(), TransactionOperationContext(), data.deadline,
               data.read_time));
 
           // Flag indicating whether we should add the given entry to the sorted set.
@@ -962,7 +966,7 @@ Status RedisWriteOperation::ApplyDel(const DocOperationApplyData& data) {
                                              &doc_reverse_found };
         RETURN_NOT_OK(GetRedisSubDocument(
             data.doc_write_batch->doc_db(),
-            get_data, redis_query_id(), boost::none /* txn_op_context */, data.deadline,
+            get_data, redis_query_id(), TransactionOperationContext(), data.deadline,
             data.read_time));
         if (doc_reverse_found && doc_reverse.value_type() != ValueType::kTombstone) {
           // The value is already in the doc, needs to be removed.
@@ -1182,7 +1186,7 @@ Status RedisWriteOperation::ApplyPop(const DocOperationApplyData& data) {
     return Status::OK();
   }
 
-  std::vector<int> indices;
+  std::vector<int64_t> indices;
   std::vector<SubDocument> new_value = {SubDocument(PrimitiveValue(ValueType::kTombstone))};
   std::vector<std::string> value;
 
@@ -1278,7 +1282,7 @@ Status RedisReadOperation::Execute() {
   auto iter = yb::docdb::CreateIntentAwareIterator(
       doc_db_, bloom_filter_mode,
       doc_key.Encode().AsSlice(),
-      redis_query_id(), /* txn_op_context */ boost::none, deadline_, read_time_);
+      redis_query_id(), TransactionOperationContext(), deadline_, read_time_);
   iterator_ = std::move(iter);
   deadline_info_.emplace(deadline_);
 
@@ -1305,12 +1309,17 @@ Status RedisReadOperation::Execute() {
   }
 }
 
-int RedisReadOperation::ApplyIndex(int32_t index, const int32_t len) {
-  if (index < 0) index += len;
-  if (index < 0) index = 0;
-  if (index > len) index = len;
-  return index;
+namespace {
+
+ssize_t ApplyIndex(ssize_t index, ssize_t len) {
+  if (index < 0) {
+    index += len;
+    return std::max<ssize_t>(index, 0);
+  }
+  return std::min<ssize_t>(index, len);
 }
+
+} // namespace
 
 Status RedisReadOperation::ExecuteHGetAllLikeCommands(ValueType value_type,
                                                       bool add_keys,
@@ -1425,7 +1434,7 @@ Status RedisReadOperation::ExecuteCollectionGetRangeByBounds(
     IndexBound low_index;
     IndexBound high_index;
     if (request_.has_range_request_limit()) {
-      int32_t offset = request_.index_range().lower_bound().index();
+      auto offset = request_.index_range().lower_bound().index();
       int32_t limit = request_.range_request_limit();
 
       if (offset < 0 || limit == 0) {
@@ -1766,7 +1775,7 @@ Status RedisReadOperation::ExecuteGet(const RedisGetRequestPB& get_request) {
       GetRedisSubDocumentData get_data = {
           encoded_key_reverse, &subdoc_reverse, &subdoc_reverse_found };
       RETURN_NOT_OK(GetRedisSubDocument(doc_db_, get_data, redis_query_id(),
-                                        boost::none /* txn_op_context */, deadline_, read_time_));
+                                        TransactionOperationContext(), deadline_, read_time_));
       if (subdoc_reverse_found) {
         double score = subdoc_reverse.GetDouble();
         response_.set_string_response(std::to_string(score));
@@ -1818,8 +1827,9 @@ Status RedisReadOperation::ExecuteGet(const RedisGetRequestPB& get_request) {
           });
 
       string current_value = "";
-      response_.mutable_array_response()->mutable_elements()->Reserve(num_subkeys);
-      for (int i = 0; i < num_subkeys; ++i) {
+      response_.mutable_array_response()->mutable_elements()->Reserve(
+          narrow_cast<int>(num_subkeys));
+      for (size_t i = 0; i < num_subkeys; ++i) {
         response_.mutable_array_response()->add_elements();
       }
       for (int i = 0; i < num_subkeys; ++i) {
@@ -1903,15 +1913,15 @@ Status RedisReadOperation::ExecuteGetRange() {
     return Status::OK();
   }
 
-  const int32_t len = value->value.length();
-  int32_t exclusive_end = request_.get_range_request().end() + 1;
+  const ssize_t len = value->value.length();
+  ssize_t exclusive_end = request_.get_range_request().end() + 1;
   if (exclusive_end == 0) {
     exclusive_end = len;
   }
 
   // We treat negative indices to refer backwards from the end of the string.
-  const int32_t start = ApplyIndex(request_.get_range_request().start(), len);
-  int32_t end = ApplyIndex(exclusive_end, len);
+  const auto start = ApplyIndex(request_.get_range_request().start(), len);
+  auto end = ApplyIndex(exclusive_end, len);
   if (end < start) {
     end = start;
   }
@@ -1942,9 +1952,9 @@ Status RedisReadOperation::ExecuteKeys() {
     RETURN_NOT_OK(doc_key.FullyDecodeFrom(key));
     const PrimitiveValue& key_primitive = doc_key.hashed_group().front();
     if (!key_primitive.IsString() ||
-        !RedisUtil::RedisPatternMatch(request_.keys_request().pattern(),
-                                     key_primitive.GetString(),
-                                     false /* ignore_case */)) {
+        !RedisPatternMatch(request_.keys_request().pattern(),
+                           key_primitive.GetString(),
+                           false /* ignore_case */)) {
       iterator_->SeekOutOfSubDoc(key);
       continue;
     }

@@ -39,21 +39,22 @@
 #include <boost/optional/optional.hpp>
 
 #include "yb/common/hybrid_time.h"
-#include "yb/common/wire_protocol.h"
+
 #include "yb/consensus/consensus_fwd.h"
-#include "yb/consensus/consensus.pb.h"
 #include "yb/consensus/consensus_round.h"
-#include "yb/consensus/opid_util.h"
+#include "yb/consensus/consensus_types.pb.h"
 
 #include "yb/tablet/tablet_fwd.h"
 
-#include "yb/util/auto_release_pool.h"
+#include "yb/util/status_fwd.h"
 #include "yb/util/locks.h"
 #include "yb/util/operation_counter.h"
-#include "yb/util/status.h"
-#include "yb/util/memory/arena.h"
+#include "yb/util/opid.h"
 
 namespace yb {
+
+class Synchronizer;
+
 namespace tablet {
 
 using OperationCompletionCallback = std::function<void(const Status&)>;
@@ -105,7 +106,13 @@ class Operation {
 
   std::string LogPrefix() const;
 
-  virtual void SubmittedToPreparer() {}
+  void set_preparing_token(ScopedOperation&& preparing_token) {
+    preparing_token_ = std::move(preparing_token);
+  }
+
+  void SubmittedToPreparer() {
+    preparing_token_ = ScopedOperation();
+  }
 
   // Returns the request PB associated with this transaction. May be NULL if the transaction's state
   // has been reset.
@@ -135,7 +142,7 @@ class Operation {
 
   virtual void Release();
 
-  virtual void SetTablet(Tablet* tablet) {
+  void SetTablet(Tablet* tablet) {
     tablet_ = tablet;
   }
 
@@ -179,18 +186,6 @@ class Operation {
 
   const OpId& op_id() const {
     return op_id_;
-  }
-
-  void UpdateIfMaxTtl(const MonoDelta& ttl);
-
-  const MonoDelta ttl() const {
-    std::lock_guard<simple_spinlock> l(mutex_);
-    return ttl_;
-  }
-
-  bool has_ttl() const {
-    std::lock_guard<simple_spinlock> l(mutex_);
-    return ttl_.Initialized();
   }
 
   bool has_completion_callback() const {
@@ -247,9 +242,9 @@ class Operation {
   // This OpId stores the canonical "anchor" OpId for this transaction.
   OpId op_id_ GUARDED_BY(mutex_);
 
-  MonoDelta ttl_ GUARDED_BY(mutex_);
-
   scoped_refptr<consensus::ConsensusRound> consensus_round_;
+
+  ScopedOperation preparing_token_;
 };
 
 template <class Request>
@@ -260,6 +255,7 @@ struct RequestTraits {
   static Request* MutableRequest(consensus::ReplicateMsg* replicate);
 };
 
+consensus::ReplicateMsgPtr CreateReplicateMsg(OperationType op_type);
 
 template <OperationType op_type, class Request, class Base = Operation>
 class OperationBase : public Base {
@@ -292,8 +288,7 @@ class OperationBase : public Base {
   }
 
   consensus::ReplicateMsgPtr NewReplicateMsg() override {
-    auto result = std::make_shared<consensus::ReplicateMsg>();
-    result->set_op_type(static_cast<consensus::OperationType>(op_type));
+    auto result = CreateReplicateMsg(op_type);
     auto* request = request_holder_.release();
     if (request) {
       RequestTraits<Request>::SetAllocatedRequest(result.get(), request);
@@ -364,15 +359,8 @@ auto MakeLatchOperationCompletionCallback(LatchPtr latch, ResponsePBPtr response
   };
 }
 
-inline auto MakeWeakSynchronizerOperationCompletionCallback(
-    std::weak_ptr<Synchronizer> synchronizer) {
-  return [synchronizer = std::move(synchronizer)](const Status& status) {
-    auto shared_synchronizer = synchronizer.lock();
-    if (shared_synchronizer) {
-      shared_synchronizer->StatusCB(status);
-    }
-  };
-}
+OperationCompletionCallback MakeWeakSynchronizerOperationCompletionCallback(
+    std::weak_ptr<Synchronizer> synchronizer);
 
 }  // namespace tablet
 }  // namespace yb

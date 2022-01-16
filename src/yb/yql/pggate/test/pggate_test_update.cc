@@ -13,8 +13,14 @@
 //
 //--------------------------------------------------------------------------------------------------
 
-#include "yb/yql/pggate/test/pggate_test.h"
 #include "yb/common/ybc-internal.h"
+
+#include "yb/gutil/casts.h"
+
+#include "yb/util/status_log.h"
+
+#include "yb/yql/pggate/test/pggate_test.h"
+#include "yb/yql/pggate/ybc_pggate.h"
 
 namespace yb {
 namespace pggate {
@@ -204,8 +210,8 @@ TEST_F(PggateTestDelete, TestDelete) {
 
     // Check result.
     int col_index = 0;
-    int32_t hash_id = values[col_index++];  // id : int32
-    int32_t id = values[col_index++];  // id : int32
+    int32_t hash_id = narrow_cast<int32_t>(values[col_index++]);  // id : int32
+    int32_t id = narrow_cast<int32_t>(values[col_index++]);  // id : int32
     CHECK_EQ(hash_id, id) << "Expect hash and range key share the same value";
     if (id%2 == 0) {
       // Check if EVEN rows stays the same as inserted.

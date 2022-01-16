@@ -13,18 +13,22 @@
 
 #include "yb/tablet/transaction_status_resolver.h"
 
-#include <gflags/gflags.h>
-
 #include "yb/client/transaction_rpc.h"
 
 #include "yb/common/wire_protocol.h"
 
 #include "yb/rpc/rpc.h"
 
+#include "yb/tablet/transaction_participant_context.h"
+
 #include "yb/tserver/tserver_service.pb.h"
 
 #include "yb/util/atomic.h"
+#include "yb/util/countdown_latch.h"
 #include "yb/util/flag_tags.h"
+#include "yb/util/logging.h"
+#include "yb/util/result.h"
+#include "yb/util/status_format.h"
 
 DEFINE_test_flag(int32, inject_status_resolver_delay_ms, 0,
                  "Inject delay before launching transaction status resolver RPC.");
@@ -175,7 +179,7 @@ class TransactionStatusResolver::Impl {
     status_infos_.resize(response.status().size());
     auto it = queues_.begin();
     auto& queue = it->second;
-    for (size_t i = 0; i != response.status().size(); ++i) {
+    for (int i = 0; i != response.status().size(); ++i) {
       auto& status_info = status_infos_[i];
       status_info.transaction_id = queue.front();
       status_info.status = response.status(i);

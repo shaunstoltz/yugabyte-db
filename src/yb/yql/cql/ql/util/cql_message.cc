@@ -16,19 +16,19 @@
 #include <lz4.h>
 #include <snappy.h>
 
-#include <regex>
-
-#include "yb/client/client.h"
-
 #include "yb/common/ql_protocol.pb.h"
+#include "yb/common/ql_type.h"
 #include "yb/common/ql_value.h"
+#include "yb/common/schema.h"
 
-#include "yb/yql/cql/cqlserver/cql_processor.h"
-
+#include "yb/gutil/casts.h"
 #include "yb/gutil/endian.h"
 #include "yb/gutil/strings/substitute.h"
 
+#include "yb/util/logging.h"
 #include "yb/util/random_util.h"
+#include "yb/util/result.h"
+#include "yb/util/status_format.h"
 
 namespace yb {
 namespace ql {
@@ -40,13 +40,12 @@ using std::set;
 using std::vector;
 using std::unordered_map;
 using strings::Substitute;
-using util::to_char_ptr;
-using util::to_uchar_ptr;
 using snappy::GetUncompressedLength;
 using snappy::MaxCompressedLength;
 using snappy::RawUncompress;
 using snappy::RawCompress;
 
+#undef RETURN_NOT_ENOUGH
 #define RETURN_NOT_ENOUGH(sz)                               \
   do {                                                      \
     if (body_.size() < (sz)) {                              \
@@ -272,8 +271,9 @@ bool CQLRequest::ParseRequest(
         buffer = std::make_unique<uint8_t[]>(uncomp_size);
         body_data += sizeof(uncomp_size);
         body_size -= sizeof(uncomp_size);
-        const int size = LZ4_decompress_safe(to_char_ptr(body_data), to_char_ptr(buffer.get()),
-                                             body_size, uncomp_size);
+        const int size = LZ4_decompress_safe(
+            to_char_ptr(body_data), to_char_ptr(buffer.get()), narrow_cast<int>(body_size),
+            uncomp_size);
         if (size < 0 || size != uncomp_size) {
           error_response->reset(
               new ErrorResponse(
@@ -561,6 +561,47 @@ Status CQLRequest::ParseQueryParameters(QueryParameters* params) {
     RETURN_NOT_OK(ParseLong(&params->default_timestamp));
   }
   return Status::OK();
+}
+
+CHECKED_STATUS CQLRequest::ParseByte(uint8_t* value) {
+  static_assert(sizeof(*value) == kByteSize, "inconsistent byte size");
+  return ParseNum("CQL byte", Load8, value);
+}
+
+CHECKED_STATUS CQLRequest::ParseShort(uint16_t* value) {
+  static_assert(sizeof(*value) == kShortSize, "inconsistent short size");
+  return ParseNum("CQL byte", NetworkByteOrder::Load16, value);
+}
+
+CHECKED_STATUS CQLRequest::ParseInt(int32_t* value) {
+  static_assert(sizeof(*value) == kIntSize, "inconsistent int size");
+  return ParseNum("CQL int", NetworkByteOrder::Load32, value);
+}
+
+CHECKED_STATUS CQLRequest::ParseLong(int64_t* value) {
+  static_assert(sizeof(*value) == kLongSize, "inconsistent long size");
+  return ParseNum("CQL long", NetworkByteOrder::Load64, value);
+}
+
+CHECKED_STATUS CQLRequest::ParseString(std::string* value)  {
+  return ParseBytes("CQL string", &CQLRequest::ParseShort, value);
+}
+
+CHECKED_STATUS CQLRequest::ParseLongString(std::string* value)  {
+  return ParseBytes("CQL long string", &CQLRequest::ParseInt, value);
+}
+
+CHECKED_STATUS CQLRequest::ParseShortBytes(std::string* value) {
+  return ParseBytes("CQL short bytes", &CQLRequest::ParseShort, value);
+}
+
+CHECKED_STATUS CQLRequest::ParseBytes(std::string* value) {
+  return ParseBytes("CQL bytes", &CQLRequest::ParseInt, value);
+}
+
+CHECKED_STATUS CQLRequest::ParseConsistency(Consistency* consistency) {
+  static_assert(sizeof(*consistency) == kConsistencySize, "inconsistent consistency size");
+  return ParseNum("CQL consistency", NetworkByteOrder::Load16, consistency);
 }
 
 // ------------------------------ Individual CQL requests -----------------------------------
@@ -958,11 +999,11 @@ void CQLResponse::Serialize(const CompressionScheme compression_scheme, faststri
       case CQLMessage::CompressionScheme::kLz4: {
         SerializeInt(static_cast<int32_t>(body.size()), mesg);
         const size_t curr_size = mesg->size();
-        const int max_comp_size = LZ4_compressBound(body.size());
+        const int max_comp_size = LZ4_compressBound(narrow_cast<int>(body.size()));
         mesg->resize(curr_size + max_comp_size);
         const int comp_size = LZ4_compress_default(to_char_ptr(body.data()),
                                                    to_char_ptr(mesg->data() + curr_size),
-                                                   body.size(),
+                                                   narrow_cast<int>(body.size()),
                                                    max_comp_size);
         CHECK_NE(comp_size, 0) << "LZ4 compression failed";
         mesg->resize(curr_size + comp_size);
@@ -1394,7 +1435,7 @@ ResultResponse::RowsMetadata::RowsMetadata(const client::YBTableName& table_name
       paging_state(paging_state),
       global_table_spec(no_metadata ? "" : table_name.namespace_name(),
                         no_metadata ? "" : table_name.table_name()),
-      col_count(columns.size()) {
+      col_count(narrow_cast<int>(columns.size())) {
   if (!no_metadata) {
     col_specs.reserve(col_count);
     for (const auto& column : columns) {
@@ -1592,9 +1633,9 @@ PreparedResultResponse::~PreparedResultResponse() {
 void PreparedResultResponse::SerializePreparedMetadata(
     const PreparedMetadata& metadata, faststring* mesg) const {
   SerializeInt(metadata.flags, mesg);
-  SerializeInt(metadata.col_specs.size(), mesg);
+  SerializeInt(narrow_cast<int32_t>(metadata.col_specs.size()), mesg);
   if (VersionIsCompatible(kV4Version)) {
-    SerializeInt(metadata.pk_indices.size(), mesg);
+    SerializeInt(narrow_cast<int32_t>(metadata.pk_indices.size()), mesg);
     for (const auto& pk_index : metadata.pk_indices) {
       SerializeShort(pk_index, mesg);
     }

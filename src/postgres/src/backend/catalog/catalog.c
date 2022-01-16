@@ -51,7 +51,6 @@
 
 /* YB includes. */
 #include "access/htup_details.h"
-#include "catalog/pg_rewrite.h"
 #include "utils/syscache.h"
 #include "pg_yb_utils.h"
 
@@ -174,6 +173,22 @@ IsSystemNamespace(Oid namespaceId)
 }
 
 /*
+ * Same logic as with IsSystemNamespace, to be used when OID isn't known.
+ * NULL name results in InvalidOid.
+ */
+bool
+YbIsSystemNamespaceByName(const char *namespace_name)
+{
+	Oid namespace_oid;
+
+	namespace_oid = namespace_name ?
+		LookupExplicitNamespace(namespace_name, true) :
+		InvalidOid;
+
+	return IsSystemNamespace(namespace_oid);
+}
+
+/*
  * IsToastNamespace
  *		True iff namespace is pg_toast or my temporary-toast-table namespace.
  *
@@ -285,10 +300,10 @@ IsSharedRelation(Oid relationId)
 			? ((Form_pg_class) GETSTRUCT(tuple))->relisshared
 			: false;
 
-		heap_close(pg_class, AccessShareLock);
-
 		if (HeapTupleIsValid(tuple))
 			heap_freetuple(tuple);
+
+		heap_close(pg_class, AccessShareLock);
 
 		return result;
 	}
@@ -629,7 +644,12 @@ GetTableOidFromRelOptions(List *relOptions,
 		DefElem *def = (DefElem *) lfirst(opt_cell);
 		if (strcmp(def->defname, "table_oid") == 0)
 		{
-			table_oid = strtol(defGetString(def), NULL, 10);
+			const char* hintmsg;
+			if (!parse_oid(defGetString(def), &table_oid, &hintmsg))
+				ereport(ERROR,
+						(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+						 errmsg("invalid value for OID option \"table_oid\""),
+						 hintmsg ? errhint("%s", _(hintmsg)) : 0));
 			if (OidIsValid(table_oid))
 			{
 				Relation pg_class_desc =
@@ -645,7 +665,7 @@ GetTableOidFromRelOptions(List *relOptions,
 				else
 					ereport(ERROR,
 							(errcode(ERRCODE_DUPLICATE_OBJECT),
-							 errmsg("table OID %d is in use", table_oid)));
+							 errmsg("table OID %u is in use", table_oid)));
 
 				/* Only process the first table_oid. */
 				break;
@@ -656,6 +676,35 @@ GetTableOidFromRelOptions(List *relOptions,
 	return InvalidOid;
 }
 
+/*
+ * GetTablegroupOidFromRelOptions
+ *		Scans through relOptions for any 'tablegroup' options.
+ *		Returns that oid, or InvalidOid if unspecified.
+ */
+Oid
+GetTablegroupOidFromRelOptions(List *relOptions)
+{
+	ListCell   *opt_cell;
+	Oid			tablegroup_oid;
+
+	foreach(opt_cell, relOptions)
+	{
+		DefElem *def = (DefElem *) lfirst(opt_cell);
+		if (strcmp(def->defname, "tablegroup") == 0)
+		{
+			const char* hintmsg;
+			if (!parse_oid(defGetString(def), &tablegroup_oid, &hintmsg))
+				ereport(ERROR,
+						(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+						 errmsg("invalid value for OID option \"tablegroup_oid\""),
+						 hintmsg ? errhint("%s", _(hintmsg)) : 0));
+			if (OidIsValid(tablegroup_oid))
+				return tablegroup_oid;
+		}
+	}
+
+	return InvalidOid;
+}
 /*
  * GetRowTypeOidFromRelOptions
  *		Scans through relOptions for any 'row_type_oid' options, and ensures
@@ -674,7 +723,12 @@ GetRowTypeOidFromRelOptions(List *relOptions)
 		DefElem *def = (DefElem *) lfirst(opt_cell);
 		if (strcmp(def->defname, "row_type_oid") == 0)
 		{
-			row_type_oid = strtol(defGetString(def), NULL, 10);
+			const char* hintmsg;
+			if (!parse_oid(defGetString(def), &row_type_oid, &hintmsg))
+				ereport(ERROR,
+						(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+						 errmsg("invalid value for OID option \"row_type_oid\""),
+						 hintmsg ? errhint("%s", _(hintmsg)) : 0));
 			if (OidIsValid(row_type_oid))
 			{
 				pg_type_desc = heap_open(TypeRelationId, AccessExclusiveLock);
@@ -683,7 +737,7 @@ GetRowTypeOidFromRelOptions(List *relOptions)
 				if (HeapTupleIsValid(tuple))
 					ereport(ERROR,
 							(errcode(ERRCODE_DUPLICATE_OBJECT),
-							 errmsg("type OID %d is in use", row_type_oid)));
+							 errmsg("type OID %u is in use", row_type_oid)));
 
 				heap_close(pg_type_desc, AccessExclusiveLock);
 
@@ -695,53 +749,17 @@ GetRowTypeOidFromRelOptions(List *relOptions)
 	return InvalidOid;
 }
 
-/*
- * GetRewriteRuleOidFromRelOptions
- *		Scans through relOptions for any 'rewrite_rule_oid' options, and ensures
- *		that oid is available. Returns that oid, or InvalidOid if unspecified.
- */
-Oid
-GetRewriteRuleOidFromRelOptions(List *relOptions)
+bool
+YbGetUseInitdbAclFromRelOptions(List *options)
 {
-	ListCell   *opt_cell;
-	Oid			rewrite_rule_oid;
-	Relation	pg_rewrite_desc;
-	ScanKeyData	skey[1];
-	SysScanDesc	rcscan;
-	HeapTuple	tuple;
+	ListCell  *opt_cell;
 
-	foreach(opt_cell, relOptions)
+	foreach(opt_cell, options)
 	{
-		DefElem *def = (DefElem *) lfirst(opt_cell);
-		if (strcmp(def->defname, "rewrite_rule_oid") == 0)
-		{
-			rewrite_rule_oid = strtol(defGetString(def), NULL, 10);
-			if (OidIsValid(rewrite_rule_oid))
-			{
-				/* Check there's no such rule yet. */
-				pg_rewrite_desc = heap_open(RewriteRelationId, RowExclusiveLock);
-
-				ScanKeyInit(&skey[0],
-							ObjectIdAttributeNumber,
-							BTEqualStrategyNumber, F_OIDEQ,
-							ObjectIdGetDatum(rewrite_rule_oid));
-
-				rcscan = systable_beginscan(pg_rewrite_desc, RewriteOidIndexId,
-							true, NULL, 1, skey);
-
-				tuple = systable_getnext(rcscan);
-
-				if (HeapTupleIsValid(tuple))
-					ereport(ERROR,
-							(errcode(ERRCODE_DUPLICATE_OBJECT),
-							 errmsg("rewrite rule OID %d is in use", rewrite_rule_oid)));
-
-				systable_endscan(rcscan);
-				heap_close(pg_rewrite_desc, RowExclusiveLock);
-
-				return rewrite_rule_oid;
-			}
-		}
+		// Don't care about multiple occurrences, this reloption is internal.
+		DefElem *def = lfirst_node(DefElem, opt_cell);
+		if (strcmp(def->defname, "use_initdb_acl") == 0)
+			return defGetBoolean(def);
 	}
 
 	return InvalidOid;

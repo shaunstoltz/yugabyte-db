@@ -17,6 +17,9 @@ yb_home_dir="/home/yugabyte"
 # they might not exist in the provided instance depending on how old it is.
 result_kvs=""
 YB_SUDO_PASS=""
+ports_to_check=""
+PROMETHEUS_FREE_SPACE_MB=100
+HOME_FREE_SPACE_MB=2048
 
 preflight_provision_check() {
   # Check python is installed.
@@ -51,6 +54,9 @@ preflight_provision_check() {
     for path in $filepaths; do
       check_filepath "Prometheus" "$path" true
     done
+
+    check_free_space "/opt/prometheus" $PROMETHEUS_FREE_SPACE_MB
+    check_free_space "/tmp" $PROMETHEUS_FREE_SPACE_MB # for downloading folder
   fi
 
   # Check ulimit settings.
@@ -63,6 +69,16 @@ preflight_provision_check() {
     check_filepath "Mount Point" "$path" false
   done
 
+  # Check ports are available.
+  IFS="," read -ra ports_to_check_arr <<< "$ports_to_check"
+  for port in "${ports_to_check_arr[@]}"; do
+    check_passed=true
+    if sudo netstat -tulpn | grep ":$port\s"; then
+      check_passed=false
+    fi
+    update_result_json "Port $port is available" "$check_passed"
+  done
+
   # Check yugabyte user belongs to yugabyte group if it exists.
   if id -u "yugabyte"; then
     yb_group=$(id -gn "yugabyte")
@@ -72,6 +88,8 @@ preflight_provision_check() {
     fi
     update_result_json "Yugabyte User in Yugabyte Group" "$user_status"
   fi
+
+  check_free_space "$yb_home_dir" $HOME_FREE_SPACE_MB
 }
 
 preflight_configure_check() {
@@ -89,6 +107,7 @@ preflight_configure_check() {
 
   # Check home directory exists.
   check_filepath "Home Directory" "$yb_home_dir" false
+  check_free_space "$yb_home_dir" $HOME_FREE_SPACE_MB
 }
 
 # Checks if given filepath is writable.
@@ -96,7 +115,6 @@ check_filepath() {
   test_type="$1"
   path="$2"
   check_parent="$3" # If true, will check parent directory is writable if given path doesn't exist.
-  file_status="1" # 0 if success, else failed
 
   # Use sudo command for provision.
   if [[ "$check_type" == "provision" ]]; then
@@ -115,6 +133,20 @@ check_filepath() {
   fi
 
   update_result_json_with_rc "($test_type) $path is writable" "$?"
+}
+
+check_free_space() {
+  path="$1"
+  required_mb="$2"
+  echo "checking free space in $1"
+  SPACE_STR=$(echo $YB_SUDO_PASS | sudo -S /bin/sh -c "/usr/bin/env python -c \"import os; \
+            filepath = '$path' if os.path.exists('$path') else os.path.dirname('$path'); \
+            st = os.statvfs(filepath); \
+            cur_space = int(st.f_bavail * st.f_frsize / 1024 / 1024); \
+            error_str = '(currently available {})'.format(cur_space); \
+            exit(error_str) if cur_space < $required_mb else exit();\"" 2>&1 > /dev/null)
+
+  update_result_json_with_rc "$path has free space of $required_mb MB $SPACE_STR" "$?"
 }
 
 update_result_json() {
@@ -152,6 +184,8 @@ Options:
     Home directory of yugabyte user.
   --sudo_pass_file
     Bash file containing the sudo password variable.
+  --ports_to_check PORTS_TO_CHECK
+    Comma-separated list of ports to check availability
   --cleanup
     Deletes this script after being run. Allows `scp` commands to port over new preflight scripts.
   -h, --help
@@ -188,6 +222,10 @@ while [[ $# -gt 0 ]]; do
     ;;
     --mount_points)
       mount_points="$2"
+      shift
+    ;;
+    --ports_to_check)
+      ports_to_check="$2"
       shift
     ;;
     --yb_home_dir)

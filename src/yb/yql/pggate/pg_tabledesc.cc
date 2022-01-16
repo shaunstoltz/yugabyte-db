@@ -14,12 +14,21 @@
 //--------------------------------------------------------------------------------------------------
 
 #include "yb/yql/pggate/pg_tabledesc.h"
-#include "yb/yql/pggate/pggate_flags.h"
 
+#include "yb/client/schema.h"
 #include "yb/client/table.h"
+#include "yb/client/yb_op.h"
 
+#include "yb/common/partition.h"
 #include "yb/common/pg_system_attr.h"
-#include "yb/common/ql_value.h"
+#include "yb/common/schema.h"
+
+#include "yb/docdb/doc_key.h"
+
+#include "yb/gutil/casts.h"
+
+#include "yb/util/result.h"
+#include "yb/util/status_format.h"
 
 namespace yb {
 namespace pggate {
@@ -48,16 +57,17 @@ Result<size_t> PgTableDesc::FindColumn(int attr_num) const {
   return STATUS_FORMAT(InvalidArgument, "Invalid column number $0", attr_num);
 }
 
-Status PgTableDesc::GetColumnInfo(int16_t attr_number, bool *is_primary, bool *is_hash) const {
+Result<YBCPgColumnInfo> PgTableDesc::GetColumnInfo(int16_t attr_number) const {
+  YBCPgColumnInfo column_info {
+    .is_primary = false,
+    .is_hash = false
+  };
   const auto itr = attr_num_map_.find(attr_number);
   if (itr != attr_num_map_.end()) {
-    *is_primary = itr->second < schema().num_key_columns();
-    *is_hash = itr->second < schema().num_hash_key_columns();
-  } else {
-    *is_primary = false;
-    *is_hash = false;
+    column_info.is_primary = itr->second < schema().num_key_columns();
+    column_info.is_hash = itr->second < schema().num_hash_key_columns();
   }
-  return Status::OK();
+  return column_info;
 }
 
 bool PgTableDesc::IsColocated() const {
@@ -77,7 +87,7 @@ const std::vector<std::string>& PgTableDesc::GetPartitions() const {
 }
 
 int PgTableDesc::GetPartitionCount() const {
-  return table_partitions_->keys.size();
+  return narrow_cast<int>(table_partitions_->keys.size());
 }
 
 Result<string> PgTableDesc::DecodeYbctid(const Slice& ybctid) const {

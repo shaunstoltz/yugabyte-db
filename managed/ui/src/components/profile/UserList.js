@@ -16,10 +16,14 @@ import { isNotHidden, isDisabled } from '../../utils/LayoutUtils';
 import {
   changeUserRole,
   createUser,
-  createUserResponse,
+  createUserFailure,
+  createUserSuccess,
   deleteUser,
   deleteUserResponse
 } from '../../actions/customers';
+import { toast } from 'react-toastify';
+import { createErrorMessage } from '../../utils/ObjectUtils';
+import { timeFormatter } from '../../utils/TableFormatters';
 
 class UserList extends Component {
   constructor(props) {
@@ -59,6 +63,7 @@ class UserList extends Component {
     ) {
       return null;
     } else {
+      const disableRoleEdit = user?.ldapSpecifiedRole; //if user is LDAP
       return (
         <DropdownButton
           className="btn btn-default"
@@ -66,7 +71,10 @@ class UserList extends Component {
           id="bg-nested-dropdown"
           pullRight
         >
-          <MenuItem onClick={() => this.editRole(user)}>
+          <MenuItem
+            disabled={disableRoleEdit}
+            onClick={() => !disableRoleEdit && this.editRole(user)}
+          >
             <span className="fa fa-edit" /> Edit User Role
           </MenuItem>
           <MenuItem onClick={() => this.showDeleteUserModal(user)}>
@@ -150,7 +158,9 @@ class UserList extends Component {
                 <TableHeaderColumn dataField="uuid" isKey hidden />
                 <TableHeaderColumn dataField="email">Email</TableHeaderColumn>
                 <TableHeaderColumn dataField="role">Role</TableHeaderColumn>
-                <TableHeaderColumn dataField="creationDate">Created At</TableHeaderColumn>
+                <TableHeaderColumn dataField="creationDate" dataFormat={timeFormatter}>
+                  Created At
+                </TableHeaderColumn>
                 <TableHeaderColumn
                   columnClassName="table-actions-cell"
                   dataFormat={(cell, row) => this.actionsDropdown(row)}
@@ -170,7 +180,17 @@ const mapDispatchToProps = (dispatch) => {
   return {
     createUser: (payload) => {
       return dispatch(createUser(payload)).then((response) => {
-        return dispatch(createUserResponse(response.payload));
+        try {
+          if (response.payload.isAxiosError || response.payload.status !== 200) {
+            toast.error(createErrorMessage(response.payload));
+            return dispatch(createUserFailure(response.payload));
+          } else {
+            toast.success('User created successfully');
+            return dispatch(createUserSuccess(response.payload));
+          }
+        } catch (error) {
+          console.error('Error while creating customer users');
+        }
       });
     },
     changeUserRole: (userUUID, newRole) => {

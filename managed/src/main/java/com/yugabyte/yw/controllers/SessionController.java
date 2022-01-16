@@ -17,6 +17,7 @@ package com.yugabyte.yw.controllers;
 import static com.yugabyte.yw.common.ConfigHelper.ConfigType.Security;
 import static com.yugabyte.yw.forms.PlatformResults.withData;
 import static com.yugabyte.yw.models.Users.Role;
+import static com.yugabyte.yw.models.Users.UserType;
 
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
@@ -25,56 +26,57 @@ import com.google.common.collect.ImmutableMap;
 import com.google.inject.Inject;
 import com.yugabyte.yw.common.ApiHelper;
 import com.yugabyte.yw.common.ConfigHelper;
+import com.yugabyte.yw.common.LdapUtil;
 import com.yugabyte.yw.common.PlatformServiceException;
 import com.yugabyte.yw.common.ValidatingFormFactory;
 import com.yugabyte.yw.common.alerts.AlertConfigurationService;
 import com.yugabyte.yw.common.alerts.AlertDestinationService;
 import com.yugabyte.yw.common.config.RuntimeConfigFactory;
 import com.yugabyte.yw.common.password.PasswordPolicyService;
+import com.yugabyte.yw.common.user.UserService;
+import com.yugabyte.yw.controllers.handlers.SessionHandler;
 import com.yugabyte.yw.forms.CustomerLoginFormData;
 import com.yugabyte.yw.forms.CustomerRegisterFormData;
 import com.yugabyte.yw.forms.PasswordPolicyFormData;
 import com.yugabyte.yw.forms.PlatformResults;
 import com.yugabyte.yw.forms.PlatformResults.YBPSuccess;
 import com.yugabyte.yw.forms.SetSecurityFormData;
-import com.yugabyte.yw.forms.UniverseResp;
-import com.yugabyte.yw.models.AlertConfiguration;
 import com.yugabyte.yw.models.Customer;
 import com.yugabyte.yw.models.Universe;
 import com.yugabyte.yw.models.Users;
+import com.yugabyte.yw.models.extended.UserWithFeatures;
 import io.swagger.annotations.Api;
 import io.swagger.annotations.ApiModel;
 import io.swagger.annotations.ApiModelProperty;
 import io.swagger.annotations.ApiOperation;
 import io.swagger.annotations.Authorization;
+import io.ebean.DuplicateKeyException;
+import io.ebean.annotation.Transactional;
 import java.io.File;
-import java.io.FileFilter;
-import java.io.FileInputStream;
 import java.io.IOException;
 import java.io.InputStream;
-import java.io.FileNotFoundException;
+import java.nio.charset.Charset;
+import java.nio.file.Files;
+import java.nio.file.Path;
+import java.nio.file.StandardOpenOption;
 import java.time.Duration;
-import java.util.ArrayList;
-import java.util.Arrays;
-import java.util.Collections;
-import java.util.List;
-import java.util.ListIterator;
-import java.util.Map;
-import java.util.UUID;
+import java.util.*;
 import java.util.concurrent.CompletionStage;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
 import java.util.regex.PatternSyntaxException;
-import java.util.stream.Collectors;
-import java.util.zip.GZIPInputStream;
-import javax.persistence.PersistenceException;
 import lombok.Data;
-import lombok.extern.slf4j.Slf4j;
 import lombok.RequiredArgsConstructor;
-import org.apache.commons.io.comparator.LastModifiedFileComparator;
-import org.apache.commons.io.filefilter.WildcardFileFilter;
-import org.apache.commons.io.IOCase;
+import lombok.extern.slf4j.Slf4j;
 import org.apache.commons.io.input.ReversedLinesFileReader;
+import org.apache.directory.api.ldap.model.cursor.EntryCursor;
+import org.apache.directory.api.ldap.model.entry.Attribute;
+import org.apache.directory.api.ldap.model.entry.Entry;
+import org.apache.directory.api.ldap.model.exception.LdapAuthenticationException;
+import org.apache.directory.api.ldap.model.exception.LdapException;
+import org.apache.directory.api.ldap.model.exception.LdapNoSuchObjectException;
+import org.apache.directory.api.ldap.model.message.SearchScope;
+import org.apache.directory.ldap.client.api.LdapNetworkConnection;
 import org.pac4j.core.profile.CommonProfile;
 import org.pac4j.core.profile.ProfileManager;
 import org.pac4j.play.PlayWebContext;
@@ -82,13 +84,9 @@ import org.pac4j.play.java.Secure;
 import org.pac4j.play.store.PlaySessionStore;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
-import org.unix4j.Unix4j;
-import org.unix4j.unix.grep.GrepOption;
-import org.unix4j.unix.Sort;
 import play.Configuration;
 import play.Environment;
 import play.data.Form;
-import play.db.ebean.Transactional;
 import play.libs.Json;
 import play.libs.concurrent.HttpExecutionContext;
 import play.libs.ws.WSClient;
@@ -131,10 +129,17 @@ public class SessionController extends AbstractPlatformController {
 
   @Inject private HttpExecutionContext ec;
 
+  @Inject private SessionHandler sessionHandler;
+
+  @Inject private UserService userService;
+
+  @Inject private LdapUtil ldapUtil;
+
   public static final String AUTH_TOKEN = "authToken";
   public static final String API_TOKEN = "apiToken";
   public static final String CUSTOMER_UUID = "customerUUID";
   private static final Integer FOREVER = 2147483647;
+  public static final String FILTERED_LOGS_SCRIPT = "bin/filtered_logs.sh";
 
   private CommonProfile getProfile() {
     final PlayWebContext context = new PlayWebContext(ctx(), playSessionStore);
@@ -169,7 +174,7 @@ public class SessionController extends AbstractPlatformController {
       response = SessionInfo.class)
   @With(TokenAuthenticator.class)
   public Result getSessionInfo() {
-    Users user = (Users) Http.Context.current().args.get("user");
+    Users user = getCurrentUser();
     Customer cust = Customer.get(user.customerUUID);
     Cookie authCookie = request().cookie(AUTH_TOKEN);
     SessionInfo sessionInfo =
@@ -230,30 +235,23 @@ public class SessionController extends AbstractPlatformController {
     }
   }
 
-  @ApiOperation(value = "getFilteredLogs", response = LogData.class)
+  @ApiOperation(value = "getFilteredLogs", produces = "text/plain")
   @With(TokenAuthenticator.class)
   public Result getFilteredLogs(Integer maxLines, String universeName, String queryRegex) {
     LOG.debug(
-        "getFilteredLogs: maxLines - {}, universeName - {}, queryRegex - {}",
+        "filtered_logs: maxLines - {}, universeName - {}, queryRegex - {}",
         maxLines,
         universeName,
         queryRegex);
-    String appHomeDir = appConfig.getString("application.home", ".");
-    String logDir = appConfig.getString("log.override.path", String.format("%s/logs", appHomeDir));
-    List<String> regexBuilder = new ArrayList<>();
-    String universeUUID = null;
-    Universe universe = null;
 
+    Universe universe = null;
     if (universeName != null) {
       universe = Universe.getUniverseByName(universeName);
       if (universe == null) {
         LOG.error("Universe {} not found", universeName);
         throw new PlatformServiceException(BAD_REQUEST, "Universe name given does not exist");
       }
-      universeUUID = universe.universeUUID.toString();
-      regexBuilder.add(universeUUID);
     }
-
     if (queryRegex != null) {
       try {
         Pattern.compile(queryRegex);
@@ -261,103 +259,57 @@ public class SessionController extends AbstractPlatformController {
         LOG.error("Invalid regular expression given: {}", queryRegex);
         throw new PlatformServiceException(BAD_REQUEST, "Invalid regular expression given");
       }
-      regexBuilder.add(queryRegex);
     }
 
-    String grepRegex = buildRegexString(regexBuilder);
-
-    File file = new File(String.format("%s/application.log", logDir));
-    if (!file.exists()) {
-      throw new PlatformServiceException(BAD_REQUEST, "Could not find application.log file.");
-    }
-    List<String> lines =
-        Unix4j.fromFile(String.format("%s/application.log", logDir))
-            .grep(GrepOption.ignoreCase, grepRegex)
-            .tail(maxLines)
-            .sort(Sort.Options.reverse)
-            .toStringList();
-
-    if (lines.size() >= maxLines) {
-      return PlatformResults.withData(new LogData(lines));
-    }
-    File dir = new File(logDir);
-    FileFilter fileFilter = new WildcardFileFilter("*.gz", IOCase.INSENSITIVE);
-    File[] gzFileList = dir.listFiles(fileFilter);
-    Arrays.sort(gzFileList, LastModifiedFileComparator.LASTMODIFIED_REVERSE);
-    for (File gzfile : gzFileList) {
-      if (gzfile.isFile()) {
-        try {
-          final InputStream gzStream = new GZIPInputStream(new FileInputStream(gzfile));
-          int linesRemaining = maxLines - lines.size();
-          List<String> newLines =
-              Unix4j.from(gzStream)
-                  .grep(GrepOption.ignoreCase, grepRegex)
-                  .tail(linesRemaining)
-                  .sort(Sort.Options.reverse)
-                  .toStringList();
-          lines.addAll(newLines);
-          if (lines.size() >= maxLines) {
-            break;
-          }
-        } catch (FileNotFoundException ex) {
-          LOG.error("Gz file not found.", ex);
-          throw new PlatformServiceException(
-              INTERNAL_SERVER_ERROR, "Could not find gz file with error " + ex.getMessage());
-        } catch (IOException ex) {
-          LOG.error("Log file open failed.", ex);
-          throw new PlatformServiceException(
-              INTERNAL_SERVER_ERROR, "Could not open gz file with error " + ex.getMessage());
-        }
-      }
-    }
-    return PlatformResults.withData(new LogData(lines));
-  }
-
-  public String buildRegexString(List<String> regexBuilder) {
-    String regexString = "";
-    if (regexBuilder.size() == 0) {
-      return regexString;
-    }
-
-    List<List<String>> permutedStrings = new ArrayList<>();
-    permute(regexBuilder, 0, permutedStrings);
-
-    List<String> regexArr = new ArrayList<>();
-    for (List<String> list : permutedStrings) {
-      regexArr.add(String.join(".*", list));
-    }
-    regexArr = regexArr.stream().map(v -> ".*" + v + ".*").collect(Collectors.toList());
-
-    regexString = String.join("|", regexArr);
-    return regexString;
-  }
-
-  public void permute(List<String> arr, int k, List<List<String>> permutations) {
-    for (int i = k; i < arr.size(); i++) {
-      Collections.swap(arr, i, k);
-      permute(arr, k + 1, permutations);
-      Collections.swap(arr, k, i);
-    }
-    if (k == arr.size() - 1) {
-      List<String> copy = new ArrayList<String>(arr);
-      permutations.add(copy);
+    try {
+      Path filteredLogsPath = sessionHandler.getFilteredLogs(maxLines, universe, queryRegex);
+      LOG.debug("filtered_logs temporary file path {}", filteredLogsPath.toString());
+      InputStream is = Files.newInputStream(filteredLogsPath, StandardOpenOption.DELETE_ON_CLOSE);
+      return ok(is).as("text/plain");
+    } catch (IOException ex) {
+      throw new PlatformServiceException(
+          INTERNAL_SERVER_ERROR, "Could not find temporary file with error " + ex.getMessage());
+    } catch (PlatformServiceException ex) {
+      throw new PlatformServiceException(INTERNAL_SERVER_ERROR, ex.getMessage());
     }
   }
 
   @ApiOperation(value = "UI_ONLY", hidden = true)
   public Result login() {
     boolean useOAuth = appConfig.getBoolean("yb.security.use_oauth", false);
+    boolean useLdap =
+        runtimeConfigFactory
+            .globalRuntimeConf()
+            .getString("yb.security.ldap.use_ldap")
+            .equals("true");
     if (useOAuth) {
       throw new PlatformServiceException(
           BAD_REQUEST, "Platform login not supported when using SSO.");
     }
-
     CustomerLoginFormData data =
         formFactory.getFormDataOrBadRequest(CustomerLoginFormData.class).get();
-    Users user = Users.authWithPassword(data.getEmail().toLowerCase(), data.getPassword());
+
+    Users user = null;
+    Users existingUser =
+        Users.find.query().where().eq("email", data.getEmail().toLowerCase()).findOne();
+    if (existingUser != null) {
+      if (existingUser.userType == null || !existingUser.userType.equals(UserType.ldap)) {
+        user = Users.authWithPassword(data.getEmail().toLowerCase(), data.getPassword());
+        if (user == null) {
+          throw new PlatformServiceException(UNAUTHORIZED, "Invalid User Credentials.");
+        }
+      }
+    }
+    if (useLdap && user == null) {
+      try {
+        user = ldapUtil.loginWithLdap(data);
+      } catch (LdapException e) {
+        LOG.error("LDAP error {} authenticating user {}", e.getMessage(), data.getEmail());
+      }
+    }
 
     if (user == null) {
-      throw new PlatformServiceException(UNAUTHORIZED, "Invalid User Credentials");
+      throw new PlatformServiceException(UNAUTHORIZED, "Invalid User Credentials.");
     }
     Customer cust = Customer.get(user.customerUUID);
 
@@ -411,7 +363,7 @@ public class SessionController extends AbstractPlatformController {
     } else {
       Customer cust = Customer.get(user.customerUUID);
       ctx().args.put("customer", cust);
-      ctx().args.put("user", user);
+      ctx().args.put("user", userService.getUserWithFeatures(cust, user));
       response()
           .setCookie(
               Http.Cookie.builder("customerId", cust.uuid.toString())
@@ -479,7 +431,7 @@ public class SessionController extends AbstractPlatformController {
     SetSecurityFormData data = formData.get();
     configHelper.loadConfigToDB(Security, ImmutableMap.of("level", data.level));
     if (data.level.equals("insecure")) {
-      Users user = (Users) Http.Context.current().args.get("user");
+      Users user = getCurrentUser();
       String apiToken = user.getApiToken();
       if (apiToken == null || apiToken.isEmpty()) {
         user.upsertApiToken();
@@ -500,7 +452,7 @@ public class SessionController extends AbstractPlatformController {
   @With(TokenAuthenticator.class)
   @ApiOperation(value = "UI_ONLY", hidden = true, response = SessionInfo.class)
   public Result api_token(UUID customerUUID) {
-    Users user = (Users) Http.Context.current().args.get("user");
+    Users user = getCurrentUser();
 
     if (user == null) {
       throw new PlatformServiceException(
@@ -574,7 +526,7 @@ public class SessionController extends AbstractPlatformController {
                 .build());
     // When there is no authenticated user in context; we just pretend that the user
     // created himself for auditing purpose.
-    ctx().args.putIfAbsent("user", user);
+    ctx().args.putIfAbsent("user", userService.getUserWithFeatures(cust, user));
     auditService().createAuditEntry(ctx(), request());
     return sessionInfo;
   }
@@ -583,7 +535,7 @@ public class SessionController extends AbstractPlatformController {
   @With(TokenAuthenticator.class)
   public Result logout() {
     response().discardCookie(AUTH_TOKEN);
-    Users user = (Users) Http.Context.current().args.get("user");
+    Users user = getCurrentUser();
     if (user != null) {
       user.deleteAuthToken();
     }
@@ -673,5 +625,10 @@ public class SessionController extends AbstractPlatformController {
                 return internalServerError(errorMsg);
               }
             });
+  }
+
+  private Users getCurrentUser() {
+    UserWithFeatures userWithFeatures = (UserWithFeatures) Http.Context.current().args.get("user");
+    return userWithFeatures.getUser();
   }
 }

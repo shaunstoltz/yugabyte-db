@@ -35,43 +35,67 @@ Yugabyte bills for its services as follows:
 
 For information on Yugabyte Cloud pricing, refer to the [Yugabyte Cloud Standard Price List](https://www.yugabyte.com/yugabyte-cloud-standard-price-list/). For a description of how cluster configurations are costed, refer to [Cluster costs](../cloud-admin/cloud-billing-costs).
 
-### What are the differences between Free and Paid clusters?
-
-Use the **Free** cluster to get started with YugabyteDB. The free cluster is limited to a single node, and although not suitable for production workloads, the cluster includes enough resources to start exploring the core features available for developing applications with YugabyteDB. You can only have one Free cluster.
-
-**Paid** clusters can have unlimited nodes and storage and are suitable for production workloads. Paid clusters support horizontal and vertical scaling - nodes and storage can be added or removed to suit your production loads. Paid clusters also support VPC peering, and scheduled and manual backups.
-
-A Yugabyte Cloud account is limited to a single Free cluster; you can add as many Paid clusters as you need.
-
-| Feature | Free | Paid |
-| :----------- | :---------- | :---------- |
-| Cluster | Single Node | Any |
-| vCPU/Storage | Up to 2 vCPU / 10 GB RAM | Any |
-| Regions | All | All |
-| Upgrades | Automatic | Automatic |
-| VPC Peering | No | Yes |
-| Fault Tolerance | None (Single node, RF -1) | Multi node RF-3 clusters with Availability zone and Node level |
-| Scaling | None | Horizontal and Vertical |
-| Backups | None | Scheduled and on-demand |
-| Support | Slack Community | Enterprise Support |
-
-### Can I migrate my Free cluster to a Paid cluster?
-
-Currently self-service migration is not supported. Contact [Yugabyte Support](https://support.yugabyte.com/hc/en-us/requests/new?ticket_form_id=360003113431) for help with migration.
-
 ### What regions in AWS and GCP are available?
 
 Refer to [Cloud provider regions](../release-notes#cloud-provider-regions) for a list currently supported regions.
 
-Yugabyte Cloud supports all the regions that have robust infrastructure and sufficient demand from customers. Regions where load balancers, certain VMs, or other resources are harder to obtain have not yet been added. We are continuously improving region coverage, so if there are any regions you would like us to support, reach out to [Yugabyte Support](https://support.yugabyte.com/hc/en-us/requests/new?ticket_form_id=360003113431).
+Yugabyte Cloud supports all the regions that have robust infrastructure and sufficient demand from customers. We are continuously improving region coverage, so if there are any regions you would like us to support, reach out to [Yugabyte Support](https://support.yugabyte.com/hc/en-us/requests/new?ticket_form_id=360003113431).
+
+### What are the differences between free and standard clusters?
+
+Use the free cluster to get started with YugabyteDB. The free cluster is limited to a single node and 10GB of storage, and although not suitable for production workloads, the cluster includes enough resources to start exploring the core features available for developing applications with YugabyteDB. Free clusters are provisioned with an edge release, typically from the YugabyteDB [latest release series](../../releases/whats-new/latest-release/); occasional edge releases will be a recent stable release. You can only have one free cluster.
+
+Standard clusters can have unlimited nodes and storage and are suitable for production workloads. They also support horizontal and vertical scaling - nodes and storage can be added or removed to suit your production loads. Standard clusters also support VPC peering, and scheduled and manual backups. By default, standard clusters are provisioned using a recent release from the YugabyteDB [stable release series](../../releases/whats-new/stable-release/).
+
+A Yugabyte Cloud account is limited to a single free cluster; you can add as many standard clusters as you need.
+
+| Feature | Free | Standard |
+| :----------- | :---------- | :---------- |
+| Cluster | Single Node | Any |
+| vCPU/Storage | Up to 2 vCPU / 2 GB RAM / 10 GB storage | Any |
+| Regions | All | All |
+| Upgrades | Automatic | Automatic |
+| VPC Peering | No | Yes |
+| Fault Tolerance | None (Single node, RF-1) | Multi node RF-3 clusters with Availability zone and Node level |
+| Scaling | None | Horizontal and Vertical |
+| Backups | None | Scheduled and on-demand |
+| YugabyteDB version | Edge | Stable |
+| Support | Slack Community | Enterprise Support |
+
+### What can I do if I run out of resources on my free cluster?
+
+If you want to continue testing YugabyteDB with more resource-intensive scenarios, you can:
+
+- Download and run YugabyteDB on a local machine. For instructions, refer to [Quick Start](../../quick-start).
+- Upgrade to a [standard cluster](../cloud-basics/create-clusters) to access bigger clusters with more resources.
+
+### Can I migrate my free cluster to a standard cluster?
+
+Currently self-service migration is not supported. Contact [Yugabyte Support](https://support.yugabyte.com/hc/en-us/requests/new?ticket_form_id=360003113431) for help with migration.
+
+## YugabyteDB
+
+### What version of YugabyteDB does my cluster run on?
+
+Free clusters are provisioned with an edge release, most often from the YugabyteDB [latest release](../../releases/whats-new/latest-release/) series; it may also be a recent stable release.
+
+By default, new standard clusters are provisioned with a release from the YugabyteDB [stable release](../../releases/whats-new/stable-release/) series. You can choose the edge track when you create the cluster.
+
+Once a cluster is created, it is upgraded with releases from the release track that was assigned at creation (that is, either edge or stable).
+
+To view the database version running on a particular cluster, navigate to the **Clusters** page; the database version is displayed next to the cluster name; hover over the version to see the release track.
+
+### Can I test YugabyteDB locally?
+
+To test locally, [download](https://download.yugabyte.com) and install YugabyteDB on a local machine. Refer to [Quick Start](../../quick-start). For accurate comparison with cloud, be sure to download the version that is running on Yugabyte Cloud.
 
 ## Support
 
 ### Is support included in the base price?
 
-Enterprise Support is included in the base price for paid clusters. Refer to the [Yugabyte Cloud Support Services Terms and Conditions](https://www.yugabyte.com/yugabyte-cloud-support-services-terms-and-conditions/).
+Enterprise Support is included in the base price for standard clusters. Refer to the [Yugabyte Cloud Support Services Terms and Conditions](https://www.yugabyte.com/yugabyte-cloud-support-services-terms-and-conditions/).
 
-Free and paid cluster customers can also use the [YugabyteDB Slack community](https://yugabyte-db.slack.com/).
+Free and standard cluster customers can also use the [YugabyteDB Slack community](https://www.yugabyte.com/slack).
 
 ### Where can I find the support policy and Service Level Agreement (SLA) for Yugabyte Cloud?
 
@@ -93,18 +117,18 @@ Your data is processed at the Yugabyte Cloud account level, and each cloud accou
 
 Yugabyte Cloud uses both encryption in transit and encryption at rest to protect clusters and cloud infrastructure, and provides DDoS and application layer protection, and automatically blocks network protocol and volumetric DDoS attacks.
 
-Yugabyte Cloud uses a shared responsibility model for cloud security. For more information on Yugabyte Cloud security, refer to [Cloud security](../cloud-security/).
+Yugabyte Cloud uses a shared responsibility model for cloud security. For more information on Yugabyte Cloud security, refer to [Security architecture](../cloud-security/).
 
 ## Cluster configuration and management
 
 ### What cluster configurations can I create?
 
-From the cloud console you can create single region clusters that can be deployed across multiple and single availability zones. 
+From the cloud console you can create single region clusters that can be deployed across multiple and single availability zones.
 
 The Fault Tolerance of a cluster determines how resilient the cluster is to node and cloud zone failues and, by extension, the cluster configuration. You can configure clusters with the following fault tolerances in Yugabyte Cloud:
 
 - **None** - single node, with no replication or resiliency. Recommended for development and testing only.
-- **Node Level** - a minimum of 3 nodes deployed in a single availability zone with a [replication factor](../../architecture/docdb-replication/replication/) (RF) of 3. YugabyteDB can continue to do reads and writes even in case of a node failure, but this configuration is not resilient to cloud availability zone outages. For horizontal scaling, you can scale nodes in increments of 1. 
+- **Node Level** - a minimum of 3 nodes deployed in a single availability zone with a [replication factor](../../architecture/docdb-replication/replication/) (RF) of 3. YugabyteDB can continue to do reads and writes even in case of a node failure, but this configuration is not resilient to cloud availability zone outages. For horizontal scaling, you can scale nodes in increments of 1.
 - **Availability Zone Level** - a minimum of 3 nodes spread across multiple availability zones with a RF of 3. YugabyteDB can continue to do reads and writes even in case of a cloud availability zone failure. This configuration provides the maximum protection for a data center failure. Recommended for production deployments. For horizontal scaling, nodes are scaled in increments of 3.
 
 Free clusters are limited to a single node in a single region.
@@ -115,9 +139,13 @@ For multi-region deployments, including [synchronous replication](../../explore/
 
 Upgrades are automatically handled by Yugabyte. There are two types of upgrades:
 
-- Cloud console - During a maintenance window, Yugabyte Cloud console may be in read-only mode and not allow any edit changes. The upgrade has no impact on running clusters. Customers will be notified in advance of the maintenance schedule.
+Cloud console
+: During a maintenance window, the Yugabyte Cloud console may be in read-only mode and not allow any edit changes. The upgrade has no impact on running clusters. Customers will be notified in advance of the maintenance schedule.
 
-- Cluster (yugabyteDB) version upgrade - To keep up with the latest bug fixes, improvements, and security fixes, Yugabyte will upgrade your cluster to the latest version. We will notify customers of any upcoming upgrade schedule via email and Slack. All database upgrades are done on a rolling basis to avoid any downtime. 
+Cluster (yugabyteDB) version upgrade
+: To keep up with the latest bug fixes, improvements, and security fixes, Yugabyte will upgrade your cluster to the latest version. We will notify you of any upcoming upgrade schedule via email.
+: The database is upgraded to the latest release in the release track that was selected when the cluster was created (either edge or stable). Free clusters are always in the edge track.
+: Database upgrades of high-availability (multi-node) clusters are done on a rolling basis to avoid any downtime.
 
 ### How do I connect to my cluster?
 
@@ -129,9 +157,9 @@ Cloud Shell
 Client Shell
 : Connect to your YugabyteDB cluster using the YugabyteDB [ysqlsh](../../admin/ysqlsh) and [ycqlsh](../../admin/ycqlsh) client shells installed on your computer.
 
-: Before you can connect using a client shell, you need to have an IP allow list or VPC peer set up. Refer to [Assign IP Allow Lists](../cloud-basics/add-connections/).
+: Before you can connect using a client shell, you need to add your computer to the cluster IP allow list. Refer to [Assign IP Allow Lists](../cloud-secure-clusters/add-connections/).
 
-: You must be running the latest versions of the client shells. These are available in Yugabyte Client 2.6 or later, which you can download using the following command on Linux or macOS:
+: You must be running the latest versions of the client shells (Yugabyte Client 2.6 or later), which you can download using the following command on Linux or macOS:
 
     ```sh
     $ curl -sSL https://downloads.yugabyte.com/get_clients.sh | bash
@@ -143,28 +171,38 @@ Client Shell
     docker run -it yugabytedb/yugabyte-client ysqlsh -h <hostname> -p <port>
     ```
 
-: Please check [cloud.yugabyte.com](https://cloud.yugabyte.com/) to see the latest version.
+psql
+: Because YugabyteDB is PostgreSQL-compatible, you can use [psql](https://www.postgresql.org/docs/current/app-psql.html) to connect to your clusters. The connection string to use is similar to what you would use for `ysqlsh`, as follows:
+
+    ```sh
+    psql --host=<HOST_ADDRESS> --port=5433 --username=<DB USER> \
+    --dbname=yugabyte \
+    --set=sslmode=verify-full \
+    --set=sslrootcert=<ROOT_CERT_PATH>
+    ```
+
+: For detailed steps for configuring other popular third party tools, see [Third party tools](../../tools/).
 
 Applications
 : Applications connect to and interact with YugabyteDB using API client libraries, also called client drivers. Before you can connect an application, you need to install the correct driver. Clusters have SSL (encryption in-transit) enabled so make sure your driver details include SSL parameters. For information on available drivers, refer to [Build an application](../../quick-start/build-apps).
 
-: Before you can connect, your application has to be able to reach your Yugabyte Cloud. To add inbound network access from your application environment to Yugabyte Cloud, add the public IP addresses to the [cluster IP access list](../cloud-basics/add-connections), or use [VPC peering](../cloud-network/vpc-peers) to add private IP addresses.
+: Before you can connect, your application has to be able to reach your Yugabyte Cloud. To add inbound network access from your application environment to Yugabyte Cloud, add the public IP addresses to the [cluster IP access list](../cloud-secure-clusters/add-connections/), or use [VPC peering](../cloud-secure-clusters/cloud-vpcs/) to add private IP addresses.
 
-For more details, refer to [Connect to clusters](../cloud-basics/connect-to-clusters). 
+For more details, refer to [Connect to clusters](../cloud-connect).
 
 ## Backups
 
 ### How are clusters backed up?
 
-Currently, Yugabyte Cloud does not support backups of free clusters.
-
-By default, every paid cluster is backed up automatically every 24 hours, and these automatic backups are retained for 8 days. The first automatic backup is triggered 24 hours after creating a table, and is scheduled every 24 hours thereafter. You can change the default backup intervals by adjusting the backup policy settings.
+By default, every cluster is backed up automatically every 24 hours, and these automatic backups are retained for 8 days. The first automatic backup is triggered 24 hours after creating a table, and is scheduled every 24 hours thereafter. You can change the default backup intervals by adjusting the backup policy settings.
 
 Yugabyte Cloud runs full backups, not incremental.
 
 Backups are retained in the same region as the cluster.
 
 Backups for AWS clusters are encrypted using AWS S3’s server-side encryption and backups for GCP clusters are encrypted using Google-managed server-side encryption keys.
+
+Currently, Yugabyte Cloud does not support backups of free clusters.
 
 ### Can I download backups?
 

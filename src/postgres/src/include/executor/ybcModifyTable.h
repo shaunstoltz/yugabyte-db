@@ -26,8 +26,24 @@
 #include "nodes/execnodes.h"
 #include "executor/tuptable.h"
 
+/**
+ * YSQL guc variables that can be used to enable non transactional writes.
+ * e.g. 'SET yb_disable_transactional_writes=true'
+ * See also the corresponding entries in guc.c.
+ */
+extern bool yb_disable_transactional_writes;
+
 //------------------------------------------------------------------------------
 // YugaByte modify table API.
+
+typedef void (*yb_bind_for_write_function) (YBCPgStatement stmt,
+											void *indexstate,
+											Relation index,
+											Datum *values,
+											bool *isnull,
+											int natts,
+											Datum ybbasectid,
+											bool ybctid_as_value);
 
 /*
  * Insert data into YugaByte table.
@@ -72,32 +88,41 @@ extern void YBCExecuteInsertIndex(Relation rel,
 								  Datum *values,
 								  bool *isnull,
 								  Datum ybctid,
-								  const uint64_t* backfill_write_time);
+								  const uint64_t* backfill_write_time,
+								  yb_bind_for_write_function callback,
+								  void *indexstate);
 extern void YBCExecuteInsertIndexForDb(Oid dboid,
 									   Relation rel,
 									   Datum* values,
 									   bool* isnull,
 									   Datum ybctid,
-									   const uint64_t* backfill_write_time);
+									   const uint64_t* backfill_write_time,
+									   yb_bind_for_write_function callback,
+									   void *indexstate);
 
 /*
  * Delete a tuple (identified by ybctid) from a YugaByte table.
  * If this is a single row op we will return false in the case that there was
  * no row to delete. This can occur because we do not first perform a scan if
- * it is a single row op.
+ * it is a single row op. 'changingPart' indicates if this delete is part of an
+ * UPDATE operation on a partitioned table that moves a row from one partition
+ * to anoter.
  */
 extern bool YBCExecuteDelete(Relation rel,
 							 TupleTableSlot *slot,
 							 EState *estate,
-							 ModifyTableState *mtstate);
+							 ModifyTableState *mtstate,
+							 bool changingPart);
 /*
  * Delete a tuple (identified by index columns and base table ybctid) from an
  * index's backing YugaByte index table.
  */
 extern void YBCExecuteDeleteIndex(Relation index,
-                                  Datum *values,
-                                  bool *isnull,
-                                  Datum ybctid);
+								  Datum *values,
+								  bool *isnull,
+								  Datum ybctid,
+								  yb_bind_for_write_function callback,
+								  void *indexstate);
 
 /*
  * Update a row (identified by ybctid) in a YugaByte table.

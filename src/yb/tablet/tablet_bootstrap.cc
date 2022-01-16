@@ -29,24 +29,43 @@
 // or implied.  See the License for the specific language governing permissions and limitations
 // under the License.
 //
+
 #include "yb/tablet/tablet_bootstrap.h"
+
+#include <map>
+#include <set>
+
+#include <boost/preprocessor/cat.hpp>
+#include <boost/preprocessor/stringize.hpp>
+
+#include "yb/common/common_fwd.h"
+#include "yb/common/schema.h"
+#include "yb/common/wire_protocol.h"
 
 #include "yb/consensus/consensus.h"
 #include "yb/consensus/consensus.pb.h"
+#include "yb/consensus/consensus_meta.h"
 #include "yb/consensus/consensus_util.h"
 #include "yb/consensus/log.h"
 #include "yb/consensus/log_anchor_registry.h"
+#include "yb/consensus/log_index.h"
 #include "yb/consensus/log_reader.h"
 #include "yb/consensus/log_util.h"
+#include "yb/consensus/opid_util.h"
 #include "yb/consensus/retryable_requests.h"
 
-#include "yb/server/hybrid_clock.h"
-#include "yb/tablet/snapshot_coordinator.h"
+#include "yb/docdb/consensus_frontier.h"
+#include "yb/docdb/value_type.h"
+
+#include "yb/gutil/casts.h"
+#include "yb/gutil/ref_counted.h"
+#include "yb/gutil/strings/substitute.h"
+#include "yb/gutil/thread_annotations.h"
+
+#include "yb/rpc/rpc_fwd.h"
+
 #include "yb/tablet/tablet_fwd.h"
-#include "yb/tablet/tablet_snapshots.h"
-#include "yb/tablet/tablet.h"
-#include "yb/tablet/tablet_peer.h"
-#include "yb/tablet/tablet_splitter.h"
+#include "yb/tablet/mvcc.h"
 #include "yb/tablet/operations/change_metadata_operation.h"
 #include "yb/tablet/operations/history_cutoff_operation.h"
 #include "yb/tablet/operations/snapshot_operation.h"
@@ -54,17 +73,30 @@
 #include "yb/tablet/operations/truncate_operation.h"
 #include "yb/tablet/operations/update_txn_operation.h"
 #include "yb/tablet/operations/write_operation.h"
+#include "yb/tablet/snapshot_coordinator.h"
+#include "yb/tablet/tablet.h"
+#include "yb/tablet/tablet_metadata.h"
+#include "yb/tablet/tablet_options.h"
+#include "yb/tablet/tablet_snapshots.h"
+#include "yb/tablet/tablet_splitter.h"
+#include "yb/tablet/transaction_coordinator.h"
+#include "yb/tablet/transaction_participant.h"
+
+#include "yb/tserver/backup.pb.h"
+
+#include "yb/util/atomic.h"
+#include "yb/util/env_util.h"
 #include "yb/util/fault_injection.h"
 #include "yb/util/flag_tags.h"
-#include "yb/util/opid.h"
+#include "yb/util/format.h"
 #include "yb/util/logging.h"
+#include "yb/util/metric_entity.h"
+#include "yb/util/monotime.h"
+#include "yb/util/opid.h"
 #include "yb/util/scope_exit.h"
 #include "yb/util/status.h"
+#include "yb/util/status_format.h"
 #include "yb/util/stopwatch.h"
-#include "yb/util/env_util.h"
-#include "yb/consensus/log_index.h"
-#include "yb/docdb/consensus_frontier.h"
-#include "yb/tserver/backup.pb.h"
 
 DEFINE_bool(skip_remove_old_recovery_dir, false,
             "Skip removing WAL recovery dir after startup. (useful for debugging)");
@@ -124,14 +156,12 @@ using consensus::OpIdToString;
 using consensus::ReplicateMsg;
 using consensus::MakeOpIdPB;
 using strings::Substitute;
-using tserver::ChangeMetadataRequestPB;
-using tserver::TruncateRequestPB;
 using tserver::WriteRequestPB;
 using tserver::TabletSnapshotOpRequestPB;
 
 static string DebugInfo(const string& tablet_id,
-                        int segment_seqno,
-                        int entry_idx,
+                        uint64_t segment_seqno,
+                        size_t entry_idx,
                         const string& segment_path,
                         const LogEntryPB* entry) {
   // Truncate the debug string to a reasonable length for logging.  Otherwise, glog will truncate
@@ -360,6 +390,10 @@ struct ReplayDecision {
   // This is true for transaction update operations that have already been applied to the regular
   // RocksDB but not to the intents RocksDB.
   AlreadyAppliedToRegularDB already_applied_to_regular_db = AlreadyAppliedToRegularDB::kFalse;
+
+  std::string ToString() const {
+    return YB_STRUCT_TO_STRING(should_replay, already_applied_to_regular_db);
+  }
 };
 
 ReplayDecision ShouldReplayOperation(
@@ -374,6 +408,9 @@ ReplayDecision ShouldReplayOperation(
   if (index <= std::min(regular_flushed_index, intents_flushed_index)) {
     // Never replay anyting that is flushed to both regular and intents RocksDBs in a transactional
     // table.
+    VLOG_WITH_FUNC(3) << "index: " << index << " "
+                      << "regular_flushed_index: " << regular_flushed_index
+                      << " intents_flushed_index: " << intents_flushed_index;
     return {false};
   }
 
@@ -381,26 +418,35 @@ ReplayDecision ShouldReplayOperation(
     if (txn_status == TransactionStatus::APPLYING &&
         intents_flushed_index < index && index <= regular_flushed_index) {
       // Intents were applied/flushed to regular RocksDB, but not flushed into the intents RocksDB.
+      VLOG_WITH_FUNC(3) << "index: " << index << " "
+                        << "regular_flushed_index: " << regular_flushed_index
+                        << " intents_flushed_index: " << intents_flushed_index;
       return {true, AlreadyAppliedToRegularDB::kTrue};
     }
     // For other types of transaction updates, we ignore them if they have been flushed to the
     // regular RocksDB.
+    VLOG_WITH_FUNC(3) << "index: " << index << " > "
+                      << "regular_flushed_index: " << regular_flushed_index;
     return {index > regular_flushed_index};
   }
 
   if (op_type == consensus::WRITE_OP && write_op_has_transaction) {
     // Write intents that have not been flushed into the intents DB.
+    VLOG_WITH_FUNC(3) << "index: " << index << " > "
+                      << "intents_flushed_index: " << intents_flushed_index;
     return {index > intents_flushed_index};
   }
 
+  VLOG_WITH_FUNC(3) << "index: " << index << " > "
+                    << "regular_flushed_index: " << regular_flushed_index;
   return {index > regular_flushed_index};
 }
 
 bool WriteOpHasTransaction(const ReplicateMsg& replicate) {
-  if (!replicate.has_write_request()) {
+  if (!replicate.has_write()) {
     return false;
   }
-  const auto& write_request = replicate.write_request();
+  const auto& write_request = replicate.write();
   if (!write_request.has_write_batch()) {
     return false;
   }
@@ -679,9 +725,8 @@ class TabletBootstrap {
         LogReader::Open(
             GetEnv(),
             index,
-            tablet_->metadata()->raft_group_id(),
+            LogPrefix(),
             wal_path,
-            tablet_->metadata()->fs_manager()->uuid(),
             tablet_->GetTableMetricsEntity().get(),
             tablet_->GetTabletMetricsEntity().get(),
             &log_reader_),
@@ -777,7 +822,7 @@ class TabletBootstrap {
   //     encountering an entry with an index lower than or equal to the index of an operation that
   //     is already present in pending_replicates.
   //   - Ignores entries that have already been flushed into regular and intents RocksDBs.
-  //   - Updates committed OpId based on the commmited OpId from the entry and calls
+  //   - Updates committed OpId based on the comsmited OpId from the entry and calls
   //     ApplyCommittedPendingReplicates.
   //   - Updates the "monotonic counter" used for assigning internal keys in YCQL arrays.
   CHECKED_STATUS HandleReplicateMessage(
@@ -910,7 +955,7 @@ class TabletBootstrap {
   }
 
   CHECKED_STATUS PlaySplitOpRequest(ReplicateMsg* replicate_msg) {
-    tserver::SplitTabletRequestPB* const split_request = replicate_msg->mutable_split_request();
+    SplitTabletRequestPB* const split_request = replicate_msg->mutable_split_request();
     // We might be asked to replay SPLIT_OP even if it was applied and flushed when
     // FLAGS_force_recover_flushed_frontier is set.
     if (split_request->tablet_id() != tablet_->tablet_id()) {
@@ -920,6 +965,7 @@ class TabletBootstrap {
 
     if (tablet_->metadata()->tablet_data_state() == TabletDataState::TABLET_DATA_SPLIT_COMPLETED) {
       // Ignore SPLIT_OP if tablet has been already split.
+      VLOG_WITH_PREFIX_AND_FUNC(1) << "Tablet has been already split.";
       return Status::OK();
     }
 
@@ -938,7 +984,7 @@ class TabletBootstrap {
 
   void HandleRetryableRequest(
       const ReplicateMsg& replicate, RestartSafeCoarseTimePoint entry_time) {
-    if (!replicate.has_write_request())
+    if (!replicate.has_write())
       return;
 
     if (data_.retryable_requests) {
@@ -971,7 +1017,7 @@ class TabletBootstrap {
         WriteOpHasTransaction(*replicate));
 
     HandleRetryableRequest(*replicate, entry_time);
-
+    VLOG_WITH_PREFIX_AND_FUNC(3) << "decision: " << AsString(decision);
     if (decision.should_replay) {
       const auto status = PlayAnyRequest(replicate, decision.already_applied_to_regular_db);
       if (!status.ok()) {
@@ -1321,12 +1367,11 @@ class TabletBootstrap {
     SCHECK(replicate_msg->has_hybrid_time(), IllegalState,
            "A write operation with no hybrid time");
 
-    WriteRequestPB* write = replicate_msg->mutable_write_request();
+    auto* write = replicate_msg->mutable_write();
 
     SCHECK(write->has_write_batch(), Corruption, "A write request must have a write batch");
 
-    WriteOperation operation(OpId::kUnknownTerm, CoarseTimePoint::max(), /* context */ nullptr);
-    *operation.AllocateRequest() = *write;
+    WriteOperation operation(tablet_.get(), write);
     operation.set_op_id(OpId::FromPB(replicate_msg->id()));
     HybridTime hybrid_time(replicate_msg->hybrid_time());
     operation.set_hybrid_time(hybrid_time);
@@ -1335,9 +1380,9 @@ class TabletBootstrap {
     tablet_->mvcc_manager()->AddFollowerPending(hybrid_time, op_id);
 
     if (test_hooks_ &&
-        replicate_msg->has_write_request() &&
-        replicate_msg->write_request().has_write_batch() &&
-        replicate_msg->write_request().write_batch().has_transaction() &&
+        replicate_msg->has_write() &&
+        replicate_msg->write().has_write_batch() &&
+        replicate_msg->write().write_batch().has_transaction() &&
         test_hooks_->ShouldSkipWritingIntents()) {
       // Used in unit tests to avoid instantiating the entire transactional subsystem.
       tablet_->mvcc_manager()->Replicated(hybrid_time, op_id);
@@ -1423,7 +1468,7 @@ class TabletBootstrap {
   }
 
   CHECKED_STATUS PlayTruncateRequest(ReplicateMsg* replicate_msg) {
-    TruncateRequestPB* req = replicate_msg->mutable_truncate_request();
+    auto* req = replicate_msg->mutable_truncate();
 
     TruncateOperation operation(tablet_.get(), req);
 

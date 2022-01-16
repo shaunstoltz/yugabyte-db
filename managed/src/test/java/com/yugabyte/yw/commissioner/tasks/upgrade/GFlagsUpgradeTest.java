@@ -4,6 +4,8 @@ package com.yugabyte.yw.commissioner.tasks.upgrade;
 
 import static com.yugabyte.yw.commissioner.tasks.UniverseDefinitionTaskBase.ServerType.MASTER;
 import static com.yugabyte.yw.commissioner.tasks.UniverseDefinitionTaskBase.ServerType.TSERVER;
+import static com.yugabyte.yw.models.TaskInfo.State.Failure;
+import static com.yugabyte.yw.models.TaskInfo.State.Success;
 import static org.junit.Assert.assertEquals;
 import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.Mockito.times;
@@ -40,7 +42,7 @@ public class GFlagsUpgradeTest extends UpgradeTaskTest {
 
   @InjectMocks GFlagsUpgrade gFlagsUpgrade;
 
-  List<TaskType> ROLLING_UPGRADE_TASK_SEQUENCE =
+  private static final List<TaskType> ROLLING_UPGRADE_TASK_SEQUENCE =
       ImmutableList.of(
           TaskType.SetNodeState,
           TaskType.AnsibleConfigureServers,
@@ -49,9 +51,10 @@ public class GFlagsUpgradeTest extends UpgradeTaskTest {
           TaskType.WaitForServer,
           TaskType.WaitForServerReady,
           TaskType.WaitForEncryptionKeyInMemory,
+          TaskType.WaitForFollowerLag,
           TaskType.SetNodeState);
 
-  List<TaskType> NON_ROLLING_UPGRADE_TASK_SEQUENCE =
+  private static final List<TaskType> NON_ROLLING_UPGRADE_TASK_SEQUENCE =
       ImmutableList.of(
           TaskType.SetNodeState,
           TaskType.AnsibleConfigureServers,
@@ -60,13 +63,14 @@ public class GFlagsUpgradeTest extends UpgradeTaskTest {
           TaskType.SetNodeState,
           TaskType.WaitForServer);
 
-  List<TaskType> NON_RESTART_UPGRADE_TASK_SEQUENCE =
+  private static final List<TaskType> NON_RESTART_UPGRADE_TASK_SEQUENCE =
       ImmutableList.of(
           TaskType.SetNodeState,
           TaskType.AnsibleConfigureServers,
           TaskType.SetFlagInMemory,
           TaskType.SetNodeState);
 
+  @Override
   @Before
   public void setUp() {
     super.setUp();
@@ -233,6 +237,7 @@ public class GFlagsUpgradeTest extends UpgradeTaskTest {
     taskParams.upgradeOption = UpgradeOption.NON_ROLLING_UPGRADE;
 
     TaskInfo taskInfo = submitTask(taskParams);
+    assertEquals(Success, taskInfo.getTaskState());
     verify(mockNodeManager, times(18)).nodeCommand(any(), any());
 
     List<TaskInfo> subTasks = taskInfo.getSubTasks();
@@ -255,6 +260,7 @@ public class GFlagsUpgradeTest extends UpgradeTaskTest {
     taskParams.upgradeOption = UpgradeOption.NON_ROLLING_UPGRADE;
 
     TaskInfo taskInfo = submitTask(taskParams);
+    assertEquals(Success, taskInfo.getTaskState());
     verify(mockNodeManager, times(9)).nodeCommand(any(), any());
 
     List<TaskInfo> subTasks = taskInfo.getSubTasks();
@@ -276,6 +282,7 @@ public class GFlagsUpgradeTest extends UpgradeTaskTest {
     taskParams.upgradeOption = UpgradeOption.NON_ROLLING_UPGRADE;
 
     TaskInfo taskInfo = submitTask(taskParams);
+    assertEquals(Success, taskInfo.getTaskState());
     verify(mockNodeManager, times(9)).nodeCommand(any(), any());
 
     List<TaskInfo> subTasks = taskInfo.getSubTasks();
@@ -296,6 +303,7 @@ public class GFlagsUpgradeTest extends UpgradeTaskTest {
     GFlagsUpgradeParams taskParams = new GFlagsUpgradeParams();
     taskParams.masterGFlags = ImmutableMap.of("master-flag", "m1");
     TaskInfo taskInfo = submitTask(taskParams);
+    assertEquals(Success, taskInfo.getTaskState());
     verify(mockNodeManager, times(9)).nodeCommand(any(), any());
 
     List<TaskInfo> subTasks = taskInfo.getSubTasks();
@@ -307,7 +315,7 @@ public class GFlagsUpgradeTest extends UpgradeTaskTest {
     position =
         assertCommonTasks(
             subTasksByPosition, position, UpgradeType.ROLLING_UPGRADE_MASTER_ONLY, true);
-    assertEquals(26, position);
+    assertEquals(29, position);
   }
 
   @Test
@@ -315,6 +323,7 @@ public class GFlagsUpgradeTest extends UpgradeTaskTest {
     GFlagsUpgradeParams taskParams = new GFlagsUpgradeParams();
     taskParams.tserverGFlags = ImmutableMap.of("tserver-flag", "t1");
     TaskInfo taskInfo = submitTask(taskParams);
+    assertEquals(Success, taskInfo.getTaskState());
     ArgumentCaptor<NodeTaskParams> commandParams = ArgumentCaptor.forClass(NodeTaskParams.class);
     verify(mockNodeManager, times(9)).nodeCommand(any(), commandParams.capture());
     List<TaskInfo> subTasks = taskInfo.getSubTasks();
@@ -327,7 +336,7 @@ public class GFlagsUpgradeTest extends UpgradeTaskTest {
     position =
         assertCommonTasks(
             subTasksByPosition, position, UpgradeType.ROLLING_UPGRADE_TSERVER_ONLY, true);
-    assertEquals(28, position);
+    assertEquals(31, position);
   }
 
   @Test
@@ -336,6 +345,7 @@ public class GFlagsUpgradeTest extends UpgradeTaskTest {
     taskParams.masterGFlags = ImmutableMap.of("master-flag", "m1");
     taskParams.tserverGFlags = ImmutableMap.of("tserver-flag", "t1");
     TaskInfo taskInfo = submitTask(taskParams);
+    assertEquals(Success, taskInfo.getTaskState());
     verify(mockNodeManager, times(18)).nodeCommand(any(), any());
     List<TaskInfo> subTasks = taskInfo.getSubTasks();
     Map<Integer, List<TaskInfo>> subTasksByPosition =
@@ -346,7 +356,7 @@ public class GFlagsUpgradeTest extends UpgradeTaskTest {
     position = assertCommonTasks(subTasksByPosition, position, UpgradeType.ROLLING_UPGRADE, false);
     position = assertSequence(subTasksByPosition, TSERVER, position, UpgradeOption.ROLLING_UPGRADE);
     position = assertCommonTasks(subTasksByPosition, position, UpgradeType.ROLLING_UPGRADE, true);
-    assertEquals(52, position);
+    assertEquals(58, position);
   }
 
   @Test
@@ -354,7 +364,7 @@ public class GFlagsUpgradeTest extends UpgradeTaskTest {
     GFlagsUpgradeParams taskParams = new GFlagsUpgradeParams();
     TaskInfo taskInfo = submitTask(taskParams);
     verify(mockNodeManager, times(0)).nodeCommand(any(), any());
-    assertEquals(TaskInfo.State.Failure, taskInfo.getTaskState());
+    assertEquals(Failure, taskInfo.getTaskState());
     defaultUniverse.refresh();
     assertEquals(2, defaultUniverse.version);
     // In case of an exception, no task should be queued.
@@ -382,6 +392,7 @@ public class GFlagsUpgradeTest extends UpgradeTaskTest {
     taskParams.tserverGFlags = ImmutableMap.of("tserver-flag", "t2");
 
     TaskInfo taskInfo = submitTask(taskParams, 3);
+    assertEquals(Success, taskInfo.getTaskState());
     verify(mockNodeManager, times(9)).nodeCommand(any(), any());
     List<TaskInfo> subTasks = taskInfo.getSubTasks();
     Map<Integer, List<TaskInfo>> subTasksByPosition =
@@ -394,7 +405,7 @@ public class GFlagsUpgradeTest extends UpgradeTaskTest {
     position =
         assertCommonTasks(
             subTasksByPosition, position, UpgradeType.ROLLING_UPGRADE_TSERVER_ONLY, true);
-    assertEquals(28, position);
+    assertEquals(31, position);
   }
 
   @Test
@@ -418,6 +429,7 @@ public class GFlagsUpgradeTest extends UpgradeTaskTest {
     taskParams.tserverGFlags = tserverFlags;
 
     TaskInfo taskInfo = submitTask(taskParams, 3);
+    assertEquals(Success, taskInfo.getTaskState());
     verify(mockNodeManager, times(9)).nodeCommand(any(), any());
     List<TaskInfo> subTasks = taskInfo.getSubTasks();
     Map<Integer, List<TaskInfo>> subTasksByPosition =
@@ -428,7 +440,7 @@ public class GFlagsUpgradeTest extends UpgradeTaskTest {
     position =
         assertCommonTasks(
             subTasksByPosition, position, UpgradeType.ROLLING_UPGRADE_MASTER_ONLY, true);
-    assertEquals(26, position);
+    assertEquals(29, position);
   }
 
   @Test
@@ -459,6 +471,7 @@ public class GFlagsUpgradeTest extends UpgradeTaskTest {
 
       int expectedVersion = serverType == MASTER ? 3 : 4;
       TaskInfo taskInfo = submitTask(taskParams, expectedVersion);
+      assertEquals(Success, taskInfo.getTaskState());
 
       int numInvocations = serverType == MASTER ? 9 : 18;
       verify(mockNodeManager, times(numInvocations)).nodeCommand(any(), any());
@@ -481,7 +494,7 @@ public class GFlagsUpgradeTest extends UpgradeTaskTest {
                   ? UpgradeType.ROLLING_UPGRADE_MASTER_ONLY
                   : UpgradeType.ROLLING_UPGRADE_TSERVER_ONLY,
               true);
-      assertEquals(serverType == MASTER ? 26 : 28, position);
+      assertEquals(serverType == MASTER ? 29 : 31, position);
     }
   }
 }

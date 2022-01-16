@@ -29,24 +29,21 @@
 // or implied.  See the License for the specific language governing permissions and limitations
 // under the License.
 //
-
 #include "yb/util/rolling_log.h"
 
-#include <unistd.h>
-#include <sys/types.h>
 #include <zlib.h>
 
 #include <iomanip>
-#include <ostream>
 #include <string>
 
+#include "yb/gutil/casts.h"
 #include "yb/gutil/strings/numbers.h"
-#include "yb/gutil/strings/substitute.h"
 #include "yb/gutil/walltime.h"
 #include "yb/util/env.h"
 #include "yb/util/net/net_util.h"
 #include "yb/util/path_util.h"
-#include "yb/util/thread_restrictions.h"
+#include "yb/util/result.h"
+#include "yb/util/status_log.h"
 #include "yb/util/user.h"
 
 using std::ostringstream;
@@ -247,7 +244,7 @@ Status RollingLog::CompressFile(const std::string& path) const {
     if (result.size() == 0) {
       break;
     }
-    int n = gzwrite(gzf, result.data(), result.size());
+    int n = gzwrite(gzf, result.data(), narrow_cast<unsigned>(result.size()));
     if (n == 0) {
       int errnum;
       return STATUS(IOError, "Unable to write to gzip output",

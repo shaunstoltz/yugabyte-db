@@ -13,6 +13,7 @@ package com.yugabyte.yw.common.kms.util;
 import com.amazonaws.auth.AWSCredentials;
 import com.amazonaws.auth.AWSStaticCredentialsProvider;
 import com.amazonaws.auth.BasicAWSCredentials;
+import com.amazonaws.client.builder.AwsClientBuilder.EndpointConfiguration;
 import com.amazonaws.services.identitymanagement.AmazonIdentityManagement;
 import com.amazonaws.services.identitymanagement.AmazonIdentityManagementClientBuilder;
 import com.amazonaws.services.identitymanagement.model.GetRoleRequest;
@@ -54,13 +55,6 @@ public class AwsEARServiceUtil {
 
   private static final Logger LOG = LoggerFactory.getLogger(AwsEARServiceUtil.class);
 
-  public enum KeyType {
-    @EnumValue("CMK")
-    CMK,
-    @EnumValue("DATA_KEY")
-    DATA_KEY;
-  }
-
   private enum CredentialType {
     @EnumValue("KMS_CONFIG")
     KMS_CONFIG,
@@ -82,6 +76,13 @@ public class AwsEARServiceUtil {
 
   public static AWSKMS getKMSClient(UUID configUUID) {
     ObjectNode authConfig = EncryptionAtRestUtil.getAuthConfig(configUUID, KeyProvider.AWS);
+    return getKMSClient(configUUID, authConfig);
+  }
+
+  public static AWSKMS getKMSClient(UUID configUUID, ObjectNode authConfig) {
+    if (authConfig == null) {
+      authConfig = EncryptionAtRestUtil.getAuthConfig(configUUID, KeyProvider.AWS);
+    }
 
     AWSCredentials awsCredentials = getCredentials(authConfig);
 
@@ -89,9 +90,21 @@ public class AwsEARServiceUtil {
 
       return AWSKMSClientBuilder.defaultClient();
     }
+
+    if (authConfig.path("AWS_KMS_ENDPOINT").isMissingNode()
+        || StringUtils.isBlank(authConfig.path("AWS_KMS_ENDPOINT").asText())) {
+      return AWSKMSClientBuilder.standard()
+          .withCredentials(new AWSStaticCredentialsProvider(awsCredentials))
+          .withRegion(authConfig.get("AWS_REGION").asText())
+          .build();
+    }
+
     return AWSKMSClientBuilder.standard()
         .withCredentials(new AWSStaticCredentialsProvider(awsCredentials))
-        .withRegion(authConfig.get("AWS_REGION").asText())
+        .withEndpointConfiguration(
+            new EndpointConfiguration(
+                authConfig.path("AWS_KMS_ENDPOINT").asText(),
+                authConfig.get("AWS_REGION").asText()))
         .build();
   }
 
@@ -244,13 +257,14 @@ public class AwsEARServiceUtil {
     return cmk;
   }
 
-  public static byte[] decryptUniverseKey(UUID configUUID, byte[] encryptedUniverseKey) {
+  public static byte[] decryptUniverseKey(
+      UUID configUUID, byte[] encryptedUniverseKey, ObjectNode config) {
     if (encryptedUniverseKey == null) return null;
     ByteBuffer encryptedKeyBuffer = ByteBuffer.wrap(encryptedUniverseKey);
     encryptedKeyBuffer.rewind();
     final DecryptRequest req = new DecryptRequest().withCiphertextBlob(encryptedKeyBuffer);
     ByteBuffer decryptedKeyBuffer =
-        AwsEARServiceUtil.getKMSClient(configUUID).decrypt(req).getPlaintext();
+        AwsEARServiceUtil.getKMSClient(configUUID, config).decrypt(req).getPlaintext();
     decryptedKeyBuffer.rewind();
     byte[] decryptedUniverseKey = new byte[decryptedKeyBuffer.remaining()];
     decryptedKeyBuffer.get(decryptedUniverseKey);

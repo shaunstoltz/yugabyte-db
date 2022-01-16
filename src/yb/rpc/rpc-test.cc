@@ -42,19 +42,18 @@
 #include <boost/ptr_container/ptr_vector.hpp>
 
 #include <gtest/gtest.h>
-#include <gtest/gtest-param-test.h>
 
 #if defined(TCMALLOC_ENABLED)
 #include <gperftools/heap-profiler.h>
 #endif
 
-#include <lz4.h>
 
 #include "yb/gutil/map-util.h"
 #include "yb/gutil/strings/human_readable.h"
-#include "yb/gutil/strings/join.h"
 
 #include "yb/rpc/compressed_stream.h"
+#include "yb/rpc/proxy.h"
+#include "yb/rpc/rpc_controller.h"
 #include "yb/rpc/secure_stream.h"
 #include "yb/rpc/serialization.h"
 #include "yb/rpc/tcp_stream.h"
@@ -62,8 +61,16 @@
 
 #include "yb/util/countdown_latch.h"
 #include "yb/util/env.h"
+#include "yb/util/format.h"
 #include "yb/util/logging_test_util.h"
+#include "yb/util/net/net_util.h"
+#include "yb/util/result.h"
+#include "yb/util/status_format.h"
+#include "yb/util/status_log.h"
+#include "yb/util/test_macros.h"
 #include "yb/util/test_util.h"
+#include "yb/util/tsan_util.h"
+#include "yb/util/thread.h"
 
 #include "yb/util/memory/memory_usage_test_util.h"
 
@@ -123,16 +130,16 @@ class TestRpc : public RpcTestBase {
   void CheckServerMessengerConnections(size_t num_connections) {
     ReactorMetrics metrics;
     ASSERT_OK(server_messenger()->TEST_GetReactorMetrics(0, &metrics));
-    ASSERT_EQ(metrics.num_server_connections_, num_connections)
+    ASSERT_EQ(metrics.num_server_connections, num_connections)
         << "Server should have " << num_connections << " server connection(s)";
-    ASSERT_EQ(metrics.num_client_connections_, 0) << "Server should have 0 client connections";
+    ASSERT_EQ(metrics.num_client_connections, 0) << "Server should have 0 client connections";
   }
 
   void CheckClientMessengerConnections(Messenger* messenger, size_t num_connections) {
     ReactorMetrics metrics;
     ASSERT_OK(messenger->TEST_GetReactorMetrics(0, &metrics));
-    ASSERT_EQ(metrics.num_server_connections_, 0) << "Client should have 0 server connections";
-    ASSERT_EQ(metrics.num_client_connections_, num_connections)
+    ASSERT_EQ(metrics.num_server_connections, 0) << "Client should have 0 server connections";
+    ASSERT_EQ(metrics.num_client_connections, num_connections)
         << "Client should have " << num_connections << " client connection(s)";
   }
 
@@ -281,7 +288,7 @@ TEST_F(TestRpc, TestInvalidMethodCall) {
       rpc_test::CalculatorServiceIf::static_service_name(), "ThisMethodDoesNotExist");
   Status s = DoTestSyncCall(&p, &method);
   ASSERT_TRUE(s.IsRemoteError()) << "unexpected status: " << s.ToString();
-  ASSERT_STR_CONTAINS(s.ToString(), "bad method");
+  ASSERT_STR_CONTAINS(s.ToString(), "invalid method name");
 }
 
 // Test that the error message returned when connecting to the wrong service
@@ -502,9 +509,8 @@ static void AcceptAndReadForever(Socket* listen_sock) {
   MonoTime deadline = MonoTime::Now();
   deadline.AddDelta(MonoDelta::FromSeconds(10));
 
-  size_t nread;
   uint8_t buf[1024];
-  while (server_sock.BlockingRecv(buf, sizeof(buf), &nread, deadline).ok()) {
+  while (server_sock.BlockingRecv(buf, sizeof(buf), deadline).ok()) {
   }
 }
 
@@ -767,7 +773,7 @@ TEST_F(TestRpc, QueueTimeout) {
   for (int i = 0; i != kCalls; ++i) {
     auto& call = calls[i];
     auto& req = call.req;
-    req.set_sleep_micros(kSleep.ToMicroseconds());
+    req.set_sleep_micros(narrow_cast<uint32_t>(kSleep.ToMicroseconds()));
     req.set_client_timeout_defined(true);
     call.controller.set_timeout(kSleep / 2);
     p.AsyncRequest(method, /* method_metrics= */ nullptr, req, &call.resp, &call.controller,

@@ -11,7 +11,9 @@ import com.yugabyte.yw.cloud.GCPInitializer;
 import com.yugabyte.yw.commissioner.BaseTaskDependencies;
 import com.yugabyte.yw.commissioner.CallHome;
 import com.yugabyte.yw.commissioner.Commissioner;
-import com.yugabyte.yw.common.PlatformExecutorFactory;
+import com.yugabyte.yw.commissioner.DefaultExecutorServiceProvider;
+import com.yugabyte.yw.commissioner.ExecutorServiceProvider;
+import com.yugabyte.yw.commissioner.TaskExecutor;
 import com.yugabyte.yw.common.AccessManager;
 import com.yugabyte.yw.common.ApiHelper;
 import com.yugabyte.yw.common.CloudQueryHelper;
@@ -21,13 +23,18 @@ import com.yugabyte.yw.common.KubernetesManager;
 import com.yugabyte.yw.common.ModelFactory;
 import com.yugabyte.yw.common.NetworkManager;
 import com.yugabyte.yw.common.NodeManager;
+import com.yugabyte.yw.common.NodeUniverseManager;
+import com.yugabyte.yw.common.PlatformExecutorFactory;
 import com.yugabyte.yw.common.PlatformGuiceApplicationBaseTest;
 import com.yugabyte.yw.common.SwamperHelper;
 import com.yugabyte.yw.common.TableManager;
+import com.yugabyte.yw.common.YcqlQueryExecutor;
+import com.yugabyte.yw.common.YsqlQueryExecutor;
 import com.yugabyte.yw.common.alerts.AlertConfigurationService;
 import com.yugabyte.yw.common.alerts.AlertDefinitionService;
 import com.yugabyte.yw.common.alerts.AlertService;
-import com.yugabyte.yw.common.config.impl.SettableRuntimeConfigFactory;
+import com.yugabyte.yw.common.config.RuntimeConfigFactory;
+import com.yugabyte.yw.common.kms.EncryptionAtRestManager;
 import com.yugabyte.yw.common.metrics.MetricService;
 import com.yugabyte.yw.common.services.YBClientService;
 import com.yugabyte.yw.models.Customer;
@@ -42,9 +49,8 @@ import org.pac4j.play.CallbackController;
 import org.pac4j.play.store.PlayCacheSessionStore;
 import org.pac4j.play.store.PlaySessionStore;
 import org.yb.client.GetMasterClusterConfigResponse;
-import org.yb.client.IsServerReadyResponse;
 import org.yb.client.YBClient;
-import org.yb.master.Master;
+import org.yb.master.CatalogEntityInfo;
 import play.Application;
 import play.Environment;
 import play.inject.guice.GuiceApplicationBuilder;
@@ -52,7 +58,7 @@ import play.modules.swagger.SwaggerModule;
 import play.test.Helpers;
 
 public abstract class CommissionerBaseTest extends PlatformGuiceApplicationBaseTest {
-  private int maxRetryCount = 200;
+  private static final int MAX_RETRY_COUNT = 2000;
   protected AccessManager mockAccessManager;
   protected NetworkManager mockNetworkManager;
   protected ConfigHelper mockConfigHelper;
@@ -73,12 +79,18 @@ public abstract class CommissionerBaseTest extends PlatformGuiceApplicationBaseT
   protected AlertService alertService;
   protected AlertDefinitionService alertDefinitionService;
   protected AlertConfigurationService alertConfigurationService;
+  protected YcqlQueryExecutor mockYcqlQueryExecutor;
+  protected YsqlQueryExecutor mockYsqlQueryExecutor;
+  protected NodeUniverseManager mockNodeUniverseManager;
+  protected TaskExecutor taskExecutor;
+  protected EncryptionAtRestManager mockEARManager;
 
   @Mock protected BaseTaskDependencies mockBaseTaskDependencies;
 
   protected Customer defaultCustomer;
   protected Provider defaultProvider;
   protected Provider gcpProvider;
+  protected Provider onPremProvider;
 
   protected Commissioner commissioner;
 
@@ -88,12 +100,13 @@ public abstract class CommissionerBaseTest extends PlatformGuiceApplicationBaseT
     defaultCustomer = ModelFactory.testCustomer();
     defaultProvider = ModelFactory.awsProvider(defaultCustomer);
     gcpProvider = ModelFactory.gcpProvider(defaultCustomer);
+    onPremProvider = ModelFactory.onpremProvider(defaultCustomer);
     metricService = app.injector().instanceOf(MetricService.class);
     alertService = app.injector().instanceOf(AlertService.class);
     alertDefinitionService = app.injector().instanceOf(AlertDefinitionService.class);
-    SettableRuntimeConfigFactory configFactory =
-        app.injector().instanceOf(SettableRuntimeConfigFactory.class);
+    RuntimeConfigFactory configFactory = app.injector().instanceOf(RuntimeConfigFactory.class);
     alertConfigurationService = app.injector().instanceOf(AlertConfigurationService.class);
+    taskExecutor = app.injector().instanceOf(TaskExecutor.class);
 
     when(mockBaseTaskDependencies.getApplication()).thenReturn(app);
     when(mockBaseTaskDependencies.getConfig()).thenReturn(app.config());
@@ -108,6 +121,7 @@ public abstract class CommissionerBaseTest extends PlatformGuiceApplicationBaseT
         .thenReturn(alertConfigurationService);
     when(mockBaseTaskDependencies.getExecutorFactory())
         .thenReturn(app.injector().instanceOf(PlatformExecutorFactory.class));
+    when(mockBaseTaskDependencies.getTaskExecutor()).thenReturn(taskExecutor);
   }
 
   @Override
@@ -128,6 +142,10 @@ public abstract class CommissionerBaseTest extends PlatformGuiceApplicationBaseT
     mockCallbackController = mock(CallbackController.class);
     mockSessionStore = mock(PlayCacheSessionStore.class);
     mockApiHelper = mock(ApiHelper.class);
+    mockYcqlQueryExecutor = mock(YcqlQueryExecutor.class);
+    mockYsqlQueryExecutor = mock(YsqlQueryExecutor.class);
+    mockNodeUniverseManager = mock(NodeUniverseManager.class);
+    mockEARManager = mock(EncryptionAtRestManager.class);
 
     return configureApplication(
             new GuiceApplicationBuilder()
@@ -150,7 +168,13 @@ public abstract class CommissionerBaseTest extends PlatformGuiceApplicationBaseT
                 .overrides(bind(CallbackController.class).toInstance(mockCallbackController))
                 .overrides(bind(PlaySessionStore.class).toInstance(mockSessionStore))
                 .overrides(bind(ApiHelper.class).toInstance(mockApiHelper))
-                .overrides(bind(BaseTaskDependencies.class).toInstance(mockBaseTaskDependencies)))
+                .overrides(bind(BaseTaskDependencies.class).toInstance(mockBaseTaskDependencies))
+                .overrides(bind(YcqlQueryExecutor.class).toInstance(mockYcqlQueryExecutor))
+                .overrides(bind(YsqlQueryExecutor.class).toInstance(mockYsqlQueryExecutor))
+                .overrides(bind(NodeUniverseManager.class).toInstance(mockNodeUniverseManager))
+                .overrides(
+                    bind(ExecutorServiceProvider.class).to(DefaultExecutorServiceProvider.class))
+                .overrides(bind(EncryptionAtRestManager.class).toInstance(mockEARManager)))
         .build();
   }
 
@@ -159,11 +183,10 @@ public abstract class CommissionerBaseTest extends PlatformGuiceApplicationBaseT
   }
 
   public void mockWaits(YBClient mockClient, int version) {
-    IsServerReadyResponse okReadyResp = new IsServerReadyResponse(0, "", null, 0, 0);
     try {
       // PlacementUtil mock.
-      Master.SysClusterConfigEntryPB.Builder configBuilder =
-          Master.SysClusterConfigEntryPB.newBuilder().setVersion(version);
+      CatalogEntityInfo.SysClusterConfigEntryPB.Builder configBuilder =
+          CatalogEntityInfo.SysClusterConfigEntryPB.newBuilder().setVersion(version);
       GetMasterClusterConfigResponse gcr =
           new GetMasterClusterConfigResponse(0, "", configBuilder.build(), null);
       when(mockClient.getMasterClusterConfig()).thenReturn(gcr);
@@ -174,13 +197,21 @@ public abstract class CommissionerBaseTest extends PlatformGuiceApplicationBaseT
 
   protected TaskInfo waitForTask(UUID taskUUID) throws InterruptedException {
     int numRetries = 0;
-    while (numRetries < maxRetryCount) {
-      TaskInfo taskInfo = TaskInfo.get(taskUUID);
-      if (taskInfo.getTaskState() == TaskInfo.State.Success
-          || taskInfo.getTaskState() == TaskInfo.State.Failure) {
-        return taskInfo;
+    while (numRetries < MAX_RETRY_COUNT) {
+      // Here is a hack to decrease amount of accidental problems for tests using this
+      // function:
+      // Surrounding the next block with try {} catch {} as sometimes h2 raises NPE
+      // inside the get() request. We are not afraid of such exception as the next
+      // request will succeeded.
+      try {
+        TaskInfo taskInfo = TaskInfo.get(taskUUID);
+        if (taskInfo.getTaskState() == TaskInfo.State.Success
+            || taskInfo.getTaskState() == TaskInfo.State.Failure) {
+          return taskInfo;
+        }
+      } catch (Exception e) {
       }
-      Thread.sleep(1000);
+      Thread.sleep(100);
       numRetries++;
     }
     throw new RuntimeException(

@@ -45,18 +45,13 @@
 
 #include <fcntl.h>
 #include <sys/mman.h>
-#include <sys/stat.h>
-#include <sys/types.h>
-#include <unistd.h>
 
 #include <mutex>
 #include <string>
 #include <vector>
 
-#include "yb/consensus/opid_util.h"
 #include "yb/gutil/map-util.h"
-#include "yb/gutil/stringprintf.h"
-#include "yb/gutil/strings/substitute.h"
+
 #include "yb/util/locks.h"
 
 using std::string;
@@ -282,7 +277,7 @@ Status LogIndex::GetEntry(int64_t index, LogIndexEntry* entry) {
 }
 
 void LogIndex::GC(int64_t min_index_to_retain) {
-  int min_chunk_to_retain = min_index_to_retain / kEntriesPerIndexChunk;
+  auto min_chunk_to_retain = min_index_to_retain / kEntriesPerIndexChunk;
 
   // Enumerate which chunks to delete.
   vector<int64_t> chunks_to_delete;

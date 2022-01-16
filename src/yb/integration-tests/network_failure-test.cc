@@ -11,9 +11,12 @@
 // under the License.
 //
 
+#include "yb/client/error.h"
+#include "yb/client/schema.h"
 #include "yb/client/session.h"
 #include "yb/client/table_handle.h"
 #include "yb/client/yb_op.h"
+#include "yb/client/yb_table_name.h"
 
 #include "yb/integration-tests/mini_cluster.h"
 #include "yb/integration-tests/yb_mini_cluster_test_base.h"
@@ -22,12 +25,15 @@
 #include "yb/master/mini_master.h"
 
 #include "yb/util/async_util.h"
+#include "yb/util/metrics.h"
 #include "yb/util/random_util.h"
+#include "yb/util/test_thread_holder.h"
 #include "yb/util/test_util.h"
+#include "yb/util/tsan_util.h"
 
 using namespace std::literals;
 
-METRIC_DECLARE_histogram(handler_latency_yb_master_MasterService_GetTabletLocations);
+METRIC_DECLARE_histogram(handler_latency_yb_master_MasterClient_GetTabletLocations);
 
 DECLARE_int64(meta_cache_lookup_throttling_max_delay_ms);
 DECLARE_int64(meta_cache_lookup_throttling_step_ms);
@@ -76,7 +82,7 @@ int64_t CountLookups(MiniCluster* cluster) {
   for (int i = 0; i != cluster->num_masters(); ++i) {
     auto new_leader_master = cluster->mini_master(i);
     auto histogram = new_leader_master->master()->metric_entity()->FindOrCreateHistogram(
-        &METRIC_handler_latency_yb_master_MasterService_GetTabletLocations);
+        &METRIC_handler_latency_yb_master_MasterClient_GetTabletLocations);
     result += histogram->TotalCount();
   }
   return result;
@@ -117,7 +123,7 @@ TEST_F(NetworkFailureTest, DisconnectMasterLeader) {
       auto* const req = op->mutable_request();
       QLAddInt32HashValue(req, key);
       table_.AddInt32ColumnValue(req, kValueColumn, value);
-      ASSERT_OK(session->Apply(op));
+      session->Apply(op);
       futures.push_back(session->FlushFuture());
       ops.push_back(op);
     }

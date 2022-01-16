@@ -34,17 +34,15 @@
 #include <regex>
 
 #include <boost/algorithm/string.hpp>
-#include <boost/date_time/posix_time/time_parsers.hpp>
-
 #include <gtest/gtest.h>
 
 #include "yb/client/client.h"
+#include "yb/client/schema.h"
 #include "yb/client/table_creator.h"
 
 #include "yb/common/json_util.h"
 
 #include "yb/gutil/map-util.h"
-#include "yb/gutil/strings/join.h"
 #include "yb/gutil/strings/substitute.h"
 
 #include "yb/integration-tests/cluster_verifier.h"
@@ -52,18 +50,17 @@
 #include "yb/integration-tests/external_mini_cluster.h"
 #include "yb/integration-tests/test_workload.h"
 
+#include "yb/master/catalog_entity_info.h"
 #include "yb/master/master_defaults.h"
-#include "yb/master/master_backup.pb.h"
 
 #include "yb/tools/admin-test-base.h"
 
-#include "yb/util/date_time.h"
+#include "yb/util/format.h"
 #include "yb/util/jsonreader.h"
 #include "yb/util/net/net_util.h"
 #include "yb/util/port_picker.h"
 #include "yb/util/random_util.h"
-#include "yb/util/stol_utils.h"
-#include "yb/util/string_trim.h"
+#include "yb/util/status_format.h"
 #include "yb/util/string_util.h"
 #include "yb/util/subprocess.h"
 #include "yb/util/test_util.h"
@@ -208,6 +205,7 @@ TEST_F(AdminCliTest, TestChangeConfig) {
   workload.set_write_timeout_millis(10000);
   workload.set_num_write_threads(1);
   workload.set_write_batch_size(1);
+  workload.set_sequential_write(true);
   workload.Setup();
   workload.Start();
 
@@ -226,19 +224,19 @@ TEST_F(AdminCliTest, TestChangeConfig) {
                                                 MonoDelta::FromSeconds(10)));
 
   workload.StopAndJoin();
-  int num_batches = workload.batches_completed();
+  auto num_batches = workload.batches_completed();
 
   LOG(INFO) << "Waiting for replicas to agree...";
   // Wait for all servers to replicate everything up through the last write op.
   // Since we don't batch, there should be at least # rows inserted log entries,
   // plus the initial leader's no-op, plus 1 for
   // the added replica for a total == #rows + 2.
-  int min_log_index = num_batches + 2;
+  auto min_log_index = num_batches + 2;
   ASSERT_OK(WaitForServersToAgree(MonoDelta::FromSeconds(30),
                                   active_tablet_servers, tablet_id_,
                                   min_log_index));
 
-  int rows_inserted = workload.rows_inserted();
+  auto rows_inserted = workload.rows_inserted();
   LOG(INFO) << "Number of rows inserted: " << rows_inserted;
 
   ClusterVerifier cluster_verifier(cluster_.get());
@@ -570,6 +568,7 @@ TEST_F(AdminCliTest, TestModifyTablePlacementPolicy) {
   TestWorkload workload(cluster_.get());
   workload.set_table_name(extra_table);
   workload.set_timeout_allowed(true);
+  workload.set_sequential_write(true);
   workload.Setup();
   workload.Start();
 
@@ -641,7 +640,7 @@ TEST_F(AdminCliTest, TestModifyTablePlacementPolicy) {
 
   // Stop the workload.
   workload.StopAndJoin();
-  int rows_inserted = workload.rows_inserted();
+  auto rows_inserted = workload.rows_inserted();
   LOG(INFO) << "Number of rows inserted: " << rows_inserted;
 
   sleep(5);
@@ -651,6 +650,90 @@ TEST_F(AdminCliTest, TestModifyTablePlacementPolicy) {
   ASSERT_NO_FATALS(cluster_verifier.CheckCluster());
   ASSERT_NO_FATALS(cluster_verifier.CheckRowCount(
     extra_table, ClusterVerifier::EXACTLY, rows_inserted));
+}
+
+
+TEST_F(AdminCliTest, TestCreateTransactionStatusTablesWithPlacements) {
+  // Start a cluster with 3 tservers, each corresponding to a different zone.
+  FLAGS_num_tablet_servers = 3;
+  FLAGS_num_replicas = 3;
+  std::vector<std::string> master_flags;
+  master_flags.push_back("--enable_load_balancing=true");
+  master_flags.push_back("--catalog_manager_wait_for_new_tablets_to_elect_leader=false");
+  std::vector<std::string> ts_flags;
+  ts_flags.push_back("--placement_cloud=c");
+  ts_flags.push_back("--placement_region=r");
+  ts_flags.push_back("--placement_zone=z${index}");
+  BuildAndStart(ts_flags, master_flags);
+
+  // Create a new table.
+  const auto extra_table = YBTableName(YQLDatabase::YQL_DATABASE_CQL,
+                                       kTableName.namespace_name(),
+                                       "extra-table");
+  // Start a workload.
+  TestWorkload workload(cluster_.get());
+  workload.set_table_name(extra_table);
+  workload.set_timeout_allowed(true);
+  workload.set_sequential_write(true);
+  workload.Setup();
+  workload.Start();
+
+  const std::string& master_address = ToString(cluster_->master()->bound_rpc_addr());
+  auto client = ASSERT_RESULT(YBClientBuilder()
+      .add_master_server_addr(master_address)
+      .Build());
+
+  // Create transaction tables for each zone.
+  for (int i = 0; i < 3; ++i) {
+    string table_name = Substitute("transactions_z$0", i);
+    string placement = Substitute("c.r.z$0", i);
+    ASSERT_OK(CallAdmin("create_transaction_table", table_name));
+    ASSERT_OK(CallAdmin("modify_table_placement_info", "system", table_name, placement, 1));
+  }
+
+  // Verify that the tables are all in transaction status tables in the right zone.
+  std::shared_ptr<client::YBTable> table;
+  for (int i = 0; i < 3; ++i) {
+    const auto table_name = YBTableName(YQLDatabase::YQL_DATABASE_CQL,
+                                        "system",
+                                        Substitute("transactions_z$0", i));
+    ASSERT_OK(client->OpenTable(table_name, &table));
+    ASSERT_EQ(table->table_type(), YBTableType::TRANSACTION_STATUS_TABLE_TYPE);
+    ASSERT_EQ(table->replication_info().get().live_replicas().placement_blocks_size(), 1);
+    auto pb = table->replication_info().get().live_replicas().placement_blocks(0).cloud_info();
+    ASSERT_EQ(pb.placement_zone(), Substitute("z$0", i));
+  }
+
+  // Add two new tservers, to zone3 and an unused zone.
+  std::vector<std::string> existing_zone_ts_flags;
+  existing_zone_ts_flags.push_back("--placement_cloud=c");
+  existing_zone_ts_flags.push_back("--placement_region=r");
+  existing_zone_ts_flags.push_back("--placement_zone=z3");
+  ASSERT_OK(cluster_->AddTabletServer(true, existing_zone_ts_flags));
+
+  std::vector<std::string> new_zone_ts_flags;
+  new_zone_ts_flags.push_back("--placement_cloud=c");
+  new_zone_ts_flags.push_back("--placement_region=r");
+  new_zone_ts_flags.push_back("--placement_zone=z4");
+  ASSERT_OK(cluster_->AddTabletServer(true, new_zone_ts_flags));
+
+  ASSERT_OK(cluster_->WaitForTabletServerCount(5, 5s));
+
+  // Blacklist the original zone3 tserver.
+  ASSERT_OK(cluster_->AddTServerToBlacklist(cluster_->master(), cluster_->tablet_server(2)));
+
+  // Stop the workload.
+  workload.StopAndJoin();
+  auto rows_inserted = workload.rows_inserted();
+  LOG(INFO) << "Number of rows inserted: " << rows_inserted;
+
+  sleep(5);
+
+  // Verify that there was no data loss.
+  ClusterVerifier cluster_verifier(cluster_.get());
+  ASSERT_NO_FATALS(cluster_verifier.CheckCluster());
+  ASSERT_NO_FATALS(cluster_verifier.CheckRowCountWithRetries(
+    extra_table, ClusterVerifier::EXACTLY, rows_inserted, 20s));
 }
 
 TEST_F(AdminCliTest, TestClearPlacementPolicy) {
@@ -726,6 +809,20 @@ TEST_F(AdminCliTest, DdlLog) {
   ASSERT_EQ(actions[0], "Drop column text_column");
   ASSERT_EQ(actions[1], "Drop index test_idx");
   ASSERT_EQ(actions[2], "Add column int_column[int32 NULLABLE NOT A PARTITION KEY]");
+}
+
+TEST_F(AdminCliTest, FlushSysCatalog) {
+  BuildAndStart();
+  string master_address = ToString(cluster_->master()->bound_rpc_addr());
+  auto client = ASSERT_RESULT(YBClientBuilder().add_master_server_addr(master_address).Build());
+  ASSERT_OK(CallAdmin("flush_sys_catalog"));
+}
+
+TEST_F(AdminCliTest, CompactSysCatalog) {
+  BuildAndStart();
+  string master_address = ToString(cluster_->master()->bound_rpc_addr());
+  auto client = ASSERT_RESULT(YBClientBuilder().add_master_server_addr(master_address).Build());
+  ASSERT_OK(CallAdmin("compact_sys_catalog"));
 }
 
 }  // namespace tools

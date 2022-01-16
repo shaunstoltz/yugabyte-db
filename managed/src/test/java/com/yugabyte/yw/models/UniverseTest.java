@@ -13,7 +13,8 @@ import static org.junit.Assert.assertNotNull;
 import static org.junit.Assert.assertNull;
 import static org.junit.Assert.assertThat;
 import static org.junit.Assert.assertTrue;
-import static org.mockito.Matchers.anyList;
+import static org.junit.Assert.fail;
+import static org.mockito.ArgumentMatchers.anyList;
 import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.spy;
 import static org.mockito.Mockito.when;
@@ -127,7 +128,7 @@ public class UniverseTest extends FakeDBApplication {
   @Test(expected = RuntimeException.class)
   public void testGetUnknownUniverse() {
     UUID unknownUUID = UUID.randomUUID();
-    Universe u = Universe.getOrBadRequest(unknownUUID);
+    Universe.getOrBadRequest(unknownUUID);
   }
 
   @Test
@@ -152,7 +153,8 @@ public class UniverseTest extends FakeDBApplication {
     executor.shutdown();
     try {
       executor.awaitTermination(120, TimeUnit.SECONDS);
-    } catch (InterruptedException ignored) {
+    } catch (InterruptedException e) {
+      fail();
     }
     Universe updUniv = Universe.getOrBadRequest(u.universeUUID);
     assertEquals(numNodes, updUniv.getNodes().size());
@@ -381,16 +383,6 @@ public class UniverseTest extends FakeDBApplication {
     assertTrue(regionsNode.isArray());
     assertEquals(3, regionsNode.size());
     assertNull(universeJson.get("dnsName"));
-
-    JsonNode targetAsyncReplicationRelationshipsNode =
-        universeJson.get("universeDetails").get("targetAsyncReplicationRelationships");
-    assertTrue(targetAsyncReplicationRelationshipsNode.isArray());
-    assertEquals(0, targetAsyncReplicationRelationshipsNode.size());
-
-    JsonNode sourceAsyncReplicationRelationshipsNode =
-        universeJson.get("universeDetails").get("sourceAsyncReplicationRelationships");
-    assertTrue(sourceAsyncReplicationRelationshipsNode.isArray());
-    assertEquals(0, sourceAsyncReplicationRelationshipsNode.size());
   }
 
   @Test
@@ -471,70 +463,6 @@ public class UniverseTest extends FakeDBApplication {
     JsonNode masterGFlags = clusterJson.get("userIntent").get("masterGFlags");
     assertThat(masterGFlags, is(notNullValue()));
     assertEquals(0, masterGFlags.size());
-  }
-
-  @Test
-  public void testSourceUniverseToJsonWithAsyncReplicationRelationships() {
-    Universe source = createUniverse("source", defaultCustomer.getCustomerId());
-    Universe target = createUniverse("target", defaultCustomer.getCustomerId());
-
-    AsyncReplicationRelationship.create(source, "sourceTableID", target, "targetTableID", false);
-
-    JsonNode sourceUniverseDetailsJson =
-        Json.toJson(new UniverseResp(source)).get("universeDetails");
-
-    JsonNode targetAsyncReplicationRelationshipsJson =
-        sourceUniverseDetailsJson.get("targetAsyncReplicationRelationships");
-    assertTrue(targetAsyncReplicationRelationshipsJson.isArray());
-    assertEquals(0, targetAsyncReplicationRelationshipsJson.size());
-
-    JsonNode sourceAsyncReplicationRelationshipsJson =
-        sourceUniverseDetailsJson.get("sourceAsyncReplicationRelationships");
-    assertTrue(sourceAsyncReplicationRelationshipsJson.isArray());
-    assertEquals(1, sourceAsyncReplicationRelationshipsJson.size());
-
-    JsonNode asyncReplicationRelationshipJson = sourceAsyncReplicationRelationshipsJson.get(0);
-    assertEquals(
-        source.universeUUID.toString(),
-        asyncReplicationRelationshipJson.get("sourceUniverseUUID").asText());
-    assertEquals("sourceTableID", asyncReplicationRelationshipJson.get("sourceTableID").asText());
-    assertEquals(
-        target.universeUUID.toString(),
-        asyncReplicationRelationshipJson.get("targetUniverseUUID").asText());
-    assertEquals("targetTableID", asyncReplicationRelationshipJson.get("targetTableID").asText());
-    assertFalse(asyncReplicationRelationshipJson.get("active").asBoolean());
-  }
-
-  @Test
-  public void testTargetUniverseToJsonWithAsyncReplicationRelationships() {
-    Universe source = createUniverse("source", defaultCustomer.getCustomerId());
-    Universe target = createUniverse("target", defaultCustomer.getCustomerId());
-
-    AsyncReplicationRelationship.create(source, "sourceTableID", target, "targetTableID", false);
-
-    JsonNode targetUniverseDetailsJson =
-        Json.toJson(new UniverseResp(target)).get("universeDetails");
-
-    JsonNode sourceAsyncReplicationRelationshipsJson =
-        targetUniverseDetailsJson.get("sourceAsyncReplicationRelationships");
-    assertTrue(sourceAsyncReplicationRelationshipsJson.isArray());
-    assertEquals(0, sourceAsyncReplicationRelationshipsJson.size());
-
-    JsonNode targetAsyncReplicationRelationshipsJson =
-        targetUniverseDetailsJson.get("targetAsyncReplicationRelationships");
-    assertTrue(targetAsyncReplicationRelationshipsJson.isArray());
-    assertEquals(1, targetAsyncReplicationRelationshipsJson.size());
-
-    JsonNode asyncReplicationRelationshipJson = targetAsyncReplicationRelationshipsJson.get(0);
-    assertEquals(
-        target.universeUUID.toString(),
-        asyncReplicationRelationshipJson.get("targetUniverseUUID").asText());
-    assertEquals("targetTableID", asyncReplicationRelationshipJson.get("targetTableID").asText());
-    assertEquals(
-        source.universeUUID.toString(),
-        asyncReplicationRelationshipJson.get("sourceUniverseUUID").asText());
-    assertEquals("sourceTableID", asyncReplicationRelationshipJson.get("sourceTableID").asText());
-    assertFalse(asyncReplicationRelationshipJson.get("active").asBoolean());
   }
 
   @Test
@@ -634,6 +562,9 @@ public class UniverseTest extends FakeDBApplication {
     ModelFactory.createUniverse(defaultCustomer.getCustomerId(), certUUID);
     Set<Universe> universes = Universe.universeDetailsIfCertsExists(certUUID, defaultCustomer.uuid);
     assertEquals(universes.size(), 1);
+
+    universes = Universe.universeDetailsIfReleaseExists("");
+    assertEquals(universes.size(), 0);
   }
 
   private UserIntent getBaseIntent() {
@@ -766,38 +697,69 @@ public class UniverseTest extends FakeDBApplication {
 
   @Test
   public void testGetNodeActions() {
-    Universe u = createUniverseWithNodes(3 /* rf */, 3 /* numNodes */, true /* setMasters */);
-    NodeDetails nd = u.getNodes().iterator().next();
+    for (int numNodes = 3; numNodes <= 4; numNodes++) {
+      Universe u = createUniverseWithNodes(3 /* rf */, numNodes, true /* setMasters */);
+      NodeDetails nd = numNodes == 3 ? u.getNode("host-n1") : u.getNode("host-n4");
 
-    for (NodeDetails.NodeState nodeState : NodeDetails.NodeState.values()) {
-      nd.state = nodeState;
-      Set<NodeActionType> allowedActions = new AllowedActionsHelper(u, nd).listAllowedActions();
+      for (NodeDetails.NodeState nodeState : NodeDetails.NodeState.values()) {
+        nd.state = nodeState;
+        Set<NodeActionType> allowedActions = new AllowedActionsHelper(u, nd).listAllowedActions();
 
-      if (nodeState == NodeDetails.NodeState.ToBeAdded) {
-        assertEquals(ImmutableSet.of(NodeActionType.DELETE), allowedActions);
-      } else if (nodeState == NodeDetails.NodeState.Adding) {
-        assertEquals(ImmutableSet.of(NodeActionType.DELETE), allowedActions);
-      } else if (nodeState == NodeDetails.NodeState.ToJoinCluster) {
-        // Cannot REMOVE host-n1: As it will under replicate the masters.
-        assertEquals(ImmutableSet.of(), allowedActions);
-      } else if (nodeState == NodeDetails.NodeState.SoftwareInstalled) {
-        assertEquals(ImmutableSet.of(NodeActionType.START, NodeActionType.DELETE), allowedActions);
-      } else if (nodeState == NodeDetails.NodeState.ToBeRemoved) {
-        // Cannot REMOVE host-n1: As it will under replicate the masters.
-        assertEquals(ImmutableSet.of(), allowedActions);
-      } else if (nodeState == NodeDetails.NodeState.Live) {
-        assertEquals(
-            ImmutableSet.of(NodeActionType.STOP, NodeActionType.REMOVE, NodeActionType.QUERY),
-            allowedActions);
-      } else if (nodeState == NodeDetails.NodeState.Stopped) {
-        assertEquals(ImmutableSet.of(NodeActionType.START, NodeActionType.QUERY), allowedActions);
-      } else if (nodeState == NodeDetails.NodeState.Removed) {
-        assertEquals(ImmutableSet.of(NodeActionType.ADD, NodeActionType.RELEASE), allowedActions);
-      } else if (nodeState == NodeDetails.NodeState.Decommissioned) {
-        assertEquals(ImmutableSet.of(NodeActionType.ADD, NodeActionType.DELETE), allowedActions);
-      } else {
-        assertTrue(allowedActions.isEmpty());
+        if (nodeState == NodeDetails.NodeState.ToBeAdded) {
+          assertEquals(ImmutableSet.of(NodeActionType.DELETE), allowedActions);
+        } else if (nodeState == NodeDetails.NodeState.Adding) {
+          assertEquals(ImmutableSet.of(NodeActionType.DELETE), allowedActions);
+        } else if (nodeState == NodeDetails.NodeState.InstanceCreated) {
+          assertEquals(ImmutableSet.of(NodeActionType.DELETE), allowedActions);
+        } else if (nodeState == NodeDetails.NodeState.ServerSetup) {
+          assertEquals(ImmutableSet.of(NodeActionType.DELETE), allowedActions);
+        } else if (nodeState == NodeDetails.NodeState.ToJoinCluster) {
+          if (nd.isMaster) {
+            // Cannot REMOVE master node: As it will under replicate the masters.
+            assertEquals(ImmutableSet.of(), allowedActions);
+          } else {
+            assertEquals(ImmutableSet.of(NodeActionType.REMOVE), allowedActions);
+          }
+        } else if (nodeState == NodeDetails.NodeState.SoftwareInstalled) {
+          assertEquals(
+              ImmutableSet.of(NodeActionType.START, NodeActionType.DELETE), allowedActions);
+        } else if (nodeState == NodeDetails.NodeState.ToBeRemoved) {
+          if (nd.isMaster) {
+            // Cannot REMOVE master node: As it will under replicate the masters.
+            assertEquals(ImmutableSet.of(), allowedActions);
+          } else {
+            assertEquals(ImmutableSet.of(NodeActionType.REMOVE), allowedActions);
+          }
+        } else if (nodeState == NodeDetails.NodeState.Live) {
+          assertEquals(
+              ImmutableSet.of(NodeActionType.STOP, NodeActionType.REMOVE, NodeActionType.QUERY),
+              allowedActions);
+        } else if (nodeState == NodeDetails.NodeState.Stopped) {
+          if (nd.isMaster) {
+            // Cannot REMOVE master node: As it will under replicate the masters.
+            assertEquals(
+                ImmutableSet.of(NodeActionType.START, NodeActionType.QUERY), allowedActions);
+          } else {
+            assertEquals(
+                ImmutableSet.of(NodeActionType.START, NodeActionType.REMOVE, NodeActionType.QUERY),
+                allowedActions);
+          }
+        } else if (nodeState == NodeDetails.NodeState.Removed) {
+          assertEquals(ImmutableSet.of(NodeActionType.ADD, NodeActionType.RELEASE), allowedActions);
+        } else if (nodeState == NodeDetails.NodeState.Decommissioned) {
+          if (numNodes == 3) {
+            // Cannot DELETE node from universe with 3 nodes only - will get only two nodes
+            // left.
+            assertEquals(ImmutableSet.of(NodeActionType.ADD), allowedActions);
+          } else {
+            assertEquals(
+                ImmutableSet.of(NodeActionType.ADD, NodeActionType.DELETE), allowedActions);
+          }
+        } else {
+          assertTrue(allowedActions.isEmpty());
+        }
       }
+      u.delete();
     }
   }
 
@@ -815,7 +777,7 @@ public class UniverseTest extends FakeDBApplication {
 
   @Test
   public void testGetNodeActions_AllDeletesAllowed() {
-    Universe u = createUniverseWithNodes(3 /* rf */, 3 /* numNodes */, true /* setMasters */);
+    Universe u = createUniverseWithNodes(1 /* rf */, 3 /* numNodes */, true /* setMasters */);
     NodeDetails nd = u.getNodes().iterator().next();
 
     for (NodeDetails.NodeState nodeState : NodeDetails.NodeState.values()) {
@@ -834,39 +796,20 @@ public class UniverseTest extends FakeDBApplication {
     assertFalse(actions.contains(NodeActionType.STOP));
   }
 
-  private AsyncReplicationRelationship setupAsyncReplicationRelationship(
-      Universe source, Universe target) {
-    return AsyncReplicationRelationship.create(
-        source, "sourceTableID", target, "targetTableID", false);
-  }
-
   @Test
-  public void testGetSourceAsyncReplicationRelationships() {
-    Universe source = createUniverse("source", defaultCustomer.getCustomerId());
-    Universe target = createUniverse("target", defaultCustomer.getCustomerId());
-    AsyncReplicationRelationship relationship = setupAsyncReplicationRelationship(source, target);
+  public void testGetNodeActions_CheckDeletePresence() {
+    Universe u = createUniverseWithNodes(3 /* rf */, 3 /* numNodes */, true /* setMasters */);
+    NodeDetails nd = u.getNodes().iterator().next();
 
-    source.refresh();
-
-    assertEquals(1, source.sourceAsyncReplicationRelationships.size());
-    assertEquals(
-        relationship, source.sourceAsyncReplicationRelationships.stream().findFirst().orElse(null));
-
-    assertTrue(source.targetAsyncReplicationRelationships.isEmpty());
-  }
-
-  @Test
-  public void testGetTargetAsyncReplicationRelationships() {
-    Universe source = createUniverse("source", defaultCustomer.getCustomerId());
-    Universe target = createUniverse("target", defaultCustomer.getCustomerId());
-    AsyncReplicationRelationship relationship = setupAsyncReplicationRelationship(source, target);
-
-    target.refresh();
-
-    assertEquals(1, target.targetAsyncReplicationRelationships.size());
-    assertEquals(
-        relationship, target.targetAsyncReplicationRelationships.stream().findFirst().orElse(null));
-
-    assertTrue(target.sourceAsyncReplicationRelationships.isEmpty());
+    for (NodeDetails.NodeState nodeState : NodeDetails.NodeState.values()) {
+      nd.state = nodeState;
+      if (!nd.isRemovable()) {
+        continue;
+      }
+      // It is not allowed to remove normal (state == Decommissioned) node from the
+      // universe if number of nodes become less than RF.
+      Set<NodeActionType> actions = new AllowedActionsHelper(u, nd).listAllowedActions();
+      assertEquals(nodeState != NodeState.Decommissioned, actions.contains(NodeActionType.DELETE));
+    }
   }
 }

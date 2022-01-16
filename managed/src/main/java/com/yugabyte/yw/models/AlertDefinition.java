@@ -21,6 +21,7 @@ import com.yugabyte.yw.models.helpers.KnownAlertLabels;
 import io.ebean.ExpressionList;
 import io.ebean.Finder;
 import io.ebean.Model;
+import io.ebean.PersistenceContextScope;
 import java.util.ArrayList;
 import java.util.Comparator;
 import java.util.List;
@@ -78,7 +79,11 @@ public class AlertDefinition extends Model {
       new Finder<UUID, AlertDefinition>(AlertDefinition.class) {};
 
   public static ExpressionList<AlertDefinition> createQueryByFilter(AlertDefinitionFilter filter) {
-    ExpressionList<AlertDefinition> query = find.query().fetch("labels").where();
+    ExpressionList<AlertDefinition> query =
+        find.query()
+            .setPersistenceContextScope(PersistenceContextScope.QUERY)
+            .fetch("labels")
+            .where();
     appendInClause(query, "uuid", filter.getUuids());
     if (filter.getCustomerUuid() != null) {
       query.eq("customerUUID", filter.getCustomerUuid());
@@ -164,6 +169,21 @@ public class AlertDefinition extends Model {
   public AlertDefinition setLabels(List<AlertDefinitionLabel> labels) {
     this.labels = setUniqueListValues(this.labels, labels);
     this.labels.forEach(label -> label.setDefinition(this));
+    return this;
+  }
+
+  public AlertDefinition removeLabel(KnownAlertLabels labelName) {
+    AlertDefinitionLabel toRemove =
+        labels
+            .stream()
+            .filter(label -> label.getName().equals(labelName.labelName()))
+            .findFirst()
+            .orElse(null);
+    if (toRemove == null) {
+      return this;
+    }
+
+    this.labels.remove(toRemove);
     return this;
   }
 

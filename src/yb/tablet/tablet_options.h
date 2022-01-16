@@ -13,6 +13,7 @@
 #ifndef YB_TABLET_TABLET_OPTIONS_H
 #define YB_TABLET_TABLET_OPTIONS_H
 
+#include <future>
 #include <memory>
 #include <vector>
 
@@ -37,18 +38,21 @@ class Env;
 namespace yb {
 
 class Env;
+class MemTracker;
 class MetricRegistry;
 
 namespace tablet {
 
 YB_STRONGLY_TYPED_BOOL(IsDropTable);
 
+// Common for all tablets within TabletManager.
 struct TabletOptions {
   std::shared_ptr<rocksdb::Cache> block_cache;
   std::shared_ptr<rocksdb::MemoryMonitor> memory_monitor;
   std::vector<std::shared_ptr<rocksdb::EventListener>> listeners;
   yb::Env* env = Env::Default();
   rocksdb::Env* rocksdb_env = rocksdb::Env::Default();
+  std::shared_ptr<rocksdb::RateLimiter> rate_limiter;
 };
 
 struct TabletInitData {
@@ -59,7 +63,7 @@ struct TabletInitData {
   std::shared_ptr<MemTracker> block_based_table_mem_tracker;
   MetricRegistry* metric_registry = nullptr;
   log::LogAnchorRegistryPtr log_anchor_registry;
-  TabletOptions tablet_options;
+  const TabletOptions tablet_options;
   std::string log_prefix_suffix;
   TransactionParticipantContext* transaction_participant_context = nullptr;
   client::LocalTabletFilter local_tablet_filter;

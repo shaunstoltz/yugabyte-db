@@ -106,7 +106,7 @@ public class TestSpark3Jsonb extends BaseMiniClusterTest {
       // check that column pruning works
       assertTrue(explain_text.contains("id,address,phone->'key'->1->'m'->2->'b'"));
       // check that jsonb column filter is pushed down
-      assertTrue(explain_text.contains("Cassandra Filters: [[phone->'key'->1->'m'->2->>'b' ="));
+      assertTrue(explain_text.contains("phone->'key'->1->'m'->2->>'b'"));
 
       Dataset<Row> rows = spark.sql(query);
 
@@ -144,6 +144,61 @@ public class TestSpark3Jsonb extends BaseMiniClusterTest {
   }
 
   @Test
+  public void testCount() throws Exception {
+      // Set up config.
+      List<InetSocketAddress> addresses = miniCluster.getCQLContactPoints();
+
+      // Setup the local spark master
+      SparkConf conf = new SparkConf().setAppName("yb.spark-jsonb")
+        .setMaster("local[1]")
+        .set("spark.cassandra.connection.localDC", "datacenter1")
+        .set("spark.cassandra.connection.host", addresses.get(0).getHostName())
+        .set("spark.sql.catalog.mycatalog",
+          "com.datastax.spark.connector.datasource.CassandraCatalog");
+
+      CqlSession session = createTestSchemaIfNotExist(conf);
+      SparkSession spark = SparkSession.builder().config(conf)
+        .withExtensions(new CassandraSparkExtensions()).getOrCreate();
+
+      String createKeyspace = "CREATE KEYSPACE IF NOT EXISTS " + KEYSPACE + ";";
+      session.execute(createKeyspace);
+      String tbl = KEYSPACE + ".test_types";
+      session.execute("create table " + tbl + "(domain text, open_date date, " +
+        "subentity text, PRIMARY KEY ((domain,open_date), subentity) ) WITH CLUSTERING ORDER BY (" +
+        "subentity DESC) AND default_time_to_live=15768000 AND transactions = {'enabled': 'true'}");
+      session.execute("insert into " + tbl + " (domain, open_date, subentity)" +
+        "values ('a', '2021-7-29', 'c')");
+      session.execute("insert into " + tbl + " (domain, open_date, subentity)" +
+        "values ('a', '2021-7-28', 'c')");
+      session.execute("insert into " + tbl + " (domain, open_date, subentity)" +
+        "values ('b', '2021-7-27', 'c')");
+      session.execute("insert into " + tbl + " (domain, open_date, subentity)" +
+        "values ('a', '2021-7-26', 'c')");
+
+      String query = "select count(*) from " + "mycatalog."+ tbl +
+        " where domain='a' and open_date='2021-7-29'";
+      Dataset<Row> explain_rows = spark.sql("EXPLAIN " + query);
+      Iterator<Row> iterator = explain_rows.toLocalIterator();
+      StringBuilder explain_sb = new StringBuilder();
+      while (iterator.hasNext()) {
+          Row row = iterator.next();
+          explain_sb.append(row.getString(0));
+      }
+      String explain_text = explain_sb.toString();
+      logger.info("plan is " + explain_text);
+
+      Dataset<Row> rows = spark.sql(query);
+      iterator = rows.toLocalIterator();
+      int rows_count = 1;
+      while (iterator.hasNext()) {
+          Row row = iterator.next();
+          Long id = row.getLong(0);
+          logger.info("cnt = " + id);
+          assertTrue(id == 1);
+      }
+  }
+
+  @Test
   public void testCdr() throws Exception {
       // Set up config.
       List<InetSocketAddress> addresses = miniCluster.getCQLContactPoints();
@@ -152,6 +207,7 @@ public class TestSpark3Jsonb extends BaseMiniClusterTest {
       SparkConf conf = new SparkConf().setAppName("yb.spark-jsonb")
         .setMaster("local[1]")
         .set("confirm.truncate", "true")
+        .set("spark.cassandra.output.ignoreNulls", "true")
         .set("spark.cassandra.connection.localDC", "datacenter1")
         .set("spark.cassandra.connection.host", addresses.get(0).getHostName())
         .set("spark.sql.catalog.mycatalog",
@@ -185,12 +241,15 @@ public class TestSpark3Jsonb extends BaseMiniClusterTest {
       spark.sqlContext().sql("select * from temp").show(false);
       logger.info("Data READ SuccessFully");
 
+      query = "SELECT usage, nm from mycatalog.test.cdr where imsi=116 order by gdate";
       rows = spark.sql(query);
       iterator = rows.toLocalIterator();
       while (iterator.hasNext()) {
           Row row = iterator.next();
           String jsonb = row.getString(0);
-          assertEquals(jsonb, "{\"dl\":1122,\"rsrp\":-80,\"rsrq\":null,\"sinr\":100,\"ul\":72}");
+          assertEquals(jsonb,
+            "{\"dl\":1122,\"rsrp\":\"s80\",\"rsrq\":10000,\"sinr\":\"100.1\",\"ul\":72}");
+          assertEquals(true, row.isNullAt(1));
       }
       spark.close();
   }
@@ -201,10 +260,11 @@ public class TestSpark3Jsonb extends BaseMiniClusterTest {
     rows.show();
     rows.createOrReplaceTempView("temp");
     Dataset<Row> updatedRows = spark
-        .sql("select date as gdate,imsi,rsrp,sinr,rsrq from temp ");
+        .sql("select date as gdate,imsi,nm,rsrp,sinr,rsrq from temp ");
     updatedRows.show();
     updatedRows.write().format("org.apache.spark.sql.cassandra").option("keyspace", KEYSPACE)
         .option("table", CDR_TABLE)
+        .option("spark.cassandra.json.quoteValueString", "true")
         .option("spark.cassandra.mergeable.json.column.mapping", "dl,rsrp,sinr,ul,rsrq:usage")
         .mode(SaveMode.Append).save();
   }
@@ -241,7 +301,7 @@ public class TestSpark3Jsonb extends BaseMiniClusterTest {
       String tableWithKeysapce = KEYSPACE + "." + CDR_TABLE;
 
       String createTable = "CREATE TABLE IF NOT EXISTS " + tableWithKeysapce +
-          "(gdate date, imsi text," + "usage jsonb, PRIMARY KEY(gdate,imsi) )";
+          "(gdate date, imsi text, nm int," + "usage jsonb, PRIMARY KEY(gdate,imsi) )";
 
       session.execute(createTable);
       logger.info("Created table tablename: {}", INPUT_TABLE);

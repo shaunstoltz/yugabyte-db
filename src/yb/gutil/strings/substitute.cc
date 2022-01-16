@@ -18,11 +18,11 @@
 #include "yb/gutil/strings/substitute.h"
 
 #include <glog/logging.h>
-#include "yb/gutil/logging-inl.h"
+
 #include "yb/gutil/macros.h"
+#include "yb/gutil/stl_util.h"
 #include "yb/gutil/strings/ascii_ctype.h"
 #include "yb/gutil/strings/escaping.h"
-#include "yb/gutil/stl_util.h"
 
 namespace strings {
 
@@ -117,7 +117,7 @@ void SubstituteAndAppend(
   if (size == 0) return;
 
   // Build the string.
-  int original_size = output->size();
+  auto original_size = output->size();
   STLStringResizeUninitialized(output, original_size + size);
   char* target = string_as_array(output) + original_size;
 

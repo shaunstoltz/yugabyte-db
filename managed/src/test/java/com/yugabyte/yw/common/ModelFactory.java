@@ -2,6 +2,8 @@
 
 package com.yugabyte.yw.common;
 
+import static com.yugabyte.yw.models.helpers.CommonUtils.nowMinusWithoutMillis;
+import static com.yugabyte.yw.models.helpers.CommonUtils.nowPlusWithoutMillis;
 import static com.yugabyte.yw.models.helpers.CommonUtils.nowWithoutMillis;
 
 import com.fasterxml.jackson.databind.JsonNode;
@@ -18,6 +20,7 @@ import com.yugabyte.yw.common.metrics.MetricLabelsBuilder;
 import com.yugabyte.yw.forms.BackupTableParams;
 import com.yugabyte.yw.forms.CustomerRegisterFormData.AlertingData;
 import com.yugabyte.yw.forms.UniverseDefinitionTaskParams;
+import com.yugabyte.yw.forms.filters.AlertConfigurationApiFilter;
 import com.yugabyte.yw.models.Alert;
 import com.yugabyte.yw.models.AlertChannel;
 import com.yugabyte.yw.models.AlertConfiguration;
@@ -31,6 +34,7 @@ import com.yugabyte.yw.models.CertificateInfo;
 import com.yugabyte.yw.models.Customer;
 import com.yugabyte.yw.models.CustomerConfig;
 import com.yugabyte.yw.models.KmsConfig;
+import com.yugabyte.yw.models.MaintenanceWindow;
 import com.yugabyte.yw.models.Provider;
 import com.yugabyte.yw.models.Schedule;
 import com.yugabyte.yw.models.Universe;
@@ -42,6 +46,7 @@ import com.yugabyte.yw.models.helpers.PlacementInfo;
 import com.yugabyte.yw.models.helpers.TaskType;
 import java.io.IOException;
 import java.security.NoSuchAlgorithmException;
+import java.time.temporal.ChronoUnit;
 import java.util.Collections;
 import java.util.Date;
 import java.util.HashSet;
@@ -157,7 +162,7 @@ public class ModelFactory {
 
   public static Universe createUniverse(
       String universeName, long customerId, Common.CloudType cloudType) {
-    return createUniverse(universeName, UUID.randomUUID(), 1L, cloudType);
+    return createUniverse(universeName, UUID.randomUUID(), customerId, cloudType);
   }
 
   public static Universe createUniverse(
@@ -242,6 +247,31 @@ public class ModelFactory {
     params.setKeyspace("foo");
     params.setTableName("bar");
     params.tableUUID = UUID.randomUUID();
+    params.actionType = BackupTableParams.ActionType.CREATE;
+    return Backup.create(customerUUID, params);
+  }
+
+  public static Backup restoreBackup(UUID customerUUID, UUID universeUUID, UUID configUUID) {
+    BackupTableParams params = new BackupTableParams();
+    params.storageConfigUUID = configUUID;
+    params.universeUUID = universeUUID;
+    params.setKeyspace("foo");
+    params.setTableName("bar");
+    params.tableUUID = UUID.randomUUID();
+    params.actionType = BackupTableParams.ActionType.RESTORE;
+    return Backup.create(customerUUID, params);
+  }
+
+  public static Backup createExpiredBackupWithScheduleUUID(
+      UUID customerUUID, UUID universeUUID, UUID configUUID, UUID scheduleUUID) {
+    BackupTableParams params = new BackupTableParams();
+    params.storageConfigUUID = configUUID;
+    params.universeUUID = universeUUID;
+    params.setKeyspace("foo");
+    params.setTableName("bar");
+    params.tableUUID = UUID.randomUUID();
+    params.scheduleUUID = scheduleUUID;
+    params.timeBeforeDelete = -100L;
     return Backup.create(customerUUID, params);
   }
 
@@ -372,6 +402,10 @@ public class ModelFactory {
             .setCustomerUUID(customer.getUuid())
             .setName("Alert 1")
             .setSourceName("Source 1")
+            .setSourceUUID(
+                universe == null
+                    ? UUID.fromString("3ea389e6-07e7-487e-8592-c1b2a7339590")
+                    : universe.getUniverseUUID())
             .setSeverity(AlertConfiguration.Severity.SEVERE)
             .setMessage("Universe on fire!")
             .generateUUID();
@@ -420,15 +454,15 @@ public class ModelFactory {
 
   public static AlertChannelEmailParams createEmailChannelParams() {
     AlertChannelEmailParams params = new AlertChannelEmailParams();
-    params.recipients = Collections.singletonList("test@test.com");
-    params.smtpData = EmailFixtures.createSmtpData();
+    params.setRecipients(Collections.singletonList("test@test.com"));
+    params.setSmtpData(EmailFixtures.createSmtpData());
     return params;
   }
 
   public static AlertChannelSlackParams createSlackChannelParams() {
     AlertChannelSlackParams params = new AlertChannelSlackParams();
-    params.username = "channel";
-    params.webhookUrl = "http://www.google.com";
+    params.setUsername("channel");
+    params.setWebhookUrl("http://www.google.com");
     return params;
   }
 
@@ -444,14 +478,43 @@ public class ModelFactory {
     return destination;
   }
 
+  public static MaintenanceWindow createMaintenanceWindow(UUID customerUUID) {
+    return createMaintenanceWindow(customerUUID, window -> {});
+  }
+
+  public static MaintenanceWindow createMaintenanceWindow(
+      UUID customerUUID, Consumer<MaintenanceWindow> modifier) {
+    Date startDate = nowMinusWithoutMillis(1, ChronoUnit.HOURS);
+    Date endDate = nowPlusWithoutMillis(1, ChronoUnit.HOURS);
+    AlertConfigurationApiFilter filter = new AlertConfigurationApiFilter();
+    filter.setName("Replication Lag");
+    MaintenanceWindow window =
+        new MaintenanceWindow()
+            .generateUUID()
+            .setName("Test")
+            .setStartTime(startDate)
+            .setEndTime(endDate)
+            .setCustomerUUID(customerUUID)
+            .setCreateTime(nowWithoutMillis())
+            .setAlertConfigurationFilter(filter);
+    modifier.accept(window);
+    window.save();
+    return window;
+  };
+
   /*
    * KMS Configuration creation helpers.
    */
   public static KmsConfig createKMSConfig(
       UUID customerUUID, String keyProvider, ObjectNode authConfig) {
+    return createKMSConfig(customerUUID, keyProvider, authConfig, "Test KMS Configuration");
+  }
+
+  public static KmsConfig createKMSConfig(
+      UUID customerUUID, String keyProvider, ObjectNode authConfig, String configName) {
     EncryptionAtRestManager keyManager = new EncryptionAtRestManager();
     EncryptionAtRestService keyService = keyManager.getServiceInstance(keyProvider);
-    return keyService.createAuthConfig(customerUUID, "Test KMS Configuration", authConfig);
+    return keyService.createAuthConfig(customerUUID, configName, authConfig);
   }
 
   /*

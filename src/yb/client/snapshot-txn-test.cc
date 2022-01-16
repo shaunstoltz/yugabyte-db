@@ -11,28 +11,50 @@
 // under the License.
 //
 
+#include <atomic>
+#include <memory>
+#include <mutex>
+#include <string>
+#include <utility>
+#include <vector>
+
+#include <boost/optional/optional_fwd.hpp>
+
 #include "yb/client/session.h"
+#include "yb/client/table.h"
 #include "yb/client/transaction.h"
 #include "yb/client/transaction_pool.h"
 #include "yb/client/txn-test-base.h"
+#include "yb/client/yb_op.h"
 
+#include "yb/common/entity_ids_types.h"
 #include "yb/common/ql_value.h"
 
-#include "yb/consensus/raft_consensus.h"
+#include "yb/consensus/consensus.h"
+#include "yb/consensus/consensus.pb.h"
 
 #include "yb/docdb/consensus_frontier.h"
 
-#include "yb/rpc/messenger.h"
+#include "yb/gutil/casts.h"
+
+#include "yb/rocksdb/db.h"
+
+#include "yb/tablet/tablet.h"
+#include "yb/tablet/tablet_peer.h"
+#include "yb/tablet/transaction_participant.h"
 
 #include "yb/tserver/mini_tablet_server.h"
 #include "yb/tserver/tablet_server.h"
 
-#include "yb/util/bfql/gen_opcodes.h"
 #include "yb/util/debug/long_operation_tracker.h"
 #include "yb/util/enums.h"
 #include "yb/util/lockfree.h"
+#include "yb/util/opid.h"
 #include "yb/util/random_util.h"
+#include "yb/util/result.h"
 #include "yb/util/scope_exit.h"
+#include "yb/util/test_thread_holder.h"
+#include "yb/util/tsan_util.h"
 
 #include "yb/yql/cql/ql/util/errcodes.h"
 #include "yb/yql/cql/ql/util/statement_result.h"
@@ -50,6 +72,7 @@ DECLARE_int32(txn_max_apply_batch_records);
 DECLARE_int64(transaction_rpc_timeout_ms);
 DECLARE_uint64(max_clock_skew_usec);
 DECLARE_uint64(max_transactions_in_status_request);
+DECLARE_uint64(clock_skew_force_crash_bound_usec);
 
 extern double TEST_delay_create_transaction_probability;
 
@@ -250,11 +273,11 @@ void SnapshotTxnTest::TestBankAccounts(
 
   if (options.Test(BankAccountsOption::kNetworkPartition)) {
     threads.AddThreadFunctor([cluster = cluster_.get(), &stop = threads.stop_flag()]() {
-      int num_tservers = cluster->num_tablet_servers();
+      auto num_tservers = cluster->num_tablet_servers();
       while (!stop.load(std::memory_order_acquire)) {
-        int partitioned = RandomUniformInt(0, num_tservers - 1);
+        auto partitioned = RandomUniformInt<size_t>(0, num_tservers - 1);
         for (auto connectivity : {Connectivity::kOff, Connectivity::kOn}) {
-          for (int i = 0; i != num_tservers; ++i) {
+          for (size_t i = 0; i != num_tservers; ++i) {
             if (i == partitioned) {
               continue;
             }
@@ -345,6 +368,7 @@ TEST_F(SnapshotTxnTest, BankAccountsPartitioned) {
 
 TEST_F(SnapshotTxnTest, BankAccountsWithTimeStrobe) {
   FLAGS_fail_on_out_of_range_clock_skew = false;
+  FLAGS_clock_skew_force_crash_bound_usec = 0;
 
   TestBankAccounts(
       BankAccountsOptions{BankAccountsOption::kTimeStrobe}, 300s,
@@ -850,7 +874,8 @@ void SnapshotTxnTest::TestRemoteBootstrap() {
     }
 
     // Start all servers. Cluster verifier should check that all tablets are synchronized.
-    for (int i = cluster_->num_tablet_servers(); i-- > 0;) {
+    for (auto i = cluster_->num_tablet_servers(); i > 0;) {
+      --i;
       ASSERT_OK(cluster_->mini_tablet_server(i)->Start());
     }
 

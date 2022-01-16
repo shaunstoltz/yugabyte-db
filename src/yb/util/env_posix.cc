@@ -18,26 +18,21 @@
 //
 
 #include <dirent.h>
-#include <errno.h>
 #include <fcntl.h>
 #include <fts.h>
-#include <limits.h>
 #include <pthread.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <sys/mman.h>
 #include <sys/stat.h>
 #include <sys/statvfs.h>
 #include <sys/time.h>
 #include <sys/types.h>
 #include <sys/uio.h>
 #include <time.h>
-#include <unistd.h>
 
 #include <set>
 #include <vector>
-#include "yb/util/status.h"
 
 #if defined(__APPLE__)
 #include <mach-o/dyld.h>
@@ -53,20 +48,27 @@
 #include "yb/gutil/atomicops.h"
 #include "yb/gutil/bind.h"
 #include "yb/gutil/callback.h"
+#include "yb/gutil/casts.h"
 #include "yb/gutil/map-util.h"
 #include "yb/gutil/strings/substitute.h"
+
 #include "yb/util/alignment.h"
 #include "yb/util/debug/trace_event.h"
 #include "yb/util/env.h"
 #include "yb/util/errno.h"
 #include "yb/util/file_system_posix.h"
 #include "yb/util/flag_tags.h"
+#include "yb/util/format.h"
 #include "yb/util/locks.h"
 #include "yb/util/logging.h"
 #include "yb/util/malloc.h"
 #include "yb/util/monotime.h"
 #include "yb/util/path_util.h"
+#include "yb/util/result.h"
 #include "yb/util/slice.h"
+#include "yb/util/status.h"
+#include "yb/util/status_format.h"
+#include "yb/util/status_log.h"
 #include "yb/util/stopwatch.h"
 #include "yb/util/thread_restrictions.h"
 
@@ -94,10 +96,6 @@ DEFINE_bool(writable_file_use_fsync, false,
             "Use fsync(2) instead of fdatasync(2) for synchronizing dirty "
             "data to disk.");
 TAG_FLAG(writable_file_use_fsync, advanced);
-
-DEFINE_bool(suicide_on_eio, true,
-            "Kill the process if an I/O operation results in EIO");
-TAG_FLAG(suicide_on_eio, advanced);
 
 #ifdef __APPLE__
 // Never fsync on Mac OS X as we are getting many slow fsync errors in Jenkins and the fsync
@@ -128,6 +126,7 @@ DEFINE_test_flag(bool, simulate_fs_without_fallocate, false,
 DEFINE_test_flag(int64, simulate_free_space_bytes, -1,
     "If a non-negative value, GetFreeSpaceBytes will return the specified value.");
 
+using namespace std::placeholders;
 using base::subtle::Atomic64;
 using base::subtle::Barrier_AtomicIncrement;
 using std::vector;
@@ -137,25 +136,6 @@ static __thread uint64_t thread_local_id;
 static Atomic64 cur_thread_local_id_;
 
 namespace yb {
-
-Status IOError(const std::string& context, int err_number, const char* file, int line) {
-  Errno err(err_number);
-  switch (err_number) {
-    case ENOENT:
-      return Status(Status::kNotFound, file, line, context, err);
-    case EEXIST:
-      return Status(Status::kAlreadyPresent, file, line, context, err);
-    case EOPNOTSUPP:
-      return Status(Status::kNotSupported, file, line, context, err);
-    case EIO:
-      if (FLAGS_suicide_on_eio) {
-        // TODO: This is very, very coarse-grained. A more comprehensive
-        // approach is described in KUDU-616.
-        LOG(FATAL) << "Fatal I/O error, context: " << context;
-      }
-  }
-  return Status(Status::kIOError, file, line, context, err);
-}
 
 namespace {
 
@@ -213,7 +193,8 @@ class ScopedFdCloser {
   int fd_;
 };
 
-#define STATUS_IO_ERROR(context, err_number) IOError(context, err_number, __FILE__, __LINE__)
+#define STATUS_IO_ERROR(context, err_number) \
+    STATUS_FROM_ERRNO_SPECIAL_EIO_HANDLING(context, err_number)
 
 static Status DoSync(int fd, const string& filename) {
   ThreadRestrictions::AssertIOAllowed();
@@ -469,7 +450,7 @@ class PosixWritableFile : public WritableFile {
       nbytes += data.size();
     }
 
-    ssize_t written = writev(fd_, iov, n);
+    ssize_t written = writev(fd_, iov, narrow_cast<int>(n));
 
     if (PREDICT_FALSE(written == -1)) {
       int err = errno;
@@ -652,7 +633,7 @@ class PosixDirectIOWritableFile final : public PosixWritableFile {
       iov[j].iov_len = block_size_;
     }
     auto bytes_to_write = blocks_to_write * block_size_;
-    ssize_t written = pwritev(fd_, iov, blocks_to_write, next_write_offset_);
+    ssize_t written = pwritev(fd_, iov, narrow_cast<int>(blocks_to_write), next_write_offset_);
 
     if (PREDICT_FALSE(written == -1)) {
       int err = errno;
@@ -741,7 +722,7 @@ class PosixRWFile final : public RWFile {
   virtual Status Read(uint64_t offset, size_t length,
                       Slice* result, uint8_t* scratch) const override {
     ThreadRestrictions::AssertIOAllowed();
-    int rem = length;
+    auto rem = length;
     uint8_t* dst = scratch;
     while (rem > 0) {
       ssize_t r = pread(fd_, dst, rem, offset);
@@ -1066,8 +1047,7 @@ class PosixEnv : public Env {
   }
 
   Status DeleteRecursively(const std::string &name) override {
-    return Walk(name, POST_ORDER, Bind(&PosixEnv::DeleteRecursivelyCb,
-                                       Unretained(this)));
+    return Walk(name, POST_ORDER, std::bind(&PosixEnv::DeleteRecursivelyCb, this, _1, _2, _3));
   }
 
   Result<uint64_t> GetFileSize(const std::string& fname) override {
@@ -1175,7 +1155,7 @@ class PosixEnv : public Env {
       dir = buf;
     }
     // Directory may already exist
-    ignore_result(CreateDir(dir));
+    WARN_NOT_OK(CreateDir(dir), "Create test dir failed");
     // /tmp may be a symlink, so canonicalize the path.
     return Canonicalize(dir, result);
   }
@@ -1221,11 +1201,11 @@ class PosixEnv : public Env {
 
   Status GetExecutablePath(string* path) override {
     uint32_t size = 64;
-    uint32_t len = 0;
+    size_t len = 0;
     while (true) {
       std::unique_ptr<char[]> buf(new char[size]);
 #if defined(__linux__)
-      int rc = readlink("/proc/self/exe", buf.get(), size);
+      auto rc = readlink("/proc/self/exe", buf.get(), size);
       if (rc == -1) {
         return STATUS(IOError, "Unable to determine own executable path", "", Errno(errno));
       } else if (rc >= size) {
@@ -1336,7 +1316,7 @@ class PosixEnv : public Env {
           break;
       }
       if (doCb) {
-        if (!cb.Run(type, DirName(ent->fts_path), ent->fts_name).ok()) {
+        if (!cb(type, DirName(ent->fts_path), ent->fts_name).ok()) {
           had_errors = true;
         }
       }

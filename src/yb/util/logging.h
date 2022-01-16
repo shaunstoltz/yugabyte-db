@@ -44,19 +44,17 @@
 #ifndef YB_UTIL_LOGGING_H
 #define YB_UTIL_LOGGING_H
 
-#include <fcntl.h>
-
 #include <mutex>
 #include <string>
 
-#include <glog/logging.h>
 #include <boost/preprocessor/cat.hpp>
 #include <boost/preprocessor/stringize.hpp>
+#include <glog/logging.h>
 
 #include "yb/gutil/atomicops.h"
 #include "yb/gutil/dynamic_annotations.h"
 #include "yb/gutil/walltime.h"
-#include "yb/util/fault_injection.h"
+
 #include "yb/util/logging_callback.h"
 #include "yb/util/monotime.h"
 
@@ -139,9 +137,9 @@ enum PRIVATE_ThrottleMsg {THROTTLE_MSG};
 #define YB_SOME_KIND_OF_LOG_FIRST_N(severity, n, what_to_do) \
   static uint64_t LOG_OCCURRENCES = 0; \
   ANNOTATE_BENIGN_RACE(&LOG_OCCURRENCES, "Logging the first N is approximate"); \
-  if (LOG_OCCURRENCES++ < n) \
+  if (LOG_OCCURRENCES++ < (n)) \
     google::LogMessage( \
-      __FILE__, __LINE__, google::GLOG_ ## severity, LOG_OCCURRENCES, \
+      __FILE__, __LINE__, google::GLOG_ ## severity, static_cast<int>(LOG_OCCURRENCES), \
       &what_to_do).stream()
 
 // The direct user-facing macros.
@@ -295,6 +293,7 @@ std::ostream& operator<<(std::ostream &os, const PRIVATE_ThrottleMsg&);
 
 #define VLOG_WITH_PREFIX(verboselevel) VLOG(verboselevel) << LogPrefix()
 #define VLOG_WITH_FUNC(verboselevel) VLOG(verboselevel) << __func__ << ": "
+#define DVLOG_WITH_FUNC(verboselevel) DVLOG(verboselevel) << __func__ << ": "
 #define VLOG_WITH_PREFIX_AND_FUNC(verboselevel) VLOG_WITH_PREFIX(verboselevel) << __func__ << ": "
 
 #define DVLOG_WITH_PREFIX(verboselevel) DVLOG(verboselevel) << LogPrefix()

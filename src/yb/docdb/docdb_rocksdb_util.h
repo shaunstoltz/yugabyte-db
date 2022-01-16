@@ -16,21 +16,16 @@
 
 #include <boost/optional.hpp>
 
-#include "yb/common/read_hybrid_time.h"
-#include "yb/common/transaction.h"
-
 #include "yb/docdb/bounded_rocksdb_iterator.h"
-#include "yb/docdb/doc_key.h"
-#include "yb/docdb/value.h"
 
 #include "yb/rocksdb/cache.h"
 #include "yb/rocksdb/db.h"
 #include "yb/rocksdb/options.h"
+#include "yb/rocksdb/rate_limiter.h"
 #include "yb/rocksdb/table.h"
 
 #include "yb/tablet/tablet_options.h"
 
-#include "yb/util/mem_tracker.h"
 #include "yb/util/slice.h"
 
 namespace yb {
@@ -98,7 +93,7 @@ std::unique_ptr<IntentAwareIterator> CreateIntentAwareIterator(
     BloomFilterMode bloom_filter_mode,
     const boost::optional<const Slice>& user_key_for_filter,
     const rocksdb::QueryId query_id,
-    const TransactionOperationContextOpt& transaction_context,
+    const TransactionOperationContext& transaction_context,
     CoarseTimePoint deadline,
     const ReadHybridTime& read_time,
     std::shared_ptr<rocksdb::ReadFileFilter> file_filter = nullptr,
@@ -111,13 +106,29 @@ rocksdb::Options TEST_AutoInitFromRocksDBFlags();
 
 rocksdb::BlockBasedTableOptions TEST_AutoInitFromRocksDbTableFlags();
 
+Result<rocksdb::KeyValueEncodingFormat> GetConfiguredKeyValueEncodingFormat(
+    const std::string& flag_value);
+
+// Defines how rate limiter is shared across a node
+YB_DEFINE_ENUM(RateLimiterSharingMode, (NONE)(TSERVER));
+
+// Extracts rate limiter's sharing mode depending on the value of
+// flag `FLAGS_rocksdb_compact_flush_rate_limit_sharing_mode`;
+// `RateLimiterSharingMode::NONE` is returned if extraction failed
+RateLimiterSharingMode GetRocksDBRateLimiterSharingMode();
+
+// Creates `rocksdb::RateLimiter` taking into account related GFlags,
+// calls `rocksdb::NewGenericRateLimiter` internally
+std::shared_ptr<rocksdb::RateLimiter> CreateRocksDBRateLimiter();
+
 // Initialize the RocksDB 'options'.
 // The 'statistics' object provided by the caller will be used by RocksDB to maintain the stats for
 // the tablet.
 void InitRocksDBOptions(
     rocksdb::Options* options, const std::string& log_prefix,
     const std::shared_ptr<rocksdb::Statistics>& statistics,
-    const tablet::TabletOptions& tablet_options);
+    const tablet::TabletOptions& tablet_options,
+    rocksdb::BlockBasedTableOptions table_options = rocksdb::BlockBasedTableOptions());
 
 // Sets logs prefix for RocksDB options. This will also reinitialize options->info_log.
 void SetLogPrefix(rocksdb::Options* options, const std::string& log_prefix);
@@ -139,6 +150,11 @@ class RocksDBPatcher {
 
   // Modify flushed frontier and clean up smallest/largest op id in per-SST file metadata.
   CHECKED_STATUS ModifyFlushedFrontier(const ConsensusFrontier& frontier);
+
+  // Update file sizes in manifest if actual file size was changed because of direct manipulation
+  // with .sst files.
+  // Like all other methods in this class it updates manifest file.
+  CHECKED_STATUS UpdateFileSizes();
 
  private:
   class Impl;

@@ -33,19 +33,24 @@
 #ifndef YB_TABLET_OPERATIONS_OPERATION_DRIVER_H
 #define YB_TABLET_OPERATIONS_OPERATION_DRIVER_H
 
+#include <condition_variable>
 #include <string>
 
 #include <boost/atomic.hpp>
+
+#include "yb/common/common_types.pb.h"
 
 #include "yb/consensus/log_fwd.h"
 #include "yb/consensus/consensus_round.h"
 
 #include "yb/gutil/ref_counted.h"
 #include "yb/gutil/walltime.h"
+
 #include "yb/tablet/operations/operation.h"
+
+#include "yb/util/status_fwd.h"
 #include "yb/util/lockfree.h"
 #include "yb/util/opid.h"
-#include "yb/util/status.h"
 #include "yb/util/trace.h"
 
 namespace yb {
@@ -112,7 +117,6 @@ class OperationDriver : public RefCountedThreadSafe<OperationDriver>,
   // of any of the objects pointed to in the constructor's arguments.
   OperationDriver(OperationTracker* operation_tracker,
                   consensus::Consensus* consensus,
-                  log::Log* log,
                   Preparer* preparer,
                   TableType table_type_);
 
@@ -244,7 +248,6 @@ class OperationDriver : public RefCountedThreadSafe<OperationDriver>,
 
   OperationTracker* const operation_tracker_;
   consensus::Consensus* const consensus_;
-  log::Log* const log_;
   Preparer* const preparer_;
 
   // Lock that synchronizes access to the operation's state.

@@ -32,17 +32,15 @@
 #ifndef YB_CONSENSUS_LOG_INDEX_H
 #define YB_CONSENSUS_LOG_INDEX_H
 
-#include <string>
 #include <map>
-
-#include "yb/consensus/consensus.pb.h"
-#include "yb/consensus/opid_util.h"
+#include <string>
 
 #include "yb/gutil/macros.h"
 #include "yb/gutil/ref_counted.h"
+
+#include "yb/util/status_fwd.h"
 #include "yb/util/locks.h"
 #include "yb/util/opid.h"
-#include "yb/util/status.h"
 
 namespace yb {
 namespace log {

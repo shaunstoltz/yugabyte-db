@@ -32,15 +32,22 @@
 
 #include "yb/common/schema.h"
 
-#include <set>
 #include <algorithm>
+#include <set>
 
+#include "yb/common/common.pb.h"
+#include "yb/common/key_encoder.h"
+#include "yb/common/ql_type.h"
+#include "yb/common/row.h"
+
+#include "yb/gutil/map-util.h"
 #include "yb/gutil/stringprintf.h"
 #include "yb/gutil/strings/join.h"
-#include "yb/gutil/strings/strcat.h"
+
 #include "yb/util/malloc.h"
-#include "yb/util/status.h"
-#include "yb/common/row.h"
+#include "yb/util/result.h"
+#include "yb/util/status_format.h"
+#include "yb/util/status_log.h"
 
 namespace yb {
 
@@ -52,6 +59,50 @@ using std::unordered_set;
 // ------------------------------------------------------------------------------------------------
 // ColumnSchema
 // ------------------------------------------------------------------------------------------------
+
+ColumnSchema::ColumnSchema(std::string name,
+                           DataType type,
+                           bool is_nullable,
+                           bool is_hash_key,
+                           bool is_static,
+                           bool is_counter,
+                           int32_t order,
+                           SortingType sorting_type)
+    : ColumnSchema(name, QLType::Create(type), is_nullable, is_hash_key, is_static, is_counter,
+                   order, sorting_type) {
+}
+
+const TypeInfo* ColumnSchema::type_info() const {
+  return type_->type_info();
+}
+
+bool ColumnSchema::CompTypeInfo(const ColumnSchema &a, const ColumnSchema &b) {
+  return a.type_info()->type() == b.type_info()->type();
+}
+
+int ColumnSchema::Compare(const void *lhs, const void *rhs) const {
+  return type_info()->Compare(lhs, rhs);
+}
+
+// Stringify the given cell. This just stringifies the cell contents,
+// and doesn't include the column name or type.
+std::string ColumnSchema::Stringify(const void *cell) const {
+  std::string ret;
+  type_info()->AppendDebugStringForValue(cell, &ret);
+  return ret;
+}
+
+void ColumnSchema::DoDebugCellAppend(const void* cell, std::string* ret) const {
+  ret->append(type_info()->name());
+  ret->append(" ");
+  ret->append(name_);
+  ret->append("=");
+  if (is_nullable_ && cell == nullptr) {
+    ret->append("NULL");
+  } else {
+    type_info()->AppendDebugStringForValue(cell, ret);
+  }
+}
 
 // TODO: include attributes_.ToString() -- need to fix unit tests
 // first
@@ -191,13 +242,39 @@ string TableProperties::ToString() const {
 // ------------------------------------------------------------------------------------------------
 
 Schema::Schema(const Schema& other)
-  : name_to_index_bytes_(0),
-    // TODO: C++11 provides a single-arg constructor
+  : // TODO: C++11 provides a single-arg constructor
     name_to_index_(10,
                    NameToIndexMap::hasher(),
                    NameToIndexMap::key_equal(),
                    NameToIndexMapAllocator(&name_to_index_bytes_)) {
   CopyFrom(other);
+}
+
+Schema::Schema(const vector<ColumnSchema>& cols,
+               size_t key_columns,
+               const TableProperties& table_properties,
+               const Uuid& cotable_id,
+               const PgTableOid pgtable_id)
+  : // TODO: C++11 provides a single-arg constructor
+    name_to_index_(10,
+                   NameToIndexMap::hasher(),
+                   NameToIndexMap::key_equal(),
+                   NameToIndexMapAllocator(&name_to_index_bytes_)) {
+  CHECK_OK(Reset(cols, key_columns, table_properties, cotable_id, pgtable_id));
+}
+
+Schema::Schema(const vector<ColumnSchema>& cols,
+               const vector<ColumnId>& ids,
+               size_t key_columns,
+               const TableProperties& table_properties,
+               const Uuid& cotable_id,
+               const PgTableOid pgtable_id)
+  : // TODO: C++11 provides a single-arg constructor
+    name_to_index_(10,
+                   NameToIndexMap::hasher(),
+                   NameToIndexMap::key_equal(),
+                   NameToIndexMapAllocator(&name_to_index_bytes_)) {
+  CHECK_OK(Reset(cols, ids, key_columns, table_properties, cotable_id, pgtable_id));
 }
 
 Schema& Schema::operator=(const Schema& other) {
@@ -265,6 +342,13 @@ void Schema::ResetColumnIds(const vector<ColumnId>& ids) {
   }
 }
 
+Status Schema::Reset(const vector<ColumnSchema>& cols, size_t key_columns,
+                     const TableProperties& table_properties,
+                     const Uuid& cotable_id,
+                     const PgTableOid pgtable_id) {
+  return Reset(cols, {}, key_columns, table_properties, cotable_id, pgtable_id);
+}
+
 Status Schema::Reset(const vector<ColumnSchema>& cols,
                      const vector<ColumnId>& ids,
                      size_t key_columns,
@@ -330,11 +414,11 @@ Status Schema::Reset(const vector<ColumnSchema>& cols,
   // Calculate the offset of each column in the row format.
   col_offsets_.reserve(cols_.size() + 1);  // Include space for total byte size at the end.
   size_t off = 0;
-  size_t i = 0;
+  size_t idx = 0;
   name_to_index_.clear();
   for (const ColumnSchema &col : cols_) {
     // The map uses the 'name' string from within the ColumnSchema object.
-    if (!InsertIfNotPresent(&name_to_index_, col.name(), i++)) {
+    if (!InsertIfNotPresent(&name_to_index_, col.name(), idx++)) {
       return STATUS(InvalidArgument, "Duplicate column name", col.name());
     }
 
@@ -352,8 +436,8 @@ Status Schema::Reset(const vector<ColumnSchema>& cols,
   // Ensure clustering columns have a default sorting type of 'ASC' if not specified.
   for (auto i = num_hash_key_columns_; i < num_key_columns(); ++i) {
     ColumnSchema& col = cols_[i];
-    if (col.sorting_type() == ColumnSchema::SortingType::kNotSpecified) {
-      col.set_sorting_type(ColumnSchema::SortingType::kAscending);
+    if (col.sorting_type() == SortingType::kNotSpecified) {
+      col.set_sorting_type(SortingType::kAscending);
     }
   }
   return Status::OK();
@@ -364,9 +448,9 @@ Status Schema::CreateProjectionByNames(const std::vector<GStringPiece>& col_name
   vector<ColumnId> ids;
   vector<ColumnSchema> cols;
   for (const GStringPiece& name : col_names) {
-    int idx = find_column(name);
-    if (idx == -1) {
-      return STATUS(NotFound, "column not found", name);
+    auto idx = find_column(name);
+    if (idx == kColumnNotFound) {
+      return STATUS(NotFound, "Column not found", name);
     }
     if (has_column_ids()) {
       ids.push_back(column_id(idx));
@@ -420,8 +504,8 @@ Status Schema::VerifyProjectionCompatibility(const Schema& projection) const {
 
   vector<string> missing_columns;
   for (const ColumnSchema& pcol : projection.columns()) {
-    int index = find_column(pcol.name());
-    if (index < 0) {
+    auto index = find_column(pcol.name());
+    if (index == kColumnNotFound) {
       missing_columns.push_back(pcol.name());
     } else if (!pcol.EqualsType(cols_[index])) {
       // TODO: We don't support query with type adaptors yet
@@ -453,7 +537,7 @@ Status Schema::GetMappedReadProjection(const Schema& projection,
   mapped_ids.reserve(projection.num_columns());
 
   for (const ColumnSchema& col : projection.columns()) {
-    int index = find_column(col.name());
+    auto index = find_column(col.name());
     DCHECK_GE(index, 0) << col.name();
     mapped_cols.push_back(cols_[index]);
     mapped_ids.push_back(col_ids_[index]);
@@ -467,7 +551,7 @@ string Schema::ToString() const {
   vector<string> col_strs;
   if (has_column_ids()) {
     for (int i = 0; i < cols_.size(); ++i) {
-      col_strs.push_back(strings::Substitute("$0:$1", col_ids_[i], cols_[i].ToString()));
+      col_strs.push_back(Format("$0:$1", col_ids_[i], cols_[i].ToString()));
     }
   } else {
     for (const ColumnSchema &col : cols_) {
@@ -548,7 +632,7 @@ size_t Schema::memory_footprint_including_this() const {
   return malloc_usable_size(this) + memory_footprint_excluding_this();
 }
 
-Result<int> Schema::ColumnIndexByName(GStringPiece col_name) const {
+Result<ssize_t> Schema::ColumnIndexByName(GStringPiece col_name) const {
   auto index = find_column(col_name);
   if (index == kColumnNotFound) {
     return STATUS_FORMAT(Corruption, "$0 not found in schema $1", col_name, name_to_index_);
@@ -557,8 +641,8 @@ Result<int> Schema::ColumnIndexByName(GStringPiece col_name) const {
 }
 
 Result<ColumnId> Schema::ColumnIdByName(const std::string& column_name) const {
-  size_t column_index = find_column(column_name);
-  if (column_index == Schema::kColumnNotFound) {
+  auto column_index = find_column(column_name);
+  if (column_index == kColumnNotFound) {
     return STATUS_FORMAT(NotFound, "Couldn't find column $0 in the schema", column_name);
   }
   return ColumnId(column_id(column_index));
@@ -566,6 +650,14 @@ Result<ColumnId> Schema::ColumnIdByName(const std::string& column_name) const {
 
 ColumnId Schema::first_column_id() {
   return kFirstColumnId;
+}
+
+Result<const ColumnSchema&> Schema::column_by_id(ColumnId id) const {
+  int idx = find_column_by_id(id);
+  if (idx < 0) {
+    return STATUS_FORMAT(InvalidArgument, "Column id $0 not found", id.ToString());
+  }
+  return cols_[idx];
 }
 
 // ============================================================================
@@ -579,7 +671,7 @@ void SchemaBuilder::Reset() {
   next_id_ = kFirstColumnId;
   table_properties_.Reset();
   pgtable_id_ = 0;
-  cotable_id_ = Uuid(boost::uuids::nil_uuid());
+  cotable_id_ = Uuid::Nil();
 }
 
 void SchemaBuilder::Reset(const Schema& schema) {
@@ -621,6 +713,22 @@ Status SchemaBuilder::AddHashKeyColumn(const string& name, DataType type) {
   return AddColumn(ColumnSchema(name, QLType::Create(type), false, true), true);
 }
 
+Status SchemaBuilder::AddColumn(const std::string& name, DataType type) {
+  return AddColumn(name, QLType::Create(type));
+}
+
+Status SchemaBuilder::AddColumn(const std::string& name,
+                                DataType type,
+                                bool is_nullable,
+                                bool is_hash_key,
+                                bool is_static,
+                                bool is_counter,
+                                int32_t order,
+                                yb::SortingType sorting_type) {
+  return AddColumn(name, QLType::Create(type), is_nullable, is_hash_key, is_static, is_counter,
+                   order, sorting_type);
+}
+
 Status SchemaBuilder::AddColumn(const string& name,
                                 const std::shared_ptr<QLType>& type,
                                 bool is_nullable,
@@ -628,9 +736,14 @@ Status SchemaBuilder::AddColumn(const string& name,
                                 bool is_static,
                                 bool is_counter,
                                 int32_t order,
-                                ColumnSchema::SortingType sorting_type) {
+                                SortingType sorting_type) {
   return AddColumn(ColumnSchema(name, type, is_nullable, is_hash_key, is_static, is_counter,
                                 order, sorting_type), false);
+}
+
+
+Status SchemaBuilder::AddNullableColumn(const std::string& name, DataType type) {
+  return AddNullableColumn(name, QLType::Create(type));
 }
 
 Status SchemaBuilder::RemoveColumn(const string& name) {

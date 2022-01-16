@@ -91,6 +91,19 @@ public abstract class DevopsBase {
       List<String> commandArgs,
       List<String> cloudArgs,
       Map<String, String> envVars) {
+    return execCommand(
+        regionUUID, providerUUID, cloudType, command, commandArgs, cloudArgs, envVars, null);
+  }
+
+  protected ShellResponse execCommand(
+      UUID regionUUID,
+      UUID providerUUID,
+      Common.CloudType cloudType,
+      String command,
+      List<String> commandArgs,
+      List<String> cloudArgs,
+      Map<String, String> envVars,
+      Map<String, String> sensitiveData) {
     List<String> commandList = new ArrayList<>();
     commandList.add(YBCLOUD_SCRIPT);
     Map<String, String> extraVars = new HashMap<>();
@@ -107,11 +120,11 @@ public abstract class DevopsBase {
       commandList.add(region.provider.code);
       commandList.add("--region");
       commandList.add(region.code);
-      extraVars.putAll(region.provider.getConfig());
+      extraVars.putAll(region.provider.getUnmaskedConfig());
     } else if (providerUUID != null) {
       provider = Provider.get(providerUUID);
       commandList.add(provider.code);
-      extraVars.putAll(provider.getConfig());
+      extraVars.putAll(provider.getUnmaskedConfig());
     } else if (cloudType != null) {
       commandList.add(cloudType.toString());
     } else {
@@ -128,6 +141,8 @@ public abstract class DevopsBase {
     commandList.add(getCommandType().toLowerCase());
     commandList.add(command);
     commandList.addAll(commandArgs);
-    return shellProcessHandler.run(commandList, extraVars, description);
+    return (sensitiveData != null && !sensitiveData.isEmpty())
+        ? shellProcessHandler.run(commandList, extraVars, description, sensitiveData)
+        : shellProcessHandler.run(commandList, extraVars, description);
   }
 }

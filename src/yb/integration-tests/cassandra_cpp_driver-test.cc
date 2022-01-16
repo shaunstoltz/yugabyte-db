@@ -11,43 +11,29 @@
 // under the License.
 //
 
-#include <cassandra.h>
-
 #include <tuple>
 
-#include "yb/common/ql_value.h"
-
-#include "yb/client/client-internal.h"
-#include "yb/client/client-test-util.h"
 #include "yb/client/client.h"
-#include "yb/client/session.h"
-#include "yb/client/table_alterer.h"
-#include "yb/client/table_creator.h"
-#include "yb/client/table_handle.h"
-#include "yb/client/transaction.h"
-#include "yb/client/transaction_manager.h"
-#include "yb/client/yb_op.h"
+#include "yb/client/table_info.h"
+
 #include "yb/gutil/strings/join.h"
 #include "yb/gutil/strings/strip.h"
 #include "yb/gutil/strings/substitute.h"
 
-#include "yb/master/master.pb.h"
-
-#include "yb/server/hybrid_clock.h"
-#include "yb/server/clock.h"
-
 #include "yb/integration-tests/backfill-test-util.h"
-#include "yb/integration-tests/external_mini_cluster-itest-base.h"
 #include "yb/integration-tests/cql_test_util.h"
+#include "yb/integration-tests/external_mini_cluster-itest-base.h"
 
 #include "yb/tools/yb-admin_client.h"
 
 #include "yb/util/backoff_waiter.h"
 #include "yb/util/jsonreader.h"
-#include "yb/util/logging.h"
 #include "yb/util/metrics.h"
 #include "yb/util/random_util.h"
 #include "yb/util/size_literals.h"
+#include "yb/util/status_log.h"
+#include "yb/util/test_thread_holder.h"
+#include "yb/util/tsan_util.h"
 
 using namespace std::literals;
 
@@ -1235,12 +1221,12 @@ void TestBackfillIndexTable(
   WARN_NOT_OK(WaitForBackfillSafeTimeOn(test->cluster_.get(), table_name, kMaxWait),
       "Could not get safe time. May be OK, if the backfill is already done.");
   WARN_NOT_OK(WaitForBackfillSatisfyCondition(
-      test->cluster_.get()->master_proxy(), table_name,
+      test->cluster_->GetMasterProxy<master::MasterDdlProxy>(), table_name,
       [kLowerBound](Result<master::BackfillJobPB> backfill_job) -> Result<bool> {
         if (!backfill_job) {
           return backfill_job.status();
         }
-        const int number_rows_processed = backfill_job->num_rows_processed();
+        const auto number_rows_processed = backfill_job->num_rows_processed();
         return number_rows_processed >= kLowerBound;
       }, kMaxWait),
       "Could not get BackfillJobPB. May be OK, if the backfill is already done.");
@@ -1812,28 +1798,38 @@ TEST_F_EX(
   TestTable<cass_int32_t, string> table;
   ASSERT_OK(table.CreateTable(&session_, "test.test_table", {"k", "v"}, {"(k)"}, true));
 
-  LOG(INFO) << "Creating index";
+  LOG(INFO) << "Creating two indexes that will backfill together";
+  // Create 2 indexes that backfill together. One of them will be deleted while the backfill
+  // is happening. The deleted index should be successfully deleted, and the other index will
+  // be successfully backfilled.
   auto session2 = ASSERT_RESULT(EstablishSession());
-  CassandraFuture create_index_future = session2.ExecuteGetFuture(
-      "CREATE INDEX test_table_index_by_v ON test_table (v)");
+  CassandraFuture create_index_future0 =
+      session2.ExecuteGetFuture("CREATE DEFERRED INDEX test_table_index_by_v0 ON test_table (v)");
+  CassandraFuture create_index_future1 =
+      session2.ExecuteGetFuture("CREATE INDEX test_table_index_by_v1 ON test_table (v)");
 
   constexpr auto kNamespace = "test";
   const YBTableName table_name(YQL_DATABASE_CQL, kNamespace, "test_table");
-  const YBTableName index_table_name(YQL_DATABASE_CQL, kNamespace, "test_table_index_by_v");
+  const YBTableName index_table_name0(YQL_DATABASE_CQL, kNamespace, "test_table_index_by_v0");
+  const YBTableName index_table_name1(YQL_DATABASE_CQL, kNamespace, "test_table_index_by_v1");
 
   auto res = client_->WaitUntilIndexPermissionsAtLeast(
-      table_name, index_table_name, IndexPermissions::INDEX_PERM_DO_BACKFILL, 50ms /* max_wait */);
+      table_name, index_table_name1, IndexPermissions::INDEX_PERM_DO_BACKFILL, 50ms /* max_wait */);
   // Allow backfill to get past GetSafeTime
   ASSERT_OK(WaitForBackfillSafeTimeOn(cluster_.get(), table_name));
 
-  ASSERT_OK(session_.ExecuteQuery("drop index test_table_index_by_v"));
+  ASSERT_OK(session_.ExecuteQuery("drop index test_table_index_by_v1"));
 
   // Wait for the backfill to actually run to completion/failure.
   SleepFor(MonoDelta::FromSeconds(10));
   res = client_->WaitUntilIndexPermissionsAtLeast(
-      table_name, index_table_name, IndexPermissions::INDEX_PERM_NOT_USED, 50ms /* max_wait */);
+      table_name, index_table_name1, IndexPermissions::INDEX_PERM_NOT_USED, 50ms /* max_wait */);
   ASSERT_TRUE(!res.ok());
   ASSERT_TRUE(res.status().IsNotFound());
+
+  auto perm = ASSERT_RESULT(client_->WaitUntilIndexPermissionsAtLeast(
+      table_name, index_table_name0, IndexPermissions::INDEX_PERM_READ_WRITE_AND_DELETE));
+  ASSERT_EQ(perm, IndexPermissions::INDEX_PERM_READ_WRITE_AND_DELETE);
 }
 
 TEST_F_EX(CppCassandraDriverTest, TestPartialFailureDeferred, CppCassandraDriverTestIndex) {
@@ -2614,7 +2610,7 @@ TEST_F(CppCassandraDriverTest, TestTokenForDoubleKey) {
 
 //------------------------------------------------------------------------------
 class CppCassandraDriverTestNoPartitionBgRefresh : public CppCassandraDriverTest {
- private:
+ protected:
   std::vector<std::string> ExtraMasterFlags() override {
     auto flags = CppCassandraDriverTest::ExtraMasterFlags();
     flags.push_back("--partitions_vtable_cache_refresh_secs=0");
@@ -2801,6 +2797,13 @@ class CppCassandraDriverTestThreeMasters : public CppCassandraDriverTestNoPartit
   int NumMasters() override {
     return 3;
   }
+
+  std::vector<std::string> ExtraMasterFlags() override {
+    auto flags = CppCassandraDriverTestNoPartitionBgRefresh::ExtraMasterFlags();
+  // Just want to test the cache, so turn off automatic updating for this vtable.
+    flags.push_back("--generate_partitions_vtable_on_changes=false");
+    return flags;
+  }
 };
 
 TEST_F_EX(CppCassandraDriverTest, ManyTables, CppCassandraDriverTestThreeMasters) {
@@ -2897,10 +2900,20 @@ class CppCassandraDriverTestPartitionsVtableCache : public CppCassandraDriverTes
         &session, Format("test.key_value_$0", ++table_idx_), {"key", "value"}, {"(key)"});
   }
 
+  Status DropTable() {
+    auto session = VERIFY_RESULT(EstablishSession());
+    CassandraStatement statement(Format("DROP TABLE test.key_value_$0", table_idx_--));
+    return ResultToStatus(session.ExecuteWithResult(statement));
+  }
+
  private:
   std::vector<std::string> ExtraMasterFlags() override {
     auto flags = CppCassandraDriverTest::ExtraMasterFlags();
     flags.push_back(Substitute("--partitions_vtable_cache_refresh_secs=$0", kCacheRefreshSecs));
+    flags.push_back(Substitute("--generate_partitions_vtable_on_changes=$0", false));
+    flags.push_back(Substitute(
+        "--TEST_catalog_manager_check_yql_partitions_exist_for_is_create_table_done=$0",
+        false));
     return flags;
   }
 
@@ -2939,19 +2952,66 @@ TEST_F_EX(CppCassandraDriverTest,
   // We are now just after a cache update, so we should expect that we only get the cached value
   // for the next kCacheRefreshSecs seconds.
 
-  // Add another table to update system.partitions again.
+  // Add a table to update system.partitions again.
   ASSERT_OK(AddTable());
 
-  // Check that we still get the same cached version.
-  auto new_result = ASSERT_RESULT(session_.ExecuteWithResult(statement));
-  auto new_results = ResultsToList(new_result);
+  // Check that we still get the same cached version as the bg task has not run yet.
+  auto new_results = ResultsToList(ASSERT_RESULT(session_.ExecuteWithResult(statement)));
   ASSERT_EQ(old_results, new_results);
 
   // Wait for the cache to update.
   SleepFor(MonoDelta::FromSeconds(kCacheRefreshSecs));
   // Verify that we get the new cached value.
-  new_result = ASSERT_RESULT(session_.ExecuteWithResult(statement));
-  new_results = ResultsToList(new_result);
+  new_results = ResultsToList(ASSERT_RESULT(session_.ExecuteWithResult(statement)));
+  ASSERT_NE(old_results, new_results);
+  old_results = new_results;
+
+  // Test dropping a table as well.
+  ASSERT_OK(DropTable());
+  // Should still get the old cached values.
+  new_results = ResultsToList(ASSERT_RESULT(session_.ExecuteWithResult(statement)));
+  ASSERT_EQ(old_results, new_results);
+
+  // Wait for the cache to update, then verify that we get the new cached value.
+  SleepFor(MonoDelta::FromSeconds(kCacheRefreshSecs));
+  new_results = ResultsToList(ASSERT_RESULT(session_.ExecuteWithResult(statement)));
+  ASSERT_NE(old_results, new_results);
+}
+
+class CppCassandraDriverTestPartitionsVtableCacheUpdateOnChanges :
+    public CppCassandraDriverTestPartitionsVtableCache {
+  std::vector<std::string> ExtraMasterFlags() override {
+    auto flags = CppCassandraDriverTest::ExtraMasterFlags();
+    // Test for generating system.partitions as changes occur, rather than via a bg task.
+    flags.push_back(Substitute("--partitions_vtable_cache_refresh_secs=$0", 0));
+    flags.push_back(Substitute("--generate_partitions_vtable_on_changes=$0", true));
+    flags.push_back(Substitute(
+        "--TEST_catalog_manager_check_yql_partitions_exist_for_is_create_table_done=$0",
+        true));
+    return flags;
+  }
+};
+
+TEST_F_EX(CppCassandraDriverTest,
+          YQLPartitionsVtableCacheUpdateOnChanges,
+          CppCassandraDriverTestPartitionsVtableCacheUpdateOnChanges) {
+  // Get the initial system.partitions and store the result.
+  CassandraStatement statement("SELECT * FROM system.partitions");
+  auto old_result = ASSERT_RESULT(session_.ExecuteWithResult(statement));
+  auto old_results = ResultsToList(old_result);
+
+  // Add a table to update system.partitions.
+  ASSERT_OK(AddTable());
+
+  // Verify that the table is in the cache.
+  auto new_results = ResultsToList(ASSERT_RESULT(session_.ExecuteWithResult(statement)));
+  ASSERT_NE(old_results, new_results);
+  old_results = new_results;
+
+  // Test dropping a table as well.
+  ASSERT_OK(DropTable());
+  // Cache should again be automatically updated.
+  new_results = ResultsToList(ASSERT_RESULT(session_.ExecuteWithResult(statement)));
   ASSERT_NE(old_results, new_results);
 }
 

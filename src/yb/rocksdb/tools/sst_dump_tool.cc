@@ -30,6 +30,7 @@
 #include <sstream>
 #include <vector>
 
+#include "yb/rocksdb/db/filename.h"
 #include "yb/rocksdb/db/memtable.h"
 #include "yb/rocksdb/db/write_batch_internal.h"
 #include "yb/rocksdb/db.h"
@@ -53,15 +54,23 @@
 
 #include "yb/docdb/docdb_debug.h"
 
-using yb::docdb::EntryToString;
+#include "yb/util/status_log.h"
+
 using yb::docdb::StorageDbType;
+
 namespace rocksdb {
 
 using std::dynamic_pointer_cast;
 
+std::string DocDBKVFormatter::Format(
+    const yb::Slice&, const yb::Slice&, yb::docdb::StorageDbType) const {
+  CHECK(false) << "unimplemented";
+  return "";
+}
+
 SstFileReader::SstFileReader(
     const std::string& file_path, bool verify_checksum, OutputFormat output_format,
-    const DocDBKVFormatter& formatter)
+    const DocDBKVFormatter* formatter)
     : file_name_(file_path),
       read_num_(0),
       verify_checksum_(verify_checksum),
@@ -71,6 +80,9 @@ SstFileReader::SstFileReader(
       internal_comparator_(std::make_shared<InternalKeyComparator>(BytewiseComparator())) {
   fprintf(stdout, "Process %s\n", file_path.c_str());
   init_result_ = GetTableReader(file_name_);
+}
+
+SstFileReader::~SstFileReader() {
 }
 
 extern const uint64_t kBlockBasedTableMagicNumber;
@@ -361,7 +373,7 @@ Status SstFileReader::ReadSequential(bool print_kv,
           auto storage_type =
               (output_format_ == OutputFormat::kDecodedRegularDB ? StorageDbType::kRegular
                                                                  : StorageDbType::kIntents);
-          fprintf(stdout, "%s\n", docdb_kv_formatter_.Format(key, value, storage_type).c_str());
+          fprintf(stdout, "%s", docdb_kv_formatter_->Format(key, value, storage_type).c_str());
           break;
       }
     }

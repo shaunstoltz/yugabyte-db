@@ -11,6 +11,9 @@
 # under the License.
 #
 
+set(YB_PCH_PREFIX rocksutil)
+set(YB_PCH_DEP_LIBS gutil yb_test_util yb_util)
+
 #######################################
 # yb_rocksutil
 #######################################

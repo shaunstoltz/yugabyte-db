@@ -31,9 +31,18 @@
 //
 
 #include "yb/util/curl_util.h"
-#include "yb/util/scope_exit.h"
+
+#include <curl/curl.h>
+
+#include <vector>
 
 #include <glog/logging.h>
+
+#include "yb/gutil/casts.h"
+
+#include "yb/util/faststring.h"
+#include "yb/util/scope_exit.h"
+#include "yb/util/status.h"
 
 using std::string;
 
@@ -71,7 +80,7 @@ EasyCurl::~EasyCurl() {
 Status EasyCurl::FetchURL(const string& url,
                           faststring* buf,
                           int64_t timeout_sec,
-                          const vector<string>& headers) {
+                          const std::vector<std::string>& headers) {
   return DoRequest(url, boost::none, boost::none, timeout_sec, buf, headers);
 }
 
@@ -91,7 +100,7 @@ Status EasyCurl::PostToURL(
 
 string EasyCurl::EscapeString(const string& data) {
   string escaped_str;
-  auto str = curl_easy_escape(curl_, data.c_str(), data.length());
+  auto str = curl_easy_escape(curl_, data.c_str(), narrow_cast<int>(data.length()));
   if (str) {
     escaped_str = str;
     curl_free(str);

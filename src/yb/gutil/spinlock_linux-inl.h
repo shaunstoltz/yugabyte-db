@@ -47,7 +47,6 @@
  * This file is a Linux-specific part of spinlock_internal.cc
  */
 
-#include <errno.h>
 #include <sched.h>
 #include <time.h>
 #include <limits.h>
@@ -78,6 +77,7 @@ static struct InitModule {
 }  // anonymous namespace
 
 
+namespace yb {
 namespace base {
 namespace internal {
 
@@ -87,7 +87,7 @@ void SpinLockDelay(volatile Atomic32 *w, int32 value, int loop) {
     struct timespec tm;
     tm.tv_sec = 0;
     if (have_futex) {
-      tm.tv_nsec = base::internal::SuggestedDelayNS(loop);
+      tm.tv_nsec = yb::base::internal::SuggestedDelayNS(loop);
     } else {
       tm.tv_nsec = 2000001;   // above 2ms so linux 2.4 doesn't spin
     }
@@ -114,3 +114,4 @@ void SpinLockWake(volatile Atomic32 *w, bool all) {
 
 } // namespace internal
 } // namespace base
+} // namespace yb

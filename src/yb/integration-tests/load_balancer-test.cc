@@ -13,22 +13,22 @@
 
 #include <gtest/gtest.h>
 
-#include "yb/integration-tests/yb_table_test_base.h"
+#include "yb/client/client.h"
 
 #include "yb/consensus/consensus.pb.h"
 #include "yb/consensus/consensus.proxy.h"
-#include "yb/gutil/strings/join.h"
-#include "yb/integration-tests/mini_cluster.h"
+
+#include "yb/gutil/casts.h"
+
 #include "yb/integration-tests/external_mini_cluster.h"
-#include "yb/integration-tests/cluster_verifier.h"
-#include "yb/master/master.h"
-#include "yb/master/master-test-util.h"
-#include "yb/master/sys_catalog.h"
-#include "yb/master/master.proxy.h"
-#include "yb/rpc/messenger.h"
-#include "yb/rpc/rpc_controller.h"
+#include "yb/integration-tests/yb_table_test_base.h"
+
+#include "yb/master/master_cluster.proxy.h"
+
 #include "yb/tools/yb-admin_client.h"
+
 #include "yb/util/monotime.h"
+#include "yb/util/result.h"
 
 using namespace std::literals;
 
@@ -57,8 +57,8 @@ class LoadBalancerTest : public YBTableTestBase {
     master::AreLeadersOnPreferredOnlyResponsePB resp;
     rpc::RpcController rpc;
     rpc.set_timeout(kDefaultTimeout);
-    auto proxy = VERIFY_RESULT(GetMasterLeaderProxy());
-    RETURN_NOT_OK(proxy->AreLeadersOnPreferredOnly(req, &resp, &rpc));
+    auto proxy = GetMasterLeaderProxy<master::MasterClusterProxy>();
+    RETURN_NOT_OK(proxy.AreLeadersOnPreferredOnly(req, &resp, &rpc));
     return !resp.has_error();
   }
 
@@ -66,7 +66,6 @@ class LoadBalancerTest : public YBTableTestBase {
     opts->extra_tserver_flags.push_back("--placement_cloud=c");
     opts->extra_tserver_flags.push_back("--placement_region=r");
     opts->extra_tserver_flags.push_back("--placement_zone=z${index}");
-    opts->extra_master_flags.push_back("--load_balancer_skip_leader_as_remove_victim=false");
   }
 
 };
@@ -86,7 +85,7 @@ TEST_F(LoadBalancerTest, PreferredZoneAddNode) {
   ASSERT_OK(external_mini_cluster()->AddTabletServer(true, extra_opts));
 
   ASSERT_OK(WaitFor([&]() -> Result<bool> {
-    return client_->IsLoadBalanced(num_tablet_servers() + 1);
+    return client_->IsLoadBalanced(narrow_cast<uint32_t>(num_tablet_servers() + 1));
   },  kDefaultTimeout * 2, "IsLoadBalanced"));
 
   auto firstLoad = ASSERT_RESULT(GetLoadOnTserver(external_mini_cluster()->tablet_server(1)));
@@ -202,7 +201,7 @@ TEST_F_EX(LoadBalancerTest, MultiZoneTest, LoadBalancerOddTabletsTest) {
   },  kDefaultTimeout * 2, "IsLoadBalancerActive"));
 
   ASSERT_OK(WaitFor([&]() -> Result<bool> {
-    return client_->IsLoadBalanced(num_tablet_servers() + 1);
+    return client_->IsLoadBalanced(narrow_cast<int>(num_tablet_servers() + 1));
   },  kDefaultTimeout * 2, "IsLoadBalanced"));
 }
 

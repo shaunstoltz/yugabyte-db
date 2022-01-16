@@ -46,8 +46,8 @@
 #include "catalog/pg_authid.h"
 #include "catalog/pg_database.h"
 #include "catalog/pg_db_role_setting.h"
-#include "catalog/pg_tablegroup.h"
 #include "catalog/pg_tablespace.h"
+#include "catalog/pg_yb_tablegroup.h"
 #include "catalog/yb_catalog_version.h"
 #include "libpq/auth.h"
 #include "libpq/libpq-be.h"
@@ -773,6 +773,13 @@ InitPostgres(const char *in_dbname, Oid dboid, const char *username,
 		PerformAuthentication(MyProcPort);
 		InitializeSessionUserId(username, useroid);
 		am_superuser = superuser();
+
+		/*
+		 * In YSQL upgrade mode (uses tserver auth method), we allow connecting to
+		 * databases with disabled connections (normally it's just template0).
+		 */
+		override_allow_connections = override_allow_connections ||
+									 MyProcPort->yb_is_tserver_auth_method;
 	}
 
 	/*
@@ -1029,8 +1036,8 @@ InitPostgres(const char *in_dbname, Oid dboid, const char *username,
 	if (IsYugaByteEnabled())
 	{
 		HandleYBStatus(YBCPgTableExists(MyDatabaseId,
-										TableGroupRelationId,
-										&TablegroupCatalogExists));
+										YbTablegroupRelationId,
+										&YbTablegroupCatalogExists));
 	}
 
 	RelationCacheInitializePhase3();

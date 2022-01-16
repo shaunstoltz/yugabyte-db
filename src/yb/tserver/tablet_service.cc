@@ -37,19 +37,22 @@
 #include <string>
 #include <vector>
 
+#include <glog/logging.h>
+
 #include "yb/client/forward_rpc.h"
 #include "yb/client/transaction.h"
 #include "yb/client/transaction_pool.h"
 
+#include "yb/common/ql_rowblock.h"
 #include "yb/common/ql_value.h"
 #include "yb/common/row_mark.h"
 #include "yb/common/schema.h"
 #include "yb/common/wire_protocol.h"
 #include "yb/consensus/leader_lease.h"
+#include "yb/consensus/consensus.pb.h"
 #include "yb/consensus/raft_consensus.h"
 
 #include "yb/docdb/cql_operation.h"
-#include "yb/docdb/doc_rowwise_iterator.h"
 #include "yb/docdb/pgsql_operation.h"
 
 #include "yb/gutil/bind.h"
@@ -57,46 +60,53 @@
 #include "yb/gutil/stl_util.h"
 #include "yb/gutil/stringprintf.h"
 #include "yb/gutil/strings/escaping.h"
-#include "yb/master/sys_catalog_constants.h"
+
+#include "yb/rpc/thread_pool.h"
+
 #include "yb/server/hybrid_clock.h"
 
-#include "yb/tablet/tablet_bootstrap_if.h"
 #include "yb/tablet/abstract_tablet.h"
 #include "yb/tablet/metadata.pb.h"
-#include "yb/tablet/tablet.h"
-#include "yb/tablet/tablet_metrics.h"
-
 #include "yb/tablet/operations/change_metadata_operation.h"
 #include "yb/tablet/operations/split_operation.h"
 #include "yb/tablet/operations/truncate_operation.h"
 #include "yb/tablet/operations/update_txn_operation.h"
 #include "yb/tablet/operations/write_operation.h"
+#include "yb/tablet/read_result.h"
+#include "yb/tablet/tablet.h"
+#include "yb/tablet/tablet_bootstrap_if.h"
+#include "yb/tablet/tablet_metadata.h"
+#include "yb/tablet/tablet_metrics.h"
+#include "yb/tablet/transaction_participant.h"
+#include "yb/tablet/write_query.h"
 
-#include "yb/tserver/remote_bootstrap_service.h"
+#include "yb/tserver/service_util.h"
 #include "yb/tserver/tablet_server.h"
 #include "yb/tserver/ts_tablet_manager.h"
 #include "yb/tserver/tserver_error.h"
-#include "yb/tserver/tserver.pb.h"
 
 #include "yb/util/crc.h"
 #include "yb/util/debug/long_operation_tracker.h"
 #include "yb/util/debug/trace_event.h"
 #include "yb/util/faststring.h"
 #include "yb/util/flag_tags.h"
+#include "yb/util/format.h"
+#include "yb/util/logging.h"
 #include "yb/util/math_util.h"
 #include "yb/util/mem_tracker.h"
+#include "yb/util/metrics.h"
 #include "yb/util/monotime.h"
 #include "yb/util/random_util.h"
 #include "yb/util/scope_exit.h"
 #include "yb/util/size_literals.h"
 #include "yb/util/status.h"
 #include "yb/util/status_callback.h"
-#include "yb/util/trace.h"
+#include "yb/util/status_format.h"
+#include "yb/util/status_log.h"
 #include "yb/util/string_util.h"
-#include "yb/consensus/consensus.pb.h"
-#include "yb/tserver/service_util.h"
+#include "yb/util/trace.h"
 
-#include "yb/yql/pggate/util/pg_doc_data.h"
+#include "yb/yql/pgwrapper/ysql_upgrade.h"
 
 using namespace std::literals;  // NOLINT
 
@@ -240,11 +250,12 @@ DEFINE_test_flag(bool, disable_post_split_tablet_rbs_check, false,
 DEFINE_test_flag(double, fail_tablet_split_probability, 0.0,
                  "Probability of failing in TabletServiceAdminImpl::SplitTablet.");
 
+DECLARE_int32(heartbeat_interval_ms);
+
 double TEST_delay_create_transaction_probability = 0;
 
 namespace yb {
 namespace tserver {
-
 
 using client::internal::ForwardReadRpc;
 using client::internal::ForwardWriteRpc;
@@ -288,17 +299,24 @@ using tablet::WriteOperation;
 
 namespace {
 
+Result<std::shared_ptr<consensus::RaftConsensus>> GetConsensus(const TabletPeerPtr& tablet_peer) {
+  auto result = tablet_peer->shared_raft_consensus();
+  if (!result) {
+    Status s = STATUS(ServiceUnavailable, "Consensus unavailable. Tablet not running");
+    return s.CloneAndAddErrorCode(TabletServerError(TabletServerErrorPB::TABLET_NOT_RUNNING));
+  }
+  return result;
+}
+
 template<class RespClass>
 std::shared_ptr<consensus::RaftConsensus> GetConsensusOrRespond(const TabletPeerPtr& tablet_peer,
                                                                 RespClass* resp,
                                                                 rpc::RpcContext* context) {
-  auto result = tablet_peer->shared_raft_consensus();
-  if (!result) {
-    Status s = STATUS(ServiceUnavailable, "Consensus unavailable. Tablet not running");
-    SetupErrorAndRespond(resp->mutable_error(), s,
-                         TabletServerErrorPB::TABLET_NOT_RUNNING, context);
+  auto result = GetConsensus(tablet_peer);
+  if (!result.ok()) {
+    SetupErrorAndRespond(resp->mutable_error(), result.status(), context);
   }
-  return result;
+  return result.get();
 }
 
 template<class RespClass>
@@ -306,7 +324,12 @@ bool GetConsensusOrRespond(const TabletPeerPtr& tablet_peer,
                            RespClass* resp,
                            rpc::RpcContext* context,
                            shared_ptr<Consensus>* consensus) {
-  return (*consensus = GetConsensusOrRespond(tablet_peer, resp, context)) != nullptr;
+  auto result = GetConsensus(tablet_peer);
+  if (!result.ok()) {
+    SetupErrorAndRespond(resp->mutable_error(), result.status(), context);
+    return false;
+  }
+  return (*consensus = result.get()) != nullptr;
 }
 
 Status GetTabletRef(const TabletPeerPtr& tablet_peer,
@@ -336,16 +359,6 @@ bool RejectWrite(tablet::TabletPeer* tablet_peer, const std::string& message, do
       << ": Rejecting Write request, " << status << THROTTLE_MSG;
   SetupErrorAndRespond(resp->mutable_error(), status, context);
   return false;
-}
-
-void AdjustYsqlOperationTransactionality(
-    size_t ysql_batch_size,
-    const TabletPeer* tablet_peer,
-    tablet::WriteOperation* operation) {
-  // Operations on YSQL system catalog tables are always considered transactional.
-  if (ysql_batch_size > 0 && tablet_peer->tablet()->is_sys_catalog()) {
-    operation->set_force_txn_path();
-  }
 }
 
 } // namespace
@@ -402,30 +415,40 @@ bool TabletServiceImpl::CheckWriteThrottlingOrRespond(
 
 typedef ListTabletsResponsePB::StatusAndSchemaPB StatusAndSchemaPB;
 
-class WriteOperationCompletionCallback {
+class WriteQueryCompletionCallback {
  public:
-  WriteOperationCompletionCallback(
+  WriteQueryCompletionCallback(
       tablet::TabletPeerPtr tablet_peer,
       std::shared_ptr<rpc::RpcContext> context,
       WriteResponsePB* response,
-      tablet::WriteOperation* operation,
+      tablet::WriteQuery* query,
       const server::ClockPtr& clock,
       bool trace = false)
-      : tablet_peer_(std::move(tablet_peer)), context_(std::move(context)), response_(response),
-        operation_(operation), clock_(clock), include_trace_(trace) {}
+      : tablet_peer_(std::move(tablet_peer)),
+        context_(std::move(context)),
+        response_(response),
+        query_(query),
+        clock_(clock),
+        include_trace_(trace),
+        trace_(include_trace_ ? Trace::CurrentTrace() : nullptr) {}
 
   void operator()(Status status) const {
     VLOG(1) << __PRETTY_FUNCTION__ << " completing with status " << status;
     // When we don't need to return any data, we could return success on duplicate request.
     if (status.IsAlreadyPresent() &&
-        operation_->ql_write_ops()->empty() &&
-        operation_->pgsql_write_ops()->empty() &&
-        operation_->request()->redis_write_batch().empty()) {
+        query_->ql_write_ops()->empty() &&
+        query_->pgsql_write_ops()->empty() &&
+        query_->client_request()->redis_write_batch().empty()) {
       status = Status::OK();
     }
 
+    TRACE("Write completing with status $0", yb::ToString(status));
+
     if (!status.ok()) {
       LOG(INFO) << tablet_peer_->LogPrefix() << "Write failed: " << status;
+      if (include_trace_ && trace_) {
+        response_->set_trace_buffer(trace_->DumpToString(true));
+      }
       SetupErrorAndRespond(get_error(), status, context_.get());
       return;
     }
@@ -433,39 +456,41 @@ class WriteOperationCompletionCallback {
     // Retrieve the rowblocks returned from the QL write operations and return them as RPC
     // sidecars. Populate the row schema also.
     faststring rows_data;
-    for (const auto& ql_write_op : *operation_->ql_write_ops()) {
+    for (const auto& ql_write_op : *query_->ql_write_ops()) {
       const auto& ql_write_req = ql_write_op->request();
       auto* ql_write_resp = ql_write_op->response();
       const QLRowBlock* rowblock = ql_write_op->rowblock();
       SchemaToColumnPBs(rowblock->schema(), ql_write_resp->mutable_column_schemas());
       rows_data.clear();
       rowblock->Serialize(ql_write_req.client(), &rows_data);
-      ql_write_resp->set_rows_data_sidecar(context_->AddRpcSidecar(rows_data));
+      ql_write_resp->set_rows_data_sidecar(
+          narrow_cast<int32_t>(context_->AddRpcSidecar(rows_data)));
     }
 
-    if (!operation_->pgsql_write_ops()->empty()) {
+    if (!query_->pgsql_write_ops()->empty()) {
       // Retrieve the resultset returned from the PGSQL write operations and return them as RPC
       // sidecars.
 
       size_t sidecars_size = 0;
-      for (const auto& pgsql_write_op : *operation_->pgsql_write_ops()) {
+      for (const auto& pgsql_write_op : *query_->pgsql_write_ops()) {
         sidecars_size += pgsql_write_op->result_buffer().size();
       }
 
       if (sidecars_size != 0) {
         context_->ReserveSidecarSpace(sidecars_size);
-        for (const auto& pgsql_write_op : *operation_->pgsql_write_ops()) {
+        for (const auto& pgsql_write_op : *query_->pgsql_write_ops()) {
           auto* pgsql_write_resp = pgsql_write_op->response();
           const faststring& result_buffer = pgsql_write_op->result_buffer();
           if (!result_buffer.empty()) {
-            pgsql_write_resp->set_rows_data_sidecar(context_->AddRpcSidecar(result_buffer));
+            pgsql_write_resp->set_rows_data_sidecar(
+                narrow_cast<int32_t>(context_->AddRpcSidecar(result_buffer)));
           }
         }
       }
     }
 
-    if (include_trace_ && Trace::CurrentTrace() != nullptr) {
-      response_->set_trace_buffer(Trace::CurrentTrace()->DumpToString(true));
+    if (include_trace_ && trace_) {
+      response_->set_trace_buffer(trace_->DumpToString(true));
     }
     response_->set_propagated_hybrid_time(clock_->Now().ToUint64());
     context_->RespondSuccess();
@@ -480,9 +505,10 @@ class WriteOperationCompletionCallback {
   tablet::TabletPeerPtr tablet_peer_;
   const std::shared_ptr<rpc::RpcContext> context_;
   WriteResponsePB* const response_;
-  tablet::WriteOperation* const operation_;
+  tablet::WriteQuery* const query_;
   server::ClockPtr clock_;
   const bool include_trace_;
+  scoped_refptr<Trace> trace_;
 };
 
 // Checksums the scan result.
@@ -530,7 +556,8 @@ TabletServiceAdminImpl::TabletServiceAdminImpl(TabletServer* server)
     : TabletServerAdminServiceIf(server->MetricEnt()), server_(server) {}
 
 void TabletServiceAdminImpl::BackfillDone(
-    const ChangeMetadataRequestPB* req, ChangeMetadataResponsePB* resp, rpc::RpcContext context) {
+    const tablet::ChangeMetadataRequestPB* req, ChangeMetadataResponsePB* resp,
+    rpc::RpcContext context) {
   if (!CheckUuidMatchOrRespond(server_->tablet_manager(), "BackfillDone", req, resp, &context)) {
     return;
   }
@@ -848,7 +875,7 @@ void TabletServiceAdminImpl::BackfillIndex(
   context.RespondSuccess();
 }
 
-void TabletServiceAdminImpl::AlterSchema(const ChangeMetadataRequestPB* req,
+void TabletServiceAdminImpl::AlterSchema(const tablet::ChangeMetadataRequestPB* req,
                                          ChangeMetadataResponsePB* resp,
                                          rpc::RpcContext context) {
   if (!CheckUuidMatchOrRespond(server_->tablet_manager(), "ChangeMetadata", req, resp, &context)) {
@@ -881,7 +908,7 @@ void TabletServiceAdminImpl::AlterSchema(const ChangeMetadataRequestPB* req,
   } else {
     table_info = tablet.peer->tablet_metadata()->primary_table_info();
   }
-  const Schema& tablet_schema = table_info->schema;
+  const Schema& tablet_schema = *table_info->schema;
   uint32_t schema_version = table_info->schema_version;
   // Sanity check, to verify that the tablet should have the same schema
   // specified in the request.
@@ -1020,7 +1047,7 @@ void TabletServiceImpl::VerifyTableRowRange(
     (*resp->mutable_consistency_stats())[table_id] = consistency_stats[table_id];
   } else {
     const IndexMap index_map =
-        peer_tablet->tablet_peer->tablet_metadata()->primary_table_info()->index_map;
+        *peer_tablet->tablet_peer->tablet_metadata()->primary_table_info()->index_map;
     vector<IndexInfo> indexes;
     vector<TableId> index_ids;
     if (req->index_ids().empty()) {
@@ -1237,7 +1264,7 @@ void TabletServiceImpl::Truncate(const TruncateRequestPB* req,
     return;
   }
 
-  auto operation = std::make_unique<TruncateOperation>(tablet.peer->tablet(), req);
+  auto operation = std::make_unique<TruncateOperation>(tablet.peer->tablet(), &req->truncate());
 
   operation->set_completion_callback(
       MakeRpcOperationCompletionCallback(std::move(context), resp, server_->Clock()));
@@ -1285,7 +1312,7 @@ Status TabletServiceAdminImpl::DoCreateTablet(const CreateTabletRequestPB* req,
   Partition partition;
   Partition::FromPB(req->partition(), &partition);
 
-  LOG(INFO) << "Processing CreateTablet for tablet " << req->tablet_id()
+  LOG(INFO) << "Processing CreateTablet for T " << req->tablet_id() << " P " << req->dest_uuid()
             << " (table=" << req->table_name()
             << " [id=" << req->table_id() << "]), partition="
             << partition_schema.PartitionDebugString(partition, schema);
@@ -1463,7 +1490,7 @@ void TabletServiceAdminImpl::AddTableToTablet(
   }
   DVLOG(3) << "Received AddTableToTablet RPC: " << yb::ToString(*req);
 
-  tserver::ChangeMetadataRequestPB change_req;
+  tablet::ChangeMetadataRequestPB change_req;
   *change_req.mutable_add_table() = req->add_table();
   change_req.set_tablet_id(tablet_id);
   Status s = tablet::SyncReplicateChangeMetadataOperation(
@@ -1485,7 +1512,7 @@ void TabletServiceAdminImpl::RemoveTableFromTablet(
     return;
   }
 
-  tserver::ChangeMetadataRequestPB change_req;
+  tablet::ChangeMetadataRequestPB change_req;
   change_req.set_remove_table_id(req->remove_table_id());
   change_req.set_tablet_id(req->tablet_id());
   Status s = tablet::SyncReplicateChangeMetadataOperation(
@@ -1498,7 +1525,7 @@ void TabletServiceAdminImpl::RemoveTableFromTablet(
 }
 
 void TabletServiceAdminImpl::SplitTablet(
-    const SplitTabletRequestPB* req, SplitTabletResponsePB* resp, rpc::RpcContext context) {
+    const tablet::SplitTabletRequestPB* req, SplitTabletResponsePB* resp, rpc::RpcContext context) {
   if (!CheckUuidMatchOrRespond(server_->tablet_manager(), "SplitTablet", req, resp, &context)) {
     return;
   }
@@ -1542,6 +1569,27 @@ void TabletServiceAdminImpl::SplitTablet(
 
   leader_tablet_peer.peer->Submit(std::move(state), leader_tablet_peer.leader_term);
 }
+
+void TabletServiceAdminImpl::UpgradeYsql(
+    const UpgradeYsqlRequestPB* req,
+    UpgradeYsqlResponsePB* resp,
+    rpc::RpcContext context) {
+  LOG(INFO) << "Starting YSQL upgrade";
+
+  pgwrapper::YsqlUpgradeHelper upgrade_helper(server_->pgsql_proxy_bind_address(),
+                                              server_->GetSharedMemoryPostgresAuthKey(),
+                                              FLAGS_heartbeat_interval_ms);
+  const auto status = upgrade_helper.Upgrade();
+  if (!status.ok()) {
+    LOG(INFO) << "YSQL upgrade failed: " << status;
+    SetupErrorAndRespond(resp->mutable_error(), status, &context);
+    return;
+  }
+
+  LOG(INFO) << "YSQL upgrade done successfully";
+  context.RespondSuccess();
+}
+
 
 bool EmptyWriteBatch(const docdb::KeyValueWriteBatchPB& write_batch) {
   return write_batch.write_pairs().empty() && write_batch.apply_external_transactions().empty();
@@ -1639,8 +1687,8 @@ void TabletServiceImpl::Write(const WriteRequestPB* req,
         }
         if (pg_req.ysql_catalog_version() < last_breaking_catalog_version) {
           SetupErrorAndRespond(resp->mutable_error(),
-              STATUS_SUBSTITUTE(QLError, "Catalog Version Mismatch: A DDL occurred while "
-                                        "processing this query. Try again."),
+              STATUS_SUBSTITUTE(QLError, "The catalog snapshot used for this "
+                                         "transaction has been invalidated."),
               TabletServerErrorPB::MISMATCHED_SCHEMA, &context);
           return;
         }
@@ -1648,26 +1696,24 @@ void TabletServiceImpl::Write(const WriteRequestPB* req,
     }
   }
 
-  auto operation = std::make_unique<WriteOperation>(
+  auto query = std::make_unique<tablet::WriteQuery>(
       tablet.leader_term, context.GetClientDeadline(), tablet.peer.get(),
       tablet.peer->tablet(), resp);
-  *operation->AllocateRequest() = *req;
+  query->set_client_request(*req);
 
   auto context_ptr = std::make_shared<RpcContext>(std::move(context));
   if (RandomActWithProbability(GetAtomicFlag(&FLAGS_TEST_respond_write_failed_probability))) {
     LOG(INFO) << "Responding with a failure to " << req->DebugString();
-    operation->set_completion_callback(nullptr);
     SetupErrorAndRespond(resp->mutable_error(), STATUS(LeaderHasNoLease, "TEST: Random failure"),
                          context_ptr.get());
   } else {
-    operation->set_completion_callback(WriteOperationCompletionCallback(
-        tablet.peer, context_ptr, resp, operation.get(), server_->Clock(), req->include_trace()));
+    query->set_callback(WriteQueryCompletionCallback(
+        tablet.peer, context_ptr, resp, query.get(), server_->Clock(), req->include_trace()));
   }
 
-  AdjustYsqlOperationTransactionality(
-      req->pgsql_write_batch_size(), tablet.peer.get(), operation.get());
+  query->AdjustYsqlQueryTransactionality(req->pgsql_write_batch_size());
 
-  tablet.peer->WriteAsync(std::move(operation));
+  tablet.peer->WriteAsync(std::move(query));
 }
 
 Status TabletServiceImpl::CheckPeerIsReady(
@@ -2024,8 +2070,8 @@ void TabletServiceImpl::Read(const ReadRequestPB* req,
         }
         if (pg_req.ysql_catalog_version() < last_breaking_catalog_version) {
           SetupErrorAndRespond(resp->mutable_error(),
-              STATUS_SUBSTITUTE(QLError, "Catalog Version Mismatch: A DDL occurred while "
-                                        "processing this query. Try again."),
+              STATUS_SUBSTITUTE(QLError, "The catalog snapshot used for this "
+                                         "transaction has been invalidated."),
               TabletServerErrorPB::MISMATCHED_SCHEMA, &context);
           return;
         }
@@ -2130,37 +2176,36 @@ void TabletServiceImpl::Read(const ReadRequestPB* req,
 
   if (serializable_isolation || has_row_mark) {
     auto deadline = read_context->context.GetClientDeadline();
-    auto operation = std::make_unique<WriteOperation>(
+    auto query = std::make_unique<tablet::WriteQuery>(
         leader_peer.leader_term, deadline, leader_peer.peer.get(),
         leader_peer.peer->tablet(), nullptr /* response */,
         docdb::OperationKind::kRead);
 
-    WriteRequestPB& write_req = *operation->AllocateRequest();
-    *write_req.mutable_write_batch()->mutable_transaction() = req->transaction();
+    auto& write = *query->operation().AllocateRequest();
+    auto& write_batch = *write.mutable_write_batch();
+    *write_batch.mutable_transaction() = req->transaction();
     if (has_row_mark) {
-      write_req.mutable_write_batch()->set_row_mark_type(batch_row_mark);
-      read_context->read_time.ToPB(write_req.mutable_read_time());
+      write_batch.set_row_mark_type(batch_row_mark);
+      query->set_read_time(read_context->read_time);
     }
-    write_req.set_tablet_id(req->tablet_id());
-    write_req.mutable_write_batch()->set_deprecated_may_have_metadata(true);
-    write_req.set_batch_idx(req->batch_idx());
+    write.set_unused_tablet_id(""); // For backward compatibility.
+    write_batch.set_deprecated_may_have_metadata(true);
+    write.set_batch_idx(req->batch_idx());
     // TODO(dtxn) write request id
 
-    auto* write_batch = write_req.mutable_write_batch();
     auto status = leader_peer.peer->tablet()->CreateReadIntents(
         req->transaction(), req->subtransaction(), req->ql_batch(), req->pgsql_batch(),
-        write_batch);
+        &write_batch);
     if (!status.ok()) {
       SetupErrorAndRespond(resp->mutable_error(), status, &read_context->context);
       return;
     }
 
-    AdjustYsqlOperationTransactionality(
-        req->pgsql_batch_size(), leader_peer.peer.get(), operation.get());
+    query->AdjustYsqlQueryTransactionality(req->pgsql_batch_size());
 
-    operation->set_completion_callback(ReadOperationCompletionCallback(
+    query->set_callback(ReadOperationCompletionCallback(
         this, leader_peer.peer, std::move(read_context)));
-    leader_peer.peer->WriteAsync(std::move(operation));
+    leader_peer.peer->WriteAsync(std::move(query));
     return;
   }
 
@@ -2380,7 +2425,8 @@ Result<ReadHybridTime> TabletServiceImpl::DoReadImpl(ReadContext* read_context) 
       if (result.restart_read_ht.is_valid()) {
         return read_context->FormRestartReadHybridTime(result.restart_read_ht);
       }
-      result.response.set_rows_data_sidecar(read_context->context.AddRpcSidecar(result.rows_data));
+      result.response.set_rows_data_sidecar(
+          narrow_cast<int32_t>(read_context->context.AddRpcSidecar(result.rows_data)));
       read_context->resp->add_ql_batch()->Swap(&result.response);
     }
     return ReadHybridTime();
@@ -2405,7 +2451,8 @@ Result<ReadHybridTime> TabletServiceImpl::DoReadImpl(ReadContext* read_context) 
       if (result.restart_read_ht.is_valid()) {
         return read_context->FormRestartReadHybridTime(result.restart_read_ht);
       }
-      result.response.set_rows_data_sidecar(read_context->context.AddRpcSidecar(result.rows_data));
+      result.response.set_rows_data_sidecar(
+          narrow_cast<int32_t>(read_context->context.AddRpcSidecar(result.rows_data)));
       read_context->resp->add_pgsql_batch()->Swap(&result.response);
     }
 
@@ -2431,6 +2478,69 @@ ConsensusServiceImpl::ConsensusServiceImpl(const scoped_refptr<MetricEntity>& me
 }
 
 ConsensusServiceImpl::~ConsensusServiceImpl() {
+}
+
+void ConsensusServiceImpl::CompleteUpdateConsensusResponse(
+    std::shared_ptr<tablet::TabletPeer> tablet_peer,
+    consensus::ConsensusResponsePB* resp) {
+  auto tablet = tablet_peer->shared_tablet();
+  if (tablet) {
+    resp->set_num_sst_files(tablet->GetCurrentVersionNumSSTFiles());
+  }
+  resp->set_propagated_hybrid_time(tablet_peer->clock().Now().ToUint64());
+}
+
+void ConsensusServiceImpl::MultiRaftUpdateConsensus(
+      const consensus::MultiRaftConsensusRequestPB *req,
+      consensus::MultiRaftConsensusResponsePB *resp,
+      rpc::RpcContext context) {
+    DVLOG(3) << "Received Batch Consensus Update RPC: " << req->ShortDebugString();
+    // Effectively performs ConsensusServiceImpl::UpdateConsensus for
+    // each ConsensusRequestPB in the batch but does not fail the entire
+    // batch if a single request fails.
+    for (int i = 0; i < req->consensus_request_size(); i++) {
+      // Unfortunately, we have to use const_cast here,
+      // because the protobuf-generated interface only gives us a const request
+      // but we need to be able to move messages out of the request for efficiency.
+      auto consensus_req = const_cast<ConsensusRequestPB*>(&req->consensus_request(i));
+      auto consensus_resp = resp->add_consensus_response();;
+
+      auto uuid_match_res = CheckUuidMatch(tablet_manager_, "UpdateConsensus", consensus_req,
+                                           context.requestor_string());
+      if (!uuid_match_res.ok()) {
+        SetupError(consensus_resp->mutable_error(), uuid_match_res.status());
+        continue;
+      }
+
+      auto peer_tablet_res = LookupTabletPeer(tablet_manager_, consensus_req->tablet_id());
+      if (!peer_tablet_res.ok()) {
+        SetupError(consensus_resp->mutable_error(), peer_tablet_res.status());
+        continue;
+      }
+      auto tablet_peer = peer_tablet_res.get().tablet_peer;
+
+      // Submit the update directly to the TabletPeer's Consensus instance.
+      auto consensus_res = GetConsensus(tablet_peer);
+      if (!consensus_res.ok()) {
+        SetupError(consensus_resp->mutable_error(), consensus_res.status());
+        continue;
+      }
+      auto consensus = *consensus_res;
+
+      Status s = consensus->Update(
+        consensus_req, consensus_resp, context.GetClientDeadline());
+      if (PREDICT_FALSE(!s.ok())) {
+        // Clear the response first, since a partially-filled response could
+        // result in confusing a caller, or in having missing required fields
+        // in embedded optional messages.
+        consensus_resp->Clear();
+        SetupError(consensus_resp->mutable_error(), s);
+        continue;
+      }
+
+      CompleteUpdateConsensusResponse(tablet_peer, consensus_resp);
+    }
+    context.RespondSuccess();
 }
 
 void ConsensusServiceImpl::UpdateConsensus(const ConsensusRequestPB* req,
@@ -2463,12 +2573,8 @@ void ConsensusServiceImpl::UpdateConsensus(const ConsensusRequestPB* req,
     return;
   }
 
-  auto tablet = tablet_peer->shared_tablet();
-  if (tablet) {
-    resp->set_num_sst_files(tablet->GetCurrentVersionNumSSTFiles());
-  }
+  CompleteUpdateConsensusResponse(tablet_peer, resp);
 
-  resp->set_propagated_hybrid_time(tablet_peer->clock().Now().ToUint64());
   context.RespondSuccess();
 }
 
@@ -2801,7 +2907,7 @@ void TabletServiceImpl::ListTabletsForTabletServer(const ListTabletsForTabletSer
     data_entry->set_tablet_id(status.tablet_id());
 
     std::shared_ptr<consensus::Consensus> consensus = peer->shared_consensus();
-    data_entry->set_is_leader(consensus && consensus->role() == consensus::RaftPeerPB::LEADER);
+    data_entry->set_is_leader(consensus && consensus->role() == PeerRole::LEADER);
     data_entry->set_state(status.state());
 
     auto tablet = peer->shared_tablet();
@@ -2905,7 +3011,8 @@ void TabletServiceImpl::IsTabletServerReady(const IsTabletServerReadyRequestPB* 
 void TabletServiceImpl::TakeTransaction(const TakeTransactionRequestPB* req,
                                         TakeTransactionResponsePB* resp,
                                         rpc::RpcContext context) {
-  auto transaction = server_->TransactionPool()->Take();
+  auto transaction = server_->TransactionPool()->Take(
+      client::ForceGlobalTransaction(req->has_is_global() && req->is_global()));
   auto metadata = transaction->Release();
   if (!metadata.ok()) {
     LOG(INFO) << "Take failed: " << metadata.status();
@@ -2951,7 +3058,7 @@ void TabletServiceImpl::Shutdown() {
 }
 
 scoped_refptr<Histogram> TabletServer::GetMetricsHistogram(
-    TabletServerServiceIf::RpcMetricIndexes metric) {
+    TabletServerServiceRpcMethodIndexes metric) {
   // Returns the metric Histogram by holding a lock to make sure tablet_server_service_ remains
   // unchanged during the operation.
   std::lock_guard<simple_spinlock> l(lock_);

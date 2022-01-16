@@ -10,19 +10,26 @@
 // or implied.  See the License for the specific language governing permissions and limitations
 // under the License.
 //
+#include "yb/docdb/kv_debug.h"
 
 #include <string>
 
-#include "yb/docdb/kv_debug.h"
+#include "yb/common/common.pb.h"
 
-#include "yb/util/result.h"
-#include "yb/util/format.h"
-
-#include "yb/docdb/docdb_types.h"
 #include "yb/docdb/doc_key.h"
-#include "yb/docdb/intent.h"
-#include "yb/docdb/docdb-internal.h"
 #include "yb/docdb/doc_kv_util.h"
+#include "yb/docdb/docdb-internal.h"
+#include "yb/docdb/docdb_types.h"
+#include "yb/docdb/intent.h"
+#include "yb/docdb/value.h"
+#include "yb/docdb/value_type.h"
+
+#include "yb/gutil/casts.h"
+
+#include "yb/util/bytes_formatter.h"
+#include "yb/util/fast_varint.h"
+#include "yb/util/result.h"
+#include "yb/util/status_format.h"
 
 namespace yb {
 namespace docdb {
@@ -110,7 +117,7 @@ Result<std::string> DocDBValueToDebugStr(KeyType key_type, Slice key, Slice valu
   switch (key_type) {
     case KeyType::kTransactionMetadata: {
       TransactionMetadataPB metadata_pb;
-      if (!metadata_pb.ParseFromArray(value.cdata(), value.size())) {
+      if (!metadata_pb.ParseFromArray(value.cdata(), narrow_cast<int>(value.size()))) {
         return STATUS_FORMAT(Corruption, "Bad metadata: $0", value.ToDebugHexString());
       }
       return ToString(VERIFY_RESULT(TransactionMetadata::FromPB(metadata_pb)));

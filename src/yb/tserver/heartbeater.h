@@ -38,8 +38,9 @@
 
 #include "yb/gutil/macros.h"
 #include "yb/master/master_fwd.h"
+#include "yb/master/master_heartbeat.fwd.h"
 #include "yb/tserver/tserver_fwd.h"
-#include "yb/util/status.h"
+#include "yb/util/status_fwd.h"
 #include "yb/util/net/net_util.h"
 
 namespace yb {

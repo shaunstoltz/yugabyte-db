@@ -238,11 +238,19 @@ class ApiService {
     return axios.post(requestURL, payload).then((res) => res.data);
   }
 
+  getAlertCount = (filter: {}): Promise<any> => {
+    const payload = {
+      ...filter
+    }
+    const requestURL = `${ROOT_URL}/customers/${this.getCustomerId()}/alerts/count`;
+    return axios.post(requestURL, payload).then(res => res.data);
+  }
+
   getAlert = (alertUUID: string) => {
     const requestURL = `${ROOT_URL}/customers/${this.getCustomerId()}/alerts/${alertUUID}`;
     return axios.get(requestURL).then((res) => res.data);
   }
-  
+
   acknowledgeAlert = (uuid: string) => {
     const requestURL = `${ROOT_URL}/customers/${this.getCustomerId()}/alerts/acknowledge`;
     return axios.post(requestURL, { uuids: [uuid] }).then((res) => res.data);

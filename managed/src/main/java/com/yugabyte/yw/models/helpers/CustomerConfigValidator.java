@@ -6,6 +6,7 @@ import static com.yugabyte.yw.models.CustomerConfig.ConfigType.PASSWORD_POLICY;
 import static com.yugabyte.yw.models.CustomerConfig.ConfigType.STORAGE;
 import static play.mvc.Http.Status.CONFLICT;
 
+import com.amazonaws.SDKGlobalConfiguration;
 import com.amazonaws.SdkClientException;
 import com.amazonaws.auth.AWSCredentials;
 import com.amazonaws.auth.BasicAWSCredentials;
@@ -38,6 +39,7 @@ import java.util.regex.Pattern;
 import java.util.stream.Collectors;
 import javax.inject.Inject;
 import org.apache.commons.lang3.StringUtils;
+import org.apache.commons.validator.routines.DomainValidator;
 import org.apache.commons.validator.routines.UrlValidator;
 
 @Singleton
@@ -57,6 +59,8 @@ public class CustomerConfigValidator {
 
   private static final String[] AZ_URL_SCHEMES = {"http", "https"};
 
+  private static final String[] TLD_OVERRIDE = {"local"};
+
   private static final String AWS_HOST_BASE_FIELDNAME = "AWS_HOST_BASE";
 
   public static final String BACKUP_LOCATION_FIELDNAME = "BACKUP_LOCATION";
@@ -68,6 +72,10 @@ public class CustomerConfigValidator {
   public static final String GCS_CREDENTIALS_JSON_FIELDNAME = "GCS_CREDENTIALS_JSON";
 
   private static final String NFS_PATH_REGEXP = "^/|//|(/[\\w-]+)+$";
+
+  public static final Integer MIN_PORT_VALUE = 0;
+
+  public static final Integer MAX_PORT_VALUE = 65535;
 
   private final BeanValidator beanValidator;
 
@@ -101,6 +109,10 @@ public class CustomerConfigValidator {
   public abstract static class ConfigFieldValidator extends ConfigValidator {
 
     protected final String fieldName;
+
+    static {
+      DomainValidator.updateTLDOverride(DomainValidator.ArrayType.LOCAL_PLUS, TLD_OVERRIDE);
+    }
 
     public ConfigFieldValidator(String type, String name, String fieldName) {
       super(type, name);
@@ -138,6 +150,12 @@ public class CustomerConfigValidator {
               .throwError();
         } else {
           try {
+            // Disable cert checking while connecting with s3
+            // Enabling it can potentially fail when s3 compatible storages like
+            // Dell ECS are provided and custom certs are needed to connect
+            // Reference: https://yugabyte.atlassian.net/browse/PLAT-2497
+            System.setProperty(
+                SDKGlobalConfiguration.DISABLE_CERT_CHECKING_SYSTEM_PROPERTY, "true");
             s3UriPath = s3UriPath.substring(5);
             String[] bucketSplit = s3UriPath.split("/", 2);
             String bucketName = bucketSplit.length > 0 ? bucketSplit[0] : "";
@@ -174,6 +192,10 @@ public class CustomerConfigValidator {
             beanValidator.error().forField(fieldFullName(fieldName), errMessage).throwError();
           } catch (SdkClientException e) {
             beanValidator.error().forField(fieldFullName(fieldName), e.getMessage()).throwError();
+          } finally {
+            // Re-enable cert checking as it applies globally
+            System.setProperty(
+                SDKGlobalConfiguration.DISABLE_CERT_CHECKING_SYSTEM_PROPERTY, "false");
           }
         }
       }
@@ -235,7 +257,9 @@ public class CustomerConfigValidator {
         String type, String name, String fieldName, String[] schemes, boolean emptyAllowed) {
       super(type, name, fieldName);
       this.emptyAllowed = emptyAllowed;
-      urlValidator = new UrlValidator(schemes, UrlValidator.ALLOW_LOCAL_URLS);
+      DomainValidator domainValidator = DomainValidator.getInstance(true);
+      urlValidator =
+          new UrlValidator(schemes, null, UrlValidator.ALLOW_LOCAL_URLS, domainValidator);
     }
 
     @Override
@@ -253,9 +277,25 @@ public class CustomerConfigValidator {
       boolean valid = false;
       try {
         URI uri = new URI(value);
-        valid =
-            urlValidator.isValid(
-                StringUtils.isEmpty(uri.getScheme()) ? DEFAULT_SCHEME + value : value);
+        if (fieldName.equals(AWS_HOST_BASE_FIELDNAME)) {
+          if (StringUtils.isEmpty(uri.getHost())) {
+            uri = new URI(DEFAULT_SCHEME + value);
+          }
+          String host = uri.getHost();
+          String scheme = uri.getScheme() + "://";
+          String uriToValidate = scheme + host;
+          Integer port = new Integer(uri.getPort());
+          boolean validPort = true;
+          if (!uri.toString().equals(uriToValidate)
+              && (port < MIN_PORT_VALUE || port > MAX_PORT_VALUE)) {
+            validPort = false;
+          }
+          valid = validPort && urlValidator.isValid(uriToValidate);
+        } else {
+          valid =
+              urlValidator.isValid(
+                  StringUtils.isEmpty(uri.getScheme()) ? DEFAULT_SCHEME + value : value);
+        }
       } catch (URISyntaxException e) {
       }
 

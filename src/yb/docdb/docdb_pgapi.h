@@ -24,10 +24,13 @@
 #ifndef YB_DOCDB_DOCDB_PGAPI_H_
 #define YB_DOCDB_DOCDB_PGAPI_H_
 
-#include "ybgate/ybgate_api.h"
+#include <vector>
 
-#include "yb/common/ql_value.h"
-#include "yb/common/schema.h"
+#include "yb/common/common_fwd.h"
+
+#include "yb/util/status_fwd.h"
+
+#include "ybgate/ybgate_api.h"
 
 namespace yb {
 namespace docdb {

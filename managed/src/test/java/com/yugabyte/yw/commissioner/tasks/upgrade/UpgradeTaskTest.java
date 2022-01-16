@@ -34,7 +34,6 @@ import com.yugabyte.yw.models.TaskInfo;
 import com.yugabyte.yw.models.Universe;
 import com.yugabyte.yw.models.helpers.PlacementInfo;
 import com.yugabyte.yw.models.helpers.TaskType;
-import java.io.File;
 import java.io.IOException;
 import java.security.NoSuchAlgorithmException;
 import java.util.Arrays;
@@ -60,14 +59,13 @@ public abstract class UpgradeTaskTest extends CommissionerBaseTest {
 
   protected YBClient mockClient;
   protected Universe defaultUniverse;
-  protected ShellResponse dummyShellResponse;
 
   protected Region region;
   protected AvailabilityZone az1;
   protected AvailabilityZone az2;
   protected AvailabilityZone az3;
 
-  protected String certContents =
+  protected static final String CERT_CONTENTS =
       "-----BEGIN CERTIFICATE-----\n"
           + "MIIDEjCCAfqgAwIBAgIUEdzNoxkMLrZCku6H1jQ4pUgPtpQwDQYJKoZIhvcNAQEL\n"
           + "BQAwLzERMA8GA1UECgwIWXVnYWJ5dGUxGjAYBgNVBAMMEUNBIGZvciBZdWdhYnl0\n"
@@ -88,9 +86,10 @@ public abstract class UpgradeTaskTest extends CommissionerBaseTest {
           + "YvtLjmJF//b3rsty6NFIonSVgq6Nqw==\n"
           + "-----END CERTIFICATE-----\n";
 
-  protected List<String> PROPERTY_KEYS = ImmutableList.of("processType", "taskSubType");
+  protected static final List<String> PROPERTY_KEYS =
+      ImmutableList.of("processType", "taskSubType");
 
-  protected List<TaskType> NON_NODE_TASKS =
+  protected static final List<TaskType> NON_NODE_TASKS =
       ImmutableList.of(
           TaskType.LoadBalancerStateChange,
           TaskType.UpdateAndPersistGFlags,
@@ -99,6 +98,7 @@ public abstract class UpgradeTaskTest extends CommissionerBaseTest {
           TaskType.UniverseSetTlsParams,
           TaskType.UniverseUpdateSucceeded);
 
+  @Override
   @Before
   public void setUp() {
     super.setUp();
@@ -116,8 +116,7 @@ public abstract class UpgradeTaskTest extends CommissionerBaseTest {
     customCertInfo.rootCertPath = "rootCertPath";
     customCertInfo.nodeCertPath = "nodeCertPath";
     customCertInfo.nodeKeyPath = "nodeKeyPath";
-    new File(TestHelper.TMP_PATH).mkdirs();
-    createTempFile("ca.crt", certContents);
+    createTempFile("upgrade_task_test_ca.crt", CERT_CONTENTS);
     try {
       CertificateInfo.create(
           certUUID,
@@ -125,7 +124,7 @@ public abstract class UpgradeTaskTest extends CommissionerBaseTest {
           "test",
           date,
           date,
-          TestHelper.TMP_PATH + "/ca.crt",
+          TestHelper.TMP_PATH + "/upgrade_task_test_ca.crt",
           customCertInfo);
     } catch (IOException | NoSuchAlgorithmException ignored) {
     }
@@ -160,7 +159,7 @@ public abstract class UpgradeTaskTest extends CommissionerBaseTest {
     }
 
     // Create dummy shell response
-    dummyShellResponse = new ShellResponse();
+    ShellResponse dummyShellResponse = new ShellResponse();
     when(mockNodeManager.nodeCommand(any(), any())).thenReturn(dummyShellResponse);
   }
 
@@ -176,7 +175,7 @@ public abstract class UpgradeTaskTest extends CommissionerBaseTest {
       int expectedVersion) {
     taskParams.universeUUID = defaultUniverse.universeUUID;
     taskParams.expectedUniverseVersion = expectedVersion;
-    // Need not sleep for default 4min in tests.
+    // Need not sleep for default 3min in tests.
     taskParams.sleepAfterMasterRestartMillis = 5;
     taskParams.sleepAfterTServerRestartMillis = 5;
 
@@ -240,7 +239,10 @@ public abstract class UpgradeTaskTest extends CommissionerBaseTest {
                           return data.isObject() ? data : data.textValue();
                         })
                     .collect(Collectors.toList());
-            values.forEach((actualValue) -> assertEquals(actualValue, expectedValue));
+            values.forEach(
+                actualValue ->
+                    assertEquals(
+                        "Unexpected value for key " + expectedKey, actualValue, expectedValue));
           }
         });
   }

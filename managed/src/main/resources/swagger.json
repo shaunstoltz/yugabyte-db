@@ -106,7 +106,7 @@
         },
         "notifiedState" : {
           "description" : "Alert state in the last-sent notification",
-          "enum" : [ "ACTIVE", "ACKNOWLEDGED", "RESOLVED" ],
+          "enum" : [ "ACTIVE", "ACKNOWLEDGED", "SUSPENDED", "RESOLVED" ],
           "readOnly" : true,
           "type" : "string"
         },
@@ -131,9 +131,15 @@
           "readOnly" : true,
           "type" : "string"
         },
+        "sourceUUID" : {
+          "description" : "The sourceUUID of the alert",
+          "format" : "uuid",
+          "readOnly" : true,
+          "type" : "string"
+        },
         "state" : {
           "description" : "The alert's state",
-          "enum" : [ "ACTIVE", "ACKNOWLEDGED", "RESOLVED" ],
+          "enum" : [ "ACTIVE", "ACKNOWLEDGED", "SUSPENDED", "RESOLVED" ],
           "readOnly" : true,
           "type" : "string"
         },
@@ -148,7 +154,7 @@
           "type" : "string"
         }
       },
-      "required" : [ "configurationType", "configurationUuid", "createTime", "customerUUID", "definitionUuid", "labels", "message", "name", "severity", "severityIndex", "sourceName", "state", "stateIndex" ],
+      "required" : [ "configurationType", "configurationUuid", "createTime", "customerUUID", "definitionUuid", "labels", "message", "name", "severity", "severityIndex", "sourceName", "sourceUUID", "state", "stateIndex" ],
       "type" : "object"
     },
     "AlertApiFilter" : {
@@ -176,9 +182,17 @@
         "sourceName" : {
           "type" : "string"
         },
+        "sourceUUIDs" : {
+          "items" : {
+            "format" : "uuid",
+            "type" : "string"
+          },
+          "type" : "array",
+          "uniqueItems" : true
+        },
         "states" : {
           "items" : {
-            "enum" : [ "ACTIVE", "ACKNOWLEDGED", "RESOLVED" ],
+            "enum" : [ "ACTIVE", "ACKNOWLEDGED", "SUSPENDED", "RESOLVED" ],
             "type" : "string"
           },
           "type" : "array",
@@ -193,7 +207,7 @@
           "uniqueItems" : true
         }
       },
-      "required" : [ "configurationTypes", "configurationUuid", "severities", "sourceName", "states", "uuids" ],
+      "required" : [ "configurationTypes", "configurationUuid", "severities", "sourceName", "sourceUUIDs", "states", "uuids" ],
       "type" : "object"
     },
     "AlertChannel" : {
@@ -259,6 +273,26 @@
       "required" : [ "alertChannelUUID", "name", "params" ],
       "type" : "object"
     },
+    "AlertChannelPagerDutyParams" : {
+      "allOf" : [ {
+        "$ref" : "#/definitions/AlertChannelParams"
+      }, {
+        "properties" : {
+          "apiKey" : {
+            "maxLength" : 2147483647,
+            "minLength" : 1,
+            "type" : "string"
+          },
+          "routingKey" : {
+            "maxLength" : 2147483647,
+            "minLength" : 1,
+            "type" : "string"
+          }
+        },
+        "required" : [ "apiKey", "routingKey" ],
+        "type" : "object"
+      } ]
+    },
     "AlertChannelParams" : {
       "discriminator" : "channelType",
       "properties" : {
@@ -293,12 +327,29 @@
         "type" : "object"
       } ]
     },
+    "AlertChannelWebHookParams" : {
+      "allOf" : [ {
+        "$ref" : "#/definitions/AlertChannelParams"
+      }, {
+        "properties" : {
+          "webhookUrl" : {
+            "type" : "string"
+          }
+        },
+        "required" : [ "webhookUrl" ],
+        "type" : "object"
+      } ]
+    },
     "AlertConfiguration" : {
       "description" : "Alert configuration",
       "properties" : {
         "active" : {
           "description" : "Is configured alerts raised or not",
           "type" : "boolean"
+        },
+        "alertCount" : {
+          "format" : "double",
+          "type" : "number"
         },
         "createTime" : {
           "description" : "Creation time",
@@ -331,6 +382,16 @@
           "minimum" : 0,
           "type" : "integer"
         },
+        "maintenanceWindowUuids" : {
+          "description" : "Maintenance window UUIDs, applied to this alert config",
+          "items" : {
+            "format" : "uuid",
+            "type" : "string"
+          },
+          "readOnly" : true,
+          "type" : "array",
+          "uniqueItems" : true
+        },
         "name" : {
           "description" : "Name",
           "maxLength" : 1000,
@@ -349,7 +410,7 @@
         },
         "template" : {
           "description" : "Template name",
-          "enum" : [ "REPLICATION_LAG", "CLOCK_SKEW", "MEMORY_CONSUMPTION", "HEALTH_CHECK_ERROR", "HEALTH_CHECK_NOTIFICATION_ERROR", "BACKUP_FAILURE", "BACKUP_SCHEDULE_FAILURE", "INACTIVE_CRON_NODES", "ALERT_QUERY_FAILED", "ALERT_CONFIG_WRITING_FAILED", "ALERT_NOTIFICATION_ERROR", "ALERT_NOTIFICATION_CHANNEL_ERROR", "NODE_DOWN", "NODE_RESTART", "NODE_CPU_USAGE", "NODE_DISK_USAGE", "NODE_FILE_DESCRIPTORS_USAGE", "DB_VERSION_MISMATCH", "DB_INSTANCE_DOWN", "DB_INSTANCE_RESTART", "DB_FATAL_LOGS", "DB_ERROR_LOGS", "DB_CORE_FILES", "DB_YSQL_CONNECTION", "DB_YCQL_CONNECTION", "DB_REDIS_CONNECTION", "NODE_TO_NODE_CA_CERT_EXPIRY", "NODE_TO_NODE_CERT_EXPIRY", "CLIENT_TO_NODE_CA_CERT_EXPIRY", "CLIENT_TO_NODE_CERT_EXPIRY", "YSQL_OP_AVG_LATENCY", "YCQL_OP_AVG_LATENCY", "YSQL_OP_P99_LATENCY", "YCQL_OP_P99_LATENCY", "HIGH_NUM_YCQL_CONNECTIONS", "HIGH_NUM_YEDIS_CONNECTIONS", "YSQL_THROUGHPUT", "YCQL_THROUGHPUT" ],
+          "enum" : [ "REPLICATION_LAG", "CLOCK_SKEW", "MEMORY_CONSUMPTION", "HEALTH_CHECK_ERROR", "HEALTH_CHECK_NOTIFICATION_ERROR", "BACKUP_FAILURE", "BACKUP_SCHEDULE_FAILURE", "INACTIVE_CRON_NODES", "ALERT_QUERY_FAILED", "ALERT_CONFIG_WRITING_FAILED", "ALERT_NOTIFICATION_ERROR", "ALERT_NOTIFICATION_CHANNEL_ERROR", "NODE_DOWN", "NODE_RESTART", "NODE_CPU_USAGE", "NODE_DISK_USAGE", "NODE_FILE_DESCRIPTORS_USAGE", "NODE_OOM_KILLS", "DB_VERSION_MISMATCH", "DB_INSTANCE_DOWN", "DB_INSTANCE_RESTART", "DB_FATAL_LOGS", "DB_ERROR_LOGS", "DB_CORE_FILES", "DB_YSQL_CONNECTION", "DB_YCQL_CONNECTION", "DB_REDIS_CONNECTION", "DB_MEMORY_OVERLOAD", "DB_COMPACTION_OVERLOAD", "DB_QUEUES_OVERFLOW", "DB_WRITE_READ_TEST_ERROR", "NODE_TO_NODE_CA_CERT_EXPIRY", "NODE_TO_NODE_CERT_EXPIRY", "CLIENT_TO_NODE_CA_CERT_EXPIRY", "CLIENT_TO_NODE_CERT_EXPIRY", "YSQL_OP_AVG_LATENCY", "YCQL_OP_AVG_LATENCY", "YSQL_OP_P99_LATENCY", "YCQL_OP_P99_LATENCY", "HIGH_NUM_YSQL_CONNECTIONS", "HIGH_NUM_YCQL_CONNECTIONS", "HIGH_NUM_YEDIS_CONNECTIONS", "YSQL_THROUGHPUT", "YCQL_THROUGHPUT", "MASTER_LEADER_MISSING", "LEADERLESS_TABLETS", "UNDER_REPLICATED_TABLETS" ],
           "readOnly" : true,
           "type" : "string"
         },
@@ -373,7 +434,7 @@
           "type" : "string"
         }
       },
-      "required" : [ "active", "createTime", "customerUUID", "defaultDestination", "description", "durationSec", "name", "target", "targetType", "template", "thresholdUnit", "thresholds" ],
+      "required" : [ "active", "alertCount", "createTime", "customerUUID", "defaultDestination", "description", "durationSec", "name", "target", "targetType", "template", "thresholdUnit", "thresholds" ],
       "type" : "object"
     },
     "AlertConfigurationApiFilter" : {
@@ -392,12 +453,19 @@
         "name" : {
           "type" : "string"
         },
+        "severity" : {
+          "enum" : [ "SEVERE", "WARNING" ],
+          "type" : "string"
+        },
+        "target" : {
+          "$ref" : "#/definitions/AlertConfigurationTarget"
+        },
         "targetType" : {
           "enum" : [ "PLATFORM", "UNIVERSE" ],
           "type" : "string"
         },
         "template" : {
-          "enum" : [ "REPLICATION_LAG", "CLOCK_SKEW", "MEMORY_CONSUMPTION", "HEALTH_CHECK_ERROR", "HEALTH_CHECK_NOTIFICATION_ERROR", "BACKUP_FAILURE", "BACKUP_SCHEDULE_FAILURE", "INACTIVE_CRON_NODES", "ALERT_QUERY_FAILED", "ALERT_CONFIG_WRITING_FAILED", "ALERT_NOTIFICATION_ERROR", "ALERT_NOTIFICATION_CHANNEL_ERROR", "NODE_DOWN", "NODE_RESTART", "NODE_CPU_USAGE", "NODE_DISK_USAGE", "NODE_FILE_DESCRIPTORS_USAGE", "DB_VERSION_MISMATCH", "DB_INSTANCE_DOWN", "DB_INSTANCE_RESTART", "DB_FATAL_LOGS", "DB_ERROR_LOGS", "DB_CORE_FILES", "DB_YSQL_CONNECTION", "DB_YCQL_CONNECTION", "DB_REDIS_CONNECTION", "NODE_TO_NODE_CA_CERT_EXPIRY", "NODE_TO_NODE_CERT_EXPIRY", "CLIENT_TO_NODE_CA_CERT_EXPIRY", "CLIENT_TO_NODE_CERT_EXPIRY", "YSQL_OP_AVG_LATENCY", "YCQL_OP_AVG_LATENCY", "YSQL_OP_P99_LATENCY", "YCQL_OP_P99_LATENCY", "HIGH_NUM_YCQL_CONNECTIONS", "HIGH_NUM_YEDIS_CONNECTIONS", "YSQL_THROUGHPUT", "YCQL_THROUGHPUT" ],
+          "enum" : [ "REPLICATION_LAG", "CLOCK_SKEW", "MEMORY_CONSUMPTION", "HEALTH_CHECK_ERROR", "HEALTH_CHECK_NOTIFICATION_ERROR", "BACKUP_FAILURE", "BACKUP_SCHEDULE_FAILURE", "INACTIVE_CRON_NODES", "ALERT_QUERY_FAILED", "ALERT_CONFIG_WRITING_FAILED", "ALERT_NOTIFICATION_ERROR", "ALERT_NOTIFICATION_CHANNEL_ERROR", "NODE_DOWN", "NODE_RESTART", "NODE_CPU_USAGE", "NODE_DISK_USAGE", "NODE_FILE_DESCRIPTORS_USAGE", "NODE_OOM_KILLS", "DB_VERSION_MISMATCH", "DB_INSTANCE_DOWN", "DB_INSTANCE_RESTART", "DB_FATAL_LOGS", "DB_ERROR_LOGS", "DB_CORE_FILES", "DB_YSQL_CONNECTION", "DB_YCQL_CONNECTION", "DB_REDIS_CONNECTION", "DB_MEMORY_OVERLOAD", "DB_COMPACTION_OVERLOAD", "DB_QUEUES_OVERFLOW", "DB_WRITE_READ_TEST_ERROR", "NODE_TO_NODE_CA_CERT_EXPIRY", "NODE_TO_NODE_CERT_EXPIRY", "CLIENT_TO_NODE_CA_CERT_EXPIRY", "CLIENT_TO_NODE_CERT_EXPIRY", "YSQL_OP_AVG_LATENCY", "YCQL_OP_AVG_LATENCY", "YSQL_OP_P99_LATENCY", "YCQL_OP_P99_LATENCY", "HIGH_NUM_YSQL_CONNECTIONS", "HIGH_NUM_YCQL_CONNECTIONS", "HIGH_NUM_YEDIS_CONNECTIONS", "YSQL_THROUGHPUT", "YCQL_THROUGHPUT", "MASTER_LEADER_MISSING", "LEADERLESS_TABLETS", "UNDER_REPLICATED_TABLETS" ],
           "type" : "string"
         },
         "uuids" : {
@@ -409,7 +477,7 @@
           "uniqueItems" : true
         }
       },
-      "required" : [ "active", "destinationType", "destinationUuid", "name", "targetType", "template", "uuids" ],
+      "required" : [ "active", "destinationType", "destinationUuid", "name", "severity", "target", "targetType", "template", "uuids" ],
       "type" : "object"
     },
     "AlertConfigurationPagedApiQuery" : {
@@ -433,7 +501,7 @@
           "type" : "integer"
         },
         "sortBy" : {
-          "enum" : [ "uuid", "name", "active", "targetType", "createTime", "template" ],
+          "enum" : [ "uuid", "name", "active", "targetType", "target", "createTime", "template", "severity", "destination", "alertCount" ],
           "type" : "string"
         }
       },
@@ -488,6 +556,10 @@
           "description" : "Is configured alerts raised or not",
           "type" : "boolean"
         },
+        "alertCount" : {
+          "format" : "double",
+          "type" : "number"
+        },
         "createTime" : {
           "description" : "Creation time",
           "format" : "date-time",
@@ -519,6 +591,16 @@
           "minimum" : 0,
           "type" : "integer"
         },
+        "maintenanceWindowUuids" : {
+          "description" : "Maintenance window UUIDs, applied to this alert config",
+          "items" : {
+            "format" : "uuid",
+            "type" : "string"
+          },
+          "readOnly" : true,
+          "type" : "array",
+          "uniqueItems" : true
+        },
         "name" : {
           "description" : "Name",
           "maxLength" : 1000,
@@ -537,7 +619,7 @@
         },
         "template" : {
           "description" : "Template name",
-          "enum" : [ "REPLICATION_LAG", "CLOCK_SKEW", "MEMORY_CONSUMPTION", "HEALTH_CHECK_ERROR", "HEALTH_CHECK_NOTIFICATION_ERROR", "BACKUP_FAILURE", "BACKUP_SCHEDULE_FAILURE", "INACTIVE_CRON_NODES", "ALERT_QUERY_FAILED", "ALERT_CONFIG_WRITING_FAILED", "ALERT_NOTIFICATION_ERROR", "ALERT_NOTIFICATION_CHANNEL_ERROR", "NODE_DOWN", "NODE_RESTART", "NODE_CPU_USAGE", "NODE_DISK_USAGE", "NODE_FILE_DESCRIPTORS_USAGE", "DB_VERSION_MISMATCH", "DB_INSTANCE_DOWN", "DB_INSTANCE_RESTART", "DB_FATAL_LOGS", "DB_ERROR_LOGS", "DB_CORE_FILES", "DB_YSQL_CONNECTION", "DB_YCQL_CONNECTION", "DB_REDIS_CONNECTION", "NODE_TO_NODE_CA_CERT_EXPIRY", "NODE_TO_NODE_CERT_EXPIRY", "CLIENT_TO_NODE_CA_CERT_EXPIRY", "CLIENT_TO_NODE_CERT_EXPIRY", "YSQL_OP_AVG_LATENCY", "YCQL_OP_AVG_LATENCY", "YSQL_OP_P99_LATENCY", "YCQL_OP_P99_LATENCY", "HIGH_NUM_YCQL_CONNECTIONS", "HIGH_NUM_YEDIS_CONNECTIONS", "YSQL_THROUGHPUT", "YCQL_THROUGHPUT" ],
+          "enum" : [ "REPLICATION_LAG", "CLOCK_SKEW", "MEMORY_CONSUMPTION", "HEALTH_CHECK_ERROR", "HEALTH_CHECK_NOTIFICATION_ERROR", "BACKUP_FAILURE", "BACKUP_SCHEDULE_FAILURE", "INACTIVE_CRON_NODES", "ALERT_QUERY_FAILED", "ALERT_CONFIG_WRITING_FAILED", "ALERT_NOTIFICATION_ERROR", "ALERT_NOTIFICATION_CHANNEL_ERROR", "NODE_DOWN", "NODE_RESTART", "NODE_CPU_USAGE", "NODE_DISK_USAGE", "NODE_FILE_DESCRIPTORS_USAGE", "NODE_OOM_KILLS", "DB_VERSION_MISMATCH", "DB_INSTANCE_DOWN", "DB_INSTANCE_RESTART", "DB_FATAL_LOGS", "DB_ERROR_LOGS", "DB_CORE_FILES", "DB_YSQL_CONNECTION", "DB_YCQL_CONNECTION", "DB_REDIS_CONNECTION", "DB_MEMORY_OVERLOAD", "DB_COMPACTION_OVERLOAD", "DB_QUEUES_OVERFLOW", "DB_WRITE_READ_TEST_ERROR", "NODE_TO_NODE_CA_CERT_EXPIRY", "NODE_TO_NODE_CERT_EXPIRY", "CLIENT_TO_NODE_CA_CERT_EXPIRY", "CLIENT_TO_NODE_CERT_EXPIRY", "YSQL_OP_AVG_LATENCY", "YCQL_OP_AVG_LATENCY", "YSQL_OP_P99_LATENCY", "YCQL_OP_P99_LATENCY", "HIGH_NUM_YSQL_CONNECTIONS", "HIGH_NUM_YCQL_CONNECTIONS", "HIGH_NUM_YEDIS_CONNECTIONS", "YSQL_THROUGHPUT", "YCQL_THROUGHPUT", "MASTER_LEADER_MISSING", "LEADERLESS_TABLETS", "UNDER_REPLICATED_TABLETS" ],
           "readOnly" : true,
           "type" : "string"
         },
@@ -593,7 +675,7 @@
           "type" : "string"
         }
       },
-      "required" : [ "active", "createTime", "customerUUID", "defaultDestination", "description", "durationSec", "name", "target", "targetType", "template", "thresholdUnit", "thresholds" ],
+      "required" : [ "active", "alertCount", "createTime", "customerUUID", "defaultDestination", "description", "durationSec", "name", "target", "targetType", "template", "thresholdUnit", "thresholds" ],
       "type" : "object"
     },
     "AlertConfigurationThreshold" : {
@@ -813,6 +895,11 @@
     "AlertingData" : {
       "description" : "Alerting configuration",
       "properties" : {
+        "activeAlertNotificationIntervalMs" : {
+          "description" : "Period, which is used to send active alert notifications",
+          "format" : "int64",
+          "type" : "integer"
+        },
         "alertingEmail" : {
           "description" : "Alert email address",
           "example" : "test@example.com",
@@ -837,29 +924,6 @@
           "type" : "integer"
         }
       },
-      "type" : "object"
-    },
-    "AsyncReplicationConfig" : {
-      "properties" : {
-        "active" : {
-          "type" : "boolean"
-        },
-        "sourceTableID" : {
-          "type" : "string"
-        },
-        "sourceUniverseUUID" : {
-          "format" : "uuid",
-          "type" : "string"
-        },
-        "targetTableID" : {
-          "type" : "string"
-        },
-        "targetUniverseUUID" : {
-          "format" : "uuid",
-          "type" : "string"
-        }
-      },
-      "required" : [ "active", "sourceTableID", "sourceUniverseUUID", "targetTableID", "targetUniverseUUID" ],
       "type" : "object"
     },
     "Audit" : {
@@ -924,6 +988,13 @@
           "description" : "AZ code",
           "example" : "AWS",
           "type" : "string"
+        },
+        "config" : {
+          "additionalProperties" : {
+            "type" : "string"
+          },
+          "description" : "AZ configuration values",
+          "type" : "object"
         },
         "kubeconfigPath" : {
           "description" : "Path to Kubernetes configuration file",
@@ -1021,7 +1092,7 @@
         },
         "state" : {
           "description" : "State of the backup",
-          "enum" : [ "InProgress", "Completed", "Failed", "Deleted", "Skipped", "FailedToDelete", "Stopped" ],
+          "enum" : [ "InProgress", "Completed", "Failed", "Deleted", "Skipped", "FailedToDelete", "Stopped", "DeleteInProgress", "QueuedForDeletion" ],
           "example" : "DELETED",
           "readOnly" : true,
           "type" : "string"
@@ -1072,6 +1143,10 @@
         "communicationPorts" : {
           "$ref" : "#/definitions/CommunicationPorts",
           "description" : "Communication ports"
+        },
+        "controller" : {
+          "description" : "Controller type",
+          "type" : "string"
         },
         "cronExpression" : {
           "description" : "Cron expression for a recurring backup",
@@ -1124,6 +1199,11 @@
           "format" : "uuid",
           "type" : "string"
         },
+        "minNumBackupsToRetain" : {
+          "description" : "Minimum number of backups to retain for a particular backup schedule",
+          "format" : "int32",
+          "type" : "integer"
+        },
         "nodeDetailsSet" : {
           "description" : "Node details",
           "items" : {
@@ -1141,6 +1221,11 @@
           "format" : "int32",
           "type" : "integer"
         },
+        "previousTaskUUID" : {
+          "description" : "Previous task UUID only if this task is a retry",
+          "format" : "uuid",
+          "type" : "string"
+        },
         "restoreTimeStamp" : {
           "description" : "Restore TimeStamp",
           "type" : "string"
@@ -1155,10 +1240,11 @@
           "format" : "int64",
           "type" : "integer"
         },
-        "sourceAsyncReplicationRelationships" : {
-          "description" : "The source universe's sync replication relationships",
+        "sourceXClusterConfigs" : {
+          "description" : "The source universe's xcluster replication relationships",
           "items" : {
-            "$ref" : "#/definitions/AsyncReplicationConfig"
+            "format" : "uuid",
+            "type" : "string"
           },
           "readOnly" : true,
           "type" : "array"
@@ -1200,10 +1286,11 @@
           },
           "type" : "array"
         },
-        "targetAsyncReplicationRelationships" : {
-          "description" : "The target universe's async replication relationships",
+        "targetXClusterConfigs" : {
+          "description" : "The target universe's xcluster replication relationships",
           "items" : {
-            "$ref" : "#/definitions/AsyncReplicationConfig"
+            "format" : "uuid",
+            "type" : "string"
           },
           "readOnly" : true,
           "type" : "array"
@@ -1227,7 +1314,7 @@
           "type" : "string"
         }
       },
-      "required" : [ "actionType", "storageConfigUUID" ],
+      "required" : [ "storageConfigUUID" ],
       "type" : "object"
     },
     "BulkImportParams" : {
@@ -1287,14 +1374,20 @@
           "description" : "Node exporter user",
           "type" : "string"
         },
+        "previousTaskUUID" : {
+          "description" : "Previous task UUID only if this task is a retry",
+          "format" : "uuid",
+          "type" : "string"
+        },
         "s3Bucket" : {
           "description" : "S3 bucket URL",
           "type" : "string"
         },
-        "sourceAsyncReplicationRelationships" : {
-          "description" : "The source universe's sync replication relationships",
+        "sourceXClusterConfigs" : {
+          "description" : "The source universe's xcluster replication relationships",
           "items" : {
-            "$ref" : "#/definitions/AsyncReplicationConfig"
+            "format" : "uuid",
+            "type" : "string"
           },
           "readOnly" : true,
           "type" : "array"
@@ -1312,10 +1405,11 @@
           "format" : "uuid",
           "type" : "string"
         },
-        "targetAsyncReplicationRelationships" : {
-          "description" : "The target universe's async replication relationships",
+        "targetXClusterConfigs" : {
+          "description" : "The target universe's xcluster replication relationships",
           "items" : {
-            "$ref" : "#/definitions/AsyncReplicationConfig"
+            "format" : "uuid",
+            "type" : "string"
           },
           "readOnly" : true,
           "type" : "array"
@@ -1738,7 +1832,7 @@
         },
         "creationDate" : {
           "description" : "Creation time",
-          "example" : "2021-06-17 15:00:05",
+          "example" : "2021-06-17T15:00:05-0400",
           "format" : "date-time",
           "readOnly" : true,
           "type" : "string"
@@ -1829,7 +1923,7 @@
         "configName" : {
           "description" : "Config name",
           "example" : "backup20-01-2021",
-          "maxLength" : 50,
+          "maxLength" : 100,
           "minLength" : 1,
           "type" : "string"
         },
@@ -1873,7 +1967,7 @@
         "configName" : {
           "description" : "Config name",
           "example" : "backup20-01-2021",
-          "maxLength" : 50,
+          "maxLength" : 100,
           "minLength" : 1,
           "type" : "string"
         },
@@ -1998,15 +2092,19 @@
     "CustomerTaskData" : {
       "description" : "Customer task data",
       "properties" : {
+        "abortable" : {
+          "description" : "Customer task abortable",
+          "type" : "boolean"
+        },
         "completionTime" : {
           "description" : "Customer task completion time",
-          "example" : "1624295417405",
+          "example" : "2021-06-17T15:00:05-0400",
           "format" : "date-time",
           "type" : "string"
         },
         "createTime" : {
           "description" : "Customer task creation time",
-          "example" : "1624295417405",
+          "example" : "2021-06-17T15:00:05-0400",
           "format" : "date-time",
           "type" : "string"
         },
@@ -2020,6 +2118,10 @@
           "example" : 100,
           "format" : "int32",
           "type" : "integer"
+        },
+        "retryable" : {
+          "description" : "Customer task retryable",
+          "type" : "boolean"
         },
         "status" : {
           "description" : "Customer task status",
@@ -2288,6 +2390,9 @@
         "airGapInstall" : {
           "type" : "boolean"
         },
+        "deleteRemote" : {
+          "type" : "boolean"
+        },
         "installNodeExporter" : {
           "type" : "boolean"
         },
@@ -2341,13 +2446,127 @@
       "required" : [ "lines" ],
       "type" : "object"
     },
-    "LoggingConfigFormData" : {
+    "MaintenanceWindow" : {
+      "description" : "Maintenance Window",
       "properties" : {
-        "level" : {
+        "alertConfigurationFilter" : {
+          "$ref" : "#/definitions/AlertConfigurationApiFilter",
+          "description" : "Alert configuration filter"
+        },
+        "createTime" : {
+          "description" : "Creation time",
+          "format" : "date-time",
+          "readOnly" : true,
+          "type" : "string"
+        },
+        "customerUUID" : {
+          "description" : "Customer UUID",
+          "format" : "uuid",
+          "readOnly" : true,
+          "type" : "string"
+        },
+        "endTime" : {
+          "description" : "End time",
+          "format" : "date-time",
+          "type" : "string"
+        },
+        "name" : {
+          "description" : "Name",
+          "maxLength" : 1000,
+          "minLength" : 1,
+          "type" : "string"
+        },
+        "startTime" : {
+          "description" : "Start time",
+          "format" : "date-time",
+          "type" : "string"
+        },
+        "state" : {
+          "description" : "State",
+          "enum" : [ "FINISHED", "ACTIVE", "PENDING" ],
+          "readOnly" : true,
+          "type" : "string"
+        },
+        "uuid" : {
+          "description" : "Maintenance window UUID",
+          "format" : "uuid",
+          "readOnly" : true,
           "type" : "string"
         }
       },
-      "required" : [ "level" ],
+      "required" : [ "alertConfigurationFilter", "createTime", "customerUUID", "endTime", "name", "startTime" ],
+      "type" : "object"
+    },
+    "MaintenanceWindowApiFilter" : {
+      "properties" : {
+        "states" : {
+          "items" : {
+            "enum" : [ "FINISHED", "ACTIVE", "PENDING" ],
+            "type" : "string"
+          },
+          "type" : "array",
+          "uniqueItems" : true
+        },
+        "uuids" : {
+          "items" : {
+            "format" : "uuid",
+            "type" : "string"
+          },
+          "type" : "array",
+          "uniqueItems" : true
+        }
+      },
+      "required" : [ "states", "uuids" ],
+      "type" : "object"
+    },
+    "MaintenanceWindowPagedApiQuery" : {
+      "properties" : {
+        "direction" : {
+          "enum" : [ "ASC", "DESC" ],
+          "type" : "string"
+        },
+        "filter" : {
+          "$ref" : "#/definitions/MaintenanceWindowApiFilter"
+        },
+        "limit" : {
+          "format" : "int32",
+          "type" : "integer"
+        },
+        "needTotalCount" : {
+          "type" : "boolean"
+        },
+        "offset" : {
+          "format" : "int32",
+          "type" : "integer"
+        },
+        "sortBy" : {
+          "enum" : [ "uuid", "name", "createTime", "startTime", "endTime", "state" ],
+          "type" : "string"
+        }
+      },
+      "required" : [ "direction", "filter", "limit", "needTotalCount", "offset", "sortBy" ],
+      "type" : "object"
+    },
+    "MaintenanceWindowPagedResponse" : {
+      "properties" : {
+        "entities" : {
+          "items" : {
+            "$ref" : "#/definitions/MaintenanceWindow"
+          },
+          "type" : "array"
+        },
+        "hasNext" : {
+          "type" : "boolean"
+        },
+        "hasPrev" : {
+          "type" : "boolean"
+        },
+        "totalCount" : {
+          "format" : "int32",
+          "type" : "integer"
+        }
+      },
+      "required" : [ "entities", "hasNext", "hasPrev", "totalCount" ],
       "type" : "object"
     },
     "MasterNode" : {
@@ -2382,6 +2601,10 @@
           "description" : "End time",
           "format" : "int64",
           "type" : "integer"
+        },
+        "isRecharts" : {
+          "description" : "Is Recharts",
+          "type" : "boolean"
         },
         "metrics" : {
           "description" : "Metrics",
@@ -2440,6 +2663,10 @@
           "$ref" : "#/definitions/CommunicationPorts",
           "description" : "Communication ports"
         },
+        "controller" : {
+          "description" : "Controller type",
+          "type" : "string"
+        },
         "cronExpression" : {
           "description" : "Cron expression for a recurring backup",
           "type" : "string"
@@ -2495,6 +2722,11 @@
           "format" : "uuid",
           "type" : "string"
         },
+        "minNumBackupsToRetain" : {
+          "description" : "Minimum number of backups to retain for a particular backup schedule",
+          "format" : "int32",
+          "type" : "integer"
+        },
         "nodeDetailsSet" : {
           "description" : "Node details",
           "items" : {
@@ -2512,6 +2744,11 @@
           "format" : "int32",
           "type" : "integer"
         },
+        "previousTaskUUID" : {
+          "description" : "Previous task UUID only if this task is a retry",
+          "format" : "uuid",
+          "type" : "string"
+        },
         "restoreTimeStamp" : {
           "description" : "Restore TimeStamp",
           "type" : "string"
@@ -2526,10 +2763,11 @@
           "format" : "int64",
           "type" : "integer"
         },
-        "sourceAsyncReplicationRelationships" : {
-          "description" : "The source universe's sync replication relationships",
+        "sourceXClusterConfigs" : {
+          "description" : "The source universe's xcluster replication relationships",
           "items" : {
-            "$ref" : "#/definitions/AsyncReplicationConfig"
+            "format" : "uuid",
+            "type" : "string"
           },
           "readOnly" : true,
           "type" : "array"
@@ -2570,10 +2808,11 @@
           },
           "type" : "array"
         },
-        "targetAsyncReplicationRelationships" : {
-          "description" : "The target universe's async replication relationships",
+        "targetXClusterConfigs" : {
+          "description" : "The target universe's xcluster replication relationships",
           "items" : {
-            "$ref" : "#/definitions/AsyncReplicationConfig"
+            "format" : "uuid",
+            "type" : "string"
           },
           "readOnly" : true,
           "type" : "array"
@@ -2597,7 +2836,7 @@
           "type" : "string"
         }
       },
-      "required" : [ "actionType", "customerUUID", "storageConfigUUID", "tableUUIDList" ],
+      "required" : [ "customerUUID", "storageConfigUUID", "tableUUIDList" ],
       "type" : "object"
     },
     "MultiTableBackupRequestParams" : {
@@ -2632,6 +2871,10 @@
         "communicationPorts" : {
           "$ref" : "#/definitions/CommunicationPorts",
           "description" : "Communication ports"
+        },
+        "controller" : {
+          "description" : "Controller type",
+          "type" : "string"
         },
         "cronExpression" : {
           "description" : "Cron expression for a recurring backup",
@@ -2689,6 +2932,11 @@
           "format" : "uuid",
           "type" : "string"
         },
+        "minNumBackupsToRetain" : {
+          "description" : "Minimum number of backups to retain for a particular backup schedule",
+          "format" : "int32",
+          "type" : "integer"
+        },
         "nodeDetailsSet" : {
           "description" : "Node details",
           "items" : {
@@ -2706,6 +2954,11 @@
           "format" : "int32",
           "type" : "integer"
         },
+        "previousTaskUUID" : {
+          "description" : "Previous task UUID only if this task is a retry",
+          "format" : "uuid",
+          "type" : "string"
+        },
         "restoreTimeStamp" : {
           "description" : "Restore TimeStamp",
           "type" : "string"
@@ -2720,10 +2973,11 @@
           "format" : "int64",
           "type" : "integer"
         },
-        "sourceAsyncReplicationRelationships" : {
-          "description" : "The source universe's sync replication relationships",
+        "sourceXClusterConfigs" : {
+          "description" : "The source universe's xcluster replication relationships",
           "items" : {
-            "$ref" : "#/definitions/AsyncReplicationConfig"
+            "format" : "uuid",
+            "type" : "string"
           },
           "readOnly" : true,
           "type" : "array"
@@ -2765,10 +3019,11 @@
           },
           "type" : "array"
         },
-        "targetAsyncReplicationRelationships" : {
-          "description" : "The target universe's async replication relationships",
+        "targetXClusterConfigs" : {
+          "description" : "The target universe's xcluster replication relationships",
           "items" : {
-            "$ref" : "#/definitions/AsyncReplicationConfig"
+            "format" : "uuid",
+            "type" : "string"
           },
           "readOnly" : true,
           "type" : "array"
@@ -2792,13 +3047,13 @@
           "type" : "string"
         }
       },
-      "required" : [ "actionType", "storageConfigUUID" ],
+      "required" : [ "storageConfigUUID" ],
       "type" : "object"
     },
     "NodeActionFormData" : {
       "properties" : {
         "nodeAction" : {
-          "enum" : [ "ADD", "REMOVE", "START", "STOP", "DELETE", "QUERY", "RELEASE", "START_MASTER" ],
+          "enum" : [ "ADD", "REMOVE", "START", "STOP", "DELETE", "QUERY", "RELEASE", "START_MASTER", "PRECHECK_DETACHED" ],
           "type" : "string"
         }
       },
@@ -2855,6 +3110,12 @@
           "format" : "int32",
           "type" : "integer"
         },
+        "masterState" : {
+          "description" : "Master state",
+          "enum" : [ "None", "ToStart", "Configured", "ToStop" ],
+          "example" : "ToStart",
+          "type" : "string"
+        },
         "nodeExporterPort" : {
           "description" : "Node exporter port",
           "format" : "int32",
@@ -2867,6 +3128,10 @@
         },
         "nodeName" : {
           "description" : "Node name",
+          "type" : "string"
+        },
+        "nodeUUID" : {
+          "format" : "uuid",
           "type" : "string"
         },
         "nodeUuid" : {
@@ -2891,7 +3156,7 @@
         },
         "state" : {
           "description" : "Node state",
-          "enum" : [ "ToBeAdded", "ToJoinCluster", "Provisioned", "SoftwareInstalled", "UpgradeSoftware", "UpdateGFlags", "Live", "Stopping", "Starting", "Stopped", "Unreachable", "ToBeRemoved", "Removing", "Removed", "Adding", "BeingDecommissioned", "Decommissioned", "UpdateCert", "ToggleTls", "Resizing" ],
+          "enum" : [ "ToBeAdded", "InstanceCreated", "ServerSetup", "ToJoinCluster", "Provisioned", "SoftwareInstalled", "UpgradeSoftware", "UpdateGFlags", "Live", "Stopping", "Starting", "Stopped", "Unreachable", "ToBeRemoved", "Removing", "Removed", "Adding", "BeingDecommissioned", "Decommissioned", "UpdateCert", "ToggleTls", "Resizing", "SystemdUpgrade" ],
           "example" : "Provisioned",
           "type" : "string"
         },
@@ -2926,13 +3191,14 @@
           "type" : "integer"
         }
       },
+      "required" : [ "nodeUUID" ],
       "type" : "object"
     },
     "NodeDetailsResp" : {
       "properties" : {
         "allowedActions" : {
           "items" : {
-            "enum" : [ "ADD", "REMOVE", "START", "STOP", "DELETE", "QUERY", "RELEASE", "START_MASTER" ],
+            "enum" : [ "ADD", "REMOVE", "START", "STOP", "DELETE", "QUERY", "RELEASE", "START_MASTER", "PRECHECK_DETACHED" ],
             "type" : "string"
           },
           "readOnly" : true,
@@ -2986,6 +3252,12 @@
           "format" : "int32",
           "type" : "integer"
         },
+        "masterState" : {
+          "description" : "Master state",
+          "enum" : [ "None", "ToStart", "Configured", "ToStop" ],
+          "example" : "ToStart",
+          "type" : "string"
+        },
         "nodeExporterPort" : {
           "description" : "Node exporter port",
           "format" : "int32",
@@ -2998,6 +3270,10 @@
         },
         "nodeName" : {
           "description" : "Node name",
+          "type" : "string"
+        },
+        "nodeUUID" : {
+          "format" : "uuid",
           "type" : "string"
         },
         "nodeUuid" : {
@@ -3022,7 +3298,7 @@
         },
         "state" : {
           "description" : "Node state",
-          "enum" : [ "ToBeAdded", "ToJoinCluster", "Provisioned", "SoftwareInstalled", "UpgradeSoftware", "UpdateGFlags", "Live", "Stopping", "Starting", "Stopped", "Unreachable", "ToBeRemoved", "Removing", "Removed", "Adding", "BeingDecommissioned", "Decommissioned", "UpdateCert", "ToggleTls", "Resizing" ],
+          "enum" : [ "ToBeAdded", "InstanceCreated", "ServerSetup", "ToJoinCluster", "Provisioned", "SoftwareInstalled", "UpgradeSoftware", "UpdateGFlags", "Live", "Stopping", "Starting", "Stopped", "Unreachable", "ToBeRemoved", "Removing", "Removed", "Adding", "BeingDecommissioned", "Decommissioned", "UpdateCert", "ToggleTls", "Resizing", "SystemdUpgrade" ],
           "example" : "Provisioned",
           "type" : "string"
         },
@@ -3057,6 +3333,7 @@
           "type" : "integer"
         }
       },
+      "required" : [ "nodeUUID" ],
       "type" : "object"
     },
     "NodeInstance" : {
@@ -3153,6 +3430,8 @@
           "items" : {
             "$ref" : "#/definitions/NodeInstanceData"
           },
+          "maxItems" : 2147483647,
+          "minItems" : 1,
           "type" : "array"
         }
       },
@@ -3206,6 +3485,10 @@
         "code" : {
           "type" : "string"
         },
+        "defaultRegion" : {
+          "format" : "uuid",
+          "type" : "string"
+        },
         "regionList" : {
           "items" : {
             "$ref" : "#/definitions/PlacementRegion"
@@ -3250,6 +3533,24 @@
           "type" : "string"
         }
       },
+      "type" : "object"
+    },
+    "PlatformLoggingConfig" : {
+      "properties" : {
+        "level" : {
+          "enum" : [ "ERROR", "WARN", "INFO", "DEBUG", "TRACE" ],
+          "type" : "string"
+        },
+        "maxHistory" : {
+          "format" : "int32",
+          "minimum" : 0,
+          "type" : "integer"
+        },
+        "rolloverPattern" : {
+          "type" : "string"
+        }
+      },
+      "required" : [ "level", "maxHistory", "rolloverPattern" ],
       "type" : "object"
     },
     "Provider" : {
@@ -3312,6 +3613,10 @@
           "description" : "Provider name",
           "type" : "string"
         },
+        "overrideKeyValidate" : {
+          "description" : "Transient property - only present in mutate API request",
+          "type" : "boolean"
+        },
         "regions" : {
           "items" : {
             "$ref" : "#/definitions/Region"
@@ -3344,6 +3649,10 @@
     "Region" : {
       "description" : "Region within a given provider. Typically, this maps to a single cloud provider region.",
       "properties" : {
+        "active" : {
+          "readOnly" : true,
+          "type" : "boolean"
+        },
         "code" : {
           "description" : "Cloud provider region code",
           "example" : "us-west-2",
@@ -3560,7 +3869,7 @@
         },
         "taskType" : {
           "description" : "Type of task to be scheduled. This can be either a multi-table backup, or a full-universe backup.",
-          "enum" : [ "CloudBootstrap", "CloudCleanup", "CreateCassandraTable", "CreateUniverse", "ReadOnlyClusterCreate", "ReadOnlyClusterDelete", "CreateKubernetesUniverse", "DestroyUniverse", "PauseUniverse", "ResumeUniverse", "DestroyKubernetesUniverse", "DeleteTable", "BackupUniverse", "MultiTableBackup", "EditUniverse", "EditKubernetesUniverse", "ExternalScript", "KubernetesProvision", "ImportIntoTable", "UpgradeUniverse", "RestartUniverse", "SoftwareUpgrade", "SoftwareKubernetesUpgrade", "GFlagsUpgrade", "GFlagsKubernetesUpgrade", "CertsRotate", "TlsToggle", "VMImageUpgrade", "CreateRootVolumes", "ReplaceRootVolume", "ChangeInstanceType", "PersistResizeNode", "PersistSystemdUpgrade", "UpdateNodeDetails", "UpgradeKubernetesUniverse", "DeleteNodeFromUniverse", "StopNodeInUniverse", "StartNodeInUniverse", "AddNodeToUniverse", "RemoveNodeFromUniverse", "ReleaseInstanceFromUniverse", "SetUniverseKey", "SetKubernetesUniverseKey", "CreateKMSConfig", "DeleteKMSConfig", "UpdateDiskSize", "StartMasterOnNode", "SyncDBStateWithPlatform", "CreateXClusterReplication", "DeleteXClusterReplication", "EditXClusterReplication", "PauseOrResumeXClusterReplication", "AnsibleClusterServerCtl", "AnsibleConfigureServers", "AnsibleDestroyServer", "PauseServer", "ResumeServer", "AnsibleSetupServer", "AnsibleCreateServer", "PrecheckNode", "AnsibleUpdateNodeInfo", "BulkImport", "ChangeMasterConfig", "ChangeAdminPassword", "CreateTable", "DeleteNode", "DeleteBackup", "UpdateNodeProcess", "DeleteTableFromUniverse", "LoadBalancerStateChange", "ModifyBlackList", "ManipulateDnsRecordTask", "RemoveUniverseEntry", "SetFlagInMemory", "SetNodeState", "SwamperTargetsFileUpdate", "UniverseUpdateSucceeded", "UpdateAndPersistGFlags", "UpdatePlacementInfo", "UpdateSoftwareVersion", "WaitForDataMove", "WaitForLoadBalance", "WaitForMasterLeader", "WaitForServer", "WaitForTServerHeartBeats", "DeleteClusterFromUniverse", "InstanceActions", "WaitForServerReady", "RunExternalScript", "CloudAccessKeyCleanup", "CloudAccessKeySetup", "CloudInitializer", "CloudProviderCleanup", "CloudRegionCleanup", "CloudRegionSetup", "CloudSetup", "BackupTable", "BackupUniverseKeys", "RestoreUniverseKeys", "WaitForLeadersOnPreferredOnly", "EnableEncryptionAtRest", "DisableEncryptionAtRest", "DestroyEncryptionAtRest", "KubernetesCommandExecutor", "KubernetesWaitForPod", "KubernetesCheckNumPod", "CopyEncryptionKeyFile", "WaitForEncryptionKeyInMemory", "UnivSetCertificate", "CreateAlertDefinitions", "UniverseSetTlsParams", "UniverseUpdateRootCert", "AsyncReplicationPlatformSync", "AsyncReplicationSetup", "ResetUniverseVersion", "AlterXClusterReplicationAddTables", "AlterXClusterReplicationRemoveTables", "AlterXClusterReplicationChangeMasterAddresses", "XClusterReplicationSetActive", "DeleteCertificate" ],
+          "enum" : [ "CloudBootstrap", "CloudCleanup", "CreateCassandraTable", "CreateUniverse", "ReadOnlyClusterCreate", "ReadOnlyClusterDelete", "CreateKubernetesUniverse", "DestroyUniverse", "PauseUniverse", "ResumeUniverse", "DestroyKubernetesUniverse", "DeleteTable", "BackupUniverse", "MultiTableBackup", "CreateBackup", "EditUniverse", "EditKubernetesUniverse", "ExternalScript", "KubernetesProvision", "ImportIntoTable", "UpgradeUniverse", "RestartUniverse", "SoftwareUpgrade", "SoftwareKubernetesUpgrade", "GFlagsUpgrade", "GFlagsKubernetesUpgrade", "CertsRotate", "TlsToggle", "VMImageUpgrade", "SystemdUpgrade", "CreateRootVolumes", "ReplaceRootVolume", "ChangeInstanceType", "PersistResizeNode", "PersistSystemdUpgrade", "UpdateNodeDetails", "UpgradeKubernetesUniverse", "DeleteNodeFromUniverse", "StopNodeInUniverse", "StartNodeInUniverse", "AddNodeToUniverse", "RemoveNodeFromUniverse", "ReleaseInstanceFromUniverse", "SetUniverseKey", "SetKubernetesUniverseKey", "CreateKMSConfig", "EditKMSConfig", "DeleteKMSConfig", "UpdateDiskSize", "StartMasterOnNode", "CreateXClusterConfig", "EditXClusterConfig", "DeleteXClusterConfig", "SyncXClusterConfig", "CreateSupportBundle", "AnsibleClusterServerCtl", "AnsibleConfigureServers", "AnsibleDestroyServer", "PauseServer", "ResumeServer", "AnsibleSetupServer", "AnsibleCreateServer", "PrecheckNode", "PrecheckNodeDetached", "AnsibleUpdateNodeInfo", "BulkImport", "ChangeMasterConfig", "ChangeAdminPassword", "CreateTable", "DeleteNode", "DeleteBackup", "DeleteBackupYb", "DeleteCustomerConfig", "UpdateNodeProcess", "DeleteTableFromUniverse", "LoadBalancerStateChange", "ModifyBlackList", "ManipulateDnsRecordTask", "RemoveUniverseEntry", "SetFlagInMemory", "SetNodeState", "SwamperTargetsFileUpdate", "UniverseUpdateSucceeded", "UpdateAndPersistGFlags", "UpdatePlacementInfo", "UpdateSoftwareVersion", "WaitForDataMove", "WaitForLeaderBlacklistCompletion", "WaitForFollowerLag", "WaitForLoadBalance", "WaitForMasterLeader", "WaitForServer", "WaitForTServerHeartBeats", "DeleteClusterFromUniverse", "InstanceActions", "WaitForServerReady", "RunExternalScript", "XClusterConfigSetup", "XClusterConfigSetStatus", "XClusterConfigModifyTables", "XClusterConfigRename", "XClusterConfigDelete", "XClusterConfigSync", "CloudAccessKeyCleanup", "CloudAccessKeySetup", "CloudInitializer", "CloudProviderCleanup", "CloudRegionCleanup", "CloudRegionSetup", "CloudSetup", "BackupTable", "BackupTableYb", "BackupUniverseKeys", "RestoreUniverseKeys", "WaitForLeadersOnPreferredOnly", "EnableEncryptionAtRest", "DisableEncryptionAtRest", "DestroyEncryptionAtRest", "KubernetesCommandExecutor", "KubernetesWaitForPod", "KubernetesCheckNumPod", "SetActiveUniverseKeys", "CopyEncryptionKeyFile", "WaitForEncryptionKeyInMemory", "UnivSetCertificate", "CreateAlertDefinitions", "UniverseSetTlsParams", "UniverseUpdateRootCert", "ResetUniverseVersion", "DeleteCertificate", "SetNodeStatus", "CheckMasterLeader", "CheckMasters", "CheckTServers", "WaitForTServerHBs", "CreatePrometheusSwamperConfig", "PreflightNodeCheck", "RunYsqlUpgrade" ],
           "type" : "string"
         }
       },
@@ -3706,10 +4015,16 @@
           "description" : "Node exporter user",
           "type" : "string"
         },
-        "sourceAsyncReplicationRelationships" : {
-          "description" : "The source universe's sync replication relationships",
+        "previousTaskUUID" : {
+          "description" : "Previous task UUID only if this task is a retry",
+          "format" : "uuid",
+          "type" : "string"
+        },
+        "sourceXClusterConfigs" : {
+          "description" : "The source universe's xcluster replication relationships",
           "items" : {
-            "$ref" : "#/definitions/AsyncReplicationConfig"
+            "format" : "uuid",
+            "type" : "string"
           },
           "readOnly" : true,
           "type" : "array"
@@ -3725,10 +4040,11 @@
           "format" : "uuid",
           "type" : "string"
         },
-        "targetAsyncReplicationRelationships" : {
-          "description" : "The target universe's async replication relationships",
+        "targetXClusterConfigs" : {
+          "description" : "The target universe's xcluster replication relationships",
           "items" : {
-            "$ref" : "#/definitions/AsyncReplicationConfig"
+            "format" : "uuid",
+            "type" : "string"
           },
           "readOnly" : true,
           "type" : "array"
@@ -3756,21 +4072,16 @@
           },
           "type" : "array"
         },
-        "cqlcreateKeyspaceString" : {
-          "description" : "CQL create keyspace detail. This is the statement to be used to create the keyspace.",
-          "type" : "string"
-        },
-        "cqlcreateTableString" : {
-          "description" : "CQL create table detail. This is the statement to be used to create the table.",
-          "type" : "string"
-        },
-        "cqluseKeyspaceString" : {
-          "description" : "CQL use keyspace detail. This is the statement to be used to use the keyspace.",
-          "type" : "string"
-        },
         "keyspace" : {
           "description" : "Keyspace to which this table belongs",
           "type" : "string"
+        },
+        "splitValues" : {
+          "description" : "Primary key values used to split table into tablets",
+          "items" : {
+            "type" : "string"
+          },
+          "type" : "array"
         },
         "tableName" : {
           "description" : "Table name",
@@ -3822,6 +4133,9 @@
     },
     "UniverseConfigureTaskParams" : {
       "properties" : {
+        "allowGeoPartitioning" : {
+          "type" : "boolean"
+        },
         "allowInsecure" : {
           "type" : "boolean"
         },
@@ -3909,6 +4223,11 @@
         "nodePrefix" : {
           "type" : "string"
         },
+        "previousTaskUUID" : {
+          "description" : "Previous task UUID only if this task is a retry",
+          "format" : "uuid",
+          "type" : "string"
+        },
         "remotePackagePath" : {
           "type" : "string"
         },
@@ -3925,18 +4244,20 @@
         "setTxnTableWaitCountFlag" : {
           "type" : "boolean"
         },
-        "sourceAsyncReplicationRelationships" : {
-          "description" : "The source universe's sync replication relationships",
+        "sourceXClusterConfigs" : {
+          "description" : "The source universe's xcluster replication relationships",
           "items" : {
-            "$ref" : "#/definitions/AsyncReplicationConfig"
+            "format" : "uuid",
+            "type" : "string"
           },
           "readOnly" : true,
           "type" : "array"
         },
-        "targetAsyncReplicationRelationships" : {
-          "description" : "The target universe's async replication relationships",
+        "targetXClusterConfigs" : {
+          "description" : "The target universe's xcluster replication relationships",
           "items" : {
-            "$ref" : "#/definitions/AsyncReplicationConfig"
+            "format" : "uuid",
+            "type" : "string"
           },
           "readOnly" : true,
           "type" : "array"
@@ -3956,7 +4277,11 @@
           "type" : "boolean"
         },
         "updatingTask" : {
-          "enum" : [ "CloudBootstrap", "CloudCleanup", "CreateCassandraTable", "CreateUniverse", "ReadOnlyClusterCreate", "ReadOnlyClusterDelete", "CreateKubernetesUniverse", "DestroyUniverse", "PauseUniverse", "ResumeUniverse", "DestroyKubernetesUniverse", "DeleteTable", "BackupUniverse", "MultiTableBackup", "EditUniverse", "EditKubernetesUniverse", "ExternalScript", "KubernetesProvision", "ImportIntoTable", "UpgradeUniverse", "RestartUniverse", "SoftwareUpgrade", "SoftwareKubernetesUpgrade", "GFlagsUpgrade", "GFlagsKubernetesUpgrade", "CertsRotate", "TlsToggle", "VMImageUpgrade", "CreateRootVolumes", "ReplaceRootVolume", "ChangeInstanceType", "PersistResizeNode", "PersistSystemdUpgrade", "UpdateNodeDetails", "UpgradeKubernetesUniverse", "DeleteNodeFromUniverse", "StopNodeInUniverse", "StartNodeInUniverse", "AddNodeToUniverse", "RemoveNodeFromUniverse", "ReleaseInstanceFromUniverse", "SetUniverseKey", "SetKubernetesUniverseKey", "CreateKMSConfig", "DeleteKMSConfig", "UpdateDiskSize", "StartMasterOnNode", "SyncDBStateWithPlatform", "CreateXClusterReplication", "DeleteXClusterReplication", "EditXClusterReplication", "PauseOrResumeXClusterReplication", "AnsibleClusterServerCtl", "AnsibleConfigureServers", "AnsibleDestroyServer", "PauseServer", "ResumeServer", "AnsibleSetupServer", "AnsibleCreateServer", "PrecheckNode", "AnsibleUpdateNodeInfo", "BulkImport", "ChangeMasterConfig", "ChangeAdminPassword", "CreateTable", "DeleteNode", "DeleteBackup", "UpdateNodeProcess", "DeleteTableFromUniverse", "LoadBalancerStateChange", "ModifyBlackList", "ManipulateDnsRecordTask", "RemoveUniverseEntry", "SetFlagInMemory", "SetNodeState", "SwamperTargetsFileUpdate", "UniverseUpdateSucceeded", "UpdateAndPersistGFlags", "UpdatePlacementInfo", "UpdateSoftwareVersion", "WaitForDataMove", "WaitForLoadBalance", "WaitForMasterLeader", "WaitForServer", "WaitForTServerHeartBeats", "DeleteClusterFromUniverse", "InstanceActions", "WaitForServerReady", "RunExternalScript", "CloudAccessKeyCleanup", "CloudAccessKeySetup", "CloudInitializer", "CloudProviderCleanup", "CloudRegionCleanup", "CloudRegionSetup", "CloudSetup", "BackupTable", "BackupUniverseKeys", "RestoreUniverseKeys", "WaitForLeadersOnPreferredOnly", "EnableEncryptionAtRest", "DisableEncryptionAtRest", "DestroyEncryptionAtRest", "KubernetesCommandExecutor", "KubernetesWaitForPod", "KubernetesCheckNumPod", "CopyEncryptionKeyFile", "WaitForEncryptionKeyInMemory", "UnivSetCertificate", "CreateAlertDefinitions", "UniverseSetTlsParams", "UniverseUpdateRootCert", "AsyncReplicationPlatformSync", "AsyncReplicationSetup", "ResetUniverseVersion", "AlterXClusterReplicationAddTables", "AlterXClusterReplicationRemoveTables", "AlterXClusterReplicationChangeMasterAddresses", "XClusterReplicationSetActive", "DeleteCertificate" ],
+          "enum" : [ "CloudBootstrap", "CloudCleanup", "CreateCassandraTable", "CreateUniverse", "ReadOnlyClusterCreate", "ReadOnlyClusterDelete", "CreateKubernetesUniverse", "DestroyUniverse", "PauseUniverse", "ResumeUniverse", "DestroyKubernetesUniverse", "DeleteTable", "BackupUniverse", "MultiTableBackup", "CreateBackup", "EditUniverse", "EditKubernetesUniverse", "ExternalScript", "KubernetesProvision", "ImportIntoTable", "UpgradeUniverse", "RestartUniverse", "SoftwareUpgrade", "SoftwareKubernetesUpgrade", "GFlagsUpgrade", "GFlagsKubernetesUpgrade", "CertsRotate", "TlsToggle", "VMImageUpgrade", "SystemdUpgrade", "CreateRootVolumes", "ReplaceRootVolume", "ChangeInstanceType", "PersistResizeNode", "PersistSystemdUpgrade", "UpdateNodeDetails", "UpgradeKubernetesUniverse", "DeleteNodeFromUniverse", "StopNodeInUniverse", "StartNodeInUniverse", "AddNodeToUniverse", "RemoveNodeFromUniverse", "ReleaseInstanceFromUniverse", "SetUniverseKey", "SetKubernetesUniverseKey", "CreateKMSConfig", "EditKMSConfig", "DeleteKMSConfig", "UpdateDiskSize", "StartMasterOnNode", "CreateXClusterConfig", "EditXClusterConfig", "DeleteXClusterConfig", "SyncXClusterConfig", "CreateSupportBundle", "AnsibleClusterServerCtl", "AnsibleConfigureServers", "AnsibleDestroyServer", "PauseServer", "ResumeServer", "AnsibleSetupServer", "AnsibleCreateServer", "PrecheckNode", "PrecheckNodeDetached", "AnsibleUpdateNodeInfo", "BulkImport", "ChangeMasterConfig", "ChangeAdminPassword", "CreateTable", "DeleteNode", "DeleteBackup", "DeleteBackupYb", "DeleteCustomerConfig", "UpdateNodeProcess", "DeleteTableFromUniverse", "LoadBalancerStateChange", "ModifyBlackList", "ManipulateDnsRecordTask", "RemoveUniverseEntry", "SetFlagInMemory", "SetNodeState", "SwamperTargetsFileUpdate", "UniverseUpdateSucceeded", "UpdateAndPersistGFlags", "UpdatePlacementInfo", "UpdateSoftwareVersion", "WaitForDataMove", "WaitForLeaderBlacklistCompletion", "WaitForFollowerLag", "WaitForLoadBalance", "WaitForMasterLeader", "WaitForServer", "WaitForTServerHeartBeats", "DeleteClusterFromUniverse", "InstanceActions", "WaitForServerReady", "RunExternalScript", "XClusterConfigSetup", "XClusterConfigSetStatus", "XClusterConfigModifyTables", "XClusterConfigRename", "XClusterConfigDelete", "XClusterConfigSync", "CloudAccessKeyCleanup", "CloudAccessKeySetup", "CloudInitializer", "CloudProviderCleanup", "CloudRegionCleanup", "CloudRegionSetup", "CloudSetup", "BackupTable", "BackupTableYb", "BackupUniverseKeys", "RestoreUniverseKeys", "WaitForLeadersOnPreferredOnly", "EnableEncryptionAtRest", "DisableEncryptionAtRest", "DestroyEncryptionAtRest", "KubernetesCommandExecutor", "KubernetesWaitForPod", "KubernetesCheckNumPod", "SetActiveUniverseKeys", "CopyEncryptionKeyFile", "WaitForEncryptionKeyInMemory", "UnivSetCertificate", "CreateAlertDefinitions", "UniverseSetTlsParams", "UniverseUpdateRootCert", "ResetUniverseVersion", "DeleteCertificate", "SetNodeStatus", "CheckMasterLeader", "CheckMasters", "CheckTServers", "WaitForTServerHBs", "CreatePrometheusSwamperConfig", "PreflightNodeCheck", "RunYsqlUpgrade" ],
+          "type" : "string"
+        },
+        "updatingTaskUUID" : {
+          "format" : "uuid",
           "type" : "string"
         },
         "userAZSelected" : {
@@ -4055,6 +4380,11 @@
         "nodePrefix" : {
           "type" : "string"
         },
+        "previousTaskUUID" : {
+          "description" : "Previous task UUID only if this task is a retry",
+          "format" : "uuid",
+          "type" : "string"
+        },
         "remotePackagePath" : {
           "type" : "string"
         },
@@ -4071,18 +4401,20 @@
         "setTxnTableWaitCountFlag" : {
           "type" : "boolean"
         },
-        "sourceAsyncReplicationRelationships" : {
-          "description" : "The source universe's sync replication relationships",
+        "sourceXClusterConfigs" : {
+          "description" : "The source universe's xcluster replication relationships",
           "items" : {
-            "$ref" : "#/definitions/AsyncReplicationConfig"
+            "format" : "uuid",
+            "type" : "string"
           },
           "readOnly" : true,
           "type" : "array"
         },
-        "targetAsyncReplicationRelationships" : {
-          "description" : "The target universe's async replication relationships",
+        "targetXClusterConfigs" : {
+          "description" : "The target universe's xcluster replication relationships",
           "items" : {
-            "$ref" : "#/definitions/AsyncReplicationConfig"
+            "format" : "uuid",
+            "type" : "string"
           },
           "readOnly" : true,
           "type" : "array"
@@ -4102,7 +4434,11 @@
           "type" : "boolean"
         },
         "updatingTask" : {
-          "enum" : [ "CloudBootstrap", "CloudCleanup", "CreateCassandraTable", "CreateUniverse", "ReadOnlyClusterCreate", "ReadOnlyClusterDelete", "CreateKubernetesUniverse", "DestroyUniverse", "PauseUniverse", "ResumeUniverse", "DestroyKubernetesUniverse", "DeleteTable", "BackupUniverse", "MultiTableBackup", "EditUniverse", "EditKubernetesUniverse", "ExternalScript", "KubernetesProvision", "ImportIntoTable", "UpgradeUniverse", "RestartUniverse", "SoftwareUpgrade", "SoftwareKubernetesUpgrade", "GFlagsUpgrade", "GFlagsKubernetesUpgrade", "CertsRotate", "TlsToggle", "VMImageUpgrade", "CreateRootVolumes", "ReplaceRootVolume", "ChangeInstanceType", "PersistResizeNode", "PersistSystemdUpgrade", "UpdateNodeDetails", "UpgradeKubernetesUniverse", "DeleteNodeFromUniverse", "StopNodeInUniverse", "StartNodeInUniverse", "AddNodeToUniverse", "RemoveNodeFromUniverse", "ReleaseInstanceFromUniverse", "SetUniverseKey", "SetKubernetesUniverseKey", "CreateKMSConfig", "DeleteKMSConfig", "UpdateDiskSize", "StartMasterOnNode", "SyncDBStateWithPlatform", "CreateXClusterReplication", "DeleteXClusterReplication", "EditXClusterReplication", "PauseOrResumeXClusterReplication", "AnsibleClusterServerCtl", "AnsibleConfigureServers", "AnsibleDestroyServer", "PauseServer", "ResumeServer", "AnsibleSetupServer", "AnsibleCreateServer", "PrecheckNode", "AnsibleUpdateNodeInfo", "BulkImport", "ChangeMasterConfig", "ChangeAdminPassword", "CreateTable", "DeleteNode", "DeleteBackup", "UpdateNodeProcess", "DeleteTableFromUniverse", "LoadBalancerStateChange", "ModifyBlackList", "ManipulateDnsRecordTask", "RemoveUniverseEntry", "SetFlagInMemory", "SetNodeState", "SwamperTargetsFileUpdate", "UniverseUpdateSucceeded", "UpdateAndPersistGFlags", "UpdatePlacementInfo", "UpdateSoftwareVersion", "WaitForDataMove", "WaitForLoadBalance", "WaitForMasterLeader", "WaitForServer", "WaitForTServerHeartBeats", "DeleteClusterFromUniverse", "InstanceActions", "WaitForServerReady", "RunExternalScript", "CloudAccessKeyCleanup", "CloudAccessKeySetup", "CloudInitializer", "CloudProviderCleanup", "CloudRegionCleanup", "CloudRegionSetup", "CloudSetup", "BackupTable", "BackupUniverseKeys", "RestoreUniverseKeys", "WaitForLeadersOnPreferredOnly", "EnableEncryptionAtRest", "DisableEncryptionAtRest", "DestroyEncryptionAtRest", "KubernetesCommandExecutor", "KubernetesWaitForPod", "KubernetesCheckNumPod", "CopyEncryptionKeyFile", "WaitForEncryptionKeyInMemory", "UnivSetCertificate", "CreateAlertDefinitions", "UniverseSetTlsParams", "UniverseUpdateRootCert", "AsyncReplicationPlatformSync", "AsyncReplicationSetup", "ResetUniverseVersion", "AlterXClusterReplicationAddTables", "AlterXClusterReplicationRemoveTables", "AlterXClusterReplicationChangeMasterAddresses", "XClusterReplicationSetActive", "DeleteCertificate" ],
+          "enum" : [ "CloudBootstrap", "CloudCleanup", "CreateCassandraTable", "CreateUniverse", "ReadOnlyClusterCreate", "ReadOnlyClusterDelete", "CreateKubernetesUniverse", "DestroyUniverse", "PauseUniverse", "ResumeUniverse", "DestroyKubernetesUniverse", "DeleteTable", "BackupUniverse", "MultiTableBackup", "CreateBackup", "EditUniverse", "EditKubernetesUniverse", "ExternalScript", "KubernetesProvision", "ImportIntoTable", "UpgradeUniverse", "RestartUniverse", "SoftwareUpgrade", "SoftwareKubernetesUpgrade", "GFlagsUpgrade", "GFlagsKubernetesUpgrade", "CertsRotate", "TlsToggle", "VMImageUpgrade", "SystemdUpgrade", "CreateRootVolumes", "ReplaceRootVolume", "ChangeInstanceType", "PersistResizeNode", "PersistSystemdUpgrade", "UpdateNodeDetails", "UpgradeKubernetesUniverse", "DeleteNodeFromUniverse", "StopNodeInUniverse", "StartNodeInUniverse", "AddNodeToUniverse", "RemoveNodeFromUniverse", "ReleaseInstanceFromUniverse", "SetUniverseKey", "SetKubernetesUniverseKey", "CreateKMSConfig", "EditKMSConfig", "DeleteKMSConfig", "UpdateDiskSize", "StartMasterOnNode", "CreateXClusterConfig", "EditXClusterConfig", "DeleteXClusterConfig", "SyncXClusterConfig", "CreateSupportBundle", "AnsibleClusterServerCtl", "AnsibleConfigureServers", "AnsibleDestroyServer", "PauseServer", "ResumeServer", "AnsibleSetupServer", "AnsibleCreateServer", "PrecheckNode", "PrecheckNodeDetached", "AnsibleUpdateNodeInfo", "BulkImport", "ChangeMasterConfig", "ChangeAdminPassword", "CreateTable", "DeleteNode", "DeleteBackup", "DeleteBackupYb", "DeleteCustomerConfig", "UpdateNodeProcess", "DeleteTableFromUniverse", "LoadBalancerStateChange", "ModifyBlackList", "ManipulateDnsRecordTask", "RemoveUniverseEntry", "SetFlagInMemory", "SetNodeState", "SwamperTargetsFileUpdate", "UniverseUpdateSucceeded", "UpdateAndPersistGFlags", "UpdatePlacementInfo", "UpdateSoftwareVersion", "WaitForDataMove", "WaitForLeaderBlacklistCompletion", "WaitForFollowerLag", "WaitForLoadBalance", "WaitForMasterLeader", "WaitForServer", "WaitForTServerHeartBeats", "DeleteClusterFromUniverse", "InstanceActions", "WaitForServerReady", "RunExternalScript", "XClusterConfigSetup", "XClusterConfigSetStatus", "XClusterConfigModifyTables", "XClusterConfigRename", "XClusterConfigDelete", "XClusterConfigSync", "CloudAccessKeyCleanup", "CloudAccessKeySetup", "CloudInitializer", "CloudProviderCleanup", "CloudRegionCleanup", "CloudRegionSetup", "CloudSetup", "BackupTable", "BackupTableYb", "BackupUniverseKeys", "RestoreUniverseKeys", "WaitForLeadersOnPreferredOnly", "EnableEncryptionAtRest", "DisableEncryptionAtRest", "DestroyEncryptionAtRest", "KubernetesCommandExecutor", "KubernetesWaitForPod", "KubernetesCheckNumPod", "SetActiveUniverseKeys", "CopyEncryptionKeyFile", "WaitForEncryptionKeyInMemory", "UnivSetCertificate", "CreateAlertDefinitions", "UniverseSetTlsParams", "UniverseUpdateRootCert", "ResetUniverseVersion", "DeleteCertificate", "SetNodeStatus", "CheckMasterLeader", "CheckMasters", "CheckTServers", "WaitForTServerHBs", "CreatePrometheusSwamperConfig", "PreflightNodeCheck", "RunYsqlUpgrade" ],
+          "type" : "string"
+        },
+        "updatingTaskUUID" : {
+          "format" : "uuid",
           "type" : "string"
         },
         "userAZSelected" : {
@@ -4201,6 +4537,11 @@
         "nodePrefix" : {
           "type" : "string"
         },
+        "previousTaskUUID" : {
+          "description" : "Previous task UUID only if this task is a retry",
+          "format" : "uuid",
+          "type" : "string"
+        },
         "remotePackagePath" : {
           "type" : "string"
         },
@@ -4217,18 +4558,20 @@
         "setTxnTableWaitCountFlag" : {
           "type" : "boolean"
         },
-        "sourceAsyncReplicationRelationships" : {
-          "description" : "The source universe's sync replication relationships",
+        "sourceXClusterConfigs" : {
+          "description" : "The source universe's xcluster replication relationships",
           "items" : {
-            "$ref" : "#/definitions/AsyncReplicationConfig"
+            "format" : "uuid",
+            "type" : "string"
           },
           "readOnly" : true,
           "type" : "array"
         },
-        "targetAsyncReplicationRelationships" : {
-          "description" : "The target universe's async replication relationships",
+        "targetXClusterConfigs" : {
+          "description" : "The target universe's xcluster replication relationships",
           "items" : {
-            "$ref" : "#/definitions/AsyncReplicationConfig"
+            "format" : "uuid",
+            "type" : "string"
           },
           "readOnly" : true,
           "type" : "array"
@@ -4248,7 +4591,11 @@
           "type" : "boolean"
         },
         "updatingTask" : {
-          "enum" : [ "CloudBootstrap", "CloudCleanup", "CreateCassandraTable", "CreateUniverse", "ReadOnlyClusterCreate", "ReadOnlyClusterDelete", "CreateKubernetesUniverse", "DestroyUniverse", "PauseUniverse", "ResumeUniverse", "DestroyKubernetesUniverse", "DeleteTable", "BackupUniverse", "MultiTableBackup", "EditUniverse", "EditKubernetesUniverse", "ExternalScript", "KubernetesProvision", "ImportIntoTable", "UpgradeUniverse", "RestartUniverse", "SoftwareUpgrade", "SoftwareKubernetesUpgrade", "GFlagsUpgrade", "GFlagsKubernetesUpgrade", "CertsRotate", "TlsToggle", "VMImageUpgrade", "CreateRootVolumes", "ReplaceRootVolume", "ChangeInstanceType", "PersistResizeNode", "PersistSystemdUpgrade", "UpdateNodeDetails", "UpgradeKubernetesUniverse", "DeleteNodeFromUniverse", "StopNodeInUniverse", "StartNodeInUniverse", "AddNodeToUniverse", "RemoveNodeFromUniverse", "ReleaseInstanceFromUniverse", "SetUniverseKey", "SetKubernetesUniverseKey", "CreateKMSConfig", "DeleteKMSConfig", "UpdateDiskSize", "StartMasterOnNode", "SyncDBStateWithPlatform", "CreateXClusterReplication", "DeleteXClusterReplication", "EditXClusterReplication", "PauseOrResumeXClusterReplication", "AnsibleClusterServerCtl", "AnsibleConfigureServers", "AnsibleDestroyServer", "PauseServer", "ResumeServer", "AnsibleSetupServer", "AnsibleCreateServer", "PrecheckNode", "AnsibleUpdateNodeInfo", "BulkImport", "ChangeMasterConfig", "ChangeAdminPassword", "CreateTable", "DeleteNode", "DeleteBackup", "UpdateNodeProcess", "DeleteTableFromUniverse", "LoadBalancerStateChange", "ModifyBlackList", "ManipulateDnsRecordTask", "RemoveUniverseEntry", "SetFlagInMemory", "SetNodeState", "SwamperTargetsFileUpdate", "UniverseUpdateSucceeded", "UpdateAndPersistGFlags", "UpdatePlacementInfo", "UpdateSoftwareVersion", "WaitForDataMove", "WaitForLoadBalance", "WaitForMasterLeader", "WaitForServer", "WaitForTServerHeartBeats", "DeleteClusterFromUniverse", "InstanceActions", "WaitForServerReady", "RunExternalScript", "CloudAccessKeyCleanup", "CloudAccessKeySetup", "CloudInitializer", "CloudProviderCleanup", "CloudRegionCleanup", "CloudRegionSetup", "CloudSetup", "BackupTable", "BackupUniverseKeys", "RestoreUniverseKeys", "WaitForLeadersOnPreferredOnly", "EnableEncryptionAtRest", "DisableEncryptionAtRest", "DestroyEncryptionAtRest", "KubernetesCommandExecutor", "KubernetesWaitForPod", "KubernetesCheckNumPod", "CopyEncryptionKeyFile", "WaitForEncryptionKeyInMemory", "UnivSetCertificate", "CreateAlertDefinitions", "UniverseSetTlsParams", "UniverseUpdateRootCert", "AsyncReplicationPlatformSync", "AsyncReplicationSetup", "ResetUniverseVersion", "AlterXClusterReplicationAddTables", "AlterXClusterReplicationRemoveTables", "AlterXClusterReplicationChangeMasterAddresses", "XClusterReplicationSetActive", "DeleteCertificate" ],
+          "enum" : [ "CloudBootstrap", "CloudCleanup", "CreateCassandraTable", "CreateUniverse", "ReadOnlyClusterCreate", "ReadOnlyClusterDelete", "CreateKubernetesUniverse", "DestroyUniverse", "PauseUniverse", "ResumeUniverse", "DestroyKubernetesUniverse", "DeleteTable", "BackupUniverse", "MultiTableBackup", "CreateBackup", "EditUniverse", "EditKubernetesUniverse", "ExternalScript", "KubernetesProvision", "ImportIntoTable", "UpgradeUniverse", "RestartUniverse", "SoftwareUpgrade", "SoftwareKubernetesUpgrade", "GFlagsUpgrade", "GFlagsKubernetesUpgrade", "CertsRotate", "TlsToggle", "VMImageUpgrade", "SystemdUpgrade", "CreateRootVolumes", "ReplaceRootVolume", "ChangeInstanceType", "PersistResizeNode", "PersistSystemdUpgrade", "UpdateNodeDetails", "UpgradeKubernetesUniverse", "DeleteNodeFromUniverse", "StopNodeInUniverse", "StartNodeInUniverse", "AddNodeToUniverse", "RemoveNodeFromUniverse", "ReleaseInstanceFromUniverse", "SetUniverseKey", "SetKubernetesUniverseKey", "CreateKMSConfig", "EditKMSConfig", "DeleteKMSConfig", "UpdateDiskSize", "StartMasterOnNode", "CreateXClusterConfig", "EditXClusterConfig", "DeleteXClusterConfig", "SyncXClusterConfig", "CreateSupportBundle", "AnsibleClusterServerCtl", "AnsibleConfigureServers", "AnsibleDestroyServer", "PauseServer", "ResumeServer", "AnsibleSetupServer", "AnsibleCreateServer", "PrecheckNode", "PrecheckNodeDetached", "AnsibleUpdateNodeInfo", "BulkImport", "ChangeMasterConfig", "ChangeAdminPassword", "CreateTable", "DeleteNode", "DeleteBackup", "DeleteBackupYb", "DeleteCustomerConfig", "UpdateNodeProcess", "DeleteTableFromUniverse", "LoadBalancerStateChange", "ModifyBlackList", "ManipulateDnsRecordTask", "RemoveUniverseEntry", "SetFlagInMemory", "SetNodeState", "SwamperTargetsFileUpdate", "UniverseUpdateSucceeded", "UpdateAndPersistGFlags", "UpdatePlacementInfo", "UpdateSoftwareVersion", "WaitForDataMove", "WaitForLeaderBlacklistCompletion", "WaitForFollowerLag", "WaitForLoadBalance", "WaitForMasterLeader", "WaitForServer", "WaitForTServerHeartBeats", "DeleteClusterFromUniverse", "InstanceActions", "WaitForServerReady", "RunExternalScript", "XClusterConfigSetup", "XClusterConfigSetStatus", "XClusterConfigModifyTables", "XClusterConfigRename", "XClusterConfigDelete", "XClusterConfigSync", "CloudAccessKeyCleanup", "CloudAccessKeySetup", "CloudInitializer", "CloudProviderCleanup", "CloudRegionCleanup", "CloudRegionSetup", "CloudSetup", "BackupTable", "BackupTableYb", "BackupUniverseKeys", "RestoreUniverseKeys", "WaitForLeadersOnPreferredOnly", "EnableEncryptionAtRest", "DisableEncryptionAtRest", "DestroyEncryptionAtRest", "KubernetesCommandExecutor", "KubernetesWaitForPod", "KubernetesCheckNumPod", "SetActiveUniverseKeys", "CopyEncryptionKeyFile", "WaitForEncryptionKeyInMemory", "UnivSetCertificate", "CreateAlertDefinitions", "UniverseSetTlsParams", "UniverseUpdateRootCert", "ResetUniverseVersion", "DeleteCertificate", "SetNodeStatus", "CheckMasterLeader", "CheckMasters", "CheckTServers", "WaitForTServerHBs", "CreatePrometheusSwamperConfig", "PreflightNodeCheck", "RunYsqlUpgrade" ],
+          "type" : "string"
+        },
+        "updatingTaskUUID" : {
+          "format" : "uuid",
           "type" : "string"
         },
         "userAZSelected" : {
@@ -4524,6 +4871,34 @@
       },
       "type" : "object"
     },
+    "UserProfileData" : {
+      "description" : "User profile data. The API and UI use this to validate form data.",
+      "properties" : {
+        "confirmPassword" : {
+          "description" : "Password confirmation",
+          "example" : "Test@1234",
+          "type" : "string"
+        },
+        "password" : {
+          "description" : "Password",
+          "example" : "Test@1234",
+          "type" : "string"
+        },
+        "role" : {
+          "description" : "User role",
+          "enum" : [ "Admin", "ReadOnly", "SuperAdmin", "BackupAdmin" ],
+          "example" : "Admin",
+          "type" : "string"
+        },
+        "timezone" : {
+          "description" : "User timezone",
+          "example" : "America/Toronto",
+          "type" : "string"
+        }
+      },
+      "required" : [ "role" ],
+      "type" : "object"
+    },
     "UserRegistrationData" : {
       "description" : "User registration data. The API and UI use this to validate form data.",
       "properties" : {
@@ -4554,13 +4929,18 @@
           "enum" : [ "Admin", "ReadOnly", "SuperAdmin", "BackupAdmin" ],
           "example" : "Admin",
           "type" : "string"
+        },
+        "timezone" : {
+          "description" : "User timezone",
+          "example" : "America/Toronto",
+          "type" : "string"
         }
       },
       "required" : [ "email", "role" ],
       "type" : "object"
     },
-    "Users" : {
-      "description" : "A user associated with a customer",
+    "UserWithFeatures" : {
+      "description" : "A user with set of features, associated with a customer",
       "properties" : {
         "authTokenIssueDate" : {
           "description" : "API token creation date",
@@ -4571,7 +4951,7 @@
         },
         "creationDate" : {
           "description" : "User creation date",
-          "example" : "2021-06-17 15:00:05",
+          "example" : "2021-06-17T15:00:05-0400",
           "format" : "date-time",
           "readOnly" : true,
           "type" : "string"
@@ -4591,9 +4971,82 @@
           "description" : "True if the user is the primary user",
           "type" : "boolean"
         },
+        "ldapSpecifiedRole" : {
+          "description" : "LDAP Specified Role",
+          "type" : "boolean"
+        },
         "role" : {
           "description" : "User role",
           "enum" : [ "Admin", "ReadOnly", "SuperAdmin", "BackupAdmin" ],
+          "type" : "string"
+        },
+        "timezone" : {
+          "description" : "User timezone",
+          "type" : "string"
+        },
+        "userType" : {
+          "description" : "User Type",
+          "enum" : [ "local", "ldap" ],
+          "type" : "string"
+        },
+        "uuid" : {
+          "description" : "User UUID",
+          "format" : "uuid",
+          "readOnly" : true,
+          "type" : "string"
+        }
+      },
+      "required" : [ "email" ],
+      "type" : "object"
+    },
+    "Users" : {
+      "description" : "A user associated with a customer",
+      "properties" : {
+        "authTokenIssueDate" : {
+          "description" : "API token creation date",
+          "example" : "1624255408795",
+          "format" : "date-time",
+          "readOnly" : true,
+          "type" : "string"
+        },
+        "creationDate" : {
+          "description" : "User creation date",
+          "example" : "2021-06-17T15:00:05-0400",
+          "format" : "date-time",
+          "readOnly" : true,
+          "type" : "string"
+        },
+        "customerUUID" : {
+          "description" : "Customer UUID",
+          "format" : "uuid",
+          "readOnly" : true,
+          "type" : "string"
+        },
+        "email" : {
+          "description" : "User email address",
+          "example" : "username1@example.com",
+          "type" : "string"
+        },
+        "isPrimary" : {
+          "description" : "True if the user is the primary user",
+          "type" : "boolean"
+        },
+        "ldapSpecifiedRole" : {
+          "description" : "LDAP Specified Role",
+          "type" : "boolean"
+        },
+        "role" : {
+          "description" : "User role",
+          "enum" : [ "Admin", "ReadOnly", "SuperAdmin", "BackupAdmin" ],
+          "type" : "string"
+        },
+        "timezone" : {
+          "description" : "User timezone",
+          "type" : "string"
+        },
+        "userType" : {
+          "description" : "User Type",
+          "enum" : [ "local", "ldap" ],
           "type" : "string"
         },
         "uuid" : {
@@ -4623,114 +5076,104 @@
       "required" : [ "mountPath", "volumeSizeGB", "volumeType" ],
       "type" : "object"
     },
-    "XClusterReplicationFormData" : {
+    "XClusterConfig" : {
+      "description" : "xcluster config object",
       "properties" : {
-        "bootstrapIds" : {
+        "createTime" : {
+          "description" : "Create time",
+          "format" : "date-time",
+          "type" : "string"
+        },
+        "modifyTime" : {
+          "description" : "Modify time",
+          "format" : "date-time",
+          "type" : "string"
+        },
+        "name" : {
+          "description" : "Name",
+          "type" : "string"
+        },
+        "sourceUniverseUUID" : {
+          "description" : "Source Universe UUID",
+          "format" : "uuid",
+          "type" : "string"
+        },
+        "status" : {
+          "description" : "Status",
+          "enum" : [ "Init", "Running", "Updating", "Paused", "Failed" ],
+          "type" : "string"
+        },
+        "tables" : {
+          "description" : "Source Universe table IDs",
           "items" : {
             "type" : "string"
-          },
-          "type" : "array"
-        },
-        "cmkArn" : {
-          "description" : "Amazon Resource Name (ARN) of the CMK",
-          "type" : "string"
-        },
-        "communicationPorts" : {
-          "$ref" : "#/definitions/CommunicationPorts",
-          "description" : "Communication ports"
-        },
-        "deviceInfo" : {
-          "$ref" : "#/definitions/DeviceInfo",
-          "description" : "Device information"
-        },
-        "encryptionAtRestConfig" : {
-          "$ref" : "#/definitions/EncryptionAtRestConfig",
-          "description" : "Encryption at rest configation"
-        },
-        "errorString" : {
-          "description" : "Error message",
-          "type" : "string"
-        },
-        "expectedUniverseVersion" : {
-          "description" : "Expected universe version",
-          "format" : "int32",
-          "type" : "integer"
-        },
-        "extraDependencies" : {
-          "$ref" : "#/definitions/ExtraDependencies",
-          "description" : "Extra dependencies"
-        },
-        "firstTry" : {
-          "description" : "Whether this task has been tried before",
-          "type" : "boolean"
-        },
-        "nodeDetailsSet" : {
-          "description" : "Node details",
-          "items" : {
-            "$ref" : "#/definitions/NodeDetails"
           },
           "type" : "array",
           "uniqueItems" : true
         },
-        "nodeExporterUser" : {
-          "description" : "Node exporter user",
-          "type" : "string"
-        },
-        "sourceAsyncReplicationRelationships" : {
-          "description" : "The source universe's sync replication relationships",
-          "items" : {
-            "$ref" : "#/definitions/AsyncReplicationConfig"
-          },
-          "readOnly" : true,
-          "type" : "array"
-        },
-        "sourceMasterAddressesToChange" : {
-          "items" : {
-            "type" : "string"
-          },
-          "type" : "array"
-        },
-        "sourceTableIds" : {
-          "items" : {
-            "type" : "string"
-          },
-          "type" : "array"
-        },
-        "sourceTableIdsToAdd" : {
-          "items" : {
-            "type" : "string"
-          },
-          "type" : "array"
-        },
-        "sourceTableIdsToRemove" : {
-          "items" : {
-            "type" : "string"
-          },
-          "type" : "array"
-        },
-        "sourceUniverseUUID" : {
+        "targetUniverseUUID" : {
+          "description" : "Target Universe UUID",
           "format" : "uuid",
           "type" : "string"
         },
-        "targetAsyncReplicationRelationships" : {
-          "description" : "The target universe's async replication relationships",
-          "items" : {
-            "$ref" : "#/definitions/AsyncReplicationConfig"
-          },
-          "readOnly" : true,
-          "type" : "array"
-        },
-        "universeUUID" : {
-          "description" : "Associated universe UUID",
+        "uuid" : {
+          "description" : "UUID",
           "format" : "uuid",
-          "type" : "string"
-        },
-        "ybPrevSoftwareVersion" : {
-          "description" : "Previous software version",
           "type" : "string"
         }
       },
-      "required" : [ "bootstrapIds", "sourceMasterAddressesToChange", "sourceTableIds", "sourceTableIdsToAdd", "sourceTableIdsToRemove", "sourceUniverseUUID" ],
+      "type" : "object"
+    },
+    "XClusterConfigCreateFormData" : {
+      "description" : "xcluster create form",
+      "properties" : {
+        "name" : {
+          "description" : "Name",
+          "type" : "string"
+        },
+        "sourceUniverseUUID" : {
+          "description" : "Source Universe UUID",
+          "format" : "uuid",
+          "type" : "string"
+        },
+        "tables" : {
+          "description" : "Source Universe table IDs",
+          "items" : {
+            "type" : "string"
+          },
+          "type" : "array",
+          "uniqueItems" : true
+        },
+        "targetUniverseUUID" : {
+          "description" : "Target Universe UUID",
+          "format" : "uuid",
+          "type" : "string"
+        }
+      },
+      "required" : [ "name", "sourceUniverseUUID", "tables", "targetUniverseUUID" ],
+      "type" : "object"
+    },
+    "XClusterConfigEditFormData" : {
+      "description" : "xcluster edit form",
+      "properties" : {
+        "name" : {
+          "description" : "Name",
+          "type" : "string"
+        },
+        "status" : {
+          "description" : "Status",
+          "enum" : [ "Running", "Paused" ],
+          "type" : "string"
+        },
+        "tables" : {
+          "description" : "Source Universe table IDs",
+          "items" : {
+            "type" : "string"
+          },
+          "type" : "array",
+          "uniqueItems" : true
+        }
+      },
       "type" : "object"
     },
     "YBPError" : {
@@ -5310,6 +5753,38 @@
         "tags" : [ "Alerts" ]
       }
     },
+    "/api/v1/customers/{cUUID}/alert_configurations/{configurationUUID}/test_alert" : {
+      "post" : {
+        "description" : "",
+        "operationId" : "sendTestAlert",
+        "parameters" : [ {
+          "format" : "uuid",
+          "in" : "path",
+          "name" : "cUUID",
+          "required" : true,
+          "type" : "string"
+        }, {
+          "format" : "uuid",
+          "in" : "path",
+          "name" : "configurationUUID",
+          "required" : true,
+          "type" : "string"
+        } ],
+        "responses" : {
+          "200" : {
+            "description" : "successful operation",
+            "schema" : {
+              "$ref" : "#/definitions/YBPSuccess"
+            }
+          }
+        },
+        "security" : [ {
+          "apiKeyAuth" : [ ]
+        } ],
+        "summary" : "Send test alert for alert configuration",
+        "tags" : [ "Alerts" ]
+      }
+    },
     "/api/v1/customers/{cUUID}/alert_destinations" : {
       "get" : {
         "description" : "",
@@ -5599,6 +6074,40 @@
         "tags" : [ "Alerts" ]
       }
     },
+    "/api/v1/customers/{cUUID}/alerts/count" : {
+      "post" : {
+        "description" : "",
+        "operationId" : "countAlerts",
+        "parameters" : [ {
+          "format" : "uuid",
+          "in" : "path",
+          "name" : "cUUID",
+          "required" : true,
+          "type" : "string"
+        }, {
+          "in" : "body",
+          "name" : "CountAlertsRequest",
+          "required" : true,
+          "schema" : {
+            "$ref" : "#/definitions/AlertApiFilter"
+          }
+        } ],
+        "responses" : {
+          "200" : {
+            "description" : "successful operation",
+            "schema" : {
+              "format" : "int32",
+              "type" : "integer"
+            }
+          }
+        },
+        "security" : [ {
+          "apiKeyAuth" : [ ]
+        } ],
+        "summary" : "Count alerts",
+        "tags" : [ "Alerts" ]
+      }
+    },
     "/api/v1/customers/{cUUID}/alerts/page" : {
       "post" : {
         "description" : "",
@@ -5720,6 +6229,38 @@
         } ],
         "summary" : "Delete backups",
         "tags" : [ "Backups" ]
+      },
+      "post" : {
+        "description" : "",
+        "operationId" : "createbackup",
+        "parameters" : [ {
+          "format" : "uuid",
+          "in" : "path",
+          "name" : "cUUID",
+          "required" : true,
+          "type" : "string"
+        }, {
+          "description" : "Backup data to be created",
+          "in" : "body",
+          "name" : "Backup",
+          "required" : true,
+          "schema" : {
+            "$ref" : "#/definitions/BackupTableParams"
+          }
+        } ],
+        "responses" : {
+          "200" : {
+            "description" : "successful operation",
+            "schema" : {
+              "$ref" : "#/definitions/YBPTask"
+            }
+          }
+        },
+        "security" : [ {
+          "apiKeyAuth" : [ ]
+        } ],
+        "summary" : "Create a backup",
+        "tags" : [ "Table management" ]
       }
     },
     "/api/v1/customers/{cUUID}/backups/{backupUUID}/stop" : {
@@ -6062,12 +6603,18 @@
           "name" : "configUUID",
           "required" : true,
           "type" : "string"
+        }, {
+          "default" : false,
+          "in" : "query",
+          "name" : "isDeleteBackups",
+          "required" : false,
+          "type" : "boolean"
         } ],
         "responses" : {
           "200" : {
             "description" : "successful operation",
             "schema" : {
-              "$ref" : "#/definitions/YBPSuccess"
+              "$ref" : "#/definitions/YBPTask"
             }
           }
         },
@@ -6143,6 +6690,32 @@
         } ],
         "summary" : "Get a cost estimate for all universes",
         "tags" : [ "Universe information" ]
+      }
+    },
+    "/api/v1/customers/{cUUID}/delete_backups" : {
+      "delete" : {
+        "description" : "",
+        "operationId" : "deleteBackupsv2",
+        "parameters" : [ {
+          "format" : "uuid",
+          "in" : "path",
+          "name" : "cUUID",
+          "required" : true,
+          "type" : "string"
+        } ],
+        "responses" : {
+          "200" : {
+            "description" : "successful operation",
+            "schema" : {
+              "$ref" : "#/definitions/YBPTasks"
+            }
+          }
+        },
+        "security" : [ {
+          "apiKeyAuth" : [ ]
+        } ],
+        "summary" : "Delete backups V2",
+        "tags" : [ "Backups" ]
       }
     },
     "/api/v1/customers/{cUUID}/host_info" : {
@@ -6268,6 +6841,46 @@
         "tags" : [ "Encryption at rest" ]
       }
     },
+    "/api/v1/customers/{cUUID}/kms_configs/{configUUID}/edit" : {
+      "post" : {
+        "description" : "",
+        "operationId" : "editKMSConfig",
+        "parameters" : [ {
+          "format" : "uuid",
+          "in" : "path",
+          "name" : "cUUID",
+          "required" : true,
+          "type" : "string"
+        }, {
+          "format" : "uuid",
+          "in" : "path",
+          "name" : "configUUID",
+          "required" : true,
+          "type" : "string"
+        }, {
+          "description" : "KMS config to be edited",
+          "in" : "body",
+          "name" : "KMS config",
+          "required" : true,
+          "schema" : {
+            "type" : "object"
+          }
+        } ],
+        "responses" : {
+          "200" : {
+            "description" : "successful operation",
+            "schema" : {
+              "$ref" : "#/definitions/YBPTask"
+            }
+          }
+        },
+        "security" : [ {
+          "apiKeyAuth" : [ ]
+        } ],
+        "summary" : "Edit a KMS configuration",
+        "tags" : [ "Encryption at rest" ]
+      }
+    },
     "/api/v1/customers/{cUUID}/kms_configs/{kmsProvider}" : {
       "post" : {
         "description" : "",
@@ -6305,6 +6918,200 @@
         } ],
         "summary" : "Create a KMS configuration",
         "tags" : [ "Encryption at rest" ]
+      }
+    },
+    "/api/v1/customers/{cUUID}/maintenance_windows" : {
+      "post" : {
+        "description" : "",
+        "operationId" : "create",
+        "parameters" : [ {
+          "format" : "uuid",
+          "in" : "path",
+          "name" : "cUUID",
+          "required" : true,
+          "type" : "string"
+        }, {
+          "in" : "body",
+          "name" : "CreateMaintenanceWindowRequest",
+          "required" : true,
+          "schema" : {
+            "$ref" : "#/definitions/MaintenanceWindow"
+          }
+        } ],
+        "responses" : {
+          "200" : {
+            "description" : "successful operation",
+            "schema" : {
+              "$ref" : "#/definitions/MaintenanceWindow"
+            }
+          }
+        },
+        "security" : [ {
+          "apiKeyAuth" : [ ]
+        } ],
+        "summary" : "Create maintenance window",
+        "tags" : [ "Maintenance windows" ]
+      }
+    },
+    "/api/v1/customers/{cUUID}/maintenance_windows/list" : {
+      "post" : {
+        "description" : "",
+        "operationId" : "listOfMaintenanceWindows",
+        "parameters" : [ {
+          "format" : "uuid",
+          "in" : "path",
+          "name" : "cUUID",
+          "required" : true,
+          "type" : "string"
+        } ],
+        "responses" : {
+          "200" : {
+            "description" : "successful operation",
+            "schema" : {
+              "items" : {
+                "$ref" : "#/definitions/MaintenanceWindow"
+              },
+              "type" : "array"
+            }
+          }
+        },
+        "security" : [ {
+          "apiKeyAuth" : [ ]
+        } ],
+        "summary" : "List maintenance windows",
+        "tags" : [ "Maintenance windows" ]
+      }
+    },
+    "/api/v1/customers/{cUUID}/maintenance_windows/page" : {
+      "post" : {
+        "description" : "",
+        "operationId" : "page",
+        "parameters" : [ {
+          "format" : "uuid",
+          "in" : "path",
+          "name" : "cUUID",
+          "required" : true,
+          "type" : "string"
+        }, {
+          "in" : "body",
+          "name" : "PageMaintenanceWindowsRequest",
+          "required" : true,
+          "schema" : {
+            "$ref" : "#/definitions/MaintenanceWindowPagedApiQuery"
+          }
+        } ],
+        "responses" : {
+          "200" : {
+            "description" : "successful operation",
+            "schema" : {
+              "$ref" : "#/definitions/MaintenanceWindowPagedResponse"
+            }
+          }
+        },
+        "security" : [ {
+          "apiKeyAuth" : [ ]
+        } ],
+        "summary" : "List maintenance windows (paginated)",
+        "tags" : [ "Maintenance windows" ]
+      }
+    },
+    "/api/v1/customers/{cUUID}/maintenance_windows/{windowUUID}" : {
+      "delete" : {
+        "description" : "",
+        "operationId" : "delete",
+        "parameters" : [ {
+          "format" : "uuid",
+          "in" : "path",
+          "name" : "cUUID",
+          "required" : true,
+          "type" : "string"
+        }, {
+          "format" : "uuid",
+          "in" : "path",
+          "name" : "windowUUID",
+          "required" : true,
+          "type" : "string"
+        } ],
+        "responses" : {
+          "200" : {
+            "description" : "successful operation",
+            "schema" : {
+              "$ref" : "#/definitions/YBPSuccess"
+            }
+          }
+        },
+        "security" : [ {
+          "apiKeyAuth" : [ ]
+        } ],
+        "summary" : "Delete maintenance window",
+        "tags" : [ "Maintenance windows" ]
+      },
+      "get" : {
+        "description" : "",
+        "operationId" : "get",
+        "parameters" : [ {
+          "format" : "uuid",
+          "in" : "path",
+          "name" : "cUUID",
+          "required" : true,
+          "type" : "string"
+        }, {
+          "format" : "uuid",
+          "in" : "path",
+          "name" : "windowUUID",
+          "required" : true,
+          "type" : "string"
+        } ],
+        "responses" : {
+          "200" : {
+            "description" : "successful operation",
+            "schema" : {
+              "$ref" : "#/definitions/MaintenanceWindow"
+            }
+          }
+        },
+        "security" : [ {
+          "apiKeyAuth" : [ ]
+        } ],
+        "summary" : "Get details of a maintenance window",
+        "tags" : [ "Maintenance windows" ]
+      },
+      "put" : {
+        "description" : "",
+        "operationId" : "update",
+        "parameters" : [ {
+          "format" : "uuid",
+          "in" : "path",
+          "name" : "cUUID",
+          "required" : true,
+          "type" : "string"
+        }, {
+          "format" : "uuid",
+          "in" : "path",
+          "name" : "windowUUID",
+          "required" : true,
+          "type" : "string"
+        }, {
+          "in" : "body",
+          "name" : "UpdateMaintenanceWindowRequest",
+          "required" : true,
+          "schema" : {
+            "$ref" : "#/definitions/MaintenanceWindow"
+          }
+        } ],
+        "responses" : {
+          "200" : {
+            "description" : "successful operation",
+            "schema" : {
+              "$ref" : "#/definitions/MaintenanceWindow"
+            }
+          }
+        },
+        "security" : [ {
+          "apiKeyAuth" : [ ]
+        } ],
+        "summary" : "Update maintenance window",
+        "tags" : [ "Maintenance windows" ]
       }
     },
     "/api/v1/customers/{cUUID}/metrics" : {
@@ -6830,6 +7637,41 @@
         } ],
         "summary" : "Delete a node instance",
         "tags" : [ "Node instances" ]
+      },
+      "post" : {
+        "description" : "",
+        "operationId" : "detachedNodeAction",
+        "parameters" : [ {
+          "format" : "uuid",
+          "in" : "path",
+          "name" : "cUUID",
+          "required" : true,
+          "type" : "string"
+        }, {
+          "format" : "uuid",
+          "in" : "path",
+          "name" : "pUUID",
+          "required" : true,
+          "type" : "string"
+        }, {
+          "in" : "path",
+          "name" : "instanceIP",
+          "required" : true,
+          "type" : "string"
+        } ],
+        "responses" : {
+          "200" : {
+            "description" : "successful operation",
+            "schema" : {
+              "$ref" : "#/definitions/YBPTask"
+            }
+          }
+        },
+        "security" : [ {
+          "apiKeyAuth" : [ ]
+        } ],
+        "summary" : "Detached node action",
+        "tags" : [ "Node instances" ]
       }
     },
     "/api/v1/customers/{cUUID}/providers/{pUUID}/nodes/list" : {
@@ -7266,6 +8108,35 @@
       }
     },
     "/api/v1/customers/{cUUID}/releases/{name}" : {
+      "delete" : {
+        "description" : "",
+        "operationId" : "deleteRelease",
+        "parameters" : [ {
+          "format" : "uuid",
+          "in" : "path",
+          "name" : "cUUID",
+          "required" : true,
+          "type" : "string"
+        }, {
+          "in" : "path",
+          "name" : "name",
+          "required" : true,
+          "type" : "string"
+        } ],
+        "responses" : {
+          "200" : {
+            "description" : "successful operation",
+            "schema" : {
+              "$ref" : "#/definitions/ReleaseMetadata"
+            }
+          }
+        },
+        "security" : [ {
+          "apiKeyAuth" : [ ]
+        } ],
+        "summary" : "Delete a release",
+        "tags" : [ "Release management" ]
+      },
       "put" : {
         "description" : "",
         "operationId" : "updateRelease",
@@ -7570,10 +8441,12 @@
         } ],
         "summary" : "Get a task's status",
         "tags" : [ "Customer Tasks" ]
-      },
+      }
+    },
+    "/api/v1/customers/{cUUID}/tasks/{tUUID}/abort" : {
       "post" : {
-        "description" : "Retry a Create Universe task.",
-        "operationId" : "retryTask",
+        "description" : "Aborts a running task",
+        "operationId" : "abortTask",
         "parameters" : [ {
           "format" : "uuid",
           "in" : "path",
@@ -7591,14 +8464,14 @@
           "200" : {
             "description" : "successful operation",
             "schema" : {
-              "$ref" : "#/definitions/UniverseResp"
+              "$ref" : "#/definitions/YBPSuccess"
             }
           }
         },
         "security" : [ {
           "apiKeyAuth" : [ ]
         } ],
-        "summary" : "Retry a task",
+        "summary" : "Abort a task",
         "tags" : [ "Customer Tasks" ]
       }
     },
@@ -7698,6 +8571,38 @@
           "apiKeyAuth" : [ ]
         } ],
         "summary" : "Get a task's failed subtasks",
+        "tags" : [ "Customer Tasks" ]
+      }
+    },
+    "/api/v1/customers/{cUUID}/tasks/{tUUID}/retry" : {
+      "post" : {
+        "description" : "Retry a Universe task.",
+        "operationId" : "retryTask",
+        "parameters" : [ {
+          "format" : "uuid",
+          "in" : "path",
+          "name" : "cUUID",
+          "required" : true,
+          "type" : "string"
+        }, {
+          "format" : "uuid",
+          "in" : "path",
+          "name" : "tUUID",
+          "required" : true,
+          "type" : "string"
+        } ],
+        "responses" : {
+          "200" : {
+            "description" : "successful operation",
+            "schema" : {
+              "$ref" : "#/definitions/UniverseResp"
+            }
+          }
+        },
+        "security" : [ {
+          "apiKeyAuth" : [ ]
+        } ],
+        "summary" : "Retry a Universe task",
         "tags" : [ "Customer Tasks" ]
       }
     },
@@ -8659,46 +9564,6 @@
         "tags" : [ "Universe management" ]
       }
     },
-    "/api/v1/customers/{cUUID}/universes/{uniUUID}/pause_xcluster_replication" : {
-      "put" : {
-        "description" : "",
-        "operationId" : "pause",
-        "parameters" : [ {
-          "format" : "uuid",
-          "in" : "path",
-          "name" : "cUUID",
-          "required" : true,
-          "type" : "string"
-        }, {
-          "format" : "uuid",
-          "in" : "path",
-          "name" : "uniUUID",
-          "required" : true,
-          "type" : "string"
-        }, {
-          "description" : "XCluster Replication Form Data",
-          "in" : "body",
-          "name" : "xcluster_replication_form_data",
-          "required" : true,
-          "schema" : {
-            "$ref" : "#/definitions/XClusterReplicationFormData"
-          }
-        } ],
-        "responses" : {
-          "200" : {
-            "description" : "successful operation",
-            "schema" : {
-              "$ref" : "#/definitions/YBPTask"
-            }
-          }
-        },
-        "security" : [ {
-          "apiKeyAuth" : [ ]
-        } ],
-        "summary" : "Pause xCluster Replication",
-        "tags" : [ "XCluster Replication" ]
-      }
-    },
     "/api/v1/customers/{cUUID}/universes/{uniUUID}/redisservers" : {
       "get" : {
         "description" : "",
@@ -8761,46 +9626,6 @@
         } ],
         "summary" : "Resume a paused universe",
         "tags" : [ "Universe management" ]
-      }
-    },
-    "/api/v1/customers/{cUUID}/universes/{uniUUID}/resume_xcluster_replication" : {
-      "put" : {
-        "description" : "",
-        "operationId" : "resume",
-        "parameters" : [ {
-          "format" : "uuid",
-          "in" : "path",
-          "name" : "cUUID",
-          "required" : true,
-          "type" : "string"
-        }, {
-          "format" : "uuid",
-          "in" : "path",
-          "name" : "uniUUID",
-          "required" : true,
-          "type" : "string"
-        }, {
-          "description" : "XCluster Replication Form Data",
-          "in" : "body",
-          "name" : "xcluster_replication_form_data",
-          "required" : true,
-          "schema" : {
-            "$ref" : "#/definitions/XClusterReplicationFormData"
-          }
-        } ],
-        "responses" : {
-          "200" : {
-            "description" : "successful operation",
-            "schema" : {
-              "$ref" : "#/definitions/YBPTask"
-            }
-          }
-        },
-        "security" : [ {
-          "apiKeyAuth" : [ ]
-        } ],
-        "summary" : "Resume xCluster Replication",
-        "tags" : [ "XCluster Replication" ]
       }
     },
     "/api/v1/customers/{cUUID}/universes/{uniUUID}/run_in_shell" : {
@@ -9080,6 +9905,74 @@
           "apiKeyAuth" : [ ]
         } ],
         "tags" : [ "ScheduleExternalScript" ]
+      }
+    },
+    "/api/v1/customers/{cUUID}/universes/{uniUUID}/support_bundle" : {
+      "post" : {
+        "description" : "",
+        "operationId" : "createSupportBundle",
+        "parameters" : [ {
+          "format" : "uuid",
+          "in" : "path",
+          "name" : "cUUID",
+          "required" : true,
+          "type" : "string"
+        }, {
+          "format" : "uuid",
+          "in" : "path",
+          "name" : "uniUUID",
+          "required" : true,
+          "type" : "string"
+        } ],
+        "responses" : {
+          "200" : {
+            "description" : "successful operation",
+            "schema" : {
+              "$ref" : "#/definitions/YBPTask"
+            }
+          }
+        },
+        "security" : [ {
+          "apiKeyAuth" : [ ]
+        } ],
+        "summary" : "Create support bundle for specific universe",
+        "tags" : [ "Support Bundle management" ]
+      }
+    },
+    "/api/v1/customers/{cUUID}/universes/{uniUUID}/support_bundle/{sbUUID}" : {
+      "get" : {
+        "description" : "",
+        "operationId" : "getSupportBundle",
+        "parameters" : [ {
+          "format" : "uuid",
+          "in" : "path",
+          "name" : "cUUID",
+          "required" : true,
+          "type" : "string"
+        }, {
+          "format" : "uuid",
+          "in" : "path",
+          "name" : "uniUUID",
+          "required" : true,
+          "type" : "string"
+        }, {
+          "format" : "uuid",
+          "in" : "path",
+          "name" : "sbUUID",
+          "required" : true,
+          "type" : "string"
+        } ],
+        "produces" : [ "application/x-compressed" ],
+        "responses" : {
+          "default" : {
+            "description" : "successful operation"
+          }
+        },
+        "security" : [ {
+          "apiKeyAuth" : [ ]
+        } ],
+        "summary" : "Download support bundle",
+        "tags" : [ "Support Bundle management" ]
       }
     },
     "/api/v1/customers/{cUUID}/universes/{uniUUID}/tables" : {
@@ -9524,122 +10417,6 @@
         "tags" : [ "ScheduleExternalScript" ]
       }
     },
-    "/api/v1/customers/{cUUID}/universes/{uniUUID}/xcluster_replication" : {
-      "delete" : {
-        "description" : "",
-        "operationId" : "delete_xcluster",
-        "parameters" : [ {
-          "format" : "uuid",
-          "in" : "path",
-          "name" : "cUUID",
-          "required" : true,
-          "type" : "string"
-        }, {
-          "format" : "uuid",
-          "in" : "path",
-          "name" : "uniUUID",
-          "required" : true,
-          "type" : "string"
-        }, {
-          "description" : "XCluster Replication Form Data",
-          "in" : "body",
-          "name" : "xcluster_replication_form_data",
-          "required" : true,
-          "schema" : {
-            "$ref" : "#/definitions/XClusterReplicationFormData"
-          }
-        } ],
-        "responses" : {
-          "200" : {
-            "description" : "successful operation",
-            "schema" : {
-              "$ref" : "#/definitions/YBPTask"
-            }
-          }
-        },
-        "security" : [ {
-          "apiKeyAuth" : [ ]
-        } ],
-        "summary" : "Delete xCluster Replication",
-        "tags" : [ "XCluster Replication" ]
-      },
-      "post" : {
-        "description" : "",
-        "operationId" : "create_xcluster",
-        "parameters" : [ {
-          "format" : "uuid",
-          "in" : "path",
-          "name" : "cUUID",
-          "required" : true,
-          "type" : "string"
-        }, {
-          "format" : "uuid",
-          "in" : "path",
-          "name" : "uniUUID",
-          "required" : true,
-          "type" : "string"
-        }, {
-          "description" : "XCluster Replication Form Data",
-          "in" : "body",
-          "name" : "xcluster_replication_form_data",
-          "required" : true,
-          "schema" : {
-            "$ref" : "#/definitions/XClusterReplicationFormData"
-          }
-        } ],
-        "responses" : {
-          "200" : {
-            "description" : "successful operation",
-            "schema" : {
-              "$ref" : "#/definitions/YBPTask"
-            }
-          }
-        },
-        "security" : [ {
-          "apiKeyAuth" : [ ]
-        } ],
-        "summary" : "Create xCluster Replication",
-        "tags" : [ "XCluster Replication" ]
-      },
-      "put" : {
-        "description" : "",
-        "operationId" : "edit",
-        "parameters" : [ {
-          "format" : "uuid",
-          "in" : "path",
-          "name" : "cUUID",
-          "required" : true,
-          "type" : "string"
-        }, {
-          "format" : "uuid",
-          "in" : "path",
-          "name" : "uniUUID",
-          "required" : true,
-          "type" : "string"
-        }, {
-          "description" : "XCluster Replication Form Data",
-          "in" : "body",
-          "name" : "xcluster_replication_form_data",
-          "required" : true,
-          "schema" : {
-            "$ref" : "#/definitions/XClusterReplicationFormData"
-          }
-        } ],
-        "responses" : {
-          "200" : {
-            "description" : "successful operation",
-            "schema" : {
-              "$ref" : "#/definitions/YBPTask"
-            }
-          }
-        },
-        "security" : [ {
-          "apiKeyAuth" : [ ]
-        } ],
-        "summary" : "Edit xCluster Replication",
-        "tags" : [ "XCluster Replication" ]
-      }
-    },
     "/api/v1/customers/{cUUID}/universes/{uniUUID}/yqlservers" : {
       "get" : {
         "description" : "",
@@ -9800,7 +10577,7 @@
             "description" : "successful operation",
             "schema" : {
               "items" : {
-                "$ref" : "#/definitions/Users"
+                "$ref" : "#/definitions/UserWithFeatures"
               },
               "type" : "array"
             }
@@ -9834,7 +10611,7 @@
           "200" : {
             "description" : "successful operation",
             "schema" : {
-              "$ref" : "#/definitions/Users"
+              "$ref" : "#/definitions/UserWithFeatures"
             }
           }
         },
@@ -9896,7 +10673,7 @@
           "200" : {
             "description" : "successful operation",
             "schema" : {
-              "$ref" : "#/definitions/Users"
+              "$ref" : "#/definitions/UserWithFeatures"
             }
           }
         },
@@ -10017,6 +10794,213 @@
         "tags" : [ "User management" ]
       }
     },
+    "/api/v1/customers/{cUUID}/users/{uUUID}/update_profile" : {
+      "put" : {
+        "description" : "",
+        "operationId" : "UpdateUserProfile",
+        "parameters" : [ {
+          "format" : "uuid",
+          "in" : "path",
+          "name" : "cUUID",
+          "required" : true,
+          "type" : "string"
+        }, {
+          "format" : "uuid",
+          "in" : "path",
+          "name" : "uUUID",
+          "required" : true,
+          "type" : "string"
+        }, {
+          "description" : "User data in profile to be updated",
+          "in" : "body",
+          "name" : "Users",
+          "required" : true,
+          "schema" : {
+            "$ref" : "#/definitions/UserProfileData"
+          }
+        } ],
+        "responses" : {
+          "200" : {
+            "description" : "successful operation",
+            "schema" : {
+              "$ref" : "#/definitions/Users"
+            }
+          }
+        },
+        "security" : [ {
+          "apiKeyAuth" : [ ]
+        } ],
+        "summary" : "Update a user's profile",
+        "tags" : [ "User management" ]
+      }
+    },
+    "/api/v1/customers/{cUUID}/xcluster_configs" : {
+      "post" : {
+        "description" : "",
+        "operationId" : "createXClusterConfig",
+        "parameters" : [ {
+          "format" : "uuid",
+          "in" : "path",
+          "name" : "cUUID",
+          "required" : true,
+          "type" : "string"
+        }, {
+          "description" : "XCluster Replication Create Form Data",
+          "in" : "body",
+          "name" : "xcluster_replication_create_form_data",
+          "required" : true,
+          "schema" : {
+            "$ref" : "#/definitions/XClusterConfigCreateFormData"
+          }
+        } ],
+        "responses" : {
+          "200" : {
+            "description" : "successful operation",
+            "schema" : {
+              "$ref" : "#/definitions/YBPTask"
+            }
+          }
+        },
+        "security" : [ {
+          "apiKeyAuth" : [ ]
+        } ],
+        "summary" : "Create xcluster config",
+        "tags" : [ "Asynchronous Replication" ]
+      }
+    },
+    "/api/v1/customers/{cUUID}/xcluster_configs/sync" : {
+      "post" : {
+        "description" : "",
+        "operationId" : "syncXClusterConfig",
+        "parameters" : [ {
+          "format" : "uuid",
+          "in" : "path",
+          "name" : "cUUID",
+          "required" : true,
+          "type" : "string"
+        }, {
+          "default" : "null",
+          "format" : "uuid",
+          "in" : "query",
+          "name" : "targetUniverseUUID",
+          "required" : false,
+          "type" : "string"
+        } ],
+        "responses" : {
+          "200" : {
+            "description" : "successful operation",
+            "schema" : {
+              "$ref" : "#/definitions/YBPTask"
+            }
+          }
+        },
+        "security" : [ {
+          "apiKeyAuth" : [ ]
+        } ],
+        "summary" : "Sync xcluster config",
+        "tags" : [ "Asynchronous Replication" ]
+      }
+    },
+    "/api/v1/customers/{cUUID}/xcluster_configs/{xccUUID}" : {
+      "delete" : {
+        "description" : "",
+        "operationId" : "deleteXClusterConfig",
+        "parameters" : [ {
+          "format" : "uuid",
+          "in" : "path",
+          "name" : "cUUID",
+          "required" : true,
+          "type" : "string"
+        }, {
+          "format" : "uuid",
+          "in" : "path",
+          "name" : "xccUUID",
+          "required" : true,
+          "type" : "string"
+        } ],
+        "responses" : {
+          "200" : {
+            "description" : "successful operation",
+            "schema" : {
+              "$ref" : "#/definitions/YBPTask"
+            }
+          }
+        },
+        "security" : [ {
+          "apiKeyAuth" : [ ]
+        } ],
+        "summary" : "Delete xcluster config",
+        "tags" : [ "Asynchronous Replication" ]
+      },
+      "get" : {
+        "description" : "",
+        "operationId" : "getXClusterConfig",
+        "parameters" : [ {
+          "format" : "uuid",
+          "in" : "path",
+          "name" : "cUUID",
+          "required" : true,
+          "type" : "string"
+        }, {
+          "format" : "uuid",
+          "in" : "path",
+          "name" : "xccUUID",
+          "required" : true,
+          "type" : "string"
+        } ],
+        "responses" : {
+          "200" : {
+            "description" : "successful operation",
+            "schema" : {
+              "$ref" : "#/definitions/XClusterConfig"
+            }
+          }
+        },
+        "security" : [ {
+          "apiKeyAuth" : [ ]
+        } ],
+        "summary" : "Get xcluster config",
+        "tags" : [ "Asynchronous Replication" ]
+      },
+      "put" : {
+        "description" : "",
+        "operationId" : "editXClusterConfig",
+        "parameters" : [ {
+          "format" : "uuid",
+          "in" : "path",
+          "name" : "cUUID",
+          "required" : true,
+          "type" : "string"
+        }, {
+          "format" : "uuid",
+          "in" : "path",
+          "name" : "xccUUID",
+          "required" : true,
+          "type" : "string"
+        }, {
+          "description" : "XCluster Replication Edit Form Data",
+          "in" : "body",
+          "name" : "xcluster_replication_edit_form_data",
+          "required" : true,
+          "schema" : {
+            "$ref" : "#/definitions/XClusterConfigEditFormData"
+          }
+        } ],
+        "responses" : {
+          "200" : {
+            "description" : "successful operation",
+            "schema" : {
+              "$ref" : "#/definitions/YBPTask"
+            }
+          }
+        },
+        "security" : [ {
+          "apiKeyAuth" : [ ]
+        } ],
+        "summary" : "Edit xcluster config",
+        "tags" : [ "Asynchronous Replication" ]
+      }
+    },
     "/api/v1/customers/{cUUID}/zones/{azUUID}/nodes" : {
       "post" : {
         "description" : "",
@@ -10098,19 +11082,22 @@
     "/api/v1/logging_config" : {
       "post" : {
         "description" : "",
-        "operationId" : "setLoggingLevel",
+        "operationId" : "setLoggingSettings",
         "parameters" : [ {
           "description" : "Logging config to be updated",
           "in" : "body",
           "name" : "Logging Config",
           "required" : true,
           "schema" : {
-            "$ref" : "#/definitions/LoggingConfigFormData"
+            "$ref" : "#/definitions/PlatformLoggingConfig"
           }
         } ],
         "responses" : {
-          "default" : {
-            "description" : "successful operation"
+          "200" : {
+            "description" : "successful operation",
+            "schema" : {
+              "$ref" : "#/definitions/PlatformLoggingConfig"
+            }
           }
         },
         "security" : [ {
@@ -10144,12 +11131,10 @@
           "required" : false,
           "type" : "string"
         } ],
+        "produces" : [ "text/plain" ],
         "responses" : {
-          "200" : {
-            "description" : "successful operation",
-            "schema" : {
-              "$ref" : "#/definitions/LogData"
-            }
+          "default" : {
+            "description" : "successful operation"
           }
         },
         "summary" : "getFilteredLogs",
@@ -10381,6 +11366,8 @@
   }, {
     "name" : "Alerts"
   }, {
+    "name" : "Asynchronous Replication"
+  }, {
     "name" : "Audit"
   }, {
     "name" : "Availability Zones"
@@ -10405,6 +11392,8 @@
   }, {
     "name" : "LoggingConfig"
   }, {
+    "name" : "Maintenance windows"
+  }, {
     "name" : "Metrics"
   }, {
     "name" : "Node instances"
@@ -10418,6 +11407,8 @@
     "name" : "ScheduleExternalScript"
   }, {
     "name" : "Session management"
+  }, {
+    "name" : "Support Bundle management"
   }, {
     "name" : "Table management"
   }, {
@@ -10436,7 +11427,5 @@
     "name" : "UniverseClusterMutations"
   }, {
     "name" : "User management"
-  }, {
-    "name" : "XCluster Replication"
   } ]
 }

@@ -32,10 +32,8 @@
 
 #include "yb/rpc/proxy.h"
 
-#include <cinttypes>
 #include <cstdint>
 #include <functional>
-#include <iostream>
 #include <memory>
 #include <sstream>
 #include <vector>
@@ -43,19 +41,21 @@
 #include <glog/logging.h>
 
 #include "yb/rpc/local_call.h"
+#include "yb/rpc/lightweight_message.h"
+#include "yb/rpc/proxy_context.h"
 #include "yb/rpc/outbound_call.h"
-#include "yb/rpc/messenger.h"
 #include "yb/rpc/remote_method.h"
-#include "yb/rpc/response_callback.h"
+#include "yb/rpc/rpc_controller.h"
 #include "yb/rpc/rpc_header.pb.h"
 
 #include "yb/util/backoff_waiter.h"
+#include "yb/util/countdown_latch.h"
+#include "yb/util/metrics.h"
 #include "yb/util/net/dns_resolver.h"
 #include "yb/util/net/sockaddr.h"
 #include "yb/util/net/socket.h"
-#include "yb/util/countdown_latch.h"
+#include "yb/util/result.h"
 #include "yb/util/status.h"
-#include "yb/util/user.h"
 
 DEFINE_int32(num_connections_to_server, 8,
              "Number of underlying connections to each server");
@@ -122,8 +122,19 @@ void Proxy::AsyncRequest(const RemoteMethod* method,
                          RpcController* controller,
                          ResponseCallback callback) {
   DoAsyncRequest(
-      method, std::move(method_metrics), req, resp, controller, std::move(callback),
-      false /* force_run_callback_on_reactor */);
+      method, std::move(method_metrics), AnyMessageConstPtr(&req), AnyMessagePtr(resp), controller,
+      std::move(callback), false /* force_run_callback_on_reactor */);
+}
+
+void Proxy::AsyncRequest(const RemoteMethod* method,
+                         std::shared_ptr<const OutboundMethodMetrics> method_metrics,
+                         const LightweightMessage& req,
+                         LightweightMessage* resp,
+                         RpcController* controller,
+                         ResponseCallback callback) {
+  DoAsyncRequest(
+      method, std::move(method_metrics), AnyMessageConstPtr(&req), AnyMessagePtr(resp), controller,
+      std::move(callback), false /* force_run_callback_on_reactor */);
 }
 
 ThreadPool* Proxy::GetCallbackThreadPool(
@@ -145,8 +156,8 @@ ThreadPool* Proxy::GetCallbackThreadPool(
 
 void Proxy::DoAsyncRequest(const RemoteMethod* method,
                            std::shared_ptr<const OutboundMethodMetrics> method_metrics,
-                           const google::protobuf::Message& req,
-                           google::protobuf::Message* resp,
+                           AnyMessageConstPtr req,
+                           AnyMessagePtr resp,
                            RpcController* controller,
                            ResponseCallback callback,
                            bool force_run_callback_on_reactor) {
@@ -186,18 +197,20 @@ void Proxy::DoAsyncRequest(const RemoteMethod* method,
   if (call_local_service_) {
     // For local call, the response message buffer is reused when an RPC call is retried. So clear
     // the buffer before calling the RPC method.
-    resp->Clear();
+    if (resp.is_lightweight()) {
+      resp.lightweight()->Clear();
+    } else {
+      resp.protobuf()->Clear();
+    }
     call->SetQueued();
     call->SetSent();
     // If currrent thread is RPC worker thread, it is ok to call the handler in the current thread.
     // Otherwise, enqueue the call to be handled by the service's handler thread.
     const shared_ptr<LocalYBInboundCall>& local_call =
         static_cast<LocalOutboundCall*>(call)->CreateLocalInboundCall();
-    if (controller->allow_local_calls_in_curr_thread() && ThreadPool::IsCurrentThreadRpcWorker()) {
-      context_->Handle(local_call);
-    } else {
-      context_->QueueInboundCall(local_call);
-    }
+    Queue queue(!controller->allow_local_calls_in_curr_thread() ||
+                !ThreadPool::IsCurrentThreadRpcWorker());
+    context_->Handle(local_call, queue);
   } else {
     auto ep = resolved_ep_.Load();
     if (ep.address().is_unspecified()) {
@@ -300,19 +313,41 @@ void Proxy::NotifyFailed(RpcController* controller, const Status& status) {
   call->SetFailed(status);
 }
 
+Status Proxy::DoSyncRequest(const RemoteMethod* method,
+                            std::shared_ptr<const OutboundMethodMetrics> method_metrics,
+                            AnyMessageConstPtr request,
+                            AnyMessagePtr resp,
+                            RpcController* controller) {
+  CountDownLatch latch(1);
+  // We want to execute this fast callback in reactor thread to avoid overhead on putting in
+  // separate pool.
+  DoAsyncRequest(
+      method, std::move(method_metrics), request, DCHECK_NOTNULL(resp), controller,
+      latch.CountDownCallback(), true /* force_run_callback_on_reactor */);
+  latch.Wait();
+  return controller->status();
+}
+
 Status Proxy::SyncRequest(const RemoteMethod* method,
                           std::shared_ptr<const OutboundMethodMetrics> method_metrics,
                           const google::protobuf::Message& req,
                           google::protobuf::Message* resp,
                           RpcController* controller) {
-  CountDownLatch latch(1);
-  // We want to execute this fast callback in reactor thread to avoid overhead on putting in
-  // separate pool.
-  DoAsyncRequest(
-      method, std::move(method_metrics), req, DCHECK_NOTNULL(resp), controller,
-      [&latch]() { latch.CountDown(); }, true /* force_run_callback_on_reactor */);
-  latch.Wait();
-  return controller->status();
+  return DoSyncRequest(
+      method, std::move(method_metrics), AnyMessageConstPtr(&req), AnyMessagePtr(resp), controller);
+}
+
+Status Proxy::SyncRequest(const RemoteMethod* method,
+                          std::shared_ptr<const OutboundMethodMetrics> method_metrics,
+                          const LightweightMessage& req,
+                          LightweightMessage* resp,
+                          RpcController* controller) {
+  return DoSyncRequest(
+      method, std::move(method_metrics), AnyMessageConstPtr(&req), AnyMessagePtr(resp), controller);
+}
+
+scoped_refptr<MetricEntity> Proxy::metric_entity() const {
+  return context_->metric_entity();
 }
 
 ProxyPtr ProxyCache::GetProxy(
@@ -339,6 +374,14 @@ ProxyMetricsPtr ProxyCache::GetMetrics(
   auto metrics = entity ? factory(entity) : nullptr;
   metrics_.emplace(service_name, metrics);
   return metrics;
+}
+
+ProxyBase::ProxyBase(const std::string& service_name, ProxyMetricsFactory metrics_factory,
+                     ProxyCache* cache, const HostPort& remote,
+                     const Protocol* protocol,
+                     const MonoDelta& resolve_cache_timeout)
+    : proxy_(cache->GetProxy(remote, protocol, resolve_cache_timeout)),
+      metrics_(cache->GetMetrics(service_name, metrics_factory)) {
 }
 
 }  // namespace rpc

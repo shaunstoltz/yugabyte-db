@@ -42,6 +42,9 @@
 set -euo pipefail
 readonly YB_COMPLETED_TEST_FLAG_DIR=/tmp/yb_completed_tests
 
+# Do not fsync the WAL in master by default in tests.
+export YB_MASTER_DURABLE_WAL_WRITE_BY_DEFAULT=0
+
 declare -i process_tree_supervisor_pid=0
 process_supervisor_log_path=""
 
@@ -93,6 +96,7 @@ is_run_test_script=true
 
 yb_readonly_virtualenv=true
 
+detect_architecture
 activate_virtualenv
 
 if [[ -n ${YB_LIST_CTEST_TESTS_ONLY:-} ]]; then

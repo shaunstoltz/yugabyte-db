@@ -3,9 +3,11 @@
 package com.yugabyte.yw.controllers;
 
 import static com.yugabyte.yw.commissioner.Common.CloudType.aws;
+import static com.yugabyte.yw.common.Util.SYSTEM_PLATFORM_DB;
 import static com.yugabyte.yw.common.Util.getUUIDRepresentation;
 import static com.yugabyte.yw.forms.TableDefinitionTaskParams.createFromResponse;
 import static io.swagger.annotations.ApiModelProperty.AccessMode.READ_ONLY;
+import static play.mvc.Http.Status.CONFLICT;
 
 import com.fasterxml.jackson.databind.node.ArrayNode;
 import com.fasterxml.jackson.databind.node.ObjectNode;
@@ -49,15 +51,16 @@ import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.UUID;
+import java.util.stream.Collectors;
 import lombok.Builder;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
-import org.yb.Common.TableType;
+import org.yb.CommonTypes.TableType;
 import org.yb.client.GetTableSchemaResponse;
 import org.yb.client.ListTablesResponse;
 import org.yb.client.YBClient;
-import org.yb.master.Master.ListTablesResponsePB.TableInfo;
-import org.yb.master.Master.RelationType;
+import org.yb.master.MasterDdlOuterClass.ListTablesResponsePB.TableInfo;
+import org.yb.master.MasterTypes.RelationType;
 import play.data.Form;
 import play.libs.Json;
 import play.mvc.Result;
@@ -290,7 +293,7 @@ public class TablesController extends AuthenticatedController {
     List<TableInfoResp> tableInfoRespList = new ArrayList<>(tableInfoList.size());
     for (TableInfo table : tableInfoList) {
       String tableKeySpace = table.getNamespace().getName();
-      if (table.getRelationType() != RelationType.SYSTEM_TABLE_RELATION || isSystemRedis(table)) {
+      if (!isSystemTable(table) || isSystemRedis(table)) {
         String id = table.getId().toStringUtf8();
         TableInfoResp.TableInfoRespBuilder builder =
             TableInfoResp.builder()
@@ -308,6 +311,12 @@ public class TablesController extends AuthenticatedController {
       }
     }
     return PlatformResults.withData(tableInfoRespList);
+  }
+
+  private boolean isSystemTable(TableInfo table) {
+    return table.getRelationType() == RelationType.SYSTEM_TABLE_RELATION
+        || (table.getTableType() == TableType.PGSQL_TABLE_TYPE
+            && table.getNamespace().getName().equals(SYSTEM_PLATFORM_DB));
   }
 
   private boolean isSystemRedis(TableInfo table) {
@@ -406,6 +415,7 @@ public class TablesController extends AuthenticatedController {
         dataType = "com.yugabyte.yw.forms.MultiTableBackupRequestParams",
         paramType = "body")
   })
+  // Will remove this on completion.
   public Result createMultiTableBackup(UUID customerUUID, UUID universeUUID) {
     // Validate customer UUID
     Customer customer = Customer.getOrBadRequest(customerUUID);
@@ -433,7 +443,8 @@ public class TablesController extends AuthenticatedController {
     taskParams.universeUUID = universeUUID;
     taskParams.customerUUID = customerUUID;
 
-    validateTables(taskParams.tableUUIDList, universe);
+    validateTables(
+        taskParams.tableUUIDList, universe, taskParams.getKeyspace(), taskParams.backupType);
 
     if (taskParams.schedulingFrequency != 0L || taskParams.cronExpression != null) {
       Schedule schedule =
@@ -466,6 +477,60 @@ public class TablesController extends AuthenticatedController {
     }
   }
 
+  @ApiOperation(value = "Create a backup", nickname = "createbackup", response = YBPTask.class)
+  @ApiImplicitParams({
+    @ApiImplicitParam(
+        name = "Backup",
+        value = "Backup data to be created",
+        required = true,
+        dataType = "com.yugabyte.yw.forms.BackupTableParams",
+        paramType = "body")
+  })
+  // Rename this to createBackup on completion
+  public Result createBackupYb(UUID customerUUID) {
+    // Validate customer UUID
+    Customer customer = Customer.getOrBadRequest(customerUUID);
+
+    Form<BackupTableParams> formData = formFactory.getFormDataOrBadRequest(BackupTableParams.class);
+    BackupTableParams taskParams = formData.get();
+
+    // Validate universe UUID
+    Universe universe = Universe.getOrBadRequest(taskParams.universeUUID);
+    taskParams.customerUuid = customerUUID;
+
+    if (taskParams.tableUUIDList == null) {
+      taskParams.tableUUIDList = new ArrayList<>();
+    }
+    validateTables(
+        taskParams.tableUUIDList, universe, taskParams.getKeyspace(), taskParams.backupType);
+
+    if (taskParams.storageConfigUUID == null) {
+      throw new PlatformServiceException(
+          BAD_REQUEST, "Missing StorageConfig UUID: " + taskParams.storageConfigUUID);
+    }
+    customerConfigService.getOrBadRequest(customerUUID, taskParams.storageConfigUUID);
+    if (universe.getUniverseDetails().updateInProgress
+        || universe.getUniverseDetails().backupInProgress) {
+      throw new PlatformServiceException(
+          CONFLICT,
+          String.format(
+              "Cannot run Backup task since the universe %s is currently in a locked state.",
+              taskParams.universeUUID.toString()));
+    }
+    UUID taskUUID = commissioner.submit(TaskType.CreateBackup, taskParams);
+    LOG.info("Submitted task to universe {}, task uuid = {}.", universe.name, taskUUID);
+    CustomerTask.create(
+        customer,
+        taskParams.universeUUID,
+        taskUUID,
+        CustomerTask.TargetType.Backup,
+        CustomerTask.TaskType.Create,
+        universe.name);
+    LOG.info("Saved task uuid {} in customer tasks for universe {}", taskUUID, universe.name);
+    auditService().createAuditEntry(ctx(), request(), Json.toJson(formData.data()), taskUUID);
+    return new YBPTask(taskUUID).asResult();
+  }
+
   @ApiOperation(
       value = "Create a single-table backup",
       nickname = "createSingleTableBackup",
@@ -478,17 +543,22 @@ public class TablesController extends AuthenticatedController {
         dataType = "com.yugabyte.yw.forms.BackupTableParams",
         paramType = "body")
   })
+  // Remove this too.
   public Result createBackup(UUID customerUUID, UUID universeUUID, UUID tableUUID) {
     // Validate customer UUID
     Customer customer = Customer.getOrBadRequest(customerUUID);
     // Validate universe UUID
     Universe universe = Universe.getOrBadRequest(universeUUID);
 
-    validateTables(Collections.singletonList(tableUUID), universe);
-
     Form<BackupTableParams> formData = formFactory.getFormDataOrBadRequest(BackupTableParams.class);
-
     BackupTableParams taskParams = formData.get();
+
+    validateTables(
+        Collections.singletonList(tableUUID),
+        universe,
+        taskParams.getKeyspace(),
+        taskParams.backupType);
+
     customerConfigService.getOrBadRequest(customerUUID, taskParams.storageConfigUUID);
     if (universe.getUniverseDetails().updateInProgress
         || universe.getUniverseDetails().backupInProgress) {
@@ -615,6 +685,59 @@ public class TablesController extends AuthenticatedController {
 
     auditService().createAuditEntry(ctx(), request(), Json.toJson(formData.data()), taskUUID);
     return new YBPTask(taskUUID, tableUUID).asResult();
+  }
+
+  @VisibleForTesting
+  void validateTables(
+      List<UUID> tableUuids, Universe universe, String keyspace, TableType tableType) {
+
+    List<TableInfo> tableInfoList = getTableInfosOrEmpty(universe);
+    if (keyspace != null && tableUuids.isEmpty()) {
+      tableInfoList =
+          tableInfoList
+              .parallelStream()
+              .filter(tableInfo -> keyspace.equals(tableInfo.getNamespace().getName()))
+              .filter(tableInfo -> tableType.equals(tableInfo.getTableType()))
+              .collect(Collectors.toList());
+      if (tableInfoList.isEmpty()) {
+        throw new PlatformServiceException(
+            BAD_REQUEST, "Cannot initiate backup with empty Keyspace " + keyspace);
+      }
+      return;
+    }
+
+    if (keyspace == null) {
+      tableInfoList =
+          tableInfoList
+              .parallelStream()
+              .filter(tableInfo -> tableType.equals(tableInfo.getTableType()))
+              .collect(Collectors.toList());
+      if (tableInfoList.isEmpty()) {
+        throw new PlatformServiceException(
+            BAD_REQUEST,
+            "No tables to backup inside specified Universe "
+                + universe.universeUUID.toString()
+                + " and Table Type "
+                + tableType.name());
+      }
+      return;
+    }
+
+    // Match if the table is an index or ysql table.
+    for (TableInfo tableInfo : tableInfoList) {
+      if (tableUuids.contains(
+          getUUIDRepresentation(tableInfo.getId().toStringUtf8().replace("-", "")))) {
+        if (tableInfo.hasRelationType()
+            && tableInfo.getRelationType() == RelationType.INDEX_TABLE_RELATION) {
+          throw new PlatformServiceException(
+              BAD_REQUEST, "Cannot backup index table " + tableInfo.getName());
+        } else if (tableInfo.hasTableType()
+            && tableInfo.getTableType() == TableType.PGSQL_TABLE_TYPE) {
+          throw new PlatformServiceException(
+              BAD_REQUEST, "Cannot backup ysql table " + tableInfo.getName());
+        }
+      }
+    }
   }
 
   @VisibleForTesting

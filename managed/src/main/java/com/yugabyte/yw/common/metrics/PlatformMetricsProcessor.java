@@ -57,6 +57,7 @@ public class PlatformMetricsProcessor {
   }
 
   public void start() {
+    metricService.initialize();
     this.actorSystem
         .scheduler()
         .schedule(
@@ -68,19 +69,22 @@ public class PlatformMetricsProcessor {
 
   @VisibleForTesting
   void scheduleRunner() {
+    if (!running.compareAndSet(false, true)) {
+      log.info("Previous run of metrics processor is still underway");
+      return;
+    }
     String errorMessage = null;
-    if (running.compareAndSet(false, true)) {
-      try {
-        errorMessage = updateMetrics();
-        cleanExpiredMetrics();
-      } catch (Exception e) {
-        errorMessage = "Error processing metrics: " + e.getMessage();
-        log.error("Error processing metrics", e);
-      } finally {
-        metricService.setStatusMetric(
-            buildMetricTemplate(PlatformMetrics.METRIC_PROCESSOR_STATUS), errorMessage);
-        running.set(false);
-      }
+    try {
+      errorMessage = updateMetrics();
+      cleanExpiredMetrics();
+      metricService.flushMetricsToDb();
+    } catch (Exception e) {
+      errorMessage = "Error processing metrics: " + e.getMessage();
+      log.error("Error processing metrics", e);
+    } finally {
+      metricService.setStatusMetric(
+          buildMetricTemplate(PlatformMetrics.METRIC_PROCESSOR_STATUS), errorMessage);
+      running.set(false);
     }
   }
 

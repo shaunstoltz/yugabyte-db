@@ -3,12 +3,18 @@
 package com.yugabyte.yw.common;
 
 import static com.yugabyte.yw.models.CustomerTask.TargetType;
+import static com.yugabyte.yw.models.CustomerTask.TaskType;
 
+import com.fasterxml.jackson.databind.JsonNode;
+import com.fasterxml.jackson.databind.node.ObjectNode;
 import com.yugabyte.yw.forms.UniverseDefinitionTaskParams;
+import com.yugabyte.yw.models.Backup;
 import com.yugabyte.yw.models.CustomerTask;
 import com.yugabyte.yw.models.TaskInfo;
 import com.yugabyte.yw.models.Universe;
 import io.ebean.Ebean;
+import java.util.List;
+import java.util.UUID;
 import javax.inject.Singleton;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -30,9 +36,40 @@ public class CustomerTaskManager {
               });
       // Mark task as a failure
       taskInfo.setTaskState(TaskInfo.State.Failure);
+      JsonNode jsonNode = taskInfo.getTaskDetails();
+      if (jsonNode != null && jsonNode instanceof ObjectNode) {
+        ObjectNode details = (ObjectNode) jsonNode;
+        details.put("errorString", "Platform restarted.");
+      }
       taskInfo.save();
       // Mark customer task as completed
       customerTask.markAsCompleted();
+
+      if (customerTask.getTarget().equals(TargetType.Backup)
+          && customerTask.getType().equals(TaskType.Create)) {
+        // Make transition state false for inProgress backups
+        UUID taskUUID = taskInfo.getTaskUUID();
+        List<Backup> backupList = Backup.fetchAllBackupsByTaskUUID(taskUUID);
+        backupList
+            .stream()
+            .filter(backup -> backup.state.equals(Backup.BackupState.InProgress))
+            .forEach(backup -> backup.transitionState(Backup.BackupState.Failed));
+        // Create the update lambda.
+        Universe.UniverseUpdater updater =
+            universe -> {
+              UniverseDefinitionTaskParams universeDetails = universe.getUniverseDetails();
+              if (universeDetails.backupInProgress) {
+                universeDetails.backupInProgress = false;
+              }
+              if (universeDetails.updateInProgress) {
+                universeDetails.updateInProgress = false;
+              }
+              universe.setUniverseDetails(universeDetails);
+            };
+
+        Universe.saveDetails(customerTask.getTargetUUID(), updater, false);
+        LOG.debug("Unlocked universe {} for backups.", customerTask.getTargetUUID());
+      }
 
       // Unlock the universe for future operations
       if (customerTask.getTarget().equals(TargetType.Universe)) {
@@ -57,13 +94,27 @@ public class CustomerTaskManager {
   public void failAllPendingTasks() {
     LOG.info("Failing incomplete tasks...");
     try {
-      // Retrieve all incomplete customer tasks
+      String incompleteStates =
+          String.join(
+              "', '",
+              new String[] {
+                TaskInfo.State.Created.name(),
+                TaskInfo.State.Initializing.name(),
+                TaskInfo.State.Running.name(),
+                TaskInfo.State.Abort.name()
+              });
+      // Retrieve all incomplete customer tasks.
+      // TODO It is possible that completion_time == NULL
+      // but task_state is completed. Retry will not appear on UI.
       String query =
           "SELECT ti.uuid AS task_uuid, ct.id AS customer_task_id "
               + "FROM task_info ti, customer_task ct "
               + "WHERE ti.uuid = ct.task_uuid "
               + "AND ct.completion_time IS NULL "
-              + "AND ti.task_state IN ('Created', 'Initializing', 'Running')";
+              + "AND ti.task_state IN ('"
+              + incompleteStates
+              + "')";
+      // TODO use Finder.
       Ebean.createSqlQuery(query)
           .findList()
           .forEach(

@@ -20,12 +20,15 @@ import com.yugabyte.yw.models.paging.PagedQuery.SortByIF;
 import io.ebean.ExpressionList;
 import io.ebean.Finder;
 import io.ebean.Model;
+import io.ebean.PersistenceContextScope;
 import io.ebean.annotation.Formula;
 import io.swagger.annotations.ApiModel;
 import io.swagger.annotations.ApiModelProperty;
+import java.util.Arrays;
 import java.util.Comparator;
 import java.util.Date;
 import java.util.List;
+import java.util.Set;
 import java.util.UUID;
 import java.util.stream.Collectors;
 import javax.persistence.CascadeType;
@@ -51,18 +54,29 @@ import org.apache.commons.lang3.StringUtils;
 public class Alert extends Model implements AlertLabelsProvider {
 
   public enum State {
-    ACTIVE("firing"),
-    ACKNOWLEDGED("acknowledged"),
-    RESOLVED("resolved");
+    ACTIVE("firing", true),
+    ACKNOWLEDGED("acknowledged", true),
+    SUSPENDED("suspended", true),
+    RESOLVED("resolved", false);
 
     private final String action;
+    private final boolean firing;
 
-    State(String action) {
+    State(String action, boolean firing) {
       this.action = action;
+      this.firing = firing;
     }
 
     public String getAction() {
       return action;
+    }
+
+    public boolean isFiring() {
+      return firing;
+    }
+
+    public static Set<State> getFiringStates() {
+      return Arrays.stream(values()).filter(State::isFiring).collect(Collectors.toSet());
     }
   }
 
@@ -102,15 +116,15 @@ public class Alert extends Model implements AlertLabelsProvider {
 
   @NotNull
   @Column(nullable = false)
-  @JsonFormat(shape = JsonFormat.Shape.STRING, pattern = "yyyy-MM-dd HH:mm:ss")
+  @JsonFormat(shape = JsonFormat.Shape.STRING, pattern = "yyyy-MM-dd'T'HH:mm:ssZ")
   @ApiModelProperty(value = "Alert creation timestamp", accessMode = READ_ONLY)
   private Date createTime = nowWithoutMillis();
 
-  @JsonFormat(shape = JsonFormat.Shape.STRING, pattern = "yyyy-MM-dd HH:mm:ss")
+  @JsonFormat(shape = JsonFormat.Shape.STRING, pattern = "yyyy-MM-dd'T'HH:mm:ssZ")
   @ApiModelProperty(value = "Timestamp at which the alert was acknowledged", accessMode = READ_ONLY)
   private Date acknowledgedTime;
 
-  @JsonFormat(shape = JsonFormat.Shape.STRING, pattern = "yyyy-MM-dd HH:mm:ss")
+  @JsonFormat(shape = JsonFormat.Shape.STRING, pattern = "yyyy-MM-dd'T'HH:mm:ssZ")
   @ApiModelProperty(value = "Timestamp at which the alert was resolved", accessMode = READ_ONLY)
   private Date resolvedTime;
 
@@ -144,6 +158,10 @@ public class Alert extends Model implements AlertLabelsProvider {
   private String sourceName;
 
   @NotNull
+  @ApiModelProperty(value = "The sourceUUID of the alert", accessMode = READ_ONLY)
+  private UUID sourceUUID;
+
+  @NotNull
   @Enumerated(EnumType.STRING)
   @ApiModelProperty(value = "The alert's state", accessMode = READ_ONLY)
   private State state = State.ACTIVE;
@@ -174,11 +192,11 @@ public class Alert extends Model implements AlertLabelsProvider {
   private List<AlertLabel> labels;
 
   @ApiModelProperty(value = "Time of the last notification attempt", accessMode = READ_ONLY)
-  @JsonFormat(shape = JsonFormat.Shape.STRING, pattern = "yyyy-MM-dd HH:mm:ss")
+  @JsonFormat(shape = JsonFormat.Shape.STRING, pattern = "yyyy-MM-dd'T'HH:mm:ssZ")
   private Date notificationAttemptTime;
 
   @ApiModelProperty(value = "Time of the next notification attempt", accessMode = READ_ONLY)
-  @JsonFormat(shape = JsonFormat.Shape.STRING, pattern = "yyyy-MM-dd HH:mm:ss")
+  @JsonFormat(shape = JsonFormat.Shape.STRING, pattern = "yyyy-MM-dd'T'HH:mm:ssZ")
   private Date nextNotificationTime = nowWithoutMillis();
 
   @ApiModelProperty(value = "Count of failures to send a notification", accessMode = READ_ONLY)
@@ -248,7 +266,11 @@ public class Alert extends Model implements AlertLabelsProvider {
   }
 
   public static ExpressionList<Alert> createQueryByFilter(AlertFilter filter) {
-    ExpressionList<Alert> query = find.query().fetch("labels").where();
+    ExpressionList<Alert> query =
+        find.query()
+            .setPersistenceContextScope(PersistenceContextScope.QUERY)
+            .fetch("labels")
+            .where();
     appendInClause(query, "uuid", filter.getUuids());
     appendNotInClause(query, "uuid", filter.getExcludeUuids());
     if (filter.getCustomerUuid() != null) {
@@ -267,6 +289,7 @@ public class Alert extends Model implements AlertLabelsProvider {
     if (!StringUtils.isEmpty(filter.getSourceName())) {
       query.like("sourceName", filter.getSourceName() + "%");
     }
+    appendInClause(query, "sourceUUID", filter.getSourceUUIDs());
     appendInClause(query, "severity", filter.getSeverities());
     appendInClause(query, "configurationType", filter.getConfigurationTypes());
 

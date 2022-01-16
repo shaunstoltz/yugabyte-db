@@ -10,7 +10,6 @@
 // or implied.  See the License for the specific language governing permissions and limitations
 // under the License.
 //
-
 #include <algorithm>
 #include <thread>
 
@@ -20,7 +19,8 @@
 #include "yb/util/random_util.h"
 #include "yb/util/scope_exit.h"
 #include "yb/util/test_macros.h"
-#include "yb/util/test_util.h"
+#include "yb/util/test_thread_holder.h"
+#include "yb/util/tostring.h"
 
 using namespace std::literals;
 
@@ -65,7 +65,7 @@ class Share {
     std::this_thread::sleep_for(kWaitTime);
     auto running_mask = running();
     out->clear();
-    size_t i = 0;
+    int i = 0;
     while (running_mask != 0) {
       if (running_mask & 1) {
         out->push_back(i / divisor);
@@ -105,7 +105,7 @@ class Task : public PriorityThreadPoolTask {
   }
 
   std::string ToString() const override {
-    return Format("{ index: $0 }", index_);
+    return YB_CLASS_TO_STRING(index);
   }
 
  private:
@@ -142,7 +142,7 @@ void TestRandom(int divisor) {
   });
 
   while (stopped.size() != kTasks) {
-    if (schedule_idx < kTasks && RandomUniformInt<int>(0, 2 + scheduled.size()) == 0) {
+    if (schedule_idx < kTasks && RandomUniformInt<size_t>(0, 2 + scheduled.size()) == 0) {
       auto& task = tasks[schedule_idx];
       auto index = task->Index();
       scheduled.insert(index);
@@ -152,10 +152,10 @@ void TestRandom(int divisor) {
       ASSERT_TRUE(task == nullptr);
       LOG(INFO) << "Submitted: " << index << ", scheduled: " << yb::ToString(scheduled);
     } else if (!scheduled.empty() &&
-               RandomUniformInt<int>(0, std::max<int>(0, 13 - scheduled.size())) == 0) {
+               RandomUniformInt<size_t>(0, std::max<size_t>(0, 13 - scheduled.size())) == 0) {
       auto it = scheduled.end();
       std::advance(
-          it, -RandomUniformInt<int>(1, std::min<int>(scheduled.size(), kMaxRunningTasks)));
+          it, -RandomUniformInt<ssize_t>(1, std::min<ssize_t>(scheduled.size(), kMaxRunningTasks)));
       auto idx = *it;
       stopped.insert(idx);
       share.Stop(idx);

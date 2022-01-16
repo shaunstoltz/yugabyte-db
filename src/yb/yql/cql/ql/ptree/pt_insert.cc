@@ -17,10 +17,21 @@
 
 #include "yb/yql/cql/ql/ptree/pt_insert.h"
 
-#include "yb/yql/cql/ql/ptree/sem_context.h"
-
 #include "yb/client/table.h"
-#include "yb/client/schema-internal.h"
+
+#include "yb/common/common.pb.h"
+#include "yb/common/ql_type.h"
+#include "yb/common/schema.h"
+
+#include "yb/gutil/casts.h"
+
+#include "yb/yql/cql/ql/ptree/column_arg.h"
+#include "yb/yql/cql/ql/ptree/column_desc.h"
+#include "yb/yql/cql/ql/ptree/pt_expr.h"
+#include "yb/yql/cql/ql/ptree/pt_insert_json_clause.h"
+#include "yb/yql/cql/ql/ptree/pt_option.h"
+#include "yb/yql/cql/ql/ptree/sem_context.h"
+#include "yb/yql/cql/ql/ptree/yb_location.h"
 
 namespace yb {
 namespace ql {
@@ -28,13 +39,13 @@ namespace ql {
 //--------------------------------------------------------------------------------------------------
 
 PTInsertStmt::PTInsertStmt(MemoryContext *memctx,
-                           YBLocation::SharedPtr loc,
+                           YBLocationPtr loc,
                            PTQualifiedName::SharedPtr relation,
                            PTQualifiedNameListNode::SharedPtr columns,
                            const PTCollection::SharedPtr& inserting_value,
-                           PTExpr::SharedPtr if_clause,
+                           PTExprPtr if_clause,
                            const bool else_error,
-                           PTDmlUsingClause::SharedPtr using_clause,
+                           PTDmlUsingClausePtr using_clause,
                            const bool returns_status)
     : PTDmlStmt(memctx, loc, nullptr /* where_clause */, if_clause, else_error, using_clause,
                 returns_status),
@@ -50,7 +61,7 @@ CHECKED_STATUS PTInsertStmt::Analyze(SemContext *sem_context) {
   RETURN_NOT_OK(PTDmlStmt::Analyze(sem_context));
 
   // Get table descriptor.
-  RETURN_NOT_OK(relation_->AnalyzeName(sem_context, OBJECT_TABLE));
+  RETURN_NOT_OK(relation_->AnalyzeName(sem_context, ObjectType::TABLE));
   RETURN_NOT_OK(LookupTable(sem_context));
   if (table_->schema().table_properties().contain_counters()) {
     return sem_context->Error(relation_, ErrorCode::INSERT_TABLE_OF_COUNTERS);
@@ -93,7 +104,7 @@ CHECKED_STATUS PTInsertStmt::AnanlyzeValuesClause(PTInsertValuesClause* values_c
   if (values_clause->TupleCount() == 0) {
     return sem_context->Error(values_clause, ErrorCode::TOO_FEW_ARGUMENTS);
   }
-  const MCList<PTExpr::SharedPtr>& value_exprs = values_clause->Tuple(0)->node_list();
+  const auto& value_exprs = values_clause->Tuple(0)->node_list();
 
   if (columns_) {
     // Processing insert statement that has column list.
@@ -108,7 +119,7 @@ CHECKED_STATUS PTInsertStmt::AnanlyzeValuesClause(PTInsertValuesClause* values_c
     }
 
     // Mismatch between arguments and columns.
-    MCList<PTExpr::SharedPtr>::const_iterator value_exprs_iter = value_exprs.begin();
+    auto value_exprs_iter = value_exprs.begin();
     for (const PTQualifiedName::SharedPtr& name : names) {
       if (!name->IsSimpleName()) {
         return sem_context->Error(name, "Qualified name not allowed for column reference",
@@ -122,7 +133,7 @@ CHECKED_STATUS PTInsertStmt::AnanlyzeValuesClause(PTInsertValuesClause* values_c
       }
 
       // Process values arguments.
-      const PTExpr::SharedPtr& value_expr = *value_exprs_iter;
+      const PTExprPtr& value_expr = *value_exprs_iter;
       RETURN_NOT_OK(ProcessColumn(name->bindvar_name(), col_desc, value_expr, sem_context));
 
       value_exprs_iter++;
@@ -172,7 +183,7 @@ CHECKED_STATUS PTInsertStmt::AnanlyzeValuesClause(PTInsertValuesClause* values_c
   // with an argument or no range key has an argument. Else, check that all range columns
   // have arguments.
   int range_keys = 0;
-  for (int idx = num_hash_key_columns(); idx < num_key_columns(); idx++) {
+  for (auto idx = num_hash_key_columns(); idx < num_key_columns(); idx++) {
     if ((*column_args_)[idx].IsInitialized()) {
       range_keys++;
     }
@@ -279,7 +290,7 @@ ExplainPlanPB PTInsertStmt::AnalysisResultToPB() {
   ExplainPlanPB explain_plan;
   InsertPlanPB *insert_plan = explain_plan.mutable_insert_plan();
   insert_plan->set_insert_type("Insert on " + table_name().ToString());
-  insert_plan->set_output_width(insert_plan->insert_type().length());
+  insert_plan->set_output_width(narrow_cast<int32_t>(insert_plan->insert_type().length()));
   return explain_plan;
 }
 

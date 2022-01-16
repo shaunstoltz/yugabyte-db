@@ -32,35 +32,42 @@
 
 #include "yb/tserver/remote_bootstrap_client.h"
 
-#include <gflags/gflags.h>
 #include <glog/logging.h>
+
+#include "yb/common/index.h"
+#include "yb/common/schema.h"
+#include "yb/common/wire_protocol.h"
 
 #include "yb/consensus/consensus.h"
 #include "yb/consensus/consensus_meta.h"
 #include "yb/consensus/metadata.pb.h"
+
 #include "yb/fs/fs_manager.h"
+
 #include "yb/gutil/strings/substitute.h"
-#include "yb/gutil/strings/util.h"
 #include "yb/gutil/walltime.h"
-#include "yb/rpc/messenger.h"
+
 #include "yb/rpc/rpc_controller.h"
+
 #include "yb/tablet/tablet.pb.h"
-#include "yb/tablet/tablet.h"
 #include "yb/tablet/tablet_bootstrap_if.h"
 #include "yb/tablet/tablet_metadata.h"
-#include "yb/tablet/tablet_peer.h"
+
 #include "yb/tserver/remote_bootstrap.pb.h"
 #include "yb/tserver/remote_bootstrap.proxy.h"
 #include "yb/tserver/remote_bootstrap_snapshots.h"
-#include "yb/tserver/tablet_server.h"
 #include "yb/tserver/ts_tablet_manager.h"
+
 #include "yb/util/env.h"
 #include "yb/util/env_util.h"
 #include "yb/util/fault_injection.h"
 #include "yb/util/flag_tags.h"
+#include "yb/util/logging.h"
 #include "yb/util/net/net_util.h"
+#include "yb/util/result.h"
 #include "yb/util/scope_exit.h"
 #include "yb/util/size_literals.h"
+#include "yb/util/status_log.h"
 
 using namespace yb::size_literals;
 
@@ -106,6 +113,7 @@ namespace tserver {
 
 using consensus::ConsensusMetadata;
 using consensus::ConsensusStatePB;
+using consensus::PeerMemberType;
 using consensus::RaftConfigPB;
 using consensus::RaftPeerPB;
 using env_util::CopyFile;
@@ -458,7 +466,8 @@ Status RemoteBootstrapClient::VerifyChangeRoleSucceeded(
         continue;
       }
 
-      if (peer.member_type() == RaftPeerPB::VOTER || peer.member_type() == RaftPeerPB::OBSERVER) {
+      if (peer.member_type() == PeerMemberType::VOTER ||
+          peer.member_type() == PeerMemberType::OBSERVER) {
         return Status::OK();
       } else {
         SleepFor(MonoDelta::FromMilliseconds(backoff_ms));
@@ -599,7 +608,7 @@ Status RemoteBootstrapClient::DownloadWALs() {
       }
     }
   } else {
-    int num_segments = wal_seqnos_.size();
+    auto num_segments = wal_seqnos_.size();
     LOG_WITH_PREFIX(INFO) << "Starting download of " << num_segments << " WAL segments...";
     for (uint64_t seg_seqno : wal_seqnos_) {
       UpdateStatusMessage(Substitute("Downloading WAL segment with seq. number $0 ($1/$2)",

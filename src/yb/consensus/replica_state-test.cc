@@ -29,15 +29,18 @@
 // or implied.  See the License for the specific language governing permissions and limitations
 // under the License.
 //
-#include "yb/consensus/replica_state.h"
 
 #include <vector>
 
 #include <gtest/gtest.h>
+
+#include "yb/consensus/consensus-test-util.h"
 #include "yb/consensus/consensus.pb.h"
 #include "yb/consensus/consensus_meta.h"
-#include "yb/consensus/consensus-test-util.h"
+#include "yb/consensus/replica_state.h"
+
 #include "yb/fs/fs_manager.h"
+
 #include "yb/util/test_macros.h"
 #include "yb/util/test_util.h"
 
@@ -65,7 +68,7 @@ class RaftConsensusStateTest : public YBTest {
     config_.set_opid_index(kInvalidOpIdIndex);
     RaftPeerPB* peer = config_.add_peers();
     peer->set_permanent_uuid(fs_manager_.uuid());
-    peer->set_member_type(RaftPeerPB::VOTER);
+    peer->set_member_type(PeerMemberType::VOTER);
 
     std::unique_ptr<ConsensusMetadata> cmeta;
     ASSERT_OK(ConsensusMetadata::Create(&fs_manager_, kTabletId, fs_manager_.uuid(),

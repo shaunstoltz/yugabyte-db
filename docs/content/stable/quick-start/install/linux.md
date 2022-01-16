@@ -17,28 +17,28 @@ showAsideToc: true
 <ul class="nav nav-tabs-alt nav-tabs-yb">
 
   <li >
-    <a href="/latest/quick-start/install/macos" class="nav-link">
+    <a href="../macos/" class="nav-link">
       <i class="fab fa-apple" aria-hidden="true"></i>
       macOS
     </a>
   </li>
 
   <li >
-    <a href="/latest/quick-start/install/linux" class="nav-link active">
+    <a href="../linux/" class="nav-link active">
       <i class="fab fa-linux" aria-hidden="true"></i>
       Linux
     </a>
   </li>
 
   <li >
-    <a href="/latest/quick-start/install/docker" class="nav-link">
+    <a href="../docker/" class="nav-link">
       <i class="fab fa-docker" aria-hidden="true"></i>
       Docker
     </a>
   </li>
 
   <li >
-    <a href="/latest/quick-start/install/kubernetes" class="nav-link">
+    <a href="../kubernetes/" class="nav-link">
       <i class="fas fa-cubes" aria-hidden="true"></i>
       Kubernetes
     </a>
@@ -69,7 +69,7 @@ showAsideToc: true
 By default, CentOS 8 doesn't have an unversioned system-wide `python` command to avoid locking users to a specific version of Python.
 One way to fix this is to set `python3` the alternative for `python` by running: `sudo alternatives --set python /usr/bin/python3`.
 
-Starting from Ubuntu 20.04, `python` isn't available anymore. An easy fix is to install `sudo apt install python-is-python3`. 
+Starting from Ubuntu 20.04, `python` isn't available anymore. An easy fix is to install `sudo apt install python-is-python3`.
 
     {{< /note >}}
 
@@ -94,13 +94,20 @@ Starting from Ubuntu 20.04, `python` isn't available anymore. An easy fix is to 
 1. Download the YugabyteDB package using the following `wget` command.
 
     ```sh
-    $ wget https://downloads.yugabyte.com/yugabyte-2.7.1.1-linux.tar.gz
+    $ wget https://downloads.yugabyte.com/releases/2.8.1.0/yugabyte-2.8.1.0-b37-linux-x86_64.tar.gz
+    ```
+
+    \
+    OR:
+
+    ```sh
+    $ wget https://downloads.yugabyte.com/releases/2.8.1.0/yugabyte-2.8.1.0-b37-el8-aarch64.tar.gz
     ```
 
 1. Extract the package and then change directories to the YugabyteDB home.
 
     ```sh
-    $ tar xvfz yugabyte-2.7.1.1-linux.tar.gz && cd yugabyte-2.7.1.1/
+    $ tar xvfz yugabyte-2.8.1.0-b37-linux-x86_64.tar.gz && cd yugabyte-2.8.1.0/
     ```
 
 ## Configure YugabyteDB

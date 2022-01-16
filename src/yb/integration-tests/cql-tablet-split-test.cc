@@ -15,22 +15,34 @@
 #include <thread>
 
 #include <boost/range/adaptors.hpp>
-
 #include <gtest/gtest.h>
 
+#include "yb/client/table_info.h"
+
 #include "yb/consensus/consensus.h"
+
+#include "yb/gutil/strings/join.h"
+
+#include "yb/integration-tests/cluster_itest_util.h"
 #include "yb/integration-tests/cql_test_base.h"
 #include "yb/integration-tests/external_mini_cluster.h"
 #include "yb/integration-tests/load_generator.h"
 #include "yb/integration-tests/mini_cluster.h"
-#include "yb/integration-tests/cluster_itest_util.h"
-#include "yb/master/catalog_manager.h"
+
+#include "yb/master/master_client.pb.h"
 #include "yb/master/mini_master.h"
-#include "yb/master/sys_catalog.h"
+
+#include "yb/tablet/tablet_metadata.h"
+#include "yb/tablet/tablet_peer.h"
+
 #include "yb/util/format.h"
+#include "yb/util/logging.h"
 #include "yb/util/monotime.h"
 #include "yb/util/random.h"
+#include "yb/util/size_literals.h"
+#include "yb/util/status_log.h"
 #include "yb/util/sync_point.h"
+#include "yb/util/test_thread_holder.h"
 #include "yb/util/test_util.h"
 #include "yb/util/tsan_util.h"
 
@@ -81,7 +93,7 @@ Result<size_t> GetNumActiveTablets(
     const RequireTabletsRunning require_tablets_running) {
   master::GetTableLocationsResponsePB resp;
   RETURN_NOT_OK(itest::GetTableLocations(
-      cluster->GetLeaderMasterProxy(), table_name, timeout, require_tablets_running, &resp));
+      cluster, table_name, timeout, require_tablets_running, &resp));
   return resp.tablet_locations_size();
 }
 
@@ -161,7 +173,7 @@ class CqlTabletSplitTest : public CqlTestBase<MiniCluster> {
   std::unique_ptr<load_generator::SessionFactory> load_session_factory_;
   std::unique_ptr<load_generator::MultiThreadedWriter> writer_;
   std::unique_ptr<load_generator::MultiThreadedReader> reader_;
-  int start_num_active_tablets_;
+  size_t start_num_active_tablets_;
 };
 
 class CqlTabletSplitTestMultiMaster : public CqlTabletSplitTest {
@@ -354,7 +366,8 @@ void CqlTabletSplitTest::CompleteSecondaryIndexTest(const int num_splits, const 
   LOG(INFO) << "Workload complete, num_writes: " << writer_->num_writes()
             << ", num_write_errors: " << writer_->num_write_errors()
             << ", num_reads: " << reader_->num_reads()
-            << ", num_read_errors:" << reader_->num_read_errors();
+            << ", num_read_errors: " << reader_->num_read_errors()
+            << ", splits done: " << num_active_tablets - start_num_active_tablets_;
   ASSERT_EQ(reader_->read_status_stopped(), load_generator::ReadStatus::kOk)
       << " reader stopped due to: " << AsString(reader_->read_status_stopped());
   ASSERT_LE(writer_->num_write_errors(), max_write_errors_);
@@ -397,17 +410,10 @@ TEST_F_EX(CqlTabletSplitTest, SecondaryIndexWithDrop, CqlTabletSplitTestMultiMas
     if (iter > 1) {
       // Test tracking split tablets in case of leader master failover.
       const auto leader_master_idx = cluster_->LeaderMasterIdx();
-      const auto sys_catalog_tablet_peer_leader = cluster_->mini_master(leader_master_idx)
-                                                ->master()
-                                                ->catalog_manager()
-                                                ->sys_catalog()
-                                                ->tablet_peer();
+      const auto sys_catalog_tablet_peer_leader =
+          cluster_->mini_master(leader_master_idx)->tablet_peer();
       const auto sys_catalog_tablet_peer_follower =
-          cluster_->mini_master((leader_master_idx + 1) % cluster_->num_masters())
-              ->master()
-              ->catalog_manager()
-              ->sys_catalog()
-              ->tablet_peer();
+          cluster_->mini_master((leader_master_idx + 1) % cluster_->num_masters())->tablet_peer();
       LOG(INFO) << "Iteration " << iter << ": stepping down master leader";
       ASSERT_OK(StepDown(
           sys_catalog_tablet_peer_leader, sys_catalog_tablet_peer_follower->permanent_uuid(),
@@ -508,8 +514,8 @@ CHECKED_STATUS RunBatchTimeSeriesTest(
   std::atomic_int num_read_errors(0);
   std::atomic_int num_write_errors(0);
 
-  Random r(/* seed */ 29383);
-  const auto num_metrics = r.Uniform(kMaxMetricsCount - kMinMetricsCount) + kMinMetricsCount;
+  std::mt19937_64 rng(/* seed */ 29383);
+  const auto num_metrics = RandomUniformInt<>(kMinMetricsCount, kMaxMetricsCount - 1, &rng);
   std::vector<std::unique_ptr<BatchTimeseriesDataSource>> data_sources;
   for (int i = 0; i < num_metrics; ++i) {
     data_sources.emplace_back(std::make_unique<BatchTimeseriesDataSource>(Format("metric-$0", i)));
@@ -538,13 +544,12 @@ CHECKED_STATUS RunBatchTimeSeriesTest(
       kTableName.table_name())));
 
   std::mutex random_mutex;
-  auto get_random_source = [&r, &random_mutex, &data_sources]() -> BatchTimeseriesDataSource* {
+  auto get_random_source = [&rng, &random_mutex, &data_sources]() -> BatchTimeseriesDataSource* {
     std::lock_guard<decltype(random_mutex)> lock(random_mutex);
-    auto index = r.Uniform(data_sources.size());
-    return data_sources.at(index).get();
+    return RandomElement(data_sources, &rng).get();
   };
 
-  auto get_value = [](int ts, std::string* value) {
+  auto get_value = [](int64_t ts, std::string* value) {
     value->clear();
     value->append(AsString(ts));
     const auto suffix_size = value->size() >= kValueSize ? 0 : kValueSize - value->size();

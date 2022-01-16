@@ -376,6 +376,7 @@ extern bool TransactionIdIsCurrentTransactionId(TransactionId xid);
 extern void CommandCounterIncrement(void);
 extern void ForceSyncCommit(void);
 extern void YBInitializeTransaction(void);
+extern void YBMaybeResetTransactionReadPoint(void);
 extern void StartTransactionCommand(void);
 extern void YBCRestartWriteTransaction(void);
 extern void SetTxnWithPGRel(void);
@@ -444,7 +445,9 @@ extern bool IsInParallelMode(void);
 
 extern void YBMarkDataSent(void);
 extern void YBMarkDataNotSent(void);
+extern void YBMarkDataNotSentForCurrQuery(void);
 extern bool YBIsDataSent(void);
+extern bool YBIsDataSentForCurrQuery(void);
 
 /*
  * Utilities for postponed pggate DDL statement handles, that can be
@@ -464,4 +467,8 @@ extern void YBSaveDdlHandle(YBCPgStatement handle);
 extern List* YBGetDdlHandles(void);
 extern void YBClearDdlHandles(void);
 
+/*
+ * Utility for clearing transaction ID.
+*/
+extern void YbClearCurrentTransactionId(void);
 #endif							/* XACT_H */

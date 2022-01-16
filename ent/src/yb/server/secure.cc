@@ -21,7 +21,10 @@
 #include "yb/rpc/tcp_stream.h"
 
 #include "yb/util/env.h"
+#include "yb/util/format.h"
+#include "yb/util/net/net_util.h"
 #include "yb/util/path_util.h"
+#include "yb/util/result.h"
 
 DEFINE_bool(use_node_to_node_encryption, false, "Use node to node encryption.");
 
@@ -54,7 +57,7 @@ DEFINE_string(key_file_pattern, "node.$0.key", "Pattern used for key file");
 
 DEFINE_string(cert_file_pattern, "node.$0.crt", "Pattern used for certificate file");
 
-DEFINE_bool(enable_stream_compression, false, "Whether it is allowed to use stream compression.");
+DEFINE_bool(enable_stream_compression, true, "Whether it is allowed to use stream compression.");
 
 namespace yb {
 namespace server {

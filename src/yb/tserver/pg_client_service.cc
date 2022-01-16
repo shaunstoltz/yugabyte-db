@@ -13,26 +13,34 @@
 
 #include "yb/tserver/pg_client_service.h"
 
-#include <boost/multi_index_container.hpp>
 #include <boost/multi_index/hashed_index.hpp>
 #include <boost/multi_index/mem_fun.hpp>
 #include <boost/multi_index/ordered_index.hpp>
+#include <boost/multi_index_container.hpp>
 
 #include "yb/client/client.h"
+#include "yb/client/schema.h"
 #include "yb/client/table.h"
 #include "yb/client/table_creator.h"
 #include "yb/client/tablet_server.h"
 
+#include "yb/common/partition.h"
 #include "yb/common/pg_types.h"
+#include "yb/common/wire_protocol.h"
 
-#include "yb/master/master.proxy.h"
+#include "yb/master/master_admin.proxy.h"
 
 #include "yb/rpc/rpc_context.h"
+#include "yb/rpc/rpc_controller.h"
 #include "yb/rpc/scheduler.h"
 
 #include "yb/tserver/pg_client_session.h"
 
 #include "yb/util/net/net_util.h"
+#include "yb/util/result.h"
+#include "yb/util/status_format.h"
+#include "yb/util/status_log.h"
+#include "yb/util/status.h"
 
 using namespace std::literals;
 
@@ -119,15 +127,25 @@ class PgClientServiceImpl::Impl {
 
   CHECKED_STATUS Heartbeat(
       const PgHeartbeatRequestPB& req, PgHeartbeatResponsePB* resp, rpc::RpcContext* context) {
-    return ResultToStatus(DoGetSession(req.session_id(), req.create()));
+    if (req.session_id()) {
+      return ResultToStatus(DoGetSession(req.session_id()));
+    }
+
+    std::lock_guard<std::mutex> lock(mutex_);
+    auto session_id = ++session_serial_no_;
+    resp->set_session_id(session_id);
+    sessions_.emplace(
+        FLAGS_pg_client_session_expiration_ms * 1ms,
+        std::make_shared<PgClientSession>(&client(), session_id));
+    return Status::OK();
   }
 
   CHECKED_STATUS OpenTable(
       const PgOpenTableRequestPB& req, PgOpenTableResponsePB* resp, rpc::RpcContext* context) {
     client::YBTablePtr table;
     RETURN_NOT_OK(client().OpenTable(req.table_id(), &table, resp->mutable_info()));
-    RSTATUS_DCHECK_EQ(
-        table->table_type(), client::YBTableType::PGSQL_TABLE_TYPE, RuntimeError,
+    RSTATUS_DCHECK(
+        table->table_type() == client::YBTableType::PGSQL_TABLE_TYPE, RuntimeError,
         "Wrong table type");
 
     auto partitions = table->GetVersionedPartitions();
@@ -153,7 +171,7 @@ class PgClientServiceImpl::Impl {
       const PgIsInitDbDoneRequestPB& req, PgIsInitDbDoneResponsePB* resp,
       rpc::RpcContext* context) {
     HostPort master_leader_host_port = client().GetMasterLeaderAddress();
-    auto proxy = std::make_shared<master::MasterServiceProxy>(
+    auto proxy = std::make_shared<master::MasterAdminProxy>(
         &client().proxy_cache(), master_leader_host_port);
     rpc::RpcController rpc;
     master::IsInitDbDoneRequestPB master_req;
@@ -265,6 +283,24 @@ class PgClientServiceImpl::Impl {
     return Status::OK();
   }
 
+  CHECKED_STATUS ValidatePlacement(
+      const PgValidatePlacementRequestPB& req, PgValidatePlacementResponsePB* resp,
+      rpc::RpcContext* context) {
+    master::ReplicationInfoPB replication_info;
+    master::PlacementInfoPB* live_replicas = replication_info.mutable_live_replicas();
+
+    for (const auto& block : req.placement_infos()) {
+      auto pb = live_replicas->add_placement_blocks();
+      pb->mutable_cloud_info()->set_placement_cloud(block.cloud());
+      pb->mutable_cloud_info()->set_placement_region(block.region());
+      pb->mutable_cloud_info()->set_placement_zone(block.zone());
+      pb->set_min_num_replicas(block.min_num_replicas());
+    }
+    live_replicas->set_num_replicas(req.num_replicas());
+
+    return client().ValidateReplicationInfo(replication_info);
+  }
+
   #define PG_CLIENT_SESSION_METHOD_FORWARD(r, data, method) \
   CHECKED_STATUS method( \
       const BOOST_PP_CAT(BOOST_PP_CAT(Pg, method), RequestPB)& req, \
@@ -279,31 +315,25 @@ class PgClientServiceImpl::Impl {
   client::YBClient& client() { return *client_future_.get(); }
 
   template <class Req>
-  Result<PgClientSessionLocker> GetSession(const Req& req, bool create = false) {
-    return GetSession(req.session_id(), create);
+  Result<PgClientSessionLocker> GetSession(const Req& req) {
+    return GetSession(req.session_id());
   }
 
-  Result<PgClientSession&> DoGetSession(uint64_t session_id, bool create) {
-    DCHECK_NE(session_id, 0);
+  Result<PgClientSession&> DoGetSession(uint64_t session_id) {
     std::lock_guard<std::mutex> lock(mutex_);
+    DCHECK_NE(session_id, 0);
     auto it = sessions_.find(session_id);
-    if (it != sessions_.end()) {
-      sessions_.modify(it, [](auto& session) {
-        session.Touch();
-      });
-      return *it->value();
-    }
-    if (!create) {
+    if (it == sessions_.end()) {
       return STATUS_FORMAT(InvalidArgument, "Unknown session: $0", session_id);
     }
-    it = sessions_.emplace(
-        FLAGS_pg_client_session_expiration_ms * 1ms,
-        std::make_unique<PgClientSession>(&client(), session_id)).first;
+    sessions_.modify(it, [](auto& session) {
+      session.Touch();
+    });
     return *it->value();
   }
 
-  Result<PgClientSessionLocker> GetSession(uint64_t session_id, bool create = false) {
-    return PgClientSessionLocker(&VERIFY_RESULT_REF(DoGetSession(session_id, create)));
+  Result<PgClientSessionLocker> GetSession(uint64_t session_id) {
+    return PgClientSessionLocker(&VERIFY_RESULT_REF(DoGetSession(session_id)));
   }
 
   void ScheduleCheckExpiredSessions(CoarseTimePoint now) REQUIRES(mutex_) {
@@ -334,7 +364,7 @@ class PgClientServiceImpl::Impl {
 
   class ExpirationTag;
 
-  using SessionsEntry = Expirable<std::unique_ptr<PgClientSession>>;
+  using SessionsEntry = Expirable<std::shared_ptr<PgClientSession>>;
   boost::multi_index_container<
       SessionsEntry,
       boost::multi_index::indexed_by<
@@ -351,6 +381,7 @@ class PgClientServiceImpl::Impl {
           >
       >
   > sessions_ GUARDED_BY(mutex_);
+  int64_t session_serial_no_ GUARDED_BY(mutex_) = 0;
 
   rpc::ScheduledTaskTracker check_expired_sessions_;
 };

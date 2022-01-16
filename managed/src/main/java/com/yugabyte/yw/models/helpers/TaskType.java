@@ -37,6 +37,8 @@ public enum TaskType {
 
   MultiTableBackup("MultiTableBackup"),
 
+  CreateBackup("CreateBackup"),
+
   EditUniverse("EditUniverse"),
 
   EditKubernetesUniverse("EditKubernetesUniverse"),
@@ -66,6 +68,8 @@ public enum TaskType {
   TlsToggle("upgrade.TlsToggle"),
 
   VMImageUpgrade("upgrade.VMImageUpgrade"),
+
+  SystemdUpgrade("upgrade.SystemdUpgrade"),
 
   CreateRootVolumes("subtasks.CreateRootVolumes"),
 
@@ -100,21 +104,23 @@ public enum TaskType {
 
   CreateKMSConfig("CreateKMSConfig"),
 
+  EditKMSConfig("EditKMSConfig"),
+
   DeleteKMSConfig("DeleteKMSConfig"),
 
   UpdateDiskSize("UpdateDiskSize"),
 
   StartMasterOnNode("StartMasterOnNode"),
 
-  SyncDBStateWithPlatform("SyncDBStateWithPlatform"),
+  CreateXClusterConfig("CreateXClusterConfig"),
 
-  CreateXClusterReplication("CreateXClusterReplication"),
+  EditXClusterConfig("EditXClusterConfig"),
 
-  DeleteXClusterReplication("DeleteXClusterReplication"),
+  DeleteXClusterConfig("DeleteXClusterConfig"),
 
-  EditXClusterReplication("EditXClusterReplication"),
+  SyncXClusterConfig("SyncXClusterConfig"),
 
-  PauseOrResumeXClusterReplication("PauseOrResumeXClusterReplication"),
+  CreateSupportBundle("CreateSupportBundle"),
 
   // Tasks belonging to subtasks classpath
   AnsibleClusterServerCtl("subtasks.AnsibleClusterServerCtl"),
@@ -133,6 +139,8 @@ public enum TaskType {
 
   PrecheckNode("subtasks.PrecheckNode"),
 
+  PrecheckNodeDetached("subtasks.PrecheckNodeDetached"),
+
   AnsibleUpdateNodeInfo("subtasks.AnsibleUpdateNodeInfo"),
 
   BulkImport("subtasks.BulkImport"),
@@ -146,6 +154,10 @@ public enum TaskType {
   DeleteNode("subtasks.DeleteNode"),
 
   DeleteBackup("subtasks.DeleteBackup"),
+
+  DeleteBackupYb("subtasks.DeleteBackupYb"),
+
+  DeleteCustomerConfig("DeleteCustomerConfig"),
 
   UpdateNodeProcess("subtasks.nodes.UpdateNodeProcess"),
 
@@ -175,6 +187,10 @@ public enum TaskType {
 
   WaitForDataMove("subtasks.WaitForDataMove"),
 
+  WaitForLeaderBlacklistCompletion("subtasks.WaitForLeaderBlacklistCompletion"),
+
+  WaitForFollowerLag("subtasks.WaitForFollowerLag"),
+
   WaitForLoadBalance("subtasks.WaitForLoadBalance"),
 
   WaitForMasterLeader("subtasks.WaitForMasterLeader"),
@@ -190,6 +206,19 @@ public enum TaskType {
   WaitForServerReady("subtasks.WaitForServerReady"),
 
   RunExternalScript("subtasks.RunExternalScript"),
+
+  // Tasks belonging to subtasks.xcluster classpath
+  XClusterConfigSetup("subtasks.xcluster.XClusterConfigSetup"),
+
+  XClusterConfigSetStatus("subtasks.xcluster.XClusterConfigSetStatus"),
+
+  XClusterConfigModifyTables("subtasks.xcluster.XClusterConfigModifyTables"),
+
+  XClusterConfigRename("subtasks.xcluster.XClusterConfigRename"),
+
+  XClusterConfigDelete("subtasks.xcluster.XClusterConfigDelete"),
+
+  XClusterConfigSync("subtasks.xcluster.XClusterConfigSync"),
 
   // Tasks belonging to subtasks.cloud classpath
   CloudAccessKeyCleanup("subtasks.cloud.CloudAccessKeyCleanup"),
@@ -207,6 +236,8 @@ public enum TaskType {
   CloudSetup("subtasks.cloud.CloudSetup"),
 
   BackupTable("subtasks.BackupTable"),
+
+  BackupTableYb("subtasks.BackupTableYb"),
 
   BackupUniverseKeys("subtasks.BackupUniverseKeys"),
 
@@ -226,6 +257,8 @@ public enum TaskType {
 
   KubernetesCheckNumPod("subtasks.KubernetesCheckNumPod"),
 
+  SetActiveUniverseKeys("subtasks.SetActiveUniverseKeys"),
+
   @Deprecated
   CopyEncryptionKeyFile("subtasks.CopyEncryptionKeyFile"),
 
@@ -239,22 +272,25 @@ public enum TaskType {
 
   UniverseUpdateRootCert("subtasks.UniverseUpdateRootCert"),
 
-  AsyncReplicationPlatformSync("subtasks.AsyncReplicationPlatformSync"),
-
-  AsyncReplicationSetup("subtasks.AsyncReplicationSetup"),
-
   ResetUniverseVersion("subtasks.ResetUniverseVersion"),
 
-  AlterXClusterReplicationAddTables("subtasks.AlterXClusterReplicationAddTables"),
+  DeleteCertificate("subtasks.DeleteCertificate"),
 
-  AlterXClusterReplicationRemoveTables("subtasks.AlterXClusterReplicationRemoveTables"),
+  SetNodeStatus("subtasks.SetNodeStatus"),
 
-  AlterXClusterReplicationChangeMasterAddresses(
-      "subtasks.AlterXClusterReplicationChangeMasterAddresses"),
+  CheckMasterLeader("subtasks.check.CheckMasterLeader"),
 
-  XClusterReplicationSetActive("subtasks.XClusterReplicationSetActive"),
+  CheckMasters("subtasks.check.CheckMasters"),
 
-  DeleteCertificate("subtasks.DeleteCertificate");
+  CheckTServers("subtasks.check.CheckTServers"),
+
+  WaitForTServerHBs("subtasks.check.WaitForTServerHBs"),
+
+  CreatePrometheusSwamperConfig("subtasks.CreatePrometheusSwamperConfig"),
+
+  PreflightNodeCheck("subtasks.PreflightNodeCheck"),
+
+  RunYsqlUpgrade("subtasks.RunYsqlUpgrade");
 
   private String relativeClassPath;
 

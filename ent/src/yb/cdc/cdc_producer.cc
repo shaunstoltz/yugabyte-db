@@ -13,18 +13,24 @@
 #include "yb/cdc/cdc_producer.h"
 
 #include "yb/cdc/cdc_service.pb.h"
+#include "yb/common/schema.h"
 #include "yb/common/transaction.h"
 #include "yb/common/wire_protocol.h"
 
 #include "yb/consensus/raft_consensus.h"
 #include "yb/consensus/replicate_msgs_holder.h"
 
+#include "yb/docdb/doc_key.h"
 #include "yb/docdb/docdb.pb.h"
 #include "yb/docdb/primitive_value.h"
+#include "yb/docdb/value.h"
 #include "yb/docdb/value_type.h"
+
 #include "yb/tablet/tablet.h"
+#include "yb/tablet/tablet_metadata.h"
 #include "yb/tablet/tablet_peer.h"
 #include "yb/tablet/transaction_participant.h"
+
 #include "yb/tserver/tablet_server.h"
 #include "yb/tserver/ts_tablet_manager.h"
 
@@ -97,9 +103,9 @@ Result<bool> SetCommittedRecordIndexForReplicateMsg(
     }
 
     case consensus::OperationType::WRITE_OP: {
-      if (msg->write_request().write_batch().has_transaction()) {
+      if (msg->write().write_batch().has_transaction()) {
         auto txn_id = VERIFY_RESULT(FullyDecodeTransactionId(
-            msg->write_request().write_batch().transaction().transaction_id()));
+            msg->write().write_batch().transaction().transaction_id()));
         const auto txn_status = txn_map.find(txn_id);
         if (txn_status == txn_map.end()) {
           return STATUS(IllegalState, "Unexpected transaction ID", txn_id.ToString());
@@ -153,7 +159,7 @@ Result<std::vector<RecordTimeIndex>> GetCommittedRecordIndexes(
 
   // Order ReplicateMsgs based on commit time.
   for (const auto &msg : msgs) {
-    if (!msg->write_request().has_external_hybrid_time()) {
+    if (!msg->write().has_external_hybrid_time()) {
       // If the message came from an external source, ignore it when producing change list.
       // Note that checkpoint, however, will be updated and will account for external message too.
       bool stop = VERIFY_RESULT(SetCommittedRecordIndexForReplicateMsg(
@@ -241,9 +247,9 @@ Result<TxnStatusMap> BuildTxnStatusMap(const ReplicateMsgs& messages,
   // corresponding APPLYING record does not exist in WAL as yet.
   for (const auto& msg : messages) {
     if (msg->op_type() == consensus::OperationType::WRITE_OP
-        && msg->write_request().write_batch().has_transaction()) {
+        && msg->write().write_batch().has_transaction()) {
       auto txn_id = VERIFY_RESULT(FullyDecodeTransactionId(
-          msg->write_request().write_batch().transaction().transaction_id()));
+          msg->write().write_batch().transaction().transaction_id()));
 
       if (!txn_map.count(txn_id)) {
         TransactionStatusResult txn_status(TransactionStatus::PENDING, HybridTime::kMin);
@@ -295,7 +301,7 @@ CHECKED_STATUS PopulateWriteRecord(const ReplicateMsgPtr& msg,
                                    const std::shared_ptr<tablet::TabletPeer>& tablet_peer,
                                    ReplicateIntents replicate_intents,
                                    GetChangesResponsePB* resp) {
-  const auto& batch = msg->write_request().write_batch();
+  const auto& batch = msg->write().write_batch();
   const auto& schema = *tablet_peer->tablet()->schema();
   // Write batch may contain records from different rows.
   // For CDC, we need to split the batch into 1 CDC record per row of the table.
@@ -406,14 +412,15 @@ Status GetChanges(const std::string& stream_id,
                   const MemTrackerPtr& mem_tracker,
                   consensus::ReplicateMsgsHolder* msgs_holder,
                   GetChangesResponsePB* resp,
-                  int64_t* last_readable_opid_index) {
+                  int64_t* last_readable_opid_index,
+                  const CoarseTimePoint deadline) {
   auto replicate_intents = ReplicateIntents(GetAtomicFlag(&FLAGS_cdc_enable_replicate_intents));
   // Request scope on transaction participant so that transactions are not removed from participant
   // while RequestScope is active.
   RequestScope request_scope;
 
   auto read_ops = VERIFY_RESULT(tablet_peer->consensus()->
-    ReadReplicatedMessagesForCDC(from_op_id, last_readable_opid_index));
+    ReadReplicatedMessagesForCDC(from_op_id, last_readable_opid_index, deadline));
   ScopedTrackedConsumption consumption;
   if (read_ops.read_from_disk_size && mem_tracker) {
     consumption = ScopedTrackedConsumption(mem_tracker, read_ops.read_from_disk_size);

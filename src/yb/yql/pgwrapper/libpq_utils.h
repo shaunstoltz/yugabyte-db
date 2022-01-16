@@ -14,14 +14,16 @@
 #ifndef YB_YQL_PGWRAPPER_LIBPQ_UTILS_H
 #define YB_YQL_PGWRAPPER_LIBPQ_UTILS_H
 
-#include <libpq-fe.h>
-
 #include <memory>
+#include <string>
 
-#include "yb/common/common.pb.h"
+#include "libpq-fe.h" // NOLINT
 
+#include "yb/common/transaction.pb.h"
+
+#include "yb/util/format.h"
 #include "yb/util/monotime.h"
-#include "yb/util/net/net_util.h"
+#include "yb/util/net/net_fwd.h"
 #include "yb/util/result.h"
 
 namespace yb {
@@ -107,7 +109,7 @@ class PGConn {
       CoarseTimePoint deadline,
       bool simple_query_protocol = false);
 
-  CHECKED_STATUS Execute(const std::string& command);
+  CHECKED_STATUS Execute(const std::string& command, bool show_query_in_error = true);
 
   template <class... Args>
   CHECKED_STATUS ExecuteFormat(const std::string& format, Args&&... args) {
@@ -167,6 +169,8 @@ class PGConn {
   bool simple_query_protocol_;
   std::unique_ptr<CopyData> copy_data_;
 };
+
+bool HasTryAgain(const Status& status);
 
 } // namespace pgwrapper
 } // namespace yb

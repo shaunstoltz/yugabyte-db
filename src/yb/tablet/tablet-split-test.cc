@@ -15,15 +15,22 @@
 
 #include <boost/algorithm/string/join.hpp>
 
+#include "yb/common/partition.h"
 #include "yb/common/ql_protocol_util.h"
+#include "yb/common/ql_rowblock.h"
 #include "yb/common/ql_value.h"
 
-#include "yb/docdb/docdb.h"
+#include "yb/docdb/doc_key.h"
 #include "yb/docdb/docdb_debug.h"
 
-#include "yb/tablet/tablet-test-util.h"
-#include "yb/tablet/tablet.h"
+#include "yb/rocksdb/db.h"
+
 #include "yb/tablet/local_tablet_writer.h"
+#include "yb/tablet/read_result.h"
+#include "yb/tablet/tablet-test-util.h"
+#include "yb/tablet/tablet_metadata.h"
+#include "yb/tablet/tablet.h"
+
 #include "yb/util/random_util.h"
 #include "yb/util/size_literals.h"
 

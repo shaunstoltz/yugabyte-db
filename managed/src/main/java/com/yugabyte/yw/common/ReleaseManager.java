@@ -5,6 +5,7 @@ import static java.nio.file.StandardCopyOption.REPLACE_EXISTING;
 
 import com.google.inject.Inject;
 import com.yugabyte.yw.forms.ReleaseFormData;
+import com.yugabyte.yw.models.Universe;
 import com.yugabyte.yw.models.helpers.CommonUtils;
 import io.swagger.annotations.ApiModel;
 import io.swagger.annotations.ApiModelProperty;
@@ -316,7 +317,7 @@ public class ReleaseManager {
     return releases;
   }
 
-  public void addReleaseWithMetadata(String version, ReleaseMetadata metadata) {
+  public synchronized void addReleaseWithMetadata(String version, ReleaseMetadata metadata) {
     Map<String, Object> currentReleases = getReleaseMetadata();
     if (currentReleases.containsKey(version)) {
       String errorMsg = "Release already exists for version [" + version + "]";
@@ -327,7 +328,31 @@ public class ReleaseManager {
     configHelper.loadConfigToDB(ConfigHelper.ConfigType.SoftwareReleases, currentReleases);
   }
 
-  public void importLocalReleases() {
+  public synchronized void removeRelease(String version) {
+    Map<String, Object> currentReleases = getReleaseMetadata();
+    boolean isPresentLocally = false;
+    String ybReleasesPath = appConfig.getString("yb.releases.path");
+    if (currentReleases.containsKey(version)) {
+      if (getReleaseByVersion(version).filePath.startsWith(ybReleasesPath)) {
+        isPresentLocally = true;
+      }
+      LOG.info("Removing release version {}", version);
+      currentReleases.remove(version);
+      configHelper.loadConfigToDB(ConfigHelper.ConfigType.SoftwareReleases, currentReleases);
+    }
+
+    if (isPresentLocally) {
+      // delete specific release's directory recursively.
+      File releaseDirectory = new File(ybReleasesPath, version);
+      if (!Util.deleteDirectory(releaseDirectory)) {
+        String errorMsg =
+            "Failed to delete release directory: " + releaseDirectory.getAbsolutePath();
+        throw new RuntimeException(errorMsg);
+      }
+    }
+  }
+
+  public synchronized void importLocalReleases() {
     String ybReleasesPath = appConfig.getString("yb.releases.path");
     String ybReleasePath = appConfig.getString("yb.docker.release");
     String ybHelmChartPath = appConfig.getString("yb.helm.packagePath");
@@ -347,7 +372,7 @@ public class ReleaseManager {
     }
   }
 
-  public void updateReleaseMetadata(String version, ReleaseMetadata newData) {
+  public synchronized void updateReleaseMetadata(String version, ReleaseMetadata newData) {
     Map<String, Object> currentReleases = getReleaseMetadata();
     if (currentReleases.containsKey(version)) {
       currentReleases.put(version, newData);
@@ -406,5 +431,9 @@ public class ReleaseManager {
 
   public Map<String, String> getReleases() {
     return (Map) configHelper.getConfig(CONFIG_TYPE);
+  }
+
+  public boolean getInUse(String version) {
+    return Universe.existsRelease(version);
   }
 }

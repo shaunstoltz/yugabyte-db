@@ -15,19 +15,11 @@
 
 #include "yb/tablet/transaction_participant.h"
 
-#include <mutex>
 #include <queue>
 
-#include <boost/multi_index_container.hpp>
 #include <boost/multi_index/hashed_index.hpp>
-#include <boost/multi_index/ordered_index.hpp>
 #include <boost/multi_index/mem_fun.hpp>
-
-#include <boost/optional/optional.hpp>
-
-#include <boost/uuid/uuid_io.hpp>
-
-#include "yb/rocksdb/write_batch.h"
+#include <boost/multi_index/ordered_index.hpp>
 
 #include "yb/client/transaction_rpc.h"
 
@@ -36,34 +28,34 @@
 #include "yb/consensus/consensus_util.h"
 
 #include "yb/docdb/docdb_rocksdb_util.h"
-#include "yb/docdb/docdb.h"
 #include "yb/docdb/transaction_dump.h"
 
 #include "yb/rpc/poller.h"
-#include "yb/rpc/rpc.h"
-#include "yb/rpc/rpc_context.h"
-#include "yb/rpc/thread_pool.h"
+
+#include "yb/server/clock.h"
 
 #include "yb/tablet/cleanup_aborts_task.h"
 #include "yb/tablet/cleanup_intents_task.h"
 #include "yb/tablet/operations/update_txn_operation.h"
+#include "yb/tablet/remove_intents_task.h"
 #include "yb/tablet/running_transaction.h"
-#include "yb/tablet/tablet.h"
+#include "yb/tablet/running_transaction_context.h"
 #include "yb/tablet/transaction_loader.h"
+#include "yb/tablet/transaction_participant_context.h"
 #include "yb/tablet/transaction_status_resolver.h"
 
 #include "yb/tserver/tserver_service.pb.h"
-#include "yb/tserver/service_util.h"
 
-#include "yb/util/delayer.h"
+#include "yb/util/countdown_latch.h"
 #include "yb/util/flag_tags.h"
-#include "yb/util/locks.h"
+#include "yb/util/format.h"
+#include "yb/util/logging.h"
 #include "yb/util/lru_cache.h"
-#include "yb/util/monotime.h"
-#include "yb/util/pb_util.h"
-#include "yb/util/random_util.h"
+#include "yb/util/metrics.h"
+#include "yb/util/operation_counter.h"
 #include "yb/util/scope_exit.h"
-#include "yb/util/thread_restrictions.h"
+#include "yb/util/status_format.h"
+#include "yb/util/status_log.h"
 #include "yb/util/tsan_util.h"
 
 using namespace std::literals;
@@ -81,7 +73,7 @@ DEFINE_uint64(transaction_min_running_check_interval_ms, 250,
               "long (ms). Used for the optimization that deletes "
               "provisional records RocksDB SSTable files.");
 
-DEFINE_test_flag(double, transaction_ignore_applying_probability_in_tests, 0,
+DEFINE_test_flag(double, transaction_ignore_applying_probability, 0,
                  "Probability to ignore APPLYING update in tests.");
 DEFINE_test_flag(bool, fail_in_apply_if_no_metadata, false,
                  "Fail when applying intents if metadata is not found.");
@@ -90,7 +82,7 @@ DEFINE_uint64(max_transactions_in_status_request, 128,
               "Request status for at most specified number of transactions at once. "
                   "0 disables load time transaction status resolution.");
 
-DEFINE_uint64(transactions_cleanup_cache_size, 64, "Transactions cleanup cache size.");
+DEFINE_uint64(transactions_cleanup_cache_size, 256, "Transactions cleanup cache size.");
 
 DEFINE_uint64(transactions_status_poll_interval_ms, 500 * yb::kTimeMultiplier,
               "Transactions poll interval.");
@@ -616,6 +608,8 @@ class TransactionParticipant::Impl
   }
 
   CHECKED_STATUS ProcessCleanup(const TransactionApplyData& data, CleanupType cleanup_type) {
+    VLOG_WITH_PREFIX_AND_FUNC(4) << AsString(data) << ", " << AsString(cleanup_type);
+
     loader_.WaitLoaded(data.transaction_id);
 
     MinRunningNotifier min_running_notifier(&applier_);
@@ -624,12 +618,9 @@ class TransactionParticipant::Impl
     if (it == transactions_.end()) {
       if (cleanup_type == CleanupType::kImmediate) {
         cleanup_cache_.Insert(data.transaction_id);
+        return Status::OK();
       }
-
-      return Status::OK();
-    }
-
-    if ((**it).ProcessingApply()) {
+    } else if ((**it).ProcessingApply()) {
       VLOG_WITH_PREFIX(2) << "Don't cleanup transaction because it is applying intents: "
                           << data.transaction_id;
       return Status::OK();
@@ -1057,7 +1048,7 @@ class TransactionParticipant::Impl
       const TransactionId& id, RemoveReason reason,
       MinRunningNotifier* min_running_notifier) REQUIRES(mutex_) override {
     auto now = participant_context_.Now();
-    VLOG_WITH_PREFIX(4) << "EnqueueRemoveUnlocked: " << id << " at " << now;
+    VLOG_WITH_PREFIX_AND_FUNC(4) << id << " at " << now << ", reason: " << AsString(reason);
     remove_queue_.emplace_back(RemoveQueueEntry{
       .id = id,
       .time = now,
@@ -1322,7 +1313,7 @@ class TransactionParticipant::Impl
 
   void HandleApplying(std::unique_ptr<tablet::UpdateTxnOperation> operation, int64_t term) {
     if (RandomActWithProbability(GetAtomicFlag(
-        &FLAGS_TEST_transaction_ignore_applying_probability_in_tests))) {
+        &FLAGS_TEST_transaction_ignore_applying_probability))) {
       VLOG_WITH_PREFIX(2)
           << "TEST: Rejected apply: "
           << FullyDecodeTransactionId(operation->request()->transaction_id());
@@ -1414,6 +1405,7 @@ class TransactionParticipant::Impl
       if (ANNOTATE_UNPROTECTED_READ(FLAGS_transactions_poll_check_aborted)) {
         CheckForAbortedTransactions();
       }
+      CleanTransactionsQueue(&graceful_cleanup_queue_, &min_running_notifier);
     }
     CleanupStatusResolvers();
   }

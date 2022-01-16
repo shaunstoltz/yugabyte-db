@@ -23,6 +23,8 @@
 #include <string>
 #include "yb/rocksdb/db.h"
 
+#include "yb/util/result.h"
+
 #ifdef _WIN32
 // Windows API macro interference
 #undef DeleteFile
@@ -292,6 +294,12 @@ class StackableDB : public DB {
       ColumnFamilyHandle *column_family,
       ColumnFamilyMetaData* cf_meta) override {
     db_->GetColumnFamilyMetaData(column_family, cf_meta);
+  }
+
+  virtual void GetColumnFamiliesOptions(
+      std::vector<std::string>* column_family_names,
+      std::vector<ColumnFamilyOptions>* column_family_options) override {
+    db_->GetColumnFamiliesOptions(column_family_names, column_family_options);
   }
 
 #endif  // ROCKSDB_LITE

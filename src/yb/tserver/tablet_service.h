@@ -32,22 +32,31 @@
 #ifndef YB_TSERVER_TABLET_SERVICE_H_
 #define YB_TSERVER_TABLET_SERVICE_H_
 
+#include <functional>
+#include <future>
 #include <memory>
+#include <set>
 #include <string>
+#include <type_traits>
+#include <utility>
 #include <vector>
 
-#include "yb/common/read_hybrid_time.h"
+#include <boost/range/iterator_range.hpp>
+
+#include "yb/common/common_fwd.h"
+
 #include "yb/consensus/consensus.service.h"
+
 #include "yb/gutil/ref_counted.h"
 
 #include "yb/tablet/tablet_fwd.h"
-#include "yb/tablet/tablet_peer.h"
 
-#include "yb/tserver/tablet_server_interface.h"
+#include "yb/tserver/tserver_util_fwd.h"
+#include "yb/tserver/tserver_fwd.h"
 #include "yb/tserver/tserver_admin.pb.h"
 #include "yb/tserver/tserver_admin.service.h"
-#include "yb/tserver/tserver_service.service.h"
 #include "yb/tserver/tserver_forward_service.service.h"
+#include "yb/tserver/tserver_service.service.h"
 
 namespace yb {
 class Schema;
@@ -214,7 +223,7 @@ class TabletServiceAdminImpl : public TabletServerAdminServiceIf {
                     DeleteTabletResponsePB* resp,
                     rpc::RpcContext context) override;
 
-  void AlterSchema(const ChangeMetadataRequestPB* req,
+  void AlterSchema(const tablet::ChangeMetadataRequestPB* req,
                    ChangeMetadataResponsePB* resp,
                    rpc::RpcContext context) override;
 
@@ -250,14 +259,20 @@ class TabletServiceAdminImpl : public TabletServerAdminServiceIf {
 
   // Called on the Index table(s) once the backfill is complete.
   void BackfillDone(
-      const ChangeMetadataRequestPB* req, ChangeMetadataResponsePB* resp,
+      const tablet::ChangeMetadataRequestPB* req, ChangeMetadataResponsePB* resp,
       rpc::RpcContext context) override;
 
   // Starts tablet splitting by adding split tablet Raft operation into Raft log of the source
   // tablet.
   void SplitTablet(
-      const SplitTabletRequestPB* req,
+      const tablet::SplitTabletRequestPB* req,
       SplitTabletResponsePB* resp,
+      rpc::RpcContext context) override;
+
+  // Upgrade YSQL cluster (all databases) to the latest version, applying necessary migrations.
+  void UpgradeYsql(
+      const UpgradeYsqlRequestPB* req,
+      UpgradeYsqlResponsePB* resp,
       rpc::RpcContext context) override;
 
  private:
@@ -283,6 +298,10 @@ class ConsensusServiceImpl : public consensus::ConsensusServiceIf {
   virtual void UpdateConsensus(const consensus::ConsensusRequestPB *req,
                                consensus::ConsensusResponsePB *resp,
                                rpc::RpcContext context) override;
+
+  virtual void MultiRaftUpdateConsensus(const consensus::MultiRaftConsensusRequestPB *req,
+                                        consensus::MultiRaftConsensusResponsePB *resp,
+                                        rpc::RpcContext context) override;
 
   virtual void RequestConsensusVote(const consensus::VoteRequestPB* req,
                                     consensus::VoteResponsePB* resp,
@@ -321,6 +340,8 @@ class ConsensusServiceImpl : public consensus::ConsensusServiceIf {
                                     rpc::RpcContext context) override;
 
  private:
+  void CompleteUpdateConsensusResponse(std::shared_ptr<tablet::TabletPeer> tablet_peer,
+                                       consensus::ConsensusResponsePB* resp);
   TabletPeerLookupIf* tablet_manager_;
 };
 

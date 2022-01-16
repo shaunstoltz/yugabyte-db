@@ -29,25 +29,32 @@
 // or implied.  See the License for the specific language governing permissions and limitations
 // under the License.
 //
+
 #include "yb/tserver/remote_bootstrap_session.h"
 
-#include <algorithm>
 #include <boost/optional.hpp>
+#include <glog/logging.h>
 
 #include "yb/consensus/consensus.h"
 #include "yb/consensus/log.h"
-#include "yb/consensus/log_reader.h"
-#include "yb/gutil/map-util.h"
+#include "yb/consensus/opid_util.h"
+
+#include "yb/gutil/casts.h"
 #include "yb/gutil/strings/substitute.h"
 #include "yb/gutil/type_traits.h"
-#include "yb/server/metadata.h"
+
 #include "yb/tablet/tablet.h"
+#include "yb/tablet/tablet_metadata.h"
 #include "yb/tablet/tablet_peer.h"
 #include "yb/tablet/tablet_snapshots.h"
 
 #include "yb/tserver/remote_bootstrap_snapshots.h"
 
+#include "yb/util/env_util.h"
+#include "yb/util/logging.h"
 #include "yb/util/size_literals.h"
+#include "yb/util/status_format.h"
+#include "yb/util/status_log.h"
 #include "yb/util/stopwatch.h"
 #include "yb/util/trace.h"
 
@@ -62,6 +69,7 @@ using std::vector;
 using std::string;
 
 using consensus::MinimumOpId;
+using consensus::PeerMemberType;
 using consensus::RaftPeerPB;
 using log::LogAnchorRegistry;
 using log::ReadableLogSegment;
@@ -125,18 +133,18 @@ Status RemoteBootstrapSession::ChangeRole() {
     }
 
     switch(peer_pb.member_type()) {
-      case RaftPeerPB::OBSERVER: FALLTHROUGH_INTENDED;
-      case RaftPeerPB::VOTER:
+      case PeerMemberType::OBSERVER: FALLTHROUGH_INTENDED;
+      case PeerMemberType::VOTER:
         LOG(ERROR) << "Peer " << peer_pb.permanent_uuid() << " is a "
-                   << RaftPeerPB::MemberType_Name(peer_pb.member_type())
+                   << PeerMemberType_Name(peer_pb.member_type())
                    << " Not changing its role after remote bootstrap";
 
         // Even though this is an error, we return Status::OK() so the remote server doesn't
         // tombstone its tablet.
         return Status::OK();
 
-      case RaftPeerPB::PRE_OBSERVER: FALLTHROUGH_INTENDED;
-      case RaftPeerPB::PRE_VOTER: {
+      case PeerMemberType::PRE_OBSERVER: FALLTHROUGH_INTENDED;
+      case PeerMemberType::PRE_VOTER: {
         consensus::ChangeConfigRequestPB req;
         consensus::ChangeConfigResponsePB resp;
 
@@ -153,14 +161,14 @@ Status RemoteBootstrapSession::ChangeRole() {
         // If another ChangeConfig is being processed, our request will be rejected.
         return consensus->ChangeConfig(req, &DoNothingStatusCB, &error_code);
       }
-      case RaftPeerPB::UNKNOWN_MEMBER_TYPE:
+      case PeerMemberType::UNKNOWN_MEMBER_TYPE:
         return STATUS(IllegalState, Substitute("Unable to change role for peer $0 in config for "
                                                "tablet $1. Peer has an invalid member type $2",
                                                peer_pb.permanent_uuid(), tablet_peer_->tablet_id(),
-                                               RaftPeerPB::MemberType_Name(peer_pb.member_type())));
+                                               PeerMemberType_Name(peer_pb.member_type())));
     }
     LOG(FATAL) << "Unexpected peer member type "
-               << RaftPeerPB::MemberType_Name(peer_pb.member_type());
+               << PeerMemberType_Name(peer_pb.member_type());
   }
   return STATUS(IllegalState, Substitute("Unable to find peer $0 in config for tablet $1",
                                          requestor_uuid_, tablet_peer_->tablet_id()));
@@ -190,7 +198,7 @@ Result<google::protobuf::RepeatedPtrField<tablet::FilePB>> ListFiles(const std::
   }
 
   google::protobuf::RepeatedPtrField<tablet::FilePB> result;
-  result.Reserve(files.size());
+  result.Reserve(narrow_cast<int>(files.size()));
   for (const auto& file : files) {
     auto full_path = JoinPathSegments(dir, file);
     if (VERIFY_RESULT(env->IsDirectory(full_path))) {

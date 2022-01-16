@@ -16,6 +16,7 @@
 #include <vector>
 
 #include "yb/client/client-test-util.h"
+#include "yb/client/client.h"
 #include "yb/client/session.h"
 #include "yb/client/table_creator.h"
 #include "yb/client/yb_op.h"
@@ -27,7 +28,8 @@
 #include "yb/integration-tests/external_mini_cluster.h"
 #include "yb/integration-tests/yb_table_test_base.h"
 
-#include "yb/util/metrics.h"
+#include "yb/util/format.h"
+#include "yb/util/status_format.h"
 #include "yb/util/test_util.h"
 
 #include "yb/yql/cql/ql/util/statement_result.h"
@@ -54,7 +56,7 @@ const auto kLeaderFailureMaxMissedHeartbeatPeriods = 3;
 const auto kKeyColumnName = "k";
 const auto kValueColumnName = "v";
 
-std::string TsNameForIndex(int idx) {
+std::string TsNameForIndex(size_t idx) {
   return Format("ts-$0", idx + 1);
 }
 
@@ -77,9 +79,7 @@ class KVTableTsFailoverWriteIfTest : public integration_tests::YBTableTestBase {
 
   void SetUp() override {
     YBTableTestBase::SetUp();
-    ASSERT_OK(itest::CreateTabletServerMap(external_mini_cluster()->master_proxy().get(),
-                                           &external_mini_cluster()->proxy_cache(),
-                                           &ts_map_));
+    ts_map_ = ASSERT_RESULT(itest::CreateTabletServerMap(external_mini_cluster()));
     ts_details_.clear();
     for (int i = 0; i < external_mini_cluster()->num_tablet_servers(); ++i) {
       std::string ts_id = external_mini_cluster()->tablet_server(i)->uuid();
@@ -97,7 +97,7 @@ class KVTableTsFailoverWriteIfTest : public integration_tests::YBTableTestBase {
     table_.AddInt32ColumnValue(req, kValueColumnName, value);
     string op_str = Format("$0: $1", key, value);
     LOG(INFO) << "Sending write: " << op_str;
-    ASSERT_OK(session->Apply(insert));
+    session->Apply(insert);
     session->FlushAsync([insert, op_str](client::FlushStatus* flush_status) {
       const auto& s = flush_status->status;
       ASSERT_TRUE(s.ok() || s.IsAlreadyPresent())
@@ -196,7 +196,7 @@ class KVTableTsFailoverWriteIfTest : public integration_tests::YBTableTestBase {
     return STATUS(NotFound, "No tablet server RAFT leader detected");
   }
 
-  void SetBoolFlag(int ts_idx, const std::string& flag, bool value) {
+  void SetBoolFlag(size_t ts_idx, const std::string& flag, bool value) {
     auto ts = external_mini_cluster()->tablet_server(ts_idx);
     LOG(INFO) << "Setting " << flag << " to " << value << " on " << TsNameForIndex(ts_idx);
     ASSERT_OK(external_mini_cluster()->SetFlag(ts, flag, yb::ToString(value)));
@@ -345,11 +345,11 @@ TEST_F(KVTableTsFailoverWriteIfTest, KillTabletServerDuringReplication) {
     } else {
       LOG(INFO) << "Error during CAS: " << s;
       LOG(INFO) << "Retrying CAS: " << op_str;
-      ASSERT_OK(session->Apply(op));
+      session->Apply(op);
       session->FlushAsync(callback);
     }
   };
-  ASSERT_OK(session->Apply(op));
+  session->Apply(op);
   session->FlushAsync(callback);
 
   // In case of bug ENG-3471 read part of CAS will be completed before appending pending ops to log,

@@ -13,6 +13,7 @@ import com.jayway.jsonpath.JsonPath;
 import com.jayway.jsonpath.spi.json.JacksonJsonNodeJsonProvider;
 import com.jayway.jsonpath.spi.mapper.JacksonMappingProvider;
 import com.yugabyte.yw.common.PlatformServiceException;
+import com.yugabyte.yw.common.utils.Pair;
 import com.yugabyte.yw.models.paging.PagedQuery;
 import com.yugabyte.yw.models.paging.PagedResponse;
 import io.ebean.ExpressionList;
@@ -20,22 +21,28 @@ import io.ebean.Junction;
 import io.ebean.PagedList;
 import io.ebean.Query;
 import io.ebean.common.BeanList;
-import io.jsonwebtoken.lang.Collections;
+import java.lang.annotation.Annotation;
 import java.time.Duration;
 import java.time.Instant;
 import java.time.temporal.ChronoUnit;
 import java.time.temporal.TemporalUnit;
 import java.util.ArrayList;
 import java.util.Collection;
+import java.util.Collections;
 import java.util.Date;
 import java.util.HashMap;
 import java.util.Iterator;
 import java.util.List;
 import java.util.Map;
 import java.util.Map.Entry;
+import java.util.Optional;
 import java.util.Set;
 import java.util.function.BiFunction;
+import java.util.function.Function;
 import java.util.function.Predicate;
+import java.util.regex.Matcher;
+import java.util.regex.Pattern;
+import java.util.stream.Collectors;
 import lombok.extern.slf4j.Slf4j;
 import org.apache.commons.collections.CollectionUtils;
 import org.apache.commons.lang3.StringUtils;
@@ -43,7 +50,11 @@ import play.libs.Json;
 
 @Slf4j
 public class CommonUtils {
+
   public static final String DEFAULT_YB_HOME_DIR = "/home/yugabyte";
+
+  private static final Pattern RELEASE_REGEX =
+      Pattern.compile("^(\\d+)\\.(\\d+)\\.(\\d+)\\.(\\d+).*$");
 
   private static final String maskRegex = "(?<!^.?).(?!.?$)";
 
@@ -72,7 +83,8 @@ public class CommonUtils {
         || ucFieldname.contains("SECRET")
         || ucFieldname.contains("CREDENTIALS")
         || ucFieldname.contains("API")
-        || ucFieldname.contains("POLICY");
+        || ucFieldname.contains("POLICY")
+        || ucFieldname.contains("HC_VAULT_TOKEN");
   }
 
   /**
@@ -109,7 +121,7 @@ public class CommonUtils {
         config, CommonUtils::isSensitiveField, (key, value) -> getMaskedValue(key, value));
   }
 
-  private static String getMaskedValue(String key, String value) {
+  public static String getMaskedValue(String key, String value) {
     return isStrictlySensitiveField(key) || (value == null) || value.length() < 5
         ? MASKED_FIELD_VALUE
         : value.replaceAll(maskRegex, "*");
@@ -253,7 +265,7 @@ public class CommonUtils {
 
   public static <T> ExpressionList<T> appendInClause(
       ExpressionList<T> query, String field, Collection<?> values) {
-    if (!Collections.isEmpty(values)) {
+    if (!CollectionUtils.isEmpty(values)) {
       if (values.size() > DB_IN_CLAUSE_TO_WARN) {
         log.warn(
             "Querying for {} entries in field {} - may affect performance", values.size(), field);
@@ -269,7 +281,7 @@ public class CommonUtils {
 
   public static <T> ExpressionList<T> appendNotInClause(
       ExpressionList<T> query, String field, Collection<?> values) {
-    if (!Collections.isEmpty(values)) {
+    if (!CollectionUtils.isEmpty(values)) {
       for (List<?> batch : Iterables.partition(values, CommonUtils.DB_MAX_IN_CLAUSE_ITEMS)) {
         query.notIn(field, batch);
       }
@@ -415,12 +427,90 @@ public class CommonUtils {
   }
 
   public static long getDurationSeconds(Date startTime, Date endTime) {
-    Duration duration = Duration.between(startTime.toInstant(), endTime.toInstant());
+    return getDurationSeconds(startTime.toInstant(), endTime.toInstant());
+  }
+
+  public static long getDurationSeconds(Instant startTime, Instant endTime) {
+    Duration duration = Duration.between(startTime, endTime);
     return duration.getSeconds();
+  }
+
+  /**
+   * Returns map with common entries (both key and value equals in all maps) from the list of input
+   * maps. Basically it calculates count of key-value pairs in all the incoming maps and builds new
+   * map from the ones, where count == maps.size().
+   *
+   * @param maps incoming maps
+   * @param <K> Map key type
+   * @param <V> Map value type
+   * @return Map with common entries.
+   */
+  public static <K, V> Map<K, V> getMapCommonElements(List<Map<K, V>> maps) {
+    if (CollectionUtils.isEmpty(maps)) {
+      return Collections.emptyMap();
+    }
+    int mapsCount = maps.size();
+    Map<Pair<K, V>, Long> pairCount =
+        maps.stream()
+            .flatMap(map -> map.entrySet().stream())
+            .map(entry -> new Pair<>(entry.getKey(), entry.getValue()))
+            .collect(Collectors.groupingBy(Function.identity(), Collectors.counting()));
+    return pairCount
+        .entrySet()
+        .stream()
+        .filter(entry -> entry.getValue() == mapsCount)
+        .map(Map.Entry::getKey)
+        .collect(Collectors.toMap(Pair::getFirst, Pair::getSecond));
+  }
+
+  public static boolean isReleaseEqualOrAfter(String thresholdRelease, String actualRelease) {
+    Matcher thresholdMatcher = RELEASE_REGEX.matcher(thresholdRelease);
+    Matcher actualMatcher = RELEASE_REGEX.matcher(actualRelease);
+    if (!thresholdMatcher.matches()) {
+      throw new IllegalArgumentException(
+          "Threshold release " + thresholdRelease + " does not match release pattern");
+    }
+    if (!actualMatcher.matches()) {
+      log.warn(
+          "Actual release {} does not match release pattern - handle as latest release",
+          actualRelease);
+      return true;
+    }
+    for (int i = 1; i < 5; i++) {
+      int thresholdPart = Integer.parseInt(thresholdMatcher.group(i));
+      int actualPart = Integer.parseInt(actualMatcher.group(i));
+      if (actualPart > thresholdPart) {
+        return true;
+      }
+      if (actualPart < thresholdPart) {
+        return false;
+      }
+    }
+    // Equal releases.
+    return true;
   }
 
   @FunctionalInterface
   private interface TriFunction<A, B, C, R> {
     R apply(A a, B b, C c);
+  }
+
+  /**
+   * Finds if the annotation class is present on the given class or its super classes.
+   *
+   * @param clazz the given class.
+   * @param annotationClass the annotation class.
+   * @return the optional of annotation.
+   */
+  public static <T extends Annotation> Optional<T> isAnnotatedWith(
+      Class<?> clazz, Class<T> annotationClass) {
+    if (clazz == null) {
+      return Optional.empty();
+    }
+    T annotation = clazz.getAnnotation(annotationClass);
+    if (annotation != null) {
+      return Optional.of(annotation);
+    }
+    return isAnnotatedWith(clazz.getSuperclass(), annotationClass);
   }
 }

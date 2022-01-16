@@ -29,7 +29,7 @@
 #include "catalog/pg_operator.h"
 #include "catalog/pg_proc.h"
 #include "catalog/pg_type.h"
-#include "catalog/pg_tablegroup.h"
+#include "catalog/pg_yb_tablegroup.h"
 #include "miscadmin.h"
 #include "nodes/pg_list.h"
 #ifdef CATCACHE_STATS
@@ -81,6 +81,7 @@
 
 /* Cache management header --- pointer is NULL until created */
 static CatCacheHeader *CacheHdr = NULL;
+static long NumCatalogCacheMisses;
 
 static inline HeapTuple SearchCatCacheInternal(CatCache *cache,
 					   int nkeys,
@@ -953,10 +954,19 @@ CatalogCacheInitializeCache(CatCache *cache)
 
 	CatalogCacheInitializeCache_DEBUG1;
 
-	// skip for TableGroupRelationId if not in snapshot
-	// TODO: remove this (as well as the include) when initdb upgrade is enabled
-	if (cache->cc_reloid == TableGroupRelationId && !TablegroupCatalogExists)
-		return;
+	/*
+	 * Skip for YbTablegroupRelationId if not in snapshot
+	 * (possible if using an older non-upgraded cluster state)
+	 */
+	if (cache->cc_reloid == YbTablegroupRelationId && !YbTablegroupCatalogExists)
+	{
+		/* double check that the Tablegroup catalog doesn't exist */
+		HeapTuple tuple = SearchSysCache1(RELOID, ObjectIdGetDatum(YbTablegroupRelationId));
+		YbTablegroupCatalogExists = HeapTupleIsValid(tuple);
+
+		if (!YbTablegroupCatalogExists)
+			return;
+	}
 	relation = heap_open(cache->cc_reloid, AccessShareLock);
 
 	/*
@@ -1155,24 +1165,24 @@ SetCatCacheList(CatCache *cache,
 				dlist_foreach(iter, bucket)
 				{
 					ct = dlist_container(CatCTup, cache_elem, iter.cur);
-	
+
 					if (ct->dead || ct->negative)
 						continue;    /* ignore dead and negative entries */
-	
+
 					if (ct->hash_value != hashValue)
 						continue;    /* quickly skip entry if wrong hash val */
-	
+
 					if (!ItemPointerEquals(&(ct->tuple.t_self),
 										   &(ntp->t_self)))
 						continue;    /* not same tuple */
-	
+
 					/*
 					 * Found a match, but can't use it if it belongs to another
 					 * list already
 					 */
 					if (ct->c_list)
 						continue;
-	
+
 					found = true;
 					break;            /* A-OK */
 				}
@@ -1712,6 +1722,9 @@ SearchCatCacheMiss(CatCache *cache,
 	 */
 	relation = heap_open(cache->cc_reloid, AccessShareLock);
 
+	if (IsYugaByteEnabled())
+		NumCatalogCacheMisses++;
+
 	if (yb_debug_log_catcache_events)
 	{
 		StringInfoData buf;
@@ -1805,10 +1818,14 @@ SearchCatCacheMiss(CatCache *cache,
 			 *    statistics in DocDB/YSQL yet.
 			 * 3. pg_class (RELNAMENSP), pg_type (TYPENAMENSP)
 			 *    but only for system tables since users cannot create system tables in YSQL.
+			 *    This is violated in YSQL upgrade, but doing so will force cache refresh.
 			 * 4. Caches within temporary namespaces as data in this namespaces can be changed by
 			 *    current session only
 			 * 5. pg_attribute as `ALTER TABLE` is used to add new columns and it increments
 			 *    catalog version
+			 * 6. pg_type (TYPEOID and TYPENAMENSP) to avoid redundant
+			 *    master lookups while parsing functions that are checked to be
+			 *    possible type coercions
 			 */
 			Oid namespace_id = DatumGetObjectId(cur_skey[1].sk_argument);
 			bool allow_negative_entries = cache->id == CASTSOURCETARGET ||
@@ -1816,7 +1833,9 @@ SearchCatCacheMiss(CatCache *cache,
 			                              cache->id == STATEXTNAMENSP ||
 			                              cache->id == STATEXTOID ||
 			                              cache->id == ATTNUM ||
-			                              ((cache->id == RELNAMENSP || cache->id == TYPENAMENSP) &&
+			                              cache->id == TYPEOID ||
+			                              cache->id == TYPENAMENSP ||
+			                              ((cache->id == RELNAMENSP) &&
 			                               namespace_id == PG_CATALOG_NAMESPACE &&
 			                               !YBIsPreparingTemplates()) ||
 			                              isTempOrTempToastNamespace(namespace_id);
@@ -2090,23 +2109,23 @@ SearchCatCacheList(CatCache *cache,
 				dlist_foreach(iter, bucket)
 				{
 					ct = dlist_container(CatCTup, cache_elem, iter.cur);
-	
+
 					if (ct->dead || ct->negative)
 						continue;	/* ignore dead and negative entries */
-	
+
 					if (ct->hash_value != hashValue)
 						continue;	/* quickly skip entry if wrong hash val */
-	
+
 					if (!ItemPointerEquals(&(ct->tuple.t_self), &(ntp->t_self)))
 						continue;	/* not same tuple */
-	
+
 					/*
 					 * Found a match, but can't use it if it belongs to another
 					 * list already
 					 */
 					if (ct->c_list)
 						continue;
-	
+
 					found = true;
 					break;			/* A-OK */
 				}
@@ -2561,4 +2580,10 @@ PrintCatCacheListLeakWarning(CatCList *list)
 	elog(WARNING, "cache reference leak: cache %s (%d), list %p has count %d",
 		 list->my_cache->cc_relname, list->my_cache->id,
 		 list, list->refcount);
+}
+
+long
+GetCatCacheMisses()
+{
+	return NumCatalogCacheMisses;
 }

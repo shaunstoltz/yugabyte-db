@@ -8,7 +8,7 @@ menu:
   latest:
     identifier: cloud-billing-costs
     parent: cloud-admin
-    weight: 300
+    weight: 400
 isTocNested: true
 showAsideToc: true
 ---
@@ -35,7 +35,7 @@ Instance vCPU capacity makes up the majority of your bill, and is the easiest to
 | Data transfer – Cross Region (Other regions) | 10 GB |
 | Data transfer – Internet | 10 GB |
 
-You can see the approximate cost for your vCPUs when creating and editing clusters, as shown in the following illustration. Refer to [Creating a cluster](../../cloud-basics/create-clusters) and [Scale and configure clusters](../../cloud-clusters/configure-clusters).
+You can see the approximate cost for your vCPUs when [creating](../../cloud-basics/create-clusters) and [scaling](../../cloud-clusters/configure-clusters) clusters, as shown in the following illustration. **+ Usage** in this context refers to any potential overages from exceeding the free allowances for disk storage, backup storage, and data transfer. 
 
 ![Cloud Cluster Settings Edit Infrastructure](/images/yb-cloud/cloud-clusters-settings-edit.png)
 
@@ -201,7 +201,7 @@ The free allowance for same region transfers is 1000 GB per month for every 1 vC
 
 ### Cross region
 
-This accounts for all of the traffic coming out of the cluster to a different region. This happens if a client is using [VPC peering](../../cloud-network/vpc-peers/) but is in different region than the cluster deployments. Different rate cards apply for clusters deployed in Asia-Pacific (APAC) vs other regions. 
+This accounts for all of the traffic coming out of the cluster to a different region. This happens if a client is using [VPC peering](../../cloud-secure-clusters/cloud-vpcs/) but is in different region than the cluster deployments. Different rate cards apply for clusters deployed in Asia-Pacific (APAC) vs other regions. 
 
 {{< tip title="Rate card" >}}
 
@@ -229,7 +229,7 @@ The free allowance for data out transfers is 10GB per month for every 1 vCPU per
 
 - Ensure that queries originate from the same cloud region and provider as your database deployment whenever possible.
 
-  - Avoid data out internet costs by using [VPC peering](../../cloud-network/vpc-peers/) and not allowing any client applications to connect over the public internet.
+  - Avoid data out internet costs by using [VPC peering](../../cloud-secure-clusters/cloud-vpcs/) and not allowing any client applications to connect over the public internet.
 
   - Minimize data out cross region costs by making sure your client application and database cluster are deployed in the same cloud and region and connected using VPC Peering.
 

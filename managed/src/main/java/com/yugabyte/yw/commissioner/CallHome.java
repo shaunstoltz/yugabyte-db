@@ -10,16 +10,14 @@ import com.yugabyte.yw.common.CallHomeManager;
 import com.yugabyte.yw.models.Customer;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
-import org.slf4j.Logger;
-import org.slf4j.LoggerFactory;
+import lombok.extern.slf4j.Slf4j;
 import play.Environment;
 import scala.concurrent.ExecutionContext;
 import scala.concurrent.duration.Duration;
 
 @Singleton
+@Slf4j
 public class CallHome {
-
-  public static final Logger LOG = LoggerFactory.getLogger(CallHome.class);
 
   private final ActorSystem actorSystem;
 
@@ -44,17 +42,15 @@ public class CallHome {
     this.executionContext = executionContext;
     this.environment = environment;
     this.callHomeManager = callHomeManager;
-
-    // We don't want to start callhome on dev environments
-    if (this.environment.isDev()) {
-      LOG.info("Skip callhome scheduling");
-    } else {
-      LOG.info("Initialize callhome service");
-      this.initialize();
-    }
   }
 
-  private void initialize() {
+  public void start() {
+    // We don't want to start callhome on dev environments
+    if (this.environment.isDev()) {
+      log.info("Skip callhome scheduling");
+      return;
+    }
+    log.info("Initialize callhome service");
     this.actorSystem
         .scheduler()
         .schedule(
@@ -66,20 +62,24 @@ public class CallHome {
 
   @VisibleForTesting
   void scheduleRunner() {
-    if (running.get()) {
-      LOG.info("Previous scheduler still running");
+    if (!running.compareAndSet(false, true)) {
+      log.info("Previous scheduler still running");
       return;
     }
 
-    LOG.info("Running scheduler");
-    running.set(true);
-    for (Customer c : Customer.getAll()) {
-      try {
-        callHomeManager.sendDiagnostics(c);
-      } catch (Exception e) {
-        LOG.error("Error sending callhome for customer: " + c.uuid, e);
+    try {
+      log.info("Running scheduler");
+      for (Customer c : Customer.getAll()) {
+        try {
+          callHomeManager.sendDiagnostics(c);
+        } catch (Exception e) {
+          log.error("Error sending callhome for customer: " + c.uuid, e);
+        }
       }
+    } catch (Exception e) {
+      log.error("Error sending callhome", e);
+    } finally {
+      running.set(false);
     }
-    running.set(false);
   }
 }

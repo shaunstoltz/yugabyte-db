@@ -33,13 +33,18 @@ class PgMiniTestBase : public YBMiniClusterTestBase<MiniCluster> {
 
   void SetUp() override;
 
-  virtual int NumMasters() {
+  virtual size_t NumMasters() {
     return 1;
   }
 
-  virtual int NumTabletServers() {
+  virtual size_t NumTabletServers() {
     return 3;
   }
+
+  // This allows modifying the logic to decide which tablet server to run postgres on -
+  // by default, randomly picked out of all the tablet servers.
+  virtual const std::shared_ptr<tserver::MiniTabletServer> PickPgTabletServer(
+     const MiniCluster::MiniTabletServers& servers);
 
   Result<PGConn> Connect() {
     return PGConn::Connect(pg_host_port_);
@@ -47,6 +52,10 @@ class PgMiniTestBase : public YBMiniClusterTestBase<MiniCluster> {
 
   Result<PGConn> ConnectToDB(const std::string& dbname) {
     return PGConn::Connect(pg_host_port_, dbname);
+  }
+
+  const HostPort& pg_host_port() const {
+    return pg_host_port_;
   }
 
  private:

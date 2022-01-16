@@ -31,24 +31,24 @@
 //
 
 #include <gtest/gtest.h>
-#include <gflags/gflags.h>
 
 #include "yb/common/schema.h"
 #include "yb/common/wire_protocol-test-util.h"
-#include "yb/consensus/consensus_queue.h"
+
 #include "yb/consensus/consensus-test-util.h"
-#include "yb/consensus/log.h"
-#include "yb/consensus/log_anchor_registry.h"
-#include "yb/consensus/log_util.h"
-#include "yb/consensus/log_reader.h"
-#include "yb/consensus/log-test-base.h"
 #include "yb/consensus/consensus.pb.h"
+#include "yb/consensus/consensus_queue.h"
+#include "yb/consensus/log-test-base.h"
+#include "yb/consensus/log_anchor_registry.h"
+#include "yb/consensus/log_reader.h"
+#include "yb/consensus/log_util.h"
 #include "yb/consensus/replicate_msgs_holder.h"
 
 #include "yb/fs/fs_manager.h"
+
 #include "yb/server/hybrid_clock.h"
+
 #include "yb/util/metrics.h"
-#include "yb/util/scope_exit.h"
 #include "yb/util/test_macros.h"
 #include "yb/util/test_util.h"
 #include "yb/util/threadpool.h"
@@ -137,8 +137,7 @@ class ConsensusQueueTest : public YBTest {
                                ConsensusResponsePB* response,
                                const OpIdPB& last_received,
                                const OpIdPB& last_received_current_leader,
-                               int last_committed_idx) {
-
+                               int64_t last_committed_idx) {
     queue_->TrackPeer(kPeerUuid);
     response->set_responder_uuid(kPeerUuid);
 
@@ -181,7 +180,7 @@ class ConsensusQueueTest : public YBTest {
     StatusToPB(STATUS(IllegalState, "LMP failed."), error->mutable_status());
   }
 
-  void WaitForLocalPeerToAckIndex(int index) {
+  void WaitForLocalPeerToAckIndex(int64_t index) {
     while (true) {
       PeerMessageQueue::TrackedPeer leader = queue_->GetTrackedPeerForTests(kLeaderUuid);
       if (leader.last_received.index >= index) {
@@ -195,7 +194,7 @@ class ConsensusQueueTest : public YBTest {
   void SetLastReceivedAndLastCommitted(ConsensusResponsePB* response,
                                        const OpId& last_received,
                                        const OpId& last_received_current_leader,
-                                       int last_committed_idx) {
+                                       int64_t last_committed_idx) {
     last_received.ToPB(response->mutable_status()->mutable_last_received());
     last_received_current_leader.ToPB(
         response->mutable_status()->mutable_last_received_current_leader());
@@ -205,7 +204,7 @@ class ConsensusQueueTest : public YBTest {
   // Like the above but uses the same last_received for current term.
   void SetLastReceivedAndLastCommitted(ConsensusResponsePB* response,
                                        const OpId& last_received,
-                                       int last_committed_idx) {
+                                       int64_t last_committed_idx) {
     SetLastReceivedAndLastCommitted(response, last_received, last_received, last_committed_idx);
   }
 
@@ -755,14 +754,14 @@ TEST_F(ConsensusQueueTest, TestOnlyAdvancesWatermarkWhenPeerHasAPrefixOfOurLog) 
 
   for (int i = 31; i <= 53; i++) {
     if (i <= 45) {
-      AppendReplicateMsg(72, i, 1024);
+      ASSERT_OK(AppendReplicateMsg(72, i, 1024));
       continue;
     }
     if (i <= 51) {
-      AppendReplicateMsg(73, i, 1024);
+      ASSERT_OK(AppendReplicateMsg(73, i, 1024));
       continue;
     }
-    AppendReplicateMsg(76, i, 1024);
+    ASSERT_OK(AppendReplicateMsg(76, i, 1024));
   }
 
   WaitForLocalPeerToAckIndex(53);

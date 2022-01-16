@@ -50,6 +50,7 @@
 #include "catalog/pg_type.h"
 #include "catalog/storage.h"
 #include "commands/tablecmds.h"
+#include "commands/defrem.h"
 #include "commands/event_trigger.h"
 #include "commands/trigger.h"
 #include "executor/executor.h"
@@ -59,6 +60,7 @@
 #include "optimizer/clauses.h"
 #include "optimizer/planner.h"
 #include "parser/parser.h"
+#include "parser/parse_utilcmd.h"
 #include "rewrite/rewriteManip.h"
 #include "storage/bufmgr.h"
 #include "storage/lmgr.h"
@@ -1021,17 +1023,25 @@ index_create(Relation heapRelation,
 	indexRelation->rd_rel->relispartition = OidIsValid(parentIndexRelid);
 
 	/*
+	 * YSQL upgrade notes:
+	 * -------------------
 	 * At this point, reloptions no longer affects the index
 	 * creation process, the only remaining use for them is to be
-	 * stored in pg_class.
+	 * stored in pg_class. ybTransformRelOptions has already
+	 * removed all temporary reloptions.
 	 *
-	 * For YSQL upgrade, we want system indexes to not have
-	 * reloptions stored to imitate BKI processing, so we can safely
-	 * remove them now.
+	 * We want system tables and indexes to not have any reloptions
+	 * stored to imitate BKI processing, so we don't allow any reloption
+	 * not removed by ybTransformRelOptions.
 	 */
-	if (IsCatalogRelation(heapRelation) && IsYsqlUpgrade)
+	if (IsYsqlUpgrade && IsCatalogRelation(heapRelation) &&
+		reloptions != (Datum) 0)
 	{
-		reloptions = (Datum) 0;
+		ereport(ERROR,
+				(errcode(ERRCODE_INVALID_TABLE_DEFINITION),
+				 errmsg("unsuppored reloptions were used for a system index "
+				        "during YSQL upgrade"),
+				 errhint("Only a small subset is allowed due to BKI restrictions.")));
 	}
 
 	/*
@@ -1239,9 +1249,6 @@ index_create(Relation heapRelation,
 												DEPENDENCY_NORMAL,
 												DEPENDENCY_AUTO, false);
 			}
-
-			/* Store dependency on tablespace */
-			recordDependencyOnTablespace(RelationRelationId, indexRelationId, tableSpaceId);
 		}
 	}
 	else
@@ -2408,7 +2415,7 @@ index_build(Relation heapRelation,
 	 * Call the access method's build procedure
 	 */
 	stats = indexRelation->rd_amroutine->ambuild(heapRelation, indexRelation,
-	                        indexInfo);
+							indexInfo);
 	Assert(PointerIsValid(stats));
 
 	/*
@@ -4262,11 +4269,24 @@ reindex_relation(Oid relid, int flags, int options)
 		{
 			Oid			indexOid = lfirst_oid(indexId);
 
-			if (is_pg_class)
-				RelationSetIndexList(rel, doneIndexes, InvalidOid);
+			if (IsYBRelationById(indexOid))
+			{
+				Relation new_rel = heap_open(YbGetStorageRelid(rel), AccessExclusiveLock);
+				AttrNumber *new_to_old_attmap = convert_tuples_by_name_map(RelationGetDescr(new_rel),
+											  	RelationGetDescr(rel),
+											  	gettext_noop("could not convert row type"));
+				heap_close(new_rel, AccessExclusiveLock);
+				YbDropAndRecreateIndex(indexOid, relid, rel, new_to_old_attmap);
+				RemoveReindexPending(indexOid);
+			}
+			else
+			{
+				if (is_pg_class)
+					RelationSetIndexList(rel, doneIndexes, InvalidOid);
 
-			reindex_index(indexOid, !(flags & REINDEX_REL_CHECK_CONSTRAINTS),
+				reindex_index(indexOid, !(flags & REINDEX_REL_CHECK_CONSTRAINTS),
 						  persistence, options);
+			}
 
 			CommandCounterIncrement();
 

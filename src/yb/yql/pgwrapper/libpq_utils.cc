@@ -11,21 +11,25 @@
 // under the License.
 //
 
+#include "yb/yql/pgwrapper/libpq_utils.h"
+
 #include <string>
 #include <utility>
 
 #include <boost/preprocessor/seq/for_each.hpp>
 
-#include "yb/yql/pgwrapper/libpq_utils.h"
-
 #include "yb/common/pgsql_error.h"
 
+#include "yb/gutil/casts.h"
 #include "yb/gutil/endian.h"
 
 #include "yb/util/enums.h"
+#include "yb/util/format.h"
 #include "yb/util/logging.h"
 #include "yb/util/monotime.h"
-
+#include "yb/util/net/net_util.h"
+#include "yb/util/status_format.h"
+#include "yb/util/status_log.h"
 
 using namespace std::literals;
 
@@ -161,6 +165,9 @@ Result<PGConn> PGConn::Connect(const std::string& conn_str,
   auto start = CoarseMonoClock::now();
   for (;;) {
     PGConnPtr result(PQconnectdb(conn_str.c_str()));
+    if (!result) {
+      return STATUS(NetworkError, "Failed to connect to DB");
+    }
     auto status = PQstatus(result.get());
     if (status == ConnStatusType::CONNECTION_OK) {
       LOG(INFO) << "Connected to PG (" << conn_str << "), time taken: "
@@ -169,8 +176,16 @@ Result<PGConn> PGConn::Connect(const std::string& conn_str,
     }
     auto now = CoarseMonoClock::now();
     if (now >= deadline) {
+      std::string msg(yb::Format("$0", status));
+      if (status == CONNECTION_BAD) {
+        msg = PQerrorMessage(result.get());
+        // Avoid double newline (postgres adds a newline after the error message).
+        if (msg.back() == '\n') {
+          msg.resize(msg.size() - 1);
+        }
+      }
       return STATUS_FORMAT(NetworkError, "Connect failed: $0, passed: $1",
-                           status, MonoDelta(now - start));
+                           msg, MonoDelta(now - start));
     }
   }
 }
@@ -196,16 +211,21 @@ void PGResultClear::operator()(PGresult* result) const {
   PQclear(result);
 }
 
-Status PGConn::Execute(const std::string& command) {
+Status PGConn::Execute(const std::string& command, bool show_query_in_error) {
+  VLOG(1) << __func__ << " " << command;
   PGResultPtr res(PQexec(impl_.get(), command.c_str()));
   auto status = PQresultStatus(res.get());
   if (ExecStatusType::PGRES_COMMAND_OK != status) {
     if (status == ExecStatusType::PGRES_TUPLES_OK) {
-      return STATUS(IllegalState, "Tuples received in Execute");
+      return STATUS_FORMAT(IllegalState,
+                           "Tuples received in Execute$0",
+                           show_query_in_error ? Format(" of '$0'", command) : "");
     }
     return STATUS(NetworkError,
-                  Format("Execute '$0' failed: $1, message: $2",
-                         command, status, PQresultErrorMessage(res.get())),
+                  Format("Execute$0 failed: $1, message: $2",
+                         show_query_in_error ? Format(" of '$0'", command) : "",
+                         status,
+                         PQresultErrorMessage(res.get())),
                   Slice() /* msg2 */,
                   PgsqlError(GetSqlState(res.get())));
   }
@@ -225,6 +245,7 @@ Result<PGResultPtr> CheckResult(PGResultPtr result, const std::string& command) 
 }
 
 Result<PGResultPtr> PGConn::Fetch(const std::string& command) {
+  VLOG(1) << __func__ << " " << command;
   return CheckResult(
       PGResultPtr(simple_query_protocol_
           ? PQexec(impl_.get(), command.c_str())
@@ -335,7 +356,7 @@ bool PGConn::CopyFlushBuffer() {
   }
   ptrdiff_t len = copy_data_->pos - copy_data_->buffer;
   if (len) {
-    int res = PQputCopyData(impl_.get(), copy_data_->buffer, len);
+    int res = PQputCopyData(impl_.get(), copy_data_->buffer, narrow_cast<int>(len));
     if (res < 0) {
       copy_data_->error = STATUS_FORMAT(NetworkError, "Put copy data failed: $0", res);
       return false;
@@ -507,6 +528,10 @@ std::string PqEscapeIdentifier(const std::string& input) {
   output.insert(0, 1, '"');
   output.push_back('"');
   return output;
+}
+
+bool HasTryAgain(const Status& status) {
+  return status.ToString().find("Try again:") != std::string::npos;
 }
 
 } // namespace pgwrapper

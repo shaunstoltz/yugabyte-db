@@ -11,16 +11,18 @@
 // under the License.
 //
 
-#include <thread>
-
 #include <boost/circular_buffer.hpp>
 
+#include "yb/client/error.h"
 #include "yb/client/ql-dml-test-base.h"
+#include "yb/client/schema.h"
 #include "yb/client/session.h"
 #include "yb/client/table_alterer.h"
 #include "yb/client/table_handle.h"
+#include "yb/client/yb_op.h"
 
 #include "yb/common/ql_value.h"
+#include "yb/common/schema.h"
 
 #include "yb/master/master_util.h"
 
@@ -33,10 +35,11 @@
 
 #include "yb/util/async_util.h"
 #include "yb/util/backoff_waiter.h"
-#include "yb/util/curl_util.h"
-#include "yb/util/jsonreader.h"
+#include "yb/util/format.h"
 #include "yb/util/random.h"
 #include "yb/util/random_util.h"
+#include "yb/util/status_format.h"
+#include "yb/util/status_log.h"
 #include "yb/util/tostring.h"
 #include "yb/util/tsan_util.h"
 
@@ -160,14 +163,14 @@ class QLDmlTest : public QLDmlTestBase<MiniCluster> {
     QLAddStringRangeValue(req, r2);
     table_.AddInt32ColumnValue(req, "c1", c1);
     table_.AddStringColumnValue(req, "c2", c2);
-    CHECK_OK(session->Apply(op));
+    session->Apply(op);
     return op;
   }
 
-  void InsertRows(size_t num_rows) {
+  void InsertRows(int num_rows) {
     auto session = NewSession();
     boost::circular_buffer<std::future<FlushStatus>> futures(kInsertBatchSize);
-    for (size_t i = 0; i != num_rows; ++i) {
+    for (int i = 0; i != num_rows; ++i) {
       for (;;) {
         // Remove all the futures that are done.
         while (!futures.empty() && IsReady(futures.front())) {
@@ -205,7 +208,7 @@ class QLDmlTest : public QLDmlTestBase<MiniCluster> {
     table_.AddInt32Condition(condition, "r1", QL_OP_EQUAL, r1);
     table_.AddStringCondition(condition, "r2", QL_OP_EQUAL, r2);
     table_.AddColumns(columns, req);
-    EXPECT_OK(session->Apply(op));
+    session->Apply(op);
     return op;
   }
 
@@ -1224,7 +1227,7 @@ TEST_F(QLDmlTest, OpenRecentlyCreatedTable) {
       auto* const req = op->mutable_request();
       QLAddInt32HashValue(req, k);
       table.AddInt32ColumnValue(req, "v", -k);
-      ASSERT_OK(session->Apply(op));
+      session->Apply(op);
     }
     ASSERT_OK(session->Flush());
     table_creation_thread.join();
@@ -1240,7 +1243,7 @@ TEST_F(QLDmlTest, ReadFollower) {
 
   auto must_see_all_rows_after_this_deadline = MonoTime::Now() + 5s * kTimeMultiplier;
   auto session = NewSession();
-  for (size_t i = 0; i != kNumRows; ++i) {
+  for (int i = 0; i != kNumRows; ++i) {
     for (;;) {
       auto row = ReadRow(session, KeyForIndex(i), YBConsistencyLevel::CONSISTENT_PREFIX);
       if (!row.ok() && row.status().IsNotFound()) {
@@ -1269,7 +1272,7 @@ TEST_F(QLDmlTest, ReadFollower) {
 
   // Check that after restart we don't miss any rows.
   std::vector<size_t> missing_rows;
-  for (size_t i = 0; i != kNumRows; ++i) {
+  for (int i = 0; i != kNumRows; ++i) {
     auto row = ReadRow(session, KeyForIndex(i), YBConsistencyLevel::CONSISTENT_PREFIX);
     if (!row.ok() && row.status().IsNotFound()) {
       missing_rows.push_back(i);

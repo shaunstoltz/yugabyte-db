@@ -10,7 +10,8 @@ import {
   isNonEmptyObject,
   isDefinedNotNull,
   isNonEmptyString,
-  isNonEmptyArray
+  isNonEmptyArray,
+  get
 } from '../../../utils/ObjectUtils';
 import { YBButton, YBModal } from '../../../components/common/forms/fields';
 import { UniverseResources } from '../UniverseResources';
@@ -182,12 +183,17 @@ class UniverseForm extends Component {
         enableNodeToNodeEncrypt: formValues[clusterType].enableNodeToNodeEncrypt,
         enableClientToNodeEncrypt: formValues[clusterType].enableClientToNodeEncrypt
       };
-
-      if (isNonEmptyObject(formValues[clusterType].masterGFlags)) {
-        intent['masterGFlags'] = formValues[clusterType].masterGFlags;
-      }
-      if (isNonEmptyObject(formValues[clusterType].tserverGFlags)) {
-        intent['tserverGFlags'] = formValues[clusterType].tserverGFlags;
+      if (isNonEmptyArray(formValues[clusterType]?.gFlags)) {
+        const masterArr = [];
+        const tServerArr = [];
+        formValues[clusterType].gFlags.forEach((flag) => {
+          if (get(flag, 'MASTER', null))
+            masterArr.push({ name: flag?.Name, value: flag['MASTER'] });
+          if (get(flag, 'TSERVER', null))
+            tServerArr.push({ name: flag?.Name, value: flag['TSERVER'] });
+        });
+        intent['masterGFlags'] = masterArr;
+        intent['tserverGFlags'] = tServerArr;
       }
       return intent;
     }
@@ -325,26 +331,6 @@ class UniverseForm extends Component {
     return null;
   };
 
-  getYSQLAuthstate = () => {
-    const { formValues, universe } = this.props;
-
-    if (isNonEmptyObject(formValues['primary'])) {
-      return formValues['primary'].enableYSQLAuth;
-    }
-
-    const {
-      currentUniverse: {
-        data: { universeDetails }
-      }
-    } = universe;
-    if (isNonEmptyObject(universeDetails)) {
-      const primaryCluster = getPrimaryCluster(universeDetails.clusters);
-      return primaryCluster.userIntent.enableYSQLAuth;
-    }
-    // We shouldn't get here!!!
-    return null;
-  };
-
   getYCQLstate = () => {
     const { formValues, universe } = this.props;
 
@@ -360,26 +346,6 @@ class UniverseForm extends Component {
     if (isNonEmptyObject(universeDetails)) {
       const primaryCluster = getPrimaryCluster(universeDetails.clusters);
       return primaryCluster.userIntent.enableYCQL;
-    }
-    // We shouldn't get here!!!
-    return null;
-  };
-
-  getYCQLAuthstate = () => {
-    const { formValues, universe } = this.props;
-
-    if (isNonEmptyObject(formValues['primary'])) {
-      return formValues['primary'].enableYCQLAuth;
-    }
-
-    const {
-      currentUniverse: {
-        data: { universeDetails }
-      }
-    } = universe;
-    if (isNonEmptyObject(universeDetails)) {
-      const primaryCluster = getPrimaryCluster(universeDetails.clusters);
-      return primaryCluster.userIntent.enableYCQLAuth;
     }
     // We shouldn't get here!!!
     return null;
@@ -433,10 +399,10 @@ class UniverseForm extends Component {
         assignPublicIP: formValues[clusterType].assignPublicIP,
         useTimeSync: formValues[clusterType].useTimeSync,
         enableYSQL: self.getYSQLstate(),
-        enableYSQLAuth: self.getYSQLAuthstate(),
+        enableYSQLAuth: formValues[clusterType].enableYSQLAuth,
         ysqlPassword: formValues[clusterType].ysqlPassword,
         enableYCQL: self.getYCQLstate(),
-        enableYCQLAuth: self.getYCQLAuthstate(),
+        enableYCQLAuth: formValues[clusterType].enableYCQLAuth,
         ycqlPassword: formValues[clusterType].ycqlPassword,
         enableYEDIS: self.getYEDISstate(),
         enableNodeToNodeEncrypt: formValues[clusterType].enableNodeToNodeEncrypt,
@@ -462,22 +428,19 @@ class UniverseForm extends Component {
       };
       const currentProvider = self.getCurrentProvider(formValues[clusterType].provider).code;
       if (clusterType === 'primary') {
-        clusterIntent.masterGFlags = formValues.primary.masterGFlags
-          .filter((masterFlag) => {
-            return isNonEmptyString(masterFlag.name) && isNonEmptyString(masterFlag.value);
-          })
-          .map((masterFlag) => {
-            return { name: masterFlag.name.trim(), value: masterFlag.value.trim() };
+        const masterArr = [],
+          tServerArr = [];
+        if (isNonEmptyArray(formValues?.primary?.gFlags)) {
+          formValues.primary.gFlags.forEach((flag) => {
+            if (get(flag, 'MASTER', null))
+              masterArr.push({ name: flag?.Name, value: flag['MASTER'] });
+            if (get(flag, 'TSERVER', null))
+              tServerArr.push({ name: flag?.Name, value: flag['TSERVER'] });
           });
-        clusterIntent.tserverGFlags = formValues.primary.tserverGFlags
-          .filter((tserverFlag) => {
-            return isNonEmptyString(tserverFlag.name) && isNonEmptyString(tserverFlag.value);
-          })
-          .map((tserverFlag) => {
-            return { name: tserverFlag.name.trim(), value: tserverFlag.value.trim() };
-          });
-
-        if (currentProvider === 'aws' || currentProvider === 'azu') {
+        }
+        clusterIntent.masterGFlags = masterArr;
+        clusterIntent.tserverGFlags = tServerArr;
+        if (['aws', 'azu', 'gcp'].includes(currentProvider)) {
           clusterIntent.instanceTags = formValues.primary.instanceTags
             .filter((userTag) => {
               return isNonEmptyString(userTag.name) && isNonEmptyString(userTag.value);
@@ -488,15 +451,16 @@ class UniverseForm extends Component {
         }
       } else {
         if (isDefinedNotNull(formValues.primary)) {
-          clusterIntent.tserverGFlags = (
-              formValues.primary.tserverGFlags && formValues.primary.tserverGFlags
-              .filter((tserverFlag) => {
-                return isNonEmptyString(tserverFlag.name) && isNonEmptyString(tserverFlag.value);
-              })
-              .map((tserverFlag) => {
-                return { name: tserverFlag.name, value: tserverFlag.value.trim() };
-              })
-            ) || {};
+          clusterIntent.tserverGFlags =
+            (formValues.primary.tserverGFlags &&
+              formValues.primary.tserverGFlags
+                .filter((tserverFlag) => {
+                  return isNonEmptyString(tserverFlag.name) && isNonEmptyString(tserverFlag.value);
+                })
+                .map((tserverFlag) => {
+                  return { name: tserverFlag.name, value: tserverFlag.value.trim() };
+                })) ||
+            {};
         } else {
           const existingTserverGFlags = getPrimaryCluster(universeDetails.clusters).userIntent
             .tserverGFlags;
@@ -574,15 +538,15 @@ class UniverseForm extends Component {
       ];
     }
 
-    submitPayload.nodeDetailsSet = submitPayload.nodeDetailsSet.map(nodeDetail => {
+    submitPayload.nodeDetailsSet = submitPayload.nodeDetailsSet.map((nodeDetail) => {
       return {
         ...nodeDetail,
         cloudInfo: {
           ...nodeDetail.cloudInfo,
-          assignPublicIP: formValues["primary"].assignPublicIP
+          assignPublicIP: formValues['primary'].assignPublicIP
         }
-      }
-    })
+      };
+    });
 
     submitPayload.clusters = submitPayload.clusters.filter((c) => c.userIntent !== null);
     // filter clusters array if configuring(adding only) Read Replica due to server side validation
@@ -1031,6 +995,7 @@ class PrimaryClusterFields extends Component {
           'primary.replicationFactor',
           'primary.numNodes',
           'primary.instanceType',
+          'primary.gFlags',
           'primary.masterGFlags',
           'primary.tserverGFlags',
           'primary.instanceTags',

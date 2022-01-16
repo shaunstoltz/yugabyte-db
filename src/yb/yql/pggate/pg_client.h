@@ -15,22 +15,32 @@
 #define YB_YQL_PGGATE_PG_CLIENT_H
 
 #include <memory>
+#include <string>
 
 #include <boost/preprocessor/seq/for_each.hpp>
+#include <boost/version.hpp>
 
-#include "yb/rpc/proxy.h"
+#include "yb/client/client_fwd.h"
 
+#include "yb/common/pg_types.h"
+
+#include "yb/master/master_fwd.h"
+
+#include "yb/rpc/rpc_fwd.h"
+
+#include "yb/tserver/tserver_fwd.h"
 #include "yb/tserver/tserver_util_fwd.h"
-#include "yb/tserver/pg_client.pb.h"
+#include "yb/tserver/pg_client.fwd.h"
+
+#include "yb/util/monotime.h"
 
 #include "yb/yql/pggate/pg_gate_fwd.h"
-#include "yb/yql/pggate/pg_env.h"
 
 namespace yb {
 namespace pggate {
 
 #define YB_PG_CLIENT_SIMPLE_METHODS \
-    (AlterDatabase)(AlterTable)(BackfillIndex)(CreateDatabase)(CreateTable)(CreateTablegroup) \
+    (AlterDatabase)(AlterTable)(CreateDatabase)(CreateTable)(CreateTablegroup) \
     (DropDatabase)(DropTablegroup)(TruncateTable)
 
 class PgClient {
@@ -58,9 +68,13 @@ class PgClient {
   Result<client::YBTableName> DropTable(
       tserver::PgDropTableRequestPB* req, CoarseTimePoint deadline);
 
+  CHECKED_STATUS BackfillIndex(tserver::PgBackfillIndexRequestPB* req, CoarseTimePoint deadline);
+
   Result<int32> TabletServerCount(bool primary_only);
 
   Result<client::TabletServersInfo> ListLiveTabletServers(bool primary_only);
+
+  CHECKED_STATUS ValidatePlacement(const tserver::PgValidatePlacementRequestPB* req);
 
 #define YB_PG_CLIENT_SIMPLE_METHOD_DECLARE(r, data, method) \
   CHECKED_STATUS method(                             \

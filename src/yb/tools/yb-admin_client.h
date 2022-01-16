@@ -37,22 +37,29 @@
 
 #include <boost/optional.hpp>
 
-#include "yb/client/client.h"
 #include "yb/client/yb_table_name.h"
-#include "yb/util/status.h"
+
+#include "yb/rpc/rpc_controller.h"
+
+#include "yb/util/status_fwd.h"
 #include "yb/util/monotime.h"
 #include "yb/util/net/net_util.h"
 #include "yb/util/net/sockaddr.h"
+#include "yb/util/status.h"
+#include "yb/util/type_traits.h"
 #include "yb/common/entity_ids.h"
+#include "yb/consensus/consensus_types.pb.h"
+
+#include "yb/master/master_client.pb.h"
+#include "yb/master/master_cluster.pb.h"
+#include "yb/master/master_fwd.h"
+
 #include "yb/tools/yb-admin_cli.h"
-#include "yb/consensus/consensus.pb.h"
-#include "yb/master/master.pb.h"
-#include "yb/master/master.proxy.h"
-#include "yb/master/master_backup.proxy.h"
 #include "yb/rpc/rpc_fwd.h"
-#include "yb/rpc/messenger.h"
 
 namespace yb {
+
+class HybridTime;
 
 namespace consensus {
 class ConsensusServiceProxy;
@@ -144,8 +151,8 @@ class ClusterAdminClient {
   CHECKED_STATUS ChangeMasterConfig(
       const std::string& change_type,
       const std::string& peer_host,
-      int16 peer_port,
-      bool use_hostport);
+      uint16_t peer_port,
+      const std::string& peer_uuid = "");
 
   CHECKED_STATUS DumpMasterState(bool to_console);
 
@@ -205,7 +212,8 @@ class ClusterAdminClient {
 
   CHECKED_STATUS ListLeaderCounts(const client::YBTableName& table_name);
 
-  Result<unordered_map<string, int>> GetLeaderCounts(const client::YBTableName& table_name);
+  Result<std::unordered_map<std::string, int>> GetLeaderCounts(
+      const client::YBTableName& table_name);
 
   CHECKED_STATUS SetupRedisTable();
 
@@ -220,6 +228,10 @@ class ClusterAdminClient {
                                  bool add_indexes,
                                  int timeout_secs,
                                  bool is_compaction);
+
+  CHECKED_STATUS FlushSysCatalog();
+
+  CHECKED_STATUS CompactSysCatalog();
 
   CHECKED_STATUS ModifyTablePlacementInfo(const client::YBTableName& table_name,
                                           const std::string& placement_info,
@@ -260,6 +272,8 @@ class ClusterAdminClient {
 
   CHECKED_STATUS SplitTablet(const std::string& tablet_id);
 
+  CHECKED_STATUS CreateTransactionsStatusTable(const std::string& table_name);
+
   Result<TableNameResolver> BuildTableNameResolver();
 
   Result<std::string> GetMasterLeaderUuid();
@@ -267,6 +281,11 @@ class ClusterAdminClient {
   CHECKED_STATUS GetYsqlCatalogVersion();
 
   Result<rapidjson::Document> DdlLog();
+
+  // Upgrade YSQL cluster (all databases) to the latest version, applying necessary migrations.
+  // Note: Works with a tserver but is placed here (and not in yb-ts-cli) because it doesn't
+  //       look like this workflow is a good fit there.
+  CHECKED_STATUS UpgradeYsql();
 
  protected:
   // Fetch the locations of the replicas for a given tablet from the Master.
@@ -288,7 +307,7 @@ class ClusterAdminClient {
 
   // Fetch the latest list of tablet servers from the Master.
   CHECKED_STATUS ListTabletServers(
-      google::protobuf::RepeatedPtrField<master::ListTabletServersResponsePB::Entry>* servers);
+      google::protobuf::RepeatedPtrField<master::ListTabletServersResponsePB_Entry>* servers);
 
   // Look up the RPC address of the server with the specified UUID from the Master.
   Result<HostPort> GetFirstRpcAddressForTS(const std::string& uuid);
@@ -337,7 +356,7 @@ class ClusterAdminClient {
     }
   }
 
-  void ResetMasterProxy();
+  void ResetMasterProxy(const HostPort& leader_addr = HostPort());
 
   std::string master_addr_list_;
   HostPort init_master_addr_;
@@ -346,8 +365,13 @@ class ClusterAdminClient {
   std::unique_ptr<rpc::SecureContext> secure_context_;
   std::unique_ptr<rpc::Messenger> messenger_;
   std::unique_ptr<rpc::ProxyCache> proxy_cache_;
-  std::unique_ptr<master::MasterServiceProxy> master_proxy_;
-  std::unique_ptr<master::MasterBackupServiceProxy> master_backup_proxy_;
+  std::unique_ptr<master::MasterAdminProxy> master_admin_proxy_;
+  std::unique_ptr<master::MasterBackupProxy> master_backup_proxy_;
+  std::unique_ptr<master::MasterClientProxy> master_client_proxy_;
+  std::unique_ptr<master::MasterClusterProxy> master_cluster_proxy_;
+  std::unique_ptr<master::MasterDdlProxy> master_ddl_proxy_;
+  std::unique_ptr<master::MasterEncryptionProxy> master_encryption_proxy_;
+  std::unique_ptr<master::MasterReplicationProxy> master_replication_proxy_;
 
   // Skip yb_client_ and related fields' initialization.
   std::unique_ptr<client::YBClient> yb_client_;
@@ -370,15 +394,15 @@ class ClusterAdminClient {
   // Perform RPC call without checking Response structure for error
   template<class Response, class Request, class Object>
   Result<Response> InvokeRpcNoResponseCheck(
-      Status (Object::*func)(const Request&, Response*, rpc::RpcController*),
-      Object* obj, const Request& req, const char* error_message = nullptr);
+      Status (Object::*func)(const Request&, Response*, rpc::RpcController*) const,
+      const Object& obj, const Request& req, const char* error_message = nullptr);
 
   // Perform RPC call by calling InvokeRpcNoResponseCheck
   // and check Response structure for error by using its has_error method (if any)
   template<class Response, class Request, class Object>
   Result<Response> InvokeRpc(
-      Status (Object::*func)(const Request&, Response*, rpc::RpcController*),
-      Object* obj, const Request& req, const char* error_message = nullptr);
+      Status (Object::*func)(const Request&, Response*, rpc::RpcController*) const,
+      const Object& obj, const Request& req, const char* error_message = nullptr);
 
  private:
   using NamespaceMap = std::unordered_map<NamespaceId, master::NamespaceIdentifierPB>;

@@ -14,10 +14,10 @@ import static com.yugabyte.yw.common.AssertHelper.assertAuditEntry;
 import static com.yugabyte.yw.common.AssertHelper.assertBadRequest;
 import static com.yugabyte.yw.common.AssertHelper.assertInternalServerError;
 import static com.yugabyte.yw.common.AssertHelper.assertOk;
+import static com.yugabyte.yw.common.AssertHelper.assertPlatformException;
 import static com.yugabyte.yw.common.AssertHelper.assertValue;
 import static com.yugabyte.yw.common.AssertHelper.assertValues;
-import static com.yugabyte.yw.common.AssertHelper.assertYWSE;
-import static com.yugabyte.yw.common.AssertHelper.assertYWSuccess;
+import static com.yugabyte.yw.common.AssertHelper.assertYBPSuccess;
 import static com.yugabyte.yw.common.ModelFactory.createUniverse;
 import static com.yugabyte.yw.common.TestHelper.createTempFile;
 import static junit.framework.TestCase.assertNull;
@@ -45,9 +45,8 @@ import com.yugabyte.yw.common.FakeApiHelper;
 import com.yugabyte.yw.common.FakeDBApplication;
 import com.yugabyte.yw.common.ModelFactory;
 import com.yugabyte.yw.common.ShellResponse;
-import com.yugabyte.yw.common.TestHelper;
-import com.yugabyte.yw.forms.UniverseDefinitionTaskParams;
 import com.yugabyte.yw.forms.PlatformResults.YBPTask;
+import com.yugabyte.yw.forms.UniverseDefinitionTaskParams;
 import com.yugabyte.yw.models.AccessKey;
 import com.yugabyte.yw.models.AvailabilityZone;
 import com.yugabyte.yw.models.Customer;
@@ -58,15 +57,12 @@ import com.yugabyte.yw.models.Universe;
 import com.yugabyte.yw.models.Users;
 import com.yugabyte.yw.models.helpers.TaskType;
 import java.io.File;
-import java.io.IOException;
 import java.util.ArrayList;
 import java.util.HashMap;
 import java.util.Map;
 import java.util.UUID;
 import junitparams.JUnitParamsRunner;
 import junitparams.Parameters;
-import org.apache.commons.io.FileUtils;
-import org.junit.After;
 import org.junit.Before;
 import org.junit.Test;
 import org.junit.runner.RunWith;
@@ -93,7 +89,6 @@ public class CloudProviderApiControllerTest extends FakeDBApplication {
   public void setUp() {
     customer = ModelFactory.testCustomer();
     user = ModelFactory.testUser(customer);
-    new File(TestHelper.TMP_PATH).mkdirs();
     try {
       String kubeFile = createTempFile("test2.conf", "test5678");
       //      when(mockAccessManager.createKubernetesConfig(anyString(), anyMap(), anyBoolean()))
@@ -101,11 +96,6 @@ public class CloudProviderApiControllerTest extends FakeDBApplication {
     } catch (Exception e) {
       // Do nothing
     }
-  }
-
-  @After
-  public void tearDown() throws IOException {
-    FileUtils.deleteDirectory(new File(TestHelper.TMP_PATH));
   }
 
   private Result listProviders() {
@@ -284,7 +274,7 @@ public class CloudProviderApiControllerTest extends FakeDBApplication {
   public void testCreateMultiInstanceProviderWithSameNameAndCloud() {
     ModelFactory.awsProvider(customer);
     Result result =
-        assertYWSE(
+        assertPlatformException(
             () ->
                 createProviderTest(
                     buildProviderReq("aws", "Amazon"),
@@ -314,7 +304,7 @@ public class CloudProviderApiControllerTest extends FakeDBApplication {
     ObjectNode bodyJson = Json.newObject();
     bodyJson.put("code", "aws");
     Result result =
-        assertYWSE(
+        assertPlatformException(
             () ->
                 createProviderTest(
                     buildProviderReq("aws", null), REGION_CODES_FROM_CLOUD_API, UUID.randomUUID()));
@@ -341,7 +331,7 @@ public class CloudProviderApiControllerTest extends FakeDBApplication {
     providerReq.setConfig(reqConfig);
     Provider createdProvider =
         createProviderTest(providerReq, REGION_CODES_FROM_CLOUD_API, UUID.randomUUID());
-    Map<String, String> config = createdProvider.getConfig();
+    Map<String, String> config = createdProvider.getUnmaskedConfig();
     assertFalse(config.isEmpty());
     // We should technically check the actual content, but the keys are different between the
     // input payload and the saved config. (So what?! check the expected keys)
@@ -360,10 +350,11 @@ public class CloudProviderApiControllerTest extends FakeDBApplication {
     Provider p = ModelFactory.awsProvider(customer);
     AccessKey ak = AccessKey.create(p.uuid, "access-key-code", new AccessKey.KeyInfo());
     Result result = deleteProvider(p.uuid);
-    assertYWSuccess(result, "Deleted provider: " + p.uuid);
+    assertYBPSuccess(result, "Deleted provider: " + p.uuid);
     assertEquals(0, AccessKey.getAll(p.uuid).size());
     assertNull(Provider.get(p.uuid));
-    verify(mockAccessManager, times(1)).deleteKeyByProvider(p, ak.getKeyCode());
+    verify(mockAccessManager, times(1))
+        .deleteKeyByProvider(p, ak.getKeyCode(), ak.getKeyInfo().deleteRemote);
     assertAuditEntry(1, customer.uuid);
   }
 
@@ -389,7 +380,7 @@ public class CloudProviderApiControllerTest extends FakeDBApplication {
     InstanceType.createWithMetadata(p.uuid, "region-1", metaData);
     AccessKey ak = AccessKey.create(p.uuid, "access-key-code", new AccessKey.KeyInfo());
     Result result = deleteProvider(p.uuid);
-    assertYWSuccess(result, "Deleted provider: " + p.uuid);
+    assertYBPSuccess(result, "Deleted provider: " + p.uuid);
 
     assertEquals(0, InstanceType.findByProvider(p, mockConfig, mockConfigHelper).size());
     assertNull(Provider.get(p.uuid));
@@ -400,17 +391,18 @@ public class CloudProviderApiControllerTest extends FakeDBApplication {
     Provider p = ModelFactory.awsProvider(customer);
     AccessKey ak = AccessKey.create(p.uuid, "access-key-code", new AccessKey.KeyInfo());
     Result result = deleteProvider(p.uuid);
-    assertYWSuccess(result, "Deleted provider: " + p.uuid);
+    assertYBPSuccess(result, "Deleted provider: " + p.uuid);
     assertEquals(0, AccessKey.getAll(p.uuid).size());
     assertNull(Provider.get(p.uuid));
-    verify(mockAccessManager, times(1)).deleteKeyByProvider(p, ak.getKeyCode());
+    verify(mockAccessManager, times(1))
+        .deleteKeyByProvider(p, ak.getKeyCode(), ak.getKeyInfo().deleteRemote);
     assertAuditEntry(1, customer.uuid);
   }
 
   //  @Test
   public void testDeleteProviderWithInvalidProviderUUID() {
     UUID providerUUID = UUID.randomUUID();
-    Result result = assertYWSE(() -> deleteProvider(providerUUID));
+    Result result = assertPlatformException(() -> deleteProvider(providerUUID));
     assertBadRequest(result, "Invalid Provider UUID: " + providerUUID);
     assertAuditEntry(0, customer.uuid);
   }
@@ -431,7 +423,7 @@ public class CloudProviderApiControllerTest extends FakeDBApplication {
         Universe.saveDetails(universe.universeUUID, ApiUtils.mockUniverseUpdater(userIntent));
     customer.addUniverseUUID(universe.universeUUID);
     customer.save();
-    Result result = assertYWSE(() -> deleteProvider(p.uuid));
+    Result result = assertPlatformException(() -> deleteProvider(p.uuid));
     assertBadRequest(result, "Cannot delete Provider with Universes");
     assertAuditEntry(0, customer.uuid);
   }
@@ -440,7 +432,7 @@ public class CloudProviderApiControllerTest extends FakeDBApplication {
   public void testDeleteProviderWithoutAccessKey() {
     Provider p = ModelFactory.awsProvider(customer);
     Result result = deleteProvider(p.uuid);
-    assertYWSuccess(result, "Deleted provider: " + p.uuid);
+    assertYBPSuccess(result, "Deleted provider: " + p.uuid);
     assertNull(Provider.get(p.uuid));
     assertAuditEntry(1, customer.uuid);
   }
@@ -459,7 +451,7 @@ public class CloudProviderApiControllerTest extends FakeDBApplication {
   }
 
   //  @Test
-  public void testCreateAwsProviderWithInValidAWSCredentials() {
+  public void testCreateAwsProviderWithInvalidAWSCredentials() {
     ObjectNode bodyJson = Json.newObject();
     bodyJson.put("code", "aws");
     bodyJson.put("name", "aws-Provider");
@@ -471,7 +463,7 @@ public class CloudProviderApiControllerTest extends FakeDBApplication {
     bodyJson.set("config", configJson);
     CloudAPI mockCloudAPI = mock(CloudAPI.class);
     when(mockCloudAPIFactory.get(any())).thenReturn(mockCloudAPI);
-    Result result = assertYWSE(() -> createProvider(bodyJson));
+    Result result = assertPlatformException(() -> createProvider(bodyJson));
     assertBadRequest(result, "Invalid AWS Credentials.");
     assertAuditEntry(0, customer.uuid);
   }
@@ -486,7 +478,7 @@ public class CloudProviderApiControllerTest extends FakeDBApplication {
     bodyJson.set("config", configJson);
 
     mockDnsManagerListFailure("fail", 0);
-    Result result = assertYWSE(() -> createProvider(bodyJson));
+    Result result = assertPlatformException(() -> createProvider(bodyJson));
     verify(mockDnsManager, times(1)).listDnsRecord(any(), any());
     assertInternalServerError(result, "Invalid devops API response: ");
     assertAuditEntry(0, customer.uuid);
@@ -502,7 +494,7 @@ public class CloudProviderApiControllerTest extends FakeDBApplication {
     bodyJson.set("config", configJson);
 
     mockDnsManagerListFailure("fail", 1);
-    Result result = assertYWSE(() -> createProvider(bodyJson));
+    Result result = assertPlatformException(() -> createProvider(bodyJson));
     verify(mockDnsManager, times(1)).listDnsRecord(any(), any());
     assertInternalServerError(result, "Invalid devops API response: ");
     assertAuditEntry(0, customer.uuid);

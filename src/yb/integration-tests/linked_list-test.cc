@@ -47,27 +47,24 @@
 #include <functional>
 #include <set>
 
-#include <gflags/gflags.h>
 #include <glog/logging.h>
-#include <glog/stl_logging.h>
 #include <gtest/gtest.h>
 
-#include "yb/client/client.h"
 #include "yb/client/client-test-util.h"
+#include "yb/client/client.h"
+#include "yb/client/schema.h"
 #include "yb/client/session.h"
+#include "yb/client/table.h"
 #include "yb/client/table_creator.h"
 #include "yb/client/tablet_server.h"
 #include "yb/client/yb_op.h"
 
-#include "yb/common/ql_expr.h"
 #include "yb/common/ql_value.h"
-
-#include "yb/docdb/doc_rowwise_iterator.h"
 
 #include "yb/gutil/map-util.h"
 #include "yb/gutil/stl_util.h"
-#include "yb/gutil/strings/substitute.h"
 #include "yb/gutil/strings/split.h"
+#include "yb/gutil/strings/substitute.h"
 #include "yb/gutil/walltime.h"
 
 #include "yb/integration-tests/external_mini_cluster.h"
@@ -75,14 +72,14 @@
 
 #include "yb/server/hybrid_clock.h"
 
-#include "yb/tablet/tablet.h"
-
 #include "yb/util/blocking_queue.h"
 #include "yb/util/curl_util.h"
 #include "yb/util/hdr_histogram.h"
 #include "yb/util/random.h"
+#include "yb/util/status_log.h"
 #include "yb/util/stopwatch.h"
 #include "yb/util/test_util.h"
+#include "yb/util/thread.h"
 
 using namespace std::literals;
 
@@ -335,9 +332,7 @@ class LinkedListChainGenerator {
     QLAddInt64HashValue(req, this_key);
     table.AddInt64ColumnValue(req, kInsertTsColumnName, ts);
     table.AddInt64ColumnValue(req, kLinkColumnName, prev_key_);
-    RETURN_NOT_OK_PREPEND(
-        session->Apply(insert),
-        strings::Substitute("Unable to apply insert with key $0 at ts $1", this_key, ts));
+    session->Apply(insert);
     prev_key_ = this_key;
     return Status::OK();
   }
@@ -392,7 +387,7 @@ class ScopedRowUpdater {
       QLAddInt64HashValue(req, next_key);
       table_.AddBoolColumnValue(req, kUpdatedColumnName, true);
       ops.push_back(update);
-      CHECK_OK(session->Apply(update));
+      session->Apply(update);
       if (ops.size() >= 50) {
         FlushSessionOrDie(session, ops);
         ops.clear();
@@ -865,7 +860,7 @@ void LinkedListVerifier::SummarizeBrokenLinks(const std::vector<int64_t>& broken
   const int kMaxToLog = 100;
 
   for (int64_t broken : broken_links) {
-    int tablet = std::upper_bound(split_key_ints_.begin(),
+    auto tablet = std::upper_bound(split_key_ints_.begin(),
                                   split_key_ints_.end(),
                                   broken) - split_key_ints_.begin();
     DCHECK_GE(tablet, 0);
@@ -1094,7 +1089,7 @@ TEST_F(LinkedListTest, TestLoadWhileOneServerDownAndVerify) {
     }
     converged_tablets.insert(tablet_id);
     LOG(INFO) << "Waiting for replicas of tablet " << tablet_id << " to agree";
-    ASSERT_NO_FATALS(WaitForServersToAgree(
+    ASSERT_OK(WaitForServersToAgree(
         MonoDelta::FromSeconds(kWaitTime),
         tablet_servers_,
         tablet_id,

@@ -58,6 +58,10 @@ public class NodeDetails {
   public enum NodeState {
     // Set when a new node needs to be added into a Universe and has not yet been created.
     ToBeAdded(DELETE),
+    // Set when a new node is created in the cloud provider.
+    InstanceCreated(DELETE),
+    // Set when a node has gone through the Ansible set-up task.
+    ServerSetup(DELETE),
     // Set when a new node is provisioned and configured but before it is added into
     // the existing cluster.
     ToJoinCluster(REMOVE),
@@ -98,7 +102,9 @@ public class NodeDetails {
     // Set when TLS params (node-to-node and client-to-node) is being toggled
     ToggleTls(),
     // Set when the node is being resized to a new intended type
-    Resizing();
+    Resizing(),
+    // Set when the node is being upgraded to systemd from cron
+    SystemdUpgrade();
 
     private final NodeActionType[] allowedActions;
 
@@ -111,9 +117,22 @@ public class NodeDetails {
     }
   }
 
+  // Intermediate master state during universe update.
+  // The state is cleared once the Universe update succeeds.
+  public enum MasterState {
+    None,
+    ToStart,
+    Configured,
+    ToStop,
+  }
+
   // The current state of the node.
   @ApiModelProperty(value = "Node state", example = "Provisioned")
   public NodeState state;
+
+  // The current intermediate state of the master process.
+  @ApiModelProperty(value = "Master state", example = "ToStart")
+  public MasterState masterState;
 
   // True if this node is a master, along with port info.
   @ApiModelProperty(value = "True if this node is a master")
@@ -176,7 +195,11 @@ public class NodeDetails {
   // List of states which are considered in-transit and ops such as upgrade should not be allowed.
   public static final Set<NodeState> IN_TRANSIT_STATES =
       ImmutableSet.of(
-          NodeState.Removed, NodeState.Stopped, NodeState.Decommissioned, NodeState.Resizing);
+          NodeState.Removed,
+          NodeState.Stopped,
+          NodeState.Decommissioned,
+          NodeState.Resizing,
+          NodeState.SystemdUpgrade);
 
   @Override
   public NodeDetails clone() {
@@ -227,7 +250,8 @@ public class NodeDetails {
         || state == NodeState.Stopped
         || state == NodeState.Adding
         || state == NodeState.BeingDecommissioned
-        || state == NodeState.Decommissioned);
+        || state == NodeState.Decommissioned
+        || state == NodeState.SystemdUpgrade);
   }
 
   @JsonIgnore
@@ -251,6 +275,8 @@ public class NodeDetails {
   public boolean isRemovable() {
     return state == NodeState.ToBeAdded
         || state == NodeState.Adding
+        || state == NodeState.InstanceCreated
+        || state == NodeState.ServerSetup
         || state == NodeState.SoftwareInstalled
         || state == NodeState.Decommissioned;
   }
@@ -276,5 +302,13 @@ public class NodeDetails {
 
   public UUID getAzUuid() {
     return azUuid;
+  }
+
+  public String getNodeName() {
+    return nodeName;
+  }
+
+  public UUID getNodeUUID() {
+    return nodeUuid;
   }
 }

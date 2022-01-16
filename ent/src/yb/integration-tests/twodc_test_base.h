@@ -16,13 +16,16 @@
 
 #include <string>
 
-#include "yb/client/client.h"
+#include "yb/client/transaction_manager.h"
 
 #include "yb/integration-tests/cdc_test_util.h"
 #include "yb/integration-tests/mini_cluster.h"
-#include "yb/master/master.h"
+
+#include "yb/master/master_replication.fwd.h"
 
 #include "yb/util/test_util.h"
+#include "yb/util/tsan_util.h"
+
 #include "yb/yql/pgwrapper/libpq_utils.h"
 #include "yb/yql/pgwrapper/pg_wrapper.h"
 
@@ -107,7 +110,7 @@ class TwoDCTestBase : public YBTest {
   CHECKED_STATUS DeleteUniverseReplication(
       const std::string& universe_id, YBClient* client, MiniCluster* cluster);
 
-  uint32_t NumProducerTabletsPolled(MiniCluster* cluster);
+  size_t NumProducerTabletsPolled(MiniCluster* cluster);
 
   CHECKED_STATUS CorrectlyPollingAllTablets(MiniCluster* cluster, uint32_t num_producer_tablets);
 

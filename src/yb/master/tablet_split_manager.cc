@@ -15,30 +15,34 @@
 
 #include <chrono>
 
-#include <gflags/gflags.h>
-
 #include "yb/gutil/port.h"
-#include "yb/util/atomic.h"
+
+#include "yb/master/catalog_entity_info.h"
+#include "yb/master/cdc_consumer_split_driver.h"
+#include "yb/master/ts_descriptor.h"
+
 #include "yb/util/flag_tags.h"
-#include "yb/util/format.h"
+#include "yb/util/status_log.h"
 #include "yb/util/unique_lock.h"
 
-DEFINE_int32(process_split_tablet_candidates_interval_msec, 15000,
-             "The tick interval time for processing accumulated tablet split candidates.");
-DEFINE_int32(max_queued_split_candidates, 5,
+DEFINE_int32(process_split_tablet_candidates_interval_msec, 1000,
+             "The tick interval time for processing accumulated tablet split candidates. We will "
+             "initiate at most one new tablet split each interval. If there are no queued "
+             "candidates or we have too many outstanding splits on a given processing interval, "
+             "we will not initiate any new splits.");
+DEFINE_int32(max_queued_split_candidates, 10,
              "The max number of pending tablet split candidates we will hold onto. We potentially "
              "iterate through every candidate in the queue for each tablet we process in a tablet "
              "report so this size should be kept relatively small to avoid any issues.");
 
-DEFINE_bool(enable_automatic_tablet_splitting, false,
-            "If false, disables automatic tablet splitting driven from the yb-master side.");
+DECLARE_bool(enable_automatic_tablet_splitting);
 
 DEFINE_test_flag(bool, disable_split_tablet_candidate_processing, false,
                  "When true, do not process split tablet candidates.");
 
 DEFINE_int32(outstanding_tablet_split_limit, 5,
-             "Limit of the number of outstanding tablet splits. Limitation is "
-             "disabled if this value is set to 0.");
+             "Limit of the number of outstanding tablet splits. Limitation is disabled if this "
+             "value is set to 0.");
 
 constexpr int32 kHardLimitCandidateQueueSize = 100;
 
@@ -54,9 +58,12 @@ int32 GetCandidateQueueLimit() {
 } // namespace
 
 TabletSplitManager::TabletSplitManager(
-    TabletSplitCandidateFilterIf* filter, TabletSplitDriverIf* driver):
+    TabletSplitCandidateFilterIf* filter,
+    TabletSplitDriverIf* driver,
+    CDCConsumerSplitDriverIf* cdc_consumer_split_driver):
     filter_(filter),
-    driver_(driver) {}
+    driver_(driver),
+    cdc_consumer_split_driver_(cdc_consumer_split_driver) {}
 
 Status TabletSplitManager::Init() {
   process_tablet_candidates_task_.reset(new BackgroundTask(
@@ -76,6 +83,24 @@ void TabletSplitManager::Shutdown() {
 void TabletSplitManager::RemoveFailedProcessingTabletSplit(const TabletId& tablet_id) {
   UniqueLock<decltype(mutex_)> lock(mutex_);
   processing_tablets_to_split_children_.erase(tablet_id);
+}
+
+void TabletSplitManager::ProcessSplitTabletResult(
+    const Status& status,
+    const TableId& consumer_table_id,
+    const SplitTabletIds& split_tablet_ids) {
+  if (!status.ok()) {
+    LOG(WARNING) << "AsyncSplitTablet task failed with status: " << status;
+    RemoveFailedProcessingTabletSplit(split_tablet_ids.source);
+  } else {
+    // Update the xCluster tablet mapping.
+    Status s = cdc_consumer_split_driver_->UpdateCDCConsumerOnTabletSplit(
+        consumer_table_id, split_tablet_ids);
+    WARN_NOT_OK(s, Format(
+        "Encountered an error while updating the xCluster consumer tablet mapping. "
+        "Table id: $0, Split Tablets: $1",
+        consumer_table_id, split_tablet_ids.ToString()));
+  }
 }
 
 bool AllReplicasHaveFinshedCompaction(const TabletInfo& tablet_info) {

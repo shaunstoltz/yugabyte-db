@@ -11,22 +11,30 @@
 // under the License.
 //
 
+#include "yb/bfql/gen_opcodes.h"
+
 #include "yb/client/client.h"
+#include "yb/client/error.h"
 #include "yb/client/ql-dml-test-base.h"
 #include "yb/client/rejection_score_source.h"
+#include "yb/client/schema.h"
 #include "yb/client/session.h"
 #include "yb/client/table.h"
 #include "yb/client/table_handle.h"
 #include "yb/client/transaction.h"
+#include "yb/client/transaction_manager.h"
+#include "yb/client/yb_op.h"
 
 #include "yb/common/ql_value.h"
+#include "yb/common/schema.h"
 
+#include "yb/consensus/log.h"
 #include "yb/consensus/log_reader.h"
 #include "yb/consensus/raft_consensus.h"
-#include "yb/consensus/replica_state.h"
 #include "yb/consensus/retryable_requests.h"
 
 #include "yb/docdb/consensus_frontier.h"
+#include "yb/docdb/doc_key.h"
 #include "yb/docdb/docdb_rocksdb_util.h"
 
 #include "yb/rocksdb/metadata.h"
@@ -36,6 +44,8 @@
 
 #include "yb/server/hybrid_clock.h"
 
+#include "yb/tablet/tablet.h"
+#include "yb/tablet/tablet_metadata.h"
 #include "yb/tablet/tablet_options.h"
 #include "yb/tablet/tablet_peer.h"
 
@@ -43,12 +53,16 @@
 #include "yb/tserver/tablet_server.h"
 #include "yb/tserver/ts_tablet_manager.h"
 
-#include "yb/util/bfql/gen_opcodes.h"
+#include "yb/util/debug-util.h"
+#include "yb/util/format.h"
+#include "yb/util/metrics.h"
 #include "yb/util/random_util.h"
-#include "yb/util/scope_exit.h"
 #include "yb/util/size_literals.h"
-
+#include "yb/util/status_format.h"
+#include "yb/util/status_log.h"
+#include "yb/util/test_thread_holder.h"
 #include "yb/util/tsan_util.h"
+
 #include "yb/yql/cql/ql/util/statement_result.h"
 
 DECLARE_bool(TEST_combine_batcher_errors);
@@ -142,7 +156,7 @@ class QLStressTest : public QLDmlTestBase<MiniCluster> {
     auto* const req = op->mutable_request();
     QLAddInt32HashValue(req, key);
     table.AddStringColumnValue(req, kValueColumn, value);
-    EXPECT_OK(session->Apply(op));
+    session->Apply(op);
     return op;
   }
 
@@ -165,7 +179,7 @@ class QLStressTest : public QLDmlTestBase<MiniCluster> {
     auto* const req = op->mutable_request();
     QLAddInt32HashValue(req, key);
     table.AddColumns({kValueColumn}, req);
-    EXPECT_OK(session->Apply(op));
+    session->Apply(op);
     return op;
   }
 
@@ -499,7 +513,7 @@ TEST_F_EX(QLStressTest, Increment, QLStressTestIntValue) {
   }
 
   for (const auto& op : write_ops) {
-    ASSERT_OK(session->Apply(op));
+    session->Apply(op);
     futures.push_back(session->FlushFuture());
   }
 
@@ -1054,7 +1068,7 @@ TEST_F_EX(QLStressTest, DynamicCompactionPriority, QLStressDynamicCompactionPrio
       auto* const req = op->mutable_request();
       QLAddInt32HashValue(req, key);
       table_.AddStringColumnValue(req, kValueColumn, value);
-      ASSERT_OK(session->Apply(op));
+      session->Apply(op);
       ASSERT_OK(session->Flush());
       ASSERT_OK(CheckOp(op.get()));
       std::this_thread::sleep_for(100ms);

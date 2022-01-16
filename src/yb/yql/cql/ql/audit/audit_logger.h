@@ -22,7 +22,6 @@
 #ifndef YB_YQL_CQL_QL_AUDIT_AUDIT_LOGGER_H_
 #define YB_YQL_CQL_QL_AUDIT_AUDIT_LOGGER_H_
 
-#include "yb/common/common.pb.h"
 #include "yb/yql/cql/ql/ql_fwd.h"
 #include "yb/yql/cql/ql/exec/exec_context.h"
 #include "yb/yql/cql/ql/util/cql_message.h"
@@ -55,7 +54,7 @@ class AuditLogger {
   // because in that case separate commands might arrive to different tservers.
   //
   // If this returns non-OK status, batch mode isn't activated.
-  CHECKED_STATUS StartBatchRequest(int statements_count,
+  CHECKED_STATUS StartBatchRequest(size_t statements_count,
                                    IsRescheduled is_rescheduled);
 
   // Exits the batch request mode. Does nothing outside of a batch request.

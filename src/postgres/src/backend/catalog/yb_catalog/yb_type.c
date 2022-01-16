@@ -425,8 +425,13 @@ void YbDatumToEnum(Datum datum, int64 *data, int64 *bytes) {
 
 		/*
 		 * We expect datum to only contain a enum oid and does not already contain a sort order.
+		 * For OID >= 2147483648, Postgres sign-extends datum with 0xffffffff, which is -NaN and
+		 * does not reprensent a valid sort order.
 		 */
-		Assert(!(datum >> 32));
+		Assert(!(datum >> 32) || ((datum >> 32) == 0xffffffff));
+
+		/* Clear the high 4-byte in case it is not zero. */
+		datum &= 0xffffffff;
 
 		/*
 		 * Find the sort order of this enum oid.
@@ -601,6 +606,18 @@ Datum YbIntervalToDatum(const void *data, int64 bytes, const YBCPgTypeAttrs *typ
 	Interval* result = palloc(sz);
 	memcpy(result, data, sz);
 	return IntervalPGetDatum(result);
+}
+
+void YbDatumToGinNull(Datum datum, uint8 *data, int64 *bytes)
+{
+	*data = DatumGetUInt8(datum);
+}
+
+Datum YbGinNullToDatum(const uint8 *data,
+					   int64 bytes,
+					   const YBCPgTypeAttrs *type_attrs)
+{
+	return UInt8GetDatum(*data);
 }
 
 /*
@@ -1323,6 +1340,14 @@ static const YBCPgTypeEntity YBCVarLenByRefTypeEntity =
 	{ InvalidOid, YB_YQL_DATA_TYPE_BINARY, false, -1,
 		(YBCPgDatumToData)YbDatumToBinary,
 		(YBCPgDatumFromData)YbBinaryToDatum };
+
+/*
+ * Special type entity used for ybgin null categories.
+ */
+const YBCPgTypeEntity YBCGinNullTypeEntity =
+	{ InvalidOid, YB_YQL_DATA_TYPE_GIN_NULL, true, -1,
+		(YBCPgDatumToData)YbDatumToGinNull,
+		(YBCPgDatumFromData)YbGinNullToDatum };
 
 void YbGetTypeTable(const YBCPgTypeEntity **type_table, int *count) {
 	*type_table = YbTypeEntityTable;

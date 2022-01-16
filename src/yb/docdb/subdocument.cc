@@ -14,11 +14,14 @@
 #include "yb/docdb/subdocument.h"
 
 #include <map>
-#include <sstream>
 #include <vector>
 
-#include "yb/common/ql_bfunc.h"
+#include "yb/common/ql_type.h"
 #include "yb/common/ql_value.h"
+
+#include "yb/docdb/value_type.h"
+
+#include "yb/util/status.h"
 
 using std::endl;
 using std::make_pair;
@@ -38,6 +41,24 @@ SubDocument::SubDocument(ValueType value_type) : PrimitiveValue(value_type) {
     EnsureContainerAllocated();
   }
 }
+
+SubDocument::SubDocument() : SubDocument(ValueType::kObject) {}
+
+SubDocument::SubDocument(ListExtendOrder extend_order) : SubDocument(ValueType::kArray) {
+  extend_order_ = extend_order;
+}
+
+SubDocument::SubDocument(
+    const std::vector<PrimitiveValue> &elements, ListExtendOrder extend_order) {
+  type_ = ValueType::kArray;
+  extend_order_ = extend_order;
+  complex_data_structure_ = new ArrayContainer();
+  array_container().reserve(elements.size());
+  for (auto& elt : elements) {
+    array_container().emplace_back(elt);
+  }
+}
+
 
 SubDocument::~SubDocument() {
   switch (type_) {
@@ -206,7 +227,7 @@ const SubDocument* SubDocument::GetChild(const PrimitiveValue& key) const {
   }
 }
 
-pair<SubDocument*, bool> SubDocument::GetOrAddChild(const PrimitiveValue& key) {
+std::pair<SubDocument*, bool> SubDocument::GetOrAddChild(const PrimitiveValue& key) {
   DCHECK(IsObjectType(type_));
   EnsureContainerAllocated();
   auto& obj_container = object_container();
@@ -227,8 +248,7 @@ void SubDocument::AddListElement(SubDocument&& value) {
 }
 
 void SubDocument::SetChild(const PrimitiveValue& key, SubDocument&& value) {
-  type_ = ValueType::kObject;
-  EnsureContainerAllocated();
+  EnsureObjectAllocated();
   auto& obj_container = object_container();
   auto existing_element = obj_container.find(key);
   if (existing_element == obj_container.end()) {
@@ -345,6 +365,11 @@ void SubDocCollectionToStreamInternal(ostream& out,
   out << end_delim;
 }
 
+void SubDocument::EnsureObjectAllocated() {
+  type_ = ValueType::kObject;
+  EnsureContainerAllocated();
+}
+
 void SubDocument::EnsureContainerAllocated() {
   if (complex_data_structure_ == nullptr) {
     if (IsObjectType(type_)) {
@@ -356,7 +381,7 @@ void SubDocument::EnsureContainerAllocated() {
 }
 
 SubDocument SubDocument::FromQLValuePB(const QLValuePB& value,
-                                       ColumnSchema::SortingType sorting_type,
+                                       SortingType sorting_type,
                                        TSOpcode write_instr) {
   switch (value.value_case()) {
     case QLValuePB::kMapValue: {
@@ -476,6 +501,28 @@ void SubDocument::ToQLValuePB(const SubDocument& doc,
     }
   }
   LOG(FATAL) << "Unsupported datatype in SubDocument: " << ql_type->ToString();
+}
+
+int SubDocument::object_num_keys() const {
+  DCHECK(IsObjectType(type_));
+  if (!has_valid_object_container()) {
+    return 0;
+  }
+  assert(object_container().size() <= std::numeric_limits<int>::max());
+  return static_cast<int>(object_container().size());
+}
+
+bool SubDocument::container_allocated() const {
+  CHECK(IsCollectionType(type_));
+  return complex_data_structure_ != nullptr;
+}
+
+bool SubDocument::has_valid_object_container() const {
+  return (IsObjectType(type_)) && has_valid_container();
+}
+
+bool SubDocument::has_valid_array_container() const {
+  return type_ == ValueType::kArray && has_valid_container();
 }
 
 }  // namespace docdb

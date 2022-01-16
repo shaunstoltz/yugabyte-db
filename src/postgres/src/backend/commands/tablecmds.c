@@ -326,10 +326,11 @@ struct DropRelationCallbackState
 #define child_dependency_type(child_is_partition)	\
 	((child_is_partition) ? DEPENDENCY_AUTO : DEPENDENCY_NORMAL)
 
+static Oid GetTablegroupOidFromCommand(OptTableGroup *tablegroup);
+static Oid GetTablegroupOidFromCreateStmt(CreateStmt *stmt);
 static void truncate_check_rel(Relation rel);
 static List *MergeAttributes(List *schema, List *supers, char relpersistence,
-				bool is_partition, List **supOids, List **supconstr,
-				int *supOidCount);
+				bool is_partition, List **supconstr, int *supOidCount);
 static bool MergeCheckConstraint(List *constraints, char *name, Node *expr);
 static void MergeAttributesIntoExisting(Relation child_rel, Relation parent_rel);
 static void MergeConstraintsIntoExisting(Relation child_rel, Relation parent_rel);
@@ -476,7 +477,7 @@ static bool ATPrepChangePersistence(Relation rel, bool toLogged);
 static void ATPrepSetTableSpace(AlteredTableInfo *tab, Relation rel,
 					const char *tablespacename, LOCKMODE lockmode);
 static void ATExecSetTableSpace(Oid tableOid, Oid newTableSpace, LOCKMODE lockmode);
-static void ATExecPartedIdxSetTableSpace(Relation rel, Oid newTableSpace);
+static void ATExecSetTableSpaceNoStorage(Relation rel, Oid newTableSpace);
 static void ATExecSetRelOptions(Relation rel, List *defList,
 					AlterTableType operation,
 					LOCKMODE lockmode);
@@ -517,6 +518,7 @@ static void QueuePartitionConstraintValidation(List **wqueue, Relation scanrel,
 								   List *partConstraint,
 								   bool validate_default);
 static void CloneRowTriggersToPartition(Relation parent, Relation partition);
+static void DropClonedTriggersFromPartition(Oid partitionId);
 static ObjectAddress ATExecDetachPartition(Relation rel, RangeVar *name);
 static ObjectAddress ATExecAttachPartitionIdx(List **wqueue, Relation rel,
 						 RangeVar *name);
@@ -568,10 +570,12 @@ DefineRelation(CreateStmt *stmt, char relkind, Oid ownerId,
 	static char *validnsps[] = HEAP_RELOPT_NAMESPACES;
 	Oid			ofTypeId;
 	ObjectAddress address;
+	LOCKMODE	parentLockmode;
 
 	/* YB variables. */
 	Oid			rowTypeId = InvalidOid;
 	bool		relisshared = false;
+	bool		use_initdb_acl = false;
 
 	/*
 	 * Truncate relname to appropriate length (probably a waste of time, as
@@ -596,6 +600,18 @@ DefineRelation(CreateStmt *stmt, char relkind, Oid ownerId,
 		relkind = RELKIND_PARTITIONED_TABLE;
 	}
 
+	if (IsYugaByteEnabled() && stmt->tablespacename &&
+		stmt->relation->relpersistence == RELPERSISTENCE_TEMP)
+	{
+		/*
+		 * Disable setting tablespaces for temporary tables in Yugabyte
+		 * clusters.
+		 */
+		ereport(ERROR,
+				(errcode(ERRCODE_INVALID_TABLE_DEFINITION),
+				 errmsg("cannot set tablespaces for temporary tables")));
+	}
+
 	/*
 	 * Look up the namespace in which we are supposed to create the relation,
 	 * check we have permission to create there, lock it against concurrent
@@ -617,12 +633,71 @@ DefineRelation(CreateStmt *stmt, char relkind, Oid ownerId,
 				 errmsg("cannot create temporary table within security-restricted operation")));
 
 	/*
+	 * Determine the lockmode to use when scanning parents.  A self-exclusive
+	 * lock is needed here.
+	 *
+	 * For regular inheritance, if two backends attempt to add children to the
+	 * same parent simultaneously, and that parent has no pre-existing
+	 * children, then both will attempt to update the parent's relhassubclass
+	 * field, leading to a "tuple concurrently updated" error.  Also, this
+	 * interlocks against a concurrent ANALYZE on the parent table, which
+	 * might otherwise be attempting to clear the parent's relhassubclass
+	 * field, if its previous children were recently dropped.
+	 *
+	 * If the child table is a partition, then we instead grab an exclusive
+	 * lock on the parent because its partition descriptor will be changed by
+	 * addition of the new partition.
+	 */
+	parentLockmode = (stmt->partbound != NULL ? AccessExclusiveLock :
+					  ShareUpdateExclusiveLock);
+
+	/* Determine the list of OIDs of the parents. */
+	inheritOids = NIL;
+	foreach(listptr, stmt->inhRelations)
+	{
+		RangeVar   *rv = (RangeVar *) lfirst(listptr);
+		Oid			parentOid;
+
+		parentOid = RangeVarGetRelid(rv, parentLockmode, false);
+
+		/*
+		 * Reject duplications in the list of parents.
+		 */
+		if (list_member_oid(inheritOids, parentOid))
+			ereport(ERROR,
+					(errcode(ERRCODE_DUPLICATE_TABLE),
+					 errmsg("relation \"%s\" would be inherited from more than once",
+							get_rel_name(parentOid))));
+
+		inheritOids = lappend_oid(inheritOids, parentOid);
+	}
+
+	/*
 	 * Select tablespace to use.  If not specified, use default tablespace
 	 * (which may in turn default to database's default).
 	 */
 	if (stmt->tablespacename)
 	{
 		tablespaceId = get_tablespace_oid(stmt->tablespacename, false);
+	}
+	else if (stmt->partbound)
+	{
+		HeapTuple	tup;
+
+		/*
+		 * For partitions, when no other tablespace is specified, we default
+		 * the tablespace to the parent partitioned table's.
+		 */
+		Assert(list_length(inheritOids) == 1);
+		tup = SearchSysCache1(RELOID,
+							  DatumGetObjectId(linitial_oid(inheritOids)));
+
+		tablespaceId = ((Form_pg_class) GETSTRUCT(tup))->reltablespace;
+
+		if (!OidIsValid(tablespaceId))
+			tablespaceId = GetDefaultTablespace(stmt->relation->relpersistence);
+
+		ReleaseSysCache(tup);
 	}
 	else
 	{
@@ -696,57 +771,7 @@ DefineRelation(CreateStmt *stmt, char relkind, Oid ownerId,
 		}
 	}
 
-	/*
-	 * Select tablegroup to use. If not specified, InvalidOid.
-	 * Disallow mixing of COLOCATED=true/false syntax and TABLEGROUP. Cannot use tablegroups
-	 * in colocated databases.
-	 * If the pg_tablegroup system table has not been created, get_tablegroup_oid will produce
-	 * an error.
-	 */
-	Oid tablegroupId = InvalidOid;
-	if (stmt->tablegroup)
-	{
-		OptTableGroup *grp = stmt->tablegroup;
-		if (MyDatabaseColocated)
-			ereport(ERROR,
-					(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
-					 errmsg("cannot use tablegroups in a colocated database")));
-		else if (!grp->has_tablegroup)
-		{
-			ereport(ERROR,
-					(errcode(ERRCODE_INVALID_TABLE_DEFINITION),
-					 errmsg("Cannot use NO TABLEGROUP in CREATE TABLE statement.")));
-		}
-		else
-			tablegroupId = get_tablegroup_oid(grp->tablegroup_name, false);
-	}
-
-	/*
-	 * Check permissions for tablegroup. To create a table within a tablegroup, a user must
-	 * either be a superuser, the owner of the tablegroup, or have create perms on it.
-	 */
-	if (OidIsValid(tablegroupId) && !pg_tablegroup_ownercheck(tablegroupId, GetUserId()))
-	{
-		AclResult  aclresult;
-
-		aclresult = pg_tablegroup_aclcheck(tablegroupId, GetUserId(), ACL_CREATE);
-		if (aclresult != ACLCHECK_OK)
-			aclcheck_error(aclresult, OBJECT_TABLEGROUP,
-						   get_tablegroup_name(tablegroupId));
-	}
-
-	/*
-	 * Prepend to stmt->options to be parsed for reloptions if tablegroupId is valid.
-	 * We set this here instead of in parse_utilcmd since we need to do the above
-	 * preprocessing and RBAC checks first. This still happens before transformReloptions
-	 * so this option is included in the reloptions text array.
-	 */
-	if (OidIsValid(tablegroupId))
-	{
-		stmt->options = lcons(makeDefElem("tablegroup",
-										  (Node *) makeInteger(tablegroupId), -1),
-										  stmt->options);
-	}
+	Oid tablegroupId = GetTablegroupOidFromCreateStmt(stmt);
 
 	/* Identify user ID that will own the table */
 	if (!OidIsValid(ownerId))
@@ -784,10 +809,10 @@ DefineRelation(CreateStmt *stmt, char relkind, Oid ownerId,
 	 * modified by MergeAttributes.)
 	 */
 	stmt->tableElts =
-		MergeAttributes(stmt->tableElts, stmt->inhRelations,
+		MergeAttributes(stmt->tableElts, inheritOids,
 						stmt->relation->relpersistence,
 						stmt->partbound != NULL,
-						&inheritOids, &old_constraints, &parentOidCount);
+						&old_constraints, &parentOidCount);
 
 	/*
 	 * Create a tuple descriptor from the relation schema.  Note that this
@@ -885,6 +910,22 @@ DefineRelation(CreateStmt *stmt, char relkind, Oid ownerId,
 	/* Handles WITH (row_type_oid = x). */
 	rowTypeId = GetRowTypeOidFromRelOptions(stmt->options);
 
+	if (relkind == RELKIND_RELATION)
+	{
+		use_initdb_acl = IsYsqlUpgrade && IsSystemNamespace(namespaceId);
+	}
+	else
+	{
+		/* Handles WITH (use_initdb_acl = x). */
+		use_initdb_acl = YbGetUseInitdbAclFromRelOptions(stmt->options);
+		if (use_initdb_acl && !(IsYsqlUpgrade && IsSystemNamespace(namespaceId)))
+		{
+			ereport(ERROR,
+					(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+					 errmsg("use_initdb_acl cannot be used outside of YSQL upgrade for pg_catalog")));
+		}
+	}
+
 	/*
 	 * Create the relation.  Inherited defaults and constraints are passed in
 	 * for immediate handling --- since they don't need parsing, they can be
@@ -912,7 +953,8 @@ DefineRelation(CreateStmt *stmt, char relkind, Oid ownerId,
 										  allowSystemTableMods,
 										  false,
 										  InvalidOid,
-										  typaddress);
+										  typaddress,
+										  use_initdb_acl);
 
 	/*
 	 * We must bump the command counter to make the newly-created relation
@@ -1146,6 +1188,92 @@ DefineRelation(CreateStmt *stmt, char relkind, Oid ownerId,
 	relation_close(rel, NoLock);
 
 	return address;
+}
+
+/*
+ * Select tablegroup to use. If not specified, InvalidOid.
+ * Will produce an error if the pg_tablegroup system table has not been created.
+ * Checks both
+ *  - the reloptions array (for syntax `CREATE TABLE (...) WITH (tablegroup=###);`)
+ *  - the tablegroup syntax (for syntax `CREATE TABLE (...) TABLEGROUP grp;`)
+ * Disallows
+ *  - mixing the two tablegroup syntaxes
+ *  - supplying an invalid tablegroup oid
+ *  - creating a table within a tablegroup without the correct permissions
+ */
+static Oid
+GetTablegroupOidFromCreateStmt(CreateStmt *stmt)
+{
+	Oid tablegroupId = InvalidOid;
+
+	Oid tablegroupIdFromOptions = GetTablegroupOidFromRelOptions(stmt->options);
+	Oid tablegroupIdFromCommand = GetTablegroupOidFromCommand(stmt->tablegroup);
+
+	if (tablegroupIdFromOptions != InvalidOid && tablegroupIdFromCommand != InvalidOid)
+		ereport(ERROR,
+		        (errcode(ERRCODE_INVALID_TABLE_DEFINITION),
+		         errmsg("cannot specify both tablegroup and tablegroup oid")));
+	else if (tablegroupIdFromOptions != InvalidOid)
+	{
+		/* Check that this OID corresponds to a tablegroup */
+		char *name = get_tablegroup_name(tablegroupIdFromOptions);
+		if (name == NULL)
+			ereport(ERROR,
+			        (errcode(ERRCODE_INVALID_TABLE_DEFINITION),
+			         errmsg("tablegroup with oid %d does not exist", tablegroupIdFromOptions)));
+
+		tablegroupId = tablegroupIdFromOptions;
+	}
+	else if (tablegroupIdFromCommand != InvalidOid)
+		tablegroupId = tablegroupIdFromCommand;
+	else
+		return InvalidOid;
+
+	/*
+	 * Check permissions for tablegroup. To create a table within a tablegroup, a user must
+	 * either be a superuser, the owner of the tablegroup, or have create perms on it.
+	 */
+	if (!pg_tablegroup_ownercheck(tablegroupId, GetUserId()))
+	{
+		AclResult  aclresult;
+
+		aclresult = pg_tablegroup_aclcheck(tablegroupId, GetUserId(), ACL_CREATE);
+		if (aclresult != ACLCHECK_OK)
+			aclcheck_error(aclresult, OBJECT_YBTABLEGROUP,
+						   get_tablegroup_name(tablegroupId));
+	}
+
+	if (tablegroupIdFromCommand != InvalidOid)
+	{
+		/*
+		 * Prepend to stmt->options to be parsed for reloptions if tablegroupId is valid. We need
+		 * to do the preprocessing and RBAC checks first. This still happens before
+		 * transformReloptions so this option is included in the reloptions text array.
+		 */
+		stmt->options = lcons(makeDefElem("tablegroup",
+										  (Node *) makeInteger(tablegroupIdFromCommand), -1),
+										  stmt->options);
+	}
+
+	return tablegroupId;
+}
+
+/*
+ * Returns the Oid of the tablegroup from the CREATE TABLE ... TABLEGROUP grp; syntax
+ * Returns InvalidOid if no tablegroup was specified.
+ */
+static Oid
+GetTablegroupOidFromCommand(OptTableGroup *tablegroup)
+{
+	if (!tablegroup)
+		return InvalidOid;
+
+	if (!tablegroup->has_tablegroup)
+		ereport(ERROR,
+				(errcode(ERRCODE_INVALID_TABLE_DEFINITION),
+				 errmsg("Cannot use NO TABLEGROUP in CREATE TABLE statement.")));
+
+	return get_tablegroup_oid(tablegroup->tablegroup_name, false);
 }
 
 /*
@@ -1955,12 +2083,11 @@ storage_name(char c)
  * Input arguments:
  * 'schema' is the column/attribute definition for the table. (It's a list
  *		of ColumnDef's.) It is destructively changed.
- * 'supers' is a list of names (as RangeVar nodes) of parent relations.
+ * 'supers' is a list of OIDs of parent relations, already locked by caller.
  * 'relpersistence' is a persistence type of the table.
  * 'is_partition' tells if the table is a partition
  *
  * Output arguments:
- * 'supOids' receives a list of the OIDs of the parent relations.
  * 'supconstr' receives a list of constraints belonging to the parents,
  *		updated as necessary to be valid for the child.
  * 'supOidCount' is set to the number of parents that have OID columns.
@@ -2009,12 +2136,10 @@ storage_name(char c)
  */
 static List *
 MergeAttributes(List *schema, List *supers, char relpersistence,
-				bool is_partition, List **supOids, List **supconstr,
-				int *supOidCount)
+				bool is_partition, List **supconstr, int *supOidCount)
 {
 	ListCell   *entry;
 	List	   *inhSchema = NIL;
-	List	   *parentOids = NIL;
 	List	   *constraints = NIL;
 	int			parentsWithOids = 0;
 	bool		have_bogus_defaults = false;
@@ -2116,31 +2241,15 @@ MergeAttributes(List *schema, List *supers, char relpersistence,
 	child_attno = 0;
 	foreach(entry, supers)
 	{
-		RangeVar   *parent = (RangeVar *) lfirst(entry);
+		Oid			parent = lfirst_oid(entry);
 		Relation	relation;
 		TupleDesc	tupleDesc;
 		TupleConstr *constr;
 		AttrNumber *newattno;
 		AttrNumber	parent_attno;
 
-		/*
-		 * A self-exclusive lock is needed here.  If two backends attempt to
-		 * add children to the same parent simultaneously, and that parent has
-		 * no pre-existing children, then both will attempt to update the
-		 * parent's relhassubclass field, leading to a "tuple concurrently
-		 * updated" error.  Also, this interlocks against a concurrent ANALYZE
-		 * on the parent table, which might otherwise be attempting to clear
-		 * the parent's relhassubclass field, if its previous children were
-		 * recently dropped.
-		 *
-		 * If the child table is a partition, then we instead grab an
-		 * exclusive lock on the parent because its partition descriptor will
-		 * be changed by addition of the new partition.
-		 */
-		if (!is_partition)
-			relation = heap_openrv(parent, ShareUpdateExclusiveLock);
-		else
-			relation = heap_openrv(parent, AccessExclusiveLock);
+		/* caller already got lock */
+		relation = heap_open(parent, NoLock);
 
 		/*
 		 * Check for active uses of the parent partitioned table in the
@@ -2159,12 +2268,12 @@ MergeAttributes(List *schema, List *supers, char relpersistence,
 			ereport(ERROR,
 					(errcode(ERRCODE_WRONG_OBJECT_TYPE),
 					 errmsg("cannot inherit from partitioned table \"%s\"",
-							parent->relname)));
+							RelationGetRelationName(relation))));
 		if (relation->rd_rel->relispartition && !is_partition)
 			ereport(ERROR,
 					(errcode(ERRCODE_WRONG_OBJECT_TYPE),
 					 errmsg("cannot inherit from partition \"%s\"",
-							parent->relname)));
+							RelationGetRelationName(relation))));
 
 		if (relation->rd_rel->relkind != RELKIND_RELATION &&
 			relation->rd_rel->relkind != RELKIND_FOREIGN_TABLE &&
@@ -2172,7 +2281,7 @@ MergeAttributes(List *schema, List *supers, char relpersistence,
 			ereport(ERROR,
 					(errcode(ERRCODE_WRONG_OBJECT_TYPE),
 					 errmsg("inherited relation \"%s\" is not a table or foreign table",
-							parent->relname)));
+							RelationGetRelationName(relation))));
 
 		/*
 		 * If the parent is permanent, so must be all of its partitions.  Note
@@ -2194,7 +2303,7 @@ MergeAttributes(List *schema, List *supers, char relpersistence,
 					 errmsg(!is_partition
 							? "cannot inherit from temporary relation \"%s\""
 							: "cannot create a permanent relation as partition of temporary relation \"%s\"",
-							parent->relname)));
+							RelationGetRelationName(relation))));
 
 		/* If existing rel is temp, it must belong to this session */
 		if (relation->rd_rel->relpersistence == RELPERSISTENCE_TEMP &&
@@ -2212,17 +2321,6 @@ MergeAttributes(List *schema, List *supers, char relpersistence,
 		if (!pg_class_ownercheck(RelationGetRelid(relation), GetUserId()))
 			aclcheck_error(ACLCHECK_NOT_OWNER, get_relkind_objtype(relation->rd_rel->relkind),
 						   RelationGetRelationName(relation));
-
-		/*
-		 * Reject duplications in the list of parents.
-		 */
-		if (list_member_oid(parentOids, RelationGetRelid(relation)))
-			ereport(ERROR,
-					(errcode(ERRCODE_DUPLICATE_TABLE),
-					 errmsg("relation \"%s\" would be inherited from more than once",
-							parent->relname)));
-
-		parentOids = lappend_oid(parentOids, RelationGetRelid(relation));
 
 		if (relation->rd_rel->relhasoids)
 			parentsWithOids++;
@@ -2643,7 +2741,6 @@ MergeAttributes(List *schema, List *supers, char relpersistence,
 		}
 	}
 
-	*supOids = parentOids;
 	*supconstr = constraints;
 	*supOidCount = parentsWithOids;
 	return schema;
@@ -4444,11 +4541,14 @@ ATExecCmd(List **wqueue, AlteredTableInfo *tab, Relation *mutable_rel,
 			break;
 		case AT_SetTableSpace:	/* SET TABLESPACE */
 			/*
-			 * Only do this for partitioned indexes, for which this is just
-			 * a catalog change.  Other relation types are handled by Phase 3.
+			 * Only do this for partitioned tables and indexes or when Yugabyte is
+			 * enabled, for which this is just a catalog change.  Other relation types
+			 * which have storage are handled by Phase 3.
 			 */
-			if (rel->rd_rel->relkind == RELKIND_PARTITIONED_INDEX)
-				ATExecPartedIdxSetTableSpace(rel, tab->newTableSpace);
+			if (IsYBRelation(rel) ||
+				rel->rd_rel->relkind == RELKIND_PARTITIONED_TABLE ||
+				rel->rd_rel->relkind == RELKIND_PARTITIONED_INDEX)
+				ATExecSetTableSpaceNoStorage(rel, tab->newTableSpace);
 
 			break;
 		case AT_SetRelOptions:	/* SET (...) */
@@ -4583,9 +4683,7 @@ ATRewriteTables(AlterTableStmt *parsetree, List **wqueue, LOCKMODE lockmode)
 		 * Foreign tables have no storage, nor do partitioned tables and
 		 * indexes.
 		 */
-		if (tab->relkind == RELKIND_FOREIGN_TABLE ||
-			tab->relkind == RELKIND_PARTITIONED_TABLE ||
-			tab->relkind == RELKIND_PARTITIONED_INDEX)
+		if (!RELKIND_CAN_HAVE_STORAGE(tab->relkind))
 			continue;
 
 		/*
@@ -4746,7 +4844,7 @@ ATRewriteTables(AlterTableStmt *parsetree, List **wqueue, LOCKMODE lockmode)
 			 * If we had SET TABLESPACE but no reason to reconstruct tuples,
 			 * just do a block-by-block copy.
 			 */
-			if (tab->newTableSpace)
+			if (tab->newTableSpace && !IsYBRelationById(tab->relid))
 				ATExecSetTableSpace(tab->relid, tab->newTableSpace, lockmode);
 		}
 	}
@@ -7553,6 +7651,39 @@ YBMoveRelDependencies(Relation old_rel, Relation new_rel,
 }
 
 /*
+ * Filter the DefElem list, removing all reloptions that should not be
+ * carried over when cloning the relation.
+ */
+static List *
+YBExcludeNonCopyableOptions(List *options)
+{
+	if (options)
+	{
+		ListCell   *prev = NULL;
+		ListCell   *next;
+
+		for (ListCell *curr = list_head(options); curr != NULL; curr = next)
+		{
+			next = lnext(curr);
+			DefElem *elem = lfirst_node(DefElem, curr);
+
+			/*
+			 * - Tablegroup is stored as a reloption but should not be copied
+			 *   as such, there's a separate mechanism for it.
+			 */
+			if (strcmp(elem->defname, "tablegroup") == 0)
+			{
+				options = list_delete_cell(options, curr, prev);
+				break; /* since we only have one case so far, we can stop early. */
+			}
+			else
+				prev = curr;
+		}
+	}
+	return options;
+}
+
+/*
  * Primary key is an inherent part of a DocDB table, we can't literally "add"
  * a primary key to an existing table.
  * As a workaround, we create a new table with the desired schema and replace
@@ -7572,6 +7703,7 @@ YBCloneRelationSetPrimaryKey(Relation* mutable_rel, IndexStmt* stmt)
 	AttrNumber*  new2old_attmap;
 	Oid          old_relid, new_relid;
 	bool         is_range_pk = false;
+	bool         is_null;
 
 	Relation     pg_constraint, pg_trigger, pg_depend;
 	ScanKeyData  key;
@@ -7674,20 +7806,26 @@ YBCloneRelationSetPrimaryKey(Relation* mutable_rel, IndexStmt* stmt)
 	create_stmt->tablegroup     = NULL;
 
 	/*
-	 * Colocation support is further complicated by the fact that we can't
-	 * verify it via pure SQL, see #6159.
+	 * Initialize reloptions.
+	 * Note that we're not allowed to look for reloptions in rd_rel, we have to look up
+	 * the real HeapTuple.
 	 */
-	const Oid tablegroup_id = RelationGetTablegroup(*mutable_rel);
-	if (OidIsValid(tablegroup_id))
+
+	tuple = SearchSysCache1(RELOID, ObjectIdGetDatum(old_relid));
+	Datum datum = SysCacheGetAttr(RELOID, tuple, Anum_pg_class_reloptions, &is_null);
+	if (!is_null)
+		create_stmt->options = untransformRelOptions(datum);
+	ReleaseSysCache(tuple);
+
+	create_stmt->options = YBExcludeNonCopyableOptions(create_stmt->options);
+
+	const Oid tablegroup_oid = RelationGetTablegroup(*mutable_rel);
+	if (OidIsValid(tablegroup_oid))
 	{
 		create_stmt->tablegroup = makeNode(OptTableGroup);
 		create_stmt->tablegroup->has_tablegroup = true;
-		create_stmt->tablegroup->tablegroup_name = get_tablegroup_name(tablegroup_id);
+		create_stmt->tablegroup->tablegroup_name = get_tablegroup_name(tablegroup_oid);
 		Assert(create_stmt->tablegroup->tablegroup_name);
-	} else if ((*mutable_rel)->rd_options && MyDatabaseColocated) {
-		const bool colocated = RelationGetColocated(*mutable_rel);
-		create_stmt->options = lappend(create_stmt->options,
-			makeDefElem("colocated", (Node *) makeInteger(colocated), -1));
 	}
 
 	/* The only constraint we care about here is the PK constraint needed for YB. */
@@ -8005,42 +8143,7 @@ YBCloneRelationSetPrimaryKey(Relation* mutable_rel, IndexStmt* stmt)
 		RenameRelation(rename_stmt);
 		CommandCounterIncrement();
 
-		/* The tablegroup attribute of a table is not a reloption at syntax level
-		 * but it is recorded as a reloption by DefineIndex (which makes a special
-		 * case only for "tablegroup" to convert it to a reloption). As a result,
-		 * if the old table has a tablegroup, then every index on the old table
-		 * including the dummy pkey index has also stored a reloption for the
-		 * tablegroup when DefineIndex was called for it.
-		 *
-		 * When generateClonedIndexStmt is called to make a new index statement, it
-		 * will have cloned the old index's reloptions, which includes the special
-		 * reloption for "tablegroup".
-		 *
-		 * Next we will call DefineIndex for each cloned index statement. DefineIndex
-		 * will again make a special case for "tablegroup" and convert "tablegroup"
-		 * to another reloption. This means that the new index statement gets two
-		 * "tablegroup" reloption instances and caused postgres error:
-		 *   ERROR: parameter "tablegroup" specified more than once
-		 * To prevent this error, remove "tablegroup" reloption if there is one.
-		 */
-		if (idx_stmt->options)
-		{
-			ListCell   *option;
-			ListCell   *prev;
-
-			prev = NULL;
-			foreach(option, idx_stmt->options)
-			{
-				DefElem *elem = lfirst_node(DefElem, option);
-				if (strcmp(elem->defname, "tablegroup") == 0)
-				{
-					idx_stmt->options = list_delete_cell(idx_stmt->options, option, prev);
-					break;
-				}
-				else
-					prev = option;
-			}
-		}
+		idx_stmt->options = YBExcludeNonCopyableOptions(idx_stmt->options);
 
 		/* Create a new index taking up the freed name. */
 		idx_stmt->idxname = pstrdup(idx_orig_name);
@@ -12490,6 +12593,18 @@ ATPrepSetTableSpace(AlteredTableInfo *tab, Relation rel, const char *tablespacen
 {
 	Oid			tablespaceId;
 
+	if (IsYugaByteEnabled() && tablespacename &&
+		rel->rd_rel->relpersistence == RELPERSISTENCE_TEMP)
+	{
+		/*
+		 * Disable setting tablespaces for temporary tables in Yugabyte
+		 * clusters.
+		 */
+		ereport(ERROR,
+				(errcode(ERRCODE_INVALID_TABLE_DEFINITION),
+				 errmsg("cannot set tablespaces for temporary tables")));
+	}
+
 	/* Check that the tablespace exists */
 	tablespaceId = get_tablespace_oid(tablespacename, false);
 
@@ -12737,6 +12852,12 @@ ATExecSetTableSpace(Oid tableOid, Oid newTableSpace, LOCKMODE lockmode)
 	rel = relation_open(tableOid, lockmode);
 
 	/*
+	 * Should only be called on relations having storage, namely non-Yugabyte and
+	 * non-parititoned relations.
+	 */
+	Assert(!IsYBRelation(rel) && RELKIND_CAN_HAVE_STORAGE(rel->rd_rel->relkind));
+
+	/*
 	 * No work if no change in tablespace.
 	 */
 	oldTableSpace = rel->rd_rel->reltablespace;
@@ -12880,19 +13001,27 @@ ATExecSetTableSpace(Oid tableOid, Oid newTableSpace, LOCKMODE lockmode)
 }
 
 /*
- * Special handling of ALTER TABLE SET TABLESPACE for partitioned indexes,
- * which have no storage (so not handled in Phase 3 like other relation types)
+ * Special handling of ALTER TABLE SET TABLESPACE for relations with no
+ * storage that have an interest in preserving tablespace.
+ *
+ * Since these have no storage the tablespace can be updated with a simple
+ * metadata only operation to update the tablespace.
  */
 static void
-ATExecPartedIdxSetTableSpace(Relation rel, Oid newTableSpace)
+ATExecSetTableSpaceNoStorage(Relation rel, Oid newTableSpace)
 {
 	HeapTuple	tuple;
 	Oid			oldTableSpace;
 	Relation	pg_class;
 	Form_pg_class rd_rel;
-	Oid			indexOid = RelationGetRelid(rel);
+	Oid			reloid = RelationGetRelid(rel);
 
-	Assert(rel->rd_rel->relkind == RELKIND_PARTITIONED_INDEX);
+	/*
+	 * Shouldn't be called on relations having storage; these are processed
+	 * in phase 3.  Yugabyte tables do not use the Postgres store so it appears to
+	 * Postgres as if there is no associated storage.
+	 */
+	Assert(IsYBRelation(rel) || !RELKIND_CAN_HAVE_STORAGE(rel->rd_rel->relkind));
 
 	/* Can't allow a non-shared relation in pg_global */
 	if (newTableSpace == GLOBALTABLESPACE_OID)
@@ -12907,24 +13036,41 @@ ATExecPartedIdxSetTableSpace(Relation rel, Oid newTableSpace)
 	if (newTableSpace == oldTableSpace ||
 		(newTableSpace == MyDatabaseTableSpace && oldTableSpace == 0))
 	{
-		InvokeObjectPostAlterHook(RelationRelationId,
-								  indexOid, 0);
+		InvokeObjectPostAlterHook(RelationRelationId, reloid, 0);
 		return;
+	}
+
+	if (IsYBRelation(rel)) {
+		Datum *options;
+		int num_options;
+		yb_get_tablespace_options(&options, &num_options, newTableSpace);
+		/*
+		 * Validation should only happen on tablespaces that have a defined
+		 * replica placement
+		 */
+		for (int i = 0; i < num_options; i++) {
+			char *option = VARDATA(options[i]);
+			YBCValidatePlacement(option);
+		}
 	}
 
 	/* Get a modifiable copy of the relation's pg_class row */
 	pg_class = heap_open(RelationRelationId, RowExclusiveLock);
 
-	tuple = SearchSysCacheCopy1(RELOID, ObjectIdGetDatum(indexOid));
+	tuple = SearchSysCacheCopy1(RELOID, ObjectIdGetDatum(reloid));
 	if (!HeapTupleIsValid(tuple))
-		elog(ERROR, "cache lookup failed for relation %u", indexOid);
+		elog(ERROR, "cache lookup failed for relation %u", reloid);
 	rd_rel = (Form_pg_class) GETSTRUCT(tuple);
 
 	/* update the pg_class row */
 	rd_rel->reltablespace = (newTableSpace == MyDatabaseTableSpace) ? InvalidOid : newTableSpace;
 	CatalogTupleUpdate(pg_class, &tuple->t_self, tuple);
 
-	InvokeObjectPostAlterHook(RelationRelationId, indexOid, 0);
+	/* Record dependency on tablespace */
+	changeDependencyOnTablespace(RelationRelationId,
+								 reloid, rd_rel->reltablespace);
+
+	InvokeObjectPostAlterHook(RelationRelationId, reloid, 0);
 
 	heap_freetuple(tuple);
 
@@ -13347,7 +13493,7 @@ ATExecAddInherit(Relation child_rel, RangeVar *parent, LOCKMODE lockmode)
 				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
 				 errmsg("trigger \"%s\" prevents table \"%s\" from becoming an inheritance child",
 						trigger_name, RelationGetRelationName(child_rel)),
-				 errdetail("ROW triggers with transition tables are not supported in inheritance hierarchies")));
+				 errdetail("ROW triggers with transition tables are not supported in inheritance hierarchies.")));
 
 	/* OK to create inheritance */
 	CreateInheritance(child_rel, parent_rel);
@@ -16230,6 +16376,22 @@ ATExecAttachPartition(List **wqueue, Relation rel, PartitionCmd *cmd)
 
 	ObjectAddressSet(address, RelationRelationId, RelationGetRelid(attachrel));
 
+	/*
+	 * If the partition we just attached is partitioned itself, invalidate
+	 * relcache for all descendent partitions too to ensure that their
+	 * rd_partcheck expression trees are rebuilt; partitions already locked
+	 * at the beginning of this function.
+	 */
+	if (attachrel->rd_rel->relkind == RELKIND_PARTITIONED_TABLE)
+	{
+		ListCell *l;
+
+		foreach(l, attachrel_children)
+		{
+			CacheInvalidateRelcacheByRelid(lfirst_oid(l));
+		}
+	}
+
 	/* keep our lock until commit */
 	heap_close(attachrel, NoLock);
 
@@ -16385,6 +16547,54 @@ AttachPartitionEnsureIndexes(Relation rel, Relation attachrel)
 }
 
 /*
+ * isPartitionTrigger
+ *		Subroutine for CloneRowTriggersToPartition: determine whether
+ *		the given trigger has been cloned from another one.
+ *
+ * We use pg_depend as a proxy for this, since we don't have any direct
+ * evidence.  This is an ugly hack to cope with a catalog deficiency.
+ * Keep away from children.  Do not stare with naked eyes.  Do not propagate.
+ */
+static bool
+isPartitionTrigger(Oid trigger_oid)
+{
+	Relation	pg_depend;
+	ScanKeyData key[2];
+	SysScanDesc	scan;
+	HeapTuple	tup;
+	bool		found = false;
+
+	pg_depend = heap_open(DependRelationId, AccessShareLock);
+
+	ScanKeyInit(&key[0], Anum_pg_depend_classid,
+				BTEqualStrategyNumber,
+				F_OIDEQ,
+				ObjectIdGetDatum(TriggerRelationId));
+	ScanKeyInit(&key[1], Anum_pg_depend_objid,
+				BTEqualStrategyNumber,
+				F_OIDEQ,
+				ObjectIdGetDatum(trigger_oid));
+
+	scan = systable_beginscan(pg_depend, DependDependerIndexId,
+							  true, NULL, 2, key);
+	while ((tup = systable_getnext(scan)) != NULL)
+	{
+		Form_pg_depend	dep = (Form_pg_depend) GETSTRUCT(tup);
+
+		if (dep->refclassid == TriggerRelationId)
+		{
+			found = true;
+			break;
+		}
+	}
+
+	systable_endscan(scan);
+	heap_close(pg_depend, AccessShareLock);
+
+	return found;
+}
+
+/*
  * CloneRowTriggersToPartition
  *		subroutine for ATExecAttachPartition/DefineRelation to create row
  *		triggers on partitions
@@ -16426,8 +16636,21 @@ CloneRowTriggersToPartition(Relation parent, Relation partition)
 		if (!TRIGGER_FOR_ROW(trigForm->tgtype))
 			continue;
 
-		/* We don't clone internal triggers, either */
-		if (trigForm->tgisinternal)
+		/*
+		 * Internal triggers require careful examination.  Ideally, we don't
+		 * clone them.
+		 *
+		 * However, if our parent is a partitioned relation, there might be
+		 * internal triggers that need cloning.  In that case, we must
+		 * skip clone it if the trigger on parent depends on another trigger.
+		 *
+		 * Note we dare not verify that the other trigger belongs to an
+		 * ancestor relation of our parent, because that creates deadlock
+		 * opportunities.
+		 */
+		if (trigForm->tgisinternal &&
+			(!parent->rd_rel->relispartition ||
+			 !isPartitionTrigger(HeapTupleGetOid(tuple))))
 			continue;
 
 		/*
@@ -16612,6 +16835,9 @@ ATExecDetachPartition(Relation rel, RangeVar *name)
 	}
 	heap_close(classRel, RowExclusiveLock);
 
+	/* Drop any triggers that were cloned on creation/attach. */
+	DropClonedTriggersFromPartition(RelationGetRelid(partRel));
+
 	/*
 	 * Detach any foreign keys that are inherited.  This includes creating
 	 * additional action triggers.
@@ -16666,12 +16892,91 @@ ATExecDetachPartition(Relation rel, RangeVar *name)
 	 */
 	CacheInvalidateRelcache(rel);
 
+	/*
+	 * If the partition we just detached is partitioned itself, invalidate
+	 * relcache for all descendent partitions too to ensure that their
+	 * rd_partcheck expression trees are rebuilt; must lock partitions
+	 * before doing so, using the same lockmode as what partRel has been
+	 * locked with by the caller.
+	 */
+	if (partRel->rd_rel->relkind == RELKIND_PARTITIONED_TABLE)
+	{
+		List   *children;
+
+		children = find_all_inheritors(RelationGetRelid(partRel),
+									   AccessExclusiveLock, NULL);
+		foreach(cell, children)
+		{
+			CacheInvalidateRelcacheByRelid(lfirst_oid(cell));
+		}
+	}
+
 	ObjectAddressSet(address, RelationRelationId, RelationGetRelid(partRel));
 
 	/* keep our lock until commit */
 	heap_close(partRel, NoLock);
 
 	return address;
+}
+
+/*
+ * DropClonedTriggersFromPartition
+ *		subroutine for ATExecDetachPartition to remove any triggers that were
+ *		cloned to the partition when it was created-as-partition or attached.
+ *		This undoes what CloneRowTriggersToPartition did.
+ */
+static void
+DropClonedTriggersFromPartition(Oid partitionId)
+{
+	ScanKeyData skey;
+	SysScanDesc	scan;
+	HeapTuple	trigtup;
+	Relation	tgrel;
+	ObjectAddresses *objects;
+
+	objects = new_object_addresses();
+
+	/*
+	 * Scan pg_trigger to search for all triggers on this rel.
+	 */
+	ScanKeyInit(&skey, Anum_pg_trigger_tgrelid, BTEqualStrategyNumber,
+				F_OIDEQ, ObjectIdGetDatum(partitionId));
+	tgrel = heap_open(TriggerRelationId, RowExclusiveLock);
+	scan = systable_beginscan(tgrel, TriggerRelidNameIndexId,
+							  true, NULL, 1, &skey);
+	while (HeapTupleIsValid(trigtup = systable_getnext(scan)))
+	{
+		Oid			trigoid = HeapTupleGetOid(trigtup);
+		ObjectAddress trig;
+
+		/* Ignore triggers that weren't cloned */
+		if (!isPartitionTrigger(trigoid))
+			continue;
+
+		/*
+		 * This is ugly, but necessary: remove the dependency markings on the
+		 * trigger so that it can be removed.
+		 */
+		deleteDependencyRecordsForClass(TriggerRelationId, trigoid,
+										TriggerRelationId,
+										DEPENDENCY_INTERNAL_AUTO);
+		deleteDependencyRecordsForClass(TriggerRelationId, trigoid,
+										RelationRelationId,
+										DEPENDENCY_INTERNAL_AUTO);
+
+		/* remember this trigger to remove it below */
+		ObjectAddressSet(trig, TriggerRelationId, trigoid);
+		add_exact_object_address(&trig, objects);
+	}
+
+	/* make the dependency removal visible to the deletion below */
+	CommandCounterIncrement();
+	performMultipleDeletions(objects, DROP_RESTRICT, PERFORM_DELETION_INTERNAL);
+
+	/* done */
+	free_object_addresses(objects);
+	systable_endscan(scan);
+	heap_close(tgrel, RowExclusiveLock);
 }
 
 /*

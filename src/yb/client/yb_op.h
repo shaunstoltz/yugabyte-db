@@ -39,9 +39,11 @@
 
 #include "yb/client/client_fwd.h"
 
+#include "yb/common/common_fwd.h"
+#include "yb/common/common_types.pb.h"
 #include "yb/common/partial_row.h"
-#include "yb/common/partition.h"
 #include "yb/common/read_hybrid_time.h"
+#include "yb/common/transaction.pb.h"
 
 namespace yb {
 
@@ -283,7 +285,7 @@ class YBqlOp : public YBOperation {
 
   std::string* mutable_rows_data() { return &rows_data_; }
 
-  bool succeeded() const override { return response().status() == QLResponsePB::YQL_STATUS_OK; }
+  bool succeeded() const override;
 
  protected:
   explicit YBqlOp(const std::shared_ptr<YBTable>& table);
@@ -307,28 +309,13 @@ class YBqlWriteOp : public YBqlOp {
 
   bool read_only() const override { return false; };
 
-  bool returns_sidecar() override {
-    return ql_write_request_->has_if_expr() || ql_write_request_->returns_status();
-  }
+  bool returns_sidecar() override;
 
   void SetHashCode(uint16_t hash_code) override;
 
   uint16_t GetHashCode() const;
 
   CHECKED_STATUS GetPartitionKey(std::string* partition_key) const override;
-
-  // Hash and equal functions to define a set of write operations that do not overlap by their
-  // hash (or primary) keys.
-  struct HashKeyComparator {
-    virtual ~HashKeyComparator() {}
-    virtual size_t operator() (const YBqlWriteOpPtr& op) const;
-    virtual bool operator() (const YBqlWriteOpPtr& op1, const YBqlWriteOpPtr& op2) const;
-  };
-  struct PrimaryKeyComparator : HashKeyComparator {
-    virtual ~PrimaryKeyComparator() {}
-    size_t operator() (const YBqlWriteOpPtr& op) const override;
-    bool operator() (const YBqlWriteOpPtr& op1, const YBqlWriteOpPtr& op2) const override;
-  };
 
   // Does this operation read/write the static or primary row?
   bool ReadsStaticRow() const;
@@ -338,6 +325,14 @@ class YBqlWriteOp : public YBqlOp {
 
   void set_writes_static_row(const bool value) { writes_static_row_ = value; }
   void set_writes_primary_row(const bool value) { writes_primary_row_ = value; }
+
+  void set_write_time_for_backfill(HybridTime value) {
+    write_time_for_backfill_ = value;
+  }
+
+  HybridTime write_time_for_backfill() const {
+    return write_time_for_backfill_;
+  }
 
  protected:
   Type type() const override { return QL_WRITE; }
@@ -352,6 +347,19 @@ class YBqlWriteOp : public YBqlOp {
   // Does this operation write to the static or primary row?
   bool writes_static_row_ = false;
   bool writes_primary_row_ = false;
+  HybridTime write_time_for_backfill_;
+};
+
+// Hash and equal functions to define a set of write operations that do not overlap by their
+// hash (or primary) keys.
+struct YBqlWriteHashKeyComparator {
+  size_t operator() (const YBqlWriteOpPtr& op) const;
+  bool operator() (const YBqlWriteOpPtr& op1, const YBqlWriteOpPtr& op2) const;
+};
+
+struct YBqlWritePrimaryKeyComparator {
+  size_t operator() (const YBqlWriteOpPtr& op) const;
+  bool operator() (const YBqlWriteOpPtr& op1, const YBqlWriteOpPtr& op2) const;
 };
 
 class YBqlReadOp : public YBqlOp {
@@ -425,13 +433,9 @@ class YBPgsqlOp : public YBOperation {
 
   std::string* mutable_rows_data() { return &rows_data_; }
 
-  bool succeeded() const override {
-    return response().status() == PgsqlResponsePB::PGSQL_STATUS_OK;
-  }
+  bool succeeded() const override;
 
-  bool applied() override {
-    return succeeded() && !response_->skipped();
-  }
+  bool applied() override;
 
   bool is_active() const {
     return is_active_;
@@ -550,7 +554,7 @@ class YBPgsqlReadOp : public YBPgsqlOp {
 
   const ReadHybridTime& read_time() const { return read_time_; }
   void SetReadTime(const ReadHybridTime& value) { read_time_ = value; }
-  void SetIsForBackfill(const bool value) { read_request_->set_is_for_backfill(value); }
+  void SetIsForBackfill(const bool value);
 
   static std::vector<ColumnSchema> MakeColumnSchemasFromColDesc(
       const google::protobuf::RepeatedPtrField<PgsqlRSColDescPB>& rscol_descs);

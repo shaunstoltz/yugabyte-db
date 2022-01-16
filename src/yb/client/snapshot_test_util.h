@@ -15,12 +15,14 @@
 #define YB_CLIENT_SNAPSHOT_TEST_UTIL_H
 
 #include "yb/client/txn-test-base.h"
+#include "yb/common/snapshot.h"
 
 #include "yb/integration-tests/mini_cluster.h"
 #include "yb/master/master_backup.proxy.h"
 #include "yb/rpc/proxy.h"
 #include "yb/util/net/net_fwd.h"
 #include "yb/util/net/net_util.h"
+#include "yb/util/tsan_util.h"
 
 using namespace std::literals;
 
@@ -50,11 +52,14 @@ class SnapshotTestUtil {
   void SetCluster(MiniCluster* cluster) {
       cluster_ = cluster;
   }
-  Result<master::MasterBackupServiceProxy> MakeBackupServiceProxy() {
-    return master::MasterBackupServiceProxy(
+
+  Result<master::MasterBackupProxy> MakeBackupServiceProxy() {
+    return master::MasterBackupProxy(
         proxy_cache_, VERIFY_RESULT(cluster_->GetLeaderMiniMaster())->bound_rpc_addr());
   }
+
   Result<master::SysSnapshotEntryPB::State> SnapshotState(const TxnSnapshotId& snapshot_id);
+
   Result<bool> IsSnapshotDone(const TxnSnapshotId& snapshot_id);
   Result<Snapshots> ListSnapshots(
       const TxnSnapshotId& snapshot_id = TxnSnapshotId::Nil(),

@@ -11,16 +11,18 @@
 // under the License.
 //
 
-#include "yb/client/txn-test-base.h"
-
+#include "yb/client/error.h"
 #include "yb/client/session.h"
 #include "yb/client/transaction.h"
+#include "yb/client/txn-test-base.h"
+#include "yb/client/yb_op.h"
+
+#include "yb/gutil/casts.h"
 
 #include "yb/util/async_util.h"
-#include "yb/util/bfql/gen_opcodes.h"
 #include "yb/util/random_util.h"
-
-#include "yb/yql/cql/ql/util/statement_result.h"
+#include "yb/util/thread.h"
+#include "yb/util/tsan_util.h"
 
 using namespace std::literals;
 
@@ -241,7 +243,7 @@ void SerializableTxnTest::TestIncrements(bool transactional) {
 
   std::vector<std::thread> threads;
   while (threads.size() != kThreads) {
-    int key = threads.size();
+    int key = narrow_cast<int>(threads.size());
     threads.emplace_back([this, key, transactional] {
       CDSAttacher attacher;
       TestIncrement(key, transactional);
@@ -306,7 +308,7 @@ void SerializableTxnTest::TestColoring() {
     std::atomic<size_t> successes(0);
 
     while (threads.size() != kColors) {
-      int32_t color = threads.size();
+      int32_t color = narrow_cast<int32_t>(threads.size());
       threads.emplace_back([this, color, &successes, kKeys] {
         CDSAttacher attacher;
         for (;;) {

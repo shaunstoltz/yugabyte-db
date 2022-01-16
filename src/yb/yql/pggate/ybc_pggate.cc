@@ -10,6 +10,8 @@
 // or implied.  See the License for the specific language governing permissions and limitations
 // under the License.
 
+#include "yb/yql/pggate/ybc_pggate.h"
+
 #include <algorithm>
 #include <string>
 
@@ -20,16 +22,17 @@
 #include "yb/common/common_flags.h"
 #include "yb/common/ql_value.h"
 #include "yb/common/ybc-internal.h"
+
 #include "yb/util/atomic.h"
+#include "yb/util/flag_tags.h"
+#include "yb/util/thread.h"
+#include "yb/util/yb_partition.h"
 
-#include "yb/yql/pggate/ybc_pggate.h"
-#include "yb/yql/pggate/pggate.h"
-#include "yb/yql/pggate/pggate_thread_local_vars.h"
-#include "yb/yql/pggate/pg_txn_manager.h"
-#include "yb/yql/pggate/pggate_flags.h"
 #include "yb/yql/pggate/pg_memctx.h"
-
 #include "yb/yql/pggate/pg_value.h"
+#include "yb/yql/pggate/pggate.h"
+#include "yb/yql/pggate/pggate_flags.h"
+#include "yb/yql/pggate/pggate_thread_local_vars.h"
 #include "yb/yql/pggate/ybc_pg_typedefs.h"
 
 DECLARE_bool(client_suppress_created_logs);
@@ -39,6 +42,10 @@ DEFINE_int32(ysql_client_read_write_timeout_ms, -1, "Timeout for YSQL's yb-clien
 DEFINE_int32(pggate_num_connections_to_server, 1,
              "Number of underlying connections to each server from a PostgreSQL backend process. "
              "This overrides the value of --num_connections_to_server.");
+DEFINE_test_flag(uint64, ysql_oid_prefetch_adjustment, 0,
+                 "Amount to add when prefetch the next batch of OIDs. Never use this flag in "
+                 "production environment. In unit test we use this flag to force allocation of "
+                 "large Postgres OIDs.");
 
 DECLARE_int32(num_connections_to_server);
 
@@ -244,8 +251,10 @@ YBCStatus YBCPgReserveOids(const YBCPgOid database_oid,
                            const uint32_t count,
                            YBCPgOid *begin_oid,
                            YBCPgOid *end_oid) {
-  return ToYBCStatus(pgapi->ReserveOids(database_oid, next_oid, count,
-                                        begin_oid, end_oid));
+  return ToYBCStatus(pgapi->ReserveOids(database_oid,
+                                        next_oid + static_cast<YBCPgOid>(
+                                          FLAGS_TEST_ysql_oid_prefetch_adjustment),
+                                        count, begin_oid, end_oid));
 }
 
 YBCStatus YBCPgGetCatalogMasterVersion(uint64_t *version) {
@@ -431,9 +440,8 @@ YBCStatus YBCPgGetTableDesc(const YBCPgOid database_oid,
 
 YBCStatus YBCPgGetColumnInfo(YBCPgTableDesc table_desc,
                              int16_t attr_number,
-                             bool *is_primary,
-                             bool *is_hash) {
-  return ToYBCStatus(pgapi->GetColumnInfo(table_desc, attr_number, is_primary, is_hash));
+                             YBCPgColumnInfo *column_info) {
+  return ExtractValueFromResult(pgapi->GetColumnInfo(table_desc, attr_number), column_info);
 }
 
 YBCStatus YBCPgSetCatalogCacheVersion(YBCPgStatement handle,
@@ -578,6 +586,15 @@ YBCStatus YBCPgDmlBindColumnCondBetween(YBCPgStatement handle, int attr_num, YBC
 YBCStatus YBCPgDmlBindColumnCondIn(YBCPgStatement handle, int attr_num, int n_attr_values,
     YBCPgExpr *attr_values) {
   return ToYBCStatus(pgapi->DmlBindColumnCondIn(handle, attr_num, n_attr_values, attr_values));
+}
+
+YBCStatus YBCPgDmlBindHashCodes(YBCPgStatement handle, bool start_valid,
+                                 bool start_inclusive, uint64_t start_hash_val,
+                                 bool end_valid, bool end_inclusive,
+                                 uint64_t end_hash_val) {
+  return ToYBCStatus(pgapi->DmlBindHashCode(handle, start_valid,
+                      start_inclusive, start_hash_val, end_valid,
+                      end_inclusive, end_hash_val));
 }
 
 YBCStatus YBCPgDmlBindTable(YBCPgStatement handle) {
@@ -885,12 +902,16 @@ YBCStatus YBCPgRestartTransaction() {
   return ToYBCStatus(pgapi->RestartTransaction());
 }
 
+YBCStatus YBCPgMaybeResetTransactionReadPoint() {
+  return ToYBCStatus(pgapi->MaybeResetTransactionReadPoint());
+}
+
 YBCStatus YBCPgCommitTransaction() {
   return ToYBCStatus(pgapi->CommitTransaction());
 }
 
-YBCStatus YBCPgAbortTransaction() {
-  return ToYBCStatus(pgapi->AbortTransaction());
+void YBCPgAbortTransaction() {
+  pgapi->AbortTransaction();
 }
 
 YBCStatus YBCPgSetTransactionIsolationLevel(int isolation) {
@@ -901,6 +922,10 @@ YBCStatus YBCPgSetTransactionReadOnly(bool read_only) {
   return ToYBCStatus(pgapi->SetTransactionReadOnly(read_only));
 }
 
+YBCStatus YBCPgEnableFollowerReads(bool enable_follower_reads, int32_t staleness_ms) {
+  return ToYBCStatus(pgapi->EnableFollowerReads(enable_follower_reads, staleness_ms));
+}
+
 YBCStatus YBCPgSetTransactionDeferrable(bool deferrable) {
   return ToYBCStatus(pgapi->SetTransactionDeferrable(deferrable));
 }
@@ -909,8 +934,12 @@ YBCStatus YBCPgEnterSeparateDdlTxnMode() {
   return ToYBCStatus(pgapi->EnterSeparateDdlTxnMode());
 }
 
-YBCStatus YBCPgExitSeparateDdlTxnMode(bool success) {
-  return ToYBCStatus(pgapi->ExitSeparateDdlTxnMode(success));
+YBCStatus YBCPgExitSeparateDdlTxnMode() {
+  return ToYBCStatus(pgapi->ExitSeparateDdlTxnMode());
+}
+
+void YBCPgClearSeparateDdlTxnMode() {
+  pgapi->ClearSeparateDdlTxnMode();
 }
 
 YBCStatus YBCPgSetActiveSubTransaction(uint32_t id) {
@@ -919,6 +948,13 @@ YBCStatus YBCPgSetActiveSubTransaction(uint32_t id) {
 
 YBCStatus YBCPgRollbackSubTransaction(uint32_t id) {
   return ToYBCStatus(pgapi->RollbackSubTransaction(id));
+}
+
+//------------------------------------------------------------------------------------------------
+// System validation.
+//------------------------------------------------------------------------------------------------
+YBCStatus YBCPgValidatePlacement(const char *placement_info) {
+  return ToYBCStatus(pgapi->ValidatePlacement(placement_info));
 }
 
 // Referential Integrity Caching
@@ -1023,6 +1059,9 @@ bool YBCPgIsYugaByteEnabled() {
 }
 
 void YBCSetTimeout(int timeout_ms, void* extra) {
+  if (!pgapi) {
+    return;
+  }
   const auto default_client_timeout_ms =
       (FLAGS_ysql_client_read_write_timeout_ms < 0
            ? std::max(FLAGS_client_read_write_timeout_ms, 600000)
@@ -1040,7 +1079,7 @@ void YBCSetTimeout(int timeout_ms, void* extra) {
   pgapi->SetTimeout(timeout_ms);
 }
 
-YBCStatus YBCGetTabletServerHosts(YBCServerDescriptor **servers, int *count) {
+YBCStatus YBCGetTabletServerHosts(YBCServerDescriptor **servers, size_t *count) {
   const auto result = pgapi->ListTabletServers();
   if (!result.ok()) {
     return ToYBCStatus(result.status());

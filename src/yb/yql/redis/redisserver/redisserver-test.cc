@@ -12,37 +12,46 @@
 //
 
 #include <chrono>
-#include <cstdio>
 #include <memory>
 #include <random>
 #include <string>
 #include <thread>
 #include <vector>
-#include <algorithm>
 
 #include <boost/algorithm/string.hpp>
+
+#include "yb/client/yb_table_name.h"
 
 #include "yb/gutil/strings/join.h"
 #include "yb/gutil/strings/substitute.h"
 
-#include "yb/client/meta_cache.h"
-
 #include "yb/integration-tests/redis_table_test_base.h"
+
+#include "yb/master/flush_manager.h"
+#include "yb/master/master_admin.pb.h"
+
+#include "yb/rpc/io_thread_pool.h"
+
+#include "yb/tserver/mini_tablet_server.h"
+#include "yb/tserver/tablet_server.h"
+
+#include "yb/util/cast.h"
+#include "yb/util/enums.h"
+#include "yb/util/metrics.h"
+#include "yb/util/net/socket.h"
+#include "yb/util/protobuf.h"
+#include "yb/util/ref_cnt_buffer.h"
+#include "yb/util/result.h"
+#include "yb/util/size_literals.h"
+#include "yb/util/status_log.h"
+#include "yb/util/test_util.h"
+#include "yb/util/tsan_util.h"
+#include "yb/util/value_changer.h"
 
 #include "yb/yql/redis/redisserver/redis_client.h"
 #include "yb/yql/redis/redisserver/redis_constants.h"
 #include "yb/yql/redis/redisserver/redis_encoding.h"
 #include "yb/yql/redis/redisserver/redis_server.h"
-
-#include "yb/rpc/io_thread_pool.h"
-
-#include "yb/util/cast.h"
-#include "yb/util/enums.h"
-#include "yb/util/protobuf.h"
-#include "yb/util/test_util.h"
-#include "yb/util/value_changer.h"
-
-#include "yb/master/flush_manager.h"
 
 DECLARE_uint64(redis_max_concurrent_commands);
 DECLARE_uint64(redis_max_batch);
@@ -216,7 +225,7 @@ class TestRedisService : public RedisTableTestBase {
           ASSERT_EQ(expected.size(), replies.size())
               << "Originator: " << __FILE__ << ":" << line << std::endl
               << "Expected: " << yb::ToString(expected) << std::endl
-              << " Replies: " << reply.ToString();
+              << " Replies: " << Max500CharsPrinter(reply.ToString());
           for (size_t i = 0; i < expected.size(); i++) {
             DVLOG(3) << "Checking " << replies[i].ToString();
             if (expected[i].get_type() == RedisReplyType::kString &&
@@ -307,7 +316,7 @@ class TestRedisService : public RedisTableTestBase {
     req.set_is_compaction(false);
     table_name().SetIntoTableIdentifierPB(req.add_tables());
     master::FlushTablesResponsePB resp;
-    RETURN_NOT_OK(VERIFY_RESULT(mini_cluster()->GetLeaderMiniMaster())->master()->flush_manager()->
+    RETURN_NOT_OK(VERIFY_RESULT(mini_cluster()->GetLeaderMiniMaster())->flush_manager().
                   FlushTables(&req, &resp));
 
     master::IsFlushTablesDoneRequestPB wait_req;
@@ -317,9 +326,7 @@ class TestRedisService : public RedisTableTestBase {
     for (int k = 0; k < 20; ++k) {
       master::IsFlushTablesDoneResponsePB wait_resp;
       RETURN_NOT_OK(VERIFY_RESULT(mini_cluster()->GetLeaderMiniMaster())
-                        ->master()
-                        ->flush_manager()
-                        ->IsFlushTablesDone(&wait_req, &wait_resp));
+                        ->flush_manager().IsFlushTablesDone(&wait_req, &wait_resp));
       if (wait_resp.done()) {
         return Status::OK();
       }
@@ -333,7 +340,7 @@ class TestRedisService : public RedisTableTestBase {
   CHECKED_STATUS Send(const std::string& cmd);
 
   CHECKED_STATUS SendCommandAndGetResponse(
-      const string& cmd, int expected_resp_length, int timeout_in_millis = kDefaultTimeoutMs);
+      const string& cmd, size_t expected_resp_length, int timeout_in_millis = kDefaultTimeoutMs);
 
   size_t CountSessions(const GaugePrototype<uint64_t>& proto) {
     constexpr uint64_t kInitialValue = 0UL;
@@ -855,8 +862,7 @@ void TestRedisService::TearDown() {
 
 Status TestRedisService::Send(const std::string& cmd) {
   // Send the command.
-  int32_t bytes_written = 0;
-  EXPECT_OK(client_sock_.Write(util::to_uchar_ptr(cmd.c_str()), cmd.length(), &bytes_written));
+  auto bytes_written = EXPECT_RESULT(client_sock_.Write(to_uchar_ptr(cmd.c_str()), cmd.length()));
 
   EXPECT_EQ(cmd.length(), bytes_written);
 
@@ -864,19 +870,18 @@ Status TestRedisService::Send(const std::string& cmd) {
 }
 
 Status TestRedisService::SendCommandAndGetResponse(
-    const string& cmd, int expected_resp_length, int timeout_in_millis) {
+    const string& cmd, size_t expected_resp_length, int timeout_in_millis) {
   RETURN_NOT_OK(Send(cmd));
 
   // Receive the response.
   MonoTime deadline = MonoTime::Now();
   deadline.AddDelta(MonoDelta::FromMilliseconds(timeout_in_millis));
-  size_t bytes_read = 0;
   resp_.resize(expected_resp_length);
   if (expected_resp_length) {
     memset(resp_.data(), 0, expected_resp_length);
   }
-  RETURN_NOT_OK(client_sock_.BlockingRecv(
-      resp_.data(), expected_resp_length, &bytes_read, deadline));
+  auto bytes_read = VERIFY_RESULT(client_sock_.BlockingRecv(
+      resp_.data(), expected_resp_length, deadline));
   resp_.resize(bytes_read);
   if (expected_resp_length != bytes_read) {
     return STATUS(
@@ -924,7 +929,7 @@ void TestRedisService::SendCommandAndExpectResponse(int line,
 
   // Verify that the response is as expected.
 
-  std::string response(util::to_char_ptr(resp_.data()), expected.length());
+  std::string response(to_char_ptr(resp_.data()), expected.length());
   ASSERT_EQ(expected, response)
                 << "Command: " << Slice(cmd).ToDebugString() << std::endl
                 << "Originator: " << __FILE__ << ":" << line;
@@ -942,7 +947,8 @@ void TestRedisService::DoRedisTest(int line,
             << reply.as_string() << ", of type: " << to_underlying(reply.get_type());
     num_callbacks_called_++;
     ASSERT_EQ(reply_type, reply.get_type())
-        << "Originator: " << __FILE__ << ":" << line << ", reply: " << reply.ToString();
+        << "Originator: " << __FILE__ << ":" << line << ", reply: "
+        << Max500CharsPrinter(reply.ToString());
     callback(reply);
   });
 }
@@ -2516,7 +2522,7 @@ class TestRedisServiceExternal : public TestRedisService {
   void CustomizeExternalMiniCluster(ExternalMiniClusterOptions* opts) override {
     opts->extra_tserver_flags.push_back(
         "--redis_connection_soft_limit_grace_period_sec=" +
-        yb::ToString(kSoftLimitGracePeriod.ToSeconds()));
+        AsString(static_cast<int>(kSoftLimitGracePeriod.ToSeconds())));
   }
 
   static const MonoDelta kSoftLimitGracePeriod;

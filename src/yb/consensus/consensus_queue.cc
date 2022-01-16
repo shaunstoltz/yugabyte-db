@@ -32,47 +32,43 @@
 
 #include "yb/consensus/consensus_queue.h"
 
-#include <shared_mutex>
 #include <algorithm>
-#include <iostream>
 #include <mutex>
+#include <shared_mutex>
 #include <string>
 #include <utility>
 
 #include <boost/container/small_vector.hpp>
-
-#include <gflags/gflags.h>
-
-#include "yb/common/wire_protocol.h"
+#include <glog/logging.h>
 
 #include "yb/consensus/consensus_context.h"
-#include "yb/consensus/log.h"
-#include "yb/consensus/log_reader.h"
 #include "yb/consensus/log_util.h"
 #include "yb/consensus/opid_util.h"
 #include "yb/consensus/quorum_util.h"
 #include "yb/consensus/raft_consensus.h"
 #include "yb/consensus/replicate_msgs_holder.h"
 
+#include "yb/gutil/bind.h"
 #include "yb/gutil/dynamic_annotations.h"
 #include "yb/gutil/map-util.h"
 #include "yb/gutil/stl_util.h"
-#include "yb/gutil/strings/join.h"
 #include "yb/gutil/strings/substitute.h"
-#include "yb/gutil/strings/strcat.h"
-#include "yb/gutil/strings/human_readable.h"
+
+#include "yb/util/enums.h"
 #include "yb/util/fault_injection.h"
 #include "yb/util/flag_tags.h"
 #include "yb/util/locks.h"
 #include "yb/util/logging.h"
 #include "yb/util/mem_tracker.h"
 #include "yb/util/metrics.h"
+#include "yb/util/monotime.h"
 #include "yb/util/random_util.h"
+#include "yb/util/result.h"
 #include "yb/util/size_literals.h"
+#include "yb/util/status_log.h"
 #include "yb/util/threadpool.h"
-#include "yb/util/url-coding.h"
-#include "yb/util/enums.h"
 #include "yb/util/tostring.h"
+#include "yb/util/url-coding.h"
 
 using namespace std::literals;
 using namespace yb::size_literals;
@@ -141,8 +137,6 @@ static bool RpcThrottleThresholdBytesValidator(const char* flagname, int32_t val
 } // namespace
 
 DECLARE_int32(rpc_throttle_threshold_bytes);
-__attribute__((unused))
-DEFINE_validator(rpc_throttle_threshold_bytes, &RpcThrottleThresholdBytesValidator);
 
 namespace yb {
 namespace consensus {
@@ -175,7 +169,7 @@ std::string PeerMessageQueue::TrackedPeer::ToString() const {
       "is_last_exchange_successful: $5 needs_remote_bootstrap: $6 member_type: $7 "
       "num_sst_files: $8 last_applied: $9 }",
       uuid, is_new, last_received, next_index, last_known_committed_idx,
-      is_last_exchange_successful, needs_remote_bootstrap, RaftPeerPB::MemberType_Name(member_type),
+      is_last_exchange_successful, needs_remote_bootstrap, PeerMemberType_Name(member_type),
       num_sst_files, last_applied);
 }
 
@@ -312,7 +306,7 @@ void PeerMessageQueue::UntrackPeer(const string& uuid) {
 
 void PeerMessageQueue::CheckPeersInActiveConfigIfLeaderUnlocked() const {
   if (queue_state_.mode != Mode::LEADER) return;
-  unordered_set<string> config_peer_uuids;
+  std::unordered_set<std::string> config_peer_uuids;
   for (const RaftPeerPB& peer_pb : queue_state_.active_config->peers()) {
     InsertOrDie(&config_peer_uuids, peer_pb.permanent_uuid());
   }
@@ -433,7 +427,7 @@ Status PeerMessageQueue::RequestForPeer(const string& uuid,
                                         ConsensusRequestPB* request,
                                         ReplicateMsgsHolder* msgs_holder,
                                         bool* needs_remote_bootstrap,
-                                        RaftPeerPB::MemberType* member_type,
+                                        PeerMemberType* member_type,
                                         bool* last_exchange_successful) {
   static constexpr uint64_t kSendUnboundedLogOps = std::numeric_limits<uint64_t>::max();
   DCHECK(request->ops().empty()) << request->ShortDebugString();
@@ -536,7 +530,7 @@ Status PeerMessageQueue::RequestForPeer(const string& uuid,
 
     peer->current_retransmissions++;
 
-    if (peer->member_type == RaftPeerPB::VOTER) {
+    if (peer->member_type == PeerMemberType::VOTER) {
       is_voter = true;
     }
   }
@@ -658,12 +652,13 @@ Status PeerMessageQueue::RequestForPeer(const string& uuid,
 Result<ReadOpsResult> PeerMessageQueue::ReadFromLogCache(int64_t after_index,
                                                          int64_t to_index,
                                                          int max_batch_size,
-                                                         const std::string& peer_uuid) {
+                                                         const std::string& peer_uuid,
+                                                         const CoarseTimePoint deadline) {
   DCHECK_LT(FLAGS_consensus_max_batch_size_bytes + 1_KB, FLAGS_rpc_max_message_size);
 
   // We try to get the follower's next_index from our log.
   // Note this is not using "term" and needs to change
-  auto result = log_cache_.ReadOps(after_index, to_index, max_batch_size);
+  auto result = log_cache_.ReadOps(after_index, to_index, max_batch_size, deadline);
   if (PREDICT_FALSE(!result.ok())) {
     auto s = result.status();
     if (PREDICT_TRUE(s.IsNotFound())) {
@@ -689,8 +684,10 @@ Result<ReadOpsResult> PeerMessageQueue::ReadFromLogCache(int64_t after_index,
 
 // Read majority replicated messages from cache for CDC.
 // CDC producer will use this to get the messages to send in response to cdc::GetChanges RPC.
-Result<ReadOpsResult> PeerMessageQueue::ReadReplicatedMessagesForCDC(const yb::OpId& last_op_id,
-                                                                     int64_t* repl_index) {
+Result<ReadOpsResult> PeerMessageQueue::ReadReplicatedMessagesForCDC(
+  const yb::OpId& last_op_id,
+  int64_t* repl_index,
+  const CoarseTimePoint deadline) {
   // The batch of messages read from cache.
 
   int64_t to_index;
@@ -717,7 +714,7 @@ Result<ReadOpsResult> PeerMessageQueue::ReadReplicatedMessagesForCDC(const yb::O
                              last_op_id.index;
 
   auto result = ReadFromLogCache(
-      after_op_index, to_index, FLAGS_consensus_max_batch_size_bytes, local_peer_uuid_);
+      after_op_index, to_index, FLAGS_consensus_max_batch_size_bytes, local_peer_uuid_, deadline);
   if (PREDICT_FALSE(!result.ok()) && PREDICT_TRUE(result.status().IsNotFound())) {
     LOG_WITH_PREFIX_UNLOCKED(INFO) << Format(
         "The logs from index $0 have been garbage collected and cannot be read ($1)",
@@ -746,9 +743,9 @@ Status PeerMessageQueue::GetRemoteBootstrapRequestForPeer(const string& uuid,
     return STATUS(IllegalState, "Peer does not need to remotely bootstrap", uuid);
   }
 
-  if (peer->member_type == RaftPeerPB::VOTER || peer->member_type == RaftPeerPB::OBSERVER) {
+  if (peer->member_type == PeerMemberType::VOTER || peer->member_type == PeerMemberType::OBSERVER) {
     LOG(INFO) << "Remote bootstrapping peer " << uuid << " with type "
-              << RaftPeerPB::MemberType_Name(peer->member_type);
+              << PeerMemberType_Name(peer->member_type);
   }
 
   req->Clear();
@@ -856,7 +853,7 @@ struct GetInfiniteWatermarkForLocalPeer<Policy, false> {
 template <class Policy>
 typename Policy::result_type PeerMessageQueue::GetWatermark() {
   DCHECK(queue_lock_.is_locked());
-  const int num_peers_required = queue_state_.majority_size_;
+  const auto num_peers_required = queue_state_.majority_size_;
   if (num_peers_required == kUninitializedMajoritySize) {
     // We don't even know the quorum majority size yet.
     return Policy::NotEnoughPeersValue();
@@ -1108,7 +1105,7 @@ bool PeerMessageQueue::ResponseFromPeer(const std::string& peer_uuid,
       }
       peer->member_type = peer_pb.member_type();
     } else {
-      peer->member_type = RaftPeerPB::UNKNOWN_MEMBER_TYPE;
+      peer->member_type = PeerMemberType::UNKNOWN_MEMBER_TYPE;
     }
 
     // Application level errors should be handled elsewhere
@@ -1606,6 +1603,21 @@ void PeerMessageQueue::TrackOperationsMemory(const OpIds& op_ids) {
 Result<OpId> PeerMessageQueue::TEST_GetLastOpIdWithType(
     int64_t max_allowed_index, OperationType op_type) {
   return log_cache_.TEST_GetLastOpIdWithType(max_allowed_index, op_type);
+}
+
+Status ValidateFlags() {
+  // Normally we would have used
+  //   DEFINE_validator(rpc_throttle_threshold_bytes, &RpcThrottleThresholdBytesValidator);
+  // right after defining the rpc_throttle_threshold_bytes flag. However, this leads to a segfault
+  // in the LTO-enabled build, presumably due to indeterminate order of static initialization.
+  // Instead, we invoke this function from master/tserver main() functions when static
+  // initialization is already finished.
+  if (!RpcThrottleThresholdBytesValidator(
+      "rpc_throttle_threshold_bytes", FLAGS_rpc_throttle_threshold_bytes)) {
+    return STATUS(InvalidArgument, "Flag validation failed");
+  }
+
+  return Status::OK();
 }
 
 }  // namespace consensus

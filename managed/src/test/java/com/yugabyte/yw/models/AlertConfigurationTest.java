@@ -1,10 +1,14 @@
 // Copyright (c) YugaByte, Inc.
 package com.yugabyte.yw.models;
 
+import static com.yugabyte.yw.common.TestUtils.replaceFirstChar;
 import static com.yugabyte.yw.common.ThrownMatcher.thrown;
+import static org.hamcrest.CoreMatchers.containsString;
 import static org.hamcrest.CoreMatchers.equalTo;
 import static org.hamcrest.CoreMatchers.nullValue;
 import static org.hamcrest.MatcherAssert.assertThat;
+import static org.hamcrest.Matchers.contains;
+import static org.hamcrest.Matchers.containsInAnyOrder;
 import static org.hamcrest.Matchers.empty;
 import static org.hamcrest.Matchers.hasSize;
 import static org.hamcrest.Matchers.notNullValue;
@@ -18,17 +22,26 @@ import com.yugabyte.yw.common.AlertTemplate;
 import com.yugabyte.yw.common.FakeDBApplication;
 import com.yugabyte.yw.common.ModelFactory;
 import com.yugabyte.yw.common.PlatformServiceException;
+import com.yugabyte.yw.common.TestUtils;
+import com.yugabyte.yw.common.alerts.MaintenanceService;
+import com.yugabyte.yw.forms.filters.AlertConfigurationApiFilter;
 import com.yugabyte.yw.models.AlertConfiguration.Severity;
+import com.yugabyte.yw.models.AlertConfiguration.SortBy;
 import com.yugabyte.yw.models.AlertConfiguration.TargetType;
 import com.yugabyte.yw.models.common.Condition;
 import com.yugabyte.yw.models.common.Unit;
 import com.yugabyte.yw.models.filters.AlertConfigurationFilter;
+import com.yugabyte.yw.models.filters.AlertConfigurationFilter.DestinationType;
 import com.yugabyte.yw.models.filters.AlertDefinitionFilter;
 import com.yugabyte.yw.models.helpers.KnownAlertLabels;
+import com.yugabyte.yw.models.paging.AlertConfigurationPagedQuery;
+import com.yugabyte.yw.models.paging.PagedQuery.SortDirection;
+import io.ebean.CallableSql;
+import io.ebean.Ebean;
 import java.io.IOException;
-import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
 import java.util.Collections;
+import java.util.Date;
 import java.util.List;
 import java.util.Map;
 import java.util.UUID;
@@ -37,27 +50,39 @@ import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.Future;
 import java.util.function.Consumer;
+import java.util.function.Function;
 import java.util.stream.Collectors;
-import org.apache.commons.io.IOUtils;
+import javax.persistence.PersistenceException;
+import junitparams.JUnitParamsRunner;
+import junitparams.Parameters;
 import org.apache.commons.lang3.StringUtils;
 import org.junit.Before;
+import org.junit.Rule;
 import org.junit.Test;
 import org.junit.runner.RunWith;
-import org.mockito.junit.MockitoJUnitRunner;
+import org.mockito.junit.MockitoJUnit;
+import org.mockito.junit.MockitoRule;
 import play.libs.Json;
 
-@RunWith(MockitoJUnitRunner.class)
+@RunWith(JUnitParamsRunner.class)
 public class AlertConfigurationTest extends FakeDBApplication {
+
+  @Rule public MockitoRule mockitoRule = MockitoJUnit.rule();
 
   private Customer customer;
   private Universe universe;
+  private Universe otherUniverse;
   private AlertDestination alertDestination;
+
+  private MaintenanceService maintenanceService;
 
   @Before
   public void setUp() {
     customer = ModelFactory.testCustomer("Customer");
     universe = ModelFactory.createUniverse();
-    ModelFactory.createUniverse("some other");
+    otherUniverse = ModelFactory.createUniverse("some other");
+
+    maintenanceService = app.injector().instanceOf(MaintenanceService.class);
 
     alertDestination =
         ModelFactory.createAlertDestination(
@@ -69,10 +94,7 @@ public class AlertConfigurationTest extends FakeDBApplication {
 
   @Test
   public void testSerialization() throws IOException {
-    String initial =
-        IOUtils.toString(
-            getClass().getClassLoader().getResourceAsStream("alert/alert_configuration.json"),
-            StandardCharsets.UTF_8);
+    String initial = TestUtils.readResource("alert/alert_configuration.json");
 
     JsonNode initialJson = Json.parse(initial);
 
@@ -99,6 +121,72 @@ public class AlertConfigurationTest extends FakeDBApplication {
   }
 
   @Test
+  public void testConfigurationUnderMaintenanceWindow() {
+    AlertConfigurationApiFilter alertConfigurationApiFilter = new AlertConfigurationApiFilter();
+    alertConfigurationApiFilter.setTarget(
+        new AlertConfigurationTarget()
+            .setAll(false)
+            .setUuids(ImmutableSet.of(universe.getUniverseUUID())));
+    AlertConfigurationApiFilter alertConfigurationApiFilter2 = new AlertConfigurationApiFilter();
+    alertConfigurationApiFilter2.setTarget(
+        new AlertConfigurationTarget()
+            .setAll(false)
+            .setUuids(ImmutableSet.of(otherUniverse.getUniverseUUID())));
+    MaintenanceWindow maintenanceWindow =
+        ModelFactory.createMaintenanceWindow(
+            customer.getUuid(),
+            window ->
+                window
+                    .setUuid(replaceFirstChar(window.getUuid(), 'a'))
+                    .setAlertConfigurationFilter(alertConfigurationApiFilter));
+    MaintenanceWindow maintenanceWindow2 =
+        ModelFactory.createMaintenanceWindow(
+            customer.getUuid(),
+            window ->
+                window
+                    .setUuid(replaceFirstChar(window.getUuid(), 'b'))
+                    .setAlertConfigurationFilter(alertConfigurationApiFilter2));
+
+    AlertConfiguration configuration = createTestConfiguration();
+    configuration.addMaintenanceWindowUuid(maintenanceWindow2.getUuid());
+    configuration.addMaintenanceWindowUuid(maintenanceWindow.getUuid());
+    alertConfigurationService.save(configuration);
+
+    AlertConfiguration queriedConfiguration =
+        alertConfigurationService.get(configuration.getUuid());
+
+    assertThat(
+        queriedConfiguration.getMaintenanceWindowUuidsSet(),
+        contains(maintenanceWindow.getUuid(), maintenanceWindow2.getUuid()));
+
+    List<AlertDefinition> definitions =
+        alertDefinitionService.list(
+            AlertDefinitionFilter.builder()
+                .configurationUuid(queriedConfiguration.getUuid())
+                .build());
+
+    assertThat(definitions, hasSize(2));
+    Map<UUID, AlertDefinition> definitionMap =
+        definitions
+            .stream()
+            .collect(
+                Collectors.toMap(
+                    definition ->
+                        UUID.fromString(definition.getLabelValue(KnownAlertLabels.SOURCE_UUID)),
+                    Function.identity()));
+    assertThat(
+        definitionMap
+            .get(universe.getUniverseUUID())
+            .getLabelValue(KnownAlertLabels.MAINTENANCE_WINDOW_UUIDS),
+        equalTo(maintenanceWindow.getUuid().toString()));
+    assertThat(
+        definitionMap
+            .get(otherUniverse.getUniverseUUID())
+            .getLabelValue(KnownAlertLabels.MAINTENANCE_WINDOW_UUIDS),
+        equalTo(maintenanceWindow2.getUuid().toString()));
+  }
+
+  @Test
   public void testUpdateAndQueryTarget() {
     AlertConfiguration configuration = createTestConfiguration();
 
@@ -120,7 +208,13 @@ public class AlertConfigurationTest extends FakeDBApplication {
 
     AlertConfiguration updated =
         alertConfigurationService
-            .list(AlertConfigurationFilter.builder().targetUuid(universe.getUniverseUUID()).build())
+            .list(
+                AlertConfigurationFilter.builder()
+                    .target(
+                        new AlertConfigurationTarget()
+                            .setAll(false)
+                            .setUuids(Collections.singleton(universe.getUniverseUUID())))
+                    .build())
             .get(0);
 
     assertThat(updated.getTarget(), equalTo(target));
@@ -135,6 +229,203 @@ public class AlertConfigurationTest extends FakeDBApplication {
             AlertDefinitionFilter.builder().configurationUuid(updated.getUuid()).build());
 
     assertThat(definitions, hasSize(1));
+  }
+
+  @Test
+  public void testFilter() {
+    AlertConfiguration configuration = createTestConfiguration();
+
+    AlertConfiguration configuration2 =
+        alertConfigurationService
+            .createConfigurationTemplate(customer, AlertTemplate.HEALTH_CHECK_ERROR)
+            .getDefaultConfiguration();
+    AlertConfigurationThreshold warningThreshold =
+        new AlertConfigurationThreshold().setCondition(Condition.GREATER_THAN).setThreshold(1D);
+    configuration2.setThresholds(ImmutableMap.of(Severity.WARNING, warningThreshold));
+    AlertConfigurationTarget target =
+        new AlertConfigurationTarget()
+            .setAll(false)
+            .setUuids(ImmutableSet.of(universe.getUniverseUUID()));
+    configuration2.setTarget(target);
+    configuration2.setActive(false);
+    alertConfigurationService.save(configuration2);
+
+    AlertConfiguration platformConfiguration =
+        alertConfigurationService
+            .createConfigurationTemplate(customer, AlertTemplate.ALERT_QUERY_FAILED)
+            .getDefaultConfiguration();
+    platformConfiguration.setDefaultDestination(false);
+    alertConfigurationService.save(platformConfiguration);
+
+    // Empty filter
+    AlertConfigurationFilter filter = AlertConfigurationFilter.builder().build();
+    assertFind(filter, configuration, configuration2, platformConfiguration);
+
+    // Name filter
+    filter =
+        AlertConfigurationFilter.builder().name(AlertTemplate.MEMORY_CONSUMPTION.getName()).build();
+    assertFind(filter, configuration);
+
+    // Active filter
+    filter = AlertConfigurationFilter.builder().active(true).build();
+    assertFind(filter, configuration, platformConfiguration);
+
+    // Target type filter
+    filter = AlertConfigurationFilter.builder().targetType(TargetType.UNIVERSE).build();
+    assertFind(filter, configuration, configuration2);
+
+    // Target filter
+    filter =
+        AlertConfigurationFilter.builder()
+            .targetType(TargetType.UNIVERSE)
+            .target(
+                new AlertConfigurationTarget()
+                    .setAll(false)
+                    .setUuids(ImmutableSet.of(universe.getUniverseUUID())))
+            .build();
+    assertFind(filter, configuration, configuration2);
+
+    filter =
+        AlertConfigurationFilter.builder()
+            .targetType(TargetType.UNIVERSE)
+            .target(
+                new AlertConfigurationTarget()
+                    .setAll(false)
+                    .setUuids(ImmutableSet.of(UUID.randomUUID())))
+            .build();
+    assertFind(filter, configuration);
+
+    filter =
+        AlertConfigurationFilter.builder()
+            .target(new AlertConfigurationTarget().setAll(true))
+            .build();
+    assertFind(filter, configuration, platformConfiguration);
+
+    // Template filter
+    filter = AlertConfigurationFilter.builder().template(AlertTemplate.MEMORY_CONSUMPTION).build();
+    assertFind(filter, configuration);
+
+    // Severity filter
+    filter = AlertConfigurationFilter.builder().severity(Severity.WARNING).build();
+    assertFind(filter, configuration2);
+
+    // Destination Type filter
+    filter =
+        AlertConfigurationFilter.builder()
+            .destinationType(DestinationType.SELECTED_DESTINATION)
+            .build();
+    assertFind(filter, configuration);
+
+    filter =
+        AlertConfigurationFilter.builder()
+            .destinationType(DestinationType.DEFAULT_DESTINATION)
+            .build();
+    assertFind(filter, configuration2);
+
+    filter =
+        AlertConfigurationFilter.builder().destinationType(DestinationType.NO_DESTINATION).build();
+    assertFind(filter, platformConfiguration);
+
+    // Destination UUID filter
+    filter = AlertConfigurationFilter.builder().destinationUuid(alertDestination.getUuid()).build();
+    assertFind(filter, configuration);
+  }
+
+  private void assertFind(AlertConfigurationFilter filter, AlertConfiguration... configurations) {
+    List<AlertConfiguration> queried = alertConfigurationService.list(filter);
+    assertThat(queried, hasSize(configurations.length));
+    assertThat(queried, containsInAnyOrder(configurations));
+  }
+
+  @Test
+  public void testSort() {
+    Date now = new Date();
+    AlertConfiguration configuration =
+        alertConfigurationService
+            .createConfigurationTemplate(customer, AlertTemplate.MEMORY_CONSUMPTION)
+            .getDefaultConfiguration();
+    configuration.setDestinationUUID(alertDestination.getUuid());
+    configuration.setDefaultDestination(false);
+    configuration.setCreateTime(Date.from(now.toInstant().minusSeconds(5)));
+    configuration.generateUUID();
+    configuration.setUuid(replaceFirstChar(configuration.getUuid(), 'a'));
+    configuration.save();
+
+    AlertConfiguration configuration2 =
+        alertConfigurationService
+            .createConfigurationTemplate(customer, AlertTemplate.HEALTH_CHECK_ERROR)
+            .getDefaultConfiguration();
+    AlertConfigurationThreshold warningThreshold =
+        new AlertConfigurationThreshold().setCondition(Condition.GREATER_THAN).setThreshold(1D);
+    configuration2.setThresholds(ImmutableMap.of(Severity.WARNING, warningThreshold));
+    AlertConfigurationTarget target =
+        new AlertConfigurationTarget()
+            .setAll(false)
+            .setUuids(ImmutableSet.of(universe.getUniverseUUID()));
+    configuration2.setTarget(target);
+    configuration2.setActive(false);
+    configuration2.setCreateTime(Date.from(now.toInstant().minusSeconds(2)));
+    configuration2.generateUUID();
+    configuration2.setUuid(replaceFirstChar(configuration2.getUuid(), 'b'));
+    configuration2.save();
+
+    AlertConfiguration platformConfiguration =
+        alertConfigurationService
+            .createConfigurationTemplate(customer, AlertTemplate.ALERT_QUERY_FAILED)
+            .getDefaultConfiguration();
+    platformConfiguration.setDefaultDestination(false);
+    platformConfiguration.setCreateTime(now);
+    platformConfiguration.generateUUID();
+    platformConfiguration.setUuid(replaceFirstChar(platformConfiguration.getUuid(), 'c'));
+    platformConfiguration.save();
+
+    AlertDefinition definition =
+        ModelFactory.createAlertDefinition(customer, universe, configuration);
+    ModelFactory.createAlert(customer, universe, definition);
+
+    assertSort(
+        SortBy.uuid, SortDirection.ASC, configuration, configuration2, platformConfiguration);
+    assertSort(
+        SortBy.name, SortDirection.DESC, configuration, configuration2, platformConfiguration);
+    assertSort(
+        SortBy.active, SortDirection.ASC, configuration2, configuration, platformConfiguration);
+    assertSort(
+        SortBy.targetType,
+        SortDirection.DESC,
+        configuration,
+        configuration2,
+        platformConfiguration);
+    assertSort(
+        SortBy.createTime,
+        SortDirection.DESC,
+        platformConfiguration,
+        configuration2,
+        configuration);
+    assertSort(
+        SortBy.template, SortDirection.ASC, platformConfiguration, configuration2, configuration);
+    assertSort(
+        SortBy.severity, SortDirection.ASC, configuration2, configuration, platformConfiguration);
+    assertSort(
+        SortBy.destination,
+        SortDirection.DESC,
+        configuration2,
+        platformConfiguration,
+        configuration);
+    assertSort(
+        SortBy.alertCount, SortDirection.ASC, configuration2, platformConfiguration, configuration);
+  }
+
+  private void assertSort(
+      SortBy sortBy, SortDirection direction, AlertConfiguration... configurations) {
+    AlertConfigurationFilter filter = AlertConfigurationFilter.builder().build();
+    AlertConfigurationPagedQuery query = new AlertConfigurationPagedQuery();
+    query.setFilter(filter);
+    query.setSortBy(sortBy);
+    query.setDirection(direction);
+    query.setLimit(3);
+    List<AlertConfiguration> queried = alertConfigurationService.pagedList(query).getEntities();
+    assertThat(queried, hasSize(configurations.length));
+    assertThat(queried, contains(configurations));
   }
 
   @Test
@@ -379,6 +670,23 @@ public class AlertConfigurationTest extends FakeDBApplication {
         "errorJson: {\"customerUUID\":[\"can't change for configuration 'Memory Consumption'\"]}");
   }
 
+  @Test
+  public void testTransactions() {
+    AlertConfiguration configuration = createTestConfiguration();
+    CallableSql dropTable = Ebean.createCallableSql("drop table maintenance_window");
+    Ebean.execute(dropTable);
+
+    configuration.setMaintenanceWindowUuids(ImmutableSet.of(UUID.randomUUID()));
+
+    assertThat(
+        () -> alertConfigurationService.save(configuration),
+        thrown(
+            PersistenceException.class, containsString("Table \"MAINTENANCE_WINDOW\" not found")));
+
+    AlertConfiguration updated = alertConfigurationService.get(configuration.getUuid());
+    assertThat(updated.getMaintenanceWindowUuids(), nullValue());
+  }
+
   private void testValidationCreate(Consumer<AlertConfiguration> modifier, String expectedMessage) {
     testValidation(modifier, expectedMessage, true);
   }
@@ -399,6 +707,100 @@ public class AlertConfigurationTest extends FakeDBApplication {
     assertThat(
         () -> alertConfigurationService.save(configuration),
         thrown(PlatformServiceException.class, expectedMessage));
+  }
+
+  @Test
+  // @formatter:off
+  @Parameters({
+    "REPLICATION_LAG|Average replication lag for universe 'Test Universe'"
+        + " is above 180000 ms. Current value is 180001 ms",
+    "CLOCK_SKEW|Max clock skew for universe 'Test Universe'"
+        + " is above 500 ms. Current value is 501 ms",
+    "MEMORY_CONSUMPTION|Average memory usage for universe 'Test Universe'"
+        + " is above 90%. Current value is 91%",
+    "HEALTH_CHECK_ERROR|Failed to perform health check for universe 'Test Universe': "
+        + "Some error occurred",
+    "HEALTH_CHECK_NOTIFICATION_ERROR|Failed to perform health check notification for universe "
+        + "'Test Universe': Some error occurred",
+    "BACKUP_FAILURE|Last backup task for universe 'Test Universe' failed: " + "Some error occurred",
+    "BACKUP_SCHEDULE_FAILURE|Last attempt to run scheduled backup for universe 'Test Universe'"
+        + " failed due to other backup or universe operation is in progress.",
+    "INACTIVE_CRON_NODES|1 node(s) has inactive cronjob for universe 'Test Universe'.",
+    "ALERT_QUERY_FAILED|Last alert query for customer 'Customer' failed: " + "Some error occurred",
+    "ALERT_CONFIG_WRITING_FAILED|Last alert rules sync for customer 'Customer' failed: "
+        + "Some error occurred",
+    "ALERT_NOTIFICATION_ERROR|Last attempt to send alert notifications for customer 'Customer'"
+        + " failed: Some error occurred",
+    "ALERT_NOTIFICATION_CHANNEL_ERROR|Last attempt to send alert notifications to channel "
+        + "'Some Channel' failed: Some error occurred",
+    "NODE_DOWN|1 DB node(s) are down for more than 15 minutes for universe 'Test Universe'.",
+    "NODE_RESTART|Universe 'Test Universe' DB node is restarted 3 times during last 30 minutes",
+    "NODE_CPU_USAGE|Average node CPU usage for universe 'Test Universe' is above 95%"
+        + " on 1 node(s).",
+    "NODE_DISK_USAGE|Node disk usage for universe 'Test Universe' is above 70% on 1 node(s).",
+    "NODE_FILE_DESCRIPTORS_USAGE|Node file descriptors usage for universe 'Test Universe'"
+        + " is above 70% on 1 node(s).",
+    "NODE_OOM_KILLS|More than 3 OOM kills detected for universe 'Test Universe'" + " on 1 node(s).",
+    "DB_VERSION_MISMATCH|Version mismatch detected for universe 'Test Universe'"
+        + " for 1 Master/TServer instance(s).",
+    "DB_INSTANCE_DOWN|1 DB Master/TServer instance(s) are down for more than 15 minutes "
+        + "for universe 'Test Universe'.",
+    "DB_INSTANCE_RESTART|Universe 'Test Universe' Master or TServer is restarted 3 times"
+        + " during last 30 minutes",
+    "DB_FATAL_LOGS|Fatal logs detected for universe 'Test Universe' on "
+        + "1 Master/TServer instance(s).",
+    "DB_ERROR_LOGS|Error logs detected for universe 'Test Universe' on "
+        + "1 Master/TServer instance(s).",
+    "DB_CORE_FILES|Core files detected for universe 'Test Universe' on " + "1 TServer instance(s).",
+    "DB_YSQL_CONNECTION|YSQLSH connection failure detected for universe 'Test Universe'"
+        + " on 1 TServer instance(s).",
+    "DB_YCQL_CONNECTION|CQLSH connection failure detected for universe 'Test Universe'"
+        + " on 1 TServer instance(s).",
+    "DB_REDIS_CONNECTION|Redis connection failure detected for universe 'Test Universe'"
+        + " on 1 TServer instance(s).",
+    "DB_MEMORY_OVERLOAD|DB memory rejections detected for universe 'Test Universe'.",
+    "DB_COMPACTION_OVERLOAD|DB compaction rejections detected for universe 'Test Universe'.",
+    "DB_QUEUES_OVERFLOW|DB queues overflow detected for universe 'Test Universe'.",
+    "NODE_TO_NODE_CA_CERT_EXPIRY|Node to node CA certificate for universe 'Test Universe'"
+        + " will expire in 29 days.",
+    "NODE_TO_NODE_CERT_EXPIRY|Node to node certificate for universe 'Test Universe'"
+        + " will expire in 29 days.",
+    "CLIENT_TO_NODE_CA_CERT_EXPIRY|Client to node CA certificate for universe 'Test Universe'"
+        + " will expire in 29 days.",
+    "CLIENT_TO_NODE_CERT_EXPIRY|Client to node certificate for universe 'Test Universe'"
+        + " will expire in 29 days.",
+    "YSQL_OP_AVG_LATENCY|Average YSQL operations latency for universe 'Test Universe'"
+        + " is above 10000 ms. Current value is 10001 ms",
+    "YCQL_OP_AVG_LATENCY|Average YCQL operations latency for universe 'Test Universe'"
+        + " is above 10000 ms. Current value is 10001 ms",
+    "YSQL_OP_P99_LATENCY|YSQL P99 latency for universe 'Test Universe'"
+        + " is above 60000 ms. Current value is 60001 ms",
+    "YCQL_OP_P99_LATENCY|YCQL P99 latency for universe 'Test Universe'"
+        + " is above 60000 ms. Current value is 60001 ms",
+    "HIGH_NUM_YCQL_CONNECTIONS|Number of YCQL connections for universe 'Test Universe'"
+        + " is above 1000. Current value is 1001",
+    "HIGH_NUM_YEDIS_CONNECTIONS|Number of YEDIS connections for universe 'Test Universe'"
+        + " is above 1000. Current value is 1001",
+    "YSQL_THROUGHPUT|Maximum throughput for YSQL operations for universe 'Test Universe'"
+        + " is above 100000. Current value is 100001",
+    "YCQL_THROUGHPUT|Maximum throughput for YCQL operations for universe 'Test Universe'"
+        + " is above 100000. Current value is 100001"
+  })
+  // @formatter:on
+  public void testTestAlertMessage(AlertTemplate template, String message) {
+    AlertConfiguration configuration =
+        alertConfigurationService
+            .createConfigurationTemplate(customer, template)
+            .getDefaultConfiguration();
+    if (configuration.getTargetType() == TargetType.UNIVERSE) {
+      configuration.setTarget(
+          new AlertConfigurationTarget()
+              .setAll(false)
+              .setUuids(ImmutableSet.of(universe.getUniverseUUID())));
+    }
+    alertConfigurationService.save(configuration);
+    Alert testAlert = alertConfigurationService.createTestAlert(configuration);
+    assertThat(testAlert.getMessage(), equalTo("[TEST ALERT!!!] " + message));
   }
 
   private AlertConfiguration createTestConfiguration() {

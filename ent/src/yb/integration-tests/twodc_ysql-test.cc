@@ -22,8 +22,9 @@
 
 #include "yb/common/common.pb.h"
 #include "yb/common/entity_ids.h"
-#include "yb/common/wire_protocol.h"
+#include "yb/common/ql_value.h"
 #include "yb/common/schema.h"
+#include "yb/common/wire_protocol.h"
 
 #include "yb/cdc/cdc_service.h"
 #include "yb/cdc/cdc_service.pb.h"
@@ -47,14 +48,17 @@
 #include "yb/integration-tests/mini_cluster.h"
 #include "yb/integration-tests/twodc_test_base.h"
 #include "yb/integration-tests/yb_mini_cluster_test_base.h"
-#include "yb/master/catalog_entity_info.h"
-#include "yb/master/catalog_manager.h"
-#include "yb/master/mini_master.h"
-#include "yb/master/master.h"
-#include "yb/master/master.pb.h"
-#include "yb/master/master-test-util.h"
 
 #include "yb/master/cdc_consumer_registry_service.h"
+#include "yb/master/mini_master.h"
+#include "yb/master/master.h"
+#include "yb/master/master_cluster.proxy.h"
+#include "yb/master/master_ddl.proxy.h"
+#include "yb/master/master_replication.proxy.h"
+#include "yb/master/master-test-util.h"
+#include "yb/master/sys_catalog_initialization.h"
+
+#include "yb/rpc/rpc_controller.h"
 #include "yb/tablet/tablet.h"
 #include "yb/tablet/tablet_peer.h"
 #include "yb/tserver/mini_tablet_server.h"
@@ -79,8 +83,9 @@ DECLARE_int32(replication_factor);
 DECLARE_int32(cdc_max_apply_batch_num_records);
 DECLARE_int32(client_read_write_timeout_ms);
 DECLARE_int32(pgsql_proxy_webserver_port);
-DECLARE_bool(master_auto_run_initdb);
+DECLARE_bool(enable_ysql);
 DECLARE_bool(hide_pg_catalog_table_creation_logs);
+DECLARE_bool(master_auto_run_initdb);
 DECLARE_int32(pggate_rpc_timeout_secs);
 
 namespace yb {
@@ -215,13 +220,13 @@ class TwoDCYsqlTest : public TwoDCTestBase, public testing::WithParamInterface<T
     master::GetMasterClusterConfigRequestPB req;
     master::GetMasterClusterConfigResponsePB resp;
 
-    auto master_proxy = std::make_shared<master::MasterServiceProxy>(
+    master::MasterClusterProxy master_proxy(
         &cluster->client_->proxy_cache(),
         VERIFY_RESULT(cluster->mini_cluster_->GetLeaderMasterBoundRpcAddr()));
 
     rpc::RpcController rpc;
     rpc.set_timeout(MonoDelta::FromSeconds(kRpcTimeout));
-    RETURN_NOT_OK(master_proxy->GetMasterClusterConfig(req, &resp, &rpc));
+    RETURN_NOT_OK(master_proxy.GetMasterClusterConfig(req, &resp, &rpc));
     if (resp.has_error()) {
       return STATUS(IllegalState, "Error getting cluster config");
     }
@@ -273,13 +278,13 @@ class TwoDCYsqlTest : public TwoDCTestBase, public testing::WithParamInterface<T
       req.add_relation_type_filter(master::USER_TABLE_RELATION);
     }
 
-    auto master_proxy = std::make_shared<master::MasterServiceProxy>(
+    master::MasterDdlProxy master_proxy(
         &cluster->client_->proxy_cache(),
         VERIFY_RESULT(cluster->mini_cluster_->GetLeaderMiniMaster())->bound_rpc_addr());
 
     rpc::RpcController rpc;
     rpc.set_timeout(MonoDelta::FromSeconds(kRpcTimeout));
-    RETURN_NOT_OK(master_proxy->ListTables(req, &resp, &rpc));
+    RETURN_NOT_OK(master_proxy.ListTables(req, &resp, &rpc));
     if (resp.has_error()) {
       return STATUS(IllegalState, "Failed listing tables");
     }
@@ -454,8 +459,8 @@ TEST_P(TwoDCYsqlTest, SimpleReplication) {
   master::GetUniverseReplicationResponsePB get_universe_replication_resp;
   ASSERT_OK(VerifyUniverseReplication(consumer_cluster(), consumer_client(), kUniverseId,
       &get_universe_replication_resp));
-  ASSERT_OK(CorrectlyPollingAllTablets(consumer_cluster(),
-                                       tables_vector.size() * kNTabletsPerTable));
+  ASSERT_OK(CorrectlyPollingAllTablets(
+      consumer_cluster(), narrow_cast<uint32_t>(tables_vector.size() * kNTabletsPerTable)));
 
   auto data_replicated_correctly = [&](int num_results) -> Result<bool> {
     for (const auto& consumer_table : consumer_tables) {
@@ -496,7 +501,7 @@ TEST_P(TwoDCYsqlTest, SetupUniverseReplicationWithProducerBootstrapId) {
   auto tables = ASSERT_RESULT(SetUpWithParams(tables_vector, tables_vector, 3));
   const string kUniverseId = ASSERT_RESULT(GetUniverseId(&producer_cluster_));
   auto* producer_leader_mini_master = ASSERT_RESULT(producer_cluster()->GetLeaderMiniMaster());
-  auto producer_master_proxy = std::make_shared<master::MasterServiceProxy>(
+  auto producer_master_proxy = std::make_shared<master::MasterReplicationProxy>(
       &producer_client()->proxy_cache(),
       producer_leader_mini_master->bound_rpc_addr());
 
@@ -536,7 +541,7 @@ TEST_P(TwoDCYsqlTest, SetupUniverseReplicationWithProducerBootstrapId) {
   }
 
   rpc::RpcController rpc;
-  producer_cdc_proxy->BootstrapProducer(req, &resp, &rpc);
+  ASSERT_OK(producer_cdc_proxy->BootstrapProducer(req, &resp, &rpc));
   ASSERT_FALSE(resp.has_error());
 
   ASSERT_EQ(resp.cdc_bootstrap_ids().size(), producer_tables.size());
@@ -594,7 +599,8 @@ TEST_P(TwoDCYsqlTest, SetupUniverseReplicationWithProducerBootstrapId) {
   auto hp_vec = ASSERT_RESULT(HostPort::ParseStrings(master_addr, 0));
   HostPortsToPBs(hp_vec, setup_universe_req.mutable_producer_master_addresses());
 
-  setup_universe_req.mutable_producer_table_ids()->Reserve(producer_tables.size());
+  setup_universe_req.mutable_producer_table_ids()->Reserve(
+      narrow_cast<int>(producer_tables.size()));
   for (const auto& producer_table : producer_tables) {
     setup_universe_req.add_producer_table_ids(producer_table->id());
     const auto& iter = table_bootstrap_ids.find(producer_table->id());
@@ -603,21 +609,21 @@ TEST_P(TwoDCYsqlTest, SetupUniverseReplicationWithProducerBootstrapId) {
   }
 
   auto* consumer_leader_mini_master = ASSERT_RESULT(consumer_cluster()->GetLeaderMiniMaster());
-  auto master_proxy = std::make_shared<master::MasterServiceProxy>(
+  master::MasterReplicationProxy master_proxy(
       &consumer_client()->proxy_cache(),
       consumer_leader_mini_master->bound_rpc_addr());
 
   rpc.Reset();
   rpc.set_timeout(MonoDelta::FromSeconds(kRpcTimeout));
-  ASSERT_OK(master_proxy->SetupUniverseReplication(setup_universe_req, &setup_universe_resp, &rpc));
+  ASSERT_OK(master_proxy.SetupUniverseReplication(setup_universe_req, &setup_universe_resp, &rpc));
   ASSERT_FALSE(setup_universe_resp.has_error());
 
   // 3. Verify everything is setup correctly.
   master::GetUniverseReplicationResponsePB get_universe_replication_resp;
   ASSERT_OK(VerifyUniverseReplication(consumer_cluster(), consumer_client(), kUniverseId,
       &get_universe_replication_resp));
-  ASSERT_OK(CorrectlyPollingAllTablets(consumer_cluster(),
-                                       tables_vector.size() * kNTabletsPerTable));
+  ASSERT_OK(CorrectlyPollingAllTablets(
+      consumer_cluster(), narrow_cast<uint32_t>(tables_vector.size() * kNTabletsPerTable)));
 
   // 4. Write more data.
   for (const auto& producer_table : producer_tables) {
@@ -722,7 +728,7 @@ TEST_P(TwoDCYsqlTest, ColocatedDatabaseReplication) {
   setup_universe_req.add_producer_table_ids(
       ns_resp.namespace_().id() + master::kColocatedParentTableIdSuffix);
   auto* consumer_leader_mini_master = ASSERT_RESULT(consumer_cluster()->GetLeaderMiniMaster());
-  auto master_proxy = std::make_shared<master::MasterServiceProxy>(
+  auto master_proxy = std::make_shared<master::MasterReplicationProxy>(
       &consumer_client()->proxy_cache(),
       consumer_leader_mini_master->bound_rpc_addr());
 

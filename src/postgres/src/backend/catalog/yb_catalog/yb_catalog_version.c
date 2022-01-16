@@ -15,6 +15,7 @@
 #include "access/sysattr.h"
 #include "catalog/catalog.h"
 #include "catalog/pg_database.h"
+#include "catalog/pg_namespace_d.h"
 #include "catalog/pg_proc.h"
 #include "catalog/pg_type.h"
 #include "catalog/pg_yb_catalog_version.h"
@@ -25,6 +26,7 @@
 #include "nodes/makefuncs.h"
 #include "utils/catcache.h"
 #include "utils/fmgroids.h"
+#include "utils/lsyscache.h"
 #include "utils/rel.h"
 
 #include "yb/yql/pggate/ybc_pggate.h"
@@ -37,21 +39,30 @@ static FormData_pg_attribute Desc_pg_yb_catalog_version[Natts_pg_yb_catalog_vers
 };
 
 static YbCatalogVersionType YbGetCatalogVersionType();
-static void YbGetMasterCatalogVersionFromTable(uint64_t *version);
+static bool YbGetMasterCatalogVersionFromTable(uint64_t *version);
 static bool YbIsSystemCatalogChange(Relation rel);
 
 /* Retrieve Catalog Version */
 
-void YbGetMasterCatalogVersion(uint64_t *version)
+uint64_t YbGetMasterCatalogVersion()
 {
-	switch (YbGetCatalogVersionType()) {
+	uint64_t version = YB_CATCACHE_VERSION_UNINITIALIZED;
+	switch (YbGetCatalogVersionType())
+	{
 		case CATALOG_VERSION_CATALOG_TABLE:
-			YbGetMasterCatalogVersionFromTable(version);
-			return;
+			if (YbGetMasterCatalogVersionFromTable(&version))
+				return version;
+			/*
+			 * In spite of the fact the pg_yb_catalog_version table exists it has no actual
+			 * version (this could happen during YSQL upgrade),
+			 * fallback to an old protobuf mechanism until the next cache refresh.
+			 */
+			yb_catalog_version_type = CATALOG_VERSION_PROTOBUF_ENTRY;
+			switch_fallthrough();
 		case CATALOG_VERSION_PROTOBUF_ENTRY:
-		    /* deprecated (kept for compatibility with old clusters). */
-			HandleYBStatus(YBCPgGetCatalogMasterVersion(version));
-			return;
+			/* deprecated (kept for compatibility with old clusters). */
+			HandleYBStatus(YBCPgGetCatalogMasterVersion(&version));
+			return version;
 
 		case CATALOG_VERSION_UNSET: /* should not happen. */
 			break;
@@ -59,15 +70,15 @@ void YbGetMasterCatalogVersion(uint64_t *version)
 	ereport(FATAL,
 			(errcode(ERRCODE_INTERNAL_ERROR),
 				errmsg("Catalog version type was not set, cannot load system catalog.")));
+	return version;
 }
 
 /* Modify Catalog Version */
 
 bool YbIncrementMasterCatalogVersionTableEntry(bool is_breaking_change)
 {
-	if (YbGetCatalogVersionType() != CATALOG_VERSION_CATALOG_TABLE) {
+	if (YbGetCatalogVersionType() != CATALOG_VERSION_CATALOG_TABLE)
 		return false;
-	}
 
 	YBCPgStatement update_stmt    = NULL;
 	HeapTuple tuple = NULL;
@@ -200,27 +211,25 @@ bool YbMarkStatementIfCatalogVersionIncrement(YBCPgStatement ybc_stmt, Relation 
 	return is_syscatalog_version_change;
 }
 
-/* Local utility methods. */
-YbCatalogVersionType YbGetCatalogVersionType() {
-
-	if (yb_catalog_version_type == CATALOG_VERSION_UNSET)
+YbCatalogVersionType YbGetCatalogVersionType()
+{
+	if (IsBootstrapProcessingMode())
 	{
-		/* First call, need to set the version type. */
-		bool catalog_version_table_exists = false;
-		HandleYBStatus(YBCPgTableExists(TemplateDbOid,
-		                                YBCatalogVersionRelationId,
-		                                &catalog_version_table_exists));
-
-		if (catalog_version_table_exists)
-		{
-			yb_catalog_version_type = CATALOG_VERSION_CATALOG_TABLE;
-		}
-		else
-		{
-			yb_catalog_version_type = CATALOG_VERSION_PROTOBUF_ENTRY;
-		}
+		/*
+		 * We don't have the catalog version table at the start of initdb,
+		 * and there's no point in switching later on.
+		 */
+		yb_catalog_version_type = CATALOG_VERSION_PROTOBUF_ENTRY;
 	}
-
+	else if (yb_catalog_version_type == CATALOG_VERSION_UNSET)
+	{
+		bool catalog_version_table_exists = false;
+		HandleYBStatus(YBCPgTableExists(
+		    TemplateDbOid, YBCatalogVersionRelationId, &catalog_version_table_exists));
+		yb_catalog_version_type = catalog_version_table_exists
+		    ? CATALOG_VERSION_CATALOG_TABLE
+		    : CATALOG_VERSION_PROTOBUF_ENTRY;
+	}
 	return yb_catalog_version_type;
 }
 
@@ -235,8 +244,8 @@ bool YbIsSystemCatalogChange(Relation rel)
 }
 
 
-void YbGetMasterCatalogVersionFromTable(uint64_t *version) {
-
+bool YbGetMasterCatalogVersionFromTable(uint64_t *version)
+{
 	*version = 0; // unset;
 
 	int natts = Natts_pg_yb_catalog_version;
@@ -244,16 +253,14 @@ void YbGetMasterCatalogVersionFromTable(uint64_t *version) {
 	 * pg_yb_catalog_version is a shared catalog table, so as per DocDB store,
 	 * it belongs to the template1 database.
 	 */
-	int cat_ver_dboid = TemplateDbOid;
-	int cat_ver_relid = YBCatalogVersionRelationId;
 	int oid_attnum = Anum_pg_yb_catalog_version_db_oid;
 	int current_version_attnum = Anum_pg_yb_catalog_version_current_version;
 	Form_pg_attribute oid_attrdesc = &Desc_pg_yb_catalog_version[oid_attnum - 1];
 
 	YBCPgStatement ybc_stmt;
 
-	HandleYBStatus(YBCPgNewSelect(cat_ver_dboid,
-	                              cat_ver_relid,
+	HandleYBStatus(YBCPgNewSelect(TemplateDbOid,
+	                              YBCatalogVersionRelationId,
 	                              NULL /* prepare_params */,
 	                              &ybc_stmt));
 
@@ -298,10 +305,13 @@ void YbGetMasterCatalogVersionFromTable(uint64_t *version) {
 	                             &syscols,
 	                             &has_data));
 
+	bool result = false;
 	if (has_data)
 	{
 		*version = (uint64_t) DatumGetInt64(values[current_version_attnum - 1]);
+		result = true;
 	}
 	pfree(values);
 	pfree(nulls);
+	return result;
 }

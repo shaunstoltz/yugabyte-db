@@ -40,7 +40,7 @@ static void dropTablespaces(PGconn *conn);
 static void dumpTablespaces(PGconn *conn);
 static void dropDBs(PGconn *conn);
 static void dumpUserConfig(PGconn *conn, const char *username);
-static void dumpDatabases(PGconn *conn);
+static void dumpDatabases(PGconn *conn, const char *pgdb);
 static void dumpTimestamp(const char *msg);
 static int	runPgDump(const char *dbname, const char *create_opts);
 static void buildShSecLabels(PGconn *conn,
@@ -79,6 +79,9 @@ static int	no_unlogged_table_data = 0;
 static int	no_role_passwords = 0;
 static int	server_version;
 static int	load_via_partition_root = 0;
+static int	include_yb_metadata = 0;	/* In this mode DDL statements include YB specific
+										 * metadata such as tablet partitions. */
+static int	dump_single_database = 0;	/* Dump only one DB specified by '--database' argument. */
 
 static char role_catalog[10];
 #define PG_AUTHID "pg_authid"
@@ -141,6 +144,8 @@ main(int argc, char *argv[])
 		{"no-subscriptions", no_argument, &no_subscriptions, 1},
 		{"no-sync", no_argument, NULL, 4},
 		{"no-unlogged-table-data", no_argument, &no_unlogged_table_data, 1},
+		{"include-yb-metadata", no_argument, &include_yb_metadata, 1},
+		{"dump-single-database", no_argument, &dump_single_database, 1},
 
 		{NULL, 0, NULL, 0}
 	};
@@ -248,7 +253,7 @@ main(int argc, char *argv[])
 				pgdb = pg_strdup(optarg);
 				break;
 
-			case 'm':           /* YB master hosts */
+			case 'm':           /* DEPRECATED and NOT USED: YB master hosts */
 				masterHosts = pg_strdup(optarg);
 				break;
 
@@ -414,6 +419,8 @@ main(int argc, char *argv[])
 		appendPQExpBufferStr(pgdumpopts, " --no-subscriptions");
 	if (no_unlogged_table_data)
 		appendPQExpBufferStr(pgdumpopts, " --no-unlogged-table-data");
+	if (include_yb_metadata)
+		appendPQExpBufferStr(pgdumpopts, " --include-yb-metadata");
 
 	/*
 	 * If there was a database specified on the command line, use that,
@@ -568,7 +575,8 @@ main(int argc, char *argv[])
 	}
 
 	if (!globals_only && !roles_only && !tablespaces_only)
-		dumpDatabases(conn);
+		/* Dump one DB only with '--dump-single-database'. */
+		dumpDatabases(conn, dump_single_database ? pgdb : NULL);
 
 	PQfinish(conn);
 
@@ -614,6 +622,7 @@ help(void)
 	printf(_("  -S, --superuser=NAME         superuser user name to use in the dump\n"));
 	printf(_("  -t, --tablespaces-only       dump only tablespaces, no databases or roles\n"));
 	printf(_("  -x, --no-privileges          do not dump privileges (grant/revoke)\n"));
+	printf(_("  --dump-single-database       dump only one DB specified by '--database' argument\n"));
 	printf(_("  --binary-upgrade             for use by upgrade utilities only\n"));
 	printf(_("  --column-inserts             dump data as INSERT commands with column names\n"));
 	printf(_("  --disable-dollar-quoting     disable dollar quoting, use SQL standard quoting\n"));
@@ -633,7 +642,8 @@ help(void)
 	printf(_("  --use-set-session-authorization\n"
 			 "                               use SET SESSION AUTHORIZATION commands instead of\n"
 			 "                               ALTER OWNER commands to set ownership\n"));
-	printf(_("  -m, --masters=HOST:PORT      comma-separated list of YB-Master hosts and ports\n"));
+	printf(_("  -m, --masters=HOST:PORT      DEPRECATED and NOT USED\n"
+			 "                               comma-separated list of YB-Master hosts and ports\n"));
 
 	printf(_("\nConnection options:\n"));
 	printf(_("  -d, --dbname=CONNSTR     connect using connection string\n"));
@@ -1379,7 +1389,7 @@ dumpUserConfig(PGconn *conn, const char *username)
  * Dump contents of databases.
  */
 static void
-dumpDatabases(PGconn *conn)
+dumpDatabases(PGconn *conn, const char *pgdb)
 {
 	PGresult   *res;
 	int			i;
@@ -1406,6 +1416,9 @@ dumpDatabases(PGconn *conn)
 		char	   *dbname = PQgetvalue(res, i, 0);
 		const char *create_opts;
 		int			ret;
+
+		if (pgdb && strcmp(dbname, pgdb) != 0)
+			continue;
 
 		/* Skip template0, even if it's not marked !datallowconn. */
 		if (strcmp(dbname, "template0") == 0)
@@ -1478,13 +1491,10 @@ runPgDump(const char *dbname, const char *create_opts)
 					  pgdumpopts->data, create_opts);
 
 	/*
-	 * YB: If there is a custom YB-Master host to use, append that.
+	 * DEPRECATED: Custom YB-Master host/port to use.
 	 */
 	if (masterHosts != NULL)
-	{
-		appendPQExpBufferStr(cmd, " -m ");
-		appendPQExpBufferStr(cmd, masterHosts);
-	}
+		fprintf(stderr, "WARNING: ignoring the deprecated argument --masters (-m)\n");
 
 	/*
 	 * If we have a filename, use the undocumented plain-append pg_dump

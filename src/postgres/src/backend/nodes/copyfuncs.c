@@ -1242,6 +1242,17 @@ _copyPartitionPruneStepCombine(const PartitionPruneStepCombine *from)
 	return newnode;
 }
 
+static PartitionPruneStepFuncOp *
+_copyPartitionPruneStepFuncOp(const PartitionPruneStepFuncOp *from)
+{
+	PartitionPruneStepFuncOp *newnode = makeNode(PartitionPruneStepFuncOp);
+
+	COPY_SCALAR_FIELD(step.step_id);
+	COPY_NODE_FIELD(exprs);
+
+	return newnode;
+}
+
 /*
  * _copyPlanInvalItem
  */
@@ -4024,6 +4035,8 @@ _copyCreateTableGroupStmt(const CreateTableGroupStmt *from)
 	CreateTableGroupStmt *newnode = makeNode(CreateTableGroupStmt);
 
 	COPY_STRING_FIELD(tablegroupname);
+	COPY_STRING_FIELD(tablespacename);
+	COPY_NODE_FIELD(owner);
 	COPY_NODE_FIELD(options);
 	return newnode;
 }

@@ -16,12 +16,25 @@
 #ifndef YB_RPC_YB_RPC_H
 #define YB_RPC_YB_RPC_H
 
+#include <stdint.h>
+
+#include <cstdint>
+#include <cstdlib>
+#include <string>
+#include <type_traits>
+
+#include <boost/version.hpp>
+
+#include "yb/rpc/rpc_fwd.h"
 #include "yb/rpc/binary_call_parser.h"
 #include "yb/rpc/circular_read_buffer.h"
 #include "yb/rpc/connection_context.h"
 #include "yb/rpc/rpc_with_call_id.h"
+#include "yb/rpc/serialization.h"
 
 #include "yb/util/ev_util.h"
+#include "yb/util/net/net_fwd.h"
+#include "yb/util/size_literals.h"
 
 namespace yb {
 namespace rpc {
@@ -115,12 +128,14 @@ class YBInboundCall : public InboundCall {
   CHECKED_STATUS ParseFrom(const MemTrackerPtr& mem_tracker, CallData* call_data);
 
   int32_t call_id() const {
-    return header_.call_id();
+    return header_.call_id;
   }
 
-  const RemoteMethod& remote_method() const {
-    return remote_method_;
+  Slice serialized_remote_method() const override {
+    return header_.remote_method;
   }
+
+  Slice method_name() const override;
 
   // See RpcContext::AddRpcSidecar()
   virtual size_t AddRpcSidecar(Slice car);
@@ -136,7 +151,7 @@ class YBInboundCall : public InboundCall {
   //
   // This method deletes the InboundCall object, so no further calls may be
   // made after this one.
-  void RespondSuccess(const google::protobuf::MessageLite& response);
+  void RespondSuccess(AnyMessageConstPtr response);
 
   // Serializes a failure response into the internal buffer, marking the
   // call as a failure. Enqueues the response back to the connection that
@@ -170,23 +185,12 @@ class YBInboundCall : public InboundCall {
     return timing_.time_received;
   }
 
-  const std::string& method_name() const override {
-    return remote_method_.method_name();
-  }
-
-  const std::string& service_name() const override {
-    return remote_method_.service_name();
-  }
-
-  virtual CHECKED_STATUS ParseParam(google::protobuf::Message *message);
-
-  void RespondBadMethod();
+  virtual CHECKED_STATUS ParseParam(RpcCallParams* params);
 
   size_t ObjectSize() const override { return sizeof(*this); }
 
   size_t DynamicMemoryUsage() const override {
-    return InboundCall::DynamicMemoryUsage() +
-           DynamicMemoryUsageOf(header_, response_buf_, remote_method_);
+    return InboundCall::DynamicMemoryUsage() + DynamicMemoryUsageOf(response_buf_);
   }
 
  protected:
@@ -198,28 +202,23 @@ class YBInboundCall : public InboundCall {
   google::protobuf::RepeatedField<uint32_t> sidecar_offsets_;
 
   // Serialize and queue the response.
-  virtual void Respond(const google::protobuf::MessageLite& response, bool is_success);
+  virtual void Respond(AnyMessageConstPtr response, bool is_success);
 
  private:
   // Serialize a response message for either success or failure. If it is a success,
   // 'response' should be the user-defined response type for the call. If it is a
   // failure, 'response' should be an ErrorStatusPB instance.
-  CHECKED_STATUS SerializeResponseBuffer(const google::protobuf::MessageLite& response,
-                                         bool is_success);
+  CHECKED_STATUS SerializeResponseBuffer(AnyMessageConstPtr response, bool is_success);
 
   // Returns number of bytes copied.
   size_t CopyToLastSidecarBuffer(const Slice& slice);
   void AllocateSidecarBuffer(size_t size);
 
   // The header of the incoming call. Set by ParseFrom()
-  RequestHeader header_;
+  ParsedRequestHeader header_;
 
   // The buffers for serialized response. Set by SerializeResponseBuffer().
   RefCntBuffer response_buf_;
-
-  // Proto service this calls belongs to. Used for routing.
-  // This field is filled in when the inbound request header is parsed.
-  RemoteMethod remote_method_;
 
   ScopedTrackedConsumption consumption_;
 };

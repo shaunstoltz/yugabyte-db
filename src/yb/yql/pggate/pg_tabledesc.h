@@ -19,12 +19,10 @@
 #define YB_YQL_PGGATE_PG_TABLEDESC_H_
 
 #include "yb/common/pgsql_protocol.pb.h"
-#include "yb/client/client.h"
 #include "yb/client/yb_op.h"
-#include "yb/yql/pggate/pg_column.h"
-#include "yb/docdb/doc_key.h"
 
-#include "yb/tserver/pg_client.pb.h"
+#include "yb/yql/pggate/pg_column.h"
+#include "yb/yql/pggate/ybc_pg_typedefs.h"
 
 namespace yb {
 namespace pggate {
@@ -47,7 +45,7 @@ class PgTableDesc : public RefCountedThreadSafe<PgTableDesc> {
   // Find the column given the postgres attr number.
   Result<size_t> FindColumn(int attr_num) const;
 
-  CHECKED_STATUS GetColumnInfo(int16_t attr_number, bool *is_primary, bool *is_hash) const;
+  Result<YBCPgColumnInfo> GetColumnInfo(int16_t attr_number) const;
 
   bool IsHashPartitioned() const;
 

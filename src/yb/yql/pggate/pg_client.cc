@@ -15,16 +15,25 @@
 
 #include "yb/client/client-internal.h"
 #include "yb/client/table.h"
+#include "yb/client/table_info.h"
 #include "yb/client/tablet_server.h"
+#include "yb/client/yb_table_name.h"
 
 #include "yb/rpc/poller.h"
+#include "yb/rpc/rpc_controller.h"
 
+#include "yb/tserver/pg_client.pb.h"
 #include "yb/tserver/pg_client.proxy.h"
 #include "yb/tserver/tserver_shared_mem.h"
+
+#include "yb/util/result.h"
+#include "yb/util/shared_mem.h"
+#include "yb/util/status.h"
 
 #include "yb/yql/pggate/pg_tabledesc.h"
 
 DECLARE_bool(use_node_hostname_for_local_tserver);
+DECLARE_int32(backfill_index_client_rpc_timeout_ms);
 DECLARE_int32(yb_client_admin_operation_timeout_sec);
 
 DEFINE_uint64(pg_client_heartbeat_interval_ms, 10000, "Pg client heartbeat interval in ms.");
@@ -62,7 +71,7 @@ class PgClient::Impl {
 
     auto future = create_session_promise_.get_future();
     Heartbeat(true);
-    RETURN_NOT_OK(future.get());
+    session_id_ = VERIFY_RESULT(future.get());
     heartbeat_poller_.Start(scheduler, FLAGS_pg_client_heartbeat_interval_ms * 1ms - 1s);
     return Status::OK();
   }
@@ -81,16 +90,22 @@ class PgClient::Impl {
       }
     }
     tserver::PgHeartbeatRequestPB req;
-    req.set_create(create);
-    req.set_session_id(session_id_);
+    if (!create) {
+      req.set_session_id(session_id_);
+    }
     proxy_->HeartbeatAsync(
         req, &heartbeat_resp_, PrepareHeartbeatController(),
-        [create, this] {
+        [this, create] {
       auto status = ResponseStatus(heartbeat_resp_);
-      heartbeat_running_ = false;
       if (create) {
-        create_session_promise_.set_value(status);
-      } else if (!status.ok()) {
+        if (!status.ok()) {
+          create_session_promise_.set_value(status);
+        } else {
+          create_session_promise_.set_value(heartbeat_resp_.session_id());
+        }
+      }
+      heartbeat_running_ = false;
+      if (!status.ok()) {
         LOG(WARNING) << "Heartbeat failed: " << status;
       }
     });
@@ -178,6 +193,20 @@ class PgClient::Impl {
     return result;
   }
 
+  CHECKED_STATUS BackfillIndex(
+      tserver::PgBackfillIndexRequestPB* req, CoarseTimePoint deadline) {
+    tserver::PgBackfillIndexResponsePB resp;
+    req->set_session_id(session_id_);
+
+    // Use backfill_index_client_rpc_timeout_ms rather than yb_client_admin_operation_timeout_sec.
+    controller_.Reset();
+    DCHECK(deadline == CoarseTimePoint());
+    controller_.set_timeout(FLAGS_backfill_index_client_rpc_timeout_ms * 1ms);
+
+    RETURN_NOT_OK(proxy_->BackfillIndex(*req, &resp, &controller_));
+    return ResponseStatus(resp);
+  }
+
   Result<int32> TabletServerCount(bool primary_only) {
     if (tablet_server_count_cache_[primary_only] > 0) {
       return tablet_server_count_cache_[primary_only];
@@ -205,6 +234,12 @@ class PgClient::Impl {
       result.push_back(client::YBTabletServerPlacementInfo::FromPB(server));
     }
     return result;
+  }
+
+  CHECKED_STATUS ValidatePlacement(const tserver::PgValidatePlacementRequestPB* req) {
+    tserver::PgValidatePlacementResponsePB resp;
+    RETURN_NOT_OK(proxy_->ValidatePlacement(*req, &resp, PrepareAdminController()));
+    return ResponseStatus(resp);
   }
 
   #define YB_PG_CLIENT_SIMPLE_METHOD_IMPL(r, data, method) \
@@ -245,13 +280,13 @@ class PgClient::Impl {
 
   std::unique_ptr<tserver::PgClientServiceProxy> proxy_;
   rpc::RpcController controller_;
-  const uint64_t session_id_ = RandomUniformInt<uint64_t>();
+  uint64_t session_id_ = 0;
 
   rpc::Poller heartbeat_poller_;
   std::atomic<bool> heartbeat_running_{false};
   rpc::RpcController heartbeat_controller_;
   tserver::PgHeartbeatResponsePB heartbeat_resp_;
-  std::promise<Status> create_session_promise_;
+  std::promise<Result<uint64_t>> create_session_promise_;
   std::array<int, 2> tablet_server_count_cache_;
 };
 
@@ -301,12 +336,21 @@ Result<client::YBTableName> PgClient::DropTable(
   return impl_->DropTable(req, deadline);
 }
 
+Status PgClient::BackfillIndex(
+    tserver::PgBackfillIndexRequestPB* req, CoarseTimePoint deadline) {
+  return impl_->BackfillIndex(req, deadline);
+}
+
 Result<int32> PgClient::TabletServerCount(bool primary_only) {
   return impl_->TabletServerCount(primary_only);
 }
 
 Result<client::TabletServersInfo> PgClient::ListLiveTabletServers(bool primary_only) {
   return impl_->ListLiveTabletServers(primary_only);
+}
+
+Status PgClient::ValidatePlacement(const tserver::PgValidatePlacementRequestPB* req) {
+  return impl_->ValidatePlacement(req);
 }
 
 #define YB_PG_CLIENT_SIMPLE_METHOD_DEFINE(r, data, method) \

@@ -11,16 +11,21 @@
 // under the License.
 //
 
-#include <iostream>
+#include <algorithm>
+#include <cstdint>
+#include <random>
+#include <string>
 
-#include "yb/gutil/strings/substitute.h"
+#include <glog/logging.h>
+
 #include "yb/util/bytes_formatter.h"
 #include "yb/util/cast.h"
 #include "yb/util/fast_varint.h"
 #include "yb/util/random.h"
-#include "yb/util/random_util.h"
+#include "yb/util/result.h"
 #include "yb/util/test_macros.h"
 #include "yb/util/test_util.h"
+#include "yb/util/tsan_util.h"
 #include "yb/util/varint.h"
 
 using namespace std::literals;
@@ -90,7 +95,7 @@ void CheckEncoding(int64_t v) {
     static const string kPrefix = "some_prefix";
     string encoded_dest = kPrefix;
     FastEncodeDescendingSignedVarInt(-v, &encoded_dest);
-    const int encoded_size = encoded_dest.size() - kPrefix.size();
+    const auto encoded_size = encoded_dest.size() - kPrefix.size();
     ASSERT_EQ(correct_encoded,
               encoded_dest.substr(kPrefix.size(), encoded_size));
 

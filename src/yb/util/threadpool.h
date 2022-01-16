@@ -32,9 +32,11 @@
 #ifndef YB_UTIL_THREADPOOL_H
 #define YB_UTIL_THREADPOOL_H
 
+#include <condition_variable>
 #include <deque>
 #include <functional>
 #include <memory>
+#include <mutex>
 #include <string>
 #include <unordered_set>
 
@@ -44,16 +46,17 @@
 #include "yb/gutil/macros.h"
 #include "yb/gutil/port.h"
 #include "yb/gutil/ref_counted.h"
+
+#include "yb/util/metrics_fwd.h"
 #include "yb/util/condition_variable.h"
 #include "yb/util/enums.h"
-#include "yb/util/metrics.h"
+#include "yb/util/math_util.h"
 #include "yb/util/monotime.h"
 #include "yb/util/mutex.h"
 #include "yb/util/status.h"
 
 namespace yb {
 
-class Histogram;
 class Thread;
 class ThreadPool;
 class ThreadPoolToken;
@@ -62,7 +65,7 @@ class Trace;
 class Runnable {
  public:
   virtual void Run() = 0;
-  virtual ~Runnable() {}
+  virtual ~Runnable() = default;
 };
 
 template <class F>
@@ -90,6 +93,8 @@ struct ThreadPoolMetrics {
 
   // Measures the amount of time that tasks spend running.
   scoped_refptr<Histogram> run_time_us_histogram;
+
+  ~ThreadPoolMetrics();
 };
 
 
@@ -241,7 +246,7 @@ class ThreadPool {
 
   template <class F>
   CHECKED_STATUS SubmitFunc(F&& f) {
-    return Submit(std::make_shared<RunnableImpl<F>>(std::move(f)));
+    return Submit(std::make_shared<RunnableImpl<F>>(std::forward<F>(f)));
   }
 
   template <class F>
@@ -508,6 +513,38 @@ class FunctionRunnable : public Runnable {
 
  private:
   std::function<void()> func_;
+};
+
+// Runs submitted tasks in created thread pool with specified concurrency.
+class TaskRunner {
+ public:
+  TaskRunner() = default;
+
+  CHECKED_STATUS Init(int concurrency);
+
+  template <class F>
+  void Submit(F&& f) {
+    ++running_tasks_;
+    auto status = thread_pool_->SubmitFunc([this, f = std::forward<F>(f)]() {
+      auto status = f();
+      CompleteTask(status);
+    });
+    if (!status.ok()) {
+      CompleteTask(status);
+    }
+  }
+
+  CHECKED_STATUS Wait();
+
+ private:
+  void CompleteTask(const Status& status);
+
+  std::unique_ptr<ThreadPool> thread_pool_;
+  std::atomic<size_t> running_tasks_{0};
+  std::atomic<bool> failed_{false};
+  Status first_failure_;
+  std::mutex mutex_;
+  std::condition_variable cond_;
 };
 
 } // namespace yb

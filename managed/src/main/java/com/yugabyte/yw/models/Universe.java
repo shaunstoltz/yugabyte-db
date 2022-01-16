@@ -6,12 +6,13 @@ import static play.mvc.Http.Status.BAD_REQUEST;
 
 import com.fasterxml.jackson.annotation.JsonFormat;
 import com.fasterxml.jackson.annotation.JsonIgnore;
-import com.fasterxml.jackson.annotation.JsonManagedReference;
 import com.fasterxml.jackson.databind.JsonNode;
 import com.google.common.collect.ImmutableSet;
 import com.google.common.net.HostAndPort;
 import com.yugabyte.yw.commissioner.tasks.UniverseDefinitionTaskBase.ServerType;
+import com.yugabyte.yw.commissioner.tasks.UniverseDefinitionTaskBase.PortType;
 import com.yugabyte.yw.common.PlatformServiceException;
+import com.yugabyte.yw.common.concurrent.KeyLock;
 import com.yugabyte.yw.common.password.RedactingService;
 import com.yugabyte.yw.common.services.YBClientService;
 import com.yugabyte.yw.forms.UniverseDefinitionTaskParams;
@@ -20,29 +21,27 @@ import com.yugabyte.yw.forms.UniverseDefinitionTaskParams.UserIntent;
 import com.yugabyte.yw.models.helpers.CommonUtils;
 import com.yugabyte.yw.models.helpers.NodeDetails;
 import com.yugabyte.yw.models.helpers.PlacementInfo;
-import io.ebean.Ebean;
+import com.yugabyte.yw.models.helpers.TransactionUtil;
 import io.ebean.ExpressionList;
 import io.ebean.Finder;
 import io.ebean.Model;
-import io.ebean.SqlUpdate;
 import io.ebean.annotation.DbJson;
 import java.util.ArrayList;
 import java.util.Collection;
 import java.util.Comparator;
-import java.util.ConcurrentModificationException;
 import java.util.Date;
 import java.util.HashMap;
+import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
 import java.util.Set;
 import java.util.UUID;
+import java.util.concurrent.atomic.AtomicReference;
 import java.util.stream.Collectors;
-import javax.persistence.CascadeType;
 import javax.persistence.Column;
 import javax.persistence.Entity;
 import javax.persistence.Id;
-import javax.persistence.OneToMany;
 import javax.persistence.Table;
 import javax.persistence.Transient;
 import javax.persistence.UniqueConstraint;
@@ -60,6 +59,9 @@ public class Universe extends Model {
   public static final String DISABLE_ALERTS_UNTIL = "disableAlertsUntilSecs";
   public static final String TAKE_BACKUPS = "takeBackups";
   public static final String HELM2_LEGACY = "helm2Legacy";
+
+  // This is a key lock for Universe by UUID.
+  private static final KeyLock<UUID> UNIVERSE_KEY_LOCK = new KeyLock<UUID>();
 
   private static void checkUniverseInCustomer(UUID universeUUID, Customer customer) {
     if (!customer.getUniverseUUIDs().contains(universeUUID)) {
@@ -93,7 +95,7 @@ public class Universe extends Model {
   // Tracks when the universe was created.
   @Constraints.Required
   @Column(nullable = false)
-  @JsonFormat(shape = JsonFormat.Shape.STRING, pattern = "yyyy-MM-dd HH:mm:ss")
+  @JsonFormat(shape = JsonFormat.Shape.STRING, pattern = "yyyy-MM-dd'T'HH:mm:ssZ")
   public Date creationDate;
 
   // The universe name.
@@ -132,14 +134,6 @@ public class Universe extends Model {
 
   @Transient private UniverseDefinitionTaskParams universeDetails;
 
-  @OneToMany(mappedBy = "sourceUniverse", cascade = CascadeType.ALL)
-  @JsonManagedReference
-  public Set<AsyncReplicationRelationship> sourceAsyncReplicationRelationships;
-
-  @OneToMany(mappedBy = "targetUniverse", cascade = CascadeType.ALL)
-  @JsonManagedReference
-  public Set<AsyncReplicationRelationship> targetAsyncReplicationRelationships;
-
   public void setUniverseDetails(UniverseDefinitionTaskParams details) {
     universeDetails = details;
   }
@@ -155,6 +149,19 @@ public class Universe extends Model {
   public void resetVersion() {
     this.version = -1;
     this.update();
+  }
+
+  @JsonIgnore
+  public List<String> getVersions() {
+    if (null == universeDetails || null == universeDetails.clusters) {
+      return new ArrayList<>();
+    }
+    return universeDetails
+        .clusters
+        .stream()
+        .filter(c -> c != null && c.userIntent != null)
+        .map(c -> c.userIntent.ybSoftwareVersion)
+        .collect(Collectors.toList());
   }
 
   public static final Finder<UUID, Universe> find = new Finder<UUID, Universe>(Universe.class) {};
@@ -251,7 +258,7 @@ public class Universe extends Model {
     // Find the universe.
     Universe universe = find.byId(universeUUID);
     if (universe == null) {
-      LOG.info("Cannot find universe {}", universeUUID);
+      LOG.trace("Cannot find universe {}", universeUUID);
       return Optional.empty();
     }
 
@@ -291,29 +298,6 @@ public class Universe extends Model {
     void run(Universe universe);
   }
 
-  // TODO: Investigate why not use transactions for this
-  // TODO: synchronized in static scope - investigate what state it is protecting
-  // Helper api to make an atomic read of universe version, and compare and swap the
-  // updated version to disk.
-  private static synchronized Universe readModifyWrite(
-      UUID universeUUID, UniverseUpdater updater, boolean incrementVersion) {
-    Universe universe = Universe.getOrBadRequest(universeUUID);
-    // Update the universe object which is supplied as a lambda function.
-    boolean updateSucceeded = false;
-    try {
-      updater.run(universe);
-      updateSucceeded = true;
-    } catch (Exception e) {
-      LOG.debug("Error running universe updater", e);
-      throw e;
-    } finally {
-      // Save the universe object by doing a compare and swap.
-      universe.compareAndSwap(updateSucceeded /* updateDetails */, incrementVersion);
-    }
-
-    return universe;
-  }
-
   /**
    * Updates the details of the universe if possible using the update lambda function.
    *
@@ -327,31 +311,24 @@ public class Universe extends Model {
 
   public static Universe saveDetails(
       UUID universeUUID, UniverseUpdater updater, boolean incrementVersion) {
-    int numRetriesLeft = 10;
-    long sleepTimeMillis = 100;
-    // Try the read and update for a few times till it succeeds.
-    Universe universe = null;
-    while (numRetriesLeft > 0) {
-      try {
-        universe = readModifyWrite(universeUUID, updater, incrementVersion);
-        break;
-      } catch (ConcurrentModificationException e) {
-        // Decrement retries.
-        numRetriesLeft--;
-        // If we are out of retries, fail the task.
-        if (numRetriesLeft == 0) {
-          throw e;
-        }
-        // If we have more retries left, wait and retry.
-        try {
-          Thread.sleep(sleepTimeMillis);
-        } catch (InterruptedException e1) {
-          LOG.error("Error while sleeping", e1);
-        }
-      }
+    UNIVERSE_KEY_LOCK.acquireLock(universeUUID);
+    try {
+      // Perform the below code block in transaction.
+      AtomicReference<Universe> universeRef = new AtomicReference<>();
+      TransactionUtil.doInTxn(
+          () -> {
+            Universe universe = Universe.getOrBadRequest(universeUUID);
+            // Update the universe object which is supplied as a lambda function.
+            // The lambda function can have DB changes.
+            updater.run(universe);
+            universe.save(incrementVersion);
+            universeRef.set(universe);
+          },
+          TransactionUtil.DEFAULT_RETRY_CONFIG);
+      return universeRef.get();
+    } finally {
+      UNIVERSE_KEY_LOCK.releaseLock(universeUUID);
     }
-
-    return universe;
   }
 
   /**
@@ -557,7 +534,17 @@ public class Universe extends Model {
     if (mastersQueryable && !verifyMastersAreQueryable(masters)) {
       return "";
     }
-    return getHostPortsString(masters, ServerType.MASTER);
+    return getHostPortsString(masters, ServerType.MASTER, PortType.RPC);
+  }
+
+  /**
+   * Returns a comma separated list of <privateIp:tserverHTTPPort> for all tservers of this
+   * universe.
+   *
+   * @return a comma separated string of 'host:port'.
+   */
+  public String getTserverHTTPAddresses() {
+    return getHostPortsString(getTServers(), ServerType.TSERVER, PortType.HTTP);
   }
 
   /**
@@ -598,7 +585,7 @@ public class Universe extends Model {
    * @return a comma separated string of 'host:port'.
    */
   public String getYQLServerAddresses() {
-    return getHostPortsString(getYqlServers(), ServerType.YQLSERVER);
+    return getHostPortsString(getYqlServers(), ServerType.YQLSERVER, PortType.RPC);
   }
 
   /**
@@ -608,7 +595,7 @@ public class Universe extends Model {
    * @return a comma separated string of 'host:port'.
    */
   public String getYSQLServerAddresses() {
-    return getHostPortsString(getYsqlServers(), ServerType.YSQLSERVER);
+    return getHostPortsString(getYsqlServers(), ServerType.YSQLSERVER, PortType.RPC);
   }
 
   /**
@@ -618,30 +605,58 @@ public class Universe extends Model {
    * @return a comma separated string of 'host:port'.
    */
   public String getRedisServerAddresses() {
-    return getHostPortsString(getRedisServers(), ServerType.REDISSERVER);
+    return getHostPortsString(getRedisServers(), ServerType.REDISSERVER, PortType.RPC);
+  }
+
+  // Helper API to return port number based on port type.
+  private static int selectPort(PortType portType, int rpcPort, int httpPort) {
+    if (portType != PortType.HTTP && portType != PortType.RPC) {
+      throw new IllegalArgumentException("Unexpected port type " + portType);
+    }
+    int port = 0;
+    switch (portType) {
+      case RPC:
+        port = rpcPort;
+        break;
+      case HTTP:
+        port = httpPort;
+        break;
+    }
+    return port;
   }
 
   // Helper API to create the based on the server type.
-  private String getHostPortsString(List<NodeDetails> serverNodes, ServerType type) {
+  private String getHostPortsString(
+      List<NodeDetails> serverNodes, ServerType type, PortType portType) {
     StringBuilder servers = new StringBuilder();
     for (NodeDetails node : serverNodes) {
       if (node.cloudInfo.private_ip != null) {
         int port = 0;
         switch (type) {
           case YQLSERVER:
-            if (node.isYqlServer) port = node.yqlServerRpcPort;
+            if (node.isYqlServer) {
+              port = selectPort(portType, node.yqlServerRpcPort, node.yqlServerHttpPort);
+            }
             break;
           case YSQLSERVER:
-            if (node.isYsqlServer) port = node.ysqlServerRpcPort;
+            if (node.isYsqlServer) {
+              port = selectPort(portType, node.ysqlServerRpcPort, node.ysqlServerHttpPort);
+            }
             break;
           case TSERVER:
-            if (node.isTserver) port = node.tserverRpcPort;
+            if (node.isTserver) {
+              port = selectPort(portType, node.tserverRpcPort, node.tserverHttpPort);
+            }
             break;
           case MASTER:
-            if (node.isMaster) port = node.masterRpcPort;
+            if (node.isMaster) {
+              port = selectPort(portType, node.masterRpcPort, node.masterHttpPort);
+            }
             break;
           case REDISSERVER:
-            if (node.isRedisServer) port = node.redisServerRpcPort;
+            if (node.isRedisServer) {
+              port = selectPort(portType, node.redisServerRpcPort, node.redisServerHttpPort);
+            }
             break;
           default:
             throw new IllegalArgumentException("Unexpected server type " + type);
@@ -657,59 +672,15 @@ public class Universe extends Model {
   }
 
   /**
-   * Compares the version of this object with the one in the DB, and updates it if the versions
-   * match.
+   * Saves the universe to DB.
    *
-   * @param updateDetails whether to update universe details or not
-   * @param incrementVersion whether to increment the version or not
-   * @return the current version of the universe metadata
+   * @param incrementVersion the version is incremented if it is set.
    */
-  private int compareAndSwap(boolean updateDetails, boolean incrementVersion) {
+  public void save(boolean incrementVersion) {
     // Update the universe details json.
-    universeDetailsJson = Json.stringify(Json.toJson(universeDetails));
-
-    // Create the new version number.
-    int newVersion = incrementVersion ? this.version + 1 : this.version;
-
-    // Save the object if the version is the same.
-    String updateQuery =
-        updateDetails
-            ? "UPDATE universe "
-                + "SET universe_details_json = :universeDetails, version = :newVersion "
-                + "WHERE universe_uuid = :universeUUID AND version = :curVersion"
-            : "UPDATE universe "
-                + "SET version = :newVersion "
-                + "WHERE universe_uuid = :universeUUID AND version = :curVersion";
-
-    SqlUpdate update = Ebean.createSqlUpdate(updateQuery);
-    if (updateDetails) {
-      update.setParameter("universeDetails", universeDetailsJson);
-    }
-
-    update.setParameter("universeUUID", universeUUID);
-    update.setParameter("curVersion", this.version);
-    update.setParameter("newVersion", newVersion);
-    LOG.trace(
-        "Swapped universe {}:{} details to [{}] with new version = {}.",
-        universeUUID,
-        this.name,
-        universeDetailsJson,
-        newVersion);
-    int modifiedCount = Ebean.execute(update);
-
-    // Check if the save was not successful.
-    if (modifiedCount == 0) {
-      // Throw an exception as the save was not successful.
-      throw new ConcurrentModificationException("Stale version " + this.version);
-    } else if (modifiedCount > 1) {
-      // Exactly one row should have been modified. Otherwise fatal.
-      LOG.error("Running query [" + updateQuery + "] updated " + modifiedCount + " rows");
-      System.exit(1);
-    }
-
-    // Update and return the current version number.
-    this.version = newVersion;
-    return this.version;
+    this.universeDetailsJson = Json.stringify(Json.toJson(universeDetails));
+    this.version = incrementVersion ? this.version + 1 : this.version;
+    super.save();
   }
 
   /**
@@ -819,8 +790,30 @@ public class Universe extends Model {
         .collect(Collectors.toSet());
   }
 
+  public static Set<Universe> universeDetailsIfReleaseExists(String version) {
+    Set<Universe> universes = new HashSet<Universe>();
+    Customer.getAll()
+        .forEach(customer -> universes.addAll(Customer.get(customer.getUuid()).getUniverses()));
+    Set<Universe> universesWithGivenRelease = new HashSet<Universe>();
+    for (Universe u : universes) {
+      List<Cluster> clusters = u.getUniverseDetails().clusters;
+      for (Cluster c : clusters) {
+        if (c.userIntent.ybSoftwareVersion != null
+            && c.userIntent.ybSoftwareVersion.equals(version)) {
+          universesWithGivenRelease.add(u);
+          break;
+        }
+      }
+    }
+    return universesWithGivenRelease;
+  }
+
   public static boolean existsCertificate(UUID certUUID, UUID customerUUID) {
     return universeDetailsIfCertsExists(certUUID, customerUUID).size() != 0;
+  }
+
+  public static boolean existsRelease(String version) {
+    return universeDetailsIfReleaseExists(version).size() != 0;
   }
 
   static boolean isUniversePaused(UUID uuid) {

@@ -10,6 +10,7 @@
 // or implied.  See the License for the specific language governing permissions and limitations
 // under the License.
 
+#include "yb/tools/yb-admin_cli.h"
 #include "yb/tools/yb-admin_client.h"
 
 #include <iostream>
@@ -21,13 +22,27 @@
 #include "yb/cdc/cdc_service.h"
 #include "yb/cdc/cdc_service.proxy.h"
 #include "yb/client/client.h"
+
 #include "yb/common/entity_ids.h"
 #include "yb/common/json_util.h"
 #include "yb/common/wire_protocol.h"
+
+#include "yb/encryption/encryption_util.h"
+
+#include "yb/gutil/casts.h"
 #include "yb/gutil/strings/util.h"
+
 #include "yb/master/master_defaults.h"
 #include "yb/master/master_error.h"
+#include "yb/master/master_backup.proxy.h"
+#include "yb/master/master_client.proxy.h"
+#include "yb/master/master_cluster.proxy.h"
+#include "yb/master/master_ddl.proxy.h"
+#include "yb/master/master_encryption.proxy.h"
+#include "yb/master/master_replication.proxy.h"
+
 #include "yb/rpc/messenger.h"
+#include "yb/rpc/rpc_controller.h"
 #include "yb/tools/yb-admin_util.h"
 #include "yb/util/cast.h"
 #include "yb/util/env.h"
@@ -41,7 +56,8 @@
 #include "yb/util/string_trim.h"
 #include "yb/util/string_util.h"
 #include "yb/util/timestamp.h"
-#include "yb/util/encryption_util.h"
+#include "yb/util/format.h"
+#include "yb/util/status_format.h"
 
 DEFINE_test_flag(int32, metadata_file_format_version, 0,
                  "Used in 'export_snapshot' metadata file format (0 means using latest format).");
@@ -91,6 +107,7 @@ using master::RestoreSnapshotResponsePB;
 using master::SnapshotInfoPB;
 using master::SysNamespaceEntryPB;
 using master::SysRowEntry;
+using master::SysRowEntryType;
 using master::BackupRowEntryPB;
 using master::SysTablesEntryPB;
 using master::SysSnapshotEntryPB;
@@ -121,7 +138,9 @@ Status ClusterAdminClient::ListSnapshots(const ListSnapshotsFlags& flags) {
   rapidjson::Value json_snapshots(rapidjson::kArrayType);
   if (!json) {
     if (resp.snapshots_size()) {
-      cout << RightPadToUuidWidth("Snapshot UUID") << kColumnSep << "State" << endl;
+      // Using 2 tabs so that the header can be aligned to the time.
+      cout << RightPadToUuidWidth("Snapshot UUID") << kColumnSep
+           << "State" << kColumnSep << kColumnSep << "Creation Time" << endl;
     } else {
       cout << "No snapshots" << endl;
     }
@@ -144,7 +163,10 @@ Status ClusterAdminClient::ListSnapshots(const ListSnapshotsFlags& flags) {
           HybridTimeToString(HybridTime::FromPB(entry.previous_snapshot_hybrid_time())),
           &json_snapshot, &document.GetAllocator());
     } else {
-      cout << SnapshotIdToString(snapshot.id()) << kColumnSep << snapshot.entry().state() << endl;
+      cout << SnapshotIdToString(snapshot.id()) << kColumnSep
+           << snapshot.entry().state() << kColumnSep
+           << HybridTimeToString(HybridTime::FromPB(snapshot.entry().snapshot_hybrid_time()))
+           << endl;
     }
 
     // Not implemented in json mode.
@@ -152,13 +174,13 @@ Status ClusterAdminClient::ListSnapshots(const ListSnapshotsFlags& flags) {
       for (SysRowEntry& entry : *snapshot.mutable_entry()->mutable_entries()) {
         string decoded_data;
         switch (entry.type()) {
-          case SysRowEntry::NAMESPACE: {
+          case SysRowEntryType::NAMESPACE: {
             auto meta = VERIFY_RESULT(ParseFromSlice<SysNamespaceEntryPB>(entry.data()));
             meta.clear_transaction();
             decoded_data = JsonWriter::ToJson(meta, JsonWriter::COMPACT);
             break;
           }
-          case SysRowEntry::TABLE: {
+          case SysRowEntryType::TABLE: {
             auto meta = VERIFY_RESULT(ParseFromSlice<SysTablesEntryPB>(entry.data()));
             meta.clear_schema();
             meta.clear_partition_schema();
@@ -257,7 +279,7 @@ Status ClusterAdminClient::CreateNamespaceSnapshot(const TypedNamespaceName& ns)
     req.set_exclude_system_tables(true);
     req.add_relation_type_filter(master::USER_TABLE_RELATION);
     req.add_relation_type_filter(master::INDEX_TABLE_RELATION);
-    return master_proxy_->ListTables(req, &resp, rpc);
+    return master_ddl_proxy_->ListTables(req, &resp, rpc);
   }));
 
   if (resp.tables_size() == 0) {
@@ -604,16 +626,23 @@ Status ClusterAdminClient::CreateSnapshotMetaFile(const string& snapshot_id,
     req.set_snapshot_id(StringToSnapshotId(snapshot_id));
 
     // Format 0 - latest format (== Format 2 at the moment).
+    // Format -1 - old format (no 'namespace_name' in the Table entry).
     // Format 1 - old format.
     // Format 2 - new format.
-    if (FLAGS_TEST_metadata_file_format_version != 1) {
+    if (FLAGS_TEST_metadata_file_format_version == 0 ||
+        FLAGS_TEST_metadata_file_format_version >= 2) {
       req.set_prepare_for_backup(true);
     }
     return master_backup_proxy_->ListSnapshots(req, &resp, rpc);
   }));
 
-  const SnapshotInfoPB* snapshot = nullptr;
-  for (const auto& snapshot_entry : resp.snapshots()) {
+  if (resp.snapshots_size() > 1) {
+    LOG(WARNING) << "Requested snapshot metadata for snapshot '" << snapshot_id << "', but got "
+                 << resp.snapshots_size() << " snapshots in the response";
+  }
+
+  SnapshotInfoPB* snapshot = nullptr;
+  for (SnapshotInfoPB& snapshot_entry : *resp.mutable_snapshots()) {
     if (SnapshotIdToString(snapshot_entry.id()) == snapshot_id) {
       snapshot = &snapshot_entry;
       break;
@@ -624,9 +653,17 @@ Status ClusterAdminClient::CreateSnapshotMetaFile(const string& snapshot_id,
         InternalError, "Response contained $0 entries but no entry for snapshot '$1'",
         resp.snapshots_size(), snapshot_id);
   }
-  if (resp.snapshots_size() > 1) {
-    LOG(WARNING) << "Requested snapshot metadata for snapshot '" << snapshot_id << "', but got "
-                 << resp.snapshots_size() << " snapshots in the response";
+
+  if (FLAGS_TEST_metadata_file_format_version == -1) {
+    // Remove 'namespace_name' from SysTablesEntryPB.
+    SysSnapshotEntryPB& sys_entry = *snapshot->mutable_entry();
+    for (SysRowEntry& entry : *sys_entry.mutable_entries()) {
+      if (entry.type() == SysRowEntryType::TABLE) {
+        auto meta = VERIFY_RESULT(ParseFromSlice<SysTablesEntryPB>(entry.data()));
+        meta.clear_namespace_name();
+        entry.set_data(meta.SerializeAsString());
+      }
+    }
   }
 
   cout << "Exporting snapshot " << snapshot_id << " ("
@@ -681,7 +718,7 @@ Status ClusterAdminClient::ImportSnapshotMetaFile(const string& file_name,
         ? tables[table_index] : YBTableName();
 
     switch (entry.type()) {
-      case SysRowEntry::NAMESPACE: {
+      case SysRowEntryType::NAMESPACE: {
         auto meta = VERIFY_RESULT(ParseFromSlice<SysNamespaceEntryPB>(entry.data()));
 
         if (!keyspace.name.empty() && keyspace.name != meta.name()) {
@@ -690,7 +727,7 @@ Status ClusterAdminClient::ImportSnapshotMetaFile(const string& file_name,
         }
         break;
       }
-      case SysRowEntry::TABLE: {
+      case SysRowEntryType::TABLE: {
         if (was_table_renamed && table_name.empty()) {
           // Renaming is allowed for all tables OR for no one table.
           return STATUS_FORMAT(InvalidArgument,
@@ -713,10 +750,6 @@ Status ClusterAdminClient::ImportSnapshotMetaFile(const string& file_name,
 
         if (meta.name().empty()) {
           return STATUS(IllegalState, "Could not find table name from snapshot metadata");
-        }
-
-        if (meta.namespace_name().empty()) {
-          return STATUS(IllegalState, "Could not find keyspace name from snapshot metadata");
         }
 
         // Update the table name if needed.
@@ -744,7 +777,9 @@ Status ClusterAdminClient::ImportSnapshotMetaFile(const string& file_name,
         }
 
         cout << (meta.colocated() ? "Colocated t" : "T") << "able being imported: "
-             << meta.namespace_name() << "." << meta.name() << endl;
+             << (meta.namespace_name().empty() ?
+                 "[" + meta.namespace_id() + "]" : meta.namespace_name())
+             << "." << meta.name() << endl;
         ++table_index;
         break;
       }
@@ -832,7 +867,7 @@ Status ClusterAdminClient::ListReplicaTypeCounts(const YBTableName& table_name) 
     for (const auto& tablet_id : tablet_ids) {
       req.add_tablet_ids(tablet_id);
     }
-    return master_proxy_->GetTabletLocations(req, &resp, rpc);
+    return master_client_proxy_->GetTabletLocations(req, &resp, rpc);
   }));
 
   struct ReplicaCounts {
@@ -852,8 +887,8 @@ Status ClusterAdminClient::ListReplicaTypeCounts(const YBTableName& table_name) 
       const string& placement_uuid =
           replica.ts_info().has_placement_uuid() ? replica.ts_info().placement_uuid() : "";
       bool is_replica_read_only =
-          replica.member_type() == consensus::RaftPeerPB::PRE_OBSERVER ||
-          replica.member_type() == consensus::RaftPeerPB::OBSERVER;
+          replica.member_type() == consensus::PeerMemberType::PRE_OBSERVER ||
+          replica.member_type() == consensus::PeerMemberType::OBSERVER;
       int live_count = is_replica_read_only ? 0 : 1;
       int read_only_count = 1 - live_count;
       if (replica_map.count(ts_uuid) == 0) {
@@ -908,7 +943,7 @@ Status ClusterAdminClient::SetPreferredZones(const std::vector<string>& preferre
     zones.emplace(zone);
   }
 
-  RETURN_NOT_OK(master_proxy_->SetPreferredZones(req, &resp, &rpc));
+  RETURN_NOT_OK(master_cluster_proxy_->SetPreferredZones(req, &resp, &rpc));
 
   if (resp.has_error()) {
     return STATUS(ServiceUnavailable, resp.error().status().message());
@@ -938,7 +973,7 @@ Status ClusterAdminClient::SendEncryptionRequest(
   if (key_path != "") {
     encryption_info_req.set_key_path(key_path);
   }
-  RETURN_NOT_OK_PREPEND(master_proxy_->
+  RETURN_NOT_OK_PREPEND(master_encryption_proxy_->
       ChangeEncryptionInfo(encryption_info_req, &encryption_info_resp, &rpc),
                         "MasterServiceImpl::ChangeEncryptionInfo call fails.")
 
@@ -955,7 +990,7 @@ Status ClusterAdminClient::IsEncryptionEnabled() {
 
   master::IsEncryptionEnabledRequestPB req;
   master::IsEncryptionEnabledResponsePB resp;
-  RETURN_NOT_OK_PREPEND(master_proxy_->
+  RETURN_NOT_OK_PREPEND(master_encryption_proxy_->
       IsEncryptionEnabled(req, &resp, &rpc),
       "MasterServiceImpl::IsEncryptionEnabled call fails.");
   if (resp.has_error()) {
@@ -970,8 +1005,8 @@ Status ClusterAdminClient::IsEncryptionEnabled() {
 Status ClusterAdminClient::AddUniverseKeyToAllMasters(
     const std::string& key_id, const std::string& universe_key) {
 
-  RETURN_NOT_OK(EncryptionParams::IsValidKeySize(
-      universe_key.size() - EncryptionParams::kBlockSize));
+  RETURN_NOT_OK(encryption::EncryptionParams::IsValidKeySize(
+      universe_key.size() - encryption::EncryptionParams::kBlockSize));
 
   master::AddUniverseKeysRequestPB req;
   master::AddUniverseKeysResponsePB resp;
@@ -981,7 +1016,7 @@ Status ClusterAdminClient::AddUniverseKeyToAllMasters(
   for (auto hp : VERIFY_RESULT(HostPort::ParseStrings(master_addr_list_, 7100))) {
     rpc::RpcController rpc;
     rpc.set_timeout(timeout_);
-    master::MasterServiceProxy proxy(proxy_cache_.get(), hp);
+    master::MasterEncryptionProxy proxy(proxy_cache_.get(), hp);
     RETURN_NOT_OK_PREPEND(proxy.AddUniverseKeys(req, &resp, &rpc),
                           Format("MasterServiceImpl::AddUniverseKeys call fails on host $0.",
                                  hp.ToString()));
@@ -1002,7 +1037,7 @@ Status ClusterAdminClient::AllMastersHaveUniverseKeyInMemory(const std::string& 
   for (auto hp : VERIFY_RESULT(HostPort::ParseStrings(master_addr_list_, 7100))) {
     rpc::RpcController rpc;
     rpc.set_timeout(timeout_);
-    master::MasterServiceProxy proxy(proxy_cache_.get(), hp);
+    master::MasterEncryptionProxy proxy(proxy_cache_.get(), hp);
     RETURN_NOT_OK_PREPEND(proxy.HasUniverseKeyInMemory(req, &resp, &rpc),
                           "MasterServiceImpl::ChangeEncryptionInfo call fails.");
 
@@ -1029,7 +1064,7 @@ Status ClusterAdminClient::RotateUniverseKeyInMemory(const std::string& key_id) 
   req.set_encryption_enabled(true);
   req.set_in_memory(true);
   req.set_version_id(key_id);
-  RETURN_NOT_OK_PREPEND(master_proxy_->ChangeEncryptionInfo(req, &resp, &rpc),
+  RETURN_NOT_OK_PREPEND(master_encryption_proxy_->ChangeEncryptionInfo(req, &resp, &rpc),
                         "MasterServiceImpl::ChangeEncryptionInfo call fails.");
   if (resp.has_error()) {
     return StatusFromPB(resp.error().status());
@@ -1047,7 +1082,7 @@ Status ClusterAdminClient::DisableEncryptionInMemory() {
   master::ChangeEncryptionInfoRequestPB req;
   master::ChangeEncryptionInfoResponsePB resp;
   req.set_encryption_enabled(false);
-  RETURN_NOT_OK_PREPEND(master_proxy_->ChangeEncryptionInfo(req, &resp, &rpc),
+  RETURN_NOT_OK_PREPEND(master_encryption_proxy_->ChangeEncryptionInfo(req, &resp, &rpc),
                         "MasterServiceImpl::ChangeEncryptionInfo call fails.");
   if (resp.has_error()) {
     return StatusFromPB(resp.error().status());
@@ -1065,7 +1100,7 @@ Status ClusterAdminClient::WriteUniverseKeyToFile(
 
   master::GetUniverseKeyRegistryRequestPB req;
   master::GetUniverseKeyRegistryResponsePB resp;
-  RETURN_NOT_OK_PREPEND(master_proxy_->GetUniverseKeyRegistry(req, &resp, &rpc),
+  RETURN_NOT_OK_PREPEND(master_encryption_proxy_->GetUniverseKeyRegistry(req, &resp, &rpc),
                         "MasterServiceImpl::ChangeEncryptionInfo call fails.");
   if (resp.has_error()) {
     return StatusFromPB(resp.error().status());
@@ -1099,7 +1134,7 @@ Status ClusterAdminClient::CreateCDCStream(const TableId& table_id) {
 
   RpcController rpc;
   rpc.set_timeout(timeout_);
-  RETURN_NOT_OK(master_proxy_->CreateCDCStream(req, &resp, &rpc));
+  RETURN_NOT_OK(master_replication_proxy_->CreateCDCStream(req, &resp, &rpc));
 
   if (resp.has_error()) {
     cout << "Error creating stream: " << resp.error().status().message() << endl;
@@ -1117,7 +1152,7 @@ Status ClusterAdminClient::DeleteCDCStream(const std::string& stream_id) {
 
   RpcController rpc;
   rpc.set_timeout(timeout_);
-  RETURN_NOT_OK(master_proxy_->DeleteCDCStream(req, &resp, &rpc));
+  RETURN_NOT_OK(master_replication_proxy_->DeleteCDCStream(req, &resp, &rpc));
 
   if (resp.has_error()) {
     cout << "Error deleting stream: " << resp.error().status().message() << endl;
@@ -1137,7 +1172,7 @@ Status ClusterAdminClient::ListCDCStreams(const TableId& table_id) {
 
   RpcController rpc;
   rpc.set_timeout(timeout_);
-  RETURN_NOT_OK(master_proxy_->ListCDCStreams(req, &resp, &rpc));
+  RETURN_NOT_OK(master_replication_proxy_->ListCDCStreams(req, &resp, &rpc));
 
   if (resp.has_error()) {
     cout << "Error getting CDC stream list: " << resp.error().status().message() << endl;
@@ -1155,7 +1190,7 @@ Status ClusterAdminClient::WaitForSetupUniverseReplicationToFinish(const string&
     master::IsSetupUniverseReplicationDoneResponsePB resp;
     RpcController rpc;
     rpc.set_timeout(timeout_);
-    Status s = master_proxy_->IsSetupUniverseReplicationDone(req, &resp, &rpc);
+    Status s = master_replication_proxy_->IsSetupUniverseReplicationDone(req, &resp, &rpc);
 
     if (!s.ok() || resp.has_error()) {
         LOG(WARNING) << "Encountered error while waiting for setup_universe_replication to complete"
@@ -1177,14 +1212,14 @@ Status ClusterAdminClient::SetupUniverseReplication(
   master::SetupUniverseReplicationResponsePB resp;
   req.set_producer_id(producer_uuid);
 
-  req.mutable_producer_master_addresses()->Reserve(producer_addresses.size());
+  req.mutable_producer_master_addresses()->Reserve(narrow_cast<int>(producer_addresses.size()));
   for (const auto& addr : producer_addresses) {
     // HostPort::FromString() expects a default port.
     auto hp = VERIFY_RESULT(HostPort::FromString(addr, master::kMasterDefaultPort));
     HostPortToPB(hp, req.add_producer_master_addresses());
   }
 
-  req.mutable_producer_table_ids()->Reserve(tables.size());
+  req.mutable_producer_table_ids()->Reserve(narrow_cast<int>(tables.size()));
   for (const auto& table : tables) {
     req.add_producer_table_ids(table);
   }
@@ -1195,17 +1230,52 @@ Status ClusterAdminClient::SetupUniverseReplication(
 
   RpcController rpc;
   rpc.set_timeout(timeout_);
-  RETURN_NOT_OK(master_proxy_->SetupUniverseReplication(req, &resp, &rpc));
+  auto setup_result_status = master_replication_proxy_->SetupUniverseReplication(req, &resp, &rpc);
+
+  // Clean up config files if setup fails.
+  if (!setup_result_status.ok()) {
+    CleanupEnvironmentOnSetupUniverseReplicationFailure(producer_uuid, setup_result_status);
+    return setup_result_status;
+  }
 
   if (resp.has_error()) {
     cout << "Error setting up universe replication: " << resp.error().status().message() << endl;
-    return StatusFromPB(resp.error().status());
+
+    Status status_from_error = StatusFromPB(resp.error().status());
+    CleanupEnvironmentOnSetupUniverseReplicationFailure(producer_uuid, status_from_error);
+
+    return status_from_error;
   }
 
-  RETURN_NOT_OK(WaitForSetupUniverseReplicationToFinish(producer_uuid));
+  setup_result_status = WaitForSetupUniverseReplicationToFinish(producer_uuid);
+
+  // Clean up config files if setup fails to complete.
+  if (!setup_result_status.ok()) {
+    CleanupEnvironmentOnSetupUniverseReplicationFailure(producer_uuid, setup_result_status);
+    return setup_result_status;
+  }
 
   cout << "Replication setup successfully" << endl;
   return Status::OK();
+}
+
+// Helper function for deleting the universe if SetupUniverseReplicaion fails.
+void ClusterAdminClient::CleanupEnvironmentOnSetupUniverseReplicationFailure(
+  const std::string& producer_uuid, const Status& failure_status) {
+  // We don't need to delete the universe if the call to SetupUniverseReplication
+  // failed due to one of the sanity checks.
+  if (failure_status.IsInvalidArgument()) {
+    return;
+  }
+
+  cout << "Replication setup failed, cleaning up environment" << endl;
+
+  Status delete_result_status = DeleteUniverseReplication(producer_uuid, false);
+  if (!delete_result_status.ok()) {
+    cout << "Could not clean up environment: " << delete_result_status.message() << endl;
+  } else {
+    cout << "Successfully cleaned up environment" << endl;
+  }
 }
 
 Status ClusterAdminClient::DeleteUniverseReplication(const std::string& producer_id, bool force) {
@@ -1216,7 +1286,7 @@ Status ClusterAdminClient::DeleteUniverseReplication(const std::string& producer
 
   RpcController rpc;
   rpc.set_timeout(timeout_);
-  RETURN_NOT_OK(master_proxy_->DeleteUniverseReplication(req, &resp, &rpc));
+  RETURN_NOT_OK(master_replication_proxy_->DeleteUniverseReplication(req, &resp, &rpc));
 
   if (resp.has_error()) {
     cout << "Error deleting universe replication: " << resp.error().status().message() << endl;
@@ -1238,13 +1308,14 @@ Status ClusterAdminClient::AlterUniverseReplication(const std::string& producer_
     const std::vector<std::string>& producer_addresses,
     const std::vector<TableId>& add_tables,
     const std::vector<TableId>& remove_tables,
-    const std::vector<std::string>& producer_bootstrap_ids_to_add) {
+    const std::vector<std::string>& producer_bootstrap_ids_to_add,
+    const std::string& new_producer_universe_id) {
   master::AlterUniverseReplicationRequestPB req;
   master::AlterUniverseReplicationResponsePB resp;
   req.set_producer_id(producer_uuid);
 
   if (!producer_addresses.empty()) {
-    req.mutable_producer_master_addresses()->Reserve(producer_addresses.size());
+    req.mutable_producer_master_addresses()->Reserve(narrow_cast<int>(producer_addresses.size()));
     for (const auto& addr : producer_addresses) {
       // HostPort::FromString() expects a default port.
       auto hp = VERIFY_RESULT(HostPort::FromString(addr, master::kMasterDefaultPort));
@@ -1253,7 +1324,7 @@ Status ClusterAdminClient::AlterUniverseReplication(const std::string& producer_
   }
 
   if (!add_tables.empty()) {
-    req.mutable_producer_table_ids_to_add()->Reserve(add_tables.size());
+    req.mutable_producer_table_ids_to_add()->Reserve(narrow_cast<int>(add_tables.size()));
     for (const auto& table : add_tables) {
       req.add_producer_table_ids_to_add(table);
     }
@@ -1266,7 +1337,8 @@ Status ClusterAdminClient::AlterUniverseReplication(const std::string& producer_
         return STATUS(InternalError, "Invalid number of bootstrap ids");
       }
 
-      req.mutable_producer_bootstrap_ids_to_add()->Reserve(producer_bootstrap_ids_to_add.size());
+      req.mutable_producer_bootstrap_ids_to_add()->Reserve(
+          narrow_cast<int>(producer_bootstrap_ids_to_add.size()));
       for (const auto& bootstrap_id : producer_bootstrap_ids_to_add) {
         req.add_producer_bootstrap_ids_to_add(bootstrap_id);
       }
@@ -1274,15 +1346,19 @@ Status ClusterAdminClient::AlterUniverseReplication(const std::string& producer_
   }
 
   if (!remove_tables.empty()) {
-    req.mutable_producer_table_ids_to_remove()->Reserve(remove_tables.size());
+    req.mutable_producer_table_ids_to_remove()->Reserve(narrow_cast<int>(remove_tables.size()));
     for (const auto& table : remove_tables) {
       req.add_producer_table_ids_to_remove(table);
     }
   }
 
+  if (!new_producer_universe_id.empty()) {
+    req.set_new_producer_universe_id(new_producer_universe_id);
+  }
+
   RpcController rpc;
   rpc.set_timeout(timeout_);
-  RETURN_NOT_OK(master_proxy_->AlterUniverseReplication(req, &resp, &rpc));
+  RETURN_NOT_OK(master_replication_proxy_->AlterUniverseReplication(req, &resp, &rpc));
 
   if (resp.has_error()) {
     cout << "Error altering universe replication: " << resp.error().status().message() << endl;
@@ -1309,7 +1385,7 @@ CHECKED_STATUS ClusterAdminClient::SetUniverseReplicationEnabled(const std::stri
 
   RpcController rpc;
   rpc.set_timeout(timeout_);
-  RETURN_NOT_OK(master_proxy_->SetUniverseReplicationEnabled(req, &resp, &rpc));
+  RETURN_NOT_OK(master_replication_proxy_->SetUniverseReplicationEnabled(req, &resp, &rpc));
 
   if (resp.has_error()) {
     cout << "Error " << toggle << "ing "

@@ -47,7 +47,6 @@
 #include "yb/util/crc.h"
 #include "yb/util/env.h"
 #include "yb/util/env_util.h"
-#include "yb/util/malloc.h"
 #include "yb/util/memenv/memenv.h"
 #include "yb/util/os-util.h"
 #include "yb/util/random.h"
@@ -55,6 +54,7 @@
 #include "yb/util/path_util.h"
 #include "yb/util/status.h"
 #include "yb/util/stopwatch.h"
+#include "yb/util/test_macros.h"
 #include "yb/util/test_util.h"
 
 DECLARE_int32(o_direct_block_size_bytes);
@@ -71,6 +71,8 @@ DECLARE_bool(TEST_simulate_fs_without_fallocate);
 #ifndef FALLOC_FL_PUNCH_HOLE
 #define FALLOC_FL_PUNCH_HOLE  0x02 /* de-allocates range */
 #endif
+
+using namespace std::placeholders;
 
 namespace yb {
 
@@ -147,7 +149,7 @@ class TestEnv : public YBTest, public ::testing::WithParamInterface<bool> {
     ASSERT_EQ(file_checksum, expected_checksum) << "File checksum didn't match expected checksum";
   }
 
-  void MakeVectors(int num_slices, int slice_size, int num_iterations,
+  void MakeVectors(size_t num_slices, size_t slice_size, size_t num_iterations,
                    std::unique_ptr<faststring[]>* data, vector<vector<Slice > >* vec) {
     data->reset(new faststring[num_iterations * num_slices]);
     vec->resize(num_iterations);
@@ -452,7 +454,7 @@ class ShortReadRandomAccessFile : public RandomAccessFile {
     CHECK_GT(n, 0);
     // Divide the requested amount of data by a small integer,
     // and issue the shorter read to the underlying file.
-    int short_n = n / ((rand_r(&seed_) % 3) + 1);
+    auto short_n = n / ((rand_r(&seed_) % 3) + 1);
     if (short_n == 0) {
       short_n = 1;
     }
@@ -692,7 +694,7 @@ TEST_F(TestEnv, TestWalk) {
   // Sadly, tr1/unordered_set doesn't implement equality operators, so we
   // compare sorted vectors instead.
   vector<string> actual;
-  ASSERT_OK(env_->Walk(root, Env::PRE_ORDER, Bind(&TestWalkCb, &actual)));
+  ASSERT_OK(env_->Walk(root, Env::PRE_ORDER, std::bind(&TestWalkCb, &actual, _1, _2, _3)));
   sort(expected.begin(), expected.end());
   sort(actual.begin(), actual.end());
   ASSERT_EQ(expected, actual);
@@ -713,7 +715,7 @@ TEST_F(TestEnv, TestWalkCbReturnsError) {
   ASSERT_OK(env_->NewWritableFile(JoinPathSegments(new_dir, new_file), &writer));
   int num_calls = 0;
   ASSERT_TRUE(env_->Walk(new_dir, Env::PRE_ORDER,
-                         Bind(&TestWalkErrorCb, &num_calls)).IsIOError());
+                         std::bind(&TestWalkErrorCb, &num_calls, _1, _2, _3)).IsIOError());
 
   // Once for the directory and once for the file inside it.
   ASSERT_EQ(2, num_calls);

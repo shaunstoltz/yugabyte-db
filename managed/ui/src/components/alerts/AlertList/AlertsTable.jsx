@@ -7,10 +7,12 @@ import { YBPanelItem } from '../../panels';
 import { Link } from 'react-router';
 import AlertDetails from './AlertDetails';
 import { YBButton } from '../../common/forms/fields';
+import { isAvailable } from '../../../utils/LayoutUtils';
 
 import './AlertsTable.scss';
 import { toast } from 'react-toastify';
 import { Label } from 'react-bootstrap';
+import {timeFormatter} from "../../../utils/TableFormatters";
 
 const DEFAULT_SORT_COLUMN = 'createTime';
 const DEFAULT_SORT_DIRECTION = 'DESC';
@@ -20,7 +22,7 @@ const findValueforlabel = (labels, labelToFind) => {
   return label ? label.value : '';
 };
 
-export default function AlertsTable({ filters }) {
+export default function AlertsTable({ filters, customer }) {
   const [page, setPage] = useState(1);
   const [limit, setLimit] = useState(10);
   const [sortType, setSortType] = useState(DEFAULT_SORT_COLUMN);
@@ -150,6 +152,7 @@ export default function AlertsTable({ filters }) {
                 dataField="createTime"
                 columnClassName="no-border name-column"
                 className="no-border"
+                dataFormat={timeFormatter}
                 width={'20%'}
                 dataSort
               >
@@ -164,36 +167,39 @@ export default function AlertsTable({ filters }) {
               >
                 Status
               </TableHeaderColumn>
-              <TableHeaderColumn
-                dataField="message"
-                columnClassName="no-border name-column"
-                className="no-border"
-                width={'10%'}
-                tdStyle={{ whiteSpace: 'normal' }}
-                dataFormat={(_, row) => {
-                  if (row.state !== 'ACTIVE') {
-                    return '';
-                  }
-                  return (
-                    <YBButton
-                      btnText="Acknowledge"
-                      btnStyle="link"
-                      btnClass="acknowledge-link-button"
-                      onClick={(e) => {
-                        e.preventDefault();
-                        acknowledge.mutateAsync(row);
-                      }}
-                    />
-                  );
-                }}
-              >
-                Action
-              </TableHeaderColumn>
+              { isAvailable(customer.currentCustomer.data.features, 'alert.list.actions') && (
+                <TableHeaderColumn
+                  dataField="message"
+                  columnClassName="no-border name-column"
+                  className="no-border"
+                  width={'10%'}
+                  tdStyle={{ whiteSpace: 'normal' }}
+                  dataFormat={(_, row) => {
+                    if (row.state !== 'ACTIVE') {
+                      return '';
+                    }
+                    return (
+                      <YBButton
+                        btnText="Acknowledge"
+                        btnStyle="link"
+                        btnClass="acknowledge-link-button"
+                        onClick={(e) => {
+                          e.preventDefault();
+                          acknowledge.mutateAsync(row);
+                        }}
+                      />
+                    );
+                  }}
+                >
+                  Action
+                </TableHeaderColumn>
+              )}
             </BootstrapTable>
           </>
         }
       />
       <AlertDetails
+        customer={customer.currentCustomer}
         alertDetails={alertDetails}
         visible={alertDetails != null}
         onHide={() => {

@@ -14,14 +14,22 @@
 //--------------------------------------------------------------------------------------------------
 
 #include "yb/yql/pggate/pg_dml_read.h"
+
+#include "yb/client/yb_op.h"
+
+#include "yb/common/partition.h"
+#include "yb/common/pg_system_attr.h"
+#include "yb/common/row_mark.h"
+#include "yb/common/schema.h"
+
+#include "yb/docdb/doc_key.h"
+#include "yb/docdb/primitive_value.h"
+
+#include "yb/util/status_format.h"
+
 #include "yb/yql/pggate/pg_select_index.h"
 #include "yb/yql/pggate/pg_tools.h"
 #include "yb/yql/pggate/util/pg_doc_data.h"
-#include "yb/client/yb_op.h"
-#include "yb/client/table.h"
-#include "yb/common/pg_system_attr.h"
-#include "yb/common/row_mark.h"
-#include "yb/docdb/primitive_value.h"
 
 namespace yb {
 namespace pggate {
@@ -168,7 +176,7 @@ Status PgDmlRead::ProcessEmptyPrimaryBinds() {
     preceding_key_column_missed = true;
   }
 
-  size_t num_bound_range_columns = 0;
+  int num_bound_range_columns = 0;
 
   const auto range_columns_end = bind_.columns().begin() + bind_->num_columns();
   const auto range_columns_begin = bind_.columns().begin() + bind_->num_hash_key_columns();
@@ -457,8 +465,7 @@ Result<std::vector<std::string>> PgDmlRead::BuildYbctidsFromPrimaryBinds() {
   google::protobuf::RepeatedPtrField<PgsqlExpressionPB> hashed_values;
   vector<docdb::PrimitiveValue> hashed_components, range_components;
   hashed_components.reserve(bind_->num_hash_key_columns());
-  range_components.reserve(
-      bind_->num_hash_key_columns() - bind_->num_hash_key_columns());
+  range_components.reserve(bind_->num_key_columns() - bind_->num_hash_key_columns());
   for (size_t i = 0; i < bind_->num_hash_key_columns(); ++i) {
     auto& col = bind_.columns()[i];
     hashed_components.push_back(VERIFY_RESULT(
@@ -561,6 +568,30 @@ Result<docdb::PrimitiveValue> PgDmlRead::BuildKeyColumnValue(
     const PgColumn& col, const PgsqlExpressionPB& src) {
   PgsqlExpressionPB temp_expr;
   return BuildKeyColumnValue(col, src, &temp_expr);
+}
+
+Status PgDmlRead::BindHashCode(bool start_valid, bool start_inclusive,
+                                uint64_t start_hash_val, bool end_valid,
+                                bool end_inclusive, uint64_t end_hash_val) {
+  if (secondary_index_query_) {
+    return secondary_index_query_->BindHashCode(start_valid, start_inclusive,
+                                                  start_hash_val, end_valid,
+                                                  end_inclusive, end_hash_val);
+  }
+  if (start_valid) {
+    read_req_->mutable_lower_bound()
+            ->set_key(PartitionSchema::EncodeMultiColumnHashValue
+                      (start_hash_val));
+    read_req_->mutable_lower_bound()->set_is_inclusive(start_inclusive);
+  }
+
+  if (end_valid) {
+    read_req_->mutable_upper_bound()
+              ->set_key(PartitionSchema::EncodeMultiColumnHashValue
+                        (end_hash_val));
+    read_req_->mutable_upper_bound()->set_is_inclusive(end_inclusive);
+  }
+  return Status::OK();
 }
 
 }  // namespace pggate

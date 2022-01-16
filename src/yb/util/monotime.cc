@@ -32,14 +32,18 @@
 
 #include "yb/util/monotime.h"
 
-#include <limits>
 #include <glog/logging.h>
 
-#include "yb/gutil/mathlimits.h"
+#include "yb/gutil/casts.h"
 #include "yb/gutil/stringprintf.h"
 #include "yb/gutil/sysinfo.h"
-#include "yb/gutil/walltime.h"
+
+#include "yb/util/result.h"
 #include "yb/util/thread_restrictions.h"
+
+#if defined(__APPLE__)
+#include "yb/gutil/walltime.h"
+#endif
 
 using namespace std::literals;
 
@@ -205,14 +209,15 @@ MonoDelta& MonoDelta::operator/=(int64_t divisor) {
 void MonoDelta::ToTimeVal(struct timeval *tv) const {
   DCHECK(Initialized());
   tv->tv_sec = nano_delta_ / MonoTime::kNanosecondsPerSecond;
-  tv->tv_usec = (nano_delta_ - (tv->tv_sec * MonoTime::kNanosecondsPerSecond))
-      / MonoTime::kNanosecondsPerMicrosecond;
+  tv->tv_usec = narrow_cast<int32_t>(
+      (nano_delta_ - tv->tv_sec * MonoTime::kNanosecondsPerSecond)
+      / MonoTime::kNanosecondsPerMicrosecond);
 
   // tv_usec must be between 0 and 999999.
   // There is little use for negative timevals so wrap it in PREDICT_FALSE.
   if (PREDICT_FALSE(tv->tv_usec < 0)) {
     --(tv->tv_sec);
-    tv->tv_usec += 1000000;
+    tv->tv_usec += MonoTime::kMicrosecondsPerSecond;
   }
 
   // Catch positive corner case where we "round down" and could potentially set a timeout of 0.
@@ -348,7 +353,8 @@ void SleepFor(const MonoDelta& delta) {
 
 CoarseMonoClock::time_point CoarseMonoClock::now() {
 #if defined(__APPLE__)
-  int64_t nanos = walltime_internal::GetMonoTimeNanos();
+  int64_t nanos = std::chrono::duration_cast<std::chrono::nanoseconds>(
+      std::chrono::steady_clock::now().time_since_epoch()).count();
 # else
   struct timespec ts;
   PCHECK(clock_gettime(CLOCK_MONOTONIC_COARSE, &ts) == 0);

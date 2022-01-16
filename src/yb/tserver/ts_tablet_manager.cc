@@ -40,75 +40,72 @@
 #include <thread>
 #include <vector>
 
+#include <boost/container/static_vector.hpp>
 #include <boost/optional/optional.hpp>
-
 #include <glog/logging.h>
 
 #include "yb/client/client.h"
 
 #include "yb/common/wire_protocol.h"
+
 #include "yb/consensus/consensus.h"
+#include "yb/consensus/multi_raft_batcher.h"
 #include "yb/consensus/consensus_meta.h"
 #include "yb/consensus/log.h"
 #include "yb/consensus/log_anchor_registry.h"
 #include "yb/consensus/metadata.pb.h"
 #include "yb/consensus/opid_util.h"
 #include "yb/consensus/quorum_util.h"
-#include "yb/consensus/retryable_requests.h"
 #include "yb/consensus/raft_consensus.h"
-
-#include "yb/docdb/consensus_frontier.h"
+#include "yb/consensus/retryable_requests.h"
+#include "yb/consensus/state_change_context.h"
 
 #include "yb/docdb/docdb_rocksdb_util.h"
+
 #include "yb/fs/fs_manager.h"
 
-#include "yb/gutil/strings/human_readable.h"
+#include "yb/gutil/bind.h"
+#include "yb/gutil/stl_util.h"
 #include "yb/gutil/strings/substitute.h"
-#include "yb/gutil/strings/util.h"
 #include "yb/gutil/sysinfo.h"
 
-#include "yb/master/master.pb.h"
+#include "yb/master/master_heartbeat.pb.h"
 #include "yb/master/sys_catalog.h"
-
-#include "yb/rocksdb/memory_monitor.h"
 
 #include "yb/rpc/messenger.h"
 #include "yb/rpc/poller.h"
 
 #include "yb/tablet/metadata.pb.h"
+#include "yb/tablet/operations/split_operation.h"
 #include "yb/tablet/tablet.h"
 #include "yb/tablet/tablet.pb.h"
 #include "yb/tablet/tablet_bootstrap_if.h"
-#include "yb/tablet/tablet_fwd.h"
 #include "yb/tablet/tablet_metadata.h"
-#include "yb/tablet/tablet_peer.h"
 #include "yb/tablet/tablet_options.h"
-#include "yb/tablet/operations/split_operation.h"
+#include "yb/tablet/tablet_peer.h"
 
 #include "yb/tserver/heartbeater.h"
-#include "yb/tserver/tablet_memory_manager.h"
 #include "yb/tserver/remote_bootstrap_client.h"
 #include "yb/tserver/remote_bootstrap_session.h"
-#include "yb/tserver/remote_bootstrap_snapshots.h"
 #include "yb/tserver/tablet_server.h"
+#include "yb/tserver/tserver.pb.h"
 
 #include "yb/util/debug/long_operation_tracker.h"
 #include "yb/util/debug/trace_event.h"
 #include "yb/util/env.h"
-#include "yb/util/env_util.h"
 #include "yb/util/fault_injection.h"
-#include "yb/util/file_util.h"
 #include "yb/util/flag_tags.h"
+#include "yb/util/format.h"
 #include "yb/util/logging.h"
 #include "yb/util/mem_tracker.h"
 #include "yb/util/metrics.h"
 #include "yb/util/pb_util.h"
 #include "yb/util/scope_exit.h"
-#include "yb/util/status.h"
+#include "yb/util/shared_lock.h"
+#include "yb/util/status_format.h"
+#include "yb/util/status_log.h"
 #include "yb/util/stopwatch.h"
 #include "yb/util/trace.h"
-#include "yb/util/tsan_util.h"
-#include "yb/util/shared_lock.h"
 
 using namespace std::literals;
 using namespace std::placeholders;
@@ -220,6 +217,8 @@ DEFINE_int32(tserver_yb_client_default_timeout_ms, kTServerYbClientDefaultTimeou
 
 DEFINE_bool(enable_restart_transaction_status_tablets_first, true,
             "Set to true to prioritize bootstrapping transaction status tablets first.");
+
+DECLARE_string(rocksdb_compact_flush_rate_limit_sharing_mode);
 
 namespace yb {
 namespace tserver {
@@ -414,17 +413,21 @@ Status TSTabletManager::Init() {
   tablet_options_.env = server_->GetEnv();
   tablet_options_.rocksdb_env = server_->GetRocksDBEnv();
   tablet_options_.listeners = server_->options().listeners;
+  if (docdb::GetRocksDBRateLimiterSharingMode() == docdb::RateLimiterSharingMode::TSERVER) {
+    tablet_options_.rate_limiter = docdb::CreateRocksDBRateLimiter();
+  }
 
   // Start the threadpool we'll use to open tablets.
   // This has to be done in Init() instead of the constructor, since the
   // FsManager isn't initialized until this point.
   int max_bootstrap_threads = FLAGS_num_tablets_to_open_simultaneously;
   if (max_bootstrap_threads == 0) {
-    size_t num_cpus = base::NumCPUs();
+    int num_cpus = base::NumCPUs();
     if (num_cpus <= 2) {
       max_bootstrap_threads = 2;
     } else {
-      max_bootstrap_threads = min(num_cpus - 1, fs_manager_->GetDataRootDirs().size() * 8);
+      max_bootstrap_threads = min(
+          num_cpus - 1, narrow_cast<int>(fs_manager_->GetDataRootDirs().size()) * 8);
     }
     LOG_WITH_PREFIX(INFO) <<  "max_bootstrap_threads=" << max_bootstrap_threads;
   }
@@ -445,6 +448,10 @@ Status TSTabletManager::Init() {
   RETURN_NOT_OK(fs_manager_->ListTabletIds(&tablet_ids));
 
   InitLocalRaftPeerPB();
+
+  multi_raft_manager_ = std::make_unique<consensus::MultiRaftManager>(server_->messenger(),
+                                                                      &server_->proxy_cache(),
+                                                                      local_peer_pb_.cloud_info());
 
   deque<RaftGroupMetadataPtr> metas;
 
@@ -520,7 +527,7 @@ void TSTabletManager::CleanupCheckpoints() {
       auto tablets = fs_manager_->env()->GetChildren(table_dir, ExcludeDots::kTrue);
       if (!tablets.ok()) {
         LOG_WITH_PREFIX(WARNING)
-            << "Failed to get tablets in " << table_dir << ": " << tables.status();
+            << "Failed to get tablets in " << table_dir << ": " << tablets.status();
         continue;
       }
       for (const auto& tablet : *tablets) {
@@ -686,7 +693,7 @@ namespace {
 
 // Creates SplitTabletsCreationMetaData for two new tablets for `tablet` splitting based on request.
 SplitTabletsCreationMetaData PrepareTabletCreationMetaDataForSplit(
-    const SplitTabletRequestPB& request, const tablet::Tablet& tablet) {
+    const tablet::SplitTabletRequestPB& request, const tablet::Tablet& tablet) {
   SplitTabletsCreationMetaData metas;
 
   const auto& split_partition_key = request.split_partition_key();
@@ -1070,8 +1077,8 @@ Status TSTabletManager::StartRemoteBootstrap(const StartRemoteBootstrapRequestPB
   }
 
   // Registering a non-initialized TabletPeer offers visibility through the Web UI.
-  RegisterTabletPeerMode mode = replacing_tablet ? REPLACEMENT_PEER : NEW_PEER;
-  TabletPeerPtr tablet_peer = VERIFY_RESULT(CreateAndRegisterTabletPeer(meta, mode));
+  TabletPeerPtr tablet_peer = VERIFY_RESULT(
+        CreateAndRegisterTabletPeer(meta, replacing_tablet ? REPLACEMENT_PEER : NEW_PEER));
   MarkTabletBeingRemoteBootstrapped(tablet_peer->tablet_id(),
       tablet_peer->tablet_metadata()->table_id());
 
@@ -1399,7 +1406,8 @@ void TSTabletManager::OpenTablet(const RaftGroupMetadataPtr& meta,
         tablet->GetTabletMetricsEntity(),
         raft_pool(),
         tablet_prepare_pool(),
-        &retryable_requests);
+        &retryable_requests,
+        multi_raft_manager_.get());
 
     if (!s.ok()) {
       LOG(ERROR) << kLogPrefix << "Tablet failed to init: "
@@ -1420,7 +1428,7 @@ void TSTabletManager::OpenTablet(const RaftGroupMetadataPtr& meta,
     tablet_peer->RegisterMaintenanceOps(server_->maintenance_manager());
   }
 
-  int elapsed_ms = MonoTime::Now().GetDeltaSince(start).ToMilliseconds();
+  auto elapsed_ms = MonoTime::Now().GetDeltaSince(start).ToMilliseconds();
   if (elapsed_ms > FLAGS_tablet_start_warn_threshold_ms) {
     LOG(WARNING) << kLogPrefix << "Tablet startup took " << elapsed_ms << "ms";
     if (Trace::CurrentTrace()) {
@@ -1738,7 +1746,7 @@ void TSTabletManager::UnmarkTabletBeingRemoteBootstrapped(
   tablets_being_remote_bootstrapped_per_table_[table_id].erase(tablet_id);
 }
 
-int TSTabletManager::GetNumDirtyTabletsForTests() const {
+size_t TSTabletManager::TEST_GetNumDirtyTablets() const {
   SharedLock<RWMutex> lock(mutex_);
   return dirty_tablets_.size();
 }
@@ -1867,7 +1875,7 @@ void TSTabletManager::GenerateTabletReport(TabletReportPB* report, bool include_
   // a local copy of the set of replicas.
   vector<std::shared_ptr<TabletPeer>> to_report;
   TabletIdSet tablet_ids;
-  int32_t dirty_count, report_limit;
+  size_t dirty_count, report_limit;
   {
     std::lock_guard<RWMutex> write_lock(mutex_);
     uint32_t cur_report_seq = next_report_seq_++;
@@ -1937,7 +1945,8 @@ void TSTabletManager::GenerateTabletReport(TabletReportPB* report, bool include_
     // Enforce a max tablet limit on reported tablets.
     if (report->updated_tablets_size() >= report_limit) break;
   }
-  report->set_remaining_tablet_count(dirty_count - report->updated_tablets_size());
+  report->set_remaining_tablet_count(
+      narrow_cast<int>(dirty_count - report->updated_tablets_size()));
 }
 
 void TSTabletManager::StartFullTabletReport(TabletReportPB* report) {
@@ -1948,7 +1957,7 @@ void TSTabletManager::StartFullTabletReport(TabletReportPB* report) {
   // to block if there is a waiting writer (see KUDU-2193). So, we just make
   // a local copy of the set of replicas.
   vector<std::shared_ptr<TabletPeer>> to_report;
-  int32_t dirty_count, report_limit;
+  size_t dirty_count, report_limit;
   {
     std::lock_guard<RWMutex> write_lock(mutex_);
     uint32_t cur_report_seq = next_report_seq_++;
@@ -1966,7 +1975,8 @@ void TSTabletManager::StartFullTabletReport(TabletReportPB* report) {
     // Enforce a max tablet limit on reported tablets.
     if (report->updated_tablets_size() >= report_limit) break;
   }
-  report->set_remaining_tablet_count(dirty_count - report->updated_tablets_size());
+  report->set_remaining_tablet_count(
+      narrow_cast<int32_t>(dirty_count - report->updated_tablets_size()));
 }
 
 void TSTabletManager::MarkTabletReportAcknowledged(int32_t acked_seq,
@@ -2328,7 +2338,7 @@ void TSTabletManager::MaybeDoChecksForTests(const TableId& table_id) {
 
 Status TSTabletManager::UpdateSnapshotsInfo(const master::TSSnapshotsInfoPB& info) {
   bool restorations_updated;
-  tablet::RestorationCompleteTimeMap restoration_complete_time;
+  RestorationCompleteTimeMap restoration_complete_time;
   {
     std::lock_guard<simple_spinlock> lock(snapshot_schedule_allowed_history_cutoff_mutex_);
     ++snapshot_schedules_version_;

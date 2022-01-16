@@ -16,7 +16,6 @@
 #include "../../../../src/yb/tools/yb-admin_client.h"
 
 #include "yb/common/snapshot.h"
-#include "yb/master/master_backup.proxy.h"
 #include "yb/rpc/secure_stream.h"
 #include "yb/server/secure.h"
 #include "yb/util/env_util.h"
@@ -101,7 +100,11 @@ class ClusterAdminClient : public yb::tools::ClusterAdminClient {
       const std::vector<std::string>& producer_addresses,
       const std::vector<TableId>& add_tables,
       const std::vector<TableId>& remove_tables,
-      const std::vector<std::string>& producer_bootstrap_ids_to_add);
+      const std::vector<std::string>& producer_bootstrap_ids_to_add,
+      const std::string& new_producer_universe_id);
+
+  CHECKED_STATUS RenameUniverseReplication(const std::string& old_universe_name,
+                                           const std::string& new_universe_name);
 
   CHECKED_STATUS WaitForSetupUniverseReplicationToFinish(const string& producer_uuid);
 
@@ -117,6 +120,9 @@ class ClusterAdminClient : public yb::tools::ClusterAdminClient {
   CHECKED_STATUS SendEncryptionRequest(const std::string& key_path, bool enable_encryption);
 
   Result<HostPort> GetFirstRpcAddressForTS();
+
+  void CleanupEnvironmentOnSetupUniverseReplicationFailure(
+    const std::string& producer_uuid, const Status& failure_status);
 
   DISALLOW_COPY_AND_ASSIGN(ClusterAdminClient);
 };

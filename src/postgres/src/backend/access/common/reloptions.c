@@ -160,6 +160,15 @@ static relopt_bool boolRelOpts[] =
 		 * colocated. This option will be ignored in non-colocated database. */
 		true
 	},
+	{
+		{
+			"use_initdb_acl",
+			"Initialize view's permissions as if it was created by initdb via yb_system_views.sql",
+			RELOPT_KIND_VIEW,
+			AccessExclusiveLock
+		},
+		false
+	},
 	/* list terminator */
 	{{NULL}}
 };
@@ -361,6 +370,12 @@ static relopt_int intRelOpts[] =
 		},
 		-1, 0, 1024
 	},
+	/* list terminator */
+	{{NULL}}
+};
+
+static relopt_oid oidRelOpts[] =
+{
 	{
 		{
 			"tablegroup",
@@ -368,7 +383,9 @@ static relopt_int intRelOpts[] =
 			RELOPT_KIND_HEAP | RELOPT_KIND_INDEX,
 			AccessExclusiveLock
 		},
-		InvalidOid, FirstNormalObjectId, INT_MAX
+		InvalidOid,
+		FirstNormalObjectId,
+		OID_MAX
 	},
 	{
 		{
@@ -379,7 +396,7 @@ static relopt_int intRelOpts[] =
 		},
 		InvalidOid,
 		1 /* parse_utilcmd takes care of OID >= FirstNormalObjectId for user tables */,
-		INT_MAX
+		OID_MAX
 	},
 	{
 		{
@@ -390,18 +407,7 @@ static relopt_int intRelOpts[] =
 		},
 		InvalidOid,
 		1 /* parse_utilcmd takes care of OID >= FirstNormalObjectId for user tables */,
-		INT_MAX
-	},
-	{
-		{
-			"rewrite_rule_oid",
-			"Postgres rewrite rule oid for the new rewrite rule defined for this view.",
-			RELOPT_KIND_VIEW,
-			AccessExclusiveLock
-		},
-		InvalidOid,
-		1,
-		FirstNormalObjectId - 1 /* we don't expect this for non-system views */
+		OID_MAX
 	},
 	/* list terminator */
 	{{NULL}}
@@ -554,6 +560,12 @@ initialize_reloptions(void)
 								   intRelOpts[i].gen.lockmode));
 		j++;
 	}
+	for (i = 0; oidRelOpts[i].gen.name; i++)
+	{
+		Assert(DoLockModesConflict(oidRelOpts[i].gen.lockmode,
+								   oidRelOpts[i].gen.lockmode));
+		j++;
+	}
 	for (i = 0; realRelOpts[i].gen.name; i++)
 	{
 		Assert(DoLockModesConflict(realRelOpts[i].gen.lockmode,
@@ -586,6 +598,14 @@ initialize_reloptions(void)
 	{
 		relOpts[j] = &intRelOpts[i].gen;
 		relOpts[j]->type = RELOPT_TYPE_INT;
+		relOpts[j]->namelen = strlen(relOpts[j]->name);
+		j++;
+	}
+
+	for (i = 0; oidRelOpts[i].gen.name; i++)
+	{
+		relOpts[j] = &oidRelOpts[i].gen;
+		relOpts[j]->type = RELOPT_TYPE_OID;
 		relOpts[j]->namelen = strlen(relOpts[j]->name);
 		j++;
 	}
@@ -692,6 +712,9 @@ allocate_reloption(bits32 kinds, int type, const char *name, const char *desc)
 		case RELOPT_TYPE_INT:
 			size = sizeof(relopt_int);
 			break;
+		case RELOPT_TYPE_OID:
+			size = sizeof(relopt_oid);
+			break;
 		case RELOPT_TYPE_REAL:
 			size = sizeof(relopt_real);
 			break;
@@ -753,6 +776,26 @@ add_int_reloption(bits32 kinds, const char *name, const char *desc, int default_
 
 	add_reloption((relopt_gen *) newoption);
 }
+
+/*
+ * add_oid_reloption
+ *		Add a new OID reloption
+ */
+void
+add_oid_reloption(bits32 kinds, const char *name, const char *desc, Oid default_val,
+				  Oid min_val, Oid max_val)
+{
+	relopt_oid *newoption;
+
+	newoption = (relopt_oid *) allocate_reloption(kinds, RELOPT_TYPE_OID,
+												  name, desc);
+	newoption->default_val = default_val;
+	newoption->min = min_val;
+	newoption->max = max_val;
+
+	add_reloption((relopt_gen *) newoption);
+}
+
 
 /*
  * add_real_reloption
@@ -841,16 +884,16 @@ transformRelOptions(Datum oldOptions, List *defList, const char *namspace,
 {
 	return ybTransformRelOptions(oldOptions, defList, namspace, validnsps,
 								 ignoreOids, isReset,
-								 false /* ybIgnoreYsqlUpgradeViewOptions */);
+								 false /* ybIgnoreYsqlUpgradeOptions */);
 }
 
 /*
  * See above for transformRelOptions description.
- * 
- * If ybIgnoreYsqlUpgradeViewOptions is specified, ignore "table_oid",
- * "row_type_oid" and "rewrite_rule_oid" options. This is needed in
- * YSQL upgrade mode, where we use them to simulate initdb-like behaviour
- * for creating relations but don't want them to be persisted.
+ *
+ * If ybIgnoreYsqlUpgradeOptions is specified, ignore "table_oid"
+ * and "row_type_oid" options. This is needed in YSQL upgrade mode, where we
+ * use them to simulate initdb-like behaviour for creating relations but don't
+ * want them to be persisted.
  */
 Datum
 ybTransformRelOptions(Datum oldOptions, List *defList, const char *namspace,
@@ -969,10 +1012,15 @@ ybTransformRelOptions(Datum oldOptions, List *defList, const char *namspace,
 			if (ignoreOids && strcmp(def->defname, "oids") == 0)
 				continue;
 
+			/*
+			 * These options serve as temporary markers during YSQL upgrade,
+			 * but they might also be used for other purposes (e.g. table_oid
+			 * is used to backup/restore colocated tables).
+			 */
 			if (ybIgnoreYsqlUpgradeOptions &&
 				(strcmp(def->defname, "table_oid") == 0 ||
 				 strcmp(def->defname, "row_type_oid") == 0 ||
-				 strcmp(def->defname, "rewrite_rule_oid") == 0))
+				 strcmp(def->defname, "use_initdb_acl") == 0))
 				continue;
 
 			/* ignore if not in the same namespace */
@@ -1279,6 +1327,26 @@ parse_one_reloption(relopt_value *option, char *text_str, int text_len,
 									   optint->min, optint->max)));
 			}
 			break;
+		case RELOPT_TYPE_OID:
+			{
+				relopt_oid *optoid = (relopt_oid *) option->gen;
+
+				parsed = parse_oid(value, &option->values.oid_val, NULL);
+				if (validate && !parsed)
+					ereport(ERROR,
+							(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+							 errmsg("invalid value for OID option \"%s\": %s",
+									option->gen->name, value)));
+				if (validate && (option->values.oid_val < optoid->min ||
+								 option->values.oid_val > optoid->max))
+					ereport(ERROR,
+							(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+							 errmsg("value %s out of bounds for option \"%s\"",
+									value, option->gen->name),
+							 errdetail("Valid values are between \"%u\" and \"%u\".",
+									   optoid->min, optoid->max)));
+			}
+			break;
 		case RELOPT_TYPE_REAL:
 			{
 				relopt_real *optreal = (relopt_real *) option->gen;
@@ -1387,6 +1455,11 @@ fillRelOptions(void *rdopts, Size basesize,
 							options[i].values.int_val :
 							((relopt_int *) options[i].gen)->default_val;
 						break;
+					case RELOPT_TYPE_OID:
+						*(Oid *) itempos = options[i].isset ?
+							options[i].values.oid_val :
+							((relopt_oid *) options[i].gen)->default_val;
+						break;
 					case RELOPT_TYPE_REAL:
 						*(double *) itempos = options[i].isset ?
 							options[i].values.real_val :
@@ -1476,9 +1549,9 @@ default_reloptions(Datum reloptions, bool validate, relopt_kind kind)
 		offsetof(StdRdOptions, vacuum_cleanup_index_scale_factor)},
 		{"colocated", RELOPT_TYPE_BOOL,
 		offsetof(StdRdOptions, colocated)},
-		{"tablegroup", RELOPT_TYPE_INT, offsetof(StdRdOptions, tablegroup_oid)},
-		{"table_oid", RELOPT_TYPE_INT, offsetof(StdRdOptions, table_oid)},
-		{"row_type_oid", RELOPT_TYPE_INT, offsetof(StdRdOptions, row_type_oid)},
+		{"tablegroup", RELOPT_TYPE_OID, offsetof(StdRdOptions, tablegroup_oid)},
+		{"table_oid", RELOPT_TYPE_OID, offsetof(StdRdOptions, table_oid)},
+		{"row_type_oid", RELOPT_TYPE_OID, offsetof(StdRdOptions, row_type_oid)},
 	};
 
 	options = parseRelOptions(reloptions, validate, kind, &numoptions);
@@ -1511,8 +1584,8 @@ view_reloptions(Datum reloptions, bool validate)
 		offsetof(ViewOptions, security_barrier)},
 		{"check_option", RELOPT_TYPE_STRING,
 		offsetof(ViewOptions, check_option_offset)},
-		{"rewrite_rule_oid", RELOPT_TYPE_BOOL,
-		offsetof(ViewOptions, rewrite_rule_oid)},
+		{"use_initdb_acl", RELOPT_TYPE_BOOL,
+		offsetof(ViewOptions, yb_use_initdb_acl)},
 	};
 
 	options = parseRelOptions(reloptions, validate, RELOPT_KIND_VIEW, &numoptions);

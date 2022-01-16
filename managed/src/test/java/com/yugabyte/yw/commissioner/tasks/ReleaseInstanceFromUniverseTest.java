@@ -4,9 +4,11 @@ package com.yugabyte.yw.commissioner.tasks;
 
 import static com.yugabyte.yw.common.AssertHelper.assertJsonEqual;
 import static com.yugabyte.yw.common.ModelFactory.createUniverse;
+import static com.yugabyte.yw.models.TaskInfo.State.Failure;
+import static com.yugabyte.yw.models.TaskInfo.State.Success;
 import static org.junit.Assert.assertEquals;
 import static org.junit.Assert.assertNull;
-import static org.mockito.Matchers.any;
+import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.when;
 
@@ -35,20 +37,17 @@ import org.junit.runner.RunWith;
 import org.mockito.runners.MockitoJUnitRunner;
 import org.yb.client.ChangeMasterClusterConfigResponse;
 import org.yb.client.GetMasterClusterConfigResponse;
-import org.yb.client.ModifyMasterClusterConfigBlacklist;
 import org.yb.client.YBClient;
-import org.yb.master.Master;
+import org.yb.master.CatalogEntityInfo;
 import play.libs.Json;
 
 @RunWith(MockitoJUnitRunner.class)
 public class ReleaseInstanceFromUniverseTest extends CommissionerBaseTest {
 
-  Universe defaultUniverse;
-  YBClient mockClient;
-  ModifyMasterClusterConfigBlacklist modifyBL;
-  ShellResponse dummyShellResponse;
+  private Universe defaultUniverse;
+  private YBClient mockClient;
 
-  static final String DEFAULT_NODE_NAME = "host-n1";
+  private static final String DEFAULT_NODE_NAME = "host-n1";
 
   private void setDefaultNodeState(final NodeState desiredState) {
     Universe.UniverseUpdater updater =
@@ -66,6 +65,7 @@ public class ReleaseInstanceFromUniverseTest extends CommissionerBaseTest {
     Universe.saveDetails(defaultUniverse.universeUUID, updater);
   }
 
+  @Override
   @Before
   public void setUp() {
     super.setUp();
@@ -87,8 +87,8 @@ public class ReleaseInstanceFromUniverseTest extends CommissionerBaseTest {
 
     setDefaultNodeState(NodeState.Removed);
 
-    Master.SysClusterConfigEntryPB.Builder configBuilder =
-        Master.SysClusterConfigEntryPB.newBuilder().setVersion(4);
+    CatalogEntityInfo.SysClusterConfigEntryPB.Builder configBuilder =
+        CatalogEntityInfo.SysClusterConfigEntryPB.newBuilder().setVersion(4);
     GetMasterClusterConfigResponse mockConfigResponse =
         new GetMasterClusterConfigResponse(1111, "", configBuilder.build(), null);
     ChangeMasterClusterConfigResponse mockChangeConfigResponse =
@@ -102,8 +102,7 @@ public class ReleaseInstanceFromUniverseTest extends CommissionerBaseTest {
     }
     when(mockYBClient.getClient(any(), any())).thenReturn(mockClient);
     when(mockNodeManager.nodeCommand(any(), any())).thenReturn(new ShellResponse());
-    modifyBL = mock(ModifyMasterClusterConfigBlacklist.class);
-    dummyShellResponse = new ShellResponse();
+    ShellResponse dummyShellResponse = new ShellResponse();
     dummyShellResponse.message = "true";
     when(mockNodeManager.nodeCommand(any(), any())).thenReturn(dummyShellResponse);
   }
@@ -120,7 +119,7 @@ public class ReleaseInstanceFromUniverseTest extends CommissionerBaseTest {
     return null;
   }
 
-  List<TaskType> RELEASE_INSTANCE_TASK_SEQUENCE =
+  private static final List<TaskType> RELEASE_INSTANCE_TASK_SEQUENCE =
       ImmutableList.of(
           TaskType.SetNodeState,
           TaskType.WaitForMasterLeader,
@@ -130,7 +129,7 @@ public class ReleaseInstanceFromUniverseTest extends CommissionerBaseTest {
           TaskType.SwamperTargetsFileUpdate,
           TaskType.UniverseUpdateSucceeded);
 
-  List<JsonNode> RELEASE_INSTANCE_TASK_EXPECTED_RESULTS =
+  private static final List<JsonNode> RELEASE_INSTANCE_TASK_EXPECTED_RESULTS =
       ImmutableList.of(
           Json.toJson(ImmutableMap.of("state", "BeingDecommissioned")),
           Json.toJson(ImmutableMap.of()),
@@ -156,8 +155,8 @@ public class ReleaseInstanceFromUniverseTest extends CommissionerBaseTest {
 
   @Test
   public void testReleaseInstanceSuccess() {
-    Master.SysClusterConfigEntryPB.Builder configBuilder =
-        Master.SysClusterConfigEntryPB.newBuilder().setVersion(3);
+    CatalogEntityInfo.SysClusterConfigEntryPB.Builder configBuilder =
+        CatalogEntityInfo.SysClusterConfigEntryPB.newBuilder().setVersion(3);
     GetMasterClusterConfigResponse mockConfigResponse =
         new GetMasterClusterConfigResponse(1111, "", configBuilder.build(), null);
 
@@ -171,6 +170,8 @@ public class ReleaseInstanceFromUniverseTest extends CommissionerBaseTest {
     taskParams.universeUUID = defaultUniverse.universeUUID;
 
     TaskInfo taskInfo = submitTask(taskParams, DEFAULT_NODE_NAME, 3);
+    assertEquals(Success, taskInfo.getTaskState());
+
     List<TaskInfo> subTasks = taskInfo.getSubTasks();
     Map<Integer, List<TaskInfo>> subTasksByPosition =
         subTasks.stream().collect(Collectors.groupingBy(TaskInfo::getPosition));
@@ -185,6 +186,8 @@ public class ReleaseInstanceFromUniverseTest extends CommissionerBaseTest {
     taskParams.universeUUID = defaultUniverse.universeUUID;
 
     TaskInfo taskInfo = submitTask(taskParams, DEFAULT_NODE_NAME, 4);
+    assertEquals(Success, taskInfo.getTaskState());
+
     List<TaskInfo> subTasks = taskInfo.getSubTasks();
     Map<Integer, List<TaskInfo>> subTasksByPosition =
         subTasks.stream().collect(Collectors.groupingBy(TaskInfo::getPosition));
@@ -197,6 +200,6 @@ public class ReleaseInstanceFromUniverseTest extends CommissionerBaseTest {
     NodeTaskParams taskParams = new NodeTaskParams();
     taskParams.universeUUID = defaultUniverse.universeUUID;
     TaskInfo taskInfo = submitTask(taskParams, "host-n9", 3);
-    assertEquals(TaskInfo.State.Failure, taskInfo.getTaskState());
+    assertEquals(Failure, taskInfo.getTaskState());
   }
 }

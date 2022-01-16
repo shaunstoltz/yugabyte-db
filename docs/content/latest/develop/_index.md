@@ -5,8 +5,6 @@ linkTitle: Develop
 description: Build YugabyteDB application that use ecosystem integrations and GraphQL.
 headcontent: Get started building applications based on YugabyteDB.
 image: /images/section_icons/index/develop.png
-aliases:
-  - /develop/
 section: YUGABYTEDB CORE
 menu:
   latest:
@@ -38,7 +36,7 @@ menu:
         <div class="title">Real world examples</div>
       </div>
       <div class="body">
-        Try out e-commerce, retail analytics, and IoT fleet management in these real world, end-to-end YugabyteDB applications.
+        Try out e-commerce and IoT fleet management in these real world, end-to-end YugabyteDB applications.
       </div>
     </a>
   </div>

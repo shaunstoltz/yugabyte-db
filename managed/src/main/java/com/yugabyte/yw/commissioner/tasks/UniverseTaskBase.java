@@ -2,22 +2,28 @@
 
 package com.yugabyte.yw.commissioner.tasks;
 
+import static com.yugabyte.yw.common.Util.SYSTEM_PLATFORM_DB;
+import static com.yugabyte.yw.forms.UniverseTaskParams.isFirstTryForTask;
+
 import com.fasterxml.jackson.databind.JsonNode;
+import com.google.common.base.Strings;
+import com.google.common.collect.Streams;
 import com.google.common.net.HostAndPort;
+import com.google.api.client.util.Objects;
 import com.yugabyte.yw.commissioner.AbstractTaskBase;
 import com.yugabyte.yw.commissioner.BaseTaskDependencies;
 import com.yugabyte.yw.commissioner.HealthChecker;
 import com.yugabyte.yw.commissioner.ITask;
 import com.yugabyte.yw.commissioner.SubTaskGroup;
+import com.yugabyte.yw.commissioner.TaskExecutor;
 import com.yugabyte.yw.commissioner.UserTaskDetails;
 import com.yugabyte.yw.commissioner.UserTaskDetails.SubTaskGroupType;
 import com.yugabyte.yw.commissioner.tasks.UniverseDefinitionTaskBase.ServerType;
 import com.yugabyte.yw.commissioner.tasks.params.NodeTaskParams;
 import com.yugabyte.yw.commissioner.tasks.subtasks.AnsibleClusterServerCtl;
 import com.yugabyte.yw.commissioner.tasks.subtasks.AnsibleDestroyServer;
-import com.yugabyte.yw.commissioner.tasks.subtasks.AsyncReplicationSetup;
-import com.yugabyte.yw.commissioner.tasks.subtasks.AsyncReplicationPlatformSync;
 import com.yugabyte.yw.commissioner.tasks.subtasks.BackupTable;
+import com.yugabyte.yw.commissioner.tasks.subtasks.BackupTableYb;
 import com.yugabyte.yw.commissioner.tasks.subtasks.BackupUniverseKeys;
 import com.yugabyte.yw.commissioner.tasks.subtasks.BulkImport;
 import com.yugabyte.yw.commissioner.tasks.subtasks.ChangeAdminPassword;
@@ -30,6 +36,8 @@ import com.yugabyte.yw.commissioner.tasks.subtasks.DeleteTableFromUniverse;
 import com.yugabyte.yw.commissioner.tasks.subtasks.DestroyEncryptionAtRest;
 import com.yugabyte.yw.commissioner.tasks.subtasks.DisableEncryptionAtRest;
 import com.yugabyte.yw.commissioner.tasks.subtasks.EnableEncryptionAtRest;
+import com.yugabyte.yw.commissioner.tasks.subtasks.RunYsqlUpgrade;
+import com.yugabyte.yw.commissioner.tasks.subtasks.SetActiveUniverseKeys;
 import com.yugabyte.yw.commissioner.tasks.subtasks.LoadBalancerStateChange;
 import com.yugabyte.yw.commissioner.tasks.subtasks.ManipulateDnsRecordTask;
 import com.yugabyte.yw.commissioner.tasks.subtasks.ModifyBlackList;
@@ -41,6 +49,7 @@ import com.yugabyte.yw.commissioner.tasks.subtasks.RestoreUniverseKeys;
 import com.yugabyte.yw.commissioner.tasks.subtasks.ResumeServer;
 import com.yugabyte.yw.commissioner.tasks.subtasks.SetFlagInMemory;
 import com.yugabyte.yw.commissioner.tasks.subtasks.SetNodeState;
+import com.yugabyte.yw.commissioner.tasks.subtasks.SetNodeStatus;
 import com.yugabyte.yw.commissioner.tasks.subtasks.SwamperTargetsFileUpdate;
 import com.yugabyte.yw.commissioner.tasks.subtasks.UnivSetCertificate;
 import com.yugabyte.yw.commissioner.tasks.subtasks.UniverseUpdateSucceeded;
@@ -49,6 +58,8 @@ import com.yugabyte.yw.commissioner.tasks.subtasks.UpdatePlacementInfo;
 import com.yugabyte.yw.commissioner.tasks.subtasks.UpdateSoftwareVersion;
 import com.yugabyte.yw.commissioner.tasks.subtasks.WaitForDataMove;
 import com.yugabyte.yw.commissioner.tasks.subtasks.WaitForEncryptionKeyInMemory;
+import com.yugabyte.yw.commissioner.tasks.subtasks.WaitForFollowerLag;
+import com.yugabyte.yw.commissioner.tasks.subtasks.WaitForLeaderBlacklistCompletion;
 import com.yugabyte.yw.commissioner.tasks.subtasks.WaitForLeadersOnPreferredOnly;
 import com.yugabyte.yw.commissioner.tasks.subtasks.WaitForLoadBalance;
 import com.yugabyte.yw.commissioner.tasks.subtasks.WaitForMasterLeader;
@@ -76,29 +87,37 @@ import com.yugabyte.yw.models.Provider;
 import com.yugabyte.yw.models.TaskInfo;
 import com.yugabyte.yw.models.Universe;
 import com.yugabyte.yw.models.Universe.UniverseUpdater;
+import com.yugabyte.yw.models.helpers.ColumnDetails;
+import com.yugabyte.yw.models.helpers.ColumnDetails.YQLDataType;
 import com.yugabyte.yw.models.helpers.NodeDetails;
+import com.yugabyte.yw.models.helpers.NodeStatus;
 import com.yugabyte.yw.models.helpers.TableDetails;
 import com.yugabyte.yw.models.helpers.TaskType;
 import java.time.Duration;
+import java.util.ArrayList;
 import java.util.Collection;
 import java.util.Collections;
 import java.util.HashMap;
 import java.util.HashSet;
-import java.util.Iterator;
 import java.util.List;
 import java.util.Map;
-import java.util.Map.Entry;
+import java.util.Optional;
 import java.util.Set;
 import java.util.UUID;
+import java.util.function.Consumer;
+import java.util.stream.Collectors;
+import java.util.stream.IntStream;
 import javax.inject.Inject;
 import lombok.extern.slf4j.Slf4j;
-import org.apache.commons.lang3.StringUtils;
+import org.apache.commons.collections.MapUtils;
+import org.slf4j.MDC;
+import org.yb.ColumnSchema.SortOrder;
 import org.yb.Common;
+import org.yb.CommonTypes.TableType;
 import org.yb.client.ModifyClusterConfigIncrementVersion;
 import org.yb.client.YBClient;
 import play.api.Play;
 import play.libs.Json;
-import org.slf4j.MDC;
 
 @Slf4j
 public abstract class UniverseTaskBase extends AbstractTaskBase {
@@ -156,6 +175,14 @@ public abstract class UniverseTaskBase extends AbstractTaskBase {
     }
   }
 
+  protected boolean isLeaderBlacklistValidRF(String nodeName) {
+    Cluster curCluster = Universe.getCluster(getUniverse(), nodeName);
+    if (curCluster == null) {
+      return false;
+    }
+    return curCluster.userIntent.replicationFactor > 1;
+  }
+
   protected UserIntent getUserIntent() {
     return getUserIntent(false);
   }
@@ -174,6 +201,16 @@ public abstract class UniverseTaskBase extends AbstractTaskBase {
       boolean checkSuccess,
       boolean isForceUpdate,
       boolean isResumeOrDelete) {
+    return getLockingUniverseUpdater(
+        expectedUniverseVersion, checkSuccess, isForceUpdate, isResumeOrDelete, null);
+  }
+
+  private UniverseUpdater getLockingUniverseUpdater(
+      int expectedUniverseVersion,
+      boolean checkSuccess,
+      boolean isForceUpdate,
+      boolean isResumeOrDelete,
+      Consumer<Universe> callback) {
     TaskType owner = taskClassnameToTaskTypeMap.get(this.getClass().getCanonicalName());
     if (owner == null) {
       log.trace("TaskType not found for class " + this.getClass().getCanonicalName());
@@ -181,7 +218,11 @@ public abstract class UniverseTaskBase extends AbstractTaskBase {
     return new UniverseUpdater() {
       @Override
       public void run(Universe universe) {
-        verifyUniverseVersion(expectedUniverseVersion, universe);
+        if (isFirstTryForTask(taskParams())) {
+          // Universe already has a reference to the last task UUID in case of retry.
+          // Check version only when it is a first try.
+          verifyUniverseVersion(expectedUniverseVersion, universe);
+        }
         UniverseDefinitionTaskParams universeDetails = universe.getUniverseDetails();
         if (universeDetails.universePaused && !isResumeOrDelete) {
           String msg = "Universe " + taskParams().universeUUID + " is currently paused";
@@ -194,7 +235,20 @@ public abstract class UniverseTaskBase extends AbstractTaskBase {
           log.error(msg);
           throw new RuntimeException(msg);
         }
+        // If the task is retried, check if the task UUID is same as the one in the universe.
+        // Check this condition only on retry to retain same behavior as before.
+        if (!isForceUpdate
+            && !universeDetails.updateSucceeded
+            && taskParams().previousTaskUUID != null
+            && !Objects.equal(taskParams().previousTaskUUID, universeDetails.updatingTaskUUID)) {
+          String msg = "Only the last task " + taskParams().previousTaskUUID + " can be retried";
+          log.error(msg);
+          throw new RuntimeException(msg);
+        }
         markUniverseUpdateInProgress(owner, universe, checkSuccess);
+        if (callback != null) {
+          callback.accept(universe);
+        }
       }
     };
   }
@@ -205,6 +259,7 @@ public abstract class UniverseTaskBase extends AbstractTaskBase {
     // Persist the updated information about the universe. Mark it as being edited.
     universeDetails.updateInProgress = true;
     universeDetails.updatingTask = owner;
+    universeDetails.updatingTaskUUID = userTaskUUID;
     if (checkSuccess) {
       universeDetails.updateSucceeded = false;
     }
@@ -313,6 +368,17 @@ public abstract class UniverseTaskBase extends AbstractTaskBase {
     return subTaskGroup;
   }
 
+  public SubTaskGroup createSetActiveUniverseKeysTask() {
+    SubTaskGroup subTaskGroup = new SubTaskGroup("SetActiveUniverseKeys", executor);
+    SetActiveUniverseKeys task = createTask(SetActiveUniverseKeys.class);
+    SetActiveUniverseKeys.Params params = new SetActiveUniverseKeys.Params();
+    params.universeUUID = taskParams().universeUUID;
+    task.initialize(params);
+    subTaskGroup.addTask(task);
+    subTaskGroupQueue.add(subTaskGroup);
+    return subTaskGroup;
+  }
+
   public SubTaskGroup createDestroyEncryptionAtRestTask() {
     SubTaskGroup subTaskGroup = new SubTaskGroup("DestroyEncryptionAtRest", executor);
     DestroyEncryptionAtRest task = createTask(DestroyEncryptionAtRest.class);
@@ -337,6 +403,22 @@ public abstract class UniverseTaskBase extends AbstractTaskBase {
   @Override
   public String getName() {
     return super.getName() + "(" + taskParams().universeUUID + ")";
+  }
+
+  /**
+   * Locks the universe for updates by setting the 'updateInProgress' flag. If the universe is
+   * already being modified, then throws an exception.
+   *
+   * @param expectedUniverseVersion Lock only if the current version of the universe is at this
+   *     version. -1 implies always lock the universe.
+   * @param callback Callback is invoked for any pre-processing to be done on the Universe before it
+   *     is saved in transaction with 'updateInProgress' flag.
+   * @return
+   */
+  public Universe lockUniverseForUpdate(int expectedUniverseVersion, Consumer<Universe> callback) {
+    UniverseUpdater updater =
+        getLockingUniverseUpdater(expectedUniverseVersion, true, false, false, callback);
+    return lockUniverseForUpdate(expectedUniverseVersion, updater);
   }
 
   /**
@@ -391,14 +473,15 @@ public abstract class UniverseTaskBase extends AbstractTaskBase {
     return lockUniverseForUpdate(expectedUniverseVersion, updater);
   }
 
-  public void unlockUniverseForUpdate() {
-    unlockUniverseForUpdate(null);
+  public Universe unlockUniverseForUpdate() {
+    return unlockUniverseForUpdate(null);
   }
 
-  public void unlockUniverseForUpdate(String error) {
+  public Universe unlockUniverseForUpdate(String error) {
+    UUID universeUUID = taskParams().universeUUID;
     if (!universeLocked) {
-      log.warn("Unlock universe called when it was not locked.");
-      return;
+      log.warn("Unlock universe({}) called when it was not locked.", universeUUID);
+      return null;
     }
     final String err = error;
     // Create the update lambda.
@@ -417,13 +500,24 @@ public abstract class UniverseTaskBase extends AbstractTaskBase {
             universeDetails.updateInProgress = false;
             universeDetails.updatingTask = null;
             universeDetails.errorString = err;
+            if (universeDetails.updateSucceeded) {
+              // Clear the task UUID only if the update succeeded.
+              universeDetails.updatingTaskUUID = null;
+              // Do not save the transient state in the universe.
+              universeDetails.nodeDetailsSet.forEach(
+                  n -> {
+                    n.masterState = null;
+                  });
+            }
             universe.setUniverseDetails(universeDetails);
           }
         };
-    // Perform the update. If unsuccessful, this will throw a runtime exception which we do not
-    // catch as we want to fail.
-    saveUniverseDetails(updater);
-    log.trace("Unlocked universe {} for updates.", taskParams().universeUUID);
+    // Update the progress flag to false irrespective of the version increment failure.
+    // Universe version in master does not need to be updated as this does not change
+    // the Universe state. It simply sets updateInProgress flag to false.
+    universe = Universe.saveDetails(universeUUID, updater, false);
+    log.trace("Unlocked universe {} for updates.", universeUUID);
+    return universe;
   }
 
   /** Create a task to mark the change on a universe as success. */
@@ -479,6 +573,22 @@ public abstract class UniverseTaskBase extends AbstractTaskBase {
     task.setUserTaskUUID(userTaskUUID);
     subTaskGroup.addTask(task);
     subTaskGroupQueue.add(subTaskGroup);
+    return subTaskGroup;
+  }
+
+  /** Create a task to run YSQL upgrade on the universe. */
+  public TaskExecutor.SubTaskGroup createRunYsqlUpgradeTask(String ybSoftwareVersion) {
+    TaskExecutor.SubTaskGroup subTaskGroup = getTaskExecutor().createSubTaskGroup("RunYsqlUpgrade");
+
+    RunYsqlUpgrade task = createTask(RunYsqlUpgrade.class);
+
+    RunYsqlUpgrade.Params params = new RunYsqlUpgrade.Params();
+    params.universeUUID = taskParams().universeUUID;
+    params.ybSoftwareVersion = ybSoftwareVersion;
+
+    task.initialize(params);
+    subTaskGroup.addSubTask(task);
+    getRunnableTask().addSubTaskGroup(subTaskGroup);
     return subTaskGroup;
   }
 
@@ -754,6 +864,27 @@ public abstract class UniverseTaskBase extends AbstractTaskBase {
   }
 
   /**
+   * Create task to check if a specific process is caught up to other processes.
+   *
+   * @param node node for which the check needs to be executed.
+   * @param serverType server process type on the node to the check.
+   * @return SubTaskGroup
+   */
+  public SubTaskGroup createWaitForFollowerLagTask(NodeDetails node, ServerType serverType) {
+    SubTaskGroup subTaskGroup = new SubTaskGroup("WaitForLeaderBlacklistCompletion", executor);
+    WaitForFollowerLag.Params params = new WaitForFollowerLag.Params();
+    params.universeUUID = taskParams().universeUUID;
+    params.serverType = serverType;
+    params.node = node;
+    params.nodeName = node.nodeName;
+    WaitForFollowerLag task = createTask(WaitForFollowerLag.class);
+    task.initialize(params);
+    subTaskGroup.addTask(task);
+    subTaskGroupQueue.add(subTaskGroup);
+    return subTaskGroup;
+  }
+
+  /**
    * Create tasks to execute Cluster CTL command against specific process in parallel
    *
    * @param nodes set of nodes to issue control command in parallel.
@@ -817,6 +948,31 @@ public abstract class UniverseTaskBase extends AbstractTaskBase {
   }
 
   /**
+   * Create tasks to update the status of the nodes.
+   *
+   * @param nodes the set if nodes to be updated.
+   * @param nodeStatus the status into which these nodes will be transitioned.
+   * @return
+   */
+  public SubTaskGroup createSetNodeStatusTasks(
+      Collection<NodeDetails> nodes, NodeStatus nodeStatus) {
+    SubTaskGroup subTaskGroup = new SubTaskGroup("SetNodeStatus", executor);
+    for (NodeDetails node : nodes) {
+      SetNodeStatus.Params params = new SetNodeStatus.Params();
+      params.universeUUID = taskParams().universeUUID;
+      params.azUuid = node.azUuid;
+      params.nodeName = node.nodeName;
+      params.nodeStatus = nodeStatus;
+      SetNodeStatus task = createTask(SetNodeStatus.class);
+      task.initialize(params);
+      task.setUserTaskUUID(userTaskUUID);
+      subTaskGroup.addTask(task);
+    }
+    subTaskGroupQueue.add(subTaskGroup);
+    return subTaskGroup;
+  }
+
+  /**
    * Create a task to update the swamper target file
    *
    * @param removeFile, flag to state if we want to remove the swamper or not
@@ -843,7 +999,7 @@ public abstract class UniverseTaskBase extends AbstractTaskBase {
    * @param tableDetails table options and related details.
    */
   public SubTaskGroup createTableTask(
-      Common.TableType tableType, String tableName, TableDetails tableDetails) {
+      TableType tableType, String tableName, TableDetails tableDetails) {
     SubTaskGroup subTaskGroup = new SubTaskGroup("CreateTable", executor);
     CreateTable task = createTask(CreateTable.class);
     CreateTable.Params params = new CreateTable.Params();
@@ -854,6 +1010,46 @@ public abstract class UniverseTaskBase extends AbstractTaskBase {
     task.initialize(params);
     subTaskGroup.addTask(task);
     subTaskGroupQueue.add(subTaskGroup);
+    return subTaskGroup;
+  }
+
+  /** Create a task to create write/read test table wor write/read metric and alert. */
+  public TaskExecutor.SubTaskGroup createReadWriteTestTableTask(
+      int numPartitions, boolean ifNotExist) {
+    TaskExecutor.SubTaskGroup subTaskGroup =
+        getTaskExecutor().createSubTaskGroup("CreateReadWriteTestTable");
+
+    CreateTable task = createTask(CreateTable.class);
+
+    ColumnDetails idColumn = new ColumnDetails();
+    idColumn.isClusteringKey = true;
+    idColumn.name = "id";
+    idColumn.type = YQLDataType.SMALLINT;
+    idColumn.sortOrder = SortOrder.ASC;
+
+    TableDetails details = new TableDetails();
+    details.tableName = "write_read_test";
+    details.keyspace = SYSTEM_PLATFORM_DB;
+    details.columns = new ArrayList<>();
+    details.columns.add(idColumn);
+    // Split at 0, 100, 200, 300 ... (numPartitions - 1) * 100
+    if (numPartitions > 1) {
+      details.splitValues =
+          IntStream.range(0, numPartitions)
+              .mapToObj(num -> String.valueOf(num * 100))
+              .collect(Collectors.toList());
+    }
+
+    CreateTable.Params params = new CreateTable.Params();
+    params.universeUUID = taskParams().universeUUID;
+    params.tableType = TableType.PGSQL_TABLE_TYPE;
+    params.tableName = details.tableName;
+    params.tableDetails = details;
+    params.ifNotExist = ifNotExist;
+
+    task.initialize(params);
+    subTaskGroup.addSubTask(task);
+    getRunnableTask().addSubTaskGroup(subTaskGroup);
     return subTaskGroup;
   }
 
@@ -979,6 +1175,9 @@ public abstract class UniverseTaskBase extends AbstractTaskBase {
     params.opType =
         isAdd ? ChangeMasterConfig.OpType.AddMaster : ChangeMasterConfig.OpType.RemoveMaster;
     params.useHostPort = useHostPort;
+    // Check before the operation for idempotency if it is a retry.
+    // Existing first-try task remains intact.
+    params.checkBeforeChange = !UniverseTaskParams.isFirstTryForTask(taskParams());
     // Create the task.
     ChangeMasterConfig changeConfig = createTask(ChangeMasterConfig.class);
     changeConfig.initialize(params);
@@ -1175,6 +1374,18 @@ public abstract class UniverseTaskBase extends AbstractTaskBase {
     return subTaskGroup;
   }
 
+  public SubTaskGroup createTableBackupTaskYb(BackupTableParams taskParams) {
+    SubTaskGroup subTaskGroup =
+        new SubTaskGroup("BackupTableYb", executor, taskParams.ignoreErrors);
+
+    BackupTableYb task = createTask(BackupTableYb.class);
+    task.initialize(taskParams);
+    task.setUserTaskUUID(userTaskUUID);
+    subTaskGroup.addTask(task);
+    subTaskGroupQueue.add(subTaskGroup);
+    return subTaskGroup;
+  }
+
   public SubTaskGroup createDeleteBackupTasks(List<Backup> backups, UUID customerUUID) {
     SubTaskGroup subTaskGroup = new SubTaskGroup("DeleteBackup", executor);
     for (Backup backup : backups) {
@@ -1300,6 +1511,22 @@ public abstract class UniverseTaskBase extends AbstractTaskBase {
     return subTaskGroup;
   }
 
+  public SubTaskGroup createWaitForLeaderBlacklistCompletionTask(int waitTimeMs) {
+    SubTaskGroup subTaskGroup = new SubTaskGroup("WaitForLeaderBlacklistCompletion", executor);
+    WaitForLeaderBlacklistCompletion.Params params = new WaitForLeaderBlacklistCompletion.Params();
+    params.universeUUID = taskParams().universeUUID;
+    params.waitTimeMs = waitTimeMs;
+    // Create the task.
+    WaitForLeaderBlacklistCompletion leaderBlacklistCompletion =
+        createTask(WaitForLeaderBlacklistCompletion.class);
+    leaderBlacklistCompletion.initialize(params);
+    // Add it to the task list.
+    subTaskGroup.addTask(leaderBlacklistCompletion);
+    // Add the task list to the task queue.
+    subTaskGroupQueue.add(subTaskGroup);
+    return subTaskGroup;
+  }
+
   /** Creates a task to wait for leaders to be on preferred regions only. */
   public void createWaitForLeadersOnPreferredOnlyTask() {
     SubTaskGroup subTaskGroup = new SubTaskGroup("WaitForLeadersOnPreferredOnly", executor);
@@ -1341,14 +1568,35 @@ public abstract class UniverseTaskBase extends AbstractTaskBase {
    *
    * @param nodes The nodes that have to be removed from the blacklist.
    * @param isAdd true if the node are added to server blacklist, else removed.
+   * @param isLeaderBlacklist true if we are leader blacklisting the node
    * @return the created task group.
    */
-  public SubTaskGroup createModifyBlackListTask(List<NodeDetails> nodes, boolean isAdd) {
+  public SubTaskGroup createModifyBlackListTask(
+      List<NodeDetails> nodes, boolean isAdd, boolean isLeaderBlacklist) {
+    if (isAdd) {
+      return createModifyBlackListTask(nodes, null, isLeaderBlacklist);
+    }
+    return createModifyBlackListTask(null, nodes, isLeaderBlacklist);
+  }
+
+  /**
+   * Creates a task to add/remove nodes from blacklist on server.
+   *
+   * @param addNodes The nodes that have to be added to the blacklist.
+   * @param removeNodes The nodes that have to be removed from the blacklist.
+   * @param isLeaderBlacklist true if we are leader blacklisting the node
+   * @return
+   */
+  public SubTaskGroup createModifyBlackListTask(
+      Collection<NodeDetails> addNodes,
+      Collection<NodeDetails> removeNodes,
+      boolean isLeaderBlacklist) {
     SubTaskGroup subTaskGroup = new SubTaskGroup("ModifyBlackList", executor);
     ModifyBlackList.Params params = new ModifyBlackList.Params();
     params.universeUUID = taskParams().universeUUID;
-    params.isAdd = isAdd;
-    params.nodes = new HashSet<NodeDetails>(nodes);
+    params.addNodes = addNodes;
+    params.removeNodes = removeNodes;
+    params.isLeaderBlacklist = isLeaderBlacklist;
     // Create the task.
     ModifyBlackList modifyBlackList = createTask(ModifyBlackList.class);
     modifyBlackList.initialize(params);
@@ -1396,45 +1644,73 @@ public abstract class UniverseTaskBase extends AbstractTaskBase {
 
   // Check if the node present in taskParams has a backing instance alive on the IaaS.
   public boolean instanceExists(NodeTaskParams taskParams) {
-    // Create the process to fetch information about the node from the cloud provider.
+    Optional<Boolean> optional = instanceExists(taskParams, null);
+    return optional.isPresent();
+  }
+
+  // It returns 3 states - empty for not found, false for not matching and true for matching.
+  public Optional<Boolean> instanceExists(
+      NodeTaskParams taskParams, Map<String, String> expectedTags) {
     NodeManager nodeManager = Play.current().injector().instanceOf(NodeManager.class);
     ShellResponse response = nodeManager.nodeCommand(NodeManager.NodeCommandType.List, taskParams);
     processShellResponse(response);
-    boolean exists = true;
-    if (response != null && response.message != null && !StringUtils.isEmpty(response.message)) {
-      JsonNode jsonNodeTmp = Json.parse(response.message);
-      if (jsonNodeTmp.isArray()) {
-        jsonNodeTmp = jsonNodeTmp.get(0);
-      }
-      final JsonNode jsonNode = jsonNodeTmp;
-      Iterator<Entry<String, JsonNode>> iter = jsonNode.fields();
-      while (iter.hasNext()) {
-        Entry<String, JsonNode> entry = iter.next();
-        log.info("key {} to value {}.", entry.getKey(), entry.getValue());
-        if (entry.getKey().equals("host_found") && entry.getValue().asText().equals("false")) {
-          exists = false;
-          break;
-        }
-      }
-    } else {
-      exists = false;
+    if (response == null || Strings.isNullOrEmpty(response.message)) {
+      // Instance does not exist.
+      return Optional.empty();
     }
-    return exists;
+    if (MapUtils.isEmpty(expectedTags)) {
+      return Optional.of(true);
+    }
+    JsonNode jsonNode = Json.parse(response.message);
+    if (jsonNode.isArray()) {
+      jsonNode = jsonNode.get(0);
+    }
+    long matchCount =
+        Streams.stream(jsonNode.fields())
+            .filter(
+                e -> {
+                  log.info(
+                      "Node: {}, Key: {}, Value: {}",
+                      taskParams.nodeName,
+                      e.getKey(),
+                      e.getValue());
+                  String expectedTagValue = expectedTags.get(e.getKey());
+                  return expectedTagValue != null && expectedTagValue.equals(e.getValue().asText());
+                })
+            .count();
+    log.info("Expected tags: {}", expectedTags);
+    return Optional.of(matchCount == expectedTags.size());
   }
 
   // Perform preflight checks on the given node.
-  public String performPreflightCheck(NodeDetails node, NodeTaskParams taskParams) {
+  public String performPreflightCheck(Cluster cluster, NodeDetails currentNode) {
+    if (cluster.userIntent.providerType != com.yugabyte.yw.commissioner.Common.CloudType.onprem) {
+      return null;
+    }
+    NodeTaskParams preflightTaskParams = new NodeTaskParams();
+    UserIntent userIntent = cluster.userIntent;
+    preflightTaskParams.nodeName = currentNode.nodeName;
+    preflightTaskParams.deviceInfo = userIntent.deviceInfo;
+    preflightTaskParams.azUuid = currentNode.azUuid;
+    preflightTaskParams.universeUUID = taskParams().universeUUID;
+    UniverseTaskParams.CommunicationPorts.exportToCommunicationPorts(
+        preflightTaskParams.communicationPorts, currentNode);
+    preflightTaskParams.extraDependencies.installNodeExporter =
+        taskParams().extraDependencies.installNodeExporter;
     // Create the process to fetch information about the node from the cloud provider.
     NodeManager nodeManager = Play.current().injector().instanceOf(NodeManager.class);
-    log.info("Running preflight checks for node {}.", taskParams.nodeName);
+    log.info("Running preflight checks for node {}.", preflightTaskParams.nodeName);
     ShellResponse response =
-        nodeManager.nodeCommand(NodeManager.NodeCommandType.Precheck, taskParams);
+        nodeManager.nodeCommand(NodeManager.NodeCommandType.Precheck, preflightTaskParams);
     if (response.code == 0) {
       JsonNode responseJson = Json.parse(response.message);
       for (JsonNode nodeContent : responseJson) {
         if (!nodeContent.isBoolean() || !nodeContent.asBoolean()) {
           String errString =
-              "Failed preflight checks for node " + taskParams.nodeName + ":\n" + response.message;
+              "Failed preflight checks for node "
+                  + preflightTaskParams.nodeName
+                  + ":\n"
+                  + response.message;
           log.error(errString);
           return response.message;
         }
@@ -1474,7 +1750,9 @@ public abstract class UniverseTaskBase extends AbstractTaskBase {
   // Helper API to update the db for the node with the given state.
   public void setNodeState(String nodeName, NodeDetails.NodeState state) {
     // Persist the desired node information into the DB.
-    UniverseUpdater updater = nodeStateUpdater(taskParams().universeUUID, nodeName, state);
+    UniverseUpdater updater =
+        nodeStateUpdater(
+            taskParams().universeUUID, nodeName, NodeStatus.builder().nodeState(state).build());
     saveUniverseDetails(updater);
   }
 
@@ -1497,24 +1775,6 @@ public abstract class UniverseTaskBase extends AbstractTaskBase {
     task.initialize(params);
 
     SubTaskGroup subTaskGroup = new SubTaskGroup("LoadBalancerStateChange", executor);
-    subTaskGroup.addTask(task);
-    subTaskGroupQueue.add(subTaskGroup);
-    return subTaskGroup;
-  }
-
-  public SubTaskGroup createAsyncReplicationSetupTask() {
-    SubTaskGroup subTaskGroup = new SubTaskGroup("AsyncReplicationSetup", executor);
-    AsyncReplicationSetup task = createTask(AsyncReplicationSetup.class);
-    task.initialize(taskParams());
-    subTaskGroup.addTask(task);
-    subTaskGroupQueue.add(subTaskGroup);
-    return subTaskGroup;
-  }
-
-  public SubTaskGroup createAsyncReplicationPlatformSyncTask() {
-    SubTaskGroup subTaskGroup = new SubTaskGroup("AsyncReplicationPlatformSync", executor);
-    AsyncReplicationPlatformSync task = createTask(AsyncReplicationPlatformSync.class);
-    task.initialize(taskParams());
     subTaskGroup.addTask(task);
     subTaskGroupQueue.add(subTaskGroup);
     return subTaskGroup;
@@ -1666,7 +1926,7 @@ public abstract class UniverseTaskBase extends AbstractTaskBase {
           newVersion);
     } catch (Exception e) {
       log.error(
-          "Error occurred incrementing cluster config version for universe {}", universeUUID, e);
+          "Error occurred incrementing cluster config version for universe " + universeUUID, e);
       throw new RuntimeException("Error incrementing cluster config version", e);
     } finally {
       ybService.closeClient(client, hostPorts);
@@ -1694,12 +1954,17 @@ public abstract class UniverseTaskBase extends AbstractTaskBase {
   }
 
   protected void preTaskActions() {
+    Universe universe = Universe.getOrBadRequest(taskParams().universeUUID);
+    preTaskActions(universe);
+  }
+
+  // Use this if it is already in transaction or the field changes are not yet written to the DB.
+  protected void preTaskActions(Universe universe) {
     HealthChecker healthChecker = Play.current().injector().instanceOf(HealthChecker.class);
-    Universe u = Universe.getOrBadRequest(taskParams().universeUUID);
-    UniverseDefinitionTaskParams details = u.getUniverseDetails();
+    UniverseDefinitionTaskParams details = universe.getUniverseDetails();
     if ((details != null) && details.updateInProgress) {
-      log.debug("Cancelling any active health-checks for universe {}", u.universeUUID);
-      healthChecker.cancelHealthCheck(u.universeUUID);
+      log.debug("Cancelling any active health-checks for universe {}", universe.universeUUID);
+      healthChecker.cancelHealthCheck(universe.universeUUID);
     }
   }
 }

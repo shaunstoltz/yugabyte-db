@@ -15,17 +15,30 @@
 
 #include "yb/client/ql-dml-test-base.h"
 
+#include "yb/bfql/gen_opcodes.h"
+
 #include "yb/client/client.h"
 #include "yb/client/error.h"
+#include "yb/client/schema.h"
 #include "yb/client/session.h"
 #include "yb/client/table.h"
 #include "yb/client/table_creator.h"
+#include "yb/client/yb_op.h"
 
 #include "yb/common/ql_name.h"
 #include "yb/common/ql_value.h"
+#include "yb/common/schema.h"
+
+#include "yb/gutil/casts.h"
 
 #include "yb/integration-tests/external_mini_cluster.h"
-#include "yb/util/bfql/gen_opcodes.h"
+
+#include "yb/server/clock.h"
+
+#include "yb/util/atomic.h"
+#include "yb/util/format.h"
+#include "yb/util/status_format.h"
+#include "yb/util/tsan_util.h"
 
 #include "yb/yql/cql/ql/util/errcodes.h"
 #include "yb/yql/cql/ql/util/statement_result.h"
@@ -35,6 +48,13 @@ DECLARE_bool(enable_ysql);
 using namespace std::literals;
 
 namespace yb {
+
+namespace ql {
+
+extern ErrorCode QLStatusToErrorCode(QLResponsePB::QLStatus status); // TODO
+
+}
+
 namespace client {
 
 const client::YBTableName kTableName(YQL_DATABASE_CQL, "my_keyspace", "ql_client_test_table");
@@ -155,7 +175,7 @@ Result<YBqlWriteOpPtr> Increment(
   column_op->add_operands()->set_column_id(value_column_id);
   bfcall->add_operands()->mutable_value()->set_int64_value(delta);
 
-  RETURN_NOT_OK(session->Apply(op));
+  session->Apply(op);
   if (flush) {
     RETURN_NOT_OK(session->Flush());
     RETURN_NOT_OK(CheckOp(op.get()));
@@ -229,7 +249,7 @@ void InitIndex(
     }
   }
 
-  index_info->set_range_column_count(num_range_keys);
+  index_info->set_range_column_count(narrow_cast<uint32_t>(num_range_keys));
   TableProperties table_properties;
   table_properties.SetUseMangledColumnName(use_mangled_names);
 
@@ -255,8 +275,7 @@ void CreateIndex(
   const YBTableName index_name(YQL_DATABASE_CQL, table.name().namespace_name(),
       table.name().table_name() + '_' + schema.Column(indexed_column_index).name() + "_idx");
 
-  ASSERT_OK(index->Create(index_name, table->GetPartitionCount(),
-      client, &builder, &index_info));
+  ASSERT_OK(index->Create(index_name, table->GetPartitionCount(), client, &builder, &index_info));
 }
 
 void PrepareIndex(
@@ -300,7 +319,7 @@ Result<YBqlWriteOpPtr> WriteRow(
   if (op_type != WriteOpType::DELETE) {
     table->AddInt32ColumnValue(req, kValueColumn, value);
   }
-  RETURN_NOT_OK(session->Apply(op));
+  session->Apply(op);
   if (flush) {
     RETURN_NOT_OK(session->Flush());
     RETURN_NOT_OK(CheckOp(op.get()));
@@ -324,7 +343,7 @@ Result<int32_t> SelectRow(
   auto* const req = op->mutable_request();
   QLAddInt32HashValue(req, key);
   table->AddColumns({column}, req);
-  RETURN_NOT_OK(session->Apply(op));
+  session->Apply(op);
   auto flush_status = session->FlushAndGetOpsErrors();
   if (flush_status.status.IsIOError()) {
     for (const auto& error : flush_status.errors) {
@@ -364,7 +383,7 @@ Result<std::map<int32_t, int32_t>> SelectAllRows(
       continue;
     }
     ops.push_back(op);
-    RETURN_NOT_OK(session->Apply(op));
+    session->Apply(op);
   }
 
   RETURN_NOT_OK(session->Flush());

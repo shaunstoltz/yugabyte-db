@@ -13,7 +13,8 @@ import {
   YBMultiSelectWithLabel,
   YBSelectWithLabel,
   YBTextArea,
-  YBTextInputWithLabel
+  YBTextInputWithLabel,
+  YBToggle
 } from '../../common/forms/fields';
 import { connect } from 'react-redux';
 import '../CreateAlerts.scss';
@@ -21,11 +22,14 @@ import { AlertsPolicy } from './AlertsPolicy';
 import { isNonEmptyArray } from '../../../utils/ObjectUtils';
 import { getAlertConfigByName } from '../../../actions/customers';
 import { toast } from 'react-toastify';
+import YBInfoTip from '../../common/descriptors/YBInfoTip';
+import { isNonAvailable } from '../../../utils/LayoutUtils';
 
 const required = (value) => (value ? undefined : 'This field is required.');
 
 const CreateAlert = (props) => {
   const {
+    customer,
     enablePlatformAlert,
     alertUniverseList,
     onCreateCancel,
@@ -42,6 +46,7 @@ const CreateAlert = (props) => {
   );
   const [alertDestination, setAlertDestination] = useState([]);
   const [currentMetric, setCurrentMetric] = useState(undefined);
+  const isReadOnly = isNonAvailable(customer.data.features, 'alert.configuration.actions');
 
   useEffect(() => {
     alertDestinations().then((res) => {
@@ -64,10 +69,10 @@ const CreateAlert = (props) => {
   }, [alertDestinations]);
 
   useEffect(() => {
-    setCurrentMetric(
+    setCurrentMetric((currentMetric) =>
       initialValues.ALERT_METRICS_CONDITION
         ? metricsData.find((metric) => metric.template === initialValues.ALERT_METRICS_CONDITION)
-        : undefined
+        : currentMetric
     );
   }, [metricsData, initialValues.ALERT_METRICS_CONDITION]);
 
@@ -126,6 +131,7 @@ const CreateAlert = (props) => {
     props.updateField('alertConfigForm', 'ALERT_METRICS_DURATION', metric.durationSec);
     props.updateField('alertConfigForm', 'ALERT_CONFIGURATION_NAME', metric.name);
     props.updateField('alertConfigForm', 'ALERT_CONFIGURATION_DESCRIPTION', metric.description);
+    props.updateField('alertConfigForm', 'ALERT_STATUS', true);
   };
 
   /**
@@ -135,7 +141,6 @@ const CreateAlert = (props) => {
    */
   const handleOnSubmit = async (values) => {
     const cUUID = localStorage.getItem('customerId');
-
     if (
       values.type !== 'update' ||
       values['ALERT_CONFIGURATION_NAME'] !== initialValues['ALERT_CONFIGURATION_NAME']
@@ -164,7 +169,7 @@ const CreateAlert = (props) => {
       thresholdUnit: currentMetric.thresholdUnit,
       template: values['ALERT_METRICS_CONDITION'] || 'REPLICATION_LAG',
       durationSec: values['ALERT_METRICS_DURATION'],
-      active: true
+      active: values['ALERT_STATUS']
     };
 
     switch (values['ALERT_DESTINATION_LIST']) {
@@ -218,6 +223,7 @@ const CreateAlert = (props) => {
               validate={required}
               options={alertMetricsConditionList}
               onInputChanged={handleMetricConditionChange}
+              readOnlySelect={isReadOnly}
             />
           </Col>
         </Row>
@@ -231,7 +237,7 @@ const CreateAlert = (props) => {
                   placeHolder="Enter an alert name"
                   component={YBTextInputWithLabel}
                   validate={required}
-                  isReadOnly={false}
+                  isReadOnly={isReadOnly}
                 />
               </Col>
             </Row>
@@ -242,7 +248,7 @@ const CreateAlert = (props) => {
                   name="ALERT_CONFIGURATION_DESCRIPTION"
                   placeHolder="Enter an alert description"
                   component={YBTextArea}
-                  isReadOnly={false}
+                  isReadOnly={isReadOnly}
                 />
               </Col>
             </Row>
@@ -259,6 +265,7 @@ const CreateAlert = (props) => {
                     component="input"
                     onChange={handleTargetTypeChange}
                     type="radio"
+                    disabled={isReadOnly}
                     value={target.value}
                   />{' '}
                   {target.label}
@@ -271,7 +278,23 @@ const CreateAlert = (props) => {
                 hideSelectedOptions={false}
                 isMulti={true}
                 validate={!isAllUniversesDisabled && required}
+                isReadOnly={isReadOnly}
                 className={isAllUniversesDisabled ? 'hide-field' : ''}
+              />
+            </Col>
+          </Row>
+        )}
+        {currentMetric && (
+          <Row>
+            <Col md={6}>
+              <Field
+                name="ALERT_STATUS"
+                component={YBToggle}
+                isReadOnly={isReadOnly}
+                onChange={(event) =>
+                  props.updateField('alertConfigForm', 'ALERT_STATUS', event?.target?.checked)
+                }
+                label="Active"
               />
             </Col>
           </Row>
@@ -282,24 +305,36 @@ const CreateAlert = (props) => {
             <Col md={12}>
               <h4>Conditions</h4>
             </Col>
-            <Row>
-              <Col md={3} className="durationInput">
-                <div className="form-item-custom-label">Duration, sec</div>
-                <Field
-                  name="ALERT_METRICS_DURATION"
-                  component={YBTextInputWithLabel}
-                  validate={required}
-                  placeHolder="Enter duration in minutes"
-                />
+            <Col md={12}>
+              <div className="form-item-custom-label">Duration</div>
+            </Col>
+            <div className="form-field-grid">
+              <Col md={12}>
+                <Row>
+                  <Col lg={2}>
+                    <Field
+                      name="ALERT_METRICS_DURATION"
+                      component={YBTextInputWithLabel}
+                      validate={required}
+                      placeHolder="Enter duration in minutes"
+                      isReadOnly={isReadOnly}
+                    />
+                  </Col>
+                  <Col lg={1}>
+                    <div className="flex-container">
+                      <p className="percent-text">sec</p>
+                    </div>
+                  </Col>
+                </Row>
               </Col>
-            </Row>
+            </div>
             <Row>
               <Col md={12}>
                 <div className="form-field-grid">
                   <FieldArray
                     name="ALERT_METRICS_CONDITION_POLICY"
                     component={AlertsPolicy}
-                    props={{ currentMetric: currentMetric }}
+                    props={{ currentMetric: currentMetric, isReadOnly: isReadOnly }}
                   />
                 </div>
               </Col>
@@ -309,11 +344,16 @@ const CreateAlert = (props) => {
         {currentMetric && (
           <Row className="actionBtnsMargin">
             <Col md={6}>
-              <div className="form-item-custom-label">Destination</div>
+              <span className="form-item-custom-label marginRight">Destination</span>
+              <YBInfoTip
+                title="Destination"
+                content={`A destination consist of one or more channels. Whenever an Alert is triggered, it sends the related data to its designated destination.`}
+              />
               <Field
                 name="ALERT_DESTINATION_LIST"
                 component={YBSelectWithLabel}
                 options={alertDestination}
+                readOnlySelect={isReadOnly}
               />
             </Col>
           </Row>
@@ -328,7 +368,7 @@ const CreateAlert = (props) => {
                 setInitialValues();
               }}
             />
-            {currentMetric && (
+            {currentMetric && !isReadOnly && (
               <YBButton btnText="Save" btnType="submit" btnClass="btn btn-orange" />
             )}
           </Col>

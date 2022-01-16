@@ -101,9 +101,12 @@ public class UniverseDefinitionTaskParams extends UniverseTaskParams {
   // Type of task which set updateInProgress flag.
   @ApiModelProperty public TaskType updatingTask = null;
 
+  // UUID of task which set updateInProgress flag.
+  @ApiModelProperty public UUID updatingTaskUUID = null;
+
   @ApiModelProperty public boolean backupInProgress = false;
 
-  // This tracks the if latest operation on this universe has successfully completed. This flag is
+  // This tracks that if latest operation on this universe has successfully completed. This flag is
   // reset each time a new operation on the universe starts, and is set at the very end of that
   // operation.
   @ApiModelProperty public boolean updateSucceeded = true;
@@ -169,7 +172,7 @@ public class UniverseDefinitionTaskParams extends UniverseTaskParams {
   public static class Cluster {
 
     private static final Set<String> AWS_INSTANCE_WITH_EPHEMERAL_STORAGE_ONLY =
-        ImmutableSet.of("i3.", "c5d.");
+        ImmutableSet.of("i3.", "c5d.", "c6gd.");
 
     public UUID uuid = UUID.randomUUID();
 
@@ -397,7 +400,7 @@ public class UniverseDefinitionTaskParams extends UniverseTaskParams {
     // When this is set to true, YW will setup the universe to communicate by way of hostnames
     // instead of ip addresses. These hostnames will have been provided during on-prem provider
     // setup and will be in-place of privateIP
-    @ApiModelProperty() public boolean useHostname = false;
+    @Deprecated @ApiModelProperty() public boolean useHostname = false;
 
     @ApiModelProperty() public boolean useSystemd = false;
 
@@ -553,6 +556,12 @@ public class UniverseDefinitionTaskParams extends UniverseTaskParams {
       }
 
       return retTags;
+    }
+
+    @JsonIgnore
+    public boolean isYSQLAuthEnabled() {
+      return tserverGFlags.getOrDefault("ysql_enable_auth", "false").equals("true")
+          || enableYSQLAuth;
     }
   }
 

@@ -33,7 +33,6 @@
 #define YB_CONSENSUS_CONSENSUS_H_
 
 #include <iosfwd>
-#include <ostream>
 #include <memory>
 #include <string>
 #include <vector>
@@ -41,30 +40,27 @@
 #include <boost/optional/optional_fwd.hpp>
 
 #include "yb/common/entity_ids_types.h"
-#include "yb/common/hybrid_time.h"
 
 #include "yb/consensus/consensus_fwd.h"
-#include "yb/consensus/consensus_types.h"
-#include "yb/consensus/consensus.pb.h"
-#include "yb/consensus/opid_util.h"
+#include "yb/consensus/consensus_types.pb.h"
+#include "yb/consensus/metadata.pb.h"
 
-#include "yb/gutil/callback.h"
 #include "yb/gutil/ref_counted.h"
 #include "yb/gutil/stringprintf.h"
 #include "yb/gutil/strings/substitute.h"
 
+#include "yb/tserver/tserver_types.pb.h"
+
+#include "yb/util/status_fwd.h"
 #include "yb/util/enums.h"
 #include "yb/util/monotime.h"
 #include "yb/util/opid.h"
-#include "yb/util/status.h"
+#include "yb/util/opid.pb.h"
+#include "yb/util/physical_time.h"
 #include "yb/util/status_callback.h"
 #include "yb/util/strongly_typed_bool.h"
 
 namespace yb {
-
-namespace master {
-class SysCatalogTable;
-}
 
 namespace server {
 class Clock;
@@ -174,9 +170,7 @@ class Consensus {
 
   // Implement a LeaderStepDown() request.
   virtual CHECKED_STATUS StepDown(const LeaderStepDownRequestPB* req,
-                                  LeaderStepDownResponsePB* resp) {
-    return STATUS(NotSupported, "Not implemented.");
-  }
+                                  LeaderStepDownResponsePB* resp);
 
   // Wait until the node has LEADER role.
   // Returns Status::TimedOut if the role is not LEADER within 'timeout'.
@@ -256,12 +250,10 @@ class Consensus {
   // Implement a ChangeConfig() request.
   virtual CHECKED_STATUS ChangeConfig(const ChangeConfigRequestPB& req,
                                       const StdStatusCallback& client_cb,
-                                      boost::optional<tserver::TabletServerErrorPB::Code>* error) {
-    return STATUS(NotSupported, "Not implemented.");
-  }
+                                      boost::optional<tserver::TabletServerErrorPB::Code>* error);
 
   // Returns the current Raft role of this instance.
-  virtual RaftPeerPB::Role role() const = 0;
+  virtual PeerRole role() const = 0;
 
   // Returns the leader status (see LeaderStatus type description for details).
   // If leader is ready, then also returns term, otherwise OpId::kUnknownTerm is returned.
@@ -335,15 +327,14 @@ class Consensus {
 
   // Read majority replicated messages for CDC producer.
   virtual Result<ReadOpsResult> ReadReplicatedMessagesForCDC(const yb::OpId& from,
-                                                             int64_t* repl_index) = 0;
+                                                             int64_t* repl_index,
+                                                             const CoarseTimePoint deadline) = 0;
 
   virtual void UpdateCDCConsumerOpId(const yb::OpId& op_id) = 0;
 
  protected:
   friend class RefCountedThreadSafe<Consensus>;
   friend class tablet::TabletPeer;
-  friend class master::SysCatalogTable;
-
 
   // Fault hooks for tests. In production code this will always be null.
   std::shared_ptr<ConsensusFaultHooks> fault_hooks_;
@@ -385,93 +376,18 @@ YB_DEFINE_ENUM(StateChangeReason,
     (LEADER_CONFIG_CHANGE_COMPLETE)
     (FOLLOWER_CONFIG_CHANGE_COMPLETE));
 
-// Context provided for callback on master/tablet-server peer state change for post processing
-// e.g., update in-memory contents.
-struct StateChangeContext {
-
-  const StateChangeReason reason;
-
-  explicit StateChangeContext(StateChangeReason in_reason)
-      : reason(in_reason) {
-  }
-
-  StateChangeContext(StateChangeReason in_reason, bool is_locked)
-      : reason(in_reason),
-        is_config_locked_(is_locked) {
-  }
-
-  StateChangeContext(StateChangeReason in_reason, string uuid)
-      : reason(in_reason),
-        new_leader_uuid(uuid) {
-  }
-
-  StateChangeContext(StateChangeReason in_reason,
-                     ChangeConfigRecordPB change_rec,
-                     string remove = "")
-      : reason(in_reason),
-        change_record(change_rec),
-        remove_uuid(remove) {
-  }
-
-  bool is_config_locked() const {
-    return is_config_locked_;
-  }
-
-  ~StateChangeContext() {}
-
-  std::string ToString() const {
-    switch (reason) {
-      case StateChangeReason::TABLET_PEER_STARTED:
-        return "Started TabletPeer";
-      case StateChangeReason::CONSENSUS_STARTED:
-        return "RaftConsensus started";
-      case StateChangeReason::NEW_LEADER_ELECTED:
-        return strings::Substitute("New leader $0 elected", new_leader_uuid);
-      case StateChangeReason::FOLLOWER_NO_OP_COMPLETE:
-        return "Replicate of NO_OP complete on follower";
-      case StateChangeReason::LEADER_CONFIG_CHANGE_COMPLETE:
-        return strings::Substitute("Replicated change config $0 round complete on leader",
-          change_record.ShortDebugString());
-      case StateChangeReason::FOLLOWER_CONFIG_CHANGE_COMPLETE:
-        return strings::Substitute("Config change $0 complete on follower",
-          change_record.ShortDebugString());
-      case StateChangeReason::INVALID_REASON: FALLTHROUGH_INTENDED;
-      default:
-        return "INVALID REASON";
-    }
-  }
-
-  // Auxiliary info for some of the reasons above.
-  // Value is filled when the change reason is NEW_LEADER_ELECTED.
-  const string new_leader_uuid;
-
-  // Value is filled when the change reason is LEADER/FOLLOWER_CONFIG_CHANGE_COMPLETE.
-  const ChangeConfigRecordPB change_record;
-
-  // Value is filled when the change reason is LEADER_CONFIG_CHANGE_COMPLETE
-  // and it is a REMOVE_SERVER, then that server's uuid is saved here by the master leader.
-  const string remove_uuid;
-
-  // If this is true, the call-stack above has taken the lock for the raft consensus state. Needed
-  // in SysCatalogStateChanged for master to not re-get the lock. Not used for tserver callback.
-  // Note that the state changes using the UpdateConsensus() mechanism always hold the lock, so
-  // defaulting to true as they are majority. For ones that do not hold the lock, setting
-  // it to false in their constructor suffices currently, so marking it const.
-  const bool is_config_locked_ = true;
-};
-
 class Consensus::ConsensusFaultHooks {
  public:
-  virtual CHECKED_STATUS PreStart() { return Status::OK(); }
-  virtual CHECKED_STATUS PostStart() { return Status::OK(); }
-  virtual CHECKED_STATUS PreConfigChange() { return Status::OK(); }
-  virtual CHECKED_STATUS PostConfigChange() { return Status::OK(); }
-  virtual CHECKED_STATUS PreReplicate() { return Status::OK(); }
-  virtual CHECKED_STATUS PostReplicate() { return Status::OK(); }
-  virtual CHECKED_STATUS PreUpdate() { return Status::OK(); }
-  virtual CHECKED_STATUS PostUpdate() { return Status::OK(); }
-  virtual CHECKED_STATUS PreShutdown() { return Status::OK(); }
-  virtual CHECKED_STATUS PostShutdown() { return Status::OK(); }
+  virtual CHECKED_STATUS PreStart();
+  virtual CHECKED_STATUS PostStart();
+  virtual CHECKED_STATUS PreConfigChange();
+  virtual CHECKED_STATUS PostConfigChange();
+  virtual CHECKED_STATUS PreReplicate();
+  virtual CHECKED_STATUS PostReplicate();
+  virtual CHECKED_STATUS PreUpdate();
+  virtual CHECKED_STATUS PostUpdate();
+  virtual CHECKED_STATUS PreShutdown();
+  virtual CHECKED_STATUS PostShutdown();
   virtual ~ConsensusFaultHooks() {}
 };
 
@@ -497,9 +413,7 @@ struct LeaderState {
   CHECKED_STATUS CreateStatus() const;
 };
 
-inline CHECKED_STATUS MoveStatus(LeaderState&& state) {
-  return state.CreateStatus();
-}
+CHECKED_STATUS MoveStatus(LeaderState&& state);
 
 } // namespace consensus
 } // namespace yb

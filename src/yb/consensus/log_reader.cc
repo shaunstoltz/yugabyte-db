@@ -32,28 +32,24 @@
 
 #include "yb/consensus/log_reader.h"
 
-#include <sys/statvfs.h>
-
 #include <algorithm>
 #include <mutex>
 
+#include <glog/logging.h>
+
 #include "yb/consensus/consensus_util.h"
 #include "yb/consensus/log_index.h"
-#include "yb/consensus/opid_util.h"
+#include "yb/consensus/log_util.h"
 
-#include "yb/gutil/map-util.h"
-#include "yb/gutil/stl_util.h"
-#include "yb/gutil/strings/util.h"
-#include "yb/gutil/strings/substitute.h"
+#include "yb/gutil/dynamic_annotations.h"
 
-#include "yb/util/coding.h"
 #include "yb/util/env_util.h"
 #include "yb/util/flag_tags.h"
-#include "yb/util/hexdump.h"
 #include "yb/util/logging.h"
 #include "yb/util/metrics.h"
+#include "yb/util/monotime.h"
 #include "yb/util/path_util.h"
-#include "yb/util/pb_util.h"
+#include "yb/util/result.h"
 
 DEFINE_bool(enable_log_retention_by_op_idx, true,
             "If true, logs will be retained based on an op id passed by the cdc service");
@@ -87,6 +83,13 @@ DEFINE_test_flag(bool, record_segments_violate_min_space_policy, false,
     "If set, everytime GetSegmentPrefixNotIncluding runs, segments that violate the max time "
     "policy will be appended to LogReader::segments_violate_min_space_policy_.");
 
+DEFINE_bool(get_changes_honor_deadline, true,
+            "Toggle whether to honor the deadline passed to log reader");
+
+DEFINE_test_flag(int32, get_changes_read_loop_delay_ms, 0,
+                 "Amount of time to sleep for between each iteration of the loop in "
+                 "ReadReplicatesInRange. This is used to test the return of partial results.");
+
 namespace yb {
 namespace log {
 
@@ -107,14 +110,13 @@ const int64_t LogReader::kNoSizeLimit = -1;
 
 Status LogReader::Open(Env *env,
                        const scoped_refptr<LogIndex>& index,
-                       const std::string& tablet_id,
+                       std::string log_prefix,
                        const std::string& tablet_wal_path,
-                       const std::string& peer_uuid,
                        const scoped_refptr<MetricEntity>& table_metric_entity,
                        const scoped_refptr<MetricEntity>& tablet_metric_entity,
                        std::unique_ptr<LogReader> *reader) {
   std::unique_ptr<LogReader> log_reader(new LogReader(
-      env, index, tablet_id, peer_uuid, table_metric_entity, tablet_metric_entity));
+      env, index, std::move(log_prefix), table_metric_entity, tablet_metric_entity));
 
   RETURN_NOT_OK(log_reader->Init(tablet_wal_path));
   *reader = std::move(log_reader);
@@ -123,14 +125,12 @@ Status LogReader::Open(Env *env,
 
 LogReader::LogReader(Env* env,
                      const scoped_refptr<LogIndex>& index,
-                     string tablet_id,
-                     string peer_uuid,
+                     std::string log_prefix,
                      const scoped_refptr<MetricEntity>& table_metric_entity,
                      const scoped_refptr<MetricEntity>& tablet_metric_entity)
     : env_(env),
       log_index_(index),
-      tablet_id_(std::move(tablet_id)),
-      log_prefix_(consensus::MakeTabletLogPrefix(tablet_id_, peer_uuid)),
+      log_prefix_(std::move(log_prefix)),
       state_(kLogReaderInitialized) {
   if (table_metric_entity) {
     read_batch_latency_ = METRIC_log_reader_read_batch_latency.Instantiate(table_metric_entity);
@@ -342,34 +342,6 @@ int64_t LogReader::GetMinReplicateIndex() const {
   return min_remaining_op_idx;
 }
 
-void LogReader::GetMaxIndexesToSegmentSizeMap(int64_t min_op_idx, int32_t segments_count,
-                                              int64_t max_close_time_us,
-                                              std::map<int64_t, int64_t>*
-                                              max_idx_to_segment_size) const {
-  std::lock_guard<simple_spinlock> lock(lock_);
-  DCHECK_GE(segments_count, 0);
-  for (const scoped_refptr<ReadableLogSegment>& segment : segments_) {
-    if (max_idx_to_segment_size->size() == segments_count) {
-      break;
-    }
-    DCHECK(segment->HasFooter());
-    if (segment->footer().max_replicate_index() < min_op_idx) {
-      // This means we found a log we can GC. Adjust the expected number of logs.
-      segments_count--;
-      continue;
-    }
-
-    if (max_close_time_us < segment->footer().close_timestamp_micros()) {
-      int64_t age_seconds = segment->footer().close_timestamp_micros() / 1000000;
-      VLOG_WITH_PREFIX(2)
-          << "Segment " << segment->path() << " is only " << age_seconds << "s old: "
-          << "won't be counted towards log retention";
-      break;
-    }
-    (*max_idx_to_segment_size)[segment->footer().max_replicate_index()] = segment->file_size();
-  }
-}
-
 scoped_refptr<ReadableLogSegment> LogReader::GetSegmentBySequenceNumber(int64_t seq) const {
   std::lock_guard<simple_spinlock> lock(lock_);
   if (segments_.empty()) {
@@ -423,21 +395,35 @@ Status LogReader::ReadReplicatesInRange(
     const int64_t starting_at,
     const int64_t up_to,
     int64_t max_bytes_to_read,
-    ReplicateMsgs* replicates) const {
+    ReplicateMsgs* replicates,
+    CoarseTimePoint deadline) const {
   DCHECK_GT(starting_at, 0);
   DCHECK_GE(up_to, starting_at);
   DCHECK(log_index_) << "Require an index to random-read logs";
-
   ReplicateMsgs replicates_tmp;
   LogIndexEntry prev_index_entry;
   prev_index_entry.segment_sequence_number = -1;
   prev_index_entry.offset_in_segment = -1;
+
+  // Remove the deadline if the GetChanges deadline feature is disabled.
+  if (!ANNOTATE_UNPROTECTED_READ(FLAGS_get_changes_honor_deadline)) {
+    deadline = CoarseTimePoint::max();
+  }
 
   int64_t total_size = 0;
   bool limit_exceeded = false;
   faststring tmp_buf;
   LogEntryBatchPB batch;
   for (int64_t index = starting_at; index <= up_to && !limit_exceeded; index++) {
+    // Stop reading if a deadline was specified and the deadline has been exceeded.
+    if (deadline != CoarseTimePoint::max() && CoarseMonoClock::Now() >= deadline) {
+      break;
+    }
+
+    if (PREDICT_FALSE(FLAGS_TEST_get_changes_read_loop_delay_ms > 0)) {
+      SleepFor(MonoDelta::FromMilliseconds(FLAGS_TEST_get_changes_read_loop_delay_ms));
+    }
+
     LogIndexEntry index_entry;
     RETURN_NOT_OK_PREPEND(log_index_->GetEntry(index, &index_entry),
                           Substitute("Failed to read log index for op $0", index));
@@ -449,6 +435,7 @@ Status LogReader::ReadReplicatesInRange(
     if (index == starting_at ||
         index_entry.segment_sequence_number != prev_index_entry.segment_sequence_number ||
         index_entry.offset_in_segment != prev_index_entry.offset_in_segment) {
+      // Make read operation.
       RETURN_NOT_OK(ReadBatchUsingIndexEntry(index_entry, &tmp_buf, &batch));
 
       // Sanity-check the property that a batch should only have increasing indexes.
@@ -589,7 +576,7 @@ Status LogReader::AppendEmptySegment(const scoped_refptr<ReadableLogSegment>& se
   return Status::OK();
 }
 
-const int LogReader::num_segments() const {
+size_t LogReader::num_segments() const {
   std::lock_guard<simple_spinlock> lock(lock_);
   return segments_.size();
 }

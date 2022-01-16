@@ -35,52 +35,23 @@
     group: "{{ user_name }}"
     state: link
 
+# Remove existing gflags present in conf file
 - name: Configure | Remove {{ yb_process_type }} gflags
   file:
     path: "{{ yb_conf_file }}"
     state: absent
-  when: replace_gflags is defined
   tags:
     - override_gflags
 
-- set_fact:
-    _gflags: "{{ common_gflags | combine(process_specific_gflags[yb_process_type]) }}"
-  tags:
-    - override_gflags
-
-- set_fact:
-    _gflags: "{{ _gflags | combine(dict(extra_gflags)) }}"
-  when: extra_gflags is defined
-  tags:
-    - override_gflags
-
+# Set the gflags in conf file
+# gflags has greater precedence over extra_gflags
 - name: Configure | Set {{ yb_process_type }} gflags
   lineinfile:
     dest: "{{ yb_conf_file }}"
     regexp: "^--{{ item.key }}=(.*)"
     line: "--{{item.key}}={{item.value}}"
     create: yes
-  with_dict: "{{ gflags | default(_gflags) }}"
-  tags:
-    - override_gflags
-
-- name: Configure | Delete {{ yb_process_type }} gflags
-  lineinfile:
-    dest: "{{ yb_conf_file }}"
-    regexp: "^--{{ item }}=(.*)"
-    state: absent
-  with_items: "{{ gflags_to_remove }}"
-  when: gflags_to_remove is defined
-  tags:
-    - override_gflags
-
-- name: Configure | Delete {{ yb_process_type }} gflags
-  lineinfile:
-    dest: "{{ yb_conf_file }}"
-    regexp: "^--{{ item }}=(.*)"
-    state: absent
-  with_items: "{{ gflags_to_remove }}"
-  when: gflags_to_remove is defined
+  with_dict: "{{ extra_gflags | combine(gflags | default({})) }}"
   tags:
     - override_gflags
 
@@ -113,6 +84,14 @@
       user: "yugabyte"
       state: absent
 
+  - name: Stop exsisting running master
+    shell:
+      cmd: "sudo systemctl stop yb-master"
+
+  - name: Stop exsisting running tserver
+    shell:
+      cmd: "sudo systemctl stop yb-tserver"
+
   # Systemd daemon-reload for yb-master and yb-tserver service files
   - name: Perform daemon-reload for the new services
     shell:
@@ -135,5 +114,7 @@
   - name: Run yb-tserver.service to start the tserver
     shell:
       cmd: "sudo systemctl start yb-tserver"
-  tags: systemd_upgrade
+  tags:
+    - override_gflags
+    - systemd_upgrade
   when: systemd_option

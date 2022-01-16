@@ -15,20 +15,20 @@
 // DateTime parser and serializer
 //--------------------------------------------------------------------------------------------------
 
+#include "yb/util/date_time.h"
+
 #include <unicode/gregocal.h>
 
 #include <regex>
-#include <ctime>
 
+#include <boost/date_time/c_local_time_adjustor.hpp>
+#include <boost/date_time/local_time/local_time.hpp>
 #include <boost/smart_ptr/make_shared.hpp>
 
-#include <gflags/gflags.h>
-#include "yb/util/date_time.h"
-#include "yb/util/logging.h"
-#include "yb/util/string_case.h"
-#include "boost/date_time/gregorian/gregorian.hpp"
-#include "boost/date_time/c_local_time_adjustor.hpp"
-#include "boost/date_time/local_time/local_time.hpp"
+#include "yb/gutil/casts.h"
+
+#include "yb/util/result.h"
+#include "yb/util/status_format.h"
 
 using std::locale;
 using std::vector;
@@ -77,7 +77,7 @@ Result<uint32_t> ToDate(const int64_t days_since_epoch) {
   if (date < std::numeric_limits<uint32_t>::min() || date > std::numeric_limits<uint32_t>::max()) {
     return STATUS(InvalidArgument, "Invalid date");
   }
-  return date;
+  return narrow_cast<uint32_t>(date);
 }
 
 Result<GregorianCalendar> CreateCalendar() {
@@ -102,8 +102,8 @@ string GetSystemTimezone() {
   const ptime utc_time = microsec_clock::universal_time();
   const ptime local_time = boost::date_time::c_local_adjustor<ptime>::utc_to_local(utc_time);
   const time_duration offset = local_time - utc_time;
-  const int hours = offset.hours();
-  const int minutes = offset.minutes();
+  const int hours = narrow_cast<int>(offset.hours());
+  const int minutes = narrow_cast<int>(offset.minutes());
   char buffer[7]; // "+HH:MM" or "-HH:MM"
   const int result = snprintf(buffer, sizeof(buffer), "%+2.2d:%2.2d", hours, minutes);
   CHECK(result > 0 && result < sizeof(buffer)) << "Unexpected snprintf result: " << result;
@@ -144,8 +144,8 @@ Result<string> GetTimezone(string timezoneID) {
         "\nUse standardized timezone such as \"America/New_York\" or offset such as UTC-07:00.");
   }
   time_duration td = milliseconds(tzone->getRawOffset());
-  const int hours = td.hours();
-  const int minutes = td.minutes();
+  const int hours = narrow_cast<int>(td.hours());
+  const int minutes = narrow_cast<int>(td.minutes());
   char buffer[7]; // "+HH:MM" or "-HH:MM"
   const int result = snprintf(buffer, sizeof(buffer), "%+2.2d:%2.2d", hours, abs(minutes));
   if (result <= 0 || result >= sizeof(buffer)) {
@@ -287,7 +287,7 @@ int64_t DateTime::DateToUnixTimestamp(uint32_t date) {
 }
 
 uint32_t DateTime::DateNow() {
-  return TimestampNow().ToInt64() / kDayInMicroSeconds + kEpochDateOffset;
+  return narrow_cast<uint32_t>(TimestampNow().ToInt64() / kDayInMicroSeconds + kEpochDateOffset);
 }
 
 //------------------------------------------------------------------------------------------------
@@ -321,10 +321,10 @@ Result<string> DateTime::TimeToString(int64_t time) {
   const int nano_sec = time % 1000000000; time /= 1000000000;
   const int second = time % 60; time /= 60;
   const int minute = time % 60; time /= 60;
-  const int hour = time;
-  if (hour > 23) {
+  if (time > 23) {
     return STATUS(InvalidArgument, "Invalid hour");
   }
+  const int hour = narrow_cast<int>(time);
   char buffer[19]; // "hh:mm:ss[.fffffffff]"
   const int result = snprintf(buffer, sizeof(buffer), "%2.2d:%2.2d:%2.2d.%9.9d",
                               hour, minute, second, nano_sec);
@@ -354,10 +354,10 @@ Result<MonoDelta> DateTime::IntervalFromString(const std::string& str) {
     std::smatch m;
     if (std::regex_match(str, m, reg)) {
       // All regex's have the name 4 capture groups, in order.
-      const int day = m.str(1).empty() ? 0 : stoi(m.str(1));
-      const int hours = m.str(2).empty() ? 0 : stoi(m.str(2));
-      const int minutes = m.str(3).empty() ? 0 : stoi(m.str(3));
-      const int seconds = m.str(4).empty() ? 0 : stoi(m.str(4));
+      const auto day = m.str(1).empty() ? 0 : stol(m.str(1));
+      const auto hours = m.str(2).empty() ? 0 : stol(m.str(2));
+      const auto minutes = m.str(3).empty() ? 0 : stol(m.str(3));
+      const auto seconds = m.str(4).empty() ? 0 : stol(m.str(4));
       // Convert to microseconds.
       return MonoDelta::FromSeconds(seconds + (60 * (minutes + 60 * (hours + 24 * day))));
     }
@@ -367,8 +367,8 @@ Result<MonoDelta> DateTime::IntervalFromString(const std::string& str) {
 
 //------------------------------------------------------------------------------------------------
 int64_t DateTime::AdjustPrecision(int64_t val,
-                                  int input_precision,
-                                  const int output_precision) {
+                                  size_t input_precision,
+                                  const size_t output_precision) {
   while (input_precision < output_precision) {
     // In case of overflow we just return max/min values -- this is needed for correctness of
     // comparison operations and is similar to Cassandra behaviour.

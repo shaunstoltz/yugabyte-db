@@ -40,7 +40,7 @@
 #include <utility>
 #include <vector>
 
-#include <gtest/gtest.h>
+#include <gtest/gtest_prod.h>
 
 #include "yb/consensus/consensus_fwd.h"
 #include "yb/consensus/log_fwd.h"
@@ -48,12 +48,14 @@
 
 #include "yb/gutil/macros.h"
 #include "yb/gutil/ref_counted.h"
+
 #include "yb/util/atomic.h"
 #include "yb/util/compare_util.h"
 #include "yb/util/env.h"
 #include "yb/util/monotime.h"
 #include "yb/util/opid.h"
 #include "yb/util/restart_safe_clock.h"
+#include "yb/util/status.h"
 #include "yb/util/tostring.h"
 
 // Used by other classes, now part of the API.
@@ -127,7 +129,6 @@ struct LogEntryMetadata {
 };
 
 // A sequence of segments, ordered by increasing sequence number.
-typedef std::vector<ReadableLogSegmentPtr> SegmentSequence;
 typedef std::vector<std::unique_ptr<LogEntryPB>> LogEntries;
 
 struct ReadEntriesResult {
@@ -308,10 +309,9 @@ class ReadableLogSegment : public RefCountedThreadSafe<ReadableLogSegment> {
   CHECKED_STATUS ScanForValidEntryHeaders(int64_t offset, bool* has_valid_entries);
 
   // Format a nice error message to report on a corruption in a log file.
-  CHECKED_STATUS MakeCorruptionStatus(int batch_number, int64_t batch_offset,
-                              std::vector<int64_t>* recent_offsets,
-                              const std::vector<std::unique_ptr<LogEntryPB>>& entries,
-                              const Status& status) const;
+  CHECKED_STATUS MakeCorruptionStatus(
+      size_t batch_number, int64_t batch_offset, std::vector<int64_t>* recent_offsets,
+      const std::vector<std::unique_ptr<LogEntryPB>>& entries, const Status& status) const;
 
   CHECKED_STATUS ReadEntryHeaderAndBatch(int64_t* offset,
                                          faststring* tmp_buf,
@@ -400,9 +400,7 @@ class WritableLogSegment {
   CHECKED_STATUS WriteEntryBatch(const Slice& entry_batch_data);
 
   // Makes sure the I/O buffers in the underlying writable file are flushed.
-  CHECKED_STATUS Sync() {
-    return writable_file_->Sync();
-  }
+  CHECKED_STATUS Sync();
 
   // Returns true if the segment header has already been written to disk.
   bool IsHeaderWritten() const {

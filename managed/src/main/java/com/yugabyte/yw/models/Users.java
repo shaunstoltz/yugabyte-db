@@ -7,8 +7,6 @@ import static play.mvc.Http.Status.BAD_REQUEST;
 
 import com.fasterxml.jackson.annotation.JsonFormat;
 import com.fasterxml.jackson.annotation.JsonIgnore;
-import com.fasterxml.jackson.databind.JsonNode;
-import com.fasterxml.jackson.databind.node.ObjectNode;
 import com.yugabyte.yw.common.PlatformServiceException;
 import io.ebean.DuplicateKeyException;
 import io.ebean.Finder;
@@ -20,19 +18,22 @@ import java.util.Date;
 import java.util.List;
 import java.util.UUID;
 import java.util.stream.Collectors;
+import java.util.Random;
+import java.nio.charset.Charset;
 import javax.persistence.Column;
 import javax.persistence.Entity;
 import javax.persistence.EnumType;
 import javax.persistence.Enumerated;
 import javax.persistence.Id;
+import lombok.extern.slf4j.Slf4j;
 import org.joda.time.DateTime;
 import org.mindrot.jbcrypt.BCrypt;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import play.data.validation.Constraints;
-import play.libs.Json;
 import play.mvc.Http.Status;
 
+@Slf4j
 @Entity
 @ApiModel(description = "A user associated with a customer")
 public class Users extends Model {
@@ -68,6 +69,14 @@ public class Users extends Model {
           return null;
       }
     }
+  }
+
+  public enum UserType {
+    @EnumValue("local")
+    local,
+
+    @EnumValue("ldap")
+    ldap;
   }
 
   @Id
@@ -108,10 +117,10 @@ public class Users extends Model {
   }
 
   @Column(nullable = false)
-  @JsonFormat(shape = JsonFormat.Shape.STRING, pattern = "yyyy-MM-dd HH:mm:ss")
+  @JsonFormat(shape = JsonFormat.Shape.STRING, pattern = "yyyy-MM-dd'T'HH:mm:ssZ")
   @ApiModelProperty(
       value = "User creation date",
-      example = "2021-06-17 15:00:05",
+      example = "2021-06-17T15:00:05-0400",
       accessMode = READ_ONLY)
   public Date creationDate;
 
@@ -129,9 +138,9 @@ public class Users extends Model {
   @ApiModelProperty(value = "User API token", accessMode = READ_ONLY)
   private String apiToken;
 
-  @Column(nullable = true, columnDefinition = "TEXT")
-  @ApiModelProperty(value = "UI_ONLY", hidden = true, accessMode = READ_ONLY)
-  private JsonNode features;
+  @Column(nullable = true)
+  @ApiModelProperty(value = "User timezone")
+  private String timezone;
 
   // The role of the user.
   @Column(nullable = false)
@@ -159,8 +168,40 @@ public class Users extends Model {
     this.isPrimary = isPrimary;
   }
 
+  @Column(nullable = false)
+  @ApiModelProperty(value = "User Type")
+  public UserType userType;
+
+  public void setUserType(UserType userType) {
+    this.userType = userType;
+  }
+
+  public UserType getUserType() {
+    return this.userType;
+  }
+
+  @Column(nullable = false)
+  @ApiModelProperty(value = "LDAP Specified Role")
+  public boolean ldapSpecifiedRole;
+
+  public void setLdapSpecifiedRole(boolean ldapSpecifiedRole) {
+    this.ldapSpecifiedRole = ldapSpecifiedRole;
+  }
+
+  public boolean getLdapSpecifiedRole() {
+    return this.ldapSpecifiedRole;
+  }
+
   public Date getAuthTokenIssueDate() {
     return this.authTokenIssueDate;
+  }
+
+  public String getTimezone() {
+    return this.timezone;
+  }
+
+  public void setTimezone(String timezone) {
+    this.timezone = timezone;
   }
 
   public static final Finder<UUID, Users> find = new Finder<UUID, Users>(Users.class) {};
@@ -225,8 +266,25 @@ public class Users extends Model {
     users.creationDate = new Date();
     users.role = role;
     users.isPrimary = isPrimary;
+    users.setUserType(UserType.local);
+    users.setLdapSpecifiedRole(false);
     users.save();
     return users;
+  }
+
+  /**
+   * Delete Users identified via email
+   *
+   * @param email
+   * @return void
+   */
+  public static void deleteUser(String email) {
+    Users userToDelete = Users.find.query().where().eq("email", email).findOne();
+    if (userToDelete != null && userToDelete.userType.equals(UserType.ldap)) {
+      log.info("Deleting user id {} with email address {}", userToDelete.uuid, userToDelete.email);
+      userToDelete.delete();
+    }
+    return;
   }
 
   /**
@@ -344,29 +402,6 @@ public class Users extends Model {
   public void deleteAuthToken() {
     authToken = null;
     authTokenIssueDate = null;
-    save();
-  }
-
-  /** Get features for this Users. */
-  public JsonNode getFeatures() {
-    return features == null ? Json.newObject() : features;
-  }
-
-  /** Set features for this User. */
-  public void setFeatures(JsonNode input) {
-    this.features = input;
-  }
-
-  /**
-   * Upserts features for this Users. If updating a feature, only specified features will be
-   * updated.
-   */
-  public void upsertFeatures(JsonNode input) {
-    if (features == null) {
-      features = input;
-    } else {
-      ((ObjectNode) features).setAll((ObjectNode) input);
-    }
     save();
   }
 

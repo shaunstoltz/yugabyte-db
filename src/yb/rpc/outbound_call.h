@@ -32,31 +32,47 @@
 #ifndef YB_RPC_OUTBOUND_CALL_H_
 #define YB_RPC_OUTBOUND_CALL_H_
 
+#include <stdint.h>
+
+#include <cstdint>
+#include <cstdlib>
 #include <deque>
+#include <memory>
 #include <string>
+#include <thread>
+#include <type_traits>
 #include <vector>
 
+#include <boost/functional/hash.hpp>
+#include <gflags/gflags_declare.h>
 #include <glog/logging.h>
 
+#include "yb/gutil/integral_types.h"
 #include "yb/gutil/macros.h"
+
 #include "yb/rpc/rpc_fwd.h"
 #include "yb/rpc/call_data.h"
 #include "yb/rpc/constants.h"
+#include "yb/rpc/lightweight_message.h"
 #include "yb/rpc/remote_method.h"
-#include "yb/rpc/response_callback.h"
 #include "yb/rpc/rpc_call.h"
 #include "yb/rpc/rpc_header.pb.h"
+#include "yb/rpc/serialization.h"
+#include "yb/rpc/rpc_introspection.pb.h"
 #include "yb/rpc/service_if.h"
 #include "yb/rpc/thread_pool.h"
 
+#include "yb/util/status_fwd.h"
+#include "yb/util/atomic.h"
 #include "yb/util/locks.h"
 #include "yb/util/mem_tracker.h"
+#include "yb/util/memory/memory_usage.h"
 #include "yb/util/monotime.h"
 #include "yb/util/net/sockaddr.h"
 #include "yb/util/object_pool.h"
 #include "yb/util/ref_cnt_buffer.h"
+#include "yb/util/shared_lock.h"
 #include "yb/util/slice.h"
-#include "yb/util/status.h"
 #include "yb/util/trace.h"
 
 namespace google {
@@ -204,11 +220,6 @@ class InvokeCallbackTask : public rpc::ThreadPoolTask {
   OutboundCallPtr call_;
 };
 
-struct OutboundMethodMetrics {
-  scoped_refptr<Counter> request_bytes;
-  scoped_refptr<Counter> response_bytes;
-};
-
 // Tracks the status of a call on the client side.
 //
 // This is an internal-facing class -- clients interact with the
@@ -223,7 +234,7 @@ class OutboundCall : public RpcCall {
   OutboundCall(const RemoteMethod* remote_method,
                const std::shared_ptr<OutboundCallMetrics>& outbound_call_metrics,
                std::shared_ptr<const OutboundMethodMetrics> method_metrics,
-               google::protobuf::Message* response_storage,
+               AnyMessagePtr response_storage,
                RpcController* controller,
                RpcMetrics* rpc_metrics,
                ResponseCallback callback,
@@ -236,7 +247,7 @@ class OutboundCall : public RpcCall {
   // Because the data is fully serialized by this call, 'req' may be
   // subsequently mutated with no ill effects.
   virtual CHECKED_STATUS SetRequestParam(
-      const google::protobuf::Message& req, const MemTrackerPtr& mem_tracker);
+      AnyMessageConstPtr req, const MemTrackerPtr& mem_tracker);
 
   // Serialize the call for the wire. Requires that SetRequestParam()
   // is called first. This is called from the Reactor thread.
@@ -308,7 +319,7 @@ class OutboundCall : public RpcCall {
   const ResponseCallback& callback() const { return callback_; }
   RpcController* controller() { return controller_; }
   const RpcController* controller() const { return controller_; }
-  google::protobuf::Message* response() const { return response_; }
+  AnyMessagePtr response() const { return response_; }
 
   int32_t call_id() const {
     return call_id_;
@@ -340,7 +351,10 @@ class OutboundCall : public RpcCall {
   RpcController* controller_;
   // Pointer for the protobuf where the response should be written.
   // Can be used only while callback_ object is alive.
-  google::protobuf::Message* response_;
+  AnyMessagePtr response_;
+
+  // The trace buffer.
+  scoped_refptr<Trace> trace_;
 
  private:
   friend class RpcController;
@@ -365,7 +379,7 @@ class OutboundCall : public RpcCall {
   // This will only be non-NULL if status().IsRemoteError().
   const ErrorStatusPB* error_pb() const;
 
-  CHECKED_STATUS InitHeader(RequestHeader* header, bool copy);
+  CHECKED_STATUS InitHeader(RequestHeader* header);
 
   // Lock for state_ status_, error_pb_ fields, since they
   // may be mutated by the reactor thread while the client thread
@@ -377,6 +391,8 @@ class OutboundCall : public RpcCall {
 
   // Invokes the user-provided callback. Uses callback_thread_pool_ if set.
   void InvokeCallback();
+
+  Result<uint32_t> TimeoutMs() const;
 
   int32_t call_id_;
 
@@ -398,9 +414,6 @@ class OutboundCall : public RpcCall {
   // Once a response has been received for this call, contains that response.
   CallResponse call_response_;
 
-  // The trace buffer.
-  scoped_refptr<Trace> trace_;
-
   std::shared_ptr<OutboundCallMetrics> outbound_call_metrics_;
 
   RpcMetrics* rpc_metrics_;
@@ -411,6 +424,17 @@ class OutboundCall : public RpcCall {
 
   DISALLOW_COPY_AND_ASSIGN(OutboundCall);
 };
+
+class RpcErrorTag : public IntegralErrorTag<ErrorStatusPB::RpcErrorCodePB> {
+ public:
+  static constexpr uint8_t kCategory = 15;
+
+  static std::string ToMessage(Value value) {
+    return ErrorStatusPB::RpcErrorCodePB_Name(value);
+  }
+};
+
+typedef StatusErrorCodeImpl<RpcErrorTag> RpcError;
 
 }  // namespace rpc
 }  // namespace yb

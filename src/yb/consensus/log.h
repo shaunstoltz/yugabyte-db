@@ -33,31 +33,40 @@
 #ifndef YB_CONSENSUS_LOG_H_
 #define YB_CONSENSUS_LOG_H_
 
+#include <pthread.h>
+#include <sys/types.h>
+
 #include <atomic>
+#include <condition_variable>
 #include <map>
 #include <memory>
+#include <mutex>
 #include <string>
 #include <vector>
 
 #include <boost/atomic.hpp>
-#include <boost/thread/shared_mutex.hpp>
+#include <glog/logging.h>
 
-#include "yb/common/schema.h"
+#include "yb/common/common_fwd.h"
+
 #include "yb/consensus/consensus_fwd.h"
 #include "yb/consensus/log_util.h"
-#include "yb/consensus/opid_util.h"
+
 #include "yb/fs/fs_manager.h"
+
+#include "yb/gutil/macros.h"
 #include "yb/gutil/ref_counted.h"
 #include "yb/gutil/spinlock.h"
-#include "yb/util/async_util.h"
-#include "yb/util/blocking_queue.h"
+
+#include "yb/util/status_fwd.h"
 #include "yb/util/locks.h"
 #include "yb/util/monotime.h"
+#include "yb/util/mutex.h"
 #include "yb/util/opid.h"
 #include "yb/util/promise.h"
-#include "yb/util/status.h"
-#include "yb/util/threadpool.h"
 #include "yb/util/shared_lock.h"
+#include "yb/util/status_callback.h"
+#include "yb/util/threadpool.h"
 
 namespace yb {
 
@@ -219,14 +228,6 @@ class Log : public RefCountedThreadSafe<Log> {
   // Computes the amount of bytes that would have been GC'd if Log::GC had been called.
   CHECKED_STATUS GetGCableDataSize(int64_t min_op_idx, int64_t* total_size) const;
 
-  // Returns a map of log index -> segment size, of all the segments that currently cannot be GCed
-  // because in-memory structures have anchors in them.
-  //
-  // 'min_op_idx' is the minimum operation index to start looking from, meaning that we skip the
-  // segment that contains it and then start recording segments.
-  void GetMaxIndexesToSegmentSizeMap(int64_t min_op_idx,
-                                     std::map<int64_t, int64_t>* max_idx_to_segment_size) const;
-
   // Returns the file system location of the currently active WAL segment.
   const WritableLogSegment* ActiveSegmentForTests() const {
     return active_segment_.get();
@@ -277,7 +278,7 @@ class Log : public RefCountedThreadSafe<Log> {
   CHECKED_STATUS TEST_SubmitFuncToAppendToken(const std::function<void()>& func);
 
   // Returns the number of segments.
-  int num_segments() const;
+  size_t num_segments() const;
 
   const std::string& LogPrefix() const {
     return log_prefix_;
@@ -420,7 +421,7 @@ class Log : public RefCountedThreadSafe<Log> {
   mutable rw_spinlock schema_lock_;
 
   // The current schema of the tablet this log is dedicated to.
-  Schema schema_;
+  std::unique_ptr<Schema> schema_;
 
   // The schema version
   uint32_t schema_version_;

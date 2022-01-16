@@ -13,18 +13,23 @@
 
 #include "yb/master/sys_catalog_writer.h"
 
+#include "yb/common/pgsql_protocol.pb.h"
 #include "yb/common/ql_expr.h"
 #include "yb/common/ql_protocol_util.h"
 
-#include "yb/docdb/doc_key.h"
 #include "yb/docdb/doc_ql_scanspec.h"
 #include "yb/docdb/doc_rowwise_iterator.h"
+
+#include "yb/gutil/casts.h"
 
 #include "yb/master/sys_catalog_constants.h"
 
 #include "yb/tablet/tablet.h"
 
+#include "yb/tserver/tserver.pb.h"
+
 #include "yb/util/pb_util.h"
+#include "yb/util/status_format.h"
 
 namespace yb {
 namespace master {
@@ -52,11 +57,12 @@ bool IsWrite(QLWriteRequestPB::QLStmtType op_type) {
   return op_type == QLWriteRequestPB::QL_STMT_INSERT || op_type == QLWriteRequestPB::QL_STMT_UPDATE;
 }
 
-SysCatalogWriter::SysCatalogWriter(
-    const std::string& tablet_id, const Schema& schema_with_ids, int64_t leader_term)
-    : schema_with_ids_(schema_with_ids), leader_term_(leader_term) {
-  req_.set_tablet_id(tablet_id);
+SysCatalogWriter::SysCatalogWriter(const Schema& schema_with_ids, int64_t leader_term)
+    : schema_with_ids_(schema_with_ids), req_(std::make_unique<tserver::WriteRequestPB>()),
+      leader_term_(leader_term) {
 }
+
+SysCatalogWriter::~SysCatalogWriter() = default;
 
 Status SysCatalogWriter::DoMutateItem(
     int8_t type,
@@ -79,7 +85,7 @@ Status SysCatalogWriter::DoMutateItem(
   }
 
   return FillSysCatalogWriteRequest(
-      type, item_id, new_pb, op_type, schema_with_ids_, req_.add_ql_write_batch());
+      type, item_id, new_pb, op_type, schema_with_ids_, req_->add_ql_write_batch());
 }
 
 Status SysCatalogWriter::InsertPgsqlTableRow(const Schema& source_schema,
@@ -88,7 +94,7 @@ Status SysCatalogWriter::InsertPgsqlTableRow(const Schema& source_schema,
                                              const Schema& target_schema,
                                              const uint32_t target_schema_version,
                                              bool is_upsert) {
-  PgsqlWriteRequestPB* pgsql_write = req_.add_pgsql_write_batch();
+  PgsqlWriteRequestPB* pgsql_write = req_->add_pgsql_write_batch();
 
   pgsql_write->set_client(YQL_CLIENT_PGSQL);
   if (is_upsert) {
@@ -175,9 +181,10 @@ Status EnumerateSysCatalog(
 Status EnumerateSysCatalog(
     docdb::DocRowwiseIterator* doc_iter, const Schema& schema, int8_t entry_type,
     const EnumerationCallback& callback) {
-  const int type_col_idx = VERIFY_RESULT(schema.ColumnIndexByName(kSysCatalogTableColType));
-  const int entry_id_col_idx = VERIFY_RESULT(schema.ColumnIndexByName(kSysCatalogTableColId));
-  const int metadata_col_idx = VERIFY_RESULT(schema.ColumnIndexByName(kSysCatalogTableColMetadata));
+  const auto type_col_idx = VERIFY_RESULT(schema.ColumnIndexByName(kSysCatalogTableColType));
+  const auto entry_id_col_idx = VERIFY_RESULT(schema.ColumnIndexByName(kSysCatalogTableColId));
+  const auto metadata_col_idx = VERIFY_RESULT(schema.ColumnIndexByName(
+      kSysCatalogTableColMetadata));
 
   QLConditionPB cond;
   cond.set_op(QL_OP_AND);
@@ -196,6 +203,8 @@ Status EnumerateSysCatalog(
     SCHECK_EQ(found_entry_type.int8_value(), entry_type, Corruption, "Found wrong entry type");
     RETURN_NOT_OK(value_map.GetValue(schema.column_id(entry_id_col_idx), &entry_id));
     RETURN_NOT_OK(value_map.GetValue(schema.column_id(metadata_col_idx), &metadata));
+    SCHECK_EQ(metadata.type(), InternalType::kBinaryValue, Corruption,
+              "System catalog snapshot is corrupted, or is built using different build type");
     RETURN_NOT_OK(callback(entry_id.binary_value(), metadata.binary_value()));
   }
 

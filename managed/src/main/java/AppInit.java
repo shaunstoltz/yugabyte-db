@@ -2,7 +2,11 @@
 
 import com.google.inject.Inject;
 import com.google.inject.Singleton;
+import com.typesafe.config.Config;
 import com.yugabyte.yw.cloud.AWSInitializer;
+import com.yugabyte.yw.commissioner.CallHome;
+import com.yugabyte.yw.commissioner.SetUniverseKey;
+import com.yugabyte.yw.commissioner.BackupGarbageCollector;
 import com.yugabyte.yw.commissioner.TaskGarbageCollector;
 import com.yugabyte.yw.common.CertificateHelper;
 import com.yugabyte.yw.common.ConfigHelper;
@@ -11,8 +15,11 @@ import com.yugabyte.yw.common.ExtraMigrationManager;
 import com.yugabyte.yw.common.ReleaseManager;
 import com.yugabyte.yw.common.YamlWrapper;
 import com.yugabyte.yw.common.alerts.AlertConfigurationService;
+import com.yugabyte.yw.common.alerts.AlertConfigurationWriter;
 import com.yugabyte.yw.common.alerts.AlertDestinationService;
 import com.yugabyte.yw.common.alerts.AlertsGarbageCollector;
+import com.yugabyte.yw.common.alerts.QueryAlerts;
+import com.yugabyte.yw.common.config.impl.SettableRuntimeConfigFactory;
 import com.yugabyte.yw.common.ha.PlatformReplicationManager;
 import com.yugabyte.yw.common.metrics.PlatformMetricsProcessor;
 import com.yugabyte.yw.models.Customer;
@@ -20,6 +27,7 @@ import com.yugabyte.yw.models.ExtraMigration;
 import com.yugabyte.yw.models.InstanceType;
 import com.yugabyte.yw.models.MetricConfig;
 import com.yugabyte.yw.models.Provider;
+import com.yugabyte.yw.scheduler.Scheduler;
 import io.ebean.Ebean;
 import io.prometheus.client.hotspot.DefaultExports;
 import java.util.List;
@@ -44,11 +52,19 @@ public class AppInit {
       YamlWrapper yaml,
       ExtraMigrationManager extraMigrationManager,
       TaskGarbageCollector taskGC,
+      SetUniverseKey setUniverseKey,
+      BackupGarbageCollector backupGC,
       PlatformReplicationManager replicationManager,
       AlertsGarbageCollector alertsGC,
+      QueryAlerts queryAlerts,
+      AlertConfigurationWriter alertConfigurationWriter,
       AlertConfigurationService alertConfigurationService,
       AlertDestinationService alertDestinationService,
-      PlatformMetricsProcessor platformMetricsProcessor)
+      PlatformMetricsProcessor platformMetricsProcessor,
+      Scheduler scheduler,
+      CallHome callHome,
+      SettableRuntimeConfigFactory sConfigFactory,
+      Config config)
       throws ReflectiveOperationException {
     Logger.info("Yugaware Application has started");
     Configuration appConfig = application.configuration();
@@ -79,6 +95,9 @@ public class AppInit {
           throw new RuntimeException(("yb.storage.path is not set in application.conf"));
         }
       }
+
+      // temporarily revert due to PLAT-2434
+      // LogUtil.updateLoggingFromConfig(sConfigFactory, config);
 
       // Initialize AWS if any of its instance types have an empty volumeDetailsList
       List<Provider> providerList = Provider.find.query().where().findList();
@@ -124,10 +143,18 @@ public class AppInit {
       taskGC.start();
       alertsGC.start();
 
-      platformMetricsProcessor.start();
+      setUniverseKey.start();
 
-      // Startup platform HA.
+      // Schedule garbage collection of backups
+      backupGC.start();
+
+      platformMetricsProcessor.start();
+      alertConfigurationWriter.start();
+
       replicationManager.init();
+
+      scheduler.start();
+      callHome.start();
 
       // Add checksums for all certificates that don't have a checksum.
       CertificateHelper.createChecksums();

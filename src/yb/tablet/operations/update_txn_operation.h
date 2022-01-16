@@ -16,16 +16,15 @@
 #ifndef YB_TABLET_OPERATIONS_UPDATE_TXN_OPERATION_H
 #define YB_TABLET_OPERATIONS_UPDATE_TXN_OPERATION_H
 
-#include <yb/tserver/tserver_service.pb.h>
-#include "yb/tablet/transaction_coordinator.h"
-
 #include "yb/tablet/operations/operation.h"
+
+#include "yb/tablet/operations.pb.h"
 
 namespace yb {
 namespace tablet {
 
 class UpdateTxnOperation
-    : public OperationBase<OperationType::kUpdateTransaction, tserver::TransactionStatePB> {
+    : public OperationBase<OperationType::kUpdateTransaction, TransactionStatePB> {
  public:
   template <class... Args>
   explicit UpdateTxnOperation(Args&&... args)

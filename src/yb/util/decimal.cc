@@ -10,14 +10,14 @@
 // or implied.  See the License for the specific language governing permissions and limitations
 // under the License.
 //
-
-#include <vector>
-#include <limits>
-#include <iomanip>
-#include <glog/logging.h>
-
-#include "yb/gutil/strings/substitute.h"
 #include "yb/util/decimal.h"
+
+#include <iomanip>
+#include <limits>
+#include <vector>
+
+#include "yb/util/status_format.h"
+#include "yb/util/status_log.h"
 #include "yb/util/stol_utils.h"
 
 using std::string;
@@ -25,6 +25,18 @@ using std::vector;
 
 namespace yb {
 namespace util {
+
+Decimal::Decimal(const std::string& string_val) {
+  CHECK_OK(FromString(string_val));
+}
+
+Decimal::Decimal(double double_val) {
+  CHECK_OK(FromDouble(double_val));
+}
+
+Decimal::Decimal(const VarInt& varint_val) {
+  CHECK_OK(FromVarInt(varint_val));
+}
 
 void Decimal::clear() {
   digits_ = {};
@@ -349,10 +361,6 @@ Status Decimal::DecodeFromComparable(const Slice& slice) {
   return DecodeFromComparable(slice, &num_decoded_bytes);
 }
 
-Status Decimal::DecodeFromComparable(const string& str) {
-  return DecodeFromComparable(Slice(str));
-}
-
 string Decimal::EncodeToSerializedBigDecimal(bool* is_out_of_range) const {
   // Note that BigDecimal's scale is not the same as our exponent, but related by the following:
   VarInt varint_scale = VarInt(static_cast<int64_t>(digits_.size())) - exponent_;
@@ -484,13 +492,13 @@ Decimal Decimal::operator+(const Decimal& other) const {
   // If we need to add 0.1E+3 and 0.05E+3, we convert them to 0.10E+3 and 0.05E+3
   size_t max_digits = std::max(decimal.digits_.size(), other1.digits_.size());
   if (decimal.digits_.size() < max_digits) {
-    int increase = max_digits - decimal.digits_.size();
+    auto increase = max_digits - decimal.digits_.size();
     for (size_t i = 0; i < increase; i = i + 1) {
       decimal.digits_.push_back(0);
     }
   }
   if (other1.digits_.size() < max_digits) {
-    int increase = max_digits - other1.digits_.size();
+    auto increase = max_digits - other1.digits_.size();
     for (size_t i = 0; i < increase; i++) {
       other1.digits_.push_back(0);
     }

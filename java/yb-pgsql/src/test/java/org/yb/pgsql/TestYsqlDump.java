@@ -90,7 +90,7 @@ public class TestYsqlDump extends BasePgSQLTest {
                      "sql/yb_ysql_dump.sql" /* inputFileRelativePath */,
                      "output/yb_ysql_dump.out" /* outputFileRelativePath */,
                      "expected/yb_ysql_dump.out" /* expectedFileRelativePath */,
-                     "ysql_dump_stdout.txt" /* stdoutFileRelativePath */);
+                     true /* includeYbMetadata */);
   }
 
   @Test
@@ -99,14 +99,79 @@ public class TestYsqlDump extends BasePgSQLTest {
                      "sql/yb_ysql_dumpall.sql" /* inputFileRelativePath */,
                      "output/yb_ysql_dumpall.out" /* outputFileRelativePath */,
                      "expected/yb_ysql_dumpall.out" /* expectedFileRelativePath */,
-                     "ysql_dumpall_stdout.txt" /* stdoutFileRelativePath */);
+                     false /* includeYbMetadata is not an option for dumpall */);
+  }
+
+  @Test
+  public void testPgDumpVerifyOutput() throws Exception {
+    /*
+     * To verify that dumps can be loaded properly.
+     * First, it restores the database using the (pre-generated) dump files created by dump and
+     * dumpall.
+     * Then runs the contents of yb_ysql_dump_verifier.sql and ensures that everything
+     * matches what was expected.
+     */
+    restartCluster(); // create a new cluster for this test
+    markClusterNeedsRecreation(); // create a new cluster for the next test
+
+    File pgRegressDir = PgRegressBuilder.getPgRegressDir();
+
+    final int tserverIndex = 0;
+    File pgBinDir = PgRegressBuilder.getPgBinDir();
+    File ysqlshExec = new File(pgBinDir, "ysqlsh");
+    File dumpOutput = new File(pgRegressDir, "expected/yb_ysql_dump.out");
+    File dumpallOutput = new File(pgRegressDir, "expected/yb_ysql_dumpall.out");
+    File input = new File(pgRegressDir, "sql/yb_ysql_dump_verifier.sql");
+    File actual = new File(pgRegressDir, "output/yb_ysql_dump_verifier.out");
+    File expected = new File(pgRegressDir, "expected/yb_ysql_dump_verifier.out");
+
+    // Create some data before loading the dumps
+    try (Statement statement = connection.createStatement()) {
+      // These users are required by the output from pg_dump
+      statement.execute("CREATE USER regress_rls_alice NOLOGIN");
+      statement.execute("CREATE USER rls_user NOLOGIN");
+      statement.execute("CREATE USER tablegroup_test_user SUPERUSER");
+      // These tables are created to shift OIDs by a few so we can be more sure that dumps aren't
+      // depending on fragile OIDs
+      statement.execute("CREATE TABLE this_table_is_just_to_shift_oids_by_1 (a INT)");
+      statement.execute("CREATE TABLE this_table_is_just_to_shift_oids_by_2 (a INT)");
+      statement.execute("CREATE TABLE this_table_is_just_to_shift_oids_by_3 (a INT)");
+    }
+
+    buildAndRunProcess("ysqlsh_load_dumpall", Arrays.asList(
+      ysqlshExec.toString(),
+      "-h", getPgHost(tserverIndex),
+      "-p", Integer.toString(getPgPort(tserverIndex)),
+      "-U", DEFAULT_PG_USER,
+      "-f", dumpallOutput.toString()
+    ));
+
+    buildAndRunProcess("ysqlsh_load_dump", Arrays.asList(
+      ysqlshExec.toString(),
+      "-h", getPgHost(tserverIndex),
+      "-p", Integer.toString(getPgPort(tserverIndex)),
+      "-U", DEFAULT_PG_USER,
+      "-f", dumpOutput.toString()
+    ));
+
+    // Run some validations
+    int exitCode = buildAndRunProcess("ysqlsh", Arrays.asList(
+      ysqlshExec.toString(),
+      "-h", getPgHost(tserverIndex),
+      "-p", Integer.toString(getPgPort(tserverIndex)),
+      "-U", DEFAULT_PG_USER,
+      "-f", input.toString(),
+      "-o", actual.toString()
+    ));
+
+    compareExpectedAndActual(expected, actual);
   }
 
   void testPgDumpHelper(final String binaryName,
                         final String inputFileRelativePath,
                         final String outputFileRelativePath,
                         final String expectedFileRelativePath,
-                        final String stdoutFileRelativePath) throws Exception {
+                        final boolean includeYbMetadata) throws Exception {
     // Location of Postgres regression tests
     File pgRegressDir = PgRegressBuilder.getPgRegressDir();
 
@@ -130,27 +195,40 @@ public class TestYsqlDump extends BasePgSQLTest {
     final int tserverIndex = 0;
     File actual = new File(pgRegressDir, outputFileRelativePath);
     File expected = new File(pgRegressDir, expectedFileRelativePath);
-    ProcessBuilder pb = new ProcessBuilder(ysqlDumpExec.toString(), "-h", getPgHost(tserverIndex),
-                                           "-p", Integer.toString(getPgPort(tserverIndex)),
-                                           "-U", DEFAULT_PG_USER,
-                                           "-f", actual.toString(),
-                                           "-m", getMasterLeaderAddress().toString());
 
-    // Handle the logs output by ysql_dump.
-    String logPrefix = "ysql_dump";
-    Process ysqlDumpProc = pb.start();
-    stdoutLogPrinter = new LogPrinter(
-        ysqlDumpProc.getInputStream(),
-        logPrefix + "|stdout ");
-    stderrLogPrinter = new LogPrinter(
-        ysqlDumpProc.getErrorStream(),
-        logPrefix + "|stderr ");
+    List<String> args = new ArrayList<>(Arrays.asList(
+      ysqlDumpExec.toString(), "-h", getPgHost(tserverIndex),
+      "-p", Integer.toString(getPgPort(tserverIndex)),
+      "-U", DEFAULT_PG_USER,
+      "-f", actual.toString(),
+      "-m", getMasterLeaderAddress().toString()
+    ));
+
+    if (includeYbMetadata) {
+      args.add("--include-yb-metadata");
+    }
+
+    buildAndRunProcess(binaryName, args);
+
+    compareExpectedAndActual(expected, actual);
+  }
+
+  private int buildAndRunProcess(String logPrefix, List<String> args) throws Exception {
+    ProcessBuilder pb = new ProcessBuilder(args);
+
+    // Handle the logs output by ysqlsh.
+    Process proc = pb.start();
+    stdoutLogPrinter = new LogPrinter(proc.getInputStream(), logPrefix + "|stdout ");
+    stderrLogPrinter = new LogPrinter(proc.getErrorStream(), logPrefix + "|stderr ");
 
     // Wait for the process to complete.
-    int exitCode = ysqlDumpProc.waitFor();
+    int exitCode = proc.waitFor();
     stdoutLogPrinter.stop();
     stderrLogPrinter.stop();
+    return exitCode;
+  }
 
+  private void compareExpectedAndActual(File expected, File actual) throws Exception {
     // Compare the expected output and the actual output.
     try (BufferedReader actualIn   = createFileReader(actual);
          BufferedReader expectedIn = createFileReader(expected);) {

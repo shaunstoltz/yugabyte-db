@@ -31,33 +31,38 @@
 //
 // Tool to query tablet server operational data
 
-#include <iostream>
 #include <memory>
 
 #include <gflags/gflags.h>
 #include <glog/logging.h>
 
-#include "yb/client/table_handle.h"
-
 #include "yb/common/partition.h"
+#include "yb/common/ql_rowblock.h"
 #include "yb/common/schema.h"
 #include "yb/common/wire_protocol.h"
-#include "yb/server/server_base.proxy.h"
+
+#include "yb/consensus/consensus.proxy.h"
+
+#include "yb/rpc/messenger.h"
+#include "yb/rpc/proxy.h"
+#include "yb/rpc/rpc_controller.h"
+#include "yb/rpc/secure_stream.h"
+
 #include "yb/server/secure.h"
-#include "yb/tserver/tserver.pb.h"
+#include "yb/server/server_base.proxy.h"
+
+#include "yb/tablet/tablet.pb.h"
+
+#include "yb/tserver/tablet_server.h"
 #include "yb/tserver/tserver_admin.proxy.h"
 #include "yb/tserver/tserver_service.proxy.h"
-#include "yb/consensus/consensus.proxy.h"
-#include "yb/tserver/tablet_server.h"
-#include "yb/util/env.h"
+
 #include "yb/util/faststring.h"
 #include "yb/util/flags.h"
 #include "yb/util/logging.h"
-#include "yb/util/protobuf_util.h"
 #include "yb/util/net/net_util.h"
-#include "yb/rpc/messenger.h"
-#include "yb/rpc/rpc_controller.h"
-#include "yb/rpc/secure_stream.h"
+#include "yb/util/protobuf_util.h"
+#include "yb/util/result.h"
 
 using std::ostringstream;
 using std::shared_ptr;
@@ -104,9 +109,12 @@ DEFINE_string(server_address, "localhost",
               "Address of server to run against");
 DEFINE_int64(timeout_ms, 1000 * 60, "RPC timeout in milliseconds");
 
-DEFINE_bool(force, false, "If true, allows the set_flag command to set a flag "
+DEFINE_bool(force, false, "set_flag: If true, allows command to set a flag "
             "which is not explicitly marked as runtime-settable. Such flag changes may be "
-            "simply ignored on the server, or may cause the server to crash.");
+            "simply ignored on the server, or may cause the server to crash.\n"
+            "delete_tablet: If true, command will delete the tablet and remove the tablet "
+            "from the memory, otherwise tablet metadata will be kept in memory with state "
+            "TOMBSTONED.");
 
 DEFINE_string(certs_dir_name, "",
               "Directory with certificates to use for secure server connection.");
@@ -186,7 +194,8 @@ class TsAdminClient {
   // Delete a tablet replica from the specified peer.
   // The 'reason' string is passed to the tablet server, used for logging.
   Status DeleteTablet(const std::string& tablet_id,
-                      const std::string& reason);
+                      const std::string& reason,
+                      tablet::TabletDataState delete_type);
 
   // Sets hybrid_time to the value of the tablet server's current hybrid_time.
   Status CurrentHybridTime(uint64_t* hybrid_time);
@@ -431,7 +440,8 @@ Status TsAdminClient::DumpTablet(const std::string& tablet_id) {
 }
 
 Status TsAdminClient::DeleteTablet(const string& tablet_id,
-                                   const string& reason) {
+                                   const string& reason,
+                                   tablet::TabletDataState delete_type) {
   ServerStatusPB status_pb;
   RETURN_NOT_OK(GetStatus(&status_pb));
 
@@ -442,7 +452,7 @@ Status TsAdminClient::DeleteTablet(const string& tablet_id,
   req.set_tablet_id(tablet_id);
   req.set_dest_uuid(status_pb.node_instance().permanent_uuid());
   req.set_reason(reason);
-  req.set_delete_type(tablet::TABLET_DATA_TOMBSTONED);
+  req.set_delete_type(delete_type);
   rpc.set_timeout(timeout_);
   RETURN_NOT_OK_PREPEND(ts_admin_proxy_->DeleteTablet(req, &resp, &rpc),
                         "DeleteTablet() failed");
@@ -531,7 +541,7 @@ void SetUsage(const char* argv0) {
       << "  " << kRefreshFlagsOp << "\n"
       << "  " << kTabletStateOp << " <tablet_id>\n"
       << "  " << kDumpTabletOp << " <tablet_id>\n"
-      << "  " << kDeleteTabletOp << " <tablet_id> <reason string>\n"
+      << "  " << kDeleteTabletOp << " [-force] <tablet_id> <reason string>\n"
       << "  " << kCurrentHybridTime << "\n"
       << "  " << kStatus << "\n"
       << "  " << kCountIntents << "\n"
@@ -677,8 +687,9 @@ static int TsCliMain(int argc, char** argv) {
 
     string tablet_id = argv[2];
     string reason = argv[3];
-
-    RETURN_NOT_OK_PREPEND_FROM_MAIN(client.DeleteTablet(tablet_id, reason),
+    tablet::TabletDataState state = FLAGS_force ? tablet::TABLET_DATA_DELETED :
+                                                  tablet::TABLET_DATA_TOMBSTONED;
+    RETURN_NOT_OK_PREPEND_FROM_MAIN(client.DeleteTablet(tablet_id, reason, state),
                                     "Unable to delete tablet");
   } else if (op == kCurrentHybridTime) {
     CHECK_ARGC_OR_RETURN_WITH_USAGE(op, 2);

@@ -14,22 +14,17 @@
 #ifndef YB_DOCDB_PGSQL_OPERATION_H
 #define YB_DOCDB_PGSQL_OPERATION_H
 
-#include "yb/common/ql_rowwise_iterator_interface.h"
+#include "yb/common/pgsql_protocol.pb.h"
 
 #include "yb/docdb/doc_expr.h"
 #include "yb/docdb/doc_key.h"
 #include "yb/docdb/doc_operation.h"
 #include "yb/docdb/intent_aware_iterator.h"
+#include "yb/docdb/ql_rowwise_iterator_interface.h"
 
 namespace yb {
 
 class IndexInfo;
-
-namespace common {
-
-class YQLStorageIf;
-
-}
 
 namespace docdb {
 
@@ -39,14 +34,16 @@ class PgsqlWriteOperation :
     public DocOperationBase<DocOperationType::PGSQL_WRITE_OPERATION, PgsqlWriteRequestPB>,
     public DocExprExecutor {
  public:
-  PgsqlWriteOperation(const Schema& schema,
-                      const TransactionOperationContextOpt& txn_op_context)
-      : schema_(schema),
+  PgsqlWriteOperation(std::reference_wrapper<const PgsqlWriteRequestPB> request,
+                      const Schema& schema,
+                      const TransactionOperationContext& txn_op_context)
+      : DocOperationBase(request),
+        schema_(schema),
         txn_op_context_(txn_op_context) {
   }
 
   // Initialize PgsqlWriteOperation. Content of request will be swapped out by the constructor.
-  CHECKED_STATUS Init(PgsqlWriteRequestPB* request, PgsqlResponsePB* response);
+  CHECKED_STATUS Init(PgsqlResponsePB* response);
   bool RequireReadSnapshot() const override {
     // For YSQL the the standard operations (INSERT/UPDATE/DELETE) will read/check the primary key.
     // We use UPSERT stmt type for specific requests when we can guarantee we can skip the read.
@@ -108,7 +105,7 @@ class PgsqlWriteOperation :
   //------------------------------------------------------------------------------------------------
   // Context.
   const Schema& schema_;
-  const TransactionOperationContextOpt txn_op_context_;
+  const TransactionOperationContext txn_op_context_;
 
   // Input arguments.
   PgsqlResponsePB* response_ = nullptr;
@@ -129,7 +126,7 @@ class PgsqlReadOperation : public DocExprExecutor {
  public:
   // Construct and access methods.
   PgsqlReadOperation(const PgsqlReadRequestPB& request,
-                     const TransactionOperationContextOpt& txn_op_context)
+                     const TransactionOperationContext& txn_op_context)
       : request_(request), txn_op_context_(txn_op_context) {
   }
 
@@ -147,7 +144,7 @@ class PgsqlReadOperation : public DocExprExecutor {
   // - Batch argument: The query condition is represented by many sets of values. For example, a
   //   batch protobuf will carry many ybctids.
   //     SELECT ... WHERE ybctid IN (y1, y2, y3)
-  Result<size_t> Execute(const common::YQLStorageIf& ql_storage,
+  Result<size_t> Execute(const YQLStorageIf& ql_storage,
                          CoarseTimePoint deadline,
                          const ReadHybridTime& read_time,
                          bool is_explicit_request_read_time,
@@ -162,7 +159,7 @@ class PgsqlReadOperation : public DocExprExecutor {
 
  private:
   // Execute a READ operator for a given scalar argument.
-  Result<size_t> ExecuteScalar(const common::YQLStorageIf& ql_storage,
+  Result<size_t> ExecuteScalar(const YQLStorageIf& ql_storage,
                                CoarseTimePoint deadline,
                                const ReadHybridTime& read_time,
                                bool is_explicit_request_read_time,
@@ -173,14 +170,14 @@ class PgsqlReadOperation : public DocExprExecutor {
                                bool *has_paging_state);
 
   // Execute a READ operator for a given batch of ybctids.
-  Result<size_t> ExecuteBatchYbctid(const common::YQLStorageIf& ql_storage,
+  Result<size_t> ExecuteBatchYbctid(const YQLStorageIf& ql_storage,
                                     CoarseTimePoint deadline,
                                     const ReadHybridTime& read_time,
                                     const Schema& schema,
                                     faststring *result_buffer,
                                     HybridTime *restart_read_ht);
 
-  Result<size_t> ExecuteSample(const common::YQLStorageIf& ql_storage,
+  Result<size_t> ExecuteSample(const YQLStorageIf& ql_storage,
                                CoarseTimePoint deadline,
                                const ReadHybridTime& read_time,
                                bool is_explicit_request_read_time,
@@ -199,7 +196,7 @@ class PgsqlReadOperation : public DocExprExecutor {
 
   // Checks whether we have processed enough rows for a page and sets the appropriate paging
   // state in the response object.
-  CHECKED_STATUS SetPagingStateIfNecessary(const common::YQLRowwiseIteratorIf* iter,
+  CHECKED_STATUS SetPagingStateIfNecessary(const YQLRowwiseIteratorIf* iter,
                                            size_t fetched_rows,
                                            const size_t row_count_limit,
                                            const bool scan_time_exceeded,
@@ -209,10 +206,10 @@ class PgsqlReadOperation : public DocExprExecutor {
 
   //------------------------------------------------------------------------------------------------
   const PgsqlReadRequestPB& request_;
-  const TransactionOperationContextOpt txn_op_context_;
+  const TransactionOperationContext txn_op_context_;
   PgsqlResponsePB response_;
-  common::YQLRowwiseIteratorIf::UniPtr table_iter_;
-  common::YQLRowwiseIteratorIf::UniPtr index_iter_;
+  YQLRowwiseIteratorIf::UniPtr table_iter_;
+  YQLRowwiseIteratorIf::UniPtr index_iter_;
 };
 
 }  // namespace docdb

@@ -43,10 +43,9 @@
 
 #include "yb/gutil/casts.h"
 
-#include "yb/util/flags.h"
 #include "yb/util/format.h"
+#include "yb/util/status_format.h"
 
-#include "yb/rocksdb/compaction_filter.h"
 #include "yb/rocksdb/db/filename.h"
 #include "yb/rocksdb/db/file_numbers.h"
 #include "yb/rocksdb/db/internal_stats.h"
@@ -61,18 +60,18 @@
 #include "yb/rocksdb/env.h"
 #include "yb/rocksdb/merge_operator.h"
 #include "yb/rocksdb/table/internal_iterator.h"
+#include "yb/rocksdb/table/iterator_wrapper.h"
 #include "yb/rocksdb/table/table_reader.h"
 #include "yb/rocksdb/table/merger.h"
 #include "yb/rocksdb/table/two_level_iterator.h"
 #include "yb/rocksdb/table/format.h"
-#include "yb/rocksdb/table/plain_table_factory.h"
 #include "yb/rocksdb/table/meta_blocks.h"
 #include "yb/rocksdb/table/get_context.h"
 
 #include "yb/rocksdb/util/coding.h"
 #include "yb/rocksdb/util/file_reader_writer.h"
-#include "yb/rocksdb/util/file_util.h"
 #include "yb/rocksdb/util/logging.h"
+#include "yb/rocksdb/util/statistics.h"
 #include "yb/rocksdb/util/stop_watch.h"
 #include "yb/rocksdb/util/sync_point.h"
 
@@ -1884,11 +1883,11 @@ void VersionStorageInfo::CalculateBaseBytes(const ImmutableCFOptions& ioptions,
   // Special logic to set number of sorted runs.
   // It is to match the previous behavior when all files are in L0.
   int num_l0_count = 0;
-  if (options.max_file_size_for_compaction == std::numeric_limits<uint64_t>::max()) {
+  if (options.MaxFileSizeForCompaction() == std::numeric_limits<uint64_t>::max()) {
     num_l0_count = static_cast<int>(files_[0].size());
   } else {
     for (const auto& file : files_[0]) {
-      if (file->fd.GetTotalFileSize() <= options.max_file_size_for_compaction) {
+      if (file->fd.GetTotalFileSize() <= options.MaxFileSizeForCompaction()) {
         ++num_l0_count;
       }
     }
@@ -3572,6 +3571,11 @@ InternalIterator* VersionSet::MakeInputIterator(Compaction* c) {
         for (size_t i = 0; i < flevel->num_files; i++) {
           FileMetaData* fmd = c->input(which, i);
           if (c->input(which, i)->delete_after_compaction) {
+            RLOG(
+                InfoLogLevel::INFO_LEVEL, db_options_->info_log,
+                yb::Format(
+                    "[$0] File marked for deletion, will be removed after compaction. file: $1",
+                    c->column_family_data()->GetName(), fmd->ToString()).c_str());
             RecordTick(cfd->ioptions()->statistics, COMPACTION_FILES_FILTERED);
             continue;
           }

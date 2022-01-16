@@ -27,7 +27,7 @@ import java.util.ArrayList;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
-import org.yb.Common.TableType;
+import org.yb.CommonTypes.TableType;
 import play.libs.Json;
 
 @Singleton
@@ -41,6 +41,7 @@ public class TableManager extends DevopsBase {
   private static final String K8S_CERT_PATH = "/opt/certs/yugabyte/";
   private static final String VM_CERT_DIR = "/yugabyte-tls-config/";
   private static final String BACKUP_SCRIPT = "bin/yb_backup.py";
+  private static final String BACKUP_LOCATION = "BACKUP_LOCATION";
 
   public enum CommandSubType {
     BACKUP(BACKUP_SCRIPT),
@@ -70,7 +71,7 @@ public class TableManager extends DevopsBase {
     String accessKeyCode = userIntent.accessKeyCode;
     AccessKey accessKey = AccessKey.get(region.provider.uuid, accessKeyCode);
     List<String> commandArgs = new ArrayList<>();
-    Map<String, String> extraVars = region.provider.getConfig();
+    Map<String, String> extraVars = region.provider.getUnmaskedConfig();
     Map<String, String> namespaceToConfig = new HashMap<>();
 
     boolean nodeToNodeTlsEnabled = userIntent.enableNodeToNodeEncrypt;
@@ -95,12 +96,17 @@ public class TableManager extends DevopsBase {
       case BACKUP:
         backupTableParams = (BackupTableParams) taskParams;
 
+        commandArgs.add("--ts_web_hosts_ports");
+        commandArgs.add(universe.getTserverHTTPAddresses());
         commandArgs.add("--parallelism");
         commandArgs.add(Integer.toString(backupTableParams.parallelism));
-        if (userIntent.enableYSQLAuth
-            || userIntent.tserverGFlags.getOrDefault("ysql_enable_auth", "false").equals("true")) {
+        if (userIntent.isYSQLAuthEnabled()) {
           commandArgs.add("--ysql_enable_auth");
         }
+        commandArgs.add("--ysql_port");
+        commandArgs.add(
+            Integer.toString(universe.getUniverseDetails().communicationPorts.ysqlServerRpcPort));
+
         if (backupTableParams.actionType == BackupTableParams.ActionType.CREATE) {
           if (backupTableParams.tableUUIDList != null
               && !backupTableParams.tableUUIDList.isEmpty()) {
@@ -171,7 +177,7 @@ public class TableManager extends DevopsBase {
         }
         if (backupTableParams.actionType == BackupTableParams.ActionType.RESTORE) {
           if (backupTableParams.restoreTimeStamp != null) {
-            String backupLocation = customerConfig.data.get("BACKUP_LOCATION").asText();
+            String backupLocation = customerConfig.data.get(BACKUP_LOCATION).asText();
             String restoreTimeStampMicroUnix =
                 getValidatedRestoreTimeStampMicroUnix(
                     backupTableParams.restoreTimeStamp,
@@ -233,6 +239,8 @@ public class TableManager extends DevopsBase {
         break;
       case DELETE:
         backupTableParams = (BackupTableParams) taskParams;
+        commandArgs.add("--ts_web_hosts_ports");
+        commandArgs.add(universe.getTserverHTTPAddresses());
         customer = Customer.find.query().where().idEq(universe.customerId).findOne();
         customerConfig = CustomerConfig.get(customer.uuid, backupTableParams.storageConfigUUID);
         LOG.info("Deleting backup at location {}", backupTableParams.storageLocation);
@@ -320,7 +328,7 @@ public class TableManager extends DevopsBase {
     commandArgs.add(customerConfig.name.toLowerCase());
     if (customerConfig.name.toLowerCase().equals("nfs")) {
       commandArgs.add("--nfs_storage_path");
-      commandArgs.add(customerConfig.getData().get("BACKUP_LOCATION").asText());
+      commandArgs.add(customerConfig.getData().get(BACKUP_LOCATION).asText());
     }
     if (nodeToNodeTlsEnabled) {
       commandArgs.add("--certs_dir");

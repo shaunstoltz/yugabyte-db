@@ -15,29 +15,23 @@
 
 #include "yb/tablet/transaction_coordinator.h"
 
-#include <condition_variable>
-
-#include <boost/multi_index_container.hpp>
 #include <boost/multi_index/hashed_index.hpp>
 #include <boost/multi_index/mem_fun.hpp>
 #include <boost/multi_index/ordered_index.hpp>
-#include <boost/multi_index/tag.hpp>
-
-#include <boost/uuid/uuid_io.hpp>
+#include <boost/multi_index_container.hpp>
 
 #include "yb/client/client.h"
-#include "yb/client/transaction_cleanup.h"
 #include "yb/client/transaction_rpc.h"
 
 #include "yb/common/common.pb.h"
 #include "yb/common/entity_ids.h"
+#include "yb/common/pgsql_error.h"
 #include "yb/common/transaction.h"
 #include "yb/common/transaction_error.h"
-#include "yb/common/pgsql_error.h"
+#include "yb/common/wire_protocol.h"
 
 #include "yb/consensus/consensus_round.h"
 #include "yb/consensus/consensus_util.h"
-#include "yb/consensus/opid_util.h"
 
 #include "yb/docdb/transaction_dump.h"
 
@@ -47,20 +41,22 @@
 
 #include "yb/server/clock.h"
 
-#include "yb/tablet/tablet.h"
 #include "yb/tablet/operations/update_txn_operation.h"
 
-#include "yb/tserver/service_util.h"
-#include "yb/tserver/tserver.pb.h"
 #include "yb/tserver/tserver_service.pb.h"
 
 #include "yb/util/atomic.h"
+#include "yb/util/countdown_latch.h"
 #include "yb/util/enums.h"
 #include "yb/util/flag_tags.h"
+#include "yb/util/format.h"
+#include "yb/util/logging.h"
 #include "yb/util/metrics.h"
 #include "yb/util/random_util.h"
 #include "yb/util/result.h"
 #include "yb/util/scope_exit.h"
+#include "yb/util/status_format.h"
+#include "yb/util/status_log.h"
 #include "yb/util/tsan_util.h"
 #include "yb/util/yb_pg_errcodes.h"
 
@@ -482,7 +478,7 @@ class TransactionState {
     }
   }
 
-  CHECKED_STATUS AppliedInOneOfInvolvedTablets(const tserver::TransactionStatePB& state) {
+  CHECKED_STATUS AppliedInOneOfInvolvedTablets(const TransactionStatePB& state) {
     if (status_ != TransactionStatus::COMMITTED && status_ != TransactionStatus::SEALED) {
       // We could ignore this request, because it will be re-send if required.
       LOG_WITH_PREFIX(DFATAL)
@@ -633,7 +629,7 @@ class TransactionState {
   void SubmitUpdateStatus(TransactionStatus status) {
     VLOG_WITH_PREFIX(4) << "SubmitUpdateStatus(" << TransactionStatus_Name(status) << ")";
 
-    tserver::TransactionStatePB state;
+    TransactionStatePB state;
     state.set_transaction_id(id_.data(), id_.size());
     state.set_status(status);
 
@@ -1351,7 +1347,7 @@ class TransactionCoordinator::Impl : public TransactionStateContext {
                     } else {
                       // Tablet has been deleted (not split), so we should mark it as applied to
                       // be able to cleanup the transaction.
-                      tserver::TransactionStatePB transaction_state;
+                      TransactionStatePB transaction_state;
                       transaction_state.add_tablets(action.tablet);
                       WARN_NOT_OK(
                           state.AppliedInOneOfInvolvedTablets(transaction_state),

@@ -14,6 +14,7 @@
 #include "yb/yql/pgwrapper/pg_mini_test_base.h"
 
 #include "yb/util/test_macros.h"
+#include "yb/util/test_thread_holder.h"
 
 using namespace std::literals;
 
@@ -39,7 +40,7 @@ TEST_F(PgTxnTest, YB_DISABLE_TEST_IN_SANITIZERS(EmptyUpdate)) {
 
 class PgTxnRF1Test : public PgTxnTest {
  public:
-  int NumTabletServers() override {
+  size_t NumTabletServers() override {
     return 1;
   }
 };

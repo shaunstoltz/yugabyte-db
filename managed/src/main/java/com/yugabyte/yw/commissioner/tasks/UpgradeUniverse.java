@@ -38,6 +38,8 @@ import com.yugabyte.yw.forms.UpgradeTaskParams.UpgradeTaskSubType;
 import com.yugabyte.yw.forms.UpgradeTaskParams.UpgradeTaskType;
 import com.yugabyte.yw.models.AvailabilityZone;
 import com.yugabyte.yw.models.CertificateInfo;
+import com.yugabyte.yw.models.Customer;
+import com.yugabyte.yw.models.CustomerConfig;
 import com.yugabyte.yw.models.InstanceType;
 import com.yugabyte.yw.models.Provider;
 import com.yugabyte.yw.models.Region;
@@ -812,6 +814,9 @@ public class UpgradeUniverse extends UniverseDefinitionTaskBase {
 
   private void createPostUpgradeTasks() {
     if (taskParams().taskType == UpgradeTaskType.Software) {
+      // Run YSQL upgrade on the universe
+      createRunYsqlUpgradeTask(taskParams().ybSoftwareVersion)
+          .setSubTaskGroupType(getTaskSubGroupType());
       // Update the software version on success.
       createUpdateSoftwareVersionTask(taskParams().ybSoftwareVersion)
           .setSubTaskGroupType(getTaskSubGroupType());
@@ -999,6 +1004,8 @@ public class UpgradeUniverse extends UniverseDefinitionTaskBase {
         return SubTaskGroupType.SystemdUpgrade;
       case ToggleTls:
         return SubTaskGroupType.ToggleTls;
+      case Certs:
+        return SubTaskGroupType.RotatingCert;
       default:
         return SubTaskGroupType.Invalid;
     }
@@ -1156,6 +1163,7 @@ public class UpgradeUniverse extends UniverseDefinitionTaskBase {
       UpgradeTaskType type,
       UpgradeTaskSubType taskSubType) {
     AnsibleConfigureServers.Params params = new AnsibleConfigureServers.Params();
+    Universe universe = Universe.getOrBadRequest(taskParams().universeUUID);
     UserIntent userIntent =
         Universe.getOrBadRequest(taskParams().universeUUID)
             .getUniverseDetails()
@@ -1177,6 +1185,31 @@ public class UpgradeUniverse extends UniverseDefinitionTaskBase {
     params.type = type;
     params.setProperty("processType", processType.toString());
     params.setProperty("taskSubType", taskSubType.toString());
+
+    // Sets the isMaster field
+    params.isMaster = node.isMaster;
+    params.enableYSQL = userIntent.enableYSQL;
+    params.enableYCQL = userIntent.enableYCQL;
+    params.enableYCQLAuth = userIntent.enableYCQLAuth;
+    params.enableYSQLAuth = userIntent.enableYSQLAuth;
+
+    // The software package to install for this cluster.
+    params.ybSoftwareVersion = userIntent.ybSoftwareVersion;
+    // Set the InstanceType
+    params.instanceType = node.cloudInfo.instance_type;
+    params.enableNodeToNodeEncrypt = userIntent.enableNodeToNodeEncrypt;
+    params.enableClientToNodeEncrypt = userIntent.enableClientToNodeEncrypt;
+    params.rootAndClientRootCASame = universe.getUniverseDetails().rootAndClientRootCASame;
+
+    params.allowInsecure = universe.getUniverseDetails().allowInsecure;
+    params.setTxnTableWaitCountFlag = universe.getUniverseDetails().setTxnTableWaitCountFlag;
+    params.rootCA = universe.getUniverseDetails().rootCA;
+    params.clientRootCA = universe.getUniverseDetails().clientRootCA;
+    params.enableYEDIS = userIntent.enableYEDIS;
+    params.useSystemd = userIntent.useSystemd;
+
+    UUID custUUID = Customer.get(universe.customerId).uuid;
+    params.callhomeLevel = CustomerConfig.getCallhomeLevel(custUUID);
 
     if (type == UpgradeTaskType.Software) {
       params.ybSoftwareVersion = taskParams().ybSoftwareVersion;

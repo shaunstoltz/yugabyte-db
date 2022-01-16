@@ -15,8 +15,14 @@
 
 #include <chrono>
 
-#include "yb/yql/pggate/test/pggate_test.h"
 #include "yb/common/ybc-internal.h"
+
+#include "yb/gutil/casts.h"
+
+#include "yb/util/status_log.h"
+
+#include "yb/yql/pggate/test/pggate_test.h"
+#include "yb/yql/pggate/ybc_pggate.h"
 
 using namespace std::chrono_literals;
 
@@ -161,7 +167,7 @@ TEST_F(PggateTestCatalog, TestDml) {
   // Check result.
   int col_index = 0;
   CHECK_EQ(values[col_index++], 0);  // compid : int64
-  int32_t empid = values[col_index++];  // empid : int32
+  int32_t empid = narrow_cast<int32_t>(values[col_index++]);  // empid : int32
   CHECK_EQ(empid, 1) << "Unexpected result for compid column";
   CHECK_EQ(values[col_index++], empid);  // dependent_count : int16
   CHECK_EQ(values[col_index++], 100 + empid);  // project_count : int32
@@ -222,7 +228,7 @@ TEST_F(PggateTestCatalog, TestDml) {
     // Check result.
     col_index = 0;
     CHECK_EQ(values[col_index++], 0);  // compid : int64
-    empid = values[col_index++];  // empid : int32
+    empid = narrow_cast<int32_t>(values[col_index++]);  // empid : int32
     CHECK_EQ(values[col_index++], empid);  // dependent_count : int16
     CHECK_EQ(values[col_index++], 100 + empid);  // project_count : int32
 
@@ -334,8 +340,8 @@ TEST_F(PggateTestCatalog, TestDml) {
 
     // Check result.
     col_index = 0;
-    int32_t compid = values[col_index++];  // id : int32
-    empid = values[col_index++];  // empid : int32
+    int32_t compid = narrow_cast<int32_t>(values[col_index++]);  // id : int32
+    empid = narrow_cast<int32_t>(values[col_index++]);  // empid : int32
     CHECK_EQ(compid, 0);
     if (empid%2 == 0) {
       // Check if EVEN rows stays the same as inserted.

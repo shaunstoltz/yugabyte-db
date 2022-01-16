@@ -13,45 +13,52 @@
 //
 //--------------------------------------------------------------------------------------------------
 
-#include <memory>
-#include <boost/optional.hpp>
-
-#include "yb/yql/pggate/pg_client.h"
-#include "yb/yql/pggate/pg_expr.h"
 #include "yb/yql/pggate/pg_session.h"
-#include "yb/yql/pggate/pggate_flags.h"
-#include "yb/yql/pggate/pg_txn_manager.h"
-#include "yb/yql/pggate/ybc_pggate.h"
+
+#include <memory>
+
+#include <boost/optional.hpp>
 
 #include "yb/client/batcher.h"
 #include "yb/client/error.h"
+#include "yb/client/schema.h"
 #include "yb/client/session.h"
 #include "yb/client/table.h"
-#include "yb/client/table_alterer.h"
-#include "yb/client/table_creator.h"
 #include "yb/client/tablet_server.h"
 #include "yb/client/transaction.h"
 #include "yb/client/yb_op.h"
+#include "yb/client/yb_table_name.h"
 
-#include "yb/common/pgsql_error.h"
 #include "yb/common/pg_types.h"
+#include "yb/common/pgsql_error.h"
+#include "yb/common/placement_info.h"
 #include "yb/common/ql_expr.h"
 #include "yb/common/ql_value.h"
 #include "yb/common/row_mark.h"
-#include "yb/common/ybc-internal.h"
+#include "yb/common/schema.h"
 #include "yb/common/transaction_error.h"
 
 #include "yb/docdb/doc_key.h"
 #include "yb/docdb/primitive_value.h"
+#include "yb/docdb/value_type.h"
 
+#include "yb/gutil/casts.h"
+
+#include "yb/tserver/pg_client.pb.h"
 #include "yb/tserver/tserver_shared_mem.h"
 
 #include "yb/util/flag_tags.h"
-#include "yb/util/logging.h"
-#include "yb/util/scope_exit.h"
+#include "yb/util/format.h"
+#include "yb/util/result.h"
+#include "yb/util/shared_mem.h"
+#include "yb/util/status_format.h"
 #include "yb/util/string_util.h"
 
-#include "yb/master/master.proxy.h"
+#include "yb/yql/pggate/pg_client.h"
+#include "yb/yql/pggate/pg_expr.h"
+#include "yb/yql/pggate/pg_txn_manager.h"
+#include "yb/yql/pggate/pggate_flags.h"
+#include "yb/yql/pggate/ybc_pggate.h"
 
 using namespace std::literals;
 
@@ -80,9 +87,6 @@ using client::YBTableName;
 using client::YBTableType;
 
 using yb::master::GetNamespaceInfoResponsePB;
-using yb::master::IsInitDbDoneRequestPB;
-using yb::master::IsInitDbDoneResponsePB;
-using yb::master::MasterServiceProxy;
 
 using yb::tserver::TServerSharedObject;
 
@@ -205,8 +209,8 @@ CHECKED_STATUS CombineErrorsToStatus(const client::CollectedErrors& errors, cons
   return AppendTxnErrorCode(AppendPsqlErrorCode(result, errors), errors);
 }
 
-docdb::PrimitiveValue NullValue(ColumnSchema::SortingType sorting) {
-  using SortingType = ColumnSchema::SortingType;
+docdb::PrimitiveValue NullValue(SortingType sorting) {
+  using SortingType = SortingType;
 
   return docdb::PrimitiveValue(
       sorting == SortingType::kAscendingNullsLast || sorting == SortingType::kDescendingNullsLast
@@ -432,7 +436,8 @@ Status PgSession::RunHelper::Apply(std::shared_ptr<client::YBPgsqlOp> op,
   if (PREDICT_FALSE(yb_debug_log_docdb_requests)) {
     LOG(INFO) << "Applying operation: " << op->ToString();
   }
-  return yb_session_->Apply(std::move(op));
+  yb_session_->Apply(std::move(op));
+  return Status::OK();
 }
 
 Result<PgSessionAsyncRunResult> PgSession::RunHelper::Flush() {
@@ -881,12 +886,7 @@ Result<bool> PgSession::ShouldHandleTransactionally(const client::YBPgsqlOp& op)
     SCHECK(has_non_ddl_txn, IllegalState, "Transactional operation requires transaction");
     return true;
   }
-  // Previously, yb_non_ddl_txn_for_sys_tables_allowed flag caused CREATE VIEW to fail with
-  // read restart error because subsequent cache refresh used an outdated txn to read from the
-  // system catalog,
-  // As a quick fix, we prevent yb_non_ddl_txn_for_sys_tables_allowed from affecting reads.
-  if (pg_txn_manager_->IsDdlMode() || (yb_non_ddl_txn_for_sys_tables_allowed && has_non_ddl_txn
-                                       && op.type() == YBOperation::Type::PGSQL_WRITE)) {
+  if (pg_txn_manager_->IsDdlMode() || (yb_non_ddl_txn_for_sys_tables_allowed && has_non_ddl_txn)) {
     return true;
   }
   if (op.type() == YBOperation::Type::PGSQL_WRITE) {
@@ -934,7 +934,8 @@ Status PgSession::ApplyOperation(client::YBSession *session,
                    op->table()->name(),
                    op->table()->schema().table_properties().is_transactional(),
                    YBCIsInitDbModeEnvVarSet()));
-  return session->Apply(op);
+  session->Apply(op);
+  return Status::OK();
 }
 
 Status PgSession::FlushOperations(PgsqlOpBuffer ops, IsTransactionalSession transactional) {
@@ -1105,6 +1106,10 @@ Result<client::TabletServersInfo> PgSession::ListTabletServers() {
   return pg_client_.ListLiveTabletServers(false);
 }
 
+bool PgSession::ShouldUseFollowerReads() const {
+  return pg_txn_manager_->ShouldUseFollowerReads();
+}
+
 void PgSession::SetTimeout(const int timeout_ms) {
   session_->SetTimeout(MonoDelta::FromMilliseconds(timeout_ms));
 }
@@ -1117,26 +1122,31 @@ void PgSession::SetCatalogReadPoint(const ReadHybridTime& read_ht) {
   catalog_session_->SetReadPoint(read_ht);
 }
 
-Status PgSession::SetActiveSubTransaction(SubTransactionId id) {
-  // It's required that we flush all buffered operations before changing the SubTransactionMetadata
-  // used by the underlying batcher and RPC logic, as this will snapshot the current
-  // SubTransactionMetadata for use in construction of RPCs for already-queued operations, thereby
-  // ensuring that previous operations use previous SubTransactionMetadata. If we do not flush here,
-  // already queued operations may incorrectly use this newly modified SubTransactionMetadata when
-  // they are eventually sent to DocDB.
-  RETURN_NOT_OK(FlushBufferedOperations());
-  RETURN_NOT_OK(pg_txn_manager_->BeginWriteTransactionIfNecessary(
-      IsReadOnlyOperation::kFalse, IsPessimisticLockRequired::kFalse));
-  return pg_txn_manager_->SetActiveSubTransaction(id);
-}
+Status PgSession::ValidatePlacement(const string& placement_info) {
+  tserver::PgValidatePlacementRequestPB req;
 
-Status PgSession::RollbackSubTransaction(SubTransactionId id) {
-  // TODO(savepoints) -- send async RPC to transaction status tablet, or rely on heartbeater to
-  // eventually send this metadata.
-  // See comment in SetActiveSubTransaction -- we must flush buffered operations before updating any
-  // SubTransactionMetadata.
-  RETURN_NOT_OK(FlushBufferedOperations());
-  return pg_txn_manager_->RollbackSubTransaction(id);
+  Result<PlacementInfoConverter::Placement> result =
+      PlacementInfoConverter::FromString(placement_info);
+
+  // For validation, if there is no replica_placement option, we default to the
+  // cluster configuration which the user is responsible for maintaining
+  if (!result.ok() && result.status().IsInvalidArgument()) {
+    return Status::OK();
+  }
+
+  RETURN_NOT_OK(result);
+
+  PlacementInfoConverter::Placement placement = result.get();
+  for (const auto& block : placement.placement_infos) {
+    auto pb = req.add_placement_infos();
+    pb->set_cloud(block.cloud);
+    pb->set_region(block.region);
+    pb->set_zone(block.zone);
+    pb->set_min_num_replicas(block.min_num_replicas);
+  }
+  req.set_num_replicas(placement.num_replicas);
+
+  return pg_client_.ValidatePlacement(&req);
 }
 
 }  // namespace pggate

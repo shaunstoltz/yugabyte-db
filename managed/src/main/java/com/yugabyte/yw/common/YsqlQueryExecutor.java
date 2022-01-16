@@ -162,12 +162,26 @@ public class YsqlQueryExecutor {
               ysqlResponse.toString());
         }
       } else {
+        boolean versionMatch =
+            universe
+                .getVersions()
+                .stream()
+                .allMatch(v -> Util.compareYbVersions(v, "2.6.4.0") >= 0);
+        String rolesList = "pg_read_all_stats, pg_signal_backend";
+        if (versionMatch) {
+          // yb_extension is only supported in recent YB versions 2.6.x >= 2.6.4 and >= 2.8.0
+          // not including the odd 2.7.x, 2.9.x releases
+          rolesList += ", yb_extension";
+        }
         ysqlResponse =
             runQueryUtil(
                 universe,
                 data,
                 String.format(
-                    "GRANT pg_read_all_stats, pg_signal_backend TO \"%s\"", DB_ADMIN_ROLE_NAME));
+                    "GRANT %2$s TO \"%1$s\"; "
+                        + "GRANT EXECUTE ON FUNCTION pg_stat_statements_reset TO  \"%1$s\"; "
+                        + " GRANT ALL ON DATABASE yugabyte, postgres TO \"%1$s\";",
+                    DB_ADMIN_ROLE_NAME, rolesList));
         LOG.info("GRANT privs to admin role, result {}", ysqlResponse.toString());
 
         ysqlResponse = runQueryUtil(universe, data, DEL_PG_ROLES_CMD_1);
@@ -196,6 +210,26 @@ public class YsqlQueryExecutor {
                   "GRANT \"%s\" TO \"%s\" WITH ADMIN OPTION", DB_ADMIN_ROLE_NAME, data.username));
       LOG.info("Grant admin role to user {}, result: {}", data.username, ysqlResponse.toString());
     }
+
+    // Reset pg_stat_statements table to remove queries containing credentials.
+    runQueryUtil(universe, data, "SELECT pg_stat_statements_reset()");
+    LOG.info("Resetting pg_stat_statements");
+  }
+
+  public void validateAdminPassword(Universe universe, DatabaseSecurityFormData data) {
+    RunQueryFormData ysqlQuery = new RunQueryFormData();
+    ysqlQuery.query = "SELECT 1";
+    JsonNode ysqlResponse =
+        executeQuery(universe, ysqlQuery, data.ysqlAdminUsername, data.ysqlAdminPassword);
+    if (ysqlResponse.has("error")) {
+      String errMsg = ysqlResponse.get("error").asText();
+      // Actual message is "FATAL: password authentication failed for user".
+      // Foolproof attempt to match words in order.
+      if (errMsg.matches(".*\\bpassword\\b.+\\bauthentication\\b.+\\bfailed\\b.*")) {
+        throw new PlatformServiceException(Http.Status.UNAUTHORIZED, errMsg);
+      }
+      throw new PlatformServiceException(Http.Status.BAD_REQUEST, errMsg);
+    }
   }
 
   public void updateAdminPassword(Universe universe, DatabaseSecurityFormData data) {
@@ -209,6 +243,14 @@ public class YsqlQueryExecutor {
     JsonNode ysqlResponse =
         executeQuery(universe, ysqlQuery, data.ysqlAdminUsername, data.ysqlCurrAdminPassword);
     LOG.info("Updating YSQL user, result: " + ysqlResponse.toString());
+    if (ysqlResponse.has("error")) {
+      throw new PlatformServiceException(
+          Http.Status.BAD_REQUEST, ysqlResponse.get("error").asText());
+    }
+    ysqlQuery.query = "SELECT pg_stat_statements_reset()";
+    ysqlResponse =
+        executeQuery(universe, ysqlQuery, data.ysqlAdminUsername, data.ysqlAdminPassword);
+    LOG.info("Resetting pg_stat_statements");
     if (ysqlResponse.has("error")) {
       throw new PlatformServiceException(
           Http.Status.BAD_REQUEST, ysqlResponse.get("error").asText());

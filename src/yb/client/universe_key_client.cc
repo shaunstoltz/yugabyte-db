@@ -11,18 +11,13 @@
 // under the License.
 //
 
-#include <gflags/gflags.h>
-#include <boost/uuid/random_generator.hpp>
-#include <boost/uuid/uuid_io.hpp>
-
 #include "yb/client/universe_key_client.h"
-#include "yb/master/master.pb.h"
-#include "yb/master/master.proxy.h"
-#include "yb/master/universe_key_registry_service.h"
-#include "yb/util/encryption.pb.h"
-#include "yb/util/pb_util.h"
+
+#include "yb/encryption/encryption.pb.h"
+
+#include "yb/master/master_encryption.proxy.h"
+
 #include "yb/rpc/rpc_controller.h"
-#include "yb/rpc/poller.h"
 
 using namespace std::chrono_literals;
 
@@ -49,7 +44,7 @@ void UniverseKeyClient::SendAsyncRequest(HostPort host_port) {
   auto rpc = std::make_shared<rpc::RpcController>();
   rpc->set_timeout(10s);
 
-  master::MasterServiceProxy peer_proxy(proxy_cache_, host_port);
+  master::MasterEncryptionProxy peer_proxy(proxy_cache_, host_port);
   peer_proxy.GetUniverseKeyRegistryAsync(
       req, resp.get(), rpc.get(),
       std::bind(&UniverseKeyClient::ProcessGetUniverseKeyRegistryResponse, this, resp, rpc,

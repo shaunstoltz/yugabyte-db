@@ -333,8 +333,12 @@ auth_failed(Port *port, int status, char *logdetail)
 			break;
 	}
 
+	char *line_to_print = port->hba->maskedline;
+	if (!line_to_print)
+		line_to_print = port->hba->rawline;
+
 	cdetail = psprintf(_("Connection matched pg_hba.conf line %d: \"%s\""),
-					   port->hba->linenumber, port->hba->rawline);
+					   port->hba->linenumber, line_to_print);
 	if (logdetail)
 		logdetail = psprintf("%s\n%s", logdetail, cdetail);
 	else
@@ -574,7 +578,6 @@ ClientAuthentication(Port *port)
 		case uaYbTserverKey:
 #ifdef HAVE_UNIX_SOCKETS
 			Assert(IsYugaByteEnabled());
-			Assert(!YBCGetDisableIndexBackfill());
 			status = CheckYbTserverKeyAuth(port, &logdetail);
 #else
 			Assert(false);

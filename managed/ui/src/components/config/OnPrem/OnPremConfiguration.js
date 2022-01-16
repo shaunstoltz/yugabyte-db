@@ -25,7 +25,9 @@ const PROVIDER_TYPE = 'onprem';
 const initialState = {
   failedBootstrapMessage: null,
   isEditingProvider: false,
+  isCreatingProvider: false,
   isJsonEntry: false,
+  selectedProviderUUID: undefined,
   isAdditionalHostOptionsOpen: false,
   configJsonVal: JSON.stringify(JSON.parse(JSON.stringify(emptyDataCenterConfig)), null, 2),
   bootstrapSteps: [
@@ -76,7 +78,12 @@ export default class OnPremConfiguration extends Component {
   showEditProviderForm = () => {
     this.setState({ isEditingProvider: true });
   };
-
+  toggleCreateProviderForm = (flag) => {
+    this.setState({isCreatingProvider: flag})
+  }
+  setSelectedProvider = (providerUUID) => {
+    this.setState({selectedProviderUUID: providerUUID})
+  }
   UNSAFE_componentWillReceiveProps(nextProps) {
     const {
       cloudBootstrap: {
@@ -219,6 +226,7 @@ export default class OnPremConfiguration extends Component {
           break;
         case 'accessKey':
           this.setState(_.clone(initialState, true));
+          this.props.resetConfigForm();
           this.props.onPremConfigSuccess();
           break;
         default:
@@ -260,10 +268,12 @@ export default class OnPremConfiguration extends Component {
 
   submitEditProvider = (payloadData) => {
     const {
-      cloud: { providers }
+      cloud: { providers },
+      onPremJsonFormData: { regions }
     } = this.props;
+    const { selectedProviderUUID } = this.state;
     const self = this;
-    const currentProvider = providers.data.find((provider) => provider.code === 'onprem');
+    const currentProvider = providers.data.find((provider) => provider.uuid === selectedProviderUUID);
     let totalNumRegions = 0;
     let totalNumInstances = 0;
     let totalNumZones = 0;
@@ -304,6 +314,11 @@ export default class OnPremConfiguration extends Component {
         }
       );
     }
+
+    //Delete removed regions
+    const regionIds = payloadData.regions.map((region) => region.uuid);
+    const deletedRegions = regions.filter((region) => !regionIds.includes(region.uuid));
+    this.props.deleteOnPremRegions(currentProvider.uuid, deletedRegions);
   };
 
   submitWizardJson = (payloadData) => {
@@ -313,7 +328,7 @@ export default class OnPremConfiguration extends Component {
 
   render() {
     const { configuredProviders, params } = this.props;
-    const { configJsonVal, isEditingProvider } = this.state;
+    const { configJsonVal, isEditingProvider, selectedProviderUUID } = this.state;
     if (
       getPromiseState(configuredProviders).isInit() ||
       getPromiseState(configuredProviders).isError()
@@ -323,7 +338,7 @@ export default class OnPremConfiguration extends Component {
       return <YBLoading />;
     } else if (getPromiseState(configuredProviders).isSuccess()) {
       const providerFound = configuredProviders.data.find((provider) => provider.code === 'onprem');
-      if (isDefinedNotNull(providerFound)) {
+      if (isDefinedNotNull(providerFound) && !this.state.isCreatingProvider) {
         if (this.state.isEditingProvider) {
           return (
             <OnPremConfigWizardContainer
@@ -346,7 +361,10 @@ export default class OnPremConfiguration extends Component {
             )}
             <OnPremSuccessContainer
               showEditProviderForm={this.showEditProviderForm}
+              setCreateProviderView={()=>{this.toggleCreateProviderForm(true)}}
+              selectedProviderUUID={selectedProviderUUID || providerFound.uuid}
               params={params}
+              setSelectedProvider={this.setSelectedProvider}
             />
           </>
         );

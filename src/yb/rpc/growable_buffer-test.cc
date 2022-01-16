@@ -17,6 +17,8 @@
 
 #include "yb/rpc/growable_buffer.h"
 
+#include "yb/util/result.h"
+#include "yb/util/test_macros.h"
 #include "yb/util/test_util.h"
 
 namespace yb {
@@ -98,7 +100,7 @@ TEST_F(GrowableBufferTest, TestConsume) {
     consumed += consume_size;
     ASSERT_EQ(consumed + buffer.size(), counter);
     auto iovs = buffer.AppendedVecs();
-    int value = consumed;
+    auto value = consumed;
     for (const auto& iov : iovs) {
       const auto* data = static_cast<const uint8_t*>(iov.iov_base);
       for (int j = 0; j != iov.iov_len; ++j) {

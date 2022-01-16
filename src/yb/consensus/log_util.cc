@@ -33,20 +33,19 @@
 #include "yb/consensus/log_util.h"
 
 #include <algorithm>
-#include <iostream>
 #include <limits>
 #include <utility>
 
-#include <gflags/gflags.h>
 #include <glog/logging.h>
 
 #include "yb/common/hybrid_time.h"
+
 #include "yb/consensus/opid_util.h"
+
 #include "yb/fs/fs_manager.h"
-#include "yb/gutil/map-util.h"
-#include "yb/gutil/stl_util.h"
+
+#include "yb/gutil/casts.h"
 #include "yb/gutil/strings/split.h"
-#include "yb/gutil/strings/substitute.h"
 #include "yb/gutil/strings/util.h"
 
 #include "yb/util/coding-inl.h"
@@ -56,7 +55,10 @@
 #include "yb/util/env_util.h"
 #include "yb/util/flag_tags.h"
 #include "yb/util/pb_util.h"
+#include "yb/util/result.h"
 #include "yb/util/size_literals.h"
+#include "yb/util/status_format.h"
+#include "yb/util/status_log.h"
 
 DEFINE_int32(log_segment_size_mb, 64,
              "The default segment size for log roll-overs, in MB");
@@ -557,9 +559,9 @@ ReadEntriesResult ReadableLogSegment::ReadEntries(int64_t max_entries_to_read) {
 
     // Number of entries to extract from the protobuf repeated field because the ownership of those
     // entries will be transferred to the caller.
-    size_t num_entries_to_extract = 0;
+    int num_entries_to_extract = 0;
 
-    for (size_t i = 0; i < current_batch.entry_size(); ++i) {
+    for (int i = 0; i < current_batch.entry_size(); ++i) {
       result.entries.emplace_back(current_batch.mutable_entry(i));
       DCHECK_NE(current_batch.mono_time(), 0);
       LogEntryMetadata entry_metadata;
@@ -629,7 +631,7 @@ Status ReadableLogSegment::ScanForValidEntryHeaders(int64_t offset, bool* has_va
   for (;
        offset < file_size() - kEntryHeaderSize;
        offset += kChunkSize - kEntryHeaderSize) {
-    int rem = std::min<int64_t>(file_size() - offset, kChunkSize);
+    auto rem = std::min<int64_t>(file_size() - offset, kChunkSize);
     Slice chunk;
     // If encryption is enabled, need to use checkpoint file to read pre-allocated file since
     // we want to preserve all 0s.
@@ -668,7 +670,7 @@ Status ReadableLogSegment::ScanForValidEntryHeaders(int64_t offset, bool* has_va
 }
 
 Status ReadableLogSegment::MakeCorruptionStatus(
-    int batch_number,
+    size_t batch_number,
     int64_t batch_offset,
     std::vector<int64_t>* recent_offsets,
     const std::vector<std::unique_ptr<LogEntryPB>>& entries,
@@ -866,8 +868,8 @@ Status WritableLogSegment::WriteEntryBatch(const Slice& data) {
   uint8_t header_buf[kEntryHeaderSize];
 
   // First encode the length of the message.
-  uint32_t len = data.size();
-  InlineEncodeFixed32(&header_buf[0], len);
+  auto len = data.size();
+  InlineEncodeFixed32(&header_buf[0], narrow_cast<uint32_t>(len));
 
   // Then the CRC of the message.
   uint32_t msg_crc = crc::Crc32c(data.data(), data.size());
@@ -887,13 +889,17 @@ Status WritableLogSegment::WriteEntryBatch(const Slice& data) {
   return Status::OK();
 }
 
+Status WritableLogSegment::Sync() {
+  return writable_file_->Sync();
+}
+
 // Creates a LogEntryBatchPB from pre-allocated ReplicateMsgs managed using shared pointers. The
 // caller has to ensure these messages are not deleted twice, both by LogEntryBatchPB and by
 // the shared pointers.
 LogEntryBatchPB CreateBatchFromAllocatedOperations(const ReplicateMsgs& msgs) {
   LogEntryBatchPB result;
   result.set_mono_time(RestartSafeCoarseMonoClock().Now().ToUInt64());
-  result.mutable_entry()->Reserve(msgs.size());
+  result.mutable_entry()->Reserve(narrow_cast<int>(msgs.size()));
   for (const auto& msg_ptr : msgs) {
     LogEntryPB* entry_pb = result.add_entry();
     entry_pb->set_type(log::REPLICATE);

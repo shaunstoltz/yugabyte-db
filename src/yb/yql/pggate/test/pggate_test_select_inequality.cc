@@ -13,8 +13,12 @@
 //
 //--------------------------------------------------------------------------------------------------
 
-#include "yb/yql/pggate/test/pggate_test.h"
 #include "yb/common/ybc-internal.h"
+
+#include "yb/util/status_log.h"
+
+#include "yb/yql/pggate/test/pggate_test.h"
+#include "yb/yql/pggate/ybc_pggate.h"
 
 namespace yb {
 namespace pggate {
@@ -160,7 +164,7 @@ TEST_F(PggateTestSelectInequality, TestSelectInequality) {
     string expected_id = strings::Substitute("$0", h);
     CHECK_EQ(selected_id, expected_id);
 
-    int32_t r1 = values[col_index++];  // h : int64
+    int64_t r1 = values[col_index++];  // h : int64
     CHECK_LE(A, r1);
     CHECK_GE(B, r1);
 
@@ -227,7 +231,7 @@ TEST_F(PggateTestSelectInequality, TestSelectInequality) {
     string expected_id = strings::Substitute("$0", h);
     CHECK_EQ(selected_id, expected_id);
 
-    int32_t r1 = values[col_index++];  // h : int64
+    int64_t r1 = values[col_index++];  // h : int64
     CHECK_LE(A, r1);
     CHECK_GE(B, r1);
 
@@ -294,7 +298,7 @@ TEST_F(PggateTestSelectInequality, TestSelectInequality) {
     string expected_id = strings::Substitute("$0", h);
     CHECK_EQ(selected_id, expected_id);
 
-    int32_t r1 = values[col_index++];  // h : int64
+    int64_t r1 = values[col_index++];  // h : int64
     CHECK_LE(A, r1);
     CHECK_GE(B, r1);
 
@@ -363,7 +367,7 @@ TEST_F(PggateTestSelectInequality, TestSelectInequality) {
     string expected_id = strings::Substitute("$0", h);
     CHECK_EQ(selected_id, expected_id);
 
-    int32_t r1 = values[col_index++];  // h : int64
+    int64_t r1 = values[col_index++];  // h : int64
     CHECK_LE(A, r1);
     CHECK_GE(B, r1);
 

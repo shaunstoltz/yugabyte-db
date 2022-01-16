@@ -19,11 +19,14 @@ import java.util.*;
 import java.util.concurrent.TimeUnit;
 import java.util.stream.Collectors;
 
+import com.google.common.net.HostAndPort;
+
 import org.json.JSONObject;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 import org.yb.client.TestUtils;
+import org.yb.minicluster.MiniYBDaemon;
 
 public final class YBBackupUtil {
   private static final Logger LOG = LoggerFactory.getLogger(YBBackupUtil.class);
@@ -31,6 +34,7 @@ public final class YBBackupUtil {
 
   // Comma separate describing the master addresses and ports.
   private static String masterAddresses;
+  private static String tsWebHostsAndPorts;
   private static InetSocketAddress postgresContactPoint;
 
   public static void setPostgresContactPoint(InetSocketAddress contactPoint) {
@@ -39,6 +43,18 @@ public final class YBBackupUtil {
 
   public static void setMasterAddresses(String addresses) {
     masterAddresses = addresses;
+  }
+
+  public static void setTSWebAddresses(String hostsAndPorts) {
+    tsWebHostsAndPorts = hostsAndPorts;
+  }
+
+  public static void setTSAddresses(Map<HostAndPort, MiniYBDaemon> tserversMap) {
+    String hostsAndPorts = "";
+    for (MiniYBDaemon tserver : tserversMap.values()) {
+      hostsAndPorts += (hostsAndPorts.isEmpty() ? "" : ",") + tserver.getWebHostAndPort();
+    }
+    setTSWebAddresses(hostsAndPorts);
   }
 
   public static String runProcess(List<String> args, int timeoutSeconds) throws Exception {
@@ -104,6 +120,10 @@ public final class YBBackupUtil {
       processCommand.add("--ysql_port=" + postgresContactPoint.getPort());
     }
 
+    if (tsWebHostsAndPorts != null) {
+      processCommand.add("--ts_web_hosts_ports=" + tsWebHostsAndPorts);
+    }
+
     if (!TestUtils.IS_LINUX) {
       processCommand.add("--mac");
       // Temporary flag to get more detailed log while the tests are failing on MAC: issue #4924.
@@ -130,10 +150,14 @@ public final class YBBackupUtil {
   }
 
   public static void runYbBackupCreate(String... args) throws Exception {
+    runYbBackupCreate(Arrays.asList(args));
+  }
+
+  public static void runYbBackupCreate(List<String> args) throws Exception {
     List<String> processCommand = new ArrayList<String>(Arrays.asList(
         "--backup_location", getTempBackupDir(),
         "create"));
-    processCommand.addAll(Arrays.asList(args));
+    processCommand.addAll(args);
     final String output = runYbBackup(processCommand);
     JSONObject json = new JSONObject(output);
     final String url = json.getString("snapshot_url");
@@ -141,10 +165,14 @@ public final class YBBackupUtil {
   }
 
   public static void runYbBackupRestore(String... args) throws Exception {
+    runYbBackupRestore(Arrays.asList(args));
+  }
+
+  public static void runYbBackupRestore(List<String> args) throws Exception {
     List<String> processCommand = new ArrayList<String>(Arrays.asList(
         "--backup_location", getTempBackupDir(),
         "restore"));
-    processCommand.addAll(Arrays.asList(args));
+    processCommand.addAll(args);
     final String output = runYbBackup(processCommand);
     JSONObject json = new JSONObject(output);
     final boolean resultOk = json.getBoolean("success");
@@ -164,8 +192,7 @@ public final class YBBackupUtil {
 
     processCommand.addAll(Arrays.asList(args));
     final String output = runProcess(processCommand, defaultYbBackupTimeoutInSeconds);
-    LOG.info("yb_backup output: " + output);
-
+    LOG.info("yb-admin output: " + output);
     return output;
   }
 
@@ -177,6 +204,5 @@ public final class YBBackupUtil {
                  .filter(line -> !line.startsWith("Tablet-UUID"))
                  .map(line -> line.split(" ")[0])
                  .collect(Collectors.toList());
-
   }
 }

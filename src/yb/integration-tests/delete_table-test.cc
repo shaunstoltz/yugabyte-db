@@ -32,27 +32,40 @@
 
 #include <memory>
 #include <string>
-#include <unordered_map>
 #include <thread>
 
 #include <boost/optional.hpp>
-#include <glog/stl_logging.h>
 #include <gtest/gtest.h>
 
 #include "yb/client/client-test-util.h"
+#include "yb/client/schema.h"
 #include "yb/client/table_creator.h"
 #include "yb/client/yb_table_name.h"
+
+#include "yb/common/partition.h"
+#include "yb/common/wire_protocol.h"
 #include "yb/common/wire_protocol-test-util.h"
+
 #include "yb/gutil/stl_util.h"
 #include "yb/gutil/strings/split.h"
 #include "yb/gutil/strings/substitute.h"
+
 #include "yb/integration-tests/cluster_verifier.h"
 #include "yb/integration-tests/external_mini_cluster-itest-base.h"
 #include "yb/integration-tests/test_workload.h"
+
 #include "yb/master/master_defaults.h"
+#include "yb/master/master_client.proxy.h"
+
+#include "yb/rpc/rpc_controller.h"
+
 #include "yb/tablet/tablet.pb.h"
+
+#include "yb/tserver/tserver_admin.proxy.h"
 #include "yb/tserver/tserver.pb.h"
+
 #include "yb/util/curl_util.h"
+#include "yb/util/status_log.h"
 #include "yb/util/subprocess.h"
 
 using yb::client::YBClient;
@@ -64,6 +77,7 @@ using yb::client::YBTableName;
 using yb::consensus::CONSENSUS_CONFIG_COMMITTED;
 using yb::consensus::ConsensusMetadataPB;
 using yb::consensus::ConsensusStatePB;
+using yb::consensus::PeerMemberType;
 using yb::consensus::RaftPeerPB;
 using yb::itest::TServerDetails;
 using yb::tablet::TABLET_DATA_COPYING;
@@ -287,7 +301,8 @@ Status DeleteTableTest::ListAllLiveTabletServersRegisteredWithMaster(const MonoD
     int leader_idx;
     RETURN_NOT_OK(cluster_->GetLeaderMasterIndex(&leader_idx));
 
-    RETURN_NOT_OK(cluster_->master_proxy(leader_idx)->ListTabletServers(req, &resp, &rpc));
+    auto proxy = cluster_->GetMasterProxy<master::MasterClusterProxy>(leader_idx);
+    RETURN_NOT_OK(proxy.ListTabletServers(req, &resp, &rpc));
 
     for (const auto& nodes : resp.servers()) {
       if (nodes.alive()) {
@@ -369,7 +384,8 @@ TEST_F(DeleteTableTest, TestDeleteEmptyTable) {
     master::GetTabletLocationsResponsePB resp;
     rpc.set_timeout(MonoDelta::FromSeconds(10));
     req.add_tablet_ids()->assign(tablet_id);
-    ASSERT_OK(cluster_->master_proxy()->GetTabletLocations(req, &resp, &rpc));
+    ASSERT_OK(cluster_->GetMasterProxy<master::MasterClientProxy>().GetTabletLocations(
+        req, &resp, &rpc));
     SCOPED_TRACE(resp.DebugString());
     ASSERT_EQ(1, resp.errors_size());
     ASSERT_STR_CONTAINS(resp.errors(0).ShortDebugString(), "code: NOT_FOUND");
@@ -592,7 +608,8 @@ TEST_F(DeleteTableTest, TestAutoTombstoneAfterCrashDuringRemoteBootstrap) {
   string leader_uuid = GetLeaderUUID(cluster_->tablet_server(1)->uuid(), tablet_id);
   TServerDetails* leader = DCHECK_NOTNULL(ts_map_[leader_uuid].get());
   TServerDetails* ts = ts_map_[cluster_->tablet_server(kTsIndex)->uuid()].get();
-  ASSERT_OK(itest::AddServer(leader, tablet_id, ts, RaftPeerPB::PRE_VOTER, boost::none, timeout));
+  ASSERT_OK(itest::AddServer(
+      leader, tablet_id, ts, PeerMemberType::PRE_VOTER, boost::none, timeout));
   ASSERT_OK(cluster_->WaitForTSToCrash(kTsIndex));
 
   // The superblock should be in TABLET_DATA_COPYING state on disk.
@@ -640,6 +657,7 @@ TEST_F(DeleteTableTest, TestAutoTombstoneAfterRemoteBootstrapRemoteFails) {
 
   // Start a workload on the cluster, and run it for a little while.
   TestWorkload workload(cluster_.get());
+  workload.set_sequential_write(true);
   workload.Setup();
   ASSERT_OK(inspect_->WaitForReplicaCount(2));
 
@@ -671,7 +689,8 @@ TEST_F(DeleteTableTest, TestAutoTombstoneAfterRemoteBootstrapRemoteFails) {
   ASSERT_OK(cluster_->tablet_server(kTsIndex)->Restart());
   TServerDetails* leader = ts_map_[leader_uuid].get();
   TServerDetails* ts = ts_map_[cluster_->tablet_server(0)->uuid()].get();
-  ASSERT_OK(itest::AddServer(leader, tablet_id, ts, RaftPeerPB::PRE_VOTER, boost::none, timeout));
+  ASSERT_OK(itest::AddServer(
+      leader, tablet_id, ts, PeerMemberType::PRE_VOTER, boost::none, timeout));
   ASSERT_OK(cluster_->WaitForTSToCrash(leader_index));
 
   // The tablet server will detect that the leader failed, and automatically
@@ -707,7 +726,7 @@ TEST_F(DeleteTableTest, TestAutoTombstoneAfterRemoteBootstrapRemoteFails) {
   ClusterVerifier cluster_verifier(cluster_.get());
   ASSERT_NO_FATALS(cluster_verifier.CheckCluster());
   ASSERT_NO_FATALS(cluster_verifier.CheckRowCount(workload.table_name(), ClusterVerifier::AT_LEAST,
-                            workload.rows_inserted()));
+                                                  workload.rows_inserted()));
 
   // For now there is no way to know if the server has finished its remote bootstrap (by verifying
   // that its role has changed in its consensus object). As a workaround, sleep for 10 seconds
@@ -1049,7 +1068,7 @@ vector<string> ListOpenFiles(pid_t pid) {
   return lines;
 }
 
-int PrintOpenTabletFiles(pid_t pid, const string& tablet_id) {
+size_t PrintOpenTabletFiles(pid_t pid, const string& tablet_id) {
   vector<string> lines = ListOpenFiles(pid);
   vector<const string*> wal_lines = Grep(tablet_id, lines);
   LOG(INFO) << "There are " << wal_lines.size() << " open WAL files for pid " << pid << ":";
@@ -1181,7 +1200,8 @@ TEST_F(DeleteTableTest, TestRemoveUnknownTablets) {
     req.add_tablet_ids()->assign(tablet_id);
     int leader_idx;
     ASSERT_OK(cluster_->GetLeaderMasterIndex(&leader_idx));
-    ASSERT_OK(cluster_->master_proxy(leader_idx)->GetTabletLocations(req, &resp, &rpc));
+    ASSERT_OK(cluster_->GetMasterProxy<master::MasterClientProxy>(leader_idx).GetTabletLocations(
+        req, &resp, &rpc));
     SCOPED_TRACE(resp.DebugString());
     ASSERT_EQ(1, resp.errors_size());
     ASSERT_STR_CONTAINS(resp.errors(0).ShortDebugString(), "code: NOT_FOUND");
@@ -1343,7 +1363,8 @@ TEST_P(DeleteTableTombstonedParamTest, TestTabletTombstone) {
   ASSERT_OK(cluster_->SetFlag(cluster_->tablet_server(kTsIndex), fault_flag, "1.0"));
   tablet_id = tablets[1].tablet_status().tablet_id();
   LOG(INFO) << "Tombstoning second tablet " << tablet_id << "...";
-  ignore_result(itest::DeleteTablet(ts, tablet_id, TABLET_DATA_TOMBSTONED, boost::none, timeout));
+  WARN_NOT_OK(itest::DeleteTablet(ts, tablet_id, TABLET_DATA_TOMBSTONED, boost::none, timeout),
+              "Delete tablet failed");
   ASSERT_OK(cluster_->WaitForTSToCrash(kTsIndex));
 
   // Restart the tablet server and wait for the WALs to be deleted and for the

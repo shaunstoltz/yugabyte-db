@@ -35,13 +35,15 @@
 #include <memory>
 #include <string>
 
-#include "yb/common/wire_protocol.pb.h"
 #include "yb/gutil/macros.h"
 #include "yb/gutil/ref_counted.h"
-#include "yb/rpc/service_if.h"
+
 #include "yb/server/server_base_options.h"
 #include "yb/server/webserver.h"
-#include "yb/util/status.h"
+
+#include "yb/util/metrics_fwd.h"
+#include "yb/util/status_fwd.h"
+#include "yb/util/countdown_latch.h"
 
 namespace yb {
 
@@ -74,6 +76,9 @@ class RpcServerBase {
   // FATALs if the server is not started.
   Endpoint first_rpc_address() const;
 
+  // Return the RPC addresses that this server has bound to.
+  const std::vector<Endpoint>& rpc_addresses() const;
+
   // Return the instance identifier of this server.
   // This may not be called until after the server is Initted.
   const NodeInstancePB& instance_pb() const;
@@ -92,9 +97,7 @@ class RpcServerBase {
   // Return a PB describing the status of the server (version info, bound ports, etc)
   virtual void GetStatusPB(ServerStatusPB* status) const;
 
-  CloudInfoPB MakeCloudInfoPB() const {
-    return options_.MakeCloudInfoPB();
-  }
+  CloudInfoPB MakeCloudInfoPB() const;
 
   const ServerBaseOptions& options() const {
     return options_;
@@ -107,7 +110,8 @@ class RpcServerBase {
   RpcServerBase(std::string name,
                 const ServerBaseOptions& options,
                 const std::string& metrics_namespace,
-                std::shared_ptr<MemTracker> mem_tracker);
+                std::shared_ptr<MemTracker> mem_tracker,
+                const scoped_refptr<Clock>& clock = nullptr);
   virtual ~RpcServerBase();
 
   CHECKED_STATUS Init();
@@ -129,6 +133,7 @@ class RpcServerBase {
   std::unique_ptr<rpc::ProxyCache> proxy_cache_;
 
   scoped_refptr<Clock> clock_;
+  bool external_clock_ = false;
 
   // The instance identifier of this server.
   std::unique_ptr<NodeInstancePB> instance_pb_;
@@ -177,7 +182,8 @@ class RpcAndWebServerBase : public RpcServerBase {
   RpcAndWebServerBase(
       std::string name, const ServerBaseOptions& options,
       const std::string& metrics_namespace,
-      std::shared_ptr<MemTracker> mem_tracker);
+      std::shared_ptr<MemTracker> mem_tracker,
+      const scoped_refptr<Clock>& clock = nullptr);
   virtual ~RpcAndWebServerBase();
 
   virtual Status HandleDebugPage(const Webserver::WebRequest& req, Webserver::WebResponse* resp);
@@ -186,8 +192,8 @@ class RpcAndWebServerBase : public RpcServerBase {
 
   virtual CHECKED_STATUS DisplayRpcIcons(std::stringstream* output);
 
-  static void DisplayIconTile(std::stringstream* output, const string icon, const string caption,
-                              const string url);
+  static void DisplayIconTile(std::stringstream* output, const std::string icon,
+                              const std::string caption, const std::string url);
 
   CHECKED_STATUS Init();
   CHECKED_STATUS Start();
@@ -211,12 +217,12 @@ std::shared_ptr<MemTracker> CreateMemTrackerForServer();
 YB_STRONGLY_TYPED_BOOL(Private);
 
 // Returns public/private address for test server with specified index.
-std::string TEST_RpcAddress(int index, Private priv);
+std::string TEST_RpcAddress(size_t index, Private priv);
 // Returns bind endpoint for test server with specified index and specified port.
-std::string TEST_RpcBindEndpoint(int index, uint16_t port);
+std::string TEST_RpcBindEndpoint(size_t index, uint16_t port);
 
 // Sets up connectivity in test for specified messenger of server with index.
-void TEST_SetupConnectivity(rpc::Messenger* messenger, int index);
+void TEST_SetupConnectivity(rpc::Messenger* messenger, size_t index);
 // Isolates specific messenger, i.e. breaks any of this messengers connections with all other
 // servers.
 void TEST_Isolate(rpc::Messenger* messenger);

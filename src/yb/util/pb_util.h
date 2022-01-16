@@ -41,8 +41,8 @@
 #include <gtest/gtest_prod.h>
 
 #include "yb/util/faststring.h"
-#include "yb/util/status.h"
-#include "yb/util/result.h"
+#include "yb/util/slice.h"
+#include "yb/util/status_fwd.h"
 
 namespace google {
 namespace protobuf {
@@ -96,7 +96,7 @@ bool ParseFromSequentialFile(MessageLite *msg, SequentialFile *rfile);
 
 // Similar to MessageLite::ParseFromArray, with the difference that it returns
 // Status::kCorruption if the message could not be parsed.
-Status ParseFromArray(MessageLite* msg, const uint8_t* data, uint32_t length);
+Status ParseFromArray(MessageLite* msg, const uint8_t* data, size_t length);
 
 template<class T>
 Result<T> ParseFromSlice(const Slice& slice) {

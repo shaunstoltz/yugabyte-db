@@ -13,11 +13,25 @@
 
 #include "yb/integration-tests/ts_itest-base.h"
 
+#include "yb/client/client.h"
+#include "yb/client/schema.h"
+#include "yb/client/table.h"
+
 #include "yb/gutil/strings/split.h"
 
 #include "yb/integration-tests/cluster_verifier.h"
 #include "yb/integration-tests/external_mini_cluster.h"
 #include "yb/integration-tests/external_mini_cluster_fs_inspector.h"
+
+#include "yb/master/master_client.proxy.h"
+#include "yb/master/master_cluster.proxy.h"
+
+#include "yb/rpc/rpc_controller.h"
+
+#include "yb/server/server_base.proxy.h"
+
+#include "yb/util/opid.h"
+#include "yb/util/status_log.h"
 
 DEFINE_string(ts_flags, "", "Flags to pass through to tablet servers");
 DEFINE_string(master_flags, "", "Flags to pass through to masters");
@@ -91,9 +105,7 @@ void TabletServerIntegrationTestBase::CreateCluster(
 // in 'tablet_servers_'.
 void TabletServerIntegrationTestBase::CreateTSProxies() {
   CHECK(tablet_servers_.empty());
-  CHECK_OK(itest::CreateTabletServerMap(cluster_->GetLeaderMasterProxy().get(),
-                                        proxy_cache_.get(),
-                                        &tablet_servers_));
+  tablet_servers_ = CHECK_RESULT(itest::CreateTabletServerMap(cluster_.get()));
 }
 
 // Waits that all replicas for a all tablets of 'kTableName' table are online
@@ -109,7 +121,8 @@ void TabletServerIntegrationTestBase::WaitForReplicasAndUpdateLocations() {
     rpc::RpcController controller;
     kTableName.SetIntoTableIdentifierPB(req.mutable_table());
     controller.set_timeout(MonoDelta::FromSeconds(1));
-    CHECK_OK(cluster_->GetLeaderMasterProxy()->GetTableLocations(req, &resp, &controller));
+    CHECK_OK(cluster_->GetLeaderMasterProxy<master::MasterClientProxy>().GetTableLocations(
+        req, &resp, &controller));
     CHECK_OK(controller.status());
     CHECK(!resp.has_error()) << "Response had an error: " << resp.error().ShortDebugString();
 
@@ -199,11 +212,12 @@ Status TabletServerIntegrationTestBase::GetTabletLeaderUUIDFromMaster(const std:
   controller.set_timeout(MonoDelta::FromMilliseconds(100));
   kTableName.SetIntoTableIdentifierPB(req.mutable_table());
 
-  RETURN_NOT_OK(cluster_->master_proxy()->GetTableLocations(req, &resp, &controller));
+  RETURN_NOT_OK(cluster_->GetMasterProxy<master::MasterClientProxy>().GetTableLocations(
+      req, &resp, &controller));
   for (const master::TabletLocationsPB& loc : resp.tablet_locations()) {
     if (loc.tablet_id() == tablet_id) {
       for (const master::TabletLocationsPB::ReplicaPB& replica : loc.replicas()) {
-        if (replica.role() == consensus::RaftPeerPB::LEADER) {
+        if (replica.role() == PeerRole::LEADER) {
           *leader_uuid = replica.ts_info().permanent_uuid();
           return Status::OK();
         }
@@ -250,7 +264,8 @@ void TabletServerIntegrationTestBase::WaitForTSAndReplicas() {
 
 // Removes a set of servers from the replicas_ list.
 // Handy for controlling who to validate against after killing servers.
-void TabletServerIntegrationTestBase::PruneFromReplicas(const unordered_set<std::string>& uuids) {
+void TabletServerIntegrationTestBase::PruneFromReplicas(
+    const std::unordered_set<std::string>& uuids) {
   auto iter = tablet_replicas_.begin();
   while (iter != tablet_replicas_.end()) {
     if (uuids.count((*iter).second->instance_id.permanent_uuid()) != 0) {
@@ -341,8 +356,8 @@ Status TabletServerIntegrationTestBase::RestartServerWithUUID(const std::string&
 // Since we're fault-tolerant we might mask when a tablet server is
 // dead. This returns Status::IllegalState() if fewer than 'num_tablet_servers'
 // are alive.
-Status TabletServerIntegrationTestBase::CheckTabletServersAreAlive(int num_tablet_servers) {
-  int live_count = 0;
+Status TabletServerIntegrationTestBase::CheckTabletServersAreAlive(size_t num_tablet_servers) {
+  size_t live_count = 0;
   std::string error = strings::Substitute("Fewer than $0 TabletServers were alive. Dead TSs: ",
                                           num_tablet_servers);
   rpc::RpcController controller;
@@ -410,11 +425,15 @@ void TabletServerIntegrationTestBase::BuildAndStart(
   tablet_id_ = (*tablet_replicas_.begin()).first;
 }
 
-void TabletServerIntegrationTestBase::AssertAllReplicasAgree(int expected_result_count) {
+void TabletServerIntegrationTestBase::AssertAllReplicasAgree(size_t expected_result_count) {
   ClusterVerifier cluster_verifier(cluster_.get());
   ASSERT_NO_FATALS(cluster_verifier.CheckCluster());
-  ASSERT_NO_FATALS(cluster_verifier.CheckRowCount(kTableName, ClusterVerifier::EXACTLY,
-      expected_result_count));
+  ASSERT_NO_FATALS(cluster_verifier.CheckRowCount(
+      kTableName, ClusterVerifier::EXACTLY, expected_result_count));
+}
+
+client::YBTableType TabletServerIntegrationTestBase::table_type() {
+  return client::YBTableType::YQL_TABLE_TYPE;
 }
 
 }  // namespace tserver

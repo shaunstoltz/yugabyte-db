@@ -16,33 +16,48 @@
 #include <unordered_set>
 #include <google/protobuf/util/message_differencer.h>
 
-#include "yb/master/catalog_manager.h"
-#include "yb/master/catalog_manager-internal.h"
 #include "yb/master/catalog_entity_info.h"
+#include "yb/master/catalog_manager-internal.h"
+#include "yb/master/cdc_consumer_registry_service.h"
 #include "yb/master/cdc_rpc_tasks.h"
 #include "yb/master/cluster_balance.h"
+#include "yb/master/master.h"
+#include "yb/master/master_backup.pb.h"
+#include "yb/master/master_error.h"
 
+#include "yb/cdc/cdc_consumer.pb.h"
 #include "yb/cdc/cdc_service.h"
+
 #include "yb/client/client-internal.h"
 #include "yb/client/schema.h"
 #include "yb/client/session.h"
 #include "yb/client/table.h"
-#include "yb/client/table_handle.h"
 #include "yb/client/table_alterer.h"
+#include "yb/client/table_handle.h"
+#include "yb/client/table_info.h"
 #include "yb/client/yb_op.h"
+#include "yb/client/yb_table_name.h"
+
 #include "yb/common/common.pb.h"
 #include "yb/common/entity_ids.h"
 #include "yb/common/ql_name.h"
+#include "yb/common/ql_type.h"
+#include "yb/common/schema.h"
 #include "yb/common/wire_protocol.h"
 #include "yb/consensus/consensus.h"
 
 #include "yb/docdb/consensus_frontier.h"
+#include "yb/docdb/doc_write_batch.h"
 
 #include "yb/gutil/bind.h"
+#include "yb/gutil/casts.h"
 #include "yb/gutil/strings/join.h"
 #include "yb/gutil/strings/substitute.h"
-#include "yb/master/master.pb.h"
+#include "yb/master/master_client.pb.h"
+#include "yb/master/master_ddl.pb.h"
 #include "yb/master/master_defaults.h"
+#include "yb/master/master_heartbeat.pb.h"
+#include "yb/master/master_replication.pb.h"
 #include "yb/master/master_util.h"
 #include "yb/master/sys_catalog.h"
 #include "yb/master/sys_catalog-internal.h"
@@ -50,11 +65,14 @@
 #include "yb/master/async_rpc_tasks.h"
 #include "yb/master/encryption_manager.h"
 #include "yb/master/restore_sys_catalog_state.h"
+#include "yb/master/scoped_leader_shared_lock.h"
+#include "yb/master/scoped_leader_shared_lock-internal.h"
 
 #include "yb/rpc/messenger.h"
 
-#include "yb/tablet/tablet_snapshots.h"
 #include "yb/tablet/operations/snapshot_operation.h"
+#include "yb/tablet/tablet_metadata.h"
+#include "yb/tablet/tablet_snapshots.h"
 
 #include "yb/tserver/backup.proxy.h"
 #include "yb/tserver/service_util.h"
@@ -62,13 +80,17 @@
 #include "yb/util/cast.h"
 #include "yb/util/date_time.h"
 #include "yb/util/flag_tags.h"
+#include "yb/util/format.h"
+#include "yb/util/logging.h"
+#include "yb/util/random_util.h"
 #include "yb/util/scope_exit.h"
 #include "yb/util/service_util.h"
 #include "yb/util/status.h"
+#include "yb/util/status_format.h"
+#include "yb/util/status_log.h"
 #include "yb/util/tostring.h"
 #include "yb/util/string_util.h"
-#include "yb/util/random_util.h"
-#include "yb/cdc/cdc_consumer.pb.h"
+#include "yb/util/trace.h"
 
 using namespace std::literals;
 using namespace std::placeholders;
@@ -81,9 +103,9 @@ using google::protobuf::RepeatedPtrField;
 using google::protobuf::util::MessageDifferencer;
 using strings::Substitute;
 
-DEFINE_uint64(cdc_state_table_num_tablets, 0,
-    "Number of tablets to use when creating the CDC state table."
-    "0 to use the same default num tablets as for regular tables.");
+DEFINE_int32(cdc_state_table_num_tablets, 0,
+             "Number of tablets to use when creating the CDC state table. "
+             "0 to use the same default num tablets as for regular tables.");
 
 DEFINE_int32(cdc_wal_retention_time_secs, 4 * 3600,
              "WAL retention time in seconds to be used for tables for which a CDC stream was "
@@ -96,6 +118,9 @@ TAG_FLAG(enable_transaction_snapshots, hidden);
 TAG_FLAG(enable_transaction_snapshots, advanced);
 TAG_FLAG(enable_transaction_snapshots, runtime);
 
+DEFINE_test_flag(bool, disable_cdc_state_insert_on_setup, false,
+                 "Disable inserting new entries into cdc state as part of the setup flow.");
+
 namespace yb {
 
 using rpc::RpcContext;
@@ -103,6 +128,30 @@ using pb_util::ParseFromSlice;
 
 namespace master {
 namespace enterprise {
+
+namespace {
+
+CHECKED_STATUS CheckStatus(const Status& status, const char* action) {
+  if (status.ok()) {
+    return status;
+  }
+
+  const Status s = status.CloneAndPrepend(std::string("An error occurred while ") + action);
+  LOG(WARNING) << s;
+  return s;
+}
+
+CHECKED_STATUS CheckLeaderStatus(const Status& status, const char* action) {
+  return CheckIfNoLongerLeader(CheckStatus(status, action));
+}
+
+template<class RespClass>
+CHECKED_STATUS CheckLeaderStatusAndSetupError(
+    const Status& status, const char* action, RespClass* resp) {
+  return CheckIfNoLongerLeaderAndSetupError(CheckStatus(status, action), resp);
+}
+
+} // namespace
 
 ////////////////////////////////////////////////////////////
 // Snapshot Loader
@@ -237,7 +286,13 @@ class UniverseReplicationLoader : public Visitor<PersistentUniverseReplicationIn
 
     // Also keep track of consumer tables.
     for (const auto& table : metadata.validated_tables()) {
-      catalog_manager_->xcluster_consumer_tables_set_.insert(table.second);
+      CDCStreamId stream_id = FindWithDefault(metadata.table_streams(), table.first, "");
+      if (stream_id.empty()) {
+        LOG(WARNING) << "Unable to find stream id for table: " << table.first;
+        continue;
+      }
+      catalog_manager_->xcluster_consumer_tables_to_stream_map_[table.second].emplace(
+          metadata.producer_id(), stream_id);
     }
 
     LOG(INFO) << "Loaded metadata for universe replication " << ri->ToString();
@@ -282,7 +337,7 @@ Status CatalogManager::RunLoaders(int64_t term) {
 
   // Clear universe replication map.
   universe_replication_map_.clear();
-  xcluster_consumer_tables_set_.clear();
+  xcluster_consumer_tables_to_stream_map_.clear();
 
   LOG_WITH_FUNC(INFO) << "Loading snapshots into memory.";
   unique_ptr<SnapshotLoader> snapshot_loader(new SnapshotLoader(this));
@@ -348,7 +403,7 @@ Status CatalogManager::CreateNonTransactionAwareSnapshot(
     }
 
     // Create a new snapshot UUID.
-    snapshot_id = GenerateIdUnlocked(SysRowEntry::SNAPSHOT);
+    snapshot_id = GenerateIdUnlocked(SysRowEntryType::SNAPSHOT);
   }
 
   vector<scoped_refptr<TabletInfo>> all_tablets;
@@ -437,6 +492,14 @@ Result<SysRowEntries> CatalogManager::CollectEntries(
   return entries;
 }
 
+Result<SysRowEntries> CatalogManager::CollectEntriesForSnapshot(
+    const google::protobuf::RepeatedPtrField<TableIdentifierPB>& tables) {
+  return CollectEntries(
+      tables,
+      CollectFlags{CollectFlag::kAddIndexes, CollectFlag::kIncludeParentColocatedTable,
+                   CollectFlag::kSucceedIfCreateInProgress});
+}
+
 server::Clock* CatalogManager::Clock() {
   return master_->clock();
 }
@@ -515,7 +578,7 @@ Status CatalogManager::ListSnapshots(const ListSnapshotsRequestPB* req,
         // Setup BackupRowEntryPB fields.
         // Set BackupRowEntryPB::pg_schema_name for YSQL table to disambiguate in case tables
         // in different schema have same name.
-        if (entry.type() == SysRowEntry::TABLE) {
+        if (entry.type() == SysRowEntryType::TABLE) {
           TRACE("Looking up table");
           scoped_refptr<TableInfo> table_info = FindPtrOrNull(*table_ids_map_, entry.id());
           if (table_info == nullptr) {
@@ -642,7 +705,7 @@ Status CatalogManager::RestoreNonTransactionAwareSnapshot(const string& snapshot
 
 Status CatalogManager::RestoreEntry(const SysRowEntry& entry, const SnapshotId& snapshot_id) {
   switch (entry.type()) {
-    case SysRowEntry::NAMESPACE: { // Restore NAMESPACES.
+    case SysRowEntryType::NAMESPACE: { // Restore NAMESPACES.
       TRACE("Looking up namespace");
       scoped_refptr<NamespaceInfo> ns = FindPtrOrNull(namespace_ids_map_, entry.id());
       if (ns == nullptr) {
@@ -655,7 +718,7 @@ Status CatalogManager::RestoreEntry(const SysRowEntry& entry, const SnapshotId& 
       }
       break;
     }
-    case SysRowEntry::TABLE: { // Restore TABLES.
+    case SysRowEntryType::TABLE: { // Restore TABLES.
       TRACE("Looking up table");
       scoped_refptr<TableInfo> table = FindPtrOrNull(*table_ids_map_, entry.id());
       if (table == nullptr) {
@@ -668,7 +731,7 @@ Status CatalogManager::RestoreEntry(const SysRowEntry& entry, const SnapshotId& 
       }
       break;
     }
-    case SysRowEntry::TABLET: { // Restore TABLETS.
+    case SysRowEntryType::TABLET: { // Restore TABLETS.
       TRACE("Looking up tablet");
       scoped_refptr<TabletInfo> tablet = FindPtrOrNull(*tablet_map_, entry.id());
       if (tablet == nullptr) {
@@ -752,7 +815,7 @@ Status CatalogManager::DeleteNonTransactionAwareSnapshot(const SnapshotId& snaps
 
   // Send DeleteSnapshot requests to all TServers (one tablet - one request).
   for (const SysRowEntry& entry : snapshot_pb.entries()) {
-    if (entry.type() == SysRowEntry::TABLET) {
+    if (entry.type() == SysRowEntryType::TABLET) {
       TRACE("Looking up tablet");
       scoped_refptr<TabletInfo> tablet = FindPtrOrNull(*tablet_map_, entry.id());
       if (tablet == nullptr) {
@@ -786,10 +849,10 @@ Status CatalogManager::ImportSnapshotPreprocess(const SnapshotInfoPB& snapshot_p
   for (const BackupRowEntryPB& backup_entry : snapshot_pb.backup_entries()) {
     const SysRowEntry& entry = backup_entry.entry();
     switch (entry.type()) {
-      case SysRowEntry::NAMESPACE: // Recreate NAMESPACE.
+      case SysRowEntryType::NAMESPACE: // Recreate NAMESPACE.
         RETURN_NOT_OK(ImportNamespaceEntry(entry, namespace_map));
         break;
-      case SysRowEntry::TABLE: { // Create TABLE metadata.
+      case SysRowEntryType::TABLE: { // Create TABLE metadata.
           LOG_IF(DFATAL, entry.id().empty()) << "Empty entry id";
           ExternalTableSnapshotData& data = (*tables_data)[entry.id()];
 
@@ -809,21 +872,21 @@ Status CatalogManager::ImportSnapshotPreprocess(const SnapshotInfoPB& snapshot_p
           LOG_IF(DFATAL, data.old_table_id.empty()) << "Not initialized table id";
         }
         break;
-      case SysRowEntry::TABLET: // Preprocess original tablets.
+      case SysRowEntryType::TABLET: // Preprocess original tablets.
         RETURN_NOT_OK(PreprocessTabletEntry(entry, tables_data));
         break;
-      case SysRowEntry::CLUSTER_CONFIG: FALLTHROUGH_INTENDED;
-      case SysRowEntry::REDIS_CONFIG: FALLTHROUGH_INTENDED;
-      case SysRowEntry::UDTYPE: FALLTHROUGH_INTENDED;
-      case SysRowEntry::ROLE: FALLTHROUGH_INTENDED;
-      case SysRowEntry::SYS_CONFIG: FALLTHROUGH_INTENDED;
-      case SysRowEntry::CDC_STREAM: FALLTHROUGH_INTENDED;
-      case SysRowEntry::UNIVERSE_REPLICATION: FALLTHROUGH_INTENDED;
-      case SysRowEntry::SNAPSHOT:  FALLTHROUGH_INTENDED;
-      case SysRowEntry::SNAPSHOT_SCHEDULE: FALLTHROUGH_INTENDED;
-      case SysRowEntry::DDL_LOG_ENTRY: FALLTHROUGH_INTENDED;
-      case SysRowEntry::UNKNOWN:
-        FATAL_INVALID_ENUM_VALUE(SysRowEntry::Type, entry.type());
+      case SysRowEntryType::CLUSTER_CONFIG: FALLTHROUGH_INTENDED;
+      case SysRowEntryType::REDIS_CONFIG: FALLTHROUGH_INTENDED;
+      case SysRowEntryType::UDTYPE: FALLTHROUGH_INTENDED;
+      case SysRowEntryType::ROLE: FALLTHROUGH_INTENDED;
+      case SysRowEntryType::SYS_CONFIG: FALLTHROUGH_INTENDED;
+      case SysRowEntryType::CDC_STREAM: FALLTHROUGH_INTENDED;
+      case SysRowEntryType::UNIVERSE_REPLICATION: FALLTHROUGH_INTENDED;
+      case SysRowEntryType::SNAPSHOT:  FALLTHROUGH_INTENDED;
+      case SysRowEntryType::SNAPSHOT_SCHEDULE: FALLTHROUGH_INTENDED;
+      case SysRowEntryType::DDL_LOG_ENTRY: FALLTHROUGH_INTENDED;
+      case SysRowEntryType::UNKNOWN:
+        FATAL_INVALID_ENUM_VALUE(SysRowEntryType, entry.type());
     }
   }
 
@@ -838,7 +901,7 @@ Status CatalogManager::ImportSnapshotCreateObject(const SnapshotInfoPB& snapshot
   // Create ONLY TABLES or ONLY INDEXES in accordance to the argument.
   for (const BackupRowEntryPB& backup_entry : snapshot_pb.backup_entries()) {
     const SysRowEntry& entry = backup_entry.entry();
-    if (entry.type() == SysRowEntry::TABLE) {
+    if (entry.type() == SysRowEntryType::TABLE) {
       ExternalTableSnapshotData& data = (*tables_data)[entry.id()];
       if ((create_objects == CreateObjects::kOnlyIndexes) == data.is_index()) {
         RETURN_NOT_OK(ImportTableEntry(*namespace_map, *tables_data, &data));
@@ -854,7 +917,7 @@ Status CatalogManager::ImportSnapshotWaitForTables(const SnapshotInfoPB& snapsho
                                                    ExternalTableSnapshotDataMap* tables_data) {
   for (const BackupRowEntryPB& backup_entry : snapshot_pb.backup_entries()) {
     const SysRowEntry& entry = backup_entry.entry();
-    if (entry.type() == SysRowEntry::TABLE) {
+    if (entry.type() == SysRowEntryType::TABLE) {
       ExternalTableSnapshotData& data = (*tables_data)[entry.id()];
       if (!data.is_index()) {
         RETURN_NOT_OK(WaitForCreateTableToFinish(data.new_table_id));
@@ -870,7 +933,7 @@ Status CatalogManager::ImportSnapshotProcessTablets(const SnapshotInfoPB& snapsh
                                                     ExternalTableSnapshotDataMap* tables_data) {
   for (const BackupRowEntryPB& backup_entry : snapshot_pb.backup_entries()) {
     const SysRowEntry& entry = backup_entry.entry();
-    if (entry.type() == SysRowEntry::TABLET) {
+    if (entry.type() == SysRowEntryType::TABLET) {
       // Create tablets IDs map.
       RETURN_NOT_OK(ImportTabletEntry(entry, tables_data));
     }
@@ -1011,7 +1074,7 @@ Status CatalogManager::IsEncryptionEnabled(const IsEncryptionEnabledRequestPB* r
 
 Status CatalogManager::ImportNamespaceEntry(const SysRowEntry& entry,
                                             NamespaceMap* namespace_map) {
-  LOG_IF(DFATAL, entry.type() != SysRowEntry::NAMESPACE)
+  LOG_IF(DFATAL, entry.type() != SysRowEntryType::NAMESPACE)
       << "Unexpected entry type: " << entry.type();
 
   SysNamespaceEntryPB meta = VERIFY_RESULT(ParseFromSlice<SysNamespaceEntryPB>(entry.data()));
@@ -1509,7 +1572,7 @@ Status CatalogManager::ImportTableEntry(const NamespaceMap& namespace_map,
   // However, still do the validation for regular colocated tables.
   if (!is_parent_colocated_table) {
     Schema persisted_schema;
-    int new_num_tablets = 0;
+    size_t new_num_tablets = 0;
     {
       TRACE("Locking table");
       auto table_lock = table->LockForRead();
@@ -1536,20 +1599,41 @@ Status CatalogManager::ImportTableEntry(const NamespaceMap& namespace_map,
       return STATUS(InternalError, msg, MasterError(MasterErrorPB::SNAPSHOT_FAILED));
     }
 
-    if (table_data->num_tablets > 0 && new_num_tablets != table_data->num_tablets) {
-      // TODO(#8229): Also recreate tables besides num tablets mismatching since it is possible for
-      // splits to be off while num tablets matches. For example, [start, 0x777f), [0x777f, end] vs
-      // [start, 0x8000), [0x8000, end]. That particular example may not occur in practice, but the
-      // issue should show up when restoring tablets that have been dynamically split.
+    if (table_data->num_tablets > 0) {
       if (meta.table_type() == TableType::PGSQL_TABLE_TYPE) {
-        RETURN_NOT_OK(RepartitionTable(table, table_data));
-      } else {
-        const string msg = Format(
-            "Wrong number of tablets in created $0 table '$1' in namespace id $2: $3 (expected $4)",
-            TableType_Name(meta.table_type()), meta.name(), new_namespace_id,
-            new_num_tablets, table_data->num_tablets);
-        LOG_WITH_FUNC(WARNING) << msg;
-        return STATUS(InternalError, msg, MasterError(MasterErrorPB::SNAPSHOT_FAILED));
+        bool partitions_match = true;
+        if (new_num_tablets != table_data->num_tablets) {
+          partitions_match = false;
+        } else {
+          // Check if partition boundaries match.  Only check the starts; assume the ends are fine.
+          size_t i = 0;
+          vector<PartitionKey> partition_starts(table_data->num_tablets);
+          for (const auto& partition_pb : table_data->partitions) {
+            partition_starts[i] = partition_pb.partition_key_start();
+            LOG_IF(DFATAL, (i == 0) ? partition_starts[i] != ""
+                                    : partition_starts[i] <= partition_starts[i-1])
+                << "Wrong partition key start: " << b2a_hex(partition_starts[i]);
+            i++;
+          }
+          if (!table->HasPartitions(partition_starts)) {
+            LOG_WITH_FUNC(INFO) << "Partition boundaries mismatch for table " << table->id();
+            partitions_match = false;
+          }
+        }
+
+        if (!partitions_match) {
+          RETURN_NOT_OK(RepartitionTable(table, table_data));
+        }
+      } else { // not PGSQL_TABLE_TYPE
+        if (new_num_tablets != table_data->num_tablets) {
+          const string msg = Format(
+              "Wrong number of tablets in created $0 table '$1' in namespace id $2:"
+              " $3 (expected $4)",
+              TableType_Name(meta.table_type()), meta.name(), new_namespace_id,
+              new_num_tablets, table_data->num_tablets);
+          LOG_WITH_FUNC(WARNING) << msg;
+          return STATUS(InternalError, msg, MasterError(MasterErrorPB::SNAPSHOT_FAILED));
+        }
       }
     }
 
@@ -1629,7 +1713,8 @@ Status CatalogManager::ImportTableEntry(const NamespaceMap& namespace_map,
 
 Status CatalogManager::PreprocessTabletEntry(const SysRowEntry& entry,
                                              ExternalTableSnapshotDataMap* table_map) {
-  LOG_IF(DFATAL, entry.type() != SysRowEntry::TABLET) << "Unexpected entry type: " << entry.type();
+  LOG_IF(DFATAL, entry.type() != SysRowEntryType::TABLET)
+      << "Unexpected entry type: " << entry.type();
 
   SysTabletsEntryPB meta = VERIFY_RESULT(ParseFromSlice<SysTabletsEntryPB>(entry.data()));
 
@@ -1643,7 +1728,8 @@ Status CatalogManager::PreprocessTabletEntry(const SysRowEntry& entry,
 
 Status CatalogManager::ImportTabletEntry(const SysRowEntry& entry,
                                          ExternalTableSnapshotDataMap* table_map) {
-  LOG_IF(DFATAL, entry.type() != SysRowEntry::TABLET) << "Unexpected entry type: " << entry.type();
+  LOG_IF(DFATAL, entry.type() != SysRowEntryType::TABLET)
+      << "Unexpected entry type: " << entry.type();
 
   SysTabletsEntryPB meta = VERIFY_RESULT(ParseFromSlice<SysTabletsEntryPB>(entry.data()));
 
@@ -1751,7 +1837,7 @@ Status CatalogManager::RestoreSysCatalog(
     // Restore the pg_catalog tables.
     const auto* meta = tablet->metadata();
     const auto& pg_yb_catalog_version_schema =
-        VERIFY_RESULT(meta->GetTableInfo(kPgYbCatalogVersionTableId))->schema;
+        *VERIFY_RESULT(meta->GetTableInfo(kPgYbCatalogVersionTableId))->schema;
     RETURN_NOT_OK(state.ProcessPgCatalogRestores(
         pg_yb_catalog_version_schema, doc_db, tablet->doc_db(), &write_batch));
   }
@@ -1775,23 +1861,23 @@ Status CatalogManager::VerifyRestoredObjects(const SnapshotScheduleRestoration& 
   VLOG_WITH_PREFIX(1) << "Objects to restore: " << AsString(objects_to_restore);
   for (const auto& entry : entries.entries()) {
     VLOG_WITH_PREFIX(1)
-        << "Alive " << SysRowEntry::Type_Name(entry.type()) << ": " << entry.id();
+        << "Alive " << SysRowEntryType_Name(entry.type()) << ": " << entry.id();
     auto it = objects_to_restore.find(entry.id());
     if (it == objects_to_restore.end()) {
       return STATUS_FORMAT(IllegalState, "Object $0/$1 present, but should not be restored",
-                           SysRowEntry::Type_Name(entry.type()), entry.id());
+                           SysRowEntryType_Name(entry.type()), entry.id());
     }
     if (it->second != entry.type()) {
       return STATUS_FORMAT(
           IllegalState, "Restored object $0 has wrong type $1, while $2 expected",
-          entry.id(), SysRowEntry::Type_Name(entry.type()), SysRowEntry::Type_Name(it->second));
+          entry.id(), SysRowEntryType_Name(entry.type()), SysRowEntryType_Name(it->second));
     }
     objects_to_restore.erase(it);
   }
   for (const auto& id_and_type : objects_to_restore) {
     return STATUS_FORMAT(
         IllegalState, "Expected to restore $0/$1, but it is not present after restoration",
-        SysRowEntry::Type_Name(id_and_type.second), id_and_type.first);
+        SysRowEntryType_Name(id_and_type.second), id_and_type.first);
   }
   return Status::OK();
 }
@@ -1844,6 +1930,14 @@ void CatalogManager::CleanupHiddenTablets(
             << ", min restore time: " << it->second;
         cleanup = false;
         break;
+      }
+    }
+    if (cleanup) {
+      SharedLock read_lock(mutex_);
+      if (IsTableCdcProducer(*tablet->table())) {
+        // We also need to check if this tablet is being kept for xcluster replication.
+        auto l = tablet->table()->LockForRead();
+        cleanup = hide_hybrid_time.AddSeconds(l->pb.wal_retention_secs()) < master_->clock()->Now();
       }
     }
     if (cleanup) {
@@ -1991,11 +2085,8 @@ void CatalogManager::HandleCreateTabletSnapshotResponse(TabletInfo *tablet, bool
           << " Complete " << num_tablets_complete << " tablets from " << tablet_snapshots->size();
 
   const Status s = sys_catalog_->Upsert(leader_ready_term(), snapshot);
-  if (!s.ok()) {
-    return (void)CheckStatus(s, "updating snapshot in sys-catalog");
-  }
 
-  l.Commit();
+  l.CommitOrWarn(s, "updating snapshot in sys-catalog");
 }
 
 void CatalogManager::HandleRestoreTabletSnapshotResponse(TabletInfo *tablet, bool error) {
@@ -2067,11 +2158,8 @@ void CatalogManager::HandleRestoreTabletSnapshotResponse(TabletInfo *tablet, boo
           << " Complete " << num_tablets_complete << " tablets from " << tablet_snapshots->size();
 
   const Status s = sys_catalog_->Upsert(leader_ready_term(), snapshot);
-  if (!s.ok()) {
-    return (void)CheckStatus(s, "updating snapshot in sys-catalog");
-  }
 
-  l.Commit();
+  l.CommitOrWarn(s, "updating snapshot in sys-catalog");
 }
 
 void CatalogManager::HandleDeleteTabletSnapshotResponse(
@@ -2136,20 +2224,14 @@ void CatalogManager::HandleDeleteTabletSnapshotResponse(
       LOG(WARNING) << "Could not remove snapshot " << snapshot_id << " from map";
     }
 
-    if (!s.ok()) {
-      return (void)CheckStatus(s, "deleting snapshot from sys-catalog");
-    }
+    l.CommitOrWarn(s, "deleting snapshot from sys-catalog");
   } else if (error) {
     l.mutable_data()->pb.set_state(SysSnapshotEntryPB::FAILED);
     LOG(WARNING) << "Failed snapshot " << snapshot->id() << " deletion on tablet " << tablet->id();
 
     const Status s = sys_catalog_->Upsert(leader_ready_term(), snapshot);
-    if (!s.ok()) {
-      return (void)CheckStatus(s, "updating snapshot in sys-catalog");
-    }
+    l.CommitOrWarn(s, "updating snapshot in sys-catalog");
   }
-
-  l.Commit();
 
   VLOG(1) << "Deleting snapshot: " << snapshot->id()
           << " PB: " << l.mutable_data()->pb.DebugString()
@@ -2188,21 +2270,6 @@ void CatalogManager::DumpState(std::ostream* out, bool on_disk_dump) const {
   // TODO: dump snapshots
 }
 
-Status CatalogManager::CheckValidReplicationInfo(const ReplicationInfoPB& replication_info,
-                                                 const TSDescriptorVector& all_ts_descs,
-                                                 const vector<Partition>& partitions,
-                                                 CreateTableResponsePB* resp) {
-  TSDescriptorVector ts_descs;
-  GetTsDescsFromPlacementInfo(replication_info.live_replicas(), all_ts_descs, &ts_descs);
-  RETURN_NOT_OK(super::CheckValidPlacementInfo(replication_info.live_replicas(), ts_descs,
-                                               partitions, resp));
-  for (int i = 0; i < replication_info.read_replicas_size(); i++) {
-    GetTsDescsFromPlacementInfo(replication_info.read_replicas(i), all_ts_descs, &ts_descs);
-    RETURN_NOT_OK(super::CheckValidPlacementInfo(replication_info.read_replicas(i), ts_descs,
-                                                 partitions, resp));
-  }
-  return Status::OK();
-}
 
 Status CatalogManager::HandlePlacementUsingReplicationInfo(
     const ReplicationInfoPB& replication_info,
@@ -2212,12 +2279,12 @@ Status CatalogManager::HandlePlacementUsingReplicationInfo(
   GetTsDescsFromPlacementInfo(replication_info.live_replicas(), all_ts_descs, &ts_descs);
   RETURN_NOT_OK(super::HandlePlacementUsingPlacementInfo(replication_info.live_replicas(),
                                                       ts_descs,
-                                                      consensus::RaftPeerPB::VOTER, config));
+                                                      consensus::PeerMemberType::VOTER, config));
   for (int i = 0; i < replication_info.read_replicas_size(); i++) {
     GetTsDescsFromPlacementInfo(replication_info.read_replicas(i), all_ts_descs, &ts_descs);
     RETURN_NOT_OK(super::HandlePlacementUsingPlacementInfo(replication_info.read_replicas(i),
                                                            ts_descs,
-                                                           consensus::RaftPeerPB::OBSERVER,
+                                                           consensus::PeerMemberType::OBSERVER,
                                                            config));
   }
   return Status::OK();
@@ -2359,16 +2426,17 @@ Status CatalogManager::IsCdcStateTableCreated(IsCreateTableDoneResponsePB* resp)
 
 // Helper class to print a vector of CDCStreamInfo pointers.
 namespace {
-  template<class CDCStreamInfoPointer>
-  std::string JoinStreamsCSVLine(std::vector<CDCStreamInfoPointer> cdc_streams) {
-    std::vector<CDCStreamId> cdc_stream_ids;
-    for (const auto& cdc_stream : cdc_streams) {
-      cdc_stream_ids.push_back(cdc_stream->id());
-    }
-    return JoinCSVLine(cdc_stream_ids);
-  }
-} // namespace
 
+template<class CDCStreamInfoPointer>
+std::string JoinStreamsCSVLine(std::vector<CDCStreamInfoPointer> cdc_streams) {
+  std::vector<CDCStreamId> cdc_stream_ids;
+  for (const auto& cdc_stream : cdc_streams) {
+    cdc_stream_ids.push_back(cdc_stream->id());
+  }
+  return JoinCSVLine(cdc_stream_ids);
+}
+
+} // namespace
 
 Status CatalogManager::DeleteCDCStreamsForTable(const TableId& table_id) {
   return DeleteCDCStreamsForTables({table_id});
@@ -2413,8 +2481,8 @@ std::vector<scoped_refptr<CDCStreamInfo>> CatalogManager::FindCDCStreamsForTable
 
 void CatalogManager::GetAllCDCStreams(std::vector<scoped_refptr<CDCStreamInfo>>* streams) {
   streams->clear();
-  streams->reserve(cdc_stream_map_.size());
   SharedLock lock(mutex_);
+  streams->reserve(cdc_stream_map_.size());
   for (const CDCStreamInfoMap::value_type& e : cdc_stream_map_) {
     if (!e.second->LockForRead()->is_deleting()) {
       streams->push_back(e.second);
@@ -2456,7 +2524,7 @@ Status CatalogManager::CreateCDCStream(const CreateCDCStreamRequestPB* req,
 
     // Construct the CDC stream if the producer wasn't bootstrapped.
     CDCStreamId stream_id;
-    stream_id = GenerateIdUnlocked(SysRowEntry::CDC_STREAM);
+    stream_id = GenerateIdUnlocked(SysRowEntryType::CDC_STREAM);
 
     stream = make_scoped_refptr<CDCStreamInfo>(stream_id);
     stream->mutable_metadata()->StartMutation();
@@ -2484,6 +2552,34 @@ Status CatalogManager::CreateCDCStream(const CreateCDCStreamRequestPB* req,
   LOG(INFO) << "Created CDC stream " << stream->ToString();
 
   RETURN_NOT_OK(CreateCdcStateTableIfNeeded(rpc));
+  if (!PREDICT_FALSE(FLAGS_TEST_disable_cdc_state_insert_on_setup) &&
+     (!req->has_initial_state() || (req->initial_state() == master::SysCDCStreamEntryPB::ACTIVE))) {
+    // Create the cdc state entries for the tablets in this table from scratch since we have no
+    // data to bootstrap. If we data to bootstrap, let the BootstrapProducer logic take care of
+    // populating entries in cdc_state.
+    auto ybclient = master_->cdc_state_client_initializer().client();
+    if (!ybclient) {
+      return STATUS(IllegalState, "Client not initialized or shutting down");
+    }
+    client::TableHandle cdc_table;
+    const client::YBTableName cdc_state_table_name(
+        YQL_DATABASE_CQL, master::kSystemNamespaceName, master::kCdcStateTableName);
+    RETURN_NOT_OK(ybclient->WaitForCreateTableToFinish(cdc_state_table_name));
+    RETURN_NOT_OK(cdc_table.Open(cdc_state_table_name, ybclient));
+    std::shared_ptr<client::YBSession> session = ybclient->NewSession();
+    auto tablets = table->GetTablets();
+    for (const auto& tablet : tablets) {
+      const auto op = cdc_table.NewWriteOp(QLWriteRequestPB::QL_STMT_INSERT);
+      auto* const req = op->mutable_request();
+      QLAddStringHashValue(req, tablet->id());
+      QLAddStringRangeValue(req, stream->id());
+      cdc_table.AddStringColumnValue(req, master::kCdcCheckpoint, OpId().ToString());
+      cdc_table.AddTimestampColumnValue(
+          req, master::kCdcLastReplicationTime, GetCurrentTimeMicros());
+      session->Apply(op);
+    }
+    RETURN_NOT_OK(session->Flush());
+  }
   return Status::OK();
 }
 
@@ -2582,7 +2678,7 @@ Status CatalogManager::FindCDCStreamsMarkedAsDeleting(
 
 Status CatalogManager::CleanUpDeletedCDCStreams(
     const std::vector<scoped_refptr<CDCStreamInfo>>& streams) {
-  auto ybclient = master_->async_client_initializer().client();
+  auto ybclient = master_->cdc_state_client_initializer().client();
   if (!ybclient) {
     return STATUS(IllegalState, "Client not initialized or shutting down");
   }
@@ -2622,17 +2718,10 @@ Status CatalogManager::CleanUpDeletedCDCStreams(
 
       QLAddStringHashValue(delete_req, tablet->tablet_id());
       QLAddStringRangeValue(delete_req, stream->id());
-      s = session->Apply(delete_op);
+      session->Apply(delete_op);
       stream_ops.push_back(std::make_pair(stream->id(), delete_op));
       LOG(INFO) << "Deleting stream " << stream->id() << " for tablet " << tablet->tablet_id()
               << " with request " << delete_req->ShortDebugString();
-      if (!s.ok()) {
-        LOG(WARNING) << "Unable to delete stream with id "
-                     << stream->id() << " from table " << master::kCdcStateTableName
-                     << " for tablet " << tablet->tablet_id()
-                     << ". Status: " << s
-                     << ", Response: " << delete_op->response().ShortDebugString();
-      }
     }
   }
   // Flush all the delete operations.
@@ -2929,6 +3018,7 @@ Status CatalogManager::SetupUniverseReplication(const SetupUniverseReplicationRe
 
   // Initialize the CDC Stream by querying the Producer server for RPC sanity checks.
   auto result = ri->GetOrCreateCDCRpcTasks(req->producer_master_addresses());
+  LOG(INFO) << "GetOrCreateCDCRpcTasks: " << result.ok();
   if (!result.ok()) {
     MarkUniverseReplicationFailed(ri, ResultToStatus(result));
     return SetupError(resp->mutable_error(), MasterErrorPB::INVALID_REQUEST, result.status());
@@ -2977,10 +3067,8 @@ void CatalogManager::MarkUniverseReplicationFailed(
 
   // Update sys_catalog.
   const Status s = sys_catalog_->Upsert(leader_ready_term(), universe);
-  if (!s.ok()) {
-    return (void)CheckStatus(s, "updating universe replication info in sys-catalog");
-  }
-  l.Commit();
+
+  l.CommitOrWarn(s, "updating universe replication info in sys-catalog");
 }
 
 Status CatalogManager::ValidateTableSchema(
@@ -2995,7 +3083,7 @@ Status CatalogManager::ValidateTableSchema(
   table->set_table_name(info->table_name.table_name());
   table->mutable_namespace_()->set_name(info->table_name.namespace_name());
   table->mutable_namespace_()->set_database_type(
-      GetDatabaseTypeForTable(client::YBTable::ClientToPBTableType(info->table_type)));
+      GetDatabaseTypeForTable(client::ClientToPBTableType(info->table_type)));
 
   // Since YSQL tables are not present in table map, we first need to list tables to get the table
   // ID and then get table schema.
@@ -3108,12 +3196,6 @@ Status CatalogManager::AddValidatedTableAndCreateCdcStreams(
     return CheckStatus(status, "updating universe replication info in sys-catalog");
   }
   l.Commit();
-
-  {
-    LockGuard lock(mutex_);
-    // Also update the set of consumer tables.
-    xcluster_consumer_tables_set_.insert(consumer_table);
-  }
 
   // Create CDC stream for each validated table, after persisting the replication state change.
   if (!validated_tables.empty()) {
@@ -3311,7 +3393,7 @@ void CatalogManager::GetCDCStreamCallback(
         // the bootstrapping is complete.
         SysCDCStreamEntryPB new_entry;
         new_entry.set_table_id(*table_id);
-        new_entry.mutable_options()->Reserve(options->size());
+        new_entry.mutable_options()->Reserve(narrow_cast<int>(options->size()));
         for (const auto& option : *options) {
           auto new_option = new_entry.add_options();
           new_option->set_key(option.first);
@@ -3349,6 +3431,7 @@ void CatalogManager::AddCDCStreamToUniverseAndInitConsumer(
   }
 
   bool merge_alter = false;
+  bool validated_all_tables = false;
   {
     auto l = universe->LockForWrite();
     if (l->is_deleted_or_failed()) {
@@ -3362,9 +3445,10 @@ void CatalogManager::AddCDCStreamToUniverseAndInitConsumer(
     // This functions as a barrier: waiting for the last RPC call from GetTableSchemaCallback.
     if (l.mutable_data()->pb.table_streams_size() == l->pb.tables_size()) {
       // All tables successfully validated! Register CDC consumers & start replication.
+      validated_all_tables = true;
       LOG(INFO) << "Registering CDC consumers for universe " << universe->id();
 
-      auto validated_tables = l->pb.validated_tables();
+      auto& validated_tables = l->pb.validated_tables();
 
       std::vector<CDCConsumerStreamInfo> consumer_info;
       consumer_info.reserve(l->pb.tables_size());
@@ -3397,23 +3481,76 @@ void CatalogManager::AddCDCStreamToUniverseAndInitConsumer(
 
     // Update sys_catalog with new producer table id info.
     Status status = sys_catalog_->Upsert(leader_ready_term(), universe);
-    if (!status.ok()) {
-      return (void)CheckStatus(status, "updating universe replication info in sys-catalog");
-    }
 
     // Before committing, run any callbacks on success.
-    if (on_success_cb &&
+    if (status.ok() && on_success_cb &&
         (l.mutable_data()->pb.state() == SysUniverseReplicationEntryPB::ACTIVE || merge_alter)) {
       on_success_cb();
     }
 
-    l.Commit();
+    l.CommitOrWarn(status, "updating universe replication info in sys-catalog");
+  }
+
+  if (validated_all_tables) {
+    // Also update the set of consumer tables.
+    LockGuard lock(mutex_);
+    auto l = universe->LockForRead();
+    for (const auto& table : l->pb.validated_tables()) {
+      xcluster_consumer_tables_to_stream_map_[table.second].emplace(universe->id(), *stream_id);
+    }
   }
 
   // If this is an 'alter', merge back into primary command now that setup is a success.
   if (merge_alter) {
     MergeUniverseReplication(universe);
   }
+}
+
+/*
+ * UpdateCDCConsumerOnTabletSplit updates the consumer -> producer tablet mapping after a local
+ * tablet split.
+ */
+Status CatalogManager::UpdateCDCConsumerOnTabletSplit(
+    const TableId& consumer_table_id,
+    const SplitTabletIds& split_tablet_ids) {
+  // Check if this table is consuming a stream.
+  XClusterConsumerTableStreamInfoMap stream_infos =
+      GetXClusterStreamInfoForConsumerTable(consumer_table_id);
+
+  auto l = cluster_config_->LockForWrite();
+  for (const auto& stream_info : stream_infos) {
+    std::string universe_id = stream_info.first;
+    CDCStreamId stream_id = stream_info.second;
+    // Fetch the stream entry so we can update the mappings.
+    auto producer_map = l.mutable_data()->pb.mutable_consumer_registry()->mutable_producer_map();
+    auto producer_entry = FindOrNull(*producer_map, universe_id);
+    if (!producer_entry) {
+      return STATUS_FORMAT(NotFound,
+                           "Unable to find the producer entry for universe $0",
+                           universe_id);
+    }
+    auto stream_entry = FindOrNull(*producer_entry->mutable_stream_map(), stream_id);
+    if (!stream_entry) {
+      return STATUS_FORMAT(NotFound,
+                           "Unable to find the stream entry for universe $0, stream $1",
+                           universe_id,
+                           stream_id);
+    }
+
+    RETURN_NOT_OK(UpdateTableMappingOnTabletSplit(stream_entry, split_tablet_ids));
+
+    // We also need to mark this stream as no longer being able to perform 1-1 mappings.
+    stream_entry->set_same_num_producer_consumer_tablets(false);
+  }
+
+  // Also bump the cluster_config_ version so that changes are propagated to tservers.
+  l.mutable_data()->pb.set_version(l.mutable_data()->pb.version() + 1);
+
+  RETURN_NOT_OK(CheckStatus(sys_catalog_->Upsert(leader_ready_term(), cluster_config_),
+                            "Updating cluster config in sys-catalog"));
+  l.Commit();
+
+  return Status::OK();
 }
 
 Status CatalogManager::InitCDCConsumer(
@@ -3442,13 +3579,13 @@ Status CatalogManager::InitCDCConsumer(
 
   // Log the Network topology of the Producer Cluster
   auto master_addrs_list = StringSplit(master_addrs, ',');
-  producer_entry.mutable_master_addrs()->Reserve(master_addrs_list.size());
+  producer_entry.mutable_master_addrs()->Reserve(narrow_cast<int>(master_addrs_list.size()));
   for (const auto& addr : master_addrs_list) {
     auto hp = VERIFY_RESULT(HostPort::FromString(addr, 0));
     HostPortToPB(hp, producer_entry.add_master_addrs());
   }
 
-  producer_entry.mutable_tserver_addrs()->Reserve(tserver_addrs.size());
+  producer_entry.mutable_tserver_addrs()->Reserve(narrow_cast<int>(tserver_addrs.size()));
   for (const auto& addr : tserver_addrs) {
     HostPortToPB(addr, producer_entry.add_tserver_addrs());
   }
@@ -3509,10 +3646,7 @@ void CatalogManager::MergeUniverseReplication(scoped_refptr<UniverseReplicationI
     }
     cl.mutable_data()->pb.set_version(cl.mutable_data()->pb.version() + 1);
     const Status s = sys_catalog_->Upsert(leader_ready_term(), cluster_config_);
-    if (!s.ok()) {
-      return (void)CheckStatus(s, "updating cluster config in sys-catalog");
-    }
-    cl.Commit();
+    cl.CommitOrWarn(s, "updating cluster config in sys-catalog");
   }
   // Merge Master Config on Consumer. (no need for Producer changes, since it uses stream_id)
   {
@@ -3532,11 +3666,10 @@ void CatalogManager::MergeUniverseReplication(scoped_refptr<UniverseReplicationI
 
     vector<UniverseReplicationInfo*> universes{original_universe.get(), universe.get()};
     const Status s = sys_catalog_->Upsert(leader_ready_term(), universes);
-    if (!s.ok()) {
-      return (void)CheckStatus(s, "updating universe replication entries in sys-catalog");
+    alter_lock.CommitOrWarn(s, "updating universe replication entries in sys-catalog");
+    if (s.ok()) {
+      original_lock.Commit();
     }
-    alter_lock.Commit();
-    original_lock.Commit();
   }
   // TODO: universe_replication_map_.erase(universe->id()) at a later time.
   //       TwoDCTest.AlterUniverseReplicationTables crashes due to undiagnosed race right now.
@@ -3608,7 +3741,7 @@ Status CatalogManager::DeleteUniverseReplication(const DeleteUniverseReplication
     } else {
       auto cdc_rpc = *result;
       vector<CDCStreamId> streams;
-      unordered_map<CDCStreamId, TableId> stream_to_producer_table_id;
+      std::unordered_map<CDCStreamId, TableId> stream_to_producer_table_id;
       for (const auto& table : l->pb.table_streams()) {
         streams.push_back(table.second);
         stream_to_producer_table_id.emplace(table.second, table.first);
@@ -3663,11 +3796,14 @@ Status CatalogManager::DeleteUniverseReplicationUnlocked(
   if (universe_replication_map_.erase(universe->id()) < 1) {
     LOG(WARNING) << "Failed to remove replication info from map: universe_id: " << universe->id();
   }
-  // Also delete all consumer tables from the set.
+  // Also update the mapping of consumer tables.
   for (const auto& table : universe->metadata().state().pb.validated_tables()) {
-    if (xcluster_consumer_tables_set_.erase(table.second) < 1) {
-      LOG(WARNING) << "Failed to remove consumer table from set. "
+    if (xcluster_consumer_tables_to_stream_map_[table.second].erase(universe->id()) < 1) {
+      LOG(WARNING) << "Failed to remove consumer table from mapping. "
                    << "table_id: " << table.second << ": universe_id: " << universe->id();
+    }
+    if (xcluster_consumer_tables_to_stream_map_[table.second].empty()) {
+      xcluster_consumer_tables_to_stream_map_.erase(table.second);
     }
   }
   return Status::OK();
@@ -3772,7 +3908,8 @@ Status CatalogManager::AlterUniverseReplication(const AlterUniverseReplicationRe
   // Currently, config options are mutually exclusive to simplify transactionality.
   int config_count = (req->producer_master_addresses_size() > 0 ? 1 : 0) +
                      (req->producer_table_ids_to_remove_size() > 0 ? 1 : 0) +
-                     (req->producer_table_ids_to_add_size() > 0 ? 1 : 0);
+                     (req->producer_table_ids_to_add_size() > 0 ? 1 : 0) +
+                     (req->has_new_producer_universe_id() ? 1 : 0);
   if (config_count != 1) {
     return STATUS(InvalidArgument, "Only 1 Alter operation per request currently supported",
                   req->ShortDebugString(), MasterError(MasterErrorPB::INVALID_REQUEST));
@@ -3965,7 +4102,7 @@ Status CatalogManager::AlterUniverseReplication(const AlterUniverseReplicationRe
 
     // Only add new tables.  Ignore tables that are currently being replicated.
     auto tid_iter = req->producer_table_ids_to_add();
-    unordered_set<string> new_tables(tid_iter.begin(), tid_iter.end());
+    std::unordered_set<string> new_tables(tid_iter.begin(), tid_iter.end());
     {
       auto l = original_ri->LockForRead();
       for(auto t : l->pb.tables()) {
@@ -4006,6 +4143,70 @@ Status CatalogManager::AlterUniverseReplication(const AlterUniverseReplicationRe
       return SetupError(resp->mutable_error(), s);
     }
     // NOTE: ALTER merges back into original after completion.
+  } else if (req->has_new_producer_universe_id()) {
+    Status s = RenameUniverseReplication(original_ri, req, resp, rpc);
+    if (!s.ok()) {
+      return SetupError(resp->mutable_error(), s);
+    }
+  }
+
+  return Status::OK();
+}
+
+Status CatalogManager::RenameUniverseReplication(
+    scoped_refptr<UniverseReplicationInfo> universe,
+    const AlterUniverseReplicationRequestPB* req,
+    AlterUniverseReplicationResponsePB* resp,
+    rpc::RpcContext* rpc) {
+  const string old_universe_replication_id = universe->id();
+  const string new_producer_universe_id = req->new_producer_universe_id();
+  if (old_universe_replication_id == new_producer_universe_id) {
+    return STATUS(InvalidArgument, "Old and new replication ids must be different",
+                  req->ShortDebugString(), MasterError(MasterErrorPB::INVALID_REQUEST));
+  }
+
+  {
+    LockGuard lock(mutex_);
+    auto l = universe->LockForWrite();
+    scoped_refptr<UniverseReplicationInfo> new_ri;
+
+    // Assert that new_replication_name isn't already in use.
+    if (FindPtrOrNull(universe_replication_map_, new_producer_universe_id) != nullptr) {
+      return STATUS(InvalidArgument, "New replication id is already in use",
+                    req->ShortDebugString(), MasterError(MasterErrorPB::INVALID_REQUEST));
+    }
+
+    // Since the producer_id is used as the key, we need to create a new UniverseReplicationInfo.
+    new_ri = new UniverseReplicationInfo(new_producer_universe_id);
+    new_ri->mutable_metadata()->StartMutation();
+    SysUniverseReplicationEntryPB *metadata = &new_ri->mutable_metadata()->mutable_dirty()->pb;
+    metadata->CopyFrom(l->pb);
+    metadata->set_producer_id(new_producer_universe_id);
+
+    // Also need to update internal maps.
+    auto cl = cluster_config_->LockForWrite();
+    auto producer_map = cl.mutable_data()->pb.mutable_consumer_registry()->mutable_producer_map();
+    (*producer_map)[new_producer_universe_id] =
+        std::move((*producer_map)[old_universe_replication_id]);
+    producer_map->erase(old_universe_replication_id);
+
+    {
+      // Need both these updates to be atomic.
+      auto w = sys_catalog_->NewWriter(leader_ready_term());
+      RETURN_NOT_OK(w->Mutate(QLWriteRequestPB::QL_STMT_DELETE, universe.get()));
+      RETURN_NOT_OK(w->Mutate(QLWriteRequestPB::QL_STMT_UPDATE,
+                              new_ri.get(),
+                              cluster_config_.get()));
+      RETURN_NOT_OK(CheckStatus(
+          sys_catalog_->SyncWrite(w.get()),
+          "Updating universe replication info and cluster config in sys-catalog"));
+    }
+    new_ri->mutable_metadata()->CommitMutation();
+    cl.Commit();
+
+    // Update universe_replication_map after persistent data is saved.
+    universe_replication_map_[new_producer_universe_id] = new_ri;
+    universe_replication_map_.erase(old_universe_replication_id);
   }
 
   return Status::OK();
@@ -4117,7 +4318,22 @@ bool CatalogManager::IsTableCdcProducer(const TableInfo& table_info) const {
 }
 
 bool CatalogManager::IsTableCdcConsumer(const TableInfo& table_info) const {
-  return xcluster_consumer_tables_set_.count(table_info.id()) == 1;
+  auto it = xcluster_consumer_tables_to_stream_map_.find(table_info.id());
+  if (it == xcluster_consumer_tables_to_stream_map_.end()) {
+    return false;
+  }
+  return !it->second.empty();
+}
+
+CatalogManager::XClusterConsumerTableStreamInfoMap
+    CatalogManager::GetXClusterStreamInfoForConsumerTable(const TableId& table_id) const {
+  SharedLock lock(mutex_);
+  auto it = xcluster_consumer_tables_to_stream_map_.find(table_id);
+  if (it == xcluster_consumer_tables_to_stream_map_.end()) {
+    return {};
+  }
+
+  return it->second;
 }
 
 bool CatalogManager::IsCdcEnabled(
@@ -4131,7 +4347,7 @@ void CatalogManager::Started() {
 }
 
 Result<SnapshotSchedulesToObjectIdsMap> CatalogManager::MakeSnapshotSchedulesToObjectIdsMap(
-    SysRowEntry::Type type) {
+    SysRowEntryType type) {
   return snapshot_coordinator_.MakeSnapshotSchedulesToObjectIdsMap(type);
 }
 
@@ -4141,6 +4357,13 @@ Result<bool> CatalogManager::IsTablePartOfSomeSnapshotSchedule(const TableInfo& 
 
 void CatalogManager::SysCatalogLoaded(int64_t term) {
   return snapshot_coordinator_.SysCatalogLoaded(term);
+}
+
+size_t CatalogManager::GetNumLiveTServersForActiveCluster() {
+  BlacklistSet blacklist = BlacklistSetFromPB();
+  TSDescriptorVector ts_descs;
+  master_->ts_manager()->GetAllLiveDescriptorsInCluster(&ts_descs, placement_uuid(), blacklist);
+  return ts_descs.size();
 }
 
 }  // namespace enterprise

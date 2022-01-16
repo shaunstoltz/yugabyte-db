@@ -32,29 +32,66 @@
 
 #include "yb/tserver/heartbeater.h"
 
+#include <cstdint>
+#include <iosfwd>
+#include <map>
 #include <memory>
-#include <vector>
 #include <mutex>
+#include <ostream>
+#include <string>
+#include <vector>
 
-#include <gflags/gflags.h>
+#include <boost/function.hpp>
 #include <glog/logging.h>
 
+#include "yb/common/hybrid_time.h"
 #include "yb/common/wire_protocol.h"
+
+#include "yb/consensus/log_fwd.h"
+
+#include "yb/docdb/docdb.pb.h"
+
+#include "yb/gutil/atomicops.h"
+#include "yb/gutil/bind.h"
+#include "yb/gutil/macros.h"
 #include "yb/gutil/ref_counted.h"
 #include "yb/gutil/strings/substitute.h"
-#include "yb/master/master.proxy.h"
+#include "yb/gutil/thread_annotations.h"
+
+#include "yb/master/master_heartbeat.proxy.h"
 #include "yb/master/master_rpc.h"
+#include "yb/master/master_types.pb.h"
+
+#include "yb/rocksdb/cache.h"
+#include "yb/rocksdb/options.h"
+#include "yb/rocksdb/statistics.h"
+
+#include "yb/rpc/rpc_fwd.h"
+
+#include "yb/server/hybrid_clock.h"
 #include "yb/server/server_base.proxy.h"
-#include "yb/tablet/tablet.h"
+
+#include "yb/tablet/tablet_options.h"
+
 #include "yb/tserver/tablet_server.h"
-#include "yb/tserver/tablet_server_options.h"
 #include "yb/tserver/ts_tablet_manager.h"
+
+#include "yb/util/async_util.h"
 #include "yb/util/capabilities.h"
+#include "yb/util/countdown_latch.h"
+#include "yb/util/enums.h"
 #include "yb/util/flag_tags.h"
+#include "yb/util/locks.h"
+#include "yb/util/logging.h"
 #include "yb/util/monotime.h"
 #include "yb/util/net/net_util.h"
+#include "yb/util/slice.h"
 #include "yb/util/status.h"
+#include "yb/util/status_format.h"
+#include "yb/util/status_log.h"
+#include "yb/util/strongly_typed_bool.h"
 #include "yb/util/thread.h"
+#include "yb/util/threadpool.h"
 
 using namespace std::literals;
 
@@ -74,10 +111,8 @@ DEFINE_int32(heartbeat_max_failures_before_backoff, 3,
              "rather than retrying.");
 TAG_FLAG(heartbeat_max_failures_before_backoff, advanced);
 
-DEFINE_bool(tserver_disable_heartbeat_test_only, false, "Should heartbeat be disabled");
-TAG_FLAG(tserver_disable_heartbeat_test_only, unsafe);
-TAG_FLAG(tserver_disable_heartbeat_test_only, hidden);
-TAG_FLAG(tserver_disable_heartbeat_test_only, runtime);
+DEFINE_test_flag(bool, tserver_disable_heartbeat, false, "Should heartbeat be disabled");
+TAG_FLAG(TEST_tserver_disable_heartbeat, runtime);
 
 DEFINE_CAPABILITY(TabletReportLimit, 0xb1a2a020);
 
@@ -85,9 +120,6 @@ using google::protobuf::RepeatedPtrField;
 using yb::HostPortPB;
 using yb::consensus::RaftPeerPB;
 using yb::master::GetLeaderMasterRpc;
-using yb::master::ListMastersResponsePB;
-using yb::master::Master;
-using yb::master::MasterServiceProxy;
 using yb::rpc::RpcController;
 using std::shared_ptr;
 using std::vector;
@@ -163,7 +195,7 @@ class Heartbeater::Thread {
   HostPort leader_master_hostport_;
 
   // Current RPC proxy to the leader master.
-  std::unique_ptr<master::MasterServiceProxy> proxy_;
+  std::unique_ptr<master::MasterHeartbeatProxy> proxy_;
 
   // The most recent response from a heartbeat.
   master::TSHeartbeatResponsePB last_hb_response_;
@@ -305,7 +337,8 @@ Status Heartbeater::Thread::ConnectToMaster() {
   LOG_WITH_PREFIX(INFO) << "Connected to a leader master server at " << leader_master_hostport_;
 
   // Save state in the instance.
-  proxy_.reset(new MasterServiceProxy(&server_->proxy_cache(), leader_master_hostport_));
+  proxy_ = std::make_unique<master::MasterHeartbeatProxy>(
+      &server_->proxy_cache(), leader_master_hostport_);
   return Status::OK();
 }
 
@@ -504,6 +537,10 @@ Status Heartbeater::Thread::TryHeartbeat() {
 
   RETURN_NOT_OK(server_->tablet_manager()->UpdateSnapshotsInfo(last_hb_response_.snapshots_info()));
 
+  if (last_hb_response_.has_txn_table_versions_hash()) {
+    server_->UpdateTxnTableVersionsHash(last_hb_response_.txn_table_versions_hash());
+  }
+
   // Update the live tserver list.
   return server_->PopulateLiveTServers(last_hb_response_);
 }
@@ -513,8 +550,8 @@ Status Heartbeater::Thread::DoHeartbeat() {
     return STATUS(IOError, "failing all heartbeats for tests");
   }
 
-  if (PREDICT_FALSE(FLAGS_tserver_disable_heartbeat_test_only)) {
-    LOG_WITH_PREFIX(INFO) << "Heartbeat disabled for testing.";
+  if (PREDICT_FALSE(FLAGS_TEST_tserver_disable_heartbeat)) {
+    YB_LOG_EVERY_N_SECS(INFO, 1) << "Heartbeat disabled for testing.";
     return Status::OK();
   }
 

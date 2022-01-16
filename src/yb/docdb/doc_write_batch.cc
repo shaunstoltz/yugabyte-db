@@ -10,29 +10,28 @@
 // or implied.  See the License for the specific language governing permissions and limitations
 // under the License.
 //
-
 #include "yb/docdb/doc_write_batch.h"
 
 #include "yb/common/doc_hybrid_time.h"
 #include "yb/docdb/doc_key.h"
-#include "yb/docdb/doc_reader.h"
-#include "yb/docdb/deadline_info.h"
-#include "yb/docdb/docdb_fwd.h"
-#include "yb/rocksdb/db.h"
-#include "yb/rocksdb/write_batch.h"
-#include "yb/rocksutil/write_batch_formatter.h"
-
-#include "yb/server/hybrid_clock.h"
-
+#include "yb/docdb/doc_path.h"
 #include "yb/docdb/doc_ttl_util.h"
 #include "yb/docdb/docdb-internal.h"
 #include "yb/docdb/docdb.pb.h"
+#include "yb/docdb/docdb_fwd.h"
 #include "yb/docdb/docdb_rocksdb_util.h"
-#include "yb/docdb/value_type.h"
 #include "yb/docdb/kv_debug.h"
+#include "yb/docdb/subdocument.h"
+#include "yb/docdb/value_type.h"
+#include "yb/rocksdb/db.h"
+#include "yb/rocksdb/write_batch.h"
+#include "yb/rocksutil/write_batch_formatter.h"
+#include "yb/server/hybrid_clock.h"
 #include "yb/util/bytes_formatter.h"
 #include "yb/util/enums.h"
 #include "yb/util/logging.h"
+#include "yb/util/result.h"
+#include "yb/util/status_format.h"
 
 using yb::BinaryOutputFormat;
 
@@ -198,7 +197,7 @@ CHECKED_STATUS DocWriteBatch::SetPrimitiveInternal(
     const Value& value,
     LazyIterator* iter,
     const bool is_deletion,
-    const int num_subkeys) {
+    const size_t num_subkeys) {
   // The write_id is always incremented by one for each new element of the write batch.
   if (put_batch_.size() > numeric_limits<IntraTxnWriteId>::max()) {
     return STATUS_SUBSTITUTE(
@@ -218,7 +217,7 @@ CHECKED_STATUS DocWriteBatch::SetPrimitiveInternal(
   const auto write_id = static_cast<IntraTxnWriteId>(put_batch_.size());
   const DocHybridTime hybrid_time = DocHybridTime(HybridTime::kMax, write_id);
 
-  for (int subkey_index = 0; subkey_index < num_subkeys; ++subkey_index) {
+  for (size_t subkey_index = 0; subkey_index < num_subkeys; ++subkey_index) {
     const PrimitiveValue& subkey = doc_path.subkey(subkey_index);
 
     // We don't need to check if intermediate documents already exist if init markers are optional,
@@ -334,7 +333,7 @@ Status DocWriteBatch::SetPrimitive(
   DOCDB_DEBUG_LOG("Called SetPrimitive with doc_path=$0, value=$1",
                   doc_path.ToString(), value.ToString());
   current_entry_.doc_hybrid_time = DocHybridTime::kMin;
-  const int num_subkeys = doc_path.num_subkeys();
+  const auto num_subkeys = doc_path.num_subkeys();
   const bool is_deletion = value.primitive_value().value_type() == ValueType::kTombstone;
 
   key_prefix_ = doc_path.encoded_doc_key();
@@ -376,7 +375,7 @@ Status DocWriteBatch::SetPrimitive(const DocPath& doc_path,
           BloomFilterMode::USE_BLOOM_FILTER,
           doc_path.encoded_doc_key().AsSlice(),
           query_id,
-          /*txn_op_context*/ boost::none,
+          TransactionOperationContext(),
           deadline,
           read_ht);
     };
@@ -416,6 +415,7 @@ Status DocWriteBatch::ExtendSubDocument(
     RETURN_NOT_OK(SetPrimitive(doc_path, Value(value, ttl, user_timestamp),
                                read_ht, deadline, query_id));
   }
+  UpdateMaxValueTtl(ttl);
   return Status::OK();
 }
 
@@ -484,7 +484,7 @@ Status DocWriteBatch::ExtendList(
 
 Status DocWriteBatch::ReplaceRedisInList(
     const DocPath &doc_path,
-    const std::vector<int>& indices,
+    const std::vector<int64_t>& indices,
     const std::vector<SubDocument>& values,
     const ReadHybridTime& read_ht,
     const CoarseTimePoint deadline,
@@ -503,14 +503,14 @@ Status DocWriteBatch::ReplaceRedisInList(
       BloomFilterMode::USE_BLOOM_FILTER,
       key_prefix_.AsSlice(),
       query_id,
-      /*txn_op_context*/ boost::none,
+      TransactionOperationContext(),
       deadline,
       read_ht);
 
   Slice value_slice;
   SubDocKey found_key;
-  int current_index = start_index;
-  int replace_index = 0;
+  auto current_index = start_index;
+  size_t replace_index = 0;
 
   if (dir == Direction::kForward) {
     // Ensure we seek directly to indices and skip init marker if it exists.
@@ -542,7 +542,7 @@ Status DocWriteBatch::ReplaceRedisInList(
     RETURN_NOT_OK(Value::DecodePrimitiveValueType(value_slice, &value_type, nullptr, &entry_ttl));
 
     if (value_type == ValueType::kTombstone) {
-      found_key.KeepPrefix(sub_doc_key.num_subkeys()+1);
+      found_key.KeepPrefix(sub_doc_key.num_subkeys() + 1);
       if (dir == Direction::kForward) {
         iter->SeekPastSubKey(key_data.key);
       } else {
@@ -588,6 +588,17 @@ Status DocWriteBatch::ReplaceRedisInList(
   }
 }
 
+void DocWriteBatch::UpdateMaxValueTtl(const MonoDelta& ttl) {
+  // Don't update the max value TTL if the value is uninitialized or if it is set to
+  // kMaxTtl (i.e. use table TTL).
+  if (!ttl.Initialized() || ttl.Equals(Value::kMaxTtl)) {
+    return;
+  }
+  if (!ttl_.Initialized() || ttl > ttl_) {
+    ttl_ = ttl;
+  }
+}
+
 Status DocWriteBatch::ReplaceCqlInList(
     const DocPath& doc_path,
     const int target_cql_index,
@@ -606,7 +617,7 @@ Status DocWriteBatch::ReplaceCqlInList(
       BloomFilterMode::USE_BLOOM_FILTER,
       key_prefix_.AsSlice(),
       query_id,
-      /*txn_op_context*/ boost::none,
+      TransactionOperationContext(),
       deadline,
       read_ht);
 
@@ -691,20 +702,26 @@ void DocWriteBatch::Clear() {
 }
 
 void DocWriteBatch::MoveToWriteBatchPB(KeyValueWriteBatchPB *kv_pb) {
-  kv_pb->mutable_write_pairs()->Reserve(put_batch_.size());
+  kv_pb->mutable_write_pairs()->Reserve(narrow_cast<int>(put_batch_.size()));
   for (auto& entry : put_batch_) {
     KeyValuePairPB* kv_pair = kv_pb->add_write_pairs();
     kv_pair->mutable_key()->swap(entry.first);
     kv_pair->mutable_value()->swap(entry.second);
   }
+  if (has_ttl()) {
+    kv_pb->set_ttl(ttl_ns());
+  }
 }
 
 void DocWriteBatch::TEST_CopyToWriteBatchPB(KeyValueWriteBatchPB *kv_pb) const {
-  kv_pb->mutable_write_pairs()->Reserve(put_batch_.size());
+  kv_pb->mutable_write_pairs()->Reserve(narrow_cast<int>(put_batch_.size()));
   for (auto& entry : put_batch_) {
     KeyValuePairPB* kv_pair = kv_pb->add_write_pairs();
     kv_pair->mutable_key()->assign(entry.first);
     kv_pair->mutable_value()->assign(entry.second);
+  }
+  if (has_ttl()) {
+    kv_pb->set_ttl(ttl_ns());
   }
 }
 
@@ -719,7 +736,7 @@ class DocWriteBatchFormatter : public WriteBatchFormatter {
       BinaryOutputFormat binary_output_format,
       WriteBatchOutputFormat batch_output_format,
       std::string line_prefix)
-      : WriteBatchFormatter(binary_output_format, batch_output_format, line_prefix),
+      : WriteBatchFormatter(binary_output_format, batch_output_format, std::move(line_prefix)),
         storage_db_type_(storage_db_type) {}
  protected:
   std::string FormatKey(const Slice& key) override {

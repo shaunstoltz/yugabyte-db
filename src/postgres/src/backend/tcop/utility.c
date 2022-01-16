@@ -417,21 +417,6 @@ standard_ProcessUtility(PlannedStmt *pstmt,
 	pstate = make_parsestate(NULL);
 	pstate->p_sourcetext = queryString;
 
-	/*
-	 * tserver auth method is only allowed to run backfill statements.
-	 */
-	if (IsYugaByteEnabled() &&
-		!IsBootstrapProcessingMode() &&
-		!YBIsPreparingTemplates() &&
-		MyProcPort->yb_is_tserver_auth_method &&
-		!IsA(parsetree, BackfillIndexStmt))
-	{
-		ereport(ERROR,
-			(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
-			errmsg("yb-tserver cannot run this query: %s",
-				CreateCommandTag(parsetree))));
-	}
-
 	switch (nodeTag(parsetree))
 	{
 			/*
@@ -1435,7 +1420,10 @@ ProcessUtilitySlow(ParseState *pstate,
 												   stmt->relation->relname)));
 						}
 						list_free(inheritors);
+					}
 
+					if (get_rel_relkind(relid) == RELKIND_PARTITIONED_TABLE)
+					{
 						/*
 						 * Transparently switch to nonconcurrent index build.
 						 */
@@ -2132,7 +2120,7 @@ AlterObjectTypeCommandTag(ObjectType objtype)
 		case OBJECT_TABCONSTRAINT:
 			tag = "ALTER TABLE";
 			break;
-		case OBJECT_TABLEGROUP:
+		case OBJECT_YBTABLEGROUP:
 			tag = "ALTER TABLEGROUP";
 			break;
 		case OBJECT_TABLESPACE:

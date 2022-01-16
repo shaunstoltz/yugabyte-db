@@ -29,11 +29,12 @@
 // or implied.  See the License for the specific language governing permissions and limitations
 // under the License.
 //
-#include <cctype>
-#include <algorithm>
-#include <glog/logging.h>
 
 #include "yb/util/string_case.h"
+
+#include <algorithm>
+
+#include <glog/logging.h>
 
 namespace yb {
 
@@ -112,14 +113,14 @@ void ToUpperCase(const std::string &string,
 }
 
 void Capitalize(string *word) {
-  uint32_t size = word->size();
+  auto size = word->size();
   if (size == 0) {
     return;
   }
 
   (*word)[0] = toupper((*word)[0]);
 
-  for (int i = 1; i < size; i++) {
+  for (size_t i = 1; i < size; i++) {
     (*word)[i] = tolower((*word)[i]);
   }
 }

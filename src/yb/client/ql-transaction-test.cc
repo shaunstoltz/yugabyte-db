@@ -13,21 +13,27 @@
 //
 //
 
-#include "yb/client/txn-test-base.h"
-
+#include "yb/client/error.h"
+#include "yb/client/schema.h"
 #include "yb/client/session.h"
+#include "yb/client/table.h"
 #include "yb/client/table_alterer.h"
 #include "yb/client/transaction.h"
 #include "yb/client/transaction_rpc.h"
+#include "yb/client/txn-test-base.h"
+#include "yb/client/yb_op.h"
 
 #include "yb/common/ql_value.h"
 
 #include "yb/consensus/consensus.h"
+#include "yb/consensus/log.h"
 
-#include "yb/gutil/dynamic_annotations.h"
+#include "yb/rocksdb/db.h"
 
 #include "yb/rpc/rpc.h"
 
+#include "yb/tablet/tablet.h"
+#include "yb/tablet/tablet_bootstrap_if.h"
 #include "yb/tablet/tablet_peer.h"
 #include "yb/tablet/transaction_coordinator.h"
 
@@ -40,6 +46,8 @@
 #include "yb/util/random_util.h"
 #include "yb/util/scope_exit.h"
 #include "yb/util/size_literals.h"
+#include "yb/util/test_thread_holder.h"
+#include "yb/util/tsan_util.h"
 
 #include "yb/yql/cql/ql/util/errcodes.h"
 #include "yb/yql/cql/ql/util/statement_result.h"
@@ -73,7 +81,7 @@ namespace client {
 struct WriteConflictsOptions {
   bool do_restarts = false;
   size_t active_transactions = 50;
-  size_t total_keys = 5;
+  int total_keys = 5;
   bool non_txn_writes = false;
 };
 
@@ -504,18 +512,18 @@ TEST_F(QLTransactionTest, ResendApplying) {
 }
 
 TEST_F(QLTransactionTest, ConflictResolution) {
-  constexpr size_t kTotalTransactions = 5;
-  constexpr size_t kNumRows = 10;
+  constexpr int kTotalTransactions = 5;
+  constexpr int kNumRows = 10;
   std::vector<YBTransactionPtr> transactions;
   std::vector<YBSessionPtr> sessions;
   std::vector<std::vector<YBqlWriteOpPtr>> write_ops(kTotalTransactions);
 
   CountDownLatch latch(kTotalTransactions);
-  for (size_t i = 0; i != kTotalTransactions; ++i) {
+  for (int i = 0; i != kTotalTransactions; ++i) {
     transactions.push_back(CreateTransaction());
     auto session = CreateSession(transactions.back());
     sessions.push_back(session);
-    for (size_t r = 0; r != kNumRows; ++r) {
+    for (int r = 0; r != kNumRows; ++r) {
       write_ops[i].push_back(ASSERT_RESULT(WriteRow(
           sessions.back(), r, i, WriteOpType::INSERT, Flush::kFalse)));
     }
@@ -558,7 +566,7 @@ TEST_F(QLTransactionTest, ConflictResolution) {
 
   auto session = CreateSession();
   std::vector<int32_t> values;
-  for (size_t r = 0; r != kNumRows; ++r) {
+  for (int r = 0; r != kNumRows; ++r) {
     auto row = SelectRow(session, r);
     ASSERT_OK(row);
     values.push_back(*row);
@@ -675,7 +683,7 @@ void QLTransactionTest::TestWriteConflicts(const WriteConflictsOptions& options)
       }
     }
     while (!expired && active_transactions.size() < options.active_transactions) {
-      auto key = RandomUniformInt<size_t>(1, options.total_keys);
+      auto key = RandomUniformInt<int>(1, options.total_keys);
       ActiveTransaction active_txn;
       if (!options.non_txn_writes || RandomUniformBool()) {
         active_txn.transaction = CreateTransaction();
@@ -687,7 +695,7 @@ void QLTransactionTest::TestWriteConflicts(const WriteConflictsOptions& options)
       const auto val = ++value;
       table_.AddInt32ColumnValue(req, kValueColumn, val);
       LOG(INFO) << "TXN: " << active_txn.ToString() << " write " << key << " = " << val;
-      ASSERT_OK(active_txn.session->Apply(op));
+      active_txn.session->Apply(op);
       active_txn.flush_future = active_txn.session->FlushFuture();
 
       ++tries;
@@ -897,7 +905,7 @@ TEST_F_EX(QLTransactionTest, IntentsCleanupAfterRestart, QLTransactionTestWithDi
 
   LOG(INFO) << "Write values";
 
-  for (size_t i = 0; i != kTransactions; ++i) {
+  for (int i = 0; i != kTransactions; ++i) {
     SCOPED_TRACE(Format("Transaction $0", i));
     auto txn = CreateTransaction();
     auto session = CreateSession(txn);
@@ -1200,7 +1208,8 @@ TEST_F(QLTransactionTest, StatusEvolution) {
       {
         auto session = CreateSession(txn);
         // Insert using different keys to avoid conflicts.
-        ASSERT_OK(WriteRow(session, states.size(), states.size()));
+        int idx = narrow_cast<int>(states.size());
+        ASSERT_OK(WriteRow(session, idx, idx));
       }
       states.push_back({ txn, txn->GetMetadata() });
       ++active_transactions;
@@ -1281,7 +1290,7 @@ TEST_F(QLTransactionTest, StatusEvolution) {
 //
 // This test addresses this issue.
 TEST_F_EX(QLTransactionTest, WaitRead, QLTransactionBigLogSegmentSizeTest) {
-  constexpr size_t kWriteThreads = 10;
+  constexpr int kWriteThreads = 10;
   constexpr size_t kCycles = 100;
   constexpr size_t kConcurrentReads = 4;
 
@@ -1290,7 +1299,7 @@ TEST_F_EX(QLTransactionTest, WaitRead, QLTransactionBigLogSegmentSizeTest) {
   std::atomic<bool> stop(false);
   std::vector<std::thread> threads;
 
-  for (size_t i = 0; i != kWriteThreads; ++i) {
+  for (int i = 0; i != kWriteThreads; ++i) {
     threads.emplace_back([this, i, &stop] {
       CDSAttacher attacher;
       auto session = CreateSession();
@@ -1313,7 +1322,7 @@ TEST_F_EX(QLTransactionTest, WaitRead, QLTransactionBigLogSegmentSizeTest) {
     for (size_t j = 0; j != kConcurrentReads; ++j) {
       values[j].clear();
       auto session = CreateSession(CreateTransaction());
-      for (size_t key = 0; key != kWriteThreads; ++key) {
+      for (int key = 0; key != kWriteThreads; ++key) {
         reads[j].push_back(ReadRow(session, key));
       }
       session->FlushAsync([&latch](FlushStatus* flush_status) {

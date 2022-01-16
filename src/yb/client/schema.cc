@@ -37,11 +37,17 @@
 #include <glog/logging.h>
 
 #include "yb/client/schema-internal.h"
-#include "yb/client/value-internal.h"
+
 #include "yb/common/partial_row.h"
+#include "yb/common/ql_type.h"
+#include "yb/common/schema.h"
 #include "yb/common/wire_protocol.h"
+
 #include "yb/gutil/map-util.h"
 #include "yb/gutil/strings/substitute.h"
+
+#include "yb/util/result.h"
+#include "yb/util/status_format.h"
 
 using std::shared_ptr;
 using std::unordered_map;
@@ -74,7 +80,7 @@ YBColumnSpec* YBColumnSpec::Order(int32_t order) {
   return this;
 }
 
-YBColumnSpec* YBColumnSpec::SetSortingType(ColumnSchema::SortingType sorting_type) {
+YBColumnSpec* YBColumnSpec::SetSortingType(SortingType sorting_type) {
   data_->sorting_type = sorting_type;
   return this;
 }
@@ -140,6 +146,10 @@ Status YBColumnSpec::ToColumnSchema(YBColumnSchema* col) const {
                         data_->sorting_type);
 
   return Status::OK();
+}
+
+YBColumnSpec* YBColumnSpec::Type(DataType type) {
+  return Type(QLType::Create(type));
 }
 
 ////////////////////////////////////////////////////////////
@@ -209,7 +219,7 @@ Status YBSchemaBuilder::Build(YBSchema* schema) {
     RETURN_NOT_OK(data_->specs[i]->ToColumnSchema(&cols[i]));
   }
 
-  int num_key_cols = 0;
+  size_t num_key_cols = 0;
   if (!data_->has_key_col_names) {
     // Change the API to allow specifying each column individually as part of a primary key.
     // Previously, we must pass an extra list of columns if the key is a compound of columns.
@@ -289,7 +299,7 @@ Status YBSchemaBuilder::Build(YBSchema* schema) {
     // Currently we require that the key columns be contiguous at the front
     // of the schema. We'll lift this restriction later -- hence the more
     // flexible user-facing API.
-    for (int i = 0; i < key_col_indexes.size(); i++) {
+    for (size_t i = 0; i < key_col_indexes.size(); i++) {
       if (key_col_indexes[i] != i) {
         return STATUS(InvalidArgument, "Primary key columns must be listed first in the schema",
                                        data_->key_col_names[i]);
@@ -320,22 +330,18 @@ YBColumnSchema::YBColumnSchema(const std::string &name,
                                bool is_static,
                                bool is_counter,
                                int32_t order,
-                               ColumnSchema::SortingType sorting_type) {
-  col_ = new ColumnSchema(name, type, is_nullable, is_hash_key, is_static, is_counter, order,
-                          sorting_type);
+                               SortingType sorting_type) {
+  col_ = std::make_unique<ColumnSchema>(
+      name, type, is_nullable, is_hash_key, is_static, is_counter, order, sorting_type);
 }
 
-YBColumnSchema::YBColumnSchema(const YBColumnSchema& other)
-  : col_(nullptr) {
+YBColumnSchema::YBColumnSchema(const YBColumnSchema& other) {
   CopyFrom(other);
 }
 
-YBColumnSchema::YBColumnSchema() : col_(nullptr) {
-}
+YBColumnSchema::YBColumnSchema() = default;
 
-YBColumnSchema::~YBColumnSchema() {
-  delete col_;
-}
+YBColumnSchema::~YBColumnSchema() = default;
 
 YBColumnSchema& YBColumnSchema::operator=(const YBColumnSchema& other) {
   if (&other != this) {
@@ -345,11 +351,9 @@ YBColumnSchema& YBColumnSchema::operator=(const YBColumnSchema& other) {
 }
 
 void YBColumnSchema::CopyFrom(const YBColumnSchema& other) {
-  delete col_;
+  col_.reset();
   if (other.col_) {
-    col_ = new ColumnSchema(*other.col_);
-  } else {
-    col_ = nullptr;
+    col_ = std::make_unique<ColumnSchema>(*other.col_);
   }
 }
 
@@ -377,7 +381,7 @@ const shared_ptr<QLType>& YBColumnSchema::type() const {
   return DCHECK_NOTNULL(col_)->type();
 }
 
-ColumnSchema::SortingType YBColumnSchema::sorting_type() const {
+SortingType YBColumnSchema::sorting_type() const {
   return DCHECK_NOTNULL(col_)->sorting_type();
 }
 
@@ -387,6 +391,74 @@ bool YBColumnSchema::is_counter() const {
 
 int32_t YBColumnSchema::order() const {
   return DCHECK_NOTNULL(col_)->order();
+}
+
+InternalType YBColumnSchema::ToInternalDataType(const std::shared_ptr<QLType>& ql_type) {
+  switch (ql_type->main()) {
+    case INT8:
+      return InternalType::kInt8Value;
+    case INT16:
+      return InternalType::kInt16Value;
+    case INT32:
+      return InternalType::kInt32Value;
+    case INT64:
+      return InternalType::kInt64Value;
+    case UINT32:
+      return InternalType::kUint32Value;
+    case UINT64:
+      return InternalType::kUint64Value;
+    case FLOAT:
+      return InternalType::kFloatValue;
+    case DOUBLE:
+      return InternalType::kDoubleValue;
+    case DECIMAL:
+      return InternalType::kDecimalValue;
+    case STRING:
+      return InternalType::kStringValue;
+    case TIMESTAMP:
+      return InternalType::kTimestampValue;
+    case DATE:
+      return InternalType::kDateValue;
+    case TIME:
+      return InternalType::kTimeValue;
+    case INET:
+      return InternalType::kInetaddressValue;
+    case JSONB:
+      return InternalType::kJsonbValue;
+    case UUID:
+      return InternalType::kUuidValue;
+    case TIMEUUID:
+      return InternalType::kTimeuuidValue;
+    case BOOL:
+      return InternalType::kBoolValue;
+    case BINARY:
+      return InternalType::kBinaryValue;
+    case USER_DEFINED_TYPE: FALLTHROUGH_INTENDED;
+    case MAP:
+      return InternalType::kMapValue;
+    case SET:
+      return InternalType::kSetValue;
+    case LIST:
+      return InternalType::kListValue;
+    case VARINT:
+      return InternalType::kVarintValue;
+    case FROZEN:
+      return InternalType::kFrozenValue;
+    case GIN_NULL:
+      return InternalType::kGinNullValue;
+
+    case TUPLE: FALLTHROUGH_INTENDED; // TODO (mihnea) Tuple type not fully supported yet
+    case NULL_VALUE_TYPE: FALLTHROUGH_INTENDED;
+    case UNKNOWN_DATA:
+      return InternalType::VALUE_NOT_SET;
+
+    case TYPEARGS: FALLTHROUGH_INTENDED;
+    case UINT8: FALLTHROUGH_INTENDED;
+    case UINT16:
+      break;
+  }
+  LOG(FATAL) << "Internal error: unsupported type " << ql_type->ToString();
+  return InternalType::VALUE_NOT_SET;
 }
 
 ////////////////////////////////////////////////////////////
@@ -452,7 +524,7 @@ void YBSchema::Reset(std::unique_ptr<Schema> schema) {
   schema_ = std::move(schema);
 }
 
-Status YBSchema::Reset(const vector<YBColumnSchema>& columns, int key_columns,
+Status YBSchema::Reset(const vector<YBColumnSchema>& columns, size_t key_columns,
                        const TableProperties& table_properties) {
   vector<ColumnSchema> cols_private;
   for (const YBColumnSchema& col : columns) {
@@ -559,6 +631,10 @@ void YBSchema::GetPrimaryKeyColumnIndexes(vector<int>* indexes) const {
 
 string YBSchema::ToString() const {
   return schema_->ToString();
+}
+
+ssize_t YBSchema::FindColumn(const GStringPiece& name) const {
+  return schema_->find_column(name);
 }
 
 } // namespace client

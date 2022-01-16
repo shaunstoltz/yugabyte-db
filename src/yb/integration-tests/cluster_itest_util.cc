@@ -29,43 +29,63 @@
 // or implied.  See the License for the specific language governing permissions and limitations
 // under the License.
 //
+
 #include "yb/integration-tests/cluster_itest_util.h"
+
+#include <stdint.h>
 
 #include <algorithm>
 #include <limits>
+#include <memory>
+#include <mutex>
+#include <string>
+#include <utility>
+#include <vector>
 
 #include <boost/optional.hpp>
-
 #include <glog/stl_logging.h>
-
 #include <gtest/gtest.h>
 
-#include "yb/client/client.h"
+#include "yb/client/schema.h"
+#include "yb/client/yb_table_name.h"
 
+#include "yb/common/wire_protocol-test-util.h"
 #include "yb/common/wire_protocol.h"
 #include "yb/common/wire_protocol.pb.h"
-#include "yb/common/wire_protocol-test-util.h"
 
-#include "yb/consensus/consensus_meta.h"
 #include "yb/consensus/consensus.proxy.h"
+#include "yb/consensus/consensus_meta.h"
+#include "yb/consensus/consensus_types.pb.h"
 #include "yb/consensus/opid_util.h"
 #include "yb/consensus/quorum_util.h"
 
-#include "yb/gutil/map-util.h"
-#include "yb/gutil/strings/join.h"
 #include "yb/gutil/strings/substitute.h"
 
-#include "yb/master/master.proxy.h"
+#include "yb/integration-tests/external_mini_cluster.h"
 
-#include "yb/rpc/rpc_controller.h"
+#include "yb/master/master_client.proxy.h"
+#include "yb/master/master_cluster.proxy.h"
+
+#include "yb/rpc/rpc_fwd.h"
 
 #include "yb/server/server_base.proxy.h"
+
 #include "yb/tserver/tablet_server_test_util.h"
 #include "yb/tserver/tserver_admin.proxy.h"
 #include "yb/tserver/tserver_service.pb.h"
 #include "yb/tserver/tserver_service.proxy.h"
 
+#include "yb/util/enums.h"
+#include "yb/util/format.h"
+#include "yb/util/logging.h"
+#include "yb/util/monotime.h"
+#include "yb/util/net/net_fwd.h"
 #include "yb/util/net/net_util.h"
+#include "yb/util/result.h"
+#include "yb/util/status.h"
+#include "yb/util/status_format.h"
+#include "yb/util/status_log.h"
+#include "yb/util/strongly_typed_bool.h"
 #include "yb/util/test_util.h"
 
 namespace yb {
@@ -96,7 +116,6 @@ using consensus::kInvalidOpIdIndex;
 using consensus::LeaderLeaseCheckMode;
 using consensus::LeaderLeaseStatus;
 using master::ListTabletServersResponsePB;
-using master::MasterServiceProxy;
 using master::TabletLocationsPB;
 using rpc::Messenger;
 using rpc::RpcController;
@@ -116,13 +135,18 @@ using tserver::TabletServerServiceProxy;
 using tserver::WriteRequestPB;
 using tserver::WriteResponsePB;
 
+TServerDetails::TServerDetails() : registration(new master::TSRegistrationPB) {
+}
+
+TServerDetails::~TServerDetails() = default;
+
 const string& TServerDetails::uuid() const {
   return instance_id.permanent_uuid();
 }
 
 std::string TServerDetails::ToString() const {
   return Format("TabletServer: $0, Rpc address: $1", instance_id.permanent_uuid(),
-                DesiredHostPort(registration.common(), CloudInfoPB()));
+                DesiredHostPort(registration->common(), CloudInfoPB()));
 }
 
 client::YBSchema SimpleIntKeyYBSchema() {
@@ -229,7 +253,7 @@ Status WaitForServersToAgree(const MonoDelta& timeout,
     *actual_index = 0;
   }
 
-  vector<OpIdType> opid_types{consensus::OpIdType::RECEIVED_OPID};
+  vector<consensus::OpIdType> opid_types{consensus::OpIdType::RECEIVED_OPID};
   if (must_be_committed) {
     // In this mode we require that last received and committed op ids from all servers converge
     // on the same value.
@@ -344,7 +368,7 @@ Status WaitUntilAllReplicasHaveOp(const int64_t log_index,
 }
 
 Status WaitUntilNumberOfAliveTServersEqual(int n_tservers,
-                                           MasterServiceProxy* master_proxy,
+                                           const master::MasterClusterProxy& master_proxy,
                                            const MonoDelta& timeout) {
 
   master::ListTabletServersRequestPB req;
@@ -359,7 +383,7 @@ Status WaitUntilNumberOfAliveTServersEqual(int n_tservers,
   MonoTime start = MonoTime::Now();
   MonoDelta passed = MonoDelta::FromMilliseconds(0);
   while (true) {
-    Status s = master_proxy->ListTabletServers(req, &resp, &controller);
+    Status s = master_proxy.ListTabletServers(req, &resp, &controller);
 
     if (s.ok() &&
         controller.status().ok() &&
@@ -390,27 +414,33 @@ Status WaitUntilNumberOfAliveTServersEqual(int n_tservers,
                                      n_tservers, timeout.ToMilliseconds()));
 }
 
-Status CreateTabletServerMap(MasterServiceProxy* master_proxy,
-                             rpc::ProxyCache* proxy_cache,
-                             TabletServerMap* ts_map) {
+Result<TabletServerMap> CreateTabletServerMap(ExternalMiniCluster* cluster) {
+  auto proxy = cluster->num_masters() > 1
+      ? cluster->GetLeaderMasterProxy<master::MasterClusterProxy>()
+      : cluster->GetMasterProxy<master::MasterClusterProxy>();
+  return CreateTabletServerMap(proxy, &cluster->proxy_cache());
+}
+
+Result<TabletServerMap> CreateTabletServerMap(
+    const master::MasterClusterProxy& proxy, rpc::ProxyCache* proxy_cache) {
   master::ListTabletServersRequestPB req;
   master::ListTabletServersResponsePB resp;
   rpc::RpcController controller;
 
-  RETURN_NOT_OK(master_proxy->ListTabletServers(req, &resp, &controller));
+  RETURN_NOT_OK(proxy.ListTabletServers(req, &resp, &controller));
   RETURN_NOT_OK(controller.status());
   if (resp.has_error()) {
     return STATUS(RemoteError, "Response had an error", resp.error().ShortDebugString());
   }
 
-  ts_map->clear();
+  TabletServerMap result;
   for (const ListTabletServersResponsePB::Entry& entry : resp.servers()) {
     HostPort host_port = HostPortFromPB(DesiredHostPort(
         entry.registration().common(), CloudInfoPB()));
 
     std::unique_ptr<TServerDetails> peer(new TServerDetails());
     peer->instance_id.CopyFrom(entry.instance_id());
-    peer->registration.CopyFrom(entry.registration());
+    peer->registration->CopyFrom(entry.registration());
 
     CreateTsClientProxies(host_port,
                           proxy_cache,
@@ -420,9 +450,9 @@ Status CreateTabletServerMap(MasterServiceProxy* master_proxy,
                           &peer->generic_proxy);
 
     const auto& key = peer->instance_id.permanent_uuid();
-    CHECK(ts_map->emplace(key, std::move(peer)).second) << "duplicate key: " << key;
+    CHECK(result.emplace(key, std::move(peer)).second) << "duplicate key: " << key;
   }
-  return Status::OK();
+  return result;
 }
 
 Status GetConsensusState(const TServerDetails* replica,
@@ -454,19 +484,19 @@ Status GetConsensusState(const TServerDetails* replica,
   return Status::OK();
 }
 
-Status WaitUntilCommittedConfigNumVotersIs(int config_size,
+Status WaitUntilCommittedConfigNumVotersIs(size_t config_size,
                                            const TServerDetails* replica,
                                            const std::string& tablet_id,
                                            const MonoDelta& timeout) {
   return WaitUntilCommittedConfigMemberTypeIs(config_size, replica, tablet_id, timeout,
-                                              RaftPeerPB::VOTER);
+                                              consensus::PeerMemberType::VOTER);
 }
 
-Status WaitUntilCommittedConfigMemberTypeIs(int config_size,
-                                           const TServerDetails* replica,
-                                           const std::string& tablet_id,
-                                           const MonoDelta& timeout,
-                                           RaftPeerPB::MemberType member_type) {
+Status WaitUntilCommittedConfigMemberTypeIs(size_t config_size,
+                                            const TServerDetails* replica,
+                                            const std::string& tablet_id,
+                                            const MonoDelta& timeout,
+                                            consensus::PeerMemberType member_type) {
   DCHECK_ONLY_NOTNULL(replica);
 
   MonoTime start = MonoTime::Now();
@@ -494,7 +524,7 @@ Status WaitUntilCommittedConfigMemberTypeIs(int config_size,
   }
   return STATUS(TimedOut, Substitute("Number of replicas of type $0 does not equal $1 after "
                                      "waiting for $2. Last consensus state: $3. Last status: $4",
-                                     RaftPeerPB::MemberType_Name(member_type), config_size,
+                                     PeerMemberType_Name(member_type), config_size,
                                      timeout.ToString(), cstate.ShortDebugString(), s.ToString()));
 }
 
@@ -892,7 +922,7 @@ namespace {
 Status AddServer(const TServerDetails* leader,
                  const std::string& tablet_id,
                  const TServerDetails* replica_to_add,
-                 consensus::RaftPeerPB::MemberType member_type,
+                 consensus::PeerMemberType member_type,
                  const boost::optional<int64_t>& cas_config_opid_index,
                  const MonoDelta& timeout,
                  TabletServerErrorPB::Code* error_code,
@@ -908,7 +938,7 @@ Status AddServer(const TServerDetails* leader,
   RaftPeerPB* peer = req.mutable_server();
   peer->set_permanent_uuid(replica_to_add->uuid());
   peer->set_member_type(member_type);
-  CopyRegistration(replica_to_add->registration.common(), peer);
+  CopyRegistration(replica_to_add->registration->common(), peer);
   if (cas_config_opid_index) {
     req.set_cas_config_opid_index(*cas_config_opid_index);
   }
@@ -971,7 +1001,7 @@ Status ListRunningTabletIds(const TServerDetails* ts,
   return Status::OK();
 }
 
-Status GetTabletLocations(const shared_ptr<MasterServiceProxy>& master_proxy,
+Status GetTabletLocations(ExternalMiniCluster* cluster,
                           const string& tablet_id,
                           const MonoDelta& timeout,
                           master::TabletLocationsPB* tablet_locations) {
@@ -980,7 +1010,8 @@ Status GetTabletLocations(const shared_ptr<MasterServiceProxy>& master_proxy,
   *req.add_tablet_ids() = tablet_id;
   rpc::RpcController rpc;
   rpc.set_timeout(timeout);
-  RETURN_NOT_OK(master_proxy->GetTabletLocations(req, &resp, &rpc));
+  RETURN_NOT_OK(cluster->GetMasterProxy<master::MasterClientProxy>().GetTabletLocations(
+      req, &resp, &rpc));
   if (resp.has_error()) {
     return StatusFromPB(resp.error().status());
   }
@@ -993,7 +1024,7 @@ Status GetTabletLocations(const shared_ptr<MasterServiceProxy>& master_proxy,
   return Status::OK();
 }
 
-Status GetTableLocations(const shared_ptr<MasterServiceProxy>& master_proxy,
+Status GetTableLocations(ExternalMiniCluster* cluster,
                          const YBTableName& table_name,
                          const MonoDelta& timeout,
                          const RequireTabletsRunning require_tablets_running,
@@ -1004,17 +1035,19 @@ Status GetTableLocations(const shared_ptr<MasterServiceProxy>& master_proxy,
   req.set_max_returned_locations(std::numeric_limits<int32_t>::max());
   rpc::RpcController rpc;
   rpc.set_timeout(timeout);
-  RETURN_NOT_OK(master_proxy->GetTableLocations(req, table_locations, &rpc));
+  RETURN_NOT_OK(cluster->GetMasterProxy<master::MasterClientProxy>().GetTableLocations(
+      req, table_locations, &rpc));
   if (table_locations->has_error()) {
     return StatusFromPB(table_locations->error().status());
   }
   return Status::OK();
 }
 
-Status WaitForNumVotersInConfigOnMaster(const shared_ptr<MasterServiceProxy>& master_proxy,
-                                        const std::string& tablet_id,
-                                        int num_voters,
-                                        const MonoDelta& timeout) {
+Status WaitForNumVotersInConfigOnMaster(
+    ExternalMiniCluster* cluster,
+    const std::string& tablet_id,
+    int num_voters,
+    const MonoDelta& timeout) {
   Status s;
   MonoTime deadline = MonoTime::Now();
   deadline.AddDelta(timeout);
@@ -1022,11 +1055,11 @@ Status WaitForNumVotersInConfigOnMaster(const shared_ptr<MasterServiceProxy>& ma
   while (true) {
     TabletLocationsPB tablet_locations;
     MonoDelta time_remaining = deadline.GetDeltaSince(MonoTime::Now());
-    s = GetTabletLocations(master_proxy, tablet_id, time_remaining, &tablet_locations);
+    s = GetTabletLocations(cluster, tablet_id, time_remaining, &tablet_locations);
     if (s.ok()) {
       num_voters_found = 0;
       for (const TabletLocationsPB::ReplicaPB& r : tablet_locations.replicas()) {
-        if (r.role() == RaftPeerPB::LEADER || r.role() == RaftPeerPB::FOLLOWER) num_voters_found++;
+        if (r.role() == PeerRole::LEADER || r.role() == PeerRole::FOLLOWER) num_voters_found++;
       }
       if (num_voters_found == num_voters) break;
     }
@@ -1164,12 +1197,13 @@ Status StartRemoteBootstrap(const TServerDetails* ts,
   return Status::OK();
 }
 
-Status GetLastOpIdForMasterReplica(const shared_ptr<ConsensusServiceProxy>& consensus_proxy,
-                                   const string& tablet_id,
-                                   const string& dest_uuid,
-                                   const consensus::OpIdType opid_type,
-                                   const MonoDelta& timeout,
-                                   OpIdPB* opid) {
+Status GetLastOpIdForMasterReplica(
+    const shared_ptr<consensus::ConsensusServiceProxy>& consensus_proxy,
+    const string& tablet_id,
+    const string& dest_uuid,
+    const consensus::OpIdType opid_type,
+    const MonoDelta& timeout,
+    OpIdPB* opid) {
   GetLastOpIdRequestPB opid_req;
   GetLastOpIdResponsePB opid_resp;
   RpcController controller;
@@ -1193,6 +1227,14 @@ Status GetLastOpIdForMasterReplica(const shared_ptr<ConsensusServiceProxy>& cons
   *opid = opid_resp.opid();
 
   return Status::OK();
+}
+
+Result<OpId> GetLastOpIdForReplica(
+    const TabletId& tablet_id,
+    TServerDetails* replica,
+    consensus::OpIdType opid_type,
+    const MonoDelta& timeout) {
+  return VERIFY_RESULT(GetLastOpIdForEachReplica(tablet_id, {replica}, opid_type, timeout))[0];
 }
 
 } // namespace itest

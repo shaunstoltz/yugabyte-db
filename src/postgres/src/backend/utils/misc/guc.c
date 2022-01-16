@@ -42,6 +42,7 @@
 #include "commands/vacuum.h"
 #include "commands/variable.h"
 #include "commands/trigger.h"
+#include "executor/ybcModifyTable.h"
 #include "funcapi.h"
 #include "jit/jit.h"
 #include "libpq/auth.h"
@@ -148,6 +149,8 @@ static bool call_bool_check_hook(struct config_bool *conf, bool *newval,
 					 void **extra, GucSource source, int elevel);
 static bool call_int_check_hook(struct config_int *conf, int *newval,
 					void **extra, GucSource source, int elevel);
+static bool call_oid_check_hook(struct config_oid *conf, Oid *newval,
+					void **extra, GucSource source, int elevel);
 static bool call_real_check_hook(struct config_real *conf, double *newval,
 					 void **extra, GucSource source, int elevel);
 static bool call_string_check_hook(struct config_string *conf, char **newval,
@@ -212,6 +215,8 @@ static void assign_ysql_upgrade_mode(bool newval, void *extra);
 static bool check_max_backoff(int *max_backoff_msecs, void **extra, GucSource source);
 static bool check_min_backoff(int *min_backoff_msecs, void **extra, GucSource source);
 static bool check_backoff_multiplier(double *multiplier, void **extra, GucSource source);
+static void check_reserved_prefixes(const char *varName);
+static List *reserved_class_prefix = NIL;
 
 /* Private functions in guc-file.l that need to be called from guc.c */
 static ConfigVariable *ProcessConfigFileInternal(GucContext context,
@@ -719,6 +724,7 @@ const char *const config_type_names[] =
 {
 	 /* PGC_BOOL */ "bool",
 	 /* PGC_INT */ "integer",
+	 /* PGC_OID */ "oid",
 	 /* PGC_REAL */ "real",
 	 /* PGC_STRING */ "string",
 	 /* PGC_ENUM */ "enum"
@@ -2008,6 +2014,26 @@ static struct config_bool ConfigureNamesBool[] =
 		NULL, NULL, NULL
 	},
 
+	{
+		{"force_global_transaction", PGC_USERSET, UNGROUPED,
+			gettext_noop("Forces use of global transaction table."),
+			NULL
+		},
+		&yb_force_global_transaction,
+		false,
+		NULL, NULL, NULL
+	},
+
+	{
+		{"yb_disable_transactional_writes", PGC_USERSET, CLIENT_CONN_STATEMENT,
+			gettext_noop("Sets the boolean flag to disable transaction writes."),
+			NULL
+		},
+		&yb_disable_transactional_writes,
+		false,
+		NULL, NULL, NULL
+	},
+
 	/* End-of-list marker */
 	{
 		{NULL, 0, 0, NULL, NULL}, NULL, false, NULL, NULL, NULL
@@ -3275,6 +3301,17 @@ static struct config_int ConfigureNamesInt[] =
 		NULL, NULL, NULL
 	},
 
+	{
+		{"yb_follower_read_staleness_ms", PGC_USERSET, CLIENT_CONN_STATEMENT,
+			gettext_noop("Sets the staleness (in ms) to be used for performing follower reads."),
+			NULL,
+			0
+		},
+		&yb_follower_read_staleness_ms,
+		30000, 0, INT_MAX,
+		check_follower_read_staleness_ms, NULL, NULL
+	},
+
 	/*
 	 * Default to a 1s delay because commits currently aren't guaranteed to be
 	 * visible across tservers.  Commits cause master to update catalog
@@ -3306,6 +3343,13 @@ static struct config_int ConfigureNamesInt[] =
 	}
 };
 
+static struct config_oid ConfigureNamesOid[] =
+{
+	/* End-of-list marker */
+	{
+		{NULL, 0, 0, NULL, NULL}, NULL, 0, 0, 0, NULL, NULL, NULL
+	}
+};
 
 static struct config_real ConfigureNamesReal[] =
 {
@@ -4213,7 +4257,7 @@ static struct config_enum ConfigureNamesEnum[] =
 		},
 		&DefaultXactIsoLevel,
 		XACT_READ_COMMITTED, isolation_level_options,
-		check_default_XactIsoLevel, NULL, NULL
+		NULL, NULL, NULL
 	},
 
 	{
@@ -4627,6 +4671,10 @@ extra_field_used(struct config_generic *gconf, void *extra)
 			if (extra == ((struct config_int *) gconf)->reset_extra)
 				return true;
 			break;
+		case PGC_OID:
+			if (extra == ((struct config_oid*) gconf)->reset_extra)
+				return true;
+			break;
 		case PGC_REAL:
 			if (extra == ((struct config_real *) gconf)->reset_extra)
 				return true;
@@ -4688,6 +4736,10 @@ set_stack_value(struct config_generic *gconf, config_var_value *val)
 			val->val.intval =
 				*((struct config_int *) gconf)->variable;
 			break;
+		case PGC_OID:
+			val->val.oidval =
+				*((struct config_oid *) gconf)->variable;
+			break;
 		case PGC_REAL:
 			val->val.realval =
 				*((struct config_real *) gconf)->variable;
@@ -4716,6 +4768,7 @@ discard_stack_value(struct config_generic *gconf, config_var_value *val)
 	{
 		case PGC_BOOL:
 		case PGC_INT:
+		case PGC_OID:
 		case PGC_REAL:
 		case PGC_ENUM:
 			/* no need to do anything */
@@ -4770,6 +4823,14 @@ build_guc_variables(void)
 		num_vars++;
 	}
 
+	for (i = 0; ConfigureNamesOid[i].gen.name; i++)
+	{
+		struct config_oid *conf = &ConfigureNamesOid[i];
+
+		conf->gen.vartype = PGC_OID;
+		num_vars++;
+	}
+
 	for (i = 0; ConfigureNamesReal[i].gen.name; i++)
 	{
 		struct config_real *conf = &ConfigureNamesReal[i];
@@ -4809,6 +4870,9 @@ build_guc_variables(void)
 
 	for (i = 0; ConfigureNamesInt[i].gen.name; i++)
 		guc_vars[num_vars++] = &ConfigureNamesInt[i].gen;
+
+	for (i = 0; ConfigureNamesOid[i].gen.name; i++)
+		guc_vars[num_vars++] = &ConfigureNamesOid[i].gen;
 
 	for (i = 0; ConfigureNamesReal[i].gen.name; i++)
 		guc_vars[num_vars++] = &ConfigureNamesReal[i].gen;
@@ -5164,6 +5228,24 @@ InitializeOneGUCOption(struct config_generic *gconf)
 				conf->gen.extra = conf->reset_extra = extra;
 				break;
 			}
+		case PGC_OID:
+			{
+				struct config_oid *conf = (struct config_oid *) gconf;
+				Oid			newval = conf->boot_val;
+				void	   *extra = NULL;
+
+				Assert(newval >= conf->min);
+				Assert(newval <= conf->max);
+				if (!call_oid_check_hook(conf, &newval, &extra,
+										 PGC_S_DEFAULT, LOG))
+					elog(FATAL, "failed to initialize %s to %u",
+						 conf->gen.name, newval);
+				if (conf->assign_hook)
+					conf->assign_hook(newval, extra);
+				*conf->variable = conf->reset_val = newval;
+				conf->gen.extra = conf->reset_extra = extra;
+				break;
+			}
 		case PGC_REAL:
 			{
 				struct config_real *conf = (struct config_real *) gconf;
@@ -5450,6 +5532,18 @@ ResetAllOptions(void)
 			case PGC_INT:
 				{
 					struct config_int *conf = (struct config_int *) gconf;
+
+					if (conf->assign_hook)
+						conf->assign_hook(conf->reset_val,
+										  conf->reset_extra);
+					*conf->variable = conf->reset_val;
+					set_extra_field(&conf->gen, &conf->gen.extra,
+									conf->reset_extra);
+					break;
+				}
+			case PGC_OID:
+				{
+					struct config_oid *conf = (struct config_oid *) gconf;
 
 					if (conf->assign_hook)
 						conf->assign_hook(conf->reset_val,
@@ -5806,6 +5900,24 @@ AtEOXact_GUC(bool isCommit, int nestLevel)
 							}
 							break;
 						}
+					case PGC_OID:
+						{
+							struct config_oid *conf = (struct config_oid *) gconf;
+							Oid			newval = newvalue.val.oidval;
+							void	   *newextra = newvalue.extra;
+
+							if (*conf->variable != newval ||
+								conf->gen.extra != newextra)
+							{
+								if (conf->assign_hook)
+									conf->assign_hook(newval, newextra);
+								*conf->variable = newval;
+								set_extra_field(&conf->gen, &conf->gen.extra,
+												newextra);
+								changed = true;
+							}
+							break;
+						}
 					case PGC_REAL:
 						{
 							struct config_real *conf = (struct config_real *) gconf;
@@ -6126,6 +6238,49 @@ parse_int(const char *value, int *result, int flags, const char **hintmsg)
 
 
 /*
+ * Try to parse value as an Oid, only accepts a decimal format.
+ *
+ * If the string parses okay, return true, else false.
+ * If okay and result is not NULL, return the value in *result.
+ * If not okay and hintmsg is not NULL, *hintmsg is set to a suitable
+ *	HINT message, or NULL if no hint provided.
+ *
+ * YB note: This is adapted from parse_int, with unit input removed.
+ */
+bool
+parse_oid(const char *value, Oid *result, const char **hintmsg)
+{
+	int64		val;
+	char	   *endptr;
+
+	/* To suppress compiler warnings, always set output params */
+	if (result)
+		*result = InvalidOid;
+	if (hintmsg)
+		*hintmsg = NULL;
+
+	/* We assume here that int64 is at least as wide as long */
+	errno = 0;
+	val = strtol(value, &endptr, 0);
+
+	if (endptr == value)
+		return false;			/* no HINT for integer syntax error */
+
+	if (errno == ERANGE || val != (int64) ((Oid) val))
+	{
+		if (hintmsg)
+			*hintmsg = val < 0 ? gettext_noop("Value cannot be negative.")
+							   : gettext_noop("Value exceeds Oid range.");
+		return false;
+	}
+
+	if (result)
+		*result = (Oid) val;
+	return true;
+}
+
+
+/*
  * Try to parse value as a floating point number in the usual format.
  * If the string parses okay, return true, else false.
  * If okay and result is not NULL, return the value in *result.
@@ -6324,6 +6479,36 @@ parse_and_validate_value(struct config_generic *record,
 				}
 
 				if (!call_int_check_hook(conf, &newval->intval, newextra,
+										 source, elevel))
+					return false;
+			}
+			break;
+		case PGC_OID:
+			{
+				struct config_oid *conf = (struct config_oid *) record;
+				const char *hintmsg;
+
+				if (!parse_oid(value, &newval->oidval, &hintmsg))
+				{
+					ereport(elevel,
+							(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+							 errmsg("invalid value for parameter \"%s\": \"%s\"",
+									name, value),
+							 hintmsg ? errhint("%s", _(hintmsg)) : 0));
+					return false;
+				}
+
+				if (newval->oidval < conf->min || newval->oidval > conf->max)
+				{
+					ereport(elevel,
+							(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+							 errmsg("%u is outside the valid range for parameter \"%s\" (%d .. %d)",
+									newval->oidval, name,
+									conf->min, conf->max)));
+					return false;
+				}
+
+				if (!call_oid_check_hook(conf, &newval->oidval, newextra,
 										 source, elevel))
 					return false;
 			}
@@ -6882,6 +7067,96 @@ set_config_option(const char *name, const char *value,
 #undef newval
 			}
 
+		case PGC_OID:
+			{
+				struct config_oid *conf = (struct config_oid *) record;
+
+#define newval (newval_union.oidval)
+
+				if (value)
+				{
+					if (!parse_and_validate_value(record, name, value,
+												  source, elevel,
+												  &newval_union, &newextra))
+						return 0;
+				}
+				else if (source == PGC_S_DEFAULT)
+				{
+					newval = conf->boot_val;
+					if (!call_oid_check_hook(conf, &newval, &newextra,
+											 source, elevel))
+						return 0;
+				}
+				else
+				{
+					newval = conf->reset_val;
+					newextra = conf->reset_extra;
+					source = conf->gen.reset_source;
+					context = conf->gen.reset_scontext;
+				}
+
+				if (prohibitValueChange)
+				{
+					if (*conf->variable != newval)
+					{
+						record->status |= GUC_PENDING_RESTART;
+						ereport(elevel,
+								(errcode(ERRCODE_CANT_CHANGE_RUNTIME_PARAM),
+								 errmsg("parameter \"%s\" cannot be changed without restarting the server",
+										name)));
+						return 0;
+					}
+					record->status &= ~GUC_PENDING_RESTART;
+					return -1;
+				}
+
+				if (changeVal)
+				{
+					/* Save old value to support transaction abort */
+					if (!makeDefault)
+						push_old_value(&conf->gen, action);
+
+					if (conf->assign_hook)
+						conf->assign_hook(newval, newextra);
+					*conf->variable = newval;
+					set_extra_field(&conf->gen, &conf->gen.extra,
+									newextra);
+					conf->gen.source = source;
+					conf->gen.scontext = context;
+				}
+				if (makeDefault)
+				{
+					GucStack   *stack;
+
+					if (conf->gen.reset_source <= source)
+					{
+						conf->reset_val = newval;
+						set_extra_field(&conf->gen, &conf->reset_extra,
+										newextra);
+						conf->gen.reset_source = source;
+						conf->gen.reset_scontext = context;
+					}
+					for (stack = conf->gen.stack; stack; stack = stack->prev)
+					{
+						if (stack->source <= source)
+						{
+							stack->prior.val.oidval = newval;
+							set_extra_field(&conf->gen, &stack->prior.extra,
+											newextra);
+							stack->source = source;
+							stack->scontext = context;
+						}
+					}
+				}
+
+				/* Perhaps we didn't install newextra anywhere */
+				if (newextra && !extra_field_used(&conf->gen, newextra))
+					free(newextra);
+				break;
+
+#undef newval
+			}
+
 		case PGC_REAL:
 			{
 				struct config_real *conf = (struct config_real *) record;
@@ -7278,6 +7553,11 @@ GetConfigOption(const char *name, bool missing_ok, bool restrict_privileged)
 					 *((struct config_int *) record)->variable);
 			return buffer;
 
+		case PGC_OID:
+			snprintf(buffer, sizeof(buffer), "%u",
+					 *((struct config_oid *) record)->variable);
+			return buffer;
+
 		case PGC_REAL:
 			snprintf(buffer, sizeof(buffer), "%g",
 					 *((struct config_real *) record)->variable);
@@ -7326,6 +7606,11 @@ GetConfigOptionResetString(const char *name)
 		case PGC_INT:
 			snprintf(buffer, sizeof(buffer), "%d",
 					 ((struct config_int *) record)->reset_val);
+			return buffer;
+
+		case PGC_OID:
+			snprintf(buffer, sizeof(buffer), "%u",
+					 ((struct config_oid *) record)->reset_val);
 			return buffer;
 
 		case PGC_REAL:
@@ -7881,6 +8166,7 @@ ExecSetVariableStmt(VariableSetStmt *stmt, bool isTopLevel)
 									 (superuser() ? PGC_SUSET : PGC_USERSET),
 									 PGC_S_SESSION,
 									 action, true, 0, false);
+			check_reserved_prefixes(stmt->name);
 			break;
 		case VAR_SET_MULTI:
 
@@ -7967,6 +8253,8 @@ ExecSetVariableStmt(VariableSetStmt *stmt, bool isTopLevel)
 									 (superuser() ? PGC_SUSET : PGC_USERSET),
 									 PGC_S_SESSION,
 									 action, true, 0, false);
+
+			check_reserved_prefixes(stmt->name);
 			break;
 		case VAR_RESET_ALL:
 			ResetAllOptions();
@@ -8366,6 +8654,36 @@ DefineCustomIntVariable(const char *name,
 }
 
 void
+DefineCustomOidVariable(const char *name,
+						const char *short_desc,
+						const char *long_desc,
+						Oid *valueAddr,
+						Oid bootValue,
+						Oid minValue,
+						Oid maxValue,
+						GucContext context,
+						int flags,
+						GucOidCheckHook check_hook,
+						GucOidAssignHook assign_hook,
+						GucShowHook show_hook)
+{
+	struct config_oid *var;
+
+	var = (struct config_oid *)
+		init_custom_variable(name, short_desc, long_desc, context, flags,
+							 PGC_OID, sizeof(struct config_oid));
+	var->variable = valueAddr;
+	var->boot_val = bootValue;
+	var->reset_val = bootValue;
+	var->min = minValue;
+	var->max = maxValue;
+	var->check_hook = check_hook;
+	var->assign_hook = assign_hook;
+	var->show_hook = show_hook;
+	define_custom_variable(&var->gen);
+}
+
+void
 DefineCustomRealVariable(const char *name,
 						 const char *short_desc,
 						 const char *long_desc,
@@ -8453,6 +8771,7 @@ EmitWarningsOnPlaceholders(const char *className)
 {
 	int			classLen = strlen(className);
 	int			i;
+	MemoryContext	oldcontext;
 
 	for (i = 0; i < num_guc_variables; i++)
 	{
@@ -8468,8 +8787,49 @@ EmitWarningsOnPlaceholders(const char *className)
 							var->name)));
 		}
 	}
+
+	oldcontext = MemoryContextSwitchTo(TopMemoryContext);
+	reserved_class_prefix = lappend(reserved_class_prefix, pstrdup(className));
+	MemoryContextSwitchTo(oldcontext);
 }
 
+/*
+ * Check a setting name against prefixes previously reserved by
+ * EmitWarningsOnPlaceholders() and throw a warning if matching.
+ */
+static void
+check_reserved_prefixes(const char *varName)
+{
+	char	   *sep = strchr(varName, GUC_QUALIFIER_SEPARATOR);
+
+	if (sep)
+	{
+		size_t		classLen = sep - varName;
+		ListCell   *lc;
+
+		foreach(lc, reserved_class_prefix)
+		{
+			char	   *rcprefix = lfirst(lc);
+
+			if (strncmp(varName, rcprefix, classLen) == 0)
+			{
+				for (int i = 0; i < num_guc_variables; i++)
+				{
+					struct config_generic *var = guc_variables[i];
+
+					if ((var->flags & GUC_CUSTOM_PLACEHOLDER) != 0 &&
+						strcmp(varName, var->name) == 0)
+					{
+						ereport(WARNING,
+								(errcode(ERRCODE_UNDEFINED_OBJECT),
+								 errmsg("unrecognized configuration parameter \"%s\"", var->name),
+								 errdetail("\"%.*s\" is a reserved prefix.", (int) classLen, var->name)));
+					}
+				}
+			}
+		}
+	}
+}
 
 /*
  * SHOW command
@@ -8766,6 +9126,32 @@ GetConfigOptionByNum(int varnum, const char **values, bool *noshow)
 				values[13] = pstrdup(lconf->reset_val ? "on" : "off");
 			}
 			break;
+
+		case PGC_OID:
+			{
+				struct config_oid *lconf = (struct config_oid *) conf;
+
+				/* min_val */
+				snprintf(buffer, sizeof(buffer), "%u", lconf->min);
+				values[9] = pstrdup(buffer);
+
+				/* max_val */
+				snprintf(buffer, sizeof(buffer), "%u", lconf->max);
+				values[10] = pstrdup(buffer);
+
+				/* enumvals */
+				values[11] = NULL;
+
+				/* boot_val */
+				snprintf(buffer, sizeof(buffer), "%u", lconf->boot_val);
+				values[12] = pstrdup(buffer);
+
+				/* reset_val */
+				snprintf(buffer, sizeof(buffer), "%u", lconf->reset_val);
+				values[13] = pstrdup(buffer);
+			}
+			break;
+
 
 		case PGC_INT:
 			{
@@ -9266,6 +9652,36 @@ _ShowOption(struct config_generic *record, bool use_units)
 			}
 			break;
 
+		case PGC_OID:
+			{
+				struct config_oid *conf = (struct config_oid *) record;
+
+				if (conf->show_hook)
+					val = conf->show_hook();
+				else
+				{
+					/*
+					 * Use int64 arithmetic to avoid overflows in units
+					 * conversion.
+					 */
+					int64		result = *conf->variable;
+					const char *unit;
+
+					if (use_units && result > 0 && (record->flags & GUC_UNIT))
+					{
+						convert_from_base_unit(result, record->flags & GUC_UNIT,
+											   &result, &unit);
+					}
+					else
+						unit = "";
+
+					snprintf(buffer, sizeof(buffer), INT64_FORMAT "%s",
+							 result, unit);
+					val = buffer;
+				}
+			}
+			break;
+
 		case PGC_REAL:
 			{
 				struct config_real *conf = (struct config_real *) record;
@@ -9355,6 +9771,14 @@ write_one_nondefault_variable(FILE *fp, struct config_generic *gconf)
 				struct config_int *conf = (struct config_int *) gconf;
 
 				fprintf(fp, "%d", *conf->variable);
+			}
+			break;
+
+		case PGC_OID:
+			{
+				struct config_oid *conf = (struct config_oid *) gconf;
+
+				fprintf(fp, "%u", *conf->variable);
 			}
 			break;
 
@@ -9621,6 +10045,22 @@ estimate_variable_size(struct config_generic *gconf)
 			}
 			break;
 
+		case PGC_OID:
+			{
+				struct config_oid *conf = (struct config_oid *) gconf;
+
+				/*
+				 * Instead of getting the exact display length, use max
+				 * length.  Also reduce the max length for typical ranges of
+				 * small values.  Maximum value is 4294967295, i.e. 10 chars.
+				 */
+				if ((*conf->variable) < 1000)
+					valsize = 3;
+				else
+					valsize = 10;
+			}
+			break;
+
 		case PGC_REAL:
 			{
 				/*
@@ -9781,6 +10221,14 @@ serialize_variable(char **destptr, Size *maxbytes,
 				struct config_int *conf = (struct config_int *) gconf;
 
 				do_serialize(destptr, maxbytes, "%d", *conf->variable);
+			}
+			break;
+
+		case PGC_OID:
+			{
+				struct config_oid *conf = (struct config_oid *) gconf;
+
+				do_serialize(destptr, maxbytes, "%u", *conf->variable);
 			}
 			break;
 
@@ -10443,6 +10891,40 @@ call_int_check_hook(struct config_int *conf, int *newval, void **extra,
 }
 
 static bool
+call_oid_check_hook(struct config_oid *conf, Oid *newval, void **extra,
+					GucSource source, int elevel)
+{
+	/* Quick success if no hook */
+	if (!conf->check_hook)
+		return true;
+
+	/* Reset variables that might be set by hook */
+	GUC_check_errcode_value = ERRCODE_INVALID_PARAMETER_VALUE;
+	GUC_check_errmsg_string = NULL;
+	GUC_check_errdetail_string = NULL;
+	GUC_check_errhint_string = NULL;
+
+	if (!conf->check_hook(newval, extra, source))
+	{
+		ereport(elevel,
+				(errcode(GUC_check_errcode_value),
+				 GUC_check_errmsg_string ?
+				 errmsg_internal("%s", GUC_check_errmsg_string) :
+				 errmsg("invalid value for parameter \"%s\": %u",
+						conf->gen.name, *newval),
+				 GUC_check_errdetail_string ?
+				 errdetail_internal("%s", GUC_check_errdetail_string) : 0,
+				 GUC_check_errhint_string ?
+				 errhint("%s", GUC_check_errhint_string) : 0));
+		/* Flush any strings created in ErrorContext */
+		FlushErrorState();
+		return false;
+	}
+
+	return true;
+}
+
+static bool
 call_real_check_hook(struct config_real *conf, double *newval, void **extra,
 					 GucSource source, int elevel)
 {
@@ -11028,7 +11510,7 @@ check_effective_io_concurrency(int *newval, void **extra, GucSource source)
 #else
 	if (*newval != 0)
 	{
-		GUC_check_errdetail("effective_io_concurrency must be set to 0 on platforms that lack posix_fadvise()");
+		GUC_check_errdetail("effective_io_concurrency must be set to 0 on platforms that lack posix_fadvise().");
 		return false;
 	}
 	return true;
@@ -11140,7 +11622,7 @@ static bool
 check_transaction_priority_lower_bound(double *newval, void **extra, GucSource source)
 {
 	if (*newval > yb_transaction_priority_upper_bound) {
-		GUC_check_errdetail("must be less than or equal to yb_transaction_priority_upper_bound (%f)",
+		GUC_check_errdetail("must be less than or equal to yb_transaction_priority_upper_bound (%f).",
 		                    yb_transaction_priority_upper_bound);
 		return false;
 	}
@@ -11152,7 +11634,7 @@ static bool
 check_transaction_priority_upper_bound(double *newval, void **extra, GucSource source)
 {
 	if (*newval < yb_transaction_priority_lower_bound) {
-		GUC_check_errdetail("must be greater than or equal to yb_transaction_priority_lower_bound (%f)",
+		GUC_check_errdetail("must be greater than or equal to yb_transaction_priority_lower_bound (%f).",
 		                    yb_transaction_priority_lower_bound);
 		return false;
 	}
@@ -11164,17 +11646,14 @@ static void
 assign_ysql_upgrade_mode(bool newval, void *extra)
 {
 	/*
-	 * YSQL upgrade mode also enables/disables allowSystemTableMods
-	 * and yb_non_ddl_txn_for_sys_tables_allowed.
+	 * YSQL upgrade mode also enables/disables allowSystemTableMods.
+	 * Note that PG doesn't allow user to change it at runtime.
 	 *
-	 * Note that PG doesn't allow user to change allowSystemTableMods.
-	 *
-	 * Also note that while we reuse allowSystemTableMods to cut some
-	 * corners for YSQL upgrade, we do alter the semantics of it to
-	 * imitate tables created by initdb rather than created by user.
+	 * While we reuse allowSystemTableMods to cut some corners for
+	 * YSQL upgrade, we do alter the semantics of it to imitate tables
+	 * created by initdb rather than by user.
 	 */
 	allowSystemTableMods = newval;
-	yb_non_ddl_txn_for_sys_tables_allowed = newval;
 }
 
 static bool
@@ -11182,7 +11661,7 @@ check_max_backoff(int *max_backoff_msecs, void **extra, GucSource source)
 {
 	if (*max_backoff_msecs < 0)
 	{
-		GUC_check_errdetail("must be greater than or equal to 0");
+		GUC_check_errdetail("must be greater than or equal to 0.");
 		return false;
 	}
 
@@ -11194,7 +11673,7 @@ check_min_backoff(int *min_backoff_msecs, void **extra, GucSource source)
 {
 	if (*min_backoff_msecs < 0)
 	{
-		GUC_check_errdetail("must be greater than or equal to 0");
+		GUC_check_errdetail("must be greater than or equal to 0.");
 		return false;
 	}
 
@@ -11206,7 +11685,7 @@ check_backoff_multiplier(double *multiplier, void **extra, GucSource source)
 {
 	if (*multiplier < 1)
 	{
-		GUC_check_errdetail("must be greater than or equal to 1");
+		GUC_check_errdetail("must be greater than or equal to 1.");
 		return false;
 	}
 	return true;

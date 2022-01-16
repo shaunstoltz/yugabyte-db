@@ -18,7 +18,7 @@
 #include <string>
 
 #include "yb/gutil/macros.h"
-#include "yb/docdb/doc_key.h"
+#include "yb/tablet/operations.pb.h"
 #include "yb/tablet/operations/operation.h"
 #include "yb/util/locks.h"
 
@@ -35,8 +35,7 @@ namespace tablet {
 // Operation Context for the Truncate operation.
 // Keeps track of the Operation states (request, result, ...)
 // Executes the truncate transaction.
-class TruncateOperation
-    : public OperationBase<OperationType::kTruncate, tserver::TruncateRequestPB> {
+class TruncateOperation : public OperationBase<OperationType::kTruncate, TruncatePB> {
  public:
   template <class... Args>
   explicit TruncateOperation(Args&&... args)

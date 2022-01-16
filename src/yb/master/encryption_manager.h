@@ -16,18 +16,18 @@
 
 #include <unordered_set>
 
-#include "yb/util/status.h"
-#include "yb/util/net/net_util.h"
-#include "yb/util/locks.h"
+#include "yb/encryption/encryption_fwd.h"
 
+#include "yb/master/master_encryption.fwd.h"
 #include "yb/master/master_fwd.h"
+#include "yb/master/master_heartbeat.fwd.h"
 
 #include "yb/rpc/rpc_fwd.h"
 
+#include "yb/util/status_fwd.h"
+#include "yb/util/locks.h"
+
 namespace yb {
-
-class UniverseKeysPB;
-
 namespace master {
 
 using HostPortSet = std::unordered_set<HostPort, HostPortHash>;
@@ -56,7 +56,7 @@ class EncryptionManager {
 
   CHECKED_STATUS GetUniverseKeyRegistry(rpc::ProxyCache* proxy_cache);
 
-  void PopulateUniverseKeys(const UniverseKeysPB& universe_key_registry);
+  void PopulateUniverseKeys(const encryption::UniverseKeysPB& universe_key_registry);
 
   CHECKED_STATUS AddPeersToGetUniverseKeyFrom(const HostPortSet& hps);
 
@@ -73,7 +73,7 @@ class EncryptionManager {
 
   mutable simple_spinlock universe_key_mutex_;
 
-  std::unique_ptr<UniverseKeysPB> universe_keys_ PT_GUARDED_BY(universe_key_mutex_);
+  std::unique_ptr<encryption::UniverseKeysPB> universe_keys_ PT_GUARDED_BY(universe_key_mutex_);
 };
 
 } // namespace master

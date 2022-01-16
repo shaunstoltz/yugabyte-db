@@ -22,6 +22,7 @@ import {
   setInitialValues,
   updateAlertConfig,
   updateAlertConfigResponse,
+  sendTestAlert,
   updateAlertDestination,
   updateAlertDestinationResponse,
   updateProfile,
@@ -31,6 +32,7 @@ import {
 import { closeDialog, openDialog } from '../../../actions/modal';
 import { fetchUniverseList, fetchUniverseListResponse } from '../../../actions/universe';
 import { AlertConfiguration } from './AlertConfiguration';
+import { createErrorMessage } from '../../../utils/ObjectUtils';
 
 const mapStateToProps = (state) => {
   return {
@@ -134,6 +136,13 @@ const mapDispatchToProps = (dispatch) => {
         return dispatch(updateAlertConfigResponse(response.payload));
       });
     },
+    sendTestAlert: (uuid) => {
+      sendTestAlert(uuid).then((response) => {
+        toast.success(response.data.message);
+      }).catch((error) => {
+        toast.error(createErrorMessage(error));
+      });
+    },
     updateAlertDestination: (payload, uuid) => {
       return dispatch(updateAlertDestination(payload, uuid)).then((response) => {
         if (response.error) {
@@ -189,20 +198,5 @@ const mapDispatchToProps = (dispatch) => {
     updateField: (form, field, newValue) => dispatch(change(form, field, newValue))
   };
 };
-
-const createErrorMessage = (payload) => {
-  const structuredError = payload?.response?.data?.error;
-  if (structuredError) {
-    if (typeof structuredError == 'string') {
-      return structuredError;
-    }
-    const message = Object.keys(structuredError).map(fieldName => {
-        const messages = structuredError[fieldName];
-        return fieldName + ": " + messages.join(', ');
-      }).join('\n');
-    return message;
-  }
-  return payload.message;
-}
 
 export default connect(mapStateToProps, mapDispatchToProps)(AlertConfiguration);
