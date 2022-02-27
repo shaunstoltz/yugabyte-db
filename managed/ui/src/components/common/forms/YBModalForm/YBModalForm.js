@@ -2,9 +2,11 @@
 
 import React, { Component } from 'react';
 import PropTypes from 'prop-types';
-import { Modal } from 'react-bootstrap';
+import { Modal, Button } from 'react-bootstrap';
 import { YBButton } from '../fields';
 import { Formik } from 'formik';
+//Icons
+import BackIcon from './images/back.svg';
 
 export default class YBModalForm extends Component {
   render() {
@@ -21,7 +23,10 @@ export default class YBModalForm extends Component {
       footerAccessory,
       showCancelButton,
       className,
-      normalizeFooter
+      dialogClassName,
+      headerClassName,
+      normalizeFooter,
+      showBackButton
     } = this.props;
 
     let footerButtonClass = '';
@@ -30,7 +35,13 @@ export default class YBModalForm extends Component {
     }
 
     return (
-      <Modal show={visible} onHide={onHide} bsSize={size} className={className}>
+      <Modal
+        show={visible}
+        onHide={onHide}
+        bsSize={size}
+        className={className}
+        dialogClassName={dialogClassName}
+      >
         <Formik
           initialValues={this.props.initialValues}
           validationSchema={this.props.validationSchema}
@@ -47,8 +58,15 @@ export default class YBModalForm extends Component {
                 props.handleSubmit(e);
               }}
             >
-              <Modal.Header closeButton>
-                <Modal.Title>{title}</Modal.Title>
+              <Modal.Header className={headerClassName} closeButton>
+                <Modal.Title>
+                  {showBackButton && (
+                    <Button className="modal-back-btn">
+                      <img alt="Back" src={BackIcon} className="cursor-pointer" onClick={onHide} />
+                    </Button>
+                  )}
+                  {title}
+                </Modal.Title>
                 <div
                   className={`yb-alert-item
                     ${error ? '' : 'hide'}`}
@@ -100,12 +118,14 @@ YBModalForm.propTypes = {
   footerAccessory: PropTypes.object,
   showCancelButton: PropTypes.bool,
   initialValues: PropTypes.object,
-  validationSchema: PropTypes.object
+  validationSchema: PropTypes.object,
+  showBackButton: PropTypes.bool
 };
 
 YBModalForm.defaultProps = {
   visible: false,
   submitLabel: 'OK',
   cancelLabel: 'Cancel',
-  showCancelButton: false
+  showCancelButton: false,
+  showBackButton: false
 };

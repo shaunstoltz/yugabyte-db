@@ -37,6 +37,10 @@
 #include "yb/yql/cql/ql/ptree/pt_select.h"
 #include "yb/yql/cql/ql/util/statement_params.h"
 
+DEFINE_int32(cql_prepare_child_threshold_ms, 2000,
+             "Timeout if preparing for child transaction takes longer"
+             "than the prescribed threshold.");
+
 namespace yb {
 namespace ql {
 
@@ -93,12 +97,26 @@ Status ExecContext::StartTransaction(
 
 Status ExecContext::PrepareChildTransaction(
     CoarseTimePoint deadline, ChildTransactionDataPB* data) {
-  ChildTransactionDataPB result =
-      VERIFY_RESULT(DCHECK_NOTNULL(transaction_.get())->PrepareChildFuture(
-           client::ForceConsistentRead::kTrue,
-           deadline).get());
-  *data = std::move(result);
-  return Status::OK();
+  auto future = DCHECK_NOTNULL(transaction_.get())->PrepareChildFuture(
+      client::ForceConsistentRead::kTrue, deadline);
+
+  // Set the deadline to be the earlier of the input deadline and the current timestamp
+  // plus the waiting time for the prepare child
+  auto future_deadline = std::min(
+      deadline,
+      CoarseMonoClock::Now() + MonoDelta::FromMilliseconds(FLAGS_cql_prepare_child_threshold_ms));
+
+  auto future_status = future.wait_until(future_deadline);
+
+  if (future_status == std::future_status::ready) {
+    *data = VERIFY_RESULT(std::move(future).get());
+    return Status::OK();
+  }
+
+  auto message = Format("Timed out waiting for prepare child status, left to deadline: $0",
+                        MonoDelta(deadline - CoarseMonoClock::now()));
+  LOG(INFO) << message;
+  return STATUS(TimedOut, message);
 }
 
 Status ExecContext::ApplyChildTransactionResult(const ChildTransactionResultPB& result) {
@@ -311,10 +329,11 @@ void TnodeContext::AdvanceToNextPartition(QLReadRequestPB *req) {
   //    h4 = 6 since pos is "3 % 1 = 0", new partition counter is "3 / 1 = 3".
   //    h3 = 5 since pos is "3 % 2 = 1", pos is non-zero which guarantees previous cols don't need
   //    to be changed (i.e. are the same as for previous partition index) so we break.
-  for (int i = hash_key_size - 1; i >= fixed_cols_size; i--) {
+  for (size_t i = hash_key_size; i > fixed_cols_size;) {
+    --i;
     const auto& options = (*hash_values_options_)[i - fixed_cols_size];
     auto pos = partition_counter % options.size();
-    *req->mutable_hashed_column_values(i) = options[pos];
+    *req->mutable_hashed_column_values(narrow_cast<int>(i)) = options[pos];
     if (pos != 0) break; // The previous position hash values must be unchanged.
     partition_counter /= options.size();
   }

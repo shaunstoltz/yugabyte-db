@@ -157,11 +157,11 @@ DEFINE_test_flag(double, fault_crash_in_split_before_log_flushed, 0.0,
                  "Fraction of the time when the tablet will crash immediately before flushing a "
                  "parent tablet's kSplit operation.");
 
-DEFINE_test_flag(int32, crash_if_remote_bootstrap_sessions_greater_than, 0,
+DEFINE_test_flag(uint64, crash_if_remote_bootstrap_sessions_greater_than, 0,
                  "If greater than zero, this process will crash if we detect more than the "
                  "specified number of remote bootstrap sessions.");
 
-DEFINE_test_flag(int32, crash_if_remote_bootstrap_sessions_per_table_greater_than, 0,
+DEFINE_test_flag(uint64, crash_if_remote_bootstrap_sessions_per_table_greater_than, 0,
                  "If greater than zero, this process will crash if for any table we exceed the "
                  "specified number of remote bootstrap sessions");
 
@@ -183,6 +183,10 @@ DEFINE_test_flag(bool, skip_post_split_compaction, false,
 DEFINE_int32(verify_tablet_data_interval_sec, 0,
              "The tick interval time for the tablet data integrity verification background task. "
              "This defaults to 0, which means disable the background task.");
+
+DEFINE_int32(cleanup_metrics_interval_sec, 60,
+             "The tick interval time for the metrics cleanup background task. "
+             "If set to 0, it disables the background task.");
 
 DEFINE_bool(skip_tablet_data_verification, false,
             "Skip checking tablet data for corruption.");
@@ -321,6 +325,11 @@ void TSTabletManager::VerifyTabletData() {
   }
 }
 
+void TSTabletManager::CleanupOldMetrics() {
+  VLOG(2) << "Cleaning up old metrics";
+  metric_registry_->RetireOldMetrics();
+}
+
 TSTabletManager::TSTabletManager(FsManager* fs_manager,
                                  TabletServer* server,
                                  MetricRegistry* metric_registry)
@@ -333,6 +342,7 @@ TSTabletManager::TSTabletManager(FsManager* fs_manager,
       METRIC_op_apply_queue_time.Instantiate(server_->metric_entity()),
       METRIC_op_apply_run_time.Instantiate(server_->metric_entity())
   };
+  tablet_options_.ServerMetricEntity = server_->metric_entity();
   CHECK_OK(ThreadPoolBuilder("apply")
                .set_metrics(std::move(metrics))
                .Build(&apply_pool_));
@@ -510,6 +520,9 @@ Status TSTabletManager::Init() {
   verify_tablet_data_poller_ = std::make_unique<rpc::Poller>(
       LogPrefix(), std::bind(&TSTabletManager::VerifyTabletData, this));
 
+  metrics_cleaner_ = std::make_unique<rpc::Poller>(
+      LogPrefix(), std::bind(&TSTabletManager::CleanupOldMetrics, this));
+
   return Status::OK();
 }
 
@@ -560,6 +573,14 @@ Status TSTabletManager::Start() {
   } else {
     LOG(INFO)
         << "Tablet data verification is disabled by verify_tablet_data_interval_sec flag set to 0";
+  }
+  if (FLAGS_cleanup_metrics_interval_sec > 0) {
+    metrics_cleaner_->Start(
+        &server_->messenger()->scheduler(), FLAGS_cleanup_metrics_interval_sec * 1s);
+    LOG(INFO) << "Old metrics cleanup task started...";
+  } else {
+    LOG(INFO)
+        << "Old metrics cleanup is disabled by cleanup_metrics_interval_sec flag set to 0";
   }
 
   return Status::OK();
@@ -1496,6 +1517,8 @@ void TSTabletManager::StartShutdown() {
 
   verify_tablet_data_poller_->Shutdown();
 
+  metrics_cleaner_->Shutdown();
+
   async_client_init_->Shutdown();
 
   mem_manager_->Shutdown();
@@ -1943,7 +1966,7 @@ void TSTabletManager::GenerateTabletReport(TabletReportPB* report, bool include_
   for (const auto& replica : to_report) {
     CreateReportedTabletPB(replica, report->add_updated_tablets());
     // Enforce a max tablet limit on reported tablets.
-    if (report->updated_tablets_size() >= report_limit) break;
+    if (implicit_cast<size_t>(report->updated_tablets_size()) >= report_limit) break;
   }
   report->set_remaining_tablet_count(
       narrow_cast<int>(dirty_count - report->updated_tablets_size()));
@@ -1973,13 +1996,13 @@ void TSTabletManager::StartFullTabletReport(TabletReportPB* report) {
   for (const auto& replica : to_report) {
     CreateReportedTabletPB(replica, report->add_updated_tablets());
     // Enforce a max tablet limit on reported tablets.
-    if (report->updated_tablets_size() >= report_limit) break;
+    if (implicit_cast<size_t>(report->updated_tablets_size()) >= report_limit) break;
   }
   report->set_remaining_tablet_count(
       narrow_cast<int32_t>(dirty_count - report->updated_tablets_size()));
 }
 
-void TSTabletManager::MarkTabletReportAcknowledged(int32_t acked_seq,
+void TSTabletManager::MarkTabletReportAcknowledged(uint32_t acked_seq,
                                                    const TabletReportUpdatesPB& updates,
                                                    bool dirty_check) {
   std::lock_guard<RWMutex> l(mutex_);
@@ -2278,7 +2301,7 @@ void TSTabletManager::MaybeDoChecksForTests(const TableId& table_id) {
   // First check that the global RBS limits are respected if the flag is non-zero.
   if (PREDICT_FALSE(FLAGS_TEST_crash_if_remote_bootstrap_sessions_greater_than > 0) &&
       tablets_being_remote_bootstrapped_.size() >
-      FLAGS_TEST_crash_if_remote_bootstrap_sessions_greater_than) {
+          FLAGS_TEST_crash_if_remote_bootstrap_sessions_greater_than) {
     string tablets;
     // The purpose of limiting the number of remote bootstraps is to cap how much
     // network bandwidth all the RBS sessions use.
@@ -2288,7 +2311,7 @@ void TSTabletManager::MaybeDoChecksForTests(const TableId& table_id) {
     // because a few tablets are already open, and in the RUNNING state, but still
     // in the tablets_being_remote_bootstrapped_ list, we check the state of each
     // tablet before deciding if the load balancer has violated the concurrent RBS limit.
-    int count = 0;
+    size_t count = 0;
     for (const auto& tablet_id : tablets_being_remote_bootstrapped_) {
       TabletPeerPtr* tablet_peer = FindOrNull(tablet_map_, tablet_id);
       if (tablet_peer && (*tablet_peer)->state() == RaftGroupStatePB::RUNNING) {
@@ -2313,7 +2336,7 @@ void TSTabletManager::MaybeDoChecksForTests(const TableId& table_id) {
       tablets_being_remote_bootstrapped_per_table_[table_id].size() >
           FLAGS_TEST_crash_if_remote_bootstrap_sessions_per_table_greater_than) {
     string tablets;
-    int count = 0;
+    size_t count = 0;
     for (const auto& tablet_id : tablets_being_remote_bootstrapped_per_table_[table_id]) {
       TabletPeerPtr* tablet_peer = FindOrNull(tablet_map_, tablet_id);
       if (tablet_peer && (*tablet_peer)->state() == RaftGroupStatePB::RUNNING) {

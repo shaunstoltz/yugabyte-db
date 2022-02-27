@@ -64,6 +64,7 @@
 #include "yb/util/monotime.h"
 #include "yb/util/net/net_util.h"
 #include "yb/util/status.h"
+#include "yb/util/tsan_util.h"
 
 namespace yb {
 
@@ -239,12 +240,12 @@ class ExternalMiniCluster : public MiniClusterBase {
   //
   // NOTE: if a leader election occurs after this method is executed, the last result may not be
   // valid.
-  CHECKED_STATUS GetLeaderMasterIndex(int* idx);
+  Result<size_t> GetLeaderMasterIndex();
 
   // Return a non-leader master index
-  CHECKED_STATUS GetFirstNonLeaderMasterIndex(int* idx);
+  Result<size_t> GetFirstNonLeaderMasterIndex();
 
-  Result<int> GetTabletLeaderIndex(const std::string& tablet_id);
+  Result<size_t> GetTabletLeaderIndex(const std::string& tablet_id);
 
   // The comma separated string of the master adresses host/ports from current list of masters.
   string GetMasterAddresses() const;
@@ -353,7 +354,7 @@ class ExternalMiniCluster : public MiniClusterBase {
   T GetProxy(ExternalDaemon* daemon);
 
   template <class T>
-  T GetTServerProxy(int i) {
+  T GetTServerProxy(size_t i) {
     return GetProxy<T>(tablet_server(i));
   }
 
@@ -408,7 +409,8 @@ class ExternalMiniCluster : public MiniClusterBase {
   CHECKED_STATUS WaitForTSToCrash(const ExternalTabletServer* ts,
                           const MonoDelta& timeout = MonoDelta::FromSeconds(60));
 
-  CHECKED_STATUS WaitForTSToCrash(int index, const MonoDelta& timeout = MonoDelta::FromSeconds(60));
+  CHECKED_STATUS WaitForTSToCrash(
+      size_t index, const MonoDelta& timeout = MonoDelta::FromSeconds(60));
 
   // Sets the given flag on the given daemon, which must be running.
   //
@@ -449,7 +451,14 @@ class ExternalMiniCluster : public MiniClusterBase {
   string data_root() const { return data_root_; }
 
   // Return true if the tserver has been marked as DEAD by master leader.
-  Result<bool> is_ts_stale(int ts_idx);
+  Result<bool> is_ts_stale(
+      int ts_idx, MonoDelta deadline = MonoDelta::FromSeconds(120) * kTimeMultiplier);
+
+  CHECKED_STATUS WaitForMasterToMarkTSAlive(
+      int ts_idx, MonoDelta deadline = MonoDelta::FromSeconds(120) * kTimeMultiplier);
+
+  CHECKED_STATUS WaitForMasterToMarkTSDead(
+      int ts_idx, MonoDelta deadline = MonoDelta::FromSeconds(120) * kTimeMultiplier);
 
  protected:
   FRIEND_TEST(MasterFailoverTest, TestKillAnyMaster);
@@ -469,7 +478,7 @@ class ExternalMiniCluster : public MiniClusterBase {
   std::string GetClusterDataDirName() const;
 
   // Helper function to get a leader or (random) follower index
-  CHECKED_STATUS GetPeerMasterIndex(int* idx, bool is_leader);
+  Result<size_t> GetPeerMasterIndex(bool is_leader);
 
   // API to help update the cluster state (rpc ports)
   CHECKED_STATUS AddMaster(ExternalMaster* master);

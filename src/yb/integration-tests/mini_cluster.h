@@ -33,6 +33,7 @@
 #ifndef YB_INTEGRATION_TESTS_MINI_CLUSTER_H_
 #define YB_INTEGRATION_TESTS_MINI_CLUSTER_H_
 
+#include <chrono>
 #include <memory>
 #include <string>
 #include <thread>
@@ -55,6 +56,7 @@
 
 #include "yb/util/env.h"
 #include "yb/util/port_picker.h"
+#include "yb/util/tsan_util.h"
 
 namespace yb {
 
@@ -160,7 +162,7 @@ class MiniCluster : public MiniClusterBase {
   // elected within kMasterLeaderElectionWaitTimeSeconds. May block until a leader Master is ready.
   Result<master::MiniMaster*> GetLeaderMiniMaster();
 
-  int LeaderMasterIdx();
+  ssize_t LeaderMasterIdx();
 
   // Returns the Master at index 'idx' for this MiniCluster.
   master::MiniMaster* mini_master(size_t idx);
@@ -292,6 +294,10 @@ std::vector<tablet::TabletPeerPtr> ListTableInactiveSplitTabletPeers(
 std::vector<tablet::TabletPeerPtr> ListActiveTabletLeadersPeers(
     MiniCluster* cluster);
 
+Result<std::vector<tablet::TabletPeerPtr>> WaitForTableActiveTabletLeadersPeers(
+    MiniCluster* cluster, const TableId& table_id, size_t num_active_leaders,
+    MonoDelta timeout = std::chrono::seconds(30) * kTimeMultiplier);
+
 CHECKED_STATUS WaitUntilTabletHasLeader(
     MiniCluster* cluster, const std::string& tablet_id, MonoTime deadline);
 
@@ -344,7 +350,7 @@ YB_DEFINE_ENUM(Connectivity, (kOn)(kOff));
 CHECKED_STATUS BreakConnectivity(MiniCluster* cluster, size_t idx1, size_t idx2);
 CHECKED_STATUS SetupConnectivity(
     MiniCluster* cluster, size_t idx1, size_t idx2, Connectivity connectivity);
-Result<int> ServerWithLeaders(MiniCluster* cluster);
+Result<size_t> ServerWithLeaders(MiniCluster* cluster);
 
 // Sets FLAGS_rocksdb_compact_flush_rate_limit_bytes_per_sec and also adjusts rate limiter
 // for already created tablets.

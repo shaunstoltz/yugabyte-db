@@ -46,6 +46,8 @@
 #include "yb/client/client.h"
 #include "yb/client/table.h"
 #include "yb/client/table_creator.h"
+#include "yb/client/table_alterer.h"
+#include "yb/client/table_info.h"
 
 #include "yb/common/json_util.h"
 #include "yb/common/redis_constants_common.h"
@@ -667,6 +669,27 @@ Status ClusterAdminClient::SetTabletPeerInfo(
   return Status::OK();
 }
 
+CHECKED_STATUS ClusterAdminClient::SetWalRetentionSecs(
+  const YBTableName& table_name,
+  const uint32_t wal_ret_secs) {
+  auto alterer = yb_client_->NewTableAlterer(table_name);
+  RETURN_NOT_OK(alterer->SetWalRetentionSecs(wal_ret_secs)->Alter());
+  cout << "Set table " << table_name.table_name() << " WAL retention time to " << wal_ret_secs
+       << " seconds." << endl;
+  return Status::OK();
+}
+
+CHECKED_STATUS ClusterAdminClient::GetWalRetentionSecs(const YBTableName& table_name) {
+  const auto info = VERIFY_RESULT(yb_client_->GetYBTableInfo(table_name));
+  if (!info.wal_retention_secs) {
+    cout << "WAL retention time not set for table " << table_name.table_name() << endl;
+  } else {
+    cout << "Found WAL retention time for table " << table_name.table_name() << ": "
+         << info.wal_retention_secs.get() << " seconds" << endl;
+  }
+  return Status::OK();
+}
+
 Status ClusterAdminClient::ParseChangeType(
     const string& change_type,
     consensus::ChangeConfigType* cc_type) {
@@ -841,11 +864,11 @@ Status ClusterAdminClient::ListLeaderCounts(const YBTableName& table_name) {
   }
 
   if (!leader_dist.empty()) {
-    for (int i = 0; i < leader_dist.size(); ++i) {
+    for (size_t i = 0; i < leader_dist.size(); ++i) {
       best_case.push_back(total_leader_count / leader_dist.size());
       worst_case.push_back(0);
     }
-    for (int i = 0; i < total_leader_count % leader_dist.size(); ++i) {
+    for (size_t i = 0; i < total_leader_count % leader_dist.size(); ++i) {
       ++best_case[i];
     }
     worst_case[0] = total_leader_count;
@@ -1246,8 +1269,14 @@ Status ClusterAdminClient::ListTables(bool include_db_type,
   return Status::OK();
 }
 
+struct FollowerDetails {
+  string uuid;
+  string host_port;
+  FollowerDetails(const string &u, const string &hp) : uuid(u), host_port(hp) {}
+};
+
 Status ClusterAdminClient::ListTablets(
-    const YBTableName& table_name, int max_tablets, bool json) {
+    const YBTableName& table_name, int max_tablets, bool json, bool followers) {
   vector<string> tablet_uuids, ranges;
   std::vector<master::TabletLocationsPB> locations;
   RETURN_NOT_OK(yb_client_->GetTablets(
@@ -1260,13 +1289,20 @@ Status ClusterAdminClient::ListTablets(
   if (!json) {
     cout << RightPadToUuidWidth("Tablet-UUID") << kColumnSep
          << RightPadToWidth("Range", kPartitionRangeColWidth) << kColumnSep
-         << RightPadToWidth("Leader-IP", kLongColWidth) << kColumnSep << "Leader-UUID" << endl;
+         << RightPadToWidth("Leader-IP", kLongColWidth) << kColumnSep << "Leader-UUID";
+    if (followers) {
+      cout << kColumnSep << "Followers";
+    }
+    cout << endl;
   }
 
-  for (int i = 0; i < tablet_uuids.size(); i++) {
+  for (size_t i = 0; i < tablet_uuids.size(); i++) {
     const string& tablet_uuid = tablet_uuids[i];
     string leader_host_port;
     string leader_uuid;
+    string follower_host_port;
+    vector<FollowerDetails> follower_list;
+    string follower_list_str;
     const auto& locations_of_this_tablet = locations[i];
     for (const auto& replica : locations_of_this_tablet.replicas()) {
       if (replica.role() == PeerRole::LEADER) {
@@ -1276,6 +1312,20 @@ Status ClusterAdminClient::ListTablets(
         } else {
           LOG(ERROR) << "Multiple leader replicas found for tablet " << tablet_uuid
                      << ": " << locations_of_this_tablet.ShortDebugString();
+        }
+      } else {
+        if (followers) {
+          string follower_host_port =
+            HostPortPBToString(replica.ts_info().private_rpc_addresses(0));
+          if (json) {
+            follower_list.push_back(
+                FollowerDetails(replica.ts_info().permanent_uuid(), follower_host_port));
+          } else {
+            if (!follower_list_str.empty()) {
+              follower_list_str += ",";
+            }
+            follower_list_str += follower_host_port;
+          }
         }
       }
     }
@@ -1294,11 +1344,27 @@ Status ClusterAdminClient::ListTablets(
       AddStringField("uuid", leader_uuid, &json_leader, &document.GetAllocator());
       AddStringField("endpoint", leader_host_port, &json_leader, &document.GetAllocator());
       json_tablet.AddMember(rapidjson::StringRef("leader"), json_leader, document.GetAllocator());
+      if (followers) {
+        rapidjson::Value json_followers(rapidjson::kArrayType);
+        CHECK(json_followers.IsArray());
+        for (const FollowerDetails &follower : follower_list) {
+          rapidjson::Value json_follower(rapidjson::kObjectType);
+          AddStringField("uuid", follower.uuid, &json_follower, &document.GetAllocator());
+          AddStringField("endpoint", follower.host_port, &json_follower, &document.GetAllocator());
+          json_followers.PushBack(json_follower, document.GetAllocator());
+        }
+        json_tablet.AddMember(rapidjson::StringRef("followers"), json_followers,
+                              document.GetAllocator());
+      }
       json_tablets.PushBack(json_tablet, document.GetAllocator());
     } else {
       cout << tablet_uuid << kColumnSep << RightPadToWidth(ranges[i], kPartitionRangeColWidth)
            << kColumnSep << RightPadToWidth(leader_host_port, kLongColWidth) << kColumnSep
-           << leader_uuid << endl;
+           << leader_uuid;
+      if (followers) {
+        cout << kColumnSep << follower_list_str;
+      }
+      cout << endl;
     }
   }
 
@@ -1680,7 +1746,7 @@ Status ClusterAdminClient::FillPlacementInfo(
         + std::to_string(placement_info_split.size()));
   }
 
-  for (int iter = 0; iter < placement_info_split.size(); iter++) {
+  for (size_t iter = 0; iter < placement_info_split.size(); iter++) {
     std::vector<std::string> placement_block = strings::Split(placement_info_split[iter], ":",
                                                               strings::SkipEmpty());
 
@@ -1731,7 +1797,7 @@ Status ClusterAdminClient::ModifyTablePlacementInfo(
   master::PlacementInfoPB* live_replicas = new master::PlacementInfoPB;
   live_replicas->set_num_replicas(replication_factor);
   // Iterate over the placement blocks of the placementInfo structure.
-  for (int iter = 0; iter < placement_info_split.size(); iter++) {
+  for (size_t iter = 0; iter < placement_info_split.size(); iter++) {
     std::vector<std::string> block = strings::Split(placement_info_split[iter], ".",
                                                     strings::SkipEmpty());
     if (block.size() != 3) {
@@ -1768,10 +1834,11 @@ Status ClusterAdminClient::ModifyPlacementInfo(
   std::vector<std::string> placement_info_split = strings::Split(
       placement_info, ",", strings::AllowEmpty());
   if (placement_info_split.size() < 1) {
-    return STATUS(InvalidCommand, "Cluster config must be a list of "
-    "placement infos seperated by commas. "
-    "Format: 'cloud1.region1.zone1,cloud2.region2.zone2,cloud3.region3.zone3 ..."
-    + std::to_string(placement_info_split.size()));
+    return STATUS(
+        InvalidCommand,
+        "Cluster config must be a list of placement infos seperated by commas. Format: "
+        "cloud1.region1.zone1:[min_replica_count1],cloud2.region2.zone2:[min_replica_count2] ..."
+        + std::to_string(placement_info_split.size()));
   }
   master::ChangeMasterClusterConfigRequestPB req_new_cluster_config;
   master::SysClusterConfigEntryPB* sys_cluster_config_entry =
@@ -1779,10 +1846,39 @@ Status ClusterAdminClient::ModifyPlacementInfo(
   master::PlacementInfoPB* live_replicas = new master::PlacementInfoPB;
   live_replicas->set_num_replicas(replication_factor);
 
+  int total_min_replica_count = 0;
+
   // Iterate over the placement blocks of the placementInfo structure.
   std::unordered_map<std::string, int> placement_to_min_replicas;
-  for (int iter = 0; iter < placement_info_split.size(); iter++) {
-    placement_to_min_replicas[placement_info_split[iter]]++;
+  for (const auto& placement_block : placement_info_split) {
+    std::vector<std::string> placement_info_min_replica_split =
+        strings::Split(placement_block, ":", strings::AllowEmpty());
+
+    if (placement_info_min_replica_split.size() == 0 ||
+        placement_info_min_replica_split.size() > 2) {
+      return STATUS(
+          InvalidCommand,
+          "Each placement info must have at most 2 values separated by a colon. "
+          "Format: cloud.region.zone:[min_replica_count]. Invalid placement info: "
+          + placement_block);
+    }
+
+    std::string placement_target = placement_info_min_replica_split[0];
+    int placement_min_replica_count = 1;
+
+    if (placement_info_min_replica_split.size() == 2) {
+      placement_min_replica_count = VERIFY_RESULT(CheckedStoi(placement_info_min_replica_split[1]));
+    }
+
+    total_min_replica_count += placement_min_replica_count;
+    placement_to_min_replicas[placement_target] += placement_min_replica_count;
+  }
+
+  if (total_min_replica_count > replication_factor) {
+    return STATUS(
+        InvalidCommand,
+        "replication_factor should be greater than or equal to the total of replica counts "
+        "specified in placement_info.");
   }
 
   for (const auto& placement_block : placement_to_min_replicas) {
@@ -1892,6 +1988,25 @@ Result<rapidjson::Document> ClusterAdminClient::DdlLog() {
 }
 
 Status ClusterAdminClient::UpgradeYsql() {
+  {
+    master::IsInitDbDoneRequestPB req;
+    auto res = InvokeRpc(
+        &master::MasterAdminProxy::IsInitDbDone, *master_admin_proxy_, req);
+    if (!res.ok()) {
+      return res.status();
+    }
+    if (!res->done()) {
+      cout << "Upgrade is not needed since YSQL is disabled" << endl;
+      return Status::OK();
+    }
+    if (res->done() && res->has_error()) {
+      return STATUS_FORMAT(IllegalState,
+                           "YSQL is not ready, initdb finished with an error: $0",
+                           res->error());
+    }
+    // Otherwise, we can proceed.
+  }
+
   // Pick some alive TServer.
   RepeatedPtrField<ListTabletServersResponsePB::Entry> servers;
   RETURN_NOT_OK(ListTabletServers(&servers));
@@ -1916,10 +2031,13 @@ Status ClusterAdminClient::UpgradeYsql() {
   TabletServerAdminServiceProxy ts_admin_proxy(proxy_cache_.get(), HostPortFromPB(*ts_rpc_addr));
 
   UpgradeYsqlRequestPB req;
-  const auto resp = VERIFY_RESULT(InvokeRpc(&TabletServerAdminServiceProxy::UpgradeYsql,
-                                            ts_admin_proxy, req));
-  if (resp.has_error()) {
-    return StatusFromPB(resp.error().status());
+  const auto resp_result = InvokeRpc(&TabletServerAdminServiceProxy::UpgradeYsql,
+                                     ts_admin_proxy, req);
+  if (!resp_result.ok()) {
+    return resp_result.status();
+  }
+  if (resp_result->has_error()) {
+    return StatusFromPB(resp_result->error().status());
   }
 
   cout << "YSQL successfully upgraded to the latest version" << endl;

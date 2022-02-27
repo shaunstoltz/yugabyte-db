@@ -86,6 +86,7 @@ void TabletServerIntegrationTestBase::CreateCluster(
   // Disable load balancer for master by default for these tests. You can override this through
   // setting flags in the passed in non_default_master_flags argument.
   opts.extra_master_flags.push_back("--enable_load_balancing=false");
+  opts.extra_master_flags.push_back(yb::Format("--replication_factor=$0", FLAGS_num_replicas));
   for (const std::string& flag : non_default_master_flags) {
     opts.extra_master_flags.push_back(flag);
   }
@@ -133,7 +134,7 @@ void TabletServerIntegrationTestBase::WaitForReplicasAndUpdateLocations() {
         tablet_replicas.emplace(location.tablet_id(), server);
       }
 
-      if (tablet_replicas.count(location.tablet_id()) < FLAGS_num_replicas) {
+      if (tablet_replicas.count(location.tablet_id()) < implicit_cast<size_t>(FLAGS_num_replicas)) {
         LOG(WARNING)<< "Couldn't find the leader and/or replicas. Location: "
             << location.ShortDebugString();
         replicas_missing = true;
@@ -315,8 +316,8 @@ int64_t TabletServerIntegrationTestBase::GetFurthestAheadReplicaIdx(
       tablet_id, replicas, consensus::RECEIVED_OPID, MonoDelta::FromSeconds(10)));
 
   int64 max_index = 0;
-  int max_replica_index = -1;
-  for (int i = 0; i < op_ids.size(); i++) {
+  ssize_t max_replica_index = -1;
+  for (size_t i = 0; i < op_ids.size(); i++) {
     if (op_ids[i].index > max_index) {
       max_index = op_ids[i].index;
       max_replica_index = i;
@@ -329,7 +330,7 @@ int64_t TabletServerIntegrationTestBase::GetFurthestAheadReplicaIdx(
 }
 
 Status TabletServerIntegrationTestBase::ShutdownServerWithUUID(const std::string& uuid) {
-  for (int i = 0; i < cluster_->num_tablet_servers(); i++) {
+  for (size_t i = 0; i < cluster_->num_tablet_servers(); i++) {
     ExternalTabletServer* ts = cluster_->tablet_server(i);
     if (ts->instance_id().permanent_uuid() == uuid) {
       ts->Shutdown();
@@ -340,7 +341,7 @@ Status TabletServerIntegrationTestBase::ShutdownServerWithUUID(const std::string
 }
 
 Status TabletServerIntegrationTestBase::RestartServerWithUUID(const std::string& uuid) {
-  for (int i = 0; i < cluster_->num_tablet_servers(); i++) {
+  for (size_t i = 0; i < cluster_->num_tablet_servers(); i++) {
     ExternalTabletServer* ts = cluster_->tablet_server(i);
     if (ts->instance_id().permanent_uuid() == uuid) {
       ts->Shutdown();
@@ -383,10 +384,10 @@ void TabletServerIntegrationTestBase::TearDown() {
   client_.reset();
   if (cluster_) {
     for (const auto* daemon : cluster_->master_daemons()) {
-      EXPECT_TRUE(daemon->IsShutdown() || daemon->IsProcessAlive());
+      EXPECT_TRUE(daemon->IsShutdown() || daemon->IsProcessAlive()) << "Daemon: " << daemon->id();
     }
     for (const auto* daemon : cluster_->tserver_daemons()) {
-      EXPECT_TRUE(daemon->IsShutdown() || daemon->IsProcessAlive());
+      EXPECT_TRUE(daemon->IsShutdown() || daemon->IsProcessAlive()) << "Daemon: " << daemon->id();
     }
     cluster_->Shutdown();
   }
