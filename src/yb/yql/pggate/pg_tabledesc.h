@@ -18,6 +18,7 @@
 #ifndef YB_YQL_PGGATE_PG_TABLEDESC_H_
 #define YB_YQL_PGGATE_PG_TABLEDESC_H_
 
+#include "yb/common/pg_types.h"
 #include "yb/common/pgsql_protocol.pb.h"
 #include "yb/client/yb_op.h"
 
@@ -32,7 +33,11 @@ namespace pggate {
 // This class can be used to describe any reference of a column.
 class PgTableDesc : public RefCountedThreadSafe<PgTableDesc> {
  public:
-  explicit PgTableDesc(const client::YBTablePtr& table);
+  PgTableDesc(const PgObjectId& id, const client::YBTablePtr& table);
+
+  const PgObjectId& id() const {
+    return id_;
+  }
 
   const client::YBTableName& table_name() const;
 
@@ -52,6 +57,8 @@ class PgTableDesc : public RefCountedThreadSafe<PgTableDesc> {
   bool IsRangePartitioned() const;
 
   const std::vector<std::string>& GetPartitions() const;
+
+  const std::string& LastPartition() const;
 
   size_t GetPartitionCount() const;
 
@@ -74,16 +81,8 @@ class PgTableDesc : public RefCountedThreadSafe<PgTableDesc> {
 
   uint32_t schema_version() const;
 
-  // TODO(PgClient) Remove those operations.
-  std::unique_ptr<client::YBPgsqlWriteOp> NewPgsqlInsert();
-  std::unique_ptr<client::YBPgsqlWriteOp> NewPgsqlUpdate();
-  std::unique_ptr<client::YBPgsqlWriteOp> NewPgsqlDelete();
-  std::unique_ptr<client::YBPgsqlWriteOp> NewPgsqlTruncateColocated();
-
-  std::unique_ptr<client::YBPgsqlReadOp> NewPgsqlSelect();
-  std::unique_ptr<client::YBPgsqlReadOp> NewPgsqlSample();
-
  private:
+  PgObjectId id_;
   // TODO(PgClient) While we have YbOps on postgres side, we have to keep YBTable.
   client::YBTablePtr table_;
 

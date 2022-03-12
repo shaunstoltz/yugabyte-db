@@ -13,6 +13,7 @@ import com.yugabyte.yw.forms.PlatformResults;
 import com.yugabyte.yw.forms.PlatformResults.YBPSuccess;
 import com.yugabyte.yw.forms.PlatformResults.YBPTask;
 import com.yugabyte.yw.forms.SupportBundleFormData;
+import com.yugabyte.yw.models.Audit;
 import com.yugabyte.yw.models.Customer;
 import com.yugabyte.yw.models.SupportBundle;
 import com.yugabyte.yw.models.SupportBundle.SupportBundleStatusType;
@@ -23,6 +24,7 @@ import io.swagger.annotations.ApiOperation;
 import io.swagger.annotations.Authorization;
 import java.io.InputStream;
 import java.util.List;
+import java.util.Objects;
 import java.util.UUID;
 import lombok.extern.slf4j.Slf4j;
 import org.slf4j.Logger;
@@ -38,6 +40,7 @@ public class SupportBundleController extends AuthenticatedController {
   public static final Logger LOG = LoggerFactory.getLogger(SupportBundleController.class);
 
   @Inject Commissioner commissioner;
+  @Inject SupportBundleUtil supportBundleUtil;
 
   @ApiOperation(
       value = "Create support bundle for specific universe",
@@ -73,6 +76,14 @@ public class SupportBundleController extends AuthenticatedController {
     SupportBundleTaskParams taskParams =
         new SupportBundleTaskParams(supportBundle, bundleData, customer, universe);
     UUID taskUUID = commissioner.submit(TaskType.CreateSupportBundle, taskParams);
+    auditService()
+        .createAuditEntryWithReqBody(
+            ctx(),
+            Audit.TargetType.SupportBundle,
+            Objects.toString(supportBundle.getBundleUUID(), null),
+            Audit.ActionType.Create,
+            requestBody,
+            taskUUID);
     return new YBPTask(taskUUID, supportBundle.getBundleUUID()).asResult();
   }
 
@@ -128,9 +139,11 @@ public class SupportBundleController extends AuthenticatedController {
     SupportBundle.delete(bundleUUID);
 
     // Delete the actual archive file
-    SupportBundleUtil.deleteFile(supportBundle.getPathObject());
+    supportBundleUtil.deleteFile(supportBundle.getPathObject());
 
-    auditService().createAuditEntry(ctx(), request());
+    auditService()
+        .createAuditEntryWithReqBody(
+            ctx(), Audit.TargetType.SupportBundle, bundleUUID.toString(), Audit.ActionType.Delete);
     log.info("Successfully deleted the support bundle: " + bundleUUID.toString());
     return YBPSuccess.empty();
   }
