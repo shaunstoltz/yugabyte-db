@@ -13,7 +13,6 @@ package com.yugabyte.yw.commissioner.tasks;
 import com.amazonaws.SDKGlobalConfiguration;
 import com.fasterxml.jackson.databind.JsonNode;
 import com.yugabyte.yw.commissioner.BaseTaskDependencies;
-import com.yugabyte.yw.commissioner.SubTaskGroupQueue;
 import com.yugabyte.yw.common.AWSUtil;
 import com.yugabyte.yw.common.AZUtil;
 import com.yugabyte.yw.common.BackupUtil;
@@ -72,7 +71,6 @@ public class DeleteCustomerConfig extends UniverseTaskBase {
       // Dell ECS are provided and custom certs are needed to connect
       // Reference: https://yugabyte.atlassian.net/browse/PLAT-2497
       System.setProperty(SDKGlobalConfiguration.DISABLE_CERT_CHECKING_SYSTEM_PROPERTY, "true");
-      subTaskGroupQueue = new SubTaskGroupQueue(userTaskUUID);
       List<Schedule> scheduleList = Schedule.findAllScheduleWithCustomerConfig(params().configUUID);
       for (Schedule schedule : scheduleList) {
         schedule.stopSchedule();
@@ -89,7 +87,7 @@ public class DeleteCustomerConfig extends UniverseTaskBase {
             case S3:
               for (Backup backup : backupList) {
                 try {
-                  backupLocations = getBackupLocations(backup);
+                  backupLocations = backupUtil.getBackupLocations(backup);
                   AWSUtil.deleteKeyIfExists(customerConfig.data, backupLocations.get(0));
                   AWSUtil.deleteStorage(customerConfig.data, backupLocations);
                 } catch (Exception e) {
@@ -97,7 +95,7 @@ public class DeleteCustomerConfig extends UniverseTaskBase {
                   backup.transitionState(Backup.BackupState.FailedToDelete);
                 } finally {
                   if (backup.state != Backup.BackupState.FailedToDelete) {
-                    backup.transitionState(Backup.BackupState.Deleted);
+                    backup.delete();
                   }
                 }
               }
@@ -105,7 +103,7 @@ public class DeleteCustomerConfig extends UniverseTaskBase {
             case GCS:
               for (Backup backup : backupList) {
                 try {
-                  backupLocations = getBackupLocations(backup);
+                  backupLocations = backupUtil.getBackupLocations(backup);
                   GCPUtil.deleteKeyIfExists(customerConfig.data, backupLocations.get(0));
                   GCPUtil.deleteStorage(customerConfig.data, backupLocations);
                 } catch (Exception e) {
@@ -113,7 +111,7 @@ public class DeleteCustomerConfig extends UniverseTaskBase {
                   backup.transitionState(Backup.BackupState.FailedToDelete);
                 } finally {
                   if (backup.state != Backup.BackupState.FailedToDelete) {
-                    backup.transitionState(Backup.BackupState.Deleted);
+                    backup.delete();
                   }
                 }
               }
@@ -121,7 +119,7 @@ public class DeleteCustomerConfig extends UniverseTaskBase {
             case AZ:
               for (Backup backup : backupList) {
                 try {
-                  backupLocations = getBackupLocations(backup);
+                  backupLocations = backupUtil.getBackupLocations(backup);
                   AZUtil.deleteKeyIfExists(customerConfig.data, backupLocations.get(0));
                   AZUtil.deleteStorage(customerConfig.data, backupLocations);
                 } catch (Exception e) {
@@ -129,7 +127,7 @@ public class DeleteCustomerConfig extends UniverseTaskBase {
                   backup.transitionState(Backup.BackupState.FailedToDelete);
                 } finally {
                   if (backup.state != Backup.BackupState.FailedToDelete) {
-                    backup.transitionState(Backup.BackupState.Deleted);
+                    backup.delete();
                   }
                 }
               }
@@ -158,7 +156,7 @@ public class DeleteCustomerConfig extends UniverseTaskBase {
         }
       }
 
-      subTaskGroupQueue.run();
+      getRunnableTask().runSubTasks();
     } catch (Exception e) {
       log.error(
           "Error while deleting backups associated to Configuration {}", params().configUUID, e);
@@ -175,19 +173,6 @@ public class DeleteCustomerConfig extends UniverseTaskBase {
   private Boolean isUniversePresent(Backup backup) {
     Optional<Universe> universe = Universe.maybeGet(backup.getBackupInfo().universeUUID);
     return universe.isPresent();
-  }
-
-  private static List<String> getBackupLocations(Backup backup) {
-    BackupTableParams backupParams = backup.getBackupInfo();
-    List<String> backupLocations = new ArrayList<>();
-    if (backupParams.backupList != null) {
-      for (BackupTableParams params : backupParams.backupList) {
-        backupLocations.add(params.storageLocation);
-      }
-    } else {
-      backupLocations.add(backupParams.storageLocation);
-    }
-    return backupLocations;
   }
 
   private Boolean isCredentialUsable(CustomerConfig config) {

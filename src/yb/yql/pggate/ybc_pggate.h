@@ -175,6 +175,7 @@ YBCStatus YBCPgNewCreateTable(const char *database_name,
                               bool add_primary_key,
                               const bool colocated,
                               YBCPgOid tablegroup_oid,
+                              YBCPgOid colocation_id,
                               YBCPgOid tablespace_oid,
                               YBCPgOid matview_pg_table_oid,
                               YBCPgStatement *handle);
@@ -225,8 +226,10 @@ YBCStatus YBCPgGetColumnInfo(YBCPgTableDesc table_desc,
                              int16_t attr_number,
                              YBCPgColumnInfo *column_info);
 
-YBCStatus YBCPgGetTableProperties(YBCPgTableDesc table_desc,
-                                  YBCPgTableProperties *properties);
+// Does not set tablegroup_oid.
+// Callers should probably use YbGetTableDescAndProps instead.
+YBCStatus YBCPgGetSomeTableProperties(YBCPgTableDesc table_desc,
+                                      YBCPgTableProperties *properties);
 
 YBCStatus YBCPgDmlModifiesRow(YBCPgStatement handle, bool *modifies_row);
 
@@ -257,6 +260,7 @@ YBCStatus YBCPgNewCreateIndex(const char *database_name,
                               const bool skip_index_backfill,
                               bool if_not_exist,
                               YBCPgOid tablegroup_oid,
+                              YBCPgOid colocation_id,
                               YBCPgOid tablespace_oid,
                               YBCPgStatement *handle);
 
@@ -361,8 +365,7 @@ YBCStatus YBCPgDmlFetch(YBCPgStatement handle, int32_t natts, uint64_t *values, 
                         YBCPgSysColumns *syscols, bool *has_data);
 
 // Utility method that checks stmt type and calls either exec insert, update, or delete internally.
-YBCStatus YBCPgDmlExecWriteOp(YBCPgStatement handle, int32_t *rows_affected_count,
-                              bool use_async_flush);
+YBCStatus YBCPgDmlExecWriteOp(YBCPgStatement handle, int32_t *rows_affected_count);
 
 // This function returns the tuple id (ybctid) of a Postgres tuple.
 YBCStatus YBCPgBuildYBTupleId(const YBCPgYBTupleIdDescriptor* data, uint64_t *ybctid);
@@ -461,6 +464,7 @@ YBCStatus YBCPgSetTransactionReadOnly(bool read_only);
 YBCStatus YBCPgSetTransactionDeferrable(bool deferrable);
 YBCStatus YBCPgEnableFollowerReads(bool enable_follower_reads, int32_t staleness_ms);
 YBCStatus YBCPgEnterSeparateDdlTxnMode();
+bool YBCPgHasWriteOperationsInDdlTxnMode();
 YBCStatus YBCPgExitSeparateDdlTxnMode();
 void YBCPgClearSeparateDdlTxnMode();
 YBCStatus YBCPgSetActiveSubTransaction(uint32_t id);
@@ -562,6 +566,13 @@ const void* YBCPgGetThreadLocalErrMsg();
 void YBCPgResetCatalogReadTime();
 
 YBCStatus YBCGetTabletServerHosts(YBCServerDescriptor **tablet_servers, size_t* numservers);
+
+void YBCStartSysTablePrefetching();
+
+void YBCStopSysTablePrefetching();
+
+void YBCRegisterSysTableForPrefetching(
+    YBCPgOid database_oid, YBCPgOid table_oid, YBCPgOid index_oid);
 
 #ifdef __cplusplus
 }  // extern "C"

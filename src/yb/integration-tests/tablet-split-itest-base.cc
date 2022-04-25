@@ -91,7 +91,7 @@ Result<size_t> SelectRowsCount(
       session->SetForceConsistentRead(client::ForceConsistentRead::kTrue);
       *req->mutable_paging_state() = std::move(paging_state);
     }
-    RETURN_NOT_OK(session->ApplyAndFlush(op));
+    RETURN_NOT_OK(session->TEST_ApplyAndFlush(op));
     auto rowblock = ql::RowsResult(op.get()).GetRowBlock();
     row_count += rowblock->row_count();
     if (!op->response().has_paging_state()) {
@@ -133,7 +133,7 @@ Status SplitTablet(master::CatalogManagerIf* catalog_mgr, const tablet::Tablet& 
   tablet.TEST_db()->GetProperty(rocksdb::DB::Properties::kAggregatedTableProperties, &properties);
   LOG(INFO) << "DB properties: " << properties;
 
-  return catalog_mgr->SplitTablet(tablet_id, true /* select_all_tablets_for_split */);
+  return catalog_mgr->SplitTablet(tablet_id, true /* is_manual_split */);
 }
 
 Status DoSplitTablet(master::CatalogManagerIf* catalog_mgr, const tablet::Tablet& tablet) {
@@ -224,14 +224,19 @@ template <class MiniClusterType>
 Result<std::pair<docdb::DocKeyHash, docdb::DocKeyHash>>
     TabletSplitITestBase<MiniClusterType>::WriteRows(
         client::TableHandle* table, const uint32_t num_rows,
-        const int32_t start_key, const int32_t start_value) {
+        const int32_t start_key, const int32_t start_value, client::YBSessionPtr session) {
   auto min_hash_code = std::numeric_limits<docdb::DocKeyHash>::max();
   auto max_hash_code = std::numeric_limits<docdb::DocKeyHash>::min();
 
   LOG(INFO) << "Writing " << num_rows << " rows...";
 
   auto txn = this->CreateTransaction();
-  auto session = this->CreateSession(txn);
+  client::YBSessionPtr session_holder;
+  if (session) {
+    session->SetTransaction(txn);
+  } else {
+    session = this->CreateSession(txn);
+  }
   for (int32_t i = start_key, v = start_value;
        i < start_key + static_cast<int32_t>(num_rows);
        ++i, ++v) {
@@ -240,18 +245,20 @@ Result<std::pair<docdb::DocKeyHash, docdb::DocKeyHash>>
                                         session,
                                         i /* key */,
                                         v /* value */,
-                                        client::WriteOpType::INSERT));
+                                        client::WriteOpType::INSERT,
+                                        client::Flush::kFalse));
     const auto hash_code = op->GetHashCode();
     min_hash_code = std::min(min_hash_code, hash_code);
     max_hash_code = std::max(max_hash_code, hash_code);
     YB_LOG_EVERY_N_SECS(INFO, 10) << "Rows written: " << start_key << "..." << i;
   }
+  RETURN_NOT_OK(session->TEST_Flush());
   if (txn) {
     RETURN_NOT_OK(txn->CommitFuture().get());
     LOG(INFO) << "Committed: " << txn->id();
   }
 
-  LOG(INFO) << num_rows << " rows has been written";
+  LOG(INFO) << num_rows << " rows have been written";
   LOG(INFO) << "min_hash_code = " << min_hash_code;
   LOG(INFO) << "max_hash_code = " << max_hash_code;
   return std::make_pair(min_hash_code, max_hash_code);
@@ -756,8 +763,11 @@ Result<std::set<TabletId>> TabletSplitExternalMiniClusterITest::GetTestTableTabl
     size_t tserver_idx) {
   std::set<TabletId> tablet_ids;
   auto res = VERIFY_RESULT(cluster_->GetTablets(cluster_->tablet_server(tserver_idx)));
+
   for (const auto& tablet : res) {
-    if (tablet.table_name() == table_->name().table_name()) {
+    if (tablet.table_name() == table_->name().table_name() &&
+        // Skip deleted (tombstoned) tablets.
+        tablet.state() != tablet::RaftGroupStatePB::SHUTDOWN) {
       tablet_ids.insert(tablet.tablet_id());
     }
   }
@@ -767,7 +777,7 @@ Result<std::set<TabletId>> TabletSplitExternalMiniClusterITest::GetTestTableTabl
 Result<std::set<TabletId>> TabletSplitExternalMiniClusterITest::GetTestTableTabletIds() {
   std::set<TabletId> tablet_ids;
   for (size_t i = 0; i < cluster_->num_tablet_servers(); ++i) {
-    if (cluster_->tablet_server(i)->IsShutdown()) {
+    if (cluster_->tablet_server(i)->IsShutdown() || cluster_->tablet_server(i)->IsProcessPaused()) {
       continue;
     }
     auto res = VERIFY_RESULT(GetTestTableTabletIds(i));
@@ -814,7 +824,7 @@ Result<vector<tserver::ListTabletsResponsePB_StatusAndSchemaPB>>
 Status TabletSplitExternalMiniClusterITest::WaitForTabletsExcept(
     size_t num_tablets, size_t tserver_idx, const TabletId& exclude_tablet) {
   std::set<TabletId> tablets;
-  auto status = WaitFor(
+  auto status = LoggedWaitFor(
       [&]() -> Result<bool> {
         tablets = VERIFY_RESULT(GetTestTableTabletIds(tserver_idx));
         size_t count = 0;
@@ -825,7 +835,7 @@ Status TabletSplitExternalMiniClusterITest::WaitForTabletsExcept(
         }
         return count == num_tablets;
       },
-      20s * kTimeMultiplier,
+      30s * kTimeMultiplier,
       Format(
           "Waiting for tablet count: $0 at tserver: $1",
           num_tablets,

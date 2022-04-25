@@ -14,7 +14,6 @@ import com.yugabyte.yw.commissioner.BaseTaskDependencies;
 import com.yugabyte.yw.commissioner.Common;
 import com.yugabyte.yw.commissioner.tasks.params.NodeTaskParams;
 import com.yugabyte.yw.common.NodeManager;
-import com.yugabyte.yw.common.ShellResponse;
 import com.yugabyte.yw.forms.UniverseDefinitionTaskParams;
 import com.yugabyte.yw.forms.UniverseDefinitionTaskParams.UserIntent;
 import com.yugabyte.yw.models.NodeInstance;
@@ -73,9 +72,9 @@ public class AnsibleDestroyServer extends NodeTaskBase {
   public void run() {
     // Execute the ansible command.
     try {
-      ShellResponse response =
-          getNodeManager().nodeCommand(NodeManager.NodeCommandType.Destroy, taskParams());
-      processShellResponse(response);
+      getNodeManager()
+          .nodeCommand(NodeManager.NodeCommandType.Destroy, taskParams())
+          .processErrors();
     } catch (Exception e) {
       if (!taskParams().isForceDelete) {
         throw e;
@@ -96,10 +95,9 @@ public class AnsibleDestroyServer extends NodeTaskBase {
     if (taskParams().deleteRootVolumes
         && !userIntent.providerType.equals(Common.CloudType.onprem)) {
       try {
-        ShellResponse response =
-            getNodeManager()
-                .nodeCommand(NodeManager.NodeCommandType.Delete_Root_Volumes, taskParams());
-        processShellResponse(response);
+        getNodeManager()
+            .nodeCommand(NodeManager.NodeCommandType.Delete_Root_Volumes, taskParams())
+            .processErrors();
       } catch (Exception e) {
         if (!taskParams().isForceDelete) {
           throw e;
@@ -131,7 +129,7 @@ public class AnsibleDestroyServer extends NodeTaskBase {
     if (taskParams().deleteNode) {
       // Update the node state to removed. Even though we remove the node below, this will
       // help tracking state for any nodes stuck in limbo.
-      setNodeState(NodeDetails.NodeState.Removed);
+      setNodeState(NodeDetails.NodeState.Terminated);
 
       removeNodeFromUniverse(taskParams().nodeName);
     }

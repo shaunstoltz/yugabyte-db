@@ -62,7 +62,8 @@ class RaftConsensusStateTest : public YBTest {
   void SetUp() override {
     YBTest::SetUp();
     ASSERT_OK(fs_manager_.CreateInitialFileSystemLayout());
-    ASSERT_OK(fs_manager_.Open());
+    ASSERT_OK(fs_manager_.CheckAndOpenFileSystemRoots());
+    fs_manager_.SetTabletPathByDataPath(kTabletId, fs_manager_.GetDataRootDirs()[0]);
 
     // Initialize test configuration.
     config_.set_opid_index(kInvalidOpIdIndex);

@@ -36,10 +36,15 @@ YB_TSERVER_DIR = os.path.join(YB_HOME_DIR, "tserver")
 YB_CORES_DIR = os.path.join(YB_HOME_DIR, "cores/")
 YB_PROCESS_LOG_PATH_FORMAT = os.path.join(YB_HOME_DIR, "{}/logs/")
 VM_ROOT_CERT_FILE_PATH = os.path.join(YB_HOME_DIR, "yugabyte-tls-config/ca.crt")
+VM_ROOT_C2N_CERT_FILE_PATH = os.path.join(YB_HOME_DIR, "yugabyte-client-tls-config/ca.crt")
+
+VM_CLIENT_CA_CERT_FILE_PATH = os.path.join(YB_HOME_DIR, ".yugabytedb/root.crt")
+VM_CLIENT_CERT_FILE_PATH = os.path.join(YB_HOME_DIR, ".yugabytedb/yugabytedb.crt")
 
 K8S_CERTS_PATH = "/opt/certs/yugabyte/"
-K8S_CLIENT_CERTS_PATH = "/root/.yugabytedb/"
 K8S_CERT_FILE_PATH = os.path.join(K8S_CERTS_PATH, "ca.crt")
+
+K8S_CLIENT_CERTS_PATH = "/root/.yugabytedb/"
 K8S_CLIENT_CA_CERT_FILE_PATH = os.path.join(K8S_CLIENT_CERTS_PATH, "root.crt")
 K8S_CLIENT_CERT_FILE_PATH = os.path.join(K8S_CLIENT_CERTS_PATH, "yugabytedb.crt")
 
@@ -174,24 +179,15 @@ class Report:
 ###################################################################################################
 def check_output(cmd, env):
     try:
-        timeout = CMD_TIMEOUT_SEC
-        command = subprocess.Popen(cmd, stderr=subprocess.PIPE, stdout=subprocess.PIPE, env=env)
-        while command.poll() is None and timeout > 0:
-            time.sleep(1)
-            timeout -= 1
-        if command.poll() is None and timeout <= 0:
-            command.kill()
-            command.wait()
-            return 'Error executing command {}: timeout occurred'.format(cmd)
-
-        output, stderr = command.communicate()
-        if not stderr:
-            return output.decode('utf-8').encode("ascii", "ignore").decode("ascii")
-        else:
-            return 'Error executing command {}: {}'.format(cmd, stderr)
-    except subprocess.CalledProcessError as e:
+        output = subprocess.check_output(
+            cmd, stderr=subprocess.STDOUT, env=env, timeout=CMD_TIMEOUT_SEC)
+        return str(output.decode('utf-8').encode("ascii", "ignore").decode("ascii"))
+    except subprocess.CalledProcessError as ex:
         return 'Error executing command {}: {}'.format(
-            cmd, e.output.decode("utf-8").encode("ascii", "ignore"))
+            cmd, ex.output.decode("utf-8").encode("ascii", "ignore"))
+    except subprocess.TimeoutExpired:
+        return 'Error: timed out executing command {} for {} seconds'.format(
+            cmd, CMD_TIMEOUT_SEC)
 
 
 def safe_pipe(command_str):
@@ -343,21 +339,31 @@ class NodeChecker():
         if len(lines) < 2:
             return e.fill_and_return_entry([output], True)
 
-        msgs.append(lines[0])
-        for line in lines[1:]:
+        found_header = False
+        for line in lines:
             msgs.append(line)
             if not line:
+                continue
+            if line.startswith("Filesystem"):
+                found_header = True
+                continue
+            if not found_header:
                 continue
             percentage = line.split()[4][:-1]
             if int(percentage) > DISK_UTILIZATION_THRESHOLD_PCT:
                 found_error = True
+
+        if not found_header:
+            return e.fill_and_return_entry([output], True)
+
         return e.fill_and_return_entry(msgs, found_error)
 
     def get_certificate_expiration_date(self, cert_path):
-        remote_cmd = 'openssl x509 -enddate -noout -in {} 2>/dev/null'.format(cert_path)
+        remote_cmd = 'if [ -f {} ]; then openssl x509 -enddate -noout -in {} 2>/dev/null;' \
+                     ' else echo \"File not found\"; fi;'.format(cert_path, cert_path)
         return self._remote_check_output(remote_cmd)
 
-    def check_certificate_expiration(self, cert_name, cert_path):
+    def check_certificate_expiration(self, cert_name, cert_path, fail_if_not_found):
         logging.info("Checking {} certificate on node {}".format(cert_name, self.node))
         e = self._new_entry(cert_name + " Cert Expiry Days")
         ssl_installed = self.additional_info.get("ssl_installed:" + self.node)
@@ -367,6 +373,10 @@ class NodeChecker():
         output = self.get_certificate_expiration_date(cert_path)
         if has_errors(output):
             return e.fill_and_return_entry([output], True)
+
+        if output == 'File not found':
+            return e.fill_and_return_entry(
+                ["Certificate file {} not found".format(cert_path)], fail_if_not_found)
 
         try:
             ssl_date_fmt = r'%b %d %H:%M:%S %Y %Z'
@@ -407,44 +417,69 @@ class NodeChecker():
                             "yugabyte-tls-config/node.{}.crt".format(self.node))
 
     def get_client_to_node_ca_certificate_path(self):
+        if self.root_and_client_root_ca_same:
+            return self.get_node_to_node_ca_certificate_path()
+        # Our helm chart do not support separate c2n certificate right now -
+        # hence no special logic for k8s
+
+        return VM_ROOT_C2N_CERT_FILE_PATH
+
+    def get_client_to_node_certificate_path(self):
+        if self.root_and_client_root_ca_same:
+            return self.get_node_to_node_certificate_path()
+        # Our helm chart do not support separate c2n certificate right now -
+        # hence no special logic for k8s
+
+        return os.path.join(
+            YB_HOME_DIR, "yugabyte-client-tls-config/node.{}.crt".format(self.node))
+
+    def get_client_ca_certificate_path(self):
         if self.is_k8s:
             return K8S_CLIENT_CA_CERT_FILE_PATH
 
-        remote_cmd = 'if [ -f "{0}" ]; then echo "{0}";'.format(
-            os.path.join(YB_HOME_DIR, "yugabyte-client-tls-config/ca.crt"))
+        return VM_CLIENT_CA_CERT_FILE_PATH
 
-        for name in 'root', 'ca':
-            remote_cmd += ' elif [ -f "{0}" ]; then echo "{0}";'.format(
-                os.path.join(YB_HOME_DIR, ".yugabytedb/{}.crt".format(name)))
-
-        remote_cmd += ' fi;'
-        return self._remote_check_output(remote_cmd).strip()
-
-    def get_client_to_node_certificate_path(self):
+    def get_client_certificate_path(self):
         if self.is_k8s:
             return K8S_CLIENT_CERT_FILE_PATH
 
-        cert_path = os.path.join(
-            YB_HOME_DIR, "yugabyte-client-tls-config/node.{}.crt".format(self.node))
-        remote_cmd = 'if [ -f "{0}" ]; then echo "{0}"; elif [ -f "{1}" ]; then echo "{1}"; fi'. \
-            format(cert_path, os.path.join(YB_HOME_DIR, ".yugabytedb/yugabytedb.crt"))
-        return self._remote_check_output(remote_cmd).strip()
+        return VM_CLIENT_CERT_FILE_PATH
 
     def check_node_to_node_ca_certificate_expiration(self):
         return self.check_certificate_expiration("Node To Node CA",
-                                                 self.get_node_to_node_ca_certificate_path())
+                                                 self.get_node_to_node_ca_certificate_path(),
+                                                 True  # fail_if_not_found
+                                                 )
 
     def check_node_to_node_certificate_expiration(self):
         return self.check_certificate_expiration("Node To Node",
-                                                 self.get_node_to_node_certificate_path())
+                                                 self.get_node_to_node_certificate_path(),
+                                                 True  # fail_if_not_found
+                                                 )
 
     def check_client_to_node_ca_certificate_expiration(self):
         return self.check_certificate_expiration("Client To Node CA",
-                                                 self.get_client_to_node_ca_certificate_path())
+                                                 self.get_client_to_node_ca_certificate_path(),
+                                                 True  # fail_if_not_found
+                                                 )
 
     def check_client_to_node_certificate_expiration(self):
         return self.check_certificate_expiration("Client To Node",
-                                                 self.get_client_to_node_certificate_path())
+                                                 self.get_client_to_node_certificate_path(),
+                                                 True  # fail_if_not_found
+                                                 )
+
+    def check_client_ca_certificate_expiration(self):
+        return self.check_certificate_expiration("Client",
+                                                 self.get_client_ca_certificate_path(),
+                                                 False  # fail_if_not_found
+                                                 )
+
+    def check_client_certificate_expiration(self):
+        return self.check_certificate_expiration("Client",
+                                                 self.get_client_certificate_path(),
+                                                 False  # fail_if_not_found
+                                                 )
 
     def check_yb_version(self, ip_address, process, port, expected):
         logging.info("Checking YB Version on node {} process {}".format(self.node, process))
@@ -485,7 +520,7 @@ class NodeChecker():
             self.node, process, self.tserver_http_port, self.universe_version)
 
     def check_logs_find_output(self, output):
-        logs = []
+        log_tuples = []
         if output:
             for line in output.strip().split('\n'):
                 splits = line.strip().split()
@@ -498,10 +533,11 @@ class NodeChecker():
                 epoch = epoch.split('.')[0]
                 if not epoch.isdigit():
                     continue
-                logs.append('{} ({} old)'.format(
-                    filename,
-                    ''.join(seconds_to_human_readable_time(int(time.time() - int(epoch))))))
-        return logs
+                log_tuples.append((epoch, filename,
+                                   seconds_to_human_readable_time(int(time.time() - int(epoch)))))
+
+        sorted_logs = sorted(log_tuples, key=lambda log: log[0], reverse=True)
+        return list(map(lambda log: '{} ({} old)'.format(log[1], log[2]), sorted_logs))
 
     def check_for_error_logs(self, process):
         logging.info("Checking for error logs on node {}".format(self.node))
@@ -512,7 +548,7 @@ class NodeChecker():
 
         metric_value = 0
         for log_severity in ["FATAL", "ERROR"]:
-            remote_cmd = ('find {} {} -name "*{}*" -type f -printf "%T@ %p\\n" | sort -rn'.format(
+            remote_cmd = ('find {} {} -name "*{}*" -type f -printf "%T@ %p\\n"'.format(
                 search_dir,
                 '-mmin -{}'.format(FATAL_TIME_THRESHOLD_MINUTES),
                 log_severity))
@@ -601,13 +637,13 @@ class NodeChecker():
         logging.info("Checking for open file descriptors on node {}".format(self.node))
         e = self._new_entry("Opened file descriptors")
 
-        remote_cmd = 'ulimit -n; cat /proc/sys/fs/file-max; cat /proc/sys/fs/file-nr | cut -f1'
+        remote_cmd = 'ulimit -n; cat /proc/sys/fs/file-max; awk \'{print $1}\' /proc/sys/fs/file-nr'
         output = self._remote_check_output(remote_cmd)
 
         if has_errors(output):
             return e.fill_and_return_entry([output], True)
 
-        counts = output.split()
+        counts = output.split('\n')
 
         if len(counts) != 3:
             return e.fill_and_return_entry(
@@ -662,7 +698,7 @@ class NodeChecker():
         logging.info("Checking redis cli works for node {}".format(self.node))
         e = self._new_entry("Connectivity with redis-cli")
         redis_cli = '{}/bin/redis-cli'.format(YB_TSERVER_DIR)
-        remote_cmd = 'echo "ping" | {} -h {} -p {}'.format(redis_cli, self.node, self.redis_port)
+        remote_cmd = '{} -h {} -p {} ping'.format(redis_cli, self.node, self.redis_port)
 
         output = self._remote_check_output(remote_cmd).strip()
 
@@ -681,8 +717,8 @@ class NodeChecker():
             host = '__local_ysql_socket__'
             port_args = ""
 
-        ysqlsh_cmd = "{} -h {} {} -U yugabyte".format(
-            ysqlsh, host, port_args, '"sslmode=require"' if self.enable_tls_client else '')
+        ysqlsh_cmd = "{} {} -h {} {} -U yugabyte".format(
+            'env sslmode="require"' if (self.enable_tls_client) else '', ysqlsh, host, port_args, )
 
         return ysqlsh_cmd
 
@@ -712,7 +748,7 @@ class NodeChecker():
 
         errors = []
         output = self._remote_check_output(remote_cmd).strip()
-        if not (output.startswith('You are connected to database')):
+        if 'You are connected to database' not in output:
             errors = [output]
         return e.fill_and_return_entry(errors, len(errors) > 0)
 
@@ -723,10 +759,12 @@ class NodeChecker():
         remote_cmd = "timedatectl status"
         output = self._remote_check_output(remote_cmd).strip()
 
-        clock_re = re.match(r'((.|\n)*)((NTP enabled: )|(NTP service: )|(Network time on: )|' +
-                            r'(systemd-timesyncd\.service active: ))(.*)$', output, re.MULTILINE)
+        clock_re = re.match(r'((.|\n)*)((NTP enabled: )|(NTP service: )|(Network time on: ))(.*)$',
+                            output, re.MULTILINE)
         if clock_re:
-            ntp_enabled_answer = clock_re.group(8).strip()
+            ntp_enabled_answer = clock_re.group(7).strip()
+        elif "systemd-timesyncd.service active:" in output:  # Ignore this check, see PLAT-3373
+            ntp_enabled_answer = "yes"
         else:
             return e.fill_and_return_entry(["Error getting NTP state - incorrect answer format"],
                                            True)
@@ -760,6 +798,15 @@ class NodeChecker():
             else:
                 errors.append("Error getting NTP synchronization state {}"
                               .format(ntp_synchronized_answer))
+
+        # Check if a time sync service is running. Stderr redirection is necessary since
+        # "service does not exist" prints to stderr but should not error.
+        remote_cmd = ""
+        for ntp_service in ["chronyd", "ntp", "ntpd", "systemd-timesyncd"]:
+            remote_cmd = remote_cmd + "systemctl status " + ntp_service + " 2>&1; "
+        output = self._remote_check_output(remote_cmd).strip()
+        if "Active: active (running)" not in output:
+            errors.append("NTP service not running")
 
         return e.fill_and_return_entry(errors, len(errors) > 0)
 
@@ -1074,9 +1121,13 @@ def main():
                     coordinator.add_check(checker, "check_node_to_node_ca_certificate_expiration")
                     coordinator.add_check(checker, "check_node_to_node_certificate_expiration")
                 if c.enable_tls_client:
-                    coordinator.add_check(
-                        checker, "check_client_to_node_ca_certificate_expiration")
-                    coordinator.add_check(checker, "check_client_to_node_certificate_expiration")
+                    coordinator.add_check(checker, "check_client_ca_certificate_expiration")
+                    coordinator.add_check(checker, "check_client_certificate_expiration")
+                    if not c.root_and_client_root_ca_same:
+                        coordinator.add_check(
+                            checker, "check_client_to_node_ca_certificate_expiration")
+                        coordinator.add_check(
+                            checker, "check_client_to_node_certificate_expiration")
 
         entries = coordinator.run()
         for e in entries:

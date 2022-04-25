@@ -13,6 +13,8 @@
 
 #include "yb/tserver/pg_client_session.h"
 
+#include <mutex>
+
 #include "yb/client/batcher.h"
 #include "yb/client/client.h"
 #include "yb/client/error.h"
@@ -175,28 +177,58 @@ CHECKED_STATUS CombineErrorsToStatus(const client::CollectedErrors& errors, cons
   return AppendTxnErrorCode(AppendPsqlErrorCode(result, errors), errors);
 }
 
-Status HandleResponse(const client::YBPgsqlOp& op, PgPerformResponsePB* resp) {
+Status ProcessUsedReadTime(uint64_t session_id,
+                           const client::YBPgsqlOp& op,
+                           PgPerformResponsePB* resp,
+                           const PgClientSession::UsedReadTimePtr& used_read_time_weak_ptr) {
+  const auto op_used_read_time = op.type() == client::YBOperation::PGSQL_READ
+      ? down_cast<const client::YBPgsqlReadOp&>(op).used_read_time()
+      : ReadHybridTime();
+  if (!op_used_read_time) {
+    return Status::OK();
+  }
+
+  if (op.table()->schema().table_properties().is_ysql_catalog_table()) {
+    // Non empty used_read_time field in catalog read operation means this is the very first
+    // catalog read operation after catalog read time resetting. read_time for the operation
+    // has been chosen by master. All further reads from catalog must use same read point.
+    auto catalog_read_time = op_used_read_time;
+
+    // We set global limit to local limit to avoid read restart errors because they are
+    // disruptive to system catalog reads and it is not always possible to handle them there.
+    // This might lead to reading slightly outdated state of the system catalog if a recently
+    // committed DDL transaction used a transaction status tablet whose leader's clock is skewed
+    // and is in the future compared to the master leader's clock.
+    // TODO(dmitry) This situation will be handled in context of #7964.
+    catalog_read_time.global_limit = catalog_read_time.local_limit;
+    catalog_read_time.ToPB(resp->mutable_catalog_read_time());
+  }
+
+  auto used_read_time_ptr = used_read_time_weak_ptr.lock();
+  if (used_read_time_ptr) {
+    auto& used_read_time = *used_read_time_ptr;
+    {
+      std::lock_guard<simple_spinlock> guard(used_read_time.lock);
+      if (PREDICT_FALSE(static_cast<bool>(used_read_time.value))) {
+        return STATUS_FORMAT(IllegalState,
+                             "Session read time already set $0 used read time is $1",
+                             used_read_time.value,
+                             op_used_read_time);
+      }
+      used_read_time.value = op_used_read_time;
+    }
+    VLOG(3) << SessionLogPrefix(session_id) << "Update used read time: " << op_used_read_time;
+  }
+  return Status::OK();
+}
+
+Status HandleResponse(uint64_t session_id,
+                      const client::YBPgsqlOp& op,
+                      PgPerformResponsePB* resp,
+                      const PgClientSession::UsedReadTimePtr& used_read_time) {
   const auto& response = op.response();
   if (response.status() == PgsqlResponsePB::PGSQL_STATUS_OK) {
-    if (op.read_only() && op.table()->schema().table_properties().is_ysql_catalog_table()) {
-      const auto& pgsql_op = down_cast<const client::YBPgsqlReadOp&>(op);
-      if (pgsql_op.used_read_time()) {
-        // Non empty used_read_time field in catalog read operation means this is the very first
-        // catalog read operation after catalog read time resetting. read_time for the operation
-        // has been chosen by master. All further reads from catalog must use same read point.
-        auto catalog_read_time = pgsql_op.used_read_time();
-
-        // We set global limit to local limit to avoid read restart errors because they are
-        // disruptive to system catalog reads and it is not always possible to handle them there.
-        // This might lead to reading slightly outdated state of the system catalog if a recently
-        // committed DDL transaction used a transaction status tablet whose leader's clock is skewed
-        // and is in the future compared to the master leader's clock.
-        // TODO(dmitry) This situation will be handled in context of #7964.
-        catalog_read_time.global_limit = catalog_read_time.local_limit;
-        catalog_read_time.ToPB(resp->mutable_catalog_read_time());
-      }
-    }
-    return Status::OK();
+    return ProcessUsedReadTime(session_id, op, resp, used_read_time);
   }
 
   auto status = STATUS(
@@ -270,6 +302,7 @@ struct PerformData {
   rpc::RpcContext context;
   PgClientSessionOperations ops;
   PgTableCache* table_cache;
+  PgClientSession::UsedReadTimePtr used_read_time;
 
   void FlushDone(client::FlushStatus* flush_status) {
     auto status = CombineErrorsToStatus(flush_status->errors, flush_status->status);
@@ -285,7 +318,7 @@ struct PerformData {
   CHECKED_STATUS ProcessResponse() {
     int idx = 0;
     for (const auto& op : ops) {
-      const auto status = HandleResponse(*op, resp);
+      const auto status = HandleResponse(session_id, *op, resp, used_read_time);
       if (!status.ok()) {
         if (PgsqlRequestStatus(status) == PgsqlResponsePB::PGSQL_STATUS_SCHEMA_VERSION_MISMATCH) {
           table_cache->Invalidate(op->table()->id());
@@ -301,7 +334,6 @@ struct PerformData {
       }
       ++idx;
     }
-
     auto& responses = *resp->mutable_responses();
     responses.Reserve(narrow_cast<int>(ops.size()));
     for (const auto& op : ops) {
@@ -344,12 +376,13 @@ Status PgClientSession::CreateTable(
     const PgCreateTableRequestPB& req, PgCreateTableResponsePB* resp, rpc::RpcContext* context) {
   PgCreateTable helper(req);
   RETURN_NOT_OK(helper.Prepare());
-  const auto* metadata = VERIFY_RESULT(GetDdlTransactionMetadata(req.use_transaction()));
+  const auto* metadata = VERIFY_RESULT(GetDdlTransactionMetadata(
+      req.use_transaction(), context->GetClientDeadline()));
   RETURN_NOT_OK(helper.Exec(&client(), metadata, context->GetClientDeadline()));
   VLOG_WITH_PREFIX(1) << __func__ << ": " << req.table_name();
   const auto& indexed_table_id = helper.indexed_table_id();
   if (indexed_table_id.IsValid()) {
-    table_cache_.Invalidate(indexed_table_id.GetYBTableId());
+    table_cache_.Invalidate(indexed_table_id.GetYbTableId());
   }
   return Status::OK();
 }
@@ -365,7 +398,7 @@ Status PgClientSession::CreateDatabase(
       req.source_database_oid() != kPgInvalidOid
           ? GetPgsqlNamespaceId(req.source_database_oid()) : "",
       req.next_oid(),
-      VERIFY_RESULT(GetDdlTransactionMetadata(req.use_transaction())),
+      VERIFY_RESULT(GetDdlTransactionMetadata(req.use_transaction(), context->GetClientDeadline())),
       req.colocated(),
       context->GetClientDeadline());
 }
@@ -381,7 +414,7 @@ Status PgClientSession::DropDatabase(
 
 Status PgClientSession::DropTable(
     const PgDropTableRequestPB& req, PgDropTableResponsePB* resp, rpc::RpcContext* context) {
-  const auto yb_table_id = PgObjectId::GetYBTableIdFromPB(req.table_id());
+  const auto yb_table_id = PgObjectId::GetYbTableIdFromPB(req.table_id());
   if (req.index()) {
     client::YBTableName indexed_table;
     RETURN_NOT_OK(client().DeleteIndexTable(
@@ -409,9 +442,10 @@ Status PgClientSession::AlterDatabase(
 
 Status PgClientSession::AlterTable(
     const PgAlterTableRequestPB& req, PgAlterTableResponsePB* resp, rpc::RpcContext* context) {
-  const auto table_id = PgObjectId::GetYBTableIdFromPB(req.table_id());
+  const auto table_id = PgObjectId::GetYbTableIdFromPB(req.table_id());
   const auto alterer = client().NewTableAlterer(table_id);
-  const auto txn = VERIFY_RESULT(GetDdlTransactionMetadata(req.use_transaction()));
+  const auto txn = VERIFY_RESULT(GetDdlTransactionMetadata(
+      req.use_transaction(), context->GetClientDeadline()));
   if (txn) {
     alterer->part_of_transaction(txn);
   }
@@ -442,14 +476,14 @@ Status PgClientSession::AlterTable(
 Status PgClientSession::TruncateTable(
     const PgTruncateTableRequestPB& req, PgTruncateTableResponsePB* resp,
     rpc::RpcContext* context) {
-  return client().TruncateTable(PgObjectId::GetYBTableIdFromPB(req.table_id()));
+  return client().TruncateTable(PgObjectId::GetYbTableIdFromPB(req.table_id()));
 }
 
 Status PgClientSession::BackfillIndex(
     const PgBackfillIndexRequestPB& req, PgBackfillIndexResponsePB* resp,
     rpc::RpcContext* context) {
   return client().BackfillIndex(
-      PgObjectId::GetYBTableIdFromPB(req.table_id()), /* wait= */ true,
+      PgObjectId::GetYbTableIdFromPB(req.table_id()), /* wait= */ true,
       context->GetClientDeadline());
 }
 
@@ -460,8 +494,8 @@ Status PgClientSession::CreateTablegroup(
   auto tablespace_id = PgObjectId::FromPB(req.tablespace_id());
   auto s = client().CreateTablegroup(
       req.database_name(), GetPgsqlNamespaceId(id.database_oid),
-      id.GetYBTablegroupId(),
-      tablespace_id.IsValid() ? tablespace_id.GetYBTablespaceId() : "");
+      id.GetYbTablegroupId(),
+      tablespace_id.IsValid() ? tablespace_id.GetYbTablespaceId() : "");
   if (s.ok()) {
     return Status::OK();
   }
@@ -508,7 +542,7 @@ Status PgClientSession::SetActiveSubTransaction(
   VLOG_WITH_PREFIX_AND_FUNC(2) << req.ShortDebugString();
 
   if (req.has_options()) {
-    RETURN_NOT_OK(BeginTransactionIfNecessary(req.options()));
+    RETURN_NOT_OK(BeginTransactionIfNecessary(req.options(), context->GetClientDeadline()));
     txn_serial_no_ = req.options().txn_serial_no();
   }
 
@@ -549,8 +583,8 @@ Status PgClientSession::FinishTransaction(
 
 Status PgClientSession::Perform(
     const PgPerformRequestPB& req, PgPerformResponsePB* resp, rpc::RpcContext* context) {
-  auto session = VERIFY_RESULT(SetupSession(req, context->GetClientDeadline()));
-
+  auto session_info = VERIFY_RESULT(SetupSession(req, context->GetClientDeadline()));
+  auto* session = session_info.first;
   auto ops = VERIFY_RESULT(PrepareOperations(req, session, &table_cache_));
   auto data = std::make_shared<PerformData>(PerformData {
     .session_id = id_,
@@ -559,6 +593,7 @@ Status PgClientSession::Perform(
     .context = std::move(*context),
     .ops = std::move(ops),
     .table_cache = &table_cache_,
+    .used_read_time = session_info.second
   });
   session->FlushAsync([data](client::FlushStatus* flush_status) {
     data->FlushDone(flush_status);
@@ -592,9 +627,8 @@ void PgClientSession::ProcessReadTimeManipulation(ReadTimeManipulation manipulat
   FATAL_INVALID_ENUM_VALUE(ReadTimeManipulation, manipulation);
 }
 
-Result<client::YBSession*> PgClientSession::SetupSession(
-    const PgPerformRequestPB& req, CoarseTimePoint deadline) {
-
+Result<std::pair<client::YBSession*, PgClientSession::UsedReadTimePtr>>
+PgClientSession::SetupSession(const PgPerformRequestPB& req, CoarseTimePoint deadline) {
   const auto& options = req.options();
   PgClientSessionKind kind;
   if (options.use_catalog_session()) {
@@ -603,17 +637,18 @@ Result<client::YBSession*> PgClientSession::SetupSession(
   } else if (options.ddl_mode()) {
     kind = PgClientSessionKind::kDdl;
     EnsureSession(kind);
-    RETURN_NOT_OK(GetDdlTransactionMetadata(true));
+    RETURN_NOT_OK(GetDdlTransactionMetadata(true /* use_transaction */, deadline));
   } else {
     kind = PgClientSessionKind::kPlain;
-    RETURN_NOT_OK(BeginTransactionIfNecessary(options));
+    RETURN_NOT_OK(BeginTransactionIfNecessary(options, deadline));
   }
 
-  client::YBSession* session = Session(kind).get();
+  auto session = Session(kind).get();
   client::YBTransaction* transaction = Transaction(kind).get();
 
   VLOG_WITH_PREFIX(4) << __func__ << ": " << options.ShortDebugString();
 
+  UsedReadTimePtr used_read_time;
   if (options.restart_transaction()) {
     if(options.ddl_mode()) {
       return STATUS(NotSupported, "Not supported to restart DDL transaction");
@@ -634,9 +669,18 @@ Result<client::YBSession*> PgClientSession::SetupSession(
       }
     } else if (!transaction &&
                (options.ddl_mode() || txn_serial_no_ != options.txn_serial_no())) {
-      session->SetReadPoint(client::Restart::kFalse);
-      VLOG_WITH_PREFIX(3) << "New read time: " << session->read_point()->GetReadTime();
+      session->SetReadPoint(ReadHybridTime());
+      if (kind == PgClientSessionKind::kPlain) {
+        used_read_time = std::weak_ptr<UsedReadTime>(
+            std::shared_ptr<UsedReadTime>(shared_from_this(), &plain_session_used_read_time_));
+        std::lock_guard<simple_spinlock>  guard(plain_session_used_read_time_.lock);
+        plain_session_used_read_time_.value = ReadHybridTime();
+      }
+      VLOG_WITH_PREFIX(3) << "Reset read time: " << session->read_point()->GetReadTime();
     } else {
+      if (!transaction && kind == PgClientSessionKind::kPlain) {
+        RETURN_NOT_OK(CheckPlainSessionReadTime());
+      }
       VLOG_WITH_PREFIX(3) << "Keep read time: " << session->read_point()->GetReadTime();
     }
   }
@@ -658,14 +702,15 @@ Result<client::YBSession*> PgClientSession::SetupSession(
 
   session->SetDeadline(deadline);
 
-  return session;
+  return std::make_pair(session, used_read_time);
 }
 
 std::string PgClientSession::LogPrefix() {
   return SessionLogPrefix(id_);
 }
 
-Status PgClientSession::BeginTransactionIfNecessary(const PgPerformOptionsPB& options) {
+Status PgClientSession::BeginTransactionIfNecessary(
+    const PgPerformOptionsPB& options, CoarseTimePoint deadline) {
   const auto isolation = static_cast<IsolationLevel>(options.isolation());
 
   auto priority = options.priority();
@@ -698,10 +743,11 @@ Status PgClientSession::BeginTransactionIfNecessary(const PgPerformOptionsPB& op
   }
 
   txn = transaction_pool_provider_()->Take(
-      client::ForceGlobalTransaction(options.force_global_transaction()));
+      client::ForceGlobalTransaction(options.force_global_transaction()), deadline);
   if ((isolation == IsolationLevel::SNAPSHOT_ISOLATION ||
            isolation == IsolationLevel::READ_COMMITTED) &&
       txn_serial_no_ == options.txn_serial_no()) {
+    RETURN_NOT_OK(CheckPlainSessionReadTime());
     txn->InitWithReadPoint(isolation, std::move(*session->read_point()));
     VLOG_WITH_PREFIX(2) << "Start transaction " << IsolationLevel_Name(isolation)
                         << ", id: " << txn->id()
@@ -723,7 +769,7 @@ Status PgClientSession::BeginTransactionIfNecessary(const PgPerformOptionsPB& op
 }
 
 Result<const TransactionMetadata*> PgClientSession::GetDdlTransactionMetadata(
-    bool use_transaction) {
+    bool use_transaction, CoarseTimePoint deadline) {
   if (!use_transaction) {
     return nullptr;
   }
@@ -732,8 +778,8 @@ Result<const TransactionMetadata*> PgClientSession::GetDdlTransactionMetadata(
   if (!txn) {
     const auto isolation = FLAGS_ysql_serializable_isolation_for_ddl_txn
         ? IsolationLevel::SERIALIZABLE_ISOLATION : IsolationLevel::SNAPSHOT_ISOLATION;
-    txn = VERIFY_RESULT(transaction_pool_provider_()->TakeAndInit(isolation));
-    ddl_txn_metadata_ = VERIFY_RESULT(Copy(txn->GetMetadata().get()));
+    txn = VERIFY_RESULT(transaction_pool_provider_()->TakeAndInit(isolation, deadline));
+    ddl_txn_metadata_ = VERIFY_RESULT(Copy(txn->GetMetadata(deadline).get()));
     EnsureSession(PgClientSessionKind::kDdl)->SetTransaction(txn);
   }
 
@@ -772,11 +818,11 @@ Status PgClientSession::InsertSequenceTuple(
     const PgInsertSequenceTupleRequestPB& req, PgInsertSequenceTupleResponsePB* resp,
     rpc::RpcContext* context) {
   PgObjectId table_oid(kPgSequencesDataDatabaseOid, kPgSequencesDataTableOid);
-  auto result = table_cache_.Get(table_oid.GetYBTableId());
+  auto result = table_cache_.Get(table_oid.GetYbTableId());
   if (!result.ok()) {
     RETURN_NOT_OK(CreateSequencesDataTable(&client_, context->GetClientDeadline()));
     // Try one more time.
-    result = table_cache_.Get(table_oid.GetYBTableId());
+    result = table_cache_.Get(table_oid.GetYbTableId());
   }
   auto table = VERIFY_RESULT(std::move(result));
 
@@ -798,14 +844,15 @@ Status PgClientSession::InsertSequenceTuple(
 
   auto& session = EnsureSession(PgClientSessionKind::kSequence);
   session->SetDeadline(context->GetClientDeadline());
-  return session->ApplyAndFlush(std::move(psql_write));
+  // TODO(async_flush): https://github.com/yugabyte/yugabyte-db/issues/12173
+  return session->TEST_ApplyAndFlush(std::move(psql_write));
 }
 
 Status PgClientSession::UpdateSequenceTuple(
     const PgUpdateSequenceTupleRequestPB& req, PgUpdateSequenceTupleResponsePB* resp,
     rpc::RpcContext* context) {
   PgObjectId table_oid(kPgSequencesDataDatabaseOid, kPgSequencesDataTableOid);
-  auto table = VERIFY_RESULT(table_cache_.Get(table_oid.GetYBTableId()));
+  auto table = VERIFY_RESULT(table_cache_.Get(table_oid.GetYbTableId()));
 
   std::shared_ptr<client::YBPgsqlWriteOp> psql_write(client::YBPgsqlWriteOp::NewUpdate(table));
 
@@ -855,7 +902,8 @@ Status PgClientSession::UpdateSequenceTuple(
 
   auto& session = EnsureSession(PgClientSessionKind::kSequence);
   session->SetDeadline(context->GetClientDeadline());
-  RETURN_NOT_OK(session->ApplyAndFlush(psql_write));
+  // TODO(async_flush): https://github.com/yugabyte/yugabyte-db/issues/12173
+  RETURN_NOT_OK(session->TEST_ApplyAndFlush(psql_write));
   resp->set_skipped(psql_write->response().skipped());
   return Status::OK();
 }
@@ -867,7 +915,7 @@ Status PgClientSession::ReadSequenceTuple(
   using pggate::PgWireDataHeader;
 
   PgObjectId table_oid(kPgSequencesDataDatabaseOid, kPgSequencesDataTableOid);
-  auto table = VERIFY_RESULT(table_cache_.Get(table_oid.GetYBTableId()));
+  auto table = VERIFY_RESULT(table_cache_.Get(table_oid.GetYbTableId()));
 
   std::shared_ptr<client::YBPgsqlReadOp> psql_read(client::YBPgsqlReadOp::NewSelect(table));
 
@@ -895,7 +943,8 @@ Status PgClientSession::ReadSequenceTuple(
 
   auto& session = EnsureSession(PgClientSessionKind::kSequence);
   session->SetDeadline(context->GetClientDeadline());
-  RETURN_NOT_OK(session->ReadSync(psql_read));
+  // TODO(async_flush): https://github.com/yugabyte/yugabyte-db/issues/12173
+  RETURN_NOT_OK(session->TEST_ReadSync(psql_read));
 
   Slice cursor;
   int64_t row_count = 0;
@@ -927,7 +976,7 @@ Status PgClientSession::DeleteSequenceTuple(
     const PgDeleteSequenceTupleRequestPB& req, PgDeleteSequenceTupleResponsePB* resp,
     rpc::RpcContext* context) {
   PgObjectId table_oid(kPgSequencesDataDatabaseOid, kPgSequencesDataTableOid);
-  auto table = VERIFY_RESULT(table_cache_.Get(table_oid.GetYBTableId()));
+  auto table = VERIFY_RESULT(table_cache_.Get(table_oid.GetYbTableId()));
 
   auto psql_delete(client::YBPgsqlWriteOp::NewDelete(table));
   auto delete_request = psql_delete->mutable_request();
@@ -937,14 +986,15 @@ Status PgClientSession::DeleteSequenceTuple(
 
   auto& session = EnsureSession(PgClientSessionKind::kSequence);
   session->SetDeadline(context->GetClientDeadline());
-  return session->ApplyAndFlush(std::move(psql_delete));
+  // TODO(async_flush): https://github.com/yugabyte/yugabyte-db/issues/12173
+  return session->TEST_ApplyAndFlush(std::move(psql_delete));
 }
 
 Status PgClientSession::DeleteDBSequences(
     const PgDeleteDBSequencesRequestPB& req, PgDeleteDBSequencesResponsePB* resp,
     rpc::RpcContext* context) {
   PgObjectId table_oid(kPgSequencesDataDatabaseOid, kPgSequencesDataTableOid);
-  auto table_res = table_cache_.Get(table_oid.GetYBTableId());
+  auto table_res = table_cache_.Get(table_oid.GetYbTableId());
   if (!table_res.ok()) {
     // Sequence table is not yet created.
     return Status::OK();
@@ -962,7 +1012,8 @@ Status PgClientSession::DeleteDBSequences(
 
   auto& session = EnsureSession(PgClientSessionKind::kSequence);
   session->SetDeadline(context->GetClientDeadline());
-  return session->ApplyAndFlush(std::move(psql_delete));
+  // TODO(async_flush): https://github.com/yugabyte/yugabyte-db/issues/12173
+  return session->TEST_ApplyAndFlush(std::move(psql_delete));
 }
 
 client::YBSessionPtr& PgClientSession::EnsureSession(PgClientSessionKind kind) {
@@ -979,6 +1030,22 @@ client::YBSessionPtr& PgClientSession::Session(PgClientSessionKind kind) {
 
 client::YBTransactionPtr& PgClientSession::Transaction(PgClientSessionKind kind) {
   return sessions_[to_underlying(kind)].transaction;
+}
+
+Status PgClientSession::CheckPlainSessionReadTime() {
+  auto session = Session(PgClientSessionKind::kPlain);
+  if (!session->read_point()->GetReadTime()) {
+    ReadHybridTime used_read_time;
+    {
+      std::lock_guard<simple_spinlock> guard(plain_session_used_read_time_.lock);
+      used_read_time = plain_session_used_read_time_.value;
+    }
+    RSTATUS_DCHECK(used_read_time, IllegalState, "Used read time is not set");
+    session->SetReadPoint(used_read_time);
+    VLOG_WITH_PREFIX(3)
+        << "Update read time from used read time: " << session->read_point()->GetReadTime();
+  }
+  return Status::OK();
 }
 
 }  // namespace tserver

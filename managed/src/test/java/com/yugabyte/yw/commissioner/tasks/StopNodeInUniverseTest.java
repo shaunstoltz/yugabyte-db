@@ -37,7 +37,7 @@ import java.util.stream.Collectors;
 import org.junit.Before;
 import org.junit.Test;
 import org.junit.runner.RunWith;
-import org.mockito.runners.MockitoJUnitRunner;
+import org.mockito.junit.MockitoJUnitRunner;
 import org.yb.client.ChangeMasterClusterConfigResponse;
 import org.yb.client.GetLoadMovePercentResponse;
 import org.yb.client.GetMasterClusterConfigResponse;
@@ -60,6 +60,7 @@ public class StopNodeInUniverseTest extends CommissionerBaseTest {
     // create default universe
     UniverseDefinitionTaskParams.UserIntent userIntent =
         new UniverseDefinitionTaskParams.UserIntent();
+    userIntent.provider = defaultProvider.uuid.toString();
     userIntent.numNodes = 3;
     userIntent.ybSoftwareVersion = "yb-version";
     userIntent.accessKeyCode = "demo-access";
@@ -119,7 +120,8 @@ public class StopNodeInUniverseTest extends CommissionerBaseTest {
           TaskType.ModifyBlackList,
           TaskType.UpdateNodeProcess,
           TaskType.SetNodeState,
-          TaskType.UniverseUpdateSucceeded);
+          TaskType.UniverseUpdateSucceeded,
+          TaskType.ModifyBlackList);
 
   private static final List<JsonNode> STOP_NODE_TASK_EXPECTED_RESULTS =
       ImmutableList.of(
@@ -131,6 +133,7 @@ public class StopNodeInUniverseTest extends CommissionerBaseTest {
           Json.toJson(ImmutableMap.of()),
           Json.toJson(ImmutableMap.of("processType", "TSERVER", "isAdd", false)),
           Json.toJson(ImmutableMap.of("state", "Stopped")),
+          Json.toJson(ImmutableMap.of()),
           Json.toJson(ImmutableMap.of()));
 
   private static final List<TaskType> STOP_NODE_TASK_SEQUENCE_MASTER =
@@ -147,7 +150,8 @@ public class StopNodeInUniverseTest extends CommissionerBaseTest {
           TaskType.ChangeMasterConfig,
           TaskType.UpdateNodeProcess,
           TaskType.SetNodeState,
-          TaskType.UniverseUpdateSucceeded);
+          TaskType.UniverseUpdateSucceeded,
+          TaskType.ModifyBlackList);
 
   private static final List<JsonNode> STOP_NODE_TASK_SEQUENCE_MASTER_RESULTS =
       ImmutableList.of(
@@ -163,6 +167,7 @@ public class StopNodeInUniverseTest extends CommissionerBaseTest {
           Json.toJson(ImmutableMap.of()),
           Json.toJson(ImmutableMap.of("processType", "MASTER", "isAdd", false)),
           Json.toJson(ImmutableMap.of("state", "Stopped")),
+          Json.toJson(ImmutableMap.of()),
           Json.toJson(ImmutableMap.of()));
 
   private void assertStopNodeSequence(
@@ -171,9 +176,7 @@ public class StopNodeInUniverseTest extends CommissionerBaseTest {
     if (isMaster) {
       for (TaskType taskType : STOP_NODE_TASK_SEQUENCE_MASTER) {
         List<TaskInfo> tasks = subTasksByPosition.get(position);
-        // The finally-clause adds 2 tasks at position 0.
-        int numTasksByPosition = position == 0 ? 2 : 1;
-        assertEquals(numTasksByPosition, tasks.size());
+        assertEquals(1, tasks.size());
         assertEquals(taskType, tasks.get(0).getTaskType());
         JsonNode expectedResults = STOP_NODE_TASK_SEQUENCE_MASTER_RESULTS.get(position);
         List<JsonNode> taskDetails =
@@ -184,9 +187,7 @@ public class StopNodeInUniverseTest extends CommissionerBaseTest {
     } else {
       for (TaskType taskType : STOP_NODE_TASK_SEQUENCE) {
         List<TaskInfo> tasks = subTasksByPosition.get(position);
-        // The finally-clause adds 2 tasks at position 0.
-        int numTasksByPosition = position == 0 ? 2 : 1;
-        assertEquals(numTasksByPosition, tasks.size());
+        assertEquals(1, tasks.size());
         assertEquals(taskType, tasks.get(0).getTaskType());
         JsonNode expectedResults = STOP_NODE_TASK_EXPECTED_RESULTS.get(position);
         List<JsonNode> taskDetails =
@@ -221,6 +222,7 @@ public class StopNodeInUniverseTest extends CommissionerBaseTest {
     UniverseDefinitionTaskParams.UserIntent userIntent =
         new UniverseDefinitionTaskParams.UserIntent();
     userIntent.numNodes = 5;
+    userIntent.provider = defaultProvider.uuid.toString();
     userIntent.replicationFactor = 3;
     universe =
         Universe.saveDetails(

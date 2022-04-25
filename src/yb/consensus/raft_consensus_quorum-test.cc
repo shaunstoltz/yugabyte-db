@@ -129,7 +129,7 @@ class RaftConsensusQuorumTest : public YBTest {
       opts.server_type = "tserver_test";
       std::unique_ptr<FsManager> fs_manager(new FsManager(env_.get(), opts));
       RETURN_NOT_OK(fs_manager->CreateInitialFileSystemLayout());
-      RETURN_NOT_OK(fs_manager->Open());
+      RETURN_NOT_OK(fs_manager->CheckAndOpenFileSystemRoots());
 
       scoped_refptr<Log> log;
       RETURN_NOT_OK(Log::Open(LogOptions(),
@@ -161,6 +161,7 @@ class RaftConsensusQuorumTest : public YBTest {
       string peer_uuid = Substitute("peer-$0", i);
 
       std::unique_ptr<ConsensusMetadata> cmeta;
+      fs_managers_[i]->SetTabletPathByDataPath(kTestTablet, fs_managers_[i]->GetDataRootDirs()[0]);
       ASSERT_OK(ConsensusMetadata::Create(fs_managers_[i], kTestTablet, peer_uuid, config_,
                                          kMinimumTerm, &cmeta));
 

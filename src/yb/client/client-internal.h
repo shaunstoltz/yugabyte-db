@@ -303,10 +303,6 @@ class YBClient::Data {
       RequireTabletsRunning require_tablets_running, CoarseTimePoint deadline,
       GetTableLocationsCallback callback);
 
-  CHECKED_STATUS InitLocalHostNames();
-
-  bool IsLocalHostPort(const HostPort& hp) const;
-
   bool IsTabletServerLocal(const internal::RemoteTabletServer& rts) const;
 
   // Returns a non-failed replica of the specified tablet based on the provided selection criteria
@@ -430,10 +426,6 @@ class YBClient::Data {
   scoped_refptr<internal::MetaCache> meta_cache_;
   scoped_refptr<MetricEntity> metric_entity_;
 
-  // Set of hostnames and IPs on the local host.
-  // This is initialized at client startup.
-  std::unordered_set<std::string> local_host_names_;
-
   // Flag name to fetch master addresses from flagfile.
   std::string master_address_flag_name_;
   // This vector holds the list of master server addresses. Note that each entry in this vector
@@ -499,6 +491,7 @@ class YBClient::Data {
   std::unique_ptr<ThreadPool> threadpool_;
 
   const ClientId id_;
+  const std::string log_prefix_;
 
   // Used to track requests that were sent to a particular tablet, so it could track different
   // RPCs related to the same write operation and reject duplicates.
@@ -538,10 +531,6 @@ Status RetryFunc(
     const std::string& timeout_msg,
     const std::function<Status(CoarseTimePoint, bool*)>& func,
     const CoarseDuration max_wait = std::chrono::seconds(2));
-
-// TODO(PgClient) Remove after removing YBTable from postgres.
-CHECKED_STATUS CreateTableInfoFromTableSchemaResp(
-    const master::GetTableSchemaResponsePB& resp, YBTableInfo* info);
 
 } // namespace client
 } // namespace yb

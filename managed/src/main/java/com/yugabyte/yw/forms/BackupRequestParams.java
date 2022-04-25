@@ -4,6 +4,7 @@ package com.yugabyte.yw.forms;
 
 import com.fasterxml.jackson.annotation.JsonIgnore;
 import com.yugabyte.yw.common.Util;
+import com.yugabyte.yw.models.helpers.TimeUnit;
 import io.swagger.annotations.ApiModel;
 import io.swagger.annotations.ApiModelProperty;
 import java.util.HashSet;
@@ -34,6 +35,9 @@ public class BackupRequestParams extends UniverseTaskParams {
   // bucket.
   @ApiModelProperty(value = "Time before deleting the backup from storage, in milliseconds")
   public long timeBeforeDelete = 0L;
+
+  @ApiModelProperty(value = "Time unit for user input schedule frequency")
+  public TimeUnit frequencyTimeUnit;
 
   // Should backup script enable verbose logging.
   @ApiModelProperty(value = "Is verbose logging enabled")
@@ -66,13 +70,23 @@ public class BackupRequestParams extends UniverseTaskParams {
   @ApiModelProperty(value = "Cron expression for a recurring backup")
   public String cronExpression = null;
 
+  @ApiModelProperty(value = "Is tablespaces information included")
+  public Boolean useTablespaces = false;
+
   // The associated schedule UUID (if applicable)
   @ApiModelProperty(value = "Schedule UUID")
   public UUID scheduleUUID = null;
 
+  // The associated schedule name (if applicable)
+  @ApiModelProperty(value = "Schedule Name")
+  public String scheduleName = null;
+
   // Specifies number of backups to retain in case of recurring backups.
   @ApiModelProperty(value = "Minimum number of backups to retain for a particular backup schedule")
   public int minNumBackupsToRetain = Util.MIN_NUM_BACKUPS_TO_RETAIN;
+
+  @ApiModelProperty(value = "Time unit for backup expiry time")
+  public TimeUnit expiryTimeUnit;
 
   @ApiModel(description = "Keyspace and table info for backup")
   public static class KeyspaceTable {

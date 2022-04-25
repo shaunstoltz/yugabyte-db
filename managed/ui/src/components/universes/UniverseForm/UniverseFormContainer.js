@@ -19,8 +19,10 @@ import {
   fetchAuthConfigList,
   fetchAuthConfigListResponse
 } from '../../../actions/cloud';
-import { getTlsCertificates, getTlsCertificatesResponse } from '../../../actions/customers';
+import { fetchRunTimeConfigs, fetchRunTimeConfigsResponse, getTlsCertificates, getTlsCertificatesResponse } from '../../../actions/customers';
 import {
+  rollingUpgrade,
+  rollingUpgradeResponse,
   createUniverse,
   createUniverseResponse,
   editUniverse,
@@ -106,14 +108,14 @@ const mapDispatchToProps = (dispatch) => {
     },
 
     submitAddUniverseReadReplica: (values, universeUUID) => {
-      dispatch(addUniverseReadReplica(values, universeUUID)).then((response) => {
-        dispatch(addUniverseReadReplicaResponse(response.payload));
+      return dispatch(addUniverseReadReplica(values, universeUUID)).then((response) => {
+        return dispatch(addUniverseReadReplicaResponse(response.payload));
       });
     },
 
     submitEditUniverseReadReplica: (values, universeUUID) => {
-      dispatch(editUniverseReadReplica(values, universeUUID)).then((response) => {
-        dispatch(editUniverseReadReplicaResponse(response.payload));
+      return dispatch(editUniverseReadReplica(values, universeUUID)).then((response) => {
+        return dispatch(editUniverseReadReplicaResponse(response.payload));
       });
     },
 
@@ -133,12 +135,21 @@ const mapDispatchToProps = (dispatch) => {
     },
 
     submitEditUniverse: (values, universeUUID) => {
-      dispatch(editUniverse(values, universeUUID)).then((response) => {
+      return dispatch(editUniverse(values, universeUUID)).then((response) => {
         if (response.error) {
           const errorMessage = response.payload?.response?.data?.error || response.payload.message;
           toast.error(errorMessage);
         }
-        dispatch(editUniverseResponse(response.payload));
+        return dispatch(editUniverseResponse(response.payload));
+      });
+    },
+
+    submitUniverseNodeResize: (values, universeUUID) => {
+      return dispatch(rollingUpgrade(values, universeUUID)).then((response) => {
+        if (!response.error) {
+          dispatch(closeUniverseDialog());
+        }
+        return dispatch(rollingUpgradeResponse(response.payload));
       });
     },
 
@@ -194,11 +205,24 @@ const mapDispatchToProps = (dispatch) => {
       dispatch(openDialog('fullMoveModal'));
     },
 
+    showSmartResizeModal: () => {
+      dispatch(openDialog('smartResizeModal'));
+    },
+
+    showUpgradeNodesModal: () => {
+      dispatch(openDialog('resizeNodesModal'));
+    },
+
     fetchNodeInstanceList: (providerUUID) => {
       dispatch(getNodeInstancesForProvider(providerUUID)).then((response) => {
         dispatch(getNodesInstancesForProviderResponse(response.payload));
       });
-    }
+    },
+    fetchRunTimeConfigs: () => {
+      return dispatch(fetchRunTimeConfigs('00000000-0000-0000-0000-000000000000',true)).then((response) =>
+        dispatch(fetchRunTimeConfigsResponse(response.payload))
+      );
+    },
   };
 };
 
@@ -361,7 +385,10 @@ function getFormData(currentUniverse, formType, clusterType) {
 
 function mapStateToProps(state, ownProps) {
   const {
-    universe: { currentUniverse }
+    universe: { currentUniverse },
+    customer: {
+      runtimeConfigs
+    }
   } = state;
   let data = {
     formType: 'Create',
@@ -429,6 +456,7 @@ function mapStateToProps(state, ownProps) {
     modal: state.modal,
     tasks: state.tasks,
     cloud: state.cloud,
+    runtimeConfigs,
     softwareVersions: state.customer.softwareVersions,
     userCertificates: state.customer.userCertificates,
     accessKeys: state.cloud.accessKeys,

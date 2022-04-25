@@ -309,7 +309,8 @@ YB_CLIENT_SPECIALIZE_SIMPLE_EX(Replication, UpdateConsumerOnProducerSplit);
 YBClient::Data::Data()
     : leader_master_rpc_(rpcs_.InvalidHandle()),
       latest_observed_hybrid_time_(YBClient::kNoHybridTime),
-      id_(ClientId::GenerateRandom()) {
+      id_(ClientId::GenerateRandom()),
+      log_prefix_(Format("Client $0: ", id_)) {
   for(auto& cache : tserver_count_cached_) {
     cache.store(0, std::memory_order_relaxed);
   }
@@ -365,24 +366,17 @@ RemoteTabletServer* YBClient::Data::SelectTServer(RemoteTablet* rt,
         }
       } else if (selection == CLOSEST_REPLICA) {
         // Choose the closest replica.
-        bool local_zone_ts = false;
+        internal::LocalityLevel best_locality_level = internal::LocalityLevel::kNone;
         for (RemoteTabletServer* rts : filtered) {
           if (IsTabletServerLocal(*rts)) {
             ret = rts;
             // If the tserver is local, we are done here.
             break;
-          } else if (cloud_info_pb_.has_placement_region() &&
-                     rts->cloud_info().has_placement_region() &&
-                     cloud_info_pb_.placement_region() == rts->cloud_info().placement_region()) {
-            if (cloud_info_pb_.has_placement_zone() && rts->cloud_info().has_placement_zone() &&
-                cloud_info_pb_.placement_zone() == rts->cloud_info().placement_zone()) {
-              // Note down that we have found a zone local tserver and continue looking for node
-              // local tserver.
+          } else {
+            auto locality_level = rts->LocalityLevelWith(cloud_info_pb_);
+            if (locality_level > best_locality_level) {
               ret = rts;
-              local_zone_ts = true;
-            } else if (!local_zone_ts) {
-              // Look for a region local tserver only if we haven't found a zone local tserver yet.
-              ret = rts;
+              best_locality_level = locality_level;
             }
           }
         }
@@ -403,14 +397,14 @@ RemoteTabletServer* YBClient::Data::SelectTServer(RemoteTablet* rt,
     LOG(FATAL) << "Selected replica is not the local tablet server";
   }
   if (PREDICT_FALSE(!FLAGS_TEST_assert_tablet_server_select_is_in_zone.empty())) {
-    if (ret->cloud_info().placement_zone() != FLAGS_TEST_assert_tablet_server_select_is_in_zone) {
+    if (ret->TEST_PlacementZone() != FLAGS_TEST_assert_tablet_server_select_is_in_zone) {
       string msg = Substitute("\nZone placement:\nNumber of candidates: $0\n", candidates->size());
       for (RemoteTabletServer* rts : *candidates) {
         msg += Substitute("Replica: $0 in zone $1\n",
-                          rts->ToString(), rts->cloud_info().placement_zone());
+                          rts->ToString(), rts->TEST_PlacementZone());
       }
       LOG(FATAL) << "Selected replica " << ret->ToString()
-                 << " is in zone " << ret->cloud_info().placement_zone()
+                 << " is in zone " << ret->TEST_PlacementZone()
                  << " instead of the expected zone "
                  << FLAGS_TEST_assert_tablet_server_select_is_in_zone
                  << " Cloud info: " << cloud_info_pb_.ShortDebugString()
@@ -1034,68 +1028,10 @@ Status YBClient::Data::WaitForFlushTableToFinish(YBClient* client,
       std::bind(&YBClient::Data::IsFlushTableInProgress, this, client, flush_id, _1, _2));
 }
 
-Status YBClient::Data::InitLocalHostNames() {
-  std::vector<IpAddress> addresses;
-  auto status = GetLocalAddresses(&addresses, AddressFilter::EXTERNAL);
-  if (!status.ok()) {
-    LOG(WARNING) << "Failed to enumerate network interfaces" << status.ToString();
-  }
-
-  string hostname;
-  status = GetFQDN(&hostname);
-
-  if (status.ok()) {
-    // We don't want to consider 'localhost' to be local - otherwise if a misconfigured
-    // server reports its own name as localhost, all clients will hammer it.
-    if (hostname != "localhost" && hostname != "localhost.localdomain") {
-      local_host_names_.insert(hostname);
-      VLOG(1) << "Considering host " << hostname << " local";
-    }
-
-    std::vector<Endpoint> endpoints;
-    status = HostPort(hostname, 0).ResolveAddresses(&endpoints);
-    if (!status.ok()) {
-      const auto message = Substitute("Could not resolve local host name '$0'", hostname);
-      LOG(WARNING) << message;
-      if (addresses.empty()) {
-        return status.CloneAndPrepend(message);
-      }
-    } else {
-      addresses.reserve(addresses.size() + endpoints.size());
-      for (const auto& endpoint : endpoints) {
-        addresses.push_back(endpoint.address());
-      }
-    }
-  } else {
-    LOG(WARNING) << "Failed to get hostname: " << status.ToString();
-    if (addresses.empty()) {
-      return status;
-    }
-  }
-
-  for (const auto& addr : addresses) {
-    // Similar to above, ignore local or wildcard addresses.
-    if (addr.is_unspecified() || addr.is_loopback()) continue;
-
-    VLOG(1) << "Considering host " << addr << " local";
-    local_host_names_.insert(addr.to_string());
-  }
-
-  return Status::OK();
-}
-
-bool YBClient::Data::IsLocalHostPort(const HostPort& hp) const {
-  return ContainsKey(local_host_names_, hp.host());
-}
-
 bool YBClient::Data::IsTabletServerLocal(const RemoteTabletServer& rts) const {
   // If the uuid's are same, we are sure the tablet server is local, since if this client is used
   // via the CQL proxy, the tablet server's uuid is set in the client.
-  if (uuid_ == rts.permanent_uuid()) {
-    return true;
-  }
-
-  return rts.HasHostFrom(local_host_names_);
+  return uuid_ == rts.permanent_uuid();
 }
 
 template <class T, class... Args>

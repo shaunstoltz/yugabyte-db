@@ -13,22 +13,33 @@
 #include "yb/yql/pggate/ybc_pggate.h"
 
 #include <algorithm>
+#include <atomic>
+#include <functional>
 #include <string>
-
-#include <cds/init.h> // NOLINT
+#include <utility>
 
 #include "yb/client/tablet_server.h"
 
 #include "yb/common/common_flags.h"
+#include "yb/common/hybrid_time.h"
+#include "yb/common/pg_types.h"
 #include "yb/common/ql_value.h"
 #include "yb/common/ybc-internal.h"
 
 #include "yb/util/atomic.h"
 #include "yb/util/flag_tags.h"
+#include "yb/util/result.h"
+#include "yb/util/slice.h"
+#include "yb/util/status.h"
 #include "yb/util/thread.h"
 #include "yb/util/yb_partition.h"
 
+#include "yb/yql/pggate/pg_env.h"
+#include "yb/yql/pggate/pg_expr.h"
+#include "yb/yql/pggate/pg_gate_fwd.h"
 #include "yb/yql/pggate/pg_memctx.h"
+#include "yb/yql/pggate/pg_statement.h"
+#include "yb/yql/pggate/pg_tabledesc.h"
 #include "yb/yql/pggate/pg_value.h"
 #include "yb/yql/pggate/pggate.h"
 #include "yb/yql/pggate/pggate_flags.h"
@@ -359,6 +370,7 @@ YBCStatus YBCPgNewCreateTable(const char *database_name,
                               bool add_primary_key,
                               const bool colocated,
                               const YBCPgOid tablegroup_oid,
+                              const YBCPgOid colocation_id,
                               const YBCPgOid tablespace_oid,
                               const YBCPgOid matview_pg_table_oid,
                               YBCPgStatement *handle) {
@@ -368,8 +380,8 @@ YBCStatus YBCPgNewCreateTable(const char *database_name,
   const PgObjectId matview_pg_table_id(database_oid, matview_pg_table_oid);
   return ToYBCStatus(pgapi->NewCreateTable(
       database_name, schema_name, table_name, table_id, is_shared_table,
-      if_not_exist, add_primary_key, colocated, tablegroup_id, tablespace_id, matview_pg_table_id,
-      handle));
+      if_not_exist, add_primary_key, colocated, tablegroup_id, colocation_id, tablespace_id,
+      matview_pg_table_id, handle));
 }
 
 YBCStatus YBCPgCreateTableAddColumn(YBCPgStatement handle, const char *attr_name, int attr_num,
@@ -480,11 +492,13 @@ YBCStatus YBCPgIsTableColocated(const YBCPgOid database_oid,
   }
 }
 
-YBCStatus YBCPgGetTableProperties(YBCPgTableDesc table_desc,
-                                  YBCPgTableProperties *properties) {
+YBCStatus YBCPgGetSomeTableProperties(YBCPgTableDesc table_desc,
+                                      YBCPgTableProperties *properties) {
   CHECK_NOTNULL(properties)->num_tablets = table_desc->GetPartitionCount();
   properties->num_hash_key_columns = table_desc->num_hash_key_columns();
   properties->is_colocated = table_desc->IsColocated();
+  properties->tablegroup_oid = 0; /* Isn't set here. */
+  properties->colocation_id = table_desc->GetColocationId();
   return YBCStatusOK();
 }
 
@@ -518,6 +532,7 @@ YBCStatus YBCPgNewCreateIndex(const char *database_name,
                               const bool skip_index_backfill,
                               bool if_not_exist,
                               const YBCPgOid tablegroup_oid,
+                              const YBCPgOid colocation_id,
                               const YBCPgOid tablespace_oid,
                               YBCPgStatement *handle) {
   const PgObjectId index_id(database_oid, index_oid);
@@ -527,7 +542,7 @@ YBCStatus YBCPgNewCreateIndex(const char *database_name,
   return ToYBCStatus(pgapi->NewCreateIndex(database_name, schema_name, index_name, index_id,
                                            table_id, is_shared_index, is_unique_index,
                                            skip_index_backfill, if_not_exist, tablegroup_id,
-                                           tablespace_id, handle));
+                                           colocation_id, tablespace_id, handle));
 }
 
 YBCStatus YBCPgCreateIndexAddColumn(YBCPgStatement handle, const char *attr_name, int attr_num,
@@ -658,10 +673,8 @@ YBCStatus YBCPgFlushBufferedOperations() {
   return ToYBCStatus(pgapi->FlushBufferedOperations());
 }
 
-YBCStatus YBCPgDmlExecWriteOp(YBCPgStatement handle,
-                              int32_t *rows_affected_count,
-                              bool use_async_flush) {
-  return ToYBCStatus(pgapi->DmlExecWriteOp(handle, rows_affected_count, use_async_flush));
+YBCStatus YBCPgDmlExecWriteOp(YBCPgStatement handle, int32_t *rows_affected_count) {
+  return ToYBCStatus(pgapi->DmlExecWriteOp(handle, rows_affected_count));
 }
 
 YBCStatus YBCPgBuildYBTupleId(const YBCPgYBTupleIdDescriptor *source, uint64_t *ybctid) {
@@ -877,7 +890,7 @@ YBCStatus YBCGetDocDBKeySize(uint64_t data, const YBCPgTypeEntity *typeentity,
   }
 
   QLValue val;
-  Status status = pggate::PgValueToPB(typeentity, data, is_null, &val);
+  Status status = pggate::PgValueToPB(typeentity, data, is_null, val.mutable_value());
   if (!status.IsOk()) {
     return ToYBCStatus(status);
   }
@@ -894,7 +907,7 @@ YBCStatus YBCAppendDatumToKey(uint64_t data, const YBCPgTypeEntity *typeentity,
                               size_t *bytes_written) {
   QLValue val;
 
-  Status status = pggate::PgValueToPB(typeentity, data, is_null, &val);
+  Status status = pggate::PgValueToPB(typeentity, data, is_null, val.mutable_value());
   if (!status.IsOk()) {
     return ToYBCStatus(status);
   }
@@ -960,6 +973,10 @@ YBCStatus YBCPgSetTransactionDeferrable(bool deferrable) {
 
 YBCStatus YBCPgEnterSeparateDdlTxnMode() {
   return ToYBCStatus(pgapi->EnterSeparateDdlTxnMode());
+}
+
+bool YBCPgHasWriteOperationsInDdlTxnMode() {
+  return pgapi->HasWriteOperationsInDdlTxnMode();
 }
 
 YBCStatus YBCPgExitSeparateDdlTxnMode() {
@@ -1163,6 +1180,21 @@ void YBCPgSetThreadLocalErrMsg(const void* new_msg) {
 
 const void* YBCPgGetThreadLocalErrMsg() {
   return PgGetThreadLocalErrMsg();
+}
+
+void YBCStartSysTablePrefetching() {
+  pgapi->StartSysTablePrefetching();
+}
+
+void YBCStopSysTablePrefetching() {
+  pgapi->StopSysTablePrefetching();
+}
+
+void YBCRegisterSysTableForPrefetching(
+  YBCPgOid database_oid, YBCPgOid table_oid, YBCPgOid index_oid) {
+  pgapi->RegisterSysTableForPrefetching(
+      PgObjectId(database_oid, table_oid),
+      index_oid == kPgInvalidOid ? PgObjectId() : PgObjectId(database_oid, index_oid));
 }
 
 } // extern "C"

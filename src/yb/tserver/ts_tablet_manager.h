@@ -173,7 +173,9 @@ class TSTabletManager : public tserver::TabletPeerLookupIf, public tablet::Table
       const bool colocated = false,
       const std::vector<SnapshotScheduleId>& snapshot_schedules = {});
 
-  CHECKED_STATUS ApplyTabletSplit(tablet::SplitOperation* operation, log::Log* raft_log) override;
+  Status ApplyTabletSplit(
+      tablet::SplitOperation* operation, log::Log* raft_log,
+      boost::optional<consensus::RaftConfigPB> committed_raft_config) override;
 
   // Delete the specified tablet.
   // 'delete_type' must be one of TABLET_DATA_DELETED or TABLET_DATA_TOMBSTONED
@@ -187,6 +189,7 @@ class TSTabletManager : public tserver::TabletPeerLookupIf, public tablet::Table
   CHECKED_STATUS DeleteTablet(
       const TabletId& tablet_id,
       tablet::TabletDataState delete_type,
+      tablet::ShouldAbortActiveTransactions should_abort_active_txns,
       const boost::optional<int64_t>& cas_config_opid_index_less_or_equal,
       bool hide_only,
       boost::optional<TabletServerErrorPB::Code>* error_code);

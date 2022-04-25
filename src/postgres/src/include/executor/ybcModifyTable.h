@@ -33,6 +33,13 @@
  */
 extern bool yb_disable_transactional_writes;
 
+/**
+ * YSQL guc variables that can be used to enable upsert mode for writes.
+ * e.g. 'SET yb_enable_upsert_mode=true'
+ * See also the corresponding entries in guc.c.
+ */
+extern bool yb_enable_upsert_mode;
+
 //------------------------------------------------------------------------------
 // YugaByte modify table API.
 
@@ -63,13 +70,11 @@ extern Oid YBCHeapInsertForDb(Oid dboid,
  */
 extern Oid YBCExecuteInsert(Relation rel,
                             TupleDesc tupleDesc,
-                            HeapTuple tuple,
-							              bool use_async_flush);
+                            HeapTuple tuple);
 extern Oid YBCExecuteInsertForDb(Oid dboid,
                                  Relation rel,
                                  TupleDesc tupleDesc,
-                                 HeapTuple tuple,
-								                 bool use_async_flush);
+                                 HeapTuple tuple);
 
 /*
  * Execute the insert outside of a transaction.

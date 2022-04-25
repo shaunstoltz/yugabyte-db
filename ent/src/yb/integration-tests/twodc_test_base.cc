@@ -167,7 +167,7 @@ Status TwoDCTestBase::VerifyUniverseReplicationDeleted(MiniCluster* consumer_clu
 
 Status TwoDCTestBase::GetCDCStreamForTable(
     const std::string& table_id, master::ListCDCStreamsResponsePB* resp) {
-  return LoggedWaitFor([=]() -> Result<bool> {
+  return LoggedWaitFor([this, table_id, resp]() -> Result<bool> {
     master::ListCDCStreamsRequestPB req;
     req.set_table_id(table_id);
     resp->Clear();
@@ -232,7 +232,7 @@ size_t TwoDCTestBase::NumProducerTabletsPolled(MiniCluster* cluster) {
 
 Status TwoDCTestBase::CorrectlyPollingAllTablets(
     MiniCluster* cluster, uint32_t num_producer_tablets) {
-  return LoggedWaitFor([=]() -> Result<bool> {
+  return LoggedWaitFor([this, cluster, num_producer_tablets]() -> Result<bool> {
     static int i = 0;
     constexpr int kNumIterationsWithCorrectResult = 5;
     auto cur_tablets = NumProducerTabletsPolled(cluster);
@@ -248,6 +248,22 @@ Status TwoDCTestBase::CorrectlyPollingAllTablets(
     return false;
   }, MonoDelta::FromSeconds(kRpcTimeout), "Num producer tablets being polled");
 }
+
+Status TwoDCTestBase::WaitForSetupUniverseReplicationCleanUp(string producer_uuid) {
+    auto proxy = std::make_shared<master::MasterReplicationProxy>(
+      &consumer_client()->proxy_cache(),
+      VERIFY_RESULT(consumer_cluster()->GetLeaderMiniMaster())->bound_rpc_addr());
+
+    master::GetUniverseReplicationRequestPB req;
+    master::GetUniverseReplicationResponsePB resp;
+    return WaitFor([proxy, &req, &resp, producer_uuid]() -> Result<bool> {
+      req.set_producer_id(producer_uuid);
+      rpc::RpcController rpc;
+      Status s = proxy->GetUniverseReplication(req, &resp, &rpc);
+
+      return resp.has_error() && resp.error().code() == master::MasterErrorPB::OBJECT_NOT_FOUND;
+    }, MonoDelta::FromSeconds(kRpcTimeout), "Waiting for universe to delete");
+  }
 
 } // namespace enterprise
 } // namespace yb

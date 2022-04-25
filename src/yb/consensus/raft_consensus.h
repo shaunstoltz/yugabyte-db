@@ -203,6 +203,7 @@ class RaftConsensus : public std::enable_shared_from_this<RaftConsensus>,
       LeaderLeaseStatus* leader_lease_status) const override;
 
   RaftConfigPB CommittedConfig() const override;
+  RaftConfigPB CommittedConfigUnlocked() const;
 
   void DumpStatusHtml(std::ostream& out) const override;
 
@@ -294,6 +295,8 @@ class RaftConsensus : public std::enable_shared_from_this<RaftConsensus>,
   virtual CHECKED_STATUS AppendNewRoundToQueueUnlocked(const ConsensusRoundPtr& round);
 
   // processed_rounds - out value for number of rounds that were processed.
+  // This function doesn't invoke callbacks for not processed rounds for performance reasons and it
+  // is responsibility of the caller to invoke callbacks after lock has been released.
   virtual CHECKED_STATUS AppendNewRoundsToQueueUnlocked(
       const ConsensusRounds& rounds, size_t* processed_rounds);
 
@@ -340,6 +343,10 @@ class RaftConsensus : public std::enable_shared_from_this<RaftConsensus>,
                             const std::string& reason) override;
 
   void MajorityReplicatedNumSSTFilesChanged(uint64_t majority_replicated_num_sst_files) override;
+
+  CHECKED_STATUS DoAppendNewRoundsToQueueUnlocked(
+        const ConsensusRounds& rounds, size_t* processed_rounds,
+        std::vector<ReplicateMsgPtr>* replicate_msgs);
 
   // Control whether printing of log messages should be done for a particular
   // function call.

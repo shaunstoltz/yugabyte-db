@@ -13,7 +13,7 @@
 
 package org.yb.pgsql;
 
-import static org.yb.AssertionWrappers.fail;
+import static org.yb.AssertionWrappers.*;
 
 import java.io.BufferedReader;
 import java.io.BufferedWriter;
@@ -23,6 +23,7 @@ import java.io.FileWriter;
 import java.io.IOException;
 import java.sql.SQLException;
 import java.sql.Statement;
+import java.util.Arrays;
 
 import org.apache.commons.lang3.StringUtils;
 import org.junit.Test;
@@ -44,11 +45,15 @@ public class TestBatchCopyFrom extends BasePgSQLTest {
       "argument to option \"rows_per_transaction\" must be a positive integer";
   private static final String INVALID_COPY_INPUT_ERROR_MSG =
       "invalid input syntax for integer";
+  private static final String INVALID_FOREIGN_KEY_ERROR_MSG =
+      "violates foreign key constraint";
   private static final String BATCH_TXN_SESSION_VARIABLE_NAME =
       "yb_default_copy_from_rows_per_transaction";
   private static final int BATCH_TXN_SESSION_VARIABLE_DEFAULT_ROWS = 1000;
   private static final String DISABLE_TXN_WRITES_SESSION_VARIABLE_NAME =
       "yb_disable_transactional_writes";
+  private static final String YB_ENABLE_UPSERT_MODE_VARIABLE_NAME =
+      "yb_enable_upsert_mode";
 
   private String getAbsFilePath(String fileName) {
     return TestUtils.getBaseTmpDir() + "/" + fileName;
@@ -68,6 +73,13 @@ public class TestBatchCopyFrom extends BasePgSQLTest {
       else
         writer.write(i+",");
     }
+    writer.close();
+  }
+
+  private void writeToFileInTmpDir(String absFilePath, String line) throws IOException {
+    File myObj = new File(absFilePath);
+    BufferedWriter writer = new BufferedWriter(new FileWriter(myObj, true));
+    writer.write(line);
     writer.close();
   }
 
@@ -248,7 +260,8 @@ public class TestBatchCopyFrom extends BasePgSQLTest {
               "COPY %s FROM \'%s\' WITH (FORMAT CSV, HEADER, ROWS_PER_TRANSACTION %s)",
               tableName, absFilePath, batchSize),
           INVALID_COPY_INPUT_ERROR_MSG);
-      assertOneRow(statement, "SELECT COUNT(*) FROM " + tableName, totalValidLines);
+      // The copy will happen in one batch, hence none of the rows will be copied
+      assertOneRow(statement, "SELECT COUNT(*) FROM " + tableName, 0);
       assertOneRow(statement, "SELECT COUNT(*) FROM " + dummyTableName, 0);
 
       // test before-statement trigger
@@ -262,9 +275,9 @@ public class TestBatchCopyFrom extends BasePgSQLTest {
               "COPY %s FROM \'%s\' WITH (FORMAT CSV, HEADER, ROWS_PER_TRANSACTION %s)",
               tableName, absFilePath, batchSize),
           INVALID_COPY_INPUT_ERROR_MSG);
-      assertOneRow(statement, "SELECT COUNT(*) FROM " + tableName, totalValidLines * 2);
-      // note, before statement-level trigger will execute even if COPY FROM fails
-      assertOneRow(statement, "SELECT COUNT(*) FROM " + dummyTableName, 1);
+      // The copy will happen in one batch, hence none of the rows will be copied
+      assertOneRow(statement, "SELECT COUNT(*) FROM " + tableName, 0);
+      assertOneRow(statement, "SELECT COUNT(*) FROM " + dummyTableName, 0);
     }
   }
 
@@ -517,6 +530,192 @@ public class TestBatchCopyFrom extends BasePgSQLTest {
   }
 
   @Test
+  public void testEnableUpsertModeSessionVariable() throws Exception {
+    String absFilePath = getAbsFilePath("batch-copyfrom-upsertmode-sessionvar.txt");
+    String tableName = "upsertModeSessionVarTable";
+    int totalValidLines = 5;
+    int expectedCopiedLines = totalValidLines;
+
+    createFileInTmpDir(absFilePath, totalValidLines);
+
+    try (Statement statement = connection.createStatement()) {
+      // check that yb_enable_upsert_mode session is off by default
+      assertOneRow(statement, "SHOW " + YB_ENABLE_UPSERT_MODE_VARIABLE_NAME, "off");
+
+      // set enable-upsert session variable
+      statement.execute("SET " + YB_ENABLE_UPSERT_MODE_VARIABLE_NAME + "=true");
+
+      // create and populate table with COPY command
+      statement.execute(String.format(
+        "CREATE TABLE %s (a INT, b INT, c TEXT, d TEXT)", tableName));
+      statement.execute(String.format(
+        "COPY %s FROM \'%s\' WITH (FORMAT CSV, HEADER)", tableName, absFilePath));
+
+      // check every row was properly inserted into the table
+      assertOneRow(statement, "SELECT COUNT(*) FROM " + tableName, expectedCopiedLines);
+
+      // verify DDL and DML statements work
+      statement.execute("ALTER TABLE " + tableName + " ADD COLUMN e INT");
+      statement.execute("ALTER TABLE " + tableName + " DROP COLUMN c");
+      statement.execute("INSERT INTO " + tableName + " VALUES (0, 1, 2, 3)");
+      statement.execute("TRUNCATE TABLE " + tableName);
+      statement.execute("DROP TABLE " + tableName);
+      statement.execute("CREATE TABLE " + tableName + " (a INT PRIMARY KEY, b TEXT)");
+    }
+  }
+
+  @Test
+  public void testEnableUpsertModeSessionVariableIndex() throws Exception {
+    String absFilePath = getAbsFilePath("batch-copyfrom-upsertmode-index-sessionvar.txt");
+    String tableName = "upsertModeSessionVarTableIndex";
+    int totalValidLines = 5;
+    int expectedCopiedLines = totalValidLines;
+
+    createFileInTmpDir(absFilePath, totalValidLines);
+
+    // add CSV line that shares the same primary key value as
+    // another row but updates the indexed column b
+    writeToFileInTmpDir(absFilePath, "0,5,2,3\n");
+
+    try (Statement statement = connection.createStatement()) {
+
+      // set enable-upsert session variable
+      statement.execute("SET " + YB_ENABLE_UPSERT_MODE_VARIABLE_NAME + "=true");
+
+      // create and populate table with COPY command
+      // COPY command should not throw error even with the duplicate primary key
+      // since upsert mode is ON
+      statement.execute(String.format(
+        "CREATE TABLE %s (a INT PRIMARY KEY, b INT, c TEXT, d TEXT)", tableName));
+      statement.execute(String.format("CREATE INDEX ON %s (b)", tableName));
+      statement.execute(String.format(
+        "COPY %s FROM \'%s\' WITH (FORMAT CSV, HEADER)", tableName, absFilePath));
+
+      // check every row was properly inserted into the table
+      assertOneRow(statement, "SELECT COUNT(*) FROM " + tableName, expectedCopiedLines);
+
+      // check that row with shared primary key was overwritten
+      assertOneRow(statement, String.format("SELECT COUNT(*) FROM %s WHERE b=1", tableName), 1);
+
+      // verify index exists, is being used, and is properly updated
+      String explainOutput = getExplainAnalyzeOutput(statement, String.format(
+        "SELECT * from %s WHERE b=5;", tableName));
+      assertTrue("SELECT query should be an index scan", explainOutput.contains(
+        "Index Scan using upsertmodesessionvartableindex_b_idx on upsertmodesessionvartableindex"));
+      explainOutput = getExplainAnalyzeOutput(statement, String.format(
+        "SELECT * from %s WHERE b=5;", tableName));
+      assertTrue("Expect to fetch 2 rows from index scan",
+                 explainOutput.contains("rows=2 loops=1)"));
+    }
+  }
+
+  @Test
+  public void testEnableUpsertModeSessionVariableForeignKey() throws Exception {
+    String foreignKeyFilePath = getAbsFilePath("batch-copyfrom-upsertmode-fk-sessionvar.txt");
+    String primaryKeyTableName = "upsertModeSessionVarTablePk";
+    String foreignKeyTableName = "upsertModeSessionVarTableFk";
+    int expectedPrimaryKeyLines = 20;
+    int expectedForeignKeyLines = 5;
+
+    // create tmp CSV file with header
+    createFileInTmpDir(foreignKeyFilePath, expectedForeignKeyLines);
+
+    // add CSV line that shares the same primary key as
+    // another row but updates the foreign key column
+    writeToFileInTmpDir(foreignKeyFilePath, "0,2,3,4\n");
+
+    try (Statement statement = connection.createStatement()) {
+
+      // set enable-upsert session variable
+      statement.execute("SET " + YB_ENABLE_UPSERT_MODE_VARIABLE_NAME + "=true");
+
+      // create and populate primary key table with COPY command
+      statement.execute(String.format(
+        "CREATE TABLE %s (a INT PRIMARY KEY, b text)", primaryKeyTableName));
+      for (int i = 0; i < expectedPrimaryKeyLines; i++) {
+        statement.execute(String.format(
+          "INSERT INTO %s VALUES (%d, %s)", primaryKeyTableName, i, i+1));
+      }
+      // check every row was properly inserted into the table
+      assertOneRow(statement, "SELECT COUNT(*) FROM " + primaryKeyTableName,
+        expectedPrimaryKeyLines);
+
+      // create and bulk load the foreign key table
+      statement.execute(String.format(
+        "CREATE TABLE %s (a INT PRIMARY KEY, b INT REFERENCES %s, c TEXT, d TEXT)",
+          foreignKeyTableName, primaryKeyTableName));
+      statement.execute(String.format(
+        "COPY %s FROM \'%s\' WITH (FORMAT CSV, HEADER)", foreignKeyTableName, foreignKeyFilePath));
+      // check every row was properly inserted into the table
+      assertOneRow(statement, "SELECT COUNT(*) FROM " + foreignKeyTableName,
+        expectedForeignKeyLines);
+
+      // verify foreign key was updated
+      assertOneRow(statement, String.format(
+        "SELECT COUNT(*) FROM %s WHERE b=2", foreignKeyTableName), 1);
+
+      // clear table to test scenario where FK constraint is violated
+      statement.execute(String.format("TRUNCATE TABLE %s", foreignKeyTableName));
+
+      // add CSV row with foreign key that points to a non-existent ID
+      writeToFileInTmpDir(foreignKeyFilePath, "0,-1,3,4\n");
+
+      // validate invalid FK is caught
+      runInvalidQuery(statement,
+        String.format(
+          "COPY %s FROM \'%s\' WITH (FORMAT CSV, HEADER)", foreignKeyTableName, foreignKeyFilePath),
+          INVALID_FOREIGN_KEY_ERROR_MSG);
+
+      // no rows should have been copied
+      assertOneRow(statement, String.format("SELECT COUNT(*) FROM %s", foreignKeyTableName), 0);
+    }
+  }
+
+  @Test
+  public void testEnableUpsertModeSessionVariableTrigger() throws Exception {
+    String absFilePath = getAbsFilePath("batch-copyfrom-upsertmode-sessionvar.txt");
+    String tableName = "upsertModeSessionVarTable";
+    int totalValidLines = 5;
+    int expectedCopiedLines = totalValidLines;
+
+    createFileInTmpDir(absFilePath, totalValidLines);
+
+    try (Statement statement = connection.createStatement()) {
+      // create and populate table with COPY command
+      statement.execute(String.format(
+        "CREATE TABLE %s (a INT, b INT, c TEXT, d TEXT)", tableName));
+
+      // create before and after triggers on table
+      statement.execute(
+        "CREATE FUNCTION trigger_func() RETURNS trigger LANGUAGE plpgsql AS \'" +
+        "BEGIN " +
+        " RAISE NOTICE \'\'trigger_func(%) called: action = %, when = %, level = %\'\', " +
+        " TG_ARGV[0], TG_OP, TG_WHEN, TG_LEVEL; " +
+        "RETURN NULL; " +
+        "END;\';");
+      statement.execute(String.format(
+        "CREATE TRIGGER before_ins_stmt_trig BEFORE INSERT ON %s " +
+        "FOR EACH STATEMENT EXECUTE PROCEDURE trigger_func(\'before_ins_stmt\');", tableName));
+      statement.execute(String.format(
+        "CREATE TRIGGER after_ins_stmt_trig AFTER INSERT ON %s " +
+        "FOR EACH STATEMENT EXECUTE PROCEDURE trigger_func(\'after_ins_stmt\');", tableName));
+
+      // verify batching is disabled if the table contains a non-FK trigger
+      verifyStatementWarnings(
+        statement,
+        String.format("COPY %s FROM \'%s\' WITH (FORMAT CSV, HEADER)", tableName, absFilePath),
+        Arrays.asList(
+          "Batched COPY is not supported on table with non RI trigger. " +
+            "Defaulting to using one transaction for the entire copy.",
+          "trigger_func(before_ins_stmt) called: action = INSERT, when = BEFORE, level = STATEMENT",
+          "trigger_func(after_ins_stmt) called: action = INSERT, when = AFTER, level = STATEMENT"));
+
+      // check every row was properly inserted into the table
+      assertOneRow(statement, "SELECT COUNT(*) FROM " + tableName, expectedCopiedLines);
+    }
+  }
+
+  @Test
   public void testSessionVariableWithRowsPerTransactionOption() throws Exception {
     String absFilePath = getAbsFilePath("batch-copyfrom-sessionvar-with-query-option.txt");
     String tableName = "batchSessionAndOptionTable";
@@ -581,6 +780,156 @@ public class TestBatchCopyFrom extends BasePgSQLTest {
         // Verify the copy went through.
         assertOneRow(statement, "SELECT COUNT(*) FROM " + parentName, totalLines);
       }
+    }
+  }
+
+  @Test
+  public void testBatchedCopyValidForeignKeyCheck() throws Exception {
+    String absFilePath = getAbsFilePath("fk-copyfrom.txt");
+    String refTableName = "reftable_ok";
+    String tableName = "maintable_ok";
+
+    int totalLines = 100;
+    int batchSize = totalLines;
+
+    createFileInTmpDir(absFilePath, totalLines);
+
+    try (Statement statement = connection.createStatement()) {
+      // Both reference table and main table have the same key set from 0 to totalLines - 1.
+      statement.execute(String.format("CREATE TABLE %s (a INT PRIMARY KEY)", refTableName));
+      statement.execute(String.format(
+          "INSERT INTO %s (a) SELECT s * 4 FROM GENERATE_SERIES (0, %d) AS s",
+          refTableName, totalLines - 1));
+
+      statement.execute(
+          String.format("CREATE TABLE %s (a INT REFERENCES %s, b INT, c INT, d INT)",
+                        tableName, refTableName));
+      statement.execute(
+          String.format("COPY %s FROM \'%s\' WITH (FORMAT CSV, HEADER, ROWS_PER_TRANSACTION %d)",
+                        tableName, absFilePath, batchSize));
+
+      assertOneRow(statement, "SELECT COUNT(*) FROM " + tableName, totalLines);
+    }
+  }
+
+  @Test
+  public void testBatchedCopyFailedOnForeignKeyCheck() throws Exception {
+    String absFilePath = getAbsFilePath("fk-copyfrom-all-failure.txt");
+    String refTableName = "reftable_failed";
+    String tableName = "maintable_failed";
+
+    int totalLines = 100;
+    int batchSize = totalLines;
+    String referenceKey = "a_fkey";
+
+    createFileInTmpDir(absFilePath, totalLines);
+
+    String INVALID_FOREIGN_KEY_CHECK_ERROR_MSG =
+        String.format("insert or update on table \"%s\" violates foreign key constraint \"%s_%s\"",
+                      tableName, tableName, referenceKey);
+
+    try (Statement statement = connection.createStatement()) {
+      statement.execute(String.format("CREATE TABLE %s (a INT PRIMARY KEY)", refTableName));
+      // Create reference table without the (a = 0) line.
+      statement.execute(String.format(
+          "INSERT INTO %s (a) SELECT s * 4 FROM GENERATE_SERIES (1, %d) AS s",
+          refTableName, totalLines - 1));
+
+      statement.execute(
+          String.format("CREATE TABLE %s (a INT REFERENCES %s, b INT, c INT, d INT)",
+                        tableName, refTableName));
+
+      // The execution will fail since the (a = 0) key is not present in the reference table.
+      runInvalidQuery(statement,
+          String.format("COPY %s FROM \'%s\' WITH (FORMAT CSV, HEADER, ROWS_PER_TRANSACTION %d)",
+                        tableName, absFilePath, batchSize),
+          INVALID_FOREIGN_KEY_CHECK_ERROR_MSG);
+
+      // No rows should be copied.
+      assertOneRow(statement, "SELECT COUNT(*) FROM " + tableName, 0);
+    }
+  }
+
+  @Test
+  public void testBatchedCopyPartialFailureOnForeignKeyCheck() throws Exception {
+    String absFilePath = getAbsFilePath("fk-copyfrom-partial-failure.txt");
+    String refTableName = "reftable_partial";
+    String tableName = "maintable_partial";
+
+    int totalLines = 100;
+    int batchSize = 1;
+    String referenceKey = "a_fkey";
+
+    createFileInTmpDir(absFilePath, totalLines);
+
+    String INVALID_FOREIGN_KEY_CHECK_ERROR_MSG =
+        String.format("insert or update on table \"%s\" violates foreign key constraint \"%s_%s\"",
+                      tableName, tableName, referenceKey);
+
+    try (Statement statement = connection.createStatement()) {
+      // Create reference table with half of the lines.
+      statement.execute(String.format("CREATE TABLE %s (a INT PRIMARY KEY)", refTableName));
+      statement.execute(String.format(
+          "INSERT INTO %s (a) SELECT s * 4 FROM GENERATE_SERIES (0, %d) AS s",
+          refTableName, totalLines/2 - 1));
+
+      statement.execute(
+          String.format("CREATE TABLE %s (a INT REFERENCES %s, b INT, c INT, d INT)",
+                        tableName, refTableName));
+
+      // The execution will throw error since the later half is not present in the reference table.
+      runInvalidQuery(statement,
+          String.format("COPY %s FROM \'%s\' WITH (FORMAT CSV, HEADER, ROWS_PER_TRANSACTION %d)",
+                        tableName, absFilePath, batchSize),
+          INVALID_FOREIGN_KEY_CHECK_ERROR_MSG);
+
+      // However, we should be able to copy up to totalLines / 2 lines
+      // that are present in the reference table.
+      assertOneRow(statement, "SELECT COUNT(*) FROM " + tableName, totalLines / 2);
+    }
+  }
+
+  @Test
+  public void testBatchedCopyManualTrigger() throws Exception {
+    String absFilePath = getAbsFilePath("manual-trigger.txt");
+    String tableName = "manual_trigger_table";
+
+    int totalLines = 100;
+
+    // The batch size will be ignored, since there is a manually created trigger.
+    int batchSize = 5;
+    String INVALID_PRIMARY_KEY_TRIGGER_ERROR_MSG = "Primary key too large";
+
+    createFileInTmpDir(absFilePath, totalLines);
+
+    try (Statement statement = connection.createStatement()) {
+      statement.execute(
+          String.format("CREATE TABLE %s (a INT PRIMARY KEY, b INT, c INT, d INT)", tableName));
+
+      // This trigger will fire since the row will eventually exceed the limit.
+      statement.execute(
+          String.format(
+              "CREATE FUNCTION log_a() RETURNS TRIGGER AS $$ " +
+              "BEGIN " +
+              "IF (NEW.a > %d) THEN RAISE EXCEPTION '%s'; " +
+              "END IF; " +
+              "RETURN NEW; " +
+              "END; " +
+              "$$ LANGUAGE plpgsql;", totalLines / 2, INVALID_PRIMARY_KEY_TRIGGER_ERROR_MSG));
+
+      statement.execute(
+          String.format(
+              "CREATE TRIGGER mytrigger BEFORE INSERT OR UPDATE ON %s " +
+              "FOR EACH ROW EXECUTE PROCEDURE log_a()", tableName));
+
+      // The execution will throw error on the primary key trigger.
+      runInvalidQuery(statement,
+          String.format("COPY %s FROM \'%s\' WITH (FORMAT CSV, HEADER, ROWS_PER_TRANSACTION %d)",
+                        tableName, absFilePath, batchSize),
+          INVALID_PRIMARY_KEY_TRIGGER_ERROR_MSG);
+
+      // We should roll back all the changes.
+      assertOneRow(statement, "SELECT COUNT(*) FROM " + tableName, 0);
     }
   }
 }

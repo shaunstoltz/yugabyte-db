@@ -44,6 +44,7 @@
 
 #include "yb/gutil/ref_counted.h"
 #include "yb/util/env.h"
+#include "yb/util/metrics.h"
 #include "yb/util/path_util.h"
 #include "yb/util/strongly_typed_bool.h"
 
@@ -132,7 +133,7 @@ class FsManager {
   // If the file system has not been initialized, returns NotFound.
   // In that case, CreateInitialFileSystemLayout may be used to initialize
   // the on-disk structures.
-  CHECKED_STATUS Open();
+  CHECKED_STATUS CheckAndOpenFileSystemRoots();
 
   //
   // Returns an error if the file system is already initialized.
@@ -179,15 +180,19 @@ class FsManager {
     return JoinPathSegments(wal_path, GetWalSegmentFileName(sequence_number));
   }
 
+  std::vector<std::string> GetRaftGroupMetadataDirs() const;
   // Return the directory where Raft group superblocks should be stored.
-  std::string GetRaftGroupMetadataDir() const;
   static std::string GetRaftGroupMetadataDir(const std::string& data_dir);
 
+  void SetTabletPathByDataPath(const std::string& tablet_id, const std::string& path);
+  Result<std::string> GetTabletPath(const string& tablet_id) const;
+  bool LookupTablet(const std::string& tablet_id);
+
   // Return the path for a specific Raft group's superblock.
-  std::string GetRaftGroupMetadataPath(const std::string& tablet_id) const;
+  Result<std::string> GetRaftGroupMetadataPath(const std::string& tablet_id) const;
 
   // List the tablet IDs in the metadata directory.
-  CHECKED_STATUS ListTabletIds(std::vector<std::string>* tablet_ids);
+  Result<std::vector<std::string>> ListTabletIds();
 
   // Return the path where InstanceMetadataPB is stored.
   std::string GetInstanceMetadataPath(const std::string& root) const;
@@ -195,14 +200,16 @@ class FsManager {
   // Return the path where the fs lock file is stored.
   std::string GetFsLockFilePath(const std::string& root) const;
 
+  // Return the directory where the certs are stored.
+  std::string GetDefaultRootDir() const;
+  static std::string GetCertsDir(const std::string& root_dir);
+
+  std::vector<std::string> GetConsensusMetadataDirs() const;
   // Return the directory where the consensus metadata is stored.
-  std::string GetConsensusMetadataDir() const;
   static std::string GetConsensusMetadataDir(const std::string& data_dir);
 
   // Return the path where ConsensusMetadataPB is stored.
-  std::string GetConsensusMetadataPath(const std::string& tablet_id) const {
-    return JoinPathSegments(GetConsensusMetadataDir(), tablet_id);
-  }
+  Result<std::string> GetConsensusMetadataPath(const std::string& tablet_id) const;
 
   Env *env() { return env_; }
 
@@ -231,14 +238,11 @@ class FsManager {
   // Initializes, sanitizes, and canonicalizes the filesystem roots.
   CHECKED_STATUS Init();
 
-  // Creates filesystem roots from 'roots', writing new on-disk
-  // instances using 'metadata'.
-  CHECKED_STATUS CreateFileSystemRoots(const std::set<std::string>& roots,
-                                       const std::set<std::string>& ancillary_dirs,
-                                       const InstanceMetadataPB& metadata,
+  // Creates filesystem roots, writing new on-disk instances using 'metadata'.
+  CHECKED_STATUS CreateFileSystemRoots(const InstanceMetadataPB& metadata,
                                        bool create_lock = false);
 
-  std::set<std::string> GetAncillaryDirs(bool add_metadata_dirs) const;
+  std::set<std::string> GetAncillaryDirs() const;
 
   // Create a new InstanceMetadataPB.
   void CreateInstanceMetadata(InstanceMetadataPB* metadata);
@@ -254,6 +258,11 @@ class FsManager {
   // Returns an error if it's not a directory. Otherwise, sets 'is_empty'
   // accordingly.
   CHECKED_STATUS IsDirectoryEmpty(const std::string& path, bool* is_empty);
+
+  // Checks write to temporary file on root.
+  CHECKED_STATUS CheckWrite(const std::string& path);
+
+  void CreateAndSetFaultDriveMetric(const std::string& path);
 
   // ==========================================================================
   //  file-system helpers
@@ -284,9 +293,14 @@ class FsManager {
   // - The first data root is used as the metadata root.
   // - Common roots in the collections have been deduplicated.
   std::set<std::string> canonicalized_wal_fs_roots_;
-  std::string canonicalized_metadata_fs_root_;
+  std::string canonicalized_default_fs_root_;
   std::set<std::string> canonicalized_data_fs_roots_;
   std::set<std::string> canonicalized_all_fs_roots_;
+
+  std::map<std::string, scoped_refptr<Counter>> counters_;
+
+  std::unordered_map<std::string, std::string> tablet_id_to_path_ GUARDED_BY(data_mutex_);
+  mutable std::mutex data_mutex_;
 
   std::unique_ptr<InstanceMetadataPB> metadata_;
 

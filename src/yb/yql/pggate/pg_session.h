@@ -14,14 +14,15 @@
 #ifndef YB_YQL_PGGATE_PG_SESSION_H_
 #define YB_YQL_PGGATE_PG_SESSION_H_
 
-#include <unordered_set>
+#include <string>
+#include <unordered_map>
+#include <utility>
+#include <vector>
 
 #include <boost/optional.hpp>
 #include <boost/unordered_set.hpp>
 
 #include "yb/client/client_fwd.h"
-#include "yb/client/session.h"
-#include "yb/client/transaction.h"
 
 #include "yb/common/pg_types.h"
 #include "yb/common/transaction.h"
@@ -32,12 +33,15 @@
 
 #include "yb/tserver/tserver_util_fwd.h"
 
+#include "yb/util/lw_function.h"
 #include "yb/util/oid_generator.h"
 #include "yb/util/result.h"
 
 #include "yb/yql/pggate/pg_client.h"
 #include "yb/yql/pggate/pg_gate_fwd.h"
 #include "yb/yql/pggate/pg_env.h"
+#include "yb/yql/pggate/pg_operation_buffer.h"
+#include "yb/yql/pggate/pg_perform_future.h"
 #include "yb/yql/pggate/pg_tabledesc.h"
 #include "yb/yql/pggate/pg_txn_manager.h"
 
@@ -46,74 +50,23 @@ namespace pggate {
 
 YB_STRONGLY_TYPED_BOOL(OpBuffered);
 YB_STRONGLY_TYPED_BOOL(InvalidateOnPgClient);
+YB_STRONGLY_TYPED_BOOL(UseCatalogSession);
 
 class PgTxnManager;
 class PgSession;
 
-struct BufferableOperations {
-  PgsqlOps operations;
-  PgObjectIds relations;
+struct TableYbctid {
+  TableYbctid(PgOid table_id_, std::string ybctid_)
+      : table_id(table_id_), ybctid(std::move(ybctid_)) {}
 
-  void Add(PgsqlOpPtr op, const PgObjectId& relation) {
-    operations.push_back(std::move(op));
-    relations.push_back(relation);
-  }
-
-  void Clear() {
-    operations.clear();
-    relations.clear();
-  }
-
-  void Swap(BufferableOperations* rhs) {
-    operations.swap(rhs->operations);
-    relations.swap(rhs->relations);
-  }
-
-  bool empty() const {
-    return operations.empty();
-  }
-
-  size_t size() const {
-    return operations.size();
-  }
+  PgOid table_id;
+  std::string ybctid;
 };
 
 struct PgForeignKeyReference {
   PgForeignKeyReference(PgOid table_id, std::string ybctid);
   PgOid table_id;
   std::string ybctid;
-};
-
-// Represents row id (ybctid) from the DocDB's point of view.
-class RowIdentifier {
- public:
-  RowIdentifier(const Schema& schema, const PgsqlWriteRequestPB& request);
-  inline const std::string& ybctid() const;
-  inline const std::string& table_id() const;
-
- private:
-  const std::string* table_id_;
-  const std::string* ybctid_;
-  std::string        ybctid_holder_;
-};
-
-YB_STRONGLY_TYPED_BOOL(IsTransactionalSession);
-YB_STRONGLY_TYPED_BOOL(UseAsyncFlush);
-YB_STRONGLY_TYPED_BOOL(IsReadOnlyOperation);
-YB_STRONGLY_TYPED_BOOL(IsCatalogOperation);
-
-class PerformFuture {
- public:
-  PerformFuture() = default;
-  PerformFuture(std::future<PerformResult> future, PgSession* session, PgObjectIds* relations);
-
-  bool Valid() const;
-
-  CHECKED_STATUS Get();
- private:
-  std::future<PerformResult> future_;
-  PgSession* session_ = nullptr;
-  PgObjectIds relations_;
 };
 
 // This class is not thread-safe as it is mostly used by a single-threaded PostgreSQL backend
@@ -208,34 +161,35 @@ class PgSession : public RefCountedThreadSafe<PgSession> {
   void ResetOperationsBuffering();
 
   // Flush all pending buffered operations. Buffering mode remain unchanged.
-  CHECKED_STATUS FlushBufferedOperations(UseAsyncFlush use_async_flush);
-  // Process previous flush for async flush.
-  CHECKED_STATUS ProcessPreviousFlush();
+  CHECKED_STATUS FlushBufferedOperations();
   // Drop all pending buffered operations. Buffering mode remain unchanged.
   void DropBufferedOperations();
 
   PgIsolationLevel GetIsolationLevel();
 
-  // Run (apply + flush) the given operation to read and write database content.
-  // Template is used here to handle all kind of derived operations
-  // (shared_ptr<YBPgsqlReadOp>, shared_ptr<YBPgsqlWriteOp>)
-  // without implicitly conversion to shared_ptr<YBPgsqlReadOp>.
-  // Conversion to shared_ptr<YBPgsqlOp> will be done later and result will re-used with move.
-  template<class Op, class... Args>
-  Result<PerformFuture> RunOneAsync(const Op& op, Args&& ...args) {
-    return DoRunAsync(&op, 1, std::forward<Args>(args)...);
-  }
-
   // Run (apply + flush) list of given operations to read and write database content.
-  template<class Op, class... Args>
-  Result<PerformFuture> RunAsync(const std::vector<Op>& ops, Args&& ...args) {
-    return DoRunAsync(ops.data(), ops.size(), std::forward<Args>(args)...);
+  struct TableOperation {
+    const PgsqlOpPtr* operation = nullptr;
+    const PgTableDesc* table = nullptr;
+  };
+
+  using OperationGenerator = LWFunction<TableOperation()>;
+
+  template<class... Args>
+  Result<PerformFuture> RunAsync(
+      const PgsqlOpPtr* ops, size_t ops_count, const PgTableDesc& table,
+      Args&&... args) {
+    const auto generator = [ops, end = ops + ops_count, &table]() mutable {
+        return ops != end
+            ? TableOperation { .operation = ops++, .table = &table }
+            : TableOperation();
+    };
+    return RunAsync(make_lw_function(generator), std::forward<Args>(args)...);
   }
 
-  template<class Op, class... Args>
-  Result<PerformFuture> RunAsync(const Op* ops, size_t ops_count, Args&& ...args) {
-    return DoRunAsync(ops, ops_count, std::forward<Args>(args)...);
-  }
+  Result<PerformFuture> RunAsync(
+      const OperationGenerator& generator, uint64_t* read_time,
+      bool force_non_bufferable);
 
   // Smart driver functions.
   // -------------
@@ -291,8 +245,7 @@ class PgSession : public RefCountedThreadSafe<PgSession> {
   // the shared memory has not been initialized (e.g. in initdb).
   Result<uint64_t> GetSharedAuthKey();
 
-  using YbctidReader =
-      std::function<Result<std::vector<std::string>>(PgOid, const std::vector<Slice>&)>;
+  using YbctidReader = LWFunction<Status(std::vector<TableYbctid>*)>;
   Result<bool> ForeignKeyReferenceExists(
       PgOid table_id, const Slice& ybctid, const YbctidReader& reader);
   void AddForeignKeyReferenceIntent(PgOid table_id, const Slice& ybctid);
@@ -321,66 +274,17 @@ class PgSession : public RefCountedThreadSafe<PgSession> {
   CHECKED_STATUS SetActiveSubTransaction(SubTransactionId id);
   CHECKED_STATUS RollbackSubTransaction(SubTransactionId id);
 
+  void ResetHasWriteOperationsInDdlMode();
+  bool HasWriteOperationsInDdlMode() const;
+
  private:
-  using Flusher = std::function<Status(BufferableOperations, IsTransactionalSession,
-                                       UseAsyncFlush)>;
+  Result<PerformFuture> FlushOperations(
+      BufferableOperations ops, bool transactional);
 
-  CHECKED_STATUS FlushBufferedOperationsImpl(const Flusher& flusher,
-                                             UseAsyncFlush use_async_flush);
-  CHECKED_STATUS FlushOperations(BufferableOperations ops, IsTransactionalSession transactional,
-                                 UseAsyncFlush use_async_flush);
+  class RunHelper;
 
-  // Run multiple operations.
-  template<class Op>
-  Result<PerformFuture> DoRunAsync(const Op* op,
-                                   size_t ops_count,
-                                   const PgTableDesc& table,
-                                   const PgObjectId& relation_id,
-                                   uint64_t* read_time,
-                                   bool force_non_bufferable,
-                                   bool use_async_flush) {
-    SCHECK_GT(ops_count, 0ULL, IllegalState, "Operation list must not be empty");
-    const IsTransactionalSession transactional(VERIFY_RESULT(
-        ShouldHandleTransactionally(table, **op)));
-    UseAsyncFlush use_async_flush_(use_async_flush);
-    RunHelper runner(relation_id, this, transactional);
-    for (auto end = op + ops_count; op != end; ++op) {
-      RETURN_NOT_OK(runner.Apply(table.schema(), *op, read_time, force_non_bufferable,
-                    use_async_flush_));
-    }
-    return runner.Flush();
-  }
-
-  // Helper class to run multiple operations on single session.
-  // This class allows to keep implementation of RunAsync template method simple
-  // without moving its implementation details into header file.
-  class RunHelper {
-   public:
-    RunHelper(
-        const PgObjectId& relation_id, PgSession* pg_session, IsTransactionalSession transactional);
-    CHECKED_STATUS Apply(
-        const Schema& schema, const PgsqlOpPtr& op, uint64_t* read_time, bool force_non_bufferable,
-        UseAsyncFlush use_async_flush);
-    Result<PerformFuture> Flush();
-
-   private:
-    const PgObjectId& relation_id_;
-    PgSession& pg_session_;
-    const IsTransactionalSession transactional_;
-    BufferableOperations& buffer_;
-    BufferableOperations operations_;
-  };
-
-  // Flush buffered write operations from the given buffer.
-  Status FlushBufferedWriteOperations(BufferableOperations* write_ops, bool transactional);
-
-  // Whether we should use transactional or non-transactional session.
-  // Error is raised in case operation requires transaction session but it has not been created.
-  Result<bool> ShouldHandleTransactionally(const PgTableDesc& table, const PgsqlOp& op);
-
-  void Perform(PgsqlOps* operations, const PerformCallback& callback);
-
-  void UpdateInTxnLimit(uint64_t* read_time);
+  Result<PerformFuture> Perform(
+      BufferableOperations ops, UseCatalogSession use_catalog_session);
 
   PgClient& pg_client_;
 
@@ -406,15 +310,12 @@ class PgSession : public RefCountedThreadSafe<PgSession> {
 
   // Should write operations be buffered?
   bool buffering_enabled_ = false;
-  BufferableOperations buffered_ops_;
-  BufferableOperations buffered_txn_ops_;
-  std::unordered_set<RowIdentifier, boost::hash<RowIdentifier>> buffered_keys_;
-
-  HybridTime in_txn_limit_;
-  bool use_catalog_session_ = false;
+  BufferingSettings buffering_settings_;
+  PgOperationBuffer buffer_;
 
   const tserver::TServerSharedObject* const tserver_shared_object_;
   const YBCPgCallbacks& pg_callbacks_;
+  bool has_write_ops_in_ddl_mode_ = false;
 };
 
 }  // namespace pggate

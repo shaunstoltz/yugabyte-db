@@ -36,7 +36,7 @@ class PgDmlWrite : public PgDml {
   void PrepareColumns();
 
   // force_non_bufferable flag indicates this operation should not be buffered.
-  CHECKED_STATUS Exec(bool force_non_bufferable = false, bool use_async_flush = false);
+  CHECKED_STATUS Exec(bool force_non_bufferable = false);
 
   void SetIsSystemCatalogChange() {
     write_req_->set_is_ysql_catalog_change(true);
@@ -62,25 +62,25 @@ class PgDmlWrite : public PgDml {
   void AllocWriteRequest();
 
   // Allocate column expression.
-  PgsqlExpressionPB *AllocColumnBindPB(PgColumn *col) override;
+  LWPgsqlExpressionPB *AllocColumnBindPB(PgColumn *col) override;
 
   // Allocate target for selected or returned expressions.
-  PgsqlExpressionPB *AllocTargetPB() override;
+  LWPgsqlExpressionPB *AllocTargetPB() override;
 
   // Allocate protobuf for a qual in the write request's where_clauses list.
-  PgsqlExpressionPB *AllocQualPB() override;
+  LWPgsqlExpressionPB *AllocQualPB() override;
 
   // Allocate protobuf for a column reference in the write request's col_refs list.
-  PgsqlColRefPB *AllocColRefPB() override;
+  LWPgsqlColRefPB *AllocColRefPB() override;
 
   // Clear the write request's col_refs list.
   void ClearColRefPBs() override;
 
   // Allocate column expression.
-  PgsqlExpressionPB *AllocColumnAssignPB(PgColumn *col) override;
+  LWPgsqlExpressionPB* AllocColumnAssignPB(PgColumn *col) override;
 
   // Protobuf code.
-  std::shared_ptr<PgsqlWriteRequestPB> write_req_;
+  std::shared_ptr<LWPgsqlWriteRequestPB> write_req_;
 
   bool is_single_row_txn_ = false; // default.
 
