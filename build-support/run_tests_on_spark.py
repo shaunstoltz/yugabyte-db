@@ -89,6 +89,9 @@ TIME_SEC_TO_START_RUNNING_TEST = 5 * 60
 DEFAULT_MAX_NUM_TEST_FAILURES_MACOS_DEBUG = 150
 DEFAULT_MAX_NUM_TEST_FAILURES = 100
 
+# Default for test artifact size limit, in bytes
+MAX_ARTIFACT_SIZE_BYTES = 100*1024*1024  # 10 MB
+
 
 def wait_for_path_to_exist(target_path: str) -> None:
     if os.path.exists(target_path):
@@ -487,11 +490,16 @@ def initialize_remote_task() -> yb_dist_tests.GlobalTestConfig:
     # worker or dev server), but put it in as separate variable to have flexibility to change it
     # later.
     remote_yb_src_root = global_conf.yb_src_root
+    remote_yb_src_job_dir = os.path.dirname(remote_yb_src_root)
+    # Job clean-up directory should be common on spark worker node for all jobs and should be on
+    # same filesystem as yb_src_root for efficient two-stage clean-up.
+    remote_yb_src_removal = os.environ.get('YB_SPARK_CLEAN_DIR', '/tmp/SPARK_TO_REMOVE')
 
     subprocess.check_call([
         'mkdir',
         '-p',
-        os.path.dirname(remote_yb_src_root)])
+        remote_yb_src_removal,
+        remote_yb_src_job_dir])
     try:
         untar_script_path = os.path.join(
                 worker_tmp_dir, 'untar_archive_once_%d.sh' % random.randint(0, 2**64))
@@ -505,12 +513,26 @@ def initialize_remote_task() -> yb_dist_tests.GlobalTestConfig:
             # Do the locking using the flock command in Bash -- file locking in Python is painful.
             # Some curly braces in the script template are escaped as "{{" and }}".
 
-            # TODO: rewrite this shell script in Python, except for the flock part.
             untar_script_file.write("""#!{bash_shebang}
 set -euo pipefail
 (
     PATH=/usr/local/bin:$PATH
+    # Options for asynchronous clean-up jobs.
+    # Optional argument for checking workspace path associated with this spark app.
+    if [[ "${{1:-none}}" == "path" ]]; then
+      echo '{remote_yb_src_root}'
+      exit 0
+    fi
+    # Optional argument for marking workspace to be removed.
+    if [[ "${{1:-none}}" == "remove" ]]; then
+      rm -f '{archive_path}'
+      mv '{remote_yb_src_job_dir}' '{remote_yb_src_removal}/'
+      exit 0
+    fi
     flock -w 60 200
+    # Clean up any pending removals before we unpack the archive.
+    rm -rf {remote_yb_src_removal}/*
+    # Check existing workspace.
     if [[ -d '{remote_yb_src_root}' ]]; then
         previous_sha256_file_path='{remote_yb_src_root}/extracted_from_archive.sha256'
         if [[ ! -f $previous_sha256_file_path ]]; then
@@ -676,10 +698,22 @@ def copy_to_host(artifact_paths: List[str], build_host: str) -> None:
     else:
         ssh_mode = True if os.getenv('YB_SPARK_COPY_MODE') == 'SSH' else False
         num_artifacts_copied = 0
+        artifact_size_limit = int(os.getenv('YB_SPARK_MAX_ARTIFACT_SIZE_BYTES',
+                                            MAX_ARTIFACT_SIZE_BYTES))
+
         for artifact_path in artifact_paths:
             if not os.path.exists(artifact_path):
                 logging.warning("Build artifact file does not exist: '%s'", artifact_path)
                 continue
+
+            artifact_size = os.path.getsize(artifact_path)
+            if artifact_size > artifact_size_limit:
+                logging.warning(
+                    "Build artifact file {} of size {} bytes exceeds max limit of {} bytes".format(
+                        artifact_path, os.path.getsize(artifact_path), artifact_size_limit)
+                )
+                continue
+
             if ssh_mode:
                 dest_dir = os.path.dirname(artifact_path)
                 logging.info(f"Copying {artifact_path} to {build_host}:{dest_dir}")

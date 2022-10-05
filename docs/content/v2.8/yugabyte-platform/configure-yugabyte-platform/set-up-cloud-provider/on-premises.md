@@ -4,12 +4,11 @@ headerTitle: Configure the on-premises cloud provider
 linkTitle: Configure the cloud provider
 description: Configure the on-premises cloud provider.
 menu:
-  v2.8:
+  v2.8_yugabyte-platform:
     identifier: set-up-cloud-provider-6-on-premises
     parent: configure-yugabyte-platform
     weight: 20
-isTocNested: true
-showAsideToc: true
+type: docs
 ---
 
 <ul class="nav nav-tabs-alt nav-tabs-yb">
@@ -230,6 +229,7 @@ You'll need to do the following for each node:
 * [Install Prometheus node exporter](#install-prometheus-node-exporter)
 * [Install backup utilities](#install-backup-utilities)
 * [Set crontab permissions](#set-crontab-permissions)
+* [Install systemd-related database service unit files (optional)](#install-systemd-related-database-service-unit-files)
 
 ##### Set up time synchronization
 
@@ -378,97 +378,83 @@ Physical nodes (or cloud instances) are installed with a standard Centos 7 serve
 
 ##### Install Prometheus node exporter
 
-For Yugabyte Platform versions 2.8 and later, download the 1.3.1 version of the Prometheus node exporter:
+Download the 1.3.1 version of the Prometheus node exporter, as follows:
 
 ```sh
 wget https://github.com/prometheus/node_exporter/releases/download/v1.3.1/node_exporter-1.3.1.linux-amd64.tar.gz
 ```
 
-For Yugabyte Platform versions prior to 2.8, download the 0.13.0 version of the exporter:
+If you are doing an airgapped installation, download the node exporter using a computer connected to the internet and copy it over to the database nodes.
 
-```sh
-$ wget https://github.com/prometheus/node_exporter/releases/download/v0.13.0/node_exporter-0.13.0.linux-amd64.tar.gz
-```
+On each node, perform the following as a user with sudo access:
 
-If you’re doing an airgapped installation, download the node exporter using a computer connected to the internet and copy it over to the database nodes.
+1. Copy the `node_exporter-1.3.1.linux-amd64.gz` package file that you downloaded into the `/tmp` directory on each of the YugabyteDB nodes. Ensure that this file is readable by the user (for example, `centos`).
 
-Note that the instructions here are for the 0.13.0 version. The same instructions work with the 1.3.1 version, but make sure to use the right filename.
+1. Run the following commands:
 
-**On each node**, do the following as a user with sudo access:
-
-1. Copy the `node_exporter-....tar.gz` package file you downloaded into the `/tmp` directory on each of the DB nodes. Ensure this file is readable by the `centos` user on each node (or another user with sudo privileges).
-
-1. (SUDO NEEDED) Run the following commands:
-
-    ```sh
-    $ sudo mkdir /opt/prometheus
-    $ sudo mkdir /etc/prometheus
-    $ sudo mkdir /var/log/prometheus
-    $ sudo mkdir /var/run/prometheus
-    $ sudo mv /tmp/node_exporter-0.13.0.linux-amd64.tar  /opt/prometheus
-    $ sudo adduser prometheus (also adds group “prometheus”)
-    $ sudo chown -R prometheus:prometheus /opt/prometheus
-    $ sudo chown -R prometheus:prometheus /etc/prometheus
-    $ sudo chown -R prometheus:prometheus /var/log/prometheus
-    $ sudo chown -R prometheus:prometheus /var/run/prometheus
-    $ sudo chmod +r /opt/prometheus/node_exporter-0.13.0.linux-amd64.tar
-    $ sudo su - prometheus (user session is now as user “prometheus”)
-    ```
+   ```sh
+   sudo mkdir /opt/prometheus
+   sudo mkdir /etc/prometheus
+   sudo mkdir /var/log/prometheus
+   sudo mkdir /var/run/prometheus
+   sudo mv /tmp/node_exporter-1.3.1.linux-amd64.tar  /opt/prometheus
+   sudo adduser prometheus # (also adds group “prometheus”)
+   sudo chown -R prometheus:prometheus /opt/prometheus
+   sudo chown -R prometheus:prometheus /etc/prometheus
+   sudo chown -R prometheus:prometheus /var/log/prometheus
+   sudo chown -R prometheus:prometheus /var/run/prometheus
+   sudo chmod +r /opt/prometheus/node_exporter-1.3.1.linux-amd64.tar
+   sudo su - prometheus (user session is now as user “prometheus”)
+   ```
 
 1. Run the following commands as user `prometheus`:
 
-    ```sh
-    $ cd /opt/prometheus
-    $ tar zxf node_exporter-0.13.0.linux-amd64.tar.gz
-    $ exit   # (exit from prometheus user back to previous user)
-    ```
+   ```sh
+   cd /opt/prometheus
+   tar zxf node_exporter-1.3.1.linux-amd64.tar.gz
+   exit   # (exit from prometheus user back to previous user)
+   ```
 
-1. (SUDO NEEDED) Edit the following file:
+1. Edit the following file:
 
-    ```sh
-    $ sudo vi /etc/systemd/system/node_exporter.service
-    ```
-
-    \
-    Add the following to `/etc/systemd/system/node_exporter.service`:
-
-      ```conf
-      [Unit]
-      Description=node_exporter - Exporter for machine metrics.
-      Documentation=https://github.com/William-Yeh/ansible-prometheus
-      After=network.target
-
-      [Install]
-      WantedBy=multi-user.target
-
-      [Service]
-      Type=simple
-
-      #ExecStartPre=/bin/sh -c  " mkdir -p '/var/run/prometheus' '/var/log/prometheus' "
-      #ExecStartPre=/bin/sh -c  " chown -R prometheus '/var/run/prometheus' '/var/log/prometheus' "
-      #PIDFile=/var/run/prometheus/node_exporter.pid
-      ```
+   ```sh
+   sudo vi /etc/systemd/system/node_exporter.service
+   ```
 
 
-      User=prometheus
-      Group=prometheus
-    
-      ExecStart=/opt/prometheus/node_exporter-0.13.0.linux-amd64/node_exporter  --web.listen-address=:9300 --collector.textfile.directory=/tmp/yugabyte/metrics
-      ```
+   Add the following to the `/etc/systemd/system/node_exporter.service` file:
 
-1. (SUDO NEEDED) Exit from vi, and continue:
+     ```conf
+     [Unit]
+     Description=node_exporter - Exporter for machine metrics.
+     Documentation=https://github.com/William-Yeh/ansible-prometheus
+     After=network.target
+   
+     [Install]
+     WantedBy=multi-user.target
+   
+     [Service]
+     Type=simple
+   
+     User=prometheus
+     Group=prometheus
+   
+     ExecStart=/opt/prometheus/node_exporter-1.3.1.linux-amd64/node_exporter  --web.listen-address=:9300 --collector.textfile.directory=/tmp/yugabyte/metrics
+     ```
 
-    ```sh
-    $ sudo systemctl daemon-reload
-    $ sudo systemctl enable node_exporter
-    $ sudo systemctl start node_exporter
-    ```
+1. Exit from vi, and continue, as follows:
 
-1. (SUDO NEEDED) Check the status of the node_exporter service with the following command:
+   ```sh
+   sudo systemctl daemon-reload
+   sudo systemctl enable node_exporter
+   sudo systemctl start node_exporter
+   ```
 
-    ```sh
-    $ sudo systemctl status node_exporter
-    ```
+1. Check the status of the `node_exporter` service with the following command:
+
+   ```sh
+   sudo systemctl status node_exporter
+   ```
 
 ##### Install backup utilities
 
@@ -549,3 +535,255 @@ If you plan to have Platform use **systemd services** to perform the monitoring 
 -->
 
 **You’re finished configuring your on-premises cloud provider.** Proceed to [Configure the backup target](../../backup-target/), or [Create deployments](../../../create-deployments/).
+
+##### Install systemd-related database service unit files
+
+As an alternative to setting crontab permissions, you can install systemd-specific database service unit files, as follows:
+
+1. Enable the `yugabyte` user to run the following commands as sudo or root:
+
+   ```sh
+   yugabyte ALL=(ALL:ALL) NOPASSWD: /bin/systemctl start yb-master, \
+   /bin/systemctl stop yb-master, \
+   /bin/systemctl restart yb-master, \
+   /bin/systemctl enable yb-master, \
+   /bin/systemctl disable yb-master, \
+   /bin/systemctl start yb-tserver, \
+   /bin/systemctl stop yb-tserver, \
+   /bin/systemctl restart yb-tserver, \
+   /bin/systemctl enable yb-tserver, \
+   /bin/systemctl disable yb-tserver, \
+   /bin/systemctl start yb-zip_purge_yb_logs.timer, \
+   /bin/systemctl stop yb-zip_purge_yb_logs.timer, \
+   /bin/systemctl restart yb-zip_purge_yb_logs.timer, \
+   /bin/systemctl enable yb-zip_purge_yb_logs.timer, \
+   /bin/systemctl disable yb-zip_purge_yb_logs.timer, \
+   /bin/systemctl start yb-clean_cores.timer, \
+   /bin/systemctl stop yb-clean_cores.timer, \
+   /bin/systemctl restart yb-clean_cores.timer, \
+   /bin/systemctl enable yb-clean_cores.timer, \
+   /bin/systemctl disable yb-clean_cores.timer, \
+   /bin/systemctl start yb-collect_metrics.timer, \
+   /bin/systemctl stop yb-collect_metrics.timer, \
+   /bin/systemctl restart yb-collect_metrics.timer, \
+   /bin/systemctl enable yb-collect_metrics.timer, \
+   /bin/systemctl disable yb-collect_metrics.timer, \
+   /bin/systemctl start yb-zip_purge_yb_logs, \
+   /bin/systemctl stop yb-zip_purge_yb_logs, \
+   /bin/systemctl restart yb-zip_purge_yb_logs, \
+   /bin/systemctl enable yb-zip_purge_yb_logs, \
+   /bin/systemctl disable yb-zip_purge_yb_logs, \
+   /bin/systemctl start yb-clean_cores, \
+   /bin/systemctl stop yb-clean_cores, \
+   /bin/systemctl restart yb-clean_cores, \
+   /bin/systemctl enable yb-clean_cores, \
+   /bin/systemctl disable yb-clean_cores, \
+   /bin/systemctl start yb-collect_metrics, \
+   /bin/systemctl stop yb-collect_metrics, \
+   /bin/systemctl restart yb-collect_metrics, \
+   /bin/systemctl enable yb-collect_metrics, \
+   /bin/systemctl disable yb-collect_metrics, \
+   /bin/systemctl daemon-reload
+   ```
+
+2. Ensure that you have root access and add the following service and timer files to the `/etc/systemd/system` directory (set their ownerships to the `yugabyte` user and 0644 permissions):<br><br>
+
+   `yb-master.service`
+
+   ```sh
+   [Unit]
+   Description=Yugabyte master service
+   Requires=network-online.target
+   After=network.target network-online.target multi-user.target
+   StartLimitInterval=100
+   StartLimitBurst=10
+
+   [Path]
+   PathExists=/home/yugabyte/master/bin/yb-master
+   PathExists=/home/yugabyte/master/conf/server.conf
+
+   [Service]
+   User=yugabyte
+   Group=yugabyte
+   # Start
+   ExecStart=/home/yugabyte/master/bin/yb-master --flagfile /home/yugabyte/master/conf/server.conf
+   Restart=on-failure
+   RestartSec=5
+   # Stop -> SIGTERM - 10s - SIGKILL (if not stopped) [matches existing cron behavior]
+   KillMode=process
+   TimeoutStopFailureMode=terminate
+   KillSignal=SIGTERM
+   TimeoutStopSec=10
+   FinalKillSignal=SIGKILL
+   # Logs
+   StandardOutput=syslog
+   StandardError=syslog
+   # ulimit
+   LimitCORE=infinity
+   LimitNOFILE=1048576
+   LimitNPROC=12000
+
+   [Install]
+   WantedBy=default.target
+   ```
+
+   <br><br>
+
+   `yb-tserver.service`
+
+   ```sh
+   [Unit]
+   Description=Yugabyte tserver service
+   Requires=network-online.target
+   After=network.target network-online.target multi-user.target
+   StartLimitInterval=100
+   StartLimitBurst=10
+
+   [Path]
+   PathExists=/home/yugabyte/tserver/bin/yb-tserver
+   PathExists=/home/yugabyte/tserver/conf/server.conf
+
+   [Service]
+   User=yugabyte
+   Group=yugabyte
+   # Start
+   ExecStart=/home/yugabyte/tserver/bin/yb-tserver --flagfile /home/yugabyte/tserver/conf/server.conf
+   Restart=on-failure
+   RestartSec=5
+   # Stop -> SIGTERM - 10s - SIGKILL (if not stopped) [matches existing cron behavior]
+   KillMode=process
+   TimeoutStopFailureMode=terminate
+   KillSignal=SIGTERM
+   TimeoutStopSec=10
+   FinalKillSignal=SIGKILL
+   # Logs
+   StandardOutput=syslog
+   StandardError=syslog
+   # ulimit
+   LimitCORE=infinity
+   LimitNOFILE=1048576
+   LimitNPROC=12000
+
+   [Install]
+   WantedBy=default.target
+   ```
+
+   <br><br>`yb-zip_purge_yb_logs.service`
+
+   ```sh
+   [Unit]
+   Description=Yugabyte logs
+   Wants=yb-zip_purge_yb_logs.timer
+
+   [Service]
+   User=yugabyte
+   Group=yugabyte
+   Type=oneshot
+   WorkingDirectory=/home/yugabyte/bin
+   ExecStart=/bin/sh /home/yugabyte/bin/zip_purge_yb_logs.sh
+
+   [Install]
+   WantedBy=multi-user.target
+   ```
+
+   <br><br>
+
+   `yb-zip_purge_yb_logs.timer`
+
+   ```sh
+   [Unit]
+   Description=Yugabyte logs
+   Requires=yb-zip_purge_yb_logs.service
+
+   [Timer]
+   User=yugabyte
+   Group=yugabyte
+   Unit=yb-zip_purge_yb_logs.service
+   # Run hourly at minute 0 (beginning) of every hour
+   OnCalendar=00/1:00
+
+   [Install]
+   WantedBy=timers.target
+   ```
+
+   <br><br>
+
+   `yb-clean_cores.service`
+
+   ```sh
+   [Unit]
+   Description=Yugabyte clean cores
+   Wants=yb-clean_cores.timer
+
+   [Service]
+   User=yugabyte
+   Group=yugabyte
+   Type=oneshot
+   WorkingDirectory=/home/yugabyte/bin
+   ExecStart=/bin/sh /home/yugabyte/bin/clean_cores.sh
+
+   [Install]
+   WantedBy=multi-user.target
+   ```
+
+   <br><br>
+
+   `yb-clean_cores.timer`
+
+   ```sh
+   [Unit]
+   Description=Yugabyte clean cores
+   Requires=yb-clean_cores.service
+
+   [Timer]
+   User=yugabyte
+   Group=yugabyte
+   Unit=yb-clean_cores.service
+   # Run every 10 minutes offset by 5 (5, 15, 25...)
+   OnCalendar=*:0/10:30
+
+   [Install]
+   WantedBy=timers.target
+   ```
+
+   <br><br>
+
+   `yb-collect_metrics.service`
+
+   ```sh
+   [Unit]
+   Description=Yugabyte collect metrics
+   Wants=yb-collect_metrics.timer
+
+   [Service]
+   User=yugabyte
+   Group=yugabyte
+   Type=oneshot
+   WorkingDirectory=/home/yugabyte/bin
+   ExecStart=/bin/bash /home/yugabyte/bin/collect_metrics_wrapper.sh
+
+   [Install]
+   WantedBy=multi-user.target
+   ```
+
+   <br><br>
+
+   `yb-collect_metrics.timer`
+
+   ```sh
+   [Unit]
+   Description=Yugabyte collect metrics
+   Requires=yb-collect_metrics.service
+
+   [Timer]
+   User=yugabyte
+   Group=yugabyte
+   Unit=yb-collect_metrics.service
+   # Run every 1 minute
+   OnCalendar=*:0/1:0
+
+   [Install]
+   WantedBy=timers.target
+   ```
+
+##

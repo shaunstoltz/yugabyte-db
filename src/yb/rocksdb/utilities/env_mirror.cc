@@ -45,7 +45,7 @@ class SequentialFileMirror : public SequentialFile {
     if (as.ok()) {
       std::unique_ptr<uint8_t[]> bscratch(new uint8_t[n]);
       Slice bslice;
-      size_t off = 0;
+      size_t off [[maybe_unused]] = 0;  // NOLINT
       size_t left = aslice.size();
       while (left) {
         Status bs = b_->Read(left, &bslice, bscratch.get());
@@ -191,11 +191,11 @@ class WritableFileMirror : public WritableFile {
     assert(as == b_->IsSyncThreadSafe());
     return as;
   }
-  void SetIOPriority(Env::IOPriority pri) override {
+  void SetIOPriority(yb::IOPriority pri) override {
     a_->SetIOPriority(pri);
     b_->SetIOPriority(pri);
   }
-  Env::IOPriority GetIOPriority() override {
+  yb::IOPriority GetIOPriority() override {
     // NOTE: we don't verify this one
     return a_->GetIOPriority();
   }

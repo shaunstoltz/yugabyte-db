@@ -43,16 +43,12 @@ public class AnsibleSetupServer extends NodeTaskBase {
 
     public String machineImage;
 
-    // Systemd vs Cron Option (Default: Cron)
-    public boolean useSystemd = false;
-
-    // For cron to systemd upgrades
-    public boolean isSystemdUpgrade = false;
     // To use custom image flow if it is a VM upgrade with custom images.
     public VmUpgradeTaskType vmUpgradeTaskType = VmUpgradeTaskType.None;
-
+    // For cron to systemd upgrades
+    public boolean isSystemdUpgrade = false;
     // In case a node doesn't have custom AMI, ignore the value of USE_CUSTOM_IMAGE config.
-    public boolean ignoreUseCustomImageConfig;
+    public boolean ignoreUseCustomImageConfig = false;
   }
 
   @Override
@@ -84,5 +80,10 @@ public class AnsibleSetupServer extends NodeTaskBase {
           .processErrors();
       setNodeStatus(NodeStatus.builder().nodeState(NodeState.ServerSetup).build());
     }
+  }
+
+  @Override
+  public int getRetryLimit() {
+    return 2;
   }
 }

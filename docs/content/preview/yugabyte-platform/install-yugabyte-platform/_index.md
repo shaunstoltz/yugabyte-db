@@ -1,21 +1,31 @@
 ---
-title: Install YugabyteDB Anywhere
+title: Install
 headerTitle: Install YugabyteDB Anywhere
-linkTitle: Install YugabyteDB Anywhere
+linkTitle: Install
 description: Install YugabyteDB Anywhere and prepare universe nodes.
 image: /images/section_icons/quick_start/install.png
 headcontent: Install YugabyteDB Anywhere to begin creating and managing deployments.
-type: page
-section: YUGABYTEDB ANYWHERE
 menu:
-  preview:
+  preview_yugabyte-platform:
+    parent: yugabytedb-anywhere
     identifier: install-yugabyte-platform
 weight: 641
-isTocNested: true
-showAsideToc: true
+type: indexpage
 ---
 
 <div class="row">
+
+  <div class="col-12 col-md-6 col-lg-12 col-xl-6">
+    <a class="section-link icon-offset" href="install/public-cloud/">
+      <div class="head">
+        <img class="icon" src="/images/section_icons/quick_start/install.png" aria-hidden="true" />
+        <div class="title">Overview</div>
+      </div>
+      <div class="body">
+        Overview of the installation process.
+      </div>
+    </a>
+  </div>
 
   <div class="col-12 col-md-6 col-lg-12 col-xl-6">
     <a class="section-link icon-offset" href="prerequisites/">
@@ -57,7 +67,7 @@ showAsideToc: true
     <a class="section-link icon-offset" href="prepare-on-prem-nodes/">
       <div class="head">
         <img class="icon" src="/images/section_icons/explore/planet_scale.png" aria-hidden="true" />
-        <div class="title">Prepare nodes (on-prem)</div>
+        <div class="title">Prepare nodes</div>
       </div>
       <div class="body">
         Prepare YugabyteDB nodes for on-premises installation.

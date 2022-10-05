@@ -11,35 +11,62 @@
 // under the License.
 //
 
+#include "yb/client/table_info.h"
+
 #include "yb/consensus/raft_consensus.h"
+
+#include "yb/docdb/primitive_value.h"
 
 #include "yb/integration-tests/cql_test_base.h"
 
 #include "yb/master/mini_master.h"
 
-#include "yb/tablet/tablet_peer.h"
+#include "yb/rocksdb/db.h"
 
+#include "yb/tablet/tablet.h"
+#include "yb/tablet/tablet_peer.h"
+#include "yb/tablet/transaction_participant.h"
+
+#include "yb/tserver/ts_tablet_manager.h"
+
+#include "yb/util/backoff_waiter.h"
 #include "yb/util/random_util.h"
+#include "yb/util/range.h"
 #include "yb/util/status_log.h"
 #include "yb/util/test_macros.h"
-#include "yb/util/test_util.h"
+#include "yb/util/thread.h"
 #include "yb/util/tsan_util.h"
 
 using namespace std::literals;
 
+DECLARE_bool(cleanup_intents_sst_files);
 DECLARE_bool(TEST_timeout_non_leader_master_rpcs);
+DECLARE_double(TEST_transaction_ignore_applying_probability);
 DECLARE_int64(cql_processors_limit);
 DECLARE_int32(client_read_write_timeout_ms);
+DECLARE_int32(history_cutoff_propagation_interval_ms);
+DECLARE_int32(rocksdb_level0_file_num_compaction_trigger);
+DECLARE_int32(timestamp_history_retention_interval_sec);
 
 DECLARE_int32(partitions_vtable_cache_refresh_secs);
 DECLARE_int32(client_read_write_timeout_ms);
 DECLARE_bool(disable_truncate_table);
+DECLARE_bool(cql_always_return_metadata_in_execute_response);
+DECLARE_bool(cql_check_table_schema_in_paging_state);
 
 namespace yb {
+
+using client::YBTableInfo;
+using client::YBTableName;
 
 class CqlTest : public CqlTestBase<MiniCluster> {
  public:
   virtual ~CqlTest() = default;
+
+  void TestAlteredPrepare(bool metadata_in_exec_resp);
+  void TestAlteredPrepareWithPaging(bool check_schema_in_paging,
+                                    bool metadata_in_exec_resp = false);
+  void TestPrepareWithDropTableWithPaging();
 };
 
 TEST_F(CqlTest, ProcessorsLimit) {
@@ -317,6 +344,460 @@ TEST_F(CqlTest, TestTruncateTable) {
 
   ANNOTATE_UNPROTECTED_WRITE(FLAGS_disable_truncate_table) = true;
   ASSERT_NOK(session.ExecuteQuery("TRUNCATE TABLE users"));
+}
+
+TEST_F(CqlTest, CompactDeleteMarkers) {
+  FLAGS_timestamp_history_retention_interval_sec = 0;
+  FLAGS_history_cutoff_propagation_interval_ms = 1;
+  FLAGS_TEST_transaction_ignore_applying_probability = 1.0;
+  FLAGS_cleanup_intents_sst_files = false;
+
+  auto session = ASSERT_RESULT(EstablishSession(driver_.get()));
+  ASSERT_OK(session.ExecuteQuery(
+      "CREATE TABLE t (i INT PRIMARY KEY) WITH transactions = { 'enabled' : true }"));
+  ASSERT_OK(session.ExecuteQuery(
+      "BEGIN TRANSACTION "
+      "  INSERT INTO t (i) VALUES (42);"
+      "END TRANSACTION;"));
+  ASSERT_OK(session.ExecuteQuery("DELETE FROM t WHERE i = 42"));
+  ASSERT_OK(cluster_->FlushTablets());
+  FLAGS_TEST_transaction_ignore_applying_probability = 0.0;
+  ASSERT_OK(WaitFor([this] {
+    auto list = ListTabletPeers(cluster_.get(), ListPeersFilter::kAll);
+    for (const auto& peer : list) {
+      auto* participant = peer->tablet()->transaction_participant();
+      if (!participant) {
+        continue;
+      }
+      if (participant->MinRunningHybridTime() != HybridTime::kMax) {
+        return false;
+      }
+    }
+    return true;
+  }, 10s, "Transaction complete"));
+  ASSERT_OK(cluster_->CompactTablets(docdb::SkipFlush::kTrue));
+  auto count_str = ASSERT_RESULT(session.ExecuteAndRenderToString("SELECT COUNT(*) FROM t"));
+  ASSERT_EQ(count_str, "0");
+}
+
+class CqlRF1Test : public CqlTest {
+ public:
+  int num_tablet_servers() override {
+    return 1;
+  }
+};
+
+namespace {
+
+class CompactionListener : public rocksdb::EventListener {
+ public:
+  void OnCompactionCompleted(rocksdb::DB* db, const rocksdb::CompactionJobInfo& ci) override {
+    LOG(INFO) << "Compaction time: " << ci.stats.elapsed_micros;
+  }
+};
+
+}
+
+// Check that we correctly update SST file range values, after removing delete markers.
+TEST_F_EX(CqlTest, RangeGC, CqlRF1Test) {
+  constexpr int kKeys = 20;
+  constexpr int kKeptKey = kKeys / 2;
+  constexpr int kRangeMultiplier = 10;
+
+  ANNOTATE_UNPROTECTED_WRITE(FLAGS_timestamp_history_retention_interval_sec) = 0;
+
+  auto session = ASSERT_RESULT(EstablishSession(driver_.get()));
+  ASSERT_OK(session.ExecuteQuery("CREATE TABLE t (h INT, r INT, v INT, PRIMARY KEY ((h), r))"));
+  auto insert_prepared = ASSERT_RESULT(session.Prepare("INSERT INTO t (h, r, v) VALUES (?, ?, ?)"));
+  for (auto key : Range(kKeys)) {
+    auto stmt = insert_prepared.Bind();
+    stmt.Bind(0, key);
+    stmt.Bind(1, key * kRangeMultiplier);
+    stmt.Bind(2, -key);
+    ASSERT_OK(session.Execute(stmt));
+  }
+
+  ASSERT_OK(cluster_->FlushTablets());
+
+  auto delete_prepared = ASSERT_RESULT(session.Prepare("DELETE FROM t WHERE h = ?"));
+  for (auto key : Range(kKeys)) {
+    if (key == kKeptKey) {
+      continue;
+    }
+    auto stmt = delete_prepared.Bind();
+    stmt.Bind(0, key);
+    ASSERT_OK(session.Execute(stmt));
+  }
+
+  ASSERT_OK(cluster_->CompactTablets());
+
+  for (auto peer : ListTabletPeers(cluster_.get(), ListPeersFilter::kAll)) {
+    auto* db = peer->tablet()->TEST_db();
+    if (!db) {
+      continue;
+    }
+    auto files = db->GetLiveFilesMetaData();
+    for (const auto& file : files) {
+      auto value = ASSERT_RESULT(docdb::KeyEntryValue::FullyDecodeFromKey(
+          file.smallest.user_values[0].AsSlice()));
+      ASSERT_EQ(value.GetInt32(), kKeptKey * kRangeMultiplier);
+      value = ASSERT_RESULT(docdb::KeyEntryValue::FullyDecodeFromKey(
+          file.largest.user_values[0].AsSlice()));
+      ASSERT_EQ(value.GetInt32(), kKeptKey * kRangeMultiplier);
+    }
+  }
+}
+
+// This test fill table with multiple value columns and long (1KB) range value.
+// Then performs compaction.
+// Test was created to measure compaction performance for the above scenario.
+TEST_F_EX(CqlTest, CompactRanges, CqlRF1Test) {
+  ANNOTATE_UNPROTECTED_WRITE(FLAGS_rocksdb_level0_file_num_compaction_trigger) = -1;
+#ifndef NDEBUG
+  constexpr int kKeys = 2000;
+#else
+  constexpr int kKeys = 20000;
+#endif
+  constexpr int kColumns = 10;
+  const std::string kRangeValue = RandomHumanReadableString(1_KB);
+
+  for (size_t i = 0; i != cluster_->num_tablet_servers(); ++i) {
+    cluster_->GetTabletManager(i)->TEST_tablet_options()->listeners.push_back(
+        std::make_shared<CompactionListener>());
+  }
+  auto session = ASSERT_RESULT(EstablishSession(driver_.get()));
+  std::string expr = "CREATE TABLE t (h INT, r TEXT";
+  for (auto column : Range(kColumns)) {
+    expr += Format(", v$0 INT", column);
+  }
+  expr += ", PRIMARY KEY ((h), r))";
+  ASSERT_OK(session.ExecuteQuery(expr));
+
+  expr = "INSERT INTO t (h, r";
+  for (auto column : Range(kColumns)) {
+    expr += Format(", v$0", column);
+  }
+  expr += ") VALUES (?, ?";
+  for (auto column [[maybe_unused]] : Range(kColumns)) { // NOLINT(whitespace/braces)
+    expr += ", ?";
+  }
+  expr += ")";
+
+  auto insert_prepared = ASSERT_RESULT(session.Prepare(expr));
+  std::deque<CassandraFuture> futures;
+  for (int key = 1; key <= kKeys; ++key) {
+    while (!futures.empty() && futures.front().Ready()) {
+      ASSERT_OK(futures.front().Wait());
+      futures.pop_front();
+    }
+    if (futures.size() >= 0x40) {
+      std::this_thread::sleep_for(10ms);
+      continue;
+    }
+    auto stmt = insert_prepared.Bind();
+    int idx = 0;
+    stmt.Bind(idx++, key);
+    stmt.Bind(idx++, kRangeValue);
+    for (auto column : Range(kColumns)) {
+      stmt.Bind(idx++, key * column);
+    }
+    futures.push_back(session.ExecuteGetFuture(stmt));
+  }
+
+  for (auto& future : futures) {
+    ASSERT_OK(future.Wait());
+  }
+
+  ASSERT_OK(cluster_->FlushTablets());
+  ASSERT_OK(cluster_->CompactTablets());
+}
+
+TEST_F(CqlTest, ManyColumns) {
+  constexpr int kNumRows = 10;
+#ifndef NDEBUG
+  constexpr int kColumns = RegularBuildVsSanitizers(100, 10);
+#else
+  constexpr int kColumns = 1000;
+#endif
+
+  auto session = ASSERT_RESULT(EstablishSession(driver_.get()));
+  std::string expr = "CREATE TABLE t (id INT PRIMARY KEY";
+  for (int i = 1; i <= kColumns; ++i) {
+    expr += Format(", c$0 INT", i);
+  }
+  expr += ") WITH tablets = 1";
+  ASSERT_OK(session.ExecuteQuery(expr));
+  expr = "UPDATE t SET";
+  for (int i = 2;; ++i) { // Don't set first column.
+    expr += Format(" c$0 = ?", i);
+    if (i == kColumns) {
+      break;
+    }
+    expr += ",";
+  }
+  expr += " WHERE id = ?";
+  auto insert_prepared = ASSERT_RESULT(session.Prepare(expr));
+
+  for (int i = 1; i <= kNumRows; ++i) {
+    auto stmt = insert_prepared.Bind();
+    int idx = 0;
+    for (int c = 2; c <= kColumns; ++c) {
+      stmt.Bind(idx++, c);
+    }
+    stmt.Bind(idx++, i);
+    ASSERT_OK(session.Execute(stmt));
+  }
+  auto start = CoarseMonoClock::Now();
+  for (int i = 0; i <= 100; ++i) {
+    auto value = ASSERT_RESULT(session.FetchValue<int64_t>("SELECT COUNT(c1) FROM t"));
+    if (i == 0) {
+      ASSERT_EQ(value, 0);
+      start = CoarseMonoClock::Now();
+    }
+  }
+  MonoDelta passed = CoarseMonoClock::Now() - start;
+  LOG(INFO) << "Passed: " << passed;
+}
+
+TEST_F(CqlTest, AlteredSchemaVersion) {
+  auto session = ASSERT_RESULT(EstablishSession(driver_.get()));
+  ASSERT_OK(session.ExecuteQuery("CREATE TABLE t1 (i INT PRIMARY KEY, j INT) "));
+  ASSERT_OK(session.ExecuteQuery("INSERT INTO t1 (i, j) VALUES (1, 1)"));
+
+  CassandraResult res = ASSERT_RESULT(session.ExecuteWithResult("SELECT * FROM t1 WHERE i = 1"));
+  ASSERT_EQ(res.RenderToString(), "1,1");
+
+  // Run ALTER TABLE in another thread.
+  struct AltererThread {
+    explicit AltererThread(CppCassandraDriver* const driver) : driver_(driver) {
+      EXPECT_OK(Thread::Create("cql-test", "AltererThread",
+                               &AltererThread::ThreadBody, this, &thread_));
+    }
+
+    ~AltererThread() {
+      thread_->Join();
+    }
+
+   private:
+    void ThreadBody() {
+      LOG(INFO) << "In thread: ALTER TABLE";
+      auto session = ASSERT_RESULT(EstablishSession(driver_));
+      ASSERT_OK(session.ExecuteQuery("ALTER TABLE t1 ADD k INT"));
+      LOG(INFO) << "In thread: ALTER TABLE - DONE";
+    }
+
+    CppCassandraDriver* const driver_;
+    scoped_refptr<Thread> thread_;
+  } start_thread(driver_.get());
+
+  const YBTableName table_name(YQL_DATABASE_CQL, kCqlTestKeyspace, "t1");
+  SchemaVersion old_version = static_cast<SchemaVersion>(-1);
+
+  while (true) {
+    YBTableInfo info = ASSERT_RESULT(client_->GetYBTableInfo(table_name));
+    LOG(INFO) << "Schema version=" << info.schema.version() << ": " << info.schema.ToString();
+    if (info.schema.num_columns() == 2) { // Old schema.
+      old_version = info.schema.version();
+      std::this_thread::sleep_for(100ms);
+    } else { // New schema.
+      ASSERT_EQ(3, info.schema.num_columns());
+      LOG(INFO) << "new-version=" << info.schema.version() << " old-version=" << old_version;
+      // Ensure the new schema version is strictly bigger than the old schema version.
+      ASSERT_LT(old_version, info.schema.version());
+      break;
+    }
+  }
+
+  res =  ASSERT_RESULT(session.ExecuteWithResult("SELECT * FROM t1 WHERE i = 1"));
+  ASSERT_EQ(res.RenderToString(), "1,1,NULL");
+
+  LOG(INFO) << "Test finished: " << CURRENT_TEST_CASE_AND_TEST_NAME_STR();
+}
+
+void CqlTest::TestAlteredPrepare(bool metadata_in_exec_resp) {
+  FLAGS_cql_always_return_metadata_in_execute_response = metadata_in_exec_resp;
+
+  auto session = ASSERT_RESULT(EstablishSession(driver_.get()));
+  ASSERT_OK(session.ExecuteQuery("CREATE TABLE t1 (i INT PRIMARY KEY, j INT)"));
+  ASSERT_OK(session.ExecuteQuery("INSERT INTO t1 (i, j) VALUES (1, 1)"));
+
+  LOG(INFO) << "Prepare";
+  auto sel_prepared = ASSERT_RESULT(session.Prepare("SELECT * FROM t1 WHERE i = 1"));
+  auto ins_prepared = ASSERT_RESULT(session.Prepare("INSERT INTO t1 (i, j) VALUES (?, ?)"));
+
+  LOG(INFO) << "Execute prepared - before Alter";
+  CassandraResult res =  ASSERT_RESULT(session.ExecuteWithResult(sel_prepared.Bind()));
+  ASSERT_EQ(res.RenderToString(), "1,1");
+
+  ASSERT_OK(session.Execute(ins_prepared.Bind().Bind(0, 2).Bind(1, 2)));
+  res =  ASSERT_RESULT(session.ExecuteWithResult("SELECT * FROM t1 WHERE i = 2"));
+  ASSERT_EQ(res.RenderToString(), "2,2");
+
+  LOG(INFO) << "Alter";
+  auto session2 = ASSERT_RESULT(EstablishSession(driver_.get()));
+  ASSERT_OK(session2.ExecuteQuery("ALTER TABLE t1 ADD k INT"));
+  ASSERT_OK(session2.ExecuteQuery("INSERT INTO t1 (i, k) VALUES (1, 9)"));
+
+  LOG(INFO) << "Execute prepared - after Alter";
+  res =  ASSERT_RESULT(session.ExecuteWithResult(sel_prepared.Bind()));
+  if (metadata_in_exec_resp) {
+    ASSERT_EQ(res.RenderToString(), "1,1,9");
+  } else {
+    ASSERT_EQ(res.RenderToString(), "1,1");
+  }
+
+  ASSERT_OK(session.Execute(ins_prepared.Bind().Bind(0, 3).Bind(1, 3)));
+  res =  ASSERT_RESULT(session.ExecuteWithResult("SELECT * FROM t1 WHERE i = 3"));
+  ASSERT_EQ(res.RenderToString(), "3,3,NULL");
+}
+
+TEST_F(CqlTest, AlteredPrepare) {
+  TestAlteredPrepare(/* metadata_in_exec_resp =*/ false);
+  LOG(INFO) << "Test finished: " << CURRENT_TEST_CASE_AND_TEST_NAME_STR();
+}
+
+TEST_F(CqlTest, AlteredPrepare_MetadataInExecResp) {
+  TestAlteredPrepare(/* metadata_in_exec_resp =*/ true);
+  LOG(INFO) << "Test finished: " << CURRENT_TEST_CASE_AND_TEST_NAME_STR();
+}
+
+void CqlTest::TestAlteredPrepareWithPaging(bool check_schema_in_paging,
+                                           bool metadata_in_exec_resp) {
+  FLAGS_cql_check_table_schema_in_paging_state = check_schema_in_paging;
+  FLAGS_cql_always_return_metadata_in_execute_response = metadata_in_exec_resp;
+
+  auto session = ASSERT_RESULT(EstablishSession(driver_.get()));
+  ASSERT_OK(session.ExecuteQuery(
+      "CREATE TABLE t1 (i INT, j INT, PRIMARY KEY(i, j)) WITH CLUSTERING ORDER BY (j ASC)"));
+
+  for (int j = 1; j <= 7; ++j) {
+    ASSERT_OK(session.ExecuteQuery(Format("INSERT INTO t1 (i, j) VALUES (0, $0)", j)));
+  }
+
+  LOG(INFO) << "Client-1: Prepare";
+  const string select_stmt = "SELECT * FROM t1";
+  auto prepared = ASSERT_RESULT(session.Prepare(select_stmt));
+
+  LOG(INFO) << "Client-1: Execute-1 prepared (for version 0 - 2 columns)";
+  CassandraStatement stmt = prepared.Bind();
+  stmt.SetPageSize(3);
+  CassandraResult res = ASSERT_RESULT(session.ExecuteWithResult(stmt));
+  ASSERT_EQ(res.RenderToString(), "0,1;0,2;0,3");
+  stmt.SetPagingState(res);
+
+  LOG(INFO) << "Client-2: Alter: ADD k";
+  auto session2 = ASSERT_RESULT(EstablishSession(driver_.get()));
+  ASSERT_OK(session2.ExecuteQuery("ALTER TABLE t1 ADD k INT"));
+  ASSERT_OK(session2.ExecuteQuery("INSERT INTO t1 (i, j, k) VALUES (0, 4, 99)"));
+
+  LOG(INFO) << "Client-2: Prepare";
+  auto prepared2 = ASSERT_RESULT(session2.Prepare(select_stmt));
+  LOG(INFO) << "Client-2: Execute-1 prepared (for version 1 - 3 columns)";
+  CassandraStatement stmt2 = prepared2.Bind();
+  stmt2.SetPageSize(3);
+  res = ASSERT_RESULT(session2.ExecuteWithResult(stmt2));
+  ASSERT_EQ(res.RenderToString(), "0,1,NULL;0,2,NULL;0,3,NULL");
+  stmt2.SetPagingState(res);
+
+  LOG(INFO) << "Client-1: Execute-2 prepared (for version 0 - 2 columns)";
+  if (check_schema_in_paging) {
+    Status s = session.Execute(stmt);
+    LOG(INFO) << "Expcted error: " << s;
+    ASSERT_TRUE(s.IsQLError());
+    ASSERT_NE(s.message().ToBuffer().find(
+        "Wrong Metadata Version: Table has been altered. Execute the query again. "
+        "Requested schema version 0, got 1."), std::string::npos) << s;
+  } else {
+    res = ASSERT_RESULT(session.ExecuteWithResult(stmt));
+    if (metadata_in_exec_resp) {
+      ASSERT_EQ(res.RenderToString(), "0,4,99;0,5,NULL;0,6,NULL");
+    } else {
+      // The ral result - (0,4,99) (0,5,NULL) (0,6,NULL) - is interpreted by the driver in
+      // accordance with the old schema - as <page-size>*(INT, INT): (0,4) (99,0,) (5,NULL).
+      ASSERT_EQ(res.RenderToString(), "0,4;99,0;5,NULL");
+    }
+  }
+
+  LOG(INFO) << "Client-2: Execute-2 prepared (for version 1 - 3 columns)";
+  res = ASSERT_RESULT(session2.ExecuteWithResult(stmt2));
+  ASSERT_EQ(res.RenderToString(), "0,4,99;0,5,NULL;0,6,NULL");
+}
+
+TEST_F(CqlTest, AlteredPrepareWithPaging) {
+  TestAlteredPrepareWithPaging(/* check_schema_in_paging =*/ true);
+  LOG(INFO) << "Test finished: " << CURRENT_TEST_CASE_AND_TEST_NAME_STR();
+}
+
+TEST_F(CqlTest, AlteredPrepareWithPaging_NoSchemaCheck) {
+  TestAlteredPrepareWithPaging(/* check_schema_in_paging =*/ false);
+  LOG(INFO) << "Test finished: " << CURRENT_TEST_CASE_AND_TEST_NAME_STR();
+}
+
+TEST_F(CqlTest, AlteredPrepareWithPaging_MetadataInExecResp) {
+  TestAlteredPrepareWithPaging(/* check_schema_in_paging =*/ false,
+                               /* metadata_in_exec_resp =*/ true);
+  LOG(INFO) << "Test finished: " << CURRENT_TEST_CASE_AND_TEST_NAME_STR();
+}
+
+void CqlTest::TestPrepareWithDropTableWithPaging() {
+  auto session = ASSERT_RESULT(EstablishSession(driver_.get()));
+  ASSERT_OK(session.ExecuteQuery(
+      "CREATE TABLE t1 (i INT, j INT, PRIMARY KEY(i, j)) WITH CLUSTERING ORDER BY (j ASC)"));
+
+  for (int j = 1; j <= 7; ++j) {
+    ASSERT_OK(session.ExecuteQuery(Format("INSERT INTO t1 (i, j) VALUES (0, $0)", j)));
+  }
+
+  LOG(INFO) << "Client-1: Prepare";
+  const string select_stmt = "SELECT * FROM t1";
+  auto prepared = ASSERT_RESULT(session.Prepare(select_stmt));
+
+  LOG(INFO) << "Client-1: Execute-1 prepared (for existing table)";
+  CassandraStatement stmt = prepared.Bind();
+  stmt.SetPageSize(3);
+  CassandraResult res = ASSERT_RESULT(session.ExecuteWithResult(stmt));
+  ASSERT_EQ(res.RenderToString(), "0,1;0,2;0,3");
+  stmt.SetPagingState(res);
+
+  LOG(INFO) << "Client-2: Drop table";
+  auto session2 = ASSERT_RESULT(EstablishSession(driver_.get()));
+  ASSERT_OK(session2.ExecuteQuery("DROP TABLE t1"));
+
+  LOG(INFO) << "Client-1: Execute-2 prepared (continue for deleted table)";
+  Status s = session.Execute(stmt);
+  LOG(INFO) << "Expcted error: " << s;
+  ASSERT_TRUE(s.IsServiceUnavailable());
+  ASSERT_NE(s.message().ToBuffer().find(
+      "All hosts in current policy attempted and were either unavailable or failed"),
+      std::string::npos) << s;
+
+  LOG(INFO) << "Client-1: Prepare (for deleted table)";
+  auto prepare_res = session.Prepare(select_stmt);
+  ASSERT_FALSE(prepare_res.ok());
+  LOG(INFO) << "Expcted error: " << prepare_res.status();
+  ASSERT_TRUE(prepare_res.status().IsQLError());
+  ASSERT_NE(prepare_res.status().message().ToBuffer().find(
+      "Object Not Found"), std::string::npos) << prepare_res.status();
+
+  LOG(INFO) << "Client-2: Prepare (for deleted table)";
+  prepare_res = session2.Prepare(select_stmt);
+  ASSERT_FALSE(prepare_res.ok());
+  LOG(INFO) << "Expcted error: " << prepare_res.status();
+  ASSERT_TRUE(prepare_res.status().IsQLError());
+  ASSERT_NE(prepare_res.status().message().ToBuffer().find(
+      "Object Not Found"), std::string::npos) << prepare_res.status();
+}
+
+TEST_F(CqlTest, PrepareWithDropTableWithPaging) {
+  FLAGS_cql_check_table_schema_in_paging_state = true;
+  TestPrepareWithDropTableWithPaging();
+  LOG(INFO) << "Test finished: " << CURRENT_TEST_CASE_AND_TEST_NAME_STR();
+}
+
+TEST_F(CqlTest, PrepareWithDropTableWithPaging_NoSchemaCheck) {
+  FLAGS_cql_check_table_schema_in_paging_state = false;
+  TestPrepareWithDropTableWithPaging();
+  LOG(INFO) << "Test finished: " << CURRENT_TEST_CASE_AND_TEST_NAME_STR();
 }
 
 }  // namespace yb

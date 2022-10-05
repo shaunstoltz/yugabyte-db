@@ -16,7 +16,7 @@
 
 #include "yb/common/schema.h"
 
-#include "yb/docdb/packed_row.h"
+#include "yb/docdb/schema_packing.h"
 
 namespace yb {
 namespace docdb {
@@ -24,17 +24,21 @@ namespace docdb {
 struct DocReadContext {
   DocReadContext() = default;
 
-  DocReadContext(const Schema& schema_, uint32_t schema_version) : schema(schema_) {
+  DocReadContext(const Schema& schema_, SchemaVersion schema_version) : schema(schema_) {
     schema_packing_storage.AddSchema(schema_version, schema_);
   }
 
-  DocReadContext(const DocReadContext& rhs, const Schema& schema_, uint32_t schema_version)
+  DocReadContext(const DocReadContext& rhs, const Schema& schema_, SchemaVersion schema_version)
       : schema(schema_), schema_packing_storage(rhs.schema_packing_storage) {
     schema_packing_storage.AddSchema(schema_version, schema_);
   }
 
+  DocReadContext(const DocReadContext& rhs, SchemaVersion min_schema_version)
+      : schema(rhs.schema), schema_packing_storage(rhs.schema_packing_storage, min_schema_version) {
+  }
+
   template <class PB>
-  CHECKED_STATUS LoadFromPB(const PB& pb) {
+  Status LoadFromPB(const PB& pb) {
     RETURN_NOT_OK(SchemaFromPB(pb.schema(), &schema));
     RETURN_NOT_OK(schema_packing_storage.LoadFromPB(pb.old_schema_packings()));
     schema_packing_storage.AddSchema(pb.schema_version(), schema);
@@ -42,10 +46,22 @@ struct DocReadContext {
   }
 
   template <class PB>
-  void ToPB(uint32_t schema_version, PB* out) {
+  Status MergeWithRestored(const PB& pb) {
+    return schema_packing_storage.MergeWithRestored(
+        pb.schema_version(), pb.schema(), pb.old_schema_packings());
+  }
+
+  template <class PB>
+  void ToPB(SchemaVersion schema_version, PB* out) {
     DCHECK(schema.has_column_ids());
     SchemaToPB(schema, out->mutable_schema());
     schema_packing_storage.ToPB(schema_version, out->mutable_old_schema_packings());
+  }
+
+  // Should account for every field in DocReadContext.
+  static bool TEST_Equals(const DocReadContext& lhs, const DocReadContext& rhs) {
+    return Schema::TEST_Equals(lhs.schema, rhs.schema) &&
+        lhs.schema_packing_storage == rhs.schema_packing_storage;
   }
 
   Schema schema;

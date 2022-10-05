@@ -185,6 +185,7 @@ typedef struct bkend
 } Backend;
 
 static dlist_head BackendList = DLIST_STATIC_INIT(BackendList);
+int too_many_conn = 0;
 
 #ifdef EXEC_BACKEND
 static Backend *ShmemBackendArray;
@@ -278,6 +279,12 @@ static StartupStatusEnum StartupStatus = STARTUP_NOT_RUNNING;
 static int	Shutdown = NoShutdown;
 
 static bool FatalError = false; /* T if recovering from backend crash */
+
+static bool YbCrashWhileLockIntermediateState = false; /* Crashed before fully acquiring a lock */
+
+#ifdef __linux__
+static char *YbBackendOomScoreAdj = NULL;
+#endif
 
 /*
  * We use a simple state machine to control startup, shutdown, and
@@ -420,7 +427,7 @@ static void SendNegotiateProtocolVersion(List *unrecognized_protocol_options);
 static void processCancelRequest(Port *port, void *pkt);
 static int	initMasks(fd_set *rmask);
 static void report_fork_failure_to_client(Port *port, int errnum);
-static CAC_state canAcceptConnections(void);
+static CAC_state canAcceptConnections(int backend_type);
 static bool RandomCancelKey(int32 *cancel_key);
 static void signal_child(pid_t pid, int signal);
 static bool SignalSomeChildren(int signal, int targets);
@@ -1671,6 +1678,13 @@ ServerLoop(void)
 	bool yb_enabled = YBIsEnabledInPostgresEnvVar();
 #endif
 
+#ifdef __linux__
+	if (getenv("FLAGS_yb_backend_oom_score_adj") != NULL)
+	{
+		YbBackendOomScoreAdj = strdup(getenv("FLAGS_yb_backend_oom_score_adj"));
+	}
+#endif
+
 	for (;;)
 	{
 		fd_set		rmask;
@@ -2312,6 +2326,8 @@ retry1:
 					 errmsg("the database system is in recovery mode")));
 			break;
 		case CAC_TOOMANY:
+			/* increment rejection counter */
+			too_many_conn++;
 			ereport(FATAL,
 					(errcode(ERRCODE_TOO_MANY_CONNECTIONS),
 					 errmsg("sorry, too many clients already")));
@@ -2417,16 +2433,21 @@ processCancelRequest(Port *port, void *pkt)
 }
 
 /*
- * canAcceptConnections --- check to see if database state allows connections.
+ * canAcceptConnections --- check to see if database state allows connections
+ * of the specified type.  backend_type can be BACKEND_TYPE_NORMAL,
+ * BACKEND_TYPE_AUTOVAC, or BACKEND_TYPE_BGWORKER.  (Note that we don't yet
+ * know whether a NORMAL connection might turn into a walsender.)
  */
 static CAC_state
-canAcceptConnections(void)
+canAcceptConnections(int backend_type)
 {
 	CAC_state	result = CAC_OK;
 
 	/*
 	 * Can't start backends when in startup/shutdown/inconsistent recovery
-	 * state.
+	 * state.  We treat autovac workers the same as user backends for this
+	 * purpose.  However, bgworkers are excluded from this test; we expect
+	 * bgworker_should_start_now() decided whether the DB state allows them.
 	 *
 	 * In state PM_WAIT_BACKUP only superusers can connect (this must be
 	 * allowed so that a superuser can end online backup mode); we return
@@ -2434,7 +2455,8 @@ canAcceptConnections(void)
 	 * that neither CAC_OK nor CAC_WAITBACKUP can safely be returned until we
 	 * have checked for too many children.
 	 */
-	if (pmState != PM_RUN)
+	if (pmState != PM_RUN &&
+		backend_type != BACKEND_TYPE_BGWORKER)
 	{
 		if (pmState == PM_WAIT_BACKUP)
 			result = CAC_WAITBACKUP;	/* allow superusers only */
@@ -2454,9 +2476,9 @@ canAcceptConnections(void)
 	/*
 	 * Don't start too many children.
 	 *
-	 * We allow more connections than we can have backends here because some
+	 * We allow more connections here than we can have backends because some
 	 * might still be authenticating; they might fail auth, or some existing
-	 * backend might exit before the auth cycle is completed. The exact
+	 * backend might exit before the auth cycle is completed.  The exact
 	 * MaxBackends limit is enforced when a new backend tries to join the
 	 * shared-inval backend array.
 	 *
@@ -2880,6 +2902,32 @@ reaper(SIGNAL_ARGS)
 	while ((pid = waitpid(-1, &exitstatus, WNOHANG)) > 0)
 	{
 		/*
+		 * We perform the following tasks when a process crashes
+		 * 1. If no locks are held during a crash, we avoid postmaster restarts.
+		 * 2. If any lock has been acquired or is in the process of being
+		 *    acquired we take a conservative approach and restart the
+		 *    postmaster.
+		 */
+
+		int i;
+		for (i = 0; i < ProcGlobal->allProcCount; i++)
+		{
+			PGPROC	   *proc = &ProcGlobal->allProcs[i];
+			/*
+			 * We take a conservative approach and restart the postmaster if
+			 * a process dies while holding a lock.
+			 */
+			if (pid == proc->pid && proc->ybAnyLockAcquired)
+			{
+				YbCrashWhileLockIntermediateState = true;
+				ereport(LOG,
+						(errmsg("terminating active server processes due to backend crash while "
+						"acquiring LWLock")));
+				break;
+			}
+		}
+
+		/*
 		 * Check if this child was a startup process.
 		 */
 		if (pid == StartupPID)
@@ -2950,6 +2998,7 @@ reaper(SIGNAL_ARGS)
 			 */
 			StartupStatus = STARTUP_NOT_RUNNING;
 			FatalError = false;
+			YbCrashWhileLockIntermediateState = false;
 			Assert(AbortStartTime == 0);
 			ReachedNormalRunning = true;
 			pmState = PM_RUN;
@@ -3168,6 +3217,17 @@ reaper(SIGNAL_ARGS)
 		 * Else do standard backend child cleanup.
 		 */
 		CleanupBackend(pid, exitstatus);
+		if (!YbCrashWhileLockIntermediateState && !FatalError)
+		{
+			/*
+			 * Since this is not a fatal crash, we are pursuing a clean exit. All
+			 * we need to do is to clear the pgstat entry of the dead backend
+			 * pid. In case of postmaster restart, it is unnecessary as all the
+			 * shared memory state will be reset.
+			 */
+			yb_pgstat_clear_entry_pid(pid);
+
+		}
 	}							/* loop over pending child-death reports */
 
 	/*
@@ -3391,8 +3451,17 @@ HandleChildCrash(int pid, int exitstatus, const char *procname)
 	 * clutter log.
 	 */
 	take_action = !FatalError && Shutdown != ImmediateShutdown;
-	if (YBIsEnabledInPostgresEnvVar()) {
-		take_action = take_action && YBShouldRestartAllChildrenIfOneCrashes();
+	/*
+	 * If we enable the flag yb_pg_terminate_child_backend to false, it means
+	 * that if a child has crashed in a safe state, we need not do a postmaster
+	 * restart. We check for that condition in determine if we need to restart
+	 * postmaster (the variable take_action determines that).
+	 */
+	if (YBIsEnabledInPostgresEnvVar() && !YBShouldRestartAllChildrenIfOneCrashes())
+	{
+		take_action = take_action && YbCrashWhileLockIntermediateState;
+		if (YbCrashWhileLockIntermediateState)
+			YbCrashWhileLockIntermediateState = false;
 	}
 
 	if (take_action)
@@ -3609,6 +3678,8 @@ HandleChildCrash(int pid, int exitstatus, const char *procname)
 		allow_immediate_pgstat_restart();
 	}
 
+	if (YBIsEnabledInPostgresEnvVar() && !YBShouldRestartAllChildrenIfOneCrashes() && !take_action)
+		return;
 	/* We do NOT restart the syslogger */
 
 	if (Shutdown != ImmediateShutdown)
@@ -4100,7 +4171,7 @@ BackendStartup(Port *port)
 	bn->cancel_key = MyCancelKey;
 
 	/* Pass down canAcceptConnections state */
-	port->canAcceptConnections = canAcceptConnections();
+	port->canAcceptConnections = canAcceptConnections(BACKEND_TYPE_NORMAL);
 	bn->dead_end = (port->canAcceptConnections != CAC_OK &&
 					port->canAcceptConnections != CAC_WAITBACKUP);
 
@@ -4168,6 +4239,34 @@ BackendStartup(Port *port)
 #ifdef EXEC_BACKEND
 	if (!bn->dead_end)
 		ShmemBackendArrayAdd(bn);
+#endif
+
+#ifdef __linux__
+	char file_name[64];
+	snprintf(file_name, sizeof(file_name), "/proc/%d/oom_score_adj", pid);
+	FILE * fPtr;
+	fPtr = fopen(file_name, "w");
+
+    /*
+	 * oom_score_adj varies from -1000 to 1000. The lower the value, the lower
+	 * the chance that it's going to be killed. Here, we are setting low priority
+	 * (YbBackendOomScoreAdj) for postgres connections so that during out of
+	 * memory, postgres connections are killed first. We do that be setting a
+	 * high oom_score_adj value for the postgres connection.
+	 */
+	if(fPtr == NULL)
+	{
+		int saved_errno = errno;
+		ereport(LOG,
+			(errcode_for_file_access(),
+				errmsg("error %d: %s, unable to open file %s", saved_errno,
+				strerror(saved_errno), file_name)));
+	}
+	else
+	{
+		fputs(YbBackendOomScoreAdj, fPtr);
+		fclose(fPtr);
+	}
 #endif
 
 	return STATUS_OK;
@@ -5521,7 +5620,7 @@ StartAutovacuumWorker(void)
 	 * we have to check to avoid race-condition problems during DB state
 	 * changes.
 	 */
-	if (canAcceptConnections() == CAC_OK)
+	if (canAcceptConnections(BACKEND_TYPE_AUTOVAC) == CAC_OK)
 	{
 		/*
 		 * Compute the cancel key that will be assigned to this session. We
@@ -5756,12 +5855,13 @@ do_start_bgworker(RegisteredBgWorker *rw)
 
 	/*
 	 * Allocate and assign the Backend element.  Note we must do this before
-	 * forking, so that we can handle out of memory properly.
+	 * forking, so that we can handle failures (out of memory or child-process
+	 * slots) cleanly.
 	 *
 	 * Treat failure as though the worker had crashed.  That way, the
-	 * postmaster will wait a bit before attempting to start it again; if it
-	 * tried again right away, most likely it'd find itself repeating the
-	 * out-of-memory or fork failure condition.
+	 * postmaster will wait a bit before attempting to start it again; if we
+	 * tried again right away, most likely we'd find ourselves hitting the
+	 * same resource-exhaustion condition.
 	 */
 	if (!assign_backendlist_entry(rw))
 	{
@@ -5886,6 +5986,19 @@ static bool
 assign_backendlist_entry(RegisteredBgWorker *rw)
 {
 	Backend    *bn;
+
+	/*
+	 * Check that database state allows another connection.  Currently the
+	 * only possible failure is CAC_TOOMANY, so we just log an error message
+	 * based on that rather than checking the error code precisely.
+	 */
+	if (canAcceptConnections(BACKEND_TYPE_BGWORKER) != CAC_OK)
+	{
+		ereport(LOG,
+				(errcode(ERRCODE_CONFIGURATION_LIMIT_EXCEEDED),
+				 errmsg("no slot available for new worker process")));
+		return false;
+	}
 
 	/*
 	 * Compute the cancel key that will be assigned to this session. We

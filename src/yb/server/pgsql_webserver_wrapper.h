@@ -18,6 +18,7 @@
 using std::atomic_ullong;
 using int64 = int64_t;
 using uint8 = uint8_t;
+using uint64 = uint64_t;
 #else
 #include <stdatomic.h>
 #endif
@@ -49,6 +50,7 @@ typedef struct rpczEntry {
   int64 query_start_timestamp;
   char *backend_type;
   uint8 backend_active;
+  int new_conn;
   char *backend_status;
   char *host;
   char *port;
@@ -66,6 +68,7 @@ typedef struct YsqlStatementStat {
   double mean_time;    /* mean execution time in msec */
   double sum_var_time; /* sum of variances in execution time in msec */
   int64 rows;          /* total # of retrieved or affected rows */
+  uint64 query_id;     /* query id of the pgssHashKey for the query */
 } YsqlStatementStat;
 
 typedef struct {
@@ -79,7 +82,8 @@ typedef struct {
 struct WebserverWrapper *CreateWebserver(char *listen_addresses, int port);
 void RegisterMetrics(ybpgmEntry *tab, int num_entries, char *metric_node_name);
 void RegisterRpczEntries(
-    postgresCallbacks *callbacks, int *num_backends_ptr, rpczEntry **rpczEntriesPointer);
+    postgresCallbacks *callbacks, int *num_backends_ptr, rpczEntry **rpczEntriesPointer,
+    int* too_many_conn_ptr);
 YBCStatus StartWebserver(struct WebserverWrapper *webserver);
 void RegisterGetYsqlStatStatements(void (*getYsqlStatementStats)(void *));
 void RegisterResetYsqlStatStatements(void (*fn)());

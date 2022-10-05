@@ -9,27 +9,27 @@ import static com.yugabyte.yw.common.DevopsBase.PY_WRAPPER;
 import static com.yugabyte.yw.common.ModelFactory.createUniverse;
 import static org.junit.Assert.assertEquals;
 import static org.junit.Assert.assertNull;
+import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.Mockito.times;
 import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.when;
-import static org.mockito.ArgumentMatchers.any;
 
+import com.typesafe.config.Config;
+import com.yugabyte.yw.common.config.RuntimeConfigFactory;
 import com.yugabyte.yw.forms.BackupTableParams;
 import com.yugabyte.yw.forms.RestoreBackupParams;
 import com.yugabyte.yw.forms.RestoreBackupParams.ActionType;
 import com.yugabyte.yw.forms.RestoreBackupParams.BackupStorageInfo;
 import com.yugabyte.yw.forms.UniverseDefinitionTaskParams;
 import com.yugabyte.yw.forms.UniverseDefinitionTaskParams.UserIntent;
-import com.typesafe.config.Config;
-import com.yugabyte.yw.common.config.RuntimeConfigFactory;
 import com.yugabyte.yw.models.AccessKey;
 import com.yugabyte.yw.models.AvailabilityZone;
 import com.yugabyte.yw.models.Backup;
 import com.yugabyte.yw.models.Customer;
-import com.yugabyte.yw.models.CustomerConfig;
 import com.yugabyte.yw.models.Provider;
 import com.yugabyte.yw.models.Region;
 import com.yugabyte.yw.models.Universe;
+import com.yugabyte.yw.models.configs.CustomerConfig;
 import com.yugabyte.yw.models.helpers.PlacementInfo;
 import java.text.SimpleDateFormat;
 import java.util.ArrayList;
@@ -39,21 +39,23 @@ import java.util.LinkedList;
 import java.util.List;
 import java.util.Map;
 import java.util.UUID;
-import lombok.extern.slf4j.Slf4j;
-import org.apache.commons.lang3.StringUtils;
+import java.util.stream.Collectors;
 import org.junit.Before;
 import org.junit.Test;
 import org.junit.runner.RunWith;
 import org.mockito.InjectMocks;
 import org.mockito.Mock;
-import org.mockito.runners.MockitoJUnitRunner;
+import org.mockito.junit.MockitoJUnitRunner;
 import play.libs.Json;
 
 @RunWith(MockitoJUnitRunner.class)
-@Slf4j
 public class RestoreManagerYbTest extends FakeDBApplication {
 
   @Mock ShellProcessHandler shellProcessHandler;
+
+  @Mock RuntimeConfigFactory runtimeConfigFactory;
+
+  @Mock Config mockConfig;
 
   @InjectMocks RestoreManagerYb restoreManagerYb;
 
@@ -102,6 +104,7 @@ public class RestoreManagerYbTest extends FakeDBApplication {
     userIntent.accessKeyCode = keyCode;
     userIntent.ybSoftwareVersion = softwareVersion;
     userIntent.numNodes = 3;
+    userIntent.provider = testProvider.uuid.toString();
     userIntent.replicationFactor = 3;
     userIntent.regionList = getMockRegionUUIDs(3);
     // userIntent.enableYSQLAuth = false;
@@ -120,8 +123,8 @@ public class RestoreManagerYbTest extends FakeDBApplication {
   public void setUp() {
     testCustomer = ModelFactory.testCustomer();
     testUniverse = createUniverse("Universe-1", testCustomer.getCustomerId());
-    testCustomer.addUniverseUUID(testUniverse.universeUUID);
-    testCustomer.save();
+    when(runtimeConfigFactory.globalRuntimeConf()).thenReturn(mockConfig);
+    when(runtimeConfigFactory.forUniverse(any())).thenReturn(mockConfig);
   }
 
   @Test
@@ -322,14 +325,14 @@ public class RestoreManagerYbTest extends FakeDBApplication {
   private List<String> getExpectedRestoreBackupCommand(
       RestoreBackupParams restoreParams, ActionType actionType, String storageType) {
     AccessKey accessKey = AccessKey.get(testProvider.uuid, keyCode);
-    Map<String, String> namespaceToConfig = new HashMap<>();
+    Map<String, Map<String, String>> podAddrToConfig = new HashMap<>();
     UserIntent userIntent = testUniverse.getUniverseDetails().getPrimaryCluster().userIntent;
 
     if (testProvider.code.equals("kubernetes")) {
       PlacementInfo pi = testUniverse.getUniverseDetails().getPrimaryCluster().placementInfo;
-      namespaceToConfig =
-          PlacementInfoUtil.getConfigPerNamespace(
-              pi, testUniverse.getUniverseDetails().nodePrefix, testProvider);
+      podAddrToConfig =
+          PlacementInfoUtil.getKubernetesConfigPerPod(
+              pi, testUniverse.getUniverseDetails().nodeDetailsSet);
     }
 
     List<String> cmd = new LinkedList<>();
@@ -364,12 +367,20 @@ public class RestoreManagerYbTest extends FakeDBApplication {
     }
     if (testProvider.code.equals("kubernetes")) {
       cmd.add("--k8s_config");
-      cmd.add(Json.stringify(Json.toJson(namespaceToConfig)));
+      cmd.add(Json.stringify(Json.toJson(podAddrToConfig)));
     } else {
       cmd.add("--ssh_port");
       cmd.add(accessKey.getKeyInfo().sshPort.toString());
       cmd.add("--ssh_key_path");
       cmd.add(pkPath);
+      cmd.add("--ip_to_ssh_key_path");
+      cmd.add(
+          Json.stringify(
+              Json.toJson(
+                  testUniverse
+                      .getTServers()
+                      .stream()
+                      .collect(Collectors.toMap(t -> t.cloudInfo.private_ip, t -> pkPath)))));
     }
     cmd.add("--backup_location");
     cmd.add(backupStorageInfo.storageLocation);
@@ -384,7 +395,9 @@ public class RestoreManagerYbTest extends FakeDBApplication {
       cmd.add(testProvider.code.equals("kubernetes") ? K8S_CERT_PATH : VM_CERT_DIR);
     }
     cmd.add(actionType.name().toLowerCase());
-    if (restoreParams.enableVerboseLogs) {
+    boolean verboseLogsEnabled =
+        runtimeConfigFactory.forUniverse(testUniverse).getBoolean("yb.backup.log.verbose");
+    if (restoreParams.enableVerboseLogs || verboseLogsEnabled) {
       cmd.add("--verbose");
     }
     return cmd;

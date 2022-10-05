@@ -112,6 +112,7 @@
 #include "yb/rocksdb/util/perf_context_imp.h"
 #include "yb/rocksdb/util/stop_watch.h"
 #include "yb/rocksdb/util/sync_point.h"
+#include "yb/rocksdb/util/task_metrics.h"
 #include "yb/rocksdb/util/xfunc.h"
 #include "yb/rocksdb/db/db_iterator_wrapper.h"
 
@@ -148,6 +149,13 @@ DEFINE_int32(compaction_priority_step_size, 5,
 
 DEFINE_int32(small_compaction_extra_priority, 1,
              "Small compaction will get small_compaction_extra_priority extra priority.");
+
+DEFINE_int32(automatic_compaction_extra_priority, 50,
+             "Assigns automatic compactions extra priority when automatic tablet splits are "
+             "enabled. This deprioritizes manual compactions including those induced by the "
+             "tserver (e.g. post-split compactions). Suggested value between 0 and 50.");
+
+DECLARE_bool(enable_automatic_tablet_splitting);
 
 DEFINE_bool(rocksdb_use_logging_iterator, false,
             "Wrap newly created RocksDB iterators in a logging wrapper");
@@ -232,23 +240,12 @@ class DBImpl::ThreadPoolTask : public yb::PriorityThreadPoolTask {
   DBImpl* const db_impl_;
 };
 
-struct StateTickers {
-  Tickers tasks;
-  Tickers files;
-  Tickers bytes;
-};
-
-bool operator==(const StateTickers& lhs, const StateTickers& rhs) {
-    return YB_STRUCT_EQUALS(tasks, files, bytes);
-}
-
+constexpr int kNoDiskPriority = 0;
 constexpr int kTopDiskCompactionPriority = 100;
 constexpr int kTopDiskFlushPriority = 200;
 constexpr int kShuttingDownPriority = 200;
 constexpr int kFlushPriority = 100;
 constexpr int kNoJobId = -1;
-const StateTickers kInvalidStateTickers{
-    Tickers::TICKER_ENUM_MAX, Tickers::TICKER_ENUM_MAX, Tickers::TICKER_ENUM_MAX};
 
 class DBImpl::CompactionTask : public ThreadPoolTask {
  public:
@@ -258,7 +255,7 @@ class DBImpl::CompactionTask : public ThreadPoolTask {
         manual_compaction_(manual_compaction),
         compaction_(manual_compaction->compaction.get()),
         priority_(CalcSizePriority()),
-        stats_(db_impl_->stats_) {
+        metrics_(db_impl->priority_thread_pool_metrics_) {
     db_impl->mutex_.AssertHeld();
     SetFileAndByteCount();
   }
@@ -270,7 +267,7 @@ class DBImpl::CompactionTask : public ThreadPoolTask {
         compaction_holder_(std::move(compaction)),
         compaction_(compaction_holder_.get()),
         priority_(CalcSizePriority()),
-        stats_(db_impl_->stats_) {
+        metrics_(db_impl->priority_thread_pool_metrics_) {
     db_impl->mutex_.AssertHeld();
     SetFileAndByteCount();
   }
@@ -324,6 +321,42 @@ class DBImpl::CompactionTask : public ThreadPoolTask {
           ((job_id_value == kNoJobId) ? "None" : std::to_string(job_id_value)));
   }
 
+  void UpdateStatsStateChangedTo(yb::PriorityThreadPoolTaskState state) const override {
+    if (!metrics_) {
+      return;
+    }
+    switch (state) {
+      case yb::PriorityThreadPoolTaskState::kNotStarted:
+        metrics_->queued.CompactionTaskAdded(compaction_info_);
+        return;
+      case yb::PriorityThreadPoolTaskState::kPaused:
+        metrics_->paused.CompactionTaskAdded(compaction_info_);
+        return;
+      case yb::PriorityThreadPoolTaskState::kRunning:
+        metrics_->active.CompactionTaskAdded(compaction_info_);
+        return;
+    }
+    FATAL_INVALID_ENUM_VALUE(yb::PriorityThreadPoolTaskState, state);
+  }
+
+  void UpdateStatsStateChangedFrom(yb::PriorityThreadPoolTaskState state) const override {
+    if (!metrics_) {
+      return;
+    }
+    switch (state) {
+      case yb::PriorityThreadPoolTaskState::kNotStarted:
+        metrics_->queued.CompactionTaskRemoved(compaction_info_);
+        return;
+      case yb::PriorityThreadPoolTaskState::kPaused:
+        metrics_->paused.CompactionTaskRemoved(compaction_info_);
+        return;
+      case yb::PriorityThreadPoolTaskState::kRunning:
+        metrics_->active.CompactionTaskRemoved(compaction_info_);
+        return;
+    }
+    FATAL_INVALID_ENUM_VALUE(yb::PriorityThreadPoolTaskState, state);
+  }
+
   void SetJobID(JobContext* job_context) {
     job_id_.Store(job_context->job_id);
   }
@@ -353,48 +386,8 @@ class DBImpl::CompactionTask : public ThreadPoolTask {
     return priority_;
   }
 
-  void UpdateStatsStateChangedTo(yb::PriorityThreadPoolTaskState state) const override {
-    StateTickers tickers = GetStateTickers(state);
-    if (!stats_ || !stats_.get() || tickers == kInvalidStateTickers) {
-      return;
-    }
-    SetTickerCount(
-        stats_.get(), tickers.tasks, stats_->getTickerCount(tickers.tasks) + 1);
-    SetTickerCount(
-        stats_.get(), tickers.tasks, stats_->getTickerCount(tickers.files) + file_count_);
-    SetTickerCount(
-        stats_.get(), tickers.tasks, stats_->getTickerCount(tickers.bytes) + byte_count_);
-  }
-
-  void UpdateStatsStateChangedFrom(yb::PriorityThreadPoolTaskState state) const override {
-    StateTickers tickers = GetStateTickers(state);
-    if (!stats_ || !stats_.get() || tickers == kInvalidStateTickers) {
-      return;
-    }
-    SetTickerCount(
-        stats_.get(), tickers.tasks, stats_->getTickerCount(tickers.tasks) - 1);
-    SetTickerCount(
-        stats_.get(), tickers.tasks, stats_->getTickerCount(tickers.files) - file_count_);
-    SetTickerCount(
-        stats_.get(), tickers.tasks, stats_->getTickerCount(tickers.bytes) - byte_count_);
-  }
-
-  StateTickers GetStateTickers(yb::PriorityThreadPoolTaskState state) const {
-    switch (state) {
-       case yb::PriorityThreadPoolTaskState::kNotStarted:
-          return queued_tickers_;
-        case yb::PriorityThreadPoolTaskState::kPaused:
-          return paused_tickers_;
-        case yb::PriorityThreadPoolTaskState::kRunning:
-          return active_tickers_;
-        default:
-          FATAL_INVALID_ENUM_VALUE(yb::PriorityThreadPoolTaskState, state);
-          return kInvalidStateTickers;
-    }
-  }
-
   int CalculateGroupNoPriority(int active_tasks) const override {
-    return kFlushPriority - active_tasks;
+    return kTopDiskCompactionPriority - active_tasks;
   }
 
  private:
@@ -419,6 +412,13 @@ class DBImpl::CompactionTask : public ThreadPoolTask {
       result += FLAGS_small_compaction_extra_priority;
     }
 
+    // Adding extra priority to automatic compactions can have a large positive impact on
+    // performance for situations with many manual major compactions (e.g. insert-heavy workloads
+    // with tablet splitting enabled).
+    if (FLAGS_enable_automatic_tablet_splitting && !compaction_->is_manual_compaction()) {
+      result += FLAGS_automatic_compaction_extra_priority;
+    }
+
     return result;
   }
 
@@ -428,29 +428,16 @@ class DBImpl::CompactionTask : public ThreadPoolTask {
     for (size_t i = 0; i < levels; i++) {
         file_count += compaction_->num_input_files(i);
     }
-    file_count_ = file_count;
-    byte_count_ = compaction_->CalculateTotalInputSize();
+    compaction_info_ = CompactionInfo{file_count, compaction_->CalculateTotalInputSize()};
   }
-  StateTickers active_tickers_{
-    Tickers::COMPACTION_ACTIVE_TASKS,
-    Tickers::COMPACTION_ACTIVE_FILES,
-    Tickers::COMPACTION_ACTIVE_BYTES};
-  StateTickers paused_tickers_{
-    Tickers::COMPACTION_PAUSED_TASKS,
-    Tickers::COMPACTION_PAUSED_FILES,
-    Tickers::COMPACTION_PAUSED_BYTES};
-  StateTickers queued_tickers_{
-    Tickers::COMPACTION_QUEUED_TASKS,
-    Tickers::COMPACTION_QUEUED_FILES,
-    Tickers::COMPACTION_QUEUED_BYTES};
+
   DBImpl::ManualCompaction* const manual_compaction_;
   std::unique_ptr<Compaction> compaction_holder_;
   Compaction* compaction_;
   int priority_;
   yb::AtomicInt<int> job_id_{kNoJobId};
-  uint64_t byte_count_;
-  uint64_t file_count_;
-  std::shared_ptr<Statistics> stats_;
+  CompactionInfo compaction_info_;
+  std::shared_ptr<RocksDBPriorityThreadPoolMetrics> metrics_;
 };
 
 class DBImpl::FlushTask : public ThreadPoolTask {
@@ -728,6 +715,8 @@ DBImpl::DBImpl(const DBOptions& options, const std::string& dbname)
   pending_outputs_ = std::make_unique<FileNumbersProvider>(versions_.get());
   column_family_memtables_.reset(
       new ColumnFamilyMemTablesImpl(versions_->GetColumnFamilySet()));
+
+  priority_thread_pool_metrics_ = options.priority_thread_pool_metrics;
 
   if (FLAGS_dump_dbimpl_info) {
     DumpDBFileSummary(db_options_, dbname_);
@@ -1879,7 +1868,7 @@ Status DBImpl::WriteLevel0TableForRecovery(int job_id, ColumnFamilyData* cfd,
                        paranoid_file_checks,
                        cfd->internal_stats(),
                        db_options_.boundary_extractor.get(),
-                       Env::IO_HIGH,
+                       yb::IOPriority::kHigh,
                        &info.table_properties);
         LogFlush(db_options_.info_log);
         RLOG(InfoLogLevel::DEBUG_LEVEL, db_options_.info_log,
@@ -2119,10 +2108,12 @@ Status DBImpl::CompactRange(const CompactRangeOptions& options,
   auto cfd = cfh->cfd();
   bool exclusive = options.exclusive_manual_compaction;
 
-  Status s = FlushMemTable(cfd, FlushOptions());
-  if (!s.ok()) {
-    LogFlush(db_options_.info_log);
-    return s;
+  if (!options.skip_flush) {
+    Status s = FlushMemTable(cfd, FlushOptions());
+    if (!s.ok()) {
+      LogFlush(db_options_.info_log);
+      return s;
+    }
   }
 
   int max_level_with_files = 0;
@@ -2137,6 +2128,7 @@ Status DBImpl::CompactRange(const CompactRangeOptions& options,
     }
   }
 
+  Status s;
   int final_output_level = 0;
   if (cfd->ioptions()->compaction_style == kCompactionStyleUniversal &&
       cfd->NumberLevels() > 1) {
@@ -5810,6 +5802,11 @@ Result<std::string> DBImpl::GetMiddleKey() {
   return default_cf_handle_->cfd()->current()->GetMiddleKey();
 }
 
+yb::Result<TableReader*> DBImpl::TEST_GetLargestSstTableReader() {
+  InstrumentedMutexLock lock(&mutex_);
+  return default_cf_handle_->cfd()->current()->TEST_GetLargestSstTableReader();
+}
+
 void DBImpl::TEST_SwitchMemtable() {
   std::lock_guard<InstrumentedMutex> lock(mutex_);
   WriteContext context;
@@ -6066,6 +6063,12 @@ UserFrontierPtr DBImpl::GetFlushedFrontier() {
   return accumulated;
 }
 
+UserFrontierPtr DBImpl::CalcMemTableFrontier(UpdateUserValueType frontier_type) {
+  InstrumentedMutexLock l(&mutex_);
+  auto cfd = default_cf_handle_->cfd();
+  return cfd->imm()->GetFrontier(cfd->mem()->GetFrontier(frontier_type), frontier_type);
+}
+
 UserFrontierPtr DBImpl::GetMutableMemTableFrontier(UpdateUserValueType type) {
   InstrumentedMutexLock l(&mutex_);
   UserFrontierPtr accumulated;
@@ -6143,8 +6146,7 @@ Status DBImpl::CheckConsistency() {
 
   std::string corruption_messages;
   for (const auto& md : metadata) {
-    // md.name has a leading "/".
-    std::string base_file_path = md.db_path + md.name;
+    std::string base_file_path = md.FullName();
     uint64_t base_fsize = 0;
     Status s = env_->GetFileSize(base_file_path, &base_fsize);
     if (!s.ok() &&
@@ -6153,7 +6155,7 @@ Status DBImpl::CheckConsistency() {
     }
     if (!s.ok()) {
       corruption_messages +=
-          "Can't access " + md.name + ": " + s.ToString() + "\n";
+          "Can't access " + md.Name() + ": " + s.ToString() + "\n";
     } else if (base_fsize != md.base_size) {
       corruption_messages += "Sst base file size mismatch: " + base_file_path +
                              ". Size recorded in manifest " +
@@ -6167,7 +6169,7 @@ Status DBImpl::CheckConsistency() {
       const uint64_t md_data_size = md.total_size - md.base_size;
       if (!s.ok()) {
         corruption_messages +=
-            "Can't access " + TableBaseToDataFileName(md.name) + ": " + s.ToString() + "\n";
+            "Can't access " + data_file_path + ": " + s.ToString() + "\n";
       } else if (data_fsize != md_data_size) {
         corruption_messages += "Sst data file size mismatch: " + data_file_path +
             ". Data size based on total and base size recorded in manifest " +

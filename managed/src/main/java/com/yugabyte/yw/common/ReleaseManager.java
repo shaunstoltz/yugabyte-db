@@ -5,6 +5,8 @@ import static java.nio.file.StandardCopyOption.REPLACE_EXISTING;
 
 import com.google.inject.Inject;
 import com.yugabyte.yw.cloud.PublicCloudConstants.Architecture;
+import com.yugabyte.yw.common.gflags.GFlagsValidation;
+import com.yugabyte.yw.common.utils.FileUtils;
 import com.yugabyte.yw.forms.ReleaseFormData;
 import com.yugabyte.yw.models.Region;
 import com.yugabyte.yw.models.Universe;
@@ -22,8 +24,10 @@ import java.nio.file.Paths;
 import java.util.ArrayList;
 import java.util.Collections;
 import java.util.HashMap;
+import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
+import java.util.Set;
 import java.util.function.Predicate;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
@@ -43,6 +47,8 @@ public class ReleaseManager {
   @Inject ConfigHelper configHelper;
 
   @Inject Configuration appConfig;
+
+  @Inject GFlagsValidation gFlagsValidation;
 
   public enum ReleaseState {
     ACTIVE,
@@ -93,7 +99,9 @@ public class ReleaseManager {
     public static class PackagePaths {
       @ApiModelProperty(value = "Path to x86_64 package")
       @Constraints.Pattern(
-          message = "Must be prefixed with s3://, gs://, or http(s)://",
+          message =
+              "File path must be prefixed with s3://, gs://, or http(s)://,"
+                  + " and must contain path to package file, instead of a directory",
           value = "\\b(?:(https|s3|gs):\\/\\/).+\\b")
       public String x86_64;
 
@@ -248,21 +256,44 @@ public class ReleaseManager {
   // This regex needs to support old style packages with -ee as well as new style packages without.
   // There are previously existing YW deployments that will have the old packages and users will
   // need to still be able to use said universes and their existing YB releases.
-  final Pattern ybPackagePattern =
-      Pattern.compile("[^.]+yugabyte-(?:ee-)?(.*)-(alma|centos)(.*).tar.gz");
+  static final Pattern ybPackagePattern =
+      Pattern.compile("yugabyte-(?:ee-)?(.*)-(alma|centos)(.*).tar.gz");
 
-  final Pattern ybHelmChartPattern = Pattern.compile("[^.]+yugabyte-(.*)-helm.tar.gz");
+  final Pattern ybHelmChartPattern = Pattern.compile("yugabyte-(.*)-helm.tar.gz");
 
-  public Map<String, String> getReleaseFiles(String releasesPath, Predicate<Path> fileFilter) {
+  static final Pattern ybVersionPattern =
+      Pattern.compile("(.*)(\\d+.\\d+.\\d+(.\\d+)?)(-(b(\\d+)|(\\w+)))?(.*)");
+
+  private static final Pattern ybcPackagePattern =
+      Pattern.compile("[^.]+ybc-(?:ee-)?(.*)-(linux|el8)(.*).tar.gz");
+
+  public Map<String, String> getReleaseFiles(
+      String releasesPath, Predicate<Path> fileFilter, boolean ybcRelease) {
     Map<String, String> fileMap = new HashMap<>();
+    Set<String> duplicateKeys = new HashSet<>();
     try {
-      fileMap =
-          Files.walk(Paths.get(releasesPath))
-              .filter(fileFilter)
-              .collect(
-                  Collectors.toMap(
-                      p -> p.getName(p.getNameCount() - 2).toString(),
-                      p -> p.toAbsolutePath().toString()));
+      Files.walk(Paths.get(releasesPath))
+          .filter(fileFilter)
+          .forEach(
+              p -> {
+                // In case of ybc release, we want to store osType, archType in version key.
+                String key =
+                    ybcRelease
+                        ? StringUtils.removeEnd(
+                            p.getName(p.getNameCount() - 1).toString(), ".tar.gz")
+                        : p.getName(p.getNameCount() - 2).toString();
+                String value = p.toAbsolutePath().toString();
+                if (!fileMap.containsKey(key)) {
+                  fileMap.put(key, value);
+                } else if (!duplicateKeys.contains(key)) {
+                  LOG.warn(
+                      String.format(
+                          "Skipping %s - it contains multiple releases of same architecture type",
+                          key));
+                  duplicateKeys.add(key);
+                }
+              });
+      duplicateKeys.forEach(k -> fileMap.remove(k));
     } catch (IOException e) {
       LOG.error(e.getMessage());
     }
@@ -289,17 +320,31 @@ public class ReleaseManager {
 
   public Map<String, ReleaseMetadata> getLocalReleases(String releasesPath) {
     Map<String, String> releaseFiles;
-    Map<String, String> releaseCharts = getReleaseFiles(releasesPath, ybChartFilter);
+    Map<String, String> releaseCharts = getReleaseFiles(releasesPath, ybChartFilter, false);
     Map<String, ReleaseMetadata> localReleases = new HashMap<>();
     for (Architecture arch : Architecture.values()) {
-      releaseFiles = getReleaseFiles(releasesPath, getPackageFilter(arch.getGlob()));
+      releaseFiles = getReleaseFiles(releasesPath, getPackageFilter(arch.getDBGlob()), false);
       updateLocalReleases(localReleases, releaseFiles, releaseCharts, arch);
     }
     return localReleases;
   }
 
+  public Map<String, ReleaseMetadata> getLocalYbcReleases(String releasesPath) {
+    Map<String, String> releaseFiles;
+    Map<String, ReleaseMetadata> localReleases = new HashMap<>();
+    for (Architecture arch : Architecture.values()) {
+      releaseFiles = getReleaseFiles(releasesPath, getPackageFilter(arch.getYbcGlob()), true);
+      updateLocalReleases(localReleases, releaseFiles, new HashMap<>(), arch);
+    }
+    return localReleases;
+  }
+
   public Map<String, Object> getReleaseMetadata() {
-    Map<String, Object> releases = configHelper.getConfig(CONFIG_TYPE);
+    return getReleaseMetadata(CONFIG_TYPE);
+  }
+
+  public Map<String, Object> getReleaseMetadata(ConfigHelper.ConfigType configType) {
+    Map<String, Object> releases = configHelper.getConfig(configType);
     if (releases == null || releases.isEmpty()) {
       LOG.debug("getReleaseMetadata: No releases found");
       return new HashMap<>();
@@ -317,7 +362,19 @@ public class ReleaseManager {
   public static Map<String, ReleaseMetadata> formDataToReleaseMetadata(
       List<ReleaseFormData> versionDataList) {
 
-    // Input validation
+    // Input validation - Note that input version must be in the correct format because a UI
+    // exception is thrown otherwise - make use of this to check package naming convention.
+
+    // Validating release names requires three checks:
+    // 1. Proper formatting of the .tar.gz package name (yugabyte-(centos|alma).tar.gz).
+    // 2. Proper formatting of the DB version in the .tar.gz package name.
+    // 3. Equality of the DB version in the .tar.gz package name with the
+    // DB version specified in the Version field.
+
+    // We create regexes to check for the first two conditions, and use contains to
+    // check for the last condition. A runtime exception is thrown if any condition is not met
+    // to validate release names.
+
     for (ReleaseFormData versionData : versionDataList) {
       if (versionData.version == null) {
         throw new RuntimeException("Version is not specified");
@@ -340,6 +397,32 @@ public class ReleaseManager {
         if (!versionData.s3.paths.x86_64.startsWith("s3://")) {
           throw new RuntimeException("S3 path should be prefixed with s3://");
         }
+
+        String packageName =
+            versionData
+                .s3
+                .paths
+                .x86_64
+                .split("/")[(versionData.s3.paths.x86_64.split("/")).length - 1];
+
+        Matcher packagePatternMatcher = ybPackagePattern.matcher(packageName);
+
+        Matcher versionPatternMatcher = ybVersionPattern.matcher(packageName);
+
+        if (!packagePatternMatcher.find()) {
+
+          throw new RuntimeException(
+              "The package name of the .tar.gz file is improperly formatted. Please"
+                  + " check to make sure that you have typed in the package name correctly.");
+        }
+
+        if (!versionPatternMatcher.find()) {
+
+          throw new RuntimeException(
+              "The version of DB in your package name is improperly formatted. Please"
+                  + " check to make sure that you have typed in the DB version correctly"
+                  + " in the package name.");
+        }
       }
 
       if (versionData.gcs != null) {
@@ -352,6 +435,32 @@ public class ReleaseManager {
         }
         if (!versionData.gcs.paths.x86_64.startsWith("gs://")) {
           throw new RuntimeException("GCS path should be prefixed with gs://");
+        }
+
+        String packageName =
+            versionData
+                .gcs
+                .paths
+                .x86_64
+                .split("/")[(versionData.gcs.paths.x86_64.split("/")).length - 1];
+
+        Matcher packagePatternMatcher = ybPackagePattern.matcher(packageName);
+
+        Matcher versionPatternMatcher = ybVersionPattern.matcher(packageName);
+
+        if (!packagePatternMatcher.find()) {
+
+          throw new RuntimeException(
+              "The package name of the .tar.gz file is improperly formatted. Please"
+                  + " check to make sure that you have typed in the package name correctly.");
+        }
+
+        if (!versionPatternMatcher.find()) {
+
+          throw new RuntimeException(
+              "The version of DB in your package name is improperly formatted. Please"
+                  + " check to make sure that you have typed in the DB version correctly"
+                  + " in the package name.");
         }
       }
 
@@ -418,7 +527,7 @@ public class ReleaseManager {
     if (isPresentLocally) {
       // delete specific release's directory recursively.
       File releaseDirectory = new File(ybReleasesPath, version);
-      if (!Util.deleteDirectory(releaseDirectory)) {
+      if (!FileUtils.deleteDirectory(releaseDirectory)) {
         String errorMsg =
             "Failed to delete release directory: " + releaseDirectory.getAbsolutePath();
         throw new RuntimeException(errorMsg);
@@ -431,17 +540,152 @@ public class ReleaseManager {
     String ybReleasePath = appConfig.getString("yb.docker.release");
     String ybHelmChartPath = appConfig.getString("yb.helm.packagePath");
     if (ybReleasesPath != null && !ybReleasesPath.isEmpty()) {
-      moveFiles(ybReleasePath, ybReleasesPath, ybPackagePattern);
-      moveFiles(ybHelmChartPath, ybReleasesPath, ybHelmChartPattern);
-      Map<String, ReleaseMetadata> localReleases = getLocalReleases(ybReleasesPath);
       Map<String, Object> currentReleases = getReleaseMetadata();
+
+      // Local copy pattern to account for the presence of characters prior to the file name itself.
+      // (ensures that all local releases get imported prior to version checking).
+      Pattern ybPackagePatternCopy =
+          Pattern.compile("[^.]+yugabyte-(?:ee-)?(.*)-(alma|centos)(.*).tar.gz");
+
+      Pattern ybHelmChartPatternCopy = Pattern.compile("[^.]+yugabyte-(.*)-helm.tar.gz");
+
+      copyFiles(ybReleasePath, ybReleasesPath, ybPackagePatternCopy, currentReleases.keySet());
+      copyFiles(ybHelmChartPath, ybReleasesPath, ybHelmChartPatternCopy, currentReleases.keySet());
+      Map<String, ReleaseMetadata> localReleases = getLocalReleases(ybReleasesPath);
       localReleases.keySet().removeAll(currentReleases.keySet());
       LOG.debug("Current releases: [ {} ]", currentReleases.keySet().toString());
       LOG.debug("Local releases: [ {} ]", localReleases.keySet());
+
+      // As described in the diff, we don't touch the currrent releases that have already been
+      // imported. We
+      // perform the same checks that we did in the import dialog case here prior to the import).
+
+      // If there is an error for one release, there is still a possibility that the user has
+      // imported multiple
+      // releases locally, and that the other ones have been named properly. We err on the cautious
+      // side, and
+      // immediately throw a Runtime Exception. The user will be able to import local releases only
+      // if all of
+      // them are properly formatted, and none otherwise.
+
       if (!localReleases.isEmpty()) {
+
+        Pattern ybPackagePatternRequiredInChartPath =
+            Pattern.compile("(.*)yugabyte-(?:ee-)?(.*)-(helm)(.*).tar.gz");
+
+        Pattern ybVersionPatternRequired =
+            Pattern.compile("^(\\d+.\\d+.\\d+(.\\d+)?)(-(b(\\d+)|(\\w+)))?$");
+
+        for (String version : localReleases.keySet()) {
+
+          String associatedFilePath = localReleases.get(version).filePath;
+
+          String associatedChartPath = localReleases.get(version).chartPath;
+
+          String filePackageName =
+              associatedFilePath.split("/")[(associatedFilePath.split("/")).length - 1];
+
+          String chartPackageName =
+              associatedChartPath.split("/")[(associatedChartPath.split("/")).length - 1];
+
+          Matcher versionPatternMatcher = ybVersionPatternRequired.matcher(version);
+
+          Matcher packagePatternFileMatcher = ybPackagePattern.matcher(filePackageName);
+
+          Matcher packagePatternChartMatcher =
+              ybPackagePatternRequiredInChartPath.matcher(chartPackageName);
+
+          Matcher versionPatternMatcherInPackageNameFilePath =
+              ybVersionPattern.matcher(filePackageName);
+
+          Matcher versionPatternMatcherInPackageNameChartPath =
+              ybVersionPattern.matcher(chartPackageName);
+
+          if (!versionPatternMatcher.find()) {
+
+            throw new RuntimeException(
+                "The version name in the folder of the imported local release is improperly "
+                    + "formatted. Please check to make sure that the folder with the version name "
+                    + "is named correctly.");
+          }
+
+          if (!versionPatternMatcherInPackageNameFilePath.find()) {
+
+            throw new RuntimeException(
+                "In the file path, the version of DB in your package name in the imported "
+                    + "local release is improperly formatted. Please "
+                    + " check to make sure that you have named the .tar.gz file with "
+                    + " the appropriate DB version.");
+          }
+
+          if (!filePackageName.contains(version)) {
+
+            throw new RuntimeException(
+                "The version of DB that you have specified in the folder name in the "
+                    + "imported local release does not match the version of DB in the "
+                    + "package name in the imported local release (specifed through the "
+                    + "file path). Please make sure that you have named the directory and "
+                    + ".tar.gz file appropriately so that the DB version in the package "
+                    + "name matches the DB version in the folder name.");
+          }
+
+          if (!associatedChartPath.equals("")) {
+
+            if (!versionPatternMatcherInPackageNameChartPath.find()) {
+
+              throw new RuntimeException(
+                  "In the chart path, the version of DB in your package name in the imported "
+                      + "local release is improperly formatted. Please "
+                      + " check to make sure that you have named the .tar.gz file with "
+                      + " the appropriate DB version.");
+            }
+
+            if (!chartPackageName.contains(version)) {
+
+              throw new RuntimeException(
+                  "The version of DB that you have specified in the folder name in the "
+                      + "imported local release does not match the version of DB in the "
+                      + "package name in the imported local release (specifed through the "
+                      + "chart path). Please make sure that you have named the directory and "
+                      + ".tar.gz file appropriately so that the DB version in the package "
+                      + "name matches the DB version in the folder name.");
+            }
+          }
+        }
         LOG.info("Importing local releases: [ {} ]", Json.toJson(localReleases));
         localReleases.forEach(currentReleases::put);
         configHelper.loadConfigToDB(ConfigHelper.ConfigType.SoftwareReleases, currentReleases);
+      }
+    }
+
+    LOG.info("Starting ybc local releases");
+    String ybcReleasesPath = appConfig.getString("ybc.releases.path");
+    String ybcReleasePath = appConfig.getString("ybc.docker.release");
+    LOG.info("ybcReleasesPath: " + ybcReleasesPath);
+    LOG.info("ybcReleasePath: " + ybcReleasePath);
+    if (ybcReleasesPath != null && !ybcReleasesPath.isEmpty()) {
+      Map<String, Object> currentYbcReleases =
+          getReleaseMetadata(ConfigHelper.ConfigType.YbcSoftwareReleases);
+      File ybcReleasePathFile = new File(ybcReleasePath);
+      File ybcReleasesPathFile = new File(ybcReleasesPath);
+      if (ybcReleasePathFile.exists() && ybcReleasesPathFile.exists()) {
+        // No need to skip copying packages as we want to allow multiple arch type of a ybc-version.
+        copyFiles(ybcReleasePath, ybcReleasesPath, ybcPackagePattern, null);
+        Map<String, ReleaseMetadata> localYbcReleases = getLocalYbcReleases(ybcReleasesPath);
+        localYbcReleases.keySet().removeAll(currentYbcReleases.keySet());
+        LOG.info("Current ybc releases: [ {} ]", currentYbcReleases.keySet().toString());
+        LOG.info("Local ybc releases: [ {} ]", localYbcReleases.keySet().toString());
+        if (!localYbcReleases.isEmpty()) {
+          LOG.info("Importing local releases: [ {} ]", Json.toJson(localYbcReleases));
+          currentYbcReleases.putAll(localYbcReleases);
+          configHelper.loadConfigToDB(
+              ConfigHelper.ConfigType.YbcSoftwareReleases, currentYbcReleases);
+        }
+      } else {
+        LOG.warn(
+            "ybc release dir: {} and/or ybc releases dir: {} not present",
+            ybcReleasePath,
+            ybcReleasesPath);
       }
     }
   }
@@ -464,7 +708,7 @@ public class ReleaseManager {
             }
             if (fp != null) {
               for (Architecture arch : Architecture.values()) {
-                if (getPathMatcher(arch.getGlob()).matches(fp)) {
+                if (getPathMatcher(arch.getDBGlob()).matches(fp)) {
                   rm.packages = new ArrayList<>();
                   rm = rm.withPackage(rm.filePath, arch);
                 }
@@ -475,9 +719,42 @@ public class ReleaseManager {
                   "Could not match any available architectures to existing release {}", version);
             }
           }
+          // Add GFlags file if not present already for active and local releases.
+          if (rm.state.equals(ReleaseState.ACTIVE) && isLocalRelease(rm)) {
+            addGFlagsMetadataFiles(version, rm);
+          }
           updatedReleases.put(version, rm);
         });
     configHelper.loadConfigToDB(ConfigHelper.ConfigType.SoftwareReleases, updatedReleases);
+  }
+
+  public void addGFlagsMetadataFiles(String version, ReleaseMetadata releaseMetadata) {
+    List<String> missingGFlagsFilesList = gFlagsValidation.getMissingGFlagFileList(version);
+    if (missingGFlagsFilesList.size() != 0) {
+      // fetch db tar package location.
+      String dbTarPackagePath = getDBTarPackagePath(releaseMetadata);
+      if (!StringUtils.isEmpty(dbTarPackagePath) && Files.exists(Paths.get(dbTarPackagePath))) {
+        gFlagsValidation.fetchGFlagsFromDBPackage(
+            dbTarPackagePath, version, missingGFlagsFilesList);
+      } else {
+        LOG.error(
+            "Could not add gFlags metadata as DB tar package is missing for the version: {}.",
+            version);
+      }
+    }
+  }
+
+  private String getDBTarPackagePath(ReleaseMetadata rm) {
+    if (rm.s3 != null) {
+      // TODO(@vipul-yb): download the package in tmp diretory and delete it after it's use
+    } else if (rm.gcs != null) {
+      // TODO(@vipul-yb): download the package in tmp diretory and delete it after it's use
+    } else if (rm.http != null) {
+      // TODO(@vipul-yb): download the package in tmp diretory and delete it after it's use
+    } else {
+      return rm.filePath;
+    }
+    return StringUtils.EMPTY;
   }
 
   public synchronized void updateReleaseMetadata(String version, ReleaseMetadata newData) {
@@ -489,13 +766,16 @@ public class ReleaseManager {
   }
 
   /**
-   * This method moves files that match a specific regex to a destination directory.
+   * This method copies release files that match a specific regex to a destination directory.
    *
    * @param sourceDir (str): Source directory to move files from
    * @param destinationDir (str): Destination directory to move files to
    * @param fileRegex (str): Regular expression specifying files to move
+   * @param skipVersions : Set of versions to ignore while copying. version is the first matching
+   *     group from fileRegex
    */
-  private static void moveFiles(String sourceDir, String destinationDir, Pattern fileRegex) {
+  private static void copyFiles(
+      String sourceDir, String destinationDir, Pattern fileRegex, Set<String> skipVersions) {
     if (sourceDir == null || sourceDir.isEmpty()) {
       return;
     }
@@ -507,17 +787,22 @@ public class ReleaseManager {
           .filter(Matcher::matches)
           .forEach(
               match -> {
+                String version = match.group(1);
+                if (skipVersions != null && skipVersions.contains(version)) {
+                  LOG.debug("Skipping re-copy of release files for {}", version);
+                  return;
+                }
                 File releaseFile = new File(match.group());
-                File destinationFolder = new File(destinationDir, match.group(1));
+                File destinationFolder = new File(destinationDir, version);
                 File destinationFile = new File(destinationFolder, releaseFile.getName());
                 if (!destinationFolder.exists()) {
                   destinationFolder.mkdir();
                 }
                 try {
-                  Files.move(releaseFile.toPath(), destinationFile.toPath(), REPLACE_EXISTING);
+                  Files.copy(releaseFile.toPath(), destinationFile.toPath(), REPLACE_EXISTING);
                 } catch (IOException e) {
                   throw new RuntimeException(
-                      "Unable to move release file "
+                      "Unable to copy release file "
                           + releaseFile.toPath()
                           + " to "
                           + destinationFile);
@@ -537,6 +822,15 @@ public class ReleaseManager {
     return metadataFromObject(metadata);
   }
 
+  public ReleaseMetadata getYbcReleaseByVersion(String version, String osType, String archType) {
+    version = String.format("ybc-%s-%s-%s", version, osType, archType);
+    Object metadata = getReleaseMetadata(ConfigHelper.ConfigType.YbcSoftwareReleases).get(version);
+    if (metadata == null) {
+      return null;
+    }
+    return metadataFromObject(metadata);
+  }
+
   public ReleaseMetadata metadataFromObject(Object object) {
     return Json.fromJson(Json.toJson(object), ReleaseMetadata.class);
   }
@@ -547,5 +841,9 @@ public class ReleaseManager {
 
   public boolean getInUse(String version) {
     return Universe.existsRelease(version);
+  }
+
+  private boolean isLocalRelease(ReleaseMetadata rm) {
+    return !(rm.s3 != null || rm.gcs != null || rm.http != null);
   }
 }

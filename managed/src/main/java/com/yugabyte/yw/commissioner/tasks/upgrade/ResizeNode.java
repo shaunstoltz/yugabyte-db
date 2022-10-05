@@ -7,21 +7,21 @@ import com.yugabyte.yw.commissioner.TaskExecutor.SubTaskGroup;
 import com.yugabyte.yw.commissioner.UpgradeTaskBase;
 import com.yugabyte.yw.commissioner.UserTaskDetails;
 import com.yugabyte.yw.commissioner.tasks.subtasks.ChangeInstanceType;
-import com.yugabyte.yw.commissioner.tasks.subtasks.UpdateNodeDetails;
 import com.yugabyte.yw.forms.ResizeNodeParams;
 import com.yugabyte.yw.forms.UniverseDefinitionTaskParams;
 import com.yugabyte.yw.models.Universe;
 import com.yugabyte.yw.models.helpers.DeviceInfo;
 import com.yugabyte.yw.models.helpers.NodeDetails;
+import java.util.ArrayList;
 import java.util.Collection;
-import java.util.HashSet;
+import java.util.Collections;
+import java.util.HashMap;
+import java.util.LinkedHashSet;
 import java.util.List;
-import java.util.Objects;
-import java.util.Set;
+import java.util.Map;
 import java.util.stream.Collectors;
 import javax.inject.Inject;
 import lombok.extern.slf4j.Slf4j;
-import org.apache.commons.lang3.tuple.Pair;
 
 @Slf4j
 public class ResizeNode extends UpgradeTaskBase {
@@ -53,74 +53,153 @@ public class ResizeNode extends UpgradeTaskBase {
           Universe universe = getUniverse();
           // Verify the request params and fail if invalid.
           taskParams().verifyParams(universe);
-          Pair<List<NodeDetails>, List<NodeDetails>> nodes = fetchNodesForCluster();
-          // Create task sequence to resize nodes.
-          final UniverseDefinitionTaskParams.UserIntent userIntent =
-              taskParams().getPrimaryCluster().userIntent;
-          String newInstanceType = userIntent.instanceType;
-          UniverseDefinitionTaskParams.UserIntent currentIntent =
-              universe.getUniverseDetails().getPrimaryCluster().userIntent;
+          LinkedHashSet<NodeDetails> allNodes = fetchNodesForCluster();
+          // Create task sequence to resize allNodes.
+          for (UniverseDefinitionTaskParams.Cluster cluster : taskParams().clusters) {
+            LinkedHashSet<NodeDetails> clusterNodes =
+                allNodes
+                    .stream()
+                    .filter(n -> cluster.uuid.equals(n.placementUuid))
+                    .collect(Collectors.toCollection(LinkedHashSet::new));
 
-          final boolean instanceTypeIsChanging =
-              !Objects.equals(
-                      newInstanceType,
-                      universe.getUniverseDetails().getPrimaryCluster().userIntent.instanceType)
-                  || taskParams().isForceResizeNode();
+            final UniverseDefinitionTaskParams.UserIntent userIntent = cluster.userIntent;
 
-          if (instanceTypeIsChanging) {
-            Set<NodeDetails> nodez = new HashSet<>(nodes.getLeft());
-            nodez.addAll(nodes.getRight());
-            createPreResizeNodeTasks(nodez, currentIntent.instanceType, currentIntent.deviceInfo);
+            UniverseDefinitionTaskParams.UserIntent currentIntent =
+                universe.getUniverseDetails().getClusterByUuid(cluster.uuid).userIntent;
+
+            List<NodeDetails> justDeviceResizeNodes = new ArrayList<>();
+            LinkedHashSet<NodeDetails> instanceChangingNodes = new LinkedHashSet<>();
+            for (NodeDetails node : clusterNodes) {
+              if (isInstanceChanging(node, userIntent)) {
+                instanceChangingNodes.add(node);
+              } else if (isDeviceResizing(node, userIntent, currentIntent)) {
+                justDeviceResizeNodes.add(node);
+              }
+            }
+            createPreResizeNodeTasks(instanceChangingNodes, currentIntent);
+            createRollingNodesUpgradeTaskFlow(
+                (nodes, processTypes) -> createResizeNodeTasks(nodes, userIntent, currentIntent),
+                instanceChangingNodes,
+                UpgradeContext.builder()
+                    .reconfigureMaster(userIntent.replicationFactor > 1)
+                    .runBeforeStopping(false)
+                    .processInactiveMaster(false)
+                    .postAction(
+                        node -> {
+                          // Persist the new instance type in the node details.
+                          node.cloudInfo.instance_type = userIntent.getInstanceTypeForNode(node);
+                          createNodeDetailsUpdateTask(node, false)
+                              .setSubTaskGroupType(
+                                  UserTaskDetails.SubTaskGroupType.ChangeInstanceType);
+                        })
+                    .build(),
+                taskParams().ybcInstalled);
+            // Only disk resizing, could be done without restarts.
+            createNonRestartUpgradeTaskFlow(
+                (nodes, processTypes) ->
+                    createUpdateDiskSizeTasks(nodes)
+                        .setSubTaskGroupType(UserTaskDetails.SubTaskGroupType.ResizingDisk),
+                justDeviceResizeNodes,
+                ServerType.EITHER,
+                DEFAULT_CONTEXT);
+
+            Integer newDiskSize = null;
+            if (userIntent.deviceInfo != null) {
+              newDiskSize = userIntent.deviceInfo.volumeSize;
+            }
+            Integer newMasterDiskSize = null;
+            if (userIntent.masterDeviceInfo != null) {
+              newMasterDiskSize = userIntent.masterDeviceInfo.volumeSize;
+            }
+            String newInstanceType = userIntent.instanceType;
+            String newMasterInstanceType = userIntent.masterInstanceType;
+            // Persist changes in the universe.
+            createPersistResizeNodeTask(
+                    newInstanceType,
+                    newDiskSize,
+                    newMasterInstanceType,
+                    newMasterDiskSize,
+                    Collections.singletonList(cluster.uuid))
+                .setSubTaskGroupType(UserTaskDetails.SubTaskGroupType.ChangeInstanceType);
           }
-
-          createRollingNodesUpgradeTaskFlow(
-              (nodez, processTypes) ->
-                  createResizeNodeTasks(nodez, universe, instanceTypeIsChanging),
-              nodes,
-              UpgradeContext.builder()
-                  .reconfigureMaster(userIntent.replicationFactor > 1)
-                  .runBeforeStopping(false)
-                  .processInactiveMaster(false)
-                  .build());
-
-          Integer newDiskSize = null;
-          if (taskParams().getPrimaryCluster().userIntent.deviceInfo != null) {
-            newDiskSize = taskParams().getPrimaryCluster().userIntent.deviceInfo.volumeSize;
-          }
-          // Persist changes in the universe.
-          createPersistResizeNodeTask(
-                  newInstanceType,
-                  newDiskSize,
-                  taskParams().clusters.stream().map(c -> c.uuid).collect(Collectors.toList()))
-              .setSubTaskGroupType(UserTaskDetails.SubTaskGroupType.ChangeInstanceType);
         });
   }
 
+  private boolean isInstanceChanging(
+      NodeDetails node, UniverseDefinitionTaskParams.UserIntent newIntent) {
+    if (taskParams().isForceResizeNode()) {
+      return true;
+    }
+    String currentInstanceType = node.cloudInfo.instance_type;
+    return !currentInstanceType.equals(newIntent.getInstanceTypeForNode(node));
+  }
+
+  private boolean isDeviceResizing(
+      NodeDetails node,
+      UniverseDefinitionTaskParams.UserIntent newIntent,
+      UniverseDefinitionTaskParams.UserIntent currentIntent) {
+    if (taskParams().isForceResizeNode()) {
+      return true;
+    }
+    DeviceInfo currentDeviceInfo = currentIntent.getDeviceInfoForNode(node);
+    DeviceInfo newDeviceInfo = newIntent.getDeviceInfoForNode(node);
+    return !currentDeviceInfo.volumeSize.equals(newDeviceInfo.volumeSize);
+  }
+
   private void createPreResizeNodeTasks(
-      Collection<NodeDetails> nodes, String currentInstanceType, DeviceInfo currentDeviceInfo) {
+      Collection<NodeDetails> nodes, UniverseDefinitionTaskParams.UserIntent currentIntent) {
     // Update mounted disks.
     for (NodeDetails node : nodes) {
       if (!node.disksAreMountedByUUID) {
-        createUpdateMountedDisksTask(node, currentInstanceType, currentDeviceInfo)
+        createUpdateMountedDisksTask(
+                node,
+                currentIntent.getInstanceTypeForNode(node),
+                currentIntent.getDeviceInfoForNode(node))
             .setSubTaskGroupType(getTaskSubGroupType());
       }
     }
   }
 
   private void createResizeNodeTasks(
-      List<NodeDetails> nodes, Universe universe, boolean instanceTypeIsChanging) {
+      List<NodeDetails> allNodes,
+      UniverseDefinitionTaskParams.UserIntent newIntent,
+      UniverseDefinitionTaskParams.UserIntent currentIntent) {
+    Map<ServerType, List<NodeDetails>> byServerType = new HashMap<>();
+    if (currentIntent.dedicatedNodes) {
+      byServerType = allNodes.stream().collect(Collectors.groupingBy(n -> n.dedicatedTo));
+    } else {
+      byServerType.put(ServerType.EITHER, allNodes);
+    }
+    byServerType.forEach(
+        (type, nodes) -> {
+          String newInstanceType = newIntent.getInstanceTypeForProcessType(type);
+          DeviceInfo newDeviceInfo = newIntent.getDeviceInfoForProcessType(type);
+          String currentInstanceType = currentIntent.getInstanceTypeForProcessType(type);
+          DeviceInfo currentDeviceInfo = currentIntent.getDeviceInfoForProcessType(type);
+          createResizeNodeTasks(
+              nodes, newInstanceType, newDeviceInfo, currentInstanceType, currentDeviceInfo);
+        });
+  }
 
-    UniverseDefinitionTaskParams.UserIntent currUserIntent =
-        universe.getUniverseDetails().getPrimaryCluster().userIntent;
-
-    Integer currDiskSize = currUserIntent.deviceInfo.volumeSize;
-    String currInstanceType = currUserIntent.instanceType;
+  /**
+   * @param nodes list of nodes that are guaranteed to have the same instance type and device.
+   * @param newInstanceType
+   * @param newDeviceInfo
+   * @param currentInstanceType
+   * @param currentDeviceInfo
+   */
+  private void createResizeNodeTasks(
+      List<NodeDetails> nodes,
+      String newInstanceType,
+      DeviceInfo newDeviceInfo,
+      String currentInstanceType,
+      DeviceInfo currentDeviceInfo) {
+    Integer currDiskSize = currentDeviceInfo.volumeSize;
     // Todo: Add preflight checks here
 
     // Change disk size.
-    DeviceInfo deviceInfo = taskParams().getPrimaryCluster().userIntent.deviceInfo;
-    if (deviceInfo != null) {
-      Integer newDiskSize = deviceInfo.volumeSize;
+    if (newDeviceInfo != null) {
+      Integer newDiskSize = newDeviceInfo.volumeSize;
       // Check if the storage needs to be resized.
       if (taskParams().isForceResizeNode() || !currDiskSize.equals(newDiskSize)) {
         log.info("Resizing disk from {} to {}", currDiskSize, newDiskSize);
@@ -137,29 +216,23 @@ public class ResizeNode extends UpgradeTaskBase {
     }
 
     // Change instance type
-    String newInstanceType = taskParams().getPrimaryCluster().userIntent.instanceType;
-    if (instanceTypeIsChanging) {
+    if (!newInstanceType.equals(currentInstanceType) || taskParams().isForceResizeNode()) {
       for (NodeDetails node : nodes) {
         // Check if the node needs to be resized.
         if (!taskParams().isForceResizeNode()
             && node.cloudInfo.instance_type.equals(newInstanceType)) {
-          log.info("Skipping node {} as its type is already {}", node.nodeName, currInstanceType);
+          log.info("Skipping node {} as its type is already {}", node.nodeName, newInstanceType);
           continue;
         }
 
         // Change the instance type.
-        createChangeInstanceTypeTask(node)
-            .setSubTaskGroupType(UserTaskDetails.SubTaskGroupType.ChangeInstanceType);
-
-        // Persist the new instance type in the node details.
-        node.cloudInfo.instance_type = newInstanceType;
-        createNodeDetailsUpdateTask(node)
+        createChangeInstanceTypeTask(node, newInstanceType)
             .setSubTaskGroupType(UserTaskDetails.SubTaskGroupType.ChangeInstanceType);
       }
     }
   }
 
-  private SubTaskGroup createChangeInstanceTypeTask(NodeDetails node) {
+  private SubTaskGroup createChangeInstanceTypeTask(NodeDetails node, String instanceType) {
     SubTaskGroup subTaskGroup =
         getTaskExecutor().createSubTaskGroup("ChangeInstanceType", executor);
     ChangeInstanceType.Params params = new ChangeInstanceType.Params();
@@ -167,28 +240,11 @@ public class ResizeNode extends UpgradeTaskBase {
     params.nodeName = node.nodeName;
     params.universeUUID = taskParams().universeUUID;
     params.azUuid = node.azUuid;
-    params.instanceType = taskParams().getPrimaryCluster().userIntent.instanceType;
+    params.instanceType = instanceType;
 
     ChangeInstanceType changeInstanceTypeTask = createTask(ChangeInstanceType.class);
     changeInstanceTypeTask.initialize(params);
     subTaskGroup.addSubTask(changeInstanceTypeTask);
-    getRunnableTask().addSubTaskGroup(subTaskGroup);
-    return subTaskGroup;
-  }
-
-  private SubTaskGroup createNodeDetailsUpdateTask(NodeDetails node) {
-    SubTaskGroup subTaskGroup = getTaskExecutor().createSubTaskGroup("UpdateNodeDetails", executor);
-    UpdateNodeDetails.Params updateNodeDetailsParams = new UpdateNodeDetails.Params();
-    updateNodeDetailsParams.universeUUID = taskParams().universeUUID;
-    updateNodeDetailsParams.azUuid = node.azUuid;
-    updateNodeDetailsParams.nodeName = node.nodeName;
-    updateNodeDetailsParams.details = node;
-    updateNodeDetailsParams.updateCustomImageUsage = false;
-
-    UpdateNodeDetails updateNodeTask = createTask(UpdateNodeDetails.class);
-    updateNodeTask.initialize(updateNodeDetailsParams);
-    updateNodeTask.setUserTaskUUID(userTaskUUID);
-    subTaskGroup.addSubTask(updateNodeTask);
     getRunnableTask().addSubTaskGroup(subTaskGroup);
     return subTaskGroup;
   }

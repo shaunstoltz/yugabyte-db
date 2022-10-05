@@ -3,6 +3,7 @@
 import React, { Component, Fragment } from 'react';
 import { connect } from 'react-redux';
 import { Row, Col } from 'react-bootstrap';
+import { toast } from 'react-toastify';
 import { YBButton, YBAddRowButton, YBToggle, YBNumericInput } from '../../../common/forms/fields';
 import {
   YBTextInputWithLabel,
@@ -16,6 +17,8 @@ import { YBLoading } from '../../../common/indicators';
 import { isNonEmptyObject, isNonEmptyString, trimString } from '../../../../utils/ObjectUtils';
 import { reduxForm, FieldArray } from 'redux-form';
 import { FlexContainer, FlexGrow, FlexShrink } from '../../../common/flexbox/YBFlexBox';
+import { NTPConfig, NTP_TYPES } from './NTPConfig';
+import { specialChars } from '../../constants';
 
 const validationIsRequired = (value) => (value && value.trim() !== '' ? undefined : 'Required');
 
@@ -87,7 +90,7 @@ class GCPProviderInitView extends Component {
       providerUUID: '',
       currentProvider: {},
       hostVpcVisible: true,
-      networkSetupType: 'new_vpc',
+      networkSetupType: 'existing_vpc',
       credentialInputType: 'upload_service_account_json'
     };
     this.hostVpcToggled = this.hostVpcToggled.bind(this);
@@ -97,6 +100,11 @@ class GCPProviderInitView extends Component {
     const self = this;
     const gcpCreateConfig = {};
     const perRegionMetadata = {};
+    const ntpConfig = {
+      setUpChrony: vals['setUpChrony'],
+      showSetUpChrony: vals['setUpChrony'],
+      ntpServers: vals['ntpServers']
+    }
     if (isNonEmptyString(vals.destVpcId)) {
       gcpCreateConfig['network'] = vals.destVpcId;
       gcpCreateConfig['use_host_vpc'] = true;
@@ -120,7 +128,7 @@ class GCPProviderInitView extends Component {
     const configText = vals.gcpConfig;
     if (vals.credential_input === 'local_service_account') {
       gcpCreateConfig['use_host_credentials'] = true;
-      return self.props.createGCPProvider(providerName, gcpCreateConfig, perRegionMetadata);
+      return self.props.createGCPProvider(providerName, gcpCreateConfig, perRegionMetadata, ntpConfig);
     } else if (
       vals.credential_input === 'upload_service_account_json' &&
       isNonEmptyObject(configText)
@@ -132,13 +140,16 @@ class GCPProviderInitView extends Component {
       reader.onloadend = function () {
         try {
           gcpCreateConfig['config_file_contents'] = JSON.parse(reader.result);
+          return self.props.createGCPProvider(providerName, gcpCreateConfig, perRegionMetadata, ntpConfig);
         } catch (e) {
-          self.setState({ error: 'Invalid GCP config JSON file' });
+          toast.error('Invalid GCP config JSON file');
         }
-        return self.props.createGCPProvider(providerName, gcpCreateConfig, perRegionMetadata);
+        return null;
       };
     } else {
-      this.setState({ error: 'GCP Config JSON is required' });
+      // TODO: This scenario is not possible as one value in dropdown is selected by default
+      // May we need to remove this
+      toast.error('GCP Config JSON is required');
     }
   };
 
@@ -185,7 +196,7 @@ class GCPProviderInitView extends Component {
     }
     const network_setup_options = [
       <option key={1} value={'new_vpc'}>
-        {'Create a new VPC'}
+        {'Create a new VPC (Beta)'}
       </option>,
       <option key={2} value={'existing_vpc'}>
         {'Specify an existing VPC'}
@@ -350,8 +361,17 @@ class GCPProviderInitView extends Component {
                 {gcpProjectField}
                 {destVpcField}
                 {regionInput}
+              <Row>
+                <Col lg={3}>
+                  <div className="form-item-custom-label">NTP Setup</div>
+                </Col>
+                <Col lg={7}>
+                  <NTPConfig onChange={this.updateFormField} hideHelp={true}/>
+                </Col>
+              </Row>
               </Col>
             </Row>
+
           </div>
           <div className="form-action-button-container">
             <YBButton
@@ -380,6 +400,12 @@ const validate = (values) => {
   if (!isNonEmptyString(values.accountName)) {
     errors.accountName = 'Account Name is Required';
   }
+  else {
+    if(!specialChars.test(values.accountName)){
+      errors.accountName = 'Account Name cannot have special characters except - and _';
+    }
+  }
+  
   if (!isNonEmptyObject(values.gcpConfig)) {
     errors.gcpConfig = 'Provider Config is Required';
   }
@@ -391,6 +417,9 @@ const validate = (values) => {
       errors.destVpcId = 'VPC Network Name is Required';
     }
   }
+  if(values.ntp_option === NTP_TYPES.MANUAL && values.ntpServers.length === 0){
+    errors.ntpServers = 'NTP servers cannot be empty'
+  }
   return errors;
 };
 
@@ -400,7 +429,10 @@ function mapStateToProps(state) {
       accountName: '',
       credential_input: 'upload_service_account_json',
       airGapInstall: false,
-      network_setup: 'new_vpc'
+      network_setup: 'existing_vpc',
+      ntp_option: NTP_TYPES.PROVIDER,
+      ntpServers: [],
+      setUpChrony: true
     }
   };
 }
@@ -411,6 +443,7 @@ export default connect(
 )(
   reduxForm({
     form: 'gcpProviderConfigForm',
-    validate
+    validate,
+    touchOnChange: true
   })(GCPProviderInitView)
 );

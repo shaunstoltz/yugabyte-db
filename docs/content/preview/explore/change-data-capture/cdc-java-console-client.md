@@ -6,12 +6,20 @@ description: Use the CDC console client to learn how CDC works.
 beta: /preview/faq/general/#what-is-the-definition-of-the-beta-feature-tag
 menu:
   preview:
-    parent: change-data-capture
+    parent: explore-change-data-capture
     identifier: cdc-java-console-client
     weight: 580
-isTocNested: true
-showAsideToc: true
+type: docs
 ---
+
+<ul class="nav nav-tabs-alt nav-tabs-yb">
+  <li>
+    <a href="../cdc-java-console-client/" class="nav-link active">
+      <i class="icon-postgres" aria-hidden="true"></i>
+      YSQL
+    </a>
+  </li>
+</ul>
 
 The Java console client for CDC prints CDC changes to the console. This client is meant **for testing purposes only**.
 
@@ -33,7 +41,6 @@ This can be done either locally using yugabyted or via YugabyteDB Managed. Refer
 
 1. Once connected, create a database.
 
-    \
     You can use any database, as long as you have the permission for it. In this example, you create `testdatabase`.
 
     ```sql
@@ -44,8 +51,7 @@ This can be done either locally using yugabyted or via YugabyteDB Managed. Refer
 
 1. Create a CDC stream.
 
-    \
-    Use the `create_change_data_stream` command to create a stream. For a full list of CDC commands, see the [yb-admin](../../../admin/yb-admin/#change-data-capture-cdc-commands) page.
+    Use the `create_change_data_stream` command to create a stream.
 
     ```sh
     ./bin/yb-admin create_change_data_stream ysql.yugabyte
@@ -55,11 +61,12 @@ This can be done either locally using yugabyted or via YugabyteDB Managed. Refer
     CDC Stream ID: 0bb74adc723248d584ce90b856974633
     ```
 
+    For a full list of CDC commands, see [Change Data Capture commands](../../../admin/yb-admin/#change-data-capture-cdc-commands).
+
 ## Run the console client
 
 1. Create a configuration file.
 
-    \
     Create a file called `config.properties`, with the following contents. Replace the `stream.id` value with the CDC stream ID from the previous step.
 
     ```conf
@@ -74,11 +81,13 @@ This can be done either locally using yugabyted or via YugabyteDB Managed. Refer
     master.address=127.0.0.1:7100
     ```
 
-1. Run the Java console client, and you can directly view the changes in your terminal.
+1. Run the Java console client. You can view the database changes in your terminal.
 
     ```bash
     java -jar java/yb-cdc/target/yb-cdc-connector.jar --config_file config.properties
     ```
+
+## Flags
 
 You can also specify the following optional flags:
 

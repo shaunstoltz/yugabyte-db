@@ -50,10 +50,6 @@
 
 namespace yb {
 
-using base::subtle::Acquire_CompareAndSwap;
-using base::subtle::NoBarrier_Load;
-using base::subtle::Release_Store;
-
 // Wrapper around the Google SpinLock class to adapt it to the method names
 // expected by Boost.
 class CAPABILITY("mutex") simple_spinlock {
@@ -97,7 +93,7 @@ struct padded_spinlock : public simple_spinlock {
 
 // Reader-writer lock.
 // This is functionally equivalent to rw_semaphore in rw_semaphore.h, but should be
-// used whenever the lock is expected to only be acquired on a single thread.
+// used whenever the lock is expected to be released on the same thread which acquired it.
 // It adds TSAN annotations which will detect misuse of the lock, but those
 // annotations also assume that the same thread the takes the lock will unlock it.
 //
@@ -254,48 +250,6 @@ class percpu_rwlock {
 
   int n_cpus_;
   padded_lock *locks_;
-};
-
-// Simple implementation of the SharedLock API, which is not available in
-// the standard library until C++14. Defers error checking to the underlying
-// mutex.
-
-template <typename Mutex>
-class shared_lock {
- public:
-  shared_lock()
-      : m_(nullptr) {
-  }
-
-  explicit shared_lock(Mutex& m) // NOLINT
-      : m_(&m) {
-    m_->lock_shared();
-  }
-
-  shared_lock(Mutex& m, std::try_to_lock_t t) // NOLINT
-      : m_(nullptr) {
-    if (m.try_lock_shared()) {
-      m_ = &m;
-    }
-  }
-
-  bool owns_lock() const {
-    return m_;
-  }
-
-  void swap(shared_lock& other) {
-    std::swap(m_, other.m_);
-  }
-
-  ~shared_lock() {
-    if (m_ != nullptr) {
-      m_->unlock_shared();
-    }
-  }
-
- private:
-  Mutex* m_;
-  DISALLOW_COPY_AND_ASSIGN(shared_lock<Mutex>);
 };
 
 template <class Container>

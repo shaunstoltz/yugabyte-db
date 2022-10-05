@@ -11,6 +11,7 @@
 package com.yugabyte.yw.commissioner.tasks;
 
 import com.yugabyte.yw.commissioner.BaseTaskDependencies;
+import com.yugabyte.yw.commissioner.ITask.Retryable;
 import com.yugabyte.yw.commissioner.UserTaskDetails.SubTaskGroupType;
 import com.yugabyte.yw.commissioner.tasks.UniverseDefinitionTaskBase.ServerType;
 import com.yugabyte.yw.commissioner.tasks.params.NodeTaskParams;
@@ -24,6 +25,7 @@ import com.yugabyte.yw.models.helpers.NodeDetails;
 import com.yugabyte.yw.models.helpers.NodeDetails.NodeState;
 import com.yugabyte.yw.models.helpers.PlacementInfo;
 import java.util.Arrays;
+import java.util.Collection;
 import java.util.HashSet;
 import javax.inject.Inject;
 import lombok.extern.slf4j.Slf4j;
@@ -31,6 +33,7 @@ import lombok.extern.slf4j.Slf4j;
 // Allows the removal of a node from a universe. Ensures the task waits for the right set of
 // server data move primitives. And stops using the underlying instance, though YW still owns it.
 @Slf4j
+@Retryable
 public class RemoveNodeFromUniverse extends UniverseTaskBase {
 
   @Inject
@@ -83,15 +86,7 @@ public class RemoveNodeFromUniverse extends UniverseTaskBase {
       createSetNodeStateTask(currentNode, NodeState.Removing)
           .setSubTaskGroupType(SubTaskGroupType.RemovingNode);
 
-      boolean instanceAlive = false;
-      try {
-        instanceAlive = instanceExists(taskParams());
-      } catch (Exception e) {
-        log.info(
-            "Instance {} in universe {} not found, assuming dead",
-            taskParams().nodeName,
-            universe.name);
-      }
+      boolean instanceAlive = instanceExists(taskParams());
 
       if (instanceAlive) {
         // Remove the master on this node from master quorum and update its state from YW DB,
@@ -129,42 +124,46 @@ public class RemoveNodeFromUniverse extends UniverseTaskBase {
       // if node is not reachable so as to avoid cases like 1 node in an 3 node cluster is being
       // removed and we know LoadBalancer will not be able to handle that.
       if (instanceAlive) {
-
+        Collection<NodeDetails> nodesExcludingCurrentNode = new HashSet<>(universe.getNodes());
+        nodesExcludingCurrentNode.remove(currentNode);
         int rfInZone =
             PlacementInfoUtil.getZoneRF(
                 pi,
                 currentNode.cloudInfo.cloud,
                 currentNode.cloudInfo.region,
                 currentNode.cloudInfo.az);
-        long nodesInZone =
+        long nodesActiveInAZExcludingCurrentNode =
             PlacementInfoUtil.getNumActiveTserversInZone(
-                universe.getNodes(),
+                nodesExcludingCurrentNode,
                 currentNode.cloudInfo.cloud,
                 currentNode.cloudInfo.region,
                 currentNode.cloudInfo.az);
 
         if (rfInZone == -1) {
           log.error(
-              "Unexpected placement info in univ {} {} {}", universe.name, rfInZone, nodesInZone);
+              "Unexpected placement info in univ {} {} {}",
+              universe.name,
+              rfInZone,
+              nodesActiveInAZExcludingCurrentNode);
           throw new RuntimeException(
               "Error getting placement info for cluster with node: " + currentNode.nodeName);
         }
 
-        // Perform a data migration and stop the tserver process only if it is reachable.
-        boolean tserverReachable = isTserverAliveOnNode(currentNode, masterAddrs);
-        log.info("Tserver {}, reachable = {}.", currentNode.cloudInfo.private_ip, tserverReachable);
-        if (tserverReachable) {
-          // Since numNodes can never be less, that will mean there is a potential node to move
-          // data to.
-          if (userIntent.numNodes > userIntent.replicationFactor) {
-            // We only want to move data if the number of nodes in the zone are more than the RF
-            // of the zone.
-            if (nodesInZone > rfInZone) {
-              createWaitForDataMoveTask()
-                  .setSubTaskGroupType(SubTaskGroupType.WaitForDataMigration);
-            }
+        // Since numNodes can never be less, that will mean there is a potential node to move
+        // data to.
+        if (userIntent.numNodes > userIntent.replicationFactor) {
+          // We only want to move data if the number of nodes in the zone are more than or equal
+          //  the RF of the zone.
+          // We would like to remove currentNode whether it is in live/stopped state
+          if (nodesActiveInAZExcludingCurrentNode >= rfInZone) {
+            createWaitForDataMoveTask().setSubTaskGroupType(SubTaskGroupType.WaitForDataMigration);
           }
-          createTServerTaskForNode(currentNode, "stop")
+        }
+        createTServerTaskForNode(currentNode, "stop")
+            .setSubTaskGroupType(SubTaskGroupType.StoppingNodeProcesses);
+
+        if (universe.isYbcEnabled()) {
+          createStopYbControllerTasks(new HashSet<>(Arrays.asList(currentNode)))
               .setSubTaskGroupType(SubTaskGroupType.StoppingNodeProcesses);
         }
       }
@@ -173,16 +172,20 @@ public class RemoveNodeFromUniverse extends UniverseTaskBase {
       createUpdateNodeProcessTask(taskParams().nodeName, ServerType.MASTER, false)
           .setSubTaskGroupType(SubTaskGroupType.StoppingNodeProcesses);
 
+      // Update the master addresses on the target universes whose source universe belongs to
+      // this task.
+      createXClusterConfigUpdateMasterAddressesTask();
+
       // Remove its tserver status in DB.
       createUpdateNodeProcessTask(taskParams().nodeName, ServerType.TSERVER, false)
           .setSubTaskGroupType(SubTaskGroupType.StoppingNodeProcesses);
 
-      // Update Node State to Removed
-      createSetNodeStateTask(currentNode, NodeState.Removed)
-          .setSubTaskGroupType(SubTaskGroupType.RemovingNode);
-
       // Update the DNS entry for this universe.
       createDnsManipulationTask(DnsManager.DnsCommandType.Edit, false, userIntent)
+          .setSubTaskGroupType(SubTaskGroupType.RemovingNode);
+
+      // Update Node State to Removed
+      createSetNodeStateTask(currentNode, NodeState.Removed)
           .setSubTaskGroupType(SubTaskGroupType.RemovingNode);
 
       // Mark universe task state to success
@@ -195,16 +198,9 @@ public class RemoveNodeFromUniverse extends UniverseTaskBase {
       hitException = true;
       throw t;
     } finally {
-      try {
-        // Reset the state, on any failure, so that the actions can be retried.
-        if (currentNode != null && hitException) {
-          setNodeState(taskParams().nodeName, currentNode.state);
-        }
-      } finally {
-        // Mark the update of the universe as done. This will allow future edits/updates to the
-        // universe to happen.
-        unlockUniverseForUpdate();
-      }
+      // Mark the update of the universe as done. This will allow future edits/updates to the
+      // universe to happen.
+      unlockUniverseForUpdate();
     }
     log.info("Finished {} task.", getName());
   }

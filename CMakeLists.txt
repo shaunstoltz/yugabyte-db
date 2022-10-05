@@ -74,6 +74,8 @@ endif()
 if(CMAKE_SYSTEM_PROCESSOR STREQUAL "aarch64")
   # Optimize for Graviton on Linux/aarch64 (not mac/arm64)
   ADD_CXX_FLAGS("-march=armv8.2-a+fp16+rcpc+dotprod+crypto")
+  ADD_CXX_FLAGS("-mtune=neoverse-n1")
+  ADD_CXX_FLAGS("-mno-outline-atomics")
 endif()
 
 if (NOT "$ENV{YB_TARGET_ARCH}" STREQUAL "" AND
@@ -92,34 +94,18 @@ endif()
 ADD_CXX_FLAGS("-DROCKSDB_PLATFORM_POSIX")
 ADD_CXX_FLAGS("-DBOOST_ERROR_CODE_HEADER_ONLY")
 
-set(YB_NUM_TESTS "0" CACHE INTERNAL "Number of tests" FORCE)
-set(YB_NUM_INCLUDED_TESTS "0" CACHE INTERNAL "Number of included tests" FORCE)
-set(YB_NUM_EXECUTABLES "0" CACHE INTERNAL "Number of executables" FORCE)
-set(YB_NUM_INCLUDED_EXECUTABLES "0" CACHE INTERNAL "Number of included executables" FORCE)
-set(YB_ALL_DEPS "" CACHE INTERNAL "All dependencies" FORCE)
+# CMake's INTERNAL type of cache variables implies FORCE, overwriting existing entries.
+# https://cmake.org/cmake/help/latest/command/set.html
+set(YB_NUM_TESTS "0" CACHE INTERNAL "Number of tests")
+set(YB_NUM_INCLUDED_TESTS "0" CACHE INTERNAL "Number of included tests")
+set(YB_NUM_EXECUTABLES "0" CACHE INTERNAL "Number of executables")
+set(YB_NUM_INCLUDED_EXECUTABLES "0" CACHE INTERNAL "Number of included executables")
+set(YB_ALL_DEPS "" CACHE INTERNAL "All dependencies")
 
 # This is used to let the add_executable wrapper know if we're adding a test.
-set(YB_ADDING_TEST_EXECUTABLE "FALSE" CACHE INTERNAL "" FORCE)
+set(YB_ADDING_TEST_EXECUTABLE "FALSE" CACHE INTERNAL "")
 
-if(NOT "$ENV{YB_DO_NOT_BUILD_TESTS}" STREQUAL "")
-  if("$ENV{YB_DO_NOT_BUILD_TESTS}" STREQUAL "1")
-    message("YB_DO_NOT_BUILD_TESTS is set to 1, will not build tests")
-    set(BUILD_TESTS OFF)
-  elseif("$ENV{YB_DO_NOT_BUILD_TESTS}" STREQUAL "0")
-    message("YB_DO_NOT_BUILD_TESTS is set to 0, will build tests")
-    set(BUILD_TESTS ON)
-  else()
-    message(FATAL_ERROR
-            "Invalid value of the YB_DO_NOT_BUILD_TESTS environment variable, expected 0 or 1 but "
-            "got '$ENV{YB_DO_NOT_BUILD_TESTS}'.")
-  endif()
-  set(BUILD_TESTS ${BUILD_TESTS} CACHE BOOL "Whether to build tests")
-elseif("$CACHE{BUILD_TESTS}" STREQUAL "")
-  set(BUILD_TESTS ON)
-  message("Will build tests by default")
-else()
-  message("BUILD_TESTS from cache: ${BUILD_TESTS} (set YB_DO_NOT_BUILD_TESTS to 0 or 1 to change)")
-endif()
+yb_disable_tests_if_necessary()
 
 parse_build_root_basename()
 if("${YB_BUILD_TYPE}" STREQUAL "")
@@ -127,6 +113,10 @@ if("${YB_BUILD_TYPE}" STREQUAL "")
 endif()
 
 message("YB_BUILD_TYPE: ${YB_BUILD_TYPE}")
+message("YB_LINKING_TYPE: ${YB_LINKING_TYPE}")
+if("${YB_LINKING_TYPE}" STREQUAL "")
+  message(FATAL_ERROR "YB_LINKING_TYPE is not set")
+endif()
 message("CMAKE_MAKE_PROGRAM: ${CMAKE_MAKE_PROGRAM}")
 
 # CMAKE_LINK_DEPENDS_NO_SHARED prevents prevent re-linking dependents of a shared library when it
@@ -184,34 +174,7 @@ CHECK_YB_COMPILER_PATH(${CMAKE_C_COMPILER})
 message("CMAKE_CXX_COMPILER=${CMAKE_CXX_COMPILER}")
 CHECK_YB_COMPILER_PATH(${CMAKE_CXX_COMPILER})
 
-# Provide a 'latest' symlink to this build directory if the "blessed" multi-build layout is
-# detected:
-#
-# build/
-# build/<first build directory>
-# build/<second build directory>
-# ...
-set(LATEST_BUILD_SYMLINK_PATH "${YB_BUILD_ROOT_PARENT}/latest")
-if (NOT "$ENV{YB_DISABLE_LATEST_SYMLINK}" STREQUAL "1")
-  message("LATEST SYMLINK PATH: ${LATEST_BUILD_SYMLINK_PATH}")
-  if ("${CMAKE_CURRENT_BINARY_DIR}" STREQUAL "${LATEST_BUILD_SYMLINK_PATH}")
-    message(FATAL_ERROR "Should not run cmake inside the build/latest symlink. "
-            "First change directories into the destination of the symlink.")
-  endif()
-
-  # This option is needed in addition to -sf, while linking, to force the link to occur on
-  # directories. Unfortunately, Linux & MacOS differ on the option name.
-  if (NOT APPLE)
-    set(MORE_ARGS "-T")
-  else()
-    set(MORE_ARGS "-h")
-  endif()
-  add_custom_target(latest_symlink ALL
-    "${BUILD_SUPPORT_DIR}/create_latest_symlink.sh"
-    "${CMAKE_CURRENT_BINARY_DIR}"
-    "${LATEST_BUILD_SYMLINK_PATH}"
-    COMMENT "Recreating the 'latest' symlink at '${LATEST_BUILD_SYMLINK_PATH}'")
-endif()
+add_latest_symlink_target()
 
 add_custom_target(dummy_target ALL
   COMMAND cat /dev/null
@@ -242,8 +205,6 @@ if ((NOT "$ENV{NO_REBUILD_THIRDPARTY}" STREQUAL "") OR
 endif()
 
 # -------------------------------------------------------------------------------------------------
-
-INIT_COMPILER_TYPE_FROM_BUILD_ROOT()
 
 include(CompilerInfo)
 
@@ -285,6 +246,9 @@ endif()
 # See http://clang.llvm.org/docs/JSONCompilationDatabase.html
 if (CMAKE_EXPORT_COMPILE_COMMANDS)
   message("CMAKE_EXPORT_COMPILE_COMMANDS is already enabled, will export compile_commands.json.")
+elseif ("${YB_LINKING_TYPE}" MATCHES "^.*-lto$")
+  message("This is an LTO-enabled build, will export compile_commands.json.")
+  set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 elseif ("$ENV{YB_EXPORT_COMPILE_COMMANDS}" STREQUAL "1")
   message("The YB_EXPORT_COMPILE_COMMANDS environment variable is set to 1, will export "
           "compile_commands.json.")
@@ -333,9 +297,6 @@ ADD_CXX_FLAGS("-DROCKSDB_LIB_IO_POSIX")
 ADD_CXX_FLAGS("-DSNAPPY")
 ADD_CXX_FLAGS("-DLZ4")
 ADD_CXX_FLAGS("-DZLIB")
-if ($ENV{YB_COMPILER_TYPE} STREQUAL "zapcc")
-  ADD_CXX_FLAGS("-DYB_ZAPCC")
-endif()
 
 ############################################################
 # Compiler flags
@@ -397,8 +358,7 @@ if(IS_CLANG)
 endif()
 
 if(USING_LINUXBREW AND IS_CLANG)
-  # We only need these when building using clang. If we use Linuxbrew's gcc, it should set the
-  # equivalent of these options automatically.
+  # We are only using Clang with Linuxbrew. We never use Linuxbrew GCC 5 anymore, it is too old.
   ADD_LINKER_FLAGS("-Wl,--dynamic-linker=${LINUXBREW_LIB_DIR}/ld.so")
   ADD_LINKER_FLAGS("--gcc-toolchain=${LINUXBREW_DIR}")
 endif()
@@ -409,6 +369,14 @@ if(IS_GCC)
   # TODO: Subtitute it with '-as-needed' instead to avoid linking with unused library (issue #1495)
   # for reducing pocess start time
   ADD_LINKER_FLAGS("-Wl,-no-as-needed")
+  if ("${COMPILER_VERSION}" MATCHES "^11[.].*$")
+    # To silence these spurious warnings:
+    # https://gist.githubusercontent.com/mbautin/60c7fb897a92b998a111ff38429a1158/raw
+    # https://gist.githubusercontent.com/mbautin/56b95b7a6816ccdf77eaa60f53a7d3ef/raw
+    ADD_CXX_FLAGS("-Wno-array-bounds")
+    ADD_CXX_FLAGS("-Wno-stringop-overflow")
+    ADD_CXX_FLAGS("-Wno-stringop-overread")
+  endif()
 endif()
 
 if(USING_LINUXBREW)
@@ -455,10 +423,6 @@ set(CXX_FLAGS_RELEASE "-O3 -g -DNDEBUG -fno-omit-frame-pointer")
 # optimization level will be changed because in case of multiple -O flags gcc uses the last one.
 set(CMAKE_CXX_FLAGS_DEBUG "")
 set(CMAKE_CXX_FLAGS_RELEASE "")
-
-if (NOT "${YB_USE_LTO}" STREQUAL "")
-  set(CXX_FLAGS_RELEASE "${CXX_FLAGS_RELEASE} flto -fno-use-linker-plugin")
-endif()
 
 set(CXX_FLAGS_PROFILE_GEN "${CXX_FLAGS_RELEASE} -fprofile-generate")
 set(CXX_FLAGS_PROFILE_BUILD "${CXX_FLAGS_RELEASE} -fprofile-use")
@@ -582,6 +546,23 @@ if ("${YB_BUILD_TYPE}" MATCHES "^(asan|tsan)$")
 endif()
 
 set(BUILD_SHARED_LIBS ON)
+if ("${YB_BUILD_TYPE}" STREQUAL "prof_gen")
+  ADD_CXX_FLAGS("-fprofile-instr-generate -DYB_PROFGEN")
+endif ()
+
+if ("${YB_BUILD_TYPE}" STREQUAL "prof_use")
+  if (NOT YB_PGO_DATA_PATH)
+    message (SEND_ERROR "Pgo data path is not set.")
+  endif()
+  ADD_CXX_FLAGS("-fprofile-instr-use=${YB_PGO_DATA_PATH}")
+  # Even with the fresh profile data we might get warnings like
+  # warning: Function control flow change detected (hash mismatch)
+  #    [-Wbackend-plugin]
+  # Silencing it for now.
+  ADD_CXX_FLAGS("-Wno-backend-plugin")
+  ADD_CXX_FLAGS("-Wno-profile-instr-unprofiled")
+  ADD_CXX_FLAGS("-Wno-profile-instr-out-of-date")
+endif ()
 
 # Position independent code is only necessary when producing shared objects.
 ADD_CXX_FLAGS(-fPIC)
@@ -693,6 +674,8 @@ if(IS_CLANG AND NOT "$ENV{YB_CLANG_PREFIX}" STREQUAL "")
   ADD_GLOBAL_RPATH_ENTRY("$ENV{YB_CLANG_PREFIX}/lib")
 endif()
 
+configure_macos_sdk()
+
 # -------------------------------------------------------------------------------------------------
 
 include(YugabyteFindThirdParty)
@@ -715,10 +698,18 @@ set(YB_CMAKE_CXX_EXTRA_FLAGS "-Wextra -Wno-unused-parameter")
 set(CMAKE_C_FLAGS "${CMAKE_CXX_FLAGS}")
 
 # C++-only flags.
+ADD_CXX_FLAGS("-Werror=missing-field-initializers")
+
 if ((IS_GCC) AND
     ("${CMAKE_CXX_COMPILER_VERSION}" VERSION_GREATER_EQUAL "7.0"))
   # Used with GCC 7.
   ADD_CXX_FLAGS("-faligned-new")
+endif()
+
+# -Wsign-compare is enabled for C++ only for GCC with just -Wall, and enabled for both C and C++
+# for GCC and Clang with -Wextra. Remove when -Wextra is enabled for all source code (#9279).
+if (IS_CLANG)
+  ADD_CXX_FLAGS("-Wsign-compare")
 endif()
 
 string (REPLACE "-Werror=non-virtual-dtor" "" CMAKE_C_FLAGS ${CMAKE_C_FLAGS})
@@ -785,6 +776,9 @@ add_subdirectory(src/yb/yql)
 add_subdirectory(src/yb/cdc)
 
 include("${YB_SRC_ROOT}/ent/CMakeLists.txt")
+
+yb_add_lto_target(yb-master)
+yb_add_lto_target(yb-tserver)
 
 # ------------------------------------------------------------------------------------------------
 # Utilities for collecting the dependency graph

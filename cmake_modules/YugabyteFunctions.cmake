@@ -131,33 +131,6 @@ function(DETECT_BREW)
   set(LINUXBREW_LIB_DIR "${LINUXBREW_DIR}/lib" PARENT_SCOPE)
 endfunction()
 
-# Ensures that the YB_COMPILER_TYPE environment variable matches the auto-detected compiler family.
-# Also this sets the convienience variables IS_GCC and IS_CLANG.
-function(INIT_COMPILER_TYPE_FROM_BUILD_ROOT)
-  get_filename_component(BUILD_ROOT_BASENAME "${CMAKE_CURRENT_BINARY_DIR}" NAME)
-
-  if ("$ENV{YB_COMPILER_TYPE}" STREQUAL "")
-    # TODO: deduplicate this.
-    string(REGEX MATCH "^.*-zapcc-.*$" RE_MATCH_RESULT "${BUILD_ROOT_BASENAME}")
-    if (NOT "${RE_MATCH_RESULT}" STREQUAL "")
-      set(ENV{YB_COMPILER_TYPE} "zapcc")
-    else()
-      string(REGEX MATCH "^.*-gcc-.*$" RE_MATCH_RESULT "${BUILD_ROOT_BASENAME}")
-      if (NOT "${RE_MATCH_RESULT}" STREQUAL "")
-        set(ENV{YB_COMPILER_TYPE} "gcc")
-      else()
-        string(REGEX MATCH "^.*-clang-.*$" RE_MATCH_RESULT "${BUILD_ROOT_BASENAME}")
-        if (NOT "${RE_MATCH_RESULT}" STREQUAL "")
-          set(ENV{YB_COMPILER_TYPE} "clang")
-        endif()
-      endif()
-    endif()
-  endif()
-
-  # Make sure we can use $ENV{YB_COMPILER_TYPE} and ${YB_COMPILER_TYPE} interchangeably.
-  SET(YB_COMPILER_TYPE "$ENV{YB_COMPILER_TYPE}" PARENT_SCOPE)
-endfunction()
-
 # Makes sure that we are using a supported compiler family.
 function(EXPECT_COMPILER_TYPE_TO_BE_SET)
   if (NOT DEFINED YB_COMPILER_TYPE OR "${YB_COMPILER_TYPE}" STREQUAL "")
@@ -171,25 +144,19 @@ function(VALIDATE_COMPILER_TYPE)
     set(ENV{YB_COMPILER_TYPE} "${COMPILER_FAMILY}")
   endif()
 
-  if ("$ENV{YB_COMPILER_TYPE}" STREQUAL "zapcc")
-    if (NOT IS_CLANG)
-      message(FATAL_ERROR
-              "Compiler type is zapcc but the compiler family is '${COMPILER_FAMILY}' "
-              "(expected to be clang)")
-    endif()
-  endif()
-
-  if("${YB_COMPILER_TYPE}" MATCHES "^gcc.*$" AND NOT IS_GCC)
+  if(NOT "${YB_COMPILER_TYPE}" MATCHES "^${COMPILER_FAMILY}([0-9]*)$")
     message(FATAL_ERROR
             "Compiler type '${YB_COMPILER_TYPE}' does not match the compiler family "
             "'${COMPILER_FAMILY}'.")
   endif()
 
-  if(("${YB_COMPILER_TYPE}" STREQUAL "gcc8" AND NOT "${COMPILER_VERSION}" MATCHES "^8[.].*$") OR
-     ("${YB_COMPILER_TYPE}" STREQUAL "gcc9" AND NOT "${COMPILER_VERSION}" MATCHES "^9[.].*$"))
+  # On macOS, we use the compiler type of simply "clang", without a major version suffix.
+  # On Linux, we validate that the major version in the compiler type matches the actual one.
+  if(NOT "${YB_COMPILER_TYPE}" STREQUAL "clang" AND
+     NOT "${COMPILER_VERSION}" MATCHES "^${CMAKE_MATCH_1}[.].*$")
     message(FATAL_ERROR
-            "Invalid compiler version '${COMPILER_VERSION}' for compiler type "
-            "'${YB_COMPILER_TYPE}'.")
+            "Compiler version ${COMPILER_VERSION} does not match the major version "
+            "${CMAKE_MATCH_1} from the compiler type ${YB_COMPILER_TYPE}.")
   endif()
 
   if (NOT IS_GCC AND
@@ -404,6 +371,11 @@ macro(YB_SETUP_CLANG)
       endif()
       ADD_CXX_FLAGS("-isystem ${CLANG_INCLUDE_DIR}")
     endif()
+
+    if ("${COMPILER_VERSION}" VERSION_GREATER_EQUAL "12.0.0")
+      ADD_LINKER_FLAGS("-fuse-ld=lld")
+      ADD_LINKER_FLAGS("-lunwind")
+    endif()
   endif()
 
   ADD_CXX_FLAGS("-nostdinc++")
@@ -413,11 +385,6 @@ macro(YB_SETUP_CLANG)
   ADD_LINKER_FLAGS("-L${LIBCXX_DIR}/lib")
   if(NOT EXISTS "${LIBCXX_DIR}/lib")
     message(FATAL_ERROR "libc++ library directory does not exist: '${LIBCXX_DIR}/lib'")
-  endif()
-
-  if("${COMPILER_VERSION}" MATCHES "^7[.]*" AND NOT USING_LINUXBREW)
-    # A special linker flag needed only with the Clang 7 build not using Linuxbrew.
-    ADD_LINKER_FLAGS("-lgcc_s")
   endif()
 endmacro()
 
@@ -704,11 +671,11 @@ function(parse_build_root_basename)
   # -----------------------------------------------------------------------------------------------
 
   set(YB_LINKING_TYPE "${CMAKE_MATCH_5}")
-  if(NOT "${YB_LINKING_TYPE}" MATCHES "^(static|dynamic)$")
+  if(NOT "${YB_LINKING_TYPE}" MATCHES "^(dynamic|thin-lto|full-lto)$")
     message(
         FATAL_ERROR
         "Invalid linking type from the build root basename '${YB_BUILD_ROOT_BASENAME}': "
-        "'${YB_LINKING_TYPE}'. Expected 'static' or 'dynamic'.")
+        "'${YB_LINKING_TYPE}'. Expected 'dynamic', 'thin-lto', or 'full-lto'.")
   endif()
   set(YB_LINKING_TYPE "${YB_LINKING_TYPE}" PARENT_SCOPE)
 
@@ -730,6 +697,73 @@ function(parse_build_root_basename)
   endif()
 endfunction()
 
+macro(configure_macos_sdk)
+  if(APPLE AND "${YB_COMPILER_TYPE}" MATCHES "^clang[0-9]+$")
+    if(NOT "${MACOS_SDK_DIR}" STREQUAL "" AND
+       NOT "${MACOS_SDK_VERSION}" STREQUAL "")
+      message("Using cached macOS SDK directory ${MACOS_SDK_DIR}, version ${MACOS_SDK_VERSION}")
+    else()
+      set(MACOS_SDK_BASE_DIR "/Library/Developer/CommandLineTools/SDKs")
+
+      file(GLOB MACOS_SDK_DIRS "${MACOS_SDK_BASE_DIR}/*")
+      set(MACOS_SDK_DIR "")
+      set(MACOS_SDK_VERSION "")
+      foreach(MACOS_SDK_CANDIDATE_DIR ${MACOS_SDK_DIRS})
+        get_filename_component(
+          MACOS_SDK_CANDIDATE_DIR_NAME "${MACOS_SDK_CANDIDATE_DIR}" NAME)
+        if("${MACOS_SDK_CANDIDATE_DIR_NAME}" MATCHES "^MacOSX([0-9.]+)[.]sdk$")
+          set(MACOS_SDK_CANDIDATE_VERSION "${CMAKE_MATCH_1}")
+          if ("${MACOS_SDK_VERSION}" STREQUAL "" OR
+              "${MACOS_SDK_CANDIDATE_VERSION}" VERSION_GREATER "${MACOS_SDK_VERSION}")
+            set(MACOS_SDK_DIR "${MACOS_SDK_CANDIDATE_DIR}")
+            set(MACOS_SDK_VERSION "${MACOS_SDK_CANDIDATE_VERSION}")
+          endif()
+        endif()
+      endforeach()
+      if("${MACOS_SDK_VERSION}" STREQUAL "")
+        message(FATAL_ERROR "Did not find a macOS SDK at ${MACOS_SDK_BASE_DIR}")
+      endif()
+      message("Using macOS SDK version ${MACOS_SDK_VERSION} at ${MACOS_SDK_DIR}")
+      # CMake's INTERNAL type of cache variables implies FORCE, overwriting existing entries.
+      # https://cmake.org/cmake/help/latest/command/set.html
+      set(MACOS_SDK_DIR "${MACOS_SDK_DIR}" CACHE INTERNAL "macOS SDK directory")
+      set(MACOS_SDK_VERSION "${MACOS_SDK_VERSION}" CACHE INTERNAL "macOS SDK version")
+    endif()
+    set(MACOS_SDK_INCLUDE_DIR "${MACOS_SDK_DIR}/usr/include")
+    INCLUDE_DIRECTORIES(SYSTEM "${MACOS_SDK_INCLUDE_DIR}")
+    ADD_LINKER_FLAGS("-L${MACOS_SDK_DIR}/usr/lib")
+  endif()
+endmacro()
+
+function(add_latest_symlink_target)
+  # Provide a 'latest' symlink to this build directory if the "blessed" multi-build layout is
+  # detected:
+  #
+  # build/
+  # build/<first build directory>
+  # build/<second build directory>
+  # ...
+  set(LATEST_BUILD_SYMLINK_PATH "${YB_BUILD_ROOT_PARENT}/latest")
+  if (NOT "$ENV{YB_DISABLE_LATEST_SYMLINK}" STREQUAL "1")
+    message("LATEST SYMLINK PATH: ${LATEST_BUILD_SYMLINK_PATH}")
+    if ("${CMAKE_CURRENT_BINARY_DIR}" STREQUAL "${LATEST_BUILD_SYMLINK_PATH}")
+      message(FATAL_ERROR
+              "Should not run cmake inside the build/latest symlink. "
+              "First change directories into the destination of the symlink.")
+    endif()
+
+    add_custom_target(latest_symlink ALL
+      "${BUILD_SUPPORT_DIR}/create_latest_symlink.sh"
+      "${CMAKE_CURRENT_BINARY_DIR}"
+      "${LATEST_BUILD_SYMLINK_PATH}"
+      COMMENT "Recreating the 'latest' symlink at '${LATEST_BUILD_SYMLINK_PATH}'")
+  endif()
+endfunction()
+
+# -------------------------------------------------------------------------------------------------
+# LTO support
+# -------------------------------------------------------------------------------------------------
+
 macro(enable_lto_if_needed)
   if(NOT DEFINED COMPILER_FAMILY)
     message(FATAL_ERROR "COMPILER_FAMILY not defined")
@@ -741,18 +775,63 @@ macro(enable_lto_if_needed)
     message(FATAL_ERROR "YB_BUILD_TYPE not defined")
   endif()
 
-  if("${YB_BUILD_TYPE}" STREQUAL "release" AND
-     "${COMPILER_FAMILY}" STREQUAL "clang" AND
-     "${YB_COMPILER_TYPE}" STREQUAL "clang12" AND
-     USING_LINUXBREW AND
-     NOT APPLE)
-    message("Enabling full LTO and lld linker")
-    ADD_CXX_FLAGS("-flto=full -fuse-ld=lld")
+  set(YB_DYNAMICALLY_LINKED_EXE_SUFFIX "-dynamic")
+  if("${YB_LINKING_TYPE}" MATCHES "^([a-z]+)-lto$")
+    message("Enabling ${CMAKE_MATCH_1} LTO based on linking type: ${YB_LINKING_TYPE}")
+    ADD_CXX_FLAGS("-flto=${CMAKE_MATCH_1} -fuse-ld=lld")
+    # In LTO mode, yb-master / yb-tserver executables are generated with LTO, but we first generate
+    # yb-master-dynamic and yb-tserver-dynamic binaries that are dynamically linked.
+    set(YB_DYNAMICALLY_LINKED_EXE_SUFFIX "-dynamic")
   else()
     message("Not enabling LTO: "
             "YB_BUILD_TYPE=${YB_BUILD_TYPE}, "
+            "YB_LINKING_TYPE=${YB_LINKING_TYPE}, "
             "COMPILER_FAMILY=${COMPILER_FAMILY}, "
             "USING_LINUXBREW=${USING_LINUXBREW}, "
             "APPLE=${APPLE}")
+    # In non-LTO builds, yb-master / yb-tserver executables themselves are dynamically linked to
+    # other YB libraries.
+    set(YB_DYNAMICALLY_LINKED_EXE_SUFFIX "")
   endif()
+  set(YB_MASTER_DYNAMIC_EXE_NAME "yb-master${YB_DYNAMICALLY_LINKED_EXE_SUFFIX}")
+  set(YB_TSERVER_DYNAMIC_EXE_NAME "yb-tserver${YB_DYNAMICALLY_LINKED_EXE_SUFFIX}")
 endmacro()
+
+function(yb_add_lto_target exe_name)
+  if("${YB_LINKING_TYPE}" STREQUAL "")
+    message(FATAL_ERROR "YB_LINKING_TYPE is not set")
+  endif()
+  if("${YB_LINKING_TYPE}" STREQUAL "dynamic")
+    return()
+  endif()
+
+  if("$ENV{YB_SKIP_FINAL_LTO_LINK}" STREQUAL "1")
+    message("Skipping adding LTO target ${exe_name} because YB_SKIP_FINAL_LTO_LINK is set to 1")
+    return()
+  endif()
+  set(dynamic_exe_name "${exe_name}${YB_DYNAMICALLY_LINKED_EXE_SUFFIX}")
+  message("Adding LTO target: ${exe_name} "
+          "(the dynamically linked equivalent is ${dynamic_exe_name})")
+  set(output_executable_path "${EXECUTABLE_OUTPUT_PATH}/${exe_name}")
+  add_custom_command(
+    OUTPUT "${output_executable_path}"
+    COMMAND "${BUILD_SUPPORT_DIR}/dependency_graph"
+            "--build-root=${YB_BUILD_ROOT}"
+            # Use $$ to escape $.
+            "--file-regex=^.*/${dynamic_exe_name}$$"
+            # Allow LTO linking in parallel with the rest of the build.
+            --incomplete-build
+            "--lto-output-path=${output_executable_path}"
+            "--never-run-build"
+            link-whole-program
+    DEPENDS "${exe_name}"
+  )
+
+  add_custom_target("${exe_name}" ALL DEPENDS "${output_executable_path}")
+
+  if("${YB_DYNAMICALLY_LINKED_EXE_SUFFIX}" STREQUAL "")
+    message(FATAL_ERROR "${YB_DYNAMICALLY_LINKED_EXE_SUFFIX} is not set")
+  endif()
+  # We need to build the corresponding non-LTO executable, such as yb-master or yb-tserver, first.
+  add_dependencies("${exe_name}" "${dynamic_exe_name}")
+endfunction()

@@ -118,11 +118,11 @@ class RpcRetrier {
   // deadline has already expired at the time that Retry() was called.
   //
   // Callers should ensure that 'rpc' remains alive.
-  CHECKED_STATUS DelayedRetry(
+  Status DelayedRetry(
       RpcCommand* rpc, const Status& why_status,
       BackoffStrategy strategy = BackoffStrategy::kLinear);
 
-  CHECKED_STATUS DelayedRetry(
+  Status DelayedRetry(
       RpcCommand* rpc, const Status& why_status, MonoDelta add_delay);
 
   RpcController* mutable_controller() { return &controller_; }
@@ -157,7 +157,7 @@ class RpcRetrier {
   }
 
  private:
-  CHECKED_STATUS DoDelayedRetry(RpcCommand* rpc, const Status& why_status);
+  Status DoDelayedRetry(RpcCommand* rpc, const Status& why_status);
 
   // Called when an RPC comes up for retrying. Actually sends the RPC.
   void DoRetry(RpcCommand* rpc, const Status& status);
@@ -244,8 +244,29 @@ class Rpcs {
   Handle Register(RpcCommandPtr call);
   void Register(RpcCommandPtr call, Handle* handle);
   bool RegisterAndStart(RpcCommandPtr call, Handle* handle);
+  Status RegisterAndStartStatus(RpcCommandPtr call, Handle* handle);
   RpcCommandPtr Unregister(Handle* handle);
-  void Abort(std::initializer_list<Handle*> list);
+
+  template <class Factory>
+  Handle RegisterConstructed(const Factory& factory) {
+    std::lock_guard<std::mutex> lock(*mutex_);
+    if (shutdown_) {
+      return InvalidHandle();
+    }
+    calls_.emplace_back();
+    auto result = --calls_.end();
+    *result = factory(result);
+    return result;
+  }
+
+  template<class Iter>
+  void Abort(Iter start, Iter end);
+
+  void Abort(std::initializer_list<Handle *> list) {
+    Abort(list.begin(), list.end());
+  }
+
+
   // Request all active calls to abort.
   void RequestAbortAll();
   Rpcs::Handle Prepare();
@@ -257,6 +278,8 @@ class Rpcs {
   Handle InvalidHandle() { return calls_.end(); }
 
  private:
+  Rpcs::Handle RegisterUnlocked(RpcCommandPtr call) REQUIRES(*mutex_);
+
   // Requests all active calls to abort. Returns deadline for waiting on abort completion.
   // If shutdown is true - switches Rpcs to shutting down state.
   CoarseTimePoint DoRequestAbortAll(RequestShutdown shutdown);
@@ -267,6 +290,36 @@ class Rpcs {
   Calls calls_;
   bool shutdown_ = false;
 };
+
+template<class Iter>
+void Rpcs::Abort(Iter start, Iter end) {
+  std::vector<RpcCommandPtr> to_abort;
+  {
+    std::lock_guard<std::mutex> lock(*mutex_);
+    for (auto it = start; it != end; ++it) {
+      auto& handle = *it;
+      if (*handle != calls_.end()) {
+        to_abort.push_back(**handle);
+      }
+    }
+  }
+  if (to_abort.empty()) {
+    return;
+  }
+  for (auto& rpc : to_abort) {
+    rpc->Abort();
+  }
+  {
+    std::unique_lock<std::mutex> lock(*mutex_);
+    for (auto it = start; it != end; ++it) {
+      auto& handle = *it;
+      while (*handle != calls_.end()) {
+        cond_.wait(lock);
+      }
+    }
+  }
+}
+
 
 template <class Value>
 class RpcFutureCallback {

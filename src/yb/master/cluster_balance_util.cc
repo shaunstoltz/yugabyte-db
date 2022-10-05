@@ -73,9 +73,11 @@ bool PerTableLoadState::LeaderLoadComparator::operator()(
     const TabletServerId& a, const TabletServerId& b) {
   // Primary criteria: whether tserver is leader blacklisted.
   auto a_leader_blacklisted =
-    state_->leader_blacklisted_servers_.find(a) != state_->leader_blacklisted_servers_.end();
+      global_state_->leader_blacklisted_servers_.find(a) !=
+          global_state_->leader_blacklisted_servers_.end();
   auto b_leader_blacklisted =
-    state_->leader_blacklisted_servers_.find(b) != state_->leader_blacklisted_servers_.end();
+      global_state_->leader_blacklisted_servers_.find(b) !=
+          global_state_->leader_blacklisted_servers_.end();
   if (a_leader_blacklisted != b_leader_blacklisted) {
     return !a_leader_blacklisted;
   }
@@ -117,6 +119,37 @@ size_t PerTableLoadState::GetLeaderLoad(const TabletServerId& ts_uuid) const {
   return per_ts_meta_.at(ts_uuid).leaders.size();
 }
 
+bool PerTableLoadState::ShouldSkipReplica(const TabletReplica& replica) {
+  bool is_replica_live = IsTsInLivePlacement(replica.ts_desc);
+  // Ignore read replica when balancing live nodes.
+  if (options_->type == LIVE && !is_replica_live) {
+    return true;
+  }
+  // Ignore live replica when balancing read replicas.
+  if (options_->type == READ_ONLY && is_replica_live) {
+    return true;
+  }
+  // Ignore read replicas from other clusters.
+  if (options_->type == READ_ONLY && !is_replica_live) {
+    const string& placement_uuid = replica.ts_desc->placement_uuid();
+    if (placement_uuid != options_->placement_uuid) {
+      return true;
+    }
+  }
+  return false;
+}
+
+size_t PerTableLoadState::GetReplicaSize(std::shared_ptr<const TabletReplicaMap> replica_map) {
+  size_t replica_size = 0;
+  for (const auto& replica_it : *replica_map) {
+    if (ShouldSkipReplica(replica_it.second)) {
+      continue;
+    }
+    replica_size++;
+  }
+  return replica_size;
+}
+
 Status PerTableLoadState::UpdateTablet(TabletInfo *tablet) {
   const auto& tablet_id = tablet->id();
   // Set the per-tablet entry to empty default and get the reference for filling up information.
@@ -126,11 +159,20 @@ Status PerTableLoadState::UpdateTablet(TabletInfo *tablet) {
   const auto& placement = placement_by_table_[tablet->table()->id()];
 
   // Get replicas for this tablet.
-  auto replica_map = GetReplicaLocations(tablet);
+  auto replica_map = tablet->GetReplicaLocations();
+
+  // Get the size of replica.
+  size_t replica_size = GetReplicaSize(replica_map);
+
   // Set state information for both the tablet and the tablet server replicas.
   for (const auto& replica_it : *replica_map) {
     const auto& ts_uuid = replica_it.first;
     const auto& replica = replica_it.second;
+
+    if (ShouldSkipReplica(replica)) {
+      continue;
+    }
+
     // If we do not have ts_meta information for this particular replica, then we are in the
     // rare case where we just became the master leader and started doing load balancing, but we
     // have yet to receive heartbeats from all the tablet servers. We will just return false
@@ -149,7 +191,7 @@ Status PerTableLoadState::UpdateTablet(TabletInfo *tablet) {
 
     // If the TS of this replica is deemed DEAD then perform LBing only if it is blacklisted.
     if (check_ts_liveness_ && !meta_ts.descriptor->IsLiveAndHasReported()) {
-      if (!blacklisted_servers_.count(ts_uuid)) {
+      if (!global_state_->blacklisted_servers_.count(ts_uuid)) {
         if (GetAtomicFlag(&FLAGS_allow_leader_balancing_dead_node)) {
           allow_only_leader_balancing_ = true;
           YB_LOG_EVERY_N_SECS(INFO, 30)
@@ -178,7 +220,10 @@ Status PerTableLoadState::UpdateTablet(TabletInfo *tablet) {
     const bool replica_is_stale = replica.IsStale();
     VLOG(2) << "Tablet " << tablet_id << " for table " << table_id_
               << " is in state " << RaftGroupStatePB_Name(tablet_state) << " on peer " << ts_uuid;
-    if (tablet_state == tablet::RUNNING) {
+
+    // The 'UNKNOWN' tablet state was introduced as a pre-'RUNNING' state. Treat 'UNKNOWN' as a
+    // 'RUNNING' state to maintain the existing behavior.
+    if (tablet_state == tablet::UNKNOWN || tablet_state == tablet::RUNNING) {
       RETURN_NOT_OK(AddRunningTablet(tablet_id, ts_uuid, replica.fs_data_dir));
     } else if (!replica_is_stale &&
                 (tablet_state == tablet::BOOTSTRAPPING || tablet_state == tablet::NOT_STARTED)) {
@@ -201,13 +246,13 @@ Status PerTableLoadState::UpdateTablet(TabletInfo *tablet) {
 
     // If this replica is blacklisted, we want to keep track of these specially, so we can
     // prioritize accordingly.
-    if (blacklisted_servers_.count(ts_uuid)) {
+    if (global_state_->blacklisted_servers_.count(ts_uuid)) {
       tablet_meta.blacklisted_tablet_servers.insert(ts_uuid);
     }
 
     // If this replica has blacklisted leader, we want to keep track of these specially, so we can
     // prioritize accordingly.
-    if (leader_blacklisted_servers_.count(ts_uuid)) {
+    if (global_state_->leader_blacklisted_servers_.count(ts_uuid)) {
       tablet_meta.leader_blacklisted_tablet_servers.insert(ts_uuid);
     }
   }
@@ -215,8 +260,8 @@ Status PerTableLoadState::UpdateTablet(TabletInfo *tablet) {
   // Only set the over-replication section if we need to.
   size_t placement_num_replicas = placement.num_replicas() > 0 ?
       placement.num_replicas() : FLAGS_replication_factor;
-  tablet_meta.is_over_replicated = placement_num_replicas < replica_map->size();
-  tablet_meta.is_under_replicated = placement_num_replicas > replica_map->size();
+  tablet_meta.is_over_replicated = placement_num_replicas < replica_size;
+  tablet_meta.is_under_replicated = placement_num_replicas > replica_size;
 
   // If no placement information, we will have already set the over and under replication flags.
   // For under-replication, we cannot use any placement_id, so we just leave the set empty and
@@ -226,13 +271,16 @@ Status PerTableLoadState::UpdateTablet(TabletInfo *tablet) {
   if (placement.placement_blocks().empty()) {
     if (tablet_meta.is_over_replicated) {
       for (auto& replica_entry : *replica_map) {
-        tablet_meta.over_replicated_tablet_servers.insert(std::move(replica_entry.first));
+        if (ShouldSkipReplica(replica_entry.second)) {
+          continue;
+        }
+        tablet_meta.over_replicated_tablet_servers.insert(replica_entry.first);
       }
     }
   } else {
     // If we do have placement information, figure out how the load is distributed based on
     // placement blocks, for this tablet.
-    std::unordered_map<CloudInfoPB, vector<TabletReplica>, cloud_hash, cloud_equal_to>
+    std::unordered_map<CloudInfoPB, vector<const TabletReplica*>, cloud_hash, cloud_equal_to>
                                                                     placement_to_replicas;
     std::unordered_map<CloudInfoPB, int, cloud_hash, cloud_equal_to> placement_to_min_replicas;
     // Preset the min_replicas, so we know if we're missing replicas somewhere as well.
@@ -243,13 +291,17 @@ Status PerTableLoadState::UpdateTablet(TabletInfo *tablet) {
     }
     // Now actually fill the structures with matching TSs.
     for (auto& replica_entry : *replica_map) {
+      if (ShouldSkipReplica(replica_entry.second)) {
+        continue;
+      }
+
       auto ci = GetValidPlacement(replica_entry.first, &placement);
       if (ci.has_value()) {
-        placement_to_replicas[*ci].push_back(std::move(replica_entry.second));
+        placement_to_replicas[*ci].push_back(&replica_entry.second);
       } else {
         // If placement does not match, we likely changed the config or the schema and this
         // tablet should no longer live on this tablet server.
-        tablet_meta.wrong_placement_tablet_servers.insert(std::move(replica_entry.first));
+        tablet_meta.wrong_placement_tablet_servers.insert(replica_entry.first);
       }
     }
 
@@ -265,8 +317,7 @@ Status PerTableLoadState::UpdateTablet(TabletInfo *tablet) {
         // If this tablet is over-replicated, consider all the placements that have more than the
         // minimum number of tablets, as candidates for removing a replica.
         for (auto& replica : replica_set) {
-          tablet_meta.over_replicated_tablet_servers.insert(
-            std::move(replica.ts_desc->permanent_uuid()));
+          tablet_meta.over_replicated_tablet_servers.insert(replica->ts_desc->permanent_uuid());
         }
       }
     }
@@ -299,53 +350,20 @@ void PerTableLoadState::UpdateTabletServer(std::shared_ptr<TSDescriptor> ts_desc
   // Also insert into per_ts_global_meta_ if we have yet to.
   global_state_->per_ts_global_meta_.emplace(ts_uuid, CBTabletServerLoadCounts());
 
-  // Only add TS for LBing if it is not dead.
-  // check_ts_liveness_ is an artifact of cluster_balance_mocked.h
-  // and is used to ensure that we don't perform a liveness check
-  // during mimicing load balancers.
-  if (!check_ts_liveness_ || ts_desc->IsLiveAndHasReported()) {
-    sorted_load_.push_back(ts_uuid);
-  }
-
-  // Mark as blacklisted if it matches.
-  bool is_blacklisted = false;
-  for (const auto& hp : blacklist_.hosts()) {
-    if (ts_meta.descriptor->IsRunningOn(hp)) {
-      blacklisted_servers_.insert(ts_uuid);
-      is_blacklisted = true;
-      break;
-    }
-  }
-
-  // Mark as blacklisted leader if it matches.
-  for (const auto& hp : leader_blacklist_.hosts()) {
-    if (ts_meta.descriptor->IsRunningOn(hp)) {
-      leader_blacklisted_servers_.insert(ts_uuid);
-      break;
-    }
-  }
-
-  // Add this tablet server for leader load-balancing only if it is not blacklisted and it has
-  // heartbeated recently enough to be considered responsive for leader balancing.
-  // Also, don't add it if isn't live or hasn't reported all its tablets.
-  // check_ts_liveness_ is an artifact of cluster_balance_mocked.h
-  // and is used to ensure that we don't perform a liveness check
-  // during mimicing load balancers.
-  if (!is_blacklisted &&
-      ts_desc->TimeSinceHeartbeat().ToMilliseconds() <
-      FLAGS_leader_balance_unresponsive_timeout_ms &&
-      (!check_ts_liveness_ || ts_desc->IsLiveAndHasReported())) {
-    sorted_leader_load_.push_back(ts_uuid);
-  }
-
-  if (ts_desc->HasTabletDeletePending()) {
-    servers_with_pending_deletes_.insert(ts_uuid);
-  }
+  // Set as blacklisted if it matches.
+  bool is_blacklisted = (global_state_->blacklisted_servers_.count(ts_uuid) != 0);
+  bool is_leader_blacklisted = (global_state_->leader_blacklisted_servers_.count(ts_uuid) != 0);
 
   // If the TS is perceived as DEAD then ignore it.
+  // check_ts_liveness_ is an artifact of cluster_balance_mocked.h
+  // and is used to ensure that we don't perform a liveness check
+  // during mimicing load balancers.
   if (check_ts_liveness_ && !ts_desc->IsLiveAndHasReported()) {
     return;
   }
+
+  // Add TS for LBing.
+  sorted_load_.push_back(ts_uuid);
 
   bool is_ts_live = IsTsInLivePlacement(ts_desc.get());
   switch (options_->type) {
@@ -353,6 +371,7 @@ void PerTableLoadState::UpdateTabletServer(std::shared_ptr<TSDescriptor> ts_desc
       if (!is_ts_live) {
         // LIVE cb run with READ_ONLY ts, ignore this ts
         sorted_load_.pop_back();
+        return;
       }
       break;
     }
@@ -364,27 +383,39 @@ void PerTableLoadState::UpdateTabletServer(std::shared_ptr<TSDescriptor> ts_desc
         string placement_uuid = ts_desc->placement_uuid();
         if (placement_uuid == "") {
           LOG(WARNING) << "Read only ts " << ts_desc->permanent_uuid()
-                        << " does not have placement uuid";
+                       << " does not have placement uuid";
         } else if (placement_uuid != options_->placement_uuid) {
           // Do not include this ts in load balancing.
           sorted_load_.pop_back();
         }
       }
-      sorted_leader_load_.clear();
       return;
     }
   }
 
-  if (sorted_leader_load_.empty() ||
-      sorted_leader_load_.back() != ts_uuid ||
-      affinitized_zones_.empty()) {
-    return;
-  }
-  TSRegistrationPB registration = ts_desc->GetRegistration();
-  if (affinitized_zones_.find(registration.common().cloud_info()) == affinitized_zones_.end()) {
-    // This tablet server is in an affinitized leader zone.
-    sorted_leader_load_.pop_back();
-    sorted_non_affinitized_leader_load_.push_back(ts_uuid);
+  // Add this tablet server for leader load-balancing only if it is not blacklisted and it has
+  // heartbeated recently enough to be considered responsive for leader balancing.
+  // Also, don't add it if isn't live or hasn't reported all its tablets.
+  if (!is_blacklisted && ts_desc->TimeSinceHeartbeat().ToMilliseconds() <
+                             FLAGS_leader_balance_unresponsive_timeout_ms) {
+    size_t priority = 0;
+    if (is_leader_blacklisted) {
+      // Consider as non affinitized
+      priority = affinitized_zones_.size();
+    } else if (!affinitized_zones_.empty()) {
+      auto ci = ts_desc->GetRegistration().common().cloud_info();
+      for (; priority < affinitized_zones_.size(); priority++) {
+        if (affinitized_zones_[priority].find(ci) != affinitized_zones_[priority].end()) {
+          break;
+        }
+      }
+    }
+
+    if (sorted_leader_load_.size() <= priority) {
+      sorted_leader_load_.resize(priority + 1);
+    }
+
+    sorted_leader_load_[priority].push_back(ts_desc->permanent_uuid());
   }
 }
 
@@ -402,7 +433,7 @@ Result<bool> PerTableLoadState::CanAddTabletToTabletServer(
     return false;
   }
   // We do not add load to blacklisted servers.
-  if (blacklisted_servers_.count(to_ts)) {
+  if (global_state_->blacklisted_servers_.count(to_ts)) {
     return false;
   }
   // We cannot add a tablet to a tablet server if it is already serving it.
@@ -416,7 +447,7 @@ Result<bool> PerTableLoadState::CanAddTabletToTabletServer(
     return false;
   }
   // If this server has a pending tablet delete, don't use it.
-  if (servers_with_pending_deletes_.count(to_ts)) {
+  if (global_state_->servers_with_pending_deletes_.count(to_ts)) {
     LOG(INFO) << "tablet server " << to_ts << " has a pending delete. "
               << "Not allowing it to take more tablets";
     return false;
@@ -611,11 +642,9 @@ Status PerTableLoadState::MoveLeader(const TabletId& tablet_id,
 }
 
 void PerTableLoadState::SortLeaderLoad() {
-  auto leader_count_comparator = LeaderLoadComparator(this);
-  sort(sorted_non_affinitized_leader_load_.begin(),
-        sorted_non_affinitized_leader_load_.end(),
-        leader_count_comparator);
-  sort(sorted_leader_load_.begin(), sorted_leader_load_.end(), leader_count_comparator);
+  for (auto& leader_set : sorted_leader_load_) {
+    sort(leader_set.begin(), leader_set.end(), LeaderLoadComparator(this, global_state_));
+  }
 
   if (global_state_->drive_aware_) {
     SortDriveLeaderLoad();
@@ -625,45 +654,50 @@ void PerTableLoadState::SortLeaderLoad() {
 void PerTableLoadState::SortDriveLeaderLoad() {
   // Sort drives on each ts by the leaders count to use a sorted list while
   // looking the leader to move to the drive with the least leaders count.
-  for (const auto& ts : sorted_leader_load_) {
-    auto& ts_meta = per_ts_meta_[ts];
-    std::vector<std::pair<std::string, uint64>> drive_load;
-    bool empty_path_found = false;
-    // Add drives with leaders
-    for (const auto& path_to_tablet : ts_meta.path_to_leaders) {
-      if (path_to_tablet.first.empty()) {
-        empty_path_found = true;
-        continue;
+  for (const auto& leader_set : sorted_leader_load_) {
+    for (const auto& ts : leader_set) {
+      auto& ts_meta = per_ts_meta_[ts];
+      std::vector<std::pair<std::string, uint64>> drive_load;
+      bool empty_path_found = false;
+      // Add drives with leaders
+      for (const auto& path_to_tablet : ts_meta.path_to_leaders) {
+        if (path_to_tablet.first.empty()) {
+          empty_path_found = true;
+          continue;
+        }
+        drive_load.emplace_back(
+            std::pair<std::string, uint>({path_to_tablet.first, path_to_tablet.second.size()}));
       }
-      drive_load.emplace_back(std::pair<std::string, uint>(
-                                {path_to_tablet.first, path_to_tablet.second.size()}));
-    }
-    // Add drives without leaders, but with tablets
-    for (const auto& path_to_tablet : ts_meta.path_to_tablets) {
-      const auto& path = path_to_tablet.first;
-      if (path.empty()) {
-        continue;
+      // Add drives without leaders, but with tablets
+      for (const auto& path_to_tablet : ts_meta.path_to_tablets) {
+        const auto& path = path_to_tablet.first;
+        if (path.empty()) {
+          continue;
+        }
+
+        if (ts_meta.path_to_leaders.find(path) == ts_meta.path_to_leaders.end()) {
+          drive_load.emplace_back(std::pair<std::string, uint>({path_to_tablet.first, 0}));
+        }
       }
 
-      if (ts_meta.path_to_leaders.find(path) == ts_meta.path_to_leaders.end()) {
-        drive_load.emplace_back(std::pair<std::string, uint>({path_to_tablet.first, 0}));
-      }
-    }
-
-    // Sort by ascending load.
-    sort(drive_load.begin(), drive_load.end(),
+      // Sort by ascending load.
+      sort(
+          drive_load.begin(), drive_load.end(),
           [](const std::pair<std::string, uint64>& l, const std::pair<std::string, uint64>& r) {
-              return l.second < r.second;
-            });
-    bool add_empty_path = empty_path_found || ts_meta.path_to_leaders.empty();
-    ts_meta.sorted_path_load_by_leader_count.reserve(drive_load.size() + (add_empty_path ? 1 : 0));
-    if (add_empty_path) {
-      // Empty path was found at path_to_leaders or no leaders on TS, so add the empty path.
-      ts_meta.sorted_path_load_by_leader_count.push_back(std::string());
+            return l.second < r.second;
+          });
+      bool add_empty_path = empty_path_found || ts_meta.path_to_leaders.empty();
+      ts_meta.sorted_path_load_by_leader_count.reserve(
+          drive_load.size() + (add_empty_path ? 1 : 0));
+      if (add_empty_path) {
+        // Empty path was found at path_to_leaders or no leaders on TS, so add the empty path.
+        ts_meta.sorted_path_load_by_leader_count.push_back(std::string());
+      }
+      std::transform(
+          drive_load.begin(), drive_load.end(),
+          std::back_inserter(ts_meta.sorted_path_load_by_leader_count),
+          [](const std::pair<std::string, uint64>& v) { return v.first; });
     }
-    std::transform(drive_load.begin(), drive_load.end(),
-                    std::back_inserter(ts_meta.sorted_path_load_by_leader_count),
-                    [](const std::pair<std::string, uint64>& v) { return v.first;});
   }
 }
 
@@ -672,57 +706,44 @@ void PerTableLoadState::LogSortedLeaderLoad() {
   // ts1_uuid[ts1_load] ts2_uuid[ts2_load] ts4_uuid[ts4_load] -- ts3_uuid[ts3_load]
   // Note: entries following "--" are leader blacklisted tservers
 
-  bool blacklisted_leader = false;
   std::string s;
-  for (const auto& ts_uuid : sorted_leader_load_) {
-    if (!blacklisted_leader) {
-      blacklisted_leader = (leader_blacklisted_servers_.find(ts_uuid) !=
-          leader_blacklisted_servers_.end());
-      if (blacklisted_leader) {
-        s += " --";
+  std::string blacklisted;
+  for (const auto& leader_set : sorted_leader_load_) {
+    for (const auto& ts_uuid : leader_set) {
+      if (global_state_->leader_blacklisted_servers_.find(ts_uuid) !=
+          global_state_->leader_blacklisted_servers_.end()) {
+        blacklisted += strings::Substitute(" $0[$1]", ts_uuid, GetLeaderLoad(ts_uuid));
+      } else {
+        s += strings::Substitute(" $0[$1]", ts_uuid, GetLeaderLoad(ts_uuid));
       }
     }
-
-    s +=  " " + ts_uuid + "[" + strings::Substitute("$0", GetLeaderLoad(ts_uuid)) + "]";
   }
+
+  if (!blacklisted.empty()) {
+    s += " --" + blacklisted;
+  }
+
   if (s.size() > 0) {
     LOG(INFO) << "tservers sorted by whether leader blacklisted and load: " << s;
   }
 }
 
-void PerTableLoadState::AdjustLeaderBalanceThreshold() {
-  if (leader_balance_threshold_ != 0) {
-    int min_threshold = sorted_leader_load_.empty() ? 0 :
-                        static_cast<int>(std::ceil(
-                          static_cast<double>(per_tablet_meta_.size()) /
-                          static_cast<double>(sorted_leader_load_.size())));
-    if (leader_balance_threshold_ < min_threshold) {
+int PerTableLoadState::AdjustLeaderBalanceThreshold(int zone_set_size) {
+  int adjusted_leader_balance_threshold = leader_balance_threshold_;
+  if (adjusted_leader_balance_threshold != 0) {
+    int min_threshold = zone_set_size <= 0
+                            ? 0
+                            : static_cast<int>(std::ceil(
+                                  static_cast<double>(per_tablet_meta_.size()) / zone_set_size));
+    if (adjusted_leader_balance_threshold < min_threshold) {
       LOG(WARNING) << strings::Substitute(
-        "leader_balance_threshold flag is set to $0 but is too low for the current "
+          "leader_balance_threshold flag is set to $0 but is too low for the current "
           "configuration. Adjusting it to $1.",
-        leader_balance_threshold_, min_threshold);
-      leader_balance_threshold_ = min_threshold;
+          adjusted_leader_balance_threshold, min_threshold);
+      adjusted_leader_balance_threshold = min_threshold;
     }
   }
-}
-
-std::shared_ptr<const TabletReplicaMap> PerTableLoadState::GetReplicaLocations(
-    TabletInfo* tablet) {
-  auto replica_locations = std::make_shared<TabletReplicaMap>();
-  auto replica_map = tablet->GetReplicaLocations();
-  for (const auto& it : *replica_map) {
-    const TabletReplica& replica = it.second;
-    bool is_replica_live =  IsTsInLivePlacement(replica.ts_desc);
-    if (is_replica_live && options_->type == LIVE) {
-      replica_locations->emplace(it.first, replica);
-    } else if (!is_replica_live && options_->type  == READ_ONLY) {
-      const string& placement_uuid = replica.ts_desc->placement_uuid();
-      if (placement_uuid == options_->placement_uuid) {
-        replica_locations->emplace(it.first, replica);
-      }
-    }
-  }
-  return replica_locations;
+  return adjusted_leader_balance_threshold;
 }
 
 Status PerTableLoadState::AddRunningTablet(const TabletId& tablet_id,

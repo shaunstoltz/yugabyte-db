@@ -65,6 +65,15 @@ constexpr size_t kCdcDbStreamIdIdx = 0;
 static const char* const kCdcTableId = "table_id";
 constexpr size_t kCdcTableIdIdx = 3;
 
+
+static const char* const kXClusterSafeTimeTableName = "xcluster_safe_time";
+static const char* const kXCUniverseId = "universe_id";
+constexpr size_t kXCUniverseIdIdx = 0;
+static const char* const kXCProducerTabletId = "tablet_id";
+constexpr size_t kXCProducerTabletIdIdx = 1;
+static const char* const kXCSafeTime  = "safe_time";
+constexpr size_t kXCSafeTimeIdx = 2;
+
 static const char* const kSystemAuthRolesTableName = "roles";
 static const char* const kSystemAuthRolePermissionsTableName = "role_permissions";
 static const char* const kSystemAuthResourceRolePermissionsIndexTableName =
@@ -75,10 +84,6 @@ static const char* const kDefaultSchemaVersion = "00000000-0000-0000-0000-000000
 static const char* const kSecurityConfigType = "security-configuration";
 static const char* const kYsqlCatalogConfigType = "ysql-catalog-configuration";
 static const char* const kTransactionTablesConfigType = "transaction-tables-configuration";
-static const char* const kColocatedParentTableIdSuffix = ".colocated.parent.uuid";
-static const char* const kColocatedParentTableNameSuffix = ".colocated.parent.tablename";
-static const char* const kTablegroupParentTableIdSuffix = ".tablegroup.parent.uuid";
-static const char* const kTablegroupParentTableNameSuffix = ".tablegroup.parent.tablename";
 static const int32_t kDelayAfterFailoverSecs = 120;
 
 // Needs to be updated each time we add a new system namespace.

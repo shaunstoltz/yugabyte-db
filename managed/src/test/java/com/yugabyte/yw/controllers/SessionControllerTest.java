@@ -9,9 +9,9 @@ import static com.yugabyte.yw.common.AssertHelper.assertConflict;
 import static com.yugabyte.yw.common.AssertHelper.assertForbidden;
 import static com.yugabyte.yw.common.AssertHelper.assertInternalServerError;
 import static com.yugabyte.yw.common.AssertHelper.assertOk;
+import static com.yugabyte.yw.common.AssertHelper.assertPlatformException;
 import static com.yugabyte.yw.common.AssertHelper.assertUnauthorized;
 import static com.yugabyte.yw.common.AssertHelper.assertValue;
-import static com.yugabyte.yw.common.AssertHelper.assertPlatformException;
 import static com.yugabyte.yw.common.FakeApiHelper.routeWithYWErrHandler;
 import static com.yugabyte.yw.common.TestHelper.testDatabase;
 import static com.yugabyte.yw.models.Users.Role;
@@ -57,7 +57,6 @@ import com.yugabyte.yw.models.Universe;
 import com.yugabyte.yw.models.Users;
 import com.yugabyte.yw.models.helpers.NodeDetails;
 import com.yugabyte.yw.scheduler.Scheduler;
-import java.util.Map;
 import java.util.UUID;
 import java.util.concurrent.ExecutionException;
 import java.util.concurrent.TimeoutException;
@@ -71,7 +70,6 @@ import org.pac4j.play.store.PlaySessionStore;
 import play.Application;
 import play.inject.guice.GuiceApplicationBuilder;
 import play.libs.Json;
-import play.modules.swagger.SwaggerModule;
 import play.mvc.Http;
 import play.mvc.Result;
 import play.test.Helpers;
@@ -97,7 +95,6 @@ public class SessionControllerTest {
     ldapUtil = mock(LdapUtil.class);
     app =
         new GuiceApplicationBuilder()
-            .disable(SwaggerModule.class)
             .disable(GuiceModule.class)
             .configure(testDatabase())
             .configure(ImmutableMap.of("yb.multiTenant", isMultiTenant))

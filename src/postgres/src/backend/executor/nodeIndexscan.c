@@ -110,6 +110,8 @@ IndexNext(IndexScanState *node)
 
 	if (scandesc == NULL)
 	{
+		IndexScan *plan = castNode(IndexScan, node->ss.ps.plan);
+
 		/*
 		 * We reach here if the index scan is not parallel, or if we're
 		 * serially executing an index scan that was planned to be parallel.
@@ -121,7 +123,11 @@ IndexNext(IndexScanState *node)
 								   node->iss_NumOrderByKeys);
 
 		node->iss_ScanDesc = scandesc;
-		scandesc->yb_scan_plan = (Scan *)node->ss.ps.plan;
+		scandesc->yb_scan_plan = (Scan *) plan;
+		scandesc->yb_rel_pushdown =
+			YbInstantiateRemoteParams(&plan->rel_remote, estate);
+		scandesc->yb_idx_pushdown =
+			YbInstantiateRemoteParams(&plan->index_remote, estate);
 
 		/*
 		 * If no run-time keys to calculate or they are ready, go ahead and
@@ -168,6 +174,14 @@ IndexNext(IndexScanState *node)
 	/*
 	 * ok, now that we have what we need, fetch the next tuple.
 	 */
+	MemoryContext oldcontext;
+	/*
+	 * To handle dead tuple for temp table, we shouldn't store its index
+	 * in per-tuple memory context.
+	 */
+	if (IsYBRelation(node->ss.ss_currentRelation))
+		oldcontext = MemoryContextSwitchTo(
+			node->ss.ps.ps_ExprContext->ecxt_per_tuple_memory);
 	while ((tuple = index_getnext(scandesc, direction)) != NULL)
 	{
 		CHECK_FOR_INTERRUPTS();
@@ -189,14 +203,16 @@ IndexNext(IndexScanState *node)
 		if (scandesc->xs_recheck)
 		{
 			econtext->ecxt_scantuple = slot;
-			if (!ExecQualAndReset(node->indexqualorig, econtext))
+			if (!ExecQual(node->indexqualorig, econtext))
 			{
+				ResetExprContext(econtext);
 				/* Fails recheck, so drop it and loop back for another */
 				InstrCountFiltered2(node, 1);
 				continue;
 			}
 		}
-
+		if (IsYBRelation(node->ss.ss_currentRelation))
+			MemoryContextSwitchTo(oldcontext);
 		return slot;
 	}
 
@@ -205,6 +221,8 @@ IndexNext(IndexScanState *node)
 	 * the scan..
 	 */
 	node->iss_ReachedEnd = true;
+	if (IsYBRelation(node->ss.ss_currentRelation))
+		MemoryContextSwitchTo(oldcontext);
 	return ExecClearTuple(slot);
 }
 
@@ -249,6 +267,8 @@ IndexNextWithReorder(IndexScanState *node)
 
 	if (scandesc == NULL)
 	{
+		IndexScan *plan = castNode(IndexScan, node->ss.ps.plan);
+
 		/*
 		 * We reach here if the index scan is not parallel, or if we're
 		 * serially executing an index scan that was planned to be parallel.
@@ -260,7 +280,11 @@ IndexNextWithReorder(IndexScanState *node)
 								   node->iss_NumOrderByKeys);
 
 		node->iss_ScanDesc = scandesc;
-		scandesc->yb_scan_plan = (Scan *)node->ss.ps.plan;
+		scandesc->yb_scan_plan = (Scan *) plan;
+		scandesc->yb_rel_pushdown =
+			YbInstantiateRemoteParams(&plan->rel_remote, estate);
+		scandesc->yb_idx_pushdown =
+			YbInstantiateRemoteParams(&plan->index_remote, estate);
 
 		/*
 		 * If no run-time keys to calculate or they are ready, go ahead and
@@ -1294,16 +1318,16 @@ ExecIndexBuildScanKeys(PlanState *planstate, Relation index,
 			if (IsA(leftop, FuncExpr)
 				&& ((FuncExpr *) leftop)->funcid == YB_HASH_CODE_OID)
 			{
-				flags |= SK_IS_HASHED;
+				flags |= YB_SK_IS_HASHED;
 			}
 
 			if (!(IsA(leftop, Var) &&
 				  ((Var *) leftop)->varno == INDEX_VAR)
-				  && ((flags & SK_IS_HASHED) == 0))
+				  && ((flags & YB_SK_IS_HASHED) == 0))
 				elog(ERROR, "indexqual doesn't have key on left side");
 
 
-			if ((flags & SK_IS_HASHED) != 0)
+			if ((flags & YB_SK_IS_HASHED) != 0)
 			{
 				varattno = InvalidAttrNumber;
 				opfamily = INTEGER_LSM_FAM_OID;

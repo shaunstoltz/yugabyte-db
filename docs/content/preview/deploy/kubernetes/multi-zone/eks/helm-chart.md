@@ -11,9 +11,7 @@ menu:
     weight: 627
 aliases:
   - /preview/deploy/kubernetes/multi-zone/eks
-type: page
-isTocNested: true
-showAsideToc: true
+type: docs
 ---
 
 <ul class="nav nav-tabs-alt nav-tabs-yb">
@@ -95,39 +93,23 @@ $ eksctl create cluster \
 
 As stated in the Prerequisites section, the default configuration in the YugabyteDB Helm Chart requires Kubernetes nodes to have a total of 12 CPU cores and 45 GB RAM allocated to YugabyteDB. This can be three nodes with 4 CPU cores and 15 GB RAM allocated to YugabyteDB. The smallest AWS instance type that meets this requirement is `m5.2xlarge` which has 8 CPU cores and 32 GB RAM.
 
-### Create a storage class per zone
+### Create a storage class
 
-We need to ensure that the storage classes used by the pods in a given zone are always pinned to that zone only.
+We need to specify `WaitForFirstConsumer` mode for the volumeBindingMode so that volumes will be provisioned according to pods' zone affinities. 
 
 Copy the contents below to a file named `storage.yaml`.
 
 ```yaml
 kind: StorageClass
-apiVersion: storage.k8s.io/v1
 metadata:
-  name: standard-us-east-1a
+  name: yb-storage
+apiVersion: storage.k8s.io/v1
+allowVolumeExpansion: true
 provisioner: kubernetes.io/aws-ebs
+volumeBindingMode: WaitForFirstConsumer
 parameters:
   type: gp2
-  zone: us-east-1a
----
-kind: StorageClass
-apiVersion: storage.k8s.io/v1
-metadata:
-  name: standard-us-east-1b
-provisioner: kubernetes.io/aws-ebs
-parameters:
-  type: gp2
-  zone: us-east-1b
----
-kind: StorageClass
-apiVersion: storage.k8s.io/v1
-metadata:
-  name: standard-us-east-1c
-provisioner: kubernetes.io/aws-ebs
-parameters:
-  type: gp2
-  zone: us-east-1c
+  fsType: xfs
 ```
 
 Apply the above configuration to your cluster.
@@ -159,8 +141,8 @@ $ helm search repo yugabytedb/yugabyte --version {{<yb-version version="preview"
 ```
 
 ```output
-NAME                    CHART VERSION   APP VERSION     DESCRIPTION
-yugabytedb/yugabyte     2.13.0           2.13.0.1-b2    YugabyteDB is the high-performance distributed ...
+NAME                 CHART VERSION  APP VERSION   DESCRIPTION
+yugabytedb/yugabyte  {{<yb-version version="preview" format="short">}}          {{<yb-version version="preview" format="build">}}  YugabyteDB is the high-performance distributed ...
 ```
 
 ### Create override files
@@ -176,9 +158,9 @@ masterAddresses: "yb-master-0.yb-masters.yb-demo-us-east-1a.svc.cluster.local:71
 
 storage:
   master:
-    storageClass: "standard-us-east-1a"
+    storageClass: "yb-storage"
   tserver:
-    storageClass: "standard-us-east-1a"
+    storageClass: "yb-storage"
 
 replicas:
   master: 1
@@ -207,9 +189,9 @@ masterAddresses: "yb-master-0.yb-masters.yb-demo-us-east-1a.svc.cluster.local:71
 
 storage:
   master:
-    storageClass: "standard-us-east-1b"
+    storageClass: "yb-storage"
   tserver:
-    storageClass: "standard-us-east-1b"
+    storageClass: "yb-storage"
 
 replicas:
   master: 1
@@ -238,9 +220,9 @@ masterAddresses: "yb-master-0.yb-masters.yb-demo-us-east-1a.svc.cluster.local:71
 
 storage:
   master:
-    storageClass: "standard-us-east-1c"
+    storageClass: "yb-storage"
   tserver:
-    storageClass: "standard-us-east-1c"
+    storageClass: "yb-storage"
 
 replicas:
   master: 1
@@ -274,18 +256,21 @@ Now create the overall YugabyteDB cluster in such a way that one third of the no
 
 ```sh
 $ helm install yb-demo-us-east-1a yugabytedb/yugabyte \
+ --version {{<yb-version version="preview" format="short">}} \
  --namespace yb-demo-us-east-1a \
  -f overrides-us-east-1a.yaml --wait
 ```
 
 ```sh
 $ helm install yb-demo-us-east-1b yugabytedb/yugabyte \
+ --version {{<yb-version version="preview" format="short">}} \
  --namespace yb-demo-us-east-1b \
  -f overrides-us-east-1b.yaml --wait
 ```
 
 ```sh
 $ helm install yb-demo-us-east-1c yugabytedb/yugabyte \
+ --version {{<yb-version version="preview" format="short">}} \
  --namespace yb-demo-us-east-1c \
  -f overrides-us-east-1c.yaml --wait
 ```

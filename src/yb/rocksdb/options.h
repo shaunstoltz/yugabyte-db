@@ -78,6 +78,7 @@ class InternalKeyComparator;
 class WalFilter;
 class MemoryMonitor;
 
+struct RocksDBPriorityThreadPoolMetrics;
 struct FileMetaData;
 
 typedef std::shared_ptr<const InternalKeyComparator> InternalKeyComparatorPtr;
@@ -1366,6 +1367,9 @@ struct DBOptions {
   // completely expired based on their table and/or column TTL.
   std::shared_ptr<CompactionFileFilterFactory> compaction_file_filter_factory;
 
+  // Metrics tracker for tasks in the priority thread pool.
+  std::shared_ptr<RocksDBPriorityThreadPoolMetrics> priority_thread_pool_metrics;
+
   // Used for identifying disk in priorty pool. This corresponds to the hashed
   // data root directory for the rocksdb instance.
   uint64_t disk_group_no;
@@ -1655,6 +1659,8 @@ struct CompactRangeOptions {
   // if there is a compaction filter
   BottommostLevelCompaction bottommost_level_compaction =
       BottommostLevelCompaction::kIfHaveCompactionFilter;
+
+  bool skip_flush = false;
 };
 }  // namespace rocksdb
 

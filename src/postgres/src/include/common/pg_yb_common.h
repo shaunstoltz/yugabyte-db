@@ -119,10 +119,17 @@ extern const char *YBGetCurrentMetricNodeName();
 extern bool YBIsCollationEnabled();
 
 /**
+ * Returns whether failure injection is enabled for matview refreshes.
+ */
+extern bool YBIsRefreshMatviewFailureInjected();
+
+/**
  * Returns the value of the configration variable `max_clock_sec_usec`
  * returns -1 if the configuration was not found.
  */
 extern int YBGetMaxClockSkewUsec();
+
+extern int YBGetYsqlOutputBufferSize();
 
 /**
  * Test only constant. When set to true initdb imports default collation

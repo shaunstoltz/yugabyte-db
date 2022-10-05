@@ -2,20 +2,19 @@
 
 package com.yugabyte.yw.models;
 
-import static io.swagger.annotations.ApiModelProperty.AccessMode.READ_ONLY;
-import static io.swagger.annotations.ApiModelProperty.AccessMode.READ_WRITE;
-import static java.lang.Math.abs;
-import static com.yugabyte.yw.models.helpers.CommonUtils.performPagedQuery;
 import static com.yugabyte.yw.models.helpers.CommonUtils.appendInClause;
 import static com.yugabyte.yw.models.helpers.CommonUtils.appendLikeClause;
+import static com.yugabyte.yw.models.helpers.CommonUtils.performPagedQuery;
+import static io.swagger.annotations.ApiModelProperty.AccessMode.READ_ONLY;
+import static io.swagger.annotations.ApiModelProperty.AccessMode.READ_WRITE;
 import static play.mvc.Http.Status.BAD_REQUEST;
 
-import com.fasterxml.jackson.databind.JsonNode;
 import com.google.common.collect.Sets;
 import com.yugabyte.yw.common.BackupUtil;
 import com.yugabyte.yw.common.PlatformServiceException;
 import com.yugabyte.yw.common.customer.config.CustomerConfigService;
 import com.yugabyte.yw.forms.BackupTableParams;
+import com.yugabyte.yw.models.configs.CustomerConfig;
 import com.yugabyte.yw.models.filters.BackupFilter;
 import com.yugabyte.yw.models.helpers.TaskType;
 import com.yugabyte.yw.models.helpers.TimeUnit;
@@ -39,6 +38,7 @@ import io.swagger.annotations.ApiModel;
 import io.swagger.annotations.ApiModelProperty;
 import java.text.SimpleDateFormat;
 import java.util.ArrayList;
+import java.util.Comparator;
 import java.util.Date;
 import java.util.HashMap;
 import java.util.HashSet;
@@ -83,6 +83,9 @@ public class Backup extends Model {
     // Complete or partial failure to delete
     @EnumValue("FailedToDelete")
     FailedToDelete,
+
+    @EnumValue("Stopping")
+    Stopping,
 
     @EnumValue("Stopped")
     Stopped,
@@ -165,6 +168,10 @@ public class Backup extends Model {
   @ApiModelProperty(value = "Storage Config UUID that created this backup", accessMode = READ_WRITE)
   @Column(nullable = false)
   public UUID storageConfigUUID;
+
+  @ApiModelProperty(value = "Base backup UUID", accessMode = READ_ONLY)
+  @Column(nullable = false)
+  public UUID baseBackupUUID;
 
   @ApiModelProperty(value = "Universe name that created this backup", accessMode = READ_WRITE)
   @Column
@@ -254,7 +261,7 @@ public class Backup extends Model {
     return updateTime;
   }
 
-  @ApiModelProperty(value = "Backup completion time", accessMode = READ_WRITE)
+  @ApiModelProperty(value = "Backup completion time", accessMode = READ_ONLY)
   @Column
   private Date completionTime;
 
@@ -280,12 +287,17 @@ public class Backup extends Model {
       UUID customerUUID, BackupTableParams params, BackupCategory category, BackupVersion version) {
     Backup backup = new Backup();
     backup.backupUUID = UUID.randomUUID();
+    backup.baseBackupUUID =
+        params.baseBackupUUID == null ? backup.backupUUID : params.baseBackupUUID;
     backup.customerUUID = customerUUID;
     backup.universeUUID = params.universeUUID;
     backup.storageConfigUUID = params.storageConfigUUID;
     Universe universe = Universe.maybeGet(params.universeUUID).orElse(null);
     if (universe != null) {
       backup.universeName = universe.name;
+      if (universe.getUniverseDetails().encryptionAtRestConfig.kmsConfigUUID != null) {
+        params.kmsConfigUUID = universe.getUniverseDetails().encryptionAtRestConfig.kmsConfigUUID;
+      }
     }
     backup.state = BackupState.InProgress;
     backup.category = category;
@@ -303,13 +315,13 @@ public class Backup extends Model {
       for (BackupTableParams childBackup : params.backupList) {
         childBackup.backupUuid = backup.backupUUID;
         if (childBackup.storageLocation == null) {
-          BackupUtil.updateDefaultStorageLocation(childBackup, customerUUID);
+          BackupUtil.updateDefaultStorageLocation(childBackup, customerUUID, backup.category);
         }
       }
     } else if (params.storageLocation == null) {
       params.backupUuid = backup.backupUUID;
       // We would derive the storage location based on the parameters
-      BackupUtil.updateDefaultStorageLocation(params, customerUUID);
+      BackupUtil.updateDefaultStorageLocation(params, customerUUID, backup.category);
     }
     CustomerConfig storageConfig = CustomerConfig.get(customerUUID, params.storageConfigUUID);
     if (storageConfig != null) {
@@ -344,6 +356,27 @@ public class Backup extends Model {
     save();
   }
 
+  public void onCompletion(long totalTimeTaken, long totalSizeInBytes, boolean unsetExpiry) {
+    this.completionTime = new Date(this.createTime.getTime() + totalTimeTaken);
+    this.backupInfo.backupSizeInBytes = totalSizeInBytes;
+    // Full chain size is same as total size for single backup.
+    this.backupInfo.fullChainSizeInBytes = totalSizeInBytes;
+    if (unsetExpiry) {
+      this.expiry = null;
+    }
+    this.state = BackupState.Completed;
+    this.save();
+  }
+
+  public void onIncrementCompletion(Date incrementExpiryDate, long incrementSizeInBytes) {
+    if (incrementExpiryDate == null
+        || (this.getExpiry() != null && this.getExpiry().before(incrementExpiryDate))) {
+      this.expiry = incrementExpiryDate;
+    }
+    this.backupInfo.fullChainSizeInBytes += incrementSizeInBytes;
+    this.save();
+  }
+
   public static List<Backup> fetchByUniverseUUID(UUID customerUUID, UUID universeUUID) {
     List<Backup> backupList =
         find.query()
@@ -361,7 +394,7 @@ public class Backup extends Model {
       UUID customerUUID, UUID universeUUID) {
     return fetchByUniverseUUID(customerUUID, universeUUID)
         .stream()
-        .filter(b -> b.backupInfo.actionType == BackupTableParams.ActionType.CREATE)
+        .filter(b -> !Backup.IN_PROGRESS_STATES.contains(b.state))
         .collect(Collectors.toList());
   }
 
@@ -397,6 +430,18 @@ public class Backup extends Model {
     return Backup.find.query().where().eq("task_uuid", taskUUID).findList();
   }
 
+  public static Optional<Backup> fetchLatestByState(UUID customerUuid, BackupState state) {
+    return Backup.find
+        .query()
+        .where()
+        .eq("customer_uuid", customerUuid)
+        .eq("state", state)
+        .orderBy("create_time DESC")
+        .findList()
+        .stream()
+        .findFirst();
+  }
+
   public static Map<Customer, List<Backup>> getExpiredBackups() {
     // Get current timestamp.
     Date now = new Date();
@@ -416,7 +461,10 @@ public class Backup extends Model {
           List<Backup> backupList =
               backups
                   .stream()
-                  .filter(backup -> !Universe.isUniversePaused(backup.getBackupInfo().universeUUID))
+                  .filter(
+                      backup ->
+                          !Universe.isUniversePaused(backup.getBackupInfo().universeUUID)
+                              && !backup.isIncrementalBackup())
                   .collect(Collectors.toList());
           ret.put(customer, backupList);
         });
@@ -434,7 +482,8 @@ public class Backup extends Model {
         || (this.state == BackupState.QueuedForDeletion && newState == BackupState.FailedToDelete)
         || (this.state == BackupState.DeleteInProgress && newState == BackupState.FailedToDelete)
         || (this.state == BackupState.Completed && newState == BackupState.Stopped)
-        || (this.state == BackupState.Failed && newState == BackupState.Stopped)) {
+        || (this.state == BackupState.Failed && newState == BackupState.Stopped)
+        || (this.state == BackupState.Stopping && newState == BackupState.Stopped)) {
       LOG.debug("New Backup API: transitioned from {} to {}", this.state, newState);
       this.state = newState;
       save();
@@ -601,6 +650,35 @@ public class Backup extends Model {
     return universes;
   }
 
+  public static List<Backup> fetchAllBackupsByBaseBackupUUID(
+      UUID customerUUID, UUID baseBackupUUID) {
+    List<Backup> backupChain =
+        find.query()
+            .where()
+            .eq("customer_uuid", customerUUID)
+            .eq("base_backup_uuid", baseBackupUUID)
+            .orderBy()
+            .desc("create_time")
+            .findList();
+    return backupChain;
+  }
+
+  /**
+   * Get last backup in chain with state = 'Completed'.
+   *
+   * @param customerUUID
+   * @param backupUUID
+   */
+  public static Backup getLastSuccessfulBackupInChain(UUID customerUUID, UUID baseBackupUUID) {
+    List<Backup> backupChain = fetchAllBackupsByBaseBackupUUID(customerUUID, baseBackupUUID);
+    Optional<Backup> backup =
+        backupChain.stream().filter(b -> b.state.equals(BackupState.Completed)).findFirst();
+    if (backup.isPresent()) {
+      return backup.get();
+    }
+    return null;
+  }
+
   public static List<Backup> fetchAllBackupsByScheduleUUID(UUID customerUUID, UUID scheduleUUID) {
     return find.query()
         .where()
@@ -650,6 +728,16 @@ public class Backup extends Model {
       orExpr.raw(queryStringOuter, filter.getKeyspaceList());
       query.endOr();
     }
+    if (filter.isOnlyShowDeletedUniverses()) {
+      String universeNotExists =
+          "t0.universe_uuid not in" + "(select U.universe_uuid from universe U)";
+      query.raw(universeNotExists);
+    }
+    if (filter.isOnlyShowDeletedConfigs()) {
+      String configNotExists =
+          "t0.storage_config_uuid not in" + "(select C.config_uuid from customer_config C)";
+      query.raw(configNotExists);
+    }
     return query;
   }
 
@@ -684,5 +772,13 @@ public class Backup extends Model {
     responseMin.setHasNext(response.isHasNext());
     responseMin.setTotalCount(response.getTotalCount());
     return responseMin;
+  }
+
+  public boolean isIncrementalBackup() {
+    return !this.isParentBackup();
+  }
+
+  public boolean isParentBackup() {
+    return this.baseBackupUUID.equals(this.backupUUID);
   }
 }

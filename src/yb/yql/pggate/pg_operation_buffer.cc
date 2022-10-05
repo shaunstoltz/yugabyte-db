@@ -20,6 +20,7 @@
 #include <vector>
 
 #include <boost/circular_buffer.hpp>
+#include <boost/container/small_vector.hpp>
 
 #include "yb/common/constants.h"
 #include "yb/common/pgsql_protocol.pb.h"
@@ -148,8 +149,8 @@ struct InFlightOperation {
   RowKeys keys;
   PerformFuture future;
 
-  explicit InFlightOperation(PerformFuture future_) : future(std::move(future_)) {
-  }
+  explicit InFlightOperation(PerformFuture future_)
+      : future(std::move(future_)) {}
 };
 
 using InFlightOps = boost::circular_buffer_space_optimized<InFlightOperation,
@@ -205,7 +206,51 @@ class PgOperationBuffer::Impl {
         buffering_settings_(buffering_settings) {
   }
 
-  CHECKED_STATUS Add(const PgTableDesc& table, PgsqlWriteOpPtr op, bool transactional) {
+  Status Add(const PgTableDesc& table, PgsqlWriteOpPtr op, bool transactional) {
+    return ClearOnError(DoAdd(table, std::move(op), transactional));
+  }
+
+  Status Flush() {
+    return ClearOnError(DoFlush());
+  }
+
+  Result<BufferableOperations> FlushTake(
+      const PgTableDesc& table, const PgsqlOp& op, bool transactional) {
+    return ClearOnError(DoFlushTake(table, op, transactional));
+  }
+
+  size_t Size() const {
+    return keys_.size() + InFlightOpsCount();
+  }
+
+  void Clear() {
+    VLOG_IF(1, !keys_.empty()) << "Dropping " << keys_.size() << " pending operations";
+    ops_.Clear();
+    txn_ops_.Clear();
+    keys_.clear();
+    // Clearing of in_flight_ops_ might get blocked on future::get()
+    // (see PerformFuture::~PerformFuture() for details). And due to the #12884 issue
+    // in_flight_ops_'s destructor might get called. In this case it is safer to keep
+    // in_flight_ops_ empty before blocking on future::get().
+    // Remove this code after fixing #12884.
+    boost::container::small_vector<InFlightOperation, 16> in_flight_ops;
+    in_flight_ops.reserve(in_flight_ops_.size());
+    for (auto& i : in_flight_ops_) {
+      in_flight_ops.push_back(std::move(i));
+    }
+    in_flight_ops_.clear();
+  }
+
+ private:
+  template<class Res>
+  Res ClearOnError(Res res) {
+    if (!res.ok()) {
+      Clear();
+    }
+    return res;
+  }
+
+  Status DoAdd(const PgTableDesc& table, PgsqlWriteOpPtr op, bool transactional) {
     // Check for buffered operation related to same row.
     // If multiple operations are performed in context of single RPC second operation will not
     // see the results of first operation on DocDB side.
@@ -219,7 +264,7 @@ class PgOperationBuffer::Impl {
       // Prevent conflicts on in-flight operations which use current row_id.
       for (auto i = in_flight_ops_.begin(); i != in_flight_ops_.end(); ++i) {
         if (i->keys.find(row_id) != i->keys.end()) {
-          RETURN_NOT_OK(EnsureCompleted(++i));
+          RETURN_NOT_OK(EnsureCompleted(i - in_flight_ops_.begin() + 1));
           break;
         }
       }
@@ -234,43 +279,30 @@ class PgOperationBuffer::Impl {
       : Status::OK();
   }
 
-  CHECKED_STATUS Flush() {
+  Status DoFlush() {
     RETURN_NOT_OK(SendBuffer());
-    return EnsureCompleted(in_flight_ops_.end());
+    return EnsureAllCompleted();
   }
 
-  Result<BufferableOperations> FlushTake(
+  Result<BufferableOperations> DoFlushTake(
       const PgTableDesc& table, const PgsqlOp& op, bool transactional) {
     BufferableOperations result;
     if (IsFullFlushRequired(table, op)) {
       RETURN_NOT_OK(Flush());
     } else {
       RETURN_NOT_OK(SendBuffer(make_lw_function(
-          [transactional, &result](BufferableOperations ops, bool txn) {
+          [transactional, &result](BufferableOperations* ops, bool txn) {
             if (txn == transactional) {
-              ops.Swap(&result);
+              ops->Swap(&result);
               return true;
             }
             return false;
           })));
-      RETURN_NOT_OK(EnsureCompleted(in_flight_ops_.end()));
+      RETURN_NOT_OK(EnsureAllCompleted());
     }
     return result;
   }
 
-  size_t Size() const {
-    return keys_.size() + InFlightOpsCount();
-  }
-
-  void Clear() {
-    VLOG_IF(1, !keys_.empty()) << "Dropping " << keys_.size() << " pending operations";
-    ops_.Clear();
-    txn_ops_.Clear();
-    keys_.clear();
-    in_flight_ops_.clear();
-  }
-
- private:
   size_t InFlightOpsCount() const {
     size_t ops_count = 0;
     for (const auto& op : in_flight_ops_) {
@@ -279,31 +311,29 @@ class PgOperationBuffer::Impl {
     return ops_count;
   }
 
-  CHECKED_STATUS EnsureCompleted(const InFlightOps::iterator& end) {
-    // Extract the InFlightOperations we are processing and erase them from in_flight_ops_.
-    std::vector<InFlightOperation> extracted_ops;
-    extracted_ops.reserve(end - in_flight_ops_.begin());
-    for (auto i = in_flight_ops_.begin(); i != end; ++i) {
-      extracted_ops.push_back(std::move(*i));
-    }
-    in_flight_ops_.erase(in_flight_ops_.begin(), end);
-    for (auto i = extracted_ops.begin(); i != extracted_ops.end(); ++i) {
-      RETURN_NOT_OK(i->future.Get());
+  Status EnsureAllCompleted() {
+    return EnsureCompleted(in_flight_ops_.size());
+  }
+
+  Status EnsureCompleted(size_t count) {
+    for(; count && !in_flight_ops_.empty(); --count) {
+      RETURN_NOT_OK(in_flight_ops_.front().future.Get());
+      in_flight_ops_.pop_front();
     }
     return Status::OK();
   }
 
-  using SendInterceptor = LWFunction<bool(BufferableOperations, bool)>;
+  using SendInterceptor = LWFunction<bool(BufferableOperations*, bool)>;
 
-  CHECKED_STATUS SendBuffer() {
+  Status SendBuffer() {
     return SendBufferImpl(nullptr /* interceptor */);
   }
 
-  CHECKED_STATUS SendBuffer(const SendInterceptor& interceptor) {
+  Status SendBuffer(const SendInterceptor& interceptor) {
     return SendBufferImpl(&interceptor);
   }
 
-  CHECKED_STATUS SendBufferImpl(const SendInterceptor* interceptor) {
+  Status SendBufferImpl(const SendInterceptor* interceptor) {
     if (keys_.empty()) {
       return Status::OK();
     }
@@ -330,14 +360,19 @@ class PgOperationBuffer::Impl {
                               BufferableOperations ops,
                               bool transactional,
                               size_t ops_count) {
-    if (!ops.empty() && !(interceptor && (*interceptor)(std::move(ops), transactional))) {
+    if (!ops.empty() && !(interceptor && (*interceptor)(&ops, transactional))) {
       EnsureCapacity(&in_flight_ops_, buffering_settings_);
-      size_t kMaxInFlightOperations = buffering_settings_.max_in_flight_operations;
-      for (int64_t space_required = (InFlightOpsCount() + ops_count) - kMaxInFlightOperations;
-           space_required > 0;) {
-        auto it = in_flight_ops_.begin();
-        space_required -= it->keys.size();
-        RETURN_NOT_OK(EnsureCompleted(++it));
+      // In case max_in_flight_operations < max_batch_size, the number of in-flight operations will
+      // be equal to max_batch_size after sending single buffer. So use max of these values for
+      // actual_max_in_flight_operations.
+      const auto actual_max_in_flight_operations = std::max(
+          buffering_settings_.max_in_flight_operations,
+          buffering_settings_.max_batch_size);
+      int64_t space_required = (InFlightOpsCount() + ops_count) - actual_max_in_flight_operations;
+      while (!in_flight_ops_.empty() &&
+             (space_required > 0 || in_flight_ops_.front().future.Ready())) {
+        space_required -= in_flight_ops_.front().keys.size();
+        RETURN_NOT_OK(EnsureCompleted(1));
       }
       in_flight_ops_.push_back(
         InFlightOperation(VERIFY_RESULT(flusher_(std::move(ops), transactional))));
@@ -382,7 +417,7 @@ Status PgOperationBuffer::Add(const PgTableDesc& table, PgsqlWriteOpPtr op, bool
     return impl_->Add(table, std::move(op), transactional);
 }
 
-CHECKED_STATUS PgOperationBuffer::Flush() {
+Status PgOperationBuffer::Flush() {
     return impl_->Flush();
 }
 

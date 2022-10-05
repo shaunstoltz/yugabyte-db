@@ -51,20 +51,6 @@ enum ReplicaType {
   READ_ONLY,
 };
 
-struct cloud_equal_to {
-  bool operator()(const yb::CloudInfoPB& x, const yb::CloudInfoPB& y) const {
-    return x.placement_cloud() == y.placement_cloud() &&
-        x.placement_region() == y.placement_region() &&
-        x.placement_zone() == y.placement_zone();
-  }
-};
-
-struct cloud_hash {
-  std::size_t operator()(const yb::CloudInfoPB& ci) const {
-    return std::hash<std::string>{} (TSDescriptor::generate_placement_id(ci));
-  }
-};
-
 struct CBTabletMetadata {
   bool is_missing_replicas() { return is_under_replicated || !under_replicated_placements.empty(); }
 
@@ -125,7 +111,6 @@ struct CBTabletMetadata {
   std::string ToString() const;
 };
 
-using AffinitizedZonesSet = std::unordered_set<CloudInfoPB, cloud_hash, cloud_equal_to>;
 using PathToTablets = std::unordered_map<std::string, std::set<TabletId>>;
 
 struct CBTabletServerMetadata {
@@ -245,6 +230,13 @@ class GlobalLoadState {
 
   bool drive_aware_ = true;
 
+  // The list of tablet server ids that match the blacklist.
+  std::set<TabletServerId> blacklisted_servers_;
+  std::set<TabletServerId> leader_blacklisted_servers_;
+
+  // List of tablet server ids that have pending deletes.
+  std::set<TabletServerId> servers_with_pending_deletes_;
+
  private:
   // Map from tablet server ids to the global metadata we store for each.
   std::unordered_map<TabletServerId, CBTabletServerLoadCounts> per_ts_global_meta_;
@@ -281,10 +273,12 @@ class PerTableLoadState {
 
   // Comparator to sort tablet servers' leader load.
   struct LeaderLoadComparator {
-    explicit LeaderLoadComparator(PerTableLoadState* state) : state_(state) {}
+    explicit LeaderLoadComparator(PerTableLoadState* state, GlobalLoadState* global_state)
+      : state_(state), global_state_(global_state) {}
     bool operator()(const TabletServerId& a, const TabletServerId& b);
 
     PerTableLoadState* state_;
+    GlobalLoadState* global_state_;
   };
 
   // Get the load for a certain TS.
@@ -293,17 +287,12 @@ class PerTableLoadState {
   // Get the load for a certain TS.
   size_t GetLeaderLoad(const TabletServerId& ts_uuid) const;
 
-  void SetBlacklist(const BlacklistPB& blacklist) { blacklist_ = blacklist; }
-  void SetLeaderBlacklist(const BlacklistPB& leader_blacklist) {
-    leader_blacklist_ = leader_blacklist;
-  }
-
   bool IsTsInLivePlacement(TSDescriptor* ts_desc) {
     return ts_desc->placement_uuid() == options_->live_placement_uuid;
   }
 
   // Update the per-tablet information for this tablet.
-  CHECKED_STATUS UpdateTablet(TabletInfo* tablet);
+  Status UpdateTablet(TabletInfo* tablet);
 
   virtual void UpdateTabletServer(std::shared_ptr<TSDescriptor> ts_desc);
 
@@ -324,15 +313,15 @@ class PerTableLoadState {
     const TabletId& tablet_id, const PlacementInfoPB& placement_info, TabletServerId* out_from_ts,
     TabletServerId* out_to_ts);
 
-  CHECKED_STATUS AddReplica(const TabletId& tablet_id, const TabletServerId& to_ts);
+  Status AddReplica(const TabletId& tablet_id, const TabletServerId& to_ts);
 
-  CHECKED_STATUS RemoveReplica(const TabletId& tablet_id, const TabletServerId& from_ts);
+  Status RemoveReplica(const TabletId& tablet_id, const TabletServerId& from_ts);
 
   void SortLoad();
 
   void SortDriveLoad();
 
-  CHECKED_STATUS MoveLeader(const TabletId& tablet_id,
+  Status MoveLeader(const TabletId& tablet_id,
                             const TabletServerId& from_ts,
                             const TabletServerId& to_ts = "",
                             const TabletServerId& to_ts_path = "");
@@ -343,30 +332,23 @@ class PerTableLoadState {
 
   void LogSortedLeaderLoad();
 
-  inline bool IsLeaderLoadBelowThreshold(const TabletServerId& ts_uuid) {
-    return ((leader_balance_threshold_ > 0) &&
-            (GetLeaderLoad(ts_uuid) <= implicit_cast<size_t>(leader_balance_threshold_)));
-  }
+  int AdjustLeaderBalanceThreshold(int zone_set_size);
 
-  void AdjustLeaderBalanceThreshold();
-
-  std::shared_ptr<const TabletReplicaMap> GetReplicaLocations(TabletInfo* tablet);
-
-  CHECKED_STATUS AddRunningTablet(const TabletId& tablet_id,
+  Status AddRunningTablet(const TabletId& tablet_id,
                                   const TabletServerId& ts_uuid,
                                   const std::string& path);
 
-  CHECKED_STATUS RemoveRunningTablet(const TabletId& tablet_id, const TabletServerId& ts_uuid);
+  Status RemoveRunningTablet(const TabletId& tablet_id, const TabletServerId& ts_uuid);
 
-  CHECKED_STATUS AddStartingTablet(const TabletId& tablet_id, const TabletServerId& ts_uuid);
+  Status AddStartingTablet(const TabletId& tablet_id, const TabletServerId& ts_uuid);
 
-  CHECKED_STATUS AddLeaderTablet(const TabletId& tablet_id,
+  Status AddLeaderTablet(const TabletId& tablet_id,
                                  const TabletServerId& ts_uuid,
                                  const TabletServerId& ts_path);
 
-  CHECKED_STATUS RemoveLeaderTablet(const TabletId& tablet_id, const TabletServerId& ts_uuid);
+  Status RemoveLeaderTablet(const TabletId& tablet_id, const TabletServerId& ts_uuid);
 
-  CHECKED_STATUS AddDisabledByTSTablet(const TabletId& tablet_id, const TabletServerId& ts_uuid);
+  Status AddDisabledByTSTablet(const TabletId& tablet_id, const TabletServerId& ts_uuid);
 
   // PerTableLoadState member fields
 
@@ -404,27 +386,29 @@ class PerTableLoadState {
   // Set of tablet ids that have been determined to have replicas in incorrect placements.
   std::set<TabletId> tablets_wrong_placement_;
 
-  // The cached blacklist setting of the cluster. We store this upfront, as we add to the list of
-  // tablet servers one by one, so we compare against it once per tablet server.
-  BlacklistPB blacklist_;
-  BlacklistPB leader_blacklist_;
-
-  // The list of tablet server ids that match the cached blacklist.
-  std::set<TabletServerId> blacklisted_servers_;
-  std::set<TabletServerId> leader_blacklisted_servers_;
-
-  // List of tablet server ids that have pending deletes.
-  std::set<TabletServerId> servers_with_pending_deletes_;
-
   // List of tablet ids that have been added to a new tablet server.
   std::set<TabletId> tablets_added_;
 
   // Number of leaders per each tablet server to balance below.
-  int leader_balance_threshold_ = 0;
+  const int leader_balance_threshold_ = 0;
 
-  // List of table server ids sorted by whether leader blacklisted and their leader load.
-  // If affinitized leaders is enabled, stores leader load for affinitized nodes.
-  vector<TabletServerId> sorted_leader_load_;
+  // Table server ids that are eligible for leader placement.
+  // The outer list is sorted by descending priority (value 1 is highest priority).
+  // The inner list servers are sorted by ascending leader load.
+  // Blacklisted servers are considered to have least priority and maximum load.
+  // Ex: Say we have the following servers:
+  // A: 3 leaders, priority 1
+  // B: 2 leaders, priority 1
+  // C: 5 leaders, priority 2
+  // D: 4 leaders, No priority
+  // E: 3 leaders, No priority
+  // F: 1 leaders, No priority, leader blacklist
+  // We will populate in the following manner:
+  // [[B,A] [C],[E,D,F]]
+  // And if B was also leader blacklisted:
+  // [[A] [C],[E,D,B,F]]
+  // If affinitized leaders is not enabled, all servers are treated as priority 1.
+  vector<vector<TabletServerId>> sorted_leader_load_;
 
   std::unordered_map<TableId, TabletToTabletServerMap> pending_add_replica_tasks_;
   std::unordered_map<TableId, TabletToTabletServerMap> pending_remove_replica_tasks_;
@@ -440,7 +424,7 @@ class PerTableLoadState {
   // remove are executed.
   GlobalLoadState* global_state_;
 
-  // Boolean whether tablets for this table should respect the affinited zones.
+  // Boolean whether tablets for this table should respect the affinitized zones.
   bool use_preferred_zones_ = true;
 
   // check_ts_liveness_ is used to indicate if the TS descriptors
@@ -451,12 +435,12 @@ class PerTableLoadState {
   // Allow only leader balancing for this table.
   bool allow_only_leader_balancing_ = false;
 
-  // If affinitized leaders is enabled, stores leader load for non affinitized nodes.
-  vector<TabletServerId> sorted_non_affinitized_leader_load_;
   // List of availability zones for affinitized leaders.
-  AffinitizedZonesSet affinitized_zones_;
+  vector<AffinitizedZonesSet> affinitized_zones_;
 
  private:
+  bool ShouldSkipReplica(const TabletReplica& replica);
+  size_t GetReplicaSize(std::shared_ptr<const TabletReplicaMap> replica_map);
   const std::string uninitialized_ts_meta_format_msg =
       "Found uninitialized ts_meta: ts_uuid: $0, table_uuid: $1";
 

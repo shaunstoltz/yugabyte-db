@@ -8,35 +8,34 @@ menu:
     identifier: fault-tolerance-4-kubernetes
     parent: explore
     weight: 215
-isTocNested: true
-showAsideToc: true
+type: docs
 ---
 
 <ul class="nav nav-tabs-alt nav-tabs-yb">
 
   <li >
-    <a href="/preview/explore/fault-tolerance/macos" class="nav-link">
+    <a href="../macos/" class="nav-link">
       <i class="fab fa-apple" aria-hidden="true"></i>
       macOS
     </a>
   </li>
 
   <li >
-    <a href="/preview/explore/fault-tolerance/linux" class="nav-link">
+    <a href="../linux/" class="nav-link">
       <i class="fab fa-linux" aria-hidden="true"></i>
       Linux
     </a>
   </li>
 
   <li >
-    <a href="/preview/explore/fault-tolerance/docker" class="nav-link">
+    <a href="../docker/" class="nav-link">
       <i class="fab fa-docker" aria-hidden="true"></i>
       Docker
     </a>
   </li>
 
   <li >
-    <a href="/preview/explore/fault-tolerance/kubernetes" class="nav-link active">
+    <a href="../kubernetes/" class="nav-link active">
       <i class="fas fa-cubes" aria-hidden="true"></i>
       Kubernetes
     </a>
@@ -61,6 +60,7 @@ Create a new YugabyteDB cluster.
 
 ```sh
 $ helm install yb-demo yugabytedb/yugabyte \
+--version {{<yb-version version="stable" format="short">}} \
 --set resource.master.requests.cpu=0.5,resource.master.requests.memory=0.5Gi,\
 resource.tserver.requests.cpu=0.5,resource.tserver.requests.memory=0.5Gi --namespace yb-demo
 ```

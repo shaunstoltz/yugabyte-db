@@ -73,6 +73,7 @@ class WriteCallback;
 class FileNumbersProvider;
 struct JobContext;
 struct ExternalSstFileInfo;
+struct RocksDBPriorityThreadPoolMetrics;
 
 class DBImpl : public DB {
  public:
@@ -221,13 +222,16 @@ class DBImpl : public DB {
 
   UserFrontierPtr GetFlushedFrontier() override;
 
-  CHECKED_STATUS ModifyFlushedFrontier(
+  Status ModifyFlushedFrontier(
       UserFrontierPtr frontier,
       FrontierModificationMode mode) override;
 
   FlushAbility GetFlushAbility() override;
 
   UserFrontierPtr GetMutableMemTableFrontier(UpdateUserValueType type) override;
+
+  // Calculates specified frontier_type for all mem tables (active and immutable).
+  UserFrontierPtr CalcMemTableFrontier(UpdateUserValueType frontier_type) override;
 
   // Obtains the meta data of the specified column family of the DB.
   // STATUS(NotFound, "") will be returned if the current DB does not have
@@ -476,12 +480,15 @@ class DBImpl : public DB {
   // Checks that source database has appropriate seqno.
   // I.e. seqno ranges of imported database does not overlap with seqno ranges of destination db.
   // And max seqno of imported database is less that active seqno of destination db.
-  CHECKED_STATUS Import(const std::string& source_dir) override;
+  Status Import(const std::string& source_dir) override;
 
   bool AreWritesStopped();
   bool NeedsDelay() override;
 
   Result<std::string> GetMiddleKey() override;
+
+  // Returns a table reader for the largest SST file.
+  Result<TableReader*> TEST_GetLargestSstTableReader() override;
 
   // Used in testing to make the old memtable immutable and start writing to a new one.
   void TEST_SwitchMemtable() override;
@@ -666,7 +673,7 @@ class DBImpl : public DB {
 
   const Snapshot* GetSnapshotImpl(bool is_write_conflict_boundary);
 
-  CHECKED_STATUS ApplyVersionEdit(VersionEdit* edit);
+  Status ApplyVersionEdit(VersionEdit* edit);
 
   void SubmitCompactionOrFlushTask(std::unique_ptr<ThreadPoolTask> task);
 
@@ -898,6 +905,10 @@ class DBImpl : public DB {
 
   // stores the number of flushes are currently running
   int num_running_flushes_;
+
+  // Tracks state changes for priority thread pool tasks.
+  // Metrics are updated within the PriorityThreadPoolTask.
+  std::shared_ptr<RocksDBPriorityThreadPoolMetrics> priority_thread_pool_metrics_;
 
   // Information for a manual compaction
   struct ManualCompaction {

@@ -7,10 +7,11 @@ import { Col, Alert } from 'react-bootstrap';
 import { YBModal, YBInputField, YBSelectWithLabel, YBToggle, YBCheckBox } from '../fields';
 import { isNonEmptyArray } from '../../../../utils/ObjectUtils';
 import { getPromiseState } from '../../../../utils/PromiseUtils';
-import { 
+import {
   isKubernetesUniverse,
   getPrimaryCluster,
-  getReadOnlyCluster 
+  getReadOnlyCluster,
+  getUniverseRegions
 } from '../../../../utils/UniverseUtils';
 import { isDefinedNotNull, isNonEmptyObject } from '../../../../utils/ObjectUtils';
 import './RollingUpgradeForm.scss';
@@ -18,7 +19,9 @@ import { EncryptionInTransit } from './EncryptionInTransit';
 import GFlagComponent from '../../../universes/UniverseForm/GFlagComponent';
 import { FlexShrink, FlexContainer } from '../../flexbox/YBFlexBox';
 import clsx from 'clsx';
+import { TASK_LONG_TIMEOUT } from '../../../tasks/constants';
 import WarningIcon from './images/warning.svg';
+import { sortVersion } from '../../../releases';
 
 export default class RollingUpgradeForm extends Component {
   constructor(props) {
@@ -55,18 +58,14 @@ export default class RollingUpgradeForm extends Component {
       universe: {
         currentUniverse: {
           data: {
-            universeDetails: {
-              currentClusterType,
-              clusters,
-              nodePrefix,
-              rootAndClientRootCASame
-            },
+            universeDetails: { currentClusterType, clusters, nodePrefix, rootAndClientRootCASame },
             universeUUID
           }
         }
       },
       overrideIntentParams,
-      resetLocation
+      resetLocation,
+      featureFlags
     } = this.props;
 
     const payload = {};
@@ -74,6 +73,20 @@ export default class RollingUpgradeForm extends Component {
       case 'softwareUpgradesModal': {
         payload.taskType = 'Software';
         payload.upgradeOption = values.rollingUpgrade ? 'Rolling' : 'Non-Rolling';
+        break;
+      }
+      case 'vmImageUpgradeModal': {
+        const regionList = getUniverseRegions(clusters);
+        const regionAMIs = regionList.reduce(
+          (prev, curRegion) => ({
+            ...prev,
+            [curRegion.uuid]: values[curRegion.uuid]
+          }),
+          {}
+        );
+        payload.taskType = 'VMImage';
+        payload.upgradeOption = 'Rolling';
+        payload.machineImages = regionAMIs;
         break;
       }
       case 'systemdUpgrade': {
@@ -88,15 +101,18 @@ export default class RollingUpgradeForm extends Component {
         break;
       }
       case 'tlsConfigurationModal': {
-        const cluster = currentClusterType === 'PRIMARY' ?
-          getPrimaryCluster(clusters) : getReadOnlyCluster(clusters);
+        const cluster =
+          currentClusterType === 'PRIMARY'
+            ? getPrimaryCluster(clusters)
+            : getReadOnlyCluster(clusters);
         payload.taskType = 'Certs';
         payload.upgradeOption = 'Rolling';
         payload.enableNodeToNodeEncrypt = cluster.userIntent.enableNodeToNodeEncrypt;
         payload.enableClientToNodeEncrypt = cluster.userIntent.enableClientToNodeEncrypt;
         payload.rootAndClientRootCASame = rootAndClientRootCASame;
-        payload.rootCA = values.tlsCertificate === "Create New Certificate" ? null : values.tlsCertificate;
-        payload.createNewRootCA = values.tlsCertificate === "Create New Certificate";
+        payload.rootCA =
+          values.tlsCertificate === 'Create New Certificate' ? null : values.tlsCertificate;
+        payload.createNewRootCA = values.tlsCertificate === 'Create New Certificate';
         break;
       }
       case 'rollingRestart': {
@@ -109,6 +125,11 @@ export default class RollingUpgradeForm extends Component {
         payload.upgradeOption = 'Rolling';
         break;
       }
+      case 'thirdpartyUpgradeModal': {
+        payload.taskType = 'Thirdparty_Software';
+        payload.upgradeOption = 'Rolling';
+        break;
+      }
       default:
         return;
     }
@@ -117,7 +138,9 @@ export default class RollingUpgradeForm extends Component {
     if (!isDefinedNotNull(primaryCluster)) {
       return;
     }
-    payload.ybSoftwareVersion = values.ybSoftwareVersion;
+    if (payload.taskType !== 'VMImage') {
+      payload.ybSoftwareVersion = values.ybSoftwareVersion;
+    }
     payload.universeUUID = universeUUID;
     payload.nodePrefix = nodePrefix;
     const masterGFlagList = [];
@@ -145,6 +168,9 @@ export default class RollingUpgradeForm extends Component {
         primaryCluster.userIntent.deviceInfo.volumeSize = overrideIntentParams.volumeSize;
       }
     }
+
+    if (!isDefinedNotNull(primaryCluster.enableYbc))
+      payload.enableYbc = featureFlags.released.enableYbc || featureFlags.test.enableYbc;
 
     this.props.submitRollingUpgradeForm(payload, universeUUID).then((response) => {
       if (response.payload.status === 200) {
@@ -174,20 +200,24 @@ export default class RollingUpgradeForm extends Component {
       handleSubmit,
       universe,
       modal: { visibleModal },
-      universe: { error },
-      softwareVersions,
+      universe: { error, supportedReleases },
       formValues,
-      certificates
+      certificates,
+      overrideIntentParams
     } = this.props;
 
     const currentVersion = this.getCurrentVersion();
     const submitAction = handleSubmit(this.setRollingUpgradeProperties);
-
-    const softwareVersionOptions = softwareVersions.map((item, idx) => (
-      <option key={idx} disabled={item === currentVersion} value={item}>
-        {item}
-      </option>
-    ));
+    let softwareVersionOptions = [];
+    if (getPromiseState(supportedReleases).isSuccess()) {
+      softwareVersionOptions = (supportedReleases?.data || [])
+        ?.sort(sortVersion)
+        .map((item, idx) => (
+          <option key={idx} disabled={item === currentVersion} value={item}>
+            {item}
+          </option>
+        ));
+    }
 
     const tlsCertificateOptions = certificates.map((item) => (
       <option
@@ -230,7 +260,7 @@ export default class RollingUpgradeForm extends Component {
                   }}
                 />
               ) : (
-                <span>Latest software is installed</span>
+                <span>Selected software version already installed</span>
               )
             }
             asyncValidating={!this.state.formConfirmed}
@@ -258,6 +288,39 @@ export default class RollingUpgradeForm extends Component {
           </YBModal>
         );
       }
+      case 'vmImageUpgradeModal': {
+        const regionList = getUniverseRegions(
+          universe?.currentUniverse?.data.universeDetails?.clusters
+        );
+
+        return (
+          <YBModal
+            className={getPromiseState(universe.rollingUpgrade).isError() ? 'modal-shake' : ''}
+            visible={modalVisible}
+            formName="RollingUpgradeForm"
+            onHide={this.resetAndClose}
+            cancelLabel="Cancel"
+            error={error}
+            onFormSubmit={submitAction}
+            showCancelButton={true}
+            size="large"
+            submitLabel="Upgrade"
+            title="Upgrade VM Image"
+          >
+            <div className="form-right-aligned-labels rolling-upgrade-form">
+              {regionList.map((region) => (
+                <Field
+                  name={region.uuid}
+                  type="text"
+                  component={YBInputField}
+                  label={`${region.name} AMI`}
+                />
+              ))}
+            </div>
+            {errorAlert}
+          </YBModal>
+        );
+      }
       case 'gFlagsModal': {
         return (
           <YBModal
@@ -266,11 +329,13 @@ export default class RollingUpgradeForm extends Component {
             formName="RollingUpgradeForm"
             onHide={this.resetAndClose}
             footerAccessory={
-              formValues.upgradeOption === 'Non-Rolling' && (
+              formValues.upgradeOption === 'Non-Restart' ? (
                 <span className="non-rolling-msg">
                   <img alt="Note" src={WarningIcon} />
                   &nbsp; <b>Note!</b> &nbsp; Flags that require rolling restart won't be applied
                 </span>
+              ) : (
+                <></>
               )
             }
             title="G-Flags"
@@ -323,14 +388,16 @@ export default class RollingUpgradeForm extends Component {
                   ))}
                 </div>
               </FlexContainer>
-              {errorAlert}
+              <div className="gflag-err-msg">{errorAlert}</div>
             </div>
           </YBModal>
         );
       }
       case 'tlsConfigurationModal': {
-        if (this.props.enableNewEncryptionInTransitModal &&
-          !isKubernetesUniverse(universe.currentUniverse.data)) {
+        if (
+          this.props.enableNewEncryptionInTransitModal &&
+          !isKubernetesUniverse(universe.currentUniverse.data)
+        ) {
           return (
             <EncryptionInTransit
               visible={modalVisible}
@@ -472,21 +539,61 @@ export default class RollingUpgradeForm extends Component {
             formName="RollingUpgradeForm"
             showCancelButton
             onHide={this.resetAndClose}
-            title="Confirm Resize Nodes"
+            title="Resize Nodes"
             onFormSubmit={submitAction}
             error={error}
             footerAccessory={
               <YBCheckBox
-                  label="Confirm rolling restart"
-                  input={{
-                    checked: this.state.formConfirmed,
-                    onChange: this.toggleConfirmValidation
-                  }}
+                label="Confirm resize nodes"
+                input={{
+                  checked: this.state.formConfirmed,
+                  onChange: this.toggleConfirmValidation
+                }}
               />
             }
             asyncValidating={!this.state.formConfirmed}
           >
             <div className="form-right-aligned-labels rolling-upgrade-form top-10 time-delay-container">
+              {overrideIntentParams.instanceType ? (
+                <Field
+                  name="timeDelay"
+                  type="number"
+                  component={YBInputField}
+                  label="Rolling Upgrade Delay Between Servers (secs)"
+                  initValue={TASK_LONG_TIMEOUT / 1000}
+                />
+              ) : (
+                <span>This operation will be performed without restart</span>
+              )}
+            </div>
+            {errorAlert}
+          </YBModal>
+        );
+      }
+      case 'thirdpartyUpgradeModal': {
+        return (
+          <YBModal
+            className={getPromiseState(universe.rollingUpgrade).isError() ? 'modal-shake' : ''}
+            visible={modalVisible}
+            formName="RollingUpgradeForm"
+            onHide={this.resetAndClose}
+            submitLabel="Upgrade"
+            showCancelButton
+            title="Initiate Third-party Software Upgrade"
+            onFormSubmit={submitAction}
+            error={error}
+            footerAccessory={
+              <YBCheckBox
+                label="Confirm third-party software upgrade"
+                input={{
+                  checked: this.state.formConfirmed,
+                  onChange: this.toggleConfirmValidation
+                }}
+              />
+            }
+            asyncValidating={!this.state.formConfirmed}
+          >
+            <div className="form-right-aligned-labels rolling-upgrade-form">
               <Field
                 name="timeDelay"
                 type="number"

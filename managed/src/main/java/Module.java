@@ -2,34 +2,38 @@
 
 import com.google.inject.AbstractModule;
 import com.google.inject.Provides;
-import com.yugabyte.yw.cloud.AWSInitializer;
-import com.yugabyte.yw.cloud.aws.AWSCloudModule;
+import com.google.inject.Singleton;
+import com.google.inject.name.Named;
+import com.yugabyte.yw.cloud.CloudModules;
+import com.yugabyte.yw.cloud.aws.AWSInitializer;
 import com.yugabyte.yw.commissioner.BackupGarbageCollector;
 import com.yugabyte.yw.commissioner.CallHome;
 import com.yugabyte.yw.commissioner.DefaultExecutorServiceProvider;
 import com.yugabyte.yw.commissioner.ExecutorServiceProvider;
 import com.yugabyte.yw.commissioner.HealthChecker;
 import com.yugabyte.yw.commissioner.SetUniverseKey;
+import com.yugabyte.yw.commissioner.PitrConfigPoller;
 import com.yugabyte.yw.commissioner.SupportBundleCleanup;
 import com.yugabyte.yw.commissioner.TaskExecutor;
 import com.yugabyte.yw.commissioner.TaskGarbageCollector;
+import com.yugabyte.yw.commissioner.YbcUpgrade;
+import com.yugabyte.yw.common.AccessKeyRotationUtil;
 import com.yugabyte.yw.common.AccessManager;
 import com.yugabyte.yw.common.AlertManager;
 import com.yugabyte.yw.common.ConfigHelper;
 import com.yugabyte.yw.common.CustomerTaskManager;
 import com.yugabyte.yw.common.ExtraMigrationManager;
-import com.yugabyte.yw.common.GFlagsValidation;
-import com.yugabyte.yw.common.HealthManager;
 import com.yugabyte.yw.common.NativeKubernetesManager;
 import com.yugabyte.yw.common.NetworkManager;
 import com.yugabyte.yw.common.NodeManager;
-import com.yugabyte.yw.common.PlatformInstanceClientFactory;
+import com.yugabyte.yw.common.PlatformScheduler;
 import com.yugabyte.yw.common.ReleaseManager;
 import com.yugabyte.yw.common.ShellKubernetesManager;
 import com.yugabyte.yw.common.ShellProcessHandler;
 import com.yugabyte.yw.common.SupportBundleUtil;
 import com.yugabyte.yw.common.SwamperHelper;
 import com.yugabyte.yw.common.TemplateManager;
+import com.yugabyte.yw.common.WSClientRefresher;
 import com.yugabyte.yw.common.YamlWrapper;
 import com.yugabyte.yw.common.YcqlQueryExecutor;
 import com.yugabyte.yw.common.YsqlQueryExecutor;
@@ -38,11 +42,15 @@ import com.yugabyte.yw.common.alerts.AlertsGarbageCollector;
 import com.yugabyte.yw.common.alerts.QueryAlerts;
 import com.yugabyte.yw.common.config.RuntimeConfigFactory;
 import com.yugabyte.yw.common.config.impl.SettableRuntimeConfigFactory;
+import com.yugabyte.yw.common.gflags.GFlagsValidation;
+import com.yugabyte.yw.common.ha.PlatformInstanceClient;
 import com.yugabyte.yw.common.ha.PlatformReplicationHelper;
 import com.yugabyte.yw.common.ha.PlatformReplicationManager;
 import com.yugabyte.yw.common.kms.EncryptionAtRestManager;
 import com.yugabyte.yw.common.kms.util.EncryptionAtRestUniverseKeyCache;
+import com.yugabyte.yw.common.kms.util.GcpEARServiceUtil;
 import com.yugabyte.yw.common.metrics.PlatformMetricsProcessor;
+import com.yugabyte.yw.common.metrics.SwamperTargetsFileUpdater;
 import com.yugabyte.yw.common.services.LocalYBClientService;
 import com.yugabyte.yw.common.services.YBClientService;
 import com.yugabyte.yw.common.ybflyway.YBFlywayInit;
@@ -51,7 +59,8 @@ import com.yugabyte.yw.controllers.PlatformHttpActionAdapter;
 import com.yugabyte.yw.metrics.MetricQueryHelper;
 import com.yugabyte.yw.queries.QueryHelper;
 import com.yugabyte.yw.scheduler.Scheduler;
-import javax.persistence.PersistenceException;
+import de.dentrassi.crypto.pem.PemKeyStoreProvider;
+import java.security.Security;
 import lombok.extern.slf4j.Slf4j;
 import org.pac4j.core.client.Clients;
 import org.pac4j.core.config.Config;
@@ -59,7 +68,6 @@ import org.pac4j.core.http.url.DefaultUrlResolver;
 import org.pac4j.oidc.client.OidcClient;
 import org.pac4j.oidc.config.OidcConfiguration;
 import org.pac4j.oidc.profile.OidcProfile;
-import org.pac4j.play.CallbackController;
 import org.pac4j.play.store.PlayCacheSessionStore;
 import org.pac4j.play.store.PlaySessionStore;
 import play.Configuration;
@@ -90,9 +98,9 @@ public class Module extends AbstractModule {
       log.info("Using Evolutions. Not using flyway migrations.");
     }
 
+    Security.addProvider(new PemKeyStoreProvider());
     bind(RuntimeConfigFactory.class).to(SettableRuntimeConfigFactory.class).asEagerSingleton();
-    // TODO: other clouds
-    install(new AWSCloudModule());
+    install(new CloudModules());
 
     // Bind Application Initializer
     bind(AppInit.class).asEagerSingleton();
@@ -106,7 +114,6 @@ public class Module extends AbstractModule {
     // We only needed to bind below ones for Platform mode.
     if (config.getString("yb.mode", "PLATFORM").equals("PLATFORM")) {
       bind(SwamperHelper.class).asEagerSingleton();
-      bind(HealthManager.class).asEagerSingleton();
       bind(NodeManager.class).asEagerSingleton();
       bind(MetricQueryHelper.class).asEagerSingleton();
       bind(QueryHelper.class).asEagerSingleton();
@@ -121,6 +128,7 @@ public class Module extends AbstractModule {
       bind(Scheduler.class).asEagerSingleton();
       bind(HealthChecker.class).asEagerSingleton();
       bind(TaskGarbageCollector.class).asEagerSingleton();
+      bind(PitrConfigPoller.class).asEagerSingleton();
       bind(BackupGarbageCollector.class).asEagerSingleton();
       bind(SupportBundleCleanup.class).asEagerSingleton();
       bind(EncryptionAtRestManager.class).asEagerSingleton();
@@ -133,8 +141,8 @@ public class Module extends AbstractModule {
       bind(PlatformMetricsProcessor.class).asEagerSingleton();
       bind(AlertsGarbageCollector.class).asEagerSingleton();
       bind(AlertConfigurationWriter.class).asEagerSingleton();
+      bind(SwamperTargetsFileUpdater.class).asEagerSingleton();
       bind(PlatformReplicationManager.class).asEagerSingleton();
-      bind(PlatformInstanceClientFactory.class).asEagerSingleton();
       bind(PlatformReplicationHelper.class).asEagerSingleton();
       bind(GFlagsValidation.class).asEagerSingleton();
       bind(ExecutorServiceProvider.class).to(DefaultExecutorServiceProvider.class);
@@ -143,57 +151,47 @@ public class Module extends AbstractModule {
       bind(NativeKubernetesManager.class).asEagerSingleton();
       bind(SupportBundleUtil.class).asEagerSingleton();
       bind(MetricGrafanaController.class).asEagerSingleton();
-
-      final CallbackController callbackController = new CallbackController();
-      // TODO(sbapat): Check whats the use case for setting default url because '/' is anyway
-      //  used when we do not call setDefaultUrl here.
-      callbackController.setDefaultUrl(config.getString("yb.security.oidcDefaultRedirectUrl"));
-      bind(CallbackController.class).toInstance(callbackController);
+      bind(PlatformScheduler.class).asEagerSingleton();
+      bind(AccessKeyRotationUtil.class).asEagerSingleton();
+      bind(GcpEARServiceUtil.class).asEagerSingleton();
+      bind(YbcUpgrade.class).asEagerSingleton();
     }
   }
 
   @Provides
   protected OidcClient<OidcProfile, OidcConfiguration> provideOidcClient(
       RuntimeConfigFactory runtimeConfigFactory) {
-    final OidcConfiguration oidcConfiguration = new OidcConfiguration();
-
-    try {
-      final com.typesafe.config.Config config = runtimeConfigFactory.globalRuntimeConf();
-      if (buildOidcClientFromAppConfig(oidcConfiguration, config)) {
-        return new OidcClient<>(oidcConfiguration);
-      }
-    } catch (PersistenceException e) {
-      // TODO(sbapat): This should not be needed.
-      log.debug("Defaulting to static configuration since runtime configuration is not available.");
-      com.typesafe.config.Config config1 = this.config.underlying();
-      if (buildOidcClientFromAppConfig(oidcConfiguration, config1)) {
-        return new OidcClient<>(oidcConfiguration);
-      }
-    }
-    return new OidcClient<>(oidcConfiguration);
-  }
-
-  private boolean buildOidcClientFromAppConfig(
-      OidcConfiguration oidcConfiguration, com.typesafe.config.Config config) {
-    if (config.getString("yb.security.type").equals("OIDC")) {
+    com.typesafe.config.Config config = runtimeConfigFactory.globalRuntimeConf();
+    String securityType = config.getString("yb.security.type");
+    if (securityType.equals("OIDC")) {
+      OidcConfiguration oidcConfiguration = new OidcConfiguration();
       oidcConfiguration.setClientId(config.getString("yb.security.clientID"));
       oidcConfiguration.setSecret(config.getString("yb.security.secret"));
       oidcConfiguration.setScope(config.getString("yb.security.oidcScope"));
       oidcConfiguration.setDiscoveryURI(config.getString("yb.security.discoveryURI"));
       oidcConfiguration.setMaxClockSkew(3600);
       oidcConfiguration.setResponseType("code");
-      return true;
+      return new OidcClient<>(oidcConfiguration);
+    } else {
+      log.warn("Client with empty OIDC configuration because yb.security.type={}", securityType);
+      // todo: fail fast instead of relying on log?
+      return new OidcClient<>();
     }
-    return false;
   }
 
   @Provides
   protected Config providePac4jConfig(OidcClient<OidcProfile, OidcConfiguration> oidcClient) {
-    final Clients clients =
-        new Clients(config.getString("yb.security.oidcCallbackUrl"), oidcClient);
+    final Clients clients = new Clients("/api/v1/callback", oidcClient);
     clients.setUrlResolver(new DefaultUrlResolver(true));
     final Config config = new Config(clients);
     config.setHttpActionAdapter(new PlatformHttpActionAdapter());
     return config;
+  }
+
+  @Provides
+  @Named(PlatformInstanceClient.YB_HA_WS_KEY)
+  @Singleton
+  protected WSClientRefresher provideWSClientForHA(WSClientRefresher refresher) {
+    return refresher;
   }
 }

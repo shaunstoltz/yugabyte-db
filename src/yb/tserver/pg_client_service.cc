@@ -25,6 +25,7 @@
 #include "yb/client/schema.h"
 #include "yb/client/table.h"
 #include "yb/client/table_creator.h"
+#include "yb/client/table_info.h"
 #include "yb/client/tablet_server.h"
 
 #include "yb/common/partition.h"
@@ -164,12 +165,14 @@ class PgClientServiceImpl::Impl {
       const std::shared_future<client::YBClient*>& client_future,
       const scoped_refptr<ClockBase>& clock,
       TransactionPoolProvider transaction_pool_provider,
-      rpc::Scheduler* scheduler)
+      rpc::Scheduler* scheduler,
+      const XClusterSafeTimeMap* xcluster_safe_time_map)
       : client_future_(client_future),
         clock_(clock),
         transaction_pool_provider_(std::move(transaction_pool_provider)),
         table_cache_(client_future),
-        check_expired_sessions_(scheduler) {
+        check_expired_sessions_(scheduler),
+        xcluster_safe_time_map_(xcluster_safe_time_map) {
     ScheduleCheckExpiredSessions(CoarseMonoClock::now());
   }
 
@@ -177,7 +180,7 @@ class PgClientServiceImpl::Impl {
     check_expired_sessions_.Shutdown();
   }
 
-  CHECKED_STATUS Heartbeat(
+  Status Heartbeat(
       const PgHeartbeatRequestPB& req, PgHeartbeatResponsePB* resp, rpc::RpcContext* context) {
     if (req.session_id()) {
       return ResultToStatus(DoGetSession(req.session_id()));
@@ -185,7 +188,8 @@ class PgClientServiceImpl::Impl {
 
     auto session_id = ++session_serial_no_;
     auto session = std::make_shared<LockablePgClientSession>(
-            &client(), clock_, transaction_pool_provider_, &table_cache_, session_id);
+        session_id, &client(), clock_, transaction_pool_provider_, &table_cache_,
+        xcluster_safe_time_map_);
     resp->set_session_id(session_id);
 
     std::lock_guard<rw_spinlock> lock(mutex_);
@@ -195,7 +199,7 @@ class PgClientServiceImpl::Impl {
     return Status::OK();
   }
 
-  CHECKED_STATUS OpenTable(
+  Status OpenTable(
       const PgOpenTableRequestPB& req, PgOpenTableResponsePB* resp, rpc::RpcContext* context) {
     if (req.invalidate_cache_time_us()) {
       table_cache_.InvalidateAll(CoarseTimePoint() + req.invalidate_cache_time_us() * 1us);
@@ -208,7 +212,7 @@ class PgClientServiceImpl::Impl {
     return Status::OK();
   }
 
-  CHECKED_STATUS GetDatabaseInfo(
+  Status GetDatabaseInfo(
       const PgGetDatabaseInfoRequestPB& req, PgGetDatabaseInfoResponsePB* resp,
       rpc::RpcContext* context) {
     RETURN_NOT_OK(client().GetNamespaceInfo(
@@ -218,7 +222,7 @@ class PgClientServiceImpl::Impl {
     return Status::OK();
   }
 
-  CHECKED_STATUS IsInitDbDone(
+  Status IsInitDbDone(
       const PgIsInitDbDoneRequestPB& req, PgIsInitDbDoneResponsePB* resp,
       rpc::RpcContext* context) {
     HostPort master_leader_host_port = client().GetMasterLeaderAddress();
@@ -245,7 +249,7 @@ class PgClientServiceImpl::Impl {
     return Status::OK();
   }
 
-  CHECKED_STATUS ReserveOids(
+  Status ReserveOids(
       const PgReserveOidsRequestPB& req, PgReserveOidsResponsePB* resp, rpc::RpcContext* context) {
     uint32_t begin_oid, end_oid;
     RETURN_NOT_OK(client().ReservePgsqlOids(
@@ -257,7 +261,7 @@ class PgClientServiceImpl::Impl {
     return Status::OK();
   }
 
-  CHECKED_STATUS GetCatalogMasterVersion(
+  Status GetCatalogMasterVersion(
       const PgGetCatalogMasterVersionRequestPB& req,
       PgGetCatalogMasterVersionResponsePB* resp,
       rpc::RpcContext* context) {
@@ -267,14 +271,14 @@ class PgClientServiceImpl::Impl {
     return Status::OK();
   }
 
-  CHECKED_STATUS CreateSequencesDataTable(
+  Status CreateSequencesDataTable(
       const PgCreateSequencesDataTableRequestPB& req,
       PgCreateSequencesDataTableResponsePB* resp,
       rpc::RpcContext* context) {
     return tserver::CreateSequencesDataTable(&client(), context->GetClientDeadline());
   }
 
-  CHECKED_STATUS TabletServerCount(
+  Status TabletServerCount(
       const PgTabletServerCountRequestPB& req, PgTabletServerCountResponsePB* resp,
       rpc::RpcContext* context) {
     int result = 0;
@@ -283,7 +287,7 @@ class PgClientServiceImpl::Impl {
     return Status::OK();
   }
 
-  CHECKED_STATUS ListLiveTabletServers(
+  Status ListLiveTabletServers(
       const PgListLiveTabletServersRequestPB& req, PgListLiveTabletServersResponsePB* resp,
       rpc::RpcContext* context) {
     auto tablet_servers = VERIFY_RESULT(client().ListLiveTabletServers(req.primary_only()));
@@ -293,7 +297,7 @@ class PgClientServiceImpl::Impl {
     return Status::OK();
   }
 
-  CHECKED_STATUS ValidatePlacement(
+  Status ValidatePlacement(
       const PgValidatePlacementRequestPB& req, PgValidatePlacementResponsePB* resp,
       rpc::RpcContext* context) {
     master::ReplicationInfoPB replication_info;
@@ -306,16 +310,55 @@ class PgClientServiceImpl::Impl {
       pb->mutable_cloud_info()->set_placement_zone(block.zone());
       pb->set_min_num_replicas(block.min_num_replicas());
 
-      if (block.leader_preference() == 1) {
-        auto new_ci = replication_info.add_affinitized_leaders();
-        new_ci->set_placement_cloud(block.cloud());
-        new_ci->set_placement_region(block.region());
-        new_ci->set_placement_zone(block.zone());
+      if (block.leader_preference() < 0) {
+        return STATUS(InvalidArgument, "leader_preference cannot be negative");
+      } else if (block.leader_preference() > req.placement_infos_size()) {
+        return STATUS(
+            InvalidArgument,
+            "Priority value cannot be more than the number of zones in the preferred list since "
+            "each priority should be associated with at least one zone from the list");
+      } else if (block.leader_preference() > 0) {
+        while (replication_info.multi_affinitized_leaders_size() < block.leader_preference()) {
+          replication_info.add_multi_affinitized_leaders();
+        }
+
+        auto zone_set =
+            replication_info.mutable_multi_affinitized_leaders(block.leader_preference() - 1);
+        auto ci = zone_set->add_zones();
+        ci->set_placement_cloud(block.cloud());
+        ci->set_placement_region(block.region());
+        ci->set_placement_zone(block.zone());
       }
     }
     live_replicas->set_num_replicas(req.num_replicas());
 
     return client().ValidateReplicationInfo(replication_info);
+  }
+
+  Status GetTableDiskSize(
+      const PgGetTableDiskSizeRequestPB& req, PgGetTableDiskSizeResponsePB* resp,
+      rpc::RpcContext* context) {
+    auto result =
+        client().GetTableDiskSize(PgObjectId::GetYbTableIdFromPB(req.table_id()));
+    if (!result.ok()) {
+      StatusToPB(result.status(), resp->mutable_status());
+    } else {
+      resp->set_size(result->table_size);
+      resp->set_num_missing_tablets(result->num_missing_tablets);
+    }
+    return Status::OK();
+  }
+
+  Status CheckIfPitrActive(
+      const PgCheckIfPitrActiveRequestPB& req, PgCheckIfPitrActiveResponsePB* resp,
+      rpc::RpcContext* context) {
+    auto res = client().CheckIfPitrActive();
+    if (!res.ok()) {
+      StatusToPB(res.status(), resp->mutable_status());
+    } else {
+      resp->set_is_pitr_active(*res);
+    }
+    return Status::OK();
   }
 
   void Perform(
@@ -327,7 +370,7 @@ class PgClientServiceImpl::Impl {
   }
 
   #define PG_CLIENT_SESSION_METHOD_FORWARD(r, data, method) \
-  CHECKED_STATUS method( \
+  Status method( \
       const BOOST_PP_CAT(BOOST_PP_CAT(Pg, method), RequestPB)& req, \
       BOOST_PP_CAT(BOOST_PP_CAT(Pg, method), ResponsePB)* resp, \
       rpc::RpcContext* context) { \
@@ -394,7 +437,7 @@ class PgClientServiceImpl::Impl {
     ScheduleCheckExpiredSessions(now);
   }
 
-  CHECKED_STATUS DoPerform(
+  Status DoPerform(
       const PgPerformRequestPB& req, PgPerformResponsePB* resp, rpc::RpcContext* context) {
     return VERIFY_RESULT(GetSession(req))->Perform(req, resp, context);
   }
@@ -434,6 +477,8 @@ class PgClientServiceImpl::Impl {
   std::atomic<int64_t> session_serial_no_{0};
 
   rpc::ScheduledTaskTracker check_expired_sessions_;
+
+  const XClusterSafeTimeMap* xcluster_safe_time_map_;
 };
 
 PgClientServiceImpl::PgClientServiceImpl(
@@ -441,9 +486,12 @@ PgClientServiceImpl::PgClientServiceImpl(
     const scoped_refptr<ClockBase>& clock,
     TransactionPoolProvider transaction_pool_provider,
     const scoped_refptr<MetricEntity>& entity,
-    rpc::Scheduler* scheduler)
+    rpc::Scheduler* scheduler,
+    const XClusterSafeTimeMap* xcluster_safe_time_map)
     : PgClientServiceIf(entity),
-      impl_(new Impl(client_future, clock, std::move(transaction_pool_provider), scheduler)) {}
+      impl_(new Impl(
+          client_future, clock, std::move(transaction_pool_provider), scheduler,
+          xcluster_safe_time_map)) {}
 
 PgClientServiceImpl::~PgClientServiceImpl() {}
 

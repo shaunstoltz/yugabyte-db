@@ -90,7 +90,7 @@ std::unique_ptr<TableBuilder> NewTableBuilder(
 
 namespace {
   Status CreateWritableFileWriter(const std::string& filename, const EnvOptions& env_options,
-      const Env::IOPriority io_priority, Env* env,
+      const yb::IOPriority io_priority, Env* env,
       std::shared_ptr<WritableFileWriter>* file_writer) {
     unique_ptr<WritableFile> file;
     Status s = NewWritableFile(env, filename, &file, env_options);
@@ -120,7 +120,7 @@ Status BuildTable(const std::string& dbname,
                   bool paranoid_file_checks,
                   InternalStats* internal_stats,
                   BoundaryValuesExtractor* boundary_values_extractor,
-                  const Env::IOPriority io_priority,
+                  const yb::IOPriority io_priority,
                   TableProperties* table_properties) {
   // Reports the IOStats for flush for every following bytes.
   const size_t kReportFlushIOStatsEvery = 1048576;
@@ -160,17 +160,30 @@ Status BuildTable(const std::string& dbname,
                               earliest_write_conflict_snapshot,
                               true /* internal key corruption is not ok */);
     c_iter.SeekToFirst();
+    const bool non_empty = c_iter.Valid();
+    if (non_empty) {
+      meta->UpdateKey(c_iter.key(), UpdateBoundariesType::kSmallest);
+    }
+
+    boost::container::small_vector<UserBoundaryValueRef, 0x10> user_values;
     for (; c_iter.Valid(); c_iter.Next()) {
       const Slice& key = c_iter.key();
       const Slice& value = c_iter.value();
       builder->Add(key, value);
-      auto boundaries = MakeFileBoundaryValues(boundary_values_extractor, key, value);
-      if (!boundaries) {
-        builder->Abandon();
-        return std::move(boundaries.status());
+      meta->UpdateBoundarySeqNo(GetInternalKeySeqno(key));
+      if (boundary_values_extractor) {
+        user_values.clear();
+        auto status = boundary_values_extractor->Extract(ExtractUserKey(key), &user_values);
+        if (!status.ok()) {
+          builder->Abandon();
+          return status;
+        }
+        meta->UpdateBoundaryUserValues(user_values, UpdateBoundariesType::kAll);
       }
-      auto& boundary_values = *boundaries;
-      meta->UpdateBoundaries(std::move(boundary_values.key), boundary_values);
+    }
+
+    if (non_empty) {
+      meta->UpdateKey(builder->LastKey(), UpdateBoundariesType::kLargest);
     }
 
     // Finish and check for builder errors

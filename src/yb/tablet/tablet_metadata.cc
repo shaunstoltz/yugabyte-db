@@ -60,6 +60,8 @@
 #include "yb/rocksdb/db.h"
 #include "yb/rocksdb/options.h"
 
+#include "yb/rpc/lightweight_message.h"
+
 #include "yb/tablet/metadata.pb.h"
 #include "yb/tablet/tablet_options.h"
 
@@ -82,13 +84,21 @@ TAG_FLAG(enable_tablet_orphaned_block_deletion, runtime);
 
 using std::shared_ptr;
 
-using base::subtle::Barrier_AtomicIncrement;
 using strings::Substitute;
 
-using yb::consensus::MinimumOpId;
+using yb::util::DereferencedEqual;
+using yb::util::MapsEqual;
 
 namespace yb {
 namespace tablet {
+
+namespace {
+
+Result<Uuid> ParseCotableId(Primary primary, const TableId& table_id) {
+  return primary ? Uuid::Nil() : Uuid::FromHexString(table_id);
+}
+
+}
 
 const int64 kNoDurableMemStore = -1;
 const std::string kIntentsSubdir = "intents";
@@ -104,19 +114,21 @@ TableInfo::TableInfo()
       index_map(std::make_unique<IndexMap>()) {
 }
 
-TableInfo::TableInfo(std::string table_id,
+TableInfo::TableInfo(Primary primary,
+                     std::string table_id_,
                      std::string namespace_name,
                      std::string table_name,
                      TableType table_type,
                      const Schema& schema,
                      const IndexMap& index_map,
                      const boost::optional<IndexInfo>& index_info,
-                     const uint32_t schema_version,
+                     const SchemaVersion schema_version,
                      PartitionSchema partition_schema)
-    : table_id(std::move(table_id)),
+    : table_id(std::move(table_id_)),
       namespace_name(std::move(namespace_name)),
       table_name(std::move(table_name)),
       table_type(table_type),
+      cotable_id(CHECK_RESULT(ParseCotableId(primary, table_id))),
       doc_read_context(std::make_unique<docdb::DocReadContext>(schema, schema_version)),
       index_map(std::make_unique<IndexMap>(index_map)),
       index_info(index_info ? new IndexInfo(*index_info) : nullptr),
@@ -128,11 +140,12 @@ TableInfo::TableInfo(const TableInfo& other,
                      const Schema& schema,
                      const IndexMap& index_map,
                      const std::vector<DeletedColumn>& deleted_cols,
-                     const uint32_t schema_version)
+                     const SchemaVersion schema_version)
     : table_id(other.table_id),
       namespace_name(other.namespace_name),
       table_name(other.table_name),
       table_type(other.table_type),
+      cotable_id(other.cotable_id),
       doc_read_context(schema_version != other.schema_version
           ? std::make_unique<docdb::DocReadContext>(
               *other.doc_read_context, schema, schema_version)
@@ -145,13 +158,30 @@ TableInfo::TableInfo(const TableInfo& other,
   this->deleted_cols.insert(this->deleted_cols.end(), deleted_cols.begin(), deleted_cols.end());
 }
 
+TableInfo::TableInfo(const TableInfo& other, SchemaVersion min_schema_version)
+    : table_id(other.table_id),
+      namespace_name(other.namespace_name),
+      table_name(other.table_name),
+      table_type(other.table_type),
+      cotable_id(other.cotable_id),
+      doc_read_context(std::make_unique<docdb::DocReadContext>(
+          *other.doc_read_context, std::min(min_schema_version, other.schema_version))),
+      index_map(std::make_unique<IndexMap>(*other.index_map)),
+      index_info(other.index_info ? new IndexInfo(*other.index_info) : nullptr),
+      schema_version(other.schema_version),
+      partition_schema(other.partition_schema),
+      deleted_cols(other.deleted_cols) {
+}
+
 TableInfo::~TableInfo() = default;
 
-Status TableInfo::LoadFromPB(const TableInfoPB& pb) {
+Status TableInfo::LoadFromPB(const TableId& primary_table_id, const TableInfoPB& pb) {
   table_id = pb.table_id();
   namespace_name = pb.namespace_name();
+  namespace_id = pb.namespace_id();
   table_name = pb.table_name();
   table_type = pb.table_type();
+  cotable_id = VERIFY_RESULT(ParseCotableId(Primary(primary_table_id == table_id), table_id));
 
   RETURN_NOT_OK(doc_read_context->LoadFromPB(pb));
   if (pb.has_index_info()) {
@@ -159,6 +189,10 @@ Status TableInfo::LoadFromPB(const TableInfoPB& pb) {
   }
   index_map->FromPB(pb.indexes());
   schema_version = pb.schema_version();
+
+  if (pb.has_wal_retention_secs()) {
+    wal_retention_secs = pb.wal_retention_secs();
+  }
 
   RETURN_NOT_OK(PartitionSchema::FromPB(pb.partition_schema(), schema(), &partition_schema));
 
@@ -171,9 +205,14 @@ Status TableInfo::LoadFromPB(const TableInfoPB& pb) {
   return Status::OK();
 }
 
+Status TableInfo::MergeWithRestored(const TableInfoPB& pb) {
+  return doc_read_context->MergeWithRestored(pb);
+}
+
 void TableInfo::ToPB(TableInfoPB* pb) const {
   pb->set_table_id(table_id);
   pb->set_namespace_name(namespace_name);
+  pb->set_namespace_id(namespace_id);
   pb->set_table_name(table_name);
   pb->set_table_type(table_type);
 
@@ -183,6 +222,7 @@ void TableInfo::ToPB(TableInfoPB* pb) const {
   }
   index_map->ToPB(pb->mutable_indexes());
   pb->set_schema_version(schema_version);
+  pb->set_wal_retention_secs(wal_retention_secs);
 
   partition_schema.ToPB(pb->mutable_partition_schema());
 
@@ -195,25 +235,74 @@ const Schema& TableInfo::schema() const {
   return doc_read_context->schema;
 }
 
+Result<docdb::CompactionSchemaInfo> TableInfo::Packing(
+    const TableInfoPtr& self, SchemaVersion schema_version, HybridTime history_cutoff) {
+  if (schema_version == docdb::kLatestSchemaVersion) {
+    // TODO(packed_row) Don't pick schema changed after retention interval.
+    schema_version = self->schema_version;
+  }
+  auto packing = self->doc_read_context->schema_packing_storage.GetPacking(schema_version);
+  if (!packing.ok()) {
+    return STATUS_FORMAT(Corruption, "Cannot find packing for table: $0, schema version: $1",
+                         self->table_id, schema_version);
+  }
+  docdb::ColumnIds deleted_before_history_cutoff;
+  for (const auto& deleted_col : self->deleted_cols) {
+    if (deleted_col.ht < history_cutoff) {
+      deleted_before_history_cutoff.insert(deleted_col.id);
+    }
+  }
+  return docdb::CompactionSchemaInfo {
+    .table_type = self->table_type,
+    .schema_version = schema_version,
+    .schema_packing = rpc::SharedField(self, packing.get_ptr()),
+    .cotable_id = self->cotable_id,
+    .deleted_cols = std::move(deleted_before_history_cutoff),
+  };
+}
+
+bool TableInfo::TEST_Equals(const TableInfo& lhs, const TableInfo& rhs) {
+  return YB_STRUCT_EQUALS(table_id,
+                          namespace_name,
+                          table_name,
+                          table_type,
+                          cotable_id,
+                          schema_version,
+                          deleted_cols,
+                          wal_retention_secs) &&
+         DereferencedEqual(lhs.doc_read_context,
+                           rhs.doc_read_context,
+                           &docdb::DocReadContext::TEST_Equals) &&
+         DereferencedEqual(lhs.index_map,
+                           rhs.index_map,
+                           IndexMap::TEST_Equals) &&
+         DereferencedEqual(lhs.index_info,
+                           rhs.index_info,
+                           IndexInfo::TEST_Equals) &&
+         lhs.partition_schema.Equals(rhs.partition_schema);
+}
+
 Status KvStoreInfo::LoadTablesFromPB(
     const google::protobuf::RepeatedPtrField<TableInfoPB>& pbs, const TableId& primary_table_id) {
   tables.clear();
   for (const auto& table_pb : pbs) {
-    auto table_info = std::make_shared<TableInfo>();
-    RETURN_NOT_OK(table_info->LoadFromPB(table_pb));
-    if (table_info->table_id != primary_table_id) {
-      // TODO(alex): cotable_id should be loaded from PB schema, do we need this section?
-      if (table_pb.schema().table_properties().is_ysql_catalog_table()) {
-        Uuid cotable_id;
-        CHECK_OK(cotable_id.FromHexString(table_info->table_id));
+    const TableId table_id = table_pb.table_id();
+    TableInfoPtr& table_info =
+        tables.emplace(table_id, std::make_shared<TableInfo>()).first->second;
+
+    RETURN_NOT_OK(table_info->LoadFromPB(primary_table_id, table_pb));
+
+    const Schema& schema = table_info->schema();
+    if (table_id != primary_table_id) {
+      if (schema.table_properties().is_ysql_catalog_table()) {
         // TODO(#79): when adding for multiple KV-stores per Raft group support - check if we need
         // to set cotable ID.
-        table_info->doc_read_context->schema.set_cotable_id(cotable_id);
+        table_info->doc_read_context->schema.set_cotable_id(table_info->cotable_id);
       }
-      // Colocation ID is already set in schema.
-      // TODO(alex): We don't have this info when master starts up?
     }
-    tables[table_info->table_id] = std::move(table_info);
+    if (schema.has_colocation_id()) {
+      colocation_to_table.emplace(schema.colocation_id(), table_info);
+    }
   }
   return Status::OK();
 }
@@ -236,6 +325,25 @@ Status KvStoreInfo::LoadFromPB(const KvStoreInfoPB& pb,
   return LoadTablesFromPB(pb.tables(), primary_table_id);
 }
 
+Status KvStoreInfo::MergeWithRestored(const KvStoreInfoPB& pb) {
+  lower_bound_key = pb.lower_bound_key();
+  upper_bound_key = pb.upper_bound_key();
+  has_been_fully_compacted = pb.has_been_fully_compacted();
+  for (const auto& table_pb : pb.tables()) {
+    const auto& table_id = table_pb.table_id();
+    auto table_it = tables.find(table_id);
+    if (table_it == tables.end()) {
+      // Skip tables that are not present in the restored state.
+      continue;
+    }
+    auto new_table_info = std::make_shared<TableInfo>(
+        *table_it->second, std::numeric_limits<SchemaVersion>::max());
+    RETURN_NOT_OK(new_table_info->MergeWithRestored(table_pb));
+    table_it->second = new_table_info;
+  }
+  return Status::OK();
+}
+
 void KvStoreInfo::ToPB(const TableId& primary_table_id, KvStoreInfoPB* pb) const {
   pb->set_kv_store_id(kv_store_id.ToString());
   pb->set_rocksdb_dir(rocksdb_dir);
@@ -252,19 +360,41 @@ void KvStoreInfo::ToPB(const TableId& primary_table_id, KvStoreInfoPB* pb) const
   pb->set_has_been_fully_compacted(has_been_fully_compacted);
 
   // Putting primary table first, then all other tables.
+  pb->mutable_tables()->Reserve(narrow_cast<int>(tables.size() + 1));
   const auto& it = tables.find(primary_table_id);
   if (it != tables.end()) {
     it->second->ToPB(pb->add_tables());
   }
-  for (const auto& id_and_table : tables) {
-    if (id_and_table.first != primary_table_id) {
-      id_and_table.second->ToPB(pb->add_tables());
+  for (const auto& [id, table_info] : tables) {
+    if (id != primary_table_id) {
+      table_info->ToPB(pb->add_tables());
     }
   }
 
   for (const auto& schedule_id : snapshot_schedules) {
     pb->add_snapshot_schedules(schedule_id.data(), schedule_id.size());
   }
+}
+
+void KvStoreInfo::UpdateColocationMap(const TableInfoPtr& table_info) {
+  auto colocation_id = table_info->schema().colocation_id();
+  if (colocation_id) {
+    colocation_to_table.emplace(colocation_id, table_info);
+  }
+}
+
+bool KvStoreInfo::TEST_Equals(const KvStoreInfo& lhs, const KvStoreInfo& rhs) {
+  auto eq = [](const auto& lhs, const auto& rhs) {
+    return DereferencedEqual(lhs, rhs, TableInfo::TEST_Equals);
+  };
+  return YB_STRUCT_EQUALS(kv_store_id,
+                          rocksdb_dir,
+                          lower_bound_key,
+                          upper_bound_key,
+                          has_been_fully_compacted,
+                          snapshot_schedules) &&
+         MapsEqual(lhs.tables, rhs.tables, eq) &&
+         MapsEqual(lhs.colocation_to_table, rhs.colocation_to_table, eq);
 }
 
 namespace {
@@ -340,7 +470,7 @@ Result<RaftGroupMetadataPtr> RaftGroupMetadata::TEST_LoadOrCreate(
 }
 
 template <class TablesMap>
-CHECKED_STATUS MakeTableNotFound(const TableId& table_id, const RaftGroupId& raft_group_id,
+Status MakeTableNotFound(const TableId& table_id, const RaftGroupId& raft_group_id,
                                  const TablesMap& tables) {
   std::string table_name = "<unknown_table_name>";
   if (!table_id.empty()) {
@@ -361,13 +491,33 @@ CHECKED_STATUS MakeTableNotFound(const TableId& table_id, const RaftGroupId& raf
   return STATUS(NotFound, msg);
 }
 
-Result<TableInfoPtr> RaftGroupMetadata::GetTableInfo(const std::string& table_id) const {
-  std::lock_guard<MutexType> lock(data_mutex_);
-  return GetTableInfoUnlocked(table_id);
+Status MakeColocatedTableNotFound(
+    const ColocationId& colocation_id, const RaftGroupId& raft_group_id) {
+  std::ostringstream string_stream;
+  string_stream << "Table with colocation id " << colocation_id << " not found in Raft group "
+                << raft_group_id;
+  std::string msg = string_stream.str();
+  return STATUS(NotFound, msg);
 }
 
-Result<TableInfoPtr> RaftGroupMetadata::GetTableInfoUnlocked(const std::string& table_id) const {
+Result<TableInfoPtr> RaftGroupMetadata::GetTableInfo(
+    const TableId& table_id, const ColocationId& colocation_id) const {
+  std::lock_guard<MutexType> lock(data_mutex_);
+  return GetTableInfoUnlocked(table_id, colocation_id);
+}
+
+Result<TableInfoPtr> RaftGroupMetadata::GetTableInfoUnlocked(
+    const TableId& table_id, const ColocationId& colocation_id) const {
   const auto& tables = kv_store_.tables;
+
+  if (table_id.empty() && colocation_id != kColocationIdNotSet) {
+    const auto& colocation_to_table = kv_store_.colocation_to_table;
+    const auto iter = colocation_to_table.find(colocation_id);
+    if (iter == colocation_to_table.end()) {
+      return MakeColocatedTableNotFound(colocation_id, raft_group_id_);
+    }
+    return iter->second;
+  }
   const auto id = !table_id.empty() ? table_id : primary_table_id_;
   const auto iter = tables.find(id);
   if (iter == tables.end()) {
@@ -492,10 +642,12 @@ RaftGroupMetadata::RaftGroupMetadata(
       wal_dir_(wal_dir),
       tablet_data_state_(data.tablet_data_state),
       colocated_(data.colocated),
-      cdc_min_replicated_index_(std::numeric_limits<int64_t>::max()) {
+      cdc_min_replicated_index_(std::numeric_limits<int64_t>::max()),
+      cdc_sdk_min_checkpoint_op_id_(OpId::Invalid()) {
   CHECK(data.table_info->schema().has_column_ids());
   CHECK_GT(data.table_info->schema().num_key_columns(), 0);
   kv_store_.tables.emplace(primary_table_id_, data.table_info);
+  kv_store_.UpdateColocationMap(data.table_info);
 }
 
 RaftGroupMetadata::~RaftGroupMetadata() {
@@ -563,6 +715,7 @@ Status RaftGroupMetadata::LoadFromSuperBlock(const RaftGroupReplicaSuperBlockPB&
       tombstone_last_logged_opid_ = OpId();
     }
     cdc_min_replicated_index_ = superblock.cdc_min_replicated_index();
+    cdc_sdk_min_checkpoint_op_id_ = OpId::FromPB(superblock.cdc_sdk_min_checkpoint_op_id());
     is_under_twodc_replication_ = superblock.is_under_twodc_replication();
     hidden_ = superblock.hidden();
     auto restoration_hybrid_time = HybridTime::FromPB(superblock.restoration_hybrid_time());
@@ -608,6 +761,16 @@ Status RaftGroupMetadata::Flush() {
   return Status::OK();
 }
 
+Status RaftGroupMetadata::SaveTo(const std::string& path) {
+  RaftGroupReplicaSuperBlockPB pb;
+  {
+    std::lock_guard<MutexType> lock(data_mutex_);
+    ToSuperBlockUnlocked(&pb);
+  }
+
+  return SaveToDiskUnlocked(pb, path);
+}
+
 Status RaftGroupMetadata::ReplaceSuperBlock(const RaftGroupReplicaSuperBlockPB &pb) {
   {
     MutexLock l(flush_lock_);
@@ -620,10 +783,14 @@ Status RaftGroupMetadata::ReplaceSuperBlock(const RaftGroupReplicaSuperBlockPB &
   return Status::OK();
 }
 
-Status RaftGroupMetadata::SaveToDiskUnlocked(const RaftGroupReplicaSuperBlockPB &pb) {
-  flush_lock_.AssertAcquired();
+Status RaftGroupMetadata::SaveToDiskUnlocked(
+    const RaftGroupReplicaSuperBlockPB &pb, const std::string& path) {
+  if (path.empty()) {
+    flush_lock_.AssertAcquired();
+    return SaveToDiskUnlocked(
+        pb, VERIFY_RESULT(fs_manager_->GetRaftGroupMetadataPath(raft_group_id_)));
+  }
 
-  string path = VERIFY_RESULT(fs_manager_->GetRaftGroupMetadataPath(raft_group_id_));
   RETURN_NOT_OK_PREPEND(pb_util::WritePBContainerToPath(
                             fs_manager_->env(), path, pb,
                             pb_util::OVERWRITE, pb_util::SYNC),
@@ -632,8 +799,20 @@ Status RaftGroupMetadata::SaveToDiskUnlocked(const RaftGroupReplicaSuperBlockPB 
   return Status::OK();
 }
 
-Status RaftGroupMetadata::ReadSuperBlockFromDisk(RaftGroupReplicaSuperBlockPB* superblock) const {
-  string path = VERIFY_RESULT(fs_manager_->GetRaftGroupMetadataPath(raft_group_id_));
+Status RaftGroupMetadata::MergeWithRestored(const std::string& path) {
+  RaftGroupReplicaSuperBlockPB pb;
+  RETURN_NOT_OK(ReadSuperBlockFromDisk(&pb, path));
+  std::lock_guard<MutexType> lock(data_mutex_);
+  return kv_store_.MergeWithRestored(pb.kv_store());
+}
+
+Status RaftGroupMetadata::ReadSuperBlockFromDisk(
+    RaftGroupReplicaSuperBlockPB* superblock, const std::string& path) const {
+  if (path.empty()) {
+    return ReadSuperBlockFromDisk(
+        superblock, VERIFY_RESULT(fs_manager_->GetRaftGroupMetadataPath(raft_group_id_)));
+  }
+
   RETURN_NOT_OK_PREPEND(
       pb_util::ReadPBContainerFromPath(fs_manager_->env(), path, superblock),
       Substitute("Could not load Raft group metadata from $0", path));
@@ -669,6 +848,7 @@ void RaftGroupMetadata::ToSuperBlockUnlocked(RaftGroupReplicaSuperBlockPB* super
   pb.set_primary_table_id(primary_table_id_);
   pb.set_colocated(colocated_);
   pb.set_cdc_min_replicated_index(cdc_min_replicated_index_);
+  cdc_sdk_min_checkpoint_op_id_.ToPB(pb.mutable_cdc_sdk_min_checkpoint_op_id());
   pb.set_is_under_twodc_replication(is_under_twodc_replication_);
   pb.set_hidden(hidden_);
   if (restoration_hybrid_time_) {
@@ -698,13 +878,14 @@ void RaftGroupMetadata::ToSuperBlockUnlocked(RaftGroupReplicaSuperBlockPB* super
 void RaftGroupMetadata::SetSchema(const Schema& schema,
                                   const IndexMap& index_map,
                                   const std::vector<DeletedColumn>& deleted_cols,
-                                  const uint32_t version,
+                                  const SchemaVersion version,
                                   const TableId& table_id) {
   DCHECK(schema.has_column_ids());
   std::lock_guard<MutexType> lock(data_mutex_);
   TableId target_table_id = table_id.empty() ? primary_table_id_ : table_id;
-  auto old_table_info = CHECK_RESULT(GetTableInfoUnlocked(target_table_id));
-  TableInfoPtr new_table_info = std::make_shared<TableInfo>(*old_table_info,
+  auto it = kv_store_.tables.find(target_table_id);
+  CHECK(it != kv_store_.tables.end());
+  TableInfoPtr new_table_info = std::make_shared<TableInfo>(*it->second,
                                                             schema,
                                                             index_map,
                                                             deleted_cols,
@@ -713,12 +894,11 @@ void RaftGroupMetadata::SetSchema(const Schema& schema,
     if (schema.table_properties().is_ysql_catalog_table()) {
       // TODO(alex): cotable_id should be copied from original schema, do we need this section?
       //             Might be related to #5017, #6107
-      Uuid cotable_id;
-      CHECK_OK(cotable_id.FromHexString(target_table_id));
+      auto cotable_id = CHECK_RESULT(Uuid::FromHexString(target_table_id));
       new_table_info->doc_read_context->schema.set_cotable_id(cotable_id);
     }
     // Ensure colocation ID remains unchanged.
-    const auto& old_schema = old_table_info->schema();
+    const auto& old_schema = it->second->schema();
     CHECK(old_schema.has_colocation_id() == schema.has_colocation_id())
             << "Attempted to change colocation state for table " << table_id
             << " from " << old_schema.has_colocation_id()
@@ -728,19 +908,26 @@ void RaftGroupMetadata::SetSchema(const Schema& schema,
             << "Attempted to change colocation ID for table " << table_id
             << " from " << old_schema.colocation_id()
             << " to " << schema.colocation_id();
+
+    if (schema.has_colocation_id()) {
+      auto colocation_it = kv_store_.colocation_to_table.find(schema.colocation_id());
+      CHECK(colocation_it != kv_store_.colocation_to_table.end());
+      colocation_it->second = new_table_info;
+    }
   }
   VLOG_WITH_PREFIX(1) << raft_group_id_ << " Updating table " << target_table_id
                       << " to Schema version " << version
-                      << " from \n" << yb::ToString(kv_store_.tables[target_table_id])
-                      << " to \n" << yb::ToString(new_table_info);
-  kv_store_.tables[target_table_id].swap(new_table_info);
+                      << " from \n" << AsString(it->second)
+                      << " to \n" << AsString(new_table_info);
+  it->second.swap(new_table_info);
 }
 
 void RaftGroupMetadata::SetPartitionSchema(const PartitionSchema& partition_schema) {
   std::lock_guard<MutexType> lock(data_mutex_);
   auto& tables = kv_store_.tables;
-  DCHECK(tables.find(primary_table_id_) != tables.end());
-  tables[primary_table_id_]->partition_schema = partition_schema;
+  auto it = tables.find(primary_table_id_);
+  DCHECK(it != tables.end());
+  it->second->partition_schema = partition_schema;
 }
 
 void RaftGroupMetadata::SetTableName(
@@ -748,9 +935,10 @@ void RaftGroupMetadata::SetTableName(
   std::lock_guard<MutexType> lock(data_mutex_);
   auto& tables = kv_store_.tables;
   auto& id = table_id.empty() ? primary_table_id_ : table_id;
-  DCHECK(tables.find(id) != tables.end());
-  tables[id]->namespace_name = namespace_name;
-  tables[id]->table_name = table_name;
+  auto it = tables.find(id);
+  DCHECK(it != tables.end());
+  it->second->namespace_name = namespace_name;
+  it->second->table_name = table_name;
 }
 
 void RaftGroupMetadata::AddTable(const std::string& table_id,
@@ -761,9 +949,11 @@ void RaftGroupMetadata::AddTable(const std::string& table_id,
                                  const IndexMap& index_map,
                                  const PartitionSchema& partition_schema,
                                  const boost::optional<IndexInfo>& index_info,
-                                 const uint32_t schema_version) {
+                                 const SchemaVersion schema_version) {
   DCHECK(schema.has_column_ids());
-  TableInfoPtr new_table_info = std::make_shared<TableInfo>(table_id,
+  Primary primary(table_id == primary_table_id_);
+  TableInfoPtr new_table_info = std::make_shared<TableInfo>(primary,
+                                                            table_id,
                                                             namespace_name,
                                                             table_name,
                                                             table_type,
@@ -772,20 +962,22 @@ void RaftGroupMetadata::AddTable(const std::string& table_id,
                                                             index_info,
                                                             schema_version,
                                                             partition_schema);
-  if (table_id != primary_table_id_) {
+  if (!primary) {
     if (schema.table_properties().is_ysql_catalog_table()) {
       // TODO(alex): cotable_id seems to be properly copied from schema, do we need this section?
       //             Might be related to #5017, #6107
-      Uuid cotable_id;
-      CHECK_OK(cotable_id.FromHexString(table_id));
-      new_table_info->doc_read_context->schema.set_cotable_id(cotable_id);
+      new_table_info->doc_read_context->schema.set_cotable_id(new_table_info->cotable_id);
     }
   }
   std::lock_guard<MutexType> lock(data_mutex_);
   auto& tables = kv_store_.tables;
-  auto existing_table_iter = tables.find(table_id);
-  if (existing_table_iter != tables.end()) {
-    const auto& existing_table = *existing_table_iter->second;
+  auto[iter, inserted] = tables.emplace(table_id, new_table_info);
+  if (!inserted) {
+    const auto& existing_table = *iter->second;
+    VLOG_WITH_PREFIX(1) << "Updating to Schema version " << schema_version
+                        << " from\n" << AsString(existing_table)
+                        << "\nto\n" << AsString(new_table_info);
+
     if (!existing_table.schema().table_properties().is_ysql_catalog_table() &&
         schema.table_properties().is_ysql_catalog_table()) {
       // This must be the one-time migration with transactional DDL being turned on for the first
@@ -806,18 +998,29 @@ void RaftGroupMetadata::AddTable(const std::string& table_id,
               << "Attempted to change colocation ID for table " << table_id
               << " from " << existing_schema.colocation_id()
               << " to " << schema.colocation_id();
+
+      CHECK(!schema.colocation_id() || kv_store_.colocation_to_table.count(schema.colocation_id()))
+          << "Missing entry in colocation table: " << schema.colocation_id() << ", "
+          << AsString(kv_store_.colocation_to_table);
     }
+  } else {
+    VLOG_WITH_PREFIX(1) << "Added table with schema version " << schema_version
+                        << "\n" << AsString(new_table_info);
+    kv_store_.UpdateColocationMap(new_table_info);
   }
-  VLOG_WITH_PREFIX(1) << "Updating to Schema version " << schema_version
-                      << " from\n" << yb::ToString(tables[table_id])
-                      << "\nto\n" << yb::ToString(new_table_info);
-  tables[table_id].swap(new_table_info);
 }
 
 void RaftGroupMetadata::RemoveTable(const TableId& table_id) {
   std::lock_guard<MutexType> lock(data_mutex_);
   auto& tables = kv_store_.tables;
-  tables.erase(table_id);
+  auto it = tables.find(table_id);
+  if (it != tables.end()) {
+    auto colocation_id = it->second->schema().colocation_id();
+    if (colocation_id) {
+      kv_store_.colocation_to_table.erase(colocation_id);
+    }
+    tables.erase(it);
+  }
 }
 
 string RaftGroupMetadata::data_root_dir() const {
@@ -845,6 +1048,14 @@ string RaftGroupMetadata::wal_root_dir() const {
     wal_root_dir = DirName(wal_root_dir);
   }
   return wal_root_dir;
+}
+
+Status RaftGroupMetadata::set_namespace_id(const NamespaceId& namespace_id) {
+  {
+    std::lock_guard<MutexType> lock(data_mutex_);
+    primary_table_info_unlocked()->namespace_id = namespace_id;
+  }
+  return Flush();
 }
 
 void RaftGroupMetadata::set_wal_retention_secs(uint32 wal_retention_secs) {
@@ -880,6 +1091,19 @@ Status RaftGroupMetadata::set_cdc_min_replicated_index(int64 cdc_min_replicated_
 int64_t RaftGroupMetadata::cdc_min_replicated_index() const {
   std::lock_guard<MutexType> lock(data_mutex_);
   return cdc_min_replicated_index_;
+}
+
+OpId RaftGroupMetadata::cdc_sdk_min_checkpoint_op_id() const {
+  std::lock_guard<MutexType> lock(data_mutex_);
+  return cdc_sdk_min_checkpoint_op_id_;
+}
+
+Status RaftGroupMetadata::set_cdc_sdk_min_checkpoint_op_id(const OpId& cdc_min_checkpoint_op_id) {
+  {
+    std::lock_guard<MutexType> lock(data_mutex_);
+    cdc_sdk_min_checkpoint_op_id_ = cdc_min_checkpoint_op_id;
+  }
+  return Flush();
 }
 
 Status RaftGroupMetadata::SetIsUnderTwodcReplicationAndFlush(bool is_under_twodc_replication) {
@@ -1016,6 +1240,61 @@ bool RaftGroupMetadata::CleanupRestorations(
   return result;
 }
 
+Status RaftGroupMetadata::OldSchemaGC(
+    const std::unordered_map<Uuid, SchemaVersion, UuidHash>& versions) {
+  bool need_flush = false;
+  {
+    std::lock_guard<MutexType> lock(data_mutex_);
+    for (const auto& [table_id, schema_version] : versions) {
+      auto it = table_id.IsNil() ? kv_store_.tables.find(primary_table_id_)
+                                 : kv_store_.tables.find(table_id.ToHexString());
+      if (it == kv_store_.tables.end()) {
+        YB_LOG_EVERY_N_SECS(WARNING, 1)
+            << "Unknown table during " << __func__ << ": " << table_id.ToString();
+        continue;
+      }
+      if (!it->second->doc_read_context->schema_packing_storage.HasVersionBelow(schema_version)) {
+        continue;
+      }
+      auto new_value = std::make_shared<TableInfo>(
+          *it->second, schema_version);
+      it->second = new_value;
+      need_flush = true;
+    }
+  }
+
+  if (!need_flush) {
+    return Status::OK();
+  }
+  return Flush();
+}
+
+Result<docdb::CompactionSchemaInfo> RaftGroupMetadata::CotablePacking(
+    const Uuid& cotable_id, uint32_t schema_version, HybridTime history_cutoff) {
+  if (cotable_id.IsNil()) {
+    return TableInfo::Packing(primary_table_info(), schema_version, history_cutoff);
+  }
+
+  auto res = GetTableInfo(cotable_id.ToHexString());
+  if (!res.ok()) {
+    return STATUS_FORMAT(
+        NotFound, "Cannot find table info for: $0, raft group id: $1",
+        cotable_id, raft_group_id_);
+  }
+  return TableInfo::Packing(*res, schema_version, history_cutoff);
+}
+
+Result<docdb::CompactionSchemaInfo> RaftGroupMetadata::ColocationPacking(
+    ColocationId colocation_id, uint32_t schema_version, HybridTime history_cutoff) {
+  auto it = kv_store_.colocation_to_table.find(colocation_id);
+  if (it == kv_store_.colocation_to_table.end()) {
+    return STATUS_FORMAT(
+        NotFound, "Cannot find table info for colocation: $0, raft group id: $1",
+        colocation_id, raft_group_id_);
+  }
+  return TableInfo::Packing(it->second, schema_version, history_cutoff);
+}
+
 std::string RaftGroupMetadata::GetSubRaftGroupWalDir(const RaftGroupId& raft_group_id) const {
   return JoinPathSegments(DirName(wal_dir_), MakeTabletDirName(raft_group_id));
 }
@@ -1064,7 +1343,7 @@ namespace {
 // Each MigrateSuperblockForDXXXX could be removed after all YugabyteDB installations are
 // upgraded to have revision DXXXX.
 
-CHECKED_STATUS MigrateSuperblockForD5900(RaftGroupReplicaSuperBlockPB* superblock) {
+Status MigrateSuperblockForD5900(RaftGroupReplicaSuperBlockPB* superblock) {
   // In previous version of superblock format we stored primary table metadata in superblock's
   // top-level fields (deprecated table_* and other). TableInfo objects were stored inside
   // RaftGroupReplicaSuperBlockPB.tables.
@@ -1125,13 +1404,15 @@ std::string RaftGroupMetadata::namespace_name(const TableId& table_id) const {
   return table_info->namespace_name;
 }
 
-std::string RaftGroupMetadata::table_name(const TableId& table_id) const {
+NamespaceId RaftGroupMetadata::namespace_id() const {
   DCHECK_NE(state_, kNotLoadedYet);
-  if (table_id.empty()) {
-    return primary_table_info()->table_name;
-  }
-  const auto& table_info = CHECK_RESULT(GetTableInfo(table_id));
-  return table_info->table_name;
+  return primary_table_info()->namespace_id;
+}
+
+std::string RaftGroupMetadata::table_name(
+    const TableId& table_id, const ColocationId& colocation_id) const {
+  DCHECK_NE(state_, kNotLoadedYet);
+  return CHECK_RESULT(GetTableInfo(table_id, colocation_id))->table_name;
 }
 
 TableType RaftGroupMetadata::table_type(const TableId& table_id) const {
@@ -1143,10 +1424,10 @@ TableType RaftGroupMetadata::table_type(const TableId& table_id) const {
   return table_info->table_type;
 }
 
-SchemaPtr RaftGroupMetadata::schema(const TableId& table_id) const {
+SchemaPtr RaftGroupMetadata::schema(
+    const TableId& table_id, const ColocationId& colocation_id) const {
   DCHECK_NE(state_, kNotLoadedYet);
-  const TableInfoPtr table_info =
-      table_id.empty() ? primary_table_info() : CHECK_RESULT(GetTableInfo(table_id));
+  const TableInfoPtr table_info = CHECK_RESULT(GetTableInfo(table_id, colocation_id));
   return SchemaPtr(table_info, &table_info->doc_read_context->schema);
 }
 
@@ -1157,10 +1438,10 @@ std::shared_ptr<IndexMap> RaftGroupMetadata::index_map(const TableId& table_id) 
   return std::shared_ptr<IndexMap>(table_info, table_info->index_map.get());
 }
 
-uint32_t RaftGroupMetadata::schema_version(const TableId& table_id) const {
+SchemaVersion RaftGroupMetadata::schema_version(
+    const TableId& table_id, const ColocationId& colocation_id) const {
   DCHECK_NE(state_, kNotLoadedYet);
-  const TableInfoPtr table_info =
-      table_id.empty() ? primary_table_info() : CHECK_RESULT(GetTableInfo(table_id));
+  const TableInfoPtr table_info = CHECK_RESULT(GetTableInfo(table_id, colocation_id));
   return table_info->schema_version;
 }
 
@@ -1172,6 +1453,10 @@ const std::string& RaftGroupMetadata::indexed_table_id(const TableId& table_id) 
       primary_table_info_unlocked() : CHECK_RESULT(GetTableInfoUnlocked(table_id));
   const auto* index_info = table_info->index_info.get();
   return index_info ? index_info->indexed_table_id() : kEmptyString;
+}
+
+bool RaftGroupMetadata::is_index(const TableId& table_id) const {
+  return !indexed_table_id(table_id).empty();
 }
 
 bool RaftGroupMetadata::is_local_index(const TableId& table_id) const {
@@ -1212,6 +1497,16 @@ std::vector<TableId> RaftGroupMetadata::GetAllColocatedTables() {
     table_ids.emplace_back(id_and_info.first);
   }
   return table_ids;
+}
+
+Status CheckCanServeTabletData(const RaftGroupMetadata& metadata) {
+  auto data_state = metadata.tablet_data_state();
+  if (!CanServeTabletData(data_state)) {
+    return STATUS_FORMAT(
+        IllegalState, "Tablet $0 data state not ready: $1", metadata.raft_group_id(),
+        TabletDataState_Name(data_state));
+  }
+  return Status::OK();
 }
 
 } // namespace tablet

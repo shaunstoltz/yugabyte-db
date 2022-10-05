@@ -90,6 +90,44 @@ Status UniverseReplicationInfo::GetSetupUniverseReplicationErrorStatus() const {
   return setup_universe_replication_error_;
 }
 
+void UniverseReplicationInfo::StoreReplicationError(
+    const TableId& consumer_table_id,
+    const CDCStreamId& stream_id,
+    const ReplicationErrorPb error,
+    const std::string& error_detail) {
+  std::lock_guard<decltype(lock_)> l(lock_);
+  table_replication_error_map_[consumer_table_id][stream_id][error] = error_detail;
+}
+
+void UniverseReplicationInfo::ClearReplicationError(
+    const TableId& consumer_table_id,
+    const CDCStreamId& stream_id,
+    const ReplicationErrorPb error) {
+  std::lock_guard<decltype(lock_)> l(lock_);
+
+  if (table_replication_error_map_.count(consumer_table_id) == 0 ||
+      table_replication_error_map_[consumer_table_id].count(stream_id) == 0 ||
+      table_replication_error_map_[consumer_table_id][stream_id].count(error) == 0) {
+    return;
+  }
+
+  table_replication_error_map_[consumer_table_id][stream_id].erase(error);
+
+  if (table_replication_error_map_[consumer_table_id][stream_id].empty()) {
+    table_replication_error_map_[consumer_table_id].erase(stream_id);
+  }
+
+  if (table_replication_error_map_[consumer_table_id].empty()) {
+    table_replication_error_map_.erase(consumer_table_id);
+  }
+}
+
+UniverseReplicationInfo::TableReplicationErrorMap
+UniverseReplicationInfo::GetReplicationErrors() const {
+  SharedLock<decltype(lock_)> l(lock_);
+  return table_replication_error_map_;
+}
+
 ////////////////////////////////////////////////////////////
 // SnapshotInfo
 ////////////////////////////////////////////////////////////
@@ -118,46 +156,6 @@ bool SnapshotInfo::IsRestoreInProgress() const {
 
 bool SnapshotInfo::IsDeleteInProgress() const {
   return LockForRead()->is_deleting();
-}
-
-void SnapshotInfo::AddEntries(
-    const TableDescription& table_description, std::unordered_set<NamespaceId>* added_namespaces) {
-  SysSnapshotEntryPB& pb = mutable_metadata()->mutable_dirty()->pb;
-  AddEntries(
-      table_description, pb.mutable_entries(), pb.mutable_tablet_snapshots(), added_namespaces);
-}
-
-void SnapshotInfo::AddEntries(
-    const TableDescription& table_description,
-    google::protobuf::RepeatedPtrField<SysRowEntry>* out,
-    google::protobuf::RepeatedPtrField<SysSnapshotEntryPB::TabletSnapshotPB>* tablet_infos,
-    std::unordered_set<NamespaceId>* added_namespaces) {
-  // Note: SysSnapshotEntryPB includes PBs for stored (1) namespaces (2) tables (3) tablets.
-  // Add namespace entry.
-  if (added_namespaces->emplace(table_description.namespace_info->id()).second) {
-    TRACE("Locking namespace");
-    AddInfoEntry(table_description.namespace_info.get(), out);
-  }
-
-  // Add table entry.
-  {
-    TRACE("Locking table");
-    AddInfoEntry(table_description.table_info.get(), out);
-  }
-
-  // Add tablet entries.
-  for (const scoped_refptr<TabletInfo>& tablet : table_description.tablet_infos) {
-    SysSnapshotEntryPB::TabletSnapshotPB* const tablet_info =
-        tablet_infos ? tablet_infos->Add() : nullptr;
-
-    TRACE("Locking tablet");
-    auto l = AddInfoEntry(tablet.get(), out);
-
-    if (tablet_info) {
-      tablet_info->set_id(tablet->id());
-      tablet_info->set_state(SysSnapshotEntryPB::CREATING);
-    }
-  }
 }
 
 } // namespace master

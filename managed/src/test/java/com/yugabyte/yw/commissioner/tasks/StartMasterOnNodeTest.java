@@ -8,10 +8,12 @@ import static com.yugabyte.yw.models.TaskInfo.State.Failure;
 import static com.yugabyte.yw.models.TaskInfo.State.Success;
 import static org.junit.Assert.assertEquals;
 import static org.junit.Assert.assertNull;
+import static org.junit.Assert.fail;
 import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.ArgumentMatchers.anyBoolean;
 import static org.mockito.ArgumentMatchers.anyLong;
 import static org.mockito.ArgumentMatchers.anyString;
+import static org.mockito.Mockito.lenient;
 import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.times;
 import static org.mockito.Mockito.verify;
@@ -23,6 +25,7 @@ import com.google.common.collect.ImmutableMap;
 import com.google.common.net.HostAndPort;
 import com.yugabyte.yw.commissioner.tasks.params.NodeTaskParams;
 import com.yugabyte.yw.common.ApiUtils;
+import com.yugabyte.yw.common.NodeManager;
 import com.yugabyte.yw.common.ShellResponse;
 import com.yugabyte.yw.forms.UniverseDefinitionTaskParams;
 import com.yugabyte.yw.models.AvailabilityZone;
@@ -72,20 +75,40 @@ public class StartMasterOnNodeTest extends CommissionerBaseTest {
     gflags.put("foo", "bar");
     defaultUniverse.getUniverseDetails().getPrimaryCluster().userIntent.masterGFlags = gflags;
 
-    ShellResponse dummyShellResponse = new ShellResponse();
-    dummyShellResponse.message = "true";
-    when(mockNodeManager.nodeCommand(any(), any())).thenReturn(dummyShellResponse);
+    when(mockNodeManager.nodeCommand(any(), any()))
+        .then(
+            invocation -> {
+              if (invocation.getArgument(0).equals(NodeManager.NodeCommandType.List)) {
+                ShellResponse listResponse = new ShellResponse();
+                NodeTaskParams params = invocation.getArgument(1);
+                if (params.nodeUuid == null) {
+                  listResponse.message = "{\"universe_uuid\":\"" + params.universeUUID + "\"}";
+                } else {
+                  listResponse.message =
+                      "{\"universe_uuid\":\""
+                          + params.universeUUID
+                          + "\", "
+                          + "\"node_uuid\": \""
+                          + params.nodeUuid
+                          + "\"}";
+                }
+                return listResponse;
+              }
+              return ShellResponse.create(ShellResponse.ERROR_CODE_SUCCESS, "true");
+            });
 
     YBClient mockClient = mock(YBClient.class);
-    when(mockClient.waitForServer(any(), anyLong())).thenReturn(true);
 
     try {
+      lenient().when(mockClient.waitForServer(any(), anyLong())).thenReturn(true);
+      lenient().when(mockClient.waitForMaster(any(), anyLong())).thenReturn(true);
       when(mockClient.setFlag(any(HostAndPort.class), anyString(), anyString(), anyBoolean()))
           .thenReturn(true);
       ListMastersResponse listMastersResponse = mock(ListMastersResponse.class);
       when(listMastersResponse.getMasters()).thenReturn(Collections.emptyList());
       when(mockClient.listMasters()).thenReturn(listMastersResponse);
     } catch (Exception e) {
+      fail();
     }
 
     when(mockYBClient.getClient(any(), any())).thenReturn(mockClient);

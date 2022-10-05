@@ -27,12 +27,17 @@ class TabletServerServiceProxy;
 class TabletServerBackupServiceProxy;
 }
 
+namespace cdc {
+class CDCServiceProxy;
+}
+
 namespace master {
 namespace enterprise {
 
 typedef util::SharedPtrTuple<tserver::TabletServerAdminServiceProxy,
     tserver::TabletServerServiceProxy,
     tserver::TabletServerBackupServiceProxy,
+    cdc::CDCServiceProxy,
     consensus::ConsensusServiceProxy> ProxyTuple;
 
 } // namespace enterprise
@@ -48,11 +53,11 @@ class ReplicationInfoPB;
 namespace enterprise {
 
 class TSDescriptor : public yb::master::TSDescriptor {
-  typedef yb::master::TSDescriptor super;
  public:
-  explicit TSDescriptor(std::string perm_id)
-      : super(std::move(perm_id)) {}
-  virtual ~TSDescriptor() {}
+  explicit TSDescriptor(
+      std::string perm_id,
+      RegisteredThroughHeartbeat registered_through_heartbeat = RegisteredThroughHeartbeat::kTrue)
+      : yb::master::TSDescriptor(std::move(perm_id), registered_through_heartbeat) {}
 
   bool IsAcceptingLeaderLoad(const ReplicationInfoPB& replication_info) const override;
 

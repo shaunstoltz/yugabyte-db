@@ -51,6 +51,10 @@ struct PersistentCDCStreamInfo : public Persistent<
     return pb.state() == SysCDCStreamEntryPB::DELETED;
   }
 
+  bool is_deleting_metadata() const {
+    return pb.state() == SysCDCStreamEntryPB::DELETING_METADATA;
+  }
+
   const google::protobuf::RepeatedPtrField<CDCStreamOptionsPB> options() const {
     return pb.options();
   }
@@ -111,7 +115,25 @@ class UniverseReplicationInfo : public RefCountedThreadSafe<UniverseReplicationI
   void SetSetupUniverseReplicationErrorStatus(const Status& status);
 
   // Get the Status of the last error from the current SetupUniverseReplication.
-  CHECKED_STATUS GetSetupUniverseReplicationErrorStatus() const;
+  Status GetSetupUniverseReplicationErrorStatus() const;
+
+  void StoreReplicationError(
+    const TableId& consumer_table_id,
+    const CDCStreamId& stream_id,
+    ReplicationErrorPb error,
+    const std::string& error_detail);
+
+  void ClearReplicationError(
+    const TableId& consumer_table_id,
+    const CDCStreamId& stream_id,
+    ReplicationErrorPb error);
+
+  // Maps from a table id -> stream id -> replication error -> error detail.
+  typedef std::unordered_map<ReplicationErrorPb, std::string> ReplicationErrorMap;
+  typedef std::unordered_map<CDCStreamId, ReplicationErrorMap> StreamReplicationErrorMap;
+  typedef std::unordered_map<TableId, StreamReplicationErrorMap> TableReplicationErrorMap;
+
+  TableReplicationErrorMap GetReplicationErrors() const;
 
  private:
   friend class RefCountedThreadSafe<UniverseReplicationInfo>;
@@ -125,6 +147,8 @@ class UniverseReplicationInfo : public RefCountedThreadSafe<UniverseReplicationI
   // The last error Status of the currently running SetupUniverseReplication. Will be OK, if freshly
   // constructed object, or if the SetupUniverseReplication was successful.
   Status setup_universe_replication_error_ = Status::OK();
+
+  TableReplicationErrorMap table_replication_error_map_;
 
   // Protects cdc_rpc_tasks_.
   mutable rw_spinlock lock_;
@@ -199,15 +223,6 @@ class SnapshotInfo : public RefCountedThreadSafe<SnapshotInfo>,
 
   // Returns true if the snapshot deleting is in-progress.
   bool IsDeleteInProgress() const;
-
-  void AddEntries(
-      const TableDescription& table_description, std::unordered_set<NamespaceId>* added_namespaces);
-
-  static void AddEntries(
-      const TableDescription& table_description,
-      google::protobuf::RepeatedPtrField<SysRowEntry>* out,
-      google::protobuf::RepeatedPtrField<SysSnapshotEntryPB::TabletSnapshotPB>* tablet_infos,
-      std::unordered_set<NamespaceId>* added_namespaces);
 
  private:
   friend class RefCountedThreadSafe<SnapshotInfo>;

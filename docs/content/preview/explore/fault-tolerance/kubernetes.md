@@ -10,8 +10,7 @@ menu:
     identifier: fault-tolerance-4-kubernetes
     parent: explore
     weight: 215
-isTocNested: true
-showAsideToc: true
+type: docs
 ---
 
 <ul class="nav nav-tabs-alt nav-tabs-yb">
@@ -48,7 +47,7 @@ showAsideToc: true
 
 YugabyteDB can automatically handle failures and therefore provides [high availability](../../../architecture/core-functions/high-availability/). You will create YSQL tables with a replication factor (RF) of `3` that allows a [fault tolerance](../../../architecture/docdb-replication/replication/) of `1`. This means the cluster will remain available for both reads and writes even if one node fails. However, if another node fails, bringing the number of failures to two, then writes will become unavailable on the cluster in order to preserve data consistency.
 
-If you haven't installed YugabyteDB yet, you can create a local YugabyteDB cluster within five minutes by following the [Quick Start](../../../quick-start/install/) guide.
+If you haven't installed YugabyteDB yet, create a local YugabyteDB cluster by following the [Quick Start](../../../quick-start/) guide.
 
 ## 1. Create universe
 
@@ -63,6 +62,7 @@ Create a new YugabyteDB cluster.
 
 ```sh
 $ helm install yb-demo yugabytedb/yugabyte \
+--version {{<yb-version version="preview" format="short">}} \
 --set resource.master.requests.cpu=0.5,resource.master.requests.memory=0.5Gi,\
 resource.tserver.requests.cpu=0.5,resource.tserver.requests.memory=0.5Gi --namespace yb-demo
 ```

@@ -1,17 +1,32 @@
 ---
-title: Hibernate ORM
-linkTitle: Hibernate ORM
-description: Hibernate ORM support for YugabyteDB
-headcontent: Hibernate ORM support for YugabyteDB
+title: Use an ORM
+linkTitle: Use an ORM
+description: Java ORM support for YugabyteDB
+headcontent: Java ORM support for YugabyteDB
 image: /images/section_icons/sample-data/s_s1-sampledata-3x.png
 menu:
   preview:
-    identifier: hibernate-orm
+    identifier: java-orm
     parent: java-drivers
     weight: 600
-isTocNested: true
-showAsideToc: true
+type: docs
 ---
+
+<ul class="nav nav-tabs-alt nav-tabs-yb">
+
+  <li >
+    <a href="../ebean/" class="nav-link ">
+      Ebean ORM
+    </a>
+  </li>
+
+  <li >
+    <a href="../hibernate/" class="nav-link active">
+      Hibernate ORM
+    </a>
+  </li>
+
+</ul>
 
 [Hibernate ORM](https://hibernate.org/orm/) is an Object/Relational Mapping (ORM) framework for Java applications. Hibernate ORM is concerned with data persistence of relational databases, and enables developers to write applications whose data outlives the application lifetime.
 
@@ -215,5 +230,4 @@ Query returned: name=John, age=35, language: Java
 
 ## Next Steps
 
-- Explore [Scaling Java Applications](/preview/explore/linear-scalability) with YugabyteDB.
-- Learn how to [develop Java applications with YugabyteDB Managed](/preview/yugabyte-cloud/cloud-quickstart/cloud-build-apps/cloud-ysql-yb-jdbc/).
+Explore [Scaling Java Applications](../../../explore/linear-scalability) with YugabyteDB.

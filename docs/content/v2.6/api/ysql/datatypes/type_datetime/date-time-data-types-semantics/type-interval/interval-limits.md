@@ -8,8 +8,7 @@ menu:
     identifier: interval-limits
     parent: type-interval
     weight: 20
-isTocNested: true
-showAsideToc: true
+type: docs
 ---
 
 The design of the code that this section presents, and the interpretation of the results that it produces, depend on the explanations given in the section [How does YSQL represent an _interval_ value?](../interval-representation/). This is the essential point:
@@ -43,7 +42,7 @@ This is the result:
 -104300858 days -08:01:49.551616
 ```
 
-The fact that the result is negative is clearly wrong. And a silent wrong results error is the most dangerous kind. The section [_Interval_ arithmetic](../interval-arithmetic//) explains how the rules that govern adding or subtracting an _interval_ value to or from a _timestamp_ or _timestamptz_ value are different for the _mm_, _dd_, and _ss_ fields. When you understand the rules, you'll see that striving for _seconds_ arithmetic semantics when the duration that the _interval_ value represents is as much, even, as _100 years_ is arguably meaningless. This means that the actual limitation that the legal _ss_ range imposes has no consequence when you design application code sensibly. However, you must always design your code so that you maximally reduce the chance that a local careless programming error brings a silent wrong results bug. The section [Defining and using custom domain types to specialize the native _interval_ functionality](../custom-interval-domains/) recommends a regime that enforces proper practice to this end.
+The fact that the result is negative is clearly wrong. And a silent wrong results error is the most dangerous kind. The section [_Interval_ arithmetic](../interval-arithmetic/) explains how the rules that govern adding or subtracting an _interval_ value to or from a _timestamp_ or _timestamptz_ value are different for the _mm_, _dd_, and _ss_ fields. When you understand the rules, you'll see that striving for _seconds_ arithmetic semantics when the duration that the _interval_ value represents is as much, even, as _100 years_ is arguably meaningless. This means that the actual limitation that the legal _ss_ range imposes has no consequence when you design application code sensibly. However, you must always design your code so that you maximally reduce the chance that a local careless programming error brings a silent wrong results bug. The section [Defining and using custom domain types to specialize the native _interval_ functionality](../custom-interval-domains/) recommends a regime that enforces proper practice to this end.
 
 ## Limits for the mm and dd fields of the internal implementation
 
@@ -66,7 +65,7 @@ select
 This is the result:
 
 ```output
-    lower months limit    |   upper months limit   | lower days limit | upper days limit 
+    lower months limit    |   upper months limit   | lower days limit | upper days limit
 --------------------------+------------------------+------------------+------------------
  -178956970 years -8 mons | 178956970 years 7 mons | -2147483648 days | 2147483647 days
 ```
@@ -152,7 +151,7 @@ select
 This is the result:
 
 ```output
-         lower limit         |        upper limit         
+         lower limit         |        upper limit
 -----------------------------+----------------------------
  (0,0,-7730941136399.000000) | (0,0,7730941132799.000000)
 ```
@@ -183,7 +182,7 @@ select
 This is the result:
 
 ```output
-        lower limit        |       upper limit       
+        lower limit        |       upper limit
 ---------------------------+-------------------------
  --2147483648:59:58.999552 | 2147483647:59:58.999552
 ```
@@ -208,7 +207,7 @@ select
 This is the result:
 
 ```output
-       lower limit        |       upper limit       
+       lower limit        |       upper limit
 --------------------------+-------------------------
  -2147483647:59:58.999552 | 2147483647:59:58.999552
 ```

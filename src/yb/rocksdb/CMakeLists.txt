@@ -188,7 +188,7 @@ set(ROCKSDB_SRCS
 
 set(CMAKE_CXX_FLAGS
   "${CMAKE_CXX_FLAGS} \
-   -Wextra -Wsign-compare -Wshadow -Woverloaded-virtual \
+   -Wextra -Wshadow -Woverloaded-virtual \
    -Wno-missing-field-initializers -Wno-unused-parameter -Wno-unused-variable")
 
 if (NOT APPLE)
@@ -226,7 +226,7 @@ if (NOT "${CMAKE_BUILD_TYPE}" STREQUAL "RELEASE")
 endif()
 
 add_library(rocksdb_test_util ${ROCKSDB_TEST_UTIL_SRCS})
-target_link_libraries(rocksdb_test_util gmock rocksdb yb_rocksutil)
+target_link_libraries(rocksdb_test_util gmock gtest rocksdb yb_rocksutil)
 
 add_executable(db_bench tools/db_bench.cc tools/db_bench_tool.cc)
 target_link_libraries(db_bench rocksdb)
@@ -286,7 +286,14 @@ ADD_YB_TEST(util/memenv_test)
 ADD_YB_TEST(util/mock_env_test)
 ADD_YB_TEST(util/options_test)
 ADD_YB_TEST(util/rate_limiter_test)
+
 ADD_YB_TEST(util/slice_transform_test)
+if (BUILD_TESTS AND
+    COMPILER_FAMILY STREQUAL "gcc" AND
+    "${COMPILER_VERSION}" MATCHES "^(10|11)[.].*$")
+  target_compile_options(slice_transform_test PRIVATE "-Wno-array-bounds")
+endif()
+
 ADD_YB_TEST(utilities/document/document_db_test)
 ADD_YB_TEST(utilities/document/json_document_test)
 ADD_YB_TEST(utilities/geodb/geodb_test)

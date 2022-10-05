@@ -33,13 +33,18 @@ struct YBTableInfo {
   IndexMap index_map;
   boost::optional<IndexInfo> index_info;
   YBTableType table_type;
-  bool colocated;
+  bool colocated; // Accounts for databases and tablegroups but not for YSQL system tables.
   boost::optional<master::ReplicationInfoPB> replication_info;
   boost::optional<uint32> wal_retention_secs;
 };
 
 Result<YBTableType> PBToClientTableType(TableType table_type_from_pb);
 TableType ClientToPBTableType(YBTableType table_type);
+
+struct TableSizeInfo {
+  int64 table_size;
+  int32 num_missing_tablets;
+};
 
 }  // namespace client
 }  // namespace yb

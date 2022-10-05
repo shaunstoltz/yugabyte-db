@@ -443,6 +443,9 @@ AllocateRelationDesc(Form_pg_class relp)
 	/* make sure relation is marked as having no open file yet */
 	relation->rd_smgr = NULL;
 
+	/* YB properties will be loaded lazily */
+	relation->yb_table_properties = NULL;
+
 	/*
 	 * Copy the relation tuple form
 	 *
@@ -550,7 +553,6 @@ RelationBuildTupleDesc(Relation relation)
 	AttrDefault *attrdef = NULL;
 	AttrMissing *attrmiss = NULL;
 	int			ndef = 0;
-	bool		index_ok;
 
 	/* copy some fields from pg_class row to rd_att */
 	relation->rd_att->tdtypeid = relation->rd_rel->reltype;
@@ -578,15 +580,12 @@ RelationBuildTupleDesc(Relation relation)
 	/*
 	 * Open pg_attribute and begin a scan.  Force heap scan if we haven't yet
 	 * built the critical relcache entries (this includes initdb and startup
-	 * without a pg_internal.init file), or we are building the tuple descriptor
-	 * of the pg_attribute_relid_attnum_index relation.
+	 * without a pg_internal.init file).
 	 */
-	index_ok = criticalRelcachesBuilt &&
-			  RelationGetRelid(relation) != AttributeRelidNumIndexId;
 	pg_attribute_desc = heap_open(AttributeRelationId, AccessShareLock);
 	pg_attribute_scan = systable_beginscan(pg_attribute_desc,
 										   AttributeRelidNumIndexId,
-										   index_ok,
+										   criticalRelcachesBuilt,
 										   NULL,
 										   2, skey);
 
@@ -1319,7 +1318,6 @@ YBLoadRelations()
 		/* Ignore update of existing sys relation as it can't be changed without DB upgrade. */
 		if (tmp_rel && IsSystemRelation(tmp_rel))
 			continue;
-
 		/* get information from the pg_class_tuple */
 		Form_pg_class relp  = (Form_pg_class) GETSTRUCT(pg_class_tuple);
 
@@ -1702,6 +1700,31 @@ YBUpdateRelationsPartitioning(bool sys_relations_update_required)
 	heap_close(pg_partitioned_table_desc, AccessShareLock);
 }
 
+static void
+YBUpdateRelationsIndicies(bool sys_relations_update_required)
+{
+	HASH_SEQ_STATUS status;
+	hash_seq_init(&status, RelationIdCache);
+
+	for (RelIdCacheEnt *idhentry;
+	     (idhentry = (RelIdCacheEnt *) hash_seq_search(&status)) != NULL;)
+	{
+		Relation relation = idhentry->reldesc;
+		if (sys_relations_update_required || !IsSystemRelation(relation))
+		{
+			/*
+			 * The result of the RelationGetIndexList function is not interesting.
+			 * The goal of calling this function is to cache index list in the
+			 * 'relation->rd_indexlist' field for future use.
+			 * It is cheap to get the index list now as all required data is already
+			 * preloaded (i.e. no read RPC will be sent to a master).
+			 */
+			List *indexlist = RelationGetIndexList(relation);
+			list_free(indexlist);
+		}
+	}
+}
+
 static bool
 YBIsDBConnectionValid()
 {
@@ -1747,12 +1770,42 @@ YBPreloadRelCache()
 	YbRegisterSysTableForPrefetching(AttrDefaultRelationId);           // pg_attrdef
 	YbRegisterSysTableForPrefetching(ConstraintRelationId);            // pg_constraint
 	YbRegisterSysTableForPrefetching(PartitionedRelationId);           // pg_partitioned_table
+	YbRegisterSysTableForPrefetching(TypeRelationId);                  // pg_type
+	YbRegisterSysTableForPrefetching(NamespaceRelationId);             // pg_namespace
+	YbRegisterSysTableForPrefetching(AuthIdRelationId);                // pg_authid
 
 	if (!YBIsDBConnectionValid())
 		ereport(FATAL,
 		        (errcode(ERRCODE_CONNECTION_FAILURE),
 		         errmsg("Could not reconnect to database"),
 		         errhint("Database might have been dropped by another user")));
+
+	/*
+	 * The preloading catalog cache before processing relations will help to avoid
+	 * sequential scans over prefetched data.
+	 * In case postgres tries to read row from the cache by a key and there is
+	 * no such row in it, postgres will sent request to read particular row
+	 * from a particular system table. But in case table was prefetched all the
+	 * rows will be returned from in-memory cache in spite of the fact only single
+	 * one was requested. And required row will be found by filtering out all rows
+	 * which doesn't match specified key (i.e. sequential scan).
+	 * In case particular table has N rows and it is required to load all of them
+	 * N * N tuples will be built and analyzed from already prefetched data.
+	 * The more effective approach is to build entire cache first. In this case
+	 * only N tuples will be built.
+	 */
+	YBPreloadCatalogCache(DATABASEOID, -1);             // pg_database
+	YBPreloadCatalogCache(RELOID, RELNAMENSP);          // pg_class
+	YBPreloadCatalogCache(ATTNAME, ATTNUM);             // pg_attribute
+	YBPreloadCatalogCache(CLAOID, CLAAMNAMENSP);        // pg_opclass
+	YBPreloadCatalogCache(AMOID, AMNAME);               // pg_am
+	YBPreloadCatalogCache(INDEXRELID, -1);              // pg_index
+	YBPreloadCatalogCache(RULERELNAME, -1);             // pg_rewrite
+	YBPreloadCatalogCache(CONSTROID, -1);               // pg_constraint
+	YBPreloadCatalogCache(PARTRELID, -1);               // pg_partitioned_table
+	YBPreloadCatalogCache(TYPEOID, TYPENAMENSP);        // pg_type
+	YBPreloadCatalogCache(NAMESPACEOID, NAMESPACENAME); // pg_namespace
+	YBPreloadCatalogCache(AUTHOID, AUTHNAME);           // pg_authid
 
 	YBLoadRelationsResult relations_result = YBLoadRelations();
 
@@ -1774,7 +1827,6 @@ YBPreloadRelCache()
 
 	if (relations_result.has_partitioned_tables)
 	{
-		YbRegisterSysTableForPrefetching(TypeRelationId);      // pg_type
 		YbRegisterSysTableForPrefetching(ProcedureRelationId); // pg_proc
 		YbRegisterSysTableForPrefetching(InheritsRelationId);  // pg_inherits
 	}
@@ -1782,28 +1834,24 @@ YBPreloadRelCache()
 	YBUpdateRelationsAttributes(relations_result.sys_relations_update_required);
 	YBUpdateRelationsPartitioning(relations_result.sys_relations_update_required);
 
-	/*
-	 * It is cheap to build the caches for all preloaded tables.
-	 * No additional RPC requests to a master will be initiated.
-	 */
-	YBPreloadCatalogCache(DATABASEOID, -1);      // pg_database
-	YBPreloadCatalogCache(RELOID, RELNAMENSP);   // pg_class
-	YBPreloadCatalogCache(ATTNAME, ATTNUM);      // pg_attribute
-	YBPreloadCatalogCache(CLAOID, CLAAMNAMENSP); // pg_opclass
-	YBPreloadCatalogCache(AMOID, AMNAME);        // pg_am
-	YBPreloadCatalogCache(INDEXRELID, -1);       // pg_index
-	YBPreloadCatalogCache(RULERELNAME, -1);      // pg_rewrite
-	YBPreloadCatalogCache(CONSTROID, -1);        // pg_constraint
-	YBPreloadCatalogCache(PARTRELID, -1);        // pg_partitioned_table
-
 	if (relations_result.has_partitioned_tables)
 	{
-		YBPreloadCatalogCache(TYPEOID, TYPENAMENSP);     // pg_type
 		YBPreloadCatalogCache(PROCOID, PROCNAMEARGSNSP); // pg_proc
 		YBPreloadCatalogCache(INHERITSRELID, -1);        // pg_inherits
 	}
 
-	criticalRelcachesBuilt = true;
+	YBUpdateRelationsIndicies(relations_result.sys_relations_update_required);
+	/*
+	 * The first request after the cache refresh will call the
+	 * recomputeNamespacePath function. And this function will try to find
+	 * namespace equal to username. In spite of the fact that we have already
+	 * loaded caches for the `pg_namespace` table such finding may initiate read
+	 * RPC to a master in case such namespace doesn't exists. In this case cache
+	 * will create negative entry. To avoid this RPC we try to find namespace
+	 * here. As far as data for the `pg_namespace` table is preloaded no RPC will
+	 * be sent a master and negative cache entry will be created for a future use.
+	 */
+	get_namespace_oid(GetUserNameFromId(GetUserId(), false), true);
 }
 
 /*
@@ -1829,7 +1877,7 @@ RelationBuildDesc(Oid targetRelId, bool insertIt)
 	/*
 	 * find the tuple in pg_class corresponding to the given relation id
 	 */
-	pg_class_tuple = ScanPgRelation(targetRelId, targetRelId != ClassOidIndexId, false);
+	pg_class_tuple = ScanPgRelation(targetRelId, true, false);
 
 	/*
 	 * if no such tuple exists, return NULL
@@ -2967,8 +3015,7 @@ RelationReloadNailed(Relation relation)
 			relation->rd_isvalid = true;
 
 			pg_class_tuple = ScanPgRelation(RelationGetRelid(relation),
-											RelationGetRelid(relation) != ClassOidIndexId,
-											false);
+											true, false);
 			relp = (Form_pg_class) GETSTRUCT(pg_class_tuple);
 			memcpy(relation->rd_rel, relp, CLASS_TUPLE_SIZE);
 			heap_freetuple(pg_class_tuple);
@@ -4364,7 +4411,7 @@ RelationCacheInitializePhase3(void)
 	 * In YB mode initialize the relache at the beginning so that we need
 	 * fewer cache lookups in steady state.
 	 */
-	if (needNewCacheFile && IsYugaByteEnabled())
+	if (IsYugaByteEnabled() && (needNewCacheFile || YBCIsInitDbModeEnvVarSet()))
 	{
 		YBPreloadRelCache();
 	}
@@ -4615,7 +4662,7 @@ RelationCacheInitializePhase3(void)
 	 * During initdb also preload catalog caches (not just relation cache) as
 	 * they will be used heavily.
 	 */
-	if (IsYugaByteEnabled() && YBIsPreparingTemplates())
+	if (IsYugaByteEnabled() && YBCIsInitDbModeEnvVarSet())
 		YBPreloadCatalogCaches();
 }
 
@@ -4629,25 +4676,25 @@ static void
 load_critical_index(Oid indexoid, Oid heapoid)
 {
 	Relation	ird;
-	if (IsYugaByteEnabled())
-	{
-		/* TODO We do not support/use critical indexes in YugaByte mode yet */
-		return;
-	}
-
 	/*
 	 * We must lock the underlying catalog before locking the index to avoid
 	 * deadlock, since RelationBuildDesc might well need to read the catalog,
 	 * and if anyone else is exclusive-locking this catalog and index they'll
 	 * be doing it in that order.
 	 */
+
 	LockRelationOid(heapoid, AccessShareLock);
 	LockRelationOid(indexoid, AccessShareLock);
-	ird = RelationBuildDesc(indexoid, true);
+	if (IsYugaByteEnabled())
+	{
+		RelationIdCacheLookup(indexoid, ird);
+	} else
+		ird = RelationBuildDesc(indexoid, true);
 	if (ird == NULL)
 		elog(PANIC, "could not open critical system index %u", indexoid);
 	ird->rd_isnailed = true;
 	ird->rd_refcnt = 1;
+
 	UnlockRelationOid(indexoid, AccessShareLock);
 	UnlockRelationOid(heapoid, AccessShareLock);
 }
@@ -6558,15 +6605,6 @@ load_relcache_init_file(bool shared)
 	int num_critical_shared_indexes = NUM_CRITICAL_SHARED_INDEXES;
 	int num_critical_local_indexes = NUM_CRITICAL_LOCAL_INDEXES;
 
-	/*
-	 * TODO We do not support/use critical indexes in YugaByte mode yet so set
-	 * the expected number of indexes to 0 so we do not fail here.
-	 */
-	if (IsYugaByteEnabled())
-	{
-		num_critical_shared_indexes = 0;
-		num_critical_local_indexes  = 0;
-	}
 	if (shared)
 	{
 		if (nailed_rels != NUM_CRITICAL_SHARED_RELS ||

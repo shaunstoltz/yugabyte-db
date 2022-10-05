@@ -16,13 +16,21 @@
 
 #include <stdlib.h>
 #include <string>
+#include <unordered_map>
 #include <boost/functional/hash.hpp>
 
+#include "yb/common/common_types.pb.h"
 #include "yb/common/entity_ids_types.h"
 #include "yb/util/format.h"
+#include "yb/gutil/strings/stringpiece.h"
 
 namespace yb {
 namespace cdc {
+
+// Maps a tablet id -> stream id -> replication error -> error detail.
+typedef std::unordered_map<ReplicationErrorPb, std::string> ReplicationErrorMap;
+typedef std::unordered_map<CDCStreamId, ReplicationErrorMap> StreamReplicationErrorMap;
+typedef std::unordered_map<TabletId, StreamReplicationErrorMap> TabletReplicationErrorMap;
 
 struct ConsumerTabletInfo {
   std::string tablet_id;
@@ -64,6 +72,15 @@ struct ProducerTabletInfo {
   };
 };
 
+struct XClusterTabletInfo {
+  ProducerTabletInfo producer_tablet_info;
+  ConsumerTabletInfo consumer_tablet_info;
+
+  const std::string& producer_tablet_id() const {
+    return producer_tablet_info.tablet_id;
+  }
+};
+
 struct CDCCreationState {
   std::vector<CDCStreamId> created_cdc_streams;
   std::vector<ProducerTabletInfo> producer_entries_modified;
@@ -76,6 +93,19 @@ struct CDCCreationState {
 
 inline size_t hash_value(const ProducerTabletInfo& p) noexcept {
   return ProducerTabletInfo::Hash()(p);
+}
+
+inline bool IsAlterReplicationUniverseId(const string& universe_uuid) {
+  return GStringPiece(universe_uuid).ends_with(".ALTER");
+}
+
+inline string GetOriginalReplicationUniverseId(const string& universe_uuid) {
+  // Remove the .ALTER suffix from universe_uuid if applicable.
+  GStringPiece clean_universe_id(universe_uuid);
+  if (clean_universe_id.ends_with(".ALTER")) {
+    clean_universe_id.remove_suffix(sizeof(".ALTER")-1 /* exclude \0 ending */);
+  }
+  return clean_universe_id.ToString();
 }
 
 } // namespace cdc

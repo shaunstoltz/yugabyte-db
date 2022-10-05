@@ -17,8 +17,9 @@ import re
 import json
 import platform
 
+from collections import defaultdict
 from enum import Enum
-from typing import Any, Set, FrozenSet, List, Optional, Dict, Union, Iterable
+from typing import Any, Set, FrozenSet, List, Optional, Dict, Union, Iterable, FrozenSet
 
 from yb.common_util import (
     get_build_type_from_build_root,
@@ -54,7 +55,10 @@ PROTO_LIBRARY_FILE_NAME_RE = re.compile(r'^lib(.*)_proto[.](?:%s)$' % '|'.join(
 TEST_FILE_SUFFIXES = ['_test', '-test', '_itest', '-itest']
 
 EXECUTABLE_FILE_NAME_RE = re.compile(r'^[a-zA-Z0-9_.-]+$')
-PROTO_OUTPUT_FILE_NAME_RE = re.compile(r'^([a-zA-Z_0-9-]+)[.]pb[.](h|cc)$')
+
+PROTO_GEN_OUTPUT_EXTENSIONS = ['pb', 'fwd', 'proxy', 'service', 'messages']
+PROTO_OUTPUT_FILE_NAME_RE = re.compile(
+    r'^([a-zA-Z_0-9-]+)[.](?:%s)[.](h|cc)$' % '|'.join(PROTO_GEN_OUTPUT_EXTENSIONS))
 
 # Ignore some special-case CMake targets that do not have a one-to-one match with executables or
 # libraries.
@@ -173,6 +177,7 @@ class DepGraphConf:
     incomplete_build: bool
     file_regex: Optional[str]
     src_dir_paths: List[str]
+    never_run_build: bool
 
     # Extra arguments to pass to yb_build.sh.
     build_args: Optional[str]
@@ -184,7 +189,8 @@ class DepGraphConf:
             incomplete_build: bool,
             file_regex: Optional[str],
             file_name_glob: Optional[str],
-            build_args: Optional[str]) -> None:
+            build_args: Optional[str],
+            never_run_build: bool) -> None:
         self.verbose = verbose
         self.build_root = os.path.realpath(build_root)
         self.is_ninja = is_ninja_build_root(self.build_root)
@@ -208,6 +214,7 @@ class DepGraphConf:
             if not os.path.isdir(dir_path):
                 raise RuntimeError("Directory does not exist, or is not a directory: %s" % dir_path)
         self.build_args = build_args
+        self.never_run_build = never_run_build
 
 
 class Node:
@@ -819,7 +826,7 @@ class DependencyGraph:
                     (rel_path, pb_h_cc_nodes_by_rel_path[rel_path]))
 
         # This is what we've verified above in two directions separately.
-        assert(set(proto_node_by_rel_path.keys()) == set(pb_h_cc_nodes_by_rel_path.keys()))
+        assert set(proto_node_by_rel_path.keys()) == set(pb_h_cc_nodes_by_rel_path.keys())
 
         for rel_path in proto_node_by_rel_path.keys():
             proto_node = proto_node_by_rel_path[rel_path]
@@ -877,6 +884,8 @@ class DependencyGraph:
 
         proto_dep_errors = []
 
+        PB_CC_SUFFIX = '.pb.cc'
+
         for node in self.get_nodes():
             if not node.path.endswith('.pb.cc.o'):
                 continue
@@ -886,27 +895,46 @@ class DependencyGraph:
                     "Could not identify a single source dependency of node %s. Found: %s. " %
                     (node, source_deps))
             source_dep = source_deps[0]
-            pb_h_path = source_dep.path[:-3] + '.h'
-            pb_h_node = self.node_by_path[pb_h_path]
-            proto_gen_target = pb_h_node.get_proto_gen_cmake_target()
+            assert source_dep.path.endswith(PB_CC_SUFFIX)
+            source_dep_path_prefix = source_dep.path[:-len(PB_CC_SUFFIX)]
 
-            for rev_dep in pb_h_node.reverse_deps:
-                if rev_dep.path.endswith('.cc.o'):
-                    containing_binaries: Optional[List[Node]] = rev_dep.get_containing_binaries()
-                    assert containing_binaries is not None
-                    for binary in containing_binaries:
-                        binary_cmake_target: Optional[str] = binary.get_cmake_target()
-                        assert binary_cmake_target is not None
+            found_extensions_set: Set[str] = set()
 
-                        recursive_cmake_deps = self.get_cmake_dep_graph().get_recursive_cmake_deps(
-                            binary_cmake_target)
-                        if proto_gen_target not in recursive_cmake_deps:
-                            proto_dep_errors.append(
-                                "CMake target %s does not depend directly or indirectly on target "
-                                "%s but uses the header file %s. Recursive cmake deps of %s: %s" %
-                                (binary_cmake_target, proto_gen_target, pb_h_path,
-                                 binary_cmake_target, recursive_cmake_deps)
-                            )
+            # The list of extensions of generated headers should match that in FindYRPC.cmake.
+            for extension in PROTO_GEN_OUTPUT_EXTENSIONS:
+                header_path = source_dep_path_prefix + '.' + extension + '.h'
+                if header_path not in self.node_by_path:
+                    if extension == 'pb':
+                        raise ValueError(
+                            'Graph node not found for protobuf-generated header: %s' % header_path)
+                    # Other types of generated headers may or may not be present.
+                    continue
+                found_extensions_set.add(extension)
+                header_node = self.node_by_path[header_path]
+                proto_gen_target = header_node.get_proto_gen_cmake_target()
+                if not proto_gen_target:
+                    raise ValueError("proto_gen_target is None for node %s" % header_node)
+
+                for rev_dep in header_node.reverse_deps:
+                    if rev_dep.path.endswith('.cc.o'):
+                        containing_binaries: Optional[List[Node]] = \
+                            rev_dep.get_containing_binaries()
+                        assert containing_binaries is not None
+                        for binary in containing_binaries:
+                            binary_cmake_target: Optional[str] = binary.get_cmake_target()
+                            assert binary_cmake_target is not None
+
+                            recursive_cmake_deps = \
+                                self.get_cmake_dep_graph().get_recursive_cmake_deps(
+                                    binary_cmake_target)
+                            if proto_gen_target not in recursive_cmake_deps:
+                                proto_dep_errors.append(
+                                    f"CMake target {binary_cmake_target} does not depend directly "
+                                    f"or indirectly on target {proto_gen_target} but uses the "
+                                    f"header file {header_path}. Recursive cmake deps "
+                                    f"of {binary_cmake_target}: {recursive_cmake_deps}"
+                                )
+
         if proto_dep_errors:
             for error_msg in proto_dep_errors:
                 logging.error("Protobuf dependency error: %s", error_msg)
