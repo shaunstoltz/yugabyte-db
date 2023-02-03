@@ -27,11 +27,12 @@ import { QueriesViewer } from '../../queries';
 import { isEmptyObject, isNonEmptyObject } from '../../../utils/ObjectUtils';
 import {
   isKubernetesUniverse,
-  isPausableUniverse
+  isPausableUniverse,
+  getPrimaryCluster,
+  hasLiveNodes
 } from '../../../utils/UniverseUtils';
 import { getPromiseState } from '../../../utils/PromiseUtils';
-import { getPrimaryCluster } from '../../../utils/UniverseUtils';
-import { hasLiveNodes } from '../../../utils/UniverseUtils';
+
 import { YBLoading, YBErrorIndicator } from '../../common/indicators';
 import { UniverseHealthCheckList } from './compounds/UniverseHealthCheckList';
 import { UniverseTaskList } from './compounds/UniverseTaskList';
@@ -79,6 +80,11 @@ class UniverseDetail extends Component {
     this.props.resetTablesList();
   }
 
+  isNewUIEnabled = () => {
+    const { featureFlags } = this.props;
+    return featureFlags.test.enableNewUI || featureFlags.released.enableNewUI;
+  };
+
   componentDidMount() {
     const {
       customer: { currentCustomer }
@@ -111,7 +117,10 @@ class UniverseDetail extends Component {
         this.props.getHealthCheck(uuid);
       }
     }
-    this.props.fetchRunTimeConfigs(this.props.uuid);
+    // Runtime config should by default be called at customer scope
+    // If a specific universe is selected then fall back to universe scope
+    const runTimeConfigUUID = this.props.uuid ?? this.props.customer?.currentCustomer?.data?.uuid;
+    this.props.fetchRunTimeConfigs(runTimeConfigUUID);
   }
 
   componentDidUpdate(prevProps) {
@@ -224,6 +233,7 @@ class UniverseDetail extends Component {
       showRunSampleAppsModal,
       showSupportBundleModal,
       showGFlagsModal,
+      showHelmOverridesModal,
       showManageKeyModal,
       showDeleteUniverseModal,
       showToggleUniverseStateModal,
@@ -235,7 +245,8 @@ class UniverseDetail extends Component {
       params: { tab },
       featureFlags,
       providers,
-      accessKeys
+      accessKeys,
+      graph
     } = this.props;
     const { showAlert, alertType, alertMessage } = this.state;
     const universePaused = universe?.currentUniverse?.data?.universeDetails?.universePaused;
@@ -251,13 +262,17 @@ class UniverseDetail extends Component {
     const providerUUID = primaryCluster?.userIntent?.provider;
     const provider = providers.data.find((provider) => provider.uuid === providerUUID);
 
-    var onPremSkipProvisioning = false;
+    let onPremSkipProvisioning = false;
     if (provider && provider.code === 'onprem') {
       const onPremKey = accessKeys.data.find(
         (accessKey) => accessKey.idKey.providerUUID === provider.uuid
       );
       onPremSkipProvisioning = onPremKey?.keyInfo.skipProvisioning;
     }
+
+    const isTopKMetricsEnabled =
+      runtimeConfigs?.data?.configEntries?.find((c) => c.key === 'yb.metrics.ui.topk.enable')
+        ?.value === 'true';
 
     const type =
       pathname.indexOf('edit') < 0
@@ -310,11 +325,11 @@ class UniverseDetail extends Component {
     const nodePrefixes = [currentUniverse.data.universeDetails.nodePrefix];
     const isItKubernetesUniverse = isKubernetesUniverse(currentUniverse.data);
 
-    let editTLSAvailability = getFeatureState(
+    const editTLSAvailability = getFeatureState(
       currentCustomer.data.features,
       'universes.details.overview.manageEncryption'
     );
-    let manageKeyAvailability = getFeatureState(
+    const manageKeyAvailability = getFeatureState(
       currentCustomer.data.features,
       'universes.details.overview.manageEncryption'
     );
@@ -354,9 +369,7 @@ class UniverseDetail extends Component {
             unmountOnExit={true}
             disabled={isDisabled(currentCustomer.data.features, 'universes.details.tables')}
           >
-            <ListTablesContainer
-             fetchUniverseTables={this.props.fetchUniverseTables}
-            />
+            <ListTablesContainer fetchUniverseTables={this.props.fetchUniverseTables} />
           </Tab.Pane>
         ),
 
@@ -385,11 +398,14 @@ class UniverseDetail extends Component {
             <div className="universe-detail-content-container">
               <CustomerMetricsPanel
                 customer={customer}
+                isTopKMetricsEnabled={isTopKMetricsEnabled}
                 origin={'universe'}
                 width={width}
                 nodePrefixes={nodePrefixes}
                 isKubernetesUniverse={isItKubernetesUniverse}
                 visibleModal={visibleModal}
+                featureFlags={featureFlags}
+                graph={graph}
               />
             </div>
           </Tab.Pane>
@@ -469,11 +485,7 @@ class UniverseDetail extends Component {
             isNotHidden(currentCustomer.data.features, 'universes.details.backups') && (
               <Tab.Pane
                 eventKey={'backups'}
-                tabtitle={
-                  <>
-                    Backups
-                  </>
-                }
+                tabtitle={<>Backups</>}
                 key="backups-tab"
                 mountOnEnter={true}
                 unmountOnExit={true}
@@ -564,6 +576,7 @@ class UniverseDetail extends Component {
             currentUniverse={currentUniverse.data}
             showLabelText={true}
             refreshUniverseData={this.getUniverseInfo}
+            shouldDisplayTaskButton={true}
           />
         </div>
         {isNotHidden(currentCustomer.data.features, 'universes.details.pageActions') && (
@@ -671,7 +684,13 @@ class UniverseDetail extends Component {
                           <YBLabelWithIcon icon="fa fa-flag fa-fw">Edit Flags</YBLabelWithIcon>
                         </YBMenuItem>
                       )}
-
+                      {!universePaused && isItKubernetesUniverse && (
+                        <YBMenuItem disabled={updateInProgress} onClick={showHelmOverridesModal}>
+                          <YBLabelWithIcon icon="fa fa-pencil-square">
+                            Edit Kubernetes Overrides
+                          </YBLabelWithIcon>
+                        </YBMenuItem>
+                      )}
                       {!universePaused && (
                         <YBMenuItem
                           disabled={updateInProgress}
@@ -706,7 +725,13 @@ class UniverseDetail extends Component {
                       {!isReadOnlyUniverse && !universePaused && (
                         <YBMenuItem
                           disabled={updateInProgress}
-                          to={`/universes/${uuid}/edit/async`}
+                          to={
+                            this.isNewUIEnabled()
+                              ? `/universes/${uuid}/${
+                                  this.hasReadReplica(universeInfo) ? 'edit' : 'create'
+                                }/async`
+                              : `/universes/${uuid}/edit/async`
+                          }
                           availability={getFeatureState(
                             currentCustomer.data.features,
                             'universes.details.overview.readReplica'
@@ -817,7 +842,6 @@ class UniverseDetail extends Component {
                             </YBLabelWithIcon>
                           </YBMenuItem>
                         )}
-
                       <YBMenuItem
                         onClick={showDeleteUniverseModal}
                         availability={getFeatureState(

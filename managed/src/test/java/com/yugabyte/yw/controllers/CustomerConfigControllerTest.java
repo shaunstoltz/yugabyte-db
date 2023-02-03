@@ -30,6 +30,7 @@ import com.yugabyte.yw.common.BeanValidator;
 import com.yugabyte.yw.common.FakeApiHelper;
 import com.yugabyte.yw.common.FakeDBApplication;
 import com.yugabyte.yw.common.ModelFactory;
+import com.yugabyte.yw.common.TestUtils;
 import com.yugabyte.yw.common.customer.config.CustomerConfigService;
 import com.yugabyte.yw.common.customer.config.CustomerConfigUI;
 import com.yugabyte.yw.models.Backup;
@@ -106,7 +107,7 @@ public class CustomerConfigControllerTest extends FakeDBApplication {
         result,
         "Cannot deserialize value of type "
             + "`com.yugabyte.yw.models.configs.CustomerConfig$ConfigType` from String \\\"foo\\\": "
-            + "value not one of declared Enum instance names: "
+            + "not one of the values accepted for Enum class: "
             + "[STORAGE, CALLHOME, PASSWORD_POLICY, ALERTS]");
     assertAuditEntry(0, defaultCustomer.uuid);
   }
@@ -127,8 +128,8 @@ public class CustomerConfigControllerTest extends FakeDBApplication {
 
     assertBadRequest(
         result,
-        "Cannot deserialize instance of `com.fasterxml.jackson.databind.node.ObjectNode` "
-            + "out of VALUE_STRING token");
+        "Cannot deserialize value of type `com.fasterxml.jackson.databind.node.ObjectNode` "
+            + "from String value");
     assertAuditEntry(0, defaultCustomer.uuid);
   }
 
@@ -258,6 +259,10 @@ public class CustomerConfigControllerTest extends FakeDBApplication {
     assertEquals(customerTask.getTargetUUID(), configUUID);
     fakeTaskUUID = UUID.randomUUID();
     when(mockCommissioner.submit(any(), any())).thenReturn(fakeTaskUUID);
+
+    // Set http context
+    TestUtils.setFakeHttpContext(defaultUser);
+
     ModelFactory.createScheduleBackup(defaultCustomer.uuid, UUID.randomUUID(), configUUID);
     result = FakeApiHelper.doRequestWithAuthToken("DELETE", url, defaultUser.createAuthToken());
     assertOk(result);

@@ -7,6 +7,7 @@ import com.yugabyte.yw.common.utils.Pair;
 import com.yugabyte.yw.models.Universe;
 import com.yugabyte.yw.models.XClusterConfig;
 import com.yugabyte.yw.models.XClusterConfig.XClusterConfigStatusType;
+import com.yugabyte.yw.models.XClusterTableConfig;
 import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
@@ -18,7 +19,6 @@ import javax.inject.Inject;
 import lombok.extern.slf4j.Slf4j;
 import org.yb.cdc.CdcConsumer;
 import org.yb.cdc.CdcConsumer.ProducerEntryPB;
-import org.yb.client.GetMasterClusterConfigResponse;
 import org.yb.client.YBClient;
 import org.yb.master.CatalogEntityInfo;
 
@@ -104,6 +104,8 @@ public class XClusterConfigSync extends XClusterConfigTaskBase {
           xClusterConfig.setPaused(value.getDisableStream());
           xClusterConfig.setTables(xClusterConfigTables);
           xClusterConfig.setReplicationSetupDone(xClusterConfigTables);
+          xClusterConfig.setStatusForTables(
+              xClusterConfigTables, XClusterTableConfig.Status.Running);
           updateStreamIdsFromTargetUniverseClusterConfig(
               config, xClusterConfig, xClusterConfigTables);
         });

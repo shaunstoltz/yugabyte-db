@@ -24,8 +24,10 @@ import com.google.common.collect.ImmutableMap;
 import com.google.inject.Inject;
 import com.yugabyte.yw.common.ApiHelper;
 import com.yugabyte.yw.common.ConfigHelper;
+import com.yugabyte.yw.common.CustomWsClientFactory;
 import com.yugabyte.yw.common.LdapUtil;
 import com.yugabyte.yw.common.PlatformServiceException;
+import com.yugabyte.yw.common.Util;
 import com.yugabyte.yw.common.ValidatingFormFactory;
 import com.yugabyte.yw.common.alerts.AlertConfigurationService;
 import com.yugabyte.yw.common.alerts.AlertDestinationService;
@@ -33,6 +35,7 @@ import com.yugabyte.yw.common.config.RuntimeConfigFactory;
 import com.yugabyte.yw.common.password.PasswordPolicyService;
 import com.yugabyte.yw.common.user.UserService;
 import com.yugabyte.yw.controllers.handlers.SessionHandler;
+import com.yugabyte.yw.controllers.handlers.ThirdPartyLoginHandler;
 import com.yugabyte.yw.forms.CustomerLoginFormData;
 import com.yugabyte.yw.forms.CustomerRegisterFormData;
 import com.yugabyte.yw.forms.PlatformResults;
@@ -61,7 +64,6 @@ import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.StandardOpenOption;
 import java.text.ParseException;
-import java.time.Duration;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
@@ -76,11 +78,7 @@ import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
 import org.apache.commons.io.input.ReversedLinesFileReader;
 import org.apache.directory.api.ldap.model.exception.LdapException;
-import org.pac4j.core.profile.CommonProfile;
-import org.pac4j.core.profile.ProfileManager;
-import org.pac4j.play.PlayWebContext;
 import org.pac4j.play.java.Secure;
-import org.pac4j.play.store.PlaySessionStore;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import play.Configuration;
@@ -88,7 +86,6 @@ import play.Environment;
 import play.data.Form;
 import play.libs.Json;
 import play.libs.ws.WSClient;
-import play.libs.ws.WSRequest;
 import play.mvc.Http;
 import play.mvc.Http.Cookie;
 import play.mvc.Result;
@@ -111,19 +108,13 @@ public class SessionController extends AbstractPlatformController {
 
   @Inject private Environment environment;
 
-  @Inject private WSClient ws;
-
-  @Inject private PlaySessionStore playSessionStore;
-
-  @Inject private ApiHelper apiHelper;
+  @Inject public ThirdPartyLoginHandler thirdPartyLoginHandler;
 
   @Inject private PasswordPolicyService passwordPolicyService;
 
   @Inject private AlertConfigurationService alertConfigurationService;
 
   @Inject private AlertDestinationService alertDestinationService;
-
-  @Inject private RuntimeConfigFactory runtimeConfigFactory;
 
   @Inject private SessionHandler sessionHandler;
 
@@ -133,19 +124,24 @@ public class SessionController extends AbstractPlatformController {
 
   @Inject private TokenAuthenticator tokenAuthenticator;
 
+  private final ApiHelper apiHelper;
+
+  private final RuntimeConfigFactory runtimeConfigFactory;
+
   public static final String AUTH_TOKEN = "authToken";
   public static final String API_TOKEN = "apiToken";
   public static final String CUSTOMER_UUID = "customerUUID";
   private static final Integer FOREVER = 2147483647;
   public static final String FILTERED_LOGS_SCRIPT = "bin/filtered_logs.sh";
 
-  private CommonProfile getProfile() {
-    final PlayWebContext context = new PlayWebContext(ctx(), playSessionStore);
-    final ProfileManager<CommonProfile> profileManager = new ProfileManager<>(context);
-    return profileManager
-        .get(true)
-        .orElseThrow(
-            () -> new PlatformServiceException(INTERNAL_SERVER_ERROR, "Unable to get profile"));
+  @Inject
+  public SessionController(
+      CustomWsClientFactory wsClientFactory, RuntimeConfigFactory runtimeConfigFactory) {
+    WSClient wsClient =
+        wsClientFactory.forCustomConfig(
+            runtimeConfigFactory.globalRuntimeConf().getValue(Util.LIVE_QUERY_TIMEOUTS));
+    this.runtimeConfigFactory = runtimeConfigFactory;
+    this.apiHelper = new ApiHelper(wsClient);
   }
 
   @ApiModel(description = "Session information")
@@ -186,7 +182,6 @@ public class SessionController extends AbstractPlatformController {
 
   @Data
   static class CustomerCountResp {
-
     final int count;
   }
 
@@ -366,7 +361,8 @@ public class SessionController extends AbstractPlatformController {
         Audit.ActionType.Login,
         null,
         null,
-        null);
+        null,
+        request().remoteAddress());
     return withData(sessionInfo);
   }
 
@@ -383,56 +379,24 @@ public class SessionController extends AbstractPlatformController {
   @ApiOperation(value = "UI_ONLY", hidden = true)
   @Secure(clients = "OidcClient")
   public Result thirdPartyLogin() {
-    CommonProfile profile = getProfile();
-    String emailAttr =
-        runtimeConfigFactory.globalRuntimeConf().getString("yb.security.oidcEmailAttribute");
-    String email;
-    String originUrl = request().getQueryString("orig_url");
-    String redirectTo = originUrl != null ? originUrl : "/";
+    String email = thirdPartyLoginHandler.getEmailFromCtx(ctx());
+    Users user = thirdPartyLoginHandler.findUserByEmailOrUnauthorizedErr(ctx(), email);
+    thirdPartyLoginHandler.onLoginSuccess(ctx(), user);
 
-    if (emailAttr.equals("")) {
-      email = profile.getEmail();
-    } else {
-      email = (String) profile.getAttribute(emailAttr);
-    }
-    Users user = Users.getByEmail(email.toLowerCase());
-    if (user == null) {
-      final PlayWebContext context = new PlayWebContext(ctx(), playSessionStore);
-      final ProfileManager<CommonProfile> profileManager = new ProfileManager<>(context);
-      profileManager.logout();
-      playSessionStore.destroySession(context);
-    } else {
-      Customer cust = Customer.get(user.customerUUID);
-      ctx().args.put("customer", cust);
-      ctx().args.put("user", userService.getUserWithFeatures(cust, user));
-      response()
-          .setCookie(
-              Http.Cookie.builder("customerId", cust.uuid.toString())
-                  .withSecure(ctx().request().secure())
-                  .build());
-      response()
-          .setCookie(
-              Http.Cookie.builder("userId", user.uuid.toString())
-                  .withSecure(ctx().request().secure())
-                  .build());
-      ctx().args.put("isAudited", true);
-      Audit.create(
-          user,
-          request().path(),
-          request().method(),
-          Audit.TargetType.User,
-          user.uuid.toString(),
-          Audit.ActionType.Login,
-          null,
-          null,
-          null);
-    }
+    ctx().args.put("isAudited", true);
+    Audit.create(
+        user,
+        request().path(),
+        request().method(),
+        Audit.TargetType.User,
+        user.uuid.toString(),
+        Audit.ActionType.Login,
+        null,
+        null,
+        null,
+        request().remoteAddress());
 
-    if (environment.isDev()) {
-      return redirect("http://localhost:3000" + redirectTo);
-    } else {
-      return redirect(redirectTo);
-    }
+    return thirdPartyLoginHandler.redirectTo(request().getQueryString("orig_url"));
   }
 
   @ApiOperation(value = "UI_ONLY", hidden = true)
@@ -474,7 +438,8 @@ public class SessionController extends AbstractPlatformController {
           Audit.ActionType.Login,
           null,
           null,
-          null);
+          null,
+          request().remoteAddress());
       return withData(sessionInfo);
     }
     throw new PlatformServiceException(UNAUTHORIZED, "Insecure login unavailable.");
@@ -677,17 +642,12 @@ public class SessionController extends AbstractPlatformController {
     final String finalRequestUrl = apiHelper.buildUrl(requestUrl, request().queryString());
 
     // Make the request
-    Duration timeout =
-        runtimeConfigFactory.globalRuntimeConf().getDuration("yb.proxy_endpoint_timeout");
-    WSRequest request =
-        ws.url("http://" + finalRequestUrl)
-            .setRequestTimeout(timeout)
-            .addHeader(play.mvc.Http.HeaderNames.ACCEPT_ENCODING, "gzip");
+    String url = "http://" + finalRequestUrl;
+
     // Accept-Encoding: gzip causes the master/tserver to typically return compressed responses,
     // however Play doesn't return gzipped responses right now
-
-    return request
-        .get()
+    return apiHelper
+        .getSimpleRequest(url, ImmutableMap.of(play.mvc.Http.HeaderNames.ACCEPT_ENCODING, "gzip"))
         .handle(
             (response, ex) -> {
               if (null != ex) {
@@ -697,7 +657,6 @@ public class SessionController extends AbstractPlatformController {
               // Format the response body
               if (null != response && response.getStatus() == 200) {
                 Result result;
-                String url = request.getUrl();
                 if (url.contains(".png") || url.contains(".ico") || url.contains("fontawesome")) {
                   result = ok(response.getBodyAsBytes().toArray());
                 } else {
@@ -712,7 +671,6 @@ public class SessionController extends AbstractPlatformController {
                     result = result.withHeader(entry.getKey(), String.join(",", entry.getValue()));
                   }
                 }
-
                 return result.as(response.getContentType());
               } else {
                 String errorMsg = "unknown error processing proxy request " + requestUrl;

@@ -157,7 +157,7 @@ TEST_F(SnapshotScheduleTest, GC) {
     auto master_leader = ASSERT_RESULT(cluster_->GetLeaderMiniMaster());
     peers.push_back(master_leader->tablet_peer());
     for (const auto& peer : peers) {
-      if (peer->table_type() == TableType::TRANSACTION_STATUS_TABLE_TYPE) {
+      if (peer->TEST_table_type() == TableType::TRANSACTION_STATUS_TABLE_TYPE) {
         continue;
       }
       auto dir = ASSERT_RESULT(peer->tablet_metadata()->TopSnapshotsDir());
@@ -186,8 +186,8 @@ TEST_F(SnapshotScheduleTest, TablegroupGC) {
   {
     auto namespaces = ASSERT_RESULT(client_->ListNamespaces(boost::none));
     for (const auto& ns : namespaces) {
-      if (ns.name() == namespace_name) {
-        namespace_id = ns.id();
+      if (ns.id.name() == namespace_name) {
+        namespace_id = ns.id.id();
         break;
       }
     }
@@ -195,7 +195,11 @@ TEST_F(SnapshotScheduleTest, TablegroupGC) {
   }
 
   // Since this is just for testing purposes, we do not bother generating a valid PgsqlTablegroupId.
-  ASSERT_OK(client_->CreateTablegroup(namespace_name, namespace_id, tablegroup_id, tablespace_id));
+  ASSERT_OK(client_->CreateTablegroup(namespace_name,
+                                      namespace_id,
+                                      tablegroup_id,
+                                      tablespace_id,
+                                      nullptr /* txn */));
 
   // Ensure that the newly created tablegroup shows up in the list.
   auto exist = ASSERT_RESULT(client_->TablegroupExists(namespace_name, tablegroup_id));

@@ -124,6 +124,7 @@ public class CDCBaseClass extends BaseMiniClusterTest {
     flagMap.put("ysql_beta_features", "true");
     flagMap.put("ysql_sleep_before_retry_on_txn_conflict", "false");
     flagMap.put("ysql_max_write_restart_attempts", "2");
+    flagMap.put("ysql_enable_packed_row", "false");
 
     return flagMap;
   }
@@ -541,6 +542,14 @@ public class CDCBaseClass extends BaseMiniClusterTest {
       "-force",
       flag,
       value);
+  }
+
+  protected void splitTablet(String masterAddresses, String tabletId) throws Exception {
+    runProcess(TestUtils.findBinary("yb-admin"),
+      "--master_addresses",
+      masterAddresses,
+      "split_tablet",
+      tabletId);
   }
 
   /**

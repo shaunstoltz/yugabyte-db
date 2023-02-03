@@ -10,6 +10,8 @@ import com.yugabyte.yw.commissioner.Common.CloudType;
 import com.yugabyte.yw.commissioner.tasks.params.SupportBundleTaskParams;
 import com.yugabyte.yw.common.PlatformServiceException;
 import com.yugabyte.yw.common.SupportBundleUtil;
+import com.yugabyte.yw.common.config.GlobalConfKeys;
+import com.yugabyte.yw.common.config.RuntimeConfGetter;
 import com.yugabyte.yw.common.config.RuntimeConfigFactory;
 import com.yugabyte.yw.forms.PlatformResults;
 import com.yugabyte.yw.forms.PlatformResults.YBPSuccess;
@@ -21,9 +23,8 @@ import com.yugabyte.yw.models.CustomerTask;
 import com.yugabyte.yw.models.SupportBundle;
 import com.yugabyte.yw.models.SupportBundle.SupportBundleStatusType;
 import com.yugabyte.yw.models.Universe;
-import com.yugabyte.yw.models.helpers.TaskType;
 import com.yugabyte.yw.models.helpers.BundleDetails.ComponentType;
-
+import com.yugabyte.yw.models.helpers.TaskType;
 import io.swagger.annotations.Api;
 import io.swagger.annotations.ApiImplicitParam;
 import io.swagger.annotations.ApiImplicitParams;
@@ -52,6 +53,7 @@ public class SupportBundleController extends AuthenticatedController {
   @Inject Commissioner commissioner;
   @Inject SupportBundleUtil supportBundleUtil;
   @Inject private RuntimeConfigFactory runtimeConfigFactory;
+  @Inject private RuntimeConfGetter confGetter;
   @Inject Config config;
 
   @ApiOperation(
@@ -73,8 +75,7 @@ public class SupportBundleController extends AuthenticatedController {
     Customer customer = Customer.getOrBadRequest(customerUUID);
     Universe universe = Universe.getValidUniverseOrBadRequest(universeUUID, customer);
     // Do not create support bundle when either backup, update, or universe is paused
-    if (universe.getUniverseDetails().backupInProgress
-        || universe.getUniverseDetails().updateInProgress
+    if (universe.getUniverseDetails().updateInProgress
         || universe.getUniverseDetails().universePaused) {
       throw new PlatformServiceException(
           BAD_REQUEST,
@@ -87,8 +88,8 @@ public class SupportBundleController extends AuthenticatedController {
     // Support bundle for onprem and k8s universes was originally behind a runtime flag.
     // Now both are enabled by default.
     CloudType cloudType = universe.getUniverseDetails().getPrimaryCluster().userIntent.providerType;
-    Boolean k8s_enabled = runtimeConfigFactory.globalRuntimeConf().getBoolean(K8S_ENABLED);
-    Boolean onprem_enabled = runtimeConfigFactory.globalRuntimeConf().getBoolean(ONPREM_ENABLED);
+    Boolean k8s_enabled = confGetter.getGlobalConf(GlobalConfKeys.supportBundleK8sEnabled);
+    Boolean onprem_enabled = confGetter.getGlobalConf(GlobalConfKeys.supportBundleOnPremEnabled);
     if (cloudType == CloudType.onprem && !onprem_enabled) {
       throw new PlatformServiceException(
           BAD_REQUEST,
@@ -100,6 +101,15 @@ public class SupportBundleController extends AuthenticatedController {
           BAD_REQUEST,
           "Creating support bundle for k8s universes is not enabled. "
               + "Please set k8s_enabled=true to create support bundle");
+    }
+
+    if (cloudType != CloudType.kubernetes
+        && bundleData.components.contains(ComponentType.K8sInfo)) {
+      bundleData.components.remove(ComponentType.K8sInfo);
+      log.warn(
+          "Component 'K8sInfo' is only applicable for kubernetes universes, not cloud type = "
+              + cloudType.toString()
+              + ". Continuing without it.");
     }
 
     SupportBundle supportBundle = SupportBundle.create(bundleData, universe);
@@ -141,7 +151,7 @@ public class SupportBundleController extends AuthenticatedController {
       produces = "application/x-compressed")
   public Result download(UUID customerUUID, UUID universeUUID, UUID bundleUUID) {
     Customer customer = Customer.getOrBadRequest(customerUUID);
-    Universe universe = Universe.getValidUniverseOrBadRequest(universeUUID, customer);
+    Universe.getValidUniverseOrBadRequest(universeUUID, customer);
     SupportBundle bundle = SupportBundle.getOrBadRequest(bundleUUID);
 
     if (bundle.getStatus() != SupportBundleStatusType.Success) {

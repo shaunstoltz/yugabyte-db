@@ -3,11 +3,13 @@
 package com.yugabyte.yw.forms;
 
 import com.fasterxml.jackson.annotation.JsonFormat;
+import com.fasterxml.jackson.databind.JsonNode;
 import io.swagger.annotations.ApiModel;
 import io.swagger.annotations.ApiModelProperty;
-import com.fasterxml.jackson.databind.JsonNode;
 import java.util.Date;
 import java.util.UUID;
+
+import static io.swagger.annotations.ApiModelProperty.AccessMode.READ_ONLY;
 
 @ApiModel(value = "CustomerTaskData", description = "Customer task data")
 public class CustomerTaskFormData {
@@ -52,4 +54,10 @@ public class CustomerTaskFormData {
 
   @ApiModelProperty(value = "Customer task retryable")
   public boolean retryable;
+
+  @ApiModelProperty(value = "Correlation id")
+  public String correlationId;
+
+  @ApiModelProperty(value = "Customer Email", accessMode = READ_ONLY)
+  public String userEmail;
 }

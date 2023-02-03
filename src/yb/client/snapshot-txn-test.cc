@@ -381,7 +381,6 @@ TEST_F(SnapshotTxnTest, BankAccountsWithTimeStrobe) {
 }
 
 TEST_F(SnapshotTxnTest, BankAccountsWithTimeJump) {
-  SetAtomicFlag(true, &FLAGS_enable_lease_revocation);
   FLAGS_fail_on_out_of_range_clock_skew = false;
 
   TestBankAccounts(
@@ -953,7 +952,7 @@ TEST_F_EX(SnapshotTxnTest, ResolveIntents, SingleTabletSnapshotTxnTest) {
 
     auto peers = ListTabletPeers(
         cluster_.get(), [](const std::shared_ptr<tablet::TabletPeer>& peer) {
-      if (peer->table_type() == TableType::TRANSACTION_STATUS_TABLE_TYPE) {
+      if (peer->TEST_table_type() == TableType::TRANSACTION_STATUS_TABLE_TYPE) {
         return false;
       }
       return peer->consensus()->GetLeaderStatus() == consensus::LeaderStatus::LEADER_AND_READY;

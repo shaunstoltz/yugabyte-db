@@ -52,15 +52,15 @@ public class DestroyKubernetesUniverseTest extends CommissionerBaseTest {
 
   private void setupUniverse(boolean updateInProgress) {
     config.put("KUBECONFIG", "test");
-    defaultProvider.setConfig(config);
-    defaultProvider.save();
-    Region r = Region.create(defaultProvider, "region-1", "PlacementRegion 1", "default-image");
+    kubernetesProvider.setConfig(config);
+    kubernetesProvider.save();
+    Region r = Region.create(kubernetesProvider, "region-1", "PlacementRegion 1", "default-image");
     AvailabilityZone.createOrThrow(r, "az-1", "PlacementAZ 1", "subnet-1");
     InstanceType i =
         InstanceType.upsert(
-            defaultProvider.uuid, "c3.xlarge", 10, 5.5, new InstanceType.InstanceTypeDetails());
+            kubernetesProvider.uuid, "c3.xlarge", 10, 5.5, new InstanceType.InstanceTypeDetails());
     UniverseDefinitionTaskParams.UserIntent userIntent =
-        getTestUserIntent(r, defaultProvider, i, 3);
+        getTestUserIntent(r, kubernetesProvider, i, 3);
     userIntent.replicationFactor = 3;
     userIntent.masterGFlags = new HashMap<>();
     userIntent.tserverGFlags = new HashMap<>();
@@ -81,19 +81,19 @@ public class DestroyKubernetesUniverseTest extends CommissionerBaseTest {
   private void setupUniverseMultiAZ(boolean updateInProgress, boolean skipProviderConfig) {
     if (!skipProviderConfig) {
       config.put("KUBECONFIG", "test");
-      defaultProvider.setConfig(config);
-      defaultProvider.save();
+      kubernetesProvider.setConfig(config);
+      kubernetesProvider.save();
     }
 
-    Region r = Region.create(defaultProvider, "region-1", "PlacementRegion 1", "default-image");
+    Region r = Region.create(kubernetesProvider, "region-1", "PlacementRegion 1", "default-image");
     az1 = AvailabilityZone.createOrThrow(r, "az-1", "PlacementAZ 1", "subnet-1");
     az2 = AvailabilityZone.createOrThrow(r, "az-2", "PlacementAZ 2", "subnet-2");
     az3 = AvailabilityZone.createOrThrow(r, "az-3", "PlacementAZ 3", "subnet-3");
     InstanceType i =
         InstanceType.upsert(
-            defaultProvider.uuid, "c3.xlarge", 10, 5.5, new InstanceType.InstanceTypeDetails());
+            kubernetesProvider.uuid, "c3.xlarge", 10, 5.5, new InstanceType.InstanceTypeDetails());
     UniverseDefinitionTaskParams.UserIntent userIntent =
-        getTestUserIntent(r, defaultProvider, i, 3);
+        getTestUserIntent(r, kubernetesProvider, i, 3);
     userIntent.replicationFactor = 3;
     userIntent.masterGFlags = new HashMap<>();
     userIntent.tserverGFlags = new HashMap<>();
@@ -185,6 +185,7 @@ public class DestroyKubernetesUniverseTest extends CommissionerBaseTest {
     setupUniverse(false);
     defaultUniverse.updateConfig(
         ImmutableMap.of(Universe.HELM2_LEGACY, Universe.HelmLegacy.V3.toString()));
+    defaultUniverse.save();
     DestroyUniverse.Params taskParams = new DestroyUniverse.Params();
     taskParams.isForceDelete = false;
     taskParams.customerUUID = defaultCustomer.uuid;
@@ -206,6 +207,7 @@ public class DestroyKubernetesUniverseTest extends CommissionerBaseTest {
     setupUniverse(true);
     defaultUniverse.updateConfig(
         ImmutableMap.of(Universe.HELM2_LEGACY, Universe.HelmLegacy.V3.toString()));
+    defaultUniverse.save();
     DestroyUniverse.Params taskParams = new DestroyUniverse.Params();
     taskParams.isForceDelete = false;
     taskParams.customerUUID = defaultCustomer.uuid;
@@ -219,6 +221,7 @@ public class DestroyKubernetesUniverseTest extends CommissionerBaseTest {
     setupUniverse(true);
     defaultUniverse.updateConfig(
         ImmutableMap.of(Universe.HELM2_LEGACY, Universe.HelmLegacy.V3.toString()));
+    defaultUniverse.save();
     DestroyUniverse.Params taskParams = new DestroyUniverse.Params();
     taskParams.isForceDelete = true;
     taskParams.customerUUID = defaultCustomer.uuid;
@@ -241,7 +244,7 @@ public class DestroyKubernetesUniverseTest extends CommissionerBaseTest {
     setupUniverseMultiAZ(/* update in progress */ false, /* skip provider config */ false);
     defaultUniverse.updateConfig(
         ImmutableMap.of(Universe.HELM2_LEGACY, Universe.HelmLegacy.V3.toString()));
-
+    defaultUniverse.save();
     ArgumentCaptor.forClass(UUID.class);
     ArgumentCaptor.forClass(String.class);
 
@@ -275,6 +278,7 @@ public class DestroyKubernetesUniverseTest extends CommissionerBaseTest {
     setupUniverseMultiAZ(/* update in progress */ false, /* skip provider config */ true);
     defaultUniverse.updateConfig(
         ImmutableMap.of(Universe.HELM2_LEGACY, Universe.HelmLegacy.V3.toString()));
+    defaultUniverse.save();
 
     String nodePrefix1 = String.format("%s-%s", NODE_PREFIX, az1.code);
     String nodePrefix2 = String.format("%s-%s", NODE_PREFIX, az2.code);
@@ -295,8 +299,11 @@ public class DestroyKubernetesUniverseTest extends CommissionerBaseTest {
     config2.put("KUBENAMESPACE", ns2);
 
     az1.updateConfig(config1);
+    az1.save();
     az2.updateConfig(config2);
+    az2.save();
     az3.updateConfig(config3);
+    az3.save();
 
     DestroyUniverse.Params taskParams = new DestroyUniverse.Params();
     taskParams.isForceDelete = false;
@@ -328,6 +335,7 @@ public class DestroyKubernetesUniverseTest extends CommissionerBaseTest {
     setupUniverseMultiAZ(/* update in progress */ false, /* skip provider config */ false);
     defaultUniverse.updateConfig(
         ImmutableMap.of(Universe.HELM2_LEGACY, Universe.HelmLegacy.V2TO3.toString()));
+    defaultUniverse.save();
 
     ArgumentCaptor.forClass(UUID.class);
     ArgumentCaptor.forClass(String.class);

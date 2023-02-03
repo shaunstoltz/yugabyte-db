@@ -55,6 +55,7 @@
 #include "yb/util/string_util.h"
 #include "yb/util/trace.h"
 #include "yb/util/tsan_util.h"
+#include "yb/util/flags.h"
 
 using namespace std::literals;
 using namespace std::placeholders;
@@ -62,7 +63,7 @@ using std::shared_ptr;
 using std::vector;
 using strings::Substitute;
 
-DEFINE_uint64(rpc_connection_timeout_ms, yb::NonTsanVsTsan(15000, 30000),
+DEFINE_UNKNOWN_uint64(rpc_connection_timeout_ms, yb::NonTsanVsTsan(15000, 30000),
     "Timeout for RPC connection operations");
 
 METRIC_DEFINE_histogram_with_percentiles(
@@ -129,15 +130,18 @@ void Connection::Shutdown(const Status& status) {
   DCHECK(reactor_->IsCurrentThread());
 
   {
-    std::lock_guard<simple_spinlock> lock(outbound_data_queue_lock_);
-    outbound_data_being_processed_.swap(outbound_data_to_process_);
-    shutdown_status_ = status;
-  }
+    std::vector<OutboundDataPtr> outbound_data_being_processed;
+    {
+      std::lock_guard<simple_spinlock> lock(outbound_data_queue_lock_);
 
-  for (auto& call : outbound_data_being_processed_) {
-    call->Transferred(status, this);
+      outbound_data_being_processed.swap(outbound_data_to_process_);
+      shutdown_status_ = status;
+    }
+
+    for (auto& call : outbound_data_being_processed) {
+      call->Transferred(status, this);
+    }
   }
-  outbound_data_being_processed_.clear();
 
   context_->Shutdown(status);
   stream_->Shutdown(status);
@@ -457,7 +461,7 @@ void Connection::ProcessResponseQueue() {
   }
 
   if (!outbound_data_being_processed_.empty()) {
-    for (auto &call : outbound_data_being_processed_) {
+    for (auto& call : outbound_data_being_processed_) {
       DoQueueOutboundData(std::move(call), /* batch */ true);
     }
     outbound_data_being_processed_.clear();

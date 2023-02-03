@@ -338,10 +338,7 @@ ybcBeginForeignScan(ForeignScanState *node, int eflags)
 			if (erm->markType != ROW_MARK_REFERENCE && erm->markType != ROW_MARK_COPY)
 			{
 				ybc_state->exec_params->rowmark = erm->markType;
-				/*
-				 * TODO(Piyush): We don't honour SKIP LOCKED yet in serializable isolation level.
-				 */
-				ybc_state->exec_params->wait_policy = LockWaitError;
+				YBUpdateRowLockPolicyForSerializable(&ybc_state->exec_params->wait_policy, erm->waitPolicy);
 			}
 			break;
 		}
@@ -349,8 +346,7 @@ ybcBeginForeignScan(ForeignScanState *node, int eflags)
 
 	ybc_state->is_exec_done = false;
 
-	/* Set the current syscatalog version (will check that we are up to date) */
-	HandleYBStatus(YBCPgSetCatalogCacheVersion(ybc_state->handle, yb_catalog_cache_version));
+	YbSetCatalogCacheVersion(ybc_state->handle, YbGetCatalogCacheVersion());
 }
 
 /*
@@ -690,6 +686,16 @@ ybcExplainForeignScan(ForeignScanState *node, ExplainState *es)
 {
 	if (node->yb_fdw_aggs != NIL)
 		ExplainPropertyBool("Partial Aggregate", true, es);
+}
+
+void
+YbExecUpdateInstrumentForeignScan(ForeignScanState *node,
+								  Instrumentation *instr)
+{
+	YbFdwExecState *ybc_state = (YbFdwExecState *) node->fdw_state;
+	if (ybc_state->handle)
+		YbUpdateReadRpcStats(ybc_state->handle,
+							 &instr->yb_read_rpcs, &instr->yb_tbl_read_rpcs);
 }
 
 /* ------------------------------------------------------------------------- */

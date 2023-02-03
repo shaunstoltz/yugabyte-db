@@ -2,6 +2,7 @@
 
 package com.yugabyte.yw.commissioner.tasks;
 
+import static com.yugabyte.yw.common.AlertTemplate.REPLICATION_LAG;
 import static com.yugabyte.yw.common.ModelFactory.createUniverse;
 import static com.yugabyte.yw.common.ModelFactory.testCustomer;
 import static com.yugabyte.yw.models.TaskInfo.State.Failure;
@@ -13,41 +14,44 @@ import static org.junit.Assert.assertFalse;
 import static org.junit.Assert.assertNotNull;
 import static org.junit.Assert.assertNull;
 import static org.junit.Assert.assertTrue;
+import static org.mockito.ArgumentMatchers.any;
+import static org.mockito.Mockito.lenient;
 import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.when;
 
 import com.google.common.collect.ImmutableList;
-import com.yugabyte.yw.common.ApiUtils;
-import com.yugabyte.yw.forms.UniverseDefinitionTaskParams;
+import com.yugabyte.yw.common.ModelFactory;
+import com.yugabyte.yw.common.TestUtils;
 import com.yugabyte.yw.forms.XClusterConfigCreateFormData;
 import com.yugabyte.yw.forms.XClusterConfigTaskParams;
-import com.yugabyte.yw.models.AvailabilityZone;
+import com.yugabyte.yw.metrics.MetricQueryResponse;
+import com.yugabyte.yw.models.AlertConfiguration;
 import com.yugabyte.yw.models.CustomerTask;
 import com.yugabyte.yw.models.CustomerTask.TargetType;
 import com.yugabyte.yw.models.HighAvailabilityConfig;
-import com.yugabyte.yw.models.Region;
+import com.yugabyte.yw.models.helpers.TaskType;
 import com.yugabyte.yw.models.TaskInfo;
 import com.yugabyte.yw.models.Universe;
-import com.yugabyte.yw.models.XClusterConfig;
+import com.yugabyte.yw.models.Users;
 import com.yugabyte.yw.models.XClusterConfig.XClusterConfigStatusType;
-import com.yugabyte.yw.models.helpers.NodeDetails;
-import com.yugabyte.yw.models.helpers.TaskType;
+import com.yugabyte.yw.models.XClusterConfig;
 import java.util.ArrayList;
+import java.util.Collections;
+import java.util.Date;
+import java.util.HashMap;
 import java.util.HashSet;
 import java.util.List;
 import java.util.Set;
 import java.util.UUID;
+import org.apache.commons.lang3.tuple.ImmutablePair;
 import org.junit.Before;
 import org.junit.Test;
 import org.junit.runner.RunWith;
 import org.mockito.junit.MockitoJUnitRunner;
 import org.yb.WireProtocol.AppStatusPB;
 import org.yb.WireProtocol.AppStatusPB.ErrorCode;
-import org.yb.cdc.CdcConsumer;
 import org.yb.client.DeleteUniverseReplicationResponse;
-import org.yb.client.GetMasterClusterConfigResponse;
 import org.yb.client.YBClient;
-import org.yb.master.CatalogEntityInfo;
 import org.yb.master.MasterTypes.MasterErrorPB;
 import org.yb.master.MasterTypes.MasterErrorPB.Code;
 
@@ -58,6 +62,7 @@ public class DeleteXClusterConfigTest extends CommissionerBaseTest {
   private String sourceUniverseName;
   private UUID sourceUniverseUUID;
   private Universe sourceUniverse;
+  private Users defaultUser;
   private String targetUniverseName;
   private UUID targetUniverseUUID;
   private Universe targetUniverse;
@@ -84,6 +89,7 @@ public class DeleteXClusterConfigTest extends CommissionerBaseTest {
     super.setUp();
 
     defaultCustomer = testCustomer("DeleteXClusterConfig-test-customer");
+    defaultUser = ModelFactory.testUser(defaultCustomer);
 
     configName = "DeleteXClusterConfigTest-test-config";
 
@@ -122,6 +128,9 @@ public class DeleteXClusterConfigTest extends CommissionerBaseTest {
     XClusterConfigTaskParams taskParams = new XClusterConfigTaskParams(xClusterConfig);
     try {
       UUID taskUUID = commissioner.submit(TaskType.DeleteXClusterConfig, taskParams);
+
+      // Set http context
+      TestUtils.setFakeHttpContext(defaultUser);
       CustomerTask.create(
           defaultCustomer,
           targetUniverse.universeUUID,
@@ -136,31 +145,39 @@ public class DeleteXClusterConfigTest extends CommissionerBaseTest {
     return null;
   }
 
-  public void initTargetUniverseClusterConfig(String replicationGroupName) {
-    CdcConsumer.ProducerEntryPB.Builder fakeProducerEntry =
-        CdcConsumer.ProducerEntryPB.newBuilder();
-    CdcConsumer.StreamEntryPB.Builder fakeStreamEntry2 =
-        CdcConsumer.StreamEntryPB.newBuilder().setProducerTableId(exampleTableID2);
-    fakeProducerEntry.putStreamMap(exampleStreamID2, fakeStreamEntry2.build());
-    CdcConsumer.StreamEntryPB.Builder fakeStreamEntry1 =
-        CdcConsumer.StreamEntryPB.newBuilder().setProducerTableId(exampleTableID1);
-    fakeProducerEntry.putStreamMap(exampleStreamID1, fakeStreamEntry1.build());
+  public void setupAlertConfigurations() {
+    AlertConfiguration alertConfiguration =
+        alertConfigurationService
+            .createConfigurationTemplate(defaultCustomer, REPLICATION_LAG)
+            .getDefaultConfiguration();
+    alertConfiguration.setDefaultDestination(true);
+    alertConfiguration.setCreateTime(new Date());
+    alertConfiguration.generateUUID();
+    alertConfiguration.save();
 
-    CdcConsumer.ConsumerRegistryPB.Builder fakeConsumerRegistryBuilder =
-        CdcConsumer.ConsumerRegistryPB.newBuilder()
-            .putProducerMap(replicationGroupName, fakeProducerEntry.build());
+    lenient()
+        .doReturn(Collections.singletonList(alertConfiguration))
+        .when(alertConfigurationService)
+        .list(any());
+  }
 
-    CatalogEntityInfo.SysClusterConfigEntryPB.Builder fakeClusterConfigBuilder =
-        CatalogEntityInfo.SysClusterConfigEntryPB.newBuilder()
-            .setConsumerRegistry(fakeConsumerRegistryBuilder.build());
+  public void setupMetricValues() {
+    ArrayList<MetricQueryResponse.Entry> metricValues = new ArrayList<>();
+    MetricQueryResponse.Entry entryExampleTableID1 = new MetricQueryResponse.Entry();
+    entryExampleTableID1.labels = new HashMap<>();
+    entryExampleTableID1.labels.put("table_id", exampleTableID1);
+    entryExampleTableID1.values = new ArrayList<>();
+    entryExampleTableID1.values.add(ImmutablePair.of(10.0, 0.0));
+    metricValues.add(entryExampleTableID1);
 
-    GetMasterClusterConfigResponse fakeClusterConfigResponse =
-        new GetMasterClusterConfigResponse(0, "", fakeClusterConfigBuilder.build(), null);
+    MetricQueryResponse.Entry entryExampleTableID2 = new MetricQueryResponse.Entry();
+    entryExampleTableID2.labels = new HashMap<>();
+    entryExampleTableID2.labels.put("table_id", exampleTableID2);
+    entryExampleTableID2.values = new ArrayList<>();
+    entryExampleTableID2.values.add(ImmutablePair.of(10.0, 0.0));
+    metricValues.add(entryExampleTableID2);
 
-    try {
-      when(mockClient.getMasterClusterConfig()).thenReturn(fakeClusterConfigResponse);
-    } catch (Exception e) {
-    }
+    when(mockMetricQueryHelper.queryDirect(any())).thenReturn(metricValues);
   }
 
   @Test
@@ -168,12 +185,10 @@ public class DeleteXClusterConfigTest extends CommissionerBaseTest {
     XClusterConfig xClusterConfig =
         XClusterConfig.create(createFormData, XClusterConfigStatusType.Running);
 
-    initTargetUniverseClusterConfig(xClusterConfig.getReplicationGroupName());
-
     try {
       DeleteUniverseReplicationResponse mockDeleteResponse =
           new DeleteUniverseReplicationResponse(0, "", null, null);
-      when(mockClient.deleteUniverseReplication(xClusterConfig.getReplicationGroupName(), true))
+      when(mockClient.deleteUniverseReplication(xClusterConfig.getReplicationGroupName(), false))
           .thenReturn(mockDeleteResponse);
     } catch (Exception e) {
     }
@@ -203,13 +218,12 @@ public class DeleteXClusterConfigTest extends CommissionerBaseTest {
     XClusterConfig xClusterConfig =
         XClusterConfig.create(createFormData, XClusterConfigStatusType.Running);
 
-    initTargetUniverseClusterConfig(xClusterConfig.getReplicationGroupName());
     HighAvailabilityConfig.create("test-cluster-key");
 
     try {
       DeleteUniverseReplicationResponse mockDeleteResponse =
           new DeleteUniverseReplicationResponse(0, "", null, null);
-      when(mockClient.deleteUniverseReplication(xClusterConfig.getReplicationGroupName(), true))
+      when(mockClient.deleteUniverseReplication(xClusterConfig.getReplicationGroupName(), false))
           .thenReturn(mockDeleteResponse);
     } catch (Exception e) {
     }
@@ -239,7 +253,6 @@ public class DeleteXClusterConfigTest extends CommissionerBaseTest {
     XClusterConfig xClusterConfig =
         XClusterConfig.create(createFormData, XClusterConfigStatusType.Running);
 
-    initTargetUniverseClusterConfig(xClusterConfig.getReplicationGroupName());
     String deleteErrMsg = "failed to run delete rpc";
     try {
       AppStatusPB.Builder appStatusBuilder =
@@ -250,7 +263,7 @@ public class DeleteXClusterConfigTest extends CommissionerBaseTest {
               .setCode(Code.UNKNOWN_ERROR);
       DeleteUniverseReplicationResponse mockSetupResponse =
           new DeleteUniverseReplicationResponse(0, "", masterErrorBuilder.build(), null);
-      when(mockClient.deleteUniverseReplication(xClusterConfig.getReplicationGroupName(), true))
+      when(mockClient.deleteUniverseReplication(xClusterConfig.getReplicationGroupName(), false))
           .thenReturn(mockSetupResponse);
     } catch (Exception e) {
     }

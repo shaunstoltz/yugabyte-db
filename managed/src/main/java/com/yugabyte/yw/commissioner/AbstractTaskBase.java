@@ -20,12 +20,12 @@ import com.yugabyte.yw.common.TableManager;
 import com.yugabyte.yw.common.TableManagerYb;
 import com.yugabyte.yw.common.Util;
 import com.yugabyte.yw.common.alerts.AlertConfigurationService;
+import com.yugabyte.yw.common.config.RuntimeConfGetter;
 import com.yugabyte.yw.common.config.RuntimeConfigFactory;
 import com.yugabyte.yw.common.metrics.MetricService;
 import com.yugabyte.yw.common.services.YBClientService;
 import com.yugabyte.yw.forms.ITaskParams;
 import com.yugabyte.yw.forms.UniverseDefinitionTaskParams;
-import com.yugabyte.yw.models.TaskInfo;
 import com.yugabyte.yw.models.Universe.UniverseUpdater;
 import com.yugabyte.yw.models.helpers.NodeDetails;
 import com.yugabyte.yw.models.helpers.NodeStatus;
@@ -65,6 +65,7 @@ public abstract class AbstractTaskBase implements ITask {
   protected final Config config;
   protected final ConfigHelper configHelper;
   protected final RuntimeConfigFactory runtimeConfigFactory;
+  protected final RuntimeConfGetter confGetter;
   protected final MetricService metricService;
   protected final AlertConfigurationService alertConfigurationService;
   protected final YBClientService ybService;
@@ -81,6 +82,7 @@ public abstract class AbstractTaskBase implements ITask {
     this.config = baseTaskDependencies.getConfig();
     this.configHelper = baseTaskDependencies.getConfigHelper();
     this.runtimeConfigFactory = baseTaskDependencies.getRuntimeConfigFactory();
+    this.confGetter = baseTaskDependencies.getConfGetter();
     this.metricService = baseTaskDependencies.getMetricService();
     this.alertConfigurationService = baseTaskDependencies.getAlertConfigurationService();
     this.ybService = baseTaskDependencies.getYbService();
@@ -159,8 +161,7 @@ public abstract class AbstractTaskBase implements ITask {
     return Util.convertStringToJson(response.message);
   }
 
-  public UniverseUpdater nodeStateUpdater(
-      final UUID universeUUID, final String nodeName, final NodeStatus nodeStatus) {
+  public UniverseUpdater nodeStateUpdater(final String nodeName, final NodeStatus nodeStatus) {
     UniverseUpdater updater =
         universe -> {
           UniverseDefinitionTaskParams universeDetails = universe.getUniverseDetails();
@@ -174,7 +175,7 @@ public abstract class AbstractTaskBase implements ITask {
               nodeName,
               currentStatus,
               nodeStatus,
-              universeUUID);
+              universe.universeUUID);
           nodeStatus.fillNodeStates(node);
           if (nodeStatus.getNodeState() == NodeDetails.NodeState.Decommissioned) {
             node.cloudInfo.private_ip = null;
@@ -194,8 +195,8 @@ public abstract class AbstractTaskBase implements ITask {
    * @param taskClass task class
    * @return Task instance with injected dependencies
    */
-  public static <T> T createTask(Class<T> taskClass) {
-    return Play.current().injector().instanceOf(taskClass);
+  public static <T extends ITask> T createTask(Class<T> taskClass) {
+    return Play.current().injector().instanceOf(TaskExecutor.class).createTask(taskClass);
   }
 
   public int getSleepMultiplier() {

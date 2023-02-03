@@ -63,7 +63,7 @@
 
 #include "yb/tserver/tserver_admin.proxy.h"
 
-#include "yb/util/flag_tags.h"
+#include "yb/util/flags.h"
 #include "yb/util/format.h"
 #include "yb/util/math_util.h"
 #include "yb/util/monotime.h"
@@ -77,52 +77,43 @@
 #include "yb/util/tsan_util.h"
 #include "yb/util/uuid.h"
 
-DEFINE_int32(ysql_index_backfill_rpc_timeout_ms, 60 * 1000, // 1 min.
-             "Timeout used by the master when attempting to backfill a YSQL tablet during index "
-             "creation.");
+using std::vector;
+using std::string;
+
+DEFINE_RUNTIME_int32(ysql_index_backfill_rpc_timeout_ms, 60 * 1000, // 1 min.
+    "Timeout used by the master when attempting to backfill a YSQL tablet during index creation.");
 TAG_FLAG(ysql_index_backfill_rpc_timeout_ms, advanced);
-TAG_FLAG(ysql_index_backfill_rpc_timeout_ms, runtime);
 
-DEFINE_int32(index_backfill_rpc_timeout_ms, 1 * 30 * 1000, // 30 sec.
-             "Timeout used by the master when attempting to backfill a tablet "
-             "during index creation.");
+DEFINE_RUNTIME_int32(index_backfill_rpc_timeout_ms, 1 * 30 * 1000, // 30 sec.
+    "Timeout used by the master when attempting to backfill a tablet during index creation.");
 TAG_FLAG(index_backfill_rpc_timeout_ms, advanced);
-TAG_FLAG(index_backfill_rpc_timeout_ms, runtime);
 
-DEFINE_int32(index_backfill_rpc_max_retries, 150,
-             "Number of times to retry backfilling a tablet chunk "
-             "during index creation.");
+DEFINE_RUNTIME_int32(index_backfill_rpc_max_retries, 150,
+    "Number of times to retry backfilling a tablet chunk during index creation.");
 TAG_FLAG(index_backfill_rpc_max_retries, advanced);
-TAG_FLAG(index_backfill_rpc_max_retries, runtime);
 
-DEFINE_int32(index_backfill_rpc_max_delay_ms, 10 * 60 * 1000, // 10 min.
-             "Maximum delay before retrying a backfill tablet chunk request "
-             "during index creation.");
+DEFINE_RUNTIME_int32(index_backfill_rpc_max_delay_ms, 10 * 60 * 1000, // 10 min.
+    "Maximum delay before retrying a backfill tablet chunk request during index creation.");
 TAG_FLAG(index_backfill_rpc_max_delay_ms, advanced);
-TAG_FLAG(index_backfill_rpc_max_delay_ms, runtime);
 
-DEFINE_int32(index_backfill_wait_for_alter_table_completion_ms, 100,
-             "Delay before retrying to see if an in-progress alter table has "
-             "completed, during index backfill.");
+DEFINE_RUNTIME_int32(index_backfill_wait_for_alter_table_completion_ms, 100,
+    "Delay before retrying to see if an in-progress alter table has "
+    "completed, during index backfill.");
 TAG_FLAG(index_backfill_wait_for_alter_table_completion_ms, advanced);
-TAG_FLAG(index_backfill_wait_for_alter_table_completion_ms, runtime);
 
-DEFINE_int32(index_backfill_tablet_split_completion_timeout_sec, 30,
-             "Total time to wait for tablet splitting to complete on a table from which we are "
-             "running a backfill before aborting the backfill and marking it as failed.");
+DEFINE_RUNTIME_int32(index_backfill_tablet_split_completion_timeout_sec, 30,
+    "Total time to wait for tablet splitting to complete on a table from which we are "
+    "running a backfill before aborting the backfill and marking it as failed.");
 TAG_FLAG(index_backfill_tablet_split_completion_timeout_sec, advanced);
-TAG_FLAG(index_backfill_tablet_split_completion_timeout_sec, runtime);
 
-DEFINE_int32(index_backfill_tablet_split_completion_poll_freq_ms, 2000,
-             "Delay before retrying to see if tablet splitting has completed on the table from "
-             "which we are running a backfill.");
+DEFINE_RUNTIME_int32(index_backfill_tablet_split_completion_poll_freq_ms, 2000,
+    "Delay before retrying to see if tablet splitting has completed on the table from "
+    "which we are running a backfill.");
 TAG_FLAG(index_backfill_tablet_split_completion_poll_freq_ms, advanced);
-TAG_FLAG(index_backfill_tablet_split_completion_poll_freq_ms, runtime);
 
-DEFINE_bool(defer_index_backfill, false,
-            "Defer index backfill so that backfills can be performed as a batch later on.");
+DEFINE_RUNTIME_bool(defer_index_backfill, false,
+    "Defer index backfill so that backfills can be performed as a batch later on.");
 TAG_FLAG(defer_index_backfill, advanced);
-TAG_FLAG(defer_index_backfill, runtime);
 
 DEFINE_test_flag(int32, slowdown_backfill_alter_table_rpcs_ms, 0,
     "Slows down the send alter table rpc's so that the master may be stopped between "
@@ -135,6 +126,10 @@ DEFINE_test_flag(
 DEFINE_test_flag(
     bool, skip_index_backfill, false,
     "Skips backfilling the data on tservers and leaves the index in inconsistent state.");
+
+DEFINE_test_flag(
+    bool, block_do_backfill, false,
+    "Block DoBackfill from proceeding.");
 
 namespace yb {
 namespace master {
@@ -154,8 +149,8 @@ Result<bool> GetPgIndexStatus(
   const auto pg_index_id =
       GetPgsqlTableId(VERIFY_RESULT(GetPgsqlDatabaseOid(idx_id)), kPgIndexTableOid);
 
-  const tablet::Tablet* catalog_tablet =
-      catalog_manager->tablet_peer()->tablet();
+  const auto catalog_tablet =
+      VERIFY_RESULT(catalog_manager->tablet_peer()->shared_tablet_safe());
   const Schema& pg_index_schema =
       VERIFY_RESULT(catalog_tablet->metadata()->GetTableInfo(pg_index_id))->schema();
 
@@ -253,6 +248,11 @@ Status MultiStageAlterTable::ClearFullyAppliedAndUpdateState(
   uint32_t current_version = l->pb.version();
   if (expected_version && *expected_version != current_version) {
     return STATUS(AlreadyPresent, "Table has already moved to a different version.");
+  } else if (!l->is_running()) {
+    LOG(WARNING) << __func__ << ": The table state is " << l->state_name() << " will stop backfill";
+    return STATUS_SUBSTITUTE(
+        IllegalState, "Table $0 is not in ALTERING or RUNNING state: $1",
+        table->ToString(), l->state_name());
   }
   l.mutable_data()->pb.clear_fully_applied_schema();
   l.mutable_data()->pb.clear_fully_applied_schema_version();
@@ -304,6 +304,12 @@ Result<bool> MultiStageAlterTable::UpdateIndexPermission(
       return STATUS_SUBSTITUTE(
           AlreadyPresent, "Schema was already updated to $0 before we got to it (expected $1).",
           indexed_table_pb.version(), *current_version);
+    } else if (!indexed_table_data.is_running()) {
+      LOG(WARNING) << __func__ << ": The table state is " << indexed_table_data.state_name()
+                   << " will stop backfill";
+      return STATUS_SUBSTITUTE(
+          IllegalState, "Table $0 is not in ALTERING or RUNNING state: $1",
+          indexed_table->ToString(), indexed_table_data.state_name());
     }
 
     CopySchemaDetailsToFullyApplied(&indexed_table_pb);
@@ -874,7 +880,8 @@ Status BackfillTable::WaitForTabletSplitting() {
   CoarseTimePoint deadline = CoarseMonoClock::Now() +
                              FLAGS_index_backfill_tablet_split_completion_timeout_sec * 1s;
   while (!tablet_split_manager->IsTabletSplittingComplete(*indexed_table_,
-                                                          false /* wait_for_parent_deletion */)) {
+                                                          false /* wait_for_parent_deletion */,
+                                                          deadline)) {
     if (CoarseMonoClock::Now() > deadline) {
       return STATUS(TimedOut, "Tablet splitting did not complete after being disabled; cannot "
                               "safely backfill the index.");
@@ -896,6 +903,11 @@ Status BackfillTable::DoLaunchBackfill() {
 }
 
 Status BackfillTable::DoBackfill() {
+  while (FLAGS_TEST_block_do_backfill) {
+    constexpr auto kSpinWait = 100ms;
+    LOG(INFO) << Format("Blocking $0 for $1", __func__, kSpinWait);
+    SleepFor(kSpinWait);
+  }
   VLOG_WITH_PREFIX(1) << "starting backfill with timestamp: "
                       << read_time_for_backfill_;
   auto tablets = indexed_table_->GetTablets();
@@ -979,6 +991,11 @@ Status BackfillTable::MarkIndexesAsDesired(
           idx_pb->clear_backfill_error_message();
         }
         idx_pb->clear_is_backfill_deferred();
+        // We clear the backfill job upon completion - however, we want to persist the number
+        // of indexed table rows completed, so we record the information in the index info PB.
+        // For partial indexes, the number of rows processed includes non-matching rows of
+        // the indexed table.
+        idx_pb->set_num_rows_processed_by_backfill_job(number_rows_processed_);
       }
     }
     RETURN_NOT_OK(
@@ -1038,7 +1055,7 @@ Status BackfillTable::UpdateIndexPermissionsForIndexes() {
       MultiStageAlterTable::UpdateIndexPermission(
           master_->catalog_manager_impl(), indexed_table_, permissions_to_set, boost::none),
       "Could not update permissions after backfill. "
-      "Possible that the master-leader has changed.");
+      "Possible that the master-leader has changed, or the table was deleted.");
   backfill_job_->SetState(
       all_success ? MonitoredTaskState::kComplete : MonitoredTaskState::kFailed);
   RETURN_NOT_OK(ClearCheckpointStateInTablets());

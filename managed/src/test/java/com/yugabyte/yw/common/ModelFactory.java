@@ -6,6 +6,10 @@ import static com.yugabyte.yw.common.AlertTemplate.MEMORY_CONSUMPTION;
 import static com.yugabyte.yw.models.helpers.CommonUtils.nowMinusWithoutMillis;
 import static com.yugabyte.yw.models.helpers.CommonUtils.nowPlusWithoutMillis;
 import static com.yugabyte.yw.models.helpers.CommonUtils.nowWithoutMillis;
+import static org.mockito.ArgumentMatchers.any;
+import static org.mockito.Mockito.lenient;
+import static org.mockito.Mockito.mock;
+import static org.mockito.Mockito.when;
 
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.node.ObjectNode;
@@ -19,6 +23,7 @@ import com.yugabyte.yw.common.alerts.AlertChannelEmailParams;
 import com.yugabyte.yw.common.alerts.AlertChannelParams;
 import com.yugabyte.yw.common.alerts.AlertChannelSlackParams;
 import com.yugabyte.yw.common.certmgmt.CertConfigType;
+import com.yugabyte.yw.common.config.RuntimeConfGetter;
 import com.yugabyte.yw.common.kms.EncryptionAtRestManager;
 import com.yugabyte.yw.common.kms.services.EncryptionAtRestService;
 import com.yugabyte.yw.common.metrics.MetricLabelsBuilder;
@@ -244,7 +249,7 @@ public class ModelFactory {
       NodeDetails node2 = node.clone();
       node2.cloudInfo.private_ip = "127.0.0.2";
       params.nodeDetailsSet.add(node2);
-      userIntent.ybSoftwareVersion = "2.14.0.0-b1";
+      userIntent.ybSoftwareVersion = "2.15.0.0-b1";
     }
     params.upsertPrimaryCluster(userIntent, pi);
     return Universe.create(params, customerId);
@@ -596,7 +601,11 @@ public class ModelFactory {
 
   public static KmsConfig createKMSConfig(
       UUID customerUUID, String keyProvider, ObjectNode authConfig, String configName) {
-    EncryptionAtRestManager keyManager = new EncryptionAtRestManager();
+    RuntimeConfGetter mockRuntimeConfGetter = mock(RuntimeConfGetter.class);
+    lenient()
+        .when(mockRuntimeConfGetter.getConfForScope(any(Universe.class), any()))
+        .thenReturn(false);
+    EncryptionAtRestManager keyManager = new EncryptionAtRestManager(mockRuntimeConfGetter);
     EncryptionAtRestService keyService = keyManager.getServiceInstance(keyProvider);
     return keyService.createAuthConfig(customerUUID, configName, authConfig);
   }
@@ -629,7 +638,9 @@ public class ModelFactory {
   // isn't found, it is created. The same is about availability zones.
   public static Universe createFromConfig(Provider provider, String univName, String config) {
     Customer customer = Customer.get(provider.customerUUID);
-    Universe universe = createUniverse(univName, customer.getCustomerId());
+    Universe universe =
+        createUniverse(
+            univName, UUID.randomUUID(), customer.getCustomerId(), provider.getCloudCode());
 
     UUID placementUuid = universe.getUniverseDetails().getPrimaryCluster().uuid;
     PlacementCloud cloud = new PlacementCloud();
@@ -661,7 +672,6 @@ public class ModelFactory {
           !azOpt.isPresent()
               ? AvailabilityZone.createOrThrow(region, zone, zone, "subnet-" + zone)
               : azOpt.get();
-
       int count = Integer.parseInt(parts[2]);
       if (count == 0) {
         // No nodes in this zone yet.
@@ -680,7 +690,7 @@ public class ModelFactory {
                 NodeDetails.NodeState.Live,
                 mastersCount-- > 0,
                 true,
-                "aws",
+                provider.code,
                 regionCode,
                 az.code,
                 null);
@@ -698,12 +708,12 @@ public class ModelFactory {
     userIntent.universeName = univName;
     userIntent.replicationFactor = rf;
     userIntent.numNodes = numNodes;
-    userIntent.provider = provider.code;
+    userIntent.provider = provider.uuid.toString();
     userIntent.regionList = regionList;
     userIntent.instanceType = ApiUtils.UTIL_INST_TYPE;
     userIntent.ybSoftwareVersion = "0.0.1";
     userIntent.accessKeyCode = "akc";
-    userIntent.providerType = CloudType.aws;
+    userIntent.providerType = provider.getCloudCode();
     userIntent.preferredRegion = null;
 
     UniverseUpdater updater =

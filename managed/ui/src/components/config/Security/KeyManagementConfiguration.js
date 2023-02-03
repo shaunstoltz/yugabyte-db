@@ -43,7 +43,7 @@ let kmsConfigTypes = [
 ];
 
 //GCP KMS
-const PROTECTION_LEVELS = [
+export const PROTECTION_LEVELS = [
   { label: 'HSM (Hardware)', value: 'HSM' },
   { label: 'Software', value: 'SOFTWARE' }
 ];
@@ -413,6 +413,7 @@ class KeyManagementConfiguration extends Component {
               component={YBFormInput}
               placeholder={'CMK ID'}
               className={'kube-provider-input-field'}
+              disabled={isEdit}
             />
           </Col>
           <Col lg={1} className="config-zone-tooltip">

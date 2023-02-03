@@ -24,13 +24,18 @@ export enum QUERY_KEY {
   universeConfigure = 'universeConfigure',
   getInstanceTypes = 'getInstanceTypes',
   getDBVersions = 'getDBVersions',
+  getDBVersionsByProvider = 'getDBVersionsByProvider',
   getAccessKeys = 'getAccessKeys',
   getCertificates = 'getCertificates',
   getKMSConfigs = 'getKMSConfigs',
   deleteCertificate = 'deleteCertificate',
   getHAConfig = 'getHAConfig',
   getHAReplicationSchedule = 'getHAReplicationSchedule',
-  getHABackups = 'getHABackups'
+  getHABackups = 'getHABackups',
+  validateGflags = 'validateGflags',
+  getMostUsedGflags = 'getMostUsedGflags',
+  getAllGflags = 'getAllGflags',
+  getGflagByName = 'getGlagByName'
 }
 
 class ApiService {
@@ -41,7 +46,7 @@ class ApiService {
     return customerId || '';
   }
 
-  findUniverseByName = (universeName: string): Promise<Universe> => {
+  findUniverseByName = (universeName: string): Promise<string[]> => {
     // auto-cancel previous request, if any
     if (this.cancellers.findUniverseByName) this.cancellers.findUniverseByName();
 
@@ -49,15 +54,18 @@ class ApiService {
     const source = axios.CancelToken.source();
     this.cancellers.findUniverseByName = source.cancel;
 
-    const requestUrl = `${ROOT_URL}/customers/${this.getCustomerId()}/universes/find/${universeName}`;
+    const requestUrl = `${ROOT_URL}/customers/${this.getCustomerId()}/universes/find?name=${universeName}`;
     return axios
-      .get<Universe>(requestUrl, { cancelToken: source.token })
+      .get<string[]>(requestUrl, { cancelToken: source.token })
       .then((resp) => resp.data);
   };
 
-  fetchUniverse = (universeId: string): Promise<Universe> => {
-    const requestUrl = `${ROOT_URL}/customers/${this.getCustomerId()}/universes/${universeId}`;
-    return axios.get<Universe>(requestUrl).then((resp) => resp.data);
+  fetchUniverse = (universeUUID: string | undefined): Promise<Universe> => {
+    if (universeUUID) {
+      const requestUrl = `${ROOT_URL}/customers/${this.getCustomerId()}/universes/${universeUUID}`;
+      return axios.get<Universe>(requestUrl).then((resp) => resp.data);
+    }
+    return Promise.reject('Querying universe failed: No universe UUID provided.');
   };
 
   getProvidersList = (): Promise<Provider[]> => {
@@ -106,6 +114,15 @@ class ApiService {
   getDBVersions = (): Promise<string[]> => {
     const requestUrl = `${ROOT_URL}/customers/${this.getCustomerId()}/releases`;
     return axios.get<string[]>(requestUrl).then((resp) => resp.data);
+  };
+
+  getDBVersionsByProvider = (providerId?: string): Promise<string[]> => {
+    if (providerId) {
+      const requestUrl = `${ROOT_URL}/customers/${this.getCustomerId()}/providers/${providerId}/releases`;
+      return axios.get<string[]>(requestUrl).then((resp) => resp.data);
+    } else {
+      return Promise.reject('Querying access keys failed: no provider ID provided');
+    }
   };
 
   getAccessKeys = (providerId?: string): Promise<AccessKey[]> => {
@@ -219,42 +236,47 @@ class ApiService {
    * @param certUUID - certificate UUID
    */
   deleteCertificate = (certUUID: string, customerUUID: string): Promise<any> => {
-    const requestUrl = `${ROOT_URL}/customers/${customerUUID}/certificates/${certUUID}`
+    const requestUrl = `${ROOT_URL}/customers/${customerUUID}/certificates/${certUUID}`;
     return axios.delete<any>(requestUrl).then((res) => res.data);
-  }
+  };
 
-  getAlerts = (offset: number, limit: number, sortBy: string, direction = "ASC",  filter: {}): Promise<any> => {
-
+  getAlerts = (
+    offset: number,
+    limit: number,
+    sortBy: string,
+    direction = 'ASC',
+    filter: {}
+  ): Promise<any> => {
     const payload = {
       filter,
       sortBy,
       direction,
       offset,
       limit,
-      "needTotalCount": true
-    }
+      needTotalCount: true
+    };
 
     const requestURL = `${ROOT_URL}/customers/${this.getCustomerId()}/alerts/page`;
     return axios.post(requestURL, payload).then((res) => res.data);
-  }
+  };
 
   getAlertCount = (filter: {}): Promise<any> => {
     const payload = {
       ...filter
-    }
+    };
     const requestURL = `${ROOT_URL}/customers/${this.getCustomerId()}/alerts/count`;
-    return axios.post(requestURL, payload).then(res => res.data);
-  }
+    return axios.post(requestURL, payload).then((res) => res.data);
+  };
 
   getAlert = (alertUUID: string) => {
     const requestURL = `${ROOT_URL}/customers/${this.getCustomerId()}/alerts/${alertUUID}`;
     return axios.get(requestURL).then((res) => res.data);
-  }
+  };
 
   acknowledgeAlert = (uuid: string) => {
     const requestURL = `${ROOT_URL}/customers/${this.getCustomerId()}/alerts/acknowledge`;
     return axios.post(requestURL, { uuids: [uuid] }).then((res) => res.data);
-  }
+  };
 }
 
 export const api = new ApiService();

@@ -3,7 +3,11 @@ import './MetricsComparisonModal.scss';
 import { NodeSelector } from './NodeSelector';
 import { FilterContext } from './ComparisonFilterContextProvider';
 
-export const NodeSelectorHeader = ({ universe }) => {
+export const NodeSelectorHeader = ({
+  universe,
+  selectedRegionClusterUUID,
+  isTopKMetricsEnabled
+}) => {
   const [state, dispatch] = useContext(FilterContext);
 
   const handleNodeChange = (type, event) => {
@@ -21,6 +25,8 @@ export const NodeSelectorHeader = ({ universe }) => {
         selectedNode={state.nodeNameFirst}
         otherSelectedNode={state.nodeNameSecond}
         nodeItemChanged={(nodeName) => handleNodeChange('CHANGE_FIRST_NODE', nodeName)}
+        selectedRegionClusterUUID={selectedRegionClusterUUID}
+        isTopKMetricsEnabled={isTopKMetricsEnabled}
       />
       <div className="node-compare">
         VS
@@ -30,6 +36,8 @@ export const NodeSelectorHeader = ({ universe }) => {
         selectedNode={state.nodeNameSecond}
         otherSelectedNode={state.nodeNameFirst}
         nodeItemChanged={(nodeName) => handleNodeChange('CHANGE_SECOND_NODE', nodeName)}
+        selectedRegionClusterUUID={selectedRegionClusterUUID}
+        isTopKMetricsEnabled={isTopKMetricsEnabled}
       />
     </div>
   );

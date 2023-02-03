@@ -44,20 +44,19 @@
 #include "yb/tools/yb-admin_client.h"
 
 #include "yb/util/flags.h"
-#include "yb/util/flag_tags.h"
 #include "yb/util/logging.h"
 #include "yb/util/status_format.h"
 #include "yb/util/stol_utils.h"
 #include "yb/util/string_case.h"
 
-DEFINE_string(master_addresses, "localhost:7100",
+DEFINE_UNKNOWN_string(master_addresses, "localhost:7100",
               "Comma-separated list of YB Master server addresses");
-DEFINE_string(init_master_addrs, "",
+DEFINE_UNKNOWN_string(init_master_addrs, "",
               "host:port of any yb-master in a cluster");
-DEFINE_int64(timeout_ms, 1000 * 60, "RPC timeout in milliseconds");
+DEFINE_UNKNOWN_int64(timeout_ms, 1000 * 60, "RPC timeout in milliseconds");
 
 // Command-specific flags
-DEFINE_bool(exclude_dead, false, "Exclude dead tservers from output");
+DEFINE_UNKNOWN_bool(exclude_dead, false, "Exclude dead tservers from output");
 
 using std::cerr;
 using std::endl;
@@ -84,15 +83,22 @@ constexpr auto kBlacklistAdd = "ADD";
 constexpr auto kBlacklistRemove = "REMOVE";
 constexpr int32 kDefaultRpcPort = 9100;
 
+const std::string namespace_expression =
+"<namespace>:\n [(ycql|ysql).]<namespace_name> (default ycql.)";
+const std::string table_expression =
+"<table>:\n <namespace> <table_name> | tableid.<table_id>";
+const std::string index_expression =
+"<index>:\n  <namespace> <index_name> | tableid.<index_id>";
+
 Status GetUniverseConfig(ClusterAdminClientClass* client,
-                                 const ClusterAdminCli::CLIArguments&) {
+                         const ClusterAdminCli::CLIArguments&) {
   RETURN_NOT_OK_PREPEND(client->GetUniverseConfig(), "Unable to get universe config");
   return Status::OK();
 }
 
 Status ChangeBlacklist(ClusterAdminClientClass* client,
-                               const ClusterAdminCli::CLIArguments& args, bool blacklist_leader,
-                               const std::string& errStr) {
+                       const ClusterAdminCli::CLIArguments& args, bool blacklist_leader,
+                       const std::string& errStr) {
   if (args.size() < 2) {
     return ClusterAdminCli::kInvalidArguments;
   }
@@ -183,6 +189,22 @@ Status PrioritizedError(Status hi_pri_status, Status low_pri_status) {
 
 } // namespace
 
+std::string ClusterAdminCli::GetArgumentExpressions(const std::string& usage_arguments) {
+  std::string expressions;
+  std::stringstream ss(usage_arguments);
+  std::string next_argument;
+  while (ss >> next_argument) {
+    if (next_argument == "<namespace>") {
+      expressions += namespace_expression + '\n';
+    } else if (next_argument == "<table>") {
+      expressions += table_expression + '\n';
+    } else if (next_argument == "<index>") {
+      expressions += index_expression + '\n';
+    }
+  }
+  return expressions.empty() ? "" : "Definitions: " + expressions;
+}
+
 Status ClusterAdminCli::RunCommand(
     const Command& command, const CLIArguments& command_args, const std::string& program_name) {
   auto s = command.action_(command_args);
@@ -193,7 +215,7 @@ Status ClusterAdminCli::RunCommand(
       cerr << "Error running " << command.name_ << ": " << s << endl;
       if (s.IsInvalidArgument()) {
         cerr << Format("Usage: $0 $1 $2", program_name, command.name_, command.usage_arguments_)
-             << endl;
+             << endl << GetArgumentExpressions(command.usage_arguments_);
       }
     }
     return STATUS(RuntimeError, "Error running command");
@@ -286,12 +308,9 @@ void ClusterAdminCli::SetUsage(const string& prog_name) {
   }
 
   str << endl;
-  str << "<namespace>:" << endl;
-  str << "  [(ycql|ysql).]<namespace_name> (default ycql.)" << endl;
-  str << "<table>:" << endl;
-  str << "  <namespace> <table_name> | tableid.<table_id>" << endl;
-  str << "<index>:" << endl;
-  str << "  <namespace> <index_name> | tableid.<index_id>" << endl;
+  str << namespace_expression << endl;
+  str << table_expression << endl;
+  str << index_expression << endl;
 
   google::SetUsageMessage(str.str());
 }
@@ -501,6 +520,14 @@ void ClusterAdminCli::RegisterCommandHandlers(ClusterAdminClientClass* client) {
         }
         RETURN_NOT_OK_PREPEND(client->DeleteReadReplicaPlacementInfo(),
                               Substitute("Unable to delete read replica placement info."));
+        return Status::OK();
+      });
+
+  Register(
+      "list_namespaces", "",
+      [client](const CLIArguments& args) -> Status {
+        RETURN_NOT_OK_PREPEND(client->ListAllNamespaces(),
+                              "Unable to list namespaces");
         return Status::OK();
       });
 
@@ -976,6 +1003,47 @@ void ClusterAdminCli::RegisterCommandHandlers(ClusterAdminClientClass* client) {
     RETURN_NOT_OK(client->GetWalRetentionSecs(table_name));
     return Status::OK();
   });
+
+  Register(
+      "promote_auto_flags",
+      "[<max_flags_class> (default kExternal) [<promote_non_runtime_flags> (default true) "
+      "[force]]]",
+      [client](const CLIArguments& args) -> Status {
+        if (args.size() > 3) {
+          return ClusterAdminCli::kInvalidArguments;
+        }
+
+        AutoFlagClass max_flag_class = AutoFlagClass::kExternal;
+        bool promote_non_runtime_flags = true;
+        bool force = false;
+
+        if (args.size() > 0) {
+          max_flag_class = VERIFY_RESULT_PREPEND(
+              ParseEnumInsensitive<AutoFlagClass>(args[0]),
+              "Invalid value provided for max_flags_class");
+        }
+
+        if (args.size() > 1) {
+          if (IsEqCaseInsensitive(args[1], "false")) {
+            promote_non_runtime_flags = false;
+          } else if (!IsEqCaseInsensitive(args[1], "true")) {
+            return STATUS(InvalidArgument, "Invalid value provided for promote_non_runtime_flags");
+          }
+        }
+
+        if (args.size() > 2) {
+          if (IsEqCaseInsensitive(args[2], "force")) {
+            force = true;
+          } else {
+            return ClusterAdminCli::kInvalidArguments;
+          }
+        }
+
+        RETURN_NOT_OK_PREPEND(
+            client->PromoteAutoFlags(ToString(max_flag_class), promote_non_runtime_flags, force),
+            "Unable to promote AutoFlags");
+        return Status::OK();
+      });
 } // NOLINT, prevents long function message
 
 Result<std::vector<client::YBTableName>> ResolveTableNames(

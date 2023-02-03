@@ -458,27 +458,52 @@ public class NodeInstanceControllerTest extends FakeDBApplication {
                 performNodeAction(
                     customer.uuid, u.universeUUID, curNode.nodeName, NodeActionType.REMOVE, false));
     assertBadRequest(
+        invalidRemove, "Cannot REMOVE " + curNode.nodeName + ": It is in Removed state");
+
+    setNodeState(u.universeUUID, "host-n1", NodeState.Live);
+    // Another node is already removed (under-replicated), but quorum is maintained.
+    setNodeState(u.universeUUID, "host-n2", NodeState.Stopped);
+
+    invalidRemove =
+        assertPlatformException(
+            () ->
+                performNodeAction(
+                    customer.uuid, u.universeUUID, curNode.nodeName, NodeActionType.REMOVE, false));
+
+    assertBadRequest(
         invalidRemove,
         "Cannot REMOVE "
             + curNode.nodeName
             + ": As it will under replicate the masters (count = 2, replicationFactor = 3)");
 
-    Result invalidStop =
+    setNodeState(u.universeUUID, "host-n1", NodeState.Stopped);
+
+    setNodeState(u.universeUUID, "host-n2", NodeState.Stopped);
+
+    invalidRemove =
         assertPlatformException(
             () ->
                 performNodeAction(
-                    customer.uuid, u.universeUUID, curNode.nodeName, NodeActionType.STOP, false));
+                    customer.uuid, u.universeUUID, curNode.nodeName, NodeActionType.REMOVE, false));
+
     assertBadRequest(
-        invalidStop,
-        "Cannot STOP "
+        invalidRemove,
+        "Cannot REMOVE "
             + curNode.nodeName
-            + ": As it will under replicate the masters (count = 2, replicationFactor = 3)");
+            + ": As it will under replicate the masters (count = 1, replicationFactor = 3)");
+
+    setNodeState(u.universeUUID, "host-n1", NodeState.Live);
 
     Result invalidReboot =
         assertPlatformException(
             () ->
                 performNodeAction(
                     customer.uuid, u.universeUUID, curNode.nodeName, NodeActionType.REBOOT, false));
+    assertBadRequest(
+        invalidReboot,
+        "Cannot REBOOT "
+            + curNode.nodeName
+            + ": As it will under replicate the masters (count = 2, replicationFactor = 3)");
 
     // Changing to another node as n1 is in progress by previous operations.
     NodeDetails nodeToDelete = u.getNode("host-n3");
@@ -496,9 +521,7 @@ public class NodeInstanceControllerTest extends FakeDBApplication {
 
     Universe.saveDetails(
         u.getUniverseUUID(),
-        univ -> {
-          univ.getNode(nodeToDelete.nodeName).state = NodeState.Decommissioned;
-        });
+        univ -> univ.getNode(nodeToDelete.nodeName).state = NodeState.Decommissioned);
 
     invalidDelete =
         assertPlatformException(

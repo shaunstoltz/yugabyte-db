@@ -13,6 +13,7 @@ import com.yugabyte.yw.models.AvailabilityZone;
 import com.yugabyte.yw.models.Region;
 import com.yugabyte.yw.models.Universe;
 import com.yugabyte.yw.models.helpers.NodeDetails;
+import io.swagger.annotations.ApiModelProperty;
 import java.util.HashMap;
 import java.util.Map;
 import java.util.UUID;
@@ -22,14 +23,34 @@ import play.mvc.Http.Status;
 @JsonIgnoreProperties(ignoreUnknown = true)
 @JsonDeserialize(converter = VMImageUpgradeParams.Converter.class)
 public class VMImageUpgradeParams extends UpgradeTaskParams {
-
   public enum VmUpgradeTaskType {
     VmUpgradeWithBaseImages,
     VmUpgradeWithCustomImages,
     None
   }
 
+  @ApiModelProperty(
+      value = "Map  of region UUID to AMI name",
+      required = true,
+      example =
+          "{\n"
+              + "    'b28e0813-4866-4a2d-89f3-52265766d666':"
+              + " 'OpenLogic:CentOS:7_9:7.9.2022020700',\n"
+              + "    'b28e0813-4866-4a2d-89f3-52265766d666':"
+              + " 'ami-0f12219b4df721aa6',\n"
+              + "    'd73833fc-0812-4a01-98f8-f4f24db76dbe':"
+              + " 'https://www.googleapis.com/compute/v1/projects/rhel-cloud/global/images/"
+              + "rhel-8-v20221102'\n"
+              + "  }")
   public Map<UUID, String> machineImages = new HashMap<>();
+  // Use whenwe want to use a different SSH_USER instead of what is defined in the default
+  // accessKey.
+  @ApiModelProperty(
+      value = "Map of region UUID to SSH User override",
+      required = false,
+      example = "{\n" + "    'b28e0813-4866-4a2d-89f3-52265766d666':" + " 'ec2-user',\n" + "  }")
+  public Map<UUID, String> sshUserOverrideMap = new HashMap<>();
+
   public boolean forceVMImageUpgrade = false;
   public String ybSoftwareVersion = null;
 

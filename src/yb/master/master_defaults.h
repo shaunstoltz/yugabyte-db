@@ -11,8 +11,7 @@
 // under the License.
 //
 
-#ifndef YB_MASTER_MASTER_DEFAULTS_H
-#define YB_MASTER_MASTER_DEFAULTS_H
+#pragma once
 
 #include <string>
 
@@ -30,6 +29,8 @@ static const char* const kSystemAuthNamespaceId = "00000000000000000000000000000
 
 static const char* const kSystemDistributedNamespaceName = "system_distributed";
 static const char* const kSystemTracesNamespaceName = "system_traces";
+
+static const char* const kSystemPlatformNamespace = "system_platform";
 
 static const char* const kSystemPeersTableName = "peers";
 static const char* const kSystemPeersV2TableName = "peers_v2";
@@ -56,6 +57,7 @@ constexpr size_t kCdcStreamIdIdx = 1;
 static const char* const kCdcCheckpoint  = "checkpoint";
 constexpr size_t kCdcCheckpointIdx = 2;
 static const char* const kCdcData = "data";
+constexpr size_t kCdcDataIdx = 3;
 static const char* const kCdcLastReplicationTime = "last_replication_time";
 constexpr size_t kCdcLastReplicationTimeIdx = 4;
 static const char* const kCdcStreamIdMappingTableName = "cdc_stream_id_mapping";
@@ -63,7 +65,6 @@ constexpr size_t kCdcTabletIdIdxforStreamIdMap = 1;
 static const char* const kCdcDbStreamId = "db_stream_id";
 constexpr size_t kCdcDbStreamIdIdx = 0;
 static const char* const kCdcTableId = "table_id";
-constexpr size_t kCdcTableIdIdx = 3;
 
 
 static const char* const kXClusterSafeTimeTableName = "xcluster_safe_time";
@@ -100,5 +101,3 @@ constexpr uint16_t kMasterDefaultWebPort = 7000;
 
 } // namespace master
 } // namespace yb
-
-#endif // YB_MASTER_MASTER_DEFAULTS_H

@@ -22,8 +22,8 @@ import {
   editBackupSchedule,
   getScheduledBackupList
 } from '../common/BackupScheduleAPI';
-import { TABLE_TYPE_MAP } from '../../../redesign/helpers/dtos';
-import { IBackupSchedule } from '../common/IBackupSchedule';
+import { TableTypeLabel } from '../../../redesign/helpers/dtos';
+import { IBackupSchedule, IBackupScheduleStatus } from '../common/IBackupSchedule';
 import { BackupCreateModal } from '../components/BackupCreateModal';
 
 import { convertScheduleToFormValues, convertMsecToTimeFrame } from './ScheduledBackupUtils';
@@ -123,7 +123,8 @@ export const ScheduledBackupList = ({ universeUUID }: { universeUUID: string }) 
           }}
           disabled={
             tablesInUniverse?.data.length === 0 ||
-            currentUniverse.data?.universeConfig?.takeBackups === 'false'
+            currentUniverse.data?.universeConfig?.takeBackups === 'false' ||
+            currentUniverse?.data?.universeDetails?.universePaused
           }
         />
         <BackupCreateModal
@@ -155,6 +156,7 @@ export const ScheduledBackupList = ({ universeUUID }: { universeUUID: string }) 
         />
       </div>
       <div className="schedule-backup-list" onScroll={handleScroll}>
+        {/* eslint-disable-next-line react/display-name */}
         {schedules?.map((schedule) => (
           <ScheduledBackupCard
             schedule={schedule}
@@ -243,23 +245,25 @@ const ScheduledBackupCard: FC<ScheduledBackupCardProps> = ({
           <span className="schedule-name">{schedule.scheduleName}</span>
           <StatusBadge
             statusType={Badge_Types.DELETED}
-            customLabel={TABLE_TYPE_MAP[schedule.backupInfo.backupType ?? '-']}
+            customLabel={TableTypeLabel[schedule.backupInfo.backupType ?? '-']}
           />
           <YBToggle
             name="Enabled"
             input={{
-              value: schedule.status === 'Active',
+              value: schedule.status === IBackupScheduleStatus.ACTIVE,
               onChange: (e: React.ChangeEvent<HTMLInputElement>) =>
                 toggleSchedule.mutateAsync({
                   scheduleUUID: schedule.scheduleUUID,
                   frequency: schedule.frequency,
                   cronExpression: schedule.cronExpression,
-                  status: e.target.checked ? 'Active' : 'Stopped',
+                  status: e.target.checked
+                    ? IBackupScheduleStatus.ACTIVE
+                    : IBackupScheduleStatus.STOPPED,
                   frequencyTimeUnit: schedule.frequencyTimeUnit
                 })
             }}
           />
-          <span>{schedule.status === 'Active' ? 'Enabled' : 'Disabled'}</span>
+          <span>{schedule.status === IBackupScheduleStatus.ACTIVE ? 'Enabled' : 'Disabled'}</span>
         </Col>
         <Col lg={6} className="no-padding">
           <DropdownButton
@@ -271,8 +275,10 @@ const ScheduledBackupCard: FC<ScheduledBackupCardProps> = ({
           >
             <MenuItem
               onClick={() => {
+                if (schedule.status !== IBackupScheduleStatus.ACTIVE) return;
                 doEditPolicy(schedule);
               }}
+              disabled={schedule.status !== IBackupScheduleStatus.ACTIVE}
             >
               <i className="fa fa-pencil"></i> Edit Policy
             </MenuItem>

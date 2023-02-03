@@ -100,7 +100,12 @@ public class CommonUtils {
           // Azure KMS fields
           "AZU_KEY_NAME",
           "AZU_KEY_ALGORITHM",
-          "AZU_KEY_SIZE");
+          "AZU_KEY_SIZE",
+          // Hashicorp KMS fields
+          "HC_VAULT_KEY_NAME",
+          "KEYSPACETABLELIST",
+          // General API field
+          "KEYSPACE");
 
   /**
    * Checks whether the field name represents a field with a sensitive data or not.
@@ -114,7 +119,7 @@ public class CommonUtils {
       return true;
     }
 
-    // Needed for GCP KMS UI - more specifically listKMSConfigs()
+    // Needed for KMS UI - more specifically listKMSConfigs()
     // Can add more exclusions if required
     if (excludedFieldNames.contains(ucFieldname)) {
       return false;
@@ -170,6 +175,27 @@ public class CommonUtils {
     return isStrictlySensitiveField(key) || (value == null) || value.length() < 5
         ? MASKED_FIELD_VALUE
         : value.replaceAll(maskRegex, "*");
+  }
+
+  public static JsonNode getMaskedValue(JsonNode value, List<String> toMaskKeys) {
+    if (value == null) {
+      return value;
+    }
+    ObjectNode jsonNodeValue = (ObjectNode) value;
+    for (String key : toMaskKeys) {
+      if (jsonNodeValue.has(key)) {
+        String keyValue = jsonNodeValue.get(key).toString();
+        jsonNodeValue.put(key, keyValue.replaceAll(maskRegex, "*"));
+      }
+    }
+    return value;
+  }
+
+  public static String getMaskedValue(String value) {
+    if (value == null) {
+      return value;
+    }
+    return value.replaceAll(maskRegex, "*");
   }
 
   @SuppressWarnings("unchecked")
@@ -317,7 +343,7 @@ public class CommonUtils {
   /** Recursively merges second JsonNode into first JsonNode. ArrayNodes will be overwritten. */
   public static void deepMerge(JsonNode node1, JsonNode node2) {
     if (node1 == null || node1.size() == 0 || node2 == null || node2.size() == 0) {
-      throw new PlatformServiceException(BAD_REQUEST, "Cannot merge empty nodes.");
+      return;
     }
 
     if (!node1.isObject() || !node2.isObject()) {
@@ -731,9 +757,8 @@ public class CommonUtils {
   public static String generateStateLogMsg(Universe universe, boolean alreadyRunning) {
     String stateLogMsg =
         String.format(
-            "alreadyRunning={} backupInProgress={} updateInProgress={} universePaused={}",
+            "alreadyRunning=%s updateInProgress=%s universePaused=%s",
             alreadyRunning,
-            universe.getUniverseDetails().backupInProgress,
             universe.getUniverseDetails().updateInProgress,
             universe.getUniverseDetails().universePaused);
     return stateLogMsg;

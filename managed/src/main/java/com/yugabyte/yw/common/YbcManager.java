@@ -5,19 +5,29 @@ package com.yugabyte.yw.common;
 import com.google.inject.Inject;
 import com.google.inject.Singleton;
 import com.google.protobuf.Descriptors.FieldDescriptor;
-import com.yugabyte.yw.common.config.RuntimeConfigFactory;
+import com.yugabyte.yw.common.config.GlobalConfKeys;
+import com.yugabyte.yw.common.config.RuntimeConfGetter;
 import com.yugabyte.yw.common.customer.config.CustomerConfigService;
 import com.yugabyte.yw.common.services.YbcClientService;
 import com.yugabyte.yw.common.utils.Pair;
 import com.yugabyte.yw.forms.UniverseDefinitionTaskParams;
-import com.yugabyte.yw.forms.YbcThrottleParameters;
 import com.yugabyte.yw.forms.UniverseDefinitionTaskParams.Cluster;
+import com.yugabyte.yw.forms.YbcThrottleParameters;
 import com.yugabyte.yw.models.Backup;
+import com.yugabyte.yw.models.Customer;
+import com.yugabyte.yw.models.Region;
 import com.yugabyte.yw.models.Universe;
 import com.yugabyte.yw.models.Universe.UniverseUpdater;
 import com.yugabyte.yw.models.configs.data.CustomerConfigStorageNFSData;
 import com.yugabyte.yw.models.helpers.NodeDetails;
-
+import java.util.ArrayList;
+import java.util.HashMap;
+import java.util.List;
+import java.util.Map;
+import java.util.Objects;
+import java.util.UUID;
+import java.util.regex.Matcher;
+import java.util.stream.Collectors;
 import org.apache.commons.collections4.MapUtils;
 import org.apache.commons.lang3.StringUtils;
 import org.slf4j.Logger;
@@ -25,14 +35,6 @@ import org.slf4j.LoggerFactory;
 import org.yb.client.YbcClient;
 import org.yb.ybc.BackupServiceNfsDirDeleteRequest;
 import org.yb.ybc.BackupServiceNfsDirDeleteResponse;
-import java.util.regex.Matcher;
-import java.util.stream.Collectors;
-import java.util.stream.Stream;
-import java.util.ArrayList;
-import java.util.HashMap;
-import java.util.List;
-import java.util.Map;
-import java.util.UUID;
 import org.yb.ybc.BackupServiceTaskAbortRequest;
 import org.yb.ybc.BackupServiceTaskAbortResponse;
 import org.yb.ybc.BackupServiceTaskCreateRequest;
@@ -57,7 +59,7 @@ public class YbcManager {
   private final CustomerConfigService customerConfigService;
   private final YbcBackupUtil ybcBackupUtil;
   private final BackupUtil backupUtil;
-  private final RuntimeConfigFactory runtimeConfigFactory;
+  private final RuntimeConfGetter confGetter;
   private final ReleaseManager releaseManager;
   private final NodeManager nodeManager;
 
@@ -65,22 +67,20 @@ public class YbcManager {
   private static final int WAIT_EACH_SHORT_ATTEMPT_MS = 2000;
   private static final int MAX_RETRIES = 10;
 
-  private static final String YBC_STABLE_RELEASE_PATH = "ybc.releases.stable_version";
-
   @Inject
   public YbcManager(
       YbcClientService ybcClientService,
       CustomerConfigService customerConfigService,
       YbcBackupUtil ybcBackupUtil,
       BackupUtil backupUtil,
-      RuntimeConfigFactory runtimeConfigFactory,
+      RuntimeConfGetter confGetter,
       ReleaseManager releaseManager,
       NodeManager nodeManager) {
     this.ybcClientService = ybcClientService;
     this.customerConfigService = customerConfigService;
     this.ybcBackupUtil = ybcBackupUtil;
     this.backupUtil = backupUtil;
-    this.runtimeConfigFactory = runtimeConfigFactory;
+    this.confGetter = confGetter;
     this.releaseManager = releaseManager;
     this.nodeManager = nodeManager;
   }
@@ -100,7 +100,7 @@ public class YbcManager {
         BackupServiceNfsDirDeleteRequest nfsDirDelRequest =
             BackupServiceNfsDirDeleteRequest.newBuilder()
                 .setNfsDir(nfsDir)
-                .setBucket(NFSUtil.DEFAULT_YUGABYTE_NFS_BUCKET)
+                .setBucket(configData.nfsBucket)
                 .setCloudDir(cloudDir)
                 .build();
         BackupServiceNfsDirDeleteResponse nfsDirDeleteResponse =
@@ -123,11 +123,10 @@ public class YbcManager {
     return true;
   }
 
-  public void abortBackupTask(UUID customerUUID, UUID backupUUID, String taskID) {
+  public void abortBackupTask(
+      UUID customerUUID, UUID backupUUID, String taskID, YbcClient ybcClient) {
     Backup backup = Backup.getOrBadRequest(customerUUID, backupUUID);
-    YbcClient ybcClient = null;
     try {
-      ybcClient = ybcBackupUtil.getYbcClient(backup.universeUUID);
       BackupServiceTaskAbortRequest abortTaskRequest =
           BackupServiceTaskAbortRequest.newBuilder().setTaskId(taskID).build();
       BackupServiceTaskAbortResponse abortTaskResponse =
@@ -151,7 +150,7 @@ public class YbcManager {
         return;
       } else {
         LOG.info("Backup {} task is successfully aborted on Yb-controller.", backup.backupUUID);
-        deleteYbcBackupTask(backup.universeUUID, taskID);
+        deleteYbcBackupTask(backup.universeUUID, taskID, ybcClient);
       }
     } catch (Exception e) {
       LOG.error("Backup {} task abort failed with error: {}.", backup.backupUUID, e.getMessage());
@@ -160,10 +159,8 @@ public class YbcManager {
     }
   }
 
-  public void deleteYbcBackupTask(UUID universeUUID, String taskID) {
-    YbcClient ybcClient = null;
+  public void deleteYbcBackupTask(UUID universeUUID, String taskID, YbcClient ybcClient) {
     try {
-      ybcClient = ybcBackupUtil.getYbcClient(universeUUID);
       BackupServiceTaskResultRequest taskResultRequest =
           BackupServiceTaskResultRequest.newBuilder().setTaskId(taskID).build();
       BackupServiceTaskResultResponse taskResultResponse =
@@ -241,7 +238,7 @@ public class YbcManager {
       }
       LOG.info("Task {} on YB-Controller to fetch success marker is successful", taskID);
       successMarker = downloadSuccessMarkerResultResponse.getMetadataJson();
-      deleteYbcBackupTask(universeUUID, taskID);
+      deleteYbcBackupTask(universeUUID, taskID, ybcClient);
       return successMarker;
     } catch (Exception e) {
       LOG.error(
@@ -255,7 +252,7 @@ public class YbcManager {
   }
 
   public String getStableYbcVersion() {
-    return runtimeConfigFactory.globalRuntimeConf().getString(YBC_STABLE_RELEASE_PATH);
+    return confGetter.getGlobalConf(GlobalConfKeys.ybcStableVersion);
   }
 
   /**
@@ -267,7 +264,10 @@ public class YbcManager {
     Cluster nodeCluster = Universe.getCluster(universe, node.nodeName);
     String ybSoftwareVersion = nodeCluster.userIntent.ybSoftwareVersion;
     String ybServerPackage =
-        nodeManager.getYbServerPackageName(ybSoftwareVersion, nodeCluster.getRegions().get(0));
+        nodeManager.getYbServerPackageName(
+            ybSoftwareVersion,
+            getFirstRegion(
+                universe, Objects.requireNonNull(Universe.getCluster(universe, node.nodeName))));
     return Util.getYbcPackageDetailsFromYbServerPackage(ybServerPackage);
   }
 
@@ -297,7 +297,8 @@ public class YbcManager {
             ybcVersion, ybcPackageDetails.getFirst(), ybcPackageDetails.getSecond());
     String ybcServerPackage =
         releaseMetadata.getFilePath(
-            Universe.getCluster(universe, node.nodeName).getRegions().get(0));
+            getFirstRegion(
+                universe, Objects.requireNonNull(Universe.getCluster(universe, node.nodeName))));
     if (StringUtils.isBlank(ybcServerPackage)) {
       throw new RuntimeException("Ybc package cannot be empty.");
     }
@@ -358,7 +359,7 @@ public class YbcManager {
                 YbcClient client = null;
                 try {
                   String nodeIp = n.cloudInfo.private_ip;
-                  if (nodeIp == null) {
+                  if (nodeIp == null || !n.isTserver) {
                     return;
                   }
                   client = ybcClientService.getNewClient(nodeIp, ybcPort, certFile);
@@ -447,5 +448,12 @@ public class YbcManager {
         ybcClientService.closeClient(ybcClient);
       }
     }
+  }
+
+  private Region getFirstRegion(Universe universe, Cluster cluster) {
+    Customer customer = Customer.get(universe.customerId);
+    UUID providerUuid = UUID.fromString(cluster.userIntent.provider);
+    UUID regionUuid = cluster.userIntent.regionList.get(0);
+    return Region.getOrBadRequest(customer.getUuid(), providerUuid, regionUuid);
   }
 }

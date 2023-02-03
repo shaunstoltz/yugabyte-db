@@ -49,6 +49,11 @@ import org.yb.master.CatalogEntityInfo;
 import io.fabric8.kubernetes.api.model.Pod;
 import io.fabric8.kubernetes.api.model.PodList;
 import io.fabric8.kubernetes.api.model.PodStatus;
+import io.fabric8.kubernetes.client.utils.Serialization;
+
+import java.io.File;
+import java.io.FileInputStream;
+import java.io.InputStream;
 
 public abstract class KubernetesUpgradeTaskTest extends CommissionerBaseTest {
 
@@ -70,14 +75,16 @@ public abstract class KubernetesUpgradeTaskTest extends CommissionerBaseTest {
     userIntent.ybSoftwareVersion = YB_SOFTWARE_VERSION_OLD;
     defaultUniverse = createUniverse(defaultCustomer.getCustomerId());
     config.put("KUBECONFIG", "test");
-    defaultProvider.setConfig(config);
-    defaultProvider.save();
+    kubernetesProvider.setConfig(config);
+    kubernetesProvider.save();
+
     Universe.saveDetails(
         defaultUniverse.universeUUID,
         ApiUtils.mockUniverseUpdater(userIntent, NODE_PREFIX, setMasters, false, placementInfo));
     defaultUniverse = Universe.getOrBadRequest(defaultUniverse.universeUUID);
     defaultUniverse.updateConfig(
         ImmutableMap.of(Universe.HELM2_LEGACY, Universe.HelmLegacy.V3.toString()));
+    defaultUniverse.save();
 
     CatalogEntityInfo.SysClusterConfigEntryPB.Builder configBuilder =
         CatalogEntityInfo.SysClusterConfigEntryPB.newBuilder().setVersion(1);
@@ -90,9 +97,14 @@ public abstract class KubernetesUpgradeTaskTest extends CommissionerBaseTest {
         new GetLoadMovePercentResponse(0, "", 100.0, 0, 0, null);
 
     try {
-      String statusString = "{ \"phase\": \"Running\", \"conditions\": [{\"status\": \"True\"}]}";
-      PodStatus status = TestUtils.deserialize(statusString, PodStatus.class);
-      when(mockKubernetesManager.getPodStatus(any(), any(), any())).thenReturn(status);
+      try {
+        File jsonFile = new File("src/test/resources/testPod.json");
+        InputStream jsonStream = new FileInputStream(jsonFile);
+
+        Pod testPod = Serialization.unmarshal(jsonStream, Pod.class);
+        when(mockKubernetesManager.getPodObject(any(), any(), any())).thenReturn(testPod);
+      } catch (Exception e) {
+      }
       YBClient mockClient = mock(YBClient.class);
       when(mockClient.waitForMaster(any(), anyLong())).thenReturn(true);
       when(mockClient.waitForServer(any(), anyLong())).thenReturn(true);
@@ -118,12 +130,12 @@ public abstract class KubernetesUpgradeTaskTest extends CommissionerBaseTest {
   }
 
   protected void setupUniverseSingleAZ(boolean setMasters, boolean mockGetLeaderMaster) {
-    Region r = Region.create(defaultProvider, "region-1", "PlacementRegion-1", "default-image");
+    Region r = Region.create(kubernetesProvider, "region-1", "PlacementRegion-1", "default-image");
     AvailabilityZone az1 = AvailabilityZone.createOrThrow(r, "az-1", "PlacementAZ-1", "subnet-1");
     InstanceType i =
         InstanceType.upsert(
-            defaultProvider.uuid, "c3.xlarge", 10, 5.5, new InstanceType.InstanceTypeDetails());
-    UserIntent userIntent = getTestUserIntent(r, defaultProvider, i, 3);
+            kubernetesProvider.uuid, "c3.xlarge", 10, 5.5, new InstanceType.InstanceTypeDetails());
+    UserIntent userIntent = getTestUserIntent(r, kubernetesProvider, i, 3);
     PlacementInfo placementInfo = new PlacementInfo();
     PlacementInfoUtil.addPlacementZone(az1.uuid, placementInfo, 3, 3, true);
     setupUniverse(setMasters, userIntent, placementInfo, mockGetLeaderMaster);
@@ -163,14 +175,14 @@ public abstract class KubernetesUpgradeTaskTest extends CommissionerBaseTest {
   }
 
   protected void setupUniverseMultiAZ(boolean setMasters, boolean mockGetLeaderMaster) {
-    Region r = Region.create(defaultProvider, "region-1", "PlacementRegion-1", "default-image");
+    Region r = Region.create(kubernetesProvider, "region-1", "PlacementRegion-1", "default-image");
     AvailabilityZone az1 = AvailabilityZone.createOrThrow(r, "az-1", "PlacementAZ-1", "subnet-1");
     AvailabilityZone az2 = AvailabilityZone.createOrThrow(r, "az-2", "PlacementAZ-2", "subnet-2");
     AvailabilityZone az3 = AvailabilityZone.createOrThrow(r, "az-3", "PlacementAZ-3", "subnet-3");
     InstanceType i =
         InstanceType.upsert(
-            defaultProvider.uuid, "c3.xlarge", 10, 5.5, new InstanceType.InstanceTypeDetails());
-    UserIntent userIntent = getTestUserIntent(r, defaultProvider, i, 3);
+            kubernetesProvider.uuid, "c3.xlarge", 10, 5.5, new InstanceType.InstanceTypeDetails());
+    UserIntent userIntent = getTestUserIntent(r, kubernetesProvider, i, 3);
     PlacementInfo placementInfo = new PlacementInfo();
     PlacementInfoUtil.addPlacementZone(az1.uuid, placementInfo, 1, 1, false);
     PlacementInfoUtil.addPlacementZone(az2.uuid, placementInfo, 1, 1, true);

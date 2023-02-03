@@ -11,8 +11,7 @@
 // under the License.
 //
 
-#ifndef YB_DOCDB_CQL_OPERATION_H
-#define YB_DOCDB_CQL_OPERATION_H
+#pragma once
 
 #include "yb/common/ql_protocol.pb.h"
 #include "yb/common/typedefs.h"
@@ -124,8 +123,17 @@ class QLWriteOperation :
       IntentAwareIterator* iter, const SubDocKey& sub_doc_key,
       HybridTime min_hybrid_time);
 
+  // Deletes an element (key/index) from a subscripted column.
+  //
+  // data - apply data that is updated per the operations performed.
+  // column_schema - schema of the column from which the element will be deleted.
+  // column_value - request proto identifying the element in the column and it's new value (empty).
+  // column_id - the id of the subscripted column.
+  Status DeleteSubscriptedColumnElement(
+      const DocOperationApplyData& data, const ColumnSchema& column_schema,
+      const QLColumnValuePB& column_value, ColumnId column_id);
   Status DeleteRow(const DocPath& row_path, DocWriteBatch* doc_write_batch,
-                           const ReadHybridTime& read_ht, CoarseTimePoint deadline);
+                   const ReadHybridTime& read_ht, CoarseTimePoint deadline);
 
   Result<bool> IsRowDeleted(const QLTableRow& current_row, const QLTableRow& new_row) const;
   UserTimeMicros user_timestamp() const;
@@ -226,14 +234,14 @@ class QLReadOperation : public DocExprExecutor {
                         int* match_count,
                         size_t* num_rows_skipped);
 
-  Status GetIntents(const Schema& schema, KeyValueWriteBatchPB* out);
+  Status GetIntents(const Schema& schema, LWKeyValueWriteBatchPB* out);
 
   QLResponsePB& response() { return response_; }
 
  private:
   // Checks whether we have processed enough rows for a page and sets the appropriate paging
   // state in the response object.
-  Status SetPagingStateIfNecessary(const YQLRowwiseIteratorIf* iter,
+  Status SetPagingStateIfNecessary(YQLRowwiseIteratorIf* iter,
                                    const QLResultSet* resultset,
                                    const size_t row_count_limit,
                                    const size_t num_rows_skipped,
@@ -246,5 +254,3 @@ class QLReadOperation : public DocExprExecutor {
 
 }  // namespace docdb
 }  // namespace yb
-
-#endif // YB_DOCDB_CQL_OPERATION_H

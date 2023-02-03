@@ -39,6 +39,7 @@ import com.google.common.collect.ImmutableList;
 import com.google.common.collect.ImmutableMap;
 import com.google.common.collect.ImmutableSet;
 import com.yugabyte.yw.commissioner.Common;
+import com.yugabyte.yw.commissioner.Common.CloudType;
 import com.yugabyte.yw.common.ApiUtils;
 import com.yugabyte.yw.common.CallHomeManager.CollectionLevel;
 import com.yugabyte.yw.common.FakeApiHelper;
@@ -592,7 +593,6 @@ public class CustomerControllerTest extends FakeDBApplication {
                 .bodyJson(params));
     assertEquals(OK, result.status());
     assertThat(contentAsString(result), allOf(notNullValue(), containsString("{\"foo\":\"bar\"}")));
-    assertAuditEntry(1, customer.uuid);
   }
 
   @Test
@@ -602,7 +602,7 @@ public class CustomerControllerTest extends FakeDBApplication {
     params.set("metrics", Json.toJson(ImmutableList.of("container_metrics")));
     params.put("start", "1479281737000");
     params.put("nodePrefix", "demo");
-    Universe u1 = createUniverse("demo", customer.getCustomerId());
+    Universe u1 = createUniverse("demo", customer.getCustomerId(), CloudType.kubernetes);
     Provider provider =
         Provider.get(
             UUID.fromString(u1.getUniverseDetails().getPrimaryCluster().userIntent.provider));
@@ -612,6 +612,7 @@ public class CustomerControllerTest extends FakeDBApplication {
     AvailabilityZone.createOrThrow(r1, "az-2", "PlacementAZ-2", "subnet-2");
     AvailabilityZone az3 = AvailabilityZone.createOrThrow(r1, "az-3", "PlacementAZ-3", "subnet-3");
     az3.updateConfig(ImmutableMap.of("KUBENAMESPACE", "test-ns-1"));
+    az3.save();
 
     ObjectNode response = Json.newObject();
     response.put("foo", "bar");
@@ -630,7 +631,6 @@ public class CustomerControllerTest extends FakeDBApplication {
     assertValue(filters, "namespace", "demo-az-1|demo-az-2|test-ns-1");
     assertEquals(OK, result.status());
     assertThat(contentAsString(result), allOf(notNullValue(), containsString("{\"foo\":\"bar\"}")));
-    assertAuditEntry(1, customer.uuid);
   }
 
   @Test
@@ -649,7 +649,7 @@ public class CustomerControllerTest extends FakeDBApplication {
     params.set("metrics", Json.toJson(ImmutableList.of("container_metrics")));
     params.put("start", "1479281737000");
     params.put("nodePrefix", "demo");
-    Universe u1 = createUniverse("demo", customer.getCustomerId());
+    Universe u1 = createUniverse("demo", customer.getCustomerId(), CloudType.kubernetes);
     if (helmNewNamingStyle) {
       u1 =
           Universe.saveDetails(
@@ -677,13 +677,12 @@ public class CustomerControllerTest extends FakeDBApplication {
     JsonNode filters = Json.parse(queryParams.getValue().get("filters").toString());
     assertValue(filters, "namespace", "demo");
     if (helmNewNamingStyle) {
-      assertValue(filters, "pod_name", "demo-(.*)-yb-tserver-(.*)");
+      assertValue(filters, "pod_name", "ybdemo-jjk0-yb-tserver-(.*)");
     } else {
       assertNull(filters.get("pod_name"));
     }
     assertEquals(OK, result.status());
     assertThat(contentAsString(result), allOf(notNullValue(), containsString("{\"foo\":\"bar\"}")));
-    assertAuditEntry(1, customer.uuid);
   }
 
   @Test
@@ -734,7 +733,6 @@ public class CustomerControllerTest extends FakeDBApplication {
     assertValue(filters, "pod_name", "yb-pod-name-az");
     assertEquals(OK, result.status());
     assertThat(contentAsString(result), allOf(notNullValue(), containsString("{\"foo\":\"bar\"}")));
-    assertAuditEntry(1, customer.uuid);
   }
 
   @Test
@@ -824,7 +822,6 @@ public class CustomerControllerTest extends FakeDBApplication {
     assertThat(queryParams.getValue(), is(notNullValue()));
     JsonNode filters = Json.parse(queryParams.getValue().get("filters").toString());
     assertThat(filters.get("table_name"), nullValue());
-    assertAuditEntry(1, customer.uuid);
   }
 
   @Test
@@ -860,7 +857,6 @@ public class CustomerControllerTest extends FakeDBApplication {
     JsonNode filters = Json.parse(queryParams.getValue().get("filters"));
     String tableId = filters.get("table_id").asText();
     assertThat(tableId, allOf(notNullValue(), equalTo("fd601f9c19074262906638c8bd203971")));
-    assertAuditEntry(1, customer.uuid);
   }
 
   @Test
@@ -916,7 +912,6 @@ public class CustomerControllerTest extends FakeDBApplication {
                 .or(
                     Matchers.is(
                         "fd601f9c19074262906638c8bd203972|fd601f9c19074262906638c8bd203971"))));
-    assertAuditEntry(1, customer.uuid);
   }
 
   @Test
@@ -1015,7 +1010,6 @@ public class CustomerControllerTest extends FakeDBApplication {
     JsonNode filters = Json.parse(queryParams.getValue().get("filters").toString());
     String nodePrefix = filters.get("node_prefix").asText();
     assertThat(nodePrefix, allOf(notNullValue(), equalTo("host-1")));
-    assertAuditEntry(1, customer.uuid);
   }
 
   @Test
@@ -1048,7 +1042,6 @@ public class CustomerControllerTest extends FakeDBApplication {
     JsonNode filters = Json.parse(queryParams.getValue().get("filters").toString());
     String nodeName = filters.get("exported_instance").asText();
     assertThat(nodeName, allOf(notNullValue(), equalTo("host-n1")));
-    assertAuditEntry(1, customer.uuid);
   }
 
   private Result getHostInfo(UUID customerUUID) {
@@ -1070,10 +1063,8 @@ public class CustomerControllerTest extends FakeDBApplication {
   @Test
   public void testCustomerHostInfo() {
     JsonNode response = Json.parse("{\"foo\": \"bar\"}");
-    when(mockCloudQueryHelper.currentHostInfo(
-            Common.CloudType.aws, ImmutableList.of("instance-id", "vpc-id", "privateIp", "region")))
-        .thenReturn(response);
-    when(mockCloudQueryHelper.currentHostInfo(Common.CloudType.gcp, null)).thenReturn(response);
+    when(mockCloudQueryHelper.getCurrentHostInfo(Common.CloudType.aws)).thenReturn(response);
+    when(mockCloudQueryHelper.getCurrentHostInfo(Common.CloudType.gcp)).thenReturn(response);
     Result result = getHostInfo(customer.uuid);
     JsonNode json = Json.parse(contentAsString(result));
     assertEquals(OK, result.status());

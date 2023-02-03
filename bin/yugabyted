@@ -80,6 +80,8 @@ COMMUNITY_REWARDS_LINK = "https://www.yugabyte.com/community-rewards/"
 HELP_LINK = "https://docs.yugabyte.com/latest/faq/"
 YUGABYTED_LINK = "https://docs.yugabyte.com/preview/reference/configuration/yugabyted/"
 YUGABYTED_START = "https://docs.yugabyte.com/preview/reference/configuration/yugabyted/#start"
+GENERATE_SERVER_CERTS = "https://docs.yugabyte.com/preview/secure/tls-encryption/\
+server-certificates/#create-the-server-certificates"
 DEFAULT_DEMO_DATABASE = "northwind"
 DEFAULT_FAULT_TOLERANCE = "zone"
 DEFAULT_START_FAULT_TOLERANCE = "none"
@@ -110,7 +112,7 @@ PREREQS_ERROR_MSGS = {
     'transparent_hugepages' :'Transparent hugepages disabled. Please enable transparent_hugepages.',
     'ntp/chrony' :'ntp/chrony package is missing for clock synchronization. For centos 7, ' +
         'we recommend installing either ntp or chrony package and for centos 8, ' +
-        'we recommend installing chrony package.'
+        'we recommend installing chrony package.',
 }
 QUICK_START_LINKS = {
     'mac' : 'https://docs.yugabyte.com/latest/quick-start/install/macos/',
@@ -120,6 +122,7 @@ LINUX_PREREQS_CMDS = {
     'transparent_hugepages' : 'cat /sys/kernel/mm/transparent_hugepage/enabled',
     'ntp' : 'which ntpd',
     'chrony' : 'which chronyd',
+    'openssl' : 'which openssl',
 }
 MAC_PREREQS_CMDS = {
 }
@@ -137,12 +140,16 @@ PREFIX = {
     'version' : "",
     'collect_logs' : "",
     'configure' : "",
+    'configure data_placement': "",
+    'configure encrypt_at_rest': "",
     'connect' : "",
     'connect ycql' : "",
     'connect ysql' : "",
     'demo' : "",
     'demo connect' : "",
     'demo destroy' : "",
+    'cert' : "",
+    'cert generate_server_certs' : "",
 }
 
 USAGE = {
@@ -153,13 +160,17 @@ USAGE = {
     'status' : "yugabyted status [flags]",
     'version' : "yugabyted version [flags]",
     'collect_logs' : "yugabyted collect_logs [flags]",
-    'configure' : "yugabyted configure [flags]",
+    'configure' : "yugabyted configure [command] [flags]",
+    'configure data_placement': "yugabyted configure data_placement [flags]",
+    'configure encrypt_at_rest': "yugabyted configure encrypt_at_rest [flags]",
     'connect' : "yugabyted connect [command] [flags]",
     'connect ycql' : "yugabyted connect ycql [flags]",
     'connect ysql' : "yugabyted connect ysql [flags]",
     'demo' : "yugabyted demo [command] [flags]",
     'demo connect' : "yugabyted demo connect [flags]",
     'demo destroy' : "yugabyted demo destroy [flags]",
+    'cert' : "yugabyted cert [command] [flags]",
+    'cert generate_server_certs' : "yugabyted cert generate_server_certs [flag]",
 }
 
 EXAMPLE = {
@@ -167,13 +178,33 @@ EXAMPLE = {
               "yugabyted start\n\n"+
               "# Create a single-node locally and join other nodes " +
               "that are part of the same cluster:\n" +
-              "yugabyted start -join=host:port,[host:port]\n\n",
+              "yugabyted start --join=host:port,[host:port]\n\n" +
+              "# Create a secure cluster:\n" +
+              "yugabyted start --secure --certs_dir=<path_to_certs_dir>\n\n",
     'stop' : "",
     'destroy' : "",
     'status' : "",
     'version' : "",
     'collect_logs' : "",
-    'configure' : "",
+    'cert' : "# Create node sever certificates:\n" +
+             "yugabyted cert generate_server_certs --hostnames=<comma_seperated_hostnames>\n\n",
+    'configure' : "# Configure a multi-zone cluster:\n" +
+                  "yugabyted configure data_placement --fault_tolerance=zone\n\n" +
+                  "# Enable encryption at rest:\n" +
+                  "yugabyted configure encrypt_at_rest --enable\n\n" +
+                  "For more examples use 'yugabyted configure [command] -h'",
+    'data_placement' : "# Configure a multi-zone cluster:\n" +
+                       "yugabyted configure data_placement --fault_tolerance=zone\n\n" +
+                       "# Configure a multi-region cluster:\n" +
+                       "yugabyted configure --fault_tolerance=region\n\n" +
+                       "# Configure a multi-zone cluster with specified placemenrt info and rf:\n" +
+                       "yugabyted configure --fault_tolerance=zone " +
+                       "--constraint_value=cloud1.region1.zone1,cloud2.region2.zone2," +
+                       "cloud3.region3.zon3 --rf=3\n\n",
+    'encrypt_at_rest' : "# Enable encryption at rest for a cluster:\n" +
+                        "yugabyted configure encrypt_at_rest --enable\n\n" +
+                        "# Disable encryption at rest for a cluster:\n" +
+                        "yugabyted configure encrypt_at_rest --disable\n\n",
 }
 
 EPILOG_COMMON = "Run '{} [command] -h' for help with specific commands.".format(SCRIPT_NAME)
@@ -187,6 +218,7 @@ EPILOG_SPECIFIC = {
     'version' : "",
     'collect_logs' : "",
     'configure' : "",
+    'cert' : "",
 }
 
 # YugabyteDB configs.
@@ -262,6 +294,17 @@ def search_file_in_paths(dir_candidates, file_name):
         "Yugabyte {} file not found in paths {}. Please check "
         "the paths.".format(file_name, dir_candidates)
     )
+
+# Checks if all given files exist in the given path
+def check_files_in_path(path, files):
+    has_error = False
+
+    for file in files:
+        if not os.path.exists(os.path.join(path, file)):
+            has_error = True
+            Output.log("{} file not found.".format(os.path.join(path, file)))
+
+    return not has_error
 
 # Finds the path of a particular YB binary
 def find_binary_location(binary_name):
@@ -366,7 +409,7 @@ class ControlScript(object):
 
     # Prints status of YugabyteDB.
     def status(self):
-        if os.path.isdir(self.configs.saved_data.get("data_dir")):
+        if len(os.listdir(self.configs.saved_data.get("data_dir"))) != 0:
             Output.print_out(self.get_status_string())
         else:
             Output.print_out("{} is not running.".format(SCRIPT_NAME))
@@ -383,6 +426,8 @@ class ControlScript(object):
             Output.print_out("Stopped {} using config {}.".format(SCRIPT_NAME, self.conf_file))
         logpath = self.configs.saved_data.get("log_dir")
         datapath = self.configs.saved_data.get("data_dir")
+        gen_certs_dir = self.configs.saved_data.get("gen_certs_dir")
+        certs_dir = self.configs.saved_data.get("certs_dir")
 
         if (self.conf_file == BREW_CONF_FILE):
             Output.print_out("{} destroy is not supported for brew installations.".format(
@@ -396,6 +441,14 @@ class ControlScript(object):
         if os.path.isdir(datapath):
             shutil.rmtree(datapath)
             Output.print_out("Deleted data at {}.".format(datapath))
+
+        if os.path.isdir(gen_certs_dir):
+            shutil.rmtree(gen_certs_dir)
+            Output.print_out("Deleted generated certs at {}.".format(gen_certs_dir))
+
+        if os.path.isdir(certs_dir):
+            shutil.rmtree(certs_dir)
+            Output.print_out("Deleted certs at {}.".format(certs_dir))
 
         if os.path.exists(self.conf_file):
             os.remove(self.conf_file)
@@ -563,7 +616,8 @@ class ControlScript(object):
         else:
             Output.print_and_log("Logs are packaged into {}".format(tarpath))
 
-    def configure(self):
+    # Configuring the data placement policy
+    def configure_data_placement(self):
 
         # to-do: can be removed after multi-region and geo-replicated feature is implemented
         fault_tolerance = self.configs.temp_data.get("fault_tolerance")
@@ -574,14 +628,12 @@ class ControlScript(object):
         advertise_ip = self.advertise_ip()
         master_addr = "{}:{}".format(join_ip if join_ip else advertise_ip,
                                         self.configs.saved_data.get("master_rpc_port"))
-
         current_masters = self.get_all_masters()
         current_masters = [ master.split(':')[0] for master in current_masters ]
         leader_master = self.get_leader_master().split(':')[0]
 
         leader_master_http_endpoint = "{}:{}".format(leader_master,
                         self.configs.saved_data.get("master_webserver_port"))
-
         placement_locations = self.get_all_masters_locations(leader_master_http_endpoint)
 
         new_masters = self.get_new_valid_masters(current_masters,
@@ -597,7 +649,7 @@ class ControlScript(object):
                 self.replace_master(master_addr, masters_to_remove[i], masters_to_add[i])
 
         current_masters = self.get_all_masters()
-        placement_info = self.configs.temp_data.get("data_placement_constraint")
+        placement_info = self.configs.temp_data.get("constraint_value")
         if not placement_info:
             placement_info = []
             for master in current_masters:
@@ -637,9 +689,335 @@ class ControlScript(object):
                 (Output.make_yellow("Fault Tolerance"), failure_status),
             ]
 
-        Output.print_out(self.get_status_string_for_configure(status_details))
+        Output.print_out(self.get_status_string_common(status_details))
 
-    #All Pre-requisites check for Linux
+    # Generate the node server certificates
+    def cert_generate_server_certs(self):
+        if self.check_openssl():
+            Output.log_error_and_exit(Output.make_red("Error") + ": openssl not installed. " +
+                "Can't create certificates.")
+
+        gen_certs_dir = self.configs.saved_data.get("gen_certs_dir")
+        root_certs_dir = os.path.join(gen_certs_dir, "root-ca")
+
+        status_details = []
+        if not self.generate_ca_certs(root_certs_dir=root_certs_dir):
+            status_details = [
+                (Output.make_yellow("Status"), "Cert generation failed. Please check the logs."),
+            ]
+            Output.print_out(self.get_status_string_common(status_details))
+            sys.exit(1)
+
+        hostnames = self.configs.temp_data.get("hostnames")
+        hostnames = hostnames.split(',')
+
+        generated_certs_hostnames = self.generate_node_server_certs(hostnames=hostnames,
+                                                                    gen_certs_dir=gen_certs_dir)
+        if len(generated_certs_hostnames):
+            status_details = [
+                (Output.make_yellow("Status"), "Server nodes certs generation for hostnames " +
+                                "{} successful.".format(",".join(generated_certs_hostnames))),
+                (Output.make_yellow("Server node certs path"),
+                        "Certs can be found at: {}".format(gen_certs_dir+"/<hostname>")),
+            ]
+        else:
+            status_details = [
+                (Output.make_yellow("Status"), "No certs generated. All hostnames already have " +
+                                               "certs generated."),
+                (Output.make_yellow("Server node certs path"),
+                        "Certs can be found at: {}".format(gen_certs_dir+"/<hostname>")),
+            ]
+
+        Output.print_out(self.get_status_string_common(status_details))
+
+    # Generate the root certificates
+    def generate_ca_certs(self, root_certs_dir):
+        generate_certs = False
+
+        if os.path.isdir(root_certs_dir):
+            if self.check_root_cert_files(root_certs_dir):
+                Output.log("Found an existing root certs directory {}.".format(root_certs_dir) +
+                    " Found appropriate files. Using the existing root certs.")
+            else:
+                Output.print_and_log(Output.make_yellow(Output.ANIMATION_WARNING + " WARNING:") +
+                    " Found an existing root certs directory {}.".format(root_certs_dir) +
+                    " Appropriate files not found. Removing these and creating new root certs." +
+                    " Please recreate any server certs created with previous root certs.")
+                shutil.rmtree(root_certs_dir)
+
+                generate_certs = True
+        else:
+            generate_certs = True
+
+        if generate_certs:
+            Output.log("Creating root certs...")
+            if not os.path.isdir(root_certs_dir):
+                os.makedirs(root_certs_dir)
+
+            status = OpenSSLProxy.generate_root_ca_certs(root_certs_dir=root_certs_dir)
+
+            if not status:
+                return False
+
+        return True
+
+    # Generate node server certififcates
+    def generate_node_server_certs(self, hostnames, gen_certs_dir):
+        root_certs_dir = os.path.join(gen_certs_dir, "root-ca")
+
+        existing_certs_hostnames = []
+        generated_certs_hostnames = []
+        # Generate certs for each server node
+        for hostname in hostnames:
+            # Check whether the hostname is already present in the certs database or not.
+            if self.check_hostname_in_root_ca_database(hostname=hostname,
+                                                       root_certs_dir=root_certs_dir):
+                existing_certs_hostnames.append(hostname)
+                continue
+
+            # Check whether the hostname cert folder is present or not
+            node_certs_dir = os.path.join(gen_certs_dir, hostname)
+            if os.path.isdir(node_certs_dir):
+                Output.log("Found an existing cert directory {} for ".format(node_certs_dir) +
+                    "hostname {}. But no data entry found in ".format(hostname) +
+                    "root-ca certs database. Removing...")
+                shutil.rmtree(node_certs_dir)
+
+            status = OpenSSLProxy.generate_node_server_certs(root_certs_dir=root_certs_dir,
+                hostname=hostname, server_cert_dir=node_certs_dir)
+
+            if not status:
+                status_details = [
+                    (Output.make_yellow("Status"), "Server node cert generation failed for " +
+                        "hostname {}. Please check the logs.".format(hostname)),
+                ]
+                Output.print_out(self.get_status_string_common(status_details))
+                exit(1)
+            else:
+                generated_certs_hostnames.append(hostname)
+
+        if len(existing_certs_hostnames):
+            Output.print_and_log(Output.make_yellow(Output.ANIMATION_WARNING + " WARNING:") +
+                " Hostnames {} ".format(Output.make_green(",".join(existing_certs_hostnames))) +
+                "already have their certifcates generated according to root-ca certs database " +
+                "index. Please use the previously generated certs. Skipping these hostnames....")
+
+
+        return generated_certs_hostnames
+
+    # Check if all root certificate files are present in a path or not
+    def check_root_cert_files(self, path):
+        root_certs_files = ["ca.crt", "ca.key", "ca.conf", "index.txt",
+            "index.txt.attr", "serial.txt"]
+
+        return check_files_in_path(path, root_certs_files)
+
+    # Check if a hostname is present in the root-ca database
+    def check_hostname_in_root_ca_database(self, hostname, root_certs_dir):
+        root_ca_database_file = os.path.join(root_certs_dir, "index.txt")
+
+        with open(root_ca_database_file, 'r') as certs_database_file:
+            certs_database = certs_database_file.read()
+            if hostname in certs_database:
+                return True
+
+        return False
+
+    # Use the masters to check if the masters has the key with <key_id>.
+    def is_key_in_all_masters(self, key_id):
+        masters = ",".join(self.get_all_masters())
+
+        # IPs of the masters which are currently in the cluster
+        master_ips = [master.split(':')[0] for master in masters.split(',')]
+
+        # Masters which have the key with id as key_id
+        masters_with_key = YBAdminProxy.check_key_in_masters(master_addrs=masters, key_id=key_id)
+        for i, master in enumerate(masters_with_key):
+            master = master.split(':')[0].split()[1]
+            masters_with_key[i] = master
+
+        ret = True
+        if masters_with_key < len(master_ips):
+            ret = False
+
+        for master in master_ips:
+            if master not in masters_with_key:
+                ret = False
+
+        return ret
+
+    # Use the masters to check if encryption at rest is enabled.
+    def is_encryption_at_rest_enabled(self):
+        masters = self.configs.saved_data.get("current_masters")
+        result = YBAdminProxy.check_encryption(master_addrs=masters)
+
+        if result is None:
+            return None
+
+        if "ENABLED" in result:
+            return True
+        else:
+            return False
+
+    # Configuring encryption at rest
+    def configure_encrypt_at_rest(self):
+        status_details = []
+        has_errors = False
+
+        # Enable encryption at rest.
+        if self.configs.temp_data.get("enable_encrypt_at_rest"):
+            Output.log("Trying to enable encryption at rest.")
+
+            # Check whether the encryption at rest is already enabled.
+            encryption_enabled = self.is_encryption_at_rest_enabled()
+            if encryption_enabled is None:
+                Output.log_error_and_exit("Error checking status of encryption-at-rest.")
+            elif encryption_enabled:
+                Output.log("Encryption at rest already enabled.")
+                has_errors = True
+                status_details = [
+                    (Output.make_yellow("Status"), "Encryption at rest already enabled.")
+                ]
+
+            # Setting the key directory and name
+            key_dir = os.path.join(self.configs.saved_data.get("data_dir"), "encrypt-keys")
+            keyname = "encrypt_at_rest"
+
+            if not has_errors:
+                # Check openssl is installed in the machine or not.
+                if self.check_openssl():
+                    Output.log_error_and_exit(Output.make_red("Error") + ": openssl not " +
+                        "installed. Can't create universe key for encryption.")
+
+                # Generate the universe key.
+                status = OpenSSLProxy.generate_key(key_dir=key_dir, keyname=keyname)
+
+                if not status:
+                    Output.log(Output.make_red("Error") + ": Universe key generation failed for " +
+                            "encryption at rest.")
+                    has_errors = True
+                    status_details = [
+                        (Output.make_yellow("Status"), "Universe key generation failed for " +
+                            "enabling encryption at rest. Please check the logs.")
+                    ]
+                else:
+                    masters = ",".join(self.get_all_masters())
+                    key_id = str(uuid.uuid4())
+                    key_path = key_dir + "/" + keyname + ".key"
+
+                    # Copy the generated universe key to all the masters
+                    if not has_errors and not YBAdminProxy.copy_key_to_masters(
+                            master_addrs=masters, key_id=key_id, key_path=key_path):
+                        Output.log(Output.make_red("Error") + ": cannot copy the " +
+                            "generated key to the masters.")
+                        has_errors = True
+                        status_details = [
+                            (Output.make_yellow("Status"), "Encryption at rest failed. " +
+                                "Please check the logs."),
+                        ]
+
+                    # Check whether all masters have the key.
+                    if not has_errors:
+                        if not self.is_key_in_all_masters(key_id=key_id):
+                            Output.log(Output.make_red("Error") + ": Universe key " +
+                                "{} not found in all masters.".format(key_id))
+                            has_errors = True
+                            status_details = [
+                                (Output.make_yellow("Status"), "Encryption at rest failed. " +
+                                    "Please check the logs."),
+                            ]
+                        else:
+                            Output.log("Copied key {} to all the masters".format(key_id))
+
+                    # Enable encryption at rest.
+                    if not has_errors and not YBAdminProxy.enable_encryption_using_key(
+                            master_addrs=masters, key_id=key_id):
+                        Output.log(Output.make_red("Error") + ": cannot enable " +
+                            "encryption at rest.")
+                        has_errors = True
+                        status_details = [
+                            (Output.make_yellow("Status"), "Encryption at rest failed. " +
+                                "Please check the logs."),
+                        ]
+
+                    # Check whether the encryption at rest has been enabled or not.
+                    if not has_errors:
+                        encryption_enabled = self.is_encryption_at_rest_enabled()
+                        if encryption_enabled is None:
+                            Output.log_error_and_exit("Error checking status of " +
+                                "encryption-at-rest.")
+                        elif not encryption_enabled:
+                            Output.log(Output.make_red("Error") + ": cannot enable " +
+                                "encryption at rest.")
+                            has_errors = True
+                            status_details = [
+                                (Output.make_yellow("Status"), "Encryption at rest failed. " +
+                                    "Please check the logs."),
+                            ]
+                        else:
+                            out = "Encryption at rest enabled with key: {}".format(key_id)
+                            Output.log(out)
+                            status_details = [
+                                (Output.make_yellow("Status"), out),
+                            ]
+
+            Output.log("Deleting the universe key generated for encryption at rest.")
+            if os.path.isdir(key_dir):
+                shutil.rmtree(key_dir)
+        # Disabling encryption at rest
+        else:
+            Output.log("Trying to disable encryption at rest.")
+
+            # Check whether encryption at rest is already disabled.
+            encryption_enabled = self.is_encryption_at_rest_enabled()
+            if encryption_enabled is None:
+                Output.log_error_and_exit("Error checking status of encryption-at-rest.")
+            elif not encryption_enabled:
+                Output.log("Encryption at rest is already disabled.")
+                has_errors = True
+                status_details = [
+                    (Output.make_yellow("Status"), "Encryption at rest is already disabled.")
+                ]
+
+            masters = ",".join(self.get_all_masters())
+
+            # Disable encryption at rest
+            if not has_errors and not YBAdminProxy.disable_encryption(master_addrs=masters):
+                Output.log(Output.make_red("Error") + ": cannot disable encryption at rest.")
+                has_errors = True
+                status_details = [
+                    (Output.make_yellow("Status"), "Disabling encryption at rest failed. " +
+                        "Please check the logs."),
+                ]
+
+            # Check whether encryption at rest has been disabled or not.
+            if not has_errors:
+                encryption_enabled = self.is_encryption_at_rest_enabled()
+                if encryption_enabled is None:
+                    Output.log_error_and_exit("Error checking status of encryption-at-rest.")
+                elif encryption_enabled:
+                    Output.log(Output.make_red("Error") + ": cannot disable encryption at rest.")
+                    has_errors = True
+                    status_details = [
+                        (Output.make_yellow("Status"), "Disabling encryption at rest failed. " +
+                            "Please check the logs."),
+                    ]
+                else:
+                    out = "Encryption at rest disabled."
+                    Output.log(out)
+                    status_details = [
+                        (Output.make_yellow("Status"), out),
+                    ]
+
+        Output.print_out(self.get_status_string_common(status_details))
+
+    # Check for openssl
+    def check_openssl(self):
+        openssl_check = run_process(shlex.split(LINUX_PREREQS_CMDS.get('openssl')))
+        openssl_exit_code = openssl_check[2]
+        return openssl_exit_code != 0
+
+    # All Pre-requisites check for Linux
     def linux_prereqs_check(self):
         prereqs_failed = set()
         prereqs_warn = set()
@@ -663,7 +1041,7 @@ class ControlScript(object):
 
         return (prereqs_failed_flag, prereqs_failed, prereqs_warn_flag, prereqs_warn)
 
-    #All Pre-requistes check for MacOS
+    # All Pre-requistes check for MacOS
     def mac_prereqs_check(self):
         prereqs_failed = set()
         prereqs_warn = set()
@@ -795,10 +1173,12 @@ class ControlScript(object):
         elif not self.wait_tserver():
             return "Failed to start tserver {}".format(SCRIPT_NAME)
 
-        universe_uuid = YBAdminProxy.get_cluster_uuid(master_addresses)
-        if universe_uuid and universe_uuid != self.configs.saved_data["universe_uuid"]:
-            self.configs.saved_data["universe_uuid"] = universe_uuid
-            self.configs.save_configs()
+        if not was_already_setup:
+            master_addresses = self.configs.saved_data.get("current_masters")
+            universe_uuid = YBAdminProxy.get_cluster_uuid(master_addresses)
+            if universe_uuid and universe_uuid != self.configs.saved_data["universe_uuid"]:
+                self.configs.saved_data["universe_uuid"] = universe_uuid
+                self.configs.save_configs()
 
         return None
 
@@ -816,6 +1196,7 @@ class ControlScript(object):
             master_addresses  = "{}:{},{}".format(join_ip, master_rpc_port, master_addresses)
         tserver_rpc_port = self.configs.saved_data.get("tserver_rpc_port")
         certs_dir = self.configs.saved_data.get("certs_dir")
+        was_already_setup = self.configs.saved_data.get("cluster_member", False)
 
         common_gflags = [
             "--stop_on_parent_termination",
@@ -883,10 +1264,63 @@ class ControlScript(object):
                 "--start_redis_proxy=false",
             ]
 
-        if self.configs.saved_data.get("tserver_flags"):
+        tserver_flags = self.configs.saved_data.get("tserver_flags")
+
+        # If ysql_hba_conf_csv is present
+        # Extract the value of ysql_hba_conf_csv
+        # Remove the flag present in the tserver_flags string
+        if tserver_flags.find("ysql_hba_conf_csv") != -1:
+            ysql_hba_conf_csv_start_index = tserver_flags.find('ysql_hba_conf_csv')
+            ysql_hba_conf_csv_end_index = tserver_flags.find('}', ysql_hba_conf_csv_start_index) + 1
+            ysql_hba_conf_csv_flag = tserver_flags[ysql_hba_conf_csv_start_index:\
+                    ysql_hba_conf_csv_end_index]
+            ysql_hba_conf_csv_flag = ysql_hba_conf_csv_flag[ysql_hba_conf_csv_flag.find("{")+1:-1]
+
+            # If the value was given through the config file
+            # remove the starting and ending quotes.
+            if ysql_hba_conf_csv_flag[0] == "'" and ysql_hba_conf_csv_flag[-1] == "'":
+                ysql_hba_conf_csv_flag = ysql_hba_conf_csv_flag[1:-1]
+            elif ysql_hba_conf_csv_flag[0] == '"' and ysql_hba_conf_csv_flag[-1] == '"':
+                ysql_hba_conf_csv_flag = ysql_hba_conf_csv_flag[1:-1]
+
+            # Remove the flag present in tserver_flags
+            if ysql_hba_conf_csv_start_index == 0:
+                tserver_flags = tserver_flags[ysql_hba_conf_csv_end_index+1:]
+            else:
+                tserver_flags = tserver_flags[:ysql_hba_conf_csv_start_index-1] + \
+                    tserver_flags[ysql_hba_conf_csv_end_index:]
+
+            yb_tserver_cmd.extend(["--ysql_hba_conf_csv={}".format(ysql_hba_conf_csv_flag)])
+
+        # If ysql_pg_conf_csv is present
+        # Extract the value of ysql_pg_conf_csv given through CLI
+        # Remove the flag present in the tserver_flags string
+        if tserver_flags.find("ysql_pg_conf_csv") != -1:
+            ysql_pg_conf_csv_start_index = tserver_flags.find('ysql_pg_conf_csv')
+            ysql_pg_conf_csv_end_index = tserver_flags.find('}', ysql_pg_conf_csv_start_index) + 1
+            ysql_pg_conf_csv_flag = tserver_flags[ysql_pg_conf_csv_start_index:\
+                    ysql_pg_conf_csv_end_index]
+            ysql_pg_conf_csv_flag = ysql_pg_conf_csv_flag[ysql_pg_conf_csv_flag.find("{")+1:-1]
+
+            # If the value was given through the config file
+            # remove the starting and ending quotes.
+            if ysql_pg_conf_csv_flag[0] == "'" and ysql_pg_conf_csv_flag[-1] == "'":
+                ysql_pg_conf_csv_flag = ysql_pg_conf_csv_flag[1:-1]
+            elif ysql_pg_conf_csv_flag[0] == '"' and ysql_pg_conf_csv_flag[-1] == '"':
+                ysql_pg_conf_csv_flag = ysql_pg_conf_csv_flag[1:-1]
+
+            # Remove the flag present in tserver_flags
+            if ysql_pg_conf_csv_start_index == 0:
+                tserver_flags = tserver_flags[ysql_pg_conf_csv_end_index+1:]
+            else:
+                tserver_flags = tserver_flags[:ysql_pg_conf_csv_start_index-1] + \
+                    tserver_flags[ysql_pg_conf_csv_end_index:]
+
+            yb_tserver_cmd.extend(["--ysql_pg_conf_csv={}".format(ysql_pg_conf_csv_flag)])
+
+        if tserver_flags:
             yb_tserver_cmd.extend(
-                ["--{}".format(flag) for flag in \
-                    self.configs.saved_data.get("tserver_flags").split(",")])
+                ["--{}".format(flag) for flag in tserver_flags.split(",")])
 
         # Add authentication flags in tserver
         if self.configs.saved_data.get("secure"):
@@ -899,14 +1333,6 @@ class ControlScript(object):
         if self.configs.saved_data.get("use_cassandra_authentication"):
             yb_tserver_cmd.extend(["--use_cassandra_authentication=true"])
 
-        # yw_cmd = [
-        #     os.path.join(YUGAWARE_BIN_DIR, "yugaware"), "-Dconfig.file={}".format(YUGAWARE_CONF),
-        #     "-Dplay.evolutions.db.default.autoApply=true",
-        #     "-Dhttp.port={}".format(self.configs.saved_data.get("webserver_port")),
-        #     "-Dhttp.address={}".format(bind_ip),
-        #     "-Dlog.override.path={}".format(self.configs.saved_data.get("log_dir"))
-        # ]
-
         self.processes = {
             "master": YBProcessManager(
                 "master", yb_master_cmd, self.configs.saved_data.get("log_dir"),
@@ -917,18 +1343,13 @@ class ControlScript(object):
         }
 
         # if self.configs.temp_data.get("ui"):
-        #     self.processes["yugaware"] = ProcessManager(
-        #         "yugaware", yw_cmd, self.configs.saved_data.get("log_dir"),
+        #     yugabyted_ui_cmd = [ find_binary_location("yugabyted-ui")] + \
+        #         [
+        #             "-database_host={}".format(bind_ip)
+        #         ]
+        #     self.processes["yugabyted-ui"] = ProcessManager(
+        #         "yugabyted-ui", yugabyted_ui_cmd, self.configs.saved_data.get("log_dir"),
         #         self.configs.saved_data.get("data_dir"))
-
-        if self.configs.temp_data.get("ui"):
-            yugabyted_ui_cmd = [ find_binary_location("yugabyted-ui")] + \
-                [
-                    "-database_host={}".format(bind_ip)
-                ]
-            self.processes["yugabyted-ui"] = ProcessManager(
-                "yugabyted-ui", yugabyted_ui_cmd, self.configs.saved_data.get("log_dir"),
-                self.configs.saved_data.get("data_dir"))
 
         for p in self.processes.values():
             pid = p.get_pid()
@@ -942,6 +1363,7 @@ class ControlScript(object):
 
         is_first_run = True
         callhome_thread = None
+        masters_list_update_thread = None
         self.stop_callhome = False
         while True:
             should_callhome = False
@@ -994,16 +1416,21 @@ class ControlScript(object):
 
                 Output.update_animation("YugabyteDB Started")
 
+                if join_ip:
+                    Output.print_and_log(Output.ANIMATION_SUCCESS +
+                            " Node joined a running cluster with UUID {}"
+                            .format(self.configs.saved_data.get("universe_uuid")))
+
                 if self.configs.saved_data.get("secure"):
-                    Output.init_animation("Enabling SSL Authentication...")
-                    if not join_ip:
+                    Output.init_animation("Enabling Encryption in Transit and " +
+                        "Password Authentication...")
+                    if not join_ip and not was_already_setup:
                         alphadigits = string.ascii_letters + string.digits
                         new_password = ''.join(PASSWORD_GENNERATOR(alphadigits) for i in range(12))
                         self.update_db_passwords(new_password)
                         self.create_password_file()
-                    Output.update_animation("SSL Authentication enabled.")
-                    Output.print_and_log(Output.ANIMATION_SUCCESS +
-                            " User Authentication enabled.")
+                    Output.update_animation("Encryption in Transit and " +
+                        "Password Authentication enabled")
                 else:
                     Output.print_and_log(Output.make_yellow(Output.ANIMATION_WARNING +
                         " WARNING:") + " Cluster started in an insecure mode without " +
@@ -1012,11 +1439,6 @@ class ControlScript(object):
 
                 # Persist the config after successful start
                 self.configs.save_configs()
-                Output.update_animation("YugabyteDB Started")
-                if join_ip:
-                    Output.print_and_log(Output.ANIMATION_SUCCESS +
-                            " Node joined a running cluster with UUID {}"
-                            .format(self.configs.saved_data.get("universe_uuid")))
             else:
                 for name in ("master", "tserver"):
                     process = self.processes.get(name)
@@ -1030,7 +1452,22 @@ class ControlScript(object):
                         process.start()
                         should_callhome = True
 
-            if self.configs.temp_data.get("ui"):
+            if is_first_run:
+                if self.configs.saved_data.get("ui"):
+                    yugabyted_ui_cmd = [ find_binary_location("yugabyted-ui")] + \
+                        [
+                            "-database_host={}".format(bind_ip)
+                        ]
+                    if self.configs.saved_data.get("secure"):
+                        yugabyted_ui_cmd.extend(["-secure=true",
+                            "-database_password={}".format(
+                            self.configs.saved_data.get("database_password"))])
+
+                    self.processes["yugabyted-ui"] = ProcessManager(
+                        "yugabyted-ui", yugabyted_ui_cmd, self.configs.saved_data.get("log_dir"),
+                        self.configs.saved_data.get("data_dir"))
+
+            if self.configs.saved_data.get("ui"):
                 (_, was_started) = self.verify_start_yugabyted_ui(is_first_run, is_first_install)
                 should_callhome = should_callhome or was_started
 
@@ -1078,9 +1515,11 @@ class ControlScript(object):
                     callhome_thread.daemon = True
                     callhome_thread.start()
 
+                masters_list_update_thread = Thread(target=self.update_masters_list_loop)
+                masters_list_update_thread.daemon = True
+                masters_list_update_thread.start()
 
             is_first_run = False
-
             if should_callhome:
                 self.callhome()
 
@@ -1095,7 +1534,7 @@ class ControlScript(object):
         was_started = False
         err = None
 
-        if not self.configs.temp_data.get("ui"):
+        if not self.configs.saved_data.get("ui"):
             return (err, was_started)
 
         yugabyted_ui_process = self.processes.get("yugabyted-ui")
@@ -1104,7 +1543,7 @@ class ControlScript(object):
             if is_first_run:
                 Output.init_animation("Bringing up UI...")
 
-            # Start YW process.
+            # Start yugabyted UI process.
             if not yugabyted_ui_process.is_running():
                 if not is_first_run:
                     Output.log(
@@ -1131,7 +1570,7 @@ class ControlScript(object):
         was_started = False
         err = None
 
-        if not self.configs.temp_data.get("ui"):
+        if not self.configs.saved_data.get("ui"):
             return (err, was_started)
 
         yw_process = self.processes.get("yugaware")
@@ -1323,11 +1762,7 @@ class ControlScript(object):
         return not err and not ret_code and "play_evolutions" in out
 
     # Returns true if this master was found in the current list of masters
-    def wait_master(self):
-        join_ip = self.configs.saved_data.get("join")
-        master_ip = join_ip if join_ip else self.advertise_ip()
-        master_addr = "{}:{}".format(master_ip,
-                                     self.configs.saved_data.get("master_rpc_port"))
+    def wait_master(self, master_addr):
 
         if (not self.processes.get("master").is_running()):
             Output.log("Failed waiting for yb-master... process died.", logging.ERROR)
@@ -1338,6 +1773,18 @@ class ControlScript(object):
         if not cur_master_uuids:
             raise RetryableError()
         return master_uuid in cur_master_uuids
+
+    # Returns the current list of master UUIDs
+    def get_master_uuids(self, master_addr):
+
+        if (not self.processes.get("master").is_running()):
+            Output.log("Failed waiting for yb-master... process died.", logging.ERROR)
+            raise RuntimeError("process died unexpectedly.")
+
+        cur_master_uuids = [ m[0] for m in YBAdminProxy.get_masters(master_addr) ]
+        if not cur_master_uuids:
+            raise RetryableError()
+        return cur_master_uuids
 
     # Use the masters we know (ourselves and the join target) to discover the full cluster.
     # Retry until timeout in case the masters we know are still coming up.
@@ -1352,9 +1799,17 @@ class ControlScript(object):
 
     # Use the masters we know (ourselves and the join target) to discover the full cluster.
     def get_all_masters(self):
+
+        current_masters = self.configs.saved_data.get("current_masters")
+
+        if current_masters:
+            all_masters = [ m[1] for m in YBAdminProxy.get_masters(current_masters) ]
+            Output.log("Got all masters: {}".format(all_masters))
+            if all_masters:
+                return all_masters
+
         join_ip = self.configs.saved_data.get("join")
         advertise_ip = self.advertise_ip()
-
         all_masters = None
         for master_ip in (join_ip, advertise_ip):
             if not master_ip:
@@ -1367,6 +1822,7 @@ class ControlScript(object):
                 return all_masters
 
         raise RetryableError()
+
 
     # Waits till the newly added master comes in the list of masters of cluster
     def wait_get_master(self, master, timeout=180):
@@ -1391,6 +1847,76 @@ class ControlScript(object):
             return True
 
         raise RetryableError()
+
+    # Get the current list of masters known to a tserver using api/v1/masters endpoint
+    # of the tserver. Use the node address given with the --join flag or use the
+    # advertise address if join flag is not provided.
+    def get_current_masters_from_api(self, tserverIp):
+        tserver_addr = "{}:{}".format(tserverIp,
+                            self.configs.saved_data.get("tserver_webserver_port"))
+        try:
+            tserverMastersAPI = "http://{}/api/v1/masters".format(tserver_addr)
+            response = urlopen(Request(tserverMastersAPI))
+            jsonResponseFromTserver = json.load(response)
+            dictOfAllNodes = jsonResponseFromTserver.get("master_server_and_type")
+
+            currentMastersCSV = ""
+            lenOfMasters = len(dictOfAllNodes)
+            for node in dictOfAllNodes:
+                currentMastersCSV += node["master_server"]
+                lenOfMasters -= 1
+                if lenOfMasters > 0:
+                    currentMastersCSV += ","
+
+            Output.log("Tserver {} returned the following ".format(tserverIp) +
+                "set of the current masters {}.".format(currentMastersCSV),
+                    logging.DEBUG)
+
+            return currentMastersCSV
+
+        except HTTPError as http_err:
+            Output.log('HTTP error occurred while fetching current' +
+                    'masters from tserver: {}', http_err)
+            return ''
+        except Exception as err:
+            Output.log('Other error occurred while fetching current' +
+                    'masters from tserver: {}', err)
+            return ''
+
+    # Get the current master leader known to a tserver using api/v1/masters endpoint
+    # of the tserver. Use the node address given with the --join flag or use the
+    # advertise address if join flag is not provided.
+    def get_current_master_leader_from_api(self):
+
+        join_ip = self.configs.saved_data.get("join")
+        advertise_ip = self.advertise_ip()
+        tserver_addr = "{}:{}".format(join_ip if join_ip else advertise_ip,
+                                        self.configs.saved_data.get("tserver_webserver_port"))
+
+        try:
+            tserverMastersAPI = "http://{}/api/v1/masters".format(tserver_addr)
+            response = urlopen(Request(tserverMastersAPI))
+            jsonResponseFromTserver = json.load(response)
+            dictOfAllNodes = jsonResponseFromTserver.get("master_server_and_type")
+
+            masterLeader = ""
+            for node in dictOfAllNodes:
+                if node["is_leader"]:
+                    masterLeader = node["master_server"]
+                    break
+
+            Output.log("Tserver {} returned the following".format(tserver_addr) +
+                        "master leader {}.".format(masterLeader),
+                            logging.DEBUG)
+
+            return masterLeader
+
+        except HTTPError as http_err:
+            print('HTTP error occurred while fetching cloud location: {}', http_err)
+            return ''
+        except Exception as err:
+            print('Other error occurred while fetching cloud location: {}', err)
+            return ''
 
     # Waits till the newly removed master doesn't comes in the list of masters of cluster
     def wait_remove_master(self, master, timeout=180):
@@ -1417,6 +1943,14 @@ class ControlScript(object):
 
     # Get Leader master of the cluster
     def get_leader_master(self):
+
+        current_masters = self.configs.saved_data.get("current_masters")
+        if current_masters:
+            all_masters_info = YBAdminProxy.get_masters(current_masters)
+            for master_info in all_masters_info:
+                if master_info[2] == "LEADER":
+                    return master_info[1]
+
         join_ip = self.configs.saved_data.get("join")
         advertise_ip = self.advertise_ip()
         master_addr = "{}:{}".format(join_ip if join_ip else advertise_ip,
@@ -1623,14 +2157,27 @@ class ControlScript(object):
     def setup_master(self, timeout=180):
         Output.log("Waiting for master")
         join_ip = self.configs.saved_data.get("join")
+        master_addrs = self.get_current_masters_from_api(join_ip)
+        # API didn't return any masters addresses, use join or advertise address
+        if not master_addrs:
+            join_ip = self.configs.saved_data.get("join")
+            master_ip = join_ip if join_ip else self.advertise_ip()
+            master_addrs = "{}:{}".format(master_ip,
+                                        self.configs.saved_data.get("master_rpc_port"))
+
+        # save the current known masters received from the get_current_masters_from_api()
+        self.configs.saved_data["current_masters"]= master_addrs
+
         try:
-            if retry_op(self.wait_master, timeout):
-                self.configs.saved_data["cluster_member"] = True
-                return True
-            # If wait_master returns False, it means the master is
+            master_uuids = retry_op_with_argument(self.get_master_uuids, master_addrs)
+            current_node_master_uuid = self.configs.saved_data.get("master_uuid")
+            # If False, it means the master is
             # not part of the current set of masters. If we have a
             # join_ip, let's try to add ourselves to it, otherwise
             # it is a hard failure.
+            if current_node_master_uuid in master_uuids:
+                self.configs.saved_data["cluster_member"] = True
+                return True
             if not join_ip:
                 return False
         except RuntimeError:
@@ -1640,10 +2187,12 @@ class ControlScript(object):
 
         # The master was not in the current list of masters
         # and we have a valid join_ip
+
         bind_ip = self.configs.saved_data.get("advertise_address")
-        master_addrs = "{}:{}".format(join_ip,
-                    self.configs.saved_data.get("master_rpc_port"))
-        master_uuids = [ m[0] for m in YBAdminProxy.get_masters(master_addrs) ]
+        # master_addrs = "{}:{}".format(join_ip,
+        #             self.configs.saved_data.get("master_rpc_port"))
+        # master_uuids = [ m[0] for m in YBAdminProxy.get_masters(master_addrs) ]
+
         if len(master_uuids) >= 3:
             # this is going to be a standalone shell master
             return True
@@ -1661,7 +2210,7 @@ class ControlScript(object):
                 return False
 
         try:
-            if retry_op(self.wait_master, timeout):
+            if retry_op_with_argument(self.get_master_uuids, master_addrs, timeout):
                 self.configs.saved_data["cluster_member"] = True
                 Output.log("Completed setup and wait for master.")
                 return True
@@ -1672,9 +2221,12 @@ class ControlScript(object):
         return False
 
     def is_tserver_up(self):
-        join_ip = self.configs.saved_data.get("join")
-        master_ip = join_ip if join_ip else self.advertise_ip()
-        master_addr = "{}:{}".format(master_ip,
+
+        master_addr = self.configs.saved_data.get("current_masters")
+        if not master_addr:
+            join_ip = self.configs.saved_data.get("join")
+            master_ip = join_ip if join_ip else self.advertise_ip()
+            master_addr = "{}:{}".format(master_ip,
                                      self.configs.saved_data.get("master_rpc_port"))
 
         if (not self.processes.get("master").is_running()
@@ -1709,17 +2261,18 @@ class ControlScript(object):
     def update_tserver_master_addrs(self):
         tserver_cmd = self.processes["tserver"].cmd
         master_flag = [ flag for flag in tserver_cmd if flag.find(TS_MASTER_ADDRS_FLAG) >= 0 ]
+        full_master_list = self.configs.saved_data.get("current_masters").split(",")
 
-        Output.log("Querying for all masters in cluster")
-        full_master_list = self.wait_get_all_masters(timeout=60)
         if not full_master_list:
-            Output.log("Unable to query for all masters list, keeping tserver flag: {}".format(
+            Output.log("Unable to get all masters list, keeping tserver flag: {}".format(
                 master_flag))
             return
-        my_master_ip = "{}:{}".format(
-            self.advertise_ip(), self.configs.saved_data.get("master_rpc_port"))
-        full_master_list = list(set(full_master_list + [ my_master_ip ]))
-        Output.log("Got full master addrs list: {}".format(full_master_list))
+
+        if len(full_master_list) < 3:
+            my_master_ip = "{}:{}".format(
+                self.advertise_ip(), self.configs.saved_data.get("master_rpc_port"))
+            full_master_list = list(set(full_master_list + [ my_master_ip ]))
+            Output.log("Got full master addrs list: {}".format(full_master_list))
 
         new_master_flag = "--{}={}".format(TS_MASTER_ADDRS_FLAG, ",".join(full_master_list))
         Output.log("Old master flag is: {} and new master flag is: {}".format(
@@ -1727,6 +2280,7 @@ class ControlScript(object):
         if master_flag:
             tserver_cmd.remove(master_flag[0])
         tserver_cmd += [new_master_flag]
+        self.configs.saved_data["current_masters"] = ",".join(full_master_list)
 
     def wait_yw_login(self, yw_proxy, timeout=180, insecure=False):
         Output.log("Attempting to log in...")
@@ -1744,10 +2298,23 @@ class ControlScript(object):
 
     # Returns pretty output table.
     def get_status_string(self):
+
         join_ip = self.configs.saved_data.get("join")
         advertise_ip = self.advertise_ip()
-        master_addrs = "{}:{}".format(join_ip if join_ip else advertise_ip,
-                                      self.configs.saved_data.get("master_rpc_port"))
+        was_already_setup = self.configs.saved_data.get("cluster_member", False)
+
+        # It is possible that masters have changed, try to find the latest
+        # masters before computing the status string.
+        master_web_addrs_ip = join_ip
+        master_addrs = self.get_current_masters_from_api(join_ip)
+        if not master_addrs:
+            master_web_addrs_ip = advertise_ip
+            master_addrs = self.get_current_masters_from_api(advertise_ip)
+        self.configs.saved_data["current_masters"] = master_addrs
+        Output.log("Master address list updated, new list: {}".format(master_addrs))
+
+        master_web_addrs = "{}:{}".format(master_web_addrs_ip,
+                                      self.configs.saved_data.get("master_webserver_port"))
 
         ycql_port = self.configs.saved_data.get("ycql_port")
         cql_hostname_param = ""
@@ -1762,11 +2329,15 @@ class ControlScript(object):
         ysql_port_param = "-p {}".format(ysql_port) if ysql_port != DEFAULT_YSQL_PORT else ""
         ysql_username, ysql_password, ysql_db = self.setup_env_init.get_ysql_credentials()
 
+        status_info = []
         # Make sure ascii escape characters for color encoding do not count towards char limit.
         if self.get_failed_node_processes():
             title = Output.make_bold(Output.make_red(SCRIPT_NAME))
             extra_len = len(Output.make_bold(Output.make_red("")))
             status = "Stopped"
+            status_info = [
+                (Output.make_yellow("Status"), status),
+            ]
         else:
             title = Output.make_bold(Output.make_green(SCRIPT_NAME))
             extra_len = len(Output.make_bold(Output.make_green("")))
@@ -1775,11 +2346,50 @@ class ControlScript(object):
             # In case of starting up via yugabyted, we have already given enough time to
             # the leader election
             # In case of manual start or some other route, we can have a smaller timeout
-            if self.wait_get_all_masters(timeout=10):
-                status = "Running."
+            status = ""
+            if was_already_setup:
+                if master_addrs:
+                    status = "Running."
             else:
-                status = "Status command timed out as YugabyteDB \"yb-master\" " + \
-                            "process is not responding."
+                if self.wait_get_all_masters(timeout=10):
+                    status = "Running."
+                else:
+                    status = "Status command timed out as YugabyteDB \"yb-master\" " + \
+                                "process is not responding."
+
+            enabled_security_features = []
+            is_secure = self.configs.saved_data.get("secure")
+            if is_secure:
+                if self.configs.temp_data.get("yugabyted_cmd") == "status":
+                    encryption_enabled = self.is_encryption_at_rest_enabled()
+                    if encryption_enabled is None:
+                        Output.log("Error checking status of " +
+                            "encryption-at-rest.")
+                    if encryption_enabled:
+                        enabled_security_features.append("Encryption-at-rest")
+                if self.is_leader_master_secure(master_web_addrs):
+                    enabled_security_features.append("Encryption-in-transit")
+                if self.configs.saved_data.get("ysql_enable_auth") and \
+                    self.configs.saved_data.get("use_cassandra_authentication"):
+                    enabled_security_features.append("Password Authentication")
+
+            rf = self.configs.temp_data.get("replication_factor")
+            if not rf and self.configs.temp_data.get("yugabyted_cmd") == "start":
+                Output.init_animation("Verifying data placement constraint " +
+                            "on the YugabyteDB Cluster...")
+                rf = YBAdminProxy.get_cluster_rf(master_addrs)
+                Output.update_animation("Data placement constraint successfully verified")
+            else:
+                rf = YBAdminProxy.get_cluster_rf(master_addrs)
+            status_info = [
+                (Output.make_yellow("Status"), status),
+                (Output.make_yellow("Replication Factor"), rf),
+            ]
+
+            if enabled_security_features:
+                status_info += [
+                    (Output.make_yellow("Security Features"), ", ".join(enabled_security_features))
+                ]
 
 
         ysql_flags = " {} {} -U {} -d {}".format(ysql_hostname_param, ysql_port_param,
@@ -1801,15 +2411,21 @@ class ControlScript(object):
                                           self.configs.saved_data.get("yugabyted_ui_port"))
         yb_master_status = "http://{}:{}".format(advertise_ip,
                                           self.configs.saved_data.get("master_webserver_port"))
-
-        status_info = [
-            (Output.make_yellow("Status"), status),
-            (Output.make_yellow("Replication Factor"), YBAdminProxy.get_cluster_rf(master_addrs)),
-        ]
         console_desc = "Web console"
-        if self.configs.temp_data.get("ui"):
-            console_desc = "YugabyteDB UI"
-            status_info += [ (Output.make_yellow(console_desc), yugabyted_ui_status), ]
+        if self.configs.saved_data.get("ui"):
+            try:
+                response = urlopen(Request(yugabyted_ui_status))
+                if response.code == 200:
+                    console_desc = "YugabyteDB UI"
+                    status_info += [ (Output.make_yellow(console_desc), yugabyted_ui_status), ]
+                else:
+                    status_info += [ (Output.make_yellow(console_desc), yb_master_status), ]
+            except HTTPError as http_err:
+                Output.log('HTTP error occurred while fetching YugabyteDB UI {}', http_err)
+                status_info += [ (Output.make_yellow(console_desc), yb_master_status), ]
+            except Exception as err:
+                Output.log('HTTP error occurred while fetching YugabyteDB UI {}', err)
+                status_info += [ (Output.make_yellow(console_desc), yb_master_status), ]
         else:
             status_info += [ (Output.make_yellow(console_desc), yb_master_status), ]
 
@@ -1835,19 +2451,23 @@ class ControlScript(object):
         status += div_line
         return status
 
-    # Returns pretty output table for configure command.
-    def get_status_string_for_configure(self, status_info):
-
+    # Returns pretty output table
+    def get_status_string_common(self, status_info):
         title = Output.make_bold(Output.make_green(SCRIPT_NAME))
         extra_len = len(Output.make_bold(Output.make_green("")))
 
-        div_line = "+" + "-" * 98 + "+" + "\n"
+        max_len = 0
+        for k, v in status_info:
+            max_len = max(max_len, len(v))
+
+        div_line = "+" + "-" * (max_len + 33) + "+" + "\n"
         status = "\n" + div_line
-        status += ("| {:^" + str(96 + extra_len) + "} |\n").format(title)
+        status += ("| {:^" + str(max_len + 31 + extra_len) + "} |\n").format(title)
         status += div_line
         for k, v in status_info:
             extra_len = len(Output.make_yellow(""))
-            status += ("| {:" + str(20 + extra_len) + "}: {:<74} |\n").format(k, v)
+            status += ("| {:" + str(27 + extra_len) + "}: ").format(k)
+            status += ("{:<" + str(max_len + 2) + "} |\n").format(v)
         status += div_line
         return status
 
@@ -1878,51 +2498,54 @@ class ControlScript(object):
                 Output.log("Callhome failed: " + str(e))
                 pass
 
+    # update the master address list every min for the first half hour, then every hour after.
+    def update_masters_list_loop(self):
+        num_times_cmd_executed = 0
+        initial_interval = 60
+        final_interval = 3600
+        try:
+            while True:
+                self.update_master_list_on_background_thread()
+                num_times_cmd_executed += 1
+                time.sleep(initial_interval
+                        if num_times_cmd_executed < 30 else final_interval)
+        except Exception as e:
+                Output.log("update_masters_list: " + str(e))
+                pass
+
+    def update_master_list_on_background_thread(self):
+
+        # global _global_current_list_of_masters
+        current_master_list = self.configs.saved_data.get("current_masters").split(",")
+        Output.log("thread-uml: current masters {}".format(current_master_list))
+
+        # thread for updating the master address list in the background
+        # First attempt for /masters using the --join flag
+        masters_csv = self.get_current_masters_from_api(self.configs.saved_data.get("join"))
+        if not masters_csv:
+            # second attempt for /masters using the --advertise_address flag
+            masters_csv = self.get_current_masters_from_api(self.advertise_ip())
+            if not masters_csv:
+                Output.log("thread-uml: Unable to query for all masters list, " +
+                    "keeping masters list: {}".format(current_master_list))
+                return
+
+        full_master_list = masters_csv.split(",")
+        # check if masters have changed since last refresh, if not return
+        if_any_new_masters = set(full_master_list).difference(current_master_list)
+        if if_any_new_masters:
+            self.configs.saved_data["current_masters"] = masters_csv
+            Output.log("thread-uml: master list updated, old list: {} ".format(
+                current_master_list) + "new list: {}".format(full_master_list))
+
+            # Persist the config if masters have changed
+            self.configs.save_configs()
+
+
     # Calls func after receiving certain exit signals.
     def set_signals(self, func):
         for sig in EXIT_SIGNALS:
             signal(sig, func)
-
-    # Download the yugabyted-ui binary. Return true if yugabyted ui binary
-    # is downloaded and extracted into bin directory. Otherwise returns false.
-    def download_extract_yugabyted_ui_binary(self):
-
-        url = None
-        fileName = None
-        if OS_NAME == "Linux":
-            url = 'https://github.com/yugabyte/yugabyte-db/releases/download/' + \
-                'v1.0.0-beta-yugabyted-ui/yugabyted-ui-1.0.0-linux-x86_64.tar.gz'
-            fileName = 'yugabyted-ui-1.0.0-linux-x86_64.tar.gz'
-        else:
-            url = 'https://github.com/yugabyte/yugabyte-db/releases/download/' + \
-                'v1.0.0-beta-yugabyted-ui/yugabyted-ui-1.0.0-darwin-x86_64.tar.gz'
-            fileName = 'yugabyted-ui-1.0.0-darwin-x86_64.tar.gz'
-
-        target_path = os.path.join(YUGABYTE_DIR, "bin")
-
-        try:
-            response = urlopen(url)
-            CHUNK_SIZE = 1 << 20
-            with open(fileName, 'wb') as f:
-                while True:
-                    chunk = response.read(CHUNK_SIZE)
-                    if not chunk:
-                        break
-                    f.write(chunk)
-        except Exception as e:
-            Output.log("Failed to download Yugabyted UI binaries: {}".format(e), logging.ERROR)
-            return False
-
-        try:
-            tarFilePath = os.path.join(target_path, fileName)
-            file = tarfile.open(tarFilePath)
-            file.extractall(target_path)
-            file.close()
-        except Exception as e:
-            Output.log("Failed to extract Yugabyted UI binaries: {}".format(e), logging.ERROR)
-            return False
-
-        return True
 
     # Returns true if Java is installed. While Java 8+ is necessary for YW, we don't explicitly
     # check for it so that future version format changes (e.g. Java 1.4 to Java 5) won't give
@@ -1935,6 +2558,33 @@ class ControlScript(object):
         except (OSError, subprocess.CalledProcessError) as e:
             Output.log("Failed to find java: {}".format(e), logging.ERROR)
             return False
+
+    # Check whether the hostnames or IP provided is in correct format.
+    def validate_hostname_ip(self, ip):
+        # Regex expression for validating IPv4
+        ipv4_regex = "^((25[0-5]|2[0-4][0-9]|1[0-9][0-9]|[1-9]?[0-9])\.){3}(25[0-5]|2[0-4]"\
+            "[0-9]|1[0-9][0-9]|[1-9]?[0-9])$"
+
+        # Regex expression for validating IPv6
+        ipv6_regex = "((([0-9a-fA-F]){1,4})\\:){7}([0-9a-fA-F]){1,4}"
+
+        ipv4_pattern = re.compile(ipv4_regex)
+        ipv6_pattern = re.compile(ipv6_regex)
+
+        # Checking if it is not a valid IPv4 or IPv6 addresses
+        if not (re.search(ipv4_pattern, ip) or re.search(ipv6_pattern, ip)):
+            return False
+
+        return True
+
+    # Returns a list of invalid IPs from the list of IPs provided.
+    def get_invalid_ips(self, ips):
+        invalid_ips = []
+        for ip in ips:
+            if not self.validate_hostname_ip(ip):
+                invalid_ips.append(ip)
+
+        return invalid_ips
 
     def find_ip_address_of_node(self):
 
@@ -1955,13 +2605,33 @@ class ControlScript(object):
 
         return fqdn
 
-    # Parse config file and input args. Validate them and save any new configs.
-    def validate_and_set_configs(self, args):
+    # Check whether the leader master is secure.
+    def is_leader_master_secure(self, master_hostport):
+        try:
+            leaderMasterURL = "http://{}/api/v1/varz".format(master_hostport)
+            response = urlopen(Request(leaderMasterURL))
+            jsonResponseFromMaster = json.load(response)
+            listOfAllFlags = jsonResponseFromMaster.get("flags")
+
+            encryptionFlag = [flag for flag in listOfAllFlags if
+                flag.get("name") == "use_node_to_node_encryption"]
+
+            return encryptionFlag[0].get("value") == "true"
+
+        except HTTPError as http_err:
+            print('HTTP error occurred while checking for security of leader master: {}', http_err)
+        except Exception as err:
+            print('Other error occurred while checking for security of leader master: {}', err)
+
+    # Parse the config file and input parent flags to validate and set them.
+    # Parent flags: --config, --data_dir, --log_dir
+    def validate_and_set_parent_configs(self, args):
 
         home_dir = os.path.expanduser("~")
         default_base_dir = os.path.join(home_dir, "var")
         default_conf_path = os.path.join(default_base_dir, "conf", "{}.conf".format(SCRIPT_NAME))
-        base_dir = os.path.abspath(args.base_dir) if args.base_dir else default_base_dir
+        base_dir = os.path.abspath(os.path.expanduser(args.base_dir)) if args.base_dir \
+            else default_base_dir
         base_dir_conf = ''
         if args.base_dir:
             base_dir_conf = os.path.join(base_dir, "conf", "{}.conf".format(SCRIPT_NAME))
@@ -1970,7 +2640,7 @@ class ControlScript(object):
 
         self.conf_file = args.config or base_dir_conf or \
                          Configs.get_brew_config() or default_conf_path
-        self.conf_file = os.path.abspath(os.path.realpath(self.conf_file))
+        self.conf_file = os.path.realpath(os.path.expanduser(self.conf_file))
 
         conf_dir = os.path.dirname(self.conf_file)
         if not os.path.isdir(conf_dir):
@@ -1983,10 +2653,226 @@ class ControlScript(object):
             if path:
                 setattr(args, path_args, os.path.abspath(os.path.realpath(path)))
 
+        if args.data_dir is not None:
+            args.data_dir = os.path.expanduser(args.data_dir)
+
+            config_data_dir = self.configs.saved_data.get("data_dir")
+            if (config_data_dir and os.path.exists(config_data_dir) and
+                    config_data_dir != args.data_dir):
+                has_errors = True
+                # TODO: Gradefully handle this case... User should be able to override config.
+                Output.print_out(
+                    "Data directory already exists at {}.".format(config_data_dir))
+
+        if args.log_dir is not None:
+            args.log_dir = os.path.expanduser(args.log_dir)
+
+            config_log_dir = self.configs.saved_data.get("log_dir")
+            if (config_log_dir and os.path.exists(config_log_dir) and
+                    config_log_dir != args.log_dir):
+                Output.print_out(
+                    "Old log directory already exists at {}. New logs will go to {}".format(
+                        config_log_dir, args.log_dir))
+
+        if has_errors:
+            sys.exit(1)
+
+        parent_flags = ["config", "log_dir", "data_dir"]
+        # Override configs and defaults with user specified variables
+        for k, v in get_kv(args.__dict__):
+            if (v is not None and k in parent_flags and k in self.configs.saved_data
+                    and v != self.configs.saved_data.get(k)):
+                self.configs.saved_data[k] = v
+
+        data_dir = self.configs.saved_data["data_dir"]
+        log_dir = self.configs.saved_data["log_dir"]
+        self.configs.save_configs()
+
+        if not os.path.isdir(data_dir):
+            os.makedirs(data_dir)
+        if not os.path.isdir(log_dir):
+            os.makedirs(log_dir)
+
+        self.script = ScriptProcessManager(log_dir, data_dir)
+
+    # Check and validate the flags regarding the secure deployment of the node.
+    # Check whether the certs files are present or not.
+    # Create certs if it is 1-node cluster throw error otherwise.
+    def validate_security_configs(self, args):
+        home_dir = os.path.expanduser("~")
+        default_base_dir = os.path.join(home_dir, "var")
+        base_dir = os.path.abspath(args.base_dir) if args.base_dir else default_base_dir
+
+        default_certs_dir = os.path.join(base_dir, "certs")
+
+        certs_dir = self.configs.saved_data.get("certs_dir") or \
+                    default_certs_dir
+
+        has_errors = False
+
+        certs_files = ["ca.crt", "node."+args.advertise_address+".crt",
+                    "node."+args.advertise_address+".key"]
+
+        if args.certs_dir is not None:
+            args.certs_dir = os.path.expanduser(args.certs_path)
+
+            if not os.path.exists(args.certs_dir):
+                # Case Scenario: When the directory provided by the user through
+                # --certs_dir flag in CLI does not exists.
+                has_errors = True
+                Output.print_out(Output.make_red("ERROR") +
+                    ": Trying to use {} as the certs directory. ".format(args.certs_dir) +
+                    "No such directory found. Please provide the correct directory " +
+                    "where the certificates are through --certs_dir flag.")
+            else:
+                if not check_files_in_path(args.certs_dir, certs_files):
+                    # Case Scenario: When the directory provided by the user through --certs_dir
+                    # flag in CLI exists but doesn't have the correct certs.
+                    has_errors = True
+                    Output.print_out(Output.make_red("ERROR") +
+                        ": Trying to use {} as the certs ".format(args.certs_dir) +
+                        "directory. Correct certs not found in this directory. Please " +
+                        "either use 'cert generate_server_certs' command to create " +
+                        "certificates or follow this doc to create your own " +
+                        "certificates: {}".format(GENERATE_SERVER_CERTS))
+                else:
+                    # Case Scenario: When the directory provided by the user through
+                    # --certs_dir flag in CLI exists and have the correct certs.
+                    Output.log("Found certs at {}.".format(args.certs_dir))
+        else:
+            if os.path.exists(certs_dir):
+                if not check_files_in_path(certs_dir, certs_files):
+                    # Case Scenario: When the default certs directory or the certs directory saved
+                    # in conf file exists but doesn't have the correct certs.
+                    has_errors = True
+                    Output.print_out(Output.make_red("ERROR") +
+                        ": Trying to use {} as the certs ".format(certs_dir) +
+                        "directory. Correct certs not found in this directory. Please " +
+                        "either use 'cert generate_server_certs' command to create " +
+                        "certificates or follow this doc to create your own " +
+                        "certificates: {}".format(GENERATE_SERVER_CERTS))
+                else:
+                    # Case Scenario: When the default certs directory or the certs directory saved
+                    # in conf file exists and has the correct certs.
+                    Output.log("Found certs at {}.".format(certs_dir))
+            else:
+                if certs_dir != default_certs_dir:
+                    # Case Scenario: When the certs directory is mentioned in the configs
+                    # file but the directory doesn't exist.
+                    # Example: When the user starts a secure cluster, then stops it.
+                    # Then due to some reason the certs directory that was being used has
+                    # been deleted. Now when the user tries to restart the node,
+                    # yugabyted will try to use the same dir as it was stored in the config file,
+                    # but the directory doesn't exist.
+                    has_errors = True
+                    Output.print_out(Output.make_red("ERROR") +
+                        ": The directory mentioned in the --cert_dir value of the configs file " +
+                        "doen't exist. Please create the directory and copy the certs into that " +
+                        "directory.")
+                elif args.join:
+                    # Case Scenario: When the user is trying to start and join a node
+                    # to a secure cluster but the generated certs are neither present
+                    # in the default directory nor given through --certs_dir flag.
+                    has_errors = True
+                    Output.print_out(Output.make_red("ERROR") +
+                        ": Trying to start a secure node but couldn't find the certs at " +
+                        "default directory. Cannot create new certs as the --join flag " +
+                        "was used. Please generate the node certificates in 1 node and " +
+                        "copy them to other nodes.")
+                else:
+                    # Case Scenario: When the user is trying to start a secure node but
+                    # the generated certs are neither present in default directory nor
+                    # given through --certs_dir flag. Create new certs in this case.
+                    Output.log("Couldn't find the certs so creating new certificates.")
+                    if self.check_openssl():
+                        has_errors = True
+                        Output.print_out(Output.make_red("Error") + ": openssl " +
+                            "not installed. Can't create certificates.")
+
+                    if not has_errors:
+                        gen_certs_dir = self.configs.saved_data.get("gen_certs_dir")
+                        root_certs_dir = os.path.join(gen_certs_dir, "root-ca")
+
+                        if not self.generate_ca_certs(root_certs_dir=root_certs_dir):
+                            has_errors = True
+                            Output.print_out(Output.make_red("Error") +
+                                "Cert generation failed. Please check the logs.")
+
+                        hostnames = [args.advertise_address]
+                        generated_certs_hostnames = self.generate_node_server_certs(
+                                            hostnames=hostnames, gen_certs_dir=gen_certs_dir)
+                        if not has_errors and not len(generated_certs_hostnames):
+                            has_errors = True
+                            Output.print_out(Output.make_red("Error") +
+                                "Cert generation failed. Please check the logs.")
+
+                        if not has_errors:
+                            os.makedirs(certs_dir)
+
+                            for file in certs_files:
+                                shutil.copy2(os.path.join(gen_certs_dir, args.advertise_address,
+                                                            file), certs_dir)
+
+            args.certs_dir = certs_dir
+
+
+
+        if has_errors:
+            sys.exit(1)
+
+    # Find the correct security nature of the deployment of the node by checking
+    # secure or insecure flags passed by the user and secure and insecure options
+    # present in the config file
+    def find_security_nature_of_deployment(self, args):
+        if args.secure and not args.insecure:
+            # If --secure flag is passed in the CLI and --insecure is not. Node should be
+            # deployed in secure mode.
+            args.secure = True
+            args.insecure = False
+            return
+
+        if args.insecure and not args.secure:
+            # If --insecure flag is passed in the CLI and --secure is not. Node should be
+            # deployed in insecure mode.
+            args.secure = False
+            args.insecure = True
+            return
+
+        if args.secure and args.insecure:
+            # If both --secure and --insecure flags are passed in the CLI, show an error.
+            Output.log_error_and_exit(Output.make_red("ERROR") +
+                ": --secure flag can't be used together with --insecure flag")
+
+        if not self.configs.saved_data.get("secure"):
+            # If neither --secure nor --insecure flag is passed in the CLI and the value
+            # of --secure in conf file is False then start the node in insecure mode
+            args.secure = False
+            args.insecure = True
+            return
+
+        if not self.configs.saved_data.get("insecure"):
+            # If neither --secure nor --insecure flag is passed in the CLI and value of
+            # --insecure in conf file is False and --secure is True then start
+            # the node in secure mode
+            args.secure = True
+            args.insecure = False
+            return
+
+        # If neither --secure nor --insecure flag and both --secure and --insecure have
+        # values in conf file have value as True, show an error.
+        Output.log_error_and_exit(Output.make_red("ERROR") +
+            ": config file {} has both secure and ".format(self.conf_file) +
+            "insecure set to True. Please change one of them to False")
+
+    # Parse config file and input args. Validate them and save any new configs.
+    def validate_and_set_configs(self, args):
+
+        has_errors = False
+
         if args.parser == "collect_logs":
             self.configs.temp_data["collect_logs_stdout"] = args.stdout
 
-        if args.parser == "configure":
+        if args.parser == "data_placement":
             if args.fault_tolerance is not None:
                 if args.fault_tolerance.lower() in FAULT_TOLERANCE_CHOICES:
                     self.configs.temp_data["fault_tolerance"] = args.fault_tolerance.lower()
@@ -1997,8 +2883,8 @@ class ControlScript(object):
                         "Please specify one of the following - zone, region or cloud ".format(
                             args.fault_tolerance.lower()))
 
-            if args.data_placement_constraint is not None:
-                data_constraints = args.data_placement_constraint.split(",")
+            if args.constraint_value is not None:
+                data_constraints = args.constraint_value.split(",")
                 has_errors = False
                 for constraint in data_constraints:
                     cloud_info = constraint.split(".")
@@ -2011,37 +2897,58 @@ class ControlScript(object):
 
                 if has_errors:
                     Output.print_out(
-                        "Incorrect value specified for data_placement_constraint. " +
+                        "Incorrect value specified for constraint_value. " +
                         "Please specify comma sperated value with format " +
                         "- cloudprovider.region.zone".format(
-                            args.data_placement_constraint))
+                            args.constraint_value))
                 else:
                     self.configs.temp_data[
-                        "data_placement_constraint"] = args.data_placement_constraint
+                        "constraint_value"] = args.constraint_value
 
             if args.rf is not None:
                 self.configs.temp_data["replication_factor"] = str(args.rf)
             else:
                 self.configs.temp_data["replication_factor"] = str("3")
 
-        if args.parser == "start":
-            if args.data_dir is not None:
-                config_data_dir = self.configs.saved_data.get("data_dir")
-                if (config_data_dir and os.path.exists(config_data_dir) and
-                        config_data_dir != args.data_dir):
+        if args.parser == "generate_server_certs":
+            if args.hostnames is None:
+                has_errors = True
+                Output.print_and_log(Output.make_red("Error") + ": Please provide the " +
+                    "--hostnames along with \'yugabyted cert generate_server_certs\' command.")
+            else:
+                hostnames = args.hostnames.split(",")
+                invalid_hostnames = self.get_invalid_ips(hostnames)
+                if invalid_hostnames:
+                    if len(invalid_hostnames) > 1:
+                        msg = Output.make_red("ERROR") + ": Hostnames {} are not valid IPv4 or "\
+                            "IPv6 addresses. Please try again with valid "\
+                            "hostnames.".format(",".join(invalid_hostnames))
+                    else:
+                        msg = Output.make_red("ERROR") + ": Hostname {} is not a valid IPv4 or "\
+                            "IPv6 address. Please try again with valid "\
+                            "hostnames.".format(",".join(invalid_hostnames))
+
                     has_errors = True
-                    # TODO: Gradefully handle this case... User should be able to override config.
-                    Output.print_out(
-                        "Data directory already exists at {}.".format(config_data_dir))
+                    Output.print_and_log(msg)
 
-            if args.log_dir is not None:
-                config_log_dir = self.configs.saved_data.get("log_dir")
-                if (config_log_dir and os.path.exists(config_log_dir) and
-                        config_log_dir != args.log_dir):
-                    Output.print_out(
-                        "Old log directory already exists at {}. New logs will go to {}".format(
-                            config_log_dir, args.log_dir))
+            self.configs.temp_data["hostnames"] = args.hostnames
 
+        if args.parser == "encrypt_at_rest":
+            if not args.enable and not args.disable:
+                has_errors = True
+                Output.print_out(Output.make_red("ERROR") +
+                    ": Either --enable or --disable flag has to be provided.")
+
+            if args.enable and args.disable:
+                has_errors = True
+                Output.print_out(Output.make_red("ERROR") +
+                    ": --enable and --disable flags cannot be used together.")
+            elif args.enable:
+                self.configs.temp_data["enable_encrypt_at_rest"] = args.enable
+            elif args.disable:
+                self.configs.temp_data["disable_encrypt_at_rest"] = args.disable
+
+        if args.parser == "start":
             if args.cloud_location is not None:
                 cloud_location = args.cloud_location.split(".")
                 if len(cloud_location) == 3:
@@ -2072,8 +2979,27 @@ class ControlScript(object):
                     has_errors = True
                 args.advertise_address = args.listen
 
-            if args.advertise_address is None and OS_NAME == "Linux":
-                args.advertise_address = self.find_ip_address_of_node()
+            if args.advertise_address is None:
+                if not self.configs.saved_data.get("advertise_address"):
+                    if OS_NAME == "Linux":
+                        # Case Scenario: When advertise_address has no value in conf file
+                        # and the OS is Linux, set the advertise address to the private IP
+                        # of the machine.
+                        args.advertise_address = self.find_ip_address_of_node()
+                    else:
+                        # Case Scenario: When advertise_address has no value in conf file
+                        # and the OS is Mac, set the advertise address to 127.0.0.1.
+                        args.advertise_address = IP_LOCALHOST
+                else:
+                    # Case Scenario: When advertise_address has a value in conf file and then
+                    # use that regardless of the OS.
+                    args.advertise_address = self.configs.saved_data.get("advertise_address")
+            else:
+                if not self.validate_hostname_ip(args.advertise_address):
+                    has_errors = True
+                    Output.print_and_log(Output.make_red("ERROR") + ": --advertise_address " +
+                        "provided is not a valid IPv4 or IPv6 address. " +
+                        "Please try again with a valid IP.")
 
             if args.daemon is not None:
                 if args.background is not None and \
@@ -2087,36 +3013,59 @@ class ControlScript(object):
             if args.background is None:
                 args.background = "True"
 
-            if args.secure and args.insecure:
+            if args.join is not None:
+                try:
+                    leaderMasterURL = "http://{}:7000/api/v1/varz".format(args.join)
+                    response = urlopen(Request(leaderMasterURL))
+                except HTTPError as http_err:
+                    Output.log("HTTP Error occured while hitting the api endpoint " +
+                        "http://{}:7000/api/v1/varz: {}".format(args.join, http_err))
+                    Output.log_error_and_exit(Output.make_red("ERROR:") + "master at the join ip " +
+                        "provided is not reachable.")
+                except Exception as err:
+                    Output.log("Error occured while hitting the api endpoint " +
+                        "http://{}:7000/api/v1/varz: {}".format(args.join, err))
+                    Output.log_error_and_exit(Output.make_red("ERROR:") + "master at the join ip " +
+                        "provided is not reachable.")
+
+
+            self.find_security_nature_of_deployment(args)
+
+            if (args.certs_dir is not None) and (not args.secure):
+                # Case Sceneario: When certs_dir flag is passed without secure flag.
                 has_errors = True
                 Output.print_out(Output.make_red("ERROR") +
-                    ": --secure flag can't be used together with --insecure flag")
-
-            if args.certs_dir is not None:
-                if not args.secure:
-                    has_errors = True
-                    Output.print_out(Output.make_red("ERROR") +
-                        ": --certs_dir flag needs to be accompanied with the --secure flag.")
+                    ": --certs_dir flag needs to be accompanied with the --secure flag.")
 
             if args.insecure:
-                args.secure=False
+                if args.join:
+                    master_hostport = "{}:7000".format(args.join)
+                    if self.is_leader_master_secure(master_hostport):
+                        # Case Scenario: When a User starts the 1st node in secure mode and tries
+                        # to start the second node in insecure mode
+                        has_errors = True
+                        Output.print_out(Output.make_red("ERROR") + ": The node whose " +
+                            "IP was provided in --join flag has SSL/TLS enabled. Cannot join a " +
+                            "secure and an insecure node.")
             elif args.secure:
-                if args.certs_dir is None:
-                    has_errors = True
-                    Output.print_out(Output.make_red("ERROR") +
-                        ": --secure flag needs to be accompanied with the path " +
-                            "to the certificates using the --certs_dir")
-                elif not os.path.exists(args.certs_dir):
-                    has_errors = True
-                    Output.print_out(Output.make_red("ERROR") +
-                        ": certs directory provided does not exist.")
+                if args.join:
+                    master_hostport = "{}:7000".format(args.join)
+                    if not self.is_leader_master_secure(master_hostport):
+                        # Case Scenario: When the user starts the 1st node in insecure mode and
+                        # tries to start the second node in secure mode.
+                        has_errors = True
+                        Output.print_out(Output.make_red("ERROR") + ": The node whose " +
+                            "IP was provided --join flag does not have SSL/TLS enabled. Cannot " +
+                            "join a secure and an insecure node.")
 
-                args.insecure=False
-                args.ysql_enable_auth="true"
-                args.use_cassandra_authentication="true"
-                if args.certs_dir:
+                if not has_errors:
+                    self.validate_security_configs(args)
+
+                    args.ysql_enable_auth="true"
+                    args.use_cassandra_authentication="true"
+
                     self.configs.saved_data["ca_cert_file_path"] = os.path.join(args.certs_dir,
-                                                                        "ca.crt")
+                                                                                    "ca.crt")
 
             args.ui = self.parse_bool(args.ui)
             args.background = self.parse_bool(args.background)
@@ -2150,12 +3099,12 @@ class ControlScript(object):
             #     Output.print_out('WARNING: UI disabled - Unable to download ui binaries.')
             #     args.ui = False
 
-            if args.ui and not self.java_installed():
-                Output.print_out('WARNING: UI disabled - Java 1.8 or higher is required.')
-                args.ui = False
+            # if args.ui and not self.java_installed():
+            #     Output.print_out('WARNING: UI disabled - Java 1.8 or higher is required.')
+            #     args.ui = False
 
             self.configs.temp_data["background"] = args.background
-            self.configs.temp_data["ui"] = args.ui
+            self.configs.saved_data["ui"] = args.ui
             self.configs.temp_data["initial_scripts_dir"] = args.initial_scripts_dir
 
         if self.configs.saved_data.get("database_password") is not None:
@@ -2164,23 +3113,12 @@ class ControlScript(object):
         if has_errors:
             sys.exit(1)
 
+        parent_flags = ["config", "log_dir", "data_dir"]
         # Override configs and defaults with user specified variables
         for k, v in get_kv(args.__dict__):
-            if (v is not None and k in self.configs.saved_data
+            if (v is not None and k not in parent_flags and k in self.configs.saved_data
                     and v != self.configs.saved_data.get(k)):
                 self.configs.saved_data[k] = v
-
-        data_dir = self.configs.saved_data["data_dir"]
-        log_dir = self.configs.saved_data["log_dir"]
-        if args.parser == "start":
-            self.configs.save_configs()
-
-            if not os.path.isdir(data_dir):
-                os.makedirs(data_dir)
-            if not os.path.isdir(log_dir):
-                os.makedirs(log_dir)
-
-        self.script = ScriptProcessManager(log_dir, data_dir)
 
 
     def parse_bool(self, config):
@@ -2200,6 +3138,8 @@ class ControlScript(object):
         common_parser.add_argument(
             "--base_dir", help="Directory under which {} will store data, conf and logs".format(
                 SCRIPT_NAME), metavar="")
+        common_parser.add_argument(
+            "--log_dir", help="Directory to store {} logs.".format(SCRIPT_NAME), metavar="")
 
         start_msg = "To start YugabyteDB cluster, run '{}'.\n\n".format(
             Output.make_green("{} start".format(SCRIPT_NAME)))
@@ -2214,8 +3154,7 @@ class ControlScript(object):
                 ("destroy", "Destroy YugabyteDB cluster and remove data."),
                 ("status", "Print status of YugabyteDB cluster."),
                 ("version", "Release version of YugabyteDB cluster."),
-                ("collect_logs", "Collect and package logs for troubleshooting."),
-                ("configure", "Configure multi-zone/multiregion cluster")):
+                ("collect_logs", "Collect and package logs for troubleshooting.")):
             example = ""
             if EXAMPLE[cmd]:
                 example = Output.make_yellow("Examples") + ": \n" + EXAMPLE[cmd]
@@ -2254,6 +3193,28 @@ class ControlScript(object):
             subparser.set_defaults(func=func)
             all_parsers[parser_name] = subparser
 
+        # Add cert generation options
+        example = Output.make_yellow("Examples") + ": \n" + EXAMPLE["cert"]
+        cert_parser = subparsers.add_parser("cert", description=example,
+                                                help="Generate SSL cerificates")
+        all_parsers["cert"] = cert_parser
+        cert_subparsers = cert_parser.add_subparsers(dest="parser", metavar="")
+        cert_subparsers.required = True
+        for cmd, description in (
+                ("generate_server_certs", "Generate node server certificates."),):
+            subparser = cert_subparsers.add_parser(cmd, help=description, parents=[common_parser])
+            parser_name = "cert_" + cmd
+            func = getattr(self, parser_name, None)
+            subparser.set_defaults(func=func)
+            all_parsers[parser_name] = subparser
+
+        # Generate node server certs of given hostname
+        for cmd in ("cert_generate_server_certs",):
+            cur_parser = all_parsers[cmd]
+            cur_parser.add_argument(
+                "--hostnames", help="Hostnames of the nodes to be added in the cluster. " +
+                "Mandatory flag.", metavar="")
+
         # Docker: Redirect the logs.tar.gz to stdout
         for cmd in ("collect_logs",):
             cur_parser = all_parsers[cmd]
@@ -2262,26 +3223,59 @@ class ControlScript(object):
                 "docker exec <container-id> bin/yugabyted collect_logs --stdout > yugabyted.tar.gz",
                 action="store_true", default=False)
 
-        # Commands that can change muti-zone/multi-region configuration.
-        for cmd in ("configure",):
+        example = Output.make_yellow("Examples") + ": \n" + EXAMPLE["configure"]
+        configure_parser = subparsers.add_parser("configure", description=example,
+                                                help="Configure data placement or " +
+                                                "toggle encryption at rest for " +
+                                                "the cluster.", parents=[common_parser])
+        all_parsers["configure"] = configure_parser
+        configure_subparsers = configure_parser.add_subparsers(dest="parser", metavar="")
+        configure_subparsers.required = True
+        for cmd, description in (
+                ("data_placement", "Configure multi-zone/multi-region cluster."),
+                ("encrypt_at_rest", "Enable or disable encryption at rest."),):
+            example = ""
+            if EXAMPLE[cmd]:
+                example = Output.make_yellow("Examples") + ": \n" + EXAMPLE[cmd]
+            subparser = configure_subparsers.add_parser(cmd, help=description, description=example,
+                                parents=[common_parser])
+            parser_name = "configure_" + cmd
+            func = getattr(self, parser_name, None)
+            subparser.set_defaults(func=func)
+            all_parsers[parser_name] = subparser
+
+        # Flags for muti-zone/multi-region configuration.
+        for cmd in ("configure_data_placement",):
             cur_parser = all_parsers[cmd]
             cur_parser.add_argument(
                 "--fault_tolerance", help="No more than 1 node in the same " +
                 "fault tolerance can be a master",
                 metavar="")
             cur_parser.add_argument(
-                "--data_placement_constraint", help="Data placement constriant to be applied " +
+                "--constraint_value", help="Data placement constriant to be applied " +
                 "on the YugabyteDB Cluster",
                 metavar="")
             cur_parser.add_argument(
                 "--rf", help="Set the replication factor for each tablet",
                 metavar="")
 
+        # Flags for encryption at rest
+        for cmd in ("configure_encrypt_at_rest",):
+            cur_parser = all_parsers[cmd]
+            cur_parser.add_argument(
+                "--enable", help="Enable encryption at rest for the cluster. No need to set a " +
+                "value for the flag. Use --enable or --disable flag to toggle encryption " +
+                "features on a YugabyteDB cluster.",
+                action="store_true")
+            cur_parser.add_argument(
+                "--disable", help="Disable encryption at rest for the cluster. No need to set a " +
+                "value for the flag. Use --enable or --disable flag to toggle encryption " +
+                "features on a YugabyteDB cluster.",
+                action="store_true")
+
         # Commands that can alter configuration file.
         for cmd in ("start",):
             cur_parser = all_parsers[cmd]
-            cur_parser.add_argument(
-                "--log_dir", help="Directory to store {} logs.".format(SCRIPT_NAME), metavar="")
             cur_parser.add_argument(
                 "--ycql_port", help=argparse.SUPPRESS)
             cur_parser.add_argument(
@@ -2306,11 +3300,17 @@ class ControlScript(object):
                 "--join", help="IP address to which this process will join".format(SCRIPT_NAME),
                 metavar="")
             cur_parser.add_argument(
-                "--secure", help="Start the cluster in a secure manner", action="store_true",
-                    default=None)
+                "--secure", help="Start a YugabyteDB cluster in secure mode with encryption in " +
+                "transit and password authentication enabled. No need to set a value for the " +
+                "flag. Use --secure or --insecure flag to toggle security features on a " +
+                "YugabyteDB cluster.",
+                action="store_true", default=None)
             cur_parser.add_argument(
-                "--insecure", help="Start the cluster in an insecure manner", action="store_true",
-                    default=None)
+                "--insecure", help="Start a YugabyteDB cluster in an insecure mode without " +
+                "encryption in transit and password authentication enabled. For non-production " +
+                "use only, not to be used without firewalls blocking the internet traffic. No " +
+                "need to set a value for the flag. Use --secure or --insecure flag to toggle " +
+                "security features on a YugabyteDB cluster.", action="store_true", default=None)
             cur_parser.add_argument(
                 "--certs_dir", help="Path to the certificates to be used for secure deployment.",
                 metavar="")
@@ -2325,7 +3325,7 @@ class ControlScript(object):
                 help=argparse.SUPPRESS)
             cur_parser.add_argument(
                 "--ui", choices=BOOL_CHOICES, default="true", metavar="",
-                help="Toggle enabling or disabling webserver UI. Default false.")
+                help="Toggle enabling or disabling webserver UI. Default true.")
             cur_parser.add_argument(
                 "--ysql_enable_auth", choices=BOOL_CHOICES,
                 help=argparse.SUPPRESS)
@@ -2354,9 +3354,11 @@ class ControlScript(object):
             parser.print_help()
             return
 
-
         args = parser.parse_args()
-        self.validate_and_set_configs(args)
+        self.validate_and_set_parent_configs(args)
+        # Yugabyted command currently being processed is required for
+        # generating the status string.
+        self.configs.temp_data["yugabyted_cmd"] = args.parser
 
         log_dir = self.configs.saved_data.get("log_dir")
         if not os.path.exists(log_dir):
@@ -2371,9 +3373,17 @@ class ControlScript(object):
         Output.log("cmd = {} using config file: {} (args.config={})".format(
             args.parser, self.conf_file, args.config))
 
+        # Initialize the script path of openssl_proxy.sh
+        OpenSSLProxy.init()
+
+        # Initialize the binary path of ybadmin
+        YBAdminProxy.init()
+
+        self.validate_and_set_configs(args)
+
         # Initialize the binary path of ybadmin
         # TODO(Sanket): Clean up and refactor this file
-        YBAdminProxy.init(self.configs.saved_data.get("master_flags"), \
+        YBAdminProxy.set_certs_dir(self.configs.saved_data.get("master_flags"), \
             self.configs.saved_data.get("secure"), self.configs.saved_data.get("certs_dir"))
 
         try:
@@ -2450,13 +3460,14 @@ class Configs(object):
         self.saved_data = {
             "data_dir": os.path.join(base_dir, "data"),
             "log_dir": os.path.join(base_dir, "logs"),
+            "gen_certs_dir": os.path.join(base_dir, "generated_certs"),
             "master_rpc_port": DEFAULT_MASTER_RPC_PORT,
             "tserver_rpc_port": DEFAULT_TSERVER_RPC_PORT,
             "master_webserver_port": DEFAULT_MASTER_WEBSERVER_PORT,
             "tserver_webserver_port": DEFAULT_TSERVER_WEBSERVER_PORT,
             "ysql_port": DEFAULT_YSQL_PORT,
             "ycql_port": DEFAULT_YCQL_PORT,
-            "advertise_address": DEFAULT_BIND_IP,
+            "advertise_address": "",
             "webserver_port": DEFAULT_WEBSERVER_PORT,
             "yugabyted_ui_port": DEFAULT_YUGABYTED_UI_PORT,
             "universe_uuid": str(uuid.uuid4()),
@@ -2476,20 +3487,24 @@ class Configs(object):
             "fault_tolerance": DEFAULT_START_FAULT_TOLERANCE,
             "secure": False,
             "insecure": True,
-            "certs_dir": "",
+            "certs_dir": os.path.join(base_dir, "certs"),
             "ca_cert_file_path": "",
             "database_password": None,
+            "current_masters": "",
+            "ui": True,
         }
         # Used to store data specific to certain functions that we don't want to save.
         self.temp_data = {
             "demo_db": DEFAULT_DEMO_DATABASE,
             "background": True,
-            "ui": True,
             "initial_scripts_dir": "",
             "collect_logs_stdout": False,
-            "data_placement_constraint": "",
-            "fault_tolerance": DEFAULT_FAULT_TOLERANCE,
+            "constraint_value": "",
             "replication_factor":"",
+            "fault_tolerance": DEFAULT_FAULT_TOLERANCE,
+            "hostnames": "",
+            "enable_encrypt_at_rest": False,
+            "disable_encrypt_at_rest": False,
         }
         self.config_file = config_file
 
@@ -2509,6 +3524,11 @@ class Configs(object):
             except ValueError as e:
                 Output.log_error_and_exit(
                     "Failed to read config file {}: {}".format(config_file, str(e)))
+
+        paths = ["data_dir", "log_dir", "certs_dir", "gen_certs_dir", "ca_cert_file_path"]
+        for k, v in configs.saved_data.items():
+            if v is not None and k in paths:
+                configs.saved_data[k] = os.path.expanduser(v)
 
         return configs
 
@@ -2863,9 +3883,11 @@ class YBAdminProxy(object):
     cmd_args = []
 
     @staticmethod
-    def init(master_flags, secure, certs_dir):
+    def init():
         YBAdminProxy.cmd_args.append(find_binary_location("yb-admin"))
 
+    @staticmethod
+    def set_certs_dir(master_flags, secure, certs_dir):
         # If the user is attempting to use TLS, let's point yb-admin to
         # the same certs dir as the master
         if secure:
@@ -2938,6 +3960,7 @@ class YBAdminProxy(object):
         cluster_config = YBAdminProxy.get_cluster_config(master_addrs)
         if cluster_config:
             if "replicationInfo" in cluster_config:
+
                 return cluster_config["replicationInfo"]["liveReplicas"]["numReplicas"]
             else:
                 return 1
@@ -2946,9 +3969,9 @@ class YBAdminProxy(object):
 
     # Returns the cluster config for this universe
     @staticmethod
-    def get_cluster_config(master_addrs):
+    def get_cluster_config(master_addrs, timeout=10):
         cmd = YBAdminProxy.cmd_args + ["--master_addresses", master_addrs, "get_universe_config"]
-        out, err, ret_code = run_process(cmd)
+        out, err, ret_code = run_process(cmd, timeout=timeout, log_cmd=True)
         if ret_code:
             return None
         try:
@@ -2972,7 +3995,6 @@ class YBAdminProxy(object):
     # Sets placement info
     @staticmethod
     def modify_placement_info(master_addrs, placement_locations, replication_factor, timeout=10):
-
         if not replication_factor:
             replication_factor = "3"
 
@@ -2980,6 +4002,50 @@ class YBAdminProxy(object):
                 placement_locations, replication_factor]
         out, err, ret_code = run_process(cmd, timeout=timeout, log_cmd=True)
         return (ret_code == 0)
+
+    # Copy universe key to all masters for encryption at rest
+    @staticmethod
+    def copy_key_to_masters(master_addrs, key_id, key_path, timeout=10):
+        cmd = YBAdminProxy.cmd_args + ["-master_addresses", master_addrs,
+            "add_universe_key_to_all_masters", key_id, key_path]
+        out, err, ret_code = run_process(cmd, timeout=timeout, log_cmd=True)
+        return (ret_code == 0)
+
+    # Check if universe key has been copied to all masters for encryption at rest
+    @staticmethod
+    def check_key_in_masters(master_addrs, key_id, timeout=10):
+        cmd = YBAdminProxy.cmd_args + ["-master_addresses", master_addrs,
+            "all_masters_have_universe_key_in_memory", key_id]
+        out, err, ret_code = run_process(cmd, timeout=timeout, log_cmd=True)
+        if 0 != ret_code:
+            return []
+        out = out.splitlines()
+        return out
+
+    # Enable encryption at rest by start using the key in masters
+    @staticmethod
+    def enable_encryption_using_key(master_addrs, key_id, timeout=10):
+        cmd = YBAdminProxy.cmd_args + ["-master_addresses", master_addrs,
+            "rotate_universe_key_in_memory", key_id]
+        out, err, ret_code = run_process(cmd, timeout=timeout, log_cmd=True)
+        return (ret_code == 0)
+
+    # Disable encryption at rest
+    @staticmethod
+    def disable_encryption(master_addrs, timeout=10):
+        cmd = YBAdminProxy.cmd_args + ["-master_addresses", master_addrs, "disable_encryption"]
+        out, err, ret_code = run_process(cmd, timeout=timeout, log_cmd=True)
+        return (ret_code == 0)
+
+    # Check if universe key has been copied to all masters for encryption at rest
+    @staticmethod
+    def check_encryption(master_addrs, timeout=10):
+        cmd = YBAdminProxy.cmd_args + ["-master_addresses", master_addrs, "is_encryption_enabled"]
+        out, err, ret_code = run_process(cmd, timeout=timeout, log_cmd=True)
+        if 0 != ret_code:
+            return None
+        return out
+
 
 # Proxy for ysqlsh commands.
 class YsqlProxy(object):
@@ -3072,7 +4138,13 @@ class YsqlProxy(object):
     def try_update_password(self, new_password, user_to_update=DEFAULT_YSQL_USER):
         cmd = self.cmd_with_password + \
             ["-c", "alter role {} password '{}';".format(user_to_update, new_password)]
-        out, err, retcode = run_process(cmd=cmd, log_cmd=True, env_vars=self.env)
+
+        encrypted_password = "*" * len(new_password)
+        encrypted_cmd = self.cmd_with_password + \
+            ["-c", "alter role {} password '{}';".format(user_to_update, encrypted_password)]
+
+        out, err, retcode = run_process(cmd=cmd, encrypted_cmd=encrypted_cmd, log_cmd=True,
+                env_vars=self.env)
         if (retcode != 0):
             raise RetryableError
 
@@ -3148,7 +4220,13 @@ class YcqlProxy(object):
     def try_update_password(self, new_password, user_to_update=DEFAULT_YCQL_USER):
         cmd = self.cmd + ["-u", self.username, "-p", self.password, "-e",
                 "ALTER ROLE {} WITH PASSWORD = '{}';".format(user_to_update, new_password)]
-        out, err, retcode = run_process(cmd=cmd, log_cmd=True, env_vars=os.environ.copy())
+
+        encrypted_password = "*" * len(new_password)
+        encrypted_cmd = self.cmd + ["-u", self.username, "-p", self.password, "-e",
+                "ALTER ROLE {} WITH PASSWORD = '{}';".format(user_to_update, encrypted_password)]
+
+        out, err, retcode = run_process(cmd=cmd, encrypted_cmd=encrypted_cmd, log_cmd=True,
+                env_vars=os.environ.copy())
         if (retcode != 0):
             raise RetryableError
 
@@ -3187,6 +4265,44 @@ class YcqlProxy(object):
         else:
             Output.log("YCQL Connection Info - {}".format(out))
             return True
+
+
+# Proxy for creating ssl certificates and keys using openssl
+class OpenSSLProxy(object):
+    cmd_args = []
+
+    @staticmethod
+    def init(path=None):
+        if path is None:
+            path = find_binary_location("openssl_proxy.sh")
+
+        OpenSSLProxy.cmd_args = [path]
+
+    # Generate root ca certificates
+    @staticmethod
+    def generate_root_ca_certs(root_certs_dir, timeout=60):
+        cmd = OpenSSLProxy.cmd_args + ['generate-ca', '-rcp', root_certs_dir]
+        out, err, ret = run_process(cmd, timeout=timeout, log_cmd=True)
+
+        return (0 == ret)
+
+    # Generate node server certificates
+    @staticmethod
+    def generate_node_server_certs(root_certs_dir, server_cert_dir, hostname, timeout=60):
+        cmd = OpenSSLProxy.cmd_args + ['generate-server-cert', '-rcp', root_certs_dir,
+            '-scp', server_cert_dir, '-hn', hostname]
+        out, err, ret = run_process(cmd, timeout=timeout, log_cmd=True)
+
+        return (0 == ret)
+
+    # Generate universe key for encryption-at-rest
+    @staticmethod
+    def generate_key(key_dir, keyname, timeout=60):
+        cmd = OpenSSLProxy.cmd_args + ['generate-key', '-kp', key_dir, '-kn', keyname]
+        out, err, ret = run_process(cmd, timeout=timeout, log_cmd=True)
+
+        return (0 == ret)
+
 
 # Currently unused. Useful for getting diagnostics that are available only through logs.
 class LogAnalyzer(object):
@@ -3588,8 +4704,14 @@ class PrettyHelpFormatter(argparse.RawTextHelpFormatter):
     # Add usage according to the command from which help is called
     def add_usage(self, usage, actions, groups, prefix=None):
         cmd = ('%(prog)s' % dict(prog=self._prog)).split()
-        if len(cmd) > 2 and cmd[1].isalpha() and cmd[-1].isalpha():
-            cmd = cmd[1] + " " +cmd[-1]
+        for cmds in ['[command]', '[flags]']:
+            if cmds in cmd:
+                cmd.remove(cmds)
+        if len(cmd) > 2:
+            temp = ""
+            for cmds in cmd[1:]:
+                temp += cmds + " "
+            cmd = temp.strip()
         else:
             cmd = cmd.pop()
         if prefix is None:
@@ -3636,16 +4758,23 @@ def get_kv(map):
     else:
         return map.items()
 
-def run_process(cmd, timeout=None, log_cmd=False, env_vars=None, shell=False):
+def run_process(cmd, encrypted_cmd=None, timeout=None, log_cmd=False, env_vars=None, shell=False):
     if log_cmd:
-        Output.log("run_process: cmd: {}".format(str(cmd)))
+        if encrypted_cmd:
+            Output.log("run_process: cmd: {}".format(str(encrypted_cmd)))
+        else:
+            Output.log("run_process: cmd: {}".format(str(cmd)))
+
     proc = subprocess.Popen(cmd, stderr=subprocess.PIPE, stdout=subprocess.PIPE,
                             env=env_vars, shell=shell)
     if PY_VERSION >= 3:
         try:
             out, err = proc.communicate(timeout=timeout)
         except subprocess.TimeoutExpired as e:
-            Output.log("run_process: {} timeout expired for command: ".format(cmd))
+            if encrypted_cmd:
+                Output.log("run_process: {} timeout expired for command: ".format(encrypted_cmd))
+            else:
+                Output.log("run_process: {} timeout expired for command: ".format(cmd))
             return None, str(e), -1
     else:
         out, err = proc.communicate()

@@ -6,7 +6,14 @@ import { MetricsFilterHeader } from './MetricsFilterHeader';
 import { ComparisonFilterContextProvider } from './ComparisonFilterContextProvider';
 import { MetricsComparisonContent } from './MetricsComparisonContent';
 
-export const MetricsComparisonModal = ({ selectedUniverse, visible, onHide, origin }) => {
+export const MetricsComparisonModal = ({
+  selectedUniverse,
+  visible,
+  onHide,
+  origin,
+  selectedRegionClusterUUID,
+  isTopKMetricsEnabled
+}) => {
   return (
     <ComparisonFilterContextProvider selectedUniverse={selectedUniverse}>
       <div className="metrics-comparison-modal">
@@ -22,7 +29,11 @@ export const MetricsComparisonModal = ({ selectedUniverse, visible, onHide, orig
           customHeader={<MetricsFilterHeader selectedUniverse={selectedUniverse} origin={origin} />}
           formClassName="metrics-comparison-form"
         >
-          <NodeSelectorHeader universe={selectedUniverse} />
+          <NodeSelectorHeader
+            universe={selectedUniverse}
+            selectedRegionClusterUUID={selectedRegionClusterUUID}
+            isTopKMetricsEnabled={isTopKMetricsEnabled}
+          />
           <MetricsComparisonContent universe={selectedUniverse} visible={visible} />
         </YBModal>
       </div>

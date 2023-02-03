@@ -21,7 +21,8 @@ The following best practices are recommended for production clusters.
 | [Provider and region](#provider-and-region) | Deploy your cluster in a virtual private cloud (VPC), with the same provider and in the same region as your application VPC. YugabyteDB Managed supports AWS and GCP.<br>Multi-region clusters must be deployed in VPCs. You need to create the VPCs before you deploy the cluster. Refer to [VPC network](../cloud-vpcs/). |
 | [Fault tolerance](#fault-tolerance) | Region or Availability zone (AZ) level - minimum of three nodes across multiple regions or AZs, with a replication factor of 3. |
 | [Sizing](#sizing) | For most production applications, at least 3 nodes with 4 to 8 vCPUs per node.<br>Clusters support 10 simultaneous connections per vCPU. For example, a 3-node cluster with 4 vCPUs per node can support 10 x 3 x 4 = 120 connections.<br>When scaling your cluster, for best results increase node size up to 16 vCPUs before adding more nodes. For example, for a 3-node cluster with 4 vCPUs per node, scale up to 8 or 16 vCPUs before adding a fourth node. |
-| [YugabyteDB version](#yugabytedb-version) | Use the **Stable** release track.<!--<br>Use a [staging cluster](#staging-clusters) to test upgrades before upgrading your production cluster.--> |
+| [YugabyteDB version](#yugabytedb-version) | Use the **Stable** release track. |
+| [Staging cluster](#staging-cluster) | Use a staging cluster to test application compatibility with database updates before upgrading your production cluster. |
 | [Backups](#backups) | Use the default backup schedule (daily, with 8 day retention). |
 | [Security and authorization](#security) | YugabyteDB Managed clusters are secure by default. After deploying, set up IP allow lists and add database users to allow clients, applications, and application VPCs to connect. Refer to [IP allow lists](../../cloud-secure-clusters/add-connections/). |
 
@@ -49,7 +50,7 @@ Multi-region clusters are resilient to region-level outages, and are available i
 - **Replicate across regions**. Cluster nodes are deployed across 3 regions, with data replicated synchronously.
 - **Partition by region**. Cluster nodes are deployed in separate regions. Data is pinned to specific geographic regions. Allows fine-grained control over pinning rows in a user table to specific geographic locations.
 - **Cross-cluster**. Two clusters are deployed in separate regions. Data is shared between the clusters, either in one direction, or asynchronously.
-- **Read replica**. Multiple clusters are deployed in separate regions. Data is written in a single region, and copied to the other regions, where it can be read. The primary cluster gets all write requests, while read requests can go either to the primary cluster or to the read replica clusters depending on which is closest.
+- **Read replica**. Replica clusters are deployed in separate regions. Data is written in the primary cluster, and copied to the read replicas, where it can be read. The primary cluster gets all write requests, while read requests can go either to the primary cluster or to the read replica clusters depending on which is closest.
 
 Multi-region clusters must be deployed in VPCs, with each region or read replica deployed in its own VPC. Refer to [VPC networking](../cloud-vpcs/).
 
@@ -72,23 +73,34 @@ For lowest possible network latency and data transfer costs, deploy your cluster
 
 For a list of supported regions, refer to [Cloud provider regions](../../release-notes/#cloud-provider-regions).
 
+#### Instance types
+
+An instance in cloud computing is a server resource provided by third-party cloud services. An instance abstracts physical computing infrastructure using virtual machines. It's similar to having your own server machine in the cloud.
+
+Cloud providers offer a variety of instance types across the regions where they have data centers. By default, where possible, YugabyteDB Managed uses the following instance type families for dedicated clusters:
+
+- AWS - m5
+- GCP - n2-standard
+
+In cases where the default is unavailable in a region, YugabyteDB Managed will fall back to a suitable replacement instance type for all nodes in the cluster.
+
 ### Fault tolerance
 
 The _fault tolerance_ determines how resilient the cluster is to node and cloud zone failures. YugabyteDB Managed provides the following options for providing replication and redundancy:
 
-- **Region level**. Includes 3 nodes spread across multiple regions with a RF of 3. YugabyteDB can continue to do reads and writes even in case of a cloud region failure. This configuration provides the maximum protection for a regional failure.
+- **Region Level**. Includes 3 nodes spread across multiple regions with a [replication factor](../../../architecture/docdb-replication/replication/) (RF) of 3. YugabyteDB can continue to do reads and writes even in case of a cloud region failure. This configuration provides the maximum protection for a regional failure.
 
-- **Availability zone level**. Includes a minimum of 3 nodes spread across multiple availability zones with a [replication factor](../../../architecture/docdb-replication/replication/) (RF) of 3. YugabyteDB can continue to do reads and writes even in case of a cloud availability zone failure. This configuration provides the maximum protection for a data center failure.
+- **Availability Zone Level**. Includes a minimum of 3 nodes spread across multiple availability zones with a RF of 3. YugabyteDB can continue to do reads and writes even in case of a cloud availability zone failure. This configuration provides the maximum protection for a data center failure.
 
-- **Node level**. Includes a minimum of 3 nodes deployed in a single availability zone with a RF of 3. YugabyteDB can continue to do reads and writes even in case of a node failure, but this configuration is not resilient to cloud availability zone outages.
+- **Node Level**. Includes a minimum of 3 nodes deployed in a single availability zone with a RF of 3. YugabyteDB can continue to do reads and writes even in case of a node failure, but this configuration is not resilient to cloud availability zone outages.
 
 Although you can't change the cluster fault tolerance after the cluster is created, you can scale horizontally as follows:
 
-- For Region level, you can add or remove nodes in increments of 1 per region; all regions have the same number of nodes.
-- For Availability zone level, you can add or remove nodes in increments of 3.
-- For Node level, you can add or remove nodes in increments of 1.
+- For Region Level, you can add or remove nodes in increments of 1 per region; all regions have the same number of nodes.
+- For Availability Zone Level, you can add or remove nodes in increments of 3.
+- For Node Level, you can add or remove nodes in increments of 1.
 
-For production clusters, a minimum of Availability zone level is recommended. Whether you choose Region or Availability zone level depends on your application architecture, design, and latency requirements.
+For production clusters, a minimum of Availability Zone Level is recommended. Whether you choose Region or Availability Zone Level depends on your application architecture, design, and latency requirements.
 
 For application development and testing, you can set fault tolerance to **None** to create a single-node cluster. Single-node clusters can't be scaled.
 
@@ -125,12 +137,26 @@ If you need a feature from a preview release (that isn't yet available in a stab
 
 Yugabyte manages upgrades for you. After you choose a track, database upgrades continue to take releases from the track you chose. For multi-node clusters, Yugabyte performs a rolling upgrade without any downtime. You can manage when Yugabyte performs maintenance and upgrades by configuring the [maintenance window](../../cloud-clusters/cloud-maintenance/) for your cluster.
 
-<!-- #### Staging clusters
+### Staging cluster
 
-Yugabyte tests every version in the stable branch for backwards compatibility. However, it's good practice to first test database updates against your pre-production environment (aka development, testing, staging, or canary environment) to ensure compatibility before upgrading your production clusters.
+Use a staging cluster for the following tasks:
 
-Create a staging cluster (this can be smaller than your production cluster) and configure your pre-production environment to connect to it. When you are notified of an upcoming maintenance event, schedule the [maintenance windows](../../cloud-clusters/cloud-maintenance/) for the staging and production cluster so that you can validate updates against your applications in your pre-production environment before updating your production cluster.
--->
+- Verifying that your application is compatible with [database updates](#database-updates).
+- Ensuring that your application correctly handles a rolling restart of the database without errors.
+- Testing new features. Use your staging (also known as development, testing, pre-production, or canary) environment to try out new database features while your production systems are still running a previous version.
+- Testing scaling operations and disaster recovery. Find out how your environment responds to a scaling operation, outages, or the loss of a node.
+
+Create a staging cluster and configure your staging environment to connect to it. The staging cluster can be smaller than your production cluster, but you need to ensure that it has enough resources and capacity to handle a reasonable load. Sandbox clusters are too [resource-limited](../create-clusters/create-clusters-free/#limitations) for staging.
+
+#### Database upgrades
+
+Every YugabyteDB version in the stable track is tested for backwards compatibility. However, before upgrading your production cluster, it's good practice to first test your pre-production environment against database updates to ensure your applications are compatible. You want to make sure that an update doesn't have any performance impact on your application. For example, new functionality or a change in the optimizer could impact performance for a single query in a complex application.
+
+When you are notified of an upcoming maintenance event, schedule the [maintenance windows](../../cloud-clusters/cloud-maintenance/) for the staging and production cluster so that you can validate updates against your applications in your pre-production environment _before_ upgrading your production cluster.
+
+You can also set an [exclusion period](../../cloud-clusters/cloud-maintenance/#set-a-maintenance-exclusion-period) for your production cluster to postpone upgrades while you conduct testing.
+
+If you identify a performance problem or regression with an update, set an exclusion period for your production cluster and contact {{% support-cloud %}}.
 
 ### Backups
 

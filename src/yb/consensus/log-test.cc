@@ -42,6 +42,7 @@
 
 #include "yb/common/wire_protocol.h"
 
+#include "yb/consensus/log.messages.h"
 #include "yb/consensus/log-test-base.h"
 #include "yb/consensus/log_index.h"
 #include "yb/consensus/opid_util.h"
@@ -52,8 +53,9 @@
 #include "yb/util/random.h"
 #include "yb/util/size_literals.h"
 #include "yb/util/stopwatch.h"
+#include "yb/util/flags.h"
 
-DEFINE_int32(num_batches, 10000,
+DEFINE_UNKNOWN_int32(num_batches, 10000,
              "Number of batches to write to/read from the Log in TestWriteManyBatches");
 
 DECLARE_int32(log_min_segments_to_retain);
@@ -66,6 +68,8 @@ namespace yb {
 namespace log {
 
 using std::shared_ptr;
+using std::vector;
+using std::string;
 using consensus::MakeOpId;
 using strings::Substitute;
 
@@ -128,7 +132,7 @@ class LogTest : public LogTestBase {
     header.set_major_version(0);
     header.set_minor_version(0);
     header.set_unused_tablet_id(kTestTablet);
-    SchemaToPB(GetSimpleTestSchema(), header.mutable_schema());
+    SchemaToPB(GetSimpleTestSchema(), header.mutable_deprecated_schema());
 
     LogSegmentFooterPB footer;
     footer.set_num_entries(10);
@@ -713,11 +717,8 @@ TEST_F(LogTest, TestGCWithLogRunning) {
   {
     ReplicateMsgs repls;
     int64_t starting_op_segment_seq_num;
-    yb::SchemaPB schema;
-    uint32_t schema_version;
     Status s = log_->GetLogReader()->ReadReplicatesInRange(
-      1, 2, LogReader::kNoSizeLimit, &repls, &starting_op_segment_seq_num,
-        &schema, &schema_version);
+      1, 2, LogReader::kNoSizeLimit, &repls, &starting_op_segment_seq_num);
     ASSERT_TRUE(s.IsNotFound()) << s.ToString();
   }
 
@@ -1111,15 +1112,12 @@ TEST_F(LogTest, TestReadLogWithReplacedReplicates) {
       auto start_index = RandomUniformInt<int64_t>(gc_index, max_repl_index - 1);
       auto end_index = RandomUniformInt<int64_t>(start_index, max_repl_index);
       int64_t starting_op_segment_seq_num;
-      yb::SchemaPB schema;
-      uint32_t schema_version;
       {
         SCOPED_TRACE(Substitute("Reading $0-$1", start_index, end_index));
         consensus::ReplicateMsgs repls;
         ASSERT_OK(reader->ReadReplicatesInRange(start_index, end_index,
                                                 LogReader::kNoSizeLimit, &repls,
-                                                &starting_op_segment_seq_num,
-                                                &schema, &schema_version));
+                                                &starting_op_segment_seq_num));
         ASSERT_EQ(end_index - start_index + 1, repls.size());
         auto expected_index = start_index;
         for (const auto& repl : repls) {
@@ -1143,8 +1141,7 @@ TEST_F(LogTest, TestReadLogWithReplacedReplicates) {
                                 start_index, end_index, size_limit));
         ReplicateMsgs repls;
         ASSERT_OK(reader->ReadReplicatesInRange(start_index, end_index, size_limit, &repls,
-                                                &starting_op_segment_seq_num,
-                                                &schema, &schema_version));
+                                                &starting_op_segment_seq_num));
         ASSERT_LE(repls.size(), end_index - start_index + 1);
         int total_size = 0;
         auto expected_index = start_index;
@@ -1152,7 +1149,7 @@ TEST_F(LogTest, TestReadLogWithReplacedReplicates) {
           ASSERT_EQ(expected_index, repl->id().index());
           ASSERT_EQ(terms_by_index[expected_index], repl->id().term());
           expected_index++;
-          total_size += repl->SpaceUsed();
+          total_size += repl->SerializedSize();
         }
         if (total_size > size_limit) {
           ASSERT_EQ(1, repls.size());
@@ -1187,12 +1184,9 @@ TEST_F(LogTest, TestReadReplicatesHighIndex) {
   auto* reader = log_->GetLogReader();
   ReplicateMsgs repls;
   int64_t starting_op_segment_seq_num;
-  yb::SchemaPB schema;
-  uint32_t schema_version;
   ASSERT_OK(reader->ReadReplicatesInRange(first_log_index, first_log_index + kSequenceLength - 1,
                                           LogReader::kNoSizeLimit, &repls,
-                                          &starting_op_segment_seq_num,
-                                          &schema, &schema_version));
+                                          &starting_op_segment_seq_num));
   ASSERT_EQ(kSequenceLength, repls.size());
 }
 
@@ -1254,7 +1248,7 @@ namespace {
 
 Status CheckEntryEq(const LogEntries& lhs, const LogEntries& rhs, const size_t entry_idx) {
   SCHECK_EQ(
-      lhs[entry_idx]->DebugString(), rhs[entry_idx]->DebugString(), InternalError,
+      lhs[entry_idx]->ShortDebugString(), rhs[entry_idx]->ShortDebugString(), InternalError,
       Format("entries[$0]", entry_idx));
   return Status::OK();
 }
@@ -1406,7 +1400,7 @@ Result<std::vector<LogTest::Op>> LogTest::GenerateOpsAndAppendToLog(
     for (auto batch_idx = 0; batch_idx < num_batches_per_segment; ++batch_idx) {
       ReplicateMsgs replicates;
       for (int i = 0; i < num_entries_per_batch; i++) {
-        replicates.emplace_back(std::make_shared<ReplicateMsg>());
+        replicates.emplace_back(rpc::MakeSharedMessage<consensus::LWReplicateMsg>());
         auto& replicate = replicates.back();
         current_op_id.ToPB(replicate->mutable_id());
         replicate->set_op_type(NO_OP);

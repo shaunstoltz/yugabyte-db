@@ -30,8 +30,7 @@
 // under the License.
 //
 
-#ifndef YB_MASTER_CATALOG_ENTITY_INFO_H
-#define YB_MASTER_CATALOG_ENTITY_INFO_H
+#pragma once
 
 #include <shared_mutex>
 #include <mutex>
@@ -42,6 +41,7 @@
 #include "yb/common/entity_ids.h"
 #include "yb/common/index.h"
 #include "yb/common/partition.h"
+#include "yb/common/transaction.h"
 
 #include "yb/master/master_client.fwd.h"
 #include "yb/master/master_fwd.h"
@@ -387,6 +387,37 @@ struct PersistentTableInfo : public Persistent<SysTablesEntryPB, SysRowEntryType
     return pb.mutable_schema();
   }
 
+  const std::string& pb_transaction_id() const {
+    static std::string kEmptyString;
+    return pb.has_transaction() ? pb.transaction().transaction_id() : kEmptyString;
+  }
+
+  bool has_ysql_ddl_txn_verifier_state() const {
+    return pb.ysql_ddl_txn_verifier_state_size() > 0;
+  }
+
+  auto ysql_ddl_txn_verifier_state() const {
+    // Currently DDL with savepoints is disabled, so this repeated field can have only 1 element.
+    DCHECK_EQ(pb.ysql_ddl_txn_verifier_state_size(), 1);
+    return pb.ysql_ddl_txn_verifier_state(0);
+  }
+
+  bool is_being_deleted_by_ysql_ddl_txn() const {
+    return has_ysql_ddl_txn_verifier_state() &&
+      ysql_ddl_txn_verifier_state().contains_drop_table_op();
+  }
+
+  bool is_being_created_by_ysql_ddl_txn() const {
+    return has_ysql_ddl_txn_verifier_state() &&
+      ysql_ddl_txn_verifier_state().contains_create_table_op();
+  }
+
+  Result<bool> is_being_modified_by_ddl_transaction(const TransactionId& txn) const;
+
+  const std::string& state_name() const {
+    return SysTablesEntryPB_State_Name(pb.state());
+  }
+
   // Helper to set the state of the tablet with a custom message.
   void set_state(SysTablesEntryPB::State state, const std::string& msg);
 };
@@ -405,10 +436,19 @@ struct TabletWithSplitPartitions {
 //
 // The non-persistent information about the table is protected by an internal
 // spin-lock.
+//
+// N.B. The catalog manager stores this object in a TableIndex data structure with multiple indices.
+// Any change to the value of the fields indexed need to be registered with the TableIndex or the
+// indices will break. The proper value for the indexed fields needs to be set before the TableInfo
+// is added to the TableIndex.
+//
+// Currently indexed values:
+//     colocated
 class TableInfo : public RefCountedThreadSafe<TableInfo>,
                   public MetadataCowWrapper<PersistentTableInfo> {
  public:
-  explicit TableInfo(TableId table_id, scoped_refptr<TasksTracker> tasks_tracker = nullptr);
+  explicit TableInfo(
+      TableId table_id, bool colocated, scoped_refptr<TasksTracker> tasks_tracker = nullptr);
 
   const TableName name() const;
 
@@ -421,17 +461,16 @@ class TableInfo : public RefCountedThreadSafe<TableInfo>,
   const NamespaceId namespace_id() const;
   const NamespaceName namespace_name() const;
 
+  ColocationId GetColocationId() const;
+
   const Status GetSchema(Schema* schema) const;
 
   bool has_pgschema_name() const;
 
-  const std::string& pgschema_name() const;
+  const std::string pgschema_name() const;
 
   // True if all the column schemas have pg_type_oid set.
   bool has_pg_type_oid() const;
-
-  // True if the table is colocated (including tablegroups, excluding YSQL system tables).
-  bool colocated() const;
 
   std::string matview_pg_table_id() const;
   // True if the table is a materialized view.
@@ -453,6 +492,11 @@ class TableInfo : public RefCountedThreadSafe<TableInfo>,
 
   void set_is_system() { is_system_ = true; }
   bool is_system() const { return is_system_; }
+
+  // True if the table is colocated (including tablegroups, excluding YSQL system tables). This is
+  // cached in memory separately from the underlying proto with the expectation it will never
+  // change.
+  bool colocated() const { return colocated_; }
 
   // Return the table type of the table.
   TableType GetTableType() const;
@@ -497,15 +541,13 @@ class TableInfo : public RefCountedThreadSafe<TableInfo>,
                      DeactivateOnly deactivate_only = DeactivateOnly::kFalse);
 
   // This only returns tablets which are in RUNNING state.
-  void GetTabletsInRange(const GetTableLocationsRequestPB* req, TabletInfos *ret) const;
-  void GetTabletsInRange(
+  TabletInfos GetTabletsInRange(const GetTableLocationsRequestPB* req) const;
+  TabletInfos GetTabletsInRange(
       const std::string& partition_key_start, const std::string& partition_key_end,
-      TabletInfos* ret,
       int32_t max_returned_locations = std::numeric_limits<int32_t>::max()) const EXCLUDES(lock_);
   // Iterates through tablets_ and not partitions_, so there may be duplicates of key ranges.
-  void GetInactiveTabletsInRange(
+  TabletInfos GetInactiveTabletsInRange(
       const std::string& partition_key_start, const std::string& partition_key_end,
-      TabletInfos* ret,
       int32_t max_returned_locations = std::numeric_limits<int32_t>::max()) const EXCLUDES(lock_);
 
   std::size_t NumPartitions() const;
@@ -646,6 +688,8 @@ class TableInfo : public RefCountedThreadSafe<TableInfo>,
 
   std::atomic<bool> is_system_{false};
 
+  const bool colocated_;
+
   // List of pending tasks (e.g. create/alter tablet requests).
   std::unordered_set<std::shared_ptr<server::MonitoredTask>> pending_tasks_ GUARDED_BY(lock_);
 
@@ -721,7 +765,7 @@ class NamespaceInfo : public RefCountedThreadSafe<NamespaceInfo>,
 
   virtual const NamespaceId& id() const override { return namespace_id_; }
 
-  const NamespaceName& name() const;
+  const NamespaceName name() const;
 
   YQLDatabase database_type() const;
 
@@ -759,7 +803,7 @@ struct PersistentUDTypeInfo : public Persistent<SysUDTypeEntryPB, SysRowEntryTyp
     return pb.field_names_size();
   }
 
-  const string& field_names(int index) const {
+  const std::string& field_names(int index) const {
     return pb.field_names(index);
   }
 
@@ -780,17 +824,17 @@ class UDTypeInfo : public RefCountedThreadSafe<UDTypeInfo>,
   // Return the user defined type's ID. Does not require synchronization.
   virtual const std::string& id() const override { return udtype_id_; }
 
-  const UDTypeName& name() const;
+  const UDTypeName name() const;
 
-  const NamespaceId& namespace_id() const;
+  const NamespaceId namespace_id() const;
 
   int field_names_size() const;
 
-  const string& field_names(int index) const;
+  const std::string field_names(int index) const;
 
   int field_types_size() const;
 
-  const QLTypePB& field_types(int index) const;
+  const QLTypePB field_types(int index) const;
 
   std::string ToString() const override;
 
@@ -990,5 +1034,3 @@ class XClusterSafeTimeInfo : public MetadataCowWrapper<PersistentXClusterSafeTim
 
 }  // namespace master
 }  // namespace yb
-
-#endif  // YB_MASTER_CATALOG_ENTITY_INFO_H

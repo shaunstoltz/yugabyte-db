@@ -48,8 +48,6 @@
 #include "catalog/pg_database.h"
 #include "catalog/pg_db_role_setting.h"
 #include "catalog/pg_tablespace.h"
-#include "catalog/pg_yb_tablegroup.h"
-#include "catalog/yb_catalog_version.h"
 #include "libpq/auth.h"
 #include "libpq/libpq-be.h"
 #include "mb/pg_wchar.h"
@@ -81,6 +79,11 @@
 #include "utils/tqual.h"
 
 #include "pg_yb_utils.h"
+#include "catalog/pg_yb_catalog_version.h"
+#include "catalog/pg_yb_tablegroup.h"
+#include "catalog/yb_catalog_version.h"
+#include "catalog/pg_yb_profile.h"
+#include "catalog/pg_yb_role_profile.h"
 
 static HeapTuple GetDatabaseTuple(const char *dbname);
 static HeapTuple GetDatabaseTupleByOid(Oid dboid);
@@ -94,7 +97,6 @@ static void IdleInTransactionSessionTimeoutHandler(void);
 static bool ThereIsAtLeastOneRole(void);
 static void process_startup_options(Port *port, bool am_superuser);
 static void process_settings(Oid databaseid, Oid roleid);
-
 
 /*** InitPostgres support ***/
 
@@ -584,8 +586,7 @@ BaseInit(void)
  */
 static void
 InitPostgresImpl(const char *in_dbname, Oid dboid, const char *username,
-                 Oid useroid, char *out_dbname, bool override_allow_connections,
-                 bool* yb_sys_table_prefetching_started)
+				 Oid useroid, char *out_dbname, bool override_allow_connections)
 {
 	bool		bootstrap = IsBootstrapProcessingMode();
 	bool		am_superuser;
@@ -684,19 +685,38 @@ InitPostgresImpl(const char *in_dbname, Oid dboid, const char *username,
 
 	if (IsYugaByteEnabled() && !bootstrap)
 	{
+		HandleYBStatus(YBCPgTableExists(TemplateDbOid,
+										YbRoleProfileRelationId,
+										&YbLoginProfileCatalogsExist));
+
+		const uint64_t catalog_master_version =
+			YbGetCatalogCacheVersionForTablePrefetching();
 		YBCPgResetCatalogReadTime();
-		YBCStartSysTablePrefetching();
-		*yb_sys_table_prefetching_started = true;
+		YBCStartSysTablePrefetching(
+			catalog_master_version, false /* should_use_cache */);
 		YbRegisterSysTableForPrefetching(
-				AuthIdRelationId);        // pg_authid
+			AuthIdRelationId);        // pg_authid
 		YbRegisterSysTableForPrefetching(
-				DatabaseRelationId);      // pg_database
-		YbRegisterSysTableForPrefetching(
-				DbRoleSettingRelationId); // pg_db_role_setting
-		YbRegisterSysTableForPrefetching(
-				AuthMemRelationId);       // pg_auth_members
+			DatabaseRelationId);      // pg_database
+
+		if (*YBCGetGFlags()->ysql_enable_profile && YbLoginProfileCatalogsExist)
+		{
+			YbRegisterSysTableForPrefetching(
+				YbProfileRelationId); // pg_yb_profile
+			YbRegisterSysTableForPrefetching(
+				YbRoleProfileRelationId);	// pg_yb_role_profile
+		}
 		YbTryRegisterCatalogVersionTableForPrefetching();
-		yb_catalog_cache_version = YbGetMasterCatalogVersion();
+
+		/*
+		 * If per database catalog version mode is enabled, this will load the
+		 * catalog version of template1. It is fine because at this time we
+		 * only read shared relations and therefore can use any database OID.
+		 * We will update yb_catalog_cache_version to match MyDatabaseId once
+		 * the latter is resolved so we will never use the catalog version of
+		 * template1 to query relations that are private to MyDatabaseId.
+		 */
+		YbUpdateCatalogCacheVersion(YbGetMasterCatalogVersion());
 	}
 	/*
 	 * Load relcache entries for the shared system catalogs.  This must create
@@ -944,6 +964,25 @@ InitPostgresImpl(const char *in_dbname, Oid dboid, const char *username,
 		return;
 	}
 
+	if (MyDatabaseId != TemplateDbOid && YBIsDBCatalogVersionMode())
+	{
+		/*
+		 * Rather than fetching the current DB catalog version for MyDatabaseId
+		 * from master which requires another RPC that can cause the connection
+		 * establishment to slow down, we just set yb_catalog_cache_version from
+		 * that in the local tserver's catalog version ver. We expect in most
+		 * cases it will be identical to what we would get from master. However
+		 * it may be stale because of the heartbeat delay between the tserver
+		 * and master. If in rare cases we have set yb_catalog_cache_version to
+		 * a stale version, a future tserver to master hearbeat response will
+		 * bring the newer version and cause a cache refresh.
+		 * TODO: It is possible that catalog cache was changed on a master
+		 *       at this point (due to concurrent DDL). Cache refresh is
+		 *       required in this case. GH #14741 is created to handle this.
+		 */
+		YbUpdateCatalogCacheVersion(YbGetSharedCatalogVersion());
+	}
+
 	/*
 	 * Now, take a writer's lock on the database we are trying to connect to.
 	 * If there is a concurrently running DROP DATABASE on that database, this
@@ -1056,16 +1095,31 @@ InitPostgresImpl(const char *in_dbname, Oid dboid, const char *username,
 		HandleYBStatus(YBCPgTableExists(MyDatabaseId,
 										YbTablegroupRelationId,
 										&YbTablegroupCatalogExists));
+
+		if (YBCIsSysTablePrefetchingStarted())
+		{
+			YBCStopSysTablePrefetching();
+			YBCPgResetCatalogReadTime();
+			YBCStartSysTablePrefetching(
+				YbGetLastKnownCatalogCacheVersion(),
+				*YBCGetGFlags()->ysql_enable_read_request_caching);
+			YbRegisterSysTableForPrefetching(
+				AuthMemRelationId);       // pg_auth_members
+			YbRegisterSysTableForPrefetching(
+				DatabaseRelationId);      // pg_database
+			YbRegisterSysTableForPrefetching(
+				DbRoleSettingRelationId); // pg_db_role_setting
+		}
 	}
 
 	RelationCacheInitializePhase3();
 
 	/*
-	 * Also cache whather the database is colocated for optimization purposes.
+	 * Also cache whether the database is colocated for optimization purposes.
 	 */
 	if (IsYugaByteEnabled() && !IsBootstrapProcessingMode())
 	{
-		MyDatabaseColocated = YbIsDatabaseColocated(MyDatabaseId);
+		MyDatabaseColocated = YbIsDatabaseColocated(MyDatabaseId, &MyColocatedDatabaseLegacy);
 	}
 
 	/* set up ACL framework (so CheckMyDatabase can check permissions) */
@@ -1119,9 +1173,9 @@ InitPostgresImpl(const char *in_dbname, Oid dboid, const char *username,
 }
 
 static void
-YbEnsureSysTablePrefetchingStopped(bool sys_table_prefetching_started)
+YbEnsureSysTablePrefetchingStopped()
 {
-	if (sys_table_prefetching_started)
+	if (IsYugaByteEnabled() && YBCIsSysTablePrefetchingStarted())
 		YBCStopSysTablePrefetching();
 }
 
@@ -1129,20 +1183,19 @@ void
 InitPostgres(const char *in_dbname, Oid dboid, const char *username,
              Oid useroid, char *out_dbname, bool override_allow_connections)
 {
-	bool sys_table_prefetching_started = false;
 	PG_TRY();
 	{
 		InitPostgresImpl(
-			in_dbname, dboid, username, useroid, out_dbname, override_allow_connections,
-			&sys_table_prefetching_started);
+			in_dbname, dboid, username, useroid, out_dbname,
+			override_allow_connections);
 	}
 	PG_CATCH();
 	{
-		YbEnsureSysTablePrefetchingStopped(sys_table_prefetching_started);
+		YbEnsureSysTablePrefetchingStopped();
 		PG_RE_THROW();
 	}
 	PG_END_TRY();
-	YbEnsureSysTablePrefetchingStopped(sys_table_prefetching_started);
+	YbEnsureSysTablePrefetchingStopped();
 }
 
 /*

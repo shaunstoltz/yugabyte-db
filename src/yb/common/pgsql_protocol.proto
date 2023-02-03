@@ -163,6 +163,14 @@ message PgsqlSamplingStatePB {
   optional uint64 rand_state = 6;
 }
 
+message PgsqlFetchSequenceParamsPB {
+  optional uint32 fetch_count = 1;
+  optional int64 inc_by = 2;
+  optional int64 min_value = 3;
+  optional int64 max_value = 4;
+  optional bool cycle = 5;
+}
+
 //--------------------------------------------------------------------------------------------------
 // Data Writing Instructions - INSERT, UPDATE, DELETE, colocated TRUNCATE.
 //--------------------------------------------------------------------------------------------------
@@ -176,6 +184,7 @@ message PgsqlWriteRequestPB {
     PGSQL_DELETE = 3;
     PGSQL_UPSERT = 4;
     PGSQL_TRUNCATE_COLOCATED = 5;
+    PGSQL_FETCH_SEQUENCE = 6;
   }
 
   // Client info
@@ -238,10 +247,19 @@ message PgsqlWriteRequestPB {
   optional PgsqlColumnRefsPB column_refs = 15;
 
   // The version of the ysql system catalog this query was prepared against.
+  // Used when per-db catalog version mode is disabled.
   optional uint64 ysql_catalog_version = 16;
 
+  // The version of the ysql per-db system catalog this query was prepared against.
+  // Used when per-db catalog version mode is enabled.
+  optional uint64 ysql_db_catalog_version = 23;
+
+  // The oid of the database of the Postgres session where this query was issued.
+  // Used when per-db catalog version mode is enabled.
+  optional uint32 ysql_db_oid = 24;
+
   // True only if this changes a system catalog table (or index).
-  optional bool is_ysql_catalog_change = 17 [default = false];
+  optional bool is_ysql_catalog_change_using_protobuf = 17 [default = false];
 
   // Does this request correspond to backfilling an index table?
   optional bool is_backfill = 19 [default = false];
@@ -260,6 +278,8 @@ message PgsqlWriteRequestPB {
 
   // Used only in pg client.
   optional bytes partition_key = 22;
+
+  optional PgsqlFetchSequenceParamsPB fetch_sequence_params = 25;
 }
 
 //--------------------------------------------------------------------------------------------------
@@ -398,6 +418,10 @@ message PgsqlReadRequestPB {
   // Reading distinct columns?
   optional bool distinct = 11 [default = false];
 
+  // Current only used on SELECT DISTINCT scan. If the value is greater than 0, use the specified
+  // prefix length to scan the table.
+  optional uint64 prefix_length = 39 [default = 0];
+
   // Flag for reading aggregate values.
   optional bool is_aggregate = 12 [default = false];
 
@@ -417,19 +441,23 @@ message PgsqlReadRequestPB {
   optional uint32 max_hash_code = 17;
 
   // The version of the ysql system catalog this query was prepared against.
+  // Used when per-db catalog version mode is disabled.
   optional uint64 ysql_catalog_version = 16;
+
+  // The version of the ysql per-db system catalog this query was prepared against.
+  // Used when per-db catalog version mode is enabled.
+  optional uint64 ysql_db_catalog_version = 36;
+
+  // The oid of the database of the Postgres session where this query was issued.
+  // Used when per-db catalog version mode is enabled.
+  optional uint32 ysql_db_oid = 37;
 
   // Row mark as used by postgres for row locking.
   optional RowMarkType row_mark_type = 23;
 
-  // Used to identify 3 possibilities: WAIT_BLOCK, WAIT_SKIP or WAIT_ERROR
-  // TODO(Piyush):
-  // 1. YB doesn't support WAIT_BLOCK as of now. That will be supported with blocking infrastructure
-  //    that is to be implemented for pessmistic locking feature.
-  // 2. Default is set to WAIT_ERROR. For now, WAIT_ERROR denotes the current YB behaviour of
-  //    "abort other txn or raise conflict error when a conflict is found". When pessimistic locking
-  //    is turned on by default on YB, WAIT_ERROR will only denote the behaviour of raising conflict
-  //    error in current txn and not aborting others (like Postgres).
+  // Used only for explicit row-locking to identify 3 possibilities: WAIT_BLOCK, WAIT_SKIP, or
+  // WAIT_ERROR.
+  // See WaitPolicy for detailed information.
   optional WaitPolicy wait_policy = 32 [default = WAIT_ERROR];
 
   // Scan partition boundary.
@@ -544,4 +572,8 @@ message PgsqlResponsePB {
   // that sent out the 'BACKFILL' request statement.
   optional bytes backfill_spec = 13;
   optional bool is_backfill_batch_done = 14;
+
+  // Table's partition list version obtained from YBTable during response preparation.
+  // Table cache should be invalidated on partition list version mismatch detected.
+  optional uint32 partition_list_version = 15;
 }

@@ -21,6 +21,8 @@
 #include "yb/yql/pggate/test/pggate_test.h"
 #include "yb/yql/pggate/ybc_pggate.h"
 
+using std::string;
+
 namespace yb {
 namespace pggate {
 
@@ -54,7 +56,7 @@ TEST_F(PggateTestSelectInequality, TestSelectInequality) {
                                                DataType::INT64, false, true));
   CHECK_YBC_STATUS(YBCTestCreateTableAddColumn(pg_stmt, "val", ++col_count,
                                                DataType::STRING, false, false));
-  CHECK_YBC_STATUS(YBCPgExecCreateTable(pg_stmt));
+  ExecCreateTableTransaction(pg_stmt);
 
   pg_stmt = nullptr;
 

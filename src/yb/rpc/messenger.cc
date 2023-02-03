@@ -41,7 +41,6 @@
 #include <string>
 #include <thread>
 
-#include <gflags/gflags.h>
 #include <glog/logging.h>
 
 #include "yb/gutil/map-util.h"
@@ -60,7 +59,7 @@
 
 #include "yb/util/debug-util.h"
 #include "yb/util/errno.h"
-#include "yb/util/flag_tags.h"
+#include "yb/util/flags.h"
 #include "yb/util/format.h"
 #include "yb/util/metrics.h"
 #include "yb/util/monotime.h"
@@ -84,18 +83,18 @@ using std::string;
 using strings::Substitute;
 
 DECLARE_int32(num_connections_to_server);
-DEFINE_int32(rpc_default_keepalive_time_ms, 65000,
+DEFINE_UNKNOWN_int32(rpc_default_keepalive_time_ms, 65000,
              "If an RPC connection from a client is idle for this amount of time, the server "
              "will disconnect the client. Setting flag to 0 disables this clean up.");
 TAG_FLAG(rpc_default_keepalive_time_ms, advanced);
-DEFINE_uint64(io_thread_pool_size, 4, "Size of allocated IO Thread Pool.");
+DEFINE_UNKNOWN_uint64(io_thread_pool_size, 4, "Size of allocated IO Thread Pool.");
 
-DEFINE_int64(outbound_rpc_memory_limit, 0, "Outbound RPC memory limit");
+DEFINE_UNKNOWN_int64(outbound_rpc_memory_limit, 0, "Outbound RPC memory limit");
 
-DEFINE_int32(rpc_queue_limit, 10000, "Queue limit for rpc server");
-DEFINE_int32(rpc_workers_limit, 1024, "Workers limit for rpc server");
+DEFINE_NON_RUNTIME_int32(rpc_queue_limit, 10000, "Queue limit for rpc server");
+DEFINE_NON_RUNTIME_int32(rpc_workers_limit, 1024, "Workers limit for rpc server");
 
-DEFINE_int32(socket_receive_buffer_size, 0, "Socket receive buffer size, 0 to use default");
+DEFINE_UNKNOWN_int32(socket_receive_buffer_size, 0, "Socket receive buffer size, 0 to use default");
 
 namespace yb {
 namespace rpc {
@@ -112,7 +111,6 @@ MessengerBuilder::MessengerBuilder(std::string name)
       connection_keepalive_time_(FLAGS_rpc_default_keepalive_time_ms * 1ms),
       coarse_timer_granularity_(100ms),
       listen_protocol_(TcpStream::StaticProtocol()),
-      queue_limit_(FLAGS_rpc_queue_limit),
       workers_limit_(FLAGS_rpc_workers_limit),
       num_connections_to_server_(GetAtomicFlag(&FLAGS_num_connections_to_server)) {
   AddStreamFactory(TcpStream::StaticProtocol(), TcpStream::Factory());
@@ -176,6 +174,12 @@ MessengerBuilder &MessengerBuilder::UseDefaultConnectionContextFactory(
 // ------------------------------------------------------------------------------------------------
 
 void Messenger::Shutdown() {
+  bool expected = false;
+  if (!closing_.compare_exchange_strong(expected, true)) {
+    return;
+  }
+  VLOG(1) << "shutting down messenger " << name_;
+
   ShutdownThreadPools();
   ShutdownAcceptor();
   UnregisterAllServices();
@@ -187,14 +191,6 @@ void Messenger::Shutdown() {
   std::unique_ptr<Acceptor> acceptor;
   {
     std::lock_guard<percpu_rwlock> guard(lock_);
-    if (closing_) {
-      return;
-    }
-    VLOG(1) << "shutting down messenger " << name_;
-    closing_ = true;
-
-    DCHECK(rpc_services_.empty()) << "Unregister RPC services before shutting down Messenger";
-    rpc_services_.clear();
 
     acceptor.swap(acceptor_);
 
@@ -226,6 +222,10 @@ void Messenger::Shutdown() {
         << "Scheduled tasks is not empty after messenger shutdown: "
         << yb::ToString(scheduled_tasks_);
   }
+
+  // Safe to clear only after reactors have been shutdown as there may be CleanupHooks which access
+  // data owned by the services.
+  rpc_services_.clear();
 }
 
 Status Messenger::ListenAddress(
@@ -396,8 +396,10 @@ rpc::ThreadPool& Messenger::ThreadPool(ServicePriority priority) {
         return *high_priority_thread_pool;
       }
       const ThreadPoolOptions& options = normal_thread_pool_->options();
-      high_priority_thread_pool_.reset(new rpc::ThreadPool(
-          name_ + "-high-pri", options.queue_limit, options.max_workers));
+      high_priority_thread_pool_.reset(new rpc::ThreadPool(rpc::ThreadPoolOptions {
+        .name = name_ + "-high-pri",
+        .max_workers = options.max_workers
+      }));
       return *high_priority_thread_pool_.get();
   }
   FATAL_INVALID_ENUM_VALUE(ServicePriority, priority);
@@ -420,8 +422,11 @@ void Messenger::ShutdownThreadPools() {
 }
 
 void Messenger::UnregisterAllServices() {
-  CHECK_OK(rpc_services_counter_.DisableAndWaitForOps(CoarseTimePoint::max(), Stop::kTrue));
-  rpc_services_counter_.UnlockExclusiveOpMutex();
+  if (!rpc_services_counter_stopped_) {
+    CHECK_OK(rpc_services_counter_.DisableAndWaitForOps(CoarseTimePoint::max(), Stop::kTrue));
+    rpc_services_counter_.UnlockExclusiveOpMutex();
+    rpc_services_counter_stopped_ = true;
+  }
 
   for (const auto& p : rpc_services_) {
     p.second->StartShutdown();
@@ -430,7 +435,6 @@ void Messenger::UnregisterAllServices() {
     p.second->CompleteShutdown();
   }
 
-  rpc_services_.clear();
   rpc_endpoints_.clear();
 }
 
@@ -553,7 +557,10 @@ Messenger::Messenger(const MessengerBuilder &bld)
       metric_entity_(bld.metric_entity_),
       io_thread_pool_(name_, FLAGS_io_thread_pool_size),
       scheduler_(&io_thread_pool_.io_service()),
-      normal_thread_pool_(new rpc::ThreadPool(name_, bld.queue_limit_, bld.workers_limit_)),
+      normal_thread_pool_(new rpc::ThreadPool(rpc::ThreadPoolOptions {
+        .name = name_,
+        .max_workers = bld.workers_limit_,
+      })),
       resolver_(new DnsResolver(&io_thread_pool_.io_service())),
       rpc_metrics_(std::make_shared<RpcMetrics>(bld.metric_entity_)),
       num_connections_to_server_(bld.num_connections_to_server_) {

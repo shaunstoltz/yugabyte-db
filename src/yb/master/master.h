@@ -29,8 +29,7 @@
 // or implied.  See the License for the specific language governing permissions and limitations
 // under the License.
 //
-#ifndef YB_MASTER_MASTER_H
-#define YB_MASTER_MASTER_H
+#pragma once
 
 #include <atomic>
 #include <memory>
@@ -102,6 +101,8 @@ class Master : public tserver::DbServerBase {
 
   FlushManager* flush_manager() const { return flush_manager_.get(); }
 
+  AutoFlagsManager* auto_flags_manager() { return auto_flags_manager_.get(); }
+
   PermissionsManager& permissions_manager();
 
   EncryptionManager& encryption_manager();
@@ -155,7 +156,7 @@ class Master : public tserver::DbServerBase {
   SysCatalogTable& sys_catalog() const;
 
   uint32_t GetAutoFlagConfigVersion() const override;
-  AutoFlagsConfigPB GetAutoFlagConfig() const;
+  AutoFlagsConfigPB GetAutoFlagsConfig() const;
 
   yb::client::AsyncClientInitialiser& async_client_initializer() {
     return *async_client_init_;
@@ -180,6 +181,9 @@ class Master : public tserver::DbServerBase {
     REQUIRES (master_metrics_mutex_) {
       return &master_metrics_;
   }
+
+  Status get_ysql_db_oid_to_cat_version_info_map(
+      bool size_only, tserver::GetTserverCatalogVersionInfoResponsePB *resp) const;
 
  protected:
   virtual Status RegisterServices();
@@ -248,4 +252,3 @@ class Master : public tserver::DbServerBase {
 
 } // namespace master
 } // namespace yb
-#endif // YB_MASTER_MASTER_H

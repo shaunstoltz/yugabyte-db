@@ -1,3 +1,4 @@
+import { YBTableRelationType } from './constants';
 import { DeepPartial } from './types';
 
 export interface PlacementAZ {
@@ -32,6 +33,28 @@ export enum CloudType {
   kubernetes = 'kubernetes',
   cloud = 'cloud-1',
   other = 'other'
+}
+
+// PublicCloudConstants.java
+export enum StorageType {
+  IO1 = 'IO1',
+  GP2 = 'GP2',
+  GP3 = 'GP3',
+  Scratch = 'Scratch',
+  Persistent = 'Persistent',
+  StandardSSD_LRS = 'StandardSSD_LRS',
+  Premium_LRS = 'Premium_LRS',
+  UltraSSD_LRS = 'UltraSSD_LRS'
+}
+
+export interface DeviceInfo {
+  volumeSize: number;
+  numVolumes: number;
+  diskIops: number | null;
+  throughput: number | null;
+  storageClass: 'standard'; // hardcoded in DeviceInfo.java
+  mountPoints: string | null;
+  storageType: StorageType | null;
 }
 
 // UniverseTaskParams.java
@@ -122,28 +145,6 @@ export interface EncryptionAtRestConfig {
   type?: 'DATA_KEY' | 'CMK';
 }
 
-// PublicCloudConstants.java
-export enum StorageType {
-  IO1 = 'IO1',
-  GP2 = 'GP2',
-  GP3 = 'GP3',
-  Scratch = 'Scratch',
-  Persistent = 'Persistent',
-  StandardSSD_LRS = 'StandardSSD_LRS',
-  Premium_LRS = 'Premium_LRS',
-  UltraSSD_LRS = 'UltraSSD_LRS'
-}
-
-export interface DeviceInfo {
-  volumeSize: number;
-  numVolumes: number;
-  diskIops: number | null;
-  throughput: number | null;
-  storageClass: 'standard'; // hardcoded in DeviceInfo.java
-  mountPoints: string | null;
-  storageType: StorageType | null;
-}
-
 // NodeDetails.java
 export enum NodeState {
   ToBeAdded = 'ToBeAdded',
@@ -217,6 +218,23 @@ export interface Universe {
   universeDetails: UniverseDetails;
   universeUUID: string;
   version: number;
+}
+
+export enum TableType {
+  YQL_TABLE_TYPE = 'YQL_TABLE_TYPE',
+  REDIS_TABLE_TYPE = 'REDIS_TABLE_TYPE',
+  PGSQL_TABLE_TYPE = 'PGSQL_TABLE_TYPE'
+}
+
+export interface YBTable {
+  isIndexTable: boolean;
+  keySpace: string;
+  pgSchemaName: string;
+  relationType: YBTableRelationType;
+  sizeBytes: number;
+  tableName: string;
+  tableType: TableType;
+  tableUUID: string;
 }
 
 // Provider.java
@@ -342,18 +360,49 @@ export interface HAReplicationSchedule {
   is_running: boolean;
 }
 
-export enum TableType {
-  YQL_TABLE_TYPE = 'YQL_TABLE_TYPE',
-  REDIS_TABLE_TYPE = 'REDIS_TABLE_TYPE',
-  PGSQL_TABLE_TYPE = 'PGSQL_TABLE_TYPE'
-}
-
-export const TABLE_TYPE_MAP: Record<TableType, string> = {
+export const TableTypeLabel: Record<TableType, string> = {
   YQL_TABLE_TYPE: 'YCQL',
   PGSQL_TABLE_TYPE: 'YSQL',
   REDIS_TABLE_TYPE: 'REDIS'
-};
+} as const;
 
+export interface MetricsData {
+  type: string;
+  metricsKey: string[];
+  nodePrefixes: string;
+  selectedUniverse: any;
+  title: string;
+  tableName?: string;
+}
+
+export interface GraphFilter {
+  startMoment: any;
+  endMoment: any;
+  nodeName: string;
+  nodePrefix: string;
+  filterValue?: string;
+  filterType?: string;
+  currentSelectedRegion?: string;
+  metricMeasure?: string;
+  outlierType?: string;
+  outlierNumNodes?: number;
+  selectedRegionClusterUUID?: string | null;
+  selectedRegionCode?: string | null;
+  selectedZoneName?: string | null;
+}
+
+export interface MetricSettings {
+  metric: string;
+  splitTopNodes: number;
+}
+
+export interface MetricQueryParams {
+  metricsWithSettings: MetricSettings[];
+  start: string;
+  end: string;
+  nodePrefix: string;
+  nodeNames: string[];
+}
 export interface CpuMeasureQueryData {
   maxNodeName: string;
   maxNodeValue: number;
@@ -406,4 +455,31 @@ export enum RecommendationTypeEnum {
   ConnectionSkew = 'ConnectionSkew',
   CpuSkew = 'CpuSkew',
   CpuUsage = 'CpuUsage'
+}
+
+export interface RunTimeConfigData {
+  configID: number;
+  configKey: string;
+  configValue: string;
+  configTags: string[];
+  isConfigInherited: boolean;
+  displayName: string;
+  helpTxt: string;
+  type: string;
+  scope: string;
+}
+
+export enum RunTimeConfigScope {
+  GLOBAL = 'GLOBAL',
+  UNIVERSE = 'UNIVERSE',
+  PROVIDER = 'PROVIDER',
+  CUSTOMER = 'CUSTOMER'
+}
+
+export interface RuntimeConfigScopeProps {
+  configTagFilter: string[];
+  fetchRuntimeConfigs: (scope?: string) => void;
+  setRuntimeConfig: (key: string, value: string, scope?: string) => void;
+  deleteRunTimeConfig: (key: string, scope?: string) => void;
+  resetRuntimeConfigs: () => void;
 }

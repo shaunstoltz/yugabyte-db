@@ -13,8 +13,7 @@
 //
 //
 
-#ifndef YB_COMMON_TRANSACTION_TEST_UTIL_H
-#define YB_COMMON_TRANSACTION_TEST_UTIL_H
+#pragma once
 
 #include <functional>
 #include <type_traits>
@@ -50,7 +49,7 @@ class TransactionStatusManagerMock : public TransactionStatusManager {
         << " has been already committed.";
   }
 
-  Result<TransactionMetadata> PrepareMetadata(const TransactionMetadataPB& pb) override {
+  Result<TransactionMetadata> PrepareMetadata(const LWTransactionMetadataPB& pb) override {
     return STATUS(Expired, "");
   }
 
@@ -89,10 +88,13 @@ class TransactionStatusManagerMock : public TransactionStatusManager {
     return tablet_id;
   }
 
+  Result<IsExternalTransaction> IsExternalTransactionResult(
+      const TransactionId& transaction_id) override {
+    return IsExternalTransaction::kFalse;
+  }
+
  private:
   std::unordered_map<TransactionId, HybridTime, TransactionIdHash> txn_commit_time_;
 };
 
 } // namespace yb
-
-#endif // YB_COMMON_TRANSACTION_TEST_UTIL_H

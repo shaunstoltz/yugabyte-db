@@ -133,7 +133,6 @@ public class RemoveNodeFromUniverseTest extends CommissionerBaseTest {
     }
 
     when(mockYBClient.getClient(any(), any())).thenReturn(mockClient);
-    when(mockYBClient.getClientWithConfig(any())).thenReturn(mockClient);
     mockWaits(mockClient, 3);
   }
 
@@ -391,6 +390,7 @@ public class RemoveNodeFromUniverseTest extends CommissionerBaseTest {
     Set<NodeState> allowedStates = NodeState.allowedStatesForAction(NodeActionType.REMOVE);
     Set<NodeState> expectedStates =
         ImmutableSet.of(
+            NodeState.Adding,
             NodeState.Live,
             NodeState.ToBeRemoved,
             NodeState.ToJoinCluster,

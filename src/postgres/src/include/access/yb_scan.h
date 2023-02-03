@@ -20,8 +20,7 @@
  *--------------------------------------------------------------------------------------------------
  */
 
-#ifndef YB_SCAN_H
-#define YB_SCAN_H
+#pragma once
 
 #include "postgres.h"
 
@@ -85,6 +84,9 @@ typedef struct YbScanDescData
 	/* number of keys which represents the yb_hash_code function */
 	int nhash_keys;
 
+	/* True if all the conditions for this index were bound to pggate. */
+	bool is_full_cond_bound;
+
 	TupleDesc target_desc;
 	AttrNumber target_key_attnums[YB_MAX_SCAN_KEYS];
 
@@ -118,6 +120,8 @@ typedef struct YbScanDescData
 } YbScanDescData;
 
 typedef struct YbScanDescData *YbScanDesc;
+
+extern void ybc_free_ybscan(YbScanDesc ybscan);
 
 /*
  * Access to YB-stored system catalogs (mirroring API from genam.c)
@@ -228,5 +232,3 @@ bool ybSampleNextBlock(YbSample ybSample);
 int ybFetchSample(YbSample ybSample, HeapTuple *rows);
 TupleTableSlot *ybFetchNext(YBCPgStatement handle,
 			TupleTableSlot *slot, Oid relid);
-
-#endif							/* YB_SCAN_H */

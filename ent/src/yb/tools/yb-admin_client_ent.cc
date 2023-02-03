@@ -20,6 +20,7 @@
 #include "yb/cdc/cdc_service.proxy.h"
 #include "yb/client/client.h"
 
+#include "yb/common/constants.h"
 #include "yb/common/entity_ids.h"
 #include "yb/common/json_util.h"
 #include "yb/common/ql_type_util.h"
@@ -51,7 +52,7 @@
 #include "yb/tools/yb-admin_util.h"
 #include "yb/util/cast.h"
 #include "yb/util/env.h"
-#include "yb/util/flag_tags.h"
+#include "yb/util/flags.h"
 #include "yb/util/jsonwriter.h"
 #include "yb/util/monotime.h"
 #include "yb/util/pb_util.h"
@@ -65,8 +66,6 @@
 #include "yb/util/format.h"
 #include "yb/util/status_format.h"
 #include "yb/util/test_util.h"
-
-#define NANOS_PER_SECOND 1000000000
 
 DEFINE_test_flag(int32, metadata_file_format_version, 0,
                  "Used in 'export_snapshot' metadata file format (0 means using latest format).");
@@ -425,19 +424,19 @@ Result<TxnSnapshotId> ClusterAdminClient::SuitableSnapshotId(
 Status ClusterAdminClient::DisableTabletSplitsDuringRestore(CoarseTimePoint deadline) {
   // TODO(Sanket): Eventually all of this logic needs to be moved
   // to the master and exposed as APIs for the clients to consume.
-  const std::string feature_name = "PITR";
   const auto splitting_disabled_until =
       CoarseMonoClock::Now() + MonoDelta::FromSeconds(kPitrSplitDisableDurationSecs);
   // Disable splitting and then wait for all pending splits to complete before
   // starting restoration.
   VERIFY_RESULT_PREPEND(
-      DisableTabletSplitsInternal(kPitrSplitDisableDurationSecs * 1000, feature_name),
+      DisableTabletSplitsInternal(kPitrSplitDisableDurationSecs * 1000, kPitrFeatureName),
       "Failed to disable tablet split before restore.");
 
   while (CoarseMonoClock::Now() < std::min(splitting_disabled_until, deadline)) {
     // Wait for existing split operations to complete.
     const auto resp = VERIFY_RESULT_PREPEND(
-        IsTabletSplittingCompleteInternal(true /* wait_for_parent_deletion */),
+        IsTabletSplittingCompleteInternal(true /* wait_for_parent_deletion */,
+                                          deadline - CoarseMonoClock::now() /* timeout */),
         "Tablet splitting did not complete. Cannot restore.");
     if (resp.is_tablet_splitting_complete()) {
       break;
@@ -460,7 +459,7 @@ Status ClusterAdminClient::DisableTabletSplitsDuringRestore(CoarseTimePoint dead
   // splitting disables. This overwrites the previous value since the feature_name is the same so
   // overall the time is still kPitrSplitDisableDurationSecs.
   VERIFY_RESULT_PREPEND(
-      DisableTabletSplitsInternal(kPitrSplitDisableDurationSecs * 1000, feature_name),
+      DisableTabletSplitsInternal(kPitrSplitDisableDurationSecs * 1000, kPitrFeatureName),
       "Failed to disable tablet split before restore.");
 
   return Status::OK();
@@ -1268,7 +1267,8 @@ Status ClusterAdminClient::WriteUniverseKeyToFile(
 }
 
 Status ClusterAdminClient::CreateCDCSDKDBStream(
-  const TypedNamespaceName& ns, const std::string& checkpoint_type) {
+    const TypedNamespaceName& ns, const std::string& checkpoint_type,
+    const std::string& record_type) {
   HostPort ts_addr = VERIFY_RESULT(GetFirstRpcAddressForTS());
   auto cdc_proxy = std::make_unique<cdc::CDCServiceProxy>(proxy_cache_.get(), ts_addr);
 
@@ -1276,7 +1276,13 @@ Status ClusterAdminClient::CreateCDCSDKDBStream(
   cdc::CreateCDCStreamResponsePB resp;
 
   req.set_namespace_name(ns.name);
-  req.set_record_type(cdc::CDCRecordType::CHANGE);
+
+  if (record_type == yb::ToString("ALL")) {
+    req.set_record_type(cdc::CDCRecordType::ALL);
+  } else {
+    req.set_record_type(cdc::CDCRecordType::CHANGE);
+  }
+
   req.set_record_format(cdc::CDCRecordFormat::PROTO);
   req.set_source_type(cdc::CDCRequestSource::CDCSDK);
   if (checkpoint_type == yb::ToString("EXPLICIT")) {
@@ -1602,8 +1608,26 @@ Status ClusterAdminClient::AlterUniverseReplication(const std::string& producer_
   return Status::OK();
 }
 
+Status ClusterAdminClient::ChangeXClusterRole(cdc::XClusterRole role) {
+  master::ChangeXClusterRoleRequestPB req;
+  master::ChangeXClusterRoleResponsePB resp;
+  req.set_role(role);
+
+  RpcController rpc;
+  rpc.set_timeout(timeout_);
+  RETURN_NOT_OK(master_replication_proxy_->ChangeXClusterRole(req, &resp, &rpc));
+
+  if (resp.has_error()) {
+    cout << "Error changing role: " << resp.error().status().message() << endl;
+    return StatusFromPB(resp.error().status());
+  }
+
+  cout << "Changed role successfully" << endl;
+  return Status::OK();
+}
+
 Status ClusterAdminClient::SetUniverseReplicationEnabled(const std::string& producer_id,
-                                                                 bool is_enabled) {
+                                                         bool is_enabled) {
   master::SetUniverseReplicationEnabledRequestPB req;
   master::SetUniverseReplicationEnabledResponsePB resp;
   req.set_producer_id(producer_id);
@@ -1793,7 +1817,7 @@ Result<rapidjson::Document> ClusterAdminClient::GetXClusterEstimatedDataLoss() {
     AddStringField("namespace_id", data_loss.namespace_id(), &json_entry, &document.GetAllocator());
 
     // Use 1 second granularity.
-    auto data_loss_s = data_loss.data_loss_ns() / NANOS_PER_SECOND;
+    int64_t data_loss_s = MonoDelta::FromMicroseconds(data_loss.data_loss_us()).ToSeconds();
     AddStringField(
         "data_loss_sec", std::to_string(data_loss_s), &json_entry, &document.GetAllocator());
     document.PushBack(json_entry, document.GetAllocator());

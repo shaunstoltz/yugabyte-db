@@ -79,7 +79,7 @@ class NonTransactionalStatusProvider: public TransactionStatusManager {
     Fail();
   }
 
-  Result<TransactionMetadata> PrepareMetadata(const TransactionMetadataPB& pb) override {
+  Result<TransactionMetadata> PrepareMetadata(const LWTransactionMetadataPB& pb) override {
     Fail();
     return STATUS(Expired, "");
   }
@@ -125,6 +125,11 @@ class NonTransactionalStatusProvider: public TransactionStatusManager {
   const TabletId& tablet_id() const override {
     static TabletId result;
     return result;
+  }
+
+  Result<IsExternalTransaction> IsExternalTransactionResult(
+      const TransactionId& transaction_id) override {
+    return IsExternalTransaction::kFalse;
   }
 
  private:

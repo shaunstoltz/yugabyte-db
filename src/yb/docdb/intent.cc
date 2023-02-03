@@ -35,8 +35,7 @@ Result<DecodedIntentKey> DecodeIntentKey(const Slice &encoded_intent_key) {
   auto& intent_prefix = result.intent_prefix;
   intent_prefix = encoded_intent_key;
 
-  size_t doc_ht_size = 0;
-  RETURN_NOT_OK(DocHybridTime::CheckAndGetEncodedSize(intent_prefix, &doc_ht_size));
+  size_t doc_ht_size = VERIFY_RESULT(DocHybridTime::GetEncodedSize(intent_prefix));
   // There should always be 3 bytes present before teh start of the doc_ht:
   // 1. ValueType::kIntentTypeSet
   // 2. the corresponding value for ValueType::kIntentTypeSet
@@ -162,7 +161,7 @@ bool HasStrong(IntentTypeSet inp) {
 
 Result<DecodedIntentValue> DecodeIntentValue(
     const Slice& encoded_intent_value, const Slice* verify_transaction_id_slice,
-    bool has_strong_intent) {
+    bool require_write_id) {
   DecodedIntentValue decoded_value;
   auto intent_value = encoded_intent_value;
   auto transaction_id_slice = Slice();
@@ -185,11 +184,14 @@ Result<DecodedIntentValue> DecodeIntentValue(
     decoded_value.subtransaction_id = kMinSubTransactionId;
   }
 
-  if (has_strong_intent) {
-    RETURN_NOT_OK(intent_value.consume_byte(ValueEntryTypeAsChar::kWriteId));
+  if (intent_value.TryConsumeByte(ValueEntryTypeAsChar::kWriteId)) {
     INTENT_VALUE_SCHECK(intent_value.size(), GE, sizeof(IntraTxnWriteId), "write id expected");
     decoded_value.write_id = BigEndian::Load32(intent_value.data());
     intent_value.remove_prefix(sizeof(IntraTxnWriteId));
+  } else {
+    RSTATUS_DCHECK(
+      !require_write_id, Corruption, "Expected IntraTxnWriteId in value, found: $0",
+      intent_value.ToDebugHexString());
   }
 
   decoded_value.body = intent_value;

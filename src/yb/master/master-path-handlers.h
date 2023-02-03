@@ -29,8 +29,7 @@
 // or implied.  See the License for the specific language governing permissions and limitations
 // under the License.
 //
-#ifndef YB_MASTER_MASTER_PATH_HANDLERS_H
-#define YB_MASTER_MASTER_PATH_HANDLERS_H
+#pragma once
 
 #include <string>
 #include <sstream>
@@ -112,7 +111,14 @@ class MasterPathHandlers {
     kNumColumns
   };
 
-  const std::string kSystemPlatformNamespace = "system_platform";
+  enum NamespaceColumns {
+    kNamespaceName,
+    kNamespaceId,
+    kNamespaceLanguage,
+    kNamespaceState,
+    kNamespaceColocated,
+    kNumNamespaceColumns
+  };
 
   struct TabletCounts {
     uint32_t user_tablet_leaders = 0;
@@ -201,6 +207,10 @@ class MasterPathHandlers {
   void HandleCatalogManager(const Webserver::WebRequest& req,
                             Webserver::WebResponse* resp,
                             bool only_user_tables = false);
+  void HandleNamespacesHTML(const Webserver::WebRequest& req,
+                            Webserver::WebResponse* resp,
+                            bool only_user_namespaces = false);
+  void HandleNamespacesJSON(const Webserver::WebRequest& req, Webserver::WebResponse* resp);
   void HandleTablePage(const Webserver::WebRequest& req,
                        Webserver::WebResponse* resp);
   void HandleTasksPage(const Webserver::WebRequest& req,
@@ -231,7 +241,7 @@ class MasterPathHandlers {
   // Otherwise, do not perform calculation if number of tables is less than max_table_count.
   Status CalculateTServerTree(TServerTree* tserver_tree, int max_table_count);
   void RenderLoadBalancerViewPanel(
-      const TServerTree& tserver_tree, const vector<std::shared_ptr<TSDescriptor>>& descs,
+      const TServerTree& tserver_tree, const std::vector<std::shared_ptr<TSDescriptor>>& descs,
       const std::vector<TableInfoPtr>& tables, std::stringstream* output);
   TableType GetTableType(const TableInfo& table);
   std::vector<TabletInfoPtr> GetNonSystemTablets();
@@ -272,4 +282,3 @@ void HandleTabletServersPage(const Webserver::WebRequest& req, Webserver::WebRes
 
 } // namespace master
 } // namespace yb
-#endif /* YB_MASTER_MASTER_PATH_HANDLERS_H */

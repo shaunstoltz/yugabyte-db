@@ -15,9 +15,7 @@ import static org.junit.Assert.assertNull;
 import static org.junit.Assert.assertThat;
 import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.ArgumentMatchers.anyBoolean;
-import static org.mockito.ArgumentMatchers.anyInt;
 import static org.mockito.ArgumentMatchers.anyLong;
-import static org.mockito.ArgumentMatchers.eq;
 import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.times;
 import static org.mockito.Mockito.verify;
@@ -39,7 +37,15 @@ import com.yugabyte.yw.models.TaskInfo;
 import com.yugabyte.yw.models.Universe;
 import com.yugabyte.yw.models.helpers.PlacementInfo;
 import com.yugabyte.yw.models.helpers.TaskType;
+import io.fabric8.kubernetes.api.model.Pod;
+import io.fabric8.kubernetes.api.model.PodList;
+import io.fabric8.kubernetes.api.model.PodStatus;
+import io.fabric8.kubernetes.client.utils.Serialization;
+
+import java.io.File;
+import java.io.FileInputStream;
 import java.io.IOException;
+import java.io.InputStream;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
@@ -54,10 +60,6 @@ import org.yb.client.ChangeMasterClusterConfigResponse;
 import org.yb.client.GetLoadMovePercentResponse;
 import org.yb.client.IsServerReadyResponse;
 import org.yb.client.YBClient;
-
-import io.fabric8.kubernetes.api.model.Pod;
-import io.fabric8.kubernetes.api.model.PodList;
-import io.fabric8.kubernetes.api.model.PodStatus;
 import play.libs.Json;
 
 @RunWith(MockitoJUnitRunner.class)
@@ -73,10 +75,14 @@ public class EditKubernetesUniverseTest extends CommissionerBaseTest {
   private Map<String, String> config = new HashMap<>();
 
   private void setup() {
-    String statusString = "{ \"phase\": \"Running\", \"conditions\": [{\"status\": \"True\"}]}";
-    PodStatus status = TestUtils.deserialize(statusString, PodStatus.class);
-    when(mockKubernetesManager.getPodStatus(any(), any(), any())).thenReturn(status);
+    try {
+      File jsonFile = new File("src/test/resources/testPod.json");
+      InputStream jsonStream = new FileInputStream(jsonFile);
 
+      Pod testPod = Serialization.unmarshal(jsonStream, Pod.class);
+      when(mockKubernetesManager.getPodObject(any(), any(), any())).thenReturn(testPod);
+    } catch (Exception e) {
+    }
     YBClient mockClient = mock(YBClient.class);
     IsServerReadyResponse okReadyResp = new IsServerReadyResponse(0, "", null, 0, 0);
     ChangeMasterClusterConfigResponse ccr = new ChangeMasterClusterConfigResponse(1111, "", null);
@@ -92,7 +98,6 @@ public class EditKubernetesUniverseTest extends CommissionerBaseTest {
     } catch (Exception e) {
     }
     when(mockClient.waitForServer(any(), anyLong())).thenReturn(true);
-    when(mockClient.waitForLoadBalance(anyLong(), anyInt())).thenReturn(true);
     when(mockYBClient.getClient(any(), any())).thenReturn(mockClient);
   }
 
@@ -100,16 +105,16 @@ public class EditKubernetesUniverseTest extends CommissionerBaseTest {
     setup();
 
     config.put("KUBECONFIG", "test");
-    defaultProvider.setConfig(config);
-    defaultProvider.save();
+    kubernetesProvider.setConfig(config);
+    kubernetesProvider.save();
     editUniverse.setUserTaskUUID(UUID.randomUUID());
-    Region r = Region.create(defaultProvider, "region-1", "PlacementRegion 1", "default-image");
+    Region r = Region.create(kubernetesProvider, "region-1", "PlacementRegion 1", "default-image");
     AvailabilityZone.createOrThrow(r, "az-1", "PlacementAZ 1", "subnet-1");
     InstanceType i =
         InstanceType.upsert(
-            defaultProvider.uuid, "c3.xlarge", 10, 5.5, new InstanceType.InstanceTypeDetails());
+            kubernetesProvider.uuid, "c3.xlarge", 10, 5.5, new InstanceType.InstanceTypeDetails());
     UniverseDefinitionTaskParams.UserIntent userIntent =
-        getTestUserIntent(r, defaultProvider, i, 3);
+        getTestUserIntent(r, kubernetesProvider, i, 3);
     userIntent.replicationFactor = 1;
     userIntent.masterGFlags = new HashMap<>();
     userIntent.tserverGFlags = new HashMap<>();
@@ -124,6 +129,7 @@ public class EditKubernetesUniverseTest extends CommissionerBaseTest {
     defaultUniverse = Universe.getOrBadRequest(defaultUniverse.universeUUID);
     defaultUniverse.updateConfig(
         ImmutableMap.of(Universe.HELM2_LEGACY, Universe.HelmLegacy.V3.toString()));
+    defaultUniverse.save();
   }
 
   private static final List<TaskType> KUBERNETES_ADD_POD_TASKS =
@@ -133,7 +139,6 @@ public class EditKubernetesUniverseTest extends CommissionerBaseTest {
           TaskType.KubernetesCommandExecutor,
           TaskType.WaitForServer,
           TaskType.UpdatePlacementInfo,
-          TaskType.WaitForLoadBalance,
           TaskType.KubernetesCommandExecutor,
           TaskType.SwamperTargetsFileUpdate,
           TaskType.UniverseUpdateSucceeded);
@@ -145,7 +150,6 @@ public class EditKubernetesUniverseTest extends CommissionerBaseTest {
         Json.toJson(ImmutableMap.of("commandType", HELM_UPGRADE.name())),
         Json.toJson(ImmutableMap.of("commandType", WAIT_FOR_PODS.name())),
         Json.toJson(ImmutableMap.of("commandType", POD_INFO.name())),
-        Json.toJson(ImmutableMap.of()),
         Json.toJson(ImmutableMap.of()),
         Json.toJson(ImmutableMap.of()),
         Json.toJson(ImmutableMap.of("commandType", POD_INFO.name())),
@@ -471,7 +475,7 @@ public class EditKubernetesUniverseTest extends CommissionerBaseTest {
     taskParams.expectedUniverseVersion = 3;
     taskParams.nodeDetailsSet = defaultUniverse.getUniverseDetails().nodeDetailsSet;
     InstanceType.upsert(
-        defaultProvider.uuid, "c5.xlarge", 10, 5.5, new InstanceType.InstanceTypeDetails());
+        kubernetesProvider.uuid, "c5.xlarge", 10, 5.5, new InstanceType.InstanceTypeDetails());
     UniverseDefinitionTaskParams.UserIntent newUserIntent =
         defaultUniverse.getUniverseDetails().getPrimaryCluster().userIntent.clone();
     newUserIntent.instanceType = "c5.xlarge";
@@ -487,7 +491,7 @@ public class EditKubernetesUniverseTest extends CommissionerBaseTest {
             expectedNamespace.capture(),
             expectedOverrideFile.capture());
     verify(mockKubernetesManager, times(3))
-        .getPodStatus(
+        .getPodObject(
             expectedConfig.capture(), expectedNodePrefix.capture(), expectedPodName.capture());
     verify(mockKubernetesManager, times(1))
         .getPodInfos(

@@ -340,13 +340,16 @@ class OnPremNodesList extends Component {
             pullRight
           >
             <MenuItem
-              onClick={self.showConfirmPrecheckModal.bind(self, row)}
+              onClick={!precheckDisabled ? self.showConfirmPrecheckModal.bind(self, row) : null}
               disabled={precheckDisabled}
             >
               <i className="fa fa-play-circle-o" />
               Perform check
             </MenuItem>
-            <MenuItem onClick={self.showConfirmDeleteModal.bind(self, row)} disabled={row.inUse}>
+            <MenuItem
+              onClick={!row.inUse ? self.showConfirmDeleteModal.bind(self, row) : null}
+              disabled={row.inUse}
+            >
               <i className={`fa fa-trash`} />
               Delete node
             </MenuItem>
@@ -355,7 +358,8 @@ class OnPremNodesList extends Component {
       );
     };
 
-    const onPremSetupReference = 'https://docs.yugabyte.com/preview/yugabyte-platform/configure-yugabyte-platform/set-up-cloud-provider/on-premises/';
+    const onPremSetupReference =
+      'https://docs.yugabyte.com/preview/yugabyte-platform/configure-yugabyte-platform/set-up-cloud-provider/on-premises/';
     let provisionMessage = <span />;
     const onPremProvider = this.findProvider();
     if (isDefinedNotNull(onPremProvider)) {
@@ -365,18 +369,18 @@ class OnPremNodesList extends Component {
       if (isDefinedNotNull(onPremKey) && onPremKey.keyInfo.skipProvisioning) {
         provisionMessage = (
           <Alert bsStyle="warning" className="pre-provision-message">
-            You need to pre-provision your nodes, If the Provider SSH User has sudo privileges
-            you can execute the following script on the {YUGABYTE_TITLE} <b> yugaware </b>
-            container -or- the  YugabyteDB Anywhere host machine depending on your deployment
-            type once for each instance that you add here.
+            You need to pre-provision your nodes, If the Provider SSH User has sudo privileges you
+            can execute the following script on the {YUGABYTE_TITLE} <b> yugaware </b>
+            container -or- the YugabyteDB Anywhere host machine depending on your deployment type
+            once for each instance that you add here.
             <YBCodeBlock>
               {onPremKey.keyInfo.provisionInstanceScript + ' --ip '}
               <b>{'<IP Address> '}</b>
               {'--mount_points '}
               <b>{'<instance type mount points>'}</b>
             </YBCodeBlock>
-            See the On-premises Provider <a href={onPremSetupReference}> documentation </a> for 
-            more details if the <b> Provider SSH User</b>  does not have <b>sudo</b> privileges.
+            See the On-premises Provider <a href={onPremSetupReference}> documentation </a> for more
+            details if the <b> Provider SSH User</b> does not have <b>sudo</b> privileges.
           </Alert>
         );
       }

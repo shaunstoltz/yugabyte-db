@@ -10,12 +10,16 @@ import static com.yugabyte.yw.common.ModelFactory.createUniverse;
 import static org.junit.Assert.assertEquals;
 import static org.junit.Assert.assertNull;
 import static org.mockito.ArgumentMatchers.any;
+import static org.mockito.ArgumentMatchers.eq;
 import static org.mockito.Mockito.times;
 import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.when;
 
 import com.typesafe.config.Config;
+import com.yugabyte.yw.common.config.GlobalConfKeys;
+import com.yugabyte.yw.common.config.RuntimeConfGetter;
 import com.yugabyte.yw.common.config.RuntimeConfigFactory;
+import com.yugabyte.yw.common.config.UniverseConfKeys;
 import com.yugabyte.yw.forms.BackupTableParams;
 import com.yugabyte.yw.forms.RestoreBackupParams;
 import com.yugabyte.yw.forms.RestoreBackupParams.ActionType;
@@ -54,6 +58,8 @@ public class RestoreManagerYbTest extends FakeDBApplication {
   @Mock ShellProcessHandler shellProcessHandler;
 
   @Mock RuntimeConfigFactory runtimeConfigFactory;
+
+  @Mock RuntimeConfGetter mockConfGetter;
 
   @Mock Config mockConfig;
 
@@ -123,8 +129,11 @@ public class RestoreManagerYbTest extends FakeDBApplication {
   public void setUp() {
     testCustomer = ModelFactory.testCustomer();
     testUniverse = createUniverse("Universe-1", testCustomer.getCustomerId());
-    when(runtimeConfigFactory.globalRuntimeConf()).thenReturn(mockConfig);
     when(runtimeConfigFactory.forUniverse(any())).thenReturn(mockConfig);
+    when(mockConfGetter.getGlobalConf(eq(GlobalConfKeys.ssh2Enabled))).thenReturn(false);
+    when(mockConfGetter.getGlobalConf(eq(GlobalConfKeys.disableXxHashChecksum))).thenReturn(false);
+    when(mockConfGetter.getConfForScope(any(Universe.class), eq(UniverseConfKeys.backupLogVerbose)))
+        .thenReturn(false);
   }
 
   @Test
@@ -243,6 +252,8 @@ public class RestoreManagerYbTest extends FakeDBApplication {
 
   @Test
   public void testRestoreGcsBackupWithRestoreTimeStamp() {
+    SimpleDateFormat formatter = new SimpleDateFormat("yyyy-MM-dd HH:mm:ss");
+    Date date = new Date(System.currentTimeMillis() - 300 * 1000);
     setupUniverse(ModelFactory.awsProvider(testCustomer));
     CustomerConfig storageConfig = ModelFactory.createGcsStorageConfig(testCustomer, "TEST43");
     BackupTableParams backupParams = getBackupUniverseParams(storageConfig.configUUID);
@@ -252,8 +263,6 @@ public class RestoreManagerYbTest extends FakeDBApplication {
             ActionType.RESTORE,
             storageConfig.configUUID,
             testBackup.getBackupInfo().backupList.get(0).storageLocation);
-    SimpleDateFormat formatter = new SimpleDateFormat("yyyy-MM-dd HH:mm:ss");
-    Date date = new Date();
     restoreBackupParams.restoreTimeStamp = formatter.format(date);
     try {
       restoreManagerYb.runCommand(restoreBackupParams);
@@ -331,7 +340,7 @@ public class RestoreManagerYbTest extends FakeDBApplication {
     if (testProvider.code.equals("kubernetes")) {
       PlacementInfo pi = testUniverse.getUniverseDetails().getPrimaryCluster().placementInfo;
       podAddrToConfig =
-          PlacementInfoUtil.getKubernetesConfigPerPod(
+          KubernetesUtil.getKubernetesConfigPerPod(
               pi, testUniverse.getUniverseDetails().nodeDetailsSet);
     }
 

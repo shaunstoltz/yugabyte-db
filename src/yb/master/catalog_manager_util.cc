@@ -18,11 +18,14 @@
 #include "yb/master/catalog_entity_info.h"
 
 #include "yb/master/master_cluster.pb.h"
-#include "yb/util/flag_tags.h"
+#include "yb/util/flags.h"
 #include "yb/util/math_util.h"
 #include "yb/util/string_util.h"
 
-DEFINE_double(balancer_load_max_standard_deviation, 2.0,
+using std::string;
+using std::vector;
+
+DEFINE_UNKNOWN_double(balancer_load_max_standard_deviation, 2.0,
     "The standard deviation among the tserver load, above which that distribution "
     "is considered not balanced.");
 TAG_FLAG(balancer_load_max_standard_deviation, advanced);
@@ -256,10 +259,9 @@ Status CatalogManagerUtil::CheckIfCanDeleteSingleTablet(
   }
   const auto partition = tablet_pb.partition();
 
-  TabletInfos tablets_in_range;
   VLOG(3) << "Tablet " << tablet_id << " " << AsString(partition);
-  tablet->table()->GetTabletsInRange(
-      partition.partition_key_start(), partition.partition_key_end(), &tablets_in_range);
+  TabletInfos tablets_in_range = tablet->table()->GetTabletsInRange(
+      partition.partition_key_start(), partition.partition_key_end());
 
   std::string partition_key = partition.partition_key_start();
   for (const auto& inner_tablet : tablets_in_range) {

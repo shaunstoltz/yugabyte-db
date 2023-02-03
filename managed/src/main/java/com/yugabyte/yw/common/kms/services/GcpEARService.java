@@ -14,10 +14,12 @@ package com.yugabyte.yw.common.kms.services;
 import java.util.UUID;
 
 import com.fasterxml.jackson.databind.node.ObjectNode;
+import com.yugabyte.yw.common.config.RuntimeConfGetter;
 import com.yugabyte.yw.common.kms.algorithms.GcpAlgorithm;
 import com.yugabyte.yw.common.kms.util.GcpEARServiceUtil;
 import com.yugabyte.yw.common.kms.util.KeyProvider;
 import com.yugabyte.yw.forms.EncryptionAtRestConfig;
+import com.yugabyte.yw.models.KmsConfig;
 
 /**
  * An implementation of EncryptionAtRestService to communicate with GCP KMS
@@ -25,10 +27,12 @@ import com.yugabyte.yw.forms.EncryptionAtRestConfig;
  */
 public class GcpEARService extends EncryptionAtRestService<GcpAlgorithm> {
   private GcpEARServiceUtil gcpEARServiceUtil;
+  private final RuntimeConfGetter confGetter;
   public static final int numBytes = 32;
 
-  public GcpEARService() {
+  public GcpEARService(RuntimeConfGetter confGetter) {
     super(KeyProvider.GCP);
+    this.confGetter = confGetter;
   }
 
   public GcpEARServiceUtil getGcpEarServiceUtil() {
@@ -63,6 +67,10 @@ public class GcpEARService extends EncryptionAtRestService<GcpAlgorithm> {
       // auth config. This is the actual master key stored on GCP KMS only.
       // Used to wrap and unwrap the universe key that will be created later.
       gcpEARServiceUtil.checkOrCreateCryptoKey(config);
+
+      // Sets the correct protection level for key that already exists in GCP KMS.
+      UUID customerUUID = KmsConfig.get(configUUID).customerUUID;
+      UpdateAuthConfigProperties(customerUUID, configUUID, config);
     } catch (Exception e) {
       final String errMsg =
           String.format(

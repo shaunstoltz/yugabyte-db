@@ -30,7 +30,7 @@ export const getScheduledBackupList = (pageno: number) => {
     },
     limit: records_to_fetch,
     offset: pageno * records_to_fetch,
-    sortBy: 'taskType'
+    sortBy: 'scheduleName'
   };
   return axios.post<Schedule_List_Reponse>(`${ROOT_URL}/customers/${cUUID}/schedules/page`, params);
 };
@@ -65,6 +65,15 @@ export const createBackupSchedule = (values: Record<string, any>) => {
       values['policy_interval'] *
       MILLISECONDS_IN[values['policy_interval_type'].value.toUpperCase()];
     payload['frequencyTimeUnit'] = values['policy_interval_type'].value.toUpperCase();
+  }
+
+  if (values['is_incremental_backup_enabled']) {
+    payload['incrementalBackupFrequency'] =
+      values['incremental_backup_frequency'] *
+      MILLISECONDS_IN[values['incremental_backup_frequency_type'].value.toUpperCase()];
+    payload['incrementalBackupFrequencyTimeUnit'] = values[
+      'incremental_backup_frequency_type'
+    ].value.toUpperCase();
   }
 
   return axios.post(requestUrl, payload);

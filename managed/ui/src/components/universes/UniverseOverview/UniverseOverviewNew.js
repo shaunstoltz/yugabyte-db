@@ -25,11 +25,12 @@ import {
   isNonEmptyObject,
   isNullOrEmpty,
   isNonEmptyArray,
-  isNonEmptyString
+  isNonEmptyString,
+  isDefinedNotNull
 } from '../../../utils/ObjectUtils';
 import { isKubernetesUniverse, getPrimaryCluster } from '../../../utils/UniverseUtils';
 import { FlexContainer, FlexGrow, FlexShrink } from '../../common/flexbox/YBFlexBox';
-import { isDefinedNotNull } from '../../../utils/ObjectUtils';
+
 import { getPromiseState } from '../../../utils/PromiseUtils';
 import { YBButton, YBModal } from '../../common/forms/fields';
 import moment from 'moment';
@@ -48,7 +49,7 @@ class DatabasePanel extends PureComponent {
       }
     } = this.props;
     const primaryCluster = getPrimaryCluster(clusters);
-    const userIntent = primaryCluster && primaryCluster.userIntent;
+    const userIntent = primaryCluster?.userIntent;
 
     const optimizeVersion = (version) => {
       if (parseInt(version[version.length - 1], 10) === 0) {
@@ -417,9 +418,21 @@ export default class UniverseOverviewNew extends Component {
     if (isNullOrEmpty(currentUniverse.resources)) return;
     const isPricingKnown = currentUniverse.resources.pricingKnown;
     const pricePerHour = currentUniverse.resources.pricePerHour;
-    const costPerDay = <YBCost value={pricePerHour} multiplier={'day'} isPricingKnown={isPricingKnown}/>;
+    const costPerDay = (
+      <YBCost
+        value={pricePerHour}
+        multiplier={'day'}
+        isPricingKnown={isPricingKnown}
+        runtimeConfigs={this.props.runtimeConfigs}
+      />
+    );
     const costPerMonth = (
-      <YBCost value={pricePerHour} multiplier={'month'} isPricingKnown={isPricingKnown} />
+      <YBCost
+        value={pricePerHour}
+        multiplier={'month'}
+        isPricingKnown={isPricingKnown}
+        runtimeConfigs={this.props.runtimeConfigs}
+      />
     );
     return (
       <Col lg={2} md={4} sm={4} xs={6}>
@@ -569,15 +582,16 @@ export default class UniverseOverviewNew extends Component {
   getDiskUsageWidget = (universeInfo) => {
     // For kubernetes the disk usage would be in container tab, rest it would be server tab.
     const isKubernetes = isKubernetesUniverse(universeInfo);
+    const metricTabPath = this.props.enableTopKMetrics ? 'tab' : 'subtab';
     const subTab = isKubernetes ? 'container' : 'server';
     const metricKey = isKubernetes ? 'container_volume_stats' : 'disk_usage';
     const secondaryMetric = isKubernetes
       ? [
-        {
-          metric: 'container_volume_max_usage',
-          name: 'size'
-        }
-      ]
+          {
+            metric: 'container_volume_max_usage',
+            name: 'size'
+          }
+        ]
       : null;
     return (
       <StandaloneMetricsPanelContainer
@@ -591,7 +605,9 @@ export default class UniverseOverviewNew extends Component {
               noMargin
               headerRight={
                 isNonEmptyObject(universeInfo) ? (
-                  <Link to={`/universes/${universeInfo.universeUUID}/metrics?subtab=${subTab}`}>
+                  <Link
+                    to={`/universes/${universeInfo.universeUUID}/metrics?${metricTabPath}=${subTab}`}
+                  >
                     Details
                   </Link>
                 ) : null
@@ -606,7 +622,10 @@ export default class UniverseOverviewNew extends Component {
   };
 
   getCPUWidget = (universeInfo) => {
+    // For kubernetes the CPU usage would be in container tab, rest it would be server tab.
     const isItKubernetesUniverse = isKubernetesUniverse(universeInfo);
+    const subTab = isItKubernetesUniverse ? 'container' : 'server';
+    const metricTabPath = this.props.enableTopKMetrics ? 'tab' : 'subtab';
     return (
       <Col lg={2} md={4} sm={4} xs={6}>
         <StandaloneMetricsPanelContainer
@@ -619,7 +638,9 @@ export default class UniverseOverviewNew extends Component {
                 noMargin
                 headerLeft={'CPU Usage'}
                 headerRight={
-                  <Link to={`/universes/${universeInfo.universeUUID}/metrics?subtab=server`}>
+                  <Link
+                    to={`/universes/${universeInfo.universeUUID}/metrics?${metricTabPath}=${subTab}`}
+                  >
                     Details
                   </Link>
                 }
@@ -702,7 +723,7 @@ export default class UniverseOverviewNew extends Component {
     const lastUpdateDate = this.getLastUpdateDate();
     const {
       universe: { currentUniverse },
-      updateAvailable, 
+      updateAvailable,
       currentCustomer
     } = this.props;
     const showUpdate =
@@ -768,7 +789,7 @@ export default class UniverseOverviewNew extends Component {
       universe: { currentUniverse },
       alerts,
       tasks,
-      currentCustomer,
+      currentCustomer
     } = this.props;
 
     const universeInfo = currentUniverse.data;
@@ -809,13 +830,16 @@ export default class UniverseOverviewNew extends Component {
             {this.getTablesWidget(universeInfo)}
           </Col>
         </Row>
-        {isQueryMonitoringEnabled &&
+        {isQueryMonitoringEnabled && (
           <Row>
             <Col lg={12} md={12} sm={12} xs={12}>
-              <QueryDisplayPanel universeUUID={universeInfo.universeUUID} enabled={isQueryMonitoringEnabled} />
+              <QueryDisplayPanel
+                universeUUID={universeInfo.universeUUID}
+                enabled={isQueryMonitoringEnabled}
+              />
             </Col>
           </Row>
-        }
+        )}
       </Fragment>
     );
   }

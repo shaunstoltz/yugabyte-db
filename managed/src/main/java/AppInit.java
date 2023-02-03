@@ -4,13 +4,18 @@ import static com.yugabyte.yw.models.MetricConfig.METRICS_CONFIG_PATH;
 
 import com.google.inject.Inject;
 import com.google.inject.Singleton;
+import com.google.inject.name.Named;
 import com.typesafe.config.Config;
 import com.yugabyte.yw.cloud.aws.AWSInitializer;
 import com.yugabyte.yw.commissioner.BackupGarbageCollector;
 import com.yugabyte.yw.commissioner.CallHome;
 import com.yugabyte.yw.commissioner.HealthChecker;
-import com.yugabyte.yw.commissioner.SetUniverseKey;
+import com.yugabyte.yw.commissioner.NodeAgentPoller;
+import com.yugabyte.yw.commissioner.PerfAdvisorScheduler;
 import com.yugabyte.yw.commissioner.PitrConfigPoller;
+import com.yugabyte.yw.commissioner.RecommendationGarbageCollector;
+import com.yugabyte.yw.commissioner.RefreshKmsService;
+import com.yugabyte.yw.commissioner.SetUniverseKey;
 import com.yugabyte.yw.commissioner.SupportBundleCleanup;
 import com.yugabyte.yw.commissioner.TaskGarbageCollector;
 import com.yugabyte.yw.commissioner.YbcUpgrade;
@@ -19,7 +24,6 @@ import com.yugabyte.yw.common.CustomerTaskManager;
 import com.yugabyte.yw.common.ExtraMigrationManager;
 import com.yugabyte.yw.common.ReleaseManager;
 import com.yugabyte.yw.common.ShellLogsManager;
-import com.yugabyte.yw.common.Util;
 import com.yugabyte.yw.common.YamlWrapper;
 import com.yugabyte.yw.common.alerts.AlertConfigurationService;
 import com.yugabyte.yw.common.alerts.AlertConfigurationWriter;
@@ -30,7 +34,6 @@ import com.yugabyte.yw.common.certmgmt.CertificateHelper;
 import com.yugabyte.yw.common.ha.PlatformReplicationManager;
 import com.yugabyte.yw.common.metrics.PlatformMetricsProcessor;
 import com.yugabyte.yw.common.metrics.SwamperTargetsFileUpdater;
-import com.yugabyte.yw.controllers.handlers.NodeAgentHandler;
 import com.yugabyte.yw.models.Customer;
 import com.yugabyte.yw.models.ExtraMigration;
 import com.yugabyte.yw.models.InstanceType;
@@ -51,6 +54,8 @@ import play.Logger;
 @Singleton
 public class AppInit {
 
+  private static final long MAX_APP_INITIALIZATION_TIME = 30;
+
   @Inject
   public AppInit(
       Environment environment,
@@ -64,7 +69,9 @@ public class AppInit {
       PitrConfigPoller pitrConfigPoller,
       TaskGarbageCollector taskGC,
       SetUniverseKey setUniverseKey,
+      RefreshKmsService refreshKmsService,
       BackupGarbageCollector backupGC,
+      PerfAdvisorScheduler perfAdvisorScheduler,
       PlatformReplicationManager replicationManager,
       AlertsGarbageCollector alertsGC,
       QueryAlerts queryAlerts,
@@ -80,41 +87,15 @@ public class AppInit {
       ShellLogsManager shellLogsManager,
       Config config,
       SupportBundleCleanup supportBundleCleanup,
-      NodeAgentHandler nodeAgentHandler,
-      YbcUpgrade ybcUpgrade)
+      NodeAgentPoller nodeAgentPoller,
+      YbcUpgrade ybcUpgrade,
+      RecommendationGarbageCollector perfRecGC,
+      @Named("AppStartupTimeMs") Long startupTime)
       throws ReflectiveOperationException {
     Logger.info("Yugaware Application has started");
 
     Configuration appConfig = application.configuration();
     String mode = appConfig.getString("yb.mode", "PLATFORM");
-
-    String version = ConfigHelper.getCurrentVersion(application);
-
-    String previousSoftwareVersion =
-        configHelper
-            .getConfig(ConfigHelper.ConfigType.YugawareMetadata)
-            .getOrDefault("version", "")
-            .toString();
-
-    boolean isPlatformDowngradeAllowed =
-        application.configuration().getBoolean("yb.is_platform_downgrade_allowed");
-
-    if (Util.compareYbVersions(previousSoftwareVersion, version, true) > 0
-        && !isPlatformDowngradeAllowed) {
-
-      String msg =
-          String.format(
-              "Platform does not support version downgrades, %s"
-                  + " has downgraded to %s. Shutting down. To override this check"
-                  + " (not recommended) and continue startup,"
-                  + " set the application config setting yb.is_platform_downgrade_allowed"
-                  + "or the environment variable"
-                  + " YB_IS_PLATFORM_DOWNGRADE_ALLOWED to true."
-                  + " Otherwise, upgrade your YBA version back to or above %s to proceed.",
-              previousSoftwareVersion, version, previousSoftwareVersion);
-
-      throw new RuntimeException(msg);
-    }
 
     if (!environment.isTest()) {
       // Check if we have provider data, if not, we need to seed the database
@@ -130,9 +111,17 @@ public class AppInit {
         alertConfigurationService.createDefaultConfigs(customer);
       }
 
+      boolean ywFileDataSynced =
+          Boolean.parseBoolean(
+              configHelper
+                  .getConfig(ConfigHelper.ConfigType.FileDataSync)
+                  .getOrDefault("synced", "false")
+                  .toString());
+      String storagePath = appConfig.getString("yb.storage.path");
+      configHelper.syncFileData(storagePath, ywFileDataSynced);
+
       if (mode.equals("PLATFORM")) {
         String devopsHome = appConfig.getString("yb.devops.home");
-        String storagePath = appConfig.getString("yb.storage.path");
         if (devopsHome == null || devopsHome.length() == 0) {
           throw new RuntimeException("yb.devops.home is not set in application.conf");
         }
@@ -184,17 +173,22 @@ public class AppInit {
       // initialize prometheus exports
       DefaultExports.initialize();
 
-      // Fail incomplete tasks
-      taskManager.failAllPendingTasks();
+      // Handle incomplete tasks
+      taskManager.handleAllPendingTasks();
 
       // Schedule garbage collection of old completed tasks in database.
       taskGC.start();
       alertsGC.start();
+      perfRecGC.start();
 
       setUniverseKey.start();
+      // Refreshes all the KMS providers. Useful for renewing tokens, ttls, etc.
+      refreshKmsService.start();
 
       // Schedule garbage collection of backups
       backupGC.start();
+
+      perfAdvisorScheduler.start();
 
       // Cleanup old support bundles
       supportBundleCleanup.start();
@@ -210,13 +204,21 @@ public class AppInit {
       queryAlerts.start();
       healthChecker.initialize();
       shellLogsManager.startLogsGC();
-      nodeAgentHandler.init();
+      nodeAgentPoller.init();
       pitrConfigPoller.start();
 
       ybcUpgrade.start();
 
       // Add checksums for all certificates that don't have a checksum.
       CertificateHelper.createChecksums();
+
+      long elapsed = (System.currentTimeMillis() - startupTime) / 1000;
+      String elapsedStr = String.valueOf(elapsed);
+      if (elapsed > MAX_APP_INITIALIZATION_TIME) {
+        Logger.warn("Completed initialization in " + elapsedStr + " seconds.");
+      } else {
+        Logger.info("Completed initialization in " + elapsedStr + " seconds.");
+      }
 
       Logger.info("AppInit completed");
     }

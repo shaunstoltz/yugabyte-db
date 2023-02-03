@@ -8,6 +8,7 @@ import com.yugabyte.yw.commissioner.UpgradeTaskBase;
 import com.yugabyte.yw.commissioner.UserTaskDetails.SubTaskGroupType;
 import com.yugabyte.yw.commissioner.tasks.XClusterConfigTaskBase;
 import com.yugabyte.yw.common.Util;
+import com.yugabyte.yw.common.config.UniverseConfKeys;
 import com.yugabyte.yw.forms.SoftwareUpgradeParams;
 import com.yugabyte.yw.forms.UniverseDefinitionTaskParams;
 import com.yugabyte.yw.forms.UpgradeTaskParams.UpgradeTaskSubType;
@@ -68,9 +69,7 @@ public class SoftwareUpgrade extends UpgradeTaskBase {
           taskParams().verifyParams(universe);
           // Precheck for Available Memory on tserver nodes.
           long memAvailableLimit =
-              runtimeConfigFactory
-                  .forUniverse(universe)
-                  .getLong("yb.dbmem.checks.mem_available_limit_kb");
+              confGetter.getConfForScope(universe, UniverseConfKeys.dbMemAvailableLimit);
           createAvailabeMemoryCheck(allNodes, Util.AVAILABLE_MEMORY, memAvailableLimit)
               .setSubTaskGroupType(SubTaskGroupType.PreflightChecks);
 
@@ -94,7 +93,6 @@ public class SoftwareUpgrade extends UpgradeTaskBase {
           }
 
           String newVersion = taskParams().ybSoftwareVersion;
-          createPackageInstallTasks(allNodes);
           // Download software to all nodes.
           createDownloadTasks(allNodes, newVersion);
           // Install software on nodes.
@@ -142,21 +140,6 @@ public class SoftwareUpgrade extends UpgradeTaskBase {
     }
     downloadTaskGroup.setSubTaskGroupType(SubTaskGroupType.DownloadingSoftware);
     getRunnableTask().addSubTaskGroup(downloadTaskGroup);
-  }
-
-  private void createPackageInstallTasks(Collection<NodeDetails> nodes) {
-    String subGroupDescription =
-        String.format(
-            "AnsibleConfigureServers (%s) for: %s",
-            SubTaskGroupType.UpdatePackage, taskParams().nodePrefix);
-    SubTaskGroup subTaskGroup = getTaskExecutor().createSubTaskGroup(subGroupDescription, executor);
-    for (NodeDetails node : nodes) {
-      subTaskGroup.addSubTask(
-          getAnsibleConfigureServerTask(
-              node, ServerType.TSERVER, UpgradeTaskSubType.PackageReInstall, null));
-    }
-    subTaskGroup.setSubTaskGroupType(SubTaskGroupType.UpdatePackage);
-    getRunnableTask().addSubTaskGroup(subTaskGroup);
   }
 
   private void createXClusterSourceRootCertDirPathGFlagTasks() {

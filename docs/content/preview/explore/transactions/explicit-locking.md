@@ -1,13 +1,11 @@
 ---
-title: Explicit Locking
-headerTitle: Explicit Locking
-linkTitle: Explicit Locking
-description: Explicit Locking in YugabyteDB.
-headcontent: Explicit Locking in YugabyteDB.
-image: <div class="icon"><i class="fas fa-file-invoice-dollar"></i></div>
+title: Explicit locking
+headerTitle: Explicit locking
+linkTitle: Explicit locking
+description: Explicit locking in YugabyteDB.
+headcontent: Learn how row locking works in YugabyteDB
 menu:
   preview:
-    name: Explicit Locking
     identifier: explore-transactions-explicit-locking-1-ysql
     parent: explore-transactions
     weight: 245
@@ -25,13 +23,7 @@ type: docs
 
 </ul>
 
-This section describes how explicit locking works in YugabyteDB.
-
-YugabyteDB supports most row-level locks, similar to PostgreSQL. Explicit row-locks use transaction priorities to ensure that two transactions can never hold conflicting locks on the same row. To do this, the query layer acquires the row lock by assigning a very high value for the priority of the transaction that is being run. This causes all other transactions that conflict with the current transaction to fail, because they have a lower transaction priority.
-
-{{< note title="Note" >}}
-Explicit locking is an area of active development in YugabyteDB. A number of enhancements are planned in this area. Unlike PostgreSQL, YugabyteDB uses optimistic concurrency control and does not block / wait for currently held locks, instead opting to abort the conflicting transaction with a lower priority. Pessimistic concurrency control is currently under development.
-{{</note >}}
+YugabyteDB's YSQL supports explicit row-level locking, similar to PostgreSQL. Explicit row-locks ensure that two transactions can never hold conflicting locks on the same row. When two transactions try to acquire conflicting lock modes, the semantics are dictated by YugabyteDB's [Concurrency Control](../../../architecture/transactions/concurrency-control/) policies.
 
 The types of row locks currently supported are:
 
@@ -40,7 +32,11 @@ The types of row locks currently supported are:
 * `FOR SHARE`
 * `FOR KEY SHARE`
 
-The following example uses the `FOR UPDATE` row lock. First, a row is selected for update, thereby locking it, and subsequently updated. A concurrent transaction should not be able to abort this transaction by updating the value of that row after the row is locked.
+## Example
+
+The following example uses the `FOR UPDATE` row lock with the [Fail-on-Conflict](../../../architecture/transactions/concurrency-control/#fail-on-conflict) concurrency control policy. First, a row is selected for update, thereby locking it, and subsequently updated. A concurrent transaction should not be able to abort this transaction by updating the value of that row after the row is locked.
+
+{{% explore-setup-single %}}
 
 To try out this scenario, first create an example table with sample data, as follows:
 
@@ -51,10 +47,10 @@ yugabyte=# INSERT INTO t VALUES ('k1', 'v1');
 
 Next, connect to the cluster using two independent `ysqlsh` instances. You can connect both session `ysqlsh` instances to the same server, or to different servers.
 
-Begin a transaction in the first session, and perform a `SELECT FOR UPDATE` on the row in the table `t`. This locks the row for an update as a part of a transaction that has a very high priority.
+Begin a transaction in the first session, and perform a `SELECT FOR UPDATE` on the row in the table `t`. This locks the row for an update as a part of a transaction that has a very high priority (i.e., in the `high priority bucket` as explained in [Transaction priorities](../../../architecture/transactions/transaction-priorities/)).
 
 ```sql
-yugabyte=# BEGIN;
+yugabyte=# BEGIN TRANSACTION ISOLATION LEVEL REPEATABLE READ;
 ```
 
 ```output
@@ -72,23 +68,19 @@ yugabyte=# SELECT * from t WHERE k='k1' FOR UPDATE;
 (1 row)
 ```
 
-Before completing the transaction, try to update the same key in your other session using a simple update statement.
+Before completing the transaction, try to update the same key in your other session using a basic update statement.
 
 ```sql
 yugabyte=# UPDATE t SET v='v1.1' WHERE k='k1';
 ```
 
 ```output
-ERROR:  Operation failed. Try again. xxx Conflicts with higher priority transaction: yyy
+ERROR:  All transparent retries exhausted. Operation failed. Try again: bb3aace4-5de2-41f9-981e-d9ca06671419 Conflicts with higher priority transaction: d4dadbf8-ca81-4bbd-b68c-067023f8ee6b
 ```
 
-This uses optimistic concurrency control, and fails.
+This operation fails because it conflicts with the row-level lock and as per `Fail-on-Conflict` concurrency control policy, the transaction aborts itselfs since it has a lower priority.
 
-If you used optimistic concurrency control instead of an explicit row-lock to do the first transaction, then this update would succeed in some of the attempts and the first transaction would fail in those cases.
-
-{{< note title="Note" >}}
-Blocking this transaction and retrying it after the other transaction completes is work in progress.
-{{</note >}}
+Note that the error message appears after all [Best-effort statement retries](../../../architecture/transactions/concurrency-control/#best-effort-internal-retries-for-first-statement-in-a-transaction) have been exhausted.
 
 Finally, in the first session, update the row and commit the transaction. This should succeed.
 

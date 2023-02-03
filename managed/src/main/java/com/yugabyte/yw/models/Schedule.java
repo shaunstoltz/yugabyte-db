@@ -16,12 +16,14 @@ import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.yugabyte.yw.commissioner.tasks.MultiTableBackup;
 import com.yugabyte.yw.common.PlatformServiceException;
+import com.yugabyte.yw.common.ScheduleUtil;
 import com.yugabyte.yw.common.Util;
 import com.yugabyte.yw.forms.BackupRequestParams;
 import com.yugabyte.yw.forms.BackupRequestParams.KeyspaceTable;
 import com.yugabyte.yw.forms.ITaskParams;
 import com.yugabyte.yw.models.ScheduleResp.BackupInfo;
 import com.yugabyte.yw.models.ScheduleResp.ScheduleRespBuilder;
+import com.yugabyte.yw.models.extended.UserWithFeatures;
 import com.yugabyte.yw.models.filters.ScheduleFilter;
 import com.yugabyte.yw.models.helpers.KeyspaceTablesList;
 import com.yugabyte.yw.models.helpers.KeyspaceTablesList.KeyspaceTablesListBuilder;
@@ -51,6 +53,7 @@ import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Date;
 import java.util.List;
+import java.util.Optional;
 import java.util.Set;
 import java.util.UUID;
 import java.util.stream.Collectors;
@@ -63,11 +66,12 @@ import javax.persistence.Id;
 import javax.persistence.Table;
 import javax.persistence.UniqueConstraint;
 import org.apache.commons.collections.CollectionUtils;
-import org.apache.commons.lang.StringUtils;
+import org.apache.commons.lang3.StringUtils;
 import org.apache.commons.lang3.time.DateUtils;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import play.libs.Json;
+import play.mvc.Http.Context;
 
 @Entity
 @Table(
@@ -91,7 +95,8 @@ public class Schedule extends Model {
 
   public enum SortBy implements PagedQuery.SortByIF {
     taskType("taskType"),
-    scheduleUUID("scheduleUUID");
+    scheduleUUID("scheduleUUID"),
+    scheduleName("scheduleName");
 
     private final String sortField;
 
@@ -225,6 +230,14 @@ public class Schedule extends Model {
   @Column(nullable = false)
   private boolean backlogStatus;
 
+  @Column
+  @ApiModelProperty(value = "User who created the schedule policy", accessMode = READ_ONLY)
+  private String userEmail;
+
+  public String getUserEmail() {
+    return userEmail;
+  }
+
   public boolean getBacklogStatus() {
     return this.backlogStatus;
   }
@@ -300,6 +313,16 @@ public class Schedule extends Model {
     save();
   }
 
+  public void updateIncrementalBackupFrequencyAndTimeUnit(
+      long incrementalBackupFrequency, TimeUnit incrementalBackupFrequencyTimeUnit) {
+    ObjectMapper mapper = new ObjectMapper();
+    BackupRequestParams params = mapper.convertValue(getTaskParams(), BackupRequestParams.class);
+    params.incrementalBackupFrequency = incrementalBackupFrequency;
+    params.incrementalBackupFrequencyTimeUnit = incrementalBackupFrequencyTimeUnit;
+    this.taskParams = Json.toJson(params);
+    save();
+  }
+
   public static final Finder<UUID, Schedule> find = new Finder<UUID, Schedule>(Schedule.class) {};
 
   public static Schedule create(
@@ -322,6 +345,7 @@ public class Schedule extends Model {
     schedule.cronExpression = cronExpression;
     schedule.ownerUUID = ownerUUID;
     schedule.frequencyTimeUnit = frequencyTimeUnit;
+    schedule.userEmail = Util.maybeGetEmailFromContext(Context.current.get());
     schedule.scheduleName =
         scheduleName != null ? scheduleName : "schedule-" + schedule.scheduleUUID;
     schedule.nextScheduleTaskTime = nextExpectedTaskTime(null, schedule);
@@ -365,6 +389,10 @@ public class Schedule extends Model {
   @Deprecated
   public static Schedule get(UUID scheduleUUID) {
     return find.query().where().idEq(scheduleUUID).findOne();
+  }
+
+  public static Optional<Schedule> maybeGet(UUID scheduleUUID) {
+    return Optional.ofNullable(get(scheduleUUID));
   }
 
   public static Schedule getOrBadRequest(UUID scheduleUUID) {
@@ -522,7 +550,6 @@ public class Schedule extends Model {
             .cronExpression(schedule.cronExpression)
             .runningState(schedule.runningState)
             .failureCount(schedule.failureCount)
-            .nextExpectedTask(nextScheduleTaskTime)
             .backlogStatus(schedule.backlogStatus);
 
     ScheduleTask lastTask = ScheduleTask.getLastTask(schedule.getScheduleUUID());
@@ -541,6 +568,21 @@ public class Schedule extends Model {
         builder.backupInfo(getV2ScheduleBackupInfo(params));
         builder.incrementalBackupFrequency(params.incrementalBackupFrequency);
         builder.incrementalBackupFrequencyTimeUnit(params.incrementalBackupFrequencyTimeUnit);
+        if (ScheduleUtil.isIncrementalBackupSchedule(schedule.scheduleUUID)) {
+          Backup latestSuccessfulIncrementalBackup =
+              ScheduleUtil.fetchLatestSuccessfulBackupForSchedule(
+                  schedule.customerUUID, schedule.scheduleUUID);
+          if (latestSuccessfulIncrementalBackup != null) {
+            Date incrementalBackupExpectedTaskTime =
+                new Date(
+                    latestSuccessfulIncrementalBackup.getCreateTime().getTime()
+                        + params.incrementalBackupFrequency);
+            if (nextScheduleTaskTime != null
+                && nextScheduleTaskTime.after(incrementalBackupExpectedTaskTime)) {
+              nextScheduleTaskTime = incrementalBackupExpectedTaskTime;
+            }
+          }
+        }
       } else if (Util.canConvertJsonNode(scheduleTaskParams, MultiTableBackup.Params.class)) {
         MultiTableBackup.Params params =
             mapper.convertValue(scheduleTaskParams, MultiTableBackup.Params.class);
@@ -554,6 +596,7 @@ public class Schedule extends Model {
     } else {
       builder.taskParams(scheduleTaskParams);
     }
+    builder.nextExpectedTask(nextScheduleTaskTime);
     return builder.build();
   }
 

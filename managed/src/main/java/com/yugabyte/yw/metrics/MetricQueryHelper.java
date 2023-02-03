@@ -1,6 +1,7 @@
 // Copyright (c) YugaByte, Inc.
 package com.yugabyte.yw.metrics;
 
+import static com.yugabyte.yw.common.SwamperHelper.getScrapeIntervalSeconds;
 import static play.mvc.Http.Status.BAD_REQUEST;
 import static play.mvc.Http.Status.INTERNAL_SERVER_ERROR;
 
@@ -9,18 +10,23 @@ import com.fasterxml.jackson.databind.ObjectMapper;
 import com.fasterxml.jackson.databind.node.ObjectNode;
 import com.google.common.annotations.VisibleForTesting;
 import com.google.inject.Singleton;
+import com.typesafe.config.Config;
 import com.yugabyte.yw.commissioner.Common.CloudType;
+import com.yugabyte.yw.commissioner.tasks.UniverseTaskBase;
 import com.yugabyte.yw.common.ApiHelper;
+import com.yugabyte.yw.common.KubernetesUtil;
 import com.yugabyte.yw.common.PlacementInfoUtil;
 import com.yugabyte.yw.common.PlatformExecutorFactory;
 import com.yugabyte.yw.common.PlatformServiceException;
 import com.yugabyte.yw.forms.MetricQueryParams;
 import com.yugabyte.yw.forms.UniverseDefinitionTaskParams;
+import com.yugabyte.yw.forms.UniverseDefinitionTaskParams.Cluster;
 import com.yugabyte.yw.forms.UniverseDefinitionTaskParams.ClusterType;
 import com.yugabyte.yw.metrics.data.AlertData;
 import com.yugabyte.yw.metrics.data.AlertsResponse;
 import com.yugabyte.yw.metrics.data.ResponseStatus;
 import com.yugabyte.yw.models.AvailabilityZone;
+import com.yugabyte.yw.models.helpers.CloudInfoInterface;
 import com.yugabyte.yw.models.Customer;
 import com.yugabyte.yw.models.Provider;
 import com.yugabyte.yw.models.Region;
@@ -49,7 +55,6 @@ import org.apache.commons.lang3.StringUtils;
 import org.joda.time.DateTime;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
-import play.Configuration;
 import play.libs.Json;
 
 @Singleton
@@ -71,10 +76,13 @@ public class MetricQueryHelper {
   private static final String NODE_PREFIX = "node_prefix";
   private static final String NAMESPACE = "namespace";
   public static final String EXPORTED_INSTANCE = "exported_instance";
+  public static final String TABLE_ID = "table_id";
+  public static final String TABLE_NAME = "table_name";
+  public static final String NAMESPACE_NAME = "namespace_name";
   private static final String POD_NAME = "pod_name";
   private static final String CONTAINER_NAME = "container_name";
   private static final String PVC = "persistentvolumeclaim";
-  private final play.Configuration appConfig;
+  private final Config appConfig;
 
   private final ApiHelper apiHelper;
 
@@ -84,7 +92,7 @@ public class MetricQueryHelper {
 
   @Inject
   public MetricQueryHelper(
-      Configuration appConfig,
+      Config appConfig,
       ApiHelper apiHelper,
       MetricUrlProvider metricUrlProvider,
       PlatformExecutorFactory platformExecutorFactory) {
@@ -185,12 +193,21 @@ public class MetricQueryHelper {
       if (CollectionUtils.isNotEmpty(metricQueryParams.getClusterUuids())
           || CollectionUtils.isNotEmpty(metricQueryParams.getRegionCodes())
           || CollectionUtils.isNotEmpty(metricQueryParams.getAvailabilityZones())
-          || CollectionUtils.isNotEmpty(metricQueryParams.getNodeNames())) {
+          || CollectionUtils.isNotEmpty(metricQueryParams.getNodeNames())
+          || metricQueryParams.getServerType() != null) {
         // Need to get matching nodes
         universe
             .getNodes()
             .forEach(
                 node -> {
+                  if (metricQueryParams.getServerType() == UniverseTaskBase.ServerType.MASTER
+                      && !node.isMaster) {
+                    return;
+                  }
+                  if (metricQueryParams.getServerType() == UniverseTaskBase.ServerType.TSERVER
+                      && !node.isTserver) {
+                    return;
+                  }
                   if (CollectionUtils.isNotEmpty(metricQueryParams.getClusterUuids())
                       && !metricQueryParams.getClusterUuids().contains(node.placementUuid)) {
                     return;
@@ -245,10 +262,26 @@ public class MetricQueryHelper {
               universeFilterLabel, getNamespacesFilter(universe, nodePrefix, newNamingStyle));
           // Check if the universe is using newNamingStyle.
           if (newNamingStyle) {
-            // TODO(bhavin192): account for max character limit in
-            // Helm release name, which is 53 characters.
-            // The default value in metrics.yml is yb-tserver-(.*)
-            filterJson.put(nodeFilterLabel, nodePrefix + "-(.*)-yb-tserver-(.*)");
+            Set<String> nodePrefixes = new HashSet<String>();
+            for (Cluster cluster : universe.getUniverseDetails().clusters) {
+              Provider provider =
+                  Provider.getOrBadRequest(UUID.fromString(cluster.userIntent.provider));
+              for (Region r : provider.regions) {
+                for (AvailabilityZone az : r.zones) {
+                  boolean isMultiAZ = PlacementInfoUtil.isMultiAZ(provider);
+                  String helmRelease =
+                      KubernetesUtil.getHelmReleaseName(
+                          isMultiAZ,
+                          nodePrefix,
+                          universe.name,
+                          az.name,
+                          cluster.clusterType == ClusterType.ASYNC,
+                          newNamingStyle);
+                  nodePrefixes.add(helmRelease + "-yb-tserver-(.*)");
+                }
+              }
+            }
+            filterJson.put(nodeFilterLabel, StringUtils.join(nodePrefixes, '|'));
           }
         }
       } else {
@@ -299,6 +332,7 @@ public class MetricQueryHelper {
       throw new PlatformServiceException(BAD_REQUEST, "Empty metricsWithSettings data provided.");
     }
 
+    long scrapeInterval = getScrapeIntervalSeconds(appConfig);
     long timeDifference;
     if (params.get("end") != null) {
       timeDifference = Long.parseLong(params.get("end")) - Long.parseLong(params.get("start"));
@@ -310,7 +344,8 @@ public class MetricQueryHelper {
       timeDifference = endTime - Long.parseLong(startTime);
     }
 
-    params.put("range", Long.toString(timeDifference));
+    long range = Math.max(scrapeInterval * 2, timeDifference);
+    params.put("range", Long.toString(range));
 
     String step = params.get("step");
     if (step == null) {
@@ -318,7 +353,7 @@ public class MetricQueryHelper {
         throw new PlatformServiceException(
             BAD_REQUEST, "Should be at least " + STEP_SIZE + " seconds between start and end time");
       }
-      int resolution = Math.round(timeDifference / STEP_SIZE);
+      long resolution = Math.max(scrapeInterval * 2, Math.round(timeDifference / STEP_SIZE));
       params.put("step", String.valueOf(resolution));
     } else {
       try {
@@ -491,12 +526,13 @@ public class MetricQueryHelper {
       for (Region r : Region.getByProvider(provider.uuid)) {
         for (AvailabilityZone az : AvailabilityZone.getAZsForRegion(r.uuid)) {
           boolean isMultiAZ = PlacementInfoUtil.isMultiAZ(provider);
+          Map<String, String> zoneConfig = CloudInfoInterface.fetchEnvVars(az);
           namespaces.add(
-              PlacementInfoUtil.getKubernetesNamespace(
+              KubernetesUtil.getKubernetesNamespace(
                   isMultiAZ,
                   nodePrefix,
                   az.code,
-                  az.getUnmaskedConfig(),
+                  zoneConfig,
                   newNamingStyle,
                   cluster.clusterType == ClusterType.ASYNC));
         }

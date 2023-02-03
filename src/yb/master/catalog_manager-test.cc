@@ -39,6 +39,8 @@ namespace master {
 
 using std::shared_ptr;
 using std::make_shared;
+using std::string;
+using std::vector;
 using strings::Substitute;
 
 class TestLoadBalancerCommunity : public TestLoadBalancerBase<ClusterLoadBalancerMocked> {
@@ -58,7 +60,7 @@ class TestLoadBalancerCommunity : public TestLoadBalancerBase<ClusterLoadBalance
 // interval on the end key (non-inclusive).
 TEST(TableInfoTest, TestAssignmentRanges) {
   const string table_id = CURRENT_TEST_NAME();
-  scoped_refptr<TableInfo> table(new TableInfo(table_id));
+  scoped_refptr<TableInfo> table(new TableInfo(table_id, /* colocated */ false));
   vector<scoped_refptr<TabletInfo>> tablets;
 
   // Define & create the splits.
@@ -83,8 +85,7 @@ TEST(TableInfoTest, TestAssignmentRanges) {
     req.set_max_returned_locations(1);
     req.mutable_table()->mutable_table_name()->assign(table_id);
     req.mutable_partition_key_start()->assign(start_key);
-    vector<scoped_refptr<TabletInfo> > tablets_in_range;
-    table->GetTabletsInRange(&req, &tablets_in_range);
+    vector<scoped_refptr<TabletInfo>> tablets_in_range = table->GetTabletsInRange(&req);
 
     // Only one tablet should own this key.
     ASSERT_EQ(1, tablets_in_range.size());
@@ -359,7 +360,7 @@ void SplitAndDeleteTablets(const TabletInfos& tablets_to_split, TabletInfos* pos
 
 TEST(TestCatalogManager, CheckIfCanDeleteSingleTablet) {
   const string table_id = CURRENT_TEST_NAME();
-  scoped_refptr<TableInfo> table(new TableInfo(table_id));
+  scoped_refptr<TableInfo> table(new TableInfo(table_id, /* colocated */ false));
   TabletInfos pre_split_tablets;
 
   const std::vector<std::string> pre_split_keys = {"a", "b", "c"};

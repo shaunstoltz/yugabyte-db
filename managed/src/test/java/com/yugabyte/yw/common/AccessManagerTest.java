@@ -23,11 +23,13 @@ import static org.mockito.Mockito.when;
 
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.node.ObjectNode;
-import com.typesafe.config.Config;
 import com.google.common.collect.ImmutableList;
+import com.typesafe.config.Config;
 import com.yugabyte.yw.common.config.RuntimeConfigFactory;
 import com.yugabyte.yw.models.AccessKey;
+import com.yugabyte.yw.models.helpers.CloudInfoInterface;
 import com.yugabyte.yw.models.Customer;
+import com.yugabyte.yw.models.FileData;
 import com.yugabyte.yw.models.Provider;
 import com.yugabyte.yw.models.Region;
 import java.io.File;
@@ -35,11 +37,13 @@ import java.io.IOException;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.Paths;
+import java.nio.file.attribute.PosixFilePermission;
 import java.nio.file.attribute.PosixFilePermissions;
 import java.util.ArrayList;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.Set;
 import java.util.UUID;
 import org.apache.commons.io.FileUtils;
 import org.junit.After;
@@ -48,9 +52,9 @@ import org.junit.Test;
 import org.junit.runner.RunWith;
 import org.mockito.ArgumentCaptor;
 import org.mockito.InjectMocks;
-import org.mockito.junit.MockitoJUnitRunner;
 import org.mockito.Mock;
 import org.mockito.Mockito;
+import org.mockito.junit.MockitoJUnitRunner;
 import play.libs.Json;
 
 @RunWith(MockitoJUnitRunner.class)
@@ -99,6 +103,18 @@ public class AccessManagerTest extends FakeDBApplication {
 
   private JsonNode uploadKeyCommand(UUID regionUUID, String keyCode, boolean mimicError)
       throws IOException {
+    String tmpVaultFile = TMP_KEYS_PATH + File.separator + defaultProvider.uuid + "/vault_file";
+    String tmpVaultPassword =
+        TMP_KEYS_PATH + File.separator + defaultProvider.uuid + "/vault_password";
+    createTempFile(
+        TMP_KEYS_PATH + File.separator + defaultProvider.uuid + File.separator,
+        "vault_file",
+        "TEST");
+    createTempFile(
+        TMP_KEYS_PATH + File.separator + defaultProvider.uuid + File.separator,
+        "vault_password",
+        "TEST");
+
     ShellResponse response = new ShellResponse();
     if (mimicError) {
       response.message = "Unknown error occurred";
@@ -119,8 +135,12 @@ public class AccessManagerTest extends FakeDBApplication {
     } else {
       response.code = 0;
       response.message =
-          "{\"vault_file\": \"/path/to/vault_file\","
-              + "\"vault_password\": \"/path/to/vault_password\"}";
+          "{\"vault_file\": \""
+              + tmpVaultFile
+              + "\","
+              + "\"vault_password\": \""
+              + tmpVaultPassword
+              + "\"}";
       when(shellProcessHandler.run(anyList(), anyMap(), anyString())).thenReturn(response);
       String tmpFile = createTempFile("SOME DATA");
       return Json.toJson(
@@ -140,6 +160,18 @@ public class AccessManagerTest extends FakeDBApplication {
   }
 
   private JsonNode runCommand(UUID regionUUID, String commandType, boolean mimicError) {
+    String tmpVaultFile = TMP_KEYS_PATH + File.separator + defaultProvider.uuid + "/vault_file";
+    String tmpVaultPassword =
+        TMP_KEYS_PATH + File.separator + defaultProvider.uuid + "/vault_password";
+    createTempFile(
+        TMP_KEYS_PATH + File.separator + defaultProvider.uuid + File.separator,
+        "vault_file",
+        "TEST");
+    createTempFile(
+        TMP_KEYS_PATH + File.separator + defaultProvider.uuid + File.separator,
+        "vault_password",
+        "TEST");
+
     ShellResponse response = new ShellResponse();
     if (mimicError) {
       response.message = "Unknown error occurred";
@@ -148,9 +180,18 @@ public class AccessManagerTest extends FakeDBApplication {
     } else {
       response.code = 0;
       if (commandType.equals("add-key")) {
-        String tmpPrivateFile = TMP_KEYS_PATH + "/private.key";
-        createTempFile("keys/private.key", "PRIVATE_KEY_FILE");
-        String tmpPublicFile = TMP_KEYS_PATH + "/public.key";
+        String tmpPrivateFile =
+            TMP_KEYS_PATH + File.separator + defaultProvider.uuid + "/private.key";
+        createTempFile(
+            TMP_KEYS_PATH + File.separator + defaultProvider.uuid + File.separator,
+            "private.key",
+            "PRIVATE_KEY_FILE");
+        String tmpPublicFile =
+            TMP_KEYS_PATH + File.separator + defaultProvider.uuid + "/public.key";
+        createTempFile(
+            TMP_KEYS_PATH + File.separator + defaultProvider.uuid + File.separator,
+            "public.key",
+            "PUBLIC_KEY_FILE");
         response.message =
             "{\"public_key\":\""
                 + tmpPublicFile
@@ -163,16 +204,24 @@ public class AccessManagerTest extends FakeDBApplication {
         ShellResponse response2 = new ShellResponse();
         response2.code = 0;
         response2.message =
-            "{\"vault_file\": \"/path/to/vault_file\","
-                + "\"vault_password\": \"/path/to/vault_password\"}";
+            "{\"vault_file\": \""
+                + tmpVaultFile
+                + "\","
+                + "\"vault_password\": \""
+                + tmpVaultPassword
+                + "\"}";
         when(shellProcessHandler.run(anyList(), anyMap(), anyString()))
             .thenReturn(response)
             .thenReturn(response2);
       } else {
         if (commandType.equals("create-vault")) {
           response.message =
-              "{\"vault_file\": \"/path/to/vault_file\","
-                  + "\"vault_password\": \"/path/to/vault_password\"}";
+              "{\"vault_file\": \""
+                  + tmpVaultFile
+                  + "\","
+                  + "\"vault_password\": \""
+                  + tmpVaultPassword
+                  + "\"}";
         } else {
           response.message = "{\"foo\": \"bar\"}";
         }
@@ -180,16 +229,18 @@ public class AccessManagerTest extends FakeDBApplication {
       }
     }
 
-    if (commandType.equals("add-key")) {
-      return Json.toJson(
-          accessManager.addKey(regionUUID, "foo", SSH_PORT, false, false, false, null, false));
-    } else if (commandType.equals("list-keys")) {
-      return accessManager.listKeys(regionUUID);
-    } else if (commandType.equals("create-vault")) {
-      String tmpPrivateFile = TMP_KEYS_PATH + "/vault-private.key";
-      return accessManager.createVault(regionUUID, tmpPrivateFile);
-    } else if (commandType.equals("delete-key")) {
-      return accessManager.deleteKey(regionUUID, "foo");
+    switch (commandType) {
+      case "add-key":
+        return Json.toJson(
+            accessManager.addKey(regionUUID, "foo", SSH_PORT, false, false, false, null, false));
+      case "list-keys":
+        return accessManager.listKeys(regionUUID);
+      case "create-vault":
+        String tmpPrivateFile =
+            TMP_KEYS_PATH + File.separator + defaultProvider.uuid + "/private.key";
+        return accessManager.createVault(regionUUID, tmpPrivateFile);
+      case "delete-key":
+        return accessManager.deleteKey(regionUUID, "foo");
     }
     return null;
   }
@@ -205,7 +256,6 @@ public class AccessManagerTest extends FakeDBApplication {
 
   @Test
   public void testManageAddKeyCommandWithoutProviderConfig() {
-    createTempFile(TMP_KEYS_PATH, "private.key", "test data");
     JsonNode json = runCommand(defaultRegion.uuid, "add-key", false);
     Mockito.verify(shellProcessHandler, times(2))
         .run(command.capture(), cloudCredentials.capture(), anyString());
@@ -215,12 +265,14 @@ public class AccessManagerTest extends FakeDBApplication {
         getBaseCommand(defaultRegion, "add-key")
             + " --key_pair_name foo --key_file_path "
             + TMP_KEYS_PATH
-            + "/"
+            + File.separator
             + defaultProvider.uuid);
     expectedCommands.add(
         getBaseCommand(defaultRegion, "create-vault")
             + " --private_key_file "
             + TMP_KEYS_PATH
+            + File.separator
+            + defaultProvider.uuid
             + "/private.key");
 
     List<List<String>> executedCommands = command.getAllValues();
@@ -230,19 +282,18 @@ public class AccessManagerTest extends FakeDBApplication {
     }
     cloudCredentials
         .getAllValues()
-        .forEach(
-            (cloudCredential) -> {
-              assertTrue(cloudCredential.isEmpty());
-            });
+        .forEach((cloudCredential) -> assertTrue(cloudCredential.isEmpty()));
     assertValidAccessKey(json);
+    List<FileData> fd = FileData.getAll();
+    assertEquals(fd.size(), 4);
   }
 
   @Test
   public void testManageAddKeyCommandWithProviderConfig() {
     Map<String, String> config = new HashMap<>();
-    config.put("accessKey", "ACCESS-KEY");
-    config.put("accessSecret", "ACCESS-SECRET");
-    defaultProvider.setConfig(config);
+    config.put("AWS_ACCESS_KEY_ID", "ACCESS-KEY");
+    config.put("AWS_SECRET_ACCESS_KEY", "ACCESS-SECRET");
+    CloudInfoInterface.setCloudProviderInfoFromConfig(defaultProvider, config);
     defaultProvider.save();
 
     createTempFile(TMP_KEYS_PATH, "private.key", "test data");
@@ -261,6 +312,8 @@ public class AccessManagerTest extends FakeDBApplication {
         getBaseCommand(defaultRegion, "create-vault")
             + " --private_key_file "
             + TMP_KEYS_PATH
+            + File.separator
+            + defaultProvider.uuid
             + "/private.key");
 
     List<List<String>> executedCommands = command.getAllValues();
@@ -272,11 +325,11 @@ public class AccessManagerTest extends FakeDBApplication {
 
     cloudCredentials
         .getAllValues()
-        .forEach(
-            (cloudCredential) -> {
-              assertEquals(config, cloudCredential);
-            });
+        .forEach((cloudCredential) -> assertEquals(config, cloudCredential));
     assertValidAccessKey(json);
+
+    List<FileData> fd = FileData.getAll();
+    assertEquals(fd.size(), 4);
   }
 
   @Test
@@ -316,6 +369,9 @@ public class AccessManagerTest extends FakeDBApplication {
   }
 
   private void assertValidAccessKey(JsonNode json) {
+    String tmpVaultFile = TMP_KEYS_PATH + File.separator + defaultProvider.uuid + "/vault_file";
+    String tmpVaultPassword =
+        TMP_KEYS_PATH + File.separator + defaultProvider.uuid + "/vault_password";
     JsonNode idKey = json.get("idKey");
     assertNotNull(idKey);
     AccessKey accessKey =
@@ -323,10 +379,16 @@ public class AccessManagerTest extends FakeDBApplication {
             UUID.fromString(idKey.get("providerUUID").asText()), idKey.get("keyCode").asText());
     assertNotNull(accessKey);
     JsonNode keyInfo = Json.toJson(accessKey.getKeyInfo());
-    assertValue(keyInfo, "publicKey", TMP_KEYS_PATH + "/public.key");
-    assertValue(keyInfo, "privateKey", TMP_KEYS_PATH + "/private.key");
-    assertValue(keyInfo, "vaultFile", "/path/to/vault_file");
-    assertValue(keyInfo, "vaultPasswordFile", "/path/to/vault_password");
+    assertValue(
+        keyInfo,
+        "publicKey",
+        TMP_KEYS_PATH + File.separator + defaultProvider.uuid + "/public.key");
+    assertValue(
+        keyInfo,
+        "privateKey",
+        TMP_KEYS_PATH + File.separator + defaultProvider.uuid + "/private.key");
+    assertValue(keyInfo, "vaultFile", tmpVaultFile);
+    assertValue(keyInfo, "vaultPasswordFile", tmpVaultPassword);
   }
 
   @Test
@@ -379,10 +441,13 @@ public class AccessManagerTest extends FakeDBApplication {
     String expectedPath =
         String.join("/", TMP_KEYS_PATH, idKey.get("providerUUID").asText(), expectedFilename);
     assertEquals(expectedPath, accessKey.getKeyInfo().privateKey);
-    assertEquals("some-user", accessKey.getKeyInfo().sshUser);
+    defaultProvider.refresh();
+    assertEquals("some-user", defaultProvider.details.sshUser);
     Path keyFile = Paths.get(expectedPath);
     String permissions = PosixFilePermissions.toString(Files.getPosixFilePermissions(keyFile));
     assertEquals(PEM_PERMISSIONS, permissions);
+    List<FileData> fd = FileData.getAll();
+    assertEquals(fd.size(), 3);
   }
 
   @Test
@@ -396,15 +461,15 @@ public class AccessManagerTest extends FakeDBApplication {
 
   @Test
   public void testManageUploadKeyDuplicateKeyCode_PureKeyCode() throws IOException {
-    doTestManageUploadKeyDuplicateKeyCode(TEST_KEY_CODE);
+    doTestManageUploadKeyDuplicateKeyCode();
   }
 
   @Test
   public void testManageUploadKeyDuplicateKeyCode_KeyCodeWithPath() throws IOException {
-    doTestManageUploadKeyDuplicateKeyCode(TEST_KEY_CODE_WITH_PATH);
+    doTestManageUploadKeyDuplicateKeyCode();
   }
 
-  private void doTestManageUploadKeyDuplicateKeyCode(String keyCode) throws IOException {
+  private void doTestManageUploadKeyDuplicateKeyCode() throws IOException {
     AccessKey.KeyInfo keyInfo = new AccessKey.KeyInfo();
     keyInfo.privateKey = TMP_KEYS_PATH + "/private.key";
     AccessKey.create(defaultProvider.uuid, TEST_KEY_CODE, keyInfo);
@@ -444,7 +509,7 @@ public class AccessManagerTest extends FakeDBApplication {
 
   @Test
   public void testCreateVaultWithInvalidFile() {
-    File file = new File(TMP_KEYS_PATH + "/vault-private.key");
+    File file = new File(TMP_KEYS_PATH + File.separator + defaultProvider.uuid + "/private.key");
     file.delete();
     try {
       runCommand(defaultRegion.uuid, "create-vault", false);
@@ -453,13 +518,23 @@ public class AccessManagerTest extends FakeDBApplication {
           re.getMessage(),
           allOf(
               notNullValue(),
-              equalTo("File " + TMP_KEYS_PATH + "/vault-private.key doesn't exists.")));
+              equalTo(
+                  "File "
+                      + TMP_KEYS_PATH
+                      + File.separator
+                      + defaultProvider.uuid
+                      + "/private.key doesn't exists.")));
     }
   }
 
   @Test
   public void testCreateVaultWithValidFile() {
-    createTempFile(TMP_KEYS_PATH, "vault-private.key", "PRIVATE_KEY_FILE");
+    String tmpVaultFile = TMP_KEYS_PATH + "/" + defaultProvider.uuid + "/vault_file";
+    String tmpVaultPassword = TMP_KEYS_PATH + "/" + defaultProvider.uuid + "/vault_password";
+    createTempFile(
+        TMP_KEYS_PATH + File.separator + defaultProvider.uuid + File.separator,
+        "private.key",
+        "TEST");
     JsonNode result = runCommand(defaultRegion.uuid, "create-vault", false);
     Mockito.verify(shellProcessHandler, times(1))
         .run(command.capture(), cloudCredentials.capture(), anyString());
@@ -469,11 +544,13 @@ public class AccessManagerTest extends FakeDBApplication {
         getBaseCommand(defaultRegion, "create-vault")
             + " --private_key_file "
             + TMP_KEYS_PATH
-            + "/vault-private.key";
+            + File.separator
+            + defaultProvider.uuid
+            + "/private.key";
     assertThat(commandStr, allOf(notNullValue(), equalTo(expectedCmd)));
     assertTrue(cloudCredentials.getValue().isEmpty());
-    assertValue(result, "vault_file", "/path/to/vault_file");
-    assertValue(result, "vault_password", "/path/to/vault_password");
+    assertValue(result, "vault_file", tmpVaultFile);
+    assertValue(result, "vault_password", tmpVaultPassword);
   }
 
   @Test
@@ -493,10 +570,7 @@ public class AccessManagerTest extends FakeDBApplication {
     Mockito.verify(shellProcessHandler, times(0)).run(command.capture(), anyMap());
     RuntimeException re =
         assertThrows(
-            RuntimeException.class,
-            () -> {
-              runCommand(defaultRegion.uuid, "add-key", false);
-            });
+            RuntimeException.class, () -> runCommand(defaultRegion.uuid, "add-key", false));
     assertThat(
         re.getMessage(), allOf(notNullValue(), equalTo("Key path /sys/foo/keys doesn't exist.")));
   }
@@ -535,7 +609,7 @@ public class AccessManagerTest extends FakeDBApplication {
   public void testDeleteKeyWithValidRegionInGCP() {
     Provider testProvider = ModelFactory.gcpProvider(defaultCustomer);
     Region testRegion = Region.create(testProvider, "us-west-2", "US West 2", "yb-image");
-    JsonNode result = runCommand(testRegion.uuid, "delete-key", false);
+    runCommand(testRegion.uuid, "delete-key", false);
     Mockito.verify(shellProcessHandler, times(0))
         .run(command.capture(), cloudCredentials.capture());
   }
@@ -580,9 +654,14 @@ public class AccessManagerTest extends FakeDBApplication {
               + com.yugabyte.yw.common.utils.FileUtils.getFileName(configName),
           configFile);
       List<String> lines = Files.readAllLines(Paths.get(configFile));
+      Set<PosixFilePermission> filePermissions =
+          Files.getPosixFilePermissions(Paths.get(configFile));
       assertEquals("hello world", lines.get(0));
       assertNull(config.get("KUBECONFIG_NAME"));
       assertNull(config.get("KUBECONFIG_CONTENT"));
+      assertEquals(filePermissions, PosixFilePermissions.fromString("rw-------"));
+      List<FileData> fd = FileData.getAll();
+      assertEquals(fd.size(), 1);
     } catch (IOException e) {
       e.printStackTrace();
       assertNotNull(e.getMessage());
@@ -601,17 +680,22 @@ public class AccessManagerTest extends FakeDBApplication {
 
   @Test
   public void testCreateKubernetesConfigFileExists() {
+    String path, providerPath;
     try {
       Map<String, String> config = new HashMap<>();
-      String providerPath = "/tmp/yugaware_tests/keys/" + defaultProvider.uuid;
+      providerPath = TMP_KEYS_PATH + "/" + defaultProvider.uuid;
       Files.createDirectory(Paths.get(providerPath));
       Files.write(Paths.get(providerPath + "/demo.conf"), ImmutableList.of("hello world"));
       config.put("KUBECONFIG_NAME", "demo.conf");
       config.put("KUBECONFIG_CONTENT", "hello world");
-      accessManager.createKubernetesConfig(defaultProvider.uuid.toString(), config, false);
+      path = accessManager.createKubernetesConfig(defaultProvider.uuid.toString(), config, false);
     } catch (IOException | RuntimeException e) {
       assertEquals("File demo.conf already exists.", e.getMessage());
+      return;
     }
+    fail(
+        String.format(
+            "%s not expected to be created as it already exits (%s)", path, providerPath));
   }
 
   @Test
@@ -620,11 +704,13 @@ public class AccessManagerTest extends FakeDBApplication {
       ObjectNode credentials = Json.newObject();
       credentials.put("foo", "bar");
       credentials.put("hello", "world");
-      String configFile = accessManager.createCredentialsFile(defaultProvider.uuid, credentials);
+      String configFile = accessManager.createGCPCredentialsFile(defaultProvider.uuid, credentials);
       assertEquals(
           "/tmp/yugaware_tests/amt/keys/" + defaultProvider.uuid + "/credentials.json", configFile);
       List<String> lines = Files.readAllLines(Paths.get(configFile));
       assertEquals("{\"foo\":\"bar\",\"hello\":\"world\"}", lines.get(0));
+      List<FileData> fd = FileData.getAll();
+      assertEquals(fd.size(), 1);
     } catch (IOException e) {
       fail();
     }
@@ -635,7 +721,7 @@ public class AccessManagerTest extends FakeDBApplication {
     Map<String, String> inputConfig = new HashMap<>();
     inputConfig.put("foo", "bar");
     inputConfig.put("hello", "world");
-    accessManager.createCredentialsFile(defaultProvider.uuid, Json.toJson(inputConfig));
+    accessManager.createGCPCredentialsFile(defaultProvider.uuid, Json.toJson(inputConfig));
     Map<String, String> configMap = accessManager.readCredentialsFromFile(defaultProvider.uuid);
     assertEquals(inputConfig, configMap);
   }

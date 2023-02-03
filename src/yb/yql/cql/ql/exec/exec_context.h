@@ -17,8 +17,7 @@
 // executed.
 //--------------------------------------------------------------------------------------------------
 
-#ifndef YB_YQL_CQL_QL_EXEC_EXEC_CONTEXT_H_
-#define YB_YQL_CQL_QL_EXEC_EXEC_CONTEXT_H_
+#pragma once
 
 #include <string>
 
@@ -83,11 +82,13 @@ class QueryPagingState {
   // Compose paging state to send to users.
   Status ComposePagingStateForUser();
   Status ComposePagingStateForUser(const QLPagingStatePB& child_state);
+  Status ComposePagingStateForUser(const QLPagingStatePB& child_state,
+                                   uint32_t overridden_schema_version);
 
   // Load the paging state in DocDB responses.
   Status LoadPagingStateFromDocdb(const RowsResult::SharedPtr& rows_result,
-                                          int64_t number_of_new_rows,
-                                          bool has_nested_query);
+                                  int64_t number_of_new_rows,
+                                  bool has_nested_query);
 
   // Access functions to query_pb_.
   const std::string& table_id() const {
@@ -153,7 +154,7 @@ class QueryPagingState {
   }
 
   // row-read counters.
-  void set_read_count(size_t val) {
+  void set_read_count(int64_t val) {
     counter_pb_.set_read_count(val);
   }
 
@@ -162,7 +163,7 @@ class QueryPagingState {
   }
 
   // row-skip counter.
-  void set_skip_count(size_t val) {
+  void set_skip_count(int64_t val) {
     counter_pb_.set_skip_count(val);
   }
 
@@ -171,7 +172,7 @@ class QueryPagingState {
   }
 
   // row limit counter processing.
-  void set_select_limit(size_t val) {
+  void set_select_limit(int64_t val) {
     counter_pb_.set_select_limit(val);
   }
 
@@ -184,7 +185,7 @@ class QueryPagingState {
   }
 
   // row offset counter processing.
-  void set_select_offset(size_t val) {
+  void set_select_offset(int64_t val) {
     counter_pb_.set_select_offset(val);
   }
 
@@ -197,9 +198,9 @@ class QueryPagingState {
   }
 
   // Debug logging.
-  string DebugString() const {
-    return (string("\nQueryPB = {\n") + query_pb_.DebugString() + string ("\n};") +
-            string("\nCounterPB = {\n") + counter_pb_.DebugString() + string("\n};"));
+  std::string DebugString() const {
+    return (std::string("\nQueryPB = {\n") + query_pb_.DebugString() + std::string ("\n};") +
+            std::string("\nCounterPB = {\n") + counter_pb_.DebugString() + std::string("\n};"));
   }
 
   // Access to internal protobuf.
@@ -211,7 +212,7 @@ class QueryPagingState {
     return counter_pb_;
   }
 
-  uint64_t max_fetch_size() const {
+  int64_t max_fetch_size() const {
     return max_fetch_size_;
   }
 
@@ -563,5 +564,3 @@ class ExecContext : public ProcessContextBase {
 
 }  // namespace ql
 }  // namespace yb
-
-#endif  // YB_YQL_CQL_QL_EXEC_EXEC_CONTEXT_H_
