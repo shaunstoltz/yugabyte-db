@@ -3,9 +3,9 @@
 //  LICENSE file in the root directory of this source tree. An additional grant
 //  of patent rights can be found in the PATENTS file in the same directory.
 //
-// The following only applies to changes made to this file as part of YugaByte development.
+// The following only applies to changes made to this file as part of YugabyteDB development.
 //
-// Portions Copyright (c) YugaByte, Inc.
+// Portions Copyright (c) YugabyteDB, Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License"); you may not use this file except
 // in compliance with the License.  You may obtain a copy of the License at
@@ -25,12 +25,12 @@
 #include <stdio.h>
 
 #include <algorithm>
+#include <cmath>
 #include <map>
 #include <memory>
 #include <string>
 #include <vector>
 
-#include <boost/optional.hpp>
 #include <gtest/gtest.h>
 
 #include "yb/rocksdb/db/dbformat.h"
@@ -42,6 +42,7 @@
 #include "yb/rocksdb/flush_block_policy.h"
 #include "yb/rocksdb/iterator.h"
 #include "yb/rocksdb/memtablerep.h"
+#include "yb/rocksdb/options.h"
 #include "yb/rocksdb/perf_context.h"
 #include "yb/rocksdb/slice_transform.h"
 #include "yb/rocksdb/statistics.h"
@@ -57,6 +58,7 @@
 #include "yb/rocksdb/table/meta_blocks.h"
 #include "yb/rocksdb/table/plain_table_factory.h"
 #include "yb/rocksdb/table/scoped_arena_iterator.h"
+#include "yb/rocksdb/util/coding.h"
 #include "yb/rocksdb/util/compression.h"
 #include "yb/rocksdb/util/file_reader_writer.h"
 #include "yb/rocksdb/util/logging.h"
@@ -64,6 +66,7 @@
 #include "yb/rocksdb/util/statistics.h"
 #include "yb/rocksdb/util/testharness.h"
 #include "yb/rocksdb/util/testutil.h"
+#include "yb/rocksdb/utilities/checkpoint.h"
 
 #include "yb/util/enums.h"
 #include "yb/util/string_util.h"
@@ -98,7 +101,7 @@ class ReverseKeyComparator : public Comparator {
     return "rocksdb.ReverseBytewiseComparator";
   }
 
-  int Compare(const Slice& a, const Slice& b) const override {
+  int Compare(Slice a, Slice b) const override {
     return BytewiseComparator()->Compare(Reverse(a), Reverse(b));
   }
 
@@ -176,7 +179,7 @@ class Constructor {
                             const InternalKeyComparatorPtr& internal_comparator,
                             const stl_wrappers::KVMap& data) = 0;
 
-  virtual InternalIterator* NewIterator() const = 0;
+  virtual InternalIterator* NewIterator(const ReadOptions& ro = {}) const = 0;
 
   virtual const stl_wrappers::KVMap& data() { return data_; }
 
@@ -210,8 +213,11 @@ class BlockConstructor: public Constructor {
                             const stl_wrappers::KVMap& kv_map) override {
     delete block_;
     block_ = nullptr;
-    BlockBuilder builder(
-        table_options.block_restart_interval, table_options.data_block_key_value_encoding_format);
+
+    block_restart_interval_ = table_options.block_restart_interval;
+    key_value_encoding_format_ = table_options.data_block_key_value_encoding_format;
+
+    BlockBuilder builder(block_restart_interval_, key_value_encoding_format_, test_mem_tracker());
 
     for (const auto& kv : kv_map) {
       builder.Add(kv.first, kv.second);
@@ -222,16 +228,20 @@ class BlockConstructor: public Constructor {
     contents.data = data_;
     contents.cachable = false;
     block_ = new Block(std::move(contents));
-    key_value_encoding_format_ = table_options.data_block_key_value_encoding_format;
+
     return Status::OK();
   }
-  InternalIterator* NewIterator() const override {
-    return block_->NewIterator(comparator_, key_value_encoding_format_);
+  InternalIterator* NewIterator(const ReadOptions& ro = {}) const override {
+    size_t restart_block_cache_capacity = ro.cache_restart_block_keys ? block_restart_interval_ : 0;
+    return block_->NewIterator(
+        comparator_, key_value_encoding_format_, /* iter = */ nullptr,
+        /* total_order_seek = */ true, restart_block_cache_capacity);
   }
 
  private:
   const Comparator* comparator_;
   KeyValueEncodingFormat key_value_encoding_format_;
+  int block_restart_interval_;
   std::string data_;
   Block* block_;
 
@@ -239,11 +249,12 @@ class BlockConstructor: public Constructor {
 };
 
 // A helper class that converts internal format keys into user keys
-class KeyConvertingIterator : public InternalIterator {
+class KeyConvertingIterator final : public InternalIterator {
  public:
   explicit KeyConvertingIterator(InternalIterator* iter,
                                  bool arena_mode = false)
       : iter_(iter), arena_mode_(arena_mode) {}
+
   virtual ~KeyConvertingIterator() {
     if (arena_mode_) {
       iter_->~InternalIterator();
@@ -251,29 +262,51 @@ class KeyConvertingIterator : public InternalIterator {
       delete iter_;
     }
   }
-  bool Valid() const override { return iter_->Valid(); }
-  void Seek(const Slice& target) override {
+
+  const KeyValueEntry& Seek(Slice target) override {
     ParsedInternalKey ikey(target, kMaxSequenceNumber, kTypeValue);
     std::string encoded;
     AppendInternalKey(&encoded, ikey);
     iter_->Seek(encoded);
+    return Entry();
   }
-  void SeekToFirst() override { iter_->SeekToFirst(); }
-  void SeekToLast() override { iter_->SeekToLast(); }
-  void Next() override { iter_->Next(); }
-  void Prev() override { iter_->Prev(); }
 
-  Slice key() const override {
-    assert(Valid());
+  const KeyValueEntry& SeekToFirst() override {
+    iter_->SeekToFirst();
+    return Entry();
+  }
+
+  const KeyValueEntry& SeekToLast() override {
+    iter_->SeekToLast();
+    return Entry();
+  }
+
+  const KeyValueEntry& Next() override {
+    iter_->Next();
+    return Entry();
+  }
+
+  const KeyValueEntry& Prev() override {
+    iter_->Prev();
+    return Entry();
+  }
+
+  const KeyValueEntry& Entry() const override {
+    const auto& res = iter_->Entry();
+    if (!res) {
+      return KeyValueEntry::Invalid();
+    }
     ParsedInternalKey parsed_key;
     if (!ParseInternalKey(iter_->key(), &parsed_key)) {
       status_ = STATUS(Corruption, "malformed internal key");
-      return Slice("corrupted key");
+      entry_.key = Slice("corrupted key");
+    } else {
+      entry_.key = parsed_key.user_key;
     }
-    return parsed_key.user_key;
+    entry_.value = res.value;
+    return entry_;
   }
 
-  Slice value() const override { return iter_->value(); }
   Status status() const override {
     return status_.ok() ? iter_->status() : status_;
   }
@@ -282,6 +315,7 @@ class KeyConvertingIterator : public InternalIterator {
   mutable Status status_;
   InternalIterator* iter_;
   bool arena_mode_;
+  mutable KeyValueEntry entry_;
 
   // No copying allowed
   KeyConvertingIterator(const KeyConvertingIterator&);
@@ -346,8 +380,7 @@ class TableConstructor: public Constructor {
         std::move(file_reader_), GetSink()->contents().size(), &table_reader_);
   }
 
-  InternalIterator* NewIterator() const override {
-    ReadOptions ro;
+  InternalIterator* NewIterator(const ReadOptions& ro = {}) const override {
     InternalIterator* iter = table_reader_->NewIterator(ro);
     if (convert_to_internal_key_) {
       return new KeyConvertingIterator(iter);
@@ -444,9 +477,9 @@ class MemTableConstructor: public Constructor {
     }
     return Status::OK();
   }
-  InternalIterator* NewIterator() const override {
+  InternalIterator* NewIterator(const ReadOptions& ro = {}) const override {
     return new KeyConvertingIterator(
-        memtable_->NewIterator(ReadOptions(), &arena_), true);
+        memtable_->NewIterator(ro, &arena_), true);
   }
 
   bool AnywayDeleteIterator() const override { return true; }
@@ -465,18 +498,43 @@ class MemTableConstructor: public Constructor {
 class InternalIteratorFromIterator : public InternalIterator {
  public:
   explicit InternalIteratorFromIterator(Iterator* it) : it_(it) {}
-  bool Valid() const override { return it_->Valid(); }
-  void Seek(const Slice& target) override { it_->Seek(target); }
-  void SeekToFirst() override { it_->SeekToFirst(); }
-  void SeekToLast() override { it_->SeekToLast(); }
-  void Next() override { it_->Next(); }
-  void Prev() override { it_->Prev(); }
-  Slice key() const override { return it_->key(); }
-  Slice value() const override { return it_->value(); }
+
+  const KeyValueEntry& Seek(Slice target) override {
+    it_->Seek(target);
+    return Entry();
+  }
+  const KeyValueEntry& SeekToFirst() override {
+    it_->SeekToFirst();
+    return Entry();
+  }
+  const KeyValueEntry& SeekToLast() override {
+    it_->SeekToLast();
+    return Entry();
+  }
+
+  const KeyValueEntry& Next() override {
+    it_->Next();
+    return Entry();
+  }
+
+  const KeyValueEntry& Prev() override {
+    it_->Prev();
+    return Entry();
+  }
+
+  const KeyValueEntry& Entry() const override {
+    const auto& entry = it_->Entry();
+    if (!entry) {
+      return KeyValueEntry::Invalid();
+    }
+    return entry_ = entry;
+  }
+
   Status status() const override { return it_->status(); }
 
  private:
   unique_ptr<Iterator> it_;
+  mutable KeyValueEntry entry_;
 };
 
 class DBConstructor: public Constructor {
@@ -506,8 +564,8 @@ class DBConstructor: public Constructor {
     return Status::OK();
   }
 
-  InternalIterator* NewIterator() const override {
-    return new InternalIteratorFromIterator(db_->NewIterator(ReadOptions()));
+  InternalIterator* NewIterator(const ReadOptions& ro = {}) const override {
+    return new InternalIteratorFromIterator(db_->NewIterator(ro));
   }
 
   DB* db() const override { return db_; }
@@ -778,6 +836,7 @@ class HarnessTest : public RocksDBTest {
       iter->Next();
     }
     ASSERT_TRUE(!iter->Valid());
+    ASSERT_OK(iter->status());
     if (constructor_->IsArenaMode() && !constructor_->AnywayDeleteIterator()) {
       iter->~InternalIterator();
     } else {
@@ -787,7 +846,9 @@ class HarnessTest : public RocksDBTest {
 
   void TestBackwardScan(const std::vector<std::string>& keys,
                         const stl_wrappers::KVMap& data) {
-    InternalIterator* iter = constructor_->NewIterator();
+    ReadOptions ro;
+    ro.cache_restart_block_keys = CacheRestartBlockKeys::kTrue;
+    InternalIterator* iter = constructor_->NewIterator(ro);
     ASSERT_TRUE(!iter->Valid());
     iter->SeekToLast();
     for (stl_wrappers::KVMap::const_reverse_iterator model_iter = data.rbegin();
@@ -796,6 +857,7 @@ class HarnessTest : public RocksDBTest {
       iter->Prev();
     }
     ASSERT_TRUE(!iter->Valid());
+    ASSERT_OK(iter->status());
     if (constructor_->IsArenaMode() && !constructor_->AnywayDeleteIterator()) {
       iter->~InternalIterator();
     } else {
@@ -869,6 +931,7 @@ class HarnessTest : public RocksDBTest {
         }
       }
     }
+    ASSERT_OK(iter->status());
     if (constructor_->IsArenaMode() && !constructor_->AnywayDeleteIterator()) {
       iter->~InternalIterator();
     } else {
@@ -896,7 +959,7 @@ class HarnessTest : public RocksDBTest {
 
   std::string ToString(const InternalIterator* it) {
     if (!it->Valid()) {
-      return "END";
+      return it->status().ok() ? "END" : "Error: " + it->status().ToString();
     } else {
       return "'" + it->key().ToString() + "->" + it->value().ToString() + "'";
     }
@@ -975,7 +1038,12 @@ class TableTest : public RocksDBTest {
 };
 
 class GeneralTableTest : public TableTest {};
-class BlockBasedTableTest : public TableTest {};
+class BlockBasedTableTest : public TableTest {
+ public:
+  void TestMiddleKey(
+      uint64_t num_records, uint64_t index_step, size_t data_block_size,
+      int expected_num_index_levels, int expected_num_data_blocks = 0);
+};
 class PlainTableTest : public TableTest {};
 class TablePropertyTest : public RocksDBTest {};
 
@@ -1054,7 +1122,8 @@ TEST_F(BlockBasedTableTest, BasicBlockBasedTableProperties) {
   ASSERT_EQ("", props.filter_policy_name);  // no filter policy is used
 
   // Verify data size.
-  BlockBuilder block_builder(1, table_options.data_block_key_value_encoding_format);
+  BlockBuilder block_builder(
+      1, table_options.data_block_key_value_encoding_format, test_mem_tracker());
   for (const auto& item : kvmap) {
     block_builder.Add(item.first, item.second);
   }
@@ -1463,6 +1532,7 @@ void TableTest::TestIndex(BlockBasedTableOptions table_options, int expected_num
     if (i == prefixes.size() - 1) {
       // last key
       ASSERT_TRUE(!iter->Valid());
+      ASSERT_OK(iter->status());
     } else {
       ASSERT_TRUE(iter->Valid());
       // seek the first element in the block
@@ -1477,7 +1547,6 @@ void TableTest::TestIndex(BlockBasedTableOptions table_options, int expected_num
     iter->Seek(InternalKey(prefix, 0, kTypeValue).Encode());
     // regular_iter->Seek(prefix);
 
-    ASSERT_OK(iter->status());
     // Seek to non-existing prefixes should yield either invalid, or a
     // key with prefix greater than the target.
     if (iter->Valid()) {
@@ -1485,6 +1554,7 @@ void TableTest::TestIndex(BlockBasedTableOptions table_options, int expected_num
       Slice ukey_prefix = options.prefix_extractor->Transform(ukey);
       ASSERT_LT(BytewiseComparator()->Compare(prefix, ukey_prefix), 0);
     }
+    ASSERT_OK(iter->status());
   }
 }
 
@@ -1593,7 +1663,6 @@ class BlockCachePropertiesSnapshot {
     filter_block_cache_miss =
         statistics->getTickerCount(BLOCK_CACHE_FILTER_MISS);
     filter_block_cache_hit = statistics->getTickerCount(BLOCK_CACHE_FILTER_HIT);
-    block_cache_bytes_read = statistics->getTickerCount(BLOCK_CACHE_BYTES_READ);
     block_cache_bytes_write =
         statistics->getTickerCount(BLOCK_CACHE_BYTES_WRITE);
   }
@@ -1626,7 +1695,7 @@ class BlockCachePropertiesSnapshot {
               block_cache_hit);
   }
 
-  int64_t GetCacheBytesRead() { return block_cache_bytes_read; }
+  int64_t GetCacheHit() { return block_cache_hit; }
 
   int64_t GetCacheBytesWrite() { return block_cache_bytes_write; }
 
@@ -1639,7 +1708,6 @@ class BlockCachePropertiesSnapshot {
   int64_t data_block_cache_hit = 0;
   int64_t filter_block_cache_miss = 0;
   int64_t filter_block_cache_hit = 0;
-  int64_t block_cache_bytes_read = 0;
   int64_t block_cache_bytes_write = 0;
 };
 
@@ -1719,17 +1787,17 @@ TEST_F(BlockBasedTableTest, FilterBlockInBlockCache) {
   // Since block_cache is disabled, no cache activities will be involved.
   unique_ptr<InternalIterator> iter;
 
-  int64_t last_cache_bytes_read = 0;
+  int64_t last_cache_hit = 0;
   // At first, no block will be accessed.
   {
     BlockCachePropertiesSnapshot props(options.statistics.get());
     // index won't be added to block cache.
     props.AssertEqual(0,  // index block miss
                       0, 0, 0);
-    ASSERT_EQ(props.GetCacheBytesRead(), 0);
+    ASSERT_EQ(props.GetCacheHit(), 0);
     ASSERT_EQ(props.GetCacheBytesWrite(),
               table_options.block_cache->GetUsage());
-    last_cache_bytes_read = props.GetCacheBytesRead();
+    last_cache_hit = props.GetCacheHit();
   }
 
   // Only index block will be accessed
@@ -1738,11 +1806,11 @@ TEST_F(BlockBasedTableTest, FilterBlockInBlockCache) {
     BlockCachePropertiesSnapshot props(options.statistics.get());
     props.AssertEqual(1,  // index block miss
                       0, 0, 0);
-    // Cache miss, Bytes read from cache should not change
-    ASSERT_EQ(props.GetCacheBytesRead(), last_cache_bytes_read);
+    // Cache miss
+    ASSERT_EQ(props.GetCacheHit(), last_cache_hit);
     ASSERT_EQ(props.GetCacheBytesWrite(),
               table_options.block_cache->GetUsage());
-    last_cache_bytes_read = props.GetCacheBytesRead();
+    last_cache_hit = props.GetCacheHit();
   }
 
   // Only data block will be accessed
@@ -1754,11 +1822,11 @@ TEST_F(BlockBasedTableTest, FilterBlockInBlockCache) {
     // value; other numbers remain the same.
     props.AssertEqual(1, 0, 0 + 1,  // data block miss
                       0);
-    // Cache miss, Bytes read from cache should not change
-    ASSERT_EQ(props.GetCacheBytesRead(), last_cache_bytes_read);
+    // Cache miss
+    ASSERT_EQ(props.GetCacheHit(), last_cache_hit);
     ASSERT_EQ(props.GetCacheBytesWrite(),
               table_options.block_cache->GetUsage());
-    last_cache_bytes_read = props.GetCacheBytesRead();
+    last_cache_hit = props.GetCacheHit();
   }
 
   // Data block will be in cache
@@ -1768,11 +1836,11 @@ TEST_F(BlockBasedTableTest, FilterBlockInBlockCache) {
     BlockCachePropertiesSnapshot props(options.statistics.get());
     props.AssertEqual(1, 0 + 1, /* index block hit */
                       1, 0 + 1 /* data block hit */);
-    // Cache hit, bytes read from cache should increase
-    ASSERT_GT(props.GetCacheBytesRead(), last_cache_bytes_read);
+    // Cache hit
+    ASSERT_GT(props.GetCacheHit(), last_cache_hit);
     ASSERT_EQ(props.GetCacheBytesWrite(),
               table_options.block_cache->GetUsage());
-    last_cache_bytes_read = props.GetCacheBytesRead();
+    last_cache_hit = props.GetCacheHit();
   }
   // release the iterator so that the block cache can reset correctly.
   iter.reset();
@@ -1789,8 +1857,8 @@ TEST_F(BlockBasedTableTest, FilterBlockInBlockCache) {
     BlockCachePropertiesSnapshot props(options.statistics.get());
     props.AssertEqual(0,  // index block miss
                       0, 0, 0);
-    // Cache miss, Bytes read from cache should not change
-    ASSERT_EQ(props.GetCacheBytesRead(), 0);
+    // Cache miss
+    ASSERT_EQ(props.GetCacheHit(), 0);
   }
 
   {
@@ -1802,8 +1870,8 @@ TEST_F(BlockBasedTableTest, FilterBlockInBlockCache) {
     props.AssertEqual(0 + 1,  // index block miss
                       0, 0,   // data block miss
                       0);
-    // Cache hit, bytes read from cache should increase
-    ASSERT_EQ(props.GetCacheBytesRead(), 0);
+    // Cache miss
+    ASSERT_EQ(props.GetCacheHit(), 0);
   }
 
   {
@@ -1813,8 +1881,8 @@ TEST_F(BlockBasedTableTest, FilterBlockInBlockCache) {
     BlockCachePropertiesSnapshot props(options.statistics.get());
     props.AssertEqual(1, 0, 0 + 1,  // data block miss
                       0);
-    // Cache miss, Bytes read from cache should not change
-    ASSERT_EQ(props.GetCacheBytesRead(), 0);
+    // Cache miss
+    ASSERT_EQ(props.GetCacheHit(), 0);
   }
   iter.reset();
 
@@ -2040,19 +2108,24 @@ std::string GenerateKey(int primary_key, int secondary_key, int padding_size, Ra
   return k;
 }
 
-void RunPerformanceTest(
+YB_DEFINE_ENUM(WorkloadType, (kScanForward)(kScanBackward)(kSeek));
+using WorkloadTypeSet = yb::EnumBitSet<WorkloadType>;
+
+uint64_t RunPerformanceTest(
+    WorkloadTypeSet workloads,
     size_t block_size,
-    const IndexType& idx_type,
-    bool run_scan_test,  // if false, runs seek tests.
+    IndexType idx_type,
     int restart_interval = 1,
-    int num_keys = 10000,
+    size_t num_keys = 10000,
     bool use_delta_encoding = false,
-    KeyValueEncodingFormat encoding_format =
-        KeyValueEncodingFormat::kKeyDeltaEncodingSharedPrefix) {
+    KeyValueEncodingFormat encoding_format = KeyValueEncodingFormat::kKeyDeltaEncodingSharedPrefix,
+    const ReadOptions& ro = {}) {
+  constexpr auto kBlockRestartInterval = 16;
   BlockBasedTableOptions table_options;
   table_options.index_type = idx_type;
   table_options.block_size = block_size;
   table_options.block_cache = NewLRUCache(1 * 1024 * 1024);
+  table_options.block_restart_interval = kBlockRestartInterval;
   table_options.index_block_restart_interval = restart_interval;
   table_options.min_keys_per_index_block = 100;
   table_options.use_delta_encoding = use_delta_encoding;
@@ -2061,7 +2134,7 @@ void RunPerformanceTest(
   TableConstructor table_constructor(BytewiseComparator());
   Random rnd(test::RandomSeed());
   Slice value_slice;
-  for (int i = 0; i < num_keys; i++) {
+  for (int i = 0; i < yb::narrow_cast<int>(num_keys); i++) {
     /*10 digits value is generated for primary and secondary key by GenerateKey*/
     auto key = GenerateKey(i, i + 1000, 32 - 10, &rnd);
     table_constructor.Add(key, value_slice);
@@ -2081,54 +2154,85 @@ void RunPerformanceTest(
   LOG(INFO) << "IndexType: " << idx_type << ", KeyCount: " << num_keys
             << ", BlockSize: " << block_size << ", RestartInterval: " << restart_interval
             << ", UseDeltaEncoding: " << use_delta_encoding << ", Encoding: " << encoding_format;
-  if (run_scan_test) {
-    LOG(INFO) << "Result order: Next, Prev in nanosecond";
-  } else {
-    LOG(INFO) << "Result order: Incr order, Incr order with gaps, Decr order, Decr order with "
-                 "gaps, Random seek, Random seek with gaps";
+  std::stringstream order_msg;
+  for (const auto wl : workloads) {
+    if (order_msg.tellp() > 0) order_msg << ", ";
+    switch (wl) {
+      case WorkloadType::kScanForward:
+        order_msg << "Next in nanosecond";
+        break;
+      case WorkloadType::kScanBackward:
+        order_msg << "Prev in nanosecond";
+        break;
+      case WorkloadType::kSeek:
+        order_msg << "Incr order, Incr order with gaps, Decr order, Decr order with "
+                     "gaps, Random seek, Random seek with gaps";
+        break;
+      default:
+        FATAL_INVALID_ENUM_VALUE(WorkloadType, wl);
+    }
   }
+  LOG(INFO) << "Result order: " << order_msg.str();
 
+  uint64_t time_taken = 0;
   unique_ptr<InternalIterator> iter;
   std::stringstream result;
   auto run_benchmark = [&](std::function<void()>&& callback, int multiplier = 1) {
-    iter.reset(table_constructor.NewIterator());
+    iter.reset(table_constructor.NewIterator(ro));
 
     auto start = Env::Default()->NowNanos();
     callback();
-    auto time_taken = (Env::Default()->NowNanos() - start);
-    auto per_key_ns = (time_taken * multiplier) / num_keys;
-    result << per_key_ns << ", ";
+    auto time_spent = (Env::Default()->NowNanos() - start);
+    auto per_key_ns = (time_spent * multiplier) / num_keys;
+    if (result.tellp() > 0) {
+      result << ", ";
+    }
+    result << per_key_ns;
+    return time_spent;
   };
 
-  if (run_scan_test) {
+  if (workloads.Test(WorkloadType::kScanForward)) {
     // Next scan text.
-    run_benchmark([&]() {
+    size_t counter = 0;
+    time_taken += run_benchmark([&]() {
       for (iter->SeekToFirst(); iter->Valid(); iter->Next()) {
         /*const auto k =*/ iter->key();
         /*const auto v =*/ iter->value();
+        ++counter;
       }
+      ASSERT_OK(iter->status());
+      ASSERT_EQ(counter, num_keys);
       return;
     });
+  }
 
+  if (workloads.Test(WorkloadType::kScanBackward)) {
     // Prev scan text.
-    run_benchmark([&]() {
+    size_t counter = 0;
+    time_taken += run_benchmark([&]() {
       for (iter->SeekToLast(); iter->Valid(); iter->Prev()) {
         /*const auto k =*/ iter->key();
         /*const auto v =*/ iter->value();
+        ++counter;
       }
+      ASSERT_OK(iter->status());
+      ASSERT_EQ(counter, num_keys);
       return;
     });
-  } else {
+  }
+
+  if (workloads.Test(WorkloadType::kSeek)) {
     // Increasing order.
-    run_benchmark([&]() {
+    time_taken += run_benchmark([&]() {
       for (size_t k = 0; k < keys.size(); k++) {
         iter->Seek(keys[k]);
       }
+      ASSERT_OK(iter->status());
       return;
     });
 
     // Increasing order with gaps.
-    run_benchmark(
+    time_taken += run_benchmark(
         [&]() {
           for (size_t k = 0; k < keys.size(); k += 5) {
             iter->Seek(keys[k]);
@@ -2138,14 +2242,14 @@ void RunPerformanceTest(
         5);
 
     // Decreasing order.
-    run_benchmark([&]() {
+    time_taken += run_benchmark([&]() {
       for (int k = static_cast<int>(keys.size()) - 1; k >= 0; k--) {
         iter->Seek(keys[k]);
       }
     });
 
     // Decreasing order with gaps.
-    run_benchmark(
+    time_taken += run_benchmark(
         [&]() {
           for (int k = static_cast<int>(keys.size()) - 1; k >= 0; k -= 5) {
             iter->Seek(keys[k]);
@@ -2160,14 +2264,14 @@ void RunPerformanceTest(
     }
 
     // Random seek.
-    run_benchmark([&]() {
+    time_taken += run_benchmark([&]() {
       for (size_t k = 0; k < keys.size(); k++) {
         iter->Seek(keys_random[k]);
       }
     });
 
     // Random seek with gaps.
-    run_benchmark(
+    time_taken += run_benchmark(
         [&]() {
           for (size_t k = 0; k < keys.size(); k += 5) {
             iter->Seek(keys_random[k]);
@@ -2177,13 +2281,15 @@ void RunPerformanceTest(
   }
 
   LOG(INFO) << result.str();
+  return time_taken;
 }
 
 void TestSeekPerformance(
     size_t block_size, const IndexType& idx_type, int restart_interval = 1, int num_keys = 10000) {
+  const auto workload = WorkloadTypeSet{WorkloadType::kSeek};
   // Run every test 2 times.
-  RunPerformanceTest(block_size, idx_type, false /*run_scan_test*/, restart_interval, num_keys);
-  RunPerformanceTest(block_size, idx_type, false /*run_scan_test*/, restart_interval, num_keys);
+  RunPerformanceTest(workload, block_size, idx_type, restart_interval, num_keys);
+  RunPerformanceTest(workload, block_size, idx_type, restart_interval, num_keys);
 }
 
 void TestScanPerformance(
@@ -2192,32 +2298,121 @@ void TestScanPerformance(
     KeyValueEncodingFormat encoding_format =
         KeyValueEncodingFormat::kKeyDeltaEncodingSharedPrefix) {
   IndexType idx_type = IndexType::kBinarySearch;
+  WorkloadTypeSet workload { WorkloadType::kScanForward, WorkloadType::kScanBackward };
+
   // Run every test 2 times.
   RunPerformanceTest(
-      block_size, IndexType::kBinarySearch, true /*run_scan_test*/, 1 /*restart_interval*/,
-      10000 /*num_keys*/, use_delta_encoding, encoding_format);
+      workload, block_size, IndexType::kBinarySearch, /* restart_interval = */ 1,
+      /* num_keys = */ 10000, use_delta_encoding, encoding_format);
   RunPerformanceTest(
-      block_size, IndexType::kBinarySearch, true /*run_scan_test*/, 1 /*restart_interval*/,
-      10000 /*num_keys*/, use_delta_encoding, encoding_format);
+      workload, block_size, IndexType::kBinarySearch, /* restart_interval = */ 1,
+      /* num_keys = */ 10000, use_delta_encoding, encoding_format);
+}
+
+// Supports only WorkloadType::kScanForward and WorkloadType::kScanBackward.
+void TestScanPerformance(
+    size_t num_repeats,
+    WorkloadType scan_type,
+    const ReadOptions& ro = {},
+    size_t num_keys = 100000,
+    size_t block_size = 32_KB,
+    bool use_delta_encoding = true,
+    KeyValueEncodingFormat encoding_format =
+        KeyValueEncodingFormat::kKeyDeltaEncodingThreeSharedParts,
+    IndexType idx_type = IndexType::kMultiLevelBinarySearch) {
+  const int index_restart_interval = 1;
+  uint64_t total_time = 0;
+  size_t num_runs = 0;
+
+  // A vector to store experiment times to calculate unbiased estimation of standard deviation.
+  std::vector<double> run_time_us;
+  run_time_us.reserve(num_runs);
+
+  WorkloadTypeSet workload { scan_type };
+  while (num_runs++ < num_repeats) {
+    auto time_taken = RunPerformanceTest(
+      workload, block_size, idx_type, index_restart_interval,
+      num_keys, use_delta_encoding, encoding_format, ro);
+    LOG(INFO) << "Run #" << num_runs << ": " << time_taken / 1000 << " us, "
+              << "per key: " << time_taken / num_keys << " ns";
+    total_time += time_taken;
+    run_time_us.push_back(static_cast<double>(time_taken) / 1000);
+  }
+
+  const auto total_avg = total_time / static_cast<double>(num_repeats);
+  const auto total_avg_us = total_avg / 1000;
+
+  // Calculate standard deviation.
+  double std_dev_us = 0.0;
+  double num_std_dev = 0.0;
+  double num_2x_std_dev = 0.0;
+  double num_3x_std_dev = 0.0;
+  if (num_repeats > 1) {
+    for (const auto rt : run_time_us) {
+      std_dev_us += std::pow(total_avg_us - rt, 2.0);
+    }
+    std_dev_us = std::sqrt(std_dev_us / (num_repeats - 1));
+    const double std_dev_2x = std_dev_us * 2;
+    const double std_dev_3x = std_dev_us * 3;
+    for (const auto rt : run_time_us) {
+      const auto delta = std::abs(rt - total_avg_us);
+      if (delta <= std_dev_us) {
+        ++num_std_dev;
+        ++num_2x_std_dev;
+        ++num_3x_std_dev;
+      } else if (delta <= std_dev_2x) {
+        ++num_2x_std_dev;
+        ++num_3x_std_dev;
+      } else if (delta <= std_dev_3x) {
+        ++num_3x_std_dev;
+      }
+    }
+    num_std_dev    /= num_repeats;
+    num_2x_std_dev /= num_repeats;
+    num_3x_std_dev /= num_repeats;
+  }
+
+
+  LOG(INFO) << "num keys: " << num_keys << ", "
+            << "avg time per key: " << total_avg / num_keys << " ns, "
+            << "avg time: " << total_avg_us << " us, "
+            << "std dev: "  << std_dev_us   << " us, "
+            << "hits in [avg - std dev, avg + 1x std dev]: "    << 100 * num_std_dev    << "%, "
+            << "hits in [avg - 2x std dev, avg + 2x std dev]: " << 100 * num_2x_std_dev << "%, "
+            << "hits in [avg - 3x std dev, avg + 3x std dev]: " << 100 * num_3x_std_dev << "%";
+}
+
+TEST_F(BlockBasedTableTest, DISABLED_ForwardScanPerformanceTest) {
+  TestScanPerformance(/* num_repeats = */ 1000, WorkloadType::kScanForward);
+}
+
+TEST_F(BlockBasedTableTest, DISABLED_BackwardScanPerformanceTest) {
+  TestScanPerformance(/* num_repeats = */ 1000, WorkloadType::kScanBackward);
+}
+
+TEST_F(BlockBasedTableTest, DISABLED_FastBackwardScanPerformanceTest) {
+  ReadOptions read_options;
+  read_options.cache_restart_block_keys = CacheRestartBlockKeys::kTrue;
+  TestScanPerformance(/* num_repeats = */ 1000, WorkloadType::kScanBackward, read_options);
 }
 
 TEST_F(BlockBasedTableTest, DISABLED_ScanPerformanceTest) {
   bool use_delta_encoding = true;
   KeyValueEncodingFormat encoding_format =
       KeyValueEncodingFormat::kKeyDeltaEncodingThreeSharedParts;
-  TestScanPerformance(8_KB, use_delta_encoding, encoding_format);
+  TestScanPerformance(8_KB,  use_delta_encoding, encoding_format);
   TestScanPerformance(16_KB, use_delta_encoding, encoding_format);
   TestScanPerformance(32_KB, use_delta_encoding, encoding_format);
   TestScanPerformance(64_KB, use_delta_encoding, encoding_format);
 }
 
 TEST_F(BlockBasedTableTest, DISABLED_IndexTypeSeekPerformanceTest) {
-  TestSeekPerformance(8_KB, IndexType::kBinarySearch);
+  TestSeekPerformance(8_KB,  IndexType::kBinarySearch);
   TestSeekPerformance(16_KB, IndexType::kBinarySearch);
   TestSeekPerformance(32_KB, IndexType::kBinarySearch);
   TestSeekPerformance(64_KB, IndexType::kBinarySearch);
 
-  TestSeekPerformance(8_KB, IndexType::kMultiLevelBinarySearch);
+  TestSeekPerformance(8_KB,  IndexType::kMultiLevelBinarySearch);
   TestSeekPerformance(16_KB, IndexType::kMultiLevelBinarySearch);
   TestSeekPerformance(32_KB, IndexType::kMultiLevelBinarySearch);
   TestSeekPerformance(64_KB, IndexType::kMultiLevelBinarySearch);
@@ -2481,6 +2676,7 @@ TEST_F(MemTableTest, Simple) {
             iter->value().ToString().c_str());
     iter->Next();
   }
+  ASSERT_OK(iter->status());
 
   delete memtable->Unref();
 }
@@ -2646,13 +2842,13 @@ TEST_P(IndexBlockRestartIntervalTest, IndexBlockRestartInterval) {
 
   int index_block_restart_interval = GetParam();
 
-  std::vector<boost::optional<KeyValueEncodingFormat>> formats_to_test;
+  std::vector<std::optional<KeyValueEncodingFormat>> formats_to_test;
   for (const auto& format : KeyValueEncodingFormatList()) {
     formats_to_test.push_back(format);
   }
   // Also test backward compatibility with SST files without
   // BlockBasedTablePropertyNames::kDataBlockKeyValueEncodingFormat property.
-  formats_to_test.push_back(boost::none);
+  formats_to_test.push_back(std::nullopt);
 
   for (const auto& format : formats_to_test) {
     Options options;
@@ -2663,7 +2859,7 @@ TEST_P(IndexBlockRestartIntervalTest, IndexBlockRestartInterval) {
     // be written with using KeyValueEncodingFormat::kKeyDeltaEncodingSharedPrefix, because there
     // were no other formats before we added this property.
     table_options.data_block_key_value_encoding_format =
-        format.get_value_or(KeyValueEncodingFormat::kKeyDeltaEncodingSharedPrefix);
+        format.value_or(KeyValueEncodingFormat::kKeyDeltaEncodingSharedPrefix);
     options.table_factory.reset(new BlockBasedTableFactory(table_options));
 
     TableConstructor c(BytewiseComparator());
@@ -2704,6 +2900,7 @@ TEST_P(IndexBlockRestartIntervalTest, IndexBlockRestartInterval) {
       ASSERT_EQ(db_iter->value(), kv_iter->second);
       kv_iter++;
     }
+    ASSERT_OK(db_iter->status());
     ASSERT_EQ(kv_iter, kvmap.end());
   }
 }
@@ -2822,18 +3019,180 @@ TEST_F(TableTest, MiddleOfMiddleKey) {
   GenerateSSTFile(db, 200, 300);
 
   // Same as the midkey of the largest sst which has 300 records.
-  const auto mkey_first = ASSERT_RESULT(db->GetMiddleKey());
+  const Slice kEmptyKey;
+  const Slice kEmptyInternalKey;
+  const auto mkey_first = ASSERT_RESULT(db->GetMiddleKey(kEmptyKey));
   const auto tw = ASSERT_RESULT(db->TEST_GetLargestSstTableReader());
-  const auto mid_key_of_sst = ASSERT_RESULT(tw->GetMiddleKey());
+  const auto mid_key_of_sst = ASSERT_RESULT(tw->GetMiddleKey(kEmptyInternalKey));
   ASSERT_EQ(mkey_first, mid_key_of_sst);
 
   // Create a file with 400 records. This is largest sst.
   GenerateSSTFile(db, 500, 400);
 
-  const auto mkey_second = ASSERT_RESULT(db->GetMiddleKey());
+  const auto mkey_second = ASSERT_RESULT(db->GetMiddleKey(kEmptyKey));
   // Still the same as the midkey of the previous largest sst.
   ASSERT_EQ(mkey_second, mid_key_of_sst);
   delete db;
+}
+
+// Open the first DB and generate some keys. Then open the second DB using a checkpoint
+// from the first one. Verify that both databases share the same block cache key prefix.
+TEST_F(TableTest, YB_LINUX_ONLY_TEST(BlockCacheWithHardlink)) {
+  BlockBasedTableOptions table_options;
+  table_options.block_size = 1024;
+  table_options.block_cache = NewLRUCache(16_MB / FLAGS_cache_single_touch_ratio);
+
+  rocksdb::Options options;
+  options.compaction_style = rocksdb::kCompactionStyleNone;
+  options.num_levels = 1;
+  options.create_if_missing = true;
+  options.table_factory.reset(NewBlockBasedTableFactory(table_options));
+
+  const std::string kDBPath = test::TmpDir() + "/hardlink";
+  ASSERT_OK(DestroyDB(kDBPath, options));
+  rocksdb::DB* db;
+  ASSERT_OK(rocksdb::DB::Open(options, kDBPath, &db));
+
+  GenerateSSTFile(db, 0, 10);
+
+  const Slice kEmptyKey;
+  const auto mkey = ASSERT_RESULT(db->GetMiddleKey(kEmptyKey));
+  const auto tw_1 = ASSERT_RESULT(db->TEST_GetLargestSstTableReader());
+  auto* table_reader_1 = dynamic_cast<BlockBasedTable*>(tw_1);
+  ASSERT_TRUE(table_reader_1->TEST_KeyInCache(ReadOptions(), mkey));
+
+  LOG(INFO) << "Opening checkpoint db";
+  auto checkpoint_dir = kDBPath + "/checkpoints";
+  ASSERT_OK(checkpoint::CreateCheckpoint(db, checkpoint_dir));
+  rocksdb::DB* checkpoint_db;
+  ASSERT_OK(rocksdb::DB::Open(options, checkpoint_dir, &checkpoint_db));
+  const auto tw_2 = ASSERT_RESULT(checkpoint_db->TEST_GetLargestSstTableReader());
+  auto* table_reader_2 = dynamic_cast<BlockBasedTable*>(tw_2);
+  ASSERT_TRUE(table_reader_2->TEST_KeyInCache(ReadOptions(), mkey));
+
+  delete db;
+  delete checkpoint_db;
+}
+
+void BlockBasedTableTest::TestMiddleKey(
+    uint64_t num_records, uint64_t index_step, size_t data_block_size,
+    int expected_num_index_levels, int expected_num_data_blocks) {
+  // Magic numbers to produce test index structures.
+  constexpr auto kIndexBlockSize = 1_KB;
+  constexpr auto kRecordValSize = 48;
+
+  // Reverse comparator is used to preserve order since the table keys are encoded in little-endian
+  // format.
+  TableConstructor c(&reverse_key_comparator);
+  const std::string val(kRecordValSize, 'v');
+  for (uint64_t key = 0; key < num_records; ++key) {
+    std::string key_str;
+    PutFixed64(&key_str, key);
+    c.Add(key_str, val);
+  }
+
+  std::vector<std::string> keys;
+  stl_wrappers::KVMap kvmap;
+  Options options;
+  options.compression = kNoCompression;
+  BlockBasedTableOptions table_options;
+  table_options.block_size = data_block_size;
+  table_options.index_block_size = kIndexBlockSize;
+  options.table_factory.reset(NewBlockBasedTableFactory(table_options));
+  const ImmutableCFOptions ioptions(options);
+  auto comparator = GetPlainInternalComparator(&reverse_key_comparator);
+  c.Finish(options, ioptions, table_options, comparator, &keys, &kvmap);
+  // Verify inserts.
+  ASSERT_EQ(num_records, keys.size());
+  // Verify number of index levels.
+  auto* reader = c.GetTableReader();
+  {
+    auto props = c.GetTableProperties().user_collected_properties;
+    auto pos = props.find(BlockBasedTablePropertyNames::kNumIndexLevels);
+    DCHECK(pos != props.end());
+    int num_index_levels = DecodeFixed32(pos->second.c_str());
+    ASSERT_EQ(expected_num_index_levels, num_index_levels);
+  }
+  // If applicable, verify number of data blocks.
+  if (expected_num_data_blocks > 0)  {
+    auto props = reader->GetTableProperties();
+    ASSERT_EQ(expected_num_data_blocks, props->num_data_blocks);
+  }
+
+  auto lower_bound = num_records - index_step;
+  for (int i = 1; i <= 5; ++i) {
+    LOG(INFO) << "Testing with " << i << " top-level index entries";
+    std::string lower_bound_str;
+    PutFixed64(&lower_bound_str, lower_bound);
+    auto middle_key_str = ASSERT_RESULT(reader->GetMiddleKey(lower_bound_str));
+    Slice middle_key_buf(middle_key_str);
+    LOG(INFO) << "Middle Key: " << middle_key_buf.ToDebugHexString();
+    uint64_t middle_key;
+    ASSERT_TRUE(GetFixed64(&middle_key_buf, &middle_key));
+    ASSERT_GE(middle_key, lower_bound);
+    auto split_percent =
+        narrow_cast<int>(100 * (middle_key - lower_bound + 1) / (num_records - lower_bound));
+    LOG(INFO) << "Split Ratio: " << split_percent << "%";
+    auto deviation = abs(split_percent - 50);
+    if (i <= 3) {
+      ASSERT_LE(deviation, 16);
+    } else {
+      ASSERT_LE(deviation, 10);
+    }
+    lower_bound -= index_step;
+  }
+
+  // Notes on deviation:
+  // - With three qualifying top-level index entries, the middle key is chosen as the second key.
+  // The second restart key represents the upper bound of the key range corresponding to that
+  // restart. Hence we expect this calculated midpoint to skew greater (~66th percentile) than the
+  // actual midpoint.
+  // - The above-mentioned skew is absent when the number of qualifying entries is even. For
+  // instance, here the second restart key of the four entries is chosen, and that key is the upper
+  // bound of the first and second key ranges, i.e., the midpoint of the four key ranges.
+  // - The above-mentioned skew for odd number of entries reduces as number of entries increase
+  // since the fraction of the total key range represented by each restart reduces.
+}
+
+TEST_F(BlockBasedTableTest, SplitKeyOneLevelIndex) {
+  // Magic numbers to produce test index structures.
+  constexpr auto kDataBlockSize = 4_KB;
+  constexpr auto kNumRecords = 544;
+
+  constexpr auto kExpectedNumIndexLevels = 1;
+  constexpr auto kExpectedNumDataBlocks = 8;
+  constexpr auto kNumTopLevelEntries = kExpectedNumDataBlocks;
+  constexpr auto kApproxIndexEntryStep = kNumRecords / kNumTopLevelEntries;
+
+  TestMiddleKey(
+      kNumRecords, kApproxIndexEntryStep, kDataBlockSize, kExpectedNumIndexLevels,
+      kExpectedNumDataBlocks);
+  // Note: These are the exact split ratios:
+  // 48% when 1 out of 8 entries qualify in the top-level block.
+  // 50% when 2 out of 8 entries qualify in the top-level block.
+  // 66% when 3 out of 8 entries qualify in the top-level block.
+  // 50% when 4 out of 8 entries qualify in the top-level block.
+  // 60% when 5 out of 8 entries qualify in the top-level block.
+}
+
+TEST_F(BlockBasedTableTest, SplitKeyTwoLevelIndex) {
+  // Magic numbers to produce test index structures.
+  constexpr auto kDataBlockSize = 1_KB;
+  constexpr auto kNumRecords = 8568;
+
+  constexpr auto kExpectedNumIndexLevels = 2;
+  constexpr auto kNumTopLevelEntries = 8;
+  // Note: kNumTopLevelEntries is not verfied by the test and may change with changes to storage
+  // organization.
+  constexpr auto kApproxIndexEntryStep = kNumRecords / kNumTopLevelEntries;
+
+  TestMiddleKey(kNumRecords, kApproxIndexEntryStep, kDataBlockSize, kExpectedNumIndexLevels);
+  // Note: These are the exact split ratios:
+  // 50% when 1 out of 8 entries qualify in the top-level block.
+  // 50% when 2 out of 8 entries qualify in the top-level block.
+  // 66% when 3 out of 8 entries qualify in the top-level block.
+  // 50% when 4 out of 8 entries qualify in the top-level block.
+  // 60% when 5 out of 8 entries qualify in the top-level block.
 }
 
 }  // namespace rocksdb

@@ -15,9 +15,9 @@
 // specific language governing permissions and limitations
 // under the License.
 //
-// The following only applies to changes made to this file as part of YugaByte development.
+// The following only applies to changes made to this file as part of YugabyteDB development.
 //
-// Portions Copyright (c) YugaByte, Inc.
+// Portions Copyright (c) YugabyteDB, Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License"); you may not use this file except
 // in compliance with the License.  You may obtain a copy of the License at
@@ -40,6 +40,7 @@
 
 #include "yb/gutil/stringprintf.h"
 
+#include "yb/util/callsite_profiling.h"
 #include "yb/util/debug/trace_event.h"
 #include "yb/util/debug/trace_logging.h"
 #include "yb/util/flags.h"
@@ -47,11 +48,13 @@
 #include "yb/util/mem_tracker.h"
 #include "yb/util/metrics.h"
 #include "yb/util/status_log.h"
+#include "yb/util/cgroups.h"
 #include "yb/util/stopwatch.h"
 #include "yb/util/thread.h"
 #include "yb/util/unique_lock.h"
 
-using std::pair;
+#include "yb/server/total_mem_watcher.h"
+
 using std::shared_ptr;
 using std::string;
 using strings::Substitute;
@@ -93,6 +96,7 @@ void MaintenanceOpStats::Clear() {
   ram_anchored_ = 0;
   logs_retained_bytes_ = 0;
   perf_improvement_ = 0;
+  cdcsdk_reset_stale_retention_barrier_ = false;
 }
 
 MaintenanceOp::MaintenanceOp(std::string name, IOUsage io_usage)
@@ -143,14 +147,31 @@ Status MaintenanceManager::Init() {
   return Status::OK();
 }
 
+#ifdef __linux__
+void MaintenanceManager::SetCgroup(Cgroup* cgroup) {
+  if (!cgroup) {
+    return;
+  }
+  if (thread_pool_) {
+    thread_pool_->SetCgroup(cgroup);
+  }
+  if (monitor_thread_) {
+    auto status = cgroup->MoveThreadToGroup(monitor_thread_->tid());
+    if (!status.ok()) {
+      LOG(WARNING) << "Failed to move maintenance_scheduler to cgroup: " << status;
+    }
+  }
+}
+#endif
+
 void MaintenanceManager::Shutdown() {
   {
-    std::lock_guard<std::mutex> guard(mutex_);
+    std::lock_guard guard(mutex_);
     if (shutdown_) {
       return;
     }
     shutdown_ = true;
-    cond_.notify_all();
+    YB_PROFILE(cond_.notify_all());
   }
   if (monitor_thread_.get()) {
     CHECK_OK(ThreadJoiner(monitor_thread_.get()).Join());
@@ -160,7 +181,7 @@ void MaintenanceManager::Shutdown() {
 }
 
 void MaintenanceManager::RegisterOp(MaintenanceOp* op) {
-  std::lock_guard<std::mutex> lock(mutex_);
+  std::lock_guard lock(mutex_);
   CHECK(!op->manager_.get()) << "Tried to register " << op->name()
           << ", but it was already registered.";
   auto inserted = ops_.emplace(op, MaintenanceOpStats()).second;
@@ -173,7 +194,7 @@ void MaintenanceManager::RegisterOp(MaintenanceOp* op) {
 
 void MaintenanceManager::UnregisterOp(MaintenanceOp* op) {
   {
-    UNIQUE_LOCK(lock, mutex_);
+    UniqueLock lock(mutex_);
 
     CHECK(op->manager_.get() == this) << "Tried to unregister " << op->name()
           << ", but it is not currently registered with this maintenance manager.";
@@ -182,7 +203,7 @@ void MaintenanceManager::UnregisterOp(MaintenanceOp* op) {
       VLOG_AND_TRACE("maintenance", 1) << "Waiting for op " << op->name() << " to finish so "
             << "we can unregister it.";
       for (;;) {
-        auto wait_status = op->cond_.wait_for(GetLockForCondition(&lock), 15s);
+        auto wait_status = op->cond_.wait_for(GetLockForCondition(lock), 15s);
         if (op->running_ == 0) {
           break;
         }
@@ -204,10 +225,10 @@ void MaintenanceManager::UnregisterOp(MaintenanceOp* op) {
 void MaintenanceManager::RunSchedulerThread() {
   auto polling_interval = polling_interval_ms_ * 1ms;
 
-  UNIQUE_LOCK(lock, mutex_);
+  UniqueLock lock(mutex_);
   for (;;) {
     // Loop until we are shutting down or it is time to run another op.
-    cond_.wait_for(GetLockForCondition(&lock), polling_interval);
+    cond_.wait_for(GetLockForCondition(lock), polling_interval);
     if (shutdown_) {
       VLOG_AND_TRACE("maintenance", 1) << "Shutting down maintenance manager.";
       return;
@@ -282,6 +303,9 @@ MaintenanceOp* MaintenanceManager::FindBestOp() {
 
   double best_perf_improvement = 0;
   MaintenanceOp* best_perf_improvement_op = nullptr;
+
+  MaintenanceOp* cdcsdk_reset_stale_retention_barrier_op = nullptr;
+
   for (OpMapTy::value_type &val : ops_) {
     MaintenanceOp* op(val.first);
     MaintenanceOpStats& stats(val.second);
@@ -316,6 +340,10 @@ MaintenanceOp* MaintenanceManager::FindBestOp() {
       best_perf_improvement_op = op;
       best_perf_improvement = stats.perf_improvement();
     }
+
+    if (stats.cdcsdk_reset_stale_retention_barrier()) {
+      cdcsdk_reset_stale_retention_barrier_op = op;
+    }
   }
 
   // Look at ops that we can run quickly that free up log retention.
@@ -349,6 +377,13 @@ MaintenanceOp* MaintenanceManager::FindBestOp() {
     return most_mem_anchored_op;
   }
 
+  if (cdcsdk_reset_stale_retention_barrier_op) {
+    VLOG_AND_TRACE("maintenance", 1)
+        << "Performing " << cdcsdk_reset_stale_retention_barrier_op->name() << ", "
+        << "because its retention barrier has gone stale";
+    return cdcsdk_reset_stale_retention_barrier_op;
+  }
+
   if (most_logs_retained_bytes_op) {
     VLOG_AND_TRACE("maintenance", 1)
             << "Performing " << most_logs_retained_bytes_op->name() << ", "
@@ -365,6 +400,7 @@ MaintenanceOp* MaintenanceManager::FindBestOp() {
       return best_perf_improvement_op;
     }
   }
+
   return nullptr;
 }
 
@@ -380,7 +416,7 @@ void MaintenanceManager::LaunchOp(const ScopedMaintenanceOpRun& run) {
   op->RunningGauge()->Decrement();
   MonoTime end_time(MonoTime::Now());
   MonoDelta delta(end_time.GetDeltaSince(start_time));
-  std::lock_guard<std::mutex> lock(mutex_);
+  std::lock_guard lock(mutex_);
 
   CompletedOp& completed_op = completed_ops_[completed_ops_count_ % completed_ops_.size()];
   completed_op.name = op->name();
@@ -393,7 +429,7 @@ void MaintenanceManager::LaunchOp(const ScopedMaintenanceOpRun& run) {
 
 void MaintenanceManager::GetMaintenanceManagerStatusDump(MaintenanceManagerStatusPB* out_pb) {
   DCHECK(out_pb != nullptr);
-  std::lock_guard<std::mutex> lock(mutex_);
+  std::lock_guard lock(mutex_);
   MaintenanceOp* best_op = FindBestOp();
   for (MaintenanceManager::OpMapTy::value_type& val : ops_) {
     MaintenanceManagerStatusPB_MaintenanceOpPB* op_pb = out_pb->add_registered_operations();
@@ -406,11 +442,13 @@ void MaintenanceManager::GetMaintenanceManagerStatusDump(MaintenanceManagerStatu
       op_pb->set_ram_anchored_bytes(stat.ram_anchored());
       op_pb->set_logs_retained_bytes(stat.logs_retained_bytes());
       op_pb->set_perf_improvement(stat.perf_improvement());
+      op_pb->set_cdcsdk_reset_stale_retention_barrier(stat.cdcsdk_reset_stale_retention_barrier());
     } else {
       op_pb->set_runnable(false);
       op_pb->set_ram_anchored_bytes(0);
       op_pb->set_logs_retained_bytes(0);
       op_pb->set_perf_improvement(0);
+      op_pb->set_cdcsdk_reset_stale_retention_barrier(false);
     }
 
     if (best_op == op) {
@@ -463,9 +501,9 @@ void ScopedMaintenanceOpRun::Reset() {
   if (!op_) {
     return;
   }
-  std::lock_guard<std::mutex> lock(op_->manager_->mutex_);
+  std::lock_guard lock(op_->manager_->mutex_);
   if (--op_->running_ == 0) {
-    op_->cond_.notify_all();
+    YB_PROFILE(op_->cond_.notify_all());
   }
   --op_->manager_->running_ops_;
   op_ = nullptr;
@@ -477,7 +515,7 @@ MaintenanceOp* ScopedMaintenanceOpRun::get() const {
 
 void ScopedMaintenanceOpRun::Assign(MaintenanceOp* op) {
   op_ = op;
-  std::lock_guard<std::mutex> lock(op_->manager_->mutex_);
+  std::lock_guard lock(op_->manager_->mutex_);
   ++op->running_;
   ++op->manager_->running_ops_;
 }

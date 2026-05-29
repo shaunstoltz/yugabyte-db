@@ -1,5 +1,5 @@
 /*
- * Copyright 2021 YugaByte, Inc. and Contributors
+ * Copyright 2021 YugabyteDB, Inc. and Contributors
  *
  * Licensed under the Polyform Free Trial License 1.0.0 (the "License"); you
  * may not use this file except in compliance with the License. You
@@ -11,13 +11,17 @@ package com.yugabyte.yw.forms.filters;
 
 import com.yugabyte.yw.models.AlertConfiguration;
 import com.yugabyte.yw.models.filters.AlertTemplateFilter;
+import io.swagger.annotations.ApiModelProperty;
 import lombok.Data;
 import lombok.NoArgsConstructor;
 
 @Data
 @NoArgsConstructor
 public class AlertTemplateApiFilter {
+  @ApiModelProperty(value = "The name of the alert template.")
   private String name;
+
+  @ApiModelProperty(value = "The target type of the alert template.")
   private AlertConfiguration.TargetType targetType;
 
   public AlertTemplateFilter toFilter() {

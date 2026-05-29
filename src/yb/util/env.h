@@ -2,9 +2,9 @@
 // Use of this source code is governed by a BSD-style license that can be
 // found in the LICENSE file. See the AUTHORS file for names of contributors.
 //
-// The following only applies to changes made to this file as part of YugaByte development.
+// The following only applies to changes made to this file as part of YugabyteDB development.
 //
-// Portions Copyright (c) YugaByte, Inc.
+// Portions Copyright (c) YugabyteDB, Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License"); you may not use this file except
 // in compliance with the License.  You may obtain a copy of the License at
@@ -295,13 +295,18 @@ class Env {
   // This should operate safely, not following any symlinks, etc.
   virtual Status DeleteRecursively(const std::string &dirname) = 0;
 
-  // Store the logical size of fname in *file_size.
+  // Returns the logical size of fname.
   virtual Result<uint64_t> GetFileSize(const std::string& fname) = 0;
 
   virtual Result<uint64_t> GetFileINode(const std::string& fname) = 0;
 
   virtual Status LinkFile(const std::string& src,
                                   const std::string& target) = 0;
+
+  // Symlink new_symlink to pointed_to. Unlinks new_symlink if it's already linked.
+  virtual Status SymlinkPath(const std::string& pointed_to, const std::string& new_symlink) = 0;
+
+  virtual Status DeleteSymlinkIfExists(const std::string& path) = 0;
 
   // Read link's actual target
   virtual Result<std::string> ReadLink(const std::string& link) = 0;
@@ -381,6 +386,9 @@ class Env {
 
   // Like IsDirectory, but non-existence of the given path is not considered an error.
   Result<bool> DoesDirectoryExist(const std::string& path);
+
+  // Checks if the file is a symlink. Returns an error if it doesn't exist.
+  virtual Result<bool> IsSymlink(const std::string& path) = 0;
 
   // Checks if the given path is an executable file. If the file does not exist
   // we simply return false rather than consider that an error.
@@ -475,91 +483,16 @@ struct WritableFileOptions {
   // See CreateMode for details.
   Env::CreateMode mode;
 
+  // Set this variable to customize the default starting offset.
+  std::optional<uint64_t> initial_offset;
+
   WritableFileOptions()
-    : sync_on_close(false),
-      o_direct(false),
-      mode(Env::CREATE_IF_NON_EXISTING_TRUNCATE) { }
+      : sync_on_close(false), o_direct(false), mode(Env::CREATE_IF_NON_EXISTING_TRUNCATE) {}
 };
 
 // A file abstraction for sequential writing.  The implementation
 // must provide buffering since callers may append small fragments
 // at a time to the file.
-class WritableFile {
- public:
-  enum FlushMode {
-    FLUSH_SYNC,
-    FLUSH_ASYNC
-  };
-
-  WritableFile() { }
-  virtual ~WritableFile();
-
-  // Pre-allocates 'size' bytes for the file in the underlying filesystem.
-  // size bytes are added to the current pre-allocated size or to the current
-  // offset, whichever is bigger. In no case is the file truncated by this
-  // operation.
-  virtual Status PreAllocate(uint64_t size) = 0;
-
-  virtual Status Append(const Slice& data) = 0;
-
-  // If possible, uses scatter-gather I/O to efficiently append
-  // multiple buffers to a file. Otherwise, falls back to regular I/O.
-  //
-  // For implementation specific quirks and details, see comments in
-  // implementation source code (e.g., env_posix.cc)
-  Status AppendVector(const std::vector<Slice>& data_vector);
-
-  virtual Status AppendSlices(const Slice* slices, size_t num) = 0;
-
-  Status AppendSlices(const Slice* begin, const Slice* end);
-
-  virtual Status Close() = 0;
-
-  // Flush all dirty data (not metadata) to disk.
-  //
-  // If the flush mode is synchronous, will wait for flush to finish and
-  // return a meaningful status.
-  virtual Status Flush(FlushMode mode) = 0;
-
-  virtual Status Sync() = 0;
-
-  virtual uint64_t Size() const = 0;
-
-  // Returns the filename provided when the WritableFile was constructed.
-  virtual const std::string& filename() const = 0;
-
- private:
-  // No copying allowed
-  WritableFile(const WritableFile&);
-  void operator=(const WritableFile&);
-};
-
-// An implementation of WritableFile that forwards all calls to another
-// WritableFile. May be useful to clients who wish to override just part of the
-// functionality of another WritableFile.
-// It's declared as friend of WritableFile to allow forwarding calls to
-// protected virtual methods.
-class WritableFileWrapper : public WritableFile {
- public:
-  explicit WritableFileWrapper(std::unique_ptr<WritableFile> t) : target_(std::move(t)) { }
-  virtual ~WritableFileWrapper() { }
-
-  // Return the target to which this WritableFile forwards all calls.
-  WritableFile* target() const { return target_.get(); }
-
-  Status PreAllocate(uint64_t size) override;
-  Status Append(const Slice& data) override;
-  Status AppendSlices(const Slice* slices, size_t num) override;
-  Status Close() override;
-  Status Flush(FlushMode mode) override;
-  Status Sync() override;
-  uint64_t Size() const override { return target_->Size(); }
-  const std::string& filename() const override { return target_->filename(); }
-
- private:
-  std::unique_ptr<WritableFile> target_;
-};
-
 // Creation-time options for RWFile
 struct RWFileOptions {
   // Call Sync() during Close().
@@ -626,8 +559,9 @@ class RWFile {
   // 'length' to disk. If length is 0, all bytes from 'offset' to the end
   // of the file are flushed.
   //
-  // If the flush mode is synchronous, will wait for flush to finish and
-  // return a meaningful status.
+  // If the flush mode is synchronous, will wait for the range to be written
+  // before returning. This differs from Sync(): it operates on a range
+  // rather than the whole file, and does not fsync metadata.
   virtual Status Flush(FlushMode mode, uint64_t offset, size_t length) = 0;
 
   // Synchronously flushes all dirty file data and metadata to disk. Upon
@@ -640,24 +574,13 @@ class RWFile {
   virtual Status Close() = 0;
 
   // Retrieves the file's size.
-  virtual Status Size(uint64_t* size) const = 0;
+  virtual Result<uint64_t> Size() const = 0;
 
   // Returns the filename provided when the RWFile was constructed.
   virtual const std::string& filename() const = 0;
 
  private:
   DISALLOW_COPY_AND_ASSIGN(RWFile);
-};
-
-// Identifies a locked file.
-class FileLock {
- public:
-  FileLock() { }
-  virtual ~FileLock();
- private:
-  // No copying allowed
-  FileLock(const FileLock&);
-  void operator=(const FileLock&);
 };
 
 // A utility routine: write "data" to the named file.
@@ -712,6 +635,8 @@ class EnvWrapper : public Env {
   Result<uint64_t> GetBlockSize(const std::string& f) override;
   Result<FilesystemStats> GetFilesystemStatsBytes(const std::string& f) override;
   Status LinkFile(const std::string& s, const std::string& t) override;
+  Status SymlinkPath(const std::string& pointed_to, const std::string& new_symlink) override;
+  Status DeleteSymlinkIfExists(const std::string& path) override;
   Result<std::string> ReadLink(const std::string& s) override;
   Status RenameFile(const std::string& s, const std::string& t) override;
   Status LockFile(const std::string& f, FileLock** l, bool r) override;
@@ -736,6 +661,7 @@ class EnvWrapper : public Env {
 
   Status GetExecutablePath(std::string* path) override;
   Status IsDirectory(const std::string& path, bool* is_dir) override;
+  Result<bool> IsSymlink(const std::string& path) override;
   Result<bool> IsExecutableFile(const std::string& path) override;
   Status Walk(const std::string& root,
               DirectoryOrder order,

@@ -1,4 +1,4 @@
-// Copyright (c) YugaByte, Inc.
+// Copyright (c) YugabyteDB, Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License"); you may not use this file except
 // in compliance with the License.  You may obtain a copy of the License at
@@ -13,6 +13,8 @@
 
 #pragma once
 
+#include "yb/common/constants.h"
+
 #include "yb/rpc/rpc_fwd.h"
 #include "yb/rpc/secure_stream.h"
 
@@ -21,9 +23,12 @@
 
 namespace yb {
 
+class ExternalYbController;
+
 namespace client {
 class YBClientBuilder;
 class YBClient;
+class StatefulServiceClientBase;
 } // namespace client
 
 // Base class for ExternalMiniCluster and MiniCluster with common interface required by
@@ -54,6 +59,22 @@ class MiniClusterBase {
 
   bool running() const { return running_.load(std::memory_order_acquire); }
 
+  int GetSplitFactor();
+
+  void SetSplitFactor(int split_factor);
+
+  virtual bool WasUnsafeShutdown() const = 0;
+
+  virtual std::vector<scoped_refptr<ExternalYbController>> yb_controller_daemons() const = 0;
+
+  virtual HostPort YsqlHostport() const = 0;
+
+  virtual std::string GetMasterAddresses() const = 0;
+
+  virtual std::string GetTabletServerHTTPAddresses() const = 0;
+
+  virtual rpc::ProxyCache& proxy_cache() = 0;
+
  protected:
   virtual ~MiniClusterBase() = default;
 
@@ -71,6 +92,10 @@ class MiniClusterBase {
   virtual void ConfigureClientBuilder(client::YBClientBuilder* builder) = 0;
 
   virtual Result<HostPort> DoGetLeaderMasterBoundRpcAddr() = 0;
+
+  int split_factor_ = kDefaultNumSplitParts;
 };
+
+rpc::MessengerBuilder CreateMiniClusterMessengerBuilder();
 
 }  // namespace yb

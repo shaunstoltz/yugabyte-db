@@ -15,9 +15,9 @@
 // specific language governing permissions and limitations
 // under the License.
 //
-// The following only applies to changes made to this file as part of YugaByte development.
+// The following only applies to changes made to this file as part of YugabyteDB development.
 //
-// Portions Copyright (c) YugaByte, Inc.
+// Portions Copyright (c) YugabyteDB, Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License"); you may not use this file except
 // in compliance with the License.  You may obtain a copy of the License at
@@ -34,23 +34,16 @@
 
 #include <algorithm>
 #include <limits>
-#include <list>
-#include <memory>
-#include <mutex>
+#include <sstream>
+#include <utility>
 
-#ifdef YB_TCMALLOC_ENABLED
-#if defined(YB_GOOGLE_TCMALLOC)
-#include <tcmalloc/malloc_extension.h>
-#else
-#include <gperftools/malloc_extension.h>
-#include <gperftools/malloc_hook.h>
-#endif
-#endif
+#include <boost/range/algorithm_ext/erase.hpp>
 
 #include "yb/gutil/map-util.h"
-#include "yb/gutil/once.h"
 #include "yb/gutil/strings/human_readable.h"
 #include "yb/gutil/strings/substitute.h"
+
+#include "yb/tserver/server_main_util.h"
 
 #include "yb/util/debug-util.h"
 #include "yb/util/debug/trace_event.h"
@@ -65,21 +58,31 @@
 #include "yb/util/status.h"
 #include "yb/util/status_log.h"
 #include "yb/util/logging.h"
+#include "yb/util/tcmalloc_profile.h"
+#include "yb/util/tcmalloc_trace.h"
+#include "yb/util/tcmalloc_util.h"
+#include "yb/util/tcmalloc_impl_util.h"
 
 using namespace std::literals;
 
-DEFINE_UNKNOWN_int64(memory_limit_hard_bytes, 0,
-             "Maximum amount of memory this daemon should use, in bytes. "
-             "A value of 0 autosizes based on the total system memory. "
-             "A value of -1 disables all memory limiting.");
+// NOTE: The default here is for tools and tests; the actual defaults
+// for the TServer and master processes are set in server_main_util.cc.
+DEFINE_NON_RUNTIME_int64(memory_limit_hard_bytes, 0,
+    "Maximum amount of memory this daemon should use in bytes. "
+    "A value of 0 specifies to instead use a percentage of the total system memory; "
+    "see --default_memory_limit_to_ram_ratio for the percentage used. "
+    "A value of -1 disables all memory limiting.");
 TAG_FLAG(memory_limit_hard_bytes, stable);
-DEFINE_UNKNOWN_double(default_memory_limit_to_ram_ratio, 0.85,
-              "If memory_limit_hard_bytes is left unspecified, then it is "
-              "set to default_memory_limit_to_ram_ratio * Available RAM.");
-TAG_FLAG(default_memory_limit_to_ram_ratio, advanced);
-TAG_FLAG(default_memory_limit_to_ram_ratio, hidden);
 
-DEFINE_UNKNOWN_int32(memory_limit_soft_percentage, 85,
+// NOTE: The default here is for tools and tests; the actual defaults
+// for the TServer and master processes are set in server_main_util.cc.
+DEFINE_NON_RUNTIME_double(default_memory_limit_to_ram_ratio, 0.85,
+    "The ratio of available RAM to use if --memory_limit_hard_bytes is 0. "
+    "The special value " BOOST_PP_STRINGIZE(USE_RECOMMENDED_MEMORY_VALUE)
+    " means to instead use a recommended percentage determined "
+    "in part by the amount of RAM available.");
+
+DEFINE_NON_RUNTIME_int32(memory_limit_soft_percentage, 85,
              "Percentage of the hard memory limit that this daemon may "
              "consume before memory throttling of writes begins. The greater "
              "the excess, the higher the chance of throttling. In general, a "
@@ -87,51 +90,32 @@ DEFINE_UNKNOWN_int32(memory_limit_soft_percentage, 85,
              "decreased throughput, and vice versa for a higher soft limit.");
 TAG_FLAG(memory_limit_soft_percentage, advanced);
 
-DEFINE_UNKNOWN_int32(memory_limit_warn_threshold_percentage, 98,
+DEFINE_RUNTIME_int32(memory_limit_warn_threshold_percentage, 98,
              "Percentage of the hard memory limit that this daemon may "
              "consume before WARNING level messages are periodically logged.");
 TAG_FLAG(memory_limit_warn_threshold_percentage, advanced);
 
-DEFINE_UNKNOWN_int64(server_tcmalloc_max_total_thread_cache_bytes, -1, "Total number of bytes to "
-             "use for the thread cache for tcmalloc across all threads in the tserver/master.");
-DEPRECATE_FLAG(int64, tserver_tcmalloc_max_total_thread_cache_bytes, "11_2022");
-DEFINE_NON_RUNTIME_int32(tcmalloc_max_per_cpu_cache_bytes, -1, "Sets the maximum cache size per "
-             "CPU cache, if Google TCMalloc is being used.");
-
-#ifdef YB_TCMALLOC_ENABLED
-DEFINE_UNKNOWN_int32(tcmalloc_max_free_bytes_percentage, 10,
+DEFINE_RUNTIME_int32(tcmalloc_max_free_bytes_percentage, 10,
                      "Maximum percentage of the RSS that tcmalloc is allowed to use for "
                      "reserved but unallocated memory.");
 TAG_FLAG(tcmalloc_max_free_bytes_percentage, advanced);
 
-DEFINE_NON_RUNTIME_bool(tcmalloc_trace_enabled, false,
-                        "Enable tracing of malloc/free calls for tcmalloc.");
-TAG_FLAG(tcmalloc_trace_enabled, advanced);
-
-DEFINE_NON_RUNTIME_uint64(tcmalloc_trace_min_threshold, 0,
-                          "Minimum (inclusive) threshold for tracing malloc/free calls.");
-TAG_FLAG(tcmalloc_trace_min_threshold, advanced);
-
-DEFINE_NON_RUNTIME_uint64(tcmalloc_trace_max_threshold, 0,
-                          "Maximum (exclusive) threshold for tracing malloc/free calls. "
-                          "If 0, no maximum threshold is used.");
-TAG_FLAG(tcmalloc_trace_max_threshold, advanced);
-
-DEFINE_RUNTIME_double(tcmalloc_trace_frequency, 0.0,
-                      "Frequency at which malloc/free calls should be traced.");
-TAG_FLAG(tcmalloc_trace_frequency, advanced);
-#endif
-
-DEFINE_UNKNOWN_bool(mem_tracker_logging, false,
+DEFINE_NON_RUNTIME_bool(mem_tracker_logging, false,
             "Enable logging of memory tracker consume/release operations");
 
-DEFINE_UNKNOWN_bool(mem_tracker_log_stack_trace, false,
+DEFINE_NON_RUNTIME_bool(mem_tracker_log_stack_trace, false,
             "Enable logging of stack traces on memory tracker consume/release operations. "
             "Only takes effect if mem_tracker_logging is also enabled.");
 
-DEFINE_UNKNOWN_int64(mem_tracker_update_consumption_interval_us, 2000000,
+DEFINE_NON_RUNTIME_int64(mem_tracker_update_consumption_interval_us, 2 * 1000 * 1000,
     "Interval that is used to update memory consumption from external source. "
     "For instance from tcmalloc statistics.");
+
+DEFINE_RUNTIME_double(mem_tracker_external_consumption_accuracy_percentage, 1.0,
+    "If mem tracker consumption changed by more than specified percentage of the soft memory limit "
+    "since the last update from external source, update it explicitly from that external source to "
+    "avoid too much bias.");
+TAG_FLAG(mem_tracker_external_consumption_accuracy_percentage, advanced);
 
 DEFINE_RUNTIME_int64(mem_tracker_tcmalloc_gc_release_bytes, -1,
     "When the total amount of memory from calls to Release() since the last GC exceeds "
@@ -139,13 +123,13 @@ DEFINE_RUNTIME_int64(mem_tracker_tcmalloc_gc_release_bytes, -1,
     "page heap freelist. A higher value implies less aggressive GC, i.e. higher memory "
     "overhead, but more efficient in terms of runtime.");
 
+DECLARE_int64(server_tcmalloc_max_total_thread_cache_bytes);
+
 namespace yb {
 
 // NOTE: this class has been adapted from Impala, so the code style varies
 // somewhat from yb.
 
-using std::deque;
-using std::list;
 using std::string;
 using std::stringstream;
 using std::shared_ptr;
@@ -155,73 +139,23 @@ using strings::Substitute;
 
 namespace {
 
-// The ancestor for all trackers. Every tracker is visible from the root down.
-shared_ptr<MemTracker> root_tracker;
-GoogleOnceType root_tracker_once = GOOGLE_ONCE_INIT;
-
 // Total amount of memory from calls to Release() since the last GC. If this
 // is greater than mem_tracker_tcmalloc_gc_release_bytes, this will trigger a tcmalloc gc.
 Atomic64 released_memory_since_gc;
 
-#if defined(YB_TCMALLOC_ENABLED) && defined(YB_GPERFTOOLS_TCMALLOC)
-
-// Memory tracker for tcmalloc tracing.
-shared_ptr<MemTracker> tcmalloc_trace_tracker;
-
-#endif // YB_TCMALLOC_ENABLED
-
-
-// Validate that various flags are percentages.
-bool ValidatePercentage(const char* flagname, int value) {
-  if (value >= 0 && value <= 100) {
-    return true;
-  }
-  LOG(ERROR) << Substitute("$0 must be a percentage, value $1 is invalid",
-      flagname, value);
-  return false;
-}
+DEFINE_validator(default_memory_limit_to_ram_ratio, &::yb::internal::ValidateMemoryLimitToRamRatio);
 
 // Marked as unused because this is not referenced in release mode.
-DEFINE_validator(memory_limit_soft_percentage, &ValidatePercentage);
-DEFINE_validator(memory_limit_warn_threshold_percentage, &ValidatePercentage);
-#if defined(YB_TCMALLOC_ENABLED) && defined(YB_GPERFTOOLS_TCMALLOC)
-DEFINE_validator(tcmalloc_max_free_bytes_percentage, &ValidatePercentage);
-#endif
+DEFINE_validator(memory_limit_soft_percentage, &::yb::ValidatePercentageFlag);
+DEFINE_validator(memory_limit_warn_threshold_percentage, &::yb::ValidatePercentageFlag);
 
-    template <class TrackerMetrics>
-    bool TryIncrementBy(
-        int64_t delta, int64_t max, HighWaterMark* consumption,
-        const std::unique_ptr<TrackerMetrics>& metrics) {
-  if (consumption->TryIncrementBy(delta, max)) {
-    if (metrics) {
-      metrics->metric_->IncrementBy(delta);
-    }
-    return true;
-  }
-  return false;
-}
-
-template <class TrackerMetrics>
-void IncrementBy(int64_t amount, HighWaterMark* consumption,
-                 const std::unique_ptr<TrackerMetrics>& metrics) {
-  consumption->IncrementBy(amount);
-  if (metrics) {
-    metrics->metric_->IncrementBy(amount);
-  }
-}
-
-std::string CreateMetricName(const MemTracker& mem_tracker) {
-  if (mem_tracker.metric_entity() &&
-        (!mem_tracker.parent() ||
-            mem_tracker.parent()->metric_entity().get() != mem_tracker.metric_entity().get())) {
-    return "mem_tracker";
-  }
-  std::string id = mem_tracker.id();
-  EscapeMetricNameForPrometheus(&id);
+std::string CreateMetricName(
+    const MemTracker& mem_tracker, std::string metric_name) {
+  EscapeMetricNameForPrometheus(&metric_name);
   if (mem_tracker.parent()) {
-    return CreateMetricName(*mem_tracker.parent()) + "_" + id;
+    return mem_tracker.parent()->metric_name() + "_" + metric_name;
   } else {
-    return id;
+    return "mem_tracker";
   }
 }
 
@@ -233,70 +167,47 @@ std::string CreateMetricDescription(const MemTracker& mem_tracker) {
   return CreateMetricLabel(mem_tracker);
 }
 
-#ifdef YB_TCMALLOC_ENABLED
-// If the mem_tracker is in Postgres backends, the default value of
-// FLAGS_mem_tracker_tcmalloc_gc_release_bytes will be overriden by a dedicated value for Postgres
-// from FLAGS_pg_mem_tracker_tcmalloc_gc_release_bytes.
-void OverrideTcmallocGcThresholdForPg() {
-  if (const auto mem_gc_threshold = std::getenv("FLAGS_pg_mem_tracker_tcmalloc_gc_release_bytes")) {
-    FLAGS_mem_tracker_tcmalloc_gc_release_bytes = strtoll(mem_gc_threshold, NULL, 10);
-    LOG(INFO) << "Overriding FLAGS_mem_tracker_tcmalloc_gc_release_bytes to "
-              << FLAGS_mem_tracker_tcmalloc_gc_release_bytes;
+std::shared_ptr<MemTracker> CreateRootTracker() {
+  int64_t limit = FLAGS_memory_limit_hard_bytes;
+  if (limit == 0) {
+    // If no limit is provided, we'll use
+    // - 85% of the RAM for tservers.
+    // - 10% of the RAM for masters.
+    int64_t total_ram;
+    CHECK_OK(Env::Default()->GetTotalRAMBytes(&total_ram));
+    DCHECK(FLAGS_default_memory_limit_to_ram_ratio != USE_RECOMMENDED_MEMORY_VALUE);
+    limit = total_ram * FLAGS_default_memory_limit_to_ram_ratio;
   }
-}
 
-// Malloc hooks are not suppported in Google's TCMalloc as of Dec 12 2022 (and thus tracing is not
-// either). // See issue: https://github.com/google/tcmalloc/issues/44.
-#if defined(YB_GPERFTOOLS_TCMALLOC)
-bool CheckWithinTCMallocTraceThreshold(size_t size) {
-  return FLAGS_tcmalloc_trace_min_threshold <= size &&
-      (FLAGS_tcmalloc_trace_max_threshold == 0 || size < FLAGS_tcmalloc_trace_max_threshold);
-}
+  ConsumptionFunctor consumption_functor;
 
-void TCMallocNewHook(const void* ptr, size_t) {
-  if (!tcmalloc_trace_tracker) return;
-
-  auto size = MallocExtension::instance()->GetAllocatedSize(ptr);
-  if (CheckWithinTCMallocTraceThreshold(size)) {
-    tcmalloc_trace_tracker->Consume(size);
-
-    // Skip stack trace logging for memory allocations while initializing random, because
-    // RandomActWithProbability will cause infinite recursion otherwise.
-    if (!IsRandomInitializingInThisThread() &&
-        RandomActWithProbability(FLAGS_tcmalloc_trace_frequency)) {
-      // Skip four top frames: GetStackTrace, this function, the malloc hook invoker, and the
-      // allocation itself.
-      LOG(INFO) << "Malloc Call: size = " << size << "\n" <<
-          GetStackTrace(StackTraceLineFormat::DEFAULT, 4 /* num_top_frames_to_skip */);
-    }
+  bool log_root_tracker_details = true;
+  const char* in_postgres = std::getenv("YB_ENABLED_IN_POSTGRES");
+  if (in_postgres != NULL && strcmp(in_postgres, "1") == 0) {
+    log_root_tracker_details = VLOG_IS_ON(1);
   }
-}
-void TCMallocDeleteHook(const void* ptr) {
-  if (!tcmalloc_trace_tracker) return;
 
-  auto size = MallocExtension::instance()->GetAllocatedSize(ptr);
+  #if YB_TCMALLOC_ENABLED
+  consumption_functor = &GetTCMallocActualHeapSizeBytes;
 
-  // We didn't track any allocations done during program initialization, but some of those may
-  // be deleted before the tracker is deleted. Avoid throwing an error by returning early.
-  if (static_cast<int64_t>(size) > tcmalloc_trace_tracker->consumption()) return;
-
-  if (CheckWithinTCMallocTraceThreshold(size)) {
-    tcmalloc_trace_tracker->Release(size);
+  if (FLAGS_mem_tracker_tcmalloc_gc_release_bytes < 0) {
+    // Allocate 1% of memory to the tcmalloc page heap freelist.
+    // On a 4GB RAM machine, the master gets 10%, so 400MB, so 1% is 4MB.
+    // On a 16GB RAM machine, the tserver gets 85%, so 13.6GB, so 1% is 136MB, so cap at 128MB.
+    FLAGS_mem_tracker_tcmalloc_gc_release_bytes =
+        std::min(static_cast<size_t>(1.0 * limit / 100), 128_MB);
   }
-}
 
-void RegisterTCMallocHooks() {
-  if (FLAGS_tcmalloc_trace_enabled && !tcmalloc_trace_tracker) {
-    LOG(INFO) << "TCMalloc tracing enabled";
-    tcmalloc_trace_tracker = MemTracker::FindOrCreateTracker(
-        "TCMalloc Trace", MemTracker::GetRootTracker(), AddToParent::kFalse, CreateMetrics::kTrue);
-    MallocHook::AddNewHook(TCMallocNewHook);
-    MallocHook::AddDeleteHook(TCMallocDeleteHook);
-  }
-}
+  LOG_IF(INFO, log_root_tracker_details)
+      << "Creating root MemTracker with garbage collection threshold "
+      << FLAGS_mem_tracker_tcmalloc_gc_release_bytes << " bytes";
+#endif
 
-#endif // defined(YB_GPERFTOOLS_TCMALLOC)
-#endif // YB_TCMALLOC_ENABLED
+  LOG_IF(INFO, log_root_tracker_details) << "Root memory limit is " << limit;
+  return std::make_shared<MemTracker>(
+      limit, "root", std::move(consumption_functor), nullptr /* parent */, AddToParent::kFalse,
+      CreateMetrics::kFalse, std::string() /* metric_name */, IsRootTracker::kTrue);
+}
 
 } // namespace
 
@@ -306,25 +217,24 @@ class MemTracker::TrackerMetrics {
       : metric_entity_(metric_entity) {
   }
 
-  void Init(const MemTracker& mem_tracker, const std::string& name_suffix) {
-    std::string name = CreateMetricName(mem_tracker);
-    if (!name_suffix.empty()) {
-      name += "_";
-      name += name_suffix;
-    }
-    metric_ = metric_entity_->FindOrCreateGauge(
-        std::unique_ptr<GaugePrototype<int64_t>>(new OwningGaugePrototype<int64_t>(
-          metric_entity_->prototype().name(), std::move(name),
-          CreateMetricLabel(mem_tracker), MetricUnit::kBytes,
-          CreateMetricDescription(mem_tracker), yb::MetricLevel::kInfo)),
-        mem_tracker.consumption());
+  void Init(const MemTracker& mem_tracker) {
+    // The GaugePrototype object is owned by the AtomicGauge and is also shared with
+    // MetricsAggregator or PrometheusWriter when the metric is being aggregated.
+    metric_ = metric_entity_->FindOrCreateMetric<AtomicGauge<int64_t>>(
+        std::shared_ptr<GaugePrototype<int64_t>>(new OwningGaugePrototype<int64_t>(
+            metric_entity_->prototype().name(), mem_tracker.metric_name(),
+            CreateMetricLabel(mem_tracker), MetricUnit::kBytes,
+            CreateMetricDescription(mem_tracker), yb::MetricLevel::kInfo)),
+        static_cast<int64_t>(0));
+    // Consumption could be changed when gauge is created, so set it separately.
+    metric_->set_value(mem_tracker.consumption());
   }
 
   TrackerMetrics(TrackerMetrics&) = delete;
   void operator=(const TrackerMetrics&) = delete;
 
   ~TrackerMetrics() {
-    metric_entity_->Remove(metric_->prototype());
+    metric_entity_->RemoveFromMetricMap(metric_->prototype());
   }
 
   MetricEntityPtr metric_entity_;
@@ -332,78 +242,24 @@ class MemTracker::TrackerMetrics {
 };
 
 void MemTracker::PrintTCMallocConfigs() {
-#if defined(YB_TCMALLOC_ENABLED) && defined (YB_GOOGLE_TCMALLOC)
+#if YB_GOOGLE_TCMALLOC
   LOG(INFO) << "TCMalloc per cpu caches active: "
             << tcmalloc::MallocExtension::PerCpuCachesActive();
   LOG(INFO) << "TCMalloc max per cpu cache size: "
             << tcmalloc::MallocExtension::GetMaxPerCpuCacheSize();
   LOG(INFO) << "TCMalloc max total thread cache bytes: "
             << tcmalloc::MallocExtension::GetMaxTotalThreadCacheBytes();
-#endif
+#endif  // YB_GOOGLE_TCMALLOC
 }
 
-void MemTracker::SetTCMallocCacheMemory() {
-#ifdef YB_TCMALLOC_ENABLED
-  if (FLAGS_server_tcmalloc_max_total_thread_cache_bytes < 0) {
-    const auto mem_limit = MemTracker::GetRootTracker()->limit();
-    FLAGS_server_tcmalloc_max_total_thread_cache_bytes =
-        std::min(std::max(static_cast<size_t>(2.5 * mem_limit / 100), 32_MB), 2_GB);
-  }
-  LOG(INFO) << "Setting tcmalloc max thread cache bytes to: "
-            << FLAGS_server_tcmalloc_max_total_thread_cache_bytes;
-#if defined(YB_GOOGLE_TCMALLOC)
-  ::tcmalloc::MallocExtension::SetMaxTotalThreadCacheBytes(
-      FLAGS_server_tcmalloc_max_total_thread_cache_bytes);
-  if (FLAGS_tcmalloc_max_per_cpu_cache_bytes > 0) {
-    ::tcmalloc::MallocExtension::SetMaxPerCpuCacheSize(
-        FLAGS_tcmalloc_max_per_cpu_cache_bytes);
-  }
-#else
-  constexpr const char* const kTcMallocMaxThreadCacheBytes =
-      "tcmalloc.max_total_thread_cache_bytes";
-  if (!MallocExtension::instance()->SetNumericProperty(
-          kTcMallocMaxThreadCacheBytes, FLAGS_server_tcmalloc_max_total_thread_cache_bytes)) {
-    LOG(FATAL) << "Failed to set Tcmalloc property: " << kTcMallocMaxThreadCacheBytes;
-  }
-  RegisterTCMallocHooks();
-#endif // defined(YB_GOOGLE_TCMALLOC)
-#endif // defined(YB_TCMALLOC_ENABLED)
-}
-
-void MemTracker::CreateRootTracker() {
-  int64_t limit = FLAGS_memory_limit_hard_bytes;
-  if (limit == 0) {
-    // If no limit is provided, we'll use
-    // - 85% of the RAM for tservers.
-    // - 10% of the RAM for masters.
-    int64_t total_ram;
-    CHECK_OK(Env::Default()->GetTotalRAMBytes(&total_ram));
-    limit = total_ram * FLAGS_default_memory_limit_to_ram_ratio;
-  }
-
-  ConsumptionFunctor consumption_functor;
-
-#ifdef YB_TCMALLOC_ENABLED
-  consumption_functor = &MemTracker::GetTCMallocActualHeapSizeBytes;
-
-  OverrideTcmallocGcThresholdForPg();
-
-  if (FLAGS_mem_tracker_tcmalloc_gc_release_bytes < 0) {
-    // Allocate 1% of memory to the tcmalloc page heap freelist.
-    // On a 4GB RAM machine, the master gets 10%, so 400MB, so 1% is 4MB.
-    // On a 16GB RAM machine, the tserver gets 85%, so 13.6GB, so 1% is 136MB, so cap at 128MB.
-    FLAGS_mem_tracker_tcmalloc_gc_release_bytes =
-        std::min(static_cast<size_t>(1.0 * limit / 100), 128_MB);
-  }
-#endif
-
-  root_tracker = std::make_shared<MemTracker>(
-      limit, "root", std::move(consumption_functor), nullptr /* parent */, AddToParent::kTrue,
-      CreateMetrics::kFalse);
+void MemTracker::ConfigureTCMalloc() {
+  ::yb::ConfigureTCMalloc(MemTracker::GetRootTracker()->limit());
+  RegisterTCMallocTraceHooks();
 }
 
 shared_ptr<MemTracker> MemTracker::CreateTracker(int64_t byte_limit,
                                                  const string& id,
+                                                 const std::string& metric_name,
                                                  ConsumptionFunctor consumption_functor,
                                                  const shared_ptr<MemTracker>& parent,
                                                  AddToParent add_to_parent,
@@ -411,7 +267,23 @@ shared_ptr<MemTracker> MemTracker::CreateTracker(int64_t byte_limit,
   shared_ptr<MemTracker> real_parent = parent ? parent : GetRootTracker();
   return real_parent->CreateChild(
       byte_limit, id, std::move(consumption_functor), MayExist::kFalse, add_to_parent,
-      create_metrics);
+          create_metrics, metric_name);
+}
+
+std::shared_ptr<MemTracker> MemTracker::InsertChildUnlocked(
+  const std::string& id, std::shared_ptr<MemTracker> child) {
+  auto [iter, inserted] = child_trackers_.emplace(id, child);
+  if (inserted) {
+    return child;
+  }
+  auto& tracker_weak_ptr = iter->second;
+  auto existing = tracker_weak_ptr.lock();
+  if (existing) {
+    LOG(DFATAL) << Format("Duplicate memory tracker (id $0) on parent $1", id, ToString());
+    return existing;
+  }
+  tracker_weak_ptr = child;
+  return child;
 }
 
 shared_ptr<MemTracker> MemTracker::CreateChild(int64_t byte_limit,
@@ -419,45 +291,48 @@ shared_ptr<MemTracker> MemTracker::CreateChild(int64_t byte_limit,
                                                ConsumptionFunctor consumption_functor,
                                                MayExist may_exist,
                                                AddToParent add_to_parent,
-                                               CreateMetrics create_metrics) {
-  std::lock_guard<std::mutex> lock(child_trackers_mutex_);
-  if (may_exist) {
-    auto result = FindChildUnlocked(id);
-    if (result) {
-      return result;
-    }
+                                               CreateMetrics create_metrics,
+                                               const std::string& metric_name) {
+  auto create_mem_tracker = [&] {
+    return std::make_shared<MemTracker>(
+        byte_limit, id, std::move(consumption_functor), shared_from_this(),
+        add_to_parent, create_metrics, metric_name, IsRootTracker::kFalse);
+  };
+  if (!may_exist) {
+    // Create mem-tracker before locking to avoid recursive mutex acquisition through the following
+    // stack for untracked memory tracker creation:
+    // MemTracker::CreateTracker -> GetRootTracker()->CreateChild -> MemTracker::MemTracker() -> ...
+    // -> MemTracker::DoUpdateConsumption() -> MemTracker::GetUntrackedMemory() ->
+    // MemTracker::GetTrackedMemory() -> GetRootTracker()->ListChildren()
+    auto child = create_mem_tracker();
+    std::lock_guard lock(child_trackers_mutex_);
+    return InsertChildUnlocked(id, std::move(child));
   }
-  auto result = std::make_shared<MemTracker>(
-      byte_limit, id, std::move(consumption_functor), shared_from_this(), add_to_parent,
-      create_metrics);
-  auto p = child_trackers_.emplace(id, result);
-  if (!p.second) {
-    auto existing = p.first->second.lock();
-    if (existing) {
-      LOG(DFATAL) << Format("Duplicate memory tracker (id $0) on parent $1", id, ToString());
-      return existing;
-    }
-    p.first->second = result;
+  std::lock_guard lock(child_trackers_mutex_);
+  auto existing = FindChildUnlocked(id);
+  if (existing) {
+    return existing;
   }
-
-  return result;
+  return InsertChildUnlocked(id, create_mem_tracker());
 }
 
 MemTracker::MemTracker(int64_t byte_limit, const string& id,
                        ConsumptionFunctor consumption_functor, std::shared_ptr<MemTracker> parent,
-                       AddToParent add_to_parent, CreateMetrics create_metrics)
+                       AddToParent add_to_parent, CreateMetrics create_metrics,
+                       const std::string& metric_name, IsRootTracker is_root_tracker)
     : limit_(byte_limit),
       soft_limit_(limit_ == -1 ? -1 : (limit_ * FLAGS_memory_limit_soft_percentage) / 100),
       id_(id),
       consumption_functor_(std::move(consumption_functor)),
       descr_(Substitute("memory consumption for $0", id)),
       parent_(std::move(parent)),
-      rand_(GetRandomSeed32()),
       enable_logging_(FLAGS_mem_tracker_logging),
       log_stack_(FLAGS_mem_tracker_log_stack_trace),
-      add_to_parent_(add_to_parent) {
+      add_to_parent_(add_to_parent),
+      metric_name_(CreateMetricName(*this, metric_name)),
+      is_root_tracker_(is_root_tracker) {
   VLOG(1) << "Creating tracker " << ToString();
-  UpdateConsumption();
+  MaybeUpdateConsumption();
 
   all_trackers_.push_back(this);
   if (has_limit()) {
@@ -474,7 +349,7 @@ MemTracker::MemTracker(int64_t byte_limit, const string& id,
     for (MemTracker* tracker = this; tracker; tracker = tracker->parent().get()) {
       if (tracker->metric_entity()) {
         metrics_ = std::make_unique<TrackerMetrics>(tracker->metric_entity());
-        metrics_->Init(*this, std::string());
+        metrics_->Init(*this);
         break;
       }
     }
@@ -496,7 +371,8 @@ void MemTracker::UnregisterFromParent() {
 }
 
 void MemTracker::UnregisterChild(const std::string& id) {
-  std::lock_guard<std::mutex> lock(child_trackers_mutex_);
+  std::lock_guard lock(child_trackers_mutex_);
+  VLOG(1) << "Unregistering child tracker " << id << " from " << id_;
   child_trackers_.erase(id);
 }
 
@@ -520,7 +396,7 @@ MemTrackerPtr MemTracker::FindTracker(const std::string& id,
 }
 
 MemTrackerPtr MemTracker::FindChild(const std::string& id) {
-  std::lock_guard<std::mutex> lock(child_trackers_mutex_);
+  std::lock_guard lock(child_trackers_mutex_);
   return FindChildUnlocked(id);
 }
 
@@ -538,12 +414,14 @@ MemTrackerPtr MemTracker::FindChildUnlocked(const std::string& id) {
 
 shared_ptr<MemTracker> MemTracker::FindOrCreateTracker(int64_t byte_limit,
                                                        const string& id,
+                                                       const std::string& metric_name,
                                                        const shared_ptr<MemTracker>& parent,
                                                        AddToParent add_to_parent,
                                                        CreateMetrics create_metrics) {
   shared_ptr<MemTracker> real_parent = parent ? parent : GetRootTracker();
   return real_parent->CreateChild(
-      byte_limit, id, ConsumptionFunctor(), MayExist::kTrue, add_to_parent, create_metrics);
+      byte_limit, id, ConsumptionFunctor(), MayExist::kTrue, add_to_parent,
+          create_metrics, metric_name);
 }
 
 std::vector<MemTrackerPtr> MemTracker::ListChildren() {
@@ -556,7 +434,7 @@ void MemTracker::ListDescendantTrackers(
     std::vector<MemTrackerPtr>* out, OnlyChildren only_children) {
   size_t begin = out->size();
   {
-    std::lock_guard<std::mutex> lock(child_trackers_mutex_);
+    std::lock_guard lock(child_trackers_mutex_);
     for (auto it = child_trackers_.begin(); it != child_trackers_.end();) {
       auto child = it->second.lock();
       if (child) {
@@ -583,36 +461,89 @@ std::vector<MemTrackerPtr> MemTracker::ListTrackers() {
   return result;
 }
 
-bool MemTracker::UpdateConsumption(bool force) {
+bool MemTracker::ShouldForceUpdateConsumption() const {
+  // If we try to include current time vs next_consumption_update_ check here, it cases +10%
+  // latency overhead for TryConsume/Consume functions due to twice calling
+  // CoarseMonoClock::now() - once in MaybeUpdateConsumption > ShouldUpdateConsumption and another
+  // time in TryIncrement/Increment.
+  // Removing this duplicity inside TryConsume/Consume is non-trivial because we want first to try
+  // to update consumption based on external source if time permits and then proceed with other
+  // checks.
+  if (soft_limit_ <= 0) {
+    return false;
+  }
+  const auto value = consumption_.current_value();
+  return value > consumption_upper_bound_for_update_.load(std::memory_order_acquire) ||
+         value < consumption_lower_bound_for_update_.load(std::memory_order_acquire);
+}
+
+void MemTracker::DoUpdateConsumption() {
+  const auto now = CoarseMonoClock::now();
+  next_consumption_update_ =
+      now + std::chrono::microseconds(FLAGS_mem_tracker_update_consumption_interval_us);
+  auto value = consumption_functor_();
+  VLOG(1) << "Setting consumption of tracker " << id_ << " from " << consumption_.current_value()
+          << " to " << value << " from consumption functor";
+  consumption_.set_value(value);
+  if (soft_limit_ > 0) {
+    const int64_t accuracy_bytes =
+        FLAGS_mem_tracker_external_consumption_accuracy_percentage / 100 * soft_limit_;
+    consumption_lower_bound_for_update_.store(
+        std::max<int64_t>(0, value - accuracy_bytes), std::memory_order_release);
+    consumption_upper_bound_for_update_.store(value + accuracy_bytes, std::memory_order_release);
+  }
+  if (metrics_) {
+    metrics_->metric_->set_value(value);
+  }
+}
+
+bool MemTracker::MaybeUpdateConsumption(bool force) {
   if (poll_children_consumption_functors_) {
     poll_children_consumption_functors_();
   }
 
-  if (consumption_functor_) {
-    auto now = CoarseMonoClock::now();
-    auto interval = std::chrono::microseconds(
-        GetAtomicFlag(&FLAGS_mem_tracker_update_consumption_interval_us));
-    if (force || now > last_consumption_update_ + interval) {
-      last_consumption_update_ = now;
-      auto value = consumption_functor_();
-      consumption_.set_value(value);
-      if (metrics_) {
-        metrics_->metric_->set_value(value);
-      }
-    }
-    return true;
+  if (!consumption_functor_) {
+    return false;
   }
 
+  auto now = CoarseMonoClock::now();
+  if (force || now > next_consumption_update_ || ShouldForceUpdateConsumption()) {
+    DoUpdateConsumption();
+    return true;
+  }
   return false;
+}
+
+void MemTracker::IncrementMetricBy(int64_t amount) {
+  if (metrics_) {
+    metrics_->metric_->IncrementBy(amount);
+  }
+}
+
+void MemTracker::IncrementBy(int64_t amount) {
+  consumption_.IncrementBy(amount);
+  if (consumption_functor_ && ShouldForceUpdateConsumption()) {
+    DoUpdateConsumption();
+    return;
+  }
+  IncrementMetricBy(amount);
+}
+
+bool MemTracker::TryIncrementBy(int64_t amount) {
+  if (!consumption_.TryIncrementBy(amount, limit_)) {
+    return false;
+  }
+  if (consumption_functor_ && ShouldForceUpdateConsumption()) {
+    DoUpdateConsumption();
+    consumption_.IncrementBy(amount);
+  }
+  IncrementMetricBy(amount);
+  return true;
 }
 
 void MemTracker::Consume(int64_t bytes) {
   if (bytes < 0) {
     Release(-bytes);
-    return;
-  }
-
-  if (UpdateConsumption()) {
     return;
   }
   if (bytes == 0) {
@@ -622,15 +553,14 @@ void MemTracker::Consume(int64_t bytes) {
     LogUpdate(true, bytes);
   }
   for (auto& tracker : all_trackers_) {
-    if (!tracker->UpdateConsumption()) {
-      IncrementBy(bytes, &tracker->consumption_, tracker->metrics_);
+    if (!tracker->MaybeUpdateConsumption()) {
+      tracker->IncrementBy(bytes);
       DCHECK_GE(tracker->consumption_.current_value(), 0);
     }
   }
 }
 
 bool MemTracker::TryConsume(int64_t bytes, MemTracker** blocking_mem_tracker) {
-  UpdateConsumption();
   if (bytes <= 0) {
     return true;
   }
@@ -643,18 +573,17 @@ bool MemTracker::TryConsume(int64_t bytes, MemTracker** blocking_mem_tracker) {
   // won't accommodate the change.
   for (i = all_trackers_.size() - 1; i >= 0; --i) {
     MemTracker *tracker = all_trackers_[i];
+    tracker->MaybeUpdateConsumption();
     if (tracker->limit_ < 0) {
-      IncrementBy(bytes, &tracker->consumption_, tracker->metrics_);
+      tracker->IncrementBy(bytes);
     } else {
-      if (!TryIncrementBy(bytes, tracker->limit_, &tracker->consumption_, tracker->metrics_)) {
+      if (!tracker->TryIncrementBy(bytes)) {
         // One of the trackers failed, attempt to GC memory or expand our limit. If that
         // succeeds, TryUpdate() again. Bail if either fails.
-        if (!tracker->GcMemory(tracker->limit_ - bytes) ||
-            tracker->ExpandLimit(bytes)) {
-          if (!TryIncrementBy(bytes, tracker->limit_, &tracker->consumption_, tracker->metrics_)) {
-            break;
-          }
-        } else {
+        if (tracker->GcMemory(tracker->limit_ - bytes)) {
+          break;
+        }
+        if (!tracker->TryIncrementBy(bytes)) {
           break;
         }
       }
@@ -675,7 +604,7 @@ bool MemTracker::TryConsume(int64_t bytes, MemTracker** blocking_mem_tracker) {
   // to adjust the consumption of the query tracker to stop the resource from never
   // getting used by a subsequent TryConsume()?
   for (ssize_t j = all_trackers_.size(); --j > i;) {
-    IncrementBy(-bytes, &all_trackers_[j]->consumption_, all_trackers_[j]->metrics_);
+    all_trackers_[j]->IncrementBy(-bytes);
   }
   if (blocking_mem_tracker) {
     *blocking_mem_tracker = all_trackers_[i];
@@ -689,26 +618,24 @@ void MemTracker::Release(int64_t bytes) {
     Consume(-bytes);
     return;
   }
-
-  if (PREDICT_FALSE(base::subtle::Barrier_AtomicIncrement(&released_memory_since_gc, bytes) >
-                    GetAtomicFlag(&FLAGS_mem_tracker_tcmalloc_gc_release_bytes))) {
-    GcTcmalloc();
-  }
-
-  if (UpdateConsumption()) {
-    return;
-  }
-
   if (bytes == 0) {
     return;
   }
+
+  bool do_force_update_consumption = false;
+  if (PREDICT_FALSE(base::subtle::Barrier_AtomicIncrement(&released_memory_since_gc, bytes) >
+                    FLAGS_mem_tracker_tcmalloc_gc_release_bytes)) {
+    // Force updating consumption to reflect real consumption if GC happened.
+    do_force_update_consumption = GcTcmallocIfNeeded();
+  }
+
   if (PREDICT_FALSE(enable_logging_)) {
     LogUpdate(false, bytes);
   }
 
   for (auto& tracker : all_trackers_) {
-    if (!tracker->UpdateConsumption()) {
-      IncrementBy(-bytes, &tracker->consumption_, tracker->metrics_);
+    if (!tracker->MaybeUpdateConsumption(do_force_update_consumption)) {
+      tracker->IncrementBy(-bytes);
       // If a UDF calls FunctionContext::TrackAllocation() but allocates less than the
       // reported amount, the subsequent call to FunctionContext::Free() may cause the
       // process mem tracker to go negative until it is synced back to the tcmalloc
@@ -737,30 +664,45 @@ bool MemTracker::LimitExceeded() {
 }
 
 SoftLimitExceededResult MemTracker::SoftLimitExceeded(double* score) {
-  // Did we exceed the actual limit?
-  if (LimitExceeded()) {
-    return {ToString(), true, consumption() * 100.0 / limit()};
-  }
-
-  // No soft limit defined.
-  if (!has_limit() || limit_ == soft_limit_) {
-    return SoftLimitExceededResult::NotExceeded();
-  }
-
-  // Are we under the soft limit threshold?
   int64_t usage = consumption();
-  if (usage < soft_limit_) {
-    return SoftLimitExceededResult::NotExceeded();
+  // If we have exceed the hard limit, we can skip the soft limit calculations.
+  if (!LimitExceeded()) {
+    // No soft limit defined.
+    if (!has_limit() || limit_ == soft_limit_) {
+      return SoftLimitExceededResult::NotExceeded();
+    }
+
+    // Are we under the soft limit threshold?
+    if (usage < soft_limit_) {
+      return SoftLimitExceededResult::NotExceeded();
+    }
+
+    // We're over the threshold; were we randomly chosen to be over the soft limit?
+    if (*score == 0.0) {
+      *score = RandomUniformReal<double>();
+    }
+    if (usage + (limit_ - soft_limit_) * *score <= limit_) {
+      return SoftLimitExceededResult::NotExceeded();
+    }
+
+    if (!GcMemory(soft_limit_)) {
+      // We were able to GC enough to be below the soft memory limit.
+      return SoftLimitExceededResult::NotExceeded();
+    }
   }
 
-  // We're over the threshold; were we randomly chosen to be over the soft limit?
-  if (*score == 0.0) {
-    *score = RandomUniformReal<double>();
+  // Soft limit exceeded.
+  // Dump heap snapshot for debugging if this is the root tracker (and we have not dumped recently).
+  if (IsRoot()) {
+    if (DumpHeapSnapshotUnlessThrottled()) {
+      DumpMemoryUsage();
+    }
   }
-  if (usage + (limit_ - soft_limit_) * *score > limit_ && GcMemory(soft_limit_)) {
-    return {ToString(), true, usage * 100.0 / limit()};
-  }
-  return SoftLimitExceededResult::NotExceeded();
+  return SoftLimitExceededResult {
+    .tracker_path = ToString(),
+    .exceeded = true,
+    .current_capacity_pct = usage * 100.0 / limit()
+  };
 }
 
 SoftLimitExceededResult MemTracker::AnySoftLimitExceeded(double* score) {
@@ -796,23 +738,20 @@ bool MemTracker::GcMemory(int64_t max_consumption) {
     }
 
     // Create vector of alive garbage collectors. Also remove stale garbage collectors.
-    std::vector<std::shared_ptr<GarbageCollector>> collectors;
+    GarbageCollectorsContainer<std::shared_ptr<GarbageCollector>> collectors;
     {
-      std::lock_guard<simple_spinlock> l(gc_mutex_);
+      std::lock_guard l(gc_mutex_);
       collectors.reserve(gcs_.size());
-      auto w = gcs_.begin();
-      for (auto i = gcs_.begin(); i != gcs_.end(); ++i) {
-        auto gc = i->lock();
-        if (!gc) {
-          continue;
-        }
-        collectors.push_back(gc);
-        if (w != i) {
-          *w = *i;
-        }
-        ++w;
-      }
-      gcs_.erase(w, gcs_.end());
+      boost::remove_erase_if(
+          gcs_,
+          [&collectors](const std::weak_ptr<GarbageCollector>& gc_weak) {
+              auto gc = gc_weak.lock();
+              if (!gc) {
+                return true;
+              }
+              collectors.push_back(std::move(gc));
+              return false;
+          });
     }
 
     // Try to free up some memory
@@ -829,16 +768,16 @@ bool MemTracker::GcMemory(int64_t max_consumption) {
   if (current_consumption > max_consumption) {
     std::vector<MemTrackerPtr> children;
     {
-      std::lock_guard<std::mutex> lock(child_trackers_mutex_);
-      for (auto it = child_trackers_.begin(); it != child_trackers_.end();) {
-        auto child = it->second.lock();
-        if (child) {
-          children.push_back(std::move(child));
-          ++it;
-        } else {
-          it = child_trackers_.erase(it);
+      std::lock_guard lock(child_trackers_mutex_);
+      children.reserve(child_trackers_.size());
+      std::erase_if(child_trackers_, [&children](const auto& item) {
+        auto child = item.second.lock();
+        if (!child) {
+          return true;
         }
-      }
+        children.push_back(std::move(child));
+        return false;
+      });
     }
 
     for (const auto& child : children) {
@@ -846,7 +785,7 @@ bool MemTracker::GcMemory(int64_t max_consumption) {
       if (did_gc) {
         current_consumption = GetUpdatedConsumption();
         if (current_consumption <= max_consumption) {
-          return true;
+          return false;
         }
       }
     }
@@ -855,33 +794,37 @@ bool MemTracker::GcMemory(int64_t max_consumption) {
   return consumption() > max_consumption;
 }
 
-void MemTracker::GcTcmalloc() {
+bool MemTracker::GcTcmallocIfNeeded() {
 #ifdef YB_TCMALLOC_ENABLED
   released_memory_since_gc = 0;
-  TRACE_EVENT0("process", "MemTracker::GcTcmalloc");
+  TRACE_EVENT0("process", "MemTracker::GcTcmallocIfNeeded");
 
   // Number of bytes in the 'NORMAL' free list (i.e reserved by tcmalloc but
   // not in use).
-  int64_t bytes_overhead = GetTCMallocProperty("tcmalloc.pageheap_free_bytes");
+  int64_t bytes_overhead = GetTCMallocPageHeapFreeBytes();
   // Bytes allocated by the application.
   int64_t bytes_used = GetTCMallocCurrentAllocatedBytes();
 
   int64_t max_overhead = bytes_used * FLAGS_tcmalloc_max_free_bytes_percentage / 100.0;
-  if (bytes_overhead > max_overhead) {
-    int64_t extra = bytes_overhead - max_overhead;
-    while (extra > 0) {
-      // Release 1MB at a time, so that tcmalloc releases its page heap lock
-      // allowing other threads to make progress. This still disrupts the current
-      // thread, but is better than disrupting all.
-#if defined(YB_GOOGLE_TCMALLOC)
-      tcmalloc::MallocExtension::ReleaseMemoryToSystem(1024 * 1024);
-#else
-      MallocExtension::instance()->ReleaseToSystem(1024 * 1024);
-#endif
-      extra -= 1024 * 1024;
-    }
+  int64_t extra = bytes_overhead - max_overhead;
+  if (extra <= 0) {
+    return false;
   }
-#endif
+  while (extra > 0) {
+    // Release 1MB at a time, so that tcmalloc releases its page heap lock
+    // allowing other threads to make progress. This still disrupts the current
+    // thread, but is better than disrupting all.
+#if YB_GOOGLE_TCMALLOC
+    tcmalloc::MallocExtension::ReleaseMemoryToSystem(1024 * 1024);
+#else
+    MallocExtension::instance()->ReleaseToSystem(1024 * 1024);
+#endif  // YB_GOOGLE_TCMALLOC
+    extra -= 1024 * 1024;
+  }
+  return true;
+#else
+  return false;
+#endif  // YB_TCMALLOC_ENABLED
 }
 
 string MemTracker::LogUsage(const string& prefix, int64_t usage_threshold, int indent) const {
@@ -898,7 +841,7 @@ string MemTracker::LogUsage(const string& prefix, int64_t usage_threshold, int i
   stringstream prefix_ss;
   prefix_ss << prefix << "  ";
   string new_prefix = prefix_ss.str();
-  std::lock_guard<std::mutex> lock(child_trackers_mutex_);
+  std::lock_guard lock(child_trackers_mutex_);
   for (const auto& p : child_trackers_) {
     auto child = p.second.lock();
     if (child && child->consumption() >= usage_threshold) {
@@ -918,7 +861,7 @@ void MemTracker::LogMemoryLimits() const {
 
 void MemTracker::LogUpdate(bool is_consume, int64_t bytes) const {
   stringstream ss;
-  ss << this << " " << (is_consume ? "Consume: " : "Release: ") << bytes
+  ss << id_ << " " << (is_consume ? "Consume: " : "Release: ") << bytes
      << " Consumption: " << consumption() << " Limit: " << limit_;
   if (log_stack_) {
     ss << std::endl << GetStackTrace();
@@ -926,13 +869,31 @@ void MemTracker::LogUpdate(bool is_consume, int64_t bytes) const {
   LOG(ERROR) << ss.str();
 }
 
-shared_ptr<MemTracker> MemTracker::GetRootTracker() {
-  GoogleOnceInit(&root_tracker_once, &MemTracker::CreateRootTracker);
+const shared_ptr<MemTracker>& MemTracker::GetRootTracker() {
+  static auto root_tracker = CreateRootTracker();
   return root_tracker;
 }
 
-void MemTracker::SetMetricEntity(
-    const MetricEntityPtr& metric_entity, const std::string& name_suffix) {
+uint64_t MemTracker::GetTrackedMemory() {
+  uint64_t tracked_memory = 0;
+  for (const auto& child_tracker : GetRootTracker()->ListChildren()) {
+    if (!child_tracker->id().starts_with(kTCMallocTrackerNamePrefix) &&
+        child_tracker->id() != kUntrackedTrackerName) {
+      tracked_memory += child_tracker->consumption();
+    }
+  }
+  return tracked_memory;
+}
+
+uint64_t MemTracker::GetUntrackedMemory() {
+  #if YB_TCMALLOC_ENABLED
+  // generic.current_allocated_bytes = root - tcmalloc
+  return ::yb::GetTCMallocProperty("generic.current_allocated_bytes") - GetTrackedMemory();
+  #endif
+  return 0;
+}
+
+void MemTracker::SetMetricEntity(const MetricEntityPtr& metric_entity) {
   if (metrics_) {
     LOG_IF(DFATAL, metric_entity->id() != metrics_->metric_entity_->id())
         << "SetMetricEntity (" << metric_entity->id() << ") while "
@@ -940,8 +901,13 @@ void MemTracker::SetMetricEntity(
         << metrics_->metric_entity_->id();
     return;
   }
-  metrics_ = std::make_unique<TrackerMetrics>(metric_entity);
-  metrics_->Init(*this, name_suffix);
+  auto metrics = std::make_unique<TrackerMetrics>(metric_entity);
+  metrics->Init(*this);
+  metrics_ = std::move(metrics);
+}
+
+void MemTracker::TEST_SetReleasedMemorySinceGC(int64_t value) {
+  released_memory_since_gc = value;
 }
 
 scoped_refptr<MetricEntity> MemTracker::metric_entity() const {
@@ -970,35 +936,39 @@ const MemTrackerData& CollectMemTrackerData(const MemTrackerPtr& tracker, int de
   return (*output)[idx];
 }
 
-std::string DumpMemTrackers() {
-  std::ostringstream out;
+namespace {
+
+void DumpMemTrackerData(const MemTrackerData& data, std::ostream& out) {
+  const auto& tracker = data.tracker;
+  const std::string current_consumption_str =
+      HumanReadableNumBytes::ToString(tracker->consumption());
+  out << std::string(data.depth, ' ') << tracker->id() << ": ";
+  if (data.consumption_excluded_from_ancestors && !data.tracker->HasExternalSource()) {
+    const auto full_consumption_str = HumanReadableNumBytes::ToString(
+        tracker->consumption() + data.consumption_excluded_from_ancestors);
+    out << current_consumption_str << " (" << full_consumption_str << ")";
+  } else {
+    out << current_consumption_str;
+  }
+}
+
+void DumpMemTrackers() {
+  LOG(INFO) << "Mem trackers:";
   std::vector<MemTrackerData> trackers;
   CollectMemTrackerData(MemTracker::GetRootTracker(), 0, &trackers);
   for (const auto& data : trackers) {
-    const auto& tracker = data.tracker;
-    const std::string current_consumption_str =
-        HumanReadableNumBytes::ToString(tracker->consumption());
-    out << std::string(data.depth, ' ') << tracker->id() << ": ";
-    if (!data.consumption_excluded_from_ancestors || data.tracker->UpdateConsumption()) {
-      out << current_consumption_str;
-    } else {
-      auto full_consumption_str = HumanReadableNumBytes::ToString(
-          tracker->consumption() + data.consumption_excluded_from_ancestors);
-      out << current_consumption_str << " (" << full_consumption_str << ")";
-    }
-    out << std::endl;
+    DumpMemTrackerData(data, LOG(INFO));
   }
-  return out.str();
 }
 
-std::string DumpMemoryUsage() {
-  std::ostringstream out;
+} // namespace
+
+void DumpMemoryUsage() {
   auto tcmalloc_stats = TcMallocStats();
   if (!tcmalloc_stats.empty()) {
-    out << "TCMalloc stats: \n" << tcmalloc_stats << "\n";
+    LOG(INFO) << "TCMalloc stats: \n" << tcmalloc_stats;
   }
-  out << "Memory usage: \n" << DumpMemTrackers();
-  return out.str();
+  DumpMemTrackers();
 }
 
 bool CheckMemoryPressureWithLogging(
@@ -1014,12 +984,56 @@ bool CheckMemoryPressureWithLogging(
       soft_limit_exceeded_result.current_capacity_pct, score);
   if (soft_limit_exceeded_result.current_capacity_pct >=
       FLAGS_memory_limit_warn_threshold_percentage) {
-    YB_LOG_EVERY_N_SECS(WARNING, 1) << error_prefix << msg << THROTTLE_MSG;
+    YB_LOG_EVERY_N_SECS(WARNING, 1) << error_prefix << msg;
   } else {
-    YB_LOG_EVERY_N_SECS(INFO, 1) << error_prefix << msg << THROTTLE_MSG;
+    YB_LOG_EVERY_N_SECS(INFO, 1) << error_prefix << msg;
   }
 
   return false;
 }
+
+void MonotonicThreadSafeScopedTrackedConsumption::Init(MemTrackerPtr tracker, int64_t to_consume) {
+  DCHECK(!tracker_);
+  DCHECK(tracker);
+  tracker_ = std::move(tracker);
+  consumption_.store(to_consume, std::memory_order_release);
+  tracker_->Consume(to_consume);
+}
+
+void MonotonicThreadSafeScopedTrackedConsumption::UpdateMonotonic(size_t new_bytes) {
+  if (!tracker_) {
+    return;
+  }
+  const auto value = new_bytes;
+  // Optimistic check: avoid taking the lock if there's nothing to do. A racing thread that
+  // sees a smaller current value will retry under the lock.
+  if (value <= consumption()) {
+    return;
+  }
+  std::lock_guard lock(mutex_);
+  const auto current = consumption();
+  if (value <= current) {
+    return;
+  }
+  tracker_->Consume(value - current);
+  consumption_.store(value, std::memory_order_release);
+}
+
+namespace internal {
+
+bool ValidateMemoryLimitToRamRatio(const char* flag_name, double value) {
+  if (value == USE_RECOMMENDED_MEMORY_VALUE) {
+    return true;  // Special sentinel value is allowed.
+  }
+  if (value <= 0.0 || value > 1.0) {
+    LOG_FLAG_VALIDATION_ERROR(flag_name, value)
+      << "Must be in the range (0, 1] or "
+      << USE_RECOMMENDED_MEMORY_VALUE << ".";
+    return false;
+  }
+  return true;
+}
+
+} // namespace internal
 
 } // namespace yb

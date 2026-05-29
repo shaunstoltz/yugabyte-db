@@ -1,5 +1,5 @@
 //--------------------------------------------------------------------------------------------------
-// Copyright (c) YugaByte, Inc.
+// Copyright (c) YugabyteDB, Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License"); you may not use this file except
 // in compliance with the License.  You may obtain a copy of the License at
@@ -14,38 +14,42 @@
 
 #pragma once
 
+#include <memory>
+
+#include "yb/util/result.h"
+
 #include "yb/yql/pggate/pg_dml_write.h"
 
-namespace yb {
-namespace pggate {
+namespace yb::pggate {
 
-//--------------------------------------------------------------------------------------------------
-// INSERT
-//--------------------------------------------------------------------------------------------------
-
-class PgInsert : public PgDmlWrite {
+class PgInsert final : public PgStatementLeafBase<PgDmlWrite, StmtOp::kInsert> {
  public:
-  PgInsert(PgSession::ScopedRefPtr pg_session,
-           const PgObjectId& table_id,
-           bool is_single_row_txn,
-           bool is_region_local)
-      : PgDmlWrite(std::move(pg_session), table_id, is_single_row_txn, is_region_local) {}
-
-  StmtOp stmt_op() const override { return StmtOp::STMT_INSERT; }
-
   void SetUpsertMode() {
     write_req_->set_stmt_type(PgsqlWriteRequestPB::PGSQL_UPSERT);
   }
 
-  void SetIsBackfill(const bool is_backfill) {
+  void SetIsBackfill(bool is_backfill) {
     write_req_->set_is_backfill(is_backfill);
   }
 
+  static Result<std::unique_ptr<PgInsert>> Make(
+      const PgSessionPtr& pg_session, const PgObjectId& table_id,
+      const YbcPgTableLocalityInfo& locality_info,
+      YbcPgTransactionSetting transaction_setting, bool skip_intents_write, bool packed) {
+    std::unique_ptr<PgInsert> result{new PgInsert{pg_session, transaction_setting, packed}};
+    RETURN_NOT_OK(result->Prepare(table_id, locality_info, skip_intents_write));
+    return result;
+  }
+
  private:
+  PgInsert(
+      const PgSessionPtr& pg_session, YbcPgTransactionSetting transaction_setting,
+      bool packed)
+      : BaseType(pg_session, transaction_setting, packed) {}
+
   PgsqlWriteRequestPB::PgsqlStmtType stmt_type() const override {
     return PgsqlWriteRequestPB::PGSQL_INSERT;
   }
 };
 
-}  // namespace pggate
-}  // namespace yb
+}  // namespace yb::pggate

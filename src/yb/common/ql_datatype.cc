@@ -1,4 +1,4 @@
-// Copyright (c) YugaByte, Inc.
+// Copyright (c) YugabyteDB, Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License"); you may not use this file except
 // in compliance with the License.  You may obtain a copy of the License at
@@ -11,8 +11,9 @@
 // under the License.
 //
 
-#include <glog/logging.h>
+#include "yb/util/logging.h"
 
+#include "yb/common/value.messages.h"
 #include "yb/common/ql_datatype.h"
 
 namespace yb {
@@ -72,6 +73,7 @@ DataType InternalToDataType(InternalType internal_type) {
     case InternalType::kGinNullValue: // No such type in YCQL.
     case InternalType::VALUE_NOT_SET:
     case InternalType::kVirtualValue:
+    case InternalType::kBsonValue: // No such type in YCQL.
       break;
   }
   LOG(FATAL) << "Internal error: unsupported type " << internal_type;
@@ -108,6 +110,7 @@ std::string InternalTypeToCQLString(InternalType internal_type) {
     case InternalType::kVirtualValue: return "virtual";
     case InternalType::kGinNullValue: return "unknown"; // No such type in YCQL.
     case InternalType::kTupleValue: return "tuple";
+    case InternalType::kBsonValue: return "unknown"; // No such type in YCQL.
   }
   LOG (FATAL) << "Invalid datatype: " << internal_type;
   return "Undefined Type";

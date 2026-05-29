@@ -1,16 +1,15 @@
-import React, { FC, useContext } from 'react';
-import _ from 'lodash';
+import { FC, useContext } from 'react';
+import _, { get } from 'lodash';
 import { useQuery } from 'react-query';
+import { useSelector } from 'react-redux';
 import { browserHistory } from 'react-router';
 import { useTranslation } from 'react-i18next';
-import { toast } from 'react-toastify';
 import { UniverseFormContext } from './UniverseFormContainer';
 import { UniverseForm } from './form/UniverseForm';
 import { YBLoading } from '../../../../components/common/indicators';
 import { api, QUERY_KEY } from './utils/api';
 import { getPlacements } from './form/fields/PlacementsField/PlacementsFieldHelper';
 import {
-  createErrorMessage,
   createReadReplica,
   filterFormDataByClusterType,
   getAsyncCluster,
@@ -27,7 +26,6 @@ import {
   NodeState,
   UniverseFormData
 } from './utils/dto';
-import { TOAST_AUTO_DISMISS_INTERVAL } from './utils/constants';
 
 interface CreateReadReplicaProps {
   uuid: string;
@@ -35,8 +33,9 @@ interface CreateReadReplicaProps {
 
 export const CreateReadReplica: FC<CreateReadReplicaProps> = ({ uuid }) => {
   const { t } = useTranslation();
+  const featureFlags = useSelector((state: any) => state.featureFlags);
   const [contextState, contextMethods]: any = useContext(UniverseFormContext);
-  const { initializeForm, setUniverseResourceTemplate } = contextMethods;
+  const { initializeForm } = contextMethods;
 
   const { isLoading, data: universe } = useQuery(
     [QUERY_KEY.fetchUniverse, uuid],
@@ -49,27 +48,26 @@ export const CreateReadReplica: FC<CreateReadReplicaProps> = ({ uuid }) => {
           mode: ClusterModes.CREATE,
           universeConfigureTemplate: _.cloneDeep(resp.universeDetails)
         });
-        //set Universe Resource Template
-        try {
-          const resourceResponse = await api.universeResource(_.cloneDeep(resp.universeDetails));
-          setUniverseResourceTemplate(resourceResponse);
-        } catch (error) {
-          toast.error(createErrorMessage(error), { autoClose: TOAST_AUTO_DISMISS_INTERVAL });
-        }
       },
       onError: (error) => {
-        console.log(error);
+        console.error(error);
         transitToUniverse(); //redirect to /universes if universe with uuid doesnot exists
       }
     }
   );
 
-  const onCancel = () => browserHistory.goBack();
+  const onCancel = () => browserHistory.push(`/universes/${uuid}`);
 
   const onSubmit = async (formData: UniverseFormData) => {
-    const PRIMARY_CLUSTER = getPrimaryCluster(contextState.universeConfigureTemplate);
+    const primaryCluster = getPrimaryCluster(contextState.universeConfigureTemplate);
+    const ayncCluster = getAsyncCluster(contextState.universeConfigureTemplate);
+
+    const userIntent = {
+      ...ayncCluster?.userIntent,
+      ...getUserIntent({ formData }, ClusterType.ASYNC, featureFlags)
+    };
     const ASYNC_CLUSTER = {
-      userIntent: getUserIntent({ formData }),
+      userIntent: userIntent,
       clusterType: ClusterType.ASYNC,
       placementInfo: {
         cloudList: [
@@ -87,14 +85,12 @@ export const CreateReadReplica: FC<CreateReadReplicaProps> = ({ uuid }) => {
       ...contextState.universeConfigureTemplate,
       clusterOperation: ClusterModes.CREATE,
       currentClusterType: ClusterType.ASYNC,
-      clusters: [
-        PRIMARY_CLUSTER,
-        {
-          ...getAsyncCluster(contextState.universeConfigureTemplate),
-          ...ASYNC_CLUSTER
-        }
-      ]
+      clusters: [{ ...primaryCluster }]
     };
+    configurePayload?.clusters.push({
+      ...getAsyncCluster(contextState.universeConfigureTemplate),
+      ...ASYNC_CLUSTER
+    });
     const configureData = await api.universeConfigure(configurePayload);
 
     //patch the final payload with response from configure call
@@ -102,9 +98,15 @@ export const CreateReadReplica: FC<CreateReadReplicaProps> = ({ uuid }) => {
     const finalPayload = {
       ...configureData,
       expectedUniverseVersion: universe?.version,
-      nodeDetailsSet: configureData.nodeDetailsSet.filter(
-        (node: NodeDetails) => node.state === NodeState.ToBeAdded
-      ),
+      nodeDetailsSet: configureData.nodeDetailsSet
+        .filter((node: NodeDetails) => node.state === NodeState.ToBeAdded)
+        .map((node: NodeDetails) => ({
+          ...node,
+          cloudInfo: {
+            ...node.cloudInfo,
+            assignPublicIP: !!primaryCluster?.userIntent.assignPublicIP
+          }
+        })),
       clusters: [
         {
           ...getAsyncCluster(configureData),
@@ -129,6 +131,7 @@ export const CreateReadReplica: FC<CreateReadReplicaProps> = ({ uuid }) => {
       submitLabel={t('universeForm.actions.addRR')}
       onFormSubmit={(data: UniverseFormData) => onSubmit(data)}
       onCancel={onCancel}
+      universeUUID={uuid}
     />
   );
 };

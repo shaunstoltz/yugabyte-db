@@ -15,9 +15,9 @@
 // specific language governing permissions and limitations
 // under the License.
 //
-// The following only applies to changes made to this file as part of YugaByte development.
+// The following only applies to changes made to this file as part of YugabyteDB development.
 //
-// Portions Copyright (c) YugaByte, Inc.
+// Portions Copyright (c) YugabyteDB, Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License"); you may not use this file except
 // in compliance with the License.  You may obtain a copy of the License at
@@ -52,12 +52,11 @@
 #include <unordered_map>
 #include <vector>
 
-#include <boost/optional/optional_fwd.hpp>
-
 #include "yb/client/client_fwd.h"
 
 #include "yb/common/entity_ids.h"
 #include "yb/common/hybrid_time.h"
+#include "yb/common/opid.h"
 
 #include "yb/consensus/consensus_fwd.h"
 #include "yb/consensus/consensus_types.pb.h"
@@ -66,14 +65,19 @@
 
 #include "yb/gutil/ref_counted.h"
 
-#include "yb/master/master_fwd.h"
+#include "yb/integration-tests/mini_cluster.h"
+
 #include "yb/master/master_client.fwd.h"
+#include "yb/master/master_client.pb.h"
+#include "yb/master/master_ddl_client.h"
+#include "yb/master/master_fwd.h"
 
 #include "yb/rpc/rpc_controller.h"
 
 #include "yb/server/server_fwd.h"
 
 #include "yb/tablet/metadata.pb.h"
+#include "yb/tablet/tablet_peer.h"
 
 #include "yb/tserver/tserver_fwd.h"
 #include "yb/tserver/tserver_types.pb.h"
@@ -81,7 +85,6 @@
 #include "yb/util/format.h"
 #include "yb/util/monotime.h"
 #include "yb/util/result.h"
-#include "yb/util/opid.h"
 
 using namespace std::literals;
 
@@ -105,6 +108,7 @@ struct TServerDetails {
   std::unique_ptr<tserver::TabletServerAdminServiceProxy> tserver_admin_proxy;
   std::unique_ptr<consensus::ConsensusServiceProxy> consensus_proxy;
   std::unique_ptr<server::GenericServiceProxy> generic_proxy;
+  std::unique_ptr<tserver::TabletServerBackupServiceProxy> backup_proxy;
 
   TServerDetails();
   ~TServerDetails();
@@ -128,11 +132,11 @@ YB_STRONGLY_TYPED_BOOL(MustBeCommitted);
 client::YBSchema SimpleIntKeyYBSchema();
 
 // Create a populated TabletServerMap by interrogating the master.
-// Note: The bare-pointer TServerDetails values must be deleted by the caller!
-// Consider using ValueDeleter (in gutil/stl_util.h) for that.
 Result<TabletServerMap> CreateTabletServerMap(
     const master::MasterClusterProxy& proxy, rpc::ProxyCache* cache);
-Result<TabletServerMap> CreateTabletServerMap(ExternalMiniCluster* cluster);
+
+template <typename MiniClusterType>
+Result<TabletServerMap> CreateTabletServerMap(MiniClusterType* cluster);
 
 template <class Getter>
 auto GetForEachReplica(const std::vector<TServerDetails*>& replicas,
@@ -175,7 +179,7 @@ std::vector<TServerDetails*> TServerDetailsVector(const TabletReplicaMap& tablet
 std::vector<TServerDetails*> TServerDetailsVector(const TabletServerMap& tablet_servers);
 std::vector<TServerDetails*> TServerDetailsVector(const TabletServerMapUnowned& tablet_servers);
 
-// Creates copy of tablet server map, which does n  ot own TServerDetails.
+// Creates copy of tablet server map, which does not own TServerDetails.
 TabletServerMapUnowned CreateTabletServerMapUnowned(const TabletServerMap& tablet_servers,
                                                     const std::set<std::string>& exclude = {});
 
@@ -230,13 +234,13 @@ Status WaitForServersToAgree(const MonoDelta& timeout,
 //
 // If must_be_committed is false, the converge is happening only for recieved operations, and if
 // the parameter is true, both received and commited operations are taken into account.
-Status WaitForServerToBeQuite(const MonoDelta& timeout,
+Status WaitForServerToBeQuiet(const MonoDelta& timeout,
                               const TabletServerMap& tablet_servers,
                               const TabletId& tablet_id,
                               OpId* last_logged_opid = nullptr,
                               MustBeCommitted must_be_committed = MustBeCommitted::kFalse);
 
-Status WaitForServerToBeQuite(const MonoDelta& timeout,
+Status WaitForServerToBeQuiet(const MonoDelta& timeout,
                               const std::vector<TServerDetails*>& tablet_servers,
                               const TabletId& tablet_id,
                               OpId* last_logged_opid = nullptr,
@@ -331,6 +335,11 @@ Status WaitUntilCommittedOpIdIndexIsAtLeast(int64_t* opid_index,
                                             const MonoDelta& timeout,
                                             CommittedEntryType type = CommittedEntryType::ANY);
 
+// Wait until all replicas of tablet_id to have the same committed op id.
+Status WaitForAllPeersToCatchup(const TabletId& tablet_id,
+                                const std::vector<TServerDetails*>& replicas,
+                                const MonoDelta& timeout);
+
 // Returns:
 // Status::OK() if the replica is alive and leader of the consensus configuration.
 // STATUS(NotFound, "") if the replica is not part of the consensus configuration or is dead.
@@ -373,6 +382,9 @@ Status FindTabletFollowers(const TabletServerMapUnowned& tablet_servers,
                            const MonoDelta& timeout,
                            std::vector<TServerDetails*>* followers);
 
+Result<std::unordered_set<TServerDetails*>> FindTabletPeers(
+    const TabletServerMap& tablet_servers, const std::string& tablet_id, const MonoDelta& timeout);
+
 // Start an election on the specified tserver.
 // 'timeout' only refers to the RPC asking the peer to start an election. The
 // StartElection() RPC does not block waiting for the results of the election,
@@ -387,14 +399,10 @@ Status StartElection(
 // Request the given replica to vote. This is thin wrapper around
 // RequestConsensusVote(). See the definition of VoteRequestPB in
 // consensus.proto for parameter details.
-Status RequestVote(const TServerDetails* replica,
-                   const std::string& tablet_id,
-                   const std::string& candidate_uuid,
-                   int64_t candidate_term,
-                   const OpIdPB& last_logged_opid,
-                   boost::optional<bool> ignore_live_leader,
-                   boost::optional<bool> is_pre_election,
-                   const MonoDelta& timeout);
+Status RequestVote(
+    const TServerDetails* replica, const std::string& tablet_id, const std::string& candidate_uuid,
+    int64_t candidate_term, const OpIdPB& last_logged_opid, std::optional<bool> ignore_live_leader,
+    std::optional<bool> is_pre_election, const MonoDelta& timeout);
 
 // Cause a leader to step down on the specified server.
 // 'timeout' refers to the RPC timeout waiting synchronously for stepdown to
@@ -424,34 +432,45 @@ Status WriteSimpleTestRow(const TServerDetails* replica,
 
 // Run a ConfigChange to ADD_SERVER on 'replica_to_add'.
 // The RPC request is sent to 'leader'.
-Status AddServer(const TServerDetails* leader,
-                 const TabletId& tablet_id,
-                 const TServerDetails* replica_to_add,
-                 consensus::PeerMemberType member_type,
-                 const boost::optional<int64_t>& cas_config_opid_index,
-                 const MonoDelta& timeout,
-                 tserver::TabletServerErrorPB::Code* error_code = nullptr,
-                 bool retry = true);
+Status AddServer(
+    const TServerDetails* leader, const TabletId& tablet_id, const TServerDetails* replica_to_add,
+    consensus::PeerMemberType member_type, const std::optional<int64_t>& cas_config_opid_index,
+    const MonoDelta& timeout, tserver::TabletServerErrorPB::Code* error_code = nullptr,
+    bool retry = true);
 
 // Run a ConfigChange to REMOVE_SERVER on 'replica_to_remove'.
 // The RPC request is sent to 'leader'.
-Status RemoveServer(const TServerDetails* leader,
-                    const TabletId& tablet_id,
-                    const TServerDetails* replica_to_remove,
-                    const boost::optional<int64_t>& cas_config_opid_index,
-                    const MonoDelta& timeout,
-                    tserver::TabletServerErrorPB::Code* error_code = nullptr,
-                    bool retry = true);
+Status RemoveServer(
+    const TServerDetails* leader, const TabletId& tablet_id,
+    const TServerDetails* replica_to_remove, const std::optional<int64_t>& cas_config_opid_index,
+    const MonoDelta& timeout, tserver::TabletServerErrorPB::Code* error_code = nullptr,
+    bool retry = true);
 
 // Get the list of tablets from the remote server.
-Status ListTablets(const TServerDetails* ts,
-                   const MonoDelta& timeout,
-                   std::vector<tserver::ListTabletsResponsePB_StatusAndSchemaPB>* tablets);
+Status ListTablets(
+    const TServerDetails* ts, const MonoDelta& timeout,
+    std::vector<tserver::ListTabletsResponsePB_StatusAndSchemaPB>* tablets,
+    bool user_tablets_only = true);
 
 // Get the list of RUNNING tablet ids from the remote server.
-Status ListRunningTabletIds(const TServerDetails* ts,
-                            const MonoDelta& timeout,
-                            std::vector<TabletId>* tablet_ids);
+Status ListRunningTabletIds(
+    const TServerDetails* ts, const MonoDelta& timeout, std::vector<TabletId>* tablet_ids);
+
+// Get the set of tablet ids across the cluster
+std::set<TabletId> GetClusterTabletIds(MiniCluster* cluster);
+
+// Get the list of tablets for the given table on the given tserver from the Master.
+Result<std::vector<master::TabletLocationsPB::ReplicaPB>>
+GetTabletsOnTsAccordingToMaster(ExternalMiniCluster* cluster,
+                                const TabletServerId& ts_uuid,
+                                const client::YBTableName& table_name,
+                                const MonoDelta& timeout,
+                                const RequireTabletsRunning require_tablets_running);
+
+Status WaitForReplicasRunningOnAllTsAccordingToMaster(
+    ExternalMiniCluster* cluster,
+    const client::YBTableName& table_name,
+    const MonoDelta& timeout);
 
 // Get the list of tablet locations for the specified tablet from the Master.
 Status GetTabletLocations(ExternalMiniCluster* cluster,
@@ -472,7 +491,10 @@ Status GetTableLocations(MiniCluster* cluster,
                          master::GetTableLocationsResponsePB* table_locations);
 
 // Get number of tablets of given table hosted by tserver.
-int GetNumTabletsOfTableOnTS(tserver::TabletServer* const tserver, const TableId& table_id);
+size_t GetNumTabletsOfTableOnTS(
+    tserver::TabletServer* const tserver,
+    const TableId& table_id,
+    TabletPeerFilter filter = nullptr);
 
 // Wait for the specified number of voters to be reported to the config on the
 // master for the specified tablet.
@@ -519,18 +541,15 @@ Status WaitUntilAllTabletReplicasRunning(const std::vector<TServerDetails*>& tse
 Status DeleteTablet(const TServerDetails* ts,
                     const TabletId& tablet_id,
                     const tablet::TabletDataState delete_type,
-                    const boost::optional<int64_t>& cas_config_opid_index_less_or_equal,
+                    const std::optional<int64_t>& cas_config_opid_index_less_or_equal,
                     const MonoDelta& timeout,
                     tserver::TabletServerErrorPB::Code* error_code = nullptr);
 
 // Cause the remote to initiate remote bootstrap using the specified host as a
 // source.
-Status StartRemoteBootstrap(const TServerDetails* ts,
-                            const TabletId& tablet_id,
-                            const std::string& bootstrap_source_uuid,
-                            const HostPort& bootstrap_source_addr,
-                            int64_t caller_term,
-                            const MonoDelta& timeout);
+Status StartRemoteBootstrap(
+    const TServerDetails* ts, const TabletId& tablet_id, const std::string& bootstrap_source_uuid,
+    const HostPort& bootstrap_source_addr, int64_t caller_term, const MonoDelta& timeout);
 
 // Get the latest OpId for the given master replica proxy. Note that this works for tablet servers
 // also, though GetLastOpIdForReplica is customized for tablet server for now.
@@ -544,6 +563,12 @@ Status GetLastOpIdForMasterReplica(
 
 Status WaitForTabletIsDeletedOrHidden(
     master::CatalogManagerIf* catalog_manager, const TabletId& tablet_id, MonoDelta timeout);
+
+void SetupQuickSplit(int64_t forced_split_threshold);
+
+Result<TableId> CreateSimpleTable(
+    master::MasterDDLClient& client, const NamespaceName& namespace_name,
+    const TableName& table_name, MonoDelta timeout);
 
 } // namespace itest
 } // namespace yb

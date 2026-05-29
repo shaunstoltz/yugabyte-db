@@ -1,5 +1,5 @@
 /*
- * Copyright 2021 YugaByte, Inc. and Contributors
+ * Copyright 2021 YugabyteDB, Inc. and Contributors
  *
  * Licensed under the Polyform Free Trial License 1.0.0 (the "License"); you
  * may not use this file except in compliance with the License. You
@@ -11,17 +11,21 @@
 
 package com.yugabyte.yw.common.kms.services;
 
+import com.fasterxml.jackson.databind.ObjectMapper;
 import com.fasterxml.jackson.databind.node.ObjectNode;
 import com.yugabyte.yw.common.config.RuntimeConfGetter;
 import com.yugabyte.yw.common.kms.algorithms.HashicorpVaultAlgorithm;
-import com.yugabyte.yw.common.kms.util.hashicorpvault.HashicorpVaultConfigParams;
+import com.yugabyte.yw.common.kms.util.EncryptionAtRestUtil;
+import com.yugabyte.yw.common.kms.util.EncryptionAtRestUtil.EncryptionKey;
 import com.yugabyte.yw.common.kms.util.HashicorpEARServiceUtil;
+import com.yugabyte.yw.common.kms.util.HashicorpEARServiceUtil.VaultSecretEngineBuilder;
 import com.yugabyte.yw.common.kms.util.KeyProvider;
+import com.yugabyte.yw.common.kms.util.hashicorpvault.HashicorpVaultConfigParams;
 import com.yugabyte.yw.common.kms.util.hashicorpvault.VaultSecretEngineBase;
 import com.yugabyte.yw.forms.EncryptionAtRestConfig;
 import com.yugabyte.yw.models.KmsConfig;
-import java.util.UUID;
 import java.util.List;
+import java.util.UUID;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -50,9 +54,10 @@ public class HashicorpEARService extends EncryptionAtRestService<HashicorpVaultA
   protected ObjectNode createAuthConfigWithService(UUID configUUID, ObjectNode authConfig) {
     ObjectNode result = null;
 
+    VaultSecretEngineBase engine = null;
     try {
       // creates vault accessor object and validates the token
-      VaultSecretEngineBase engine = HashicorpEARServiceUtil.getVaultSecretEngine(authConfig);
+      engine = HashicorpEARServiceUtil.getVaultSecretEngine(authConfig);
       List<Object> ttlInfo = engine.getTTL();
       result = authConfig;
 
@@ -72,6 +77,7 @@ public class HashicorpEARService extends EncryptionAtRestService<HashicorpVaultA
     try {
       // Check if key with given name in the authConfig exists, else create a new one.
       HashicorpEARServiceUtil.createVaultKEK(configUUID, authConfig);
+      HashicorpEARServiceUtil.testEncryptDecrypt(engine, algorithm, configUUID);
     } catch (Exception e) {
       LOG.error(
           "Error while trying to check/create a key in the vault for config UUID '{}'.",
@@ -79,7 +85,7 @@ public class HashicorpEARService extends EncryptionAtRestService<HashicorpVaultA
           e);
       return null;
     }
-    LOG.info("Returing from createAuthConfigWithService");
+    LOG.info("Returning from createAuthConfigWithService");
     return result;
   }
 
@@ -116,7 +122,7 @@ public class HashicorpEARService extends EncryptionAtRestService<HashicorpVaultA
   }
 
   @Override
-  protected byte[] createKeyWithService(
+  protected EncryptionKey createKeyWithService(
       UUID universeUUID, UUID configUUID, EncryptionAtRestConfig config) {
     LOG.info("createKeyWithService called : {}, {}", universeUUID, configUUID);
 
@@ -130,11 +136,11 @@ public class HashicorpEARService extends EncryptionAtRestService<HashicorpVaultA
       throw new RuntimeException(errMsg, e);
     }
 
-    return generateUniverseDataKey(configUUID, universeUUID, algorithm, keySize);
+    return new EncryptionKey(generateUniverseDataKey(configUUID, universeUUID, algorithm, keySize));
   }
 
   @Override
-  protected byte[] rotateKeyWithService(
+  protected EncryptionKey rotateKeyWithService(
       UUID universeUUID, UUID configUUID, EncryptionAtRestConfig config) {
     LOG.info("rotateKeyWithService called: {}, {}", universeUUID, configUUID);
 
@@ -147,24 +153,19 @@ public class HashicorpEARService extends EncryptionAtRestService<HashicorpVaultA
       throw new IllegalArgumentException(errMsg);
     }
 
-    return generateUniverseDataKey(configUUID, universeUUID, algorithm, keySize);
+    return new EncryptionKey(generateUniverseDataKey(configUUID, universeUUID, algorithm, keySize));
   }
 
   @Override
   public byte[] validateRetrieveKeyWithService(
-      UUID universeUUID,
-      UUID configUUID,
-      byte[] keyRef,
-      EncryptionAtRestConfig config,
-      ObjectNode authConfig) {
+      UUID configUUID, byte[] keyRef, ObjectNode encryptionContext, ObjectNode authConfig) {
 
-    LOG.debug("validateRetrieveKeyWithService called: {}, {}", universeUUID, configUUID);
+    LOG.debug("validateRetrieveKeyWithService called on config UUID: '{}'", configUUID);
 
     byte[] keyVal = null;
     try {
       // keyRef is ciphertext
-      keyVal =
-          HashicorpEARServiceUtil.decryptUniverseKey(universeUUID, configUUID, keyRef, authConfig);
+      keyVal = HashicorpEARServiceUtil.decryptUniverseKey(configUUID, keyRef, authConfig);
       if (keyVal == null) {
         LOG.warn("Could not retrieve key from key ref through KMS");
       }
@@ -179,8 +180,8 @@ public class HashicorpEARService extends EncryptionAtRestService<HashicorpVaultA
   void updateCurrentAuthConfigProperties(UUID configUUID, ObjectNode authConfig) {
     LOG.debug("updateCurrentAuthConfigProperties called for {}", configUUID.toString());
     try {
-      KmsConfig config = KmsConfig.get(configUUID);
-      UUID customerUUID = config.customerUUID;
+      KmsConfig config = KmsConfig.getOrBadRequest(configUUID);
+      UUID customerUUID = config.getCustomerUUID();
 
       UpdateAuthConfigProperties(customerUUID, configUUID, authConfig);
     } catch (Exception e) {
@@ -190,13 +191,13 @@ public class HashicorpEARService extends EncryptionAtRestService<HashicorpVaultA
 
   @Override
   public byte[] retrieveKeyWithService(
-      UUID universeUUID, UUID configUUID, byte[] keyRef, EncryptionAtRestConfig config) {
-    LOG.debug("retrieveKeyWithService called: {}, {}", universeUUID, configUUID);
+      UUID configUUID, byte[] keyRef, ObjectNode encryptionContext) {
+    LOG.debug("retrieveKeyWithService called on config UUID: '{}'", configUUID);
 
     try {
       final ObjectNode authConfig = getAuthConfig(configUUID);
       byte[] key =
-          validateRetrieveKeyWithService(universeUUID, configUUID, keyRef, config, authConfig);
+          validateRetrieveKeyWithService(configUUID, keyRef, encryptionContext, authConfig);
       updateCurrentAuthConfigProperties(configUUID, authConfig);
       return key;
     } catch (Exception e) {
@@ -206,20 +207,58 @@ public class HashicorpEARService extends EncryptionAtRestService<HashicorpVaultA
     }
   }
 
+  @Override
+  public EncryptionKey encryptKeyWithService(UUID configUUID, byte[] universeKey) {
+    byte[] encryptedUniverseKey = null;
+    try {
+      ObjectNode authConfig = EncryptionAtRestUtil.getAuthConfig(configUUID);
+      encryptedUniverseKey =
+          HashicorpEARServiceUtil.encryptUniverseKey(configUUID, authConfig, universeKey);
+      if (encryptedUniverseKey == null) {
+        throw new RuntimeException("Encrypted universe key is null.");
+      }
+    } catch (Exception e) {
+      final String errMsg =
+          String.format(
+              "Error occurred encrypting universe key in Hashicorp KMS with config UUID '%s'.",
+              configUUID);
+      LOG.error(errMsg, e);
+      throw new RuntimeException(errMsg, e);
+    }
+    return new EncryptionKey(encryptedUniverseKey);
+  }
+
   protected void cleanupWithService(UUID universeUUID, UUID configUUID) {
     LOG.info("cleanupWithService called: {}, {}", universeUUID, configUUID);
   }
 
-  public void refreshService(UUID configUUID) {
-    LOG.debug("Starting refresh Hashicorp KMS with KMS config '{}'.", configUUID);
-    try {
-      ObjectNode authConfig = getAuthConfig(configUUID);
-      HashicorpEARServiceUtil.refreshServiceUtil(configUUID, authConfig);
-      LOG.info("Refreshed Hashicorp KMS with config '{}'.", configUUID);
-    } catch (Exception e) {
-      final String errMsg = "Error occurred while refreshing Hashicorp KMS.";
-      LOG.error(errMsg, e);
-      throw new RuntimeException(errMsg, e);
+  @Override
+  public void refreshKmsWithService(UUID configUUID, ObjectNode authConfig) throws Exception {
+    // Refresh TTL info in the authConfig object.
+    VaultSecretEngineBase vaultSecretEngine =
+        VaultSecretEngineBuilder.getVaultSecretEngine(authConfig);
+    HashicorpEARServiceUtil.updateAuthConfigObj(configUUID, vaultSecretEngine, authConfig);
+    final String engineKey = HashicorpEARServiceUtil.getVaultKeyForUniverse(authConfig);
+
+    // Test encrypt and decrypt for Hashicorp KMS config with fake data
+    HashicorpEARServiceUtil.testEncryptDecrypt(vaultSecretEngine, engineKey, configUUID);
+  }
+
+  @Override
+  public ObjectNode getKeyMetadata(UUID configUUID) {
+    ObjectNode authConfig = EncryptionAtRestUtil.getAuthConfig(configUUID);
+    ObjectNode keyMetadata = new ObjectMapper().createObjectNode();
+    // All the hashicorp metadata fields.
+    List<String> metadataFields = HashicorpEARServiceUtil.getMetadataFields();
+
+    // Add all the metadata fields.
+    for (String fieldName : metadataFields) {
+      if (authConfig.has(fieldName)) {
+        keyMetadata.set(fieldName, authConfig.get(fieldName));
+      }
     }
+    // Add key_provider field.
+    keyMetadata.put("key_provider", KeyProvider.HASHICORP.name());
+    return keyMetadata;
   }
 }

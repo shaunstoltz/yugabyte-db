@@ -13,8 +13,13 @@ import {
   UniverseConfigure,
   RunTimeConfig,
   HelmOverridesError,
-  UniverseResource
+  UniverseResource,
+  YBSoftwareMetadata,
+  ImageBundle
 } from './dto';
+import { EditGflagPayload } from '../../universe-actions/edit-gflags/GflagHelper';
+import { YBPTask } from '../../../../helpers/dtos';
+import { ArchitectureType } from '../../../../../components/configRedesign/providerRedesign/constants';
 
 // define unique names to use them as query keys
 export enum QUERY_KEY {
@@ -31,8 +36,16 @@ export enum QUERY_KEY {
   fetchGlobalRunTimeConfigs = 'fetchGlobalRunTimeConfigs',
   fetchCustomerRunTimeConfigs = 'fetchCustomerRunTimeConfigs',
   fetchProviderRunTimeConfigs = 'fetchProviderRunTimeConfigs',
-  validateHelmYAML = 'validateHelmYAML'
+  validateHelmYAML = 'validateHelmYAML',
+  editGflag = 'upgradeGflags',
+  getLinuxVersions = 'linuxVersions',
+  fetchUniverseTasks = 'fetchUniverseTasks'
 }
+
+export const DBReleasesQueryKey = {
+  ALL: ['DBReleases'],
+  provider: (providerUuid: string) => [...DBReleasesQueryKey.ALL, 'provider', providerUuid]
+};
 
 const DEFAULT_RUNTIME_GLOBAL_SCOPE = '00000000-0000-0000-0000-000000000000';
 
@@ -41,7 +54,7 @@ class ApiService {
 
   private getCustomerId(): string {
     const customerId = localStorage.getItem('customerId');
-    return customerId || '';
+    return customerId ?? '';
   }
 
   findUniverseByName = (universeName: string): Promise<string[]> => {
@@ -59,11 +72,40 @@ class ApiService {
   };
 
   fetchRunTimeConfigs = (
-    includeInherited: boolean = false,
+    includeInherited = false,
     scope: string = DEFAULT_RUNTIME_GLOBAL_SCOPE
   ): Promise<RunTimeConfig> => {
     const requestUrl = `${ROOT_URL}/customers/${this.getCustomerId()}/runtime_config/${scope}?includeInherited=${includeInherited}`;
     return axios.get<RunTimeConfig>(requestUrl).then((resp) => resp.data);
+  };
+
+  setRunTimeConfig = ({
+    key,
+    value,
+    scope = DEFAULT_RUNTIME_GLOBAL_SCOPE
+  }: {
+    key: string;
+    value: any;
+    scope?: string;
+  }) => {
+    const cUUID = localStorage.getItem('customerId');
+    const headers = {
+      'Content-Type': 'text/plain'
+    };
+    return axios.put(`${ROOT_URL}/customers/${cUUID}/runtime_config/${scope}/key/${key}`, value, {
+      headers
+    });
+  };
+
+  deleteRunTimeConfig = ({
+    key,
+    scope = DEFAULT_RUNTIME_GLOBAL_SCOPE
+  }: {
+    key: string;
+    scope?: string;
+  }) => {
+    const cUUID = localStorage.getItem('customerId');
+    return axios.delete(`${ROOT_URL}/customers/${cUUID}/runtime_config/${scope}/key/${key}`);
   };
 
   fetchUniverse = (universeId: string): Promise<Universe> => {
@@ -132,18 +174,49 @@ class ApiService {
     return axios.post<Universe>(requestUrl, data).then((resp) => resp.data);
   };
 
-  getInstanceTypes = (providerId?: string): Promise<InstanceType[]> => {
+  getInstanceTypes = (
+    providerId?: string,
+    zones: string[] = [],
+    arch: ArchitectureType | null = null
+  ): Promise<InstanceType[]> => {
     if (providerId) {
-      const requestUrl = `${ROOT_URL}/customers/${this.getCustomerId()}/providers/${providerId}/instance_types`;
-      return axios.get<InstanceType[]>(requestUrl).then((resp) => resp.data);
+      const requestUrl = new URL(
+        `${ROOT_URL}/customers/${this.getCustomerId()}/providers/${providerId}/instance_types`,
+        document.baseURI
+      );
+      if (zones.length) {
+        zones.forEach((item) => {
+          requestUrl.searchParams.append('zone', encodeURIComponent(item));
+        });
+      }
+      if (arch !== null) {
+        requestUrl.searchParams.append('arch', encodeURIComponent(arch));
+      }
+      return axios.get<InstanceType[]>(requestUrl.toString()).then((resp) => resp.data);
     } else {
       return Promise.reject('Querying instance types failed: no provider ID provided');
     }
   };
 
-  getDBVersions = (): Promise<string[]> => {
-    const requestUrl = `${ROOT_URL}/customers/${this.getCustomerId()}/releases`;
-    return axios.get<string[]>(requestUrl).then((resp) => resp.data);
+  getDBVersions = (
+    includeMetadata = false,
+    arch = null,
+    isReleasesEnabled: boolean
+  ): Promise<string[] | Record<string, YBSoftwareMetadata>> => {
+    const requestUrl = isReleasesEnabled
+      ? `${ROOT_URL}/customers/${this.getCustomerId()}/ybdb_release`
+      : `${ROOT_URL}/customers/${this.getCustomerId()}/releases`;
+    const params = isReleasesEnabled
+      ? { deployment_type: arch }
+      : {
+          includeMetadata,
+          arch
+        };
+    return axios
+      .get<string[] | Record<string, YBSoftwareMetadata>>(requestUrl, {
+        params
+      })
+      .then((resp) => resp.data);
   };
 
   getDBVersionsByProvider = (providerId?: string): Promise<string[]> => {
@@ -179,10 +252,37 @@ class ApiService {
     return axios.post<HelmOverridesError>(requestUrl, data).then((resp) => resp.data);
   };
 
+  upgradeGflags = (
+    data: EditGflagPayload,
+    universeId: string
+  ): Promise<EditGflagPayload | YBPTask> => {
+    const requestUrl = `${ROOT_URL}/customers/${this.getCustomerId()}/universes/${universeId}/upgrade/gflags`;
+    return axios.post<EditGflagPayload>(requestUrl, data).then((resp) => resp.data);
+  };
+
+  fetchUniverseTasks = (universeUuid: string): Promise<any> => {
+    const requestUrl = `${ROOT_URL}/customers/${this.getCustomerId()}/tasks_list`;
+    return axios.get<any>(requestUrl, { params: { uUUID: universeUuid } });
+  };
+
   // check if exception was caused by canceling previous request
   isRequestCancelError(error: unknown): boolean {
     return axios.isCancel(error);
   }
+
+  getLinuxVersions = (
+    providerUUID: string,
+    arch: ArchitectureType | null = null
+  ): Promise<ImageBundle[]> => {
+    const requestUrl = `${ROOT_URL}/customers/${this.getCustomerId()}/providers/${providerUUID}/image_bundle`;
+    return axios
+      .get<ImageBundle[]>(requestUrl, {
+        params: {
+          arch
+        }
+      })
+      .then((resp) => resp.data);
+  };
 }
 
 export const api = new ApiService();

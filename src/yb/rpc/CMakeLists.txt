@@ -15,9 +15,9 @@
 # specific language governing permissions and limitations
 # under the License.
 #
-# The following only applies to changes made to this file as part of YugaByte development.
+# The following only applies to changes made to this file as part of YugabyteDB development.
 #
-# Portions Copyright (c) YugaByte, Inc.
+# Portions Copyright (c) YugabyteDB, Inc.
 #
 # Licensed under the Apache License, Version 2.0 (the "License"); you may not use this file except
 # in compliance with the License.  You may obtain a copy of the License at
@@ -31,7 +31,7 @@
 #
 
 set(YB_PCH_PREFIX rpc)
-set(YB_PCH_DEP_LIBS cds gmock gtest gutil libev protoc snappy yb_test_util yb_util)
+set(YB_PCH_DEP_LIBS gmock gtest gutil libev protoc snappy yb_test_util yb_util)
 
 ADD_YB_LIBRARY(
     yrpc_base
@@ -48,7 +48,7 @@ YRPC_GENERATE(
   PROTO_FILES rpc_header.proto)
 ADD_YB_LIBRARY(rpc_header_proto
   SRCS ${RPC_HEADER_PROTO_SRCS}
-  DEPS protobuf yrpc_base
+  DEPS protobuf yrpc_base yb_common_proto
   NONLINK_DEPS ${RPC_HEADER_PROTO_TGTS})
 
 PROTOBUF_GENERATE_CPP(
@@ -57,7 +57,8 @@ PROTOBUF_GENERATE_CPP(
   BINARY_ROOT ${CMAKE_CURRENT_BINARY_DIR}/../..
   PROTO_FILES rpc_introspection.proto)
 set(RPC_INTROSPECTION_PROTO_LIBS
-  rpc_header_proto  
+  yb_common_proto
+  rpc_header_proto
   protobuf)
 ADD_YB_LIBRARY(rpc_introspection_proto
   SRCS ${RPC_INTROSPECTION_PROTO_SRCS}
@@ -68,6 +69,7 @@ ADD_YB_LIBRARY(rpc_introspection_proto
 set(YRPC_SRCS
     acceptor.cc
     binary_call_parser.cc
+    call_data.cc
     circular_read_buffer.cc
     compressed_stream.cc
     connection.cc
@@ -76,7 +78,6 @@ set(YRPC_SRCS
     inbound_call.cc
     io_thread_pool.cc
     messenger.cc
-    network_error.cc
     outbound_call.cc
     local_call.cc
     rpc_call.cc
@@ -84,6 +85,9 @@ set(YRPC_SRCS
     poller.cc
     proxy.cc
     reactor.cc
+    reactor_monitor.cc
+    reactor_task.cc
+    delayed_task.cc
     refined_stream.cc
     remote_method.cc
     rpc.cc
@@ -94,17 +98,15 @@ set(YRPC_SRCS
     rpc_with_queue.cc
     rpc_util.cc
     scheduler.cc
+    secure.cc
     secure_stream.cc
     serialization.cc
     service_if.cc
     service_pool.cc
     sidecars.cc
     stream.cc
-    strand.cc
     tcp_stream.cc
-    thread_pool.cc
-    yb_rpc.cc
-    ${RPC_SRCS_EXTENSIONS})
+    yb_rpc.cc)
 
 set(YRPC_LIBS
   gutil
@@ -113,6 +115,8 @@ set(YRPC_LIBS
   rpc_header_proto
   rpc_introspection_proto
   snappy
+  yb_ash
+  yb_common
   yb_util
   ${OPENSSL_CRYPTO_LIBRARY}
   ${OPENSSL_SSL_LIBRARY})
@@ -177,7 +181,3 @@ ADD_YB_TEST(rpc-bench RUN_SERIAL true)
 ADD_YB_TEST(rpc-test)
 ADD_YB_TEST(rpc_stub-test RUN_SERIAL true)
 ADD_YB_TEST(scheduler-test)
-ADD_YB_TEST(thread_pool-test)
-if(RPC_ADDITIONAL_TESTS)
-  ADD_YB_TESTS(${RPC_ADDITIONAL_TESTS})
-endif()

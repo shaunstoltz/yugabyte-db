@@ -1,4 +1,4 @@
-// Copyright (c) YugaByte, Inc.
+// Copyright (c) YugabyteDB, Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License"); you may not use this file except
 // in compliance with the License.  You may obtain a copy of the License at
@@ -13,7 +13,8 @@
 
 #pragma once
 
-#include <string>
+#include <stdint.h>
+#include <stddef.h>
 
 namespace yb {
 namespace master {
@@ -49,36 +50,30 @@ static const char* const kSystemSchemaPartitionsTableName = "partitions";
 static const char* const kSystemSchemaKeyspacesTableName = "keyspaces";
 static const char* const kSystemSchemaTablesTableName = "tables";
 
-static const char* const kCdcStateTableName = "cdc_state";
-static const char* const kCdcTabletId = "tablet_id";
-constexpr size_t kCdcTabletIdIdx = 0;
-static const char* const kCdcStreamId = "stream_id";
-constexpr size_t kCdcStreamIdIdx = 1;
-static const char* const kCdcCheckpoint  = "checkpoint";
-constexpr size_t kCdcCheckpointIdx = 2;
-static const char* const kCdcData = "data";
-constexpr size_t kCdcDataIdx = 3;
-static const char* const kCdcLastReplicationTime = "last_replication_time";
-constexpr size_t kCdcLastReplicationTimeIdx = 4;
-static const char* const kCdcStreamIdMappingTableName = "cdc_stream_id_mapping";
-constexpr size_t kCdcTabletIdIdxforStreamIdMap = 1;
-static const char* const kCdcDbStreamId = "db_stream_id";
-constexpr size_t kCdcDbStreamIdIdx = 0;
-static const char* const kCdcTableId = "table_id";
-
-
 static const char* const kXClusterSafeTimeTableName = "xcluster_safe_time";
-static const char* const kXCUniverseId = "universe_id";
-constexpr size_t kXCUniverseIdIdx = 0;
+static const char* const kXCReplicationGroupId = "replication_group_id";
+constexpr size_t kXCReplicationGroupIdIdx = 0;
 static const char* const kXCProducerTabletId = "tablet_id";
 constexpr size_t kXCProducerTabletIdIdx = 1;
-static const char* const kXCSafeTime  = "safe_time";
+static const char* const kXCSafeTime = "safe_time";
 constexpr size_t kXCSafeTimeIdx = 2;
+
+static const char* const kPgAutoAnalyzeTableId = "table_id";
+static const char* const kPgAutoAnalyzeMutations = "mutations_since_last_analyze";
+static const char* const kPgAutoAnalyzeLastAnalyzeInfo = "last_analyze_info";
+static const char* const kPgAutoAnalyzeCurrentAnalyzeInfo = "current_analyze_info";
 
 static const char* const kSystemAuthRolesTableName = "roles";
 static const char* const kSystemAuthRolePermissionsTableName = "role_permissions";
 static const char* const kSystemAuthResourceRolePermissionsIndexTableName =
                   "resource_role_permissions_index";
+
+static const char* const kTestEchoTimestamp = "timestamp";
+constexpr size_t kTestEchoTimestampIdx = 0;
+static const char* const kTestEchoNodeId = "node_id";
+constexpr size_t kTestEchoNodeIdIdx = 1;
+static const char* const kTestEchoMessage = "message";
+constexpr size_t kTestEchoMessageIdx = 2;
 
 static const char* const kDefaultSchemaVersion = "00000000-0000-0000-0000-000000000000";
 
@@ -93,11 +88,17 @@ static constexpr int kNumSystemNamespaces = 3;
 // Needs to be updated each time we add a new system table. Currently, this is only used for unit
 // tests which don't have access to the master object (for ex: unit tests which use ExternalMaster).
 static constexpr int kNumSystemTables = 17;
-// The same, including the transaction status table.
-static constexpr int kNumSystemTablesWithTxn = kNumSystemTables + 1;
+// The same, including the transaction status table and advisory lock table.
+static constexpr int kNumSystemTablesWithTxn = kNumSystemTables + 2;
 
 constexpr uint16_t kMasterDefaultPort = 7100;
 constexpr uint16_t kMasterDefaultWebPort = 7000;
+
+static constexpr int32_t kInvalidClusterConfigVersion = 0;
+
+static const char* const kYbSystemDbName = "yb_system";
+static const char* const kPgYbNotificationsTableName = "pg_yb_notifications";
+static const char* const kPgYbNotificationsPublicationName = "pg_yb_notifications_publication";
 
 } // namespace master
 } // namespace yb

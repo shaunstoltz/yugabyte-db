@@ -1,4 +1,4 @@
-// Copyright (c) YugaByte, Inc.
+// Copyright (c) YugabyteDB, Inc.
 
 import { connect } from 'react-redux';
 import AuthenticatedComponent from './AuthenticatedComponent';
@@ -32,6 +32,9 @@ import {
   fetchSoftwareVersions,
   fetchSoftwareVersionsSuccess,
   fetchSoftwareVersionsFailure,
+  fetchDBVersions,
+  fetchDBVersionsSuccess,
+  fetchDBVersionsFailure,
   fetchYugaWareVersion,
   fetchYugaWareVersionResponse,
   fetchCustomerConfigs,
@@ -40,11 +43,13 @@ import {
   fetchRunTimeConfigsKeyInfoResponse,
   getTlsCertificates,
   getTlsCertificatesResponse,
-  insecureLogin,
-  insecureLoginResponse,
   fetchUser,
   fetchUserSuccess,
-  fetchUserFailure
+  fetchUserFailure,
+  fetchAdminNotifications,
+  fetchAdminNotificationsResponse,
+  fetchPerfAdvisorList,
+  fetchPerfAdvisorListResponse
 } from '../../actions/customers';
 import {
   fetchCustomerTasks,
@@ -57,12 +62,23 @@ import Cookies from 'js-cookie';
 
 const mapDispatchToProps = (dispatch) => {
   return {
+    // Remove - 2024.2
     fetchSoftwareVersions: () => {
       dispatch(fetchSoftwareVersions()).then((response) => {
         if (response.payload.status !== 200) {
           dispatch(fetchSoftwareVersionsFailure(response.payload));
         } else {
           dispatch(fetchSoftwareVersionsSuccess(response.payload));
+        }
+      });
+    },
+
+    fetchDBVersions: () => {
+      dispatch(fetchDBVersions()).then((response) => {
+        if (response.payload.status !== 200) {
+          dispatch(fetchDBVersionsFailure(response.payload));
+        } else {
+          dispatch(fetchDBVersionsSuccess(response.payload));
         }
       });
     },
@@ -161,14 +177,6 @@ const mapDispatchToProps = (dispatch) => {
       });
     },
 
-    fetchInsecureLogin: () => {
-      dispatch(insecureLogin()).then((response) => {
-        if (response.payload.status === 200) {
-          dispatch(insecureLoginResponse(response));
-        }
-      });
-    },
-
     fetchCustomerConfigs: () => {
       dispatch(fetchCustomerConfigs()).then((response) => {
         dispatch(fetchCustomerConfigsResponse(response.payload));
@@ -190,6 +198,18 @@ const mapDispatchToProps = (dispatch) => {
           dispatch(fetchUserFailure(userResponse.payload.error));
         }
       });
+    },
+
+    fetchAdminNotifications: () => {
+      dispatch(fetchAdminNotifications()).then((response) => {
+        dispatch(fetchAdminNotificationsResponse(response.payload));
+      });
+    },
+
+    fetchPerfAdvisorList: () => {
+      dispatch(fetchPerfAdvisorList()).then((response) => {
+        dispatch(fetchPerfAdvisorListResponse(response.payload));
+      });
     }
   };
 };
@@ -201,7 +221,8 @@ const mapStateToProps = (state) => {
     universe: state.universe,
     tasks: state.tasks,
     fetchMetadata: state.cloud.fetchMetadata,
-    fetchUniverseMetadata: state.universe.fetchUniverseMetadata
+    fetchUniverseMetadata: state.universe.fetchUniverseMetadata,
+    adminNotifications: state.customer.adminNotifications
   };
 };
 

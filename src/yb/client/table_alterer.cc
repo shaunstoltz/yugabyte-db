@@ -1,4 +1,4 @@
-// Copyright (c) YugaByte, Inc.
+// Copyright (c) YugabyteDB, Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License"); you may not use this file except
 // in compliance with the License.  You may obtain a copy of the License at
@@ -16,10 +16,15 @@
 #include "yb/client/client-internal.h"
 #include "yb/client/schema-internal.h"
 
+#include "yb/common/common_util.h"
+#include "yb/common/schema_pbutil.h"
 #include "yb/common/schema.h"
 #include "yb/common/transaction.h"
 
 #include "yb/master/master_ddl.pb.h"
+
+DEFINE_test_flag(bool, allow_wait_for_alter_table_to_finish, true,
+    "When disabled, alter returns without waiting inline and checking the alter status at master.");
 
 using std::string;
 
@@ -69,8 +74,8 @@ YBTableAlterer* YBTableAlterer::SetTableProperties(const TableProperties& table_
   return this;
 }
 
-YBTableAlterer* YBTableAlterer::replication_info(const master::ReplicationInfoPB& ri) {
-  replication_info_ = std::make_unique<master::ReplicationInfoPB>(ri);
+YBTableAlterer* YBTableAlterer::replication_info(const ReplicationInfoPB& ri) {
+  replication_info_ = std::make_unique<ReplicationInfoPB>(ri);
   return this;
 }
 
@@ -94,6 +99,11 @@ YBTableAlterer* YBTableAlterer::part_of_transaction(const TransactionMetadata* t
   return this;
 }
 
+YBTableAlterer* YBTableAlterer::part_of_sub_transaction(uint32_t sub_txn_id) {
+  sub_txn_id_ = sub_txn_id;
+  return this;
+}
+
 YBTableAlterer* YBTableAlterer::set_increment_schema_version() {
   increment_schema_version_ = true;
   return this;
@@ -108,7 +118,7 @@ Status YBTableAlterer::Alter() {
     client_->default_admin_operation_timeout();
   auto deadline = CoarseMonoClock::Now() + timeout;
   RETURN_NOT_OK(client_->data_->AlterTable(client_, req, deadline));
-  if (wait_) {
+  if (wait_ && PREDICT_TRUE(FLAGS_TEST_allow_wait_for_alter_table_to_finish)) {
     YBTableName alter_name = rename_to_ ? *rename_to_ : table_name_;
     RETURN_NOT_OK(client_->data_->WaitForAlterTableToFinish(
         client_, alter_name, table_id_, deadline));
@@ -129,7 +139,7 @@ Status YBTableAlterer::ToRequest(master::AlterTableRequestPB* req) {
 
   req->Clear();
 
-  if (table_name_.has_table()) {
+  if (table_name_.has_table() || table_name_.has_table_id()) {
     table_name_.SetIntoTableIdentifierPB(req->mutable_table());
   }
 
@@ -138,10 +148,12 @@ Status YBTableAlterer::ToRequest(master::AlterTableRequestPB* req) {
   }
 
   if (rename_to_) {
-    req->set_new_table_name(rename_to_->table_name());
+    if (rename_to_->has_table()) {
+      req->set_new_table_name(rename_to_->table_name());
+    }
 
-    if (rename_to_->has_namespace()) {
-      req->mutable_new_namespace()->set_name(rename_to_->namespace_name());
+    if (rename_to_->has_pgschema_name()) {
+      req->set_pgschema_name(rename_to_->pgschema_name());
     }
   }
 
@@ -167,19 +179,19 @@ Status YBTableAlterer::ToRequest(master::AlterTableRequestPB* req) {
         // TODO(KUDU-861): support altering a column in the wire protocol.
         // For now, we just give an error if the caller tries to do
         // any operation other than rename.
-        if (s.spec->data_->has_type ||
-            s.spec->data_->has_nullable ||
-            s.spec->data_->primary_key) {
-          return STATUS(NotSupported, "cannot support AlterColumn of this type",
-                                      s.spec->data_->name);
+        if (s.spec->data_->type) {
+          return STATUS(NotSupported, "Cannot change type of the column", s.spec->data_->name);
+        }
+        if (s.spec->data_->kind != ColumnKind::VALUE) {
+          return STATUS(NotSupported, "Cannot alter key column", s.spec->data_->name);
         }
         // We only support rename column
-        if (!s.spec->data_->has_rename_to) {
+        if (!s.spec->data_->rename_to) {
           return STATUS(InvalidArgument, "no alter operation specified",
                                          s.spec->data_->name);
         }
         pb_step->mutable_rename_column()->set_old_name(s.spec->data_->name);
-        pb_step->mutable_rename_column()->set_new_name(s.spec->data_->rename_to);
+        pb_step->mutable_rename_column()->set_new_name(*s.spec->data_->rename_to);
         pb_step->set_type(master::AlterTableRequestPB::RENAME_COLUMN);
         break;
       default:
@@ -202,6 +214,10 @@ Status YBTableAlterer::ToRequest(master::AlterTableRequestPB* req) {
 
   if (txn_) {
     txn_->ToPB(req->mutable_transaction());
+    req->set_ysql_yb_ddl_rollback_enabled(YsqlDdlRollbackEnabled());
+    if (YsqlDdlSavepointEnabled()) {
+      req->set_sub_transaction_id(sub_txn_id_);
+    }
   }
 
   if (increment_schema_version_) {

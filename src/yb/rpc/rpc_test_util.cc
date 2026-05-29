@@ -1,4 +1,4 @@
-// Copyright (c) YugaByte, Inc.
+// Copyright (c) YugabyteDB, Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License"); you may not use this file except
 // in compliance with the License.  You may obtain a copy of the License at
@@ -13,19 +13,12 @@
 
 #include "yb/rpc/rpc_test_util.h"
 
-#include "yb/rpc/messenger.h"
-
 namespace yb {
 namespace rpc {
 
-void MessengerShutdownDeleter::operator()(Messenger* messenger) const {
-  messenger->Shutdown();
-  delete messenger;
-}
-
 AutoShutdownMessengerHolder CreateAutoShutdownMessengerHolder(
     std::unique_ptr<Messenger>&& messenger) {
-  return AutoShutdownMessengerHolder(std::move(messenger).release());
+  return AutoShutdownMessengerHolder(messenger.release());
 }
 
 } // namespace rpc

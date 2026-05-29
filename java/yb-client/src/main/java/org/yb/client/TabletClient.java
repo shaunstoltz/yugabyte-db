@@ -25,9 +25,9 @@
  */
 
 //
-// The following only applies to changes made to this file as part of YugaByte development.
+// The following only applies to changes made to this file as part of YugabyteDB development.
 //
-// Portions Copyright (c) YugaByte, Inc.
+// Portions Copyright (c) YugabyteDB, Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License"); you may not use this file except
 // in compliance with the License.  You may obtain a copy of the License at
@@ -50,6 +50,8 @@ import io.netty.channel.ChannelFutureListener;
 import io.netty.channel.ChannelHandlerContext;
 import io.netty.handler.codec.ReplayingDecoder;
 import io.netty.handler.timeout.ReadTimeoutException;
+import io.netty.util.Signal;
+
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.yb.WireProtocol;
@@ -60,6 +62,8 @@ import org.yb.rpc.RpcHeader;
 import org.yb.tserver.TserverTypes;
 import org.yb.util.Pair;
 
+import java.net.InetSocketAddress;
+import java.net.SocketAddress;
 import java.util.ArrayList;
 import java.util.Collection;
 import java.util.Iterator;
@@ -67,7 +71,6 @@ import java.util.List;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.RejectedExecutionException;
 import java.util.concurrent.atomic.AtomicInteger;
-import java.util.function.BiConsumer;
 
 /**
  * Stateful handler that manages a connection to a specific TabletServer.
@@ -141,16 +144,10 @@ public class TabletClient extends ReplayingDecoder<Void> {
 
   private final long socketReadTimeoutMs;
 
-  private BiConsumer<TabletClient, Channel> disconnectListener;
-
   public TabletClient(AsyncYBClient client, String uuid) {
     this.ybClient = client;
     this.uuid = uuid;
     this.socketReadTimeoutMs = client.getDefaultSocketReadTimeoutMs();
-  }
-
-  public void setDisconnectListener(BiConsumer<TabletClient, Channel> disconnectListener) {
-    this.disconnectListener = disconnectListener;
   }
 
   <R> void sendRpc(YRpc<R> rpc) {
@@ -270,16 +267,22 @@ public class TabletClient extends ReplayingDecoder<Void> {
 
     final Channel chancopy = chan;
     if (chancopy == null) {
+      LOG.warn("Channel is missing during client shutdown for {}", getPeerUuidLoggingString());
       return Deferred.fromResult(null);
     }
+    String hostPort = getHostPort(chan.remoteAddress());
+    LOG.debug("Shutting down channel {}", hostPort);
     final Deferred<Void> d = new Deferred<Void>();
     if (chancopy.isActive()) {
       try {
         chancopy.disconnect().sync();   // ... this is going to set it to null.
         // At this point, all in-flight RPCs are going to be failed.
       } catch (InterruptedException e) {
-        LOG.warn(getPeerUuidLoggingString() + chan + " - failed to disconnect - interrupted");
+        LOG.warn("{} {} - failed to disconnect - interrupted",
+          getPeerUuidLoggingString(), hostPort);
       }
+    } else {
+      LOG.warn("Channel {} is not active during shutdown", hostPort);
     }
     // It's OK to call close() on a Channel if it's already closed.
     final ChannelFuture future = chancopy.close();
@@ -318,23 +321,52 @@ public class TabletClient extends ReplayingDecoder<Void> {
    * and to not pass an Exception in the callback.
    */
   @Override
-  @SuppressWarnings("unchecked")
   protected void decode(ChannelHandlerContext ctx, ByteBuf buf,
                         List<Object> list) {
+    final int initialReadIndex = buf.readerIndex();
+    final String channelId = ctx.channel().id().asShortText();
+    final boolean isChannelActive = ctx.channel().isActive();
     final long start = System.nanoTime();
-    final int rdx = buf.readerIndex();
-    LOG.debug("------------------>> ENTERING DECODE >>------------------");
-
-    if (buf == null) {
-      return;
+    try {
+      LOG.debug("------------------>> ENTERING DECODE (CHANNEL: {}({})) >>------------------",
+          channelId, isChannelActive);
+      // This can throw an exception if the buffer doesn't contain enough bytes, which will cause
+      // the ReplayingDecoder to wait for more bytes to arrive before trying again.
+      // The buffer must not be cleared in this case on exception.
+      CallResponse response = new CallResponse(buf);
+      if (response.isEmpty()) {
+        // Skip empty messages which we are using as heartbeats.
+        return;
+      }
+      processCallResponse(ctx, buf, list, initialReadIndex, response);
+    } catch (Signal signal) {
+      // Catch to log and re-throw the signal for replay until sufficient bytes are received.
+      LOG.debug("Data not fully received yet, waiting for more data to arrive at channel {}",
+          channelId);
+      throw signal;
+    } finally {
+      if (LOG.isDebugEnabled()) {
+        double elapsedMicro = (System.nanoTime() - start) / 1000.0;
+        LOG.debug("------------------<< LEAVING  DECODE (CHANNEL: {}({})) <<------------------"
+            + " time elapsed: {} us", channelId, isChannelActive, elapsedMicro);
+      }
     }
+  }
 
-    CallResponse response = new CallResponse(buf);
-    if (response.isEmpty()) {
-      // Skip empty messages which we are using as heartbeats.
-      return;
+  private int discardUnreadBytes(CallResponse response) {
+    int unreadBytes = response.discardUnreadBytes();
+    if (unreadBytes > 0) {
+      LOG.warn("{} Discarded unread bytes {}", getPeerUuidLoggingString(), unreadBytes);
+      checkpoint();
     }
+    return unreadBytes;
+  }
 
+  // This method processes the response after the response is fully read and the header is parsed.
+  // No read must happen from the ByteBuf beyond the readable bytes.
+  @SuppressWarnings("unchecked")
+  private void processCallResponse(ChannelHandlerContext ctx, ByteBuf buf,
+                        List<Object> list, int initialReadIndex, CallResponse response) {
     RpcHeader.ResponseHeader header = response.getHeader();
     if (!header.hasCallId()) {
       final int size = response.getTotalResponseSize();
@@ -345,12 +377,15 @@ public class TabletClient extends ReplayingDecoder<Void> {
     }
     final int rpcid = header.getCallId();
 
+    // Check for presence of the ID first before removing as decode can be called again.
     @SuppressWarnings("rawtypes")
     final YRpc rpc = rpcs_inflight.get(rpcid);
 
     if (rpc == null) {
+      // This can happen when the channel becomes inactive as last attempt to decode
+      // message is performed that can result in invalid RPC ID.
       final String msg = getPeerUuidLoggingString() + "Invalid rpcid: " + rpcid + " found in "
-          + buf + '=' + Bytes.pretty(buf);
+          + buf + '=' + Bytes.pretty(buf) + ", channel active: " + ctx.channel().isActive();
       LOG.error(msg);
       // The problem here is that we don't know which Deferred corresponds to
       // this RPC, since we don't have a valid ID.  So we're hopeless, we'll
@@ -381,26 +416,23 @@ public class TabletClient extends ReplayingDecoder<Void> {
       }
     } else {
       try {
+        // Fully read the data from the buffer in CallResponse.
         decoded = rpc.deserialize(response, this.uuid);
       } catch (Exception ex) {
         exception = ex;
       }
     }
+    // Remove it after decoding.
+    rpcs_inflight.remove(rpcid);
     if (LOG.isDebugEnabled()) {
       LOG.debug(getPeerUuidLoggingString() + "rpcid=" + rpcid
-          + ", response size=" + (buf.readerIndex() - rdx) + " bytes"
+          + ", response size=" + (buf.readerIndex() - initialReadIndex) + " bytes"
           + ", " + actualReadableBytes() + " readable bytes left"
           + ", rpc=" + rpc);
     }
-
-    {
-      final YRpc<?> removed = rpcs_inflight.remove(rpcid);
-      if (removed == null) {
-        // The RPC we were decoding was cleaned up already, give up.
-        throw new NonRecoverableException("RPC not found");
-      }
-    }
-
+    // Discard because unread bytes are not needed anymore.
+    // ReplayingDecoder will not call decode() again.
+    discardUnreadBytes(response);
     // This check is specifically for the ERROR_SERVER_TOO_BUSY case above.
     if (retryableHeaderException != null) {
       ybClient.handleRetryableError(rpc, retryableHeaderException, this);
@@ -453,12 +485,8 @@ public class TabletClient extends ReplayingDecoder<Void> {
         rpc.errback(exception);
       }
     } catch (Exception e) {
-      LOG.debug(getPeerUuidLoggingString() + "Unexpected exception while handling RPC #" + rpcid
+      LOG.warn(getPeerUuidLoggingString() + "Unexpected exception while handling RPC #" + rpcid
           + ", rpc=" + rpc + ", buf=" + Bytes.pretty(buf), e);
-    }
-    if (LOG.isDebugEnabled()) {
-      LOG.debug("------------------<< LEAVING  DECODE <<------------------"
-          + " time elapsed: " + ((System.nanoTime() - start) / 1000) + "us");
     }
     return;  // Stop processing here.  The Deferred does everything else.
   }
@@ -529,8 +557,10 @@ public class TabletClient extends ReplayingDecoder<Void> {
       code == WireProtocol.AppStatusPB.ErrorCode.ABORTED ||
       error.getCode() == CdcService.CDCErrorPB.Code.NOT_LEADER) {
       ybClient.handleNotLeader(rpc, ex, this);
+    } else {
+      return ex;
     }
-    return ex;
+    return null;
   }
 
   /**
@@ -645,8 +675,7 @@ public class TabletClient extends ReplayingDecoder<Void> {
     doCleanup(ctx.channel());
   }
 
-  public void doCleanup(Channel channel) throws Exception {
-    disconnectListener.accept(this, channel);
+  public void doCleanup(Channel channel) {
     chan = null;
     cleanup(channel);
   }
@@ -716,13 +745,13 @@ public class TabletClient extends ReplayingDecoder<Void> {
       LOG.warn(getPeerUuidLoggingString() + "RPC rejected by the executor," +
                " ignore this if we're shutting down", cause);
     } else if (cause instanceof ReadTimeoutException) {
-      LOG.debug(getPeerUuidLoggingString() + "Encountered a read timeout");
+      LOG.warn(getPeerUuidLoggingString() + "Encountered a read timeout");
       // Doing the cleanup here since we want to invalidate all the RPCs right _now_, and not let
       // the ReplayingDecoder continue decoding through Channels.close() below.
       cleanup(c);
     } else {
-      LOG.debug(getPeerUuidLoggingString() + "Unexpected exception " + cause.getMessage() +
-                " from downstream on " + c, cause);
+      LOG.warn(getPeerUuidLoggingString() + "Unexpected exception " + cause.getMessage() +
+               " from downstream on " + c, cause);
     }
     if (c.isOpen()) {
       c.close();          // Will trigger channelClosed(), which will cleanup()
@@ -790,6 +819,17 @@ public class TabletClient extends ReplayingDecoder<Void> {
         .append(rpcs_inflight.size())       // ~ 2
         .append(')');                       // = 1
     return buf.toString();
+  }
+
+  public static String getHostPort(SocketAddress remoteAddress) {
+    if (remoteAddress == null) {
+      return null;
+    }
+    if (!(remoteAddress instanceof InetSocketAddress)) {
+      return "Unknown address type " + remoteAddress.getClass().getSimpleName();
+    }
+    InetSocketAddress inetSocketAddress = (InetSocketAddress) remoteAddress;
+    return  inetSocketAddress.getAddress().getHostAddress() + ":" + inetSocketAddress.getPort();
   }
 
 }

@@ -5,9 +5,9 @@
 //  LICENSE file in the root directory of this source tree. An additional grant
 //  of patent rights can be found in the PATENTS file in the same directory.
 //
-// The following only applies to changes made to this file as part of YugaByte development.
+// The following only applies to changes made to this file as part of YugabyteDB development.
 //
-// Portions Copyright (c) YugaByte, Inc.
+// Portions Copyright (c) YugabyteDB, Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License"); you may not use this file except
 // in compliance with the License.  You may obtain a copy of the License at
@@ -54,10 +54,22 @@ class MockTableReader : public TableReader {
 
   bool IsSplitSst() const override { return false; }
 
-  void SetDataFileReader(std::unique_ptr<RandomAccessFileReader>&& data_file) override { assert(false); }
+  void SetDataFileReader(std::unique_ptr<RandomAccessFileReader>&& data_file) override {
+    assert(false);
+  }
 
-  InternalIterator* NewIterator(const ReadOptions&, Arena* arena,
-                                bool skip_filters = false) override;
+  InternalIterator* NewIterator(
+      const ReadOptions&, Arena* arena, bool skip_filters,
+      SkipCorruptDataBlocksUnsafe skip_corrupt_data_blocks_unsafe) override;
+
+  InternalIterator* NewIndexIterator(const ReadOptions& read_options) override {
+    return nullptr;
+  }
+
+  DataBlockAwareIndexInternalIterator* NewDataBlockAwareIndexIterator(
+      const ReadOptions& read_options) override {
+    return nullptr;
+  }
 
   Status Get(const ReadOptions&, const Slice& key, GetContext* get_context,
              bool skip_filters = false) override;
@@ -82,39 +94,54 @@ class MockTableIterator : public InternalIterator {
     itr_ = table_.end();
   }
 
-  bool Valid() const override { return itr_ != table_.end(); }
+  const KeyValueEntry& SeekToFirst() override {
+    itr_ = table_.begin();
+    return Entry();
+  }
 
-  void SeekToFirst() override { itr_ = table_.begin(); }
-
-  void SeekToLast() override {
+  const KeyValueEntry& SeekToLast() override {
     itr_ = table_.end();
     --itr_;
+    return Entry();
   }
 
-  void Seek(const Slice& target) override {
+  const KeyValueEntry& Seek(Slice target) override {
     std::string str_target(target.cdata(), target.size());
     itr_ = table_.lower_bound(str_target);
+    return Entry();
   }
 
-  void Next() override { ++itr_; }
+  const KeyValueEntry& Next() override {
+    ++itr_;
+    return Entry();
+  }
 
-  void Prev() override {
+  const KeyValueEntry& Prev() override {
     if (itr_ == table_.begin()) {
       itr_ = table_.end();
     } else {
       --itr_;
     }
+    return Entry();
   }
 
-  Slice key() const override { return Slice(itr_->first); }
-
-  Slice value() const override { return Slice(itr_->second); }
+  const KeyValueEntry& Entry() const override {
+    if (itr_ == table_.end()) {
+      return KeyValueEntry::Invalid();
+    }
+    entry_ = {
+      .key = Slice(itr_->first),
+      .value = Slice(itr_->second),
+    };
+    return entry_;
+  }
 
   Status status() const override { return Status::OK(); }
 
  private:
   const stl_wrappers::KVMap& table_;
   stl_wrappers::KVMap::const_iterator itr_;
+  mutable KeyValueEntry entry_;
 };
 
 class MockTableBuilder : public TableBuilder {

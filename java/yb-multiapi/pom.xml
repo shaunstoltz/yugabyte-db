@@ -1,5 +1,5 @@
 <?xml version="1.0"?>
-<!-- Copyright (c) YugaByte, Inc. -->
+<!-- Copyright (c) YugabyteDB, Inc. -->
 <project
     xsi:schemaLocation="http://maven.apache.org/POM/4.0.0
                         http://maven.apache.org/xsd/maven-4.0.0.xsd"
@@ -9,7 +9,7 @@
   <parent>
     <groupId>org.yb</groupId>
     <artifactId>yb-parent</artifactId>
-    <version>0.8.38-SNAPSHOT</version>
+    <version>0.8.117-SNAPSHOT</version>
   </parent>
 
   <artifactId>yb-multiapi</artifactId>
@@ -19,14 +19,12 @@
     <dependency>
       <groupId>org.yb</groupId>
       <artifactId>yb-client</artifactId>
-      <version>0.8.38-SNAPSHOT</version>
       <type>test-jar</type>
       <scope>test</scope>
     </dependency>
     <dependency>
       <groupId>org.yb</groupId>
       <artifactId>yb-client</artifactId>
-      <version>0.8.38-SNAPSHOT</version>
       <scope>test</scope>
     </dependency>
     <dependency>

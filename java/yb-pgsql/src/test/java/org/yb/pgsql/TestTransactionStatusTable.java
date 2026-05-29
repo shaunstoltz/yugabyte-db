@@ -1,4 +1,4 @@
-// Copyright (c) YugaByte, Inc.
+// Copyright (c) YugabyteDB, Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License"); you may not use this file except
 // in compliance with the License.  You may obtain a copy of the License at
@@ -18,15 +18,16 @@ import org.junit.runner.RunWith;
 import org.yb.minicluster.MiniYBClusterBuilder;
 import org.yb.util.MiscUtil;
 import org.yb.util.ThrowingRunnable;
-import org.yb.util.YBTestRunnerNonTsanOnly;
+import org.yb.YBTestRunner;
 
+import java.sql.SQLException;
 import java.sql.Statement;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.concurrent.CountDownLatch;
 import org.yb.util.BuildTypeUtil;
 
-@RunWith(value=YBTestRunnerNonTsanOnly.class)
+@RunWith(value=YBTestRunner.class)
 public class TestTransactionStatusTable extends BasePgSQLTest {
   @Override
   protected void customizeMiniClusterBuilder(MiniYBClusterBuilder builder) {
@@ -38,7 +39,7 @@ public class TestTransactionStatusTable extends BasePgSQLTest {
 
   @Test
   public void testCreation() throws Throwable {
-    final int kTablesCount = BuildTypeUtil.nonTsanVsTsan(4, 2);
+    final int kTablesCount = BuildTypeUtil.nonSanitizerVsSanitizer(4, 2);
     final CountDownLatch startSignal = new CountDownLatch(kTablesCount);
     List<ThrowingRunnable> cmds = new ArrayList<>();
     for (int i = 0; i <  kTablesCount; ++i) {
@@ -48,7 +49,18 @@ public class TestTransactionStatusTable extends BasePgSQLTest {
           startSignal.countDown();
           startSignal.await();
           // Check table is created in spite of the fact transaction status table is not ready yet.
-          stmt.execute(String.format("CREATE TABLE t_%d(k INT, v INT)", idx));
+          // Retry on catalog mismatch error.
+          while (true) {
+            try {
+              stmt.execute(String.format("CREATE TABLE t_%d(k INT, v INT)", idx));
+              break;
+            } catch (SQLException e) {
+              if (e.getSQLState().equals("40001")) {
+                continue;
+              }
+              throw e;
+            }
+          }
           assertOneRow(stmt, String.format("SELECT COUNT(*) FROM t_%d", idx), 0L);
         }
       });

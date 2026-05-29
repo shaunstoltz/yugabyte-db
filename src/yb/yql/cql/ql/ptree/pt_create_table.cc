@@ -1,5 +1,5 @@
 //--------------------------------------------------------------------------------------------------
-// Copyright (c) YugaByte, Inc.
+// Copyright (c) YugabyteDB, Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License"); you may not use this file except
 // in compliance with the License.  You may obtain a copy of the License at
@@ -40,10 +40,6 @@ TAG_FLAG(cql_table_is_transactional_by_default, advanced);
 
 namespace yb {
 namespace ql {
-
-using std::shared_ptr;
-using std::to_string;
-using client::YBColumnSchema;
 
 //--------------------------------------------------------------------------------------------------
 

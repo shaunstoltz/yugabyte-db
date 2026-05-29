@@ -1,4 +1,4 @@
-// Copyright (c) YugaByte, Inc.
+// Copyright (c) YugabyteDB, Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License"); you may not use this file except
 // in compliance with the License.  You may obtain a copy of the License at
@@ -13,40 +13,25 @@
 
 #include "yb/common/doc_hybrid_time.h"
 
-#include "yb/gutil/casts.h"
-
 #include "yb/util/bytes_formatter.h"
 #include "yb/util/cast.h"
 #include "yb/util/checked_narrow_cast.h"
-#include "yb/util/debug-util.h"
 #include "yb/util/fast_varint.h"
 #include "yb/util/result.h"
 #include "yb/util/status.h"
 #include "yb/util/status_format.h"
-#include "yb/util/varint.h"
 
 using std::string;
 
-using yb::util::VarInt;
-using yb::util::FastEncodeDescendingSignedVarInt;
-using yb::util::FastDecodeDescendingSignedVarIntUnsafe;
-using yb::FormatBytesAsStr;
-using yb::FormatSliceAsStr;
-using yb::QuotesType;
+using yb::FastEncodeDescendingSignedVarInt;
 
-using strings::Substitute;
 using strings::SubstituteAndAppend;
 
 namespace yb {
 
-// It does not really matter what write id we use here. We determine DocHybridTime validity based
-// on its HybridTime component's validity. However, given that HybridTime::kInvalid is close to the
-// highest possible value of the underlying in-memory representation of HybridTime, we use
-// kMaxWriteId for the write id portion of this constant for consistency.
-const DocHybridTime DocHybridTime::kInvalid = DocHybridTime(HybridTime::kInvalid, kMaxWriteId);
+const EncodedDocHybridTime kEncodedDocHybridTimeMin{DocHybridTime::kMin};
 
-const DocHybridTime DocHybridTime::kMin = DocHybridTime(HybridTime::kMin, 0);
-const DocHybridTime DocHybridTime::kMax = DocHybridTime(HybridTime::kMax, kMaxWriteId);
+const Slice EncodedDocHybridTime::kMin = kEncodedDocHybridTimeMin.AsSlice();
 
 constexpr int kNumBitsForHybridTimeSize = 5;
 constexpr int kHybridTimeSizeMask = (1 << kNumBitsForHybridTimeSize) - 1;
@@ -89,24 +74,50 @@ char* DocHybridTime::EncodedInDocDbFormat(char* dest) const {
   return out;
 }
 
+Result<Slice> DocHybridTime::EncodedFromStart(Slice* slice) {
+  const auto* begin = slice->cdata();
+  const char* mid = VERIFY_RESULT(EncodedFromStart(begin, slice->cend()));
+  *slice = Slice(mid, slice->cend());
+  return Slice(begin, mid);
+}
+
+Result<const char*> DocHybridTime::EncodedFromStart(const char* begin, const char* end) {
+  const char* start = begin;
+  // There are following components:
+  // 1) Generation number - not used always 0.
+  // 2) Physical part of hybrid time.
+  // 3) Logical part of hybrid time.
+  // 4) Write id.
+  for (size_t i = 0; i != 4; ++i) {
+    auto size = FastDecodeDescendingSignedVarIntSize(Slice(begin, end));
+    if (size == 0 || begin + size > end) {
+      return STATUS_FORMAT(
+          Corruption, "Bad doc hybrid time: $0, step: $1",
+          Slice(start, end).ToDebugHexString(), i);
+    }
+    begin += size;
+  }
+  return begin;
+}
+
 Result<DocHybridTime> DocHybridTime::DecodeFrom(Slice *slice) {
   DocHybridTime result;
   const size_t previous_size = slice->size();
   {
     // Currently we just ignore the generation number as it should always be 0.
-    RETURN_NOT_OK(FastDecodeDescendingSignedVarIntUnsafe(slice));
+    RETURN_NOT_OK(FastDecodeDescendingSignedVarInt(slice));
     int64_t decoded_micros =
-        kYugaByteMicrosecondEpoch + VERIFY_RESULT(FastDecodeDescendingSignedVarIntUnsafe(slice));
+        kYugaByteMicrosecondEpoch + VERIFY_RESULT(FastDecodeDescendingSignedVarInt(slice));
 
     auto decoded_logical = VERIFY_RESULT(checked_narrow_cast<LogicalTimeComponent>(
-        VERIFY_RESULT(FastDecodeDescendingSignedVarIntUnsafe(slice))));
+        VERIFY_RESULT(FastDecodeDescendingSignedVarInt(slice))));
 
     result.hybrid_time_ = HybridTime::FromMicrosecondsAndLogicalValue(
         decoded_micros, decoded_logical);
   }
 
   const auto ptr_before_decoding_write_id = slice->data();
-  int64_t decoded_shifted_write_id = VERIFY_RESULT(FastDecodeDescendingSignedVarIntUnsafe(slice));
+  int64_t decoded_shifted_write_id = VERIFY_RESULT(FastDecodeDescendingSignedVarInt(slice));
 
   if (decoded_shifted_write_id < 0) {
     return STATUS_SUBSTITUTE(
@@ -241,17 +252,40 @@ EncodedDocHybridTime::EncodedDocHybridTime(const DocHybridTime& input)
 EncodedDocHybridTime::EncodedDocHybridTime(HybridTime ht, IntraTxnWriteId write_id)
     : EncodedDocHybridTime(DocHybridTime(ht, write_id)) {}
 
+EncodedDocHybridTime::EncodedDocHybridTime(const Slice& src)
+    : size_(src.size()) {
+  memcpy(buffer_.data(), src.data(), src.size());
+}
+
 void EncodedDocHybridTime::Assign(const Slice& input) {
   size_ = input.size();
   memcpy(buffer_.data(), input.data(), size_);
 }
 
+void EncodedDocHybridTime::Assign(const DocHybridTime& doc_ht) {
+  size_ = doc_ht.EncodedInDocDbFormat(buffer_.data()) - buffer_.data();
+}
+
+void EncodedDocHybridTime::Reset() {
+  size_ = 0;
+}
+
 std::string EncodedDocHybridTime::ToString() const {
+  if (empty()) {
+    return "<EMPTY>";
+  }
   return DocHybridTime::FullyDecodeFrom(AsSlice()).ToString();
 }
 
 Result<DocHybridTime> EncodedDocHybridTime::Decode() const {
   return DocHybridTime::FullyDecodeFrom(AsSlice());
+}
+
+void EncodedDocHybridTime::MakeAtLeast(const EncodedDocHybridTime& rhs) {
+  if (*this >= rhs) {
+    return;
+  }
+  Assign(rhs.AsSlice());
 }
 
 }  // namespace yb

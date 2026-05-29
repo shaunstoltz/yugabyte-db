@@ -1,5 +1,5 @@
 /*
- * Copyright 2019 YugaByte, Inc. and Contributors
+ * Copyright 2019 YugabyteDB, Inc. and Contributors
  *
  * Licensed under the Polyform Free Trial License 1.0.0 (the "License"); you
  * may not use this file except in compliance with the License. You
@@ -15,11 +15,8 @@ import static com.yugabyte.yw.common.PlacementInfoUtil.removeNodeByName;
 import static com.yugabyte.yw.common.PlacementInfoUtil.updatePlacementInfo;
 
 import com.yugabyte.yw.commissioner.BaseTaskDependencies;
-import com.yugabyte.yw.commissioner.Common;
-import com.yugabyte.yw.common.NodeManager;
 import com.yugabyte.yw.forms.UniverseDefinitionTaskParams;
 import com.yugabyte.yw.forms.UniverseDefinitionTaskParams.Cluster;
-import com.yugabyte.yw.models.NodeInstance;
 import com.yugabyte.yw.models.Universe;
 import com.yugabyte.yw.models.helpers.NodeDetails;
 import java.util.Set;
@@ -29,8 +26,8 @@ import lombok.extern.slf4j.Slf4j;
 @Slf4j
 public class DeleteNode extends NodeTaskBase {
   @Inject
-  protected DeleteNode(BaseTaskDependencies baseTaskDependencies, NodeManager nodeManager) {
-    super(baseTaskDependencies, nodeManager);
+  protected DeleteNode(BaseTaskDependencies baseTaskDependencies) {
+    super(baseTaskDependencies);
   }
 
   @Override
@@ -53,23 +50,11 @@ public class DeleteNode extends NodeTaskBase {
               removeNodeByName(taskParams().nodeName, universeDetails.nodeDetailsSet);
               // Update Placement Info to reflect new nodeDetailSet
               Set<NodeDetails> clusterNodes = universeDetails.getNodesInCluster(cluster.uuid);
-              updatePlacementInfo(clusterNodes, cluster.placementInfo);
+              updatePlacementInfo(clusterNodes, cluster);
 
               // Update userIntent to reflect new numNodes
-              cluster.userIntent.numNodes = universeDetails.nodeDetailsSet.size();
-              // If OnPrem Free up the node.
-              if (cluster.userIntent.providerType.equals(Common.CloudType.onprem)) {
-                try {
-                  NodeInstance node = NodeInstance.getByName(taskParams().nodeName);
-                  node.clearNodeDetails();
-                } catch (Exception ex) {
-                  log.warn(
-                      "On-prem node {} in universe {} doesn't have a linked instance. "
-                          + "Deletion is skipped.",
-                      taskParams().nodeName,
-                      universe.name);
-                }
-              }
+              cluster.userIntent.numNodes =
+                  (int) universeDetails.getNodesInCluster(cluster.uuid).size();
               universe.setUniverseDetails(universeDetails);
             }
           };

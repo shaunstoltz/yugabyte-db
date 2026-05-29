@@ -15,9 +15,9 @@
 // specific language governing permissions and limitations
 // under the License.
 //
-// The following only applies to changes made to this file as part of YugaByte development.
+// The following only applies to changes made to this file as part of YugabyteDB development.
 //
-// Portions Copyright (c) YugaByte, Inc.
+// Portions Copyright (c) YugabyteDB, Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License"); you may not use this file except
 // in compliance with the License.  You may obtain a copy of the License at
@@ -30,18 +30,18 @@
 // under the License.
 //
 
-#include <glog/logging.h>
 #include <gtest/gtest.h>
 
 #include "yb/common/hybrid_time.h"
+#include "yb/common/schema_pbutil.h"
 #include "yb/common/wire_protocol-test-util.h"
-#include "yb/common/wire_protocol.h"
 
 #include "yb/consensus/consensus.h"
 #include "yb/consensus/consensus_fwd.h"
 #include "yb/consensus/consensus_meta.h"
 #include "yb/consensus/log.h"
 #include "yb/consensus/log_anchor_registry.h"
+#include "yb/consensus/log_index.h"
 #include "yb/consensus/log_reader.h"
 #include "yb/consensus/log_util.h"
 #include "yb/consensus/metadata.pb.h"
@@ -50,7 +50,6 @@
 #include "yb/consensus/state_change_context.h"
 
 #include "yb/gutil/bind.h"
-#include "yb/gutil/macros.h"
 
 #include "yb/rpc/messenger.h"
 #include "yb/rpc/proxy.h"
@@ -64,14 +63,14 @@
 #include "yb/tablet/tablet_peer.h"
 #include "yb/tablet/write_query.h"
 
-#include "yb/tserver/tserver.pb.h"
+#include "yb/tserver/tserver.messages.h"
 
 #include "yb/util/backoff_waiter.h"
-#include "yb/util/debug-util.h"
 #include "yb/util/metrics.h"
 #include "yb/util/result.h"
 #include "yb/util/status_log.h"
 #include "yb/util/test_macros.h"
+#include "yb/util/test_thread_holder.h"
 #include "yb/util/threadpool.h"
 
 METRIC_DECLARE_entity(table);
@@ -81,36 +80,32 @@ DECLARE_uint64(initial_log_segment_size_bytes);
 DECLARE_int32(log_min_seconds_to_retain);
 DECLARE_uint64(log_segment_size_bytes);
 DECLARE_uint64(max_group_replicate_batch_size);
-DECLARE_int32(protobuf_message_total_bytes_limit);
+DECLARE_uint32(protobuf_message_total_bytes_limit);
 DECLARE_uint64(rpc_max_message_size);
+DECLARE_int32(retryable_request_timeout_secs);
 
+DECLARE_bool(enable_flush_retryable_requests);
 DECLARE_bool(quick_leader_election_on_create);
+DECLARE_bool(TEST_pause_before_copying_bootstrap_state);
+DECLARE_bool(TEST_pause_before_flushing_bootstrap_state);
+DECLARE_bool(TEST_pause_before_submitting_flush_bootstrap_state);
 
-namespace yb {
-namespace tablet {
+namespace yb::tablet {
 
-using consensus::Consensus;
+using namespace std::literals;
+
 using consensus::ConsensusBootstrapInfo;
 using consensus::ConsensusMetadata;
-using consensus::MakeOpId;
-using consensus::MinimumOpId;
-using consensus::OpIdEquals;
 using consensus::RaftPeerPB;
-using consensus::WRITE_OP;
-using docdb::KeyValueWriteBatchPB;
 using log::Log;
-using log::LogAnchorRegistry;
 using log::LogOptions;
-using server::Clock;
-using server::LogicalClock;
 using std::shared_ptr;
 using std::string;
-using strings::Substitute;
 using tserver::WriteRequestPB;
 using tserver::WriteResponsePB;
 
 static Schema GetTestSchema() {
-  return Schema({ ColumnSchema("key", INT32) }, 1);
+  return Schema({ ColumnSchema("key", DataType::INT32, ColumnKind::HASH) });
 }
 
 class TabletPeerTest : public YBTabletTest {
@@ -128,6 +123,7 @@ class TabletPeerTest : public YBTabletTest {
 
     ASSERT_OK(ThreadPoolBuilder("raft").Build(&raft_pool_));
     ASSERT_OK(ThreadPoolBuilder("prepare").Build(&tablet_prepare_pool_));
+    ASSERT_OK(ThreadPoolBuilder("flush-bootstrap-state").Build(&flush_bootstrap_state_pool_));
 
     rpc::MessengerBuilder builder(CURRENT_TEST_NAME());
     messenger_ = ASSERT_RESULT(builder.Build());
@@ -156,11 +152,12 @@ class TabletPeerTest : public YBTabletTest {
             Unretained(this),
             tablet()->tablet_id()),
         &metric_registry_,
-        nullptr, // tablet_splitter
-        std::shared_future<client::YBClient*>()));
+        /*tablet_splitter=*/nullptr,
+        std::shared_future<client::YBClient*>()
+    ));
 
     // Make TabletPeer use the same LogAnchorRegistry as the Tablet created by the harness.
-    // TODO: Refactor TabletHarness to allow taking a LogAnchorRegistry, while also providing
+    // TODO: Refactor TabletTestHarness to allow taking a LogAnchorRegistry, while also providing
     // RaftGroupMetadata for consumption by TabletPeer before Tablet is instantiated.
     tablet_peer_->log_anchor_registry_ = tablet()->log_anchor_registry_;
 
@@ -168,38 +165,81 @@ class TabletPeerTest : public YBTabletTest {
     config.add_peers()->CopyFrom(config_peer);
     config.set_opid_index(consensus::kInvalidOpIdIndex);
 
-    std::unique_ptr<ConsensusMetadata> cmeta;
-    ASSERT_OK(ConsensusMetadata::Create(tablet()->metadata()->fs_manager(),
-                                        tablet()->tablet_id(),
-                                        tablet()->metadata()->fs_manager()->uuid(),
-                                        config,
-                                        consensus::kMinimumTerm,
-                                        &cmeta));
+    std::unique_ptr<ConsensusMetadata> cmeta = ASSERT_RESULT(ConsensusMetadata::Create(
+        tablet()->metadata()->fs_manager(), tablet()->tablet_id(),
+        tablet()->metadata()->fs_manager()->uuid(), config, consensus::kMinimumTerm));
 
     ASSERT_OK(ThreadPoolBuilder("log")
                  .unlimited_threads()
                  .Build(&log_thread_pool_));
     scoped_refptr<Log> log;
-    ASSERT_OK(Log::Open(LogOptions(), tablet()->tablet_id(),
-                        tablet()->metadata()->wal_dir(), tablet()->metadata()->fs_manager()->uuid(),
-                        *tablet()->schema(), tablet()->metadata()->schema_version(),
-                        table_metric_entity_.get(), tablet_metric_entity_.get(),
-                        log_thread_pool_.get(), log_thread_pool_.get(), log_thread_pool_.get(),
-                        tablet()->metadata()->cdc_min_replicated_index(), &log));
+    auto metadata = tablet()->metadata();
+    log::NewSegmentAllocationCallback noop = {};
+    auto new_segment_allocation_callback =
+        metadata->IsLazySuperblockFlushEnabled()
+            ? [metadata] { return metadata->Flush(OnlyIfDirty::kTrue); }
+            : noop;
+    TabletPeerWeakPtr peer_weak_ptr(tablet_peer_);
+    auto pre_log_rollover_callback = [peer_weak_ptr]() {
+      auto peer = peer_weak_ptr.lock();
+      if (peer) {
+        Status s = peer->SubmitFlushBootstrapStateTask();
+        LOG_IF(WARNING, !s.ok() && !s.IsNotSupported())
+            <<  "Failed to submit retryable requests task: " << s.ToString();
+      }
+    };
+
+    auto min_start_ht_running_txns_callback = [peer_weak_ptr]() {
+      auto peer = peer_weak_ptr.lock();
+      if (peer) {
+        return peer->GetMinStartHTRunningTxnsOrLeaderSafeTime();
+      }
+
+      LOG(WARNING) << "Tablet peer not found, so setting minimum start time of running txns to "
+                      "kInitial.";
+      return HybridTime::kInitial;
+    };
+
+    ASSERT_OK(Log::Open(
+        LogOptions(), tablet()->tablet_id(), metadata->wal_dir(), metadata->fs_manager()->uuid(),
+        *tablet()->schema(), metadata->primary_table_schema_version(), table_metric_entity_.get(),
+        tablet_metric_entity_.get(),
+        /*read_wal_mem_tracker=*/nullptr, log_thread_pool_.get(), log_thread_pool_.get(),
+        log_thread_pool_.get(), &log, pre_log_rollover_callback, new_segment_allocation_callback,
+        log::CreateNewSegment::kTrue, min_start_ht_running_txns_callback));
+
+    auto bootstrap_state_manager = std::make_shared<TabletBootstrapStateManager>(
+        tablet()->tablet_id(), metadata->fs_manager(), metadata->wal_dir());
+    ASSERT_OK(bootstrap_state_manager->Init());
+
+    consensus::RetryableRequests retryable_requests(
+        MemTracker::FindOrCreateTracker(tablet()->tablet_id()),
+        "");
+    retryable_requests.SetServerClock(clock());
+    retryable_requests.SetRequestTimeout(FLAGS_retryable_request_timeout_secs);
 
     ASSERT_OK(tablet_peer_->SetBootstrapping());
+    raft_notifications_pool_ = std::make_unique<rpc::ThreadPool>(rpc::ThreadPoolOptions {
+      .name = "raft_notifications",
+      .max_workers = rpc::ThreadPoolOptions::kUnlimitedWorkers
+    });
     ASSERT_OK(tablet_peer_->InitTabletPeer(tablet(),
                                            nullptr /* server_mem_tracker */,
                                            messenger_.get(),
+                                           messenger_->ThreadPoolPtr(),
                                            proxy_cache_.get(),
                                            log,
                                            table_metric_entity_,
                                            tablet_metric_entity_,
                                            raft_pool_.get(),
+                                           raft_notifications_pool_.get(),
                                            tablet_prepare_pool_.get(),
-                                           nullptr /* retryable_requests */,
+                                           &retryable_requests,
+                                           bootstrap_state_manager,
                                            nullptr /* consensus_meta */,
-                                           multi_raft_manager_.get()));
+                                           multi_raft_manager_.get(),
+                                           flush_bootstrap_state_pool_.get()));
+    tablet_peer_->EnableFlushBootstrapState();
   }
 
   Status StartPeer(const ConsensusBootstrapInfo& info) {
@@ -209,7 +249,7 @@ class TabletPeerTest : public YBTabletTest {
       if (FLAGS_quick_leader_election_on_create) {
         return tablet_peer_->LeaderStatus() == consensus::LeaderStatus::LEADER_AND_READY;
       }
-      RETURN_NOT_OK(tablet_peer_->consensus()->EmulateElection());
+      RETURN_NOT_OK(VERIFY_RESULT(tablet_peer_->GetConsensus())->EmulateElection());
       return true;
     }, MonoDelta::FromMilliseconds(500), "If quick leader elections enabled, wait for peer to be a "
                                          "leader, otherwise emulate.");
@@ -249,11 +289,13 @@ class TabletPeerTest : public YBTabletTest {
   }
 
   void ExecuteWrite(TabletPeer* tablet_peer, const WriteRequestPB& req) {
-    WriteResponsePB resp;
+    auto arena = SharedThreadSafeArena();
+    auto& resp = *arena->NewArenaObject<tserver::LWWriteResponsePB>();
+    auto& lw_req = *arena->NewArenaObject<tserver::LWWriteRequestPB>(req);
     auto query = std::make_unique<WriteQuery>(
         /* leader_term */ 1, CoarseTimePoint::max(), tablet_peer,
-        ASSERT_RESULT(tablet_peer->shared_tablet_safe()), nullptr, &resp);
-    query->set_client_request(req);
+        ASSERT_RESULT(tablet_peer->shared_tablet()), /* rpc_context= */ nullptr, &resp);
+    query->set_client_request(lw_req);
 
     CountDownLatch rpc_latch(1);
     query->set_callback(MakeLatchOperationCompletionCallback(&rpc_latch, &resp));
@@ -261,7 +303,20 @@ class TabletPeerTest : public YBTabletTest {
     tablet_peer->WriteAsync(std::move(query));
     rpc_latch.Wait();
     CHECK(!resp.has_error())
-        << "\nResp:\n" << resp.DebugString() << "Req:\n" << req.DebugString();
+        << "\nResp:\n" << resp.ShortDebugString() << "Req:\n" << req.ShortDebugString();
+  }
+
+  template<class Callback>
+  std::unique_ptr<WriteQuery> CreateQuery(TabletPeer* tablet_peer,
+                                          const tserver::WriteRequestMsg& req,
+                                          tserver::WriteResponseMsg* resp,
+                                          const Callback& cb) {
+    auto query = std::make_unique<WriteQuery>(
+        /* leader_term */ 1, CoarseTimePoint::max(), tablet_peer,
+        CHECK_RESULT(tablet_peer->shared_tablet()), /* rpc_context= */ nullptr, resp);
+    query->set_client_request(req);
+    query->set_callback(cb);
+    return query;
   }
 
   Status RollLog(TabletPeer* tablet_peer) {
@@ -321,13 +376,15 @@ class TabletPeerTest : public YBTabletTest {
   std::unique_ptr<ThreadPool> raft_pool_;
   std::unique_ptr<ThreadPool> tablet_prepare_pool_;
   std::unique_ptr<ThreadPool> log_thread_pool_;
+  std::unique_ptr<ThreadPool> flush_bootstrap_state_pool_;
   std::shared_ptr<TabletPeer> tablet_peer_;
   std::unique_ptr<consensus::MultiRaftManager> multi_raft_manager_;
+  std::unique_ptr<rpc::ThreadPool> raft_notifications_pool_;
 };
 
 // Ensure that Log::GC() doesn't delete logs with anchors.
 TEST_F(TabletPeerTest, TestLogAnchorsAndGC) {
-  FLAGS_log_min_seconds_to_retain = 0;
+  ANNOTATE_UNPROTECTED_WRITE(FLAGS_log_min_seconds_to_retain) = 0;
   ConsensusBootstrapInfo info;
   ASSERT_OK(StartPeer(info));
 
@@ -335,38 +392,41 @@ TEST_F(TabletPeerTest, TestLogAnchorsAndGC) {
   int32_t num_gced;
 
   log::SegmentSequence segments;
-  ASSERT_OK(log->GetLogReader()->GetSegmentsSnapshot(&segments));
+  auto* log_reader = ASSERT_RESULT(log->GetLogReader());
+  ASSERT_OK(log_reader->GetSegmentsSnapshot(&segments));
 
   ASSERT_EQ(1, segments.size());
   ASSERT_OK(ExecuteInsertsAndRollLogs(3));
-  ASSERT_OK(log->GetLogReader()->GetSegmentsSnapshot(&segments));
+  ASSERT_OK(log_reader->GetSegmentsSnapshot(&segments));
   ASSERT_EQ(4, segments.size());
 
   ASSERT_NO_FATALS(AssertLogAnchorEarlierThanLogLatest());
 
   // Ensure nothing gets deleted.
+  auto tablet = ASSERT_RESULT(tablet_peer_->shared_tablet());
+  ASSERT_OK(tablet->Flush(tablet::FlushMode::kSync, rocksdb::FlushReason::kTestOnly));
   int64_t min_log_index = ASSERT_RESULT(tablet_peer_->GetEarliestNeededLogIndex());
   ASSERT_OK(log->GC(min_log_index, &num_gced));
   ASSERT_EQ(2, num_gced) << "Earliest needed: " << min_log_index;
 
   // Flush RocksDB to ensure that we don't have OpId in anchors.
-  ASSERT_OK(tablet_peer_->tablet()->Flush(tablet::FlushMode::kSync));
+  ASSERT_OK(tablet->Flush(tablet::FlushMode::kSync, rocksdb::FlushReason::kTestOnly));
 
   // The first two segments should be deleted.
   // The last is anchored due to the commit in the last segment being the last
   // OpId in the log.
   int32_t earliest_needed = 0;
-  auto total_segments = log->GetLogReader()->num_segments();
+  auto total_segments = log_reader->num_segments();
   min_log_index = ASSERT_RESULT(tablet_peer_->GetEarliestNeededLogIndex());
   ASSERT_OK(log->GC(min_log_index, &num_gced));
   ASSERT_EQ(earliest_needed, num_gced) << "earliest needed: " << min_log_index;
-  ASSERT_OK(log->GetLogReader()->GetSegmentsSnapshot(&segments));
+  ASSERT_OK(log_reader->GetSegmentsSnapshot(&segments));
   ASSERT_EQ(total_segments - earliest_needed, segments.size());
 }
 
 // Ensure that Log::GC() doesn't delete logs when the DMS has an anchor.
 TEST_F(TabletPeerTest, TestDMSAnchorPreventsLogGC) {
-  FLAGS_log_min_seconds_to_retain = 0;
+  ANNOTATE_UNPROTECTED_WRITE(FLAGS_log_min_seconds_to_retain) = 0;
   ConsensusBootstrapInfo info;
   ASSERT_OK(StartPeer(info));
 
@@ -374,24 +434,26 @@ TEST_F(TabletPeerTest, TestDMSAnchorPreventsLogGC) {
   int32_t num_gced;
 
   log::SegmentSequence segments;
-  ASSERT_OK(log->GetLogReader()->GetSegmentsSnapshot(&segments));
+  auto* log_reader = ASSERT_RESULT(log->GetLogReader());
+  ASSERT_OK(log_reader->GetSegmentsSnapshot(&segments));
 
   ASSERT_EQ(1, segments.size());
   ASSERT_OK(ExecuteInsertsAndRollLogs(2));
-  ASSERT_OK(log->GetLogReader()->GetSegmentsSnapshot(&segments));
+  ASSERT_OK(log_reader->GetSegmentsSnapshot(&segments));
   ASSERT_EQ(3, segments.size());
 
   // Flush RocksDB so the next mutation goes into a DMS.
-  ASSERT_OK(tablet_peer_->tablet()->Flush(tablet::FlushMode::kSync));
+  auto tablet = ASSERT_RESULT(tablet_peer_->shared_tablet());
+  ASSERT_OK(tablet->Flush(tablet::FlushMode::kSync, rocksdb::FlushReason::kTestOnly));
 
   int32_t earliest_needed = 1;
-  auto total_segments = log->GetLogReader()->num_segments();
+  auto total_segments = log_reader->num_segments();
   int64_t min_log_index = ASSERT_RESULT(tablet_peer_->GetEarliestNeededLogIndex());
   ASSERT_OK(log->GC(min_log_index, &num_gced));
   // We will only GC 1, and have 1 left because the earliest needed OpId falls
   // back to the latest OpId written to the Log if no anchors are set.
   ASSERT_EQ(earliest_needed, num_gced);
-  ASSERT_OK(log->GetLogReader()->GetSegmentsSnapshot(&segments));
+  ASSERT_OK(log_reader->GetSegmentsSnapshot(&segments));
   ASSERT_EQ(total_segments - earliest_needed, segments.size());
 
   auto id = log->GetLatestEntryOpId();
@@ -410,26 +472,29 @@ TEST_F(TabletPeerTest, TestDMSAnchorPreventsLogGC) {
   ASSERT_NO_FATALS(AssertLogAnchorEarlierThanLogLatest());
 
   total_segments += 1;
-  ASSERT_OK(log->GetLogReader()->GetSegmentsSnapshot(&segments));
+  ASSERT_OK(log_reader->GetSegmentsSnapshot(&segments));
   ASSERT_EQ(total_segments, segments.size());
 
   // Execute another couple inserts, but Flush it so it doesn't anchor.
   ASSERT_OK(ExecuteInsertsAndRollLogs(2));
   total_segments += 2;
-  ASSERT_OK(log->GetLogReader()->GetSegmentsSnapshot(&segments));
+  ASSERT_OK(log_reader->GetSegmentsSnapshot(&segments));
   ASSERT_EQ(total_segments, segments.size());
 
   // Ensure the delta and last insert remain in the logs, anchored by the delta.
   // Note that this will allow GC of the 2nd insert done above.
+  ASSERT_OK(tablet->Flush(tablet::FlushMode::kSync, rocksdb::FlushReason::kTestOnly));
   earliest_needed = 4;
-  min_log_index = ASSERT_RESULT(tablet_peer_->GetEarliestNeededLogIndex());
+  std::string details;
+  min_log_index = ASSERT_RESULT(tablet_peer_->GetEarliestNeededLogIndex(&details));
+  LOG(INFO) << details;
   ASSERT_OK(log->GC(min_log_index, &num_gced));
   ASSERT_EQ(earliest_needed, num_gced);
-  ASSERT_OK(log->GetLogReader()->GetSegmentsSnapshot(&segments));
+  ASSERT_OK(log_reader->GetSegmentsSnapshot(&segments));
   ASSERT_EQ(total_segments - earliest_needed, segments.size());
 
   earliest_needed = 0;
-  total_segments = log->GetLogReader()->num_segments();
+  total_segments = log_reader->num_segments();
   // We should only hang onto one segment due to no anchors.
   // The last log OpId is the commit in the last segment, so it only anchors
   // that segment, not the previous, because it's not the first OpId in the
@@ -437,24 +502,25 @@ TEST_F(TabletPeerTest, TestDMSAnchorPreventsLogGC) {
   min_log_index = ASSERT_RESULT(tablet_peer_->GetEarliestNeededLogIndex());
   ASSERT_OK(log->GC(min_log_index, &num_gced));
   ASSERT_EQ(earliest_needed, num_gced);
-  ASSERT_OK(log->GetLogReader()->GetSegmentsSnapshot(&segments));
+  ASSERT_OK(log_reader->GetSegmentsSnapshot(&segments));
   ASSERT_EQ(total_segments - earliest_needed, segments.size());
 }
 
 // Ensure that Log::GC() doesn't compact logs with OpIds of active transactions.
 TEST_F(TabletPeerTest, TestActiveOperationPreventsLogGC) {
-  FLAGS_log_min_seconds_to_retain = 0;
+  ANNOTATE_UNPROTECTED_WRITE(FLAGS_log_min_seconds_to_retain) = 0;
   ConsensusBootstrapInfo info;
   ASSERT_OK(StartPeer(info));
 
   Log* log = tablet_peer_->log_.get();
 
   log::SegmentSequence segments;
-  ASSERT_OK(log->GetLogReader()->GetSegmentsSnapshot(&segments));
+  auto* log_reader = ASSERT_RESULT(log->GetLogReader());
+  ASSERT_OK(log_reader->GetSegmentsSnapshot(&segments));
 
   ASSERT_EQ(1, segments.size());
   ASSERT_OK(ExecuteInsertsAndRollLogs(4));
-  ASSERT_OK(log->GetLogReader()->GetSegmentsSnapshot(&segments));
+  ASSERT_OK(log_reader->GetSegmentsSnapshot(&segments));
   ASSERT_EQ(5, segments.size());
 }
 
@@ -463,6 +529,93 @@ TEST_F(TabletPeerTest, TestGCEmptyLog) {
   ASSERT_OK(tablet_peer_->Start(info));
   // We don't wait on consensus on purpose.
   ASSERT_OK(tablet_peer_->RunLogGC());
+}
+
+TEST_F(TabletPeerTest, TestAddTableUpdatesMetadataAndStoresNamespaceInfo) {
+  auto tablet = ASSERT_RESULT(tablet_peer_->shared_tablet());
+  const std::string kTableId = "00004000000030008000000000004020";
+  const std::string kNamespaceId = "abcdef01abcdef01abcdef01abcdef01";
+  const std::string kNamespaceName = "test_ns";
+  TableInfoPB table_info;
+  table_info.set_table_id(kTableId);
+  table_info.set_table_name("test");
+  table_info.set_table_type(PGSQL_TABLE_TYPE);
+  table_info.set_namespace_id(kNamespaceId);
+  table_info.set_namespace_name(kNamespaceName);
+  ColumnSchema col("a", DataType::UINT32, ColumnKind::RANGE_ASC_NULL_FIRST);
+  ColumnId col_id(1);
+  Schema schema({col}, {col_id});
+  SchemaToPB(schema, table_info.mutable_schema());
+  OpId op_id(100, 5);
+  ASSERT_OK(tablet->AddTable(table_info, op_id, HybridTime()));
+  ASSERT_EQ(tablet->metadata()->TEST_LastAppliedChangeMetadataOperationOpId(), op_id);
+  auto result = ASSERT_RESULT(tablet->metadata()->GetTableInfo(kTableId));
+  ASSERT_EQ(result->namespace_id, kNamespaceId);
+  ASSERT_EQ(result->namespace_name, kNamespaceName);
+}
+
+TEST_F(TabletPeerTest, TestRollLogAfterTabletPeerShutdown) {
+  ASSERT_OK(tablet_peer_->Shutdown(
+      ShouldAbortActiveTransactions::kFalse, DisableFlushOnShutdown::kFalse));
+  auto s = tablet_peer_->log()->AsyncAllocateSegmentAndRollover();
+  ASSERT_NOK_STR_CONTAINS(s, "Invalid log state");
+}
+
+void VerifyNonDecreasingTxnStartTimeInClosedSegments(const log::SegmentSequence& segments) {
+  VLOG(1) << "Found " << segments.size() << " log segments";
+  uint64_t prev_seg_min_start_time_running_txns = HybridTime::kInitial.ToUint64();
+  for (const auto& segment : segments) {
+    if (!segment->HasFooter()) {
+      VLOG(1) << "Footer for segment " << segment->header().sequence_number() << " not found";
+      continue;
+    }
+    ASSERT_TRUE(segment->footer().has_min_start_time_running_txns());
+    // Footer of all closed segments will have the tablet leader safe time as the
+    // min_start_time_running_txns as there are no running txns. Therefore,
+    // min_start_time_running_txns across closed segments will follow a non-decreasing order except
+    // for those segments which have kInitial as min_start_time_running_txns.
+    auto curr_seg_min_start_time_running_txns = segment->footer().min_start_time_running_txns();
+    VLOG(1) << "Footer for segment " << segment->header().sequence_number()
+            << " found with min_start_time_running_txns: " << curr_seg_min_start_time_running_txns;
+    bool min_start_time_in_order =
+        curr_seg_min_start_time_running_txns == HybridTime::kInitial.ToUint64() ||
+        curr_seg_min_start_time_running_txns >= prev_seg_min_start_time_running_txns;
+    ASSERT_TRUE(min_start_time_in_order);
+    if (curr_seg_min_start_time_running_txns != HybridTime::kInitial.ToUint64()) {
+      prev_seg_min_start_time_running_txns = segment->footer().min_start_time_running_txns();
+    }
+  }
+}
+
+TEST_F(TabletPeerTest, TestMinStartTimeRunningTxnsOnLogSegmentRollover) {
+  google::SetVLOGLevel("tablet_peer-test*", 1);
+  ConsensusBootstrapInfo info;
+  ASSERT_OK(StartPeer(info));
+
+  Log* log = tablet_peer_->log();
+
+  log::SegmentSequence segments;
+  auto* log_reader = ASSERT_RESULT(log->GetLogReader());
+  ASSERT_OK(log_reader->GetSegmentsSnapshot(&segments));
+
+  ASSERT_EQ(1, segments.size());
+  ASSERT_OK(ExecuteInsertsAndRollLogs(3));
+  ASSERT_OK(log_reader->GetSegmentsSnapshot(&segments));
+  ASSERT_EQ(4, segments.size());
+  VerifyNonDecreasingTxnStartTimeInClosedSegments(segments);
+
+  ASSERT_OK(log->Close());
+
+  auto metadata = tablet()->metadata();
+
+  std::unique_ptr<log::LogReader> reader;
+  ASSERT_OK(log::LogReader::Open(
+      metadata->fs_manager()->env(), /*index=*/nullptr, "Log reader: ", metadata->wal_dir(),
+      /*table_metric_entity=*/nullptr,
+      /*tablet_metric_entity=*/nullptr, /*read_wal_mem_tracker=*/nullptr, &reader));
+
+  ASSERT_OK(reader->GetSegmentsSnapshot(&segments));
+  VerifyNonDecreasingTxnStartTimeInClosedSegments(segments);
 }
 
 class TabletPeerProtofBufSizeLimitTest : public TabletPeerTest {
@@ -493,8 +646,8 @@ TEST_F_EX(TabletPeerTest, MaxRaftBatchProtobufLimit, TabletPeerProtofBufSizeLimi
 
   std::string value(kValueSize, 'X');
 
-  std::vector<WriteRequestPB> requests(kNumOps);
-  std::vector<WriteResponsePB> responses(kNumOps);
+  auto arena = SharedThreadSafeArena();
+  std::vector<tserver::LWWriteResponsePB*> responses(kNumOps);
   std::vector<std::unique_ptr<WriteQuery>> queries;
   queries.reserve(kNumOps);
   CountDownLatch latch(kNumOps);
@@ -502,20 +655,13 @@ TEST_F_EX(TabletPeerTest, MaxRaftBatchProtobufLimit, TabletPeerProtofBufSizeLimi
   auto* const tablet_peer = tablet_peer_.get();
 
   for (int i = 0; i < kNumOps; ++i) {
-    auto* req = &requests[i];
-    auto* resp = &responses[i];
+    auto* req = arena->NewArenaObject<tserver::LWWriteRequestPB>();
+    auto* resp = responses[i] = arena->NewArenaObject<tserver::LWWriteResponsePB>();
 
-    req->set_tablet_id(tablet()->tablet_id());
+    req->dup_tablet_id(tablet()->tablet_id());
     AddTestRowInsert(i, i, value, req);
-    auto query = std::make_unique<WriteQuery>(
-        /* leader_term = */ 1, CoarseTimePoint::max(), tablet_peer, tablet(), nullptr, resp);
-    query->set_client_request(*req);
-    query->set_callback([&latch, resp](const Status& status) {
-      if (!status.ok()) {
-        StatusToPB(status, resp->mutable_error()->mutable_status());
-      }
-      latch.CountDown();
-    });
+    auto query = CreateQuery(
+        tablet_peer, *req, resp, MakeLatchOperationCompletionCallback(&latch, resp));
     queries.push_back(std::move(query));
   }
 
@@ -525,8 +671,8 @@ TEST_F_EX(TabletPeerTest, MaxRaftBatchProtobufLimit, TabletPeerProtofBufSizeLimi
   latch.Wait();
 
   for (size_t i = 0; i < responses.size(); ++i) {
-    const auto& resp = responses[i];
-    ASSERT_FALSE(responses[i].has_error()) << "\n Response[" << i << "]:\n" << resp.DebugString();
+    const auto& resp = *responses[i];
+    ASSERT_FALSE(resp.has_error()) << "\n Response[" << i << "]:\n" << resp.ShortDebugString();
   }
 
   ASSERT_OK(RollLog(tablet_peer_.get()));
@@ -534,7 +680,8 @@ TEST_F_EX(TabletPeerTest, MaxRaftBatchProtobufLimit, TabletPeerProtofBufSizeLimi
   auto* log = tablet_peer_->log();
 
   log::SegmentSequence segments;
-  ASSERT_OK(log->GetLogReader()->GetSegmentsSnapshot(&segments));
+  auto* log_reader = ASSERT_RESULT(log->GetLogReader());
+  ASSERT_OK(log_reader->GetSegmentsSnapshot(&segments));
 
   for (auto& segment : segments) {
     auto entries = segment->ReadEntries();
@@ -563,32 +710,235 @@ TEST_F_EX(TabletPeerTest, SingleOpExceedsRpcMsgLimit, TabletPeerProtofBufSizeLim
 
   std::string value(kValueSize, 'X');
 
-  WriteRequestPB req;
-  WriteResponsePB resp;
-  std::vector<std::unique_ptr<WriteQuery>> queries;
-  queries.reserve(1);
+  auto arena = SharedThreadSafeArena();
+  auto& req = *arena->NewArenaObject<tserver::LWWriteRequestPB>();
+  auto& resp = *arena->NewArenaObject<tserver::LWWriteResponsePB>();
   CountDownLatch latch(1);
 
   auto* const tablet_peer = tablet_peer_.get();
 
-  req.set_tablet_id(tablet()->tablet_id());
+  req.dup_tablet_id(tablet()->tablet_id());
   AddTestRowInsert(1, 1, value, &req);
-  auto query = std::make_unique<WriteQuery>(
-      /* leader_term = */ 1, CoarseTimePoint::max(), tablet_peer,
-      ASSERT_RESULT(tablet_peer->shared_tablet_safe()), nullptr, &resp);
-  query->set_client_request(req);
-  query->set_callback([&latch, &resp](const Status& status) {
-      if (!status.ok()) {
-      StatusToPB(status, resp.mutable_error()->mutable_status());
-    }
-    latch.CountDown();
-  });
+  auto query = CreateQuery(
+      tablet_peer, req, &resp, MakeLatchOperationCompletionCallback(&latch, &resp));
 
   tablet_peer->WriteAsync(std::move(query));
   latch.Wait();
 
-  ASSERT_TRUE(resp.has_error()) << "\n Response:\n" << resp.DebugString();
+  ASSERT_TRUE(resp.has_error()) << "\n Response:\n" << resp.ShortDebugString();
 }
 
-} // namespace tablet
-} // namespace yb
+class TabletBootstrapStateFlusherTest : public TabletPeerTest {
+ protected:
+  TabletBootstrapStateFlusherTest() : TabletPeerTest(GetSimpleTestSchema()) {}
+  void SetUp() override {
+    ANNOTATE_UNPROTECTED_WRITE(FLAGS_enable_flush_retryable_requests) = true;
+    TabletPeerTest::SetUp();
+    StartTabletPeer();
+  }
+
+  void StartTabletPeer() {
+    ConsensusBootstrapInfo info;
+    ASSERT_OK(StartPeer(info));
+  }
+
+  Status WaitForFlushState(TabletBootstrapFlushState state) {
+    return WaitFor([&] {
+      return tablet_peer_->TEST_TabletBootstrapStateFlusherState() == state;
+    }, 10s, Format("Wait for flush state to be $0", state));
+  }
+};
+
+TEST_F(TabletBootstrapStateFlusherTest, RejectFlushOrSubmitIfFlushingOrSubmitted) {
+  TestThreadHolder thread_holder;
+
+  // If a flush is in progress, the next flush or submit should just return with
+  // AlreadyPresent error.
+  ANNOTATE_UNPROTECTED_WRITE(FLAGS_TEST_pause_before_flushing_bootstrap_state) = true;
+  thread_holder.AddThreadFunctor([&] {
+    ASSERT_OK(tablet_peer_->FlushBootstrapState());
+  });
+  ASSERT_OK(WaitForFlushState(TabletBootstrapFlushState::kFlushing));
+  Status s = tablet_peer_->FlushBootstrapState();
+  ASSERT_TRUE(s.IsAlreadyPresent());
+  s = tablet_peer_->SubmitFlushBootstrapStateTask();
+  ASSERT_TRUE(s.IsAlreadyPresent());
+  ANNOTATE_UNPROTECTED_WRITE(FLAGS_TEST_pause_before_flushing_bootstrap_state) = false;
+  ASSERT_OK(WaitForFlushState(TabletBootstrapFlushState::kFlushIdle));
+
+  // If a flush is submitted, the next flush or submit should just return with AlreadyPresent error.
+  ANNOTATE_UNPROTECTED_WRITE(FLAGS_TEST_pause_before_submitting_flush_bootstrap_state) = true;
+  thread_holder.AddThreadFunctor([&] {
+    ASSERT_OK(tablet_peer_->SubmitFlushBootstrapStateTask());
+  });
+  ASSERT_OK(WaitForFlushState(TabletBootstrapFlushState::kFlushSubmitted));
+  s = tablet_peer_->FlushBootstrapState();
+  ASSERT_TRUE(s.IsAlreadyPresent());
+  s = tablet_peer_->SubmitFlushBootstrapStateTask();
+  ASSERT_TRUE(s.IsAlreadyPresent());
+  ANNOTATE_UNPROTECTED_WRITE(FLAGS_TEST_pause_before_submitting_flush_bootstrap_state) = false;
+  ASSERT_OK(WaitForFlushState(TabletBootstrapFlushState::kFlushIdle));
+
+  thread_holder.WaitAndStop(10s);
+}
+
+TEST_F(TabletBootstrapStateFlusherTest, WaitFlushDoneBeforeCopy) {
+  TestThreadHolder thread_holder;
+
+  // If a flush is in progress, the next copy should wait for flush done.
+  ANNOTATE_UNPROTECTED_WRITE(FLAGS_TEST_pause_before_flushing_bootstrap_state) = true;
+  thread_holder.AddThreadFunctor([&] {
+    ASSERT_OK(tablet_peer_->FlushBootstrapState());
+  });
+  ASSERT_OK(WaitForFlushState(TabletBootstrapFlushState::kFlushing));
+  thread_holder.AddThreadFunctor([&] {
+    // There's no data to flush, so CopyBootstrapStateTo should do nothing.
+    auto res = tablet_peer_->CopyBootstrapStateTo("fake_path");
+    ASSERT_FALSE(res.ok());
+    ASSERT_TRUE(res.status().IsNotFound());
+    ASSERT_TRUE(res.status().message().Contains("Bootstrap state has not been flushed"));
+  });
+  SleepFor(1s);
+  ANNOTATE_UNPROTECTED_WRITE(FLAGS_TEST_pause_before_flushing_bootstrap_state) = false;
+  ASSERT_OK(WaitForFlushState(TabletBootstrapFlushState::kFlushIdle));
+  thread_holder.WaitAndStop(10s);
+
+  // If a submit is in progress, the next copy should wait for flush done.
+  ANNOTATE_UNPROTECTED_WRITE(FLAGS_TEST_pause_before_submitting_flush_bootstrap_state) = true;
+  thread_holder.AddThreadFunctor([&] {
+    ASSERT_OK(tablet_peer_->SubmitFlushBootstrapStateTask());
+  });
+  ASSERT_OK(WaitForFlushState(TabletBootstrapFlushState::kFlushSubmitted));
+  thread_holder.AddThreadFunctor([&] {
+    // There's no data to flush, so CopyBootstrapStateTo should do nothing.
+    auto res = tablet_peer_->CopyBootstrapStateTo("fake_path");
+    ASSERT_FALSE(res.ok());
+    ASSERT_TRUE(res.status().IsNotFound());
+    ASSERT_TRUE(res.status().message().Contains("Bootstrap state has not been flushed"));
+  });
+  SleepFor(1s);
+  ANNOTATE_UNPROTECTED_WRITE(FLAGS_TEST_pause_before_submitting_flush_bootstrap_state) = false;
+  ASSERT_OK(WaitForFlushState(TabletBootstrapFlushState::kFlushIdle));
+
+  thread_holder.WaitAndStop(10s);
+}
+
+TEST_F(TabletBootstrapStateFlusherTest, WaitCopyDoneBeforeFlushOrSubmit) {
+  TestThreadHolder thread_holder;
+
+  std::atomic<int> finish_order{0};
+  // If a flush is in progress, the next copy should wait for flush done.
+  ANNOTATE_UNPROTECTED_WRITE(FLAGS_TEST_pause_before_copying_bootstrap_state) = true;
+  thread_holder.AddThreadFunctor([&] {
+    auto res = tablet_peer_->CopyBootstrapStateTo("fake_path");
+    ASSERT_FALSE(res.ok());
+    ASSERT_TRUE(res.status().IsNotFound());
+    ASSERT_TRUE(res.status().message().Contains("Bootstrap state has not been flushed"));
+    auto order = finish_order.fetch_add(1);
+    ASSERT_EQ(order, 0);
+  });
+  ASSERT_OK(WaitForFlushState(TabletBootstrapFlushState::kReading));
+  thread_holder.AddThreadFunctor([&] {
+    ASSERT_OK(tablet_peer_->FlushBootstrapState());
+    auto order = finish_order.fetch_add(1);
+    ASSERT_EQ(order, 1);
+  });
+  SleepFor(1s);
+  ANNOTATE_UNPROTECTED_WRITE(FLAGS_TEST_pause_before_copying_bootstrap_state) = false;
+  ASSERT_OK(WaitForFlushState(TabletBootstrapFlushState::kFlushIdle));
+  thread_holder.WaitAndStop(10s);
+
+  finish_order.store(0);
+  ANNOTATE_UNPROTECTED_WRITE(FLAGS_TEST_pause_before_copying_bootstrap_state) = true;
+  thread_holder.AddThreadFunctor([&] {
+    auto res = tablet_peer_->CopyBootstrapStateTo("fake_path");
+    ASSERT_FALSE(res.ok());
+    ASSERT_TRUE(res.status().IsNotFound());
+    ASSERT_TRUE(res.status().message().Contains("Bootstrap state has not been flushed"));
+    auto order = finish_order.fetch_add(1);
+    ASSERT_EQ(order, 0);
+  });
+  ASSERT_OK(WaitForFlushState(TabletBootstrapFlushState::kReading));
+  thread_holder.AddThreadFunctor([&] {
+    ASSERT_OK(tablet_peer_->SubmitFlushBootstrapStateTask());
+    auto order = finish_order.fetch_add(1);
+    ASSERT_EQ(order, 1);
+  });
+  SleepFor(1s);
+  ANNOTATE_UNPROTECTED_WRITE(FLAGS_TEST_pause_before_copying_bootstrap_state) = false;
+  ASSERT_OK(WaitForFlushState(TabletBootstrapFlushState::kFlushIdle));
+
+  thread_holder.WaitAndStop(10s);
+}
+
+TEST_F(TabletBootstrapStateFlusherTest, WaitFlushIdleBeforeShutdown) {
+  TestThreadHolder thread_holder;
+
+  std::atomic<int> finish_order{0};
+  ANNOTATE_UNPROTECTED_WRITE(FLAGS_TEST_pause_before_flushing_bootstrap_state) = true;
+  thread_holder.AddThreadFunctor([&] {
+    Status s = tablet_peer_->FlushBootstrapState();
+    ASSERT_TRUE(s.ok() || s.IsIllegalState());
+    auto order = finish_order.fetch_add(1);
+    ASSERT_EQ(order, 0);
+  });
+  ASSERT_OK(WaitForFlushState(TabletBootstrapFlushState::kFlushing));
+  thread_holder.AddThreadFunctor([&] {
+    WARN_NOT_OK(
+        tablet_peer_->Shutdown(
+            ShouldAbortActiveTransactions::kFalse, DisableFlushOnShutdown::kFalse),
+            "Tablet peer shutdown failed");
+    auto order = finish_order.fetch_add(1);
+    ASSERT_EQ(order, 1);
+  });
+  SleepFor(1s);
+  ANNOTATE_UNPROTECTED_WRITE(FLAGS_TEST_pause_before_flushing_bootstrap_state) = false;
+
+  thread_holder.WaitAndStop(10s);
+}
+
+class TabletBootstrapStateFlusherWithLargeBatchTest : public TabletBootstrapStateFlusherTest {
+ protected:
+  void SetUp() override {
+    ANNOTATE_UNPROTECTED_WRITE(FLAGS_log_segment_size_bytes) = 5_KB;
+    ANNOTATE_UNPROTECTED_WRITE(FLAGS_initial_log_segment_size_bytes) = 1_KB;
+    TabletBootstrapStateFlusherTest::SetUp();
+  }
+};
+
+TEST_F_EX(TabletBootstrapStateFlusherTest,
+          TestLogRolloverWithSingleBatch,
+          TabletBootstrapStateFlusherWithLargeBatchTest) {
+  const int kNumOps = 100;
+  std::string value(ANNOTATE_UNPROTECTED_READ(FLAGS_log_segment_size_bytes) + 1, 'X');
+
+  auto arena = SharedThreadSafeArena();
+  std::vector<std::unique_ptr<WriteQuery>> queries;
+  queries.reserve(kNumOps);
+  CountDownLatch latch(kNumOps);
+
+  auto* const tablet_peer = tablet_peer_.get();
+
+  for (int i = 0; i < kNumOps; ++i) {
+    auto* req = arena->NewArenaObject<tserver::LWWriteRequestPB>();
+    auto* resp = arena->NewArenaObject<tserver::LWWriteResponsePB>();
+
+    req->dup_tablet_id(tablet()->tablet_id());
+    AddTestRowInsert(i, i, value, req);
+    auto query = CreateQuery(
+        tablet_peer, *req, resp, MakeLatchOperationCompletionCallback(&latch, resp));
+    queries.push_back(std::move(query));
+  }
+
+  // Pause at the first flush, and following submission or flush should be skipped.
+  // Otherwise, it will cause deadlock, see https://github.com/yugabyte/yugabyte-db/issues/18946
+  ANNOTATE_UNPROTECTED_WRITE(FLAGS_TEST_pause_before_flushing_bootstrap_state) = true;
+  for (auto& query : queries) {
+    tablet_peer->WriteAsync(std::move(query));
+    SleepFor(10ms);
+  }
+  latch.Wait();
+  ANNOTATE_UNPROTECTED_WRITE(FLAGS_TEST_pause_before_flushing_bootstrap_state) = false;
+}
+
+} // namespace yb::tablet

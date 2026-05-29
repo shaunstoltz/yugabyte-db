@@ -6,9 +6,9 @@
 // Use of this source code is governed by a BSD-style license that can be
 // found in the LICENSE file. See the AUTHORS file for names of contributors.
 //
-// The following only applies to changes made to this file as part of YugaByte development.
+// The following only applies to changes made to this file as part of YugabyteDB development.
 //
-// Portions Copyright (c) YugaByte, Inc.
+// Portions Copyright (c) YugabyteDB, Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License"); you may not use this file except
 // in compliance with the License.  You may obtain a copy of the License at
@@ -27,9 +27,12 @@
 #include <string>
 #include <vector>
 
-#include "yb/util/slice.h"
 #include "yb/rocksdb/metadata.h"
 #include "yb/rocksdb/db/version_edit.h"
+
+#include "yb/storage/storage_types.h"
+
+#include "yb/util/slice.h"
 
 namespace rocksdb {
 
@@ -47,7 +50,7 @@ struct CompactionFilterContext {
 // CompactionFilter allows an application to modify/delete a key-value at
 // the time of compaction.
 
-YB_DEFINE_ENUM(FilterDecision, (kKeep)(kDiscard));
+using FilterDecision = yb::storage::FilterDecision;
 
 class CompactionFilter {
  public:

@@ -3,9 +3,9 @@
 //  LICENSE file in the root directory of this source tree. An additional grant
 //  of patent rights can be found in the PATENTS file in the same directory.
 //
-// The following only applies to changes made to this file as part of YugaByte development.
+// The following only applies to changes made to this file as part of YugabyteDB development.
 //
-// Portions Copyright (c) YugaByte, Inc.
+// Portions Copyright (c) YugabyteDB, Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License"); you may not use this file except
 // in compliance with the License.  You may obtain a copy of the License at
@@ -329,6 +329,7 @@ class MemTable {
   // After MarkImmutable() is called, you should not attempt to
   // write anything to this MemTable().  (Ie. do not call Add() or Update()).
   void MarkImmutable() {
+    immutable_ = true;
     table_->MarkReadOnly();
     allocator_.DoneAllocating();
   }
@@ -355,24 +356,27 @@ class MemTable {
 
   const MemTableOptions* GetMemTableOptions() const { return &moptions_; }
 
-  void UpdateFrontiers(const UserFrontiers& value) {
-    std::lock_guard<SpinMutex> l(frontiers_mutex_);
-    if (frontiers_) {
-      frontiers_->MergeFrontiers(value);
-    } else {
-      frontiers_ = value.Clone();
-    }
+  void UpdateFrontiers(const yb::storage::UserFrontiers& value) {
+    std::lock_guard l(frontiers_mutex_);
+    yb::storage::UpdateFrontiers(frontiers_, value);
   }
 
-  UserFrontierPtr GetFrontier(UpdateUserValueType type) const;
+  // Frontiers accessors might return stale frontiers if invoked after records have been written to
+  // the memtable, but before frontiers are updated.
+  yb::storage::UserFrontierPtr GetFrontier(yb::storage::UpdateUserValueType type) const;
+  UserFrontierRange GetFrontiers() const;
 
-  const UserFrontiers* Frontiers() const { return frontiers_.get(); }
+  const yb::storage::UserFrontiers* Frontiers() const;
 
   std::string ToString() const;
 
   bool FullyErased() const {
     return num_entries_.load(std::memory_order_acquire) ==
            num_erased_.load(std::memory_order_acquire);
+  }
+
+  uint64_t data_size() const {
+    return data_size_.load(std::memory_order_relaxed);
   }
 
  private:
@@ -388,6 +392,7 @@ class MemTable {
   ConcurrentArena arena_;
   MemTableAllocator allocator_;
   std::unique_ptr<MemTableRep> table_;
+  std::atomic<bool> immutable_{false};
 
   // Total data size of all data inserted
   std::atomic<uint64_t> data_size_;
@@ -430,7 +435,7 @@ class MemTable {
   Env* env_;
 
   mutable SpinMutex frontiers_mutex_;
-  std::unique_ptr<UserFrontiers> frontiers_;
+  yb::storage::UserFrontiersPtr frontiers_;
 
   // Returns a heuristic flush decision
   bool ShouldFlushNow() const;

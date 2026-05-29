@@ -1,20 +1,18 @@
-// Copyright (c) YugaByte, Inc.
+// Copyright (c) YugabyteDB, Inc.
 
 package com.yugabyte.yw.models.configs.data;
 
 import com.fasterxml.jackson.annotation.JsonFormat;
-import com.fasterxml.jackson.annotation.JsonInclude;
-import com.fasterxml.jackson.annotation.JsonProperty;
-import com.fasterxml.jackson.annotation.JsonUnwrapped;
 import com.fasterxml.jackson.annotation.JsonFormat.Shape;
 import com.fasterxml.jackson.annotation.JsonInclude.Include;
+import com.fasterxml.jackson.annotation.JsonProperty;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.yugabyte.yw.common.IAMTemporaryCredentialsProvider.IAMCredentialSource;
-
+import com.yugabyte.yw.models.common.YbaApi;
+import com.yugabyte.yw.models.common.YbaApi.YbaApiVisibility;
 import io.swagger.annotations.ApiModelProperty;
 import java.util.List;
 import java.util.Map;
-
 import javax.validation.Valid;
 import javax.validation.constraints.Max;
 import javax.validation.constraints.Min;
@@ -36,13 +34,20 @@ public class CustomerConfigStorageS3Data extends CustomerConfigStorageData {
   @JsonProperty("AWS_HOST_BASE")
   public String awsHostBase;
 
+  @JsonProperty("GLOBAL_BUCKET_ACCESS")
+  public boolean globalBucketAccess = true;
+
   @ApiModelProperty(value = "path style access boolean")
   @JsonProperty("PATH_STYLE_ACCESS")
   public boolean isPathStyleAccess = false;
 
-  @ApiModelProperty(value = "AWS fallback region if region-chaining fails.")
+  @ApiModelProperty(value = "Use chunked encoding for S3 requests")
+  @JsonProperty("USE_CHUNKED_ENCODING")
+  public boolean useChunkedEncoding = true;
+
+  @ApiModelProperty(value = "AWS signing region for S3 requests")
   @JsonProperty("SIGNING_REGION")
-  public String fallbackRegion = "us-east-1";
+  public String fallbackRegion;
 
   @ApiModelProperty(value = "IAM Instance profile")
   @JsonProperty("IAM_INSTANCE_PROFILE")
@@ -57,7 +62,11 @@ public class CustomerConfigStorageS3Data extends CustomerConfigStorageData {
   @JsonProperty("REGION_LOCATIONS")
   public List<RegionLocations> regionLocations;
 
-  @ApiModelProperty(value = "Proxy settings")
+  @ApiModelProperty(
+      value =
+          "<b style=\"color:#ff0000\">Deprecated since YBA version 2.20.3.0.</b>."
+              + " Use userIntent.proxySettings instead. </b>. Proxy settings")
+  @YbaApi(visibility = YbaApiVisibility.DEPRECATED, sinceYBAVersion = "2.20.3.0")
   @JsonProperty("PROXY_SETTINGS")
   @Valid
   public ProxySetting proxySetting;
@@ -66,6 +75,13 @@ public class CustomerConfigStorageS3Data extends CustomerConfigStorageData {
     @ApiModelProperty(value = "AWS host base", example = "s3.amazonaws.com")
     @JsonProperty("AWS_HOST_BASE")
     public String awsHostBase;
+
+    @JsonProperty("GLOBAL_BUCKET_ACCESS")
+    public boolean globalBucketAccess = true;
+
+    @ApiModelProperty(value = "AWS signing region for S3 requests")
+    @JsonProperty("SIGNING_REGION")
+    public String fallbackRegion;
   }
 
   public static class IAMConfiguration {
@@ -84,6 +100,10 @@ public class CustomerConfigStorageS3Data extends CustomerConfigStorageData {
     @ApiModelProperty(value = "Use global/regional STS")
     @JsonProperty("REGIONAL_STS")
     public boolean regionalSTS = true;
+
+    @ApiModelProperty("Region for STS endpoint")
+    @JsonProperty("STS_REGION")
+    public String stsRegion;
   }
 
   public static class ProxySetting {

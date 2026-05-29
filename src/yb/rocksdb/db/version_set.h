@@ -3,9 +3,9 @@
 //  LICENSE file in the root directory of this source tree. An additional grant
 //  of patent rights can be found in the PATENTS file in the same directory.
 //
-// The following only applies to changes made to this file as part of YugaByte development.
+// The following only applies to changes made to this file as part of YugabyteDB development.
 //
-// Portions Copyright (c) YugaByte, Inc.
+// Portions Copyright (c) YugabyteDB, Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License"); you may not use this file except
 // in compliance with the License.  You may obtain a copy of the License at
@@ -44,6 +44,8 @@
 #include <utility>
 #include <vector>
 
+#include "yb/rocksdb/rocksdb_fwd.h"
+
 #include "yb/rocksdb/db/dbformat.h"
 #include "yb/rocksdb/db/version_builder.h"
 #include "yb/rocksdb/db/version_edit.h"
@@ -63,20 +65,19 @@ namespace log {
 class Writer;
 }
 
+class ColumnFamilyData;
+class ColumnFamilySet;
 class Compaction;
+class FileNumbersProvider;
 class InternalIterator;
 class LogBuffer;
 class LookupKey;
 class MemTable;
+class MergeContext;
+class TableCache;
 class Version;
 class VersionSet;
 class WriteBuffer;
-class MergeContext;
-class ColumnFamilyData;
-class ColumnFamilySet;
-class TableCache;
-class MergeIteratorBuilder;
-class FileNumbersProvider;
 
 // Return the smallest index i such that file_level.files[i]->largest >= key.
 // Return file_level.num_files if there is no such file.
@@ -442,6 +443,10 @@ class Version {
   // REQUIRES: This version has been saved (see VersionSet::SaveTo)
   void AddIterators(const ReadOptions&, const EnvOptions& soptions,
                     MergeIteratorBuilder* merger_iter_builder);
+  template<typename MergeIteratorBuilderType>
+  void AddIndexIterators(
+      const ReadOptions& read_options, const EnvOptions& soptions,
+      MergeIteratorBuilderType* merge_iter_builder);
 
   // Lookup the value for key.  If found, store it in *val and
   // return OK.  Else return a non-OK status.
@@ -518,7 +523,7 @@ class Version {
   // Returns weighted middle key of the approximate middle keys of the SST files
   // (see TableReader::GetMiddleKey).
   // Returns Status(Incomplete) if there are no SST files for this version.
-  Result<std::string> GetMiddleKey();
+  Result<std::string> GetMiddleKey(Slice lower_bound_internal_key);
 
   // Returns a table reader for the largest SST file.
   Result<TableReader*> TEST_GetLargestSstTableReader();
@@ -572,7 +577,19 @@ class Version {
   void UpdateFilesByCompactionPri();
 
   Result<TableCache::TableReaderWithHandle> GetLargestSstTableReader();
-  Result<std::string> GetMiddleOfMiddleKeys();
+
+  // The second component of the return value is true iff there are not enough entries in the file
+  // to detect the middle point. In this case, the first component must contain a non-OK status.
+  std::tuple<Result<std::string>, bool> GetMiddleKeyFromFile(
+      const FileMetaData& file, Slice lower_bound);
+
+  template <typename IteratorBuilder, typename CreateIteratorFunc>
+  void AddLevel0Iterators(
+      const ReadOptions& read_options,
+      const EnvOptions& soptions,
+      IteratorBuilder* merge_iter_builder,
+      Arena* arena,
+      const CreateIteratorFunc& create_iterator_func);
 
   ColumnFamilyData* cfd_;  // ColumnFamilyData to which this Version belongs
   Logger* info_log_;
@@ -680,7 +697,7 @@ class VersionSet {
     return last_sequence_.load(std::memory_order_acquire);
   }
 
-  UserFrontier* FlushedFrontier() const {
+  yb::storage::UserFrontier* FlushedFrontier() const {
     return flushed_frontier_.get();
   }
 
@@ -695,7 +712,7 @@ class VersionSet {
   // supplied values for each dimension. This will DFATAL in case the supplied frontier regresses
   // relative to the current frontier in any of its dimensions which have non-default (defined)
   // values.
-  void UpdateFlushedFrontier(UserFrontierPtr values);
+  void UpdateFlushedFrontier(yb::storage::UserFrontierPtr values, FrontierModificationMode mode);
 
   // Mark the specified file number as used.
   // REQUIRED: this is only called during single-threaded recovery
@@ -779,7 +796,7 @@ class VersionSet {
   uint64_t ApproximateSize(Version* v, const FdWithBoundaries& f, const Slice& key);
 
   // Save current contents to *log
-  Status WriteSnapshot(log::Writer* log, UserFrontierPtr flushed_frontier_override);
+  Status WriteSnapshot(log::Writer* log, yb::storage::UserFrontierPtr flushed_frontier_override);
 
   void AppendVersion(ColumnFamilyData* column_family_data, Version* v);
 
@@ -789,9 +806,9 @@ class VersionSet {
   static void EnsureNonDecreasingLastSequence(
       SequenceNumber prev_last_seq, SequenceNumber new_last_seq);
   static void EnsureNonDecreasingFlushedFrontier(
-      const UserFrontier* prev_value, const UserFrontier& new_value);
+      const yb::storage::UserFrontier* prev_value, const yb::storage::UserFrontier& new_value);
 
-  void UpdateFlushedFrontierNoSanityChecking(UserFrontierPtr values);
+  void UpdateFlushedFrontierNoSanityChecking(yb::storage::UserFrontierPtr values);
 
   std::unique_ptr<ColumnFamilySet> column_family_set_;
 
@@ -803,7 +820,7 @@ class VersionSet {
   uint64_t pending_manifest_file_number_ = 0;
   std::atomic<uint64_t> last_sequence_ = {0};
   uint64_t prev_log_number_ = 0; // 0 or backing store for memtable being compacted
-  UserFrontierPtr flushed_frontier_;
+  yb::storage::UserFrontierPtr flushed_frontier_;
 
   // Opened lazily
   std::unique_ptr<log::Writer> descriptor_log_;

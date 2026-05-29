@@ -1,4 +1,4 @@
-// Copyright (c) YugaByte, Inc.
+// Copyright (c) YugabyteDB, Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License"); you may not use this file except
 // in compliance with the License.  You may obtain a copy of the License at
@@ -17,9 +17,8 @@
 #include <future>
 
 #include "yb/util/flags.h"
-#include <glog/logging.h>
+#include "yb/util/logging.h"
 
-#include "yb/client/callbacks.h"
 #include "yb/client/client.h"
 #include "yb/client/table.h"
 #include "yb/client/tablet_server.h"
@@ -45,28 +44,12 @@ using namespace std::literals;
 
 using std::string;
 using std::vector;
-using std::unique_ptr;
-
-using yb::client::YBValue;
-
-using std::shared_ptr;
 
 DECLARE_int32(log_cache_size_limit_mb);
 DECLARE_int32(global_log_cache_size_limit_mb);
 
 namespace yb {
 namespace integration_tests {
-
-using client::YBClient;
-using client::YBClientBuilder;
-using client::YBColumnSchema;
-using client::YBSchema;
-using client::YBSchemaBuilder;
-using client::YBSession;
-using client::YBStatusMemberCallback;
-using client::YBTable;
-using client::YBTableCreator;
-using strings::Split;
 
 class KVTableTest : public YBTableTestBase {
  protected:
@@ -212,8 +195,8 @@ class KVTableSingleTabletTest : public KVTableTest {
   }
 
   void SetUp() override {
-    FLAGS_global_log_cache_size_limit_mb = 1;
-    FLAGS_log_cache_size_limit_mb = 1;
+    ANNOTATE_UNPROTECTED_WRITE(FLAGS_global_log_cache_size_limit_mb) = 1;
+    ANNOTATE_UNPROTECTED_WRITE(FLAGS_log_cache_size_limit_mb) = 1;
     KVTableTest::SetUp();
   }
 };
@@ -225,7 +208,7 @@ class KVTableSingleTabletTest : public KVTableTest {
 // after this tservers joined raft group again.
 //
 // Also check that we track such operations.
-TEST_F_EX(KVTableTest, BigValues, KVTableSingleTabletTest) {
+TEST_F_EX(KVTableTest, YB_DISABLE_TEST_ON_MACOS(BigValues), KVTableSingleTabletTest) {
   std::atomic_bool stop_requested_flag(false);
   SetFlagOnExit set_flag_on_exit(&stop_requested_flag);
   int rows = 100;
@@ -248,7 +231,7 @@ TEST_F_EX(KVTableTest, BigValues, KVTableSingleTabletTest) {
   while (writer.num_writes() - start_writes < 50) {
     std::this_thread::sleep_for(100ms);
   }
-  ASSERT_OK(mini_cluster_->mini_tablet_server(1)->Start());
+  ASSERT_OK(mini_cluster_->mini_tablet_server(1)->Start(tserver::WaitTabletsBootstrapped::kFalse));
 
   ASSERT_OK(WaitFor([] {
     std::vector<MemTrackerData> trackers;

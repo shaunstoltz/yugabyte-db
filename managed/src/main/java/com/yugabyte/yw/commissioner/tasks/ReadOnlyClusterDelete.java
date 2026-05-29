@@ -1,5 +1,5 @@
 /*
- * Copyright 2019 YugaByte, Inc. and Contributors
+ * Copyright 2019 YugabyteDB, Inc. and Contributors
  *
  * Licensed under the Polyform Free Trial License 1.0.0 (the "License"); you
  * may not use this file except in compliance with the License. You
@@ -10,9 +10,13 @@
 
 package com.yugabyte.yw.commissioner.tasks;
 
+import com.fasterxml.jackson.databind.annotation.JsonDeserialize;
 import com.yugabyte.yw.commissioner.BaseTaskDependencies;
+import com.yugabyte.yw.commissioner.ITask.Abortable;
+import com.yugabyte.yw.commissioner.ITask.Retryable;
 import com.yugabyte.yw.commissioner.UserTaskDetails.SubTaskGroupType;
-import com.yugabyte.yw.common.DnsManager;
+import com.yugabyte.yw.common.DnsManager.DnsCommandType;
+import com.yugabyte.yw.common.UniverseInProgressException;
 import com.yugabyte.yw.forms.UniverseDefinitionTaskParams;
 import com.yugabyte.yw.forms.UniverseDefinitionTaskParams.Cluster;
 import com.yugabyte.yw.models.Universe;
@@ -26,6 +30,8 @@ import lombok.extern.slf4j.Slf4j;
 
 // Tracks a read only cluster delete intent from a universe.
 @Slf4j
+@Abortable
+@Retryable
 public class ReadOnlyClusterDelete extends UniverseDefinitionTaskBase {
 
   @Inject
@@ -33,9 +39,12 @@ public class ReadOnlyClusterDelete extends UniverseDefinitionTaskBase {
     super(baseTaskDependencies);
   }
 
+  @JsonDeserialize(converter = Params.Converter.class)
   public static class Params extends UniverseDefinitionTaskParams {
     public UUID clusterUUID;
     public Boolean isForceDelete = false;
+
+    public static class Converter extends BaseConverter<Params> {}
   }
 
   public Params params() {
@@ -43,56 +52,68 @@ public class ReadOnlyClusterDelete extends UniverseDefinitionTaskBase {
   }
 
   @Override
-  public void run() {
-    log.info("Started {} task for uuid={}", getName(), params().universeUUID);
-
+  protected void validateUniverseState(Universe universe) {
     try {
-
-      // Set the 'updateInProgress' flag to prevent other updates from happening.
-      Universe universe = null;
-      if (params().isForceDelete) {
-        universe = forceLockUniverseForUpdate(-1 /* expectedUniverseVersion */);
-      } else {
-        universe = lockUniverseForUpdate(params().expectedUniverseVersion);
+      super.validateUniverseState(universe);
+    } catch (UniverseInProgressException e) {
+      if (!params().isForceDelete) {
+        throw e;
       }
+    }
+  }
 
-      List<Cluster> roClusters = universe.getUniverseDetails().getReadOnlyClusters();
-      if (Collections.isEmpty(roClusters)) {
-        String msg =
-            "Unable to delete RO cluster from universe \""
-                + universe.name
-                + "\" as it doesn't have any RO clusters.";
-        log.error(msg);
-        throw new RuntimeException(msg);
-      }
+  @Override
+  protected void createPrecheckTasks(Universe universe) {
+    List<Cluster> roClusters = universe.getUniverseDetails().getReadOnlyClusters();
+    if (isFirstTry() && Collections.isEmpty(roClusters)) {
+      String msg =
+          "Unable to delete RO cluster from universe \""
+              + universe.getName()
+              + "\" as it doesn't have any RO clusters.";
+      log.error(msg);
+      throw new RuntimeException(msg);
+    }
+    addBasicPrecheckTasks();
+  }
+
+  @Override
+  public void run() {
+    log.info("Started {} task for uuid={}", getName(), params().getUniverseUUID());
+
+    Universe universe =
+        lockAndFreezeUniverseForUpdate(params().expectedUniverseVersion, null /* Txn callback */);
+    try {
 
       preTaskActions();
 
       // Delete all the read-only cluster nodes.
-      Cluster cluster = roClusters.get(0);
-      Collection<NodeDetails> nodesToBeRemoved = universe.getNodesInCluster(cluster.uuid);
-      // Set the node states to Removing.
-      createSetNodeStateTasks(nodesToBeRemoved, NodeDetails.NodeState.Terminating)
-          .setSubTaskGroupType(SubTaskGroupType.RemovingUnusedServers);
-      createDestroyServerTasks(
-              universe,
-              nodesToBeRemoved,
-              params().isForceDelete,
-              true /* deleteNodeFromDB */,
-              true /* deleteRootVolumes */)
-          .setSubTaskGroupType(SubTaskGroupType.RemovingUnusedServers);
+      List<Cluster> roClusters = universe.getUniverseDetails().getReadOnlyClusters();
+      if (roClusters.size() > 0) {
+        Cluster cluster = roClusters.get(0);
+        Collection<NodeDetails> nodesToBeRemoved = universe.getNodesInCluster(cluster.uuid);
+        // Set the node states to Removing.
+        createSetNodeStateTasks(nodesToBeRemoved, NodeDetails.NodeState.Terminating)
+            .setSubTaskGroupType(SubTaskGroupType.RemovingUnusedServers);
+        createDestroyServerTasks(
+                universe,
+                nodesToBeRemoved,
+                node -> params().isForceDelete,
+                true /* deleteNodeFromDB */,
+                true /* deleteRootVolumes */,
+                true /* skipDestroyPrecheck */)
+            .setSubTaskGroupType(SubTaskGroupType.RemovingUnusedServers);
 
-      // Remove the cluster entry from the universe db entry.
-      createDeleteClusterFromUniverseTask(params().clusterUUID)
-          .setSubTaskGroupType(SubTaskGroupType.RemovingUnusedServers);
+        // Remove the cluster entry from the universe db entry.
+        createDeleteClusterFromUniverseTask(params().clusterUUID)
+            .setSubTaskGroupType(SubTaskGroupType.RemovingUnusedServers);
+      }
 
       // Remove the async_replicas in the cluster config on master leader.
       createPlacementInfoTask(null /* blacklistNodes */)
           .setSubTaskGroupType(SubTaskGroupType.ConfigureUniverse);
 
-      // Remove the DNS entry for this cluster.
-      createDnsManipulationTask(
-              DnsManager.DnsCommandType.Delete, params().isForceDelete, cluster.userIntent)
+      // Remove read replica nodes from the DNS entry.
+      createDnsManipulationTask(DnsCommandType.Edit, false, universe)
           .setSubTaskGroupType(SubTaskGroupType.RemovingUnusedServers);
 
       // Update the swamper target file.

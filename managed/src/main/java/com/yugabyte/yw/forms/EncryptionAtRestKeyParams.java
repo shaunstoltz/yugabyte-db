@@ -1,5 +1,5 @@
 /*
- * Copyright 2019 YugaByte, Inc. and Contributors
+ * Copyright 2019 YugabyteDB, Inc. and Contributors
  *
  * Licensed under the Polyform Free Trial License 1.0.0 (the "License"); you
  * may not use this file except in compliance with the License. You
@@ -24,7 +24,7 @@ public class EncryptionAtRestKeyParams extends UniverseTaskParams {
   public static EncryptionAtRestKeyParams bindFromFormData(
       UUID universeUUID, Http.Request request) {
     EncryptionAtRestKeyParams taskParams = new EncryptionAtRestKeyParams();
-    taskParams.universeUUID = universeUUID;
+    taskParams.setUniverseUUID(universeUUID);
     try {
       taskParams.encryptionAtRestConfig =
           Json.mapper().treeToValue(request.body().asJson(), EncryptionAtRestConfig.class);

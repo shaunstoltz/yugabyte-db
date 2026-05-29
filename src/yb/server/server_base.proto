@@ -15,9 +15,9 @@
 // specific language governing permissions and limitations
 // under the License.
 //
-// The following only applies to changes made to this file as part of YugaByte development.
+// The following only applies to changes made to this file as part of YugabyteDB development.
 //
-// Portions Copyright (c) YugaByte, Inc.
+// Portions Copyright (c) YugabyteDB, Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License"); you may not use this file except
 // in compliance with the License.  You may obtain a copy of the License at
@@ -37,7 +37,7 @@ option java_package = "org.yb.server";
 
 import "yb/common/common_net.proto";
 import "yb/common/wire_protocol.proto";
-import "yb/util/version_info.proto";
+import "yb/common/version_info.proto";
 
 // The status information dumped by a server after it starts.
 //
@@ -155,12 +155,35 @@ message GetAutoFlagsConfigVersionResponsePB {
   required uint32 config_version = 1;
 }
 
+message ValidateFlagValueRequestPB {
+  // Legacy single-flag fields. Still supported for backward compatibility.
+  // Cannot be specified together with the batch 'flags' field.
+  optional string flag_name = 1;
+  optional string flag_value = 2;
+
+  // Batch validation: list of flags to validate.
+  message FlagValuePB {
+    required string name = 1;
+    required string value = 2;
+  }
+  repeated FlagValuePB flags = 3;
+}
+
+message ValidateFlagValueResponsePB {
+  // Per-flag validation errors. Only flags that failed validation appear here.
+  // Empty means all flags are valid. Key is the flag name, value is the error message.
+  map<string, string> errors = 1;
+}
+
 service GenericService {
   rpc SetFlag(SetFlagRequestPB)
     returns (SetFlagResponsePB);
 
   rpc GetFlag(GetFlagRequestPB)
     returns (GetFlagResponsePB);
+
+  rpc ValidateFlagValue(ValidateFlagValueRequestPB)
+      returns (ValidateFlagValueResponsePB);
 
   rpc RefreshFlags(RefreshFlagsRequestPB)
     returns (RefreshFlagsResponsePB);

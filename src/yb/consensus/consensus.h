@@ -15,9 +15,9 @@
 // specific language governing permissions and limitations
 // under the License.
 //
-// The following only applies to changes made to this file as part of YugaByte development.
+// The following only applies to changes made to this file as part of YugabyteDB development.
 //
-// Portions Copyright (c) YugaByte, Inc.
+// Portions Copyright (c) YugabyteDB, Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License"); you may not use this file except
 // in compliance with the License.  You may obtain a copy of the License at
@@ -33,14 +33,17 @@
 
 #include <iosfwd>
 #include <memory>
+#include <optional>
 #include <string>
 #include <vector>
 
-#include <boost/optional/optional_fwd.hpp>
-
 #include "yb/common/entity_ids_types.h"
+#include "yb/common/opid.h"
+#include "yb/common/opid.pb.h"
 
 #include "yb/consensus/consensus_fwd.h"
+#include "yb/consensus/consensus_meta.h"
+#include "yb/consensus/consensus_types.h"
 #include "yb/consensus/consensus_types.pb.h"
 #include "yb/consensus/metadata.pb.h"
 
@@ -55,8 +58,6 @@
 #include "yb/util/status_fwd.h"
 #include "yb/util/enums.h"
 #include "yb/util/monotime.h"
-#include "yb/util/opid.h"
-#include "yb/util/opid.pb.h"
 #include "yb/util/physical_time.h"
 #include "yb/util/status_callback.h"
 #include "yb/util/strongly_typed_bool.h"
@@ -80,13 +81,13 @@ namespace consensus {
 // After completing bootstrap, some of the results need to be plumbed through
 // into the consensus implementation.
 struct ConsensusBootstrapInfo {
-  ConsensusBootstrapInfo();
+  ConsensusBootstrapInfo() = default;
 
   // The id of the last operation in the log
-  OpIdPB last_id;
+  OpId last_id = OpId::Min();
 
   // The id of the last committed operation in the log.
-  OpIdPB last_committed_id;
+  OpId last_committed_id = OpId::Min();
 
   // REPLICATE messages which were in the log with no accompanying
   // COMMIT. These need to be passed along to consensus init in order
@@ -170,7 +171,7 @@ class Consensus {
 
   // Implement a LeaderStepDown() request.
   virtual Status StepDown(const LeaderStepDownRequestPB* req,
-                                  LeaderStepDownResponsePB* resp);
+                          LeaderStepDownResponsePB* resp);
 
   // Wait until the node has LEADER role.
   // Returns Status::TimedOut if the role is not LEADER within 'timeout'.
@@ -244,16 +245,18 @@ class Consensus {
   // Messages sent from CANDIDATEs to voting peers to request their vote
   // in leader election.
   virtual Status RequestVote(const VoteRequestPB* request,
-                                     VoteResponsePB* response) = 0;
+                             VoteResponsePB* response) = 0;
 
   // Implement a ChangeConfig() request.
-  virtual Status ChangeConfig(const ChangeConfigRequestPB& req,
-                                      const StdStatusCallback& client_cb,
-                                      boost::optional<tserver::TabletServerErrorPB::Code>* error);
+  virtual Status ChangeConfig(
+      const ChangeConfigRequestPB& req, const StdStatusCallback& client_cb,
+      std::optional<tserver::TabletServerErrorPB::Code>* error);
 
   virtual Status UnsafeChangeConfig(
       const UnsafeChangeConfigRequestPB& req,
-      boost::optional<tserver::TabletServerErrorPB::Code>* error_code) = 0;
+      std::optional<tserver::TabletServerErrorPB::Code>* error_code) = 0;
+
+  virtual std::vector<FollowerCommunicationTime> GetFollowerCommunicationTimes() = 0;
 
   // Returns the current Raft role of this instance.
   virtual PeerRole role() const = 0;
@@ -275,6 +278,9 @@ class Consensus {
   virtual const TabletId& tablet_id() const = 0;
 
   virtual const TabletId& split_parent_tablet_id() const = 0;
+
+  // The sequence number of the clone op that created this tablet, and the source tablet's id.
+  virtual const std::optional<CloneSourceInfo>& clone_source_info() const = 0;
 
   // Returns a copy of the committed state of the Consensus system. Also allows returning the
   // leader lease status captured under the same lock.
@@ -328,10 +334,24 @@ class Consensus {
   virtual Result<MicrosTime> MajorityReplicatedHtLeaseExpiration(
       MicrosTime min_allowed, CoarseTimePoint deadline) const = 0;
 
+  // Read replicated messages for xCluster replication.
+  // Only committed messages (committed_op_id) are returned.
+  // There can be more valid messages that are within the majority_replicated_op_id and
+  // committed_op_id range.
+  // If any message is not returned due to delay in commit, or if the result reaches
+  // FLAGS_consensus_max_batch_size_bytes, have_more_messages is set.
+  virtual Result<XClusterReadOpsResult> ReadReplicatedMessagesForXCluster(
+      const yb::OpId& from, const CoarseTimePoint deadline, bool fetch_single_entry) = 0;
+
   // Read majority replicated messages for CDC producer.
   virtual Result<ReadOpsResult> ReadReplicatedMessagesForCDC(
       const yb::OpId& from, int64_t* repl_index, const CoarseTimePoint deadline,
       const bool fetch_single_entry = false) = 0;
+
+  // Read all the committed messages for CDC producer.
+  virtual Result<ReadOpsResult> ReadReplicatedMessagesForConsistentCDC(
+      OpId from, uint64_t stream_safe_time, CoarseTimePoint deadline,
+      bool fetch_single_entry = false, int64_t* repl_index = nullptr) = 0;
 
   virtual void UpdateCDCConsumerOpId(const yb::OpId& op_id) = 0;
 

@@ -1,16 +1,23 @@
 package com.yugabyte.yw.common.supportbundle;
 
-import com.typesafe.config.Config;
-import com.yugabyte.yw.controllers.handlers.UniverseInfoHandler;
-import com.yugabyte.yw.models.Customer;
 import com.google.inject.Inject;
 import com.google.inject.Singleton;
+import com.typesafe.config.Config;
+import com.yugabyte.yw.commissioner.tasks.params.SupportBundleTaskParams;
 import com.yugabyte.yw.common.NodeUniverseManager;
 import com.yugabyte.yw.common.SupportBundleUtil;
-import com.yugabyte.yw.models.helpers.NodeDetails;
+import com.yugabyte.yw.controllers.handlers.UniverseInfoHandler;
+import com.yugabyte.yw.forms.SupportBundleFormData;
+import com.yugabyte.yw.models.Customer;
 import com.yugabyte.yw.models.Universe;
+import com.yugabyte.yw.models.helpers.NodeDetails;
 import java.nio.file.Path;
+import java.nio.file.Paths;
+import java.util.Arrays;
 import java.util.Date;
+import java.util.HashMap;
+import java.util.List;
+import java.util.Map;
 import lombok.extern.slf4j.Slf4j;
 
 @Slf4j
@@ -21,7 +28,8 @@ class TabletMetaComponent implements SupportBundleComponent {
   private final NodeUniverseManager nodeUniverseManager;
   protected final Config config;
   private final SupportBundleUtil supportBundleUtil;
-  public static final String sourceNodeFiles = "master/tablet-meta;tserver/tablet-meta";
+  public static final List<String> sourceNodeFiles =
+      Arrays.asList("master/tablet-meta", "tserver/tablet-meta");
 
   @Inject
   TabletMetaComponent(
@@ -37,7 +45,12 @@ class TabletMetaComponent implements SupportBundleComponent {
 
   @Override
   public void downloadComponent(
-      Customer customer, Universe universe, Path bundlePath, NodeDetails node) throws Exception {
+      SupportBundleTaskParams supportBundleTaskParams,
+      Customer customer,
+      Universe universe,
+      Path bundlePath,
+      NodeDetails node)
+      throws Exception {
     // Downloads the /mnt/d0/master/table-tmeta and /mnt/d0/tserver/tablet-meta from each node
     // in the universe into the bundle path
     // Get source file path prefix
@@ -52,11 +65,13 @@ class TabletMetaComponent implements SupportBundleComponent {
         node,
         nodeHomeDir,
         sourceNodeFiles,
-        this.getClass().getSimpleName());
+        this.getClass().getSimpleName(),
+        false /* skipUntar */);
   }
 
   @Override
   public void downloadComponentBetweenDates(
+      SupportBundleTaskParams supportBundleTaskParams,
       Customer customer,
       Universe universe,
       Path bundlePath,
@@ -64,6 +79,26 @@ class TabletMetaComponent implements SupportBundleComponent {
       Date endDate,
       NodeDetails node)
       throws Exception {
-    this.downloadComponent(customer, universe, bundlePath, node);
+    this.downloadComponent(supportBundleTaskParams, customer, universe, bundlePath, node);
+  }
+
+  public Map<String, Long> getFilesListWithSizes(
+      Customer customer,
+      SupportBundleFormData bundleData,
+      Universe universe,
+      Date startDate,
+      Date endDate,
+      NodeDetails node)
+      throws Exception {
+
+    String mountPath =
+        supportBundleUtil.getDataDirPath(universe, node, nodeUniverseManager, config);
+    String nodeHomeDir = mountPath + "/yb-data";
+    Map<String, Long> res = new HashMap<>();
+    for (String path : sourceNodeFiles) {
+      String fullPath = Paths.get(nodeHomeDir, path).toString();
+      res.putAll(nodeUniverseManager.getNodeFilePathAndSizes(node, universe, fullPath, 1, "f"));
+    }
+    return res;
   }
 }

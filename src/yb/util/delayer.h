@@ -1,4 +1,4 @@
-// Copyright (c) YugaByte, Inc.
+// Copyright (c) YugabyteDB, Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License"); you may not use this file except
 // in compliance with the License.  You may obtain a copy of the License at
@@ -18,7 +18,9 @@
 #include <functional>
 #include <thread>
 
+#include "yb/gutil/ref_counted.h"
 #include "yb/util/monotime.h"
+#include "yb/util/thread.h"
 
 namespace yb {
 
@@ -35,7 +37,7 @@ class Delayer {
 
   std::mutex mutex_;
   std::condition_variable cond_;
-  std::thread thread_;
+  scoped_refptr<Thread> thread_;
   bool stop_ = false;
   std::deque<std::pair<MonoTime, std::function<void()>>> queue_;
 };

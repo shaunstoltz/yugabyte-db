@@ -8,9 +8,8 @@ my @sources = (
 	'src/backend/optimizer/path/joinrels.c');
 my %defs =
   ('core.c'
-   => {protos => ['populate_joinrel_with_paths'],
+   => {protos => [],
 	   funcs => ['set_plain_rel_pathlist',
-				 'set_append_rel_pathlist',
 				 'standard_join_search',
 				 'create_plain_partial_paths',
 				 'join_search_one_level',
@@ -18,8 +17,10 @@ my %defs =
 				 'make_rels_by_clauseless_joins',
 				 'join_is_legal',
 				 'has_join_restriction',
-				 'mark_dummy_rel',
 				 'restriction_is_constant_false',
+				 'build_child_join_sjinfo',
+				 'get_matching_part_pairs',
+				 'compute_partition_bounds',
 				 'try_partitionwise_join'],
 	   head => core_c_head()},
    'make_join_rel.c'
@@ -27,7 +28,19 @@ my %defs =
 	   funcs => ['make_join_rel',
 				 'populate_joinrel_with_paths'],
 	   head => make_join_rel_head()});
-	
+
+# YB note
+# The objdump command above assumes that the postgres binary in PATH is built
+# from the source tree this pg_hint_plan extension is compiled for and that
+# the binary has the source file names with full path in it.
+# These assumptions don't hold in YB build environment so modify $srcpath to
+# point at the postgres source root.
+# TODO: This is a short term solution. The value should come from an env var, 
+#       etc. specified by the build system.
+#
+# See https://github.com/yugabyte/yugabyte-db/issues/26360.
+# 
+=begin
 open (my $in, '-|', "objdump -W `which postgres`") || die "failed to objdump";
 while (<$in>)
 {
@@ -38,9 +51,12 @@ while (<$in>)
 	}
 }
 close($in);
+=cut
+
+$srcpath = '../../';
 
 die "source path not found" if (! defined $srcpath);
-printf("Source path = %s\n", $srcpath);
+#printf("Source path = %s\n", $srcpath);
 
 my %protos;
 my %funcs;
@@ -52,7 +68,7 @@ for my $fname (@sources)
 	my $f = $srcpath.$fname;
 	my $source;
 
-	open ($in, '<', $f) || die "failed to open $f: $!";
+	open (my $in, '<', $f) || die "failed to open $f: $!";
 	while (<$in>)
 	{
 		$source .= $_;
@@ -144,7 +160,6 @@ sub core_c_head()
  *
  *	static functions:
  *	   set_plain_rel_pathlist()
- *	   set_append_rel_pathlist()
  *	   create_plain_partial_paths()
  *
  * src/backend/optimizer/path/joinrels.c
@@ -158,15 +173,21 @@ sub core_c_head()
  *     make_rels_by_clauseless_joins()
  *     join_is_legal()
  *     has_join_restriction()
- *     mark_dummy_rel()
  *     restriction_is_constant_false()
+ *     build_child_join_sjinfo()
+ *     get_matching_part_pairs()
+ *     compute_partition_bounds()
  *     try_partitionwise_join()
  *
- * Portions Copyright (c) 1996-2020, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2023, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  *-------------------------------------------------------------------------
  */
+
+#include "access/tsmapi.h"
+#include "catalog/pg_operator.h"
+#include "foreign/fdwapi.h"
 EOS
 }
 
@@ -187,8 +208,8 @@ sub make_join_rel_head
  *     make_join_rel()
  *     populate_joinrel_with_paths()
  *
- * Portions Copyright (c) 2013-2020, NIPPON TELEGRAPH AND TELEPHONE CORPORATION
- * Portions Copyright (c) 1996-2020, PostgreSQL Global Development Group
+ * Portions Copyright (c) 2013-2023, NIPPON TELEGRAPH AND TELEPHONE CORPORATION
+ * Portions Copyright (c) 1996-2023, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  *-------------------------------------------------------------------------
@@ -225,7 +246,7 @@ adjust_rows(double rows, RowsHint *hint)
 }
 EOS
 }
-   
+
 
 sub patch_make_join_rel
 {
@@ -239,8 +260,8 @@ index 0e7b99f..287e7f1 100644
 @@ -126,6 +126,84 @@ make_join_rel(PlannerInfo *root, RelOptInfo *rel1, RelOptInfo *rel2)
  	joinrel = build_join_rel(root, joinrelids, rel1, rel2, sjinfo,
  							 &restrictlist);
- 
-+	/* !!! START: HERE IS THE PART WHICH ADDED FOR PG_HINT_PLAN !!! */
+
++	/* !!! START: HERE IS THE PART WHICH IS ADDED FOR PG_HINT_PLAN !!! */
 +	{
 +		RowsHint   *rows_hint = NULL;
 +		int			i;
@@ -276,7 +297,7 @@ index 0e7b99f..287e7f1 100644
 +				/*
 +				 * If the rows_hint's target relids is not a subset of both of
 +				 * component rels and is a subset of this joinrel, ths hint's
-+				 * targets spread over both component rels. This means that
++				 * targets spread over both component rels. This menas that
 +				 * this hint has been never applied so far and this joinrel is
 +				 * the first (and only) chance to fire in current join tree.
 +				 * Only the multiplication hint has the cumulative nature so we
@@ -290,7 +311,7 @@ index 0e7b99f..287e7f1 100644
 +		{
 +			/*
 +			 * If a hint just for me is found, no other adjust method is
-+			 * useless, but this cannot be more than twice becuase this joinrel
++			 * useles, but this cannot be more than twice becuase this joinrel
 +			 * is already adjusted by this hint.
 +			 */
 +			if (justforme->base.state == HINT_STATE_NOTUSED)
@@ -310,13 +331,13 @@ index 0e7b99f..287e7f1 100644
 +				 */
 +				set_joinrel_size_estimates(root, joinrel, rel1, rel2, sjinfo,
 +										   restrictlist);
-+				
++
 +				joinrel->rows = adjust_rows(joinrel->rows, domultiply);
 +			}
-+			
++
 +		}
 +	}
-+	/* !!! END: HERE IS THE PART WHICH ADDED FOR PG_HINT_PLAN !!! */
++	/* !!! END: HERE IS THE PART WHICH IS ADDED FOR PG_HINT_PLAN !!! */
 +
  	/*
  	 * If we've already proven this join is empty, we needn't consider any

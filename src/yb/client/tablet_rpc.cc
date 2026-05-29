@@ -1,5 +1,5 @@
 //
-// Copyright (c) YugaByte, Inc.
+// Copyright (c) YugabyteDB, Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License"); you may not use this file except
 // in compliance with the License.  You may obtain a copy of the License at
@@ -28,10 +28,13 @@
 
 #include "yb/tserver/tserver_error.h"
 #include "yb/tserver/tserver_service.proxy.h"
+#include "yb/tserver/tserver_types.messages.h"
 
+#include "yb/util/debug-util.h"
 #include "yb/util/flags.h"
 #include "yb/util/logging.h"
 #include "yb/util/result.h"
+#include "yb/util/sync_point.h"
 #include "yb/util/trace.h"
 
 using std::vector;
@@ -54,6 +57,14 @@ DEFINE_UNKNOWN_int32(lookup_cache_refresh_secs, 60, "When non-zero, specifies ho
 DEFINE_test_flag(int32, assert_failed_replicas_less_than, 0,
                  "If greater than 0, this process will crash if the number of failed replicas for "
                  "a RemoteTabletServer is greater than the specified number.");
+DEFINE_test_flag(bool, always_return_consensus_info_for_succeeded_rpc, yb::kIsDebug,
+    "If set to true, we will always pass a stale raft_config_opid_index to the request when it is "
+    "possible for the request. This is turned on in debug mode to test that our metacache "
+    "will always be refreshed when a successful Write/Read/TransactionStatus/GetChanges RPC "
+    "responds.");
+DEFINE_RUNTIME_bool(enable_metacache_partial_refresh, true,
+    "If set, we will attempt to refresh the tablet metadata cache with a TabletConsensusInfoPB in "
+    "the tablet invoker.");
 
 using namespace std::placeholders;
 
@@ -70,8 +81,9 @@ TabletInvoker::TabletInvoker(const bool local_tserver_only,
                              const std::shared_ptr<const YBTable>& table,
                              rpc::RpcRetrier* retrier,
                              Trace* trace,
-                             master::IncludeInactive include_inactive,
-                             master::IncludeDeleted include_deleted)
+                             master::IncludeHidden include_hidden,
+                             master::IncludeDeleted include_deleted,
+                             const bool fail_on_not_found)
       : client_(client),
         command_(command),
         rpc_(rpc),
@@ -80,10 +92,11 @@ TabletInvoker::TabletInvoker(const bool local_tserver_only,
         table_(table),
         retrier_(retrier),
         trace_(trace),
-        include_inactive_(include_inactive),
+        include_hidden_(include_hidden),
         include_deleted_(include_deleted),
         local_tserver_only_(local_tserver_only),
-        consistent_prefix_(consistent_prefix) {}
+        consistent_prefix_(consistent_prefix),
+        fail_on_not_found_(fail_on_not_found) {}
 
 TabletInvoker::~TabletInvoker() {}
 
@@ -156,8 +169,8 @@ void TabletInvoker::SelectTabletServer()  {
       assign_new_leader_ = true;
     } else {
       YB_LOG_EVERY_N_SECS(INFO, 1)
-          << "Unable to pick leader for " << tablet_id_ << ", replicas: " << AsString(replicas)
-          << ", followers: " << AsString(followers_) << THROTTLE_MSG;
+          << "Unable to find the leader for " << tablet_id_ << ", replicas: " << AsString(replicas)
+          << ", followers: " << AsString(followers_);
     }
   } else {
     VLOG(4) << "Selected TServer " << current_ts_->ToString() << " as leader for " << tablet_id_;
@@ -165,7 +178,7 @@ void TabletInvoker::SelectTabletServer()  {
   VTRACE_TO(1, trace_, "Selected $0", (current_ts_ ? current_ts_->ToString() : "none"));
 }
 
-void TabletInvoker::Execute(const std::string& tablet_id, bool leader_only) {
+void TabletInvoker::Execute(TabletIdView tablet_id, bool leader_only) {
   if (tablet_id_.empty()) {
     if (!tablet_id.empty()) {
       tablet_id_ = tablet_id;
@@ -174,10 +187,13 @@ void TabletInvoker::Execute(const std::string& tablet_id, bool leader_only) {
     }
   }
 
+  ash::WaitStateSnapshot wait_state_snapshot;
+
   if (!tablet_) {
-    client_->LookupTabletById(tablet_id_, table_, include_inactive_, include_deleted_,
+    client_->LookupTabletById(tablet_id_, table_, include_hidden_, include_deleted_,
                               retrier_->deadline(),
-                              std::bind(&TabletInvoker::InitialLookupTabletDone, this, _1),
+                              std::bind(&TabletInvoker::InitialLookupTabletDone, this,
+                                  wait_state_snapshot, _1),
                               UseCache::kTrue);
     return;
   }
@@ -185,24 +201,24 @@ void TabletInvoker::Execute(const std::string& tablet_id, bool leader_only) {
   if (consistent_prefix_ && !leader_only) {
     bool refresh_cache = false;
     if (PREDICT_FALSE(FLAGS_force_lookup_cache_refresh_secs > 0) &&
-        MonoTime::Now().GetDeltaSince(tablet_->refresh_time()).ToSeconds() >
+        MonoTime::Now().GetDeltaSince(tablet_->full_refresh_time()).ToSeconds() >
         FLAGS_force_lookup_cache_refresh_secs) {
 
       refresh_cache = true;
 
       VLOG(1) << "Updating tablet " << tablet_->tablet_id() << " replicas cache "
               << "force_lookup_cache_refresh_secs: " << FLAGS_force_lookup_cache_refresh_secs
-              << ". " << MonoTime::Now().GetDeltaSince(tablet_->refresh_time()).ToSeconds()
+              << ". " << MonoTime::Now().GetDeltaSince(tablet_->full_refresh_time()).ToSeconds()
               << " seconds since the last update. Replicas in current cache: "
               << tablet_->ReplicasAsString();
     } else if (FLAGS_lookup_cache_refresh_secs > 0 &&
-               MonoTime::Now().GetDeltaSince(tablet_->refresh_time()).ToSeconds() >
+               MonoTime::Now().GetDeltaSince(tablet_->full_refresh_time()).ToSeconds() >
                FLAGS_lookup_cache_refresh_secs &&
                !tablet_->IsReplicasCountConsistent()) {
       refresh_cache = true;
       VLOG(1) << "Updating tablet " << tablet_->tablet_id() << " replicas cache "
               << "force_lookup_cache_refresh_secs: " << FLAGS_force_lookup_cache_refresh_secs
-              << ". " << MonoTime::Now().GetDeltaSince(tablet_->refresh_time()).ToSeconds()
+              << ". " << MonoTime::Now().GetDeltaSince(tablet_->full_refresh_time()).ToSeconds()
               << " seconds since the last update. Replicas in current cache: "
               << tablet_->ReplicasAsString();
     }
@@ -211,10 +227,11 @@ void TabletInvoker::Execute(const std::string& tablet_id, bool leader_only) {
     if (refresh_cache) {
       client_->LookupTabletById(tablet_id_,
                                 table_,
-                                include_inactive_,
+                                include_hidden_,
                                 include_deleted_,
                                 retrier_->deadline(),
-                                std::bind(&TabletInvoker::LookupTabletCb, this, _1),
+                                std::bind(&TabletInvoker::LookupTabletCb, this,
+                                    wait_state_snapshot, _1),
                                 UseCache::kFalse);
       return;
     }
@@ -241,10 +258,11 @@ void TabletInvoker::Execute(const std::string& tablet_id, bool leader_only) {
   if (!current_ts_) {
     client_->LookupTabletById(tablet_id_,
                               table_,
-                              include_inactive_,
+                              include_hidden_,
                               include_deleted_,
                               retrier_->deadline(),
-                              std::bind(&TabletInvoker::LookupTabletCb, this, _1),
+                              std::bind(&TabletInvoker::LookupTabletCb, this,
+                                  wait_state_snapshot, _1),
                               UseCache::kTrue);
     return;
   }
@@ -263,16 +281,25 @@ void TabletInvoker::Execute(const std::string& tablet_id, bool leader_only) {
 
   VLOG(2) << "Tablet " << tablet_id_ << ": Sending " << command_->ToString() << " to replica "
           << current_ts_->ToString();
+  int64_t opid_index = client_->GetRaftConfigOpidIndex(tablet_id_);
+  rpc_->SetRequestRaftConfigOpidIndex(opid_index);
 
+  // Keep a refon trace, since it is possible that we receive reply before returning from async rpc,
+  // destroying us.
+  auto trace = trace_;
+  TRACE_TO(trace, "SendRpcToTserver");
+  ADOPT_TRACE(trace);
   rpc_->SendRpcToTserver(retrier_->attempt_num());
+  TRACE_TO(trace, "RpcDispatched Asynchronously");
 }
 
 Status TabletInvoker::FailToNewReplica(const Status& reason,
-                                       const tserver::TabletServerErrorPB* error_code) {
+                                       tserver::TabletServerErrorPB_Code error_code,
+                                       bool consensus_info_refresh_succeeded) {
   TRACE_TO(trace_, "FailToNewReplica($0)", reason.ToString());
-  if (ErrorCode(error_code) == tserver::TabletServerErrorPB::STALE_FOLLOWER) {
+  if (error_code == tserver::TabletServerErrorPB::STALE_FOLLOWER) {
     VLOG(1) << "Stale follower for " << command_->ToString() << " just retry";
-  } else if (ErrorCode(error_code) == tserver::TabletServerErrorPB::NOT_THE_LEADER) {
+  } else if (error_code == tserver::TabletServerErrorPB::NOT_THE_LEADER) {
     VLOG(1) << "Not the leader for " << command_->ToString()
             << " retrying with a different replica";
     // In the past we were marking a replica as failed whenever an error was returned. The problem
@@ -284,15 +311,26 @@ Status TabletInvoker::FailToNewReplica(const Status& reason,
     // tablet server is marked as a follower so that it's not used during a retry for requests that
     // need to contact the leader only. This has the same effect as marking the replica as failed
     // for this specific RPC, but without affecting other RPCs.
-    followers_.emplace(current_ts_, FollowerData {
-      .status = STATUS(IllegalState, "Not the leader"),
-      .time = CoarseMonoClock::now()
-    });
+
+    // If RefreshMetaCacheWithResponse returns true it means the meta-cache information for this
+    // tablet is successfully refreshed using the tablet_consensus_info, so we need to clear the
+    // followers set to let tablet invoker use our latest leader tablet peer that has just been
+    // refreshed.
+    if (consensus_info_refresh_succeeded) {
+      TEST_SYNC_POINT_CALLBACK(
+          "CDCSDKMetaCacheRefreshTest::Refresh", &consensus_info_refresh_succeeded);
+      followers_.clear();
+    } else {
+      followers_.emplace(
+          current_ts_,
+          FollowerData{
+              .status = STATUS(IllegalState, "Not the leader"), .time = CoarseMonoClock::now()});
+    }
   } else {
     VLOG(1) << "Failing " << command_->ToString() << " to a new replica: " << reason
             << ", old replica: " << yb::ToString(current_ts_);
 
-    if (GetAtomicFlag(&FLAGS_update_all_tablets_upon_network_failure) &&
+    if (FLAGS_update_all_tablets_upon_network_failure &&
         rpc::NetworkError(reason) == rpc::NetworkErrorCode::kConnectFailed) {
       YB_LOG_EVERY_N_SECS(WARNING, 1) << "Marking TServer " << current_ts_->ToString()
                                       << " as unreachable due to " << reason.ToString();
@@ -308,7 +346,6 @@ Status TabletInvoker::FailToNewReplica(const Status& reason,
                    << " as failed. Replicas: " << tablet_->ReplicasAsString();
     }
   }
-
   auto status = retrier_->DelayedRetry(command_, reason);
   if (!status.ok()) {
     LOG(WARNING) << "Failed to schedule retry on new replica: " << status;
@@ -322,7 +359,6 @@ bool TabletInvoker::Done(Status* status) {
 
   bool assign_new_leader = assign_new_leader_;
   assign_new_leader_ = false;
-
   if (status->IsAborted() || retrier_->finished()) {
     if (status->ok()) {
       *status = retrier_->controller().status();
@@ -339,6 +375,19 @@ bool TabletInvoker::Done(Status* status) {
     return false;
   }
 
+  // We are shutting down. Fail the rpc immediately.
+  if (status->IsShutdownInProgress() || status->IsAborted()) {
+    rpc_->Failed(*status);
+    return true;
+  }
+
+  bool consensus_info_refresh_succeeded = false;
+  if (status->ok() && FLAGS_enable_metacache_partial_refresh) {
+    consensus_info_refresh_succeeded = rpc_->RefreshMetaCacheWithResponse();
+    TEST_SYNC_POINT_CALLBACK(
+        "TabletInvoker::RefreshFinishedWithOkRPCResponse", &consensus_info_refresh_succeeded);
+  }
+
   // Failover to a replica in the event of any network failure.
   //
   // TODO: This is probably too harsh; some network failures should be
@@ -349,7 +398,8 @@ bool TabletInvoker::Done(Status* status) {
   }
 
   // Prefer controller failures over response failures.
-  auto rsp_err = rpc_->response_error();
+  auto rsp_err = status->ok() ? rpc_->response_error() : nullptr;
+  auto error_code = ErrorCode(rsp_err);
   {
     Status resp_error_status = ErrorStatus(rsp_err);
     if (status->ok() && !resp_error_status.ok()) {
@@ -368,7 +418,7 @@ bool TabletInvoker::Done(Status* status) {
     }
   }
 
-  const bool is_tablet_split = ErrorCode(rsp_err) == tserver::TabletServerErrorPB::TABLET_SPLIT;
+  const bool is_tablet_split = error_code == tserver::TabletServerErrorPB::TABLET_SPLIT;
   if (is_tablet_split || ClientError(*status) == ClientErrorCode::kTablePartitionListIsStale) {
     // Replace status error with TryAgain, so upper layer retry request after refreshing
     // table partitioning metadata.
@@ -388,14 +438,13 @@ bool TabletInvoker::Done(Status* status) {
   // this case.
   if (status->IsIllegalState() || status->IsServiceUnavailable() || status->IsAborted() ||
       status->IsLeaderNotReadyToServe() || status->IsLeaderHasNoLease() ||
-      TabletNotFoundOnTServer(rsp_err, *status) ||
+      IsTabletConsideredNotFound(error_code, *status) ||
+      IsTabletConsideredNonLeader(error_code, *status) ||
       (status->IsTimedOut() && CoarseMonoClock::Now() < retrier_->deadline())) {
-    VLOG(4) << "Retryable failure: " << *status
-            << ", response: " << yb::ToString(rsp_err);
+    VLOG(4) << "Retryable failure: " << *status << ", response: " << AsString(rsp_err);
 
     const bool leader_is_not_ready =
-        ErrorCode(rsp_err) ==
-            tserver::TabletServerErrorPB::LEADER_NOT_READY_TO_SERVE ||
+        error_code == tserver::TabletServerErrorPB::LEADER_NOT_READY_TO_SERVE ||
         status->IsLeaderNotReadyToServe();
 
     // If the leader just is not ready - let's retry the same tserver.
@@ -414,14 +463,24 @@ bool TabletInvoker::Done(Status* status) {
 
     // If only local tserver is requested and it is not the leader, respond error and done.
     // Otherwise, continue below to retry.
+    // TODO(tsplit): At the moment it's not possible to identify if status->IsIllegalState() due
+    // to any type of failure or because the tablet is in SHUTDOWN state. If tablet is in SHUTDOWN
+    // state the RPC should be retried as if tablet is not found.
+    // Refer to https://github.com/yugabyte/yugabyte-db/issues/16846
     if (local_tserver_only_ && current_ts_->IsLocal() && status->IsIllegalState()) {
       rpc_->Failed(*status);
       return true;
     }
 
-    if (status->IsIllegalState() || TabletNotFoundOnTServer(rsp_err, *status)) {
+    if (fail_on_not_found_ && IsTabletConsideredNotFound(error_code, *status)) {
+      rpc_->Failed(*status);
+      return true;
+    }
+
+    if (status->IsIllegalState() || IsTabletConsideredNotFound(error_code, *status) ||
+        IsTabletConsideredNonLeader(error_code, *status)) {
       // The whole operation is completed if we can't schedule a retry.
-      return !FailToNewReplica(*status, rsp_err).ok();
+      return !FailToNewReplica(*status, error_code, consensus_info_refresh_succeeded).ok();
     } else {
       tserver::TabletServerDelay delay(*status);
       auto retry_status = delay.value().Initialized()
@@ -466,12 +525,18 @@ bool TabletInvoker::Done(Status* status) {
         << "Unable to mark as leader: " << current_ts_->ToString() << " for "
         << tablet_->ToString();
   }
+  int attempt_num = retrier_->attempt_num();
+  TEST_SYNC_POINT_CALLBACK("TabletInvoker::Done", &attempt_num);
 
   return true;
 }
 
-void TabletInvoker::InitialLookupTabletDone(const Result<RemoteTabletPtr>& result) {
+void TabletInvoker::InitialLookupTabletDone(
+    ash::WaitStateSnapshot snapshot, const Result<RemoteTabletPtr>& result) {
   VLOG(1) << "InitialLookupTabletDone(" << result << ")";
+
+  ADOPT_WAIT_STATE(snapshot.wait_state);
+  SET_WAIT_STATUS_FROM_SNAPSHOT(snapshot);
 
   if (result.ok()) {
     tablet_ = *result;
@@ -485,6 +550,16 @@ bool TabletInvoker::IsLocalCall() const {
   return current_ts_ != nullptr && current_ts_->IsLocal();
 }
 
+bool TabletInvoker::RefreshTabletInfoWithConsensusInfo(
+    const tserver::TabletConsensusInfoPB& tablet_consensus_info) {
+    return client_->RefreshTabletInfoWithConsensusInfo(tablet_consensus_info);
+}
+
+bool TabletInvoker::RefreshTabletInfoWithConsensusInfo(
+    const tserver::LWTabletConsensusInfoPB& tablet_consensus_info) {
+    return client_->RefreshTabletInfoWithConsensusInfo(tablet_consensus_info);
+}
+
 std::shared_ptr<tserver::TabletServerServiceProxy> TabletInvoker::proxy() const {
   return current_ts_->proxy();
 }
@@ -493,9 +568,13 @@ std::shared_ptr<tserver::TabletServerServiceProxy> TabletInvoker::proxy() const 
   return current_ts_->ProxyEndpoint();
 }
 
-void TabletInvoker::LookupTabletCb(const Result<RemoteTabletPtr>& result) {
+void TabletInvoker::LookupTabletCb(
+    ash::WaitStateSnapshot snapshot, const Result<RemoteTabletPtr>& result) {
   VLOG_WITH_FUNC(1) << AsString(result) << ", command: " << command_->ToString()
                     << ", retrier: " << retrier_->ToString();
+
+  ADOPT_WAIT_STATE(snapshot.wait_state);
+  SET_WAIT_STATUS_FROM_SNAPSHOT(snapshot);
 
   if (result.ok()) {
 #ifndef DEBUG
@@ -538,9 +617,33 @@ Status ErrorStatus(const tserver::TabletServerErrorPB* error) {
                           : StatusFromPB(error->status());
 }
 
+Status ErrorStatus(const tserver::LWTabletServerErrorPB* error) {
+  return error == nullptr ? Status::OK()
+                          : StatusFromPB(error->status());
+}
+
+Status ErrorStatus(TabletServerErrorPtr error) {
+  if (error.is_lightweight()) {
+    return ErrorStatus(error.lightweight());
+  }
+  return ErrorStatus(error.protobuf());
+}
+
 tserver::TabletServerErrorPB_Code ErrorCode(const tserver::TabletServerErrorPB* error) {
   return error == nullptr ? tserver::TabletServerErrorPB::UNKNOWN_ERROR
                           : error->code();
+}
+
+tserver::TabletServerErrorPB_Code ErrorCode(const tserver::LWTabletServerErrorPB* error) {
+  return error == nullptr ? tserver::TabletServerErrorPB::UNKNOWN_ERROR
+                          : error->code();
+}
+
+tserver::TabletServerErrorPB_Code ErrorCode(TabletServerErrorPtr error) {
+  if (error.is_lightweight()) {
+    return ErrorCode(error.lightweight());
+  }
+  return ErrorCode(error.protobuf());
 }
 
 } // namespace internal

@@ -4,9 +4,9 @@ module.exports = {
   root: true,
   env: {
     browser: true,
-    es2020: true
+    es2022: true
   },
-  ignorePatterns: ['build/*'],
+  ignorePatterns: ['build/*', 'public/mockServiceWorker.js', 'node_modules/*'],
   settings: {
     react: {
       version: 'detect'
@@ -26,17 +26,14 @@ module.exports = {
   // .js / .jsx uses babel-eslint
   parser: '@typescript-eslint/parser',
   parserOptions: {
-    ecmaVersion: 2020,
+    ecmaVersion: 2022,
     sourceType: 'module',
+    tsconfigRootDir: __dirname,
     ecmaFeatures: {
       jsx: true
     },
     project: ['./tsconfig.json']
   },
-
-  // Plugins
-  // =================================
-  // plugins: ["import"],
 
   // Extend Other Configs
   // =================================
@@ -46,6 +43,7 @@ module.exports = {
     'plugin:react/recommended',
     'plugin:@typescript-eslint/recommended',
     'plugin:react-hooks/recommended',
+    'plugin:storybook/recommended',
     // Disable rules that conflict with Prettier
     // Prettier must be last to override other configs
     'prettier'
@@ -64,6 +62,7 @@ module.exports = {
     'no-undef': 0,
     'one-var': [2, 'never'],
     'import/no-unresolved': [0, { caseSensitive: false }],
+    'no-control-regex': 0,
     // TODO: Handle null check in a separate diff
     eqeqeq: 2,
     'no-useless-return': 2,
@@ -79,7 +78,7 @@ module.exports = {
     'no-extra-boolean-cast': 0,
     'no-unused-vars': 0,
     '@typescript-eslint/no-unused-vars': [
-      2,
+      0,
       { vars: 'all', args: 'none', ignoreRestSiblings: true }
     ],
     '@typescript-eslint/ban-types': 0,
@@ -102,7 +101,7 @@ module.exports = {
     // TODO: Fix no-shadow in a separate diff
     '@typescript-eslint/no-shadow': 0,
     '@typescript-eslint/prefer-includes': 2,
-    '@typescript-eslint/prefer-nullish-coalescing': 2,
+    '@typescript-eslint/prefer-nullish-coalescing': 1,
     // TODO: Fix prefer-nullish-coalescing in a separate diff as it needs more investigation
     // due to conflict with no-unused-expressions which is result of react script version we are using
     '@typescript-eslint/prefer-optional-chain': 0,

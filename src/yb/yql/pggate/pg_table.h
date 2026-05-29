@@ -1,4 +1,4 @@
-// Copyright (c) YugaByte, Inc.
+// Copyright (c) YugabyteDB, Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License"); you may not use this file except
 // in compliance with the License.  You may obtain a copy of the License at
@@ -56,7 +56,8 @@ class PgTable {
   }
 
   Result<PgColumn&> ColumnForAttr(int attr_num);
-  PgColumn& ColumnForIndex(size_t index);
+  [[nodiscard]] PgColumn& ColumnForIndex(size_t index);
+  [[nodiscard]] const PgColumn& ColumnForIndex(size_t index) const;
 
  private:
   PgTableDescPtr desc_;

@@ -3,9 +3,9 @@
 //  LICENSE file in the root directory of this source tree. An additional grant
 //  of patent rights can be found in the PATENTS file in the same directory.
 //
-// The following only applies to changes made to this file as part of YugaByte development.
+// The following only applies to changes made to this file as part of YugabyteDB development.
 //
-// Portions Copyright (c) YugaByte, Inc.
+// Portions Copyright (c) YugabyteDB, Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License"); you may not use this file except
 // in compliance with the License.  You may obtain a copy of the License at
@@ -31,7 +31,7 @@
 #include <stdio.h>
 #include <string.h>
 
-#include <glog/logging.h>
+#include "yb/util/logging.h"
 
 #include "yb/rocksdb/util/logging.h"
 #include "yb/util/status_log.h"
@@ -182,7 +182,7 @@ int GetMaxOpenFiles() {
     return -1;
   }
   // protect against overflow
-  if (yb::std_util::cmp_greater_equal(no_files_limit.rlim_cur, std::numeric_limits<int>::max())) {
+  if (std::cmp_greater_equal(no_files_limit.rlim_cur, std::numeric_limits<int>::max())) {
     return std::numeric_limits<int>::max();
   }
   return static_cast<int>(no_files_limit.rlim_cur);

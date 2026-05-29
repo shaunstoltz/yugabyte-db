@@ -1,4 +1,4 @@
-import React, { FC, useEffect, useRef, useState } from 'react';
+import { FC, useEffect, useRef } from 'react';
 import _ from 'lodash';
 import { useMutation, useQueryClient } from 'react-query';
 import { Alert, Col, Grid, Row } from 'react-bootstrap';
@@ -8,20 +8,11 @@ import { toast } from 'react-toastify';
 
 import { YBButton, YBFormInput, YBSegmentedButtonGroup, YBToggle } from '../../common/forms/fields';
 import { YBCopyButton, YBPasteButton } from '../../common/descriptors';
-import { api, QUERY_KEY } from '../../../redesign/helpers/api';
-import { HAConfig, HAReplicationSchedule } from '../../../redesign/helpers/dtos';
+import { api, CreateHaConfigRequest, QUERY_KEY } from '../../../redesign/helpers/api';
+import { HaConfig, HaReplicationSchedule } from '../dtos';
 import YBInfoTip from '../../common/descriptors/YBInfoTip';
-import {
-  getPeerCertIdentifier,
-  getPeerCerts,
-  YbHAWebService,
-  YB_HA_WS_RUNTIME_CONFIG_KEY,
-  EMPTY_YB_HA_WEBSERVICE
-} from './HAReplicationView';
-import { getPromiseState } from '../../../utils/PromiseUtils';
 
 import './HAReplicationForm.scss';
-import { ManagePeerCertsModal } from '../modals/ManagePeerCertsModal';
 
 export enum HAInstanceTypes {
   Active = 'Active',
@@ -50,8 +41,8 @@ interface HAReplicationFormStateProps {
 interface HAReplicationFormOwnProps {
   backToViewMode(): void;
 
-  config?: HAConfig;
-  schedule?: HAReplicationSchedule;
+  config?: HaConfig;
+  schedule?: HaReplicationSchedule;
 }
 
 type HAReplicationFormProps = HAReplicationFormStateProps &
@@ -79,11 +70,8 @@ export const HAReplicationForm: FC<HAReplicationFormProps> = ({
   runtimeConfigs,
   schedule,
   backToViewMode,
-  fetchRuntimeConfigs,
-  setRuntimeConfig
+  fetchRuntimeConfigs
 }) => {
-  const [isAddPeerCertsModalVisible, setAddPeerCertsModalVisible] = useState(false);
-
   const formik = useRef({} as FormikProps<FormValues>);
   const queryClient = useQueryClient();
   const generateKey = useMutation(api.generateHAKey, {
@@ -95,8 +83,13 @@ export const HAReplicationForm: FC<HAReplicationFormProps> = ({
   const { mutateAsync: disableReplication } = useMutation((formValues: FormValues) =>
     api.stopHABackupSchedule(formValues.configId)
   );
-  const { mutateAsync: createHAConfig } = useMutation<HAConfig, unknown, FormValues>((formValues) =>
-    api.createHAConfig(formValues.clusterKey)
+  const { mutateAsync: createHAConfig } = useMutation<HaConfig, unknown, FormValues>(
+    (formValues) => {
+      const createHaConfigRequest: CreateHaConfigRequest = {
+        cluster_key: formValues.clusterKey
+      };
+      return api.createHAConfig(createHaConfigRequest);
+    }
   );
   const { mutateAsync: createHAInstance } = useMutation((formValues: FormValues) =>
     api.createHAInstance(
@@ -110,20 +103,6 @@ export const HAReplicationForm: FC<HAReplicationFormProps> = ({
   useEffect(() => {
     fetchRuntimeConfigs();
   }, []); // eslint-disable-line react-hooks/exhaustive-deps
-
-  // fetch only specific key
-  const showAddPeerCertModal = () => {
-    fetchRuntimeConfigs();
-    setAddPeerCertsModalVisible(true);
-  };
-  const hideAddPeerCertModal = () => {
-    fetchRuntimeConfigs();
-    setAddPeerCertsModalVisible(false);
-  };
-
-  const setYBHAWebserviceRuntimeConfig = (value: string) => {
-    setRuntimeConfig(YB_HA_WS_RUNTIME_CONFIG_KEY, value);
-  };
 
   let initialValues = INITIAL_VALUES;
   const isEditMode = !!config && !!schedule;
@@ -156,18 +135,15 @@ export const HAReplicationForm: FC<HAReplicationFormProps> = ({
         } else {
           await disableReplication(data);
         }
-      } else {
-        // eslint-disable-next-line no-lonely-if
-        if (data.instanceType === HAInstanceTypes.Active) {
-          data.configId = (await createHAConfig(data)).uuid;
-          await createHAInstance(data);
-          if (data.replicationEnabled) {
-            await enableReplication(data);
-          }
-        } else {
-          data.configId = (await createHAConfig(data)).uuid;
-          await createHAInstance(data);
+      } else if (data.instanceType === HAInstanceTypes.Active) {
+        data.configId = (await createHAConfig(data)).uuid;
+        await createHAInstance(data);
+        if (data.replicationEnabled) {
+          await enableReplication(data);
         }
+      } else {
+        data.configId = (await createHAConfig(data)).uuid;
+        await createHAInstance(data);
       }
 
       // invalidating queries will trigger their re-fetching and updating components where they are used
@@ -181,22 +157,8 @@ export const HAReplicationForm: FC<HAReplicationFormProps> = ({
     }
   };
 
-  const ybHAWebService: YbHAWebService =
-    runtimeConfigs?.data && getPromiseState(runtimeConfigs).isSuccess()
-      ? JSON.parse(
-          runtimeConfigs.data.configEntries.find((c: any) => c.key === YB_HA_WS_RUNTIME_CONFIG_KEY)
-            .value
-        )
-      : EMPTY_YB_HA_WEBSERVICE;
-  const peerCerts = getPeerCerts(ybHAWebService);
   return (
     <div className="ha-replication-form" data-testid="ha-replication-config-form">
-      <ManagePeerCertsModal
-        visible={isAddPeerCertsModalVisible}
-        peerCerts={peerCerts}
-        setYBHAWebserviceRuntimeConfig={setYBHAWebserviceRuntimeConfig}
-        onClose={hideAddPeerCertModal}
-      />
       <Formik<FormValues>
         initialValues={initialValues}
         validationSchema={validationSchema}
@@ -206,23 +168,9 @@ export const HAReplicationForm: FC<HAReplicationFormProps> = ({
           // workaround for outdated version of Formik to access form methods outside of <Formik>
           formik.current = formikProps;
 
-          const isHTTPS = formikProps.values?.instanceAddress?.startsWith('https:');
           const { instanceType, clusterKey } = formikProps.values;
           return (
             <>
-              <div className="ha-replication-form__action-bar">
-                {instanceType === HAInstanceTypes.Active && (
-                  <YBButton
-                    btnText={`${
-                      getPeerCerts(ybHAWebService).length > 0 ? 'Manage' : 'Add'
-                    } Peer Certificates`}
-                    onClick={(e: any) => {
-                      showAddPeerCertModal();
-                      e.currentTarget.blur();
-                    }}
-                  />
-                )}
-              </div>
               <Form role="form">
                 <Grid fluid>
                   {instanceType === HAInstanceTypes.Standby && !isEditMode && (
@@ -334,7 +282,16 @@ export const HAReplicationForm: FC<HAReplicationFormProps> = ({
                         <span>minute(s)</span>
                         <YBInfoTip
                           title="Replication Configuration"
-                          content="How frequently periodic backups are sent to standby platforms"
+                          content={
+                            <div>
+                              <p>How frequently periodic backups are sent to standby platforms.</p>
+                              <p>
+                                If this value is greater than the HA standby sync alert threshold,
+                                then that alert will fire repeatedly. You may adjust the replication
+                                frequency or the alert threshold to avoid this.
+                              </p>
+                            </div>
+                          }
                         />
                       </Col>
                     </Row>
@@ -362,54 +319,13 @@ export const HAReplicationForm: FC<HAReplicationFormProps> = ({
                       </Col>
                     </Row>
                   </div>
-                  {instanceType === HAInstanceTypes.Active && (
-                    <Row className="ha-replication-form__row">
-                      <Col xs={2} className="ha-replication-form__label">
-                        Peer Certificates
-                      </Col>
-                      <Col xs={10} className="ha-replication-form__certs">
-                        {peerCerts.length === 0 ? (
-                          <button
-                            className="ha-replication-form__no-cert--add-button"
-                            onClick={(e) => {
-                              e.preventDefault();
-                              showAddPeerCertModal();
-                            }}
-                          >
-                            Add a peer certificate
-                          </button>
-                        ) : (
-                          peerCerts.map((peerCert) => {
-                            return (
-                              <>
-                                <div className="ha-replication-form__cert-container">
-                                  <span className="ha-replication-form__cert-container--identifier">
-                                    {getPeerCertIdentifier(peerCert)}
-                                  </span>
-                                  <span className="ha-replication-form__cert-container--ellipse">
-                                    ( . . . )
-                                  </span>
-                                </div>
-                              </>
-                            );
-                          })
-                        )}
-                      </Col>
-                    </Row>
-                  )}
 
                   <Row className="ha-replication-form__row">
                     <Col xs={12} className="ha-replication-form__footer">
                       {isEditMode && <YBButton btnText="Cancel" onClick={backToViewMode} />}
                       <YBButton
                         btnType="submit"
-                        disabled={
-                          formikProps.isSubmitting ||
-                          !formikProps.isValid ||
-                          (instanceType === HAInstanceTypes.Active &&
-                            isHTTPS &&
-                            peerCerts.length === 0)
-                        }
+                        disabled={formikProps.isSubmitting || !formikProps.isValid}
                         loading={formikProps.isSubmitting}
                         btnClass="btn btn-orange"
                         btnText={isEditMode ? 'Save' : 'Create'}

@@ -1,5 +1,5 @@
 /**
- * Copyright (c) YugaByte, Inc.
+ * Copyright (c) YugabyteDB, Inc.
  *
  * Licensed under the Apache License, Version 2.0 (the "License"); you may not use this file except
  * in compliance with the License.  You may obtain a copy of the License at
@@ -56,6 +56,16 @@ public class MiniYBClusterBuilder {
 
   public MiniYBClusterBuilder numTservers(int numTservers) {
     this.clusterParameters.numTservers = numTservers;
+    return this;
+  }
+
+  public MiniYBClusterBuilder ycqlNumTablets(int numTablets) {
+    this.clusterParameters.ycqlNumTablets = numTablets;
+    return this;
+  }
+
+  public MiniYBClusterBuilder ysqlNumTablets(int numTablets) {
+    this.clusterParameters.ysqlNumTablets = numTablets;
     return this;
   }
 
@@ -189,6 +199,14 @@ public class MiniYBClusterBuilder {
    */
   public MiniYBClusterBuilder enableYsql(boolean enableYsql) {
     this.clusterParameters.startYsqlProxy = enableYsql;
+    return this;
+  }
+
+  /**
+   * Enable Ysql Connection Manager in tablet servers.
+   */
+  public MiniYBClusterBuilder enableYsqlConnMgr(boolean enableYsqlConnMgr) {
+    this.clusterParameters.startYsqlConnMgr = enableYsqlConnMgr;
     return this;
   }
 

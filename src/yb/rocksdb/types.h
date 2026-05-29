@@ -3,9 +3,9 @@
 // LICENSE file in the root directory of this source tree. An additional grant
 // of patent rights can be found in the PATENTS file in the same directory.
 //
-// The following only applies to changes made to this file as part of YugaByte development.
+// The following only applies to changes made to this file as part of YugabyteDB development.
 //
-// Portions Copyright (c) YugaByte, Inc.
+// Portions Copyright (c) YugabyteDB, Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License"); you may not use this file except
 // in compliance with the License.  You may obtain a copy of the License at
@@ -23,10 +23,10 @@
 #include <stdint.h>
 
 #include "yb/common/hybrid_time.h"
+#include "yb/common/opid.h"
 
 #include "yb/util/enums.h"
 #include "yb/util/math_util.h"
-#include "yb/util/opid.h"
 
 namespace rocksdb {
 
@@ -39,13 +39,15 @@ typedef uint64_t SequenceNumber;
 using yb::OpId;
 using yb::HybridTime;
 
-YB_DEFINE_ENUM(UpdateUserValueType, ((kSmallest, 1))((kLargest, -1)));
-YB_DEFINE_ENUM(FrontierModificationMode, (kForce)(kUpdate));
+// kUpdateIgnoreBackwards is similar to kUpdate but will not check whether a new frointier is less
+// when a new edit is applied to VersionSet. Just like kUpdate, a smaller FlushedFrontier will never
+// be flushed. This is just used to skip DFATAL in VersionSet::EnsureNonDecreasingFlushedFrontier in
+// some cases.
+YB_DEFINE_ENUM(FrontierModificationMode, (kForce)(kUpdate)(kUpdateIgnoreBackwards));
 
 // Specific how key value entries are encoded inside the block.
 // See Block and BlockBuilder for more details.
-YB_DEFINE_ENUM(
-    KeyValueEncodingFormat,
+YB_DEFINE_ENUM(KeyValueEncodingFormat,
     // <key_shared_prefix_size<key_non_shared_size><value_size><key_non_shared_bytes><value_bytes>
     ((kKeyDeltaEncodingSharedPrefix, 1))
     // Advanced key delta encoding optimized for docdb-specific encoded key structure.

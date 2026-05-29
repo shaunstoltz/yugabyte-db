@@ -1,22 +1,22 @@
 /*
  * Created on Thu Jul 21 2022
  *
- * Copyright 2021 YugaByte, Inc. and Contributors
+ * Copyright 2021 YugabyteDB, Inc. and Contributors
  * Licensed under the Polyform Free Trial License 1.0.0 (the "License")
  * You may not use this file except in compliance with the License. You may obtain a copy of the License at
  * http://github.com/YugaByte/yugabyte-db/blob/master/licenses/POLYFORM-FREE-TRIAL-LICENSE-1.0.0.txt
  */
 
-import React, { FC } from 'react';
+import { FC } from 'react';
 import { Tab } from 'react-bootstrap';
 import { useDispatch } from 'react-redux';
 import { fetchCustomerConfigs, fetchCustomerConfigsResponse } from '../../../../actions/customers';
 import { YBTabsPanel } from '../../../panels';
 
-import awss3Logo from '../images/aws-s3.png';
-import azureLogo from '../images/azure_logo.svg';
-import gcsLogo from '../images/gcs-logo.png';
-import nfsIcon from '../images/nfs.svg';
+import AwsS3Logo from '../images/aws-s3.png';
+import AzureLogo from '../images/azure_logo.svg?img';
+import GcsLogo from '../images/gcs-logo.png';
+import NfsLogo from '../images/nfs.svg?img';
 import { AWSBackupConfig } from './AWS';
 import { AzureBackupConfig } from './AZURE';
 import { GCSBackupConfig } from './GCS';
@@ -28,25 +28,25 @@ const getTabTitle = (configName: IStorageProviders) => {
     case IStorageProviders.AWS:
       return (
         <span>
-          <img src={awss3Logo} alt="AWS S3" className="s3-logo" /> Amazon S3
+          <img src={AwsS3Logo} alt="AWS S3" className="s3-logo" /> Amazon S3
         </span>
       );
     case IStorageProviders.GCS:
       return (
         <span>
-          <img src={gcsLogo} alt="Google Cloud Storage" className="gcs-logo" /> Google Cloud Storage
+          <img src={GcsLogo} alt="Google Cloud Storage" className="gcs-logo" /> Google Cloud Storage
         </span>
       );
     case IStorageProviders.NFS:
       return (
         <span>
-          <img src={nfsIcon} alt="NFS" className="nfs-icon" /> Network File System
+          <img src={NfsLogo} alt="NFS" className="nfs-icon" /> Network File System
         </span>
       );
     case IStorageProviders.AZURE:
       return (
         <span>
-          <img src={azureLogo} alt="Azure" className="azure-logo" /> Azure Storage
+          <img src={AzureLogo} alt="Azure" className="azure-logo" /> Azure Storage
         </span>
       );
     default:
@@ -61,7 +61,6 @@ interface NewStorageConfigurationProps {
 export const NewStorageConfiguration: FC<NewStorageConfigurationProps> = ({ activeTab }) => {
   const tabToDisplay = activeTab ?? IStorageProviders.AWS;
   const dispatch: any = useDispatch();
-
 
   const fetchConfigs = () => {
     dispatch(fetchCustomerConfigs()).then((response: any) => {

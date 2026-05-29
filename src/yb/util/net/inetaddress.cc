@@ -1,4 +1,4 @@
-// Copyright (c) YugaByte, Inc.
+// Copyright (c) YugabyteDB, Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License"); you may not use this file except
 // in compliance with the License.  You may obtain a copy of the License at
@@ -27,7 +27,6 @@ using std::vector;
 using boost::asio::ip::address;
 using boost::asio::ip::address_v4;
 using boost::asio::ip::address_v6;
-using boost::asio::ip::tcp;
 
 namespace yb {
 
@@ -157,8 +156,8 @@ void FilterAddresses(const string& filter_spec, vector<IpAddress>* addresses) {
     if (filter_it != kFilters->end()) {
       filters.push_back(&filter_it->second);
     } else {
-      LOG(ERROR) << "Unknown filter spec " << filter_name << " in filter spec "
-                 << filter_spec;
+      LOG(DFATAL) << "Unknown filter spec " << filter_name << " in filter spec "
+                  << filter_spec;
     }
   }
 

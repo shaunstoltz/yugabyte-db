@@ -1,4 +1,4 @@
-// Copyright (c) YugaByte, Inc.
+// Copyright (c) YugabyteDB, Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License"); you may not use this file except
 // in compliance with the License.  You may obtain a copy of the License at
@@ -43,7 +43,17 @@ class ConsensusContext {
 
   virtual void SetPropagatedSafeTime(HybridTime ht) = 0;
 
+  // Set the propagated safe time of the mvcc.
+  virtual void SetMvccPropagatedSafeTime(HybridTime ht) = 0;
+
   virtual bool ShouldApplyWrite() = 0;
+
+  // Returns true if writes are hard-stopped on any backing store (regular_db or intents_db).
+  // Unlike ShouldApplyWrite(), this only checks for hard stops (not delays) and is safe
+  // to call outside ReplicaState's lock. Used by RaftConsensus::Update() to reject
+  // UpdateConsensus RPCs before acquiring update_mutex_, preventing RPC thread pile-up
+  // when a DB is stalled. See #30728.
+  virtual bool AreWritesStopped() = 0;
 
   // Performs steps to prepare request for peer.
   // For instance it could enqueue some operations to the Raft.
@@ -53,8 +63,11 @@ class ConsensusContext {
 
   // This is called every time majority-replicated watermarks (OpId / leader leases) change. This is
   // used for updating the "propagated safe time" value in MvccManager and unblocking readers
-  // waiting for it to advance.
-  virtual void MajorityReplicated() = 0;
+  // waiting for it to advance, and notifying async write operations of completion.
+  virtual Status MajorityReplicated(const OpId& committed_op_id) = 0;
+
+  // This is called when a LEADER transitions to a follower or learner.
+  virtual void BecomeReplica() = 0;
 
   // This is called every time the Raft config was changed and replicated.
   // This is used to notify the higher layer about the config change. Currently it's

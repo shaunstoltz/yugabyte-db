@@ -1,5 +1,5 @@
 /*
- * Copyright 2019 YugaByte, Inc. and Contributors
+ * Copyright 2019 YugabyteDB, Inc. and Contributors
  *
  * Licensed under the Polyform Free Trial License 1.0.0 (the "License"); you
  * may not use this file except in compliance with the License. You
@@ -20,7 +20,7 @@ import javax.inject.Singleton;
 
 @Singleton
 public class EncryptionAtRestUniverseKeyCache {
-  private class EncryptionAtRestUniverseKeyCacheEntry {
+  private static class EncryptionAtRestUniverseKeyCacheEntry {
     private String keyRef;
     private String keyVal;
 

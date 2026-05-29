@@ -1,20 +1,40 @@
-// Copyright (c) Yugabyte, Inc.
+// Copyright (c) YugabyteDB, Inc.
 
 package com.yugabyte.yw.models;
 
+import static com.yugabyte.yw.models.helpers.CommonUtils.appendInClause;
 import static io.swagger.annotations.ApiModelProperty.AccessMode.READ_ONLY;
 import static play.mvc.Http.Status.BAD_REQUEST;
 
+import com.fasterxml.jackson.annotation.JsonFormat;
 import com.fasterxml.jackson.annotation.JsonIgnore;
+import com.google.common.annotations.VisibleForTesting;
 import com.google.common.collect.ImmutableSet;
 import com.yugabyte.yw.common.PlatformServiceException;
 import com.yugabyte.yw.common.certmgmt.CertificateHelper;
+import com.yugabyte.yw.common.concurrent.KeyLock;
+import com.yugabyte.yw.models.common.YbaApi;
+import com.yugabyte.yw.models.common.YbaApi.YbaApiVisibility;
+import com.yugabyte.yw.models.filters.NodeAgentFilter;
+import com.yugabyte.yw.models.helpers.TransactionUtil;
+import com.yugabyte.yw.models.helpers.YBAError;
+import com.yugabyte.yw.models.paging.PagedQuery;
+import com.yugabyte.yw.models.paging.PagedQuery.SortByIF;
+import com.yugabyte.yw.nodeagent.ServerInfo;
+import io.ebean.DB;
 import io.ebean.ExpressionList;
 import io.ebean.Finder;
 import io.ebean.Model;
+import io.ebean.PersistenceContextScope;
 import io.ebean.annotation.DbJson;
-import io.ebean.annotation.UpdatedTimestamp;
+import io.ebean.annotation.WhenModified;
+import io.swagger.annotations.ApiModel;
 import io.swagger.annotations.ApiModelProperty;
+import jakarta.persistence.Column;
+import jakarta.persistence.Entity;
+import jakarta.persistence.EnumType;
+import jakarta.persistence.Enumerated;
+import jakarta.persistence.Id;
 import java.io.ByteArrayInputStream;
 import java.io.File;
 import java.io.IOException;
@@ -30,26 +50,37 @@ import java.util.Collection;
 import java.util.Collections;
 import java.util.Date;
 import java.util.EnumSet;
+import java.util.List;
 import java.util.Map;
 import java.util.Objects;
 import java.util.Optional;
 import java.util.Set;
 import java.util.UUID;
+import java.util.function.Consumer;
 import java.util.stream.Collectors;
-import javax.persistence.Column;
-import javax.persistence.Entity;
-import javax.persistence.EnumType;
-import javax.persistence.Enumerated;
-import javax.persistence.Id;
+import lombok.AccessLevel;
+import lombok.Getter;
+import lombok.Setter;
 import lombok.extern.slf4j.Slf4j;
-import org.apache.commons.io.FileUtils;
+import org.apache.commons.collections4.CollectionUtils;
+import org.apache.commons.lang3.ArrayUtils;
 import org.apache.commons.lang3.EnumUtils;
 import org.apache.commons.lang3.StringUtils;
+import org.apache.commons.lang3.builder.ToStringBuilder;
+import org.apache.commons.lang3.builder.ToStringStyle;
 import play.mvc.Http.Status;
 
 @Slf4j
 @Entity
+@Getter
+@Setter
+@ApiModel(description = "Node agent details")
 public class NodeAgent extends Model {
+  public static final KeyLock<UUID> NODE_AGENT_KEY_LOCK = new KeyLock<UUID>();
+  public static final String NODE_AGENT_DIR = "node-agent";
+
+  private static final Set<State> INACTIVE_STATES =
+      ImmutableSet.of(State.REGISTERING, State.REGISTERED);
 
   /** Node agent server OS type. */
   public enum OSType {
@@ -94,6 +125,12 @@ public class NodeAgent extends Model {
   /** State and the transitions. */
   public enum State {
     REGISTERING {
+      @Override
+      public Set<State> nextStates() {
+        return toSet(READY, REGISTERED);
+      }
+    },
+    REGISTERED {
       @Override
       public Set<State> nextStates() {
         return toSet(READY);
@@ -142,12 +179,19 @@ public class NodeAgent extends Model {
     }
   }
 
+  @Getter
+  @Setter
+  public static class Config {
+    private String certPath;
+    private String serverCert;
+    private String serverKey;
+    private boolean offloadable;
+    private String compressor;
+  }
+
   public static final Finder<UUID, NodeAgent> finder =
       new Finder<UUID, NodeAgent>(NodeAgent.class) {};
 
-  public static final String CERT_DIR_PATH_PROPERTY = "certPath";
-  public static final String SERVER_CERT_PROPERTY = "serverCert";
-  public static final String SERVER_KEY_PROPERTY = "serverKey";
   public static final String ROOT_CA_CERT_NAME = "ca.root.crt";
   public static final String ROOT_CA_KEY_NAME = "ca.key.pem";
   public static final String SERVER_CERT_NAME = "server.crt";
@@ -155,53 +199,97 @@ public class NodeAgent extends Model {
   public static final String MERGED_ROOT_CA_CERT_NAME = "merged.ca.key.crt";
 
   @Id
-  @ApiModelProperty(accessMode = READ_ONLY)
-  public UUID uuid;
+  @ApiModelProperty(value = "Node agent UUID", accessMode = READ_ONLY)
+  private UUID uuid;
 
-  @ApiModelProperty(accessMode = READ_ONLY)
-  public String name;
+  @ApiModelProperty(value = "Node agent name", accessMode = READ_ONLY)
+  private String name;
 
-  @ApiModelProperty(accessMode = READ_ONLY)
-  public String ip;
+  @ApiModelProperty(value = "Node agent server IP", accessMode = READ_ONLY)
+  private String ip;
 
-  @ApiModelProperty(accessMode = READ_ONLY)
-  public int port;
+  @ApiModelProperty(value = "Node agent server port", accessMode = READ_ONLY)
+  private int port;
 
-  @ApiModelProperty(accessMode = READ_ONLY)
-  public UUID customerUuid;
+  @ApiModelProperty(value = "Customer UUID", accessMode = READ_ONLY)
+  private UUID customerUuid;
 
-  @ApiModelProperty(accessMode = READ_ONLY)
-  public String version;
+  @ApiModelProperty(value = "Node agent installed version", accessMode = READ_ONLY)
+  private String version;
 
   @Enumerated(EnumType.STRING)
-  @ApiModelProperty(accessMode = READ_ONLY)
-  public State state;
+  @ApiModelProperty(value = "Node agent state", accessMode = READ_ONLY)
+  @Setter(AccessLevel.NONE)
+  private State state;
 
-  @UpdatedTimestamp
+  @WhenModified
   @Column(nullable = false)
-  @ApiModelProperty(value = "Updated time", accessMode = READ_ONLY, example = "1624295239113")
-  public Date updatedAt;
+  @JsonFormat(shape = JsonFormat.Shape.STRING, pattern = "yyyy-MM-dd'T'HH:mm:ss'Z'")
+  @ApiModelProperty(
+      value = "Updated time",
+      accessMode = READ_ONLY,
+      example = "2022-12-21T13:07:18Z")
+  private Date updatedAt;
 
-  @ApiModelProperty(accessMode = READ_ONLY)
+  @ApiModelProperty(value = "Node agent configuration", accessMode = READ_ONLY)
   @Column(nullable = false)
   @DbJson
-  public Map<String, String> config;
+  private Config config;
 
   @Enumerated(EnumType.STRING)
-  @ApiModelProperty(accessMode = READ_ONLY)
-  public OSType osType;
+  @ApiModelProperty(value = "Node agent host OS", accessMode = READ_ONLY)
+  private OSType osType;
 
   @Enumerated(EnumType.STRING)
-  @ApiModelProperty(accessMode = READ_ONLY)
-  public ArchType archType;
+  @ApiModelProperty(value = "Node agent host machine arch", accessMode = READ_ONLY)
+  private ArchType archType;
+
+  @ApiModelProperty(value = "Node agent installation directory", accessMode = READ_ONLY)
+  @Column(nullable = false)
+  private String home;
+
+  @ApiModelProperty(
+      value = "WARNING: This is a preview API that could change. Last error of node agent.",
+      accessMode = READ_ONLY)
+  @YbaApi(visibility = YbaApiVisibility.PREVIEW, sinceYBAVersion = "2024.2.1")
+  @Column(columnDefinition = "TEXT")
+  @DbJson
+  private YBAError lastError;
+
+  public enum SortBy implements PagedQuery.SortByIF {
+    uuid("uuid"),
+    ip("ip"),
+    name("name"),
+    state("state"),
+    updatedAt("updatedAt"),
+    version("version");
+
+    private final String sortField;
+
+    SortBy(String sortField) {
+      this.sortField = sortField;
+    }
+
+    public String getSortField() {
+      return sortField;
+    }
+
+    @Override
+    public SortByIF getOrderField() {
+      return SortBy.uuid;
+    }
+  }
+
+  public void setState(State state) {
+    if (this.state != null) {
+      this.state.validateTransition(state);
+    }
+    this.state = state;
+    setLastError(null);
+  }
 
   public static Optional<NodeAgent> maybeGet(UUID uuid) {
-    NodeAgent nodeAgent = finder.byId(uuid);
-    if (nodeAgent == null) {
-      log.trace("Cannot find node-agent {}", uuid);
-      return Optional.empty();
-    }
-    return Optional.of(nodeAgent);
+    return Optional.ofNullable(finder.byId(uuid));
   }
 
   public static Optional<NodeAgent> maybeGetByIp(String ip) {
@@ -217,6 +305,14 @@ public class NodeAgent extends Model {
     return nodeAgent;
   }
 
+  public static NodeAgent getOrBadRequest(UUID nodeAgentUuid) {
+    return NodeAgent.maybeGet(nodeAgentUuid)
+        .orElseThrow(
+            () ->
+                new PlatformServiceException(
+                    BAD_REQUEST, "Cannot find node agent " + nodeAgentUuid));
+  }
+
   public static Collection<NodeAgent> list(UUID customerUuid, String nodeAgentIp /* Optional */) {
     ExpressionList<NodeAgent> expr = finder.query().where().eq("customer_uuid", customerUuid);
     if (StringUtils.isNotBlank(nodeAgentIp)) {
@@ -225,12 +321,32 @@ public class NodeAgent extends Model {
     return expr.findList();
   }
 
-  public static Set<NodeAgent> getNodeAgents(UUID customerUuid) {
+  public static Set<NodeAgent> getAll(UUID customerUuid) {
     return finder.query().where().eq("customer_uuid", customerUuid).findSet();
   }
 
   public static Set<NodeAgent> getAll() {
     return finder.query().findSet();
+  }
+
+  public static List<NodeAgent> getByIps(UUID customerUuid, Set<String> ips) {
+    ExpressionList<NodeAgent> query = finder.query().where().eq("customerUuid", customerUuid);
+    appendInClause(query, "ip", ips);
+    return query.findList();
+  }
+
+  public static int count(UUID customerUuid, Set<String> ips, State... states) {
+    ExpressionList<NodeAgent> query =
+        finder
+            .query()
+            .setPersistenceContextScope(PersistenceContextScope.QUERY)
+            .where()
+            .eq("customerUuid", customerUuid);
+    appendInClause(query, "ip", ips);
+    if (states != null && ArrayUtils.isNotEmpty(states)) {
+      appendInClause(query, "state", Arrays.stream(states).collect(Collectors.toSet()));
+    }
+    return query.findCount();
   }
 
   public static Set<NodeAgent> getUpdatableNodeAgents(UUID customerUuid, String softwareVersion) {
@@ -242,24 +358,64 @@ public class NodeAgent extends Model {
         .findSet();
   }
 
+  public static ExpressionList<NodeAgent> createQuery(UUID customerUuid, Set<UUID> nodeAgentUuids) {
+    ExpressionList<NodeAgent> query =
+        finder
+            .query()
+            .setPersistenceContextScope(PersistenceContextScope.QUERY)
+            .where()
+            .eq("customer_uuid", customerUuid);
+    if (CollectionUtils.isEmpty(nodeAgentUuids)) {
+      query = query.isNull("uuid");
+    } else {
+      appendInClause(query, "uuid", nodeAgentUuids);
+    }
+    return query;
+  }
+
   public static void delete(UUID uuid) {
     finder.deleteById(uuid);
   }
 
+  private void updateInTxn(Consumer<NodeAgent> consumer) {
+    NODE_AGENT_KEY_LOCK.acquireLock(getUuid());
+    try {
+      TransactionUtil.doInTxn(
+          () -> consumer.accept(NodeAgent.getOrBadRequest(getUuid())),
+          TransactionUtil.DEFAULT_RETRY_CONFIG);
+      // Reload the record from the DB.
+      refresh();
+    } finally {
+      NODE_AGENT_KEY_LOCK.releaseLock(getUuid());
+    }
+  }
+
+  @Override
+  public String toString() {
+    return new ToStringBuilder(this, ToStringStyle.NO_CLASS_NAME_STYLE)
+        .append("uuid", getUuid())
+        .append("ip", getIp())
+        .append("port", getPort())
+        .append("state", getState())
+        .append("home", getHome())
+        .append("version", getVersion())
+        .build();
+  }
+
   public void ensureState(State expectedState) {
-    if (state != expectedState) {
+    if (getState() != expectedState) {
       throw new PlatformServiceException(
           Status.CONFLICT,
           String.format(
-              "Invalid current node agent state %s, expected state %s", state, expectedState));
+              "Invalid current node agent state %s, expected state %s", getState(), expectedState));
     }
   }
 
   public void validateStateTransition(State nextState) {
-    if (state == null) {
+    if (getState() == null) {
       throw new PlatformServiceException(Status.BAD_REQUEST, "Node agent state must be set");
     }
-    state.validateTransition(nextState);
+    getState().validateTransition(nextState);
   }
 
   @JsonIgnore
@@ -285,16 +441,35 @@ public class NodeAgent extends Model {
   }
 
   public void saveState(State state) {
-    validateStateTransition(state);
-    this.state = state;
-    save();
+    updateInTxn(
+        n -> {
+          n.setState(state);
+          n.update();
+        });
+  }
+
+  public void finalizeUpgrade(String nodeAgentHome, String version) {
+    updateInTxn(
+        n -> {
+          n.setHome(nodeAgentHome);
+          n.setVersion(version);
+          n.setState(State.READY);
+          n.update();
+        });
   }
 
   public void heartbeat() {
-    Date current = new Date();
-    if (db().update(NodeAgent.class).set("updatedAt", current).where().eq("uuid", uuid).update()
+    if (getState() == State.READY) {
+      clearLastError();
+    }
+    updateTimestamp(new Date());
+  }
+
+  @VisibleForTesting
+  public void updateTimestamp(Date date) {
+    if (db().update(NodeAgent.class).set("updatedAt", date).where().eq("uuid", getUuid()).update()
         > 0) {
-      updatedAt = current;
+      setUpdatedAt(date);
     }
   }
 
@@ -303,7 +478,7 @@ public class NodeAgent extends Model {
       try {
         File file = certDir.toFile();
         if (file.exists()) {
-          FileUtils.deleteDirectory(file);
+          FileData.deleteFiles(file.getAbsolutePath(), true);
         }
       } catch (Exception e) {
         log.warn("Error deleting cert directory {}", certDir, e);
@@ -320,9 +495,7 @@ public class NodeAgent extends Model {
   @JsonIgnore
   public PublicKey getPublicKey() {
     try {
-      CertificateFactory factory = CertificateFactory.getInstance("X.509");
-      X509Certificate cert =
-          (X509Certificate) factory.generateCertificate(new ByteArrayInputStream(getServerCert()));
+      X509Certificate cert = getServerX509Cert();
       return cert.getPublicKey();
     } catch (RuntimeException e) {
       throw e;
@@ -332,37 +505,160 @@ public class NodeAgent extends Model {
   }
 
   @JsonIgnore
+  public X509Certificate getServerX509Cert() {
+    try {
+      CertificateFactory factory = CertificateFactory.getInstance("X.509");
+      return (X509Certificate)
+          factory.generateCertificate(new ByteArrayInputStream(getServerCert()));
+    } catch (RuntimeException e) {
+      throw e;
+    } catch (Exception e) {
+      throw new RuntimeException(e.getMessage(), e);
+    }
+  }
+
+  @JsonIgnore
+  public Date getServerCertExpiry() {
+    // TODO Cache this to avoid doing expensive work in periodic calls.
+    return CertificateHelper.extractDatesFromCertBundle(
+            Collections.singletonList(getServerX509Cert()))
+        .getRight();
+  }
+
+  @JsonIgnore
   public Path getCertDirPath() {
-    String certDirPath = config.get(NodeAgent.CERT_DIR_PATH_PROPERTY);
+    String certDirPath = getConfig().getCertPath();
     if (StringUtils.isBlank(certDirPath)) {
-      throw new IllegalArgumentException(
-          "Missing config key - " + NodeAgent.CERT_DIR_PATH_PROPERTY);
+      throw new IllegalArgumentException("Missing cert path");
     }
     return Paths.get(certDirPath);
   }
 
   @JsonIgnore
   public Path getCaCertFilePath() {
-    return getCertDirPath().resolve(NodeAgent.ROOT_CA_CERT_NAME);
+    return getCertDirPath().resolve(ROOT_CA_CERT_NAME);
   }
 
   @JsonIgnore
   public Path getMergedCaCertFilePath() {
-    return getCertDirPath().resolve(NodeAgent.MERGED_ROOT_CA_CERT_NAME);
+    return getCertDirPath().resolve(MERGED_ROOT_CA_CERT_NAME);
   }
 
   @JsonIgnore
   public Path getServerCertFilePath() {
-    return getCertDirPath().resolve(NodeAgent.SERVER_CERT_NAME);
+    return getCertDirPath().resolve(SERVER_CERT_NAME);
   }
 
   @JsonIgnore
   public Path getServerKeyFilePath() {
-    return getCertDirPath().resolve(NodeAgent.SERVER_KEY_NAME);
+    return getCertDirPath().resolve(SERVER_KEY_NAME);
+  }
+
+  @JsonIgnore
+  public boolean isActive() {
+    return !INACTIVE_STATES.contains(getState());
   }
 
   public void updateCertDirPath(Path certDirPath) {
-    config.put(NodeAgent.CERT_DIR_PATH_PROPERTY, certDirPath.toString());
-    save();
+    updateCertDirPath(certDirPath, null);
+  }
+
+  public void updateCertDirPath(Path certDirPath, State state) {
+    updateInTxn(
+        n -> {
+          if (state != null) {
+            n.setState(state);
+          }
+          n.getConfig().setCertPath(certDirPath.toString());
+          n.update();
+        });
+  }
+
+  public void updateServerInfo(ServerInfo serverInfo) {
+    if (getConfig().isOffloadable() != serverInfo.getOffloadable()
+        || !Objects.equals(getConfig().getCompressor(), serverInfo.getCompressor())) {
+      updateInTxn(
+          n -> {
+            n.getConfig().setOffloadable(serverInfo.getOffloadable());
+            n.getConfig().setCompressor(serverInfo.getCompressor());
+            n.update();
+          });
+    }
+    clearLastError();
+  }
+
+  public void updateLastError(YBAError error) {
+    if (!Objects.equals(error, getLastError())) {
+      updateInTxn(
+          n -> {
+            n.setLastError(error);
+            n.update();
+          });
+    }
+  }
+
+  public void clearLastError() {
+    if (getLastError() != null) {
+      updateLastError(null);
+    }
+  }
+
+  @JsonIgnore
+  public static List<Map<String, Object>> getJoinResults(
+      UUID customerUuid, NodeAgentFilter filter) {
+    StringBuilder sb = new StringBuilder();
+    sb.append("select node_agents.uuid as uuid, universe_uuid, universe_name, provider_uuid,");
+    sb.append(" provider_name, provider_code, region_uuid, region_code, az_uuid, az_code");
+    // Left join node_agents with left join of provider and full join of universe and node_instance.
+    // Node agents can exist without any provider (not yet added).
+    sb.append(" from (select * from node_agent) as node_agents left join");
+    sb.append(" (select p.uuid as provider_uuid, p.name as provider_name,");
+    sb.append(" p.code as provider_code, r.uuid as region_uuid, r.code as region_code,");
+    sb.append(" az.uuid as az_uuid, az.code as az_code");
+    sb.append(" from provider p, region r, availability_zone az");
+    sb.append(" where az.region_uuid = r.uuid and r.provider_uuid = p.uuid) as providers");
+    sb.append(" left join ((select universe_uuid, universe_name,");
+    sb.append(" (node_details->>'azUuid')::uuid as universe_az_uuid,");
+    sb.append(" node_details->'cloudInfo'->>'private_ip' as universe_node_private_ip");
+    sb.append(" from (select universe_uuid as universe_uuid, universe.name as universe_name,");
+    sb.append(" jsonb_array_elements(universe_details_json::jsonb->'nodeDetailsSet')");
+    sb.append(" as node_details from universe) as tmp) as universe_nodes");
+    sb.append(" full join (select zone_uuid, node_details_json::jsonb->>'ip'");
+    sb.append(" as node_instance_ip from node_instance) as node_instances");
+    sb.append(" on node_instance_ip = universe_node_private_ip) as node_instances");
+    sb.append(" on az_uuid = universe_az_uuid or az_uuid = zone_uuid");
+    sb.append(" on node_agents.ip = universe_node_private_ip or node_agents.ip = node_instance_ip");
+    sb.append(" where node_agents.customer_uuid = '").append(customerUuid.toString()).append("'");
+    if (CollectionUtils.isNotEmpty(filter.getNodeIps())) {
+      sb.append(" and node_agents.ip in ('").append(StringUtils.join(filter.getNodeIps(), "','"));
+      sb.append("')");
+    }
+    if (filter.getCloudType() != null) {
+      sb.append(" and provider_code = '").append(filter.getCloudType().name()).append("'");
+    }
+    if (filter.getProviderUuid() != null) {
+      sb.append(" and provider_uuid = '").append(filter.getProviderUuid().toString()).append("'");
+    }
+
+    if (filter.getRegionUuid() != null) {
+      sb.append(" and region_uuid = '").append(filter.getRegionUuid().toString()).append("'");
+    }
+
+    if (filter.getZoneUuid() != null) {
+      sb.append(" and az_uuid = '").append(filter.getZoneUuid().toString()).append("'");
+    }
+    if (filter.getUniverseUuid() != null) {
+      sb.append(" and universe_uuid = '").append(filter.getUniverseUuid().toString()).append("'");
+    }
+    String nodeAgentQuery = sb.toString();
+    log.trace("Running SQL query: {}", nodeAgentQuery);
+    return DB.sqlQuery(nodeAgentQuery).findList().stream()
+        .map(
+            rs ->
+                rs.entrySet().stream()
+                    .filter(e -> e.getValue() != null)
+                    .collect(
+                        Collectors.toMap(Map.Entry::getKey, Map.Entry::getValue, (e1, e2) -> e2)))
+        .collect(Collectors.toList());
   }
 }

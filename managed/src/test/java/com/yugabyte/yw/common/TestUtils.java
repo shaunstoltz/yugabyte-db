@@ -1,5 +1,5 @@
 /*
- * Copyright 2021 YugaByte, Inc. and Contributors
+ * Copyright 2021 YugabyteDB, Inc. and Contributors
  *
  * Licensed under the Polyform Free Trial License 1.0.0 (the "License"); you
  * may not use this file except in compliance with the License. You
@@ -9,24 +9,31 @@
  */
 package com.yugabyte.yw.common;
 
+import static io.prometheus.metrics.model.registry.PrometheusRegistry.defaultRegistry;
+import static org.hamcrest.MatcherAssert.assertThat;
+import static org.hamcrest.Matchers.closeTo;
+import static org.junit.Assert.fail;
+
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.google.common.collect.ImmutableMap;
+import com.yugabyte.yw.controllers.RequestContext;
+import com.yugabyte.yw.controllers.TokenAuthenticator;
+import com.yugabyte.yw.forms.UniverseDefinitionTaskParams;
 import com.yugabyte.yw.models.Users;
 import com.yugabyte.yw.models.extended.UserWithFeatures;
+import io.prometheus.metrics.model.snapshots.CounterSnapshot.CounterDataPointSnapshot;
+import io.prometheus.metrics.model.snapshots.DataPointSnapshot;
+import io.prometheus.metrics.model.snapshots.GaugeSnapshot.GaugeDataPointSnapshot;
+import io.prometheus.metrics.model.snapshots.Labels;
+import io.prometheus.metrics.model.snapshots.MetricSnapshot;
+import io.prometheus.metrics.model.snapshots.MetricSnapshots;
 import java.io.IOException;
 import java.nio.charset.StandardCharsets;
-import java.util.Collections;
-import java.util.Map;
+import java.util.Arrays;
 import java.util.UUID;
 import org.apache.commons.io.IOUtils;
-
 import play.libs.Json;
-import play.mvc.Http;
-import play.mvc.Http.Context;
-
-import static org.mockito.Mockito.mock;
-import static play.test.Helpers.contextComponents;
 
 public class TestUtils {
   public static String readResource(String path) {
@@ -62,16 +69,55 @@ public class TestUtils {
   }
 
   public static void setFakeHttpContext(Users user, String email) {
-    Map<String, String> flashData = Collections.emptyMap();
     if (user != null) {
-      user.email = email;
+      user.setEmail(email);
     }
-    Map<String, Object> argData = ImmutableMap.of("user", new UserWithFeatures().setUser(user));
-    Http.Request request = mock(Http.Request.class);
-    Long id = 2L;
-    play.api.mvc.RequestHeader header = mock(play.api.mvc.RequestHeader.class);
-    Context currentContext =
-        new Context(id, header, request, flashData, flashData, argData, contextComponents());
-    Context.current.set(currentContext);
+    RequestContext.put(TokenAuthenticator.USER, new UserWithFeatures().setUser(user));
+  }
+
+  public static String generateLongString(int length) {
+    char[] chars = new char[length];
+    Arrays.fill(chars, 'A');
+    return new String(chars);
+  }
+
+  public static UniverseDefinitionTaskParams.UserIntentOverrides composeAZOverrides(
+      UUID azUUID, String instanceType, Integer cgroupSize) {
+    UniverseDefinitionTaskParams.UserIntentOverrides result =
+        new UniverseDefinitionTaskParams.UserIntentOverrides();
+    UniverseDefinitionTaskParams.AZOverrides azOverrides =
+        new UniverseDefinitionTaskParams.AZOverrides();
+    azOverrides.setCgroupSize(cgroupSize);
+    azOverrides.setInstanceType(instanceType);
+    result.setAzOverrides(ImmutableMap.of(azUUID, azOverrides));
+    return result;
+  }
+
+  public static void validateMetric(String name, Double value, String... labels) {
+    Double actualValue = getMetricValue(name, labels);
+    if (actualValue == null && value == null) {
+      return;
+    }
+    if (actualValue == null) {
+      fail("Metric value is not found");
+    }
+    assertThat(actualValue, closeTo(value, 0.1));
+  }
+
+  public static Double getMetricValue(String name, String... labels) {
+    MetricSnapshots snapshots = defaultRegistry.scrape(n -> n.equals(name));
+    for (MetricSnapshot snapshot : snapshots) {
+      for (DataPointSnapshot dataPoint : snapshot.getDataPoints()) {
+        if (dataPoint.getLabels().equals(Labels.of(labels))) {
+          if (dataPoint instanceof GaugeDataPointSnapshot) {
+            return ((GaugeDataPointSnapshot) dataPoint).getValue();
+          }
+          if (dataPoint instanceof CounterDataPointSnapshot) {
+            return ((CounterDataPointSnapshot) dataPoint).getValue();
+          }
+        }
+      }
+    }
+    return null;
   }
 }

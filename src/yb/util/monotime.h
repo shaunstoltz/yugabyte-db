@@ -15,9 +15,9 @@
 // specific language governing permissions and limitations
 // under the License.
 //
-// The following only applies to changes made to this file as part of YugaByte development.
+// The following only applies to changes made to this file as part of YugabyteDB development.
 //
-// Portions Copyright (c) YugaByte, Inc.
+// Portions Copyright (c) YugabyteDB, Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License"); you may not use this file except
 // in compliance with the License.  You may obtain a copy of the License at
@@ -34,6 +34,7 @@
 
 #include <chrono>
 #include <cstdint>
+#include <optional>
 #include <string>
 
 #include <gtest/gtest_prod.h>
@@ -74,6 +75,7 @@ class MonoDelta {
   bool MoreThan(const MonoDelta &rhs) const;
   bool Equals(const MonoDelta &rhs) const;
   bool IsNegative() const;
+  std::string ToPrettyString() const;
   std::string ToString() const;
   double ToSeconds() const;
   double ToMinutes() const;
@@ -114,7 +116,7 @@ class MonoDelta {
   MonoDelta operator-() const { return MonoDelta(-nano_delta_); }
 
  private:
-  typedef int64_t NanoDeltaType;
+  using NanoDeltaType = int64_t;
   static const NanoDeltaType kUninitialized;
 
   FRIEND_TEST(TestMonoTime, TestDeltaConversions);
@@ -147,7 +149,12 @@ inline std::ostream& operator<<(std::ostream& out, MonoDelta delta) {
 // This time is monotonic, meaning that if the user changes his or her system
 // clock, the monotime does not change.
 class MonoTime {
+  using Clock = std::chrono::steady_clock;
+  using Duration = Clock::duration;
+
  public:
+  using TimePoint = Clock::time_point;
+
   static constexpr int64_t kNanosecondsPerMicrosecond = 1000L;
   static constexpr int64_t kMicrosecondsPerMillisecond = 1000L;
   static constexpr int64_t kMillisecondsPerSecond = 1000L;
@@ -156,11 +163,17 @@ class MonoTime {
   static constexpr int64_t kMinutesPerHour = 60L;
   static constexpr int64_t kHoursPerDay = 24L;
 
-  static constexpr int64_t kNanosecondsPerMillisecond =
-      kNanosecondsPerMicrosecond * kMicrosecondsPerMillisecond;
+  static constexpr int64_t kMillisecondsPerMinute =
+      kMillisecondsPerSecond * kSecondsPerMinute;
+
+  static constexpr int64_t kMillisecondsPerHour =
+      kMillisecondsPerMinute * kMinutesPerHour;
 
   static constexpr int64_t kMicrosecondsPerSecond =
       kMillisecondsPerSecond * kMicrosecondsPerMillisecond;
+
+  static constexpr int64_t kNanosecondsPerMillisecond =
+      kNanosecondsPerMicrosecond * kMicrosecondsPerMillisecond;
 
   static constexpr int64_t kNanosecondsPerSecond =
       kNanosecondsPerMillisecond * kMillisecondsPerSecond;
@@ -178,23 +191,34 @@ class MonoTime {
   static const MonoTime kMax;
   static const MonoTime kUninitialized;
 
+  // Connvert timespec to microseconds.
+  static uint64_t TimespecToMicros(const struct timespec& ts) {
+    return ts.tv_sec * kMicrosecondsPerSecond +
+           ts.tv_nsec / kNanosecondsPerMicrosecond;
+  }
+
   // The coarse monotonic time is faster to retrieve, but "only" accurate to within a millisecond or
   // two.  The speed difference will depend on your timer hardware.
   static MonoTime Now();
+  static MonoTime NowPlus(MonoDelta delta);
+
+  static MonoTime NowIf(bool flag) {
+    return flag ? Now() : MonoTime();
+  }
 
   // Return MonoTime equal to farthest possible time into the future.
-  static MonoTime Max();
+  static constexpr MonoTime Max();
 
   // Return MonoTime equal to farthest possible time into the past.
-  static MonoTime Min();
+  static constexpr MonoTime Min();
 
   // Return the earliest (minimum) of the two monotimes.
   static const MonoTime& Earliest(const MonoTime& a, const MonoTime& b);
 
-  MonoTime() noexcept {}
-  MonoTime(std::chrono::steady_clock::time_point value) : value_(value) {} // NOLINT
+  constexpr MonoTime() noexcept {}
+  constexpr MonoTime(TimePoint value) : value_(value) {} // NOLINT
 
-  bool Initialized() const { return value_ != std::chrono::steady_clock::time_point(); }
+  bool Initialized() const { return value_ != TimePoint(); }
 
   MonoDelta GetDeltaSince(const MonoTime &rhs) const;
   MonoDelta GetDeltaSinceMin() const { return GetDeltaSince(Min()); }
@@ -202,14 +226,19 @@ class MonoTime {
   void SubtractDelta(const MonoDelta &delta);
   bool ComesBefore(const MonoTime &rhs) const;
   std::string ToString() const;
+  std::string ToFormattedString(const std::string& format = "%Y-%m-%d %H:%M:%S %Z") const;
   bool Equals(const MonoTime& other) const;
   bool IsMax() const;
   bool IsMin() const;
 
+  template <class Rep, class Period>
+  static MonoTime FromDuration(const std::chrono::duration<Rep, Period>& dur) {
+    return TimePoint{std::chrono::duration_cast<Duration>(dur)};
+  }
+
   uint64_t ToUint64() const { return value_.time_since_epoch().count(); }
   static MonoTime FromUint64(uint64_t value) {
-    return MonoTime(std::chrono::steady_clock::time_point(std::chrono::steady_clock::duration(
-        value)));
+    return TimePoint{Duration{value}};
   }
 
   explicit operator bool() const { return Initialized(); }
@@ -218,18 +247,38 @@ class MonoTime {
   // Set this time to the given value if it is lower than that or uninitialized.
   void MakeAtLeast(MonoTime rhs);
 
-  std::chrono::steady_clock::time_point ToSteadyTimePoint() const {
+  void MakeAtMost(MonoTime rhs);
+
+  TimePoint ToSteadyTimePoint() const {
     return value_;
   }
 
  private:
   double ToSeconds() const;
 
-  std::chrono::steady_clock::time_point value_;
+  TimePoint value_;
 };
+
+constexpr MonoTime MonoTime::Min() {
+  return MonoTime(std::chrono::steady_clock::time_point(std::chrono::steady_clock::duration(1)));
+}
+
+constexpr MonoTime MonoTime::Max() {
+  return MonoTime(std::chrono::steady_clock::time_point::max());
+}
+
+inline constexpr MonoTime MonoTime::kMin = MonoTime::Min();
+inline constexpr MonoTime MonoTime::kMax = MonoTime::Max();
+inline constexpr MonoTime MonoTime::kUninitialized = MonoTime();
 
 inline MonoTime& operator+=(MonoTime& lhs, const MonoDelta& rhs) { // NOLINT
   lhs.AddDelta(rhs);
+  return lhs;
+}
+
+template <class Clock>
+inline auto operator+=(std::chrono::time_point<Clock>& lhs, const MonoDelta& rhs) { // NOLINT
+  lhs += rhs.ToSteadyDuration();
   return lhs;
 }
 
@@ -245,6 +294,11 @@ inline auto operator+(const std::chrono::time_point<Clock>& lhs, const MonoDelta
 
 inline MonoDelta operator-(const MonoTime& lhs, const MonoTime& rhs) {
   return lhs.GetDeltaSince(rhs);
+}
+
+template <class Clock>
+inline auto operator-(const std::chrono::time_point<Clock>& lhs, const MonoDelta& rhs) {
+  return lhs - rhs.ToSteadyDuration();
 }
 
 inline MonoTime& operator-=(MonoTime& lhs, const MonoDelta& rhs) { // NOLINT
@@ -282,12 +336,12 @@ void SleepUntil(const MonoTime& deadline);
 // any use cases that just need a locally monotonic clock.
 class CoarseMonoClock {
  public:
-  typedef std::chrono::nanoseconds duration;
-  typedef duration Duration;
-  typedef std::chrono::time_point<CoarseMonoClock> time_point;
-  typedef time_point TimePoint;
-  typedef time_point::period period;
-  typedef time_point::rep rep;
+  using duration = std::chrono::nanoseconds;
+  using Duration = duration;
+  using time_point = std::chrono::time_point<CoarseMonoClock>;
+  using TimePoint = time_point;
+  using period = time_point::period;
+  using rep = time_point::rep;
 
   static constexpr bool is_steady = true;
 
@@ -303,8 +357,8 @@ typename Clock::duration ClockResolution() {
 template <>
 CoarseMonoClock::Duration ClockResolution<CoarseMonoClock>();
 
-typedef CoarseMonoClock::TimePoint CoarseTimePoint;
-typedef CoarseMonoClock::Duration CoarseDuration;
+using CoarseTimePoint = CoarseMonoClock::TimePoint;
+using CoarseDuration = CoarseMonoClock::Duration;
 
 template <class Rep, class Period>
 int64_t ToMilliseconds(const std::chrono::duration<Rep, Period>& duration) {
@@ -337,6 +391,26 @@ std::string ToString(CoarseMonoClock::TimePoint value);
 CoarseTimePoint ToCoarse(MonoTime monotime);
 std::chrono::steady_clock::time_point ToSteady(CoarseTimePoint time_point);
 
+// Returns false if the given time point is the minimum possible value of CoarseTimePoint. The
+// implementation is consistent with MonoDelta's notion of being initialized, looking at the time
+// since epoch. Note that CoarseTimePoint::min() is not the default value of a CoarseTimePoint.
+// Its default value is a time point represented by zero, which may be an arbitrary point in time,
+// since CLOCK_MONOTONIC represents monotonic time since some unspecified starting point.
 bool IsInitialized(CoarseTimePoint time_point);
+
+// Returns true if the given time point is either the minimum or maximum possible value.
+bool IsExtremeValue(CoarseTimePoint time_point);
+
+// Formats the given time point in the form "<time> (<relation_to_now>)" where <relation_to_now>
+// is either "<interval> from now" or "<interval> ago", depending on whether the given point in
+// time is before or after the current moment, passed in as "now".
+std::string ToStringRelativeToNow(CoarseTimePoint t, CoarseTimePoint now);
+
+// The same as above but skips the relative part if `now` is not specified.
+std::string ToStringRelativeToNow(CoarseTimePoint t, std::optional<CoarseTimePoint> now);
+
+// Only returns the relation of t to now (the parenthesized part of the ToStringRelativeToNow
+// return value, without the parentheses).
+std::string ToStringRelativeToNowOnly(CoarseTimePoint t, CoarseTimePoint now);
 
 } // namespace yb

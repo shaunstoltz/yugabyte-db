@@ -4,9 +4,12 @@ headerTitle: SELECT
 linkTitle: SELECT
 description: Use the SELECT statement to retrieve (part of) rows of specified columns that meet a given condition from a table.
 menu:
-  stable:
+  stable_api:
     parent: api-cassandra
     weight: 1310
+aliases:
+  - /stable/api/cassandra/dml_select
+  - /stable/api/ycql/dml_select
 type: docs
 ---
 
@@ -43,7 +46,7 @@ Where
 
 - `table_name` and `column_name` are identifiers (`table_name` may be qualified with a keyspace name).
 - `limit_expression` is an integer literal (or a bind variable marker for prepared statements).
-- Restrictions for `where_expression` are discussed in the Semantics section below.
+- Restrictions for `where_expression` are discussed in the Semantics section.
 - See [Expressions](..#expressions) for more information on syntax rules.
 
 ## Semantics
@@ -53,6 +56,10 @@ Where
 - `*` means all columns of the table will be retrieved.
 - `LIMIT` clause sets the maximum number of results (rows) to be returned.
 - `OFFSET` clause sets the number of rows to be skipped before returning results.
+- `ALLOW FILTERING` is provided for syntax compatibility with Cassandra. You can always filter on all columns.
+- Reads default to `QUORUM` and read from the tablet-leader.
+- To read from followers use `ONE` consistency level.
+- To benefit from local reads, in addition to specifying the consistency level of `ONE`, set the `region` also in the client driver to indicate where the request is coming from, and it should match the `--placement_region` argument for the yb-tservers in that region.
 
 ### `ORDER BY` clause
 
@@ -205,7 +212,7 @@ ycqlsh:example> SELECT * FROM employees WHERE department_id = 1 AND employee_id 
 ### Select with condition on a regular column, using WHERE clause
 
 ```sql
-ycqlsh:example> SELECT * FROM employees WHERE department_id = 1 AND employee_name = 'John' ALLOW FILTERING;
+ycqlsh:example> SELECT * FROM employees WHERE employee_name = 'John';
 ```
 
 ```output

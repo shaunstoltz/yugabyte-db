@@ -1,5 +1,5 @@
 //--------------------------------------------------------------------------------------------------
-// Copyright (c) YugaByte, Inc.
+// Copyright (c) YugabyteDB, Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License"); you may not use this file except
 // in compliance with the License.  You may obtain a copy of the License at
@@ -139,7 +139,7 @@ TEST_F(TestQLInsertTable, TestQLInsertCast) {
 
   // Get a processor.
   TestQLProcessor *processor = GetQLProcessor();
-  std::shared_ptr<QLRowBlock> row_block;
+  std::shared_ptr<qlexpr::QLRowBlock> row_block;
   LOG(INFO) << "Test inserting with cast(... as text) built-in.";
 
   // Create table.
@@ -197,7 +197,7 @@ TEST_F(TestQLInsertTable, TestQLInsertToJson) {
 
   // Get a processor.
   TestQLProcessor *processor = GetQLProcessor();
-  std::shared_ptr<QLRowBlock> row_block;
+  std::shared_ptr<qlexpr::QLRowBlock> row_block;
   LOG(INFO) << "Test inserting with ToJson() built-in.";
 
   auto to_json_str = [](const QLValue& value) -> string {

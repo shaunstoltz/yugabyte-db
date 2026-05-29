@@ -1,5 +1,5 @@
 //
-// Copyright (c) YugaByte, Inc.
+// Copyright (c) YugabyteDB, Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License"); you may not use this file except
 // in compliance with the License.  You may obtain a copy of the License at
@@ -51,7 +51,11 @@ class SplitOperation
 
   static Status RejectionStatus(
       OpId split_op_id, OpId rejected_op_id, consensus::OperationType op_type,
-      const TabletId& child1, const TabletId& child2);
+      const std::vector<TabletId>& children);
+
+  bool use_mvcc() const override {
+    return true;
+  }
 
  private:
   Status Prepare(IsLeaderSide is_leader_side) override;

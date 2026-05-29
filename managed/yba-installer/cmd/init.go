@@ -1,20 +1,28 @@
 /*
- * Copyright (c) YugaByte, Inc.
+ * Copyright (c) YugabyteDB, Inc.
  */
 
 package cmd
 
 import (
-	"errors"
 	"fmt"
-	"io/fs"
 	"os"
-	"path/filepath"
+	osuser "os/user"
+	"strings"
 
-	"github.com/spf13/cobra"
 	"github.com/spf13/viper"
-	"github.com/yugabyte/yugabyte-db/managed/yba-installer/common"
-	log "github.com/yugabyte/yugabyte-db/managed/yba-installer/logging"
+	"github.com/yugabyte/yugabyte-db/managed/yba-installer/pkg/common"
+	"github.com/yugabyte/yugabyte-db/managed/yba-installer/pkg/components"
+	"github.com/yugabyte/yugabyte-db/managed/yba-installer/pkg/components/ybactl"
+	"github.com/yugabyte/yugabyte-db/managed/yba-installer/pkg/config"
+	log "github.com/yugabyte/yugabyte-db/managed/yba-installer/pkg/logging"
+	"github.com/yugabyte/yugabyte-db/managed/yba-installer/pkg/preflight/checks"
+)
+
+var (
+	PostgresVersion    string = ""
+	PrometheusVersion  string = ""
+	PerfAdvisorVersion string = ""
 )
 
 // Get the commands that will require yba-ctl.yml to be setup before getting run
@@ -22,101 +30,128 @@ import (
 func cmdsRequireConfigInit() []string {
 	return []string{
 		"yba-ctl install",
-		"yba-ctl license",
-		"yba-ctl license update",
 		"yba-ctl upgrade",
 		"yba-ctl preflight",
 	}
 }
 
-// List of services required for YBA installation.
-var services map[string]common.Component
-var serviceOrder []string
+var ybaCtl *ybactl.YbaCtlComponent
 
 func initAfterFlagsParsed(cmdName string) {
-	if force {
-		common.DisableUserConfirm()
-	}
-
 	// init logging and set log level for stdout
 	log.Init(logLevel)
 
-	// verify that we have a conf file
+	if force {
+		common.DisableUserConfirm()
+	}
+	// verify that we have a conf file, or create it if necessary
 	if common.Contains(cmdsRequireConfigInit(), cmdName) {
 		ensureInstallerConfFile()
 	}
 
+	// Load the config after confirming config file
 	common.InitViper()
 
-	log.AddOutputFile(common.YbaCtlLogFile)
-	log.Trace(fmt.Sprintf("yba-ctl started with cmd %s", cmdName))
+	// Replicated migration handles config and root checks on its own.
+	// License does not need any config, so skip for now
+	// Generate config will create the config, and set as_root as needed.
+	if !(strings.HasPrefix(cmdName, "yba-ctl replicated-migrate") ||
+		strings.HasPrefix(cmdName, "yba-ctl license") ||
+		strings.HasPrefix(cmdName, "yba-ctl generate-config")) {
+		handleRootCheck(cmdName)
+	}
 
+	// Finally, do basic yba-ctl setup
+	ybaCtl = ybactl.New()
+	ybaCtl.Setup()
 	initServices()
+
+	// Add logging now that yba-ctl directory is created
+	log.AddOutputFile(common.YbactlLogFile())
+
+	log.Trace(fmt.Sprintf("yba-ctl started with cmd %s", cmdName))
 }
 
 func ensureInstallerConfFile() {
-	_, err := os.Stat(common.InputFile)
+	_, err := os.Stat(common.InputFile())
 	if err != nil && !os.IsNotExist(err) {
-		log.Fatal("Unexpected error reading file " + common.InputFile)
+		log.Fatal("Unexpected error reading file " + common.InputFile())
 	}
 
 	if os.IsNotExist(err) {
 		userChoice := common.UserConfirm(
 			fmt.Sprintf(
-				("Using default settings in config file %s. "+
-					"Note that some settings cannot be changed later. \n\n"+
-					"Proceed with default config? "),
-				common.InputFile),
+				("No config file found at '%s', creating it with default values now.\n"+
+					"Do you want to proceed with the default config?"),
+				common.InputFile()),
 			common.DefaultNo)
 
 		// Copy over reference yaml before checking the user choice.
-		common.MkdirAllOrFail(filepath.Dir(common.InputFile), 0755)
-		common.CopyFile(common.GetReferenceYaml(), common.InputFile)
-		os.Chmod(common.InputFile, 0600)
+		config.WriteDefaultConfig()
 
 		if !userChoice {
 			log.Info(fmt.Sprintf(
-				"Aborting current command. Please edit the config at %s and retry.", common.InputFile))
+				"Aborting current command. Please edit the config at %s and retry.", common.InputFile()))
 			os.Exit(1)
 		}
-
 	}
 }
 
 func initServices() {
 	// services is an ordered map so services that depend on others should go later in the chain.
-	services = make(map[string]common.Component)
-	installPostgres := viper.GetBool("postgres.install.enabled")
-	services[PostgresServiceName] = NewPostgres("10.23")
-	services[PrometheusServiceName] = NewPrometheus("2.41.0")
-	services[YbPlatformServiceName] = NewPlatform(common.GetVersion())
-	// serviceOrder = make([]string, len(services))
-	if installPostgres {
-		serviceOrder = []string{PostgresServiceName, PrometheusServiceName, YbPlatformServiceName}
-	} else {
-		serviceOrder = []string{PrometheusServiceName, YbPlatformServiceName}
+	serviceManager.RegisterService(NewPostgres(PostgresVersion))
+	serviceManager.RegisterService(NewPrometheus(PrometheusVersion))
+	serviceManager.RegisterService(NewPlatform(ybactl.Version))
+	serviceManager.RegisterService(NewPerfAdvisor(PerfAdvisorVersion))
+	serviceManager.RegisterService(NewLogRotate())
+	var services []components.Service
+	for s := range serviceManager.Services() {
+		services = append(services, s)
 	}
-	// populate names of services for valid args
+	checks.SetServicesRunningCheck(services)
 }
 
-func handleRootCheck(cmd *cobra.Command) {
-	switch cmd.CommandPath() {
-	// Install should typically be done as root, and will confirm if the user does not.
-	case "yba-ctl install":
-		if !common.HasSudoAccess() {
-			if !common.UserConfirm("Installing without root access is not recommend and should only be "+
-				"done for POC's. Do you want to continue install as non-root? ", common.DefaultNo) {
-				fmt.Println("Please run install as root")
-				os.Exit(1)
-			}
+func handleRootCheck(cmdName string) {
+	user, err := osuser.Current()
+	if err != nil {
+		log.Fatal("Could not determine current user: " + err.Error())
+	}
+
+	if !viper.IsSet("as_root") {
+		// Upgrading from before "as_root" exists. /opt/yba-ctl is source of truth, not viper
+		_, err := os.Stat(common.YbactlRootInstallDir)
+		if user.Uid == "0" && err != nil {
+			log.Fatal("no root install found at /opt/yba-ctl, cannot upgrade with root")
+		} else if user.Uid != "0" && err == nil {
+			log.Fatal("Detected root install at /opt/yba-ctl, cannot upgrade as non-root")
 		}
-	default:
-		if _, err := os.Stat(common.InputFile); !errors.Is(err, fs.ErrNotExist) {
-			// If /opt/yba-ctl/yba-ctl.yml exists, it was put there be root?
-			if !common.HasSudoAccess() {
-				fmt.Println("Please run yba-ctl as root")
-				os.Exit(1)
-			}
+		log.Debug(fmt.Sprintf("legacy root check passed for %s", cmdName))
+
+		// Also handle the case where a config file is provided but did not include as_root
+		if err := common.SetYamlValue(common.InputFile(), "as_root", user.Uid == "0"); err != nil {
+			log.Warn("Failed to set as_root in config file, please set it manually")
+			log.Fatal("Failed to set as_root in config file: " + err.Error())
 		}
+		return
+	} else if user.Uid == "0" && !viper.GetBool("as_root") {
+		log.Fatal("running as root user with 'as_root' set to false is not supported")
+	} else if user.Uid != "0" &&
+		(viper.GetBool("as_root") || common.Exists(common.YbactlRootInstallDir)) {
+		// Allow running certain commands as non-root in root install mode
+		switch cmdName {
+		case "yba-ctl version", "yba-ctl status", "yba-ctl createBackup":
+			break
+		default:
+			log.Fatal("running as non-root user with 'as_root' set to true is not supported")
+		}
+	}
+}
+
+func init() {
+	if PostgresVersion == "" {
+		panic("PostgresVersion not set during build")
+	}
+	if PrometheusVersion == "" {
+		panic("PrometheusVersion not set during build")
 	}
 }

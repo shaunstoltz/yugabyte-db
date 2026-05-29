@@ -1,5 +1,5 @@
 //--------------------------------------------------------------------------------------------------
-// Copyright (c) YugaByte, Inc.
+// Copyright (c) YugabyteDB, Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License"); you may not use this file except
 // in compliance with the License.  You may obtain a copy of the License at
@@ -61,6 +61,8 @@ PTBaseType::SharedPtr PTBaseType::FromQLType(MemoryContext *memctx,
     case DataType::UINT32: FALLTHROUGH_INTENDED;
     case DataType::UINT64: FALLTHROUGH_INTENDED;
     case DataType::GIN_NULL: FALLTHROUGH_INTENDED;
+    case DataType::VECTOR: FALLTHROUGH_INTENDED;
+    case DataType::BSON: FALLTHROUGH_INTENDED;
     case DataType::UNKNOWN_DATA: FALLTHROUGH_INTENDED;
     case DataType::NULL_VALUE_TYPE:
       FATAL_INVALID_ENUM_VALUE(DataType, ql_type->main());

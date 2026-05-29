@@ -15,9 +15,9 @@
 // specific language governing permissions and limitations
 // under the License.
 //
-// The following only applies to changes made to this file as part of YugaByte development.
+// The following only applies to changes made to this file as part of YugabyteDB development.
 //
-// Portions Copyright (c) YugaByte, Inc.
+// Portions Copyright (c) YugabyteDB, Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License"); you may not use this file except
 // in compliance with the License.  You may obtain a copy of the License at
@@ -31,38 +31,20 @@
 //
 #include "yb/server/generic_service.h"
 
-#include <ctype.h>
-#include <functional>
-#include <map>
-#include <mutex>
-#include <set>
 #include <string>
-#include <unordered_map>
-#include <unordered_set>
 
 #include <boost/preprocessor/cat.hpp>
 #include <boost/preprocessor/stringize.hpp>
-#include <glog/logging.h>
 
-#include "yb/gutil/atomicops.h"
-#include "yb/gutil/callback_forward.h"
-#include "yb/gutil/dynamic_annotations.h"
-#include "yb/gutil/macros.h"
-#include "yb/gutil/map-util.h"
-#include "yb/gutil/port.h"
-#include "yb/gutil/strings/split.h"
 #include "yb/rpc/rpc_context.h"
 #include "yb/server/clock.h"
 #include "yb/server/server_base.h"
 #include "yb/util/flags.h"
-#include "yb/util/metrics_fwd.h"
-#include "yb/util/monotime.h"
 #include "yb/util/status.h"
 #include "yb/util/status_format.h"
 #include "yb/util/status_fwd.h"
 
 using std::string;
-using std::unordered_set;
 
 DECLARE_string(flagfile);
 DECLARE_string(vmodule);
@@ -138,6 +120,60 @@ void GenericServiceImpl::GetFlag(const GetFlagRequestPB* req,
   rpc.RespondSuccess();
 }
 
+void GenericServiceImpl::ValidateFlagValue(
+    const ValidateFlagValueRequestPB* req, ValidateFlagValueResponsePB* resp, rpc::RpcContext rpc) {
+  if (req->has_flag_name() && req->flags_size() > 0) {
+    rpc.RespondFailure(STATUS(
+        InvalidArgument, "Cannot specify both legacy flag_name/flag_value and batch flags fields"));
+    return;
+  }
+
+  std::vector<std::pair<string, string>> flags_to_validate;
+  for (const auto& flag : req->flags()) {
+    flags_to_validate.emplace_back(flag.name(), flag.value());
+  }
+  if (flags_to_validate.empty() && req->has_flag_name()) {
+    flags_to_validate.emplace_back(req->flag_name(), req->flag_value());
+  }
+  if (flags_to_validate.empty()) {
+    rpc.RespondFailure(STATUS(InvalidArgument, "No flags specified for validation"));
+    return;
+  }
+
+  // Legacy single-flag path: return RPC-level failure to preserve backward compatibility
+  // with callers (e.g. YBA) that rely on catching an exception on invalid values.
+  // Batch path: errors are returned in the response errors map.
+  const bool legacy_mode = req->has_flag_name();
+
+  std::map<string, string> extra_validation_flags;
+  for (const auto& [flag_name, flag_value] : flags_to_validate) {
+    auto status = flags_internal::ValidateFlagValue(flag_name, flag_value);
+    if (!status.ok()) {
+      LOG(INFO) << "Flag validation failed for " << flag_name << ": " << status;
+      if (legacy_mode) {
+        rpc.RespondFailure(status);
+        return;
+      }
+      (*resp->mutable_errors())[flag_name] = status.message().ToBuffer();
+      continue;
+    }
+    extra_validation_flags[flag_name] = flag_value;
+  }
+
+  auto extra_errors =
+      server_->ExtendedFlagValidation(extra_validation_flags, rpc.GetClientDeadline());
+  for (auto& [flag_name, error_msg] : extra_errors) {
+    LOG(INFO) << "Extra flag validation failed for " << flag_name << ": " << error_msg;
+    if (legacy_mode) {
+      rpc.RespondFailure(STATUS(InvalidArgument, error_msg));
+      return;
+    }
+    (*resp->mutable_errors())[flag_name] = std::move(error_msg);
+  }
+
+  rpc.RespondSuccess();
+}
+
 void GenericServiceImpl::FlushCoverage(const FlushCoverageRequestPB* req,
                                        FlushCoverageResponsePB* resp,
                                        rpc::RpcContext rpc) {
@@ -177,7 +213,7 @@ void GenericServiceImpl::ReloadCertificates(
     rpc::RpcContext rpc) {
   const auto status = server_->ReloadKeysAndCertificates();
   if (!status.ok()) {
-    LOG(ERROR) << "Reloading certificates failed: " << status;
+    LOG(WARNING) << "Reloading certificates failed: " << status;
     rpc.RespondFailure(status);
     return;
   }

@@ -1,5 +1,5 @@
 //
-// Copyright (c) YugaByte, Inc.
+// Copyright (c) YugabyteDB, Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License"); you may not use this file except
 // in compliance with the License.  You may obtain a copy of the License at
@@ -17,25 +17,63 @@
 
 #include <memory>
 
+#include "yb/util/enums.h"
+#include "yb/util/strongly_typed_bool.h"
+
+namespace yb {
+class WritableFile;
+}
+
 namespace rocksdb {
 
+using yb::WritableFile;
+
+class Arena;
+class BoundaryValuesExtractor;
+class Cache;
 class CompactionContext;
 class CompactionFeed;
+class DataBlockAwareIndexInternalIterator;
 class DB;
+class DirectWriteHandler;
 class Env;
 class MemTable;
+class InternalIterator;
 class Iterator;
+class ReadFileFilter;
 class Statistics;
-class UserFrontiers;
+class IteratorFilter;
+class TableReader;
 class WriteBatch;
 
 struct BlockBasedTableOptions;
 struct CompactionContextOptions;
 struct CompactionInputFiles;
+struct FilterKeyCache;
+struct FileMetaData;
+struct KeyValueEntry;
 struct Options;
+struct QueryOptions;
+struct ReadOptions;
 struct TableBuilderOptions;
 struct TableProperties;
 
+template <typename IteratorType, bool kSkipLastEntry>
+class IteratorWrapperBase;
+using IteratorWrapper = IteratorWrapperBase<InternalIterator, /* kSkipLastEntry = */ false>;
+
+template <typename IteratorType>
+class MergingIterator;
+
+template <typename IteratorWrapperType>
+class MergeIteratorBuilderBase;
+using MergeIteratorBuilder = MergeIteratorBuilderBase<IteratorWrapper>;
+
 using CompactionContextPtr = std::unique_ptr<CompactionContext>;
+
+class DirectWriteHandler;
+
+YB_STRONGLY_TYPED_BOOL(AllowCompactionFailures);
+YB_STRONGLY_TYPED_BOOL(SkipCorruptDataBlocksUnsafe);
 
 } // namespace rocksdb

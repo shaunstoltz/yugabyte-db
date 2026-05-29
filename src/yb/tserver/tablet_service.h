@@ -15,9 +15,9 @@
 // specific language governing permissions and limitations
 // under the License.
 //
-// The following only applies to changes made to this file as part of YugaByte development.
+// The following only applies to changes made to this file as part of YugabyteDB development.
 //
-// Portions Copyright (c) YugaByte, Inc.
+// Portions Copyright (c) YugabyteDB, Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License"); you may not use this file except
 // in compliance with the License.  You may obtain a copy of the License at
@@ -48,6 +48,8 @@
 
 #include "yb/gutil/ref_counted.h"
 
+#include "yb/rpc/rpc_context.h"
+
 #include "yb/tablet/tablet_fwd.h"
 
 #include "yb/tserver/read_query.h"
@@ -73,9 +75,14 @@ class TabletServiceImpl : public TabletServerServiceIf, public ReadTabletProvide
 
   explicit TabletServiceImpl(TabletServerIf* server);
 
-  void Write(const WriteRequestPB* req, WriteResponsePB* resp, rpc::RpcContext context) override;
+  void Write(
+      const WriteRequestMsg* req, WriteResponseMsg* resp, rpc::RpcContext context) override;
 
-  void Read(const ReadRequestPB* req, ReadResponsePB* resp, rpc::RpcContext context) override;
+  void WaitForAsyncWrite(
+      const WaitForAsyncWriteRequestPB* req, WaitForAsyncWriteResponsePB* resp,
+      rpc::RpcContext context) override;
+
+  void Read(const ReadRequestMsg* req, ReadResponseMsg* resp, rpc::RpcContext context) override;
 
   void VerifyTableRowRange(
       const VerifyTableRowRangeRequestPB* req, VerifyTableRowRangeResponsePB* resp,
@@ -119,6 +126,14 @@ class TabletServiceImpl : public TabletServerServiceIf, public ReadTabletProvide
                             GetTransactionStatusResponsePB* resp,
                             rpc::RpcContext context) override;
 
+  void GetOldTransactions(const GetOldTransactionsRequestPB* req,
+                          GetOldTransactionsResponsePB* resp,
+                          rpc::RpcContext context) override;
+
+  void GetOldSingleShardWaiters(const GetOldSingleShardWaitersRequestPB* req,
+                                GetOldSingleShardWaitersResponsePB* resp,
+                                rpc::RpcContext context) override;
+
   void GetTransactionStatusAtParticipant(const GetTransactionStatusAtParticipantRequestPB* req,
                                          GetTransactionStatusAtParticipantResponsePB* resp,
                                          rpc::RpcContext context) override;
@@ -126,10 +141,6 @@ class TabletServiceImpl : public TabletServerServiceIf, public ReadTabletProvide
   void AbortTransaction(const AbortTransactionRequestPB* req,
                         AbortTransactionResponsePB* resp,
                         rpc::RpcContext context) override;
-
-  void UpdateTransactionStatusLocation(const UpdateTransactionStatusLocationRequestPB* req,
-                                       UpdateTransactionStatusLocationResponsePB* resp,
-                                       rpc::RpcContext context) override;
 
   void UpdateTransactionWaitingForStatus(
       const UpdateTransactionWaitingForStatusRequestPB* req,
@@ -145,6 +156,10 @@ class TabletServiceImpl : public TabletServerServiceIf, public ReadTabletProvide
                 TruncateResponsePB* resp,
                 rpc::RpcContext context) override;
 
+  void GetCompatibleSchemaVersion(const GetCompatibleSchemaVersionRequestPB* req,
+                                  GetCompatibleSchemaVersionResponsePB* resp,
+                                  rpc::RpcContext context) override;
+
   void GetTabletStatus(const GetTabletStatusRequestPB* req,
                        GetTabletStatusResponsePB* resp,
                        rpc::RpcContext context) override;
@@ -158,38 +173,120 @@ class TabletServiceImpl : public TabletServerServiceIf, public ReadTabletProvide
       GetSplitKeyResponsePB* resp,
       rpc::RpcContext context) override;
 
-  void GetSharedData(const GetSharedDataRequestPB* req,
-                     GetSharedDataResponsePB* resp,
-                     rpc::RpcContext context) override;
-
   void GetTserverCatalogVersionInfo(const GetTserverCatalogVersionInfoRequestPB* req,
                                     GetTserverCatalogVersionInfoResponsePB* resp,
                                     rpc::RpcContext context) override;
 
+  void GetTserverCatalogMessageLists(const GetTserverCatalogMessageListsRequestPB* req,
+                                     GetTserverCatalogMessageListsResponsePB* resp,
+                                     rpc::RpcContext context) override;
+
+  void TriggerRelcacheInitConnection(const TriggerRelcacheInitConnectionRequestPB* req,
+                                     TriggerRelcacheInitConnectionResponsePB* resp,
+                                     rpc::RpcContext context) override;
+
   void ListMasterServers(const ListMasterServersRequestPB* req,
                          ListMasterServersResponsePB* resp,
                          rpc::RpcContext context) override;
+
+  void ClearUniverseUuid(const ClearUniverseUuidRequestPB* req,
+                         ClearUniverseUuidResponsePB* resp,
+                         rpc::RpcContext context) override;
+
+  void GetLockStatus(const GetLockStatusRequestPB* req,
+                     GetLockStatusResponsePB* resp,
+                     rpc::RpcContext context) override;
+
+  void GetObjectLockStatus(const GetObjectLockStatusRequestPB* req,
+                           GetObjectLockStatusResponsePB* resp,
+                           rpc::RpcContext context) override;
+
+  void GetMetrics(const GetMetricsRequestPB* req,
+                  GetMetricsResponsePB* resp,
+                  rpc::RpcContext context) override;
+
+  void PgRemoteExec(const PgRemoteExecRequestPB* req,
+                    PgRemoteExecResponsePB* resp,
+                    rpc::RpcContext context) override;
+
+  // Method to cancel a given transaction. If the passed in request has a status tablet id, a cancel
+  // transaction request is sent to that status tablet alone. Else, the request is broadcast to all
+  // status tablets hosted at this server.
+  void CancelTransaction(const CancelTransactionRequestPB* req,
+                         CancelTransactionResponsePB* resp,
+                         rpc::RpcContext context) override;
+
+  void CheckTserverTabletHealth(const CheckTserverTabletHealthRequestPB* req,
+                                  CheckTserverTabletHealthResponsePB* resp,
+                                  rpc::RpcContext context) override;
+
+  void StartRemoteSnapshotTransfer(
+      const StartRemoteSnapshotTransferRequestPB* req, StartRemoteSnapshotTransferResponsePB* resp,
+      rpc::RpcContext context) override;
+
+  void GetTabletKeyRanges(
+      const GetTabletKeyRangesRequestPB* req, GetTabletKeyRangesResponsePB* resp,
+      rpc::RpcContext context) override;
+
+  void ClearAllMetaCachesOnServer(
+      const ClearAllMetaCachesOnServerRequestPB* req, ClearAllMetaCachesOnServerResponsePB* resp,
+      rpc::RpcContext context) override;
+
+  void ClearMetacache(
+      const ClearMetacacheRequestPB* req, ClearMetacacheResponsePB* resp,
+      rpc::RpcContext context) override;
+
+  void ClearYCQLMetaDataCacheOnServer(
+      const ClearYCQLMetaDataCacheOnServerRequestPB* req,
+      ClearYCQLMetaDataCacheOnServerResponsePB* resp,
+      rpc::RpcContext context) override;
+
+  void AcquireObjectLocks(
+      const AcquireObjectLockRequestPB* req, AcquireObjectLockResponsePB* resp,
+      rpc::RpcContext context) override;
+
+  void ReleaseObjectLocks(
+      const ReleaseObjectLockRequestPB* req, ReleaseObjectLockResponsePB* resp,
+      rpc::RpcContext context) override;
+
+  Result<GetYSQLLeaseInfoResponsePB> GetYSQLLeaseInfo(
+      const GetYSQLLeaseInfoRequestPB& req, CoarseTimePoint deadline) override;
+
+  void AdminExecutePgsql(
+      const AdminExecutePgsqlRequestPB* req, AdminExecutePgsqlResponsePB* resp,
+      rpc::RpcContext context) override;
+
+  void GetLocalPgTxnSnapshot(
+      const GetLocalPgTxnSnapshotRequestPB* req, GetLocalPgTxnSnapshotResponsePB* resp,
+      rpc::RpcContext context) override;
+
+  Result<VerifyVectorIndexesResponsePB> VerifyVectorIndexes(
+      const VerifyVectorIndexesRequestPB& req, CoarseTimePoint deadline) override;
+
+  Result<DumpTabletDataResponsePB> DumpTabletData(
+      const DumpTabletDataRequestPB& req, CoarseTimePoint deadline) override;
+
+  Result<ConnectivityStateResponsePB> ConnectivityState(
+      const ConnectivityStateRequestPB& req, CoarseTimePoint deadline) override;
+
+  void CollectYsqlCallHomeStats(
+      const CollectYsqlCallHomeStatsRequestPB* req, CollectYsqlCallHomeStatsResponsePB* resp,
+      rpc::RpcContext context) override;
+
   void Shutdown() override;
 
  private:
-  Status PerformWrite(const WriteRequestPB* req, WriteResponsePB* resp, rpc::RpcContext* context);
+  Status PerformWrite(
+      const WriteRequestMsg* req, WriteResponseMsg* resp, rpc::RpcContext* context);
 
   Result<std::shared_ptr<tablet::AbstractTablet>> GetTabletForRead(
-    const TabletId& tablet_id, tablet::TabletPeerPtr tablet_peer,
-    YBConsistencyLevel consistency_level, tserver::AllowSplitTablet allow_split_tablet) override;
-
-  template<class Resp>
-  bool CheckWriteThrottlingOrRespond(
-      double score, tablet::TabletPeer* tablet_peer, Resp* resp, rpc::RpcContext* context);
-
-  template <class Req, class Resp, class F>
-  void PerformAtLeader(const Req& req, Resp* resp, rpc::RpcContext* context, const F& f);
+    TabletIdView tablet_id, tablet::TabletPeerPtr tablet_peer,
+    YBConsistencyLevel consistency_level, tserver::AllowSplitTablet allow_split_tablet,
+    tserver::ReadResponseMsg* resp) override;
 
   Result<uint64_t> DoChecksum(const ChecksumRequestPB* req, CoarseTimePoint deadline);
 
-  Status HandleUpdateTransactionStatusLocation(const UpdateTransactionStatusLocationRequestPB* req,
-                                               UpdateTransactionStatusLocationResponsePB* resp,
-                                               std::shared_ptr<rpc::RpcContext> context);
+  Status CheckLocalLeaseEpoch(std::optional<uint64_t> recipient_lease_epoch);
 
   TabletServerIf *const server_;
 };
@@ -199,6 +296,9 @@ class TabletServiceAdminImpl : public TabletServerAdminServiceIf {
   typedef std::vector<tablet::TabletPeerPtr> TabletPeers;
 
   explicit TabletServiceAdminImpl(TabletServer* server);
+
+  std::string LogPrefix() const;
+
   void CreateTablet(const CreateTabletRequestPB* req,
                     CreateTabletResponsePB* resp,
                     rpc::RpcContext context) override;
@@ -214,10 +314,6 @@ class TabletServiceAdminImpl : public TabletServerAdminServiceIf {
   void AlterSchema(const tablet::ChangeMetadataRequestPB* req,
                    ChangeMetadataResponsePB* resp,
                    rpc::RpcContext context) override;
-
-  void CopartitionTable(const CopartitionTableRequestPB* req,
-                        CopartitionTableResponsePB* resp,
-                        rpc::RpcContext context) override;
 
   void FlushTablets(const FlushTabletsRequestPB* req,
                     FlushTabletsResponsePB* resp,
@@ -263,18 +359,61 @@ class TabletServiceAdminImpl : public TabletServerAdminServiceIf {
       UpgradeYsqlResponsePB* resp,
       rpc::RpcContext context) override;
 
+  // Wait for all YSQL backends to reach a certain catalog version.
+  void WaitForYsqlBackendsCatalogVersion(
+      const WaitForYsqlBackendsCatalogVersionRequestPB* req,
+      WaitForYsqlBackendsCatalogVersionResponsePB* resp,
+      rpc::RpcContext context) override;
+
   void UpdateTransactionTablesVersion(
       const UpdateTransactionTablesVersionRequestPB* req,
       UpdateTransactionTablesVersionResponsePB* resp,
       rpc::RpcContext context) override;
 
+  void CloneTablet(
+      const tablet::CloneTabletRequestPB* req,
+      CloneTabletResponsePB* resp,
+      rpc::RpcContext context) override;
+
+  void ClonePgSchema(
+      const ClonePgSchemaRequestPB* req, ClonePgSchemaResponsePB* resp,
+      rpc::RpcContext context) override;
+
+  void EnableDbConns(
+      const EnableDbConnsRequestPB* req, EnableDbConnsResponsePB* resp,
+      rpc::RpcContext context) override;
+
   void TestRetry(
       const TestRetryRequestPB* req, TestRetryResponsePB* resp, rpc::RpcContext context) override;
 
- private:
-  TabletServer* server_;
+  void GetActiveRbsInfo(
+      const GetActiveRbsInfoRequestPB* req, GetActiveRbsInfoResponsePB* resp,
+      rpc::RpcContext context) override;
 
-  Status DoCreateTablet(const CreateTabletRequestPB* req, CreateTabletResponsePB* resp);
+  void GetPgSocketDir(
+      const GetPgSocketDirRequestPB* req, GetPgSocketDirResponsePB* resp,
+      rpc::RpcContext context) override;
+
+ private:
+  TabletServer* const server_;
+
+  Status DoCreateTablet(
+      const CreateTabletRequestPB* req, CreateTabletResponsePB* resp, const MonoDelta& timeout);
+
+  Result<HostPort> GetLocalPgHostPort();
+
+  Status DoClonePgSchema(const ClonePgSchemaRequestPB* req, ClonePgSchemaResponsePB* resp);
+
+  Status DoEnableDbConns(
+      const EnableDbConnsRequestPB* req, EnableDbConnsResponsePB* resp);
+
+  Status SetupCDCSDKRetention(
+      const tablet::ChangeMetadataRequestPB* req, ChangeMetadataResponsePB* resp,
+      const tablet::TabletPeerPtr& peer);
+
+  Status SetupCDCSDKRetentionOnNewTablet(
+      const MonoDelta& timeout, CreateTabletResponsePB* resp,
+      const tablet::TabletPeerPtr& tablet_peer);
 
   // Used to implement wait/signal mechanism for backfill requests.
   // Since the number of concurrently allowed backfill requests is
@@ -282,7 +421,7 @@ class TabletServiceAdminImpl : public TabletServerAdminServiceIf {
   mutable std::mutex backfill_lock_;
   std::condition_variable backfill_cond_;
   std::atomic<int32_t> num_tablets_backfilling_{0};
-  std::atomic<int32_t> num_test_retry_calls{0};
+  std::atomic<int32_t> TEST_num_test_retry_calls_{0};
   scoped_refptr<yb::AtomicGauge<uint64_t>> ts_split_op_added_;
 };
 
@@ -344,6 +483,7 @@ class ConsensusServiceImpl : public consensus::ConsensusServiceIf {
  private:
   void CompleteUpdateConsensusResponse(std::shared_ptr<tablet::TabletPeer> tablet_peer,
                                        consensus::LWConsensusResponsePB* resp);
+
   TabletPeerLookupIf* tablet_manager_;
 };
 

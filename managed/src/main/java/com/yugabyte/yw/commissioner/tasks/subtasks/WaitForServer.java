@@ -1,5 +1,5 @@
 /*
- * Copyright 2019 YugaByte, Inc. and Contributors
+ * Copyright 2019 YugabyteDB, Inc. and Contributors
  *
  * Licensed under the Polyform Free Trial License 1.0.0 (the "License"); you
  * may not use this file except in compliance with the License. You
@@ -16,32 +16,35 @@ import com.google.common.net.HostAndPort;
 import com.yugabyte.yw.commissioner.BaseTaskDependencies;
 import com.yugabyte.yw.commissioner.tasks.UniverseTaskBase.ServerType;
 import com.yugabyte.yw.commissioner.tasks.params.ServerSubTaskParams;
-import com.yugabyte.yw.common.YsqlQueryExecutor;
+import com.yugabyte.yw.common.Util;
+import com.yugabyte.yw.common.config.ProviderConfKeys;
+import com.yugabyte.yw.common.config.UniverseConfKeys;
+import com.yugabyte.yw.common.gflags.GFlagsUtil;
 import com.yugabyte.yw.forms.RunQueryFormData;
+import com.yugabyte.yw.forms.UniverseDefinitionTaskParams;
+import com.yugabyte.yw.models.Provider;
 import com.yugabyte.yw.models.Universe;
 import com.yugabyte.yw.models.helpers.NodeDetails;
-import javax.inject.Inject;
 import java.time.Duration;
+import javax.annotation.Nullable;
+import javax.inject.Inject;
 import lombok.extern.slf4j.Slf4j;
 import org.yb.client.YBClient;
 
 @Slf4j
 public class WaitForServer extends ServerSubTaskBase {
 
-  private final YsqlQueryExecutor ysqlQueryExecutor;
-
-  private final long POSTGRES_STATUS_RETRY_SLEEP_TIME_MILLIS = 60000;
-
   @Inject
-  protected WaitForServer(
-      BaseTaskDependencies baseTaskDependencies, YsqlQueryExecutor ysqlQueryExecutor) {
+  protected WaitForServer(BaseTaskDependencies baseTaskDependencies) {
     super(baseTaskDependencies);
-    this.ysqlQueryExecutor = ysqlQueryExecutor;
   }
 
   public static class Params extends ServerSubTaskParams {
     // Timeout for the RPC call.
     public long serverWaitTimeoutMs;
+    // During upgrades we update universe state only at the end of the task.
+    // So here we can pass updated universe state that is not yet persisted.
+    @Nullable public Universe currentUniverseState;
   }
 
   @Override
@@ -53,42 +56,46 @@ public class WaitForServer extends ServerSubTaskBase {
   public void run() {
 
     checkParams();
-
+    Universe universe =
+        taskParams().currentUniverseState == null
+            ? Universe.getOrBadRequest(taskParams().getUniverseUUID())
+            : taskParams().currentUniverseState;
     boolean ret;
-    YBClient client = null;
     long startMs = System.currentTimeMillis();
-    try {
+    try (YBClient client = getClient()) {
       HostAndPort hp = getHostPort();
-      client = getClient();
       if (taskParams().serverType == ServerType.MASTER) {
         // This first calls waitForServer followed by availability check of master UUID.
         // Check for master UUID retries until timeout.
         ret = client.waitForMaster(hp, taskParams().serverWaitTimeoutMs);
       } else if (taskParams().serverType.equals(ServerType.YSQLSERVER)) {
-        Universe universe = Universe.getOrBadRequest(taskParams().universeUUID);
         NodeDetails node = universe.getNode(taskParams().nodeName);
+        Provider provider = Util.getProviderForNode(node, universe);
+        Duration waitTimeout = Duration.ofMillis(taskParams().serverWaitTimeoutMs);
         Stopwatch stopwatch = Stopwatch.createStarted();
+        Duration waitDuration =
+            confGetter.getConfForScope(provider, ProviderConfKeys.waitForYQLRetryDuration);
+        log.debug("Retry duration is {}", waitDuration);
         while (true) {
           log.info("Check if postgres server is healthy on node {}", node.nodeName);
           ret = checkPostgresStatus(universe);
-          if (ret
-              || stopwatch.elapsed().compareTo(Duration.ofMillis(taskParams().serverWaitTimeoutMs))
-                  > 0) break;
-          try {
-            Thread.sleep(POSTGRES_STATUS_RETRY_SLEEP_TIME_MILLIS);
-          } catch (InterruptedException ex) {
-            throw new RuntimeException(ex);
-          }
+          if (ret || stopwatch.elapsed().compareTo(waitTimeout) > 0) break;
+          waitFor(waitDuration);
         }
       } else {
         ret = client.waitForServer(hp, taskParams().serverWaitTimeoutMs);
       }
+      if (ret
+          && (taskParams().serverType == ServerType.MASTER
+              || taskParams().serverType == ServerType.TSERVER)
+          && confGetter.getConfForScope(universe, UniverseConfKeys.verifyClusterUUIDOnStart)) {
+        verifyUniverseUUID(hp.getHost(), taskParams().serverType, universe);
+      }
     } catch (Exception e) {
       log.error("{} hit error : {}", getName(), e.getMessage());
       throw new RuntimeException(e);
-    } finally {
-      closeClient(client);
     }
+
     if (!ret) {
       throw new RuntimeException(getName() + " did not respond in the set time.");
     }
@@ -100,11 +107,44 @@ public class WaitForServer extends ServerSubTaskBase {
 
   private boolean checkPostgresStatus(Universe universe) {
     RunQueryFormData runQueryFormData = new RunQueryFormData();
-    runQueryFormData.query = "SELECT version()";
-    runQueryFormData.db_name = "system_platform";
+    runQueryFormData.setQuery("SELECT version()");
+    runQueryFormData.setDbName("system_platform");
+    NodeDetails node = universe.getNode(taskParams().nodeName);
+    UniverseDefinitionTaskParams.UserIntent userIntent =
+        universe.getUniverseDetails().getPrimaryCluster().userIntent;
     JsonNode ysqlResponse =
         ysqlQueryExecutor.executeQueryInNodeShell(
-            universe, runQueryFormData, universe.getNode(taskParams().nodeName));
-    return !ysqlResponse.has("error");
+            universe,
+            runQueryFormData,
+            node,
+            userIntent.isYSQLAuthEnabled(),
+            userIntent.enableConnectionPooling);
+    return ysqlResponse != null && !ysqlResponse.has("error");
+  }
+
+  private void verifyUniverseUUID(String privateIp, ServerType serverType, Universe universe) {
+    NodeDetails nodeDetails = universe.getNodeByAnyIP(privateIp);
+    int port =
+        serverType == ServerType.MASTER ? nodeDetails.masterHttpPort : nodeDetails.tserverHttpPort;
+    JsonNode varz = nodeUIApiHelper.getRequest("http://" + privateIp + ":" + port + "/api/v1/varz");
+    JsonNode errors = varz.get("error");
+    if (errors != null) {
+      throw new RuntimeException("Received error: " + errors.asText());
+    }
+    String universeUUIDStr = universe.getUniverseUUID().toString();
+    if (varz.get("flags") == null) {
+      throw new RuntimeException("No flags in response: " + varz);
+    }
+    for (JsonNode flag : varz.get("flags")) {
+      if (flag.get("name").asText().equals(GFlagsUtil.CLUSTER_UUID)) {
+        String flagValue = flag.get("value").asText().trim();
+        if (!flagValue.equalsIgnoreCase(universeUUIDStr)) {
+          throw new IllegalStateException(
+              String.format(
+                  "Expected '%s' for %s %s gflag, found '%s'",
+                  universeUUIDStr, serverType.name(), GFlagsUtil.CLUSTER_UUID, flagValue));
+        }
+      }
+    }
   }
 }

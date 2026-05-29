@@ -1,4 +1,4 @@
-// Copyright (c) YugaByte, Inc.
+// Copyright (c) YugabyteDB, Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License"); you may not use this file except
 // in compliance with the License.  You may obtain a copy of the License at
@@ -18,8 +18,6 @@
 #include "yb/util/memory/tracked_shared_ptr.h"
 #include "yb/util/memory/tracked_shared_ptr_impl.h"
 #include "yb/util/random_util.h"
-
-using std::numeric_limits;
 
 namespace yb {
 

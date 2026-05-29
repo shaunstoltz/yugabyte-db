@@ -1,4 +1,4 @@
-// Copyright (c) YugaByte, Inc.
+// Copyright (c) YugabyteDB, Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License"); you may not use this file except
 // in compliance with the License.  You may obtain a copy of the License at
@@ -42,7 +42,10 @@ ReplicateMsgsHolder::~ReplicateMsgsHolder() {
 
 void ReplicateMsgsHolder::Reset() {
   if (ops_) {
-    ops_->ExtractSubrange(0, ops_->size(), nullptr /* elements */);
+    // ExtractSubrange with nullptr for last argument will hit debug assertion, probably due to
+    // unsafety with arenas. We don't use arenas here, so it's not an issue, and
+    // UnsafeArenaExtractSubrange provides the same behavior (but without DCHECK).
+    ops_->UnsafeArenaExtractSubrange(0, ops_->size(), nullptr /* elements */);
     ops_ = nullptr;
   }
 

@@ -1,5 +1,5 @@
 /*
- * Copyright 2019 YugaByte, Inc. and Contributors
+ * Copyright 2019 YugabyteDB, Inc. and Contributors
  *
  * Licensed under the Polyform Free Trial License 1.0.0 (the "License"); you
  * may not use this file except in compliance with the License. You
@@ -18,16 +18,19 @@ import com.yugabyte.yw.commissioner.tasks.params.NodeTaskParams;
 import com.yugabyte.yw.common.NodeManager;
 import com.yugabyte.yw.common.RecoverableException;
 import com.yugabyte.yw.common.ShellResponse;
-import com.yugabyte.yw.models.AccessKey;
+import com.yugabyte.yw.common.utils.CapacityReservationUtil;
+import com.yugabyte.yw.forms.UniverseDefinitionTaskParams;
 import com.yugabyte.yw.models.Provider;
+import com.yugabyte.yw.models.TaskInfo;
 import com.yugabyte.yw.models.Universe;
 import com.yugabyte.yw.models.Universe.UniverseUpdater;
 import com.yugabyte.yw.models.helpers.NodeDetails;
-import com.yugabyte.yw.models.TaskInfo;
 import com.yugabyte.yw.models.helpers.NodeDetails.NodeState;
 import com.yugabyte.yw.models.helpers.NodeStatus;
-import java.util.List;
+import java.util.UUID;
 import javax.inject.Inject;
+import lombok.Getter;
+import lombok.Setter;
 import lombok.extern.slf4j.Slf4j;
 import play.libs.Json;
 
@@ -35,9 +38,8 @@ import play.libs.Json;
 public class AnsibleCreateServer extends NodeTaskBase {
 
   @Inject
-  protected AnsibleCreateServer(
-      BaseTaskDependencies baseTaskDependencies, NodeManager nodeManager) {
-    super(baseTaskDependencies, nodeManager);
+  protected AnsibleCreateServer(BaseTaskDependencies baseTaskDependencies) {
+    super(baseTaskDependencies);
   }
 
   // Additional parameters for this task.
@@ -50,14 +52,15 @@ public class AnsibleCreateServer extends NodeTaskBase {
     public boolean assignPublicIP = true;
     public boolean assignStaticPublicIP = false;
 
-    // If this is set to the universe's AWS KMS CMK arn, AWS EBS volume
-    // encryption will be enabled
-    public String cmkArn;
+    public boolean useSpotInstance = false;
+    public Double spotPrice = 0.0;
 
     // If set, we will use this Amazon Resource Name of the user's
     // instance profile instead of an access key id and secret
     public String ipArnString;
-    public String machineImage;
+    @Getter @Setter private String machineImage;
+    public UUID imageBundleUUID;
+    public String capacityReservation;
   }
 
   @Override
@@ -68,11 +71,10 @@ public class AnsibleCreateServer extends NodeTaskBase {
   @Override
   public void run() {
     Provider p = taskParams().getProvider();
-    List<AccessKey> accessKeys = AccessKey.getAll(p.uuid);
     boolean skipProvision = false;
 
-    if (p.code.equals(Common.CloudType.onprem.name())) {
-      skipProvision = p.details.skipProvisioning;
+    if (p.getCode().equals(Common.CloudType.onprem.name())) {
+      skipProvision = p.getDetails().skipProvisioning;
     }
 
     if (skipProvision) {
@@ -80,10 +82,17 @@ public class AnsibleCreateServer extends NodeTaskBase {
     } else if (instanceExists(taskParams())) {
       log.info("Waiting for SSH to succeed on existing instance {}", taskParams().nodeName);
       getNodeManager()
-          .nodeCommand(NodeManager.NodeCommandType.Wait_For_SSH, taskParams())
+          .nodeCommand(NodeManager.NodeCommandType.Wait_For_Connection, taskParams())
           .processErrors();
       setNodeStatus(NodeStatus.builder().nodeState(NodeState.InstanceCreated).build());
     } else {
+      Universe universe = Universe.getOrBadRequest(taskParams().getUniverseUUID());
+      NodeDetails nodeDetails = universe.getNode(taskParams().nodeName);
+      UniverseDefinitionTaskParams.Cluster cluster = universe.getCluster(nodeDetails.placementUuid);
+      Provider provider = Provider.getOrBadRequest(UUID.fromString(cluster.userIntent.provider));
+      taskParams().capacityReservation =
+          CapacityReservationUtil.getReservationIfPresent(
+              getTaskCache(), provider, taskParams().nodeName);
       // Execute the ansible command to create the node.
       // It waits for SSH connection to work.
       ShellResponse response =
@@ -91,7 +100,7 @@ public class AnsibleCreateServer extends NodeTaskBase {
               .nodeCommand(NodeManager.NodeCommandType.Create, taskParams())
               .processErrors();
       setNodeStatus(NodeStatus.builder().nodeState(NodeState.InstanceCreated).build());
-      if (p.code.equals(CloudType.azu.name())) {
+      if (p.getCode().equals(CloudType.azu.name())) {
         // Parse into a json object.
         JsonNode jsonNodeTmp = Json.parse(response.message);
         if (jsonNodeTmp.isArray()) {
@@ -128,31 +137,35 @@ public class AnsibleCreateServer extends NodeTaskBase {
   }
 
   @Override
-  public void onFailure(TaskInfo taskInfo, Throwable cause) {
+  public boolean onFailure(TaskInfo taskInfo, Throwable cause) {
     Params params = taskParams();
 
     if (instanceExists(taskParams())) {
       if (cause instanceof RecoverableException) {
-        super.onFailure(taskInfo, cause);
+        return super.onFailure(taskInfo, cause);
       } else {
         // TODO: retry in a different AZ?
-        log.warn("Instance creation in {} failed", params.getAZ().name);
+        log.warn("Instance creation in {} failed", params.getAZ().getName());
 
         AnsibleDestroyServer.Params destroyParams = new AnsibleDestroyServer.Params();
         destroyParams.deviceInfo = params.deviceInfo;
         destroyParams.azUuid = params.azUuid;
         destroyParams.nodeName = params.nodeName;
         destroyParams.nodeUuid = params.nodeUuid;
-        destroyParams.universeUUID = params.universeUUID;
-        destroyParams.isForceDelete = true;
+        destroyParams.setUniverseUUID(params.getUniverseUUID());
+        destroyParams.isForceDelete = false;
         destroyParams.deleteNode = false;
         destroyParams.deleteRootVolumes = true;
         destroyParams.instanceType = params.instanceType;
+        destroyParams.skipUpdateNodeState = true;
         AnsibleDestroyServer task = createTask(AnsibleDestroyServer.class);
         task.initialize(destroyParams);
-        task.setUserTaskUUID(userTaskUUID);
+        task.setUserTaskUUID(getUserTaskUUID());
         task.run();
+        return true;
       }
     }
+
+    return false;
   }
 }

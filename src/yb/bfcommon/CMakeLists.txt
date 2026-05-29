@@ -1,4 +1,4 @@
-# Copyright (c) YugaByte, Inc.
+# Copyright (c) YugabyteDB, Inc.
 #
 # Licensed under the Apache License, Version 2.0 (the "License"); you may not use this file except
 # in compliance with the License.  You may obtain a copy of the License at
@@ -18,11 +18,14 @@ set(YB_PCH_DEP_LIBS gutil yb_test_util yb_util)
 set(YB_BFCOMMON_SRCS
     bfdecl.cc)
 
-set(YB_BFPG_LIBS
+set(YB_BFCOMMON_LIBS
     gutil
-    yb_common_base
     yb_common_proto
     yb_util)
+
+if (NOT APPLE)
+  list(APPEND YB_BFCOMMON_LIBS libuuid)
+endif()
 
 ADD_YB_LIBRARY(yb_bfcommon
                SRCS ${YB_BFCOMMON_SRCS}

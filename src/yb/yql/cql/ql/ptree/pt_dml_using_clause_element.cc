@@ -1,4 +1,4 @@
-// Copyright (c) YugaByte, Inc.
+// Copyright (c) YugabyteDB, Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License"); you may not use this file except
 // in compliance with the License.  You may obtain a copy of the License at
@@ -71,12 +71,12 @@ Status PTDmlUsingClauseElement::Analyze(SemContext *sem_context) {
 
   SemState sem_state(sem_context);
   if (strcmp(name_->c_str(), kTtl) == 0) {
-    sem_state.SetExprState(QLType::Create(INT32), InternalType::kInt32Value);
+    sem_state.SetExprState(QLType::Create(DataType::INT32), InternalType::kInt32Value);
     sem_state.set_bindvar_name(PTBindVar::ttl_bindvar_name());
   } else {
     // has to be timestamp.
     DCHECK_EQ(0, strcmp(name_->c_str(), kTimestamp));
-    sem_state.SetExprState(QLType::Create(INT64), InternalType::kInt64Value);
+    sem_state.SetExprState(QLType::Create(DataType::INT64), InternalType::kInt64Value);
     sem_state.set_bindvar_name(PTBindVar::timestamp_bindvar_name());
   }
 

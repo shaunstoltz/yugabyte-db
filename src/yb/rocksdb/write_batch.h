@@ -6,9 +6,9 @@
 // Use of this source code is governed by a BSD-style license that can be
 // found in the LICENSE file. See the AUTHORS file for names of contributors.
 //
-// The following only applies to changes made to this file as part of YugaByte development.
+// The following only applies to changes made to this file as part of YugabyteDB development.
 //
-// Portions Copyright (c) YugaByte, Inc.
+// Portions Copyright (c) YugabyteDB, Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License"); you may not use this file except
 // in compliance with the License.  You may obtain a copy of the License at
@@ -49,6 +49,9 @@
 #include "yb/rocksdb/status.h"
 #include "yb/rocksdb/write_batch_base.h"
 
+#include "yb/storage/storage_fwd.h"
+
+#include "yb/util/monotime.h"
 #include "yb/util/slice.h"
 #include "yb/util/slice_parts.h"
 
@@ -56,7 +59,6 @@ namespace rocksdb {
 
 class ColumnFamilyHandle;
 struct SavePoints;
-class UserFrontiers;
 
 class DirectWriteHandler {
  public:
@@ -73,7 +75,7 @@ class DirectWriteHandler {
 // entries directly to the memtable.
 class DirectWriter {
  public:
-  virtual Status Apply(DirectWriteHandler* handler) = 0;
+  virtual Status Apply(DirectWriteHandler& handler) = 0;
 
   virtual ~DirectWriter() = default;
 };
@@ -222,7 +224,7 @@ class WriteBatch : public WriteBatchBase {
     }
     virtual void Merge(const Slice& /*key*/, const Slice& /*value*/) {}
 
-    virtual Status Frontiers(const UserFrontiers&) {
+    virtual Status Frontiers(const yb::storage::UserFrontiers&) {
       return STATUS(NotSupported, "UserFrontiers not implemented");
     }
 
@@ -268,8 +270,8 @@ class WriteBatch : public WriteBatchBase {
   WriteBatch& operator=(const WriteBatch& src);
   WriteBatch& operator=(WriteBatch&& src);
 
-  void SetFrontiers(const UserFrontiers* value) { frontiers_ = value; }
-  const UserFrontiers* Frontiers() const { return frontiers_; }
+  void SetFrontiers(const yb::storage::UserFrontiers* value) { frontiers_ = value; }
+  const yb::storage::UserFrontiers* Frontiers() const { return frontiers_; }
 
   void SetDirectWriter(DirectWriter* direct_writer) {
     direct_writer_ = direct_writer;
@@ -287,6 +289,14 @@ class WriteBatch : public WriteBatchBase {
     handler_for_logging_ = handler_for_logging;
   }
 
+  yb::MonoDelta GetWriteGroupJoinDuration() const {
+    return write_group_join_duration_;
+  }
+
+  void SetWriteGroupJoinDuration(yb::MonoDelta write_group_join_duration) {
+    write_group_join_duration_ = write_group_join_duration;
+  }
+
  private:
   friend class WriteBatchInternal;
   std::unique_ptr<SavePoints> save_points_;
@@ -299,11 +309,14 @@ class WriteBatch : public WriteBatchBase {
 
  protected:
   std::string rep_;  // See comment in write_batch.cc for the format of rep_
-  const UserFrontiers* frontiers_ = nullptr;
+  const yb::storage::UserFrontiers* frontiers_ = nullptr;
   DirectWriter* direct_writer_ = nullptr;
   mutable size_t direct_entries_ = 0;
 
   Handler* handler_for_logging_ = nullptr;
+
+  // The field is set by rocksdb during the batch write.
+  yb::MonoDelta write_group_join_duration_ = yb::MonoDelta::kZero;
 };
 
 }  // namespace rocksdb

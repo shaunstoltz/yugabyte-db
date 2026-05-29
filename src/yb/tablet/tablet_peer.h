@@ -15,9 +15,9 @@
 // specific language governing permissions and limitations
 // under the License.
 //
-// The following only applies to changes made to this file as part of YugaByte development.
+// The following only applies to changes made to this file as part of YugabyteDB development.
 //
-// Portions Copyright (c) YugaByte, Inc.
+// Portions Copyright (c) YugabyteDB, Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License"); you may not use this file except
 // in compliance with the License.  You may obtain a copy of the License at
@@ -36,35 +36,35 @@
 #include <future>
 #include <map>
 #include <memory>
-#include <mutex>
 #include <string>
 #include <vector>
 
-#include "yb/consensus/consensus_fwd.h"
 #include "yb/consensus/consensus_context.h"
+#include "yb/consensus/consensus_fwd.h"
 #include "yb/consensus/consensus_meta.h"
-#include "yb/consensus/consensus_types.h"
 #include "yb/gutil/callback.h"
 #include "yb/gutil/ref_counted.h"
 #include "yb/gutil/thread_annotations.h"
 #include "yb/rpc/rpc_fwd.h"
 
-#include "yb/tablet/tablet_fwd.h"
-#include "yb/tablet/metadata.pb.h"
 #include "yb/tablet/mvcc.h"
-#include "yb/tablet/transaction_coordinator.h"
-#include "yb/tablet/transaction_participant_context.h"
 #include "yb/tablet/operations/operation_tracker.h"
 #include "yb/tablet/preparer.h"
+#include "yb/tablet/tablet_bootstrap_state_flusher.h"
+#include "yb/tablet/tablet_bootstrap_state_manager.h"
+#include "yb/tablet/tablet_fwd.h"
 #include "yb/tablet/tablet_options.h"
+#include "yb/tablet/transaction_coordinator.h"
+#include "yb/tablet/transaction_participant_context.h"
 #include "yb/tablet/write_query_context.h"
 
 #include "yb/util/atomic.h"
-#include "yb/util/semaphore.h"
 
 using yb::consensus::StateChangeContext;
 
 namespace yb {
+
+class Cgroup;
 
 namespace tserver {
 class CatchUpServiceTest;
@@ -82,7 +82,14 @@ struct TabletOnDiskSizeInfo {
   int64_t wal_files_disk_size = 0;
   int64_t sst_files_disk_size = 0;
   int64_t uncompressed_sst_files_disk_size = 0;
-  int64_t sum_on_disk_size = 0;
+
+  // Sum of consensus metadata, WALs, and SSTs. Excludes snapshots, retryable requests, MANIFEST,
+  // and other files in those directories. This is always up-to-date.
+  int64_t active_on_disk_size = 0;
+
+  // Estimated size of the tablet on disk, including snapshots, retryable requests, MANIFEST,
+  // and other files in those directories. This is updated periodically, so may be stale or 0.
+  int64_t total_on_disk_size = 0;
 
   template <class PB>
   static TabletOnDiskSizeInfo FromPB(const PB& pb) {
@@ -91,7 +98,8 @@ struct TabletOnDiskSizeInfo {
       .wal_files_disk_size = pb.wal_files_disk_size(),
       .sst_files_disk_size = pb.sst_files_disk_size(),
       .uncompressed_sst_files_disk_size = pb.uncompressed_sst_files_disk_size(),
-      .sum_on_disk_size = pb.estimated_on_disk_size()
+      .active_on_disk_size = pb.active_on_disk_size(),
+      .total_on_disk_size = pb.total_on_disk_size(),
     };
   }
 
@@ -101,7 +109,8 @@ struct TabletOnDiskSizeInfo {
     pb->set_wal_files_disk_size(wal_files_disk_size);
     pb->set_sst_files_disk_size(sst_files_disk_size);
     pb->set_uncompressed_sst_files_disk_size(uncompressed_sst_files_disk_size);
-    pb->set_estimated_on_disk_size(sum_on_disk_size);
+    pb->set_active_on_disk_size(active_on_disk_size);
+    pb->set_total_on_disk_size(total_on_disk_size);
   }
 
   void operator+=(const TabletOnDiskSizeInfo& other) {
@@ -109,19 +118,19 @@ struct TabletOnDiskSizeInfo {
     wal_files_disk_size += other.wal_files_disk_size;
     sst_files_disk_size += other.sst_files_disk_size;
     uncompressed_sst_files_disk_size += other.uncompressed_sst_files_disk_size;
-    sum_on_disk_size += other.sum_on_disk_size;
+    active_on_disk_size += other.active_on_disk_size;
+    total_on_disk_size += other.total_on_disk_size;
   }
 
   void RecomputeTotalSize() {
-    sum_on_disk_size =
+    active_on_disk_size =
         consensus_metadata_disk_size +
         sst_files_disk_size +
         wal_files_disk_size;
   }
 };
 
-YB_DEFINE_ENUM(
-    TabletObjectState,
+YB_DEFINE_ENUM(TabletObjectState,
     (kUninitialized)
     (kAvailable)
     (kDestroyed));
@@ -137,7 +146,7 @@ class TabletPeer : public std::enable_shared_from_this<TabletPeer>,
                    public TransactionCoordinatorContext,
                    public WriteQueryContext {
  public:
-  typedef std::map<int64_t, int64_t> MaxIdxToSegmentSizeMap;
+  using MaxIdxToSegmentSizeMap = std::map<int64_t, int64_t>;
 
   // Creates TabletPeer.
   // `tablet_splitter` will be used for applying split tablet Raft operation.
@@ -151,7 +160,7 @@ class TabletPeer : public std::enable_shared_from_this<TabletPeer>,
       TabletSplitter* tablet_splitter,
       const std::shared_future<client::YBClient*>& client_future);
 
-  ~TabletPeer();
+  ~TabletPeer() override;
 
   // Initializes the TabletPeer, namely creating the Log and initializing
   // Consensus.
@@ -160,15 +169,23 @@ class TabletPeer : public std::enable_shared_from_this<TabletPeer>,
       const TabletPtr& tablet,
       const std::shared_ptr<MemTracker>& server_mem_tracker,
       rpc::Messenger* messenger,
+      rpc::ThreadPoolPtr service_pool,
       rpc::ProxyCache* proxy_cache,
       const scoped_refptr<log::Log>& log,
       const scoped_refptr<MetricEntity>& table_metric_entity,
       const scoped_refptr<MetricEntity>& tablet_metric_entity,
       ThreadPool* raft_pool,
+      rpc::ThreadPool* raft_notifications_pool,
       ThreadPool* tablet_prepare_pool,
       consensus::RetryableRequests* retryable_requests,
+      std::shared_ptr<TabletBootstrapStateManager> bootstrap_state_manager,
       std::unique_ptr<consensus::ConsensusMetadata> consensus_meta,
-      consensus::MultiRaftManager* multi_raft_manager);
+      consensus::MultiRaftManager* multi_raft_manager,
+      ThreadPool* flush_bootstrap_state_pool);
+
+  // Set the per-database cgroup on all internal consensus/WAL tokens and the tablet's
+  // RocksDB task cgroup. Used for per-DB cgroup mode.
+  void SetPerDbCgroup(Cgroup* cgroup);
 
   // Starts the TabletPeer, making it available for Write()s. If this
   // TabletPeer is part of a consensus configuration this will connect it to other peers
@@ -179,14 +196,16 @@ class TabletPeer : public std::enable_shared_from_this<TabletPeer>,
   // Returns true if shutdown was just initiated, false if shutdown was already running.
   MUST_USE_RESULT bool StartShutdown();
   // Completes shutdown process and waits for it's completeness.
-  void CompleteShutdown(DisableFlushOnShutdown disable_flush_on_shutdown);
+  void CompleteShutdown(DisableFlushOnShutdown disable_flush_on_shutdown, AbortOps abort_ops);
 
   // Abort active transactions on the tablet after shutdown is initiated.
-  Status AbortSQLTransactions();
+  void AbortActiveTransactions(
+      std::optional<TransactionId>&& exclude_aborting_txn_id = std::nullopt) const;
 
   Status Shutdown(
       ShouldAbortActiveTransactions should_abort_active_txns,
-      DisableFlushOnShutdown disable_flush_on_shutdown);
+      DisableFlushOnShutdown disable_flush_on_shutdown,
+      std::optional<TransactionId>&& exclude_aborting_txn_id = std::nullopt);
 
   // Check that the tablet is in a RUNNING state.
   Status CheckRunning() const;
@@ -215,8 +234,9 @@ class TabletPeer : public std::enable_shared_from_this<TabletPeer>,
   std::unique_ptr<UpdateTxnOperation> CreateUpdateTransaction(
       std::shared_ptr<LWTransactionStatePB> request) override;
 
+  // `operation` is moved from in the event of success, and left alive in event of failure.
   Status SubmitUpdateTransaction(
-      std::unique_ptr<UpdateTxnOperation> operation, int64_t term) override;
+      std::unique_ptr<UpdateTxnOperation>& operation, int64_t term) override;
 
   HybridTime SafeTimeForTransactionParticipant() override;
   Result<HybridTime> WaitForSafeTime(HybridTime safe_time, CoarseTimePoint deadline) override;
@@ -234,14 +254,19 @@ class TabletPeer : public std::enable_shared_from_this<TabletPeer>,
   // UpdateReplica -> EnqueuePreparesUnlocked on Raft heartbeats.
   void SetPropagatedSafeTime(HybridTime ht) override;
 
+  void SetMvccPropagatedSafeTime(HybridTime ht) override;
+
   // Returns false if it is preferable to don't apply write operation.
   bool ShouldApplyWrite() override;
 
-  consensus::Consensus* consensus() const;
-  consensus::RaftConsensus* raft_consensus() const;
+  bool AreWritesStopped() override;
 
-  std::shared_ptr<consensus::Consensus> shared_consensus() const;
-  std::shared_ptr<consensus::RaftConsensus> shared_raft_consensus() const;
+  // Returns valid shared pointer to the consensus. Returns a not OK status if the consensus is not
+  // in a valid state or a peer is not running (shutting down or shut down).
+  Result<std::shared_ptr<consensus::Consensus>> GetConsensus() const EXCLUDES(lock_);
+  Result<std::shared_ptr<consensus::RaftConsensus>> GetRaftConsensus() const EXCLUDES(lock_);
+
+  std::shared_ptr<TabletBootstrapStateFlusher> shared_bootstrap_state_flusher() const;
 
   // ----------------------------------------------------------------------------------------------
   // Functions for accessing the tablet. We need to gradually improve the safety so that all callers
@@ -250,29 +275,21 @@ class TabletPeer : public std::enable_shared_from_this<TabletPeer>,
   // checking and return a raw pointer.
   // ----------------------------------------------------------------------------------------------
 
-  // Returns the tablet associated with this TabletPeer as a raw pointer.
-  [[deprecated]] Tablet* tablet() const {
-    return shared_tablet().get();
-  }
-
-  TabletPtr shared_tablet() const {
-    auto tablet_result = shared_tablet_safe();
+  TabletPtr shared_tablet_maybe_null() const {
+    auto tablet_result = shared_tablet();
     if (tablet_result.ok()) {
       return *tablet_result;
     }
     return nullptr;
   }
 
-  Result<TabletPtr> shared_tablet_safe() const;
+  Result<TabletPtr> shared_tablet() const;
 
   RaftGroupStatePB state() const {
     return state_.load(std::memory_order_acquire);
   }
 
   TabletDataState data_state() const;
-
-  // Returns the current Raft configuration.
-  consensus::RaftConfigPB RaftConfig() const;
 
   TabletStatusListener* status_listener() const {
     return status_listener_.get();
@@ -317,9 +334,15 @@ class TabletPeer : public std::enable_shared_from_this<TabletPeer>,
   // to it.
   Result<int64_t> GetEarliestNeededLogIndex(std::string* details = nullptr) const;
 
-  // Returns the latest log index for non transaction tables and the minimum log index for
-  // transaction tables.
-  Result<OpId> GetCdcBootstrapOpIdByTableType() const;
+  Result<OpId> MaxPersistentOpId() const override;
+
+  // Returns the the minimum log index for transaction tables and latest log index for other tables.
+  // Returns the bootstrap_time which is safe_time higher than the time of the returned OpId.
+  // If FLAGS_abort_active_txns_during_cdc_bootstrap is set then all active transactions are
+  // aborted.
+  Result<std::pair<OpId, HybridTime>> GetOpIdAndSafeTimeForXReplBootstrap() const;
+
+  bool IsRunning() const override;
 
   // Returns the amount of bytes that would be GC'd if RunLogGC() was called.
   //
@@ -352,11 +375,16 @@ class TabletPeer : public std::enable_shared_from_this<TabletPeer>,
     return client_future_;
   }
 
+  Result<client::YBClient*> client() const override;
+
   int64_t LeaderTerm() const override;
   consensus::LeaderStatus LeaderStatus(bool allow_stale = false) const;
   Result<HybridTime> LeaderSafeTime() const override;
 
-  HybridTime HtLeaseExpiration() const override;
+  bool IsLeaderAndReady() const;
+  bool IsNotLeader() const;
+
+  Result<HybridTime> HtLeaseExpiration() const override;
 
   const scoped_refptr<log::LogAnchorRegistry>& log_anchor_registry() const {
     return log_anchor_registry_;
@@ -380,7 +408,7 @@ class TabletPeer : public std::enable_shared_from_this<TabletPeer>,
   Result<OperationDriverPtr> NewReplicaOperationDriver(std::unique_ptr<Operation>* operation);
 
   // Tells the tablet's log to garbage collect.
-  Status RunLogGC();
+  Status RunLogGC(bool rollover = false);
 
   // Register the maintenance ops associated with this peer's tablet, also invokes
   // Tablet::RegisterMaintenanceOps().
@@ -396,6 +424,11 @@ class TabletPeer : public std::enable_shared_from_this<TabletPeer>,
   const RaftGroupMetadataPtr& tablet_metadata() const {
     return meta_;
   }
+
+  //------------------------------------------------------------------------------------------------
+  // CDC Related
+
+  bool is_cdc_min_replicated_index_stale(double* seconds_since_last_refresh = nullptr) const;
 
   Status set_cdc_min_replicated_index(int64_t cdc_min_replicated_index);
 
@@ -415,11 +448,36 @@ class TabletPeer : public std::enable_shared_from_this<TabletPeer>,
 
   CoarseTimePoint cdc_sdk_min_checkpoint_op_id_expiration();
 
+  bool is_under_cdc_sdk_replication();
+
+  Status reset_all_cdc_retention_barriers_if_stale();
+
+  HybridTime GetMinStartHTRunningTxnsOrLeaderSafeTime();
+
   Status SetCDCSDKRetainOpIdAndTime(
       const OpId& cdc_sdk_op_id, const MonoDelta& cdc_sdk_op_id_expiration,
       const HybridTime& cdc_sdk_safe_time = HybridTime::kInvalid);
 
   Result<MonoDelta> GetCDCSDKIntentRetainTime(const int64_t& cdc_sdk_latest_active_time);
+
+  Result<bool> SetAllCDCRetentionBarriers(
+      int64 cdc_wal_index, OpId cdc_sdk_intents_op_id, MonoDelta cdc_sdk_op_id_expiration,
+      HybridTime cdc_sdk_history_cutoff, bool require_history_cutoff,
+      bool initial_retention_barrier);
+
+  Result<bool> SetAllInitialCDCRetentionBarriers(
+      int64 cdc_wal_index, OpId cdc_sdk_intents_op_id, HybridTime cdc_sdk_history_cutoff,
+      bool require_history_cutoff);
+
+  Result<bool> SetAllInitialCDCSDKRetentionBarriers(
+      OpId cdc_sdk_op_id, HybridTime cdc_sdk_history_cutoff, bool require_history_cutoff);
+
+  Result<bool> MoveForwardAllCDCRetentionBarriers(
+      int64 cdc_wal_index, OpId cdc_sdk_intents_op_id, MonoDelta cdc_sdk_op_id_expiration,
+      HybridTime cdc_sdk_history_cutoff, bool require_history_cutoff);
+
+  std::string AllCDCRetentionBarriersToString() const;
+  //------------------------------------------------------------------------------------------------
 
   OpId GetLatestCheckPoint();
 
@@ -435,9 +493,43 @@ class TabletPeer : public std::enable_shared_from_this<TabletPeer>,
 
   std::string LogPrefix() const;
 
-  // Called from RemoteBootstrapSession and RemoteBootstrapAnchorSession to change role of the
-  // new peer post RBS.
-  Status ChangeRole(const std::string& requestor_uuid);
+  Result<consensus::RetryableRequests> GetRetryableRequests();
+  Status FlushBootstrapState();
+  Result<OpId> CopyBootstrapStateTo(const std::string& dest_path);
+  Status CopyBootstrapStateForTabletSplit(const std::string& child_wal_dir);
+  Status SubmitFlushBootstrapStateTask();
+
+  void EnableFlushBootstrapState();
+
+  bool TEST_HasBootstrapStateOnDisk();
+  TabletBootstrapFlushState TEST_TabletBootstrapStateFlusherState() const;
+
+  std::shared_ptr<TabletBootstrapStateManager> bootstrap_state_manager() {
+    return bootstrap_state_manager_;
+  }
+
+  Preparer* DEBUG_GetPreparer();
+
+  std::string Tserver_uuid() {
+    return local_peer_pb_.permanent_uuid();
+  }
+
+  bool HasSufficientDiskSpaceForWrite();
+
+  TabletOnDiskSizeInfo GetOnDiskSizeInfo() const EXCLUDES(lock_);
+
+  void SetTabletOnDiskSize(size_t total_on_disk_size);
+
+  void NotifyCommitedAsyncWrites(const OpId& committed_op_id) EXCLUDES(async_write_queries_mutex_);
+
+  void FailAllAsyncWrites(const Status& status) EXCLUDES(async_write_queries_mutex_);
+
+  void RegisterAsyncWrite(const OpId& op_id) override;
+  void RegisterAsyncWriteCompletion(const OpId& op_id, StdStatusCallback&& callback)
+      EXCLUDES(async_write_queries_mutex_) override;
+
+  // Verifies that this peer has the op_id in its local log.
+  Status VerifyAsyncWriteReceived(const OpId& op_id);
 
  protected:
   friend class RefCountedThreadSafe<TabletPeer>;
@@ -480,7 +572,7 @@ class TabletPeer : public std::enable_shared_from_this<TabletPeer>,
   TabletWeakPtr tablet_weak_;
   std::atomic<TabletObjectState> tablet_obj_state_{TabletObjectState::kUninitialized};
 
-  std::shared_ptr<consensus::RaftConsensus> consensus_;
+  std::shared_ptr<consensus::RaftConsensus> consensus_ GUARDED_BY(lock_);
   std::unique_ptr<TabletStatusListener> status_listener_;
   simple_spinlock prepare_replicate_lock_;
 
@@ -524,8 +616,8 @@ class TabletPeer : public std::enable_shared_from_this<TabletPeer>,
 
   OperationCounter preparing_operations_counter_;
 
-  // Serializes access to set_cdc_min_replicated_index and reset_cdc_min_replicated_index_if_stale
-  // and protects cdc_min_replicated_index_refresh_time_ for reads and writes.
+  // Serializes access to set_cdc_min_replicated_index and is_cdc_min_replicated_index_stale and
+  // protects cdc_min_replicated_index_refresh_time_ for reads and writes.
   mutable simple_spinlock cdc_min_replicated_index_lock_;
   MonoTime cdc_min_replicated_index_refresh_time_ = MonoTime::Min();
 
@@ -534,7 +626,8 @@ class TabletPeer : public std::enable_shared_from_this<TabletPeer>,
 
   Result<FixedHybridTimeLease> HybridTimeLease(HybridTime min_allowed, CoarseTimePoint deadline);
   Result<HybridTime> PreparePeerRequest() override;
-  void MajorityReplicated() override;
+  Status MajorityReplicated(const OpId& committed_op_id) override;
+  void BecomeReplica() override;
   void ChangeConfigReplicated(const consensus::RaftConfigPB& config) override;
   uint64_t NumSSTFiles() override;
   void ListenNumSSTFilesChanged(std::function<void()> listener) override;
@@ -542,7 +635,13 @@ class TabletPeer : public std::enable_shared_from_this<TabletPeer>,
   Status CheckOperationAllowed(
       const OpId& op_id, consensus::OperationType op_type) override;
   // Return granular types of on-disk size of this tablet replica, in bytes.
-  TabletOnDiskSizeInfo GetOnDiskSizeInfo() const REQUIRES(lock_);
+  TabletOnDiskSizeInfo GetOnDiskSizeInfoUnlocked() const REQUIRES(lock_);
+
+  bool FlushBootstrapStateEnabled() const;
+
+  void MinReplayTxnFirstWriteTimeUpdated(HybridTime first_write_ht);
+
+  Status VerifyAsyncWriteCompletion(const OpId& op_id);
 
   MetricRegistry* metric_registry_;
 
@@ -550,16 +649,38 @@ class TabletPeer : public std::enable_shared_from_this<TabletPeer>,
     return LeaderTerm() != OpId::kUnknownTerm;
   }
 
-  void PollWaitQueue() const;
+  // Returns the consensus. Can be nullptr.
+  std::shared_ptr<consensus::RaftConsensus> GetRaftConsensusUnsafe() const EXCLUDES(lock_);
 
   TabletSplitter* tablet_splitter_;
 
   std::shared_future<client::YBClient*> client_future_;
+  mutable std::atomic<client::YBClient*> client_cache_{nullptr};
 
   rpc::Messenger* messenger_;
 
+  std::shared_ptr<TabletBootstrapStateManager> bootstrap_state_manager_;
+
+  std::atomic<bool> flush_bootstrap_state_enabled_{false};
+  std::shared_ptr<TabletBootstrapStateFlusher> bootstrap_state_flusher_;
+
+  // The size of the tablet on disk in bytes, including snapshots, retryable requests, MANIFEST,
+  // and other files in those directories. This can be stale as it is only updated every
+  // FLAGS_data_size_metric_updater_interval_sec seconds.
+  std::atomic<size_t> total_on_disk_size_{0};
+
+  std::mutex async_write_queries_mutex_;
+  std::atomic<OpId> last_known_committed_op_id_;
+  std::deque<std::pair<OpId, std::vector<StdStatusCallback>>> in_flight_async_write_queries_
+      GUARDED_BY(async_write_queries_mutex_);
+
+  rpc::ThreadPoolPtr service_thread_pool_holder_;
+
   DISALLOW_COPY_AND_ASSIGN(TabletPeer);
 };
+
+Status BackfillNamespaceIdIfNeeded(
+    const TableId& table_id, tablet::RaftGroupMetadata& metadata, client::YBClient& client);
 
 }  // namespace tablet
 }  // namespace yb

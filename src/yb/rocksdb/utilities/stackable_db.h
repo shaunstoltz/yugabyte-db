@@ -2,9 +2,9 @@
 // Use of this source code is governed by a BSD-style license that can be
 // found in the LICENSE file. See the AUTHORS file for names of contributors.
 //
-// The following only applies to changes made to this file as part of YugaByte development.
+// The following only applies to changes made to this file as part of YugabyteDB development.
 //
-// Portions Copyright (c) YugaByte, Inc.
+// Portions Copyright (c) YugabyteDB, Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License"); you may not use this file except
 // in compliance with the License.  You may obtain a copy of the License at
@@ -273,18 +273,18 @@ class StackableDB : public DB {
     db_->GetLiveFilesMetaData(metadata);
   }
 
-  UserFrontierPtr GetFlushedFrontier() override {
+  yb::storage::UserFrontierPtr GetFlushedFrontier() override {
     return db_->GetFlushedFrontier();
   }
 
   Status ModifyFlushedFrontier(
-      UserFrontierPtr values,
+      yb::storage::UserFrontierPtr values,
       FrontierModificationMode mode) override {
     return db_->ModifyFlushedFrontier(std::move(values), mode);
   }
 
-  yb::Result<std::string> GetMiddleKey() override {
-    return db_->GetMiddleKey();
+  yb::Result<std::string> GetMiddleKey(Slice lower_bound_key) override {
+    return db_->GetMiddleKey(lower_bound_key);
   };
 
   virtual void GetColumnFamilyMetaData(
@@ -299,14 +299,18 @@ class StackableDB : public DB {
     db_->GetColumnFamiliesOptions(column_family_names, column_family_options);
   }
 
-
-  virtual Status GetLiveFiles(std::vector<std::string>& vec, uint64_t* mfs,
-                              bool flush_memtable = true) override {
-      return db_->GetLiveFiles(vec, mfs, flush_memtable);
+  virtual Status GetLiveFiles(
+      std::vector<std::string>& vec, uint64_t* mfs, bool flush_memtable,
+      FlushReason flush_reason) override {
+    return db_->GetLiveFiles(vec, mfs, flush_memtable, flush_reason);
   }
 
   virtual SequenceNumber GetLatestSequenceNumber() const override {
     return db_->GetLatestSequenceNumber();
+  }
+
+  virtual uint64_t GetNextFileNumber() const override {
+    return db_->GetNextFileNumber();
   }
 
   virtual Status GetSortedWalFiles(VectorLogPtr* files) override {

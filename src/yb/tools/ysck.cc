@@ -15,9 +15,9 @@
 // specific language governing permissions and limitations
 // under the License.
 //
-// The following only applies to changes made to this file as part of YugaByte development.
+// The following only applies to changes made to this file as part of YugabyteDB development.
 //
-// Portions Copyright (c) YugaByte, Inc.
+// Portions Copyright (c) YugabyteDB, Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License"); you may not use this file except
 // in compliance with the License.  You may obtain a copy of the License at
@@ -35,7 +35,7 @@
 #include <mutex>
 #include <unordered_set>
 
-#include <glog/logging.h>
+#include "yb/util/logging.h"
 
 #include "yb/gutil/bind.h"
 #include "yb/gutil/map-util.h"
@@ -59,10 +59,10 @@ using std::unordered_map;
 using std::vector;
 using strings::Substitute;
 
-DEFINE_UNKNOWN_int32(checksum_timeout_sec, 120,
+DEFINE_NON_RUNTIME_int32(checksum_timeout_sec, 120,
              "Maximum total seconds to wait for a checksum scan to complete "
              "before timing out.");
-DEFINE_UNKNOWN_int32(checksum_scan_concurrency, 4,
+DEFINE_NON_RUNTIME_int32(checksum_scan_concurrency, 4,
              "Number of concurrent checksum scans to execute per tablet server.");
 
 ChecksumOptions::ChecksumOptions()
@@ -208,7 +208,7 @@ class ChecksumResultReporter : public RefCountedThreadSafe<ChecksumResultReporte
                     const std::string& replica_uuid,
                     const Status& status,
                     uint64_t checksum) {
-    std::lock_guard<simple_spinlock> guard(lock_);
+    std::lock_guard guard(lock_);
     unordered_map<string, TableResults>& replica_results =
         LookupOrInsert(&checksums_, tablet_id, unordered_map<string, TableResults>());
     if (replica_results.find(replica_uuid) == replica_results.end()) {
@@ -232,7 +232,7 @@ class ChecksumResultReporter : public RefCountedThreadSafe<ChecksumResultReporte
 
   // Get reported results.
   TabletResultMap checksums() const {
-    std::lock_guard<simple_spinlock> guard(lock_);
+    std::lock_guard guard(lock_);
     return checksums_;
   }
 

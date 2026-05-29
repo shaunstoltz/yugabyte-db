@@ -1,8 +1,8 @@
-// Copyright (c) YugaByte, Inc.
+// Copyright (c) YugabyteDB, Inc.
 
 package com.yugabyte.yw.forms;
 
-import com.fasterxml.jackson.databind.PropertyNamingStrategy;
+import com.fasterxml.jackson.databind.PropertyNamingStrategies;
 import com.fasterxml.jackson.databind.annotation.JsonNaming;
 import io.swagger.annotations.ApiModel;
 import io.swagger.annotations.ApiModelProperty;
@@ -14,7 +14,7 @@ import lombok.experimental.Accessors;
 @ApiModel
 @Data
 @Accessors(chain = true)
-@JsonNaming(PropertyNamingStrategy.SnakeCaseStrategy.class)
+@JsonNaming(PropertyNamingStrategies.SnakeCaseStrategy.class)
 public class PerfAdvisorSettingsFormData {
 
   @ApiModelProperty(value = "Enable/disable perf advisor runs for the universe")
@@ -75,4 +75,24 @@ public class PerfAdvisorSettingsFormData {
   @ApiModelProperty(value = "Perf advisor rejected connections check interval")
   @Min(1)
   private Integer rejectedConnIntervalMins;
+
+  @ApiModelProperty(value = "Perf Advisor hot shard write skew threshold")
+  @Min(1)
+  private Double hotShardWriteSkewThresholdPct;
+
+  @ApiModelProperty(value = "Perf Advisor hot shard read skew threshold")
+  @Min(1)
+  private Double hotShardReadSkewThresholdPct;
+
+  @ApiModelProperty(value = "Perf Advisor hot shard check interval")
+  @Min(1)
+  private Integer hotShardIntervalMins;
+
+  @ApiModelProperty(value = "Perf advisor hot shard minimal node writes")
+  @Min(1)
+  private Integer hotShardMinNodeWrites;
+
+  @ApiModelProperty(value = "Perf advisor hot shard minimal node reads")
+  @Min(1)
+  private Integer hotShardMinNodeReads;
 }

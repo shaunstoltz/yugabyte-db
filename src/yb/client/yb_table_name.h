@@ -1,4 +1,4 @@
-// Copyright (c) YugaByte, Inc.
+// Copyright (c) YugabyteDB, Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License"); you may not use this file except
 // in compliance with the License.  You may obtain a copy of the License at
@@ -14,9 +14,9 @@
 #pragma once
 
 #include <string>
-#include <boost/optional.hpp>
 
 #include "yb/util/flags.h"
+#include "yb/util/memory/memory_usage.h"
 
 #include "yb/common/common_types.pb.h"
 
@@ -37,8 +37,8 @@ DECLARE_bool(yb_system_namespace_readonly);
 // The class is used to store a table name, which can include namespace name as a suffix.
 class YBTableName {
  public:
-  // Empty (undefined) name.
-  YBTableName() : namespace_type_(YQL_DATABASE_UNKNOWN) {}
+  // Empty (undefined) name. Only the table type can be known.
+  explicit YBTableName(YQLDatabase db_type = YQL_DATABASE_UNKNOWN) : namespace_type_(db_type) {}
 
   // Complex table name: 'namespace_name.table_name'.
   // The namespace must not be empty.
@@ -59,20 +59,20 @@ class YBTableName {
     set_table_name(table_name);
   }
 
-  YBTableName(YQLDatabase db_type,
-              const std::string& namespace_id,
-              const std::string& namespace_name,
-              const std::string& table_id,
-              const std::string& table_name,
-              const std::string& pgschema_name = "",
-              boost::optional<master::RelationType> relation_type = boost::none)
-            : namespace_type_(db_type) {
+  YBTableName(
+      YQLDatabase db_type, const std::string& namespace_id, const std::string& namespace_name,
+      const std::string& table_id, const std::string& table_name,
+      const std::string& pgschema_name = "",
+      std::optional<master::RelationType> relation_type = std::nullopt)
+      : namespace_type_(db_type) {
     set_namespace_id(namespace_id);
     set_namespace_name(namespace_name);
     set_table_id(table_id);
     set_table_name(table_name);
-    set_pgschema_name(pgschema_name);
     set_relation_type(relation_type);
+    if (!pgschema_name.empty()) {
+      set_pgschema_name(pgschema_name);
+    }
   }
 
   // Simple table name (no namespace provided at the moment of construction).
@@ -127,14 +127,14 @@ class YBTableName {
     return pgschema_name_; // Can be empty
   }
 
-  boost::optional<master::RelationType> relation_type() const {
-    return relation_type_;
-  }
+  std::optional<master::RelationType> relation_type() const { return relation_type_; }
 
   bool is_system() const;
 
-  bool is_cql_namespace() const {
-    return namespace_type_ == YQL_DATABASE_CQL;
+  bool is_cql_namespace() const { return namespace_type_ == YQL_DATABASE_CQL; }
+
+  bool is_pgsql_namespace() const {
+    return namespace_type_ == YQL_DATABASE_PGSQL;
   }
 
   bool is_redis_namespace() const {
@@ -143,9 +143,7 @@ class YBTableName {
 
   bool is_redis_table() const;
 
-  std::string ToString() const {
-    return has_namespace() ? (namespace_name_ + '.' + table_name_) : table_name_;
-  }
+  std::string ToString(bool include_id = true) const;
 
   void set_namespace_id(const std::string& namespace_id);
   void set_namespace_name(const std::string& namespace_name);
@@ -153,7 +151,7 @@ class YBTableName {
   void set_table_id(const std::string& table_id);
   void set_pgschema_name(const std::string& pgschema_name);
 
-  void set_relation_type(boost::optional<master::RelationType> relation_type) {
+  void set_relation_type(std::optional<master::RelationType> relation_type) {
     relation_type_ = relation_type;
   }
 
@@ -163,6 +161,12 @@ class YBTableName {
 
   void SetIntoNamespaceIdentifierPB(master::NamespaceIdentifierPB* id) const;
   void GetFromNamespaceIdentifierPB(const master::NamespaceIdentifierPB& id);
+
+  size_t DynamicMemoryUsage() const {
+    return sizeof(*this) +
+           DynamicMemoryUsageOf(
+               namespace_id_, namespace_name_, table_id_, table_name_ + pgschema_name_);
+  }
 
  private:
   void check_db_type();
@@ -174,17 +178,15 @@ class YBTableName {
   std::string table_name_;
   std::string pgschema_name_; // Can be empty
   // Optional. Can be set when the client knows the table type.
-  boost::optional<master::RelationType> relation_type_;
+  std::optional<master::RelationType> relation_type_;
 };
 
-inline bool operator ==(const YBTableName& lhs, const YBTableName& rhs) {
+inline bool operator==(const YBTableName& lhs, const YBTableName& rhs) {
   // Not comparing namespace_id and table_id because they are optional.
   return (lhs.namespace_name() == rhs.namespace_name() && lhs.table_name() == rhs.table_name());
 }
 
-inline bool operator !=(const YBTableName& lhs, const YBTableName& rhs) {
-  return !(lhs == rhs);
-}
+inline bool operator!=(const YBTableName& lhs, const YBTableName& rhs) { return !(lhs == rhs); }
 
 // In order to be able to use YBTableName with boost::hash
 size_t hash_value(const YBTableName& table_name);

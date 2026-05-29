@@ -15,9 +15,9 @@
 // specific language governing permissions and limitations
 // under the License.
 //
-// The following only applies to changes made to this file as part of YugaByte development.
+// The following only applies to changes made to this file as part of YugabyteDB development.
 //
-// Portions Copyright (c) YugaByte, Inc.
+// Portions Copyright (c) YugabyteDB, Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License"); you may not use this file except
 // in compliance with the License.  You may obtain a copy of the License at
@@ -99,28 +99,20 @@ namespace yb {
 
 using client::YBClient;
 using client::YBClientBuilder;
-using client::YBColumnSchema;
-using client::YBError;
 using client::YBSchema;
 using client::YBSchemaBuilder;
 using client::YBSession;
-using client::YBTable;
 using client::YBTableAlterer;
 using client::YBTableCreator;
 using client::YBTableName;
 using client::YBTableType;
-using client::YBValue;
 using std::shared_ptr;
-using master::AlterTableRequestPB;
-using master::AlterTableResponsePB;
-using master::MiniMaster;
 using std::map;
 using std::pair;
 using std::vector;
 using std::string;
 using std::max;
 using tablet::TabletPeer;
-using tserver::MiniTabletServer;
 
 class AlterTableTest : public YBMiniClusterTestBase<MiniCluster>,
                        public ::testing::WithParamInterface<int> {
@@ -130,29 +122,29 @@ class AlterTableTest : public YBMiniClusterTestBase<MiniCluster>,
       inserted_idx_(0) {
 
     YBSchemaBuilder b;
-    b.AddColumn("c0")->Type(INT32)->NotNull()->HashPrimaryKey();
-    b.AddColumn("c1")->Type(INT32)->NotNull();
+    b.AddColumn("c0")->Type(DataType::INT32)->NotNull()->HashPrimaryKey();
+    b.AddColumn("c1")->Type(DataType::INT32)->NotNull();
     CHECK_OK(b.Build(&schema_));
 
-    FLAGS_enable_data_block_fsync = false; // Keep unit tests fast.
-    FLAGS_use_hybrid_clock = false;
-    FLAGS_ht_lease_duration_ms = 0;
-    FLAGS_enable_ysql = false;
+    ANNOTATE_UNPROTECTED_WRITE(FLAGS_enable_data_block_fsync) = false; // Keep unit tests fast.
+    ANNOTATE_UNPROTECTED_WRITE(FLAGS_use_hybrid_clock) = false;
+    ANNOTATE_UNPROTECTED_WRITE(FLAGS_ht_lease_duration_ms) = 0;
+    ANNOTATE_UNPROTECTED_WRITE(FLAGS_enable_ysql) = false;
     ANNOTATE_BENIGN_RACE(&FLAGS_enable_maintenance_manager,
                          "safe to change at runtime");
   }
 
   void SetUp() override {
     // Make heartbeats faster to speed test runtime.
-    FLAGS_heartbeat_interval_ms = 10;
+    ANNOTATE_UNPROTECTED_WRITE(FLAGS_heartbeat_interval_ms) = 10;
 
-    FLAGS_catalog_manager_report_batch_size = GetParam();
+    ANNOTATE_UNPROTECTED_WRITE(FLAGS_catalog_manager_report_batch_size) = GetParam();
 
     YBMiniClusterTestBase::SetUp();
 
     MiniClusterOptions opts;
     opts.num_tablet_servers = num_replicas();
-    FLAGS_replication_factor = num_replicas();
+    ANNOTATE_UNPROTECTED_WRITE(FLAGS_replication_factor) = num_replicas();
     cluster_.reset(new MiniCluster(opts));
     ASSERT_OK(cluster_->Start());
     ASSERT_OK(cluster_->WaitForTabletServerCount(num_replicas()));
@@ -206,7 +198,7 @@ class AlterTableTest : public YBMiniClusterTestBase<MiniCluster>,
     if (cluster_->mini_tablet_server(idx)->server()) {
       ASSERT_OK(cluster_->mini_tablet_server(idx)->Restart());
     } else {
-      ASSERT_OK(cluster_->mini_tablet_server(idx)->Start());
+      ASSERT_OK(cluster_->mini_tablet_server(idx)->Start(tserver::WaitTabletsBootstrapped::kFalse));
     }
 
     ASSERT_OK(cluster_->mini_tablet_server(idx)->WaitStarted());
@@ -241,7 +233,7 @@ class AlterTableTest : public YBMiniClusterTestBase<MiniCluster>,
                          const string& column_name,
                          const MonoDelta& timeout) {
     std::unique_ptr<YBTableAlterer> table_alterer(client_->NewTableAlterer(table_name));
-    table_alterer->AddColumn(column_name)->Type(INT32)->NotNull();
+    table_alterer->AddColumn(column_name)->Type(DataType::INT32)->NotNull();
     return table_alterer->timeout(timeout)->Alter();
   }
 
@@ -315,14 +307,16 @@ INSTANTIATE_TEST_CASE_P(BatchSize, ReplicatedAlterTableTest, ::testing::Values(1
 // on the TS handling the tablet of the altered table.
 // TODO: create and verify multiple tablets when the client will support that.
 TEST_P(AlterTableTest, TestTabletReports) {
-  ASSERT_EQ(0, tablet_peer_->tablet()->metadata()->schema_version());
+  auto tablet = ASSERT_RESULT(tablet_peer_->shared_tablet());
+  ASSERT_EQ(0, tablet->metadata()->primary_table_schema_version());
   ASSERT_OK(AddNewI32Column(kTableName, "new-i32"));
-  ASSERT_EQ(1, tablet_peer_->tablet()->metadata()->schema_version());
+  ASSERT_EQ(1, tablet->metadata()->primary_table_schema_version());
 }
 
 // Verify that adding an existing column will return an "already present" error
 TEST_P(AlterTableTest, TestAddExistingColumn) {
-  ASSERT_EQ(0, tablet_peer_->tablet()->metadata()->schema_version());
+  auto tablet = ASSERT_RESULT(tablet_peer_->shared_tablet());
+  ASSERT_EQ(0, tablet->metadata()->primary_table_schema_version());
 
   {
     Status s = AddNewI32Column(kTableName, "c1");
@@ -330,18 +324,19 @@ TEST_P(AlterTableTest, TestAddExistingColumn) {
     ASSERT_STR_CONTAINS(s.ToString(), "The column already exists: c1");
   }
 
-  ASSERT_EQ(0, tablet_peer_->tablet()->metadata()->schema_version());
+  ASSERT_EQ(0, tablet->metadata()->primary_table_schema_version());
 }
 
 // Adding a nullable column with no default value should be equivalent
 // to a NULL default.
 TEST_P(AlterTableTest, TestAddNullableColumnWithoutDefault) {
   InsertRows(0, 1);
-  ASSERT_OK(tablet_peer_->tablet()->Flush(tablet::FlushMode::kSync));
+  auto tablet = ASSERT_RESULT(tablet_peer_->shared_tablet());
+  ASSERT_OK(tablet->Flush(tablet::FlushMode::kSync, rocksdb::FlushReason::kTestOnly));
 
   {
     std::unique_ptr<YBTableAlterer> table_alterer(client_->NewTableAlterer(kTableName));
-    table_alterer->AddColumn("new")->Type(INT32);
+    table_alterer->AddColumn("new")->Type(DataType::INT32);
     ASSERT_OK(table_alterer->Alter());
   }
 
@@ -356,7 +351,8 @@ TEST_P(AlterTableTest, TestAddNullableColumnWithoutDefault) {
 // Verify that, if a tablet server is down when an alter command is issued,
 // it will eventually receive the command when it restarts.
 TEST_P(AlterTableTest, TestAlterOnTSRestart) {
-  ASSERT_EQ(0, tablet_peer_->tablet()->metadata()->schema_version());
+  auto tablet = ASSERT_RESULT(tablet_peer_->shared_tablet());
+  ASSERT_EQ(0, tablet->metadata()->primary_table_schema_version());
 
   ShutdownTS();
 
@@ -369,7 +365,7 @@ TEST_P(AlterTableTest, TestAlterOnTSRestart) {
   LOG(INFO) << "Original " << schema_.ToString();
   // Verify that the Schema is the new one.
   YBSchema schema;
-  PartitionSchema partition_schema;
+  dockv::PartitionSchema partition_schema;
   bool alter_in_progress = false;
   string table_id;
   ASSERT_OK(client_->GetTableSchema(kTableName, &schema, &partition_schema));
@@ -382,13 +378,15 @@ TEST_P(AlterTableTest, TestAlterOnTSRestart) {
   // Restart the TS and wait for the new schema
   RestartTabletServer();
   ASSERT_OK(WaitAlterTableCompletion(kTableName, 50));
-  ASSERT_EQ(1, tablet_peer_->tablet()->metadata()->schema_version());
+  tablet = ASSERT_RESULT(tablet_peer_->shared_tablet());
+  ASSERT_EQ(1, tablet->metadata()->primary_table_schema_version());
 }
 
 // Verify that nothing is left behind on cluster shutdown with pending async tasks
 TEST_P(AlterTableTest, TestShutdownWithPendingTasks) {
   DontVerifyClusterBeforeNextTearDown();
-  ASSERT_EQ(0, tablet_peer_->tablet()->metadata()->schema_version());
+  auto tablet = ASSERT_RESULT(tablet_peer_->shared_tablet());
+  ASSERT_EQ(0, tablet->metadata()->primary_table_schema_version());
 
   ShutdownTS();
 
@@ -410,7 +408,8 @@ TEST_P(AlterTableTest, TestRestartTSDuringAlter) {
     return;
   }
 
-  ASSERT_EQ(0, tablet_peer_->tablet()->metadata()->schema_version());
+  auto tablet = ASSERT_RESULT(tablet_peer_->shared_tablet());
+  ASSERT_EQ(0, tablet->metadata()->primary_table_schema_version());
 
   Status s = AddNewI32Column(kTableName, "new-i32", MonoDelta::FromMilliseconds(1));
   ASSERT_TRUE(s.IsTimedOut());
@@ -423,27 +422,26 @@ TEST_P(AlterTableTest, TestRestartTSDuringAlter) {
 
   // Wait for the new schema
   ASSERT_OK(WaitAlterTableCompletion(kTableName, 50));
-  ASSERT_EQ(1, tablet_peer_->tablet()->metadata()->schema_version());
+  ASSERT_EQ(1, tablet->metadata()->primary_table_schema_version());
 }
 
 TEST_P(AlterTableTest, TestGetSchemaAfterAlterTable) {
   ASSERT_OK(AddNewI32Column(kTableName, "new-i32"));
 
   YBSchema s;
-  PartitionSchema partition_schema;
+  dockv::PartitionSchema partition_schema;
   ASSERT_OK(client_->GetTableSchema(kTableName, &s, &partition_schema));
 }
 
 void AlterTableTest::InsertRows(int start_row, int num_rows) {
-  shared_ptr<YBSession> session = client_->NewSession();
-  session->SetTimeout(15s);
+  auto session = client_->NewSession(15s);
   client::TableHandle table;
   ASSERT_OK(table.Open(kTableName, client_.get()));
   std::vector<std::shared_ptr<client::YBqlOp>> ops;
 
   // Insert a bunch of rows with the current schema
   for (int i = start_row; i < start_row + num_rows; i++) {
-    auto op = table.NewInsertOp();
+    auto op = table.NewInsertOp(session->arena());
     // Endian-swap the key so that we spew inserts randomly
     // instead of just a sequential write pattern. This way
     // compactions may actually be triggered.
@@ -469,13 +467,12 @@ void AlterTableTest::InsertRows(int start_row, int num_rows) {
 
 void AlterTableTest::UpdateRow(int32_t row_key,
                                const map<string, int32_t>& updates) {
-  shared_ptr<YBSession> session = client_->NewSession();
-  session->SetTimeout(15s);
+  auto session = client_->NewSession(15s);
 
   client::TableHandle table;
   ASSERT_OK(table.Open(kTableName, client_.get()));
 
-  auto update = table.NewUpdateOp();
+  auto update = table.NewUpdateOp(session->arena());
   int32_t key = bswap_32(row_key); // endian swap to match 'InsertRows'
   QLAddInt32HashValue(update->mutable_request(), key);
   for (const auto& e : updates) {
@@ -551,7 +548,8 @@ TEST_P(AlterTableTest, DISABLED_TestCompactionAfterDrop) {
   LOG(INFO) << "Inserting rows";
   InsertRows(0, 3);
 
-  std::string docdb_dump = tablet_peer_->tablet()->TEST_DocDBDumpStr();
+  auto tablet = ASSERT_RESULT(tablet_peer_->shared_tablet());
+  std::string docdb_dump = tablet->TEST_DocDBDumpStr();
   // DocDB should not be empty right now.
   ASSERT_NE(0, docdb_dump.length());
 
@@ -560,9 +558,9 @@ TEST_P(AlterTableTest, DISABLED_TestCompactionAfterDrop) {
   ASSERT_OK(table_alterer->DropColumn("c1")->Alter());
 
   LOG(INFO) << "Forcing compaction";
-  tablet_peer_->tablet()->TEST_ForceRocksDBCompact();
+  CHECK_OK(tablet->ForceManualRocksDBCompact());
 
-  docdb_dump = tablet_peer_->tablet()->TEST_DocDBDumpStr();
+  docdb_dump = tablet->TEST_DocDBDumpStr();
 
   LOG(INFO) << "Checking that docdb is empty";
   ASSERT_EQ("", docdb_dump);
@@ -579,7 +577,8 @@ TEST_P(AlterTableTest, TestLogSchemaReplay) {
   UpdateRow(1, { {"c1", 0} });
 
   LOG(INFO) << "Flushing RocksDB";
-  ASSERT_OK(tablet_peer_->tablet()->Flush(tablet::FlushMode::kSync));
+  auto tablet = ASSERT_RESULT(tablet_peer_->shared_tablet());
+  ASSERT_OK(tablet->Flush(tablet::FlushMode::kSync, rocksdb::FlushReason::kTestOnly));
 
   UpdateRow(0, { {"c1", 1}, {"c2", 10001} });
 
@@ -596,7 +595,7 @@ TEST_P(AlterTableTest, TestLogSchemaReplay) {
 
   google::FlagSaver flag_saver;
   // Restart without flushing RocksDB
-  FLAGS_flush_rocksdb_on_shutdown = false;
+  ANNOTATE_UNPROTECTED_WRITE(FLAGS_flush_rocksdb_on_shutdown) = false;
   LOG(INFO) << "Restarting tablet";
   ASSERT_NO_FATALS(RestartTabletServer());
 
@@ -623,7 +622,8 @@ TEST_P(AlterTableTest, TestRenameTableAndAdd) {
 TEST_P(AlterTableTest, TestBootstrapAfterAlters) {
   ASSERT_OK(AddNewI32Column(kTableName, "c2"));
   InsertRows(0, 1);
-  ASSERT_OK(tablet_peer_->tablet()->Flush(tablet::FlushMode::kSync));
+  auto tablet = ASSERT_RESULT(tablet_peer_->shared_tablet());
+  ASSERT_OK(tablet->Flush(tablet::FlushMode::kSync, rocksdb::FlushReason::kTestOnly));
   InsertRows(1, 1);
 
   UpdateRow(0, { {"c1", 10001} });
@@ -679,29 +679,30 @@ TEST_P(AlterTableTest, TestAlterWalRetentionSecs) {
 
   int expected_wal_retention_secs = max(FLAGS_log_min_seconds_to_retain, kWalRetentionSecs);
 
-  ASSERT_EQ(kWalRetentionSecs, tablet_peer_->tablet()->metadata()->wal_retention_secs());
+  auto tablet = ASSERT_RESULT(tablet_peer_->shared_tablet());
+  ASSERT_EQ(kWalRetentionSecs, tablet->metadata()->wal_retention_secs());
   ASSERT_EQ(expected_wal_retention_secs, tablet_peer_->log()->wal_retention_secs());
 
   // Test that the wal retention time gets set correctly in the metadata and in the log objects.
   ASSERT_NO_FATALS(RestartTabletServer());
 
-  ASSERT_EQ(kWalRetentionSecs, tablet_peer_->tablet()->metadata()->wal_retention_secs());
+  ASSERT_EQ(kWalRetentionSecs, tablet->metadata()->wal_retention_secs());
   ASSERT_EQ(expected_wal_retention_secs, tablet_peer_->log()->wal_retention_secs());
 }
 
 TEST_P(AlterTableTest, TestCompactAfterUpdatingRemovedColumn) {
   // Disable maintenance manager, since we manually flush/compact
   // in this test.
-  FLAGS_enable_maintenance_manager = false;
+  ANNOTATE_UNPROTECTED_WRITE(FLAGS_enable_maintenance_manager) = false;
 
   vector<string> rows;
 
   ASSERT_OK(AddNewI32Column(kTableName, "c2"));
   InsertRows(0, 1);
-  ASSERT_OK(tablet_peer_->tablet()->Flush(tablet::FlushMode::kSync));
+  auto tablet = ASSERT_RESULT(tablet_peer_->shared_tablet());
+  ASSERT_OK(tablet->Flush(tablet::FlushMode::kSync, rocksdb::FlushReason::kTestOnly));
   InsertRows(1, 1);
-  ASSERT_OK(tablet_peer_->tablet()->Flush(tablet::FlushMode::kSync));
-
+  ASSERT_OK(tablet->Flush(tablet::FlushMode::kSync, rocksdb::FlushReason::kTestOnly));
 
   rows = ScanToStrings();
   ASSERT_EQ(2, rows.size());
@@ -742,8 +743,7 @@ std::pair<bool, int> AnalyzeResponse(const Ops& ops) {
 // to communicate how much data has been written (and should now be
 // updateable)
 void AlterTableTest::WriteThread(QLWriteRequestPB::QLStmtType type) {
-  shared_ptr<YBSession> session = client_->NewSession();
-  session->SetTimeout(15s);
+  auto session = client_->NewSession(15s);
 
   client::TableHandle table;
   ASSERT_OK(table.Open(kTableName, client_.get()));
@@ -754,7 +754,7 @@ void AlterTableTest::WriteThread(QLWriteRequestPB::QLStmtType type) {
   for (;;) {
     bool should_stop = stop_threads_.Load();
     if (!should_stop) {
-      auto op = table.NewWriteOp(type);
+      auto op = table.NewWriteOp(session->arena(), type);
       auto req = op->mutable_request();
       // Endian-swap the key so that we spew inserts randomly
       // instead of just a sequential write pattern. This way
@@ -885,13 +885,12 @@ TEST_P(AlterTableTest, TestInsertAfterAlterTable) {
   ASSERT_OK(AddNewI32Column(kSplitTableName, "new-i32"));
   client::TableHandle table;
   ASSERT_OK(table.Open(kSplitTableName, client_.get()));
-  auto insert = table.NewInsertOp();
+  auto session = client_->NewSession(15s);
+  auto insert = table.NewInsertOp(session->arena());
   auto req = insert->mutable_request();
   QLAddInt32HashValue(req, 1);
   table.AddInt32ColumnValue(req, "c1", 1);
   table.AddInt32ColumnValue(req, "new-i32", 1);
-  shared_ptr<YBSession> session = client_->NewSession();
-  session->SetTimeout(15s);
   session->Apply(insert);
   auto flush_status = session->TEST_FlushAndGetOpsErrors();
   const auto& s = flush_status.status;
@@ -916,7 +915,7 @@ TEST_P(AlterTableTest, TestMultipleAlters) {
   for (size_t i = 0; i < kNumNewCols; i++) {
     std::unique_ptr<YBTableAlterer> table_alterer(client_->NewTableAlterer(kSplitTableName));
     table_alterer->AddColumn(strings::Substitute("new_col$0", i))
-                 ->Type(INT32)->NotNull();
+                 ->Type(DataType::INT32)->NotNull();
     ASSERT_OK(table_alterer->wait(false)->Alter());
   }
 
@@ -925,7 +924,7 @@ TEST_P(AlterTableTest, TestMultipleAlters) {
 
   // All new columns should be present.
   YBSchema new_schema;
-  PartitionSchema partition_schema;
+  dockv::PartitionSchema partition_schema;
   ASSERT_OK(client_->GetTableSchema(kSplitTableName, &new_schema, &partition_schema));
   ASSERT_EQ(kNumNewCols + schema_.num_columns(), new_schema.num_columns());
 }

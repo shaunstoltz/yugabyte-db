@@ -15,9 +15,9 @@
 // specific language governing permissions and limitations
 // under the License.
 //
-// The following only applies to changes made to this file as part of YugaByte development.
+// The following only applies to changes made to this file as part of YugabyteDB development.
 //
-// Portions Copyright (c) YugaByte, Inc.
+// Portions Copyright (c) YugabyteDB, Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License"); you may not use this file except
 // in compliance with the License.  You may obtain a copy of the License at
@@ -39,9 +39,9 @@
 #include <utility>
 #include <vector>
 
-#include <boost/optional/optional_fwd.hpp>
-
 #include "yb/common/entity_ids_types.h"
+#include "yb/common/opid.h"
+
 #include "yb/consensus/consensus.h"
 #include "yb/consensus/consensus.pb.h"
 #include "yb/consensus/consensus_meta.h"
@@ -53,7 +53,6 @@
 #include "yb/rpc/scheduler.h"
 
 #include "yb/util/atomic.h"
-#include "yb/util/opid.h"
 #include "yb/util/random.h"
 
 DECLARE_int32(leader_lease_duration_ms);
@@ -61,9 +60,7 @@ DECLARE_int32(ht_lease_duration_ms);
 
 namespace yb {
 
-typedef std::lock_guard<simple_spinlock> Lock;
-typedef std::unique_ptr<Lock> ScopedLock;
-
+class Cgroup;
 class Counter;
 class HostPort;
 class ThreadPool;
@@ -96,6 +93,8 @@ YB_DEFINE_ENUM(RejectMode, (kNone)(kAll)(kNonEmpty));
 std::unique_ptr<ConsensusRoundCallback> MakeNonTrackedRoundCallback(
     ConsensusRound* round, const StdStatusCallback& callback);
 
+YB_DEFINE_ENUM(RaftConsensusShutdownState, (kNotStarted)(kStarted)(kCompleted));
+
 class RaftConsensus : public std::enable_shared_from_this<RaftConsensus>,
                       public Consensus,
                       public PeerMessageQueueObserver,
@@ -120,6 +119,7 @@ class RaftConsensus : public std::enable_shared_from_this<RaftConsensus>,
     const Callback<void(std::shared_ptr<StateChangeContext> context)> mark_dirty_clbk,
     TableType table_type,
     ThreadPool* raft_pool,
+    rpc::ThreadPool* raft_notifications_pool,
     RetryableRequests* retryable_requests,
     MultiRaftManager* multi_raft_manager);
 
@@ -130,7 +130,7 @@ class RaftConsensus : public std::enable_shared_from_this<RaftConsensus>,
     std::unique_ptr<PeerProxyFactory> peer_proxy_factory,
     std::unique_ptr<PeerMessageQueue> queue,
     std::unique_ptr<PeerManager> peer_manager,
-    std::unique_ptr<ThreadPoolToken> raft_pool_token,
+    std::unique_ptr<ThreadPoolToken> raft_pool_concurrent_token,
     const scoped_refptr<MetricEntity>& table_metric_entity,
     const scoped_refptr<MetricEntity>& tablet_metric_entity,
     const std::string& peer_uuid,
@@ -142,7 +142,10 @@ class RaftConsensus : public std::enable_shared_from_this<RaftConsensus>,
     TableType table_type,
     RetryableRequests* retryable_requests);
 
-  virtual ~RaftConsensus();
+  virtual ~RaftConsensus() override;
+
+  // Set the per-database cgroup on consensus tokens/strands for per-DB cgroup mode.
+  void SetPerDbCgroup(Cgroup* cgroup);
 
   virtual Status Start(const ConsensusBootstrapInfo& info) override;
 
@@ -171,14 +174,15 @@ class RaftConsensus : public std::enable_shared_from_this<RaftConsensus>,
   Status RequestVote(const VoteRequestPB* request,
                      VoteResponsePB* response) override;
 
-  Status ChangeConfig(const ChangeConfigRequestPB& req,
-                      const StdStatusCallback& client_cb,
-                      boost::optional<tserver::TabletServerErrorPB::Code>* error_code)
-                      override;
+  Status ChangeConfig(
+      const ChangeConfigRequestPB& req, const StdStatusCallback& client_cb,
+      std::optional<tserver::TabletServerErrorPB::Code>* error_code) override;
 
   Status UnsafeChangeConfig(
       const UnsafeChangeConfigRequestPB& req,
-      boost::optional<tserver::TabletServerErrorPB::Code>* error_code) override;
+      std::optional<tserver::TabletServerErrorPB::Code>* error_code) override;
+
+  std::vector<FollowerCommunicationTime> GetFollowerCommunicationTimes() override;
 
   PeerRole GetRoleUnlocked() const;
 
@@ -192,6 +196,11 @@ class RaftConsensus : public std::enable_shared_from_this<RaftConsensus>,
 
   const TabletId& split_parent_tablet_id() const override;
 
+  const std::optional<CloneSourceInfo>& clone_source_info() const override;
+
+  LeaderLeaseStatus GetLeaderLeaseStatusIfLeader(MicrosTime* ht_lease_exp) const;
+  LeaderLeaseStatus GetLeaderLeaseStatusUnlocked(MicrosTime* ht_lease_exp) const;
+
   ConsensusStatePB ConsensusState(
       ConsensusConfigType type,
       LeaderLeaseStatus* leader_lease_status) const override;
@@ -200,11 +209,17 @@ class RaftConsensus : public std::enable_shared_from_this<RaftConsensus>,
       ConsensusConfigType type,
       LeaderLeaseStatus* leader_lease_status) const override;
 
+  // Returns a copy of ConsensusState from the committed consensus state cache.
+  // This method is thread safe.
+  ConsensusStatePB GetConsensusStateFromCache() const;
+
   RaftConfigPB CommittedConfig() const override;
   RaftConfigPB CommittedConfigUnlocked() const;
 
   void DumpStatusHtml(std::ostream& out) const override;
 
+  void StartShutdown();
+  void CompleteShutdown();
   void Shutdown() override;
 
   // Return the active (as opposed to committed) role.
@@ -227,13 +242,15 @@ class RaftConsensus : public std::enable_shared_from_this<RaftConsensus>,
         committed_index, last_committed_op_id);
   }
 
-  yb::OpId GetLastReceivedOpId() override;
+  OpId GetLastReceivedOpId() override;
 
-  yb::OpId GetLastCommittedOpId() override;
+  OpId GetLastCommittedOpId() override;
 
-  yb::OpId GetLastAppliedOpId() override;
+  OpId GetLastAppliedOpId() override;
 
-  yb::OpId GetAllAppliedOpId();
+  OpId GetAllAppliedOpId();
+
+  Status CheckReadyAsRbsSource();
 
   Result<MicrosTime> MajorityReplicatedHtLeaseExpiration(
       MicrosTime min_allowed, CoarseTimePoint deadline) const override;
@@ -241,7 +258,7 @@ class RaftConsensus : public std::enable_shared_from_this<RaftConsensus>,
   // The on-disk size of the consensus metadata.
   uint64_t OnDiskSize() const;
 
-  yb::OpId MinRetryableRequestOpId();
+  OpId MinRetryableRequestOpId();
 
   Status StartElection(const LeaderElectionData& data) override {
     return DoStartElection(data, PreElected::kFalse);
@@ -262,16 +279,35 @@ class RaftConsensus : public std::enable_shared_from_this<RaftConsensus>,
     TEST_delay_update_.store(duration, std::memory_order_release);
   }
 
+  Result<XClusterReadOpsResult> ReadReplicatedMessagesForXCluster(
+      const OpId& from, const CoarseTimePoint deadline, bool fetch_single_entry) override;
+
   Result<ReadOpsResult> ReadReplicatedMessagesForCDC(
-      const yb::OpId& from,
+      const OpId& from,
       int64_t* last_replicated_opid_index,
       const CoarseTimePoint deadline = CoarseTimePoint::max(),
       const bool fetch_single_entry = false) override;
 
-  void UpdateCDCConsumerOpId(const yb::OpId& op_id) override;
+  Result<ReadOpsResult> ReadReplicatedMessagesForConsistentCDC(
+      OpId from,
+      uint64_t stream_safe_time,
+      CoarseTimePoint deadline,
+      bool fetch_single_entry = false,
+      int64_t* last_replicated_opid_index = nullptr) override;
+
+  // Read all the messages in a segment for CDC producer.
+  Result<ReadOpsResult> ReadReplicatedMessagesInSegmentForCDC(
+      const OpId& from_op_id,
+      CoarseTimePoint deadline,
+      bool fetch_single_entry = false,
+      int64_t* last_committed_index = nullptr,
+      HybridTime* consistent_stream_safe_time_footer = nullptr,
+      bool* read_entire_wal = nullptr);
+
+  void UpdateCDCConsumerOpId(const OpId& op_id) override;
 
   // Start memory tracking of following operation in case it is still present in our caches.
-  void TrackOperationMemory(const yb::OpId& op_id);
+  void TrackOperationMemory(const OpId& op_id);
 
   uint64_t MajorityNumSSTFiles() const {
     return majority_num_sst_files_.load(std::memory_order_acquire);
@@ -281,6 +317,12 @@ class RaftConsensus : public std::enable_shared_from_this<RaftConsensus>,
   Result<OpId> TEST_GetLastOpIdWithType(OpIdType opid_type, OperationType op_type);
 
   int64_t TEST_LeaderTerm() const;
+
+  int64_t GetFirstIndexOfCurrentTerm() const;
+
+  // Atomically returns the leader state and the first log index of the current leader's term.
+  // The first index is only meaningful when the leader state's status is LEADER_AND_READY.
+  std::pair<LeaderState, int64_t> GetLeaderStateAndFirstIndexOfCurrentTerm() const;
 
   // Trigger that a non-Operation ConsensusRound has finished replication.
   // If the replication was successful, an status will be OK. Otherwise, it
@@ -292,6 +334,13 @@ class RaftConsensus : public std::enable_shared_from_this<RaftConsensus>,
       ConsensusRound* round, const StdStatusCallback& client_cb, const Status& status);
 
   Result<RetryableRequests> GetRetryableRequests() const;
+  Result<std::unique_ptr<RetryableRequests>> TakeSnapshotOfRetryableRequests();
+  OpId GetLastFlushedOpIdInRetryableRequests();
+  Status SetLastFlushedOpIdInRetryableRequests(const OpId& op_id);
+
+  int64_t follower_lag_ms() const;
+
+  int TEST_RetryableRequestTimeoutSecs() const;
 
  protected:
   // As a leader, append a new ConsensusRound to the queue.
@@ -451,7 +500,7 @@ class RaftConsensus : public std::enable_shared_from_this<RaftConsensus>,
       LWConsensusResponsePB* response, LeaderRequest* deduped_req);
 
   // Returns the most recent OpId written to the Log.
-  yb::OpId GetLatestOpIdFromLog();
+  OpId GetLatestOpIdFromLog();
 
   // Begin a replica operation. If the type of message in 'msg' is not a type
   // that uses operations, delegates to StartConsensusOnlyRoundUnlocked().
@@ -569,11 +618,12 @@ class RaftConsensus : public std::enable_shared_from_this<RaftConsensus>,
   // The maximum delta is capped by 'FLAGS_leader_failure_exp_backoff_max_delta_ms'.
   MonoDelta LeaderElectionExpBackoffDeltaUnlocked();
 
-  // Checks if the leader is ready to process a change config request (one requirement for this is
-  // for it to have at least one committed op in the current term). Also checks that there are no
-  // voters in transition in the active config state. Status OK() implies leader is ready.
-  // server_uuid is the uuid of the server that we are trying to remove, add, or change its
-  // role.
+  // Checks if the leader is ready to process a change config request
+  // 1. has at least one committed op in the current term
+  // 2. has no pending change config request
+  //
+  // For sys catalog tablet, the function additionally ensures that there are no servers
+  // currently amidst transition.
   Status IsLeaderReadyForChangeConfigUnlocked(ChangeConfigType type,
                                               const std::string& server_uuid);
 
@@ -635,7 +685,7 @@ class RaftConsensus : public std::enable_shared_from_this<RaftConsensus>,
                                        LeaderRequest* deduped_req,
                                        LWConsensusResponsePB* response);
   // Returns last op id received from leader.
-  yb::OpId EnqueueWritesUnlocked(const LeaderRequest& deduped_req, WriteEmpty write_empty);
+  OpId EnqueueWritesUnlocked(const LeaderRequest& deduped_req, WriteEmpty write_empty);
   Status MarkOperationsAsCommittedUnlocked(const LWConsensusRequestPB& request,
                                            const LeaderRequest& deduped_req,
                                            OpId last_from_leader);
@@ -647,7 +697,7 @@ class RaftConsensus : public std::enable_shared_from_this<RaftConsensus>,
   // See comment for ReplicaState::CancelPendingOperation
   void RollbackIdAndDeleteOpId(const ReplicateMsgPtr& replicate_msg, bool should_exists);
 
-  yb::OpId WaitForSafeOpIdToApply(const yb::OpId& op_id) override;
+  OpId WaitForSafeOpIdToApply(const OpId& op_id) override;
 
   void AppendEmptyBatchToLeaderLog();
 
@@ -661,7 +711,7 @@ class RaftConsensus : public std::enable_shared_from_this<RaftConsensus>,
 
   // Threadpool token for constructing requests to peers, handling RPC callbacks,
   // etc.
-  std::unique_ptr<ThreadPoolToken> raft_pool_token_;
+  std::unique_ptr<ThreadPoolToken> raft_pool_concurrent_token_;
 
   scoped_refptr<log::Log> log_;
   scoped_refptr<server::Clock> clock_;
@@ -719,9 +769,10 @@ class RaftConsensus : public std::enable_shared_from_this<RaftConsensus>,
 
   std::atomic<bool> outstanding_report_failure_task_{false};
 
-  AtomicBool shutdown_;
+  using ShutdownState = RaftConsensusShutdownState;
+  std::atomic<ShutdownState> shutdown_state_{ShutdownState::kNotStarted};
 
-  scoped_refptr<Counter> follower_memory_pressure_rejections_;
+  scoped_refptr<Counter> deprecated_follower_memory_pressure_rejections_;
   scoped_refptr<AtomicGauge<int64_t>> term_metric_;
   scoped_refptr<AtomicMillisLag> follower_last_update_time_ms_metric_;
   scoped_refptr<AtomicGauge<int64_t>> is_raft_leader_metric_;
@@ -733,7 +784,7 @@ class RaftConsensus : public std::enable_shared_from_this<RaftConsensus>,
   std::mutex leader_lease_wait_mtx_;
   std::condition_variable leader_lease_wait_cond_;
 
-  scoped_refptr<Histogram> update_raft_config_dns_latency_;
+  scoped_refptr<EventStats> update_raft_config_dns_latency_;
 
   // Used only when TEST_follower_reject_update_consensus_requests_seconds is greater than 0.
   // Any requests to update the replica will be rejected until this time. For testing only.
@@ -748,6 +799,10 @@ class RaftConsensus : public std::enable_shared_from_this<RaftConsensus>,
   std::atomic<uint64_t> majority_num_sst_files_{0};
 
   const TabletId split_parent_tablet_id_;
+
+  const std::optional<CloneSourceInfo> clone_source_info_;
+
+  std::atomic<uint64_t> follower_last_update_received_time_ms_{0};
 
   DISALLOW_COPY_AND_ASSIGN(RaftConsensus);
 };

@@ -1,4 +1,4 @@
-// Copyright (c) YugaByte, Inc.
+// Copyright (c) YugabyteDB, Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License"); you may not use this file except
 // in compliance with the License.  You may obtain a copy of the License at
@@ -34,6 +34,8 @@ class PgWrapperTestBase : public MiniClusterTestWithClient<ExternalMiniCluster> 
 
   Result<TabletId> GetSingleTabletId(const TableName& table_name);
 
+  Result<std::string> RunYbAdminCommand(const std::string& cmd);
+
   // Tablet server to use to perform PostgreSQL operations.
   ExternalTabletServer* pg_ts = nullptr;
 };
@@ -43,17 +45,24 @@ class PgCommandTestBase : public PgWrapperTestBase {
   PgCommandTestBase(bool auth, bool encrypted)
       : use_auth_(auth), encrypt_connection_(encrypted) {}
 
+  std::string GetDbName() {
+    return db_name_;
+  }
+
   void SetDbName(const std::string& db_name) {
     db_name_ = db_name;
   }
 
   YB_STRONGLY_TYPED_BOOL(TuplesOnly);
+  YB_STRONGLY_TYPED_BOOL(CheckErrorString);
 
   Result<std::string> RunPsqlCommand(
-      const std::string &statement, TuplesOnly tuples_only = TuplesOnly::kFalse);
+      const std::string &statement, TuplesOnly tuples_only = TuplesOnly::kFalse,
+      CheckErrorString check_error_string = CheckErrorString::kFalse);
 
   void RunPsqlCommand(
-      const std::string &statement, const std::string &expected_output, bool tuples_only = false);
+      const std::string &statement, const std::string &expected_output, bool tuples_only = false,
+      CheckErrorString check_error_string = CheckErrorString::kFalse);
 
   void UpdateMiniClusterOptions(ExternalMiniClusterOptions* options) override;
 
@@ -63,6 +72,10 @@ class PgCommandTestBase : public PgWrapperTestBase {
 
   void CreateType(const std::string &statement) {
     RunPsqlCommand(statement, "CREATE TYPE");
+  }
+
+  void CreateSequence(const std::string &statement) {
+    RunPsqlCommand(statement, "CREATE SEQUENCE");
   }
 
   void CreateIndex(const std::string &statement) {

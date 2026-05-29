@@ -15,9 +15,9 @@
 // specific language governing permissions and limitations
 // under the License.
 //
-// The following only applies to changes made to this file as part of YugaByte development.
+// The following only applies to changes made to this file as part of YugabyteDB development.
 //
-// Portions Copyright (c) YugaByte, Inc.
+// Portions Copyright (c) YugabyteDB, Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License"); you may not use this file except
 // in compliance with the License.  You may obtain a copy of the License at
@@ -43,23 +43,24 @@
 #include "yb/util/test_macros.h"
 #include "yb/util/thread.h"
 
+DECLARE_bool(TEST_enable_sync_points);
+
 using std::string;
 using std::vector;
 
 namespace yb {
 
-#ifndef NDEBUG
 static void RunThread(bool *var) {
   *var = true;
   TEST_SYNC_POINT("first");
 }
-#endif
 
 TEST(SyncPointTest, TestSyncPoint) {
-#ifndef NDEBUG
+  ANNOTATE_UNPROTECTED_WRITE(FLAGS_TEST_enable_sync_points) = true;
+
   // Set up a sync point "second" that depends on "first".
   vector<SyncPoint::Dependency> dependencies;
-  dependencies.push_back(SyncPoint::Dependency("first", "second"));
+  dependencies.push_back({"first", "second"});
   SyncPoint::GetInstance()->LoadDependency(dependencies);
   SyncPoint::GetInstance()->EnableProcessing();
 
@@ -67,17 +68,13 @@ TEST(SyncPointTest, TestSyncPoint) {
   // setting 'var' to true, which unblocks the main thread.
   scoped_refptr<Thread> thread;
   bool var = false;
-  ASSERT_OK(yb::Thread::Create("test", "test",
-                                        &RunThread, &var, &thread));
+  ASSERT_OK(yb::Thread::Create("test", "test", &RunThread, &var, &thread));
 
   // Blocked on RunThread to process "first".
   TEST_SYNC_POINT("second");
   ASSERT_TRUE(var);
 
   thread->Join();
-#else
-  LOG(INFO) << "Test skipped in release mode.";
-#endif // NDEBUG
 }
 
 } // namespace yb

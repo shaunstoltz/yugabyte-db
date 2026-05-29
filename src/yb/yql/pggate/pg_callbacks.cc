@@ -1,4 +1,4 @@
-// Copyright (c) YugaByte, Inc.
+// Copyright (c) YugabyteDB, Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License"); you may not use this file except
 // in compliance with the License.  You may obtain a copy of the License at
@@ -19,7 +19,7 @@
 namespace yb {
 namespace pggate {
 
-std::string GetDebugQueryString(const PgCallbacks& callbacks) {
+std::string GetDebugQueryString(const YbcPgCallbacks& callbacks) {
   DCHECK_ONLY_NOTNULL(callbacks.GetDebugQueryString);
   const char* query_str = callbacks.GetDebugQueryString();
   if (query_str) {

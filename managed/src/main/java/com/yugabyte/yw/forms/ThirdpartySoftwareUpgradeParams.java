@@ -1,4 +1,4 @@
-// Copyright (c) YugaByte, Inc.
+// Copyright (c) YugabyteDB, Inc.
 
 package com.yugabyte.yw.forms;
 
@@ -24,7 +24,7 @@ public class ThirdpartySoftwareUpgradeParams extends UpgradeTaskParams {
   public ThirdpartySoftwareUpgradeParams() {}
 
   @Override
-  public void verifyParams(Universe universe) {
+  public void verifyParams(Universe universe, boolean isFirstTry) {
     if (upgradeOption != UpgradeOption.ROLLING_UPGRADE) {
       throw new PlatformServiceException(
           Http.Status.BAD_REQUEST,

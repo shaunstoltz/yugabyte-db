@@ -4,9 +4,12 @@ headerTitle: Integer and counter data types
 linkTitle: Integer and counter
 description: There are several different data types for integers of different value ranges. Integers can be set, inserted, incremented, and decremented.
 menu:
-  stable:
+  stable_api:
     parent: api-cassandra
     weight: 1420
+aliases:
+  - /stable/api/cassandra/type_int
+  - /stable/api/ycql/type_int
 type: docs
 ---
 
@@ -19,8 +22,8 @@ Datatype | Min | Max |
 `TINYINT` | -128 | 127 |
 `SMALLINT` | -32,768 | 32,767 |
 `INT` or `INTEGER` | -2,147,483,648 | 2,147,483,647 |
-`BIGINT` | –9,223,372,036,854,775,808 | 9,223,372,036,854,775,807 |
-`COUNTER` | –9,223,372,036,854,775,808 | 9,223,372,036,854,775,807 |
+`BIGINT` | -9,223,372,036,854,775,808 | 9,223,372,036,854,775,807 |
+`COUNTER` | -9,223,372,036,854,775,808 | 9,223,372,036,854,775,807 |
 `VARINT` | unbounded | unbounded |
 
 ## Syntax

@@ -1,5 +1,5 @@
 /*
- * Copyright 2022 YugaByte, Inc. and Contributors
+ * Copyright 2022 YugabyteDB, Inc. and Contributors
  *
  * Licensed under the Polyform Free Trial License 1.0.0 (the "License"); you
  * may not use this file except in compliance with the License. You
@@ -10,16 +10,13 @@
  */
 package com.yugabyte.yw.common.certmgmt.providers;
 
+import com.yugabyte.yw.common.certmgmt.CertConfigType;
+import com.yugabyte.yw.common.certmgmt.CertificateDetails;
 import java.security.KeyPair;
 import java.security.cert.X509Certificate;
 import java.util.Date;
-import java.util.UUID;
-import java.util.HashMap;
 import java.util.Map;
-
-import com.yugabyte.yw.common.certmgmt.CertConfigType;
-import com.yugabyte.yw.common.certmgmt.CertificateDetails;
-
+import java.util.UUID;
 import org.apache.commons.lang3.tuple.Pair;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;

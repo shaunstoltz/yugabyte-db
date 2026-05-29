@@ -1,4 +1,4 @@
-// Copyright (c) YugaByte, Inc.
+// Copyright (c) YugabyteDB, Inc.
 
 import axios from 'axios';
 import { ROOT_URL, PROVIDER_TYPES } from '../config';
@@ -95,6 +95,9 @@ export const BOOTSTRAP_PROVIDER_RESPONSE = 'BOOTSTRAP_PROVIDER_RESPONSE';
 
 export const DELETE_INSTANCE = 'DELETE_INSTANCE';
 export const DELETE_INSTANCE_RESPONSE = 'DELETE_INSTANCE_RESPONSE';
+
+export const CHANGE_NODE_INSTANCE_STATUS = 'CHANGE_NODE_INSTANCE_STATUS';
+export const CHANGE_NODE_INSTANCE_STATUS_RESPONSE = 'CHANGE_NODE_INSTANCE_STATUS_RESPONSE';
 
 export const PRECHECK_INSTANCE = 'PRECHECK_INSTANCE';
 export const PRECHECK_INSTANCE_RESPONSE = 'PRECHECK_INSTANCE_RESPONSE';
@@ -415,6 +418,11 @@ export function createKMSProviderConfigResponse(result) {
   };
 }
 
+export function refreshKMSConfig(configUUID) {
+  const endpoint = getCustomerEndpoint() + `/kms_configs/${configUUID}/refresh`;
+  return axios.put(endpoint);
+}
+
 export function editKMSProviderConfig(configUUID, body) {
   const endpoint = getCustomerEndpoint() + `/kms_configs/${configUUID}/edit`;
   const request = axios.post(endpoint, body);
@@ -694,6 +702,22 @@ export function deleteInstance(providerUUID, instanceIP) {
 export function deleteInstanceResponse(response) {
   return {
     type: DELETE_INSTANCE_RESPONSE,
+    payload: response
+  };
+}
+
+export function changeNodeInstanceStatus(providerUUID, instanceIP, nodeInstanceStatus) {
+  const uri = `${getProviderEndpoint(providerUUID)}/instances/${instanceIP}/state`;
+  const request = axios.put(uri, nodeInstanceStatus);
+  return {
+    type: CHANGE_NODE_INSTANCE_STATUS,
+    payload: request
+  };
+}
+
+export function changeNodeInstanceStatusResponse(response) {
+  return {
+    type: CHANGE_NODE_INSTANCE_STATUS_RESPONSE,
     payload: response
   };
 }

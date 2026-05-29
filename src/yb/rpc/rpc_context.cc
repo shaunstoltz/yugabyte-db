@@ -15,9 +15,9 @@
 // specific language governing permissions and limitations
 // under the License.
 //
-// The following only applies to changes made to this file as part of YugaByte development.
+// The following only applies to changes made to this file as part of YugabyteDB development.
 //
-// Portions Copyright (c) YugaByte, Inc.
+// Portions Copyright (c) YugabyteDB, Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License"); you may not use this file except
 // in compliance with the License.  You may obtain a copy of the License at
@@ -92,14 +92,14 @@ scoped_refptr<debug::ConvertableToTraceFormat> TracePb(const Message& msg) {
 
 }  // anonymous namespace
 
-Result<size_t> RpcCallPBParams::ParseRequest(Slice param, const RefCntBuffer& buffer) {
+Status RpcCallPBParams::ParseRequest(Slice param, const RefCntBuffer& buffer) {
   google::protobuf::io::CodedInputStream in(param.data(), narrow_cast<int>(param.size()));
   SetupLimit(&in);
   auto& message = request();
   if (PREDICT_FALSE(!message.ParseFromCodedStream(&in))) {
     return STATUS(InvalidArgument, message.InitializationErrorString());
   }
-  return message.SpaceUsedLong();
+  return Status::OK();
 }
 
 AnyMessageConstPtr RpcCallPBParams::SerializableResponse() {
@@ -114,10 +114,9 @@ const google::protobuf::Message* RpcCallPBParams::CastMessage(const AnyMessageCo
   return msg.protobuf();
 }
 
-Result<size_t> RpcCallLWParams::ParseRequest(Slice param, const RefCntBuffer& buffer) {
+Status RpcCallLWParams::ParseRequest(Slice param, const RefCntBuffer& buffer) {
   buffer_ = buffer;
-  RETURN_NOT_OK(request().ParseFromSlice(param));
-  return 0;
+  return request().ParseFromSlice(param);
 }
 
 AnyMessageConstPtr RpcCallLWParams::SerializableResponse() {
@@ -196,6 +195,10 @@ Sidecars& RpcContext::sidecars() {
   return call_->sidecars();
 }
 
+Result<RefCntSlice> RpcContext::ExtractSidecar(size_t idx) const {
+  return call_->ExtractSidecar(idx);
+}
+
 const Endpoint& RpcContext::remote_address() const {
   return call_->remote_address();
 }
@@ -244,13 +247,25 @@ void RpcContext::Panic(const char* filepath, int line_number, const string& mess
 
 void RpcContext::CloseConnection() {
   auto connection = call_->connection();
-  connection->reactor()->ScheduleReactorFunctor([connection](Reactor*) {
-    connection->Close();
-  }, SOURCE_LOCATION());
+  auto closing_status =
+      connection->reactor()->ScheduleReactorFunctor([connection](Reactor*) {
+        connection->Close();
+      }, SOURCE_LOCATION());
+  LOG_IF(DFATAL, !closing_status.ok())
+      << "Could not schedule a reactor task to close a connection: " << closing_status;
+}
+
+void RpcContext::ListenConnectionShutdown(const std::function<void()>& listener) {
+  call_->connection()->ListenShutdown(listener);
 }
 
 std::string RpcContext::ToString() const {
   return call_->ToString();
+}
+
+const ash::WaitStateInfoPtr& RpcContext::wait_state() const {
+  static const ash::WaitStateInfoPtr kNullPtr;
+  return call_ ? call_->wait_state() : kNullPtr;
 }
 
 void PanicRpc(RpcContext* context, const char* file, int line_number, const std::string& message) {

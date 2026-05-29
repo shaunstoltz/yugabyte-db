@@ -4,41 +4,23 @@ headerTitle: DROP OPERATOR CLASS
 linkTitle: DROP OPERATOR CLASS
 description: Use the DROP OPERATOR CLASS statement to remove an operator class.
 menu:
-  stable:
+  stable_api:
     identifier: ddl_drop_operator_class
     parent: statements
+aliases:
+  - /stable/api/ysql/commands/ddl_drop_operator_class/
 type: docs
 ---
 
 ## Synopsis
 
-Use the `DROP OPERATOR CLASS` statement to remove an operator class.
+Use the DROP OPERATOR CLASS statement to remove an operator class.
 
 ## Syntax
 
-<ul class="nav nav-tabs nav-tabs-yb">
-  <li >
-    <a href="#grammar" class="nav-link active" id="grammar-tab" data-toggle="tab" role="tab" aria-controls="grammar" aria-selected="true">
-      <img src="/icons/file-lines.svg" alt="Grammar Icon">
-      Grammar
-    </a>
-  </li>
-  <li>
-    <a href="#diagram" class="nav-link" id="diagram-tab" data-toggle="tab" role="tab" aria-controls="diagram" aria-selected="false">
-      <img src="/icons/diagram.svg" alt="Diagram Icon">
-      Diagram
-    </a>
-  </li>
-</ul>
-
-<div class="tab-content">
-  <div id="grammar" class="tab-pane fade show active" role="tabpanel" aria-labelledby="grammar-tab">
-  {{% includeMarkdown "../../syntax_resources/the-sql-language/statements/drop_operator_class.grammar.md" %}}
-  </div>
-  <div id="diagram" class="tab-pane fade" role="tabpanel" aria-labelledby="diagram-tab">
-  {{% includeMarkdown "../../syntax_resources/the-sql-language/statements/drop_operator_class.diagram.md" %}}
-  </div>
-</div>
+{{%ebnf%}}
+  drop_operator_class
+{{%/ebnf%}}
 
 ## Semantics
 
@@ -59,5 +41,6 @@ yugabyte=# DROP OPERATOR CLASS my_op_class USING btree;
 
 ## See also
 
-- [`CREATE OPERATOR CLASS`](../ddl_create_operator_class)
-- [postgresql-docs-drop-operator-class](https://www.postgresql.org/docs/current/sql-dropopclass.html)
+- [CREATE OPERATOR CLASS](../ddl_create_operator_class)
+
+[postgresql-docs-drop-operator-class]: https://www.postgresql.org/docs/15/sql-dropopclass.html

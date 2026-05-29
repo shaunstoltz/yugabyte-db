@@ -1,4 +1,4 @@
-// Copyright (c) YugaByte, Inc.
+// Copyright (c) YugabyteDB, Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License"); you may not use this file except
 // in compliance with the License.  You may obtain a copy of the License at
@@ -28,9 +28,10 @@ class SystemTablet : public tablet::AbstractTablet {
   SystemTablet(const Schema& schema, std::unique_ptr<YQLVirtualTable> yql_virtual_table,
                const TabletId& tablet_id);
 
-  docdb::DocReadContextPtr GetDocReadContext(const std::string& table_id = "") const override;
+  docdb::DocReadContextPtr GetDocReadContext() const override;
+  Result<docdb::DocReadContextPtr> GetDocReadContext(const std::string& table_id) const override;
 
-  const docdb::YQLStorageIf& QLStorage() const override;
+  const YQLVirtualTable& YQLTable() const;
 
   TableType table_type() const override;
 
@@ -44,37 +45,34 @@ class SystemTablet : public tablet::AbstractTablet {
     return nullptr;
   }
 
-  Status HandleRedisReadRequest(CoarseTimePoint deadline,
-                                const ReadHybridTime& read_time,
-                                const RedisReadRequestPB& redis_read_request,
-                                RedisResponsePB* response) override {
+  Status HandleRedisReadRequest(const docdb::ReadOperationData& read_operation_data,
+                                const RedisReadRequestMsg& redis_read_request,
+                                RedisResponseMsg* response) override {
     return STATUS(NotSupported, "RedisReadRequest is not supported for system tablets!");
   }
 
-  Status HandleQLReadRequest(CoarseTimePoint deadline,
-                             const ReadHybridTime& read_time,
-                             const QLReadRequestPB& ql_read_request,
-                             const TransactionMetadataPB& transaction_metadata,
+  Status HandleQLReadRequest(const docdb::ReadOperationData& read_operation_data,
+                             const QLReadRequestMsg& ql_read_request,
+                             const TransactionMetadataMsg& transaction_metadata,
                              tablet::QLReadRequestResult* result,
                              WriteBuffer* rows_data) override;
 
-  Status CreatePagingStateForRead(const QLReadRequestPB& ql_read_request,
+  Status CreatePagingStateForRead(const QLReadRequestMsg& ql_read_request,
                                   const size_t row_count,
-                                  QLResponsePB* response) const override;
+                                  QLResponseMsg* response) const override;
 
-  Status HandlePgsqlReadRequest(CoarseTimePoint deadline,
-                                const ReadHybridTime& read_time,
+  Status HandlePgsqlReadRequest(const docdb::ReadOperationData& read_operation_data,
                                 bool is_explicit_request_read_time,
-                                const PgsqlReadRequestPB& pgsql_read_request,
-                                const TransactionMetadataPB& transaction_metadata,
-                                const SubTransactionMetadataPB& subtransaction_metadata,
+                                const PgsqlReadRequestMsg& pgsql_read_request,
+                                const TransactionMetadataMsg& transaction_metadata,
+                                const SubTransactionMetadataMsg& subtransaction_metadata,
                                 tablet::PgsqlReadRequestResult* result) override {
     return STATUS(NotSupported, "Postgres system table is not yet supported");
   }
 
-  Status CreatePagingStateForRead(const PgsqlReadRequestPB& pgsql_read_request,
+  Status CreatePagingStateForRead(const PgsqlReadRequestMsg& pgsql_read_request,
                                   const size_t row_count,
-                                  PgsqlResponsePB* response) const override {
+                                  PgsqlResponseMsg* response) const override {
     return STATUS(NotSupported, "Postgres system table is not yet supported");
   }
 

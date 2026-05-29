@@ -1,49 +1,45 @@
 import moment from 'moment';
 
 import {
+  BootstrapCategory,
   CUSTOM_METRIC_TIME_RANGE_OPTION,
   DROPDOWN_DIVIDER,
   MetricName,
   METRIC_TIME_RANGE_OPTIONS,
-  XClusterConfigStatus,
   XClusterTableEligibility,
-  XClusterTableStatus
+  XClusterTableStatus,
+  XCLUSTER_SUPPORTED_TABLE_TYPES
 } from './constants';
 
-import { TableType, YBTable } from '../../redesign/helpers/dtos';
+import { MetricTrace, YBTable } from '../../redesign/helpers/dtos';
+import { XClusterConfigNeedBootstrapPerTableResponse, XClusterTableDetails } from './dtos';
 
 /**
  * XCluster supported table type.
  */
-export type XClusterTableType = TableType.PGSQL_TABLE_TYPE | TableType.YQL_TABLE_TYPE;
+export type XClusterTableType = typeof XCLUSTER_SUPPORTED_TABLE_TYPES[number];
 
 /**
- * Source: XClusterTableConfig.java
+ * Extra metadata to be merged into xCluster table details for use in YBA UI.
  */
- export interface XClusterTableDetails {
-  needBootstrap: boolean;
-  replicationSetupDone: true;
-  bootstrapCreateTime: string;
-  status: XClusterTableStatus;
-  restoreTime: string;
-  streamId: string;
-  tableId: string;
-}
+type XClusterTableUiExtraMetadata = {
+  // Stores the user facing string in the object for sorting/searching usage.
+  statusLabel: string;
+  replicationLag: number;
+};
 
-export type XClusterTable = YBTable & Omit<XClusterTableDetails, 'tableId'>;
-
-export interface XClusterConfig {
-  createTime: string;
-  modifyTime: string;
-  name: string;
-  paused: boolean;
-  sourceUniverseUUID?: string;
-  status: XClusterConfigStatus;
-  tableDetails: XClusterTableDetails[];
-  tables: string[];
-  targetUniverseUUID?: string;
-  uuid: string;
-}
+export type XClusterTable = YBTable &
+  Omit<XClusterTableDetails, 'tableId'> &
+  XClusterTableUiExtraMetadata;
+/**
+ * A table which is in the replication config but dropped from the database.
+ */
+export type XClusterTableWithoutDetails = Omit<XClusterTableDetails, 'tableId'> &
+  XClusterTableUiExtraMetadata & {
+    tableUUID: string;
+    status: typeof XClusterTableStatus.DROPPED | typeof XClusterTableStatus.TABLE_INFO_MISSING;
+  };
+export type XClusterReplicationTable = XClusterTable | XClusterTableWithoutDetails;
 
 //------------------------------------------------------------------------------------
 // Table Selection Types
@@ -59,59 +55,88 @@ export type EligibilityDetails =
       status: typeof XClusterTableEligibility.ELIGIBLE_IN_CURRENT_CONFIG;
       xClusterConfigName: string;
     }
-  | { status: typeof XClusterTableEligibility.INELIGIBLE_IN_USE; xClusterConfigName: string }
-  | { status: typeof XClusterTableEligibility.INELIGIBLE_NO_MATCH };
+  | { status: typeof XClusterTableEligibility.INELIGIBLE_IN_USE; xClusterConfigName: string };
 
 /**
- * YBTable with an EligibilityDetail field
+ * YBTable with additional metadata for table selection.
  */
-export interface XClusterTableCandidate extends YBTable {
+export interface IndexTableReplicationCandidate extends YBTable {
   eligibilityDetails: EligibilityDetails;
+  isUnreplicatedTableInReplicatedNamespace: boolean;
+  isDroppedOnTarget: boolean;
 }
+/**
+ * YBTable with with additional metadata for table selection and an array of index tables.
+ */
+export interface MainTableReplicationCandidate extends YBTable {
+  eligibilityDetails: EligibilityDetails;
+  isUnreplicatedTableInReplicatedNamespace: boolean;
+  isDroppedOnTarget: boolean;
+
+  indexTables?: IndexTableReplicationCandidate[];
+}
+export type TableReplicationCandidate =
+  | MainTableReplicationCandidate
+  | IndexTableReplicationCandidate;
+
+export type IndexTableRestartReplicationCandidate = XClusterTable;
+export interface MainTableRestartReplicationCandidate extends XClusterTable {
+  indexTables?: IndexTableRestartReplicationCandidate[];
+}
+export type TableRestartReplicationCandidate =
+  | MainTableRestartReplicationCandidate
+  | IndexTableRestartReplicationCandidate;
 
 /**
- * Holds list of tables for a keyspace and provides extra metadata.
+ * Holds list of tables for a namespace and provides extra metadata.
  */
-export interface KeyspaceItem {
+export interface NamespaceItem {
+  uuid: string;
+  name: string;
   tableEligibilityCount: {
     ineligible: number;
     eligibleInCurrentConfig: number;
   };
   sizeBytes: number;
-  tables: XClusterTableCandidate[];
-}
 
-export interface KeyspaceRow extends KeyspaceItem {
-  keyspace: string;
+  // Filtered table list currently shown to the user
+  tables: MainTableReplicationCandidate[];
+  // All tables under the namespace
+  allTables: MainTableReplicationCandidate[];
 }
 
 /**
- * Structure for organizing tables by table type first and keyspace/database name second.
+ * Structure for organizing tables by namespaces.
  */
-export type ReplicationItems = Record<
-  XClusterTableType,
-  { keyspaces: Record<string, KeyspaceItem>; tableCount: number }
->;
-//------------------------------------------------------------------------------------
+export type ReplicationItems = {
+  namespaces: Record<string, NamespaceItem>;
 
-// TODO: Move the metric types to dtos.ts or another more appropriate file.
+  // We store a set of table uuids at the top level to make it easy to check
+  // if the list of table options matching the current search tokens contains a specific table uuid.
+  searchMatchingTableUuids: Set<string>;
+  searchMatchingNamespaceUuids: Set<string>;
+};
 
-export interface MetricTrace {
-  instanceName?: string;
-  name: string;
-  type: string;
-  x: number[];
-  y: string[] | number[];
-  mode?: string;
-  line?: {
-    dash: string;
-    width: number;
-  };
+export interface CategoryNeedBootstrapResponse {
+  bootstrapCategory: BootstrapCategory;
+  tableCount: number;
+  tables: XClusterConfigNeedBootstrapPerTableResponse;
 }
 
+export interface CategorizedNeedBootstrapPerTableResponse {
+  bootstrapTableUuids: string[];
+  noBootstrapRequired: CategoryNeedBootstrapResponse;
+  tableHasDataBidirectional: CategoryNeedBootstrapResponse;
+  targetTableMissingBidirectional: CategoryNeedBootstrapResponse;
+  tableHasData: CategoryNeedBootstrapResponse;
+  targetTableMissing: CategoryNeedBootstrapResponse;
+  drWithAutomaticDdlMode: CategoryNeedBootstrapResponse;
+}
+
+//------------------------------------------------------------------------------------
+
 export type Metrics<MetricNameType extends MetricName> = {
-  // eslint-disable-next-line @typescript-eslint/no-unused-vars
-  [metricName in MetricNameType]: { // eslint-disable-line no-unused-vars
+  [metricName in MetricNameType]: {
     data: MetricTrace[];
     directURLs: string[];
     layout: {
@@ -128,6 +153,8 @@ export type Metrics<MetricNameType extends MetricName> = {
     queryKey: string;
   };
 };
+
+//------------------------------------------------------------------------------------
 
 // Time range selector types.
 

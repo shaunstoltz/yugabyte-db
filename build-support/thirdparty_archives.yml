@@ -1,100 +1,116 @@
-sha_for_local_checkout: 32d6b89b028f560826c8fb7593e88b9129da6a09
+sha: 17fb8ba725996eed2649a6c746c1c89187999973
 archives:
+
   - os_type: almalinux8
-    architecture: x86_64
-    compiler_type: clang15
-    is_linuxbrew: false
-    sha: 32d6b89b028f560826c8fb7593e88b9129da6a09
-    lto_type:
-    tag: v20221115221821-32d6b89b02-almalinux8-x86_64-clang15
-  - os_type: almalinux8
-    architecture: x86_64
-    compiler_type: clang15
-    is_linuxbrew: true
-    sha: 32d6b89b028f560826c8fb7593e88b9129da6a09
-    lto_type:
-    tag: v20221115221748-32d6b89b02-almalinux8-x86_64-clang15-linuxbrew
-  - os_type: almalinux8
-    architecture: x86_64
-    compiler_type: clang15
-    is_linuxbrew: true
-    sha: 32d6b89b028f560826c8fb7593e88b9129da6a09
-    lto_type: full
-    tag: v20221115221740-32d6b89b02-almalinux8-x86_64-clang15-linuxbrew-full-lto
-  - os_type: almalinux8
-    architecture: x86_64
-    compiler_type: gcc11
-    is_linuxbrew: false
-    sha: 32d6b89b028f560826c8fb7593e88b9129da6a09
-    lto_type:
-    tag: v20221115221759-32d6b89b02-almalinux8-x86_64-gcc11
-  - os_type: centos7
     architecture: aarch64
-    compiler_type: clang15
-    is_linuxbrew: false
-    sha: 32d6b89b028f560826c8fb7593e88b9129da6a09
-    lto_type:
-    tag: v20221115221900-32d6b89b02-centos7-aarch64-clang15
-  - os_type: centos7
+    compiler_type: clang19
+    tag: v20260504075000-17fb8ba725-almalinux8-aarch64-clang19
+
+  - os_type: almalinux8
     architecture: aarch64
-    compiler_type: clang15
-    is_linuxbrew: false
-    sha: 32d6b89b028f560826c8fb7593e88b9129da6a09
+    compiler_type: clang19
     lto_type: full
-    tag: v20221111193722-e53055c445-centos7-aarch64-clang15-full-lto
-  - os_type: centos7
-    architecture: x86_64
-    compiler_type: clang15
-    is_linuxbrew: false
-    sha: 32d6b89b028f560826c8fb7593e88b9129da6a09
-    lto_type:
-    tag: v20221115221900-32d6b89b02-centos7-x86_64-clang15
-  - os_type: centos7
-    architecture: x86_64
-    compiler_type: clang15
-    is_linuxbrew: false
-    sha: 32d6b89b028f560826c8fb7593e88b9129da6a09
+    tag: v20260504074951-17fb8ba725-almalinux8-aarch64-clang19-full-lto
+
+  - os_type: almalinux8
+    architecture: aarch64
+    compiler_type: clang21
+    tag: v20260504074839-17fb8ba725-almalinux8-aarch64-clang21
+
+  - os_type: almalinux8
+    architecture: aarch64
+    compiler_type: clang21
     lto_type: full
-    tag: v20221115221902-32d6b89b02-centos7-x86_64-clang15-full-lto
-  - os_type: centos7
+    tag: v20260504074951-17fb8ba725-almalinux8-aarch64-clang21-full-lto
+
+  - os_type: almalinux8
     architecture: x86_64
-    compiler_type: gcc11
-    is_linuxbrew: false
-    sha: 32d6b89b028f560826c8fb7593e88b9129da6a09
-    lto_type:
-    tag: v20221115221840-32d6b89b02-centos7-x86_64-gcc11
+    compiler_type: clang19
+    tag: v20260504074818-17fb8ba725-almalinux8-x86_64-clang19
+
+  - os_type: almalinux8
+    architecture: x86_64
+    compiler_type: clang19
+    lto_type: full
+    tag: v20260504074854-17fb8ba725-almalinux8-x86_64-clang19-full-lto
+
+  - os_type: almalinux8
+    architecture: x86_64
+    compiler_type: clang21
+    tag: v20260504074854-17fb8ba725-almalinux8-x86_64-clang21
+
+  - os_type: almalinux8
+    architecture: x86_64
+    compiler_type: clang21
+    lto_type: full
+    tag: v20260504074919-17fb8ba725-almalinux8-x86_64-clang21-full-lto
+
+  - os_type: almalinux8
+    architecture: x86_64
+    compiler_type: gcc15
+    tag: v20260504074901-17fb8ba725-almalinux8-x86_64-gcc15
+
+  - os_type: almalinux9
+    architecture: x86_64
+    compiler_type: clang19
+    tag: v20260504074910-17fb8ba725-almalinux9-x86_64-clang19
+
+  - os_type: almalinux9
+    architecture: x86_64
+    compiler_type: clang21
+    tag: v20260504074835-17fb8ba725-almalinux9-x86_64-clang21
+
+  - os_type: almalinux9
+    architecture: x86_64
+    compiler_type: gcc15
+    tag: v20260504074832-17fb8ba725-almalinux9-x86_64-gcc15
+
   - os_type: macos
     architecture: arm64
     compiler_type: clang
-    is_linuxbrew: false
-    sha: 32d6b89b028f560826c8fb7593e88b9129da6a09
-    lto_type:
-    tag: v20221103093245-efbc29b551-macos-arm64
+    tag: v20260504074637-17fb8ba725-macos-arm64
+
+  - os_type: macos
+    architecture: arm64
+    compiler_type: clang21
+    tag: v20260504074637-17fb8ba725-macos-arm64-clang21
+
   - os_type: macos
     architecture: x86_64
     compiler_type: clang
-    is_linuxbrew: false
-    sha: 32d6b89b028f560826c8fb7593e88b9129da6a09
-    lto_type:
-    tag: v20221115221905-32d6b89b02-macos-x86_64
-  - os_type: ubuntu20.04
+    tag: v20260504074758-17fb8ba725-macos-x86_64
+
+  - os_type: macos
     architecture: x86_64
-    compiler_type: clang15
-    is_linuxbrew: false
-    sha: 32d6b89b028f560826c8fb7593e88b9129da6a09
-    lto_type:
-    tag: v20221115221745-32d6b89b02-ubuntu2004-x86_64-clang15
+    compiler_type: clang21
+    tag: v20260504074809-17fb8ba725-macos-x86_64-clang21
+
   - os_type: ubuntu22.04
     architecture: x86_64
-    compiler_type: clang15
-    is_linuxbrew: false
-    sha: 32d6b89b028f560826c8fb7593e88b9129da6a09
-    lto_type:
-    tag: v20221115221744-32d6b89b02-ubuntu2204-x86_64-clang15
+    compiler_type: clang19
+    tag: v20260504074834-17fb8ba725-ubuntu2204-x86_64-clang19
+
   - os_type: ubuntu22.04
     architecture: x86_64
-    compiler_type: gcc11
-    is_linuxbrew: false
-    sha: 32d6b89b028f560826c8fb7593e88b9129da6a09
-    lto_type:
-    tag: v20221115221847-32d6b89b02-ubuntu2204-x86_64-gcc11
+    compiler_type: clang21
+    tag: v20260504074929-17fb8ba725-ubuntu2204-x86_64-clang21
+
+  - os_type: ubuntu22.04
+    architecture: x86_64
+    compiler_type: gcc15
+    tag: v20260504074857-17fb8ba725-ubuntu2204-x86_64-gcc15
+
+  - os_type: ubuntu24.04
+    architecture: x86_64
+    compiler_type: clang19
+    tag: v20260504074904-17fb8ba725-ubuntu2404-x86_64-clang19
+
+  - os_type: ubuntu24.04
+    architecture: x86_64
+    compiler_type: clang21
+    tag: v20260504074847-17fb8ba725-ubuntu2404-x86_64-clang21
+
+  - os_type: ubuntu24.04
+    architecture: x86_64
+    compiler_type: gcc15
+    tag: v20260504074926-17fb8ba725-ubuntu2404-x86_64-gcc15

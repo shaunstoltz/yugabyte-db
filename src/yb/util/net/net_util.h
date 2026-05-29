@@ -15,9 +15,9 @@
 // specific language governing permissions and limitations
 // under the License.
 //
-// The following only applies to changes made to this file as part of YugaByte development.
+// The following only applies to changes made to this file as part of YugabyteDB development.
 //
-// Portions Copyright (c) YugaByte, Inc.
+// Portions Copyright (c) YugabyteDB, Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License"); you may not use this file except
 // in compliance with the License.  You may obtain a copy of the License at
@@ -36,7 +36,6 @@
 #include <memory>
 
 #include <boost/container/small_vector.hpp>
-#include <boost/optional/optional_fwd.hpp>
 
 #include "yb/util/flags.h"
 
@@ -98,6 +97,19 @@ class HostPort {
   template <class PB>
   static HostPort FromPB(const PB& pb) {
     return HostPort(pb.host(), pb.port());
+  }
+
+  template <class PB>
+  PB ToPB() const {
+    PB out;
+    ToPB(&out);
+    return out;
+  }
+
+  template <class PB>
+  void ToPB(PB* out) const {
+    out->set_host(host());
+    out->set_port(port());
   }
 
   // Takes a vector of HostPort objects and returns a comma separated
@@ -180,6 +192,10 @@ Status HostPortFromEndpointReplaceWildcard(const Endpoint& addr, HostPort* hp);
 // is non-NULL (mostly useful for testing).
 void TryRunLsof(const Endpoint& addr, std::vector<std::string>* log = NULL);
 
+void TryRunChronycTracking(std::vector<std::string>* log = NULL);
+
+void TryRunChronycSourceInfo(std::vector<std::string>* log = NULL);
+
 // Get a free port that a local server could listen to. For use in tests. Tries up to a 1000 times
 // and fatals after that.
 // @param file_lock This will be set to a file lock ensuring the port does not get taken by
@@ -206,11 +222,10 @@ static std::string HostPortPBToString(const PB& pb) {
 }
 
 Status HostToAddresses(
-    const std::string& host,
-    boost::container::small_vector_base<IpAddress>* addresses);
+    const std::string& host, boost::container::small_vector_base<IpAddress>* addresses);
 
 Result<IpAddress> HostToAddress(const std::string& host);
-boost::optional<IpAddress> TryFastResolve(const std::string& host);
+std::optional<IpAddress> TryFastResolve(const std::string& host);
 Result<IpAddress> ParseIpAddress(const std::string& host);
 
 // Returns true if host_str is 0.0.0.0 or [::]

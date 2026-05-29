@@ -1,9 +1,9 @@
 // Copyright 2010 Google Inc. All Rights Reserved.
 // Maintainer: mec@google.com (Michael Chastain)
 //
-// The following only applies to changes made to this file as part of YugaByte development.
+// The following only applies to changes made to this file as part of YugabyteDB development.
 //
-// Portions Copyright (c) YugaByte, Inc.
+// Portions Copyright (c) YugabyteDB, Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License"); you may not use this file except
 // in compliance with the License.  You may obtain a copy of the License at
@@ -350,34 +350,6 @@ bool AutoDigitLessThan(const char* a, size_t alen,
 
 bool StrictAutoDigitLessThan(const char* a, size_t alen,
                              const char* b, size_t blen);
-
-struct autodigit_less
-  : public std::binary_function<const std::string&, const std::string&, bool> {
-  bool operator()(const std::string& a, const std::string& b) const {
-    return AutoDigitLessThan(a.data(), a.size(), b.data(), b.size());
-  }
-};
-
-struct autodigit_greater
-  : public std::binary_function<const std::string&, const std::string&, bool> {
-  bool operator()(const std::string& a, const std::string& b) const {
-    return AutoDigitLessThan(b.data(), b.size(), a.data(), a.size());
-  }
-};
-
-struct strict_autodigit_less
-  : public std::binary_function<const std::string&, const std::string&, bool> {
-  bool operator()(const std::string& a, const std::string& b) const {
-    return StrictAutoDigitLessThan(a.data(), a.size(), b.data(), b.size());
-  }
-};
-
-struct strict_autodigit_greater
-  : public std::binary_function<const std::string&, const std::string&, bool> {
-  bool operator()(const std::string& a, const std::string& b) const {
-    return StrictAutoDigitLessThan(b.data(), b.size(), a.data(), a.size());
-  }
-};
 
 // ----------------------------------------------------------------------
 // SimpleItoa()

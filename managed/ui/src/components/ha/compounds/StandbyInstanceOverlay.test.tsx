@@ -1,26 +1,23 @@
-import React from 'react';
-import { createMemoryHistory } from 'history';
-import { Route, Router } from 'react-router';
-import { render } from '../../../test-utils';
+import type { Mock } from 'vitest';
+import { MemoryRouter, Route } from 'react-router-dom';
+import { render } from '@testing-library/react';
 import { useLoadHAConfiguration } from '../hooks/useLoadHAConfiguration';
 import { StandbyInstanceOverlay } from './StandbyInstanceOverlay';
-import { HAConfig } from '../../../redesign/helpers/dtos';
+import { HaConfig } from '../dtos';
 
-jest.mock('../hooks/useLoadHAConfiguration');
+vi.mock('../hooks/useLoadHAConfiguration');
 
 type HookReturnType = Partial<ReturnType<typeof useLoadHAConfiguration>>;
 
-const fakeStandbyConfig = { instances: [{ is_local: true, is_leader: false }] } as HAConfig;
-const fakeActiveConfig = { instances: [{ is_local: true, is_leader: true }] } as HAConfig;
+const fakeStandbyConfig = { instances: [{ is_local: true, is_leader: false }] } as HaConfig;
+const fakeActiveConfig = { instances: [{ is_local: true, is_leader: true }] } as HaConfig;
 
 const setup = (hookResponse: HookReturnType, route = '/') => {
-  (useLoadHAConfiguration as jest.Mock<HookReturnType>).mockReturnValue(hookResponse);
-  const history = createMemoryHistory();
-  history.push(route);
+  (useLoadHAConfiguration as Mock<() => HookReturnType>).mockReturnValue(hookResponse);
   return render(
-    <Router history={history}>
+    <MemoryRouter initialEntries={[route]}>
       <Route path={route} component={StandbyInstanceOverlay} />
-    </Router>
+    </MemoryRouter>
   );
 };
 

@@ -1,4 +1,4 @@
-// Copyright (c) YugaByte, Inc.
+// Copyright (c) YugabyteDB, Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License"); you may not use this file except
 // in compliance with the License.  You may obtain a copy of the License at
@@ -17,19 +17,25 @@
 #include <memory>
 #include <vector>
 
-#include "yb/util/env.h"
-#include "yb/util/threadpool.h"
-#include "yb/rocksdb/env.h"
-
 #include "yb/client/client_fwd.h"
 
 #include "yb/consensus/log_fwd.h"
 
 #include "yb/docdb/local_waiting_txn_registry.h"
 
+#include "yb/hnsw/hnsw_fwd.h"
+
+#include "yb/rocksdb/rocksdb_fwd.h"
+#include "yb/rocksdb/env.h"
+
 #include "yb/server/server_fwd.h"
 
 #include "yb/tablet/tablet_fwd.h"
+#include "yb/tablet/tablet_retention_policy.h"
+
+#include "yb/util/env.h"
+#include "yb/util/metrics.h"
+#include "yb/util/threadpool.h"
 
 namespace rocksdb {
 class Cache;
@@ -42,12 +48,14 @@ struct RocksDBPriorityThreadPoolMetrics;
 
 namespace yb {
 
-class AutoFlagsManager;
+class AutoFlagsManagerBase;
 class Env;
 class MemTracker;
 class MetricRegistry;
 
 namespace tablet {
+
+struct TabletFullCompactionListener;
 
 // Common for all tablets within TabletManager.
 struct TabletOptions {
@@ -60,17 +68,30 @@ struct TabletOptions {
   std::shared_ptr<rocksdb::RocksDBPriorityThreadPoolMetrics> priority_thread_pool_metrics;
 };
 
+struct MutableTabletOptions {
+  rocksdb::AllowCompactionFailures allow_compaction_failures =
+      rocksdb::AllowCompactionFailures::kFalse;
+};
+
 using TransactionManagerProvider = std::function<client::TransactionManager&()>;
+
+YB_DEFINE_ENUM(VectorIndexThreadPoolType, (kBackground)(kBackfill)(kInsert));
+
+using VectorIndexThreadPoolProvider = std::function<rpc::ThreadPool*(VectorIndexThreadPoolType)>;
+using VectorIndexCompactionTokenProvider = std::function<PriorityThreadPoolTokenPtr()>;
 
 struct TabletInitData {
   RaftGroupMetadataPtr metadata;
   std::shared_future<client::YBClient*> client_future;
   scoped_refptr<server::Clock> clock;
   std::shared_ptr<MemTracker> parent_mem_tracker;
-  std::shared_ptr<MemTracker> block_based_table_mem_tracker;
+  std::shared_ptr<MemTracker> parent_block_based_table_mem_tracker;
+  std::shared_ptr<MemTracker> parent_block_based_table_builder_mem_tracker;
+  std::shared_ptr<MemTracker> read_wal_mem_tracker;
   MetricRegistry* metric_registry = nullptr;
   log::LogAnchorRegistryPtr log_anchor_registry;
-  const TabletOptions tablet_options;
+  TabletOptions tablet_options;
+  MutableTabletOptions mutable_tablet_options;
   std::string log_prefix_suffix;
   TransactionParticipantContext* transaction_participant_context = nullptr;
   client::LocalTabletFilter local_tablet_filter;
@@ -79,13 +100,21 @@ struct TabletInitData {
   IsSysCatalogTablet is_sys_catalog = IsSysCatalogTablet::kFalse;
   SnapshotCoordinator* snapshot_coordinator = nullptr;
   TabletSplitter* tablet_splitter = nullptr;
-  std::function<HybridTime(RaftGroupMetadata*)> allowed_history_cutoff_provider;
+  AllowedHistoryCutoffProvider allowed_history_cutoff_provider;
   TransactionManagerProvider transaction_manager_provider;
-  LocalWaitingTxnRegistry* waiting_txn_registry = nullptr;
+  docdb::LocalWaitingTxnRegistry* waiting_txn_registry = nullptr;
   ThreadPool* wait_queue_pool = nullptr;
-  AutoFlagsManager* auto_flags_manager = nullptr;
+  AutoFlagsManagerBase* auto_flags_manager = nullptr;
   ThreadPool* full_compaction_pool;
+  ThreadPool* admin_triggered_compaction_pool;
   scoped_refptr<yb::AtomicGauge<uint64_t>> post_split_compaction_added;
+  client::YBMetaDataCache* metadata_cache;
+  std::function<SchemaVersion(const TableId&, const ColocationId&)>
+      get_min_xcluster_schema_version = nullptr;
+  rpc::Messenger* messenger = nullptr;
+  VectorIndexThreadPoolProvider vector_index_thread_pool_provider = {};
+  VectorIndexCompactionTokenProvider vector_index_compaction_token_provider = {};
+  hnsw::BlockCachePtr vector_index_block_cache = {};
 };
 
 } // namespace tablet

@@ -1,9 +1,8 @@
-// Copyright (c) Yugabyte, Inc.
+// Copyright (c) YugabyteDB, Inc.
 
 package com.yugabyte.yw.controllers;
 
-import static com.yugabyte.yw.common.FakeApiHelper.doRequestWithAuthToken;
-import static com.yugabyte.yw.common.FakeApiHelper.doRequestWithAuthTokenAndBody;
+import static com.yugabyte.yw.models.helpers.CommonUtils.nowWithoutMillis;
 import static org.hamcrest.MatcherAssert.assertThat;
 import static org.hamcrest.Matchers.contains;
 import static org.hamcrest.Matchers.equalTo;
@@ -21,8 +20,12 @@ import com.yugabyte.yw.common.ModelFactory;
 import com.yugabyte.yw.common.TestUtils;
 import com.yugabyte.yw.forms.PerfAdvisorSettingsFormData;
 import com.yugabyte.yw.forms.PerfAdvisorSettingsWithDefaults;
+import com.yugabyte.yw.models.UniversePerfAdvisorRun;
 import com.yugabyte.yw.models.Users;
+import io.ebean.DB;
 import java.time.Instant;
+import java.time.temporal.ChronoUnit;
+import java.util.List;
 import java.util.UUID;
 import org.junit.Before;
 import org.junit.Test;
@@ -62,8 +65,9 @@ public class PerfAdvisorControllerTest extends FakePerfAdvisorDBTest {
         createTestRecommendation().setRecommendationState(RecommendationState.HIDDEN);
     PerformanceRecommendation recommendation3 =
         createTestRecommendation().setRecommendationState(RecommendationState.RESOLVED);
-    performanceRecommendationService.save(
-        ImmutableList.of(recommendation1, recommendation2, recommendation3));
+    List<PerformanceRecommendation> recommendations =
+        ImmutableList.of(recommendation1, recommendation2, recommendation3);
+    performanceRecommendationService.save(recommendations);
 
     PerformanceRecommendationPagedQuery query = new PerformanceRecommendationPagedQuery();
     query.setSortBy(SortBy.recommendationState);
@@ -182,13 +186,13 @@ public class PerfAdvisorControllerTest extends FakePerfAdvisorDBTest {
     UUID baseUuid = UUID.randomUUID();
     StateChangeAuditInfo info1 =
         createAuditInfo(recommendation, TestUtils.replaceFirstChar(baseUuid, 'a'));
-    StateChangeAuditInfo.db("perf_advisor").save(info1);
+    DB.byName("perf_advisor").save(info1);
     StateChangeAuditInfo info2 =
         createAuditInfo(recommendation, TestUtils.replaceFirstChar(baseUuid, 'b'));
-    StateChangeAuditInfo.db("perf_advisor").save(info2);
+    DB.byName("perf_advisor").save(info2);
     StateChangeAuditInfo info3 =
         createAuditInfo(recommendation, TestUtils.replaceFirstChar(baseUuid, 'c'));
-    StateChangeAuditInfo.db("perf_advisor").save(info3);
+    DB.byName("perf_advisor").save(info3);
 
     StateChangeAuditInfoPagedQuery query = new StateChangeAuditInfoPagedQuery();
     query.setSortBy(StateChangeAuditInfo.SortBy.id);
@@ -236,7 +240,12 @@ public class PerfAdvisorControllerTest extends FakePerfAdvisorDBTest {
             .setQuerySkewMinQueries(200)
             .setQuerySkewIntervalMins(8)
             .setRejectedConnThreshold(9)
-            .setRejectedConnIntervalMins(15);
+            .setRejectedConnIntervalMins(15)
+            .setHotShardWriteSkewThresholdPct(800.0)
+            .setHotShardReadSkewThresholdPct(800.0)
+            .setHotShardIntervalMins(10)
+            .setHotShardMinNodeWrites(600)
+            .setHotShardMinNodeReads(600);
 
     Result result =
         doRequestWithAuthTokenAndBody(
@@ -268,6 +277,28 @@ public class PerfAdvisorControllerTest extends FakePerfAdvisorDBTest {
     assertThat(updated.getDefaultSettings(), notNullValue());
   }
 
+  @Test
+  public void testGetLatestRun() {
+    UniversePerfAdvisorRun lastRun =
+        UniversePerfAdvisorRun.create(customer.getUuid(), universe.getUniverseUUID(), true);
+    lastRun.setScheduleTime(nowWithoutMillis());
+    lastRun.save();
+    Result result =
+        doRequestWithAuthToken(
+            "GET",
+            "/api/customers/"
+                + customer.getUuid()
+                + "/universes/"
+                + universe.getUniverseUUID()
+                + "/last_run",
+            authToken);
+    assertThat(result.status(), equalTo(OK));
+    JsonNode json = Json.parse(contentAsString(result));
+    UniversePerfAdvisorRun queried = Json.fromJson(json, UniversePerfAdvisorRun.class);
+
+    assertThat(lastRun, equalTo(queried));
+  }
+
   private StateChangeAuditInfo createAuditInfo(
       PerformanceRecommendation recommendation, UUID uuid) {
     return new StateChangeAuditInfo()
@@ -278,6 +309,6 @@ public class PerfAdvisorControllerTest extends FakePerfAdvisorDBTest {
         .setPerformanceRecommendation(recommendation)
         .setCustomerId(customer.getUuid())
         .setUserId(UUID.randomUUID())
-        .setTimestamp(Instant.now());
+        .setTimestamp(Instant.now().truncatedTo(ChronoUnit.MICROS));
   }
 }

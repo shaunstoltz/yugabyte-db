@@ -1,4 +1,4 @@
-# Copyright (c) YugaByte, Inc.
+# Copyright (c) YugabyteDB, Inc.
 #
 # Licensed under the Apache License, Version 2.0 (the "License"); you may not use this file except
 # in compliance with the License.  You may obtain a copy of the License at
@@ -12,65 +12,92 @@
 #
 
 set(YB_PCH_PREFIX pggate)
-set(YB_PCH_DEP_LIBS opid_proto yb_test_util)
+set(YB_PCH_DEP_LIBS yb_test_util)
 
 # We need access to the generated pg_type_d.h header from this directory.
-include_directories("${YB_BUILD_ROOT}/postgres_build/src/include")
+include_directories("${YB_BUILD_ROOT}/postgres_build/src/backend")
 
 # Utility functions that are specific for PGGate.
 add_subdirectory(util)
 
+add_subdirectory(webserver)
+
+add_subdirectory(ysql_bench_metrics_handler)
+
 # PGGate API library.
 set(PGGATE_SRCS
-    ybc_pggate.cc
+    insert_on_conflict_buffer.cc
+    pg_callbacks.cc
+    pg_client.cc
+    pg_column.cc
+    pg_ddl.cc
+    pg_dml.cc
+    pg_dml_read.cc
+    pg_dml_write.cc
+    pg_doc_metrics.cc
+    pg_doc_op.cc
+    pg_doc_op_fetch_stream.cc
+    pg_explicit_row_lock_buffer.cc
+    pg_expr.cc
+    pg_fk_reference_cache.cc
+    pg_flush_debug_context.cc
+    pg_flush_future.cc
+    pg_function.cc
+    pg_function_helpers.cc
     pggate.cc
     pggate_thread_local_vars.cc
-    pg_client.cc
+    pg_memctx.cc
     pg_op.cc
     pg_operation_buffer.cc
     pg_perform_future.cc
+    pg_read_range.cc
     pg_sample.cc
-    pg_session.cc
-    pg_ddl.cc
-    pg_dml.cc
-    pg_dml_write.cc
-    pg_dml_read.cc
-    pg_type.cc
     pg_select.cc
     pg_select_index.cc
-    pg_expr.cc
-    pg_column.cc
-    pg_doc_op.cc
+    pg_session.cc
+    pg_shared_mem.cc
+    pg_sys_table_prefetcher.cc
     pg_table.cc
     pg_tabledesc.cc
+    pg_tools.cc
     pg_txn_manager.cc
     pg_value.cc
-    pg_memctx.cc
-    pg_callbacks.cc
-    pg_tools.cc
-    pg_sys_table_prefetcher.cc)
+    pg_ybctid_reader.cc
+    pg_global_view_read.cc
+    ybc_dist_trace.cc
+    ybc_gflags.cc
+    ybc_pg_shared_mem.cc
+    ybc_pggate.cc)
 
 ADD_YB_LIBRARY(yb_pggate_flags
                SRCS pggate_flags.cc
-               DEPS yb_util)
+               DEPS yb_ash yb_util)
 
 set(PGGATE_LIBS
-    consensus_error
+    cdc_service_proto
+    server_common
+    yb_ash
     yb_util
     yb_common
-    yb_ql_common
     yb_client
-    tserver_util
+    tserver_shared
     yb_pggate_util
     yb_pggate_flags
-    tablet_error
     pg_client_proto)
 
 ADD_YB_LIBRARY(yb_pggate
                SRCS ${PGGATE_SRCS}
                DEPS ${PGGATE_LIBS})
 
+include_directories(${YB_BUILD_ROOT}/postgres_build/src/include)
+
+add_dependencies(yb_pggate postgres_genbki)
+
 yb_use_pch(yb_pggate pggate)
 
-# Test
+# Unit tests (no postgres dependency).
+set(YB_TEST_LINK_LIBS yb_pggate ${YB_MIN_TEST_LIBS})
+ADD_YB_TEST(pg_read_range-test)
+
+# Integration tests (depend on postgres).
 add_subdirectory(test)

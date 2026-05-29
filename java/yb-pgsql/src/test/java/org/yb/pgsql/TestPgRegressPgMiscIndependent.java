@@ -1,4 +1,4 @@
-// Copyright (c) YugaByte, Inc.
+// Copyright (c) YugabyteDB, Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License"); you may not use this file except
 // in compliance with the License.  You may obtain a copy of the License at
@@ -16,13 +16,13 @@ import java.util.Map;
 
 import org.junit.Test;
 import org.junit.runner.RunWith;
-import org.yb.util.YBTestRunnerNonTsanOnly;
+import org.yb.YBTestRunner;
 
 /**
  * Runs the pg_regress test suite on YB code.
  */
-@RunWith(value=YBTestRunnerNonTsanOnly.class)
-public class TestPgRegressPgMiscIndependent extends BasePgSQLTest {
+@RunWith(value=YBTestRunner.class)
+public class TestPgRegressPgMiscIndependent extends BasePgRegressTestPorted {
 
   private static final int TURN_OFF_SEQUENCE_CACHE_FLAG = 0;
 
@@ -35,11 +35,19 @@ public class TestPgRegressPgMiscIndependent extends BasePgSQLTest {
   protected Map<String, String> getTServerFlags() {
     Map<String, String> flagMap = super.getTServerFlags();
     flagMap.put("ysql_sequence_cache_minval", Integer.toString(TURN_OFF_SEQUENCE_CACHE_FLAG));
+    // TODO(#26734): Enable transactional DDL (& table locks) once savepoint for DDLs are supported.
+    flagMap.put("ysql_yb_ddl_transaction_block_enabled", "false");
+    flagMap.put("enable_object_locking_for_table_locks", "false");
     return flagMap;
   }
 
   @Test
   public void testPgRegressPgMiscIndependent() throws Exception {
-    runPgRegressTest("yb_pg_misc_independent_serial_schedule");
+    runPgRegressTest("yb_pg_misc_independent_1_schedule");
+  }
+
+  @Test
+  public void testPgRegressPgMiscIndependent2() throws Exception {
+    runPgRegressTest("yb_pg_misc_independent_2_schedule");
   }
 }

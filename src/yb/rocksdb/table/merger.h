@@ -3,9 +3,9 @@
 //  LICENSE file in the root directory of this source tree. An additional grant
 //  of patent rights can be found in the PATENTS file in the same directory.
 //
-// The following only applies to changes made to this file as part of YugaByte development.
+// The following only applies to changes made to this file as part of YugabyteDB development.
 //
-// Portions Copyright (c) YugaByte, Inc.
+// Portions Copyright (c) YugabyteDB, Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License"); you may not use this file except
 // in compliance with the License.  You may obtain a copy of the License at
@@ -23,7 +23,12 @@
 
 #pragma once
 
+#include <memory>
 
+#include "yb/rocksdb/rocksdb_fwd.h"
+#include "yb/rocksdb/options.h"
+#include "yb/rocksdb/table/internal_iterator.h"
+#include "yb/rocksdb/table/iterator_wrapper.h"
 
 namespace rocksdb {
 
@@ -40,35 +45,69 @@ class Arena;
 // key is present in K child iterators, it will be yielded K times.
 //
 // REQUIRES: n >= 0
-extern InternalIterator* NewMergingIterator(const Comparator* comparator,
-                                            InternalIterator** children, int n,
-                                            Arena* arena = nullptr);
+InternalIterator* NewMergingIterator(
+    const Comparator* comparator, InternalIterator** children, int n, Arena* arena = nullptr);
 
-class MergingIterator;
+constexpr size_t kMergeIteratorNumReserved = 4;
 
 // A builder class to build a merging iterator by adding iterators one by one.
-class MergeIteratorBuilder {
+template <typename IteratorWrapperType>
+class MergeIteratorBuilderBase {
  public:
+  using IteratorType = typename IteratorWrapperType::IteratorType;
   // comparator: the comparator used in merging comparator
   // arena: where the merging iterator needs to be allocated from.
-  explicit MergeIteratorBuilder(const Comparator* comparator, Arena* arena);
-  ~MergeIteratorBuilder() {}
+  explicit MergeIteratorBuilderBase(const Comparator* comparator, Arena* arena);
+  ~MergeIteratorBuilderBase() {}
 
   // Add iter to the merging iterator.
   void AddIterator(InternalIterator* iter);
 
   // Get arena used to build the merging iterator. It is called one a child
   // iterator needs to be allocated.
-  Arena* GetArena() { return arena; }
+  Arena* GetArena() { return arena_; }
 
   // Return the result merging iterator.
   InternalIterator* Finish();
 
+  void SetupIteratorFilter(
+      const IteratorFilter* filter, const QueryOptions& filter_options) {
+    filter_ = filter;
+    filter_options_ = filter_options;
+  }
+
  private:
-  MergingIterator* merge_iter;
-  InternalIterator* first_iter;
-  bool use_merging_iter;
-  Arena* arena;
+  const Comparator* const comparator_;
+  Arena* const arena_;
+  boost::container::small_vector<InternalIterator*, kMergeIteratorNumReserved> iterators_;
+  const IteratorFilter* filter_ = nullptr;
+  QueryOptions filter_options_;
+};
+
+template <typename IteratorType>
+class MergingIterator : public InternalIterator {
+ public:
+  virtual IteratorType* GetCurrentIterator() = 0;
+};
+
+// Same as MergeIteratorBuilder but uses heap instead of arena.
+// DO NOT USE for critical code paths.
+template <typename IteratorWrapperType>
+class MergeIteratorInHeapBuilder {
+ public:
+  using IteratorType = typename IteratorWrapperType::IteratorType;
+  explicit MergeIteratorInHeapBuilder(const Comparator* comparator);
+  ~MergeIteratorInHeapBuilder();
+
+  // Add iter to the merging iterator.
+  void AddIterator(IteratorType* iter);
+
+  // Return the result merging iterator.
+  std::unique_ptr<MergingIterator<IteratorType>> Finish();
+
+ private:
+  const Comparator* const comparator_;
+  boost::container::small_vector<IteratorWrapperType, kMergeIteratorNumReserved> iterators_;
 };
 
 }  // namespace rocksdb

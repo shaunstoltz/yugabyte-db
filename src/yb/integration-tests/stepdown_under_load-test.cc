@@ -1,4 +1,4 @@
-// Copyright (c) YugaByte, Inc.
+// Copyright (c) YugabyteDB, Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License"); you may not use this file except
 // in compliance with the License.  You may obtain a copy of the License at
@@ -33,13 +33,8 @@
 namespace yb {
 namespace itest {
 
-using client::YBClient;
-using client::YBClientBuilder;
-using client::YBTable;
 using integration_tests::YBTableTestBase;
-using std::shared_ptr;
 using std::string;
-using std::unique_ptr;
 using std::vector;
 
 namespace {

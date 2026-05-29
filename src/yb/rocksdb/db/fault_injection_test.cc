@@ -3,9 +3,9 @@
 //  LICENSE file in the root directory of this source tree. An additional grant
 //  of patent rights can be found in the PATENTS file in the same directory.
 //
-// The following only applies to changes made to this file as part of YugaByte development.
+// The following only applies to changes made to this file as part of YugabyteDB development.
 //
-// Portions Copyright (c) YugaByte, Inc.
+// Portions Copyright (c) YugabyteDB, Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License"); you may not use this file except
 // in compliance with the License.  You may obtain a copy of the License at
@@ -37,10 +37,10 @@
 #include "yb/rocksdb/table.h"
 #include "yb/rocksdb/util/mock_env.h"
 #include "yb/rocksdb/util/mutexlock.h"
-#include "yb/rocksdb/util/sync_point.h"
 #include "yb/rocksdb/util/testharness.h"
 #include "yb/rocksdb/util/testutil.h"
 
+#include "yb/util/sync_point.h"
 #include "yb/util/test_macros.h"
 
 using std::unique_ptr;
@@ -158,9 +158,11 @@ class TestWritableFile : public WritableFile {
   Status Append(const Slice& data) override;
   Status Truncate(uint64_t size) override { return target_->Truncate(size); }
   Status Close() override;
-  Status Flush() override;
+  Status Flush(FlushMode mode) override;
   Status Sync() override;
   bool IsSyncThreadSafe() const override { return true; }
+  uint64_t Size() const override { return target_->Size(); }
+  const std::string& filename() const override { return target_->filename(); }
 
  private:
   FileState state_;
@@ -430,8 +432,8 @@ Status TestWritableFile::Close() {
   return s;
 }
 
-Status TestWritableFile::Flush() {
-  Status s = target_->Flush();
+Status TestWritableFile::Flush(FlushMode mode) {
+  Status s = target_->Flush(mode);
   if (s.ok() && env_->IsFilesystemActive()) {
     state_.pos_at_last_flush_ = state_.pos_;
   }
@@ -494,8 +496,8 @@ class FaultInjectionTest : public RocksDBTest,
   }
 
   ~FaultInjectionTest() {
-    rocksdb::SyncPoint::GetInstance()->DisableProcessing();
-    rocksdb::SyncPoint::GetInstance()->ClearAllCallBacks();
+    yb::SyncPoint::GetInstance()->DisableProcessing();
+    yb::SyncPoint::GetInstance()->ClearAllCallBacks();
   }
 
   bool ChangeOptions() {
@@ -676,7 +678,7 @@ class FaultInjectionTest : public RocksDBTest,
   void DeleteAllData() {
     Iterator* iter = db_->NewIterator(ReadOptions());
     WriteOptions options;
-    for (iter->SeekToFirst(); iter->Valid(); iter->Next()) {
+    for (iter->SeekToFirst(); ASSERT_RESULT(iter->CheckedValid()); iter->Next()) {
       ASSERT_OK(db_->Delete(WriteOptions(), iter->key()));
     }
 
@@ -842,14 +844,14 @@ TEST_P(FaultInjectionTest, UninstalledCompaction) {
   ASSERT_OK(OpenDB());
 
   if (!sequential_order_) {
-    rocksdb::SyncPoint::GetInstance()->LoadDependency({
+    yb::SyncPoint::GetInstance()->LoadDependency({
         {"FaultInjectionTest::FaultTest:0", "DBImpl::BGWorkCompaction"},
         {"CompactionJob::Run():End", "FaultInjectionTest::FaultTest:1"},
         {"FaultInjectionTest::FaultTest:2",
          "DBImpl::BackgroundCompaction:NonTrivial:AfterRun"},
     });
   }
-  rocksdb::SyncPoint::GetInstance()->EnableProcessing();
+  yb::SyncPoint::GetInstance()->EnableProcessing();
 
   int kNumKeys = 1000;
   Build(WriteOptions(), 0, kNumKeys);
@@ -862,22 +864,22 @@ TEST_P(FaultInjectionTest, UninstalledCompaction) {
   env_->SetFilesystemActive(false);
   TEST_SYNC_POINT("FaultInjectionTest::FaultTest:2");
   CloseDB();
-  rocksdb::SyncPoint::GetInstance()->DisableProcessing();
+  yb::SyncPoint::GetInstance()->DisableProcessing();
   ResetDBState(kResetDropUnsyncedData);
 
   std::atomic<bool> opened(false);
-  rocksdb::SyncPoint::GetInstance()->SetCallBack(
+  yb::SyncPoint::GetInstance()->SetCallBack(
       "DBImpl::Open:Opened", [&](void* arg) { opened.store(true); });
-  rocksdb::SyncPoint::GetInstance()->SetCallBack(
+  yb::SyncPoint::GetInstance()->SetCallBack(
       "DBImpl::BGWorkCompaction",
       [&](void* arg) { ASSERT_TRUE(opened.load()); });
-  rocksdb::SyncPoint::GetInstance()->EnableProcessing();
+  yb::SyncPoint::GetInstance()->EnableProcessing();
   ASSERT_OK(OpenDB());
   ASSERT_OK(Verify(0, kNumKeys, FaultInjectionTest::kValExpectFound));
   WaitCompactionFinish();
   ASSERT_OK(Verify(0, kNumKeys, FaultInjectionTest::kValExpectFound));
-  rocksdb::SyncPoint::GetInstance()->DisableProcessing();
-  rocksdb::SyncPoint::GetInstance()->ClearAllCallBacks();
+  yb::SyncPoint::GetInstance()->DisableProcessing();
+  yb::SyncPoint::GetInstance()->ClearAllCallBacks();
 }
 
 TEST_P(FaultInjectionTest, ManualLogSyncTest) {

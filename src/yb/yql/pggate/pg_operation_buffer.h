@@ -1,4 +1,4 @@
-// Copyright (c) YugaByte, Inc.
+// Copyright (c) YugabyteDB, Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License"); you may not use this file except
 // in compliance with the License.  You may obtain a copy of the License at
@@ -15,6 +15,9 @@
 
 #include <functional>
 #include <memory>
+#include <utility>
+
+#include "yb/ash/wait_state.h"
 
 #include "yb/common/common_fwd.h"
 #include "yb/common/pg_types.h"
@@ -23,46 +26,51 @@
 #include "yb/util/status_fwd.h"
 
 #include "yb/yql/pggate/pg_gate_fwd.h"
-#include "yb/yql/pggate/pg_perform_future.h"
+#include "yb/yql/pggate/pg_flush_future.h"
+#include "yb/yql/pggate/pg_tools.h"
 
-namespace yb {
-namespace pggate {
+namespace yb::pggate {
 
-struct BufferingSettings {
-  size_t max_batch_size;
-  size_t max_in_flight_operations;
-};
+class PgFlushDebugContext;
+class PgTableDesc;
 
-struct BufferableOperations {
-  PgsqlOps operations;
-  PgObjectIds relations;
-
-  void Add(PgsqlOpPtr op, const PgObjectId& relation);
+class BufferableOperations {
+ public:
+  const PgsqlOps& operations() const { return operations_; }
+  const PgObjectIds& relations() const { return relations_; }
+  void Add(PgsqlOpPtr&& op, const PgTableDesc& table);
   void Swap(BufferableOperations* rhs);
   void Clear();
   void Reserve(size_t capacity);
-  bool empty() const;
-  size_t size() const;
+  bool Empty() const;
+  size_t Size() const;
+  void MoveTo(PgsqlOps& operations, PgObjectIds& relations) &&;
+
+  friend std::pair<BufferableOperations, BufferableOperations> Split(
+      BufferableOperations&& ops, size_t index);
+
+ private:
+  PgsqlOps operations_;
+  PgObjectIds relations_;
 };
 
 class PgOperationBuffer {
  public:
-  using Flusher = std::function<Result<PerformFuture>(BufferableOperations, bool)>;
+  using Flusher = std::function<Result<FlushFuture>(
+      BufferableOperations&&, bool, const PgFlushDebugContext&)>;
 
-  PgOperationBuffer(const Flusher& flusher, const BufferingSettings& buffering_settings);
+  PgOperationBuffer(Flusher&& flusher, const BufferingSettings& buffering_settings);
   ~PgOperationBuffer();
   Status Add(const PgTableDesc& table, PgsqlWriteOpPtr op, bool transactional);
-  Status Flush();
-  Result<BufferableOperations> FlushTake(
-      const PgTableDesc& table, const PgsqlOp& op, bool transactional);
+  Status Flush(const PgFlushDebugContext& dbg_ctx);
+  Result<BufferableOperations> Take(bool transactional, const PgFlushDebugContext& dbg_ctx);
+  bool IsEmpty() const;
   size_t Size() const;
   void Clear();
-  void GetAndResetRpcStats(uint64_t* count, uint64_t* wait_time);
 
  private:
   class Impl;
   std::unique_ptr<Impl> impl_;
 };
 
-} // namespace pggate
-} // namespace yb
+} // namespace yb::pggate

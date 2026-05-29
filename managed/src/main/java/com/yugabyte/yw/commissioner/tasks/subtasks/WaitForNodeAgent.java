@@ -1,25 +1,21 @@
-// Copyright (c) Yugabyte, Inc.
+// Copyright (c) YugabyteDB, Inc.
 
 package com.yugabyte.yw.commissioner.tasks.subtasks;
 
-import com.yugabyte.yw.commissioner.AbstractTaskBase;
 import com.yugabyte.yw.commissioner.BaseTaskDependencies;
 import com.yugabyte.yw.commissioner.tasks.params.NodeTaskParams;
-import com.yugabyte.yw.common.NodeAgentClient;
 import com.yugabyte.yw.models.NodeAgent;
+import com.yugabyte.yw.models.NodeAgent.State;
 import com.yugabyte.yw.models.Universe;
 import com.yugabyte.yw.models.helpers.NodeDetails;
 import java.time.Duration;
 import javax.inject.Inject;
 
-public class WaitForNodeAgent extends AbstractTaskBase {
-  private final NodeAgentClient nodeAgentClient;
+public class WaitForNodeAgent extends NodeTaskBase {
 
   @Inject
-  protected WaitForNodeAgent(
-      BaseTaskDependencies baseTaskDependencies, NodeAgentClient nodeAgentClient) {
+  protected WaitForNodeAgent(BaseTaskDependencies baseTaskDependencies) {
     super(baseTaskDependencies);
-    this.nodeAgentClient = nodeAgentClient;
   }
 
   public static class Params extends NodeTaskParams {
@@ -33,9 +29,13 @@ public class WaitForNodeAgent extends AbstractTaskBase {
 
   @Override
   public void run() {
-    Universe universe = Universe.getOrBadRequest(taskParams().universeUUID);
+    Universe universe = Universe.getOrBadRequest(taskParams().getUniverseUUID());
     NodeDetails node = universe.getNode(taskParams().nodeName);
     NodeAgent.maybeGetByIp(node.cloudInfo.private_ip)
-        .ifPresent(n -> nodeAgentClient.waitForServerReady(n, taskParams().timeout));
+        .ifPresent(
+            n -> {
+              nodeAgentClient.waitForServerReady(n, taskParams().timeout);
+              n.saveState(State.READY);
+            });
   }
 }

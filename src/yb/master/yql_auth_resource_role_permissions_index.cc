@@ -1,4 +1,4 @@
-// Copyright (c) YugaByte, Inc.
+// Copyright (c) YugabyteDB, Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License"); you may not use this file except
 // in compliance with the License.  You may obtain a copy of the License at
@@ -16,6 +16,7 @@
 #include "yb/common/ql_type.h"
 #include "yb/common/schema.h"
 
+#include "yb/master/catalog_manager_if.h"
 #include "yb/master/permissions_manager.h"
 
 #include "yb/util/status_log.h"
@@ -28,9 +29,9 @@ YQLAuthResourceRolePermissionsIndexVTable::YQLAuthResourceRolePermissionsIndexVT
     : YQLVirtualTable(table_name, namespace_name, master, CreateSchema()) {
 }
 
-Result<std::shared_ptr<QLRowBlock>> YQLAuthResourceRolePermissionsIndexVTable::RetrieveData(
-    const QLReadRequestPB& request) const {
-  auto vtable = std::make_shared<QLRowBlock>(schema());
+Result<VTableDataPtr> YQLAuthResourceRolePermissionsIndexVTable::RetrieveData(
+    const QLReadRequestMsg& request) const {
+  auto vtable = std::make_shared<qlexpr::QLRowBlock>(schema());
   std::vector<scoped_refptr<RoleInfo>> roles;
   catalog_manager().permissions_manager()->GetAllRoles(&roles);
   for (const auto& rp : roles) {
@@ -38,7 +39,7 @@ Result<std::shared_ptr<QLRowBlock>> YQLAuthResourceRolePermissionsIndexVTable::R
     const auto& pb = l->pb;
     for (int i = 0; i <  pb.resources_size(); i++) {
       const auto& rp = pb.resources(i);
-      QLRow& row = vtable->Extend();
+      auto& row = vtable->Extend();
       RETURN_NOT_OK(SetColumnValue(kResource, rp.canonical_resource(), &row));
       RETURN_NOT_OK(SetColumnValue(kRole, pb.role(), &row));
     }

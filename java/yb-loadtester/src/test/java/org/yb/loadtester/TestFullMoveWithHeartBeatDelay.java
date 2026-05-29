@@ -1,4 +1,4 @@
-// Copyright (c) YugaByte, Inc.
+// Copyright (c) YugabyteDB, Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License"); you may not use this file except
 // in compliance with the License.  You may obtain a copy of the License at
@@ -19,7 +19,7 @@ import static org.yb.AssertionWrappers.assertTrue;
 import com.google.common.net.HostAndPort;
 import org.junit.Test;
 import org.junit.runner.RunWith;
-import org.yb.util.YBTestRunnerNonTsanOnly;
+import org.yb.YBTestRunner;
 
 import java.util.HashSet;
 import java.util.Iterator;
@@ -30,7 +30,7 @@ import java.util.Set;
  * (with injected heartbeat delays) without any significant impact to a running load test.
  */
 
-@RunWith(value=YBTestRunnerNonTsanOnly.class)
+@RunWith(value=YBTestRunner.class)
 public class TestFullMoveWithHeartBeatDelay extends TestClusterBase {
 
   @Test(timeout = TEST_TIMEOUT_SEC * 1000) // 20 minutes.

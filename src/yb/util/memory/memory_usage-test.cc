@@ -1,5 +1,5 @@
 //
-// Copyright (c) YugaByte, Inc.
+// Copyright (c) YugabyteDB, Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License"); you may not use this file except
 // in compliance with the License.  You may obtain a copy of the License at
@@ -22,13 +22,13 @@
 #include "yb/util/test_util.h"
 #include "yb/util/flags.h"
 
-DEFINE_UNKNOWN_bool(print_memory_usage, false, "Print real memory usage instead of assert.");
+DEFINE_NON_RUNTIME_bool(print_memory_usage, false, "Print real memory usage instead of assert.");
 
 namespace yb {
 
 class MemoryUsageTest : public YBTest {};
 
-#if !defined(ADDRESS_SANITIZER) && !defined(THREAD_SANITIZER) && defined(YB_GPERFTOOLS_TCMALLOC)
+#if !defined(ADDRESS_SANITIZER) && !defined(THREAD_SANITIZER) && YB_GPERFTOOLS_TCMALLOC
 TEST_F(MemoryUsageTest, String) {
 #else
 TEST_F(MemoryUsageTest, DISABLED_String) {

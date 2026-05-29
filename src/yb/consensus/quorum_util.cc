@@ -15,9 +15,9 @@
 // specific language governing permissions and limitations
 // under the License.
 //
-// The following only applies to changes made to this file as part of YugaByte development.
+// The following only applies to changes made to this file as part of YugabyteDB development.
 //
-// Portions Copyright (c) YugaByte, Inc.
+// Portions Copyright (c) YugabyteDB, Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License"); you may not use this file except
 // in compliance with the License.  You may obtain a copy of the License at
@@ -51,24 +51,6 @@ namespace consensus {
 using google::protobuf::RepeatedPtrField;
 using std::string;
 using strings::Substitute;
-
-bool IsRaftConfigMember(const std::string& uuid, const RaftConfigPB& config) {
-  for (const RaftPeerPB& peer : config.peers()) {
-    if (peer.permanent_uuid() == uuid) {
-      return true;
-    }
-  }
-  return false;
-}
-
-bool IsRaftConfigVoter(const std::string& uuid, const RaftConfigPB& config) {
-  for (const RaftPeerPB& peer : config.peers()) {
-    if (peer.permanent_uuid() == uuid) {
-      return peer.member_type() == PeerMemberType::VOTER;
-    }
-  }
-  return false;
-}
 
 Status GetRaftConfigMember(const RaftConfigPB& config,
                            const std::string& uuid,
@@ -188,36 +170,6 @@ PeerMemberType GetConsensusMemberType(const std::string& permanent_uuid,
     }
   }
   return PeerMemberType::UNKNOWN_MEMBER_TYPE;
-}
-
-PeerRole GetConsensusRole(const std::string& permanent_uuid, const ConsensusStatePB& cstate) {
-  if (cstate.leader_uuid() == permanent_uuid) {
-    if (IsRaftConfigVoter(permanent_uuid, cstate.config())) {
-      return PeerRole::LEADER;
-    }
-    return PeerRole::NON_PARTICIPANT;
-  }
-
-  for (const RaftPeerPB& peer : cstate.config().peers()) {
-    if (peer.permanent_uuid() == permanent_uuid) {
-      switch (peer.member_type()) {
-        case PeerMemberType::VOTER:
-          return PeerRole::FOLLOWER;
-
-        // PRE_VOTER, PRE_OBSERVER peers are considered LEARNERs.
-        case PeerMemberType::PRE_VOTER:
-        case PeerMemberType::PRE_OBSERVER:
-          return PeerRole::LEARNER;
-
-        case PeerMemberType::OBSERVER:
-          return PeerRole::READ_REPLICA;
-
-        case PeerMemberType::UNKNOWN_MEMBER_TYPE:
-          return PeerRole::UNKNOWN_ROLE;
-      }
-    }
-  }
-  return PeerRole::NON_PARTICIPANT;
 }
 
 Status VerifyRaftConfig(const RaftConfigPB& config, RaftConfigState type) {

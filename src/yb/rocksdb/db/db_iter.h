@@ -3,9 +3,9 @@
 //  LICENSE file in the root directory of this source tree. An additional grant
 //  of patent rights can be found in the PATENTS file in the same directory.
 //
-// The following only applies to changes made to this file as part of YugaByte development.
+// The following only applies to changes made to this file as part of YugabyteDB development.
 //
-// Portions Copyright (c) YugaByte, Inc.
+// Portions Copyright (c) YugabyteDB, Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License"); you may not use this file except
 // in compliance with the License.  You may obtain a copy of the License at
@@ -46,50 +46,49 @@ extern Iterator* NewDBIterator(
     const Comparator* user_key_comparator, InternalIterator* internal_iter,
     const SequenceNumber& sequence, uint64_t max_sequential_skip_in_iterations,
     uint64_t version_number, const Slice* iterate_upper_bound = nullptr,
-    bool prefix_same_as_start = false, bool pin_data = false);
+    bool prefix_same_as_start = false, bool pin_data = false, Statistics* statistics = nullptr);
 
 // A wrapper iterator which wraps DB Iterator and the arena, with which the DB
 // iterator is supposed be allocated. This class is used as an entry point of
 // an iterator hierarchy whose memory can be allocated inline. In that way,
 // accessing the iterator tree can be more cache friendly. It is also faster
 // to allocate.
-class ArenaWrappedDBIter : public Iterator {
+class ArenaWrappedDBIter final : public Iterator {
  public:
-  virtual ~ArenaWrappedDBIter();
+  ~ArenaWrappedDBIter();
 
   // Get the arena to be used to allocate memory for DBIter to be wrapped,
   // as well as child iterators in it.
-  virtual Arena* GetArena() { return &arena_; }
+  Arena* GetArena() { return &arena_; }
 
   // Set the DB Iterator to be wrapped
 
-  virtual void SetDBIter(DBIter* iter);
+  void SetDBIter(DBIter* iter);
 
   // Set the internal iterator wrapped inside the DB Iterator. Usually it is
   // a merging iterator.
-  virtual void SetIterUnderDBIter(InternalIterator* iter);
-  virtual bool Valid() const override;
-  virtual void SeekToFirst() override;
-  virtual void SeekToLast() override;
-  virtual void Seek(const Slice& target) override;
-  virtual void Next() override;
-  virtual void Prev() override;
-  virtual Slice key() const override;
-  virtual Slice value() const override;
-  virtual Status status() const override;
+  void SetIterUnderDBIter(InternalIterator* iter);
+
+  const KeyValueEntry& Entry() const override;
+  const KeyValueEntry& SeekToFirst() override;
+  const KeyValueEntry& SeekToLast() override;
+  const KeyValueEntry& Seek(Slice target) override;
+  const KeyValueEntry& Next() override;
+  const KeyValueEntry& Prev() override;
+  Status status() const override;
+  void UseFastNext(bool value) override;
 
   void RegisterCleanup(CleanupFunction function, void* arg1, void* arg2);
-  virtual Status PinData();
-  virtual Status ReleasePinnedData();
-  virtual Status GetProperty(std::string prop_name, std::string* prop) override;
+  Status PinData();
+  Status ReleasePinnedData();
+
+  Status GetProperty(std::string prop_name, std::string* prop) override;
 
   void RevalidateAfterUpperBoundChange() override;
 
-  virtual bool ScanForward(
-    const Slice& upperbound, KeyFilterCallback* key_filter_callback,
-    ScanCallback* scan_callback) override;
-
  private:
+  void UpdateFilterKey(Slice user_key_for_filter, Slice seek_key) override;
+
   DBIter* db_iter_;
   Arena arena_;
 };
@@ -100,6 +99,7 @@ extern ArenaWrappedDBIter* NewArenaWrappedDbIterator(
     const Comparator* user_key_comparator, const SequenceNumber& sequence,
     uint64_t max_sequential_skip_in_iterations, uint64_t version_number,
     const Slice* iterate_upper_bound = nullptr,
-    bool prefix_same_as_start = false, bool pin_data = false);
+    bool prefix_same_as_start = false, bool pin_data = false,
+    Statistics* statistics = nullptr);
 
 }  // namespace rocksdb

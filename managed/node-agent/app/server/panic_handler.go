@@ -3,16 +3,58 @@ package server
 import (
 	"context"
 	"node-agent/util"
+	"runtime/debug"
 
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/metadata"
 	"google.golang.org/grpc/status"
 )
 
-// UnaryPanicHandler returns the ServerOption to handle panic occurred in the unary interceptor
-// or the downstream unary handler.
-func UnaryPanicHandler(interceptor grpc.UnaryServerInterceptor) grpc.ServerOption {
-	return grpc.UnaryInterceptor(func(
+type serverStream struct {
+	grpc.ServerStream
+	ctx context.Context
+}
+
+// Context returns the overridden context.
+func (ss *serverStream) Context() context.Context {
+	return ss.ctx
+}
+
+func requestHeaderValue(md metadata.MD, header string) string {
+	var value string
+	if md != nil {
+		values := md[header]
+		if len(values) > 0 {
+			value = values[0]
+		}
+	}
+	if value == "" {
+		value = util.NewUUID().String()
+	}
+	return value
+}
+
+func withRequestHeaders(srvCtx context.Context) context.Context {
+	md, ok := metadata.FromIncomingContext(srvCtx)
+	if !ok {
+		md = nil
+	}
+	ctx := srvCtx
+	for key, val := range util.ContextKeys {
+		ctx = context.WithValue(
+			ctx,
+			val,
+			requestHeaderValue(md, key),
+		)
+	}
+	return ctx
+}
+
+// UnaryPanicHandler returns the ServerOption to handle panic occurred in the
+// downstream unary handler.
+func UnaryPanicHandler() grpc.UnaryServerInterceptor {
+	return grpc.UnaryServerInterceptor(func(
 		ctx context.Context,
 		req interface{},
 		info *grpc.UnaryServerInfo,
@@ -20,39 +62,35 @@ func UnaryPanicHandler(interceptor grpc.UnaryServerInterceptor) grpc.ServerOptio
 	) (response interface{}, err error) {
 		defer func() {
 			if e := recover(); e != nil {
-				util.FileLogger().Errorf("Panic occurred: %v", err)
+				util.FileLogger().Errorf(ctx, "Panic occurred: %v", string(debug.Stack()))
 				err = status.Errorf(codes.Internal, "Internal error occurred")
 			}
 		}()
-		if interceptor == nil {
-			response, err = handler(ctx, req)
-		} else {
-			response, err = interceptor(ctx, req, info, handler)
-		}
+		ctx = withRequestHeaders(ctx)
+		response, err = handler(ctx, req)
 		return
 	})
 }
 
-// StreamPanicHandler returns the ServerOption to handle panic occurred in the stream interceptor
-// or the downstream stream handler.
-func StreamPanicHandler(interceptor grpc.StreamServerInterceptor) grpc.ServerOption {
-	return grpc.StreamInterceptor(func(
+// StreamPanicHandler returns the interceptor to handle panic occurred in the
+// downstream stream handler.
+func StreamPanicHandler() grpc.StreamServerInterceptor {
+	return grpc.StreamServerInterceptor(func(
 		srv interface{},
 		stream grpc.ServerStream,
 		info *grpc.StreamServerInfo,
 		handler grpc.StreamHandler,
 	) (err error) {
+		ctx := stream.Context()
 		defer func() {
 			if e := recover(); e != nil {
-				util.FileLogger().Errorf("Panic occurred: %v", e)
+				util.FileLogger().Errorf(ctx, "Panic occurred: %v", string(debug.Stack()))
 				err = status.Errorf(codes.Internal, "Internal error occurred")
 			}
 		}()
-		if interceptor == nil {
-			err = handler(srv, stream)
-		} else {
-			err = interceptor(srv, stream, info, handler)
-		}
+		ctx = withRequestHeaders(ctx)
+		stream = &serverStream{stream, ctx}
+		err = handler(srv, stream)
 		return
 	})
 }

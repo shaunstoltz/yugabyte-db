@@ -3,7 +3,7 @@
  * ybgin.c
  *	  Implementation of Yugabyte Generalized Inverted Index access method.
  *
- * Copyright (c) YugaByte, Inc.
+ * Copyright (c) YugabyteDB, Inc.
  *
  * Licensed under the Apache License, Version 2.0 (the "License"); you may not
  * use this file except in compliance with the License.  You may obtain a copy
@@ -46,15 +46,16 @@ ybginhandler(PG_FUNCTION_ARGS)
 	amroutine->amcanorderbyop = false;
 	amroutine->amcanbackward = false;
 	amroutine->amcanunique = false;
-	amroutine->amcanmulticol = false; /* TODO(jason): support multicolumn */
+	amroutine->amcanmulticol = false;	/* TODO(jason): support multicolumn */
 	amroutine->amoptionalkey = true;
 	amroutine->amsearcharray = false;
 	amroutine->amsearchnulls = false;
 	amroutine->amstorage = true;
 	amroutine->amclusterable = false;
-	amroutine->ampredlocks = true; /* TODO(jason): check what this is */
+	amroutine->ampredlocks = true;	/* TODO(jason): check what this is */
 	amroutine->amcanparallel = false;
 	amroutine->amcaninclude = false;
+	amroutine->ybamcanupdatetupleinplace = false;
 	amroutine->amkeytype = InvalidOid;
 
 	amroutine->ambuild = ybginbuild;
@@ -70,16 +71,20 @@ ybginhandler(PG_FUNCTION_ARGS)
 	amroutine->ambeginscan = ybginbeginscan;
 	amroutine->amrescan = ybginrescan;
 	amroutine->amgettuple = ybgingettuple;
-	amroutine->amgetbitmap = NULL; /* TODO(jason): support bitmap scan */
+	amroutine->amgetbitmap = NULL;	/* TODO(jason): support bitmap scan */
 	amroutine->amendscan = ybginendscan;
 	amroutine->ammarkpos = NULL;
 	amroutine->amrestrpos = NULL;
 	amroutine->amestimateparallelscan = NULL;
 	amroutine->aminitparallelscan = NULL;
 	amroutine->amparallelrescan = NULL;
+	amroutine->yb_amisforybrelation = true;
 	amroutine->yb_aminsert = ybgininsert;
 	amroutine->yb_amdelete = ybgindelete;
+	amroutine->yb_amupdate = NULL;
 	amroutine->yb_ambackfill = ybginbackfill;
+	amroutine->yb_ammightrecheck = ybginmightrecheck;
+	amroutine->yb_ambindschema = ybginbindschema;
 
 	PG_RETURN_POINTER(amroutine);
 }

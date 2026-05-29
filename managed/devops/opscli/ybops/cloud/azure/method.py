@@ -1,4 +1,4 @@
-# Copyright 2020 YugaByte, Inc. and Contributors
+# Copyright 2020 YugabyteDB, Inc. and Contributors
 #
 # Licensed under the Polyform Free Trial License 1.0.0 (the "License"); you
 # may not use this file except in compliance with the License. You
@@ -7,9 +7,11 @@
 # https://github.com/YugaByte/yugabyte-db/blob/master/licenses/POLYFORM-FREE-TRIAL-LICENSE-1.0.0.txt
 
 from ybops.cloud.common.method import ListInstancesMethod, CreateInstancesMethod, \
-    ProvisionInstancesMethod, DestroyInstancesMethod, AbstractMethod, \
+    ChangeInstanceTypeMethod, ProvisionInstancesMethod, DestroyInstancesMethod, AbstractMethod, \
     AbstractAccessMethod, AbstractNetworkMethod, AbstractInstancesMethod, \
-    DestroyInstancesMethod, AbstractInstancesMethod, DeleteRootVolumesMethod
+    DestroyInstancesMethod, AbstractInstancesMethod, DeleteRootVolumesMethod, \
+    CreateRootVolumesMethod, ReplaceRootVolumeMethod, HardRebootInstancesMethod
+from ybops.common.exceptions import YBOpsRuntimeError, get_exception_message
 import logging
 import json
 import glob
@@ -49,7 +51,8 @@ class AzureCreateInstancesMethod(CreateInstancesMethod):
     def add_extra_args(self):
         super(AzureCreateInstancesMethod, self).add_extra_args()
         self.parser.add_argument("--volume_type",
-                                 choices=["premium_lrs", "standardssd_lrs", "ultrassd_lrs"],
+                                 choices=["premium_lrs", "standardssd_lrs", "ultrassd_lrs",
+                                          "premiumv2_lrs"],
                                  default="premium_lrs", help="Volume type for Azure instances.")
         self.parser.add_argument("--security_group_id", default=None,
                                  help="Azure comma delimited security group IDs.")
@@ -59,6 +62,18 @@ class AzureCreateInstancesMethod(CreateInstancesMethod):
                                  help="Desired iops for ultrassd instance volumes.")
         self.parser.add_argument("--disk_throughput", type=int, default=None,
                                  help="Desired throughput for ultrassd instance volumes.")
+        self.parser.add_argument("--spot_price", default=None,
+                                 help="Spot price for each instance")
+        self.parser.add_argument("--custom_vm_params", default=None,
+                                 help="JSON of custom virtual machine options to merge.")
+        self.parser.add_argument("--custom_disk_params", default=None,
+                                 help="JSON of custom data disk options to merge.")
+        self.parser.add_argument("--custom_network_params", default=None,
+                                 help="JSON of custom network interface options to merge.")
+        self.parser.add_argument("--ignore_plan", action="store_true", default=False,
+                                 help="Whether or not to skip passing in plan information.")
+        self.parser.add_argument("--capacity_reservation", default=None,
+                                 help="Capacity reservation group to use.")
 
     def preprocess_args(self, args):
         super(AzureCreateInstancesMethod, self).preprocess_args(args)
@@ -66,7 +81,7 @@ class AzureCreateInstancesMethod(CreateInstancesMethod):
     def callback(self, args):
         super(AzureCreateInstancesMethod, self).callback(args)
 
-    def run_ansible_create(self, args):
+    def run_create_instance(self, args):
         return self.cloud.create_or_update_instance(args, self.extra_vars["ssh_user"])
 
 
@@ -80,10 +95,48 @@ class AzureProvisionInstancesMethod(ProvisionInstancesMethod):
     def callback(self, args):
         super(AzureProvisionInstancesMethod, self).callback(args)
 
-    def update_ansible_vars_with_args(self, args):
-        super(AzureProvisionInstancesMethod, self).update_ansible_vars_with_args(args)
+    def update_extra_vars_with_args(self, args):
+        super(AzureProvisionInstancesMethod, self).update_extra_vars_with_args(args)
         self.extra_vars["device_names"] = self.cloud.get_device_names(args)
         self.extra_vars["mount_points"] = self.cloud.get_mount_points_csv(args)
+
+
+class AzureCreateRootVolumesMethod(CreateRootVolumesMethod):
+    """Subclass for creating root volumes in Azure.
+    """
+    def __init__(self, base_command):
+        super(AzureCreateRootVolumesMethod, self).__init__(base_command)
+        self.create_method = AzureCreateInstancesMethod(base_command)
+
+    def create_master_volume(self, args):
+        # Don't need public IP as we will delete the VM.
+        args.assign_public_ip = False
+        # Update the extra vars with the arguments passed.
+        self.create_method.update_extra_vars_with_args(args)
+        try:
+            self.create_method.run_create_instance(args)
+        except Exception as e:
+            logging.error("Could not create Azure master volume. Failed with error {}.".format(e))
+            host_info = self.cloud.get_host_info(args)
+            self.delete_instance(args, host_info["node_uuid"], False)
+
+        host_info = self.cloud.get_host_info(args)
+        self.delete_instance(args, host_info["node_uuid"], True)
+        return host_info["root_volume"]
+
+    def delete_instance(self, args, node_uuid, skip_os_delete):
+        self.cloud.get_admin().destroy_instance(args.search_pattern, node_uuid, skip_os_delete)
+
+
+class AzureReplaceRootVolumeMethod(ReplaceRootVolumeMethod):
+    def __init__(self, base_command):
+        super(AzureReplaceRootVolumeMethod, self).__init__(base_command)
+
+    def _mount_root_volume(self, host_info, volume):
+        self.cloud.mount_disk(host_info, volume)
+
+    def _host_info_with_current_root_volume(self, args, host_info):
+        return (host_info, host_info.get("root_volume"))
 
 
 class AzureDestroyInstancesMethod(DestroyInstancesMethod):
@@ -257,7 +310,7 @@ class AzureDeleteRootVolumesMethod(DeleteRootVolumesMethod):
         super(AzureDeleteRootVolumesMethod, self).__init__(base_command)
 
     def delete_volumes(self, args):
-        pass
+        self.cloud.delete_volumes(args)
 
 
 class AzurePauseInstancesMethod(AbstractInstancesMethod):
@@ -270,7 +323,18 @@ class AzurePauseInstancesMethod(AbstractInstancesMethod):
                                  help="The ip of the instance to pause.")
 
     def callback(self, args):
-        self.cloud.stop_instance(args)
+        host_info = self.cloud.get_host_info(args)
+        if host_info is None:
+            raise YBOpsRuntimeError("Could not find instance {}".format(args.search_pattern))
+        self.cloud.stop_instance(host_info)
+
+
+class AzureHardRebootInstancesMethod(HardRebootInstancesMethod):
+    def __init__(self, base_command):
+        super(AzureHardRebootInstancesMethod, self).__init__(base_command)
+        self.valid_states = ('running', 'starting', 'stopped', 'stopping', 'deallocated',
+                             'deallocating')
+        self.valid_stoppable_states = ('running', 'stopping')
 
 
 class AzureResumeInstancesMethod(AbstractInstancesMethod):
@@ -279,8 +343,65 @@ class AzureResumeInstancesMethod(AbstractInstancesMethod):
 
     def add_extra_args(self):
         super(AzureResumeInstancesMethod, self).add_extra_args()
+        self.parser.add_argument("--capacity_reservation", default=None,
+                                 help="Capacity reservation group to use.")
         self.parser.add_argument("--node_ip", default=None,
                                  help="The ip of the instance to resume.")
 
     def callback(self, args):
-        self.cloud.start_instance(args, [args.custom_ssh_port])
+        self.update_extra_vars_with_args(args)
+        server_ports = self.get_server_ports_to_check(args)
+        host_info = self.cloud.get_host_info(args)
+        if host_info is None:
+            raise YBOpsRuntimeError("Could not find instance {}".format(args.search_pattern))
+        self.cloud.start_instance(host_info, server_ports, args.capacity_reservation)
+
+
+class AzureChangeInstanceTypeMethod(ChangeInstanceTypeMethod):
+    def __init__(self, base_command):
+        super(AzureChangeInstanceTypeMethod, self).__init__(base_command)
+
+    def add_extra_args(self):
+        super(AzureChangeInstanceTypeMethod, self).add_extra_args()
+        self.parser.add_argument("--capacity_reservation", default=None,
+                                 help="Capacity reservation group to use.")
+
+    def _change_instance_type(self, args, host_info):
+        self.cloud.change_instance_type(host_info, args.instance_type, args.capacity_reservation,
+                                        args.cloud_instance_types)
+
+    def _host_info(self, args, host_info):
+        return host_info
+
+
+class AzureQueryCurrentHostMethod(AbstractMethod):
+    def __init__(self, base_command):
+        super(AzureQueryCurrentHostMethod, self).__init__(base_command, "current-host")
+        # We do not need cloud credentials to query metadata.
+        self.need_validation = False
+
+    def callback(self, args):
+        try:
+            print(json.dumps(self.cloud.get_current_host_info(args)))
+        except YBOpsRuntimeError as ye:
+            print(json.dumps(get_exception_message(ye)))
+
+
+class AzureQueryDeviceNames(AbstractMethod):
+    def __init__(self, base_command):
+        super(AzureQueryDeviceNames, self).__init__(base_command, "device_names")
+
+    def add_extra_args(self):
+        super(AzureQueryDeviceNames, self).add_extra_args()
+        self.parser.add_argument("--volume_type",
+                                 choices=["premium_lrs", "standardssd_lrs", "ultrassd_lrs",
+                                          "premiumv2_lrs"],
+                                 default="premium_lrs", help="Volume type for Azure instances.")
+        self.parser.add_argument("--instance_type",
+                                 required=False,
+                                 help="The instance type to act on")
+        self.parser.add_argument("--num_volumes", type=int, default=0,
+                                 help="number of volumes to mount at the default path (/mnt/d#)")
+
+    def callback(self, args):
+        print(json.dumps(self.cloud.get_device_names(args)))

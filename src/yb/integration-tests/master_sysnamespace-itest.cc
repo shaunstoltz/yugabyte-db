@@ -1,4 +1,4 @@
-// Copyright (c) YugaByte, Inc.
+// Copyright (c) YugabyteDB, Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License"); you may not use this file except
 // in compliance with the License.  You may obtain a copy of the License at
@@ -15,7 +15,7 @@
 
 #include "yb/integration-tests/mini_cluster.h"
 
-#include "yb/common/value.pb.h"
+#include "yb/common/value.messages.h"
 
 #include "yb/master/master_client.proxy.h"
 #include "yb/master/master_ddl.proxy.h"
@@ -95,10 +95,10 @@ class MasterSysNamespaceTest : public YBTest {
     }
   }
 
-  void ValidateColumn(ColumnSchemaPB col_schema, string name, bool is_key, DataType type) {
+  void ValidateColumn(const ColumnSchemaPB& col_schema, string name, bool is_key, DataType type) {
     ASSERT_EQ(name, col_schema.name());
     ASSERT_EQ(is_key, col_schema.is_key());
-    ASSERT_EQ(type, col_schema.type().main());
+    ASSERT_EQ(type, ToLW(col_schema.type().main()));
   }
 
   std::unique_ptr<MiniCluster> cluster_;

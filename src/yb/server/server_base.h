@@ -15,9 +15,9 @@
 // specific language governing permissions and limitations
 // under the License.
 //
-// The following only applies to changes made to this file as part of YugaByte development.
+// The following only applies to changes made to this file as part of YugabyteDB development.
 //
-// Portions Copyright (c) YugaByte, Inc.
+// Portions Copyright (c) YugabyteDB, Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License"); you may not use this file except
 // in compliance with the License.  You may obtain a copy of the License at
@@ -31,6 +31,7 @@
 //
 #pragma once
 
+#include <map>
 #include <memory>
 #include <string>
 
@@ -41,6 +42,7 @@
 #include "yb/server/webserver.h"
 
 #include "yb/util/metrics_fwd.h"
+#include "yb/util/monotime.h"
 #include "yb/util/status_fwd.h"
 #include "yb/util/countdown_latch.h"
 
@@ -53,6 +55,7 @@ class MetricEntity;
 class MetricRegistry;
 class NodeInstancePB;
 class ScopedGLogMetrics;
+class ServerRegistrationPB;
 class Thread;
 class Webserver;
 
@@ -67,7 +70,7 @@ class ServerStatusPB;
 // a YB tablet server and master.
 class RpcServerBase {
  public:
-  const RpcServer *rpc_server() const { return rpc_server_.get(); }
+  const RpcServer* rpc_server() const { return rpc_server_.get(); }
   rpc::Messenger* messenger() const { return messenger_.get(); }
   rpc::ProxyCache& proxy_cache() { return *proxy_cache_; }
 
@@ -110,6 +113,16 @@ class RpcServerBase {
 
   virtual uint32_t GetAutoFlagConfigVersion() const { return 0; }
 
+  // Hook for additional flag validation beyond the standard gflag validator.
+  // Subclasses (e.g. TabletServer) can override to add server-specific checks.
+  // Accepts a map of flag_name -> proposed_value, returns a map of flag_name -> error_message
+  // for any flags that failed validation. An empty return map means all flags are valid.
+  virtual std::map<std::string, std::string> ExtendedFlagValidation(
+      const std::map<std::string, std::string>& flags_to_validate,
+      CoarseTimePoint deadline) {
+    return {};
+  }
+
  protected:
   RpcServerBase(std::string name,
                 const ServerBaseOptions& options,
@@ -118,7 +131,7 @@ class RpcServerBase {
                 const scoped_refptr<Clock>& clock = nullptr);
   virtual ~RpcServerBase();
 
-  virtual Status InitAutoFlags();
+  virtual Status InitFlags(rpc::Messenger* messenger);
   virtual Status Init();
   virtual Status Start();
 
@@ -199,17 +212,39 @@ class RpcAndWebServerBase : public RpcServerBase {
 
   virtual void DisplayGeneralInfoIcons(std::stringstream* output);
 
+  virtual void DisplayMemoryIcons(std::stringstream* output);
+
   virtual Status DisplayRpcIcons(std::stringstream* output);
+
+  // Local calls is an optimization used to directly handle the incoming
+  // TServer rpc calls locally without going through the rpc layer.
+  // This is used when a cql or a pg perform call performs a read/write
+  // call to the local TServer.
+  virtual bool ShouldExportLocalCalls() {
+    return false;
+  }
 
   static void DisplayIconTile(std::stringstream* output, const std::string icon,
                               const std::string caption, const std::string url);
 
   Status Init() override;
+  Status InitFlags(rpc::Messenger* messenger) override;
   Status Start() override;
   void Shutdown() override;
 
   std::unique_ptr<FsManager> fs_manager_;
   std::unique_ptr<Webserver> web_server_;
+
+ protected:
+  // Returns all the AutoFlags associated with this process.
+  virtual Result<std::unordered_set<std::string>> GetAvailableAutoFlagsForServer() const {
+    return std::unordered_set<std::string>();
+  }
+
+  // Returns all the flags associated with this process.
+  virtual Result<std::unordered_set<std::string>> GetFlagsForServer() const {
+    return std::unordered_set<std::string>();
+  }
 
  private:
   void GenerateInstanceID();
@@ -217,6 +252,8 @@ class RpcAndWebServerBase : public RpcServerBase {
   std::string FooterHtml() const;
 
   scoped_refptr<AtomicMillisLag> server_uptime_ms_metric_;
+  scoped_refptr<AtomicGauge<int64_t>> server_hard_limit_;
+  scoped_refptr<AtomicGauge<int64_t>> server_soft_limit_;
 
   DISALLOW_COPY_AND_ASSIGN(RpcAndWebServerBase);
 };
@@ -231,10 +268,16 @@ std::string TEST_RpcAddress(size_t index, Private priv);
 std::string TEST_RpcBindEndpoint(size_t index, uint16_t port);
 
 // Sets up connectivity in test for specified messenger of server with index.
+// Configures messenger to only allow incoming/outgoing RPCs to the same server group using
+// private IP and to rest of servers using public IP. Not allowed RPCs will be rejected by
+// messenger. Also drops already established connections which are not allowed as a result of this
+// function.
 void TEST_SetupConnectivity(rpc::Messenger* messenger, size_t index);
 // Isolates specific messenger, i.e. breaks any of this messengers connections with all other
 // servers.
 void TEST_Isolate(rpc::Messenger* messenger);
+
+std::string MakeServerLogPrefix(const std::string& uuid);
 
 } // namespace server
 } // namespace yb

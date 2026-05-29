@@ -3,9 +3,9 @@
 //  LICENSE file in the root directory of this source tree. An additional grant
 //  of patent rights can be found in the PATENTS file in the same directory.
 //
-// The following only applies to changes made to this file as part of YugaByte development.
+// The following only applies to changes made to this file as part of YugabyteDB development.
 //
-// Portions Copyright (c) YugaByte, Inc.
+// Portions Copyright (c) YugabyteDB, Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License"); you may not use this file except
 // in compliance with the License.  You may obtain a copy of the License at
@@ -36,10 +36,10 @@
 #include "yb/rocksdb/util/coding.h"
 #include "yb/rocksdb/util/file_reader_writer.h"
 #include "yb/rocksdb/util/perf_context_imp.h"
-#include "yb/rocksdb/util/sync_point.h"
 
 #include "yb/util/logging.h"
 #include "yb/util/stats/perf_step_timer.h"
+#include "yb/util/sync_point.h"
 
 using std::unique_ptr;
 
@@ -164,7 +164,7 @@ Status TableCache::DoGetTableReader(
     }
     (*table_reader)->SetDataFileReader(std::move(data_file_reader));
   }
-  TEST_SYNC_POINT("TableCache::GetTableReader:0");
+  DEBUG_ONLY_TEST_SYNC_POINT("TableCache::GetTableReader:0");
   return s;
 }
 
@@ -172,14 +172,14 @@ Status TableCache::FindTable(const EnvOptions& env_options,
                              const InternalKeyComparatorPtr& internal_comparator,
                              const FileDescriptor& fd, Cache::Handle** handle,
                              const QueryId query_id, const bool no_io, bool record_read_stats,
-                             HistogramImpl* file_read_hist, bool skip_filters) {
+                             HistogramImpl* file_read_hist, bool skip_filters,
+                             Statistics* statistics) {
   PERF_TIMER_GUARD(find_table_nanos);
   Status s;
   uint64_t number = fd.GetNumber();
   Slice key = GetSliceForFileNumber(&number);
-  *handle = cache_->Lookup(key, query_id);
-  TEST_SYNC_POINT_CALLBACK("TableCache::FindTable:0",
-      const_cast<bool*>(&no_io));
+  *handle = cache_->Lookup(key, query_id, statistics);
+  DEBUG_ONLY_TEST_SYNC_POINT_CALLBACK("TableCache::FindTable:0", const_cast<bool*>(&no_io));
 
   if (*handle == nullptr) {
     if (no_io) {  // Don't do IO and return a not-found status
@@ -256,7 +256,7 @@ Status TableCache::DoGetTableReaderForIterator(
     bool skip_filters) {
   const bool create_new_table_reader =
       (for_compaction && ioptions_.new_table_reader_for_compaction_inputs);
-  if (create_new_table_reader) {
+  if (create_new_table_reader || options.query_id == kNoCacheQueryId) {
     unique_ptr<TableReader> table_reader_unique_ptr;
     Status s = DoGetTableReader(
         env_options, icomparator, fd, /* sequential mode */ true,
@@ -265,12 +265,14 @@ Status TableCache::DoGetTableReaderForIterator(
       return s;
     }
     trwh->table_reader = table_reader_unique_ptr.release();
+    trwh->created_new = true;
   } else {
     *trwh = VERIFY_RESULT(GetTableReader(
         env_options, icomparator, fd, options.query_id,
-        /* no_io =*/ options.read_tier == kBlockCacheTier, file_read_hist, skip_filters));
+        /* no_io =*/ options.read_tier == kBlockCacheTier, file_read_hist, skip_filters,
+        options.statistics));
+    trwh->created_new = false;
   }
-  trwh->created_new = create_new_table_reader;
   return Status::OK();
 }
 
@@ -285,26 +287,37 @@ Status TableCache::GetTableReaderForIterator(
 }
 
 InternalIterator* TableCache::NewIterator(
-    const ReadOptions& options, TableReaderWithHandle* trwh, const Slice& filter,
-    bool for_compaction, Arena* arena, bool skip_filters) {
+    const ReadOptions& options, TableReaderWithHandle* trwh, Slice filter, bool for_compaction,
+    Arena* arena, bool skip_filters, SkipCorruptDataBlocksUnsafe skip_corrupt_data_blocks_unsafe) {
   PERF_TIMER_GUARD(new_table_iterator_nanos);
-  return DoNewIterator(options, trwh, filter, for_compaction, arena, skip_filters);
+  return DoNewIterator(
+      options, trwh, filter, for_compaction, arena, skip_filters, skip_corrupt_data_blocks_unsafe);
 }
 
-InternalIterator* TableCache::DoNewIterator(
-    const ReadOptions& options, TableReaderWithHandle* trwh, const Slice& filter,
-    bool for_compaction, Arena* arena, bool skip_filters) {
-  RecordTick(ioptions_.statistics, NO_TABLE_CACHE_ITERATORS);
+namespace {
 
-  InternalIterator* result =
-      trwh->table_reader->NewIterator(options, arena, skip_filters);
-
+template <typename IteratorType>
+void RegisterIteratorCleanup(
+    Cache* cache, TableCache::TableReaderWithHandle* trwh, IteratorType* iter) {
   if (trwh->created_new) {
     DCHECK(trwh->handle == nullptr);
-    result->RegisterCleanup(&DeleteTableReader, trwh->table_reader, nullptr);
+    iter->RegisterCleanup(&DeleteTableReader, trwh->table_reader, nullptr);
   } else if (trwh->handle != nullptr) {
-    result->RegisterCleanup(&UnrefEntry, cache_, trwh->handle);
+    iter->RegisterCleanup(&UnrefEntry, cache, trwh->handle);
   }
+}
+
+} // namespace
+
+InternalIterator* TableCache::DoNewIterator(
+    const ReadOptions& options, TableReaderWithHandle* trwh, Slice filter, bool for_compaction,
+    Arena* arena, bool skip_filters, SkipCorruptDataBlocksUnsafe skip_corrupt_data_blocks_unsafe) {
+  RecordTick(ioptions_.statistics, NO_TABLE_CACHE_ITERATORS);
+
+  InternalIterator* result = trwh->table_reader->NewIterator(
+      options, arena, skip_filters, skip_corrupt_data_blocks_unsafe);
+
+  RegisterIteratorCleanup(cache_, trwh, result);
 
   if (for_compaction) {
     trwh->table_reader->SetupForCompaction();
@@ -319,11 +332,30 @@ InternalIterator* TableCache::DoNewIterator(
   return result;
 }
 
+InternalIterator* TableCache::NewIndexIterator(
+    const ReadOptions& options, TableReaderWithHandle* trwh) {
+  RecordTick(ioptions_.statistics, NO_TABLE_CACHE_ITERATORS);
+  InternalIterator* result = trwh->table_reader->NewIndexIterator(options);
+  RegisterIteratorCleanup(cache_, trwh, result);
+  trwh->Release();
+  return result;
+}
+
+DataBlockAwareIndexInternalIterator* TableCache::NewDataBlockAwareIndexIterator(
+    const ReadOptions& options, TableReaderWithHandle* trwh) {
+  RecordTick(ioptions_.statistics, NO_TABLE_CACHE_ITERATORS);
+  DataBlockAwareIndexInternalIterator* result =
+      trwh->table_reader->NewDataBlockAwareIndexIterator(options);
+  RegisterIteratorCleanup(cache_, trwh, result);
+  trwh->Release();
+  return result;
+}
+
 InternalIterator* TableCache::NewIterator(
     const ReadOptions& options, const EnvOptions& env_options,
-    const InternalKeyComparatorPtr& icomparator, const FileDescriptor& fd, const Slice& filter,
-    TableReader** table_reader_ptr, HistogramImpl* file_read_hist,
-    bool for_compaction, Arena* arena, bool skip_filters) {
+    const InternalKeyComparatorPtr& icomparator, const FileDescriptor& fd, Slice filter,
+    TableReader** table_reader_ptr, HistogramImpl* file_read_hist, bool for_compaction,
+    Arena* arena, bool skip_filters, SkipCorruptDataBlocksUnsafe skip_corrupt_data_blocks_unsafe) {
   PERF_TIMER_GUARD(new_table_iterator_nanos);
 
   if (table_reader_ptr != nullptr) {
@@ -342,7 +374,7 @@ InternalIterator* TableCache::NewIterator(
   }
 
   InternalIterator* result = DoNewIterator(
-      options, &trwh, filter, for_compaction, arena, skip_filters);
+      options, &trwh, filter, for_compaction, arena, skip_filters, skip_corrupt_data_blocks_unsafe);
 
   return result;
 }
@@ -431,13 +463,14 @@ Status TableCache::Get(const ReadOptions& options,
 yb::Result<TableCache::TableReaderWithHandle> TableCache::GetTableReader(
     const EnvOptions& env_options, const InternalKeyComparatorPtr& internal_comparator,
     const FileDescriptor& fd, const QueryId query_id, const bool no_io,
-    HistogramImpl* file_read_hist, const bool skip_filters) {
+    HistogramImpl* file_read_hist, const bool skip_filters,
+    Statistics* statistics) {
   TableReaderWithHandle trwh;
   trwh.table_reader = fd.table_reader;
   if (trwh.table_reader == nullptr) {
     RETURN_NOT_OK(FindTable(
         env_options, internal_comparator, fd, &trwh.handle, query_id, no_io,
-        /* record_read_stats =*/ true, file_read_hist, skip_filters));
+        /* record_read_stats =*/ true, file_read_hist, skip_filters, statistics));
     trwh.table_reader = GetTableReaderFromHandle(trwh.handle);
     trwh.cache = cache_;
   }

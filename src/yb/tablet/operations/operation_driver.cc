@@ -15,9 +15,9 @@
 // specific language governing permissions and limitations
 // under the License.
 //
-// The following only applies to changes made to this file as part of YugaByte development.
+// The following only applies to changes made to this file as part of YugabyteDB development.
 //
-// Portions Copyright (c) YugaByte, Inc.
+// Portions Copyright (c) YugabyteDB, Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License"); you may not use this file except
 // in compliance with the License.  You may obtain a copy of the License at
@@ -94,11 +94,11 @@ OperationDriver::OperationDriver(OperationTracker *operation_tracker,
     : operation_tracker_(operation_tracker),
       consensus_(consensus),
       preparer_(preparer),
-      trace_(Trace::NewTraceForParent(Trace::CurrentTrace())),
+      trace_(Trace::MaybeGetNewTraceForParent(Trace::CurrentTrace())),
+      wait_state_(ash::WaitStateInfo::CurrentWaitState()),
       start_time_(MonoTime::Now()),
       replication_state_(NOT_REPLICATING),
-      prepare_state_(NOT_PREPARED),
-      table_type_(table_type) {
+      prepare_state_(NOT_PREPARED) {
   DCHECK(IsAcceptableAtomicImpl(op_id_copy_));
 }
 
@@ -153,7 +153,7 @@ OperationType OperationDriver::operation_type() const {
 }
 
 string OperationDriver::ToString() const {
-  std::lock_guard<simple_spinlock> lock(lock_);
+  std::lock_guard lock(lock_);
   return ToStringUnlocked();
 }
 
@@ -173,8 +173,11 @@ void OperationDriver::ExecuteAsync() {
   TRACE_EVENT_FLOW_BEGIN0("operation", "ExecuteAsync", this);
   ADOPT_TRACE(trace());
   TRACE_FUNC();
+  ADOPT_WAIT_STATE(wait_state());
+  ASH_ENABLE_CONCURRENT_UPDATES_FOR(wait_state());
+  SCOPED_WAIT_STATUS(OnCpu_Active);
 
-  auto delay = GetAtomicFlag(&FLAGS_TEST_delay_execute_async_ms);
+  auto delay = FLAGS_TEST_delay_execute_async_ms;
   if (delay != 0 && operation_type() == OperationType::kWrite) {
     auto tablet_result = operation_->tablet_safe();
     if (!tablet_result.ok()) {
@@ -192,7 +195,7 @@ void OperationDriver::ExecuteAsync() {
   auto s = preparer_->Submit(this);
 
   if (operation_) {
-    operation_->SubmittedToPreparer();
+    operation_->ResetPreparingToken();
   }
 
   if (!s.ok()) {
@@ -202,10 +205,13 @@ void OperationDriver::ExecuteAsync() {
 
 Status OperationDriver::AddedToLeader(const OpId& op_id, const OpId& committed_op_id) {
   ADOPT_TRACE(trace());
+  ADOPT_WAIT_STATE(wait_state());
+  SCOPED_WAIT_STATUS(OnCpu_Active);
   CHECK(!GetOpId().valid());
   op_id_copy_.store(op_id, boost::memory_order_release);
 
   RETURN_NOT_OK(operation_->AddedToLeader(op_id, committed_op_id));
+  SET_WAIT_STATUS(Raft_WaitingForReplication);
 
   StartOperation();
   return Status::OK();
@@ -232,6 +238,11 @@ bool OperationDriver::StartOperation() {
 
 Status OperationDriver::PrepareAndStart(IsLeaderSide is_leader_side) {
   ADOPT_TRACE(trace());
+  TRACE_FUNC();
+  ADOPT_WAIT_STATE(wait_state());
+  ASH_ENABLE_CONCURRENT_UPDATES_FOR(wait_state());
+  // ASH: Expect raft to update the wait state asynchronously.
+  SCOPED_WAIT_STATUS(OnCpu_Active);
   TRACE_EVENT1("operation", "PrepareAndStart", "operation", this);
   VLOG_WITH_PREFIX(4) << "PrepareAndStart()";
   // Actually prepare and start the operation.
@@ -246,7 +257,7 @@ Status OperationDriver::PrepareAndStart(IsLeaderSide is_leader_side) {
   // phase.
   ReplicationState repl_state_copy;
   {
-    std::lock_guard<simple_spinlock> lock(lock_);
+    std::lock_guard lock(lock_);
     CHECK_EQ(prepare_state_, NOT_PREPARED);
     repl_state_copy = replication_state_;
   }
@@ -260,7 +271,7 @@ Status OperationDriver::PrepareAndStart(IsLeaderSide is_leader_side) {
   }
 
   {
-    std::lock_guard<simple_spinlock> lock(lock_);
+    std::lock_guard lock(lock_);
     // No one should have modified prepare_state_ since we've read it under the lock a few lines
     // above, because PrepareAndStart should only run once per operation.
     CHECK_EQ(prepare_state_, NOT_PREPARED);
@@ -283,13 +294,15 @@ void OperationDriver::HandleFailure(const Status& status) {
   ReplicationState repl_state_copy;
 
   {
-    std::lock_guard<simple_spinlock> lock(lock_);
+    std::lock_guard lock(lock_);
     repl_state_copy = replication_state_;
   }
 
   VLOG_WITH_PREFIX(2) << "Failed operation: " << status;
   CHECK(!status.ok());
   ADOPT_TRACE(trace());
+  ADOPT_WAIT_STATE(wait_state());
+  SCOPED_WAIT_STATUS(OnCpu_Active);
   TRACE("HandleFailure($0)", status.ToString());
 
   switch (repl_state_copy) {
@@ -314,11 +327,12 @@ void OperationDriver::HandleFailure(const Status& status) {
 
 void OperationDriver::ReplicationFinished(
     const Status& status, int64_t leader_term, OpIds* applied_op_ids) {
+  TRACE_BEGIN_END_FUNC();
   LOG_IF(DFATAL, status.ok() && !GetOpId().valid()) << "Invalid op id after replication";
 
   PrepareState prepare_state_copy;
   {
-    std::lock_guard<simple_spinlock> lock(lock_);
+    std::lock_guard lock(lock_);
     if (replication_state_ == REPLICATION_FAILED) {
       LOG_IF(DFATAL, status.ok()) << "Successfully replicated operation that was previously failed";
       return;
@@ -338,15 +352,14 @@ void OperationDriver::ReplicationFinished(
   // the tablet.
   if (prepare_state_copy != PrepareState::PREPARED) {
     LOG(DFATAL) << "Replicating an operation that has not been prepared: " << AsString(this);
-
-    LOG(ERROR) << "Attempting to wait for the operation to be prepared";
+    LOG(WARNING) << "Attempting to wait for the operation to be prepared";
 
     // This case should never happen, but if it happens we are trying to survive.
     for (;;) {
       std::this_thread::sleep_for(1ms);
       PrepareState prepare_state;
       {
-        std::lock_guard<simple_spinlock> lock(lock_);
+        std::lock_guard lock(lock_);
         prepare_state = prepare_state_;
         if (prepare_state == PrepareState::PREPARED) {
           break;
@@ -370,7 +383,7 @@ void OperationDriver::TEST_Abort(const Status& status) {
 
   ReplicationState repl_state_copy;
   {
-    std::lock_guard<simple_spinlock> lock(lock_);
+    std::lock_guard lock(lock_);
     repl_state_copy = replication_state_;
   }
 
@@ -387,10 +400,12 @@ void OperationDriver::TEST_Abort(const Status& status) {
 void OperationDriver::ApplyTask(int64_t leader_term, OpIds* applied_op_ids) {
   TRACE_EVENT_FLOW_END0("operation", "ApplyTask", this);
   ADOPT_TRACE(trace());
+  ADOPT_WAIT_STATE(wait_state());
+  SCOPED_WAIT_STATUS(OnCpu_Active);
 
 #ifndef NDEBUG
   {
-    std::lock_guard<simple_spinlock> lock(lock_);
+    std::lock_guard lock(lock_);
     DCHECK_EQ(replication_state_, REPLICATED);
     DCHECK_EQ(prepare_state_, PREPARED);
   }
@@ -401,6 +416,7 @@ void OperationDriver::ApplyTask(int64_t leader_term, OpIds* applied_op_ids) {
   scoped_refptr<OperationDriver> ref(this);
 
   {
+    SCOPED_WAIT_STATUS(Raft_ApplyingEdits);
     auto status = operation_->Replicated(leader_term, WasPending::kTrue);
     LOG_IF_WITH_PREFIX(FATAL, !status.ok())
         << "Apply failed: " << status
@@ -448,7 +464,7 @@ std::string OperationDriver::LogPrefix() const {
   OperationType operation_type;
 
   {
-    std::lock_guard<simple_spinlock> lock(lock_);
+    std::lock_guard lock(lock_);
     repl_state_copy = replication_state_;
     prep_state_copy = prepare_state_;
     ts_string = operation_ && operation_->has_hybrid_time()
@@ -469,10 +485,6 @@ std::string OperationDriver::LogPrefix() const {
 int64_t OperationDriver::SpaceUsed() {
   if (!operation_) {
     return 0;
-  }
-  auto consensus_round = operation_->consensus_round();
-  if (consensus_round) {
-    return consensus_round->replicate_msg()->SpaceUsedLong();
   }
   return operation()->request()->SpaceUsedLong();
 }

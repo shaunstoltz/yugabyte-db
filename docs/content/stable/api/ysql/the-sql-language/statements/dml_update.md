@@ -4,9 +4,11 @@ headerTitle: UPDATE
 linkTitle: UPDATE
 description: Use UPDATE to modify values of specified columns in all rows that meet certain conditions. When conditions are not provided in WHERE clause, all rows update.
 menu:
-  stable:
+  stable_api:
     identifier: dml_update
     parent: statements
+aliases:
+  - /stable/api/ysql/commands/dml_update/
 type: docs
 ---
 
@@ -16,29 +18,13 @@ Use the `UPDATE` statement to modify the values of specified columns in all rows
 
 ## Syntax
 
-<ul class="nav nav-tabs nav-tabs-yb">
-  <li >
-    <a href="#grammar" class="nav-link active" id="grammar-tab" data-toggle="tab" role="tab" aria-controls="grammar" aria-selected="true">
-      <img src="/icons/file-lines.svg" alt="Grammar Icon">
-      Grammar
-    </a>
-  </li>
-  <li>
-    <a href="#diagram" class="nav-link" id="diagram-tab" data-toggle="tab" role="tab" aria-controls="diagram" aria-selected="false">
-      <img src="/icons/diagram.svg" alt="Diagram Icon">
-      Diagram
-    </a>
-  </li>
-</ul>
-
-<div class="tab-content">
-  <div id="grammar" class="tab-pane fade show active" role="tabpanel" aria-labelledby="grammar-tab">
-  {{% includeMarkdown "../../syntax_resources/the-sql-language/statements/update,returning_clause,update_item,column_values,column_names.grammar.md" %}}
-  </div>
-  <div id="diagram" class="tab-pane fade" role="tabpanel" aria-labelledby="diagram-tab">
-  {{% includeMarkdown "../../syntax_resources/the-sql-language/statements/update,returning_clause,update_item,column_values,column_names.diagram.md" %}}
-  </div>
-</div>
+{{%ebnf%}}
+  update,
+  returning_clause,
+  update_item,
+  column_values,
+  column_names
+{{%/ebnf%}}
 
 {{< note title="Table inheritance is not yet supported" >}}
 The [table_expr](../../../syntax_resources/grammar_diagrams/#table-expr) rule specifies syntax that is useful only when at least one other table inherits one of the tables that the `truncate` statement lists explicitly. See [this note](../ddl_alter_table#table-expr-note) for more detail. Until inheritance is supported, use a bare [table_name](../../../syntax_resources/grammar_diagrams/#table-name).
@@ -71,6 +57,12 @@ Specify the column in the table to be updated.
 ### *expression*
 
 Specify the value to be assigned to a column. When the expression is referencing a column, the old value of this column is used to evaluate.
+
+### *from_item*
+
+A table expression that enables referencing columns from additional tables within the `WHERE` clause.
+This follows the identical syntax conventions as the `FROM` clause in a `SELECT` statement, including the ability to define table aliases.
+The target table should not be included as a `from_item` unless performing a self-join operation, in which case the target table must appear with an alias in the `from_item` list.
 
 ### *output_expression*
 

@@ -1,4 +1,4 @@
-// Copyright (c) YugaByte, Inc.
+// Copyright (c) YugabyteDB, Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License"); you may not use this file except
 // in compliance with the License.  You may obtain a copy of the License at
@@ -18,11 +18,13 @@ import org.junit.Test;
 import org.junit.runner.RunWith;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
-import org.yb.util.YBTestRunnerNonTsanOnly;
+import org.yb.YBTestRunner;
+import org.yb.util.SkipOnTSAN;
 
 // Runs the pg_regress test suite on YB code.
-@RunWith(value=YBTestRunnerNonTsanOnly.class)
-public class TestPgRegressIndex extends BasePgSQLTest {
+@SkipOnTSAN
+@RunWith(value=YBTestRunner.class)
+public class TestPgRegressIndex extends BasePgRegressTest {
   private static final Logger LOG = LoggerFactory.getLogger(TestPgRegressIndex.class);
 
   @Override
@@ -31,14 +33,22 @@ public class TestPgRegressIndex extends BasePgSQLTest {
   }
 
   @Override
-  protected Map<String, String> getMasterFlags() {
-    Map<String, String> flagMap = super.getMasterFlags();
-    flagMap.put("TEST_ysql_suppress_ybctid_corruption_details", "true");
+  protected Map<String, String> getTServerFlags() {
+    Map<String, String> flagMap = super.getTServerFlags();
+    // TODO (#19975): Enable read committed isolation
+    flagMap.put("yb_enable_read_committed_isolation", "false");
+    // Disable auto analyze because it aborts the SQL snippet:
+    // force_cache_refresh which increments catalog version explictly.
+    flagMap.put("ysql_enable_auto_analyze", "false");
+    flagMap.put("enable_object_locking_for_table_locks", "false");
     return flagMap;
   }
 
   @Test
-  public void testPgRegressIndex() throws Exception {
-    runPgRegressTest("yb_index_serial_schedule");
+  public void schedule() throws Exception {
+    // (DB-13032) This test touches system tables, so enable stickiness for
+    // superuser connections when Connection Manager is enabled.
+    enableStickySuperuserConnsAndRestartCluster();
+    runPgRegressTest("yb_index_schedule");
   }
 }

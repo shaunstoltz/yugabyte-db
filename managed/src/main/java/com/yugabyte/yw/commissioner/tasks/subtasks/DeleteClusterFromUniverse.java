@@ -1,5 +1,5 @@
 /*
- * Copyright 2019 YugaByte, Inc. and Contributors
+ * Copyright 2019 YugabyteDB, Inc. and Contributors
  *
  * Licensed under the Polyform Free Trial License 1.0.0 (the "License"); you
  * may not use this file except in compliance with the License. You
@@ -41,7 +41,7 @@ public class DeleteClusterFromUniverse extends UniverseTaskBase {
   public String getName() {
     return super.getName()
         + "'("
-        + taskParams().universeUUID
+        + taskParams().getUniverseUUID()
         + " "
         + taskParams().clusterUUID
         + ")'";

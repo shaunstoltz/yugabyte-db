@@ -1,4 +1,4 @@
-// Copyright (c) YugaByte, Inc.
+// Copyright (c) YugabyteDB, Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License"); you may not use this file except
 // in compliance with the License.  You may obtain a copy of the License at
@@ -13,20 +13,21 @@
 
 #include "yb/master/permissions_manager.h"
 
-#include <mutex>
-
 #include "yb/gutil/casts.h"
 #include "yb/gutil/strings/substitute.h"
 
 #include "yb/master/catalog_manager-internal.h"
+#include "yb/master/catalog_manager.h"
 #include "yb/master/master_dcl.pb.h"
 #include "yb/master/master_ddl.pb.h"
-#include "yb/master/scoped_leader_shared_lock-internal.h"
+#include "yb/master/master_defaults.h"
+#include "yb/master/master_util.h"
 #include "yb/master/sys_catalog.h"
 #include "yb/master/sys_catalog_constants.h"
 
+#include "yb/rpc/rpc_context.h"
+
 #include "yb/util/crypt.h"
-#include "yb/util/shared_lock.h"
 #include "yb/util/status_format.h"
 #include "yb/util/status_log.h"
 #include "yb/util/trace.h"
@@ -40,6 +41,9 @@ using yb::util::bcrypt_hashpw;
 using strings::Substitute;
 
 DECLARE_bool(ycql_cache_login_info);
+
+DEFINE_RUNTIME_AUTO_bool(ycql_allow_cassandra_drop, kLocalPersisted, false, true,
+    "When true, stops the regeneration of the cassandra user on restart of the cluster.");
 
 // TODO: remove direct references to member fields in CatalogManager from here.
 
@@ -76,21 +80,48 @@ class ScopedMutation {
 
 }  // anonymous namespace
 
-
 PermissionsManager::PermissionsManager(CatalogManager* catalog_manager)
     : security_config_(nullptr),
-      catalog_manager_(catalog_manager) {
+      catalog_manager_(catalog_manager),
+      cm_mutex_(catalog_manager_->mutex_) {
   CHECK_NOTNULL(catalog_manager);
 }
 
 Status PermissionsManager::PrepareDefaultRoles(int64_t term) {
   LockGuard lock(mutex_);
-  if (FindPtrOrNull(roles_map_, kDefaultCassandraUsername) != nullptr) {
+
+  bool userExists = (FindPtrOrNull(roles_map_, kDefaultCassandraUsername) != nullptr);
+  if (FLAGS_ycql_allow_cassandra_drop) {
+    bool userAlreadyCreated =
+        security_config_->LockForRead()->pb.security_config().cassandra_user_created();
+
+    if (userAlreadyCreated) {
+      LOG(INFO) << "Role " << kDefaultCassandraUsername
+                << " already created, skipping initialization."
+                << " User cassandra exists: " << userExists;
+      return Status::OK();
+    }
+
+    if (userExists) {
+      // If the user exists currently in the db, mark that the cassandra user was created
+      // Used during cluster upgrade
+      auto l = CHECK_NOTNULL(security_config_.get())->LockForWrite();
+      l.mutable_data()->pb.mutable_security_config()->set_cassandra_user_created(true);
+      RETURN_NOT_OK(catalog_manager_->sys_catalog_->Upsert(term, security_config_));
+      l.Commit();
+      LOG(INFO) << "Role " << kDefaultCassandraUsername
+                << " was already created, marked it as created in config";
+      return Status::OK();
+    }
+  }
+
+  if (userExists) {
     LOG(INFO) << "Role " << kDefaultCassandraUsername
-              << " already created, skipping initialization";
+              << " was already created, skipping initialization";
     return Status::OK();
   }
 
+  // This must either be a new cluster or a cluster upgrading with a deleted cassandra user
   char hash[kBcryptHashSize];
   // TODO: refactor interface to be more c++ like...
   int ret = bcrypt_hashpw(kDefaultCassandraPassword, hash);
@@ -102,6 +133,12 @@ Status PermissionsManager::PrepareDefaultRoles(int64_t term) {
   Status s = CreateRoleUnlocked(kDefaultCassandraUsername, std::string(hash, kBcryptHashSize),
                                 true, true, term, false /* Don't increment the roles version */);
   if (PREDICT_TRUE(s.ok())) {
+    if (FLAGS_ycql_allow_cassandra_drop) {
+      auto l = CHECK_NOTNULL(security_config_.get())->LockForWrite();
+      l.mutable_data()->pb.mutable_security_config()->set_cassandra_user_created(true);
+      RETURN_NOT_OK(catalog_manager_->sys_catalog_->Upsert(term, security_config_));
+      l.Commit();
+    }
     LOG(INFO) << "Created role: " << kDefaultCassandraUsername;
   }
 
@@ -414,7 +451,7 @@ Status PermissionsManager::AlterRole(
 
     s = catalog_manager_->sys_catalog_->Upsert(catalog_manager_->leader_ready_term(), role);
     if (!s.ok()) {
-      LOG(ERROR) << "Unable to alter role " << req->name() << ": " << s;
+      LOG(WARNING) << "Unable to alter role " << req->name() << ": " << s;
       return s;
     }
     l.Commit();
@@ -480,8 +517,8 @@ Status PermissionsManager::DeleteRole(
     // Update sys-catalog with the new member_of list for this role.
     s = catalog_manager_->sys_catalog_->Upsert(catalog_manager_->leader_ready_term(), role);
     if (!s.ok()) {
-      LOG(ERROR) << "Unable to remove role " << req->name()
-                 << " from member_of list for role " << role_name;
+      LOG(WARNING) << "Unable to remove role " << req->name()
+                   << " from member_of list for role " << role_name;
       role->mutable_metadata()->AbortMutation();
     } else {
       role->mutable_metadata()->CommitMutation();
@@ -767,7 +804,7 @@ Status PermissionsManager::GetPermissions(
     permissions_cache = permissions_cache_;
   }
 
-  boost::optional<uint64_t> request_version;
+  std::optional<uint64_t> request_version;
   if (req->has_if_version_greater_than()) {
     request_version = req->if_version_greater_than();
   }

@@ -1,7 +1,7 @@
 /*
  * Created on Thu Feb 10 2022
  *
- * Copyright 2021 YugaByte, Inc. and Contributors
+ * Copyright 2021 YugabyteDB, Inc. and Contributors
  * Licensed under the Polyform Free Trial License 1.0.0 (the "License")
  * You may not use this file except in compliance with the License. You may obtain a copy of the License at
  * http://github.com/YugaByte/yugabyte-db/blob/master/licenses/POLYFORM-FREE-TRIAL-LICENSE-1.0.0.txt
@@ -11,14 +11,17 @@ import axios from 'axios';
 import { Dictionary, groupBy } from 'lodash';
 import { IBackup, Keyspace_Table, RESTORE_ACTION_TYPE, TIME_RANGE_STATE } from '..';
 import { ROOT_URL } from '../../../config';
+import { convertToISODateString } from '../../../redesign/helpers/DateUtils';
 import { MILLISECONDS_IN } from '../scheduled/ScheduledBackupUtils';
+
 import {
   BACKUP_API_TYPES,
   Backup_Options_Type,
   ICommonBackupInfo,
-  IStorageConfig,
+  CustomerConfig,
   ITable,
-  ThrottleParameters
+  ThrottleParameters,
+  IBackupEditParams
 } from './IBackup';
 
 export function getBackupsList(
@@ -59,8 +62,8 @@ export function getBackupsList(
     payload.filter['states'] = [states[0].value];
   }
   if (timeRange.startTime && timeRange.endTime) {
-    payload.filter['dateRangeStart'] = timeRange.startTime.toISOString();
-    payload.filter['dateRangeEnd'] = timeRange.endTime.toISOString();
+    payload.filter['dateRangeStart'] = convertToISODateString(timeRange.startTime);
+    payload.filter['dateRangeEnd'] = convertToISODateString(timeRange.endTime);
   }
 
   if (Array.isArray(moreFilters) && moreFilters?.length > 0) {
@@ -128,19 +131,6 @@ export function getKMSConfigs() {
   return axios.get(requestUrl).then((resp) => resp.data);
 }
 
-export function createBackup(values: Record<string, any>, isIncrementalBackup = false) {
-  const cUUID = localStorage.getItem('customerId');
-  const requestUrl = `${ROOT_URL}/customers/${cUUID}/backups`;
-
-  const payload = prepareBackupCreationPayload(values, cUUID);
-
-  if (isIncrementalBackup) {
-    payload['baseBackupUUID'] = values['baseBackupUUID'];
-  }
-
-  return axios.post(requestUrl, payload);
-}
-
 export const prepareBackupCreationPayload = (values: Record<string, any>, cUUID: string | null) => {
   const backup_type = values['api_type'].value;
 
@@ -150,7 +140,10 @@ export const prepareBackupCreationPayload = (values: Record<string, any>, cUUID:
     parallelism: values['parallel_threads'],
     sse: values['storage_config'].name === 'S3',
     storageConfigUUID: values['storage_config'].value,
-    universeUUID: values['universeUUID']
+    universeUUID: values['universeUUID'],
+    tableByTableBackup: values['isTableByTableBackup'],
+    useTablespaces: values['useTablespaces'],
+    useRoles: values['useRoles']
   };
 
   let dbMap: Dictionary<any> = [];
@@ -203,7 +196,28 @@ export const prepareBackupCreationPayload = (values: Record<string, any>, cUUID:
   return payload;
 };
 
-export const assignStorageConfig = (backup: IBackup, storageConfig: IStorageConfig) => {
+export function createBackup(values: Record<string, any>, isIncrementalBackup = false) {
+  const cUUID = localStorage.getItem('customerId');
+  const requestUrl = `${ROOT_URL}/customers/${cUUID}/backups`;
+
+  const payload = prepareBackupCreationPayload(values, cUUID);
+
+  if (isIncrementalBackup) {
+    payload['baseBackupUUID'] = values['baseBackupUUID'];
+  }
+
+  return axios.post(requestUrl, payload);
+}
+
+export function editBackup(values: IBackupEditParams) {
+  const cUUID = localStorage.getItem('customerId');
+  const backupUUID = values.backupUUID;
+  const requestUrl = `${ROOT_URL}/customers/${cUUID}/backups/${backupUUID}`;
+
+  return axios.put(requestUrl, values);
+}
+
+export const assignStorageConfig = (backup: IBackup, storageConfig: CustomerConfig) => {
   const cUUID = localStorage.getItem('customerId');
   const requestUrl = `${ROOT_URL}/customers/${cUUID}/backups/${backup.commonBackupInfo.backupUUID}`;
   return axios.put(requestUrl, {
@@ -217,21 +231,26 @@ export const fetchThrottleParameters = (universeUUID: string) => {
   return axios.get<ThrottleParameters>(requestUrl);
 };
 
-export const setThrottleParameters = (universeUUID: string, values: ThrottleParameters) => {
+export const setThrottleParameters = (
+  universeUUID: string,
+  values: ThrottleParameters['throttleParamsMap']
+) => {
   const cUUID = localStorage.getItem('customerId');
   const payload = {
-    maxConcurrentUploads: values.max_concurrent_uploads,
-    perUploadNumObjects: values.per_upload_num_objects,
-    maxConcurrentDownloads: values.max_concurrent_downloads,
-    perDownloadNumObjects: values.per_download_num_objects
+    maxConcurrentUploads: values.max_concurrent_uploads.currentValue,
+    perUploadNumObjects: values.per_upload_num_objects.currentValue,
+    maxConcurrentDownloads: values.max_concurrent_downloads.currentValue,
+    perDownloadNumObjects: values.per_download_num_objects.currentValue,
+    diskReadBytesPerSecond: values.disk_read_bytes_per_sec.currentValue,
+    diskWriteBytesPerSecond: values.disk_write_bytes_per_sec.currentValue
   };
-  const requestUrl = `${ROOT_URL}/customers/${cUUID}/universes/${universeUUID}/ybc_throttle_params`;
+  const requestUrl = `${ROOT_URL}/customers/${cUUID}/universes/${universeUUID}/ybc_throttle_params_async`;
   return axios.post<ThrottleParameters>(requestUrl, payload);
 };
 
 export const resetThrottleParameterToDefaults = (universeUUID: string) => {
   const cUUID = localStorage.getItem('customerId');
-  const requestUrl = `${ROOT_URL}/customers/${cUUID}/universes/${universeUUID}/ybc_throttle_params`;
+  const requestUrl = `${ROOT_URL}/customers/${cUUID}/universes/${universeUUID}/ybc_throttle_params_async`;
   return axios.post(requestUrl, {
     resetDefaults: true
   });
@@ -255,7 +274,9 @@ export const addIncrementalBackup = (backup: IBackup) => {
     storageConfigUUID: backup.commonBackupInfo.storageConfigUUID,
     universeUUID: backup.universeUUID,
     baseBackupUUID: backup.commonBackupInfo.baseBackupUUID,
-    keyspaceTableList: backup.commonBackupInfo.responseList
+    keyspaceTableList: backup.commonBackupInfo.responseList,
+    tableByTableBackup: backup.commonBackupInfo.tableByTableBackup,
+    useTablespaces: backup.useTablespaces
   };
 
   return axios.post(requestUrl, payload);
@@ -272,3 +293,9 @@ export function deleteIncrementalBackup(incrementalBackup: ICommonBackupInfo) {
     ]
   });
 }
+
+export const fetchStorageConfigs = () => {
+  const cUUID = localStorage.getItem('customerId');
+  const requestUrl = `${ROOT_URL}/customers/${cUUID}/configs`;
+  return axios.get<CustomerConfig[]>(requestUrl);
+};

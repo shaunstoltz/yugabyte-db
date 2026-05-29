@@ -17,6 +17,7 @@ class KubernetesClient:
         self.pod_name = args.k8s_config["podName"]
         self.namespace = args.k8s_config["namespace"]
         self.is_master = args.is_master
+        self.container = "yb-master" if self.is_master else "yb-tserver"
         self.env_config = os.environ.copy()
         self.env_config["KUBECONFIG"] = args.k8s_config["KUBECONFIG"]
 
@@ -25,12 +26,13 @@ class KubernetesClient:
         if isinstance(cmd, str):
             command = [cmd]
         return ['kubectl', 'exec', '-n', self.namespace, '-c',
-                'yb-master' if self.is_master else 'yb-tserver', self.pod_name, '--'] + command
+                self.container, self.pod_name, '--'] + command
 
     def get_file(self, source_file_path, target_local_file_path):
         cmd = [
             'kubectl',
             'cp',
+            '-c', self.container,
             self.namespace + "/" + self.pod_name + ":" + source_file_path,
             target_local_file_path]
         return subprocess.call(cmd, env=self.env_config)
@@ -39,6 +41,7 @@ class KubernetesClient:
         cmd = [
             'kubectl',
             'cp',
+            '-c', self.container,
             source_file_path,
             self.namespace + "/" + self.pod_name + ":" + target_file_path]
         return subprocess.call(cmd, env=self.env_config)
@@ -47,11 +50,11 @@ class KubernetesClient:
         cmd = self.wrap_command(cmd)
         return subprocess.call(cmd, stdout=stdout, env=self.env_config)
 
-    def exec_command(self, cmd):
+    def check_exec_command(self, cmd):
         cmd = self.wrap_command(cmd)
         return subprocess.check_output(cmd, env=self.env_config).decode()
 
-    def exec_script(self, local_script_name, params):
+    def check_exec_script(self, local_script_name, params):
         '''
         Function to execute a local bash script on the k8s cluster.
         Parameters:
@@ -69,7 +72,7 @@ class KubernetesClient:
 
         # Cannot use self.exec_command() because it needs '/bin/bash' and '-c' before the command
         wrapped_command = ['kubectl', 'exec', '-n', self.namespace, '-c',
-                           'yb-master' if self.is_master else 'yb-tserver', self.pod_name, '--',
+                           self.container, self.pod_name, '--',
                            '/bin/bash', '-c', command]
 
         output = subprocess.check_output(wrapped_command, env=self.env_config).decode()

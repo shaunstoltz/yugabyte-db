@@ -1,4 +1,4 @@
-// Copyright (c) YugaByte, Inc.
+// Copyright (c) YugabyteDB, Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License"); you may not use this file except
 // in compliance with the License.  You may obtain a copy of the License at
@@ -13,17 +13,18 @@
 
 #pragma once
 
-#include <boost/optional/optional.hpp>
-
 #include "yb/client/client_fwd.h"
 #include "yb/client/yb_table_name.h"
 
 #include "yb/common/constants.h"
 #include "yb/common/common_fwd.h"
 
+#include "yb/common/transaction.h"
+#include "yb/dockv/dockv_fwd.h"
+
 #include "yb/gutil/macros.h"
 
-#include "yb/master/master_fwd.h"
+#include "yb/master/master_ddl.pb.h"
 
 #include "yb/util/monotime.h"
 
@@ -43,6 +44,9 @@ class YBTableCreator {
   // Sets the type of the table.
   YBTableCreator& table_type(YBTableType table_type);
 
+  // In special cases sets the internal type of the table.
+  YBTableCreator& internal_table_type(master::InternalTableType internal_type);
+
   // Sets the name of the role creating this table.
   YBTableCreator& creator_role_name(const RoleName& creator_role_name);
 
@@ -52,7 +56,7 @@ class YBTableCreator {
   YBTableCreator& is_pg_shared_table();
 
   // Sets the partition hash schema.
-  YBTableCreator& hash_schema(YBHashSchema hash_schema);
+  YBTableCreator& hash_schema(dockv::YBHashSchema hash_schema);
 
   // Number of tablets that should be used for this table. If tablet_count is not given, YBClient
   // will calculate this value (num_shards_per_tserver * num_of_tservers).
@@ -71,7 +75,15 @@ class YBTableCreator {
 
   YBTableCreator& is_matview(bool is_matview);
 
-  YBTableCreator& matview_pg_table_id(const std::string& matview_pg_table_id);
+  YBTableCreator& pg_table_id(const std::string& pg_table_id);
+
+  YBTableCreator& old_rewrite_table_id(const std::string& old_rewrite_table_id);
+
+  YBTableCreator& is_truncate(bool is_truncate);
+
+  YBTableCreator& xcluster_source_table_id(const TableId& source_table_id);
+
+  YBTableCreator& xcluster_backfill_hybrid_time(uint64_t backfill_hybrid_time);
 
   // Sets the schema with which to create the table. Must remain valid for
   // the lifetime of the builder. Required.
@@ -80,8 +92,12 @@ class YBTableCreator {
   // The creation of this table is dependent upon the success of this higher-level transaction.
   YBTableCreator& part_of_transaction(const TransactionMetadata* txn);
 
+  // The creation of this table is happening within this sub-transaction. If the sub-transaction is
+  // rolled back, this creation will be rolled back too.
+  YBTableCreator& part_of_sub_transaction(uint32_t sub_txn_id);
+
   // Adds a partitions to the table.
-  YBTableCreator& add_partition(const Partition& partition);
+  YBTableCreator& add_partition(const dockv::Partition& partition);
 
   // Adds a set of hash partitions to the table.
   //
@@ -132,6 +148,9 @@ class YBTableCreator {
   // For index table: sets whether to do online schema migration when creating index.
   YBTableCreator& skip_index_backfill(const bool skip_index_backfill);
 
+  // For vector index table: adds vector index-specific options.
+  YBTableCreator& add_vector_options(const PgVectorIdxOptionsPB& vec_options);
+
   // For index table: indicates whether this index has mangled column name.
   // - Older index supports only ColumnRef, and its name is identical with colum name.
   // - Newer index supports expressions including ColumnRef, and its name is a mangled name of
@@ -155,7 +174,7 @@ class YBTableCreator {
   // If not provided, defaults to true.
   YBTableCreator& wait(bool wait);
 
-  YBTableCreator& replication_info(const master::ReplicationInfoPB& ri);
+  YBTableCreator& replication_info(const ReplicationInfoPB& ri);
 
   // Creates the table.
   //
@@ -164,7 +183,9 @@ class YBTableCreator {
   // returned.
   Status Create();
 
-  Result<int> NumTabletsForUserTable();
+  const std::string& get_table_id() const {
+    return table_id_;
+  }
 
  private:
   friend class YBClient;
@@ -176,14 +197,15 @@ class YBTableCreator {
   YBTableName table_name_; // Required.
 
   TableType table_type_ = TableType::DEFAULT_TABLE_TYPE;
+  master::InternalTableType internal_table_type_ = master::InternalTableType::GENERIC_TABLE;
 
   RoleName creator_role_name_;
 
   // For Postgres: table id to assign, and whether the table is a sys catalog / shared table.
   // For all tables, table_id_ will contain the table id assigned after creation.
   std::string table_id_;
-  boost::optional<bool> is_pg_catalog_table_;
-  boost::optional<bool> is_pg_shared_table_;
+  std::optional<bool> is_pg_catalog_table_;
+  std::optional<bool> is_pg_shared_table_;
 
   int32_t num_tablets_ = 0;
 
@@ -191,11 +213,11 @@ class YBTableCreator {
 
   std::unique_ptr<PartitionSchemaPB> partition_schema_;
 
-  std::vector<Partition> partitions_;
+  std::vector<dockv::Partition> partitions_;
 
   int num_replicas_ = 0;
 
-  std::unique_ptr<master::ReplicationInfoPB> replication_info_;
+  std::unique_ptr<ReplicationInfoPB> replication_info_;
 
   // When creating index, proxy server construct index_info_, and master server will write it to
   // the data-table being indexed.
@@ -219,11 +241,26 @@ class YBTableCreator {
   // The id of the tablespace to which this table is to be associated with.
   std::string tablespace_id_;
 
-  boost::optional<bool> is_matview_;
+  std::optional<bool> is_matview_;
 
-  std::string matview_pg_table_id_;
+  // In case the table was rewritten, explicitly store the TableId containing the PG table OID
+  // (as the table's TableId no longer matches).
+  TableId pg_table_id_;
+
+  // Used during table rewrite - the TableId of the old DocDB table that is being rewritten.
+  TableId old_rewrite_table_id_;
+
+  // Set to true when the table is being re-written as part of a TRUNCATE operation.
+  std::optional<bool> is_truncate_;
+
+  // Set by DDL Replication to link the table to the original table in the source cluster.
+  TableId xcluster_source_table_id_;
+
+  // Set by DDL Replication as a set time to perform index backfill.
+  uint64_t xcluster_backfill_hybrid_time_ = 0;
 
   const TransactionMetadata* txn_ = nullptr;
+  uint32_t sub_txn_id_ = kMinSubTransactionId;
 
   DISALLOW_COPY_AND_ASSIGN(YBTableCreator);
 };

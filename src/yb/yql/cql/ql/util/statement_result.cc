@@ -1,5 +1,5 @@
 //--------------------------------------------------------------------------------------------------
-// Copyright (c) YugaByte, Inc.
+// Copyright (c) YugabyteDB, Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License"); you may not use this file except
 // in compliance with the License.  You may obtain a copy of the License at
@@ -21,9 +21,9 @@
 #include "yb/client/yb_op.h"
 #include "yb/common/ql_protocol.messages.h"
 #include "yb/common/ql_protocol_util.h"
-#include "yb/common/ql_rowblock.h"
+#include "yb/common/schema_pbutil.h"
+#include "yb/qlexpr/ql_rowblock.h"
 #include "yb/common/schema.h"
-#include "yb/common/wire_protocol.h"
 #include "yb/util/debug-util.h"
 #include "yb/yql/cql/ql/ptree/list_node.h"
 #include "yb/yql/cql/ql/ptree/pt_dml.h"
@@ -38,7 +38,6 @@ using std::vector;
 using std::unique_ptr;
 using std::shared_ptr;
 using std::make_shared;
-using strings::Substitute;
 
 using client::YBOperation;
 using client::YBqlOp;
@@ -95,7 +94,8 @@ shared_ptr<vector<ColumnSchema>> GetColumnSchemasFromOp(const YBqlOp& op, const 
     case YBOperation::Type::PGSQL_READ: FALLTHROUGH_INTENDED;
     case YBOperation::Type::PGSQL_WRITE: FALLTHROUGH_INTENDED;
     case YBOperation::Type::REDIS_READ: FALLTHROUGH_INTENDED;
-    case YBOperation::Type::REDIS_WRITE:
+    case YBOperation::Type::REDIS_WRITE: FALLTHROUGH_INTENDED;
+    case YBOperation::Type::PGSQL_LOCK:
       break;
     // default: fallthrough
   }
@@ -113,7 +113,8 @@ QLClient GetClientFromOp(const YBqlOp& op) {
     case YBOperation::Type::PGSQL_READ: FALLTHROUGH_INTENDED;
     case YBOperation::Type::PGSQL_WRITE: FALLTHROUGH_INTENDED;
     case YBOperation::Type::REDIS_READ: FALLTHROUGH_INTENDED;
-    case YBOperation::Type::REDIS_WRITE:
+    case YBOperation::Type::REDIS_WRITE: FALLTHROUGH_INTENDED;
+    case YBOperation::Type::PGSQL_LOCK:
       break;
     // default: fallthrough
   }
@@ -164,7 +165,7 @@ RowsResult::RowsResult(const PTDmlStmt *tnode)
     : table_name_(tnode->table()->name()),
       column_schemas_(tnode->selected_schemas()),
       client_(YQL_CLIENT_CQL),
-      rows_data_(QLRowBlock::ZeroRowsData(YQL_CLIENT_CQL)) {
+      rows_data_(qlexpr::QLRowBlock::ZeroRowsData(YQL_CLIENT_CQL)) {
   if (column_schemas_ == nullptr) {
     column_schemas_ = make_shared<vector<ColumnSchema>>();
   }
@@ -202,7 +203,7 @@ Status RowsResult::Append(RowsResult&& other) {
   if (rows_data_.empty()) {
     rows_data_ = std::move(other.rows_data_);
   } else {
-    RETURN_NOT_OK(QLRowBlock::AppendRowsData(other.client_, other.rows_data_, &rows_data_));
+    RETURN_NOT_OK(qlexpr::QLRowBlock::AppendRowsData(other.client_, other.rows_data_, &rows_data_));
   }
   paging_state_ = std::move(other.paging_state_);
   return Status::OK();
@@ -212,8 +213,8 @@ void RowsResult::SetPagingState(YBqlOp *op) {
   // If there is a paging state in the response, fill in the table ID also and serialize the
   // paging state as bytes.
   if (op->response().has_paging_state()) {
-    QLPagingStatePB *paging_state = op->mutable_response()->mutable_paging_state();
-    paging_state->set_table_id(op->table()->id());
+    auto *paging_state = op->response().mutable_paging_state();
+    paging_state->ref_table_id(op->table()->id());
     paging_state->set_schema_version(op->table()->schema().version());
     SetPagingState(*paging_state);
   }
@@ -224,14 +225,21 @@ void RowsResult::SetPagingState(const QLPagingStatePB& paging_state) {
   CHECK(paging_state.SerializeToString(&paging_state_));
 }
 
+void RowsResult::SetPagingState(const LWQLPagingStatePB& paging_state) {
+  std::string temp;
+  paging_state.AppendToString(&temp);
+  paging_state_ = std::move(temp);
+}
+
 void RowsResult::SetPagingState(RowsResult&& other) {
   paging_state_ = std::move(other.paging_state_);
 }
 
 void RowsResult::OverrideSchemaVersionInPagingState(uint32_t schema_version) {
   LOG_IF(DFATAL, paging_state_.empty()) << "PagingState is not available";
-  QLPagingStatePB paging_state;
-  paging_state.ParseFromString(paging_state_);
+  auto arena = SharedThreadSafeArena();
+  auto& paging_state = *arena->NewArenaObject<LWQLPagingStatePB>();
+  CHECK_OK(paging_state.ParseFromSlice(paging_state_));
   paging_state.set_schema_version(schema_version);
   SetPagingState(paging_state);
 }
@@ -241,8 +249,8 @@ void RowsResult::ClearPagingState() {
   paging_state_.clear();
 }
 
-std::unique_ptr<QLRowBlock> RowsResult::GetRowBlock() const {
-  return CreateRowBlock(client_, Schema(*column_schemas_, 0), rows_data_.AsSlice());
+std::unique_ptr<qlexpr::QLRowBlock> RowsResult::GetRowBlock() const {
+  return qlexpr::CreateRowBlock(client_, Schema(*column_schemas_), rows_data_.AsSlice());
 }
 
 //------------------------------------------------------------------------------------------------

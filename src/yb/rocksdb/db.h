@@ -6,9 +6,9 @@
 // Use of this source code is governed by a BSD-style license that can be
 // found in the LICENSE file. See the AUTHORS file for names of contributors.
 //
-// The following only applies to changes made to this file as part of YugaByte development.
+// The following only applies to changes made to this file as part of YugabyteDB development.
 //
-// Portions Copyright (c) YugaByte, Inc.
+// Portions Copyright (c) YugabyteDB, Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License"); you may not use this file except
 // in compliance with the License.  You may obtain a copy of the License at
@@ -38,6 +38,8 @@
 #include "yb/rocksdb/transaction_log.h"
 #include "yb/rocksdb/types.h"
 
+#include "yb/storage/storage_types.h"
+
 #ifdef _WIN32
 // Windows API macro interference
 #undef DeleteFile
@@ -56,10 +58,15 @@ struct CompactionOptions;
 struct CompactRangeOptions;
 struct TableProperties;
 struct ExternalSstFileInfo;
-class WriteBatch;
+
+class DataBlockAwareIndexIterator;
 class Env;
 class EventListener;
+class WriteBatch;
 
+YB_STRONGLY_TYPED_BOOL(SkipLastEntry);
+
+using FlushAbility = yb::storage::FlushAbility;
 
 extern const char kDefaultColumnFamilyName[];
 
@@ -99,13 +106,13 @@ struct Range {
   Range(const Slice& s, const Slice& l) : start(s), limit(l) { }
 };
 
-YB_DEFINE_ENUM(FlushAbility, (kNoNewData)(kHasNewData)(kAlreadyFlushing))
-
 // A collections of table properties objects, where
 //  key: is the table's file name.
 //  value: the table properties object of the given table.
 typedef std::unordered_map<std::string, std::shared_ptr<const TableProperties>>
     TablePropertiesCollection;
+
+using UserFrontierRange = std::pair<yb::storage::UserFrontierPtr, yb::storage::UserFrontierPtr>;
 
 // A DB is a persistent ordered map from keys to values.
 // A DB is safe for concurrent access from multiple threads without
@@ -313,6 +320,27 @@ class DB {
   virtual Iterator* NewIterator(const ReadOptions& options) {
     return NewIterator(options, DefaultColumnFamily());
   }
+
+  virtual std::unique_ptr<Iterator> NewIndexIterator(
+      const ReadOptions& options, SkipLastEntry skip_last_index_entry,
+      ColumnFamilyHandle* column_family) = 0;
+
+  std::unique_ptr<Iterator> NewIndexIterator(
+      const ReadOptions& options, SkipLastEntry skip_last_index_entry) {
+    return NewIndexIterator(options, skip_last_index_entry, DefaultColumnFamily());
+  }
+
+  // Potentially slower (due to additional wrapper) version of index iterator but with access to
+  // data block.
+  virtual std::unique_ptr<DataBlockAwareIndexIterator> NewDataBlockAwareIndexIterator(
+      const ReadOptions& options, SkipLastEntry skip_last_index_entry,
+      ColumnFamilyHandle* column_family) = 0;
+
+  std::unique_ptr<DataBlockAwareIndexIterator> NewDataBlockAwareIndexIterator(
+      const ReadOptions& options, SkipLastEntry skip_last_index_entry) {
+    return NewDataBlockAwareIndexIterator(options, skip_last_index_entry, DefaultColumnFamily());
+  }
+
   // Returns iterators from a consistent database state across multiple
   // column families. Iterators are heap allocated and need to be deleted
   // before the db is deleted
@@ -705,6 +733,8 @@ class DB {
     return Flush(options, DefaultColumnFamily());
   }
 
+  virtual Status UpdateFrontiers(const yb::storage::UserFrontiers& frontiers) = 0;
+
   // Wait for end of mem-table data flushing.
   virtual Status WaitForFlush(ColumnFamilyHandle* column_family) = 0;
   virtual Status WaitForFlush() {
@@ -720,6 +750,8 @@ class DB {
   // The sequence number of the most recent transaction.
   virtual SequenceNumber GetLatestSequenceNumber() const = 0;
 
+  // The file number that will be used for the next new file.
+  virtual uint64_t GetNextFileNumber() const = 0;
 
   // Prevent file deletions. Compactions will continue to occur,
   // but no obsolete files will be deleted. Calling this multiple
@@ -745,6 +777,8 @@ class DB {
   // ever growing file, but only the portion specified by manifest_file_size is
   // valid for this snapshot.
   // Setting flush_memtable to true does Flush before recording the live files.
+  // flush_reason tags that flush for observability; callers must pass an explicit reason
+  // (e.g. `kCheckpointCreation` for `CreateCheckpoint`, `kTestOnly` for tests).
   // Setting flush_memtable to false is useful when we don't want to wait for
   // flush which may have to wait for compaction to complete taking an
   // indeterminate time.
@@ -753,9 +787,9 @@ class DB {
   // you still need to call GetSortedWalFiles after GetLiveFiles to compensate
   // for new data that arrived to already-flushed column families while other
   // column families were flushing
-  virtual Status GetLiveFiles(std::vector<std::string>&,
-                              uint64_t* manifest_file_size,
-                              bool flush_memtable = true) = 0;
+  virtual Status GetLiveFiles(
+      std::vector<std::string>&, uint64_t* manifest_file_size, bool flush_memtable,
+      FlushReason flush_reason) = 0;
 
   // Retrieve the sorted list of all wal files with earliest file first
   virtual Status GetSortedWalFiles(VectorLogPtr* files) = 0;
@@ -808,20 +842,29 @@ class DB {
     return result;
   }
 
-  virtual UserFrontierPtr GetFlushedFrontier() { return nullptr; }
+  virtual yb::storage::UserFrontierPtr GetFlushedFrontier() { return nullptr; }
 
   virtual Status ModifyFlushedFrontier(
-      UserFrontierPtr values,
+      yb::storage::UserFrontierPtr values,
       FrontierModificationMode mode) {
     return Status::OK();
   }
 
   virtual FlushAbility GetFlushAbility() { return FlushAbility::kHasNewData; }
 
-  virtual UserFrontierPtr GetMutableMemTableFrontier(UpdateUserValueType type) { return nullptr; }
-
-  virtual UserFrontierPtr CalcMemTableFrontier(UpdateUserValueType type) {
+  // Might return stale frontiers if invoked after records have been written to the memtable, but
+  // before frontiers are updated.
+  virtual yb::storage::UserFrontierPtr GetMutableMemTableFrontier(
+      yb::storage::UpdateUserValueType type) {
     return nullptr;
+  }
+
+  virtual yb::storage::UserFrontierPtr CalcMemTableFrontier(yb::storage::UpdateUserValueType type) {
+    return nullptr;
+  }
+
+  virtual UserFrontierRange CalcMemTableFrontiers() {
+    return {};
   }
 
   virtual void ListenFilesChanged(std::function<void()> listener) {}
@@ -901,8 +944,16 @@ class DB {
 
   virtual bool NeedsDelay() { return false; }
 
+  virtual bool AreWritesStopped() { return false; }
+
   // Returns approximate middle key (see Version::GetMiddleKey).
-  virtual yb::Result<std::string> GetMiddleKey() = 0;
+  virtual yb::Result<std::string> GetMiddleKey(Slice lower_bound_key) = 0;
+
+  // If true, will allow compactions to fail without setting bg_error and not causing writes to
+  // fail. Should only be used with extra care for troubleshooting when/while there are no other
+  // options available.
+  // Default: false
+  virtual void SetAllowCompactionFailures(AllowCompactionFailures allow_compaction_failures) = 0;
 
   // Returns a table reader for the largest SST file.
   virtual yb::Result<TableReader*> TEST_GetLargestSstTableReader() {

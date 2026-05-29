@@ -15,9 +15,9 @@
 // specific language governing permissions and limitations
 // under the License.
 //
-// The following only applies to changes made to this file as part of YugaByte development.
+// The following only applies to changes made to this file as part of YugabyteDB development.
 //
-// Portions Copyright (c) YugaByte, Inc.
+// Portions Copyright (c) YugabyteDB, Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License"); you may not use this file except
 // in compliance with the License.  You may obtain a copy of the License at
@@ -39,10 +39,12 @@
 
 #include <boost/range/adaptor/indirected.hpp>
 
+#include "yb/gutil/strings/stringpiece.h"
 #include "yb/gutil/strings/substitute.h"
 #include "yb/gutil/walltime.h"
 
 #include "yb/util/flags.h"
+#include "yb/util/logging.h"
 #include "yb/util/random.h"
 #include "yb/util/threadlocal.h"
 #include "yb/util/memory/arena.h"
@@ -55,6 +57,10 @@ using std::string;
 
 DEFINE_RUNTIME_bool(enable_tracing, false, "Flag to enable/disable tracing across the code.");
 TAG_FLAG(enable_tracing, advanced);
+
+DEFINE_RUNTIME_uint32(trace_max_dump_size, 30000,
+    "The max size of a trace dumped to the logs in Trace::DumpToLogInfo. 0 means unbounded.");
+TAG_FLAG(trace_max_dump_size, advanced);
 
 DEFINE_RUNTIME_int32(sampled_trace_1_in_n, 1000,
     "Flag to enable/disable sampled tracing. 0 disables.");
@@ -74,15 +80,34 @@ DEFINE_RUNTIME_int32(print_nesting_levels, 5,
     "controls the depth of the child traces to be printed.");
 TAG_FLAG(print_nesting_levels, advanced);
 
+
+DEFINE_RUNTIME_uint32(tracing_max_entries_per_trace, 100,
+    "max number of entries in a trace. 0 means unbounded.");
+TAG_FLAG(tracing_max_entries_per_trace, advanced);
+
+DEFINE_RUNTIME_uint32(tracing_max_children_per_trace, 10,
+    "max number of child traces. 0 means unbounded.");
+TAG_FLAG(tracing_max_children_per_trace, advanced);
 namespace yb {
 
 using strings::internal::SubstituteArg;
 
-__thread Trace* Trace::threadlocal_trace_;
+__thread Trace* Trace::threadlocal_trace_ = nullptr;
 
 namespace {
 
 const char* kNestedChildPrefix = "..  ";
+const size_t kNestedChildPrefixLen = strlen(kNestedChildPrefix);
+const char* kMultiLineNestedPrefix = "..  ";
+
+std::string GetNestingPrefix(int tracing_depth) {
+  std::string nesting_prefix;
+  nesting_prefix.reserve(kNestedChildPrefixLen * tracing_depth);
+  for (int i = 0; i < tracing_depth; i++) {
+    nesting_prefix += kNestedChildPrefix;
+  }
+  return nesting_prefix;
+}
 
 // Get the part of filepath after the last path separator.
 // (Doesn't modify filepath, contrary to basename() in libgen.h.)
@@ -95,13 +120,12 @@ const char* const_basename(const char* filepath) {
 template <class Children>
 void DumpChildren(
     std::ostream* out, int32_t tracing_depth, bool include_time_deltas, const Children* children) {
-  if (tracing_depth > GetAtomicFlag(&FLAGS_print_nesting_levels)) {
+  if (tracing_depth > FLAGS_print_nesting_levels) {
     return;
   }
+  const auto nesting_prefix = GetNestingPrefix(tracing_depth);
   for (auto &child_trace : *children) {
-    for (int i = 0; i < tracing_depth; i++) {
-      *out << kNestedChildPrefix;
-    }
+    *out << nesting_prefix;
     *out << "Related trace:" << std::endl;
     *out << (child_trace ? child_trace->DumpToString(tracing_depth, include_time_deltas)
                          : "Not collected");
@@ -125,6 +149,8 @@ void DumpEntries(
   auto time_usec = MonoDelta(entries.begin()->timestamp.time_since_epoch()).ToMicroseconds();
   const int64_t time_correction_usec = start - time_usec;
   int64_t prev_usecs = time_usec;
+  const auto nesting_prefix = GetNestingPrefix(tracing_depth);
+
   for (const auto& e : entries) {
     time_usec = MonoDelta(e.timestamp.time_since_epoch()).ToMicroseconds();
     const int64_t usecs_since_prev = time_usec - prev_usecs;
@@ -136,9 +162,7 @@ void DumpEntries(
     struct tm tm_time;
     localtime_r(&secs_since_epoch, &tm_time);
 
-    for (int i = 0; i < tracing_depth; i++) {
-      *out << kNestedChildPrefix;
-    }
+    *out << nesting_prefix;
     // Log format borrowed from glog/logging.cc
     using std::setw;
     out->fill('0');
@@ -154,7 +178,7 @@ void DumpEntries(
       out->fill(' ');
       *out << "(+" << setw(6) << usecs_since_prev << "us) ";
     }
-    e.Dump(out);
+    e.Dump(out, nesting_prefix);
     *out << std::endl;
   }
 }
@@ -238,10 +262,28 @@ struct TraceEntry {
   TraceEntry* next;
   char message[0];
 
-  void Dump(std::ostream* out) const {
+  void Dump(std::ostream* out, const std::string& nesting_prefix = "") const {
     *out << const_basename(file_path) << ':' << line_number
          << "] ";
-    out->write(message, message_len);
+    // Split a multi-line message and prepend the desired nesting_prefix.
+    size_t start = 0;
+    while (start < message_len) {
+      if (start != 0) {
+        *out << nesting_prefix;
+        // Add additional indentation for split-up lines.
+        *out << kMultiLineNestedPrefix;
+      }
+
+      std::string_view piece(message + start, message_len - start);
+      auto single_line_length = piece.find('\n');
+      if (single_line_length == std::string_view::npos) {
+        *out << piece;
+        break;
+      }
+
+      *out << std::string_view(message + start, single_line_length) << '\n';
+      start += single_line_length + 1;
+    }
   }
 };
 
@@ -278,11 +320,11 @@ ThreadSafeArena* Trace::GetAndInitArena() {
   return arena;
 }
 
-scoped_refptr<Trace> Trace::NewTrace() {
-  if (GetAtomicFlag(&FLAGS_enable_tracing)) {
+scoped_refptr<Trace> Trace::MaybeGetNewTrace() {
+  if (FLAGS_enable_tracing) {
     return scoped_refptr<Trace>(new Trace());
   }
-  const int32_t sampling_freq = GetAtomicFlag(&FLAGS_sampled_trace_1_in_n);
+  const int32_t sampling_freq = FLAGS_sampled_trace_1_in_n;
   if (sampling_freq <= 0) {
     VLOG(2) << "Sampled tracing returns nullptr";
     return nullptr;
@@ -297,13 +339,32 @@ scoped_refptr<Trace> Trace::NewTrace() {
   return ret;
 }
 
-scoped_refptr<Trace>  Trace::NewTraceForParent(Trace* parent) {
+bool Trace::must_print() const {
+  decltype(child_traces_) child_traces;
+  {
+    std::lock_guard l(lock_);
+    if (must_print_) {
+      return true;
+    }
+    child_traces = child_traces_;
+  }
+  return std::ranges::any_of(child_traces,
+                             [](const auto& child_trace) { return child_trace->must_print(); });
+}
+
+scoped_refptr<Trace>  Trace::MaybeGetNewTraceForParent(Trace* parent) {
   if (parent) {
+    auto max_children = FLAGS_tracing_max_children_per_trace;
+    if (max_children > 0 && parent->NumChildren() >= max_children) {
+      TRACE_TO(parent, "Cannot add more child traces");
+      YB_LOG_EVERY_N_SECS(WARNING, 10) << "Trace has too many child traces. Cannot add more.";
+      return MaybeGetNewTrace();
+    }
     scoped_refptr<Trace> trace(new Trace);
     parent->AddChildTrace(trace.get());
     return trace;
   }
-  return NewTrace();
+  return MaybeGetNewTrace();
 }
 
 void Trace::SubstituteAndTrace(
@@ -337,13 +398,28 @@ void Trace::SubstituteAndTrace(const char* file_path,
   AddEntry(entry);
 }
 
+size_t Trace::NumEntries() const {
+  return entries_count_.load(std::memory_order_acquire);
+}
+
+size_t Trace::NumChildren() const {
+  std::lock_guard l(lock_);
+  return child_traces_.size();
+}
+
 TraceEntry* Trace::NewEntry(
     size_t msg_len, const char* file_path, int line_number, CoarseTimePoint now) {
+  auto max_entries = FLAGS_tracing_max_entries_per_trace;
+  if (max_entries > 0 && NumEntries() >= max_entries) {
+    YB_LOG_EVERY_N_SECS(WARNING, 10) << "Trace has too many entries. Will not add more entries;";
+    return nullptr;
+  }
   auto* arena = GetAndInitArena();
   size_t size = offsetof(TraceEntry, message) + msg_len;
   void* dst = arena->AllocateBytesAligned(size, alignof(TraceEntry));
   if (dst == nullptr) {
-    LOG(ERROR) << "NewEntry(msg_len, " << file_path << ", " << line_number
+    LOG(DFATAL)
+        << "NewEntry(msg_len, " << file_path << ", " << line_number
         << ") received nullptr from AllocateBytes.\n So far:" << DumpToString(true);
     return nullptr;
   }
@@ -356,7 +432,7 @@ TraceEntry* Trace::NewEntry(
 }
 
 void Trace::AddEntry(TraceEntry* entry) {
-  std::lock_guard<simple_spinlock> l(lock_);
+  std::lock_guard l(lock_);
   entry->next = nullptr;
 
   if (entries_tail_ != nullptr) {
@@ -367,10 +443,52 @@ void Trace::AddEntry(TraceEntry* entry) {
     trace_start_time_usec_ = GetCurrentMicrosFast(entry->timestamp);
   }
   entries_tail_ = entry;
+  entries_count_++;
 }
 
 void Trace::Dump(std::ostream *out, bool include_time_deltas) const {
   Dump(out, 0, include_time_deltas);
+}
+
+void Trace::DumpToLogInfo(bool include_time_deltas) const {
+  auto trace_buffer = DumpToString(include_time_deltas);
+  const size_t trace_max_dump_size = FLAGS_trace_max_dump_size;
+  const size_t kMaxDumpSize =
+      (trace_max_dump_size > 0 ? trace_max_dump_size : std::numeric_limits<uint32_t>::max());
+  size_t start = 0;
+  size_t max_to_print = std::min(trace_buffer.size(), kMaxDumpSize);
+  const size_t kMaxLogMessageLen = google::LogMessage::kMaxLogMessageLen;
+  const string kContinuationMarker("\ntrace continues ...");
+  // An upper bound on the overhead due to printing the file name/timestamp etc + continuation
+  // marker.
+  const size_t kMaxOverhead = 100;
+  bool skip_newline = false;
+  do {
+    size_t length_to_print = max_to_print - start;
+    bool has_more = false;
+    if (length_to_print > kMaxLogMessageLen) {
+      // Try to split a line by \n starting a search from the end of the printable interval till
+      // the middle of that interval to not shrink too much.
+      auto last_end_of_line_pos = std::string_view(
+                                      trace_buffer.c_str() + start + (kMaxLogMessageLen / 2),
+                                      (kMaxLogMessageLen / 2) - kMaxOverhead)
+                                      .rfind('\n');
+      // If we have a really long line, we will just split it.
+      if (last_end_of_line_pos == string::npos) {
+        length_to_print = kMaxLogMessageLen - kMaxOverhead;
+        skip_newline = false;
+      } else {
+        length_to_print = (kMaxLogMessageLen / 2) + last_end_of_line_pos;
+        skip_newline = true;
+      }
+      has_more = true;
+    }
+    LOG(INFO) << std::string_view(trace_buffer.c_str() + start, length_to_print)
+              << (has_more ? kContinuationMarker : "");
+    start += length_to_print;
+    // Skip the newline character which would otherwise be at the begining of the next part.
+    start += static_cast<size_t>(skip_newline);
+  } while (start < max_to_print);
 }
 
 void Trace::Dump(std::ostream* out, int32_t tracing_depth, bool include_time_deltas) const {
@@ -382,7 +500,7 @@ void Trace::Dump(std::ostream* out, int32_t tracing_depth, bool include_time_del
   vector<scoped_refptr<Trace> > child_traces;
   decltype(trace_start_time_usec_) trace_start_time_usec;
   {
-    std::lock_guard<simple_spinlock> l(lock_);
+    std::lock_guard l(lock_);
     for (TraceEntry* cur = entries_head_;
         cur != nullptr;
         cur = cur->next) {
@@ -416,7 +534,7 @@ void Trace::DumpCurrentTrace() {
 void Trace::AddChildTrace(Trace* child_trace) {
   CHECK_NOTNULL(child_trace);
   {
-    std::lock_guard<simple_spinlock> l(lock_);
+    std::lock_guard l(lock_);
     scoped_refptr<Trace> ptr(child_trace);
     child_traces_.push_back(ptr);
   }
@@ -428,13 +546,29 @@ size_t Trace::DynamicMemoryUsage() const {
   return arena ? arena->memory_footprint() : 0;
 }
 
+void Trace::DumpTraceIfNecessary(Trace* trace, int print_trace_every_n, bool must_print) {
+  if (!trace) {
+    return;
+  }
+  if (must_print || trace->must_print()) {
+    print_trace_every_n = 1;  // Force printing if must_print is set.
+  }
+  bool was_printed = false;
+  YB_LOG_IF_EVERY_N(INFO, print_trace_every_n > 0, print_trace_every_n)
+      << "Trace: \n"
+      << Trace::SetTrue(&was_printed);
+  if (was_printed) {
+    trace->DumpToLogInfo();
+  }
+}
+
 PlainTrace::PlainTrace() {
 }
 
 void PlainTrace::Trace(const char *file_path, int line_number, const char *message) {
   auto timestamp = CoarseMonoClock::Now();
   {
-    std::lock_guard<decltype(mutex_)> lock(mutex_);
+    std::lock_guard lock(mutex_);
     if (size_ < kMaxEntries) {
       if (size_ == 0) {
         trace_start_time_usec_ = GetCurrentMicrosFast(timestamp);
@@ -453,7 +587,7 @@ void PlainTrace::Dump(std::ostream* out, int32_t tracing_depth, bool include_tim
   size_t size;
   decltype(trace_start_time_usec_) trace_start_time_usec;
   {
-    std::lock_guard<decltype(mutex_)> lock(mutex_);
+    std::lock_guard lock(mutex_);
     size = size_;
     trace_start_time_usec = trace_start_time_usec_;
   }
@@ -469,7 +603,8 @@ std::string PlainTrace::DumpToString(int32_t tracing_depth, bool include_time_de
   return s.str();
 }
 
-void PlainTrace::Entry::Dump(std::ostream *out) const {
+void PlainTrace::Entry::Dump(
+    std::ostream* out, const std::string& /* ignored */ nesting_prefix) const {
   *out << const_basename(file_path) << ':' << line_number << "] " << message;
 }
 

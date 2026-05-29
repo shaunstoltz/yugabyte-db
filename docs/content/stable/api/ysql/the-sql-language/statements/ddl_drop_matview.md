@@ -4,9 +4,11 @@ headerTitle: DROP MATERIALIZED VIEW
 linkTitle: DROP MATERIALIZED VIEW
 description: Use the DROP MATERIALIZED VIEW statement to drop a materialized view.
 menu:
-  stable:
+  stable_api:
     identifier: ddl_drop_matview
     parent: statements
+aliases:
+  - /stable/api/ysql/commands/ddl_drop_matview/
 type: docs
 ---
 
@@ -16,33 +18,13 @@ Use the `DROP MATERIALIZED VIEW` statement to drop a materialized view.
 
 ## Syntax
 
-<ul class="nav nav-tabs nav-tabs-yb">
-  <li >
-    <a href="#grammar" class="nav-link active" id="grammar-tab" data-toggle="tab" role="tab" aria-controls="grammar" aria-selected="true">
-      <img src="/icons/file-lines.svg" alt="Grammar Icon">
-      Grammar
-    </a>
-  </li>
-  <li>
-    <a href="#diagram" class="nav-link" id="diagram-tab" data-toggle="tab" role="tab" aria-controls="diagram" aria-selected="false">
-      <img src="/icons/diagram.svg" alt="Diagram Icon">
-      Diagram
-    </a>
-  </li>
-</ul>
-
-<div class="tab-content">
-  <div id="grammar" class="tab-pane fade show active" role="tabpanel" aria-labelledby="grammar-tab">
-  {{% includeMarkdown "../../syntax_resources/the-sql-language/statements/drop_matview.grammar.md" %}}
-  </div>
-  <div id="diagram" class="tab-pane fade" role="tabpanel" aria-labelledby="diagram-tab">
-  {{% includeMarkdown "../../syntax_resources/the-sql-language/statements/drop_matview.diagram.md" %}}
-  </div>
-</div>
+{{%ebnf%}}
+  drop_matview
+{{%/ebnf%}}
 
 ## Semantics
 
-Drop a materialized view named *matview_name*. If `matview_name` already exists in the specified database, an error will be raised unless the `IF NOT EXISTS` clause is used.
+Drop a materialized view named *matview_name*. If `matview_name` doesn't exist in the specified database, an error will be raised unless the `IF EXISTS` clause is used.
 
 ### RESTRICT / CASCADE
 

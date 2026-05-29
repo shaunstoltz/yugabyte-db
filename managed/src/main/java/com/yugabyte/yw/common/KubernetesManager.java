@@ -1,23 +1,39 @@
-// Copyright (c) YugaByte, Inc.
+// Copyright (c) YugabyteDB, Inc.
 
 package com.yugabyte.yw.common;
 
-import com.fasterxml.jackson.core.JsonProcessingException;
+import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.google.common.collect.ImmutableList;
+import com.google.common.collect.ImmutableMap;
 import com.google.common.collect.Sets;
+import com.google.inject.Inject;
+import com.typesafe.config.Config;
+import com.yugabyte.yw.commissioner.Common;
+import com.yugabyte.yw.commissioner.tasks.UniverseTaskBase.ServerType;
+import com.yugabyte.yw.common.RedactingService.RedactionTarget;
+import com.yugabyte.yw.common.config.RuntimeConfGetter;
+import com.yugabyte.yw.common.config.UniverseConfKeys;
 import com.yugabyte.yw.common.helm.HelmUtils;
+import com.yugabyte.yw.forms.UniverseDefinitionTaskParams;
+import com.yugabyte.yw.forms.UniverseDefinitionTaskParams.ExposingServiceState;
+import com.yugabyte.yw.models.AvailabilityZone;
+import com.yugabyte.yw.models.Provider;
+import com.yugabyte.yw.models.Universe;
+import com.yugabyte.yw.models.helpers.PlacementInfo;
 import io.fabric8.kubernetes.api.model.LoadBalancerIngress;
+import io.fabric8.kubernetes.api.model.Namespace;
 import io.fabric8.kubernetes.api.model.Node;
+import io.fabric8.kubernetes.api.model.ObjectMeta;
+import io.fabric8.kubernetes.api.model.PersistentVolumeClaim;
 import io.fabric8.kubernetes.api.model.Pod;
 import io.fabric8.kubernetes.api.model.PodCondition;
 import io.fabric8.kubernetes.api.model.PodStatus;
+import io.fabric8.kubernetes.api.model.Quantity;
 import io.fabric8.kubernetes.api.model.Secret;
 import io.fabric8.kubernetes.api.model.Service;
 import io.fabric8.kubernetes.api.model.events.v1.Event;
-import lombok.AllArgsConstructor;
-import lombok.Data;
-import lombok.ToString;
+import io.fabric8.kubernetes.api.model.storage.StorageClass;
 import java.io.BufferedWriter;
 import java.io.File;
 import java.io.FileWriter;
@@ -28,13 +44,19 @@ import java.util.HashMap;
 import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
+import java.util.Map.Entry;
 import java.util.Set;
 import java.util.UUID;
+import java.util.function.BiFunction;
 import java.util.stream.Collectors;
 import javax.annotation.Nullable;
-import javax.inject.Inject;
+import lombok.AllArgsConstructor;
+import lombok.Data;
+import lombok.ToString;
+import org.apache.commons.lang3.StringUtils;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
+import org.springframework.util.CollectionUtils;
 import org.yaml.snakeyaml.Yaml;
 
 public abstract class KubernetesManager {
@@ -43,7 +65,11 @@ public abstract class KubernetesManager {
 
   @Inject ShellProcessHandler shellProcessHandler;
 
-  @Inject play.Configuration appConfig;
+  @Inject RuntimeConfGetter confGetter;
+
+  @Inject Config appConfig;
+
+  @Inject FileHelperService fileHelperService;
 
   public static final Logger LOG = LoggerFactory.getLogger(KubernetesManager.class);
 
@@ -53,9 +79,17 @@ public abstract class KubernetesManager {
 
   private static final long DEFAULT_HELM_TEMPLATE_TIMEOUT_SECS = 1;
 
-  /* helm interface */
+  private static final long HELM_UNINSTALL_RETRY = 5;
 
+  protected BiFunction<ObjectMeta, Boolean, ServerType> serverTypeLabelConverter =
+      (oM, newNamingStyle) ->
+          oM.getLabels().get(newNamingStyle ? "app.kubernetes.io/name" : "app").equals("yb-tserver")
+              ? ServerType.TSERVER
+              : ServerType.MASTER;
+
+  /* helm interface */
   public void helmInstall(
+      UUID universeUUID,
       String ybSoftwareVersion,
       Map<String, String> config,
       UUID providerUUID,
@@ -64,47 +98,98 @@ public abstract class KubernetesManager {
       String overridesFile) {
 
     String helmPackagePath = this.getHelmPackagePath(ybSoftwareVersion);
-    List<String> commandList =
-        ImmutableList.of(
-            "helm",
-            "install",
-            helmReleaseName,
-            helmPackagePath,
-            "--debug",
-            "--namespace",
-            namespace,
-            "-f",
-            overridesFile,
-            "--timeout",
-            getTimeout(),
-            "--wait");
+
+    int currentTry = 0;
+    boolean helmReleaseExists = false;
+    // Helm uninstall can fail or timeout.
+    // Error occurred. Code: 1. Output: Error: uninstallation
+    // completed with 1 error(s): context deadline exceeded
+    // This block does a retry with a generous timeout to give it time to finish
+    while (currentTry < HELM_UNINSTALL_RETRY) {
+      // List Helm releases to check if the release already exists
+      List<String> listCmd = ImmutableList.of("helm", "list", "--short", "--namespace", namespace);
+      ShellResponse responseList = execCommand(config, listCmd);
+
+      responseList.processErrors();
+
+      String output = responseList.getMessage();
+      LOG.info("helm list command output: {}", output);
+
+      helmReleaseExists = output.contains(helmReleaseName);
+
+      if (helmReleaseExists) {
+        // The release already exists, uninstall it
+        List<String> deleteCmd =
+            ImmutableList.of(
+                "helm",
+                "uninstall",
+                helmReleaseName,
+                "--namespace",
+                namespace,
+                "--timeout",
+                getTimeout(universeUUID),
+                "--wait");
+        ShellResponse responseDelete = execCommand(config, deleteCmd);
+        responseDelete.processErrors();
+      } else {
+        // Release does not exist, exit the loop
+        break;
+      }
+
+      currentTry++;
+    }
+
+    if (helmReleaseExists) {
+      String message =
+          String.format(
+              "Failed to delete Helm release %s after %d attempts",
+              helmReleaseName, HELM_UNINSTALL_RETRY);
+      LOG.error(message);
+      throw new RuntimeException(message);
+    }
+
+    // If the release does not exist or was successfully deleted, proceed with installation
+    String labelsFlag = extractAndFormatCommonLabels(overridesFile);
+    ImmutableList.Builder<String> commandBuilder =
+        ImmutableList.<String>builder()
+            .add(
+                "helm",
+                "install",
+                helmReleaseName,
+                helmPackagePath,
+                "--debug",
+                "--namespace",
+                namespace)
+            .add("-f", overridesFile);
+    if (labelsFlag != null && !labelsFlag.isEmpty()) {
+      commandBuilder.add("--labels", labelsFlag);
+    }
+    commandBuilder.add("--timeout", getTimeout(universeUUID), "--wait");
+    List<String> commandList = commandBuilder.build();
     ShellResponse response = execCommand(config, commandList);
     processHelmResponse(config, helmReleaseName, namespace, response);
   }
+
   // Log a diff before applying helm upgrade.
   public void diff(Map<String, String> config, String inputYamlFilePath) {
     List<String> diffCommandList =
-        ImmutableList.of("kubectl", "diff", "--server-side=false", "-f ", inputYamlFilePath);
+        ImmutableList.of("kubectl", "diff", "--server-side=false", "-f", inputYamlFilePath);
     ShellResponse response = execCommand(config, diffCommandList);
     if (response != null && !response.isSuccess()) {
-      LOG.error("kubectl diff failed with response %s", response.toString());
+      LOG.error("kubectl diff failed with response {}", response.toString());
     }
   }
 
   public String helmTemplate(
+      UUID universeUuid,
       String ybSoftwareVersion,
       Map<String, String> config,
       String helmReleaseName,
       String namespace,
       String overridesFile) {
     String helmPackagePath = this.getHelmPackagePath(ybSoftwareVersion);
-    Path tempOutputFile;
-    try {
-      tempOutputFile = Files.createTempFile("helm-template", ".output");
-    } catch (Exception ex) {
-      LOG.error("Failed to create a tempfile");
-      return null;
-    }
+
+    Path tempOutputFile = fileHelperService.createTempFile("helm-template", ".output");
     String tempOutputPath = tempOutputFile.toAbsolutePath().toString();
     List<String> templateCommandList =
         ImmutableList.of(
@@ -117,30 +202,60 @@ public abstract class KubernetesManager {
             "--namespace",
             namespace,
             "--timeout",
-            getTimeout(),
+            getTimeout(universeUuid),
             "--is-upgrade",
             "--no-hooks",
-            "--skip-crds",
-            " > ",
-            tempOutputPath);
+            "--skip-crds");
 
     ShellResponse response = execCommand(config, templateCommandList);
     if (response != null && !response.isSuccess()) {
       try {
         String templateOutput = Files.readAllLines(tempOutputFile).get(0);
-        LOG.error("Output from the template command %s", templateOutput);
+        LOG.error("Output from the template command {}", templateOutput);
       } catch (Exception ex) {
-        LOG.error("Got exception in reading template output %s", ex.getMessage());
+        LOG.error("Got exception in reading template output {}", ex.getMessage());
       }
-
       return null;
+    } else {
+      LOG.info("Writing template output to file: {}", tempOutputPath);
+      try (BufferedWriter writer = new BufferedWriter(new FileWriter(tempOutputPath))) {
+        writer.write(response.getMessage());
+      } catch (IOException e) {
+        LOG.error("Got exception in writing template output {}", e.getMessage());
+      }
     }
-
     // Success case return the output file path.
     return tempOutputPath;
   }
 
+  public void helmResume(
+      UUID universeUuid,
+      String ybSoftwareVersion,
+      Map<String, String> config,
+      String helmReleaseName,
+      String namespace) {
+
+    String helmPackagePath = this.getHelmPackagePath(ybSoftwareVersion);
+    List<String> commandList =
+        ImmutableList.of(
+            "helm",
+            "upgrade",
+            "--install",
+            helmReleaseName,
+            helmPackagePath,
+            "--debug",
+            "--reuse-values",
+            "--namespace",
+            namespace,
+            "--timeout",
+            getTimeout(universeUuid),
+            "--wait");
+    ShellResponse response = execCommand(config, commandList);
+    processHelmResponse(config, helmReleaseName, namespace, response);
+  }
+
   public void helmUpgrade(
+      UUID universeUuid,
       String ybSoftwareVersion,
       Map<String, String> config,
       String helmReleaseName,
@@ -150,29 +265,122 @@ public abstract class KubernetesManager {
 
     // Capture the diff what is going to be upgraded.
     String helmTemplatePath =
-        helmTemplate(ybSoftwareVersion, config, helmReleaseName, namespace, overridesFile);
+        helmTemplate(
+            universeUuid, ybSoftwareVersion, config, helmReleaseName, namespace, overridesFile);
     if (helmTemplatePath != null) {
       diff(config, helmTemplatePath);
     } else {
       LOG.error("Error in helm template generation");
     }
 
-    List<String> commandList =
-        ImmutableList.of(
-            "helm",
-            "upgrade",
-            helmReleaseName,
-            helmPackagePath,
-            "--debug",
-            "-f",
-            overridesFile,
-            "--namespace",
-            namespace,
-            "--timeout",
-            getTimeout(),
-            "--wait");
+    String labelsFlag = extractAndFormatCommonLabels(overridesFile);
+    ImmutableList.Builder<String> commandBuilder =
+        ImmutableList.<String>builder()
+            .add("helm", "upgrade", helmReleaseName, helmPackagePath, "--debug")
+            .add("-f", overridesFile)
+            .add("--namespace", namespace);
+    if (labelsFlag != null && !labelsFlag.isEmpty()) {
+      commandBuilder.add("--labels", labelsFlag);
+    }
+    commandBuilder.add("--timeout", getTimeout(universeUuid), "--wait");
+    List<String> commandList = commandBuilder.build();
     ShellResponse response = execCommand(config, commandList);
     processHelmResponse(config, helmReleaseName, namespace, response);
+  }
+
+  public void checkAndRecoverFromHelmPendingState(
+      Map<String, String> config, String helmReleaseName, String namespace) {
+    List<String> commandList =
+        ImmutableList.of("helm", "status", helmReleaseName, "-n", namespace, "-o", "json");
+    ShellResponse response = execCommand(config, commandList, false);
+    if (response != null && response.isSuccess()) {
+      try {
+        ObjectMapper mapper = new ObjectMapper();
+        JsonNode statusJson = mapper.readTree(response.getMessage());
+        String status = statusJson.path("info").path("status").asText();
+        String currentVersion = statusJson.path("version").asText();
+        LOG.info(
+            "Helm release {} status: {}, current version: {}",
+            helmReleaseName,
+            status,
+            currentVersion);
+
+        if (status.startsWith("pending-")) {
+          LOG.info(
+              "Helm release {} is stuck in {} state, triggering recovery mechanism",
+              helmReleaseName,
+              status);
+          handleStuckHelmUpgrade(config, helmReleaseName, namespace, currentVersion);
+        }
+      } catch (Exception e) {
+        LOG.error("Error parsing helm status response for release {}", helmReleaseName, e);
+      }
+    } else {
+      LOG.warn(
+          "Failed to get helm status for release {}: {}", helmReleaseName, response.getMessage());
+    }
+  }
+
+  public void handleStuckHelmUpgrade(
+      Map<String, String> config, String helmReleaseName, String namespace, String currentVersion) {
+    LOG.info(
+        "Handling stuck helm upgrade for release {} in namespace {}", helmReleaseName, namespace);
+
+    String secretName = "sh.helm.release.v1." + helmReleaseName + ".v" + currentVersion;
+    String storagePath = AppConfigHelper.getStoragePath();
+    File backupDir = new File(storagePath, "helm-backups");
+    if (!backupDir.exists()) {
+      backupDir.mkdirs();
+    }
+    String backupFileName =
+        new File(backupDir, secretName + "-backup-" + System.currentTimeMillis() + ".yaml")
+            .getAbsolutePath();
+
+    try {
+      LOG.info("Backing up helm version secret: {} to file: {}", secretName, backupFileName);
+      List<String> getSecretCommand =
+          ImmutableList.of("kubectl", "get", "secret", secretName, "-n", namespace, "-o", "yaml");
+      ShellResponse getResponse = execCommand(config, getSecretCommand);
+      if (getResponse != null && getResponse.isSuccess()) {
+        try (BufferedWriter writer = new BufferedWriter(new FileWriter(backupFileName))) {
+          writer.write(getResponse.getMessage());
+        }
+        LOG.info(
+            "Successfully backed up helm version secret: {} to file: {}",
+            secretName,
+            backupFileName);
+      } else {
+        LOG.warn(
+            "Failed to get helm version secret for backup: {}. Response: {}. Skipping deletion.",
+            secretName,
+            getResponse != null ? getResponse.getMessage() : "null response");
+        return;
+      }
+      LOG.info("Deleting helm version secret: {} in namespace: {}", secretName, namespace);
+      List<String> deleteSecretCommand =
+          ImmutableList.of(
+              "kubectl",
+              "delete",
+              "secret",
+              secretName,
+              "-n",
+              namespace,
+              "--ignore-not-found=true");
+      ShellResponse response = execCommand(config, deleteSecretCommand);
+      if (response != null && response.isSuccess()) {
+        LOG.info(
+            "Successfully deleted helm version secret: {}. Backup available at: {}",
+            secretName,
+            backupFileName);
+      } else {
+        LOG.warn(
+            "Failed to delete helm version secret: {}. Response: {}",
+            secretName,
+            response != null ? response.getMessage() : "null response");
+      }
+    } catch (Exception e) {
+      LOG.error("Error handling helm version secret: {}", secretName, e);
+    }
   }
 
   public void helmDelete(Map<String, String> config, String helmReleaseName, String namespace) {
@@ -222,9 +430,7 @@ public abstract class KubernetesManager {
   }
 
   private Set<String> getNullValueKeys(Map<String, String> userMap) {
-    return userMap
-        .entrySet()
-        .stream()
+    return userMap.entrySet().stream()
         .filter(e -> e.getValue() == null)
         .map(Map.Entry::getKey)
         .collect(Collectors.toSet());
@@ -343,10 +549,54 @@ public abstract class KubernetesManager {
 
   /* helm helpers */
 
+  /**
+   * Extracts commonLabels from the helm overrides file and formats them for helm --labels flag.
+   * Returns null if no commonLabels are found.
+   *
+   * @param overridesFile Path to the helm overrides YAML file
+   * @return Formatted labels string (key1=value1,key2=value2) or null if no labels found
+   */
+  @SuppressWarnings("unchecked")
+  private String extractAndFormatCommonLabels(String overridesFile) {
+    if (overridesFile == null || overridesFile.isEmpty()) {
+      return null;
+    }
+    try {
+      String yamlContent = Files.readString(Path.of(overridesFile));
+      Map<String, Object> overrides = new Yaml().load(yamlContent);
+      if (overrides == null || !overrides.containsKey("commonLabels")) {
+        return null;
+      }
+      Object commonLabelsObj = overrides.get("commonLabels");
+      if (!(commonLabelsObj instanceof Map)) {
+        return null;
+      }
+      Map<String, Object> commonLabels = (Map<String, Object>) commonLabelsObj;
+      if (commonLabels.isEmpty()) {
+        return null;
+      }
+      // Format as key1=value1,key2=value2
+      // Convert values to strings to handle non-string types (numbers, booleans, etc.)
+      return commonLabels.entrySet().stream()
+          .map(
+              entry ->
+                  entry.getKey()
+                      + "="
+                      + (entry.getValue() != null ? entry.getValue().toString() : ""))
+          .collect(Collectors.joining(","));
+    } catch (Exception e) {
+      LOG.warn(
+          "Error extracting commonLabels from overrides file {}: {}",
+          overridesFile,
+          e.getMessage());
+      return null;
+    }
+  }
+
   private String createTempFile(Map<String, Object> valuesMap) {
     Path tempFile;
     try {
-      tempFile = Files.createTempFile("values", ".yml");
+      tempFile = fileHelperService.createTempFile("values", ".yml");
       try (BufferedWriter bw = new BufferedWriter(new FileWriter(tempFile.toFile())); ) {
         new Yaml().dump(valuesMap, bw);
         return tempFile.toAbsolutePath().toString();
@@ -382,31 +632,49 @@ public abstract class KubernetesManager {
           }
         }
       }
+      String helmErrorMessage = null;
+      String[] lines = response.getMessage().split("\\r?\\n");
+      for (String line : lines) {
+        if (line.contains("INSTALLATION FAILED") || line.contains("UPGRADE FAILED")) {
+          helmErrorMessage += line;
+          helmErrorMessage += "\n";
+          break;
+        }
+      }
+
       if (pods.isEmpty()) {
         message = "No pods even scheduled. Previous step(s) incomplete";
       } else {
         message = "Pods are ready. Services still not running";
       }
+      // Add helm error message to the exception message if it was found.
+      if (StringUtils.isNotBlank(helmErrorMessage)) {
+        helmErrorMessage = "HELM ERROR: " + helmErrorMessage;
+        message += "\n" + helmErrorMessage;
+      }
       throw new RuntimeException(message);
     }
   }
 
-  public Long getTimeoutSecs() {
-    Long timeout = appConfig.getLong("yb.helm.timeout_secs");
+  public Long getTimeoutSecs(UUID universeUuid) {
+    Long timeout =
+        confGetter.getConfForScope(
+            Universe.getOrBadRequest(universeUuid), UniverseConfKeys.helmTimeoutSecs);
     if (timeout == null || timeout == 0) {
       timeout = DEFAULT_TIMEOUT_SECS;
     }
     return timeout;
   }
 
-  public String getTimeout() {
-    return String.valueOf(getTimeoutSecs()) + "s";
+  public String getTimeout(UUID universeUuid) {
+    return String.valueOf(getTimeoutSecs(universeUuid)) + "s";
   }
 
   private ShellResponse execCommand(
       Map<String, String> config, List<String> command, boolean logCmdOutput) {
     String description = String.join(" ", command);
-    return shellProcessHandler.run(command, config, logCmdOutput, description);
+    RedactionTarget target = RedactionTarget.HELM_VALUES;
+    return shellProcessHandler.run(command, config, logCmdOutput, description, target);
   }
 
   private ShellResponse execCommand(Map<String, String> config, List<String> command) {
@@ -417,10 +685,9 @@ public abstract class KubernetesManager {
     String helmPackagePath = null;
 
     // Get helm package filename from release metadata.
-    ReleaseManager.ReleaseMetadata releaseMetadata =
-        releaseManager.getReleaseByVersion(ybSoftwareVersion);
-    if (releaseMetadata != null) {
-      helmPackagePath = releaseMetadata.chartPath;
+    ReleaseContainer release = releaseManager.getReleaseByVersion(ybSoftwareVersion);
+    if (release != null) {
+      helmPackagePath = release.getHelmChart();
     }
 
     if (helmPackagePath == null || helmPackagePath.isEmpty()) {
@@ -483,6 +750,119 @@ public abstract class KubernetesManager {
     return events.stream().map(x -> toReadableString(x)).collect(Collectors.joining("\n"));
   }
 
+  /**
+   * Checks if the given kubeConfig points to the same Kubernetes cluster where YBA is running. This
+   * is done by checking existance of the YBA pod in the given cluster.
+   *
+   * @param kubeConfig the kubeConfig of the cluster to check.
+   * @return true if it is home cluster, false if pod is not found.
+   */
+  public boolean isHomeCluster(String kubeConfig) {
+    if (StringUtils.isBlank(kubeConfig)) {
+      return true;
+    }
+
+    String ns = getPlatformNamespace();
+    String podName = getPlatformPodName();
+
+    // TODO(bhavin192): verify the .metadata.uid of the pod object to
+    // ensure it is the same pod.
+    // Map<String, String> homeConfig = ImmutableMap.of("KUBECONFIG", "");
+    // Pod homePod = k8s.getPodObject(homeConfig, ns, podName);
+
+    Map<String, String> config = ImmutableMap.of("KUBECONFIG", kubeConfig);
+    try {
+      getPodObject(config, ns, podName);
+    } catch (RuntimeException e) {
+      if (e.getMessage().contains("Error from server (NotFound): namespaces")
+          || e.getMessage().contains("Error from server (NotFound): pods")) {
+        return false;
+      }
+      throw e;
+    }
+    return true;
+  }
+
+  public String getKubernetesServiceIPPort(ServerType type, Universe universe) {
+    Set<String> allIPs = new HashSet<>();
+    UniverseDefinitionTaskParams universeDetails = universe.getUniverseDetails();
+    UniverseDefinitionTaskParams.Cluster primary = universeDetails.getPrimaryCluster();
+    // If no service is exposed, fail early.
+    if (primary.userIntent.enableExposingService == ExposingServiceState.UNEXPOSED) {
+      return null;
+    }
+    Provider provider = Util.getSingleProvider(primary);
+
+    if (provider.getCloudCode() != Common.CloudType.kubernetes) {
+      return null;
+    } else {
+      PlacementInfo pi = universeDetails.getPrimaryCluster().getOverallPlacement();
+
+      boolean isMultiAz = PlacementInfoUtil.isMultiAZ(provider);
+      Map<UUID, Map<String, String>> azToConfig = KubernetesUtil.getConfigPerAZ(pi);
+
+      for (Entry<UUID, Map<String, String>> entry : azToConfig.entrySet()) {
+        UUID azUUID = entry.getKey();
+        String azName = isMultiAz ? AvailabilityZone.get(azUUID).getCode() : null;
+
+        Map<String, String> config = entry.getValue();
+
+        String namespace =
+            KubernetesUtil.getKubernetesNamespace(
+                isMultiAz,
+                universeDetails.nodePrefix,
+                azName,
+                config,
+                universeDetails.useNewHelmNamingStyle,
+                false);
+
+        String helmReleaseName =
+            KubernetesUtil.getHelmReleaseName(
+                isMultiAz,
+                universeDetails.nodePrefix,
+                universe.getName(),
+                azName,
+                false,
+                universeDetails.useNewHelmNamingStyle);
+
+        Set<String> ips =
+            getPreferredServiceIP(
+                config,
+                helmReleaseName,
+                namespace,
+                type == ServerType.MASTER,
+                universe
+                    .getConfig()
+                    .getOrDefault(Universe.LABEL_K8S_RESOURCES, "false")
+                    .equals("true") /* k8sNewLabels */,
+                universe.getName());
+        if (CollectionUtils.isEmpty(ips)) {
+          return null;
+        }
+
+        int rpcPort;
+        switch (type) {
+          case MASTER:
+            rpcPort = universeDetails.communicationPorts.masterRpcPort;
+            break;
+          case YSQLSERVER:
+            rpcPort = universeDetails.communicationPorts.ysqlServerRpcPort;
+            break;
+          case YQLSERVER:
+            rpcPort = universeDetails.communicationPorts.yqlServerRpcPort;
+            break;
+          case REDISSERVER:
+            rpcPort = universeDetails.communicationPorts.redisServerRpcPort;
+            break;
+          default:
+            throw new IllegalArgumentException("Unexpected type " + type);
+        }
+        ips.stream().forEach(ip -> allIPs.add(String.format("%s:%d", ip, rpcPort)));
+      }
+      return String.join(",", allIPs);
+    }
+  }
+
   /* kubernetes interface */
 
   public abstract void createNamespace(Map<String, String> config, String universePrefix);
@@ -491,22 +871,39 @@ public abstract class KubernetesManager {
 
   public abstract Pod getPodObject(Map<String, String> config, String namespace, String podName);
 
+  public abstract String getCloudProvider(Map<String, String> config);
+
   public abstract List<Pod> getPodInfos(
       Map<String, String> config, String universePrefix, String namespace);
 
   public abstract List<Service> getServices(
       Map<String, String> config, String universePrefix, String namespace);
 
+  public abstract List<Namespace> getNamespaces(Map<String, String> config);
+
+  public boolean namespaceExists(Map<String, String> config, String namespace) {
+    Set<String> namespaceNames =
+        getNamespaces(config).stream()
+            .map(n -> n.getMetadata().getName())
+            .collect(Collectors.toSet());
+    return namespaceNames.contains(namespace);
+  }
+
+  public abstract boolean dbNamespaceExists(Map<String, String> config, String namespace);
+
   public abstract PodStatus getPodStatus(
       Map<String, String> config, String namespace, String podName);
 
-  /** @return the first that exists of loadBalancer.hostname, loadBalancer.ip, clusterIp */
-  public abstract String getPreferredServiceIP(
+  /**
+   * @return the first that exists of loadBalancer.hostname, loadBalancer.ip, clusterIp
+   */
+  public abstract Set<String> getPreferredServiceIP(
       Map<String, String> config,
       String universePrefix,
       String namespace,
       boolean isMaster,
-      boolean newNamingStyle);
+      boolean k8sNewLabels,
+      String universeName);
 
   public abstract List<Node> getNodeInfos(Map<String, String> config);
 
@@ -519,6 +916,9 @@ public abstract class KubernetesManager {
       String namespace,
       int numNodes,
       boolean newNamingStyle);
+
+  public abstract void PauseAllPodsInRelease(
+      Map<String, String> config, String universePrefix, String namespace, boolean newNamingStyle);
 
   public abstract void deleteStorage(
       Map<String, String> config, String universePrefix, String namespace);
@@ -533,12 +933,56 @@ public abstract class KubernetesManager {
       Map<String, String> config, String namespace, String stsName);
 
   public abstract boolean expandPVC(
+      UUID universeUUID,
       Map<String, String> config,
       String namespace,
       String helmReleaseName,
       String appName,
       String newDiskSize,
       boolean newNamingStyle);
+
+  public abstract List<Quantity> getPVCSizeList(
+      Map<String, String> config,
+      String namespace,
+      String helmReleaseName,
+      String appName,
+      boolean newNamingStyle);
+
+  public abstract List<PersistentVolumeClaim> getPVCs(
+      Map<String, String> config,
+      String namespace,
+      String helmReleaseName,
+      String appName,
+      boolean newNamingStyle);
+
+  public abstract List<Pod> getPods(
+      Map<String, String> config,
+      String namespace,
+      String helmReleaseName,
+      String appName,
+      boolean newNamingStyle);
+
+  public abstract void deleteAllServerTypePods(
+      Map<String, String> config,
+      String namespace,
+      ServerType serverType,
+      String releaseName,
+      boolean newNamingStyle);
+
+  public abstract void copyFileToPod(
+      Map<String, String> config,
+      String namespace,
+      String podName,
+      String containerName,
+      String srcFilePath,
+      String destFilePath);
+
+  public abstract String executeCommandInPodContainer(
+      Map<String, String> config,
+      String namespace,
+      String podName,
+      String containerName,
+      List<String> commandArgs);
 
   // Get the name of StorageClass used for master/tserver PVCs.
   public abstract String getStorageClassName(
@@ -565,6 +1009,8 @@ public abstract class KubernetesManager {
 
   public abstract String getPlatformNamespace();
 
+  public abstract String getPlatformPodName();
+
   public abstract String getHelmValues(
       Map<String, String> config, String namespace, String helmReleaseName, String outputFormat);
 
@@ -584,5 +1030,46 @@ public abstract class KubernetesManager {
       Map<String, String> config, RoleData roleData, String outputFormat);
 
   public abstract String getStorageClass(
-      Map<String, String> config, String storageClassName, String namespace, String outputFormat);
+      Map<String, String> config, String storageClassName, String outputFormat);
+
+  public abstract StorageClass getStorageClass(Map<String, String> config, String storageClassName);
+
+  public abstract String getKubeconfigUser(Map<String, String> config);
+
+  public abstract String getKubeconfigCluster(Map<String, String> config);
+
+  public abstract boolean checkStatefulSetStatus(
+      Map<String, String> config, String namespace, String labelSelector, int replicaCount);
+
+  public abstract void deleteUnusedPVCs(
+      Map<String, String> config,
+      String namespace,
+      String helmReleaseName,
+      String appName,
+      boolean newNamingStyle,
+      int replicaCount);
+
+  public abstract boolean resourceExists(
+      Map<String, String> config, String resourceType, String resourceName, String namespace);
+
+  public abstract Map<ServerType, String> getServerTypeGflagsChecksumMap(
+      String namespace, String helmReleaseName, Map<String, String> config, boolean newNamingStyle);
+
+  public abstract String getCertChecksum(
+      String namespace, String helmReleaseName, Map<String, String> config);
+
+  public abstract void deleteNamespacedService(
+      Map<String, String> config, String namespace, String universeName);
+
+  public abstract void deleteNamespacedService(
+      Map<String, String> config,
+      String namespace,
+      String universeName,
+      @Nullable Set<String> serviceNames);
+
+  public abstract void updateNamespacedServiceOwnership(
+      Map<String, String> config, String namespace, String universeName, String ownerReleaseName);
+
+  public abstract List<Service> getNamespacedServices(
+      Map<String, String> config, String namespace, String universeName);
 }

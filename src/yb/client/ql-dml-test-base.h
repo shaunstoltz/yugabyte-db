@@ -1,4 +1,4 @@
-// Copyright (c) YugaByte, Inc.
+// Copyright (c) YugabyteDB, Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License"); you may not use this file except
 // in compliance with the License.  You may obtain a copy of the License at
@@ -19,10 +19,9 @@
 
 #include <gtest/gtest.h>
 
-#include "yb/client/callbacks.h"
 #include "yb/client/table_handle.h"
 #include "yb/common/ql_protocol.pb.h"
-#include "yb/common/ql_rowblock.h"
+#include "yb/qlexpr/ql_rowblock.h"
 
 #include "yb/server/server_fwd.h"
 
@@ -176,6 +175,12 @@ extern template class KeyValueTableTest<MiniCluster>;
 extern template class KeyValueTableTest<ExternalMiniCluster>;
 
 Status CheckOp(YBqlOp* op);
+
+// Select rows count without intermediate conversion of rows to string vector as CountTableRows
+// does.
+Result<size_t> CountRows(
+    const YBSessionPtr& session, const TableHandle& table,
+    MonoDelta timeout = MonoDelta::FromSeconds(10) * kTimeMultiplier);
 
 }  // namespace client
 }  // namespace yb

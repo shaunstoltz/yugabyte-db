@@ -1,4 +1,4 @@
-// Copyright (c) YugaByte, Inc.
+// Copyright (c) YugabyteDB, Inc.
 
 package com.yugabyte.yw.common;
 
@@ -12,7 +12,6 @@ import static com.yugabyte.yw.models.helpers.TaskType.StartNodeInUniverse;
 import static com.yugabyte.yw.models.helpers.TaskType.StopNodeInUniverse;
 import static org.junit.Assert.assertEquals;
 
-import com.yugabyte.yw.commissioner.tasks.RebootNodeInUniverse;
 import com.yugabyte.yw.models.CustomerTask;
 import org.junit.Test;
 

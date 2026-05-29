@@ -15,9 +15,9 @@
 // specific language governing permissions and limitations
 // under the License.
 //
-// The following only applies to changes made to this file as part of YugaByte development.
+// The following only applies to changes made to this file as part of YugabyteDB development.
 //
-// Portions Copyright (c) YugaByte, Inc.
+// Portions Copyright (c) YugabyteDB, Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License"); you may not use this file except
 // in compliance with the License.  You may obtain a copy of the License at
@@ -35,7 +35,7 @@
 #include <algorithm>
 #include <random>
 
-#include <glog/logging.h> // For CHECK
+#include "yb/util/logging.h"  // For CHECK
 
 namespace yb {
 
@@ -147,5 +147,18 @@ typename Collection::const_reference RandomElement(const Collection& collection,
 }
 
 std::string RandomHumanReadableString(size_t len, std::mt19937_64* rng = nullptr);
+
+template<typename Distribution>
+std::vector<float> RandomFloatVector(
+    size_t dimensions, Distribution& dis, std::mt19937_64* rng = nullptr) {
+  if (!rng) {
+    rng = &ThreadLocalRandom();
+  }
+  std::vector<float> vec(dimensions);
+  for (auto& v : vec) {
+    v = dis(*rng);
+  }
+  return vec;
+}
 
 } // namespace yb

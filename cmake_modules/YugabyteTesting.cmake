@@ -1,4 +1,4 @@
-# Copyright (c) Yugabyte, Inc.
+# Copyright (c) YugabyteDB, Inc.
 #
 # Licensed under the Apache License, Version 2.0 (the "License"); you may not use this file except
 # in compliance with the License.  You may obtain a copy of the License at
@@ -238,4 +238,24 @@ function(ADD_YB_TEST_LIBRARY LIB_NAME)
   if(ARG_NONLINK_DEPS)
     add_dependencies(${LIB_NAME} ${ARG_NONLINK_DEPS})
   endif()
+endfunction()
+
+function(ADD_YB_FUZZ_TARGET REL_TEST_NAME)
+  if(NOT YB_BUILD_FUZZ_TARGETS)
+    return()
+  endif()
+  set(TEST_SOURCE_PATH "${CMAKE_CURRENT_LIST_DIR}/${REL_TEST_NAME}.cc")
+  if(NOT EXISTS "${TEST_SOURCE_PATH}")
+    message(FATAL_ERROR "Test source '${TEST_SOURCE_PATH}' does not exist.")
+  endif()
+  GET_TEST_PREFIX_AND_BINARY_NAME(CTEST_PREFIX TEST_BINARY_NAME ${REL_TEST_NAME})
+  set(TEST_BINARY_DIR "${YB_BUILD_ROOT}/fuzz-targets-${CTEST_PREFIX}")
+  set(TEST_PATH "${TEST_BINARY_DIR}/${TEST_BINARY_NAME}")
+  add_executable("${TEST_BINARY_NAME}" "${TEST_SOURCE_PATH}")
+  set_target_properties(${TEST_BINARY_NAME}
+    PROPERTIES
+    LINK_FLAGS "-fsanitize=fuzzer"
+    COMPILE_FLAGS "-fsanitize=fuzzer"
+    RUNTIME_OUTPUT_DIRECTORY "${TEST_BINARY_DIR}")
+  target_link_libraries(${TEST_BINARY_NAME} ${YB_FUZZ_TARGET_LINK_LIBS})
 endfunction()

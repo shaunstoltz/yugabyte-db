@@ -1,5 +1,5 @@
 /*
- * Copyright 2019 YugaByte, Inc. and Contributors
+ * Copyright 2019 YugabyteDB, Inc. and Contributors
  *
  * Licensed under the Polyform Free Trial License 1.0.0 (the "License"); you
  * may not use this file except in compliance with the License. You
@@ -50,44 +50,40 @@ public class WaitForLoadBalance extends AbstractTaskBase {
 
   @Override
   public String getName() {
-    return super.getName() + "(" + taskParams().universeUUID + ")";
+    return super.getName() + "(" + taskParams().getUniverseUUID() + ")";
   }
 
   @Override
   public void run() {
-    Universe universe = Universe.getOrBadRequest(taskParams().universeUUID);
-    String hostPorts = universe.getMasterAddresses();
-    String certificate = universe.getCertificateNodetoNode();
+    Universe universe = Universe.getOrBadRequest(taskParams().getUniverseUUID());
+    String masterAddresses = universe.getMasterAddresses();
     boolean ret = false;
-    YBClient client = null;
-    try {
+    try (YBClient client = ybService.getUniverseClient(universe)) {
       log.info(
-          "Running {}: hostPorts={}, numTservers={}.",
+          "Running {}: masterAddresses={}, numTservers={}.",
           getName(),
-          hostPorts,
+          masterAddresses,
           taskParams().numTservers);
-      client = ybService.getClient(hostPorts, certificate);
       waitFor(Duration.ofSeconds(getSleepMultiplier() * SLEEP_TIME));
       // When an AZ is down and Platform is unaware(external failure) then load balancing will not
       // work if we pass in the expected number of TServers to the API as the first step for load
       // balancing is the liveness check. All those TServers will be expected to be alive at the
-      // minimum. The TServer which is down becuase of an external fault will fail this liveness
+      // minimum. The TServer which is down because of an external fault will fail this liveness
       // check, so load will not be balanced. NOTE: Zero implies load distribution can be checked
       // across all servers which the master leader knows about.
       ret = client.waitForLoadBalance(TIMEOUT_SERVER_WAIT_MS, taskParams().numTservers);
     } catch (Exception e) {
       log.error("{} hit error : {}", getName(), e.getMessage());
       Throwables.propagate(e);
-    } finally {
-      ybService.closeClient(client, hostPorts);
     }
+
     if (!ret) {
       throw new RuntimeException(getName() + " did not complete.");
     }
     log.info(
-        "Completed {}: hostPorts={}, numTservers={}.",
+        "Completed {}: masterAddresses={}, numTservers={}.",
         getName(),
-        hostPorts,
+        masterAddresses,
         taskParams().numTservers);
   }
 }

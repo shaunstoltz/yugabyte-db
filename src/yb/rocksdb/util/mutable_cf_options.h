@@ -3,9 +3,9 @@
 // LICENSE file in the root directory of this source tree. An additional grant
 // of patent rights can be found in the PATENTS file in the same directory.
 //
-// The following only applies to changes made to this file as part of YugaByte development.
+// The following only applies to changes made to this file as part of YugabyteDB development.
 //
-// Portions Copyright (c) YugaByte, Inc.
+// Portions Copyright (c) YugabyteDB, Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License"); you may not use this file except
 // in compliance with the License.  You may obtain a copy of the License at
@@ -31,6 +31,7 @@ struct MutableCFOptions {
   MutableCFOptions(const Options& options, const ImmutableCFOptions& ioptions)
       : write_buffer_size(options.write_buffer_size),
         max_write_buffer_number(options.max_write_buffer_number),
+        max_flushing_bytes(options.max_flushing_bytes),
         arena_block_size(options.arena_block_size),
         memtable_prefix_bloom_bits(options.memtable_prefix_bloom_bits),
         memtable_prefix_bloom_probes(options.memtable_prefix_bloom_probes),
@@ -64,7 +65,7 @@ struct MutableCFOptions {
             options.max_sequential_skip_in_iterations),
         paranoid_file_checks(options.paranoid_file_checks),
         compaction_measure_io_stats(options.compaction_measure_io_stats),
-        max_file_size_for_compaction(options.max_file_size_for_compaction) {
+        exclude_from_compaction(options.exclude_from_compaction) {
     RefreshDerivedOptions(ioptions);
   }
 
@@ -97,15 +98,14 @@ struct MutableCFOptions {
         max_sequential_skip_in_iterations(0),
         paranoid_file_checks(false),
         compaction_measure_io_stats(false),
-        max_file_size_for_compaction(nullptr) {}
+        exclude_from_compaction(nullptr) {}
 
   // Must be called after any change to MutableCFOptions
   void RefreshDerivedOptions(const ImmutableCFOptions& ioptions);
 
   // Get the max file size in a given level.
   uint64_t MaxFileSizeForLevel(int level) const;
-  // Get the max file size for compaction.
-  uint64_t MaxFileSizeForCompaction() const;
+
   // Returns maximum total overlap bytes with grandparent
   // level (i.e., level+2) before we stop building a single
   // file in level->level+1 compaction.
@@ -119,11 +119,14 @@ struct MutableCFOptions {
     return max_bytes_for_level_multiplier_additional[level];
   }
 
+  bool ExcludeFromCompaction(const FileMetaData& file) const;
+
   void Dump(Logger* log) const;
 
   // Memtable related options
   size_t write_buffer_size;
   int max_write_buffer_number;
+  size_t max_flushing_bytes = std::numeric_limits<size_t>::max();
   size_t arena_block_size;
   uint32_t memtable_prefix_bloom_bits;
   uint32_t memtable_prefix_bloom_probes;
@@ -155,7 +158,7 @@ struct MutableCFOptions {
   uint64_t max_sequential_skip_in_iterations;
   bool paranoid_file_checks;
   bool compaction_measure_io_stats;
-  std::shared_ptr<std::function<uint64_t()>> max_file_size_for_compaction;
+  std::shared_ptr<CompactionFileExcluder> exclude_from_compaction;
 
   // Derived options
   // Per-level target file size.

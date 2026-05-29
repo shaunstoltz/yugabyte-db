@@ -1,4 +1,4 @@
-// Copyright (c) YugaByte, Inc.
+// Copyright (c) YugabyteDB, Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License"); you may not use this file except
 // in compliance with the License.  You may obtain a copy of the License at
@@ -13,7 +13,7 @@
 
 #include "yb/master/yql_peers_vtable.h"
 
-#include "yb/common/ql_protocol.pb.h"
+#include "yb/common/ql_protocol.messages.h"
 #include "yb/common/ql_type.h"
 #include "yb/common/schema.h"
 
@@ -32,8 +32,6 @@ namespace master {
 
 using std::string;
 using std::shared_ptr;
-using std::unique_ptr;
-using std::map;
 using std::vector;
 
 namespace {
@@ -56,8 +54,8 @@ PeersVTable::PeersVTable(const TableName& table_name,
     : YQLVirtualTable(table_name, namespace_name, master, CreateSchema()) {
 }
 
-Result<std::shared_ptr<QLRowBlock>> PeersVTable::RetrieveData(
-    const QLReadRequestPB& request) const {
+Result<VTableDataPtr> PeersVTable::RetrieveData(
+    const QLReadRequestMsg& request) const {
   // Retrieve all lives nodes known by the master.
   // TODO: Ideally we would like to populate this table with all valid nodes of the cluster, but
   // currently the master just has a list of all nodes it has heard from and which one of those
@@ -75,7 +73,7 @@ Result<std::shared_ptr<QLRowBlock>> PeersVTable::RetrieveData(
   const auto& proxy_uuid = request.proxy_uuid();
 
   // Populate the YQL rows.
-  auto vtable = std::make_shared<QLRowBlock>(schema());
+  auto vtable = std::make_shared<qlexpr::QLRowBlock>(schema());
 
   struct Entry {
     size_t index;
@@ -91,7 +89,7 @@ Result<std::shared_ptr<QLRowBlock>> PeersVTable::RetrieveData(
     size_t current_index = index++;
 
     // This is thread safe since all operations are reads.
-    TSInformationPB ts_info = *desc->GetTSInformationPB();
+    TSInformationPB ts_info = desc->GetTSInformationPB();
 
     if (!proxy_uuid.empty()) {
       if (desc->permanent_uuid() == proxy_uuid) {
@@ -116,21 +114,21 @@ Result<std::shared_ptr<QLRowBlock>> PeersVTable::RetrieveData(
     // result, skip 'remote_endpoint' in the results.
     auto private_ip = entry.ts_ips.private_ip_future.get();
     if (!private_ip.ok()) {
-      LOG(ERROR) << "Failed to get private ip from " << entry.ts_info.ShortDebugString()
-                 << ": " << private_ip.status();
+      LOG(WARNING) << "Failed to get private ip from " << entry.ts_info.ShortDebugString()
+                   << ": " << private_ip.status();
       continue;
     }
 
     auto public_ip = entry.ts_ips.public_ip_future.get();
     if (!public_ip.ok()) {
-      LOG(ERROR) << "Failed to get public ip from " << entry.ts_info.ShortDebugString()
-                 << ": " << public_ip.status();
+      LOG(WARNING) << "Failed to get public ip from " << entry.ts_info.ShortDebugString()
+                   << ": " << public_ip.status();
       continue;
     }
 
     // Need to use only 1 rpc address per node since system.peers has only 1 entry for each host,
     // so pick the first one.
-    QLRow &row = vtable->Extend();
+    auto &row = vtable->Extend();
     RETURN_NOT_OK(SetColumnValue(kPeer, InetAddress(*public_ip), &row));
     RETURN_NOT_OK(SetColumnValue(kRPCAddress, InetAddress(*public_ip), &row));
     RETURN_NOT_OK(SetColumnValue(kPreferredIp, InetAddress(*private_ip), &row));

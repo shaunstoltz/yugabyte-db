@@ -1,5 +1,5 @@
 //--------------------------------------------------------------------------------------------------
-// Copyright (c) YugaByte, Inc.
+// Copyright (c) YugabyteDB, Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License"); you may not use this file except
 // in compliance with the License.  You may obtain a copy of the License at
@@ -15,36 +15,37 @@
 #pragma once
 
 #include <memory>
-#include <utility>
+
+#include "yb/util/result.h"
 
 #include "yb/yql/pggate/pg_dml_write.h"
 
-namespace yb {
-namespace pggate {
+namespace yb::pggate {
 
-//--------------------------------------------------------------------------------------------------
-// DELETE
-//--------------------------------------------------------------------------------------------------
-
-class PgDelete : public PgDmlWrite {
+class PgDelete final : public PgStatementLeafBase<PgDmlWrite, StmtOp::kDelete> {
  public:
-  PgDelete(PgSession::ScopedRefPtr pg_session,
-           const PgObjectId& table_id,
-           bool is_single_row_txn,
-           bool is_region_local)
-      : PgDmlWrite(std::move(pg_session), table_id, is_single_row_txn, is_region_local) {}
-
-  StmtOp stmt_op() const override { return StmtOp::STMT_DELETE; }
-
-  void SetIsPersistNeeded(const bool is_persist_needed) {
+  void SetIsPersistNeeded(bool is_persist_needed) {
     write_req_->set_is_delete_persist_needed(is_persist_needed);
   }
 
+  static Result<std::unique_ptr<PgDelete>> Make(
+      const PgSessionPtr& pg_session, const PgObjectId& table_id,
+      const YbcPgTableLocalityInfo& locality_info,
+      YbcPgTransactionSetting transaction_setting,
+      bool skip_intents_write) {
+    std::unique_ptr<PgDelete> result{new PgDelete{pg_session, transaction_setting}};
+    RETURN_NOT_OK(result->Prepare(table_id, locality_info, skip_intents_write));
+    return result;
+  }
+
  private:
+  PgDelete(
+      const PgSessionPtr& pg_session, YbcPgTransactionSetting transaction_setting)
+      : BaseType(pg_session, transaction_setting) {}
+
   PgsqlWriteRequestPB::PgsqlStmtType stmt_type() const override {
     return PgsqlWriteRequestPB::PGSQL_DELETE;
   }
 };
 
-}  // namespace pggate
-}  // namespace yb
+}  // namespace yb::pggate

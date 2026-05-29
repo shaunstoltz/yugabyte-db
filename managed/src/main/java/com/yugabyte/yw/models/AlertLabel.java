@@ -1,5 +1,5 @@
 /*
- * Copyright 2021 YugaByte, Inc. and Contributors
+ * Copyright 2021 YugabyteDB, Inc. and Contributors
  *
  * Licensed under the Polyform Free Trial License 1.0.0 (the "License"); you
  * may not use this file except in compliance with the License. You
@@ -13,12 +13,11 @@ package com.yugabyte.yw.models;
 import com.fasterxml.jackson.annotation.JsonIgnore;
 import com.yugabyte.yw.models.helpers.UniqueKeyListValue;
 import io.ebean.Model;
+import jakarta.persistence.Column;
+import jakarta.persistence.EmbeddedId;
+import jakarta.persistence.Entity;
+import jakarta.persistence.ManyToOne;
 import java.util.Objects;
-import javax.persistence.Column;
-import javax.persistence.EmbeddedId;
-import javax.persistence.Entity;
-import javax.persistence.ManyToOne;
-import javax.persistence.MapsId;
 import lombok.Data;
 import lombok.EqualsAndHashCode;
 import lombok.ToString;

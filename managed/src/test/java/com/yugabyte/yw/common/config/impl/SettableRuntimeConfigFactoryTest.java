@@ -1,5 +1,5 @@
 /*
- * Copyright 2021 YugaByte, Inc. and Contributors
+ * Copyright 2021 YugabyteDB, Inc. and Contributors
  *
  * Licensed under the Polyform Free Trial License 1.0.0 (the "License"); you
  * may not use this file except in compliance with the License. You
@@ -58,15 +58,15 @@ public class SettableRuntimeConfigFactoryTest extends FakeDBApplication {
 
   // app config
   private static final Map<String, Object> staticConfigMap =
-      ImmutableMap.of(
-          SettableRuntimeConfigFactory.RUNTIME_CONFIG_INCLUDED_OBJECTS,
-          ImmutableList.of("yb.external_script"),
-          YB_STATIC_ONLY_KEY,
-          Scope.STATIC.toString(),
-          YB_OVERRIDDEN_KEY,
-          Scope.STATIC.toString(),
-          YB_CLOUD_ENABLED_KEY,
-          Boolean.TRUE);
+      ImmutableMap.<String, Object>builder()
+          .put(
+              SettableRuntimeConfigFactory.RUNTIME_CONFIG_INCLUDED_OBJECTS,
+              ImmutableList.of("yb.external_script"))
+          .put(YB_STATIC_ONLY_KEY, Scope.STATIC.toString())
+          .put(YB_OVERRIDDEN_KEY, Scope.STATIC.toString())
+          .put(YB_CLOUD_ENABLED_KEY, Boolean.TRUE)
+          .put("runtime_config.cache_enabled", Boolean.FALSE)
+          .build();
 
   // overrides in global scope:
   private static final Set<String> globalConfigSet =
@@ -94,7 +94,7 @@ public class SettableRuntimeConfigFactoryTest extends FakeDBApplication {
   @Before
   public void setUp() {
     defaultCustomer = ModelFactory.testCustomer();
-    defaultUniverse = ModelFactory.createUniverse(defaultCustomer.getCustomerId());
+    defaultUniverse = ModelFactory.createUniverse(defaultCustomer.getId());
     defaultProvider = ModelFactory.kubernetesProvider(defaultCustomer);
   }
 
@@ -162,7 +162,8 @@ public class SettableRuntimeConfigFactoryTest extends FakeDBApplication {
     validateProviderValues(providerConfig);
 
     // modifying provider level should not mod customer config.
-    validateCustomerValues(configFactory.forCustomer(Customer.get(defaultProvider.customerUUID)));
+    validateCustomerValues(
+        configFactory.forCustomer(Customer.get(defaultProvider.getCustomerUUID())));
 
     // modifying provider level should not mod global config.
     validateGlobalValues(configFactory.globalRuntimeConf());
@@ -198,7 +199,8 @@ public class SettableRuntimeConfigFactoryTest extends FakeDBApplication {
     validateUniverseValues(universeConfig);
 
     // modifying universe level should not mod customer config.
-    validateCustomerValues(configFactory.forCustomer(Customer.get(defaultUniverse.customerId)));
+    validateCustomerValues(
+        configFactory.forCustomer(Customer.get(defaultUniverse.getCustomerId())));
 
     // modifying universe level should not mod global config.
     validateGlobalValues(configFactory.globalRuntimeConf());
@@ -209,8 +211,8 @@ public class SettableRuntimeConfigFactoryTest extends FakeDBApplication {
 
   @Test
   public void testTwoUniverses() {
-    Universe universe1 = ModelFactory.createUniverse("USA", defaultCustomer.getCustomerId());
-    Universe universe2 = ModelFactory.createUniverse("Asia", defaultCustomer.getCustomerId());
+    Universe universe1 = ModelFactory.createUniverse("USA", defaultCustomer.getId());
+    Universe universe2 = ModelFactory.createUniverse("Asia", defaultCustomer.getId());
     configFactory.forUniverse(universe1).setValue(TASK_GC_FREQUENCY, "1 day");
     configFactory.forUniverse(universe2).setValue(TASK_GC_FREQUENCY, "2 days");
 

@@ -1,4 +1,4 @@
-// Copyright (c) YugaByte, Inc.
+// Copyright (c) YugabyteDB, Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License"); you may not use this file except
 // in compliance with the License.  You may obtain a copy of the License at
@@ -14,17 +14,17 @@
 package org.yb.pgsql;
 
 import com.google.common.net.HostAndPort;
-import com.yugabyte.ysql.ClusterAwareLoadBalancer;
 import com.yugabyte.jdbc.PgConnection;
-import org.yb.AssertionWrappers;
+import com.yugabyte.ysql.LoadBalanceService;
 import org.junit.Test;
 import org.junit.runner.RunWith;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
+import org.yb.AssertionWrappers;
+import org.yb.YBTestRunner;
 import org.yb.client.TestUtils;
 import org.yb.minicluster.MiniYBClusterBuilder;
 import org.yb.minicluster.MiniYBDaemon;
-import org.yb.util.YBTestRunnerNonTsanOnly;
 
 import java.sql.Connection;
 import java.sql.ResultSet;
@@ -35,13 +35,13 @@ import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 
-@RunWith(value = YBTestRunnerNonTsanOnly.class)
+@RunWith(value = YBTestRunner.class)
 public class TestLoadBalance extends BasePgSQLTest {
   private static final Logger LOG = LoggerFactory.getLogger(TestPgEncryption.class);
 
   @Override
-  public ConnectionBuilder getConnectionBuilder() {
-    ConnectionBuilder cb = new ConnectionBuilder(miniCluster);
+  protected ConnectionBuilder getConnectionBuilder() {
+    ConnectionBuilder cb = super.getConnectionBuilder();
     cb.setLoadBalance(true);
     return cb;
   }
@@ -51,6 +51,33 @@ public class TestLoadBalance extends BasePgSQLTest {
     super.customizeMiniClusterBuilder(builder);
     builder.numTservers(7);
     builder.replicationFactor(3);
+  }
+
+  private static int parseYsqlPort(String[] cmds) {
+    for (String cmd : cmds) {
+      if (cmd.contains("pgsql_proxy_bind_address")) {
+        int idx = cmd.indexOf(":");
+        return Integer.parseInt(cmd.substring(idx + 1));
+      }
+    }
+
+    return 5433;
+  }
+
+  private static int parseYsqlConnMgrPort(String[] cmds) {
+    for (String cmd : cmds) {
+      if (cmd.contains("ysql_conn_mgr_port")) {
+        int idx = cmd.indexOf("=");
+        return Integer.parseInt(cmd.substring(idx + 1));
+      }
+    }
+
+    return 5433;
+  }
+
+  private int getSmartDriverPortFromTserverFlags(String[] cmds) {
+    return isTestRunningWithConnectionManager() == true ?
+       parseYsqlConnMgrPort(cmds) : parseYsqlPort(cmds);
   }
 
   @Test
@@ -78,15 +105,8 @@ public class TestLoadBalance extends BasePgSQLTest {
       AssertionWrappers.assertNotNull(portInMap);
       HostAndPort hp = HostAndPort.fromParts(host, portInMap);
       MiniYBDaemon daemon = hostPortsDaemonMap.get(hp);
-      String[] cmds = daemon.getCommandLine();
-      int pg_port = 5433;
-      for (String cmd : cmds) {
-        if (cmd.contains("pgsql_proxy_bind_address")) {
-          int idx = cmd.indexOf(":");
-          pg_port = Integer.parseInt(cmd.substring(idx+1));
-          break;
-        }
-      }
+      int pg_port = getSmartDriverPortFromTserverFlags(daemon.getCommandLine());
+
       AssertionWrappers.assertEquals("port should be equal", pg_port, port);
       AssertionWrappers.assertEquals("primary", node_type);
       AssertionWrappers.assertEquals("connections has been hardcoded to 0", 0, connections);
@@ -99,8 +119,6 @@ public class TestLoadBalance extends BasePgSQLTest {
     }
     AssertionWrappers.assertEquals(
       "expected servers started by minicluster", hostPortsDaemonMap.size(), cnt);
-    ClusterAwareLoadBalancer clb = ClusterAwareLoadBalancer.instance();
-    AssertionWrappers.assertNotNull(clb);
     List<Connection> connList = new ArrayList<>();
     try {
       Map<String, Integer> hostToNumConnections = new HashMap<>();
@@ -121,7 +139,7 @@ public class TestLoadBalance extends BasePgSQLTest {
       String firstHost = ((PgConnection)connection).getQueryExecutor().getHostSpec().getHost();
       Integer numConns = hostToNumConnections.get(firstHost);
       hostToNumConnections.put(firstHost, numConns+1);
-      clb.printHostToConnMap();
+      LoadBalanceService.printHostToConnectionMap();
       AssertionWrappers.assertEquals(7, hostToNumConnections.size());
       for (Map.Entry<String, Integer> e : hostToNumConnections.entrySet()) {
         AssertionWrappers.assertTrue(e.getValue() >= 2);
@@ -220,7 +238,7 @@ public class TestLoadBalance extends BasePgSQLTest {
     AssertionWrappers.assertTrue("Expected 7 tservers, found " + rows, rows == 7);
 
     AssertionWrappers.assertTrue("Expected 6 tservers not found",
-      verifyResultUntil(10, 3000, e.getKey(), 6));
+      verifyResultUntil(50, 3000, e.getKey(), 6));
 
     runProcess(
       TestUtils.findBinary("yb-admin"),

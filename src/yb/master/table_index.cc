@@ -1,4 +1,4 @@
-// Copyright (c) YugaByte, Inc.
+// Copyright (c) YugabyteDB, Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License"); you may not use this file except
 // in compliance with the License.  You may obtain a copy of the License at
@@ -27,27 +27,17 @@ scoped_refptr<TableInfo> TableIndex::FindTableOrNull(const TableId& id) const {
   return *result;
 }
 
-TableIndex::TablesRange TableIndex::GetAllTables() const {
-  return boost::make_iterator_range(
-      tables_.get<PrimaryTableTag>().begin(), tables_.get<PrimaryTableTag>().end());
-}
-
-TableIndex::TablesRange TableIndex::GetPrimaryTables() const {
-  auto range = tables_.get<PrimaryTableTag>().equal_range(false);
-  return boost::make_iterator_range(range.first, range.second);
-}
-
 void TableIndex::Clear() {
   tables_.clear();
 }
 
-void TableIndex::AddOrReplace(const scoped_refptr<TableInfo>& table) {
+void TableIndex::AddOrReplace(const TableInfoPtr& table) {
   auto [pos, insertion_successful] = tables_.insert(table);
   if (!insertion_successful) {
     std::string first_id = (*pos)->id();
     auto replace_successful = tables_.replace(pos, table);
     if (!replace_successful) {
-      LOG(ERROR) << Format(
+      LOG(WARNING) << Format(
           "Multiple tables prevented inserting a new table with id $0. First id was $1",
           table->id(), first_id);
     }

@@ -1,4 +1,4 @@
-// Copyright (c) YugaByte, Inc.
+// Copyright (c) YugabyteDB, Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License"); you may not use this file except
 // in compliance with the License.  You may obtain a copy of the License at
@@ -19,6 +19,7 @@
 
 #include "yb/docdb/docdb_fwd.h"
 
+#include "yb/master/leader_epoch.h"
 #include "yb/master/master_fwd.h"
 #include "yb/master/master_types.pb.h"
 
@@ -30,16 +31,16 @@
 
 #include "yb/tserver/backup.pb.h"
 
+#include "yb/util/monotime.h"
+
 namespace yb {
 namespace master {
 
 using TabletSnapshotOperationCallback =
     std::function<void(Result<const tserver::TabletSnapshotOpResponsePB&>)>;
 
-using ScheduleMinRestoreTime =
-    std::unordered_map<SnapshotScheduleId, HybridTime, SnapshotScheduleIdHash>;
-
 YB_STRONGLY_TYPED_BOOL(SendMetadata);
+YB_STRONGLY_TYPED_BOOL(IncludeHiddenTables);
 
 // Context class for MasterSnapshotCoordinator.
 class SnapshotCoordinatorContext {
@@ -51,22 +52,24 @@ class SnapshotCoordinatorContext {
 
   virtual AsyncTabletSnapshotOpPtr CreateAsyncTabletSnapshotOp(
       const TabletInfoPtr& tablet, const std::string& snapshot_id,
-      tserver::TabletSnapshotOpRequestPB::Operation operation,
+      tserver::TabletSnapshotOpRequestPB::Operation operation, const LeaderEpoch& epoch,
       TabletSnapshotOperationCallback callback) = 0;
 
   virtual void ScheduleTabletSnapshotOp(const AsyncTabletSnapshotOpPtr& operation) = 0;
 
   virtual Result<SysRowEntries> CollectEntriesForSnapshot(
-      const google::protobuf::RepeatedPtrField<TableIdentifierPB>& tables) = 0;
+      const google::protobuf::RepeatedPtrField<TableIdentifierPB>& tables,
+      IncludeHiddenTables includeHiddenTables = IncludeHiddenTables::kFalse) = 0;
 
   virtual Status RestoreSysCatalog(
-      SnapshotScheduleRestoration* restoration, tablet::Tablet* tablet,
+      SnapshotScheduleRestoration* restoration, tablet::Tablet* tablet, bool leader_mode,
       Status* complete_status) = 0;
   virtual Status VerifyRestoredObjects(
       const std::unordered_map<std::string, SysRowEntryType>& objects,
       const google::protobuf::RepeatedPtrField<TableIdentifierPB>& tables) = 0;
 
-  virtual void CleanupHiddenObjects(const ScheduleMinRestoreTime& schedule_min_restore_time) = 0;
+  virtual void CleanupHiddenObjects(
+      const ScheduleMinRestoreTime& schedule_min_restore_time, const LeaderEpoch& epoch) = 0;
 
   virtual const Schema& schema() = 0;
 
@@ -82,16 +85,33 @@ class SnapshotCoordinatorContext {
 
   virtual Result<size_t> GetNumLiveTServersForActiveCluster() = 0;
 
-  virtual void ReenableTabletSplitting(const std::string& feature) = 0;
-
   virtual Result<scoped_refptr<TableInfo>> GetTableById(const TableId& table_id) const = 0;
 
   virtual void AddPendingBackFill(const TableId& id) = 0;
 
+  // Advance per-DB OID counters past any in-use OIDs (including hidden tables).
+  // Used after PITR restore to prevent OID collisions with hidden tables.
+  //
+  // Note: PITR does NOT need to invalidate tserver OID caches. The caches are
+  // only inconsistent with master's allocator after ysql_dump paths (backup/
+  // restore, clone) that pin OIDs via binary_upgrade_set_next_heap_relfilenode.
+  // PITR restores sys catalog state via Raft; all OIDs in tserver caches were
+  // issued by the master allocator and remain consistent.
+  virtual Status AdvanceOidCounters(const NamespaceId& namespace_id) = 0;
+
   virtual ~SnapshotCoordinatorContext() = default;
+
+  virtual PitrCount pitr_count() const = 0;
+
+  // Collect the same set of SysRowEntries as CollectEntries, but by reading sys.catalog as of
+  // a specified hybrid time instead of using in-memory maps. This should include namespaces,
+  // UD types (when requested), tables, and tablets in RUNNING state as of 'read_time'.
+  virtual Result<SysRowEntries> CollectEntriesAsOfTime(
+      const NamespaceId& namespace_id, CollectFlags flags, HybridTime read_time,
+      CoarseTimePoint deadline) = 0;
 };
 
-Result<docdb::KeyBytes> EncodedKey(
+Result<dockv::KeyBytes> EncodedKey(
     SysRowEntryType type, const Slice& id, SnapshotCoordinatorContext* context);
 
 } // namespace master

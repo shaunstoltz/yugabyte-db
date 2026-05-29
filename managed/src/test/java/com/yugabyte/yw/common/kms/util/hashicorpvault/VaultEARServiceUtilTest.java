@@ -1,5 +1,5 @@
 /*
- * Copyright 2021 YugaByte, Inc. and Contributors
+ * Copyright 2021 YugabyteDB, Inc. and Contributors
  *
  * Licensed under the Polyform Free Trial License 1.0.0 (the "License"); you
  * may not use this file except in compliance with the License. You
@@ -17,10 +17,6 @@ import static org.junit.Assert.assertTrue;
 import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.when;
 
-import java.nio.charset.StandardCharsets;
-import java.util.Arrays;
-import java.util.UUID;
-
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.node.ObjectNode;
 import com.yugabyte.yw.common.FakeDBApplication;
@@ -28,12 +24,13 @@ import com.yugabyte.yw.common.kms.util.EncryptionAtRestUtil.KeyType;
 import com.yugabyte.yw.common.kms.util.HashicorpEARServiceUtil;
 import com.yugabyte.yw.common.kms.util.KeyProvider;
 import com.yugabyte.yw.models.KmsConfig;
-
+import java.nio.charset.StandardCharsets;
+import java.util.Arrays;
+import java.util.UUID;
 import org.junit.Before;
 import org.junit.Test;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
-
 import play.libs.Json;
 
 public class VaultEARServiceUtilTest extends FakeDBApplication {
@@ -94,16 +91,16 @@ public class VaultEARServiceUtilTest extends FakeDBApplication {
   public void setUp() {
     LOCAL_MOCK_RUN = MOCK_RUN;
     config = new KmsConfig();
-    config.authConfig = (ObjectNode) Json.parse(jsonString);
-    config.customerUUID = customerID;
-    config.configUUID = testConfigID;
+    config.setAuthConfig((ObjectNode) Json.parse(jsonString));
+    config.setCustomerUUID(customerID);
+    config.setConfigUUID(testConfigID);
   }
 
   @Test
   public void testGetVaultSecretEngine() {
     String key = "key1";
     byte[] data = "TestData".getBytes();
-    ObjectNode cfg = config.authConfig;
+    ObjectNode cfg = config.getAuthConfig();
 
     try {
       VaultSecretEngineBase transitEngine;
@@ -133,7 +130,7 @@ public class VaultEARServiceUtilTest extends FakeDBApplication {
 
     VaultAccessor vAccessor;
     VaultSecretEngineBase transitEngine;
-    ObjectNode cfg = config.authConfig.deepCopy();
+    ObjectNode cfg = config.getAuthConfig().deepCopy();
 
     if (LOCAL_MOCK_RUN) {
       vAccessor = mock(VaultAccessor.class);
@@ -157,7 +154,7 @@ public class VaultEARServiceUtilTest extends FakeDBApplication {
 
     VaultAccessor vAccessor;
     VaultSecretEngineBase transitEngine;
-    ObjectNode cfg = config.authConfig.deepCopy();
+    ObjectNode cfg = config.getAuthConfig().deepCopy();
     if (!LOCAL_MOCK_RUN) return;
 
     vAccessor = mock(VaultAccessor.class);

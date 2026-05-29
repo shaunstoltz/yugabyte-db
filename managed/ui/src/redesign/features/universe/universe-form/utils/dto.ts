@@ -1,4 +1,10 @@
+import { ArchitectureType } from '../../../../../components/configRedesign/providerRedesign/constants';
 import { ProviderMin } from '../form/fields/ProvidersField/ProvidersField';
+import { AuditLogConfig } from '../../universe-tabs/db-audit-logs/utils/types';
+import {
+  MULTI_TENANCY_QOS_MAX_DB_CPU_PERCENT_FALLBACK,
+  MULTI_TENANCY_QOS_MAX_DB_COUNT_FALLBACK
+} from '../../universe-actions/edit-multi-tenancy/multiTenancyQosDbCount';
 
 //This File has enum, interfaces, dto related Universe Form and divided to help in finding theme easily
 //--------------------------------------------------------- Most Used OR Common Types - Starts --------------------------------------------------------
@@ -10,6 +16,13 @@ export enum ClusterModes {
 export enum ClusterType {
   PRIMARY = 'PRIMARY',
   ASYNC = 'ASYNC'
+}
+
+export enum UpdateActions {
+  FULL_MOVE = 'FULL_MOVE',
+  SMART_RESIZE = 'SMART_RESIZE',
+  SMART_RESIZE_NON_RESTART = 'SMART_RESIZE_NON_RESTART',
+  UPDATE = 'UPDATE'
 }
 
 export enum CloudType {
@@ -24,6 +37,17 @@ export enum CloudType {
   other = 'other'
 }
 
+export enum MasterPlacementMode {
+  COLOCATED = 'COLOCATED',
+  DEDICATED = 'DEDICATED'
+}
+
+export enum K8sEncryptionOption {
+  ClienToNode = 'enableClientToNodeEncrypt',
+  NodeToNode = 'enableNodeToNodeEncrypt',
+  EnableBoth = 'EnableBoth'
+}
+
 export interface CommunicationPorts {
   masterHttpPort: number;
   masterRpcPort: number;
@@ -36,17 +60,22 @@ export interface CommunicationPorts {
   ysqlServerHttpPort: number;
   ysqlServerRpcPort: number;
   nodeExporterPort: number;
+  ybControllerrRpcPort: number;
 }
 
 export enum StorageType {
   IO1 = 'IO1',
+  IO2 = 'IO2',
   GP2 = 'GP2',
   GP3 = 'GP3',
   Scratch = 'Scratch',
   Persistent = 'Persistent',
   StandardSSD_LRS = 'StandardSSD_LRS',
   Premium_LRS = 'Premium_LRS',
-  UltraSSD_LRS = 'UltraSSD_LRS'
+  PremiumV2_LRS = 'PremiumV2_LRS',
+  UltraSSD_LRS = 'UltraSSD_LRS',
+  Hyperdisk_Balanced = 'Hyperdisk_Balanced',
+  Hyperdisk_Extreme = 'Hyperdisk_Extreme'
 }
 export interface DeviceInfo {
   volumeSize: number;
@@ -54,8 +83,24 @@ export interface DeviceInfo {
   diskIops: number | null;
   throughput: number | null;
   storageClass: 'standard'; // hardcoded in DeviceInfo.java
-  mountPoints: string | null;
+  mountPoints?: string | null;
   storageType: StorageType | null;
+}
+
+/** Per-AZ override for K8s: perProcess.TSERVER/MASTER each have deviceInfo (volume size/count/storage class). */
+export interface AZOverridePerProcess {
+  deviceInfo?: {
+    volumeSize?: number;
+    numVolumes?: number;
+    storageClass?: string;
+  };
+}
+
+export interface AZOverridePerAZ {
+  perProcess?: {
+    TSERVER?: AZOverridePerProcess;
+    MASTER?: AZOverridePerProcess;
+  };
 }
 
 export enum ExposingServiceTypes {
@@ -95,15 +140,22 @@ export interface UserIntent {
   replicationFactor: number;
   regionList: string[];
   instanceType: string | null;
+  masterInstanceType?: string | null;
+  tserverK8SNodeResourceSpec?: K8NodeSpec | null;
+  masterK8SNodeResourceSpec?: K8NodeSpec | null;
   numNodes: number;
+  masterNumNodes?: number;
   ybSoftwareVersion: string | null;
   deviceInfo: DeviceInfo | null;
+  masterDeviceInfo?: DeviceInfo | null;
   enableYSQL: boolean;
   enableYSQLAuth: boolean;
   enableYCQL: boolean;
   enableYCQLAuth: boolean;
   enableExposingService: ExposingServiceTypes | null;
   useSystemd: boolean;
+  enableConnectionPooling?: boolean;
+  multiTenancy?: { enableQos: boolean; qosMaxDbCpuPercent?: number; qosMaxDbCount?: number };
   //optional fields
   accessKeyCode?: string | null;
   dedicatedNodes?: boolean;
@@ -118,10 +170,27 @@ export interface UserIntent {
   enableIPV6?: boolean;
   ybcPackagePath?: string | null;
   instanceTags?: Record<string, string>;
+  specificGFlags?: {
+    gflagGroups?: string[];
+    inheritFromPrimary: boolean;
+    perProcessFlags: {
+      value?: {
+        MASTER?: Record<string, any>;
+        TSERVER?: Record<string, any>;
+      };
+    };
+    perAZ?: {};
+  };
   masterGFlags?: Record<string, any>;
   tserverGFlags?: Record<string, any>;
   universeOverrides?: string;
-  azOverrides?: Record<string, string>;
+  userIntentOverrides?: {
+    azOverrides?: Record<string, AZOverridePerAZ>;
+  };
+  proxyConfig?: {};
+  useSpotInstance?: boolean | null;
+  imageBundleUUID?: string;
+  auditLogConfig?: AuditLogConfig;
 }
 
 export interface Cluster {
@@ -159,6 +228,7 @@ export interface NodeDetails {
   nodeUuid: string | null;
   placementUuid: string;
   state: NodeState;
+  cloudInfo?: CloudInfo;
 }
 
 export interface EncryptionAtRestConfig {
@@ -180,6 +250,7 @@ export interface UniverseDetails {
   communicationPorts: CommunicationPorts;
   cmkArn: string;
   deviceInfo: DeviceInfo | null;
+  masterDeviceInfo: DeviceInfo | null;
   encryptionAtRestConfig: EncryptionAtRestConfig;
   errorString: string | null;
   expectedUniverseVersion: number;
@@ -190,12 +261,24 @@ export interface UniverseDetails {
   nodePrefix: string;
   resetAZConfig: boolean;
   rootCA: string;
+  clientRootCA: string;
+  rootAndClientRootCASame: boolean;
   universeUUID: string;
   updateInProgress: boolean;
+  updatingTaskUUID?: string;
   updateSucceeded: boolean;
   userAZSelected: boolean;
   enableYbc: boolean;
   updateOptions: string[];
+  useSpotInstance: boolean;
+  arch: ArchitectureType;
+  softwareUpgradeState: string;
+  prevYBSoftwareConfig: { softwareVersion: string };
+  universePaused: boolean;
+  xclusterInfo: any;
+  installNodeAgent: boolean;
+  nodeAgentMissing: boolean;
+  runOnlyPrechecks?: boolean;
 }
 
 export type UniverseConfigure = Partial<UniverseDetails>;
@@ -206,6 +289,8 @@ export interface Resources {
   memSizeGB: number;
   numCores: number;
   numNodes: number;
+  masterNumNodes?: number;
+  pricingKnown: boolean;
   pricePerHour: number;
   volumeCount: number;
   volumeSizeGB: number;
@@ -215,14 +300,24 @@ export interface UniverseConfig {
   disableAlertsUntilSecs: string;
   takeBackups: string;
 }
+
+export interface RollMaxBatchSize {
+  primaryBatchSize: number;
+  readReplicaBatchSize: number;
+}
+
 export interface Universe {
   creationDate: string;
   name: string;
+  pricePerHour: number;
   resources: Resources;
   universeConfig: UniverseConfig;
   universeDetails: UniverseDetails;
   universeUUID: string;
   version: number;
+  rollMaxBatchSize: RollMaxBatchSize;
+  drConfigUuidsAsSource: string[];
+  drConfigUuidsAsTarget: string[];
 }
 
 //-------------------------------------------------------- Payload related Types - Ends -------------------------------------------------------------------
@@ -253,6 +348,8 @@ export interface CommunicationPorts {
   ysqlServerHttpPort: number;
   ysqlServerRpcPort: number;
   nodeExporterPort: number;
+  internalYsqlServerRpcPort?: number;
+  ybControllerrRpcPort: number;
 }
 
 export interface DeviceInfo {
@@ -261,10 +358,18 @@ export interface DeviceInfo {
   diskIops: number | null;
   throughput: number | null;
   storageClass: 'standard'; // hardcoded in DeviceInfo.java
-  mountPoints: string | null;
+  mountPoints?: string | null;
   storageType: StorageType | null;
+  cloudVolumeEncryption?: {
+    enableVolumeEncryption: boolean;
+    kmsConfigUUID: string;
+  };
 }
 
+export interface K8NodeSpec {
+  memoryGib: number;
+  cpuCoreCount: number;
+}
 //-------------------------------------------------------- Most Used OR Common Types - Ends --------------------------------------------------------
 
 //-------------------------------------------------------- Payload related Types - Starts ----------------------------------------------------------
@@ -306,6 +411,7 @@ export interface UserIntent {
   enableYCQLAuth: boolean;
   enableExposingService: ExposingServiceTypes | null;
   useSystemd: boolean;
+  enableConnectionPooling?: boolean;
   //optional fields
   accessKeyCode?: string | null;
   dedicatedNodes?: boolean;
@@ -323,7 +429,7 @@ export interface UserIntent {
   masterGFlags?: Record<string, any>;
   tserverGFlags?: Record<string, any>;
   universeOverrides?: string;
-  azOverrides?: Record<string, string>;
+  azOverrides?: Record<string, AZOverridePerAZ>;
 }
 
 export interface Cluster {
@@ -335,12 +441,20 @@ export interface Cluster {
   regions?: any;
 }
 
+export interface CloudInfo {
+  assignPublicIP: boolean;
+  private_ip?: string;
+  az?: string;
+  region?: string;
+}
+
 export interface NodeDetails {
   nodeIdx: number;
   nodeName: string | null;
   nodeUuid: string | null;
   placementUuid: string;
   state: NodeState;
+  cloudInfo?: CloudInfo;
 }
 
 export interface EncryptionAtRestConfig {
@@ -378,6 +492,7 @@ export interface UniverseDetails {
   userAZSelected: boolean;
   enableYbc: boolean;
   updateOptions: string[];
+  xclusterInfo: any;
 }
 
 export interface Resources {
@@ -426,22 +541,32 @@ export interface CloudConfigFormValue {
   provider: ProviderMin | null;
   regionList: string[]; // array of region IDs
   numNodes: number;
+  masterNumNodes?: number;
   replicationFactor: number;
   autoPlacement?: boolean;
   placements: Placement[];
   defaultRegion?: string | null;
   resetAZConfig?: boolean;
+  userAZSelected?: boolean;
   mastersInDefaultRegion?: boolean;
+  masterPlacement?: MasterPlacementMode;
 }
 
 export interface InstanceConfigFormValue {
   instanceType: string | null;
+  useSpotInstance?: boolean | null;
+  masterInstanceType?: string | null;
   deviceInfo: DeviceInfo | null;
+  masterDeviceInfo?: DeviceInfo | null;
+  tserverK8SNodeResourceSpec?: K8NodeSpec | null;
+  masterK8SNodeResourceSpec?: K8NodeSpec | null;
   assignPublicIP: boolean;
   useTimeSync: boolean;
   enableClientToNodeEncrypt: boolean;
   enableNodeToNodeEncrypt: boolean;
   rootCA: string;
+  clientRootCA: string;
+  rootAndClientRootCASame: boolean;
   enableEncryptionAtRest: boolean;
   enableYSQL: boolean;
   enableYSQLAuth: boolean;
@@ -451,9 +576,12 @@ export interface InstanceConfigFormValue {
   enableYCQLAuth: boolean;
   ycqlPassword?: string;
   ycqlConfirmPassword?: string;
-  enableYEDIS: boolean;
+  enableYEDIS?: boolean;
   kmsConfig: string | null;
-  dedicatedNodes?: boolean;
+  arch?: ArchitectureType | null;
+  imageBundleUUID?: string | null;
+  k8sEncryptionType?: K8sEncryptionOption;
+  enableTLS?: boolean;
 }
 
 export interface AdvancedConfigFormValue {
@@ -466,6 +594,11 @@ export interface AdvancedConfigFormValue {
   accessKeyCode: string | null;
   ybSoftwareVersion: string | null;
   communicationPorts: CommunicationPorts;
+  enablePGCompatibitilty: boolean;
+  enableConnectionPooling?: boolean;
+  enableMultiTenancyQos?: boolean;
+  multiTenancyQosMaxDbCpuPercent?: number;
+  multiTenancyQosMaxDbCount?: number;
 }
 
 export interface InstanceTag {
@@ -479,6 +612,11 @@ export interface Gflag {
   Name: string;
   MASTER?: string | boolean | number;
   TSERVER?: string | boolean | number;
+  tags?: string;
+  /** True if changing this flag requires a restart/rolling restart; from gflag metadata (list_gflags). */
+  requiresRestart?: boolean;
+  /** True when the flag was added in this session via the Add GFlag modal; undefined/false for flags loaded from the universe. */
+  isNewlyAdded?: boolean;
 }
 
 export interface UniverseFormData {
@@ -487,8 +625,14 @@ export interface UniverseFormData {
   advancedConfig: AdvancedConfigFormValue;
   instanceTags: InstanceTags;
   gFlags: Gflag[];
+  inheritFlagsFromPrimary?: boolean;
   universeOverrides?: string;
+  /** Helm: userIntent.azOverrides (YAML strings per AZ) */
   azOverrides?: Record<string, string>;
+  /** K8s: userIntent.userIntentOverrides.azOverrides (per-AZ volume/config) */
+  k8sAzOverrides?: Record<string, AZOverridePerAZ>;
+  proxyConfig?: {};
+  specificGFlagsAzOverrides?: {};
 }
 
 //Default data
@@ -503,7 +647,9 @@ export const DEFAULT_COMMUNICATION_PORTS: CommunicationPorts = {
   yqlServerRpcPort: 9042,
   ysqlServerHttpPort: 13000,
   ysqlServerRpcPort: 5433,
-  nodeExporterPort: 9300
+  internalYsqlServerRpcPort: 6433,
+  nodeExporterPort: 9300,
+  ybControllerrRpcPort: 18018
 };
 
 export const DEFAULT_CLOUD_CONFIG: CloudConfigFormValue = {
@@ -511,22 +657,32 @@ export const DEFAULT_CLOUD_CONFIG: CloudConfigFormValue = {
   provider: null,
   regionList: [],
   numNodes: 3,
+  masterNumNodes: 3,
   replicationFactor: 3,
   autoPlacement: true, // "AUTO" is the default value when creating new universe
   placements: [],
   defaultRegion: null,
+  mastersInDefaultRegion: false,
+  masterPlacement: MasterPlacementMode.COLOCATED,
   resetAZConfig: false,
-  mastersInDefaultRegion: false
+  userAZSelected: false
 };
 
 export const DEFAULT_INSTANCE_CONFIG: InstanceConfigFormValue = {
   instanceType: null,
+  masterInstanceType: null,
+  useSpotInstance: null,
   deviceInfo: null,
+  masterDeviceInfo: null,
+  tserverK8SNodeResourceSpec: null,
+  masterK8SNodeResourceSpec: null,
   assignPublicIP: true,
   useTimeSync: true,
   enableClientToNodeEncrypt: true,
   enableNodeToNodeEncrypt: true,
   rootCA: '',
+  clientRootCA: '',
+  rootAndClientRootCASame: true,
   enableEncryptionAtRest: false,
   enableYSQL: true,
   enableYSQLAuth: true,
@@ -538,7 +694,10 @@ export const DEFAULT_INSTANCE_CONFIG: InstanceConfigFormValue = {
   ycqlConfirmPassword: '',
   enableYEDIS: false,
   kmsConfig: null,
-  dedicatedNodes: false
+  arch: null,
+  imageBundleUUID: '',
+  k8sEncryptionType: K8sEncryptionOption.EnableBoth,
+  enableTLS: true
 };
 
 export const DEFAULT_ADVANCED_CONFIG: AdvancedConfigFormValue = {
@@ -550,13 +709,19 @@ export const DEFAULT_ADVANCED_CONFIG: AdvancedConfigFormValue = {
   customizePort: false,
   accessKeyCode: '',
   ybSoftwareVersion: null,
-  communicationPorts: DEFAULT_COMMUNICATION_PORTS
+  communicationPorts: DEFAULT_COMMUNICATION_PORTS,
+  enablePGCompatibitilty: false,
+  enableConnectionPooling: false,
+  enableMultiTenancyQos: false,
+  multiTenancyQosMaxDbCpuPercent: MULTI_TENANCY_QOS_MAX_DB_CPU_PERCENT_FALLBACK,
+  multiTenancyQosMaxDbCount: MULTI_TENANCY_QOS_MAX_DB_COUNT_FALLBACK
 };
 
 export const DEFAULT_USER_TAGS = [{ name: '', value: '' }];
 export const DEFAULT_GFLAGS = [];
 export const DEFAULT_UNIVERSE_OVERRIDES = '';
-export const DEFAULT_AZ_OVERRIDES = {};
+export const DEFAULT_AZ_OVERRIDES: Record<string, string> = {};
+export const DEFAULT_K8S_AZ_OVERRIDES: Record<string, AZOverridePerAZ> = {};
 
 export const DEFAULT_FORM_DATA: UniverseFormData = {
   cloudConfig: DEFAULT_CLOUD_CONFIG,
@@ -564,8 +729,10 @@ export const DEFAULT_FORM_DATA: UniverseFormData = {
   advancedConfig: DEFAULT_ADVANCED_CONFIG,
   instanceTags: DEFAULT_USER_TAGS,
   gFlags: DEFAULT_GFLAGS,
+  inheritFlagsFromPrimary: true,
   universeOverrides: DEFAULT_UNIVERSE_OVERRIDES,
-  azOverrides: DEFAULT_AZ_OVERRIDES
+  azOverrides: DEFAULT_AZ_OVERRIDES,
+  k8sAzOverrides: DEFAULT_K8S_AZ_OVERRIDES
 };
 //-------------------------------------------------------- Form Data related Types - Ends -------------------------------------------------------------------
 
@@ -608,7 +775,7 @@ export interface Certificate {
   expiryDate: string;
   privateKey: string;
   certificate: string;
-  certType: 'SelfSigned' | 'CustomCertHostPath';
+  certType: 'SelfSigned' | 'CustomCertHostPath' | 'K8SCertManager';
 }
 
 export interface AccessKey {
@@ -629,12 +796,27 @@ export interface AccessKey {
   };
 }
 
+export interface YBSoftwareMetadata {
+  state: string;
+  notes: string[];
+  filePath: string[];
+  chartPath: string;
+  imageTag: string;
+  packages: YBSoftwareMetadataPackages[];
+}
+
+export interface YBSoftwareMetadataPackages {
+  path: string;
+  arch: string;
+}
+
 export interface Provider {
   uuid: string;
   code: CloudType;
   name: string;
   active: boolean;
   customerUUID: string;
+  details: Record<string, any>;
 }
 export interface RegionInfo {
   parentRegionId: string;
@@ -730,10 +912,56 @@ export interface UniverseResource {
   memSizeGB: number;
   numCores: number;
   numNodes: number;
+  masterNumNodes?: number;
   pricePerHour: number;
   pricingKnown: boolean;
   volumeCount: number;
   volumeSizeGB: number;
+}
+
+export interface UniverseFormConfigurationProps {
+  runtimeConfigs: any;
+}
+
+export enum ImageBundleType {
+  YBA_ACTIVE = 'YBA_ACTIVE',
+  YBA_DEPRECATED = 'YBA_DEPRECATED',
+  CUSTOM = 'CUSTOM'
+}
+export interface ImageBundle {
+  uuid: string;
+  name: string;
+  details: {
+    arch: ArchitectureType;
+    globalYbImage: string;
+    regions: {
+      [key: string]: {
+        ybImage: string;
+      };
+    };
+    sshUser: string;
+    sshPort: number;
+    useIMDSv2?: boolean;
+  };
+  useAsDefault: boolean;
+  metadata?: {
+    type: ImageBundleType;
+    version: string;
+  };
+  active: true;
+}
+
+export enum PRECHECK_UPGRADE_TYPE {
+  SOFTWARE = 'Software', // Upgrade database version
+  SYSTEMD = 'Systemd', // Upgrade to systemd
+  VMIMAGE = 'VMImage', // Upgade linux version
+  RESTART = 'Restart', // Restart universe
+  CERTS = 'Certs', // Rotate certificates
+  TOGGLE_TLS = 'ToggleTls', // Edit security
+  RESIZE_NODE = 'ResizeNode', // Resize node
+  REBOOT = 'Reboot', // Reboot universe
+  THIRDPARTY = 'ThirdPartyPackages', // Third party packages upgrade
+  GFLAGS = 'GFlags' // Edit flags
 }
 
 //-------------------------------------------------------- Remaining types - Field/API Ends -------------------------------------------------------------------

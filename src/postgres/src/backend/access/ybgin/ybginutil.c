@@ -3,7 +3,7 @@
  * ybginutil.c
  *	  Utility routines for the Yugabyte inverted index access method.
  *
- * Copyright (c) YugaByte, Inc.
+ * Copyright (c) YugabyteDB, Inc.
  *
  * Licensed under the Apache License, Version 2.0 (the "License"); you may not
  * use this file except in compliance with the License.  You may obtain a copy
@@ -25,9 +25,10 @@
 #include "postgres.h"
 
 #include "access/gin_private.h"
+#include "access/relation.h"
 #include "access/reloptions.h"
-#include "c.h"
-#include "nodes/relation.h"
+#include "commands/yb_cmds.h"
+#include "nodes/execnodes.h"
 #include "nodes/nodes.h"
 #include "utils/index_selfuncs.h"
 
@@ -37,6 +38,8 @@ ybgincostestimate(struct PlannerInfo *root, struct IndexPath *path,
 				  Cost *indexTotalCost, Selectivity *indexSelectivity,
 				  double *indexCorrelation, double *indexPages)
 {
+	Assert(!path->yb_index_path_info.merge_scan_saop_cols);
+
 	gincostestimate(root, path, loop_count, indexStartupCost, indexTotalCost,
 					indexSelectivity, indexCorrelation, indexPages);
 }
@@ -96,6 +99,21 @@ ybginvalidate(Oid opclassoid)
 	 * string and pass it down).
 	 */
 	return ginvalidate(opclassoid);
+}
+
+void
+ybginbindschema(YbcPgStatement handle,
+				struct IndexInfo *indexInfo,
+				TupleDesc indexTupleDesc,
+				int16 *coloptions,
+				Oid *opclassOids,
+				Datum reloptions)
+{
+	YBCBindCreateIndexColumns(handle,
+							  indexInfo,
+							  indexTupleDesc,
+							  coloptions,
+							  indexInfo->ii_NumIndexKeyAttrs);
 }
 
 /*

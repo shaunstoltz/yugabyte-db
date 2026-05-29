@@ -1,4 +1,4 @@
-// Copyright (c) YugaByte, Inc.
+// Copyright (c) YugabyteDB, Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License"); you may not use this file except
 // in compliance with the License.  You may obtain a copy of the License at
@@ -19,7 +19,7 @@
 #include "yb/client/yb_op.h"
 
 #include "yb/common/column_id.h"
-#include "yb/common/ql_protocol.pb.h"
+#include "yb/common/ql_protocol.messages.h"
 
 #include "yb/integration-tests/mini_cluster.h"
 #include "yb/integration-tests/yb_mini_cluster_test_base.h"
@@ -37,6 +37,7 @@
 
 DECLARE_uint64(max_clock_sync_error_usec);
 DECLARE_bool(disable_clock_sync_error);
+DECLARE_bool(fail_on_out_of_range_clock_skew);
 DECLARE_int32(ht_lease_duration_ms);
 DECLARE_string(time_source);
 
@@ -51,7 +52,7 @@ class ClockSynchronizationTest : public YBMiniClusterTestBase<MiniCluster> {
   }
 
   void SetUp() override {
-    FLAGS_ht_lease_duration_ms = 0;
+    ANNOTATE_UNPROTECTED_WRITE(FLAGS_ht_lease_duration_ms) = 0;
     SetupFlags();
 
     YBMiniClusterTestBase::SetUp();
@@ -62,8 +63,8 @@ class ClockSynchronizationTest : public YBMiniClusterTestBase<MiniCluster> {
     ASSERT_OK(cluster_->Start());
 
     client::YBSchemaBuilder b;
-    b.AddColumn("key")->Type(INT64)->NotNull()->HashPrimaryKey();
-    b.AddColumn("value")->Type(INT64)->NotNull();
+    b.AddColumn("key")->Type(DataType::INT64)->NotNull()->HashPrimaryKey();
+    b.AddColumn("value")->Type(DataType::INT64)->NotNull();
     CHECK_OK(b.Build(&schema_));
 
     client_ = ASSERT_RESULT(cluster_->CreateClient());
@@ -94,17 +95,18 @@ class ClockSynchronizationTest : public YBMiniClusterTestBase<MiniCluster> {
     google::protobuf::RepeatedPtrField<master::TabletLocationsPB> tablets;
     ASSERT_OK(
         client_->GetTablets(*table_name_, 0, &tablets, /* partition_list_version =*/ nullptr));
-    std::shared_ptr<client::YBSession> session =  client_->NewSession();
+    auto session = client_->NewSession(MonoDelta::FromSeconds(60));
     for (int i = 0; i < num_writes_per_tserver; i++) {
-      auto ql_write = std::make_shared<client::YBqlWriteOp>(table_);
+      auto ql_write = std::make_shared<client::YBqlWriteOp>(
+          table_, SharedThreadSafeArena(), /* request= */ nullptr);
       auto *const req = ql_write->mutable_request();
       req->set_client(QLClient::YQL_CLIENT_CQL);
       req->set_type(QLWriteRequestPB_QLStmtType_QL_STMT_INSERT);
-      QLExpressionPB *hash_column = req->add_hashed_column_values();
+      auto *hash_column = req->add_hashed_column_values();
       int64_t val = random_.Next64();
       hash_column->mutable_value()->set_int64_value(val);
 
-      QLColumnValuePB *column = req->add_column_values();
+      auto *column = req->add_column_values();
       column->set_column_id(kFirstColumnId + 1);
       column->mutable_expr()->mutable_value()->set_int64_value(val);
       EXPECT_OK(session->TEST_ApplyAndFlush(ql_write));
@@ -113,7 +115,17 @@ class ClockSynchronizationTest : public YBMiniClusterTestBase<MiniCluster> {
   }
 
   virtual void SetupFlags() {
-    FLAGS_time_source = "mock";
+    ANNOTATE_UNPROTECTED_WRITE(FLAGS_time_source) = "mock";
+    // MockClock returns a frozen physical time, so each call to HybridClock::NowWithError()
+    // (driven by background pollers in transactional tablets) advances only HybridClock's
+    // internal logical counter -- MockClock itself never moves.  After 4096 such calls the
+    // overflow handler bumps last_usec by 1; the next read then sees the (still-frozen)
+    // physical time as 1us behind last_usec and trips a FATAL when
+    // fail_on_out_of_range_clock_skew is true (the default).  Under ASAN the slower run
+    // gives pollers enough wall-clock time to reach the 4096-call threshold before
+    // TestClockSkewError's body finishes (#31467, ~97% flake rate on alma9-clang21-asan).
+    // Disable the FATAL the same way transaction-test.cc and snapshot-txn-test.cc do.
+    ANNOTATE_UNPROTECTED_WRITE(FLAGS_fail_on_out_of_range_clock_skew) = false;
   }
 
   std::unique_ptr<client::YBClient> client_;
@@ -127,6 +139,11 @@ class ClockSynchronizationTest : public YBMiniClusterTestBase<MiniCluster> {
   constexpr static const char* const kTableName = "my_table";
 };
 
+// Verifies the cluster keeps serving DDL + writes when the (mocked) physical clock reports an
+// NTP max_error above FLAGS_max_clock_sync_error_usec.  This exercises the
+// disable_clock_sync_error=true path (the default) added by ENG-2012 (commit 577b0cbcf2, 2017):
+// with that flag set, CheckClockSyncError swallows the high max_error instead of returning
+// ServiceUnavailable, so CreateTable and PerformOps below should both succeed.
 TEST_F(ClockSynchronizationTest, TestClockSkewError) {
   mock_clock_.Set({0, FLAGS_max_clock_sync_error_usec + 1});
 

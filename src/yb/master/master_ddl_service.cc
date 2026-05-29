@@ -1,4 +1,4 @@
-// Copyright (c) YugaByte, Inc.
+// Copyright (c) YugabyteDB, Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License"); you may not use this file except
 // in compliance with the License.  You may obtain a copy of the License at
@@ -40,6 +40,7 @@ class MasterDdlServiceImpl : public MasterServiceBase, public MasterDdlIf {
     (DeleteTablegroup)
     (DeleteUDType)
     (GetBackfillJobs)
+    (GetBackfillStatus)
     (GetColocatedTabletSchema)
     (GetNamespaceInfo)
     (GetTableDiskSize)
@@ -52,6 +53,7 @@ class MasterDdlServiceImpl : public MasterServiceBase, public MasterDdlIf {
     (IsDeleteNamespaceDone)
     (IsDeleteTableDone)
     (IsTruncateTableDone)
+    (IsYsqlDdlVerificationDone)
     (LaunchBackfillIndexForTable)
     (ListNamespaces)
     (ListTablegroups)
@@ -59,7 +61,28 @@ class MasterDdlServiceImpl : public MasterServiceBase, public MasterDdlIf {
     (ListUDTypes)
     (ReportYsqlDdlTxnStatus)
     (TruncateTable)
+    (RefreshYsqlLease)
+    (RelinquishYsqlLease)
+    (RollbackDocdbSchemaToSubtxn)
+    (IsRollbackDocdbSchemaToSubtxnDone)
   )
+
+  MASTER_SERVICE_IMPL_ON_LEADER_WITHOUT_LOCK(
+    CatalogManager,
+    (GetObjectLockStatus)
+  )
+
+  void AcquireObjectLocksGlobal(
+      const AcquireObjectLocksGlobalRequestPB* req, AcquireObjectLocksGlobalResponsePB* resp,
+      rpc::RpcContext rpc) override {
+    server_->catalog_manager_impl()->AcquireObjectLocksGlobal(req, resp, std::move(rpc));
+  }
+
+  void ReleaseObjectLocksGlobal(
+      const ReleaseObjectLocksGlobalRequestPB* req, ReleaseObjectLocksGlobalResponsePB* resp,
+      rpc::RpcContext rpc) override {
+    server_->catalog_manager_impl()->ReleaseObjectLocksGlobal(req, resp, std::move(rpc));
+  }
 };
 
 } // namespace

@@ -1,5 +1,5 @@
 /*
- * Copyright 2019 YugaByte, Inc. and Contributors
+ * Copyright 2019 YugabyteDB, Inc. and Contributors
  *
  * Licensed under the Polyform Free Trial License 1.0.0 (the "License"); you
  * may not use this file except in compliance with the License. You
@@ -14,13 +14,13 @@ import com.fasterxml.jackson.databind.node.ObjectNode;
 import com.yugabyte.yw.common.kms.algorithms.SupportedAlgorithmInterface;
 import com.yugabyte.yw.common.kms.util.EncryptionAtRestUtil;
 import com.yugabyte.yw.common.kms.util.EncryptionAtRestUtil.BackupEntry;
+import com.yugabyte.yw.common.kms.util.EncryptionAtRestUtil.EncryptionKey;
 import com.yugabyte.yw.common.kms.util.KeyProvider;
 import com.yugabyte.yw.forms.EncryptionAtRestConfig;
 import com.yugabyte.yw.models.KmsConfig;
 import com.yugabyte.yw.models.KmsHistory;
 import com.yugabyte.yw.models.KmsHistoryId;
-import com.yugabyte.yw.models.Universe;
-import java.util.ArrayList;
+import java.io.IOException;
 import java.util.Arrays;
 import java.util.Base64;
 import java.util.List;
@@ -48,9 +48,7 @@ public abstract class EncryptionAtRestService<T extends SupportedAlgorithmInterf
   }
 
   public boolean validateKeySize(int keySize, T algorithm) {
-    return algorithm
-        .getKeySizes()
-        .stream()
+    return algorithm.getKeySizes().stream()
         .anyMatch(supportedKeySize -> supportedKeySize == keySize);
   }
 
@@ -62,23 +60,24 @@ public abstract class EncryptionAtRestService<T extends SupportedAlgorithmInterf
    * @param config
    * @return
    */
-  protected abstract byte[] createKeyWithService(
-      UUID universeUUID, UUID configUUID, EncryptionAtRestConfig config);
+  protected abstract EncryptionKey createKeyWithService(
+      UUID universeUUID, UUID configUUID, EncryptionAtRestConfig config) throws IOException;
 
-  public byte[] createKey(UUID universeUUID, UUID configUUID, EncryptionAtRestConfig config) {
-    byte[] result = null;
+  public EncryptionKey createKey(
+      UUID universeUUID, UUID configUUID, EncryptionAtRestConfig config) {
+    EncryptionKey result = null;
     try {
       final byte[] existingEncryptionKey = retrieveKey(universeUUID, configUUID, config);
       if (existingEncryptionKey != null && existingEncryptionKey.length > 0) {
         final String errMsg =
             String.format(
-                "Encryption key for universe %s already exists" + " with provider %s",
+                "Encryption key for universe %s already exists with provider %s",
                 universeUUID.toString(), this.keyProvider.name());
         LOG.error(errMsg);
         throw new IllegalArgumentException(errMsg);
       }
-      final byte[] ref = createKeyWithService(universeUUID, configUUID, config);
-      if (ref == null || ref.length == 0) {
+      final EncryptionKey ref = createKeyWithService(universeUUID, configUUID, config);
+      if (ref == null || ref.getKeyBytes() == null || ref.getKeyBytes().length == 0) {
         final String errMsg = "createKeyWithService returned empty key ref";
         LOG.error(errMsg);
         throw new RuntimeException(errMsg);
@@ -90,14 +89,15 @@ public abstract class EncryptionAtRestService<T extends SupportedAlgorithmInterf
     return result;
   }
 
-  protected abstract byte[] rotateKeyWithService(
-      UUID universeUUID, UUID configUUID, EncryptionAtRestConfig config);
+  protected abstract EncryptionKey rotateKeyWithService(
+      UUID universeUUID, UUID configUUID, EncryptionAtRestConfig config) throws IOException;
 
-  public byte[] rotateKey(UUID universeUUID, UUID configUUID, EncryptionAtRestConfig config) {
-    byte[] result = null;
+  public EncryptionKey rotateKey(
+      UUID universeUUID, UUID configUUID, EncryptionAtRestConfig config) {
+    EncryptionKey result = null;
     try {
-      final byte[] ref = rotateKeyWithService(universeUUID, configUUID, config);
-      if (ref == null || ref.length == 0) {
+      final EncryptionKey ref = rotateKeyWithService(universeUUID, configUUID, config);
+      if (ref == null || ref.getKeyBytes() == null || ref.getKeyBytes().length == 0) {
         final String errMsg = "rotateKeyWithService returned empty key ref";
         LOG.error(errMsg);
         throw new RuntimeException(errMsg);
@@ -110,11 +110,11 @@ public abstract class EncryptionAtRestService<T extends SupportedAlgorithmInterf
     return result;
   }
 
-  protected abstract byte[] retrieveKeyWithService(
-      UUID universeUUID, UUID configUUID, byte[] keyRef, EncryptionAtRestConfig config);
+  public abstract byte[] retrieveKeyWithService(
+      UUID configUUID, byte[] keyRef, ObjectNode encryptionContext);
 
   public byte[] retrieveKey(
-      UUID universeUUID, UUID configUUID, byte[] keyRef, EncryptionAtRestConfig config) {
+      UUID universeUUID, UUID configUUID, byte[] keyRef, ObjectNode encryptionContext) {
     if (keyRef == null) {
       String errMsg =
           String.format(
@@ -122,27 +122,20 @@ public abstract class EncryptionAtRestService<T extends SupportedAlgorithmInterf
       LOG.warn(errMsg);
       return null;
     }
-
     // Attempt to retrieve cached entry
     byte[] keyVal = EncryptionAtRestUtil.getUniverseKeyCacheEntry(universeUUID, keyRef);
     // Retrieve through KMS provider if no cache entry exists
     if (keyVal == null) {
       LOG.debug("Universe key cache entry empty. Retrieving key from service");
-      keyVal = retrieveKeyWithService(universeUUID, configUUID, keyRef, config);
+      keyVal = retrieveKeyWithService(configUUID, keyRef, encryptionContext);
       // Update the cache entry
       if (keyVal != null) {
         EncryptionAtRestUtil.setUniverseKeyCacheEntry(universeUUID, keyRef, keyVal);
       } else {
-        LOG.warn("Could not retrieve key from key ref for universe " + universeUUID.toString());
+        LOG.warn("Could not retrieve key from key ref for universe " + universeUUID);
       }
     }
     return keyVal;
-  }
-
-  public byte[] retrieveKey(UUID universeUUID, UUID configUUID, byte[] keyRef) {
-    Universe u = Universe.getOrBadRequest(universeUUID);
-    return retrieveKey(
-        universeUUID, configUUID, keyRef, u.getUniverseDetails().encryptionAtRestConfig);
   }
 
   public byte[] retrieveKey(UUID universeUUID, UUID configUUID, EncryptionAtRestConfig config) {
@@ -151,23 +144,45 @@ public abstract class EncryptionAtRestService<T extends SupportedAlgorithmInterf
     if (activeKey != null) {
       key =
           retrieveKey(
-              universeUUID, configUUID, Base64.getDecoder().decode(activeKey.uuid.keyRef), config);
+              universeUUID,
+              configUUID,
+              Base64.getDecoder().decode(activeKey.getUuid().keyRef),
+              activeKey.encryptionContext);
     }
 
     return key;
   }
 
+  public abstract EncryptionKey encryptKeyWithService(UUID configUUID, byte[] universeKey);
+
+  /**
+   * Verifies if the config UUID can decrypt the given key ref (encrypted universe key).
+   *
+   * @param configUUID the KMS config UUID.
+   * @param keyRef the encrypted universe key.
+   * @return true if it can be decrypted, else false.
+   */
+  public boolean verifyKmsConfigAndKeyRef(
+      UUID universeUUID, UUID configUUID, byte[] keyRef, ObjectNode encryptionContext) {
+    try {
+      return retrieveKey(universeUUID, configUUID, keyRef, encryptionContext) != null;
+    } catch (Exception e) {
+      LOG.error(e.getMessage(), e);
+      // Throws an error when decrypting wrong encrypted text,
+      // because the key ref stores the master key metadata (managed by the KMS provider).
+      // This means it is the wrong KMS config to decrypt with - return false.
+      return false;
+    }
+  }
+
   protected abstract byte[] validateRetrieveKeyWithService(
-      UUID universeUUID,
-      UUID configUUID,
-      byte[] keyRef,
-      EncryptionAtRestConfig config,
-      ObjectNode authConfig);
+      UUID configUUID, byte[] keyRef, ObjectNode encryptionContext, ObjectNode authConfig);
 
   public byte[] validateConfigForUpdate(
       UUID universeUUID,
       UUID configUUID,
       byte[] keyRef,
+      ObjectNode encryptionContext,
       EncryptionAtRestConfig config,
       ObjectNode authConfig) {
     if (keyRef == null) {
@@ -178,9 +193,7 @@ public abstract class EncryptionAtRestService<T extends SupportedAlgorithmInterf
       return null;
     }
     // LOG.debug("DO_NOT_PRINT::config dictionary is : {}", authConfig.toString());
-    byte[] keyVal =
-        validateRetrieveKeyWithService(universeUUID, configUUID, keyRef, config, authConfig);
-    return keyVal;
+    return validateRetrieveKeyWithService(configUUID, keyRef, encryptionContext, authConfig);
   }
 
   protected void cleanupWithService(UUID universeUUID, UUID configUUID) {}
@@ -226,7 +239,7 @@ public abstract class EncryptionAtRestService<T extends SupportedAlgorithmInterf
   public KmsConfig createAuthConfig(UUID customerUUID, String configName, ObjectNode config) {
     KmsConfig result =
         KmsConfig.createKMSConfig(customerUUID, this.keyProvider, config, configName);
-    UUID configUUID = result.configUUID;
+    UUID configUUID = result.getConfigUUID();
     ObjectNode existingConfig = getAuthConfig(configUUID);
     ObjectNode updatedConfig = createAuthConfigWithService(configUUID, existingConfig);
     if (updatedConfig != null) {
@@ -240,17 +253,16 @@ public abstract class EncryptionAtRestService<T extends SupportedAlgorithmInterf
     return result;
   }
 
-  public KmsConfig updateAuthConfig(UUID customerUUID, UUID configUUID, ObjectNode config) {
-    KmsConfig result = KmsConfig.get(configUUID);
+  public KmsConfig updateAuthConfig(UUID configUUID, ObjectNode config) {
     KmsConfig.updateKMSConfig(configUUID, config);
     ObjectNode existingConfig = getAuthConfig(configUUID);
     ObjectNode updatedConfig = createAuthConfigWithService(configUUID, existingConfig);
+
     if (updatedConfig != null) {
-      result = KmsConfig.updateKMSConfig(configUUID, updatedConfig);
+      return KmsConfig.updateKMSConfig(configUUID, updatedConfig);
     } else {
       return null;
     }
-    return result;
   }
 
   public ObjectNode getAuthConfig(UUID configUUID) {
@@ -265,17 +277,16 @@ public abstract class EncryptionAtRestService<T extends SupportedAlgorithmInterf
         configUUID.toString());
     if (updatedConfig == null) return false;
     KmsConfig result = KmsConfig.updateKMSConfig(configUUID, updatedConfig);
-    return (result == null) ? false : true;
+    return result != null;
   }
 
   public List<KmsHistory> getKeyRotationHistory(UUID configUUID, UUID universeUUID) {
     List<KmsHistory> rotationHistory =
         KmsHistory.getAllConfigTargetKeyRefs(
             configUUID, universeUUID, KmsHistoryId.TargetType.UNIVERSE_KEY);
-    if (rotationHistory == null) {
+    if (rotationHistory.isEmpty()) {
       LOG.warn(
           String.format("No rotation history exists for universe %s", universeUUID.toString()));
-      rotationHistory = new ArrayList<KmsHistory>();
     }
     return rotationHistory;
   }
@@ -297,17 +308,45 @@ public abstract class EncryptionAtRestService<T extends SupportedAlgorithmInterf
   }
 
   public BackupEntry getBackupEntry(KmsHistory history) {
-    return new BackupEntry(Base64.getDecoder().decode(history.uuid.keyRef), this.keyProvider);
+    return new BackupEntry(
+        Base64.getDecoder().decode(history.getUuid().keyRef),
+        this.keyProvider,
+        history.dbKeyId,
+        history.encryptionContext);
   }
 
   // Add backed up keyRefs to the kms_history table for universeUUID and configUUID
-  public void restoreBackupEntry(UUID universeUUID, UUID configUUID, byte[] keyRef) {
-    if (!EncryptionAtRestUtil.keyRefExists(universeUUID, keyRef)) {
-      EncryptionAtRestUtil.addKeyRef(universeUUID, configUUID, keyRef);
+  public void restoreBackupEntry(
+      UUID universeUUID,
+      UUID configUUID,
+      byte[] keyRef,
+      String dbKeyId,
+      ObjectNode encryptionContext) {
+    if (!EncryptionAtRestUtil.dbKeyIdExists(universeUUID, dbKeyId)) {
+      EncryptionAtRestUtil.addKeyRefAndKeyId(
+          universeUUID, configUUID, keyRef, dbKeyId, encryptionContext);
     }
   }
 
-  public void refreshService(UUID configUUID) {
-    // Do Nothing - optionally override sub classes when required.
+  public abstract void refreshKmsWithService(UUID configUUID, ObjectNode authConfig)
+      throws Exception;
+
+  public void refreshKms(UUID configUUID) {
+    LOG.debug("Starting refresh {} KMS with KMS config '{}'.", this.keyProvider.name(), configUUID);
+    try {
+      ObjectNode authConfig = getAuthConfig(configUUID);
+      refreshKmsWithService(configUUID, authConfig);
+      LOG.info(
+          "Refreshed {} KMS successfully with config '{}'.", this.keyProvider.name(), configUUID);
+    } catch (Exception e) {
+      final String errMsg =
+          String.format(
+              "Error occurred while refreshing %s KMS config '%s'.",
+              this.keyProvider.name(), configUUID);
+      LOG.error(errMsg, e);
+      throw new RuntimeException(errMsg, e);
+    }
   }
+
+  public abstract ObjectNode getKeyMetadata(UUID configUUID);
 }

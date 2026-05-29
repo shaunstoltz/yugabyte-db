@@ -1,4 +1,4 @@
-// Copyright (c) YugaByte, Inc.
+// Copyright (c) YugabyteDB, Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License"); you may not use this file except
 // in compliance with the License.  You may obtain a copy of the License at
@@ -13,6 +13,7 @@
 
 #pragma once
 
+#include <future>
 #include <memory>
 
 #include "yb/gutil/ref_counted.h"
@@ -32,15 +33,23 @@ class Message;
 namespace yb {
 namespace pggate {
 
+class PerformFuture;
 class PgClient;
-
+class PgDml;
+class PgExpr;
+class PgFetchedTarget;
 class PgTable;
 class PgTableDesc;
-using PgTableDescPtr = scoped_refptr<PgTableDesc>;
-
+class PgTuple;
 class PgsqlOp;
 class PgsqlReadOp;
 class PgsqlWriteOp;
+
+class BufferableOperations;
+struct PerformResult;
+struct PgDdlCommitInfo;
+
+using PgTableDescPtr = scoped_refptr<PgTableDesc>;
 using PgsqlOpPtr = std::shared_ptr<PgsqlOp>;
 using PgsqlReadOpPtr = std::shared_ptr<PgsqlReadOp>;
 using PgsqlWriteOpPtr = std::shared_ptr<PgsqlWriteOp>;

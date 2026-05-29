@@ -1,34 +1,34 @@
-// Copyright (c) YugaByte, Inc.
+// Copyright (c) YugabyteDB, Inc.
 
 #pragma once
 
 #include "yb/master/cluster_balance.h"
 #include "yb/master/cluster_balance_util.h"
+#include "yb/master/master_fwd.h"
 #include "yb/master/ts_manager.h"
 
-namespace yb {
-namespace master {
+namespace yb::master {
 
 class ClusterLoadBalancerMocked : public ClusterLoadBalancer {
  public:
-  explicit ClusterLoadBalancerMocked(Options* options) : ClusterLoadBalancer(nullptr)  {
+  explicit ClusterLoadBalancerMocked(const TableId& table_id) : ClusterLoadBalancer(nullptr)  {
     const int kHighNumber = 100;
-    options->kMaxConcurrentAdds = kHighNumber;
-    options->kMaxConcurrentRemovals = kHighNumber;
-    options->kAllowLimitStartingTablets = false;
-    options->kAllowLimitOverReplicatedTablets = false;
+    options_.kMaxConcurrentAdds = kHighNumber;
+    options_.kMaxConcurrentRemovals = kHighNumber;
+    options_.kAllowLimitStartingTablets = false;
+    options_.kAllowLimitOverReplicatedTablets = false;
 
     auto table_state = std::make_unique<PerTableLoadState>(global_state_.get());
-    table_state->options_ = options;
+    table_state->options_ = &options_;
     state_ = table_state.get();
-    per_table_states_[""] = std::move(table_state);
+    per_table_states_[table_id] = std::move(table_state);
     ResetOptions();
 
     InitTablespaceManager();
   }
 
   // Overrides for base class functionality to bypass calling CatalogManager.
-  void GetAllReportedDescriptors(TSDescriptorVector* ts_descs) const override {
+  void GetAllDescriptors(TSDescriptorVector* ts_descs) const override {
     *ts_descs = ts_descs_;
   }
 
@@ -38,51 +38,56 @@ class ClusterLoadBalancerMocked : public ClusterLoadBalancer {
     *affinitized_zones = affinitized_zones_;
   }
 
-  const TabletInfoMap& GetTabletMap() const override { return tablet_map_; }
-
-  TableIndex::TablesRange GetTables() const override {
-    return tables_.GetPrimaryTables();
+  std::optional<std::reference_wrapper<const TabletInfoPtr>> GetTabletInfo(
+      const TabletId& id) const override {
+    auto it = tablet_map_.find(id);
+    if (it == tablet_map_.end()) {
+      return std::nullopt;
+    }
+    return std::cref(it->second);
   }
 
-  const scoped_refptr<TableInfo> GetTableInfo(const TableId& table_uuid) const override {
-    return tables_.FindTableOrNull(table_uuid);
-  }
-
-  Result<ReplicationInfoPB> GetTableReplicationInfo(
-      const scoped_refptr<const TableInfo>& table) const override {
+  ReplicationInfoPB GetTableReplicationInfo(const TableInfoPtr& table) const override {
     return replication_info_;
+  }
+
+  const PerTableLoadState* GetTableState(const TableId& table_id) {
+    return per_table_states_[table_id].get();
   }
 
   void SetBlacklistAndPendingDeleteTS() override {
     for (const auto& ts_desc : global_state_->ts_descs_) {
       AddTSIfBlacklisted(ts_desc, blacklist_, false);
       AddTSIfBlacklisted(ts_desc, leader_blacklist_, true);
-      if (ts_desc->HasTabletDeletePending()) {
-        global_state_->servers_with_pending_deletes_.insert(ts_desc->permanent_uuid());
-      }
+      global_state_->pending_deletes_[ts_desc->permanent_uuid()] =
+          ts_desc->TabletsPendingDeletion();
     }
   }
 
-  Status SendReplicaChanges(scoped_refptr<TabletInfo> tablet, const TabletServerId& ts_uuid,
-                          const bool is_add, const bool should_remove,
-                          const TabletServerId& new_leader_uuid) override {
-    // Do nothing.
+  Status SendAddReplica(
+      const TabletInfoPtr& tablet, const TabletServerId& ts_uuid, const std::string& reason)
+      override {
+    return Status::OK();
+  }
+  Status SendRemoveReplica(
+      const TabletInfoPtr& tablet, const TabletServerId& ts_uuid, const std::string& reason)
+      override {
+    return Status::OK();
+  }
+  Status SendMoveLeader(
+      const TabletInfoPtr& tablet, const TabletServerId& ts_uuid,
+      bool also_remove_replica, const std::string& reason,
+      const TabletServerId& new_leader_ts_uuid) override {
     return Status::OK();
   }
 
-  void GetPendingTasks(const TableId& table_uuid,
+  void GetPendingTasks(const TableInfoPtr& table,
                        TabletToTabletServerMap* pending_add_replica_tasks,
                        TabletToTabletServerMap* pending_remove_replica_tasks,
                        TabletToTabletServerMap* pending_stepdown_leader_tasks) override {
-    for (const auto& tablet_id : pending_add_replica_tasks_) {
-      (*pending_add_replica_tasks)[tablet_id] = "";
-    }
-    for (const auto& tablet_id : pending_remove_replica_tasks_) {
-      (*pending_remove_replica_tasks)[tablet_id] = "";
-    }
-    for (const auto& tablet_id : pending_stepdown_leader_tasks_) {
-      (*pending_stepdown_leader_tasks)[tablet_id] = "";
-    }
+    *pending_add_replica_tasks = pending_add_replica_tasks_;
+    *pending_remove_replica_tasks = pending_remove_replica_tasks_;
+    *pending_stepdown_leader_tasks = pending_stepdown_leader_tasks_;
   }
 
   void ResetTableStatePtr(const TableId& table_id, Options* options) override {
@@ -106,8 +111,9 @@ class ClusterLoadBalancerMocked : public ClusterLoadBalancer {
     state_->options_->placement_uuid = placement_uuid;
   }
 
-  void ResetOptions() { SetOptions(LIVE, ""); }
+  void ResetOptions() { SetOptions(ReplicaType::kLive, ""); }
 
+  Options options_;
   TSDescriptorVector ts_descs_;
   std::vector<AffinitizedZonesSet> affinitized_zones_;
   TabletInfoMap tablet_map_;
@@ -115,12 +121,11 @@ class ClusterLoadBalancerMocked : public ClusterLoadBalancer {
   ReplicationInfoPB replication_info_;
   BlacklistPB blacklist_;
   BlacklistPB leader_blacklist_;
-  std::vector<TabletId> pending_add_replica_tasks_;
-  std::vector<TabletId> pending_remove_replica_tasks_;
-  std::vector<TabletId> pending_stepdown_leader_tasks_;
+  TabletToTabletServerMap pending_add_replica_tasks_;
+  TabletToTabletServerMap pending_remove_replica_tasks_;
+  TabletToTabletServerMap pending_stepdown_leader_tasks_;
 
   friend class TestLoadBalancerEnterprise;
 };
 
-} // namespace master
-} // namespace yb
+} // namespace yb::master

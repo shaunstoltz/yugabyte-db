@@ -2,9 +2,9 @@
 // Use of this source code is governed by a BSD-style license that can be
 // found in the LICENSE file. See the AUTHORS file for names of contributors.
 //
-// The following only applies to changes made to this file as part of YugaByte development.
+// The following only applies to changes made to this file as part of YugabyteDB development.
 //
-// Portions Copyright (c) YugaByte, Inc.
+// Portions Copyright (c) YugabyteDB, Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License"); you may not use this file except
 // in compliance with the License.  You may obtain a copy of the License at
@@ -56,26 +56,6 @@ std::string NormalizeFileName(const std::string fname) {
   }
   return out_name;
 }
-
-class WritableFileImpl : public WritableFile {
- public:
-  explicit WritableFileImpl(std::shared_ptr<InMemoryFileState> file) : file_(std::move(file)) {}
-
-  ~WritableFileImpl() {}
-
-  Status Append(const Slice& data) override {
-    return file_->Append(data);
-  }
-  Status Truncate(uint64_t size) override {
-    return Status::OK();
-  }
-  Status Close() override { return Status::OK(); }
-  Status Flush() override { return Status::OK(); }
-  Status Sync() override { return Status::OK(); }
-
- private:
-  std::shared_ptr<InMemoryFileState> file_;
-};
 
 class InMemoryDirectory : public Directory {
  public:
@@ -129,7 +109,7 @@ class InMemoryEnv : public EnvWrapper {
     auto file = std::make_shared<InMemoryFileState>(fname);
     file_map_[nfname] = file;
 
-    result->reset(new WritableFileImpl(file));
+    result->reset(new yb::InMemoryWritableFile(file));
     return Status::OK();
   }
 

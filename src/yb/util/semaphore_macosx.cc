@@ -15,9 +15,9 @@
 // specific language governing permissions and limitations
 // under the License.
 //
-// The following only applies to changes made to this file as part of YugaByte development.
+// The following only applies to changes made to this file as part of YugabyteDB development.
 //
-// Portions Copyright (c) YugaByte, Inc.
+// Portions Copyright (c) YugabyteDB, Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License"); you may not use this file except
 // in compliance with the License.  You may obtain a copy of the License at
@@ -31,7 +31,8 @@
 //
 #include <semaphore.h>
 
-#include <glog/logging.h>
+#include "yb/util/callsite_profiling.h"
+#include "yb/util/logging.h"
 
 #include "yb/util/semaphore.h"
 
@@ -80,7 +81,7 @@ void Semaphore::Release() {
   std::unique_lock<std::mutex> lock(mutex_);
   CHECK_GE(count_.load(), 0);
   count_.fetch_add(1);
-  cv_.notify_all();
+  YB_PROFILE(cv_.notify_all());
 }
 
 int Semaphore::GetValue() {

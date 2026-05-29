@@ -1,4 +1,4 @@
-// Copyright (c) YugaByte, Inc.
+// Copyright (c) YugabyteDB, Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License"); you may not use this file except
 // in compliance with the License.  You may obtain a copy of the License at
@@ -19,24 +19,40 @@ import org.junit.runner.RunWith;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.yb.util.Pair;
-import org.yb.util.YBTestRunnerNonTsanOnly;
+import org.yb.YBTestRunner;
 
 import java.sql.Connection;
 import java.sql.SQLException;
 import java.sql.Statement;
+import java.util.Collections;
 import java.util.Map;
 
 import com.yugabyte.util.PSQLException;
 import static org.yb.AssertionWrappers.*;
 
-@RunWith(value=YBTestRunnerNonTsanOnly.class)
+@RunWith(value=YBTestRunner.class)
 public class TestPgExplicitLocks extends BasePgSQLTest {
   private static final Logger LOG = LoggerFactory.getLogger(TestPgSelect.class);
+
+  @Override
+  protected int getInitialNumTServers() {
+    return 1;
+  }
+
+  @Override
+  protected int getReplicationFactor() {
+    return 1;
+  }
 
   @Override
   protected Map<String, String> getTServerFlags() {
     Map<String, String> flagMap = super.getTServerFlags();
     flagMap.put("yb_enable_read_committed_isolation", "true");
+    flagMap.put("skip_prefix_locks", "false");
+    flagMap.put("allowed_preview_flags_csv", "skip_prefix_locks");
+    // This test depends on fail-on-conflict concurrency control to perform its validation.
+    // TODO(wait-queues): https://github.com/yugabyte/yugabyte-db/issues/17871
+    setFailOnConflictFlags(flagMap);
     return flagMap;
   }
 
@@ -64,7 +80,8 @@ public class TestPgExplicitLocks extends BasePgSQLTest {
       String query = "update explicitlocks set vi=5 where h=0 and r=0";
       s2.execute(query);
     } catch (PSQLException ex) {
-      if (ex.getMessage().contains("Conflicts with higher priority transaction")) {
+      if (ex.getMessage().contains("could not serialize access due to concurrent update")) {
+        assertTrue(ex.getMessage().contains("conflicts with higher priority transaction"));
         LOG.info("Conflict ERROR");
         conflict_occurred = true;
       }
@@ -78,7 +95,7 @@ public class TestPgExplicitLocks extends BasePgSQLTest {
 
     ParallelQueryRunner(Statement s1, Statement s2) throws SQLException {
       stmts = new Statement[]{s1, s2};
-      runOnBoth("SET retry_max_backoff = 0");
+      runOnBoth("SET yb_max_query_layer_retries = 0");
       stmts[0].execute("SET yb_transaction_priority_lower_bound = 0.5");
       stmts[1].execute("SET yb_transaction_priority_upper_bound = 0.1");
     }
@@ -98,7 +115,9 @@ public class TestPgExplicitLocks extends BasePgSQLTest {
       int first = stmts[0].getUpdateCount();
       int second = 0;
       if (conflict_expected) {
-        runInvalidQuery(stmts[1], query2, "Conflicts with higher priority transaction");
+        runInvalidQuery(stmts[1], query2, true,
+          "could not serialize access due to concurrent update",
+          "conflicts with higher priority transaction");
         stmts[0].execute("COMMIT");
         stmts[1].execute("ROLLBACK");
       } else {
@@ -131,17 +150,21 @@ public class TestPgExplicitLocks extends BasePgSQLTest {
       return String.format("DELETE FROM %s WHERE %s", table, where);
     }
 
-    String select(String where) {
+    String selectKeyShare(String where) {
       return String.format("SELECT * FROM %s WHERE %s FOR KEY SHARE OF %1$s", table, where);
     }
   };
 
   private void runRangeKeyLocksTest(ParallelQueryRunner runner,
-                                    IsolationLevel pgIsolationLevel) throws SQLException {
+                                    IsolationLevel pgIsolationLevel,
+                                    boolean skip_prefix_locks) throws SQLException {
+    boolean slowModeSerializable = pgIsolationLevel == IsolationLevel.SERIALIZABLE &&
+                                   skip_prefix_locks;
     QueryBuilder builder = new QueryBuilder("table_with_hash");
-    // NOTE: for all examples below, the SELECT statement will lock the whole predicate for
-    // SERIALIZABLE isolation level and only matching rows in other isolation levels. The predicate
-    // is locked by locking the longest prefix of pk that is specified in the where clause.
+    // NOTE: for all examples below, the SELECT KEY SHARE statement will lock the whole predicate
+    // for SERIALIZABLE isolation level and only matching rows in other isolation levels. The
+    // predicate is locked by locking the longest prefix of pk that is specified in the where
+    // clause.
     // E.g:
     //   SELECT ... WHERE h=1 : lock full partition (h=1)
     //   SELECT ... WHERE h=1 and r2=100 : lock only (h=1) chunk since value for r1 is missing
@@ -154,119 +177,130 @@ public class TestPgExplicitLocks extends BasePgSQLTest {
     //      Conflicts will occur in both isolation levels since the row that DELETE tries to remove
     //      is already locked either way (lock predicate or only matching rows).
     runner.runWithConflict(
-      builder.select("h = 1"),
+      builder.selectKeyShare("h = 1"),
       builder.delete("h = 1 AND r1 = 10 AND r2 = 100"));
     // 2. DELETE on row that matches the same predicate but doesn't exist.
     runner.run(
-      builder.select("h = 1"),
+      builder.selectKeyShare("h = 1"),
       builder.delete("h = 1 AND r1 = 10 AND r2 = 102"),
       pgIsolationLevel == IsolationLevel.SERIALIZABLE /* conflict_expected */);
 
     runner.runWithConflict(
-      builder.select("h = 1 AND r1 = 10 AND r2 = 100"),
+      builder.selectKeyShare("h = 1 AND r1 = 10 AND r2 = 100"),
       builder.delete("h = 1"));
 
     // SELECT with (h: 1, r1: 10)
     // 1. DELETE on rows that exists and matches SELECT where clause
     runner.runWithConflict(
-      builder.select("h = 1 AND r1 = 10"),
+      builder.selectKeyShare("h = 1 AND r1 = 10"),
       builder.delete("h = 1 AND r1 = 10 AND r2 = 100"));
     // 2. DELETE on row that matches the same predicate but doesn't exist.
     runner.run(
-      builder.select("h = 1 AND r1 = 10"),
+      builder.selectKeyShare("h = 1 AND r1 = 10"),
       builder.delete("h = 1 AND r1 = 10 AND r2 = 102"),
       pgIsolationLevel == IsolationLevel.SERIALIZABLE /* conflict_expected */);
 
     // SELECT with (h:1, r1:10, r2:100) and (h:1, r1:11, r2:100)
     // 1. DELETE on row that exists and matches SELECT where clause
     runner.runWithConflict(
-      builder.select("h = 1 AND r1 IN (10, 11) AND r2 = 100"),
+      builder.selectKeyShare("h = 1 AND r1 IN (10, 11) AND r2 = 100"),
       builder.delete("h = 1 AND r1 = 10 AND r2 = 100"));
     // 2. DELETE on row that matches the same predicate but doesn't exist.
     runner.run(
-      builder.select("h = 1 AND r1 IN (10, 11) AND r2 = 100"),
+      builder.selectKeyShare("h = 1 AND r1 IN (10, 11) AND r2 = 100"),
       builder.delete("h = 1 AND r1 = 11 AND r2 = 100"),
       pgIsolationLevel == IsolationLevel.SERIALIZABLE /* conflict_expected */);
 
     // SELECT with (h:1, r1: 10, r2: 100) and (h:1, r1: 10, r2: 101)
     // 1. DELETE on row that exists and matches SELECT where clause
     runner.run(
-      builder.select("h = 1 AND r1 = 10 AND r2 IN (100, 101)"),
+      builder.selectKeyShare("h = 1 AND r1 = 10 AND r2 IN (100, 101)"),
       builder.delete("h = 1 AND r1 = 10 AND r2 = 100"),
       true /* conflict_expected */);
     // 2. DELETE on row that matches the same predicate but doesn't exist.
     runner.run(
-      builder.select("h = 1 AND r1 = 10 AND r2 IN (100, 101)"),
+      builder.selectKeyShare("h = 1 AND r1 = 10 AND r2 IN (100, 101)"),
       builder.delete("h = 1 AND r1 = 10 AND r2 = 101"),
       pgIsolationLevel == IsolationLevel.SERIALIZABLE /* conflict_expected */);
 
     // Lock full partition (h: 1) if SERIALIZABLE.
     runner.run(
-      builder.select("h = 1 AND r2 = 102"),
+      builder.selectKeyShare("h = 1 AND r2 = 102"),
       builder.delete("h = 1 AND r1 = 11 AND r2 = 101"),
       pgIsolationLevel == IsolationLevel.SERIALIZABLE /* conflict_expected */);
 
     // Lock full tablet if SERIALIZABLE.
     runner.run(
-      builder.select("r1 = 11"),
+      builder.selectKeyShare("r1 = 11"),
       builder.delete("h = 2 AND r1 = 21 AND r2 = 201"),
       pgIsolationLevel == IsolationLevel.SERIALIZABLE /* conflict_expected */);
     runner.run(
-      builder.select("r2 = 102"),
+      builder.selectKeyShare("r2 = 102"),
       builder.delete("h = 2 AND r1 = 21 AND r2 = 201"),
       pgIsolationLevel == IsolationLevel.SERIALIZABLE /* conflict_expected */);
 
     runner.runWithConflict(
-      builder.select("h = 1 AND r1 = 10 AND r2 = 100"),
+      builder.selectKeyShare("h = 1 AND r1 = 10 AND r2 = 100"),
       builder.delete("h = 1 AND r1 = 10 AND r2 = 100"));
-
-    runner.runWithoutConflict(
-      builder.select("h = 1"),
-      builder.delete("h = 2 AND r1 = 20 AND r2 = 200"));
-    runner.runWithoutConflict(
-      builder.select("h = 1 AND r1 = 10"),
-      builder.delete("h = 1 AND r1 = 11 AND r2 = 101"));
-    runner.runWithoutConflict(
-      builder.select("h = 1 AND r1 in (10, 11) AND r2 = 102"),
-      builder.delete("h = 2 AND r1 = 21 AND r2 = 201"));
-    runner.runWithoutConflict(
-      builder.select("h = 1 AND r1 = 11 AND r2 in (100, 101)"),
-      builder.delete("h = 1 AND r1 = 10 AND r2 = 100"));
-    runner.runWithoutConflict(
-      builder.select("h = 1 AND r2 = 102"),
-      builder.delete("h = 2 AND r1 = 22 AND r2 = 202"));
-    runner.runWithoutConflict(
-      builder.select("h = 1 AND r1 = 10 AND r2 = 100"),
-      builder.delete("h = 1 AND r1 = 10 AND r2 = 1000"));
+    runner.run(
+      builder.selectKeyShare("h = 1"),
+      builder.delete("h = 2 AND r1 = 20 AND r2 = 200"),
+      slowModeSerializable /* conflict_expected */);
+    runner.run(
+      builder.selectKeyShare("h = 1 AND r1 = 10"),
+      builder.delete("h = 1 AND r1 = 11 AND r2 = 101"),
+      slowModeSerializable);
+    runner.run(
+      builder.selectKeyShare("h = 1 AND r1 in (10, 11) AND r2 = 102"),
+      builder.delete("h = 2 AND r1 = 21 AND r2 = 201"),
+      slowModeSerializable /* conflict_expected */);
+    runner.run(
+      builder.selectKeyShare("h = 1 AND r1 = 11 AND r2 in (100, 101)"),
+      builder.delete("h = 1 AND r1 = 10 AND r2 = 100"),
+      slowModeSerializable /* conflict_expected */);
+    runner.run(
+      builder.selectKeyShare("h = 1 AND r2 = 102"),
+      builder.delete("h = 2 AND r1 = 22 AND r2 = 202"),
+      slowModeSerializable /* conflict_expected */);
+    runner.run(
+      builder.selectKeyShare("h = 1 AND r1 = 10 AND r2 = 100"),
+      builder.delete("h = 1 AND r1 = 10 AND r2 = 1000"),
+      slowModeSerializable /* conflict_expected */);
 
     builder = new QueryBuilder("table_without_hash");
     // Lock full tablet if SERIALIZABLE.
     runner.run(
-      builder.select("r2 = 11"),
+      builder.selectKeyShare("r2 = 11"),
       builder.delete("r1 = 2 AND r2 = 22"),
       pgIsolationLevel == IsolationLevel.SERIALIZABLE /* conflict_expected */);
 
     runner.run(
-      builder.select("r1 = 1 OR r2 = 11"),
+      builder.selectKeyShare("r1 = 1 OR r2 = 11"),
       builder.delete("r1 = 2 AND r2 = 22"),
       pgIsolationLevel == IsolationLevel.SERIALIZABLE /* conflict_expected */);
     runner.run(
-      builder.select("r1 = 1"),
+      builder.selectKeyShare("r1 = 1"),
       builder.delete("r1 = 1 AND r2 = 10"),
       true /* conflict_expected */);
     runner.runWithConflict(
-      builder.select("r2 = 10 AND r1 IN (1)"),
+      builder.selectKeyShare("r2 = 10 AND r1 IN (1)"),
       builder.delete("r1 = 1 AND r2 = 10"));
 
-    runner.runWithoutConflict(
-      builder.select("r1 = 1"),
-      builder.delete("r1 = 2 AND r2 = 20"));
-    runner.runWithoutConflict(
-      builder.select("r2 = 10 AND r1 IN (1)"),
-      builder.delete("r1 = 1 AND r2 = 11"));
+    runner.run(
+      builder.selectKeyShare("r1 = 1"),
+      builder.delete("r1 = 2 AND r2 = 20"),
+      slowModeSerializable /* conflict_expected */);
+    runner.run(
+      builder.selectKeyShare("r2 = 10 AND r1 IN (1)"),
+      builder.delete("r1 = 1 AND r2 = 11"),
+      slowModeSerializable /* conflict_expected */);
   }
 
-  private void runFKLocksTest(ParallelQueryRunner runner) throws SQLException {
+  private void runFKLocksTest(ParallelQueryRunner runner,
+                              IsolationLevel pgIsolationLevel,
+                              boolean skip_prefix_locks) throws SQLException {
+    boolean slowModeSerializable = pgIsolationLevel == IsolationLevel.SERIALIZABLE &&
+                                   skip_prefix_locks;
     QueryBuilder childBuilder = new QueryBuilder("child_with_hash");
     QueryBuilder parentBuilder = new QueryBuilder("parent_with_hash");
     runner.runWithConflict(
@@ -279,29 +313,35 @@ public class TestPgExplicitLocks extends BasePgSQLTest {
       childBuilder.insert("(3, 1, 10, 100)"),
       parentBuilder.delete("h = 1 AND r1 = 10 AND r2 = 100"));
 
-    runner.runWithoutConflict(
+    runner.run(
       childBuilder.insert("(4, 1, 10, 100)"),
-      parentBuilder.delete("h = 2"));
-    runner.runWithoutConflict(
+      parentBuilder.delete("h = 2"),
+      slowModeSerializable /* conflict_expected */);
+    runner.run(
       childBuilder.insert("(5, 1, 10, 100)"),
-      parentBuilder.delete("h = 1 AND r1 = 11"));
-    runner.runWithoutConflict(
+      parentBuilder.delete("h = 1 AND r1 = 11"),
+      slowModeSerializable);
+    runner.run(
       childBuilder.insert("(6, 1, 10, 100)"),
-      parentBuilder.delete("h = 1 AND r1 = 10 AND r2 = 1000"));
-    Pair<Integer, Integer> result = runner.runWithoutConflict(
+      parentBuilder.delete("h = 1 AND r1 = 10 AND r2 = 1000"),
+      slowModeSerializable);
+    Pair<Integer, Integer> result = runner.run(
       parentBuilder.delete("h = 3 AND r1 = 1 AND r2 = 10"),
-      parentBuilder.delete("h = 3 AND r1 = 1 AND r2 = 20"));
+      parentBuilder.delete("h = 3 AND r1 = 1 AND r2 = 20"),
+      slowModeSerializable /* conflict_expected */);
     LOG.info("RESULT " + result.getFirst() + ", " + result.getSecond());
-    assertEquals(new Pair<>(1, 1), result);
+    assertEquals(slowModeSerializable ? new Pair<>(1, 0) : new Pair<>(1, 1), result);
 
     childBuilder = new QueryBuilder("child_without_hash");
     parentBuilder = new QueryBuilder("parent_without_hash");
-    runner.runWithoutConflict(
+    runner.run(
       childBuilder.insert("(3, 1, 10)"),
-      parentBuilder.delete("r1 = 2"));
-    runner.runWithoutConflict(
+      parentBuilder.delete("r1 = 2"),
+      slowModeSerializable /* conflict_expected */);
+    runner.run(
       childBuilder.insert("(4, 1, 10)"),
-      parentBuilder.delete("r1 = 1 AND r2 = 11"));
+      parentBuilder.delete("r1 = 1 AND r2 = 11"),
+      slowModeSerializable);
 
     runner.runWithConflict(
       childBuilder.insert("(1, 1, 10)"),
@@ -309,13 +349,15 @@ public class TestPgExplicitLocks extends BasePgSQLTest {
     runner.runWithConflict(
       childBuilder.insert("(2, 1, 10)"),
       parentBuilder.delete("r1 = 1 AND r2 = 10"));
-    result = runner.runWithoutConflict(
+    result = runner.run(
       parentBuilder.delete("r1 = 3 AND r2 = 10"),
-      parentBuilder.delete("r1 = 3 AND r2 = 20"));
-    assertEquals(new Pair<>(1, 1), result);
+      parentBuilder.delete("r1 = 3 AND r2 = 20"),
+      slowModeSerializable /* conflict_expected */);
+    assertEquals(slowModeSerializable ? new Pair<>(1, 0) : new Pair<>(1, 1), result);
   }
 
-  private void testRangeKeyLocks(IsolationLevel pgIsolationLevel) throws Exception {
+  private void testRangeKeyLocks(IsolationLevel pgIsolationLevel,
+                                 boolean skip_prefix_locks) throws Exception {
     ConnectionBuilder builder = getConnectionBuilder().withIsolationLevel(pgIsolationLevel);
     try (Connection conn = builder.connect();
          Statement stmt = conn.createStatement();
@@ -331,11 +373,13 @@ public class TestPgExplicitLocks extends BasePgSQLTest {
       stmt.execute("INSERT INTO table_without_hash VALUES " +
         "(1, 10), (1, 11), (1, 12), " +
         "(2, 10), (2, 11), (2, 20), (2, 21), (2, 22)");
-      runRangeKeyLocksTest(new ParallelQueryRunner(stmt, extraStmt), pgIsolationLevel);
+      runRangeKeyLocksTest(new ParallelQueryRunner(stmt, extraStmt), pgIsolationLevel,
+                           skip_prefix_locks);
     }
   }
 
-  private void testFKLocks(IsolationLevel pgIsolationLevel) throws Exception {
+  private void testFKLocks(IsolationLevel pgIsolationLevel,
+                           boolean skip_prefix_locks) throws Exception {
     ConnectionBuilder builder = getConnectionBuilder().withIsolationLevel(pgIsolationLevel);
     try (Connection conn = builder.connect();
          Statement stmt = conn.createStatement();
@@ -365,23 +409,42 @@ public class TestPgExplicitLocks extends BasePgSQLTest {
       stmt.execute("CREATE INDEX ON child_with_hash(pH, pR1, pR2)");
       stmt.execute("CREATE INDEX ON child_without_hash(pR1, pR2)");
 
-      runFKLocksTest(new ParallelQueryRunner(stmt, extraStmt));
+      runFKLocksTest(new ParallelQueryRunner(stmt, extraStmt), pgIsolationLevel, skip_prefix_locks);
     }
   }
 
-  private void testLocksIsolationLevel(IsolationLevel pgIsolationLevel) throws Exception {
-    testRangeKeyLocks(pgIsolationLevel);
-    testFKLocks(pgIsolationLevel);
+  private void testLocksIsolationLevel(IsolationLevel pgIsolationLevel,
+                                       boolean skip_prefix_locks) throws Exception {
+    testRangeKeyLocks(pgIsolationLevel, skip_prefix_locks);
+    testFKLocks(pgIsolationLevel, skip_prefix_locks);
   }
 
   @Test
   public void testLocksSerializableIsolation() throws Exception {
-    testLocksIsolationLevel(IsolationLevel.SERIALIZABLE);
+    // skip prefilx lock is disabled
+    testLocksIsolationLevel(IsolationLevel.SERIALIZABLE, /*skip_prefix_locks=*/ false);
+
+    // skip prefilx lock is enabled
+    Map<String, String> flagMap = getTServerFlags();
+    flagMap.put("skip_prefix_locks", "true");
+    flagMap.put("allowed_preview_flags_csv", "skip_prefix_locks");
+    flagMap.put("ysql_enable_packed_row", "true");
+    restartClusterWithFlags(Collections.emptyMap(), flagMap);
+    testLocksIsolationLevel(IsolationLevel.SERIALIZABLE, /*skip_prefix_locks=*/ true);
   }
 
   @Test
   public void testLocksSnapshotIsolation() throws Exception {
-    testLocksIsolationLevel(IsolationLevel.REPEATABLE_READ);
+    // skip prefilx lock is disabled
+    testLocksIsolationLevel(IsolationLevel.REPEATABLE_READ, /*skip_prefix_locks=*/ false);
+
+    // skip prefilx lock is enabled
+    Map<String, String> flagMap = getTServerFlags();
+    flagMap.put("skip_prefix_locks", "true");
+    flagMap.put("allowed_preview_flags_csv", "skip_prefix_locks");
+    flagMap.put("ysql_enable_packed_row", "true");
+    restartClusterWithFlags(Collections.emptyMap(), flagMap);
+    testLocksIsolationLevel(IsolationLevel.REPEATABLE_READ, /*skip_prefix_locks=*/ true);
   }
 
   @Test
@@ -432,8 +495,8 @@ public class TestPgExplicitLocks extends BasePgSQLTest {
         assertTrue("Should not reach here since the statement is supposed to fail", false);
       } catch (SQLException e) {
         // If txn2 had a lower priority than txn1, instead of attempting retries for
-        // ysql_max_write_restart_attempts, it would fail immediately due to the NOWAIT clause
-        // with the appropriate message.
+        // yb_max_query_layer_retries, it would fail immediately due to the NOWAIT clause with the
+        // appropriate message.
         assertTrue(StringUtils.containsIgnoreCase(e.getMessage(),
           "ERROR: could not obtain lock on row in relation \"test\""));
 

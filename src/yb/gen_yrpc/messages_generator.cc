@@ -1,4 +1,4 @@
-// Copyright (c) YugaByte, Inc.
+// Copyright (c) YugabyteDB, Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License"); you may not use this file except
 // in compliance with the License.  You may obtain a copy of the License at
@@ -18,6 +18,8 @@
 
 #include "yb/gen_yrpc/model.h"
 
+#include "yb/gutil/stl_util.h"
+
 using google::protobuf::internal::WireFormatLite;
 using namespace std::literals;
 
@@ -32,7 +34,7 @@ const std::string kFieldCase =
     "$message_name$::$field_containing_oneof_cap_name$Case::k$field_camelcase_name$";
 
 std::string SetHasField(const google::protobuf::FieldDescriptor* field) {
-  return field->containing_oneof()
+  return field->real_containing_oneof()
       ? "$field_containing_oneof_name$_case_ = " + kFieldCase + ";"
       : "has_fields_.Set($message_name$Fields::k$field_camelcase_name$);";
 }
@@ -65,7 +67,7 @@ class Message {
 
     for (int j = 0; j != message_->field_count(); ++j) {
       const auto* field = message_->field(j);
-      if (field->is_repeated() || StoreAsPointer(field) || field->containing_oneof()) {
+      if (field->is_repeated() || StoreAsPointer(field) || field->real_containing_oneof()) {
         continue;
       }
       if (!need_has_fields_enum_) {
@@ -110,7 +112,7 @@ class Message {
         "Status ParseFromCodedStream("
             "google::protobuf::io::CodedInputStream* cis) override;\n"
         "size_t SerializedSize() const override;\n"
-        "uint8_t* SerializeToArray(uint8_t* out) const override;\n"
+        "uint8_t* DoSerializeToArray(uint8_t* out) const override;\n"
         "void AppendToDebugString(std::string* out) const override;\n"
         "\n"
         "void Clear() override;\n"
@@ -156,8 +158,8 @@ class Message {
       const auto* field = message_->field(j);
       ScopedSubstituter field_substituter(printer, field);
 
-      if (last_oneof != field->containing_oneof()) {
-        last_oneof = field->containing_oneof();
+      if (last_oneof != field->real_containing_oneof()) {
+        last_oneof = field->real_containing_oneof();
         if (last_oneof) {
           printer(
               "$message_name$::$field_containing_oneof_cap_name$Case "
@@ -173,7 +175,16 @@ class Message {
 
       if (IsSimple(field)) {
         printer(
+            "using $field_camelcase_name$ReturnType = $field_stored_type$;\n"
             "$field_stored_type$ $field_name$() const {\n"
+            );
+        if (field->containing_oneof()) {
+          printer(
+              "  if (!has_$field_name$()) {\n"
+              "    return $field_default_value$;\n"
+              "  }\n");
+        }
+        printer(
             "  return $field_accessor$;\n"
             "}\n"
             "\n");
@@ -181,7 +192,7 @@ class Message {
           printer(
               "void dup_$field_name$($field_stored_type$ value) {\n"
               "  " + set_has_field + "\n"
-              "  $field_accessor$ = arena_.DupSlice(value);\n"
+              "  $field_accessor$ = arena_->DupSlice(value);\n"
               "}\n\n"
               "void ref_$field_name$($field_stored_type$ value) {\n"
               "  " + set_has_field + "\n"
@@ -198,9 +209,10 @@ class Message {
         }
       } else if (StoreAsPointer(field)) {
         printer(
+            "using $field_camelcase_name$ReturnType = const $field_stored_type$&;\n"
             "const $field_stored_type$& $field_name$() const {\n"
             "  return ");
-        if (field->containing_oneof()) {
+        if (field->real_containing_oneof()) {
           printer("$field_containing_oneof_name$_case_ == " + kFieldCase);
         } else {
           printer("$field_accessor$");
@@ -211,7 +223,7 @@ class Message {
             "}\n\n"
             "$field_stored_type$& ref_$field_name$($field_stored_type$* value) {\n"
         );
-        if (field->containing_oneof()) {
+        if (field->real_containing_oneof()) {
           printer("  " + set_has_field + "\n");
         }
         printer(
@@ -221,7 +233,15 @@ class Message {
         );
       } else {
         printer(
-            "const $field_stored_type$& $field_name$() const {\n"
+            "using $field_camelcase_name$ReturnType = const $field_stored_type$&;\n"
+            "const $field_stored_type$& $field_name$() const {\n");
+        if (field->containing_oneof()) {
+          printer(
+              "  if (!has_$field_name$()) {\n"
+              "    return $field_default_value$;\n"
+              "  }\n");
+        }
+        printer(
             "  return $field_accessor$;\n"
             "}\n\n"
         );
@@ -234,14 +254,14 @@ class Message {
       ScopedIndent mutable_ident(printer);
 
       if (StoreAsPointer(field)) {
-        if (field->containing_oneof()) {
+        if (field->real_containing_oneof()) {
           printer("if (!has_$field_name$()) {\n"
                   "  " + set_has_field + "\n");
         } else {
           printer("if (!$field_name$_) {\n");
         }
         printer(
-          "  $field_accessor$ = arena_.NewObject<$field_stored_type$>(&arena_);\n"
+          "  $field_accessor$ = arena_->NewArenaObject<$field_stored_type$>();\n"
           "}\n"
           "return $field_accessor$;\n"
         );
@@ -259,7 +279,7 @@ class Message {
 
       if (!field->is_repeated() || IsPointerField(field)) {
         printer("bool has_$field_name$() const {\n");
-        if (field->containing_oneof()) {
+        if (field->real_containing_oneof()) {
           printer(
               "  return $field_containing_oneof_name$_case_ == "
               "$message_name$::$field_containing_oneof_cap_name$Case::k$field_camelcase_name$;\n");
@@ -270,7 +290,7 @@ class Message {
         }
         printer("}\n\n");
         printer("void clear_$field_name$() {\n");
-        if (field->containing_oneof()) {
+        if (field->real_containing_oneof()) {
           printer(
             "  if (!has_$field_name$()) {\n"
             "    return;\n"
@@ -309,7 +329,7 @@ class Message {
         } else if (StoredAsSlice(field)) {
           printer(
               "void add_dup_$field_name$(const ::yb::Slice& value) {\n"
-              "  $field_accessor$.push_back(arena_.DupSlice(value));\n"
+              "  $field_accessor$.push_back(arena_->DupSlice(value));\n"
               "}\n\n"
               "void add_ref_$field_name$(const ::yb::Slice& value) {\n"
               "  $field_accessor$.push_back(value);\n"
@@ -335,7 +355,7 @@ class Message {
     if (NeedArena(message_)) {
       printer(
           "::yb::ThreadSafeArena& arena() const {\n"
-          "  return arena_;\n"
+          "  return *arena_;\n"
           "}\n\n"
       );
     }
@@ -354,7 +374,7 @@ class Message {
 
     if (NeedArena(message_)) {
       printer(
-          "::yb::ThreadSafeArena& arena_;\n"
+          "::yb::ThreadSafeArena* arena_;\n"
       );
     }
     if (need_has_fields_enum_) {
@@ -368,7 +388,7 @@ class Message {
 
     for (int j = 0; j != message_->field_count(); ++j) {
       const auto* field = message_->field(j);
-      if (!StoredAsSlice(field) || !field->containing_oneof()) {
+      if (!StoredAsSlice(field) || !field->real_containing_oneof()) {
         continue;
       }
       ScopedSubstituter field_substituter(printer, field);
@@ -390,8 +410,8 @@ class Message {
     for (int j = 0; j != message_->field_count();) {
       const auto* field = message_->field(j);
       ScopedSubstituter field_substituter(printer, field);
-      if (field->containing_oneof() != current_oneof) {
-        current_oneof = field->containing_oneof();
+      if (field->real_containing_oneof() != current_oneof) {
+        current_oneof = field->real_containing_oneof();
         if (current_oneof) {
           printer("union {\n");
           printer.Indent();
@@ -404,7 +424,7 @@ class Message {
           printer(" = nullptr");
         }
         printer(";\n");
-      } else if (StoredAsSlice(field) && field->containing_oneof()) {
+      } else if (StoredAsSlice(field) && field->real_containing_oneof()) {
         printer("alignas($field_stored_type$) char $field_name$_[sizeof($field_stored_type$)];\n");
       } else if (IsSimple(field)) {
         printer("$field_stored_type$ $field_name$_");
@@ -421,12 +441,27 @@ class Message {
         }
       }
       ++j;
-      if (j == message_->field_count() || message_->field(j)->containing_oneof() != current_oneof) {
+      if (j == message_->field_count() ||
+          message_->field(j)->real_containing_oneof() != current_oneof) {
         FinishOneOf(printer, current_oneof);
       }
     }
 
     private_scope.Reset("};\n\n");
+
+    if (message_->options().map_entry()) {
+      printer(
+          "inline $message_lw_name$::KeyReturnType ExtractKey(const $message_lw_name$& pair) {\n"
+          "  return pair.key();\n"
+          "}\n"
+          "\n"
+          "inline $message_lw_name$::ValueReturnType ExtractValue"
+              "(const $message_lw_name$& pair) {\n"
+          "  return pair.value();\n"
+          "}\n"
+          "\n"
+      );
+    }
 
     generated_ = true;
   }
@@ -466,7 +501,7 @@ class Message {
     bool first = true;
     if (NeedArena(message_)) {
       NextCtorField(printer, &first);
-      printer("arena_(*arena)");
+      printer("arena_(arena)");
     }
     for (int j = 0; j != message_->field_count(); ++j) {
       const auto* field = message_->field(j);
@@ -488,7 +523,7 @@ class Message {
     bool first = true;
     if (NeedArena(message_)) {
       NextCtorField(printer, &first);
-      printer("arena_(*arena)");
+      printer("arena_(arena)");
     }
     if (need_has_fields_enum_) {
       NextCtorField(printer, &first);
@@ -496,7 +531,7 @@ class Message {
     }
     for (int j = 0; j != message_->field_count(); ++j) {
       const auto* field = message_->field(j);
-      if (field->containing_oneof()) {
+      if (field->real_containing_oneof()) {
         continue;
       }
       NextCtorField(printer, &first);
@@ -619,12 +654,12 @@ class Message {
   void CopyFields(YBPrinter printer, Lightweight lightweight, OneOfOnly oneof_only) const {
     for (int j = 0; j != message_->field_count(); ++j) {
       const auto* field = message_->field(j);
-      if (oneof_only && !field->containing_oneof()) {
+      if (oneof_only && !field->real_containing_oneof()) {
         continue;
       }
       ScopedSubstituter field_substituter(printer, field);
 
-      auto source = lightweight && (!StoredAsSlice(field) || !field->containing_oneof())
+      auto source = lightweight && (!StoredAsSlice(field) || !field->real_containing_oneof())
           ? "rhs.$field_accessor$"s : "rhs.$field_name$()"s;
       if (!lightweight && message_->options().map_entry()) {
         if (field->name() == "key") {
@@ -639,7 +674,7 @@ class Message {
               "$field_accessor$.clear();\n"
               "$field_accessor$.reserve(" + source + ".size());\n"
               "for (const auto& entry : " + source + ") {\n"
-              "  $field_accessor$.push_back(arena_.DupSlice(entry));\n"
+              "  $field_accessor$.push_back(arena_->DupSlice(entry));\n"
               "}\n"
           );
         } else if (lightweight) {
@@ -679,7 +714,7 @@ class Message {
               "if (rhs.has_$field_name$()) {\n"
               "  mutable_$field_name$()->CopyFrom("s + (lightweight ? "*" : "") + source + ");\n"
           );
-          if (field->containing_oneof()) {
+          if (field->real_containing_oneof()) {
               printer("  " + SetHasField(field) + "\n");
           }
         } else {
@@ -691,11 +726,11 @@ class Message {
           if (IsMessage(field)) {
             printer("  $field_name$_.CopyFrom(" + source + ");\n");
           } else if (StoredAsSlice(field)) {
-            printer("  $field_accessor$ = arena_.DupSlice(" + source + ");\n");
+            printer("  $field_accessor$ = arena_->DupSlice(" + source + ");\n");
           } else {
             printer("  $field_accessor$ = " + source + ";\n");
           }
-          if (!lightweight || field->containing_oneof()) {
+          if (!lightweight || field->real_containing_oneof()) {
             printer("  " + SetHasField(field) + "\n");
           }
         }
@@ -723,6 +758,14 @@ class Message {
   }
 
   void Parse(YBPrinter printer) const {
+    const auto& options = message_->options().GetExtension(rpc::lightweight_message);
+    if (options.verify()) {
+      printer(
+          "using $message_lw_name$VerifyType = Status (*)(const $message_lw_name$& msg);\n"
+          "$message_lw_name$VerifyType $message_lw_name$Verify = nullptr;\n\n"
+      );
+    }
+
     printer(
         "Status $message_lw_name$::ParseFromCodedStream("
             "google::protobuf::io::CodedInputStream* input) {\n"
@@ -735,11 +778,33 @@ class Message {
     );
 
     ScopedIndent loop_indent(printer);
+    printer("auto p = input->ReadTagWithCutoffNoLastTag($cutoff$);\n");
+    if (options.dump_parse()) {
+      printer(
+          "LOG(INFO) << std::string(100 - input->RecursionBudget(), ' ') << "
+              "\"$message_lw_name$, tag: \" << p.first << '(' << "
+              "::google::protobuf::internal::WireFormatLite::GetTagFieldNumber(p.first) << \"), "
+              "\" << p.second;\n"
+      );
+    }
+    printer("if (!p.second && !p.first) {\n");
+    if (options.verify()) {
+      printer(
+           "  return $message_lw_name$Verify ? $message_lw_name$Verify(*this) : Status::OK();\n"
+      );
+    } else {
+      printer("  return Status::OK();\n");
+    }
     printer(
-        "auto p = input->ReadTagWithCutoffNoLastTag($cutoff$);\n"
-        "if (!p.second && !p.first) {\n"
-        "  return Status::OK();\n"
         "}\n"
+    );
+    if (options.dump_parse()) {
+      printer(
+          "const void* input_start;\n"
+          "int input_left_start;\n"
+          "input->GetDirectBufferPointerInline(&input_start, &input_left_start);\n");
+    }
+    printer(
         "switch(::google::protobuf::internal::WireFormatLite::GetTagFieldNumber(p.first)) {\n"
     );
 
@@ -829,6 +894,16 @@ class Message {
     case_indent.Reset("}\n");
 
     switch_indent.Reset("}\n");
+    if (options.dump_parse()) {
+      printer(
+          "const void* input_finish;\n"
+          "int input_left_finish;\n"
+          "input->GetDirectBufferPointerInline(&input_finish, &input_left_finish);\n"
+          "LOG(INFO) << std::string(100 - input->RecursionBudget(), ' ') << "
+              "\"$message_lw_name$ consumed: \" << Slice(pointer_cast<const char*>(input_start), "
+              "pointer_cast<const char*>(input_finish)).ToDebugHexString();\n"
+      );
+    }
     loop_indent.Reset("}\n");
     method_indent.Reset("}\n\n");
   }
@@ -896,7 +971,7 @@ class Message {
 
   void Serialize(YBPrinter printer) const {
     printer(
-        "uint8_t* $message_lw_name$::SerializeToArray(uint8_t* out) const {\n");
+        "uint8_t* $message_lw_name$::DoSerializeToArray(uint8_t* out) const {\n");
 
     ScopedIndent method_indent(printer);
 
@@ -1048,7 +1123,7 @@ class Message {
 
   bool StoreAsPointer(const google::protobuf::FieldDescriptor* field) const {
     return cycle_dependencies_.count(field) || IsPointerField(field) ||
-           (field->containing_oneof() && field->message_type());
+           (field->real_containing_oneof() && field->message_type());
   }
 
   const google::protobuf::Descriptor* message_;
@@ -1056,6 +1131,22 @@ class Message {
   bool need_has_fields_enum_ = false;
   std::unordered_set<const google::protobuf::FieldDescriptor*> cycle_dependencies_;
 };
+
+std::vector<const google::protobuf::EnumValueDescriptor*> EnumValues(
+    const google::protobuf::EnumDescriptor* enum_desc) {
+  std::vector<const google::protobuf::EnumValueDescriptor*> values;
+  for (int i = 0; i != enum_desc->value_count(); ++i) {
+    values.push_back(enum_desc->value(i));
+  }
+  std::sort(values.begin(), values.end(), [](const auto* lhs, const auto* rhs) {
+    return lhs->number() < rhs->number() ||
+           (lhs->number() == rhs->number() && lhs->index() < rhs->index());
+  });
+  Unique(&values, [](const auto* lhs, const auto* rhs) {
+    return lhs->number() == rhs->number();
+  });
+  return values;
+}
 
 } // namespace
 
@@ -1078,11 +1169,15 @@ class MessagesGenerator::Impl {
     }
 
     if (generating_any) {
-      printer("#include <google/protobuf/any.pb.h>\n");
+      printer("#include <google/protobuf/any.pb.h>\n\n");
     }
 
+    printer("#include \"yb/rpc/lightweight_message.h\"\n\n");
+
+    if (file->enum_type_count()) {
+      printer("#include \"yb/util/enums.h\"\n");
+    }
     printer(
-        "#include \"yb/rpc/lightweight_message.h\"\n"
         "#include \"yb/util/memory/arena.h\"\n"
         "#include \"yb/util/memory/arena_list.h\"\n"
         "#include \"yb/util/memory/mc_types.h\"\n"
@@ -1103,6 +1198,10 @@ class MessagesGenerator::Impl {
     printer(
         "$open_namespace$\n"
     );
+
+    for (int i = 0; i != file->enum_type_count(); ++i) {
+      EnumDeclaration(printer, file->enum_type(i));
+    }
 
     for (int i = 0; i != file->message_type_count(); ++i) {
       MessageForward(printer, file->message_type(i));
@@ -1135,6 +1234,10 @@ class MessagesGenerator::Impl {
         "\n"
         "$open_namespace$\n"
     );
+
+    for (int i = 0; i != file->enum_type_count(); ++i) {
+      EnumDefinition(printer, file->enum_type(i));
+    }
 
     for (int i = 0; i != file->message_type_count(); ++i) {
       MessageDefinition(printer, file->message_type(i));
@@ -1201,6 +1304,61 @@ class MessagesGenerator::Impl {
     }
 
     messages_[message]->Definition(printer);
+  }
+
+  void EnumDeclaration(YBPrinter printer, const google::protobuf::EnumDescriptor* enum_desc) {
+    auto name = LightweightName(enum_desc);
+    if (!name) {
+      return;
+    }
+
+    ScopedSubstituter enum_substituter(printer, enum_desc);
+
+    printer("YB_DEFINE_ENUM($enum_lw_name$,\n");
+    {
+      ScopedIndent enum_scope(printer);
+      for (const auto* value : EnumValues(enum_desc)) {
+        printer(Format("($0) // $1\n", value->name(), value->number()));
+      }
+    }
+    printer(");\n\n");
+    printer("$enum_name$ ToPB($enum_lw_name$ value);\n");
+    printer("$enum_lw_name$ ToLW($enum_name$ value);\n\n");
+  }
+
+  void EnumDefinition(YBPrinter printer, const google::protobuf::EnumDescriptor* enum_desc) {
+    auto name = LightweightName(enum_desc);
+    if (!name) {
+      return;
+    }
+
+    ScopedSubstituter enum_substituter(printer, enum_desc);
+    auto values = EnumValues(enum_desc);
+    GenEnumConverter(printer, enum_desc, "ToPB", "enum_lw_name", "enum_name");
+    GenEnumConverter(printer, enum_desc, "ToLW", "enum_name", "enum_lw_name");
+  }
+
+  void GenEnumConverter(
+      YBPrinter printer, const google::protobuf::EnumDescriptor* enum_desc,
+      const std::string& name, const std::string& from_type, const std::string& to_type) {
+    printer(Format("$$$2$$ $0($$$1$$ value) {\n", name, from_type, to_type));
+    {
+      ScopedIndent function_scope(printer);
+      printer("switch (value) {\n");
+      for (const auto* value : EnumValues(enum_desc)) {
+        printer(Format("case $$$0$$::$1:\n", from_type, value->name()));
+        printer(Format("  return $$$0$$::$1;\n", to_type, value->name()));
+      }
+      if (enum_desc->file()->syntax() == google::protobuf::FileDescriptor::SYNTAX_PROTO3 &&
+          name == "ToLW") {
+        printer(Format("case $$$0$$::$$$0$$_INT_MIN_SENTINEL_DO_NOT_USE_:\n", from_type));
+        printer(Format("case $$$0$$::$$$0$$_INT_MAX_SENTINEL_DO_NOT_USE_:\n", from_type));
+        printer("  break;\n");
+      }
+      printer("};\n");
+      printer(Format("FATAL_INVALID_ENUM_VALUE($$$0$$, value);\n", from_type));
+    }
+    printer("}\n\n");
   }
 
   std::unordered_map<const google::protobuf::Descriptor*, std::unique_ptr<Message>> messages_;

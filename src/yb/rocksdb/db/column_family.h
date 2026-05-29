@@ -3,9 +3,9 @@
 //  LICENSE file in the root directory of this source tree. An additional grant
 //  of patent rights can be found in the PATENTS file in the same directory.
 //
-// The following only applies to changes made to this file as part of YugaByte development.
+// The following only applies to changes made to this file as part of YugabyteDB development.
 //
-// Portions Copyright (c) YugaByte, Inc.
+// Portions Copyright (c) YugabyteDB, Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License"); you may not use this file except
 // in compliance with the License.  You may obtain a copy of the License at
@@ -25,6 +25,7 @@
 #pragma once
 
 #include <atomic>
+#include <optional>
 #include <string>
 #include <unordered_map>
 #include <vector>
@@ -39,6 +40,8 @@
 #include "yb/rocksdb/options.h"
 #include "yb/rocksdb/util/mutable_cf_options.h"
 #include "yb/rocksdb/util/thread_local.h"
+
+#include "yb/util/enums.h"
 
 namespace rocksdb {
 
@@ -55,6 +58,8 @@ class DBImpl;
 class LogBuffer;
 class InstrumentedMutex;
 class InstrumentedMutexLock;
+
+YB_DEFINE_ENUM(CompactionSizeKind, (kSmall)(kLarge));
 
 extern const double kSlowdownRatio;
 
@@ -267,15 +272,9 @@ class ColumnFamilyData {
   static const int kCompactToBaseLevel;
   // REQUIRES: DB mutex held
   std::unique_ptr<Compaction> CompactRange(
-      const MutableCFOptions& mutable_cf_options,
-      int input_level,
-      int output_level,
-      uint32_t output_path_id,
-      const InternalKey* begin,
-      const InternalKey* end,
-      CompactionReason compaction_reason,
-      InternalKey** compaction_end,
-      bool* manual_conflict);
+      const MutableCFOptions& mutable_cf_options, int input_level, int output_level,
+      const CompactRangeOptions& compact_range_options, const InternalKey* begin,
+      const InternalKey* end, InternalKey** compaction_end, bool* manual_conflict);
 
   CompactionPicker* compaction_picker() { return compaction_picker_.get(); }
   // thread-safe
@@ -322,11 +321,27 @@ class ColumnFamilyData {
 
   void ResetThreadLocalSuperVersions();
 
-  // Protected by DB mutex
-  void set_pending_flush(bool value) { pending_flush_ = value; }
-  void set_pending_compaction(bool value) { pending_compaction_ = value; }
-  bool pending_flush() { return pending_flush_; }
-  bool pending_compaction() { return pending_compaction_; }
+  // Protected by DB mutex. When engaged, a flush is scheduled / in progress for this CF.
+  bool pending_flush() const { return pending_flush_.has_value(); }
+  // Best-effort reason for the in-flight or scheduled flush; kUnknown when unset or unknown.
+  FlushReason pending_flush_reason() const {
+    return pending_flush_.value_or(FlushReason::kUnknown);
+  }
+  void mark_pending_flush(FlushReason reason) { pending_flush_ = reason; }
+  void clear_pending_flush() { pending_flush_.reset(); }
+
+  void PendingCompactionAdded(CompactionSizeKind compaction_size_kind);
+  void PendingCompactionRemoved(CompactionSizeKind compaction_size_kind);
+  void PendingCompactionSizeKindUpdated(CompactionSizeKind from, CompactionSizeKind to);
+  bool pending_compaction() const;
+
+  bool pending_compaction(CompactionSizeKind compaction_size_kind) const {
+    return num_pending_compactions_[std::to_underlying(compaction_size_kind)] > 0;
+  }
+
+  size_t num_pending_compactions(CompactionSizeKind compaction_size_kind) const {
+    return num_pending_compactions_[std::to_underlying(compaction_size_kind)];
+  }
 
   // Recalculate some small conditions, which are changed only during
   // compaction, adding new memtable and/or
@@ -335,6 +350,11 @@ class ColumnFamilyData {
   // a write stall
   void RecalculateWriteStallConditions(
       const MutableCFOptions& mutable_cf_options);
+
+  // Used in testing to replace current exclude_from_compaction functor. Returns current functor.
+  // Must be triggered under DBs mutex.
+  CompactionFileExcluderPtr TEST_SetExcludeFromCompaction(
+      CompactionFileExcluderPtr exclude_from_compaction);
 
  private:
   friend class ColumnFamilySet;
@@ -398,12 +418,14 @@ class ColumnFamilyData {
 
   std::unique_ptr<WriteControllerToken> write_controller_token_;
 
-  // If true --> this ColumnFamily is currently present in DBImpl::flush_queue_
-  bool pending_flush_;
+  // Engaged while a flush is scheduled / in flight for this CF (DB mutex). Value is best-effort.
+  std::optional<FlushReason> pending_flush_;
 
-  // If true --> this ColumnFamily is currently present in
-  // DBImpl::compaction_queue_
-  bool pending_compaction_;
+  // How many times this ColumnFamily is currently present in DBImpl::compaction_queue_.
+  // Note: in general it might be not effective to use such nearly aligned atomics. This is not a
+  // problem for this particular use case because this is not a hot path, but shouldn't be applied
+  // in other cases where performance is critical.
+  std::array<std::atomic<size_t>, kElementsInCompactionSizeKind> num_pending_compactions_;
 
   uint64_t prev_compaction_needed_bytes_;
 };

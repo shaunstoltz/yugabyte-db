@@ -15,9 +15,9 @@
 // specific language governing permissions and limitations
 // under the License.
 //
-// The following only applies to changes made to this file as part of YugaByte development.
+// The following only applies to changes made to this file as part of YugabyteDB development.
 //
-// Portions Copyright (c) YugaByte, Inc.
+// Portions Copyright (c) YugabyteDB, Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License"); you may not use this file except
 // in compliance with the License.  You may obtain a copy of the License at
@@ -34,12 +34,12 @@
 
 #include <vector>
 
-#include <boost/optional/optional.hpp>
-
 #include <gtest/gtest.h>
 
 #include "yb/gutil/strings/util.h"
+
 #include "yb/util/countdown_latch.h"
+#include "yb/util/metrics.h"
 #include "yb/util/net/sockaddr.h"
 #include "yb/util/status_log.h"
 #include "yb/util/test_macros.h"
@@ -56,7 +56,7 @@ class DnsResolverTest : public YBTest {
     io_thread_ = CHECK_RESULT(Thread::Make("io_thread", "io_thread", [this] {
       boost::system::error_code ec;
       io_service_.run(ec);
-      LOG_IF(ERROR, ec) << "Failed to run io service: " << ec;
+      LOG_IF(DFATAL, ec) << "Failed to run io service: " << ec;
     }));
   }
 
@@ -70,7 +70,7 @@ class DnsResolverTest : public YBTest {
     auto deadline = std::chrono::steady_clock::now() + 15s;
     while (!io_service_.stopped()) {
       if (std::chrono::steady_clock::now() >= deadline) {
-        LOG(ERROR) << "Io service failed to stop";
+        LOG(DFATAL) << "Io service failed to stop";
         io_service_.stop();
         break;
       }
@@ -81,9 +81,9 @@ class DnsResolverTest : public YBTest {
 
   ThreadPtr io_thread_;
   IoService io_service_;
-  boost::optional<IoService::work> work_{io_service_};
+  std::optional<IoService::work> work_{io_service_};
 
-  DnsResolver resolver_{&io_service_};
+  DnsResolver resolver_{&io_service_, nullptr};
 };
 
 TEST_F(DnsResolverTest, TestResolution) {

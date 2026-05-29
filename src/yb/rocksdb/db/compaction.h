@@ -3,9 +3,9 @@
 //  LICENSE file in the root directory of this source tree. An additional grant
 //  of patent rights can be found in the PATENTS file in the same directory.
 //
-// The following only applies to changes made to this file as part of YugaByte development.
+// The following only applies to changes made to this file as part of YugabyteDB development.
 //
-// Portions Copyright (c) YugaByte, Inc.
+// Portions Copyright (c) YugabyteDB, Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License"); you may not use this file except
 // in compliance with the License.  You may obtain a copy of the License at
@@ -62,6 +62,7 @@ struct LightweightBoundaries {
   size_t num_user_values;
   UserBoundaryTag* user_tags;
   Slice* user_values;
+  uint64_t hybrid_time = 0;
 
   Slice user_key() const { return ExtractUserKey(key); }
 
@@ -83,7 +84,8 @@ struct FdWithBoundaries {
   FileDescriptor fd;
   LightweightBoundaries smallest; // smallest boundaries in this file
   LightweightBoundaries largest;  // largest boundaries in this file
-  Slice user_filter_data; // Data provided by user that will be passed to iterator replacer.
+  // Data provided by user that will be passed to iterator replacer.
+  Slice user_filter_data;
 
   FdWithBoundaries(Arena* arena, const FileMetaData& source);
 };
@@ -107,11 +109,12 @@ class Compaction {
       VersionStorageInfo* input_version, const MutableCFOptions& mutable_cf_options,
       std::vector<CompactionInputFiles> inputs, int output_level, uint64_t target_file_size,
       uint64_t max_grandparent_overlap_bytes, uint32_t output_path_id, CompressionType compression,
-      std::vector<FileMetaData*> grandparents,
-      Logger* info_log,
-      bool manual_compaction = false, double score = -1,
+      std::vector<FileMetaData*> grandparents, const yb::MemTrackerPtr& mem_tracker,
+      Logger* info_log, bool manual_compaction = false, double score = -1,
       bool deletion_compaction = false,
-      CompactionReason compaction_reason = CompactionReason::kUnknown);
+      CompactionReason compaction_reason = CompactionReason::kUnknown,
+      SkipCorruptDataBlocksUnsafe skip_corrupt_data_blocks_unsafe =
+          SkipCorruptDataBlocksUnsafe::kFalse);
 
   // No copying allowed
   Compaction(const Compaction&) = delete;
@@ -294,19 +297,22 @@ class Compaction {
 
   CompactionReason compaction_reason() const { return compaction_reason_; }
 
+  SkipCorruptDataBlocksUnsafe skip_corrupt_data_blocks_unsafe() const {
+    return skip_corrupt_data_blocks_unsafe_;
+  }
+
   yb::PriorityThreadPoolSuspender* suspender() { return suspender_; }
   void SetSuspender(yb::PriorityThreadPoolSuspender* value) { suspender_ = value; }
 
  private:
-  Compaction(VersionStorageInfo* input_version,
-             const MutableCFOptions& mutable_cf_options,
-             std::vector<CompactionInputFiles> inputs, int output_level,
-             uint64_t target_file_size, uint64_t max_grandparent_overlap_bytes,
-             uint32_t output_path_id, CompressionType compression,
-             std::vector<FileMetaData*> grandparents,
-             bool manual_compaction, double score,
-             bool deletion_compaction,
-             CompactionReason compaction_reason);
+  Compaction(
+      VersionStorageInfo* input_version, const MutableCFOptions& mutable_cf_options,
+      std::vector<CompactionInputFiles> inputs, int output_level, uint64_t target_file_size,
+      uint64_t max_grandparent_overlap_bytes, uint32_t output_path_id, CompressionType compression,
+      std::vector<FileMetaData*> grandparents, const yb::MemTrackerPtr& mem_tracker,
+      bool manual_compaction, double score, bool deletion_compaction,
+      CompactionReason compaction_reason,
+      SkipCorruptDataBlocksUnsafe skip_corrupt_data_blocks_unsafe);
 
   // mark (or clear) all files that are being compacted
   void MarkFilesBeingCompacted(bool mark_as_compacted);
@@ -384,6 +390,11 @@ class Compaction {
 
   // Reason for compaction
   CompactionReason compaction_reason_;
+
+  // UNSAFE: Skip corrupt data, this will result in data loss. Use with extra care only when/while
+  // there are no other options available.
+  SkipCorruptDataBlocksUnsafe skip_corrupt_data_blocks_unsafe_ =
+      SkipCorruptDataBlocksUnsafe::kFalse;
 
   yb::PriorityThreadPoolSuspender* suspender_ = nullptr;
 };

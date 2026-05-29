@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 
-# Copyright (c) YugaByte, Inc.
+# Copyright (c) YugabyteDB, Inc.
 #
 # Licensed under the Apache License, Version 2.0 (the "License"); you may not use this file except
 # in compliance with the License.  You may obtain a copy of the License at
@@ -13,6 +13,7 @@
 # under the License.
 #
 
+# shellcheck source=build-support/common-test-env.sh
 . "${BASH_SOURCE%/*}"/common-test-env.sh
 
 print_usage() {
@@ -33,7 +34,6 @@ EOT
 
 core_file_path=""
 executable_path=""
-delete_core_file=false
 while [[ $# -gt 0 ]]; do
   case $1 in
     --core|-c)

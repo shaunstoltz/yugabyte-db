@@ -15,9 +15,9 @@
 // specific language governing permissions and limitations
 // under the License.
 //
-// The following only applies to changes made to this file as part of YugaByte development.
+// The following only applies to changes made to this file as part of YugabyteDB development.
 //
-// Portions Copyright (c) YugaByte, Inc.
+// Portions Copyright (c) YugabyteDB, Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License"); you may not use this file except
 // in compliance with the License.  You may obtain a copy of the License at
@@ -39,12 +39,14 @@
 #include <vector>
 
 #include <boost/atomic.hpp>
+#include <boost/function.hpp>
 
 #include "yb/common/hybrid_time.h"
 
 #include "yb/consensus/consensus_meta.h"
 #include "yb/consensus/consensus_queue.h"
 #include "yb/consensus/consensus_types.h"
+#include "yb/consensus/opid_util.h"
 #include "yb/consensus/retryable_requests.h"
 #include "yb/consensus/leader_lease.h"
 
@@ -62,9 +64,6 @@ class ThreadPool;
 namespace consensus {
 
 class RetryableRequests;
-
-YB_DEFINE_ENUM(SetMajorityReplicatedLeaseExpirationFlag,
-               (kResetOldLeaderLease)(kResetOldLeaderHtLease));
 
 YB_STRONGLY_TYPED_BOOL(CouldStop);
 
@@ -123,7 +122,7 @@ class ReplicaState {
 
   ~ReplicaState();
 
-  Status StartUnlocked(const OpIdPB& last_in_wal);
+  Status StartUnlocked(const OpId& last_in_wal);
 
   // Should be used only to assert that the update_lock_ is held.
   bool IsLocked() const WARN_UNUSED_RESULT;
@@ -188,6 +187,10 @@ class ReplicaState {
   // Return current consensus state summary.
   ConsensusStatePB ConsensusStateUnlocked(ConsensusConfigType type) const;
 
+  // Return a copy of the committed consensus state cache.
+  // This method is thread safe.
+  ConsensusStatePB GetConsensusStateFromCache() const;
+
   // Returns the currently active Raft role.
   PeerRole GetActiveRoleUnlocked() const;
 
@@ -244,6 +247,7 @@ class ReplicaState {
   const std::string& GetLeaderUuidUnlocked() const;
   bool HasLeaderUnlocked() const { return !GetLeaderUuidUnlocked().empty(); }
   void ClearLeaderUnlocked() { SetLeaderUuidUnlocked(""); }
+  void BecomeReplicaUnlocked();
 
   // Return whether this peer has voted in the current term.
   const bool HasVotedCurrentTermUnlocked() const;
@@ -339,7 +343,11 @@ class ReplicaState {
   // API to dump pending transactions. Added to debug ENG-520.
   void DumpPendingOperationsUnlocked();
 
-  OpId NewIdUnlocked();
+  // Also checks whether a leader-side operation that was just assigned `op_id` (via NewIdUnlocked)
+  // is allowed by the registered operation filters (e.g. a WRITE_OP / UPDATE_TRANSACTION_OP must be
+  // rejected once a SPLIT_OP has become pending). If it is not allowed, cancels the id allocation
+  // and returns the rejection status; otherwise returns OK.
+  Result<OpId> NewIdUnlocked(OperationType op_type);
 
   // Used when, for some reason, an operation that failed before it could be considered
   // a part of the state machine. Basically restores the id gen to the state it was before
@@ -354,6 +362,9 @@ class ReplicaState {
   const OpId& GetPendingElectionOpIdUnlocked() { return pending_election_opid_; }
   void SetPendingElectionOpIdUnlocked(const OpId& opid) { pending_election_opid_ = opid; }
   void ClearPendingElectionOpIdUnlocked() { pending_election_opid_ = OpId(); }
+
+  const OpId& GetPendingSplitOpIdUnlocked() { return pending_split_op_id_; }
+  void ClearPendingSplitOpIdUnlocked() { pending_split_op_id_ = OpId(); }
 
   std::string ToString() const;
   std::string ToStringUnlocked() const;
@@ -370,27 +381,34 @@ class ReplicaState {
   // The update_lock_ must be held.
   ReplicaState::State state() const;
 
-  // Update the point in time we have to wait until before starting to act as a leader in case
+  // Update the point in time we have to wait until we can start acting as a leader in case
   // we win an election.
   void UpdateOldLeaderLeaseExpirationOnNonLeaderUnlocked(
-      const CoarseTimeLease& lease, const PhysicalComponentLease& ht_lease);
+      const CoarseTimeLeaseUpdate& lease, const PhysicalComponentLeaseUpdate& ht_lease);
+
+  void UpdateOldLeaderLeaseExpirationAfterElectionUnlocked(
+      const std::vector<CoarseTimeLeaseUpdate>& leases,
+      const std::vector<PhysicalComponentLeaseUpdate>& ht_leases);
 
   Status SetMajorityReplicatedLeaseExpirationUnlocked(
       const MajorityReplicatedData& majority_replicated_data,
-      EnumBitSet<SetMajorityReplicatedLeaseExpirationFlag> flags);
+      const boost::function<bool(const std::string&)>& filter);
 
   // Checks two conditions:
   // - That the old leader definitely does not have a lease.
   // - That this leader has a committed lease.
   LeaderLeaseStatus GetLeaderLeaseStatusUnlocked(
-      MonoDelta* remaining_old_leader_lease = nullptr, CoarseTimePoint* now = nullptr) const;
+      MonoDelta* remaining_old_leader_lease = nullptr, CoarseTimePoint* now = nullptr,
+      bool check_no_op_committed = false) const;
 
   LeaderLeaseStatus GetHybridTimeLeaseStatusAtUnlocked(MicrosTime micros_time) const;
 
-  // Get the remaining duration of the old leader's lease. Optionally, return the current time in
-  // the "now" output parameter. In case the old leader's lease has already expired or is not known,
-  // returns an uninitialized MonoDelta value.
-  MonoDelta RemainingOldLeaderLeaseDuration(CoarseTimePoint* now = nullptr) const;
+  // Get the remaining duration of the old leader's lease.
+  // Returns the most advanced lease information left after cleanup.
+  CoarseTimeLeaseUpdate RemainingOldLeaderLease(CoarseTimePoint* now = nullptr) const;
+  PhysicalComponentLeaseUpdate RemainingOldLeaderHtLease(MicrosTime physical_component) const;
+
+  MonoDelta RemainingMajorityReplicatedLeaderLeaseDuration(CoarseTimePoint now) const;
 
   const PhysicalComponentLease& old_leader_ht_lease() const {
     return old_leader_ht_lease_;
@@ -423,16 +441,32 @@ class ReplicaState {
   RestartSafeCoarseMonoClock& Clock();
 
   RetryableRequestsCounts TEST_CountRetryableRequests();
+  bool TEST_HasBootstrapStateOnDisk() const;
 
-  void SetLeaderNoOpCommittedUnlocked(bool value);
+  void SetLeaderNoOpCommittedUnlocked(bool value, int64_t no_op_index = kInvalidOpIdIndex);
 
   void NotifyReplicationFinishedUnlocked(
       const ConsensusRoundPtr& round, const Status& status, int64_t leader_term,
       OpIds* applied_op_ids);
 
-  const RetryableRequests& retryable_requests() const {
+  RetryableRequests& retryable_requests() {
     DCHECK(IsLocked());
     return retryable_requests_;
+  }
+
+  Status FlushBootstrapState();
+
+  Status CopyBootstrapStateTo(const std::string& dest_path);
+
+  Result<std::unique_ptr<RetryableRequests>> TakeSnapshotOfRetryableRequests();
+
+  OpId GetLastFlushedOpIdInRetryableRequests();
+
+  Status SetLastFlushedOpIdInRetryableRequests(const OpId& op_id);
+
+  int64_t GetFirstIndexOfCurrentTermUnlocked() const {
+    DCHECK(IsLocked());
+    return first_index_of_current_term_;
   }
 
  private:
@@ -451,8 +485,7 @@ class ReplicaState {
   // Applies committed config change.
   void ApplyConfigChangeUnlocked(const ConsensusRoundPtr& round);
 
-  consensus::LeaderState RefreshLeaderStateCacheUnlocked(
-      CoarseTimePoint* now) const ATTRIBUTE_NONNULL(2);
+  consensus::LeaderState RefreshLeaderStateCacheUnlocked(CoarseTimePoint& now) const;
 
   PendingOperations::iterator FindPendingOperation(int64_t index);
 
@@ -508,6 +541,8 @@ class ReplicaState {
   // If set, a leader election is pending upon the specific op id commitment to this peer's log.
   OpId pending_election_opid_;
 
+  OpId pending_split_op_id_;
+
   State state_ = State::kInitialized;
 
   // When a follower becomes the leader, it uses this field to wait out the old leader's lease
@@ -526,7 +561,7 @@ class ReplicaState {
   // is allowed to serve up-to-date reads and accept writes only while the current time is less than
   // this. However, the leader might manage to replicate a lease extension without losing its
   // leadership.
-  CoarseTimePoint majority_replicated_lease_expiration_;
+  mutable CoarseTimePoint majority_replicated_lease_expiration_;
 
   // LEADER only: the latest committed hybrid time lease expiration deadline for the current leader.
   // The leader is allowed to add new log entries only when lease of old leader is expired.
@@ -538,6 +573,10 @@ class ReplicaState {
   // This leader is ready to serve only if NoOp was successfully committed
   // after the new leader successful election.
   bool leader_no_op_committed_ = false;
+
+  // The index of the NO_OP entry at the start of this leader's term.
+  // Only valid when leader_no_op_committed_ is true.
+  int64_t first_index_of_current_term_ = kInvalidOpIdIndex;
 
   std::function<void(const OpIds&)> applied_ops_tracker_;
 
@@ -552,7 +591,7 @@ class ReplicaState {
     // Extra value meaning depends on actual status:
     // LEADER_AND_READY: leader term.
     // LEADER_BUT_OLD_LEADER_MAY_HAVE_LEASE: number of microseconds in remaining_old_leader_lease.
-    uint64_t packed_status;
+    uint64_t packed_status = 0;
     CoarseTimePoint expire_at;
 
     LeaderStateCache() noexcept {}

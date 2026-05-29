@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 
-# Copyright (c) YugaByte, Inc.
+# Copyright (c) YugabyteDB, Inc.
 #
 # Licensed under the Apache License, Version 2.0 (the "License"); you may not use this file except
 # in compliance with the License.  You may obtain a copy of the License at
@@ -80,7 +80,7 @@ if [[ -z $tserver_ip || -z $ssh_key_file || -z $staging_dir ]]; then
 fi
 
 set +eo pipefail
-match=$(echo $staging_dir | grep bulk_load_staging)
+match="$(echo "$staging_dir" | grep bulk_load_staging)"
 set -eo pipefail
 
 if [[ -z $match ]]; then
@@ -90,6 +90,6 @@ fi
 
 # Delete the appropriate directory.
 echo "Deleting $staging_dir on tserver $tserver_ip"
-ssh -o 'StrictHostKeyChecking no' -p $ssh_port -i $ssh_key_file $ssh_user_name@$tserver_ip \
+ssh -o 'StrictHostKeyChecking no' -p "$ssh_port" -i "$ssh_key_file" "$ssh_user_name@$tserver_ip" \
 "rm -rf $staging_dir"
 echo "Deleted $staging_dir on tserver $tserver_ip"

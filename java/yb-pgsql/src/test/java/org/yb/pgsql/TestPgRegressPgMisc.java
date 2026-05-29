@@ -1,4 +1,4 @@
-// Copyright (c) YugaByte, Inc.
+// Copyright (c) YugabyteDB, Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License"); you may not use this file except
 // in compliance with the License.  You may obtain a copy of the License at
@@ -12,18 +12,54 @@
 //
 package org.yb.pgsql;
 
+import java.util.Arrays;
+import java.util.List;
+import java.util.Map;
+
 import org.junit.Test;
 import org.junit.runner.RunWith;
-import org.yb.util.YBTestRunnerNonTsanOnly;
+import org.junit.runners.Parameterized;
+import org.yb.YBParameterizedTestRunner;
 
 /**
  * Runs the pg_regress test suite on YB code.
  */
-@RunWith(value=YBTestRunnerNonTsanOnly.class)
-public class TestPgRegressPgMisc extends BasePgSQLTest {
+@RunWith(value = YBParameterizedTestRunner.class)
+public class TestPgRegressPgMisc extends BasePgRegressTestPorted {
+  private final boolean objectLockingEnabled;
+  private final boolean concurrentDDLEnabled;
+
+  public TestPgRegressPgMisc(boolean objectLockingEnabled, boolean concurrentDDLEnabled) {
+    this.objectLockingEnabled = objectLockingEnabled;
+    this.concurrentDDLEnabled = concurrentDDLEnabled;
+  }
+
+  @Parameterized.Parameters(name = "objectLocking={0}-concurrentDDL={1}")
+  public static List<Object[]> parameters() {
+    return Arrays.asList(
+        new Object[]{false, false},
+        new Object[]{true, false},
+        new Object[]{true, true});
+  }
+
   @Override
   public int getTestMethodTimeoutSec() {
     return 1800;
+  }
+
+  // Disable auto analyze likely because of issue #27973.
+  // This may not be related to auto analyze at all.
+  @Override
+  protected Map<String, String> getTServerFlags() {
+    Map<String, String> flagMap = super.getTServerFlags();
+    flagMap.put("ysql_enable_auto_analyze", "false");
+    flagMap.put("enable_object_locking_for_table_locks", String.valueOf(objectLockingEnabled));
+    flagMap.put("allowed_preview_flags_csv", "ysql_enable_concurrent_ddl");
+    flagMap.put("ysql_enable_concurrent_ddl", String.valueOf(concurrentDDLEnabled));
+
+    // TODO(28543): Remove once transactional ddl is enabled by default.
+    flagMap.put("ysql_yb_ddl_transaction_block_enabled", "true");
+    return flagMap;
   }
 
   @Test

@@ -1,42 +1,155 @@
 import algoliasearch from 'algoliasearch';
+import { getCookie } from 'browser-cookie-utils';
 
+/* eslint no-underscore-dangle: 0 */
 (function () {
-  'use strict';
-
+  const algoliaAppId = 'UMBCUJCBE8';
+  const algoliaApiKey = '7cd0659fb88c5d3f1abce809ad5f96f2';
+  const algoliaIndexName = 'yugabytedb_docs';
   const ignoreClickOnMeElement = document.querySelector('body:not(.td-searchpage) .search-area');
   const searchInput = document.getElementById('search-query');
+
+  /**
+   * Kapa modal Styling and add shadow on root.
+   */
+  function askAiPopupStyle() {
+    const host = document.querySelector('#kapa-widget-container:not(.styled)');
+
+    if (host) {
+      const shadowRoot = host.shadowRoot;
+      if (shadowRoot) {
+        const style = document.createElement('style');
+
+        // Original (Unminified) file located in `docs/assets/scss/_yb_kapa_modal_styling.scss`.
+        style.textContent = `.mantine-Image-root{border-radius:0}`;
+
+        shadowRoot.appendChild(style);
+      }
+      host.classList.add('styled');
+    }
+  }
 
   /**
    * Provided name value from the Query param either from URL or with the passed
    * search query.
    */
-  function searchURLParameter(name, fetchFrom) {
-    if (!fetchFrom) {
-      fetchFrom = location.search;
-    }
+  function searchURLParameter(name) {
+    const fetchFrom = location.search;
 
-    return decodeURIComponent((new RegExp('[?|&]' + name + '=([^&;]+?)(&|#|;|$)').exec(fetchFrom) || [null, ''])[1].replace(/\+/g, '%20')) || null;
+    return decodeURIComponent((new RegExp(`[?|&]${name}=([^&;]+?)(&|#|;|$)`).exec(fetchFrom) || [null, ''])[1].replace(/\+/g, '%20')) || null;
   }
 
   /**
    * Create a URL that contains query, tab, items etc.
    */
   function createSearchUrl(pager = 1) {
-    const searchText = searchInput.value.trim();
+    const searchText = encodedSearchedTerm();
     if (history.pushState) {
       let addQueryParams = '';
-      if (searchText && searchText.trim().length > 0) {
-        document.getElementById('search-query').classList.add('have-text');
-        addQueryParams = '?query=' + searchText.trim();
+      if (searchText.length > 0) {
+        searchInput.classList.add('have-text');
+        addQueryParams = `?query=${searchText.trim()}`;
       } else {
         addQueryParams = '/search/';
-        document.getElementById('search-query').classList.remove('have-text');
+        searchInput.classList.remove('have-text');
       }
+
       if (document.querySelector('body').classList.contains('td-searchpage')) {
         if (pager > 1) {
-          addQueryParams += '&page=' + pager;
+          addQueryParams += `&page=${pager}`;
         }
+
         window.history.pushState({}, '', addQueryParams);
+      }
+    }
+  }
+
+  /**
+   * Generate Heading ID based on the heading text.
+   */
+  function generateHeadingIDs(headingText) {
+    let headingHash = '';
+    let headingId = '';
+
+    headingId = headingText.toLowerCase().trim();
+    if (headingId !== '') {
+      headingId = headingId.replace(/<em>|<\/em>/g, '')
+        .replace(/[^a-zA-Z0-9]/g, '-')
+        .replace(/[-]+/g, '-')
+        .replace(/^[-]|[-]$/g, '');
+
+      if (headingId !== '') {
+        headingHash = `#${headingId}`;
+      }
+    }
+
+    return headingHash;
+  }
+
+  /**
+   * Send the click events to Algolia.
+   *
+   * @param {Object} e - click event.
+   */
+  function clickEvents(e) {
+    if ((e.target.parentNode && e.target.parentNode.className === 'search-title') || (e.target.parentNode.parentNode && e.target.parentNode.parentNode.className === 'search-title')) {
+      let clickResult;
+
+      if (e.target.href) {
+        clickResult = e.target;
+      } else if (e.target.parentNode.href) {
+        clickResult = e.target.parentNode;
+      }
+
+      let hitPosition = 0;
+      let objectId = '';
+      let queryId = '';
+
+      if (clickResult.href) {
+        if (clickResult.getAttribute('data-objectid')) {
+          objectId = clickResult.getAttribute('data-objectid');
+        }
+
+        if (clickResult.getAttribute('data-queryid')) {
+          queryId = clickResult.getAttribute('data-queryid');
+        }
+
+        if (clickResult.getAttribute('data-position')) {
+          hitPosition = clickResult.getAttribute('data-position');
+        }
+      }
+
+      if (objectId !== '' && queryId !== '' && hitPosition > 0) {
+        let userTokenValue = getCookie('_ga');
+        if (userTokenValue === '') {
+          userTokenValue = 'noToken';
+        }
+
+        (async () => {
+          const rawResponse = await fetch('https://insights.algolia.io/1/events', {
+            method: 'POST',
+            headers: {
+              'Content-Type': 'application/json',
+              'X-Algolia-Application-Id': algoliaAppId,
+              'X-Algolia-API-Key': algoliaApiKey,
+            },
+            body: JSON.stringify(
+              {
+                events: [{
+                  eventType: 'click',
+                  eventName: 'Link clicked',
+                  index: algoliaIndexName,
+                  userToken: userTokenValue,
+                  queryID: queryId,
+                  objectIDs: [objectId],
+                  positions: [parseInt(hitPosition, 10)],
+                }],
+              },
+            ),
+          });
+
+          await rawResponse.json();
+        })();
       }
     }
   }
@@ -45,36 +158,104 @@ import algoliasearch from 'algoliasearch';
    * Show Message when Search is empty.
    */
   function emptySearch() {
-    setTimeout(() => {
-      if (document.querySelector('body').classList.contains('td-searchpage--')) {
-        document.querySelector('#doc-hit').innerHTML = '<li class="no-result">Search data related to <b>YugabyteDb</b> in our Documentation </li>';
-        document.querySelector('#pagination-docs').style.display = 'none';
-      } else {
-        document.querySelector('.search-result').style.display = 'none';
-      }
-    }, 800);
+    const searchSummary = document.querySelector('#search-summary');
+    if (searchSummary) {
+      searchSummary.innerHTML = '';
+    }
+
+    document.querySelector('.search-result').style.display = 'none';
+  }
+
+  /**
+   * Encode user searched term to avoid XSS.
+   *
+   * @returns string
+   */
+  function encodedSearchedTerm() {
+    const searchedValue = searchInput.value.trim();
+    const encodedValue = searchedValue.replace(/[\u00A0-\u9999<>&]/g, i => `&#${i.charCodeAt(0)};`);
+
+    return encodedValue;
   }
 
   /**
    * Main Docs section HTML.
    */
-  function docsSection(hitIs) {
-    console.log(hitIs);
+  function docsSection(queryID, hitIs, resultPosition) {
+    const searchText = encodedSearchedTerm();
+
     let content = '';
-    hitIs.forEach(hit => {
-      const hitLevel0 = hit.hierarchy.lvl0;
-      if (!hitLevel0) {
+    hitIs.forEach((hit, index) => {
+      const dataPosition = resultPosition + index + 1;
+      let pageBreadcrumb = '';
+      let pageHash = '';
+      let pageTitle = '';
+      let subHead = '';
+
+      if (hit.title) {
+        pageTitle = hit.title;
+      } else if (hit.headers[0]) {
+        pageTitle = hit.headers[0];
+      } else {
         return;
       }
 
-      content += '<li>' +
-        '<div class="search-title">' +
-        '<a href="' + hit.url.replace(/^(?:\/\/|[^/]+)*\//, '/') + '">' +
-        '<span class="search-title-inner">' + hitLevel0 + '</span>' +
-        '<div class="breadcrumb-item">' + hit.breadcrumb + '</div>' +
-        '</a>' +
-        '</div>' +
-        '</li>';
+      if (hit.breadcrumb) {
+        pageBreadcrumb = hit.breadcrumb;
+      }
+
+      if (hit._highlightResult.title.matchLevel !== 'full' && hit._highlightResult.description.matchLevel !== 'full') {
+        let finalSubHead = '';
+        let partialHeaderLength = 0;
+        let headerFull = '';
+        let headerPartial = '';
+        if (hit._highlightResult.headers) {
+          hit._highlightResult.headers.every(pageHeader => {
+            if (pageHeader.matchLevel) {
+              const testSubHead = pageHeader.value.replace(/<em>|<\/em>/g, '');
+              if (testSubHead.indexOf(searchText) !== -1) {
+                finalSubHead = pageHeader.value;
+
+                return false;
+              }
+
+              if (pageHeader.matchLevel === 'full' && headerFull === '') {
+                headerFull = pageHeader.value;
+              } else if (pageHeader.matchLevel === 'partial' && pageHeader.matchedWords.length > partialHeaderLength) {
+                headerPartial = pageHeader.value;
+                partialHeaderLength = pageHeader.matchedWords.length;
+              }
+            }
+
+            return true;
+          });
+
+          if (finalSubHead !== '') {
+            pageHash = generateHeadingIDs(finalSubHead);
+            subHead = finalSubHead.replace(/<em>|<\/em>/g, '');
+          } else if (headerFull !== '') {
+            pageHash = generateHeadingIDs(headerFull);
+            subHead = headerFull.replace(/<em>|<\/em>/g, '');
+          } else if (headerPartial !== '') {
+            pageHash = generateHeadingIDs(headerPartial);
+            subHead = headerPartial.replace(/<em>|<\/em>/g, '');
+          }
+        }
+      }
+
+      if (pageTitle === subHead) {
+        subHead = '';
+      }
+
+      content += `<li>
+        <div class="search-title">
+          <a href="${hit.url.replace(/^(?:\/\/|[^/]+)*\//, '/')}${pageHash}" data-objectid="${hit.objectID}" data-queryid="${queryID}" data-position="${dataPosition}">
+            <span class="search-title-inner">${pageTitle}</span>
+            <div class="search-subhead-inner">${subHead}</div>
+            <div class="breadcrumb-item">${pageBreadcrumb}</div>
+          </a>
+        </div>
+      </li>`;
     });
 
     return content;
@@ -83,30 +264,31 @@ import algoliasearch from 'algoliasearch';
   /**
    * Search Pagination HTML.
    */
-  function searchPagination(pagerInfo) {
+  function searchPager(pagerInfo) {
     document.querySelector('#docs').removeAttribute('style');
 
-    const searchpager = document.getElementById(pagerInfo.pagerId);
-    const currentPage = pagerInfo.currentPage;
-    const totalPages = pagerInfo.totalPages;
+    const {
+      currentPage, pagerId, pagerType, totalPages,
+    } = pagerInfo;
+    const searchpager = document.getElementById(pagerId);
 
-    let firstPage = '<span class="pager-btn" data-pager="' + 1 + '">1</span>';
-    let lastPage = '<span class="pager-btn" data-pager="' + totalPages + '">' + totalPages + '</span>';
-    let nextPageHTML = '<span class="right-btn pager-btn" data-pager="' + (currentPage + 1) + '"> &raquo; </span>';
+    let firstPage = '<span class="pager-btn" data-pager="1">1</span>';
+    let lastPage = `<span class="pager-btn" data-pager="${totalPages}">${totalPages}</span>`;
+    let nextPageHTML = `<span class="right-btn pager-btn" data-pager="${(currentPage + 1)}"> &raquo; </span>`;
     let pagerClick = '';
     let pagerClickLength = 0;
     let pagerLoop = 0;
     let pagerFull = '';
-    let prevPageHTML = '<span class="left-btn pager-btn" data-pager="' + (currentPage - 1) + '"> &laquo; </span>';
+    let prevPageHTML = `<span class="left-btn pager-btn" data-pager="${(currentPage - 1)}"> &laquo; </span>`;
 
     if (currentPage === 1) {
       prevPageHTML = '';
-      firstPage = '<span class="pager-btn active-page" data-pager="' + 1 + '">1</span>';
+      firstPage = '<span class="pager-btn active-page" data-pager="1">1</span>';
     }
 
     if (currentPage === totalPages) {
       nextPageHTML = '';
-      lastPage = '<span class="pager-btn active-page" data-pager="' + totalPages + '">' + totalPages + '</span>';
+      lastPage = `<span class="pager-btn active-page" data-pager="${totalPages}"> ${totalPages}</span>`;
     }
 
     if (totalPages > 1) {
@@ -145,7 +327,7 @@ import algoliasearch from 'algoliasearch';
           activeClass = ' active-page';
         }
 
-        pagerFull += '<span class="pager-btn' + activeClass + '" data-pager="' + pagerStep + '">' + pagerStep + '</span>';
+        pagerFull += `<span class="pager-btn${activeClass}" data-pager="${pagerStep}">${pagerStep}</span>`;
       }
 
       if (loopTill < (totalPages - 1)) {
@@ -155,20 +337,18 @@ import algoliasearch from 'algoliasearch';
       pagerFull += lastPage;
     }
 
-    searchpager.innerHTML = '<nav>' +
-      '<div class="pager-area">' +
-      '<div class="left-right-button" data-pager-type="' + pagerInfo.pagerType + '">' +
-      prevPageHTML +
-      '<span class="page-number">' +
-      pagerFull +
-      '</span>' +
-      nextPageHTML +
-      '</div>' +
-      '</div>' +
-      '</nav>' +
-      '<span class="left-right-button mobile-button" data-pager-type="' + pagerInfo.pagerType + '"></span>';
+    searchpager.innerHTML = `<nav>
+      <div class="pager-area">
+        <div class="left-right-button" data-pager-type="${pagerType}">
+          ${prevPageHTML}
+          <span class="page-number">${pagerFull}</span>
+          ${nextPageHTML}
+        </div>
+      </div>
+    </nav>
+    <span class="left-right-button mobile-button" data-pager-type="${pagerType}"></span>`;
 
-    pagerClick = document.querySelectorAll('#' + pagerInfo.pagerId + ' .left-right-button .pager-btn');
+    pagerClick = document.querySelectorAll(`#${pagerId} .left-right-button .pager-btn`);
     pagerClickLength = pagerClick.length;
 
     while (pagerLoop < pagerClickLength) {
@@ -178,14 +358,64 @@ import algoliasearch from 'algoliasearch';
   }
 
   /**
+   * Shoe "Ask AI" button in search results dropdown.
+   */
+  function kapaAskAI() {
+    const askAI = document.getElementById('yb-ask-ai');
+    if (askAI) {
+      askAI.addEventListener('click', () => {
+        if (window.Kapa) {
+          window.Kapa.open({
+            mode: 'ai',
+            query: encodedSearchedTerm(),
+            submit: true,
+          });
+        }
+        askAiPopupStyle();
+      });
+    }
+    const askAITop = document.querySelector('.ask-ai-top span');
+    if (askAITop) {
+      askAITop.addEventListener('click', () => {
+        askAiPopupStyle();
+      });
+    }
+  }
+
+  /**
+   * Trigger AI Search on clicking custom button.
+   */
+  function kapaSearch() {
+    const aiSearch = document.getElementById('ai-search');
+    if (aiSearch) {
+      aiSearch.addEventListener('click', () => {
+        if (window.Kapa) {
+          window.Kapa.open({
+            mode: 'search',
+            query: encodedSearchedTerm(),
+            submit: true,
+          });
+        }
+        askAiPopupStyle();
+      });
+    }
+  }
+
+  /**
    * Add queries with filters selected by user and call search algolia function.
    */
   function searchAlgolia() {
-    const searchValue = searchInput.value.trim();
+    const searchedTerm = encodedSearchedTerm();
+
+    let searchValue = searchedTerm;
     if (searchValue.length > 0) {
       document.querySelector('.search-result').style.display = 'block';
+      setTimeout(() => {
+        document.querySelector('.search-result').style.display = 'block';
+      }, 800);
     } else {
       emptySearch();
+      setTimeout(emptySearch, 800);
       return;
     }
 
@@ -194,56 +424,110 @@ import algoliasearch from 'algoliasearch';
       perPageCount = 10;
     }
 
-    const client = algoliasearch('UMBCUJCBE8', 'a879f0ab89b677264d0c6e087b714fd8');
-    const index = client.initIndex('yugabyte_docs');
+    const client = algoliasearch(algoliaAppId, algoliaApiKey);
+    const index = client.initIndex(algoliaIndexName);
     const pageItems = searchURLParameter('page');
     const searchpagerparent = document.querySelector('#pagination-docs');
     const searchOptions = {
       hitsPerPage: perPageCount,
       page: 0,
-      filters: 'version:"preview"',
+      clickAnalytics: true,
     };
+    const searchSummary = document.getElementById('search-summary');
+
+    if (searchValue.includes('_')) {
+      const searchScript = document.getElementById('algolia-search-script');
+      const sequenceExpressions = searchScript.getAttribute('data-sequence-expressions');
+
+      if (sequenceExpressions) {
+        searchValue = searchValue.replace(/_/g, '-');
+      }
+    }
 
     if (pageItems && pageItems > 0) {
       searchOptions.page = pageItems - 1;
     }
 
-    index.search(searchValue, searchOptions).then(({hits, nbHits, nbPages, page}) => {
-      let pagerDetails = {};
-      let sectionHTML = '';
-      sectionHTML += docsSection(hits);
-      if (hits.length > 0) {
-        document.getElementById('doc-hit').innerHTML = sectionHTML;
-      } else {
-        document.getElementById('doc-hit').innerHTML = '<li class="no-result">0 results found for <b>"' + searchValue + '"</b></li>';
-      }
+    index.search(searchValue, searchOptions).then(
+      ({
+        hits, nbHits, nbPages, page, queryID,
+      }) => {
+        const searchResults = document.getElementById('doc-hit');
+        const startResultPosition = page * perPageCount;
 
-      if (document.querySelector('body').classList.contains('td-searchpage')) {
-        pagerDetails = {
-          currentPage: page + 1,
-          pagerId: 'pagination-docs',
-          pagerType: 'docs',
-          totalHits: nbHits,
-          totalPages: nbPages,
-        };
+        let pagerDetails = {};
+        let sectionHTML = '';
+        let totalResults = nbHits;
+        sectionHTML += docsSection(queryID, hits, startResultPosition);
 
-        searchPagination(pagerDetails);
-        searchpagerparent.className = 'pager results-' + nbHits;
-      } else {
-        searchpagerparent.className = 'pager results-' + nbHits;
-        let viewAll = '';
-        if (nbPages > 1) {
-          viewAll = '<a href="/search/?query=' + searchValue + '" title="View all results">View all results</a>';
+        if (totalResults > 1000) {
+          totalResults = 1000;
         }
 
-        document.getElementById('pagination-docs').innerHTML = '<nav class="pager-area">' +
-          '<div class="pager-area">' +
-          '<span class="total-result">' + nbHits + ' Results</span>' +
-          '</div>' +
-          viewAll +
-          '</nav>';
-      }
-    });
+        document.getElementById('doc-hit').innerHTML = sectionHTML;
+
+        if (hits.length > 0 && sectionHTML !== '') {
+          if (searchSummary !== null) {
+            searchSummary.innerHTML = `${totalResults} results found for <b>"${searchedTerm}"</b>. <a role="button" id="ai-search">Try this search in AI</a>.`;
+          }
+
+          const btnSearchVal = document.querySelector('.yb-kapa-button .search-val');
+          if (btnSearchVal) {
+            btnSearchVal.innerHTML = `${searchedTerm}`;
+          }
+
+          setTimeout(() => {
+            if (document.querySelector('.yb-kapa-button')) {
+              document.querySelector('.yb-kapa-button').style.display = 'block';
+            }
+          }, 500);
+        } else {
+          const noResultMessage = `No results found for <b>"${searchedTerm}"</b>. <a role="button" id="ai-search">Try this search in AI</a>.`;
+          if (searchSummary) {
+            searchSummary.innerHTML = noResultMessage;
+          } else {
+            document.getElementById('doc-hit').innerHTML = `<li class="no-result">${noResultMessage}</li>`;
+          }
+
+          if (document.querySelector('.yb-kapa-button')) {
+            document.querySelector('.yb-kapa-button').style.display = 'none';
+          }
+        }
+
+        kapaSearch();
+
+        if (document.querySelector('body').classList.contains('td-searchpage')) {
+          pagerDetails = {
+            currentPage: page + 1,
+            pagerId: 'pagination-docs',
+            pagerType: 'docs',
+            totalHits: totalResults,
+            totalPages: nbPages,
+          };
+
+          searchPager(pagerDetails);
+          searchpagerparent.className = `pager results-${totalResults}`;
+        } else {
+          searchpagerparent.className = `pager results-${totalResults}`;
+          let viewAll = '';
+          if (nbPages > 1) {
+            viewAll = `<a href="/search/?query=${searchValue}" title="View all results">View all results <img src="/icons/arrow-btn-sm.svg"></a>`;
+          }
+
+          document.getElementById('pagination-docs').innerHTML = `<nav class="pager-area">
+            <div class="pager-area">
+              <span class="total-result">${totalResults} Results</span>
+            </div>
+            ${viewAll}
+          </nav>`;
+        }
+
+        if (searchResults) {
+          searchResults.addEventListener('click', clickEvents);
+          searchResults.addEventListener('contextmenu', clickEvents);
+        }
+      },
+    );
   }
 
   /**
@@ -256,6 +540,7 @@ import algoliasearch from 'algoliasearch';
           if (document.querySelector('body').classList.contains('td-searchpage')) {
             createSearchUrl(e.target.getAttribute('data-pager'));
           }
+
           searchAlgolia();
           setTimeout(() => {
             window.scrollTo(0, 0);
@@ -287,9 +572,14 @@ import algoliasearch from 'algoliasearch';
   }
 
   addSearchEvents();
+  kapaAskAI();
 
   document.addEventListener('keydown', (event) => {
-    if (event.code === 'Slash' || event.code === 'NumpadDivide') {
+    if (event.target.nodeName === 'TEXTAREA') {
+      return;
+    }
+
+    if (event.key === '/' || event.code === 'NumpadDivide') {
       document.querySelector('body').classList.add('search-focus');
       if (searchURLParameter('query')) {
         searchInput.setAttribute('value', searchURLParameter('query'));
@@ -312,14 +602,14 @@ import algoliasearch from 'algoliasearch';
       }
     });
   }
+
   const inputReset = document.querySelector('.reset-input');
   inputReset.addEventListener('click', () => {
-    document.querySelector('.td-search-input').value = '';
+    searchInput.value = '';
     emptySearch();
-    document.querySelector('.td-search-input').classList.remove('have-text');
+    searchInput.classList.remove('have-text');
     if (document.querySelector('body').classList.contains('td-searchpage')) {
       window.history.pushState({}, '', '/search/');
     }
   });
 })();
-

@@ -1,11 +1,19 @@
+// Copyright (c) YugabyteDB, Inc.
+
 package com.yugabyte.yw.models;
 
+import static com.yugabyte.yw.models.helpers.CommonUtils.appendInClause;
+
 import com.google.common.annotations.VisibleForTesting;
+import io.ebean.ExpressionList;
 import io.ebean.Finder;
 import io.ebean.Model;
+import jakarta.persistence.Entity;
+import jakarta.persistence.Id;
+import java.util.Set;
 import java.util.UUID;
-import javax.persistence.Entity;
-import javax.persistence.Id;
+import lombok.Getter;
+import lombok.Setter;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -16,6 +24,8 @@ import org.slf4j.LoggerFactory;
  * scoped configurations for provider or customer.
  */
 @Entity
+@Getter
+@Setter
 public class ScopedRuntimeConfig extends Model {
   // TODO: delete if not needed by the end of it.
   //  public static final ScopedRuntimeConfig GLOBAL_SCOPE = new ScopedRuntimeConfig();
@@ -28,14 +38,17 @@ public class ScopedRuntimeConfig extends Model {
   // no uuid defined for parent entity we will
   // create a new uuid. At present all the use cases
   // global, provider, universe and customer have a uuid.
-  @VisibleForTesting @Id final UUID uuid;
+  @Id private final UUID uuid;
 
   // ====================================================
   // Foreign keys to scoping entities.
   // At most one of these can be valid.
-  @VisibleForTesting final UUID customerUUID;
-  @VisibleForTesting final UUID universeUUID;
-  @VisibleForTesting final UUID providerUUID;
+  private final UUID customerUUID;
+
+  private final UUID universeUUID;
+
+  private final UUID providerUUID;
+
   // End foreign key fields
   // ====================================================
 
@@ -44,35 +57,57 @@ public class ScopedRuntimeConfig extends Model {
     customerUUID = null;
     universeUUID = null;
     providerUUID = null;
-    LOG.info("Created Global ScopedRuntimeConfig");
+    LOG.trace("Created Global ScopedRuntimeConfig");
   }
 
   private ScopedRuntimeConfig(Customer customer) {
-    uuid = customer.uuid;
-    customerUUID = customer.uuid;
+    uuid = customer.getUuid();
+    customerUUID = customer.getUuid();
     universeUUID = null;
     providerUUID = null;
-    LOG.info("Created Customer({}) ScopedRuntimeConfig", customerUUID);
+    LOG.trace("Created Customer({}) ScopedRuntimeConfig", getCustomerUUID());
   }
 
   private ScopedRuntimeConfig(Universe universe) {
-    uuid = universe.universeUUID;
+    uuid = universe.getUniverseUUID();
     providerUUID = null;
     customerUUID = null;
-    universeUUID = universe.universeUUID;
-    LOG.info("Created Universe({}) ScopedRuntimeConfig", universeUUID);
+    universeUUID = universe.getUniverseUUID();
+    LOG.trace("Created Universe({}) ScopedRuntimeConfig", getUniverseUUID());
   }
 
   private ScopedRuntimeConfig(Provider provider) {
-    uuid = provider.uuid;
+    uuid = provider.getUuid();
     customerUUID = null;
     universeUUID = null;
-    providerUUID = provider.uuid;
-    LOG.info("Created Provider({}) ScopedRuntimeConfig", providerUUID);
+    providerUUID = provider.getUuid();
+    LOG.trace("Created Provider({}) ScopedRuntimeConfig", getProviderUUID());
   }
 
   private static final Finder<UUID, ScopedRuntimeConfig> finder =
       new Finder<UUID, ScopedRuntimeConfig>(ScopedRuntimeConfig.class) {};
+
+  /**
+   * Checks if all the given scopeUuids are present in the database.
+   *
+   * @param scopeUuids the set of scopeUuids to check for presence in the database.
+   * @return true if all the given scopeUuids are present in the database, false otherwise.
+   */
+  public static boolean containsAll(Set<UUID> scopeUuids) {
+    ExpressionList<ScopedRuntimeConfig> query = finder.query().where();
+    appendInClause(query, "uuid", scopeUuids);
+    return query.findCount() == scopeUuids.size();
+  }
+
+  /**
+   * Checks if the given scopeUuid is present in the database.
+   *
+   * @param scopeUuid the scopeUuid to check for presence in the database.
+   * @return true if the given scopeUuid is present in the database, false otherwise.
+   */
+  public static boolean isPresent(UUID scopeUuid) {
+    return finder.query().where().idEq(scopeUuid).findCount() == 1;
+  }
 
   @VisibleForTesting
   static ScopedRuntimeConfig get(UUID uuid) {
@@ -88,37 +123,37 @@ public class ScopedRuntimeConfig extends Model {
   }
 
   static void ensure(Customer customer) {
-    if (get(customer.uuid) == null) {
+    if (get(customer.getUuid()) == null) {
       new ScopedRuntimeConfig(customer).save();
     }
   }
 
   static void ensure(Universe universe) {
-    if (get(universe.universeUUID) == null) {
+    if (get(universe.getUniverseUUID()) == null) {
       new ScopedRuntimeConfig(universe).save();
     }
   }
 
   static void ensure(Provider provider) {
-    if (get(provider.uuid) == null) {
+    if (get(provider.getUuid()) == null) {
       new ScopedRuntimeConfig(provider).save();
     }
   }
 
   @Override
   public String toString() {
-    if (GLOBAL_SCOPE_UUID.equals(uuid)) {
+    if (GLOBAL_SCOPE_UUID.equals(getUuid())) {
       return "ScopedRuntimeConfig(GLOBAL_SCOPE)";
     } else {
       return "ScopedRuntimeConfig{"
           + "uuid="
-          + uuid
+          + getUuid()
           + ", customerUUID="
-          + customerUUID
+          + getCustomerUUID()
           + ", universeUUID="
-          + universeUUID
+          + getUniverseUUID()
           + ", providerUUID="
-          + providerUUID
+          + getProviderUUID()
           + '}';
     }
   }

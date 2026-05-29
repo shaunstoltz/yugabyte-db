@@ -1,4 +1,4 @@
-// Copyright (c) YugaByte, Inc.
+// Copyright (c) YugabyteDB, Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License"); you may not use this file except
 // in compliance with the License.  You may obtain a copy of the License at
@@ -16,12 +16,13 @@
 #include <boost/function.hpp>
 
 #include "yb/common/common_fwd.h"
+#include "yb/common/entity_ids_types.h"
 
 #include "yb/docdb/docdb_fwd.h"
 #include "yb/docdb/doc_operation.h"
-#include "yb/docdb/intent.h"
-#include "yb/docdb/shared_lock_manager.h"
+#include "yb/dockv/intent.h"
 #include "yb/docdb/wait_queue.h"
+#include "yb/tablet/tablet_fwd.h"
 
 namespace rocksdb {
 
@@ -57,7 +58,7 @@ using ResolutionCallback = boost::function<void(const Result<HybridTime>&)>;
 //
 // 3. Fail-on-Conflict:
 //    (a) In this mode, transactions are assigned random priorities (with some exceptions based on
-//        TxnPriorityRequirement).
+//        YbcTxnPriorityRequirement).
 //    (b) If T0 tries to write an intent or data that conflicts with data modififed by committed
 //        transactions, T0 fails (i.e., tserver returns a kConflict error back to YSQL).
 //    (c) If T0 tries to write an intent or data that conflicts with intents of pending
@@ -78,7 +79,7 @@ typedef enum {
 // Perform either of the above three conflict management policies as applicable.
 //
 // write_batch - values that would be written as part of transaction.
-// hybrid_time - current hybrid time.
+// intial_resolution_ht - current hybrid time. Used to request status of conflicting transactions.
 // db - db that contains tablet data.
 // status_manager - status manager that should be used during this conflict resolution.
 // conflicts_metric - transaction_conflicts metric to update.
@@ -88,18 +89,26 @@ typedef enum {
 // wait_queue - a pointer to the tablet's wait queue. Required if the Wait-on-Conflict policy is to
 //              be used. If Wait-on-Conflict policy is to be used but wait_queue is nullptr, an
 //              error will be returned.
-Status ResolveTransactionConflicts(const DocOperations& doc_ops,
-                                   const ConflictManagementPolicy conflict_management_policy,
-                                   const LWKeyValueWriteBatchPB& write_batch,
-                                   HybridTime resolution_ht,
-                                   HybridTime read_time,
-                                   const DocDB& doc_db,
-                                   PartialRangeKeyIntents partial_range_key_intents,
-                                   TransactionStatusManager* status_manager,
-                                   Counter* conflicts_metric,
-                                   LockBatch* lock_batch,
-                                   WaitQueue* wait_queue,
-                                   ResolutionCallback callback);
+Status ResolveTransactionConflicts(
+    const DocOperations& doc_ops,
+    const ConflictManagementPolicy conflict_management_policy,
+    const LWKeyValueWriteBatchPB& write_batch,
+    RequestScope& request_scope,
+    HybridTime intial_resolution_ht,
+    HybridTime read_time,
+    int64_t txn_start_us,
+    uint64_t req_start_us,
+    int64_t request_id,
+    const DocDB& doc_db,
+    dockv::PartialRangeKeyIntents partial_range_key_intents,
+    TransactionStatusManager* status_manager,
+    const std::shared_ptr<tablet::TabletMetricsHolder>& tablet_metrics,
+    LockBatch* lock_batch,
+    WaitQueue* wait_queue,
+    bool is_advisory_lock_request,
+    CoarseTimePoint deadline,
+    ResolutionCallback callback,
+    dockv::SkipPrefixLocks skip_prefix_locks);
 
 // Resolves conflicts for doc operations.
 // Read all intents that could conflict with provided doc_ops.
@@ -110,35 +119,44 @@ Status ResolveTransactionConflicts(const DocOperations& doc_ops,
 // transaction.
 //
 // doc_ops - doc operations that would be applied as part of operation.
-// resolution_ht - current hybrid time. Used to request status of conflicting transactions.
+// intial_resolution_ht - current hybrid time. Used to request status of conflicting transactions.
 // db - db that contains tablet data.
 // status_manager - status manager that should be used during this conflict resolution.
-Status ResolveOperationConflicts(const DocOperations& doc_ops,
-                                 const ConflictManagementPolicy conflict_management_policy,
-                                 HybridTime resolution_ht,
-                                 const DocDB& doc_db,
-                                 PartialRangeKeyIntents partial_range_key_intents,
-                                 TransactionStatusManager* status_manager,
-                                 Counter* conflicts_metric,
-                                 LockBatch* lock_batch,
-                                 WaitQueue* wait_queue,
-                                 ResolutionCallback callback);
-
-struct ParsedIntent {
-  // Intent DocPath.
-  Slice doc_path;
-  IntentTypeSet types;
-  // Intent doc hybrid time.
-  Slice doc_ht;
-};
-
-// Parses the intent pointed to by intent_iter to a ParsedIntent.
-// Intent is encoded as Prefix + DocPath + IntentType + DocHybridTime.
-// `transaction_id_source` could be larger that 16 bytes, it is not problem here, because it is
-// used for error reporting.
-Result<ParsedIntent> ParseIntentKey(Slice intent_key, Slice transaction_id_source);
+Status ResolveOperationConflicts(
+    const DocOperations& doc_ops,
+    const ConflictManagementPolicy conflict_management_policy,
+    const LWKeyValueWriteBatchPB& write_batch,
+    RequestScope& request_scope,
+    HybridTime intial_resolution_ht,
+    uint64_t req_start_us,
+    int64_t request_id,
+    const DocDB& doc_db,
+    dockv::PartialRangeKeyIntents partial_range_key_intents,
+    TransactionStatusManager* status_manager,
+    const std::shared_ptr<tablet::TabletMetricsHolder>& tablet_metrics,
+    LockBatch* lock_batch,
+    WaitQueue* wait_queue,
+    CoarseTimePoint deadline,
+    ResolutionCallback callback);
 
 std::string DebugIntentKeyToString(Slice intent_key);
+
+// Abstarct class to enable fetching table info from parsed intents while populating lock info in
+// PopulateLockInfoFromParsedIntent.
+class TableInfoProvider {
+ public:
+  virtual Result<tablet::TableInfoPtr> GetTableInfo(ColocationId colocation_id) const = 0;
+
+  virtual ~TableInfoProvider() = default;
+};
+
+// Decodes the doc_path present in the parsed_intent, and adds the lock information to the given
+// lock_info pointer. parsed_intent is expected to have a hybrid time by default. If not,
+// intent_has_ht needs to be set to false for the function to not return an error status.
+Status PopulateLockInfoFromParsedIntent(
+    const dockv::ParsedIntent& parsed_intent, const dockv::DecodedIntentValue& decoded_value,
+    const TableInfoProvider& table_info_provider, LockInfoPB* lock_info,
+    bool intent_has_ht = true);
 
 } // namespace docdb
 } // namespace yb

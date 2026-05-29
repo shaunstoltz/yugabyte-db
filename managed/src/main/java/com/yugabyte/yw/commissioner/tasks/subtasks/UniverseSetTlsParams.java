@@ -1,4 +1,4 @@
-// Copyright (c) YugaByte, Inc.
+// Copyright (c) YugabyteDB, Inc.
 
 package com.yugabyte.yw.commissioner.tasks.subtasks;
 
@@ -49,7 +49,8 @@ public class UniverseSetTlsParams extends UniverseTaskBase {
             // If this universe is not being edited, fail the request.
             UniverseDefinitionTaskParams universeDetails = universe.getUniverseDetails();
             if (!universeDetails.updateInProgress) {
-              String errMsg = "UserUniverse " + taskParams().universeUUID + " is not being edited.";
+              String errMsg =
+                  "UserUniverse " + taskParams().getUniverseUUID() + " is not being edited.";
               log.error(errMsg);
               throw new RuntimeException(errMsg);
             }
@@ -65,15 +66,16 @@ public class UniverseSetTlsParams extends UniverseTaskBase {
             universeDetails.rootCA = null;
             universeDetails.setClientRootCA(null);
             universeDetails.rootAndClientRootCASame = taskParams().rootAndClientRootCASame;
-            if (EncryptionInTransitUtil.isRootCARequired(taskParams())) {
+            if (taskParams().rootAndClientRootCASame
+                && EncryptionInTransitUtil.isEitherNodeToNodeOrClientToNodeEncryptRequired(
+                    taskParams())) {
+              UUID rootCAUUID = getRootCAWhenRootAndClientRootCASameIsTrue();
+              universeDetails.rootCA = rootCAUUID;
+              universeDetails.setClientRootCA(rootCAUUID);
+            } else if (EncryptionInTransitUtil.isEitherNodeToNodeOrClientToNodeEncryptRequired(
+                taskParams())) {
               universeDetails.rootCA = taskParams().rootCA;
-            }
-            if (EncryptionInTransitUtil.isClientRootCARequired(taskParams())) {
-              UUID clientRootCA =
-                  taskParams().rootAndClientRootCASame
-                      ? taskParams().rootCA
-                      : taskParams().clientRootCA;
-              universeDetails.setClientRootCA(clientRootCA);
+              universeDetails.setClientRootCA(taskParams().clientRootCA);
             }
             universe.setUniverseDetails(universeDetails);
           };
@@ -86,5 +88,15 @@ public class UniverseSetTlsParams extends UniverseTaskBase {
       log.warn(msg, e.getMessage());
       throw new RuntimeException(msg, e);
     }
+  }
+
+  private UUID getRootCAWhenRootAndClientRootCASameIsTrue() {
+    if (taskParams().rootCA != null) {
+      return taskParams().rootCA;
+    }
+    if (taskParams().clientRootCA != null) {
+      return taskParams().clientRootCA;
+    }
+    return null;
   }
 }

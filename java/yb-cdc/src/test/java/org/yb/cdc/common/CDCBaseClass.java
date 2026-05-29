@@ -1,4 +1,4 @@
-// Copyright (c) YugaByte, Inc.
+// Copyright (c) YugabyteDB, Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License"); you may not use this file except
 // in compliance with the License.  You may obtain a copy of the License at
@@ -48,9 +48,12 @@ import java.util.stream.Collectors;
 public class CDCBaseClass extends BaseMiniClusterTest {
   private static final Logger LOG = LoggerFactory.getLogger(CDCBaseClass.class);
 
-  protected String CDC_BATCH_SIZE_GFLAG = "cdc_snapshot_batch_size";
+  protected String CDC_SNAPSHOT_THRESHOLD_SIZE_GFLAG = "cdc_snapshot_records_threshold_size_bytes";
   protected String CDC_INTENT_SIZE_GFLAG = "cdc_max_stream_intent_records";
-
+  protected String CDC_ENABLE_CONSISTENT_RECORDS = "cdc_enable_consistent_records";
+  protected String CDC_POPULATE_SAFEPOINT_RECORD = "cdc_populate_safepoint_record";
+  protected String TEST_DCHECK_FOR_MISSING_SCHEMA_PACKING =
+      "TEST_dcheck_for_missing_schema_packing";
   // Postgres settings.
   protected static final String DEFAULT_PG_DATABASE = "yugabyte";
   protected static final String DEFAULT_PG_USER = "yugabyte";
@@ -95,8 +98,8 @@ public class CDCBaseClass extends BaseMiniClusterTest {
     return null;
   }
 
-  /** empty helper function */
   protected void setUp() throws Exception {
+    setServerFlag(getTserverHostAndPort(), TEST_DCHECK_FOR_MISSING_SCHEMA_PACKING, "false");
   }
 
   /**
@@ -123,9 +126,10 @@ public class CDCBaseClass extends BaseMiniClusterTest {
 
     flagMap.put("ysql_beta_features", "true");
     flagMap.put("ysql_sleep_before_retry_on_txn_conflict", "false");
-    flagMap.put("ysql_max_write_restart_attempts", "2");
+    flagMap.put("ysql_pg_conf_csv", maxQueryLayerRetriesConf(2));
     flagMap.put("ysql_enable_packed_row", "false");
 
+    flagMap.put("cdc_enable_implicit_checkpointing", "true");
     return flagMap;
   }
 
@@ -145,9 +149,10 @@ public class CDCBaseClass extends BaseMiniClusterTest {
   }
 
   @Before
-  public void initYBBackupUtil() {
+  public void initYBBackupUtil() throws Exception {
     YBBackupUtil.setMasterAddresses(masterAddresses);
     YBBackupUtil.setPostgresContactPoint(miniCluster.getPostgresContactPoints().get(0));
+    YBBackupUtil.maybeStartYbControllers(miniCluster);
   }
 
   @Before

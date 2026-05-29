@@ -1,4 +1,4 @@
-// Copyright (c) YugaByte, Inc.
+// Copyright (c) YugabyteDB, Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License"); you may not use this file except
 // in compliance with the License.  You may obtain a copy of the License at
@@ -15,7 +15,7 @@
 #include <algorithm>
 #include <string>
 
-#include <glog/logging.h>
+#include "yb/util/logging.h"
 
 using std::string;
 
@@ -26,10 +26,13 @@ Status RetryFunc(
     const string& retry_msg,
     const string& timeout_msg,
     const std::function<Status(CoarseTimePoint, bool*)>& func,
-    const CoarseDuration max_wait) {
+    const CoarseDuration max_wait,
+    const uint32_t max_jitter_ms,
+    const uint32_t init_exponent) {
   DCHECK(deadline != CoarseTimePoint());
 
-  CoarseBackoffWaiter waiter(deadline, max_wait);
+  CoarseBackoffWaiter waiter(
+      deadline, max_wait, std::chrono::milliseconds(1), max_jitter_ms, init_exponent);
 
   if (waiter.ExpiredNow()) {
     return STATUS(TimedOut, timeout_msg);

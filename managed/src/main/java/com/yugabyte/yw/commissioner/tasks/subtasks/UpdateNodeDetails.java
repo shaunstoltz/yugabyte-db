@@ -3,18 +3,21 @@ package com.yugabyte.yw.commissioner.tasks.subtasks;
 import com.google.common.collect.ImmutableMap;
 import com.yugabyte.yw.commissioner.BaseTaskDependencies;
 import com.yugabyte.yw.commissioner.tasks.params.NodeTaskParams;
-import com.yugabyte.yw.common.NodeManager;
 import com.yugabyte.yw.forms.UniverseDefinitionTaskParams;
 import com.yugabyte.yw.models.Universe;
 import com.yugabyte.yw.models.Universe.UniverseUpdater;
 import com.yugabyte.yw.models.helpers.NodeDetails;
 import javax.inject.Inject;
 
+/**
+ * @deprecated Use {@link #createUpdateUniverseFieldsTask(java.util.function.Consumer)}.
+ */
+@Deprecated
 public class UpdateNodeDetails extends NodeTaskBase {
 
   @Inject
-  protected UpdateNodeDetails(BaseTaskDependencies baseTaskDependencies, NodeManager nodeManager) {
-    super(baseTaskDependencies, nodeManager);
+  protected UpdateNodeDetails(BaseTaskDependencies baseTaskDependencies) {
+    super(baseTaskDependencies);
   }
 
   public static class Params extends NodeTaskParams {
@@ -56,10 +59,7 @@ public class UpdateNodeDetails extends NodeTaskBase {
             ImmutableMap.of(
                 Universe.USE_CUSTOM_IMAGE,
                 Boolean.toString(
-                    getUniverse()
-                        .getUniverseDetails()
-                        .nodeDetailsSet
-                        .stream()
+                    getUniverse().getUniverseDetails().nodeDetailsSet.stream()
                         .allMatch(n -> n.ybPrebuiltAmi))));
         universe.save();
       }

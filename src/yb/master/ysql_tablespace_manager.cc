@@ -1,4 +1,4 @@
-// Copyright (c) YugaByte, Inc.
+// Copyright (c) YugabyteDB, Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License"); you may not use this file except
 // in compliance with the License.  You may obtain a copy of the License at
@@ -15,13 +15,11 @@
 
 #include "yb/master/catalog_entity_info.h"
 
-#include "yb/util/atomic.h"
 #include "yb/util/result.h"
 
 DECLARE_bool(enable_ysql_tablespaces_for_placement);
 
-namespace yb {
-namespace master {
+namespace yb::master {
 
 YsqlTablespaceManager::YsqlTablespaceManager(
     std::shared_ptr<TablespaceIdToReplicationInfoMap> tablespace_map,
@@ -32,21 +30,19 @@ YsqlTablespaceManager::YsqlTablespaceManager(
 
 std::shared_ptr<YsqlTablespaceManager> YsqlTablespaceManager::CreateCloneWithTablespaceMap(
     std::shared_ptr<TablespaceIdToReplicationInfoMap> tablespace_map) {
-
   return std::make_shared<YsqlTablespaceManager>(tablespace_map, table_to_tablespace_map_);
 }
 
-Result<boost::optional<ReplicationInfoPB>> YsqlTablespaceManager::GetTablespaceReplicationInfo(
+Result<std::optional<ReplicationInfoPB>> YsqlTablespaceManager::GetTablespaceReplicationInfo(
     const TablespaceId& tablespace_id) {
-
-  if (!GetAtomicFlag(&FLAGS_enable_ysql_tablespaces_for_placement)) {
+  if (!FLAGS_enable_ysql_tablespaces_for_placement) {
     // Tablespaces feature has been disabled.
-    return boost::none;
+    return std::nullopt;
   }
 
   if (tablespace_id.empty()) {
     // No tablespace id passed in. Return.
-    return boost::none;
+    return std::nullopt;
   }
 
   if (tablespace_id_to_replication_info_map_) {
@@ -60,48 +56,64 @@ Result<boost::optional<ReplicationInfoPB>> YsqlTablespaceManager::GetTablespaceR
       tablespace_id + " not found");
 }
 
-Result<boost::optional<TablespaceId>> YsqlTablespaceManager::GetTablespaceForTable(
-  const scoped_refptr<const TableInfo>& table) const {
-
-  if (!GetAtomicFlag(&FLAGS_enable_ysql_tablespaces_for_placement) ||
-      !table->UsesTablespacesForPlacement()) {
-    return boost::none;
+Result<std::optional<TablespaceId>> YsqlTablespaceManager::GetTablespaceForTable(
+    const scoped_refptr<const TableInfo>& table) const {
+  if (!FLAGS_enable_ysql_tablespaces_for_placement ||
+      !table->TableTypeUsesTablespacesForPlacement()) {
+    // At this point we know that table is not a type of table that will use tablespaces for
+    // placement.
+    return std::nullopt;
   }
 
   if (!tablespace_id_to_replication_info_map_) {
-    return STATUS(InternalError, "Tablespace information not found for table " + table->id());
+    return STATUS(
+        InternalError,
+        "tablespace_id_to_replication_info_map_ not present; tablespace information not found "
+        "for table " +
+            table->id());
   }
 
   if (!ContainsCustomTablespaces()) {
-    return boost::none;
+    return std::nullopt;
   }
 
   if (!table_to_tablespace_map_) {
-    return STATUS(InternalError, "Tablespace information not found for table " + table->id());
+    const auto tablespace_id = table->TablespaceIdForTableCreation();
+    if (!tablespace_id.empty()) {
+      return tablespace_id;
+    }
+    return STATUS(
+        InternalError,
+        "table_to_tablespace_map_ not present; tablespace information not found for table " +
+            table->id());
   }
 
   // Lookup the tablespace for this table.
   const auto& iter = table_to_tablespace_map_->find(table->id());
   if (iter == table_to_tablespace_map_->end()) {
-    return STATUS(InternalError, "Tablespace information not found for table " + table->id());
+    const auto tablespace_id = table->TablespaceIdForTableCreation();
+    if (!tablespace_id.empty()) {
+      return tablespace_id;
+    }
+    return std::nullopt;
   }
 
   return iter->second;
 }
 
-Result<boost::optional<ReplicationInfoPB>> YsqlTablespaceManager::GetTableReplicationInfo(
+Result<std::optional<ReplicationInfoPB>> YsqlTablespaceManager::GetTableReplicationInfo(
     const scoped_refptr<const TableInfo>& table) const {
-
   // Lookup tablespace for the given table.
   auto tablespace_id = VERIFY_RESULT(GetTablespaceForTable(table));
-
   if (!tablespace_id) {
-    return boost::none;
+    VLOG(1) << "Tablespace not found for table " << table->id();
+    return std::nullopt;
   }
 
   // Lookup the placement info associated with the above tablespace.
   const auto iter = tablespace_id_to_replication_info_map_->find(tablespace_id.value());
   if (iter == tablespace_id_to_replication_info_map_->end()) {
+    VLOG(1) << "Tablespace found for table " << table->id() << " but placement not found";
     return STATUS(InternalError, "Placement policy not found for " + tablespace_id.value());
   }
   return iter->second;
@@ -110,8 +122,8 @@ Result<boost::optional<ReplicationInfoPB>> YsqlTablespaceManager::GetTableReplic
 bool YsqlTablespaceManager::NeedsRefreshToFindTablePlacement(
     const scoped_refptr<TableInfo>& table) {
 
-  if (!GetAtomicFlag(&FLAGS_enable_ysql_tablespaces_for_placement) ||
-      !table->UsesTablespacesForPlacement()) {
+  if (!FLAGS_enable_ysql_tablespaces_for_placement ||
+      !table->TableTypeUsesTablespacesForPlacement()) {
     return false;
   }
 
@@ -140,7 +152,7 @@ bool YsqlTablespaceManager::NeedsRefreshToFindTablePlacement(
   }
 
   if (!iter->second) {
-    // This is a boost::none value, which indicates that this table does not have a custom
+    // This is a std::nullopt value, which indicates that this table does not have a custom
     // tablespace specified for it. It defaults to the cluster placement policy. Nothing
     // more to do for this table.
     return false;
@@ -163,5 +175,4 @@ bool YsqlTablespaceManager::ContainsCustomTablespaces() const {
   return tablespace_id_to_replication_info_map_->size() > kYsqlNumDefaultTablespaces;
 }
 
-}  // namespace master
-}  // namespace yb
+} // namespace yb::master

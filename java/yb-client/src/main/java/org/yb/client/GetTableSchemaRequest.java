@@ -15,9 +15,9 @@
 // specific language governing permissions and limitations
 // under the License.
 //
-// The following only applies to changes made to this file as part of YugaByte development.
+// The following only applies to changes made to this file as part of YugabyteDB development.
 //
-// Portions Copyright (c) YugaByte, Inc.
+// Portions Copyright (c) YugabyteDB, Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License"); you may not use this file except
 // in compliance with the License.  You may obtain a copy of the License at
@@ -111,7 +111,8 @@ public class GetTableSchemaRequest extends YRpc<GetTableSchemaResponse> {
         ProtobufHelper.pbToPartitionSchema(respBuilder.getPartitionSchema(), schema),
         respBuilder.getCreateTableDone(),
         respBuilder.getTableType(),
-        indexes);
+        indexes,
+        respBuilder.getColocated());
     return new Pair<GetTableSchemaResponse, Object>(
         response, respBuilder.hasError() ? respBuilder.getError() : null);
   }

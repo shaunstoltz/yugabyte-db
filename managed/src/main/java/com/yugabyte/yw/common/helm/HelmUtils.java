@@ -1,12 +1,12 @@
-// Copyright (c) YugaByte, Inc.
+// Copyright (c) YugabyteDB, Inc.
 
 package com.yugabyte.yw.common.helm;
 
 import java.util.HashMap;
-import java.util.Map;
-import java.util.function.Function;
 import java.util.Iterator;
+import java.util.Map;
 import java.util.Map.Entry;
+import java.util.function.Function;
 import org.apache.commons.lang3.StringUtils;
 import org.yaml.snakeyaml.Yaml;
 

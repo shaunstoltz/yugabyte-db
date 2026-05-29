@@ -1,13 +1,14 @@
 #!/bin/bash
+# shellcheck disable=SC2034
 
 # Usage: fio_disk_benchmark.sh <DIR> <DESCRIPTION>
 #   fio_disk_benchmark.sh /mnt/d0 c3.4xlarge-instance
 #   fio_disk_benchmark.sh /mnt/d2 ebs-gp2-3334gb
 
 #
-# The following only applies to changes made to this file as part of YugaByte development.
+# The following only applies to changes made to this file as part of YugabyteDB development.
 #
-# Portions Copyright (c) YugaByte, Inc.
+# Portions Copyright (c) YugabyteDB, Inc.
 #
 # Licensed under the Apache License, Version 2.0 (the "License"); you may not use this file except
 # in compliance with the License.  You may obtain a copy of the License at
@@ -26,11 +27,11 @@ function run_test {
   CMD=$2
 
   echo "$TEST: $CMD"
-  FILE=/tmp/yb-bench-$TEST.log
-  $CMD 2>&1 > $FILE
-  export ${TEST}_bw_kbps=$(cat $FILE | grep 'bw=' | sed 's/.*bw=//' | sed 's/KB.*//')
-  export ${TEST}_iops=$(cat $FILE | grep 'iops=' | sed 's/.*iops=//' | sed 's/,.*//')
-  export ${TEST}_latency_avg=$(cat $FILE | grep ' lat (usec):' | sed 's/.*avg=//' | sed 's/,.*//')
+  FILE=/tmp/yb-bench-"$TEST".log
+  $CMD > "$FILE" 2>&1
+  export "${TEST}"_bw_kbps="$(grep 'bw=' "$FILE" | sed 's/.*bw=//' | sed 's/KB.*//')"
+  export "${TEST}"_iops="$(grep 'iops=' "$FILE" | sed 's/.*iops=//' | sed 's/,.*//')"
+  export "${TEST}"_latency_avg="$(grep ' lat (usec):' "$FILE" | sed 's/.*avg=//' | sed 's/,.*//')"
 }
 
 echo ""
@@ -58,7 +59,7 @@ TESTS="TEST1 TEST2 TEST3 TEST4 TEST5"
 for TEST in $TESTS
 do
   cmd="${TEST}_CMD"
-  run_test $TEST "${!cmd}"
+  run_test "$TEST" "${!cmd}"
 done
 
 echo "=============="
@@ -71,5 +72,6 @@ do
   iops="${TEST}_iops"
   latency_avg="${TEST}_latency_avg"
   bw_kbps="${TEST}_bw_kbps"
-  printf '%-12s %-40s %-10s %-10s %-10s\n' "$DIRECTORY" "${!TEST}" ${!iops} ${!latency_avg} ${!bw_kbps}
+  printf '%-12s %-40s %-10s %-10s %-10s\n' "$DIRECTORY" "${!TEST}" "${!iops}" "${!latency_avg}" \
+    "${!bw_kbps}"
 done

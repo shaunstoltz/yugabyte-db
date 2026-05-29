@@ -1,4 +1,4 @@
-// Copyright (c) YugaByte, Inc.
+// Copyright (c) YugabyteDB, Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License"); you may not use this file except
 // in compliance with the License.  You may obtain a copy of the License at
@@ -147,6 +147,8 @@ class Decimal {
   Status DecodeFromComparable(const Slice& slice, size_t *num_decoded_bytes);
 
   Status DecodeFromComparable(const Slice& string);
+
+  Status DecodeFromComparable(Slice* slice);
 
   // Encode the decimal by using to Cassandra serialization format, as described above.
   std::string EncodeToSerializedBigDecimal(bool* is_out_of_range) const;

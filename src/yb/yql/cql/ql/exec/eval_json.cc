@@ -1,5 +1,5 @@
 //--------------------------------------------------------------------------------------------------
-// Copyright (c) YugaByte, Inc.
+// Copyright (c) YugabyteDB, Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License"); you may not use this file except
 // in compliance with the License.  You may obtain a copy of the License at
@@ -20,6 +20,7 @@
 
 #include "yb/client/schema.h"
 
+#include "yb/common/ql_protocol.messages.h"
 #include "yb/common/ql_value.h"
 
 #include "yb/util/result.h"
@@ -55,18 +56,19 @@ std::string GetCoercionErr(const DataType src_type,
 }
 
 // Parses JSON string as rapidjson document
-Result<rapidjson::Document> ParseJsonString(const char* json_string,
+Result<rapidjson::Document> ParseJsonString(std::string_view json_string,
                                             ExecContext* exec_context,
                                             const YBLocationPtr& loc) {
   // Special case: boolean strings in CQL are case-insensitive, but rapidjson disagrees
-  if (strcasecmp(json_string, "true") == 0) {
+  if (boost::iequals(json_string, "true")) {
     json_string = "true";
-  } else if (strcasecmp(json_string, "false") == 0) {
+  } else if (boost::iequals(json_string, "false")) {
     json_string = "false";
   }
 
   rapidjson::Document document;
-  document.Parse<rapidjson::ParseFlag::kParseNumbersAsStringsFlag>(json_string);
+  document.Parse<rapidjson::ParseFlag::kParseNumbersAsStringsFlag>(
+      json_string.data(), json_string.size());
   if (document.HasParseError()) {
     // TODO: Location offset to pinpoint an error?
     return exec_context->Error(*loc,
@@ -130,7 +132,7 @@ Result<PTExpr::SharedPtr> Executor::ConvertJsonToExprInner(const rapidjson::Valu
       // 2) We specifically instruct JSON parser to parse numerics as strings
       // to avoid precision loss and overflow.
       //
-      const char* json_value_string = json_value.GetString();
+      std::string_view json_value_string(json_value.GetString(), json_value.GetStringLength());
       const auto mc_string = MCMakeShared<MCString>(memctx, json_value_string);
       if (QLType::IsImplicitlyConvertible(type->main(), DataType::STRING)) {
         return PTConstText::MakeShared(memctx, loc, mc_string);
@@ -152,7 +154,8 @@ Result<PTExpr::SharedPtr> Executor::ConvertJsonToExprInner(const rapidjson::Valu
     }
     case rapidjson::Type::kArrayType: {
       // All of these collections are represented as JSON lists
-      if (type->main() != LIST && type->main() != SET) { // TODO: Add tuple during #936
+      // TODO: Add tuple during #936
+      if (type->main() != DataType::LIST && type->main() != DataType::SET) {
         return exec_context_->Error(*loc,
                                     GetCoercionErr(DataType::LIST, type->main()),
                                     ErrorCode::DATATYPE_MISMATCH);
@@ -165,14 +168,14 @@ Result<PTExpr::SharedPtr> Executor::ConvertJsonToExprInner(const rapidjson::Valu
     }
     case rapidjson::Type::kObjectType: {
       // Could be either Map or UDT
-      if (type->main() != MAP && type->main() != USER_DEFINED_TYPE) {
+      if (type->main() != DataType::MAP && type->main() != DataType::USER_DEFINED_TYPE) {
         return exec_context_->Error(*loc,
                                     GetCoercionErr(DataType::MAP, type->main()),
                                     ErrorCode::DATATYPE_MISMATCH);
       }
       auto result =  PTCollectionExpr::MakeShared(memctx, loc, type);
       for (const auto& member : json_value.GetObject()) {
-        if (type->main() == MAP) {
+        if (type->main() == DataType::MAP) {
           const PTExpr::SharedPtr processed_key =
               VERIFY_RESULT(ConvertJsonToExpr(member.name, type->keys_type(), loc));
           const PTExpr::SharedPtr processed_value =
@@ -197,7 +200,7 @@ Result<PTExpr::SharedPtr> Executor::ConvertJsonToExprInner(const rapidjson::Valu
           result->AddKeyValuePair(processed_key, processed_value);
         }
       }
-      if (type->main() == USER_DEFINED_TYPE) {
+      if (type->main() == DataType::USER_DEFINED_TYPE) {
         RETURN_NOT_OK(result->InitializeUDTValues(type, exec_context_));
       }
       return result;
@@ -213,20 +216,19 @@ Result<PTExpr::SharedPtr> Executor::ConvertJsonToExprInner(const rapidjson::Valu
 }
 
 Status Executor::PreExecTreeNode(PTInsertJsonClause* json_clause) {
-
   //
   // Resolve JSON string
   //
-  QLValuePB json_expr_pb;
+  ThreadSafeArena arena;
+  LWQLValuePB json_expr_pb(&arena);
   RETURN_NOT_OK(PTConstToPB(json_clause->Expr(), &json_expr_pb));
-  const std::string& json_string = json_expr_pb.string_value();
+  std::string_view json_string = json_expr_pb.string_value();
 
   //
   // Parse JSON and store the result
   //
-  auto json_document = VERIFY_RESULT(ParseJsonString(json_string.c_str(),
-                                                     exec_context_,
-                                                     json_clause->Expr()->loc_ptr()));
+  auto json_document = VERIFY_RESULT(
+      ParseJsonString(json_string, exec_context_, json_clause->Expr()->loc_ptr()));
   if (json_document.GetType() != rapidjson::Type::kObjectType) {
     return exec_context_->Error(json_clause->Expr(),
                                 kJsonMapDecodeErrMsg,
@@ -237,12 +239,12 @@ Status Executor::PreExecTreeNode(PTInsertJsonClause* json_clause) {
 
 Status Executor::InsertJsonClauseToPB(const PTInsertStmt* insert_stmt,
                                       const PTInsertJsonClause* json_clause,
-                                      QLWriteRequestPB* req) {
+                                      QLWriteRequestMsg* req) {
   const auto& column_map = insert_stmt->column_map();
   const auto& loc        = json_clause->Expr()->loc_ptr();
 
   // Processed columns with their associated QL expressions
-  std::map<const ColumnDesc*, QLExpressionPB*> processed_cols;
+  std::map<const ColumnDesc*, QLExpressionMsg*> processed_cols;
 
   // Process all columns in JSON clause
   for (const auto& member : json_clause->JsonDocument().GetObject()) {
@@ -260,12 +262,12 @@ Status Executor::InsertJsonClauseToPB(const PTInsertStmt* insert_stmt,
     }
 
     const ColumnDesc& col_desc = found_column_entry->second;
-    QLExpressionPB* expr_pb = processed_cols[&col_desc];
+    auto* expr_pb = processed_cols[&col_desc];
     if (!expr_pb) {
       expr_pb = CreateQLExpression(req, col_desc);
       processed_cols[&col_desc] = expr_pb;
     }
-    QLValuePB* value_pb = expr_pb->mutable_value();
+    auto* value_pb = expr_pb->mutable_value();
     PTExpr::SharedPtr expr = VERIFY_RESULT(ConvertJsonToExpr(value, col_desc.ql_type(), loc));
     RETURN_NOT_OK(PTConstToPB(expr, value_pb, false));
   }
@@ -282,13 +284,13 @@ Status Executor::InsertJsonClauseToPB(const PTInsertStmt* insert_stmt,
         && (not_found
             || !found_col_entry->second->has_value()
             || IsNull(found_col_entry->second->value()))) {
-      LOG(INFO) << "Unexpected null value. Current request: " << req->DebugString();
+      LOG(INFO) << "Unexpected null value. Current request: " << req->ShortDebugString();
       return exec_context_->Error(*loc, ErrorCode::NULL_ARGUMENT_FOR_PRIMARY_KEY);
     }
 
     // All non-mentioned columns should be set to NULL
     if (not_found && json_clause->IsDefaultNull()) {
-      QLExpressionPB* expr_pb = CreateQLExpression(req, col_desc);
+      auto* expr_pb = CreateQLExpression(req, col_desc);
       SetNull(expr_pb->mutable_value());
     }
   }

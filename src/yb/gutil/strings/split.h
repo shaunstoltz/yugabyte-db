@@ -17,9 +17,9 @@
 // (3) (Optional) Replace old Split*() API calls at call sites with calls to new
 //     Split() API.
 //
-// The following only applies to changes made to this file as part of YugaByte development.
+// The following only applies to changes made to this file as part of YugabyteDB development.
 //
-// Portions Copyright (c) YugaByte, Inc.
+// Portions Copyright (c) YugabyteDB, Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License"); you may not use this file except
 // in compliance with the License.  You may obtain a copy of the License at
@@ -42,7 +42,7 @@
 #include <utility>
 #include <vector>
 
-#include <glog/logging.h>
+#include "yb/util/logging.h"
 
 #include "yb/gutil/integral_types.h"
 #include "yb/gutil/logging-inl.h"
@@ -667,6 +667,8 @@ void SplitGStringPieceToVector(const GStringPiece& full,
 // For even better performance, store the result in a vector<GStringPiece>
 // to avoid string copies.
 // ----------------------------------------------------------------------
+std::vector<std::string> SplitStringUsing(const std::string& full,
+                                          const char* delimiters);
 void SplitStringUsing(const std::string& full, const char* delimiters,
                       std::vector<std::string>* result);
 void SplitStringToSetUsing(const std::string& full, const char* delimiters,

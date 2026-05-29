@@ -1,4 +1,4 @@
-// Copyright (c) YugaByte, Inc
+// Copyright (c) YugabyteDB, Inc
 
 package com.yugabyte.yw.commissioner.tasks;
 
@@ -21,7 +21,6 @@ import java.io.FileInputStream;
 import java.io.FileNotFoundException;
 import java.io.IOException;
 import java.util.UUID;
-import org.apache.commons.lang3.StringUtils;
 import org.junit.Before;
 import org.junit.Test;
 import org.junit.runner.RunWith;
@@ -53,7 +52,6 @@ public class AddGFlagMetadataTest extends CommissionerBaseTest {
 
   @Before
   public void setup() {
-    super.setUp();
     tempFilePath =
         TestHelper.createTempFile(TestHelper.TMP_PATH, DEFAULT_VERSION + ".tar.gz", "test-file");
     defaultReleaseMetadata = ReleaseMetadata.create(DEFAULT_VERSION).withFilePath(tempFilePath);
@@ -65,7 +63,7 @@ public class AddGFlagMetadataTest extends CommissionerBaseTest {
     params.requiredGFlagsFileList = GFlagsValidation.GFLAG_FILENAME_LIST;
     params.releaseMetadata = defaultReleaseMetadata;
     params.version = DEFAULT_VERSION;
-    when(mockReleaseManager.getTarGZipDBPackageInputStream(any(), any()))
+    when(mockReleaseManager.getTarGZipDBPackageInputStream(any()))
         .thenReturn(new FileInputStream(tempFilePath));
     doNothing()
         .when(mockGFlagsValidation)
@@ -80,7 +78,7 @@ public class AddGFlagMetadataTest extends CommissionerBaseTest {
     params.requiredGFlagsFileList = GFlagsValidation.GFLAG_FILENAME_LIST;
     params.releaseMetadata = defaultReleaseMetadata;
     params.version = DEFAULT_VERSION;
-    when(mockReleaseManager.getTarGZipDBPackageInputStream(any(), any()))
+    when(mockReleaseManager.getTarGZipDBPackageInputStream(any()))
         .thenThrow(new RuntimeException("File does not exists"));
     TaskInfo taskInfo = submitTask(TaskType.AddGFlagMetadata, params, false);
     assertEquals(Failure, taskInfo.getTaskState());
@@ -92,7 +90,7 @@ public class AddGFlagMetadataTest extends CommissionerBaseTest {
     params.requiredGFlagsFileList = GFlagsValidation.GFLAG_FILENAME_LIST;
     params.releaseMetadata = defaultReleaseMetadata;
     params.version = DEFAULT_VERSION;
-    when(mockReleaseManager.getTarGZipDBPackageInputStream(any(), any()))
+    when(mockReleaseManager.getTarGZipDBPackageInputStream(any()))
         .thenReturn(new FileInputStream(tempFilePath));
     doThrow(new IOException("Error-Message"))
         .when(mockGFlagsValidation)

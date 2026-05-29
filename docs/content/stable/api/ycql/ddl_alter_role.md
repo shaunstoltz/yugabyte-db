@@ -4,9 +4,12 @@ headerTitle: ALTER ROLE
 linkTitle: ALTER ROLE
 description: Use the ALTER ROLE statement to change the properties of an existing role.
 menu:
-  stable:
+  stable_api:
     parent: api-cassandra
     weight: 1210
+aliases:
+  - /stable/api/cassandra/ddl_alter_role
+  - /stable/api/ycql/ddl_alter_role
 type: docs
 ---
 
@@ -42,8 +45,6 @@ Where
 An error is raised if `role_name` does not exist.
 
 ## Examples
-
-You can do this as shown below.
 
 ```sql
 ycqlsh:example> CREATE ROLE finance;

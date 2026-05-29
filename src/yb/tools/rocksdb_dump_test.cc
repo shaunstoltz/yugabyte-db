@@ -1,4 +1,4 @@
-// Copyright (c) YugaByte, Inc.
+// Copyright (c) YugabyteDB, Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License"); you may not use this file except
 // in compliance with the License.  You may obtain a copy of the License at
@@ -48,10 +48,8 @@ namespace yb {
 namespace tools {
 
 using client::YBClient;
-using client::YBClientBuilder;
 using client::YBSchema;
 using client::YBSchemaBuilder;
-using client::YBTableCreator;
 using client::YBTableName;
 using client::YBTable;
 
@@ -78,7 +76,7 @@ class RocksDbDumpTest : public YBMiniClusterTestBase<MiniCluster> {
 
     YBSchema schema;
     YBSchemaBuilder b;
-    b.AddColumn("k")->Type(INT64)->NotNull()->HashPrimaryKey();
+    b.AddColumn("k")->Type(DataType::INT64)->NotNull()->HashPrimaryKey();
     ASSERT_OK(b.Build(&schema));
 
     client_ = ASSERT_RESULT(cluster_->CreateClient());
@@ -108,10 +106,9 @@ class RocksDbDumpTest : public YBMiniClusterTestBase<MiniCluster> {
  protected:
 
   Status WriteData() {
-    auto session = client_->NewSession();
-    session->SetTimeout(5s);
+    auto session = client_->NewSession(5s);
 
-    std::shared_ptr<client::YBqlWriteOp> insert(table_->NewQLWrite());
+    std::shared_ptr<client::YBqlWriteOp> insert(table_->NewQLWrite(SharedThreadSafeArena()));
     auto req = insert->mutable_request();
     GenerateDataForRow(table_->schema(), 17 /* record_id */, &random_, req);
 

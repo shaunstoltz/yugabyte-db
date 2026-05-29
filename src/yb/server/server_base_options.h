@@ -15,9 +15,9 @@
 // specific language governing permissions and limitations
 // under the License.
 //
-// The following only applies to changes made to this file as part of YugaByte development.
+// The following only applies to changes made to this file as part of YugabyteDB development.
 //
-// Portions Copyright (c) YugaByte, Inc.
+// Portions Copyright (c) YugabyteDB, Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License"); you may not use this file except
 // in compliance with the License.  You may obtain a copy of the License at
@@ -31,24 +31,24 @@
 //
 #pragma once
 
+#include <mutex>
 #include <string>
 #include <vector>
-#include <mutex>
 
-#include "yb/common/common_fwd.h"
 #include "yb/fs/fs_manager.h"
+
+#include "yb/server/server_fwd.h"
 #include "yb/server/webserver_options.h"
 #include "yb/server/rpc_server.h"
+
 #include "yb/util/net/net_util.h"
 
 namespace yb {
 
+class CloudInfoPB;
 class Env;
 
 namespace server {
-
-typedef std::vector<std::vector<HostPort>> MasterAddresses;
-typedef std::shared_ptr<const MasterAddresses> MasterAddressesPtr;
 
 // Options common to both types of servers.
 // The subclass constructor should fill these in with defaults from
@@ -102,7 +102,7 @@ class ServerBaseOptions {
 
   WebserverOptions& CompleteWebserverOptions();
 
-  std::string HostsString();
+  std::string HostsString() const;
 
  protected:
   explicit ServerBaseOptions(int default_port);
@@ -132,8 +132,6 @@ Status DetermineMasterAddresses(
 std::string MasterAddressesToString(const MasterAddresses& addresses);
 
 Result<std::vector<Endpoint>> ResolveMasterAddresses(const MasterAddresses& master_addresses);
-
-CloudInfoPB GetPlacementFromGFlags();
 
 } // namespace server
 } // namespace yb

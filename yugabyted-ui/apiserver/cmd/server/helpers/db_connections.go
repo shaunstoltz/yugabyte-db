@@ -4,22 +4,58 @@ import (
     "apiserver/cmd/server/logger"
     "context"
     "fmt"
+    "net"
+    "strconv"
     "time"
 
     "github.com/yugabyte/gocql"
     "github.com/jackc/pgx/v4/pgxpool"
 )
 
-func CreateGoCqlClient(log logger.Logger) *gocql.ClusterConfig {
+type PgClientConnectionParams struct {
+        User     string
+        Password string
+        Host     string
+        Port     int
+        Database string
+}
 
+func (h *HelperContainer) CreateGoCqlClient(log logger.Logger) *gocql.ClusterConfig {
+
+    // Get list of tservers
+    hostNames := []string{}
+    tabletServersFuture := make(chan TabletServersFuture)
+    go h.GetTabletServersFuture(HOST, tabletServersFuture)
+    tabletServersResponse := <-tabletServersFuture
+    if tabletServersResponse.Error != nil {
+        log.Warnf("failed to get list of tservers for gocql client setup: %s",
+            tabletServersResponse.Error)
+        // If we fail to get tservers from GetTabletServersFuture, use HOST
+        hostNames = append(hostNames, net.JoinHostPort(HOST, strconv.Itoa(YcqlPort)))
+    } else {
+        // to get hostnames, get all second level keys and only keep if
+        // net.SpliHostPort succeeds.
+        for _, obj := range tabletServersResponse.Tablets {
+            for hostport := range obj {
+                host, _, err := net.SplitHostPort(hostport)
+                if err != nil {
+                    log.Warnf("failed to split hostport %s: %s", hostport, err.Error())
+                } else {
+                    hostNames = append(hostNames, net.JoinHostPort(host, strconv.Itoa(YcqlPort)))
+                }
+            }
+        }
+    }
+    log.Infof("initializing gocql client with initial addresses: %v", hostNames)
     // Initialize gocql client
-    cluster := gocql.NewCluster(HOST)
+    cluster := gocql.NewCluster(hostNames...)
+
+    cluster.Authenticator = gocql.PasswordAuthenticator{
+        Username: DbYcqlUser,
+        Password: DbYcqlPassword,
+    }
 
     if Secure {
-            cluster.Authenticator = gocql.PasswordAuthenticator{
-                    Username: DbYcqlUser,
-                    Password: DbPassword,
-            }
             cluster.SslOpts = &gocql.SslOptions{
                     CaPath: SslRootCert,
             }
@@ -34,12 +70,15 @@ func CreateGoCqlClient(log logger.Logger) *gocql.ClusterConfig {
     return cluster
 }
 
-func CreatePgClient(log logger.Logger, host string) (*pgxpool.Pool, error) {
+func (h *HelperContainer) CreatePgClient(log logger.Logger,
+        connectionParams PgClientConnectionParams) (*pgxpool.Pool, error) {
 
     var url string
 
-    url = fmt.Sprintf("postgres://%s:%s@%s:%d/%s",
-            DbYsqlUser, DbPassword, host, PORT, DbName)
+    url = fmt.Sprintf("postgres://%s:%s@%s/%s",
+            connectionParams.User, connectionParams.Password,
+            net.JoinHostPort(connectionParams.Host, strconv.Itoa(connectionParams.Port)),
+            connectionParams.Database)
     if Secure {
             secureOptions := fmt.Sprintf("sslmode=%s", SslMode)
             if SslRootCert != "" {

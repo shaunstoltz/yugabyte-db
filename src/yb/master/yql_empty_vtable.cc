@@ -1,4 +1,4 @@
-// Copyright (c) YugaByte, Inc.
+// Copyright (c) YugabyteDB, Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License"); you may not use this file except
 // in compliance with the License.  You may obtain a copy of the License at
@@ -23,10 +23,9 @@ YQLEmptyVTable::YQLEmptyVTable(const TableName& table_name,
     : YQLVirtualTable(table_name, namespace_name, master, schema) {
 }
 
-Result<std::shared_ptr<QLRowBlock>> YQLEmptyVTable::RetrieveData(
-    const QLReadRequestPB& request) const {
+Result<VTableDataPtr> YQLEmptyVTable::RetrieveData(const QLReadRequestMsg& request) const {
   // Empty rowblock.
-  return std::make_shared<QLRowBlock>(schema());
+  return std::make_shared<qlexpr::QLRowBlock>(schema());
 }
 
 }  // namespace master

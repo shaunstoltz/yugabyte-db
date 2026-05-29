@@ -1,4 +1,4 @@
-// Copyright (c) YugaByte, Inc.
+// Copyright (c) YugabyteDB, Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License"); you may not use this file except
 // in compliance with the License.  You may obtain a copy of the License at
@@ -14,13 +14,15 @@
 package org.yb.pgsql;
 
 import static org.yb.AssertionWrappers.*;
+import static org.junit.Assume.*;
 
 import org.hamcrest.CoreMatchers;
 import org.junit.Test;
 import org.junit.runner.RunWith;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
-import org.yb.util.YBTestRunnerNonTsanOnly;
+import org.yb.YBTestRunner;
+import org.yb.minicluster.MiniYBClusterBuilder;
 
 import java.sql.Connection;
 import java.sql.ResultSet;
@@ -38,7 +40,7 @@ import java.util.concurrent.locks.ReentrantLock;
 /**
  * Tests for PostgreSQL RBAC.
  */
-@RunWith(value = YBTestRunnerNonTsanOnly.class)
+@RunWith(value = YBTestRunner.class)
 public class TestPgAuthorization extends BasePgSQLTest {
   private static final Logger LOG = LoggerFactory.getLogger(TestPgAuthorization.class);
 
@@ -55,7 +57,22 @@ public class TestPgAuthorization extends BasePgSQLTest {
   protected Map<String, String> getTServerFlags() {
     Map<String, String> flags = super.getTServerFlags();
     flags.put("ysql_hba_conf", CUSTOM_PG_HBA_CONFIG);
+    if(isTestRunningWithConnectionManager()) {
+      flags.put("enable_ysql_conn_mgr", "true");
+      flags.put("ysql_conn_mgr_alter_guc_adoption_strategy", "connection_static");
+      flags.put("ysql_conn_mgr_alter_guc_stale_backend_ttl_ms", "-1");
+    }
     return flags;
+  }
+
+  @Override
+  protected void customizeMiniClusterBuilder(MiniYBClusterBuilder builder) {
+    super.customizeMiniClusterBuilder(builder);
+    // Since BasePgSQLTest is setting the warmup mode to random, we need to
+    // overwrite the flag to none here
+    if (isTestRunningWithConnectionManager()) {
+      builder.addCommonTServerFlag("TEST_ysql_conn_mgr_dowarmup_all_pools_mode", "none");
+    }
   }
 
   @Test
@@ -355,6 +372,11 @@ public class TestPgAuthorization extends BasePgSQLTest {
 
   @Test
   public void testAttributes() throws Exception {
+    // (DB-10760) Role OID-based pool design is needed in addition to waiting
+    // for connection count-related statistics for this test to pass when
+    // Connection Manager is enabled. Skipping this test temporarily.
+    skipYsqlConnMgr(BasePgSQLTest.RECREATE_USER_SUPPORT_NEEDED);
+
     // NOTE: The INHERIT attribute is tested separately in testMembershipInheritance.
     try (Statement statement = connection.createStatement()) {
       statement.execute("CREATE ROLE unprivileged");
@@ -442,7 +464,7 @@ public class TestPgAuthorization extends BasePgSQLTest {
         runInvalidQuery(
             statement,
             "ALTER ROLE su LOGIN",
-            "must be superuser to alter superusers"
+            "must be superuser to alter superuser roles or change superuser attribute"
         );
       });
 
@@ -494,7 +516,11 @@ public class TestPgAuthorization extends BasePgSQLTest {
 
       ConnectionBuilder limitRoleUserConnBldr = getConnectionBuilder().withUser("limit_role");
       try (Connection ignored1 = limitRoleUserConnBldr.connect()) {
+        // TODO(GH #18886) While running the test on ysql conn mgr port, add a wait for
+        // ysql conn mgr stats to get updated to check if conn limit is exceeded or not.
         try (Connection connection2 = limitRoleUserConnBldr.connect()) {
+          // TODO(GH #18886) While running the test on ysql conn mgr port, add a wait for
+          // ysql conn mgr stats to get updated to check if conn limit is exceeded or not.
           // Third concurrent connection causes error.
           try (Connection ignored3 = limitRoleUserConnBldr.connect()) {
             fail("Expected third login attempt to fail");
@@ -507,7 +533,8 @@ public class TestPgAuthorization extends BasePgSQLTest {
 
           // Close second connection.
           connection2.close();
-
+          // TODO(GH #18886) While running the test on ysql conn mgr port, add a wait for
+          // ysql conn mgr stats to get updated to check if conn limit is exceeded or not.
           // New connection now succeeds.
           try (Connection ignored2 = limitRoleUserConnBldr.connect()) {
             // No-op.
@@ -2834,6 +2861,9 @@ public class TestPgAuthorization extends BasePgSQLTest {
 
   @Test
   public void testConnectionLimitDecreasedMidSession() throws Exception {
+    // (DB-12741) Skip this test if running with connection manager.
+    skipYsqlConnMgr(BasePgSQLTest.INCORRECT_CONN_STATE_BEHAVIOR);
+
     try (Connection connection1 = getConnectionBuilder().withTServer(0).connect();
          Statement statement1 = connection1.createStatement()) {
 
@@ -2902,6 +2932,14 @@ public class TestPgAuthorization extends BasePgSQLTest {
 
   @Test
   public void testMembershipRevokedInsideGroup() throws Exception {
+
+    // The test fails with Connection Manager enabled as the role GUC variable
+    // is replayed at the beginning of every transaction boundary. This test
+    // requires that the role GUC variable is not changed even after revoking
+    // membership from a role group in order to succeed, which would not be the
+    // case when Connection Manager is enabled.
+    skipYsqlConnMgr(BasePgSQLTest.GUC_REPLAY_AFFECTS_CONN_STATE);
+
     try (Connection connection1 = getConnectionBuilder().withTServer(0).connect();
          Statement statement1 = connection1.createStatement()) {
       statement1.execute("CREATE ROLE test_role LOGIN");
@@ -3193,6 +3231,172 @@ public class TestPgAuthorization extends BasePgSQLTest {
         // Connection 2 observers owner privileges.
         statement2.execute("DROP TABLE other_table");
       });
+    }
+  }
+
+  @Test
+  public void testLongPasswords() throws Exception {
+    // (DB-10387) (DB-10760) Using long passwords with Connection Manager
+    // causes I/O errors during test execution. Skip this test temporarily
+    // until support for the same can be provided with Connection Manager.
+    // This test will further need the support of role OID-based pooling
+    // to help support recreate role operations (DROP ROLE followed by
+    // CREATE ROLE).
+    skipYsqlConnMgr(BasePgSQLTest.LONG_PASSWORD_SUPPORT_NEEDED);
+
+    try (Statement statement = connection.createStatement()) {
+      statement.execute("CREATE ROLE unprivileged");
+
+      StringBuilder builder = new StringBuilder(5000);
+      for (int i = 0; i < 5000; i++) {
+          builder.append("a");
+      }
+      String passwordWithLen5000 = builder.toString();
+      // "md5" + md5_hash("aaa..5000 times" + "pass_role").
+      // The role name "pass_role" is used as the salt.
+      String md5HashOfPassword = "md57a389663c1d96e12c7e25948d9325894";
+
+      /*
+       * PASSWORD
+       */
+
+      // Create role with password.
+      statement.execute("DROP ROLE IF EXISTS pass_role");
+      statement.execute("SET password_encryption = 'md5'");
+      statement.execute(
+          String.format("CREATE ROLE pass_role LOGIN PASSWORD '%s'", passwordWithLen5000));
+
+      // Password is encrypted, despite not being specified.
+      ResultSet password_result = statement.executeQuery(
+          "SELECT rolpassword FROM pg_authid WHERE rolname='pass_role'");
+      password_result.next();
+      String password_hash = password_result.getString(1);
+      // We need an exact equals check here because it is not enough to just check that the long
+      // passwords work for login. It could happen that we have the same truncation during role
+      // creation as well as login. In that case, a long password will still work since we will
+      // truncate to the same length and calculate the hash in both the cases.
+      // Example: If password is "abcd" and the stored password gets truncated to "ab", the login
+      // will still work if we have the same truncation during login.
+      assertEquals(password_hash, md5HashOfPassword);
+
+      ConnectionBuilder passRoleUserConnBldr = getConnectionBuilder().withUser("pass_role");
+
+      // Can login with password.
+      try (Connection ignored = passRoleUserConnBldr.withPassword(passwordWithLen5000).connect()) {
+        // No-op.
+      }
+
+      // Cannot login without password.
+      try (Connection ignored = passRoleUserConnBldr.connect()) {
+        fail("Expected login attempt to fail");
+      } catch (SQLException sqle) {
+        assertThat(
+            sqle.getMessage(),
+            CoreMatchers.containsString("no password was provided")
+        );
+      }
+
+      // Cannot login with incorrect password.
+      try (Connection ignored = passRoleUserConnBldr.withPassword("wrong").connect()) {
+        fail("Expected login attempt to fail");
+      } catch (SQLException sqle) {
+        assertThat(
+            sqle.getMessage(),
+            CoreMatchers.containsString("password authentication failed for user \"pass_role\"")
+        );
+      }
+
+      // Password does not imply login.
+      statement.execute("DROP ROLE IF EXISTS pass_role");
+      statement.execute("CREATE ROLE pass_role PASSWORD 'pass1'");
+      try (Connection ignored = passRoleUserConnBldr.withPassword("pass1").connect()) {
+        fail("Expected login attempt to fail");
+      } catch (SQLException sqle) {
+        assertThat(
+            sqle.getMessage(),
+            CoreMatchers.containsString("role \"pass_role\" is not permitted to log in")
+        );
+      }
+
+      /*
+       * ENCRYPTED PASSWORD
+       */
+
+      // Create role with encrypted password.
+      statement.execute("DROP ROLE IF EXISTS pass_role");
+      statement.execute(String.format(
+          "CREATE ROLE pass_role LOGIN ENCRYPTED PASSWORD '%s'", passwordWithLen5000));
+
+      // Password is encrypted.
+      password_result = statement.executeQuery(
+          "SELECT rolpassword FROM pg_authid WHERE rolname='pass_role'");
+      password_result.next();
+      password_hash = password_result.getString(1);
+      // We need an exact equals check here because it is not enough to just check that the long
+      // passwords work for login. It could happen that we have the same truncation during role
+      // creation as well as login. In that case, a long password will still work since we will
+      // truncate to the same length and calculate the hash in both the cases.
+      // Example: If password is "abcd" and the stored password gets truncated to "ab", the login
+      // will still work if we have the same truncation during login.
+      assertEquals(password_hash, md5HashOfPassword);
+
+      // Can login with password.
+      try (Connection ignored = passRoleUserConnBldr.withPassword(passwordWithLen5000).connect()) {
+        // No-op.
+      }
+
+      // Cannot login without password.
+      try (Connection ignored = passRoleUserConnBldr.connect()) {
+        fail("Expected login attempt to fail");
+      } catch (SQLException sqle) {
+        assertThat(
+            sqle.getMessage(),
+            CoreMatchers.containsString("no password was provided")
+        );
+      }
+
+      // Cannot login with incorrect password.
+      try (Connection ignored = passRoleUserConnBldr.withPassword("wrong").connect()) {
+        fail("Expected login attempt to fail");
+      } catch (SQLException sqle) {
+        assertThat(
+            sqle.getMessage(),
+            CoreMatchers.containsString("password authentication failed for user \"pass_role\"")
+        );
+      }
+    }
+  }
+
+  @Test
+  public void testPgLocksAuthorization() throws Exception {
+    try (Statement statement = connection.createStatement()) {
+      statement.execute("CREATE ROLE yb_lock_status_user LOGIN");
+      statement.execute("GRANT yb_db_admin TO yb_lock_status_user");
+    }
+
+    try (Connection connection = getConnectionBuilder().withUser("yb_lock_status_user").connect();
+         Statement statement = connection.createStatement()) {
+      // yb_db_admin_member should be able to query pg_locks without superuser access.
+      statement.executeQuery("SELECT * FROM pg_locks");
+    }
+  }
+
+  @Test
+  public void testPgPublicSchemaCreateAuthorization() throws Exception {
+    try (Statement statement = connection.createStatement()) {
+      // In java tests using BasePsqSQLTest, we provide CREATE privilege on public schema to PUBLIC,
+      // which is not the default PG15 behaviour (which is only USAGE privilege). The below two
+      // queries reset this to PG15 behaviour. This test ensures that yb_db_admin has CREATE
+      // privilege on public schema.
+      statement.execute("REVOKE CREATE ON SCHEMA public FROM PUBLIC");
+      statement.execute("CREATE ROLE yb_public_schema_user LOGIN");
+      statement.execute("GRANT yb_db_admin TO yb_public_schema_user");
+    }
+
+    try (Connection connection = getConnectionBuilder().withUser("yb_public_schema_user").connect();
+        Statement statement = connection.createStatement()) {
+      // yb_db_admin user should have create privilege in public schema.
+      statement.execute("CREATE TABLE public.t1(col INT)");
     }
   }
 }

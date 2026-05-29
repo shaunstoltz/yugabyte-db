@@ -1,4 +1,4 @@
-// Copyright (c) YugaByte, Inc.
+// Copyright (c) YugabyteDB, Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License"); you may not use this file except
 // in compliance with the License.  You may obtain a copy of the License at
@@ -13,8 +13,11 @@
 
 #include "yb/master/yql_virtual_table.h"
 
-#include "yb/common/ql_scanspec.h"
+#include "yb/common/ql_protocol.messages.h"
 #include "yb/common/schema.h"
+
+#include "yb/docdb/doc_ql_scanspec.h"
+#include "yb/dockv/key_entry_value.h"
 
 #include "yb/master/master.h"
 #include "yb/master/scoped_leader_shared_lock.h"
@@ -22,16 +25,15 @@
 #include "yb/master/yql_vtable_iterator.h"
 
 #include "yb/util/metrics.h"
-#include "yb/util/shared_lock.h"
 #include "yb/util/status_format.h"
 
-namespace yb {
-namespace master {
+namespace yb::master {
 
-namespace  {
-static const char* const kBaseMetricDescription = "Time spent querying YCQL system table: ";
+namespace {
+static const char* const kBaseMetricDescription =
+    "Time (microseconds) spent querying YCQL system table: ";
 static const char* const kMetricPrefixName = "ycql_queries_";
-}
+}  // namespace
 
 YQLVirtualTable::YQLVirtualTable(const TableName& table_name,
                                  const NamespaceName &namespace_name,
@@ -48,19 +50,19 @@ YQLVirtualTable::YQLVirtualTable(const TableName& table_name,
                 "server", metricName, metricDescription,
                 MetricUnit::kMicroseconds, metricDescription,
                 MetricLevel::kInfo, 0, 10000000, 2);
-    histogram_ = master->metric_entity()->FindOrCreateHistogram(std::move(prototype));
+    histogram_ = master->metric_entity()->FindOrCreateMetric<Histogram>(std::move(prototype));
 }
 
 YQLVirtualTable::~YQLVirtualTable() = default;
 
 Status YQLVirtualTable::GetIterator(
-    const QLReadRequestPB& request,
-    const Schema& projection,
+    const QLReadRequestMsg& request,
+    const dockv::ReaderProjection& projection,
       std::reference_wrapper<const docdb::DocReadContext> doc_read_context,
     const TransactionOperationContext& txn_op_context,
-    CoarseTimePoint deadline,
-    const ReadHybridTime& read_time,
-    const QLScanSpec& spec,
+    const docdb::ReadOperationData& read_operation_data,
+    const qlexpr::QLScanSpec& spec,
+    std::reference_wrapper<const ScopedRWOperation> pending_op,
     std::unique_ptr<docdb::YQLRowwiseIteratorIf>* iter) const {
   // Acquire shared lock on catalog manager to verify it is still the leader and metadata will
   // not change.
@@ -75,20 +77,22 @@ Status YQLVirtualTable::GetIterator(
 }
 
 Status YQLVirtualTable::BuildYQLScanSpec(
-    const QLReadRequestPB& request,
+    const QLReadRequestMsg& request,
     const ReadHybridTime& read_time,
     const Schema& schema,
     const bool include_static_columns,
-    const Schema& static_projection,
-    std::unique_ptr<QLScanSpec>* spec,
-    std::unique_ptr<QLScanSpec>* static_row_spec) const {
+    std::unique_ptr<qlexpr::QLScanSpec>* spec,
+    std::unique_ptr<qlexpr::QLScanSpec>* static_row_spec) const {
   // There should be no static columns in system tables so we are not handling it.
   if (include_static_columns) {
     return STATUS(IllegalState, "system table contains no static columns");
   }
-  spec->reset(new QLScanSpec(
-      request.has_where_expr() ? &request.where_expr().condition() : nullptr,
-      request.has_if_expr() ? &request.if_expr().condition() : nullptr,
+  spec->reset(new docdb::DocQLScanSpec(
+      schema, /* hash_code = */ std::nullopt, /* max_hash_code = */ std::nullopt, nullptr, {},
+      qlexpr::QLConditionPBPtr(
+          request.has_where_expr() ? &request.where_expr().condition() : nullptr),
+      qlexpr::QLConditionPBPtr(request.has_if_expr() ? &request.if_expr().condition() : nullptr),
+      rocksdb::kDefaultQueryId,
       request.is_forward_scan()));
   return Status::OK();
 }
@@ -120,5 +124,4 @@ Result<std::pair<int, DataType>> YQLVirtualTable::ColumnIndexAndType(
 const std::string kSystemTablesReleaseVersion = "3.9-SNAPSHOT";
 const std::string kSystemTablesReleaseVersionColumn = "release_version";
 
-}  // namespace master
-}  // namespace yb
+} // namespace yb::master

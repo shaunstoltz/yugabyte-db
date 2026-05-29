@@ -1,5 +1,5 @@
 //--------------------------------------------------------------------------------------------------
-// Copyright (c) YugaByte, Inc.
+// Copyright (c) YugabyteDB, Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License"); you may not use this file except
 // in compliance with the License.  You may obtain a copy of the License at
@@ -14,92 +14,43 @@
 
 #pragma once
 
-#include <list>
+#include <functional>
 #include <memory>
+#include <optional>
+#include <span>
 #include <string>
+#include <utility>
 #include <variant>
 #include <vector>
 
+#include "yb/common/hybrid_time.h"
+
+#include "yb/dockv/doc_key.h"
+#include "yb/dockv/key_bytes.h"
+
 #include "yb/gutil/macros.h"
 
+#include "yb/util/concepts.h"
 #include "yb/util/locks.h"
 #include "yb/util/lw_function.h"
 #include "yb/util/ref_cnt_buffer.h"
+#include "yb/util/result.h"
+#include "yb/util/slice.h"
 
+#include "yb/yql/pggate/pg_doc_metrics.h"
+#include "yb/yql/pggate/pg_doc_op_fetch_stream.h"
 #include "yb/yql/pggate/pg_gate_fwd.h"
 #include "yb/yql/pggate/pg_op.h"
+#include "yb/yql/pggate/pg_read_range.h"
 #include "yb/yql/pggate/pg_session.h"
+#include "yb/yql/pggate/pg_tools.h"
 #include "yb/yql/pggate/pg_sys_table_prefetcher.h"
+#include "yb/yql/pggate/util/pg_tuple.h"
 
-namespace yb {
-namespace pggate {
-
-class PgTuple;
+namespace yb::pggate {
 
 YB_STRONGLY_TYPED_BOOL(RequestSent);
-
-//--------------------------------------------------------------------------------------------------
-// PgDocResult represents a batch of rows in ONE reply from tablet servers.
-class PgDocResult {
- public:
-  explicit PgDocResult(rpc::SidecarHolder data, std::vector<int64_t>&& row_orders = {});
-
-  PgDocResult(const PgDocResult&) = delete;
-  PgDocResult& operator=(const PgDocResult&) = delete;
-
-  // Get the order of the next row in this batch.
-  int64_t NextRowOrder();
-
-  // End of this batch.
-  bool is_eof() const {
-    return row_count_ == 0 || row_iterator_.empty();
-  }
-
-  // Get the postgres tuple from this batch.
-  Status WritePgTuple(const std::vector<PgExpr*>& targets, PgTuple* pg_tuple, int64_t* row_order);
-
-  // Get system columns' values from this batch.
-  // Currently, we only have ybctids, but there could be more.
-  Status ProcessSystemColumns();
-
-  // Update the reservoir with ybctids from this batch.
-  // The update is expected to be sparse, so ybctids come as index/value pairs.
-  Status ProcessSparseSystemColumns(std::string* reservoir);
-
-  // Access function to ybctids value in this batch.
-  // Sys columns must be processed before this function is called.
-  const std::vector<Slice>& ybctids() const {
-    DCHECK(syscol_processed_) << "System columns are not yet setup";
-    return ybctids_;
-  }
-
-  // Row count in this batch.
-  int64_t row_count() const {
-    return row_count_;
-  }
-
- private:
-  // Data selected from DocDB.
-  rpc::SidecarHolder data_;
-
-  // Iterator on "data_" from row to row.
-  Slice row_iterator_;
-
-  // The row number of only this batch.
-  int64_t row_count_ = 0;
-
-  // The indexing order of the row in this batch.
-  // These order values help to identify the row order across all batches.
-  using RowOrders = std::vector<int64_t>;
-  RowOrders row_orders_;
-  RowOrders::const_iterator current_row_order_;
-
-  // System columns.
-  // - ybctids_ contains pointers to the buffers "data_".
-  // - System columns must be processed before these fields have any meaning.
-  std::vector<Slice> ybctids_;
-  bool syscol_processed_ = false;
-};
+YB_STRONGLY_TYPED_BOOL(KeepOrder);
 
 //--------------------------------------------------------------------------------------------------
 // Doc operation API
@@ -107,7 +58,7 @@ class PgDocResult {
 // - PgDocOp: Shared functionalities among all ops, mostly just RPC calls to tablet servers.
 // - PgDocReadOp: Definition for data & method members to be used in READ operation.
 // - PgDocWriteOp: Definition for data & method members to be used in WRITE operation.
-// - PgDocResult: Definition data holder before they are passed to Postgres layer.
+// - DocResult: Definition data holder before they are passed to Postgres layer.
 //
 // Processing Steps
 // (1) Collecting Data:
@@ -133,12 +84,10 @@ class PgDocResult {
 //
 // (3) SendRequest:
 //     PgSession API requires contiguous array of operators. For this reason, before sending the
-//     pgsql_ops_ is soreted to place active ops first, and all inactive ops are place at the end.
-//     For example,
-//        PgSession::RunAsync(pgsql_ops_.data(), active_op_count)
+//     pgsql_ops_ is sorted to place active ops first, and all inactive ops are place at the end.
 //
 // (4) ReadResponse:
-//     Response are written to a local cache PgDocResult.
+//     Response are written to a local cache DocResult.
 //
 // This API has several sets of methods and attributes for different purposes.
 // (1) Build request.
@@ -170,7 +119,7 @@ class PgDocResult {
 //      The same requests are constructed for each tablet server.
 //    - PopulateNextHashPermutationOps() Parallel processing SELECT by hash conditions.
 //      Hash permutations will be group into different request based on their hash_codes.
-//    - PopulateDmlByYbctidOps() Parallel processing SELECT by ybctid values.
+//    - PopulateByYbctidOps() Parallel processing SELECT by ybctid values.
 //      Ybctid values will be group into different request based on their hash_codes.
 //      This function is a bit different from other formulating function because it is used for an
 //      internal request within PgGate. Other populate functions are used for external requests
@@ -178,24 +127,17 @@ class PgDocResult {
 //
 // (3) Execution
 //  This section exchanges RPC calls with tablet servers.
-//  * Attributes
-//    - active_op_counts_: Number of active operators in vector "pgsql_ops_".
-//        Exec/active op range = pgsql_ops_[0, active_op_count_)
-//        Inactive op range = pgsql_ops_[active_op_count_, total_count)
-//      The vector pgsql_ops_ is fixed sized, can have inactive operators as operators are not
-//      completing execution at the same time.
 //  * Methods
 //    - ExecuteInit()
 //    - Execute() Driver for all RPC related effort.
 //    - SendRequest() Send request for active operators to tablet server using YBPgsqlOp.
-//        RunAsync(pgsql_ops_.data(), active_op_count_)
 //    - ProcessResponse() Get response from tablet server using YBPgsqlOp.
 //    - MoveInactiveOpsOutside() Sort pgsql_ops_ to move inactive operators outside of exec range.
 //
 // (4) Return result
 //  This section return result via PgGate API to postgres.
 //  * Attributes
-//    - Objects of class PgDocResult
+//    - Objects of class DocResult
 //    - rows_affected_count_: Number of rows that was operated by this doc_op.
 //  * Methods
 //    - GetResult()
@@ -208,17 +150,14 @@ class PgDocResult {
 // different partitions and interact with different tablet servers.
 //--------------------------------------------------------------------------------------------------
 
+YB_STRONGLY_TYPED_BOOL(IsForWritePgDoc);
+YB_STRONGLY_TYPED_BOOL(IsOpBuffered);
+
 // Helper class to wrap PerformFuture and custom response provider.
 // No memory allocations is required in case of using PerformFuture.
 class PgDocResponse {
  public:
-  struct Data {
-    Data(const rpc::CallResponsePtr& response_, uint64_t in_txn_limit_)
-        : response(response_), in_txn_limit(in_txn_limit_) {
-    }
-    rpc::CallResponsePtr response;
-    uint64_t in_txn_limit;
-  };
+  using Data = PerformFuture::Data;
 
   class Provider {
    public:
@@ -226,46 +165,146 @@ class PgDocResponse {
     virtual Result<Data> Get() = 0;
   };
 
+  struct MetricInfo {
+    MetricInfo(TableType table_type_,
+               IsForWritePgDoc is_write_,
+               IsOpBuffered is_buffered_)
+        : table_type(table_type_), is_write(is_write_), is_buffered(is_buffered_) {}
+
+    TableType table_type;
+    IsForWritePgDoc is_write;
+    IsOpBuffered is_buffered;
+  };
+
+  struct FutureInfo {
+    FutureInfo() : metrics(TableType::USER, IsForWritePgDoc::kFalse, IsOpBuffered::kFalse) {}
+    FutureInfo(PerformFuture&& future_, const MetricInfo& metrics_)
+        : future(std::move(future_)), metrics(metrics_) {}
+
+    PerformFuture future;
+    MetricInfo metrics;
+  };
+
   using ProviderPtr = std::unique_ptr<Provider>;
 
   PgDocResponse() = default;
-  PgDocResponse(PerformFuture future, uint64_t in_txn_limit);
+  PgDocResponse(PerformFuture&& future, const MetricInfo& info);
   explicit PgDocResponse(ProviderPtr provider);
 
   bool Valid() const;
-  Result<Data> Get(MonoDelta* wait_time);
+  Result<Data> Get(PgSession& session);
 
  private:
-  struct PerformInfo {
-    PerformFuture future;
-    uint64_t in_txn_limit;
-  };
-  std::variant<PerformInfo, ProviderPtr> holder_;
+  std::variant<FutureInfo, ProviderPtr> holder_;
 };
 
-class PgDocOp : public std::enable_shared_from_this<PgDocOp> {
+//--------------------------------------------------------------------------------------------------
+// Classes to facilitate IN clause permutations.
+// The input is one or more expressions of following supported types:
+// 1. Single value representing an equality condition
+// 2. A tuple of values representing IN clause condition
+// 3. A tuple of tuples, where the first inner tuple contains column references, and remaining
+//    tuples contain values, representing ROW(<columns>) IN (ROW(values1), ... ROW(valuesN))
+// The facility is initialized by the InPermutationBuilder class. The participating expressions are
+// added to the builder using AddExpression method. Since expressions of type 1. and 2. do not
+// contain column information, the caller must provide the index of the associated column. If the
+// expression is of type 3., the indexes are retrieved from the expression and the index passed in
+// is ignored. The participating expressions may only refer table's key columns, must refer all the
+// hash column and must not refer any column more than once.
+// After all participating expressions are added to the builder, the Build() method initializes and
+// returns the permutations state. Call to Build() invalidates the builder.
+// The InPermutationGenerator class is the core of the permutations state. It tracks the current
+// permutation and provides it as a vector of pointers to the values in the respective expressions.
+// Not referenced indexes in the permutation contain null pointers.
+// The InExpressionWrapper keeps current position in one participating expression and configured to
+// efficiently retrieve current value(s) into the permutation.
+class InExpressionWrapper {
+ public:
+  static InExpressionWrapper Make(
+      const PgTable& table, size_t idx, const LWPgsqlExpressionPB* expr);
+
+  const std::vector<size_t>& Targets() const { return targets_; }
+  size_t Size() const { return values_.size(); }
+
+  bool Next();
+  void GetValues(std::vector<const LWQLValuePB*>* permutation);
+  void ResetPos() { pos_ = 0; }
+
+ private:
+  InExpressionWrapper(
+      std::vector<size_t>&& targets, std::vector<const LWPgsqlExpressionPB*>&& values,
+      void (InExpressionWrapper::*fn)(std::vector<const LWQLValuePB*>*))
+      : pos_(0),
+        targets_(std::move(targets)),
+        values_(std::move(values)),
+        GetValuesFn_(fn) {}
+
+  // GetValues implementations for supported expression types
+  void GetSingleValue(std::vector<const LWQLValuePB*>* permutation);
+  void GetInValue(std::vector<const LWQLValuePB*>* permutation);
+  void GetRowInValues(std::vector<const LWQLValuePB*>* permutation);
+
+  size_t pos_;
+  const std::vector<size_t> targets_;
+  const std::vector<const LWPgsqlExpressionPB*> values_;
+  void (InExpressionWrapper::*GetValuesFn_)(std::vector<const LWQLValuePB*>*);
+};
+
+class InPermutationGenerator {
+ public:
+  InPermutationGenerator(InPermutationGenerator&& other) = default;
+
+  const std::vector<size_t>& Targets() const { return all_targets_; }
+  size_t Size();
+
+  bool HasPermutation() { return !done_; }
+  const std::vector<const LWQLValuePB*>& NextPermutation();
+  void Reset();
+
+ private:
+  friend class InPermutationBuilder;
+  InPermutationGenerator(
+      PgTable& table,
+      std::vector<InExpressionWrapper>&& source_exprs,
+      std::vector<size_t>&& targets);
+  void Next();
+
+  const std::vector<size_t> all_targets_;
+  std::vector<InExpressionWrapper> source_exprs_;
+  std::vector<const LWQLValuePB*> current_permutation_;
+  bool done_ = false;
+  DISALLOW_COPY_AND_ASSIGN(InPermutationGenerator);
+};
+
+class InPermutationBuilder {
+ public:
+  explicit InPermutationBuilder(PgTable& table) : table_(table) {}
+
+  void AddExpression(size_t idx, const LWPgsqlExpressionPB* expr);
+  InPermutationGenerator Build();
+
+ private:
+  bool TargetsAreValid(const std::vector<size_t>& all_targets);
+  PgTable& table_;
+  std::vector<InExpressionWrapper> source_exprs_;
+};
+
+//--------------------------------------------------------------------------------------------------
+
+class PgDocOp {
  public:
   using SharedPtr = std::shared_ptr<PgDocOp>;
 
   using Sender = std::function<Result<PgDocResponse>(
-      PgSession*, const PgsqlOpPtr*, size_t, const PgTableDesc&, uint64_t, ForceNonBufferable)>;
-
-  struct OperationRowOrder {
-    OperationRowOrder(const PgsqlOpPtr& operation_, int64_t order_)
-        : operation(operation_), order(order_) {}
-
-    std::weak_ptr<const PgsqlOp> operation;
-    int64_t order;
-  };
-
-  using OperationRowOrders = std::vector<OperationRowOrder>;
+      PgSession*, std::span<const PgsqlOpPtr>, const PgTableDesc&, const PgSession::RunOptions&,
+      IsForWritePgDoc)>;
 
   virtual ~PgDocOp() = default;
 
   // Initialize doc operator.
-  virtual Status ExecuteInit(const PgExecParameters *exec_params);
+  virtual Status ExecuteInit(const YbcPgExecParameters* exec_params);
 
-  const PgExecParameters& ExecParameters() const;
+  const YbcPgExecParameters& ExecParameters() const;
 
   // Execute the op. Return true if the request has been sent and is awaiting the result.
   virtual Result<RequestSent> Execute(
@@ -275,30 +314,31 @@ class PgDocOp : public std::enable_shared_from_this<PgDocOp> {
   // - This op will not send request to tablet server.
   // - This op will return empty result-set when being requested for data.
   void AbandonExecution() {
+    DCHECK(!HasActiveOps());
     end_of_data_ = true;
   }
 
-  // Get the result of the op. No rows will be added to rowsets in case end of data reached.
-  virtual Result<std::list<PgDocResult>> GetResult();
   Result<int32_t> GetRowsAffectedCount() const;
 
-  struct YbctidGenerator {
-    using Next = LWFunction<Slice()>;
-
-    YbctidGenerator(const Next& next_, size_t capacity_)
-        : next(next_), capacity(capacity_) {}
-
-    const Next& next;
-    const size_t capacity;
-  };
+  // Get the results and hand them over to the result stream.
+  // Send requests for new pages if necessary.
+  virtual Status FetchMoreResults();
+  PgDocOpFetchStream& ResultStream();
+  void SetFetchedTargets(FetchedTargetsPtr targets);
 
   // This operation is requested internally within PgGate, and that request does not go through
-  // all the steps as other operation from Postgres thru PgDocOp. This is used to create requests
-  // for the following select.
-  //   SELECT ... FROM <table> WHERE ybctid IN (SELECT base_ybctids from INDEX)
-  // After ybctids are queried from INDEX, PgGate will call "PopulateDmlByYbctidOps" to create
-  // operators to fetch rows whose rowids equal queried ybctids.
-  Status PopulateDmlByYbctidOps(const YbctidGenerator& generator);
+  // all the steps as other operation from Postgres thru PgDocOp.
+  // Ybctids from the generator may be skipped if they conflict with other conditions placed on the
+  // request. Function returns true result if it ended up with any requests to execute.
+  // Response will have same order of ybctids as request in case of using KeepOrder::kTrue.
+  Result<bool> PopulateByYbctidOps(const YbctidGenerator& generator, KeepOrder = KeepOrder::kFalse);
+
+  // Create PgsqlOp instances and adjust their requests for the merge streams defined by provided
+  // sort keys and conditions on the template requests.
+  // Check requests boundaries and discard those that are out of bounds.
+  // Returns true if requests are successfully created, false if all are out of bounds.
+  Result<bool> PopulateMergeStreamRequests(
+      MergeSortKeysPtr merge_sort_keys, PgTable& bind, InPermutationGenerator&& merge_streams);
 
   bool has_out_param_backfill_spec() {
     return !out_param_backfill_spec_.empty();
@@ -308,61 +348,49 @@ class PgDocOp : public std::enable_shared_from_this<PgDocOp> {
     return out_param_backfill_spec_.c_str();
   }
 
-  bool end_of_data() const {
-    return end_of_data_;
-  }
-
   virtual bool IsWrite() const = 0;
 
-  Status CreateRequests();
+  Result<size_t> CreateRequests();
 
   const PgTable& table() const { return table_; }
 
-  // RPC stats for EXPLAIN ANALYZE
-  void GetAndResetReadRpcStats(uint64_t* read_rpc_count, uint64_t* read_rpc_wait_time) {
-    *read_rpc_count = read_rpc_count_;
-    read_rpc_count_ = 0;
-    *read_rpc_wait_time = read_rpc_wait_time_.ToNanoseconds();
-    read_rpc_wait_time_ = MonoDelta::FromNanoseconds(0);
-  }
+  static Result<PgDocResponse> DefaultSender(
+      PgSession* session, std::span<const PgsqlOpPtr> ops, const PgTableDesc& table,
+      const PgSession::RunOptions& options, IsForWritePgDoc is_write);
 
  protected:
   PgDocOp(
-    const PgSession::ScopedRefPtr& pg_session, PgTable* table,
+    const PgSessionPtr& pg_session, PgTable* table,
     const Sender& = Sender(&PgDocOp::DefaultSender));
-
-  uint64_t& GetInTxnLimit();
 
   // Populate Protobuf requests using the collected information for this DocDB operator.
   virtual Result<bool> DoCreateRequests() = 0;
 
-  virtual Status DoPopulateDmlByYbctidOps(const YbctidGenerator& generator) = 0;
+  virtual Status DoPopulateByYbctidOps(const YbctidGenerator& generator, KeepOrder keep_order) = 0;
 
-  // Only active operators are kept in the active range [0, active_op_count_)
-  // - Not execute operators that are outside of range [0, active_op_count_).
-  // - Sort the operators in "pgsql_ops_" to move "inactive" operators to the end of the list.
-  void MoveInactiveOpsOutside();
+  virtual Status DoPopulateMergeStreamRequests(
+      MergeSortKeysPtr merge_sort_keys, PgTable& bind, InPermutationGenerator&& merge_streams) = 0;
+
+  // Sorts the operators in "pgsql_ops_" to move "inactive" operators to the end of the list.
+  size_t MoveInactiveOpsOutside();
+
+  // If there is a result stream, reset it.
+  void ResetResultStream();
+
+  // If there is a result stream, add current operations to it.
+  void AddOpsToResultStream();
+
+  auto ActiveOps() const;
+  bool HasActiveOps() const;
 
   // Session control.
-  PgSession::ScopedRefPtr pg_session_;
-
-  // This time is set at the start (i.e., before sending the first batch of PgsqlOp ops) and must
-  // stay the same for the lifetime of the PgDocOp.
-  //
-  // Each query must only see data written by earlier queries in the same transaction, not data
-  // written by itself. Setting it at the start ensures that future operations of the PgDocOp only
-  // see data written by previous queries.
-  //
-  // NOTE: Each query might result in many PgDocOps. So using 1 in_txn_limit_ per PgDocOp is not
-  // enough. The same should be used across all PgDocOps in the query. This is ensured by the use
-  // of statement_in_txn_limit in yb_exec_params of EState.
-  uint64_t in_txn_limit_ = 0;
+  PgSessionPtr pg_session_;
 
   // Target table.
   PgTable& table_;
 
   // Exec control parameters.
-  PgExecParameters exec_params_;
+  YbcPgExecParameters exec_params_;
 
   // Suppress sending new request after processing response.
   // Next request will be sent in case upper level will ask for additional data.
@@ -371,19 +399,8 @@ class PgDocOp : public std::enable_shared_from_this<PgDocOp> {
   // Populated protobuf request.
   std::vector<PgsqlOpPtr> pgsql_ops_;
 
-  // Number of active operators in the pgsql_ops_ list.
-  size_t active_op_count_ = 0;
-
   // Indicator for completing all request populations.
   bool request_population_completed_ = false;
-
-  // If true, all data for each batch must be collected before PgGate gets the reply.
-  // NOTE:
-  // - Currently, PgSession's default behavior is to get all responses in a batch together.
-  // - We set this flag only to prevent future optimization where requests & their responses to
-  //   and from different tablet servers are sent and received independently. That optimization
-  //   should only be done when "wait_for_batch_completion_ == false"
-  bool wait_for_batch_completion_ = true;
 
   // Object to fetch a response from DocDB after sending a request.
   // Object's Valid() method returns false in case no request is sent
@@ -397,32 +414,8 @@ class PgDocOp : public std::enable_shared_from_this<PgDocOp> {
   // Whether all requested data by the statement has been received or there's a run-time error.
   bool end_of_data_ = false;
 
-  // The order number of each request when batching arguments.
-  // Currently, this is used for query by YBCTID.
-  // - Each pgsql_op has a batch of ybctids selected from INDEX.
-  // - The order of resulting rows should match with the order of queried ybctids.
-  // - Example:
-  //   Suppose we got from INDEX table
-  //     { ybctid_1, ybctid_2, ybctid_3, ybctid_4, ybctid_5, ybctid_6, ybctid_7 }
-  //
-  //   Now pgsql_op are constructed as the following, one op per partition.
-  //     pgsql_op <partition 1> (ybctid_1, ybctid_3, ybctid_4)
-  //     pgsql_op <partition 2> (ybctid_2, ybctid_6)
-  //     pgsql_op <partition 2> (ybctid_5, ybctid_7)
-  //
-  //  These respective ybctids are stored in batch_ybctid_ also.
-  //  In other words,
-  //     batch_ybctid_[partition 1] contains (ybctid_1, ybctid_3, ybctid_4)
-  //     batch_ybctid_[partition 2] contains (ybctid_2, ybctid_6)
-  //     batch_ybctid_[partition 3] contains (ybctid_5, ybctid_7)
-  //
-  //   After getting the rows of data from pgsql, the rows must be then ordered from 1 thru 7.
-  //   To do so, for each pgsql_op we kept an array of orders, batch_row_orders_.
-  //  Caution: batch_row_orders_ might have irrelevant data in case of dynamic tablet splitting
-  //           In the vast majority of cases ordering information will came with response.
-  //           Local ordering info is only required for upgrade scenario when new YSQL communicates
-  //           With quite old t-server. In future this field must be removed.
-  OperationRowOrders batch_row_orders_;
+  std::unique_ptr<PgDocOpFetchStream> result_stream_;
+  FetchedTargetsPtr targets_;
 
   // This counter is used to maintain the row order when the operator sends requests in parallel
   // by partition. Currently only query by YBCTID uses this variable.
@@ -436,28 +429,36 @@ class PgDocOp : public std::enable_shared_from_this<PgDocOp> {
   // Output parameter of the execution.
   std::string out_param_backfill_spec_;
 
-  // Read RPC stats for EXPLAIN ANALYZE.
-  uint64_t read_rpc_count_ = 0;
-  MonoDelta read_rpc_wait_time_ = MonoDelta::FromNanoseconds(0);
-
  private:
   Status SendRequest(ForceNonBufferable force_non_bufferable = ForceNonBufferable::kFalse);
 
   Status SendRequestImpl(ForceNonBufferable force_non_bufferable);
 
-  Result<std::list<PgDocResult>> ProcessResponse(const Result<PgDocResponse::Data>& data);
+  void RecordRequestMetrics();
 
-  Result<std::list<PgDocResult>> ProcessResponseImpl(const Result<PgDocResponse::Data>& data);
+  Status ProcessResponse(const Result<PgDocResponse::Data>& data);
 
-  Result<std::list<PgDocResult>> ProcessCallResponse(const rpc::CallResponse& response);
+  Status ProcessResponseImpl(const Result<PgDocResponse::Data>& data);
+
+  Status ProcessCallResponse(const rpc::CallResponse& response);
 
   virtual Status CompleteProcessResponse() = 0;
 
-  Status CompleteRequests();
+  Result<size_t> CompleteRequests();
 
-  static Result<PgDocResponse> DefaultSender(
-      PgSession* session, const PgsqlOpPtr* ops, size_t ops_count, const PgTableDesc& table,
-      uint64_t in_txn_limit, ForceNonBufferable force_non_bufferable);
+  // Returns a reference to the in_txn_limit_ht to be used.
+  //
+  // For read ops: usually one in txn limit is chosen for all for read ops of a SQL statement. And
+  // the hybrid time in such a situation references the statement level integer that is passed down
+  // to all PgDocOp instances via YbcPgExecParameters.
+  //
+  // In case the reference to the statement level in_txn_limit_ht isn't passed in
+  // YbcPgExecParameters, the local in_txn_limit_ht_ is used which is 0 at the start of the PgDocOp.
+  //
+  // For writes: the local in_txn_limit_ht_ is used if available.
+  //
+  // See ReadHybridTimePB for more details about in_txn_limit.
+  uint64_t& GetInTxnLimitHt();
 
   // Result set either from selected or returned targets is cached in a list of strings.
   // Querying state variables.
@@ -465,30 +466,87 @@ class PgDocOp : public std::enable_shared_from_this<PgDocOp> {
 
   Sender sender_;
 
+  // See ReadHybridTimePB for more details about in_txn_limit.
+  uint64_t in_txn_limit_ht_ = 0;
+
   DISALLOW_COPY_AND_ASSIGN(PgDocOp);
 };
 
-//--------------------------------------------------------------------------------------------------
-
 class PgDocReadOp : public PgDocOp {
  public:
-  PgDocReadOp(const PgSession::ScopedRefPtr& pg_session, PgTable* table, PgsqlReadOpPtr read_op);
+  PgDocReadOp(const PgSessionPtr& pg_session, PgTable* table, PgsqlReadOpPtr read_op);
   PgDocReadOp(
-      const PgSession::ScopedRefPtr& pg_session, PgTable* table,
+      const PgSessionPtr& pg_session, PgTable* table,
       PgsqlReadOpPtr read_op, const Sender& sender);
 
-  Status ExecuteInit(const PgExecParameters *exec_params) override;
-
-  // Row sampler collects number of live and dead rows it sees.
-  Status GetEstimatedRowCount(double *liverows, double *deadrows);
+  Status ExecuteInit(const YbcPgExecParameters *exec_params) override;
 
   bool IsWrite() const override {
     return false;
   }
 
-  Status DoPopulateDmlByYbctidOps(const YbctidGenerator& generator) override;
+  Status DoPopulateByYbctidOps(const YbctidGenerator& generator, KeepOrder keep_order) override;
+
+  Status DoPopulateMergeStreamRequests(
+      MergeSortKeysPtr merge_sort_keys, PgTable& bind,
+      InPermutationGenerator&& merge_streams) override;
+
+  Status ResetPgsqlOps();
+
+ protected:
+  Status CompleteProcessResponse() override;
+
+  // Set bounds on the request so it only affect specified partition
+  // Returns false if current bounds fully exclude the partition
+  Result<bool> SetLowerUpperBound(LWPgsqlReadRequestPB* request, size_t partition);
+
+  // Get the read_op for a specific operation index from pgsql_ops_.
+  PgsqlReadOp& GetReadOp(size_t op_index);
+
+  // Get the read_req for a specific operation index from pgsql_ops_.
+  LWPgsqlReadRequestPB& GetReadReq(size_t op_index);
+
+  // Create operators.
+  // - Each operator is used for one request.
+  // - When parallelism by partition is applied, each operator is associated with one partition,
+  //   and each operator has a batch of arguments that belong to that partition.
+  //   * The higher the number of partition_count, the higher the parallelism level.
+  //   * If (partition_count == 1), only one operator is needed for the entire partition range.
+  //   * If (partition_count > 1), each operator is used for a specific partition range.
+  //   * This optimization is used by
+  //       PopulateByYbctidOps()
+  //       PopulateParallelSelectOps()
+  // - When parallelism by arguments is applied, each operator has only one argument.
+  //   When tablet server will run the requests in parallel as it assigned one thread per request.
+  //       PopulateNextHashPermutationOps()
+  void ClonePgsqlOps(size_t op_count);
+
+  const LWPgsqlReadRequestPB& GetTemplateReadReq() const { return read_op_->read_request(); }
 
  private:
+  // Structure to hold information about a hash permutations batch associated with a partition.
+  // - read_op: The partition's read operation.
+  // - rhs_values: The pointer into the IN predicate where new row expressions representing the
+  //   hash permutation are added.
+  // - request_range: The range of the operation request, if different from the partition range.
+  //   Used to filter out the out of bounds hash permutations.
+  // The fields are initialized lazily when the first hash permutation is bound to the partition.
+  // If the operation has empty range, like if the template request range does not intersect with
+  // the partition range, the rhs_values and request_range fields are not initialized. The operation
+  // remains associated with the partition batch, to prevent re-initialization attempts. Such
+  // operations are never activated and not executed.
+  struct PartitionBatch {
+    PgsqlReadOp* read_op = nullptr;
+    LWPgsqlExpressionPB* rhs_values = nullptr;
+    std::optional<PgReadRange> request_range = std::nullopt;
+  };
+  using QLValuePBs = std::vector<const LWQLValuePB*>;
+  using PartitionBatches = std::vector<PartitionBatch>;
+
+  // Check request conditions if they allow to limit the scan range
+  // Returns true if resulting range is not empty, false otherwise
+  Result<bool> SetScanBounds(PgTable& table, LWPgsqlReadRequestPB& request);
+
   // Create protobuf requests using template_op_.
   Result<bool> DoCreateRequests() override;
 
@@ -498,6 +556,10 @@ class PgDocReadOp : public PgDocOp {
   // - After being queried from inner select, ybctids are used for populate request for outer query.
   void InitializeYbctidOperators();
 
+  bool IsHashBatchingEnabled();
+
+  bool IsBatchFlushRequired() const;
+
   // Create operators by partition arguments.
   // - Optimization for statement:
   //     SELECT ... WHERE <hash-columns> IN <value-lists>
@@ -506,31 +568,34 @@ class PgDocReadOp : public PgDocOp {
   // - When an operator is assigned a hash permutation, it is marked as active to be executed.
   // - When an operator completes the execution, it is marked as inactive and available for the
   //   exection of the next hash permutation.
-  bool PopulateNextHashPermutationOps();
-  void InitializeHashPermutationStates();
+  Result<bool> PopulateNextHashPermutationOps();
+  InPermutationGenerator InitializeHashPermutationStates();
 
-  // Helper functions for PopulateNextHashPermutationOps
-  // Prepares a new read request from the pool of inactive operators.
-  LWPgsqlReadRequestPB *PrepareReadReq();
-  // True if the next call to GetNextPermutation will not fail.
-  bool HasNextPermutation();
-  // Gets the next possible permutation of partition_exprs.
-  bool GetNextPermutation(std::vector<const LWPgsqlExpressionPB *> *exprs);
-  // Binds a given permutation of partition expressions to the given read request.
-  void BindPermutation(const std::vector<const LWPgsqlExpressionPB *> &exprs,
-                       LWPgsqlReadRequestPB *read_op);
+  // Binds the given values to the given read operation.
+  // Hash column values are bound to the request's partition_column_values, range column values are
+  // added as equality conditions to the condition_expr.
+  // Performs boundary check, if the request range is empty, returns false
+  Result<bool> BindExprsRegular(
+      PgTable& table, LWPgsqlReadRequestPB& read_req, const QLValuePBs& values);
 
+  // Binds the given values to the partition defined by hash column values.
+  // The partition_batches vector for each partition stores the flag indicating the partition
+  // has been initialized, and the references to initialized RHSs of the batched IN expression,
+  // or null, if the partition batch is inactive.
+  // Batch may be inactive if it has not been yet initialized, or its request range is empty.
+  using ReadOpProvider = LWFunction<Result<PgsqlReadOp&>()>;
+  Result<bool> BindExprsToBatch(
+      PartitionBatches& partition_batches, const QLValuePBs& values,
+      const ReadOpProvider& read_op_provider);
+  LWPgsqlExpressionPB* InitHashPermutationBatch(LWPgsqlReadRequestPB& read_req);
   // Create operators by partitions.
   // - Optimization for aggregating or filtering requests.
   Result<bool> PopulateParallelSelectOps();
 
-  // Create one sampling operator per partition and arrange their execution in random order
-  Result<bool> PopulateSamplingOps();
-
-  // Set partition boundaries to a given partition.
-  Status SetScanPartitionBoundary();
-
-  Status CompleteProcessResponse() override;
+  // Set partition boundaries to a given partition. Return true if new boundaries combined with
+  // old boundaries, if any, are non-empty range. Obviously, there's no need to send request with
+  // empty range boundaries, because the result will be empty.
+  Result<bool> SetScanPartitionBoundary();
 
   // Process response read state from DocDB.
   Status ProcessResponseReadStates();
@@ -539,7 +604,7 @@ class PgDocReadOp : public PgDocOp {
   void ResetInactivePgsqlOps();
 
   // Analyze options and pick the appropriate prefetch limit.
-  void SetRequestPrefetchLimit();
+  Status SetRequestPrefetchLimit();
 
   // Set the backfill_spec field of our read request.
   void SetBackfillSpec();
@@ -550,73 +615,46 @@ class PgDocReadOp : public PgDocOp {
   // Set the read_time for our backfill's read request based on our exec control parameter.
   void SetReadTimeForBackfill();
 
-  void SetDistinctScan();
-
-  Result<bool> SetLowerUpperBound(LWPgsqlReadRequestPB* request, size_t partition);
-
-  // Get the read_op for a specific operation index from pgsql_ops_.
-  PgsqlReadOp& GetReadOp(size_t op_index);
-
-  // Get the read_req for a specific operation index from pgsql_ops_.
-  LWPgsqlReadRequestPB& GetReadReq(size_t op_index);
-
   // Re-format the request when connecting to older server during rolling upgrade.
   void FormulateRequestForRollingUpgrade(LWPgsqlReadRequestPB *read_req);
-
-  // Create operators.
-  // - Each operator is used for one request.
-  // - When parallelism by partition is applied, each operator is associated with one partition,
-  //   and each operator has a batch of arguments that belong to that partition.
-  //   * The higher the number of partition_count, the higher the parallelism level.
-  //   * If (partition_count == 1), only one operator is needed for the entire partition range.
-  //   * If (partition_count > 1), each operator is used for a specific partition range.
-  //   * This optimization is used by
-  //       PopulateDmlByYbctidOps()
-  //       PopulateParallelSelectOps()
-  // - When parallelism by arguments is applied, each operator has only one argument.
-  //   When tablet server will run the requests in parallel as it assigned one thread per request.
-  //       PopulateNextHashPermutationOps()
-  void ClonePgsqlOps(size_t op_count);
 
   //----------------------------------- Data Members -----------------------------------------------
 
   // Template operation, used to fill in pgsql_ops_ by either assigning or cloning.
   PgsqlReadOpPtr read_op_;
 
-  // While sampling is in progress, number of scanned row is accumulated in this variable.
-  // After completion the value is extrapolated to account for not scanned partitions and estimate
-  // total number of rows in the table.
-  double sample_rows_ = 0;
+  // Arena for pgsql operations. In some cases PgGate may need to create too many pgsql operations
+  // to keep everything in memory. In such cases pgsql_op_arena_ is created and pgsql operations
+  // are allocated on that arena. When all pgsql operations are out of active state the arena is
+  // reset and operations are recreated to start the next batch from the scratch.
+  std::shared_ptr<ThreadSafeArena> pgsql_op_arena_;
 
-  // Used internally for PopulateNextHashPermutationOps to keep track of which permutation should
-  // be used to construct the next read_op.
-  // Is valid as long as request_population_completed_ is false.
+  // Support for hash permutations. Allows IN conditions on hash columns.
+  // For example, if the query clause is "h1 = 1 AND h2 IN (2,3) AND h3 IN (4,5,6) AND h4 = 7",
+  // it is transformed into the following set of values for ROW(h1, h2, h3, h4):
+  //   (1, 2, 4, 7)
+  //   (1, 3, 4, 7)
+  //   (1, 2, 5, 7)
+  //   (1, 3, 5, 7)
+  //   (1, 2, 6, 7)
+  //   (1, 3, 6, 7)
+  // Each element is a complete set of hash column values, so DocDB can calculate the hash code and
+  // locate keys by the prefix.
   //
-  // Example:
-  // For a query clause "h1 = 1 AND h2 IN (2,3) AND h3 IN (4,5,6) AND h4 = 7",
-  // there are 1*2*3*1 = 6 possible permutation.
-  // As such, this field will take on values 0 through 5.
-  int total_permutation_count_ = 0;
-  int next_permutation_idx_ = 0;
-
-  // Used internally for PopulateNextHashPermutationOps to holds all partition expressions.
-  // Elements correspond to a hash columns, in the same order as they were defined
-  // in CREATE TABLE statement.
-  // This is somewhat similar to what hash_values_options_ in CQL is used for.
-  //
-  // Example:
-  // For a query clause "h1 = 1 AND h2 IN (2,3) AND h3 IN (4,5,6) AND h4 = 7",
-  // this will be initialized to [[1], [2, 3], [4, 5, 6], [7]]
-  // For a query clause "(h1,h3) IN ((1,5),(2,3)) AND h2 IN (2,4)"
-  // the will be initialized to [[(1,5), (2,3)], [(2,4)], []]
-  std::vector<std::vector<const LWPgsqlExpressionPB*>> partition_exprs_;
+  // hash_permutations_ contains the permutation state, which allows to generate desired number of
+  // permutations at a time and work in batches.
+  // is_hash_batched_ indicates if multiple permutations can be batched into one request as part of
+  // the condition_expr condition instead of making one request per permutation with updated
+  // partition_column_values. PgGate makes one batch per tablet.
+  std::optional<InPermutationGenerator> hash_permutations_;
+  std::optional<bool> is_hash_batched_;
 };
 
 //--------------------------------------------------------------------------------------------------
 
 class PgDocWriteOp : public PgDocOp {
  public:
-  PgDocWriteOp(const PgSession::ScopedRefPtr& pg_session,
+  PgDocWriteOp(const PgSessionPtr& pg_session,
                PgTable* table,
                PgsqlWriteOpPtr write_op);
 
@@ -636,7 +674,14 @@ class PgDocWriteOp : public PgDocOp {
   // For write ops, we are not yet batching ybctid from index query.
   // TODO(neil) This function will be implemented when we push down sub-query inside WRITE ops to
   // the proxy layer. There's many scenarios where this optimization can be done.
-  Status DoPopulateDmlByYbctidOps(const YbctidGenerator& generator) override {
+  Status DoPopulateByYbctidOps(const YbctidGenerator& generator, KeepOrder keep_order) override {
+    LOG(FATAL) << "Not yet implemented";
+    return Status::OK();
+  }
+
+  Status DoPopulateMergeStreamRequests(
+      MergeSortKeysPtr merge_sort_keys, PgTable& bind,
+      InPermutationGenerator&& merge_streams) override {
     LOG(FATAL) << "Not yet implemented";
     return Status::OK();
   }
@@ -650,7 +695,6 @@ class PgDocWriteOp : public PgDocOp {
 };
 
 PgDocOp::SharedPtr MakeDocReadOpWithData(
-    const PgSession::ScopedRefPtr& pg_session, PrefetchedDataHolder data);
+    const PgSessionPtr& pg_session, PrefetchedDataHolder data);
 
-}  // namespace pggate
-}  // namespace yb
+}  // namespace yb::pggate

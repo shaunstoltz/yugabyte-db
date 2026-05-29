@@ -1,4 +1,4 @@
-// Copyright (c) YugaByte, Inc.
+// Copyright (c) YugabyteDB, Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License"); you may not use this file except
 // in compliance with the License.  You may obtain a copy of the License at
@@ -20,7 +20,7 @@
 #endif
 #include <fcntl.h>
 #include <string>
-#include <glog/logging.h>
+#include "yb/util/logging.h"
 
 #include "yb/gutil/casts.h"
 
@@ -31,6 +31,8 @@
 #include "yb/util/status_format.h"
 
 using std::string;
+
+DECLARE_string(tmp_dir);
 
 namespace yb {
 
@@ -69,17 +71,14 @@ Result<void*> MMap(int fd, SharedMemorySegment::AccessMode access_mode, size_t s
 
 // Returns the directory in which all shared memory files should be created.
 std::string GetSharedMemoryDirectory() {
-  std::string directory = "/tmp";
+  std::string directory = FLAGS_tmp_dir;
 
 #if defined(__linux__)
   auto* mount_file = fopen("/proc/mounts", "r");
-  auto se = ScopeExit([&mount_file] {
-    if (mount_file) {
-      fclose(mount_file);
-    }
-  });
 
   if (mount_file) {
+    ScopeExit se{[mount_file] { fclose(mount_file); }};
+
     while (struct mntent* mount_info = getmntent(mount_file)) {
       // We want a read-write tmpfs mount.
       if (strcmp(mount_info->mnt_type, "tmpfs") == 0
@@ -93,8 +92,8 @@ std::string GetSharedMemoryDirectory() {
       }
     }
   } else if (errno != ENOENT) {
-    LOG(ERROR) << "Unexpected error when reading /proc/mounts: errno=" << errno
-               << ": " << ErrnoToString(errno);
+    LOG(DFATAL) << "Unexpected error when reading /proc/mounts: errno=" << errno
+                << ": " << ErrnoToString(errno);
   }
 #endif
 
@@ -115,8 +114,8 @@ int TryMemfdCreate() {
 
   struct utsname uts_name;
   if (uname(&uts_name) == -1) {
-    LOG(ERROR) << "Failed to get kernel name information: errno=" << errno
-               << ": " << ErrnoToString(errno);
+    LOG(DFATAL) << "Failed to get kernel name information: errno=" << errno
+                << ": " << ErrnoToString(errno);
     return fd;
   }
 
@@ -138,8 +137,8 @@ int TryMemfdCreate() {
 
     fd = memfd_create();
     if (fd == -1) {
-      LOG(ERROR) << "Error creating shared memory via memfd_create: errno=" << errno
-                 << ": " << ErrnoToString(errno);
+      LOG(DFATAL) << "Error creating shared memory via memfd_create: errno=" << errno
+                  << ": " << ErrnoToString(errno);
     }
   }
 
@@ -178,9 +177,9 @@ Result<int> CreateTempSharedMemoryFile() {
 
     // Immediately unlink the file to so it will be removed when all file descriptors close.
     if (unlink(temp_file_path.c_str()) == -1) {
-      LOG(ERROR) << "Leaking shared memory file '" << temp_file_path
-                 << "' after failure to unlink: errno=" << errno
-                 << ": " << ErrnoToString(errno);
+      LOG(DFATAL) << "Leaking shared memory file '" << temp_file_path
+                  << "' after failure to unlink: errno=" << errno
+                  << ": " << ErrnoToString(errno);
     }
     break;
   }
@@ -199,12 +198,11 @@ Result<int> CreateTempSharedMemoryFile() {
 
 Result<SharedMemorySegment> SharedMemorySegment::Create(size_t segment_size) {
   int fd = -1;
-  bool auto_close_fd = true;
-  auto se = ScopeExit([&fd, &auto_close_fd] {
-    if (fd != -1 && auto_close_fd) {
+  CancelableScopeExit autoclose_se{[&fd] {
+    if (fd != -1) {
       close(fd);
     }
-  });
+  }};
 
 #if defined(__linux__)
   // Prefer memfd_create over creating temporary files, if available.
@@ -228,7 +226,7 @@ Result<SharedMemorySegment> SharedMemorySegment::Create(size_t segment_size) {
 
   void* segment_address = VERIFY_RESULT(MMap(fd, AccessMode::kReadWrite, segment_size));
 
-  auto_close_fd = false;
+  autoclose_se.Cancel();
   return SharedMemorySegment(segment_address, fd, segment_size);
 }
 
@@ -247,22 +245,26 @@ SharedMemorySegment::SharedMemorySegment(void* base_address, int fd, size_t segm
 }
 
 SharedMemorySegment::SharedMemorySegment(SharedMemorySegment&& other)
-    : base_address_(other.base_address_),
-      fd_(other.fd_),
-      segment_size_(other.segment_size_) {
-  other.base_address_ = nullptr;
-  other.fd_ = -1;
-}
+    : base_address_(std::exchange(other.base_address_, nullptr)),
+      fd_(std::exchange(other.fd_, -1)),
+      segment_size_(other.segment_size_) { }
 
 SharedMemorySegment::~SharedMemorySegment() {
   if (base_address_ && munmap(base_address_, segment_size_) == -1) {
-    LOG(ERROR) << "Failed to unmap shared memory segment: errno=" << errno
-               << ": " << ErrnoToString(errno);
+    LOG(DFATAL) << "Failed to unmap shared memory segment: errno=" << errno
+                << ": " << ErrnoToString(errno);
   }
 
   if (fd_ != -1) {
     close(fd_);
   }
+}
+
+SharedMemorySegment& SharedMemorySegment::operator=(SharedMemorySegment&& other) {
+  base_address_ = std::exchange(other.base_address_, nullptr);
+  fd_ = std::exchange(other.fd_, -1);
+  segment_size_ = other.segment_size_;
+  return *this;
 }
 
 void* SharedMemorySegment::GetAddress() const {
@@ -271,6 +273,63 @@ void* SharedMemorySegment::GetAddress() const {
 
 int SharedMemorySegment::GetFd() const {
   return fd_;
+}
+
+Result<InterprocessSharedMemoryObject> InterprocessSharedMemoryObject::Create(
+    const std::string& name, size_t size) {
+  try {
+    boost::interprocess::shared_memory_object object(
+        boost::interprocess::create_only, name.c_str(), boost::interprocess::read_write);
+    object.truncate(size);
+    return InterprocessSharedMemoryObject(std::move(object));
+  } catch (boost::interprocess::interprocess_exception& exc) {
+    return STATUS_FORMAT(
+        RuntimeError, "Failed to create segment $0 of size $1: $2", name, size, exc.what());
+  }
+}
+
+Result<InterprocessSharedMemoryObject> InterprocessSharedMemoryObject::Open(
+    const std::string& name) {
+  try {
+    boost::interprocess::shared_memory_object object(
+        boost::interprocess::open_only, name.c_str(), boost::interprocess::read_write);
+    return InterprocessSharedMemoryObject(std::move(object));
+  } catch (boost::interprocess::interprocess_exception& exc) {
+    return STATUS_FORMAT(
+        RuntimeError, "Failed to open segment $0: $1", name, exc.what());
+  }
+}
+
+InterprocessSharedMemoryObject::operator bool() const noexcept {
+  return impl_.get_mapping_handle().handle !=
+         boost::interprocess::shared_memory_object().get_mapping_handle().handle;
+}
+
+void InterprocessSharedMemoryObject::DestroyAndRemove() {
+  if (!*this) {
+    return;
+  }
+  std::string shared_memory_object_name(impl_.get_name());
+  try {
+    impl_ = boost::interprocess::shared_memory_object();
+    boost::interprocess::shared_memory_object::remove(shared_memory_object_name.c_str());
+  } catch (boost::interprocess::interprocess_exception& exc) {
+    LOG(DFATAL)
+        << "Failed to remove shared memory segment " << shared_memory_object_name << ": "
+        << exc.what();
+  }
+}
+
+Result<InterprocessMappedRegion> InterprocessSharedMemoryObject::Map() const {
+  try {
+    boost::interprocess::mapped_region region(impl_, boost::interprocess::read_write);
+    return InterprocessMappedRegion(std::move(region));
+  } catch (boost::interprocess::interprocess_exception& exc) {
+    auto status = STATUS_FORMAT(
+        RuntimeError, "Failed to map region $0: $1", impl_.get_name(), exc.what());
+    LOG(DFATAL) << status;
+    return status;
+  }
 }
 
 }  // namespace yb

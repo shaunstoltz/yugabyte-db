@@ -1,4 +1,4 @@
-// Copyright (c) YugaByte, Inc.
+// Copyright (c) YugabyteDB, Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License"); you may not use this file except
 // in compliance with the License.  You may obtain a copy of the License at
@@ -28,7 +28,6 @@
 #include <boost/asio.hpp>
 #include <boost/container/small_vector.hpp>
 #include <boost/date_time/posix_time/posix_time.hpp>
-#include <boost/optional/optional_fwd.hpp>
 #include <boost/version.hpp>
 #include "yb/util/flags.h"
 
@@ -37,7 +36,7 @@
 #include "yb/rpc/service_if.h"
 
 #include "yb/server/server_base.h"
-
+#include "yb/server/ycql_server_external_if.h"
 #include "yb/tserver/tserver_fwd.h"
 
 #include "yb/util/status_fwd.h"
@@ -52,9 +51,16 @@
 
 namespace yb {
 
+namespace tserver {
+class PgYCQLStatementStatsRequestPB;
+class PgYCQLStatementStatsResponsePB;
+}
+
 namespace cqlserver {
 
-class CQLServer : public server::RpcAndWebServerBase {
+class CQLServiceImpl;
+
+class CQLServer : public server::RpcAndWebServerBase, public server::YCQLServerExternalInterface {
  public:
   static const uint16_t kDefaultPort = 9042;
   static const uint16_t kDefaultWebPort = 12000;
@@ -63,21 +69,35 @@ class CQLServer : public server::RpcAndWebServerBase {
             boost::asio::io_service* io,
             tserver::TabletServerIf* tserver);
 
-  Status Start();
+  Status Start() override;
 
-  void Shutdown();
+  void Shutdown() override;
 
   tserver::TabletServerIf* tserver() const { return tserver_; }
+
+  Status ReloadKeysAndCertificates() override;
+
+  Status YCQLStatementStats(const tserver::PgYCQLStatementStatsRequestPB& req,
+      tserver::PgYCQLStatementStatsResponsePB* resp) const override;
+
+  void ClearMetaDataCache() const override;
+
+  std::shared_ptr<CQLServiceImpl> TEST_cql_service() const { return cql_service_; }
 
  private:
   CQLServerOptions opts_;
   void CQLNodeListRefresh(const boost::system::error_code &e);
   void RescheduleTimer();
+  std::unique_ptr<ql::CQLServerEvent> BuildTopologyChangeEvent(
+      const std::string& event_type, const Endpoint& addr);
+  Status SetupMessengerBuilder(rpc::MessengerBuilder* builder) override;
+
   boost::asio::deadline_timer timer_;
   tserver::TabletServerIf* const tserver_;
 
-  std::unique_ptr<ql::CQLServerEvent> BuildTopologyChangeEvent(const std::string& event_type,
-                                                               const Endpoint& addr);
+  std::unique_ptr<rpc::SecureContext> secure_context_;
+
+  std::shared_ptr<CQLServiceImpl> cql_service_;
 
   DISALLOW_COPY_AND_ASSIGN(CQLServer);
 };

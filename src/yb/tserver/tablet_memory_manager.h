@@ -1,4 +1,4 @@
-// Copyright (c) YugaByte, Inc.
+// Copyright (c) YugabyteDB, Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License"); you may not use this file except
 // in compliance with the License.  You may obtain a copy of the License at
@@ -15,15 +15,12 @@
 
 #include <memory>
 
-#include <boost/optional.hpp>
-
 #include "yb/tablet/tablet_options.h"
 
 #include "yb/util/background_task.h"
 #include "yb/util/mem_tracker.h"
 
-namespace yb {
-namespace tserver {
+namespace yb::tserver {
 
 class TabletMemoryManagerListenerIf {
  public:
@@ -57,6 +54,14 @@ class TabletMemoryManager {
 
   // The MemTracker associated with the block cache.
   std::shared_ptr<MemTracker> block_based_table_mem_tracker();
+
+  std::shared_ptr<MemTracker> block_based_table_builder_mem_tracker();
+
+  std::shared_ptr<MemTracker> read_wal_mem_tracker();
+
+  std::shared_ptr<MemTracker> tablets_overhead_mem_tracker();
+
+  std::shared_ptr<MemTracker> FindOrCreateOverheadMemTrackerForTablet(const TabletId& id);
 
   // Flushing function for the memstore.
   void FlushTabletIfLimitExceeded();
@@ -93,11 +98,12 @@ class TabletMemoryManager {
   std::function<std::vector<tablet::TabletPeerPtr>()> peers_fn_;
 
   std::shared_ptr<MemTracker> server_mem_tracker_;
-
   std::shared_ptr<MemTracker> block_based_table_mem_tracker_;
+  std::shared_ptr<MemTracker> block_based_table_builder_mem_tracker_;
+  std::shared_ptr<MemTracker> read_wal_mem_tracker_;
+  std::shared_ptr<MemTracker> tablets_overhead_mem_tracker_;
 
   std::shared_ptr<GarbageCollector> block_based_table_gc_;
-
   std::shared_ptr<GarbageCollector> log_cache_gc_;
 
   std::unique_ptr<BackgroundTask> background_task_;
@@ -105,5 +111,10 @@ class TabletMemoryManager {
   std::shared_ptr<rocksdb::MemoryMonitor> memory_monitor_;
 };
 
-}  // namespace tserver
-}  // namespace yb
+int64 ComputeTabletOverheadLimit();
+
+// Evaluates the number of bits used to shard the block cache depending on the number of cores.
+int32_t GetDbBlockCacheNumShardBits();
+int64_t GetTargetBlockCacheSize(int32_t default_block_cache_size_percentage);
+
+} // namespace yb::tserver

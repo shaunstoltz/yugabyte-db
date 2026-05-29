@@ -1,4 +1,4 @@
-// Copyright (c) YugaByte, Inc.
+// Copyright (c) YugabyteDB, Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License"); you may not use this file except
 // in compliance with the License.  You may obtain a copy of the License at
@@ -17,7 +17,7 @@
 
 #include <stdint.h>
 
-#include <glog/logging.h>
+#include "yb/util/logging.h"
 
 #include "yb/common/common_fwd.h"
 #include "yb/common/common_types.pb.h"
@@ -31,16 +31,18 @@
 
 // The list of unsupported datatypes to use in switch statements
 #define QL_UNSUPPORTED_TYPES_IN_SWITCH \
-  case NULL_VALUE_TYPE: FALLTHROUGH_INTENDED; \
-  case TYPEARGS: FALLTHROUGH_INTENDED;  \
-  case UNKNOWN_DATA
+  case DataType::NULL_VALUE_TYPE: FALLTHROUGH_INTENDED; \
+  case DataType::TYPEARGS: FALLTHROUGH_INTENDED;  \
+  case DataType::UNKNOWN_DATA
 
 #define QL_INVALID_TYPES_IN_SWITCH     \
-  case UINT8:  FALLTHROUGH_INTENDED;    \
-  case UINT16: FALLTHROUGH_INTENDED;    \
-  case UINT32: FALLTHROUGH_INTENDED;    \
-  case UINT64: FALLTHROUGH_INTENDED;    \
-  case GIN_NULL
+  case DataType::UINT8:  FALLTHROUGH_INTENDED;    \
+  case DataType::UINT16: FALLTHROUGH_INTENDED;    \
+  case DataType::UINT32: FALLTHROUGH_INTENDED;    \
+  case DataType::UINT64: FALLTHROUGH_INTENDED;    \
+  case DataType::GIN_NULL: FALLTHROUGH_INTENDED;  \
+  case DataType::VECTOR: FALLTHROUGH_INTENDED;  \
+  case DataType::BSON
 
 namespace yb {
 
@@ -133,6 +135,7 @@ class QLValue {
   QLVALUE_PRIMITIVE_GETTER(frozen);
   QLVALUE_PRIMITIVE_GETTER(gin_null);
   QLVALUE_PRIMITIVE_GETTER(tuple);
+  QLVALUE_PRIMITIVE_GETTER(bson);
   #undef QLVALUE_PRIMITIVE_GETTER
 
   static Timestamp timestamp_value(const QLValuePB& pb);
@@ -217,14 +220,14 @@ class QLValue {
     return timeuuid_value(pb_);
   }
 
-  static util::VarInt varint_value(const QLValuePB& pb);
-  static util::VarInt varint_value(const LWQLValuePB& pb);
+  static VarInt varint_value(const QLValuePB& pb);
+  static VarInt varint_value(const LWQLValuePB& pb);
 
-  static util::VarInt varint_value(const QLValue& value) {
+  static VarInt varint_value(const QLValue& value) {
     return varint_value(value.pb_);
   }
 
-  util::VarInt varint_value() const {
+  VarInt varint_value() const {
     return varint_value(pb_);
   }
 
@@ -372,7 +375,7 @@ class QLValue {
   static void set_timeuuid_value(const Uuid& val, QLValuePB* out);
   static void set_timeuuid_value(const Uuid& val, QLValue* out);
 
-  void set_varint_value(const util::VarInt& val) {
+  void set_varint_value(const VarInt& val) {
     pb_.set_varint_value(val.EncodeToComparable());
   }
 
@@ -559,6 +562,9 @@ bool operator >=(const LWQLValuePB& lhs, const LWQLValuePB& rhs);
 bool operator ==(const LWQLValuePB& lhs, const LWQLValuePB& rhs);
 bool operator !=(const LWQLValuePB& lhs, const LWQLValuePB& rhs);
 
+bool operator ==(const QLValuePB& lhs, const LWQLValuePB& rhs);
+bool operator ==(const LWQLValuePB& lhs, const QLValuePB& rhs);
+
 InternalType type(const QLValuePB& v);
 
 bool IsNull(const QLValuePB& v);
@@ -570,20 +576,23 @@ inline bool IsNull(const QLValue& v) {
 void SetNull(QLValuePB* v);
 void SetNull(LWQLValuePB* v);
 
+inline void SetNull(QLValuePB& v) {
+  SetNull(&v);
+}
+
+inline void SetNull(LWQLValuePB& v) {
+  SetNull(&v);
+}
+
 inline void SetNull(QLValue* v) {
   SetNull(v->mutable_value());
 }
 
-bool EitherIsNull(const QLValuePB& lhs, const QLValuePB& rhs);
-bool BothNotNull(const QLValuePB& lhs, const QLValuePB& rhs);
-bool BothNull(const QLValuePB& lhs, const QLValuePB& rhs);
 bool Comparable(const QLValuePB& lhs, const QLValuePB& rhs);
 bool Comparable(const LWQLValuePB& lhs, const LWQLValuePB& rhs);
 int Compare(const QLValuePB& lhs, const QLValuePB& rhs);
-bool EitherIsNull(const QLValuePB& lhs, const QLValue& rhs);
+int Compare(const LWQLValuePB& lhs, const LWQLValuePB& rhs);
 bool Comparable(const QLValuePB& lhs, const QLValue& rhs);
-bool BothNotNull(const QLValuePB& lhs, const QLValue& rhs);
-bool BothNull(const QLValuePB& lhs, const QLValue& rhs);
 int Compare(const QLValuePB& lhs, const QLValue& rhs);
 int Compare(const QLSeqValuePB& lhs, const QLSeqValuePB& rhs);
 int Compare(const bool lhs, const bool rhs);
@@ -598,9 +607,8 @@ void ConcatStrings(const std::string& lhs, const std::string& rhs, QLValuePB* re
 void ConcatStrings(const std::string& lhs, const std::string& rhs, QLValue* result);
 void ConcatStrings(const Slice& lhs, const Slice& rhs, LWQLValuePB* result);
 
-std::vector<const QLValuePB*> GetTuplesSortedByOrdering(
-    const QLSeqValuePB& options, const Schema& schema, bool is_forward_scan,
-    const std::vector<int>& col_idxs);
+void SetStringValue(QLValuePB& key, std::string_view value);
+void SetStringValue(LWQLValuePB& key, std::string_view value);
 
 #define YB_SET_INT_VALUE(ql_valuepb, input, bits) \
   case DataType::BOOST_PP_CAT(INT, bits): { \

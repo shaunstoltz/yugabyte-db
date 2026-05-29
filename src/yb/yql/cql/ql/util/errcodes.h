@@ -1,5 +1,5 @@
 //--------------------------------------------------------------------------------------------------
-// Copyright (c) YugaByte, Inc.
+// Copyright (c) YugabyteDB, Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License"); you may not use this file except
 // in compliance with the License.  You may obtain a copy of the License at
@@ -20,7 +20,12 @@
 
 #pragma once
 
+#include <string>
+#include <string_view>
+
 #include "yb/util/status_ec.h"
+
+using namespace std::literals;
 
 // Return an unauthorized error if authentication is not enabled through the flag
 // use_cassandra_authentication.
@@ -31,8 +36,7 @@
   }                                                                                               \
 } while (false);
 
-namespace yb {
-namespace ql {
+namespace yb::ql {
 
 enum class ErrorCode : int64_t {
   //------------------------------------------------------------------------------------------------
@@ -102,7 +106,7 @@ enum class ErrorCode : int64_t {
   DUPLICATE_TYPE = -218,
   DUPLICATE_TYPE_FIELD = -219,
   ALTER_KEY_COLUMN = -220,
-  INCOMPATIBLE_COPARTITION_SCHEMA = -221,
+  // reserved code: INCOMPATIBLE_COPARTITION_SCHEMA = -221
   INVALID_ROLE_DEFINITION = -222,
   DUPLICATE_ROLE = -223,
   NULL_IN_COLLECTIONS = -224,
@@ -150,14 +154,13 @@ std::string FormatForComparisonFailureMessage(ErrorCode op, ErrorCode other);
 
 struct QLErrorTag : IntegralErrorTag<ErrorCode> {
   // This category id is part of the wire protocol and should not be changed once released.
-  static constexpr uint8_t kCategory = 4;
+  static constexpr CategoryDescriptor kCategory{4, "ql error"sv};
 
   static std::string ToMessage(Value code) {
     return ErrorText(code);
   }
 };
 
-typedef StatusErrorCodeImpl<QLErrorTag> QLError;
+using QLError = StatusErrorCodeImpl<QLErrorTag>;
 
-}  // namespace ql
-}  // namespace yb
+}  // namespace yb::ql

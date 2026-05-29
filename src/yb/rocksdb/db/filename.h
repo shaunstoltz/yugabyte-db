@@ -3,9 +3,9 @@
 //  LICENSE file in the root directory of this source tree. An additional grant
 //  of patent rights can be found in the PATENTS file in the same directory.
 //
-// The following only applies to changes made to this file as part of YugaByte development.
+// The following only applies to changes made to this file as part of YugabyteDB development.
 //
-// Portions Copyright (c) YugaByte, Inc.
+// Portions Copyright (c) YugabyteDB, Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License"); you may not use this file except
 // in compliance with the License.  You may obtain a copy of the License at
@@ -71,7 +71,8 @@ extern std::string ArchivalDirectory(const std::string& dbname);
 extern std::string ArchivedLogFileName(const std::string& dbname,
                                        uint64_t num);
 
-extern std::string MakeTableFileName(const std::string& name, uint64_t number);
+std::string MakeTableFileName(const std::string& name, uint64_t number);
+std::string MakeTableDataFilePath(const std::string& path, uint64_t number);
 
 // Return the name of sstable with LevelDB suffix
 // created from RocksDB sstable suffixed name
@@ -89,7 +90,6 @@ extern std::string TableFileName(const std::vector<DbPath>& db_paths,
 
 // Return data file name of the sstable for specific base file name.
 extern std::string TableBaseToDataFileName(const std::string& base_fname);
-
 // Sufficient buffer size for FormatFileNumber.
 const size_t kFormatFileNumberBufSize = 38;
 

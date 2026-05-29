@@ -1,16 +1,19 @@
-// Copyright (c) YugaByte, Inc.
+// Copyright (c) YugabyteDB, Inc.
 
 package scheduler
 
 import (
 	"context"
+	"node-agent/app/executor"
 	"testing"
 	"time"
 )
 
 func TestScheduler(t *testing.T) {
 	ctx, cancelFunc := context.WithCancel(context.Background())
-	instance := GetInstance(ctx)
+	executor.Init(ctx)
+	Init(ctx)
+	instance := GetInstance()
 	ch := make(chan int, 1)
 	start := time.Now()
 	instance.Schedule(ctx, time.Second*2, func(ctx context.Context) (any, error) {
@@ -19,14 +22,10 @@ func TestScheduler(t *testing.T) {
 	})
 	count := 0
 	maxCount := 3
-loop:
-	for {
-		select {
-		case <-ch:
-			count++
-			if count >= maxCount {
-				break loop
-			}
+	for range ch {
+		count++
+		if count >= maxCount {
+			break
 		}
 	}
 	elapasedTime := time.Since(start)

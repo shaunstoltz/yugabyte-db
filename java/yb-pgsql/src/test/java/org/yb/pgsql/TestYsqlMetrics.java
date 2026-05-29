@@ -1,4 +1,4 @@
-// Copyright (c) YugaByte, Inc.
+// Copyright (c) YugabyteDB, Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License"); you may not use this file except
 // in compliance with the License.  You may obtain a copy of the License at
@@ -13,11 +13,15 @@
 
 package org.yb.pgsql;
 
+import static org.junit.Assume.assumeFalse;
 import static org.yb.AssertionWrappers.*;
+import static org.yb.util.BuildTypeUtil.isSanitizerBuild;
 
 import java.sql.Connection;
 import java.sql.ResultSet;
 import java.sql.Statement;
+import java.util.Arrays;
+import java.util.Map;
 
 import org.apache.commons.lang3.time.StopWatch;
 import org.junit.Test;
@@ -25,21 +29,80 @@ import org.junit.runner.RunWith;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
-import org.yb.util.YBTestRunnerNonTsanOnly;
+import org.yb.YBTestRunner;
 
 import org.yb.minicluster.MiniYBCluster;
 
-@RunWith(value=YBTestRunnerNonTsanOnly.class)
+@RunWith(value=YBTestRunner.class)
 public class TestYsqlMetrics extends BasePgSQLTest {
   private static final Logger LOG = LoggerFactory.getLogger(TestYsqlMetrics.class);
 
+  private static final String PEAK_MEM_FIELD = "Peak Memory Usage";
+
+  @Override
+  protected Map<String, String> getTServerFlags() {
+    Map<String, String> flagMap = super.getTServerFlags();
+    // Disable auto analyze because it introduces flakiness in metric numbers.
+    flagMap.put("ysql_enable_auto_analyze", "false");
+    return flagMap;
+  }
+
   @Test
   public void testMetrics() throws Exception {
+    // Rotate deterministically between a pool of CONN_MGR_WARMUP_BACKEND_COUNT
+    // physical connections, we will be testing the metrics during set-up as
+    // well as steady state with Connection Manager enabled.
+    setConnMgrWarmupModeAndRestartCluster(ConnectionManagerWarmupMode.ROUND_ROBIN);
     Statement statement = connection.createStatement();
+    // The first DDL that requires table oid allocation will build a hash table
+    // by executing a query SELECT relfilenode FROM pg_class where relfilenode >= 16384.
+    // To avoid this internal query to affect metrics, create a dummy table first.
+    statement.execute("CREATE TABLE dummy_table(id int)");
+
+    // Some additional queries to allow for more accurate testing with YSQL
+    // Connection Manager. The following code block is responsible for:
+    // 1. Asserting Connection Manager's behavior while setting up new
+    //    physical connections.
+    // 2. Allowing Connection Manager to reach steady state behavior on the
+    //    connection being used throughout the rest of the test.
+    //    Connection Manager query metrics should not differ from those of the
+    //    Postgres port query metrics after achieving steady state.
+    if (isTestRunningWithConnectionManager()) {
+      // Queries issued so far are routed round-robin across backends (S1, S2, S3, ...):
+      //   SET application_name=...      -> S1  (sets application_name)
+      //   SET extra_float_digits=...    -> S2  (sets application_name + extra_float_digits)
+      //   GRANT ALL ON SCHEMA public... -> S3  (sets application_name + extra_float_digits)
+      //   CREATE TABLE dummy_table...   -> S1  (sets extra_float_digits; application_name
+      //                                         was already set on S1's first visit)
+      //
+      // After these 4 queries S1, S2, and S3 all have both GUCs in sync with the client
+      // cache, so CONN_MGR_WARMUP_BACKEND_COUNT == 3 is already at steady state.
+      //
+      // For CONN_MGR_WARMUP_BACKEND_COUNT >= 4, backends S4..SN have never been visited,
+      // so conn mgr would set application_name and extra_float_digits (2 setup queries).
+      // Additionally, after visiting S4..SN the round-robin returns to S1, which still
+      // needs extra_float_digits (1 setup query) to bring it steady state. This is
+      // because S1 was the very first backend visited, when only application_name was
+      // in the client's GUC cache.
+      for (int i = 0; i < CONN_MGR_WARMUP_BACKEND_COUNT - 4; i++) {
+        verifyStatementMetric(statement, "SELECT 1", OTHER_STMT_METRIC, 2, 0, 1, true);
+      }
+      if (CONN_MGR_WARMUP_BACKEND_COUNT >= 4) {
+        // This will go on S1 to set extra_float_digits.
+        verifyStatementMetric(statement, "SELECT 1", OTHER_STMT_METRIC, 1, 0, 1, true);
+      }
+
+      // The client's GUC cache should now match each of the servers' caches.
+      // Subsequent queries should not require any "setup" queries while
+      // forwarding the client queries to the server.
+      for (int i = 0; i < CONN_MGR_WARMUP_BACKEND_COUNT; i++) {
+        verifyStatementMetric(statement, "SELECT 1", OTHER_STMT_METRIC, 0, 0, 1, true);
+      }
+    }
 
     // DDL is non-txn.
     verifyStatementMetric(statement, "CREATE TABLE test (k int PRIMARY KEY, v int)",
-                          OTHER_STMT_METRIC, 1, 0, 1, true);
+                      OTHER_STMT_METRIC, 1, 0, 1, true);
 
     // Select uses txn.
     verifyStatementMetric(statement, "SELECT * FROM test",
@@ -101,7 +164,7 @@ public class TestYsqlMetrics extends BasePgSQLTest {
     // Set session variable in transaction block.
     verifyStatementMetric(statement, "BEGIN",
                           BEGIN_STMT_METRIC, 1, 0, 0, true);
-    verifyStatementMetric(statement, "SET yb_debug_report_error_stacktrace=true;",
+    verifyStatementMetric(statement, "SET yb_debug_log_docdb_error_backtrace=true;",
                           OTHER_STMT_METRIC, 1, 0, 0, true);
     verifyStatementMetric(statement, "COMMIT",
                           COMMIT_STMT_METRIC, 1, 0, 1, true);
@@ -207,7 +270,18 @@ public class TestYsqlMetrics extends BasePgSQLTest {
 
   @Test
   public void testMetricRows() throws Exception {
-    try (Statement stmt = connection.createStatement()) {
+    // Reason for skipping the test with Connection Manager is mentioned in the test below wherever
+    // it fails.
+    skipYsqlConnMgr(CATALOG_CACHE_MISS_NEED_UNIQUE_PHYSICAL_CONN);
+    try (Statement stmt = getConnectionBuilder()
+                          .withConnectionEndpoint(ConnectionEndpoint.DEFAULT)
+                          .connect()
+                          .createStatement()) {
+
+      // With Ysql Connection Manager, extra SET stmts are being executed which are counted under
+      // OTHER_STMT_METRIC leading to increase in count which are:
+      // SET datestyle=E'ISO', SET extra_float_digits=E'3',
+      // SET application_name=E'PostgreSQL JDBC Driver', CREATE TABLE test(), RESET ALL;
       verifyStatementMetricRows(
         stmt,"CREATE TABLE test (k INT PRIMARY KEY, v INT)",
         OTHER_STMT_METRIC, 1, 0);
@@ -242,9 +316,9 @@ public class TestYsqlMetrics extends BasePgSQLTest {
         DELETE_STMT_METRIC, 1, 8);
 
       // Testing catalog cache.
-      long miss_init = getMetricCounter(CATALOG_CACHE_MISSES_METRICS);
+      long miss_init = getMetricCounter(CATALOG_CACHE_MISSES_METRICS_DEPRECATED);
       stmt.execute("SELECT ln(2)");
-      long miss1 = getMetricCounter(CATALOG_CACHE_MISSES_METRICS);
+      long miss1 = getMetricCounter(CATALOG_CACHE_MISSES_METRICS_DEPRECATED);
 
       // Misses should strictly increase, we check that miss1 >= miss_init + 1.
       assertGreaterThanOrEqualTo(
@@ -255,14 +329,19 @@ public class TestYsqlMetrics extends BasePgSQLTest {
 
       // Lookups done to resolve ln should've been cached.
       stmt.execute("SELECT ln(2)");
-      long miss2 = getMetricCounter(CATALOG_CACHE_MISSES_METRICS);
+      long miss2 = getMetricCounter(CATALOG_CACHE_MISSES_METRICS_DEPRECATED);
+      // With Connection Manager, the below assertion fails if test runs in RANDOM mode as the
+      // query "SELECT ln(2)" would run or get cached on a different physical connections when ran
+      // first and second time, due to which the CATALOG_CACHE_MISSES_METRICS result would be
+      // different each time.
       assertEquals(miss1, miss2);
 
       // Invalidate the cached resolution for ln from another connection.
       Connection connection2 = getConnectionBuilder().connect();
       try (Statement stmt2 = connection2.createStatement()) {
 
-        long misses_before_second_cxn_call = getMetricCounter(CATALOG_CACHE_MISSES_METRICS);
+        long misses_before_second_cxn_call = getMetricCounter(
+          CATALOG_CACHE_MISSES_METRICS_DEPRECATED);
         assertGreaterThanOrEqualTo(
             String.format("Misses shouldn't decrease after making a new " +
                         "connection. Before: %d, After %d",
@@ -275,7 +354,12 @@ public class TestYsqlMetrics extends BasePgSQLTest {
 
         // Making sure that miss counts from two different connections
         // add onto each other.
-        long misses_after_second_cxn_call = getMetricCounter(CATALOG_CACHE_MISSES_METRICS);
+        long misses_after_second_cxn_call = getMetricCounter(
+          CATALOG_CACHE_MISSES_METRICS_DEPRECATED);
+        // With Connection Manager, the below assertion fails if test runs in NONE mode as the
+        // query "SELECT ln(2)" has already been cached for stmt2 by stmt1 due to sharing of the
+        // same physical connection. This does not allow the number of cache misses to increase
+        // as otherwise expected.
         assertGreaterThanOrEqualTo(
             String.format("Expected misses to increase after " +
                         "second connection's first cache miss. Before: %d, After %d",
@@ -286,14 +370,16 @@ public class TestYsqlMetrics extends BasePgSQLTest {
 
         // Make a type that should invalid cached resolution for ln.
         stmt2.execute("CREATE TYPE ln AS (a INTEGER)");
-        long misses_post_invalidate_before = getMetricCounter(CATALOG_CACHE_MISSES_METRICS);
+        long misses_post_invalidate_before = getMetricCounter(
+          CATALOG_CACHE_MISSES_METRICS_DEPRECATED);
 
         // Wait for catalog change to register, needed in debug mode.
         Thread.sleep(5 * MiniYBCluster.TSERVER_HEARTBEAT_INTERVAL_MS);
 
         // This should miss on the cache now and cause a master lookup.
         stmt.execute("SELECT ln(2)");
-        long misses_post_invalidate_after = getMetricCounter(CATALOG_CACHE_MISSES_METRICS);
+        long misses_post_invalidate_after = getMetricCounter(
+          CATALOG_CACHE_MISSES_METRICS_DEPRECATED);
         assertGreaterThanOrEqualTo(
             String.format("Expected misses to increase after " +
                         "cache invalidation. Before: %d, After %d",
@@ -305,7 +391,8 @@ public class TestYsqlMetrics extends BasePgSQLTest {
         stmt.execute("SELECT ln(2)");
 
         // No misses should occur again.
-        long misses_post_invalidate_after2 = getMetricCounter(CATALOG_CACHE_MISSES_METRICS);
+        long misses_post_invalidate_after2 = getMetricCounter(
+          CATALOG_CACHE_MISSES_METRICS_DEPRECATED);
         assertEquals(misses_post_invalidate_after, misses_post_invalidate_after2);
       }
     }
@@ -432,11 +519,20 @@ public class TestYsqlMetrics extends BasePgSQLTest {
     }
   }
 
+  long getAverage(long[] arr, int start_ind, int end_ind) {
+    long sum = 0;
+    for (int i = start_ind; i < end_ind; i++) {
+      sum += arr[i];
+    }
+    return sum / (end_ind - start_ind);
+  }
+
   /**
    * This test does memory stats verification in EXPLAIN ANALYZE's output.
    * First, it does a rough validation on the stats by comparing queries that consume different
    * amounts of memory and validating their max memory outputs.
-   * Second, it does a more accurate validation on the stats against the sorting memory, to validate
+   * Second, it runs a query many times, checking for consistency on the max memory output.
+   * Third, it does a more accurate validation on the stats against the sorting memory, to validate
    * that max memory is slightly higher than sorting's memory.
    * It also does basic tests to ensure the newly added cutomized logic
    * for memory stats doesn't break existing EXPLAIN ANALYZE's execution for DDLs.
@@ -477,16 +573,35 @@ public class TestYsqlMetrics extends BasePgSQLTest {
       // If the tracking logic is not accurate and has errors, it will accumulate and shows in the
       // output.
       {
-        final long maxMemSimpleStart = runExplainAnalyze(statement, 1000);
+        final int N_WARMUP_RUNS = 5;
+        final int N_INITIAL_RUNS = 10;
+        final int N_UNMEASURED_RUNS = isSanitizerBuild() ? 10 : 80;
+        final int N_FINAL_RUNS = 10;
+        final int N_TOTAL_RUNS = N_INITIAL_RUNS + N_UNMEASURED_RUNS + N_FINAL_RUNS;
+        final int LIMIT = 1000;
+        final double TOLERANCE = 0.05;
 
-        final String query = buildExplainAnalyzeDemoQuery(1000);
-        int loopN = 100;
-        while (loopN-- > 0) {
-          statement.executeQuery(query);
+        for (int i = 0; i < N_WARMUP_RUNS; i++) {
+          runExplainAnalyze(statement, LIMIT);
         }
 
-        final long maxMemSimpleEnd = runExplainAnalyze(statement, 1000);
-        assertEquals(maxMemSimpleEnd, maxMemSimpleStart);
+        long[] max_memories = new long[N_TOTAL_RUNS];
+        for (int i = 0; i < N_TOTAL_RUNS; i++) {
+          max_memories[i] = runExplainAnalyze(statement, LIMIT);
+        }
+
+        String max_memory_str = Arrays.toString(max_memories);
+
+        long initial_avg = getAverage(max_memories, 0, N_INITIAL_RUNS);
+        long final_avg = getAverage(max_memories, N_TOTAL_RUNS - N_FINAL_RUNS, N_TOTAL_RUNS);
+
+        if (initial_avg > final_avg * (1.0 + TOLERANCE) ||
+            initial_avg < final_avg * (1.0 - TOLERANCE)) {
+          throw new Exception(
+            String.format("Expected average memory to be consistent between first %d runs (%dkB)" +
+                          "and last %d runs (%dkB). Got measurements %s",
+                          N_INITIAL_RUNS, initial_avg, N_FINAL_RUNS, final_avg, max_memory_str));
+        }
       }
 
       // Run an accurate max-memory validation by including a single memory consumption operator
@@ -522,6 +637,24 @@ public class TestYsqlMetrics extends BasePgSQLTest {
   }
 
   /**
+   * Test "Peak Memory" is not shown in EXPLAIN ANALYZE when yb_enable_memory_tracking
+   * flag is off.
+   * @throws Exception
+   */
+  @Test
+  public void testExplainPeakMemWhenMemoryTrackingOff() throws Exception {
+    try (Statement statement = connection.createStatement()) {
+      statement.execute("SET yb_enable_memory_tracking = OFF");
+      final String query = "EXPLAIN (ANALYZE) SELECT 1";
+      ResultSet result = statement.executeQuery(query);
+      while(result.next()) {
+        final String row = result.getString(1);
+        assertFalse(row.contains(PEAK_MEM_FIELD));
+      }
+    }
+  }
+
+  /**
    * Validate the EXPLAIN ANALYZE output, and return maximum memory consumption found.
    **/
   private long runExplainAnalyze(Statement statement, final int limit) throws Exception {
@@ -541,7 +674,7 @@ public class TestYsqlMetrics extends BasePgSQLTest {
   private long findMaxMemInExplain(final ResultSet result) throws Exception {
     while(result.next()) {
       final String row = result.getString(1);
-      if (row.contains("Peak Memory Usage")) {
+      if (row.contains(PEAK_MEM_FIELD)) {
         final String[] tks = row.split(" ");
         long maxMem = Long.valueOf(tks[tks.length - 2]);
         return maxMem;

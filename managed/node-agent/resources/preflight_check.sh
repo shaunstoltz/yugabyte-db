@@ -1,6 +1,6 @@
 #!/bin/bash
 #
-# Copyright 2020 YugaByte, Inc. and Contributors
+# Copyright 2020 YugabyteDB, Inc. and Contributors
 #
 # Licensed under the Polyform Free Trial License 1.0.0 (the "License"); you
 # may not use this file except in compliance with the License. You
@@ -8,12 +8,17 @@
 #
 # https://github.com/YugaByte/yugabyte-db/blob/master/licenses/POLYFORM-FREE-TRIAL-LICENSE-1.0.0.txt
 
+# DEPRECATED: This script is deprecated and will be removed in a future release in favor of YNP preflight checks.
+# Please do not make any new changes to this file.
+
 check_type="provision"
+node_agent_mode=false
 airgap=false
 install_node_exporter=true
 skip_ntp_check=false
 mount_points=""
 yb_home_dir="/home/yugabyte"
+yb_user_home="/home/yugabyte"
 # This should be a comma separated key-value list. Associative arrays were add in bash 4.0 so
 # they might not exist in the provided instance depending on how old it is.
 result_kvs=""
@@ -21,10 +26,36 @@ ssh_port=""
 package_manager_cmd=""
 is_aarch64=false
 is_debian=false
+is_sles=false
+master_http_port="7000"
+master_rpc_port="7100"
+tserver_http_port="9000"
+tserver_rpc_port="9100"
+yb_controller_http_port="14000"
+yb_controller_rpc_port="18018"
+redis_server_http_port="11000"
+redis_server_rpc_port="6379"
+ycql_server_http_port="12000"
+ycql_server_rpc_port="9042"
+ysql_server_http_port="13000"
+ysql_server_rpc_port="5433"
+node_exporter_port="9300"
+
+PYTHON_EXECUTABLES=('python3.6' 'python3' 'python3.7' 'python3.8' 'python')
+PYTHON_EXECUTABLE=""
+# Set python executable
+set_python_executable() {
+  for py_executable in "${PYTHON_EXECUTABLES[@]}"; do
+    if which "$py_executable" > /dev/null 2>&1; then
+      PYTHON_EXECUTABLE="$py_executable"
+      export PYTHON_EXECUTABLE
+      return
+    fi
+  done
+}
+set_python_executable
 
 preflight_provision_check() {
-
-
   # Check for internet access.
   if [[ "$airgap" = false ]]; then
     # Attempt to run "/dev/tcp" 3 times with a 3 second timeout and return success if any succeed.
@@ -61,6 +92,7 @@ preflight_provision_check() {
 
     check_free_space "prometheus_space" "/opt/prometheus"
     check_free_space "tmp_dir_space" "/tmp"
+    check_port "node_exporter_port" "$node_exporter_port"
   fi
 
   # Check ulimit settings.
@@ -91,6 +123,14 @@ preflight_provision_check() {
     update_result_json "sudo_access" true
   else
     update_result_json "sudo_access" false
+  fi
+
+  # Check Locale
+  result=$(locale -a | grep -q -E "en_US.utf8|en_US.UTF-8")
+  if [[ "$?" -eq 0 ]]; then
+    update_result_json "locale_present" true
+  else
+    update_result_json "locale_present" false
   fi
 }
 
@@ -126,10 +166,20 @@ check_ntp_synchronization() {
     # Check if one of chronyd, ntpd and systemd-timesyncd is running on the node
     service_regex="Active: active \(running\)"
     service_check=false
+    skew_ms=500
     for ntp_service in chronyd ntp ntpd systemd-timesyncd; do
       service_status=$(systemctl status $ntp_service)
       if [[ $service_status =~ $service_regex ]]; then
         service_check=true
+        if [[ $ntp_service == "chronyd" ]]; then
+          chrony_tracking="$(chronyc tracking)"
+          skew=$(echo "${chrony_tracking}" | awk "/System time/ {print \$4}")
+          skew_ms=$("${PYTHON_EXECUTABLE}" -c "print(int(${skew} * 1000))")
+        elif [[ $ntp_service == "ntp" || $ntp_service == "ntpd" ]]; then
+          skew_ms=$(ntpq -p | awk '$1 ~ "^*" {print $9}')
+        elif [[ $ntp_service == "systemd-timesyncd" ]]; then
+          skew_ms=0
+        fi
         break
       fi
     done
@@ -137,6 +187,11 @@ check_ntp_synchronization() {
       update_result_json "ntp_service_status" true
     else
       update_result_json "ntp_service_status" false
+    fi
+    if awk "BEGIN{exit !(${skew_ms} < 400)}"; then
+      update_result_json "ntp_skew" true
+    else
+      update_result_json "ntp_skew" false
     fi
   fi
 }
@@ -151,10 +206,26 @@ check_yugabyte_user() {
   update_result_json "user_group" "$result"
 }
 
+find_yb_user_home() {
+  if id -u "yugabyte" >/dev/null 2>&1; then
+    yb_user_home=$(getent passwd yugabyte | cut -d: -f6 2>&1)
+    if [[ -z "$yb_user_home" ]]; then
+      echo "FATAL: Could not find home directory for user yugabyte"
+      exit 1
+    else
+      echo "$yb_user_home"
+    fi
+  else
+    echo "$yb_user_home"
+  fi
+}
+
 check_packages_installed() {
 
   check_package_installed "openssl" # Required.
-  check_package_installed "policycoreutils" # Required.
+  if [[ "$is_sles" = false ]]; then
+    check_package_installed "policycoreutils" # Required (not available on SLES).
+  fi
   check_package_installed "rsync" # Optional.
   check_package_installed "xxhash" # Optional.
 
@@ -187,15 +258,13 @@ check_binaries_installed() {
 
 check_binary_installed() {
   binary_name=$1
-  binary_exists=false
-  result="type -P $binary_name | grep $binary_name"
-  if [[ -n "$result" ]]; then
-    binary_exists=true
-  fi
-  update_result_json "$binary_name" "$binary_exists"
+  command -v $binary_name >/dev/null 2>&1;
+  update_result_json_with_rc "$binary_name" "$?"
 }
 
 preflight_configure_check() {
+
+  check_yugabyte_user
 
   check_packages_installed
 
@@ -211,9 +280,13 @@ preflight_configure_check() {
 
 
   # Check that node exporter is listening on correct port (default: 9300).
-  node_exporter_port=$(ps -ef | grep "node_exporter" | grep -v "grep" |
+  running_port=$(ps -ef | grep "node_exporter" | grep -v "grep" |
             grep -v "preflight" | grep -oP '(?<=web.listen-address=:)\w+')
-  update_result_json "node_exporter_port" "$node_exporter_port"
+  check_passed=false
+  if [[ "$running_port" == "$node_exporter_port" ]]; then
+    check_passed=true
+  fi
+  update_result_json "node_exporter_port:$node_exporter_port" "$check_passed"
 
   # Check swappiness (optional).
   swappiness=$(cat /proc/sys/vm/swappiness)
@@ -227,13 +300,9 @@ preflight_configure_check() {
   ulimit_user_processes=$(ulimit -u)
   update_result_json "ulimit_user_processes" "$ulimit_user_processes"
 
-  # Check systemd sudoers.
-  timeout 5 /bin/systemctl --no-ask-password enable yb-master
-  if [[ "$?" = 0 ]]; then
-    update_result_json "systemd_sudoer_entry" true
-  else
-    update_result_json "systemd_sudoer_entry" false
-  fi
+  # Check virtual memory max map limit.
+  vm_max_map_count=$(cat /proc/sys/vm/max_map_count 2> /dev/null)
+  update_result_json "vm_max_map_count" "${vm_max_map_count:-0}"
 }
 
 preflight_all_checks() {
@@ -244,31 +313,26 @@ preflight_all_checks() {
   fi
   update_result_json "python_version" "$result"
 
-  # Check home directory exists.
-  if [[ -d "$yb_home_dir" ]]; then
-    update_result_json "home_dir_exists" true
-  else
-    update_result_json "home_dir_exists" false
-  fi
+  yb_user_home=$(find_yb_user_home)
 
   # Check all the communication ports
-  check_port "master_http_port" "7000"
-  check_port "master_rpc_port" "7100"
-  check_port "tserver_http_port" "9000"
-  check_port "tserver_rpc_port" "9100"
-  check_port "yb_controller_http_port" "14000"
-  check_port "yb_controller_rpc_port" "18018"
-  check_port "redis_server_http_port" "11000"
-  check_port "redis_server_rpc_port" "6379"
-  check_port "yql_server_http_port" "12000"
-  check_port "yql_server_rpc_port" "9042"
-  check_port "ysql_server_http_port" "13000"
-  check_port "ysql_server_rpc_port" "5433"
+  check_port "master_http_port" "$master_http_port"
+  check_port "master_rpc_port" "$master_rpc_port"
+  check_port "tserver_http_port" "$tserver_http_port"
+  check_port "tserver_rpc_port" "$tserver_rpc_port"
+  check_port "yb_controller_http_port" "$yb_controller_http_port"
+  check_port "yb_controller_rpc_port" "$yb_controller_rpc_port"
+  check_port "redis_server_http_port" "$redis_server_http_port"
+  check_port "redis_server_rpc_port" "$redis_server_rpc_port"
+  check_port "ycql_server_http_port" "$ycql_server_http_port"
+  check_port "ycql_server_rpc_port" "$ycql_server_rpc_port"
+  check_port "ysql_server_http_port" "$ysql_server_http_port"
+  check_port "ysql_server_rpc_port" "$ysql_server_rpc_port"
 
   # Check mount points volume size.
   IFS="," read -ra mount_points_arr <<< "$mount_points"
   for path in "${mount_points_arr[@]}"; do
-    volume=$(df -m "$path" | awk 'FNR == 2 {print $4}' 2>&1)
+    volume=$(df -B1G "$path" | awk 'FNR == 2 {print $4}' 2>&1)
     update_result_json "mount_points_volume:$path" "$volume"
   done
 
@@ -280,10 +344,44 @@ preflight_all_checks() {
 
   check_ntp_synchronization
 
-  check_yugabyte_user
-
   check_free_space "home_dir_space" "$yb_home_dir"
 
+  # Check whether files in home directory are cleaned up if exists.
+  # Finds all files including the .yugabytedb folder and ignores other dot files, node-agent files.
+  yb_home_dir_clean=true
+  if [[ -e "$yb_home_dir" ]]; then
+    if [[ "$check_type" == "provision" ]]; then
+      files=$(sudo find "$yb_home_dir" -maxdepth 1 -mindepth 1  -name "bin" -o -name ".yugabytedb" -o -name "controller" -o -name "master" -o -name "tserver")
+    else
+      files=$(find "$yb_home_dir" -maxdepth 1 -mindepth 1  -name "bin" -o -name ".yugabytedb" -o -name "controller" -o -name "master" -o -name "tserver")
+    fi
+    if [[ -n "$files" ]]; then
+      yb_home_dir_clean=false
+    fi
+  fi
+  update_result_json "yb_home_dir_clean" "$yb_home_dir_clean"
+
+  # Check whether files in data directory are cleaned up.
+  data_dir_clean=true
+  processes=("tserver" "master" "controller")
+  IFS="," read -ra mount_points_arr <<< "$mount_points"
+  for path in "${mount_points_arr[@]}"; do
+    if [ -e "$path/pg_data" ]; then
+      data_dir_clean=false
+      break
+    fi
+    if [ -e "$path/ybc-data" ]; then
+      data_dir_clean=false
+      break
+    fi
+    for daemon in "${processes[@]}"; do
+      if [ -e "$path/yb-data/$daemon" ]; then
+        data_dir_clean=false
+        break
+      fi
+    done
+  done
+  update_result_json "data_dir_clean" "$data_dir_clean"
 }
 
 check_port() {
@@ -295,7 +393,6 @@ check_port() {
     check_passed=false
   fi
   update_result_json "$name:$port" "$check_passed"
-
 }
 
 # Checks if given filepath is writable.
@@ -316,13 +413,13 @@ check_free_space() {
     path=$(dirname "$path")
   fi
 
-  result=$(df -m "$path" 2>&1)
+  result=$(df -B1G "$path" 2>&1)
 
   # If parent does not exist, set space to 0.
   if [ $? == "1" ]; then
     update_result_json "$test_type:$path" 0
   else
-    result=$(df -m "$path" | awk 'FNR == 2 {print $4}' 2>&1)
+    result=$(df -B1G "$path" | awk 'FNR == 2 {print $4}' 2>&1)
     update_result_json "$test_type:$path" "$result"
   fi
 }
@@ -349,8 +446,10 @@ setup() {
     package_manager_cmd="yum list installed"
   elif [ -n "$(command -v apt-get)" ]; then
     package_manager_cmd="apt list --installed"
+  elif [ -n "$(command -v zypper)" ]; then
+    package_manager_cmd="zypper search --installed-only"
   else
-    err_msg "Yum and Apt do not exist"
+    err_msg "Yum, Apt, and Zypper do not exist"
     exit 1
   fi
 
@@ -360,10 +459,16 @@ setup() {
     is_aarch64=true
   fi
 
+  os_id=$(grep '^ID=' /etc/os-release | cut -d= -f2 \
+        | sed -e 's/^"//' -e 's/"$//' | tr '[:upper:]' '[:lower:]')
   # Determine whether we are using Debian linux distribution.
-  if [[ $(grep '^ID=' /etc/os-release |  cut -d= -f2 |
-        sed -e 's/^"//' -e 's/"$//') = 'debian' ]]; then
+  if [[ "$os_id" = 'debian' ]]; then
     is_debian=true
+  fi
+
+  # Determine whether we are using SLES/SUSE linux distribution.
+  if [[ "$os_id" = 'sles' || "$os_id" = 'suse' || "$os_id" = 'opensuse' ]]; then
+    is_sles=true
   fi
 }
 
@@ -414,6 +519,9 @@ while [[ $# -gt 0 ]]; do
       check_type="$2"
       shift
     ;;
+    --node_agent_mode)
+      node_agent_mode=true
+    ;;
     --airgap)
       airgap=true
     ;;
@@ -427,12 +535,66 @@ while [[ $# -gt 0 ]]; do
       mount_points="$2"
       shift
     ;;
+    --master_http_port)
+      master_http_port="$2"
+      shift
+    ;;
+    --master_rpc_port)
+      master_rpc_port="$2"
+      shift
+    ;;
+    --tserver_http_port)
+      tserver_http_port="$2"
+      shift
+    ;;
+    --tserver_rpc_port)
+      tserver_rpc_port="$2"
+      shift
+    ;;
+    --yb_controller_http_port)
+      yb_controller_http_port="$2"
+      shift
+    ;;
+    --yb_controller_rpc_port)
+      yb_controller_rpc_port="$2"
+      shift
+    ;;
+    --redis_server_http_port)
+      redis_server_http_port="$2"
+      shift
+    ;;
+    --redis_server_rpc_port)
+      redis_server_rpc_port="$2"
+      shift
+    ;;
+    --ycql_server_http_port)
+      ycql_server_http_port="$2"
+      shift
+    ;;
+    --ycql_server_rpc_port)
+      ycql_server_rpc_port="$2"
+      shift
+    ;;
+    --ysql_server_http_port)
+      ysql_server_http_port="$2"
+      shift
+    ;;
+    --ysql_server_rpc_port)
+      ysql_server_rpc_port="$2"
+      shift
+    ;;
+    --node_exporter_port)
+      node_exporter_port="$2"
+      shift
+    ;;
     --ssh_port)
       ssh_port="$2"
       shift
     ;;
     --yb_home_dir)
       yb_home_dir=${2//\'/}
+      # Normalize the path.
+      yb_home_dir=$(readlink -m "$yb_home_dir" 2>&1)
       shift
     ;;
     --cleanup)
@@ -460,4 +622,19 @@ else
   preflight_configure_check >/dev/null 2>&1
 fi
 
-echo "{$result_kvs}"
+if [[ "$node_agent_mode" == "false" ]]; then
+  python - "{$result_kvs}" <<EOF
+import json
+import sys
+dict=json.loads(sys.argv[1])
+keys = list(dict.keys())
+keys.sort()
+idx = 1
+for key in keys:
+  val = dict[key].get("value")
+  print('{}. {} is {}'.format(idx, key, val))
+  idx += 1
+EOF
+else
+  echo "{$result_kvs}"
+fi

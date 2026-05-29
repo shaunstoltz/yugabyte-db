@@ -1,5 +1,5 @@
 //--------------------------------------------------------------------------------------------------
-// Copyright (c) YugaByte, Inc.
+// Copyright (c) YugabyteDB, Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License"); you may not use this file except
 // in compliance with the License.  You may obtain a copy of the License at
@@ -17,11 +17,13 @@
 //--------------------------------------------------------------------------------------------------
 #include "yb/yql/cql/ql/util/errcodes.h"
 
+#include <unordered_map>
+#include <utility>
+
 #include "yb/common/ql_protocol.pb.h"
 #include "yb/util/enums.h"
 
-namespace yb {
-namespace ql {
+namespace yb::ql {
 
 const std::unordered_map<ErrorCode, const char*, EnumHash> kQLErrorMessage {
   //------------------------------------------------------------------------------------------------
@@ -84,7 +86,6 @@ const std::unordered_map<ErrorCode, const char*, EnumHash> kQLErrorMessage {
   { ErrorCode::DUPLICATE_TYPE, "Duplicate Type" },
   { ErrorCode::DUPLICATE_TYPE_FIELD, "Duplicate Type Field" },
   { ErrorCode::ALTER_KEY_COLUMN, "Alter key column" },
-  { ErrorCode::INCOMPATIBLE_COPARTITION_SCHEMA, "Incompatible Copartition Schema" },
   { ErrorCode::INVALID_ROLE_DEFINITION, "Invalid Role Definition" },
   { ErrorCode::DUPLICATE_ROLE, "Duplicate Role"},
   { ErrorCode::NULL_IN_COLLECTIONS, "null is not supported inside collections"},
@@ -122,7 +123,7 @@ ErrorCode GetErrorCode(const Status& s) {
 const char *ErrorText(const ErrorCode error_code) {
   auto it = kQLErrorMessage.find(error_code);
   if (it == kQLErrorMessage.end()) {
-    LOG(DFATAL) << "Unknown error code: " << to_underlying(error_code);
+    LOG(DFATAL) << "Unknown error code: " << std::to_underlying(error_code);
     return "Unknown error";
   }
   return it->second;
@@ -154,10 +155,4 @@ ErrorCode QLStatusToErrorCode(QLResponsePB::QLStatus status) {
   FATAL_INVALID_ENUM_VALUE(QLResponsePB::QLStatus, status);
 }
 
-static const std::string kQLErrorCategoryName = "ql error";
-
-static StatusCategoryRegisterer ql_error_category_registerer(
-    StatusCategoryDescription::Make<QLErrorTag>(&kQLErrorCategoryName));
-
-}  // namespace ql
-}  // namespace yb
+}  // namespace yb::ql

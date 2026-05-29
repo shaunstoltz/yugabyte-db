@@ -1,4 +1,4 @@
-// Copyright (c) YugaByte, Inc.
+// Copyright (c) YugabyteDB, Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License"); you may not use this file except
 // in compliance with the License.  You may obtain a copy of the License at
@@ -29,6 +29,7 @@ using namespace std::literals;
 
 DECLARE_int64(transaction_rpc_timeout_ms);
 DECLARE_int32(txn_max_apply_batch_records);
+DECLARE_bool(enable_wait_queues);
 
 namespace yb {
 namespace client {
@@ -37,6 +38,9 @@ class SerializableTxnTest
     : public TransactionCustomLogSegmentSizeTest<0, TransactionTestBase<MiniCluster>> {
  protected:
   void SetUp() override {
+    // This test depends on fail-on-conflict concurrency control to perform its validation.
+    // TODO(wait-queues): https://github.com/yugabyte/yugabyte-db/issues/17871
+    ANNOTATE_UNPROTECTED_WRITE(FLAGS_enable_wait_queues) = false;
     SetIsolationLevel(IsolationLevel::SERIALIZABLE_ISOLATION);
     TransactionTestBase::SetUp();
   }
@@ -238,7 +242,7 @@ void SerializableTxnTest::TestIncrement(int key, bool transactional) {
 // serializable isolation.
 // With retries the resulting value should be equal to number of increments.
 void SerializableTxnTest::TestIncrements(bool transactional) {
-  FLAGS_transaction_rpc_timeout_ms = MonoDelta(1min).ToMilliseconds();
+  ANNOTATE_UNPROTECTED_WRITE(FLAGS_transaction_rpc_timeout_ms) = MonoDelta(1min).ToMilliseconds();
 
   const auto kThreads = RegularBuildVsSanitizers(3, 2);
 
@@ -246,7 +250,6 @@ void SerializableTxnTest::TestIncrements(bool transactional) {
   while (threads.size() != kThreads) {
     int key = narrow_cast<int>(threads.size());
     threads.emplace_back([this, key, transactional] {
-      CDSAttacher attacher;
       TestIncrement(key, transactional);
     });
   }
@@ -311,7 +314,6 @@ void SerializableTxnTest::TestColoring() {
     while (threads.size() != kColors) {
       int32_t color = narrow_cast<int32_t>(threads.size());
       threads.emplace_back([this, color, &successes, kKeys] {
-        CDSAttacher attacher;
         for (;;) {
           auto txn = CreateTransaction();
           LOG(INFO) << "Start: " << txn->id() << ", color: " << color;
@@ -389,7 +391,7 @@ TEST_F(SerializableTxnTest, Coloring) {
 }
 
 TEST_F(SerializableTxnTest, ColoringWithLongApply) {
-  FLAGS_txn_max_apply_batch_records = 3;
+  ANNOTATE_UNPROTECTED_WRITE(FLAGS_txn_max_apply_batch_records) = 3;
   TestColoring();
 }
 

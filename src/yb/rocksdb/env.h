@@ -6,9 +6,9 @@
 // Use of this source code is governed by a BSD-style license that can be
 // found in the LICENSE file. See the AUTHORS file for names of contributors.
 //
-// The following only applies to changes made to this file as part of YugaByte development.
+// The following only applies to changes made to this file as part of YugabyteDB development.
 //
-// Portions Copyright (c) YugaByte, Inc.
+// Portions Copyright (c) YugabyteDB, Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License"); you may not use this file except
 // in compliance with the License.  You may obtain a copy of the License at
@@ -39,6 +39,7 @@
 
 #include "yb/util/file_system.h"
 #include "yb/util/io.h"
+#include "yb/util/monotime.h"
 #include "yb/util/slice.h"
 #include "yb/util/status_fwd.h"
 
@@ -70,11 +71,12 @@
 
 namespace rocksdb {
 
-class FileLock;
 class Logger;
 class Directory;
 struct DBOptions;
 class RateLimiter;
+
+YB_DEFINE_ENUM(TimeResolution, (kMicros)(kNanos));
 
 typedef yb::SequentialFile SequentialFile;
 typedef yb::RandomAccessFile RandomAccessFile;
@@ -257,6 +259,8 @@ class Env {
   virtual Status GetChildren(const std::string& dir,
                              std::vector<std::string>* result) = 0;
 
+  yb::Result<std::vector<std::string>> GetChildren(const std::string& dir);
+
   void GetChildrenWarnNotOk(const std::string& dir,
                             std::vector<std::string>* result);
 
@@ -273,7 +277,8 @@ class Env {
   virtual Status DeleteFile(const std::string& fname) = 0;
 
   // Delete file, print warning on failure.
-  void CleanupFile(const std::string& fname);
+  // Returns true iff file has been deleted.
+  bool CleanupFile(const std::string& fname, const std::string& log_prefix = "");
 
   // Create the specified directory. Returns error if directory exists.
   virtual Status CreateDir(const std::string& dirname) = 0;
@@ -281,6 +286,8 @@ class Env {
   // Creates directory if missing. Return Ok if it exists, or successful in
   // Creating.
   virtual Status CreateDirIfMissing(const std::string& dirname) = 0;
+
+  Status CreateDirs(const std::string& dirname);
 
   // Delete the specified directory.
   virtual Status DeleteDir(const std::string& dirname) = 0;
@@ -377,6 +384,8 @@ class Env {
     return NowMicros() * 1000;
   }
 
+  virtual uint64_t NowCpuCycles() = 0;
+
   // Sleep/delay the thread for the perscribed number of micro-seconds.
   virtual void SleepForMicroseconds(int micros) = 0;
 
@@ -444,6 +453,7 @@ class Directory {
 
 enum InfoLogLevel : unsigned char {
   DEBUG_LEVEL = 0,
+  DETAIL_LEVEL,
   INFO_LEVEL,
   WARN_LEVEL,
   ERROR_LEVEL,
@@ -451,6 +461,24 @@ enum InfoLogLevel : unsigned char {
   HEADER_LEVEL,
   NUM_INFO_LOG_LEVELS,
 };
+
+// Returns true if a message at `message_level` should be logged given a logger
+// configured at `logger_level`. DETAIL_LEVEL is treated as equivalent to
+// INFO_LEVEL for filtering: a logger at INFO will show DETAIL messages and
+// vice versa.
+inline bool ShouldLog(InfoLogLevel message_level, InfoLogLevel logger_level) {
+  if (message_level >= logger_level) {
+    return true;
+  }
+
+  // Special handling for DETAIL_LEVEL.
+  if (message_level == InfoLogLevel::DETAIL_LEVEL && logger_level == InfoLogLevel::INFO_LEVEL) {
+    return true;
+  }
+
+  // Nothing to log in accordance with log levels.
+  return false;
+}
 
 // An interface for writing log messages.
 class Logger {
@@ -511,16 +539,6 @@ class Logger {
 };
 
 
-// Identifies a locked file.
-class FileLock {
- public:
-  FileLock() { }
-  virtual ~FileLock();
- private:
-  // No copying allowed
-  FileLock(const FileLock&);
-  void operator=(const FileLock&);
-};
 
 extern void LogFlush(const std::shared_ptr<Logger>& info_log);
 
@@ -692,6 +710,7 @@ class EnvWrapper : public Env {
   virtual Status NewLogger(const std::string& fname,
                            std::shared_ptr<Logger>* result) override;
   uint64_t NowMicros() override { return target_->NowMicros(); }
+  uint64_t NowCpuCycles() override { return target_->NowCpuCycles(); }
   void SleepForMicroseconds(int micros) override {
     target_->SleepForMicroseconds(micros);
   }
@@ -732,5 +751,15 @@ class EnvWrapper : public Env {
 // when it is no longer needed.
 // *base_env must remain live while the result is in use.
 Env* NewMemEnv(Env* base_env);
+
+constexpr inline uint64_t UnitsInSecond(TimeResolution time_resolution) {
+  switch (time_resolution) {
+    case TimeResolution::kMicros:
+      return yb::MonoTime::kMicrosecondsPerSecond;
+    case TimeResolution::kNanos:
+      return yb::MonoTime::kNanosecondsPerSecond;
+  }
+  FATAL_INVALID_ENUM_VALUE(TimeResolution, time_resolution);
+}
 
 }  // namespace rocksdb

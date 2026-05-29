@@ -1,4 +1,4 @@
-// Copyright (c) YugaByte, Inc.
+// Copyright (c) YugabyteDB, Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License"); you may not use this file except
 // in compliance with the License.  You may obtain a copy of the License at
@@ -13,7 +13,7 @@
 
 #include "yb/master/yql_local_vtable.h"
 
-#include "yb/common/ql_protocol.pb.h"
+#include "yb/common/ql_protocol.messages.h"
 #include "yb/common/ql_type.h"
 #include "yb/common/schema.h"
 
@@ -61,11 +61,11 @@ LocalVTable::LocalVTable(const TableName& table_name,
     : YQLVirtualTable(table_name, namespace_name, master, CreateSchema()) {
 }
 
-Result<std::shared_ptr<QLRowBlock>> LocalVTable::RetrieveData(
-    const QLReadRequestPB& request) const {
+Result<VTableDataPtr> LocalVTable::RetrieveData(
+    const QLReadRequestMsg& request) const {
   vector<std::shared_ptr<TSDescriptor> > descs;
   GetSortedLiveDescriptors(&descs);
-  auto vtable = std::make_shared<QLRowBlock>(schema());
+  auto vtable = std::make_shared<qlexpr::QLRowBlock>(schema());
 
   struct Entry {
     size_t index;
@@ -83,7 +83,7 @@ Result<std::shared_ptr<QLRowBlock>> LocalVTable::RetrieveData(
     ++index;
 
     // This is thread safe since all operations are reads.
-    TSInformationPB ts_info = *desc->GetTSInformationPB();
+    TSInformationPB ts_info = desc->GetTSInformationPB();
 
     // The system.local table contains only a single entry for the host that we are connected
     // to and hence we need to look for the 'remote_endpoint' here.
@@ -107,7 +107,7 @@ Result<std::shared_ptr<QLRowBlock>> LocalVTable::RetrieveData(
   }
 
   for (const auto& entry : entries) {
-    QLRow& row = vtable->Extend();
+    auto& row = vtable->Extend();
     InetAddress private_ip(VERIFY_RESULT(Copy(entry.ips.private_ip_future.get())));
     InetAddress public_ip(VERIFY_RESULT(Copy(entry.ips.public_ip_future.get())));
     const CloudInfoPB& cloud_info = entry.ts_info.registration().common().cloud_info();

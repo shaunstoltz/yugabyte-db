@@ -1,4 +1,4 @@
-// Copyright (c) YugaByte, Inc.
+// Copyright (c) YugabyteDB, Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License"); you may not use this file except
 // in compliance with the License.  You may obtain a copy of the License at
@@ -27,7 +27,7 @@ class YQLEmptyVTable : public YQLVirtualTable {
                           const NamespaceName& namespace_name,
                           const Master* const master,
                           const Schema& schema);
-  Result<std::shared_ptr<QLRowBlock>> RetrieveData(const QLReadRequestPB& request) const override;
+  Result<VTableDataPtr> RetrieveData(const QLReadRequestMsg& request) const override;
 };
 
 }  // namespace master

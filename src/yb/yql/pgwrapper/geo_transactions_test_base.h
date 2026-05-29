@@ -1,4 +1,4 @@
-// Copyright (c) YugaByte, Inc.
+// Copyright (c) YugabyteDB, Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License"); you may not use this file except
 // in compliance with the License.  You may obtain a copy of the License at
@@ -24,40 +24,59 @@ namespace yb {
 
 namespace client {
 
+YB_DEFINE_ENUM(ExpectedLocality, (kLocal)(kGlobal)(kNoCheck));
+YB_STRONGLY_TYPED_BOOL(SetGlobalTransactionsGFlag);
+YB_STRONGLY_TYPED_BOOL(SetGlobalTransactionSessionVar);
+YB_STRONGLY_TYPED_BOOL(WaitForHashChange);
+YB_STRONGLY_TYPED_BOOL(InsertToLocalFirst);
+
 class TransactionManager;
 class TransactionPool;
 
 class GeoTransactionsTestBase : public pgwrapper::PgMiniTestBase {
  public:
-  static constexpr auto kTablePrefix = "test";
+  static const inline std::string kTablePrefix = "test";
+  static const inline std::string kTableName = kTablePrefix + "_tbl";
+  static const inline std::string kIndexName = kTablePrefix + "_idx";
+  static const inline std::string kMatViewName = kTablePrefix + "_mv";
+
   static constexpr auto kLocalRegion = 1;
   static constexpr auto kOtherRegion = 2;
 
   void SetUp() override;
+
+  void InitTransactionManagerAndPool();
 
   size_t NumTabletServers() override { return NumRegions(); }
 
   virtual size_t NumRegions() { return 3; }
 
  protected:
-  const std::shared_ptr<tserver::MiniTabletServer> PickPgTabletServer(
-      const MiniCluster::MiniTabletServers& servers) override;
-
   uint64_t GetCurrentVersion();
 
   void CreateTransactionTable(int region);
 
   Result<TableId> GetTransactionTableId(int region);
 
-  void StartDeleteTransactionTable(int region);
+  Result<TableId> GetTransactionTableId(const std::string& name);
 
-  void WaitForDeleteTransactionTableToFinish(int region);
+  void StartDeleteTransactionTable(std::string_view tablespace);
+
+  void WaitForDeleteTransactionTableToFinish(std::string_view tablespace);
 
   void CreateMultiRegionTransactionTable();
 
-  void SetupTables(size_t tables_per_region);
+  virtual void SetupTablespaces();
 
-  void DropTables();
+  virtual void SetupTables(size_t tables_per_region);
+
+  void SetupTablesAndTablespaces(size_t tables_per_region);
+
+  void DropTablespaces();
+
+  virtual void DropTables();
+
+  void DropTablesAndTablespaces();
 
   void WaitForStatusTabletsVersion(uint64_t version);
 
@@ -72,6 +91,19 @@ class GeoTransactionsTestBase : public pgwrapper::PgMiniTestBase {
   Status StartShutdownTabletServers(
     const std::optional<std::string>& region_str, const std::optional<std::string>& zone_str,
     bool shutdown);
+
+  void ValidateAllTabletLeaderInZone(std::vector<TabletId> tablet_uuids, int region);
+  bool AllTabletLeaderInZone(std::vector<TabletId> tablet_uuids, int region);
+
+  static Status WarmupTablespaceCache(pgwrapper::PGConn& conn, std::string_view table);
+
+  Result<PgTablespaceOid> GetTablespaceOid(std::string_view tablespace) const;
+  Result<PgTablespaceOid> GetTablespaceOidForRegion(int region) const;
+  Result<std::vector<TabletId>> GetStatusTabletsWithTableName(
+      const std::string& local_txn_table, ExpectedLocality expected);
+  Result<std::vector<TabletId>> GetStatusTablets(
+      std::string_view tablespace, ExpectedLocality locality);
+  Result<std::vector<TabletId>> GetStatusTablets(int region, ExpectedLocality locality);
 
   TransactionManager* transaction_manager_;
   TransactionPool* transaction_pool_;

@@ -15,9 +15,9 @@
 // specific language governing permissions and limitations
 // under the License.
 //
-// The following only applies to changes made to this file as part of YugaByte development.
+// The following only applies to changes made to this file as part of YugabyteDB development.
 //
-// Portions Copyright (c) YugaByte, Inc.
+// Portions Copyright (c) YugabyteDB, Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License"); you may not use this file except
 // in compliance with the License.  You may obtain a copy of the License at
@@ -51,6 +51,10 @@ class HostPort;
 
 namespace tserver {
 
+using SetLogAnchorRefreshStatusFunc = void(std::shared_ptr<rpc::RpcController> controller,
+    const std::shared_ptr<UpdateLogAnchorResponsePB>&,
+    const std::shared_ptr<KeepLogAnchorAliveResponsePB>&);
+
 class RemoteBootstrapAnchorClient : public RefCountedThreadSafe<RemoteBootstrapAnchorClient> {
  public:
   RemoteBootstrapAnchorClient(
@@ -59,17 +63,19 @@ class RemoteBootstrapAnchorClient : public RefCountedThreadSafe<RemoteBootstrapA
       rpc::ProxyCache* proxy_cache,
       const HostPort& tablet_leader_peer_addr);
 
-  Status RegisterLogAnchor(const std::string& tablet_id, const OpId& op_id);
+  Status RegisterLogAnchor(
+      const std::string& tablet_id, const int64_t& log_index, bool session_succeeded);
 
-  Status UpdateLogAnchorAsync(const OpId& op_id);
+  Status UpdateLogAnchorAsync(const int64_t& log_index, bool session_succeeded);
 
   Status UnregisterLogAnchor();
 
-  Status KeepLogAnchorAliveAsync();
+  Status KeepLogAnchorAliveAsync(bool session_succeeded);
 
-  Status ChangePeerRole();
-
-  void SetLogAnchorRefreshStatus(std::shared_ptr<rpc::RpcController> controller);
+  void SetLogAnchorRefreshStatus(
+      std::shared_ptr<rpc::RpcController> controller,
+      const std::shared_ptr<UpdateLogAnchorResponsePB> &update_anchor_resp,
+      const std::shared_ptr<KeepLogAnchorAliveResponsePB> &keep_anchor_alive_resp);
 
   Status ProcessLogAnchorRefreshStatus();
 

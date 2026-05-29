@@ -15,9 +15,9 @@
 // specific language governing permissions and limitations
 // under the License.
 //
-// The following only applies to changes made to this file as part of YugaByte development.
+// The following only applies to changes made to this file as part of YugabyteDB development.
 //
-// Portions Copyright (c) YugaByte, Inc.
+// Portions Copyright (c) YugabyteDB, Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License"); you may not use this file except
 // in compliance with the License.  You may obtain a copy of the License at
@@ -30,7 +30,7 @@
 // under the License.
 //
 
-#include <glog/logging.h>
+#include "yb/util/logging.h"
 
 #include "yb/util/thread.h"
 #include "yb/util/threadlocal.h"
@@ -65,6 +65,10 @@ bool ThreadRestrictions::SetIOAllowed(bool allowed) {
   bool previous_allowed = LoadTLS()->io_allowed;
   LoadTLS()->io_allowed = allowed;
   return previous_allowed;
+}
+
+bool ThreadRestrictions::IsIOAllowed() {
+  return LoadTLS()->io_allowed;
 }
 
 void ThreadRestrictions::AssertIOAllowed() {

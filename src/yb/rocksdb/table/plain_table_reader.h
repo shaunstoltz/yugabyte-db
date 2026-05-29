@@ -2,9 +2,9 @@
 // Use of this source code is governed by a BSD-style license that can be
 // found in the LICENSE file. See the AUTHORS file for names of contributors.
 //
-// The following only applies to changes made to this file as part of YugaByte development.
+// The following only applies to changes made to this file as part of YugabyteDB development.
 //
-// Portions Copyright (c) YugaByte, Inc.
+// Portions Copyright (c) YugabyteDB, Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License"); you may not use this file except
 // in compliance with the License.  You may obtain a copy of the License at
@@ -93,10 +93,13 @@ class PlainTableReader: public TableReader {
 
   bool IsSplitSst() const override { return false; }
 
-  void SetDataFileReader(std::unique_ptr<RandomAccessFileReader>&& data_file) override { assert(false); }
+  void SetDataFileReader(std::unique_ptr<RandomAccessFileReader>&& data_file) override {
+    LOG(FATAL) << "PlainTableReader::SetDataFileReader is not supported";
+  }
 
-  InternalIterator* NewIterator(const ReadOptions&, Arena* arena = nullptr,
-                                bool skip_filters = false) override;
+  InternalIterator* NewIterator(
+      const ReadOptions&, Arena* arena, bool skip_filters,
+      SkipCorruptDataBlocksUnsafe skip_corrupt_data_blocks_unsafe) override;
 
   void Prepare(const Slice& target) override;
 
@@ -115,6 +118,11 @@ class PlainTableReader: public TableReader {
   virtual size_t ApproximateMemoryUsage() const override {
     return arena_.MemoryAllocatedBytes();
   }
+
+  InternalIterator* NewIndexIterator(const ReadOptions& read_options) override;
+
+  DataBlockAwareIndexInternalIterator* NewDataBlockAwareIndexIterator(
+      const ReadOptions& read_options) override;
 
   PlainTableReader(const ImmutableCFOptions& ioptions,
                    std::unique_ptr<RandomAccessFileReader>&& file,

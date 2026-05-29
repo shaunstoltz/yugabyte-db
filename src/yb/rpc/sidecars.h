@@ -1,4 +1,4 @@
-// Copyright (c) YugaByte, Inc.
+// Copyright (c) YugabyteDB, Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License"); you may not use this file except
 // in compliance with the License.  You may obtain a copy of the License at
@@ -63,6 +63,19 @@ class Sidecars {
   void CopyTo(std::byte* out);
 
   void Flush(ByteBlocks* output);
+
+  const google::protobuf::RepeatedField<uint32_t>& offsets() const {
+    return offsets_;
+  }
+
+  WriteBuffer& buffer() {
+    return buffer_;
+  }
+
+  void Swap(Sidecars& rhs) {
+    buffer_.Swap(rhs.buffer_);
+    offsets_.Swap(&rhs.offsets_);
+  }
 
  private:
   simple_spinlock take_mutex_;

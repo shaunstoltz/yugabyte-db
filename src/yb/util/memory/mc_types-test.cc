@@ -1,5 +1,5 @@
 //--------------------------------------------------------------------------------------------------
-// Copyright (c) YugaByte, Inc.
+// Copyright (c) YugabyteDB, Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License"); you may not use this file except
 // in compliance with the License.  You may obtain a copy of the License at
@@ -19,9 +19,7 @@
 
 namespace yb {
 
-using std::make_shared;
 using std::string;
-using std::unique_ptr;
 
 class MemoryContextTypesTest : public YBTest {
  public:
@@ -116,7 +114,7 @@ TEST_F(MemoryContextTypesTest, TestMCStl) {
 
   // Constructing vector.
   MCVector<int> ql_vec(arena());
-  ql_vec.reserve(max_entry);
+  ql_vec.resize(max_entry);
   for (i = 0; i < max_entry; i++) {
     ql_vec[i] = i*7;
   }
@@ -157,7 +155,7 @@ TEST_F(MemoryContextTypesTest, TestMCTreeNode) {
 
   // Construct vector.
   MCVector<MCObjectType *> objects(arena());
-  objects.reserve(max_entry);
+  objects.resize(max_entry);
   for (i = 0; i < max_entry; i++) {
     // Make SQL objects that share the same pool with "objects".
     objects[i] = new(arena()) MCObjectType(i*9);

@@ -1,4 +1,4 @@
-// Copyright (c) YugaByte, Inc.
+// Copyright (c) YugabyteDB, Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License"); you may not use this file except
 // in compliance with the License.  You may obtain a copy of the License at
@@ -12,9 +12,14 @@
 //
 #pragma once
 
+#include <stdint.h>
+
 #include <string>
 
 #include <boost/preprocessor/seq/for_each.hpp>
+
+#include "yb/util/memory/arena.h"
+#include "yb/util/slice.h"
 
 namespace google {
 namespace protobuf {
@@ -58,15 +63,17 @@ extern const std::string kInfoResponse;
 // For more info: http://redis.io/topics/protocol
 
 #define REDIS_PRIMITIVES \
-  ((Integer, const std::string&)) \
+  ((Integer, std::string_view)) \
   ((Integer, int64_t)) \
-  ((SimpleString, const std::string&)) \
-  ((BulkString, const std::string&)) \
-  ((Error, const std::string&)) \
+  ((SimpleString, std::string_view)) \
+  ((BulkString, std::string_view)) \
+  ((Error, std::string_view)) \
   ((Array, const google::protobuf::RepeatedPtrField<std::string>&)) \
   ((Array, const std::initializer_list<std::string>&)) \
-  ((Encoded, const std::string&)) \
+  ((Array, const ArenaVector<Slice>&)) \
+  ((Encoded, std::string_view)) \
   ((EncodedArray, const google::protobuf::RepeatedPtrField<std::string>&)) \
+  ((EncodedArray, const ArenaVector<Slice>&)) \
   /**/
 
 #define DO_REDIS_PRIMITIVES_FORWARD(name, type) \

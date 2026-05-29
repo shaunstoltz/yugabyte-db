@@ -1,6 +1,6 @@
-#!/usr/bin/env python
+#!/usr/bin/env python3
 
-# Copyright (c) YugaByte, Inc.
+# Copyright (c) YugabyteDB, Inc.
 #
 # Licensed under the Apache License, Version 2.0 (the "License"); you may not use this file except
 # in compliance with the License.  You may obtain a copy of the License at
@@ -303,7 +303,7 @@ def download_file(url, dest_path):
                 remote_file.close()
     except:  # noqa
         if os.path.exists(dest_path):
-            logging.warn("Deleting the unfinished download: %s", dest_path)
+            logging.warning("Deleting the unfinished download: %s", dest_path)
             os.remove(dest_path)
         raise
 
@@ -597,6 +597,7 @@ class ClusterOptions:
         self.force = False
         self.use_cassandra_authentication = False
         self.ysql_hba_conf_csv = None
+        self.ysql_ident_conf_csv = None
         self.ysql_pg_conf_csv = None
         self.node_type = DAEMON_TYPE_TSERVER
         self.is_shell_master = False
@@ -659,6 +660,14 @@ class ClusterOptions:
         self.replication_factor = args.replication_factor
         self.custom_binary_dir = args.binary_dir
         self.cluster_base_dir = args.data_dir
+        if self.cluster_base_dir and not os.path.isabs(self.cluster_base_dir):
+            example = os.path.abspath(os.path.expanduser(self.cluster_base_dir))
+            raise ExitWithError(
+                "Invalid --data_dir '{}': must be an absolute path. YugabyteDB's --fs_data_dirs "
+                "does not accept relative paths, and yb-ctl passes this directory through as the "
+                "filesystem root for each node. For example: {}".format(
+                    self.cluster_base_dir, example))
+
         self.num_shards_per_tserver = args.num_shards_per_tserver
         self.ysql_num_shards_per_tserver = args.ysql_num_shards_per_tserver
         self.timeout_yb_admin_sec = args.timeout_yb_admin_sec
@@ -681,6 +690,9 @@ class ClusterOptions:
         if hasattr(args, "ysql_hba_conf_csv"):
             self.ysql_hba_conf_csv = args.ysql_hba_conf_csv
 
+        if hasattr(args, "ysql_ident_conf_csv"):
+            self.ysql_ident_conf_csv = args.ysql_ident_conf_csv
+
         if hasattr(args, "ysql_pg_conf_csv"):
             self.ysql_pg_conf_csv = args.ysql_pg_conf_csv
 
@@ -698,6 +710,15 @@ class ClusterOptions:
             except AttributeError:
                 parser_arg = None
             setattr(self, arg, self.parse_flag_args(parser_arg))
+
+        # Reflect webserver_port overrides from --master_flags / --tserver_flags
+        # so the status output shows the actual port the daemon will bind to.
+        for flag in self.master_flags:
+            if flag.startswith("webserver_port="):
+                self.base_ports[DAEMON_TYPE_MASTER]["http"] = int(flag.split("=", 1)[1])
+        for flag in self.tserver_flags:
+            if flag.startswith("webserver_port="):
+                self.base_ports[DAEMON_TYPE_TSERVER]["http"] = int(flag.split("=", 1)[1])
 
         try:
             self.placement_info_raw = getattr(args, "placement_info")
@@ -926,7 +947,7 @@ class ClusterControl:
             help="Specify a custom directory in which to find the yugabyte binaries.")
         self.parent_parser.add_argument(
             "--data_dir", default=None,
-            help="Specify a custom directory where to store data.")
+            help="Specify a custom directory where to store data (must be an absolute path).")
         self.parent_parser.add_argument(
             "--replication_factor", "--rf", type=int, default=None,
             help="Replication factor for the cluster as well as default number of masters. ")
@@ -1048,7 +1069,7 @@ class ClusterControl:
             help="Specify a custom directory in which to find the yugabyte binaries.")
         self.parser.add_argument(
             "--data_dir", default=get_default_data_dir(), dest="data_dir_dest",
-            help="Specify a custom directory where to store data.")
+            help="Specify a custom directory where to store data (must be an absolute path).")
         self.parser.add_argument(
             "--replication_factor", "--rf", default=DEFAULT_REPLICATION_FACTOR, type=int,
             dest="replication_factor_dest",
@@ -1169,6 +1190,10 @@ class ClusterControl:
             subparsers[cmd].add_argument("--ysql_hba_conf_csv",
                                          help="Set HBA configuration for YSQL API in CSV format")
 
+            subparsers[cmd].add_argument("--ysql_ident_conf_csv",
+                                         help="Set user name mapping (ident) configuration for "
+                                         "YSQL API in CSV format")
+
             subparsers[cmd].add_argument("--ysql_pg_conf_csv",
                                          help="Set configuration for YSQL API in CSV format")
 
@@ -1276,7 +1301,8 @@ class ClusterControl:
                 pgrep_full_command_output_arg = '--list-full'
             pgrep_regex_str = self.get_pgrep_regex(daemon_id)
             pgrep_output = subprocess.check_output(
-                ["pgrep", pgrep_full_command_output_arg, "-f", pgrep_regex_str]
+                ["pgrep", pgrep_full_command_output_arg, "-f", pgrep_regex_str],
+                env={"LC_ALL": "C.UTF-8"}
             ).strip().decode('utf-8')
 
             data_dirs_re_match = FS_DATA_DIRS_ARG_RE.search(pgrep_output)
@@ -1402,6 +1428,9 @@ class ClusterControl:
             if (self.options.ysql_hba_conf_csv is not None):
                 command_list.append(
                     "--ysql_hba_conf_csv='{}'".format(self.options.ysql_hba_conf_csv))
+            if (self.options.ysql_ident_conf_csv is not None):
+                command_list.append(
+                    "--ysql_ident_conf_csv='{}'".format(self.options.ysql_ident_conf_csv))
             if (self.options.ysql_pg_conf_csv is not None):
                 command_list.append(
                     "--ysql_pg_conf_csv='{}'".format(self.options.ysql_pg_conf_csv))
@@ -1627,6 +1656,7 @@ class ClusterControl:
         num_yb_admin_ts = None
 
         def call_check_for_ts(should_get_error):
+            nonlocal num_alive_ts, num_yb_admin_ts
             if not call_check_for_processes(should_get_error):
                 self.dump_missing_process_error_logs()
                 raise ExitWithError("At least one master or tserver process is down.")
@@ -1720,7 +1750,7 @@ class ClusterControl:
         print("-" * 100)
         print("| {:<96} |".format(title))
         print("-" * 100)
-        for k, v in body_kv_list:
+        for k, v in body_kv_list.items():
             print("| {:20}: {:<74} |".format(k, v))
         print("-" * 100)
 
@@ -1731,14 +1761,11 @@ class ClusterControl:
         title = "Node Count: {} | Replication Factor: {}".format(
             num_servers, self.get_replication_factor())
         info_kv_list = self.gen_status_tserver_connectivity(DaemonId(DAEMON_TYPE_TSERVER, 1))
-        info_kv_list.extend([
-            # TODO: this might cause issues if the first master is down...
-            ("Web UI", "http://{}/".format(
-                self.options.get_client_advertise_host_port(
-                    DaemonId(DAEMON_TYPE_MASTER, 1),
-                    "http"))),
-            ("Cluster Data", self.options.cluster_base_dir)
-        ])
+        # TODO: this might cause issues if the first master is down...
+        info_kv_list["Web UI"] = "http://{}/".format(self.options.get_client_advertise_host_port(
+            DaemonId(DAEMON_TYPE_MASTER, 1),
+            "http"))
+        info_kv_list["Cluster Data"] = self.options.cluster_base_dir
         self.print_status_box(title, info_kv_list)
         if more_info:
             status_cmd = "yb-ctl"
@@ -1749,7 +1776,7 @@ class ClusterControl:
             print("For more info, please use: {}".format(status_cmd))
 
     def gen_status_tserver_connectivity(self, tserver_daemon_id):
-        info_kv_list = []
+        info_kv_list = dict()
         if not tserver_daemon_id:
             return info_kv_list
 
@@ -1765,11 +1792,8 @@ class ClusterControl:
                 self.options.get_client_tool_path('ysqlsh'), ip_address, ysql_port,
                 YSQL_DEFAULT_PORT)
 
-            info_kv_list.extend([
-                ("JDBC", "jdbc:postgresql://{}:{}/yugabyte".format(
-                    ip_address, ysql_port)),
-                ("YSQL Shell", ysqlsh_cmd_line)
-            ])
+            info_kv_list["JDBC"] = "jdbc:postgresql://{}:{}/yugabyte".format(ip_address, ysql_port)
+            info_kv_list["YSQL Shell"] = ysqlsh_cmd_line
 
         # -----------------------------------------------------------------------------------------
         # cqlsh command line
@@ -1782,8 +1806,7 @@ class ClusterControl:
             if ycql_port != YCQL_DEFAULT_PORT:
                 cqlsh_cmd_line += ' %s' % ycql_port
 
-        info_kv_list.append(
-            ("YCQL Shell", cqlsh_cmd_line))
+        info_kv_list["YCQL Shell"] = cqlsh_cmd_line
 
         # -----------------------------------------------------------------------------------------
         # redis-cli command line
@@ -1794,7 +1817,7 @@ class ClusterControl:
         redis_cli_cmd_line = format_cmd_line_with_host_port(
             self.options.get_client_tool_path('redis-cli'), ip_address, yedis_port,
             YEDIS_DEFAULT_PORT)
-        info_kv_list.append(("YEDIS Shell", redis_cli_cmd_line))
+        info_kv_list["YEDIS Shell"] = redis_cli_cmd_line
         return info_kv_list
 
     def show_node_status(self, daemon_index, server_counts=None):
@@ -1806,19 +1829,18 @@ class ClusterControl:
         master_daemon_id = DaemonId(DAEMON_TYPE_MASTER, daemon_index) if is_master else None
 
         info_kv_list = self.gen_status_tserver_connectivity(tserver_daemon_id)
-        log_kv_list = []
+        log_kv_list = dict()
         for idx, node_dir in enumerate(self.get_base_node_dirs(daemon_index)):
             data_path = os.path.join(node_dir, "yb-data")
             if idx == 0:
                 if is_tserver:
-                    log_kv_list.append(
-                        ("yb-tserver Logs", os.path.join(data_path, DAEMON_TYPE_TSERVER, "logs")))
+                    log_kv_list["yb-tserver Logs"] = os.path.join(data_path, DAEMON_TYPE_TSERVER,
+                                                                  "logs")
                 if is_master:
-                    log_kv_list.append(
-                        ("yb-master Logs", os.path.join(data_path, DAEMON_TYPE_MASTER, "logs")))
-            info_kv_list.append(
-                ("data-dir[{}]".format(idx), data_path))
-        info_kv_list.extend(log_kv_list)
+                    log_kv_list["yb-master Logs"] = os.path.join(data_path, DAEMON_TYPE_MASTER,
+                                                                 "logs")
+            info_kv_list["data-dir[{}]".format(idx)] = data_path
+        info_kv_list |= log_kv_list
 
         master_pid = self.get_pid(master_daemon_id) if master_daemon_id else None
         process_list = []
@@ -1878,8 +1900,6 @@ class ClusterControl:
             self.cluster_config["installation_dir"] = self.options.installation_dir
         self.save_cluster_config()
 
-        if self.is_ysql_enabled():
-            self.run_cluster_wide_ysql_initdb()
         self.cluster_status()
 
     # Starts as well as creates. Check if the cluster exists.
@@ -1901,8 +1921,6 @@ class ClusterControl:
                     # To prevent YSQL from showing up in the status.
                     self.options.enable_ysql = False
                 else:
-                    print("YSQL has been enabled on an existing cluster, running initdb")
-                    self.run_cluster_wide_ysql_initdb()
                     self.cluster_config["enable_ysql"] = True
                     self.save_cluster_config()
 
@@ -2011,49 +2029,6 @@ class ClusterControl:
             logging.error(result)
             raise RuntimeError("Failed to Setup Redis.")
         print("Setup Redis successful.")
-
-    def run_cluster_wide_ysql_initdb(self):
-        initdb_binary_path = self.options.get_binary_path("initdb")
-
-        logging.info("Running initdb to initialize YSQL metadata in the YugaByte DB cluster.")
-        env = {'FLAGS_pggate_master_addresses': self.options.master_addresses,
-               'YB_ENABLED_IN_POSTGRES': '1'}
-        certs_dir = self.get_certs_dir()
-        if certs_dir:
-            env.update({'FLAGS_use_client_to_server_encryption': '1',
-                        'FLAGS_certs_dir': certs_dir})
-        with SetAndRestoreEnv(env):
-            adjust_env_for_ysql()
-
-            tmp_pg_data_dir = os.path.join(self.args.data_dir, 'yb-ctl_tmp_pg_data_{}'.format(
-                ''.join([random.choice('0123456789abcdef') for _ in range(32)])))
-
-            initdb_log_path = os.path.join(self.args.data_dir, "initdb.log")
-            if os.path.exists(initdb_log_path):
-                os.remove(initdb_log_path)
-            succeeded = False
-            try:
-                with open(initdb_log_path, 'w') as initdb_stdout_file:
-                    proc = subprocess.Popen([
-                        initdb_binary_path,
-                        '-D', tmp_pg_data_dir,
-                        '-U', 'postgres'
-                    ], stdout=initdb_stdout_file, stderr=subprocess.STDOUT)
-                    wait_for_proc_report_progress(proc)
-                    succeeded = proc.returncode == 0
-            finally:
-                if os.path.exists(tmp_pg_data_dir):
-                    logging.info("Deleting temporary YSQL data directory: %s",
-                                 tmp_pg_data_dir)
-                    shutil.rmtree(tmp_pg_data_dir, ignore_errors=True)
-                if not succeeded and os.path.exists(initdb_log_path):
-                    logging.info("initdb log file (from %s):", initdb_log_path)
-                    with open(initdb_log_path) as initdb_log_input_file:
-                        for line in initdb_log_input_file:
-                            logging.info(line.rstrip())
-
-        logging.info(
-            "Successfully ran initdb to initialize YSQL data in the YugaByte cluster")
 
     def get_certs_dir(self):
         # We split parameters containing multiple '='s like 'vmodule=meta_cache=5,tablet=5' into

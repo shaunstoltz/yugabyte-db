@@ -1,4 +1,4 @@
-// Copyright (c) YugaByte, Inc.
+// Copyright (c) YugabyteDB, Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License"); you may not use this file except
 // in compliance with the License.  You may obtain a copy of the License at
@@ -12,6 +12,12 @@
 //
 
 #include <boost/algorithm/string/join.hpp>
+
+#include "yb/docdb/docdb_test_util.h"
+
+#include "yb/gutil/casts.h"
+#include "yb/gutil/strings/join.h"
+#include "yb/gutil/strings/split.h"
 
 #include "yb/integration-tests/cql_test_base.h"
 #include "yb/integration-tests/mini_cluster.h"
@@ -30,10 +36,6 @@
 #include "yb/util/test_macros.h"
 #include "yb/util/timestamp.h"
 
-#include "yb/gutil/casts.h"
-#include "yb/gutil/strings/join.h"
-#include "yb/gutil/strings/split.h"
-
 using namespace std::literals;
 
 DECLARE_bool(fail_on_out_of_range_clock_skew);
@@ -48,7 +50,7 @@ class DataPatcherTest : public CqlTestBase<MiniCluster> {
  protected:
   void SetUp() override {
     server::SkewedClock::Register();
-    FLAGS_time_source = server::SkewedClock::kName;
+    ANNOTATE_UNPROTECTED_WRITE(FLAGS_time_source) = server::SkewedClock::kName;
     CqlTestBase<MiniCluster>::SetUp();
   }
 
@@ -161,12 +163,14 @@ void CheckWriteTimeConsistency(
 // Write more values.
 // Check that all write times are before current time.
 TEST_F(DataPatcherTest, AddTimeDelta) {
+  docdb::DisableYcqlPackedRow();
+
   constexpr int kValueGroupSize = 10;
   constexpr int kDataPatcherConcurrency = 2;
   const MonoDelta kMonoDelta(60min * 24 * 365 * 80);
 
-  FLAGS_fail_on_out_of_range_clock_skew = false;
-  FLAGS_TEST_transaction_ignore_applying_probability = 0.8;
+  ANNOTATE_UNPROTECTED_WRITE(FLAGS_fail_on_out_of_range_clock_skew) = false;
+  ANNOTATE_UNPROTECTED_WRITE(FLAGS_TEST_transaction_ignore_applying_probability) = 0.8;
 
   auto session = ASSERT_RESULT(EstablishSession(driver_.get()));
   ASSERT_OK(session.ExecuteQuery(
@@ -298,8 +302,8 @@ TEST_F(DataPatcherTest, AddTimeDelta) {
   ASSERT_OK(RunDataPatcher(args));
 
   LOG(INFO) << "Turning off clock skew checking and restarting the cluster";
-  SetAtomicFlag(0, &FLAGS_clock_skew_force_crash_bound_usec);
-  SetAtomicFlag(false, &FLAGS_fail_on_out_of_range_clock_skew);
+  ANNOTATE_UNPROTECTED_WRITE(FLAGS_clock_skew_force_crash_bound_usec) = 0;
+  ANNOTATE_UNPROTECTED_WRITE(FLAGS_fail_on_out_of_range_clock_skew) = false;
   start_cluster();
   delta_changers = jump_clocks();
 

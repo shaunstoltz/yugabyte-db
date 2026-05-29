@@ -1,5 +1,5 @@
 //
-// Copyright (c) YugaByte, Inc.
+// Copyright (c) YugabyteDB, Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License"); you may not use this file except
 // in compliance with the License.  You may obtain a copy of the License at
@@ -34,12 +34,10 @@ namespace yb {
 
 class TransactionStatusManagerMock : public TransactionStatusManager {
  public:
-  HybridTime LocalCommitTime(const TransactionId& id) override {
-    return HybridTime::kInvalid;
-  }
+  HybridTime LocalCommitTime(const TransactionId& id) override { return HybridTime::kInvalid; }
 
-  boost::optional<TransactionLocalState> LocalTxnData(const TransactionId& id) override {
-    return boost::none;
+  std::optional<TransactionLocalState> LocalTxnData(const TransactionId& id) override {
+    return std::nullopt;
   }
 
   void RequestStatusAt(const StatusRequest& request) override;
@@ -56,28 +54,27 @@ class TransactionStatusManagerMock : public TransactionStatusManager {
   void Abort(const TransactionId& id, TransactionStatusCallback callback) override {
   }
 
-  void Cleanup(TransactionIdSet&& set) override {
+  Status Cleanup(TransactionIdApplyOpIdMap&& set) override {
+    return Status::OK();
   }
 
-  Result<int64_t> RegisterRequest() override {
+  Result<int64_t> RegisterRequest(bool allow_when_closing) override {
     return 0;
   }
 
   void UnregisterRequest(int64_t) override {
   }
 
-  void FillPriorities(
-      boost::container::small_vector_base<std::pair<TransactionId, uint64_t>>* inout) override {}
-
-  void FillStatusTablets(std::vector<BlockingTransactionData>* inout) override { }
-
-  boost::optional<TabletId> FindStatusTablet(const TransactionId& id) override {
-    return boost::none;
+  Status FillPriorities(
+      boost::container::small_vector_base<std::pair<TransactionId, uint64_t>>* inout) override {
+    return Status::OK();
   }
 
-  HybridTime MinRunningHybridTime() const override {
-    return HybridTime::kMin;
+  Result<std::optional<TabletId>> FindStatusTablet(const TransactionId& id) override {
+    return std::nullopt;
   }
+
+  HybridTime MinRunningHybridTime() const override { return HybridTime::kMin; }
 
   Result<HybridTime> WaitForSafeTime(HybridTime safe_time, CoarseTimePoint deadline) override {
     return STATUS(NotSupported, "WaitForSafeTime not implemented");
@@ -88,10 +85,9 @@ class TransactionStatusManagerMock : public TransactionStatusManager {
     return tablet_id;
   }
 
-  Result<IsExternalTransaction> IsExternalTransactionResult(
-      const TransactionId& transaction_id) override {
-    return IsExternalTransaction::kFalse;
-  }
+  void RecordConflictResolutionKeysScanned(int64_t num_keys) override {}
+
+  void RecordConflictResolutionScanLatency(MonoDelta latency) override {}
 
  private:
   std::unordered_map<TransactionId, HybridTime, TransactionIdHash> txn_commit_time_;

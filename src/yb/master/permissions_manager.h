@@ -1,4 +1,4 @@
-// Copyright (c) YugaByte, Inc.
+// Copyright (c) YugabyteDB, Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License"); you may not use this file except
 // in compliance with the License.  You may obtain a copy of the License at
@@ -15,29 +15,17 @@
 
 #include <stdint.h>
 
-#include <set>
-#include <type_traits>
-#include <utility>
+#include "yb/master/catalog_entity_info.h"
+#include "yb/master/master_dcl.fwd.h"
+#include "yb/master/master_fwd.h"
 
-#include "yb/util/flags.h"
-#include <glog/logging.h>
-
-#include "yb/common/entity_ids.h"
 #include "yb/common/roles_permissions.h"
 
-#include "yb/gutil/callback.h"
-#include "yb/gutil/integral_types.h"
-
-#include "yb/master/catalog_manager.h"
-
-#include "yb/rpc/rpc.h"
+#include "yb/rpc/rpc_fwd.h"
 
 #include "yb/util/debug/lock_debug.h"
-#include "yb/util/math_util.h"
-#include "yb/util/shared_lock.h"
 #include "yb/util/status_callback.h"
 #include "yb/util/status_fwd.h"
-#include "yb/util/unique_lock.h"
 
 namespace yb {
 namespace master {
@@ -186,7 +174,7 @@ class PermissionsManager final {
   // from a client.
   std::shared_ptr<GetPermissionsResponsePB> permissions_cache_ GUARDED_BY(mutex_);
 
-  mutable MutexType mutex_ ACQUIRED_AFTER(catalog_manager_->mutex_);
+  mutable MutexType mutex_ ACQUIRED_AFTER(cm_mutex_);
   using SharedLock = NonRecursiveSharedLock<MutexType>;
   using LockGuard = std::lock_guard<MutexType>;
 
@@ -194,6 +182,7 @@ class PermissionsManager final {
   scoped_refptr<SysConfigInfo> security_config_ GUARDED_BY(mutex_);
 
   CatalogManager* catalog_manager_;
+  MutexType& cm_mutex_;
 
   DISALLOW_COPY_AND_ASSIGN(PermissionsManager);
 };

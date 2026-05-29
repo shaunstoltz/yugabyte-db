@@ -15,9 +15,9 @@
 // specific language governing permissions and limitations
 // under the License.
 //
-// The following only applies to changes made to this file as part of YugaByte development.
+// The following only applies to changes made to this file as part of YugabyteDB development.
 //
-// Portions Copyright (c) YugaByte, Inc.
+// Portions Copyright (c) YugabyteDB, Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License"); you may not use this file except
 // in compliance with the License.  You may obtain a copy of the License at
@@ -34,7 +34,6 @@
 #include <utility>
 #include <vector>
 
-#include <glog/logging.h>
 #include <gtest/gtest.h>
 
 #include "yb/common/hybrid_time.h"
@@ -45,14 +44,13 @@
 #include "yb/consensus/consensus.messages.h"
 #include "yb/consensus/log.h"
 #include "yb/consensus/log_anchor_registry.h"
+#include "yb/consensus/log_index.h"
 #include "yb/consensus/log_reader.h"
 #include "yb/consensus/opid_util.h"
 
 #include "yb/fs/fs_manager.h"
 
 #include "yb/gutil/bind.h"
-#include "yb/gutil/stl_util.h"
-#include "yb/gutil/stringprintf.h"
 #include "yb/gutil/strings/substitute.h"
 #include "yb/gutil/strings/util.h"
 
@@ -64,7 +62,6 @@
 #include "yb/tserver/tserver.pb.h"
 
 #include "yb/util/async_util.h"
-#include "yb/util/env_util.h"
 #include "yb/util/metrics.h"
 #include "yb/util/path_util.h"
 #include "yb/util/result.h"
@@ -77,8 +74,7 @@ METRIC_DECLARE_entity(tablet);
 
 DECLARE_int32(log_min_seconds_to_retain);
 
-namespace yb {
-namespace log {
+namespace yb::log {
 
 using consensus::ReplicateMsg;
 using consensus::WRITE_OP;
@@ -99,9 +95,9 @@ YB_STRONGLY_TYPED_BOOL(AppendSync);
 // Append a single batch of 'count' NoOps to the log.  If 'size' is not nullptr, increments it by
 // the expected increase in log size.  Increments 'op_id''s index once for each operation logged.
 static Status AppendNoOpsToLogSync(const scoped_refptr<Clock>& clock,
-                                           Log* log, OpIdPB* op_id,
-                                           int count,
-                                           ssize_t* size = nullptr) {
+                                   Log* log, OpIdPB* op_id,
+                                   int count,
+                                   ssize_t* size = nullptr) {
   ReplicateMsgs replicates;
   for (int i = 0; i < count; i++) {
     auto replicate = rpc::MakeSharedMessage<consensus::LWReplicateMsg>();
@@ -144,15 +140,15 @@ static Status AppendNoOpToLogSync(const scoped_refptr<Clock>& clock,
 class LogTestBase : public YBTest {
  public:
 
-  typedef std::pair<int, int> DeltaId;
+  using DeltaId = std::pair<int, int>;
 
-  typedef std::tuple<int, int, std::string> TupleForAppend;
+  using TupleForAppend = std::tuple<int, int, std::string>;
 
   LogTestBase()
-      : schema_({ ColumnSchema("key", INT32, false, true),
-                  ColumnSchema("int_val", INT32),
-                  ColumnSchema("string_val", STRING, true) },
-                1),
+      : schema_({
+            ColumnSchema("key", DataType::INT32, ColumnKind::HASH),
+            ColumnSchema("int_val", DataType::INT32),
+            ColumnSchema("string_val", DataType::STRING, ColumnKind::VALUE, Nullable::kTrue) }),
         log_anchor_registry_(new LogAnchorRegistry()) {
   }
 
@@ -169,7 +165,7 @@ class LogTestBase : public YBTest {
     tablet_wal_path_ = fs_manager_->GetFirstTabletWalDirOrDie(kTestTable, kTestTablet);
     clock_.reset(new server::HybridClock());
     ASSERT_OK(clock_->Init());
-    FLAGS_log_min_seconds_to_retain = 0;
+    ANNOTATE_UNPROTECTED_WRITE(FLAGS_log_min_seconds_to_retain) = 0;
     ASSERT_OK(ThreadPoolBuilder("log")
                  .unlimited_threads()
                  .Build(&log_thread_pool_));
@@ -180,8 +176,10 @@ class LogTestBase : public YBTest {
     ASSERT_OK(fs_manager_->CreateInitialFileSystemLayout());
   }
 
-  void BuildLog() {
+  void BuildLog(int64_t byte_limit = -1) {
     Schema schema_with_ids = SchemaBuilder(schema_).Build();
+    read_wal_mem_tracker_ =
+        MemTracker::FindOrCreateTracker(byte_limit, "Log Reader Memory");
     ASSERT_OK(Log::Open(options_,
                        kTestTablet,
                        tablet_wal_path_,
@@ -190,10 +188,10 @@ class LogTestBase : public YBTest {
                        0, // schema_version
                        table_metric_entity_.get(),
                        tablet_metric_entity_.get(),
+                       read_wal_mem_tracker_,
                        log_thread_pool_.get(),
                        log_thread_pool_.get(),
                        log_thread_pool_.get(),
-                       std::numeric_limits<int64_t>::max(), // cdc_min_replicated_index
                        &log_));
     LOG(INFO) << "Sucessfully opened the log at " << tablet_wal_path_;
   }
@@ -357,6 +355,7 @@ class LogTestBase : public YBTest {
   std::unique_ptr<MetricRegistry> metric_registry_;
   scoped_refptr<MetricEntity> table_metric_entity_;
   scoped_refptr<MetricEntity> tablet_metric_entity_;
+  std::shared_ptr<MemTracker> read_wal_mem_tracker_;
   std::unique_ptr<ThreadPool> log_thread_pool_;
   scoped_refptr<Log> log_;
   int64_t current_index_;
@@ -398,5 +397,33 @@ Status CorruptLogFile(Env* env, const std::string& log_path,
   return Status::OK();
 }
 
-} // namespace log
-} // namespace yb
+Result<SegmentSequence> GetReadableSegments(const std::string& wal_dir_path) {
+  SegmentSequence segments;
+  std::unique_ptr<LogReader> reader;
+  RETURN_NOT_OK(LogReader::Open(
+      Env::Default(), nullptr, "Log reader", wal_dir_path, nullptr, nullptr,
+      /*read_wal_mem_tracker=*/nullptr, &reader));
+  RETURN_NOT_OK(reader->GetSegmentsSnapshot(&segments));
+  return segments;
+}
+
+Result<uint32_t> GetEntries(const SegmentSequence& segments) {
+  uint32_t num_entries = 0;
+  for (const scoped_refptr<log::ReadableLogSegment>& segment : segments) {
+    auto read_entries = segment->ReadEntries();
+    num_entries += read_entries.entries.size();
+  }
+  return num_entries;
+}
+
+Result<uint32_t> GetEntries(const std::string& wal_dir_path) {
+  SegmentSequence segments = VERIFY_RESULT(GetReadableSegments(wal_dir_path));
+  return GetEntries(segments);
+}
+
+Result<size_t> GetSegmentsCount(const std::string& wal_dir_path) {
+  SegmentSequence segments = VERIFY_RESULT(GetReadableSegments(wal_dir_path));
+  return segments.size();
+}
+
+} // namespace yb::log

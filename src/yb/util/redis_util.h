@@ -1,4 +1,4 @@
-// Copyright (c) YugaByte, Inc.
+// Copyright (c) YugabyteDB, Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License"); you may not use this file except
 // in compliance with the License.  You may obtain a copy of the License at
@@ -17,7 +17,6 @@
 
 namespace yb {
 
-bool RedisPatternMatch(
-    const std::string_view& pattern, const std::string_view& string, bool ignore_case);
+bool RedisPatternMatch(std::string_view pattern, std::string_view string, bool ignore_case);
 
 } // namespace yb

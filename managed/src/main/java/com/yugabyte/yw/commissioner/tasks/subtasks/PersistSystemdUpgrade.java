@@ -1,4 +1,4 @@
-// Copyright (c) YugaByte, Inc.
+// Copyright (c) YugabyteDB, Inc.
 
 package com.yugabyte.yw.commissioner.tasks.subtasks;
 
@@ -33,7 +33,7 @@ public class PersistSystemdUpgrade extends UniverseTaskBase {
     String ret =
         super.getName()
             + "("
-            + taskParams().universeUUID
+            + taskParams().getUniverseUUID()
             + ", useSystemd: "
             + taskParams().useSystemd
             + ")";

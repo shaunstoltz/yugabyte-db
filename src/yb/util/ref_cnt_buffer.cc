@@ -1,5 +1,5 @@
 //
-// Copyright (c) YugaByte, Inc.
+// Copyright (c) YugabyteDB, Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License"); you may not use this file except
 // in compliance with the License.  You may obtain a copy of the License at
@@ -13,7 +13,7 @@
 //
 //
 
-#include <glog/logging.h>
+#include "yb/util/logging.h"
 
 #include "yb/util/ref_cnt_buffer.h"
 
@@ -84,13 +84,17 @@ void RefCntBuffer::DoReset(char* data) {
   data_ = data;
 }
 
-std::string RefCntPrefix::ShortDebugString() const {
-  return Slice(data(), size()).ToDebugHexString();
+std::string RefCntPrefix::ToString() const {
+  return as_slice().ToDebugHexString();
 }
 
 void RefCntPrefix::Resize(size_t value) {
   DCHECK_LE(value, bytes_.size());
   size_ = value;
+}
+
+std::string RefCntSlice::ToString() const {
+  return slice_.ToDebugHexString();
 }
 
 } // namespace yb

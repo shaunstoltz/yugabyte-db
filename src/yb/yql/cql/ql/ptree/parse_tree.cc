@@ -1,5 +1,5 @@
 //--------------------------------------------------------------------------------------------------
-// Copyright (c) YugaByte, Inc.
+// Copyright (c) YugabyteDB, Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License"); you may not use this file except
 // in compliance with the License.  You may obtain a copy of the License at
@@ -29,6 +29,8 @@
 #include "yb/yql/cql/ql/ptree/pt_update.h"
 
 #include "yb/client/table.h"
+
+#include "yb/util/logging.h"
 
 namespace yb {
 namespace ql {
@@ -125,21 +127,23 @@ Result<SchemaVersion> ParseTree::GetYBTableSchemaVersion() const {
   return table->schema().version();
 }
 
-Result<bool> ParseTree::IsYBTableAltered(QLEnv *ql_env) const {
+Result<bool> ParseTree::IsYBTableAltered(QLEnv *ql_env, bool use_cache) const {
   // We check the Main Table schema version even for "Index Only scan" & "Index + Table scan". This
   // is safe to do since if Index schema was changed - the Main Table schema version is also
   // incremented.
   const shared_ptr<const client::YBTable> table = GetYBTableFromTreeNode(root_.get());
   SCHECK(table, IllegalState, "Table missing");
   const SchemaVersion current_schema_ver = table->schema().version();
-  const SchemaVersion updated_schema_ver = VERIFY_RESULT(
-      DCHECK_NOTNULL(ql_env)->GetUpToDateTableSchemaVersion(table->name()));
+  DCHECK_ONLY_NOTNULL(ql_env);
+  const SchemaVersion updated_schema_ver =
+      VERIFY_RESULT(use_cache ? ql_env->GetCachedTableSchemaVersion(table->id())
+                              : ql_env->GetUpToDateTableSchemaVersion(table->id()));
 
   if (updated_schema_ver == current_schema_ver) {
     return false;
   } else {
     // Clean-up the internal cache for the stale table.
-    ql_env->RemoveCachedTableDesc(table->name());
+    ql_env->RemoveCachedTableDesc(table->id());
     return true;
   }
 }

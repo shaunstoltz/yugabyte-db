@@ -15,9 +15,9 @@
 // specific language governing permissions and limitations
 // under the License.
 //
-// The following only applies to changes made to this file as part of YugaByte development.
+// The following only applies to changes made to this file as part of YugabyteDB development.
 //
-// Portions Copyright (c) YugaByte, Inc.
+// Portions Copyright (c) YugabyteDB, Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License"); you may not use this file except
 // in compliance with the License.  You may obtain a copy of the License at
@@ -37,7 +37,10 @@
 
 #include <boost/atomic.hpp>
 
+#include "yb/ash/wait_state.h"
+
 #include "yb/common/common_types.pb.h"
+#include "yb/common/opid.h"
 
 #include "yb/consensus/log_fwd.h"
 #include "yb/consensus/consensus.pb.h"
@@ -50,12 +53,10 @@
 
 #include "yb/util/status_fwd.h"
 #include "yb/util/lockfree.h"
-#include "yb/util/opid.h"
 #include "yb/util/trace.h"
 
 namespace yb {
 class ThreadPool;
-
 namespace tablet {
 class MvccManager;
 class OperationTracker;
@@ -164,12 +165,13 @@ class OperationDriver : public RefCountedThreadSafe<OperationDriver>,
   const MonoTime& start_time() const { return start_time_; }
 
   Trace* trace() { return trace_.get(); }
+  const ash::WaitStateInfoPtr& wait_state() const { return wait_state_; }
 
   Status AddedToLeader(const OpId& op_id, const OpId& committed_op_id) override;
 
   bool is_leader_side() {
     // TODO: switch state to an atomic.
-    std::lock_guard<simple_spinlock> lock(lock_);
+    std::lock_guard lock(lock_);
     return replication_state_ == ReplicationState::NOT_REPLICATING;
   }
 
@@ -264,6 +266,7 @@ class OperationDriver : public RefCountedThreadSafe<OperationDriver>,
 
   // Trace object for tracing any operations started by this driver.
   scoped_refptr<Trace> trace_;
+  const ash::WaitStateInfoPtr wait_state_;
 
   const MonoTime start_time_;
 
@@ -273,8 +276,6 @@ class OperationDriver : public RefCountedThreadSafe<OperationDriver>,
   // The system monotonic time when the operation was prepared.
   // This is used for debugging only, not any actual operation ordering.
   MicrosecondsInt64 prepare_physical_hybrid_time_ = 0;
-
-  TableType table_type_;
 
   MvccManager* mvcc_ = nullptr;
   HybridTime propagated_safe_time_;

@@ -1,10 +1,19 @@
-// Copyright (c) YugaByte, Inc.
+// Copyright (c) YugabyteDB, Inc.
 package com.yugabyte.yw.metrics;
 
+import static com.yugabyte.yw.metrics.MetricQueryHelper.AZ_NAME;
+import static com.yugabyte.yw.metrics.MetricQueryHelper.CONTAINER_METRIC_PREFIX;
+import static com.yugabyte.yw.metrics.MetricQueryHelper.CONTAINER_VOLUME_METRIC_PREFIX;
 import static com.yugabyte.yw.metrics.MetricQueryHelper.EXPORTED_INSTANCE;
+import static com.yugabyte.yw.metrics.MetricQueryHelper.KUBELET_VOLUME_METRIC_PREFIX;
+import static com.yugabyte.yw.metrics.MetricQueryHelper.NAMESPACE;
+import static com.yugabyte.yw.metrics.MetricQueryHelper.NAMESPACE_ID;
 import static com.yugabyte.yw.metrics.MetricQueryHelper.NAMESPACE_NAME;
+import static com.yugabyte.yw.metrics.MetricQueryHelper.POD_NAME;
+import static com.yugabyte.yw.metrics.MetricQueryHelper.PVC;
 import static com.yugabyte.yw.metrics.MetricQueryHelper.TABLE_ID;
 import static com.yugabyte.yw.metrics.MetricQueryHelper.TABLE_NAME;
+import static com.yugabyte.yw.metrics.MetricQueryHelper.YBA_INSTANCE_ADDRESS;
 
 import com.fasterxml.jackson.core.JsonProcessingException;
 import com.fasterxml.jackson.databind.JsonNode;
@@ -19,6 +28,8 @@ import java.util.HashMap;
 import java.util.Iterator;
 import java.util.List;
 import java.util.Map;
+import java.util.regex.Matcher;
+import java.util.regex.Pattern;
 import java.util.stream.Collectors;
 import org.apache.commons.lang3.StringUtils;
 import org.apache.commons.lang3.tuple.ImmutablePair;
@@ -75,10 +86,20 @@ public class MetricQueryResponse {
       MetricGraphData metricGraphData = new MetricGraphData();
       ObjectNode metricInfo = (ObjectNode) objNode.get("metric");
 
+      metricGraphData.metricName = metricName;
       metricGraphData.instanceName = getAndRemoveLabelValue(metricInfo, EXPORTED_INSTANCE);
+      // For container metrics, also check for pod_name label to set instanceName
+      if (metricGraphData.instanceName == null
+          && (metricName.startsWith(CONTAINER_METRIC_PREFIX)
+              || metricName.startsWith(KUBELET_VOLUME_METRIC_PREFIX))) {
+        metricGraphData.instanceName = getInstanceNameLabelForKubernetes(metricInfo, metricName);
+      }
       metricGraphData.tableId = getAndRemoveLabelValue(metricInfo, TABLE_ID);
       metricGraphData.tableName = getAndRemoveLabelValue(metricInfo, TABLE_NAME);
       metricGraphData.namespaceName = getAndRemoveLabelValue(metricInfo, NAMESPACE_NAME);
+      metricGraphData.namespaceId = getAndRemoveLabelValue(metricInfo, NAMESPACE_ID);
+      metricGraphData.ybaInstanceAddress = getAndRemoveLabelValue(metricInfo, YBA_INSTANCE_ADDRESS);
+
       if (metricInfo.has("node_prefix")) {
         metricGraphData.name = metricInfo.get("node_prefix").asText();
       } else if (metricInfo.size() == 1) {
@@ -169,8 +190,7 @@ public class MetricQueryResponse {
         nameOrderMap.put(alias, position++);
       }
     }
-    return graphData
-        .stream()
+    return graphData.stream()
         .sorted(
             Comparator.comparing(
                 data -> {
@@ -199,6 +219,42 @@ public class MetricQueryResponse {
     return value;
   }
 
+  private String getInstanceNameLabelForKubernetes(ObjectNode metricInfo, String metricName) {
+    metricInfo.remove(NAMESPACE);
+    // For container volume metrics, use pvc instead of pod_name
+    if (metricName.startsWith(CONTAINER_VOLUME_METRIC_PREFIX)
+        || metricName.startsWith(KUBELET_VOLUME_METRIC_PREFIX)) {
+      return getInstanceNameLabel(
+          getAndRemoveLabelValue(metricInfo, PVC),
+          getAndRemoveLabelValue(metricInfo, AZ_NAME),
+          true);
+    }
+    // For rest of container metrics, use pod_name
+    return getInstanceNameLabel(
+        getAndRemoveLabelValue(metricInfo, POD_NAME),
+        getAndRemoveLabelValue(metricInfo, AZ_NAME),
+        false);
+  }
+
+  private String getInstanceNameLabel(String baseLabel, String azName, boolean extractDatadir) {
+    if (azName == null) return baseLabel;
+    try {
+      String suffix = baseLabel.substring(baseLabel.lastIndexOf("yb-"));
+      suffix += "_" + azName;
+      if (extractDatadir) {
+        Matcher matcher = Pattern.compile("(datadir\\d+)").matcher(baseLabel);
+        if (matcher.find()) {
+          suffix += "_" + matcher.group(1);
+        }
+      }
+      return suffix;
+    } catch (Exception e) {
+      LOG.warn(
+          "Error extracting instanceName label: baseLabel={}, azName={}", baseLabel, azName, e);
+      return baseLabel;
+    }
+  }
+
   /**
    * Converts the JSON result of a prometheus HTTP query call to the MetricQueryResponse.Entry
    * format.
@@ -224,8 +280,8 @@ public class MetricQueryResponse {
         if (valueNode != null) {
           entry.values.add(
               new ImmutablePair<>(
-                  new Double(valueNode.get(0).asText()), // timestamp
-                  new Double(valueNode.get(1).asText()) // value
+                  Double.parseDouble(valueNode.get(0).asText()), // timestamp
+                  Double.parseDouble(valueNode.get(1).asText()) // value
                   ));
         } else if (valuesNode != null) {
           entry.values = new ArrayList<>();
@@ -234,8 +290,8 @@ public class MetricQueryResponse {
             final JsonNode eachValueNode = elements.next();
             entry.values.add(
                 new ImmutablePair<>(
-                    new Double(eachValueNode.get(0).asText()), // timestamp
-                    new Double(eachValueNode.get(1).asText()) // value
+                    Double.parseDouble(eachValueNode.get(0).asText()), // timestamp
+                    Double.parseDouble(eachValueNode.get(1).asText()) // value
                     ));
           }
         }

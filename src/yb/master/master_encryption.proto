@@ -1,4 +1,4 @@
-// Copyright (c) YugaByte, Inc.
+// Copyright (c) YugabyteDB, Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License"); you may not use this file except
 // in compliance with the License.  You may obtain a copy of the License at
@@ -56,6 +56,14 @@ message GetUniverseKeyRegistryResponsePB {
   optional encryption.UniverseKeysPB universe_keys = 2;
 }
 
+message GetFullUniverseKeyRegistryRequestPB {
+}
+
+message GetFullUniverseKeyRegistryResponsePB {
+  optional MasterErrorPB error = 1;
+  optional encryption.UniverseKeyRegistryPB universe_key_registry = 2;
+}
+
 message HasUniverseKeyInMemoryRequestPB {
   optional string version_id = 1;
 }
@@ -75,6 +83,8 @@ service MasterEncryption {
   rpc AddUniverseKeys(AddUniverseKeysRequestPB)  returns (AddUniverseKeysResponsePB);
   rpc GetUniverseKeyRegistry(GetUniverseKeyRegistryRequestPB)
       returns (GetUniverseKeyRegistryResponsePB);
+  rpc GetFullUniverseKeyRegistry(GetFullUniverseKeyRegistryRequestPB)
+      returns (GetFullUniverseKeyRegistryResponsePB);
   rpc HasUniverseKeyInMemory(HasUniverseKeyInMemoryRequestPB)
       returns (HasUniverseKeyInMemoryResponsePB);
 }

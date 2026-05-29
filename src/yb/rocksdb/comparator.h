@@ -6,9 +6,9 @@
 // Use of this source code is governed by a BSD-style license that can be
 // found in the LICENSE file. See the AUTHORS file for names of contributors.
 //
-// The following only applies to changes made to this file as part of YugaByte development.
+// The following only applies to changes made to this file as part of YugabyteDB development.
 //
-// Portions Copyright (c) YugaByte, Inc.
+// Portions Copyright (c) YugabyteDB, Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License"); you may not use this file except
 // in compliance with the License.  You may obtain a copy of the License at
@@ -42,14 +42,14 @@ class Comparator {
   //   < 0 iff "a" < "b",
   //   == 0 iff "a" == "b",
   //   > 0 iff "a" > "b"
-  virtual int Compare(const Slice& a, const Slice& b) const = 0;
+  virtual int Compare(Slice a, Slice b) const = 0;
 
   // Compares two slices for equality. The following invariant should always
   // hold (and is the default implementation):
   //   Equal(a, b) iff Compare(a, b) == 0
   // Overwrite only if equality comparisons can be done more efficiently than
   // three-way comparisons.
-  virtual bool Equal(const Slice& a, const Slice& b) const {
+  virtual bool Equal(Slice a, Slice b) const {
     return Compare(a, b) == 0;
   }
 

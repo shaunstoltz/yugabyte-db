@@ -1,4 +1,4 @@
-// Copyright (c) YugaByte, Inc.
+// Copyright (c) YugabyteDB, Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License"); you may not use this file except
 // in compliance with the License.  You may obtain a copy of the License at
@@ -23,15 +23,17 @@
 #include "yb/gutil/integral_types.h"
 #include "yb/gutil/ref_counted.h"
 
+#include "yb/master/leader_epoch.h"
 #include "yb/master/master_admin.fwd.h"
 #include "yb/master/master_fwd.h"
+
+#include "yb/rpc/rpc_context.h"
 
 #include "yb/util/status_fwd.h"
 #include "yb/util/enums.h"
 #include "yb/util/locks.h"
 
-namespace yb {
-namespace master {
+namespace yb::master {
 
 class Master;
 class CatalogManager;
@@ -46,22 +48,26 @@ class FlushManager {
 
   // API to start a table flushing.
   Status FlushTables(const FlushTablesRequestPB* req,
-                     FlushTablesResponsePB* resp);
+                     FlushTablesResponsePB* resp,
+                     rpc::RpcContext* rpc,
+                     const LeaderEpoch& epoch);
 
   Status IsFlushTablesDone(const IsFlushTablesDoneRequestPB* req,
                            IsFlushTablesDoneResponsePB* resp);
 
   void HandleFlushTabletsResponse(const FlushRequestId& flush_id,
                                   const TabletServerId& ts_uuid,
-                                  const Status& status);
+                                  const Status& status) EXCLUDES(lock_);
+
+  void HandleFlushTabletsRpcFinish(const FlushRequestId& flush_id,
+                                   const TabletServerId& ts_uuid,
+                                   const Status& status) EXCLUDES(lock_);
 
  private:
-  // Start the background task to send the FlushTablets RPC to the Tablet Server.
-  void SendFlushTabletsRequest(const TabletServerId& ts_uuid,
-                               const scoped_refptr<TableInfo>& table,
-                               const std::vector<TabletId>& tablet_ids,
-                               const FlushRequestId& flush_id,
-                               bool is_compaction);
+  void UpdateFlushRequestsUnlocked(const FlushRequestId& flush_id,
+                                   const TabletServerId& ts_uuid,
+                                   const Status& status) REQUIRES(lock_);
+
 
   void DeleteCompleteFlushRequests();
 
@@ -92,5 +98,4 @@ class FlushManager {
   DISALLOW_COPY_AND_ASSIGN(FlushManager);
 };
 
-} // namespace master
-} // namespace yb
+} // namespace yb::master

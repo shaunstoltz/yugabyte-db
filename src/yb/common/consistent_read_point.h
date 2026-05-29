@@ -1,4 +1,4 @@
-// Copyright (c) YugaByte, Inc.
+// Copyright (c) YugabyteDB, Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License"); you may not use this file except
 // in compliance with the License.  You may obtain a copy of the License at
@@ -13,18 +13,18 @@
 
 #pragma once
 
-#include <mutex>
-#include <set>
 #include <unordered_map>
-#include <utility>
 
 #include "yb/common/common_fwd.h"
 #include "yb/common/entity_ids_types.h"
 #include "yb/common/read_hybrid_time.h"
 
+#include "yb/gutil/macros.h"
+#include "yb/gutil/ref_counted.h"
 #include "yb/gutil/thread_annotations.h"
 
 #include "yb/util/locks.h"
+#include "yb/util/strongly_typed_bool.h"
 
 namespace yb {
 
@@ -34,30 +34,36 @@ YB_STRONGLY_TYPED_BOOL(HadReadTime);
 class ConsistentReadPoint {
  public:
   // A map of tablet id to local limits.
-  typedef std::unordered_map<TabletId, HybridTime> HybridTimeMap;
+  using HybridTimeMap = UnorderedStringMap<TabletId, HybridTime>;
 
   explicit ConsistentReadPoint(const scoped_refptr<ClockBase>& clock);
 
   void MoveFrom(ConsistentReadPoint* rhs);
 
   // Set the current time as the read point.
-  void SetCurrentReadTime() EXCLUDES(mutex_);
+  // No uncertainty window when clamp is set.
+  void SetCurrentReadTime(
+      ClampUncertaintyWindow clamp = ClampUncertaintyWindow::kFalse) EXCLUDES(mutex_);
+
+  // If read point is not set, use the current time as the read point and defer it to the global
+  // limit. If read point was already set, return error if it is not deferred.
+  Status TrySetDeferredCurrentReadTime() EXCLUDES(mutex_);
 
   // Set the read point to the specified read time with local limits.
   void SetReadTime(const ReadHybridTime& read_time, HybridTimeMap&& local_limits) EXCLUDES(mutex_);
 
-  ReadHybridTime GetReadTime() const;
+  [[nodiscard]] ReadHybridTime GetReadTime() const  EXCLUDES(mutex_);
 
   // Get the read time of this read point for a tablet.
-  ReadHybridTime GetReadTime(const TabletId& tablet) const EXCLUDES(mutex_);
+  [[nodiscard]] ReadHybridTime GetReadTime(TabletIdView tablet) const EXCLUDES(mutex_);
 
   // Notify that a tablet requires restart. This method is thread-safe.
-  void RestartRequired(const TabletId& tablet, const ReadHybridTime& restart_time) EXCLUDES(mutex_);
+  void RestartRequired(TabletIdView tablet, const ReadHybridTime& restart_time) EXCLUDES(mutex_);
 
-  void UpdateLocalLimit(const TabletId& tablet, HybridTime local_limit) EXCLUDES(mutex_);
+  void UpdateLocalLimit(TabletIdView tablet, HybridTime local_limit) EXCLUDES(mutex_);
 
   // Does the current read require restart?
-  bool IsRestartRequired() const EXCLUDES(mutex_);
+  [[nodiscard]] bool IsRestartRequired() const EXCLUDES(mutex_);
 
   // Restart read.
   void Restart() EXCLUDES(mutex_);
@@ -69,7 +75,7 @@ class ConsistentReadPoint {
   void UpdateClock(HybridTime propagated_hybrid_time) EXCLUDES(mutex_);
 
   // Return the current time to propagate.
-  HybridTime Now() const EXCLUDES(mutex_);
+  [[nodiscard]] HybridTime Now() const EXCLUDES(mutex_);
 
   // Prepare the read time and local limits in a child transaction.
   void PrepareChildTransactionData(ChildTransactionDataPB* data) const EXCLUDES(mutex_);
@@ -80,16 +86,49 @@ class ConsistentReadPoint {
 
   // Apply restart read times from a child transaction result. This method is thread-safe.
   void ApplyChildTransactionResult(const ChildTransactionResultPB& result) EXCLUDES(mutex_);
+  void ApplyChildTransactionResult(const LWChildTransactionResultPB& result) EXCLUDES(mutex_);
 
   // Sets in transaction limit.
   void SetInTxnLimit(HybridTime value) EXCLUDES(mutex_);
 
+  class Momento {
+   public:
+    const ReadHybridTime& read_time() const { return read_time_; }
+
+   private:
+    Momento(const ReadHybridTime& read_time,
+          HybridTime restart_read_ht,
+          const HybridTimeMap& local_limits,
+          const HybridTimeMap& restarts) :
+        read_time_(read_time),
+        restart_read_ht_(restart_read_ht),
+        local_limits_(local_limits),
+        restarts_(restarts) {}
+
+    ReadHybridTime read_time_;
+    HybridTime restart_read_ht_;
+    HybridTimeMap local_limits_;
+    HybridTimeMap restarts_;
+
+    friend class ConsistentReadPoint;
+  };
+
+  [[nodiscard]] Momento GetMomento() const EXCLUDES(mutex_);
+  void SetMomento(const ConsistentReadPoint::Momento& momento) EXCLUDES(mutex_);
+
  private:
+  inline void SetReadTimeUnlocked(
+      const ReadHybridTime& read_time, HybridTimeMap* local_limits = nullptr) REQUIRES(mutex_);
+  void SetCurrentReadTimeUnlocked(
+      ClampUncertaintyWindow clamp = ClampUncertaintyWindow::kFalse) REQUIRES(mutex_);
   void UpdateLimitsMapUnlocked(
-      const TabletId& tablet, const HybridTime& local_limit, HybridTimeMap* map) REQUIRES(mutex_);
-  void RestartRequiredUnlocked(const TabletId& tablet, const ReadHybridTime& restart_time)
+      TabletIdView tablet, const HybridTime& local_limit, HybridTimeMap* map) REQUIRES(mutex_);
+  void RestartRequiredUnlocked(TabletIdView tablet, const ReadHybridTime& restart_time)
       REQUIRES(mutex_);
-  bool IsRestartRequiredUnlocked() const REQUIRES(mutex_);
+  [[nodiscard]] bool IsRestartRequiredUnlocked() const REQUIRES(mutex_);
+
+  template <class PB>
+  void DoApplyChildTransactionResult(const PB& result) EXCLUDES(mutex_);
 
   const scoped_refptr<ClockBase> clock_;
 
@@ -105,6 +144,8 @@ class ConsistentReadPoint {
   // Restarts that happen during a consistent read. Used to initialise local_limits for restarted
   // read.
   HybridTimeMap restarts_ GUARDED_BY(mutex_);
+
+  DISALLOW_COPY_AND_ASSIGN(ConsistentReadPoint);
 };
 
 } // namespace yb

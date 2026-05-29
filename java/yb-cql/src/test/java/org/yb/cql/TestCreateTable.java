@@ -1,4 +1,4 @@
-// Copyright (c) YugaByte, Inc.
+// Copyright (c) YugabyteDB, Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License"); you may not use this file except
 // in compliance with the License.  You may obtain a copy of the License at
@@ -12,6 +12,8 @@
 //
 package org.yb.cql;
 
+import java.util.HashMap;
+
 import com.datastax.driver.core.ResultSet;
 import com.datastax.driver.core.Row;
 
@@ -22,6 +24,8 @@ import static org.yb.AssertionWrappers.assertNull;
 import static org.yb.AssertionWrappers.assertTrue;
 
 import java.util.Set;
+import java.util.Map;
+import java.util.HashMap;
 
 import org.yb.YBTestRunner;
 import org.junit.runner.RunWith;
@@ -187,6 +191,7 @@ public class TestCreateTable extends BaseCQLTest {
 
   @Test
   public void testCreateTableWithColumnNamedGroup() throws Exception {
+    // Run test with error suppressed as GROUP BY is not supported.
     LOG.info("Start test: " + getCurrentTestMethodName());
     testCreateTableWithColumnNamedKeyword("group");
 
@@ -207,6 +212,8 @@ public class TestCreateTable extends BaseCQLTest {
 
   @Test
   public void testCreateTableNumTablets() throws Exception {
+    restartClusterWithTSFlags(new HashMap<String, String>());
+    
     // Test default number of tablets.
     session.execute("CREATE TABLE test_num_tablets_1 (id int PRIMARY KEY);");
     Set<String> ids =

@@ -1,5 +1,5 @@
 //--------------------------------------------------------------------------------------------------
-// Copyright (c) YugaByte, Inc.
+// Copyright (c) YugabyteDB, Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License"); you may not use this file except
 // in compliance with the License.  You may obtain a copy of the License at
@@ -24,6 +24,7 @@
 
 #include "yb/yql/cql/ql/ptree/ptree_fwd.h"
 #include "yb/yql/cql/ql/ptree/process_context.h"
+#include "yb/yql/cql/ql/ql_fwd.h"
 
 namespace yb {
 namespace ql {
@@ -66,8 +67,10 @@ class SemContext : public ProcessContext {
 
   //------------------------------------------------------------------------------------------------
   // Constructor & destructor.
-  SemContext(ParseTreePtr parse_tree, QLEnv *ql_env);
+  SemContext(ParseTreePtr parse_tree, QLEnv *ql_env, const QLMetrics *ql_metrics);
   virtual ~SemContext();
+
+  const QLMetrics *ql_metrics_;
 
   // Memory pool for semantic analysis of the parse tree of a statement.
   MemoryContext *PSemMem() const;

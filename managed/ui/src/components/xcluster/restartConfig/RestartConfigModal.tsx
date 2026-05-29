@@ -1,240 +1,393 @@
-import React, { useRef, useState } from 'react';
+import { useRef, useState } from 'react';
 import { useMutation, useQuery, useQueryClient } from 'react-query';
 import { FormikActions, FormikErrors, FormikProps } from 'formik';
 import { toast } from 'react-toastify';
+import { AxiosError } from 'axios';
+import { useTranslation } from 'react-i18next';
+import { Typography } from '@material-ui/core';
 
 import { YBModalForm } from '../../common/forms';
-import { PARALLEL_THREADS_RANGE } from '../../backupv2/common/BackupUtils';
 import { YBButton, YBModal } from '../../common/forms/fields';
 import { YBErrorIndicator, YBLoading } from '../../common/indicators';
 import { ConfigureBootstrapStep } from './ConfigureBootstrapStep';
-import { TableTypeLabel, Universe } from '../../../redesign/helpers/dtos';
-import { api } from '../../../redesign/helpers/api';
-import { isYbcEnabledUniverse } from '../../../utils/UniverseUtils';
+import { ConfigTableSelect } from '../sharedComponents/tableSelect/ConfigTableSelect';
+import {
+  api,
+  drConfigQueryKey,
+  universeQueryKey,
+  xClusterQueryKey
+} from '../../../redesign/helpers/api';
 import {
   fetchTaskUntilItCompletes,
+  fetchXClusterConfig,
   restartXClusterConfig
 } from '../../../actions/xClusterReplication';
-import { assertUnreachableCase } from '../../../utils/ErrorUtils';
-import { ConfigTableSelect } from '../common/tableSelect/ConfigTableSelect';
-
-import { XClusterConfig, XClusterTableType } from '../XClusterTypes';
+import { isActionFrozen } from '../../../redesign/helpers/utils';
+import { assertUnreachableCase, handleServerError } from '../../../utils/errorHandlingUtils';
+import { XClusterConfig } from '../dtos';
+import {
+  AllowedTasks,
+  TableType,
+  Universe,
+  UniverseNamespace
+} from '../../../redesign/helpers/dtos';
+import { DrConfig } from '../disasterRecovery/dtos';
+import {
+  SOURCE_MISSING_XCLUSTER_TABLE_STATUSES,
+  XClusterConfigStatus,
+  XClusterTableStatus
+} from '../constants';
+import { UNIVERSE_TASKS } from '../../../redesign/helpers/constants';
+import { getXClusterConfigTableType } from '../ReplicationUtils';
+import { XClusterTableType } from '../XClusterTypes';
 
 import styles from './RestartConfigModal.module.scss';
 
 export interface RestartXClusterConfigFormValues {
-  tableUUIDs: string[];
+  tableUuids: string[];
+  namespaceUuids: string[];
   // Bootstrap fields
   storageConfig: { label: string; name: string; regions: any[]; value: string };
-  parallelThreads: number;
 }
 
 export interface RestartXClusterConfigFormErrors {
   tableUUIDs: { title: string; body: string };
   // Bootstrap fields
   storageConfig: string;
-  parallelThreads: string;
 }
 
 export interface RestartXClusterConfigFormWarnings {
   tableUUIDs?: { title: string; body: string };
   // Bootstrap fields
   storageConfig?: string;
-  parallelThreads?: string;
 }
 
-interface RestartConfigModalProps {
-  configTableType: XClusterTableType;
+interface CommonRestartConfigModalProps {
   isVisible: boolean;
   onHide: () => void;
-  xClusterConfig: XClusterConfig;
+  allowedTasks: AllowedTasks;
+  xClusterConfigUuid: string;
 }
+type RestartConfigModalProps =
+  | (CommonRestartConfigModalProps & {
+      isDrInterface: true;
+      drConfig: DrConfig;
+    })
+  | (CommonRestartConfigModalProps & { isDrInterface: false });
 
 export const FormStep = {
+  // Uninitialized step is used as a temporary step while
+  // the xCluster config is still being fetched.
+  // The actual first step of the form depends on the state of the
+  // xCluster config.
+  UNINITIALIZED: 'uninitialized',
   SELECT_TABLES: 'selectTables',
   CONFIGURE_BOOTSTRAP: 'configureBootstrap'
 } as const;
-// eslint-disable-next-line no-redeclare
 export type FormStep = typeof FormStep[keyof typeof FormStep];
 
-const MODAL_TITLE = 'Restart Replication';
-const FIRST_FORM_STEP = FormStep.SELECT_TABLES;
-const INITIAL_VALUES: Partial<RestartXClusterConfigFormValues> = {
-  tableUUIDs: [],
-  // Bootstrap fields
-  parallelThreads: PARALLEL_THREADS_RANGE.MIN
-};
+const TRANSLATION_KEY_PREFIX = 'clusterDetail.xCluster.restartReplicationModal';
+const TRANSLATION_KEY_PREFIX_QUERY_ERROR = 'queryError';
+const TRANSLATION_KEY_PREFIX_XCLUSTER = 'clusterDetail.xCluster';
 
-export const RestartConfigModal = ({
-  configTableType,
-  isVisible,
-  onHide,
-  xClusterConfig
-}: RestartConfigModalProps) => {
-  const [currentStep, setCurrentStep] = useState<FormStep>(FIRST_FORM_STEP);
+export const RestartConfigModal = (props: RestartConfigModalProps) => {
+  const { isVisible, onHide, xClusterConfigUuid } = props;
+
+  const [currentFormStep, setCurrentFormStep] = useState<FormStep>(FormStep.UNINITIALIZED);
   const [formWarnings, setFormWarnings] = useState<RestartXClusterConfigFormWarnings>();
-
-  // Need to store this to support navigating between pages
-  const [selectedKeyspaces, setSelectedKeyspaces] = useState<string[]>([]);
 
   const queryClient = useQueryClient();
   const formik = useRef({} as FormikProps<RestartXClusterConfigFormValues>);
+  const { t } = useTranslation('translation', { keyPrefix: TRANSLATION_KEY_PREFIX });
 
+  // We always want to fetch a fresh xCluster config before presenting the user with
+  // xCluster table actions (add/remove/restart). This is because it gives the backend
+  // an opportunity to sync with the DB and add/drop tables as needed.
+  const xClusterConfigFullQuery = useQuery(
+    xClusterQueryKey.detail(xClusterConfigUuid),
+    () => fetchXClusterConfig(xClusterConfigUuid),
+    { refetchOnMount: 'always' }
+  );
   const sourceUniverseQuery = useQuery<Universe>(
-    ['universe', xClusterConfig.sourceUniverseUUID],
-    () => api.fetchUniverse(xClusterConfig.sourceUniverseUUID)
+    universeQueryKey.detail(xClusterConfigFullQuery.data?.sourceUniverseUUID),
+    () => api.fetchUniverse(xClusterConfigFullQuery.data?.sourceUniverseUUID),
+    { enabled: !!xClusterConfigFullQuery.data }
+  );
+
+  const sourceUniverseNamespaceQuery = useQuery<UniverseNamespace[]>(
+    universeQueryKey.namespaces(xClusterConfigFullQuery.data?.sourceUniverseUUID),
+    () => api.fetchUniverseNamespaces(xClusterConfigFullQuery.data?.sourceUniverseUUID)
   );
 
   const restartConfigMutation = useMutation(
-    (values: RestartXClusterConfigFormValues) => {
-      // Currently backend only supports restart replication for the
-      // entire config. Table level restart support is coming soon.
-      const tables: string[] = values.tableUUIDs;
-      return restartXClusterConfig(xClusterConfig.uuid, tables, {
-        backupRequestParams: {
-          storageConfigUUID: values.storageConfig.value,
-          parallelism: values.parallelThreads,
-          sse: values.storageConfig.name === 'S3',
-          universeUUID: null
-        }
-      });
+    (formValues: RestartXClusterConfigFormValues) => {
+      return props.isDrInterface
+        ? api.restartDrConfig(props.drConfig.uuid, {
+            dbs: formValues.namespaceUuids
+          })
+        : restartXClusterConfig(xClusterConfigUuid, formValues.tableUuids, {
+            allowBootstrap: true,
+            backupRequestParams: {
+              storageConfigUUID: formValues.storageConfig.value
+            }
+          });
     },
     {
       onSuccess: (response) => {
-        closeModal();
-
-        fetchTaskUntilItCompletes(
-          response.data.taskUUID,
-          (err: boolean) => {
-            if (err) {
-              toast.error(
-                <span className={styles.alertMsg}>
-                  <i className="fa fa-exclamation-circle" />
-                  <span>Replication restart failed.</span>
-                  <a
-                    href={`/tasks/${response.data.taskUUID}`}
-                    rel="noopener noreferrer"
-                    target="_blank"
-                  >
-                    View Details
-                  </a>
-                </span>
-              );
-            }
-            queryClient.invalidateQueries(['Xcluster', xClusterConfig.uuid]);
-          },
-          // Invalidate the cached data for current xCluster config. The xCluster config status should change to
-          // 'in progress' once the restart config task starts.
-          () => {
-            queryClient.invalidateQueries(['Xcluster', xClusterConfig.uuid]);
+        const invalidateQueries = () => {
+          if (props.isDrInterface) {
+            queryClient.invalidateQueries(drConfigQueryKey.detail(props.drConfig.uuid));
           }
+          queryClient.invalidateQueries(xClusterQueryKey.detail(xClusterConfig.uuid));
+        };
+        const handleTaskCompletion = (error: boolean) => {
+          if (error) {
+            toast.error(
+              <span className={styles.alertMsg}>
+                <i className="fa fa-exclamation-circle" />
+                <span>{t('error.taskFailure')}</span>
+                <a href={`/tasks/${response.taskUUID}`} rel="noopener noreferrer" target="_blank">
+                  {t('viewDetails', { keyPrefix: 'task' })}
+                </a>
+              </span>
+            );
+          } else {
+            toast.success(
+              <Typography variant="body2" component="span">
+                {t(`success.taskSuccess.${props.isDrInterface ? 'dr' : 'xCluster'}`)}
+              </Typography>
+            );
+          }
+        };
+
+        toast.success(
+          <Typography variant="body2" component="span">
+            {t('success.requestSuccess')}
+          </Typography>
         );
+        closeModal();
+        fetchTaskUntilItCompletes(response.taskUUID, handleTaskCompletion, invalidateQueries);
       },
-      onError: (error: any) => {
-        toast.error(
-          <span className={styles.alertMsg}>
-            <i className="fa fa-exclamation-circle" />
-            <span>{error.message}</span>
-          </span>
-        );
-      }
+      onError: (error: Error | AxiosError) =>
+        handleServerError(error, { customErrorLabel: t('error.requestFailureLabel') })
     }
   );
 
   const resetModalState = () => {
-    setCurrentStep(FIRST_FORM_STEP);
+    setCurrentFormStep(FormStep.UNINITIALIZED);
     setFormWarnings({});
-    setSelectedKeyspaces([]);
   };
   const closeModal = () => {
     resetModalState();
     onHide();
   };
 
+  const getFormSubmitLabel = (formStep: FormStep) => {
+    switch (formStep) {
+      case FormStep.UNINITIALIZED:
+        return '';
+      case FormStep.SELECT_TABLES:
+        return t(`step.selectTables.submitButton.${props.isDrInterface ? 'dr' : 'xCluster'}`);
+      case FormStep.CONFIGURE_BOOTSTRAP:
+        return t('step.configureBootstrap.submitButton');
+      default:
+        return assertUnreachableCase(formStep);
+    }
+  };
+  const modalTitle = t(`title.${props.isDrInterface ? 'dr' : 'xCluster'}`);
+  if (
+    xClusterConfigFullQuery.isLoading ||
+    xClusterConfigFullQuery.isIdle ||
+    sourceUniverseQuery.isLoading ||
+    sourceUniverseQuery.isIdle ||
+    sourceUniverseNamespaceQuery.isLoading ||
+    sourceUniverseNamespaceQuery.isIdle
+  ) {
+    return (
+      <YBModal
+        size="large"
+        title={modalTitle}
+        visible={isVisible}
+        onHide={() => {
+          closeModal();
+        }}
+      >
+        <YBLoading />
+      </YBModal>
+    );
+  }
+
+  if (xClusterConfigFullQuery.isError) {
+    return (
+      <YBModal
+        title={modalTitle}
+        visible={isVisible}
+        onHide={() => {
+          closeModal();
+        }}
+      >
+        <YBErrorIndicator
+          customErrorMessage={t('failedToFetchXClusterConfig', {
+            keyPrefix: TRANSLATION_KEY_PREFIX_QUERY_ERROR,
+            xClusterConfigUuid: xClusterConfigUuid
+          })}
+        />
+      </YBModal>
+    );
+  }
+
+  const xClusterConfig = xClusterConfigFullQuery.data;
+  // If xCluster config is in failed or initialized state, then we should restart the whole xCluster config.
+  // Allowing partial restarts when the xCluster config is in initialized status is not expected behavior.
+  // Thus, we skip table selection for the xCluster config setup failed scenario.
+  const isTableSelectionAllowed = !(
+    xClusterConfig.status === XClusterConfigStatus.FAILED ||
+    xClusterConfig.status === XClusterConfigStatus.INITIALIZED
+  );
+  const firstFormStep = !isTableSelectionAllowed
+    ? FormStep.CONFIGURE_BOOTSTRAP
+    : FormStep.SELECT_TABLES;
+  if (currentFormStep === FormStep.UNINITIALIZED) {
+    setCurrentFormStep(firstFormStep);
+  }
+  const configTableType = getXClusterConfigTableType(xClusterConfig);
+  if (
+    sourceUniverseQuery.isError ||
+    (sourceUniverseNamespaceQuery.isError && isTableSelectionAllowed) ||
+    configTableType === null
+  ) {
+    const errorMessage = sourceUniverseQuery.isError
+      ? props.isDrInterface
+        ? t('failedToFetchDrPrimaryUniverse', {
+            keyPrefix: TRANSLATION_KEY_PREFIX_QUERY_ERROR,
+            universeUuid: xClusterConfig.sourceUniverseUUID
+          })
+        : t('failedToFetchSourceUniverse', {
+            keyPrefix: TRANSLATION_KEY_PREFIX_QUERY_ERROR,
+            universeUuid: xClusterConfig.sourceUniverseUUID
+          })
+      : sourceUniverseNamespaceQuery.isError
+      ? props.isDrInterface
+        ? t('failedToFetchDrPrimaryNamespaces', {
+            keyPrefix: TRANSLATION_KEY_PREFIX_QUERY_ERROR,
+            universeUuid: xClusterConfig.sourceUniverseUUID
+          })
+        : t('failedToFetchSourceUniverseNamespaces', {
+            keyPrefix: TRANSLATION_KEY_PREFIX_QUERY_ERROR,
+            universeUuid: xClusterConfig.sourceUniverseUUID
+          })
+      : t('error.undefinedXClusterTableType', {
+          keyPrefix: TRANSLATION_KEY_PREFIX_XCLUSTER
+        });
+    return (
+      <YBModal
+        size="large"
+        title={modalTitle}
+        visible={isVisible}
+        onHide={() => {
+          closeModal();
+        }}
+      >
+        <YBErrorIndicator customErrorMessage={errorMessage} />
+      </YBModal>
+    );
+  }
+
   const handleFormSubmit = async (
     values: RestartXClusterConfigFormValues,
     actions: FormikActions<RestartXClusterConfigFormValues>
   ) => {
-    switch (currentStep) {
+    switch (currentFormStep) {
+      case FormStep.UNINITIALIZED:
+        return;
       case FormStep.SELECT_TABLES:
-        setCurrentStep(FormStep.CONFIGURE_BOOTSTRAP);
+        setCurrentFormStep(FormStep.CONFIGURE_BOOTSTRAP);
         actions.setSubmitting(false);
         return;
       case FormStep.CONFIGURE_BOOTSTRAP:
         restartConfigMutation.mutate(values, { onSettled: () => actions.setSubmitting(false) });
         return;
       default:
-        assertUnreachableCase(currentStep);
+        assertUnreachableCase(currentFormStep);
     }
   };
 
-  const submitLabel = getFormSubmitLabel(currentStep);
-  if (sourceUniverseQuery.isLoading || sourceUniverseQuery.isIdle) {
-    return (
-      <YBModal
-        size="large"
-        title={MODAL_TITLE}
-        visible={isVisible}
-        onHide={() => {
-          closeModal();
-        }}
-        submitLabel={submitLabel}
-      >
-        <YBLoading />
-      </YBModal>
-    );
-  }
-  if (sourceUniverseQuery.isError) {
-    return (
-      <YBModal
-        size="large"
-        title={MODAL_TITLE}
-        visible={isVisible}
-        onHide={() => {
-          closeModal();
-        }}
-      >
-        <YBErrorIndicator />
-      </YBModal>
-    );
-  }
+  const { defaultTableUuids, defaultNamespaces } = getDefaultFormValues(
+    xClusterConfig,
+    configTableType
+  );
+  const namespaceToNamespaceUuid = Object.fromEntries(
+    sourceUniverseNamespaceQuery.data?.map((namespace) => [
+      namespace.name,
+      namespace.namespaceUUID
+    ]) ?? []
+  );
+  const initialValues: Partial<RestartXClusterConfigFormValues> = isTableSelectionAllowed
+    ? {
+        // Preselect all the tables in `ERROR` status, because in most cases these are the
+        // tables that the user wants to restart.
+        tableUuids: defaultTableUuids,
+        namespaceUuids: defaultNamespaces.map((namespace) => namespaceToNamespaceUuid[namespace])
+      }
+    : { tableUuids: [], namespaceUuids: [] };
 
+  const isButtonDisabled = props.isDrInterface
+    ? isActionFrozen(props.allowedTasks, UNIVERSE_TASKS.RESTART_DR)
+    : isActionFrozen(props.allowedTasks, UNIVERSE_TASKS.RESTART_REPLICATION);
+  const submitLabel = getFormSubmitLabel(currentFormStep);
   return (
     <YBModalForm
       size="large"
-      title={MODAL_TITLE}
+      title={modalTitle}
       visible={isVisible}
       validate={(values: RestartXClusterConfigFormValues) =>
-        validateForm(values, currentStep, sourceUniverseQuery.data)
+        validateForm(values, currentFormStep, props.isDrInterface, configTableType)
       }
       onFormSubmit={handleFormSubmit}
-      initialValues={INITIAL_VALUES}
+      initialValues={initialValues}
       submitLabel={submitLabel}
       onHide={() => {
         closeModal();
       }}
+      isButtonDisabled={isButtonDisabled}
       footerAccessory={<YBButton btnClass="btn" btnText={'Cancel'} onClick={closeModal} />}
       render={(formikProps: FormikProps<RestartXClusterConfigFormValues>) => {
         // workaround for outdated version of Formik to access form methods outside of <Formik>
         formik.current = formikProps;
-        switch (currentStep) {
+
+        switch (currentFormStep) {
+          case FormStep.UNINITIALIZED:
+            // This is unreachable because we initialize the form step after fetching the xCluster config.
+            // We also display an error or loading page before reaching this return if the xCluster config
+            // query is not successfully completed.
+            return <></>;
           case FormStep.SELECT_TABLES: {
             // Casting because FormikValues and FormikError have different types.
             const errors = formik.current.errors as FormikErrors<RestartXClusterConfigFormErrors>;
             return (
               <>
                 <div className={styles.formInstruction}>
-                  {`1. Select the ${TableTypeLabel[configTableType]} tables you want to restart replication for.`}
+                  {t(
+                    `step.selectTables.instruction.${
+                      props.isDrInterface
+                        ? 'dr'
+                        : configTableType === TableType.PGSQL_TABLE_TYPE
+                        ? 'xClusterYsql'
+                        : 'xClusterYcql'
+                    }`
+                  )}
                 </div>
                 <ConfigTableSelect
                   {...{
                     xClusterConfig,
-                    selectedTableUUIDs: formik.current.values.tableUUIDs,
-                    setSelectedTableUUIDs: (tableUUIDs: string[]) =>
-                      formik.current.setFieldValue('tableUUIDs', tableUUIDs),
+                    selectedTableUuids: formik.current.values.tableUuids,
+                    setSelectedTableUuids: (tableUuids: string[]) =>
+                      formik.current.setFieldValue('tableUuids', tableUuids),
+                    isDrInterface: !!props.isDrInterface,
                     configTableType,
-                    selectedKeyspaces,
-                    setSelectedKeyspaces,
+                    selectedNamespaceUuids: formik.current.values.namespaceUuids,
+                    setSelectedNamespaceUuids: (namespaceUuids: string[]) =>
+                      formik.current.setFieldValue('namespaceUuids', namespaceUuids),
                     selectionError: errors.tableUUIDs,
                     selectionWarning: formWarnings?.tableUUIDs
                   }}
@@ -245,13 +398,25 @@ export const RestartConfigModal = ({
           case FormStep.CONFIGURE_BOOTSTRAP: {
             return (
               <>
-                <div className={styles.formInstruction}>2. Configure bootstrap</div>
-                <ConfigureBootstrapStep formik={formik} />
+                <div className={styles.formInstruction}>
+                  {t(
+                    `step.configureBootstrap.instruction.${props.isDrInterface ? 'dr' : 'xCluster'}`
+                  )}
+                </div>
+                <ConfigureBootstrapStep
+                  isDrInterface={!!props.isDrInterface}
+                  formik={formik}
+                  storageConfigUuid={
+                    props.isDrInterface
+                      ? props.drConfig.bootstrapParams.backupRequestParams.storageConfigUUID
+                      : undefined
+                  }
+                />
               </>
             );
           }
           default:
-            return assertUnreachableCase(currentStep);
+            return assertUnreachableCase(currentFormStep);
         }
       }}
     />
@@ -261,37 +426,32 @@ export const RestartConfigModal = ({
 const validateForm = async (
   values: RestartXClusterConfigFormValues,
   formStep: FormStep,
-  currentUniverse: Universe
+  isDrInterface: boolean,
+  tableType: XClusterTableType
 ) => {
-  // Since our formik verision is < 2.0 , we need to throw errors instead of
+  // Since our formik version is < 2.0 , we need to throw errors instead of
   // returning them in custom async validation:
   // https://github.com/jaredpalmer/formik/issues/1392#issuecomment-606301031
 
   switch (formStep) {
     case FormStep.SELECT_TABLES: {
       const errors: Partial<RestartXClusterConfigFormErrors> = {};
-      if (!values.tableUUIDs || values.tableUUIDs.length === 0) {
+      if (!values.tableUuids || values.tableUuids.length === 0) {
         errors.tableUUIDs = {
-          title: 'No tables selected.',
-          body: 'Select at least 1 table to proceed'
+          title: `No ${
+            tableType === TableType.PGSQL_TABLE_TYPE ? 'databases' : 'tables'
+          } selected.`,
+          body: `Select at least 1 ${
+            tableType === TableType.PGSQL_TABLE_TYPE ? 'database' : 'table'
+          } to proceed`
         };
       }
       throw errors;
     }
     case FormStep.CONFIGURE_BOOTSTRAP: {
       const errors: Partial<RestartXClusterConfigFormErrors> = {};
-      if (!values.storageConfig) {
+      if (!values.storageConfig && !isDrInterface) {
         errors.storageConfig = 'Backup storage configuration is required.';
-      }
-      const shouldValidateParallelThread =
-        values.parallelThreads && isYbcEnabledUniverse(currentUniverse?.universeDetails);
-      if (shouldValidateParallelThread && values.parallelThreads > PARALLEL_THREADS_RANGE.MAX) {
-        errors.parallelThreads = `Parallel threads must be less than or equal to ${PARALLEL_THREADS_RANGE.MAX}`;
-      } else if (
-        shouldValidateParallelThread &&
-        values.parallelThreads < PARALLEL_THREADS_RANGE.MIN
-      ) {
-        errors.parallelThreads = `Parallel threads must be greater than or equal to ${PARALLEL_THREADS_RANGE.MIN}`;
       }
 
       throw errors;
@@ -301,13 +461,57 @@ const validateForm = async (
   }
 };
 
-const getFormSubmitLabel = (formStep: FormStep) => {
-  switch (formStep) {
-    case FormStep.SELECT_TABLES:
-      return 'Next: Configure Bootstrap';
-    case FormStep.CONFIGURE_BOOTSTRAP:
-      return 'Restart Replication';
-    default:
-      return assertUnreachableCase(formStep);
+const getDefaultFormValues = (
+  xClusterConfig: XClusterConfig,
+  configTableType: XClusterTableType
+): { defaultTableUuids: string[]; defaultNamespaces: string[] } => {
+  const tableUuidsInErrorStatus = xClusterConfig.tableDetails
+    .filter((tableDetail) => tableDetail.status === XClusterTableStatus.ERROR)
+    .map((tableDetail) => tableDetail.tableId);
+
+  // For YCQL, backup and restore can be done at the table level so we simply
+  // set the tables which are in error state as selected by default.
+  if (configTableType === TableType.YQL_TABLE_TYPE) {
+    return {
+      defaultTableUuids: tableUuidsInErrorStatus,
+      defaultNamespaces: []
+    };
   }
+
+  // For YSQL, backup and restore can only be done at the database level.
+  // Thus, we preselect all tables in any database containing tables in error state.
+  const selectedTableUuids = new Set<string>();
+  const selectedNamespace = new Set<string>();
+  const ysqlNamespaceToConfiguredTableUuids = new Map<string, Set<string>>();
+
+  xClusterConfig.tableDetails.forEach((tableDetail) => {
+    const namespace =
+      tableDetail.sourceTableInfo?.keySpace ?? tableDetail.targetTableInfo?.keySpace;
+    if (namespace && !SOURCE_MISSING_XCLUSTER_TABLE_STATUSES.includes(tableDetail.status)) {
+      const tableUuids = ysqlNamespaceToConfiguredTableUuids.get(namespace);
+
+      if (tableUuids !== undefined) {
+        tableUuids.add(tableDetail.tableId);
+      } else {
+        ysqlNamespaceToConfiguredTableUuids.set(
+          namespace,
+          new Set<string>([tableDetail.tableId])
+        );
+      }
+      if (tableUuidsInErrorStatus.includes(tableDetail.tableId)) {
+        selectedNamespace.add(namespace);
+      }
+    }
+
+    selectedNamespace.forEach((namespace) => {
+      const tableUuids = ysqlNamespaceToConfiguredTableUuids.get(namespace);
+      tableUuids?.forEach((tableUuid) => {
+        selectedTableUuids.add(tableUuid);
+      });
+    });
+  });
+  return {
+    defaultTableUuids: Array.from(selectedTableUuids),
+    defaultNamespaces: Array.from(selectedNamespace)
+  };
 };

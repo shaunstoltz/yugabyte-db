@@ -1,5 +1,5 @@
 //--------------------------------------------------------------------------------------------------
-// Copyright (c) YugaByte, Inc.
+// Copyright (c) YugabyteDB, Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License"); you may not use this file except
 // in compliance with the License.  You may obtain a copy of the License at
@@ -15,54 +15,30 @@
 
 #include "yb/yql/pggate/pg_select_index.h"
 
+#include "yb/util/atomic.h"
 #include "yb/util/status_format.h"
 
+#include "yb/yql/pggate/pggate_flags.h"
 #include "yb/yql/pggate/util/pg_doc_data.h"
 
-using std::vector;
 
-namespace yb {
-namespace pggate {
+namespace yb::pggate {
 
-//--------------------------------------------------------------------------------------------------
-// PgSelectIndex
-//--------------------------------------------------------------------------------------------------
-
-PgSelectIndex::PgSelectIndex(PgSession::ScopedRefPtr pg_session,
-                             const PgObjectId& table_id,
-                             const PgObjectId& index_id,
-                             const PgPrepareParameters *prepare_params,
-                             bool is_region_local)
-    : PgSelect(pg_session, table_id, index_id, prepare_params, is_region_local) {
+PgSelectIndex::PgSelectIndex(const PgSessionPtr& pg_session)
+    : PgSelect(pg_session) {
 }
 
-Result<PgTableDescPtr> PgSelectIndex::LoadTable() {
-  return pg_session_->LoadTable(index_id_);
-}
-
-bool PgSelectIndex::UseSecondaryIndex() const {
-  return false;
-}
-
-Status PgSelectIndex::PrepareSubquery(std::shared_ptr<LWPgsqlReadRequestPB> read_req) {
-  if (!read_req) {
-    return PgSelect::Prepare();
-  }
-
-  SCHECK(prepare_params_.use_secondary_index && !prepare_params_.index_only_scan,
-         InvalidArgument,
-         "Unexpected Index scan type");
-
+Status PgSelectIndex::PrepareSubquery(
+    const PgObjectId& index_id, bool skip_intents_read,
+    std::shared_ptr<LWPgsqlReadRequestPB>&& read_req) {
   // Setup target and bind descriptor.
-  target_ = bind_ = PgTable(VERIFY_RESULT(pg_session_->LoadTable(index_id_)));
+  target_ = bind_ = PgTable(VERIFY_RESULT(pg_session_->LoadTable(index_id)));
 
-  // For (system and user) colocated tables, SelectIndex is a part of Select and being sent
-  // together with the SELECT protobuf request. A read doc_op and request is not needed in this
-  // case.
-  RSTATUS_DCHECK(
-      prepare_params_.querying_colocated_table, InvalidArgument, "Read request invalid");
   read_req_ = std::move(read_req);
-  read_req_->dup_table_id(index_id_.GetYbTableId()); // TODO(LW_PERFORM)
+  if (read_req_ && skip_intents_read) {
+    read_req_->set_skip_intents_read(skip_intents_read);
+  }
+  read_req_->dup_table_id(index_id.GetYbTableId()); // TODO(LW_PERFORM)
 
   // Prepare index key columns.
   PrepareBinds();
@@ -70,35 +46,27 @@ Status PgSelectIndex::PrepareSubquery(std::shared_ptr<LWPgsqlReadRequestPB> read
   return Status::OK();
 }
 
-Result<bool> PgSelectIndex::FetchYbctidBatch(const vector<Slice> **ybctids) {
-  // Keep reading until we get one batch of ybctids or EOF.
-  while (!VERIFY_RESULT(GetNextYbctidBatch())) {
-    if (!VERIFY_RESULT(FetchDataFromServer())) {
-      // Server returns no more rows.
-      *ybctids = nullptr;
-      return false;
-    }
+Result<std::optional<YbctidBatch>> PgSelectIndex::FetchYbctidBatch() {
+  ybctids_.Clear();
+  auto& ybctids = ybctids_.values;
+  if (!VERIFY_RESULT(doc_op_->ResultStream().ProcessNextYbctids(
+          [&ybctids](Slice ybctid) { ybctids.push_back(ybctid); }, &ybctids_.retention))) {
+    return std::nullopt;
   }
-
-  // Got the next batch of ybctids.
-  DCHECK(!rowsets_.empty());
-  *ybctids = &rowsets_.front().ybctids();
-  return true;
+  AtomicFlagSleepMs(&FLAGS_TEST_inject_delay_between_prepare_ybctid_execute_batch_ybctid_ms);
+  return YbctidBatch{ybctids, read_req_->has_is_forward_scan()};
 }
 
-Result<bool> PgSelectIndex::GetNextYbctidBatch() {
-  for (auto rowset_iter = rowsets_.begin(); rowset_iter != rowsets_.end();) {
-    if (rowset_iter->is_eof()) {
-      rowset_iter = rowsets_.erase(rowset_iter);
-    } else {
-      // Write all found rows to ybctid array.
-      RETURN_NOT_OK(rowset_iter->ProcessSystemColumns());
-      return true;
-    }
-  }
-
-  return false;
+Result<std::unique_ptr<PgSelectIndex>> PgSelectIndex::Make(
+    const PgSessionPtr& pg_session, const PgObjectId& index_id,
+    const YbcPgTableLocalityInfo& locality_info,
+    bool skip_intents_read,
+    std::shared_ptr<LWPgsqlReadRequestPB>&& read_req) {
+  std::unique_ptr<PgSelectIndex> result{new PgSelectIndex{pg_session}};
+  RETURN_NOT_OK(read_req
+      ? result->PrepareSubquery(index_id, skip_intents_read, std::move(read_req))
+      : result->Prepare(index_id, locality_info, skip_intents_read));
+  return result;
 }
 
-}  // namespace pggate
-}  // namespace yb
+}  // namespace yb::pggate

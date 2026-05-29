@@ -3,7 +3,7 @@
  * yb_catalog_version.h
  *	  utility functions related to the ysql catalog version table.
  *
- * Portions Copyright (c) YugaByte, Inc.
+ * Portions Copyright (c) YugabyteDB, Inc.
  *
  * src/include/catalog/yb_catalog_version.h
  *
@@ -12,6 +12,8 @@
 
 #pragma once
 
+#include "pg_yb_utils.h"
+#include "storage/sinval.h"
 #include "yb/yql/pggate/ybc_pg_typedefs.h"
 
 /*
@@ -24,18 +26,23 @@
  */
 typedef enum YbCatalogVersionType
 {
-	CATALOG_VERSION_UNSET,           /* Not yet set. */
-	CATALOG_VERSION_PROTOBUF_ENTRY,  /* Old protobuf-based version. */
-	CATALOG_VERSION_CATALOG_TABLE,   /* New table-based version. */
+	CATALOG_VERSION_UNSET,		/* Not yet set. */
+	CATALOG_VERSION_PROTOBUF_ENTRY, /* Old protobuf-based version. */
+	CATALOG_VERSION_CATALOG_TABLE,	/* New table-based version. */
 } YbCatalogVersionType;
 
 extern YbCatalogVersionType yb_catalog_version_type;
 
 /* Get the latest catalog version from the master leader. */
 extern uint64_t YbGetMasterCatalogVersion();
+extern void YbMaybeLockMasterCatalogVersion();
 
 /* Send a request to increment the master catalog version. */
-extern bool YbIncrementMasterCatalogVersionTableEntry(bool is_breaking_change);
+extern bool YbIncrementMasterCatalogVersionTableEntry(bool is_breaking_change,
+													  bool is_global_ddl,
+													  const char *command_tag,
+													  const SharedInvalidationMessage *invalMessages,
+													  int nmsgs);
 
 /* Send a request to create the master catalog version for the given database. */
 extern void YbCreateMasterDBCatalogVersionTableEntry(Oid db_oid);
@@ -43,10 +50,11 @@ extern void YbCreateMasterDBCatalogVersionTableEntry(Oid db_oid);
 /* Send a request to delete the master catalog version for the given database. */
 extern void YbDeleteMasterDBCatalogVersionTableEntry(Oid db_oid);
 
+extern void YbDeleteMasterDBInvalidationMessagesTableEntries(Oid db_oid);
+
 /* Annotate an DML request if it changes the catalog data (if needed). */
-extern bool YbMarkStatementIfCatalogVersionIncrement(
-	YBCPgStatement ybc_stmt,
-	Relation rel);
+extern bool YbMarkStatementIfCatalogVersionIncrement(YbcPgStatement ybc_stmt,
+													 Relation rel);
 
 extern bool YbIsSystemCatalogChange(Relation rel);
 
@@ -54,4 +62,4 @@ extern bool YbIsSystemCatalogChange(Relation rel);
 extern YbCatalogVersionType YbGetCatalogVersionType();
 
 /* Get actual db_oid for pg_yb_catalog_version */
-Oid YbMasterCatalogVersionTableDBOid();
+Oid			YbMasterCatalogVersionTableDBOid();

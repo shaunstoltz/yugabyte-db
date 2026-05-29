@@ -1,9 +1,9 @@
 //
 // Copyright (C) 1999 and onwards Google, Inc.
 //
-// The following only applies to changes made to this file as part of YugaByte development.
+// The following only applies to changes made to this file as part of YugabyteDB development.
 //
-// Portions Copyright (c) YugaByte, Inc.
+// Portions Copyright (c) YugabyteDB, Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License"); you may not use this file except
 // in compliance with the License.  You may obtain a copy of the License at
@@ -91,6 +91,7 @@
 #include <string.h>
 #include <algorithm>
 #include <string>
+#include <string_view>
 #include <utility>
 
 #include "yb/gutil/casts.h"
@@ -152,7 +153,7 @@ inline uint64 CombineFingerprintHalves(uint32 hi, uint32 lo) {
 inline uint64 Fingerprint(const std::string& s) {
   return Fingerprint(s.data(), static_cast<uint32>(s.size()));
 }
-inline uint64 Hash64StringWithSeed(const std::string& s, uint64 c) {
+inline uint64 Hash64StringWithSeed(std::string_view s, uint64 c) {
   return Hash64StringWithSeed(s.data(), static_cast<uint32>(s.size()), c);
 }
 inline uint64 Fingerprint(schar c) {

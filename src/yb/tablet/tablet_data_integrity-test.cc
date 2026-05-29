@@ -1,4 +1,4 @@
-// Copyright (c) Yugabyte, Inc.
+// Copyright (c) YugabyteDB, Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License"); you may not use this file except
 // in compliance with the License.  You may obtain a copy of the License at
@@ -13,7 +13,7 @@
 
 #include <gtest/gtest.h>
 
-#include "yb/common/ql_expr.h"
+#include "yb/qlexpr/ql_expr.h"
 
 #include "yb/gutil/stl_util.h"
 #include "yb/gutil/strings/join.h"
@@ -30,8 +30,8 @@
 namespace yb {
 namespace tablet {
 
-class TabletDataIntegrityTest : public TabletTestBase<IntKeyTestSetup<INT32>> {
-  typedef TabletTestBase<IntKeyTestSetup<INT32>> superclass;
+class TabletDataIntegrityTest : public TabletTestBase<IntKeyTestSetup<DataType::INT32>> {
+  typedef TabletTestBase<IntKeyTestSetup<DataType::INT32>> superclass;
  public:
   void SetUp() override {
     superclass::SetUp();
@@ -39,7 +39,7 @@ class TabletDataIntegrityTest : public TabletTestBase<IntKeyTestSetup<INT32>> {
     auto tablet = this->tablet();
     LocalTabletWriter writer(tablet);
     ASSERT_OK(this->InsertTestRow(&writer, 12345, 0));
-    ASSERT_OK(tablet->Flush(FlushMode::kSync));
+    ASSERT_OK(tablet->Flush(FlushMode::kSync, rocksdb::FlushReason::kTestOnly));
   }
 
  protected:

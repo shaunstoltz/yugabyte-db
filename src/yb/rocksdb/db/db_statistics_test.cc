@@ -1,4 +1,4 @@
-// Copyright (c) YugaByte, Inc.
+// Copyright (c) YugabyteDB, Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License"); you may not use this file except
 // in compliance with the License.  You may obtain a copy of the License at
@@ -27,7 +27,8 @@ namespace {
 Result<size_t> GetManifestFileSize(DB* db) {
   std::vector<std::string> live_files;
   uint64_t manifest_file_size;
-  RETURN_NOT_OK(db->GetLiveFiles(live_files, &manifest_file_size, /* flush_memtable = */ false));
+  RETURN_NOT_OK(db->GetLiveFiles(
+      live_files, &manifest_file_size, /* flush_memtable = */ false, FlushReason::kTestOnly));
   return manifest_file_size;
 }
 

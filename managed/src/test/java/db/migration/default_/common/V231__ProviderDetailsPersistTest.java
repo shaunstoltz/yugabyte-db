@@ -3,19 +3,17 @@ package db.migration.default_.common;
 import static org.junit.Assert.assertEquals;
 import static org.junit.Assert.assertNotNull;
 
-import java.util.HashMap;
-import java.util.Map;
-
-import org.junit.Before;
-import org.junit.Test;
-
 import com.yugabyte.yw.common.FakeDBApplication;
 import com.yugabyte.yw.common.ModelFactory;
+import com.yugabyte.yw.models.Customer;
+import com.yugabyte.yw.models.Provider;
 import com.yugabyte.yw.models.helpers.provider.AWSCloudInfo;
 import com.yugabyte.yw.models.helpers.provider.AzureCloudInfo;
-import com.yugabyte.yw.models.Customer;
 import com.yugabyte.yw.models.helpers.provider.GCPCloudInfo;
-import com.yugabyte.yw.models.Provider;
+import java.util.HashMap;
+import java.util.Map;
+import org.junit.Before;
+import org.junit.Test;
 
 public class V231__ProviderDetailsPersistTest extends FakeDBApplication {
 
@@ -35,7 +33,7 @@ public class V231__ProviderDetailsPersistTest extends FakeDBApplication {
           }
         };
     awsProvider = ModelFactory.awsProvider(defaultCustomer);
-    awsProvider.config = awsConfig;
+    awsProvider.setConfigMap(awsConfig);
     awsProvider.save();
 
     Map<String, String> azuConfig =
@@ -48,7 +46,7 @@ public class V231__ProviderDetailsPersistTest extends FakeDBApplication {
           }
         };
     azureProvider = ModelFactory.azuProvider(defaultCustomer);
-    azureProvider.config = azuConfig;
+    azureProvider.setConfigMap(azuConfig);
     azureProvider.save();
 
     Map<String, String> gcpConfig =
@@ -56,6 +54,7 @@ public class V231__ProviderDetailsPersistTest extends FakeDBApplication {
           {
             put("client_email", "Client Email");
             put("project_id", "GCP Project ID");
+            put("GCE_HOST_PROJECT", "GCP Host project ID");
             put("auth_provider_x509_cert_url", "Cert URL");
             put("private_key", "GCP Provider Private key");
             put("private_key_id", "GCP Private Key ID");
@@ -64,7 +63,7 @@ public class V231__ProviderDetailsPersistTest extends FakeDBApplication {
           }
         };
     gcpProvider = ModelFactory.gcpProvider(defaultCustomer);
-    gcpProvider.config = gcpConfig;
+    gcpProvider.setConfig(gcpConfig);
     gcpProvider.save();
   }
 
@@ -76,23 +75,24 @@ public class V231__ProviderDetailsPersistTest extends FakeDBApplication {
     azureProvider.refresh();
 
     // GCP Provider Check
-    assertNotNull(gcpProvider.details);
-    GCPCloudInfo gcpCloudInfo = gcpProvider.details.cloudInfo.gcp;
+    assertNotNull(gcpProvider.getDetails());
+    GCPCloudInfo gcpCloudInfo = gcpProvider.getDetails().getCloudInfo().gcp;
     assertNotNull(gcpCloudInfo);
-    assertEquals("GCP Project ID", gcpCloudInfo.gceProject);
-    assertEquals("GCP Custom network", gcpCloudInfo.customGceNetwork);
-    assertNotNull(gcpCloudInfo.gceApplicationCredentials);
+    assertEquals("GCP Project ID", gcpCloudInfo.getGceProject());
+    assertEquals("GCP Host project ID", gcpCloudInfo.getSharedVPCProject());
+    assertEquals("GCP Custom network", gcpCloudInfo.getDestVpcId());
+    assertNotNull(gcpCloudInfo.getGceApplicationCredentials());
 
     // AWS Provider Check
-    assertNotNull(awsProvider.details);
-    AWSCloudInfo awsCloudInfo = awsProvider.details.cloudInfo.aws;
+    assertNotNull(awsProvider.getDetails());
+    AWSCloudInfo awsCloudInfo = awsProvider.getDetails().getCloudInfo().aws;
     assertNotNull(awsCloudInfo);
     assertEquals("awsAccessKeyID", awsCloudInfo.awsAccessKeyID);
     assertEquals("awsAccessKeySecret", awsCloudInfo.awsAccessKeySecret);
 
     // Azure Provider Check
-    assertNotNull(azureProvider.details);
-    AzureCloudInfo azureCloudInfo = azureProvider.details.cloudInfo.azu;
+    assertNotNull(azureProvider.getDetails());
+    AzureCloudInfo azureCloudInfo = azureProvider.getDetails().getCloudInfo().azu;
     assertNotNull(azureCloudInfo);
     assertEquals("azuClientId", azureCloudInfo.azuClientId);
     assertEquals("azuClientSecret", azureCloudInfo.azuClientSecret);

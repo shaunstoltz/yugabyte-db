@@ -1,4 +1,4 @@
-// Copyright (c) YugaByte, Inc.
+// Copyright (c) YugabyteDB, Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License"); you may not use this file except
 // in compliance with the License.  You may obtain a copy of the License at
@@ -13,39 +13,40 @@
 
 #pragma once
 
-#include <stdint.h>
+#include <sys/types.h>
 
-#include <array>
+#include <cstddef>
 #include <functional>
 #include <memory>
-#include <string>
-#include <type_traits>
 #include <utility>
-#include <vector>
 
-#include <boost/optional.hpp>
 #include <boost/preprocessor/seq/for_each.hpp>
-#include <boost/range/iterator_range.hpp>
 
 #include "yb/client/client_fwd.h"
 
-#include "yb/common/entity_ids.h"
+#include "yb/common/consistent_read_point.h"
 #include "yb/common/read_hybrid_time.h"
 #include "yb/common/transaction.h"
-#include "yb/gutil/casts.h"
+
+#include "yb/docdb/object_lock_shared_fwd.h"
+
+#include "yb/gutil/ref_counted.h"
 
 #include "yb/rpc/rpc_fwd.h"
 
+#include "yb/tserver/pg_client.fwd.h"
+#include "yb/tserver/pg_client_service.h"
 #include "yb/tserver/tserver_fwd.h"
-#include "yb/tserver/pg_client.pb.h"
+#include "yb/tserver/tserver_shared_mem.h"
 
-#include "yb/util/locks.h"
-
-DECLARE_bool(TEST_enable_db_catalog_version_mode);
+#include "yb/util/lw_function.h"
+#include "yb/util/metrics.h"
+#include "yb/util/result.h"
+#include "yb/util/strongly_typed_bool.h"
 
 namespace yb {
-class ConsistentReadPoint;
-class XClusterSafeTimeMap;
+
+class WriteBuffer;
 
 namespace tserver {
 
@@ -54,125 +55,152 @@ namespace tserver {
     (AlterTable) \
     (BackfillIndex) \
     (CreateDatabase) \
+    (CreateReplicationSlot) \
     (CreateTable) \
     (CreateTablegroup) \
-    (DeleteDBSequences) \
-    (DeleteSequenceTuple) \
     (DropDatabase) \
+    (DropReplicationSlot) \
     (DropTable) \
     (DropTablegroup) \
-    (FetchSequenceTuple) \
+    (FetchData) \
     (FinishTransaction) \
+    (RollbackToSubTransaction) \
+    (TruncateTable) \
+    (WaitForBackendsCatalogVersion) \
+    (AcquireAdvisoryLock) \
+    (ReleaseAdvisoryLock) \
+    (ReleaseSessionObjectLock) \
+    /**/
+
+#define PG_CLIENT_SESSION_LW_METHODS \
+    (DeleteDBSequences) \
+    (DeleteSequenceTuple) \
+    (FetchSequenceTuple) \
     (InsertSequenceTuple) \
     (ReadSequenceTuple) \
-    (RollbackToSubTransaction) \
-    (SetActiveSubTransaction) \
-    (TruncateTable) \
     (UpdateSequenceTuple) \
     /**/
 
-using PgClientSessionOperations = std::vector<std::shared_ptr<client::YBPgsqlOp>>;
+// These methods may respond with Status::OK() and continue async processing (including network
+// operations). In this case it is their responsibility to fill response and call
+// context.RespondSuccess asynchronously.
+// If such method responds with error Status, it will be handled by the upper layer that will fill
+// response with error status and call context.RespondSuccess.
+#define PG_CLIENT_SESSION_ASYNC_METHODS \
+    /**/
 
-YB_DEFINE_ENUM(PgClientSessionKind, (kPlain)(kDdl)(kCatalog)(kSequence));
+#define PG_CLIENT_SESSION_ASYNC_LW_METHODS \
+    (AcquireObjectLock) \
+    (GetTableKeyRanges) \
+    /**/
 
-class PgClientSession : public std::enable_shared_from_this<PgClientSession> {
+YB_STRONGLY_TYPED_BOOL(IsDDL);
+
+struct PgClientSessionMetrics {
+  explicit PgClientSessionMetrics(MetricEntity* metric_entity);
+
+  EventStatsPtr exchange_response_size;
+  EventStatsPtr vector_index_fetch_us;
+  EventStatsPtr vector_index_collect_us;
+  EventStatsPtr vector_index_reduce_us;
+};
+
+struct PgClientSessionContext {
+  // xcluster_context is nullptr on master.
+  const TserverXClusterContextIf* xcluster_context;
+  YsqlAdvisoryLocksTable& advisory_locks_table;
+  PgMutationCounter* pg_node_level_mutation_counter;
+  const scoped_refptr<ClockBase>& clock;
+  PgTableCache& table_cache;
+  PgResponseCache& response_cache;
+  PgSequenceCache& sequence_cache;
+  PgSharedMemoryPool& shared_mem_pool;
+  PgClientSessionMetrics metrics;
+  const std::string& instance_uuid;
+  docdb::ObjectLockOwnerRegistry* lock_owner_registry;
+  const TransactionManagerProvider transaction_manager_provider;
+#ifdef __linux__
+  TServerCgroupManager* cgroup_manager;
+#endif
+};
+
+using RequestProcessingPreconditionWaiter = LWFunction<Status(size_t, CoarseTimePoint)>;
+
+class PgClientSession final {
+ private:
+  using SharedThisSource = std::shared_ptr<void>;
+
  public:
-  struct UsedReadTime {
-    simple_spinlock lock;
-    ReadHybridTime value;
-  };
-
-  struct SessionData {
-    client::YBSessionPtr session;
-    client::YBTransactionPtr transaction;
-  };
-
-  using UsedReadTimePtr = std::weak_ptr<UsedReadTime>;
+  using TransactionBuilder = std::function<client::YBTransactionPtr(
+      IsDDL, TransactionFullLocality, CoarseTimePoint, client::ForceCreateTransaction)>;
 
   PgClientSession(
-      uint64_t id,
-      client::YBClient* client, const scoped_refptr<ClockBase>& clock,
-      std::reference_wrapper<const TransactionPoolProvider> transaction_pool_provider,
-      PgTableCache* table_cache, const XClusterSafeTimeMap* xcluster_safe_time_map,
-      PgResponseCache* response_cache);
+      SharedThisSource shared_this_source, rpc::Scheduler& scheduler,
+      TransactionBuilder&& transaction_builder, client::YBClient& client,
+      std::reference_wrapper<const PgClientSessionContext> context,
+      uint64_t id, pid_t pid, uint64_t lease_epoch,
+      tserver::TSLocalLockManagerPtr ts_local_lock_manager);
+  ~PgClientSession();
 
   uint64_t id() const;
 
-  Status Perform(PgPerformRequestPB* req, PgPerformResponsePB* resp, rpc::RpcContext* context);
+  void SetupSharedObjectLocking(PgSessionLockOwnerTagShared& object_lock_shared);
 
-  #define PG_CLIENT_SESSION_METHOD_DECLARE(r, data, method) \
-  Status method( \
-      const BOOST_PP_CAT(BOOST_PP_CAT(Pg, method), RequestPB)& req, \
-      BOOST_PP_CAT(BOOST_PP_CAT(Pg, method), ResponsePB)* resp, \
-      rpc::RpcContext* context);
+  void Perform(
+      LWPgPerformRequestPB& req, LWPgPerformResponsePB& resp, rpc::RpcContext&& context,
+      const PgTablesQueryResult& tables);
 
-  BOOST_PP_SEQ_FOR_EACH(PG_CLIENT_SESSION_METHOD_DECLARE, ~, PG_CLIENT_SESSION_METHODS);
+  void ProcessSharedRequest(
+      size_t size, SharedExchange* exchange,
+      const RequestProcessingPreconditionWaiter& precondition_waiter);
+
+  size_t SaveData(const RefCntBuffer& buffer, WriteBuffer&& sidecars);
+
+  std::pair<uint64_t, std::byte*> ObtainBigSharedMemorySegment(size_t size);
+
+  void StartShutdown(bool pg_service_shutting_down);
+  bool ReadyToShutdown() const;
+  void CompleteShutdown();
+
+  Result<ReadHybridTime> GetTxnSnapshotReadTime(
+      const PgPerformOptionsPB& options, CoarseTimePoint deadline);
+
+  Status SetTxnSnapshotReadTime(const PgPerformOptionsPB& options, CoarseTimePoint deadline);
+
+  #define PG_CLIENT_SESSION_METHOD_DECLARE_IMPL(ret, ctx_type, prefix, method) \
+    ret method( \
+        const YB_PG_CLIENT_METHOD_ARG(prefix, method, Request)& req, \
+        YB_PG_CLIENT_METHOD_ARG(prefix, method, Response)* resp, \
+        ctx_type context);
+
+  #define PG_CLIENT_SESSION_METHOD_DECLARE(r, data_tuple, method) \
+    PG_CLIENT_SESSION_METHOD_DECLARE_IMPL( \
+        BOOST_PP_TUPLE_ELEM(3, 0, data_tuple), BOOST_PP_TUPLE_ELEM(3, 1, data_tuple), \
+        BOOST_PP_TUPLE_ELEM(3, 2, data_tuple), method)
+
+  BOOST_PP_SEQ_FOR_EACH(
+        PG_CLIENT_SESSION_METHOD_DECLARE, (Status, rpc::RpcContext*, BOOST_PP_NIL),
+        PG_CLIENT_SESSION_METHODS);
+  BOOST_PP_SEQ_FOR_EACH(
+        PG_CLIENT_SESSION_METHOD_DECLARE, (Status, rpc::RpcContext*, (LW)),
+        PG_CLIENT_SESSION_LW_METHODS);
+  BOOST_PP_SEQ_FOR_EACH(
+        PG_CLIENT_SESSION_METHOD_DECLARE,
+        (void, rpc::RpcContext&&, BOOST_PP_NIL), PG_CLIENT_SESSION_ASYNC_METHODS);
+BOOST_PP_SEQ_FOR_EACH(
+        PG_CLIENT_SESSION_METHOD_DECLARE,
+        (void, rpc::RpcContext&&, (LW)), PG_CLIENT_SESSION_ASYNC_LW_METHODS);
+
+  #undef PG_CLIENT_SESSION_METHOD_DECLARE
+  #undef PG_CLIENT_SESSION_METHOD_DECLARE_IMPL
 
  private:
-  std::string LogPrefix();
-
-  Result<const TransactionMetadata*> GetDdlTransactionMetadata(
-      bool use_transaction, CoarseTimePoint deadline);
-  Status BeginTransactionIfNecessary(
-      const PgPerformOptionsPB& options, CoarseTimePoint deadline);
-  Result<client::YBTransactionPtr> RestartTransaction(
-      client::YBSession* session, client::YBTransaction* transaction);
-
-  Result<std::pair<SessionData, PgClientSession::UsedReadTimePtr>> SetupSession(
-      const PgPerformRequestPB& req, CoarseTimePoint deadline);
-  Status ProcessResponse(
-      const PgClientSessionOperations& operations, const PgPerformRequestPB& req,
-      PgPerformResponsePB* resp, rpc::RpcContext* context);
-  void ProcessReadTimeManipulation(ReadTimeManipulation manipulation);
-
-  client::YBClient& client();
-  client::YBSessionPtr& EnsureSession(PgClientSessionKind kind);
-  client::YBSessionPtr& Session(PgClientSessionKind kind);
-  client::YBTransactionPtr& Transaction(PgClientSessionKind kind);
-  Status CheckPlainSessionReadTime();
-
-  // Set the read point to the databases xCluster safe time if consistent reads are enabled
-  Status UpdateReadPointForXClusterConsistentReads(
-      const PgPerformOptionsPB& options, ConsistentReadPoint* read_point);
-
-  template <class InRequestPB, class OutRequestPB>
-  Status SetCatalogVersion(const InRequestPB& in_req, OutRequestPB* out_req) const {
-    // Note that in initdb/bootstrap mode, even if FLAGS_enable_db_catalog_version_mode is
-    // on it will be ignored and we'll use ysql_catalog_version not ysql_db_catalog_version.
-    // That's why we must use in_req as the source of truth. Unlike the older version google
-    // protobuf, this protobuf of in_req (google proto3) does not have has_ysql_catalog_version()
-    // and has_ysql_db_catalog_version() member functions so we use invalid version 0 as an
-    // alternative.
-    // For now we either use global catalog version or db catalog version but not both.
-    // So it is an error if both are set.
-    // It is possible that neither is set during initdb.
-    SCHECK(in_req.ysql_catalog_version() == 0 || in_req.ysql_db_catalog_version() == 0,
-           InvalidArgument, "Wrong catalog versions: $0 and $1",
-           in_req.ysql_catalog_version(), in_req.ysql_db_catalog_version());
-    if (in_req.ysql_db_catalog_version()) {
-      CHECK(FLAGS_TEST_enable_db_catalog_version_mode);
-      out_req->set_ysql_db_catalog_version(in_req.ysql_db_catalog_version());
-      out_req->set_ysql_db_oid(narrow_cast<uint32_t>(in_req.db_oid()));
-    } else if (in_req.ysql_catalog_version()) {
-      out_req->set_ysql_catalog_version(in_req.ysql_catalog_version());
-    }
-    return Status::OK();
-  }
-
-  const uint64_t id_;
-  client::YBClient& client_;
-  scoped_refptr<ClockBase> clock_;
-  const TransactionPoolProvider& transaction_pool_provider_;
-  PgTableCache& table_cache_;
-  const XClusterSafeTimeMap* xcluster_safe_time_map_;
-  PgResponseCache& response_cache_;
-
-  std::array<SessionData, kPgClientSessionKindMapSize> sessions_;
-  uint64_t txn_serial_no_ = 0;
-  boost::optional<uint64_t> saved_priority_;
-  TransactionMetadata ddl_txn_metadata_;
-  UsedReadTime plain_session_used_read_time_;
+  class Impl;
+  std::unique_ptr<Impl> impl_;
 };
 
-}  // namespace tserver
-}  // namespace yb
+void PreparePgTablesQuery(
+    const PgPerformRequestMsg& req, boost::container::small_vector_base<TableId>& table_ids);
+
+} // namespace tserver
+} // namespace yb

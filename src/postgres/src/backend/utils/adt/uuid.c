@@ -3,7 +3,7 @@
  * uuid.c
  *	  Functions for the built-in type "uuid".
  *
- * Copyright (c) 2007-2018, PostgreSQL Global Development Group
+ * Copyright (c) 2007-2022, PostgreSQL Global Development Group
  *
  * IDENTIFICATION
  *	  src/backend/utils/adt/uuid.c
@@ -13,7 +13,7 @@
 
 #include "postgres.h"
 
-#include "access/hash.h"
+#include "common/hashfn.h"
 #include "lib/hyperloglog.h"
 #include "libpq/pqformat.h"
 #include "port/pg_bswap.h"
@@ -34,7 +34,6 @@ typedef struct
 static void string_to_uuid(const char *source, pg_uuid_t *uuid);
 static int	uuid_internal_cmp(const pg_uuid_t *arg1, const pg_uuid_t *arg2);
 static int	uuid_fast_cmp(Datum x, Datum y, SortSupport ssup);
-static int	uuid_cmp_abbrev(Datum x, Datum y, SortSupport ssup);
 static bool uuid_abbrev_abort(int memtupcount, SortSupport ssup);
 static Datum uuid_abbrev_convert(Datum original, SortSupport ssup);
 
@@ -79,6 +78,22 @@ uuid_out(PG_FUNCTION_ARGS)
 	}
 
 	PG_RETURN_CSTRING(buf.data);
+}
+
+/*
+ * Return a palloc'd 32-character lowercase hex representation of 'uuid' (no
+ * dashes, null-terminated). This is the format used internally by YugabyteDB
+ * (e.g. by YBCGetTabletServerHosts) and is not the canonical UUID textual
+ * format produced by uuid_out().
+ */
+char *
+yb_convert_uuid_to_yb_uuid_string_repr(const pg_uuid_t *uuid)
+{
+	char	   *hex = (char *) palloc(2 * UUID_LEN + 1);
+
+	hex_encode((const char *) uuid->data, UUID_LEN, hex);
+	hex[2 * UUID_LEN] = '\0';
+	return hex;
 }
 
 /*
@@ -255,7 +270,7 @@ uuid_sortsupport(PG_FUNCTION_ARGS)
 
 		ssup->ssup_extra = uss;
 
-		ssup->comparator = uuid_cmp_abbrev;
+		ssup->comparator = ssup_datum_unsigned_cmp;
 		ssup->abbrev_converter = uuid_abbrev_convert;
 		ssup->abbrev_abort = uuid_abbrev_abort;
 		ssup->abbrev_full_comparator = uuid_fast_cmp;
@@ -276,20 +291,6 @@ uuid_fast_cmp(Datum x, Datum y, SortSupport ssup)
 	pg_uuid_t  *arg2 = DatumGetUUIDP(y);
 
 	return uuid_internal_cmp(arg1, arg2);
-}
-
-/*
- * Abbreviated key comparison func
- */
-static int
-uuid_cmp_abbrev(Datum x, Datum y, SortSupport ssup)
-{
-	if (x > y)
-		return 1;
-	else if (x == y)
-		return 0;
-	else
-		return -1;
 }
 
 /*
@@ -390,10 +391,10 @@ uuid_abbrev_convert(Datum original, SortSupport ssup)
 	/*
 	 * Byteswap on little-endian machines.
 	 *
-	 * This is needed so that uuid_cmp_abbrev() (an unsigned integer 3-way
-	 * comparator) works correctly on all platforms.  If we didn't do this,
-	 * the comparator would have to call memcmp() with a pair of pointers to
-	 * the first byte of each abbreviated key, which is slower.
+	 * This is needed so that ssup_datum_unsigned_cmp() (an unsigned integer
+	 * 3-way comparator) works correctly on all platforms.  If we didn't do
+	 * this, the comparator would have to call memcmp() with a pair of
+	 * pointers to the first byte of each abbreviated key, which is slower.
 	 */
 	res = DatumBigEndianToNative(res);
 
@@ -415,4 +416,24 @@ uuid_hash_extended(PG_FUNCTION_ARGS)
 	pg_uuid_t  *key = PG_GETARG_UUID_P(0);
 
 	return hash_any_extended(key->data, UUID_LEN, PG_GETARG_INT64(1));
+}
+
+Datum
+gen_random_uuid(PG_FUNCTION_ARGS)
+{
+	pg_uuid_t  *uuid = palloc(UUID_LEN);
+
+	if (!pg_strong_random(uuid, UUID_LEN))
+		ereport(ERROR,
+				(errcode(ERRCODE_INTERNAL_ERROR),
+				 errmsg("could not generate random values")));
+
+	/*
+	 * Set magic numbers for a "version 4" (pseudorandom) UUID, see
+	 * http://tools.ietf.org/html/rfc4122#section-4.4
+	 */
+	uuid->data[6] = (uuid->data[6] & 0x0f) | 0x40;	/* time_hi_and_version */
+	uuid->data[8] = (uuid->data[8] & 0x3f) | 0x80;	/* clock_seq_hi_and_reserved */
+
+	PG_RETURN_UUID_P(uuid);
 }

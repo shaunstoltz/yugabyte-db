@@ -1,5 +1,5 @@
 //
-// Copyright (c) YugaByte, Inc.
+// Copyright (c) YugabyteDB, Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License"); you may not use this file except
 // in compliance with the License.  You may obtain a copy of the License at
@@ -21,6 +21,8 @@
 #include <atomic>
 #include <string>
 
+#include "yb/util/hash_util.h"
+#include "yb/util/logging.h"
 #include "yb/util/slice.h"
 
 namespace yb {
@@ -45,7 +47,7 @@ class RefCntBuffer {
 
   explicit RefCntBuffer(const faststring& str);
 
-  explicit RefCntBuffer(const Slice& slice) :
+  explicit RefCntBuffer(Slice slice) :
       RefCntBuffer(slice.data(), slice.size()) {}
 
   RefCntBuffer(const RefCntBuffer& rhs) noexcept;
@@ -152,7 +154,7 @@ class RefCntPrefix {
   explicit RefCntPrefix(const std::string& str)
       : bytes_(RefCntBuffer(str)), size_(bytes_.size()) {}
 
-  explicit RefCntPrefix(const Slice& slice)
+  explicit RefCntPrefix(Slice slice)
       : bytes_(RefCntBuffer(slice)), size_(bytes_.size()) {}
 
   RefCntPrefix(RefCntBuffer bytes) // NOLINT
@@ -194,7 +196,7 @@ class RefCntPrefix {
     return r;
   }
 
-  std::string ShortDebugString() const;
+  std::string ToString() const;
 
  private:
   RefCntBuffer bytes_;
@@ -215,6 +217,10 @@ struct RefCntPrefixHash {
   }
 };
 
+inline size_t hash_value(const RefCntPrefix& ref_cnt_prefix) noexcept {
+  return ref_cnt_prefix.as_slice().hash();
+}
+
 class RefCntSlice {
  public:
   RefCntSlice() = default;
@@ -222,7 +228,7 @@ class RefCntSlice {
   explicit RefCntSlice(RefCntBuffer holder)
       : holder_(std::move(holder)), slice_(holder_.AsSlice()) {}
 
-  RefCntSlice(RefCntBuffer holder, const Slice& slice)
+  RefCntSlice(RefCntBuffer holder, Slice slice)
       : holder_(std::move(holder)), slice_(slice) {}
 
   explicit operator bool() const {
@@ -269,9 +275,45 @@ class RefCntSlice {
     return holder_.unique();
   }
 
+  void Resize(size_t new_size) {
+    slice_ = Slice(slice_.mutable_data(), new_size);
+  }
+
+  void Reset() {
+    holder_.Reset();
+  }
+
+  const RefCntBuffer& holder() const {
+    return holder_;
+  }
+
+  RefCntSlice SubSlice(size_t begin, size_t end) {
+    DCHECK_LE(begin, end);
+    DCHECK_LE(end, slice_.size());
+    return RefCntSlice(holder_, Slice(slice_.mutable_data() + begin, slice_.mutable_data() + end));
+  }
+
+  size_t DynamicMemoryUsage() const { return holder_.DynamicMemoryUsage(); }
+
+  std::string ToString() const;
+
  private:
   RefCntBuffer holder_;
   Slice slice_;
+
+  friend inline auto operator<=>(const RefCntSlice& lhs, const RefCntSlice& rhs) {
+    return lhs.AsSlice() <=> rhs.AsSlice();
+  }
+
+  friend inline bool operator==(const RefCntSlice& lhs, const RefCntSlice& rhs) {
+    return lhs.AsSlice() == rhs.AsSlice();
+  }
+};
+
+struct RefCntSliceHash {
+  size_t operator()(const RefCntSlice& inp) const {
+    return inp.AsSlice().hash();
+  }
 };
 
 } // namespace yb

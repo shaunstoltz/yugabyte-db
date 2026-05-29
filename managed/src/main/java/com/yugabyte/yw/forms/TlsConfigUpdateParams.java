@@ -1,10 +1,9 @@
-// Copyright (c) YugaByte, Inc.
+// Copyright (c) YugabyteDB, Inc.
 
 package com.yugabyte.yw.forms;
 
 import com.fasterxml.jackson.annotation.JsonIgnoreProperties;
 import com.fasterxml.jackson.databind.annotation.JsonDeserialize;
-import java.util.UUID;
 
 @JsonIgnoreProperties(ignoreUnknown = true)
 @JsonDeserialize(converter = TlsConfigUpdateParams.Converter.class)

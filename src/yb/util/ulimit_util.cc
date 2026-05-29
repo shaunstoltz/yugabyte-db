@@ -15,9 +15,9 @@
 // specific language governing permissions and limitations
 // under the License.
 //
-// The following only applies to changes made to this file as part of YugaByte development.
+// The following only applies to changes made to this file as part of YugabyteDB development.
 //
-// Portions Copyright (c) YugaByte, Inc.
+// Portions Copyright (c) YugabyteDB, Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License"); you may not use this file except
 // in compliance with the License.  You may obtain a copy of the License at
@@ -44,26 +44,28 @@
 
 using std::string;
 using std::stringstream;
-using yb::operator"" _KB;
-using yb::operator"" _MB;
+using yb::operator""_KB;
+using yb::operator""_MB;
 
-// These flags allow operators to define process resource soft limits at runtime. Note that on some
-// systems, RLIM_INFINITY is defined as -1, and setting these flags to that value will result in an
-// attempt to set these resource limits to infinity. All other negative values are ignored.
-DEFINE_UNKNOWN_int64(rlimit_data, RLIM_INFINITY, "Data file size limit: bytes.");
+// These flags allow operators to define process resource soft limits without having to change the
+// system ulimits. The values are applied once during process startup via setrlimit(); changing
+// them after startup has no effect. Note that on some systems, RLIM_INFINITY is defined as -1, and
+// setting these flags to that value will result in an attempt to set these resource limits to
+// infinity. All other negative values are ignored.
+DEFINE_NON_RUNTIME_int64(rlimit_data, RLIM_INFINITY, "Data file size limit: bytes.");
 #if defined(__APPLE__)
 // Note that we've chosen 10240 as the default value here since this is the default system limit
 // for this resource on *macOS* as defined by OPEN_MAX in <sys/syslimits.h>
-DEFINE_UNKNOWN_int64(rlimit_nofile, 10240, "Open files limit.");
+DEFINE_NON_RUNTIME_int64(rlimit_nofile, 10240, "Open files limit.");
 #else
-DEFINE_UNKNOWN_int64(rlimit_nofile, 1048576, "Open files limit.");
+DEFINE_NON_RUNTIME_int64(rlimit_nofile, 1048576, "Open files limit.");
 #endif
-DEFINE_UNKNOWN_int64(rlimit_fsize, RLIM_INFINITY, "File size limit: blocks.");
-DEFINE_UNKNOWN_int64(rlimit_memlock, 64_KB, "Locked memory limit: bytes.");
-DEFINE_UNKNOWN_int64(rlimit_as, RLIM_INFINITY, "Memory size limit: bytes.");
-DEFINE_UNKNOWN_int64(rlimit_stack, 8_MB, "Stack size limit: bytes.");
-DEFINE_UNKNOWN_int64(rlimit_cpu, RLIM_INFINITY, "CPU time limit: seconds.");
-DEFINE_UNKNOWN_int64(rlimit_nproc, 12000, "User process limit.");
+DEFINE_NON_RUNTIME_int64(rlimit_fsize, RLIM_INFINITY, "File size limit: blocks.");
+DEFINE_NON_RUNTIME_int64(rlimit_memlock, 64_KB, "Locked memory limit: bytes.");
+DEFINE_NON_RUNTIME_int64(rlimit_as, RLIM_INFINITY, "Memory size limit: bytes.");
+DEFINE_NON_RUNTIME_int64(rlimit_stack, 8_MB, "Stack size limit: bytes.");
+DEFINE_NON_RUNTIME_int64(rlimit_cpu, RLIM_INFINITY, "CPU time limit: seconds.");
+DEFINE_NON_RUNTIME_int64(rlimit_nproc, 12000, "User process limit.");
 
 // Note: we've observed it can take a while to dump full cores, esp. on systems like kubernetes or
 // consumer laptops. In order to avoid causing more usability issues, we disable this flag for now
@@ -202,8 +204,8 @@ void UlimitUtil::InitUlimits() {
 
     const auto limits_or_status = Env::Default()->GetUlimit(resource_id);
     if (!limits_or_status.ok()) {
-      LOG(ERROR) << "Unable to fetch hard limit for resource " << resource_name
-                 << " Skipping initialization.";
+      LOG(DFATAL) << "Unable to fetch hard limit for resource " << resource_name
+                  << " Skipping initialization.";
       continue;
     }
 
@@ -221,8 +223,8 @@ void UlimitUtil::InitUlimits() {
 
     Status set_ulim_status = Env::Default()->SetUlimit(resource_id, new_soft_limit, resource_name);
     if (!set_ulim_status.ok()) {
-      LOG(ERROR) << "Unable to set new soft limit for resource " << resource_name
-                 << " error: " << set_ulim_status.ToString();
+      LOG(DFATAL) << "Unable to set new soft limit for resource " << resource_name
+                  << " error: " << set_ulim_status.ToString();
     }
   }
 }

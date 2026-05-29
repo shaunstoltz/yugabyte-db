@@ -15,9 +15,9 @@
 // specific language governing permissions and limitations
 // under the License.
 //
-// The following only applies to changes made to this file as part of YugaByte development.
+// The following only applies to changes made to this file as part of YugabyteDB development.
 //
-// Portions Copyright (c) YugaByte, Inc.
+// Portions Copyright (c) YugabyteDB, Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License"); you may not use this file except
 // in compliance with the License.  You may obtain a copy of the License at
@@ -45,7 +45,7 @@
 #include "yb/util/thread.h"
 #include "yb/util/flags.h"
 
-DEFINE_UNKNOWN_int32(mt_metrics_test_num_threads, 4,
+DEFINE_NON_RUNTIME_int32(mt_metrics_test_num_threads, 4,
              "Number of threads to spawn in mt metrics tests");
 
 METRIC_DEFINE_entity(test_entity);
@@ -128,7 +128,7 @@ TEST_F(MultiThreadedMetricsTest, AddCounterToRegistryTest) {
   int num_counters = 1000;
   std::function<void()> f = std::bind(RegisterCounters, entity, "prefix", num_counters);
   RunWithManyThreads(&f, num_threads);
-  ASSERT_EQ(num_threads * num_counters, entity->UnsafeMetricsMapForTests().size());
+  ASSERT_EQ(num_threads * num_counters, entity->TEST_UsageMetricsMap().size());
 }
 
 } // namespace yb

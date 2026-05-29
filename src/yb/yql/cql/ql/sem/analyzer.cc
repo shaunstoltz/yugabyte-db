@@ -1,5 +1,5 @@
 //--------------------------------------------------------------------------------------------------
-// Copyright (c) YugaByte, Inc.
+// Copyright (c) YugabyteDB, Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License"); you may not use this file except
 // in compliance with the License.  You may obtain a copy of the License at
@@ -34,22 +34,20 @@ Analyzer::~Analyzer() {
 
 //--------------------------------------------------------------------------------------------------
 
-Status Analyzer::Analyze(ParseTreePtr parse_tree) {
+Status Analyzer::Analyze(ParseTreePtr parse_tree, const QLMetrics *ql_metrics) {
   ParseTree *ptree = parse_tree.get();
   DCHECK(ptree != nullptr) << "Parse tree is null";
-  sem_context_ = std::make_unique<SemContext>(std::move(parse_tree), ql_env_);
+  sem_context_ = std::make_unique<SemContext>(std::move(parse_tree), ql_env_, ql_metrics);
   Status s = ptree->Analyze(sem_context_.get());
   if (PREDICT_FALSE(!s.ok())) {
+    VLOG(3) << "Failed to analyze parse-tree <" << ptree << ">";
+    VLOG(1) << "Result of analyze parse-tree: " << s;
     // When a statement is parsed for the first time, semantic analysis may fail because stale
     // table metadata cache was used. If that happens, clear the cache and tell the caller to
-    // reparse. The only exception is when the keyspace, table or type or is not found in which
-    // case no cache is used.
+    // reparse. The only exception is when the cache is not used.
     if (!ptree->reparsed()) {
-      const ErrorCode errcode = GetErrorCode(s);
-      if (errcode != ErrorCode::KEYSPACE_NOT_FOUND &&
-          errcode != ErrorCode::OBJECT_NOT_FOUND &&
-          errcode != ErrorCode::TYPE_NOT_FOUND &&
-          sem_context_->cache_used()) {
+      if (sem_context_->cache_used()) {
+        VLOG(1) << "Clean internal cache and retry analyze";
         ptree->ClearAnalyzedTableCache(ql_env_);
         ptree->ClearAnalyzedUDTypeCache(ql_env_);
         ptree->set_stale();
@@ -58,7 +56,7 @@ Status Analyzer::Analyze(ParseTreePtr parse_tree) {
     }
 
     // Before leaving the semantic step, collect all errors and place them in return status.
-    VLOG(3) << "Failed to analyze parse-tree <" << ptree << ">";
+    VLOG(3) << "Semantic context status: " << sem_context_->GetStatus();
     return sem_context_->GetStatus();
   }
 

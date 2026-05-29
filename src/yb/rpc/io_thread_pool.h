@@ -1,5 +1,5 @@
 //
-// Copyright (c) YugaByte, Inc.
+// Copyright (c) YugabyteDB, Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License"); you may not use this file except
 // in compliance with the License.  You may obtain a copy of the License at
@@ -22,12 +22,15 @@
 #include "yb/util/net/net_fwd.h"
 
 namespace yb {
+
+class Cgroup;
+
 namespace rpc {
 
 // Runs io service in specified number of threads.
 class IoThreadPool {
  public:
-  IoThreadPool(const std::string& name, size_t num_threads);
+  IoThreadPool(const std::string& name, size_t num_threads, Cgroup* cgroup = nullptr);
   ~IoThreadPool();
 
   void Shutdown();

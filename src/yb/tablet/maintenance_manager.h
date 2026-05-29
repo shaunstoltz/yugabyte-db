@@ -15,9 +15,9 @@
 // specific language governing permissions and limitations
 // under the License.
 //
-// The following only applies to changes made to this file as part of YugaByte development.
+// The following only applies to changes made to this file as part of YugabyteDB development.
 //
-// Portions Copyright (c) YugaByte, Inc.
+// Portions Copyright (c) YugabyteDB, Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License"); you may not use this file except
 // in compliance with the License.  You may obtain a copy of the License at
@@ -52,9 +52,10 @@
 
 namespace yb {
 
+class Cgroup;
 template<class T>
 class AtomicGauge;
-class Histogram;
+class EventStats;
 class MaintenanceManager;
 class MemTracker;
 
@@ -105,6 +106,16 @@ class MaintenanceOpStats {
     perf_improvement_ = perf_improvement;
   }
 
+  bool cdcsdk_reset_stale_retention_barrier() const {
+    DCHECK(valid_);
+    return cdcsdk_reset_stale_retention_barrier_;
+  }
+
+  void set_cdcsdk_reset_stale_retention_barrier(bool cdcsdk_reset_stale_retention_barrier) {
+    UpdateLastModified();
+    cdcsdk_reset_stale_retention_barrier_ = cdcsdk_reset_stale_retention_barrier;
+  }
+
   const MonoTime& last_modified() const {
     DCHECK(valid_);
     return last_modified_;
@@ -138,6 +149,9 @@ class MaintenanceOpStats {
   // The estimated performance improvement-- how good it is to do this on some
   // absolute scale (yet TBD).
   double perf_improvement_;
+
+  // True if the operation should run when retention barriers are stale.
+  bool cdcsdk_reset_stale_retention_barrier_;
 
   // The last time that the stats were modified.
   MonoTime last_modified_;
@@ -184,7 +198,7 @@ class MaintenanceOp {
   virtual void Perform() = 0;
 
   // Returns the histogram for this op that tracks duration. Cannot be NULL.
-  virtual scoped_refptr<Histogram> DurationHistogram() const = 0;
+  virtual scoped_refptr<EventStats> DurationHistogram() const = 0;
 
   // Returns the gauge for this op that tracks when this op is running. Cannot be NULL.
   virtual scoped_refptr<AtomicGauge<uint32_t> > RunningGauge() const = 0;
@@ -263,6 +277,10 @@ class MaintenanceManager : public std::enable_shared_from_this<MaintenanceManage
   void GetMaintenanceManagerStatusDump(tablet::MaintenanceManagerStatusPB* out_pb);
 
   static const Options DEFAULT_OPTIONS;
+
+#ifdef __linux__
+  void SetCgroup(Cgroup* cgroup);
+#endif
 
  private:
   friend class ScopedMaintenanceOpRun;

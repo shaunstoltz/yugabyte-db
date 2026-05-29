@@ -1,5 +1,5 @@
 //--------------------------------------------------------------------------------------------------
-// Copyright (c) YugaByte, Inc.
+// Copyright (c) YugabyteDB, Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License"); you may not use this file except
 // in compliance with the License.  You may obtain a copy of the License at
@@ -20,6 +20,8 @@
 //--------------------------------------------------------------------------------------------------
 
 #pragma once
+
+#include <memory>
 
 #include "yb/rpc/service_if.h"
 
@@ -105,12 +107,30 @@ class CQLProcessor : public ql::QLProcessor {
   std::unique_ptr<ql::CQLResponse> ProcessResult(const ql::ExecutedResult::SharedPtr& result);
   std::unique_ptr<ql::CQLResponse> ProcessAuthResult(const std::string& saved_hash, bool can_login);
   std::unique_ptr<ql::CQLResponse> ProcessError(
-      const Status& s,
-      boost::optional<ql::CQLMessage::QueryId> query_id = boost::none);
+      const Status& s, std::optional<ql::CQLMessage::QueryId> query_id = std::nullopt);
 
   // Send response back to client.
   void PrepareAndSendResponse(const std::unique_ptr<ql::CQLResponse>& response);
   void SendResponse(const ql::CQLResponse& response);
+
+  void UpdateAshQueryId(const ql::CQLMessage::QueryId& query_id);
+
+  ql::CQLMessage::QueryId GetPrepQueryId() const {
+    return request_ && request_->opcode() == ql::CQLMessage::Opcode::EXECUTE
+        ? static_cast<const ql::ExecuteRequest&>(*request_).query_id() : "";
+  }
+
+  ql::CQLMessage::QueryId GetUnprepQueryId() const {
+    return request_ && request_->opcode() == ql::CQLMessage::Opcode::QUERY
+        ? CQLStatement::GetQueryId(ql_env_.CurrentKeyspace(),
+                                   static_cast<const ql::QueryRequest&>(*request_).query()) : "";
+  }
+
+  // Set in ProcessRequest(BatchRequest) via CQLStatement::GetBatchQueryId before ExecuteAsync;
+  // stored on the processor so SendResponse (stat statements) can read it after async completion.
+  ql::CQLMessage::QueryId GetBatchQueryId() const {
+    return request_ && request_->opcode() == ql::CQLMessage::Opcode::BATCH ? batch_query_id_ : "";
+  }
 
   const std::unordered_map<std::string, std::vector<std::string>> kSupportedOptions = {
       {ql::CQLMessage::kCQLVersionOption,
@@ -143,6 +163,9 @@ class CQLProcessor : public ql::QLProcessor {
   MonoTime parse_begin_;
   MonoTime execute_begin_;
 
+  // Only set and read when the current request is BATCH (ql::CQLMessage::Opcode::BATCH).
+  ql::CQLMessage::QueryId batch_query_id_;
+
   // Statement executed callback.
   ql::StatementExecutedCallback statement_executed_cb_;
 
@@ -154,6 +177,8 @@ class CQLProcessor : public ql::QLProcessor {
    public:
     ProcessRequestTask& Bind(CQLProcessor* processor) {
       processor_ = processor;
+      wait_state_ = ash::WaitStateInfo::CurrentWaitState();
+      ASH_ENABLE_CONCURRENT_UPDATES();
       return *this;
     }
 
@@ -163,6 +188,9 @@ class CQLProcessor : public ql::QLProcessor {
     void Run() override {
       auto processor = processor_;
       processor_ = nullptr;
+      auto wait_state = wait_state_;
+      wait_state_ = nullptr;
+      ADOPT_WAIT_STATE(wait_state);
       std::unique_ptr<ql::CQLResponse> response(processor->ProcessRequest(*processor->request_));
       if (response != nullptr) {
         processor->SendResponse(*response);
@@ -172,6 +200,7 @@ class CQLProcessor : public ql::QLProcessor {
     void Done(const Status& status) override {}
 
     CQLProcessor* processor_ = nullptr;
+    ash::WaitStateInfoPtr wait_state_{nullptr};
   };
 
   friend class ProcessRequestTask;

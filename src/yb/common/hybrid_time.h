@@ -15,9 +15,9 @@
 // specific language governing permissions and limitations
 // under the License.
 //
-// The following only applies to changes made to this file as part of YugaByte development.
+// The following only applies to changes made to this file as part of YugabyteDB development.
 //
-// Portions Copyright (c) YugaByte, Inc.
+// Portions Copyright (c) YugabyteDB, Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License"); you may not use this file except
 // in compliance with the License.  You may obtain a copy of the License at
@@ -30,19 +30,18 @@
 // under the License.
 //
 
-// Portions Copyright (c) YugaByte, Inc.
+// Portions Copyright (c) YugabyteDB, Inc.
 
 #pragma once
-
-#include <inttypes.h>
 
 #include <limits>
 #include <string>
 
-#include "yb/util/status_fwd.h"
 #include "yb/util/faststring.h"
+#include "yb/util/kv_util.h"
 #include "yb/util/monotime.h"
 #include "yb/util/physical_time.h"
+#include "yb/util/status_fwd.h"
 
 namespace yb {
 
@@ -88,12 +87,14 @@ class HybridTime {
   // Hybrid times are converted to debug strings as <this_string_constant>(<hybrid_time_value>).
   static const char* const kHybridTimeDebugStrPrefix;
 
+  static const size_t SizeOfHybridTimeRepr = sizeof(HybridTimeRepr);
+
   // ----------------------------------------------------------------------------------------------
   // Constructors / static factories
 
-  HybridTime() noexcept : v(kInvalidHybridTimeValue) {}
+  constexpr HybridTime() noexcept : v(kInvalidHybridTimeValue) {}
 
-  HybridTime(MicrosTime micros, LogicalTimeComponent logical_value) {
+  constexpr HybridTime(MicrosTime micros, LogicalTimeComponent logical_value) {
     v = (micros << kBitsForLogicalComponent) + logical_value;
   }
 
@@ -106,7 +107,7 @@ class HybridTime {
     return HybridTime(micros, 0);
   }
 
-  explicit HybridTime(uint64_t val) : v(val) {}
+  constexpr explicit HybridTime(uint64_t val) : v(val) {}
 
   bool operator ==(const HybridTime &other) const {
     return v == other.v;
@@ -171,6 +172,10 @@ class HybridTime {
     return value ? HybridTime(value) : HybridTime();
   }
 
+  uint64_t ToPB() const {
+    return *this ? v : 0;
+  }
+
   HybridTimeRepr value() const { return v; }
 
   // Returns this HybridTime if valid, otherwise returns the one provided.
@@ -206,14 +211,18 @@ class HybridTime {
   }
 
   // Returns the physical value embedded in this HybridTime, in microseconds.
-  inline MicrosTime GetPhysicalValueMicros() const {
+  constexpr MicrosTime GetPhysicalValueMicros() const {
     return v >> kBitsForLogicalComponent;
   }
 
+  uint64_t GetPhysicalValueMillis() const;
+  uint64_t GetPhysicalValueNanos() const;
+
   MicrosTime CeilPhysicalValueMicros() const;
 
-  inline int64_t PhysicalDiff(const HybridTime& other) const {
-    return static_cast<int64_t>(GetPhysicalValueMicros() - other.GetPhysicalValueMicros());
+  inline MonoDelta PhysicalDiff(const HybridTime& other) const {
+    return MonoDelta::FromMicroseconds(
+        static_cast<int64_t>(GetPhysicalValueMicros() - other.GetPhysicalValueMicros()));
   }
 
   inline LogicalTimeComponent GetLogicalValue() const {
@@ -251,6 +260,11 @@ class HybridTime {
   HybridTimeRepr v;
 };
 
+inline constexpr HybridTime HybridTime::kMin(kMinHybridTimeValue);
+inline constexpr HybridTime HybridTime::kMax(kMaxHybridTimeValue);
+inline constexpr HybridTime HybridTime::kInitial{kInitialHybridTimeValue};
+inline constexpr HybridTime HybridTime::kInvalid(kInvalidHybridTimeValue);
+
 // The maximum microsecond value possible so that the corresponding HybridTime can still fit into a
 // uint64_t.
 constexpr MicrosTime kMaxHybridTimePhysicalMicros{
@@ -269,18 +283,46 @@ inline int HybridTime::CompareTo(const HybridTime &other) const {
   return 0;
 }
 
+// Given two hybrid times, determines whether the delta between end and begin them is higher,
+// lower or equal to the given delta and returns 1, -1 and 0 respectively. Note that if end <
+// begin we return -1.
+int CompareHybridTimesToDelta(HybridTime begin, HybridTime end, MonoDelta delta);
+
 inline std::ostream &operator <<(std::ostream &o, const HybridTime &hybridTime) {
   return o << hybridTime.ToString();
 }
 
 namespace hybrid_time_literals {
 
-inline HybridTime operator "" _usec_ht(unsigned long long microseconds) { // NOLINT
+inline HybridTime operator""_usec_ht(unsigned long long microseconds) { // NOLINT
   return HybridTime::FromMicros(microseconds);
 }
 
 } // namespace hybrid_time_literals
 
-using hybrid_time_literals::operator"" _usec_ht;
+using hybrid_time_literals::operator""_usec_ht;
+
+struct ReadRestartData {
+  HybridTime restart_time;
+  KeyBuffer key;
+
+  bool is_valid() const {
+    return restart_time.is_valid();
+  }
+
+  void MakeAtLeast(ReadRestartData rhs) {
+    if (!rhs.restart_time.is_valid()) {
+      return;
+    }
+    if (!restart_time.is_valid() || restart_time < rhs.restart_time) {
+      restart_time = rhs.restart_time;
+      key = rhs.key;
+    }
+  }
+
+  std::string ToString() const {
+    return YB_STRUCT_TO_STRING(restart_time, key);
+  }
+};
 
 }  // namespace yb

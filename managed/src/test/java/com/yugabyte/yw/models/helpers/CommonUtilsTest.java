@@ -1,4 +1,4 @@
-// Copyright (c) YugaByte, Inc.
+// Copyright (c) YugabyteDB, Inc.
 
 package com.yugabyte.yw.models.helpers;
 
@@ -71,6 +71,41 @@ public class CommonUtilsTest {
     config.put("SOME_DATA", "VISIBLE_DATA");
     JsonNode maskedData = CommonUtils.maskConfig(config);
     assertValue(maskedData, "SOME_DATA", "VISIBLE_DATA");
+  }
+
+  @Test
+  public void testMaskBearerTokenNestedObject() {
+    // The inner `token` string (exact field name) must be masked.
+    // The `bearerToken` container object must remain an object - not collapsed to "********".
+    // `authTokenIssueDate` must NOT be masked (contains "token" but is a date, not a secret).
+    ObjectNode bearerTokenNode = Json.newObject();
+    bearerTokenNode.put("token", "6203effbbc01ebef9ec79f3e75de5a2bFFFFNRAL");
+    ObjectNode config = Json.newObject();
+    config.set("bearerToken", bearerTokenNode);
+    config.put("authType", "BearerToken");
+    config.put("authTokenIssueDate", "2024-01-01T00:00:00Z");
+
+    JsonNode maskedData = CommonUtils.maskConfig(config);
+
+    assertThat(maskedData.get("bearerToken").isObject(), is(true));
+    assertThat(
+        maskedData.get("bearerToken").get("token").asText(),
+        not("6203effbbc01ebef9ec79f3e75de5a2bFFFFNRAL"));
+    assertValue(maskedData, "authType", "BearerToken");
+    assertValue(maskedData, "authTokenIssueDate", "2024-01-01T00:00:00Z");
+  }
+
+  @Test
+  public void testMaskSplunkToken() {
+    // A top-level field named exactly `token` must be masked (exact-name match).
+    ObjectNode config = Json.newObject();
+    config.put("token", "splunk-secret-token-value");
+    config.put("endpoint", "https://splunk.example.com");
+
+    JsonNode maskedData = CommonUtils.maskConfig(config);
+
+    assertThat(maskedData.get("token").asText(), not("splunk-secret-token-value"));
+    assertValue(maskedData, "endpoint", "https://splunk.example.com");
   }
 
   @Test
@@ -151,12 +186,22 @@ public class CommonUtilsTest {
 
   @Test
   @Parameters({
-    "1.2.3.4sdfdsf, 1.2.3.4wqerq, true",
+    "1.2.3.4, 1.2.3.4, true",
+    "1.2.3.4, 1.2.3.4wqerq, true",
+    "1.2.3.4-b15, 1.2.3.4, true",
+    "1.2.3.4-b15, 1.2.3.4wqerq, true",
+    "1.2.3.4-b15, 1.2.3.4-b14, false",
+    "1.2.3.4-b15, 1.2.3.4-b15, true",
+    "1.2.3.4-b15, 1.2.3.4-b16, true",
     "1.2.3.3sdfdsf, 1.2.3.4wqerq, true",
     "1.2.3.5sdfdsf, 1.2.3.4wqerq, false",
     "1.2.2.6sdfdsf, 1.2.3.4wqerq, true",
     "1.2.4.1sdfdsf, 1.2.3.4wqerq, false",
     "1.2.4.1sdfdsf, asdfdsaf, true",
+    "1.2.4.1-b1, 2024.1.0.0, true",
+    "2024.1.0.0-b1, 2.21.0.0-b1, false",
+    "2024.1.0.0-b1, 2024.1.0.0-b1, true",
+    "2024.1.0.0-b1, 2024.2.0.0, true",
   })
   public void testReleaseEqualOrAfter(
       String thresholdRelease, String actualRelease, boolean result) {
@@ -165,12 +210,21 @@ public class CommonUtilsTest {
 
   @Test
   @Parameters({
-    "1.2.3.4sdfdsf, 1.2.3.4wqerq, false",
+    "1.2.3.4, 1.2.3.4, false",
+    "1.2.3.4, 1.2.3.4wqerq, false",
+    "1.2.3.4-b15, 1.2.3.4, false",
+    "1.2.3.4-b15, 1.2.3.4wqerq, false",
+    "1.2.3.4-b15, 1.2.3.4-b14, true",
+    "1.2.3.4-b15, 1.2.3.4-b15, false",
+    "1.2.3.4-b15, 1.2.3.4-b16, false",
     "1.2.3.3sdfdsf, 1.2.3.4wqerq, false",
     "1.2.3.5sdfdsf, 1.2.3.4wqerq, true",
     "1.2.2.6sdfdsf, 1.2.3.4wqerq, false",
     "1.2.4.1sdfdsf, 1.2.3.4wqerq, true",
     "1.2.4.1sdfdsf, asdfdsaf, false",
+    "2024.1.0.0-b1, 2.21.0.0-b1, true",
+    "2024.1.0.0-b1, 2024.1.0.0-b1, false",
+    "2024.1.0.0-b1, 2024.2.0.0, false",
   })
   public void testReleaseBefore(String thresholdRelease, String actualRelease, boolean result) {
     assertThat(CommonUtils.isReleaseBefore(thresholdRelease, actualRelease), equalTo(result));
@@ -219,5 +273,28 @@ public class CommonUtilsTest {
     assertFalse(
         CommonUtils.isEqualIgnoringOrder(Arrays.asList("a", "b", "c"), Arrays.asList("a", "b")));
     assertFalse(CommonUtils.isEqualIgnoringOrder(Arrays.asList("a", "b", "c"), null));
+  }
+
+  @Test
+  public void testReplaceBeginningPathChanged() {
+    String pathToModify = "/opt/yugaware/path/to/opt/yugaware/file";
+    String initialRootPath = "/opt/yugaware";
+    String finalRootPath = "/root/data";
+    String expectedModifiedPath = "/root/data/path/to/opt/yugaware/file";
+
+    String modifiedPath =
+        CommonUtils.replaceBeginningPath(pathToModify, initialRootPath, finalRootPath);
+    assertEquals(expectedModifiedPath, modifiedPath);
+  }
+
+  @Test
+  public void testReplaceBeginningPathUnChanged() {
+    String pathToModify = "/opt/yugaware/path/to/opt/path/file";
+    String initialRootPath = "/opt/yugaware";
+    String finalRootPath = "/opt/yugaware";
+
+    String modifiedPath =
+        CommonUtils.replaceBeginningPath(pathToModify, initialRootPath, finalRootPath);
+    assertEquals(pathToModify, modifiedPath);
   }
 }

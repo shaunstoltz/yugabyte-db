@@ -1,14 +1,18 @@
-// Copyright (c) YugaByte, Inc.
+// Copyright (c) YugabyteDB, Inc.
 
 package com.yugabyte.yw.common.alerts.impl;
 
 import com.google.inject.Singleton;
 import com.yugabyte.yw.common.WSClientRefresher;
 import com.yugabyte.yw.common.alerts.AlertChannelSlackParams;
+import com.yugabyte.yw.common.alerts.AlertTemplateVariableService;
 import com.yugabyte.yw.common.alerts.PlatformNotificationException;
+import com.yugabyte.yw.forms.AlertChannelTemplatesExt;
 import com.yugabyte.yw.models.Alert;
 import com.yugabyte.yw.models.AlertChannel;
+import com.yugabyte.yw.models.AlertTemplateVariable;
 import com.yugabyte.yw.models.Customer;
+import java.util.List;
 import javax.inject.Inject;
 import lombok.Data;
 import lombok.extern.slf4j.Slf4j;
@@ -22,16 +26,24 @@ public class AlertChannelSlack extends AlertChannelWebBase {
   public static final String SLACK_WS_KEY = "yb.alert.slack.ws";
 
   @Inject
-  public AlertChannelSlack(WSClientRefresher wsClientRefresher) {
-    super(wsClientRefresher);
+  public AlertChannelSlack(
+      WSClientRefresher wsClientRefresher,
+      AlertTemplateVariableService alertTemplateVariableService) {
+    super(wsClientRefresher, alertTemplateVariableService);
   }
 
   @Override
-  public void sendNotification(Customer customer, Alert alert, AlertChannel channel)
+  public void sendNotification(
+      Customer customer,
+      Alert alert,
+      AlertChannel channel,
+      AlertChannelTemplatesExt channelTemplates)
       throws PlatformNotificationException {
     log.trace("sendNotification {}", alert);
     AlertChannelSlackParams params = (AlertChannelSlackParams) channel.getParams();
-    String text = getNotificationText(alert, channel);
+    List<AlertTemplateVariable> variables = alertTemplateVariableService.list(customer.getUuid());
+    Context context = new Context(channel, channelTemplates, variables);
+    String text = getNotificationText(alert, context, false);
 
     SlackMessage message = new SlackMessage();
     message.username = params.getUsername();
@@ -39,6 +51,8 @@ public class AlertChannelSlack extends AlertChannelWebBase {
     message.text = text;
 
     try {
+      log.debug("Sending Slack alert notification {} to {}", text, message.username);
+
       WSResponse response = sendRequest(SLACK_WS_KEY, params.getWebhookUrl(), message);
 
       if (response.getStatus() != HttpStatus.SC_OK) {

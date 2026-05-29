@@ -5,9 +5,9 @@
 //--------------------------------------------------------------------------------------------------
 
 //--------------------------------------------------------------------------------------------------
-// The following only applies to changes made to this file as part of YugaByte development.
+// The following only applies to changes made to this file as part of YugabyteDB development.
 //
-// Copyright (c) YugaByte, Inc.
+// Copyright (c) YugabyteDB, Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License"); you may not use this file except
 // in compliance with the License.  You may obtain a copy of the License at
@@ -45,7 +45,7 @@ unsigned int hexval(unsigned char c) {
   if (c >= 'A' && c <= 'F')
     return c - 'A' + 0xA;
 
-  LOG(ERROR) << "invalid hexadecimal digit";
+  LOG(DFATAL) << "invalid hexadecimal digit";
   return 0; /* not reached */
 }
 
@@ -233,7 +233,7 @@ void report_invalid_encoding(const char *mbstr, size_t len) {
       p += sprintf(p, " ");  // NOLINT(*)
   }
 
-  LOG(ERROR) << "SQL Error: " << ErrorText(ErrorCode::CHARACTER_NOT_IN_REPERTOIRE)
+  LOG(DFATAL) << "SQL Error: " << ErrorText(ErrorCode::CHARACTER_NOT_IN_REPERTOIRE)
              << ". Invalid byte sequence for UTF8 \"" << buf << "\"";
 }
 

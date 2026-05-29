@@ -1,4 +1,4 @@
-// Copyright (c) YugaByte, Inc.
+// Copyright (c) YugabyteDB, Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License"); you may not use this file except
 // in compliance with the License.  You may obtain a copy of the License at
@@ -46,7 +46,6 @@ namespace yb {
 
 using client::YBClient;
 using client::YBClientBuilder;
-using client::YBColumnSchema;
 using client::YBSchemaBuilder;
 using client::YBSession;
 using client::YBTableCreator;
@@ -132,6 +131,7 @@ void YBTableTestBase::SetUp() {
         .extra_tserver_flags = {},
         .extra_master_flags = {},
         .cluster_id = {},
+        .cluster_short_name = {},
     };
     CustomizeExternalMiniCluster(&opts);
 
@@ -143,10 +143,11 @@ void YBTableTestBase::SetUp() {
         .num_tablet_servers = num_tablet_servers(),
         .num_drives = num_drives(),
         .master_env = env_.get(),
-        .ts_env = ts_env_.get(),
-        .ts_rocksdb_env = ts_rocksdb_env_.get()
+        .ts_env = ts_env_ ? ts_env_.get() : nullptr,
+        .ts_rocksdb_env = ts_rocksdb_env_ ? ts_rocksdb_env_.get() : nullptr
     };
-    SetAtomicFlag(enable_ysql(), &FLAGS_enable_ysql);
+    LOG(INFO) << "opts: " << opts.ts_env;
+    ANNOTATE_UNPROTECTED_WRITE(FLAGS_enable_ysql) = enable_ysql();
 
     mini_cluster_.reset(new MiniCluster(opts));
     BeforeStartCluster();
@@ -169,11 +170,6 @@ void YBTableTestBase::SetUp() {
 }
 
 void YBTableTestBase::TearDown() {
-  DeleteTable();
-
-  // Fetch the tablet server metrics page after we delete the table. [ENG-135].
-  FetchTSMetricsPage();
-
   client_.reset();
   if (use_yb_admin_client()) {
     yb_admin_client_.reset();
@@ -216,7 +212,7 @@ void YBTableTestBase::CreateAdminClient() {
     }  else {
       addrs = mini_cluster_->GetMasterAddresses();
     }
-    yb_admin_client_ = std::make_unique<tools::enterprise::ClusterAdminClient>(
+    yb_admin_client_ = std::make_unique<tools::ClusterAdminClient>(
         addrs, MonoDelta::FromMilliseconds(client_rpc_timeout_ms()));
 
     ASSERT_OK(yb_admin_client_->Init());
@@ -245,8 +241,8 @@ void YBTableTestBase::CreateTable() {
     ASSERT_OK(client_->CreateNamespaceIfNotExists(tn.namespace_name(), tn.namespace_type()));
 
     YBSchemaBuilder b;
-    b.AddColumn("k")->Type(BINARY)->NotNull()->HashPrimaryKey();
-    b.AddColumn("v")->Type(BINARY)->NotNull();
+    b.AddColumn("k")->Type(DataType::BINARY)->NotNull()->HashPrimaryKey();
+    b.AddColumn("v")->Type(DataType::BINARY)->NotNull();
     ASSERT_OK(b.Build(&schema_));
 
     ASSERT_OK(NewTableCreator()->table_name(tn).schema(&schema_).Create());
@@ -262,20 +258,26 @@ void YBTableTestBase::DeleteTable() {
 }
 
 shared_ptr<YBSession> YBTableTestBase::NewSession() {
-  shared_ptr<YBSession> session = client_->NewSession();
-  session->SetTimeout(MonoDelta::FromMilliseconds(session_timeout_ms()));
-  return session;
+  return client_->NewSession(MonoDelta::FromMilliseconds(session_timeout_ms()));
 }
 
-void YBTableTestBase::PutKeyValue(YBSession* session, string key, string value) {
-  auto insert = table_.NewInsertOp();
+Status YBTableTestBase::PutKeyValue(YBSession* session, const string& key, const string& value) {
+  auto insert = table_.NewInsertOp(session->arena());
   QLAddStringHashValue(insert->mutable_request(), key);
   table_.AddStringColumnValue(insert->mutable_request(), "v", value);
-  ASSERT_OK(session->TEST_ApplyAndFlush(insert));
+  return session->TEST_ApplyAndFlush(insert);
 }
 
-void YBTableTestBase::PutKeyValue(string key, string value) {
-  PutKeyValue(session_.get(), key, value);
+void YBTableTestBase::PutKeyValue(const string& key, const string& value) {
+  ASSERT_OK(PutKeyValue(session_.get(), key, value));
+}
+
+void YBTableTestBase::PutKeyValueIgnoreError(const string& key, const string& value) {
+  auto s ATTRIBUTE_UNUSED = PutKeyValue(session_.get(), key, value);
+  if (!s.ok()) {
+    LOG(WARNING) << "PutKeyValueIgnoreError: " << s;
+  }
+  return;
 }
 
 void YBTableTestBase::RestartCluster() {

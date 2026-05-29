@@ -1,4 +1,4 @@
-// Copyright (c) YugaByte, Inc.
+// Copyright (c) YugabyteDB, Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License"); you may not use this file except
 // in compliance with the License.  You may obtain a copy of the License at
@@ -13,7 +13,10 @@
 
 package org.yb.pgsql;
 
-import static org.yb.AssertionWrappers.*;
+import static org.yb.AssertionWrappers.assertEquals;
+import static org.yb.AssertionWrappers.assertFalse;
+import static org.yb.AssertionWrappers.assertTrue;
+import static org.yb.AssertionWrappers.fail;
 
 import java.sql.Connection;
 import java.sql.ResultSet;
@@ -28,13 +31,15 @@ import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.yb.util.BuildTypeUtil;
 import org.yb.util.MiscUtil;
-import org.yb.util.ThrowingRunnable;
 import org.yb.util.ProcessUtil;
-import org.yb.util.YBTestRunnerNonTsanOnly;
+import org.yb.util.ThrowingRunnable;
+import org.yb.YBTestRunner;
+import org.yb.util.SkipOnTSAN;
 
 import com.yugabyte.util.PSQLException;
 
-@RunWith(value=YBTestRunnerNonTsanOnly.class)
+@SkipOnTSAN
+@RunWith(value=YBTestRunner.class)
 public class TestPgYbStat extends BasePgSQLTest {
   private static final Integer MAX_PG_STAT_RETRIES = 20;
   private static final Logger LOG = LoggerFactory.getLogger(TestPgSequences.class);
@@ -43,32 +48,16 @@ public class TestPgYbStat extends BasePgSQLTest {
   private void executeQueryAndExpectNoResults(final String query,
     final Connection inputConnection) throws Exception {
     try (Statement statement = inputConnection.createStatement()) {
-      statement.executeQuery(String.format(query));
+      statement.executeQuery(query);
     } catch (PSQLException exception) {
       assertEquals("No results were returned by the query.", exception.getMessage());
     }
   }
 
-  // TODO: Will remove this when blocking upgrade issue lands that prohibits a system
-  // view from being properly added moving between different versions.
-  private void createQueryTerminationView(final Connection inputConnection) throws Exception {
-    String createViewQuery = "CREATE VIEW yb_terminated_queries AS " +
-      "SELECT " +
-            "D.datname AS databasename," +
-            "S.backend_pid AS backend_pid," +
-            "S.query_text AS query_text," +
-            "S.termination_reason AS termination_reason," +
-            "S.query_start AS query_start_time," +
-            "S.query_end AS query_end_time " +
-      "FROM yb_pg_stat_get_queries(NULL) AS S " +
-      "LEFT JOIN pg_database AS D ON (S.db_oid = D.oid);";
-    executeQueryAndExpectNoResults(createViewQuery, inputConnection);
-  }
-
   private void executeQueryAndExpectTempFileLimitExceeded(final String query,
     final Connection inputConnection) throws Exception {
     try (Statement statement = inputConnection.createStatement()) {
-      statement.executeQuery(String.format(query));
+      statement.executeQuery(query);
     } catch (PSQLException exception) {
       assertEquals("ERROR: temporary file size exceeds temp_file_limit (0kB)",
                    exception.getMessage());
@@ -86,9 +75,13 @@ public class TestPgYbStat extends BasePgSQLTest {
         startSignal.countDown();
         startSignal.await();
         try {
+          LOG.info("Executing query: {}", query);
           statement.execute(query);
         } catch (Throwable throwable) {
-          assertEquals("An I/O error occurred while sending to the backend.",
+          if(isTestRunningWithConnectionManager())
+            assertTrue(throwable.getMessage().contains("remote server read/write error"));
+          else
+            assertEquals("An I/O error occurred while sending to the backend.",
                        throwable.getMessage());
         }
       });
@@ -96,6 +89,7 @@ public class TestPgYbStat extends BasePgSQLTest {
         startSignal.countDown();
         startSignal.await();
         Thread.sleep(100); // Allow the query execution a headstart before killing
+        LOG.info("Sending signal {} to backend pid {}", signal, pid);
         ProcessUtil.signalProcess(pid, signal);
       });
       MiscUtil.runInParallel(cmds, startSignal, 60);
@@ -148,7 +142,7 @@ public class TestPgYbStat extends BasePgSQLTest {
     int retries = 0;
     while (retries++ < MAX_PG_STAT_RETRIES) {
       try (Statement statement = inputConnection.createStatement()) {
-        ResultSet resultSet = statement.executeQuery(String.format(query));
+        ResultSet resultSet = statement.executeQuery(query);
         if (checkResultSetCallback.checkResultSet(resultSet))
           return true;
       }
@@ -159,6 +153,10 @@ public class TestPgYbStat extends BasePgSQLTest {
 
   @Test
   public void testYbTerminatedQueriesMultipleCauses() throws Exception {
+    // (DB-12741) Test is flaky with connection manager irrespective of warmup
+    // mode. Disable the test for now when running with connection manager.
+    skipYsqlConnMgr(BasePgSQLTest.INCORRECT_CONN_STATE_BEHAVIOR);
+
     // We need to restart the cluster to wipe the state currently contained in yb_terminated_queries
     // that can potentially be leftover from another test in this class. This would let us start
     // with a clean slate.
@@ -184,8 +182,6 @@ public class TestPgYbStat extends BasePgSQLTest {
     executeQueryAndExpectTempFileLimitExceeded(oversized_query, connection);
 
     try (Statement statement = connection.createStatement()) {
-      createQueryTerminationView(connection);
-
       // By current implementation, we expect that the queries will overflow from the end
       // of the array and start overwiting the oldest entries stored at the beginning of
       // the array. Consider this a circular buffer.
@@ -206,7 +202,6 @@ public class TestPgYbStat extends BasePgSQLTest {
                         .equals("Terminated by SIGSEGV"))
               return false;
           }
-
 
           if (!resultSet.next()
            || !oversized_query.equals(resultSet.getString("query_text"))
@@ -238,8 +233,6 @@ public class TestPgYbStat extends BasePgSQLTest {
 
       executeQueryAndExpectNoResults("SET work_mem TO 2048", connection);
 
-      createQueryTerminationView(connection);
-
       // By current implementation, we expect that the queries will overflow from the end
       // of the array and start overwiting the oldest entries stored at the beginning of
       // the array. Consider this a circular buffer.
@@ -269,7 +262,11 @@ public class TestPgYbStat extends BasePgSQLTest {
     // We need to restart the cluster to wipe the state currently contained in yb_terminated_queries
     // that can potentially be leftover from another test in this class. This would let us start
     // with a clean slate.
-    restartCluster();
+    if (isTestRunningWithConnectionManager()) {
+      setConnMgrWarmupModeAndRestartCluster(ConnectionManagerWarmupMode.NONE);
+    } else {
+      restartCluster();
+    }
 
     final ArrayList<Connection> connections = createConnections(2);
     final Connection connection1 = connections.get(0);
@@ -282,8 +279,6 @@ public class TestPgYbStat extends BasePgSQLTest {
     final String statement2 = "SELECT * FROM generate_series(6, 1234567)";
     executeQueryAndExpectTempFileLimitExceeded(statement1, connection1);
     executeQueryAndExpectTempFileLimitExceeded(statement2, connection2);
-
-    createQueryTerminationView(connection1);
 
     assertTrue(waitUntilConditionSatisfiedOrTimeout(
       "SELECT backend_pid, query_text FROM yb_terminated_queries", connection1,
@@ -354,6 +349,106 @@ public class TestPgYbStat extends BasePgSQLTest {
           if (!result.next()) return false;
           if (!statement2.equals(result.getString("query_text"))) return false;
           return !result.next();
+        }));
+    }
+  }
+
+  @Test
+  public void testYbTerminatedQueriesEmpty() throws Exception {
+    // We need to restart the cluster to wipe the state currently contained in yb_terminated_queries
+    // that can potentially be leftover from another test in this class. This would let us start
+    // with a clean slate.
+    restartCluster();
+    // We expect the yb_terminated_queries view to be empty.
+    assertTrue(waitUntilConditionSatisfiedOrTimeout(
+      "SELECT query_text FROM yb_terminated_queries", connection,
+      (ResultSet resultSet) -> {
+        assertFalse("yb_terminated_queries view should be empty.",
+            resultSet.next());
+        return true;
+    }));
+  }
+
+  @Test
+  public void testYbTerminatedQueriesPersistence() throws Exception {
+    // We need to restart the cluster to wipe the state currently contained in yb_terminated_queries
+    // that can potentially be leftover from another test in this class. This would let us start
+    // with a clean slate.
+    restartCluster();
+    setupMinTempFileConfigs(connection);
+
+    final int num_queries = 100;
+
+    try (Statement statement = connection.createStatement()) {
+      for (int i = 0; i < num_queries; i++) {
+        final String query = String.format("SELECT * FROM generate_series(0, 1000000 + %d)", i);
+        executeQueryAndExpectTempFileLimitExceeded(query, connection);
+
+        if (i == num_queries / 2)
+        {
+          miniCluster.restart();
+          connection = getConnectionBuilder().connect();
+          setupMinTempFileConfigs(connection);
+        }
+      }
+
+      // Restarting the cluster without wiping previously reported terminated queries.
+      miniCluster.restart();
+
+      // Re-establishing a connection to the cluster.
+      connection = getConnectionBuilder().connect();
+
+      // Terminated queries reported before cluster restart should be persistent after the restart.
+      assertTrue(waitUntilConditionSatisfiedOrTimeout(
+        "SELECT query_text FROM yb_terminated_queries", connection,
+        (ResultSet resultSet) -> {
+          for (int i = 0; i < num_queries; i++) {
+            String expected_query = String.format("SELECT * FROM generate_series(0, 1000000 + %d)",
+                                                  i);
+            if (!resultSet.next() || !expected_query.equals(resultSet.getString("query_text")))
+              return false;
+          }
+          return true;
+        }));
+    }
+  }
+
+  @Test
+  public void testYbTerminatedQueriesQueryId() throws Exception {
+    // We need to restart the cluster to wipe the state currently contained in yb_terminated_queries
+    // that can potentially be leftover from another test in this class. This would let us start
+    // with a clean slate.
+    restartCluster();
+    setupMinTempFileConfigs(connection);
+
+    List<String> test_queries = new ArrayList<>();
+
+    test_queries.add("SELECT * FROM generate_series(0, 1000000)");
+    test_queries.add("SELECT gs % 10 AS mod_group, COUNT(*)\n" +
+                            "FROM generate_series(1, 1000000) AS gs\n" +
+                            "GROUP BY mod_group");
+    test_queries.add("SELECT * FROM generate_series(1, 500000) UNION\n"+
+                            "SELECT * FROM generate_series(500001, 1000000)");
+    test_queries.add("SELECT A.series AS series_a, B.series AS series_b\n" +
+                            "FROM generate_series(1, 1000000) A(series)\n" +
+                            "JOIN generate_series(500000, 1500000) B(series)\n" +
+                            "ON A.series = B.series");
+
+    final String validation_query = "SELECT COUNT(*) AS num_queries\n" +
+                                    "FROM yb_terminated_queries AS S\n" +
+                                    "LEFT JOIN pg_stat_statements AS P\n" +
+                                    "ON (S.query_id = P.queryid)";
+
+    try (Statement statement = connection.createStatement()) {
+      for (int i=0; i<test_queries.size(); i++) {
+        executeQueryAndExpectTempFileLimitExceeded(test_queries.get(i), connection);
+      }
+
+      assertTrue(waitUntilConditionSatisfiedOrTimeout(
+        validation_query, connection,
+        (ResultSet result) -> {
+          if (!result.next()) return false;
+          return result.getInt("num_queries") == test_queries.size();
         }));
     }
   }

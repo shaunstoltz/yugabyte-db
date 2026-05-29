@@ -1,4 +1,4 @@
-// Copyright (c) YugaByte, Inc.
+// Copyright (c) YugabyteDB, Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License"); you may not use this file except
 // in compliance with the License.  You may obtain a copy of the License at
@@ -14,12 +14,14 @@
 #include "yb/master/yql_vtable_iterator.h"
 #include <iterator>
 
-#include "yb/common/ql_expr.h"
-#include "yb/common/ql_rowblock.h"
+#include "yb/common/ql_protocol.messages.h"
 #include "yb/common/ql_value.h"
 #include "yb/common/schema.h"
 
 #include "yb/gutil/casts.h"
+
+#include "yb/qlexpr/ql_expr.h"
+#include "yb/qlexpr/ql_rowblock.h"
 
 #include "yb/util/result.h"
 
@@ -27,43 +29,36 @@ namespace yb {
 namespace master {
 
 YQLVTableIterator::YQLVTableIterator(
-    std::shared_ptr<QLRowBlock> vtable,
-    const google::protobuf::RepeatedPtrField<QLExpressionPB>& hashed_column_values)
+    std::shared_ptr<qlexpr::QLRowBlock> vtable,
+    const QLExpressionMsgs& hashed_column_values)
     : vtable_(std::move(vtable)), hashed_column_values_(hashed_column_values) {
   Advance(false /* increment */);
 }
 
-Status YQLVTableIterator::DoNextRow(
-    boost::optional<const Schema&> projection, QLTableRow* table_row) {
+Result<bool> YQLVTableIterator::PgFetchNext(dockv::PgTableRow* table_row) {
+  return STATUS_FORMAT(NotSupported, "$0 on system table", __func__);
+}
+
+Result<bool> YQLVTableIterator::DoFetchNext(
+    qlexpr::QLTableRow* table_row,
+    const dockv::ReaderProjection* projection,
+    qlexpr::QLTableRow* static_row,
+    const dockv::ReaderProjection* static_projection) {
   if (vtable_index_ >= vtable_->row_count()) {
-    return STATUS(NotFound, "No more rows left!");
+    return false;
   }
 
   // TODO: return columns in projection only.
-  QLRow& row = vtable_->row(vtable_index_);
+  auto& row = vtable_->row(vtable_index_);
   for (size_t i = 0; i < row.schema().num_columns(); i++) {
     table_row->AllocColumn(row.schema().column_id(i), down_cast<const QLValue&>(row.column(i)));
   }
   Advance(true /* increment */);
-  return Status::OK();
-}
-
-void YQLVTableIterator::SkipRow() {
-  if (vtable_index_ < vtable_->row_count()) {
-    Advance(true /* increment */);
-  }
-}
-
-Result<bool> YQLVTableIterator::HasNext() {
-  return vtable_index_ < vtable_->row_count();
+  return true;
 }
 
 std::string YQLVTableIterator::ToString() const {
   return "YQLVTableIterator";
-}
-
-const Schema& YQLVTableIterator::schema() const {
-  return vtable_->schema();
 }
 
 // Advances iterator to next valid row, filtering columns using hashed_column_values_.
@@ -71,15 +66,16 @@ void YQLVTableIterator::Advance(bool increment) {
   if (increment) {
     ++vtable_index_;
   }
-  int num_hashed_columns = hashed_column_values_.size();
+  auto num_hashed_columns = hashed_column_values_.size();
   if (num_hashed_columns == 0) {
     return;
   }
   while (vtable_index_ < vtable_->row_count()) {
     auto& row = vtable_->row(vtable_index_);
     bool bad = false;
-    for (int idx = 0; idx != num_hashed_columns; ++idx) {
-      if (hashed_column_values_[idx].value() != row.column(idx)) {
+    auto it = hashed_column_values_.begin();
+    for (size_t idx = 0; idx != num_hashed_columns; ++idx, ++it) {
+      if (it->value().ToGoogleProtobuf() != row.column(idx)) {
         bad = true;
         break;
       }
@@ -94,8 +90,8 @@ void YQLVTableIterator::Advance(bool increment) {
 YQLVTableIterator::~YQLVTableIterator() {
 }
 
-HybridTime YQLVTableIterator::RestartReadHt() {
-  return HybridTime::kInvalid;
+Result<ReadRestartData> YQLVTableIterator::GetReadRestartData() {
+  return ReadRestartData{};
 }
 
 }  // namespace master

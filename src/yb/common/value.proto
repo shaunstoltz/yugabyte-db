@@ -1,4 +1,4 @@
-// Copyright (c) YugaByte, Inc.
+// Copyright (c) YugabyteDB, Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License"); you may not use this file except
 // in compliance with the License.  You may obtain a copy of the License at
@@ -11,6 +11,8 @@
 // under the License.
 
 syntax = "proto2";
+
+import "yb/rpc/lightweight_message.proto";
 
 package yb;
 
@@ -86,14 +88,19 @@ message QLValuePB {
     // Null category for GIN indexes.
     uint32 gin_null_value = 26;
     QLSeqValuePB tuple_value = 27;
+    // raw bytes for bson value.
+    bytes bson_value = 28;
   }
 }
 
 // To ensure compatibility between release versions, the numeric values of these datatypes cannot
 // be changed once the types are implemented and released.
 //
-// Make sure this is in sync with YBCPgDataType in ybc_pg_typedefs.h.
-enum DataType {
+// Make sure this is in sync with YbcPgDataType in ybc_pg_typedefs.h.
+enum PersistentDataType {
+  // DataType constains continuous range of values and should be used in memory for efficiency.
+  option (yb.rpc.lightweight_enum).name = "DataType";
+
   UNKNOWN_DATA = 999;
   NULL_VALUE_TYPE = 0;
   INT8 = 1;
@@ -129,6 +136,8 @@ enum DataType {
   UINT64 = 103;
 
   GIN_NULL = 104;
+  VECTOR = 105;
+  BSON = 106;
 }
 
 // Expression operators.
@@ -160,6 +169,8 @@ enum QLOperator {
   QL_OP_NOT_LIKE = 15;
   QL_OP_IN = 16;
   QL_OP_NOT_IN = 17;
+  QL_OP_CONTAINS = 22;
+  QL_OP_CONTAINS_KEY = 23;
 
   // Relation operators that take three operands.
   QL_OP_BETWEEN = 18;
@@ -168,19 +179,4 @@ enum QLOperator {
   // Operators that take no operand. For use in "if" clause only currently.
   QL_OP_EXISTS = 20;     // IF EXISTS
   QL_OP_NOT_EXISTS = 21; // IF NOT EXISTS
-}
-
-message DatumMessagePB {
-  optional string column_name = 1;
-  optional int64 column_type = 2;
-  oneof datum {
-    int32 datum_int32 = 3;
-    int64 datum_int64 = 4;
-    float datum_float = 5;
-    double datum_double = 6;
-    bool datum_bool = 7;
-    string datum_string = 8;
-    bytes datum_bytes = 9;
-    bool datum_missing = 10;
-  }
 }

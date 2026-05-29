@@ -1,5 +1,5 @@
 //--------------------------------------------------------------------------------------------------
-// Copyright (c) YugaByte, Inc.
+// Copyright (c) YugabyteDB, Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License"); you may not use this file except
 // in compliance with the License.  You may obtain a copy of the License at
@@ -15,10 +15,11 @@
 
 #include "yb/bfql/directory.h"
 
+#include "yb/common/value.messages.h"
+
 namespace yb {
 namespace bfql {
 
-using std::initializer_list;
 using std::vector;
 
 const DataType VOID = DataType::UNKNOWN_DATA;

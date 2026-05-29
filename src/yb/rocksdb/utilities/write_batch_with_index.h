@@ -6,9 +6,9 @@
 // Use of this source code is governed by a BSD-style license that can be
 // found in the LICENSE file. See the AUTHORS file for names of contributors.
 //
-// The following only applies to changes made to this file as part of YugaByte development.
+// The following only applies to changes made to this file as part of YugabyteDB development.
 //
-// Portions Copyright (c) YugaByte, Inc.
+// Portions Copyright (c) YugabyteDB, Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License"); you may not use this file except
 // in compliance with the License.  You may obtain a copy of the License at
@@ -53,10 +53,8 @@ enum WriteType {
 
 // an entry for Put, Merge, Delete, or SingleDelete entry for write batches.
 // Used in WBWIIterator.
-struct WriteEntry {
+struct WriteEntry : public KeyValueEntry {
   WriteType type;
-  Slice key;
-  Slice value;
 };
 
 // Iterator of one column family out of a WriteBatchWithIndex.
@@ -78,7 +76,7 @@ class WBWIIterator {
 
   // the return WriteEntry is only valid until the next mutation of
   // WriteBatchWithIndex
-  virtual WriteEntry Entry() const = 0;
+  virtual const WriteEntry& Entry() const = 0;
 
   virtual Status status() const = 0;
 };

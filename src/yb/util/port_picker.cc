@@ -1,4 +1,4 @@
-// Copyright (c) YugaByte, Inc.
+// Copyright (c) YugabyteDB, Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License"); you may not use this file except
 // in compliance with the License.  You may obtain a copy of the License at
@@ -19,7 +19,7 @@
 namespace yb {
 
 uint16_t PortPicker::AllocateFreePort() {
-  std::lock_guard<std::mutex> lock(mutex_);
+  std::lock_guard lock(mutex_);
 
   // This will take a file lock ensuring the port does not get claimed by another thread/process
   // and add it to our vector of such locks that will be freed on minicluster shutdown.

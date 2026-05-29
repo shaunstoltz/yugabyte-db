@@ -15,9 +15,9 @@
 // specific language governing permissions and limitations
 // under the License.
 //
-// The following only applies to changes made to this file as part of YugaByte development.
+// The following only applies to changes made to this file as part of YugabyteDB development.
 //
-// Portions Copyright (c) YugaByte, Inc.
+// Portions Copyright (c) YugabyteDB, Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License"); you may not use this file except
 // in compliance with the License.  You may obtain a copy of the License at
@@ -32,6 +32,7 @@
 
 #include "yb/integration-tests/create-table-itest-base.h"
 
+#include "yb/common/colocated_util.h"
 #include "yb/util/backoff_waiter.h"
 #include "yb/yql/pgwrapper/pg_wrapper.h"
 #include "yb/yql/pgwrapper/libpq_utils.h"
@@ -42,28 +43,30 @@ using std::vector;
 METRIC_DECLARE_entity(server);
 METRIC_DECLARE_entity(tablet);
 METRIC_DECLARE_gauge_int64(is_raft_leader);
+METRIC_DECLARE_gauge_uint32(ts_live_tablet_peers);
 METRIC_DECLARE_histogram(handler_latency_yb_tserver_TabletServerAdminService_CreateTablet);
 METRIC_DECLARE_histogram(handler_latency_yb_tserver_TabletServerAdminService_DeleteTablet);
 
-DECLARE_int32(ycql_num_tablets);
-DECLARE_int32(yb_num_shards_per_tserver);
-DECLARE_int32(raft_heartbeat_interval_ms);
 DECLARE_double(leader_failure_max_missed_heartbeat_periods);
+DECLARE_int32(heartbeat_interval_ms);
+DECLARE_int32(raft_heartbeat_interval_ms);
+DECLARE_int32(yb_num_shards_per_tserver);
+DECLARE_int32(ycql_num_tablets);
 
 namespace yb {
-
-using pgwrapper::GetInt32;
 
 class CreateTableITest : public CreateTableITestBase {
  public:
   Result<pgwrapper::PGConn> ConnectToDB(
       const std::string& dbname, bool simple_query_protocol = false) {
     return pgwrapper::PGConnBuilder({
-      .host = cluster_->pgsql_hostport(0).host(),
-      .port = cluster_->pgsql_hostport(0).port(),
+      .host = cluster_->ysql_hostport(0).host(),
+      .port = cluster_->ysql_hostport(0).port(),
       .dbname = dbname
     }).Connect(simple_query_protocol);
   }
+
+  void TestLazySuperblockFlushPersistence(int num_tables, int iterations);
 };
 
 // TODO(bogdan): disabled until ENG-2687
@@ -78,7 +81,7 @@ TEST_F(CreateTableITest, DISABLED_TestCreateRedisTable) {
                           Substitute("--placement_zone=$0", zone)};
   ASSERT_NO_FATALS(StartCluster(flags, flags, kNumReplicas));
 
-  master::ReplicationInfoPB replication_info;
+  ReplicationInfoPB replication_info;
   replication_info.mutable_live_replicas()->set_num_replicas(kNumReplicas);
   auto* placement_block = replication_info.mutable_live_replicas()->add_placement_blocks();
   auto* cloud_info = placement_block->mutable_cloud_info();
@@ -104,7 +107,7 @@ TEST_F(CreateTableITest, DISABLED_TestCreateWithPlacement) {
                           Substitute("--placement_zone=$0", zone)};
   ASSERT_NO_FATALS(StartCluster(flags, flags, kNumReplicas));
 
-  master::ReplicationInfoPB replication_info;
+  ReplicationInfoPB replication_info;
   replication_info.mutable_live_replicas()->set_num_replicas(kNumReplicas);
   auto* placement_block = replication_info.mutable_live_replicas()->add_placement_blocks();
   auto* cloud_info = placement_block->mutable_cloud_info();
@@ -321,18 +324,16 @@ TEST_F(CreateTableITest, LegacyColocatedDBTableColocationRemoteBootstrapTest) {
   vector<string> ts_flags;
   vector<string> master_flags;
 
-  ts_flags.push_back("--follower_unavailable_considered_failed_sec=3");
+  ts_flags.push_back("--follower_unavailable_considered_failed_sec=6");
   master_flags.push_back("--ysql_legacy_colocated_database_creation=true");
   ASSERT_NO_FATALS(StartCluster(ts_flags, master_flags, kNumReplicas));
-  ASSERT_OK(
-      client_->CreateNamespace("colocation_test", boost::none /* db */, "" /* creator */,
-                               "" /* ns_id */, "" /* src_ns_id */,
-                               boost::none /* next_pg_oid */, nullptr /* txn */,
-                               true /* colocated */));
+  ASSERT_OK(client_->CreateNamespace(
+      "colocation_test", std::nullopt /* db */, "" /* creator */, "" /* ns_id */,
+      "" /* src_ns_id */, std::nullopt /* next_pg_oid */, nullptr /* txn */, true /* colocated */));
 
   {
     string ns_id;
-    auto namespaces = ASSERT_RESULT(client_->ListNamespaces(boost::none));
+    auto namespaces = ASSERT_RESULT(client_->ListNamespaces());
     for (const auto& ns : namespaces) {
       if (ns.id.name() == "colocation_test") {
         ns_id = ns.id.id();
@@ -340,7 +341,7 @@ TEST_F(CreateTableITest, LegacyColocatedDBTableColocationRemoteBootstrapTest) {
       }
     }
     ASSERT_FALSE(ns_id.empty());
-    parent_table_id = master::GetColocatedDbParentTableId(ns_id);
+    parent_table_id = GetColocatedDbParentTableId(ns_id);
   }
 
   {
@@ -382,7 +383,7 @@ TEST_F(CreateTableITest, LegacyColocatedDBTableColocationRemoteBootstrapTest) {
   ASSERT_OK(WaitFor(dirs_exist, MonoDelta::FromSeconds(100), "Create data and wal directories"));
 }
 
-TEST_F(CreateTableITest, YB_DISABLE_TEST_IN_TSAN(TableColocationRemoteBootstrapTest)) {
+TEST_F(CreateTableITest, TableColocationRemoteBootstrapTest) {
   const int kNumReplicas = 3;
   const string kNamespaceName = "colocation_test";
   string parent_table_id;
@@ -390,7 +391,7 @@ TEST_F(CreateTableITest, YB_DISABLE_TEST_IN_TSAN(TableColocationRemoteBootstrapT
   vector<string> ts_flags;
   vector<string> master_flags;
 
-  ts_flags.push_back("--follower_unavailable_considered_failed_sec=3");
+  ts_flags.push_back("--follower_unavailable_considered_failed_sec=6");
   master_flags.push_back("--ysql_legacy_colocated_database_creation=false");
   ASSERT_NO_FATALS(StartCluster(ts_flags, master_flags, kNumReplicas, 1 /* num_masters */,
                                 true /* enable_ysql */));
@@ -398,13 +399,12 @@ TEST_F(CreateTableITest, YB_DISABLE_TEST_IN_TSAN(TableColocationRemoteBootstrapT
   ASSERT_OK(conn.ExecuteFormat("CREATE DATABASE $0 WITH colocation = true", kNamespaceName));
   conn = ASSERT_RESULT(ConnectToDB(kNamespaceName));
   ASSERT_OK(conn.Execute("CREATE TABLE tbl (k int PRIMARY KEY, v int)"));
-  auto res = ASSERT_RESULT(conn.FetchFormat("SELECT oid FROM pg_database WHERE datname = '$0'",
-                                            kNamespaceName));
-  uint32 db_oid = static_cast<uint32>(ASSERT_RESULT(GetInt32(res.get(), 0, 0)));
-  res = ASSERT_RESULT(conn.Fetch("SELECT oid FROM pg_yb_tablegroup WHERE grpname = 'default'"));
-  uint32 tablegroup_oid = static_cast<uint32>(ASSERT_RESULT(GetInt32(res.get(), 0, 0)));
+  auto db_oid = ASSERT_RESULT(conn.FetchRow<pgwrapper::PGOid>(Format(
+      "SELECT oid FROM pg_database WHERE datname = '$0'", kNamespaceName)));
+  auto tablegroup_oid = ASSERT_RESULT(conn.FetchRow<pgwrapper::PGOid>(
+      "SELECT oid FROM pg_yb_tablegroup WHERE grpname = 'default'"));
   TablegroupId tablegroup_id = GetPgsqlTablegroupId(db_oid, tablegroup_oid);
-  parent_table_id = master::GetColocationParentTableId(tablegroup_id);
+  parent_table_id = GetColocationParentTableId(tablegroup_id);
 
   auto exists = ASSERT_RESULT(client_->TablegroupExists(kNamespaceName, tablegroup_id));
   ASSERT_TRUE(exists);
@@ -449,7 +449,7 @@ TEST_F(CreateTableITest, YB_DISABLE_TEST_IN_TSAN(TableColocationRemoteBootstrapT
 }
 
 // Skipping in TSAN because of an error with initdb in TSAN when ysql is enabled
-TEST_F(CreateTableITest, YB_DISABLE_TEST_IN_TSAN(TablegroupRemoteBootstrapTest)) {
+TEST_F(CreateTableITest, TablegroupRemoteBootstrapTest) {
   const int kNumReplicas = 3;
   string parent_table_id;
   string tablet_id;
@@ -460,17 +460,17 @@ TEST_F(CreateTableITest, YB_DISABLE_TEST_IN_TSAN(TablegroupRemoteBootstrapTest))
   TablespaceId tablespace_id = "";
   string namespace_id;
 
-  ts_flags.push_back("--follower_unavailable_considered_failed_sec=3");
+  ts_flags.push_back("--follower_unavailable_considered_failed_sec=6");
   ts_flags.push_back("--ysql_beta_feature_tablegroup=true");
   ASSERT_NO_FATALS(StartCluster(ts_flags, master_flags, kNumReplicas, 1 /* masters */,
                                 true /* enable_ysql (allows load balancing) */));
 
-  ASSERT_OK(client_->CreateNamespace(namespace_name, YQL_DATABASE_PGSQL, "" /* creator */,
-                                     "" /* ns_id */, "" /* src_ns_id */,
-                                     boost::none /* next_pg_oid */, nullptr /* txn */, false));
+  ASSERT_OK(client_->CreateNamespace(
+      namespace_name, YQL_DATABASE_PGSQL, "" /* creator */, "" /* ns_id */, "" /* src_ns_id */,
+      std::nullopt /* next_pg_oid */, nullptr /* txn */, false));
 
   {
-    auto namespaces = ASSERT_RESULT(client_->ListNamespaces(boost::none));
+    auto namespaces = ASSERT_RESULT(client_->ListNamespaces());
     for (const auto& ns : namespaces) {
       if (ns.id.name() == namespace_name) {
         namespace_id = ns.id.id();
@@ -491,7 +491,7 @@ TEST_F(CreateTableITest, YB_DISABLE_TEST_IN_TSAN(TablegroupRemoteBootstrapTest))
   // Now want to ensure that the newly created tablegroup shows up in the list.
   auto exists = ASSERT_RESULT(client_->TablegroupExists(namespace_name, tablegroup_id));
   ASSERT_TRUE(exists);
-  parent_table_id = master::GetTablegroupParentTableId(tablegroup_id);
+  parent_table_id = GetTablegroupParentTableId(tablegroup_id);
 
   {
     google::protobuf::RepeatedPtrField<master::TabletLocationsPB> tablets;
@@ -565,18 +565,50 @@ TEST_F(CreateTableITest, TestIsRaftLeaderMetric) {
   ASSERT_EQ(kNumRaftLeaders, kExpectedRaftLeaders);
 }
 
+TEST_F(CreateTableITest, TestLiveTabletPeersMetric) {
+  constexpr int kNumTServers = 3;
+  const int kNumTablets = 10;
+  ASSERT_NO_FATALS(StartCluster({}, {"--tablet_creation_timeout_ms=1000"}, kNumTServers));
+  ASSERT_OK(client_->CreateNamespaceIfNotExists(
+      kTableName.namespace_name(), kTableName.namespace_type()));
+  std::unique_ptr<client::YBTableCreator> table_creator(client_->NewTableCreator());
+  client::YBSchema client_schema(client::YBSchemaFromSchema(GetSimpleTestSchema()));
+
+  ASSERT_OK(table_creator->table_name(kTableName)
+                .schema(&client_schema)
+                .num_tablets(kNumTablets)
+                .Create());
+
+  // For each tserver verify the metric value ts_live_tablet_peers is equal to the number of tablets
+  // we requested for the table.
+  for (const auto& tserver : cluster_->tserver_daemons()) {
+    ASSERT_OK(LoggedWaitFor(
+        [&]() -> Result<bool> {
+          auto metric_value = VERIFY_RESULT(tserver->GetMetric<uint32>(
+              "server", "yb.tabletserver", "ts_live_tablet_peers", "value"));
+          return metric_value == kNumTablets;
+        },
+        10s * kTimeMultiplier, "Wait for ts_live_tablet_peers to become equal to kNumTablets"));
+  }
+}
+
 // In TSAN, currently, initdb isn't created during build but on first start.
 // As a result transaction table gets created without waiting for the requisite
 // number of TS.
-TEST_F(CreateTableITest, YB_DISABLE_TEST_IN_TSAN(TestTransactionStatusTableCreation)) {
+TEST_F(CreateTableITest, TestTransactionStatusTableCreation) {
   // Set up an RF 1.
   // Tell the Master leader to wait for 3 TS to join before creating the
   // transaction status table.
   vector<string> master_flags = {
-        "--txn_table_wait_min_ts_count=3"
+      "--txn_table_wait_min_ts_count=3"
+  };
+  vector<string> tserver_flags = {
+      // TODO(#27854): We get stuck with object locking when there is no system.transactions
+      // table. Disabling it for now until we fix the underlying issue.
+      "--enable_object_locking_for_table_locks=false",
   };
   // We also need to enable ysql.
-  ASSERT_NO_FATALS(StartCluster({}, master_flags, 1, 1, true));
+  ASSERT_NO_FATALS(StartCluster(tserver_flags, master_flags, 1, 1, true));
 
   // Check that the transaction table hasn't been created yet.
   YQLDatabase db = YQL_DATABASE_CQL;
@@ -617,11 +649,12 @@ TEST_F(CreateTableITest, TestCreateTableWithDefinedPartition) {
   client::YBSchema client_schema(client::YBSchemaFromSchema(GetSimpleTestSchema()));
 
   // Allocate the partitions.
-  Partition partitions[kNumPartitions];
-  const uint16_t interval = PartitionSchema::kMaxPartitionKey / (kNumPartitions + 1);
+  dockv::Partition partitions[kNumPartitions];
+  const uint16_t interval = dockv::PartitionSchema::kMaxPartitionKey / (kNumPartitions + 1);
 
-  partitions[0].set_partition_key_end(PartitionSchema::EncodeMultiColumnHashValue(interval));
-  partitions[1].set_partition_key_start(PartitionSchema::EncodeMultiColumnHashValue(interval));
+  partitions[0].set_partition_key_end(dockv::PartitionSchema::EncodeMultiColumnHashValue(interval));
+  partitions[1].set_partition_key_start(
+      dockv::PartitionSchema::EncodeMultiColumnHashValue(interval));
 
   // create a table
   ASSERT_OK(table_creator->table_name(kTableName)
@@ -636,8 +669,8 @@ TEST_F(CreateTableITest, TestCreateTableWithDefinedPartition) {
       kTableName, -1, &tablets, /* partition_list_version =*/ nullptr,
       RequireTabletsRunning::kFalse));
   for (int i = 0 ; i < kNumPartitions; ++i) {
-    Partition p;
-    Partition::FromPB(tablets[i].partition(), &p);
+    dockv::Partition p;
+    dockv::Partition::FromPB(tablets[i].partition(), &p);
     ASSERT_TRUE(partitions[i].BoundsEqualToPartition(p));
   }
 }
@@ -653,8 +686,8 @@ TEST_F(CreateTableITest, TestNumTabletsFlags) {
   const string kTableName3 = "test-table3";
 
   // Set the value of the flags.
-  FLAGS_ycql_num_tablets = 1;
-  FLAGS_yb_num_shards_per_tserver = 3;
+  ANNOTATE_UNPROTECTED_WRITE(FLAGS_ycql_num_tablets) = 1;
+  ANNOTATE_UNPROTECTED_WRITE(FLAGS_yb_num_shards_per_tserver) = 3;
   // Start an RF3.
   ASSERT_NO_FATALS(StartCluster({}, {}, kNumReplicas));
 
@@ -695,7 +728,7 @@ TEST_F(CreateTableITest, TestNumTabletsFlags) {
   ASSERT_EQ(tablets.size(), 1);
 
   // Reset the value of the flag.
-  FLAGS_ycql_num_tablets = -1;
+  ANNOTATE_UNPROTECTED_WRITE(FLAGS_ycql_num_tablets) = -1;
 
   // Test 3: Create a table without explicit tablet count.
   YBTableName table_name3(kNamespaceType, kNamespaceName, kTableName3);
@@ -844,7 +877,7 @@ TEST_F(CreateTableITest, OnlyMajorityReplicasWithPlacement) {
   LOG(INFO) << "Started an RF3 cluster with 3 tservers in c.r.z0,c.r.z1,c.r.z2 and 1 master";
 
   // Modify placement info to contain at least one replica in each of the three zones.
-  master::ReplicationInfoPB replication_info;
+  ReplicationInfoPB replication_info;
   auto* placement_info = replication_info.mutable_live_replicas();
   PreparePlacementInfo({ {"z0", 1}, {"z1", 1}, {"z2", 1} }, 3, placement_info);
 
@@ -943,7 +976,7 @@ TEST_F(CreateTableITest, OnlyMajorityReplicasWithPlacement) {
   // Result: Create Table should succeed.
 
   // Increase the number of replicas to 5 with the same placement config.
-  master::ReplicationInfoPB replication_info2;
+  ReplicationInfoPB replication_info2;
   auto* placement_info2 = replication_info2.mutable_live_replicas();
   PreparePlacementInfo({ {"z0", 1}, {"z1", 1}, {"z2", 1} }, 5, placement_info2);
 
@@ -985,19 +1018,19 @@ TEST_F(CreateTableITest, OnlyMajorityReplicasWithPlacement) {
   // Result: Create Table should succeed despite having 0 read replica nodes.
 
   // Modify Placement info to contain a read replica also.
-  master::ReplicationInfoPB replication_info3;
+  ReplicationInfoPB replication_info3;
   auto* placement_info3 = replication_info3.mutable_live_replicas();
   PreparePlacementInfo({ {"z0", 1}, {"z1", 1}, {"z2", 1} }, 5, placement_info3);
-  auto* read_placement_info = replication_info3.add_read_replicas();
-  read_placement_info->set_placement_uuid("read-replica");
-  PreparePlacementInfo({ {"z4", 1} }, 1, read_placement_info);
+  auto* read_replica_placement_info = replication_info3.add_read_replicas();
+  read_replica_placement_info->set_placement_uuid("read-replica");
+  PreparePlacementInfo({ {"z4", 1} }, 1, read_replica_placement_info);
   ASSERT_OK(client_->SetReplicationInfo(replication_info3));
   LOG(INFO) << "Set replication info to " << replication_info3.ShortDebugString();
 
   // Try creating a table. It should succeed.
   YBTableName table_name5(kNamespaceType, kNamespaceName, kTableName5);
   std::unique_ptr<client::YBTableCreator> table_creator5(client_->NewTableCreator());
-  ASSERT_OK(table_creator1->table_name(table_name5)
+  ASSERT_OK(table_creator5->table_name(table_name5)
                             .schema(&client_schema)
                             .num_tablets(kNumTablets)
                             .wait(true)
@@ -1022,6 +1055,77 @@ TEST_F(CreateTableITest, OnlyMajorityReplicasWithPlacement) {
     }
     return true;
   }, 120s * kTimeMultiplier, "Are tablets running", 1s));
+}
+
+void CreateTableITest::TestLazySuperblockFlushPersistence(int num_tables, int iterations) {
+  const string database = "test_db";
+  const string table_prefix = "foo";
+  for (int itr = 0; itr < iterations; ++itr) {
+    auto conn = ASSERT_RESULT(ConnectToDB(std::string()));
+    ASSERT_OK(conn.ExecuteFormat("DROP DATABASE IF EXISTS $0", database));
+    ASSERT_OK(conn.ExecuteFormat("CREATE DATABASE $0 WITH COLOCATION = true", database));
+    auto db_conn = ASSERT_RESULT(ConnectToDB(database));
+    for (int i = 0; i < num_tables; ++i) {
+      ASSERT_OK(db_conn.ExecuteFormat("CREATE TABLE $0$1 (i int)", table_prefix, i));
+      ASSERT_OK(db_conn.Execute("BEGIN"));
+      ASSERT_OK(db_conn.ExecuteFormat("INSERT INTO $0$1 values (1)", table_prefix, i));
+      ASSERT_OK(db_conn.Execute("COMMIT"));
+    }
+    ASSERT_OK(cluster_->WaitForAllIntentsApplied(30s));
+
+    // Flush rocksdb (but not superblock) so that the rocksdb flush OpId is ahead of superblock
+    // flush OpId.
+    auto client = ASSERT_RESULT(cluster_->CreateClient());
+    auto table_id =
+        ASSERT_RESULT(GetTableIdByTableName(client.get(), database, table_prefix + "0"));
+    ASSERT_OK(client->FlushTables({table_id}));
+
+    // Restart tservers.
+    cluster_->Shutdown(ExternalMiniCluster::NodeSelectionMode::TS_ONLY);
+    ASSERT_OK(cluster_->Restart());
+
+    // Check persistence after restart.
+    auto new_conn = ASSERT_RESULT(ConnectToDB(database));
+    for (int i = 0; i < num_tables; ++i) {
+      auto res = ASSERT_RESULT(
+          new_conn.FetchRow<int64_t>(Format("SELECT COUNT(*) FROM $0$1", table_prefix, i)));
+      ASSERT_EQ(res, 1);
+    }
+  }
+}
+
+TEST_F(CreateTableITest, LazySuperblockFlushSingleTablePersistence) {
+  std::vector<string> ts_flags;
+  // Enable lazy superblock flush.
+  ts_flags.push_back("--lazily_flush_superblock=true");
+  ASSERT_NO_FATALS(StartCluster(ts_flags, {} /* master_flags */, 3, 1, true));
+  TestLazySuperblockFlushPersistence(1, 1);
+}
+
+TEST_F(CreateTableITest, LazySuperblockFlushMultiTablePersistence) {
+  std::vector<string> ts_flags;
+  // Enable lazy superblock flush.
+  ts_flags.push_back("--lazily_flush_superblock=true");
+
+  // Minimize log retention.
+  ts_flags.push_back("--log_min_segments_to_retain=1");
+  ts_flags.push_back("--log_min_seconds_to_retain=0");
+
+  // Prevent the flag validator from failing when FLAGS_log_min_seconds_to_retain is also set to 0
+  ts_flags.push_back("--xcluster_checkpoint_max_staleness_secs=0");
+
+  // Minimize log replay.
+  ts_flags.push_back("--retryable_request_timeout_secs=0");
+
+  // Reduce the WAL segment size so that the number of WAL segments are > 1.
+  ts_flags.push_back("--initial_log_segment_size_bytes=1024");
+  ts_flags.push_back("--log_segment_size_bytes=1024");
+
+  // Skip flushing superblock on table flush.
+  ts_flags.push_back("--TEST_skip_force_superblock_flush=true");
+
+  ASSERT_NO_FATALS(StartCluster(ts_flags, {} /* master_flags */, 3, 1, true));
+  TestLazySuperblockFlushPersistence(/* num_tables = */ 20, /* num_iterations = */ 2);
 }
 
 }  // namespace yb

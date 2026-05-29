@@ -1,4 +1,4 @@
-// Copyright (c) YugaByte, Inc.
+// Copyright (c) YugabyteDB, Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License"); you may not use this file except
 // in compliance with the License.  You may obtain a copy of the License at
@@ -15,6 +15,11 @@
 
 #include <mutex>
 
+#include "yb/common/entity_ids_types.h"
+
+#include "yb/docdb/docdb_fwd.h"
+
+#include "yb/rocksdb/listener.h"
 #include "yb/rocksdb/rocksdb_fwd.h"
 
 #include "yb/tablet/tablet_fwd.h"
@@ -23,6 +28,7 @@
 
 namespace yb {
 
+class Env;
 class RWOperationCounter;
 
 namespace tablet {
@@ -40,19 +46,29 @@ class TabletComponent {
   }
 
  protected:
-  Result<TabletScopedRWOperationPauses> StartShutdownRocksDBs(
-      DisableFlushOnShutdown disable_flush_on_shutdown);
+  TabletScopedRWOperationPauses StartShutdownStorages(
+      DisableFlushOnShutdown disable_flush_on_shutdown, AbortOps abort_ops);
 
-  Status CompleteShutdownRocksDBs(
-      Destroy destroy, TabletScopedRWOperationPauses* ops_pauses);
+  std::vector<std::string> CompleteShutdownStorages(
+      const TabletScopedRWOperationPauses& ops_pauses);
 
-  Status OpenRocksDBs();
+  Status DeleteStorages(const std::vector<std::string>& db_paths);
+
+  Status OpenStorages();
 
   std::string LogPrefix() const;
 
+  Status Flush(FlushMode mode, FlushFlags flags, rocksdb::FlushReason rocksdb_flush_reason);
+
+  Status Flush(FlushMode mode, rocksdb::FlushReason rocksdb_flush_reason) {
+    return Flush(mode, FlushFlags::kAllDbs, rocksdb_flush_reason);
+  }
+
   RaftGroupMetadata& metadata() const;
 
-  RWOperationCounter& pending_op_counter() const;
+  RWOperationCounter& pending_op_counter_blocking_rocksdb_shutdown_start() const;
+
+  const TabletId& tablet_id() const;
 
   rocksdb::DB& regular_db() const;
 
@@ -62,11 +78,17 @@ class TabletComponent {
 
   bool has_intents_db() const;
 
+  docdb::DocDB doc_db(TabletMetrics* metrics = nullptr) const;
+
   std::mutex& create_checkpoint_lock() const;
+
+  Env& env() const;
 
   rocksdb::Env& rocksdb_env() const;
 
   void RefreshYBMetaDataCache();
+
+  docdb::DocVectorIndexesPtr VectorIndexesList() const;
 
  private:
   Tablet& tablet_;

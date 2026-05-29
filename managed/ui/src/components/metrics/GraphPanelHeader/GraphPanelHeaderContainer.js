@@ -1,4 +1,4 @@
-// Copyright (c) YugaByte, Inc.
+// Copyright (c) YugabyteDB, Inc.
 
 import { connect } from 'react-redux';
 import { reduxForm } from 'redux-form';
@@ -8,10 +8,13 @@ import {
   resetGraphQueryPeriod,
   togglePrometheusQuery,
   getGrafanaJson,
-  resetMetrics
+  resetMetrics,
+  resetGraphFilter,
+  setGraphFilter
 } from '../../../actions/graph';
 import { fetchUniverseList, fetchUniverseListResponse } from '../../../actions/universe';
-import { closeDialog, openDialog } from "../../../actions/modal";
+import { closeDialog, openDialog } from '../../../actions/modal';
+import { fetchCustomerRunTimeConfigs, fetchCustomerRunTimeConfigsResponse } from '../../../actions/customers';
 
 const mapDispatchToProps = (dispatch) => {
   return {
@@ -19,6 +22,11 @@ const mapDispatchToProps = (dispatch) => {
       dispatch(fetchUniverseList()).then((response) => {
         dispatch(fetchUniverseListResponse(response.payload));
       });
+    },
+    fetchCustomerRunTimeConfigs: () => {
+      return dispatch(fetchCustomerRunTimeConfigs(true)).then((response) =>
+        dispatch(fetchCustomerRunTimeConfigsResponse(response.payload))
+      );
     },
     changeGraphQueryFilters: (filterParams) => {
       dispatch(changeGraphQueryPeriod(filterParams));
@@ -35,6 +43,12 @@ const mapDispatchToProps = (dispatch) => {
     },
     resetMetrics: () => {
       dispatch(resetMetrics());
+    },
+    resetGraphFilter: () => {
+      dispatch(resetGraphFilter());
+    },
+    setGraphFilter: (filter) => {
+      dispatch(setGraphFilter(filter));
     },
     closeModal: () => {
       dispatch(closeDialog());
@@ -53,8 +67,7 @@ function mapStateToProps(state, ownProps) {
     prometheusQueryEnabled: state.graph.prometheusQueryEnabled,
     customer: state.customer,
     visibleModal: state.modal.visibleModal,
-    enableNodeComparisonModal: test.enableNodeComparisonModal || released.enableNodeComparisonModal,
-    isTopKMetricsEnabled: ownProps.isTopKMetricsEnabled
+    enableNodeComparisonModal: test.enableNodeComparisonModal || released.enableNodeComparisonModal
   };
 }
 

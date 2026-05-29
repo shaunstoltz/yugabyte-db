@@ -4,9 +4,12 @@ headerTitle: INSERT
 linkTitle: INSERT
 description: Use the INSERT statement to add a row to a specified table.
 menu:
-  stable:
+  stable_api:
     parent: api-cassandra
     weight: 1300
+aliases:
+  - /stable/api/cassandra/dml_insert
+  - /stable/api/ycql/dml_insert
 type: docs
 ---
 
@@ -50,7 +53,7 @@ Where
 
 - `table_name` and `column` are identifiers (`table_name` may be qualified with a keyspace name).
 - `value` can be any expression although Apache Cassandra requires that `value`s must be literals.
-- Restrictions for `if_expression` and `ttl_expression` are covered in the Semantics section below.
+- Restrictions for `if_expression` and `ttl_expression` are covered in the Semantics section.
 - See [Expressions](..#expressions) for more information on syntax rules.
 
 ## Semantics
@@ -65,6 +68,7 @@ Where
   them. Using a mix of statements where some have `USING TIMESTAMP` and others do not will lead to
   very confusing results.
 - Inserting rows with TTL is not supported on tables with [transactions enabled](./../ddl_create_table#table-properties-1).
+- `INSERT` is always done at `QUORUM` consistency level irrespective of setting.
 
 ### `VALUES` clause
 
@@ -154,7 +158,7 @@ ycqlsh:example> SELECT * FROM employees;
 
 ### Insert a row with expiration time using the `USING TTL` clause
 
-You can do this as shown below.
+You can do this as follows:
 
 ```sql
 ycqlsh:example> INSERT INTO employees(department_id, employee_id, name) VALUES (2, 2, 'Jack') USING TTL 10;

@@ -11,11 +11,11 @@ main {
       font-size: inherit !important;
       line-height: 110%;
       max-width: 100%;
-      background: #f2f6ff;
-      border: 1px solid #cbdbff;
+      background: #f7fafc!important;
+      border: 1px solid #d7dee4;
       border-radius: 4px;
       color: $yb-font-gray;
-      padding: 0 3px;
+      padding: 3px 6px;
     }
 
     p > a {
@@ -37,7 +37,7 @@ main {
     p > strong > code,
     p > a > code,
     p > code {
-      font-size: 12px !important;
+      font-size: 13px !important;
       line-height: 16px;
     }
 
@@ -65,6 +65,15 @@ main {
     > pre,
     .highlight {
       margin: 20px 0;
+      position: relative;
+      display: flex;
+      flex-direction: column;
+      min-width: 0;
+      word-wrap: break-word;
+      background-color: #fff;
+      background-clip: border-box;
+      border: 1px solid rgba(0, 0, 0, .125);
+      border-radius: .25rem;
     }
 
     li > p + pre,
@@ -90,6 +99,7 @@ main {
       background: transparent !important;
       padding: 0 !important;
       margin: 0;
+      border: 0;
       position: relative !important;
       overflow-y: auto;
       overflow-x: visible;
@@ -97,7 +107,7 @@ main {
       font-size: 13px;
       margin-top: 20px;
       margin-bottom: 20px;
-      max-width:calc(100% - 5px);
+      max-width: calc(100% - 5px);
 
       > code {
         font-size: 100%;
@@ -116,12 +126,12 @@ main {
         word-break: keep-all;
         overflow: auto;
         scrollbar-width: thin;
-        
-        &:only-child{
+
+        &:nth-child(2):last-child {
           padding: 11px 15px;
         }
 
-        &:not(:only-child) {
+        &:not(:last-child) {
           > span > span {
             padding-right: 40px;
           }
@@ -140,7 +150,6 @@ main {
 
       .highlight {
         margin-bottom: 20px !important;
-
         > pre {
           margin-top: 1rem;
           margin-bottom: 1rem;
@@ -199,7 +208,7 @@ main {
           position: absolute;
           top: 0;
           left: 0;
-          font: 15px/1 "Font awesome 6 free";
+          font: 15px/1 $td-font-awesome-font-name;
           font-weight: 700;
           content: "\f00c";
           color: #48ab52 !important;
@@ -216,7 +225,7 @@ main {
         }
       }
     }
-    
+
     table {
       pre {
         > code {
@@ -225,18 +234,29 @@ main {
       }
     }
 
+    div.custom-yb-table {
+      table {
+        pre > code {
+          > span {
+            white-space: pre;
+          }
+        }
+      }
+    }
+
+    div.highlight pre.can-be-copied[data-code="2"] {
+      margin-bottom: -13px;
+    }
+
     pre.can-be-copied {
       width: calc(100% + 20px);
       padding-right: 20px !important;
+      border: 0;
       max-width: none;
       min-height: 85px;
 
       &[data-code="1"] {
         margin-bottom: -35px;
-      }
-
-      &[data-code="2"] {
-        margin-bottom: -13px;
       }
 
       &::after {
@@ -252,6 +272,10 @@ main {
         border-radius: 5px;
       }
 
+      .click-to-copy {
+        display: none;
+      }
+
       button.copy {
         right: 27px;
 
@@ -259,6 +283,41 @@ main {
           color: transparent;
           background-color: transparent;
           transform: none;
+        }
+      }
+    }
+
+    .badcode {
+      > pre {
+        button.copy.unclicked:not(:hover) {
+          filter: contrast(100);
+        }
+
+        > code {
+          background: #efb2b2 !important;
+          border-color: #f00 !important;
+        }
+
+        &::after {
+          background: #efb2b2;
+        }
+      }
+    }
+  }
+}
+
+body.is-safari {
+  main {
+    .td-content {
+      pre {
+        button.copy {
+          z-index: 2;
+        }
+      }
+
+      pre.can-be-copied {
+        &::after {
+          z-index: 1;
         }
       }
     }

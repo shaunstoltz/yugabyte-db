@@ -1,4 +1,4 @@
-// Copyright (c) YugaByte, Inc.
+// Copyright (c) YugabyteDB, Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License"); you may not use this file except
 // in compliance with the License.  You may obtain a copy of the License at
@@ -13,7 +13,7 @@
 
 #include "yb/master/system_tablet.h"
 
-#include "yb/common/common.pb.h"
+#include "yb/common/common.messages.h"
 #include "yb/common/schema.h"
 #include "yb/common/transaction.h"
 
@@ -29,17 +29,24 @@ SystemTablet::SystemTablet(const Schema& schema, std::unique_ptr<YQLVirtualTable
                            const TabletId& tablet_id)
     : log_prefix_(Format("T $0: ", tablet_id)), // Don't have UUID here to log in T XX P YY format.
       doc_read_context_(std::make_shared<docdb::DocReadContext>(
-          log_prefix_, schema, kSysCatalogSchemaVersion)),
+          log_prefix_, TableType::YQL_TABLE_TYPE,
+          docdb::Index::kFalse, std::make_shared<dockv::SchemaPackingRegistry>(log_prefix_),
+          schema, kSysCatalogSchemaVersion)),
       yql_virtual_table_(std::move(yql_virtual_table)),
       tablet_id_(tablet_id) {
 }
 
-docdb::DocReadContextPtr SystemTablet::GetDocReadContext(const std::string& table_id) const {
+Result<docdb::DocReadContextPtr> SystemTablet::GetDocReadContext(
+    const std::string& table_id) const {
   // table_id is ignored. It should match the system table's id.
+  return GetDocReadContext();
+}
+
+docdb::DocReadContextPtr SystemTablet::GetDocReadContext() const {
   return doc_read_context_;
 }
 
-const docdb::YQLStorageIf& SystemTablet::QLStorage() const {
+const YQLVirtualTable& SystemTablet::YQLTable() const {
   return *yql_virtual_table_;
 }
 
@@ -57,20 +64,22 @@ Result<HybridTime> SystemTablet::DoGetSafeTime(
   return HybridTime::kMax;
 }
 
-Status SystemTablet::HandleQLReadRequest(CoarseTimePoint deadline,
-                                         const ReadHybridTime& read_time,
-                                         const QLReadRequestPB& ql_read_request,
-                                         const TransactionMetadataPB& transaction_metadata,
+Status SystemTablet::HandleQLReadRequest(const docdb::ReadOperationData& read_operation_data,
+                                         const QLReadRequestMsg& ql_read_request,
+                                         const TransactionMetadataMsg& transaction_metadata,
                                          tablet::QLReadRequestResult* result,
                                          WriteBuffer* rows_data) {
   DCHECK(!transaction_metadata.has_transaction_id());
-  return tablet::AbstractTablet::HandleQLReadRequest(
-      deadline, read_time, ql_read_request, TransactionOperationContext(), result, rows_data);
+  // Passing empty ScopedRWOperation because we don't have underlying RocksDB here.
+  auto pending_op = ScopedRWOperation();
+  return AbstractTablet::HandleQLReadRequest(
+      read_operation_data, ql_read_request, TransactionOperationContext(), YQLTable(), pending_op,
+      result, rows_data);
 }
 
-Status SystemTablet::CreatePagingStateForRead(const QLReadRequestPB& ql_read_request,
+Status SystemTablet::CreatePagingStateForRead(const QLReadRequestMsg& ql_read_request,
                                               const size_t row_count,
-                                              QLResponsePB* response) const {
+                                              QLResponseMsg* response) const {
   // We don't support pagination for system tablets. Although we need to return an OK() status
   // here since we don't want to raise this as an error to the client, but just want to avoid
   // populating any paging state here for the client.

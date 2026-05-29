@@ -3,40 +3,61 @@ title: Benchmark YSQL performance using sysbench
 headerTitle: sysbench
 linkTitle: sysbench
 description: Benchmark YSQL performance using sysbench.
-headcontent: Benchmark YSQL performance using sysbench.
+headcontent: Benchmark YSQL performance using sysbench
 menu:
   stable:
     identifier: sysbench-ysql
     parent: benchmark
     weight: 5
+aliases:
+  - /benchmark/sysbench/
 type: docs
 ---
-<ul class="nav nav-tabs-alt nav-tabs-yb">
 
+sysbench is a popular tool for benchmarking databases like PostgreSQL and MySQL, as well as system capabilities like CPU, memory, and I/O. The [YugabyteDB version of sysbench](https://github.com/yugabyte/sysbench) is forked from the [official version](https://github.com/akopytov/sysbench) with a few modifications to better reflect YugabyteDB's distributed nature.
+
+## Running the benchmark
+
+### Prerequisites
+
+To ensure the recommended hardware requirements are met and the database is correctly configured before benchmarking, review the [deployment checklist](../../deploy/checklist/).
+
+Make sure you have the [YSQL shell](../../api/ysqlsh/) `ysqlsh` exported to the `PATH` variable.
+
+```sh
+$ export PATH=$PATH:/path/to/ysqlsh
+```
+
+### Install sysbench
+
+Install sysbench on a machine which satisfies the Prerequisites using one of the following options:
+
+<ul class="nav nav-tabs nav-tabs-yb">
+    <li>
+    <a href="#github" class="nav-link active" id="github-tab" data-bs-toggle="tab" role="tab" aria-controls="github" aria-selected="true">
+      <i class="fab fa-github" aria-hidden="true"></i>
+      Source
+    </a>
+  </li>
+  <li>
+    <a href="#rhel" class="nav-link" id="rhel-tab" data-bs-toggle="tab" role="tab" aria-controls="rhel" aria-selected="true">
+      <i class="fa-brands fa-redhat" aria-hidden="true"></i>
+      RHEL
+    </a>
+  </li>
   <li >
-    <a href="{{< relref "./sysbench-ysql.md" >}}" class="nav-link active">
-      <i class="icon-postgres" aria-hidden="true"></i>
-      YSQL
+    <a href="#macos" class="nav-link" id="macos-tab" data-bs-toggle="tab" role="tab" aria-controls="macos" aria-selected="true">
+      <i class="fa-brands fa-apple" aria-hidden="true"></i>
+      macOS
     </a>
   </li>
 
 </ul>
 
-## Overview
+<div class="tab-content">
+  <div id="github" class="tab-pane fade show active" role="tabpanel" aria-labelledby="github-tab">
 
-sysbench is a popular tool for benchmarking databases like Postgres and MySQL, as well as system capabilities like CPU, memory and I/O. Follow the steps below to run Sysbench against YugabyteDB.
-
-The [YugabyteDB version of sysbench](https://github.com/yugabyte/sysbench) is forked from the [official](https://github.com/akopytov/sysbench) version with a few modifications to better reflect YugabyteDB's distributed nature.
-
-{{< note title="Note" >}}
-To ensure the recommended hardware requirements are met and the database is correctly configured before benchmarking, review the [deployment checklist](../../deploy/checklist/)
-{{< /note >}}
-
-## Running the benchmark
-
-### 1. Prerequisites
-
-Install sysbench using the following steps.
+Install sysbench using the following steps:
 
 ```sh
 $ cd $HOME
@@ -45,99 +66,164 @@ $ cd sysbench
 $ ./autogen.sh && ./configure --with-pgsql && make -j && sudo make install
 ```
 
+  </div>
+
+  <div id="rhel" class="tab-pane fade" role="tabpanel" aria-labelledby="rhel-tab">
+
 {{< note title="Note" >}}
-The above steps will install the sysbench utility in '/usr/local/bin'
+
+RHEL package is only for EL8
+
 {{< /note >}}
 
-Make sure you have the YSQL shell `ysqlsh` exported to the `PATH` variable. You can download [`ysqlsh`](https://download.yugabyte.com/) if you do not have it.
-
 ```sh
-$ export PATH=$PATH:/path/to/ysqlsh
+wget https://github.com/yugabyte/sysbench/releases/download/1.0.0-yb/sysbench-1.0.0-1.el8.x86_64.rpm
+
+sudo yum install -y sysbench-1.0.0-1.el8.x86_64.rpm
 ```
 
-### 2. Start YugabyteDB
+  </div>
+  <div id="macos" class="tab-pane fade" role="tabpanel" aria-labelledby="macos-tab">
 
-Start your YugabyteDB cluster by following the steps [here](../../deploy/manual-deployment/).
+{{< note title="Note" >}}
+
+The MacOS package is only for Apple Silicon.
+
+{{< /note >}}
+
+```sh
+brew install postgresql@14 wget
+
+wget https://github.com/yugabyte/sysbench/releases/download/1.0.0-yb/Sysbench.pkg
+
+sudo  installer -pkg Sysbench.pkg -target /
+```
+
+  </div>
+
+</div>
+
+This installs the sysbench utility in `/usr/local/bin`.
+
+### Start YugabyteDB
+
+Start your YugabyteDB cluster by following the steps in [Manual deployment](../../deploy/manual-deployment/).
 
 {{< tip title="Tip" >}}
 You will need the IP addresses of the nodes in the cluster for the next step.
 {{< /tip>}}
 
-### 3. Run the benchmark
+### Run individual workloads
 
-There is a handy shell script `run_sysbench.sh` that loads the data and runs the various workloads.
+You can choose to run the following workloads individually:
 
-```sh
-./run_sysbench.sh --ip <ip>
-```
-
-This script runs all the 8 workloads using 64 threads with the number of tables as 10 and the table size as 100k. If you want to run the benchmark with a different count of tables and tablesize:
-
-```sh
-./run_sysbench.sh --ip <ip> --numtables <number of tables> --tablesize <number of rows in each table>
-```
-
-### 4. Run individual workloads (optional)
-
-This section outlines instructions in case you need to run workloads individually. Before starting the workload you need to load the data first.
-
-```sh
-$ sysbench oltp_point_select        \
-      --tables=10                   \
-      --table-size=100000           \
-      --range_key_partitioning=true \
-      --db-driver=pgsql             \
-      --pgsql-host=127.0.0.1        \
-      --pgsql-port=5433             \
-      --pgsql-user=yugabyte         \
-      --pgsql-db=yugabyte           \
-      prepare
-```
-
-Then you can run the workload as follows
-
-```sh
-$ sysbench oltp_point_select        \
-      --tables=10                   \
-      --table-size=100000           \
-      --range_key_partitioning=true \
-      --db-driver=pgsql             \
-      --pgsql-host=127.0.0.1        \
-      --pgsql-port=5433             \
-      --pgsql-user=yugabyte         \
-      --pgsql-db=yugabyte           \
-      --threads=64                  \
-      --time=120                    \
-      --warmup-time=120             \
-      run
-```
-
-The choice of different workloads are:
-
-* oltp_insert
-* oltp_point_select
-* oltp_write_only
 * oltp_read_only
 * oltp_read_write
+* oltp_multi_insert
 * oltp_update_index
 * oltp_update_non_index
 * oltp_delete
 
+Before starting the workload, load the data as follows:
+
+```sh
+sysbench <workload> \
+  --pgsql-host=<comma-separated-ips> \
+  --tables=20 \
+  --table_size=5000000 \
+  --range_key_partitioning=false \
+  --serial_cache_size=1000 \
+  --create_secondary=true \
+  --pgsql-db=yugabyte \
+  --pgsql-user=yugabyte \
+  --db-driver=pgsql \
+  --pgsql-port=5433 \
+  prepare
+
+```
+
+Run a workload as follows:
+
+```sh
+sysbench <workload> \
+  --pgsql-host=<comma-separated-ips> \
+  --tables=20 \
+  --table_size=5000000  \
+  --range_key_partitioning=false \
+  --serial_cache_size=1000 \
+  --create_secondary=true \
+  --pgsql-db=yugabyte \
+  --pgsql-user=yugabyte \
+  --db-driver=pgsql \
+  --pgsql-port=5433 \
+  --time=1800 \
+  --warmup-time=300 \
+  --num_rows_in_insert=10 \
+  --point_selects=10 \
+  --index_updates=10 \
+  --non_index_updates=10 \
+  --range_selects=false \
+  --thread-init-timeout=90 \
+  --threads=60 \
+  run
+
+```
+
 ## Expected results
 
-### Setup
+The following results are for a 3-node cluster running YBDB version {{< yb-version version="stable" format="short">}}, with each node running on a c5.2xlarge AWS instance (8 cores, 16 GiB of RAM), all in the same AZ, with a replication factor of 3 and TLS enabled.
 
-When run on a 3-node cluster with each node on a c5.4xlarge AWS instance (16 cores, 32 GB of RAM, and 2 EBS volumes), all belonging to the same AZ with the client VM running in the same AZ, you get the following results:
+### 10 tables each with 100k rows
 
-### 10 Tables Each with 100k Rows
+<table>
+  <thead>
+    <tr>
+      <th rowspan="2">Workload</th>
+      <th colspan="2">Benchmark Statistics</th>
+      <th colspan="2">Per Query Statistics</th>
+      <th rowspan="2">Queries executed in each transaction</th>
+    </tr>
+    <tr>
+      <th>Throughput (txns/sec)</th>
+      <th>Latency (ms) - avg</th>
+      <th>Throughput (queries/sec)</th>
+      <th>Latency (ms) - avg</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td>oltp_read_only</td>
+      <td>4616.32</td>
+      <td>13</td>
+      <td>46163.2</td>
+      <td>1.3</td>
+      <td>10 point selects</td>
+    </tr>
+    <tr>
+      <td>oltp_read_write</td>
+      <td>245.49</td>
+      <td>97.76</td>
+      <td>7855.68</td>
+      <td>3.05</td>
+      <td>10 point selects <br> 10 index updates <br> 10 non-index update <br> 1 Insert <br> 1 Delete</td>
+    </tr>
+    <tr>
+      <td>oltp_multi_insert</td>
+      <td>585.66</td>
+      <td>40.98</td>
+      <td>5856.6</td>
+      <td>4.09</td>
+      <td>10 Insert</td>
+    </tr>
+    <tr>
+      <td>oltp_update_index</td>
+      <td>259.64</td>
+      <td>92.43</td>
+      <td>2596.4</td>
+      <td>9.43</td>
+      <td>10 index updates</td>
+    </tr>
+  </tbody>
+</table>
 
-| Workload | Throughput (txns/sec) | Latency (ms) |
-| :------- | :-------------------- | :----------- |
-| OLTP_READ_ONLY | 3276 | 39 |
-| OLTP_READ_WRITE | 487 | 265 |
-| OLTP_WRITE_ONLY | 1818 | 70 |
-| OLTP_POINT_SELECT| 95695 | 1.3 |
-| OLTP_INSERT | 6348 | 20.1 |
-| OLTP_UPDATE_INDEX | 4052 | 31 |
-| OLTP_UPDATE_NON_INDEX | 11496 | 11 |
-| OLTP_DELETE | 67499 | 1.9 |
+The _Queries executed in each transaction_ column shows the individual queries that are executed as part of each sysbench transaction, for each workload. These queries impact the overall transaction performance and are key to understanding the workload distribution for different sysbench benchmarks.

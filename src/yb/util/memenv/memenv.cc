@@ -2,9 +2,9 @@
 // Use of this source code is governed by a BSD-style license that can be
 // found in the LICENSE file. See the AUTHORS file for names of contributors.
 //
-// The following only applies to changes made to this file as part of YugaByte development.
+// The following only applies to changes made to this file as part of YugabyteDB development.
 //
-// Portions Copyright (c) YugaByte, Inc.
+// Portions Copyright (c) YugabyteDB, Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License"); you may not use this file except
 // in compliance with the License.  You may obtain a copy of the License at
@@ -27,7 +27,7 @@
 #include <string>
 #include <vector>
 
-#include <glog/logging.h>
+#include "yb/util/logging.h"
 
 #include "yb/gutil/map-util.h"
 #include "yb/gutil/stringprintf.h"
@@ -70,7 +70,7 @@ class RandomAccessFileImpl : public RandomAccessFile {
     return 0;
   }
 
-  const string& filename() const override {
+  const std::string& filename() const override {
     return file_->filename();
   }
 
@@ -78,48 +78,6 @@ class RandomAccessFileImpl : public RandomAccessFile {
     // The InMemoryFileState is actually shared between multiple files, but the double
     // counting doesn't matter much since MemEnv is only used in tests.
     return malloc_usable_size(this) + file_->memory_footprint();
-  }
-
- private:
-  const std::shared_ptr<InMemoryFileState> file_;
-};
-
-class WritableFileImpl : public WritableFile {
- public:
-  explicit WritableFileImpl(const std::shared_ptr<InMemoryFileState>& file)
-    : file_(file) {
-  }
-
-  ~WritableFileImpl() {
-  }
-
-  Status PreAllocate(uint64_t size) override {
-    return file_->PreAllocate(size);
-  }
-
-  Status Append(const Slice& data) override {
-    return file_->Append(data);
-  }
-
-  // This is a dummy implementation that simply serially appends all
-  // slices using regular I/O.
-  Status AppendSlices(const Slice* slices, size_t num) override {
-    for (const auto* end = slices + num; slices != end; ++slices) {
-      RETURN_NOT_OK(file_->Append(*slices));
-    }
-    return Status::OK();
-  }
-
-  Status Close() override { return Status::OK(); }
-
-  Status Flush(FlushMode mode) override { return Status::OK(); }
-
-  Status Sync() override { return Status::OK(); }
-
-  uint64_t Size() const override { return file_->Size(); }
-
-  const string& filename() const override {
-    return file_->filename();
   }
 
  private:
@@ -173,9 +131,8 @@ class RWFileImpl : public RWFile {
     return Status::OK();
   }
 
-  Status Size(uint64_t* size) const override {
-    *size = file_->Size();
-    return Status::OK();
+  Result<uint64_t> Size() const override {
+    return file_->Size();
   }
 
   const string& filename() const override {
@@ -219,7 +176,7 @@ class InMemoryEnv : public EnvWrapper {
   virtual Status NewWritableFile(const WritableFileOptions& opts,
                                  const std::string& fname,
                                  std::unique_ptr<WritableFile>* result) override {
-    std::unique_ptr<WritableFileImpl> wf;
+    std::unique_ptr<InMemoryWritableFile> wf;
     RETURN_NOT_OK(CreateAndRegisterNewFile(fname, opts.mode, &wf));
     result->reset(wf.release());
     return Status::OK();
@@ -261,7 +218,7 @@ class InMemoryEnv : public EnvWrapper {
 
       MutexLock lock(mutex_);
       if (!ContainsKey(file_map_, path)) {
-        CreateAndRegisterNewWritableFileUnlocked<WritableFile, WritableFileImpl>(path, result);
+        CreateAndRegisterNewWritableFileUnlocked<WritableFile, InMemoryWritableFile>(path, result);
         *created_filename = path;
         return Status::OK();
       }

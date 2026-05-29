@@ -1,4 +1,4 @@
-import React, { FC, ReactNode } from 'react';
+import { FC, ReactNode } from 'react';
 import clsx from 'clsx';
 import {
   makeStyles,
@@ -87,22 +87,24 @@ export interface OptionProps {
   'data-testid'?: string;
 }
 
-export enum RadioOrientation {
-  Vertical = 'vertical',
-  Horizontal = 'horizontal'
-}
+export const RadioGroupOrientation = {
+  VERTICAL: 'vertical',
+  HORIZONTAL: 'horizontal'
+} as const;
+export type RadioGroupOrientation = typeof RadioGroupOrientation[keyof typeof RadioGroupOrientation];
 
 export interface YBRadioGroupProps extends RadioGroupProps {
   label?: ReactNode;
   options: OptionProps[];
-  orientation?: RadioOrientation;
+  orientation?: RadioGroupOrientation;
 }
 
 export const YBRadioGroup: FC<YBRadioGroupProps> = ({
   label,
   options = [],
-  orientation = RadioOrientation.Vertical,
+  orientation = RadioGroupOrientation.VERTICAL,
   className,
+  value,
   ...muiRadioGroupProps
 }) => {
   const classes = useStyles();
@@ -111,7 +113,10 @@ export const YBRadioGroup: FC<YBRadioGroupProps> = ({
     <>
       {label && <FormLabel className={classes.mainLabel}>{label}</FormLabel>}
       <RadioGroup
-        className={clsx(orientation === 'horizontal' && classes.formGroupRow, className)}
+        className={clsx(
+          orientation === RadioGroupOrientation.HORIZONTAL && classes.formGroupRow,
+          className
+        )}
         aria-label="radio-group"
         {...muiRadioGroupProps}
       >
@@ -119,7 +124,12 @@ export const YBRadioGroup: FC<YBRadioGroupProps> = ({
           <FormControlLabel
             key={`form-radio-option-${option.value}`}
             value={option.value}
-            control={<YBRadio inputProps={{ 'data-testid': option['data-testid'] }} />}
+            control={
+              <YBRadio
+                inputProps={{ 'data-testid': option['data-testid'] ?? `YBRadio-${option.value}` }}
+                checked={option.value === value}
+              />
+            }
             label={option.label}
             disabled={option.disabled}
             classes={{ label: classes.label }}

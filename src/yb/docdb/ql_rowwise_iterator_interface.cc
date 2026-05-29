@@ -1,4 +1,4 @@
-// Copyright (c) YugaByte, Inc.
+// Copyright (c) YugabyteDB, Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License"); you may not use this file except
 // in compliance with the License.  You may obtain a copy of the License at
@@ -13,34 +13,41 @@
 
 #include "yb/docdb/ql_rowwise_iterator_interface.h"
 
+#include "yb/common/hybrid_time.h"
+#include "yb/dockv/doc_key.h"
 #include "yb/util/result.h"
 
-namespace yb {
-namespace docdb {
+namespace yb::docdb {
 
-Status YQLRowwiseIteratorIf::GetNextReadSubDocKey(SubDocKey* sub_doc_key) {
-  return Status::OK();
+Result<dockv::SubDocKey> YQLRowwiseIteratorIf::GetSubDocKey(ReadKey read_key) {
+  return dockv::SubDocKey();
 }
 
-Result<Slice> YQLRowwiseIteratorIf::GetTupleId() const {
-  return STATUS(NotSupported, "This iterator does not provide tuple id");
+Slice YQLRowwiseIteratorIf::GetTupleId() const {
+  LOG(DFATAL) << "This iterator does not provide tuple id";
+  return Slice();
 }
 
-Result<bool> YQLRowwiseIteratorIf::SeekTuple(const Slice& tuple_id) {
-  return STATUS(NotSupported, "This iterator cannot seek by tuple id");
+Slice YQLRowwiseIteratorIf::GetRowKey() const {
+  LOG(DFATAL) << "This iterator cannot return row key";
+  return Slice();
 }
 
-Status YQLRowwiseIteratorIf::NextRow(const Schema& projection, QLTableRow* table_row) {
-  return DoNextRow(projection, table_row);
+void YQLRowwiseIteratorIf::SeekTuple(Slice tuple_id, UpdateFilterKey update_filter_key) {
+  LOG(DFATAL) << "This iterator cannot seek by tuple id";
 }
 
-Status YQLRowwiseIteratorIf::NextRow(QLTableRow* table_row) {
-  return DoNextRow(boost::none, table_row);
+void YQLRowwiseIteratorIf::SeekToDocKeyPrefix(Slice doc_key_prefix) {
+  LOG(DFATAL) << "This iterator cannot seek to doc key prefix";
 }
 
-Status YQLRowwiseIteratorIf::Iterate(const YQLScanCallback& callback) {
-  return STATUS(NotSupported, "This iterator does not support iterate with callback.");
+
+HybridTime YQLRowwiseIteratorIf::TEST_MaxSeenHt() {
+  return HybridTime::kInvalid;
 }
 
-}  // namespace docdb
-}  // namespace yb
+Result<bool> YQLRowwiseIteratorIf::FetchTuple(Slice tuple_id, qlexpr::QLTableRow* row) {
+  return STATUS(NotSupported, "This iterator cannot fetch tuple id");
+}
+
+}  // namespace yb::docdb

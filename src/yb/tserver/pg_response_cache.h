@@ -1,4 +1,4 @@
-// Copyright (c) YugaByte, Inc.
+// Copyright (c) YugabyteDB, Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License"); you may not use this file except
 // in compliance with the License.  You may obtain a copy of the License at
@@ -13,8 +13,10 @@
 
 #pragma once
 
+#include <functional>
 #include <memory>
 #include <vector>
+#include <utility>
 
 #include "yb/client/client_fwd.h"
 
@@ -22,47 +24,64 @@
 
 #include "yb/rpc/rpc_fwd.h"
 
-#include "yb/tserver/pg_client.fwd.h"
+#include "yb/tserver/pg_client.pb.h"
 #include "yb/tserver/pg_client_session.h"
 #include "yb/tserver/tserver_fwd.h"
 
 #include "yb/util/ref_cnt_buffer.h"
+#include "yb/util/result.h"
 
 #include "yb/util/monotime.h"
 
 namespace yb {
 
+class MemTracker;
 class MetricEntity;
 
 namespace tserver {
 
-YB_STRONGLY_TYPED_BOOL(IsFailure);
+class PgResponseCacheWaiter;
+using PgResponseCacheWaiterPtr = std::shared_ptr<PgResponseCacheWaiter>;
 
 class PgResponseCache {
  public:
-  explicit PgResponseCache(MetricEntity* metric_entity);
+  using KeyGroup = decltype(std::declval<PgPerformOptionsPB::CachingInfoPB>().key_group());
+
+  PgResponseCache(
+      const std::shared_ptr<MemTracker>& parent_mem_tracker, MetricEntity* metric_entity);
   ~PgResponseCache();
 
   struct Response {
-    Response(PgPerformResponsePB&& response_, std::vector<RefCntSlice>&& rows_data_)
-        : response(std::move(response_)), rows_data(std::move(rows_data_)) {
-      DCHECK_EQ(response.responses_size(), rows_data.size());
-    }
+    Response(const PgPerformResponseMsg& response_, std::vector<RefCntSlice> rows_data_);
 
-    PgPerformResponsePB response;
+    std::shared_ptr<LWPgPerformResponsePB> response;
     std::vector<RefCntSlice> rows_data;
   };
 
-  using Setter = std::function<void(Response&&, IsFailure)>;
+  using Setter = std::function<void(Response&&)>;
 
-  Setter Get(std::string&& cache_key, PgPerformResponsePB* response, rpc::RpcContext* context);
+  Result<Setter> Get(
+      LWPgPerformOptionsPB_LWCachingInfoPB* cache_info, CoarseTimePoint deadline,
+      const PgResponseCacheWaiterPtr& waiter);
+
+  struct DisablerType;
+  using Disabler = std::shared_ptr<DisablerType>;
+
+  [[nodiscard]] Disabler Disable(KeyGroup key_group);
 
  private:
   class Impl;
 
-  std::unique_ptr<Impl> impl_;
+  std::shared_ptr<Impl> impl_;
 
   DISALLOW_COPY_AND_ASSIGN(PgResponseCache);
+};
+
+class PgResponseCacheWaiter {
+ public:
+  virtual ~PgResponseCacheWaiter() = default;
+
+  virtual void Apply(const PgResponseCache::Response& response) = 0;
 };
 
 }  // namespace tserver

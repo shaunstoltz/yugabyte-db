@@ -1,4 +1,4 @@
-// Copyright (c) YugaByte, Inc.
+// Copyright (c) YugabyteDB, Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License"); you may not use this file except
 // in compliance with the License.  You may obtain a copy of the License at
@@ -14,6 +14,7 @@
 #pragma once
 
 #include <future>
+#include <string>
 
 // This include is needed because we use std::shared_future<Result<IpAddress>>, and IpAddress
 // is an alias for boost::asio::ip::address. If we just include net_fwd.h, we get this compilation
@@ -21,7 +22,8 @@
 // https://gist.githubusercontent.com/mbautin/ed9e5d17f39fc0066eba77ce15cbbef9/raw
 #include <boost/asio/ip/address.hpp>
 
-#include "yb/common/value.pb.h"
+#include "yb/common/common_fwd.h"
+#include "yb/common/value.messages.h"
 
 #include "yb/master/master_heartbeat.fwd.h"
 #include "yb/master/master_fwd.h"

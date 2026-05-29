@@ -3,7 +3,7 @@
  * tsquery_rewrite.c
  *	  Utilities for reconstructing tsquery
  *
- * Portions Copyright (c) 1996-2018, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2022, PostgreSQL Global Development Group
  *
  *
  * IDENTIFICATION
@@ -282,7 +282,7 @@ tsquery_rewrite_query(PG_FUNCTION_ARGS)
 	TSQuery		query = PG_GETARG_TSQUERY_COPY(0);
 	text	   *in = PG_GETARG_TEXT_PP(1);
 	TSQuery		rewrited = query;
-	MemoryContext outercontext = GetCurrentMemoryContext();
+	MemoryContext outercontext = CurrentMemoryContext;
 	MemoryContext oldcontext;
 	QTNode	   *tree;
 	char	   *buf;

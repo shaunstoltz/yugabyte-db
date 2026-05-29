@@ -1,4 +1,4 @@
-// Copyright (c) YugaByte, Inc.
+// Copyright (c) YugabyteDB, Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License"); you may not use this file except
 // in compliance with the License.  You may obtain a copy of the License at
@@ -39,6 +39,10 @@ PgObjectId::PgObjectId(const Slice& table_id)
 
 std::string PgObjectId::ToString() const {
   return YB_STRUCT_TO_STRING(database_oid, object_oid);
+}
+
+std::string YsqlFullTableName::ToString() const {
+  return YB_STRUCT_TO_STRING(namespace_name, schema_name, table_name);
 }
 
 }  // namespace yb

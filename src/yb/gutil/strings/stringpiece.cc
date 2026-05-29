@@ -1,8 +1,8 @@
 // Copyright 2004 and onwards Google Inc.
 //
-// The following only applies to changes made to this file as part of YugaByte development.
+// The following only applies to changes made to this file as part of YugabyteDB development.
 //
-// Portions Copyright (c) YugaByte, Inc.
+// Portions Copyright (c) YugabyteDB, Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License"); you may not use this file except
 // in compliance with the License.  You may obtain a copy of the License at
@@ -22,18 +22,13 @@
 #include <algorithm>
 #include <string>
 
-#include <glog/logging.h>
+#include "yb/util/logging.h"
 
 #include "yb/gutil/hash/hash.h"
 #include "yb/gutil/stl_util.h"
 #include "yb/gutil/strings/memutil.h"
 
-using std::copy;
-using std::max;
 using std::min;
-using std::reverse;
-using std::sort;
-using std::swap;
 using std::string;
 
 namespace std {

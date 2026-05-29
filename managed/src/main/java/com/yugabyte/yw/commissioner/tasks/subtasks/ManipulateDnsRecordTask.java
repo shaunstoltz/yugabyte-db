@@ -1,5 +1,5 @@
 /*
- * Copyright 2019 YugaByte, Inc. and Contributors
+ * Copyright 2019 YugabyteDB, Inc. and Contributors
  *
  * Licensed under the Polyform Free Trial License 1.0.0 (the "License"); you
  * may not use this file except in compliance with the License. You
@@ -14,11 +14,16 @@ import com.google.inject.Inject;
 import com.yugabyte.yw.commissioner.BaseTaskDependencies;
 import com.yugabyte.yw.commissioner.tasks.UniverseTaskBase;
 import com.yugabyte.yw.common.DnsManager;
+import com.yugabyte.yw.common.Util;
 import com.yugabyte.yw.forms.UniverseTaskParams;
+import com.yugabyte.yw.models.Provider;
 import com.yugabyte.yw.models.Universe;
 import com.yugabyte.yw.models.helpers.NodeDetails;
+import java.util.HashSet;
 import java.util.List;
+import java.util.Set;
 import java.util.UUID;
+import java.util.function.Function;
 import java.util.stream.Collectors;
 import lombok.extern.slf4j.Slf4j;
 
@@ -40,6 +45,7 @@ public class ManipulateDnsRecordTask extends UniverseTaskBase {
     public String hostedZoneId;
     public String domainNamePrefix;
     public Boolean isForceDelete;
+    public Set<String> serversToExclude;
   }
 
   @Override
@@ -50,10 +56,19 @@ public class ManipulateDnsRecordTask extends UniverseTaskBase {
   @Override
   public void run() {
     try {
-      List<NodeDetails> tserverNodes =
-          Universe.getOrBadRequest(taskParams().universeUUID).getTServers();
+      Set<String> toExclude = new HashSet<>();
+      if (taskParams().serversToExclude != null) {
+        toExclude.addAll(taskParams().serversToExclude);
+      }
+      Universe universe = Universe.getOrBadRequest(taskParams().getUniverseUUID());
+      Function<NodeDetails, Provider> providerGetter = Util.getProviderGetter(universe);
+      List<NodeDetails> tserverNodes = universe.getTServers();
       String nodeIpCsv =
-          tserverNodes.stream().map(nd -> nd.cloudInfo.private_ip).collect(Collectors.joining(","));
+          tserverNodes.stream()
+              .filter(nd -> providerGetter.apply(nd).getUuid().equals(taskParams().providerUUID))
+              .map(nd -> nd.cloudInfo.private_ip)
+              .filter(ip -> !toExclude.contains(ip))
+              .collect(Collectors.joining(","));
       // Create the process to fetch information about the node from the cloud provider.
       dnsManager
           .manipulateDnsRecord(
@@ -64,13 +79,21 @@ public class ManipulateDnsRecordTask extends UniverseTaskBase {
               nodeIpCsv)
           .processErrors();
     } catch (Exception e) {
-      if (taskParams().type != DnsManager.DnsCommandType.Delete || !taskParams().isForceDelete) {
+      if (taskParams().type != DnsManager.DnsCommandType.Delete) {
         throw e;
-      } else {
+      }
+      if (taskParams().isForceDelete) {
         log.info(
             "Ignoring error in dns record deletion for {} due to isForceDelete being set.",
             taskParams().domainNamePrefix,
             e);
+      } else if (e.getMessage().toLowerCase().contains("not found")) {
+        log.info(
+            "Ignoring error in dns record deletion for {} as it may have already been deleted.",
+            taskParams().domainNamePrefix,
+            e);
+      } else {
+        throw e;
       }
     }
   }

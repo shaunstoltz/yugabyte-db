@@ -3,9 +3,9 @@
 //  LICENSE file in the root directory of this source tree. An additional grant
 //  of patent rights can be found in the PATENTS file in the same directory.
 //
-// The following only applies to changes made to this file as part of YugaByte development.
+// The following only applies to changes made to this file as part of YugabyteDB development.
 //
-// Portions Copyright (c) YugaByte, Inc.
+// Portions Copyright (c) YugabyteDB, Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License"); you may not use this file except
 // in compliance with the License.  You may obtain a copy of the License at
@@ -32,6 +32,8 @@
 #include <algorithm>
 #include <vector>
 #include <chrono>
+
+#include "yb/ash/wait_state.h"
 
 #include "yb/rocksdb/db/builder.h"
 #include "yb/rocksdb/db/dbformat.h"
@@ -60,13 +62,13 @@
 #include "yb/rocksdb/util/mutexlock.h"
 #include "yb/rocksdb/util/statistics.h"
 #include "yb/rocksdb/util/stop_watch.h"
-#include "yb/rocksdb/util/sync_point.h"
 
 #include "yb/util/atomic.h"
 #include "yb/util/flags.h"
 #include "yb/util/logging.h"
 #include "yb/util/result.h"
 #include "yb/util/stats/iostats_context_imp.h"
+#include "yb/util/sync_point.h"
 
 DEFINE_UNKNOWN_int32(rocksdb_nothing_in_memtable_to_flush_sleep_ms, 10,
     "Used for a temporary workaround for http://bit.ly/ybissue437. How long to wait (ms) in case "
@@ -81,21 +83,15 @@ DEFINE_UNKNOWN_bool(rocksdb_release_mutex_during_wait_for_memtables_to_flush, tr
 
 namespace rocksdb {
 
-FlushJob::FlushJob(const std::string& dbname, ColumnFamilyData* cfd,
-                   const DBOptions& db_options,
-                   const MutableCFOptions& mutable_cf_options,
-                   const EnvOptions& env_options, VersionSet* versions,
-                   InstrumentedMutex* db_mutex,
-                   std::atomic<bool>* shutting_down,
-                   std::atomic<bool>* disable_flush_on_shutdown,
-                   std::vector<SequenceNumber> existing_snapshots,
-                   SequenceNumber earliest_write_conflict_snapshot,
-                   MemTableFilter mem_table_flush_filter,
-                   FileNumbersProvider* file_numbers_provider,
-                   JobContext* job_context, LogBuffer* log_buffer,
-                   Directory* db_directory, Directory* output_file_directory,
-                   CompressionType output_compression, Statistics* stats,
-                   EventLogger* event_logger)
+FlushJob::FlushJob(
+    const std::string& dbname, ColumnFamilyData* cfd, const DBOptions& db_options,
+    const MutableCFOptions& mutable_cf_options, const EnvOptions& env_options, VersionSet* versions,
+    InstrumentedMutex* db_mutex, std::atomic<bool>* shutting_down,
+    std::atomic<bool>* disable_flush_on_shutdown, std::vector<SequenceNumber> existing_snapshots,
+    SequenceNumber earliest_write_conflict_snapshot, MemTableFilter mem_table_flush_filter,
+    FileNumbersProvider* file_numbers_provider, JobContext* job_context, LogBuffer* log_buffer,
+    Directory* db_directory, Directory* output_file_directory, CompressionType output_compression,
+    Statistics* stats, FlushReason flush_reason, EventLogger* event_logger)
     : dbname_(dbname),
       cfd_(cfd),
       db_options_(db_options),
@@ -115,13 +111,27 @@ FlushJob::FlushJob(const std::string& dbname, ColumnFamilyData* cfd,
       output_file_directory_(output_file_directory),
       output_compression_(output_compression),
       stats_(stats),
-      event_logger_(event_logger) {
+      flush_reason_(flush_reason),
+      event_logger_(event_logger),
+      wait_state_(yb::ash::WaitStateInfo::CreateIfAshIsEnabled<yb::ash::WaitStateInfo>()) {
+  if (wait_state_) {
+    wait_state_->UpdateMetadata(
+        {.root_request_id = yb::Uuid::Generate(),
+         .query_id = std::to_underlying(yb::ash::FixedQueryId::kQueryIdForFlush),
+         .rpc_request_id = job_context_->job_id});
+    wait_state_->UpdateAuxInfo({.tablet_id = db_options_.tablet_id, .method = "Flush"});
+    SET_WAIT_STATUS_TO(wait_state_, OnCpu_Passive);
+    yb::ash::FlushAndCompactionWaitStatesTracker().Track(wait_state_);
+  }
   // Update the thread status to indicate flush.
   ReportStartedFlush();
-  TEST_SYNC_POINT("FlushJob::FlushJob()");
+  DEBUG_ONLY_TEST_SYNC_POINT("FlushJob::FlushJob()");
 }
 
 FlushJob::~FlushJob() {
+  if (wait_state_) {
+    yb::ash::FlushAndCompactionWaitStatesTracker().Untrack(wait_state_);
+  }
 }
 
 void FlushJob::ReportStartedFlush() {
@@ -134,14 +144,16 @@ void FlushJob::RecordFlushIOStats() {
 }
 
 Result<FileNumbersHolder> FlushJob::Run(FileMetaData* file_meta) {
-  if (PREDICT_FALSE(yb::GetAtomicFlag(&FLAGS_TEST_rocksdb_crash_on_flush))) {
+  ADOPT_WAIT_STATE(wait_state_);
+  SCOPED_WAIT_STATUS(RocksDB_Flush);
+  if (PREDICT_FALSE(FLAGS_TEST_rocksdb_crash_on_flush)) {
     CHECK(false) << "a flush should not have been scheduled.";
   }
 
   // Save the contents of the earliest memtable as a new Table
   FileMetaData meta;
   autovector<MemTable*> mems;
-  cfd_->imm()->PickMemtablesToFlush(&mems, mem_table_flush_filter_);
+  cfd_->imm()->PickMemtablesToFlush(&mems, mem_table_flush_filter_, &mutable_cf_options_);
   if (mems.empty()) {
     // A temporary workaround for repeated "Nothing in memtable to flush" messages in a
     // transactional workload due to the flush filter preventing us from flushing any memtables in
@@ -192,7 +204,7 @@ Result<FileNumbersHolder> FlushJob::Run(FileMetaData* file_meta) {
   if (!fnum.ok()) {
     cfd_->imm()->RollbackMemtableFlush(mems, meta.fd.GetNumber());
   } else {
-    TEST_SYNC_POINT("FlushJob::InstallResults");
+    DEBUG_ONLY_TEST_SYNC_POINT("FlushJob::InstallResults");
     // Replace immutable memtable with the generated Table
     Status s = cfd_->imm()->InstallMemtableFlushResults(
         cfd_, mutable_cf_options_, mems, versions_, db_mutex_,
@@ -210,9 +222,11 @@ Result<FileNumbersHolder> FlushJob::Run(FileMetaData* file_meta) {
   // This includes both SST and MANIFEST files IO.
   RecordFlushIOStats();
 
-  auto stream = event_logger_->LogToBuffer(log_buffer_);
+  // Same EVENT_LOG_v1 style as flush_started (INFO); includes flush_reason for observability.
+  auto stream = event_logger_->Log();
   stream << "job" << job_context_->job_id << "event"
-         << "flush_finished";
+         << "flush_finished"
+         << "flush_reason" << ToString(flush_reason_);
   stream << "lsm_state";
   stream.StartArray();
   auto vstorage = cfd_->current()->storage_info();
@@ -246,7 +260,7 @@ Result<FileNumbersHolder> FlushJob::WriteLevel0Table(
     uint64_t total_num_entries = 0, total_num_deletes = 0;
     size_t total_memory_usage = 0;
     for (MemTable* m : mems) {
-      RLOG(InfoLogLevel::INFO_LEVEL, db_options_.info_log,
+      RLOG(InfoLogLevel::DETAIL_LEVEL, db_options_.info_log,
           "[%s] [JOB %d] Flushing memtable with next log file: %" PRIu64 "\n",
           cfd_->GetName().c_str(), job_context_->job_id, m->GetNextLogNumber());
       memtables.push_back(m->NewIterator(ro, &arena));
@@ -255,15 +269,18 @@ Result<FileNumbersHolder> FlushJob::WriteLevel0Table(
       total_memory_usage += m->ApproximateMemoryUsage();
       const auto* range = m->Frontiers();
       if (range) {
-        UserFrontier::Update(
-            &range->Smallest(), UpdateUserValueType::kSmallest, &meta->smallest.user_frontier);
-        UserFrontier::Update(
-            &range->Largest(), UpdateUserValueType::kLargest, &meta->largest.user_frontier);
+        yb::storage::UserFrontier::Update(
+            &range->Smallest(), yb::storage::UpdateUserValueType::kSmallest,
+            &meta->smallest.user_frontier);
+        yb::storage::UserFrontier::Update(
+            &range->Largest(), yb::storage::UpdateUserValueType::kLargest,
+            &meta->largest.user_frontier);
       }
     }
 
     event_logger_->Log() << "job" << job_context_->job_id << "event"
                          << "flush_started"
+                         << "flush_reason" << ToString(flush_reason_)
                          << "num_memtables" << mems.size() << "num_entries"
                          << total_num_entries << "num_deletes"
                          << total_num_deletes << "memory_usage"
@@ -274,14 +291,14 @@ Result<FileNumbersHolder> FlushJob::WriteLevel0Table(
       ScopedArenaIterator iter(
           NewMergingIterator(cfd_->internal_comparator().get(), &memtables[0],
                              static_cast<int>(memtables.size()), &arena));
-      RLOG(InfoLogLevel::INFO_LEVEL, db_options_.info_log,
+      RLOG(InfoLogLevel::DETAIL_LEVEL, db_options_.info_log,
           "[%s] [JOB %d] Level-0 flush table #%" PRIu64 ": started",
           cfd_->GetName().c_str(), job_context_->job_id, meta->fd.GetNumber());
 
-      TEST_SYNC_POINT_CALLBACK("FlushJob::WriteLevel0Table:output_compression",
-                               &output_compression_);
+      DEBUG_ONLY_TEST_SYNC_POINT_CALLBACK(
+          "FlushJob::WriteLevel0Table:output_compression", &output_compression_);
       s = BuildTable(dbname_,
-                     db_options_.env,
+                     db_options_,
                      *cfd_->ioptions(),
                      env_options_,
                      cfd_->table_cache(),
@@ -296,13 +313,12 @@ Result<FileNumbersHolder> FlushJob::WriteLevel0Table(
                      cfd_->ioptions()->compression_opts,
                      mutable_cf_options_.paranoid_file_checks,
                      cfd_->internal_stats(),
-                     db_options_.boundary_extractor.get(),
                      yb::IOPriority::kHigh,
                      &table_properties_);
       info.table_properties = table_properties_;
       LogFlush(db_options_.info_log);
     }
-    RLOG(InfoLogLevel::INFO_LEVEL, db_options_.info_log,
+    RLOG(InfoLogLevel::DETAIL_LEVEL, db_options_.info_log,
         "[%s] [JOB %d] Level-0 flush table #%" PRIu64 ": %" PRIu64
         " bytes %s%s %s",
         cfd_->GetName().c_str(), job_context_->job_id, meta->fd.GetNumber(),
@@ -322,13 +338,13 @@ Result<FileNumbersHolder> FlushJob::WriteLevel0Table(
       EventHelpers::LogAndNotifyTableFileCreation(
           event_logger_, db_options_.listeners,
           meta->fd, info);
-      TEST_SYNC_POINT("FlushJob::LogAndNotifyTableFileCreation()");
+      DEBUG_ONLY_TEST_SYNC_POINT("FlushJob::LogAndNotifyTableFileCreation()");
     }
 
     if (!db_options_.disableDataSync && output_file_directory_ != nullptr) {
       RETURN_NOT_OK(output_file_directory_->Fsync());
     }
-    TEST_SYNC_POINT("FlushJob::WriteLevel0Table");
+    DEBUG_ONLY_TEST_SYNC_POINT("FlushJob::WriteLevel0Table");
     db_mutex_->Lock();
   }
 

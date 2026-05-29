@@ -1,4 +1,4 @@
-// Copyright (c) YugaByte, Inc.
+// Copyright (c) YugabyteDB, Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License"); you may not use this file except
 // in compliance with the License.  You may obtain a copy of the License at
@@ -24,7 +24,7 @@ class YQLKeyspacesVTable : public YQLVirtualTable {
   explicit YQLKeyspacesVTable(const TableName& table_name,
                               const NamespaceName& namespace_name,
                               Master* const master);
-  Result<std::shared_ptr<QLRowBlock>> RetrieveData(const QLReadRequestPB& request) const override;
+  Result<VTableDataPtr> RetrieveData(const QLReadRequestMsg& request) const override;
  protected:
   Schema CreateSchema() const;
  private:

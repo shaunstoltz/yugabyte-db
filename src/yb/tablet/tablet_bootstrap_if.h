@@ -15,9 +15,9 @@
 // specific language governing permissions and limitations
 // under the License.
 //
-// The following only applies to changes made to this file as part of YugaByte development.
+// The following only applies to changes made to this file as part of YugabyteDB development.
 //
-// Portions Copyright (c) YugaByte, Inc.
+// Portions Copyright (c) YugabyteDB, Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License"); you may not use this file except
 // in compliance with the License.  You may obtain a copy of the License at
@@ -36,9 +36,9 @@
 #include <string>
 #include <vector>
 
-#include <boost/optional.hpp>
-
 #include "yb/client/client_fwd.h"
+
+#include "yb/common/opid.h"
 
 #include "yb/consensus/log_fwd.h"
 #include "yb/consensus/consensus_fwd.h"
@@ -49,14 +49,11 @@
 #include "yb/tablet/tablet_options.h"
 
 #include "yb/util/status_fwd.h"
-#include "yb/util/opid.h"
 #include "yb/util/shared_lock.h"
 
 namespace yb {
 
 class MetricRegistry;
-class Partition;
-class PartitionSchema;
 class ThreadPool;
 
 namespace consensus {
@@ -68,11 +65,28 @@ class Clock;
 }
 
 namespace tablet {
-class Tablet;
 class RaftGroupMetadata;
+class Tablet;
+class TabletBootstrapStateManager;
 class TransactionCoordinatorContext;
 class TransactionParticipantContext;
 struct TabletOptions;
+
+struct RbsProgressInfo {
+  TabletServerId source_ts_uuid;
+  int64_t sst_bytes_to_download;
+  int64_t sst_bytes_downloaded;
+  int64_t sst_start_time_micros;
+  int64_t sst_end_time_micros;
+};
+
+// When lazy superblock flush is enabled (currently colocated tables), tablet bootstrap may need
+// to replay this many trailing WAL segments to pick up committed-but-unflushed CHANGE_METADATA_OPs
+// (see the long comment in tablet_bootstrap.cc / PlaySegments). Callers that decide which WAL
+// segments to retain or to ship over the wire (e.g. remote bootstrap) must keep at least this
+// many segments available when lazy superblock flush is on, so that the destination's local
+// bootstrap can satisfy the same invariant.
+constexpr size_t kMinSegmentsToReplayWithLazySuperblockFlush = 2;
 
 // A listener for logging the tablet related statuses as well as
 // piping it into the web UI.
@@ -84,6 +98,8 @@ class TabletStatusListener {
 
   void StatusMessage(const std::string& status);
 
+  void SetStatusPrefix(const std::string& prefix);
+
   const std::string tablet_id() const;
 
   const std::string namespace_name() const;
@@ -92,20 +108,30 @@ class TabletStatusListener {
 
   const std::string table_id() const;
 
-  std::shared_ptr<Partition> partition() const;
+  std::shared_ptr<dockv::Partition> partition() const;
 
   SchemaPtr schema() const;
 
   std::string last_status() const {
     SharedLock<std::shared_timed_mutex> l(lock_);
-    return last_status_;
+    return status_prefix_ + last_status_;
   }
+
+  std::optional<RbsProgressInfo> GetRbsProgressInfo();
+  void SetInitialRbsProgressInfo(
+      const TabletServerId& source_ts_uuid, int64_t sst_bytes_to_download,
+      int64_t start_time_micros);
+  void IncrementSstDownloadProgress(int64_t bytes_downloaded);
+  void SetSstDownloadDone();
+  void ClearRbsProgressInfo();
 
  private:
   mutable std::shared_timed_mutex lock_;
 
   RaftGroupMetadataPtr meta_;
-  std::string last_status_;
+  std::string last_status_ GUARDED_BY(lock_);
+  std::string status_prefix_ GUARDED_BY(lock_);
+  std::optional<RbsProgressInfo> rbs_progress_info_ GUARDED_BY(lock_) = std::nullopt;
 
   DISALLOW_COPY_AND_ASSIGN(TabletStatusListener);
 };
@@ -113,6 +139,7 @@ class TabletStatusListener {
 struct DocDbOpIds {
   OpId regular;
   OpId intents;
+  boost::container::small_vector<OpId, 1> vector_indexes;
 
   std::string ToString() const;
 };
@@ -124,14 +151,16 @@ class TabletBootstrapTestHooksIf {
 
   // This is called during TabletBootstrap initialization so that the test can pretend certain
   // OpIds have been flushed in to regular and intents RocksDBs.
-  virtual boost::optional<DocDbOpIds> GetFlushedOpIdsOverride() const = 0;
+  virtual std::optional<DocDbOpIds> GetFlushedOpIdsOverride() const = 0;
+
+  // This is called during TabletBootstrap initialization so that the test can pretent certain
+  // OpId has been flushed in retryable requests;
+  virtual std::optional<OpId> GetFlushedRetryableRequestsOpIdOverride() const = 0;
 
   // TabletBootstrap calls this when an operation is replayed.
   // replay_decision is true for transaction update operations that have already been applied to the
   // regular RocksDB but not to the intents RocksDB.
-  virtual void Replayed(
-      OpId op_id,
-      AlreadyAppliedToRegularDB already_applied_to_regular_db) = 0;
+  virtual void Replayed(OpId op_id, const docdb::StorageSet& apply_to_storages) = 0;
 
   // TabletBootstrap calls this when an operation is overwritten after a leader change.
   virtual void Overwritten(OpId op_id) = 0;
@@ -153,6 +182,10 @@ class TabletBootstrapTestHooksIf {
   // it discovers the first OpId of a log segment. OpId will be invalid if we could not read the
   // first OpId. This is called in the order from newer to older segments;
   virtual void FirstOpIdOfSegment(const std::string& path, OpId first_op_id) = 0;
+
+  // Tablet bootstrap calls this before replaying each segment to track the first entry read from
+  // the segment. OpId will be invalid if nothing read from the segment.
+  virtual void FirstOpIdReadFromReplayedSegment(const std::string& path, OpId first_op_id) = 0;
 };
 
 struct BootstrapTabletData {
@@ -162,9 +195,12 @@ struct BootstrapTabletData {
   ThreadPool* allocation_pool = nullptr;
   ThreadPool* log_sync_pool = nullptr;
   consensus::RetryableRequests* retryable_requests = nullptr;
+  TabletBootstrapStateManager* bootstrap_state_manager = nullptr;
   std::shared_ptr<TabletBootstrapTestHooksIf> test_hooks = nullptr;
   bool bootstrap_retryable_requests = true;
   consensus::ConsensusMetadata* consensus_meta = nullptr;
+  log::PreLogRolloverCallback pre_log_rollover_callback = {};
+  log::MinStartHTRunningTxnsCallback min_start_ht_running_txns_callback = {};
 };
 
 // Bootstraps a tablet, initializing it with the provided metadata. If the tablet

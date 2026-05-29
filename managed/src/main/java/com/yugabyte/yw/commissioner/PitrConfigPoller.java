@@ -1,11 +1,12 @@
 package com.yugabyte.yw.commissioner;
 
-import static com.yugabyte.yw.common.metrics.MetricService.STATUS_OK;
 import static com.yugabyte.yw.common.metrics.MetricService.STATUS_NOT_OK;
+import static com.yugabyte.yw.common.metrics.MetricService.STATUS_OK;
+
 import com.google.inject.Inject;
 import com.google.inject.Singleton;
-import com.yugabyte.yw.common.BackupUtil;
 import com.yugabyte.yw.common.PlatformScheduler;
+import com.yugabyte.yw.common.backuprestore.BackupUtil;
 import com.yugabyte.yw.common.config.RuntimeConfigFactory;
 import com.yugabyte.yw.common.metrics.MetricService;
 import com.yugabyte.yw.common.services.YBClientService;
@@ -14,9 +15,9 @@ import com.yugabyte.yw.models.PitrConfig;
 import com.yugabyte.yw.models.Universe;
 import com.yugabyte.yw.models.filters.MetricFilter;
 import com.yugabyte.yw.models.helpers.PlatformMetrics;
-import java.util.Collections;
 import java.time.Duration;
 import java.util.ArrayList;
+import java.util.Collections;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
@@ -67,13 +68,11 @@ public class PitrConfigPoller {
     log.info("Running PITR Config Poller");
     List<PitrConfig> pitrConfigList = PitrConfig.getAll();
     Map<UUID, Map<UUID, PitrConfig>> scheduleMap =
-        pitrConfigList
-            .stream()
+        pitrConfigList.stream()
             .collect(
                 Collectors.groupingBy(
                     p -> p.getUniverse().getUniverseUUID(),
                     Collectors.toMap(PitrConfig::getUuid, Function.identity())));
-    YBClient client = null;
 
     List<Metric> metrics = new ArrayList<>();
     for (Map.Entry<UUID, Map<UUID, PitrConfig>> entry : scheduleMap.entrySet()) {
@@ -83,22 +82,17 @@ public class PitrConfigPoller {
         if (universe.getUniverseDetails().universePaused) {
           continue;
         }
-        String masterHostPorts = universe.getMasterAddresses();
-        String certificate = universe.getCertificateNodetoNode();
         ListSnapshotSchedulesResponse scheduleResp;
         List<SnapshotScheduleInfo> scheduleInfoList;
         Map<UUID, PitrConfig> snapshotScheduleMap = entry.getValue();
         Set<UUID> snapshotScheduleUUIDs = snapshotScheduleMap.keySet();
         log.info("Universe uuid: {}, schedule uuid: {}", universeUUID, snapshotScheduleUUIDs);
-        try {
-          client = ybClientService.getClient(masterHostPorts, certificate);
+        try (YBClient client = ybClientService.getUniverseClient(universe)) {
           scheduleResp = client.listSnapshotSchedules(null);
           scheduleInfoList = scheduleResp.getSnapshotScheduleInfoList();
         } catch (Exception ex) {
           log.error("Failed to get snapshots for universe {}", universeUUID, ex);
           continue;
-        } finally {
-          ybClientService.closeClient(client, masterHostPorts);
         }
 
         for (SnapshotScheduleInfo snapshotScheduleInfo : scheduleInfoList) {

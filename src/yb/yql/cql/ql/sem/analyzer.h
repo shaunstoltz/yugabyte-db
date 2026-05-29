@@ -1,5 +1,5 @@
 //--------------------------------------------------------------------------------------------------
-// Copyright (c) YugaByte, Inc.
+// Copyright (c) YugabyteDB, Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License"); you may not use this file except
 // in compliance with the License.  You may obtain a copy of the License at
@@ -25,6 +25,8 @@
 namespace yb {
 namespace ql {
 
+class QLMetrics;
+
 //--------------------------------------------------------------------------------------------------
 
 class Analyzer {
@@ -41,7 +43,7 @@ class Analyzer {
 
   // Run semantics analysis on the given parse tree and decorate it with semantics information such
   // as datatype or object-type of a database object.
-  Status Analyze(ParseTreePtr ptree);
+  Status Analyze(ParseTreePtr ptree, const QLMetrics *ql_metrics);
 
   // Returns decorated parse tree from the semantic analysis and destroys the context.
   ParseTreePtr Done();

@@ -4,9 +4,11 @@ headerTitle: DELETE
 linkTitle: DELETE
 description: Use the DELETE statement to remove rows that meet certain conditions, and when conditions are not provided in WHERE clause, all rows are deleted.
 menu:
-  stable:
+  stable_api:
     identifier: dml_delete
     parent: statements
+aliases:
+  - /stable/api/ysql/commands/dml_delete/
 type: docs
 ---
 
@@ -16,29 +18,10 @@ Use the `DELETE` statement to remove rows that meet certain conditions, and when
 
 ## Syntax
 
-<ul class="nav nav-tabs nav-tabs-yb">
-  <li >
-    <a href="#grammar" class="nav-link active" id="grammar-tab" data-toggle="tab" role="tab" aria-controls="grammar" aria-selected="true">
-      <img src="/icons/file-lines.svg" alt="Grammar Icon">
-      Grammar
-    </a>
-  </li>
-  <li>
-    <a href="#diagram" class="nav-link" id="diagram-tab" data-toggle="tab" role="tab" aria-controls="diagram" aria-selected="false">
-      <img src="/icons/diagram.svg" alt="Diagram Icon">
-      Diagram
-    </a>
-  </li>
-</ul>
-
-<div class="tab-content">
-  <div id="grammar" class="tab-pane fade show active" role="tabpanel" aria-labelledby="grammar-tab">
-  {{% includeMarkdown "../../syntax_resources/the-sql-language/statements/delete,returning_clause.grammar.md" %}}
-  </div>
-  <div id="diagram" class="tab-pane fade" role="tabpanel" aria-labelledby="diagram-tab">
-  {{% includeMarkdown "../../syntax_resources/the-sql-language/statements/delete,returning_clause.diagram.md" %}}
-  </div>
-</div>
+{{%ebnf%}}
+  delete,
+  returning_clause
+{{%/ebnf%}}
 
 {{< note title="Table inheritance is not yet supported" >}}
 The [table_expr](../../../syntax_resources/grammar_diagrams/#table-expr) rule specifies syntax that is useful only when at least one other table inherits one of the tables that the `truncate` statement lists explicitly. See [this note](../ddl_alter_table#table-expr-note) for more detail. Until inheritance is supported, use a bare [table_name](../../../syntax_resources/grammar_diagrams/#table-name).
@@ -48,13 +31,11 @@ See the section [The WITH clause and common table expressions](../../with-clause
 
 ## Semantics
 
-- `USING` clause is not yet supported.
-
 - While the `WHERE` clause allows a wide range of operators, the exact conditions used in the `WHERE` clause have significant performance considerations (especially for large datasets). For the best performance, use a `WHERE` clause that provides values for all columns in `PRIMARY KEY` or `INDEX KEY`.
 
 ### *delete*
 
-#### WITH [ RECURSIVE ] *with_query* [ , ... ] DELETE FROM [ ONLY ] *table_name* [ * ] [ [ AS ] *alias* ] [ WHERE *condition* | WHERE CURRENT OF *cursor_name* ] [ [*returning_clause*] (#returning-clause) ]
+#### WITH [ RECURSIVE ] *with_query* [ , ... ] DELETE FROM [ ONLY ] *table_name* [ * ] [ [ AS ] *alias* ] [USING from_item] [ WHERE *condition* | WHERE CURRENT OF *cursor_name* ] [ [*returning_clause*] (#returning-clause) ]
 
 ##### *with_query*
 
@@ -67,6 +48,12 @@ Specify the name of the table to be deleted.
 ##### *alias*
 
 Specify the identifier of the target table within the DELETE statement. When an alias is specified, it must be used in place of the actual table in the statement.
+
+##### *from_item*
+
+A table expression that enables referencing columns from additional tables within the `WHERE` clause.
+This follows the identical syntax conventions as the `FROM` clause in a `SELECT` statement, including the ability to define table aliases.
+The target table should not be included as a `from_item` unless performing a self-join operation, in which case the target table must appear with an alias in the `from_item` list.
 
 ### *returning_clause*
 

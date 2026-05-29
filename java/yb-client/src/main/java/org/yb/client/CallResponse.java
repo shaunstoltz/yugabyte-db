@@ -15,9 +15,9 @@
 // specific language governing permissions and limitations
 // under the License.
 //
-// The following only applies to changes made to this file as part of YugaByte development.
+// The following only applies to changes made to this file as part of YugabyteDB development.
 //
-// Portions Copyright (c) YugaByte, Inc.
+// Portions Copyright (c) YugabyteDB, Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License"); you may not use this file except
 // in compliance with the License.  You may obtain a copy of the License at
@@ -47,6 +47,8 @@ import java.util.List;
 final class CallResponse extends DefaultByteBufHolder {
   private final RpcHeader.ResponseHeader header;
   private final int totalResponseSize;
+  // Points to the index after the end of the response data.
+  private final int responseEndIndex;
 
   // Non-header main message slice is generated upon request and cached.
   private Slice message = null;
@@ -71,19 +73,34 @@ final class CallResponse extends DefaultByteBufHolder {
     if (this.totalResponseSize > 0) {
       YRpc.checkArrayLength(buf, this.totalResponseSize);
       TabletClient.ensureReadable(buf, this.totalResponseSize);
-
+      final int readIndex = buf.readerIndex();
+      // Only the header is read out of the total response size.
+      // The reader index is not advanced yet.
       final int headerSize = Bytes.readVarInt32(buf);
       final Slice headerSlice = nextBytes(buf, headerSize);
       RpcHeader.ResponseHeader.Builder builder = RpcHeader.ResponseHeader.newBuilder();
       YRpc.readProtobuf(headerSlice, builder);
       this.header = builder.build();
+      this.responseEndIndex = readIndex + this.totalResponseSize;
     } else {
       this.header = null;
+      this.responseEndIndex = 0;
     }
   }
 
+  public int discardUnreadBytes() {
+    int bytesToSkip = 0;
+    ByteBuf buf = content();
+    int rIndex = buf.readerIndex();
+    if (rIndex < this.responseEndIndex) {
+      bytesToSkip = this.responseEndIndex - rIndex;
+      buf.skipBytes(bytesToSkip);
+    }
+    return bytesToSkip;
+  }
+
   public boolean isEmpty() {
-    return this.totalResponseSize == 0;
+    return this.totalResponseSize <= 0;
   }
 
   /**

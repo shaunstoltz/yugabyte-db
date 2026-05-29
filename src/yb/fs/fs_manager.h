@@ -15,9 +15,9 @@
 // specific language governing permissions and limitations
 // under the License.
 //
-// The following only applies to changes made to this file as part of YugaByte development.
+// The following only applies to changes made to this file as part of YugabyteDB development.
 //
-// Portions Copyright (c) YugaByte, Inc.
+// Portions Copyright (c) YugabyteDB, Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License"); you may not use this file except
 // in compliance with the License.  You may obtain a copy of the License at
@@ -43,9 +43,10 @@
 
 #include "yb/gutil/ref_counted.h"
 #include "yb/util/env.h"
-#include "yb/util/metrics.h"
+#include "yb/util/metrics_fwd.h"
 #include "yb/util/path_util.h"
 #include "yb/util/strongly_typed_bool.h"
+#include "yb/util/strongly_typed_uuid.h"
 
 DECLARE_bool(enable_data_block_fsync);
 
@@ -66,7 +67,10 @@ class ExternalMiniClusterFsInspector;
 
 class InstanceMetadataPB;
 
+YB_STRONGLY_TYPED_BOOL(CleanupTemporaryFiles);
 YB_STRONGLY_TYPED_BOOL(ShouldDeleteLogs);
+YB_STRONGLY_TYPED_UUID_DECL(UniverseUuid);
+
 
 struct FsManagerOpts {
   FsManagerOpts();
@@ -194,7 +198,13 @@ class FsManager {
 
   // Read all RaftGroupMetadataDirs and fill tablet_id_to_path_.
   // Return the tablet IDs in the metadata directory.
-  Result<std::vector<std::string>> ListTabletIds();
+  Result<std::vector<std::string>> ListTabletIds(CleanupTemporaryFiles cleanup_temporary_files);
+
+  Result<std::string> GetUniverseUuidFromTserverInstanceMetadata() const;
+
+  Status SetUniverseUuidOnTserverInstanceMetadata(const UniverseUuid& universe_uuid);
+
+  Status ClearUniverseUuidOnTserverInstanceMetadata();
 
   // Return the path where InstanceMetadataPB is stored.
   std::string GetInstanceMetadataPath(const std::string& root) const;
@@ -204,7 +214,6 @@ class FsManager {
 
   // Return the directory where the certs are stored.
   std::string GetDefaultRootDir() const;
-  static std::string GetCertsDir(const std::string& root_dir);
 
   std::vector<std::string> GetConsensusMetadataDirs() const;
   // Return the directory where the consensus metadata is stored.
@@ -216,6 +225,14 @@ class FsManager {
   std::string GetAutoFlagsConfigPath() const EXCLUDES(auto_flag_mutex_);
 
   Env *env() { return env_; }
+
+  void SetEncryptedEnv(std::unique_ptr<Env> encrypted_env) {
+    encrypted_env_ = std::move(encrypted_env);
+  }
+
+  Env *encrypted_env() {
+    return encrypted_env_ ? encrypted_env_.get() : env();
+  }
 
   bool read_only() const {
     return read_only_;
@@ -239,6 +256,8 @@ class FsManager {
   Status CreateDirIfMissing(const std::string& path, bool* created = NULL);
 
   Status CreateDirIfMissingAndSync(const std::string& path, bool* created = NULL);
+
+  Result<uint64> GetFreeSpaceBytes(const std::string& path) const;
 
  private:
   FRIEND_TEST(FsManagerTestBase, TestDuplicatePaths);
@@ -281,7 +300,12 @@ class FsManager {
                           const std::string& path,
                           const std::vector<std::string>& objects);
 
+  Result<std::string> GetExistingInstanceMetadataPath() const;
+
   Env *env_;
+
+  // Set on the TabletServer::Init path.
+  std::unique_ptr<Env> encrypted_env_;
 
   // If false, operations that mutate on-disk state are prohibited.
   const bool read_only_;
@@ -311,7 +335,8 @@ class FsManager {
   mutable std::mutex auto_flag_mutex_;
   std::string auto_flags_config_path_ GUARDED_BY(auto_flag_mutex_);
 
-  std::unique_ptr<InstanceMetadataPB> metadata_;
+  std::unique_ptr<InstanceMetadataPB> metadata_ GUARDED_BY(metadata_mutex_);
+  mutable std::mutex metadata_mutex_;
 
   // Keep references to counters, counters without reference will be retired.
   std::vector<scoped_refptr<Counter>> counters_;

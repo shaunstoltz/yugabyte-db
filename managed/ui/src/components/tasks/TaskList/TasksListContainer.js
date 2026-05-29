@@ -1,4 +1,4 @@
-// Copyright (c) YugaByte, Inc.
+// Copyright (c) YugabyteDB, Inc.
 
 import { connect } from 'react-redux';
 import { TasksList } from '../../tasks';
@@ -8,7 +8,8 @@ import {
   fetchCustomerTasks,
   fetchCustomerTasksSuccess,
   fetchCustomerTasksFailure,
-  resetCustomerTasks
+  resetCustomerTasks,
+  showTaskInDrawer
 } from '../../../actions/tasks';
 import { openDialog, closeDialog } from '../../../actions/modal';
 
@@ -26,7 +27,7 @@ const mapDispatchToProps = (dispatch) => {
     resetCustomerTasks: () => {
       dispatch(resetCustomerTasks());
     },
-    abortCurrentTask: (taskUUID) => {
+    abortTask: (taskUUID) => {
       return dispatch(abortTask(taskUUID)).then((response) => {
         return dispatch(abortTaskResponse(response.payload));
       });
@@ -36,6 +37,9 @@ const mapDispatchToProps = (dispatch) => {
     },
     showTaskAbortModal: () => {
       dispatch(openDialog('confirmAbortTask'));
+    },
+    showTaskDrawer: (taskUUID) => {
+      dispatch(showTaskInDrawer(taskUUID));
     }
   };
 };
@@ -45,7 +49,8 @@ function mapStateToProps(state) {
     universe: state.universe,
     customer: state.customer,
     tasks: state.tasks,
-    visibleModal: state.modal.visibleModal
+    visibleModal: state.modal.visibleModal,
+    featureFlags: state.featureFlags
   };
 }
 

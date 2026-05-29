@@ -1,5 +1,5 @@
 /*
- * Copyright 2021 YugaByte, Inc. and Contributors
+ * Copyright 2021 YugabyteDB, Inc. and Contributors
  *
  * Licensed under the Polyform Free Trial License 1.0.0 (the "License"); you
  * may not use this file except in compliance with the License. You
@@ -10,6 +10,7 @@
 package com.yugabyte.yw.common.config;
 
 import com.yugabyte.yw.models.Customer;
+import com.yugabyte.yw.models.Provider;
 import com.yugabyte.yw.models.Universe;
 
 public interface RuntimeConfigChangeListener {
@@ -24,6 +25,10 @@ public interface RuntimeConfigChangeListener {
   }
 
   default void processUniverse(Universe universe) {
+    // Do nothing by default
+  }
+
+  default void processProvider(Provider provider) {
     // Do nothing by default
   }
 }

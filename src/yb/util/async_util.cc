@@ -1,4 +1,4 @@
-// Copyright (c) YugaByte, Inc.
+// Copyright (c) YugabyteDB, Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License"); you may not use this file except
 // in compliance with the License.  You may obtain a copy of the License at
@@ -14,6 +14,7 @@
 
 #include "yb/gutil/bind.h"
 
+#include "yb/util/callsite_profiling.h"
 #include "yb/util/logging.h" // Required in NDEBUG mode
 #include "yb/util/status_log.h"
 
@@ -35,11 +36,11 @@ Synchronizer::~Synchronizer() {
 }
 
 void Synchronizer::StatusCB(const Status& status) {
-  std::lock_guard<std::mutex> lock(mutex_);
+  std::lock_guard lock(mutex_);
   if (!assigned_) {
     assigned_ = true;
     status_ = status;
-    cond_.notify_all();
+    YB_PROFILE(cond_.notify_all());
   } else {
     LOG(DFATAL) << "Status already assigned, existing: " << status_ << ", new: " << status;
   }
@@ -68,6 +69,15 @@ StatusCallback Synchronizer::AsStatusCallback(const std::shared_ptr<Synchronizer
   return Bind(CallStatusCBMaybe, weak_sync);
 }
 
+StdStatusCallback Synchronizer::AsStdStatusCallback(
+    const std::shared_ptr<Synchronizer>& synchronizer) {
+  DCHECK(!synchronizer->assigned_);
+  // No need to set must_wait_ here -- the callback knows whether Synchronizer still exists.
+  return [weak_sync = std::weak_ptr<Synchronizer>(synchronizer)](const Status& status) {
+    CallStatusCBMaybe(weak_sync, status);
+  };
+}
+
 Status Synchronizer::WaitUntil(const std::chrono::steady_clock::time_point& time) {
   std::unique_lock<std::mutex> lock(mutex_);
   auto predicate = [this] { return assigned_; };
@@ -86,7 +96,7 @@ Status Synchronizer::WaitUntil(const std::chrono::steady_clock::time_point& time
 }
 
 void Synchronizer::Reset() {
-  std::lock_guard<std::mutex> lock(mutex_);
+  std::lock_guard lock(mutex_);
   EnsureWaitDone();
   assigned_ = false;
   status_ = Status::OK();
@@ -103,7 +113,7 @@ void Synchronizer::EnsureWaitDone() {
     LOG(FATAL) << kErrorMsg;
 #else
     const int kWaitSec = 10;
-    YB_LOG_EVERY_N_SECS(ERROR, 1) << kErrorMsg << " Waiting up to " << kWaitSec << " seconds";
+    YB_LOG_EVERY_N_SECS(DFATAL, 1) << kErrorMsg << " Waiting up to " << kWaitSec << " seconds";
     CHECK_OK(WaitFor(MonoDelta::FromSeconds(kWaitSec)));
 #endif
   }

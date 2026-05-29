@@ -1,5 +1,5 @@
 /**
- * Copyright (c) YugaByte, Inc.
+ * Copyright (c) YugabyteDB, Inc.
  *
  * Licensed under the Apache License, Version 2.0 (the "License"); you may not use this file except
  * in compliance with the License.  You may obtain a copy of the License at
@@ -17,6 +17,8 @@ import static org.yb.AssertionWrappers.fail;
 
 import java.net.MalformedURLException;
 import java.net.URL;
+import java.util.ArrayList;
+import java.util.Arrays;
 import java.util.Collections;
 import java.util.HashMap;
 import java.util.List;
@@ -25,6 +27,7 @@ import java.util.Scanner;
 import java.util.Set;
 import java.util.TreeMap;
 import java.util.function.Consumer;
+import java.util.stream.Collectors;
 
 import org.junit.AfterClass;
 import org.junit.Before;
@@ -32,7 +35,11 @@ import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.yb.BaseYBTest;
 import org.yb.client.TestUtils;
+import org.yb.client.YBClient;
+import org.yb.client.YBTable;
+import org.yb.master.MasterDdlOuterClass;
 import org.yb.util.BuildTypeUtil;
+import org.yb.util.ProcessUtil;
 import org.yb.util.Timeouts;
 
 import com.google.common.net.HostAndPort;
@@ -95,6 +102,16 @@ public class BaseMiniClusterTest extends BaseYBTest {
 
   protected int getInitialNumTServers() {
     return -1;
+  }
+
+  /** Subclasses can override this to set the initial YCQL number of tablets. */
+  protected int getYcqlNumTablets() {
+    return MiniYBClusterParameters.DEFAULT_NUM_TABLETS;
+  }
+
+  /** Subclasses can override this to set the initial YSQL number of tablets. */
+  protected int getYsqlNumTablets() {
+    return MiniYBClusterParameters.DEFAULT_NUM_TABLETS;
   }
 
   /** Subclasses can override this to set the number of shards per tablet server. */
@@ -286,6 +303,8 @@ public class BaseMiniClusterTest extends BaseYBTest {
                       .addMasterFlags(additionalMasterFlags)
                       .commonTServerFlags(getTServerFlags())
                       .addCommonTServerFlags(additionalTserverFlags)
+                      .ycqlNumTablets(getYcqlNumTablets())
+                      .ysqlNumTablets(getYsqlNumTablets())
                       .numShardsPerTServer(getNumShardsPerTServer())
                       .useIpWithCertificate(useIpWithCertificate)
                       .replicationFactor(replicationFactor)
@@ -371,6 +390,22 @@ public class BaseMiniClusterTest extends BaseYBTest {
         miniCluster.getClient().openTableByUUID(tableUUID));
   }
 
+  /**
+   * Get the list of all YBTable satisfying the input table name filter as a substring.
+   * @param tableNameFilter table name filter as a name substring
+   * @return a list of YBTable satisfying the name filter
+   */
+  protected List<YBTable> getTablesFromName(final String tableNameFilter) throws Exception {
+    final YBClient client = miniCluster.getClient();
+    List<MasterDdlOuterClass.ListTablesResponsePB.TableInfo> tables =
+      client.getTablesList(tableNameFilter).getTableInfoList();
+    List<YBTable> tablesList = new ArrayList<>();
+    for (MasterDdlOuterClass.ListTablesResponsePB.TableInfo table : tables) {
+      tablesList.add(client.openTableByUUID(table.getId().toStringUtf8()));
+    }
+    return tablesList;
+  }
+
   protected int getTableCounterMetricByTableUUID(String tableUUID,
                                                  String metricName) throws Exception {
     int value = 0;
@@ -430,6 +465,29 @@ public class BaseMiniClusterTest extends BaseYBTest {
     return metrics;
   }
 
+  public static String runYbAdmin(String... args) throws Exception {
+    final String ybAdminPath = TestUtils.findBinary("yb-admin");
+    List<String> processCommand = new ArrayList<String>(Arrays.asList(
+        ybAdminPath,
+        "--master_addresses", masterAddresses
+    ));
+
+    processCommand.addAll(Arrays.asList(args));
+    final String output = ProcessUtil.runProcess(processCommand, 60 /* timeoutSeconds */);
+    LOG.info("yb-admin output: " + output);
+    return output;
+  }
+
+  // Returns list of tablet uuids for a given table.
+  public static List<String> getTabletsForTable(String namespace, String tableName)
+      throws Exception {
+    String output = runYbAdmin("list_tablets", namespace, tableName);
+    return Arrays.stream(output.split(System.lineSeparator()))
+                 .filter(line -> !line.startsWith("Tablet-UUID"))
+                 .map(line -> line.split(" ")[0])
+                 .collect(Collectors.toList());
+  }
+
 
   @AfterClass
   public static void tearDownAfterClass() throws Exception {
@@ -438,4 +496,16 @@ public class BaseMiniClusterTest extends BaseYBTest {
     LOG.info("BaseMiniClusterTest.tearDownAfterClass completed");
   }
 
+  protected static String maxQueryLayerRetriesConf(int max_retries) {
+    return "yb_max_query_layer_retries=" + max_retries;
+  }
+
+  public void findAndKillMasterLeader() throws Exception {
+    HostAndPort masterHostAndPort = miniCluster.getClient().getLeaderMasterHostAndPort();
+    miniCluster.killMasterOnHostPort(masterHostAndPort);
+  }
+
+  public void waitForMasterLeader(long timeout) throws Exception {
+    miniCluster.getClient().waitForMasterLeader(timeout);
+  }
 }

@@ -1,4 +1,4 @@
-// Copyright (c) YugaByte, Inc.
+// Copyright (c) YugabyteDB, Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License"); you may not use this file except
 // in compliance with the License.  You may obtain a copy of the License at
@@ -12,6 +12,8 @@
 //
 
 #include "yb/client/client_master_rpc.h"
+
+#include "yb/ash/wait_state.h"
 
 #include "yb/rpc/outbound_call.h"
 #include "yb/rpc/rpc_header.pb.h"
@@ -32,21 +34,25 @@ namespace internal {
 ClientMasterRpcBase::ClientMasterRpcBase(YBClient::Data* client_data, CoarseTimePoint deadline)
     : Rpc(deadline, client_data->messenger_, client_data->proxy_cache_.get()),
       client_data_(DCHECK_NOTNULL(client_data)),
-      retained_self_(client_data->rpcs_.InvalidHandle()) {
+      retained_self_(client_data->rpcs_.InvalidHandle()),
+      wait_state_(ash::WaitStateInfo::CurrentWaitState()) {
 }
 
 void ClientMasterRpcBase::SendRpc() {
   DCHECK(retained_self_ != client_data_->rpcs_.InvalidHandle());
 
+  auto deadline = retrier().deadline();
   auto now = CoarseMonoClock::Now();
-  if (retrier().deadline() < now) {
+  if (deadline < now) {
     Finished(STATUS_FORMAT(TimedOut, "Request $0 timed out after deadline expired", *this));
     return;
   }
 
-  auto rpc_deadline = now + client_data_->default_rpc_timeout_;
   mutable_retrier()->mutable_controller()->set_deadline(
-      std::min(rpc_deadline, retrier().deadline()));
+      deadline != CoarseTimePoint::max() ? deadline : now + client_data_->default_rpc_timeout_);
+
+  ASH_ENABLE_CONCURRENT_UPDATES();
+  SET_WAIT_STATUS(YBClient_WaitingOnMaster);
   CallRemoteMethod();
 }
 
@@ -71,16 +77,26 @@ void ClientMasterRpcBase::NewLeaderMasterDeterminedCb(const Status& status) {
 }
 
 void ClientMasterRpcBase::Finished(const Status& status) {
+  ADOPT_TRACE(trace_.get());
+  ADOPT_WAIT_STATE(wait_state_);
+  SET_WAIT_STATUS(OnCpu_Passive);
+  SCOPED_WAIT_STATUS(OnCpu_Active);
   auto resp_status = ResponseStatus();
   if (status.ok() && !resp_status.ok()) {
-    LOG_WITH_PREFIX(INFO) << "Failed, got resp error: " << resp_status;
+    YB_LOG_WITH_PREFIX_EVERY_N_SECS(INFO, 1) << "Failed, got resp error: " << resp_status;
   } else if (!status.ok()) {
-    LOG_WITH_PREFIX(INFO) << "Failed: " << status;
+    YB_LOG_WITH_PREFIX_EVERY_N_SECS(INFO, 1) << "Failed: " << status;
   }
 
   Status new_status = status;
   if (new_status.ok() &&
       mutable_retrier()->HandleResponse(this, &new_status, rpc::RetryWhenBusy::kFalse)) {
+    return;
+  }
+
+  if (client_data_->Closing()) {
+    auto retained_self = client_data_->rpcs_.Unregister(&retained_self_);
+    ProcessResponse(new_status);
     return;
   }
 
@@ -120,12 +136,18 @@ void ClientMasterRpcBase::Finished(const Status& status) {
       new_status = STATUS_FORMAT(
           TimedOut, "$0 timed out after deadline expired, passed $1 of $2",
           *this, now - retrier().start(), retrier().deadline() - retrier().start());
-      ResetMasterLeader(Retry::kFalse);
+      // If RPC start time >= deadline, this RPC was doomed to timeout and timeout reason is not in
+      // master.
+      if (retrier().start() < retrier().deadline()) {
+        ResetMasterLeader(Retry::kFalse);
+      }
     }
   }
 
   if (new_status.IsNetworkError() || new_status.IsRemoteError()) {
-    if (rpc::RpcError(new_status) != rpc::ErrorStatusPB::ERROR_NO_SUCH_METHOD) {
+    const auto rpc_error = rpc::RpcError(new_status);
+    if (rpc_error != rpc::ErrorStatusPB::ERROR_NO_SUCH_METHOD &&
+        rpc_error != rpc::ErrorStatusPB::FATAL_SERVER_SHUTTING_DOWN) {
       LOG(WARNING) << ToString() << ": Encountered a network error from the Master("
                    << client_data_->leader_master_hostport().ToString()
                    << "): " << new_status.ToString() << ", retrying...";

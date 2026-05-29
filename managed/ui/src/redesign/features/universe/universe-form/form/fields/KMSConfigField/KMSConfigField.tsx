@@ -1,4 +1,5 @@
-import React, { FC, ChangeEvent } from 'react';
+import { FC, ChangeEvent } from 'react';
+import _ from 'lodash';
 import { useQuery } from 'react-query';
 import { useTranslation } from 'react-i18next';
 import { Controller, useFormContext, useWatch } from 'react-hook-form';
@@ -7,6 +8,7 @@ import { YBLabel, YBAutoComplete } from '../../../../../../components';
 import { api, QUERY_KEY } from '../../../utils/api';
 import { DEFAULT_INSTANCE_CONFIG, KmsConfig, UniverseFormData } from '../../../utils/dto';
 import { KMS_CONFIG_FIELD, EAR_FIELD } from '../../../utils/constants';
+import { useFormFieldStyles } from '../../../universeMainStyle';
 
 const renderOption = (op: Record<string, string>): string => {
   const option = (op as unknown) as KmsConfig;
@@ -24,6 +26,7 @@ interface KMSConfigFieldProps {
 
 export const KMSConfigField: FC<KMSConfigFieldProps> = ({ disabled }) => {
   const { setValue, control } = useFormContext<UniverseFormData>();
+  const classes = useFormFieldStyles();
   const { t } = useTranslation();
 
   //watchers
@@ -31,7 +34,7 @@ export const KMSConfigField: FC<KMSConfigFieldProps> = ({ disabled }) => {
 
   //fetch data
   const { data, isLoading } = useQuery(QUERY_KEY.getKMSConfigs, api.getKMSConfigs);
-  let kmsConfigs: KmsConfig[] = data || [];
+  let kmsConfigs: KmsConfig[] = data ? _.sortBy(data, 'metadata.provider', 'metadata.name') : [];
 
   const handleChange = (e: ChangeEvent<{}>, option: any) => {
     setValue(KMS_CONFIG_FIELD, option?.metadata?.configUUID ?? DEFAULT_INSTANCE_CONFIG.kmsConfig, {
@@ -58,11 +61,12 @@ export const KMSConfigField: FC<KMSConfigFieldProps> = ({ disabled }) => {
             <YBLabel dataTestId="KMSConfigField-Label">
               {t('universeForm.instanceConfig.kmsConfig')}
             </YBLabel>
-            <Box flex={1}>
+            <Box flex={1} className={classes.defaultTextBox}>
               <YBAutoComplete
                 disabled={disabled}
                 loading={isLoading}
                 options={(kmsConfigs as unknown) as Record<string, string>[]}
+                groupBy={(option: Record<string, any>) => option?.metadata?.provider} //group by provider
                 ybInputProps={{
                   placeholder: t('universeForm.instanceConfig.kmsConfigPlaceHolder'),
                   error: !!fieldState.error,

@@ -1,4 +1,4 @@
-# Copyright 2019 YugaByte, Inc. and Contributors
+# Copyright 2019 YugabyteDB, Inc. and Contributors
 #
 # Licensed under the Polyform Free Trial License 1.0.0 (the "License"); you
 # may not use this file except in compliance with the License. You
@@ -52,6 +52,11 @@ class YBOpsRecoverableError(YBOpsExitCodeException):
 
     def exitcode(self):
         return 3  # also see ShellResponse#ERROR_CODE_RECOVERABLE_ERROR in Java
+
+
+class YBOpsFaultInjectionError(YBOpsException):
+    def __init__(self, message):
+        super().__init__("Fault injected", message)
 
 
 def get_exception_message(exc):

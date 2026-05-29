@@ -15,9 +15,9 @@
 // specific language governing permissions and limitations
 // under the License.
 //
-// The following only applies to changes made to this file as part of YugaByte development.
+// The following only applies to changes made to this file as part of YugabyteDB development.
 //
-// Portions Copyright (c) YugaByte, Inc.
+// Portions Copyright (c) YugabyteDB, Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License"); you may not use this file except
 // in compliance with the License.  You may obtain a copy of the License at
@@ -69,7 +69,7 @@ void TsRecoveryITest::StartCluster(const vector<string>& extra_tserver_flags,
   opts.num_tablet_servers = num_tablet_servers;
   opts.extra_tserver_flags = extra_tserver_flags;
   if (num_tablet_servers < 3) {
-    opts.extra_master_flags.push_back("--replication_factor=1");
+    opts.replication_factor = 1;
   }
   cluster_.reset(new ExternalMiniCluster(opts));
   ASSERT_OK(cluster_->Start());
@@ -80,7 +80,7 @@ TEST_F(TsRecoveryITest, TestCrashDuringLogReplay) {
   const std::string crash_flag = "--TEST_fault_crash_during_log_replay=0.05";
   ASSERT_NO_FATALS(StartCluster({ crash_flag }));
 
-  TestWorkload work(cluster_.get());
+  TestYcqlWorkload work(cluster_.get());
   work.set_num_write_threads(4);
   work.set_write_batch_size(1);
   work.set_write_timeout_millis(100);
@@ -124,16 +124,19 @@ TEST_F(TsRecoveryITest, TestCrashDuringLogReplay) {
 }
 
 TEST_F(TsRecoveryITest, CrashAfterLogSegmentPreAllocationg) {
+  // Set xcluster_checkpoint_max_staleness_secs to 0 to prevent the flag validator from failing
+  // when log_min_seconds_to_retain is also set to 0
   ASSERT_NO_FATALS(StartCluster({
       "--log_segment_size_bytes=2000",
       "--log_min_seconds_to_retain=0",
+      "--xcluster_checkpoint_max_staleness_secs=0",
       "--retryable_request_timeout_secs=0",
       "--db_write_buffer_size=2000",
       "--TEST_log_fault_after_segment_allocation_min_replicate_index=10" }));
 
   auto& tserver = *cluster_->tablet_server(0);
 
-  TestWorkload work(cluster_.get());
+  TestYcqlWorkload work(cluster_.get());
   work.set_num_write_threads(4);
   work.set_write_timeout_millis(100);
   work.set_timeout_allowed(true);

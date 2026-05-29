@@ -1,4 +1,4 @@
-// Copyright (c) YugaByte, Inc.
+// Copyright (c) YugabyteDB, Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License"); you may not use this file except
 // in compliance with the License.  You may obtain a copy of the License at
@@ -19,6 +19,8 @@
 #include <unordered_set>
 #include <vector>
 
+#include "yb/ash/rpc_wait_state.h"
+
 #include "yb/client/client.h"
 #include "yb/client/meta_cache.h"
 
@@ -28,7 +30,7 @@
 #include "yb/rpc/messenger.h"
 #include "yb/rpc/rpc.h"
 
-#include "yb/server/secure.h"
+#include "yb/rpc/secure.h"
 
 #include "yb/util/atomic.h"
 #include "yb/util/locks.h"
@@ -64,12 +66,13 @@ Result<std::unique_ptr<rpc::Messenger>> CreateClientMessenger(
   builder.set_num_reactors(num_reactors);
   builder.set_metric_entity(metric_entity);
   builder.UseDefaultConnectionContextFactory(parent_mem_tracker);
+  builder.UseLocalHostOutboundIpBaseInTests();
   if (secure_context) {
-    server::ApplySecureContext(secure_context, &builder);
+    rpc::ApplySecureContext(secure_context, &builder);
   }
   auto messenger = VERIFY_RESULT(builder.Build());
-  if (PREDICT_FALSE(FLAGS_TEST_running_test)) {
-    messenger->TEST_SetOutboundIpBase(VERIFY_RESULT(HostToAddress("127.0.0.1")));
+  if (FLAGS_ysql_yb_enable_ash) {
+    messenger->SetMetadataSerializerFactory(std::make_unique<ash::MetadataSerializerFactory>());
   }
   return messenger;
 }
@@ -80,7 +83,7 @@ std::vector<internal::RemoteTabletPtr> FilterTabletsByKeyRange(
     const std::string& partition_key_end) {
   std::vector<internal::RemoteTabletPtr> filtered_results;
   for (const auto& remote_tablet : all_tablets) {
-    if (PartitionSchema::HasOverlap(
+    if (dockv::PartitionSchema::HasOverlap(
             remote_tablet->partition().partition_key_start(),
             remote_tablet->partition().partition_key_end(),
             partition_key_start,

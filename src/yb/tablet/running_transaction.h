@@ -1,4 +1,4 @@
-// Copyright (c) YugaByte, Inc.
+// Copyright (c) YugabyteDB, Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License"); you may not use this file except
 // in compliance with the License.  You may obtain a copy of the License at
@@ -39,7 +39,9 @@ class RunningTransaction : public std::enable_shared_from_this<RunningTransactio
                      const TransactionalBatchData& last_batch_data,
                      OneWayBitmap&& replicated_batches,
                      HybridTime base_time_for_abort_check_ht_calculation,
-                     RunningTransactionContext* context);
+                     HybridTime first_write_ht,
+                     RunningTransactionContext* context,
+                     const AtomicGaugePtr<uint64_t>& metric_aborted_transactions_pending_cleanup);
 
   ~RunningTransaction();
 
@@ -55,9 +57,14 @@ class RunningTransaction : public std::enable_shared_from_this<RunningTransactio
     return abort_check_ht_;
   }
 
+  HybridTime first_write_ht() const {
+    return first_write_ht_;
+  }
+
   MUST_USE_RESULT bool UpdateStatus(
-      TransactionStatus transaction_status, HybridTime time_of_status,
-      HybridTime coordinator_safe_time, AbortedSubTransactionSet aborted_subtxn_set);
+      const TabletId& status_tablet, TransactionStatus transaction_status,
+      HybridTime time_of_status, HybridTime coordinator_safe_time, SubtxnSet aborted_subtxn_set,
+      const Status& expected_deadlock_status, PgSessionRequestVersion pg_session_req_version);
 
   void UpdateAbortCheckHT(HybridTime now, UpdateAbortCheckHTMode mode);
 
@@ -81,15 +88,17 @@ class RunningTransaction : public std::enable_shared_from_this<RunningTransactio
     return local_commit_time_;
   }
 
-  const AbortedSubTransactionSet& last_known_aborted_subtxn_set() const {
+  const SubtxnSet& last_known_aborted_subtxn_set() const {
     return last_known_aborted_subtxn_set_;
   }
 
-  const IsExternalTransaction external_transaction() const {
-    return metadata_.external_transaction;
+  const HybridTime last_known_status_hybrid_time() const {
+    return last_known_status_hybrid_time_;
   }
 
-  void SetLocalCommitData(HybridTime time, const AbortedSubTransactionSet& aborted_subtxn_set);
+  const TransactionStatus last_known_status() const { return last_known_status_; }
+
+  void SetLocalCommitData(HybridTime time, const SubtxnSet& aborted_subtxn_set);
   void AddReplicatedBatch(
       size_t batch_idx, boost::container::small_vector_base<uint8_t>* encoded_replicated_batches);
   void BatchReplicated(const TransactionalBatchData& value);
@@ -103,6 +112,18 @@ class RunningTransaction : public std::enable_shared_from_this<RunningTransactio
              TransactionStatusCallback callback,
              std::unique_lock<std::mutex>* lock);
 
+  Status CheckPromotionAllowed() {
+    if (last_known_status_ == TransactionStatus::ABORTED) {
+      return STATUS_FORMAT(
+          IllegalState, Format("Transaction $0 in ABORTED state. Cannot be promoted.", id()));
+    }
+    if (abort_request_in_progress_) {
+      return STATUS_FORMAT(
+          IllegalState, Format("Request to abort txn $0 in progress. Cannot be promoted.", id()));
+    }
+    return Status::OK();
+  }
+
   std::string ToString() const;
   void ScheduleRemoveIntents(const RunningTransactionPtr& shared_self, RemoveReason reason);
 
@@ -114,34 +135,51 @@ class RunningTransaction : public std::enable_shared_from_this<RunningTransactio
 
   void SetApplyOpId(const OpId& id);
 
-  const OpId& GetApplyOpId() {
+  const OpId& GetApplyOpId() const {
     return apply_record_op_id_;
+  }
+
+  HybridTime GetCommitHybridTime() {
+    return apply_data_.commit_ht;
+  }
+
+  HybridTime GetApplyHybridTime() {
+    return apply_data_.log_ht;
   }
 
   // Whether this transactions is currently applying intents.
   bool ProcessingApply() const;
 
-  void UpdateTransactionStatusLocation(const TabletId& new_status_tablet);
+  void UpdateTransactionPromoting(const TabletId& new_status_tablet);
 
   std::string LogPrefix() const;
 
   const TabletId& status_tablet() const;
 
+  void SetTxnLoadedWithCDC();
+
+  bool IsTxnLoadedWithCDC() const;
+
+  void MarkHasRetryableRequestsReplicated();
+
+  bool HasRetryableRequestsReplicated() const;
+
  private:
-  static boost::optional<TransactionStatus> GetStatusAt(
-      HybridTime time,
-      HybridTime last_known_status_hybrid_time,
-      TransactionStatus last_known_status,
-      bool external_transaction);
+  static std::optional<TransactionStatus> GetStatusAt(
+      HybridTime time, HybridTime last_known_status_hybrid_time,
+      TransactionStatus last_known_status);
 
-  void SendStatusRequest(int64_t serial_no, const RunningTransactionPtr& shared_self);
+  void SendStatusRequest(
+      const TabletId& status_tablet, int64_t serial_no, const RunningTransactionPtr& shared_self);
 
-  void StatusReceived(const Status& status,
+  void StatusReceived(const TabletId& status_tablet,
+                      const Status& status,
                       const tserver::GetTransactionStatusResponsePB& response,
                       int64_t serial_no,
                       const RunningTransactionPtr& shared_self);
 
-  void DoStatusReceived(const Status& status,
+  void DoStatusReceived(const TabletId& status_tablet,
+                        const Status& status,
                         const tserver::GetTransactionStatusResponsePB& response,
                         int64_t serial_no,
                         const RunningTransactionPtr& shared_self);
@@ -154,27 +192,36 @@ class RunningTransaction : public std::enable_shared_from_this<RunningTransactio
   // Notify provided status waiters.
   void NotifyWaiters(int64_t serial_no, HybridTime time_of_status,
                      TransactionStatus transaction_status,
-                     const AbortedSubTransactionSet& aborted_subtxn_set,
-                     const std::vector<StatusRequest>& status_waiters);
+                     const SubtxnSet& aborted_subtxn_set,
+                     const std::vector<StatusRequest>& status_waiters,
+                     const Status& expected_deadlock_status,
+                     PgSessionRequestVersion pg_session_req_version);
 
   static Result<TransactionStatusResult> MakeAbortResult(
       const Status& status,
       const tserver::AbortTransactionResponsePB& response);
 
-  void AbortReceived(const Status& status,
-                     const tserver::AbortTransactionResponsePB& response,
-                     const RunningTransactionPtr& shared_self);
+  void AbortReceived(const TabletId& status_tablet,
+                     const Status& status,
+                     const tserver::AbortTransactionResponsePB& response);
 
   TransactionMetadata metadata_;
   TransactionalBatchData last_batch_data_;
   OneWayBitmap replicated_batches_;
   RunningTransactionContext& context_;
+  std::weak_ptr<void> weak_context_;
   RemoveIntentsTask remove_intents_task_;
   HybridTime local_commit_time_ = HybridTime::kInvalid;
 
   TransactionStatus last_known_status_ = TransactionStatus::CREATED;
   HybridTime last_known_status_hybrid_time_ = HybridTime::kMin;
-  AbortedSubTransactionSet last_known_aborted_subtxn_set_;
+  SubtxnSet last_known_aborted_subtxn_set_;
+  // Status containing the deadlock info if the transaction was aborted due to a deadlock.
+  // Defaults to Status::OK() in all other cases.
+  Status last_known_deadlock_status_ = Status::OK();
+  // Only relevant for docdb transactions of type PgClientSessionKind::kPgSession. The field is
+  // used by the the wait-queue to resume deadlocked session advisory lock requests.
+  PgSessionRequestVersion last_known_pg_session_req_version_ = 0;
   std::vector<StatusRequest> status_waiters_;
   rpc::Rpcs::Handle get_status_handle_;
   rpc::Rpcs::Handle abort_handle_;
@@ -189,6 +236,27 @@ class RunningTransaction : public std::enable_shared_from_this<RunningTransactio
 
   // Time of the next check whether this transaction has been aborted.
   HybridTime abort_check_ht_;
+  // Is true if an external request to abort the transaction is in progress i.e. AbortTransaction
+  // rpc to the transaction coordinator is in progress. Gets set in RunningTransaction::Abort and
+  // reset in RunningTransaction::AbortReceived.
+  bool abort_request_in_progress_ = false;
+
+  // Hybrid time of first write batch to this particular tablet.
+  HybridTime first_write_ht_;
+
+  // Number of outstanding status request rpcs.
+  std::atomic<int64_t> outstanding_status_requests_{0};
+
+  // Identification marker for transactions that are loaded on tablet bootstrap with CDC
+  // enbled.
+  bool is_txn_loaded_with_cdc_ = false;
+
+  // Whether or not transaction has any batches replicated by retryable requests.
+  bool has_retryable_requests_replicated_ = false;
+
+  FastModeTransactionScope fast_mode_scope_;
+
+  AtomicGaugePtr<uint64_t> metric_aborted_transactions_pending_cleanup_;
 };
 
 Status MakeAbortedStatus(const TransactionId& id);

@@ -15,9 +15,9 @@
 // specific language governing permissions and limitations
 // under the License.
 //
-// The following only applies to changes made to this file as part of YugaByte development.
+// The following only applies to changes made to this file as part of YugabyteDB development.
 //
-// Portions Copyright (c) YugaByte, Inc.
+// Portions Copyright (c) YugabyteDB, Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License"); you may not use this file except
 // in compliance with the License.  You may obtain a copy of the License at
@@ -33,12 +33,12 @@
 #pragma once
 
 #include <atomic>
-#include <chrono>
 #include <string>
 #include <vector>
 
-#include <glog/logging.h>
+#include <boost/regex.hpp>
 
+#include "yb/util/logging.h"
 #include "yb/util/monotime.h"
 #include "yb/util/status_fwd.h"
 
@@ -65,30 +65,41 @@ class StringVectorSink : public google::LogSink {
   std::vector<std::string> logged_msgs_;
 };
 
-// GLog sink that waits for specified string to appear in log.
-class StringWaiterLogSink : public google::LogSink {
+// GLog sink that waits for specified pattern to appear in log.
+template<class Pattern>
+class PatternWaiterLogSink : public google::LogSink {
  public:
-  explicit StringWaiterLogSink(const std::string& string_to_wait)
-      : string_to_wait_(string_to_wait) {
+  explicit PatternWaiterLogSink(const std::string& pattern)
+      : pattern_source_(pattern), pattern_to_wait_for_(pattern) {
     google::AddLogSink(this);
   }
 
-  // Wait for string_to_wait to occur in log.
+  // Wait for string_to_wait to occur at least once in log.
   Status WaitFor(MonoDelta timeout);
 
   void send(
       google::LogSeverity severity, const char* full_filename, const char* base_filename, int line,
       const struct ::tm* tm_time, const char* message, size_t message_len) override;
 
-  bool IsEventOccurred() { return event_occurred_; }
+  bool IsEventOccurred() { return GetEventCount() > 0; }
+  int64_t GetEventCount() { return event_count_.load(); }
 
-  ~StringWaiterLogSink() { google::RemoveLogSink(this); }
+  ~PatternWaiterLogSink() override { google::RemoveLogSink(this); }
 
  private:
   static const char* kWaitingMessage;
-  std::string string_to_wait_;
-  std::atomic<bool> event_occurred_{false};
+  // Stores the original pattern provided to constructor.
+  // For PatternWaiterLogSink<std::regex> this is raw (uncompiled) regex, for
+  // PatternWaiterLogSink<std::string> this is the same string pattern we are waiting for.
+  std::string pattern_source_;
+  Pattern pattern_to_wait_for_;
+  std::atomic<int64_t> event_count_{0};
 };
+
+using StringWaiterLogSink = PatternWaiterLogSink<std::string>;
+// We use boost::regex here instead of std::regex to avoid a bug where gcc's std::regex crashes due
+// to running out of stack space when it is applied to too large of an input.
+using RegexWaiterLogSink = PatternWaiterLogSink<boost::regex>;
 
 // RAII wrapper around registering a LogSink with GLog.
 struct ScopedRegisterSink {

@@ -1,5 +1,5 @@
 /*
- * Copyright 2020 YugaByte, Inc. and Contributors
+ * Copyright 2020 YugabyteDB, Inc. and Contributors
  *
  * Licensed under the Polyform Free Trial License 1.0.0 (the "License"); you
  * may not use this file except in compliance with the License. You
@@ -18,23 +18,25 @@ import com.yugabyte.yw.common.alerts.AlertChannelEmailParams;
 import com.yugabyte.yw.common.alerts.AlertChannelInterface;
 import com.yugabyte.yw.common.alerts.AlertChannelManager;
 import com.yugabyte.yw.common.alerts.AlertChannelService;
+import com.yugabyte.yw.common.alerts.AlertChannelTemplateService;
 import com.yugabyte.yw.common.alerts.AlertConfigurationService;
 import com.yugabyte.yw.common.alerts.AlertDestinationService;
 import com.yugabyte.yw.common.alerts.AlertNotificationContext;
 import com.yugabyte.yw.common.alerts.AlertNotificationReport;
 import com.yugabyte.yw.common.alerts.AlertService;
-import com.yugabyte.yw.common.alerts.AlertUtils;
 import com.yugabyte.yw.common.metrics.MetricLabelsBuilder;
 import com.yugabyte.yw.common.metrics.MetricService;
+import com.yugabyte.yw.forms.AlertChannelTemplatesExt;
 import com.yugabyte.yw.forms.AlertingData;
 import com.yugabyte.yw.models.Alert;
 import com.yugabyte.yw.models.Alert.State;
-import com.yugabyte.yw.models.configs.CustomerConfig;
 import com.yugabyte.yw.models.AlertChannel;
+import com.yugabyte.yw.models.AlertChannel.ChannelType;
 import com.yugabyte.yw.models.AlertConfiguration;
 import com.yugabyte.yw.models.AlertDestination;
 import com.yugabyte.yw.models.Customer;
 import com.yugabyte.yw.models.Metric;
+import com.yugabyte.yw.models.configs.CustomerConfig;
 import com.yugabyte.yw.models.filters.AlertFilter;
 import com.yugabyte.yw.models.helpers.KnownAlertLabels;
 import com.yugabyte.yw.models.helpers.PlatformMetrics;
@@ -53,7 +55,7 @@ import javax.inject.Singleton;
 import lombok.AllArgsConstructor;
 import lombok.Value;
 import lombok.extern.slf4j.Slf4j;
-import org.apache.commons.collections.CollectionUtils;
+import org.apache.commons.collections4.CollectionUtils;
 import org.apache.commons.lang3.StringUtils;
 import play.libs.Json;
 
@@ -66,6 +68,7 @@ public class AlertManager {
   private final EmailHelper emailHelper;
   private final AlertConfigurationService alertConfigurationService;
   private final AlertChannelService alertChannelService;
+  private final AlertChannelTemplateService alertChannelTemplateService;
   private final AlertDestinationService alertDestinationService;
   private final AlertChannelManager channelsManager;
   private final AlertService alertService;
@@ -77,6 +80,7 @@ public class AlertManager {
       AlertService alertService,
       AlertConfigurationService alertConfigurationService,
       AlertChannelService alertChannelService,
+      AlertChannelTemplateService alertChannelTemplateService,
       AlertDestinationService alertDestinationService,
       AlertChannelManager channelsManager,
       MetricService metricService) {
@@ -84,6 +88,7 @@ public class AlertManager {
     this.alertService = alertService;
     this.alertConfigurationService = alertConfigurationService;
     this.alertChannelService = alertChannelService;
+    this.alertChannelTemplateService = alertChannelTemplateService;
     this.alertDestinationService = alertDestinationService;
     this.channelsManager = channelsManager;
     this.metricService = metricService;
@@ -216,8 +221,7 @@ public class AlertManager {
     Set<UUID> customerUuids =
         toNotify.stream().map(Alert::getCustomerUUID).collect(Collectors.toSet());
     Map<UUID, AlertingData> alertingConfigByCustomer =
-        CustomerConfig.getAlertConfigs(customerUuids)
-            .stream()
+        CustomerConfig.getAlertConfigs(customerUuids).stream()
             .filter(config -> config.getData() != null)
             .collect(
                 Collectors.toMap(
@@ -293,7 +297,7 @@ public class AlertManager {
     List<AlertChannel> channels = new ArrayList<>(strategy.getDestination().getChannelsList());
 
     if ((channels.size() == 1)
-        && ("Email".equals(AlertUtils.getJsonTypeName(channels.get(0).getParams())))
+        && (channels.get(0).getParams().getChannelType().equals(ChannelType.Email))
         && ((AlertChannelEmailParams) channels.get(0).getParams()).isDefaultRecipients()
         && CollectionUtils.isEmpty(emailHelper.getDestinations(customer.getUuid()))) {
 
@@ -330,37 +334,38 @@ public class AlertManager {
           log.warn(String.format("Channel %s skipped: %s", channel.getUuid(), e.getMessage()), e);
         }
         perChannelStatus.put(channel.getName(), "Misconfigured alert channel");
-        handleChannelSendError(channel, report);
+        handleChannelSendError(customer, channel, report);
         continue;
       }
 
       try {
-        AlertChannelInterface handler =
-            channelsManager.get(AlertUtils.getJsonTypeName(channel.getParams()));
-        handler.sendNotification(customer, tempAlert, channel);
+        ChannelType channelType = channel.getParams().getChannelType();
+        AlertChannelTemplatesExt channelTemplates =
+            alertChannelTemplateService.getWithDefaults(channel.getCustomerUUID(), channelType);
+
+        AlertChannelInterface handler = channelsManager.get(channelType.name());
+        handler.sendNotification(customer, tempAlert, channel, channelTemplates);
         atLeastOneSucceeded = true;
         perChannelStatus.put(channel.getName(), "Alert sent successfully");
-        setOkChannelStatusMetric(PlatformMetrics.ALERT_MANAGER_CHANNEL_STATUS, channel);
+        setOkChannelStatusMetric(PlatformMetrics.ALERT_MANAGER_CHANNEL_STATUS, customer, channel);
       } catch (PlatformServiceException e) {
         if (report.failuresByChannel(channel.getUuid()) == 0) {
           log.error(e.getMessage(), e);
         }
         perChannelStatus.put(channel.getName(), e.getMessage());
-        handleChannelSendError(channel, report);
+        handleChannelSendError(customer, channel, report);
       } catch (Exception e) {
         if (report.failuresByChannel(channel.getUuid()) == 0) {
           log.error(e.getMessage(), e);
         }
         perChannelStatus.put(channel.getName(), "Error sending notification: " + e.getMessage());
-        handleChannelSendError(channel, report);
+        handleChannelSendError(customer, channel, report);
       }
     }
 
     String resultMessage =
         "Result: "
-            + perChannelStatus
-                .entrySet()
-                .stream()
+            + perChannelStatus.entrySet().stream()
                 .sorted(Entry.comparingByKey())
                 .map(e -> e.getKey() + " - " + e.getValue())
                 .collect(Collectors.joining("; "));
@@ -369,31 +374,34 @@ public class AlertManager {
         : new SendNotificationResult(SendNotificationStatus.FAILED_TO_RESCHEDULE, resultMessage);
   }
 
-  private void handleChannelSendError(AlertChannel channel, AlertNotificationReport report) {
+  private void handleChannelSendError(
+      Customer customer, AlertChannel channel, AlertNotificationReport report) {
     report.failChannel(channel.getUuid());
-    setChannelStatusMetric(PlatformMetrics.ALERT_MANAGER_CHANNEL_STATUS, channel, false);
+    setChannelStatusMetric(PlatformMetrics.ALERT_MANAGER_CHANNEL_STATUS, customer, channel, false);
   }
 
   @VisibleForTesting
-  void setOkChannelStatusMetric(PlatformMetrics metric, AlertChannel channel) {
-    setChannelStatusMetric(metric, channel, true);
+  void setOkChannelStatusMetric(PlatformMetrics metric, Customer customer, AlertChannel channel) {
+    setChannelStatusMetric(metric, customer, channel, true);
   }
 
   @VisibleForTesting
-  void setChannelStatusMetric(PlatformMetrics metric, AlertChannel channel, boolean isSuccess) {
-    Metric statusMetric = buildMetricTemplate(metric, channel).setValue(isSuccess ? 1.0 : 0.0);
+  void setChannelStatusMetric(
+      PlatformMetrics metric, Customer customer, AlertChannel channel, boolean isSuccess) {
+    Metric statusMetric =
+        buildMetricTemplate(metric, customer, channel).setValue(isSuccess ? 1.0 : 0.0);
     metricService.save(statusMetric);
   }
 
-  private Metric buildMetricTemplate(PlatformMetrics metric, AlertChannel channel) {
+  private Metric buildMetricTemplate(
+      PlatformMetrics metric, Customer customer, AlertChannel channel) {
     return new Metric()
         .setExpireTime(
             nowPlusWithoutMillis(MetricService.DEFAULT_METRIC_EXPIRY_SEC, ChronoUnit.SECONDS))
         .setCustomerUUID(channel.getCustomerUUID())
-        .setType(Metric.Type.GAUGE)
         .setName(metric.getMetricName())
         .setSourceUuid(channel.getUuid())
-        .setLabels(MetricLabelsBuilder.create().appendSource(channel).getMetricLabels());
+        .setLabels(MetricLabelsBuilder.create().fromChannel(customer, channel).getMetricLabels());
   }
 
   @Value

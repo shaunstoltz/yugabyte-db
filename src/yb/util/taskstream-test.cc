@@ -15,9 +15,9 @@
 // specific language governing permissions and limitations
 // under the License.
 //
-// The following only applies to changes made to this file as part of YugaByte development.
+// The following only applies to changes made to this file as part of YugabyteDB development.
 //
-// Portions Copyright (c) YugaByte, Inc.
+// Portions Copyright (c) YugabyteDB, Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License"); you may not use this file except
 // in compliance with the License.  You may obtain a copy of the License at
@@ -39,7 +39,7 @@
 #include <vector>
 
 #include "yb/util/flags.h"
-#include <glog/logging.h>
+#include "yb/util/logging.h"
 #include <gtest/gtest.h>
 
 #include "yb/gutil/atomicops.h"
@@ -53,16 +53,10 @@
 #include "yb/util/threadpool.h"
 
 using std::atomic;
-using std::shared_ptr;
 using std::string;
-using std::thread;
 using std::unique_ptr;
-using std::vector;
 
-using strings::Substitute;
 DECLARE_bool(enable_tracing);
-
-using std::shared_ptr;
 
 namespace yb {
 
@@ -80,7 +74,7 @@ static Status BuildMinMaxTestPool(
 class TestTaskStream : public ::testing::Test {
  public:
   TestTaskStream() {
-    FLAGS_enable_tracing = true;
+    ANNOTATE_UNPROTECTED_WRITE(FLAGS_enable_tracing) = true;
   }
  protected:
   const int32_t kTaskstreamQueueMaxSize = 100000;

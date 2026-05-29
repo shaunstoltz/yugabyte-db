@@ -1,5 +1,5 @@
 //
-// Copyright (c) YugaByte, Inc.
+// Copyright (c) YugabyteDB, Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License"); you may not use this file except
 // in compliance with the License.  You may obtain a copy of the License at
@@ -33,6 +33,8 @@ namespace yb {
 class MultiDriveTestEnvBase {
  public:
   void AddFailedPath(const std::string& path);
+
+  void RemoveFailedPath(const std::string& path);
 
  protected:
   Status FailureStatus(const std::string& filename) const;

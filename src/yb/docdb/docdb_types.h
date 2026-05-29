@@ -1,4 +1,4 @@
-// Copyright (c) YugaByte, Inc.
+// Copyright (c) YugabyteDB, Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License"); you may not use this file except
 // in compliance with the License.  You may obtain a copy of the License at
@@ -20,6 +20,8 @@
 namespace yb {
 namespace docdb {
 
+YB_STRONGLY_TYPED_BOOL(AllowEmptyValue);
+
 // Used in various debug dump functions to specify whether to include binary representation in the
 // output.
 YB_STRONGLY_TYPED_BOOL(IncludeBinary);
@@ -28,14 +30,16 @@ YB_STRONGLY_TYPED_BOOL(IncludeBinary);
 YB_DEFINE_ENUM(StorageDbType, (kRegular)(kIntents));
 
 // Type of keys written by DocDB into RocksDB.
-YB_DEFINE_ENUM(
-    KeyType,
+YB_DEFINE_ENUM(KeyType,
     (kEmpty)
     (kIntentKey)
     (kReverseTxnKey)
     (kPlainSubDocKey)
     (kTransactionMetadata)
-    (kExternalIntents));
+    (kPostApplyTransactionMetadata)
+    (kExternalIntents)
+    (kApplyState)
+    (kVectorIndexMetadata));
 
 // ------------------------------------------------------------------------------------------------
 // Bounds

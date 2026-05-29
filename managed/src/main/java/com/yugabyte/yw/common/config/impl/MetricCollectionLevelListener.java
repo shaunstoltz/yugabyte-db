@@ -1,5 +1,5 @@
 /*
- * Copyright 2021 YugaByte, Inc. and Contributors
+ * Copyright 2021 YugabyteDB, Inc. and Contributors
  *
  * Licensed under the Polyform Free Trial License 1.0.0 (the "License"); you
  * may not use this file except in compliance with the License. You
@@ -31,7 +31,7 @@ public class MetricCollectionLevelListener implements RuntimeConfigChangeListene
     Set<Universe> universes = Universe.getAllWithoutResources();
     universes.forEach(
         universe -> {
-          universe.updateSwamperConfigWritten(false);
+          universe.setSwamperConfigWritten(false);
           universe.save();
         });
   }
@@ -42,14 +42,14 @@ public class MetricCollectionLevelListener implements RuntimeConfigChangeListene
     Set<Universe> universes = Universe.getAllWithoutResources(customer);
     universes.forEach(
         universe -> {
-          universe.updateSwamperConfigWritten(false);
+          universe.setSwamperConfigWritten(false);
           universe.save();
         });
   }
 
   @Override
   public void processUniverse(Universe universe) {
-    universe.updateSwamperConfigWritten(false);
+    universe.setSwamperConfigWritten(false);
     universe.save();
   }
 }

@@ -15,9 +15,9 @@
 // specific language governing permissions and limitations
 // under the License.
 //
-// The following only applies to changes made to this file as part of YugaByte development.
+// The following only applies to changes made to this file as part of YugabyteDB development.
 //
-// Portions Copyright (c) YugaByte, Inc.
+// Portions Copyright (c) YugabyteDB, Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License"); you may not use this file except
 // in compliance with the License.  You may obtain a copy of the License at
@@ -42,7 +42,7 @@
 #include <unordered_set>
 #include <vector>
 
-#include <glog/logging.h>
+#include "yb/util/logging.h"
 #include <google/protobuf/descriptor.pb.h>
 #include <google/protobuf/descriptor_database.h>
 #include <google/protobuf/dynamic_message.h>
@@ -66,6 +66,7 @@
 #include "yb/util/env.h"
 #include "yb/util/env_util.h"
 #include "yb/util/flags.h"
+#include "yb/util/flag_validators.h"
 #include "yb/util/path_util.h"
 #include "yb/util/pb_util-internal.h"
 #include "yb/util/pb_util.pb.h"
@@ -101,12 +102,10 @@ using std::ostream;
 using strings::Substitute;
 using strings::Utf8SafeCEscape;
 
-using yb::operator"" _MB;
+using yb::operator""_MB;
 
 DEFINE_test_flag(bool, fail_write_pb_container, false,
                  "Simulate a failure during WritePBContainer.");
-
-static const char* const kTmpTemplateSuffix = ".tmp.XXXXXX";
 
 // Protobuf container constants.
 static const int kPBContainerVersion = 1;
@@ -120,14 +119,31 @@ static const int kPBContainerChecksumLen = sizeof(uint32_t);
 COMPILE_ASSERT((arraysize(kPBContainerMagic) - 1) == kPBContainerMagicLen,
                kPBContainerMagic_does_not_match_expected_length);
 
+// Maximum size of RPC should be larger than size of consensus batch
+// At each layer, we embed the "message" from the previous layer.
+// In order to send three strings of 64, the request from cql/redis will be larger
+// than that because we will have overheads from that layer.
+// Hence, we have a limit of 254MB at the consensus layer.
+// The rpc layer adds its own headers, so we limit the rpc message size to 255MB.
+DEFINE_NON_RUNTIME_uint64(rpc_max_message_size, 255_MB,
+    "The maximum size of a message of any RPC that the server will accept. The sum of "
+    "consensus_max_batch_size_bytes and 1MB should be less than rpc_max_message_size. "
+    "This value must also be less than protobuf_message_total_bytes_limit.");
+
 // To permit parsing of very large PB messages, we must use parse through a CodedInputStream and
 // bump the byte limit. The SetTotalBytesLimit() docs say that 512MB is the shortest theoretical
 // message length that may produce integer overflow warnings, so that's what we'll use.
-DEFINE_UNKNOWN_int32(
-    protobuf_message_total_bytes_limit, 511_MB,
-    "Limits single protobuf message size for deserialization.");
+DEFINE_NON_RUNTIME_uint32(protobuf_message_total_bytes_limit, 511_MB,
+    "Limits single protobuf message size for deserialization. This value must be greater than "
+    "rpc_max_message_size and less than 512MB.");
 TAG_FLAG(protobuf_message_total_bytes_limit, advanced);
 TAG_FLAG(protobuf_message_total_bytes_limit, hidden);
+
+DEFINE_validator(rpc_max_message_size, FLAG_LT_FLAG_VALIDATOR(protobuf_message_total_bytes_limit));
+
+DEFINE_validator(protobuf_message_total_bytes_limit,
+    FLAG_GT_FLAG_VALIDATOR(rpc_max_message_size),
+    FLAG_LT_VALUE_VALIDATOR(512_MB));
 
 namespace yb {
 namespace pb_util {
@@ -186,7 +202,7 @@ Status DoAppendPartialToString(const MessageLite &msg, Out* output) {
   auto old_size = output->size();
   int byte_size = msg.ByteSize();
 
-  if (std_util::cmp_greater(byte_size, FLAGS_protobuf_message_total_bytes_limit)) {
+  if (std::cmp_greater(byte_size, FLAGS_protobuf_message_total_bytes_limit)) {
     return STATUS_FORMAT(
         InternalError, "Serialized protobuf message is too big: $0 > $1", byte_size,
         FLAGS_protobuf_message_total_bytes_limit);
@@ -229,7 +245,7 @@ bool ParseFromSequentialFile(MessageLite *msg, SequentialFile *rfile) {
 
 Status ParseFromArray(MessageLite* msg, const uint8_t* data, size_t length) {
   CodedInputStream in(data, narrow_cast<uint32_t>(length));
-  in.SetTotalBytesLimit(FLAGS_protobuf_message_total_bytes_limit, -1);
+  in.SetTotalBytesLimit(FLAGS_protobuf_message_total_bytes_limit);
   // Parse data into protobuf message
   if (!msg->ParseFromCodedStream(&in)) {
     return STATUS(Corruption, "Error parsing msg", InitializationErrorMessage("parse", *msg));
@@ -240,7 +256,7 @@ Status ParseFromArray(MessageLite* msg, const uint8_t* data, size_t length) {
 Status WritePBToPath(Env* env, const std::string& path,
                      const MessageLite& msg,
                      SyncMode sync) {
-  const string tmp_template = path + kTmpTemplateSuffix;
+  const string tmp_template = MakeTempPath(path);
   string tmp_path;
 
   std::unique_ptr<WritableFile> file;
@@ -375,7 +391,7 @@ Status WritablePBContainerFile::Flush() {
   DCHECK(!closed_);
 
   // TODO: Flush just the dirty bytes.
-  RETURN_NOT_OK_PREPEND(writer_->Flush(WritableFile::FLUSH_ASYNC), "Failed to Flush() file");
+  RETURN_NOT_OK_PREPEND(writer_->Flush(), "Failed to Flush() file");
 
   return Status::OK();
 }
@@ -565,7 +581,7 @@ Status ReadablePBContainerFile::ReadNextPB(Message* msg) {
 
   ArrayInputStream ais(body.data(), narrow_cast<int>(body.size()));
   CodedInputStream cis(&ais);
-  cis.SetTotalBytesLimit(FLAGS_protobuf_message_total_bytes_limit, -1);
+  cis.SetTotalBytesLimit(FLAGS_protobuf_message_total_bytes_limit);
   if (PREDICT_FALSE(!msg->ParseFromCodedStream(&cis))) {
     return STATUS(IOError, "Unable to parse PB from path", reader_->filename());
   }
@@ -640,8 +656,8 @@ Status ReadablePBContainerFile::ValidateAndRead(size_t length, EofOK eofOK,
       case EOF_NOT_OK:
         return STATUS(Corruption, "File size not large enough to be valid",
                                   Substitute("Proto container file $0: "
-                                      "tried to read $0 bytes at offset "
-                                      "$1 but file size is only $2",
+                                      "tried to read $1 bytes at offset "
+                                      "$2 but file size is only $3",
                                       reader_->filename(), length,
                                       offset_, file_size));
       default:
@@ -710,7 +726,7 @@ Status WritePBContainerToPath(Env* env, const std::string& path,
     return STATUS(AlreadyPresent, Substitute("File $0 already exists", path));
   }
 
-  const string tmp_template = path + kTmpTemplateSuffix;
+  const string tmp_template = MakeTempPath(path);
   string tmp_path;
 
   std::unique_ptr<WritableFile> file;

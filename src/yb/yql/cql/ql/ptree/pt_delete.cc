@@ -1,5 +1,5 @@
 //--------------------------------------------------------------------------------------------------
-// Copyright (c) YugaByte, Inc.
+// Copyright (c) YugabyteDB, Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License"); you may not use this file except
 // in compliance with the License.  You may obtain a copy of the License at
@@ -176,11 +176,12 @@ void PTDeleteStmt::PrintSemanticAnalysisResult(SemContext *sem_context) {
 ExplainPlanPB PTDeleteStmt::AnalysisResultToPB() {
   ExplainPlanPB explain_plan;
   DeletePlanPB *delete_plan = explain_plan.mutable_delete_plan();
-  delete_plan->set_delete_type("Delete on " + table_name().ToString());
+  auto table_name = this->table_name().ToString(false);
+  delete_plan->set_delete_type("Delete on " + table_name);
   if (modifies_multiple_rows_) {
-    delete_plan->set_scan_type("  ->  Range Scan on " + table_name().ToString());
+    delete_plan->set_scan_type("  ->  Range Scan on " + table_name);
   } else {
-    delete_plan->set_scan_type("  ->  Primary Key Lookup on " + table_name().ToString());
+    delete_plan->set_scan_type("  ->  Primary Key Lookup on " + table_name);
   }
   std::string key_conditions = "        Key Conditions: " + ConditionsToString(key_where_ops());
   delete_plan->set_key_conditions(key_conditions);

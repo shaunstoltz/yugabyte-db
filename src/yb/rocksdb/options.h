@@ -6,9 +6,9 @@
 // Use of this source code is governed by a BSD-style license that can be
 // found in the LICENSE file. See the AUTHORS file for names of contributors.
 //
-// The following only applies to changes made to this file as part of YugaByte development.
+// The following only applies to changes made to this file as part of YugabyteDB development.
 //
-// Portions Copyright (c) YugaByte, Inc.
+// Portions Copyright (c) YugabyteDB, Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License"); you may not use this file except
 // in compliance with the License.  You may obtain a copy of the License at
@@ -31,28 +31,34 @@
 #include <limits>
 #include <unordered_map>
 
+#include "yb/common/entity_ids_types.h"
+
 #include "yb/rocksdb/rocksdb_fwd.h"
 #include "yb/rocksdb/cache.h"
 #include "yb/rocksdb/listener.h"
+#include "yb/rocksdb/metadata.h"
 #include "yb/rocksdb/universal_compaction.h"
 
 #include "yb/util/slice.h"
+#include "yb/util/strongly_typed_bool.h"
 
 #ifdef max
 #undef max
 #endif
 
+// TODO: forward declarations should be moved to "yb/rocksdb/rocksdb_fwd.h".
 namespace yb {
 
 class MemTracker;
 class PriorityThreadPool;
+class PriorityThreadPoolToken;
+using PriorityThreadPoolTokenPtr = std::shared_ptr<PriorityThreadPoolToken>;
 
 }
 
 namespace rocksdb {
 
 class Arena;
-class BoundaryValuesExtractor;
 class Cache;
 class CompactionFilter;
 class CompactionFilterFactory;
@@ -111,11 +117,11 @@ enum CompactionStyle : char {
   kCompactionStyleNone = 0x3,
 };
 
-// In Level-based comapction, it Determines which file from a level to be
+// In Level-based compaction, it Determines which file from a level to be
 // picked to merge to the next level. We suggest people try
 // kMinOverlappingRatio first when you tune your database.
 enum CompactionPri : char {
-  // Slightly Priotize larger files by size compensated by #deletes
+  // Slightly Prioritize larger files by size compensated by #deletes
   kByCompensatedSize = 0x0,
   // First compact files whose data's latest update time is oldest.
   // Try this if you only update some hot keys in small ranges.
@@ -234,7 +240,7 @@ struct ColumnFamilyOptions {
   // the same DB. The only exception is reserved for upgrade, where a DB
   // previously without a merge operator is introduced to Merge operation
   // for the first time. It's necessary to specify a merge operator when
-  // openning the DB in this case.
+  // opening the DB in this case.
   // Default: nullptr
   std::shared_ptr<MergeOperator> merge_operator;
 
@@ -299,9 +305,13 @@ struct ColumnFamilyOptions {
   // Dynamically changeable through SetOptions() API
   int max_write_buffer_number;
 
+  // The limit for the number of bytes in immutable mem tables.
+  // After reaching this limit new writes are blocked.
+  size_t max_flushing_bytes = std::numeric_limits<size_t>::max();
+
   // The minimum number of write buffers that will be merged together
   // before writing to storage.  If set to 1, then
-  // all write buffers are fushed to L0 as individual files and this increases
+  // all write buffers are flushed to L0 as individual files and this increases
   // read amplification because a get request has to check in all of these
   // files. Also, an in-memory merge may result in writing lesser
   // data to storage if there are duplicate records in each of these
@@ -600,7 +610,7 @@ struct ColumnFamilyOptions {
   // Dynamically changeable through SetOptions() API
   bool disable_auto_compactions;
 
-  // DEPREACTED
+  // DEPRECATED
   // Does not have any effect.
   bool purge_redundant_kvs_while_flush;
 
@@ -821,13 +831,16 @@ struct ColumnFamilyOptions {
   void Dump(Logger* log) const;
 };
 
-typedef std::function<yb::Result<bool>(const MemTable&)> MemTableFilter;
+using MemTableFilter = std::function<yb::Result<bool>(const MemTable&, bool)>;
 
 using IteratorReplacer =
-    std::function<InternalIterator*(InternalIterator*, Arena*, const Slice&)>;
+    std::function<InternalIterator*(InternalIterator*, Arena*, Slice)>;
 
 using CompactionContextFactory = std::function<CompactionContextPtr(
     CompactionFeed* feed, const CompactionContextOptions& options)>;
+
+using CompactionFileExcluder = std::function<bool(const FileMetaData&)>;
+using CompactionFileExcluderPtr = std::shared_ptr<CompactionFileExcluder>;
 
 struct DBOptions {
   // Some functions that make it easier to optimize RocksDB
@@ -1328,9 +1341,10 @@ struct DBOptions {
 
   std::shared_ptr<CompactionContextFactory> compaction_context_factory;
 
-  // Function that returns max file size for compaction.
+  // Function that check if file is not eligible for a compaction. Actively used by
+  // File TTL expiration to check max file size for compaction.
   // Supported only for level0 of universal style compactions.
-  std::shared_ptr<std::function<uint64_t()>> max_file_size_for_compaction;
+  std::shared_ptr<CompactionFileExcluder> exclude_from_compaction;
 
   // Invoked after memtable switched.
   std::shared_ptr<std::function<MemTableFilter()>> mem_table_flush_filter_factory;
@@ -1338,11 +1352,17 @@ struct DBOptions {
   // A prefix for log messages, usually containing the tablet id.
   std::string log_prefix;
 
+  // Tablet id.
+  yb::TabletId tablet_id;
+
   // This RocksDB instance root mem tracker.
   std::shared_ptr<yb::MemTracker> mem_tracker;
 
-  // Specific mem tracker for block based tables created by this RocksDB instance.
+  // Specific mem tracker for block based table readers created by this RocksDB instance.
   std::shared_ptr<yb::MemTracker> block_based_table_mem_tracker;
+
+  // Specific mem tracker for block based table builders created by this RocksDB instance.
+  std::shared_ptr<yb::MemTracker> block_based_table_builder_mem_tracker;
 
   // Adds ability to modify iterator created for SST file.
   // For instance some additional filtering could be added.
@@ -1357,7 +1377,7 @@ struct DBOptions {
   // Metrics tracker for tasks in the priority thread pool.
   std::shared_ptr<RocksDBPriorityThreadPoolMetrics> priority_thread_pool_metrics;
 
-  // Used for identifying disk in priorty pool. This corresponds to the hashed
+  // Used for identifying disk in priority pool. This corresponds to the hashed
   // data root directory for the rocksdb instance.
   uint64_t disk_group_no;
 };
@@ -1411,14 +1431,31 @@ class ReadFileFilter {
   virtual ~ReadFileFilter() {}
 };
 
-class TableReader;
-class TableAwareReadFileFilter {
+// Cache filter key produced from user key by particular transformer.
+struct FilterKeyCache {
+  explicit FilterKeyCache(Slice user_key) : filter_key(user_key) {}
+
+  Slice filter_key;
+  const void* transformer = nullptr;
+
+  void Reset(Slice user_key) {
+    filter_key = user_key;
+    transformer = nullptr;
+  }
+};
+
+struct QueryOptions;
+
+class IteratorFilter {
  public:
-  virtual bool Filter(TableReader*) const = 0;
+  virtual bool Filter(
+      const QueryOptions& options, Slice user_key, FilterKeyCache* cache, void* context) const = 0;
 
  protected:
-  virtual ~TableAwareReadFileFilter() {}
+  virtual ~IteratorFilter() = default;
 };
+
+YB_STRONGLY_TYPED_BOOL(CacheRestartBlockKeys);
 
 // Options that control read operations
 struct ReadOptions {
@@ -1519,14 +1556,34 @@ struct ReadOptions {
 
   // Filter for pruning SST files. RocksDB user can provide its own implementation to exclude SST
   // files from being added to MergeIterator. By default doesn't filter files.
-  std::shared_ptr<TableAwareReadFileFilter> table_aware_file_filter;
+  const IteratorFilter* iterator_filter = nullptr;
+
+  Slice user_key_for_filter;
+
+  // Defer iterator filter checks to iteration phase. I.e. user could call UpdateFilterKey
+  // before Seek/Next, to recheck file filter for all SST files.
+  bool defer_iterator_filter = false;
 
   std::shared_ptr<ReadFileFilter> file_filter;
+
+  // Statistics object to use instead of the DB statistics object (default).
+  Statistics* statistics = nullptr;
+
+  // Whether entry keys to be cached per a restart block during iteration over that block.
+  CacheRestartBlockKeys cache_restart_block_keys = CacheRestartBlockKeys::kFalse;
 
   static const ReadOptions kDefault;
 
   ReadOptions();
   ReadOptions(bool cksum, bool cache);
+};
+
+struct QueryOptions {
+  QueryId query_id;
+  bool no_io = false;
+  Statistics* statistics = nullptr;
+
+  static QueryOptions FromReadOptions(const ReadOptions& read_options);
 };
 
 // Options that control write operations
@@ -1582,6 +1639,16 @@ struct FlushOptions {
   static constexpr int64_t kNeverIgnore = std::numeric_limits<int64_t>::max();
 
   int64_t ignore_if_flushed_after_tick = kNeverIgnore;
+
+  // Best-effort tag for observability (listeners, EVENT_LOG_v1, schedule VLOG(2) in `db_impl.cc`).
+  // Production DocDB/tablet code must pass an explicit reason via `FlushOptions(FlushReason)` (see
+  // `listener.h`). Default `kUnknown` is for legacy RocksDB tests and callers that intentionally
+  // omit a reason (often `kTestOnly` in YB tests).
+  FlushReason flush_reason = FlushReason::kUnknown;
+
+  FlushOptions() = default;
+
+  explicit FlushOptions(FlushReason reason) : flush_reason(reason) {}
 };
 
 // Get options based on some guidelines. Now only tune parameter based on
@@ -1644,9 +1711,20 @@ struct CompactRangeOptions {
   // if there is a compaction filter
   BottommostLevelCompaction bottommost_level_compaction =
       BottommostLevelCompaction::kIfHaveCompactionFilter;
-
+  // If true, flush does not happen during compaction. Currently used in tests only.
   bool skip_flush = false;
-
+  // Specifies the reason for this compaction.
   CompactionReason compaction_reason = CompactionReason::kManualCompaction;
+  // Defines the upper bound for the files set which should considered for a compaction.
+  uint64_t file_number_upper_bound = 0;
+  // Defines the maximum sum of files sizes picked for a one compaction job. Several jobs/iterations
+  // may be triggered to cover the whole set of files considered for a compaction. It is guaranteed
+  // to pick at least one file for a compaction job even if its size is above the specified limit.
+  uint64_t input_size_limit_per_job = 0;
+
+  // UNSAFE: Skip corrupt data blocks, this will result in data loss. Use with extra care only
+  // when/while there are no other options available.
+  SkipCorruptDataBlocksUnsafe skip_corrupt_data_blocks_unsafe = SkipCorruptDataBlocksUnsafe::kFalse;
 };
+
 }  // namespace rocksdb

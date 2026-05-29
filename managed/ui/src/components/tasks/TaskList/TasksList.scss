@@ -1,6 +1,6 @@
-/* Copyright (c) YugaByte, Inc. */
+/* Copyright (c) YugabyteDB, Inc. */
 
-@import '../../../_style/colors.scss';
+@use '../../../_style/colors.scss';
 
 .react-bs-table-search-form {
   .form-control {
@@ -13,4 +13,7 @@
   display: inline-block;
   text-align: center;
   vertical-align: middle;
+}
+.react-bs-table table th, .react-bs-table table td.task-type-column {
+  padding-left: 5px !important;
 }

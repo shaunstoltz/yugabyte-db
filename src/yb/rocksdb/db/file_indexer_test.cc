@@ -3,9 +3,9 @@
 //  LICENSE file in the root directory of this source tree. An additional grant
 //  of patent rights can be found in the PATENTS file in the same directory.
 //
-// The following only applies to changes made to this file as part of YugaByte development.
+// The following only applies to changes made to this file as part of YugabyteDB development.
 //
-// Portions Copyright (c) YugaByte, Inc.
+// Portions Copyright (c) YugabyteDB, Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License"); you may not use this file except
 // in compliance with the License.  You may obtain a copy of the License at
@@ -36,7 +36,7 @@ namespace rocksdb {
 
 class IntComparator : public Comparator {
  public:
-  int Compare(const Slice& a, const Slice& b) const override {
+  int Compare(Slice a, Slice b) const override {
     assert(a.size() == 8);
     assert(b.size() == 8);
     int64_t diff = *reinterpret_cast<const int64_t*>(a.data()) -

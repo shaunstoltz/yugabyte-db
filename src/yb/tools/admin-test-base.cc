@@ -1,4 +1,4 @@
-// Copyright (c) YugaByte, Inc.
+// Copyright (c) YugabyteDB, Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License"); you may not use this file except
 // in compliance with the License.  You may obtain a copy of the License at
@@ -20,18 +20,21 @@
 #include "yb/util/status_format.h"
 #include "yb/util/subprocess.h"
 
-namespace yb {
-namespace tools {
+namespace yb::tools {
 
 namespace {
 
 const char* const kAdminToolName = "yb-admin";
-
+const char* const kTSCliToolName = "yb-ts-cli";
 }
 
 // Figure out where the admin tool is.
 std::string AdminTestBase::GetAdminToolPath() const {
   return GetToolPath(kAdminToolName);
+}
+
+std::string AdminTestBase::GetTSCliToolPath() const {
+  return GetToolPath(kTSCliToolName);
 }
 
 std::string AdminTestBase::GetMasterAddresses() const {
@@ -45,23 +48,18 @@ std::string AdminTestBase::GetMasterAddresses() const {
   return result;
 }
 
-Result<std::string> AdminTestBase::CallAdminVec(const std::vector<std::string>& args) {
-  std::string result;
-  LOG(INFO) << "Execute: " << AsString(args);
-  auto status = Subprocess::Call(args, &result, StdFdTypes{StdFdType::kOut, StdFdType::kErr});
-  if (!status.ok()) {
-    return status.CloneAndAppend(result);
-  }
-  return result;
+std::string AdminTestBase::GetTServerAddress(int idx) const {
+  return AsString(cluster_->tablet_server(idx)->bound_rpc_addr());
 }
 
-Result<rapidjson::Document> AdminTestBase::ParseJson(const std::string& raw) {
-  rapidjson::Document result;
-  if (result.Parse(raw.c_str(), raw.length()).HasParseError()) {
-    return STATUS_FORMAT(
-        InvalidArgument, "Failed to parse json output $0: $1", result.GetParseError(), raw);
+Result<std::string> AdminTestBase::CallAdminVec(const std::vector<std::string>& args) {
+  std::string output, error;
+  LOG(INFO) << "Execute: " << AsString(args);
+  auto status = Subprocess::Call(args, &output, &error);
+  if (!status.ok()) {
+    return status.CloneAndAppend(error);
   }
-  return result;
+  return output;
 }
 
 Result<CassandraSession> AdminTestBase::CqlConnect(const std::string& db_name) {
@@ -81,21 +79,4 @@ Result<CassandraSession> AdminTestBase::CqlConnect(const std::string& db_name) {
   return result;
 }
 
-Result<const rapidjson::Value&> Get(const rapidjson::Value& value, const char* name) {
-  auto it = value.FindMember(name);
-  if (it == value.MemberEnd()) {
-    return STATUS_FORMAT(InvalidArgument, "Missing $0 field", name);
-  }
-  return it->value;
-}
-
-Result<rapidjson::Value&> Get(rapidjson::Value* value, const char* name) {
-  auto it = value->FindMember(name);
-  if (it.operator==(value->MemberEnd())) {
-    return STATUS_FORMAT(InvalidArgument, "Missing $0 field", name);
-  }
-  return it->value;
-}
-
-}  // namespace tools
-}  // namespace yb
+}  // namespace yb::tools

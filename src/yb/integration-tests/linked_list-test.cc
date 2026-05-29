@@ -15,9 +15,9 @@
 // specific language governing permissions and limitations
 // under the License.
 //
-// The following only applies to changes made to this file as part of YugaByte development.
+// The following only applies to changes made to this file as part of YugabyteDB development.
 //
-// Portions Copyright (c) YugaByte, Inc.
+// Portions Copyright (c) YugabyteDB, Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License"); you may not use this file except
 // in compliance with the License.  You may obtain a copy of the License at
@@ -47,7 +47,7 @@
 #include <functional>
 #include <set>
 
-#include <glog/logging.h>
+#include "yb/util/logging.h"
 #include <gtest/gtest.h>
 
 #include "yb/client/client-test-util.h"
@@ -84,17 +84,17 @@
 
 using namespace std::literals;
 
-DEFINE_UNKNOWN_int32(seconds_to_run, 5, "Number of seconds for which to run the test");
+DEFINE_NON_RUNTIME_int32(seconds_to_run, 5, "Number of seconds for which to run the test");
 
-DEFINE_UNKNOWN_int32(num_chains, 50, "Number of parallel chains to generate");
-DEFINE_UNKNOWN_int32(num_tablets, 3, "Number of tablets over which to split the data");
-DEFINE_UNKNOWN_bool(enable_mutation, true, "Enable periodic mutation of inserted rows");
-DEFINE_UNKNOWN_int32(num_snapshots, 3,
+DEFINE_NON_RUNTIME_int32(num_chains, 50, "Number of parallel chains to generate");
+DEFINE_NON_RUNTIME_int32(num_tablets, 3, "Number of tablets over which to split the data");
+DEFINE_NON_RUNTIME_bool(enable_mutation, true, "Enable periodic mutation of inserted rows");
+DEFINE_NON_RUNTIME_int32(num_snapshots, 3,
     "Number of snapshots to verify across replicas and reboots.");
 
-DEFINE_UNKNOWN_bool(stress_flush_compact, false,
+DEFINE_NON_RUNTIME_bool(stress_flush_compact, false,
             "Flush and compact way more aggressively to try to find bugs");
-DEFINE_UNKNOWN_bool(stress_wal_gc, false,
+DEFINE_NON_RUNTIME_bool(stress_wal_gc, false,
             "Set WAL segment size small so that logs will be GCed during the test");
 DECLARE_int32(replication_factor);
 DECLARE_string(ts_flags);
@@ -102,9 +102,6 @@ DECLARE_string(ts_flags);
 namespace yb {
 
 using yb::client::YBClient;
-using yb::client::YBClientBuilder;
-using yb::client::YBSchema;
-using yb::client::YBTableName;
 using std::shared_ptr;
 using std::string;
 using std::vector;
@@ -143,10 +140,10 @@ class LinkedListTester {
         client_(client) {
     client::YBSchemaBuilder b;
 
-    b.AddColumn(kKeyColumnName)->Type(INT64)->NotNull()->HashPrimaryKey();
-    b.AddColumn(kLinkColumnName)->Type(INT64)->NotNull();
-    b.AddColumn(kInsertTsColumnName)->Type(INT64)->NotNull();
-    b.AddColumn(kUpdatedColumnName)->Type(BOOL)->NotNull();
+    b.AddColumn(kKeyColumnName)->Type(DataType::INT64)->NotNull()->HashPrimaryKey();
+    b.AddColumn(kLinkColumnName)->Type(DataType::INT64)->NotNull();
+    b.AddColumn(kInsertTsColumnName)->Type(DataType::INT64)->NotNull();
+    b.AddColumn(kUpdatedColumnName)->Type(DataType::BOOL)->NotNull();
     CHECK_OK(b.Build(&schema_));
   }
 
@@ -333,7 +330,7 @@ class LinkedListChainGenerator {
     int64_t this_key = (Rand64() << 8) | chain_idx_;
     int64_t ts = GetCurrentTimeMicros();
 
-    auto insert = table.NewInsertOp();
+    auto insert = table.NewInsertOp(session->arena());
     auto req = insert->mutable_request();
     QLAddInt64HashValue(req, this_key);
     table.AddInt64ColumnValue(req, kInsertTsColumnName, ts);
@@ -382,13 +379,12 @@ class ScopedRowUpdater {
 
  private:
   void RowUpdaterThread() {
-    std::shared_ptr<client::YBSession> session(table_.client()->NewSession());
-    session->SetTimeout(15s);
+    auto session = table_.client()->NewSession(15s);
 
     int64_t next_key;
     std::vector<client::YBqlOpPtr> ops;
     while (to_update_.BlockingGet(&next_key)) {
-      auto update = table_.NewUpdateOp();
+      auto update = table_.NewUpdateOp(session->arena());
       auto req = update->mutable_request();
       QLAddInt64HashValue(req, next_key);
       table_.AddBoolColumnValue(req, kUpdatedColumnName, true);
@@ -423,10 +419,12 @@ class PeriodicWebUIChecker {
     master_pages.push_back("/tables");
     master_pages.push_back("/dump-entities");
     master_pages.push_back("/tablet-servers");
+    master_pages.push_back("/api/v1/meta-cache");
 
     ts_pages.push_back("/metrics");
     ts_pages.push_back("/tablets");
     ts_pages.push_back(strings::Substitute("/transactions?tablet_id=$0", tablet_id));
+    ts_pages.push_back("/api/v1/meta-cache");
 
     // Generate list of urls for each master and tablet server
     for (size_t i = 0; i < cluster.num_masters(); i++) {
@@ -571,8 +569,7 @@ Status LinkedListTester::LoadLinkedList(
   auto start = CoarseMonoClock::Now();
   auto deadline = start + run_for.ToSteadyDuration();
 
-  std::shared_ptr<client::YBSession> session = client_->NewSession();
-  session->SetTimeout(30s);
+  auto session = client_->NewSession(30s);
 
   ScopedRowUpdater updater(table);
   std::vector<std::unique_ptr<LinkedListChainGenerator>> chains;
@@ -1066,8 +1063,8 @@ TEST_F(LinkedListTest, TestLoadWhileOneServerDownAndVerify) {
   FLAGS_ts_flags += "--log_cache_size_limit_mb=2";
   FLAGS_ts_flags += " --global_log_cache_size_limit_mb=4";
 
-  FLAGS_num_tablet_servers = 3;
-  FLAGS_num_tablets = 1;
+  ANNOTATE_UNPROTECTED_WRITE(FLAGS_num_tablet_servers) = 3;
+  ANNOTATE_UNPROTECTED_WRITE(FLAGS_num_tablets) = 1;
   ASSERT_NO_FATALS(BuildAndStart());
 
   LOG(INFO) << "Load the data with one of the three servers down.";

@@ -1,92 +1,104 @@
-// Copyright (c) Yugabyte, Inc.
+// Copyright (c) YugabyteDB, Inc.
 package com.yugabyte.yw.models;
 
+import static io.swagger.annotations.ApiModelProperty.AccessMode.AUTO;
 import static io.swagger.annotations.ApiModelProperty.AccessMode.READ_ONLY;
 import static play.mvc.Http.Status.BAD_REQUEST;
 import static play.mvc.Http.Status.INTERNAL_SERVER_ERROR;
 
 import com.fasterxml.jackson.annotation.JsonBackReference;
 import com.fasterxml.jackson.annotation.JsonIgnore;
+import com.fasterxml.jackson.annotation.JsonInclude;
 import com.fasterxml.jackson.annotation.JsonProperty;
+import com.google.common.base.Strings;
+import com.yugabyte.yw.commissioner.Common.CloudType;
 import com.yugabyte.yw.common.PlatformServiceException;
 import com.yugabyte.yw.models.helpers.CloudInfoInterface;
-
+import io.ebean.ExpressionList;
 import io.ebean.Finder;
 import io.ebean.Model;
 import io.ebean.annotation.DbJson;
 import io.ebean.annotation.Encrypted;
 import io.swagger.annotations.ApiModel;
 import io.swagger.annotations.ApiModelProperty;
+import jakarta.persistence.Column;
+import jakarta.persistence.Entity;
+import jakarta.persistence.Id;
+import jakarta.persistence.ManyToOne;
+import jakarta.persistence.Transient;
 import java.util.List;
 import java.util.Map;
+import java.util.Objects;
 import java.util.Optional;
-import java.util.Set;
 import java.util.UUID;
-import javax.persistence.Column;
-import javax.persistence.Entity;
-import javax.persistence.Id;
-import javax.persistence.ManyToOne;
+import lombok.Getter;
+import lombok.Setter;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import play.data.validation.Constraints;
 
 @Entity
 @ApiModel(description = "Availability zone (AZ) for a region")
+@Getter
+@Setter
+@JsonInclude(JsonInclude.Include.NON_NULL)
 public class AvailabilityZone extends Model {
 
   @Id
-  @ApiModelProperty(value = "AZ UUID", accessMode = READ_ONLY)
-  public UUID uuid;
+  @ApiModelProperty(
+      value = "AZ UUID. This must be specified for existing AZs on update",
+      accessMode = AUTO)
+  private UUID uuid;
 
-  @Column(length = 25, nullable = false)
+  @Column(length = 100, nullable = false)
   @ApiModelProperty(value = "AZ code", example = "us-west1-a")
-  public String code;
+  private String code;
 
   @Column(length = 100, nullable = false)
   @Constraints.Required
   @ApiModelProperty(value = "AZ name", example = "us-west1-a", required = true)
-  public String name;
+  private String name;
 
   @Constraints.Required
   @Column(nullable = false)
   @ManyToOne
   @JsonBackReference("region-zones")
   @ApiModelProperty(value = "AZ region", example = "South east 1", required = true)
-  public Region region;
+  private Region region;
 
   @Column(nullable = false, columnDefinition = "boolean default true")
   @ApiModelProperty(
       value = "AZ status. This value is `true` for an active AZ.",
       accessMode = READ_ONLY)
-  public Boolean active = true;
+  private Boolean active = true;
 
-  public Boolean isActive() {
-    return active;
+  public boolean isActive() {
+    return getActive();
   }
 
-  public void setActiveFlag(Boolean active) {
-    this.active = active;
-  }
-
-  @Column(length = 80)
+  @Column(length = 500)
   @ApiModelProperty(value = "AZ subnet", example = "subnet id")
-  public String subnet;
+  private String subnet;
 
-  @Column(length = 80)
+  @Column(length = 500)
   @ApiModelProperty(value = "AZ secondary subnet", example = "secondary subnet id")
-  public String secondarySubnet;
+  private String secondarySubnet;
+
+  @Transient
+  @ApiModelProperty(hidden = true)
+  private String providerCode;
 
   @Deprecated
   @DbJson
   @Column(columnDefinition = "TEXT")
   @ApiModelProperty(value = "AZ configuration values")
-  public Map<String, String> config;
+  private Map<String, String> config;
 
   @Encrypted
   @DbJson
   @Column(columnDefinition = "TEXT")
   @ApiModelProperty
-  public AvailabilityZoneDetails details = new AvailabilityZoneDetails();
+  private AvailabilityZoneDetails details = new AvailabilityZoneDetails();
 
   @ApiModelProperty(value = "Path to Kubernetes configuration file", accessMode = READ_ONLY)
   public String getKubeconfigPath() {
@@ -111,21 +123,29 @@ public class AvailabilityZone extends Model {
 
   @JsonProperty("details")
   public void setAvailabilityZoneDetails(AvailabilityZoneDetails azDetails) {
-    this.details = azDetails;
+    this.setDetails(azDetails);
   }
 
   @JsonProperty("details")
   public AvailabilityZoneDetails getMaskAvailabilityZoneDetails() {
-    CloudInfoInterface.maskAvailabilityZoneDetails(this);
-    return details;
+    return CloudInfoInterface.maskAvailabilityZoneDetails(this);
   }
 
   @JsonIgnore
   public AvailabilityZoneDetails getAvailabilityZoneDetails() {
-    if (details == null) {
-      details = new AvailabilityZoneDetails();
+    if (getDetails() == null) {
+      setDetails(new AvailabilityZoneDetails());
     }
-    return details;
+    return getDetails();
+  }
+
+  @JsonIgnore
+  public boolean isUpdateNeeded(AvailabilityZone zone) {
+    return !Objects.equals(this.getSubnet(), zone.getSubnet())
+        || !Objects.equals(this.getSecondarySubnet(), zone.getSecondarySubnet())
+        || !Objects.equals(this.getDetails(), zone.getDetails())
+        || !Objects.equals(
+            CloudInfoInterface.fetchEnvVars(this), CloudInfoInterface.fetchEnvVars(zone));
   }
 
   /** Query Helper for Availability Zone with primary key */
@@ -136,12 +156,41 @@ public class AvailabilityZone extends Model {
 
   @JsonIgnore
   public long getNodeCount() {
-    return Customer.get(region.provider.customerUUID)
-        .getUniversesForProvider(region.provider.uuid)
-        .stream()
-        .flatMap(u -> u.getUniverseDetails().nodeDetailsSet.stream())
-        .filter(nd -> nd.azUuid.equals(uuid))
-        .count();
+    Provider provider = getRegion().getProvider();
+    long universeNodeCount =
+        Customer.get(provider.getCustomerUUID())
+            .getUniversesForProvider(provider.getUuid())
+            .stream()
+            .flatMap(u -> u.getUniverseDetails().nodeDetailsSet.stream())
+            .filter(nd -> nd.azUuid.equals(getUuid()))
+            .count();
+    long onpremInstanceCount = 0;
+    if (provider.getCloudCode() == CloudType.onprem) {
+      // We will have to consider the not-in-use instances associated with the az.
+      onpremInstanceCount = NodeInstance.listByZone(getUuid(), null).stream().count();
+    }
+
+    return universeNodeCount + onpremInstanceCount;
+  }
+
+  public static AvailabilityZone getOrCreate(
+      Region region, String code, String name, String subnet) {
+    return getOrCreate(region, code, name, subnet, null);
+  }
+
+  public static AvailabilityZone getOrCreate(
+      Region region, String code, String name, String subnet, String secondarySubnet) {
+    try {
+      LOG.debug("Trying to retrieve zone {} in region {}", code, region.getCode());
+      Optional<AvailabilityZone> zone = maybeGetByCode(region.getProvider(), code);
+      if (zone.isPresent()) {
+        return zone.get();
+      }
+    } catch (Exception e) {
+      LOG.debug("Zone {} in region does not exist. Creating one...", code);
+    }
+
+    return createOrThrow(region, code, name, subnet, secondarySubnet);
   }
 
   public static AvailabilityZone createOrThrow(
@@ -164,12 +213,12 @@ public class AvailabilityZone extends Model {
       AvailabilityZoneDetails details) {
     try {
       AvailabilityZone az = new AvailabilityZone();
-      az.region = region;
-      az.code = code;
-      az.name = name;
-      az.subnet = subnet;
+      az.setRegion(region);
+      az.setCode(code);
+      az.setName(name);
+      az.setSubnet(subnet);
       az.setAvailabilityZoneDetails(details);
-      az.secondarySubnet = secondarySubnet;
+      az.setSecondarySubnet(secondarySubnet);
       az.save();
       return az;
     } catch (Exception e) {
@@ -188,12 +237,12 @@ public class AvailabilityZone extends Model {
       Map<String, String> config) {
     try {
       AvailabilityZone az = new AvailabilityZone();
-      az.region = region;
-      az.code = code;
-      az.name = name;
-      az.subnet = subnet;
+      az.setRegion(region);
+      az.setCode(code);
+      az.setName(name);
+      az.setSubnet(subnet);
       az.setConfig(config);
-      az.secondarySubnet = secondarySubnet;
+      az.setSecondarySubnet(secondarySubnet);
       az.save();
       return az;
     } catch (Exception e) {
@@ -203,11 +252,15 @@ public class AvailabilityZone extends Model {
   }
 
   public static List<AvailabilityZone> getAZsForRegion(UUID regionUUID) {
-    return find.query().where().eq("region_uuid", regionUUID).findList();
+    return getAZsForRegion(regionUUID, true);
   }
 
-  public static Set<AvailabilityZone> getAllByCode(String code) {
-    return find.query().where().eq("code", code).findSet();
+  public static List<AvailabilityZone> getAZsForRegion(UUID regionUUID, boolean onlyActive) {
+    ExpressionList<AvailabilityZone> expr = find.query().where().eq("region_uuid", regionUUID);
+    if (onlyActive) {
+      expr.eq("active", true);
+    }
+    return expr.findList();
   }
 
   public static AvailabilityZone getByRegionOrBadRequest(UUID azUUID, UUID regionUUID) {
@@ -220,18 +273,38 @@ public class AvailabilityZone extends Model {
   }
 
   public static AvailabilityZone getByCode(Provider provider, String code) {
-    return maybeGetByCode(provider, code)
+    return getByCode(provider, code, true);
+  }
+
+  public static AvailabilityZone getByCode(Provider provider, String code, boolean onlyActive) {
+    return maybeGetByCode(provider, code, onlyActive)
         .orElseThrow(
             () ->
                 new RuntimeException(
-                    "AZ by code " + code + " and provider " + provider.code + " NOT FOUND "));
+                    "AZ by code " + code + " and provider " + provider.getCode() + " NOT FOUND "));
   }
 
   public static Optional<AvailabilityZone> maybeGetByCode(Provider provider, String code) {
-    return getAllByCode(code)
-        .stream()
-        .filter(az -> az.getProvider().uuid.equals(provider.uuid))
+    return maybeGetByCode(provider, code, true);
+  }
+
+  public static Optional<AvailabilityZone> maybeGetByCode(
+      Provider provider, String code, boolean onlyActive) {
+    return find.query().where().eq("code", code).findSet().stream()
+        .filter(az -> az.getProvider().getUuid().equals(provider.getUuid()))
+        .filter(az -> !onlyActive || az.getActive())
         .findFirst();
+  }
+
+  @JsonIgnore
+  public CloudType getProviderCloudCode() {
+    if (region != null) {
+      return region.getProviderCloudCode();
+    } else if (!Strings.isNullOrEmpty(providerCode)) {
+      return CloudType.valueOf(providerCode);
+    }
+
+    return CloudType.other;
   }
 
   public static AvailabilityZone getOrBadRequest(UUID zoneUuid) {
@@ -264,7 +337,7 @@ public class AvailabilityZone extends Model {
         .query()
         .fetchLazy("regions")
         .where()
-        .eq("uuid", region.provider.uuid)
+        .eq("uuid", getRegion().getProvider().getUuid())
         .findOne();
   }
 
@@ -272,22 +345,22 @@ public class AvailabilityZone extends Model {
   public String toString() {
     return "AvailabilityZone{"
         + "uuid="
-        + uuid
+        + getUuid()
         + ", code='"
-        + code
+        + getCode()
         + '\''
         + ", name='"
-        + name
+        + getName()
         + '\''
         + ", region="
-        + region
+        + getRegion()
         + ", active="
-        + active
+        + getActive()
         + ", subnet='"
-        + subnet
+        + getSubnet()
         + '\''
         + ", config="
-        + config
+        + getConfig()
         + '}';
   }
 }

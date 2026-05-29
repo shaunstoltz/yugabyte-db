@@ -1,4 +1,4 @@
-// Copyright (c) YugaByte, Inc.
+// Copyright (c) YugabyteDB, Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License"); you may not use this file except
 // in compliance with the License.  You may obtain a copy of the License at
@@ -15,10 +15,12 @@
 
 #include <string>
 
-#include <glog/logging.h>
+#include "yb/util/logging.h"
 
 #include "yb/docdb/docdb_fwd.h"
-#include "yb/docdb/intent.h"
+#include "yb/docdb/lock_util.h"
+
+#include "yb/dockv/intent.h"
 
 #include "yb/gutil/macros.h"
 
@@ -26,27 +28,7 @@
 #include "yb/util/ref_cnt_buffer.h"
 #include "yb/util/status.h"
 
-namespace yb {
-
-class RefCntPrefix;
-
-namespace docdb {
-
-class SharedLockManager;
-
-// We don't care about actual content of this struct here, since it is an implementation detail
-// of SharedLockManager.
-struct LockedBatchEntry;
-
-struct LockBatchEntry {
-  RefCntPrefix key;
-  IntentTypeSet intent_types;
-
-  // Memory is owned by SharedLockManager.
-  LockedBatchEntry* locked = nullptr;
-
-  std::string ToString() const;
-};
+namespace yb::docdb {
 
 class UnlockedBatch;
 
@@ -55,9 +37,13 @@ class UnlockedBatch;
 // in the destructor.
 class LockBatch {
  public:
-  LockBatch() {}
-  LockBatch(SharedLockManager* lock_manager, LockBatchEntries&& key_to_intent_type,
+  LockBatch() = default;
+  LockBatch(SharedLockManager* lock_manager,
+            LockBatchEntries<SharedLockManager>&& key_to_intent_type,
             CoarseTimePoint deadline);
+  // Construct a LockBatch from the provided unlocked_batch instance. If successful, assumes
+  // ownership of UnlockedBatch::key_to_type_.
+  LockBatch(UnlockedBatch* unlocked_batch, CoarseTimePoint deadline);
   LockBatch(LockBatch&& other) { MoveFrom(&other); }
   LockBatch& operator=(LockBatch&& other) { MoveFrom(&other); return *this; }
   ~LockBatch();
@@ -82,18 +68,22 @@ class LockBatch {
   // re-lock the keys.
   std::optional<UnlockedBatch> Unlock();
 
+  const LockBatchEntries<SharedLockManager>& Get() const { return data_.key_to_type; }
+
  private:
   void MoveFrom(LockBatch* other);
 
-  // Initializes the LockBatch and locks the specified keys. Updates data_.status in case of error.
+  // Initializes the LockBatch and locks the specified keys. Updates data_.status and
+  // data_.shared_lock_manager in case of error and leaves data_.key_to_type unchanged.
   void Init(CoarseTimePoint deadline);
 
   void DoUnlock();
 
   struct Data {
     Data() = default;
-    Data(LockBatchEntries&& key_to_type_, SharedLockManager* shared_lock_manager_) :
-      key_to_type(std::move(key_to_type_)), shared_lock_manager(shared_lock_manager_) {}
+    Data(LockBatchEntries<SharedLockManager>&& key_to_type_,
+         SharedLockManager* shared_lock_manager_)
+        : key_to_type(std::move(key_to_type_)), shared_lock_manager(shared_lock_manager_) {}
 
     Data(Data&&) = default;
     Data& operator=(Data&& other) = default;
@@ -101,7 +91,7 @@ class LockBatch {
     Data(const Data&) = delete;
     Data& operator=(const Data&) = delete;
 
-    LockBatchEntries key_to_type;
+    LockBatchEntries<SharedLockManager> key_to_type;
 
     SharedLockManager* shared_lock_manager = nullptr;
 
@@ -112,29 +102,35 @@ class LockBatch {
 };
 
 // A container which houses all data needed to re-lock the LockBatch which generated an
-// UnlockedBatch via LockBatch::Unlock(). Recreates a LockBatch with the same keys via Lock().
+// UnlockedBatch via LockBatch::Unlock().
 class UnlockedBatch {
  public:
-  UnlockedBatch(LockBatchEntries&& key_to_type_, SharedLockManager* shared_lock_manager_);
+  UnlockedBatch(LockBatchEntries<SharedLockManager>&& key_to_type_,
+                SharedLockManager* shared_lock_manager_);
 
   UnlockedBatch(UnlockedBatch&& other) { MoveFrom(&other); }
 
-  // Invalidates the provided UnlockedBatch instance and returns a new LockBatch which locks the
-  // keys specified in "unlocked". An rvalue is required for the UnlockedBatch argument to ensure
-  // that the caller does not expect the fields of "unlocked" to be in a valid state -- they will
-  // be moved into the returned LockBatch instance.
-  LockBatch Lock(CoarseTimePoint deadline) &&;
+  // Tries locking the keys specified in "key_to_type_". On success, clears the state in
+  // this->key_to_type_ (the caller is expected not to re-use the fields since they wouldn't
+  // be in a valid state). In case of failure, preserves the state of the fields, so that
+  // the caller can re-attempt locking. The status of the returned LockBatch must be checked
+  // before usage.
+  LockBatch TryLock(CoarseTimePoint deadline);
 
   UnlockedBatch& operator=(UnlockedBatch&& other) { MoveFrom(&other); return *this; }
+
+  const LockBatchEntries<SharedLockManager>& Get() const { return key_to_type_; }
+
  private:
   void MoveFrom(UnlockedBatch* other);
 
-  LockBatchEntries key_to_type_;
+  LockBatchEntries<SharedLockManager> key_to_type_;
 
   SharedLockManager* shared_lock_manager_ = nullptr;
+
+  friend class LockBatch;
 
   DISALLOW_COPY_AND_ASSIGN(UnlockedBatch);
 };
 
-}  // namespace docdb
-}  // namespace yb
+}  // namespace yb::docdb

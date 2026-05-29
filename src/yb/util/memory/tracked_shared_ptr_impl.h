@@ -1,4 +1,4 @@
-// Copyright (c) YugaByte, Inc.
+// Copyright (c) YugabyteDB, Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License"); you may not use this file except
 // in compliance with the License.  You may obtain a copy of the License at
@@ -17,7 +17,7 @@
 
 #include <map>
 
-#include <boost/functional/hash.hpp>
+#include "yb/util/hash_util.h"
 
 namespace { // NOLINT
 
@@ -25,28 +25,19 @@ struct StackWithIsNotNull {
   yb::StackTrace* stack_trace;
   bool is_not_nullptr;
 
-  size_t HashCode() const {
-    size_t hash = 0;
-    boost::hash_combine(hash, stack_trace);
-    boost::hash_combine(hash, is_not_nullptr);
-    return hash;
-  }
-
   int compare(const StackWithIsNotNull& other) const {
     int cmp = is_not_nullptr - other.is_not_nullptr;
     return cmp ? cmp : stack_trace->compare(*other.stack_trace);
   }
+
+  bool operator==(const StackWithIsNotNull&) const = default;
+
+  std::strong_ordering operator<=>(const StackWithIsNotNull& other) const {
+    return compare(other) <=> 0;
+  }
+
+  YB_STRUCT_DEFINE_HASH(StackWithIsNotNull, stack_trace, is_not_nullptr);
 };
-
-__attribute__((unused)) bool operator==(
-    const StackWithIsNotNull& lhs, const StackWithIsNotNull& rhs) {
-  return lhs.is_not_nullptr == rhs.is_not_nullptr && lhs.stack_trace == rhs.stack_trace;
-}
-
-__attribute__((unused)) bool operator<(
-    const StackWithIsNotNull& lhs, const StackWithIsNotNull& rhs) {
-  return lhs.compare(rhs) < 0;
-}
 
 template <class Key, class Value>
 void IncrementMapEntry(std::map<Key, Value>* map, const Key& key) {
@@ -58,15 +49,6 @@ void IncrementMapEntry(std::map<Key, Value>* map, const Key& key) {
 }
 
 } // namespace
-
-namespace std {
-
-template <>
-struct hash<StackWithIsNotNull> {
-  std::size_t operator()(StackWithIsNotNull const& obj) const noexcept { return obj.HashCode(); }
-};
-
-} // namespace std
 
 namespace yb {
 
@@ -84,7 +66,7 @@ std::set<TrackedSharedPtr<T>*> TrackedSharedPtr<T>::instances_;
 
 template <class T>
 void TrackedSharedPtr<T>::Dump() {
-  std::lock_guard<simple_spinlock> l(lock_);
+  std::lock_guard l(lock_);
   LOG(INFO) << "num_references: " << num_references_;
   LOG(INFO) << "num_instances: " << num_instances_;
 
@@ -132,7 +114,7 @@ void TrackedSharedPtr<T>::UnrefIfInitialized() {
 
 template <class T>
 void TrackedSharedPtr<T>::RegisterInstance() {
-  std::lock_guard<simple_spinlock> l(lock_);
+  std::lock_guard l(lock_);
   ++num_instances_;
   instances_.insert(this);
   // We skip 3 frames: StackTrace::Collect, TrackedSharedPtr::RegisterInstance and
@@ -142,7 +124,7 @@ void TrackedSharedPtr<T>::RegisterInstance() {
 
 template <class T>
 void TrackedSharedPtr<T>::UnregisterInstance() {
-  std::lock_guard<simple_spinlock> l(lock_);
+  std::lock_guard l(lock_);
   --num_instances_;
   instances_.erase(this);
 }

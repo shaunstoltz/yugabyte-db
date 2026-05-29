@@ -1,4 +1,4 @@
-// Copyright (c) YugaByte, Inc.
+// Copyright (c) YugabyteDB, Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License"); you may not use this file except
 // in compliance with the License.  You may obtain a copy of the License at
@@ -27,16 +27,6 @@
 #include "yb/util/status_fwd.h"
 #include "yb/util/monotime.h"
 
-// This file contains utility functions that can be shared between client and master code.
-static constexpr const char* kTablegroupParentTableNameSuffix = ".tablegroup.parent.tablename";
-static constexpr const char* kColocatedDbParentTableIdSuffix = ".colocated.parent.uuid";
-static constexpr const char* kColocatedDbParentTableNameSuffix = ".colocated.parent.tablename";
-static constexpr const char* kTablegroupParentTableIdSuffix = ".tablegroup.parent.uuid";
-// ID && name of a tablegroup for Colocation GA contain string "colocation".
-// We keep string "tablegroup" in ID && name of user-created tablegroups in non-colocated databases.
-static constexpr const char* kColocationParentTableIdSuffix = ".colocation.parent.uuid";
-static constexpr const char* kColocationParentTableNameSuffix = ".colocation.parent.tablename";
-
 static constexpr const char* kDBTypePrefixUnknown = "unknown";
 static constexpr const char* kDBTypePrefixCql = "ycql";
 static constexpr const char* kDBTypePrefixYsql = "ysql";
@@ -45,6 +35,10 @@ static constexpr const char* kDBTypePrefixRedis = "yedis";
 namespace yb {
 
 const char* DatabasePrefix(YQLDatabase db);
+
+// A short version of the given database type, such as "YCQL" or "YSQL". Used
+// for human-readable messages.
+std::string ShortDatabaseType(YQLDatabase db_type);
 
 namespace consensus {
 
@@ -91,33 +85,9 @@ Result<bool> TableMatchesIdentifier(const TableId& id,
                                     const TableIdentifierPB& table_identifier);
 
 Status SetupError(MasterErrorPB* error, const Status& s);
+Status SetupError(MasterErrorPB* error, MasterErrorPB_Code code, const Status& s);
 
 // TODO(alex): Merge with stuff in entity_ids?
-
-// Is this a parent dummy table ID created for a colocation group (database/tablegroup)?
-bool IsColocationParentTableId(const TableId& table_id);
-
-// Is this a parent dummy table ID created for a colocated database?
-bool IsColocatedDbParentTableId(const TableId& table_id);
-
-TableId GetColocatedDbParentTableId(const TableId& table_id);
-
-TableName GetColocatedDbParentTableName(const NamespaceId& database_id);
-
-// Is this a parent dummy table ID created for a tablegroup?
-bool IsTablegroupParentTableId(const TableId& table_id);
-
-TableId GetTablegroupParentTableId(const TablegroupId& tablegroup_id);
-
-TableName GetTablegroupParentTableName(const TablegroupId& tablegroup_id);
-
-TablegroupId GetTablegroupIdFromParentTableId(const TableId& table_id);
-
-bool IsColocatedDbTablegroupParentTableId(const TableId& table_id);
-
-TableId GetColocationParentTableId(const TablegroupId& tablegroup_id);
-
-TableName GetColocationParentTableName(const TablegroupId& tablegroup_id);
 
 bool IsBlacklisted(const ServerRegistrationPB& registration, const BlacklistSet& blacklist);
 

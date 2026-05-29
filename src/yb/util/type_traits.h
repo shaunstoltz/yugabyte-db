@@ -1,5 +1,5 @@
 //
-// Copyright (c) YugaByte, Inc.
+// Copyright (c) YugabyteDB, Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License"); you may not use this file except
 // in compliance with the License.  You may obtain a copy of the License at
@@ -15,6 +15,7 @@
 
 #pragma once
 
+#include <optional>
 #include <type_traits>
 
 #include <boost/preprocessor/cat.hpp>
@@ -50,11 +51,14 @@ namespace yb {
     };
 
 // We suppose that if class has nested const_iterator then it is collection.
-BOOST_TTI_HAS_TYPE(const_iterator);
+HAS_MEMBER_FUNCTION(begin);
+HAS_MEMBER_FUNCTION(end);
 
 template <class T>
-class IsCollection : public has_type_const_iterator<
-    typename std::remove_cv<typename std::remove_reference<T>::type>::type> {
+struct IsCollection {
+  using StrippedT = typename std::remove_cv<typename std::remove_reference<T>::type>::type;
+  constexpr static bool value =
+      HasMemberFunction_begin<StrippedT>::value && HasMemberFunction_end<StrippedT>::value;
 };
 
 // This class is used to determine whether T is similar to pointer.
@@ -88,5 +92,18 @@ template<class T>
 class IsPointerLike : public IsPointerLikeImpl<
     typename std::remove_cv<typename std::remove_reference<T>::type>::type> {
 };
+
+template <class T>
+concept StdOptionalType = std::is_same_v<T, std::optional<typename T::value_type>>;
+
+template <class T>
+concept TupleLikeType = requires(T a) {
+                          typename std::tuple_size<T>::type;
+                          typename std::tuple_element_t<0, T>;
+                          std::get<0>(a);
+                        };
+
+template<typename T>
+concept NonReferenceType = !std::is_reference_v<T>;
 
 }  // namespace yb

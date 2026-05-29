@@ -15,9 +15,9 @@
 // specific language governing permissions and limitations
 // under the License.
 //
-// The following only applies to changes made to this file as part of YugaByte development.
+// The following only applies to changes made to this file as part of YugabyteDB development.
 //
-// Portions Copyright (c) YugaByte, Inc.
+// Portions Copyright (c) YugabyteDB, Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License"); you may not use this file except
 // in compliance with the License.  You may obtain a copy of the License at
@@ -35,9 +35,10 @@
 
 #include <array>
 #include <string>
+#include <string_view>
 #include <vector>
 
-#include <glog/logging.h>
+#include "yb/util/logging.h"
 #include <gtest/gtest.h>
 
 #include "yb/util/errno.h"
@@ -51,9 +52,23 @@ using namespace std::literals;
 
 namespace yb {
 
+constexpr uint8_t kMinTestError = 202;
+constexpr uint8_t kMaxTestError = 210;
+
+constexpr std::array<std::string_view, kMaxTestError - kMinTestError + 1> kCategoryNames{
+    "test error 202"sv,
+    "test error 203"sv,
+    "test error 204"sv,
+    "test error 205"sv,
+    "test error 206"sv,
+    "test error 207"sv,
+    "test error 208"sv,
+    "test error 209"sv,
+    "test error 210"sv};
+
 template <uint8_t category>
 struct TestErrorTag : IntegralErrorTag<int64_t> {
-  static constexpr uint8_t kCategory = category;
+  static constexpr CategoryDescriptor kCategory{category, kCategoryNames[category - kMinTestError]};
 
   static std::string ToMessage(Value value) {
     return std::to_string(value);
@@ -83,19 +98,11 @@ class TestErrorDescriptorImpl : public TestErrorDescriptor {
   }
 };
 
-constexpr uint8_t kMinTestError = 202;
-constexpr uint8_t kMaxTestError = 210;
-
 std::array<std::unique_ptr<TestErrorDescriptor>, kMaxTestError + 1> kTestErrorDescriptors;
 
 template <uint8_t category>
-StatusCategoryRegisterer& RegisterTestError() {
-  static const std::string kTestErrorCategoryName = "test error " + std::to_string(category);
-
-  static StatusCategoryRegisterer test_error_category_registerer(
-      StatusCategoryDescription::Make<TestErrorTag<category>>(&kTestErrorCategoryName));
+void RegisterTestError() {
   kTestErrorDescriptors[category] = std::make_unique<TestErrorDescriptorImpl<category>>();
-  return test_error_category_registerer;
 }
 
 template <uint8_t category>
@@ -135,35 +142,25 @@ class ErrorDelayTraits {
 
 class ErrorDelayTag : public IntegralBackedErrorTag<ErrorDelayTraits> {
  public:
-  static constexpr uint8_t kCategory = kMaxTestError + 1;
+  static constexpr CategoryDescriptor kCategory{kMaxTestError + 1, "error delay"sv};
 
   static std::string ToMessage(MonoDelta value) {
     return value.ToString();
   }
 };
 
-typedef StatusErrorCodeImpl<ErrorDelayTag> ErrorDelay;
-
-const std::string kErrorDelayCategoryName = "error delay";
-
-static StatusCategoryRegisterer error_delay_category_registerer(
-    StatusCategoryDescription::Make<ErrorDelayTag>(&kErrorDelayCategoryName));
+using ErrorDelay = StatusErrorCodeImpl<ErrorDelayTag>;
 
 class StringVectorErrorTag : public StringVectorBackedErrorTag {
  public:
-  static constexpr uint8_t kCategory = kMaxTestError + 2;
+  static constexpr CategoryDescriptor kCategory{kMaxTestError + 2, "string vector error"sv};
 
   static std::string ToMessage(Value value) {
     return AsString(value);
   }
 };
 
-typedef StatusErrorCodeImpl<StringVectorErrorTag> StringVectorError;
-
-const std::string kStringVectorErrorCategoryName = "string vector error";
-
-static StatusCategoryRegisterer string_vector_error_category_registerer(
-    StatusCategoryDescription::Make<StringVectorErrorTag>(&kStringVectorErrorCategoryName));
+using StringVectorError = StatusErrorCodeImpl<StringVectorErrorTag>;
 
 TEST(StatusTest, TestPosixCode) {
   Status ok = Status::OK();
@@ -242,7 +239,7 @@ TEST(StatusTest, TestMoveConstructor) {
   {
     Status src = Status::OK();
     Status dst = std::move(src);
-    ASSERT_OK(src);
+    ASSERT_OK(src); // NOLINT(bugprone-use-after-move)
     ASSERT_OK(dst);
   }
 
@@ -251,7 +248,7 @@ TEST(StatusTest, TestMoveConstructor) {
   {
     Status src = STATUS(NotFound, "foo");
     Status dst = std::move(src);
-    ASSERT_OK(src);
+    ASSERT_OK(src); // NOLINT(bugprone-use-after-move)
     ASSERT_EQ("Not found: foo", dst.ToString(false));
   }
 }
@@ -263,7 +260,7 @@ TEST(StatusTest, TestMoveAssignment) {
     Status src = Status::OK();
     Status dst = STATUS(NotFound, "orig dst");
     dst = std::move(src);
-    ASSERT_OK(src);
+    ASSERT_OK(src); // NOLINT(bugprone-use-after-move)
     ASSERT_OK(dst);
   }
 
@@ -272,7 +269,7 @@ TEST(StatusTest, TestMoveAssignment) {
     Status src = STATUS(NotFound, "orig src");
     Status dst = STATUS(NotFound, "orig dst");
     dst = std::move(src);
-    ASSERT_OK(src);
+    ASSERT_OK(src); // NOLINT(bugprone-use-after-move)
     ASSERT_EQ("Not found: orig src", dst.ToString(false));
   }
 
@@ -281,7 +278,7 @@ TEST(StatusTest, TestMoveAssignment) {
     Status src = STATUS(NotFound, "orig src");
     Status dst = Status::OK();
     dst = std::move(src);
-    ASSERT_OK(src);
+    ASSERT_OK(src); // NOLINT(bugprone-use-after-move)
     ASSERT_EQ("Not found: orig src", dst.ToString(false));
   }
 }
@@ -305,6 +302,33 @@ TEST(StatusTest, StringVectorError) {
     }
     vector.push_back(str);
   }
+}
+
+#define CAPTURE_STATUS(expr) \
+  []() -> Status { \
+    expr; \
+    return Status::OK(); \
+  }()
+
+TEST(StatusTest, StatusFormat) {
+  auto status = CAPTURE_STATUS(SCHECK_FORMAT(true, NotFound, "TEST $0", 42));
+  ASSERT_OK(status);
+
+  status = CAPTURE_STATUS(SCHECK_FORMAT(false, IllegalState, "TEST $0", 42));
+  ASSERT_NOK(status);
+  ASSERT_STR_CONTAINS(status.ToString(), "Illegal state");
+  ASSERT_STR_CONTAINS(status.ToString(), "TEST 42");
+
+  status =
+      CAPTURE_STATUS(SCHECK_EC_FORMAT(true || false, NotFound, Errno(ENOTDIR), "ENOTDIR $0", 42));
+  ASSERT_OK(status);
+
+  status = CAPTURE_STATUS(
+      SCHECK_EC_FORMAT(false, NotFound, Errno(ENOTDIR), "ENOTDIR $0 $1 $0", 37, "foo"));
+  ASSERT_NOK(status);
+  ASSERT_EQ(ENOTDIR, Errno(status));
+  ASSERT_STR_CONTAINS(status.ToString(), "Not found");
+  ASSERT_STR_CONTAINS(status.ToString(), "ENOTDIR 37 foo 37");
 }
 
 }  // namespace yb

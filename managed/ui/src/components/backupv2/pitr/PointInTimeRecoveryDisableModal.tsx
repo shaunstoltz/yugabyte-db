@@ -1,20 +1,25 @@
 /*
  * Created on Wed Jun 08 2022
  *
- * Copyright 2021 YugaByte, Inc. and Contributors
+ * Copyright 2021 YugabyteDB, Inc. and Contributors
  * Licensed under the Polyform Free Trial License 1.0.0 (the "License")
  * You may not use this file except in compliance with the License. You may obtain a copy of the License at
  * http://github.com/YugaByte/yugabyte-db/blob/master/licenses/POLYFORM-FREE-TRIAL-LICENSE-1.0.0.txt
  */
 
-import React, { FC } from 'react';
+import { FC } from 'react';
 import { toast } from 'react-toastify';
 import { useMutation, useQueryClient } from 'react-query';
 import { Col, Row } from 'react-bootstrap';
 import { YBModalForm } from '../../common/forms';
 import { YBButton } from '../../common/forms/fields';
-import { FormatUnixTimeStampTimeToTimezone } from './PointInTimeRecoveryList';
 import { deletePITRConfig } from '../common/PitrAPI';
+import { isActionFrozen } from '../../../redesign/helpers/utils';
+import { ybFormatDate } from '../../../redesign/helpers/DateUtils';
+import { AllowedTasks } from '../../../redesign/helpers/dtos';
+import { UNIVERSE_TASKS } from '../../../redesign/helpers/constants';
+import { handleServerError } from '../../../utils/errorHandlingUtils';
+
 import './PointInTimeRecoveryDisableModal.scss';
 
 interface PointInTimeRecoveryDisableModalProps {
@@ -22,29 +27,27 @@ interface PointInTimeRecoveryDisableModalProps {
   universeUUID: string;
   onHide: () => void;
   config: any;
+  allowedTasks: AllowedTasks;
 }
-
-const TOAST_AUTO_CLOSE_INTERVAL = 3000;
 
 export const PointInTimeRecoveryDisableModal: FC<PointInTimeRecoveryDisableModalProps> = ({
   visible,
   onHide,
   config,
-  universeUUID
+  universeUUID,
+  allowedTasks
 }) => {
   const queryClient = useQueryClient();
 
   const deletePITR = useMutation((pUUID: string) => deletePITRConfig(universeUUID, pUUID), {
     onSuccess: () => {
-      toast.success(`Point-in-time recovery disabled successfully for ${config.dbName}`, {
-        autoClose: TOAST_AUTO_CLOSE_INTERVAL
-      });
+      toast.success(`Point-in-time recovery disabled successfully for ${config.dbName}`);
       queryClient.invalidateQueries(['scheduled_sanpshots']);
       onHide();
     },
     onError: (err: any) => {
-      toast.error(`Failed to disable point-in-time recovery for ${config.dbName}`, {
-        autoClose: TOAST_AUTO_CLOSE_INTERVAL
+      handleServerError(err, {
+        customErrorLabel: `Failed to disable point-in-time recovery for ${config.dbName}`
       });
       onHide();
     }
@@ -58,15 +61,19 @@ export const PointInTimeRecoveryDisableModal: FC<PointInTimeRecoveryDisableModal
 
   const minTime = config.minRecoverTimeInMillis;
   const retentionDays = config.retentionPeriod / (24 * 60 * 60);
+  const isDeleteActionFrozen = isActionFrozen(allowedTasks, UNIVERSE_TASKS.DELETE_PITR);
 
   return (
     <YBModalForm
       title="Disable Point-In-Time Recovery"
       visible={visible}
+      isButtonDisabled={isDeleteActionFrozen}
       onHide={onHide}
       submitLabel="Disable Point-In-Time Recovery"
       onFormSubmit={handleSubmit}
       dialogClassName="pitr-disable-modal"
+      submitTestId="DisablePitrSubmitBtn"
+      cancelTestId="DisablePitrCancelBtn"
       footerAccessory={<YBButton btnClass="btn" btnText="Cancel" onClick={onHide} />}
       render={() => {
         return (
@@ -99,9 +106,7 @@ export const PointInTimeRecoveryDisableModal: FC<PointInTimeRecoveryDisableModal
                 <Col sm={6} className="config-row-label">
                   Earliest Recoverable Time
                 </Col>
-                <Col sm={6}>
-                  <FormatUnixTimeStampTimeToTimezone timestamp={minTime} />
-                </Col>
+                <Col sm={6}>{ybFormatDate(minTime)}</Col>
               </Row>
             </div>
           </>

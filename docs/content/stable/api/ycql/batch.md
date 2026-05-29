@@ -5,7 +5,7 @@ linkTitle: BATCH
 summary: Execute multiple DML in 1 request
 description: Use batch to update multiple rows in 1 request.
 menu:
-  stable:
+  stable_api:
     parent: api-cassandra
     weight: 19991
 type: docs
@@ -161,7 +161,7 @@ cqlsh:sample> SELECT * FROM test;
 (1 rows)
 ```
 
-{{< note Type="Note" >}}
+{{< note title="Note" >}}
 
 `BEGIN/END TRANSACTION` doesn't currently support `RETURNS STATUS AS ROW`.
 

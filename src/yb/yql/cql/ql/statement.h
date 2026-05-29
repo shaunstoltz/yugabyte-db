@@ -1,5 +1,5 @@
 //--------------------------------------------------------------------------------------------------
-// Copyright (c) YugaByte, Inc.
+// Copyright (c) YugabyteDB, Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License"); you may not use this file except
 // in compliance with the License.  You may obtain a copy of the License at
@@ -66,6 +66,10 @@ class Statement {
   // Clear the reparsed status.
   void clear_reparsed() const {
     parse_tree_->clear_reparsed();
+  }
+
+  size_t DynamicMemoryUsage() const {
+    return sizeof(*this) + keyspace_.size() + text_.size();
   }
 
  protected:

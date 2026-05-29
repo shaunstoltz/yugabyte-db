@@ -3,9 +3,9 @@
 //  LICENSE file in the root directory of this source tree. An additional grant
 //  of patent rights can be found in the PATENTS file in the same directory.
 //
-// The following only applies to changes made to this file as part of YugaByte development.
+// The following only applies to changes made to this file as part of YugabyteDB development.
 //
-// Portions Copyright (c) YugaByte, Inc.
+// Portions Copyright (c) YugabyteDB, Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License"); you may not use this file except
 // in compliance with the License.  You may obtain a copy of the License at
@@ -38,8 +38,9 @@
 #include "yb/rocksdb/env.h"
 #include "yb/rocksdb/port/port.h"
 #include "yb/rocksdb/util/mutexlock.h"
-#include "yb/rocksdb/util/sync_point.h"
 #include "yb/rocksdb/util/file_util.h"
+
+#include "yb/util/sync_point.h"
 
 namespace rocksdb {
 
@@ -47,8 +48,7 @@ Status DBImpl::DisableFileDeletions() {
   InstrumentedMutexLock l(&mutex_);
   ++disable_delete_obsolete_files_;
   if (disable_delete_obsolete_files_ == 1) {
-    RLOG(InfoLogLevel::INFO_LEVEL, db_options_.info_log,
-        "File Deletions Disabled");
+    RLOG(InfoLogLevel::DETAIL_LEVEL, db_options_.info_log, "File Deletions Disabled");
   } else {
     RLOG(InfoLogLevel::WARN_LEVEL, db_options_.info_log,
         "File Deletions Disabled, but already disabled. Counter: %d",
@@ -71,7 +71,7 @@ Status DBImpl::EnableFileDeletions(bool force) {
       --disable_delete_obsolete_files_;
     }
     if (disable_delete_obsolete_files_ == 0) {
-      RLOG(InfoLogLevel::INFO_LEVEL, db_options_.info_log,
+      RLOG(InfoLogLevel::DETAIL_LEVEL, db_options_.info_log,
           "File Deletions Enabled");
       should_purge_files = true;
       FindObsoleteFiles(&job_context, true);
@@ -93,10 +93,9 @@ int DBImpl::IsFileDeletionsEnabled() const {
   return disable_delete_obsolete_files_;
 }
 
-Status DBImpl::GetLiveFiles(std::vector<std::string> &ret,
-    uint64_t *manifest_file_size,
-    bool flush_memtable) {
-
+Status DBImpl::GetLiveFiles(
+    std::vector<std::string>& ret, uint64_t* manifest_file_size, bool flush_memtable,
+    FlushReason flush_reason) {
   *manifest_file_size = 0;
 
   mutex_.Lock();
@@ -110,9 +109,9 @@ Status DBImpl::GetLiveFiles(std::vector<std::string> &ret,
       }
       cfd->Ref();
       mutex_.Unlock();
-      status = FlushMemTable(cfd, FlushOptions());
-      TEST_SYNC_POINT("DBImpl::GetLiveFiles:1");
-      TEST_SYNC_POINT("DBImpl::GetLiveFiles:2");
+      status = FlushMemTable(cfd, FlushOptions(flush_reason));
+      DEBUG_ONLY_TEST_SYNC_POINT("DBImpl::GetLiveFiles:1");
+      DEBUG_ONLY_TEST_SYNC_POINT("DBImpl::GetLiveFiles:2");
       mutex_.Lock();
       cfd->Unref();
       if (!status.ok()) {

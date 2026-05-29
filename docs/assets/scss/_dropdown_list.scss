@@ -9,7 +9,7 @@
 
   .dropdown-menu {
     background: #fff;
-    border: 1px solid #d7dee4;
+    border: 1px solid #E9EEF2;
     box-shadow: 0 1px 4px rgba(153, 153, 153, 0.5);
     border-radius: 8px;
     padding: 8px 0;
@@ -21,31 +21,53 @@
       color: $yb-font-dark;
       padding: 8px 16px;
 
+      .tag.release {
+        top: 0;
+      }
+
       &:hover {
         background: #f2f6ff !important;
+      }
+
+      &[role="button"] {
+        cursor: not-allowed;
+        opacity: 0.6;
+
+        .tag.release .popup-details {
+          display: none;
+        }
+
+        &:hover {
+          background: #fff !important;
+        }
       }
     }
   }
 
   .dropdown-toggle {
-    padding: 8px 12px;
+    padding: 4px 12px;
+    padding-right: 5px;
     transition: all 0.2s;
     vertical-align: middle;
     box-shadow: none;
     position: relative;
     letter-spacing: -0.02em;
-    min-width: 145px;
     justify-content: space-between;
     font-weight: 400;
     font-size: 13px;
     line-height: 16px;
     display: flex;
     align-items: center;
-    color: $yb-font-gray;
+    color: #0B1117;
     background: #fff;
-    border: 1px solid #d7dee4;
     border-radius: 8px;
     min-height: 32px;
+    border: 1px solid transparent;
+
+    &.show,
+    &:hover {
+      border: 1px solid #d7dee4;
+    }
 
     > span {
       font-weight: 500;
@@ -55,18 +77,24 @@
       height: 20px;
       border-radius: 4px;
       padding: 2px 6px;
-      margin-left: 6px;
+      margin-left: 8px;
       margin-right: auto;
+      position: static;
     }
 
     &::after {
       display: inline-block;
-      margin-left: 0.255em;
-      vertical-align: 0.255em;
+      margin-left: 8px;
+      vertical-align: middle;
       content: "\f107";
       color: #97a5b0;
-      font-family: "Font Awesome 6 Free";
+      font-family: $td-font-awesome-font-name;
+      font-weight: 700;
       border: 0;
+      width: 20px;
+      height: 24px;
+      text-align: center;
+      line-height: 24px;
     }
   }
 
@@ -100,13 +128,14 @@
 
       .dropdown-menu {
         width: 100%;
-        transform:translate3d(0px, 38px, 0px)!important;
+        transform: translate3d(0px, 38px, 0px) !important;
       }
     }
 
     @media (min-width: 992px) {
       display: none;
     }
+
     @media (max-width: 991px) and (min-width: 768px) {
       margin-top: 18px;
       width: calc(100% - 85px);

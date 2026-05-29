@@ -1,4 +1,4 @@
-// Copyright (c) YugaByte, Inc.
+// Copyright (c) YugabyteDB, Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License"); you may not use this file except
 // in compliance with the License.  You may obtain a copy of the License at
@@ -38,15 +38,16 @@ namespace tserver {
 class ReadTabletProvider {
  public:
   virtual Result<std::shared_ptr<tablet::AbstractTablet>> GetTabletForRead(
-    const TabletId& tablet_id, tablet::TabletPeerPtr tablet_peer,
-    YBConsistencyLevel consistency_level, AllowSplitTablet allow_split_tablet) = 0;
+      TabletIdView tablet_id, tablet::TabletPeerPtr tablet_peer,
+      YBConsistencyLevel consistency_level, AllowSplitTablet allow_split_tablet,
+      ReadResponseMsg* resp) = 0;
 
   virtual ~ReadTabletProvider() = default;
 };
 
 void PerformRead(
     TabletServerIf* server, ReadTabletProvider* read_tablet_provider,
-    const ReadRequestPB* req, ReadResponsePB* resp, rpc::RpcContext context);
+    const ReadRequestMsg* req, ReadResponseMsg* resp, rpc::RpcContext context);
 
 }  // namespace tserver
 }  // namespace yb

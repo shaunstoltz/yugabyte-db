@@ -1,5 +1,5 @@
 //
-// Copyright (c) YugaByte, Inc.
+// Copyright (c) YugabyteDB, Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License"); you may not use this file except
 // in compliance with the License.  You may obtain a copy of the License at
@@ -24,10 +24,12 @@
 
 #include <boost/version.hpp>
 
-#include "yb/rpc/rpc_fwd.h"
 #include "yb/rpc/binary_call_parser.h"
 #include "yb/rpc/circular_read_buffer.h"
 #include "yb/rpc/connection_context.h"
+#include "yb/rpc/connection.h"
+#include "yb/rpc/reactor_thread_role.h"
+#include "yb/rpc/rpc_fwd.h"
 #include "yb/rpc/rpc_with_call_id.h"
 #include "yb/rpc/serialization.h"
 #include "yb/rpc/sidecars.h"
@@ -86,16 +88,18 @@ class YBInboundConnectionContext : public YBConnectionContext {
   static std::string Name() { return "Inbound RPC"; }
  private:
   // Takes ownership of call_data content.
-  Status HandleCall(const ConnectionPtr& connection, CallData* call_data) override;
-  void Connected(const ConnectionPtr& connection) override;
-  Result<ProcessCallsResult> ProcessCalls(const ConnectionPtr& connection,
-                                          const IoVecs& data,
-                                          ReadBufferFull read_buffer_full) override;
+  Status HandleCall(const ConnectionPtr& connection, CallData* call_data)
+      ON_REACTOR_THREAD override;
+  Status Connected(const ConnectionPtr& connection) override;
+  Result<ProcessCallsResult> ProcessCalls(
+      const ConnectionPtr& connection,
+      const IoVecs& data,
+      ReadBufferFull read_buffer_full) ON_REACTOR_THREAD override;
 
   // Takes ownership of call_data content.
   Status HandleInboundCall(const ConnectionPtr& connection, std::vector<char>* call_data);
 
-  void HandleTimeout(ev::timer& watcher, int revents); // NOLINT
+  void HandleTimeout(ev::timer& watcher, int revents) ON_REACTOR_THREAD;  // NOLINT
 
   RpcConnectionPB::StateType State() override { return state_; }
 
@@ -113,12 +117,17 @@ class YBInboundConnectionContext : public YBConnectionContext {
 
 class YBInboundCall : public InboundCall {
  public:
-  YBInboundCall(ConnectionPtr conn, CallProcessedListener* call_processed_listener);
-  explicit YBInboundCall(RpcMetrics* rpc_metrics, const RemoteMethod& remote_method);
-  virtual ~YBInboundCall();
+  YBInboundCall(
+      ConnectionPtr conn,
+      CallProcessedListener* call_processed_listener,
+      CallStateListenerFactory* call_state_listener_factory);
 
-  // Is this a local call?
-  virtual bool IsLocalCall() const { return false; }
+  YBInboundCall(
+      RpcMetrics* rpc_metrics,
+      const RemoteMethod& remote_method,
+      CallStateListenerFactory* call_state_listener_factory);
+
+  virtual ~YBInboundCall();
 
   // Parse an inbound call message.
   //
@@ -142,6 +151,10 @@ class YBInboundCall : public InboundCall {
 
   Sidecars& sidecars() {
     return sidecars_;
+  }
+
+  ThreadPoolTag pool_tag() const override {
+    return header_.pool_tag;
   }
 
   // Serializes 'response' into the InboundCall's internal buffer, and marks
@@ -188,8 +201,11 @@ class YBInboundCall : public InboundCall {
 
   size_t ObjectSize() const override { return sizeof(*this); }
 
+  Result<RefCntSlice> ExtractSidecar(size_t idx) const;
+
   size_t DynamicMemoryUsage() const override {
-    return InboundCall::DynamicMemoryUsage() + DynamicMemoryUsageOf(response_buf_);
+    return InboundCall::DynamicMemoryUsage() +
+           response_data_memory_usage_.load(std::memory_order_acquire);
   }
 
  protected:
@@ -199,6 +215,8 @@ class YBInboundCall : public InboundCall {
 
   // Serialize and queue the response.
   virtual void Respond(AnyMessageConstPtr response, bool is_success);
+
+  virtual void UpdateWaitStateInfo();
 
  private:
   // Serialize a response message for either success or failure. If it is a success,
@@ -215,6 +233,9 @@ class YBInboundCall : public InboundCall {
 
   // The buffers for serialized response. Set by SerializeResponseBuffer().
   RefCntBuffer response_buf_;
+  std::atomic<size_t> response_data_memory_usage_{0};
+
+  ReceivedSidecars received_sidecars_;
 
   // Cache of result of YBInboundCall::ToString().
   mutable std::string cached_to_string_;
@@ -235,16 +256,18 @@ class YBOutboundConnectionContext : public YBConnectionContext {
   }
 
   // Takes ownership of call_data content.
-  Status HandleCall(const ConnectionPtr& connection, CallData* call_data) override;
-  void Connected(const ConnectionPtr& connection) override;
-  void AssignConnection(const ConnectionPtr& connection) override;
-  Result<ProcessCallsResult> ProcessCalls(const ConnectionPtr& connection,
-                                          const IoVecs& data,
-                                          ReadBufferFull read_buffer_full) override;
+  Status HandleCall(const ConnectionPtr& connection, CallData* call_data)
+      ON_REACTOR_THREAD override;
+  Status Connected(const ConnectionPtr& connection) override;
+  Status AssignConnection(const ConnectionPtr& connection) override;
+  Result<ProcessCallsResult> ProcessCalls(
+      const ConnectionPtr& connection,
+      const IoVecs& data,
+      ReadBufferFull read_buffer_full) ON_REACTOR_THREAD override;
 
   void UpdateLastRead(const ConnectionPtr& connection) override;
 
-  void HandleTimeout(ev::timer& watcher, int revents); // NOLINT
+  void HandleTimeout(ev::timer& watcher, int revents) ON_REACTOR_THREAD;  // NOLINT
 
   std::weak_ptr<Connection> connection_;
 

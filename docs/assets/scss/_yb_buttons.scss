@@ -44,6 +44,10 @@ body {
       background: #5d5fef;
       color: #fff;
     }
+
+    &[data-bs-toggle="tab"]:hover {
+      background: inherit;
+    }
   }
 
   .secondary-btn:not(.btn-priority) {
@@ -137,6 +141,14 @@ body {
       background: transparent;
       color: #2b59c3;
       border: 1px solid #2b59c3;
+    }
+  }
+
+  .card-link {
+    .arrow-btn {
+      &.more {
+        font-size: 13px;
+      }
     }
   }
 

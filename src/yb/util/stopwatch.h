@@ -15,9 +15,9 @@
 // specific language governing permissions and limitations
 // under the License.
 //
-// The following only applies to changes made to this file as part of YugaByte development.
+// The following only applies to changes made to this file as part of YugabyteDB development.
 //
-// Portions Copyright (c) YugaByte, Inc.
+// Portions Copyright (c) YugabyteDB, Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License"); you may not use this file except
 // in compliance with the License.  You may obtain a copy of the License at
@@ -35,7 +35,7 @@
 #include <sys/time.h>
 #include <time.h>
 #include <string>
-#include <glog/logging.h>
+#include "yb/util/logging.h"
 #if defined(__APPLE__)
 #include <mach/clock.h>
 #include <mach/mach.h>

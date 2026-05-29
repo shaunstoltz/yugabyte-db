@@ -3,9 +3,9 @@
 //  LICENSE file in the root directory of this source tree. An additional grant
 //  of patent rights can be found in the PATENTS file in the same directory.
 //
-// The following only applies to changes made to this file as part of YugaByte development.
+// The following only applies to changes made to this file as part of YugabyteDB development.
 //
-// Portions Copyright (c) YugaByte, Inc.
+// Portions Copyright (c) YugabyteDB, Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License"); you may not use this file except
 // in compliance with the License.  You may obtain a copy of the License at
@@ -26,7 +26,8 @@
 #include "yb/rocksdb/port/likely.h"
 #include "yb/rocksdb/port/port.h"
 #include "yb/rocksdb/util/random.h"
-#include "yb/gutil/sysinfo.h"
+
+#include "yb/util/cgroups.h"
 
 namespace rocksdb {
 
@@ -38,7 +39,7 @@ ConcurrentArena::ConcurrentArena(size_t block_size, size_t huge_page_size)
     : shard_block_size_(block_size / 8), arena_(block_size, huge_page_size) {
   // find a power of two >= num_cpus and >= 8
   index_mask_ = 7;
-  size_t num_cpus = base::NumCPUs();
+  size_t num_cpus = yb::NumEffectiveCPUs();
   while (index_mask_ + 1 < num_cpus) {
     index_mask_ = index_mask_ * 2 + 1;
   }

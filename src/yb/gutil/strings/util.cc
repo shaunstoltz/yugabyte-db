@@ -1,9 +1,9 @@
 //
 // Copyright (C) 1999-2005 Google, Inc.
 //
-// The following only applies to changes made to this file as part of YugaByte development.
+// The following only applies to changes made to this file as part of YugabyteDB development.
 //
-// Portions Copyright (c) YugaByte, Inc.
+// Portions Copyright (c) YugabyteDB, Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License"); you may not use this file except
 // in compliance with the License.  You may obtain a copy of the License at
@@ -29,7 +29,7 @@
 
 #include <algorithm>
 
-#include <glog/logging.h>
+#include "yb/util/logging.h"
 
 #include "yb/gutil/casts.h"
 #include "yb/gutil/stl_util.h"  // for string_as_array, STLAppendToString
@@ -37,11 +37,6 @@
 #include "yb/gutil/strings/numbers.h"
 #include "yb/gutil/utf/utf.h"
 
-using std::copy;
-using std::max;
-using std::min;
-using std::reverse;
-using std::sort;
 using std::swap;
 using std::string;
 using std::vector;
@@ -185,14 +180,23 @@ char* AdjustedLastPos(const char* str, char separator, int n) {
 // Misc. routines
 // ----------------------------------------------------------------------
 
-bool IsAscii(const char* str, size_t len) {
+template <typename Fn>
+bool IsCharType(const char* str, size_t len, Fn isType) {
   const char* end = str + len;
   while (str < end) {
-    if (!ascii_isascii(*str++)) {
+    if (!isType(*str++)) {
       return false;
     }
   }
   return true;
+}
+
+bool IsAscii(const char* str, size_t len) {
+  return IsCharType(str, len, ascii_isascii);
+}
+
+bool IsPrint(const char* str, size_t len) {
+  return IsCharType(str, len, ascii_isprint);
 }
 
 // ----------------------------------------------------------------------

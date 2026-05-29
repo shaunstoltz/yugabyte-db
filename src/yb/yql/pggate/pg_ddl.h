@@ -1,5 +1,5 @@
 //--------------------------------------------------------------------------------------------------
-// Copyright (c) YugaByte, Inc.
+// Copyright (c) YugabyteDB, Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License"); you may not use this file except
 // in compliance with the License.  You may obtain a copy of the License at
@@ -21,50 +21,36 @@
 
 #include "yb/yql/pggate/pg_statement.h"
 
-namespace yb {
-namespace pggate {
+namespace yb::pggate {
 
 class PgDdl : public PgStatement {
- public:
-  explicit PgDdl(PgSession::ScopedRefPtr pg_session) : PgStatement(pg_session) {
-  }
+ protected:
+  explicit PgDdl(const PgSessionPtr& pg_session) : PgStatement(pg_session) {}
 };
 
-//--------------------------------------------------------------------------------------------------
-// CREATE DATABASE
-//--------------------------------------------------------------------------------------------------
-
-class PgCreateDatabase : public PgDdl {
+class PgCreateDatabase final : public PgStatementLeafBase<PgDdl, StmtOp::kCreateDatabase> {
  public:
-  PgCreateDatabase(PgSession::ScopedRefPtr pg_session,
-                   const char *database_name,
+  PgCreateDatabase(const PgSessionPtr& pg_session,
+                   const char* database_name,
                    PgOid database_oid,
                    PgOid source_database_oid,
                    PgOid next_oid,
-                   const bool colocated);
-  virtual ~PgCreateDatabase();
+                   YbcCloneInfo* yb_clone_info,
+                   bool colocated,
+                   bool use_transaction,
+                   bool use_regular_transaction_block);
 
-  void UseTransaction() {
-    req_.set_use_transaction(true);
-  }
-
-  StmtOp stmt_op() const override { return StmtOp::STMT_CREATE_DATABASE; }
-
-  // Execute.
   Status Exec();
 
  private:
   tserver::PgCreateDatabaseRequestPB req_;
 };
 
-class PgDropDatabase : public PgDdl {
+class PgDropDatabase final : public PgStatementLeafBase<PgDdl, StmtOp::kDropDatabase> {
  public:
-  PgDropDatabase(PgSession::ScopedRefPtr pg_session, const char *database_name, PgOid database_oid);
-  virtual ~PgDropDatabase();
+  PgDropDatabase(
+      const PgSessionPtr& pg_session, const char* database_name, PgOid database_oid);
 
-  StmtOp stmt_op() const override { return StmtOp::STMT_DROP_DATABASE; }
-
-  // Execute.
   Status Exec();
 
  private:
@@ -72,204 +58,267 @@ class PgDropDatabase : public PgDdl {
   const PgOid database_oid_;
 };
 
-class PgAlterDatabase : public PgDdl {
+class PgAlterDatabase final : public PgStatementLeafBase<PgDdl, StmtOp::kAlterDatabase> {
  public:
-  PgAlterDatabase(PgSession::ScopedRefPtr pg_session,
-                  const char *database_name,
-                  PgOid database_oid);
-  virtual ~PgAlterDatabase();
-
-  StmtOp stmt_op() const override { return StmtOp::STMT_ALTER_DATABASE; }
+  PgAlterDatabase(
+      const PgSessionPtr& pg_session, const char* database_name, PgOid database_oid);
 
   void RenameDatabase(const char *newname);
 
-  // Execute.
   Status Exec();
 
  private:
   tserver::PgAlterDatabaseRequestPB req_;
 };
 
-//--------------------------------------------------------------------------------------------------
-// CREATE / DROP TABLEGROUP
-//--------------------------------------------------------------------------------------------------
-
-class PgCreateTablegroup : public PgDdl {
+class PgCreateTablegroup final : public PgStatementLeafBase<PgDdl, StmtOp::kCreateTablegroup> {
  public:
-  // Assumes we are within a DDL transaction.
-  PgCreateTablegroup(PgSession::ScopedRefPtr pg_session,
-                     const char *database_name,
-                     const PgOid database_oid,
-                     const PgOid tablegroup_oid,
-                     const PgOid tablespace_oid);
-  virtual ~PgCreateTablegroup();
+  PgCreateTablegroup(
+      const PgSessionPtr& pg_session, const char* database_name, PgOid database_oid,
+      PgOid tablegroup_oid, PgOid tablespace_oid, bool use_regular_transaction_block);
 
-  StmtOp stmt_op() const override { return StmtOp::STMT_CREATE_TABLEGROUP; }
-
-  // Execute.
   Status Exec();
 
  private:
   tserver::PgCreateTablegroupRequestPB req_;
 };
 
-class PgDropTablegroup : public PgDdl {
+class PgDropTablegroup final : public PgStatementLeafBase<PgDdl, StmtOp::kDropTablegroup> {
  public:
-  PgDropTablegroup(PgSession::ScopedRefPtr pg_session,
-                   PgOid database_oid,
-                   PgOid tablegroup_oid);
-  virtual ~PgDropTablegroup();
+  PgDropTablegroup(
+      const PgSessionPtr& pg_session, PgOid database_oid, PgOid tablegroup_oid,
+      bool use_regular_transaction_block);
 
-  StmtOp stmt_op() const override { return StmtOp::STMT_DROP_TABLEGROUP; }
-
-  // Execute.
   Status Exec();
 
  private:
   tserver::PgDropTablegroupRequestPB req_;
 };
 
-//--------------------------------------------------------------------------------------------------
-// CREATE TABLE
-//--------------------------------------------------------------------------------------------------
-
-class PgCreateTable : public PgDdl {
+class PgCreateTableBase : public PgDdl {
  public:
-  PgCreateTable(PgSession::ScopedRefPtr pg_session,
-                const char *database_name,
-                const char *schema_name,
-                const char *table_name,
-                const PgObjectId& table_id,
-                bool is_shared_table,
-                bool if_not_exist,
-                bool add_primary_key,
-                bool is_colocated_via_database,
-                const PgObjectId& tablegroup_oid,
-                const ColocationId colocation_id,
-                const PgObjectId& tablespace_oid,
-                bool is_matview,
-                const PgObjectId& matview_pg_table_oid);
-
-  void SetupIndex(
-      const PgObjectId& base_table_id, bool is_unique_index, bool skip_index_backfill);
-
-  StmtOp stmt_op() const override;
-
-  Status AddColumn(const char *attr_name,
-                   int attr_num,
-                   int attr_ybtype,
-                   bool is_hash,
-                   bool is_range,
-                   SortingType sorting_type = SortingType::kNotSpecified) {
-    return AddColumnImpl(attr_name, attr_num, attr_ybtype, 20 /*INT8OID*/,
-                         is_hash, is_range, sorting_type);
+  Status AddColumn(
+      const char* attr_name, int attr_num, int attr_ybtype, bool is_hash, bool is_range,
+      SortingType sorting_type = SortingType::kNotSpecified) {
+    return AddColumnImpl(
+        attr_name, attr_num, attr_ybtype, 20 /*INT8OID*/, is_hash, is_range, sorting_type);
   }
 
-  Status AddColumn(const char *attr_name,
-                   int attr_num,
-                   const YBCPgTypeEntity *attr_type,
-                   bool is_hash,
-                   bool is_range,
-                   SortingType sorting_type = SortingType::kNotSpecified) {
-    return AddColumnImpl(attr_name, attr_num, attr_type->yb_type, attr_type->type_oid,
-                         is_hash, is_range, sorting_type);
+  Status AddColumn(
+      const char* attr_name, int attr_num, const YbcPgTypeEntity* attr_type, bool is_hash,
+      bool is_range, SortingType sorting_type = SortingType::kNotSpecified) {
+    return AddColumnImpl(
+        attr_name, attr_num, attr_type->yb_type, attr_type->type_oid, is_hash, is_range,
+        sorting_type);
   }
 
-  // Specify the number of tablets explicitly.
   Status SetNumTablets(int32_t num_tablets);
 
-  Status AddSplitBoundary(PgExpr **exprs, int expr_count);
+  Status SetHnswOptions(int m, int m0, int ef_construction);
 
-  void UseTransaction() {
-    req_.set_use_transaction(true);
-  }
+  Status SetVectorOptions(YbcPgVectorIdxOptions* options);
 
-  // Execute.
-  virtual Status Exec();
+  Status AddSplitBoundary(PgExpr** exprs, int expr_count);
+
+  Status Exec();
 
  protected:
-  virtual Status AddColumnImpl(
-      const char *attr_name, int attr_num, int attr_ybtype, int pg_type_oid, bool is_hash,
-      bool is_range, SortingType sorting_type = SortingType::kNotSpecified);
+  PgCreateTableBase(const PgSessionPtr& pg_session,
+                    const char* database_name,
+                    const char* schema_name,
+                    const char* table_name,
+                    const PgObjectId& table_id,
+                    bool is_shared_table,
+                    bool is_sys_catalog_table,
+                    bool if_not_exist,
+                    YbcPgYbrowidMode ybrowid_mode,
+                    bool is_colocated_via_database,
+                    const PgObjectId& tablegroup_oid,
+                    ColocationId colocation_id,
+                    const PgObjectId& tablespace_oid,
+                    bool is_matview,
+                    const PgObjectId& pg_table_oid,
+                    const PgObjectId& old_relfilenode_oid,
+                    bool is_truncate,
+                    bool use_transaction,
+                    bool use_regular_transaction_block);
+
+  tserver::PgCreateTableRequestPB req_;
 
  private:
-  tserver::PgCreateTableRequestPB req_;
+  Status AddColumnImpl(
+      const char* attr_name, int attr_num, int attr_ybtype, int pg_type_oid, bool is_hash,
+      bool is_range, SortingType sorting_type = SortingType::kNotSpecified);
 };
 
-class PgDropTable : public PgDdl {
+class PgCreateTable final : public PgStatementLeafBase<PgCreateTableBase, StmtOp::kCreateTable> {
  public:
-  PgDropTable(PgSession::ScopedRefPtr pg_session, const PgObjectId& table_id, bool if_exist);
-  virtual ~PgDropTable();
+  PgCreateTable(
+      const PgSessionPtr& pg_session,
+      const char* database_name,
+      const char* schema_name,
+      const char* table_name,
+      const PgObjectId& table_id,
+      bool is_shared_table,
+      bool is_sys_catalog_table,
+      bool if_not_exist,
+      YbcPgYbrowidMode ybrowid_mode,
+      bool is_colocated_via_database,
+      const PgObjectId& tablegroup_oid,
+      ColocationId colocation_id,
+      const PgObjectId& tablespace_oid,
+      bool is_matview,
+      const PgObjectId& pg_table_oid,
+      const PgObjectId& old_relfilenode_oid,
+      bool is_truncate,
+      bool use_transaction,
+      bool use_regular_transaction_block);
+};
 
-  StmtOp stmt_op() const override { return StmtOp::STMT_DROP_TABLE; }
+class PgCreateIndex final : public PgStatementLeafBase<PgCreateTableBase, StmtOp::kCreateIndex> {
+ public:
+  PgCreateIndex(
+      const PgSessionPtr& pg_session,
+      const char* database_name,
+      const char* schema_name,
+      const char* table_name,
+      const PgObjectId& table_id,
+      bool is_shared_table,
+      bool is_sys_catalog_table,
+      bool if_not_exist,
+      YbcPgYbrowidMode ybrowid_mode,
+      bool is_colocated_via_database,
+      const PgObjectId& tablegroup_oid,
+      ColocationId colocation_id,
+      const PgObjectId& tablespace_oid,
+      bool is_matview,
+      const PgObjectId& pg_table_oid,
+      const PgObjectId& old_relfilenode_oid,
+      bool is_truncate,
+      bool use_transaction,
+      bool use_regular_transaction_block,
+      const PgObjectId& base_table_id,
+      bool is_unique_index,
+      bool skip_index_backfill);
+};
 
-  // Execute.
+class PgDropTable final : public PgStatementLeafBase<PgDdl, StmtOp::kDropTable> {
+ public:
+  PgDropTable(
+      const PgSessionPtr& pg_session, const PgObjectId& table_id, bool if_exist,
+      bool use_regular_transaction_block);
+
   Status Exec();
 
  protected:
   const PgObjectId table_id_;
-  bool if_exist_;
+  const bool if_exist_;
+  const bool use_regular_transaction_block_;
 };
 
-class PgTruncateTable : public PgDdl {
+class PgTruncateTable final : public PgStatementLeafBase<PgDdl, StmtOp::kTruncateTable> {
  public:
-  PgTruncateTable(PgSession::ScopedRefPtr pg_session, const PgObjectId& table_id);
-  virtual ~PgTruncateTable();
+  PgTruncateTable(const PgSessionPtr& pg_session, const PgObjectId& table_id);
 
-  StmtOp stmt_op() const override { return StmtOp::STMT_TRUNCATE_TABLE; }
-
-  // Execute.
   Status Exec();
 
  private:
   tserver::PgTruncateTableRequestPB req_;
 };
 
-class PgDropIndex : public PgDropTable {
+class PgDropIndex final : public PgStatementLeafBase<PgDdl, StmtOp::kDropIndex> {
  public:
-  PgDropIndex(PgSession::ScopedRefPtr pg_session, const PgObjectId& index_id, bool if_exist);
-  virtual ~PgDropIndex();
+  PgDropIndex(
+      const PgSessionPtr& pg_session, const PgObjectId& index_id, bool if_exist,
+      bool ddl_rollback_enabled, bool use_regular_transaction_block);
 
-  StmtOp stmt_op() const override { return StmtOp::STMT_DROP_INDEX; }
-
-  // Execute.
   Status Exec();
+
+ private:
+  const PgObjectId index_id_;
+  const bool if_exist_;
+  const bool ddl_rollback_enabled_;
+  const bool use_regular_transaction_block_;
 };
 
-//--------------------------------------------------------------------------------------------------
-// ALTER TABLE
-//--------------------------------------------------------------------------------------------------
-
-class PgAlterTable : public PgDdl {
+class PgAlterTable final : public PgStatementLeafBase<PgDdl, StmtOp::kAlterTable> {
  public:
-  PgAlterTable(PgSession::ScopedRefPtr pg_session,
-               const PgObjectId& table_id);
+  PgAlterTable(const PgSessionPtr& pg_session,
+               const PgObjectId& table_id,
+               bool use_transaction,
+               bool use_regular_transaction_block);
 
   Status AddColumn(const char *name,
-                   const YBCPgTypeEntity *attr_type,
-                   int order);
+                   const YbcPgTypeEntity *attr_type,
+                   int order,
+                   YbcPgExpr missing_value);
 
   Status RenameColumn(const char *oldname, const char *newname);
 
   Status DropColumn(const char *name);
 
-  Status RenameTable(const char *db_name, const char *newname);
+  Status RenameTable(const char *newname);
 
   Status IncrementSchemaVersion();
 
+  Status SetTableId(const PgObjectId& table_id);
+
+  Status SetReplicaIdentity(const char identity_type);
+
+  Status SetSchema(const char *schema_name);
+
   Status Exec();
 
-  virtual ~PgAlterTable();
-
-  StmtOp stmt_op() const override { return StmtOp::STMT_ALTER_TABLE; }
-
-  void UseTransaction() {
-    req_.set_use_transaction(true);
-  }
+  void InvalidateTableCacheEntry();
 
  private:
   tserver::PgAlterTableRequestPB req_;
 };
 
-}  // namespace pggate
-}  // namespace yb
+class PgDropSequence final : public PgStatementLeafBase<PgDdl, StmtOp::kDropSequence> {
+ public:
+  PgDropSequence(const PgSessionPtr& pg_session, PgOid database_oid, PgOid sequence_oid);
+
+  Status Exec();
+
+ private:
+  const PgOid database_oid_;
+  const PgOid sequence_oid_;
+};
+
+class PgDropDBSequences final : public PgStatementLeafBase<PgDdl, StmtOp::kDropDbSequences> {
+ public:
+  PgDropDBSequences(const PgSessionPtr& pg_session, PgOid database_oid);
+
+  Status Exec();
+
+ private:
+  const PgOid database_oid_;
+};
+
+class PgCreateReplicationSlot final : public PgStatementLeafBase<
+                                                 PgDdl, StmtOp::kCreateReplicationSlot> {
+ public:
+  PgCreateReplicationSlot(
+      const PgSessionPtr& pg_session, const char* slot_name, const char* plugin_name,
+      PgOid database_oid, YbcPgReplicationSlotSnapshotAction snapshot_action,
+      YbcLsnType lsn_type, YbcOrderingMode yb_ordering_mode);
+
+  Result<tserver::PgCreateReplicationSlotResponsePB> Exec();
+
+ private:
+  tserver::PgCreateReplicationSlotRequestPB req_;
+};
+
+class PgDropReplicationSlot final : public PgStatementLeafBase<
+                                               PgDdl, StmtOp::kDropReplicationSlot> {
+ public:
+  PgDropReplicationSlot(const PgSessionPtr& pg_session, const char *slot_name);
+
+  Status Exec();
+
+ private:
+  tserver::PgDropReplicationSlotRequestPB req_;
+};
+
+}  // namespace yb::pggate

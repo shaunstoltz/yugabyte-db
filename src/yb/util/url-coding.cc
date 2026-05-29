@@ -15,9 +15,9 @@
 // specific language governing permissions and limitations
 // under the License.
 //
-// The following only applies to changes made to this file as part of YugaByte development.
+// The following only applies to changes made to this file as part of YugabyteDB development.
 //
-// Portions Copyright (c) YugaByte, Inc.
+// Portions Copyright (c) YugabyteDB, Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License"); you may not use this file except
 // in compliance with the License.  You may obtain a copy of the License at
@@ -48,7 +48,7 @@
 #include <boost/archive/iterators/binary_from_base64.hpp>
 #include <boost/archive/iterators/transform_width.hpp>
 
-#include <glog/logging.h>
+#include "yb/util/logging.h"
 
 using std::string;
 using std::vector;
@@ -207,19 +207,9 @@ bool Base64Decode(const string& in, string* out) {
   return true;
 }
 
-void EscapeForHtml(const string& in, std::stringstream* out) {
-  DCHECK(out != nullptr);
-  for (const char& c : in) {
-    switch (c) {
-      case '<': (*out) << "&lt;";
-                break;
-      case '>': (*out) << "&gt;";
-                break;
-      case '&': (*out) << "&amp;";
-                break;
-      default: (*out) << c;
-    }
-  }
+void EscapeForHtml(const string& in, std::ostream* out) {
+  auto ss = std::istringstream(in);
+  EscapeForHtml(&ss, out);
 }
 
 std::string EscapeForHtmlToString(const std::string& in) {

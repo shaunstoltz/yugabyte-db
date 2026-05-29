@@ -15,9 +15,9 @@
 // specific language governing permissions and limitations
 // under the License.
 //
-// The following only applies to changes made to this file as part of YugaByte development.
+// The following only applies to changes made to this file as part of YugabyteDB development.
 //
-// Portions Copyright (c) YugaByte, Inc.
+// Portions Copyright (c) YugabyteDB, Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License"); you may not use this file except
 // in compliance with the License.  You may obtain a copy of the License at
@@ -67,22 +67,34 @@ class TabletServerPathHandlers {
                          Webserver::WebResponse* resp);
   void HandleOperationsPage(const Webserver::WebRequest& req,
                             Webserver::WebResponse* resp);
+  void HandleRemoteBootstrapsPage(const Webserver::WebRequest& req,
+                                  Webserver::WebResponse* resp);
+  void HandleObjectLocksPage(const Webserver::WebRequest& req, Webserver::WebResponse* resp);
+  void HandleCgroupsPage(const Webserver::WebRequest& req, Webserver::WebResponse* resp);
   void HandleDashboardsPage(const Webserver::WebRequest& req,
                             Webserver::WebResponse* resp);
   void HandleIntentsDBPage(const Webserver::WebRequest& req,
                            Webserver::WebResponse* resp);
   void HandleMaintenanceManagerPage(const Webserver::WebRequest& req,
                                     Webserver::WebResponse* resp);
+  void HandleXClusterPage(const Webserver::WebRequest& req, Webserver::WebResponse* resp);
+  void HandleXClusterJSON(const Webserver::WebRequest& req, Webserver::WebResponse* resp);
   void HandleHealthCheck(const Webserver::WebRequest& req,
                          Webserver::WebResponse* resp);
   void HandleVersionInfoDump(const Webserver::WebRequest& req,
                               Webserver::WebResponse* resp);
   void HandleListMasterServers(const Webserver::WebRequest& req,
                                Webserver::WebResponse* resp);
+  void HandleTabletsJSON(const Webserver::WebRequest& req,
+                         Webserver::WebResponse* resp);
+  void HandleSnapshotsPage(const Webserver::WebRequest& req,
+                           Webserver::WebResponse* resp);
+  void HandleTabletMetaCacheJSON(const Webserver::WebRequest& req, Webserver::WebResponse* resp);
 
   std::string ConsensusStatePBToHtml(const consensus::ConsensusStatePB& cstate) const;
   std::string GetDashboardLine(const std::string& link,
                                const std::string& text, const std::string& desc);
+  void OutputConnectivity(std::ostream& output);
 
   TabletServer* const tserver_;
 

@@ -1,4 +1,4 @@
-// Copyright (c) YugaByte, Inc.
+// Copyright (c) YugabyteDB, Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License"); you may not use this file except
 // in compliance with the License.  You may obtain a copy of the License at
@@ -105,7 +105,6 @@ public class BaseCQLTest extends BaseMiniClusterTest {
         String.valueOf(systemQueryCacheEmptyResponses));
     flagMap.put("client_read_write_timeout_ms",
         String.valueOf(BuildTypeUtil.adjustTimeout(clientReadWriteTimeoutMs)));
-
     return flagMap;
   }
 
@@ -186,6 +185,7 @@ public class BaseCQLTest extends BaseMiniClusterTest {
         break;
       }
       LOG.info("system.peers still contains only " + numPeers + " entries, waiting");
+      attemptsMade++;
       Thread.sleep(1000);
     }
     if (waitSuccessful) {
@@ -269,12 +269,20 @@ public class BaseCQLTest extends BaseMiniClusterTest {
     afterBaseCQLTestTearDown();
   }
 
-  protected void restartClusterWithFlag(String flag, String value) throws Exception {
+  protected void restartClusterWithTSFlags(Map<String, String> tserverFlags) throws Exception {
     destroyMiniCluster();
-    createMiniCluster(
-        Collections.emptyMap(),
-        Collections.singletonMap(flag, value));
+    createMiniCluster(Collections.emptyMap(), tserverFlags);
     setUpCqlClient();
+  }
+
+  protected void restartClusterWithMasterFlags(Map<String, String> masterFlags) throws Exception {
+    destroyMiniCluster();
+    createMiniCluster(masterFlags, Collections.emptyMap());
+    setUpCqlClient();
+  }
+
+  protected void restartClusterWithFlag(String flag, String value) throws Exception {
+    restartClusterWithTSFlags(Collections.singletonMap(flag, value));
   }
 
   protected void afterBaseCQLTestTearDown() throws Exception {

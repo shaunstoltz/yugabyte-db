@@ -1,10 +1,12 @@
-import React, { useState, ReactElement } from 'react';
+import { useState, ReactElement } from 'react';
 import _ from 'lodash';
 import * as Yup from 'yup';
 import clsx from 'clsx';
+import { useQuery } from 'react-query';
+import { useSelector } from 'react-redux';
 import { Box } from '@material-ui/core';
-import { Control, useFieldArray } from 'react-hook-form';
-import { useUpdateEffect } from 'react-use';
+import { useFieldArray } from 'react-hook-form';
+import { useEffectOnce, useUpdateEffect } from 'react-use';
 import { useTranslation } from 'react-i18next';
 import {
   Alert,
@@ -19,16 +21,27 @@ import { BootstrapTable, TableHeaderColumn } from 'react-bootstrap-table';
 import { YBModalForm } from '../../../../../../../components/common/forms';
 import AddGFlag from '../../../../../../../components/universes/UniverseForm/AddGFlag';
 import EditorGFlag from '../../../../../../../components/universes/UniverseForm/EditorGFlag';
+import { GFlagRowProps } from '../../../../../../../components/universes/UniverseForm/EditGFlagsConf';
 import { useWhenMounted } from '../../../../../../helpers/hooks';
 import { validateGFlags } from '../../../../../../../actions/universe';
-import { UniverseFormData, Gflag } from '../../../utils/dto';
+import { Gflag } from '../../../utils/dto';
+import { MULTILINE_GFLAGS_ARRAY, SENSITIVE_INFO } from '../../../../../../../utils/UniverseUtils';
+import {
+  GFlagGroupObject,
+  GFlagValues,
+  getFlagsByGroupName
+} from '../../../../universe-actions/edit-gflags/GflagHelper';
+import { api, QUERY_KEY } from '../../../../../../utils/api';
+import { isVersionPGSupported } from '../../../utils/helpers';
+import { GFLAG_GROUPS } from '../../../../../../helpers/constants';
 //Icons
-import Edit from '../../../../../../assets/edit_pen.svg';
-import Close from '../../../../../../assets/close.svg';
-import Plus from '../../../../../../assets/plus.svg';
-import MoreIcon from '../../../../../../assets/ellipsis.svg';
+import EditIcon from '../../../../../../assets/edit_pen.svg?img';
+import CloseIcon from '../../../../../../assets/close.svg?img';
+import PlusIcon from '../../../../../../assets/plus.svg?img';
+import MoreIcon from '../../../../../../assets/ellipsis.svg?img';
+import '../../../../../../../components/universes/UniverseForm/UniverseForm.scss';
 
-/* TODO : 
+/* TODO :
 1. Rewrite this file with proper types
 2. Integrate with react-query
 3. Rewrite AddGflag and EditorGflag with typescript and react-query
@@ -38,9 +51,13 @@ import MoreIcon from '../../../../../../assets/ellipsis.svg';
 interface GflagsFieldProps {
   dbVersion: string;
   fieldPath: string;
-  control: Control<Partial<UniverseFormData>>;
+  control: any;
   editMode: boolean;
   isReadOnly: boolean;
+  isReadReplica: boolean;
+  tableMaxHeight?: string;
+  isGFlagMultilineConfEnabled: boolean;
+  isPGSupported: boolean;
 }
 
 interface SelectedOption {
@@ -48,8 +65,15 @@ interface SelectedOption {
   server: string;
   mode?: string;
   label?: string;
+  tserverFlagDetails?: FlagDetails;
+  masterFlagDetails?: FlagDetails;
   flagname?: string;
   flagvalue?: any;
+}
+
+interface FlagDetails {
+  flagvalueobject?: GFlagRowProps[];
+  previewFlagValue?: string;
 }
 
 interface GflagValidationObject {
@@ -66,8 +90,8 @@ interface GflagValidationResponse {
 export type SERVER = 'MASTER' | 'TSERVER';
 
 //server
-const MASTER = 'MASTER';
-const TSERVER = 'TSERVER';
+export const MASTER = 'MASTER';
+export const TSERVER = 'TSERVER';
 //options
 const FREE_TEXT = 'FREE_TEXT';
 const ADD_GFLAG = 'ADD_GFLAG';
@@ -75,26 +99,61 @@ const ADD_GFLAG = 'ADD_GFLAG';
 const CREATE = 'CREATE';
 const EDIT = 'EDIT';
 
-export type GFlagWithId = Gflag & { id: string };
+export type AddGFlagObject = { [SERVER: string]: any; Name: string };
+export type GFlagConfServerProps = {
+  ConfValue: GFlagRowProps[];
+  PreviewConfValue: string;
+};
+export type GFlagConf = {
+  tserverFlagDetails?: GFlagConfServerProps;
+  masterFlagDetails?: GFlagConfServerProps;
+};
+export type GFlagWithId = Gflag & { id: string } & GFlagConf;
+export type AddGFlagConfObject = AddGFlagObject & GFlagConf;
 
 export const GFlagsField = ({
   dbVersion,
   fieldPath,
   control,
   editMode = false,
-  isReadOnly = false
+  isReadOnly = false,
+  isReadReplica = false,
+  tableMaxHeight,
+  isGFlagMultilineConfEnabled,
+  isPGSupported
 }: GflagsFieldProps): ReactElement => {
   const { fields, append, insert, remove } = useFieldArray({
     name: fieldPath as any,
     control
   });
+  const [modalProps, setModalProps] = useState<any>(null);
   const [selectedProps, setSelectedProps] = useState<SelectedOption | null>(null);
   const [toggleModal, setToggleModal] = useState(false);
+  const [isJWKSKeyDialogOpen, setIsJWKSKeyDialogOpen] = useState<boolean>(false);
   const [validationError, setValidationError] = useState([]);
   const [formError, setFormError] = useState<string | null>(null);
   const [versionError, setVersionError] = useState<string | null>(null);
   const whenMounted = useWhenMounted();
   const { t } = useTranslation();
+  const featureFlags = useSelector((state: any) => state.featureFlags);
+  const enableRRGflags = featureFlags.test.enableRRGflags || featureFlags.released.enableRRGflags;
+
+  const { data: pgFlags, isLoading } = useQuery<GFlagGroupObject[]>(
+    [QUERY_KEY.getGflagGroups],
+    () => api.getGflagGroups(dbVersion, GFLAG_GROUPS.ENHANCED_POSTGRES_COMPATIBILITY),
+    {
+      enabled: isPGSupported && isVersionPGSupported(dbVersion)
+    }
+  );
+
+  const { data: gflagValues } = useQuery<GFlagValues[]>([QUERY_KEY.getGflagGroups], () =>
+    api.fetchGFlags(dbVersion, selectedProps?.server ?? TSERVER)
+  );
+
+  // selectedProps
+  const pgGroupFlags = isPGSupported
+    ? getFlagsByGroupName(pgFlags, GFLAG_GROUPS.ENHANCED_POSTGRES_COMPATIBILITY)
+    : {};
 
   //options Array -- TO DRY THE CODE
   const OPTIONS = [
@@ -106,7 +165,7 @@ export const GFlagsField = ({
           {t('universeForm.gFlags.addGflags')}
         </>
       ),
-      className: 'btn btn-orange mr-10',
+      className: 'btn btn-orange mr-10 btn-add-gflag',
       bsStyle: 'danger'
     },
     {
@@ -117,18 +176,21 @@ export const GFlagsField = ({
           {t('universeForm.gFlags.addJson')}
         </>
       ),
-      className: 'btn btn-default'
+      className: 'btn btn-orange mr-10',
+      bsStyle: 'danger'
     }
   ];
   //server list - TO DRY THE CODE
   const SERVER_LIST = [
     {
       serverName: TSERVER,
-      label: t('universeForm.gFlags.addToTServer')
+      label: t('universeForm.gFlags.addToTServer'),
+      visible: true
     },
     {
       serverName: MASTER,
-      label: t('universeForm.gFlags.addToMaster')
+      label: t('universeForm.gFlags.addToMaster'),
+      visible: !isReadReplica
     }
   ];
 
@@ -176,7 +238,7 @@ export const GFlagsField = ({
           const newFlagArr: Gflag[] = [];
           if (Object.keys(formValues).length > 0) {
             Object.entries(formValues).forEach(([key, val]) => {
-              const obj = { Name: key, [values?.server]: val };
+              const obj = { Name: key, [values?.server]: val, isNewlyAdded: true };
               checkExistsAndPush(obj);
               newFlagArr.push(obj);
             });
@@ -194,7 +256,29 @@ export const GFlagsField = ({
       }
 
       case ADD_GFLAG: {
-        const obj = { Name: values?.flagname, [values?.server]: values?.flagvalue };
+        const obj: AddGFlagConfObject = {
+          Name: values?.flagname,
+          [values?.server]: values?.flagvalue,
+          isNewlyAdded: true
+        };
+        if (values?.tags !== null) obj.tags = values.tags;
+        if (values?.requiresRestart !== null) obj.requiresRestart = values.requiresRestart;
+        if (MULTILINE_GFLAGS_ARRAY.includes(values?.server)) {
+          // In case of any multi-line csv flags, the below variables
+          // will have concatenated string and preview flag value to be displayed
+          if (values?.server === TSERVER) {
+            obj.tserverFlagDetails = {
+              ConfValue: values?.tserverFlagDetails?.flagvalueobject,
+              PreviewConfValue: values?.tserverFlagDetails?.previewFlagValue
+            };
+          } else {
+            obj.masterFlagDetails = {
+              ConfValue: values?.masterFlagDetails?.flagvalueobject,
+              PreviewConfValue: values?.masterFlagDetails?.previewFlagValue
+            };
+          }
+        }
+
         checkExistsAndPush(obj);
         callValidation([obj]);
         setToggleModal(false);
@@ -221,7 +305,9 @@ export const GFlagsField = ({
     });
   };
 
-  useUpdateEffect(onVersionChange, [dbVersion]);
+  useUpdateEffect(onVersionChange, [dbVersion, isReadReplica]);
+
+  useEffectOnce(onVersionChange);
 
   const errorPopover = (title: string, msg: string) => (
     <OverlayTrigger
@@ -263,7 +349,7 @@ export const GFlagsField = ({
               }
             >
               <Button bsClass="flag-icon-button mb-2" onClick={() => remove(index)}>
-                <img alt="Remove" src={Close} width="22" />
+                <img alt="Remove" src={CloseIcon} width="22" />
               </Button>
             </OverlayTrigger>
             &nbsp;
@@ -299,12 +385,33 @@ export const GFlagsField = ({
       mode: EDIT
     };
 
-    if (isReadOnly) return <span className="cell-font">{valueExists ? `${cell}` : ''}</span>;
+    const isPasswordField = gflagValues?.find(
+      (gflag: GFlagValues) => gflag.name === row?.Name && gflag.tags?.includes(SENSITIVE_INFO)
+    );
+
+    if (isReadOnly)
+      return (
+        <span className="cell-font">
+          {valueExists
+            ? isPasswordField
+              ? '*'.repeat(Math.min(String(cell).length, 15))
+              : `${cell}`
+            : ''}
+        </span>
+      );
     if (valueExists) {
       modalProps = {
         ...modalProps,
         flagname: row?.Name,
-        flagvalue: row[server]
+        flagvalue: row[server],
+        tserverFlagDetails: {
+          flagvalueobject: row?.tserverFlagDetails?.ConfValue,
+          previewFlagValue: row?.tserverFlagDetails?.PreviewConfValue
+        },
+        masterFlagDetails: {
+          flagvalueobject: row?.masterFlagDetails?.ConfValue,
+          previewFlagValue: row?.masterFlagDetails?.PreviewConfValue
+        }
       };
       if (isError) modalProps['errorMsg'] = eInfo[server]?.error;
 
@@ -318,7 +425,9 @@ export const GFlagsField = ({
 
       return (
         <div className={clsx('table-val-column', isError && 'error-val-column')}>
-          <div className="cell-font">{`${cell}`}</div>
+          <div className="cell-font">
+            {isPasswordField ? '*'.repeat(Math.min(String(cell).length, 15)) : `${cell}`}
+          </div>
           <div className="icons">
             <div className="more-icon">
               <Button
@@ -342,7 +451,7 @@ export const GFlagsField = ({
                     bsClass="flag-icon-button mr-10 mb-2"
                     onClick={() => handleSelectedOption(modalProps)}
                   >
-                    <img alt="Edit" src={Edit} width="20" />
+                    <img alt="Edit" src={EditIcon} width="20" />
                   </Button>
                 </OverlayTrigger>
               )}
@@ -363,7 +472,7 @@ export const GFlagsField = ({
                     handleRemoveFlag(row, index, server, checkFlagExistsOnOtherServer(server))
                   }
                 >
-                  <img alt="Remove" src={Close} width="22" />
+                  <img alt="Remove" src={CloseIcon} width="22" />
                 </Button>
               </OverlayTrigger>
             </div>
@@ -386,13 +495,13 @@ export const GFlagsField = ({
         flagname: row?.Name
       };
       return (
-        <div className="table-val-column">
+        <div className={clsx('table-val-column', 'empty-cell', notExists && 'no-border')}>
           {isFlagExist && (
             <Button
               bsClass="flag-icon-button display-inline-flex mb-2"
               onClick={() => handleSelectedOption(modalProps)}
             >
-              <img alt="Add" src={Plus} width="20" />
+              <img alt="Add" src={PlusIcon} width="20" />
               <span className="add-label">{t('universeForm.gFlags.addValue')}</span>
             </Button>
           )}
@@ -407,27 +516,34 @@ export const GFlagsField = ({
       <div className={isReadOnly ? 'gflag-read-table' : 'gflag-edit-table'}>
         <BootstrapTable
           data={fields}
-          height={editMode ? '420px' : 'auto'}
-          maxHeight="420px"
+          height={tableMaxHeight ?? 'auto'}
+          maxHeight={tableMaxHeight ?? '420px'}
           tableStyle={{ overflow: 'scroll' }}
         >
-          <TableHeaderColumn width="40%" dataField="Name" dataFormat={nameFormatter} isKey>
+          <TableHeaderColumn
+            width={isReadReplica ? '50%' : '30%'}
+            dataField="Name"
+            dataFormat={nameFormatter}
+            isKey
+          >
             <span className="header-title">{t('universeForm.gFlags.flagName')}</span>
           </TableHeaderColumn>
           <TableHeaderColumn
             dataField="TSERVER"
-            width="30%"
+            width={isReadReplica ? '30%' : '25%'}
             dataFormat={(cell, row, e, index) => valueFormatter(cell, row, index, TSERVER)}
           >
             <span className="header-title">{t('universeForm.gFlags.tServerValue')}</span>
           </TableHeaderColumn>
-          <TableHeaderColumn
-            dataField="MASTER"
-            width="30%"
-            dataFormat={(cell, row, e, index) => valueFormatter(cell, row, index, MASTER)}
-          >
-            <span className="header-title">{t('universeForm.gFlags.masterValue')}</span>
-          </TableHeaderColumn>
+          {!isReadReplica && (
+            <TableHeaderColumn
+              dataField="MASTER"
+              width="25%"
+              dataFormat={(cell, row, e, index) => valueFormatter(cell, row, index, MASTER)}
+            >
+              <span className="header-title">{t('universeForm.gFlags.masterValue')}</span>
+            </TableHeaderColumn>
+          )}
         </BootstrapTable>
       </div>
     );
@@ -440,23 +556,58 @@ export const GFlagsField = ({
       }
 
       case ADD_GFLAG:
-        return <AddGFlag formProps={formProps} gFlagProps={{ ...selectedProps, dbVersion }} />;
+        return (
+          <AddGFlag
+            formProps={formProps}
+            updateJWKSDialogStatus={updateJWKSDialogStatus}
+            disabledFlags={pgGroupFlags}
+            gFlagProps={{
+              ...selectedProps,
+              dbVersion,
+              existingFlags: fields,
+              isGFlagMultilineConfEnabled,
+              editMode,
+              pgGroupFlags
+            }}
+          />
+        );
 
       default:
         return null;
     }
   };
 
+  const updateJWKSDialogStatus = (status: boolean) => {
+    setIsJWKSKeyDialogOpen(status);
+  };
+
   const renderModal = () => {
     const gflagSchema = Yup.object().shape({
       flagvalue: Yup.mixed().required(t('universeForm.validation.fieldRequired'))
     });
-    const modalTitle =
+    let modalTitle =
       selectedProps?.mode === CREATE
         ? selectedProps?.label
         : t('universeForm.gFlags.editFlagValue');
     const modalLabel =
       selectedProps?.mode === CREATE ? t('universeForm.gFlags.addFlag') : t('common.confirm');
+    if (enableRRGflags) {
+      if (isReadReplica)
+        modalTitle =
+          t('universeForm.gFlags.rrTab') +
+          ' / ' +
+          selectedProps?.server +
+          ' / ' +
+          t('universeForm.gFlags.addFlag');
+      else
+        modalTitle =
+          t('universeForm.gFlags.primaryTab') +
+          ' / ' +
+          selectedProps?.server +
+          ' / ' +
+          t('universeForm.gFlags.addFlag');
+    }
+
     return (
       <YBModalForm
         title={modalTitle}
@@ -470,7 +621,13 @@ export const GFlagsField = ({
         onHide={() => setToggleModal(false)}
         onFormSubmit={handleFormSubmit}
         render={(properties: any) => renderOption(properties)}
-        dialogClassName={toggleModal ? 'gflag-modal modal-fade in' : 'modal-fade'}
+        dialogClassName={
+          toggleModal
+            ? isJWKSKeyDialogOpen
+              ? 'gflag-modal modal-fade partial'
+              : 'gflag-modal modal-fade in'
+            : 'modal-fade'
+        }
         headerClassName="add-flag-header"
         showBackButton={true}
       />
@@ -479,27 +636,34 @@ export const GFlagsField = ({
 
   const renderBanner = () => {
     return (
-      <div className="gflag-empty-banner">
+      <div className="gflag-empty-banner-new ">
         <span className="empty-text">{t('universeForm.gFlags.noFlags')}</span>
       </div>
     );
   };
 
   return (
-    <Box display="flex" width="100%" flexDirection="column">
+    <Box display="flex" width="100%" height="100%" flexDirection="column">
       {versionError && (
         <Alert bsStyle="danger">
           {versionError} ({t('universeForm.gFlags.selectedDBVersion')}
           <b>{dbVersion}</b>)
         </Alert>
       )}
-      <Box flexShrink={1} flexDirection="row">
+      {isLoading && <span>Loading Gflag groups ...</span>}
+      <Box flexShrink={1} mt={0.5} flexDirection="row">
         {!isReadOnly &&
           OPTIONS.map((option) => {
             const { optionName, ...rest } = option;
             return (
-              <DropdownButton {...rest} bsSize="small" id={optionName} key={optionName}>
-                {SERVER_LIST.map((server) => {
+              <DropdownButton
+                {...rest}
+                bsSize="small"
+                id={optionName}
+                key={optionName}
+                disabled={isLoading}
+              >
+                {SERVER_LIST.filter((e) => e.visible).map((server) => {
                   const { serverName, label } = server;
                   const serverProps = {
                     option: optionName,
@@ -511,6 +675,7 @@ export const GFlagsField = ({
                     <MenuItem
                       key={optionName + '-' + serverName}
                       onClick={() => handleSelectedOption(serverProps)}
+                      data-testid={optionName + '-' + serverName}
                     >
                       {label}
                     </MenuItem>

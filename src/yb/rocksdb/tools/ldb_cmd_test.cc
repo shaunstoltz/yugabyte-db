@@ -3,9 +3,9 @@
 //  LICENSE file in the root directory of this source tree. An additional grant
 //  of patent rights can be found in the PATENTS file in the same directory.
 //
-// The following only applies to changes made to this file as part of YugaByte development.
+// The following only applies to changes made to this file as part of YugabyteDB development.
 //
-// Portions Copyright (c) YugaByte, Inc.
+// Portions Copyright (c) YugabyteDB, Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License"); you may not use this file except
 // in compliance with the License.  You may obtain a copy of the License at
@@ -34,9 +34,8 @@ using std::map;
 DECLARE_bool(TEST_exit_on_finish);
 
 const string kDbName = "/lbd_cmd_test";
-const string kKeyFileOption = "--key_file=" + rocksdb::DBTestBase::kKeyId + ":" +
-                              rocksdb::DBTestBase::kKeyFile;
-
+const string kKeyFileOption = "--key_file=" + std::string(rocksdb::DBTestBase::kKeyId) + ":" +
+                              std::string(rocksdb::DBTestBase::kKeyFile);
 
 class LdbCmdTest : public rocksdb::DBTestBase, public testing::WithParamInterface<bool> {
  public:
@@ -103,7 +102,7 @@ TEST_P(LdbCmdTest, HexToStringBadInputs) {
 }
 
 TEST_P(LdbCmdTest, Scan) {
-  FLAGS_TEST_exit_on_finish = false;
+  ANNOTATE_UNPROTECTED_WRITE(FLAGS_TEST_exit_on_finish) = false;
   ASSERT_OK(WriteRecordsAndFlush());
   auto args = CreateArgs("scan");
   args.push_back("--only_verify_checksums");
@@ -111,7 +110,7 @@ TEST_P(LdbCmdTest, Scan) {
 }
 
 TEST_P(LdbCmdTest, CheckConsistency) {
-  FLAGS_TEST_exit_on_finish = false;
+  ANNOTATE_UNPROTECTED_WRITE(FLAGS_TEST_exit_on_finish) = false;
   ASSERT_OK(WriteRecordsAndFlush());
   auto args = CreateArgs("checkconsistency");
   ASSERT_NO_FATALS(RunLdb(args));

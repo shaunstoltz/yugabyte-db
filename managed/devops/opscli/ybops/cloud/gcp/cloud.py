@@ -1,6 +1,6 @@
 #!/usr/bin/env python
 #
-# Copyright 2019 YugaByte, Inc. and Contributors
+# Copyright 2019 YugabyteDB, Inc. and Contributors
 #
 # Licensed under the Polyform Free Trial License 1.0.0 (the "License"); you
 # may not use this file except in compliance with the License. You
@@ -12,7 +12,7 @@ import json
 import logging
 import time
 
-from ybops.cloud.common.cloud import AbstractCloud
+from ybops.cloud.common.cloud import AbstractCloud, InstanceState
 from ybops.cloud.gcp.command import (GcpAccessCommand, GcpInstanceCommand, GcpNetworkCommand,
                                      GcpQueryCommand)
 from ybops.cloud.gcp.utils import (GCP_SCRATCH, GcpMetadata, GoogleCloudAdmin)
@@ -69,28 +69,21 @@ class GcpCloud(AbstractCloud):
         return subnet['ipCidrRange']
 
     def create_instance(self, args, server_type, can_ip_forward, machine_image, ssh_keys):
-        # If we are configuring second NIC, ensure that this only happens for a
-        # centOS AMI right now.
-        if args.cloud_subnet_secondary:
-            # GCP machine image for centos is of the form:
-            # https://www.googleapis.com/compute/beta/projects/centos-cloud/global/images/*
-            supported_os = ['centos', 'almalinux']
-            if not any(os_type in machine_image for os_type in supported_os):
-                raise YBOpsRuntimeError(
-                    "Second NIC can only be configured for CentOS/Alma right now")
-
         self.get_admin().create_instance(
             args.region, args.zone, args.cloud_subnet, args.search_pattern, args.instance_type,
-            server_type, args.use_preemptible, can_ip_forward, machine_image, args.num_volumes,
+            server_type, args.use_spot_instance, can_ip_forward, machine_image, args.num_volumes,
             args.volume_type, args.volume_size, args.boot_disk_size_gb, args.assign_public_ip,
             args.assign_static_public_ip, ssh_keys, boot_script=args.boot_script,
             auto_delete_boot_disk=args.auto_delete_boot_disk, tags=args.instance_tags,
-            cloud_subnet_secondary=args.cloud_subnet_secondary)
+            cloud_subnet_secondary=args.cloud_subnet_secondary,
+            gcp_instance_template=args.instance_template, disk_iops=args.disk_iops,
+            disk_throughput=args.disk_throughput, capacity_reservation=args.capacity_reservation)
 
     def create_disk(self, args, body):
         self.get_admin().create_disk(args.zone, args.instance_tags, body)
 
-    def clone_disk(self, args, volume_id, num_disks):
+    def clone_disk(self, args, volume_id, num_disks,
+                   snapshot_creation_delay=15, snapshot_creation_max_attempts=80):
         output = []
         # disk names must match regex https://cloud.google.com/compute/docs/reference/rest/v1/disks
         name = args.search_pattern[:58] if len(args.search_pattern) > 58 else args.search_pattern
@@ -109,15 +102,27 @@ class GcpCloud(AbstractCloud):
         return output
 
     def mount_disk(self, args, body):
+        logging.info("Mounting disk on host {} in zone {}; volume info is {}".format(
+                     args['search_pattern'], args['zone'], body))
         self.get_admin().mount_disk(args['zone'], args['search_pattern'], body)
 
     def unmount_disk(self, args, name):
+        logging.info("Unmounting disk {} from host {} in zone {}".format(
+                     name, args['search_pattern'], args['zone']))
         self.get_admin().unmount_disk(args['zone'], args['search_pattern'], name)
 
-    def stop_instance(self, args):
-        instance = self.get_admin().get_instances(args['zone'], args['search_pattern'])
+    def get_disk(self, host_info, volume_id, args):
+        logging.info("Retrieving disk {} from host {} in zone {}".format(
+                     volume_id, host_info['search_pattern'], host_info['zone']))
+        return self.get_admin().get_disk(host_info['zone'],
+                                         host_info['search_pattern'],
+                                         volume_id)
+
+    def stop_instance(self, host_info):
+        instance = self.get_admin().get_instances(host_info['zone'], host_info['search_pattern'],
+                                                  node_uuid=host_info.get('node_uuid', None))
         if not instance:
-            logging.error("Host {} does not exist".format(args['search_pattern']))
+            logging.error("Host {} does not exist".format(host_info['search_pattern']))
             return
         instance_state = instance['instance_state']
         if instance_state == 'TERMINATED':
@@ -132,16 +137,18 @@ class GcpCloud(AbstractCloud):
             raise YBOpsRuntimeError("Host {} cannot be stopped while in '{}' state".format(
                 instance['name'], instance_state))
 
-    def start_instance(self, args, ssh_ports):
-        instance = self.get_admin().get_instances(args['zone'], args['search_pattern'])
+    def start_instance(self, host_info, server_ports, capacity_reservation=None):
+        instance = self.get_admin().get_instances(host_info['zone'], host_info['search_pattern'],
+                                                  node_uuid=host_info.get('node_uuid', None))
+        logging.info("The instance is {}".format(instance))
         if not instance:
-            logging.error("Host {} does not exist".format(args['search_pattern']))
+            logging.error("Host {} does not exist".format(host_info['search_pattern']))
             return
         instance_state = instance['instance_state']
         if instance_state == 'RUNNING':
             pass
         elif instance_state == 'TERMINATED':
-            self.admin.start_instance(instance['zone'], instance['name'])
+            self.admin.start_instance(instance['zone'], instance['name'], capacity_reservation)
         elif instance_state in ('PROVISIONING', 'STAGING'):
             self.admin.wait_for_operation(zone=instance['zone'],
                                           instance=instance['name'],
@@ -149,7 +156,7 @@ class GcpCloud(AbstractCloud):
         else:
             raise YBOpsRuntimeError("Host {} cannot be started while in '{}' state".format(
                 instance['name'], instance_state))
-        self.wait_for_ssh_ports(instance['private_ip'], instance['name'], ssh_ports)
+        self.wait_for_server_ports(instance['private_ip'], instance['name'], server_ports)
 
     def delete_instance(self, args, filters=None):
         host_info = self.get_host_info(args, filters=filters)
@@ -166,9 +173,19 @@ class GcpCloud(AbstractCloud):
         self.get_admin().delete_instance(
             args.region, args.zone, args.search_pattern, has_static_ip=args.delete_static_public_ip)
 
-    def reboot_instance(self, host_info, ssh_ports):
+    def reboot_instance(self, host_info, server_ports):
         self.admin.reboot_instance(host_info['zone'], host_info['name'])
-        self.wait_for_ssh_ports(host_info['private_ip'], host_info['name'], ssh_ports)
+        self.wait_for_server_ports(host_info["private_ip"], host_info["id"], server_ports)
+
+    def update_user_data(self, args):
+        if args.boot_script is None:
+            return
+        boot_script = ''
+        with open(args.boot_script, 'r') as script:
+            boot_script = script.read()
+        instance = self.get_host_info(args)
+        logging.info("[app] Updating the user_data for the instance {}".format(instance['id']))
+        self.get_admin().update_boot_script(args, instance, boot_script)
 
     def get_regions(self, args):
         regions_we_know_of = self.get_admin().get_regions()
@@ -278,11 +295,17 @@ class GcpCloud(AbstractCloud):
                         }
                     if region in result[name]["prices"]:
                         continue
-                    result[name]["prices"][region] = self.get_os_price_map(pricing_map,
-                                                                           name,
-                                                                           region,
-                                                                           result[name]["numCores"],
-                                                                           result[name]["isShared"])
+                    try:
+                        result[name]["prices"][region] = self.get_os_price_map(
+                            pricing_map,
+                            name,
+                            region,
+                            result[name]["numCores"],
+                            result[name]["isShared"]
+                        )
+                    except Exception as e:
+                        logging.warning("[app] Error {} getting price info for {}".format(e, name))
+                        result[name]["prices"][region] = 0.0
         to_delete_instance_types = []
         for name in result:
             to_delete_regions = []
@@ -304,7 +327,9 @@ class GcpCloud(AbstractCloud):
         dest_vpc_id = custom_payload.get("destVpcId")
         host_vpc_id = custom_payload.get("hostVpcId")
         per_region_meta = custom_payload.get("perRegionMetadata")
-        return self.get_admin().network(dest_vpc_id, host_vpc_id, per_region_meta).bootstrap()
+        create_new_vpc = custom_payload.get("createNewVpc")
+        return self.get_admin().network(
+            dest_vpc_id, host_vpc_id, per_region_meta, create_new_vpc).bootstrap()
 
     def network_cleanup(self, args):
         custom_payload = json.loads(args.custom_payload)
@@ -323,7 +348,9 @@ class GcpCloud(AbstractCloud):
         """
         zone = args.zone
         search_pattern = args.search_pattern
-        return self.get_admin().get_instances(zone, search_pattern, get_all, filters=filters)
+        node_uuid = args.node_uuid
+        return self.get_admin().get_instances(zone, search_pattern, get_all, filters=filters,
+                                              node_uuid=node_uuid)
 
     def get_device_names(self, args):
         # Boot disk is also a persistent disk, so add persistent disks starting at index 1
@@ -340,8 +367,8 @@ class GcpCloud(AbstractCloud):
         instance = self.get_host_info(args)
         self.get_admin().update_disk(args, instance['id'])
 
-    def change_instance_type(self, args, newInstanceType):
-        self.get_admin().change_instance_type(args['zone'], args['search_pattern'], newInstanceType)
+    def change_instance_type(self, args, instance_type, capacity_reservation):
+        self.get_admin().change_instance_type(args['zone'], args['search_pattern'], instance_type, capacity_reservation)
 
     def get_per_region_meta(self, args):
         if hasattr(args, "custom_payload") and args.custom_payload:
@@ -360,3 +387,16 @@ class GcpCloud(AbstractCloud):
     def modify_tags(self, args):
         instance = self.get_host_info(args)
         self.get_admin().modify_tags(args, instance['id'], args.instance_tags, args.remove_tags)
+
+    def normalize_instance_state(self, instance_state):
+        if instance_state:
+            instance_state = instance_state.lower()
+            if instance_state in ("provisioning", "staging", "repairing"):
+                return InstanceState.STARTING
+            if instance_state in ("running"):
+                return InstanceState.RUNNING
+            if instance_state in ("suspending", "suspended", "stopping"):
+                return InstanceState.STOPPING
+            if instance_state in ("terminated"):
+                return InstanceState.STOPPED
+        return InstanceState.UNKNOWN

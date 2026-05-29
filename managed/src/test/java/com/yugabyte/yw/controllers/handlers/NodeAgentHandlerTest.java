@@ -1,14 +1,10 @@
-// Copyright (c) Yugabyte, Inc.
+// Copyright (c) YugabyteDB, Inc.
 
 package com.yugabyte.yw.controllers.handlers;
 
 import static org.junit.Assert.assertNotNull;
 import static org.junit.Assert.assertTrue;
 import static org.junit.Assert.fail;
-import static org.mockito.ArgumentMatchers.eq;
-import static org.mockito.Mockito.times;
-import static org.mockito.Mockito.verify;
-import static org.mockito.Mockito.when;
 
 import com.typesafe.config.Config;
 import com.yugabyte.yw.common.ConfigHelper;
@@ -18,6 +14,8 @@ import com.yugabyte.yw.common.NodeAgentClient;
 import com.yugabyte.yw.common.NodeAgentManager;
 import com.yugabyte.yw.common.PlatformExecutorFactory;
 import com.yugabyte.yw.common.PlatformScheduler;
+import com.yugabyte.yw.common.certmgmt.CertificateHelper;
+import com.yugabyte.yw.common.config.RuntimeConfGetter;
 import com.yugabyte.yw.forms.NodeAgentForm;
 import com.yugabyte.yw.models.Customer;
 import com.yugabyte.yw.models.NodeAgent;
@@ -44,6 +42,9 @@ public class NodeAgentHandlerTest extends FakeDBApplication {
   @Mock private PlatformExecutorFactory mockPlatformExecutorFactory;
   @Mock private PlatformScheduler mockPlatformScheduler;
   @Mock private NodeAgentClient mockNodeAgentClient;
+
+  private CertificateHelper certificateHelper;
+
   private NodeAgentManager nodeAgentManager;
   private NodeAgentHandler nodeAgentHandler;
   private Customer customer;
@@ -51,11 +52,13 @@ public class NodeAgentHandlerTest extends FakeDBApplication {
   @Before
   public void setup() {
     customer = ModelFactory.testCustomer();
-    nodeAgentManager = new NodeAgentManager(mockAppConfig, mockConfigHelper);
-    nodeAgentHandler = new NodeAgentHandler(mockAppConfig, nodeAgentManager, mockNodeAgentClient);
-
+    certificateHelper = new CertificateHelper(app.injector().instanceOf(RuntimeConfGetter.class));
+    nodeAgentManager =
+        new NodeAgentManager(
+            mockAppConfig, mockConfigHelper, certificateHelper, mockFileHelperService);
+    nodeAgentHandler =
+        new NodeAgentHandler(mockCommissioner, nodeAgentManager, mockNodeAgentClient);
     nodeAgentHandler.enableConnectionValidation(false);
-    when(mockAppConfig.getString(eq("yb.storage.path"))).thenReturn("/tmp");
   }
 
   private void verifyKeys(UUID nodeAgentUuid) {
@@ -88,16 +91,16 @@ public class NodeAgentHandlerTest extends FakeDBApplication {
     payload.ip = "10.20.30.40";
     payload.osType = OSType.LINUX.name();
     payload.archType = ArchType.AMD64.name();
-    NodeAgent nodeAgent = nodeAgentHandler.register(customer.uuid, payload);
-    assertNotNull(nodeAgent.uuid);
-    UUID nodeAgentUuid = nodeAgent.uuid;
-    verify(mockAppConfig, times(1)).getString(eq("yb.storage.path"));
-    String serverCert = nodeAgent.config.get(NodeAgent.SERVER_CERT_PROPERTY);
+    payload.home = "/home/yugabyte/node-agent";
+    NodeAgent nodeAgent = nodeAgentHandler.register(customer.getUuid(), payload);
+    assertNotNull(nodeAgent.getUuid());
+    UUID nodeAgentUuid = nodeAgent.getUuid();
+    String serverCert = nodeAgent.getConfig().getServerCert();
     assertNotNull(serverCert);
     Path serverCertPath = nodeAgent.getServerCertFilePath();
     assertNotNull(serverCertPath);
     assertTrue(Files.exists(serverCertPath));
-    String serverKey = nodeAgent.config.get(NodeAgent.SERVER_KEY_PROPERTY);
+    String serverKey = nodeAgent.getConfig().getServerKey();
     assertNotNull(serverKey);
     Path serverKeyPath = nodeAgent.getServerKeyFilePath();
     assertNotNull(serverKeyPath);
@@ -105,7 +108,7 @@ public class NodeAgentHandlerTest extends FakeDBApplication {
     // With a real agent, the files are saved locally and ack is sent to the platform.
     // Complete registration.
     payload.state = State.READY.name();
-    nodeAgentHandler.updateState(customer.uuid, nodeAgentUuid, payload);
+    nodeAgentHandler.updateState(customer.getUuid(), nodeAgentUuid, payload);
     verifyKeys(nodeAgentUuid);
     nodeAgentHandler.unregister(nodeAgentUuid);
     Path certPath = nodeAgentManager.getNodeAgentBaseCertDirectory(nodeAgent);

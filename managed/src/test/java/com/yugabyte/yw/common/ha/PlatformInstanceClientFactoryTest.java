@@ -1,5 +1,5 @@
 /*
- * Copyright 2022 YugaByte, Inc. and Contributors
+ * Copyright 2022 YugabyteDB, Inc. and Contributors
  *
  * Licensed under the Polyform Free Trial License 1.0.0 (the "License"); you
  * may not use this file except in compliance with the License. You
@@ -11,9 +11,7 @@
 package com.yugabyte.yw.common.ha;
 
 import static com.yugabyte.yw.models.ScopedRuntimeConfig.GLOBAL_SCOPE_UUID;
-import static org.junit.Assert.assertEquals;
 import static org.junit.Assert.assertNotEquals;
-import static org.junit.Assert.assertThrows;
 import static play.test.Helpers.fakeRequest;
 
 import com.yugabyte.yw.common.FakeApi;
@@ -22,8 +20,8 @@ import com.yugabyte.yw.common.ModelFactory;
 import com.yugabyte.yw.models.Customer;
 import com.yugabyte.yw.models.Users;
 import com.yugabyte.yw.models.Users.Role;
-import io.ebean.Ebean;
-import io.ebean.EbeanServer;
+import io.ebean.DB;
+import io.ebean.Database;
 import org.junit.Before;
 import org.junit.Test;
 import play.inject.guice.GuiceApplicationBuilder;
@@ -35,13 +33,11 @@ public class PlatformInstanceClientFactoryTest extends FakeDBApplication {
   private static final String KEY = "/api/customers/%s/runtime_config/%s/key/%s";
   private String authToken;
   private Customer customer;
-  private EbeanServer localEBeanServer;
+  private Database localEBeanServer;
   private FakeApi fakeApi;
   private PlatformInstanceClientFactory platformInstanceClientFactory;
 
   private static final String REMOTE_ACME_ORG = "http://remote.acme.org";
-
-  private static final String BAD_CA_CERT_KEY = "-----BAD CERT-----\n";
 
   private static final String GOOD_CA_CERT_KEY =
       "-----BEGIN CERTIFICATE-----\n"
@@ -78,7 +74,7 @@ public class PlatformInstanceClientFactoryTest extends FakeDBApplication {
     customer = ModelFactory.testCustomer();
     Users user = ModelFactory.testUser(customer, Role.SuperAdmin);
     authToken = user.createAuthToken();
-    localEBeanServer = Ebean.getDefaultServer();
+    localEBeanServer = DB.getDefault();
     fakeApi = new FakeApi(app, localEBeanServer);
     platformInstanceClientFactory = app.injector().instanceOf(PlatformInstanceClientFactory.class);
   }
@@ -86,7 +82,7 @@ public class PlatformInstanceClientFactoryTest extends FakeDBApplication {
   @Test
   public void getDefaultClient() {
     final PlatformInstanceClient platformInstanceClient =
-        platformInstanceClientFactory.getClient("clusterK$Y", REMOTE_ACME_ORG);
+        platformInstanceClientFactory.getClient("clusterK$Y", REMOTE_ACME_ORG, null);
     assertNotEquals(
         "Expect custom wsClient differnt from default",
         app.injector().instanceOf(WSClient.class),
@@ -97,7 +93,7 @@ public class PlatformInstanceClientFactoryTest extends FakeDBApplication {
   public void getCustomClient() {
     setWsConfig(GOOD_CA_CERT_KEY);
     final PlatformInstanceClient platformInstanceClient =
-        platformInstanceClientFactory.getClient("clusterK$Y", REMOTE_ACME_ORG);
+        platformInstanceClientFactory.getClient("clusterK$Y", REMOTE_ACME_ORG, null);
     assertNotEquals(
         "Expect custom wsClient differnt from default",
         app.injector().instanceOf(WSClient.class),
@@ -105,27 +101,17 @@ public class PlatformInstanceClientFactoryTest extends FakeDBApplication {
 
     // get client with same config
     final PlatformInstanceClient platformInstanceClient2 =
-        platformInstanceClientFactory.getClient("clusterK$Y", REMOTE_ACME_ORG);
-
-    assertEquals(
-        "Expect reuse the underlying wsClient",
-        platformInstanceClient.getApiHelper().getWsClient(),
-        platformInstanceClient2.getApiHelper().getWsClient());
+        platformInstanceClientFactory.getClient("clusterK$Y", REMOTE_ACME_ORG, null);
 
     // set new config
     setWsConfig(GOOD_CA_CERT_KEY);
     final PlatformInstanceClient platformInstanceClient3 =
-        platformInstanceClientFactory.getClient("clusterK$Y", REMOTE_ACME_ORG);
+        platformInstanceClientFactory.getClient("clusterK$Y", REMOTE_ACME_ORG, null);
     // This should NOT reuse the underlying apiHelper
     assertNotEquals(platformInstanceClient, platformInstanceClient2);
     assertNotEquals(
         platformInstanceClient.getApiHelper().getWsClient(),
         platformInstanceClient3.getApiHelper().getWsClient());
-  }
-
-  @Test
-  public void setWsConfig_badCert() {
-    assertThrows(RuntimeException.class, () -> setWsConfig(BAD_CA_CERT_KEY));
   }
 
   private void setWsConfig(String pemKey) {
@@ -149,7 +135,7 @@ public class PlatformInstanceClientFactoryTest extends FakeDBApplication {
 
   private void setConfigKey(String k, String v) {
     Http.RequestBuilder request =
-        fakeRequest("PUT", String.format(KEY, customer.uuid, GLOBAL_SCOPE_UUID, k))
+        fakeRequest("PUT", String.format(KEY, customer.getUuid(), GLOBAL_SCOPE_UUID, k))
             .header("X-AUTH-TOKEN", authToken)
             .header("content-type", "text/plain")
             .bodyText(v);

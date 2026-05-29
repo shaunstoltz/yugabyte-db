@@ -1,5 +1,5 @@
 //--------------------------------------------------------------------------------------------------
-// Copyright (c) YugaByte, Inc.
+// Copyright (c) YugabyteDB, Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License"); you may not use this file except
 // in compliance with the License.  You may obtain a copy of the License at
@@ -32,8 +32,7 @@
 using std::string;
 using std::max;
 
-DEFINE_RUNTIME_bool(
-    ycql_bind_collection_assignment_using_column_name, false,
+DEFINE_RUNTIME_bool(ycql_bind_collection_assignment_using_column_name, false,
     "Enable using column name for binding the value of subscripted collection column");
 
 namespace yb {
@@ -309,8 +308,9 @@ void PTUpdateStmt::PrintSemanticAnalysisResult(SemContext *sem_context) {
 ExplainPlanPB PTUpdateStmt::AnalysisResultToPB() {
   ExplainPlanPB explain_plan;
   UpdatePlanPB *update_plan = explain_plan.mutable_update_plan();
-  update_plan->set_update_type("Update on " + table_name().ToString());
-  update_plan->set_scan_type("  ->  Primary Key Lookup on " + table_name().ToString());
+  auto table_name = this->table_name().ToString(false);
+  update_plan->set_update_type("Update on " + table_name);
+  update_plan->set_scan_type("  ->  Primary Key Lookup on " + table_name);
   string key_conditions = "        Key Conditions: " +
       ConditionsToString<MCVector<ColumnOp>>(key_where_ops());
   update_plan->set_key_conditions(key_conditions);

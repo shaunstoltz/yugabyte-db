@@ -15,9 +15,9 @@
 // specific language governing permissions and limitations
 // under the License.
 //
-// The following only applies to changes made to this file as part of YugaByte development.
+// The following only applies to changes made to this file as part of YugabyteDB development.
 //
-// Portions Copyright (c) YugaByte, Inc.
+// Portions Copyright (c) YugabyteDB, Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License"); you may not use this file except
 // in compliance with the License.  You may obtain a copy of the License at
@@ -42,7 +42,6 @@
 #include <vector>
 
 #include <boost/container/small_vector.hpp>
-#include <boost/optional/optional_fwd.hpp>
 #include <boost/version.hpp>
 #include "yb/util/flags.h"
 #include <gtest/gtest.h>
@@ -53,7 +52,6 @@
 
 #include "yb/master/master_ddl.fwd.h"
 #include "yb/master/master_fwd.h"
-#include "yb/master/master-test-util.h"
 
 #include "yb/rpc/messenger.h"
 #include "yb/rpc/proxy_base.h"
@@ -121,6 +119,9 @@ namespace master {
 
 using strings::Substitute;
 
+class MiniMaster;
+class MasterClusterClient;
+
 class MasterTestBase : public YBTest {
  protected:
 
@@ -149,6 +150,14 @@ class MasterTestBase : public YBTest {
   Status CreatePgsqlTable(const NamespaceId& namespace_id,
                           const TableName& table_name,
                           const Schema& schema);
+  Status CreatePgsqlTable(const NamespaceId& namespace_id,
+                          const TableName& table_name,
+                          const TableId& table_id,
+                          const Schema& schema);
+  Status CreatePgsqlTable(const NamespaceId& namespace_id,
+                          const TableName& table_name,
+                          const Schema& schema,
+                          CreateTableRequestPB* req);
 
   Status CreateTablegroupTable(const NamespaceId& namespace_id,
                                const TableId& table_id,
@@ -192,28 +201,29 @@ class MasterTestBase : public YBTest {
 
   Status DeleteTablegroup(const TablegroupId& tablegroup_id);
 
-  void DoListTablegroups(const ListTablegroupsRequestPB& req,
-                         ListTablegroupsResponsePB* resp);
+  void DoListTablegroups(const ListTablegroupsRequestPB& req, ListTablegroupsResponsePB* resp);
 
   void DoListAllNamespaces(ListNamespacesResponsePB* resp);
-  void DoListAllNamespaces(const boost::optional<YQLDatabase>& database_type,
-                           ListNamespacesResponsePB* resp);
+  void DoListAllNamespaces(
+      const std::optional<YQLDatabase>& database_type, ListNamespacesResponsePB* resp);
 
   Status CreateNamespace(const NamespaceName& ns_name, CreateNamespaceResponsePB* resp);
-  Status CreateNamespace(const NamespaceName& ns_name,
-                         const boost::optional<YQLDatabase>& database_type,
-                         CreateNamespaceResponsePB* resp);
-  Status CreateNamespaceAsync(const NamespaceName& ns_name,
-                              const boost::optional<YQLDatabase>& database_type,
-                              CreateNamespaceResponsePB* resp);
-  Status CreateNamespaceWait(const NamespaceId& ns_id,
-                             const boost::optional<YQLDatabase>& database_type);
+  Status CreateNamespace(
+      const NamespaceName& ns_name, const std::optional<YQLDatabase>& database_type,
+      CreateNamespaceResponsePB* resp);
+  Status CreatePgsqlNamespace(
+      const NamespaceName& ns_name, const NamespaceId& ns_id, CreateNamespaceResponsePB* resp);
+  Status CreateNamespaceAsync(
+      const NamespaceName& ns_name, const std::optional<YQLDatabase>& database_type,
+      CreateNamespaceResponsePB* resp);
+  Result<CreateNamespaceResponsePB> CreateNamespaceAsync(const CreateNamespaceRequestPB& req);
+  Status CreateNamespaceWait(
+      const NamespaceId& ns_id, const std::optional<YQLDatabase>& database_type);
 
-  Status AlterNamespace(const NamespaceName& ns_name,
-                        const NamespaceId& ns_id,
-                        const boost::optional<YQLDatabase>& database_type,
-                        const std::string& new_name,
-                        AlterNamespaceResponsePB* resp);
+  Status AlterNamespace(
+      const NamespaceName& ns_name, const NamespaceId& ns_id,
+      const std::optional<YQLDatabase>& database_type, const std::string& new_name,
+      AlterNamespaceResponsePB* resp);
 
   Status DeleteNamespaceWait(IsDeleteNamespaceDoneRequestPB const& del_req);
 
@@ -232,15 +242,16 @@ class MasterTestBase : public YBTest {
       const std::set<std::tuple<TableName, NamespaceName, NamespaceId, bool>>& table_info,
       const ListTablesResponsePB& tables);
 
-  void UpdateMasterClusterConfig(SysClusterConfigEntryPB* cluster_config);
+  Status UpdateMasterClusterConfig(SysClusterConfigEntryPB* cluster_config);
   std::unique_ptr<Messenger> client_messenger_;
   std::unique_ptr<MiniMaster> mini_master_;
   std::unique_ptr<MasterClientProxy> proxy_client_;
-  std::unique_ptr<MasterClusterProxy> proxy_cluster_;
   std::unique_ptr<MasterDdlProxy> proxy_ddl_;
   std::unique_ptr<MasterHeartbeatProxy> proxy_heartbeat_;
   std::unique_ptr<MasterReplicationProxy> proxy_replication_;
   std::shared_ptr<RpcController> controller_;
+
+  std::unique_ptr<MasterClusterClient> cluster_client_;
 };
 
 } // namespace master

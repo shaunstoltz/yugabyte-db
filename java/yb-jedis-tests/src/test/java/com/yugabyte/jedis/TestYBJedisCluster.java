@@ -1,4 +1,4 @@
-// Copyright (c) YugaByte, Inc.
+// Copyright (c) YugabyteDB, Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License"); you may not use this file except
 // in compliance with the License.  You may obtain a copy of the License at
@@ -97,6 +97,7 @@ public class TestYBJedisCluster extends BaseJedisTest {
     // Add a node and verify our commands succeed.
     LOG.info("Adding a new node ");
     miniCluster.startTServer(ImmutableMap.of(
+        "start_redis_proxy", "true",
         "forward_redis_requests", "false",
         "memory_limit_hard_bytes", String.valueOf(MEMORY_LIMIT)));
 

@@ -9,6 +9,8 @@ menu:
     name: Azure Kubernetes Service
     identifier: k8s-aks-2
     weight: 624
+aliases:
+  - /stable/deploy/kubernetes/aks/statefulset-yaml/
 type: docs
 ---
 
@@ -22,7 +24,7 @@ type: docs
   </li>
   <li >
     <a href="../statefulset-yaml/" class="nav-link active">
-      <i class="fa-solid fa-cubes" aria-hidden="true"></i>
+      <i class="fa-regular fa-dharmachakra" aria-hidden="true"></i>
       StatefulSet YAML
     </a>
   </li>
@@ -151,7 +153,7 @@ yb-tservers   ClusterIP   None         <none>        9000/TCP,9100/TCP,9042/TCP,
 
 ## Connect to the cluster
 
-To open the YCQL shell (`ycqlsh`), run the following command:
+To open the YCQL shell (ycqlsh), run the following command:
 
 ```sh
 kubectl exec -it yb-tserver-0 -- ycqlsh yb-tserver-0

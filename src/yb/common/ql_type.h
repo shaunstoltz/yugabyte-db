@@ -1,5 +1,5 @@
 //--------------------------------------------------------------------------------------------------
-// Copyright (c) YugaByte, Inc.
+// Copyright (c) YugabyteDB, Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License"); you may not use this file except
 // in compliance with the License.  You may obtain a copy of the License at
@@ -22,12 +22,10 @@
 #include <utility>
 #include <vector>
 
-#include <boost/optional.hpp>
-
-#include <glog/logging.h>
+#include "yb/util/logging.h"
 
 #include "yb/common/common_fwd.h"
-#include "yb/common/value.pb.h"
+#include "yb/common/value.messages.h"
 #include "yb/gutil/macros.h"
 #include "yb/util/status_fwd.h"
 
@@ -37,13 +35,13 @@ namespace yb {
 // Used internally in QLType and only set for user-defined types.
 class UDTypeInfo {
  public:
-  UDTypeInfo(std::string&& keyspace_name,
-             std::string&& name,
-             std::string&& id,
+  UDTypeInfo(std::string_view keyspace_name,
+             std::string_view name,
+             std::string_view id,
              std::vector<std::string>&& field_names)
-      : keyspace_name_(std::move(keyspace_name)),
-        name_(std::move(name)),
-        id_(std::move(id)),
+      : keyspace_name_(keyspace_name),
+        name_(name),
+        id_(id),
         field_names_(std::move(field_names)) {
   }
 
@@ -105,9 +103,9 @@ class QLType {
   static SharedPtr CreateTypeFrozen(SharedPtr value_type);
 
   static SharedPtr CreateUDType(
-      std::string keyspace_name,
-      std::string type_name,
-      std::string type_id,
+      std::string_view keyspace_name,
+      std::string_view type_name,
+      std::string_view type_id,
       std::vector<std::string> field_names,
       Params field_types);
 
@@ -115,7 +113,9 @@ class QLType {
   // Protobuf support.
 
   void ToQLTypePB(QLTypePB* pb_type) const;
+  void ToQLTypePB(LWQLTypePB* pb_type) const;
   static SharedPtr FromQLTypePB(const QLTypePB& pb_type);
+  static SharedPtr FromQLTypePB(const LWQLTypePB& pb_type);
 
   //------------------------------------------------------------------------------------------------
   // Access functions.
@@ -159,12 +159,10 @@ class QLType {
     return udtype_info_->name();
   }
 
-  const std::string& udtype_id() const {
-    return udtype_info_->id();
-  }
+  const std::string& udtype_id() const { return udtype_info_->id(); }
 
   // returns position of "field_name" in udtype_field_names() vector if found, otherwise -1
-  boost::optional<size_t> GetUDTypeFieldIdxByName(const std::string& field_name) const;
+  std::optional<size_t> GetUDTypeFieldIdxByName(const std::string& field_name) const;
 
   // Get the type ids of all UDTs (transitively) referenced by this UDT.
   std::vector<std::string> GetUserDefinedTypeIds() const {
@@ -199,15 +197,16 @@ class QLType {
   // Predicates.
 
   bool IsCollection() const {
-    return id_ == MAP || id_ == SET || id_ == LIST || id_ == TUPLE;
+    return id_ == DataType::MAP || id_ == DataType::SET || id_ == DataType::LIST ||
+           id_ == DataType::TUPLE;
   }
 
   bool IsUserDefined() const {
-    return id_ == USER_DEFINED_TYPE;
+    return id_ == DataType::USER_DEFINED_TYPE;
   }
 
   bool IsFrozen() const {
-    return id_ == FROZEN;
+    return id_ == DataType::FROZEN;
   }
 
   bool IsParametric() const {
@@ -249,13 +248,13 @@ class QLType {
       return params_.empty();
     } else {
       // checking number of params
-      if (id_ == MAP && params_.size() != 2) {
+      if (id_ == DataType::MAP && params_.size() != 2) {
         return false; // expect two type parameters for maps
-      } else if ((id_ == SET || id_ == LIST) && params_.size() != 1) {
+      } else if ((id_ == DataType::SET || id_ == DataType::LIST) && params_.size() != 1) {
         return false; // expect one type parameter for set and list
-      } else if (id_ == TUPLE && params_.size() == 0) {
+      } else if (id_ == DataType::TUPLE && params_.size() == 0) {
         return false; // expect at least one type parameters for tuples
-      } else if (id_ == FROZEN && params_.size() != 1) {
+      } else if (id_ == DataType::FROZEN && params_.size() != 1) {
         return false; // expect one type parameter for frozen
       }
       // recursively checking params
@@ -303,7 +302,7 @@ class QLType {
   //       It must be removed somehow as the QLType objects are stored in various caches and they
   //       must be immutable.
   void add_param(SharedPtr param) {
-    DCHECK(id_ == TUPLE);
+    DCHECK(id_ == DataType::TUPLE);
     params_.push_back(std::move(param));
   }
 
@@ -315,29 +314,21 @@ class QLType {
 
   //------------------------------------------------------------------------------------------------
   // static methods
-  static const int kMaxTypeIndex = DataType::JSONB + 1;
-
-  // When a new type is added in the enum "DataType", kMaxTypeIndex should be updated for this
-  // module to work properly. The DCHECKs in this struct would failed if kMaxTypeIndex is wrong.
-  static bool IsValid(DataType type) {
-    return (type >= 0 && type < kMaxTypeIndex);
-  }
-
   static bool IsInteger(DataType t) {
-    return (t >= INT8 && t <= INT64) || t == VARINT;
+    return (t >= DataType::INT8 && t <= DataType::INT64) || t == DataType::VARINT;
   }
 
   static bool IsJson(DataType t) {
-    return t == JSONB;
+    return t == DataType::JSONB;
   }
 
   static bool IsNumeric(DataType t) {
-    return IsInteger(t) || t == FLOAT || t == DOUBLE || t == DECIMAL;
+    return IsInteger(t) || t == DataType::FLOAT || t == DataType::DOUBLE || t == DataType::DECIMAL;
   }
 
   // NULL_VALUE_TYPE represents type of a null value.
   static bool IsNull(DataType t) {
-    return t == NULL_VALUE_TYPE;
+    return t == DataType::NULL_VALUE_TYPE;
   }
 
   // Type is not yet set (VOID).

@@ -15,9 +15,9 @@
 // specific language governing permissions and limitations
 // under the License.
 //
-// The following only applies to changes made to this file as part of YugaByte development.
+// The following only applies to changes made to this file as part of YugabyteDB development.
 //
-// Portions Copyright (c) YugaByte, Inc.
+// Portions Copyright (c) YugabyteDB, Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License"); you may not use this file except
 // in compliance with the License.  You may obtain a copy of the License at
@@ -35,10 +35,13 @@
 #include <unordered_set>
 
 #include "yb/common/entity_ids_types.h"
-#include "yb/util/status_fwd.h"
-#include "yb/util/mutex.h"
-#include "yb/util/condition_variable.h"
 #include "yb/gutil/ref_counted.h"
+#include "yb/master/leader_epoch.h"
+#include "yb/master/master_fwd.h"
+#include "yb/util/condition_variable.h"
+#include "yb/util/metrics_fwd.h"
+#include "yb/util/mutex.h"
+#include "yb/util/status_fwd.h"
 
 namespace yb {
 
@@ -48,13 +51,11 @@ namespace master {
 
 class CatalogManager;
 
-namespace enterprise {
-class CatalogManager;
-}
+int32_t TEST_catalog_manager_bg_task_run_count();
 
 class CatalogManagerBgTasks final {
  public:
-  explicit CatalogManagerBgTasks(CatalogManager *catalog_manager);
+  explicit CatalogManagerBgTasks(Master* master);
 
   ~CatalogManagerBgTasks() {}
 
@@ -66,17 +67,38 @@ class CatalogManagerBgTasks final {
   void WakeIfHasPendingUpdates();
 
  private:
-  void TryResumeBackfillForTables(std::unordered_set<TableId>* tables);
+  void TryResumeBackfillForTables(const LeaderEpoch& epoch, std::unordered_set<TableId>* tables);
+  void ClearDeadTServerMetrics() const;
   void Run();
+  void RunOnceAsLeader(const LeaderEpoch& epoch);
 
  private:
+  void MaybeRunClusterBalancer(
+      const LeaderEpoch& epoch, const std::vector<TableInfoPtr>& tables,
+      const TabletInfoMap& tablets);
+
+  void ScaleUpTransactionStatusTablesIfNeeded(const LeaderEpoch& epoch);
+  Status DoScaleUpTransactionStatusTables(
+      size_t num_live_tservers, const LeaderEpoch& epoch);
+  Status ScaleUpLocalTransactionStatusTablesIfNeeded(const LeaderEpoch& epoch,
+      const TableId& global_txn_table_id);
+  Status AddTabletsToTransactionStatusTableIfNeeded(
+      const TableInfoPtr& table, size_t num_live_tservers,
+      const ReplicationInfoPB& repl_info, bool is_global, const LeaderEpoch& epoch);
+  Status AddTabletsToTransactionStatusTable(
+      const TableInfoPtr& table, size_t tablets_to_add, const LeaderEpoch& epoch);
+
   std::atomic<bool> closing_;
   bool pending_updates_;
   mutable Mutex lock_;
   ConditionVariable cond_;
   scoped_refptr<yb::Thread> thread_;
-  enterprise::CatalogManager *catalog_manager_;
+  Master* master_;
+  CatalogManager* catalog_manager_;
   bool was_leader_ = false;
+  scoped_refptr<EventStats> cluster_balancer_duration_;
+  CoarseTimePoint last_transaction_status_check_time_;
+  size_t last_live_tservers_;
 };
 
 }  // namespace master

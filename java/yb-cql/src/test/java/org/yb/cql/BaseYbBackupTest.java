@@ -1,4 +1,4 @@
-// Copyright (c) YugaByte, Inc.
+// Copyright (c) YugabyteDB, Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License"); you may not use this file except
 // in compliance with the License.  You may obtain a copy of the License at
@@ -15,14 +15,15 @@ package org.yb.cql;
 import java.util.*;
 
 import org.junit.Before;
-
+import org.yb.client.TestUtils;
 import org.yb.util.YBBackupUtil;
 
 public class BaseYbBackupTest extends BaseCQLTest {
   @Before
-  public void initYBBackupUtil() {
+  public void initYBBackupUtil() throws Exception {
     YBBackupUtil.setTSAddresses(miniCluster.getTabletServers());
     YBBackupUtil.setMasterAddresses(masterAddresses);
+    YBBackupUtil.maybeStartYbControllers(miniCluster);
   }
 
   @Override

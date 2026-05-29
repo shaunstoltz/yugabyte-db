@@ -1,5 +1,5 @@
 /*
- * Copyright 2022 YugaByte, Inc. and Contributors
+ * Copyright 2022 YugabyteDB, Inc. and Contributors
  *
  * Licensed under the Polyform Free Trial License 1.0.0 (the "License"); you
  * may not use this file except in compliance with the License. You
@@ -11,15 +11,23 @@
 
 package com.yugabyte.yw.common.kms.services;
 
-import java.util.UUID;
+import static play.mvc.Http.Status.BAD_REQUEST;
 
+import com.fasterxml.jackson.databind.ObjectMapper;
 import com.fasterxml.jackson.databind.node.ObjectNode;
+import com.yugabyte.yw.common.PlatformServiceException;
 import com.yugabyte.yw.common.config.RuntimeConfGetter;
 import com.yugabyte.yw.common.kms.algorithms.GcpAlgorithm;
+import com.yugabyte.yw.common.kms.util.EncryptionAtRestUtil;
+import com.yugabyte.yw.common.kms.util.EncryptionAtRestUtil.EncryptionKey;
 import com.yugabyte.yw.common.kms.util.GcpEARServiceUtil;
+import com.yugabyte.yw.common.kms.util.GcpEARServiceUtil.GcpKmsAuthConfigField;
 import com.yugabyte.yw.common.kms.util.KeyProvider;
 import com.yugabyte.yw.forms.EncryptionAtRestConfig;
 import com.yugabyte.yw.models.KmsConfig;
+import java.io.IOException;
+import java.util.List;
+import java.util.UUID;
 
 /**
  * An implementation of EncryptionAtRestService to communicate with GCP KMS
@@ -27,12 +35,10 @@ import com.yugabyte.yw.models.KmsConfig;
  */
 public class GcpEARService extends EncryptionAtRestService<GcpAlgorithm> {
   private GcpEARServiceUtil gcpEARServiceUtil;
-  private final RuntimeConfGetter confGetter;
   public static final int numBytes = 32;
 
   public GcpEARService(RuntimeConfGetter confGetter) {
     super(KeyProvider.GCP);
-    this.confGetter = confGetter;
   }
 
   public GcpEARServiceUtil getGcpEarServiceUtil() {
@@ -69,7 +75,7 @@ public class GcpEARService extends EncryptionAtRestService<GcpAlgorithm> {
       gcpEARServiceUtil.checkOrCreateCryptoKey(config);
 
       // Sets the correct protection level for key that already exists in GCP KMS.
-      UUID customerUUID = KmsConfig.get(configUUID).customerUUID;
+      UUID customerUUID = KmsConfig.getOrBadRequest(configUUID).getCustomerUUID();
       UpdateAuthConfigProperties(customerUUID, configUUID, config);
     } catch (Exception e) {
       final String errMsg =
@@ -83,10 +89,10 @@ public class GcpEARService extends EncryptionAtRestService<GcpAlgorithm> {
   }
 
   @Override
-  protected byte[] createKeyWithService(
-      UUID universeUUID, UUID configUUID, EncryptionAtRestConfig config) {
+  protected EncryptionKey createKeyWithService(
+      UUID universeUUID, UUID configUUID, EncryptionAtRestConfig config) throws IOException {
     this.gcpEARServiceUtil = getGcpEarServiceUtil();
-    byte[] result = null;
+    EncryptionKey result;
     ObjectNode authConfig = gcpEARServiceUtil.getAuthConfig(configUUID);
     // Ensure the key ring exists from GCP KMS
     String keyRingRN = gcpEARServiceUtil.getKeyRingRN(authConfig);
@@ -104,24 +110,23 @@ public class GcpEARService extends EncryptionAtRestService<GcpAlgorithm> {
     }
     switch (config.type) {
       case CMK:
-        result = gcpEARServiceUtil.getCryptoKey(authConfig).getName().getBytes();
+        result = new EncryptionKey(gcpEARServiceUtil.getCryptoKey(authConfig).getName().getBytes());
         break;
       default:
-      case DATA_KEY:
         // Generate random byte array and encrypt it.
         // Store the encrypted byte array locally in the db.
         byte[] keyBytes = gcpEARServiceUtil.generateRandomBytes(authConfig, numBytes);
-        result = gcpEARServiceUtil.encryptBytes(authConfig, keyBytes);
+        result = new EncryptionKey(gcpEARServiceUtil.encryptBytes(authConfig, keyBytes));
         break;
     }
     return result;
   }
 
   @Override
-  protected byte[] rotateKeyWithService(
-      UUID universeUUID, UUID configUUID, EncryptionAtRestConfig config) {
+  protected EncryptionKey rotateKeyWithService(
+      UUID universeUUID, UUID configUUID, EncryptionAtRestConfig config) throws IOException {
     this.gcpEARServiceUtil = getGcpEarServiceUtil();
-    byte[] result = null;
+    EncryptionKey result;
     ObjectNode authConfig = gcpEARServiceUtil.getAuthConfig(configUUID);
     // Ensure the key ring exists from GCP KMS to universe UUID
     String keyRingRN = gcpEARServiceUtil.getKeyRingRN(authConfig);
@@ -140,29 +145,21 @@ public class GcpEARService extends EncryptionAtRestService<GcpAlgorithm> {
     // Generate random byte array and encrypt it.
     // Store the encrypted byte array locally in the db.
     byte[] keyBytes = gcpEARServiceUtil.generateRandomBytes(authConfig, numBytes);
-    result = gcpEARServiceUtil.encryptBytes(authConfig, keyBytes);
+    result = new EncryptionKey(gcpEARServiceUtil.encryptBytes(authConfig, keyBytes));
     return result;
   }
 
   @Override
   public byte[] retrieveKeyWithService(
-      UUID universeUUID, UUID configUUID, byte[] keyRef, EncryptionAtRestConfig config) {
+      UUID configUUID, byte[] keyRef, ObjectNode encryptionContext) {
     this.gcpEARServiceUtil = getGcpEarServiceUtil();
-    byte[] keyVal = null;
+    byte[] keyVal;
     try {
-      switch (config.type) {
-        case CMK:
-          keyVal = keyRef;
-          break;
-        default:
-        case DATA_KEY:
-          // Decrypt the locally stored encrypted keyRef to get the universe key.
-          ObjectNode authConfig = gcpEARServiceUtil.getAuthConfig(configUUID);
-          keyVal = gcpEARServiceUtil.decryptBytes(authConfig, keyRef);
-          if (keyVal == null) {
-            LOG.warn("Could not retrieve key from key ref through GCP KMS");
-          }
-          break;
+      // Decrypt the locally stored encrypted keyRef to get the universe key.
+      ObjectNode authConfig = gcpEARServiceUtil.getAuthConfig(configUUID);
+      keyVal = gcpEARServiceUtil.decryptBytes(authConfig, keyRef);
+      if (keyVal == null) {
+        LOG.warn("Could not retrieve key from key ref through GCP KMS");
       }
     } catch (Exception e) {
       final String errMsg = "Error occurred retrieving encryption key";
@@ -174,29 +171,17 @@ public class GcpEARService extends EncryptionAtRestService<GcpAlgorithm> {
 
   @Override
   protected byte[] validateRetrieveKeyWithService(
-      UUID universeUUID,
-      UUID configUUID,
-      byte[] keyRef,
-      EncryptionAtRestConfig config,
-      ObjectNode authConfig) {
+      UUID configUUID, byte[] keyRef, ObjectNode encryptionContext, ObjectNode authConfig) {
     this.gcpEARServiceUtil = getGcpEarServiceUtil();
-    byte[] keyVal = null;
+    byte[] keyVal;
     try {
-      switch (config.type) {
-        case CMK:
-          keyVal = keyRef;
-          break;
-        default:
-        case DATA_KEY:
-          if (authConfig == null) {
-            authConfig = gcpEARServiceUtil.getAuthConfig(configUUID);
-          }
-          // Decrypt the locally stored encrypted keyRef to get the universe key.
-          keyVal = gcpEARServiceUtil.decryptBytes(authConfig, keyRef);
-          if (keyVal == null) {
-            LOG.warn("Could not retrieve key from key ref through GCP KMS");
-          }
-          break;
+      if (authConfig == null) {
+        authConfig = gcpEARServiceUtil.getAuthConfig(configUUID);
+      }
+      // Decrypt the locally stored encrypted keyRef to get the universe key.
+      keyVal = gcpEARServiceUtil.decryptBytes(authConfig, keyRef);
+      if (keyVal == null) {
+        LOG.warn("Could not retrieve key from key ref through GCP KMS");
       }
     } catch (Exception e) {
       final String errMsg = "Error occurred retrieving encryption key";
@@ -207,7 +192,66 @@ public class GcpEARService extends EncryptionAtRestService<GcpAlgorithm> {
   }
 
   @Override
+  public EncryptionKey encryptKeyWithService(UUID configUUID, byte[] universeKey) {
+    this.gcpEARServiceUtil = getGcpEarServiceUtil();
+    byte[] encryptedUniverseKey;
+    try {
+      ObjectNode authConfig = getAuthConfig(configUUID);
+      encryptedUniverseKey = gcpEARServiceUtil.encryptBytes(authConfig, universeKey);
+      if (encryptedUniverseKey == null) {
+        throw new RuntimeException("Encrypted universe key is null.");
+      }
+    } catch (Exception e) {
+      final String errMsg =
+          String.format(
+              "Error occurred encrypting universe key in GCP KMS with config UUID '%s'.",
+              configUUID);
+      LOG.error(errMsg, e);
+      throw new RuntimeException(errMsg, e);
+    }
+    return new EncryptionKey(encryptedUniverseKey);
+  }
+
+  @Override
   protected void cleanupWithService(UUID universeUUID, UUID configUUID) {
     // Do nothing to KMS when deleting universe with EAR enabled
+  }
+
+  @Override
+  public void refreshKmsWithService(UUID configUUID, ObjectNode authConfig) throws Exception {
+    this.gcpEARServiceUtil = getGcpEarServiceUtil();
+    gcpEARServiceUtil.validateKMSProviderConfigFormData(authConfig);
+
+    if (!gcpEARServiceUtil.validateCryptoKeySettings(authConfig)) {
+      throw new PlatformServiceException(
+          BAD_REQUEST,
+          String.format("Key does not have valid settings in GCP KMS config '%s'.", configUUID));
+    }
+    gcpEARServiceUtil.testWrapAndUnwrapKey(authConfig);
+  }
+
+  @Override
+  public ObjectNode getKeyMetadata(UUID configUUID) {
+    // Get all the auth config fields marked as metadata.
+    List<String> gcpKmsMetadataFields = GcpKmsAuthConfigField.getMetadataFields();
+    ObjectNode authConfig = EncryptionAtRestUtil.getAuthConfig(configUUID);
+    ObjectNode keyMetadata = new ObjectMapper().createObjectNode();
+
+    for (String fieldName : gcpKmsMetadataFields) {
+      if (authConfig.has(fieldName)) {
+        keyMetadata.set(fieldName, authConfig.get(fieldName));
+      }
+    }
+    // Add the GCP project ID to the key metadata as well.
+    // This is useful info to the user.
+    if (authConfig.has(GcpKmsAuthConfigField.GCP_CONFIG.fieldName)
+        && authConfig.get(GcpKmsAuthConfigField.GCP_CONFIG.fieldName).has("project_id")) {
+      keyMetadata.set(
+          "project_id",
+          authConfig.get(GcpKmsAuthConfigField.GCP_CONFIG.fieldName).get("project_id"));
+    }
+    // Add key_provider field.
+    keyMetadata.put("key_provider", KeyProvider.GCP.name());
+    return keyMetadata;
   }
 }

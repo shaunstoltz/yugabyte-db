@@ -15,9 +15,9 @@
 // specific language governing permissions and limitations
 // under the License.
 //
-// The following only applies to changes made to this file as part of YugaByte development.
+// The following only applies to changes made to this file as part of YugabyteDB development.
 //
-// Portions Copyright (c) YugaByte, Inc.
+// Portions Copyright (c) YugabyteDB, Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License"); you may not use this file except
 // in compliance with the License.  You may obtain a copy of the License at
@@ -31,6 +31,7 @@
 //
 #pragma once
 
+#include <functional>
 #include <future>
 
 #include "yb/gutil/macros.h"
@@ -41,7 +42,8 @@
 
 namespace yb {
 
-class Histogram;
+class EventStats;
+class MetricEntity;
 class HostPort;
 class ThreadPool;
 
@@ -53,12 +55,12 @@ class DnsResolver {
   DnsResolver(const DnsResolver&) = delete;
   void operator=(const DnsResolver&) = delete;
 
-  explicit DnsResolver(IoService* io_service);
+  explicit DnsResolver(IoService* io_service, const scoped_refptr<MetricEntity>& metric_entity);
   ~DnsResolver();
 
-  std::shared_future<Result<IpAddress>> ResolveFuture(const std::string& host);
-  void AsyncResolve(const std::string& host, const AsyncResolveCallback& callback);
-  Result<IpAddress> Resolve(const std::string& host);
+  std::shared_future<Result<IpAddress>> ResolveFuture(std::string_view host);
+  void AsyncResolve(std::string_view host, const AsyncResolveCallback& callback);
+  Result<IpAddress> Resolve(std::string_view host);
 
  private:
   class Impl;
@@ -67,16 +69,16 @@ class DnsResolver {
 
 class ScopedDnsTracker {
  public:
-  explicit ScopedDnsTracker(const scoped_refptr<Histogram>& metric);
+  explicit ScopedDnsTracker(const scoped_refptr<EventStats>& metric);
   ~ScopedDnsTracker();
 
   ScopedDnsTracker(const ScopedDnsTracker&) = delete;
   void operator=(const ScopedDnsTracker&) = delete;
 
-  static Histogram* active_metric();
+  static EventStats* active_metric();
  private:
-  Histogram* old_metric_;
-  scoped_refptr<Histogram> metric_;
+  EventStats* old_metric_;
+  scoped_refptr<EventStats> metric_;
 };
 
 } // namespace yb

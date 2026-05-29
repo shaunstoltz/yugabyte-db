@@ -1,5 +1,5 @@
 /*
- * Copyright 2022 YugaByte, Inc. and Contributors
+ * Copyright 2022 YugabyteDB, Inc. and Contributors
  *
  * Licensed under the Polyform Free Trial License 1.0.0 (the "License"); you
  * may not use this file except in compliance with the License. You
@@ -10,38 +10,56 @@
 
 package com.yugabyte.yw.commissioner.tasks;
 
+import com.fasterxml.jackson.databind.annotation.JsonDeserialize;
 import com.yugabyte.yw.commissioner.BaseTaskDependencies;
+import com.yugabyte.yw.commissioner.ITask.Abortable;
+import com.yugabyte.yw.commissioner.ITask.Retryable;
 import com.yugabyte.yw.commissioner.TaskExecutor.SubTaskGroup;
-import com.yugabyte.yw.commissioner.tasks.subtasks.KubernetesCommandExecutor;
 import com.yugabyte.yw.commissioner.UserTaskDetails;
 import com.yugabyte.yw.commissioner.UserTaskDetails.SubTaskGroupType;
+import com.yugabyte.yw.commissioner.tasks.subtasks.KubernetesCommandExecutor;
 import com.yugabyte.yw.common.KubernetesUtil;
 import com.yugabyte.yw.common.PlacementInfoUtil;
+import com.yugabyte.yw.common.UniverseInProgressException;
+import com.yugabyte.yw.common.Util;
+import com.yugabyte.yw.common.operator.OperatorStatusUpdater;
+import com.yugabyte.yw.common.operator.OperatorStatusUpdater.UniverseState;
+import com.yugabyte.yw.common.operator.OperatorStatusUpdaterFactory;
 import com.yugabyte.yw.forms.UniverseDefinitionTaskParams;
 import com.yugabyte.yw.forms.UniverseDefinitionTaskParams.Cluster;
 import com.yugabyte.yw.models.AvailabilityZone;
-import com.yugabyte.yw.models.helpers.PlacementInfo;
 import com.yugabyte.yw.models.Provider;
 import com.yugabyte.yw.models.Universe;
+import com.yugabyte.yw.models.helpers.PlacementInfo;
+import com.yugabyte.yw.models.helpers.TaskType;
 import java.util.List;
 import java.util.Map;
 import java.util.Map.Entry;
 import java.util.UUID;
 import javax.inject.Inject;
 import lombok.extern.slf4j.Slf4j;
-import org.apache.commons.collections.CollectionUtils;
+import org.apache.commons.collections4.CollectionUtils;
 
 @Slf4j
+@Abortable
+@Retryable
 public class ReadOnlyKubernetesClusterDelete extends KubernetesTaskBase {
+  private final OperatorStatusUpdater kubernetesStatus;
 
   @Inject
-  public ReadOnlyKubernetesClusterDelete(BaseTaskDependencies baseTaskDependencies) {
+  public ReadOnlyKubernetesClusterDelete(
+      BaseTaskDependencies baseTaskDependencies,
+      OperatorStatusUpdaterFactory operatorStatusUpdaterFactory) {
     super(baseTaskDependencies);
+    this.kubernetesStatus = operatorStatusUpdaterFactory.create();
   }
 
+  @JsonDeserialize(converter = Params.Converter.class)
   public static class Params extends UniverseDefinitionTaskParams {
     public UUID clusterUUID;
     public Boolean isForceDelete = false;
+
+    public static class Converter extends BaseConverter<Params> {}
   }
 
   public Params params() {
@@ -49,34 +67,45 @@ public class ReadOnlyKubernetesClusterDelete extends KubernetesTaskBase {
   }
 
   @Override
-  public void run() {
+  protected void validateUniverseState(Universe universe) {
     try {
-      // Update the universe DB with the update to be performed and set the 'updateInProgress' flag
-      // to prevent other updates from happening.
-      Universe universe = null;
-      if (params().isForceDelete) {
-        universe = forceLockUniverseForUpdate(-1);
-      } else {
-        universe = lockUniverseForUpdate(-1 /* expectedUniverseVersion */);
+      super.validateUniverseState(universe);
+    } catch (UniverseInProgressException e) {
+      if (!params().isForceDelete) {
+        throw e;
       }
+    }
+  }
 
+  @Override
+  public void run() {
+    Universe universe = lockAndFreezeUniverseForUpdate(-1, null /* Txn callback */);
+    Throwable th = null;
+    try {
+      kubernetesStatus.startYBUniverseEventStatus(
+          universe,
+          taskParams().getKubernetesResourceDetails(),
+          TaskType.ReadOnlyKubernetesClusterDelete.name(),
+          getUserTaskUUID(),
+          UniverseState.EDITING);
       List<Cluster> roClusters = universe.getUniverseDetails().getReadOnlyClusters();
       if (CollectionUtils.isEmpty(roClusters)) {
         String msg =
             String.format(
                 "Unable to delete ReadOnly cluster from universe %s as "
                     + "it doesn't have any ReadOnly clusters.",
-                universe.name);
+                universe.getName());
         log.error(msg);
         throw new RuntimeException(msg);
       }
 
       preTaskActions();
+      addBasicPrecheckTasks();
 
       // We support only one readonly cluster, so using the first one in the list.
       Cluster cluster = roClusters.get(0);
       UniverseDefinitionTaskParams.UserIntent userIntent = cluster.userIntent;
-      UUID providerUUID = UUID.fromString(userIntent.provider);
+      UUID providerUUID = Util.getSingleProviderUUID(cluster);
 
       Map<String, String> universeConfig = universe.getConfig();
       // True for all the new and v2 to v3 migrated universes
@@ -92,25 +121,27 @@ public class ReadOnlyKubernetesClusterDelete extends KubernetesTaskBase {
       boolean isMultiAz = PlacementInfoUtil.isMultiAZ(provider);
 
       SubTaskGroup helmDeletes =
-          getTaskExecutor()
-              .createSubTaskGroup(
-                  KubernetesCommandExecutor.CommandType.HELM_DELETE.getSubTaskGroupName(),
-                  executor);
+          createSubTaskGroup(
+              KubernetesCommandExecutor.CommandType.HELM_DELETE.getSubTaskGroupName());
       helmDeletes.setSubTaskGroupType(UserTaskDetails.SubTaskGroupType.RemovingUnusedServers);
 
       SubTaskGroup volumeDeletes =
-          getTaskExecutor()
-              .createSubTaskGroup(
-                  KubernetesCommandExecutor.CommandType.VOLUME_DELETE.getSubTaskGroupName(),
-                  executor);
+          createSubTaskGroup(
+              KubernetesCommandExecutor.CommandType.VOLUME_DELETE.getSubTaskGroupName());
       volumeDeletes.setSubTaskGroupType(UserTaskDetails.SubTaskGroupType.RemovingUnusedServers);
 
       SubTaskGroup namespaceDeletes =
-          getTaskExecutor()
-              .createSubTaskGroup(
-                  KubernetesCommandExecutor.CommandType.NAMESPACE_DELETE.getSubTaskGroupName(),
-                  executor);
+          createSubTaskGroup(
+              KubernetesCommandExecutor.CommandType.NAMESPACE_DELETE.getSubTaskGroupName());
       namespaceDeletes.setSubTaskGroupType(UserTaskDetails.SubTaskGroupType.RemovingUnusedServers);
+
+      // Handle Namespaced services ownership change/delete
+      addHandleKubernetesNamespacedServices(
+              true /* readReplicaDelete */,
+              null /* universeParams */,
+              universe.getUniverseUUID(),
+              false /* handleOwnershipChanges */)
+          .setSubTaskGroupType(SubTaskGroupType.KubernetesHandleNamespacedService);
 
       // This value cannot be changed once set during the Universe
       // creation, so we don't allow users to modify it later during
@@ -119,7 +150,7 @@ public class ReadOnlyKubernetesClusterDelete extends KubernetesTaskBase {
 
       for (Entry<UUID, Map<String, String>> entry : azToConfig.entrySet()) {
         UUID azUUID = entry.getKey();
-        String azName = isMultiAz ? AvailabilityZone.get(azUUID).code : null;
+        String azName = isMultiAz ? AvailabilityZone.get(azUUID).getCode() : null;
 
         Map<String, String> config = entry.getValue();
 
@@ -129,7 +160,7 @@ public class ReadOnlyKubernetesClusterDelete extends KubernetesTaskBase {
           // Delete the helm deployments.
           helmDeletes.addSubTask(
               createDestroyKubernetesTask(
-                  universe.name,
+                  universe.getName(),
                   universe.getUniverseDetails().nodePrefix,
                   azName,
                   config,
@@ -142,7 +173,7 @@ public class ReadOnlyKubernetesClusterDelete extends KubernetesTaskBase {
         // Delete the PVCs created for this AZ.
         volumeDeletes.addSubTask(
             createDestroyKubernetesTask(
-                universe.name,
+                universe.getName(),
                 universe.getUniverseDetails().nodePrefix,
                 azName,
                 config,
@@ -159,7 +190,7 @@ public class ReadOnlyKubernetesClusterDelete extends KubernetesTaskBase {
         if (namespace == null && !newNamingStyle) {
           namespaceDeletes.addSubTask(
               createDestroyKubernetesTask(
-                  universe.name,
+                  universe.getName(),
                   universe.getUniverseDetails().nodePrefix,
                   azName,
                   config,
@@ -174,6 +205,11 @@ public class ReadOnlyKubernetesClusterDelete extends KubernetesTaskBase {
       getRunnableTask().addSubTaskGroup(volumeDeletes);
       getRunnableTask().addSubTaskGroup(namespaceDeletes);
 
+      // Delete old PDB policy for the universe.
+      if (universe.getUniverseDetails().useNewHelmNamingStyle) {
+        createPodDisruptionBudgetPolicyTask(true /* deletePDB */);
+      }
+
       // Remove the cluster entry from the universe db entry.
       createDeleteClusterFromUniverseTask(params().clusterUUID)
           .setSubTaskGroupType(SubTaskGroupType.RemovingUnusedServers);
@@ -181,6 +217,11 @@ public class ReadOnlyKubernetesClusterDelete extends KubernetesTaskBase {
       // Remove the async_replicas in the cluster config on master leader.
       createPlacementInfoTask(null /* blacklistNodes */)
           .setSubTaskGroupType(UserTaskDetails.SubTaskGroupType.ConfigureUniverse);
+
+      // Create new PDB policy for the universe.
+      if (universe.getUniverseDetails().useNewHelmNamingStyle) {
+        createPodDisruptionBudgetPolicyTask(false /* deletePDB */);
+      }
 
       // Update the swamper target file.
       createSwamperTargetUpdateTask(false /* removeFile */);
@@ -193,8 +234,16 @@ public class ReadOnlyKubernetesClusterDelete extends KubernetesTaskBase {
       getRunnableTask().runSubTasks();
     } catch (Throwable t) {
       log.error("Error executing task {} with error='{}'.", getName(), t.getMessage(), t);
+      th = t;
       throw t;
     } finally {
+      kubernetesStatus.updateYBUniverseStatus(
+          getUniverse(),
+          taskParams().getKubernetesResourceDetails(),
+          TaskType.ReadOnlyKubernetesClusterDelete.name(),
+          getUserTaskUUID(),
+          (th != null) ? UniverseState.ERROR_UPDATING : UniverseState.READY,
+          th);
       // Mark the update of the universe as done. This will allow future edits/updates to the
       // universe to happen.
       unlockUniverseForUpdate();
@@ -217,6 +266,7 @@ public class ReadOnlyKubernetesClusterDelete extends KubernetesTaskBase {
     params.commandType = commandType;
     params.providerUUID = providerUUID;
     params.isReadOnlyCluster = isReadOnlyCluster;
+    params.azCode = az;
     params.helmReleaseName =
         KubernetesUtil.getHelmReleaseName(
             nodePrefix, universeName, az, isReadOnlyCluster, newNamingStyle);
@@ -230,7 +280,7 @@ public class ReadOnlyKubernetesClusterDelete extends KubernetesTaskBase {
           KubernetesUtil.getKubernetesNamespace(
               nodePrefix, az, config, newNamingStyle, isReadOnlyCluster);
     }
-    params.universeUUID = taskParams().universeUUID;
+    params.setUniverseUUID(taskParams().getUniverseUUID());
     KubernetesCommandExecutor task = createTask(KubernetesCommandExecutor.class);
     task.initialize(params);
     return task;

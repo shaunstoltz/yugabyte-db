@@ -3,9 +3,9 @@
 //  LICENSE file in the root directory of this source tree. An additional grant
 //  of patent rights can be found in the PATENTS file in the same directory.
 //
-// The following only applies to changes made to this file as part of YugaByte development.
+// The following only applies to changes made to this file as part of YugabyteDB development.
 //
-// Portions Copyright (c) YugaByte, Inc.
+// Portions Copyright (c) YugabyteDB, Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License"); you may not use this file except
 // in compliance with the License.  You may obtain a copy of the License at
@@ -101,12 +101,18 @@ Status DBImpl::TEST_CompactRange(int level, const Slice* begin,
        cfd->ioptions()->compaction_style == kCompactionStyleFIFO)
           ? level
           : level + 1;
-  return RunManualCompaction(cfd, level, output_level, 0, begin, end, true,
-                             CompactionReason::kManualCompaction, disallow_trivial_move);
+  CompactRangeOptions options = {
+      .exclusive_manual_compaction = true,
+      .target_path_id = 0,
+      .compaction_reason = CompactionReason::kManualCompaction,
+      .file_number_upper_bound = 0,
+      .input_size_limit_per_job = 0,
+  };
+  return RunManualCompaction(cfd, level, output_level, options, begin, end, disallow_trivial_move);
 }
 
 Status DBImpl::TEST_FlushMemTable(bool wait) {
-  FlushOptions fo;
+  FlushOptions fo(FlushReason::kTestOnly);
   fo.wait = wait;
   return FlushMemTable(default_cf_handle_->cfd(), fo);
 }
@@ -183,6 +189,15 @@ Status DBImpl::TEST_GetAllImmutableCFOptions(
   }
 
   return Status::OK();
+}
+
+CompactionFileExcluderPtr DBImpl::TEST_SetExcludeFromCompaction(
+    ColumnFamilyHandle* column_family, CompactionFileExcluderPtr exclude_from_compaction) {
+  auto* cfd = down_cast<ColumnFamilyHandleImpl*>(column_family)->cfd();
+  {
+    InstrumentedMutexLock lock(&mutex_);
+    return cfd->TEST_SetExcludeFromCompaction(std::move(exclude_from_compaction));
+  }
 }
 
 }  // namespace rocksdb

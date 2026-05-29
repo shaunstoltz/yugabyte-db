@@ -1,4 +1,4 @@
-# <img src="https://www.yugabyte.com/wp-content/uploads/2021/05/yb_horizontal_alt_color_RGB.png" align="top" alt="YugabyteDB" height="51"/> CONTRIBUTORS
+# <img src="https://cloud.yugabyte.com/logo-big.png" align="top" alt="YugabyteDB" height="51"/> CONTRIBUTORS
 
 ## New Contributors
 
@@ -155,4 +155,16 @@ This is a list of people who have contributed code to the [YugabyteDB](https://g
 * [AntonRybochkin](https://github.com/arybochkin)
 * [joe-maley](https://github.com/joe-maley)
 * [msun07](https://github.com/msun07)
-* [dr0pdb][https://github.com/dr0pdb]
+* [dr0pdb](https://github.com/dr0pdb)
+* [nishantwrp](https://github.com/nishantwrp)
+* [mdbridge](https://github.com/mdbridge)
+* [hbhanawat](https://github.com/hbhanawat)
+* [asrinivasanyb](https://github.com/asrinivasanyb)
+* [devansh-ism](https://github.com/devansh-ism)
+* [swapshivam3](https://github.com/swapshivam3)
+* [utkarsh-um-yb](https://github.com/utkarsh-um-yb)
+* [aashir24-yb](https://github.com/aashir24-yb)
+* [keisku](https://github.com/keisku)
+* [Rylan12](https://github.com/Rylan12)
+* [SrivastavaAnubhav](https://github.com/SrivastavaAnubhav)
+* [neera-mital](https://github.com/neera-mital)

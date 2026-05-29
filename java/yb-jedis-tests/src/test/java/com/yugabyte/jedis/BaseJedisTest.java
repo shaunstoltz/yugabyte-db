@@ -1,4 +1,4 @@
-// Copyright (c) YugaByte, Inc.
+// Copyright (c) YugabyteDB, Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License"); you may not use this file except
 // in compliance with the License.  You may obtain a copy of the License at
@@ -21,6 +21,7 @@ import org.yb.client.GetTableSchemaResponse;
 import org.yb.client.YBClient;
 import org.yb.Common.PartitionSchemaPB.HashSchema;
 import org.yb.minicluster.BaseMiniClusterTest;
+import org.yb.minicluster.MiniYBClusterBuilder;
 import org.yb.util.BuildTypeUtil;
 import redis.clients.jedis.HostAndPort;
 import redis.clients.jedis.Jedis;
@@ -37,6 +38,7 @@ import java.net.InetSocketAddress;
 import java.util.ArrayList;
 import java.util.Collection;
 import java.util.Collections;
+import java.util.function.Consumer;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
@@ -69,6 +71,16 @@ public abstract class BaseJedisTest extends BaseMiniClusterTest {
   protected JedisCommands jedis_client;
   protected JedisCommands jedis_client_1;
   private static final Logger LOG = LoggerFactory.getLogger(BaseJedisTest.class);
+
+  protected void createMiniCluster(int numMasters, int numTservers,
+      Map<String, String> additionalMasterFlags, Map<String, String> additionalTserverFlags,
+      Consumer<MiniYBClusterBuilder> customize, Map<String, String> additionalEnvironmentVars)
+      throws Exception {
+    Map<String, String> tserverFlags = new HashMap<>(additionalTserverFlags);
+    tserverFlags.put("start_redis_proxy", "true");
+    super.createMiniCluster(numMasters, numTservers, additionalMasterFlags, tserverFlags, customize,
+        additionalEnvironmentVars);
+  }
 
   class TSValuePairs {
     TSValuePairs(int size) {

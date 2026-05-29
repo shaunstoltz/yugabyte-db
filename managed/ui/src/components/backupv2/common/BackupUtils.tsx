@@ -1,7 +1,7 @@
 /*
  * Created on Fri Feb 18 2022
  *
- * Copyright 2021 YugaByte, Inc. and Contributors
+ * Copyright 2021 YugabyteDB, Inc. and Contributors
  * Licensed under the Polyform Free Trial License 1.0.0 (the "License")
  * You may not use this file except in compliance with the License. You may obtain a copy of the License at
  * http://github.com/YugaByte/yugabyte-db/blob/master/licenses/POLYFORM-FREE-TRIAL-LICENSE-1.0.0.txt
@@ -10,14 +10,20 @@
 import React, { useState } from 'react';
 import moment from 'moment';
 import { useSelector } from 'react-redux';
-import { keyBy, mapValues } from 'lodash';
-import { Backup_Options_Type, IBackup, IStorageConfig, IUniverse } from './IBackup';
-import { Backup_States } from '../common/IBackup';
+import { keyBy, mapValues, capitalize, lowerCase, find } from 'lodash';
+import { Backup_Options_Type, Backup_States, CustomerConfig, IBackup, IUniverse } from './IBackup';
 import { Alert } from 'react-bootstrap';
 import { TableType } from '../../../redesign/helpers/dtos';
+import { RunTimeConfig } from '../../../redesign/features/universe/universe-form/utils/dto';
+import { MILLISECONDS_IN } from '../scheduled/ScheduledBackupUtils';
 import './BackupUtils.scss';
 
 export const BACKUP_REFETCH_INTERVAL = 20 * 1000;
+export const BACKUP_PITR_ENABLED = 'yb.ui.feature_flags.off_cluster_pitr_enabled';
+export const PATH_STYLE_ACCESS = 'yb.ui.feature_flags.enable_path_style_access';
+export const CHUNKED_ENCODING = 'yb.ui.feature_flags.enable_chunked_encoding';
+export const ENABLE_SIGNING_REGION = 'yb.ui.feature_flags.enable_signing_region';
+export const ENABLE_S3_BACKUP_PROXY = 'yb.ui.feature_flags.enable_s3_backup_proxy';
 
 /**
  * Calculates the difference between two dates
@@ -25,7 +31,11 @@ export const BACKUP_REFETCH_INTERVAL = 20 * 1000;
  * @param endtime end time
  * @returns diff between the dates
  */
-export const calculateDuration = (startTime: number, endtime: number): string => {
+export const calculateDuration = (
+  startTime: string,
+  endtime: string,
+  haveSeparator = false
+): string => {
   const start = moment(startTime);
   const end = moment(endtime);
 
@@ -35,10 +45,21 @@ export const calculateDuration = (startTime: number, endtime: number): string =>
   const totalHours = end.diff(start, 'hours');
   const totalMinutes = end.diff(start, 'minutes');
   const totalSeconds = end.diff(start, 'seconds');
-  let duration = totalDays !== 0 ? `${totalDays} d ` : '';
-  duration += totalHours % 24 !== 0 ? `${totalHours % 24} h ` : '';
-  duration += totalMinutes % 60 !== 0 ? `${totalMinutes % 60} m ` : ``;
-  duration += totalSeconds % 60 !== 0 ? `${totalSeconds % 60} s` : '';
+  let duration = totalDays !== 0 ? (haveSeparator ? `${totalDays}d ` : `${totalDays} d `) : '';
+  duration +=
+    totalHours % 24 !== 0 ? (haveSeparator ? `${totalHours % 24}h ` : `${totalHours % 24} h `) : '';
+  duration +=
+    totalMinutes % 60 !== 0
+      ? haveSeparator
+        ? `${totalMinutes % 60}m `
+        : `${totalMinutes % 60} m `
+      : ``;
+  duration +=
+    totalSeconds % 60 !== 0
+      ? haveSeparator
+        ? `${totalSeconds % 60}s`
+        : `${totalSeconds % 60} s`
+      : '';
   return duration;
 };
 
@@ -48,11 +69,11 @@ export const BACKUP_STATUS_OPTIONS: { value: Backup_States | null; label: string
     value: null
   },
   {
-    label: 'In Progress',
+    label: 'Backup In Progress',
     value: Backup_States.IN_PROGRESS
   },
   {
-    label: 'Completed',
+    label: 'Backup Completed',
     value: Backup_States.COMPLETED
   },
   {
@@ -60,7 +81,7 @@ export const BACKUP_STATUS_OPTIONS: { value: Backup_States | null; label: string
     value: Backup_States.DELETE_IN_PROGRESS
   },
   {
-    label: 'Failed',
+    label: 'Backup Failed',
     value: Backup_States.FAILED
   },
   {
@@ -72,11 +93,11 @@ export const BACKUP_STATUS_OPTIONS: { value: Backup_States | null; label: string
     value: Backup_States.QUEUED_FOR_DELETION
   },
   {
-    label: 'Skipped',
+    label: 'Backup Skipped',
     value: Backup_States.SKIPPED
   },
   {
-    label: 'Cancelled',
+    label: 'Backup Cancelled',
     value: Backup_States.STOPPED
   }
 ];
@@ -134,8 +155,9 @@ export const CALDENDAR_ICON = () => ({
 export const convertArrayToMap = (arr: IUniverse[], keyStr: string, valueStr: string) =>
   mapValues(keyBy(arr, keyStr), valueStr);
 
-export const PARALLEL_THREADS_RANGE = {
+export const ParallelThreads = {
   MIN: 1,
+  XCLUSTER_DEFAULT: 8,
   MAX: 100
 };
 
@@ -146,7 +168,7 @@ export const RESTORE_IN_PROGRESS_MSG = (
     progress.
   </Alert>
 );
-export const convertBackupToFormValues = (backup: IBackup, storage_config: IStorageConfig) => {
+export const convertBackupToFormValues = (backup: IBackup, storage_config: CustomerConfig) => {
   const formValues = {
     use_cron_expression: false,
     cron_expression: '',
@@ -155,9 +177,11 @@ export const convertBackupToFormValues = (backup: IBackup, storage_config: IStor
       label: backup.backupType === TableType.PGSQL_TABLE_TYPE ? 'YSQL' : 'YCQL'
     },
     selected_ycql_tables: [] as any[],
-    parallel_threads: PARALLEL_THREADS_RANGE.MIN,
+    parallel_threads: ParallelThreads.MIN,
     storage_config: null as any,
-    baseBackupUUID: backup.commonBackupInfo.baseBackupUUID
+    baseBackupUUID: backup.commonBackupInfo.baseBackupUUID,
+    isTableByTableBackup: backup.commonBackupInfo.tableByTableBackup,
+    useTablespaces: backup.useTablespaces
   };
   if (backup.isFullBackup) {
     formValues['db_to_backup'] = {
@@ -198,5 +222,45 @@ export const convertBackupToFormValues = (backup: IBackup, storage_config: IStor
     };
   }
 
+  if (backup.expiryTime) {
+    formValues['retention_interval'] = Math.ceil(
+      (backup.hasIncrementalBackups
+        ? Date.parse(backup.expiryTime) - Date.parse(backup.lastIncrementalBackupTime)
+        : Date.parse(backup.expiryTime) - Date.parse(backup.commonBackupInfo.createTime)) /
+        MILLISECONDS_IN[backup.expiryTimeUnit]
+    );
+    const interval_type = capitalize(lowerCase(backup.expiryTimeUnit));
+    formValues['retention_interval_type'] = { value: interval_type, label: interval_type };
+    formValues['keep_indefinitely'] = false;
+  } else {
+    formValues['keep_indefinitely'] = true;
+  }
+
+  formValues['scheduleName'] = backup.scheduleName;
+  formValues['backupObj'] = backup;
+
   return formValues;
+};
+
+export const isBackupPITREnabled = (runtimeConfigs: RunTimeConfig) => {
+  return (
+    find(runtimeConfigs?.configEntries, (config) => config.key === BACKUP_PITR_ENABLED)?.value ===
+    'true'
+  );
+};
+
+export const isPathStyleAccess = (runtimeConfigs: RunTimeConfig) => {
+  return find(runtimeConfigs?.configEntries, (config) => config.key === PATH_STYLE_ACCESS)?.value === 'true';
+};
+
+export const isChunkedEncodingEnabled = (runtimeConfigs: RunTimeConfig) => {
+  return find(runtimeConfigs?.configEntries, (config) => config.key === CHUNKED_ENCODING)?.value === 'true';
+};
+
+export const isSigningRegionEnabled = (runtimeConfigs: RunTimeConfig) => {
+  return find(runtimeConfigs?.configEntries, (config) => config.key === ENABLE_SIGNING_REGION)?.value === 'true';
+};
+
+export const isS3BackupProxyEnabled = (runtimeConfigs: RunTimeConfig) => {
+  return find(runtimeConfigs?.configEntries, (config) => config.key === ENABLE_S3_BACKUP_PROXY)?.value === 'true';
 };

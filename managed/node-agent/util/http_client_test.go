@@ -1,8 +1,9 @@
-// Copyright (c) YugaByte, Inc.
+// Copyright (c) YugabyteDB, Inc.
 package util
 
 import (
-	"io/ioutil"
+	"context"
+	"io"
 	"net/http"
 	"testing"
 )
@@ -41,11 +42,11 @@ func TestHttpClientSuccess(t *testing.T) {
 		100,
 		config.String(PlatformUrlKey),
 	)
-	res, err := testClient.Do(http.MethodGet, "/test", nil, nil, nil)
+	res, err := testClient.Do(context.TODO(), http.MethodGet, "/test", nil, nil, nil)
 	if err != nil {
 		t.Fatalf("Error while calling the request - %s", err.Error())
 	}
-	body, err := ioutil.ReadAll(res.Body)
+	body, err := io.ReadAll(res.Body)
 	defer res.Body.Close()
 	if err != nil {
 		t.Fatalf("Error reading the respone - %s", err.Error())
@@ -53,7 +54,7 @@ func TestHttpClientSuccess(t *testing.T) {
 	if string(body) != "success" {
 		t.Fatalf("Unexpected body in the response")
 	}
-	res, err = testClient.Do(http.MethodPut, "/test", nil, nil, nil)
+	res, err = testClient.Do(context.TODO(), http.MethodPut, "/test", nil, nil, nil)
 	if res.StatusCode != 405 {
 		t.Fatalf("Expected 405 status code.")
 	}

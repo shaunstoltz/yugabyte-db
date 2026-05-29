@@ -1,4 +1,4 @@
-// Copyright (c) YugaByte, Inc.
+// Copyright (c) YugabyteDB, Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License"); you may not use this file except
 // in compliance with the License.  You may obtain a copy of the License at
@@ -13,20 +13,35 @@
 
 #pragma once
 
+#include <array>
 #include <memory>
+#include <optional>
 #include <string>
+#include <string_view>
+#include <tuple>
+#include <type_traits>
+#include <utility>
+#include <vector>
 
 #include "libpq-fe.h" // NOLINT
 
 #include "yb/common/transaction.pb.h"
 
 #include "yb/util/format.h"
+#include "yb/util/json_document.h"
+#include "yb/util/lw_function.h"
 #include "yb/util/monotime.h"
 #include "yb/util/net/net_fwd.h"
 #include "yb/util/result.h"
+#include "yb/util/subprocess.h"
+#include "yb/util/type_traits.h"
+#include "yb/util/uuid.h"
 
-namespace yb {
-namespace pgwrapper {
+namespace yb::pgwrapper {
+
+YB_DEFINE_TYPED_ENUM(PGResultFormat, int,
+    ((kText, 0))
+    ((kBinary, 1)));
 
 struct PGConnClose {
   void operator()(PGconn* conn) const;
@@ -38,6 +53,10 @@ struct PGResultClear {
 
 typedef std::unique_ptr<PGconn, PGConnClose> PGConnPtr;
 typedef std::unique_ptr<PGresult, PGResultClear> PGResultPtr;
+
+// FetchRow/GetValue<MonoDelta> return MonoDelta since POSTGRES_EPOCH_DATE
+// The PGPostgresEpoch function returns this moment as MonoTime
+const MonoTime& PGPostgresEpoch();
 
 struct PGOid {};
 
@@ -65,10 +84,21 @@ struct IsPGNonNegImpl<T> : std::true_type {};
 template<class T>
 inline constexpr bool IsPGNonNeg = IsPGNonNegImpl<T>::value;
 
+class RowAsString;
+
 template<class T>
-concept AllowedPGType =
+concept BasePGType =
     IsPGNonNeg<T> || IsPGIntType<T> || IsPGFloatType<T> ||
-    std::is_same_v<T, bool> || std::is_same_v<T, std::string> || std::is_same_v<T, PGOid>;
+    std::is_same_v<T, bool> || std::is_same_v<T, std::string> || std::is_same_v<T, char> ||
+    std::is_same_v<T, PGOid> || std::is_same_v<T, Uuid> || std::is_same_v<T, MonoDelta> ||
+    std::is_same_v<T, JsonDocument> ||
+    std::is_same_v<T, std::vector<float>> || std::is_same_v<T, RowAsString>;
+
+template<class T>
+concept OptionalPGType = StdOptionalType<T> && BasePGType<typename T::value_type>;
+
+template<class T>
+concept AllowedPGType = BasePGType<T> || OptionalPGType<T>;
 
 template<AllowedPGType T>
 struct PGTypeTraits {
@@ -87,34 +117,197 @@ struct PGTypeTraits<T> {
   using ReturnType = Oid;
 };
 
+template<OptionalPGType T>
+struct PGTypeTraits<T> {
+  using ReturnType = std::optional<typename PGTypeTraits<typename T::value_type>::ReturnType>;
+};
+
 using PGUint16 = PGNonNeg<int16_t>;
 using PGUint32 = PGNonNeg<int32_t>;
 using PGUint64 = PGNonNeg<int64_t>;
 
-template<class T>
+template<AllowedPGType T>
 using GetValueResult = Result<typename PGTypeTraits<T>::ReturnType>;
 
-template<class T>
-GetValueResult<T> GetValue(PGresult* result, int row, int column);
+namespace libpq_utils::internal {
 
-inline Result<int32_t> GetInt32(PGresult* result, int row, int column) {
-  return GetValue<int32_t>(result, row, column);
+template<BasePGType T>
+struct GetValueHelper {
+  static Status CheckType(const PGresult* result, int column);
+  static GetValueResult<T> Get(const PGresult* result, int row, int column);
+};
+
+} // namespace libpq_utils::internal
+
+template<BasePGType T>
+GetValueResult<T> GetValue(const PGresult* result, int row, int column) {
+  using Helper = libpq_utils::internal::GetValueHelper<T>;
+  RETURN_NOT_OK(Helper::CheckType(result, column));
+  return Helper::Get(result, row, column);
 }
 
-inline Result<std::string> GetString(PGresult* result, int row, int column) {
-  return GetValue<std::string>(result, row, column);
+template<OptionalPGType T>
+GetValueResult<T> GetValue(const PGresult* result, int row, int column) {
+  using Helper = libpq_utils::internal::GetValueHelper<typename T::value_type>;
+  RETURN_NOT_OK(Helper::CheckType(result, column));
+  if (PQgetisnull(result, row, column)) {
+    return std::nullopt;
+  }
+  return Helper::Get(result, row, column);
 }
 
 const std::string& DefaultColumnSeparator();
 const std::string& DefaultRowSeparator();
 
-Result<std::string> ToString(PGresult* result, int row, int column);
-Result<std::string> RowToString(
-    PGresult* result, int row, const std::string& sep = DefaultColumnSeparator());
-void LogResult(PGresult* result);
+// DEPRECATED: use FetchRows instead.
+Result<std::string> ToString(const PGresult* result, int row, int column);
 
 std::string PqEscapeLiteral(const std::string& input);
 std::string PqEscapeIdentifier(const std::string& input);
+std::string PqEscapeStringConn(const std::string& input);
+
+namespace libpq_utils::internal {
+
+template <AllowedPGType... ColumnTypes>
+class RowFetcher {
+ public:
+  static constexpr auto kNumColumns = sizeof...(ColumnTypes);
+  static_assert(kNumColumns > 1);
+  using RowType = std::tuple<typename PGTypeTraits<ColumnTypes>::ReturnType...>;
+
+  static Result<RowType> Fetch(const PGresult* res, int row) {
+    RowType result;
+    RETURN_NOT_OK(Update<0>(&result, res, row));
+    return result;
+  }
+
+ private:
+  template <size_t ColumnIdx>
+  static Status Update(RowType* dest, const PGresult* res, int row) {
+    using ColumnType = std::tuple_element_t<ColumnIdx, std::tuple<ColumnTypes...>>;
+    std::get<ColumnIdx>(*dest) = VERIFY_RESULT(GetValue<ColumnType>(res, row, ColumnIdx));
+    constexpr auto kNextColumnIdx = ColumnIdx + 1;
+    if constexpr (kNextColumnIdx < kNumColumns) {
+      return Update<kNextColumnIdx>(dest, res, row);
+    } else {
+      return Status::OK();
+    }
+  }
+};
+
+template <AllowedPGType ColumnType>
+class RowFetcher<ColumnType> {
+ public:
+  static constexpr auto kNumColumns = 1;
+  using RowType = typename PGTypeTraits<ColumnType>::ReturnType;
+
+  static Result<RowType> Fetch(const PGresult* res, int row) {
+    return GetValue<ColumnType>(res, row, 0);
+  }
+};
+
+template <AllowedPGType... Args>
+class FetchHelper {
+  using Fetcher = RowFetcher<Args...>;
+  using RowType = typename Fetcher::RowType;
+  using RowsType = std::vector<RowType>;
+  using RowResult = Result<RowType>;
+  using RowsResult = Result<RowsType>;
+
+ public:
+  static RowResult FetchRow(Result<PGResultPtr>&& source) {
+    return FetchRow(VERIFY_RESULT(CheckSource(std::move(source))).get());
+  }
+
+  static RowsResult FetchRows(Result<PGResultPtr>&& source) {
+    return FetchRows(VERIFY_RESULT(CheckSource(std::move(source))).get());
+  }
+
+ private:
+  static RowResult FetchRow(const PGresult* source) {
+    SCHECK_EQ(PQntuples(source), 1, RuntimeError, "Unexpected number of rows");
+    return Fetcher::Fetch(source, 0);
+  }
+
+  static RowsResult FetchRows(const PGresult* source) {
+    RowsType result;
+    auto num_rows = PQntuples(source);
+    result.reserve(num_rows);
+    for (int row = 0; row < num_rows; ++row) {
+      result.push_back(VERIFY_RESULT(Fetcher::Fetch(source, row)));
+    }
+    return result;
+  }
+
+  static Result<PGResultPtr> CheckSource(Result<PGResultPtr>&& source) {
+    if (source.ok()) {
+      SCHECK_EQ(
+          PQnfields(source->get()), Fetcher::kNumColumns,
+          RuntimeError, "Unexpected number of columns");
+    }
+    return source;
+  }
+};
+
+template <>
+class FetchHelper<RowAsString> {
+  using RowsType = std::vector<std::string>;
+  using RowsResult = Result<RowsType>;
+
+ public:
+  static RowsResult FetchRows(Result<PGResultPtr>&& source);
+};
+
+struct CopyOptions {
+  std::optional<size_t> rows_per_txn{};
+};
+
+class CopyController;
+
+class RowMakerImpl {
+ public:
+  explicit RowMakerImpl(CopyController& impl) : impl_(impl) {}
+
+  template<class... Args>
+  void operator()(const Args&... args) {
+    StartRow(sizeof...(Args));
+    DoPut(args...);
+  }
+
+ private:
+  template<class T, class... Tail>
+  void DoPut(const T& v, const Tail&... tail) {
+    Put(v);
+    if constexpr (sizeof...(Tail) > 0) {
+      DoPut(tail...);
+    }
+  }
+
+  void Put(int32_t value);
+  void Put(int64_t value);
+  void Put(std::string_view value);
+  void StartRow(uint16_t columns);
+
+  CopyController& impl_;
+};
+
+template<class... Args>
+class RowMaker {
+ public:
+  explicit RowMaker(CopyController& controller) : impl_(controller) {}
+
+  void operator()(const Args&... args) { impl_(args...); }
+
+ private:
+  RowMakerImpl impl_;
+};
+
+template<class T, class... Args>
+auto MakeRowMaker(CopyController& controller, void (T::*)(RowMaker<Args...>&) const) {
+  return RowMaker<Args...>{controller};
+}
+
+} // namespace libpq_utils::internal
 
 class PGConn {
  public:
@@ -140,33 +333,58 @@ class PGConn {
       bool simple_query_protocol,
       const std::string& conn_str_for_log);
 
-  Status Execute(const std::string& command, bool show_query_in_error = true);
+  // Reconnect.
+  void Reset();
+
+  // Execute a query that does not return any results.
+  // If show_query_in_error is set, the query will be included in the error message.
+  // If ignore_empty_query is set, an empty query or a query containing only comments will not
+  // result in an error.
+  Status Execute(
+      const std::string& command, bool show_query_in_error = true, bool ignore_empty_query = false);
 
   template <class... Args>
   Status ExecuteFormat(const std::string& format, Args&&... args) {
     return Execute(Format(format, std::forward<Args>(args)...));
   }
 
-  Result<PGResultPtr> Fetch(const std::string& command);
+  bool IsBusy();
+
+  ConnStatusType ConnStatus();
+
+  Result<PGResultPtr> Fetch(
+      const std::string& command,
+      std::optional<PGResultFormat> data_format = std::nullopt,
+      const std::vector<const char*>& params = {});
 
   template <class... Args>
+  requires(sizeof...(Args) > 0)
   Result<PGResultPtr> FetchFormat(const std::string& format, Args&&... args) {
     return Fetch(Format(format, std::forward<Args>(args)...));
   }
 
   // Fetches data matrix of specified size. I.e. exact number of rows and columns are expected.
   Result<PGResultPtr> FetchMatrix(const std::string& command, int rows, int columns);
+
+  // TODO (#30816): FetchRow<T> for non-string types fails on simple query protocol connections
+  template <class... Args>
+  auto FetchRow(const std::string& query) {
+    return libpq_utils::internal::FetchHelper<Args...>::FetchRow(Fetch(query));
+  }
+
+  template <class... Args>
+  auto FetchRows(const std::string& query) {
+    return libpq_utils::internal::FetchHelper<Args...>::FetchRows(Fetch(query));
+  }
+
+  // The following two methods are really important because they convenient way for checking table
+  // content and debugging tests.
+  // Please do not remove them. Consult @sergei if you have any questions.
   Result<std::string> FetchRowAsString(
       const std::string& command, const std::string& sep = DefaultColumnSeparator());
   Result<std::string> FetchAllAsString(const std::string& command,
       const std::string& column_sep = DefaultColumnSeparator(),
       const std::string& row_sep = DefaultRowSeparator());
-
-  template<class T>
-  GetValueResult<T> FetchValue(const std::string& command) {
-    auto res = VERIFY_RESULT(FetchMatrix(command, 1, 1));
-    return GetValue<T>(res.get(), 0, 0);
-  }
 
   Status StartTransaction(IsolationLevel isolation_level);
   Status CommitTransaction();
@@ -174,51 +392,57 @@ class PGConn {
 
   Status TestFailDdl(const std::string& ddl_to_fail);
 
+  void SetNoticeProcessor(PQnoticeProcessor proc, void* arg) {
+    PQsetNoticeProcessor(impl_.get(), proc, arg);
+  }
+
   // Would this query use an index [only] scan?
   Result<bool> HasIndexScan(const std::string& query);
   Result<bool> HasScanType(const std::string& query, const std::string expected_scan_type);
 
-  Status CopyBegin(const std::string& command);
-  Result<PGResultPtr> CopyEnd();
+  template<class... Args>
+  using RowMaker = libpq_utils::internal::RowMaker<Args...>;
+  using CopyOptions = libpq_utils::internal::CopyOptions;
+  using CopyController = libpq_utils::internal::CopyController;
 
-  void CopyStartRow(int16_t columns);
-
-  void CopyPutInt16(int16_t value);
-  void CopyPutInt32(int32_t value);
-  void CopyPutInt64(int64_t value);
-  void CopyPut(const char* value, size_t len);
-
-  void CopyPutString(const std::string& value) {
-    CopyPut(value.c_str(), value.length());
-  }
-
-  PGconn* get() {
-    return impl_.get();
+  template<class RowProvider, class... Args>
+  Status CopyFromStdin(
+      std::string_view table, const RowProvider& row_provider, const CopyOptions& options = {}) {
+    return DoCopyFromStdin(
+        table, options,
+        make_lw_function([&row_provider](CopyController& controller) {
+          auto maker = MakeRowMaker(controller, &RowProvider::operator());
+          row_provider(maker);
+        }));
   }
 
  private:
-  struct CopyData;
+  using ControllerReceiver = LWFunction<void(CopyController&)>;
+
+  Status DoCopyFromStdin(
+      std::string_view table, const CopyOptions& options, const ControllerReceiver& receiver);
 
   PGConn(PGConnPtr ptr, bool simple_query_protocol);
 
-  bool CopyEnsureBuffer(size_t len);
-  bool CopyFlushBuffer();
+  using CopyBuffer = std::array<char, 2048>;
 
   PGConnPtr impl_;
   bool simple_query_protocol_;
-  std::unique_ptr<CopyData> copy_data_;
+  std::unique_ptr<CopyBuffer> copy_buffer_;
 };
 
 // Settings to pass to PGConnBuilder.
 struct PGConnSettings {
   constexpr static const char* kDefaultUser = "postgres";
 
-  const std::string& host;
+  std::string host = {};
   uint16_t port;
-  const std::string& dbname = std::string();
-  const std::string& user = kDefaultUser;
-  const std::string& password = std::string();
+  std::string dbname = {};
+  std::string user = kDefaultUser;
+  std::string password = {};
+  std::string replication = {};
   size_t connect_timeout = 0;
+  bool yb_auto_analyze = false;
 };
 
 class PGConnBuilder {
@@ -232,9 +456,31 @@ class PGConnBuilder {
   const size_t connect_timeout_;
 };
 
-bool HasTryAgain(const Status& status);
-
 Result<PGConn> Execute(Result<PGConn> connection, const std::string& query);
+Result<PGConn> SetHighPriTxn(Result<PGConn> connection);
+Result<PGConn> SetLowPriTxn(Result<PGConn> connection);
+Result<PGConn> SetDefaultTransactionIsolation(
+    Result<PGConn> connection, IsolationLevel isolation_level);
+Result<IsolationLevel> EffectiveIsolationLevel(PGConn* conn);
+Status SetMaxBatchSize(PGConn* conn, size_t max_batch_size);
 
-} // namespace pgwrapper
-} // namespace yb
+class PGConnPerf {
+ public:
+  explicit PGConnPerf(PGConn* conn);
+  ~PGConnPerf();
+ private:
+  Subprocess process_;
+};
+
+// Utility function for creating internal pg connections (ie local connection using yb-tserver-key
+// authentication).
+PGConnBuilder CreateInternalPGConnBuilder(
+    const HostPort& pgsql_proxy_bind_address, const std::string& database_name,
+    uint64_t postgres_auth_key, const std::optional<CoarseTimePoint>& deadline,
+    bool yb_auto_analyze = false);
+
+Result<std::string> ResultAsString(
+    PGresult* res, const std::string& column_sep = DefaultColumnSeparator(),
+    const std::string& row_sep = DefaultRowSeparator());
+
+} // namespace yb::pgwrapper

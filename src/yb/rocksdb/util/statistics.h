@@ -3,9 +3,9 @@
 //  LICENSE file in the root directory of this source tree. An additional grant
 //  of patent rights can be found in the PATENTS file in the same directory.
 //
-// The following only applies to changes made to this file as part of YugaByte development.
+// The following only applies to changes made to this file as part of YugabyteDB development.
 //
-// Portions Copyright (c) YugaByte, Inc.
+// Portions Copyright (c) YugabyteDB, Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License"); you may not use this file except
 // in compliance with the License.  You may obtain a copy of the License at
@@ -28,10 +28,12 @@
 
 #include "yb/rocksdb/statistics.h"
 
+#include "yb/util/aggregate_stats.h"
+
 namespace yb {
 class MetricEntity;
-class Histogram;
-class HistogramPrototype;
+class EventStats;
+class EventStatsPrototype;
 
 template <class T>
 class AtomicGauge;
@@ -54,17 +56,42 @@ class StatisticsMetricImpl : public Statistics {
 
   uint64_t getTickerCount(uint32_t ticker_type) const override;
   void histogramData(uint32_t histogram_type, HistogramData* const data) const override;
+  const yb::AggregateStats& getAggregateStats(uint32_t histogramType) const override;
 
   void setTickerCount(uint32_t ticker_type, uint64_t count) override;
   void recordTick(uint32_t ticker_type, uint64_t count) override;
   void measureTime(uint32_t histogram_type, uint64_t value) override;
+  void addHistogram(uint32_t histogramType, const yb::AggregateStats& stats) override;
   void resetTickersForTest() override;
 
   const char* GetTickerName(uint32_t ticker_type) const override;
 
  private:
-  std::vector<scoped_refptr<yb::Histogram>> histograms_;
+  std::vector<scoped_refptr<yb::EventStats>> histograms_;
   std::vector<scoped_refptr<yb::AtomicGauge<uint64_t>>> tickers_;
+};
+
+class ScopedStatistics : public Statistics {
+ public:
+  ScopedStatistics();
+
+  uint64_t getTickerCount(uint32_t ticker_type) const override;
+  void histogramData(uint32_t histogram_type, HistogramData* const data) const override;
+  const yb::AggregateStats& getAggregateStats(uint32_t histogramType) const override;
+
+  void setTickerCount(uint32_t ticker_type, uint64_t count) override;
+  void recordTick(uint32_t ticker_type, uint64_t count) override;
+  void measureTime(uint32_t histogram_type, uint64_t value) override;
+  void addHistogram(uint32_t histogramType, const yb::AggregateStats& stats) override;
+  void resetTickersForTest() override;
+
+  const char* GetTickerName(uint32_t ticker_type) const override;
+
+  void MergeAndClear(Statistics* target);
+
+ private:
+  std::vector<uint64_t> tickers_;
+  std::vector<yb::AggregateStats> histograms_;
 };
 
 // Utility functions
@@ -79,6 +106,17 @@ inline void RecordTick(Statistics* statistics, uint32_t ticker_type,
                        uint64_t count = 1) {
   if (statistics) {
     statistics->recordTick(ticker_type, count);
+  }
+}
+
+inline void RecordTick(Statistics* statistics1, Statistics* statistics2, uint32_t ticker_type,
+                       uint64_t count = 1) {
+  if (statistics1) {
+    statistics1->recordTick(ticker_type, count);
+    return;
+  }
+  if (statistics2) {
+    statistics2->recordTick(ticker_type, count);
   }
 }
 

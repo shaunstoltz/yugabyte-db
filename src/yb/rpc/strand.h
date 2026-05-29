@@ -1,4 +1,4 @@
-// Copyright (c) YugaByte, Inc.
+// Copyright (c) YugabyteDB, Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License"); you may not use this file except
 // in compliance with the License.  You may obtain a copy of the License at
@@ -13,65 +13,13 @@
 
 #pragma once
 
-#include "yb/rpc/thread_pool.h"
+#include "yb/rpc/rpc_fwd.h"
 
-#include "yb/util/lockfree.h"
+#include "yb/util/strand.h"
+#include "yb/util/thread_pool.h"
 
-namespace yb {
-namespace rpc {
+namespace yb::rpc {
 
-class StrandTask : public MPSCQueueEntry<StrandTask>, public ThreadPoolTask {
- protected:
-  ~StrandTask() = default;
-};
+using yb::StrandTaskWithErrorFunc;
 
-template <class F>
-FunctorThreadPoolTask<F, StrandTask>* MakeFunctorStrandTask(const F& f) {
-  return new FunctorThreadPoolTask<F, StrandTask>(f);
-}
-
-template <class F>
-FunctorThreadPoolTask<F, StrandTask>* MakeFunctorStrandTask(F&& f) {
-  return new FunctorThreadPoolTask<F, StrandTask>(std::move(f));
-}
-
-// Strand prevent concurrent execution of enqueued tasks.
-// If task is submitted into strand and it already has enqueued tasks, new task will be executed
-// after all previously enqueued tasks.
-//
-// Submitted task should inherit StrandTask or wrapped by class that provides such inheritance.
-class Strand : public ThreadPoolTask {
- public:
-  explicit Strand(ThreadPool* thread_pool);
-  virtual ~Strand();
-
-  void Enqueue(StrandTask* task);
-
-  template <class F>
-  void EnqueueFunctor(const F& f) {
-    Enqueue(MakeFunctorStrandTask(f));
-  }
-
-  template <class F>
-  void EnqueueFunctor(F&& f) {
-    Enqueue(MakeFunctorStrandTask(std::move(f)));
-  }
-
-  void Shutdown();
-
- private:
-  void Run() override;
-
-  void Done(const Status& status) override;
-
-  void ProcessTasks(const Status& status, bool allow_closing);
-
-  ThreadPool& thread_pool_;
-  std::atomic<size_t> active_tasks_{0};
-  MPSCQueue<StrandTask> queue_;
-  std::atomic<bool> running_{false};
-  std::atomic<bool> closing_{false};
-};
-
-} // namespace rpc
-} // namespace yb
+} // namespace yb::rpc

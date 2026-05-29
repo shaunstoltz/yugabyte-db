@@ -15,9 +15,9 @@
 // specific language governing permissions and limitations
 // under the License.
 //
-// The following only applies to changes made to this file as part of YugaByte development.
+// The following only applies to changes made to this file as part of YugabyteDB development.
 //
-// Portions Copyright (c) YugaByte, Inc.
+// Portions Copyright (c) YugabyteDB, Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License"); you may not use this file except
 // in compliance with the License.  You may obtain a copy of the License at
@@ -31,15 +31,11 @@
 //
 #include "yb/cdc/cdc_error.h"
 
-namespace yb {
-namespace cdc {
+#include "yb/common/wire_protocol.h"
 
-static const std::string kCDCErrorCategoryName = "CDC error";
+namespace yb::cdc {
 
-static StatusCategoryRegisterer cdc_error_category_registerer(
-    StatusCategoryDescription::Make<CDCErrorTag>(&kCDCErrorCategoryName));
-
-void SetupError(::yb::cdc::CDCErrorPB* error, const Status& status) {
+void SetupError(CDCErrorPB* error, const Status& status) {
   StatusToPB(status, error->mutable_status());
   auto code = CDCError::ValueFromStatus(status);
   if (code) {
@@ -47,5 +43,4 @@ void SetupError(::yb::cdc::CDCErrorPB* error, const Status& status) {
   }
 }
 
-} // namespace cdc
-} // namespace yb
+} // namespace yb::cdc

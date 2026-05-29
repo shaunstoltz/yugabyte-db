@@ -1,4 +1,4 @@
-// Copyright YugaByte Inc.
+// Copyright YugabyteDB, Inc.
 
 import { NodeActionModal } from '../../universes';
 import { connect } from 'react-redux';
@@ -7,8 +7,7 @@ import {
   getNodeDetails,
   getNodeDetailsResponse,
   performUniverseNodeAction,
-  performUniverseNodeActionResponse,
-
+  performUniverseNodeActionResponse
 } from '../../../actions/universe';
 
 function mapStateToProps(state) {
@@ -25,8 +24,10 @@ const mapDispatchToProps = (dispatch) => {
     getNodeDetailsResponse: (payload) => {
       dispatch(getNodeDetailsResponse(payload));
     },
-    performUniverseNodeAction: (universeUUID, nodeName, actionType) => {
-      return dispatch(performUniverseNodeAction(universeUUID, nodeName, actionType));
+    performUniverseNodeAction: (universeUUID, nodeName, actionType, runOnlyPrechecks) => {
+      return dispatch(
+        performUniverseNodeAction(universeUUID, nodeName, actionType, runOnlyPrechecks)
+      );
     },
     performUniverseNodeActionResponse: (payload) => {
       dispatch(performUniverseNodeActionResponse(payload));

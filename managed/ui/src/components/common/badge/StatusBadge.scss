@@ -36,8 +36,14 @@
   }
 
   &.QueuedForDeletion,
-  &.Stopping {
+  &.Stopping,
+  &.Paused {
     background: #ffeec8;
     color: #9d6c00;
+  }
+
+  &.Expired {
+    background: #e9eef2;
+    color: #4e5f6d;
   }
 }

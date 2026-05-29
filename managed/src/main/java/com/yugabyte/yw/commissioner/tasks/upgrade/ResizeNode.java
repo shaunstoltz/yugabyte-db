@@ -1,18 +1,20 @@
-// Copyright (c) YugaByte, Inc.
+// Copyright (c) YugabyteDB, Inc.
 
 package com.yugabyte.yw.commissioner.tasks.upgrade;
 
-import com.google.common.collect.ImmutableList;
-import com.google.common.collect.ImmutableSet;
 import com.yugabyte.yw.commissioner.BaseTaskDependencies;
 import com.yugabyte.yw.commissioner.ITask.Retryable;
 import com.yugabyte.yw.commissioner.TaskExecutor.SubTaskGroup;
 import com.yugabyte.yw.commissioner.UpgradeTaskBase;
 import com.yugabyte.yw.commissioner.UserTaskDetails;
 import com.yugabyte.yw.commissioner.tasks.subtasks.ChangeInstanceType;
+import com.yugabyte.yw.common.NodeAgentClient;
 import com.yugabyte.yw.common.gflags.GFlagsUtil;
+import com.yugabyte.yw.common.utils.CapacityReservationUtil;
+import com.yugabyte.yw.forms.GFlagsUpgradeParams;
 import com.yugabyte.yw.forms.ResizeNodeParams;
 import com.yugabyte.yw.forms.UniverseDefinitionTaskParams;
+import com.yugabyte.yw.forms.UniverseDefinitionTaskParams.Cluster;
 import com.yugabyte.yw.forms.UniverseDefinitionTaskParams.UserIntent;
 import com.yugabyte.yw.models.Universe;
 import com.yugabyte.yw.models.helpers.DeviceInfo;
@@ -24,6 +26,10 @@ import java.util.HashMap;
 import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Map;
+import java.util.Objects;
+import java.util.Set;
+import java.util.UUID;
+import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.stream.Collectors;
 import javax.inject.Inject;
 import lombok.extern.slf4j.Slf4j;
@@ -53,159 +59,323 @@ public class ResizeNode extends UpgradeTaskBase {
   }
 
   @Override
+  public void validateParams(boolean isFirstTry) {
+    super.validateParams(isFirstTry);
+    taskParams().verifyParams(getUniverse(), !isFirstTry() ? getNodeState() : null, isFirstTry);
+  }
+
+  @Override
+  protected void createPrecheckTasks(Universe universe) {
+    super.createPrecheckTasks(universe);
+    addBasicPrecheckTasks();
+  }
+
+  @Override
+  protected boolean isSkipPrechecks() {
+    NodesToApply nodesToApply = calclulateNodesToApply();
+    if (!nodesToApply.applyGFlagsToAllNodes
+        && nodesToApply.instanceChangingNodes.isEmpty()
+        && nodesToApply.tserversToUpgradeGFlags.isEmpty()
+        && nodesToApply.mastersToUpgradeGFlags.isEmpty()
+        && !nodesToApply.justModifyDeviceNodes.isEmpty()) {
+      return true;
+    }
+    return super.isSkipPrechecks();
+  }
+
+  private static class NodesToApply {
+    LinkedHashSet<NodeDetails> instanceChangingNodes = new LinkedHashSet<>();
+    List<NodeDetails> justModifyDeviceNodes = new ArrayList<>();
+    List<NodeDetails> mastersToUpgradeGFlags = new ArrayList<>();
+    List<NodeDetails> tserversToUpgradeGFlags = new ArrayList<>();
+    boolean applyGFlagsToAllNodes = false;
+  }
+
+  private NodesToApply nodesToApplyCalculated;
+
+  @Override
+  protected MastersAndTservers calculateNodesToBeRestarted() {
+    NodesToApply nodesToApply = calclulateNodesToApply();
+    List<NodeDetails> masters = new ArrayList<>(nodesToApply.mastersToUpgradeGFlags);
+    List<NodeDetails> tservers = new ArrayList<>(nodesToApply.tserversToUpgradeGFlags);
+    masters.addAll(nodesToApply.instanceChangingNodes);
+    tservers.addAll(nodesToApply.instanceChangingNodes);
+    return new MastersAndTservers(masters, tservers);
+  }
+
+  private NodesToApply calclulateNodesToApply() {
+    if (nodesToApplyCalculated != null) {
+      return nodesToApplyCalculated;
+    }
+    Universe universe = getUniverse();
+    boolean flagsProvided = taskParams().flagsProvided(universe);
+    UserIntent userIntentForFlags = getUserIntent();
+    nodesToApplyCalculated = new NodesToApply();
+    LinkedHashSet<NodeDetails> allNodes = fetchNodesForCluster();
+    LinkedHashSet<NodeDetails> nodesNotUpdated = new LinkedHashSet<>(allNodes);
+    Map<UUID, UniverseDefinitionTaskParams.Cluster> newVersionsOfClusters =
+        taskParams().getNewVersionsOfClusters(universe);
+    // Create task sequence to resize allNodes.
+    for (UniverseDefinitionTaskParams.Cluster cluster : taskParams().clusters) {
+      if (flagsProvided) {
+        Map<String, String> masterGFlags =
+            GFlagsUtil.getBaseGFlags(
+                ServerType.MASTER,
+                newVersionsOfClusters.get(cluster.uuid),
+                newVersionsOfClusters.values());
+        Map<String, String> tserverGFlags =
+            GFlagsUtil.getBaseGFlags(
+                ServerType.TSERVER,
+                newVersionsOfClusters.get(cluster.uuid),
+                newVersionsOfClusters.values());
+        boolean updatedByMasterFlags =
+            GFlagsUtil.syncGflagsToIntent(masterGFlags, userIntentForFlags);
+        boolean updatedByTserverFlags =
+            GFlagsUtil.syncGflagsToIntent(tserverGFlags, userIntentForFlags);
+        nodesToApplyCalculated.applyGFlagsToAllNodes =
+            updatedByMasterFlags || updatedByTserverFlags;
+      }
+      LinkedHashSet<NodeDetails> clusterNodes =
+          allNodes.stream()
+              .filter(n -> cluster.uuid.equals(n.placementUuid))
+              .collect(Collectors.toCollection(LinkedHashSet::new));
+
+      final UniverseDefinitionTaskParams.UserIntent userIntent = cluster.userIntent;
+
+      UniverseDefinitionTaskParams.UserIntent currentIntent =
+          universe.getUniverseDetails().getClusterByUuid(cluster.uuid).userIntent;
+
+      for (NodeDetails node : clusterNodes) {
+        if (isInstanceChanging(node, userIntent, currentIntent)) {
+          nodesToApplyCalculated.instanceChangingNodes.add(node);
+        } else if (isModifyingDevice(node, userIntent, currentIntent)) {
+          nodesToApplyCalculated.justModifyDeviceNodes.add(node);
+        }
+      }
+      // The nodes that are being resized will be restarted, so the gflags can be
+      // upgraded in one go.
+      nodesNotUpdated.removeAll(nodesToApplyCalculated.instanceChangingNodes);
+    }
+    // Need to run gflag upgrades for the nodes that weren't updated.
+    if (flagsProvided) {
+      nodesToApplyCalculated.mastersToUpgradeGFlags =
+          nodesNotUpdated.stream()
+              .filter(n -> n.isMaster)
+              .filter(
+                  n -> {
+                    UniverseDefinitionTaskParams.Cluster curCluster =
+                        universe.getCluster(n.placementUuid);
+                    UniverseDefinitionTaskParams.Cluster newCluster =
+                        newVersionsOfClusters.get(n.placementUuid);
+                    return nodesToApplyCalculated.applyGFlagsToAllNodes
+                        || GFlagsUpgradeParams.nodeHasGflagsChanges(
+                            n,
+                            ServerType.MASTER,
+                            curCluster,
+                            universe.getUniverseDetails().clusters,
+                            newCluster,
+                            newVersionsOfClusters.values());
+                  })
+              .collect(Collectors.toList());
+      nodesToApplyCalculated.tserversToUpgradeGFlags =
+          nodesNotUpdated.stream()
+              .filter(n -> n.isTserver)
+              .filter(
+                  n -> {
+                    UniverseDefinitionTaskParams.Cluster curCluster =
+                        universe.getCluster(n.placementUuid);
+                    UniverseDefinitionTaskParams.Cluster newCluster =
+                        newVersionsOfClusters.get(n.placementUuid);
+                    return nodesToApplyCalculated.applyGFlagsToAllNodes
+                        || GFlagsUpgradeParams.nodeHasGflagsChanges(
+                            n,
+                            ServerType.TSERVER,
+                            curCluster,
+                            universe.getUniverseDetails().clusters,
+                            newCluster,
+                            newVersionsOfClusters.values());
+                  })
+              .collect(Collectors.toList());
+    }
+    return nodesToApplyCalculated;
+  }
+
+  @Override
   public void run() {
-    // Verify the request params and fail if invalid.
-    taskParams().verifyParams(getUniverse(), !isFirstTry() ? getNodeState() : null);
     runUpgrade(
         () -> {
+          NodesToApply nodesToApply = calclulateNodesToApply();
+
           Universe universe = getUniverse();
 
           UserIntent userIntentForFlags = getUserIntent();
 
-          boolean updateMasterFlags;
-          boolean updateTserverFlags;
-          if (taskParams().flagsProvided()) {
-            boolean changedByMasterFlags =
-                GFlagsUtil.syncGflagsToIntent(taskParams().masterGFlags, userIntentForFlags);
-            boolean changedByTserverFlags =
-                GFlagsUtil.syncGflagsToIntent(taskParams().tserverGFlags, userIntentForFlags);
-            log.debug(
-                "Intent changed by master {} by tserver {}",
-                changedByMasterFlags,
-                changedByTserverFlags);
-            updateMasterFlags =
-                (changedByMasterFlags || changedByTserverFlags)
-                    || !taskParams().masterGFlags.equals(getUserIntent().masterGFlags);
-            updateTserverFlags =
-                (changedByMasterFlags || changedByTserverFlags)
-                    || !taskParams().tserverGFlags.equals(getUserIntent().tserverGFlags);
-          } else {
-            updateMasterFlags = false;
-            updateTserverFlags = false;
-          }
+          boolean flagsProvided = taskParams().flagsProvided(universe);
 
-          LinkedHashSet<NodeDetails> allNodes = fetchNodesForCluster();
-          // Since currently gflags are global (primary and read-replica nodes use the same gflags),
-          // we will need to roll all servers that weren't upgraded as part of the resize.
-          LinkedHashSet<NodeDetails> nodesNotUpdated = new LinkedHashSet<>(allNodes);
+          Map<UUID, UniverseDefinitionTaskParams.Cluster> newVersionsOfClusters =
+              taskParams().getNewVersionsOfClusters(universe);
+
+          boolean deleteCapacityReservation =
+              createCapacityReservationsIfNeeded(
+                  nodesToApply.instanceChangingNodes,
+                  CapacityReservationUtil.OperationType.RESIZE,
+                  node -> {
+                    UniverseDefinitionTaskParams.Cluster targetCluster =
+                        taskParams().getClusterByUuid(node.placementUuid);
+                    String targetInstanceType =
+                        targetCluster.userIntent.getInstanceTypeForNode(node);
+                    return !node.cloudInfo.instance_type.equals(targetInstanceType);
+                  });
+
+          AtomicBoolean applyGFlagsToAllNodes = new AtomicBoolean();
           // Create task sequence to resize allNodes.
           for (UniverseDefinitionTaskParams.Cluster cluster : taskParams().clusters) {
-            LinkedHashSet<NodeDetails> clusterNodes =
-                allNodes
-                    .stream()
-                    .filter(n -> cluster.uuid.equals(n.placementUuid))
-                    .collect(Collectors.toCollection(LinkedHashSet::new));
-
             final UniverseDefinitionTaskParams.UserIntent userIntent = cluster.userIntent;
 
             UniverseDefinitionTaskParams.UserIntent currentIntent =
                 universe.getUniverseDetails().getClusterByUuid(cluster.uuid).userIntent;
 
-            List<NodeDetails> justDeviceResizeNodes = new ArrayList<>();
-            LinkedHashSet<NodeDetails> instanceChangingNodes = new LinkedHashSet<>();
-            for (NodeDetails node : clusterNodes) {
-              if (isInstanceChanging(node, userIntent)) {
-                instanceChangingNodes.add(node);
-              } else if (isDeviceResizing(node, userIntent, currentIntent)) {
-                justDeviceResizeNodes.add(node);
-              }
-            }
-            // The nodes that are being resized will be restarted, so the gflags can be
-            // upgraded in one go.
-            nodesNotUpdated.removeAll(instanceChangingNodes);
+            LinkedHashSet<NodeDetails> instanceChangingNodes =
+                nodesToApply.instanceChangingNodes.stream()
+                    .filter(n -> n.isInPlacement(cluster.uuid))
+                    .collect(Collectors.toCollection(LinkedHashSet::new));
+
+            List<NodeDetails> justModifyDeviceNodes =
+                nodesToApply.justModifyDeviceNodes.stream()
+                    .filter(n -> n.isInPlacement(cluster.uuid))
+                    .collect(Collectors.toList());
 
             createPreResizeNodeTasks(instanceChangingNodes, currentIntent);
             createRollingNodesUpgradeTaskFlow(
                 (nodes, processTypes) -> {
                   createResizeNodeTasks(nodes, userIntent, currentIntent);
-                  createGflagUpgradeTasks(
-                      nodes, userIntentForFlags, updateMasterFlags, updateTserverFlags);
+                  if (flagsProvided) {
+                    createGFlagsUpgradeTasks(
+                        userIntentForFlags,
+                        processTypes,
+                        nodes,
+                        universe,
+                        newVersionsOfClusters,
+                        applyGFlagsToAllNodes.get());
+                  }
                 },
                 instanceChangingNodes,
                 UpgradeContext.builder()
-                    .reconfigureMaster(userIntent.replicationFactor > 1)
                     .runBeforeStopping(false)
                     .processInactiveMaster(false)
                     .postAction(
                         node -> {
                           // Persist the new instance type in the node details.
-                          node.cloudInfo.instance_type = userIntent.getInstanceTypeForNode(node);
-                          createNodeDetailsUpdateTask(node, false)
+                          String instanceType = userIntent.getInstanceTypeForNode(node);
+                          node.cloudInfo.instance_type = instanceType;
+                          createUpdateUniverseFieldsTask(
+                                  univ -> {
+                                    NodeDetails nodeDetails = univ.getNode(node.nodeName);
+                                    if (nodeDetails != null) {
+                                      nodeDetails.cloudInfo.instance_type = instanceType;
+                                    }
+                                  })
                               .setSubTaskGroupType(
                                   UserTaskDetails.SubTaskGroupType.ChangeInstanceType);
                         })
                     .build(),
-                taskParams().ybcInstalled);
-            // Only disk resizing, could be done without restarts.
+                taskParams().isYbcInstalled());
+            // Only disk modification, could be done without restarts.
             createNonRestartUpgradeTaskFlow(
                 (nodes, processTypes) ->
                     createUpdateDiskSizeTasks(nodes)
                         .setSubTaskGroupType(UserTaskDetails.SubTaskGroupType.ResizingDisk),
-                justDeviceResizeNodes,
+                justModifyDeviceNodes,
                 ServerType.EITHER,
                 DEFAULT_CONTEXT);
-
-            Integer newDiskSize = null;
-            if (userIntent.deviceInfo != null) {
-              newDiskSize = userIntent.deviceInfo.volumeSize;
-            }
-            Integer newMasterDiskSize = null;
-            if (userIntent.masterDeviceInfo != null) {
-              newMasterDiskSize = userIntent.masterDeviceInfo.volumeSize;
-            }
-            String newInstanceType = userIntent.instanceType;
-            String newMasterInstanceType = userIntent.masterInstanceType;
             // Persist changes in the universe.
-            createPersistResizeNodeTask(
-                    newInstanceType,
-                    newDiskSize,
-                    newMasterInstanceType,
-                    newMasterDiskSize,
-                    Collections.singletonList(cluster.uuid))
+            createPersistResizeNodeTask(userIntent, cluster.uuid)
                 .setSubTaskGroupType(UserTaskDetails.SubTaskGroupType.ChangeInstanceType);
           }
+          if (deleteCapacityReservation) {
+            createDeleteCapacityReservationTask();
+          }
           // Need to run gflag upgrades for the nodes that weren't updated.
-          if (updateMasterFlags || updateTserverFlags) {
-            List<NodeDetails> masterNodes =
-                nodesNotUpdated
-                    .stream()
-                    .filter(n -> n.isMaster && updateMasterFlags)
-                    .collect(Collectors.toList());
-            List<NodeDetails> tserverNodes =
-                nodesNotUpdated
-                    .stream()
-                    .filter(n -> n.isTserver && updateTserverFlags)
-                    .collect(Collectors.toList());
+          if (flagsProvided) {
             // Only rolling restart supported.
             createRollingUpgradeTaskFlow(
                 (nodes, processTypes) ->
-                    createServerConfFileUpdateTasks(
+                    createGFlagsUpgradeTasks(
                         userIntentForFlags,
-                        nodes,
                         processTypes,
-                        taskParams().masterGFlags,
-                        taskParams().tserverGFlags),
-                masterNodes,
-                tserverNodes,
+                        nodes,
+                        universe,
+                        newVersionsOfClusters,
+                        applyGFlagsToAllNodes.get()),
+                nodesToApply.mastersToUpgradeGFlags,
+                nodesToApply.tserversToUpgradeGFlags,
                 RUN_BEFORE_STOPPING,
-                taskParams().ybcInstalled);
+                taskParams().isYbcInstalled());
+
             // Update the list of parameter key/values in the universe with the new ones.
-            updateGFlagsPersistTasks(taskParams().masterGFlags, taskParams().tserverGFlags)
-                .setSubTaskGroupType(getTaskSubGroupType());
+            for (UniverseDefinitionTaskParams.Cluster cluster : taskParams().clusters) {
+              updateGFlagsPersistTasks(
+                      cluster,
+                      taskParams().masterGFlags,
+                      taskParams().tserverGFlags,
+                      cluster.userIntent.specificGFlags)
+                  .setSubTaskGroupType(getTaskSubGroupType());
+            }
           }
         });
   }
 
+  private void createGFlagsUpgradeTasks(
+      UserIntent userIntentForFlags,
+      Set<ServerType> processTypes,
+      List<NodeDetails> nodes,
+      Universe universe,
+      Map<UUID, UniverseDefinitionTaskParams.Cluster> newVersionsOfClusters,
+      boolean applyToAll) {
+
+    for (NodeDetails node : nodes) {
+      UUID clusterUUID = node.placementUuid;
+      UniverseDefinitionTaskParams.Cluster oldCluster = universe.getCluster(clusterUUID);
+      UniverseDefinitionTaskParams.Cluster newCluster = newVersionsOfClusters.get(clusterUUID);
+
+      for (ServerType processType : processTypes) {
+        if (applyToAll
+            || GFlagsUpgradeParams.nodeHasGflagsChanges(
+                node,
+                processType,
+                oldCluster,
+                universe.getUniverseDetails().clusters,
+                newCluster,
+                newVersionsOfClusters.values())) {
+          createServerConfFileUpdateTasks(
+              userIntentForFlags,
+              nodes,
+              Collections.singleton(processType),
+              oldCluster,
+              universe.getUniverseDetails().clusters,
+              newCluster,
+              newVersionsOfClusters.values());
+        }
+      }
+    }
+  }
+
   private boolean isInstanceChanging(
-      NodeDetails node, UniverseDefinitionTaskParams.UserIntent newIntent) {
+      NodeDetails node,
+      UniverseDefinitionTaskParams.UserIntent newIntent,
+      UniverseDefinitionTaskParams.UserIntent currentIntent) {
     if (taskParams().isForceResizeNode()) {
       return true;
     }
     String currentInstanceType = node.cloudInfo.instance_type;
-    return !currentInstanceType.equals(newIntent.getInstanceTypeForNode(node));
+    Integer newCgroupSize = newIntent.getCGroupSize(node);
+    Integer oldCgroupSize = currentIntent.getCGroupSize(node);
+
+    return !currentInstanceType.equals(newIntent.getInstanceTypeForNode(node))
+        || !Objects.equals(oldCgroupSize, newCgroupSize);
   }
 
-  private boolean isDeviceResizing(
+  private boolean isModifyingDevice(
       NodeDetails node,
       UniverseDefinitionTaskParams.UserIntent newIntent,
       UniverseDefinitionTaskParams.UserIntent currentIntent) {
@@ -214,7 +384,25 @@ public class ResizeNode extends UpgradeTaskBase {
     }
     DeviceInfo currentDeviceInfo = currentIntent.getDeviceInfoForNode(node);
     DeviceInfo newDeviceInfo = newIntent.getDeviceInfoForNode(node);
-    return !currentDeviceInfo.volumeSize.equals(newDeviceInfo.volumeSize);
+    return isModifyingDevice(currentDeviceInfo, newDeviceInfo);
+  }
+
+  private boolean isModifyingDevice(DeviceInfo currentDeviceInfo, DeviceInfo newDeviceInfo) {
+    // Disk will not be modified if the cluster has no currently defined device info.
+    if (currentDeviceInfo == null) {
+      log.warn("Cannot modify disk since the cluster has no defined device info");
+      return false;
+    }
+    boolean modifySize =
+        newDeviceInfo.volumeSize != null
+            && !newDeviceInfo.volumeSize.equals(currentDeviceInfo.volumeSize);
+    boolean modifyIops =
+        newDeviceInfo.diskIops != null
+            && !newDeviceInfo.diskIops.equals(currentDeviceInfo.diskIops);
+    boolean modifyThroughput =
+        newDeviceInfo.throughput != null
+            && !newDeviceInfo.throughput.equals(currentDeviceInfo.throughput);
+    return modifySize || modifyIops || modifyThroughput;
   }
 
   private void createPreResizeNodeTasks(
@@ -223,9 +411,7 @@ public class ResizeNode extends UpgradeTaskBase {
     for (NodeDetails node : nodes) {
       if (!node.disksAreMountedByUUID) {
         createUpdateMountedDisksTask(
-                node,
-                currentIntent.getInstanceTypeForNode(node),
-                currentIntent.getDeviceInfoForNode(node))
+                node, node.getInstanceType(), currentIntent.getDeviceInfoForNode(node))
             .setSubTaskGroupType(getTaskSubGroupType());
       }
     }
@@ -243,12 +429,21 @@ public class ResizeNode extends UpgradeTaskBase {
     }
     byServerType.forEach(
         (type, nodes) -> {
-          String newInstanceType = newIntent.getInstanceTypeForProcessType(type);
-          DeviceInfo newDeviceInfo = newIntent.getDeviceInfoForProcessType(type);
-          String currentInstanceType = currentIntent.getInstanceTypeForProcessType(type);
-          DeviceInfo currentDeviceInfo = currentIntent.getDeviceInfoForProcessType(type);
-          createResizeNodeTasks(
-              nodes, newInstanceType, newDeviceInfo, currentInstanceType, currentDeviceInfo);
+          for (NodeDetails node : nodes) {
+            DeviceInfo newDeviceInfo = newIntent.getDeviceInfoForNode(node);
+            String newInstanceType = newIntent.getInstanceType(type, node.getAzUuid());
+            String currentInstanceType = node.cloudInfo.instance_type;
+            DeviceInfo currentDeviceInfo = currentIntent.getDeviceInfoForNode(node);
+            Integer newCgroupSize = newIntent.getCGroupSize(node);
+            Integer oldCgroupSize = currentIntent.getCGroupSize(node);
+            createResizeNodeTasks(
+                Collections.singletonList(node),
+                newInstanceType,
+                newDeviceInfo,
+                currentInstanceType,
+                currentDeviceInfo,
+                !Objects.equals(oldCgroupSize, newCgroupSize));
+          }
         });
   }
 
@@ -264,16 +459,19 @@ public class ResizeNode extends UpgradeTaskBase {
       String newInstanceType,
       DeviceInfo newDeviceInfo,
       String currentInstanceType,
-      DeviceInfo currentDeviceInfo) {
-    Integer currDiskSize = currentDeviceInfo.volumeSize;
+      DeviceInfo currentDeviceInfo,
+      boolean cgroupSizeChanging) {
     // Todo: Add preflight checks here
 
     // Change instance type
-    if (!newInstanceType.equals(currentInstanceType) || taskParams().isForceResizeNode()) {
+    if (!newInstanceType.equals(currentInstanceType)
+        || taskParams().isForceResizeNode()
+        || cgroupSizeChanging) {
       for (NodeDetails node : nodes) {
         // Check if the node needs to be resized.
         if (!taskParams().isForceResizeNode()
-            && node.cloudInfo.instance_type.equals(newInstanceType)) {
+            && node.cloudInfo.instance_type.equals(newInstanceType)
+            && !cgroupSizeChanging) {
           log.info("Skipping node {} as its type is already {}", node.nodeName, newInstanceType);
           continue;
         }
@@ -284,66 +482,42 @@ public class ResizeNode extends UpgradeTaskBase {
       }
     }
 
-    // Change disk size.
+    // Modify disk.
+    log.info("Existing device info: {}", currentDeviceInfo);
     if (newDeviceInfo != null) {
-      Integer newDiskSize = newDeviceInfo.volumeSize;
-      // Check if the storage needs to be resized.
-      if (taskParams().isForceResizeNode() || !currDiskSize.equals(newDiskSize)) {
-        log.info("Resizing disk from {} to {}", currDiskSize, newDiskSize);
-
+      // Check if the storage needs to be modified.
+      if (taskParams().isForceResizeNode() || isModifyingDevice(currentDeviceInfo, newDeviceInfo)) {
         // Resize the nodes' disks.
+        log.info("New device info: {}", newDeviceInfo);
         createUpdateDiskSizeTasks(nodes, taskParams().isForceResizeNode())
             .setSubTaskGroupType(UserTaskDetails.SubTaskGroupType.ResizingDisk);
       } else {
         log.info(
-            "Skipping resizing disk as both old and new sizes are {}, "
-                + "and forceResizeNode flag is false",
-            currDiskSize);
+            "No storage device properties were changed and forceResizeNode flag is false."
+                + " Skipping disk modification.");
       }
     }
   }
 
   private SubTaskGroup createChangeInstanceTypeTask(NodeDetails node, String instanceType) {
-    SubTaskGroup subTaskGroup =
-        getTaskExecutor().createSubTaskGroup("ChangeInstanceType", executor);
+    SubTaskGroup subTaskGroup = createSubTaskGroup("ChangeInstanceType");
     ChangeInstanceType.Params params = new ChangeInstanceType.Params();
-
+    Universe universe = Universe.getOrBadRequest(taskParams().getUniverseUUID());
+    Cluster nodeCluster = universe.getCluster(node.placementUuid);
     params.nodeName = node.nodeName;
-    params.universeUUID = taskParams().universeUUID;
+    params.setUniverseUUID(taskParams().getUniverseUUID());
     params.azUuid = node.azUuid;
     params.instanceType = instanceType;
     params.force = taskParams().isForceResizeNode();
-
+    params.useSystemd = universe.getUniverseDetails().getPrimaryCluster().userIntent.useSystemd;
+    params.placementUuid = node.placementUuid;
+    params.cgroupSize = getCGroupSize(node);
+    params.skipAnsiblePlaybookForCGroup =
+        NodeAgentClient.isCloudTypeSupported(nodeCluster.userIntent.providerType);
     ChangeInstanceType changeInstanceTypeTask = createTask(ChangeInstanceType.class);
     changeInstanceTypeTask.initialize(params);
     subTaskGroup.addSubTask(changeInstanceTypeTask);
     getRunnableTask().addSubTaskGroup(subTaskGroup);
     return subTaskGroup;
-  }
-
-  private void createGflagUpgradeTasks(
-      List<NodeDetails> allNodes,
-      UserIntent userIntentForFlags,
-      boolean updateMasterFlags,
-      boolean updateTserverFlags) {
-    for (NodeDetails node : allNodes) {
-      // Update the flags for the nodes if required.
-      if (updateMasterFlags && node.isMaster) {
-        createServerConfFileUpdateTasks(
-            userIntentForFlags,
-            ImmutableList.of(node),
-            ImmutableSet.of(ServerType.MASTER),
-            taskParams().masterGFlags,
-            taskParams().tserverGFlags);
-      }
-      if (updateTserverFlags && node.isTserver) {
-        createServerConfFileUpdateTasks(
-            userIntentForFlags,
-            ImmutableList.of(node),
-            ImmutableSet.of(ServerType.TSERVER),
-            taskParams().masterGFlags,
-            taskParams().tserverGFlags);
-      }
-    }
   }
 }

@@ -15,9 +15,9 @@
 // specific language governing permissions and limitations
 // under the License.
 //
-// The following only applies to changes made to this file as part of YugaByte development.
+// The following only applies to changes made to this file as part of YugabyteDB development.
 //
-// Portions Copyright (c) YugaByte, Inc.
+// Portions Copyright (c) YugabyteDB, Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License"); you may not use this file except
 // in compliance with the License.  You may obtain a copy of the License at
@@ -32,7 +32,7 @@
 #include "yb/tools/data_gen_util.h"
 
 #include "yb/client/schema.h"
-#include "yb/common/ql_protocol.pb.h"
+#include "yb/common/ql_protocol.messages.h"
 #include "yb/common/ql_type.h"
 
 #include "yb/gutil/casts.h"
@@ -46,32 +46,32 @@ namespace tools {
 void WriteValueToColumn(const client::YBSchema& schema,
                         size_t col_idx,
                         uint64_t value,
-                        QLValuePB* out) {
+                        QLValueMsg* out) {
   DataType type = schema.Column(col_idx).type()->main();
   char buf[kFastToBufferSize];
   switch (type) {
-    case INT8:
+    case DataType::INT8:
       out->set_int8_value(static_cast<int32_t>(value));
       return;
-    case INT16:
+    case DataType::INT16:
       out->set_int16_value(static_cast<int32_t>(value));
       return;
-    case INT32:
+    case DataType::INT32:
       out->set_int32_value(static_cast<int32_t>(value));
       return;
-    case INT64:
+    case DataType::INT64:
       out->set_int64_value(value);
       return;
-    case FLOAT:
+    case DataType::FLOAT:
       out->set_float_value(value / 123.0);
       return;
-    case DOUBLE:
+    case DataType::DOUBLE:
       out->set_double_value(value / 123.0);
       return;
-    case STRING:
-      out->set_string_value(FastHex64ToBuffer(value, buf));
+    case DataType::STRING:
+      out->dup_string_value(FastHex64ToBuffer(value, buf));
       return;
-    case BOOL:
+    case DataType::BOOL:
       out->set_bool_value(value);
       return;
     default:
@@ -81,7 +81,7 @@ void WriteValueToColumn(const client::YBSchema& schema,
 }
 
 void GenerateDataForRow(const client::YBSchema& schema, uint64_t record_id,
-                        Random* random, QLWriteRequestPB* req) {
+                        Random* random, QLWriteRequestMsg* req) {
   for (size_t col_idx = 0; col_idx < schema.num_columns(); col_idx++) {
     // We randomly generate the inserted data, except for the first column,
     // which is always based on a monotonic "record id".
@@ -91,7 +91,7 @@ void GenerateDataForRow(const client::YBSchema& schema, uint64_t record_id,
     } else {
       value = random->Next64();
     }
-    QLValuePB* out;
+    QLValueMsg* out;
     if (col_idx < schema.num_hash_key_columns()) {
       out = req->add_hashed_column_values()->mutable_value();
     } else {

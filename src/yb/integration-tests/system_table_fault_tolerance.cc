@@ -1,4 +1,4 @@
-// Copyright (c) YugaByte, Inc.
+// Copyright (c) YugabyteDB, Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License"); you may not use this file except
 // in compliance with the License.  You may obtain a copy of the License at
@@ -10,6 +10,7 @@
 // or implied.  See the License for the specific language governing permissions and limitations
 // under the License.
 //
+#include "yb/ash/wait_state.h"
 
 #include "yb/client/client.h"
 #include "yb/client/meta_data_cache.h"
@@ -98,6 +99,7 @@ TEST_F(SystemTableFaultTolerance, TestFaultTolerance) {
       /* parser_pool= */ nullptr, clock, ql::TransactionPoolProvider());
   Synchronizer s;
   ql::StatementParameters statement_parameters;
+  ADOPT_WAIT_STATE(ash::WaitStateInfo::CreateIfAshIsEnabled<ash::WaitStateInfo>());
   processor->RunAsync("SELECT * from system.peers", statement_parameters,
                       Bind(&SystemTableFaultTolerance::RunAsyncDone, Unretained(this),
                            Bind(&Synchronizer::StatusCB, Unretained(&s))));

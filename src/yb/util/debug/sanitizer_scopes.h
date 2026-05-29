@@ -15,9 +15,9 @@
 // specific language governing permissions and limitations
 // under the License.
 //
-// The following only applies to changes made to this file as part of YugaByte development.
+// The following only applies to changes made to this file as part of YugabyteDB development.
 //
-// Portions Copyright (c) YugaByte, Inc.
+// Portions Copyright (c) YugabyteDB, Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License"); you may not use this file except
 // in compliance with the License.  You may obtain a copy of the License at
@@ -52,6 +52,21 @@ class ScopedTSANIgnoreReadsAndWrites {
   }
  private:
   DISALLOW_COPY_AND_ASSIGN(ScopedTSANIgnoreReadsAndWrites);
+};
+
+// Scope guard which instructs TSAN to ignore all synchronization events
+// on the current thread as long as it is alive. These may be safely
+// nested.
+class ScopedTSANIgnoreSync {
+ public:
+  ScopedTSANIgnoreSync() {
+    ANNOTATE_IGNORE_SYNC_BEGIN();
+  }
+  ~ScopedTSANIgnoreSync() {
+    ANNOTATE_IGNORE_SYNC_END();
+  }
+ private:
+  DISALLOW_COPY_AND_ASSIGN(ScopedTSANIgnoreSync);
 };
 
 } // namespace debug

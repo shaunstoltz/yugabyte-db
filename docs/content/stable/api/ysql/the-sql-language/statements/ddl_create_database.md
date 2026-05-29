@@ -4,7 +4,7 @@ headerTitle: CREATE DATABASE
 linkTitle: CREATE DATABASE
 description: Use the CREATE DATABASE statement to create a database that functions as a grouping mechanism for database objects, such as tables.
 menu:
-  stable:
+  stable_api:
     identifier: ddl_create_database
     parent: statements
 type: docs
@@ -16,29 +16,10 @@ Use the `CREATE DATABASE` statement to create a database that functions as a gro
 
 ## Syntax
 
-<ul class="nav nav-tabs nav-tabs-yb">
-  <li >
-    <a href="#grammar" class="nav-link active" id="grammar-tab" data-toggle="tab" role="tab" aria-controls="grammar" aria-selected="true">
-      <img src="/icons/file-lines.svg" alt="Grammar Icon">
-      Grammar
-    </a>
-  </li>
-  <li>
-    <a href="#diagram" class="nav-link" id="diagram-tab" data-toggle="tab" role="tab" aria-controls="diagram" aria-selected="false">
-      <img src="/icons/diagram.svg" alt="Diagram Icon">
-      Diagram
-    </a>
-  </li>
-</ul>
-
-<div class="tab-content">
-  <div id="grammar" class="tab-pane fade show active" role="tabpanel" aria-labelledby="grammar-tab">
-{{% includeMarkdown "../../syntax_resources/the-sql-language/statements/create_database,create_database_options.grammar.md" %}}
-  </div>
-  <div id="diagram" class="tab-pane fade" role="tabpanel" aria-labelledby="diagram-tab">
-{{% includeMarkdown "../../syntax_resources/the-sql-language/statements/create_database,create_database_options.diagram.md" %}}
-  </div>
-</div>
+{{%ebnf%}}
+  create_database,
+  create_database_options
+{{%/ebnf%}}
 
 ## Semantics
 
@@ -83,23 +64,25 @@ Specify how many concurrent connections can be made to this database. Default of
 `true` — This database can be cloned by any user with `CREATEDB` privileges.
 Specify `false` to only superusers or the owner of the database can clone it.
 
-### COLOCATED
+### COLOCATION
 
-Colocated table support is currently in [Beta](/preview/faq/general/#what-is-the-definition-of-the-beta-feature-tag).
-
-Specify `true` if all tables for this database should be colocated on a single tablet. See [colocated tables architecture](https://github.com/yugabyte/yugabyte-db/blob/master/architecture/design/ysql-colocated-tables.md) for details on when colocated tables are useful.
+Specify `true` if tables (and their indexes) for this database should be colocated on a single tablet by default. See [Colocated tables](../../../../../additional-features/colocation/) for details on when colocated tables are beneficial.
 
 Default is `false` and every table in the database will have its own set of tablets.
+
+### AS OF
+
+Specify the [Unix timestamp](https://www.unixtimestamp.com/) (in microseconds) to create a clone of the original database at a specific point in time, within the history retention period specified when creating the snapshot schedule for the database. See [Instant database cloning](../../../../../manage/backup-restore/instant-db-cloning/).
 
 ## Examples
 
 ### Create a colocated database
 
 ```plpgsql
-yugabyte=# CREATE DATABASE company WITH COLOCATED = true;
+yugabyte=# CREATE DATABASE company WITH COLOCATION = true;
 ```
 
-In this example, all tables in the database `company` will be colocated on a single tablet.
+In this example, tables in the database `company` will be colocated on a single tablet by default.
 
 ## See also
 

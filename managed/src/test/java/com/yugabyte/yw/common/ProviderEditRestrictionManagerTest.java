@@ -1,4 +1,4 @@
-// Copyright (c) YugaByte, Inc.
+// Copyright (c) YugabyteDB, Inc.
 
 package com.yugabyte.yw.common;
 
@@ -13,6 +13,7 @@ import com.yugabyte.yw.commissioner.ITask;
 import com.yugabyte.yw.commissioner.tasks.CommissionerBaseTest;
 import com.yugabyte.yw.commissioner.tasks.upgrade.ThirdpartySoftwareUpgrade;
 import com.yugabyte.yw.common.config.DummyRuntimeConfigFactoryImpl;
+import com.yugabyte.yw.common.config.RuntimeConfGetter;
 import com.yugabyte.yw.forms.AbstractTaskParams;
 import com.yugabyte.yw.forms.ITaskParams;
 import com.yugabyte.yw.forms.ThirdpartySoftwareUpgradeParams;
@@ -41,7 +42,6 @@ public class ProviderEditRestrictionManagerTest extends CommissionerBaseTest {
   private static final int TIMEOUT_MILLIS = 500;
 
   private ProviderEditRestrictionManager providerEditRestrictionManager;
-  private Config mockConfig;
   private boolean isEnabled = true;
   private Multimap<UUID, UUID> useProviderIdsByTaskId = ArrayListMultimap.create();
   private Map<UUID, UUID> editProviderIdByTaskId = new HashMap<>();
@@ -63,7 +63,8 @@ public class ProviderEditRestrictionManagerTest extends CommissionerBaseTest {
     builder = super.configureApplication(builder);
     ProviderEditRestrictionManager manager =
         new ProviderEditRestrictionManager(
-            new DummyRuntimeConfigFactoryImpl(Mockito.mock(Config.class))) {
+            new RuntimeConfGetter(
+                new DummyRuntimeConfigFactoryImpl(Mockito.mock(Config.class)), null)) {
           @Override
           protected long getLockTimeoutMillis() {
             return TIMEOUT_MILLIS;
@@ -91,10 +92,8 @@ public class ProviderEditRestrictionManagerTest extends CommissionerBaseTest {
 
   @Before
   public void setUp() {
-    super.setUp();
     providerEditRestrictionManager =
         app.injector().instanceOf(ProviderEditRestrictionManager.class);
-    ;
   }
 
   @Test
@@ -251,9 +250,8 @@ public class ProviderEditRestrictionManagerTest extends CommissionerBaseTest {
   public void testListenerIsCalled() {
     ThirdpartySoftwareUpgradeParams params = new ThirdpartySoftwareUpgradeParams();
     Universe universe =
-        ModelFactory.createUniverse(
-            "nn", defaultCustomer.getCustomerId(), defaultProvider.getCloudCode());
-    params.universeUUID = universe.getUniverseUUID();
+        ModelFactory.createUniverse("nn", defaultCustomer.getId(), defaultProvider.getCloudCode());
+    params.setUniverseUUID(universe.getUniverseUUID());
     commissioner.submit(TaskType.ThirdpartySoftwareUpgrade, params);
     Mockito.verify(providerEditRestrictionManager)
         .onTaskCreated(
@@ -281,10 +279,10 @@ public class ProviderEditRestrictionManagerTest extends CommissionerBaseTest {
   }
 
   private TaskInfo createFakeTaskInfo(UUID taskUUID) {
-    TaskInfo taskInfo = new TaskInfo(TaskType.ResizeNode);
+    TaskInfo taskInfo = new TaskInfo(TaskType.ResizeNode, null);
     taskInfo.setTaskState(TaskInfo.State.Running);
-    taskInfo.setTaskUUID(taskUUID);
-    taskInfo.setTaskDetails(Json.newObject());
+    taskInfo.setUuid(taskUUID);
+    taskInfo.setTaskParams(Json.newObject());
     taskInfo.setOwner("Myself");
     taskInfo.save();
     return taskInfo;

@@ -15,9 +15,9 @@
 // specific language governing permissions and limitations
 // under the License.
 //
-// The following only applies to changes made to this file as part of YugaByte development.
+// The following only applies to changes made to this file as part of YugabyteDB development.
 //
-// Portions Copyright (c) YugaByte, Inc.
+// Portions Copyright (c) YugabyteDB, Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License"); you may not use this file except
 // in compliance with the License.  You may obtain a copy of the License at
@@ -60,8 +60,7 @@ DECLARE_uint64(consensus_max_batch_size_bytes);
 
 METRIC_DECLARE_entity(tablet);
 
-namespace yb {
-namespace consensus {
+namespace yb::consensus {
 
 static const char* kLeaderUuid = "peer-0";
 static const char* kPeerUuid = "peer-1";
@@ -76,7 +75,7 @@ class ConsensusQueueTest : public YBTest {
       : schema_(GetSimpleTestSchema()),
         metric_entity_(METRIC_ENTITY_tablet.Instantiate(&metric_registry_, "queue-test")),
         registry_(new log::LogAnchorRegistry) {
-    FLAGS_enable_data_block_fsync = false; // Keep unit tests fast.
+    ANNOTATE_UNPROTECTED_WRITE(FLAGS_enable_data_block_fsync) = false; // Keep unit tests fast.
   }
 
   void SetUp() override {
@@ -91,34 +90,40 @@ class ConsensusQueueTest : public YBTest {
                             fs_manager_->uuid(),
                             schema_,
                             0, // schema_version
-                            nullptr,
-                            nullptr,
+                            /*table_metric_entity=*/nullptr,
+                            /*tablet_metric_entity=*/nullptr,
+                            /*read_wal_mem_tracker=*/nullptr,
                             log_thread_pool_.get(),
                             log_thread_pool_.get(),
                             log_thread_pool_.get(),
-                            std::numeric_limits<int64_t>::max(), // cdc_min_replicated_index
                             &log_));
     clock_.reset(new server::HybridClock());
     ASSERT_OK(clock_->Init());
 
-    ASSERT_OK(ThreadPoolBuilder("raft").Build(&raft_pool_));
+    raft_notifications_pool_ = std::make_unique<rpc::ThreadPool>(rpc::ThreadPoolOptions {
+      .name = "raft_notifications",
+      .max_workers = rpc::ThreadPoolOptions::kUnlimitedWorkers
+    });
     CloseAndReopenQueue();
   }
 
+  virtual void SetupConsensus() { consensus_.reset(new TestRaftConsensusQueueIface()); }
+
   void CloseAndReopenQueue() {
-    // Blow away the memtrackers before creating the new queue.
+    // Blow away the memtrackers before creating the new queue. Otherwise we will get an error
+    // trying to create a duplicate log cache memtracker.
     queue_.reset();
-    auto token = raft_pool_->NewToken(ThreadPool::ExecutionMode::SERIAL);
+    auto notify_observers_strand = std::make_unique<rpc::Strand>(raft_notifications_pool_.get());
     queue_.reset(new PeerMessageQueue(metric_entity_,
                                       log_.get(),
-                                      nullptr /* server_tracker */,
-                                      nullptr /* parent_tracker */,
+                                      /*server_tracker=*/nullptr,
+                                      /*parent_tracker=*/nullptr,
                                       FakeRaftPeerPB(kLeaderUuid),
                                       kTestTablet,
                                       clock_,
-                                      nullptr /* consensus_context */,
-                                      std::move(token)));
-    consensus_.reset(new TestRaftConsensusQueueIface());
+                                      /*context=*/nullptr,
+                                      std::move(notify_observers_strand)));
+    SetupConsensus();
     queue_->RegisterObserver(consensus_.get());
   }
 
@@ -141,7 +146,7 @@ class ConsensusQueueTest : public YBTest {
                                const OpId& last_received,
                                const OpId& last_received_current_leader,
                                int64_t last_committed_idx) {
-    queue_->TrackPeer(kPeerUuid);
+    TrackPeer(*queue_, kPeerUuid);
     response->ref_responder_uuid(kPeerUuid);
 
     // Ask for a request. The queue assumes the peer is up-to-date so this should contain no
@@ -226,10 +231,10 @@ class ConsensusQueueTest : public YBTest {
   scoped_refptr<MetricEntity> metric_entity_;
   std::unique_ptr<ThreadPool> log_thread_pool_;
   scoped_refptr<log::Log> log_;
-  std::unique_ptr<ThreadPool> raft_pool_;
   std::unique_ptr<PeerMessageQueue> queue_;
   scoped_refptr<log::LogAnchorRegistry> registry_;
   scoped_refptr<server::Clock> clock_;
+  std::unique_ptr<rpc::ThreadPool> raft_notifications_pool_;
 };
 
 // Tests that the queue is able to track a peer when it starts tracking a peer
@@ -313,7 +318,7 @@ TEST_F(ConsensusQueueTest, TestGetPagedMessages) {
 
   // Save the current flag state.
   google::FlagSaver saver;
-  FLAGS_consensus_max_batch_size_bytes = page_size_estimate;
+  ANNOTATE_UNPROTECTED_WRITE(FLAGS_consensus_max_batch_size_bytes) = page_size_estimate;
 
   ThreadSafeArena arena;
   {
@@ -441,11 +446,11 @@ TEST_F(ConsensusQueueTest, TestQueueAdvancesCommittedIndex) {
   queue_->Init(OpId::Min());
   queue_->SetLeaderMode(
       OpId::Min(), OpId::Min().term, OpId::Min(), BuildRaftConfigPBForTests(5));
-  // Track 4 additional peers (in addition to the local peer)
-  queue_->TrackPeer("peer-1");
-  queue_->TrackPeer("peer-2");
-  queue_->TrackPeer("peer-3");
-  queue_->TrackPeer("peer-4");
+  // Track 4 additional peers (in addition to the local peer).
+  TrackPeer(*queue_, "peer-1");
+  TrackPeer(*queue_, "peer-2");
+  TrackPeer(*queue_, "peer-3");
+  TrackPeer(*queue_, "peer-4");
 
   // Append 10 messages to the queue with a majority of 2 for a total of 3 peers.
   // This should add messages 0.1 -> 0.7, 1.8 -> 1.10 to the queue.
@@ -454,7 +459,7 @@ TEST_F(ConsensusQueueTest, TestQueueAdvancesCommittedIndex) {
 
   // Since only the local log might have ACKed at this point,
   // the committed_index should be MinimumOpId().
-  queue_->raft_pool_observers_token_->Wait();
+  queue_->TEST_WaitForNotificationToFinish();
   ASSERT_EQ(queue_->TEST_GetCommittedIndex(), OpId::Min());
   ASSERT_EQ(queue_->TEST_GetLastAppliedOpId(), OpId::Min());
   ASSERT_EQ(queue_->GetAllAppliedOpId(), OpId::Min());
@@ -474,7 +479,7 @@ TEST_F(ConsensusQueueTest, TestQueueAdvancesCommittedIndex) {
   ASSERT_TRUE(queue_->ResponseFromPeer(response.responder_uuid().ToBuffer(), response));
 
   // Committed index should be the same
-  queue_->raft_pool_observers_token_->Wait();
+  queue_->TEST_WaitForNotificationToFinish();
   ASSERT_EQ(queue_->TEST_GetCommittedIndex(), OpId::Min());
   ASSERT_EQ(queue_->TEST_GetLastAppliedOpId(), OpId::Min());
   ASSERT_EQ(queue_->GetAllAppliedOpId(), OpId::Min());
@@ -484,10 +489,10 @@ TEST_F(ConsensusQueueTest, TestQueueAdvancesCommittedIndex) {
   ASSERT_TRUE(queue_->ResponseFromPeer(response.responder_uuid().ToBuffer(), response));
 
   // A majority has now replicated up to 0.5.
-  queue_->raft_pool_observers_token_->Wait();
+  queue_->TEST_WaitForNotificationToFinish();
   ASSERT_EQ(queue_->TEST_GetMajorityReplicatedOpId(), MakeOpIdForIndex(5));
 
-  string up_to_date_peer = queue_->GetUpToDatePeer();
+  string up_to_date_peer = queue_->FindBestNewLeader();
   ASSERT_TRUE((up_to_date_peer == "peer-2") || (up_to_date_peer == "peer-1"));
 
   // Ack all operations for peer-3
@@ -500,7 +505,7 @@ TEST_F(ConsensusQueueTest, TestQueueAdvancesCommittedIndex) {
   ASSERT_TRUE(queue_->ResponseFromPeer(response.responder_uuid().ToBuffer(), response));
 
   up_to_date_peer.clear();
-  up_to_date_peer = queue_->GetUpToDatePeer();
+  up_to_date_peer = queue_->FindBestNewLeader();
   ASSERT_EQ(up_to_date_peer, "peer-3");
 
   // Majority replicated watermark should be the same
@@ -511,17 +516,43 @@ TEST_F(ConsensusQueueTest, TestQueueAdvancesCommittedIndex) {
   ASSERT_TRUE(queue_->ResponseFromPeer(response.responder_uuid().ToBuffer(), response));
 
   up_to_date_peer.clear();
-  up_to_date_peer = queue_->GetUpToDatePeer();
+  up_to_date_peer = queue_->FindBestNewLeader();
   ASSERT_TRUE((up_to_date_peer == "peer-3") || (up_to_date_peer == "peer-4"));
 
   // Now that a majority of peers have replicated an operation in the queue's
   // term the committed index should advance.
-  queue_->raft_pool_observers_token_->Wait();
+  queue_->TEST_WaitForNotificationToFinish();
   const auto expected_op_id = MakeOpIdForIndex(10);
   ASSERT_EQ(queue_->TEST_GetMajorityReplicatedOpId(), expected_op_id);
   ASSERT_EQ(queue_->TEST_GetCommittedIndex(), expected_op_id);
   consensus_->WaitForMajorityReplicatedIndex(expected_op_id.index);
   ASSERT_EQ(queue_->TEST_GetLastAppliedOpId(), expected_op_id);
+}
+
+TEST_F(ConsensusQueueTest, FindBestNewLeaderExcludesNonvoters) {
+  std::vector<PeerMemberType> kNonVoterTypes = {
+      PeerMemberType::UNKNOWN_MEMBER_TYPE, PeerMemberType::PRE_VOTER, PeerMemberType::PRE_OBSERVER,
+      PeerMemberType::OBSERVER};
+  auto raft_config = BuildRaftConfigPBForTests(5);
+  for (int i = 1; i < 5; ++i) {
+    raft_config.mutable_peers(i)->set_member_type(kNonVoterTypes[i - 1]);
+  }
+  queue_->Init(OpId::Min());
+  queue_->SetLeaderMode(OpId::Min(), OpId::Min().term, OpId::Min(), raft_config);
+
+  // Get a response from each peer to set the member type and verify that it is set correctly.
+  ThreadSafeArena arena;
+  LWConsensusResponsePB response(&arena);
+  for (int i = 1; i < 5; ++i) {
+    queue_->TrackPeer(raft_config.peers(i));
+    response.ref_responder_uuid(raft_config.peers(i).permanent_uuid());
+    queue_->ResponseFromPeer(response.responder_uuid().ToBuffer(), response);
+    ASSERT_EQ(queue_->GetTrackedPeerForTests(
+        raft_config.peers(i).permanent_uuid()).member_type, kNonVoterTypes[i - 1]);
+  }
+
+  // We should not be able to choose any of the peers for election because they are all non-voters.
+  ASSERT_TRUE(queue_->FindBestNewLeader().empty());
 }
 
 // In this test we append a sequence of operations to a log
@@ -622,7 +653,7 @@ TEST_F(ConsensusQueueTest, TestQueueHandlesOperationOverwriting) {
   LWConsensusResponsePB response(&arena);
   response.ref_responder_uuid(kPeerUuid);
 
-  queue_->TrackPeer(kPeerUuid);
+  TrackPeer(*queue_, kPeerUuid);
 
   // Ask for a request. The queue assumes the peer is up-to-date so
   // this should contain no operations.
@@ -748,7 +779,7 @@ TEST_F(ConsensusQueueTest, TestQueueMovesWatermarksBackward) {
 // as successful and the peer's last received would be taken into account when
 // calculating watermarks, which was incorrect.
 TEST_F(ConsensusQueueTest, TestOnlyAdvancesWatermarkWhenPeerHasAPrefixOfOurLog) {
-  FLAGS_consensus_max_batch_size_bytes = 1024 * 10;
+  ANNOTATE_UNPROTECTED_WRITE(FLAGS_consensus_max_batch_size_bytes) = 1024 * 10;
 
   queue_->Init(OpId(72, 30));
   queue_->SetLeaderMode(OpId(72, 31), 76, OpId(72, 31), BuildRaftConfigPBForTests(3));
@@ -866,7 +897,7 @@ TEST_F(ConsensusQueueTest, TestTriggerRemoteBootstrapIfTabletNotFound) {
   LWConsensusRequestPB request(&arena);
   LWConsensusResponsePB response(&arena);
   response.ref_responder_uuid(kPeerUuid);
-  queue_->TrackPeer(kPeerUuid);
+  TrackPeer(*queue_, kPeerUuid);
 
   // Create request for new peer.
   LWReplicateMsgsHolder refs;
@@ -897,14 +928,14 @@ TEST_F(ConsensusQueueTest, TestTriggerRemoteBootstrapIfTabletNotFound) {
             rb_req.bootstrap_source_private_addr()[0].ShortDebugString());
 }
 
-// Tests that ReadReplicatedMessagesForCDC() only reads messages until the last known
+// Tests that TestReadReplicatedMessagesForCDC() only reads messages until the last known
 // committed index.
 TEST_F(ConsensusQueueTest, TestReadReplicatedMessagesForCDC) {
   auto start_op_id = MakeOpIdForIndex(3); // Starting after the normal first index.
   queue_->Init(start_op_id);
   queue_->SetLeaderMode(
       start_op_id, start_op_id.term, start_op_id, BuildRaftConfigPBForTests(2));
-  queue_->TrackPeer(kPeerUuid);
+  TrackPeer(*queue_, kPeerUuid);
 
   AppendReplicateMessagesToQueue(queue_.get(), clock_, start_op_id.index, kNumMessages);
 
@@ -913,7 +944,7 @@ TEST_F(ConsensusQueueTest, TestReadReplicatedMessagesForCDC) {
 
   // Since only the local log might have ACKed at this point,
   // the committed_index should be MinimumOpId().
-  queue_->raft_pool_observers_token_->Wait();
+  queue_->TEST_WaitForNotificationToFinish();
   ASSERT_EQ(queue_->TEST_GetCommittedIndex(), start_op_id);
   ASSERT_EQ(queue_->TEST_GetLastAppliedOpId(), start_op_id);
 
@@ -925,19 +956,21 @@ TEST_F(ConsensusQueueTest, TestReadReplicatedMessagesForCDC) {
   // Ack last_committed_index messages.
   SetLastReceivedAndLastCommitted(&response, MakeOpIdForIndex(last_committed_index));
   ASSERT_TRUE(queue_->ResponseFromPeer(response.responder_uuid().ToBuffer(), response));
-  queue_->raft_pool_observers_token_->Wait();
+  queue_->TEST_WaitForNotificationToFinish();
   const auto expected_op_id = MakeOpIdForIndex(last_committed_index);
   ASSERT_EQ(queue_->TEST_GetCommittedIndex(), expected_op_id);
   consensus_->WaitForMajorityReplicatedIndex(expected_op_id.index);
   ASSERT_EQ(queue_->TEST_GetLastAppliedOpId(), expected_op_id);
 
   // Read from the start_op_id
-  auto read_result = ASSERT_RESULT(queue_->ReadReplicatedMessagesForCDC(MakeOpIdForIndex(3)));
+  auto read_result = ASSERT_RESULT(queue_->ReadReplicatedMessagesForCDC(start_op_id));
   ASSERT_EQ(last_committed_index - start_op_id.index, read_result.messages.size());
+  ASSERT_EQ(start_op_id, read_result.preceding_op);
 
   // Start reading from 0.0 and ensure that we get the first known OpID.
   read_result = ASSERT_RESULT(queue_->ReadReplicatedMessagesForCDC(MakeOpIdForIndex(0)));
   ASSERT_EQ(last_committed_index - start_op_id.index, read_result.messages.size());
+  ASSERT_EQ(start_op_id, read_result.preceding_op);
 
   // Read from some index > 0
   int start = 10;
@@ -945,5 +978,86 @@ TEST_F(ConsensusQueueTest, TestReadReplicatedMessagesForCDC) {
   ASSERT_EQ(last_committed_index - start, read_result.messages.size());
 }
 
-}  // namespace consensus
-}  // namespace yb
+class DelayedCommitObserver : public TestRaftConsensusQueueIface {
+ public:
+  explicit DelayedCommitObserver(OpId max_commit_op_id) : max_commit_op_id_(max_commit_op_id) {}
+
+  void UpdateMajorityReplicated(
+      const MajorityReplicatedData& data, OpId* committed_index,
+      OpId* last_applied_op_id) override {
+    TestRaftConsensusQueueIface::UpdateMajorityReplicated(
+        data, committed_index, last_applied_op_id);
+    if (committed_index->index > max_commit_op_id_.index) {
+      *committed_index = max_commit_op_id_;
+      *last_applied_op_id = max_commit_op_id_;
+    }
+  }
+
+ private:
+  OpId max_commit_op_id_;
+};
+
+class ConsensusQueueDelayedCommitTest : public ConsensusQueueTest {
+ public:
+  const OpId kMaxCommitOpId = MakeOpIdForIndex(kNumMessages - 20);
+
+  ConsensusQueueDelayedCommitTest() = default;
+
+  void SetupConsensus() override { consensus_.reset(new DelayedCommitObserver(kMaxCommitOpId)); }
+};
+
+TEST_F(ConsensusQueueDelayedCommitTest, TestReadReplicatedMessagesForXCluster) {
+  const auto start_op_id = MakeOpIdForIndex(3);  // Starting after the normal first index.
+  queue_->Init(start_op_id);
+  queue_->SetLeaderMode(start_op_id, start_op_id.term, start_op_id, BuildRaftConfigPBForTests(2));
+  TrackPeer(*queue_, kPeerUuid);
+
+  AppendReplicateMessagesToQueue(queue_.get(), clock_, start_op_id.index, kNumMessages);
+
+  // Wait for the local peer to append all messages.
+  WaitForLocalPeerToAckIndex(kNumMessages);
+
+  // Since only the local log might have ACKed at this point,
+  // the committed_index should be MinimumOpId().
+  queue_->TEST_WaitForNotificationToFinish();
+  ASSERT_EQ(queue_->TEST_GetCommittedIndex(), start_op_id);
+  ASSERT_EQ(queue_->TEST_GetLastAppliedOpId(), start_op_id);
+
+  ThreadSafeArena arena;
+  LWConsensusResponsePB response(&arena);
+  response.ref_responder_uuid(kPeerUuid);
+
+  const auto received_op_id = MakeOpIdForIndex(kNumMessages - 10);
+
+  // Ack last_committed_index messages.
+  SetLastReceivedAndLastCommitted(&response, received_op_id, kMaxCommitOpId.index);
+  ASSERT_TRUE(queue_->ResponseFromPeer(response.responder_uuid().ToBuffer(), response));
+  queue_->TEST_WaitForNotificationToFinish();
+  ASSERT_EQ(queue_->TEST_GetCommittedIndex(), kMaxCommitOpId);
+  consensus_->WaitForMajorityReplicatedIndex(received_op_id.index);
+  ASSERT_EQ(queue_->TEST_GetMajorityReplicatedOpId(), received_op_id);
+  ASSERT_EQ(queue_->TEST_GetLastAppliedOpId(), kMaxCommitOpId);
+
+  auto read_wal_for_xcluster = [this](const yb::OpId& last_op_id) {
+    return queue_->ReadReplicatedMessagesForXCluster(
+        last_op_id, /*deadline=*/CoarseTimePoint::max(), /*fetch_single_entry=*/false);
+  };
+
+  // Read from the start_op_id
+  auto read_result = ASSERT_RESULT(read_wal_for_xcluster(MakeOpIdForIndex(3)));
+  ASSERT_EQ(kMaxCommitOpId.index - start_op_id.index, read_result.result.messages.size());
+  ASSERT_EQ(received_op_id.index, read_result.majority_replicated_index);
+
+  // Start reading from 0.0 and ensure that we get the first known OpID.
+  read_result = ASSERT_RESULT(read_wal_for_xcluster(MakeOpIdForIndex(0)));
+  ASSERT_EQ(kMaxCommitOpId.index - start_op_id.index, read_result.result.messages.size());
+  ASSERT_EQ(received_op_id.index, read_result.majority_replicated_index);
+
+  // Read from some index > 0
+  int start = 10;
+  read_result = ASSERT_RESULT(read_wal_for_xcluster(MakeOpIdForIndex(start)));
+  ASSERT_EQ(kMaxCommitOpId.index - start, read_result.result.messages.size());
+  ASSERT_EQ(received_op_id.index, read_result.majority_replicated_index);
+}
+
+} // namespace yb::consensus

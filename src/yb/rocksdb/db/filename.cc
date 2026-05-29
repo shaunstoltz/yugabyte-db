@@ -3,9 +3,9 @@
 //  LICENSE file in the root directory of this source tree. An additional grant
 //  of patent rights can be found in the PATENTS file in the same directory.
 //
-// The following only applies to changes made to this file as part of YugaByte development.
+// The following only applies to changes made to this file as part of YugabyteDB development.
 //
-// Portions Copyright (c) YugaByte, Inc.
+// Portions Copyright (c) YugabyteDB, Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License"); you may not use this file except
 // in compliance with the License.  You may obtain a copy of the License at
@@ -33,8 +33,8 @@
 #include "yb/rocksdb/env.h"
 #include "yb/rocksdb/util/file_reader_writer.h"
 #include "yb/rocksdb/util/logging.h"
-#include "yb/rocksdb/util/sync_point.h"
 
+#include "yb/util/sync_point.h"
 #include "yb/util/test_kill.h"
 
 namespace rocksdb {
@@ -98,6 +98,10 @@ std::string ArchivedLogFileName(const std::string& name, uint64_t number) {
 
 std::string MakeTableFileName(const std::string& path, uint64_t number) {
   return MakeFileName(path, number, kRocksDbTFileExt);
+}
+
+std::string MakeTableDataFilePath(const std::string& path, uint64_t number) {
+  return MakeFileName(path, number, kRocksDbTSBlockFileExt);
 }
 
 std::string Rocks2LevelTableFileName(const std::string& fullname) {

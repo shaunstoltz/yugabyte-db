@@ -15,9 +15,9 @@
 // specific language governing permissions and limitations
 // under the License.
 //
-// The following only applies to changes made to this file as part of YugaByte development.
+// The following only applies to changes made to this file as part of YugabyteDB development.
 //
-// Portions Copyright (c) YugaByte, Inc.
+// Portions Copyright (c) YugabyteDB, Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License"); you may not use this file except
 // in compliance with the License.  You may obtain a copy of the License at
@@ -34,7 +34,7 @@
 
 #include <string>
 
-#include "yb/common/ql_protocol.pb.h"
+#include "yb/common/ql_protocol.messages.h"
 #include "yb/common/schema.h"
 
 #include "yb/docdb/docdb_fwd.h"
@@ -45,19 +45,20 @@
 namespace yb {
 
 using docdb::KeyValuePairPB;
-using docdb::SubDocKey;
-using docdb::DocKey;
-using docdb::PrimitiveValue;
+using dockv::SubDocKey;
+using dockv::DocKey;
+using dockv::PrimitiveValue;
 
 inline Schema GetSimpleTestSchema() {
-  return Schema({ ColumnSchema("key", INT32, false, true),
-                  ColumnSchema("int_val", INT32),
-                  ColumnSchema("string_val", STRING, true) },
-                1);
+  return Schema({
+      ColumnSchema("key", DataType::INT32, ColumnKind::HASH),
+      ColumnSchema("int_val", DataType::INT32),
+      ColumnSchema("string_val", DataType::STRING, ColumnKind::VALUE, Nullable::kTrue)
+  });
 }
 
 template <class WriteRequestPB, class Type>
-QLWriteRequestPB* TestRow(int32_t key, Type type, WriteRequestPB* req) {
+auto TestRow(int32_t key, Type type, WriteRequestPB* req) {
   auto wb = req->add_ql_write_batch();
   wb->set_schema_version(0);
   wb->set_type(type);
@@ -70,17 +71,17 @@ QLWriteRequestPB* TestRow(int32_t key, Type type, WriteRequestPB* req) {
 }
 
 template <class WriteRequestPB>
-QLWriteRequestPB* AddTestRowDelete(int32_t key, WriteRequestPB* req) {
+auto AddTestRowDelete(int32_t key, WriteRequestPB* req) {
   return TestRow(key, QLWriteRequestPB::QL_STMT_DELETE, req);
 }
 
 template <class WriteRequestPB>
-QLWriteRequestPB* AddTestRowInsert(int32_t key, WriteRequestPB* req) {
+auto AddTestRowInsert(int32_t key, WriteRequestPB* req) {
   return TestRow(key, QLWriteRequestPB::QL_STMT_INSERT, req);
 }
 
 template <class Type, class WriteRequestPB>
-QLWriteRequestPB* AddTestRow(int32_t key,
+auto AddTestRow(int32_t key,
                              int32_t int_val,
                              Type type,
                              WriteRequestPB* req) {
@@ -100,7 +101,12 @@ void AddTestRow(int32_t key,
   auto wb = AddTestRow(key, int_val, type, req);
   auto column_value = wb->add_column_values();
   column_value->set_column_id(kFirstColumnId + 2);
-  column_value->mutable_expr()->mutable_value()->set_string_value(string_val);
+  auto value = column_value->mutable_expr()->mutable_value();
+  if constexpr (rpc::IsGoogleProtobuf<WriteRequestPB>) {
+    value->set_string_value(string_val);
+  } else {
+    value->dup_string_value(string_val);
+  }
 }
 
 template <class WriteRequestPB>

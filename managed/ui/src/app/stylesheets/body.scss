@@ -1,4 +1,6 @@
-/* Copyright (c) YugaByte, Inc. */
+@use "../../_style/colors";
+
+/* Copyright (c) YugabyteDB, Inc. */
 
 body {
   color: #333;
@@ -7,6 +9,8 @@ body {
   font-size: 13px;
   font-weight: 400;
   line-height: 1.471;
+  -webkit-font-smoothing: antialiased;
+  text-rendering: optimizeLegibility;
 }
 html {
   &:before {
@@ -14,7 +18,7 @@ html {
     width: 90px;
     height: 10000%;
     margin-top: -100%;
-    background-color: $YB_VIOLET;
+    // background-color: colors.$YB_VIOLET;
     content: '';
     z-index: -1;
   }

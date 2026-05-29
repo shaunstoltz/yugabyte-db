@@ -3,9 +3,9 @@
 //  LICENSE file in the root directory of this source tree. An additional grant
 //  of patent rights can be found in the PATENTS file in the same directory.
 //
-// The following only applies to changes made to this file as part of YugaByte development.
+// The following only applies to changes made to this file as part of YugabyteDB development.
 //
-// Portions Copyright (c) YugaByte, Inc.
+// Portions Copyright (c) YugabyteDB, Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License"); you may not use this file except
 // in compliance with the License.  You may obtain a copy of the License at
@@ -26,11 +26,11 @@
 
 #include "yb/rocksdb/db.h"
 #include "yb/rocksdb/env.h"
-#include "yb/rocksdb/util/sync_point.h"
 #include "yb/rocksdb/util/testharness.h"
 #include "yb/rocksdb/util/testutil.h"
 
 #include "yb/util/string_util.h"
+#include "yb/util/sync_point.h"
 #include "yb/util/test_util.h"
 
 namespace rocksdb {
@@ -113,11 +113,11 @@ TEST_F(CompactFilesTest, CapturingPendingFiles) {
   auto l0_files = collector->GetFlushedFiles();
   EXPECT_EQ(5, l0_files.size());
 
-  rocksdb::SyncPoint::GetInstance()->LoadDependency({
+  yb::SyncPoint::GetInstance()->LoadDependency({
       {"CompactFilesImpl:2", "CompactFilesTest.CapturingPendingFiles:0"},
       {"CompactFilesTest.CapturingPendingFiles:1", "CompactFilesImpl:3"},
   });
-  rocksdb::SyncPoint::GetInstance()->EnableProcessing();
+  yb::SyncPoint::GetInstance()->EnableProcessing();
 
   // Start compacting files.
   std::thread compaction_thread(
@@ -131,7 +131,7 @@ TEST_F(CompactFilesTest, CapturingPendingFiles) {
 
   compaction_thread.join();
 
-  rocksdb::SyncPoint::GetInstance()->DisableProcessing();
+  yb::SyncPoint::GetInstance()->DisableProcessing();
 
   delete db;
 

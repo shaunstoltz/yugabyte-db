@@ -15,9 +15,9 @@
 // specific language governing permissions and limitations
 // under the License.
 //
-// The following only applies to changes made to this file as part of YugaByte development.
+// The following only applies to changes made to this file as part of YugabyteDB development.
 //
-// Portions Copyright (c) YugaByte, Inc.
+// Portions Copyright (c) YugabyteDB, Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License"); you may not use this file except
 // in compliance with the License.  You may obtain a copy of the License at
@@ -71,19 +71,19 @@ struct LockHoldersCount {
   }
 
   void AdjustReaders(int delta) {
-    std::lock_guard<simple_spinlock> l(lock);
+    std::lock_guard l(lock);
     num_readers += delta;
     CheckInvariants();
   }
 
   void AdjustWriters(int delta) {
-    std::lock_guard<simple_spinlock> l(lock);
+    std::lock_guard l(lock);
     num_writers += delta;
     CheckInvariants();
   }
 
   void AdjustCommitters(int delta) {
-    std::lock_guard<simple_spinlock> l(lock);
+    std::lock_guard l(lock);
     num_committers += delta;
     CheckInvariants();
   }
@@ -109,7 +109,7 @@ void ReaderThread(SharedState* state) {
   }
 }
 
-void WriterThread(SharedState* state) {
+void WriterThread(SharedState* state) NO_THREAD_SAFETY_ANALYSIS {
   string local_str;
   while (!NoBarrier_Load(&state->stop)) {
     state->rwc_lock.WriteLock();

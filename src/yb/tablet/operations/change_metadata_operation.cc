@@ -15,9 +15,9 @@
 // specific language governing permissions and limitations
 // under the License.
 //
-// The following only applies to changes made to this file as part of YugaByte development.
+// The following only applies to changes made to this file as part of YugabyteDB development.
 //
-// Portions Copyright (c) YugaByte, Inc.
+// Portions Copyright (c) YugabyteDB, Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License"); you may not use this file except
 // in compliance with the License.  You may obtain a copy of the License at
@@ -32,10 +32,8 @@
 
 #include "yb/tablet/operations/change_metadata_operation.h"
 
-#include <glog/logging.h>
-
+#include "yb/common/schema_pbutil.h"
 #include "yb/common/schema.h"
-#include "yb/common/wire_protocol.h"
 
 #include "yb/consensus/consensus.messages.h"
 #include "yb/consensus/consensus_round.h"
@@ -48,6 +46,8 @@
 #include "yb/tserver/tserver_error.h"
 
 #include "yb/util/async_util.h"
+#include "yb/util/debug-util.h"
+#include "yb/util/flags/flag_tags.h"
 #include "yb/util/logging.h"
 #include "yb/util/status_format.h"
 #include "yb/util/trace.h"
@@ -56,7 +56,11 @@ DEFINE_test_flag(bool, ignore_apply_change_metadata_on_followers, false,
                  "Used in tests to ignore applying change metadata operation"
                  " on followers.");
 
-using std::string;
+DEFINE_test_flag(bool, fail_cdc_setting_retention_barriers_on_apply, false,
+                 "Used in tests to fail setting retention barriers on apply of change metadata "
+                 "operation.");
+
+DECLARE_bool(TEST_invalidate_last_change_metadata_op);
 
 namespace yb {
 namespace tablet {
@@ -91,7 +95,7 @@ void ChangeMetadataOperation::SetIndexes(const RepeatedPtrField<IndexInfoPB>& in
   index_map_.FromPB(indexes);
 }
 
-string ChangeMetadataOperation::ToString() const {
+std::string ChangeMetadataOperation::ToString() const {
   return Format("ChangeMetadataOperation { hybrid_time: $0 schema: $1 request: $2 }",
                 hybrid_time_even_if_unset(), schema_, request());
 }
@@ -120,8 +124,9 @@ Status ChangeMetadataOperation::Prepare(IsLeaderSide is_leader_side) {
   return Status::OK();
 }
 
-Status ChangeMetadataOperation::DoReplicated(int64_t leader_term, Status* complete_status) {
-  if (PREDICT_FALSE(FLAGS_TEST_ignore_apply_change_metadata_on_followers)) {
+Status ChangeMetadataOperation::Apply(int64_t leader_term, Status* complete_status) {
+  if (PREDICT_FALSE(FLAGS_TEST_ignore_apply_change_metadata_on_followers) &&
+      leader_term == OpId::kUnknownTerm) {
     LOG_WITH_PREFIX(INFO) << "Ignoring apply of change metadata ops on followers";
     return Status::OK();
   }
@@ -132,6 +137,11 @@ Status ChangeMetadataOperation::DoReplicated(int64_t leader_term, Status* comple
   log::Log* log = mutable_log();
   size_t num_operations = 0;
 
+  // CDCSDK Create Stream Context
+  if (request()->has_retention_requester_id()) {
+    RETURN_NOT_OK(ProcessCDCSDKCreateStreamContext(complete_status));
+  }
+
   if (request()->has_wal_retention_secs()) {
     // We don't consider wal retention changes as another operation because this value is always
     // sent together with the schema, as long as it has been changed in the master's sys-catalog.
@@ -139,7 +149,7 @@ Status ChangeMetadataOperation::DoReplicated(int64_t leader_term, Status* comple
     if (s.ok()) {
       log->set_wal_retention_secs(request()->wal_retention_secs());
     } else {
-      LOG(WARNING) << "T " << tablet->tablet_id() << ": Unable to alter wal retention secs";
+      LOG(WARNING) << "T " << tablet->tablet_id() << " Unable to alter wal retention secs: " << s;
     }
   }
 
@@ -155,9 +165,30 @@ Status ChangeMetadataOperation::DoReplicated(int64_t leader_term, Status* comple
 
   MetadataChange metadata_change = MetadataChange::NONE;
   bool request_has_newer_schema = false;
+  SchemaVersion current_schema_version = std::numeric_limits<SchemaVersion>::max();
   if (request()->has_schema()) {
+    const auto& schema = request()->schema();
     metadata_change = MetadataChange::SCHEMA;
-    request_has_newer_schema = tablet->metadata()->schema_version() < schema_version();
+    if (schema.has_colocated_table_id()) {
+      switch (schema.colocated_table_id().value_case()) {
+        case ColocatedTableIdentifierPB::kCotableId: {
+          auto uuid = VERIFY_RESULT(Uuid::FromSlice(schema.colocated_table_id().cotable_id()));
+          current_schema_version = VERIFY_RESULT(tablet->metadata()->schema_version(uuid));
+          break;
+        }
+        case ColocatedTableIdentifierPB::kColocationId:
+          current_schema_version = VERIFY_RESULT(tablet->metadata()->schema_version(
+              schema.colocated_table_id().colocation_id()));
+          break;
+        case ColocatedTableIdentifierPB::VALUE_NOT_SET:
+          // Not set means we should use the parent table schema version.
+          current_schema_version = tablet->metadata()->primary_table_schema_version();
+          break;
+      }
+    } else {
+      current_schema_version = tablet->metadata()->primary_table_schema_version();
+    }
+    request_has_newer_schema = current_schema_version < schema_version();
     if (request_has_newer_schema) {
       ++num_operations;
     }
@@ -191,6 +222,9 @@ Status ChangeMetadataOperation::DoReplicated(int64_t leader_term, Status* comple
     }
   }
 
+  // Get the op id corresponding to this raft op.
+  const OpId id = op_id();
+
   switch (metadata_change) {
     case MetadataChange::NONE:
       return STATUS_FORMAT(
@@ -199,7 +233,7 @@ Status ChangeMetadataOperation::DoReplicated(int64_t leader_term, Status* comple
     case MetadataChange::SCHEMA:
       if (!request_has_newer_schema) {
         LOG_WITH_PREFIX(INFO)
-            << "Already running schema version " << tablet->metadata()->schema_version()
+            << "Already running schema version " << current_schema_version
             << " got alter request for version " << schema_version();
         break;
       }
@@ -211,24 +245,23 @@ Status ChangeMetadataOperation::DoReplicated(int64_t leader_term, Status* comple
     case MetadataChange::ADD_TABLE:
       DCHECK_EQ(1, num_operations) << "Invalid number of change metadata operations: "
                                    << num_operations;
-      RETURN_NOT_OK(tablet->AddTable(request()->add_table().ToGoogleProtobuf()));
+      RETURN_NOT_OK(tablet->AddTable(request()->add_table().ToGoogleProtobuf(), id, hybrid_time()));
       break;
     case MetadataChange::REMOVE_TABLE:
       DCHECK_EQ(1, num_operations) << "Invalid number of change metadata operations: "
                                    << num_operations;
-      RETURN_NOT_OK(tablet->RemoveTable(request()->remove_table_id().ToBuffer()));
+      RETURN_NOT_OK(tablet->RemoveTable(request()->remove_table_id().ToBuffer(), id));
       break;
     case MetadataChange::BACKFILL_DONE:
       DCHECK_EQ(1, num_operations) << "Invalid number of change metadata operations: "
                                    << num_operations;
       RETURN_NOT_OK(tablet->MarkBackfillDone(
-          request()->backfill_done_table_id().ToBuffer()));
+          id, request()->backfill_done_table_id().ToBuffer()));
       break;
     case MetadataChange::ADD_MULTIPLE_TABLES:
       DCHECK_EQ(1, num_operations) << "Invalid number of change metadata operations: "
                                    << num_operations;
-      RETURN_NOT_OK(tablet->AddMultipleTables(
-          ToRepeatedPtrField(request()->add_multiple_tables())));
+      RETURN_NOT_OK(tablet->AddMultipleTables(request()->add_multiple_tables(), id, hybrid_time()));
       break;
   }
 
@@ -238,9 +271,55 @@ Status ChangeMetadataOperation::DoReplicated(int64_t leader_term, Status* comple
   return Status::OK();
 }
 
+Status ChangeMetadataOperation::DoReplicated(int64_t leader_term, Status* complete_status) {
+  return Apply(leader_term, complete_status);
+}
+
 Status ChangeMetadataOperation::DoAborted(const Status& status) {
   TRACE("AlterSchemaCommitCallback: transaction aborted");
   return status;
+}
+
+// CDCSDK Create Stream Context
+Status ChangeMetadataOperation::ProcessCDCSDKCreateStreamContext(Status* complete_status) {
+  if (PREDICT_FALSE(FLAGS_TEST_fail_cdc_setting_retention_barriers_on_apply)) {
+    *complete_status =
+        STATUS_FORMAT(InternalError, "Setting retention barriers on tablet for CDC failed.");
+    return Status::OK();
+  }
+
+  TabletPtr tablet = VERIFY_RESULT(tablet_safe());
+  log::Log* log = mutable_log();
+
+  // Set WAL/Intents/History Retention Barriers
+  LOG(INFO) << tablet->LogPrefix()
+            << "Setting all retention barriers for stream "
+            << request()->retention_requester_id() << "."
+            << " Setting WAL cdc_min_replicated_index at most to " << op_id().index;
+
+  if (log->cdc_min_replicated_index() > op_id().index) {
+    log->set_cdc_min_replicated_index(op_id().index);
+  }
+
+  // Intent Retention and History Retention
+  LOG(INFO) << tablet->LogPrefix()
+            << "Blocking Intents GC at least from " << op_id();
+
+  auto require_history_cutoff =
+      request()->has_cdc_sdk_require_history_cutoff() &&
+      request()->cdc_sdk_require_history_cutoff() &&
+      has_hybrid_time();
+
+  auto history_cutoff_time = HybridTime::kMin;
+  if (require_history_cutoff) {
+    history_cutoff_time = hybrid_time();
+    // History retention barrier also needs to be set
+    LOG(INFO) << tablet->LogPrefix()
+              << "History retention barrier to be set at most at " << history_cutoff_time;
+  }
+
+  return tablet->SetAllInitialCDCSDKRetentionBarriers(
+      log, op_id(), history_cutoff_time, require_history_cutoff);
 }
 
 Status SyncReplicateChangeMetadataOperation(
@@ -248,7 +327,7 @@ Status SyncReplicateChangeMetadataOperation(
     TabletPeer* tablet_peer,
     int64_t term) {
   auto operation = std::make_unique<ChangeMetadataOperation>(
-      VERIFY_RESULT(tablet_peer->shared_tablet_safe()), tablet_peer->log());
+      VERIFY_RESULT(tablet_peer->shared_tablet()), tablet_peer->log());
   operation->AllocateRequest()->CopyFrom(*req);
 
   Synchronizer synchronizer;

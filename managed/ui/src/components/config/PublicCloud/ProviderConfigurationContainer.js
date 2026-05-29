@@ -1,4 +1,4 @@
-// Copyright (c) YugaByte, Inc.
+// Copyright (c) YugabyteDB, Inc.
 
 import { connect } from 'react-redux';
 import ProviderConfiguration from './ProviderConfiguration';
@@ -53,16 +53,14 @@ const mapDispatchToProps = (dispatch) => {
           dispatch(fetchCloudMetadata());
           const providerUUID = response.payload.data.uuid;
           dispatch(bootstrapProvider(providerUUID, regionFormVals)).then((boostrapResponse) => {
-
             if (boostrapResponse.payload.status === 200) {
               toast.success('AWS Provider creation is in progress!');
-            }
-            else {
+            } else {
               const errorMessage =
                 response?.payload?.response?.data?.error || response?.payload?.message;
               toast.error(errorMessage);
             }
-            
+
             dispatch(bootstrapProviderResponse(boostrapResponse.payload));
           });
         } else {

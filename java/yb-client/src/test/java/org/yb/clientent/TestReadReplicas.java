@@ -1,4 +1,4 @@
-// Copyright (c) YugaByte, Inc.
+// Copyright (c) YugabyteDB, Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License"); you may not use this file except
 // in compliance with the License.  You may obtain a copy of the License at
@@ -24,13 +24,17 @@ import org.junit.runner.RunWith;
 
 import org.yb.Schema;
 import org.yb.ColumnSchema;
-import org.yb.master.CatalogEntityInfo;
+import org.yb.CommonNet;
+import org.yb.YBTestRunner;
 import org.yb.minicluster.MiniYBCluster;
-import org.yb.util.YBTestRunnerNonTsanAsan;
+import org.yb.util.SkipOnASAN;
+import org.yb.util.SkipOnTSAN;
 
 import static org.yb.AssertionWrappers.assertTrue;
 
-@RunWith(value=YBTestRunnerNonTsanAsan.class)
+@SkipOnTSAN
+@SkipOnASAN
+@RunWith(value=YBTestRunner.class)
 public class TestReadReplicas extends TestYBClient {
   private static final String PLACEMENT_CLOUD = "testCloud";
   private static final String PLACEMENT_REGION = "testRegion";
@@ -90,26 +94,28 @@ public class TestReadReplicas extends TestYBClient {
             .setPlacementZone(PLACEMENT_ZONE)
             .build();
 
-    CatalogEntityInfo.PlacementBlockPB placementBlock0 = CatalogEntityInfo.PlacementBlockPB.
+    CommonNet.PlacementBlockPB placementBlock0 = CommonNet.PlacementBlockPB.
         newBuilder().setCloudInfo(cloudInfo0).setMinNumReplicas(3).build();
 
-    List<CatalogEntityInfo.PlacementBlockPB> placementBlocksLive =
-        new ArrayList<CatalogEntityInfo.PlacementBlockPB>();
+    List<CommonNet.PlacementBlockPB> placementBlocksLive =
+        new ArrayList<CommonNet.PlacementBlockPB>();
     placementBlocksLive.add(placementBlock0);
 
-    List<CatalogEntityInfo.PlacementBlockPB> placementBlocksReadOnly =
-            new ArrayList<CatalogEntityInfo.PlacementBlockPB>();
+    List<CommonNet.PlacementBlockPB> placementBlocksReadOnly =
+            new ArrayList<CommonNet.PlacementBlockPB>();
     placementBlocksReadOnly.add(placementBlock0);
 
-    CatalogEntityInfo.PlacementInfoPB livePlacementInfo = CatalogEntityInfo.PlacementInfoPB.
+    CommonNet.PlacementInfoPB livePlacementInfo = CommonNet.PlacementInfoPB.
         newBuilder().addAllPlacementBlocks(placementBlocksLive).
+        setNumReplicas(3).
         setPlacementUuid(ByteString.copyFromUtf8(liveTsPlacement)).build();
 
-    CatalogEntityInfo.PlacementInfoPB readOnlyPlacementInfo = CatalogEntityInfo.PlacementInfoPB.
+    CommonNet.PlacementInfoPB readOnlyPlacementInfo = CommonNet.PlacementInfoPB.
         newBuilder().addAllPlacementBlocks(placementBlocksReadOnly).
+        setNumReplicas(3).
         setPlacementUuid(ByteString.copyFromUtf8(readOnlyTsPlacement)).build();
 
-    List<CatalogEntityInfo.PlacementInfoPB> readOnlyPlacements = Arrays.asList(
+    List<CommonNet.PlacementInfoPB> readOnlyPlacements = Arrays.asList(
         readOnlyPlacementInfo);
     ModifyClusterConfigReadReplicas readOnlyOperation =
             new ModifyClusterConfigReadReplicas(syncClient, readOnlyPlacements);
@@ -179,16 +185,17 @@ public class TestReadReplicas extends TestYBClient {
     Thread.sleep(2 * MiniYBCluster.CQL_NODE_LIST_REFRESH_SECS * 1000);
     miniCluster.waitForTabletServers(11);
 
-    List<CatalogEntityInfo.PlacementBlockPB> placementBlocksreadOnlyNew =
-            new ArrayList<CatalogEntityInfo.PlacementBlockPB>();
+    List<CommonNet.PlacementBlockPB> placementBlocksreadOnlyNew =
+            new ArrayList<CommonNet.PlacementBlockPB>();
     placementBlocksreadOnlyNew.add(placementBlock0);
 
-    CatalogEntityInfo.PlacementInfoPB readOnlyPlacementInfoNew =
-            CatalogEntityInfo.PlacementInfoPB.newBuilder().
+    CommonNet.PlacementInfoPB readOnlyPlacementInfoNew =
+            CommonNet.PlacementInfoPB.newBuilder().
                     addAllPlacementBlocks(placementBlocksreadOnlyNew).
+                    setNumReplicas(3).
                     setPlacementUuid(ByteString.copyFromUtf8(readOnlyNewTsPlacement)).build();
 
-    List<CatalogEntityInfo.PlacementInfoPB> readOnlyPlacementsNew =
+    List<CommonNet.PlacementInfoPB> readOnlyPlacementsNew =
             Arrays.asList(readOnlyPlacementInfoNew);
     ModifyClusterConfigReadReplicas readOnlyOperationNew =
             new ModifyClusterConfigReadReplicas(syncClient, readOnlyPlacementsNew);

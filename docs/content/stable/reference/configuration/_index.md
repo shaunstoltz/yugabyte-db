@@ -2,64 +2,60 @@
 title: YugabyteDB configuration reference
 headerTitle: Configuration
 linkTitle: Configuration
-description: Configuration reference for core database services, including yb-tserver, yb-master, and yugabyted.
-headcontent: Configuration of the core database services.
-image: /images/section_icons/sample-data/s_s1-sampledata-3x.png
+description: YugabyteDB configuration reference for core database services, including yb-tserver, yb-master, and yugabyted.
+headcontent: Configure core database services
+aliases:
+  - /stable/reference
 menu:
   stable:
     identifier: configuration
     parent: reference
-    weight: 2600
+    weight: 200
 type: indexpage
 ---
-<div class="row">
 
-   <div class="col-12 col-md-6 col-lg-12 col-xl-6">
-    <a class="section-link icon-offset" href="yb-tserver/">
-      <div class="head">
-        <img class="icon" src="/images/section_icons/reference/configuration/yb-tserver.png" aria-hidden="true" />
-        <div class="title">yb-tserver</div>
-      </div>
-      <div class="body">
-        Configure yb-tserver to store and manages data for client applications.
-      </div>
-    </a>
-  </div>
+{{<index/block>}}
 
-  <div class="col-12 col-md-6 col-lg-12 col-xl-6">
-    <a class="section-link icon-offset" href="yb-master/">
-      <div class="head">
-        <img class="icon" src="/images/section_icons/reference/configuration/yb-master.png" aria-hidden="true" />
-        <div class="title">yb-master</div>
-      </div>
-      <div class="body">
-        Configure yb-master to manage cluster metadata, tablets, and coordination of cluster-wide operations.
-      </div>
-    </a>
-  </div>
+  {{<index/item
+      title="yugabyted reference"
+      body="Use the yugabyted utility to launch and manage YugabyteDB."
+      href="yugabyted/"
+      icon="fa-thin fa-rocket">}}
 
-  <div class="col-12 col-md-6 col-lg-12 col-xl-6">
-    <a class="section-link icon-offset" href="yugabyted/">
-      <div class="head">
-        <img class="icon" src="/images/section_icons/reference/configuration/yb-master.png" aria-hidden="true" />
-        <div class="title">yugabyted</div>
-      </div>
-      <div class="body">
-        Use the new yugabyted to develop and test local clusters.
-      </div>
-    </a>
-  </div>
+{{</index/block>}}
 
-  <div class="col-12 col-md-6 col-lg-12 col-xl-6">
-    <a class="section-link icon-offset" href="default-ports/">
-      <div class="head">
-        <img class="icon" src="/images/section_icons/reference/configuration/yb-master.png" aria-hidden="true" />
-        <div class="title">Default ports</div>
-      </div>
-      <div class="body">
-        Default ports for APIs, RPC and admin web servers.
-      </div>
-    </a>
-  </div>
+### Manual server management
 
-</div>
+You can use the yb-tserver and yb-master binaries to manually start and configure the servers. For simplified deployment, use [yugabyted](./yugabyted/).
+
+{{<index/block>}}
+  {{<index/item
+      title="yb-master reference"
+      body="Configure YB-Master servers to manage cluster metadata, tablets, and coordination of cluster-wide operations."
+      href="yb-master/"
+      icon="fa-thin fa-sliders">}}
+
+  {{<index/item
+      title="yb-tserver reference"
+      body="Configure YB-TServer servers to store and manage data for client applications."
+      href="yb-tserver/"
+      icon="fa-thin fa-sliders">}}
+
+{{</index/block>}}
+
+### Operating system and ports
+
+{{<index/block>}}
+  {{<index/item
+      title="Supported operating systems"
+      body="Operating systems for deploying YugabyteDB and YugabyteDB Anywhere."
+      href="operating-systems/"
+      icon="fa-thin fa-window">}}
+
+  {{<index/item
+      title="Default ports"
+      body="Default ports for APIs, RPCs, and admin web servers."
+      href="default-ports/"
+      icon="fa-thin fa-network-wired">}}
+
+{{</index/block>}}

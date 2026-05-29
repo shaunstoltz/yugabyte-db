@@ -3,9 +3,9 @@
 //  LICENSE file in the root directory of this source tree. An additional grant
 //  of patent rights can be found in the PATENTS file in the same directory.
 //
-// The following only applies to changes made to this file as part of YugaByte development.
+// The following only applies to changes made to this file as part of YugabyteDB development.
 //
-// Portions Copyright (c) YugaByte, Inc.
+// Portions Copyright (c) YugabyteDB, Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License"); you may not use this file except
 // in compliance with the License.  You may obtain a copy of the License at
@@ -196,8 +196,7 @@ BlockBasedFilterBlockReader::BlockBasedFilterBlockReader(
   num_ = (n - 5 - last_word) / 4;
 }
 
-bool BlockBasedFilterBlockReader::KeyMayMatch(const Slice& key,
-                                              uint64_t block_offset) {
+bool BlockBasedFilterBlockReader::KeyMayMatch(Slice key, uint64_t block_offset) {
   assert(block_offset != kNotValid);
   if (!whole_key_filtering_) {
     return true;
@@ -214,8 +213,7 @@ bool BlockBasedFilterBlockReader::PrefixMayMatch(const Slice& prefix,
   return MayMatch(prefix, block_offset);
 }
 
-bool BlockBasedFilterBlockReader::MayMatch(const Slice& entry,
-                                           uint64_t block_offset) {
+bool BlockBasedFilterBlockReader::MayMatch(Slice entry, uint64_t block_offset) {
   uint64_t index = block_offset >> base_lg_;
   if (index < num_) {
     uint32_t start = DecodeFixed32(offset_ + index * 4);

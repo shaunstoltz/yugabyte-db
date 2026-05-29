@@ -3,9 +3,9 @@
 //  LICENSE file in the root directory of this source tree. An additional grant
 //  of patent rights can be found in the PATENTS file in the same directory.
 //
-// The following only applies to changes made to this file as part of YugaByte development.
+// The following only applies to changes made to this file as part of YugabyteDB development.
 //
-// Portions Copyright (c) YugaByte, Inc.
+// Portions Copyright (c) YugabyteDB, Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License"); you may not use this file except
 // in compliance with the License.  You may obtain a copy of the License at
@@ -35,12 +35,12 @@
 #include "yb/util/test_util.h"
 
 #ifndef GFLAGS
-bool FLAGS_enable_print = false;
+bool ANNOTATE_UNPROTECTED_WRITE(FLAGS_enable_print) = false;
 #else
 #include "yb/util/flags.h"
 
 using GFLAGS::ParseCommandLineFlags;
-DEFINE_UNKNOWN_bool(enable_print, false, "Print options generated to console.");
+DEFINE_NON_RUNTIME_bool(enable_print, false, "Print options generated to console.");
 #endif  // GFLAGS
 
 using std::unique_ptr;

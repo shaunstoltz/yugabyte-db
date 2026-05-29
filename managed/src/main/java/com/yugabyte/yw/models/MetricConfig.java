@@ -1,4 +1,4 @@
-// Copyright (c) YugaByte, Inc.
+// Copyright (c) YugabyteDB, Inc.
 
 package com.yugabyte.yw.models;
 
@@ -11,20 +11,22 @@ import io.ebean.Model;
 import io.ebean.annotation.DbJson;
 import io.swagger.annotations.ApiModel;
 import io.swagger.annotations.ApiModelProperty;
+import jakarta.persistence.Column;
+import jakarta.persistence.Entity;
+import jakarta.persistence.Id;
 import java.util.List;
 import java.util.Map;
 import java.util.stream.Collectors;
-import javax.persistence.Column;
-import javax.persistence.Entity;
-import javax.persistence.Id;
 import lombok.Data;
 import lombok.EqualsAndHashCode;
+import lombok.extern.slf4j.Slf4j;
 import play.libs.Json;
 
 @ApiModel(description = "Metric configuration key and value for Prometheus")
 @Entity
 @Data
 @EqualsAndHashCode(callSuper = false)
+@Slf4j
 public class MetricConfig extends Model {
 
   public static final String METRICS_CONFIG_PATH = "metric/metrics.yml";
@@ -87,5 +89,6 @@ public class MetricConfig extends Model {
         metricConfig.save();
       }
     }
+    log.info("Loaded {} metric configs", configs.size());
   }
 }

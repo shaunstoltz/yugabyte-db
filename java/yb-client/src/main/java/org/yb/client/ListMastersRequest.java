@@ -1,4 +1,4 @@
-// Copyright (c) YugaByte, Inc.
+// Copyright (c) YugabyteDB, Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License"); you may not use this file except
 // in compliance with the License.  You may obtain a copy of the License at
@@ -73,7 +73,8 @@ class ListMastersRequest extends YRpc<ListMastersResponse> {
                                 rpc_addr != null ? rpc_addr.getHost() : "UNKNOWN",
                                 rpc_addr != null ? rpc_addr.getPort() : 0,
                                 entry.getRole() == PeerRole.LEADER,
-                                entry.hasError() ? entry.getError().getCode().name() : "ALIVE");
+                                entry.hasError() ? entry.getError().getCode().name() : "ALIVE",
+                                entry.getRole());
         masters.add(master);
       }
     }
@@ -81,6 +82,6 @@ class ListMastersRequest extends YRpc<ListMastersResponse> {
     ListMastersResponse response = new ListMastersResponse(
         deadlineTracker.getElapsedMillis(), masterUUID, hasErr, masters);
 
-    return new Pair<ListMastersResponse, Object>(response, hasErr ? respBuilder.getError() : null);
+    return new Pair<>(response, hasErr ? respBuilder.getError() : null);
   }
 }

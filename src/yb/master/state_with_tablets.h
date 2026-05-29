@@ -1,4 +1,4 @@
-// Copyright (c) YugaByte, Inc.
+// Copyright (c) YugabyteDB, Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License"); you may not use this file except
 // in compliance with the License.  You may obtain a copy of the License at
@@ -19,7 +19,7 @@
 #include <boost/multi_index/ordered_index.hpp>
 #include <boost/multi_index_container.hpp>
 #include <boost/range/iterator_range_core.hpp>
-#include <glog/logging.h>
+#include "yb/util/logging.h"
 
 #include "yb/gutil/casts.h"
 
@@ -30,8 +30,9 @@
 #include "yb/util/status.h"
 #include "yb/util/tostring.h"
 
-namespace yb {
-namespace master {
+namespace yb::master {
+
+YB_STRONGLY_TYPED_BOOL(ForClient);
 
 class StateWithTablets {
  public:
@@ -58,12 +59,13 @@ class StateWithTablets {
   Result<SysSnapshotEntryPB::State> AggregatedState() const;
 
   Status AnyFailure() const;
-  Result<bool> Complete() const;
   bool AllTabletsDone() const;
   bool PassedSinceCompletion(const MonoDelta& duration) const;
   std::vector<TabletId> TabletIdsInState(SysSnapshotEntryPB::State state);
-  void Done(const TabletId& tablet_id, Status status);
-  bool AllInState(SysSnapshotEntryPB::State state);
+
+  // Returns true if the tablet is in a terminal state now.
+  bool Done(const TabletId& tablet_id, int64_t serial, Status status);
+  bool AllInState(SysSnapshotEntryPB::State state) const;
   bool HasInState(SysSnapshotEntryPB::State state);
   void SetInitialTabletsState(SysSnapshotEntryPB::State state);
 
@@ -96,7 +98,7 @@ class StateWithTablets {
   }
 
   template <class PB>
-  void TabletsToPB(google::protobuf::RepeatedPtrField<PB>* out) {
+  void TabletsToPB(google::protobuf::RepeatedPtrField<PB>* out) const {
     out->Reserve(narrow_cast<int>(tablets_.size()));
     for (const auto& tablet : tablets_) {
       auto* tablet_state = out->Add();
@@ -110,20 +112,24 @@ class StateWithTablets {
   template <class Functor>
   void DoPrepareOperations(const Functor& functor) {
     auto& running_index = tablets_.get<RunningTag>();
+    VLOG_WITH_PREFIX_AND_FUNC(4) << "tablets: " << AsString(running_index);
     for (auto it = running_index.begin(); it != running_index.end();) {
-      if (it->running) {
+      if (it->running_task_serial_no != 0) {
         // Could exit here, because we have already iterated over all non-running operations.
         break;
       }
-      bool should_run = it->state == initial_state_ && functor(*it);
+      auto running_serial = NextTaskSerialNo();
+      bool should_run = it->state == initial_state_ && functor(*it, running_serial);
       if (should_run) {
-        VLOG(4) << "Prepare operation for " << it->ToString();
+        VLOG_WITH_PREFIX_AND_FUNC(4) << "Prepare operation for " << it->ToString();
 
         // Here we modify indexed value, so iterator could be advanced to the next element.
         // Taking next before modify.
         auto new_it = it;
         ++new_it;
-        running_index.modify(it, [](TabletData& data) { data.running = true; });
+        running_index.modify(it, [running_serial](TabletData& data) {
+          data.running_task_serial_no = running_serial;
+        });
         it = new_it;
       } else {
         ++it;
@@ -141,12 +147,15 @@ class StateWithTablets {
   }
 
   const std::string& LogPrefix() const;
-
-  virtual bool IsTerminalFailure(const Status& status) = 0;
+  // Determine whether we can transition to a terminal state
+  virtual std::optional<SysSnapshotEntryPB::State> GetTerminalStateForStatus(
+      const Status& status) = 0;
 
   virtual Status CheckDoneStatus(const Status& status) {
     return status;
   }
+
+  virtual size_t ResetRunning();
 
   bool Empty() {
     return tablets().empty();
@@ -157,14 +166,18 @@ class StateWithTablets {
     TabletId id;
     SysSnapshotEntryPB::State state;
     Status last_error;
-    bool running = false;
+    // In-memory record of whether the task is running. A non-zero value indicates that the task is
+    // running.
+    int64_t running_task_serial_no = 0;
+    bool aborted = false;
 
     TabletData(const TabletId& id_, SysSnapshotEntryPB::State state_)
         : id(id_), state(state_) {
     }
 
     std::string ToString() const {
-      return YB_STRUCT_TO_STRING(id, state, last_error, running);
+      return YB_STRUCT_TO_STRING(
+          id, (state, SysSnapshotEntryPB::State_Name(state)), last_error, running_task_serial_no);
     }
   };
 
@@ -180,7 +193,7 @@ class StateWithTablets {
       >,
       boost::multi_index::ordered_non_unique<
         boost::multi_index::tag<RunningTag>,
-        boost::multi_index::member<TabletData, bool, &TabletData::running>
+        boost::multi_index::member<TabletData, int64_t, &TabletData::running_task_serial_no>
       >
     >
   > Tablets;
@@ -189,11 +202,19 @@ class StateWithTablets {
     return tablets_;
   }
 
+  void DecrementTablets() {
+    --num_tablets_in_initial_state_;
+    CheckCompleteness();
+  }
+
+  SysSnapshotEntryPB::State initial_state_;
+
  private:
+  static int64_t NextTaskSerialNo();
+
   void CheckCompleteness();
 
   SnapshotCoordinatorContext& context_;
-  SysSnapshotEntryPB::State initial_state_;
   const std::string log_prefix_;
 
   Tablets tablets_;
@@ -203,5 +224,4 @@ class StateWithTablets {
   CoarseTimePoint complete_at_;
 };
 
-} // namespace master
-} // namespace yb
+} // namespace yb::master

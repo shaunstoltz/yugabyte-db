@@ -15,9 +15,9 @@
 // specific language governing permissions and limitations
 // under the License.
 //
-// The following only applies to changes made to this file as part of YugaByte development.
+// The following only applies to changes made to this file as part of YugabyteDB development.
 //
-// Portions Copyright (c) YugaByte, Inc.
+// Portions Copyright (c) YugabyteDB, Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License"); you may not use this file except
 // in compliance with the License.  You may obtain a copy of the License at
@@ -32,36 +32,27 @@
 
 #include "yb/rpc/acceptor.h"
 
-#include <inttypes.h>
 #include <pthread.h>
-#include <stdint.h>
 
-#include <atomic>
-#include <list>
 #include <memory>
 #include <string>
 #include <unordered_map>
-#include <unordered_set>
 #include <vector>
 
-#include <glog/logging.h>
 #include <gtest/gtest_prod.h>
 
 #include "yb/gutil/ref_counted.h"
-#include "yb/gutil/strings/substitute.h"
 
 #include "yb/rpc/reactor.h"
 
-#include "yb/util/flags.h"
+#include "yb/util/logging.h"
 #include "yb/util/metrics.h"
-#include "yb/util/monotime.h"
 #include "yb/util/net/sockaddr.h"
+#include "yb/util/cgroups.h"
 #include "yb/util/status.h"
 #include "yb/util/status_format.h"
 #include "yb/util/status_log.h"
 #include "yb/util/thread.h"
-
-using google::protobuf::Message;
 
 METRIC_DEFINE_counter(server, rpc_connections_accepted,
                       "RPC Connections Accepted",
@@ -77,13 +68,18 @@ DEFINE_UNKNOWN_int32(rpc_acceptor_listen_backlog, 128,
              "new inbound connection requests.");
 TAG_FLAG(rpc_acceptor_listen_backlog, advanced);
 
-namespace yb {
-namespace rpc {
+namespace yb::rpc {
 
-Acceptor::Acceptor(const scoped_refptr<MetricEntity>& metric_entity, NewSocketHandler handler)
+Acceptor::Acceptor(
+    const scoped_refptr<MetricEntity>& metric_entity, NewSocketHandler handler, Cgroup* cgroup)
     : handler_(std::move(handler)),
       rpc_connections_accepted_(METRIC_rpc_connections_accepted.Instantiate(metric_entity)),
-      loop_(kDefaultLibEvFlags) {
+      loop_(kDefaultLibEvFlags)
+#ifdef __linux__
+      , cgroup_(cgroup)
+#endif
+{
+  (void)cgroup;
 }
 
 Acceptor::~Acceptor() {
@@ -103,7 +99,7 @@ Status Acceptor::Listen(const Endpoint& endpoint, Endpoint* bound_endpoint) {
 
   bool was_empty;
   {
-    std::lock_guard<std::mutex> lock(mutex_);
+    std::lock_guard lock(mutex_);
     if (closing_) {
       return STATUS_SUBSTITUTE(ServiceUnavailable, "Acceptor closing");
     }
@@ -128,7 +124,7 @@ Status Acceptor::Start() {
 
 void Acceptor::Shutdown() {
   {
-    std::lock_guard<std::mutex> lock(mutex_);
+    std::lock_guard lock(mutex_);
     if (closing_) {
       CHECK(sockets_to_add_.empty());
       VLOG(2) << "Acceptor already shut down";
@@ -142,13 +138,17 @@ void Acceptor::Shutdown() {
 
     CHECK_OK(ThreadJoiner(thread_.get()).Join());
     thread_.reset();
+  } else {
+    // This is reached if Start() was never called.
+    std::lock_guard lock(mutex_);
+    sockets_to_add_.clear();
   }
 }
 
 void Acceptor::IoHandler(ev::io& io, int events) {
   auto it = sockets_.find(&io);
   if (it == sockets_.end()) {
-    LOG(ERROR) << "IoHandler for unknown socket: " << &io;
+    LOG(DFATAL) << "IoHandler for unknown socket: " << &io;
     return;
   }
   Socket& socket = it->second.socket;
@@ -187,7 +187,7 @@ void Acceptor::IoHandler(ev::io& io, int events) {
 void Acceptor::AsyncHandler(ev::async& async, int events) {
   bool closing;
   {
-    std::lock_guard<std::mutex> lock(mutex_);
+    std::lock_guard lock(mutex_);
     closing = closing_;
     sockets_to_add_.swap(processing_sockets_to_add_);
   }
@@ -204,13 +204,14 @@ void Acceptor::AsyncHandler(ev::async& async, int events) {
     Endpoint endpoint;
     auto status = socket.GetSocketAddress(&endpoint);
     if (!status.ok()) {
-      LOG(WARNING) << "Failed to get address for socket: "
-                   << socket.GetFd() << ": " << status.ToString();
+      LOG(WARNING) << "Failed to get address for socket: " << socket.GetFd() << ": "
+                   << status.ToString();
     }
     VLOG(1) << "Adding socket fd " << socket.GetFd() << " at " << endpoint;
-    AcceptingSocket ac{ std::unique_ptr<ev::io>(new ev::io),
-                        Socket(std::move(socket)),
-                        endpoint };
+    AcceptingSocket ac{
+        .io = std::make_unique<ev::io>(),
+        .socket = Socket(std::move(socket)),
+        .endpoint = endpoint};
     processing_sockets_to_add_.pop_back();
     ac.io->set(loop_);
     ac.io->set<Acceptor, &Acceptor::IoHandler>(this);
@@ -220,9 +221,14 @@ void Acceptor::AsyncHandler(ev::async& async, int events) {
 }
 
 void Acceptor::RunThread() {
+#ifdef __linux__
+  if (cgroup_) {
+    WARN_NOT_OK(cgroup_->MoveCurrentThreadToGroup(),
+                "Failed to move acceptor thread to cgroup");
+  }
+#endif
   loop_.run();
   VLOG(1) << "Acceptor shutting down.";
 }
 
-} // namespace rpc
-} // namespace yb
+} // namespace yb::rpc

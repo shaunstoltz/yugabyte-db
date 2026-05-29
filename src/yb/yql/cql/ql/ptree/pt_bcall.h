@@ -1,5 +1,5 @@
 //--------------------------------------------------------------------------------------------------
-// Copyright (c) YugaByte, Inc.
+// Copyright (c) YugabyteDB, Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License"); you may not use this file except
 // in compliance with the License.  You may obtain a copy of the License at
@@ -75,7 +75,7 @@ class PTBcall : public PTExpr {
   }
 
   // BCall result set column type in QL format.
-  void rscol_type_PB(QLTypePB *pb_type) const override;
+  void rscol_type_PB(QLTypeMsg *pb_type) const override;
 
   virtual Status CheckOperator(SemContext *sem_context) override;
 
@@ -85,7 +85,8 @@ class PTBcall : public PTExpr {
 
   void CollectReferencedIndexColnames(MCSet<std::string> *col_names) const override;
 
-  std::string QLName(QLNameOption option = QLNameOption::kUserOriginalName) const override;
+  std::string QLName(
+      qlexpr::QLNameOption option = qlexpr::QLNameOption::kUserOriginalName) const override;
   bool IsAggregateCall() const override;
   yb::bfql::TSOpcode aggregate_opcode() const override;
 

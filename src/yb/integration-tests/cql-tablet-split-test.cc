@@ -1,4 +1,4 @@
-// Copyright (c) YugaByte, Inc.
+// Copyright (c) YugabyteDB, Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License"); you may not use this file except
 // in compliance with the License.  You may obtain a copy of the License at
@@ -147,39 +147,31 @@ const auto kSecondaryIndexTestTableName =
 class CqlTabletSplitTest : public CqlTestBase<MiniCluster> {
  protected:
   void SetUp() override {
-    FLAGS_yb_num_shards_per_tserver = 1;
-    FLAGS_enable_automatic_tablet_splitting = true;
+    itest::SetupQuickSplit(64_KB);
 
-    // Setting this very low will just cause to include metrics in every heartbeat, no overhead on
-    // setting it lower than FLAGS_heartbeat_interval_ms.
-    FLAGS_tserver_heartbeat_metrics_interval_ms = 1;
-    FLAGS_heartbeat_interval_ms = 1000;
+    ANNOTATE_UNPROTECTED_WRITE(FLAGS_yb_num_shards_per_tserver) = 1;
 
-    // Reduce cleanup waiting time, so tests are completed faster.
-    FLAGS_cleanup_split_tablets_interval_sec = 1;
-
-    FLAGS_tablet_split_low_phase_size_threshold_bytes = 0;
-    FLAGS_tablet_split_high_phase_size_threshold_bytes = 0;
-    FLAGS_tablet_split_low_phase_shard_count_per_node = 0;
-    FLAGS_tablet_split_high_phase_shard_count_per_node = 0;
-    FLAGS_tablet_force_split_threshold_bytes = 64_KB;
-    FLAGS_db_write_buffer_size = FLAGS_tablet_force_split_threshold_bytes;
-    FLAGS_db_block_size_bytes = 2_KB;
-    FLAGS_db_filter_block_size_bytes = 2_KB;
-    FLAGS_db_index_block_size_bytes = 2_KB;
+    ANNOTATE_UNPROTECTED_WRITE(FLAGS_tablet_force_split_threshold_bytes) = 64_KB;
+    ANNOTATE_UNPROTECTED_WRITE(FLAGS_db_write_buffer_size) =
+        FLAGS_tablet_force_split_threshold_bytes;
+    ANNOTATE_UNPROTECTED_WRITE(FLAGS_db_block_size_bytes) = 2_KB;
+    ANNOTATE_UNPROTECTED_WRITE(FLAGS_db_filter_block_size_bytes) = 2_KB;
+    ANNOTATE_UNPROTECTED_WRITE(FLAGS_db_index_block_size_bytes) = 2_KB;
     CqlTestBase::SetUp();
 
     // We want to test default behaviour here without overrides done by
     // YBMiniClusterTestBase::SetUp.
     // See https://github.com/yugabyte/yugabyte-db/issues/8935#issuecomment-1142223006
-    FLAGS_use_priority_thread_pool_for_flushes = saved_use_priority_thread_pool_for_flushes_;
+    ANNOTATE_UNPROTECTED_WRITE(FLAGS_use_priority_thread_pool_for_flushes) =
+        saved_use_priority_thread_pool_for_flushes_;
   }
 
   void WaitUntilAllCommittedOpsApplied(const MonoDelta timeout) {
     const auto splits_completion_deadline = MonoTime::Now() + timeout;
     for (auto& peer : ListTabletPeers(cluster_.get(), ListPeersFilter::kAll)) {
-      auto consensus = peer->shared_consensus();
-      if (consensus) {
+      auto consensus_result = peer->GetConsensus();
+      if (consensus_result) {
+        auto consensus = consensus_result->get();
         ASSERT_OK(Wait([consensus]() -> Result<bool> {
           return consensus->GetLastAppliedOpId() >= consensus->GetLastCommittedOpId();
         }, splits_completion_deadline, "Waiting for all committed ops to be applied"));
@@ -314,20 +306,20 @@ load_generator::ReadStatus CqlSecondaryIndexReader::PerformRead(
         "for v: '$0', expected key: '$1', key_index: $2", expected_value, key_str, key_index);
   };
   if (!iter.Next()) {
-    LOG(ERROR) << "No rows found " << values_formatter();
+    LOG(WARNING) << "No rows found " << values_formatter();
     return load_generator::ReadStatus::kNoRows;
   }
   auto row = iter.Row();
   const auto k = row.Value(0).ToString();
   if (k != key_str) {
-    LOG(ERROR) << "Invalid k " << values_formatter() << " got k: " << k;
+    LOG(WARNING) << "Invalid k " << values_formatter() << " got k: " << k;
     return load_generator::ReadStatus::kInvalidRead;
   }
   if (iter.Next()) {
     return load_generator::ReadStatus::kExtraRows;
-    LOG(ERROR) << "More than 1 row found " << values_formatter();
+    LOG(WARNING) << "More than 1 row found " << values_formatter();
     do {
-      LOG(ERROR) << "k: " << iter.Row().Value(0).ToString();
+      LOG(WARNING) << "k: " << iter.Row().Value(0).ToString();
     } while (iter.Next());
   }
   return load_generator::ReadStatus::kOk;
@@ -411,7 +403,7 @@ void CqlTabletSplitTest::CompleteSecondaryIndexTest(const int num_splits, const 
 }
 
 TEST_F(CqlTabletSplitTest, SecondaryIndex) {
-  const auto kNumSplits = RegularBuildVsSanitizers(10, 3);
+  const auto kNumSplits = ReleaseVsDebugVsAsanVsTsanVsApple(10, 10, 3, 3, 3);
 
   ASSERT_NO_FATALS(StartSecondaryIndexTest());
   ANNOTATE_UNPROTECTED_WRITE(FLAGS_TEST_simulate_lookup_partition_list_mismatch_probability) = 0.5;
@@ -484,14 +476,17 @@ TEST_F_EX(CqlTabletSplitTest, SecondaryIndexWithDrop, CqlTabletSplitTestMultiMas
 class CqlTabletSplitTestExt : public CqlTestBase<ExternalMiniCluster> {
  protected:
   void SetUpFlags() override {
+#ifdef __APPLE__
+    const int64 kSplitThreshold = 16_KB;
+#else
     const int64 kSplitThreshold = 64_KB;
+#endif
 
     std::vector<std::string> common_flags;
     common_flags.push_back("--yb_num_shards_per_tserver=1");
 
+    mini_cluster_opt_.replication_factor = std::min(num_tablet_servers(), 3);
     auto& master_flags = mini_cluster_opt_.extra_master_flags;
-    master_flags.push_back(
-        Format("--replication_factor=$0", std::min(num_tablet_servers(), 3)));
     master_flags.push_back("--enable_automatic_tablet_splitting=true");
     master_flags.push_back("--tablet_split_low_phase_size_threshold_bytes=0");
     master_flags.push_back("--tablet_split_high_phase_size_threshold_bytes=0");
@@ -501,6 +496,7 @@ class CqlTabletSplitTestExt : public CqlTestBase<ExternalMiniCluster> {
 
     auto& tserver_flags = mini_cluster_opt_.extra_tserver_flags;
     tserver_flags.push_back(Format("--db_write_buffer_size=$0", kSplitThreshold));
+    tserver_flags.push_back("--rocksdb_max_write_buffer_number=2");
     // Lower SST block size to have multiple entries in index and be able to detect a split key.
     tserver_flags.push_back(Format(
         "--db_block_size_bytes=$0", std::min(FLAGS_db_block_size_bytes, kSplitThreshold / 8)));
@@ -529,14 +525,22 @@ struct BatchTimeseriesDataSource {
 Status RunBatchTimeSeriesTest(
     ExternalMiniCluster* cluster, CppCassandraDriver* driver, const int num_splits,
     const MonoDelta timeout) {
+#ifdef __APPLE__
+  const auto kWriterThreads = 1;
+  const auto kReaderThreads = 1;
+  const auto kReadBatchSize = 10;
+  const auto kWriteBatchSize = 10;
+  const auto kValueSize = 500;
+#else
   const auto kWriterThreads = 4;
   const auto kReaderThreads = 4;
-  const auto kMinMetricsCount = 10000;
-  const auto kMaxMetricsCount = 20000;
   const auto kReadBatchSize = 100;
   const auto kWriteBatchSize = 500;
-  const auto kReadBackDeltaTime = 100;
   const auto kValueSize = 100;
+#endif
+  const auto kMinMetricsCount = 10000;
+  const auto kMaxMetricsCount = 20000;
+  const auto kReadBackDeltaTime = 100;
 
   const auto kMaxWriteErrors = 100;
   const auto kMaxReadErrors = 100;
@@ -581,7 +585,7 @@ Status RunBatchTimeSeriesTest(
 
   std::mutex random_mutex;
   auto get_random_source = [&rng, &random_mutex, &data_sources]() -> BatchTimeseriesDataSource* {
-    std::lock_guard<decltype(random_mutex)> lock(random_mutex);
+    std::lock_guard lock(random_mutex);
     return RandomElement(data_sources, &rng).get();
   };
 
@@ -660,6 +664,11 @@ Status RunBatchTimeSeriesTest(
       }
       YB_LOG_EVERY_N_SECS(INFO, 5)
           << "Completed " << num_writes << " writes, num_write_errors: " << num_write_errors;
+      // Throttle on slower (non-release) builds; otherwise compactions can't keep up with the
+      // write rate and post-split compactions get starved, causing the test to time out.
+      if (RegularBuildVsDebugVsSanitizers(false, true, true)) {
+        std::this_thread::sleep_for(num_writes.load() * 1ms);
+      }
     }
   };
 

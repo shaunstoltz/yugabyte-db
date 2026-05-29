@@ -3,9 +3,9 @@ title: Date and time data types and functionality [YSQL]
 headerTitle: Date and time data types and functionality
 linkTitle: Date and time
 description: Learn about YSQL support for the date, time, timestamp, and interval data types and their functions and operators.
-image: /images/section_icons/api/ysql.png
+image: /images/section_icons/api/subsection.png
 menu:
-  stable:
+  stable_api:
     identifier: api-ysql-datatypes-datetime
     parent: api-ysql-datatypes
 type: indexpage
@@ -35,11 +35,13 @@ A value of the _interval_ data type represents a _duration_. In contrast, a valu
 <a name="avoid-timetz"></a>Subtraction between a pair of moment values with the same data type produces, with one exception, an _interval_ value. Exceptionally, subtracting one _date_ value from another produces an _integer_ value.
 
 {{< tip title="Avoid using the 'timetz' data type." >}}
-The [PostgreSQL documentation](https://www.postgresql.org/docs/11/datatype-datetime.html#DATATYPE-DATETIME-TABLE) recommends against using the _timetz_ (a.k.a. _time with time zone_) data type. This text is slightly reworded:
+The [PostgreSQL documentation](https://www.postgresql.org/docs/15/datatype-datetime.html#DATATYPE-DATETIME-TABLE) recommends against using the _timetz_ (a.k.a. _time with time zone_) data type. This text is slightly reworded:
 
 > The data type _time with time zone_ is defined by the SQL standard, but the definition exhibits properties which lead to questionable usefulness. In most cases, a combination of _date_, (plain) _time_, (plain) _timestamp_, and _timestamptz_ should provide the complete range of _date-time_ functionality that any application could require.
 
 The thinking is that a notion that expresses only what a clock might read in a particular timezone gives only part of the picture. For example when a clock reads 20:00 in _UTC_, it reads 03:00 in China Standard Time. But 20:00 _UTC_ is the evening of one day and 03:00 is in the small hours of the morning of the _next day_ in China Standard Time. (Neither _UTC_ nor China Standard Time adjusts its clocks for Daylight Savings.) The data type _timestamptz_ represents both the time of day and the date and so it handles the present use case naturally. No further reference will be made to _timetz_.
+
+YugabyteDB also doesn't support index key columns that use the _timetz_ data type.
 {{< /tip >}}
 <a name="maximum-and-minimum-supported-values"></br></a>
 {{< note title="Maximum and minimum supported values." >}}
@@ -101,7 +103,7 @@ This is the result:
 
 You see the same date and time-of-day values, but without the timezone offset of course, if you define the _ts_t_ domain type using plain _timestamp_.
 
-This test is shown for completeness. Its outcome is of little practical consequence. You can rely on the values in the "Min" and "Max" columns in the table above, copied from the [PostgreSQL documentation](https://www.postgresql.org/docs/11/datatype-datetime.html#DATATYPE-DATETIME-TABLE), to specify the _supported_ range. Yugabyte recommends that, as a practical compromise, you take these to be the limits for _timestamp[tz]_ values:
+This test is shown for completeness. Its outcome is of little practical consequence. You can rely on the values in the "Min" and "Max" columns in the table above, copied from the [PostgreSQL documentation](https://www.postgresql.org/docs/15/datatype-datetime.html#DATATYPE-DATETIME-TABLE), to specify the _supported_ range. Yugabyte recommends that, as a practical compromise, you take these to be the limits for _timestamp[tz]_ values:
 
 ```output
 ['4713-01-01 00:00:00 BC', '294276-12-31 23:59:59 AD']
@@ -127,7 +129,7 @@ PostgreSQL, and therefore YSQL, support the use of several special manifest _tex
 | 'yesterday' | date, plain timestamp              |
 | 'allballs'  | plain time                         |
 
-Their meanings are given in section [8.5.1.4. Special Values](https://www.postgresql.org/docs/11/datatype-datetime.html#DATATYPE-DATETIME-SPECIAL-VALUES) in the PostgreSQL documentation.
+Their meanings are given in section [8.5.1.4. Special Values](https://www.postgresql.org/docs/15/datatype-datetime.html#DATATYPE-DATETIME-SPECIAL-VALUES) in the PostgreSQL documentation.
 
 {{< tip title="Avoid using all of these special constants except for 'infinity' and '-infinity'." >}}
 

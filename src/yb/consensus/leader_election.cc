@@ -15,9 +15,9 @@
 // specific language governing permissions and limitations
 // under the License.
 //
-// The following only applies to changes made to this file as part of YugaByte development.
+// The following only applies to changes made to this file as part of YugabyteDB development.
 //
-// Portions Copyright (c) YugaByte, Inc.
+// Portions Copyright (c) YugabyteDB, Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License"); you may not use this file except
 // in compliance with the License.  You may obtain a copy of the License at
@@ -34,8 +34,6 @@
 
 #include <functional>
 #include <mutex>
-
-#include <glog/logging.h>
 
 #include "yb/common/wire_protocol.h"
 
@@ -185,7 +183,7 @@ LeaderElection::LeaderElection(const RaftConfigPB& config,
 }
 
 LeaderElection::~LeaderElection() {
-  std::lock_guard<Lock> guard(lock_);
+  std::lock_guard guard(lock_);
   DCHECK(has_responded_); // We must always call the callback exactly once.
   voter_state_.clear();
 }
@@ -201,7 +199,7 @@ void LeaderElection::Run() {
   for (const std::string& voter_uuid : voting_follower_uuids_) {
     VoterState* state = nullptr;
     {
-      std::lock_guard<Lock> guard(lock_);
+      std::lock_guard guard(lock_);
       if (result_.decided()) { // Already have result.
         break;
       }
@@ -235,7 +233,7 @@ void LeaderElection::Run() {
 void LeaderElection::CheckForDecision() {
   bool to_respond = false;
   {
-    std::lock_guard<Lock> guard(lock_);
+    std::lock_guard guard(lock_);
     // Check if the vote has been newly decided.
     auto decision = vote_counter_->GetDecision();
     if (!result_.decided() && decision != ElectionVote::kUnknown) {
@@ -262,7 +260,7 @@ void LeaderElection::CheckForDecision() {
 void LeaderElection::VoteResponseRpcCallback(const std::string& voter_uuid,
                                              const LeaderElectionPtr& self) {
   {
-    std::lock_guard<Lock> guard(lock_);
+    std::lock_guard guard(lock_);
 
     if (has_responded_) {
       return;
@@ -351,20 +349,28 @@ void LeaderElection::HandleVoteGrantedUnlocked(const string& voter_uuid, const V
   DCHECK(lock_.is_locked());
   DCHECK_EQ(state.response.responder_term(), election_term());
   DCHECK(state.response.vote_granted());
-  if (state.response.has_remaining_leader_lease_duration_ms()) {
-    CoarseTimeLease lease(
-        state.response.leader_lease_uuid(),
-        CoarseMonoClock::Now() + state.response.remaining_leader_lease_duration_ms() * 1ms);
-    result_.old_leader_lease.TryUpdate(lease);
+  if (!state.response.remaining_leader_lease_duration_ms().empty()) {
+    auto now = CoarseMonoClock::Now();
+    for (int i = 0; i != state.response.remaining_leader_lease_duration_ms().size(); ++i) {
+      result_.old_leader_leases.push_back({
+        .holder_uuid = state.response.leader_lease_uuid(i),
+        .expiration = now + state.response.remaining_leader_lease_duration_ms(i) * 1ms,
+      });
+    }
   }
 
-  if (state.response.has_leader_ht_lease_expiration()) {
-    PhysicalComponentLease lease(
-        state.response.leader_ht_lease_uuid(), state.response.leader_ht_lease_expiration());
-    result_.old_leader_ht_lease.TryUpdate(lease);
+  for (int i = 0; i != state.response.leader_ht_lease_expiration().size(); ++i) {
+    result_.old_leader_ht_leases.push_back({
+      .holder_uuid = state.response.leader_ht_lease_uuid(i),
+      .expiration = state.response.leader_ht_lease_expiration(i),
+    });
   }
 
-  LOG_WITH_PREFIX(INFO) << "Vote granted by peer " << voter_uuid;
+  LOG_WITH_PREFIX(INFO)
+      << "Vote granted by peer " << voter_uuid << ", old leader leases: "
+      << AsString(result_.old_leader_leases) << ", old leader ht leases: "
+      << AsString(result_.old_leader_ht_leases);
+
   RecordVoteUnlocked(voter_uuid, ElectionVote::kGranted);
 }
 

@@ -3,9 +3,9 @@
 //  LICENSE file in the root directory of this source tree. An additional grant
 //  of patent rights can be found in the PATENTS file in the same directory.
 //
-// The following only applies to changes made to this file as part of YugaByte development.
+// The following only applies to changes made to this file as part of YugabyteDB development.
 //
-// Portions Copyright (c) YugaByte, Inc.
+// Portions Copyright (c) YugabyteDB, Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License"); you may not use this file except
 // in compliance with the License.  You may obtain a copy of the License at
@@ -36,6 +36,7 @@
 #include "yb/gutil/thread_annotations.h"
 
 #include "yb/rocksdb/db.h"
+#include "yb/rocksdb/db/background_error.h"
 #include "yb/rocksdb/db/column_family.h"
 #include "yb/rocksdb/db/compaction.h"
 #include "yb/rocksdb/db/dbformat.h"
@@ -59,6 +60,10 @@
 #include "yb/rocksdb/util/instrumented_mutex.h"
 #include "yb/rocksdb/util/stop_watch.h"
 #include "yb/rocksdb/util/thread_local.h"
+
+namespace yb {
+class Cgroup;
+}  // namespace yb
 
 namespace rocksdb {
 
@@ -128,6 +133,12 @@ class DBImpl : public DB {
   using DB::NewIterator;
   virtual Iterator* NewIterator(const ReadOptions& options,
                                 ColumnFamilyHandle* column_family) override;
+  std::unique_ptr<Iterator> NewIndexIterator(
+      const ReadOptions& options, SkipLastEntry skip_last_index_entry,
+      ColumnFamilyHandle* column_family) override;
+  std::unique_ptr<DataBlockAwareIndexIterator> NewDataBlockAwareIndexIterator(
+      const ReadOptions& options, SkipLastEntry skip_last_index_entry,
+      ColumnFamilyHandle* column_family) override;
   virtual Status NewIterators(
       const ReadOptions& options,
       const std::vector<ColumnFamilyHandle*>& column_families,
@@ -195,17 +206,20 @@ class DBImpl : public DB {
                        ColumnFamilyHandle* column_family) override;
   using DB::WaitForFlush;
   virtual Status WaitForFlush(ColumnFamilyHandle* column_family) override;
+  virtual Status UpdateFrontiers(const yb::storage::UserFrontiers& frontiers) override;
   virtual Status SyncWAL() override;
 
   virtual SequenceNumber GetLatestSequenceNumber() const override;
+
+  uint64_t GetNextFileNumber() const override;
 
   virtual Status DisableFileDeletions() override;
   virtual Status EnableFileDeletions(bool force) override;
   virtual int IsFileDeletionsEnabled() const;
   // All the returned filenames start with "/"
-  virtual Status GetLiveFiles(std::vector<std::string>&,
-                              uint64_t* manifest_file_size,
-                              bool flush_memtable = true) override;
+  virtual Status GetLiveFiles(
+      std::vector<std::string>&, uint64_t* manifest_file_size, bool flush_memtable,
+      FlushReason flush_reason) override;
   virtual Status GetSortedWalFiles(VectorLogPtr* files) override;
 
   virtual Status GetUpdatesSince(
@@ -218,18 +232,22 @@ class DBImpl : public DB {
 
   void GetLiveFilesMetaData(std::vector<LiveFileMetaData>* metadata) override;
 
-  UserFrontierPtr GetFlushedFrontier() override;
+  yb::storage::UserFrontierPtr GetFlushedFrontier() override;
 
   Status ModifyFlushedFrontier(
-      UserFrontierPtr frontier,
+      yb::storage::UserFrontierPtr frontier,
       FrontierModificationMode mode) override;
 
   FlushAbility GetFlushAbility() override;
 
-  UserFrontierPtr GetMutableMemTableFrontier(UpdateUserValueType type) override;
+  yb::storage::UserFrontierPtr GetMutableMemTableFrontier(
+      yb::storage::UpdateUserValueType type) override;
 
   // Calculates specified frontier_type for all mem tables (active and immutable).
-  UserFrontierPtr CalcMemTableFrontier(UpdateUserValueType frontier_type) override;
+  yb::storage::UserFrontierPtr CalcMemTableFrontier(
+      yb::storage::UpdateUserValueType frontier_type) override;
+
+  UserFrontierRange CalcMemTableFrontiers() override;
 
   // Obtains the meta data of the specified column family of the DB.
   // STATUS(NotFound, "") will be returned if the current DB does not have
@@ -316,12 +334,10 @@ class DBImpl : public DB {
 
   virtual Status GetDbIdentity(std::string* identity) const override;
 
-  Status RunManualCompaction(ColumnFamilyData* cfd, int input_level,
-                             int output_level, uint32_t output_path_id,
-                             const Slice* begin, const Slice* end,
-                             bool exclusive,
-                             CompactionReason compaction_reason,
-                             bool disallow_trivial_move = false);
+  Status RunManualCompaction(
+      ColumnFamilyData* cfd, int input_level, int output_level,
+      const CompactRangeOptions& options, const Slice* begin, const Slice* end,
+      bool disallow_trivial_move = false);
 
   // Return an internal iterator over the current state of the database.
   // The keys of this iterator are internal keys (see format.h).
@@ -361,6 +377,8 @@ class DBImpl : public DB {
 
   int TEST_NumTotalRunningCompactions();
 
+  size_t TEST_NumNotStartedCompactionsUnlocked(CompactionSizeKind compaction_size_kind);
+
   int TEST_NumRunningFlushes();
 
   int TEST_NumBackgroundCompactionsScheduled();
@@ -371,6 +389,10 @@ class DBImpl : public DB {
   void TEST_LockMutex();
 
   void TEST_UnlockMutex();
+
+  InstrumentedMutex* TEST_mutex() {
+    return &mutex_;
+  }
 
   // REQUIRES: mutex locked
   void* TEST_BeginWrite();
@@ -480,16 +502,33 @@ class DBImpl : public DB {
   // And max seqno of imported database is less that active seqno of destination db.
   Status Import(const std::string& source_dir) override;
 
-  bool AreWritesStopped();
+  bool AreWritesStopped() override;
   bool NeedsDelay() override;
 
-  Result<std::string> GetMiddleKey() override;
+  Result<std::string> GetMiddleKey(Slice lower_bound_key) override;
+
+  void SetAllowCompactionFailures(AllowCompactionFailures allow_compaction_failures) override;
 
   // Returns a table reader for the largest SST file.
   Result<TableReader*> TEST_GetLargestSstTableReader() override;
 
   // Used in testing to make the old memtable immutable and start writing to a new one.
   void TEST_SwitchMemtable() override;
+
+  // Used in testing to replace current exclude_from_compaction functor. Returns current functor.
+  CompactionFileExcluderPtr TEST_SetExcludeFromCompaction(
+      ColumnFamilyHandle* column_family,
+      CompactionFileExcluderPtr exclude_from_compaction);
+
+  CompactionFileExcluderPtr TEST_SetExcludeFromCompaction(
+      CompactionFileExcluderPtr exclude_from_compaction) {
+    return TEST_SetExcludeFromCompaction(DefaultColumnFamily(), std::move(exclude_from_compaction));
+  }
+
+  DBOptions& TEST_db_options() { return const_cast<DBOptions&>(db_options_); }
+
+  void SetTaskCgroup(yb::Cgroup* cgroup) { task_cgroup_ = cgroup; }
+  yb::Cgroup* task_cgroup() const { return task_cgroup_; }
 
  protected:
   Env* const env_;
@@ -503,6 +542,16 @@ class DBImpl : public DB {
                                         SuperVersion* super_version,
                                         Arena* arena);
 
+  // TODO(index_iter): consider using arena.
+  template <typename IndexInternalIteratorType, bool kSkipLastEntry>
+  std::unique_ptr<MergingIterator<IndexInternalIteratorType>> NewMergedIndexInternalIterator(
+      const ReadOptions&, ColumnFamilyData* cfd, SuperVersion* super_version);
+
+  template <typename IndexIteratorType, typename IndexInternalIteratorType>
+  std::unique_ptr<typename IndexIteratorType::Base> DoNewIndexIterator(
+      const ReadOptions& read_options, SkipLastEntry skip_last_index_entry,
+      ColumnFamilyHandle* column_family);
+
   // Except in DB::Open(), WriteOptionsFile can only be called when:
   // 1. WriteThread::Writer::EnterUnbatched() is used.
   // 2. db_mutex is held
@@ -514,14 +563,17 @@ class DBImpl : public DB {
   Status RenameTempFileToOptionsFile(const std::string& file_name);
   Status DeleteObsoleteOptionsFiles();
 
-  void NotifyOnFlushCompleted(ColumnFamilyData* cfd, FileMetaData* file_meta,
-                              const MutableCFOptions& mutable_cf_options,
-                              int job_id, TableProperties prop);
+  void NotifyOnFlushCompleted(
+      ColumnFamilyData* cfd, FileMetaData* file_meta, const MutableCFOptions& mutable_cf_options,
+      int job_id, TableProperties prop, FlushReason flush_reason);
 
   void NotifyOnCompactionCompleted(ColumnFamilyData* cfd,
                                    Compaction *c, const Status &st,
                                    const CompactionJobStats& job_stats,
                                    int job_id);
+
+  void NotifyOnNoOpCompactionCompleted(const ColumnFamilyData& cfd,
+                                       const CompactionReason compaction_reason);
 
   Status WriteImpl(const WriteOptions& options, WriteBatch* updates,
                    WriteCallback* callback);
@@ -571,7 +623,8 @@ class DBImpl : public DB {
   // log-file/memtable and writes a new descriptor iff successful.
   Result<FileNumbersHolder> FlushMemTableToOutputFile(
       ColumnFamilyData* cfd, const MutableCFOptions& mutable_cf_options,
-      bool* made_progress, JobContext* job_context, LogBuffer* log_buffer);
+      FlushReason flush_reason_for_job, bool* made_progress, JobContext* job_context,
+      LogBuffer* log_buffer);
 
   // REQUIRES: log_numbers are sorted in ascending order
   Status RecoverLogFiles(const std::vector<uint64_t>& log_numbers,
@@ -591,7 +644,7 @@ class DBImpl : public DB {
 
   Status ScheduleFlushes(WriteContext* context);
 
-  Status SwitchMemtable(ColumnFamilyData* cfd, WriteContext* context);
+  Status SwitchMemtable(ColumnFamilyData* cfd, WriteContext* context, FlushReason flush_reason);
 
   // Force current memtable contents to be flushed.
   Status FlushMemTable(ColumnFamilyData* cfd, const FlushOptions& options);
@@ -608,20 +661,18 @@ class DBImpl : public DB {
   ColumnFamilyData* GetColumnFamilyDataByName(const std::string& cf_name);
 
   void MaybeScheduleFlushOrCompaction();
-  void SchedulePendingFlush(ColumnFamilyData* cfd);
+  void SchedulePendingFlush(ColumnFamilyData* cfd, FlushReason reason);
   void SchedulePendingCompaction(ColumnFamilyData* cfd);
   static void BGWorkCompaction(void* arg);
   static void BGWorkFlush(void* db);
   static void UnscheduleCallback(void* arg);
   void WaitAfterBackgroundError(const Status& s, const char* job_name, LogBuffer* log_buffer);
   void BackgroundCallCompaction(
-      ManualCompaction* manual_compaction, std::unique_ptr<Compaction> compaction = nullptr,
-      CompactionTask* compaction_task = nullptr);
+      ManualCompaction* manual_compaction, CompactionTask* compaction_task = nullptr);
   void BackgroundCallFlush(ColumnFamilyData* cfd);
   Result<FileNumbersHolder> BackgroundCompaction(
       bool* made_progress, JobContext* job_context, LogBuffer* log_buffer,
-      ManualCompaction* manual_compaction = nullptr,
-      std::unique_ptr<Compaction> compaction = nullptr);
+      ManualCompaction* manual_compaction, CompactionTask* compaction_task);
   Result<FileNumbersHolder> BackgroundFlush(
       bool* made_progress, JobContext* job_context, LogBuffer* log_buffer, ColumnFamilyData* cfd);
   void BackgroundJobComplete(const Status& s, JobContext* job_context, LogBuffer* log_buffer);
@@ -651,16 +702,16 @@ class DBImpl : public DB {
   // hold the data set.
   Status ReFitLevel(ColumnFamilyData* cfd, int level, int target_level = -1);
 
-  // helper functions for adding and removing from flush & compaction queues
-  bool AddToCompactionQueue(ColumnFamilyData* cfd);
+  // Helper functions for adding and removing from flush & compaction queues.
+  void MaybeAddToCompactionQueue(ColumnFamilyData* cfd, bool use_priority_thread_pool);
   std::unique_ptr<Compaction> PopFirstFromSmallCompactionQueue();
   std::unique_ptr<Compaction> PopFirstFromLargeCompactionQueue();
   bool IsEmptyCompactionQueue();
-  void AddToFlushQueue(ColumnFamilyData* cfd);
-  ColumnFamilyData* PopFirstFromFlushQueue();
+  void AddToFlushQueue(ColumnFamilyData* cfd, FlushReason reason);
+  ColumnFamilyData* PopFirstFromFlushQueue(FlushReason* flush_reason_out = nullptr);
 
   // Compaction is marked as large based on options, so cannot be static or free function.
-  bool IsLargeCompaction(const Compaction& compaction);
+  CompactionSizeKind GetCompactionSizeKind(const Compaction& compaction);
 
   // helper function to call after some of the logs_ were synced
   void MarkLogsSynced(uint64_t up_to, bool synced_dir, const Status& status);
@@ -871,10 +922,10 @@ class DBImpl : public DB {
   // compaction and flush threads we need to schedule. This scheduling is done
   // in MaybeScheduleFlushOrCompaction()
   // invariant(column family present in flush_queue_ <==>
-  // ColumnFamilyData::pending_flush_ == true)
+  // ColumnFamilyData::pending_flush())
   std::deque<ColumnFamilyData*> flush_queue_;
-  // invariant(column family present in compaction_queue_ <==>
-  // ColumnFamilyData::pending_compaction_ == true)
+  // invariant(number of column families in compaction_queue_ ==
+  // ColumnFamilyData::num_pending_compactions_)
   std::deque<std::unique_ptr<Compaction>> small_compaction_queue_;
   std::deque<std::unique_ptr<Compaction>> large_compaction_queue_;
   int unscheduled_flushes_;
@@ -909,13 +960,13 @@ class DBImpl : public DB {
     ColumnFamilyData* cfd;
     int input_level;
     int output_level;
-    uint32_t output_path_id;
     Status status;
     bool done;
     bool in_progress;             // compaction request being processed?
     bool incomplete;              // only part of requested range compacted
     bool exclusive;               // current behavior of only one manual
     bool disallow_trivial_move;   // Force actual compaction to run
+    bool has_input_size_limit;    // if true, consider the mark incompete after it's actually done
     const InternalKey* begin;     // nullptr means beginning of key range
     const InternalKey* end;       // nullptr means end of key range
     InternalKey* manual_end;      // how far we are compacting
@@ -931,7 +982,7 @@ class DBImpl : public DB {
   };
 
   // Have we encountered a background error in paranoid mode?
-  Status bg_error_;
+  BackgroundError bg_error_;
 
   // shall we disable deletion of obsolete files
   // if 0 the deletion is enabled.
@@ -992,6 +1043,8 @@ class DBImpl : public DB {
 
   std::function<void()> files_changed_listener_ GUARDED_BY(files_changed_listener_mutex_);
 
+  std::atomic<bool> allow_compaction_failures_{false};
+
   // No copying allowed
   DBImpl(const DBImpl&) = delete;
   void operator=(const DBImpl&) = delete;
@@ -1001,15 +1054,15 @@ class DBImpl : public DB {
   // job_context which can have new_superversion already
   // allocated.
   void InstallSuperVersionAndScheduleWorkWrapper(
-      ColumnFamilyData* cfd, JobContext* job_context,
-      const MutableCFOptions& mutable_cf_options);
+      ColumnFamilyData* cfd, JobContext* job_context, const MutableCFOptions& mutable_cf_options,
+      FlushReason flush_reason);
 
   // All ColumnFamily state changes go through this function. Here we analyze
   // the new state and we schedule background work if we detect that the new
   // state needs flush or compaction.
   std::unique_ptr<SuperVersion> InstallSuperVersionAndScheduleWork(
-      ColumnFamilyData* cfd, SuperVersion* new_sv,
-      const MutableCFOptions& mutable_cf_options);
+      ColumnFamilyData* cfd, SuperVersion* new_sv, const MutableCFOptions& mutable_cf_options,
+      FlushReason flush_reason);
 
   using DB::GetPropertiesOfAllTables;
   virtual Status GetPropertiesOfAllTables(ColumnFamilyHandle* column_family,
@@ -1043,6 +1096,8 @@ class DBImpl : public DB {
   bool ShouldntRunManualCompaction(ManualCompaction* m);
   bool HaveManualCompaction(ColumnFamilyData* cfd);
   bool MCOverlap(ManualCompaction* m, ManualCompaction* m1);
+
+  [[maybe_unused]] yb::Cgroup* task_cgroup_ = nullptr;
 };
 
 // Sanitize db options.  The caller should delete result.info_log if

@@ -1,4 +1,4 @@
-// Copyright (c) YugaByte, Inc.
+// Copyright (c) YugabyteDB, Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License"); you may not use this file except
 // in compliance with the License.  You may obtain a copy of the License at
@@ -14,6 +14,7 @@
 #include "yb/util/bytes_formatter.h"
 
 #include "yb/gutil/stringprintf.h"
+#include "yb/gutil/strings/ascii_ctype.h"
 #include "yb/gutil/strings/substitute.h"
 
 #include "yb/util/cast.h"
@@ -44,8 +45,9 @@ string FormatBytesAsStr(const char* data,
   result.push_back(quote);
   const char* end = data + n;
 
-  // Not including the current character we're looking at. Cast to a signed int to avoid underflow.
-  int64_t bytes_left = static_cast<int64_t>(n - 1);
+  // Not including the current character we're looking at.
+  // In case of n == 0, data == end, so we don't enter loop at all.
+  size_t bytes_left = n - 1;
 
   for (const char* p = data; p != end; ++p, --bytes_left) {
     uint8_t c = static_cast<uint8_t>(*p);
@@ -54,7 +56,7 @@ string FormatBytesAsStr(const char* data,
       result.push_back(quote);
     } else if (c == '\\') {
       result.append("\\\\");
-    } else if (isgraph(c) || c == ' ') {
+    } else if (ascii_isprint(c)) {
       result.push_back(c);
     } else {
       result.append(StringPrintf("\\x%02x", c));

@@ -3,43 +3,37 @@ title: Upgrade YugabyteDB Anywhere
 headerTitle: Upgrade YugabyteDB Anywhere
 linkTitle: Upgrade
 description: Upgrade YugabyteDB Anywhere.
-image: /images/section_icons/manage/enterprise.png
+aliases:
+  - /stable/yugabyte-platform/upgrade/upgrade-yp-replicated/
 menu:
   stable_yugabyte-platform:
     parent: yugabytedb-anywhere
     identifier: upgrade
-    weight: 649
+    weight: 700
 type: indexpage
 ---
 
-You can upgrade YugabyteDB Anywhere to a newer version.
+Keep YugabyteDB Anywhere up to date for the latest fixes and improvements, and to be able to [upgrade your universes](../manage-deployments/upgrade-software/) to the latest version of YugabyteDB. You cannot upgrade a universe to a version of YugabyteDB that is later than the version of YugabyteDB Anywhere.
 
-<div class="row">
+You can upgrade YBA using the following methods:
 
-  <div class="col-12 col-md-6 col-lg-12 col-xl-6">
-    <a class="section-link icon-offset" href="upgrade-yp-replicated/">
-      <div class="head">
-        <img class="icon" src="/images/section_icons/manage/backup.png" aria-hidden="true" />
-        <div class="title">Upgrade using Replicated</div>
-      </div>
-      <div class="body">
-        Use Replicated to upgrade YugabyteDB Anywhere
-      </div>
-    </a>
-  </div>
+| Method | Using | Use If |
+| :--- | :--- | :--- |
+| YBA&nbsp;Installer | yba-ctl CLI | Your installation already uses YBA Installer. |
+| Kubernetes | Helm chart | You're deploying in Kubernetes. |
 
+{{<index/block>}}
 
-  <div class="col-12 col-md-6 col-lg-12 col-xl-6">
-    <a class="section-link icon-offset" href="upgrade-yp-kubernetes/">
-      <div class="head">
-        <img class="icon" src="/images/section_icons/manage/backup.png" aria-hidden="true" />
-        <div class="title">Upgrade the Kubernetes installation</div>
-      </div>
-      <div class="body">
-        Upgrade YugabyteDB Anywhere installed on Kubernetes
-      </div>
-    </a>
-  </div>
+  {{<index/item
+    title="Prepare for your upgrade"
+    body="Review changes that may affect your upgrade."
+    href="prepare-to-upgrade/"
+    icon="fa-thin fa-diamond-exclamation">}}
 
+  {{<index/item
+    title="Upgrade YugabyteDB Anywhere"
+    body="Upgrade your YugabyteDB Anywhere installation."
+    href="upgrade-yp-installer/"
+    icon="fa-thin fa-up-from-bracket">}}
 
-</div>
+{{</index/block>}}

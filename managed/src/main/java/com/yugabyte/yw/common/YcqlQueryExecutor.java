@@ -1,16 +1,17 @@
-// Copyright (c) YugaByte, Inc.
+// Copyright (c) YugabyteDB, Inc.
 
 package com.yugabyte.yw.common;
 
 import static play.libs.Json.newObject;
 import static play.libs.Json.toJson;
 
-import com.datastax.driver.core.Cluster;
-import com.datastax.driver.core.ColumnDefinitions;
-import com.datastax.driver.core.ResultSet;
-import com.datastax.driver.core.Row;
-import com.datastax.driver.core.Session;
-import com.datastax.driver.core.exceptions.AuthenticationException;
+import com.datastax.oss.driver.api.core.AllNodesFailedException;
+import com.datastax.oss.driver.api.core.CqlSession;
+import com.datastax.oss.driver.api.core.CqlSessionBuilder;
+import com.datastax.oss.driver.api.core.auth.AuthenticationException;
+import com.datastax.oss.driver.api.core.cql.ColumnDefinitions;
+import com.datastax.oss.driver.api.core.cql.ResultSet;
+import com.datastax.oss.driver.api.core.cql.Row;
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.node.ObjectNode;
 import com.google.inject.Singleton;
@@ -18,7 +19,6 @@ import com.yugabyte.yw.forms.DatabaseSecurityFormData;
 import com.yugabyte.yw.forms.DatabaseUserFormData;
 import com.yugabyte.yw.forms.RunQueryFormData;
 import com.yugabyte.yw.models.Universe;
-import java.io.Closeable;
 import java.net.InetSocketAddress;
 import java.util.ArrayList;
 import java.util.HashMap;
@@ -43,10 +43,11 @@ public class YcqlQueryExecutor {
     // --use_cassandra_authentication=true
     // This is always true if the universe was created via cloud.
     RunQueryFormData ycqlQuery = new RunQueryFormData();
-    ycqlQuery.query =
+    ycqlQuery.setQuery(
         String.format(
             "CREATE ROLE '%s' WITH SUPERUSER=true AND LOGIN=true AND PASSWORD='%s'",
-            Util.escapeSingleQuotesOnly(data.username), Util.escapeSingleQuotesOnly(data.password));
+            Util.escapeSingleQuotesOnly(data.username),
+            Util.escapeSingleQuotesOnly(data.password)));
     JsonNode ycqlResponse =
         executeQuery(universe, ycqlQuery, true, data.ycqlAdminUsername, data.ycqlAdminPassword);
     LOG.info("Creating YCQL user, result: " + ycqlResponse.toString());
@@ -57,17 +58,16 @@ public class YcqlQueryExecutor {
   }
 
   public void validateAdminPassword(Universe universe, DatabaseSecurityFormData data) {
-    CassandraConnection cc = null;
-    try {
-      cc =
-          createCassandraConnection(
-              universe.universeUUID, true, data.ycqlAdminUsername, data.ycqlAdminPassword);
-    } catch (AuthenticationException e) {
-      LOG.warn(e.getMessage());
-      throw new PlatformServiceException(Http.Status.UNAUTHORIZED, e.getMessage());
-    } finally {
-      if (cc != null) {
-        cc.close();
+    try (CqlSession session =
+        createCassandraConnection(
+            universe.getUniverseUUID(), true, data.ycqlAdminUsername, data.ycqlAdminPassword)) {
+      // Connection created
+    } catch (AllNodesFailedException e) {
+      if (isAuthenticationException(e)) {
+        LOG.warn(e.getMessage());
+        throw new PlatformServiceException(Http.Status.UNAUTHORIZED, e.getMessage());
+      } else {
+        throw e;
       }
     }
   }
@@ -79,11 +79,11 @@ public class YcqlQueryExecutor {
     // --use_cassandra_authentication=true
     // This is always true if the universe was created via cloud.
     RunQueryFormData ycqlQuery = new RunQueryFormData();
-    ycqlQuery.query =
+    ycqlQuery.setQuery(
         String.format(
             "ALTER ROLE '%s' WITH PASSWORD='%s'",
             Util.escapeSingleQuotesOnly(data.ycqlAdminUsername),
-            Util.escapeSingleQuotesOnly(data.ycqlAdminPassword));
+            Util.escapeSingleQuotesOnly(data.ycqlAdminPassword)));
     JsonNode ycqlResponse =
         executeQuery(universe, ycqlQuery, true, data.ycqlAdminUsername, data.ycqlCurrAdminPassword);
     LOG.info("Updating YCQL user, result: " + ycqlResponse.toString());
@@ -93,36 +93,21 @@ public class YcqlQueryExecutor {
     }
   }
 
-  private static class CassandraConnection implements Closeable {
-    Cluster cluster = null;
-    Session session = null;
-
-    @Override
-    public void close() {
-      session.close();
-      cluster.close();
-    }
-  }
-
-  private CassandraConnection createCassandraConnection(
+  private CqlSession createCassandraConnection(
       UUID universeUUID, Boolean authEnabled, String username, String password) {
-    CassandraConnection cc = new CassandraConnection();
     List<InetSocketAddress> addresses = Util.getNodesAsInet(universeUUID);
     if (addresses.isEmpty()) {
-      return cc;
+      throw new RuntimeException("Addresses list is empty for universe " + universeUUID);
     }
-    Cluster.Builder builder = Cluster.builder().addContactPointsWithPorts(addresses);
+    CqlSessionBuilder builder = CqlSession.builder().addContactPoints(addresses);
     if (authEnabled) {
-      builder.withCredentials(username.trim(), password.trim());
+      builder.withAuthCredentials(username.trim(), password.trim());
     }
     String certificate = Universe.getOrBadRequest(universeUUID).getCertificateClientToNode();
     if (certificate != null) {
-      builder.withSSL(SslHelper.getSSLOptions(certificate));
+      builder.withSslEngineFactory(SslHelper.getSSLOptions(certificate));
     }
-    cc.cluster = builder.build();
-
-    cc.session = cc.cluster.connect();
-    return cc;
+    return builder.build();
   }
 
   private List<Map<String, Object>> resultSetToMap(ResultSet result) {
@@ -134,7 +119,7 @@ public class YcqlQueryExecutor {
       Map<String, Object> row = new HashMap<>();
       for (int i = 0; i < columnCount; i++) {
         // Note that the index is 1-based
-        String colName = rsmd.getName(i);
+        String colName = rsmd.get(i).getName().toString();
         Object colVal = currRow.getObject(i);
         row.put(colName, colVal);
       }
@@ -172,32 +157,36 @@ public class YcqlQueryExecutor {
       String username,
       String password) {
     ObjectNode response = newObject();
-    CassandraConnection cc = null;
-    try {
-      cc = createCassandraConnection(universe.universeUUID, authEnabled, username, password);
-    } catch (AuthenticationException e) {
-      response.put("error", AUTH_ERR_MSG);
-      return response;
+    try (CqlSession session =
+        createCassandraConnection(universe.getUniverseUUID(), authEnabled, username, password)) {
+      try {
+        ResultSet rs = session.execute(queryParams.getQuery());
+        if (rs.iterator().hasNext()) {
+          List<Map<String, Object>> rows = resultSetToMap(rs);
+          response.set("result", toJson(rows));
+        } else {
+          // For commands without a result we return only executed command identifier
+          // (SELECT/UPDATE/...). We can't return query itself to avoid logging of
+          // sensitive data.
+          response.put("queryType", getQueryType(queryParams.getQuery()));
+        }
+      } catch (Exception e) {
+        response.put("error", removeQueryFromErrorMessage(e.getMessage(), queryParams.getQuery()));
+      }
+    } catch (AllNodesFailedException e) {
+      if (isAuthenticationException(e)) {
+        response.put("error", AUTH_ERR_MSG);
+      } else {
+        response.put("error", e.getMessage());
+      }
     }
 
-    try {
-      ResultSet rs = cc.session.execute(queryParams.query);
-      if (rs.iterator().hasNext()) {
-        List<Map<String, Object>> rows = resultSetToMap(rs);
-        response.set("result", toJson(rows));
-      } else {
-        // For commands without a result we return only executed command identifier
-        // (SELECT/UPDATE/...). We can't return query itself to avoid logging of
-        // sensitive data.
-        response.put("queryType", getQueryType(queryParams.query));
-      }
-    } catch (Exception e) {
-      response.put("error", removeQueryFromErrorMessage(e.getMessage(), queryParams.query));
-    } finally {
-      if (cc != null) {
-        cc.close();
-      }
-    }
     return response;
+  }
+
+  private boolean isAuthenticationException(AllNodesFailedException exception) {
+    return exception.getAllErrors().values().stream()
+        .flatMap(List::stream)
+        .anyMatch(e -> e instanceof AuthenticationException);
   }
 }

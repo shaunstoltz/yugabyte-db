@@ -15,9 +15,9 @@
 // specific language governing permissions and limitations
 // under the License.
 //
-// The following only applies to changes made to this file as part of YugaByte development.
+// The following only applies to changes made to this file as part of YugabyteDB development.
 //
-// Portions Copyright (c) YugaByte, Inc.
+// Portions Copyright (c) YugabyteDB, Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License"); you may not use this file except
 // in compliance with the License.  You may obtain a copy of the License at
@@ -43,6 +43,10 @@
 
 #pragma once
 
+#include "yb/server/webserver.h"
+#include "yb/util/metric_entity.h"
+#include "yb/util/jsonwriter.h"
+
 namespace yb {
 
 class MetricRegistry;
@@ -57,6 +61,9 @@ class RpcServerBase;
 // logs and configuration flags.
 void AddDefaultPathHandlers(Webserver* webserver);
 
+// Prints out memory allocation statistics.
+void MemUsageHandler(const Webserver::WebRequest& req, Webserver::WebResponse* resp);
+
 // Adds an endpoint to get metrics in JSON format.
 void RegisterMetricsJsonHandler(Webserver* webserver, const MetricRegistry* const metrics);
 
@@ -64,5 +71,9 @@ void RegisterMetricsJsonHandler(Webserver* webserver, const MetricRegistry* cons
 void RegisterPathUsageHandler(Webserver* webserver, FsManager* fsmanager);
 
 void RegisterTlsHandler(Webserver* webserver, server::RpcServerBase* server);
+
+void ParseRequestOptions(
+    const Webserver::WebRequest& req, MetricPrometheusOptions* prometheus_opts,
+    MetricJsonOptions* json_opts = nullptr, JsonWriter::Mode* json_mode = nullptr);
 
 } // namespace yb

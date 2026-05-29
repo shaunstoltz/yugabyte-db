@@ -3,9 +3,9 @@
 //  LICENSE file in the root directory of this source tree. An additional grant
 //  of patent rights can be found in the PATENTS file in the same directory.
 //
-// The following only applies to changes made to this file as part of YugaByte development.
+// The following only applies to changes made to this file as part of YugabyteDB development.
 //
-// Portions Copyright (c) YugaByte, Inc.
+// Portions Copyright (c) YugabyteDB, Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License"); you may not use this file except
 // in compliance with the License.  You may obtain a copy of the License at
@@ -50,21 +50,21 @@ class ColumnFamilyData;
  * ReleaseIter or automatically (as needed on space pressure or age.)
  * The iterator is recreated using the saved original arguments.
  */
-class ManagedIterator : public Iterator {
+class ManagedIterator final : public Iterator {
  public:
   ManagedIterator(DBImpl* db, const ReadOptions& read_options,
                   ColumnFamilyData* cfd);
   virtual ~ManagedIterator();
 
-  virtual void SeekToLast() override;
-  virtual void Prev() override;
-  virtual bool Valid() const override;
-  void SeekToFirst() override;
-  virtual void Seek(const Slice& target) override;
-  virtual void Next() override;
-  virtual Slice key() const override;
-  virtual Slice value() const override;
-  virtual Status status() const override;
+  const KeyValueEntry& SeekToLast() override;
+  const KeyValueEntry& Prev() override;
+  const KeyValueEntry& Entry() const override;
+  const KeyValueEntry& SeekToFirst() override;
+  const KeyValueEntry& Seek(Slice target) override;
+  const KeyValueEntry& Next() override;
+  void UpdateFilterKey(Slice user_key_for_filter, Slice seek_key) override;
+
+  Status status() const override;
   void ReleaseIter(bool only_old);
   void SetDropOld(bool only_old) {
     only_drop_old_ = read_options_.tailing || only_old;
@@ -87,8 +87,8 @@ class ManagedIterator : public Iterator {
   std::unique_ptr<Iterator> mutable_iter_;
   // internal iterator status
   Status status_;
-  bool valid_;
 
+  KeyValueEntry entry_;
   IterKey cached_key_;
   IterKey cached_value_;
 

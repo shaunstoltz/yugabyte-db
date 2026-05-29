@@ -3,9 +3,9 @@
 // LICENSE file in the root directory of this source tree. An additional grant
 // of patent rights can be found in the PATENTS file in the same directory.
 //
-// The following only applies to changes made to this file as part of YugaByte development.
+// The following only applies to changes made to this file as part of YugabyteDB development.
 //
-// Portions Copyright (c) YugaByte, Inc.
+// Portions Copyright (c) YugabyteDB, Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License"); you may not use this file except
 // in compliance with the License.  You may obtain a copy of the License at
@@ -33,6 +33,8 @@
 
 #include "yb/util/random_util.h"
 #include "yb/util/status_log.h"
+
+DECLARE_bool(TEST_allow_table_option_compressed_block_cache);
 
 using std::string;
 using std::unique_ptr;
@@ -67,9 +69,6 @@ SpecialEnv::SpecialEnv(Env* base)
   table_write_callback_ = nullptr;
 }
 
-const string DBHolder::kKeyId = "key_id";
-const string DBHolder::kKeyFile = "universe_key_file";
-
 DBHolder::DBHolder(const std::string path, bool encryption_enabled)
     : option_config_(kDefault),
       mem_env_(!getenv("MEM_ENV") ? nullptr : new MockEnv(Env::Default())),
@@ -95,9 +94,9 @@ DBHolder::DBHolder(const std::string path, bool encryption_enabled)
 
 DBHolder::~DBHolder() {
   Env::Default()->CleanupFile(kKeyFile);
-  rocksdb::SyncPoint::GetInstance()->DisableProcessing();
-  rocksdb::SyncPoint::GetInstance()->LoadDependency({});
-  rocksdb::SyncPoint::GetInstance()->ClearAllCallBacks();
+  yb::SyncPoint::GetInstance()->DisableProcessing();
+  yb::SyncPoint::GetInstance()->LoadDependency({});
+  yb::SyncPoint::GetInstance()->ClearAllCallBacks();
   Close();
   Options options;
   options.db_paths.emplace_back(dbname_, 0);
@@ -344,6 +343,7 @@ Options DBHolder::CurrentOptions(
       options.num_levels = 8;
       break;
     case kCompressedBlockCache:
+      ANNOTATE_UNPROTECTED_WRITE(FLAGS_TEST_allow_table_option_compressed_block_cache) = true;
       options.allow_mmap_writes = true;
       table_options.block_cache_compressed = NewLRUCache(8 * 1024 * 1024);
       break;
@@ -596,7 +596,7 @@ std::string DBHolder::Contents(int cf) {
   std::string result;
   Iterator* iter = (cf == 0) ? db_->NewIterator(ReadOptions())
                              : db_->NewIterator(ReadOptions(), handles_[cf]);
-  for (iter->SeekToFirst(); iter->Valid(); iter->Next()) {
+  for (iter->SeekToFirst(); EXPECT_RESULT(iter->CheckedValid()); iter->Next()) {
     std::string s = IterStatus(iter);
     result.push_back('(');
     result.append(s);
@@ -606,7 +606,7 @@ std::string DBHolder::Contents(int cf) {
 
   // Check reverse iteration results are the reverse of forward results
   unsigned int matched = 0;
-  for (iter->SeekToLast(); iter->Valid(); iter->Prev()) {
+  for (iter->SeekToLast(); EXPECT_RESULT(iter->CheckedValid()); iter->Prev()) {
     EXPECT_LT(matched, forward.size());
     EXPECT_EQ(IterStatus(iter), forward[forward.size() - matched - 1]);
     matched++;
@@ -923,7 +923,7 @@ std::string DBHolder::IterStatus(Iterator* iter) {
   if (iter->Valid()) {
     result = iter->key().ToString() + "->" + iter->value().ToString();
   } else {
-    result = "(invalid)";
+    result = "(invalid) " + iter->status().ToString();
   }
   return result;
 }
@@ -1074,6 +1074,46 @@ std::unordered_map<std::string, uint64_t> DBHolder::GetAllSSTFiles(
     }
   }
   return res;
+}
+
+Status DelayedCompactionFeed::Feed(const Slice& key, const Slice& value) {
+  auto status = next_feed_.Feed(key, value);
+  const auto ns = delay_ns_.load();
+  if (ns > 0) {
+    base::SleepForNanoseconds(ns);
+  }
+  return status;
+}
+
+void CompactionContextFactoryDelayer::SetDelayForNextCompactions(yb::MonoDelta delay) {
+  data_->delay_ns = delay.ToNanoseconds();
+}
+
+void CompactionContextFactoryDelayer::SetDelayForAllCompactions(yb::MonoDelta delay) {
+  data_->delay_ns = delay.ToNanoseconds();
+  std::lock_guard lock(data_->mutex);
+  for (auto* context : data_->contexts) {
+    context->Feed()->SetDelayNs(data_->delay_ns);
+  }
+}
+
+std::shared_ptr<CompactionContextFactory> CompactionContextFactoryDelayer::WrapFactory(
+    std::shared_ptr<CompactionContextFactory> original) {
+  return std::make_shared<CompactionContextFactory>(
+      [original, data = data_](CompactionFeed* feed, const CompactionContextOptions& options) {
+        auto original_context = (*original)(feed, options);
+        auto result = std::make_unique<DelayedCompactionContext>(
+            std::move(original_context), data->delay_ns.load(),
+            [data](DelayedCompactionContext* context) {
+              std::lock_guard lock(data->mutex);
+              data->contexts.erase(context);
+            });
+        {
+          std::lock_guard lock(data->mutex);
+          data->contexts.insert(result.get());
+        }
+        return result;
+      });
 }
 
 void ConfigureLoggingToGlog(Options* options, const std::string& log_prefix) {

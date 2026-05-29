@@ -1,4 +1,4 @@
-// Copyright (c) YugaByte, Inc.
+// Copyright (c) YugabyteDB, Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License"); you may not use this file except
 // in compliance with the License.  You may obtain a copy of the License at
@@ -18,7 +18,7 @@
 #include "yb/common/hybrid_time.h"
 
 #include "yb/docdb/consensus_frontier.h"
-#include "yb/docdb/doc_ttl_util.h"
+#include "yb/dockv/doc_ttl_util.h"
 #include "yb/docdb/docdb_compaction_context.h"
 
 #include "yb/gutil/casts.h"
@@ -54,15 +54,17 @@ using std::unique_ptr;
 using std::vector;
 
 namespace {
-  const ExpiryMode CurrentExpiryMode() {
-    if (FLAGS_file_expiration_ignore_value_ttl) {
-      return EXP_TABLE_ONLY;
-    } else if (FLAGS_file_expiration_value_ttl_overrides_table_ttl) {
-      return EXP_TRUST_VALUE;
-    }
-    return EXP_NORMAL;
+
+ExpiryMode CurrentExpiryMode() {
+  if (FLAGS_file_expiration_ignore_value_ttl) {
+    return EXP_TABLE_ONLY;
+  } else if (FLAGS_file_expiration_value_ttl_overrides_table_ttl) {
+    return EXP_TRUST_VALUE;
   }
+  return EXP_NORMAL;
 }
+
+} // namespace
 
 ExpirationTime ExtractExpirationTime(const FileMetaData* file) {
   // If no frontier detected, return an expiration time that will not expire.
@@ -73,7 +75,7 @@ ExpirationTime ExtractExpirationTime(const FileMetaData* file) {
   // If the TTL expiration time is uninitialized, return a max expiration time with the
   // frontier's hybrid time.
   const auto ttl_expiry_ht =
-      consensus_frontier.max_value_level_ttl_expiration_time().GetValueOr(kNoExpiration);
+      consensus_frontier.max_value_level_ttl_expiration_time().GetValueOr(dockv::kNoExpiration);
 
   return ExpirationTime{
     .ttl_expiration_ht = ttl_expiry_ht,
@@ -81,22 +83,65 @@ ExpirationTime ExtractExpirationTime(const FileMetaData* file) {
   };
 }
 
-bool TtlIsExpired(const ExpirationTime expiry,
+Status CheckTtlFileExpirationConsistency(const rocksdb::FileMetaData& file, MonoDelta table_ttl) {
+  return CheckTtlFileExpirationConsistency(
+      table_ttl, ExtractExpirationTime(&file), CurrentExpiryMode());
+}
+
+Status CheckTtlFileExpirationConsistency(
+    MonoDelta table_ttl, ExpirationTime expiry, ExpiryMode mode) {
+  // If table_ttl is configured, then value expiration should not be later than table expiration.
+
+  // Check table level TTL is configured.
+  if (dockv::IsInvalidTTL(table_ttl)) {
+    return STATUS(InvalidArgument, "Table TTL is not configured");
+  }
+
+  if (!expiry.Valid()) {
+    return STATUS(InvalidArgument, "Expiry is not configured");
+  }
+
+  // Check table level TTL takes over value level TTL.
+  if (mode == EXP_TABLE_ONLY) {
+    return Status::OK();
+  }
+
+  // Get table expiration time.
+  const auto table_expiry = dockv::ComputeExpiration(expiry.created_ht, table_ttl);
+  if (table_expiry == dockv::kNoExpiration) {
+    return STATUS_FORMAT(RuntimeError,
+        "Failed to compute table TTL expiry value from '$0' and table ttl '$1'",
+        expiry.created_ht, table_ttl);
+  }
+
+  const auto value_expiry = expiry.ttl_expiration_ht;
+  if (value_expiry != dockv::kNoExpiration && value_expiry > table_expiry) {
+    return STATUS_FORMAT(IllegalState,
+        "Value TTL expiry '$0' is higher than table TTL expiry '$1'",
+        value_expiry, table_expiry);
+  }
+
+  return Status::OK();
+}
+
+bool TtlIsExpired(
+    const ExpirationTime expiry,
     const MonoDelta table_ttl,
     const HybridTime now,
     const ExpiryMode mode) {
   // If FLAGS_file_expiration_ignore_value_ttl is set, ignore the value level TTL
   // entirely and use only the default table TTL.
   const auto ttl_expiry_ht =
-      mode == EXP_TABLE_ONLY ? kUseDefaultTTL : expiry.ttl_expiration_ht;
+      mode == EXP_TABLE_ONLY ? dockv::kUseDefaultTTL : expiry.ttl_expiration_ht;
 
-  if (mode == EXP_TRUST_VALUE && ttl_expiry_ht.is_valid() && ttl_expiry_ht != kUseDefaultTTL) {
-    return HasExpiredTTL(ttl_expiry_ht, now);
+  if (mode == EXP_TRUST_VALUE && ttl_expiry_ht.is_valid() &&
+      ttl_expiry_ht != dockv::kUseDefaultTTL) {
+    return dockv::HasExpiredTTL(ttl_expiry_ht, now);
   }
 
-  auto file_expiry_ht = MaxExpirationFromValueAndTableTTL(
+  auto file_expiry_ht = dockv::MaxExpirationFromValueAndTableTTL(
       expiry.created_ht, table_ttl, ttl_expiry_ht);
-  return HasExpiredTTL(file_expiry_ht, now);
+  return dockv::HasExpiredTTL(file_expiry_ht, now);
 }
 
 bool IsLastKeyCreatedBeforeHistoryCutoff(ExpirationTime expiry, HybridTime history_cutoff) {
@@ -157,7 +202,21 @@ unique_ptr<CompactionFileFilter> DocDBCompactionFileFilterFactory::CreateCompact
   const HybridTime filter_ht = clock_->Now();
   auto history_retention = retention_policy_->GetRetentionDirective();
   MonoDelta table_ttl = history_retention.table_ttl;
-  HybridTime history_cutoff = history_retention.history_cutoff;
+  // For the sys catalog tablet, the expiration time is never set
+  // since it does not have TTL so the chosen
+  // history cutoff does not matter since the files will never expire. For tablets
+  // on tserver, only the primary_cutoff_ht will be valid and that can
+  // be used to detect expiration. Still, to be safe here we simply take the minimum
+  // of both.
+  HybridTime history_cutoff = HybridTime::kMax;
+  if (history_retention.history_cutoff.cotables_cutoff_ht) {
+    history_cutoff.MakeAtMost(
+        history_retention.history_cutoff.cotables_cutoff_ht);
+  }
+  if (history_retention.history_cutoff.primary_cutoff_ht) {
+    history_cutoff.MakeAtMost(
+        history_retention.history_cutoff.primary_cutoff_ht);
+  }
   HybridTime min_kept_ht = HybridTime::kMax;
   const ExpiryMode mode = CurrentExpiryMode();
 

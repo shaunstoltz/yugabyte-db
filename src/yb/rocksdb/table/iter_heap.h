@@ -3,9 +3,9 @@
 //  LICENSE file in the root directory of this source tree. An additional grant
 //  of patent rights can be found in the PATENTS file in the same directory.
 //
-// The following only applies to changes made to this file as part of YugaByte development.
+// The following only applies to changes made to this file as part of YugabyteDB development.
 //
-// Portions Copyright (c) YugaByte, Inc.
+// Portions Copyright (c) YugabyteDB, Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License"); you may not use this file except
 // in compliance with the License.  You may obtain a copy of the License at
@@ -27,12 +27,13 @@ namespace rocksdb {
 
 // When used with std::priority_queue, this comparison functor puts the
 // iterator with the max/largest key on top.
+template <typename IteratorType>
 class MaxIteratorComparator {
  public:
-  MaxIteratorComparator(const Comparator* comparator) :
+  explicit MaxIteratorComparator(const Comparator* comparator) :
     comparator_(comparator) {}
 
-  bool operator()(IteratorWrapper* a, IteratorWrapper* b) const {
+  bool operator()(IteratorType* a, IteratorType* b) const {
     return comparator_->Compare(a->key(), b->key()) < 0;
   }
  private:
@@ -41,12 +42,13 @@ class MaxIteratorComparator {
 
 // When used with std::priority_queue, this comparison functor puts the
 // iterator with the min/smallest key on top.
+template <typename IteratorType>
 class MinIteratorComparator {
  public:
-  MinIteratorComparator(const Comparator* comparator) :
+  explicit MinIteratorComparator(const Comparator* comparator) :
     comparator_(comparator) {}
 
-  bool operator()(IteratorWrapper* a, IteratorWrapper* b) const {
+  bool operator()(IteratorType* a, IteratorType* b) const {
     return comparator_->Compare(a->key(), b->key()) > 0;
   }
  private:

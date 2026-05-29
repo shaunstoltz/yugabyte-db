@@ -1,4 +1,4 @@
-// Copyright (c) YugaByte, Inc.
+// Copyright (c) YugabyteDB, Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License"); you may not use this file except
 // in compliance with the License.  You may obtain a copy of the License at
@@ -21,6 +21,8 @@
 #include "yb/docdb/docdb_fwd.h"
 
 #include "yb/tablet/tablet_fwd.h"
+
+#include "yb/util/operation_counter.h"
 #include "yb/util/result.h"
 
 namespace yb {
@@ -35,9 +37,8 @@ class AbstractTablet {
  public:
   virtual ~AbstractTablet() {}
 
-  virtual docdb::DocReadContextPtr GetDocReadContext(const std::string& table_id = "") const = 0;
-
-  virtual const docdb::YQLStorageIf& QLStorage() const = 0;
+  virtual docdb::DocReadContextPtr GetDocReadContext() const = 0;
+  virtual Result<docdb::DocReadContextPtr> GetDocReadContext(const std::string& table_id) const = 0;
 
   virtual TableType table_type() const = 0;
 
@@ -48,24 +49,31 @@ class AbstractTablet {
   //------------------------------------------------------------------------------------------------
   // Redis support.
   virtual Status HandleRedisReadRequest(
-      CoarseTimePoint deadline,
-      const ReadHybridTime& read_time,
-      const RedisReadRequestPB& redis_read_request,
-      RedisResponsePB* response) = 0;
+      const docdb::ReadOperationData& read_operation_data,
+      const RedisReadRequestMsg& redis_read_request,
+      RedisResponseMsg* response) = 0;
 
   //------------------------------------------------------------------------------------------------
   // CQL support.
   virtual Status HandleQLReadRequest(
-      CoarseTimePoint deadline,
-      const ReadHybridTime& read_time,
-      const QLReadRequestPB& ql_read_request,
-      const TransactionMetadataPB& transaction_metadata,
+      const docdb::ReadOperationData& read_operation_data,
+      const QLReadRequestMsg& ql_read_request,
+      const TransactionMetadataMsg& transaction_metadata,
       QLReadRequestResult* result,
       WriteBuffer* rows_data) = 0;
 
-  virtual Status CreatePagingStateForRead(const QLReadRequestPB& ql_read_request,
-                                                  const size_t row_count,
-                                                  QLResponsePB* response) const = 0;
+  Status HandleQLReadRequest(
+      const docdb::ReadOperationData& read_operation_data,
+      const QLReadRequestMsg& ql_read_request,
+      const TransactionOperationContext& txn_op_context,
+      const docdb::YQLStorageIf& ql_storage,
+      std::reference_wrapper<const ScopedRWOperation> pending_op,
+      QLReadRequestResult* result,
+      WriteBuffer* rows_data);
+
+  virtual Status CreatePagingStateForRead(const QLReadRequestMsg& ql_read_request,
+                                          const size_t row_count,
+                                          QLResponseMsg* response) const = 0;
 
   virtual TabletRetentionPolicy* RetentionPolicy() = 0;
 
@@ -90,12 +98,11 @@ class AbstractTablet {
   }
 
   virtual Status HandlePgsqlReadRequest(
-      CoarseTimePoint deadline,
-      const ReadHybridTime& read_time,
+      const docdb::ReadOperationData& read_operation_data,
       bool is_explicit_request_read_time,
-      const PgsqlReadRequestPB& ql_read_request,
-      const TransactionMetadataPB& transaction_metadata,
-      const SubTransactionMetadataPB& subtransaction_metadata,
+      const PgsqlReadRequestMsg& ql_read_request,
+      const TransactionMetadataMsg& transaction_metadata,
+      const SubTransactionMetadataMsg& subtransaction_metadata,
       PgsqlReadRequestResult* result) = 0;
 
   virtual Result<IsolationLevel> GetIsolationLevel(const LWTransactionMetadataPB& transaction) = 0;
@@ -105,25 +112,13 @@ class AbstractTablet {
   // PGSQL support.
   //-----------------------------------------------------------------------------------------------
 
-  Status HandleQLReadRequest(
-      CoarseTimePoint deadline,
-      const ReadHybridTime& read_time,
-      const QLReadRequestPB& ql_read_request,
-      const TransactionOperationContext& txn_op_context,
-      QLReadRequestResult* result,
-      WriteBuffer* rows_data);
+  virtual Status CreatePagingStateForRead(const PgsqlReadRequestMsg& pgsql_read_request,
+                                          size_t row_count,
+                                          PgsqlResponseMsg* response) const = 0;
 
-  virtual Status CreatePagingStateForRead(const PgsqlReadRequestPB& pgsql_read_request,
-                                                  const size_t row_count,
-                                                  PgsqlResponsePB* response) const = 0;
-
-  Status ProcessPgsqlReadRequest(CoarseTimePoint deadline,
-                                 const ReadHybridTime& read_time,
-                                 bool is_explicit_request_read_time,
-                                 const PgsqlReadRequestPB& pgsql_read_request,
-                                 const std::shared_ptr<TableInfo>& table_info,
-                                 const TransactionOperationContext& txn_op_context,
-                                 PgsqlReadRequestResult* result);
+  Status ProcessPgsqlReadRequest(
+      const docdb::PgsqlReadOperationData& op_data,
+      PgsqlReadRequestResult* result);
 
   virtual bool IsTransactionalRequest(bool is_ysql_request) const = 0;
 

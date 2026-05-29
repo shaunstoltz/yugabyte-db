@@ -1,4 +1,4 @@
-// Copyright (c) YugaByte, Inc.
+// Copyright (c) YugabyteDB, Inc.
 
 package com.yugabyte.yw.cloud;
 
@@ -11,6 +11,11 @@ import static com.yugabyte.yw.cloud.PublicCloudConstants.IO1_SIZE;
 import static com.yugabyte.yw.cloud.PublicCloudConstants.StorageType;
 import static com.yugabyte.yw.common.ApiUtils.getDummyDeviceInfo;
 import static com.yugabyte.yw.common.ApiUtils.getDummyUserIntent;
+import static com.yugabyte.yw.models.helpers.NodeDetails.NodeState.BeingDecommissioned;
+import static com.yugabyte.yw.models.helpers.NodeDetails.NodeState.Decommissioned;
+import static com.yugabyte.yw.models.helpers.NodeDetails.NodeState.Stopped;
+import static com.yugabyte.yw.models.helpers.NodeDetails.NodeState.Terminating;
+import static com.yugabyte.yw.models.helpers.NodeDetails.NodeState.ToBeAdded;
 import static com.yugabyte.yw.models.helpers.NodeDetails.NodeState.ToBeRemoved;
 import static org.hamcrest.CoreMatchers.equalTo;
 import static org.hamcrest.CoreMatchers.notNullValue;
@@ -20,6 +25,7 @@ import static org.mockito.Mockito.mock;
 import com.yugabyte.yw.cloud.UniverseResourceDetails.Context;
 import com.yugabyte.yw.common.FakeDBApplication;
 import com.yugabyte.yw.common.ModelFactory;
+import com.yugabyte.yw.common.PlacementInfoUtil;
 import com.yugabyte.yw.forms.UniverseDefinitionTaskParams;
 import com.yugabyte.yw.forms.UniverseDefinitionTaskParams.UserIntent;
 import com.yugabyte.yw.models.AvailabilityZone;
@@ -31,6 +37,9 @@ import com.yugabyte.yw.models.Region;
 import com.yugabyte.yw.models.helpers.CloudSpecificInfo;
 import com.yugabyte.yw.models.helpers.DeviceInfo;
 import com.yugabyte.yw.models.helpers.NodeDetails;
+import com.yugabyte.yw.models.helpers.PlacementInfo;
+import java.util.Collection;
+import java.util.Collections;
 import java.util.Iterator;
 import java.util.Set;
 import java.util.UUID;
@@ -59,9 +68,21 @@ public class UniverseResourceDetailsTest extends FakeDBApplication {
   private int throughput = 1000;
   private NodeDetails sampleNodeDetails;
   private Context context;
+  private static final int NUM_NODES = 3;
+
+  private PlacementInfo setupPlacement() {
+    return setupPlacement(setUpNodeDetailsSet());
+  }
+
+  private PlacementInfo setupPlacement(Collection<NodeDetails> nodes) {
+    PlacementInfo placementInfo = new PlacementInfo();
+    PlacementInfoUtil.addPlacementZone(
+        nodes.iterator().next().azUuid, placementInfo, 1, nodes.size());
+    return placementInfo;
+  }
 
   private Set<NodeDetails> setUpNodeDetailsSet() {
-    return setUpNodeDetailsSet(3);
+    return setUpNodeDetailsSet(NUM_NODES);
   }
 
   private Set<NodeDetails> setUpNodeDetailsSet(int numNodes) {
@@ -95,12 +116,12 @@ public class UniverseResourceDetailsTest extends FakeDBApplication {
       int numNodes, BiConsumer<NodeDetails, Integer> modifier) {
 
     // Set up instance type
-    InstanceType.upsert(provider.uuid, testInstanceType, 10, 5.5, null);
+    InstanceType.upsert(provider.getUuid(), testInstanceType, 10, 5.5, null);
 
     // Set up PriceComponent
     PriceComponent.PriceDetails instanceDetails = new PriceComponent.PriceDetails();
     instanceDetails.pricePerHour = instancePrice;
-    PriceComponent.upsert(provider.uuid, region.code, testInstanceType, instanceDetails);
+    PriceComponent.upsert(provider.getUuid(), region.getCode(), testInstanceType, instanceDetails);
 
     // Set up userIntent
     UserIntent userIntent =
@@ -108,7 +129,7 @@ public class UniverseResourceDetailsTest extends FakeDBApplication {
 
     // Set up TaskParams
     UniverseDefinitionTaskParams params = new UniverseDefinitionTaskParams();
-    params.upsertPrimaryCluster(userIntent, null);
+    params.upsertPrimaryCluster(userIntent, null, setupPlacement());
     sampleNodeDetails.placementUuid = params.getPrimaryCluster().uuid;
     params.nodeDetailsSet = setUpNodeDetailsSet(numNodes, modifier);
     context = new Context(null, customer, params);
@@ -116,14 +137,19 @@ public class UniverseResourceDetailsTest extends FakeDBApplication {
   }
 
   private UniverseDefinitionTaskParams setUpValidEBS(PublicCloudConstants.StorageType storageType) {
+    return setUpValidEBS(storageType, false);
+  }
+
+  private UniverseDefinitionTaskParams setUpValidEBS(
+      PublicCloudConstants.StorageType storageType, boolean createEdit) {
 
     // Set up instance type
-    InstanceType.upsert(provider.uuid, testInstanceType, 10, 5.5, null);
+    InstanceType.upsert(provider.getUuid(), testInstanceType, 10, 5.5, null);
 
     // Set up PriceComponents
     PriceComponent.PriceDetails instanceDetails = new PriceComponent.PriceDetails();
     instanceDetails.pricePerHour = instancePrice;
-    PriceComponent.upsert(provider.uuid, region.code, testInstanceType, instanceDetails);
+    PriceComponent.upsert(provider.getUuid(), region.getCode(), testInstanceType, instanceDetails);
     PriceComponent.PriceDetails sizeDetails;
     PriceComponent.PriceDetails piopsDetails;
     PriceComponent.PriceDetails throughputDetails;
@@ -131,26 +157,27 @@ public class UniverseResourceDetailsTest extends FakeDBApplication {
       case IO1:
         piopsDetails = new PriceComponent.PriceDetails();
         piopsDetails.pricePerHour = piopsPrice;
-        PriceComponent.upsert(provider.uuid, region.code, IO1_PIOPS, piopsDetails);
+        PriceComponent.upsert(provider.getUuid(), region.getCode(), IO1_PIOPS, piopsDetails);
         sizeDetails = new PriceComponent.PriceDetails();
         sizeDetails.pricePerHour = sizePrice;
-        PriceComponent.upsert(provider.uuid, region.code, IO1_SIZE, sizeDetails);
+        PriceComponent.upsert(provider.getUuid(), region.getCode(), IO1_SIZE, sizeDetails);
         break;
       case GP2:
         sizeDetails = new PriceComponent.PriceDetails();
         sizeDetails.pricePerHour = sizePrice;
-        PriceComponent.upsert(provider.uuid, region.code, GP2_SIZE, sizeDetails);
+        PriceComponent.upsert(provider.getUuid(), region.getCode(), GP2_SIZE, sizeDetails);
         break;
       case GP3:
         piopsDetails = new PriceComponent.PriceDetails();
         piopsDetails.pricePerHour = piopsPrice;
-        PriceComponent.upsert(provider.uuid, region.code, GP3_PIOPS, piopsDetails);
+        PriceComponent.upsert(provider.getUuid(), region.getCode(), GP3_PIOPS, piopsDetails);
         sizeDetails = new PriceComponent.PriceDetails();
         sizeDetails.pricePerHour = sizePrice;
-        PriceComponent.upsert(provider.uuid, region.code, GP3_SIZE, sizeDetails);
+        PriceComponent.upsert(provider.getUuid(), region.getCode(), GP3_SIZE, sizeDetails);
         throughputDetails = new PriceComponent.PriceDetails();
         throughputDetails.pricePerHour = throughputPrice;
-        PriceComponent.upsert(provider.uuid, region.code, GP3_THROUGHPUT, throughputDetails);
+        PriceComponent.upsert(
+            provider.getUuid(), region.getCode(), GP3_THROUGHPUT, throughputDetails);
         break;
       default:
         break;
@@ -167,11 +194,11 @@ public class UniverseResourceDetailsTest extends FakeDBApplication {
 
     // Set up TaskParams
     UniverseDefinitionTaskParams params = new UniverseDefinitionTaskParams();
-    params.upsertPrimaryCluster(userIntent, null);
+    params.upsertPrimaryCluster(userIntent, null, setupPlacement());
     sampleNodeDetails.placementUuid = params.getPrimaryCluster().uuid;
     params.nodeDetailsSet = setUpNodeDetailsSet();
 
-    context = new Context(null, customer, params);
+    context = new Context(null, customer, params, createEdit);
     return params;
   }
 
@@ -179,16 +206,16 @@ public class UniverseResourceDetailsTest extends FakeDBApplication {
       PublicCloudConstants.StorageType storageType) {
 
     // Set up instance type
-    InstanceType.upsert(provider.uuid, testInstanceType, 10, 5.5, null);
+    InstanceType.upsert(provider.getUuid(), testInstanceType, 10, 5.5, null);
 
     // Set up PriceComponents
     PriceComponent.PriceDetails sizeDetails;
     sizeDetails = new PriceComponent.PriceDetails();
     sizeDetails.pricePerHour = sizePrice;
-    PriceComponent.upsert(provider.uuid, region.code, GP2_SIZE, sizeDetails);
+    PriceComponent.upsert(provider.getUuid(), region.getCode(), GP2_SIZE, sizeDetails);
     PriceComponent.PriceDetails emrDetails = new PriceComponent.PriceDetails();
     emrDetails.pricePerHour = 0.68;
-    PriceComponent.upsert(provider.uuid, region.code, "c4.large", emrDetails);
+    PriceComponent.upsert(provider.getUuid(), region.getCode(), "c4.large", emrDetails);
 
     // Set up DeviceInfo
     DeviceInfo deviceInfo = getDummyDeviceInfo(numVolumes, volumeSize);
@@ -201,7 +228,7 @@ public class UniverseResourceDetailsTest extends FakeDBApplication {
 
     // Set up TaskParams
     UniverseDefinitionTaskParams params = new UniverseDefinitionTaskParams();
-    params.upsertPrimaryCluster(userIntent, null);
+    params.upsertPrimaryCluster(userIntent, null, setupPlacement());
     sampleNodeDetails.placementUuid = params.getPrimaryCluster().uuid;
     params.nodeDetailsSet = setUpNodeDetailsSet();
     context = new Context(null, customer, params);
@@ -213,11 +240,11 @@ public class UniverseResourceDetailsTest extends FakeDBApplication {
       PublicCloudConstants.StorageType storageType) {
 
     // Set up instance type
-    InstanceType.upsert(provider.uuid, testInstanceType, 10, 5.5, null);
+    InstanceType.upsert(provider.getUuid(), testInstanceType, 10, 5.5, null);
 
     // Set up null PriceComponents
-    PriceComponent.upsert(provider.uuid, region.code, GP2_SIZE, null);
-    PriceComponent.upsert(provider.uuid, region.code, "c4.large", null);
+    PriceComponent.upsert(provider.getUuid(), region.getCode(), GP2_SIZE, null);
+    PriceComponent.upsert(provider.getUuid(), region.getCode(), "c4.large", null);
 
     // Set up DeviceInfo
     DeviceInfo deviceInfo = getDummyDeviceInfo(numVolumes, volumeSize);
@@ -230,10 +257,10 @@ public class UniverseResourceDetailsTest extends FakeDBApplication {
 
     // Set up TaskParams
     UniverseDefinitionTaskParams params = new UniverseDefinitionTaskParams();
-    params.upsertPrimaryCluster(userIntent, null);
+    params.upsertPrimaryCluster(userIntent, null, setupPlacement());
     sampleNodeDetails.placementUuid = params.getPrimaryCluster().uuid;
-    params.nodeDetailsSet = setUpNodeDetailsSet();
     context = new Context(null, customer, params);
+    params.nodeDetailsSet = setUpNodeDetailsSet();
 
     return params;
   }
@@ -246,16 +273,16 @@ public class UniverseResourceDetailsTest extends FakeDBApplication {
     az = AvailabilityZone.createOrThrow(region, "az-1", "PlacementAZ 1", "subnet-1");
     sampleNodeDetails = new NodeDetails();
     sampleNodeDetails.cloudInfo = new CloudSpecificInfo();
-    sampleNodeDetails.cloudInfo.cloud = provider.code;
+    sampleNodeDetails.cloudInfo.cloud = provider.getCode();
     sampleNodeDetails.cloudInfo.instance_type = testInstanceType;
-    sampleNodeDetails.cloudInfo.region = region.code;
-    sampleNodeDetails.cloudInfo.az = az.code;
-    sampleNodeDetails.azUuid = az.uuid;
+    sampleNodeDetails.cloudInfo.region = region.getCode();
+    sampleNodeDetails.cloudInfo.az = az.getCode();
+    sampleNodeDetails.azUuid = az.getUuid();
     sampleNodeDetails.state = NodeDetails.NodeState.Live;
   }
 
   @Test
-  public void testCreate() throws Exception {
+  public void testCreate() {
     UniverseDefinitionTaskParams params = setUpValidSSD(3);
     Context context = new Context(getApp().config(), customer, params);
     UniverseResourceDetails details =
@@ -268,7 +295,7 @@ public class UniverseResourceDetailsTest extends FakeDBApplication {
   }
 
   @Test
-  public void testAddPriceToDetailsSSD() throws Exception {
+  public void testAddPriceToDetailsSSD() {
     Iterator<NodeDetails> mockIterator = mock(Iterator.class);
     UniverseDefinitionTaskParams params = setUpValidSSD();
 
@@ -280,7 +307,7 @@ public class UniverseResourceDetailsTest extends FakeDBApplication {
   }
 
   @Test
-  public void testAddPriceToDetailsIO1() throws Exception {
+  public void testAddPriceToDetailsIO1() {
     UniverseDefinitionTaskParams params = setUpValidEBS(PublicCloudConstants.StorageType.IO1);
 
     UniverseResourceDetails details = new UniverseResourceDetails();
@@ -296,7 +323,7 @@ public class UniverseResourceDetailsTest extends FakeDBApplication {
   }
 
   @Test
-  public void testAddPriceToDetailsGP2() throws Exception {
+  public void testAddPriceToDetailsGP2() {
     UniverseDefinitionTaskParams params = setUpValidEBS(PublicCloudConstants.StorageType.GP2);
 
     UniverseResourceDetails details = new UniverseResourceDetails();
@@ -310,7 +337,7 @@ public class UniverseResourceDetailsTest extends FakeDBApplication {
   }
 
   @Test
-  public void testAddPriceToDetailsGP3() throws Exception {
+  public void testAddPriceToDetailsGP3() {
     UniverseDefinitionTaskParams params = setUpValidEBS(StorageType.GP3);
 
     UniverseResourceDetails details = new UniverseResourceDetails();
@@ -333,21 +360,148 @@ public class UniverseResourceDetailsTest extends FakeDBApplication {
   }
 
   @Test
-  public void testAddPriceWithRemovingOneNode() throws Exception {
+  public void testAddPricePausedUniverse() {
+    UniverseDefinitionTaskParams params = setUpValidEBS(StorageType.GP3);
+    params.universePaused = true;
+    params.nodeDetailsSet.forEach(node -> node.state = Stopped);
+
+    UniverseResourceDetails details = new UniverseResourceDetails();
+    details.gp3FreePiops = 3000;
+    details.gp3FreeThroughput = 125;
+    details.addPrice(params, context);
+    double expectedEbsPrice =
+        Double.parseDouble(
+            String.format(
+                "%.4f",
+                3
+                    * (numVolumes
+                        * (((diskIops - 3000) * piopsPrice)
+                            + (volumeSize * sizePrice)
+                            + ((throughput - 125) * throughputPrice / 1024)))));
+    // We're only accounted for drives in case universe is paused.
+    assertThat(details.ebsPricePerHour, equalTo(expectedEbsPrice));
+    assertThat(details.pricePerHour, equalTo(expectedEbsPrice));
+  }
+
+  @Test
+  public void testAddPriceWithTerminatedNode() {
     UniverseDefinitionTaskParams params =
         setUpValidSSD(
             4,
             (node, index) -> {
+              if (index == 2) {
+                node.state = Terminating;
+              }
               if (index == 3) {
-                node.state = ToBeRemoved;
+                node.state = Terminating;
               }
             });
 
     UniverseResourceDetails details = new UniverseResourceDetails();
     details.addPrice(params, context);
     assertThat(details.ebsPricePerHour, equalTo(0.0));
-    double expectedPrice = Double.parseDouble(String.format("%.4f", 3 * instancePrice));
+    double expectedPrice = Double.parseDouble(String.format("%.4f", 2 * instancePrice));
     assertThat(details.pricePerHour, equalTo(expectedPrice));
+  }
+
+  @Test
+  public void testAddPriceWithDecommissionedNode() {
+    UniverseDefinitionTaskParams params =
+        setUpValidSSD(
+            4,
+            (node, index) -> {
+              if (index == 2) {
+                node.state = Decommissioned;
+              }
+              if (index == 3) {
+                node.state = BeingDecommissioned;
+              }
+            });
+
+    UniverseResourceDetails details = new UniverseResourceDetails();
+    details.addPrice(params, context);
+    assertThat(details.ebsPricePerHour, equalTo(0.0));
+    double expectedPrice = Double.parseDouble(String.format("%.4f", 2 * instancePrice));
+    assertThat(details.pricePerHour, equalTo(expectedPrice));
+  }
+
+  @Test
+  public void testAddPriceWithToBeAdded() {
+    // ToBeAdded nodes are not counted - as node is not created yet
+    UniverseDefinitionTaskParams params = setUpValidEBS(StorageType.GP3);
+    params.nodeDetailsSet.forEach(node -> node.state = ToBeAdded);
+
+    UniverseResourceDetails details = new UniverseResourceDetails();
+    details.gp3FreePiops = 3000;
+    details.gp3FreeThroughput = 125;
+    details.addPrice(params, context);
+    assertThat(details.ebsPricePerHour, equalTo(0.0));
+    assertThat(details.pricePerHour, equalTo(0.0));
+  }
+
+  @Test
+  public void testAddPriceWithToBeRemoved() {
+    // ToBeRemoved nodes are not counted - as node is still running
+    UniverseDefinitionTaskParams params = setUpValidEBS(StorageType.GP3);
+    params.nodeDetailsSet.forEach(node -> node.state = ToBeRemoved);
+
+    UniverseResourceDetails details = new UniverseResourceDetails();
+    details.gp3FreePiops = 3000;
+    details.gp3FreeThroughput = 125;
+    details.addPrice(params, context);
+    double expectedEbsPrice =
+        Double.parseDouble(
+            String.format(
+                "%.4f",
+                3
+                    * (numVolumes
+                        * (((diskIops - 3000) * piopsPrice)
+                            + (volumeSize * sizePrice)
+                            + ((throughput - 125) * throughputPrice / 1024)))));
+    assertThat(details.ebsPricePerHour, equalTo(expectedEbsPrice));
+    double expectedPrice =
+        Double.parseDouble(String.format("%.4f", 3 * instancePrice + expectedEbsPrice));
+    assertThat(details.pricePerHour, equalTo(expectedPrice));
+  }
+
+  @Test
+  public void testAddPriceWithToBeAddedOnCreateEdit() {
+    // ToBeAdded nodes are counted during create or edit - to show estimate for future universe
+    UniverseDefinitionTaskParams params = setUpValidEBS(StorageType.GP3, true);
+    params.nodeDetailsSet.forEach(node -> node.state = ToBeAdded);
+
+    UniverseResourceDetails details = new UniverseResourceDetails();
+    details.gp3FreePiops = 3000;
+    details.gp3FreeThroughput = 125;
+    details.addPrice(params, context);
+    double expectedEbsPrice =
+        Double.parseDouble(
+            String.format(
+                "%.4f",
+                3
+                    * (numVolumes
+                        * (((diskIops - 3000) * piopsPrice)
+                            + (volumeSize * sizePrice)
+                            + ((throughput - 125) * throughputPrice / 1024)))));
+    assertThat(details.ebsPricePerHour, equalTo(expectedEbsPrice));
+    double expectedPrice =
+        Double.parseDouble(String.format("%.4f", 3 * instancePrice + expectedEbsPrice));
+    assertThat(details.pricePerHour, equalTo(expectedPrice));
+  }
+
+  @Test
+  public void testAddPriceWithToBeRemovedOnCreateEdit() {
+    // ToBeRemoved nodes are not counted during create or edit
+    // - to show estimate for future universe
+    UniverseDefinitionTaskParams params = setUpValidEBS(StorageType.GP3, true);
+    params.nodeDetailsSet.forEach(node -> node.state = ToBeRemoved);
+
+    UniverseResourceDetails details = new UniverseResourceDetails();
+    details.gp3FreePiops = 3000;
+    details.gp3FreeThroughput = 125;
+    details.addPrice(params, context);
+    assertThat(details.ebsPricePerHour, equalTo(0.0));
+    assertThat(details.pricePerHour, equalTo(0.0));
   }
 
   @Test
@@ -377,15 +531,18 @@ public class UniverseResourceDetailsTest extends FakeDBApplication {
 
   @Test
   public void testRRWithDiffProvider() {
-    InstanceType.upsert(provider.uuid, testInstanceType, 10, 5.5, null);
+    InstanceType.upsert(provider.getUuid(), testInstanceType, 10, 5.5, null);
     Provider provider2 = ModelFactory.gcpProvider(customer);
+    Region region2 = Region.create(provider2, "region-2", "Region 2", "yb-image-2");
+    AvailabilityZone az2 =
+        AvailabilityZone.createOrThrow(region2, "az-2", "PlacementAZ 2", "subnet-2");
     String testInstanceType2 = "c4.large";
-    InstanceType.upsert(provider2.uuid, testInstanceType2, 5, 5.0, null);
+    InstanceType.upsert(provider2.getUuid(), testInstanceType2, 5, 5.0, null);
 
     // Set up PriceComponent
     PriceComponent.PriceDetails instanceDetails = new PriceComponent.PriceDetails();
     instanceDetails.pricePerHour = instancePrice;
-    PriceComponent.upsert(provider.uuid, region.code, testInstanceType, instanceDetails);
+    PriceComponent.upsert(provider.getUuid(), region.getCode(), testInstanceType, instanceDetails);
 
     // Set up userIntent
     UserIntent userIntent =
@@ -397,24 +554,25 @@ public class UniverseResourceDetailsTest extends FakeDBApplication {
 
     // Set up TaskParams
     UniverseDefinitionTaskParams params = new UniverseDefinitionTaskParams();
-    params.upsertPrimaryCluster(userIntent, null);
+    params.upsertPrimaryCluster(userIntent, null, setupPlacement());
     sampleNodeDetails.placementUuid = params.getPrimaryCluster().uuid;
     params.nodeDetailsSet = setUpNodeDetailsSet(2, null);
-    params.upsertCluster(rrIntent, null, UUID.randomUUID());
     NodeDetails nodeDetails = new NodeDetails();
     nodeDetails.cloudInfo = new CloudSpecificInfo();
-    nodeDetails.cloudInfo.cloud = provider2.code;
+    nodeDetails.cloudInfo.cloud = provider2.getCode();
     nodeDetails.cloudInfo.instance_type = testInstanceType2;
-    nodeDetails.cloudInfo.region = region.code;
-    nodeDetails.cloudInfo.az = az.code;
-    nodeDetails.azUuid = az.uuid;
+    nodeDetails.cloudInfo.region = region2.getCode();
+    nodeDetails.cloudInfo.az = az2.getCode();
+    nodeDetails.azUuid = az2.getUuid();
     nodeDetails.state = NodeDetails.NodeState.Live;
+    params.upsertCluster(
+        rrIntent, null, setupPlacement(Collections.singleton(nodeDetails)), UUID.randomUUID());
     nodeDetails.placementUuid = params.getReadOnlyClusters().get(0).uuid;
     params.nodeDetailsSet.add(nodeDetails);
 
     context = new Context(null, customer, params);
-    InstanceType type1 = context.getInstanceType(provider.uuid, testInstanceType);
-    InstanceType type2 = context.getInstanceType(provider2.uuid, testInstanceType2);
+    InstanceType type1 = context.getInstanceType(provider.getUuid(), testInstanceType);
+    InstanceType type2 = context.getInstanceType(provider2.getUuid(), testInstanceType2);
 
     assertThat(type1, notNullValue());
     assertThat(type2, notNullValue());

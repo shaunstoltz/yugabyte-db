@@ -15,9 +15,9 @@
 // specific language governing permissions and limitations
 // under the License.
 //
-// The following only applies to changes made to this file as part of YugaByte development.
+// The following only applies to changes made to this file as part of YugabyteDB development.
 //
-// Portions Copyright (c) YugaByte, Inc.
+// Portions Copyright (c) YugabyteDB, Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License"); you may not use this file except
 // in compliance with the License.  You may obtain a copy of the License at
@@ -32,8 +32,6 @@
 // Command line tool to run Ysck against a cluster. Defaults to running against a local Master
 // on the default RPC port. It verifies that all the reported Tablet Servers are running and that
 // the tablets are in a consistent state.
-
-#include <glog/logging.h>
 
 #include "yb/gutil/strings/split.h"
 #include "yb/gutil/strings/substitute.h"
@@ -60,17 +58,15 @@ using std::vector;
 using std::string;
 using strings::Substitute;
 
-DEFINE_UNKNOWN_string(master_address, "",
-              "Address of master server to run against.");
+DEFINE_NON_RUNTIME_string(master_address, "", "Address of master server to run against.");
 
-DEFINE_UNKNOWN_bool(checksum_scan, false,
-            "Perform a checksum scan on data in the cluster.");
+DEFINE_NON_RUNTIME_bool(checksum_scan, false, "Perform a checksum scan on data in the cluster.");
 
-DEFINE_UNKNOWN_string(tables, "",
+DEFINE_NON_RUNTIME_string(tables, "",
               "Tables to check (comma-separated list of names). "
               "If not specified, checks all tables.");
 
-DEFINE_UNKNOWN_string(tablets, "",
+DEFINE_NON_RUNTIME_string(tablets, "",
               "Tablets to check (comma-separated list of IDs) "
               "If not specified, checks all tablets.");
 

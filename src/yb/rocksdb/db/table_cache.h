@@ -3,9 +3,9 @@
 //  LICENSE file in the root directory of this source tree. An additional grant
 //  of patent rights can be found in the PATENTS file in the same directory.
 //
-// The following only applies to changes made to this file as part of YugaByte development.
+// The following only applies to changes made to this file as part of YugabyteDB development.
 //
-// Portions Copyright (c) YugaByte, Inc.
+// Portions Copyright (c) YugabyteDB, Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License"); you may not use this file except
 // in compliance with the License.  You may obtain a copy of the License at
@@ -33,6 +33,7 @@
 #include "yb/rocksdb/cache.h"
 #include "yb/rocksdb/env.h"
 #include "yb/rocksdb/immutable_options.h"
+#include "yb/rocksdb/metadata.h"
 #include "yb/rocksdb/options.h"
 
 namespace rocksdb {
@@ -43,6 +44,7 @@ struct FileDescriptor;
 class GetContext;
 class HistogramImpl;
 class InternalIterator;
+class DataBlockAwareIndexInternalIterator;
 
 class TableCache {
  public:
@@ -76,10 +78,12 @@ class TableCache {
   // @param skip_filters Disables loading/accessing the filter block
   InternalIterator* NewIterator(
       const ReadOptions& options, const EnvOptions& toptions,
-      const InternalKeyComparatorPtr& internal_comparator,
-      const FileDescriptor& file_fd, const Slice& filter, TableReader** table_reader_ptr = nullptr,
-      HistogramImpl* file_read_hist = nullptr, bool for_compaction = false,
-      Arena* arena = nullptr, bool skip_filters = false);
+      const InternalKeyComparatorPtr& internal_comparator, const FileDescriptor& file_fd,
+      Slice filter, TableReader** table_reader_ptr = nullptr,
+      HistogramImpl* file_read_hist = nullptr, bool for_compaction = false, Arena* arena = nullptr,
+      bool skip_filters = false,
+      SkipCorruptDataBlocksUnsafe skip_corrupt_data_blocks_unsafe =
+          SkipCorruptDataBlocksUnsafe::kFalse);
 
   // Return table reader wrapped in internal structure for future use to create iterator.
   // Parameters meaning is the same as for NewIterator function above.
@@ -91,10 +95,16 @@ class TableCache {
       bool skip_filters = false);
 
   // Version of NewIterator which uses provided table reader instead of getting it by
-  // itself.
+  // itself. Releases TableReaderWithHandle before return.
   InternalIterator* NewIterator(
-      const ReadOptions& options, TableReaderWithHandle* trwh, const Slice& filter,
-      bool for_compaction = false, Arena* arena = nullptr, bool skip_filters = false);
+      const ReadOptions& options, TableReaderWithHandle* trwh, Slice filter,
+      bool for_compaction = false, Arena* arena = nullptr, bool skip_filters = false,
+      SkipCorruptDataBlocksUnsafe skip_corrupt_data_blocks_unsafe =
+          SkipCorruptDataBlocksUnsafe::kFalse);
+  InternalIterator* NewIndexIterator(
+      const ReadOptions& options, TableReaderWithHandle* trwh);
+  DataBlockAwareIndexInternalIterator* NewDataBlockAwareIndexIterator(
+      const ReadOptions& options, TableReaderWithHandle* trwh);
 
   // If a seek to internal key "k" in specified file finds an entry,
   // call (*handle_result)(arg, found_key, found_value) repeatedly until
@@ -120,7 +130,7 @@ class TableCache {
   yb::Result<TableReaderWithHandle> GetTableReader(
       const EnvOptions& toptions, const InternalKeyComparatorPtr& internal_comparator,
       const FileDescriptor& fd, QueryId query_id, bool no_io, HistogramImpl* file_read_hist,
-      bool skip_filters);
+      bool skip_filters, Statistics* statistics = nullptr);
 
   // Find table reader
   // @param skip_filters Disables loading/accessing the filter block
@@ -130,7 +140,8 @@ class TableCache {
                    const QueryId query_id,
                    const bool no_io = false, bool record_read_stats = true,
                    HistogramImpl* file_read_hist = nullptr,
-                   bool skip_filters = false);
+                   bool skip_filters = false,
+                   Statistics* statistics = nullptr);
 
   // Get TableReader from a cache handle.
   TableReader* GetTableReaderFromHandle(Cache::Handle* handle);
@@ -179,8 +190,8 @@ class TableCache {
       bool skip_filters = false);
 
   InternalIterator* DoNewIterator(
-      const ReadOptions& options, TableReaderWithHandle* trwh, const Slice& filter,
-      bool for_compaction = false, Arena* arena = nullptr, bool skip_filters = false);
+      const ReadOptions& options, TableReaderWithHandle* trwh, Slice filter, bool for_compaction,
+      Arena* arena, bool skip_filters, SkipCorruptDataBlocksUnsafe skip_corrupt_data_blocks_unsafe);
 
   const ImmutableCFOptions& ioptions_;
   const EnvOptions& env_options_;

@@ -30,6 +30,10 @@ export const useFormMainStyles = makeStyles((theme) => ({
     fontWeight: 500
   },
 
+  headerText: {
+    color: theme.palette.common.black
+  },
+
   subHeaderFont: {
     color: '#9f9ea7',
     fontFamily: 'Rubik,Helvetica Neue,sans-serif',
@@ -41,7 +45,6 @@ export const useFormMainStyles = makeStyles((theme) => ({
 
   selectedTab: {
     fontSize: theme.spacing(2),
-    marginLeft: theme.spacing(3),
     borderBottom: `3px solid ${theme.palette.orange[500]}`,
     color: theme.palette.common.black,
     fontFamily: 'Rubik,Helvetica Neue,sans-serif',
@@ -50,7 +53,6 @@ export const useFormMainStyles = makeStyles((theme) => ({
 
   disabledTab: {
     fontSize: theme.spacing(2),
-    marginLeft: theme.spacing(3),
     color: theme.palette.common.black,
     height: '100%',
     opacity: 0.35,
@@ -62,7 +64,7 @@ export const useFormMainStyles = makeStyles((theme) => ({
     display: 'flex',
     flexDirection: 'column',
     height: '100%',
-    padding: theme.spacing(0, 3),
+    padding: theme.spacing(0, 5),
     width: '100%',
     flexGrow: 1
   },
@@ -81,33 +83,72 @@ export const useFormMainStyles = makeStyles((theme) => ({
   },
 
   clearRRButton: {
-    padding: '1px !important',
     '& span': {
-      color: theme.palette.orange[300],
       marginLeft: theme.spacing(0),
-      fontSize: '12px !important',
-      textDecoration: 'underline'
+      fontSize: '15px',
+      color: theme.palette.ybacolors.ybDarkGray
     }
+  },
+
+  universeFormButtons: {
+    ['@media screen and (min-width: 500px) and (max-width: 1260px)']: {
+      marginTop: theme.spacing(2)
+    }
+  },
+
+  upgradeDetailsContainer: {
+    width: '100%',
+    display: 'flex',
+    flexDirection: 'column',
+    padding: theme.spacing(2),
+    marginTop: theme.spacing(2),
+    border: '1px solid #E5E5E9',
+    borderRadius: '8px'
   }
 }));
 
 export const useSectionStyles = makeStyles((theme) => ({
   sectionContainer: {
     display: 'flex',
-    padding: theme.spacing(2, 0),
-    flexDirection: 'column',
-    borderBottom: `1px solid ${theme.palette.ybacolors.ybGrayHover}`
+    padding: theme.spacing(5, 0),
+    borderBottom: `1px solid ${theme.palette.ybacolors.ybBorderGray}`
   },
   sectionHeaderFont: {
-    fontFamily: 'Rubik,Helvetica Neue,sans-serif',
-    fontWeight: 500,
+    fontFamily: 'Inter',
+    fontWeight: 700,
     fontSize: theme.spacing(2.25)
+  },
+  subsectionHeaderFont: {
+    fontFamily: 'Inter',
+    fontWeight: 600,
+    fontSize: '15px'
   }
 }));
 
-export const useFormFieldStyles = makeStyles(() => ({
+export const useFormFieldStyles = makeStyles((theme) => ({
   itemDisabled: {
     cursor: 'not-allowed',
     opacity: 0.5
+  },
+  labelFont: {
+    fontFamily: 'Inter',
+    fontSize: '13px',
+    fontWeight: theme.typography.fontWeightMedium as number
+  },
+  defaultTextBox: {
+    maxWidth: theme.spacing(50),
+    minWidth: theme.spacing(48.5)
+  },
+  advancedConfigLabel: {
+    maxWidth: theme.spacing(28),
+    minWidth: theme.spacing(27),
+    zIndex: 2
+  },
+  advancedConfigTextBox: {
+    maxWidth: theme.spacing(58.5),
+    minWidth: theme.spacing(50)
+  },
+  instanceConfigTextBox: {
+    maxWidth: theme.spacing(47.75)
   }
 }));

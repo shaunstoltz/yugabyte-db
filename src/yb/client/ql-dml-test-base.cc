@@ -1,5 +1,5 @@
 //
-// Copyright (c) YugaByte, Inc.
+// Copyright (c) YugabyteDB, Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License"); you may not use this file except
 // in compliance with the License.  You may obtain a copy of the License at
@@ -25,9 +25,9 @@
 #include "yb/client/table_creator.h"
 #include "yb/client/yb_op.h"
 
-#include "yb/common/ql_name.h"
+#include "yb/qlexpr/ql_name.h"
 #include "yb/common/ql_value.h"
-#include "yb/common/partition.h"
+#include "yb/dockv/partition.h"
 #include "yb/common/schema.h"
 
 #include "yb/gutil/casts.h"
@@ -87,7 +87,7 @@ QLDmlTestBase<ExternalMiniCluster>::QLDmlTestBase() {
 
 template<>
 void QLDmlTestBase<MiniCluster>::SetFlags() {
-  SetAtomicFlag(false, &FLAGS_enable_ysql);
+  ANNOTATE_UNPROTECTED_WRITE(FLAGS_enable_ysql) = false;
 }
 
 template<>
@@ -162,7 +162,7 @@ QLWriteRequestPB::QLStmtType GetQlStatementType(const WriteOpType op_type) {
 Result<YBqlWriteOpPtr> Increment(
     TableHandle* table, const YBSessionPtr& session, int32_t key, int32_t delta,
     Flush flush) {
-  auto op = table->NewWriteOp(QLWriteRequestPB::QL_STMT_UPDATE);
+  auto op = table->NewWriteOp(session->arena(), QLWriteRequestPB::QL_STMT_UPDATE);
   auto value_column_id = table->ColumnId(kValueColumn);
 
   auto* const req = op->mutable_request();
@@ -171,12 +171,12 @@ Result<YBqlWriteOpPtr> Increment(
   auto* column_value = req->add_column_values();
   column_value->set_column_id(value_column_id);
   auto* bfcall = column_value->mutable_expr()->mutable_bfcall();
-  bfcall->set_opcode(to_underlying(bfql::BFOpcode::OPCODE_ConvertI64ToI32_18));
+  bfcall->set_opcode(std::to_underlying(bfql::BFOpcode::OPCODE_ConvertI64ToI32_18));
   bfcall = bfcall->add_operands()->mutable_bfcall();
 
-  bfcall->set_opcode(to_underlying(bfql::BFOpcode::OPCODE_AddI64I64_80));
+  bfcall->set_opcode(std::to_underlying(bfql::BFOpcode::OPCODE_AddI64I64_80));
   auto column_op = bfcall->add_operands()->mutable_bfcall();
-  column_op->set_opcode(to_underlying(bfql::BFOpcode::OPCODE_ConvertI32ToI64_13));
+  column_op->set_opcode(std::to_underlying(bfql::BFOpcode::OPCODE_ConvertI32ToI64_13));
   column_op->add_operands()->set_column_id(value_column_id);
   bfcall->add_operands()->mutable_value()->set_int64_value(delta);
 
@@ -196,8 +196,8 @@ void CreateTable(
                                                table_name.namespace_type()));
 
   YBSchemaBuilder builder;
-  builder.AddColumn(kKeyColumn)->Type(INT32)->HashPrimaryKey()->NotNull();
-  builder.AddColumn(kValueColumn)->Type(INT32);
+  builder.AddColumn(kKeyColumn)->Type(DataType::INT32)->HashPrimaryKey()->NotNull();
+  builder.AddColumn(kValueColumn)->Type(DataType::INT32);
   if (transactional) {
     TableProperties table_properties;
     table_properties.SetTransactional(true);
@@ -210,12 +210,13 @@ void CreateTable(
 void BuildSchema(Partitioning partitioning, Schema* schema) {
   switch (partitioning) {
     case Partitioning::kHash:
-      *schema = Schema({ ColumnSchema(kKeyColumn, INT32, false, true),
-                         ColumnSchema(kValueColumn, INT32) }, 1);
+      *schema = Schema({ ColumnSchema(kKeyColumn, DataType::INT32, ColumnKind::HASH),
+                         ColumnSchema(kValueColumn, DataType::INT32) });
       return;
     case Partitioning::kRange:
-      *schema = Schema({ ColumnSchema(kKeyColumn, INT32),
-                         ColumnSchema(kValueColumn, INT32) }, 1);
+      *schema = Schema({
+          ColumnSchema(kKeyColumn, DataType::INT32, ColumnKind::RANGE_ASC_NULL_FIRST),
+          ColumnSchema(kValueColumn, DataType::INT32) });
       return;
   }
   FATAL_INVALID_ENUM_VALUE(Partitioning, partitioning);
@@ -275,11 +276,11 @@ void InitIndex(
 
   auto* column = index_info->add_columns();
   const string name = schema.Column(indexed_column_index).name();
-  column->set_column_name(use_mangled_names ? YcqlName::MangleColumnName(name) : name);
+  column->set_column_name(use_mangled_names ? qlexpr::YcqlName::MangleColumnName(name) : name);
   column->set_indexed_column_id(schema.ColumnId(indexed_column_index));
 
   // Setup Index table schema.
-  builder->AddColumn(use_mangled_names ? YcqlName::MangleColumnName(name) : name)
+  builder->AddColumn(use_mangled_names ? qlexpr::YcqlName::MangleColumnName(name) : name)
       ->Type(schema.Column(indexed_column_index).type())
       ->NotNull()
       ->HashPrimaryKey();
@@ -288,13 +289,13 @@ void InitIndex(
   for (size_t i = 0; i < schema.num_hash_key_columns(); ++i) {
     if (i != indexed_column_index) {
       const string name = schema.Column(i).name();
-      builder->AddColumn(use_mangled_names ? YcqlName::MangleColumnName(name) : name)
+      builder->AddColumn(use_mangled_names ? qlexpr::YcqlName::MangleColumnName(name) : name)
           ->Type(schema.Column(i).type())
           ->NotNull()
           ->PrimaryKey();
 
       column = index_info->add_columns();
-      column->set_column_name(use_mangled_names ? YcqlName::MangleColumnName(name) : name);
+      column->set_column_name(use_mangled_names ? qlexpr::YcqlName::MangleColumnName(name) : name);
       column->set_indexed_column_id(schema.ColumnId(i));
       ++num_range_keys;
     }
@@ -364,7 +365,7 @@ Result<YBqlWriteOpPtr> WriteRow(
   VLOG(4) << "Calling WriteRow key=" << key << " value=" << value << " op_type="
           << yb::ToString(op_type);
   const QLWriteRequestPB::QLStmtType stmt_type = GetQlStatementType(op_type);
-  const auto op = table->NewWriteOp(stmt_type);
+  const auto op = table->NewWriteOp(session->arena(), stmt_type);
   auto* const req = op->mutable_request();
   if (table->table()->partition_schema().IsHashPartitioning()) {
     QLAddInt32HashValue(req, key);
@@ -394,7 +395,7 @@ Result<YBqlWriteOpPtr> UpdateRow(
 
 Result<int32_t> SelectRow(
     TableHandle* table, const YBSessionPtr& session, int32_t key, const std::string& column) {
-  const YBqlReadOpPtr op = table->NewReadOp();
+  const YBqlReadOpPtr op = table->NewReadOp(session->arena());
   auto* const req = op->mutable_request();
   QLAddInt32HashValue(req, key);
   table->AddColumns({column}, req);
@@ -405,6 +406,7 @@ Result<int32_t> SelectRow(
       LOG(WARNING) << "Error: " << error->status() << ", op: " << error->failed_op().ToString();
     }
   }
+  RETURN_NOT_OK(flush_status.status);
   RETURN_NOT_OK(CheckOp(op.get()));
   auto rowblock = yb::ql::RowsResult(op.get()).GetRowBlock();
   if (rowblock->row_count() == 0) {
@@ -420,22 +422,21 @@ Result<std::map<int32_t, int32_t>> SelectAllRows(
   partitions.push_back(std::string()); // Upper bound for last partition.
 
   uint16_t prev_code = 0;
-  for (const auto& partition : partitions) {
-    const YBqlReadOpPtr op = table->NewReadOp();
+  // When processing partition key current_code (not including the first partition key, which is
+  // empty), we add a read op for the keys in [prev_code, current_code).
+  for (size_t i = 1; i < partitions.size(); ++i) {
+    const auto& partition = partitions[i];
+    const YBqlReadOpPtr op = table->NewReadOp(session->arena());
     auto* const req = op->mutable_request();
     table->AddColumns(table->AllColumnNames(), req);
     if (prev_code) {
       req->set_hash_code(prev_code);
     }
-    // Partition could be empty, or contain 2 bytes of partition start.
+    // Partition is either a 2 byte key or empty (the last key).
     if (partition.size() == 2) {
       uint16_t current_code = BigEndian::Load16(partition.c_str());
       req->set_max_hash_code(current_code - 1);
       prev_code = current_code;
-    } else if (!prev_code) {
-      // Partitions contain starts of partition, so we always skip first iteration, because don't
-      // know end of first partition at this point.
-      continue;
     }
     ops.push_back(op);
     session->Apply(op);
@@ -492,11 +493,11 @@ int KeyValueTableTest<MiniClusterType>::NumTablets() {
 template <class MiniClusterType>
 YBSessionPtr KeyValueTableTest<MiniClusterType>::CreateSession(
     const YBTransactionPtr& transaction, const server::ClockPtr& clock) {
-  auto session = std::make_shared<YBSession>(client_.get(), clock);
+  auto session =
+      std::make_shared<YBSession>(client_.get(), RegularBuildVsSanitizers(15s, 60s), clock);
   if (transaction) {
     session->SetTransaction(transaction);
   }
-  session->SetTimeout(RegularBuildVsSanitizers(15s, 60s));
   return session;
 }
 
@@ -512,6 +513,39 @@ Status CheckOp(YBqlOp* op) {
   }
 
   return Status::OK();
+}
+
+Result<size_t> CountRows(const YBSessionPtr& session, const TableHandle& table, MonoDelta timeout) {
+  LOG(INFO) << "Running full scan on table " << table.name().ToString() << "...";
+  session->SetTimeout(timeout);
+  QLPagingStatePB paging_state;
+  bool has_paging_state = false;
+  size_t row_count = 0;
+  for (;;) {
+    const auto op = table.NewReadOp(session->arena());
+    auto* const req = op->mutable_request();
+    req->set_return_paging_state(true);
+    if (has_paging_state) {
+      if (paging_state.has_read_time()) {
+        ReadHybridTime read_time = ReadHybridTime::FromPB(paging_state.read_time());
+        if (read_time) {
+          session->SetReadPoint(read_time);
+        }
+      }
+      session->SetForceConsistentRead(client::ForceConsistentRead::kTrue);
+      *req->mutable_paging_state() = std::move(paging_state);
+    }
+    RETURN_NOT_OK(session->TEST_ApplyAndFlush(op));
+    RETURN_NOT_OK(CheckOp(op.get()));
+    auto rowblock = VERIFY_RESULT(op->MakeRowBlock());
+    row_count += rowblock.row_count();
+    if (!op->response().has_paging_state()) {
+      break;
+    }
+    paging_state = op->response().paging_state().ToGoogleProtobuf();
+    has_paging_state = true;
+  }
+  return row_count;
 }
 
 } // namespace client

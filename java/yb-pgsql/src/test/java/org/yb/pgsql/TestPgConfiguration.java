@@ -1,4 +1,4 @@
-// Copyright (c) YugaByte, Inc.
+// Copyright (c) YugabyteDB, Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License"); you may not use this file except
 // in compliance with the License.  You may obtain a copy of the License at
@@ -18,10 +18,12 @@ import static org.yb.AssertionWrappers.*;
 import java.io.File;
 import java.nio.file.Files;
 import java.sql.Connection;
+import java.sql.ResultSet;
 import java.sql.SQLException;
 import java.sql.Statement;
 import java.util.Arrays;
 import java.util.Collections;
+import java.util.List;
 
 import org.hamcrest.CoreMatchers;
 import org.junit.Test;
@@ -29,14 +31,14 @@ import org.junit.runner.RunWith;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
-import org.yb.util.YBTestRunnerNonTsanOnly;
+import org.yb.YBTestRunner;
 
 import com.google.common.collect.ImmutableMap;
 
 /**
  * Tests for PostgreSQL configuration.
  */
-@RunWith(value = YBTestRunnerNonTsanOnly.class)
+@RunWith(value = YBTestRunner.class)
 public class TestPgConfiguration extends BasePgSQLTest {
   private static final Logger LOG = LoggerFactory.getLogger(TestPgConfiguration.class);
 
@@ -252,11 +254,11 @@ public class TestPgConfiguration extends BasePgSQLTest {
     try (Connection connection = tsConnBldr.withUser("su")
         .withPassword("pass").connect();
          Statement statement = connection.createStatement()) {
-      assertQuery(
-          statement,
-          "SELECT type, database, user_name, address, netmask, auth_method" +
-              " FROM pg_hba_file_rules ORDER BY line_number",
-          new Row("host", Arrays.asList("all"), Arrays.asList("all"), "all", null, "md5"));
+      assertQuery(statement,
+          "SELECT type, database, user_name, address, netmask, auth_method"
+              + " FROM pg_hba_file_rules ORDER BY line_number",
+          new Row("host", Arrays.asList("all"), Arrays.asList("all"), "all", null, "md5"),
+          new Row("local", Arrays.asList("all"), Arrays.asList("yugabyte"), null, null, "trust"));
     }
   }
 
@@ -308,6 +310,7 @@ public class TestPgConfiguration extends BasePgSQLTest {
       );
 
       // Root setting value was set properly, but was overridden by JDBC client.
+
       assertQuery(
           statement,
           "SELECT source, boot_val FROM pg_settings WHERE name='TimeZone'",
@@ -539,7 +542,19 @@ public class TestPgConfiguration extends BasePgSQLTest {
     }
   }
 
-  private int spawnTServer() throws Exception {
+  @Test
+  public void testShowAll() throws Exception {
+    int tserver = spawnTServer();
+
+    try (Connection connection = getConnectionBuilder().withTServer(tserver).connect();
+         Statement statement = connection.createStatement()) {
+      ResultSet rs = statement.executeQuery("SHOW ALL;");
+      List<Row> rows = getRowList(rs);
+      assertGreaterThan(rows.size(), 0);
+    }
+  }
+
+  protected int spawnTServer() throws Exception {
     return spawnTServerWithFlags(Collections.emptyMap());
   }
 }

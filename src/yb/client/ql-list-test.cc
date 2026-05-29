@@ -1,4 +1,4 @@
-// Copyright (c) YugaByte, Inc.
+// Copyright (c) YugabyteDB, Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License"); you may not use this file except
 // in compliance with the License.  You may obtain a copy of the License at
@@ -71,10 +71,10 @@ class QLListTest : public QLDmlTestBase<MiniCluster> {
     QLDmlTestBase::SetUp();
 
     YBSchemaBuilder b;
-    b.AddColumn("h1")->Type(INT32)->HashPrimaryKey()->NotNull();
-    b.AddColumn("h2")->Type(INT32)->HashPrimaryKey()->NotNull();
-    b.AddColumn("h3")->Type(STRING)->HashPrimaryKey()->NotNull();
-    b.AddColumn("r1")->Type(INT32)->PrimaryKey()->NotNull();
+    b.AddColumn("h1")->Type(DataType::INT32)->HashPrimaryKey()->NotNull();
+    b.AddColumn("h2")->Type(DataType::INT32)->HashPrimaryKey()->NotNull();
+    b.AddColumn("h3")->Type(DataType::STRING)->HashPrimaryKey()->NotNull();
+    b.AddColumn("r1")->Type(DataType::INT32)->PrimaryKey()->NotNull();
     b.AddColumn("l1")->Type(QLType::CreateTypeList(DataType::INT32));
     b.AddColumn("s1")->Type(QLType::CreateTypeSet(DataType::STRING));
     b.AddColumn("s2")->Type(QLType::CreateTypeSet(DataType::STRING));
@@ -85,7 +85,7 @@ class QLListTest : public QLDmlTestBase<MiniCluster> {
   void InsertRows(YBSession* session, int32_t hash_seed, int32_t ranges) {
     std::vector<YBOperationPtr> ops;
     for (int32_t range = 0; range != ranges; ++range) {
-      auto op = table_.NewWriteOp(QLWriteRequestPB::QL_STMT_INSERT);
+      auto op = table_.NewWriteOp(session->arena(), QLWriteRequestPB::QL_STMT_INSERT);
       auto* const req = op->mutable_request();
       AddHash(hash_seed, req);
       QLAddInt32RangeValue(req, range);
@@ -95,16 +95,16 @@ class QLListTest : public QLDmlTestBase<MiniCluster> {
       int32_t seed = RowSeed(hash_seed, range);
       for (int i = 1; i <= kCollectionSize; ++i) {
         l1->add_elems()->set_int32_value(ListEntry(hash_seed, range, i));
-        s1->add_elems()->set_string_value(To8LengthHex(seed * i));
-        s2->add_elems()->set_string_value(To8LengthHex((~seed) * i));
+        s1->add_elems()->dup_string_value(To8LengthHex(seed * i));
+        s2->add_elems()->dup_string_value(To8LengthHex((~seed) * i));
       }
       ops.push_back(std::move(op));
     }
     ASSERT_OK(session->TEST_ApplyAndFlush(ops));
   }
 
-  std::unique_ptr<QLRowBlock> ReadRows(YBSession* session, int32_t hash_seed) {
-    auto op = table_.NewReadOp();
+  std::unique_ptr<qlexpr::QLRowBlock> ReadRows(YBSession* session, int32_t hash_seed) {
+    auto op = table_.NewReadOp(session->arena());
     auto* const req = op->mutable_request();
     AddHash(hash_seed, req);
     table_.AddColumns(table_.AllColumnNames(), req);

@@ -1,4 +1,4 @@
-// Copyright (c) YugaByte, Inc.
+// Copyright (c) YugabyteDB, Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License"); you may not use this file except
 // in compliance with the License.  You may obtain a copy of the License at
@@ -15,7 +15,9 @@
 #include <string>
 
 #include "yb/common/json_util.h"
+#include "yb/gutil/map-util.h"
 #include "yb/util/flags/auto_flags_util.h"
+#include "yb/util/enum_parse.h"
 #include "yb/util/env_util.h"
 #include "yb/util/path_util.h"
 #include "yb/util/status.h"
@@ -33,6 +35,15 @@ using rapidjson::Value;
 using std::string;
 using yb::common::AddMember;
 
+#define VALIDATE_MEMBER(doc, member_name, is_type, expected_type_name) \
+  SCHECK( \
+      doc.HasMember(member_name), NotFound, \
+      AutoFlagsJsonParseErrorMsg() + Format("'$0' member not found.", member_name)); \
+  SCHECK( \
+      doc[member_name].is_type(), InvalidArgument, \
+      AutoFlagsJsonParseErrorMsg() + \
+          Format("'$0' member should be of type $1.", member_name, expected_type_name))
+
 namespace yb {
 const char kAutoFlagsJsonFileName[] = "auto_flags.json";
 const char kAutoFlagsMember[] = "auto_flags";
@@ -40,9 +51,19 @@ const char kProgramMember[] = "program";
 const char kFlagsMember[] = "flags";
 const char kNameMember[] = "name";
 const char kClassMember[] = "class";
-const char kRuntimeMember[] = "is_runtime";
 
-string AutoFlagsUtil::DumpAutoFlagsToJSON(const std::string& program_name) {
+namespace {
+
+// Function wrapper for the prefix error message to avoid static initialization order issues.
+string AutoFlagsJsonParseErrorMsg() {
+  static const string error_msg = Format("Failed to parse $0.", kAutoFlagsJsonFileName);
+  return error_msg;
+}
+
+}  // namespace
+
+namespace AutoFlagsUtil {
+string DumpAutoFlagsToJSON(const ProcessName& program_name) {
   // Format:
   //  {
   //     "auto_flags": [
@@ -51,8 +72,7 @@ string AutoFlagsUtil::DumpAutoFlagsToJSON(const std::string& program_name) {
   //         "flags": [
   //           {
   //             "name": "<flag_name>",
-  //             "class": "<flag_class>",
-  //             "is_runtime": <boolean>
+  //             "class": "<flag_class>"
   //           },...]
   //       },...
   //     ]
@@ -71,8 +91,7 @@ string AutoFlagsUtil::DumpAutoFlagsToJSON(const std::string& program_name) {
     Value obj(rapidjson::kObjectType);
 
     AddMember(kNameMember, flag->name, &obj, &allocator);
-    obj.AddMember(kClassMember, Value(yb::to_underlying(flag->flag_class)), allocator);
-    obj.AddMember(kRuntimeMember, Value(flag->is_runtime), allocator);
+    obj.AddMember(kClassMember, Value(std::to_underlying(flag->flag_class)), allocator);
 
     flags.PushBack(obj, allocator);
   }
@@ -86,23 +105,6 @@ string AutoFlagsUtil::DumpAutoFlagsToJSON(const std::string& program_name) {
   return str_buf.GetString();
 }
 
-namespace {
-
-// Function wrapper for the prefix error message to avoid static initialization order issues
-string AutoFlagsJsonParseErrorMsg() {
-  static const string error_msg = Format("Failed to parse $0.", kAutoFlagsJsonFileName);
-  return error_msg;
-}
-
-#define VALIDATE_MEMBER(doc, member_name, is_type, expected_type_name) \
-  SCHECK( \
-      doc.HasMember(member_name), NotFound, \
-      AutoFlagsJsonParseErrorMsg() + Format("'$0' member not found.", member_name)); \
-  SCHECK( \
-      doc[member_name].is_type(), InvalidArgument, \
-      AutoFlagsJsonParseErrorMsg() + \
-          Format("'$0' member should be of type $1.", member_name, expected_type_name))
-
 // Read kAutoFlagsJsonFileName and get the list of available auto flags for all processes.
 Result<AutoFlagsInfoMap> GetAvailableAutoFlags() {
   AutoFlagsInfoMap available_flags;
@@ -110,7 +112,9 @@ Result<AutoFlagsInfoMap> GetAvailableAutoFlags() {
 
   string full_path = JoinPathSegments(auto_flags_file_json_path, kAutoFlagsJsonFileName);
   std::ifstream json_file(full_path);
-  SCHECK(!json_file.fail(), IOError, Format("Could not open JSON file $0", full_path));
+  SCHECK(
+      !json_file.fail(), IOError,
+      Format("Could not open JSON file $0: $1", full_path, strerror(errno)));
 
   rapidjson::IStreamWrapper stream_wrapper(json_file);
   Document doc;
@@ -136,31 +140,26 @@ Result<AutoFlagsInfoMap> GetAvailableAutoFlags() {
     for (const auto& flag : flags.GetArray()) {
       VALIDATE_MEMBER(flag, kNameMember, IsString, "string");
       VALIDATE_MEMBER(flag, kClassMember, IsInt, "int");
-      VALIDATE_MEMBER(flag, kRuntimeMember, IsBool, "bool");
 
       auto flag_class = VERIFY_RESULT_PREPEND(
           yb::UnderlyingToEnumSlow<yb::AutoFlagClass>(flag[kClassMember].GetInt()),
           AutoFlagsJsonParseErrorMsg() +
               Format("Flag Class '{0}' is invalid.", flag[kClassMember].GetString()));
 
-      output.emplace_back(
-          flag[kNameMember].GetString(), flag_class,
-          RuntimeAutoFlag(flag[kRuntimeMember].GetBool()));
+      output.emplace_back(flag[kNameMember].GetString(), flag_class);
     }
   }
 
   return available_flags;
 }
-}  // namespace
 
-AutoFlagsInfoMap AutoFlagsUtil::GetFlagsEligibleForPromotion(
-    const AutoFlagsInfoMap& available_flags, const AutoFlagClass max_flag_class,
-    const PromoteNonRuntimeAutoFlags promote_non_runtime) {
+AutoFlagsInfoMap GetFlagsEligibleForPromotion(
+    const AutoFlagsInfoMap& available_flags, const AutoFlagClass max_flag_class) {
   AutoFlagsInfoMap eligible_flags;
 
   for (const auto& process_flag : available_flags) {
     for (const auto& flag : process_flag.second) {
-      if (flag.flag_class <= max_flag_class && (flag.is_runtime || promote_non_runtime)) {
+      if (flag.flag_class <= max_flag_class) {
         eligible_flags[process_flag.first].emplace_back(flag);
       }
     }
@@ -169,11 +168,58 @@ AutoFlagsInfoMap AutoFlagsUtil::GetFlagsEligibleForPromotion(
   return eligible_flags;
 }
 
-Result<AutoFlagsInfoMap> AutoFlagsUtil::GetFlagsEligibleForPromotion(
-    const AutoFlagClass max_flag_class, const PromoteNonRuntimeAutoFlags promote_non_runtime) {
+Result<AutoFlagsInfoMap> GetFlagsEligibleForPromotion(const AutoFlagClass max_flag_class) {
   auto available_flags = VERIFY_RESULT(GetAvailableAutoFlags());
 
-  return GetFlagsEligibleForPromotion(available_flags, max_flag_class, promote_non_runtime);
+  return GetFlagsEligibleForPromotion(available_flags, max_flag_class);
 }
+
+Result<bool> AreAutoFlagsCompatible(
+    const AutoFlagsNameMap& base_flags, const AutoFlagsNameMap& to_check_flags,
+    const AutoFlagsInfoMap& auto_flag_infos, AutoFlagClass min_class) {
+  // Allowed test flags that we do not care about.
+  static const std::set<std::string> kAutoFlagAllowList = {
+      "TEST_auto_flags_initialized", "TEST_auto_flags_new_install"};
+
+  for (const auto& [process_name, base_process_flags] : base_flags) {
+    auto process_flag_info = FindOrNull(auto_flag_infos, process_name);
+    SCHECK(process_flag_info, NotFound, "AutoFlags info for process $0 not found", process_name);
+
+    auto to_check_flags_set = FindOrNull(to_check_flags, process_name);
+    uint32 num_flags = 0;
+
+    for (const auto& flag : *process_flag_info) {
+      if (!base_process_flags.contains(flag.name)) {
+        continue;
+      }
+
+      num_flags++;
+      if (kAutoFlagAllowList.contains(flag.name)) {
+        VLOG_WITH_FUNC(3) << "Skipping flag " << flag.name << " of process " << process_name;
+        continue;
+      }
+      if (flag.flag_class < min_class) {
+        VLOG_WITH_FUNC(3) << "Skipping flag " << flag.name << " of process " << process_name
+                          << " since its class " << flag.flag_class << " is less than min class "
+                          << min_class;
+        continue;
+      }
+
+      if (!to_check_flags_set || !to_check_flags_set->contains(flag.name)) {
+        LOG_WITH_FUNC(INFO) << "Flag " << flag.name << " of process " << process_name
+                            << " with class " << flag.flag_class
+                            << " not found in config to validate";
+        return false;
+      }
+    }
+
+    SCHECK_EQ(
+        num_flags, base_process_flags.size(), NotFound, "AutoFlags info for some flags not found");
+  }
+
+  return true;
+}
+
+}  // namespace AutoFlagsUtil
 
 }  // namespace yb

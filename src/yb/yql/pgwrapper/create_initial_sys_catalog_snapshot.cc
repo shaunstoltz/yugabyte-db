@@ -1,4 +1,4 @@
-// Copyright (c) YugaByte, Inc.
+// Copyright (c) YugabyteDB, Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License"); you may not use this file except
 // in compliance with the License.  You may obtain a copy of the License at
@@ -55,7 +55,7 @@ class CreateInitialSysCatalogSnapshotTest : public PgWrapperTestBase {
 };
 
 TEST_F(CreateInitialSysCatalogSnapshotTest,
-       YB_DISABLE_TEST_IN_TSAN(CreateInitialSysCatalogSnapshot)) {
+       CreateInitialSysCatalogSnapshot) {
   // All the work is done by the master on cluster startup.
 }
 

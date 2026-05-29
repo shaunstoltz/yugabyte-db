@@ -1,5 +1,5 @@
 /*
- * Copyright 2020 YugaByte, Inc. and Contributors
+ * Copyright 2020 YugabyteDB, Inc. and Contributors
  *
  * Licensed under the Polyform Free Trial License 1.0.0 (the "License"); you
  * may not use this file except in compliance with the License. You
@@ -26,7 +26,8 @@ import lombok.experimental.Accessors;
 @ApiModel(
     value = "AlertConfigurationThreshold",
     description =
-        "Alert configuration threshold. Conditions can be either greater than a specified value, or less than a specified value.")
+        "Alert configuration threshold. Conditions can be either greater than a specified value, or"
+            + " less than a specified value.")
 public class AlertConfigurationThreshold {
 
   @NotNull

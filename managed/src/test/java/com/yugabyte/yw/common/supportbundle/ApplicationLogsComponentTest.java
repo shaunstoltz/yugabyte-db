@@ -1,4 +1,4 @@
-// Copyright (c) YugaByte, Inc.
+// Copyright (c) YugabyteDB, Inc.
 
 package com.yugabyte.yw.common.supportbundle;
 
@@ -6,23 +6,22 @@ import static com.yugabyte.yw.common.TestHelper.createTempFile;
 import static org.junit.Assert.assertEquals;
 import static org.junit.Assert.assertTrue;
 import static org.mockito.Mockito.when;
-import static org.mockito.Mockito.lenient;
 
 import com.typesafe.config.Config;
 import com.yugabyte.yw.commissioner.BaseTaskDependencies;
 import com.yugabyte.yw.common.FakeDBApplication;
 import com.yugabyte.yw.common.ModelFactory;
 import com.yugabyte.yw.common.SupportBundleUtil;
+import com.yugabyte.yw.common.config.RuntimeConfigFactory;
 import com.yugabyte.yw.models.Customer;
 import com.yugabyte.yw.models.Universe;
 import java.io.File;
 import java.io.IOException;
 import java.nio.file.Paths;
+import java.text.SimpleDateFormat;
+import java.util.Arrays;
 import java.util.Date;
 import java.util.List;
-import java.util.Arrays;
-import java.text.ParseException;
-import java.text.SimpleDateFormat;
 import org.apache.commons.io.FileUtils;
 import org.junit.After;
 import org.junit.Before;
@@ -35,10 +34,12 @@ import org.mockito.junit.MockitoJUnitRunner;
 public class ApplicationLogsComponentTest extends FakeDBApplication {
   @Mock public BaseTaskDependencies mockBaseTaskDependencies;
   @Mock public Config mockConfig;
+  @Mock public RuntimeConfigFactory mockRuntimeConfigFactory;
+  @Mock public Config mockGlobalRuntimeConfig;
 
   private final SimpleDateFormat dateFormat = new SimpleDateFormat("yyyy-MM-dd");
-  private final String testRegexPattern = "application-log-\\d{4}-\\d{2}-\\d{2}\\.gz";
-  private final String testSdfPattern = "'application-log-'yyyy-MM-dd'.gz'";
+  private final String testRegexPattern = "application-log-\\d{4}-\\d{2}-\\d{2}(\\.gz)?";
+  private final String testSdfPattern = "'application-log-'yyyy-MM-dd";
 
   private Universe universe;
   private Customer customer;
@@ -52,7 +53,7 @@ public class ApplicationLogsComponentTest extends FakeDBApplication {
   public void setUp() {
     // Setup fake temp log files, universe, customer
     this.customer = ModelFactory.testCustomer();
-    this.universe = ModelFactory.createUniverse(customer.getCustomerId());
+    this.universe = ModelFactory.createUniverse(customer.getId());
     List<String> fakeLogsList =
         Arrays.asList(
             "application-log-2022-03-05.gz",
@@ -69,13 +70,12 @@ public class ApplicationLogsComponentTest extends FakeDBApplication {
 
     // Mock all the config invocations with fake data
     when(mockBaseTaskDependencies.getConfig()).thenReturn(mockConfig);
-    when(mockConfig.hasPath("application.home")).thenReturn(false);
-    lenient().when(mockConfig.getString("application.home")).thenReturn(fakeSupportBundleBasePath);
-    when(mockConfig.hasPath("log.override.path")).thenReturn(true);
+    when(mockBaseTaskDependencies.getRuntimeConfigFactory()).thenReturn(mockRuntimeConfigFactory);
+    when(mockRuntimeConfigFactory.globalRuntimeConf()).thenReturn(mockGlobalRuntimeConfig);
     when(mockConfig.getString("log.override.path")).thenReturn(fakeSourceLogsPath);
-    when(mockConfig.getString("yb.support_bundle.application_logs_regex_pattern"))
+    when(mockGlobalRuntimeConfig.getString("yb.support_bundle.application_logs_regex_pattern"))
         .thenReturn(testRegexPattern);
-    when(mockConfig.getString("yb.support_bundle.application_logs_sdf_pattern"))
+    when(mockGlobalRuntimeConfig.getString("yb.support_bundle.application_logs_sdf_pattern"))
         .thenReturn(testSdfPattern);
   }
 
@@ -85,7 +85,7 @@ public class ApplicationLogsComponentTest extends FakeDBApplication {
   }
 
   @Test
-  public void testDownloadComponentBetweenDatesTillCurrentDay() throws IOException, ParseException {
+  public void testDownloadComponentBetweenDatesTillCurrentDay() throws Exception {
     // Define start and end dates to filter
     Date startDate = dateFormat.parse("2022-03-06");
     Date endDate = mockSupportBundleUtil.getTodaysDate();
@@ -94,7 +94,7 @@ public class ApplicationLogsComponentTest extends FakeDBApplication {
     ApplicationLogsComponent applicationLogsComponent =
         new ApplicationLogsComponent(mockBaseTaskDependencies, mockSupportBundleUtil);
     applicationLogsComponent.downloadComponentBetweenDates(
-        customer, universe, Paths.get(fakeBundlePath), startDate, endDate, null);
+        null, customer, universe, Paths.get(fakeBundlePath), startDate, endDate, null);
 
     // Files expected to be present in the bundle after filtering
     List<String> expectedFilesList =
@@ -113,7 +113,7 @@ public class ApplicationLogsComponentTest extends FakeDBApplication {
   }
 
   @Test
-  public void testDownloadComponentBetweenDatesWithOlderDates() throws IOException, ParseException {
+  public void testDownloadComponentBetweenDatesWithOlderDates() throws Exception {
     // Define start and end dates to filter
     Date startDate = dateFormat.parse("2022-03-06");
     Date endDate = dateFormat.parse("2022-03-07");
@@ -122,7 +122,7 @@ public class ApplicationLogsComponentTest extends FakeDBApplication {
     ApplicationLogsComponent applicationLogsComponent =
         new ApplicationLogsComponent(mockBaseTaskDependencies, mockSupportBundleUtil);
     applicationLogsComponent.downloadComponentBetweenDates(
-        customer, universe, Paths.get(fakeBundlePath), startDate, endDate, null);
+        null, customer, universe, Paths.get(fakeBundlePath), startDate, endDate, null);
 
     // Files expected to be present in the bundle after filtering
     List<String> expectedFilesList =
@@ -137,7 +137,7 @@ public class ApplicationLogsComponentTest extends FakeDBApplication {
   }
 
   @Test
-  public void testDownloadComponentBetweenDatesPartialBounds() throws IOException, ParseException {
+  public void testDownloadComponentBetweenDatesPartialBounds() throws Exception {
     // Define start and end dates to filter
     Date startDate = dateFormat.parse("2022-03-01");
     Date endDate = dateFormat.parse("2022-03-05");
@@ -146,7 +146,7 @@ public class ApplicationLogsComponentTest extends FakeDBApplication {
     ApplicationLogsComponent applicationLogsComponent =
         new ApplicationLogsComponent(mockBaseTaskDependencies, mockSupportBundleUtil);
     applicationLogsComponent.downloadComponentBetweenDates(
-        customer, universe, Paths.get(fakeBundlePath), startDate, endDate, null);
+        null, customer, universe, Paths.get(fakeBundlePath), startDate, endDate, null);
 
     // Files expected to be present in the bundle after filtering
     List<String> expectedFilesList = Arrays.asList("application-log-2022-03-05.gz");
@@ -160,7 +160,7 @@ public class ApplicationLogsComponentTest extends FakeDBApplication {
   }
 
   @Test
-  public void testDownloadComponentBetweenDatesOutOfBounds() throws IOException, ParseException {
+  public void testDownloadComponentBetweenDatesOutOfBounds() throws Exception {
     // Define start and end dates to filter
     Date startDate = dateFormat.parse("2022-03-01");
     Date endDate = dateFormat.parse("2022-03-03");
@@ -169,7 +169,7 @@ public class ApplicationLogsComponentTest extends FakeDBApplication {
     ApplicationLogsComponent applicationLogsComponent =
         new ApplicationLogsComponent(mockBaseTaskDependencies, mockSupportBundleUtil);
     applicationLogsComponent.downloadComponentBetweenDates(
-        customer, universe, Paths.get(fakeBundlePath), startDate, endDate, null);
+        null, customer, universe, Paths.get(fakeBundlePath), startDate, endDate, null);
 
     // Files expected to be present in the bundle after filtering
     List<String> expectedFilesList = Arrays.asList();

@@ -15,9 +15,9 @@
 // specific language governing permissions and limitations
 // under the License.
 //
-// The following only applies to changes made to this file as part of YugaByte development.
+// The following only applies to changes made to this file as part of YugabyteDB development.
 //
-// Portions Copyright (c) YugaByte, Inc.
+// Portions Copyright (c) YugabyteDB, Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License"); you may not use this file except
 // in compliance with the License.  You may obtain a copy of the License at
@@ -55,7 +55,6 @@ METRIC_DECLARE_counter(rpcs_queue_overflow);
 
 using std::string;
 using std::shared_ptr;
-using strings::Substitute;
 using namespace std::literals;
 
 namespace yb {
@@ -197,15 +196,14 @@ TEST_F(MultiThreadedRpcTest, TestBlowOutServiceQueue) {
 
   std::unique_ptr<ServiceIf> service(new GenericCalculatorService());
   auto service_name = service->service_name();
-  ThreadPool thread_pool(ThreadPoolOptions {
-    .name = "bogus_pool",
-    .max_workers = 0UL,
-  });
-  scoped_refptr<ServicePool> service_pool(new ServicePool(kMaxConcurrency,
-                                                          &thread_pool,
-                                                          &server_messenger->scheduler(),
-                                                          std::move(service),
-                                                          metric_entity()));
+  ThreadPoolPtr thread_pool = std::make_shared<ThreadPool>(
+      ThreadPoolOptions {
+        .name = "bogus_pool",
+        .max_workers = 0
+      });
+  scoped_refptr<ServicePool> service_pool(new ServicePool(
+      kMaxConcurrency, [thread_pool](auto) { return thread_pool; },
+      &server_messenger->scheduler(), std::move(service), metric_entity()));
   ASSERT_OK(server_messenger->RegisterService(service_name, service_pool));
   ASSERT_OK(server_messenger->StartAcceptor());
 
@@ -225,7 +223,7 @@ TEST_F(MultiThreadedRpcTest, TestBlowOutServiceQueue) {
   // The rest would time out after 10 sec, but we help them along.
   server_messenger->UnregisterAllServices();
   service_pool->Shutdown();
-  thread_pool.Shutdown();
+  thread_pool->Shutdown();
   server_messenger->Shutdown();
 
   for (const auto& thread : threads) {

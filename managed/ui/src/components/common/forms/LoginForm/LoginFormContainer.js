@@ -1,4 +1,4 @@
-// Copyright (c) YugaByte, Inc.
+// Copyright (c) YugabyteDB, Inc.
 
 import LoginForm from './LoginForm';
 import {
@@ -6,9 +6,12 @@ import {
   loginResponse,
   resetCustomerError,
   fetchYugaWareVersion,
-  fetchYugaWareVersionResponse
+  fetchYugaWareVersionResponse,
+  validateToken
 } from '../../../../actions/customers';
 import { connect } from 'react-redux';
+import { api } from '../../../../redesign/features/universe/universe-form/utils/api';
+import { RBAC_RUNTIME_FLAG, setIsRbacEnabled } from '../../../../redesign/features/rbac/common/RbacUtils';
 
 const mapDispatchToProps = (dispatch) => {
   return {

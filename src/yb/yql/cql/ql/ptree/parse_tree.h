@@ -1,5 +1,5 @@
 //--------------------------------------------------------------------------------------------------
-// Copyright (c) YugaByte, Inc.
+// Copyright (c) YugabyteDB, Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License"); you may not use this file except
 // in compliance with the License.  You may obtain a copy of the License at
@@ -103,7 +103,7 @@ class ParseTree {
   Result<SchemaVersion> GetYBTableSchemaVersion() const;
 
   // Check if the used schema version is not in sync with the Master.
-  Result<bool> IsYBTableAltered(QLEnv *ql_env) const;
+  Result<bool> IsYBTableAltered(QLEnv *ql_env, bool use_cache) const;
 
   // Add table to the set of tables used during semantic analysis.
   void AddAnalyzedTable(const client::YBTableName& table_name);

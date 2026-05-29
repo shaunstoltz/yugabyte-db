@@ -1,76 +1,57 @@
+// Copyright (c) YugabyteDB, Inc.
+
 package com.yugabyte.yw.common;
 
-import static play.mvc.Http.Status.INTERNAL_SERVER_ERROR;
-import static play.mvc.Http.Status.FAILED_DEPENDENCY;
-import static play.mvc.Http.Status.BAD_REQUEST;
-
-import java.io.File;
-import java.sql.Timestamp;
-import java.text.SimpleDateFormat;
-import java.util.ArrayList;
-import java.util.Date;
-import java.util.List;
-import java.util.Map;
-import java.util.Optional;
-import java.util.TimeZone;
-import java.util.stream.Stream;
-
-import org.apache.commons.collections.MapUtils;
-import org.apache.commons.io.FileUtils;
-import org.apache.commons.lang3.StringUtils;
-
-import com.amazonaws.SDKGlobalConfiguration;
-import com.amazonaws.SdkClientException;
-import com.amazonaws.auth.AWSCredentials;
-import com.amazonaws.auth.AWSCredentialsProvider;
-import com.amazonaws.auth.AWSSessionCredentials;
-import com.amazonaws.auth.AWSStaticCredentialsProvider;
-import com.amazonaws.auth.AnonymousAWSCredentials;
-import com.amazonaws.auth.EC2ContainerCredentialsProviderWrapper;
-import com.amazonaws.auth.InstanceProfileCredentialsProvider;
-import com.amazonaws.auth.WebIdentityTokenCredentialsProvider;
-import com.amazonaws.auth.profile.ProfileCredentialsProvider;
-import com.amazonaws.client.builder.AwsClientBuilder;
-import com.amazonaws.client.builder.AwsClientBuilder.EndpointConfiguration;
-import com.amazonaws.regions.AwsRegionProvider;
-import com.amazonaws.regions.AwsRegionProviderChain;
-import com.amazonaws.regions.DefaultAwsRegionProviderChain;
-import com.amazonaws.services.identitymanagement.AmazonIdentityManagement;
-import com.amazonaws.services.identitymanagement.AmazonIdentityManagementClientBuilder;
-import com.amazonaws.services.identitymanagement.model.GetRoleRequest;
-import com.amazonaws.services.identitymanagement.model.Role;
-import com.amazonaws.services.s3.internal.RegionalEndpointsOptionResolver;
-import com.amazonaws.services.securitytoken.AWSSecurityTokenService;
-import com.amazonaws.services.securitytoken.AWSSecurityTokenServiceClient;
-import com.amazonaws.services.securitytoken.AWSSecurityTokenServiceClientBuilder;
-import com.amazonaws.services.securitytoken.model.AssumeRoleRequest;
-import com.amazonaws.services.securitytoken.model.AssumeRoleResult;
-import com.amazonaws.services.securitytoken.model.AssumeRoleWithWebIdentityRequest;
-import com.amazonaws.services.securitytoken.model.AssumeRoleWithWebIdentityResult;
-import com.amazonaws.services.securitytoken.model.Credentials;
-import com.amazonaws.services.securitytoken.model.GetCallerIdentityRequest;
-import com.amazonaws.services.securitytoken.model.GetCallerIdentityResult;
-import com.amazonaws.util.EC2MetadataUtils;
-import com.amazonaws.util.EC2MetadataUtils.IAMSecurityCredential;
-import com.google.auth.oauth2.AwsCredentials;
-import com.google.inject.Inject;
-import com.google.inject.Singleton;
+import com.yugabyte.yw.common.config.RuntimeConfGetter;
 import com.yugabyte.yw.models.configs.data.CustomerConfigStorageS3Data;
 import com.yugabyte.yw.models.configs.data.CustomerConfigStorageS3Data.IAMConfiguration;
-
+import java.io.File;
+import java.net.URI;
+import java.util.ArrayList;
+import java.util.List;
 import lombok.extern.slf4j.Slf4j;
+import org.apache.commons.io.FileUtils;
+import org.apache.commons.lang3.StringUtils;
+import software.amazon.awssdk.auth.credentials.*;
+import software.amazon.awssdk.core.exception.SdkClientException;
+import software.amazon.awssdk.regions.Region;
+import software.amazon.awssdk.regions.providers.DefaultAwsRegionProviderChain;
+import software.amazon.awssdk.services.iam.IamClient;
+import software.amazon.awssdk.services.iam.model.GetRoleRequest;
+import software.amazon.awssdk.services.iam.model.Role;
+import software.amazon.awssdk.services.sts.StsClient;
+import software.amazon.awssdk.services.sts.StsClientBuilder;
+import software.amazon.awssdk.services.sts.model.AssumeRoleRequest;
+import software.amazon.awssdk.services.sts.model.AssumeRoleResponse;
+import software.amazon.awssdk.services.sts.model.AssumeRoleWithWebIdentityRequest;
+import software.amazon.awssdk.services.sts.model.AssumeRoleWithWebIdentityResponse;
+import software.amazon.awssdk.services.sts.model.Credentials;
+import software.amazon.awssdk.services.sts.model.GetCallerIdentityRequest;
+import software.amazon.awssdk.services.sts.model.GetCallerIdentityResponse;
 
 @Slf4j
-@Singleton
 public class IAMTemporaryCredentialsProvider {
 
   public static final String STS_DEFAULT_ENDPOINT = "sts.amazonaws.com";
+  private static final String NUM_RETRIES_CONFIG_PATH = "yb.aws.iam_credentials_num_retries";
+  private static final int WAIT_EACH_RETRY_SECS = 5;
+
+  private final RuntimeConfGetter confGetter;
+
+  public IAMTemporaryCredentialsProvider(RuntimeConfGetter confGetter) {
+    this.confGetter = confGetter;
+  }
 
   public enum IAMCredentialSource {
+    // Try all in order WEB_TOKEN > IAM_USER > ASSUME_INSTANCE_ROLE > EC2_INSTANCE
     DEFAULT("default"),
+    // ProfileCredentialsProvider
     IAM_USER("iam_user"),
+    // WebIdentityTokenCredentialsProvider
     WEB_TOKEN("web_token"),
+    // AssumeInstanceRole
     ASSUME_INSTANCE_ROLE("assume_instance_role"),
+    // EC2ContainerCredentialsProvider
     EC2_INSTANCE("ec2_instance");
 
     private final String enumVal;
@@ -84,157 +65,161 @@ public class IAMTemporaryCredentialsProvider {
     }
   }
 
-  public AWSCredentials getTemporaryCredentials(CustomerConfigStorageS3Data s3Data)
-      throws Exception {
-    return CustomAWSCredentials.getTemporaryCredentials(s3Data);
+  public AwsCredentials getTemporaryCredentials(CustomerConfigStorageS3Data s3Data) {
+    List<CustomAWSCredentials> credentialsSource = new ArrayList<>();
+    switch (s3Data.iamConfig.credentialSource) {
+      case ASSUME_INSTANCE_ROLE:
+        credentialsSource.add(new AssumeInstanceRole(s3Data.iamConfig));
+        break;
+      case EC2_INSTANCE:
+        credentialsSource.add(new InstanceProfileCredentials());
+        break;
+      case IAM_USER:
+        credentialsSource.add(new IAMUserCredentials(s3Data.iamConfig.iamUserProfile));
+        break;
+      case WEB_TOKEN:
+        credentialsSource.add(new AssumeRoleWithWebIdentity(s3Data.iamConfig));
+        break;
+      case DEFAULT:
+        log.debug(
+            "Trying chain of credential providers in order:"
+                + " WebIdentityTokenFileCredentialsProvider,"
+                + " ProfileCredentialsProvider,"
+                + " AssumeInstanceRole,"
+                + " ContainerCredentialsProvider");
+        credentialsSource.add(new AssumeRoleWithWebIdentity(s3Data.iamConfig));
+        credentialsSource.add(new IAMUserCredentials(s3Data.iamConfig.iamUserProfile));
+        credentialsSource.add(new AssumeInstanceRole(s3Data.iamConfig));
+        credentialsSource.add(new InstanceProfileCredentials());
+        break;
+      default:
+        throw new RuntimeException(
+            String.format(
+                "Invalid IAM credential source option %s", s3Data.iamConfig.credentialSource));
+    }
+
+    int numRetries = confGetter.getStaticConf().getInt(NUM_RETRIES_CONFIG_PATH);
+    List<String> errorMessages = new ArrayList<>();
+    while (numRetries > 0) {
+      errorMessages.clear();
+      // Loop through credential sources and get working credentials
+      for (CustomAWSCredentials credentialSource : credentialsSource) {
+        try {
+          log.info("Loading IAM credentials from: {}", credentialSource.getSourceName());
+          AwsCredentials credentials = credentialSource.getCredentialsOrFail();
+          log.info("Found IAM credentials in: {}", credentialSource.getSourceName());
+          return credentials;
+        } catch (Exception e) {
+          String message = "Source '" + credentialSource.getSourceName() + "': " + e.getMessage();
+          errorMessages.add(message);
+        }
+      }
+      numRetries--;
+      if (numRetries > 0) {
+        log.debug("Fetching IAM credentials failed, will retry after 5 seconds");
+        try {
+          Thread.sleep(WAIT_EACH_RETRY_SECS * 1000);
+        } catch (InterruptedException e) {
+          throw new RuntimeException("Thread interrupted while sleeping!");
+        }
+      }
+    }
+    throw new RuntimeException("Unable to load AWS credentials: " + errorMessages);
   }
 
   private interface CustomAWSCredentials {
-    AWSCredentials getCredentialsOrFail() throws Exception;
+    AwsCredentials getCredentialsOrFail() throws Exception;
 
-    default Optional<AWSCredentials> optionalGetCredentials() {
-      try {
-        return Optional.of(getCredentialsOrFail());
-      } catch (Exception e) {
-        return Optional.empty();
-      }
-    }
-
-    static AWSCredentials getTemporaryCredentials(CustomerConfigStorageS3Data s3Data) {
-      try {
-        switch (s3Data.iamConfig.credentialSource) {
-          case ASSUME_INSTANCE_ROLE:
-            return new AssumeInstanceRole(s3Data.iamConfig, s3Data.fallbackRegion)
-                .getCredentialsOrFail();
-          case EC2_INSTANCE:
-            return new InstanceProfileCredentials().getCredentialsOrFail();
-          case IAM_USER:
-            return new IAMUserCredentials(s3Data.iamConfig.iamUserProfile).getCredentialsOrFail();
-          case WEB_TOKEN:
-            return new AssumeRoleWithWebIdentity(s3Data.iamConfig, s3Data.fallbackRegion)
-                .getCredentialsOrFail();
-          case DEFAULT:
-            Optional<AWSCredentials> creds =
-                Stream.of(
-                        new AssumeRoleWithWebIdentity(s3Data.iamConfig, s3Data.fallbackRegion),
-                        new IAMUserCredentials(s3Data.iamConfig.iamUserProfile),
-                        new AssumeInstanceRole(s3Data.iamConfig, s3Data.fallbackRegion),
-                        new InstanceProfileCredentials())
-                    .map(CustomAWSCredentials::optionalGetCredentials)
-                    .filter(Optional::isPresent)
-                    .findFirst()
-                    .get();
-            if (creds.isPresent()) {
-              return creds.get();
-            } else {
-              throw new RuntimeException("No credential found in chain.");
-            }
-          default:
-            throw new RuntimeException("Invalid IAM credential source option");
-        }
-      } catch (Exception e) {
-        throw new RuntimeException(e.getCause());
-      }
-    }
+    String getSourceName();
   }
 
   private static class AssumeInstanceRole implements CustomAWSCredentials {
     IAMConfiguration iamConfig;
-    String signingRegion;
+    String stsRegion;
 
-    public AssumeInstanceRole(IAMConfiguration iamConfig, String signingRegion) {
+    @Override
+    public String getSourceName() {
+      return "AssumeInstanceRole";
+    }
+
+    public AssumeInstanceRole(IAMConfiguration iamConfig) {
       this.iamConfig = iamConfig;
-      this.signingRegion = signingRegion;
+      this.stsRegion = iamConfig.stsRegion;
     }
 
     @Override
-    public AWSCredentials getCredentialsOrFail() throws SdkClientException {
+    public AwsCredentials getCredentialsOrFail() throws SdkClientException {
       int maxDuration = iamConfig.duration;
       String roleArn = null;
-      AWSSecurityTokenService stsService =
-          getStandardSTSClientWithoutCredentials(signingRegion, iamConfig.regionalSTS)
-              .withCredentials(new EC2ContainerCredentialsProviderWrapper())
+      StsClient stsService =
+          getStsClientBuilderWithoutCredentials(stsRegion, iamConfig.regionalSTS)
+              .credentialsProvider(ContainerCredentialsProvider.create())
               .build();
 
       try {
         // Fetch max session limit for the role.
-        GetCallerIdentityResult gcResult =
-            stsService.getCallerIdentity(new GetCallerIdentityRequest());
-        String assumedRoleArn = gcResult.getArn();
+        GetCallerIdentityResponse gcResult =
+            stsService.getCallerIdentity(GetCallerIdentityRequest.builder().build());
+        String assumedRoleArn = gcResult.arn();
         String[] arnSplit = assumedRoleArn.split("/", 0);
         String role = arnSplit[arnSplit.length - 2];
-        AmazonIdentityManagement iamClient =
-            AmazonIdentityManagementClientBuilder.standard()
-                .withCredentials(new EC2ContainerCredentialsProviderWrapper())
-                .build();
-        Role iamRole = iamClient.getRole(new GetRoleRequest().withRoleName(role)).getRole();
-        roleArn = iamRole.getArn();
-        maxDuration = iamRole.getMaxSessionDuration();
+        IamClient iamClient =
+            IamClient.builder().credentialsProvider(ContainerCredentialsProvider.create()).build();
+        Role iamRole = iamClient.getRole(GetRoleRequest.builder().roleName(role).build()).role();
+        roleArn = iamRole.arn();
+        maxDuration = iamRole.maxSessionDuration();
       } catch (Exception e) {
-        log.error(
+        log.debug(
             "Could not get maximum duration for role arn: {}. Using default 1 hour instead.",
             roleArn);
       }
       // Generate temporary credentials valid until the max session duration.
       AssumeRoleRequest roleRequest =
-          new AssumeRoleRequest()
-              .withDurationSeconds(maxDuration)
-              .withRoleArn(roleArn)
-              .withRoleSessionName("aws-java-sdk-" + System.currentTimeMillis());
-      AssumeRoleResult roleResult = stsService.assumeRole(roleRequest);
-      Credentials temporaryCredentials = roleResult.getCredentials();
-      AWSSessionCredentials sessionCredentials =
-          new AWSSessionCredentials() {
-            @Override
-            public String getAWSAccessKeyId() {
-              return temporaryCredentials.getAccessKeyId();
-            }
+          AssumeRoleRequest.builder()
+              .durationSeconds(maxDuration)
+              .roleArn(roleArn)
+              .roleSessionName("aws-java-sdk-" + System.currentTimeMillis())
+              .build();
 
-            @Override
-            public String getAWSSecretKey() {
-              return temporaryCredentials.getSecretAccessKey();
-            }
-
-            @Override
-            public String getSessionToken() {
-              return temporaryCredentials.getSessionToken();
-            }
-          };
-      return sessionCredentials;
+      AssumeRoleResponse assumeRoleResponse = stsService.assumeRole(roleRequest);
+      Credentials credentials = assumeRoleResponse.credentials();
+      return AwsSessionCredentials.create(
+          credentials.accessKeyId(), credentials.secretAccessKey(), credentials.sessionToken());
     }
   }
 
   private static class AssumeRoleWithWebIdentity implements CustomAWSCredentials {
     IAMConfiguration iamConfig;
-    String signingRegion;
+    String stsRegion;
 
-    public AssumeRoleWithWebIdentity(IAMConfiguration iamConfig, String signingRegion) {
+    @Override
+    public String getSourceName() {
+      return "WebIdentityTokenCredentialsProvider";
+    }
+
+    public AssumeRoleWithWebIdentity(IAMConfiguration iamConfig) {
       this.iamConfig = iamConfig;
-      this.signingRegion = signingRegion;
+      this.stsRegion = iamConfig.stsRegion;
     }
 
     @Override
-    public AWSCredentials getCredentialsOrFail() throws Exception {
+    public AwsCredentials getCredentialsOrFail() throws Exception {
       String webIdentityRoleArn = null;
       String webToken = null;
       int maxDuration = iamConfig.duration;
 
       // Create STS client to make subsequent calls.
-      AWSSecurityTokenService stsService =
-          getStandardSTSClientWithoutCredentials(signingRegion, iamConfig.regionalSTS)
-              .withCredentials(new AWSStaticCredentialsProvider(new AnonymousAWSCredentials()))
+      StsClient stsService =
+          getStsClientBuilderWithoutCredentials(stsRegion, iamConfig.regionalSTS)
+              .credentialsProvider(AnonymousCredentialsProvider.create())
               .build();
+
       // Fetch AWS_ROLE_ARN from environment( Yugaware is required to have it if service account IAM
       // set).
       // This is how default chain fetches it.
-      try {
-        webIdentityRoleArn = System.getenv("AWS_ROLE_ARN");
-        if (StringUtils.isBlank(webIdentityRoleArn)) {
-          throw new RuntimeException("AWS_ROLE_ARN: blank variable value.");
-        }
-      } catch (Exception e) {
-        throw new RuntimeException(
-            "AWS_ROLE_ARN not found for Web Identity assume role.", e.getCause());
+      webIdentityRoleArn = System.getenv("AWS_ROLE_ARN");
+      if (StringUtils.isBlank(webIdentityRoleArn)) {
+        throw new RuntimeException("AWS_ROLE_ARN: blank variable value.");
       }
 
       // Fetch web-token for making the Assume role request.
@@ -244,90 +229,94 @@ public class IAMTemporaryCredentialsProvider {
                 new File(System.getenv("AWS_WEB_IDENTITY_TOKEN_FILE")), "UTF-8");
       } catch (Exception e) {
         throw new RuntimeException(
-            "Could not get web token for Assume role request.", e.getCause());
+            String.format("Fetching Web Identity token failed: %s", e.getMessage()));
       }
-
       try {
-        // Fetch max session limit for the role.
         String[] arnSplit = webIdentityRoleArn.split("/", 0);
-        AmazonIdentityManagement iamClient =
-            AmazonIdentityManagementClientBuilder.standard()
-                .withCredentials(new WebIdentityTokenCredentialsProvider())
+        String roleName = arnSplit[arnSplit.length - 1];
+
+        IamClient iamClient =
+            IamClient.builder()
+                .credentialsProvider(WebIdentityTokenFileCredentialsProvider.create())
                 .build();
+        ;
         Role iamRole =
-            iamClient
-                .getRole(new GetRoleRequest().withRoleName(arnSplit[arnSplit.length - 1]))
-                .getRole();
-        maxDuration = iamRole.getMaxSessionDuration();
+            iamClient.getRole(GetRoleRequest.builder().roleName(roleName).build()).role();
+        maxDuration = iamRole.maxSessionDuration();
       } catch (Exception e) {
-        log.error(
+        log.debug(
             "Could not get maximum duration for role arn: {}. Using default 1 hour instead.",
             webIdentityRoleArn);
       }
-      AssumeRoleWithWebIdentityRequest stsWebIdentityRequest =
-          new AssumeRoleWithWebIdentityRequest()
-              .withRoleArn(webIdentityRoleArn)
-              .withWebIdentityToken(webToken)
-              .withRoleSessionName("aws-java-sdk-" + System.currentTimeMillis())
-              .withDurationSeconds(maxDuration);
-      AssumeRoleWithWebIdentityResult roleResult =
-          stsService.assumeRoleWithWebIdentity(stsWebIdentityRequest);
-      Credentials temporaryCredentials = roleResult.getCredentials();
-      AWSSessionCredentials sessionCredentials =
-          new AWSSessionCredentials() {
-            @Override
-            public String getAWSAccessKeyId() {
-              return temporaryCredentials.getAccessKeyId();
-            }
 
-            @Override
-            public String getAWSSecretKey() {
-              return temporaryCredentials.getSecretAccessKey();
-            }
+      // Generate temporary credentials valid until the max session duration.
+      AssumeRoleWithWebIdentityRequest roleRequest =
+          AssumeRoleWithWebIdentityRequest.builder()
+              .durationSeconds(maxDuration)
+              .roleArn(webIdentityRoleArn)
+              .webIdentityToken(webToken)
+              .roleSessionName("aws-java-sdk-" + System.currentTimeMillis())
+              .build();
 
-            @Override
-            public String getSessionToken() {
-              return temporaryCredentials.getSessionToken();
-            }
-          };
-      return sessionCredentials;
+      AssumeRoleWithWebIdentityResponse assumeRoleResponse =
+          stsService.assumeRoleWithWebIdentity(roleRequest);
+      Credentials credentials = assumeRoleResponse.credentials();
+      return AwsSessionCredentials.create(
+          credentials.accessKeyId(), credentials.secretAccessKey(), credentials.sessionToken());
     }
   }
 
   private static class InstanceProfileCredentials implements CustomAWSCredentials {
-
     public InstanceProfileCredentials() {}
 
     @Override
-    public AWSCredentials getCredentialsOrFail() throws Exception {
-      AWSCredentialsProvider ec2CredentialsProvider = new EC2ContainerCredentialsProviderWrapper();
-      ec2CredentialsProvider.refresh();
-      return ec2CredentialsProvider.getCredentials();
+    public String getSourceName() {
+      return "EC2ContainerCredentialsProvider";
+    }
+
+    @Override
+    public AwsCredentials getCredentialsOrFail() throws Exception {
+      return InstanceProfileCredentialsProvider.create().resolveCredentials();
     }
   }
 
   private static class IAMUserCredentials implements CustomAWSCredentials {
-
     String profileName;
+
+    @Override
+    public String getSourceName() {
+      return "ProfileCredentialsProvider";
+    }
 
     public IAMUserCredentials(String profileName) {
       this.profileName = profileName;
     }
 
     @Override
-    public AWSCredentials getCredentialsOrFail() throws Exception {
-      return new ProfileCredentialsProvider(profileName).getCredentials();
+    public AwsCredentials getCredentialsOrFail() throws Exception {
+      return ProfileCredentialsProvider.builder()
+          .profileName(profileName)
+          .build()
+          .resolveCredentials();
     }
   }
 
-  public static AWSSecurityTokenServiceClientBuilder getStandardSTSClientWithoutCredentials(
-      String fallbackRegion, boolean regionalSTS) {
-    fallbackRegion = AWSUtil.getClientRegion(fallbackRegion);
-    String stsEndpoint = STS_DEFAULT_ENDPOINT;
-    if (regionalSTS) {
-      stsEndpoint = String.format("sts.%s.amazonaws.com", fallbackRegion);
+  private static StsClientBuilder getStsClientBuilderWithoutCredentials(
+      String stsRegion, boolean regionalSTS) {
+    String region = stsRegion;
+    if (StringUtils.isBlank(region)) {
+      try {
+        region = new DefaultAwsRegionProviderChain().getRegion().id();
+      } catch (SdkClientException e) {
+        log.trace("No region found in Default region chain.");
+      }
     }
-    return AWSSecurityTokenServiceClientBuilder.standard()
-        .withEndpointConfiguration(new EndpointConfiguration(stsEndpoint, fallbackRegion));
+    // If region still empty, revert to default region.
+    region = StringUtils.isBlank(region) ? "us-east-1" : region;
+    StsClientBuilder builder = StsClient.builder().region(Region.of(region));
+    if (!regionalSTS) {
+      builder.endpointOverride(URI.create("https://" + STS_DEFAULT_ENDPOINT));
+    }
+    return builder;
   }
 }

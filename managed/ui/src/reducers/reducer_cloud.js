@@ -1,4 +1,4 @@
-// Copyright (c) YugaByte, Inc.
+// Copyright (c) YugabyteDB, Inc.
 
 import {
   GET_REGION_LIST,
@@ -96,7 +96,7 @@ const INITIAL_STATE = {
   selectedProvider: null,
   error: null,
   accessKeys: getInitialState([]),
-  allAccessKeysReqCompleted: false, 
+  allAccessKeysReqCompleted: false,
   bootstrap: getInitialState({}),
   dockerBootstrap: getInitialState({}),
   status: 'init',
@@ -310,6 +310,7 @@ export default function (state = INITIAL_STATE, action) {
       return setInitialState(state, 'bootstrap');
 
     case LIST_ACCESS_KEYS:
+      // eslint-disable-next-line @typescript-eslint/prefer-nullish-coalescing
       return setLoadingState(state, 'accessKeys', state.accessKeys.data || []);
 
     case LIST_ACCESS_KEYS_RESPONSE:

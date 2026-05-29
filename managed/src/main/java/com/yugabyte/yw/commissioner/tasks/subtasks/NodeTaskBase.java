@@ -1,5 +1,5 @@
 /*
- * Copyright 2019 YugaByte, Inc. and Contributors
+ * Copyright 2019 YugabyteDB, Inc. and Contributors
  *
  * Licensed under the Polyform Free Trial License 1.0.0 (the "License"); you
  * may not use this file except in compliance with the License. You
@@ -12,11 +12,13 @@ package com.yugabyte.yw.commissioner.tasks.subtasks;
 
 import com.fasterxml.jackson.databind.JsonNode;
 import com.yugabyte.yw.commissioner.BaseTaskDependencies;
+import com.yugabyte.yw.commissioner.Common.CloudType;
 import com.yugabyte.yw.commissioner.tasks.UniverseDefinitionTaskBase;
 import com.yugabyte.yw.commissioner.tasks.params.NodeTaskParams;
 import com.yugabyte.yw.common.NodeManager;
 import com.yugabyte.yw.common.RecoverableException;
 import com.yugabyte.yw.models.TaskInfo;
+import com.yugabyte.yw.models.Universe;
 import com.yugabyte.yw.models.helpers.NodeDetails;
 import com.yugabyte.yw.models.helpers.NodeStatus;
 import javax.inject.Inject;
@@ -25,12 +27,9 @@ import play.libs.Json;
 
 @Slf4j
 public abstract class NodeTaskBase extends UniverseDefinitionTaskBase {
-  private final NodeManager nodeManager;
-
   @Inject
-  protected NodeTaskBase(BaseTaskDependencies baseTaskDependencies, NodeManager nodeManager) {
+  protected NodeTaskBase(BaseTaskDependencies baseTaskDependencies) {
     super(baseTaskDependencies);
-    this.nodeManager = nodeManager;
   }
 
   public NodeManager getNodeManager() {
@@ -45,11 +44,11 @@ public abstract class NodeTaskBase extends UniverseDefinitionTaskBase {
   @Override
   public String getName() {
     NodeTaskParams taskParams = taskParams();
-    return super.getName() + "(" + taskParams.universeUUID + ", " + taskParams.nodeName + ")";
+    return super.getName() + "(" + taskParams.getUniverseUUID() + ", " + taskParams.nodeName + ")";
   }
 
   @Override
-  public JsonNode getTaskDetails() {
+  public JsonNode getTaskParams() {
     return Json.toJson(taskParams);
   }
 
@@ -63,22 +62,28 @@ public abstract class NodeTaskBase extends UniverseDefinitionTaskBase {
   }
 
   @Override
-  public void onFailure(TaskInfo taskInfo, Throwable cause) {
+  public boolean onFailure(TaskInfo taskInfo, Throwable cause) {
     if (cause instanceof RecoverableException) {
       NodeTaskParams params = taskParams();
-
-      log.warn("Encountered a recoverable error, rebooting node {}", params.nodeName);
-
-      RebootServer.Params rebootParams = new RebootServer.Params();
+      // Universe UUID and node name are always set.
+      Universe universe = Universe.getOrBadRequest(params.getUniverseUUID());
+      CloudType cloudType = universe.getNodeDeploymentMode(universe.getNode(params.nodeName));
+      if (!cloudType.isPublicCloud()) {
+        log.warn("Skipping reboot of {} for non-public cloud {}", params.nodeName, cloudType);
+        return false;
+      }
+      log.warn("Encountered a recoverable error, hard rebooting node {}", params.nodeName);
+      NodeTaskParams rebootParams = new NodeTaskParams();
       rebootParams.nodeName = params.nodeName;
-      rebootParams.universeUUID = params.universeUUID;
+      rebootParams.setUniverseUUID(params.getUniverseUUID());
       rebootParams.azUuid = params.azUuid;
-      rebootParams.useSSH = false;
 
-      RebootServer task = createTask(RebootServer.class);
+      HardRebootServer task = createTask(HardRebootServer.class);
       task.initialize(rebootParams);
-      task.setUserTaskUUID(userTaskUUID);
+      task.setUserTaskUUID(getUserTaskUUID());
       task.run();
+      return true;
     }
+    return false;
   }
 }

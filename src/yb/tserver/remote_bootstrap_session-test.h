@@ -15,9 +15,9 @@
 // specific language governing permissions and limitations
 // under the License.
 //
-// The following only applies to changes made to this file as part of YugaByte development.
+// The following only applies to changes made to this file as part of YugabyteDB development.
 //
-// Portions Copyright (c) YugaByte, Inc.
+// Portions Copyright (c) YugabyteDB, Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License"); you may not use this file except
 // in compliance with the License.  You may obtain a copy of the License at
@@ -33,11 +33,11 @@
 
 #include <memory>
 
-#include <glog/logging.h>
+#include "yb/util/logging.h"
 #include <gtest/gtest.h>
 
 #include "yb/consensus/consensus_fwd.h"
-#include "yb/common/partial_row.h"
+#include "yb/dockv/partial_row.h"
 #include "yb/common/wire_protocol-test-util.h"
 
 #include "yb/consensus/consensus_meta.h"
@@ -106,6 +106,7 @@ class RemoteBootstrapSessionTest : public YBTabletTest {
   MetricRegistry metric_registry_;
   scoped_refptr<LogAnchorRegistry> log_anchor_registry_;
   std::unique_ptr<ThreadPool> raft_pool_;
+  std::unique_ptr<rpc::ThreadPool> raft_notifications_pool_;
   std::unique_ptr<ThreadPool> tablet_prepare_pool_;
   std::unique_ptr<ThreadPool> log_thread_pool_;
   std::shared_ptr<TabletPeer> tablet_peer_;

@@ -1,5 +1,5 @@
 //
-// Copyright (c) YugaByte, Inc.
+// Copyright (c) YugabyteDB, Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License"); you may not use this file except
 // in compliance with the License.  You may obtain a copy of the License at
@@ -87,7 +87,7 @@ struct SharedPtrTuple : public TypeIndexer<Types ...> {
   template <class Type>
   bool has_type() const { return super::template index_of<Type>() >= 0; }
 
-  void reset() { super::template reset_tail(&storage_); }
+  void reset() { super::template reset_tail<>(&storage_); }
 
  protected:
   typedef TypeIndexer<Types ...> super;

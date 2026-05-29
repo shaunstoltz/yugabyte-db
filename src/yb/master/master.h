@@ -15,9 +15,9 @@
 // specific language governing permissions and limitations
 // under the License.
 //
-// The following only applies to changes made to this file as part of YugaByte development.
+// The following only applies to changes made to this file as part of YugabyteDB development.
 //
-// Portions Copyright (c) YugaByte, Inc.
+// Portions Copyright (c) YugabyteDB, Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License"); you may not use this file except
 // in compliance with the License.  You may obtain a copy of the License at
@@ -44,12 +44,16 @@
 #include "yb/gutil/thread_annotations.h"
 #include "yb/gutil/macros.h"
 
-#include "yb/master/master_fwd.h"
 #include "yb/master/master_defaults.h"
+#include "yb/master/master_fwd.h"
 #include "yb/master/master_options.h"
 #include "yb/master/master_tserver.h"
+#include "yb/master/tablet_health_manager.h"
+
 #include "yb/server/server_base.h"
+
 #include "yb/tserver/db_server_base.h"
+
 #include "yb/util/status_fwd.h"
 
 namespace yb {
@@ -58,7 +62,7 @@ class MaintenanceManager;
 class RpcServer;
 class ServerEntryPB;
 class ThreadPool;
-class AutoFlagsManager;
+class AutoFlagsManagerBase;
 class AutoFlagsConfigPB;
 
 namespace server {
@@ -67,14 +71,22 @@ struct RpcServerOptions;
 
 }
 
+namespace rpc {
+
+class SecureContext;
+
+}
+
 namespace master {
+
+class MasterAutoFlagsManager;
 
 class Master : public tserver::DbServerBase {
  public:
   explicit Master(const MasterOptions& opts);
   virtual ~Master();
 
-  virtual Status InitAutoFlags() override;
+  virtual Status InitFlags(rpc::Messenger* messenger) override;
   Status InitAutoFlagsFromMasterLeader(const HostPort& leader_address);
   Status Init() override;
   Status Start() override;
@@ -95,17 +107,43 @@ class Master : public tserver::DbServerBase {
 
   TSManager* ts_manager() const { return ts_manager_.get(); }
 
+  MasterTabletServer* tablet_server() const { return master_tablet_server_.get(); }
+
   CatalogManagerIf* catalog_manager() const;
 
-  enterprise::CatalogManager* catalog_manager_impl() const { return catalog_manager_.get(); }
+  CatalogManager* catalog_manager_impl() const { return CHECK_NOTNULL(catalog_manager_.get()); }
+
+  TabletSplitManager& tablet_split_manager() const;
+
+  XClusterManagerIf* xcluster_manager() const;
+
+  XClusterManager* xcluster_manager_impl() const;
+
+  YsqlManagerIf& ysql_manager() const;
+
+  YsqlManager& ysql_manager_impl() const;
 
   FlushManager* flush_manager() const { return flush_manager_.get(); }
 
-  AutoFlagsManager* auto_flags_manager() { return auto_flags_manager_.get(); }
+  TestAsyncRpcManager* test_async_rpc_manager() const { return test_async_rpc_manager_.get(); }
+
+  TabletHealthManager* tablet_health_manager() const { return tablet_health_manager_.get(); }
+
+  MasterClusterHandler* master_cluster_handler() const { return master_cluster_handler_.get(); }
+
+  YsqlBackendsManager* ysql_backends_manager() const {
+    return ysql_backends_manager_.get();
+  }
 
   PermissionsManager& permissions_manager();
 
   EncryptionManager& encryption_manager();
+
+  MasterAutoFlagsManager* GetAutoFlagsManagerImpl() { return auto_flags_manager_.get(); }
+
+  CloneStateManager& clone_state_manager() const;
+
+  MasterSnapshotCoordinator& snapshot_coordinator() const;
 
   scoped_refptr<MetricEntity> metric_entity_cluster();
 
@@ -158,20 +196,16 @@ class Master : public tserver::DbServerBase {
   uint32_t GetAutoFlagConfigVersion() const override;
   AutoFlagsConfigPB GetAutoFlagsConfig() const;
 
-  yb::client::AsyncClientInitialiser& async_client_initializer() {
-    return *async_client_init_;
-  }
+  const std::shared_future<client::YBClient*>& client_future() const;
 
-  yb::client::AsyncClientInitialiser& cdc_state_client_initializer() {
-    return *cdc_state_client_init_;
-  }
+  const std::shared_future<client::YBClient*>& cdc_state_client_future() const;
 
   enum MasterMetricType {
     TaskMetric,
     AttemptMetric,
   };
 
-  // Function that returns an object pointer to a RPC's histogram metric. If a histogram
+  // Function that returns an object pointer to an RPC's histogram metric. If a histogram
   // metric pointer is not created, it will create a new object pointer and return it.
   scoped_refptr<Histogram> GetMetric(const std::string& metric_identifier,
                                      Master::MasterMetricType type,
@@ -183,12 +217,46 @@ class Master : public tserver::DbServerBase {
   }
 
   Status get_ysql_db_oid_to_cat_version_info_map(
-      bool size_only, tserver::GetTserverCatalogVersionInfoResponsePB *resp) const;
+      const tserver::GetTserverCatalogVersionInfoRequestPB& req,
+      tserver::GetTserverCatalogVersionInfoResponsePB *resp) const;
+
+  Status GetTserverCatalogMessageLists(
+      const tserver::GetTserverCatalogMessageListsRequestPB& req,
+      tserver::GetTserverCatalogMessageListsResponsePB *resp) const;
+
+  Status SetTserverCatalogMessageList(
+      uint32_t db_oid, bool is_breaking_change, uint64_t new_catalog_version,
+      const std::optional<std::string>& message_list);
+
+  void TriggerRelcacheInitConnection(
+    const tserver::TriggerRelcacheInitConnectionRequestPB& req,
+    StdStatusCallback callback);
+
+  void EnableCDCService();
+
+  Status ReloadKeysAndCertificates() override;
+
+  std::string GetCertificateDetails() override;
+
+  void WriteServerMetaCacheAsJson(JsonWriter* writer) override;
+
+  const std::string& permanent_uuid() const override;
+
+  void RegisterCertificateReloader(tserver::CertificateReloader reloader) override {}
+  void RegisterPgProcessRestarter(std::function<Status(void)> restarter) override {}
+  void RegisterPgProcessKiller(std::function<Status(void)> killer) override {}
+  void RegisterPgConfigGenerator(pgwrapper::PgConfigGenerator generator) override {}
 
  protected:
-  virtual Status RegisterServices();
+  Status RegisterServices();
 
   void DisplayGeneralInfoIcons(std::stringstream* output) override;
+
+  Status SetupMessengerBuilder(rpc::MessengerBuilder* builder) override;
+
+  Result<std::unordered_set<std::string>> GetAvailableAutoFlagsForServer() const override;
+
+  Result<std::unordered_set<std::string>> GetFlagsForServer() const override;
 
  private:
   friend class MasterTest;
@@ -210,17 +278,30 @@ class Master : public tserver::DbServerBase {
 
   MonoDelta default_client_timeout() override;
 
-  const std::string& permanent_uuid() const override;
-
-  void SetupAsyncClientInit(client::AsyncClientInitialiser* async_client_init) override;
+  void SetupAsyncClientInit(client::AsyncClientInitializer* async_client_init) override;
 
   std::atomic<MasterState> state_;
 
-  std::unique_ptr<AutoFlagsManager> auto_flags_manager_;
+  // The metric entity for the cluster.
+  scoped_refptr<MetricEntity> metric_entity_cluster_;
+
+  // Master's tablet server implementation used to host virtual tables like system.peers.
+  std::unique_ptr<MasterTabletServer> master_tablet_server_;
+
+  std::unique_ptr<SysCatalogTable> sys_catalog_;
   std::unique_ptr<TSManager> ts_manager_;
-  std::unique_ptr<enterprise::CatalogManager> catalog_manager_;
+  std::unique_ptr<CatalogManager> catalog_manager_;
+  std::unique_ptr<MasterAutoFlagsManager> auto_flags_manager_;
+  std::unique_ptr<YsqlBackendsManager> ysql_backends_manager_;
   std::unique_ptr<MasterPathHandlers> path_handlers_;
   std::unique_ptr<FlushManager> flush_manager_;
+  std::unique_ptr<TabletHealthManager> tablet_health_manager_;
+  std::unique_ptr<MasterClusterHandler> master_cluster_handler_;
+  std::unique_ptr<TabletSplitManager> tablet_split_manager_;
+  std::unique_ptr<CloneStateManager> clone_state_manager_;
+  std::unique_ptr<MasterSnapshotCoordinator> snapshot_coordinator_;
+
+  std::unique_ptr<TestAsyncRpcManager> test_async_rpc_manager_;
 
   // For initializing the catalog manager.
   std::unique_ptr<ThreadPool> init_pool_;
@@ -237,15 +318,11 @@ class Master : public tserver::DbServerBase {
   // The maintenance manager for this master.
   std::shared_ptr<MaintenanceManager> maintenance_manager_;
 
-  // The metric entity for the cluster.
-  scoped_refptr<MetricEntity> metric_entity_cluster_;
-
-  // Master's tablet server implementation used to host virtual tables like system.peers.
-  std::unique_ptr<MasterTabletServer> master_tablet_server_;
-
-  std::unique_ptr<yb::client::AsyncClientInitialiser> cdc_state_client_init_;
+  std::unique_ptr<yb::client::AsyncClientInitializer> cdc_state_client_init_;
   std::mutex master_metrics_mutex_;
   std::map<std::string, scoped_refptr<Histogram>> master_metrics_ GUARDED_BY(master_metrics_mutex_);
+
+  std::unique_ptr<rpc::SecureContext> secure_context_;
 
   DISALLOW_COPY_AND_ASSIGN(Master);
 };

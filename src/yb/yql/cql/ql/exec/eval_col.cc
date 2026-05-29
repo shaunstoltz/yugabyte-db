@@ -1,5 +1,5 @@
 //--------------------------------------------------------------------------------------------------
-// Copyright (c) YugaByte, Inc.
+// Copyright (c) YugabyteDB, Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License"); you may not use this file except
 // in compliance with the License.  You may obtain a copy of the License at
@@ -14,6 +14,7 @@
 //--------------------------------------------------------------------------------------------------
 
 #include "yb/common/jsonb.h"
+#include "yb/common/ql_protocol.messages.h"
 #include "yb/common/ql_value.h"
 
 #include "yb/util/result.h"
@@ -30,12 +31,10 @@
 namespace yb {
 namespace ql {
 
-using std::shared_ptr;
-
 //--------------------------------------------------------------------------------------------------
 
 Status Executor::ColumnRefsToPB(const PTDmlStmt *tnode,
-                                QLReferencedColumnsPB *columns_pb) {
+                                QLReferencedColumnsMsg *columns_pb) {
   // Write a list of columns to be read before executing the statement.
   const MCSet<int32>& column_refs = tnode->column_refs();
   for (auto column_ref : column_refs) {
@@ -49,7 +48,7 @@ Status Executor::ColumnRefsToPB(const PTDmlStmt *tnode,
   return Status::OK();
 }
 
-Status Executor::ColumnArgsToPB(const PTDmlStmt *tnode, QLWriteRequestPB *req) {
+Status Executor::ColumnArgsToPB(const PTDmlStmt *tnode, QLWriteRequestMsg *req) {
   const MCVector<ColumnArg>& column_args = tnode->column_args();
 
   for (const ColumnArg& col : column_args) {
@@ -68,21 +67,27 @@ Status Executor::ColumnArgsToPB(const PTDmlStmt *tnode, QLWriteRequestPB *req) {
       if(VERIFY_RESULT(exec_context_->params().IsBindVariableUnset(bind_pt->name()->c_str(),
                                                                    bind_pt->pos()))) {
         VLOG(3) << "Value unset for column: " << bind_pt->name()->c_str();
+        if (col_desc->is_primary()) {
+          VLOG(3) << "Unexpected value unset for primary key. Current request: "
+                  << req->ShortDebugString();
+          return exec_context_->Error(tnode, ErrorCode::NULL_ARGUMENT_FOR_PRIMARY_KEY);
+        }
+
         continue;
       }
     }
 
-    QLExpressionPB *expr_pb = CreateQLExpression(req, *col_desc);
+    auto *expr_pb = CreateQLExpression(req, *col_desc);
 
     RETURN_NOT_OK(PTExprToPB(expr, expr_pb));
 
     if (col_desc->is_primary()) {
-      RETURN_NOT_OK(EvalExpr(expr_pb, QLTableRow::empty_row()));
+      RETURN_NOT_OK(EvalExpr(expr_pb, qlexpr::QLTableRow::empty_row()));
     }
 
     // Null values not allowed for primary key: checking here catches nulls introduced by bind.
     if (col_desc->is_primary() && expr_pb->has_value() && IsNull(expr_pb->value())) {
-      LOG(INFO) << "Unexpected null value. Current request: " << req->DebugString();
+      LOG(INFO) << "Unexpected null value. Current request: " << req->ShortDebugString();
       return exec_context_->Error(tnode, ErrorCode::NULL_ARGUMENT_FOR_PRIMARY_KEY);
     }
   }
@@ -90,19 +95,19 @@ Status Executor::ColumnArgsToPB(const PTDmlStmt *tnode, QLWriteRequestPB *req) {
   const MCVector<SubscriptedColumnArg>& subcol_args = tnode->subscripted_col_args();
   for (const SubscriptedColumnArg& col : subcol_args) {
     const ColumnDesc *col_desc = col.desc();
-    QLColumnValuePB *col_pb = req->add_column_values();
+    auto *col_pb = req->add_column_values();
     col_pb->set_column_id(col_desc->id());
-    QLExpressionPB *expr_pb = col_pb->mutable_expr();
+    auto *expr_pb = col_pb->mutable_expr();
     RETURN_NOT_OK(PTExprToPB(col.expr(), expr_pb));
     for (auto& col_arg : col.args()->node_list()) {
-      QLExpressionPB *arg_pb = col_pb->add_subscript_args();
+      auto *arg_pb = col_pb->add_subscript_args();
       RETURN_NOT_OK(PTExprToPB(col_arg, arg_pb));
     }
   }
 
   const MCVector<JsonColumnArg>& jsoncol_args = tnode->json_col_args();
   for (const JsonColumnArg& col : jsoncol_args) {
-    QLExpressionPB expr_pb;
+    LWQLExpressionPB expr_pb(&req->arena());
     RETURN_NOT_OK(PTExprToPB(col.expr(), &expr_pb));
 
     if (tnode->opcode() == TreeNodeOpcode::kPTUpdateStmt) {
@@ -121,12 +126,12 @@ Status Executor::ColumnArgsToPB(const PTDmlStmt *tnode, QLWriteRequestPB *req) {
     }
 
     const ColumnDesc *col_desc = col.desc();
-    QLColumnValuePB *col_pb = req->add_column_values();
+    auto *col_pb = req->add_column_values();
     col_pb->set_column_id(col_desc->id());
     *(col_pb->mutable_expr()) = expr_pb;
 
     for (auto& col_arg : col.args()->node_list()) {
-      QLJsonOperationPB *arg_pb = col_pb->add_json_args();
+      auto *arg_pb = col_pb->add_json_args();
       RETURN_NOT_OK(PTJsonOperatorToPB(std::dynamic_pointer_cast<PTJsonOperator>(col_arg), arg_pb));
     }
   }

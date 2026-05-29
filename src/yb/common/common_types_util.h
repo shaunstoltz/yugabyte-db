@@ -1,4 +1,4 @@
-// Copyright (c) YugaByte, Inc.
+// Copyright (c) YugabyteDB, Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License"); you may not use this file except
 // in compliance with the License.  You may obtain a copy of the License at
@@ -14,6 +14,7 @@
 #pragma once
 
 #include "yb/common/common_types.pb.h"
+#include "yb/util/strongly_typed_uuid.h"
 
 namespace yb {
 
@@ -27,5 +28,7 @@ const char* DatabaseTypeName(YQLDatabase db);
 
 // Returns the db type from its string name.
 YQLDatabase DatabaseTypeByName(const std::string& db_type_name);
+
+YB_STRONGLY_TYPED_UUID_DECL(UniverseUuid);
 
 } // namespace yb

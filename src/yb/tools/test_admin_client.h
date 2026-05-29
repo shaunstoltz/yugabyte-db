@@ -1,4 +1,4 @@
-// Copyright (c) YugaByte, Inc.
+// Copyright (c) YugabyteDB, Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License"); you may not use this file except
 // in compliance with the License.  You may obtain a copy of the License at
@@ -24,6 +24,7 @@
 
 #include "yb/master/master_admin.proxy.h"
 #include "yb/master/master_client.pb.h"
+#include "yb/master/master_fwd.h"
 
 #include "yb/util/tsan_util.h"
 #include "yb/util/status.h"
@@ -58,21 +59,27 @@ class TestAdminClient {
   Result<bool> IsTabletSplittingComplete(bool wait_for_parent_deletion);
 
   Result<std::vector<master::TabletLocationsPB>> GetTabletLocations(
-      const client::YBTableName& table);
+      const client::YBTableName& table,
+      master::IncludeInactive include_inactive = master::IncludeInactive::kFalse);
   Result<std::vector<master::TabletLocationsPB>> GetTabletLocations(
-      const std::string& ns, const std::string& table);
+      const std::string& ns, const std::string& table,
+      master::IncludeInactive include_inactive = master::IncludeInactive::kFalse);
 
-  Status WaitForTabletFullyCompacted(size_t tserver_idx, const TabletId& tablet_id);
+  Status WaitForTabletPostSplitCompacted(size_t tserver_idx, const TabletId& tablet_id);
 
   Status FlushTable(const std::string& ns, const std::string& table);
 
   Result<TxnSnapshotId> CreateSnapshotAndWait(
-      const std::optional<SnapshotScheduleId>& schedule_id = std::nullopt);
+      const SnapshotScheduleId& schedule_id = SnapshotScheduleId(Uuid::Nil()),
+      const master::TableIdentifierPB& tables = {},
+      const std::optional<int32_t> retention_duration_hours = std::nullopt);
+
+  Status DeleteSnapshotAndWait(const TxnSnapshotId& snapshot_id);
 
   Result<TxnSnapshotId> CreateSnapshot(
-      const std::optional<SnapshotScheduleId>& schedule_id = std::nullopt);
-
-  Status WaitForSnapshotComplete(const TxnSnapshotId& snapshot_id);
+      const SnapshotScheduleId& schedule_id, const master::TableIdentifierPB& tables,
+      const std::optional<int32_t> retention_duration_hours);
+  Status WaitForSnapshotComplete(const TxnSnapshotId& snapshot_id, bool check_deleted = false);
 
  private:
   ExternalMiniCluster* cluster_;

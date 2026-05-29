@@ -1,4 +1,4 @@
-// Copyright (c) YugaByte, Inc.
+// Copyright (c) YugabyteDB, Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License"); you may not use this file except
 // in compliance with the License.  You may obtain a copy of the License at
@@ -12,6 +12,8 @@
 //
 
 #include "yb/integration-tests/ts_itest-base.h"
+
+#include "yb/common/opid.h"
 
 #include "yb/client/client.h"
 #include "yb/client/schema.h"
@@ -30,18 +32,17 @@
 
 #include "yb/server/server_base.proxy.h"
 
-#include "yb/util/opid.h"
 #include "yb/util/random_util.h"
 #include "yb/util/status_log.h"
 #include "yb/util/flags.h"
 
 using std::pair;
 
-DEFINE_UNKNOWN_string(ts_flags, "", "Flags to pass through to tablet servers");
-DEFINE_UNKNOWN_string(master_flags, "", "Flags to pass through to masters");
+DEFINE_NON_RUNTIME_string(ts_flags, "", "Flags to pass through to tablet servers");
+DEFINE_NON_RUNTIME_string(master_flags, "", "Flags to pass through to masters");
 
-DEFINE_UNKNOWN_int32(num_tablet_servers, 3, "Number of tablet servers to start");
-DEFINE_UNKNOWN_int32(num_replicas, 3, "Number of replicas per tablet server");
+DEFINE_NON_RUNTIME_int32(num_tablet_servers, 3, "Number of tablet servers to start");
+DEFINE_NON_RUNTIME_int32(num_replicas, 3, "Number of replicas per tablet server");
 
 namespace yb {
 namespace tserver {
@@ -65,7 +66,8 @@ void TabletServerIntegrationTestBase::AddExtraFlags(
 void TabletServerIntegrationTestBase::CreateCluster(
     const std::string& data_root_path,
     const std::vector<std::string>& non_default_ts_flags,
-    const std::vector<std::string>& non_default_master_flags) {
+    const std::vector<std::string>& non_default_master_flags,
+    bool enable_ysql) {
   LOG(INFO) << "Starting cluster with:";
   LOG(INFO) << "--------------";
   LOG(INFO) << FLAGS_num_tablet_servers << " tablet servers";
@@ -75,6 +77,8 @@ void TabletServerIntegrationTestBase::CreateCluster(
   ExternalMiniClusterOptions opts;
   opts.num_tablet_servers = FLAGS_num_tablet_servers;
   opts.data_root = GetTestPath(data_root_path);
+  opts.enable_ysql = enable_ysql;
+  opts.replication_factor = FLAGS_num_replicas;
 
   // If the caller passed no flags use the default ones, where we stress consensus by setting
   // low timeouts and frequent cache misses.
@@ -90,7 +94,6 @@ void TabletServerIntegrationTestBase::CreateCluster(
   // Disable load balancer for master by default for these tests. You can override this through
   // setting flags in the passed in non_default_master_flags argument.
   opts.extra_master_flags.push_back("--enable_load_balancing=false");
-  opts.extra_master_flags.push_back(yb::Format("--replication_factor=$0", FLAGS_num_replicas));
   for (const std::string& flag : non_default_master_flags) {
     opts.extra_master_flags.push_back(flag);
   }
@@ -156,7 +159,7 @@ void TabletServerIntegrationTestBase::WaitForReplicasAndUpdateLocations() {
 
   tablet_id_ = (*tablet_replicas_.begin()).first;
   CHECK_OK(WaitUntilAllTabletReplicasRunning(TServerDetailsVector(tablet_replicas_), tablet_id_,
-                                               10s * kTimeMultiplier));
+                                             30s * kTimeMultiplier));
 }
 
 // Returns the last committed leader of the consensus configuration. Tries to get it from master
@@ -425,8 +428,9 @@ void TabletServerIntegrationTestBase::CreateTable() {
 // flags to pass to the tablet servers.
 void TabletServerIntegrationTestBase::BuildAndStart(
     const std::vector<std::string>& ts_flags,
-    const std::vector<std::string>& master_flags) {
-  CreateCluster("raft_consensus-itest-cluster", ts_flags, master_flags);
+    const std::vector<std::string>& master_flags,
+    bool enable_ysql) {
+  CreateCluster("raft_consensus-itest-cluster", ts_flags, master_flags, enable_ysql);
   client_ = ASSERT_RESULT(CreateClient());
   ASSERT_NO_FATALS(CreateTable());
   WaitForTSAndReplicas();

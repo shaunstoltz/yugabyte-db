@@ -1,4 +1,4 @@
-// Copyright (c) YugaByte, Inc.
+// Copyright (c) YugabyteDB, Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License"); you may not use this file except
 // in compliance with the License.  You may obtain a copy of the License at
@@ -19,6 +19,7 @@
 
 #include "yb/gutil/endian.h"
 
+#include "yb/util/result.h"
 #include "yb/util/status_fwd.h"
 #include "yb/util/slice.h"
 #include "yb/util/uuid.h"
@@ -33,36 +34,61 @@
   typedef boost::hash<TypeName> BOOST_PP_CAT(TypeName, Hash); \
   Result<TypeName> BOOST_PP_CAT(FullyDecode, TypeName)(const Slice& slice); \
   TypeName BOOST_PP_CAT(TryFullyDecode, TypeName)(const Slice& slice); \
-  Result<TypeName> BOOST_PP_CAT(Decode, TypeName)(Slice* slice); \
+  Result<TypeName> BOOST_PP_CAT(Decode, TypeName)(Slice * slice); \
   Result<TypeName> BOOST_PP_CAT(TypeName, FromString)(const std::string& strval); \
-  Result<TypeName> FromStringHelper(TypeName*, const std::string& strval);
+  std::string ToStringHelper(const TypeName& uuid); \
+  Result<TypeName> FromStringHelper(TypeName*, const std::string& strval); \
+  size_t GetStaticStringSizeHelper(TypeName*);
 
-#define YB_STRONGLY_TYPED_UUID_IMPL(TypeName) \
+#define __YB_STRONGLY_TYPED_UUID_IMPL_BASE(TypeName) \
   [[maybe_unused]] Result<TypeName> BOOST_PP_CAT(FullyDecode, TypeName)(const Slice& slice) { \
     return TypeName(VERIFY_RESULT(yb::Uuid::FullyDecode(slice, BOOST_PP_STRINGIZE(TypeName)))); \
   } \
   [[maybe_unused]] TypeName BOOST_PP_CAT(TryFullyDecode, TypeName)(const Slice& slice) { \
     return TypeName(yb::Uuid::TryFullyDecode(slice)); \
   } \
-  [[maybe_unused]] Result<TypeName> BOOST_PP_CAT(Decode, TypeName)(Slice* slice) { \
+  [[maybe_unused]] Result<TypeName> BOOST_PP_CAT(Decode, TypeName)(Slice * slice) { \
     return TypeName(VERIFY_RESULT(yb::Uuid::Decode(slice))); \
-  } \
-  [[maybe_unused]] Result<TypeName> BOOST_PP_CAT(TypeName, FromString)(const std::string& strval) \
-  { \
-    return TypeName(VERIFY_RESULT(::yb::Uuid::FromString(strval))); \
   } \
   [[maybe_unused]] Result<TypeName> FromStringHelper(TypeName*, const std::string& strval) { \
     return BOOST_PP_CAT(TypeName, FromString)(strval); \
   }
 
+#define YB_STRONGLY_TYPED_UUID_IMPL(TypeName) \
+  [[maybe_unused]] std::string ToStringHelper(const TypeName& uuid) { \
+    return uuid.GetUuid().ToString(); \
+  } \
+  [[maybe_unused]] Result<TypeName> BOOST_PP_CAT( \
+      TypeName, FromString)(const std::string& strval) { \
+    return TypeName(VERIFY_RESULT(::yb::Uuid::FromString(strval))); \
+  } \
+  [[maybe_unused]] size_t GetStaticStringSizeHelper(TypeName*) { return 36; } \
+  __YB_STRONGLY_TYPED_UUID_IMPL_BASE(TypeName)
+
+// Same as YB_STRONGLY_TYPED_UUID_IMPL, but converts to and from a hex string (no dashes)
+// representation.
+#define YB_STRONGLY_TYPED_HEX_UUID_IMPL(TypeName) \
+  [[maybe_unused]] std::string ToStringHelper(const TypeName& uuid) { \
+    return uuid.GetUuid().ToHexString(); \
+  } \
+  [[maybe_unused]] Result<TypeName> BOOST_PP_CAT( \
+      TypeName, FromString)(const std::string& strval) { \
+    return TypeName(VERIFY_RESULT(::yb::Uuid::FromHexString(strval))); \
+  } \
+  [[maybe_unused]] size_t GetStaticStringSizeHelper(TypeName*) { return 32; } \
+  __YB_STRONGLY_TYPED_UUID_IMPL_BASE(TypeName)
+
 #define YB_STRONGLY_TYPED_UUID(TypeName) \
   YB_STRONGLY_TYPED_UUID_DECL(TypeName) \
   YB_STRONGLY_TYPED_UUID_IMPL(TypeName)
+
 namespace yb {
 
 template <class Tag>
 class StronglyTypedUuid {
  public:
+  StronglyTypedUuid() = default;
+
   // This is public so that we can construct a strongly-typed UUID value out of a regular one.
   // In that case we'll have to spell out the class name, which will enforce readability.
   explicit StronglyTypedUuid(const Uuid& uuid) : uuid_(uuid) {}
@@ -79,11 +105,7 @@ class StronglyTypedUuid {
     return uuid_.impl();
   }
 
-  // Converts a UUID to a string, returns "<Undefined{ClassName}>" if UUID is undefined, where
-  // {ClassName} is the name associated with the Tag class.
-  std::string ToString() const {
-    return uuid_.ToString();
-  }
+  const Uuid& GetUuid() const { return uuid_; }
 
   // Returns true iff the UUID is nil.
   bool IsNil() const {
@@ -114,6 +136,10 @@ class StronglyTypedUuid {
   static StronglyTypedUuid<Tag> Nil() {
     return StronglyTypedUuid(Uuid::Nil());
   }
+
+  // Converts a UUID to a string, returns "<Undefined{ClassName}>" if UUID is undefined, where
+  // {ClassName} is the name associated with the Tag class.
+  std::string ToString() const { return ToStringHelper(*this); }
 
   // Converts a string to a StronglyTypedUuid, if such a conversion exists.
   // The empty string maps to undefined.
@@ -151,7 +177,7 @@ class StronglyTypedUuid {
   }
 
   static size_t StaticStringSize() {
-    return 36;
+    return GetStaticStringSizeHelper(static_cast<StronglyTypedUuid<Tag>*>(nullptr));
   }
 
  private:
@@ -165,33 +191,14 @@ std::ostream& operator << (std::ostream& out, const StronglyTypedUuid<Tag>& uuid
 }
 
 template <class Tag>
-bool operator == (const StronglyTypedUuid<Tag>& lhs, const StronglyTypedUuid<Tag>& rhs) noexcept {
+bool operator== (const StronglyTypedUuid<Tag>& lhs, const StronglyTypedUuid<Tag>& rhs) noexcept {
   return *lhs == *rhs;
 }
 
 template <class Tag>
-bool operator != (const StronglyTypedUuid<Tag>& lhs, const StronglyTypedUuid<Tag>& rhs) noexcept {
-  return !(lhs == rhs);
-}
-
-template <class Tag>
-bool operator < (const StronglyTypedUuid<Tag>& lhs, const StronglyTypedUuid<Tag>& rhs) noexcept {
-  return *lhs < *rhs;
-}
-
-template <class Tag>
-bool operator > (const StronglyTypedUuid<Tag>& lhs, const StronglyTypedUuid<Tag>& rhs) noexcept {
-  return rhs < lhs;
-}
-
-template <class Tag>
-bool operator <= (const StronglyTypedUuid<Tag>& lhs, const StronglyTypedUuid<Tag>& rhs) noexcept {
-  return !(rhs < lhs);
-}
-
-template <class Tag>
-bool operator >= (const StronglyTypedUuid<Tag>& lhs, const StronglyTypedUuid<Tag>& rhs) noexcept {
-  return !(lhs < rhs);
+std::strong_ordering operator <=> (
+    const StronglyTypedUuid<Tag>& lhs, const StronglyTypedUuid<Tag>& rhs) noexcept {
+  return std::compare_strong_order_fallback(*lhs, *rhs);
 }
 
 template <class Tag>
@@ -199,4 +206,14 @@ std::size_t hash_value(const StronglyTypedUuid<Tag>& u) noexcept {
   return hash_value(*u);
 }
 
-} // namespace yb
+}  // namespace yb
+
+namespace std {
+template <class Tag>
+struct hash<yb::StronglyTypedUuid<Tag>> {
+  size_t operator()(const yb::StronglyTypedUuid<Tag>& strong_uuid) const {
+    return yb::hash_value(strong_uuid);
+  }
+};
+
+}  // namespace std

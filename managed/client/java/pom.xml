@@ -18,9 +18,9 @@
 // specific language governing permissions and limitations
 // under the License.
 //
-// The following only applies to changes made to this file as part of YugaByte development.
+// The following only applies to changes made to this file as part of YugabyteDB development.
 //
-// Portions Copyright (c) YugaByte, Inc.
+// Portions Copyright (c) YugabyteDB, Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License"); you may not use this file except
 // in compliance with the License.  You may obtain a copy of the License at
@@ -39,14 +39,14 @@
   <modelVersion>4.0.0</modelVersion>
 
   <groupId>com.yugabyte</groupId>
-  <artifactId>platform-parent</artifactId>
-  <version>2.7.3.0</version>
+  <artifactId>yba</artifactId>
+  <version>2.0.0</version>
   <packaging>pom</packaging>
 
-  <name>YugaByte</name>
+  <name>Yugabyte Anywhere Java client SDK</name>
 
   <description>
-    YugaByte Platform client
+    Yugabyte Anywhere Java client SDK
   </description>
 
   <!-- Properties Management -->
@@ -60,16 +60,31 @@
   </properties>
 
   <modules>
-    <module>platform-client</module>
+    <module>v1</module>
+    <module>v2</module>
   </modules>
 
   <build>
+    <plugins>
+      <plugin>
+        <groupId>org.apache.maven.plugins</groupId>
+        <artifactId>maven-javadoc-plugin</artifactId>
+        <configuration>
+          <javadocExecutable>${java.home}/bin/javadoc</javadocExecutable>
+        </configuration>
+      </plugin>
+    </plugins>
     <extensions>
       <extension>
         <groupId>com.github.seahen</groupId>
         <artifactId>maven-s3-wagon</artifactId>
         <version>${maven-s3-wagon.version}</version>
-     </extension>
+      </extension>
+      <extension>
+        <groupId>com.google.cloud.artifactregistry</groupId>
+        <artifactId>artifactregistry-maven-wagon</artifactId>
+        <version>2.2.5</version>
+      </extension>
     </extensions>
   </build>
 

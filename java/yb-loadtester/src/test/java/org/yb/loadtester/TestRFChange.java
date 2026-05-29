@@ -1,4 +1,4 @@
-// Copyright (c) YugaByte, Inc.
+// Copyright (c) YugabyteDB, Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License"); you may not use this file except
 // in compliance with the License.  You may obtain a copy of the License at
@@ -14,11 +14,11 @@ package org.yb.loadtester;
 
 import org.junit.Test;
 
-import org.yb.util.YBTestRunnerNonTsanOnly;
+import org.yb.YBTestRunner;
 
 import org.junit.runner.RunWith;
 
-@RunWith(value=YBTestRunnerNonTsanOnly.class)
+@RunWith(value=YBTestRunner.class)
 public class TestRFChange extends TestClusterBase {
 
   @Test(timeout = TEST_TIMEOUT_SEC * 1000) // 10 minutes.

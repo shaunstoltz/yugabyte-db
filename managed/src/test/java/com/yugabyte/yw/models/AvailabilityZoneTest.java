@@ -1,4 +1,4 @@
-// Copyright (c) Yugabyte, Inc.
+// Copyright (c) YugabyteDB, Inc.
 
 package com.yugabyte.yw.models;
 
@@ -16,7 +16,6 @@ import com.google.common.collect.ImmutableMap;
 import com.yugabyte.yw.common.FakeDBApplication;
 import com.yugabyte.yw.common.ModelFactory;
 import com.yugabyte.yw.models.helpers.CloudInfoInterface;
-
 import java.util.Map;
 import java.util.Set;
 import org.junit.Before;
@@ -37,9 +36,9 @@ public class AvailabilityZoneTest extends FakeDBApplication {
   public void testCreate() {
     AvailabilityZone az =
         AvailabilityZone.createOrThrow(defaultRegion, "az-1", "A Zone", "subnet-1");
-    assertEquals(az.code, "az-1");
-    assertEquals(az.name, "A Zone");
-    assertEquals(az.region.code, "region-1");
+    assertEquals(az.getCode(), "az-1");
+    assertEquals(az.getName(), "A Zone");
+    assertEquals(az.getRegion().getCode(), "region-1");
     assertTrue(az.isActive());
   }
 
@@ -58,15 +57,15 @@ public class AvailabilityZoneTest extends FakeDBApplication {
     AvailabilityZone az =
         AvailabilityZone.createOrThrow(defaultRegion, "az-1", "A Zone", "subnet-1");
 
-    assertEquals(az.code, "az-1");
-    assertEquals(az.name, "A Zone");
-    assertEquals(az.region.code, "region-1");
+    assertEquals(az.getCode(), "az-1");
+    assertEquals(az.getName(), "A Zone");
+    assertEquals(az.getRegion().getCode(), "region-1");
     assertTrue(az.isActive());
 
-    az.setActiveFlag(false);
+    az.setActive(false);
     az.save();
 
-    AvailabilityZone fetch = AvailabilityZone.find.byId(az.uuid);
+    AvailabilityZone fetch = AvailabilityZone.find.byId(az.getUuid());
     assertFalse(fetch.isActive());
   }
 
@@ -76,10 +75,10 @@ public class AvailabilityZoneTest extends FakeDBApplication {
     AvailabilityZone.createOrThrow(defaultRegion, "az-2", "A Zone 2", "subnet-2");
 
     Set<AvailabilityZone> zones =
-        AvailabilityZone.find.query().where().eq("region_uuid", defaultRegion.uuid).findSet();
+        AvailabilityZone.find.query().where().eq("region_uuid", defaultRegion.getUuid()).findSet();
     assertEquals(zones.size(), 2);
     for (AvailabilityZone zone : zones) {
-      assertThat(zone.code, containsString("az-"));
+      assertThat(zone.getCode(), containsString("az-"));
     }
   }
 
@@ -96,7 +95,7 @@ public class AvailabilityZoneTest extends FakeDBApplication {
   public void testNullConfig() {
     AvailabilityZone az =
         AvailabilityZone.createOrThrow(defaultRegion, "az-1", "A Zone", "subnet-1");
-    assertNotNull(az.uuid);
+    assertNotNull(az.getUuid());
     Map<String, String> envVars = CloudInfoInterface.fetchEnvVars(az);
     assertTrue(envVars.isEmpty());
   }
@@ -108,7 +107,18 @@ public class AvailabilityZoneTest extends FakeDBApplication {
     az.updateConfig(ImmutableMap.of("Foo", "Bar"));
     az.save();
     Map<String, String> envVars = CloudInfoInterface.fetchEnvVars(az);
-    assertNotNull(az.uuid);
+    assertNotNull(az.getUuid());
     assertNotNull(envVars.toString(), allOf(notNullValue(), equalTo("{Foo=Bar}")));
+  }
+
+  @Test
+  public void testAzCodeLength() {
+    String azCode = String.valueOf('A').repeat(110);
+    try {
+      AvailabilityZone az =
+          AvailabilityZone.createOrThrow(defaultRegion, azCode, "A Zone", "subnet-1");
+    } catch (Exception e) {
+      assertTrue(e.getMessage().contains("Unable to create zone: " + azCode));
+    }
   }
 }

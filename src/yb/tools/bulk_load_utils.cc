@@ -1,4 +1,4 @@
-// Copyright (c) YugaByte, Inc.
+// Copyright (c) YugabyteDB, Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License"); you may not use this file except
 // in compliance with the License.  You may obtain a copy of the License at
@@ -21,15 +21,15 @@
 
 using std::string;
 
-DEFINE_UNKNOWN_string(csv_delimiter, ",", "The character used to separate different columns.");
-DEFINE_UNKNOWN_string(
-    csv_quote_character, "\"", "The character used to quote a column that may have a delimiter.");
-DEFINE_UNKNOWN_string(skipped_cols, "", "Comma separated list of 0-indexed columns to skip");
+DEFINE_NON_RUNTIME_string(csv_delimiter, ",", "The character used to separate different columns.");
+DEFINE_NON_RUNTIME_string(csv_quote_character, "\"",
+    "The character used to quote a column that may have a delimiter.");
+DEFINE_NON_RUNTIME_string(skipped_cols, "", "Comma separated list of 0-indexed columns to skip");
 
 namespace {
-static bool CSVSeparatorValidator(const char* flagname, const string& value) {
+static bool CSVSeparatorValidator(const char* flag_name, const string& value) {
   if (value.size() != 1) {
-    LOG(INFO) << "Expect " << flagname << " to be 1 character long";
+    LOG_FLAG_VALIDATION_ERROR(flag_name, value) << "Must be 1 character long";
     return false;
   }
   return true;

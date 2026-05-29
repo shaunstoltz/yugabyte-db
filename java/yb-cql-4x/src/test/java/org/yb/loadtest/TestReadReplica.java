@@ -1,4 +1,4 @@
-// Copyright (c) YugaByte, Inc.
+// Copyright (c) YugabyteDB, Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License"); you may not use this file except
 // in compliance with the License.  You may obtain a copy of the License at
@@ -11,6 +11,9 @@
 // under the License.
 //
 package org.yb.loadtest;
+
+import static org.yb.AssertionWrappers.assertEquals;
+import static org.yb.AssertionWrappers.assertTrue;
 
 import com.datastax.oss.driver.api.core.ConsistencyLevel;
 import com.datastax.oss.driver.api.core.CqlSession;
@@ -25,35 +28,30 @@ import com.google.common.collect.ImmutableMap;
 import com.google.common.net.HostAndPort;
 import com.google.protobuf.ByteString;
 import com.yugabyte.oss.driver.internal.core.loadbalancing.PartitionAwarePolicy;
+import java.net.InetSocketAddress;
+import java.time.Duration;
+import java.util.*;
 import org.junit.Test;
 import org.junit.runner.RunWith;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
+import org.yb.CommonNet.PlacementBlockPB;
+import org.yb.CommonNet.PlacementInfoPB;
 import org.yb.ColumnSchema;
-import org.yb.Common;
 import org.yb.CommonTypes;
 import org.yb.Schema;
 import org.yb.Type;
 import org.yb.client.*;
-import org.yb.consensus.Metadata;
-import org.yb.master.CatalogEntityInfo.PlacementBlockPB;
-import org.yb.master.CatalogEntityInfo.PlacementInfoPB;
 import org.yb.minicluster.BaseMiniClusterTest;
 import org.yb.minicluster.Metrics;
 import org.yb.minicluster.MiniYBCluster;
 import org.yb.minicluster.MiniYBDaemon;
-import org.yb.util.YBTestRunnerNonTsanOnly;
+import org.yb.YBTestRunner;
+import org.yb.util.RequiresLinux;
 
-import java.net.InetSocketAddress;
-import java.time.Duration;
-import java.util.*;
-
-import static org.yb.AssertionWrappers.assertEquals;
-import static org.yb.AssertionWrappers.assertTrue;
-
-@RunWith(value= YBTestRunnerNonTsanOnly.class)
+@RequiresLinux
+@RunWith(value = YBTestRunner.class)
 public class TestReadReplica extends BaseMiniClusterTest {
-
   protected static final Logger LOG = LoggerFactory.getLogger(TestReadReplica.class);
   private static final String PLACEMENT_CLOUD = "testCloud";
   private static final String PLACEMENT_REGION_LIVE = "testRegionLive";
@@ -125,10 +123,12 @@ public class TestReadReplica extends BaseMiniClusterTest {
 
     PlacementInfoPB livePlacementInfo =
       PlacementInfoPB.newBuilder().addAllPlacementBlocks(placementBlocksLive).
+        setNumReplicas(3).
         setPlacementUuid(ByteString.copyFromUtf8(liveTsPlacement)).build();
 
     PlacementInfoPB readOnlyPlacementInfo =
       PlacementInfoPB.newBuilder().addAllPlacementBlocks(placementBlocksReadOnly).
+        setNumReplicas(3).
         setPlacementUuid(ByteString.copyFromUtf8(readOnlyTsPlacement)).build();
 
     List<PlacementInfoPB> readOnlyPlacements = Arrays.asList(readOnlyPlacementInfo);

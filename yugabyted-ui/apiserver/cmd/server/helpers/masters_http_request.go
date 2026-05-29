@@ -3,8 +3,10 @@ package helpers
 import (
     "encoding/json"
     "fmt"
-    "io/ioutil"
+    "io"
+    "net"
     "net/http"
+    "net/url"
     "time"
 )
 
@@ -54,15 +56,79 @@ type MastersFuture struct {
     Error error `json:"error"`
 }
 
-func GetMastersFuture(nodeHost string, future chan MastersFuture) {
+func (h *HelperContainer) GetMastersFuture(future chan MastersFuture) {
     masters := MastersFuture{
         Masters: []Master{},
         Error: nil,
     }
+    // Note: we don't use the BuildMasterURLs helper here, because it might call this function
+    // and cause infinite recursion
+    mastersListFuture := make(chan MastersListFuture)
+    go h.GetMastersFromTserverFuture(HOST, mastersListFuture)
+    mastersListResponse := <-mastersListFuture
+    masterAddresses := []string{}
+    if mastersListResponse.Error != nil {
+        h.logger.Warnf("failed to get masters list from tserver at %s: %s",
+            HOST, mastersListResponse.Error.Error())
+        // In this case, assume current node is a master
+        masterAddresses = append(masterAddresses, HOST)
+    } else {
+        masterAddresses = h.ExtractMasterAddressesList(mastersListResponse)
+    }
+    urlList := []string{}
+    for _, host := range masterAddresses {
+        url, err := url.JoinPath(fmt.Sprintf("http://%s", net.JoinHostPort(host, MasterUIPort)),
+            "api/v1/masters")
+        if err != nil {
+            h.logger.Warnf("failed to construct url for host: %s port: %s with path %s",
+                host, MasterUIPort, "api/v1/masters")
+            continue
+        }
+        urlList = append(urlList, url)
+    }
+    body, _, err := h.AttemptGetRequests(urlList, true)
+    if err != nil {
+        masters.Error = err
+        future <- masters
+        return
+    }
+    err = json.Unmarshal([]byte(body), &masters)
+    if err != nil {
+        h.logger.Debugf("unable to parse json: %s", body)
+        future <- masters
+        return
+    }
+    masters.Error = err
+    future <- masters
+    // Update cache if successful
+    if err == nil {
+        masterAddresses := h.ExtractMasterAddresses(masters)
+        MasterAddressCache.Update(masterAddresses)
+        h.logger.Debugf("updated cached master addresses %v", masterAddresses)
+    }
+}
+
+type MasterAddressAndType struct {
+    HostPort string `json:"master_server"`
+    IsLeader bool   `json:"is_leader"`
+}
+
+type MastersListFuture struct {
+    Masters []MasterAddressAndType `json:"master_server_and_type"`
+    Error   error
+}
+func (h *HelperContainer) GetMastersFromTserverFuture(
+    nodeHost string,
+    future chan MastersListFuture,
+) {
+    masters := MastersListFuture{
+        Masters: []MasterAddressAndType{},
+        Error:   nil,
+    }
     httpClient := &http.Client{
         Timeout: time.Second * 10,
     }
-    url := fmt.Sprintf("http://%s:7000/api/v1/masters", nodeHost)
+    url := fmt.Sprintf("http://%s/api/v1/masters", net.JoinHostPort(nodeHost, TserverUIPort))
     resp, err := httpClient.Get(url)
     if err != nil {
         masters.Error = err
@@ -70,7 +136,7 @@ func GetMastersFuture(nodeHost string, future chan MastersFuture) {
         return
     }
     defer resp.Body.Close()
-    body, err := ioutil.ReadAll(resp.Body)
+    body, err := io.ReadAll(resp.Body)
     if err != nil {
         masters.Error = err
         future <- masters
@@ -83,4 +149,48 @@ func GetMastersFuture(nodeHost string, future chan MastersFuture) {
     }
     masters.Error = err
     future <- masters
+    // Update cache if successful
+    if err == nil {
+        masterAddresses := h.ExtractMasterAddressesList(masters)
+        MasterAddressCache.Update(masterAddresses)
+        h.logger.Debugf("updated cached master addresses %v", masterAddresses)
+    }
+}
+
+// Get master addresses from MastersFuture, from master server response
+func (h *HelperContainer) ExtractMasterAddresses(masters MastersFuture) []string {
+    addresses := []string{}
+    count := 0
+    for _, master := range masters.Masters {
+        if len(master.Registration.PrivateRpcAddresses) > 0 {
+            host := master.Registration.PrivateRpcAddresses[0].Host
+            addresses = append(addresses, host)
+            if host == HOST {
+                addresses[0], addresses[count] = addresses[count], addresses[0]
+            }
+            count += 1
+        } else {
+            h.logger.Warnf("couldn't find private rpc address of a master")
+        }
+    }
+    return addresses
+}
+
+// Get master addresses from MastersListFuture, from tserver response
+func (h *HelperContainer) ExtractMasterAddressesList(masters MastersListFuture) []string {
+    addresses := []string{}
+    count := 0
+    for _, master := range masters.Masters {
+        host, _, err := net.SplitHostPort(master.HostPort)
+        if err != nil {
+            h.logger.Warnf("failed to split host and port of %s", master.HostPort)
+            continue
+        }
+        addresses = append(addresses, host)
+        if host == HOST {
+            addresses[0], addresses[count] = addresses[count], addresses[0]
+        }
+        count += 1
+    }
+    return addresses
 }

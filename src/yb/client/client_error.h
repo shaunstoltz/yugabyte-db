@@ -1,4 +1,4 @@
-// Copyright (c) YugaByte, Inc.
+// Copyright (c) YugabyteDB, Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License"); you may not use this file except
 // in compliance with the License.  You may obtain a copy of the License at
@@ -13,16 +13,19 @@
 
 #pragma once
 
+#include <string>
+#include <string_view>
+
 #include "yb/util/enums.h"
-#include "yb/util/math_util.h"
+#include "yb/util/tostring.h"
 #include "yb/util/status.h"
 #include "yb/util/status_ec.h"
 
-namespace yb {
-namespace client {
+using namespace std::literals;
 
-YB_DEFINE_ENUM(
-    ClientErrorCode,
+namespace yb::client {
+
+YB_DEFINE_ENUM(ClientErrorCode,
     // Special value used to indicate no error of this type.
     (kNone)
     (kTablePartitionListIsStale)
@@ -35,7 +38,7 @@ YB_DEFINE_ENUM(
 
 struct ClientErrorTag : IntegralErrorTag<ClientErrorCode> {
   // It is part of the wire protocol and should not be changed once released.
-  static constexpr uint8_t kCategory = 12;
+  static constexpr CategoryDescriptor kCategory{12, "client error"sv};
 
   static std::string ToMessage(Value value) {
     return ToString(value);
@@ -48,5 +51,4 @@ using ClientError = StatusErrorCodeImpl<ClientErrorTag>;
 // If status is OK, also returns false.
 bool IsRetryableClientError(const Status& status);
 
-} // namespace client
-} // namespace yb
+} // namespace yb::client

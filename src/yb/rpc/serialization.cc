@@ -15,9 +15,9 @@
 // specific language governing permissions and limitations
 // under the License.
 //
-// The following only applies to changes made to this file as part of YugaByte development.
+// The following only applies to changes made to this file as part of YugabyteDB development.
 //
-// Portions Copyright (c) YugaByte, Inc.
+// Portions Copyright (c) YugabyteDB, Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License"); you may not use this file except
 // in compliance with the License.  You may obtain a copy of the License at
@@ -41,8 +41,11 @@
 #include "yb/rpc/constants.h"
 #include "yb/rpc/lightweight_message.h"
 
+#include "yb/rpc/call_data.h"
 #include "yb/rpc/rpc_header.pb.h"
+#include "yb/rpc/sidecars.h"
 
+#include "yb/util/crc.h"
 #include "yb/util/faststring.h"
 #include "yb/util/ref_cnt_buffer.h"
 #include "yb/util/result.h"
@@ -55,12 +58,17 @@ using google::protobuf::MessageLite;
 using google::protobuf::io::CodedInputStream;
 using google::protobuf::io::CodedOutputStream;
 
-namespace yb {
-namespace rpc {
+namespace yb::rpc {
+
+// tag + 4 bytes values
+constexpr size_t kCrcFieldSize = 5;
 
 size_t SerializedMessageSize(size_t body_size, size_t additional_size) {
   auto full_size = body_size + additional_size;
-  return body_size + CodedOutputStream::VarintSize32(narrow_cast<uint32_t>(full_size));
+  // VarintSize64 used to avoid casting errors. There is a separate constraint later enforced where
+  // size <= rpc_max_message_size <= protobuf_message_total_bytes_limit < 512 MB, so we never end up
+  // in a case where we actually send RPCs with size that doesn't fit in 32 bits.
+  return body_size + CodedOutputStream::VarintSize64(full_size);
 }
 
 Status SerializeMessage(
@@ -103,6 +111,10 @@ Status SerializeHeader(const MessageLite& header,
       + header_pb_len;                                  // Length for the header PB itself.
   size_t total_size = header_tot_len + param_len;
 
+  if (total_size > FLAGS_rpc_max_message_size) {
+    return STATUS_FORMAT(InvalidArgument, "Sending too long RPC message ($0 bytes)", total_size);
+  }
+
   *header_buf = RefCntBuffer(header_tot_len + reserve_for_param);
   if (header_size != nullptr) {
     *header_size = header_tot_len;
@@ -124,7 +136,7 @@ Status SerializeHeader(const MessageLite& header,
   return Status::OK();
 }
 
-Result<RefCntBuffer> SerializeRequest(
+Result<std::pair<RefCntBuffer, size_t>> SerializeResponse(
     size_t body_size, size_t additional_size, const google::protobuf::Message& header,
     AnyMessageConstPtr body) {
   auto message_size = SerializedMessageSize(body_size, additional_size);
@@ -134,7 +146,7 @@ Result<RefCntBuffer> SerializeRequest(
       header, message_size + additional_size, &result, message_size, &header_size));
 
   RETURN_NOT_OK(SerializeMessage(body, body_size, result, additional_size, header_size));
-  return result;
+  return std::pair{result, header_size};
 }
 
 bool SkipField(uint8_t type, CodedInputStream* in) {
@@ -167,7 +179,7 @@ Result<Slice> ParseString(const Slice& buf, const char* name, CodedInputStream* 
 }
 
 Status ParseHeader(
-    const Slice& buf, CodedInputStream* in, ParsedRequestHeader* parsed_header) {
+    Slice buf, CodedInputStream* in, ParsedRequestHeader* parsed_header) {
   while (in->BytesUntilLimit() > 0) {
     auto tag = in->ReadTag();
     auto field = tag >> 3;
@@ -187,6 +199,36 @@ Status ParseHeader(
           return STATUS(Corruption, "Unable to decode timeout_ms field");
         }
         break;
+      case RequestHeader::kSidecarOffsetsFieldNumber: {
+          uint32 length;
+          if (!in->ReadVarint32(&length)) {
+            return STATUS(Corruption, "Unable to decode sidecars field length");
+          }
+          auto start = pointer_cast<const uint32_t*>(buf.data() + in->CurrentPosition());
+          parsed_header->sidecar_offsets = boost::make_iterator_range(
+              start, start + length / sizeof(uint32_t));
+          in->Skip(length);
+        }
+        break;
+      case RequestHeader::kPoolTagFieldNumber: {
+          uint32_t pool_tag;
+          if (!in->ReadVarint32(&pool_tag)) {
+            return STATUS(Corruption, "Unable to decode pool_tag field");
+          }
+          parsed_header->pool_tag = pool_tag;
+        }
+        break;
+      case RequestHeader::kCrcFieldNumber: {
+          uint32_t crc;
+          if (!in->ReadLittleEndian32(&crc)) {
+            return STATUS(Corruption, "Unable to decode CRC field");
+          }
+          parsed_header->crc = crc;
+        }
+        break;
+      case RequestHeader::kMetadataFieldNumber:
+        parsed_header->metadata = VERIFY_RESULT(ParseString(buf, "metadata", in));
+        break;
       default: {
         if (!SkipField(tag & 7, in)) {
           return STATUS_FORMAT(Corruption, "Unable to skip: $0", tag);
@@ -198,7 +240,7 @@ Status ParseHeader(
   return Status::OK();
 }
 
-Status ParseHeader(const Slice& buf, CodedInputStream* in, MessageLite* parsed_header) {
+Status ParseHeader(Slice buf, CodedInputStream* in, MessageLite* parsed_header) {
   if (PREDICT_FALSE(!parsed_header->ParseFromCodedStream(in))) {
     return STATUS(Corruption, "Invalid packet: header too short",
                               buf.ToDebugString());
@@ -209,10 +251,19 @@ Status ParseHeader(const Slice& buf, CodedInputStream* in, MessageLite* parsed_h
 
 namespace {
 
+std::optional<uint32_t> GetCrc(const ParsedRequestHeader& header) {
+  return header.crc;
+}
+
+std::optional<uint32_t> GetCrc(const ResponseHeader& header) {
+  if (header.has_crc()) {
+    return header.crc();
+  }
+  return std::nullopt;
+}
+
 template <class Header>
-Status DoParseYBMessage(const Slice& buf,
-                        Header* parsed_header,
-                        Slice* parsed_main_message) {
+Result<Slice> ParseYBHeader(Slice buf, Header* parsed_header) {
   CodedInputStream in(buf.data(), narrow_cast<int>(buf.size()));
   SetupLimit(&in);
 
@@ -225,6 +276,18 @@ Status DoParseYBMessage(const Slice& buf,
   auto l = in.PushLimit(header_len);
   RETURN_NOT_OK(ParseHeader(buf, &in, parsed_header));
   in.PopLimit(l);
+
+  if (auto crc = GetCrc(*parsed_header)) {
+    crc::Crc32Accumulator msg_crc;
+    msg_crc.Feed(buf.Prefix(in.CurrentPosition() - kCrcFieldSize));
+    msg_crc.Feed(buf.WithoutPrefix(in.CurrentPosition()));
+    if (msg_crc.result() != *crc) {
+      auto status = STATUS_FORMAT(
+          Corruption, "Invalid CRC $0 for $1", msg_crc.result(), *parsed_header);
+      LOG(DFATAL) << status;
+      return status;
+    }
+  }
 
   uint32_t main_msg_len;
   if (PREDICT_FALSE(!in.ReadVarint32(&main_msg_len))) {
@@ -244,23 +307,47 @@ Status DoParseYBMessage(const Slice& buf,
       buf.ToDebugString());
   }
 
-  *parsed_main_message = Slice(buf.data() + buf.size() - main_msg_len,
-                              main_msg_len);
+  return buf.Suffix(main_msg_len);
+}
+
+const auto& sidecar_offsets(const ParsedRequestHeader& header) {
+  return header.sidecar_offsets;
+}
+
+auto sidecar_offsets(const ResponseHeader& header) {
+  auto start = header.sidecar_offsets().data();
+  return boost::make_iterator_range(start, start + header.sidecar_offsets_size());
+}
+
+template <class Header>
+Status DoParseYBMessage(
+    const CallData& call_data, Header* header, Slice* serialized_pb, ReceivedSidecars* sidecars) {
+  auto entire_message = VERIFY_RESULT(ParseYBHeader(call_data.AsSlice(), header));
+
+  // Use information from header to extract the payload slices.
+  auto offsets = sidecar_offsets(*header);
+
+  if (!offsets.empty()) {
+    *serialized_pb = entire_message.Prefix(offsets[0]);
+    RETURN_NOT_OK(sidecars->Parse(entire_message, offsets));
+  } else {
+    *serialized_pb = entire_message;
+  }
   return Status::OK();
 }
 
 } // namespace
 
-Status ParseYBMessage(const Slice& buf,
-                      ParsedRequestHeader* parsed_header,
-                      Slice* parsed_main_message) {
-  return DoParseYBMessage(buf, parsed_header, parsed_main_message);
+Status ParseYBMessage(
+    const CallData& call_data, ResponseHeader* header, Slice* serialized_pb,
+    ReceivedSidecars* sidecars) {
+  return DoParseYBMessage(call_data, header, serialized_pb, sidecars);
 }
 
-Status ParseYBMessage(const Slice& buf,
-                      MessageLite* parsed_header,
-                      Slice* parsed_main_message) {
-  return DoParseYBMessage(buf, parsed_header, parsed_main_message);
+Status ParseYBMessage(
+    const CallData& call_data, ParsedRequestHeader* header, Slice* serialized_pb,
+    ReceivedSidecars* sidecars) {
+  return DoParseYBMessage(call_data, header, serialized_pb, sidecars);
 }
 
 Result<ParsedRemoteMethod> ParseRemoteMethod(const Slice& buf) {
@@ -307,7 +394,52 @@ void ParsedRequestHeader::ToPB(RequestHeader* out) const {
     out->mutable_remote_method()->set_service_name(parsed_remote_method->service.ToBuffer());
     out->mutable_remote_method()->set_method_name(parsed_remote_method->method.ToBuffer());
   }
+  if (pool_tag) {
+    out->set_pool_tag(pool_tag);
+  }
+  if (crc) {
+    out->set_crc(*crc);
+  }
 }
 
-}  // namespace rpc
-}  // namespace yb
+std::string ParsedRequestHeader::ToString() const {
+  return YB_STRUCT_TO_STRING(
+      (remote_method, RemoteMethodAsString()), call_id, timeout_ms, sidecar_offsets, pool_tag, crc);
+}
+
+Status ParseMetadata(Slice buf, AnyMessagePtr out) {
+  CodedInputStream in(buf.data(), narrow_cast<int>(buf.size()));
+  in.PushLimit(narrow_cast<int>(buf.size()));
+  auto* message = out.protobuf();
+  if (PREDICT_FALSE(!message->ParseFromCodedStream(&in))) {
+    return STATUS(InvalidArgument, message->InitializationErrorString());
+  }
+  return Status::OK();
+}
+
+Status ParseMetadataFromSharedMemory(
+    uint8_t** input, size_t length, AnyMessagePtr out) {
+  CodedInputStream in(*input, narrow_cast<int>(length));
+  in.PushLimit(narrow_cast<int>(length));
+  auto metadata = VERIFY_RESULT(ParseString(Slice(*input, length), "metadata", &in));
+  *input += in.CurrentPosition();
+  return ParseMetadata(metadata, out);
+}
+
+void StoreCrc(
+    const RefCntBuffer& buffer, size_t header_size, size_t message_size, Sidecars* sidecars) {
+  crc::Crc32Accumulator crc;
+  // 5 last bytes for CRC.
+  crc.Feed(
+      buffer.AsSlice().Prefix(header_size - kCrcFieldSize).WithoutPrefix(kMsgLengthPrefixLength));
+  crc.Feed(buffer.udata() + header_size, message_size);
+  if (sidecars) {
+    sidecars->buffer().IterateBlocks([&crc](Slice block) {
+      crc.Feed(block.data(), block.size());
+    });
+  }
+  // Expect CRC to be located at header end.
+  LittleEndian::Store32(buffer.udata() + header_size - 4, crc.result());
+}
+
+}  // namespace yb::rpc

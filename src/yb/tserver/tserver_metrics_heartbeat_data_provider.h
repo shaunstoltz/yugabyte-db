@@ -1,4 +1,4 @@
-// Copyright (c) YugaByte, Inc.
+// Copyright (c) YugabyteDB, Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License"); you may not use this file except
 // in compliance with the License.  You may obtain a copy of the License at
@@ -13,9 +13,6 @@
 
 #pragma once
 
-#include <memory>
-
-#include "yb/cdc/cdc_util.h"
 #include "yb/tserver/heartbeater.h"
 
 namespace yb {
@@ -26,8 +23,8 @@ class TServerMetricsHeartbeatDataProvider : public PeriodicalHeartbeatDataProvid
   explicit TServerMetricsHeartbeatDataProvider(TabletServer* server);
 
  private:
-  void DoAddData(
-      const master::TSHeartbeatResponsePB& last_resp, master::TSHeartbeatRequestPB* req) override;
+  void DoAddData(bool needs_full_tablet_report, master::TSHeartbeatRequestPB* req) override;
+  MonoDelta Period() const override;
 
   uint64_t CalculateUptime();
 
@@ -36,9 +33,6 @@ class TServerMetricsHeartbeatDataProvider : public PeriodicalHeartbeatDataProvid
   // Stores the total read and writes ops for computing iops.
   uint64_t prev_reads_ = 0;
   uint64_t prev_writes_ = 0;
-
-  // Stores the previously reported replication errors.
-  cdc::TabletReplicationErrorMap prev_replication_error_map_;
 };
 
 } // namespace tserver

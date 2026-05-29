@@ -15,9 +15,9 @@
 // specific language governing permissions and limitations
 // under the License.
 //
-// The following only applies to changes made to this file as part of YugaByte development.
+// The following only applies to changes made to this file as part of YugabyteDB development.
 //
-// Portions Copyright (c) YugaByte, Inc.
+// Portions Copyright (c) YugabyteDB, Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License"); you may not use this file except
 // in compliance with the License.  You may obtain a copy of the License at
@@ -107,9 +107,21 @@
 //         DEFINE_pg_flag macro. The name and type of the flag should exactly match the guc
 //         variable.
 //
+// - "conn_mgr":
+//         These are flags for the YSQL Connection Manager (Odyssey). Only define these using the
+//         DEFINE_CONN_MGR_FLAG macros. The flag name will be automatically prefixed with
+//         ysql_conn_mgr_. Changing a runtime conn_mgr flag triggers a config reload of the
+//         connection manager process via SIGHUP.
+//
 // - "deprecated":
 //         This tag is used to indicate that a flag is deprecated. Do not explicitly set this tag.
 //         Use DEPRECATE_FLAG instead.
+//
+// - "preview":
+//         These flags guard features that are still in preview/early access. These are not safe
+//         to be enabled in production by default. Customers are allowed to enable these flags only
+//         after acknowledging the risks associated with the feature by adding the preview flag name
+//         to --allowed_preview_flags_csv.
 //
 //
 // A given flag may have zero or more tags associated with it. The system does
@@ -145,8 +157,7 @@
 
 namespace yb {
 
-YB_DEFINE_ENUM(
-    FlagTag,
+YB_DEFINE_ENUM(FlagTag,
     (kStable)
     (kEvolving)
     (kExperimental)
@@ -157,7 +168,10 @@ YB_DEFINE_ENUM(
     (kSensitive_info)
     (kAuto)
     (kPg)
-    (kDeprecated));
+    (kConnMgr)
+    (kDeprecated)
+    (kPreview)
+    (kHasNewInstallValue));
 
 #define FLAG_TAG_stable ::yb::FlagTag::kStable
 #define FLAG_TAG_evolving ::yb::FlagTag::kEvolving
@@ -170,6 +184,7 @@ YB_DEFINE_ENUM(
 // kRuntime: Use DEFINE_RUNTIME_type macro instead
 // kAuto: Use DEFINE_RUNTIME_AUTO_type or DEFINE_NON_RUNTIME_AUTO_type macros instead
 // kPg: Use DEFINE_RUNTIME_pg_flag or DEFINE_NON_RUNTIME_pg_flag macros instead
+// kConnMgr: Use DEFINE_RUNTIME_CONN_MGR_FLAG or DEFINE_NON_RUNTIME_CONN_MGR_FLAG macros instead
 // kDeprecated: Use DEPRECATE_FLAG instead
 
 // Tag the flag 'flag_name' with the given tag 'tag'.
@@ -215,84 +230,289 @@ class FlagTagger {
 
 } // namespace flag_tags_internal
 
+namespace flags_internal {
+bool RegisterFlagNewInstallValue(const std::string& flag_name, const std::string& value);
+
+constexpr bool StringsNotEqual(char const* a, char const* b) {
+    return std::string_view(a) != std::string_view(b);
+}
+
+template <typename T>
+constexpr bool IsValid_bool(T a) {
+  return std::is_same<bool, decltype(a)>::value;
+}
+
+template <typename T>
+constexpr bool IsValid_int32(T a) {
+  return std::is_same<int32_t, decltype(a)>::value;
+}
+
+template <typename T>
+constexpr bool IsValid_int64(T a) {
+  return std::is_same<int64_t, decltype(a)>::value || std::is_same<uint32_t, decltype(a)>::value ||
+         std::is_same<int32_t, decltype(a)>::value;
+}
+
+template <typename T>
+constexpr bool IsValid_uint64(T a) {
+  return std::is_same<uint64_t, decltype(a)>::value || std::is_same<uint32_t, decltype(a)>::value ||
+         std::is_same<int32_t, decltype(a)>::value;
+}
+
+template <typename T>
+constexpr bool IsValid_double(T a) {
+  return std::is_same<double, decltype(a)>::value || std::is_same<int64_t, decltype(a)>::value ||
+         std::is_same<uint32_t, decltype(a)>::value || std::is_same<int32_t, decltype(a)>::value;
+}
+
+template <typename T>
+constexpr bool IsValid_string(T a) {
+  return std::is_same<std::string, decltype(a)>::value ||
+         std::is_same<const char*, decltype(a)>::value || std::is_same<char*, decltype(a)>::value;
+}
+
+}  // namespace flags_internal
+
 } // namespace yb
 
+#define DEFINE_NEW_INSTALL_VALUE(flag_name, flag_value) \
+  COMPILE_ASSERT(sizeof(BOOST_PP_CAT(FLAGS_, flag_name)), flag_does_not_exist); \
+  static_assert( \
+      std::is_trivially_assignable< \
+          decltype(BOOST_PP_CAT(FLAGS_, flag_name))&, decltype(flag_value)>::value, \
+      "Value cannot be assigned to flag"); \
+  _TAG_FLAG(flag_name, ::yb::FlagTag::kHasNewInstallValue, hasNewInstallValue); \
+  namespace { \
+  auto BOOST_PP_CAT(_flag_new_install_value_, flag_name) = \
+      yb::flags_internal::RegisterFlagNewInstallValue( \
+          BOOST_PP_STRINGIZE(flag_name), BOOST_PP_STRINGIZE(flag_value)); \
+  } \
+  static_assert(true, "semi-colon required after this macro")
+
+#define DEFINE_NEW_INSTALL_STRING_VALUE(flag_name, flag_value) \
+  COMPILE_ASSERT(sizeof(BOOST_PP_CAT(FLAGS_, flag_name)), flag_does_not_exist); \
+  static_assert( \
+      yb::flags_internal::IsValid_string(flag_value), \
+      "Value is not valid for string flag " BOOST_PP_STRINGIZE(flag_name)); \
+  _TAG_FLAG(flag_name, ::yb::FlagTag::kHasNewInstallValue, hasNewInstallValue); \
+  namespace { \
+  auto BOOST_PP_CAT(_flag_new_install_value_, flag_name) = \
+      yb::flags_internal::RegisterFlagNewInstallValue( \
+          BOOST_PP_STRINGIZE(flag_name), flag_value); \
+  } \
+  static_assert(true, "semi-colon required after this macro")
+
+#define _DEFINE_FLAG_IN_FILE(name) BOOST_PP_CAT(name, _DefinedInFile)
+
+#define _DEFINE_flag(type, name, default_value, description) \
+  using _DEFINE_FLAG_IN_FILE(name) = bool; \
+  DEFINE_##type(name, default_value, description)
+
 #define DEFINE_test_flag(type, name, default_value, description) \
-  BOOST_PP_CAT(DEFINE_, type)(TEST_##name, default_value, description " (For testing only!)"); \
+  _DEFINE_flag(type, BOOST_PP_CAT(TEST_, name), default_value, description " (For testing only!)");\
   TAG_FLAG(BOOST_PP_CAT(TEST_, name), unsafe); \
   TAG_FLAG(BOOST_PP_CAT(TEST_, name), hidden)
 
 // Runtime flags.
 #define DEFINE_RUNTIME_bool(name, default_value, description) \
-  DEFINE_bool(name, default_value, description); \
+  _DEFINE_flag(bool, name, default_value, description); \
   _TAG_FLAG_RUNTIME(name)
 
 #define DEFINE_RUNTIME_uint32(name, default_value, description) \
-  DEFINE_uint32(name, default_value, description); \
+  _DEFINE_flag(uint32, name, default_value, description); \
   _TAG_FLAG_RUNTIME(name)
 
 #define DEFINE_RUNTIME_int32(name, default_value, description) \
-  DEFINE_int32(name, default_value, description); \
+  _DEFINE_flag(int32, name, default_value, description); \
   _TAG_FLAG_RUNTIME(name)
 
 #define DEFINE_RUNTIME_int64(name, default_value, description) \
-  DEFINE_int64(name, default_value, description); \
+  _DEFINE_flag(int64, name, default_value, description); \
   _TAG_FLAG_RUNTIME(name)
 
 #define DEFINE_RUNTIME_uint64(name, default_value, description) \
-  DEFINE_uint64(name, default_value, description); \
+  _DEFINE_flag(uint64, name, default_value, description); \
   _TAG_FLAG_RUNTIME(name)
 
 #define DEFINE_RUNTIME_double(name, default_value, description) \
-  DEFINE_double(name, default_value, description); \
+  _DEFINE_flag(double, name, default_value, description); \
   _TAG_FLAG_RUNTIME(name)
 
 #define DEFINE_RUNTIME_string(name, default_value, description) \
-  DEFINE_string(name, default_value, description); \
+  _DEFINE_flag(string, name, default_value, description); \
   _TAG_FLAG_RUNTIME(name)
 
 // Non Runtime flags.
 #define DEFINE_NON_RUNTIME_bool(name, default_value, description) \
-  DEFINE_bool(name, default_value, description)
+  _DEFINE_flag(bool, name, default_value, description)
 
 #define DEFINE_NON_RUNTIME_uint32(name, default_value, description) \
-  DEFINE_uint32(name, default_value, description)
+  _DEFINE_flag(uint32, name, default_value, description)
 
 #define DEFINE_NON_RUNTIME_int32(name, default_value, description) \
-  DEFINE_int32(name, default_value, description)
+  _DEFINE_flag(int32, name, default_value, description)
 
 #define DEFINE_NON_RUNTIME_int64(name, default_value, description) \
-  DEFINE_int64(name, default_value, description)
+  _DEFINE_flag(int64, name, default_value, description)
 
 #define DEFINE_NON_RUNTIME_uint64(name, default_value, description) \
-  DEFINE_uint64(name, default_value, description)
+  _DEFINE_flag(uint64, name, default_value, description)
 
 #define DEFINE_NON_RUNTIME_double(name, default_value, description) \
-  DEFINE_double(name, default_value, description)
+  _DEFINE_flag(double, name, default_value, description)
 
 #define DEFINE_NON_RUNTIME_string(name, default_value, description) \
-  DEFINE_string(name, default_value, description)
+  _DEFINE_flag(string, name, default_value, description)
+
+// Runtime preview flags.
+#define PREVIEW_FLAG_DESCRIPTION(description, name) \
+  description \
+      " NOTE: This flag protects a feature that is currently in preview. In order for it to be " \
+      "modified, '" #name "' must be set in --allowed_preview_flags_csv."
+#define DEFINE_RUNTIME_PREVIEW_bool(name, default_value, description) \
+  DEFINE_RUNTIME_bool(name, default_value, PREVIEW_FLAG_DESCRIPTION(description, name)); \
+  _TAG_FLAG(name, ::yb::FlagTag::kPreview, preview)
+
+#define DEFINE_RUNTIME_PREVIEW_uint32(name, default_value, description) \
+  DEFINE_RUNTIME_uint32(name, default_value, PREVIEW_FLAG_DESCRIPTION(description, name)); \
+  _TAG_FLAG(name, ::yb::FlagTag::kPreview, preview)
+
+#define DEFINE_RUNTIME_PREVIEW_int32(name, default_value, description) \
+  DEFINE_RUNTIME_int32(name, default_value, PREVIEW_FLAG_DESCRIPTION(description, name)); \
+  _TAG_FLAG(name, ::yb::FlagTag::kPreview, preview)
+
+#define DEFINE_RUNTIME_PREVIEW_int64(name, default_value, description) \
+  DEFINE_RUNTIME_int64(name, default_value, PREVIEW_FLAG_DESCRIPTION(description, name)); \
+  _TAG_FLAG(name, ::yb::FlagTag::kPreview, preview)
+
+#define DEFINE_RUNTIME_PREVIEW_uint64(name, default_value, description) \
+  DEFINE_RUNTIME_uint64(name, default_value, PREVIEW_FLAG_DESCRIPTION(description, name)); \
+  _TAG_FLAG(name, ::yb::FlagTag::kPreview, preview)
+
+#define DEFINE_RUNTIME_PREVIEW_double(name, default_value, description) \
+  DEFINE_RUNTIME_double(name, default_value, PREVIEW_FLAG_DESCRIPTION(description, name)); \
+  _TAG_FLAG(name, ::yb::FlagTag::kPreview, preview)
+
+#define DEFINE_RUNTIME_PREVIEW_string(name, default_value, description) \
+  DEFINE_RUNTIME_string(name, default_value, PREVIEW_FLAG_DESCRIPTION(description, name)); \
+  _TAG_FLAG(name, ::yb::FlagTag::kPreview, preview)
+
+// Non Runtime preview flags.
+#define DEFINE_NON_RUNTIME_PREVIEW_bool(name, default_value, description) \
+  DEFINE_NON_RUNTIME_bool(name, default_value, PREVIEW_FLAG_DESCRIPTION(description, name)); \
+  _TAG_FLAG(name, ::yb::FlagTag::kPreview, preview)
+
+#define DEFINE_NON_RUNTIME_PREVIEW_uint32(name, default_value, description) \
+  DEFINE_NON_RUNTIME_uint32(name, default_value, PREVIEW_FLAG_DESCRIPTION(description, name)); \
+  _TAG_FLAG(name, ::yb::FlagTag::kPreview, preview)
+
+#define DEFINE_NON_RUNTIME_PREVIEW_int32(name, default_value, description) \
+  DEFINE_NON_RUNTIME_int32(name, default_value, PREVIEW_FLAG_DESCRIPTION(description, name)); \
+  _TAG_FLAG(name, ::yb::FlagTag::kPreview, preview)
+
+#define DEFINE_NON_RUNTIME_PREVIEW_int64(name, default_value, description) \
+  DEFINE_NON_RUNTIME_int64(name, default_value, PREVIEW_FLAG_DESCRIPTION(description, name)); \
+  _TAG_FLAG(name, ::yb::FlagTag::kPreview, preview)
+
+#define DEFINE_NON_RUNTIME_PREVIEW_uint64(name, default_value, description) \
+  DEFINE_NON_RUNTIME_uint64(name, default_value, PREVIEW_FLAG_DESCRIPTION(description, name)); \
+  _TAG_FLAG(name, ::yb::FlagTag::kPreview, preview)
+
+#define DEFINE_NON_RUNTIME_PREVIEW_double(name, default_value, description) \
+  DEFINE_NON_RUNTIME_double(name, default_value, PREVIEW_FLAG_DESCRIPTION(description, name)); \
+  _TAG_FLAG(name, ::yb::FlagTag::kPreview, preview)
+
+#define DEFINE_NON_RUNTIME_PREVIEW_string(name, default_value, description) \
+  DEFINE_NON_RUNTIME_string(name, default_value, PREVIEW_FLAG_DESCRIPTION(description, name)); \
+  _TAG_FLAG(name, ::yb::FlagTag::kPreview, preview)
+
+// gFlag wrappers over Postgres GUC parameter.
+// The value type should match the GUC parameter, or it should be a string, in which case Postgres
+// will convert it to the correct type.
+// The default values of gFlag are visible to customers via flags metadata xml, documentation, and
+// platform UI. So, it's important to keep these values as accurate as possible. The default_value
+// or target_value (for AutoFlags) should match the default specified in guc.c.
+// Use an empty string or 0 for parameters like timezone and max_connections whose default is
+// computed at runtime so that they show up as an undefined value instead of an incorrect value. If
+// 0 is a valid value for the parameter, then use an empty string. These are enforced by the
+// PgWrapperFlagsTest.VerifyGFlagDefaults test.
+#define DEFINE_NON_RUNTIME_PG_FLAG(type, name, default_value, description) \
+  BOOST_PP_CAT(DEFINE_NON_RUNTIME_, type)(BOOST_PP_CAT(ysql_, name), default_value, description); \
+  _TAG_FLAG(BOOST_PP_CAT(ysql_, name), ::yb::FlagTag::kPg, pg)
+
+#define DEFINE_RUNTIME_PG_FLAG(type, name, default_value, description) \
+  BOOST_PP_CAT(DEFINE_RUNTIME_, type)(BOOST_PP_CAT(ysql_, name), default_value, description); \
+  _TAG_FLAG(BOOST_PP_CAT(ysql_, name), ::yb::FlagTag::kPg, pg)
+
+#define DEFINE_NON_RUNTIME_PG_PREVIEW_FLAG(type, name, default_value, description) \
+  DEFINE_NON_RUNTIME_PG_FLAG(type, name, default_value, description); \
+  _TAG_FLAG(BOOST_PP_CAT(ysql_, name), ::yb::FlagTag::kPreview, preview)
+
+#define DEFINE_RUNTIME_PG_PREVIEW_FLAG(type, name, default_value, description) \
+  DEFINE_RUNTIME_PG_FLAG(type, name, default_value, description); \
+  _TAG_FLAG(BOOST_PP_CAT(ysql_, name), ::yb::FlagTag::kPreview, preview)
+
+#define DEFINE_RUNTIME_AUTO_PG_FLAG(type, name, flag_class, initial_val, target_val, description) \
+  BOOST_PP_CAT(DEFINE_RUNTIME_AUTO_, type)(ysql_##name, flag_class, initial_val, target_val, \
+                                           description); \
+  _TAG_FLAG(BOOST_PP_CAT(ysql_, name), ::yb::FlagTag::kPg, pg)
+
+// gFlag wrappers for YSQL Connection Manager (Odyssey) configuration.
+// The flag name will be automatically prefixed with ysql_conn_mgr_.
+// Changing a runtime conn_mgr flag triggers a config reload of the connection manager process.
+#define DEFINE_RUNTIME_CONN_MGR_FLAG(type, name, default_value, description) \
+  BOOST_PP_CAT(DEFINE_RUNTIME_, type)( \
+      BOOST_PP_CAT(ysql_conn_mgr_, name), default_value, description); \
+  _TAG_FLAG(BOOST_PP_CAT(ysql_conn_mgr_, name), ::yb::FlagTag::kConnMgr, conn_mgr)
+
+#define DEFINE_NON_RUNTIME_CONN_MGR_FLAG(type, name, default_value, description) \
+  BOOST_PP_CAT(DEFINE_NON_RUNTIME_, type)( \
+      BOOST_PP_CAT(ysql_conn_mgr_, name), default_value, description); \
+  _TAG_FLAG(BOOST_PP_CAT(ysql_conn_mgr_, name), ::yb::FlagTag::kConnMgr, conn_mgr)
+
+#define DEFINE_RUNTIME_CONN_MGR_PREVIEW_FLAG(type, name, default_value, description) \
+  DEFINE_RUNTIME_CONN_MGR_FLAG(type, name, default_value, description); \
+  _TAG_FLAG(BOOST_PP_CAT(ysql_conn_mgr_, name), ::yb::FlagTag::kPreview, preview)
+
+#define DEFINE_NON_RUNTIME_CONN_MGR_PREVIEW_FLAG(type, name, default_value, description) \
+  DEFINE_NON_RUNTIME_CONN_MGR_FLAG(type, name, default_value, description); \
+  _TAG_FLAG(BOOST_PP_CAT(ysql_conn_mgr_, name), ::yb::FlagTag::kPreview, preview)
+
+#define DEFINE_RUNTIME_CONN_MGR_test_flag(type, name, default_value, description) \
+  BOOST_PP_CAT(DEFINE_RUNTIME_, type)( \
+      BOOST_PP_CAT(TEST_ysql_conn_mgr_, name), default_value, \
+      description " (For testing only!)"); \
+  TAG_FLAG(BOOST_PP_CAT(TEST_ysql_conn_mgr_, name), unsafe); \
+  TAG_FLAG(BOOST_PP_CAT(TEST_ysql_conn_mgr_, name), hidden); \
+  _TAG_FLAG(BOOST_PP_CAT(TEST_ysql_conn_mgr_, name), ::yb::FlagTag::kConnMgr, conn_mgr)
+
+#define DEFINE_NON_RUNTIME_CONN_MGR_test_flag(type, name, default_value, description) \
+  BOOST_PP_CAT(DEFINE_NON_RUNTIME_, type)( \
+      BOOST_PP_CAT(TEST_ysql_conn_mgr_, name), default_value, \
+      description " (For testing only!)"); \
+  TAG_FLAG(BOOST_PP_CAT(TEST_ysql_conn_mgr_, name), unsafe); \
+  TAG_FLAG(BOOST_PP_CAT(TEST_ysql_conn_mgr_, name), hidden); \
+  _TAG_FLAG(BOOST_PP_CAT(TEST_ysql_conn_mgr_, name), ::yb::FlagTag::kConnMgr, conn_mgr)
 
 // Unknown flags. !!Not to be used!!
 // Older flags need to be reviewed in order to determine if they are runtime or non-runtime.
 #define DEFINE_UNKNOWN_bool(name, default_value, description) \
-  DEFINE_bool(name, default_value, description)
+  _DEFINE_flag(bool, name, default_value, description)
 
 #define DEFINE_UNKNOWN_uint32(name, default_value, description) \
-  DEFINE_uint32(name, default_value, description)
+  _DEFINE_flag(uint32, name, default_value, description)
 
 #define DEFINE_UNKNOWN_int32(name, default_value, description) \
-  DEFINE_int32(name, default_value, description)
+  _DEFINE_flag(int32, name, default_value, description)
 
 #define DEFINE_UNKNOWN_int64(name, default_value, description) \
-  DEFINE_int64(name, default_value, description); \
-  _TAG_FLAG_RUNTIME(name);
+  _DEFINE_flag(int64, name, default_value, description)
 
 #define DEFINE_UNKNOWN_uint64(name, default_value, description) \
-  DEFINE_uint64(name, default_value, description)
+  _DEFINE_flag(uint64, name, default_value, description)
 
 #define DEFINE_UNKNOWN_double(name, default_value, description) \
-  DEFINE_double(name, default_value, description)
+  _DEFINE_flag(double, name, default_value, description)
 
 #define DEFINE_UNKNOWN_string(name, default_value, description) \
-  DEFINE_string(name, default_value, description)
+  _DEFINE_flag(string, name, default_value, description)

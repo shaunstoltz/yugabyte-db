@@ -15,9 +15,9 @@
 // specific language governing permissions and limitations
 // under the License.
 //
-// The following only applies to changes made to this file as part of YugaByte development.
+// The following only applies to changes made to this file as part of YugabyteDB development.
 //
-// Portions Copyright (c) YugaByte, Inc.
+// Portions Copyright (c) YugabyteDB, Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License"); you may not use this file except
 // in compliance with the License.  You may obtain a copy of the License at
@@ -35,14 +35,19 @@
 #include <dirent.h>
 
 #include <atomic>
+#include <functional>
+#include <future>
 #include <string>
+#include <type_traits>
+#include <utility>
 
-#include <glog/logging.h>
 #include <gtest/gtest.h>
 
+#include "yb/util/enums.h"
 #include "yb/util/env.h"
 #include "yb/util/monotime.h"
 #include "yb/util/port_picker.h"
+#include "yb/util/logging.h"
 #include "yb/util/test_macros.h" // For convenience
 
 #define ASSERT_EVENTUALLY(expr) do { \
@@ -50,7 +55,19 @@
   NO_PENDING_FATALS(); \
 } while (0)
 
+// Invokes super setup, and returns if the test was marked as skipped.
+#define TEST_SETUP_SUPER(super) \
+  do { \
+    super::SetUp(); \
+    if (Test::IsSkipped()) { \
+      return; \
+    } \
+  } while (false)
+
 namespace yb {
+
+class CurlGlobalInitializer;
+
 namespace rpc {
 
 class Messenger;
@@ -86,6 +103,7 @@ class YBTest : public ::testing::Test {
 
  private:
   std::string test_dir_;
+  std::unique_ptr<CurlGlobalInitializer> global_curl_;
 };
 
 // Returns true if slow tests are runtime-enabled.
@@ -102,8 +120,6 @@ bool AllowSlowTests();
 //
 void OverrideFlagForSlowTests(const std::string& flag_name,
                               const std::string& new_value);
-
-Status EnableVerboseLoggingForModule(const std::string& module, int level);
 
 // Call srand() with a random seed based on the current time, reporting
 // that seed to the logs. The time-based seed may be overridden by passing
@@ -192,7 +208,20 @@ inline std::string GetPgToolPath(const std::string& tool_name) {
   return GetToolPath("../postgres/bin", tool_name);
 }
 
+// For now this assumes that YB Controller binaries are present in build/ybc.
+inline std::string GetYbcToolPath(const std::string& tool_name) {
+  return GetToolPath("../../ybc", tool_name);
+}
+
 std::string GetCertsDir();
+
+// See https://docs.google.com/document/d/1aGD37sMIkkGFyvm7QEe2jtru1G-qGHIObu7IyoaUPS4
+// for more context and steps to use YB Controller in UTs locally.
+// Read YB_TEST_YB_CONTROLLER from env.
+// If true, spawn YB Controller servers for backup operations.
+bool UseYbController();
+
+void AddExtraFlagsFromEnvVar(const char* env_var_name, std::vector<std::string>* args_dest);
 
 int CalcNumTablets(size_t num_tablet_servers);
 
@@ -235,6 +264,27 @@ class StopOnFailure {
   bool success_ = false;
   std::atomic<bool>& stop_;
 };
+
+YB_DEFINE_ENUM(CorruptionType, (kZero)(kXor55));
+
+// Corrupt bytes_to_corrupt bytes at specified offset. If offset is negative, treats it as
+// an offset relative to the end of file. Also fixes specified region to not exceed the file before
+// corrupting data.
+Status CorruptFile(
+    const std::string& file_path, int64_t offset, size_t bytes_to_corrupt,
+    CorruptionType corruption_type);
+
+Status ForkAndRunToCompletion(const std::function<void(void)>& child,
+                              const std::function<void(void)>& parent = {});
+
+Status ForkAndRunToCrashPoint(const std::function<void(void)>& child,
+                              const std::function<void(void)>& parent,
+                              std::string_view crash_point);
+
+inline Status ForkAndRunToCrashPoint(const std::function<void(void)>& f,
+                                     std::string_view crash_point) {
+  return ForkAndRunToCrashPoint(f, {} /* parent */, crash_point);
+}
 
 } // namespace yb
 

@@ -1,4 +1,4 @@
-// Copyright (c) YugaByte, Inc.
+// Copyright (c) YugabyteDB, Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License"); you may not use this file except
 // in compliance with the License.  You may obtain a copy of the License at
@@ -13,13 +13,7 @@
 
 #include "yb/client/client_error.h"
 
-namespace yb {
-namespace client {
-
-const std::string kClientErrorCategoryName = "client error";
-
-StatusCategoryRegisterer client_error_category_registerer(
-    StatusCategoryDescription::Make<ClientErrorTag>(&kClientErrorCategoryName));
+namespace yb::client {
 
 bool IsRetryableClientError(const Status& s) {
   if (s.ok()) {
@@ -46,5 +40,4 @@ bool IsRetryableClientError(const Status& s) {
   FATAL_INVALID_ENUM_VALUE(ClientErrorCode, ClientError(s).value());
 }
 
-} // namespace client
-} // namespace yb
+} // namespace yb::client

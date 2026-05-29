@@ -2,7 +2,6 @@
 title: Configure audit logging in YCQL
 headerTitle: Configure audit logging in YCQL
 description: Configure audit logging in YCQL.
-image: /images/section_icons/secure/authentication.png
 menu:
   stable:
     name: Configure audit logging
@@ -27,7 +26,7 @@ type: docs
   </li>
 </ul>
 
-Audit logging can be used to record information about YCQL statements or events (such as login events) and log the records on a per-node basis into the YB-Tserver logs. Audit logging can be enabled on YugabyteDB cluster by setting the `ycql_enable_audit_log` TServer flag to `true`. By default, each TServer records all login events and YCQL commands issued to the server.
+Audit logging can be used to record information about YCQL statements or events (such as login events) and log the records on a per-node basis into the YB-TServer logs. Audit logging can be enabled on YugabyteDB cluster by setting the `ycql_enable_audit_log` TServer flag to `true`. By default, each TServer records all login events and YCQL commands issued to the server.
 
 Audit record is logged before an operation attempts to be executed, and failures are audited as well. If an operation fails to execute, both operation execution and failure are logged. However, an error that happens during parsing or analysis of YCQL statement results only in an error audit record to be logged.
 
@@ -35,7 +34,7 @@ YCQL audit logging can be further customized using additional YB-TServer flags.
 
 ## Enable audit logging
 
-Audit logging for YCQL can be enabled by passing the `--ycql_enable_audit_log` flag to `yb-tserver`. The command to start the `yb-tserver` would look as follows:
+Audit logging for YCQL can be enabled by passing the `--ycql_enable_audit_log` flag to yb-tserver. The command to start the yb-tserver would look as follows:
 
 ```sh
 $ yb-tserver <options> --ycql_enable_audit_log=true
@@ -117,7 +116,7 @@ The available flags are described in the following table:
   </tr>
 </table>
 
-All the preceding flags are `runtime` flags, so they can be set without requiring `yb-tserver` restart.
+All the preceding flags are `runtime` flags, so they can be set without requiring yb-tserver restart.
 
 ### Statements being audited
 

@@ -1,4 +1,4 @@
-// Copyright (c) YugaByte, Inc.
+// Copyright (c) YugabyteDB, Inc.
 
 package com.yugabyte.yw.common.alerts.impl;
 
@@ -11,15 +11,20 @@ import com.google.common.annotations.VisibleForTesting;
 import com.google.inject.Singleton;
 import com.yugabyte.yw.common.WSClientRefresher;
 import com.yugabyte.yw.common.alerts.AlertChannelPagerDutyParams;
+import com.yugabyte.yw.common.alerts.AlertTemplateVariableService;
 import com.yugabyte.yw.common.alerts.PlatformNotificationException;
+import com.yugabyte.yw.forms.AlertChannelTemplatesExt;
 import com.yugabyte.yw.models.Alert;
 import com.yugabyte.yw.models.Alert.State;
 import com.yugabyte.yw.models.AlertChannel;
 import com.yugabyte.yw.models.AlertConfiguration;
 import com.yugabyte.yw.models.AlertLabel;
+import com.yugabyte.yw.models.AlertTemplateVariable;
 import com.yugabyte.yw.models.Customer;
+import com.yugabyte.yw.models.helpers.KnownAlertLabels;
 import java.time.ZoneId;
 import java.util.Comparator;
+import java.util.List;
 import javax.inject.Inject;
 import lombok.Builder;
 import lombok.Value;
@@ -38,23 +43,34 @@ public class AlertChannelPagerDuty extends AlertChannelWebBase {
   private final String eventApiUrl;
 
   @Inject
-  public AlertChannelPagerDuty(WSClientRefresher wsClientRefresher) {
-    this(PAGER_DUTY_EVENT_API, wsClientRefresher);
+  public AlertChannelPagerDuty(
+      WSClientRefresher wsClientRefresher,
+      AlertTemplateVariableService alertTemplateVariableService) {
+    this(PAGER_DUTY_EVENT_API, wsClientRefresher, alertTemplateVariableService);
   }
 
   @VisibleForTesting
-  AlertChannelPagerDuty(String eventApiUrl, WSClientRefresher wsClientRefresher) {
-    super(wsClientRefresher);
+  AlertChannelPagerDuty(
+      String eventApiUrl,
+      WSClientRefresher wsClientRefresher,
+      AlertTemplateVariableService alertTemplateVariableService) {
+    super(wsClientRefresher, alertTemplateVariableService);
     this.eventApiUrl = eventApiUrl;
   }
 
   @Override
-  public void sendNotification(Customer customer, Alert alert, AlertChannel channel)
+  public void sendNotification(
+      Customer customer,
+      Alert alert,
+      AlertChannel channel,
+      AlertChannelTemplatesExt channelTemplates)
       throws PlatformNotificationException {
     log.trace("sendNotification {}", alert);
     AlertChannelPagerDutyParams params = (AlertChannelPagerDutyParams) channel.getParams();
-    String title = getNotificationTitle(alert, channel);
-    String text = getNotificationText(alert, channel);
+    List<AlertTemplateVariable> variables = alertTemplateVariableService.list(customer.getUuid());
+    Context context = new Context(channel, channelTemplates, variables);
+    String title = getNotificationTitle(alert, context, false);
+    String text = getNotificationText(alert, context, false);
 
     try {
       EventResult eventResult;
@@ -65,17 +81,22 @@ public class AlertChannelPagerDuty extends AlertChannelWebBase {
           severity = Severity.WARNING;
         }
         ObjectNode customDetails = Json.newObject();
-        alert
-            .getLabels()
-            .stream()
+        alert.getEffectiveLabels().stream()
             .sorted(Comparator.comparing(AlertLabel::getName))
-            .forEach(label -> customDetails.put(label.getName(), label.getValue()));
+            .forEach(
+                label -> {
+                  String name = label.getName();
+                  if (name.equals(KnownAlertLabels.SEVERITY.labelName())) {
+                    name = "yba_" + name;
+                  }
+                  customDetails.put(name, label.getValue());
+                });
         Payload payload =
             Payload.builder()
                 .group(alert.getConfigurationType().name())
                 .eventClass(title)
                 .summary(text)
-                .source("YB Platform " + customer.name)
+                .source("YB Platform " + customer.getName())
                 .severity(severity)
                 .timestamp(
                     alert
@@ -121,6 +142,7 @@ public class AlertChannelPagerDuty extends AlertChannelWebBase {
   }
 
   private EventResult sendRequest(Incident incident) throws Exception {
+    log.debug("Sending PagerDuty alert notification {} to {}", Json.toJson(incident), eventApiUrl);
     WSResponse response = sendRequest(PAGERDUTY_WS_KEY, eventApiUrl, incident);
 
     int responseStatus = response.getStatus();

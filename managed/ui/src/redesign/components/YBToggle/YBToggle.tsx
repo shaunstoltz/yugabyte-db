@@ -1,4 +1,4 @@
-import React, { FC } from 'react';
+import { FC } from 'react';
 import {
   makeStyles,
   FormControl,
@@ -20,6 +20,7 @@ const AntSwitch = withStyles((theme: Theme) => {
       height: 24,
       marginRight: 8,
       padding: 0,
+      overflow: 'visible',
       display: 'flex'
     },
     switchBase: {
@@ -66,7 +67,7 @@ interface ToggleFormControlProps {
 }
 
 export interface YBToggleProps extends SwitchProps {
-  label?: string;
+  label?: string | JSX.Element;
   labelVariant?: TypographyVariant;
   FormControlProps?: ToggleFormControlProps;
   inputProps?: InputProps['inputProps'];

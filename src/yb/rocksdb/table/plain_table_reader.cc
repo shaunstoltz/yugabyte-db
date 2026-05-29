@@ -2,9 +2,9 @@
 // Use of this source code is governed by a BSD-style license that can be
 // found in the LICENSE file. See the AUTHORS file for names of contributors.
 //
-// The following only applies to changes made to this file as part of YugaByte development.
+// The following only applies to changes made to this file as part of YugabyteDB development.
 //
-// Portions Copyright (c) YugaByte, Inc.
+// Portions Copyright (c) YugabyteDB, Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License"); you may not use this file except
 // in compliance with the License.  You may obtain a copy of the License at
@@ -62,26 +62,22 @@ inline uint32_t GetFixed32Element(const char* base, size_t offset) {
 }  // namespace
 
 // Iterator to iterate IndexedTable
-class PlainTableIterator : public InternalIterator {
+class PlainTableIterator final : public InternalIterator {
  public:
   explicit PlainTableIterator(PlainTableReader* table, bool use_prefix_seek);
   ~PlainTableIterator();
 
-  bool Valid() const override;
+  const KeyValueEntry& Entry() const override;
 
-  void SeekToFirst() override;
+  const KeyValueEntry& SeekToFirst() override;
 
-  void SeekToLast() override;
+  const KeyValueEntry& SeekToLast() override;
 
-  void Seek(const Slice& target) override;
+  const KeyValueEntry& Seek(Slice target) override;
 
-  void Next() override;
+  const KeyValueEntry& Next() override;
 
-  void Prev() override;
-
-  Slice key() const override;
-
-  Slice value() const override;
+  const KeyValueEntry& Prev() override;
 
   Status status() const override;
 
@@ -91,8 +87,7 @@ class PlainTableIterator : public InternalIterator {
   bool use_prefix_seek_;
   uint32_t offset_;
   uint32_t next_offset_;
-  Slice key_;
-  Slice value_;
+  KeyValueEntry entry_;
   Status status_;
   // No copying allowed
   PlainTableIterator(const PlainTableIterator&) = delete;
@@ -204,9 +199,13 @@ Status PlainTableReader::Open(const ImmutableCFOptions& ioptions,
 void PlainTableReader::SetupForCompaction() {
 }
 
-InternalIterator* PlainTableReader::NewIterator(const ReadOptions& options,
-                                                Arena* arena,
-                                                bool skip_filters) {
+InternalIterator* PlainTableReader::NewIterator(
+    const ReadOptions& options, Arena* arena, bool skip_filters,
+    SkipCorruptDataBlocksUnsafe skip_corrupt_data_blocks_unsafe) {
+  if (skip_corrupt_data_blocks_unsafe) {
+    return NewErrorInternalIterator(
+        STATUS(InvalidArgument, "skip_corrupt_data_blocks_unsafe not supported"), arena);
+  }
   if (options.total_order_seek && !IsTotalOrderMode()) {
     return NewErrorInternalIterator(
         STATUS(InvalidArgument, "total_order_seek not supported"), arena);
@@ -549,7 +548,7 @@ void PlainTableReader::Prepare(const Slice& target) {
   }
 }
 
-Status PlainTableReader::Get(const ReadOptions& ro, const Slice& target,
+Status PlainTableReader::Get(const ReadOptions&, const Slice& target,
                              GetContext* get_context, bool skip_filters) {
   // Check bloom filter first.
   Slice prefix_slice;
@@ -618,6 +617,17 @@ uint64_t PlainTableReader::ApproximateOffsetOf(const Slice& key) {
   return 0;
 }
 
+InternalIterator* PlainTableReader::NewIndexIterator(const ReadOptions& read_options) {
+  return NewErrorInternalIterator(
+      STATUS(NotSupported, "NewIndexIterator() is not supported for PlainTableBuilder"));
+}
+
+DataBlockAwareIndexInternalIterator* PlainTableReader::NewDataBlockAwareIndexIterator(
+    const ReadOptions& read_options) {
+  return NewErrorIterator<DataBlockAwareIndexInternalIterator>(STATUS(
+      NotSupported, "NewDataBlockAwareIndexIterator() is not supported for PlainTableBuilder"));
+}
+
 PlainTableIterator::PlainTableIterator(PlainTableReader* table,
                                        bool use_prefix_seek)
     : table_(table),
@@ -630,26 +640,30 @@ PlainTableIterator::PlainTableIterator(PlainTableReader* table,
 PlainTableIterator::~PlainTableIterator() {
 }
 
-bool PlainTableIterator::Valid() const {
-  return offset_ < table_->file_info_.data_end_offset &&
-         offset_ >= table_->data_start_offset_;
+const KeyValueEntry& PlainTableIterator::Entry() const {
+  if (offset_ < table_->file_info_.data_end_offset &&
+      offset_ >= table_->data_start_offset_ ) {
+    return entry_;
+  }
+  return KeyValueEntry::Invalid();
 }
 
-void PlainTableIterator::SeekToFirst() {
+const KeyValueEntry& PlainTableIterator::SeekToFirst() {
   next_offset_ = table_->data_start_offset_;
   if (next_offset_ >= table_->file_info_.data_end_offset) {
     next_offset_ = offset_ = table_->file_info_.data_end_offset;
-  } else {
-    Next();
+    return Entry();
   }
+  return Next();
 }
 
-void PlainTableIterator::SeekToLast() {
+const KeyValueEntry& PlainTableIterator::SeekToLast() {
   assert(false);
   status_ = STATUS(NotSupported, "SeekToLast() is not supported in PlainTable");
+  return Entry();
 }
 
-void PlainTableIterator::Seek(const Slice& target) {
+const KeyValueEntry& PlainTableIterator::Seek(Slice target) {
   // If the user doesn't set prefix seek option and we are not able to do a
   // total Seek(). assert failure.
   if (!use_prefix_seek_) {
@@ -657,14 +671,14 @@ void PlainTableIterator::Seek(const Slice& target) {
       status_ =
           STATUS(InvalidArgument, "Seek() is not allowed in full scan mode.");
       offset_ = next_offset_ = table_->file_info_.data_end_offset;
-      return;
+      return Entry();
     } else if (table_->GetIndexSize() > 1) {
       assert(false);
       status_ = STATUS(NotSupported,
           "PlainTable cannot issue non-prefix seek unless in total order "
           "mode.");
       offset_ = next_offset_ = table_->file_info_.data_end_offset;
-      return;
+      return Entry();
     }
   }
 
@@ -675,7 +689,7 @@ void PlainTableIterator::Seek(const Slice& target) {
     prefix_hash = GetSliceHash(prefix_slice);
     if (!table_->MatchBloom(prefix_hash)) {
       offset_ = next_offset_ = table_->file_info_.data_end_offset;
-      return;
+      return Entry();
     }
   }
   bool prefix_match;
@@ -683,7 +697,7 @@ void PlainTableIterator::Seek(const Slice& target) {
                               &prefix_match, &next_offset_);
   if (!status_.ok()) {
     offset_ = next_offset_ = table_->file_info_.data_end_offset;
-    return;
+    return Entry();
   }
 
   if (next_offset_ < table_->file_info_.data_end_offset) {
@@ -703,33 +717,27 @@ void PlainTableIterator::Seek(const Slice& target) {
   } else {
     offset_ = table_->file_info_.data_end_offset;
   }
+  return Entry();
 }
 
-void PlainTableIterator::Next() {
+const KeyValueEntry& PlainTableIterator::Next() {
   offset_ = next_offset_;
   if (offset_ < table_->file_info_.data_end_offset) {
     Slice tmp_slice;
     ParsedInternalKey parsed_key;
-    status_ =
-        table_->Next(&decoder_, &next_offset_, &parsed_key, &key_, &value_);
+    status_ = table_->Next(
+        &decoder_, &next_offset_, &parsed_key, &entry_.key, &entry_.value);
     if (!status_.ok()) {
       offset_ = next_offset_ = table_->file_info_.data_end_offset;
     }
   }
+
+  return Entry();
 }
 
-void PlainTableIterator::Prev() {
+const KeyValueEntry& PlainTableIterator::Prev() {
   assert(false);
-}
-
-Slice PlainTableIterator::key() const {
-  assert(Valid());
-  return key_;
-}
-
-Slice PlainTableIterator::value() const {
-  assert(Valid());
-  return value_;
+  return Entry();
 }
 
 Status PlainTableIterator::status() const {

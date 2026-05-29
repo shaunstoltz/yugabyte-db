@@ -3,9 +3,9 @@
 //  LICENSE file in the root directory of this source tree. An additional grant
 //  of patent rights can be found in the PATENTS file in the same directory.
 //
-// The following only applies to changes made to this file as part of YugaByte development.
+// The following only applies to changes made to this file as part of YugabyteDB development.
 //
-// Portions Copyright (c) YugaByte, Inc.
+// Portions Copyright (c) YugabyteDB, Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License"); you may not use this file except
 // in compliance with the License.  You may obtain a copy of the License at
@@ -100,9 +100,9 @@ class DBImplReadOnly : public DBImpl {
   virtual Status EnableFileDeletions(bool force) override {
     return STATUS(NotSupported, "Not supported operation in read only mode.");
   }
-  virtual Status GetLiveFiles(std::vector<std::string>&,
-                              uint64_t* manifest_file_size,
-                              bool flush_memtable = true) override {
+  virtual Status GetLiveFiles(
+      std::vector<std::string>&, uint64_t* manifest_file_size, bool flush_memtable,
+      FlushReason flush_reason) override {
     return STATUS(NotSupported, "Not supported operation in read only mode.");
   }
 

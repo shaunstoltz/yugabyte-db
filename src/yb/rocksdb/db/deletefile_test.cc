@@ -3,9 +3,9 @@
 //  LICENSE file in the root directory of this source tree. An additional grant
 //  of patent rights can be found in the PATENTS file in the same directory.
 //
-// The following only applies to changes made to this file as part of YugaByte development.
+// The following only applies to changes made to this file as part of YugabyteDB development.
 //
-// Portions Copyright (c) YugaByte, Inc.
+// Portions Copyright (c) YugabyteDB, Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License"); you may not use this file except
 // in compliance with the License.  You may obtain a copy of the License at
@@ -41,6 +41,8 @@
 #include "yb/rocksdb/util/testutil.h"
 #include "yb/rocksdb/env.h"
 #include "yb/rocksdb/transaction_log.h"
+
+#include "yb/rocksutil/yb_rocksdb_logger.h"
 
 #include "yb/util/status_log.h"
 #include "yb/util/string_util.h"
@@ -176,7 +178,7 @@ class DeleteFileTest : public RocksDBTest {
     return dbfull()->TEST_FlushMemTable(/* wait = */ true);
   }
 
-  Result<std::vector<LiveFileMetaData>> AddFiles(int num_sst_files, int num_key_per_sst);
+  Result<std::vector<LiveFileMetaData>> AddFiles(int num_sst_files, int num_keys_per_sst);
 
   size_t TryDeleteFiles(
       const std::vector<LiveFileMetaData>& files, size_t max_files_to_delete,
@@ -283,7 +285,7 @@ TEST_F(DeleteFileTest, DeleteFileWithIterator) {
   ASSERT_TRUE(status.ok());
   it->SeekToFirst();
   int numKeysIterated = 0;
-  while(it->Valid()) {
+  while(ASSERT_RESULT(it->CheckedValid())) {
     numKeysIterated++;
     it->Next();
   }
@@ -370,8 +372,7 @@ TEST_F(DeleteFileTest, DeleteNonDefaultColumnFamily) {
   {
     std::unique_ptr<Iterator> itr(db->NewIterator(ReadOptions(), handles[1]));
     int count = 0;
-    for (itr->SeekToFirst(); itr->Valid(); itr->Next()) {
-      ASSERT_OK(itr->status());
+    for (itr->SeekToFirst(); ASSERT_RESULT(itr->CheckedValid()); itr->Next()) {
       ++count;
     }
     ASSERT_EQ(count, 1000);
@@ -385,8 +386,7 @@ TEST_F(DeleteFileTest, DeleteNonDefaultColumnFamily) {
   {
     std::unique_ptr<Iterator> itr(db->NewIterator(ReadOptions(), handles[1]));
     int count = 0;
-    for (itr->SeekToFirst(); itr->Valid(); itr->Next()) {
-      ASSERT_OK(itr->status());
+    for (itr->SeekToFirst(); ASSERT_RESULT(itr->CheckedValid()); itr->Next()) {
       ++count;
     }
     ASSERT_EQ(count, 1000);
@@ -398,10 +398,10 @@ TEST_F(DeleteFileTest, DeleteNonDefaultColumnFamily) {
 }
 
 Result<std::vector<LiveFileMetaData>> DeleteFileTest::AddFiles(
-    const int num_sst_files, const int num_key_per_sst) {
+    const int num_sst_files, const int num_keys_per_sst) {
   LOG(INFO) << "Writing " << num_sst_files << " SSTs";
   for (auto num = 0; num < num_sst_files; num++) {
-    AddKeys(num_key_per_sst, 0);
+    AddKeys(num_keys_per_sst, 0);
     RETURN_NOT_OK(FlushSync());
   }
   std::vector<LiveFileMetaData> metadata;
@@ -425,7 +425,7 @@ size_t DeleteFileTest::TryDeleteFiles(
         continue;
       }
       if (db_->DeleteFile(file.Name()).ok()) {
-        const auto file_path = file.FullName();
+        const auto file_path = file.BaseFilePath();
 
         std::vector<LiveFileMetaData> current_files;
         dbfull()->GetLiveFilesMetaData(&current_files);
@@ -450,7 +450,7 @@ constexpr auto kNumKeysPerSst = 10000;
 } // namespace compaction_race
 
 TEST_F(DeleteFileTest, DeleteWithManualCompaction) {
-  rocksdb::SyncPoint::GetInstance()->LoadDependency({
+  yb::SyncPoint::GetInstance()->LoadDependency({
       {"DBImpl::DeleteFile:DecidedToDelete", "DBImpl::RunManualCompaction"}
   });
 
@@ -459,7 +459,7 @@ TEST_F(DeleteFileTest, DeleteWithManualCompaction) {
 
     auto metadata = ASSERT_RESULT(AddFiles(num_sst_files, compaction_race::kNumKeysPerSst));
 
-    rocksdb::SyncPoint::GetInstance()->EnableProcessing();
+    yb::SyncPoint::GetInstance()->EnableProcessing();
 
     std::atomic<bool> manual_compaction_done{false};
     Status manual_compaction_status;
@@ -482,19 +482,19 @@ TEST_F(DeleteFileTest, DeleteWithManualCompaction) {
 
     CloseDB();
 
-    rocksdb::SyncPoint::GetInstance()->DisableProcessing();
-    rocksdb::SyncPoint::GetInstance()->ClearTrace();
+    yb::SyncPoint::GetInstance()->DisableProcessing();
+    yb::SyncPoint::GetInstance()->ClearTrace();
   }
 }
 
 TEST_F(DeleteFileTest, DeleteWithBackgroundCompaction) {
-  rocksdb::SyncPoint::GetInstance()->LoadDependency({
+  yb::SyncPoint::GetInstance()->LoadDependency({
       {"DBImpl::DeleteFile:DecidedToDelete", "DBImpl::EnableAutoCompaction"},
       {"DBImpl::SchedulePendingCompaction:Done", "VersionSet::LogAndApply:WriteManifest"},
   });
 
   for (int num_sst_files = 1; num_sst_files <= compaction_race::kMaxNumSstFiles; ++num_sst_files) {
-    auto listener = std::make_shared<CompactionStartedListener>();
+    auto listener = std::make_shared<TestCompactionListener>();
     options_.level0_file_num_compaction_trigger = 2;
     options_.disable_auto_compactions = true;
     options_.listeners.push_back(listener);
@@ -504,7 +504,7 @@ TEST_F(DeleteFileTest, DeleteWithBackgroundCompaction) {
 
     const bool expect_compaction = num_sst_files > 1;
 
-    rocksdb::SyncPoint::GetInstance()->EnableProcessing();
+    yb::SyncPoint::GetInstance()->EnableProcessing();
 
     std::atomic<bool> pending_compaction{false};
     std::thread enable_compactions([this, &pending_compaction] {
@@ -527,8 +527,8 @@ TEST_F(DeleteFileTest, DeleteWithBackgroundCompaction) {
                  dbfull()->TEST_NumTotalRunningCompactions() == 0;
         });
 
-    rocksdb::SyncPoint::GetInstance()->DisableProcessing();
-    rocksdb::SyncPoint::GetInstance()->ClearTrace();
+    yb::SyncPoint::GetInstance()->DisableProcessing();
+    yb::SyncPoint::GetInstance()->ClearTrace();
 
     enable_compactions.join();
     EXPECT_EQ(files_deleted, 1);
@@ -542,6 +542,42 @@ TEST_F(DeleteFileTest, DeleteWithBackgroundCompaction) {
 
     CloseDB();
   }
+}
+
+TEST_F(DeleteFileTest, DeleteWithConcurrentOptionsChange) {
+  const auto kNumSstFiles = 30;
+  const auto kNumKeysPerSst = 1000;
+
+  options_.info_log = std::make_shared<yb::YBRocksDBLogger>(options_.log_prefix);
+  options_.disable_auto_compactions = true;
+  options_.level0_stop_writes_trigger = kNumSstFiles + 10;
+  options_.level0_slowdown_writes_trigger = options_.level0_stop_writes_trigger;
+  ASSERT_OK(ReopenDB(/* create = */ true));
+
+  auto metadata = ASSERT_RESULT(AddFiles(kNumSstFiles, kNumKeysPerSst));
+
+  std::atomic<bool> stop_requested{false};
+
+  std::thread change_options([this, &stop_requested] {
+    // We don't care about actual max_sequential_skip_in_iterations, just changing it to reproduce
+    // tsan race when accessing options object.
+    int delta = 1;
+    while (!stop_requested) {
+      ASSERT_OK(db_->SetOptions(
+          {{"max_sequential_skip_in_iterations",
+            yb::AsString(options_.max_sequential_skip_in_iterations + delta)}}));
+      delta = -delta;
+    }
+  });
+
+  auto files_deleted = TryDeleteFiles(
+      metadata, /* max_files_to_delete = */ kNumSstFiles, StopOnMaxFilesDeleted::kTrue,
+      []{ return false; });
+
+  stop_requested = true;
+  change_options.join();
+
+  CloseDB();
 }
 
 } // namespace rocksdb

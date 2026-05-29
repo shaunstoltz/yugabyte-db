@@ -53,7 +53,7 @@
  * |	  |__|	|__||________________________||___________________|		   |
  * |_______________________________________________________________________|
  *
- * Copyright (c) 2019, PostgreSQL Global Development Group
+ * Copyright (c) 2019-2022, PostgreSQL Global Development Group
  *
  * IDENTIFICATION
  *	src/backend/utils/adt/jsonpath.c
@@ -74,13 +74,13 @@
 
 static Datum jsonPathFromCstring(char *in, int len);
 static char *jsonPathToCstring(StringInfo out, JsonPath *in,
-				  int estimated_len);
-static int flattenJsonPathParseItem(StringInfo buf, JsonPathParseItem *item,
-						 int nestingLevel, bool insideArraySubscript);
+							   int estimated_len);
+static int	flattenJsonPathParseItem(StringInfo buf, JsonPathParseItem *item,
+									 int nestingLevel, bool insideArraySubscript);
 static void alignStringInfoInt(StringInfo buf);
 static int32 reserveSpaceForItemPointer(StringInfo buf);
 static void printJsonPathItem(StringInfo buf, JsonPathItem *v, bool inKey,
-				  bool printBracketes);
+							  bool printBracketes);
 static int	operationPriority(JsonPathItemType op);
 
 
@@ -179,7 +179,8 @@ jsonPathFromCstring(char *in, int len)
 	if (!jsonpath)
 		ereport(ERROR,
 				(errcode(ERRCODE_INVALID_TEXT_REPRESENTATION),
-				 errmsg("invalid input syntax for jsonpath: \"%s\"", in)));
+				 errmsg("invalid input syntax for type %s: \"%s\"", "jsonpath",
+						in)));
 
 	flattenJsonPathParseItem(&buf, jsonpath->expr, 0, false);
 
@@ -228,7 +229,7 @@ static int
 flattenJsonPathParseItem(StringInfo buf, JsonPathParseItem *item,
 						 int nestingLevel, bool insideArraySubscript)
 {
-	/* position from begining of jsonpath data */
+	/* position from beginning of jsonpath data */
 	int32		pos = buf->len - JSONPATH_HDRSZ;
 	int32		chld;
 	int32		next;
@@ -330,7 +331,8 @@ flattenJsonPathParseItem(StringInfo buf, JsonPathParseItem *item,
 			break;
 		case jpiFilter:
 			argNestingLevel++;
-			switch_fallthrough();
+			/* FALLTHROUGH */
+			yb_switch_fallthrough();
 		case jpiIsUnknown:
 		case jpiNot:
 		case jpiPlus:
@@ -383,9 +385,9 @@ flattenJsonPathParseItem(StringInfo buf, JsonPathParseItem *item,
 					int32	   *ppos;
 					int32		topos;
 					int32		frompos =
-					flattenJsonPathParseItem(buf,
-											 item->value.array.elems[i].from,
-											 nestingLevel, true) - pos;
+						flattenJsonPathParseItem(buf,
+												 item->value.array.elems[i].from,
+												 nestingLevel, true) - pos;
 
 					if (item->value.array.elems[i].to)
 						topos = flattenJsonPathParseItem(buf,
@@ -441,13 +443,16 @@ alignStringInfoInt(StringInfo buf)
 	{
 		case 3:
 			appendStringInfoCharMacro(buf, 0);
-			switch_fallthrough();
+			/* FALLTHROUGH */
+			yb_switch_fallthrough();
 		case 2:
 			appendStringInfoCharMacro(buf, 0);
-			switch_fallthrough();
+			/* FALLTHROUGH */
+			yb_switch_fallthrough();
 		case 1:
 			appendStringInfoCharMacro(buf, 0);
-			switch_fallthrough();
+			/* FALLTHROUGH */
+			yb_switch_fallthrough();
 		default:
 			break;
 	}
@@ -499,9 +504,13 @@ printJsonPathItem(StringInfo buf, JsonPathItem *v, bool inKey,
 			escape_json(buf, jspGetString(v, NULL));
 			break;
 		case jpiNumeric:
+			if (jspHasNext(v))
+				appendStringInfoChar(buf, '(');
 			appendStringInfoString(buf,
 								   DatumGetCString(DirectFunctionCall1(numeric_out,
 																	   NumericGetDatum(jspGetNumeric(v)))));
+			if (jspHasNext(v))
+				appendStringInfoChar(buf, ')');
 			break;
 		case jpiBool:
 			if (jspGetBool(v))
@@ -659,7 +668,7 @@ printJsonPathItem(StringInfo buf, JsonPathItem *v, bool inKey,
 			else if (v->content.anybounds.first == v->content.anybounds.last)
 			{
 				if (v->content.anybounds.first == PG_UINT32_MAX)
-					appendStringInfo(buf, "**{last}");
+					appendStringInfoString(buf, "**{last}");
 				else
 					appendStringInfo(buf, "**{%u}",
 									 v->content.anybounds.first);
@@ -867,8 +876,8 @@ jspInitByBuffer(JsonPathItem *v, char *base, int32 pos)
 		case jpiString:
 		case jpiVariable:
 			read_int32(v->content.value.datalen, base, pos);
-			/* follow next */
-			switch_fallthrough();
+			/* FALLTHROUGH */
+			yb_switch_fallthrough();
 		case jpiNumeric:
 		case jpiBool:
 			v->content.value.data = base + pos;
@@ -978,7 +987,8 @@ jspGetNext(JsonPathItem *v, JsonPathItem *a)
 			   v->type == jpiDouble ||
 			   v->type == jpiDatetime ||
 			   v->type == jpiKeyValue ||
-			   v->type == jpiStartsWith);
+			   v->type == jpiStartsWith ||
+			   v->type == jpiLikeRegex);
 
 		if (a)
 			jspInitByBuffer(a, v->base, v->nextPos);

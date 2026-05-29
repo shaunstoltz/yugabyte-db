@@ -1,4 +1,4 @@
-// Copyright (c) YugaByte, Inc.
+// Copyright (c) YugabyteDB, Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License"); you may not use this file except
 // in compliance with the License. You may obtain a copy of the License at
@@ -16,23 +16,25 @@
 #include "yb/consensus/log_util.h"
 #include "yb/util/test_macros.h"
 
+DECLARE_string(fs_data_dirs);
+
 namespace yb {
 
 #if defined(__linux__)
 TEST(TestLogUtil, TestModifyDurableWriteFlagIfNotDirectNegative) {
   gflags::FlagSaver flag_saver;
-  FLAGS_fs_data_dirs = "/var/run";
+  ANNOTATE_UNPROTECTED_WRITE(FLAGS_fs_data_dirs) = "/var/run";
 
   // Test that the method does not crash and durable_wal_write is flipped
   // when directory is not O_DIRECT writable.
-  FLAGS_durable_wal_write = true;
-  FLAGS_require_durable_wal_write = false;
+  ANNOTATE_UNPROTECTED_WRITE(FLAGS_durable_wal_write) = true;
+  ANNOTATE_UNPROTECTED_WRITE(FLAGS_require_durable_wal_write) = false;
   ASSERT_OK(log::ModifyDurableWriteFlagIfNotODirect());
   ASSERT_EQ(FLAGS_durable_wal_write, false);
 
   // Test that the method crashes when durable_wal_write is set to true.
-  FLAGS_durable_wal_write = true;
-  FLAGS_require_durable_wal_write = true;
+  ANNOTATE_UNPROTECTED_WRITE(FLAGS_durable_wal_write) = true;
+  ANNOTATE_UNPROTECTED_WRITE(FLAGS_require_durable_wal_write) = true;
   ASSERT_NOK(log::ModifyDurableWriteFlagIfNotODirect());
 }
 #endif
@@ -41,10 +43,10 @@ TEST(TestLogUtil, TestModifyDurableWriteFlagIfNotODirectPositive) {
   gflags::FlagSaver flag_saver;
   // Test that the method does not crash when durable_wal_write is set true and paths are O_DIRECT
   // Writable.
-  FLAGS_durable_wal_write = true;
+  ANNOTATE_UNPROTECTED_WRITE(FLAGS_durable_wal_write) = true;
   ASSERT_OK(log::ModifyDurableWriteFlagIfNotODirect());
   // Test that the method does not crash when durable_wal_write is set to false.
-  FLAGS_durable_wal_write = false;
+  ANNOTATE_UNPROTECTED_WRITE(FLAGS_durable_wal_write) = false;
   ASSERT_OK(log::ModifyDurableWriteFlagIfNotODirect());
 }
 } // namespace yb

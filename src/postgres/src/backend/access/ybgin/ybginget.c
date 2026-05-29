@@ -3,7 +3,7 @@
  * ybginget.c
  *	  fetch tuples from a Yugabyte GIN scan.
  *
- * Copyright (c) YugaByte, Inc.
+ * Copyright (c) YugabyteDB, Inc.
  *
  * Licensed under the Apache License, Version 2.0 (the "License"); you may not
  * use this file except in compliance with the License.  You may obtain a copy
@@ -29,20 +29,21 @@
 #include "access/relscan.h"
 #include "access/sdir.h"
 #include "access/sysattr.h"
+#include "access/yb_scan.h"
 #include "access/ybgin.h"
 #include "access/ybgin_private.h"
 #include "catalog/pg_collation.h"
 #include "catalog/pg_opfamily.h"
 #include "catalog/pg_type.h"
 #include "nodes/makefuncs.h"
+#include "pg_yb_utils.h"
 #include "utils/builtins.h"
 #include "utils/elog.h"
 #include "utils/lsyscache.h"
 #include "utils/memutils.h"
 #include "utils/rel.h"
 #include "utils/selfuncs.h"
-
-#include "pg_yb_utils.h"
+#include "utils/yb_like_support.h"
 #include "yb/yql/pggate/ybc_pggate.h"
 
 /* Copied from ginget.c. */
@@ -100,7 +101,7 @@ entryIndexByFrequencyCmp(const void *a1, const void *a2, void *arg)
 static void
 startScanKey(GinScanOpaque so, GinScanKey key)
 {
-	MemoryContext oldCtx = GetCurrentMemoryContext();
+	MemoryContext oldCtx = CurrentMemoryContext;
 	int			i;
 	int			j;
 	int		   *entryIndexes;
@@ -260,7 +261,7 @@ get_greaterstr(Datum prefix, Oid datatype, Oid colloid)
 	Oid			opfamily;
 	Oid			oproid;
 
-	/* make_greater_string cannot accurately handle non-C collations. */
+	/* yb_make_greater_string cannot accurately handle non-C collations. */
 	if (!lc_collate_is_c(colloid))
 		ereport(ERROR,
 				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
@@ -286,7 +287,7 @@ get_greaterstr(Datum prefix, Oid datatype, Oid colloid)
 		elog(ERROR, "no < operator for opfamily %u", opfamily);
 	fmgr_info(get_opcode(oproid), &ltproc);
 	prefix_const = text_to_const(prefix, colloid);
-	return make_greater_string(prefix_const, &ltproc, colloid);
+	return yb_make_greater_string(prefix_const, &ltproc, colloid);
 }
 
 static void
@@ -297,7 +298,7 @@ ybginSetupBindsForPrefix(TupleDesc tupdesc, YbginScanOpaque ybso,
 	GinScanOpaque so = (GinScanOpaque) ybso;
 	Oid			colloid;
 	Oid			typoid;
-	YBCPgExpr	expr_start,
+	YbcPgExpr	expr_start,
 				expr_end;
 
 	colloid = so->ginstate.supportCollation[0];
@@ -307,7 +308,7 @@ ybginSetupBindsForPrefix(TupleDesc tupdesc, YbginScanOpaque ybso,
 								typoid,
 								colloid,
 								entry->queryKey,
-								false /* is_null */);
+								false /* is_null */ );
 
 	greaterstr = get_greaterstr((Datum) entry->queryKey,
 								typoid,
@@ -318,9 +319,9 @@ ybginSetupBindsForPrefix(TupleDesc tupdesc, YbginScanOpaque ybso,
 								  typoid,
 								  colloid,
 								  greaterstr->constvalue,
-								  false /* is_null */);
+								  false /* is_null */ );
 		HandleYBStatus(YBCPgDmlBindColumnCondBetween(ybso->handle,
-													 1 /* attr_num */,
+													 1 /* attr_num */ ,
 													 expr_start,
 													 true,
 													 expr_end,
@@ -329,10 +330,10 @@ ybginSetupBindsForPrefix(TupleDesc tupdesc, YbginScanOpaque ybso,
 	}
 	else
 		HandleYBStatus(YBCPgDmlBindColumnCondBetween(ybso->handle,
-													 1 /* attr_num */,
+													 1 /* attr_num */ ,
 													 expr_start,
 													 true,
-													 NULL /* attr_value_end */,
+													 NULL /* attr_value_end */ ,
 													 true));
 }
 
@@ -432,71 +433,18 @@ ybginSetupBinds(IndexScanDesc scan)
 	}
 	else
 	{
-		YBCPgExpr	expr;
+		YbcPgExpr	expr;
 
 		/* Bind the one scan entry to the index column. */
 		expr = YBCNewConstant(ybso->handle,
 							  TupleDescAttr(tupdesc, 0)->atttypid,
 							  so->ginstate.supportCollation[0],
 							  entry->queryKey,
-							  false /* is_null */);
+							  false /* is_null */ );
 		HandleYBStatus(YBCPgDmlBindColumn(ybso->handle,
-										  1 /* attr_num */,
+										  1 /* attr_num */ ,
 										  expr));
 	}
-}
-
-/*
- * Add a system column as target to the given statement handle.
- *
- * See related ybcAddTargetColumn.
- */
-static void
-addTargetSystemColumn(int attnum, YBCPgStatement handle)
-{
-	Assert(attnum < 0);
-
-	YBCPgExpr	expr;
-	YBCPgTypeAttrs type_attrs;
-
-	/* System columns don't use typmod. */
-	type_attrs.typmod = -1;
-
-	expr = YBCNewColumnRef(handle,
-						   attnum,
-						   InvalidOid /* attr_typid */,
-						   InvalidOid /* attr_collation */,
-						   &type_attrs);
-	HandleYBStatus(YBCPgDmlAppendTarget(handle, expr));
-}
-
-/*
- * Add a regular column as target to the given statement handle if it is not
- * dropped.  Assume tupdesc's relation is the same as handle's target relation.
- *
- * See related ybcAddTargetColumn.
- */
-static void
-addTargetRegularColumn(TupleDesc tupdesc, int attnum, YBCPgStatement handle)
-{
-	/* This can possibly be >= 0. */
-	Assert(attnum >= 1);
-
-	Form_pg_attribute att;
-	YBCPgExpr	expr;
-	YBCPgTypeAttrs type_attrs;
-
-	att = TupleDescAttr(tupdesc, attnum - 1);
-	/* Ignore dropped attributes. */
-	if (att->attisdropped)
-		return;
-	type_attrs.typmod = att->atttypmod;
-	expr = YBCNewColumnRef(handle,
-						   attnum,
-						   att->atttypid,
-						   att->attcollation,
-						   &type_attrs);
-	HandleYBStatus(YBCPgDmlAppendTarget(handle, expr));
 }
 
 /*
@@ -516,16 +464,11 @@ ybginSetupTargets(IndexScanDesc scan)
 	tupdesc = RelationGetDescr(scan->heapRelation);
 
 	/*
-	 * IndexScan needs to get base ctids from the index table to pass as binds
-	 * to the base table.  This is handled in the pggate layer.
-	 */
-	addTargetSystemColumn(YBIdxBaseTupleIdAttributeNumber, ybso->handle);
-	/*
 	 * For scans that touch the base table, we seem to always query for the
 	 * ybctid, even if the table may have explicit primary keys.  A lower layer
 	 * probably filters this out when not applicable.
 	 */
-	addTargetSystemColumn(YBTupleIdAttributeNumber, ybso->handle);
+	YbDmlAppendTargetSystem(YBTupleIdAttributeNumber, ybso->handle);
 	/*
 	 * For now, target all non-system columns of the base table.  This can be
 	 * very inefficient.  The lsm index access method avoids this using
@@ -534,7 +477,10 @@ ybginSetupTargets(IndexScanDesc scan)
 	 * TODO(jason): don't target unnecessary columns.
 	 */
 	for (AttrNumber attnum = 1; attnum <= tupdesc->natts; attnum++)
-		addTargetRegularColumn(tupdesc, attnum, ybso->handle);
+	{
+		if (!TupleDescAttr(tupdesc, attnum - 1)->attisdropped)
+			YbDmlAppendTargetRegular(tupdesc, attnum, ybso->handle);
+	}
 }
 
 /*
@@ -544,11 +490,14 @@ ybginSetupTargets(IndexScanDesc scan)
 static void
 ybginExecSelect(IndexScanDesc scan, ScanDirection dir)
 {
-	bool		is_forward_scan = (dir == ForwardScanDirection);
 	YbginScanOpaque ybso = (YbginScanOpaque) scan->opaque;
 
-	HandleYBStatus(YBCPgSetForwardScan(ybso->handle, is_forward_scan));
-	HandleYBStatus(YBCPgExecSelect(ybso->handle, NULL /* exec_params */));
+	Assert(!ScanDirectionIsBackward(dir));
+	/* Set scan direction, if matters */
+	if (ScanDirectionIsForward(dir))
+		HandleYBStatus(YBCPgSetForwardScan(ybso->handle, true));
+
+	HandleYBStatus(YBCPgExecSelect(ybso->handle, NULL /* exec_params */ ));
 }
 
 /*
@@ -566,7 +515,19 @@ ybginDoFirstExec(IndexScanDesc scan, ScanDirection dir)
 	ybginSetupBinds(scan);
 
 	/* targets */
-	ybginSetupTargets(scan);
+	if (scan->yb_aggrefs != NIL)
+		/*
+		 * As of 2023-06-28, aggregate pushdown is only implemented for
+		 * IndexOnlyScan, not IndexScan.
+		 */
+		YbDmlAppendTargetsAggregate(scan->yb_aggrefs,
+									NULL,
+									RelationGetDescr(scan->indexRelation),
+									scan->indexRelation,
+									scan->xs_want_itup,
+									ybso->handle);
+	else
+		ybginSetupTargets(scan);
 
 	YbSetCatalogCacheVersion(ybso->handle, YbGetCatalogCacheVersion());
 
@@ -587,7 +548,7 @@ ybginFetchNextHeapTuple(IndexScanDesc scan)
 	Datum	   *values;
 	HeapTuple	tuple = NULL;
 	TupleDesc	tupdesc;
-	YBCPgSysColumns syscols;
+	YbcPgSysColumns syscols;
 	YbginScanOpaque ybso = (YbginScanOpaque) scan->opaque;
 
 	/*
@@ -610,9 +571,7 @@ ybginFetchNextHeapTuple(IndexScanDesc scan)
 
 		tuple->t_tableOid = RelationGetRelid(scan->heapRelation);
 		if (syscols.ybctid != NULL)
-			tuple->t_ybctid = PointerGetDatum(syscols.ybctid);
-		if (syscols.oid != InvalidOid)
-			HeapTupleSetOid(tuple, syscols.oid);
+			HEAPTUPLE_YBCTID(tuple) = PointerGetDatum(syscols.ybctid);
 	}
 	pfree(values);
 	pfree(nulls);
@@ -627,7 +586,7 @@ ybgingettuple(IndexScanDesc scan, ScanDirection dir)
 	YbginScanOpaque ybso = (YbginScanOpaque) scan->opaque;
 
 	/* Sanity check: amcanbackward. */
-	Assert(dir == ForwardScanDirection);
+	Assert(!ScanDirectionIsBackward(dir));
 
 	if (!ybso->is_exec_done)
 	{
@@ -637,22 +596,43 @@ ybgingettuple(IndexScanDesc scan, ScanDirection dir)
 	}
 
 	/* fetch */
-	scan->xs_ctup.t_ybctid = 0;
+	if (scan->yb_aggrefs)
+	{
+		/*
+		 * TODO(jason): don't assume that recheck is needed.
+		 */
+		scan->xs_recheck = true;
+
+		/*
+		 * Aggregate pushdown directly modifies the scan slot rather than
+		 * passing it through xs_hitup or xs_itup.
+		 */
+		return ybc_getnext_aggslot(scan, ybso->handle, scan->xs_want_itup);
+	}
 	while (HeapTupleIsValid(tup = ybginFetchNextHeapTuple(scan)))
 	{
 		if (true)				/* TODO(jason): don't assume a match. */
 		{
-			scan->xs_ctup.t_ybctid = tup->t_ybctid;
 			scan->xs_hitup = tup;
 			scan->xs_hitupdesc = RelationGetDescr(scan->heapRelation);
 
 			/* TODO(jason): don't assume that recheck is needed. */
 			scan->xs_recheck = true;
-			break;
+			return true;
 		}
 
 		heap_freetuple(tup);
 	}
 
-	return scan->xs_ctup.t_ybctid != 0;
+	return false;
+}
+
+/*
+ * TODO(jason): don't assume that recheck is needed.
+ */
+bool
+ybginmightrecheck(Scan *scan, Relation heapRelation, Relation indexRelation,
+				  bool xs_want_itup, ScanKey keys, int nkeys)
+{
+	return true;
 }

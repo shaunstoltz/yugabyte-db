@@ -1,5 +1,5 @@
 /*
- * Copyright 2019 YugaByte, Inc. and Contributors
+ * Copyright 2019 YugabyteDB, Inc. and Contributors
  *
  * Licensed under the Polyform Free Trial License 1.0.0 (the "License"); you
  * may not use this file except in compliance with the License. You
@@ -44,7 +44,7 @@ public class LoadBalancerStateChange extends UniverseTaskBase {
   public String getName() {
     return super.getName()
         + "("
-        + taskParams().universeUUID
+        + taskParams().getUniverseUUID()
         + ", enable="
         + taskParams().enable
         + ")";
@@ -53,20 +53,13 @@ public class LoadBalancerStateChange extends UniverseTaskBase {
   @Override
   public void run() {
     ChangeLoadBalancerStateResponse resp;
-    YBClient client = null;
-    Universe universe = Universe.getOrBadRequest(taskParams().universeUUID);
-    String masterHostPorts = universe.getMasterAddresses();
-    String certificate = universe.getCertificateNodetoNode();
-    try {
-      log.info("Running {}: masterHostPorts={}.", getName(), masterHostPorts);
-
-      client = ybService.getClient(masterHostPorts, certificate);
+    Universe universe = Universe.getOrBadRequest(taskParams().getUniverseUUID());
+    try (YBClient client = ybService.getUniverseClient(universe)) {
+      log.info("Running {}: masterHostPorts={}.", getName(), universe.getMasterAddresses());
       resp = client.changeLoadBalancerState(taskParams().enable);
     } catch (Exception e) {
       log.error("{} hit exception : {}", getName(), e.getMessage());
       throw new RuntimeException(e);
-    } finally {
-      ybService.closeClient(client, masterHostPorts);
     }
 
     if (resp != null && resp.hasError()) {

@@ -1,5 +1,5 @@
 //
-// Copyright (c) YugaByte, Inc.
+// Copyright (c) YugabyteDB, Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License"); you may not use this file except
 // in compliance with the License.  You may obtain a copy of the License at
@@ -15,7 +15,7 @@
 
 #include "yb/util/allocation_tracker.h"
 
-#include <glog/logging.h>
+#include "yb/util/logging.h"
 
 #include "yb/util/debug-util.h"
 
@@ -23,15 +23,15 @@ namespace yb {
 
 AllocationTrackerBase::~AllocationTrackerBase() {
 #ifndef NDEBUG
-  std::lock_guard<std::mutex> lock(mutex_);
+  std::lock_guard lock(mutex_);
   for (auto& pair : objects_) {
-    LOG(ERROR) << "Error of type " << name_ << " not destroyed, id: " << pair.second.second
-               << ", created at: " << pair.second.first;
+    LOG(DFATAL) << "Error of type " << name_ << " not destroyed, id: " << pair.second.second
+                << ", created at: " << pair.second.first;
   }
 #else
   if (count_) {
-    LOG(ERROR) << "Not all objects of type " << name_ << " were destroyed, "
-               << count_ << " objects left";
+    LOG(DFATAL) << "Not all objects of type " << name_ << " were destroyed, "
+                << count_ << " objects left";
   }
 #endif
 }
@@ -39,7 +39,7 @@ AllocationTrackerBase::~AllocationTrackerBase() {
 void AllocationTrackerBase::DoCreated(void* object) {
   LOG(INFO) << "Created " << name_ << ": " << object;
 #ifndef NDEBUG
-  std::lock_guard<std::mutex> lock(mutex_);
+  std::lock_guard lock(mutex_);
   objects_.emplace(object,
                   std::make_pair(GetStackTrace(StackTraceLineFormat::CLION_CLICKABLE),
                                  ++id_));
@@ -51,7 +51,7 @@ void AllocationTrackerBase::DoCreated(void* object) {
 void AllocationTrackerBase::DoDestroyed(void* object) {
   LOG(INFO) << "Destroyed " << name_ << ": " << object;
 #ifndef NDEBUG
-  std::lock_guard<std::mutex> lock(mutex_);
+  std::lock_guard lock(mutex_);
   objects_.erase(object);
 #else
   --count_;

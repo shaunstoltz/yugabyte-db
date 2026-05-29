@@ -15,9 +15,9 @@
 // specific language governing permissions and limitations
 // under the License.
 //
-// The following only applies to changes made to this file as part of YugaByte development.
+// The following only applies to changes made to this file as part of YugabyteDB development.
 //
-// Portions Copyright (c) YugaByte, Inc.
+// Portions Copyright (c) YugabyteDB, Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License"); you may not use this file except
 // in compliance with the License.  You may obtain a copy of the License at
@@ -37,38 +37,35 @@
 
 #include <atomic>
 #include <condition_variable>
-#include <map>
 #include <memory>
 #include <mutex>
 #include <string>
-#include <vector>
 
 #include <boost/atomic.hpp>
-#include <glog/logging.h>
+
+#include "yb/ash/ash_fwd.h"
 
 #include "yb/common/common_fwd.h"
+#include "yb/common/hybrid_time.h"
+#include "yb/common/opid.h"
 
-#include "yb/consensus/consensus_fwd.h"
 #include "yb/consensus/log_util.h"
 
 #include "yb/fs/fs_manager.h"
 
 #include "yb/gutil/macros.h"
 #include "yb/gutil/ref_counted.h"
-#include "yb/gutil/spinlock.h"
 
-#include "yb/util/status_fwd.h"
 #include "yb/util/locks.h"
 #include "yb/util/monotime.h"
-#include "yb/util/mutex.h"
-#include "yb/util/opid.h"
 #include "yb/util/promise.h"
-#include "yb/util/shared_lock.h"
 #include "yb/util/status_callback.h"
+#include "yb/util/status_fwd.h"
 #include "yb/util/threadpool.h"
 
 namespace yb {
 
+class Cgroup;
 class MetricEntity;
 class ThreadPool;
 
@@ -79,23 +76,21 @@ class CDCServiceTestMinSpace_TestLogRetentionByOpId_MinSpace_Test;
 
 namespace log {
 
-YB_DEFINE_ENUM(
-    SyncType,
+YB_DEFINE_ENUM(SyncType,
     (kNoSync)
     (kAsyncFsync)
     (kForceFsync)
 );
 
 YB_STRONGLY_TYPED_BOOL(CreateNewSegment);
-YB_DEFINE_ENUM(
-    SegmentAllocationState,
+YB_DEFINE_ENUM(SegmentAllocationState,
     (kAllocationNotStarted)  // No segment allocation requested
     (kAllocationInProgress)  // Next segment allocation started
     (kAllocationFinished)    // Next segment ready
+    (kAllocationFailed)      // Next segment allocation failed
 );
 
-YB_DEFINE_ENUM(
-    SegmentOpIdRelation,
+YB_DEFINE_ENUM(SegmentOpIdRelation,
     // Segment is empty
     (kEmptySegment)
     // OpId is before the segment
@@ -109,6 +104,8 @@ YB_DEFINE_ENUM(
 );
 
 YB_STRONGLY_TYPED_BOOL(SkipWalWrite);
+
+using NewSegmentAllocationCallback = std::function<Status(void)>;
 
 // Log interface, inspired by Raft's (logcabin) Log. Provides durability to YugaByte as a normal
 // Write Ahead Log and also plays the role of persistent storage for the consensus state machine.
@@ -138,20 +135,24 @@ class Log : public RefCountedThreadSafe<Log> {
 
   // Opens or continues a log and sets 'log' to the newly built Log.
   // After a successful Open() the Log is ready to receive entries, if create_new_segment is true.
-  static Status Open(const LogOptions &options,
-                             const std::string& tablet_id,
-                             const std::string& wal_dir,
-                             const std::string& peer_uuid,
-                             const Schema& schema,
-                             uint32_t schema_version,
-                             const scoped_refptr<MetricEntity>& table_metric_entity,
-                             const scoped_refptr<MetricEntity>& tablet_metric_entity,
-                             ThreadPool *append_thread_pool,
-                             ThreadPool* allocation_thread_pool,
-                             ThreadPool* background_sync_threadpool,
-                             int64_t cdc_min_replicated_index,
-                             scoped_refptr<Log> *log,
-                             CreateNewSegment create_new_segment = CreateNewSegment::kTrue);
+  static Status Open(
+      const LogOptions& options,
+      const std::string& tablet_id,
+      const std::string& wal_dir,
+      const std::string& peer_uuid,
+      const Schema& schema,
+      uint32_t schema_version,
+      const scoped_refptr<MetricEntity>& table_metric_entity,
+      const scoped_refptr<MetricEntity>& tablet_metric_entity,
+      std::shared_ptr<MemTracker> read_wal_mem_tracker,
+      ThreadPool* append_thread_pool,
+      ThreadPool* allocation_thread_pool,
+      ThreadPool* background_sync_threadpool,
+      scoped_refptr<Log>* log,
+      const PreLogRolloverCallback& pre_log_rollover_callback = {},
+      NewSegmentAllocationCallback callback = {},
+      CreateNewSegment create_new_segment = CreateNewSegment::kTrue,
+      MinStartHTRunningTxnsCallback min_start_ht_running_txns_callback = {});
 
   ~Log();
 
@@ -193,9 +194,9 @@ class Log : public RefCountedThreadSafe<Log> {
                                          const std::string& wal_dir,
                                          const std::string& peer_uuid);
 
-  // Returns a reader that is able to read through the previous segments. The reader pointer is
-  // guaranteed to be live as long as the log itself is initialized and live.
-  LogReader* GetLogReader() const;
+  // Returns a reader that is able to read through the previous segments.
+  // Returns IllegalState if the log has been closed and the reader is no longer available.
+  Result<LogReader*> GetLogReader() const;
 
   Status GetSegmentsSnapshot(SegmentSequence* segments) const;
 
@@ -237,6 +238,19 @@ class Log : public RefCountedThreadSafe<Log> {
   // Computes the amount of bytes that would have been GC'd if Log::GC had been called.
   Status GetGCableDataSize(int64_t min_op_idx, int64_t* total_size) const;
 
+  // Test-only public wrapper around the private GetSegmentsToGC, used by unit tests that need to
+  // compute the GC-eligible prefix Log::GC would pick for a given 'min_op_idx' (with the full
+  // retention policy stack applied: xCluster/CDC retention, FLAGS_log_min_segments_to_retain, and
+  // time-based retention). Production callers should not consult GC's reclaimable set directly --
+  // remote bootstrap, for instance, drives its own trim off a frozen GetSegmentsSnapshot() to
+  // avoid races with the GC thread.
+  //
+  // This method is thread-safe.
+  Status TEST_GetSegmentsToGC(int64_t min_op_idx, SegmentSequence* segments_to_gc) const
+      EXCLUDES(state_lock_) {
+    return GetSegmentsToGC(min_op_idx, segments_to_gc);
+  }
+
   // Returns the file system location of the currently active WAL segment.
   const WritableLogSegment* TEST_ActiveSegment() const {
     return active_segment_.get();
@@ -247,9 +261,23 @@ class Log : public RefCountedThreadSafe<Log> {
   // readable segments. Note that this assumes there is already a valid active_segment_.
   Status AllocateSegmentAndRollOver();
 
+  // If active segment is not empty, forces the Log to allocate a new segment and roll over
+  // asynchronously and won't wait for wal rotation is actually done.
+  Status AsyncAllocateSegmentAndRollover();
+
+  // When WAL restarts from a crash, instead of allocating a new segment, we try to reuse the
+  // left in-progress segment as writable active_segment_. If return value is false, it means
+  // we fail to reuse the segment because the size of the segment is too large.
+  // If true, this function restored footer_builder_, log_index_, and other attributes of WAl,
+  // then reopen the file as writable active_segment_.
+  Result<bool>  ReuseAsActiveSegment(
+      const scoped_refptr<ReadableLogSegment>& recover_segment) EXCLUDES(active_segment_mutex_);
+
   // For a log created with CreateNewSegment::kFalse, this is used to finish log initialization by
-  // allocating a new segment.
-  Status EnsureInitialNewSegmentAllocated();
+  // either allocating a new segment or reused left in-progress segment that doesn't have footer.
+  Status EnsureSegmentInitialized();
+
+  Status EnsureSegmentInitializedUnlocked() REQUIRES(state_lock_);
 
   // Returns the total size of the current segments, in bytes.
   // Returns 0 if the log is shut down.
@@ -284,6 +312,14 @@ class Log : public RefCountedThreadSafe<Log> {
 
   uint64_t active_segment_sequence_number() const;
 
+  SegmentAllocationState allocation_state() {
+    return allocation_state_.load(std::memory_order_acquire);
+  }
+
+  Status TEST_GetAllocationStatus() {
+    return allocation_status_.Get();
+  }
+
   Status TEST_SubmitFuncToAppendToken(const std::function<void()>& func);
 
   // Returns the number of segments.
@@ -315,6 +351,23 @@ class Log : public RefCountedThreadSafe<Log> {
   // Waits until all entries flushed, then reset last received op id to specified one.
   Status ResetLastSyncedEntryOpId(const OpId& op_id);
 
+  Status TEST_WriteCorruptedEntryBatchAndSync();
+
+  bool HasSufficientDiskSpaceForWrite();
+
+  void SetGetXClusterMinIndexToRetainFunc(
+      std::function<int64_t(const std::string&)> get_xcluster_required_index_func) {
+    std::lock_guard l(get_xcluster_index_lock_);
+    if (get_xcluster_min_index_to_retain_ == nullptr) {
+      get_xcluster_min_index_to_retain_ = std::move(get_xcluster_required_index_func);
+    }
+  }
+
+  HybridTime GetMinStartHTOfRunningTxnsFromGCSegments() const;
+
+  // Set per-DB cgroup on all internal pool tokens for per-DB cgroup mode.
+  void SetPerDbCgroup(Cgroup* cgroup);
+
  private:
   friend class LogTest;
   friend class LogTestBase;
@@ -323,7 +376,8 @@ class Log : public RefCountedThreadSafe<Log> {
   FRIEND_TEST(LogTest, TestReadLogWithReplacedReplicates);
   FRIEND_TEST(LogTest, TestWriteAndReadToAndFromInProgressSegment);
   FRIEND_TEST(LogTest, TestLogMetrics);
-
+  FRIEND_TEST(LogTest, TestLogMetricsWithSegmentReuse);
+  FRIEND_TEST(LogTest, AsyncRolloverMarker);
   FRIEND_TEST(cdc::CDCServiceTestMaxRentionTime, TestLogRetentionByOpId_MaxRentionTime);
   FRIEND_TEST(cdc::CDCServiceTestMinSpace, TestLogRetentionByOpId_MinSpace);
 
@@ -345,10 +399,14 @@ class Log : public RefCountedThreadSafe<Log> {
       uint32_t schema_version,
       const scoped_refptr<MetricEntity>& table_metric_entity,
       const scoped_refptr<MetricEntity>& tablet_metric_entity,
+      std::shared_ptr<MemTracker> read_wal_mem_tracker,
       ThreadPool* append_thread_pool,
       ThreadPool* allocation_thread_pool,
       ThreadPool* background_sync_threadpool,
-      CreateNewSegment create_new_segment = CreateNewSegment::kTrue);
+      NewSegmentAllocationCallback callback,
+      const PreLogRolloverCallback& pre_log_rollover_callback,
+      CreateNewSegment create_new_segment = CreateNewSegment::kTrue,
+      MinStartHTRunningTxnsCallback min_start_ht_running_txns_callback = {});
 
   Env* get_env() {
     return options_.env;
@@ -379,6 +437,7 @@ class Log : public RefCountedThreadSafe<Log> {
   Status PreAllocateNewSegment();
 
   // Returns the desired size for the next log segment to be created.
+  // If next_max_segment_size_ is specified, return it directly.
   uint64_t NextSegmentDesiredSize();
 
   // Writes serialized contents of 'entry' to the log. Called inside AppenderThread. If
@@ -428,7 +487,10 @@ class Log : public RefCountedThreadSafe<Log> {
   Status UpdateSegmentReadableOffset() EXCLUDES(active_segment_mutex_);
 
   // Helper method to get the segment sequence to GC based on the provided min_op_idx.
-  Status GetSegmentsToGCUnlocked(int64_t min_op_idx, SegmentSequence* segments_to_gc) const;
+  Status GetSegmentsToGCUnlocked(int64_t min_op_idx, SegmentSequence* segments_to_gc) const
+      REQUIRES_SHARED(state_lock_);
+  Status GetSegmentsToGC(int64_t min_op_idx, SegmentSequence* segments_to_gc) const
+      EXCLUDES(state_lock_);
 
   // Discards segments from 'segments_to_gc' if they have not yet met the minimim retention time.
   void ApplyTimeRetentionPolicy(SegmentSequence* segments_to_gc) const;
@@ -437,11 +499,7 @@ class Log : public RefCountedThreadSafe<Log> {
   // 'allocation_status_'. To wait for the result of the task, use allocation_status_.Get().
   Status AsyncAllocateSegment();
 
-  SegmentAllocationState allocation_state() {
-    return allocation_state_.load(std::memory_order_acquire);
-  }
-
-  std::unique_ptr<LogEntryBatch> ReserveMarker(LogEntryTypePB type);
+  Result<std::unique_ptr<LogEntryBatch>> ReserveMarker(LogEntryTypePB type);
 
   // Returns WritableFileOptions for a new segment writable file.
   WritableFileOptions GetNewSegmentWritableFileOptions();
@@ -460,8 +518,7 @@ class Log : public RefCountedThreadSafe<Log> {
   // Returns true if max_included_op_id is before or inside the segment and false otherwise.
 
   Result<bool> CopySegmentUpTo(
-      ReadableLogSegment* segment, const std::string& dest_wal_dir,
-      const OpId& max_included_op_id);
+      ReadableLogSegment* segment, const std::string& dest_wal_dir, const OpId& max_included_op_id);
 
   // Asynchronously appends 'entry' to the log. Once the append completes and is synced, 'callback'
   // will be invoked.
@@ -475,8 +532,13 @@ class Log : public RefCountedThreadSafe<Log> {
   //
   // WARNING: the caller _must_ call AsyncAppend() or else the log will "stall" and will never be
   // able to make forward progress.
-  std::unique_ptr<LogEntryBatch> Reserve(
+  Result<std::unique_ptr<LogEntryBatch>> Reserve(
       LogEntryTypePB type, std::shared_ptr<LWLogEntryBatchPB> entry_batch);
+
+  void WriteLatestMinStartTimeRunningTxnsInFooterBuilder();
+
+  // Updates 'min_start_time_running_txns_from_gc_segments_' from the available segments for GC.
+  void UpdateMinStartTimeRunningTxnsFromGCSegments(const SegmentSequence& segments) const;
 
   LogOptions options_;
 
@@ -520,7 +582,7 @@ class Log : public RefCountedThreadSafe<Log> {
   std::string next_segment_path_;
 
   // Lock to protect mutations to log_state_ and other shared state variables.
-  mutable percpu_rwlock state_lock_;
+  mutable PerCpuRwMutex state_lock_;
 
   LogState log_state_;
 
@@ -554,6 +616,10 @@ class Log : public RefCountedThreadSafe<Log> {
   // The maximum segment size we want for the current WAL segment, in bytes.  This value keeps
   // doubling (for each subsequent WAL segment) till it gets to max_segment_size_.
   uint64_t cur_max_segment_size_;
+
+  // The maximum segment size we want for the next WAL segment, in bytes. Use this value instead of
+  // doubling cur_max_segment_size_ if it's specifed.
+  std::optional<uint64_t> next_max_segment_size_;
 
   // Appender manages a TaskStream writing to the log. We will use one taskstream per tablet.
   std::unique_ptr<Appender> appender_;
@@ -600,6 +666,8 @@ class Log : public RefCountedThreadSafe<Log> {
   scoped_refptr<MetricEntity> tablet_metric_entity_;
   std::unique_ptr<LogMetrics> metrics_;
 
+  std::shared_ptr<MemTracker> read_wal_mem_tracker_;
+
   // The cached on-disk size of the log, used to track its size even if it has been closed.
   std::atomic<uint64_t> on_disk_size_;
 
@@ -619,6 +687,11 @@ class Log : public RefCountedThreadSafe<Log> {
   // Minimum replicate index for the current log being written. Used for CDC read initialization.
   std::atomic<int64_t> min_replicate_index_{-1};
 
+  // Stores the min_start_time_running_txns from WAL segments that are available for GC based on
+  // index.
+  mutable std::atomic<HybridTime> min_start_time_running_txns_from_gc_segments_ =
+      HybridTime::kInvalid;
+
   // The current replicated index that CDC has read.  Used for CDC read cache optimization.
   std::atomic<int64_t> cdc_min_replicated_index_{std::numeric_limits<int64_t>::max()};
 
@@ -628,6 +701,32 @@ class Log : public RefCountedThreadSafe<Log> {
   int64_t log_copy_min_index_ GUARDED_BY(state_lock_) = std::numeric_limits<int64_t>::max();
 
   CreateNewSegment create_new_segment_at_start_;
+
+  NewSegmentAllocationCallback new_segment_allocation_callback_;
+
+  PreLogRolloverCallback pre_log_rollover_callback_;
+
+  const yb::ash::WaitStateInfoPtr background_synchronizer_wait_state_;
+
+  // Initialised during tablet bootstrap to TabletPeer::GetMinStartHTRunningTxnsOrLeaderSafeTime.
+  // The callback guarantees that value returned would be a 'valid' Hybrid time.
+  MinStartHTRunningTxnsCallback min_start_ht_running_txns_callback_;
+
+  std::atomic<CoarseTimePoint> last_disk_space_check_time_{CoarseTimePoint::min()};
+  std::atomic<bool> has_free_disk_space_{false};
+  std::atomic<uint32> disk_space_frequent_check_interval_sec_{0};
+  std::shared_timed_mutex disk_space_mutex_;
+
+  // Protect access to the get_xcluster_min_index_to_retain_.
+  mutable PerCpuRwMutex get_xcluster_index_lock_;
+
+  // Function pointer to CDCServiceImpl::GetXClusterMinRequiredIndex.
+  // This function retrieves the xCluster minimum required index for a given tablet.
+  std::function<int64_t(const std::string&)> get_xcluster_min_index_to_retain_
+      GUARDED_BY(get_xcluster_index_lock_);
+
+  // Tracks on-disk size of active log segment file for metric reporting.
+  int64_t active_segment_ondisk_size_ = 0;
 
   DISALLOW_COPY_AND_ASSIGN(Log);
 };

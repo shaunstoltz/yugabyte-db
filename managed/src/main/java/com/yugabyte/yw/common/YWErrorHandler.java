@@ -1,5 +1,5 @@
 /*
- * Copyright 2021 YugaByte, Inc. and Contributors
+ * Copyright 2021 YugabyteDB, Inc. and Contributors
  *
  * Licensed under the Polyform Free Trial License 1.0.0 (the "License"); you
  * may not use this file except in compliance with the License. You
@@ -19,10 +19,12 @@ import com.google.common.base.Throwables;
 import com.google.inject.Inject;
 import com.google.inject.Singleton;
 import com.typesafe.config.Config;
+import jakarta.persistence.EntityNotFoundException;
+import jakarta.persistence.OptimisticLockException;
+import jakarta.persistence.QueryTimeoutException;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CompletionStage;
 import javax.inject.Provider;
-import javax.persistence.OptimisticLockException;
 import org.jetbrains.annotations.NotNull;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -52,7 +54,11 @@ public final class YWErrorHandler extends DefaultHttpErrorHandler {
 
   @Override
   public CompletionStage<Result> onServerError(Http.RequestHeader request, Throwable exception) {
-    LOG.debug("YWErrorHandler invoked {}", exception.getMessage());
+    LOG.debug(
+        "YWErrorHandler invoked for endpoint {} {}: {}",
+        request.method(),
+        request.uri(),
+        exception.getMessage());
     for (Throwable cause : Throwables.getCausalChain(exception)) {
       if (cause instanceof PlatformServiceException) {
         return CompletableFuture.completedFuture(
@@ -62,6 +68,13 @@ public final class YWErrorHandler extends DefaultHttpErrorHandler {
         return CompletableFuture.completedFuture(
             new PlatformServiceException(
                     BAD_REQUEST, "Data has changed, please refresh and try again")
+                .buildResult(request.method(), request.uri()));
+      }
+      if (cause instanceof EntityNotFoundException || cause instanceof QueryTimeoutException) {
+        // 529 was proposed for YBM. This can happen when entity object is already fetched but
+        // deleted before fetching the fields.
+        return CompletableFuture.completedFuture(
+            new PlatformServiceException(529, "Transient error. Please refresh and try again")
                 .buildResult(request.method(), request.uri()));
       }
     }
@@ -76,7 +89,7 @@ public final class YWErrorHandler extends DefaultHttpErrorHandler {
           new PlatformServiceException(
                   INTERNAL_SERVER_ERROR,
                   "HTTP Server Error. This exception has been logged with id " + exception)
-              .buildResult());
+              .buildResult(request));
     }
     return super.onProdServerError(request, exception);
   }
@@ -88,7 +101,7 @@ public final class YWErrorHandler extends DefaultHttpErrorHandler {
       return CompletableFuture.completedFuture(
           new PlatformServiceException(
                   INTERNAL_SERVER_ERROR, "HTTP Server Error", Json.toJson(exception))
-              .buildResult());
+              .buildResult(request));
     }
     return super.onProdServerError(request, exception);
   }
@@ -98,7 +111,8 @@ public final class YWErrorHandler extends DefaultHttpErrorHandler {
       RequestHeader request, int statusCode, String message) {
     LOG.trace("Json formatting client error {}: {}", statusCode, message);
     return CompletableFuture.completedFuture(
-        new PlatformServiceException(statusCode, "HTTP Client Error: " + message).buildResult());
+        new PlatformServiceException(statusCode, "HTTP Client Error: " + message)
+            .buildResult(request));
   }
 
   @Override
@@ -106,7 +120,7 @@ public final class YWErrorHandler extends DefaultHttpErrorHandler {
     if (request.accepts("application/json")) {
       // keep it same since we will have too many tests depending on this behaviour
       return CompletableFuture.completedFuture(
-          new PlatformServiceException(BAD_REQUEST, message).buildResult());
+          new PlatformServiceException(BAD_REQUEST, message).buildResult(request));
     }
     return super.onBadRequest(request, message);
   }

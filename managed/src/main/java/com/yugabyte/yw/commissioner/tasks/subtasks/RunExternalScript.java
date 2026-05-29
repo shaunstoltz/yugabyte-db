@@ -1,3 +1,5 @@
+// Copyright (c) YugabyteDB, Inc.
+
 package com.yugabyte.yw.commissioner.tasks.subtasks;
 
 import static com.yugabyte.yw.models.helpers.ExternalScriptHelper.EXT_SCRIPT_CONTENT_CONF_PATH;
@@ -99,7 +101,7 @@ public class RunExternalScript extends AbstractTaskBase {
       List<String> commandList = new ArrayList<>();
       commandList.add(SCRIPT_DIR + tempScriptFile.getName());
       commandList.add("--universe_name");
-      commandList.add(universe.name);
+      commandList.add(universe.getName());
       commandList.add("--universe_uuid");
       commandList.add(params().universeUUID.toString());
       commandList.add("--platform_url");

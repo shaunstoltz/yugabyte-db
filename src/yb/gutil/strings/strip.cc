@@ -1,9 +1,9 @@
 // Copyright 2011 Google Inc. All Rights Reserved.
 // based on contributions of various authors in strings/strutil_unittest.cc
 //
-// The following only applies to changes made to this file as part of YugaByte development.
+// The following only applies to changes made to this file as part of YugabyteDB development.
 //
-// Portions Copyright (c) YugaByte, Inc.
+// Portions Copyright (c) YugabyteDB, Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License"); you may not use this file except
 // in compliance with the License.  You may obtain a copy of the License at
@@ -25,10 +25,6 @@
 
 #include <algorithm>
 
-using std::copy;
-using std::max;
-using std::min;
-using std::swap;
 using std::string;
 
 string StripPrefixString(GStringPiece str, const GStringPiece& prefix) {
@@ -138,10 +134,10 @@ void StripWhiteSpace(string* str) {
 
   // Strip off trailing whitespace.
   size_t last = str_length - 1;
-  while (last >= 0 && ascii_isspace((*str)[last])) {
+  while (ascii_isspace((*str)[last])) {
     --last;
   }
-  if (last != (str_length - 1) && last >= 0) {
+  if (last != str_length - 1) {
     str->erase(last + 1, string::npos);
   }
 }

@@ -1,4 +1,4 @@
-// Copyright (c) YugaByte, Inc.
+// Copyright (c) YugabyteDB, Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License"); you may not use this file except
 // in compliance with the License.  You may obtain a copy of the License at
@@ -13,26 +13,17 @@
 
 #pragma once
 
-#include <string>
-#include <vector>
-
 #include "yb/docdb/docdb_fwd.h"
-#include "yb/docdb/shared_lock_manager_fwd.h"
-#include "yb/docdb/intent.h"
 
 #include "yb/util/monotime.h"
 
-namespace yb {
-namespace docdb {
+namespace yb::docdb {
 
-typedef uint64_t LockState;
-
-// This class manages six types of locks on string keys. On each key, the possibilities are:
-// - No locks
-// - A single kStrongSnapshotWrite
-// - Multiple kStrongSerializableRead and kWeakSerializableRead
-// - Multiple kStrongSerializableWrite and kWeakSerializableWrite
-// - Multiple kWeakSnapshotWrite, kWeakSerializableRead, and kWeakSerializableWrite
+// This class manages locks on keys of type RefCntPrefix. On each key, the possibilities arise
+// from a combination of kWeak/kStrong Read/Write intent types.
+//
+// Every tablet maintains its own SharedLockManager and uses it to acquire required in-memory locks
+// for the scope of the read/write request being served.
 class SharedLockManager {
  public:
   SharedLockManager();
@@ -43,26 +34,17 @@ class SharedLockManager {
   // this lock manager, which makes it auto-unlock on destruction.
   //
   // Returns false if was not able to acquire lock until deadline.
-  MUST_USE_RESULT bool Lock(LockBatchEntries* key_to_intent_type, CoarseTimePoint deadline);
+  MUST_USE_RESULT bool Lock(
+      LockBatchEntries<SharedLockManager>& key_to_intent_type, CoarseTimePoint deadline);
 
   // Release the batch of locks. Requires that the locks are held.
-  void Unlock(const LockBatchEntries& key_to_intent_type);
+  void Unlock(const LockBatchEntries<SharedLockManager>& key_to_intent_type);
 
-  // Whether or not the state is possible
-  static std::string ToString(const LockState& state);
+  void DumpStatusHtml(std::ostream& out);
 
  private:
   class Impl;
   std::unique_ptr<Impl> impl_;
 };
 
-// Masks of intent type sets.
-// I.e. bits that related to any of intents from this set is filled with 1, others are 0.
-extern const std::array<LockState, kIntentTypeSetMapSize> kIntentTypeSetMask;
-// Conflicts of intent types. I.e. combination of masks of intent type sets that conflict with it.
-extern const std::array<LockState, kIntentTypeSetMapSize> kIntentTypeSetConflicts;
-
-bool IntentTypeSetsConflict(IntentTypeSet lhs, IntentTypeSet rhs);
-
-}  // namespace docdb
-}  // namespace yb
+}  // namespace yb::docdb

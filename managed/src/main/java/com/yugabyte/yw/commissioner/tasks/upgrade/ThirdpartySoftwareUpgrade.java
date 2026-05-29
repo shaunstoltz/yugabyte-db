@@ -1,11 +1,14 @@
-// Copyright (c) YugaByte, Inc.
+// Copyright (c) YugabyteDB, Inc.
 
 package com.yugabyte.yw.commissioner.tasks.upgrade;
 
 import com.yugabyte.yw.commissioner.BaseTaskDependencies;
+import com.yugabyte.yw.commissioner.ITask.Abortable;
+import com.yugabyte.yw.commissioner.ITask.Retryable;
 import com.yugabyte.yw.commissioner.UpgradeTaskBase;
 import com.yugabyte.yw.commissioner.UserTaskDetails.SubTaskGroupType;
 import com.yugabyte.yw.forms.ThirdpartySoftwareUpgradeParams;
+import com.yugabyte.yw.models.Universe;
 import com.yugabyte.yw.models.helpers.NodeDetails;
 import com.yugabyte.yw.models.helpers.NodeDetails.NodeState;
 import java.util.LinkedHashSet;
@@ -15,6 +18,8 @@ import lombok.extern.slf4j.Slf4j;
 
 @Slf4j
 @EqualsAndHashCode(callSuper = false)
+@Retryable
+@Abortable
 public class ThirdpartySoftwareUpgrade extends UpgradeTaskBase {
 
   @Inject
@@ -38,11 +43,27 @@ public class ThirdpartySoftwareUpgrade extends UpgradeTaskBase {
   }
 
   @Override
+  public void validateParams(boolean isFirstTry) {
+    super.validateParams(isFirstTry);
+    taskParams().verifyParams(getUniverse(), isFirstTry);
+  }
+
+  @Override
+  protected void createPrecheckTasks(Universe universe) {
+    super.createPrecheckTasks(universe);
+    addBasicPrecheckTasks();
+  }
+
+  @Override
+  protected MastersAndTservers calculateNodesToBeRestarted() {
+    return fetchNodes(taskParams().upgradeOption);
+  }
+
+  @Override
   public void run() {
     runUpgrade(
         () -> {
-          taskParams().verifyParams(getUniverse());
-          LinkedHashSet<NodeDetails> nodesToUpdate = fetchAllNodes(taskParams().upgradeOption);
+          LinkedHashSet<NodeDetails> nodesToUpdate = toOrderedSet(getNodesToBeRestarted().asPair());
 
           createRollingNodesUpgradeTaskFlow(
               (nodes, processTypes) -> {
@@ -56,7 +77,7 @@ public class ThirdpartySoftwareUpgrade extends UpgradeTaskBase {
               },
               nodesToUpdate,
               DEFAULT_CONTEXT,
-              taskParams().ybcInstalled);
+              taskParams().isYbcInstalled());
         });
   }
 }

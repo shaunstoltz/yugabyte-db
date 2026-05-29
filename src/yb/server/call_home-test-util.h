@@ -1,4 +1,4 @@
-// Copyright (c) YugaByte, Inc.
+// Copyright (c) YugabyteDB, Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License"); you may not use this file except
 // in compliance with the License.  You may obtain a copy of the License at
@@ -14,9 +14,8 @@
 
 #include "yb/server/call_home.h"
 #include "yb/util/flags.h"
-#include "yb/util/jsonreader.h"
-#include "yb/util/test_util.h"
-#include "yb/common/wire_protocol.h"
+#include "yb/util/json_document.h"
+#include "yb/util/test_macros.h"
 #include "yb/util/tsan_util.h"
 #include "yb/util/user.h"
 #include <boost/asio/ip/tcp.hpp>
@@ -26,8 +25,17 @@ DECLARE_string(callhome_tag);
 DECLARE_string(callhome_url);
 DECLARE_bool(callhome_enabled);
 DECLARE_int32(callhome_interval_secs);
+DECLARE_int32(callhome_ysql_connect_timeout_ms);
+DECLARE_int32(callhome_ysql_statement_timeout_ms);
+DECLARE_int32(callhome_ysql_interval_secs);
 
 DECLARE_string(ysql_pg_conf_csv);
+DECLARE_string(ysql_hba_conf_csv);
+DECLARE_bool(remote_bootstrap_from_leader_only);
+DECLARE_string(ysql_cron_database_name);
+
+DEFINE_test_flag(bool, call_home_dummy1, false, "Dummy test flag to test call home");
+DEFINE_test_flag(bool, call_home_dummy2, false, "Dummy test flag to test call home");
 
 namespace yb {
 
@@ -35,6 +43,10 @@ template <class ServerType, class CallHomeType>
 void TestCallHome(
     const std::string& webserver_dir, const std::set<std::string>& additional_collections,
     ServerType* server) {
+  ANNOTATE_UNPROTECTED_WRITE(FLAGS_callhome_ysql_connect_timeout_ms) = 1000;
+  ANNOTATE_UNPROTECTED_WRITE(FLAGS_callhome_ysql_statement_timeout_ms) = 1000;
+  ANNOTATE_UNPROTECTED_WRITE(FLAGS_callhome_ysql_interval_secs) = 0;
+
   std::string json;
   CountDownLatch latch(1);
   const char* tag_value = "callhome-test";
@@ -57,53 +69,42 @@ void TestCallHome(
   };
 
   webserver.RegisterPathHandler("/callhome", "callhome", handler);
-  FLAGS_callhome_tag = tag_value;
-  FLAGS_callhome_url = Format("http://$0/callhome", addr);
+  ANNOTATE_UNPROTECTED_WRITE(FLAGS_callhome_tag) = tag_value;
+  ANNOTATE_UNPROTECTED_WRITE(FLAGS_callhome_url) = Format("http://$0/callhome", addr);
 
-  std::set<std::string> low{"cluster_uuid", "node_uuid", "server_type",
-                       "timestamp",    "tablets",   "gflags"};
+  std::set<std::string> low{"cluster_uuid", "node_uuid", "server_type", "timestamp",
+                            "tablets",      "gflags",    "version_info"};
   low.insert(additional_collections.begin(), additional_collections.end());
 
   std::unordered_map<std::string, std::set<std::string>> collection_levels;
   collection_levels["low"] = low;
   collection_levels["medium"] = low;
-  collection_levels["medium"].insert({"hostname", "current_user"});
   collection_levels["high"] = collection_levels["medium"];
   collection_levels["high"].insert({"metrics", "rpcs"});
 
   for (const auto& collection_level : collection_levels) {
     LOG(INFO) << "Collection level: " << collection_level.first;
-    FLAGS_callhome_collection_level = collection_level.first;
+    ANNOTATE_UNPROTECTED_WRITE(FLAGS_callhome_collection_level) = collection_level.first;
     CallHomeType call_home(server);
     json = call_home.BuildJson();
     ASSERT_TRUE(!json.empty());
-    JsonReader reader(json);
-    ASSERT_OK(reader.Init());
+    JsonDocument doc;
+    auto root = ASSERT_RESULT(doc.Parse(json));
     for (const auto& field : collection_level.second) {
       LOG(INFO) << "Checking json has field: " << field;
-      ASSERT_TRUE(reader.root()->HasMember(field.c_str()));
+      ASSERT_TRUE(root[field].IsValid());
     }
     LOG(INFO) << "Checking json has field: tag";
-    ASSERT_TRUE(reader.root()->HasMember("tag"));
-
-    std::string received_tag;
-    ASSERT_OK(reader.ExtractString(reader.root(), "tag", &received_tag));
+    auto received_tag = ASSERT_RESULT(root["tag"].GetString());
     ASSERT_EQ(received_tag, tag_value);
 
-    if (collection_level.second.find("hostname") != collection_level.second.end()) {
-      std::string received_hostname;
-      ASSERT_OK(reader.ExtractString(reader.root(), "hostname", &received_hostname));
-      ASSERT_EQ(received_hostname, server->get_hostname());
-    }
-
     if (collection_level.second.find("current_user") != collection_level.second.end()) {
-      std::string received_user;
-      ASSERT_OK(reader.ExtractString(reader.root(), "current_user", &received_user));
+      auto received_user = ASSERT_RESULT(root["current_user"].GetString());
       auto expected_user = ASSERT_RESULT(GetLoggedInUser());
       ASSERT_EQ(received_user, expected_user);
     }
 
-    auto count = reader.root()->MemberEnd() - reader.root()->MemberBegin();
+    auto count = ASSERT_RESULT(root.size());
     LOG(INFO) << "Number of elements for level " << collection_level.first << ": " << count;
     // The number of fields should be equal to the number of collectors plus one for the tag field.
     ASSERT_EQ(count, collection_level.second.size() + 1);
@@ -111,6 +112,8 @@ void TestCallHome(
     call_home.SendData(json);
     ASSERT_TRUE(latch.WaitFor(MonoDelta::FromSeconds(10)));
     latch.Reset(1);
+
+    call_home.Shutdown();
   }
 }
 
@@ -121,6 +124,10 @@ void TestCallHomeFlag(const std::string& webserver_dir, ServerType* server) {
   CountDownLatch latch(1);
   const char* tag_value = "callhome-test";
   bool disabled = false;
+
+  ANNOTATE_UNPROTECTED_WRITE(FLAGS_callhome_ysql_connect_timeout_ms) = 1000;
+  ANNOTATE_UNPROTECTED_WRITE(FLAGS_callhome_ysql_statement_timeout_ms) = 1000;
+  ANNOTATE_UNPROTECTED_WRITE(FLAGS_callhome_ysql_interval_secs) = 0;
 
   WebserverOptions opts;
   opts.port = 0;
@@ -147,10 +154,10 @@ void TestCallHomeFlag(const std::string& webserver_dir, ServerType* server) {
   webserver.RegisterPathHandler("/callhome", "callhome", handler);
   LOG(INFO) << "Started webserver to listen for callhome post requests.";
 
-  FLAGS_callhome_tag = tag_value;
-  FLAGS_callhome_url = Format("http://$0/callhome", addr);
+  ANNOTATE_UNPROTECTED_WRITE(FLAGS_callhome_tag) = tag_value;
+  ANNOTATE_UNPROTECTED_WRITE(FLAGS_callhome_url) = Format("http://$0/callhome", addr);
   // Set the interval to 3 secs.
-  FLAGS_callhome_interval_secs = 3 * kTimeMultiplier;
+  ANNOTATE_UNPROTECTED_WRITE(FLAGS_callhome_interval_secs) = 3 * kTimeMultiplier;
   // Start with the default value i.e. callhome enabled.
   disabled = false;
 
@@ -168,24 +175,43 @@ void TestCallHomeFlag(const std::string& webserver_dir, ServerType* server) {
   // Wait for 3 cycles for no callhome posts. The handler is expected to assert
   // if it gets any new HTTP POST now.
   SleepFor(MonoDelta::FromSeconds(3 * FLAGS_callhome_interval_secs * kTimeMultiplier));
+
+  call_home.Shutdown();
 }
 
 template <class ServerType, class CallHomeType>
 void TestGFlagsCallHome(ServerType* server) {
-  ASSERT_OK(SET_FLAG(ysql_pg_conf_csv, R"(flagA="String with quotes")"));
+  const auto kValueWithQuotes = R"("flagA=""String with quotes""")";
+  ASSERT_OK(SET_FLAG(ysql_pg_conf_csv, kValueWithQuotes));
+  const auto kHbaValue = "local all yugabyte trust";
+  ASSERT_OK(SET_FLAG(ysql_hba_conf_csv, kHbaValue));
+  ASSERT_OK(SET_FLAG(remote_bootstrap_from_leader_only, true));
+  ASSERT_OK(SET_FLAG(TEST_call_home_dummy1, true));
+  const auto kSecretDBname = "shhh_db";
+  ASSERT_OK(SET_FLAG(ysql_cron_database_name, kSecretDBname));
   std::string json;
   CallHomeType call_home(server);
   json = call_home.BuildJson();
   ASSERT_TRUE(!json.empty());
-  JsonReader reader(json);
-  ASSERT_OK(reader.Init());
+  JsonDocument doc;
+  auto root = ASSERT_RESULT(doc.Parse(json));
 
-  LOG(INFO) << "Checking json has field: tag";
-  ASSERT_TRUE(reader.root()->HasMember("gflags"));
+  LOG(INFO) << "Checking json has field: gflags";
+  auto flags = ASSERT_RESULT(root["gflags"].GetString());
+  ASSERT_STR_CONTAINS(flags, kValueWithQuotes);
+  ASSERT_STR_NOT_CONTAINS(flags, kHbaValue);
+  // Default AutoFlags should not be included.
+  ASSERT_STR_NOT_CONTAINS(flags, "enable_automatic_tablet_splitting");
+  // Non default AutoFlags should be included.
+  ASSERT_STR_CONTAINS(flags, "remote_bootstrap_from_leader_only");
+  // TEST flags should only be included if they are non default.
+  ASSERT_STR_CONTAINS(flags, "call_home_dummy1");
+  ASSERT_STR_NOT_CONTAINS(flags, "call_home_dummy2");
+  // Secret db name should be masked.
+  ASSERT_STR_NOT_CONTAINS(flags, kSecretDBname);
+  ASSERT_STR_CONTAINS(flags, "ysql_cron_database_name=***");
 
-  std::string flags;
-  ASSERT_OK(reader.ExtractString(reader.root(), "gflags", &flags));
-  ASSERT_TRUE(flags.find(R"(flagA="String with quotes")") != std::string::npos);
+  call_home.Shutdown();
 }
 
 }  // namespace yb

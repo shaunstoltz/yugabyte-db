@@ -1,4 +1,4 @@
-// Copyright (c) YugaByte, Inc.
+// Copyright (c) YugabyteDB, Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License"); you may not use this file except
 // in compliance with the License.  You may obtain a copy of the License at
@@ -13,9 +13,17 @@
 
 #pragma once
 
+#include "yb/common/entity_ids_types.h"
 #include "yb/common/retryable_request.h"
 #include "yb/consensus/consensus_fwd.h"
 
+#include "yb/fs/fs_manager.h"
+
+#include "yb/server/server_fwd.h"
+#include "yb/tablet/operations/operation.h"
+
+#include "yb/util/mem_tracker.h"
+#include "yb/util/pb_util.h"
 #include "yb/util/restart_safe_clock.h"
 #include "yb/util/status_fwd.h"
 
@@ -34,7 +42,8 @@ struct RetryableRequestsCounts {
 // Holds information about retryable requests.
 class RetryableRequests {
  public:
-  explicit RetryableRequests(std::string log_prefix = std::string());
+  explicit RetryableRequests(const MemTrackerPtr& tablet_mem_tracker = {},
+                             std::string log_prefix = std::string());
   ~RetryableRequests();
 
   RetryableRequests(const RetryableRequests& rhs);
@@ -42,10 +51,20 @@ class RetryableRequests {
   RetryableRequests(RetryableRequests&& rhs);
   void operator=(RetryableRequests&& rhs);
 
+  void CopyFrom(const RetryableRequests& rhs);
+
+  OpId GetMaxReplicatedOpId() const;
+  void SetLastFlushedOpId(const OpId& op_id);
+  OpId GetLastFlushedOpId() const;
+  void ToPB(TabletBootstrapStatePB* pb) const;
+  void FromPB(const TabletBootstrapStatePB& pb);
+  bool HasUnflushedData() const;
+
   // Tries to register a new running retryable request.
   // Returns error or false if request with such id is already present.
   Result<bool> Register(
       const ConsensusRoundPtr& round,
+      tablet::IsLeaderSide is_leader_side,
       RestartSafeCoarseTimePoint entry_time = RestartSafeCoarseTimePoint());
 
   // Cleans expires replicated requests and returns min op id of running request.
@@ -69,6 +88,11 @@ class RetryableRequests {
   void SetMetricEntity(const scoped_refptr<MetricEntity>& metric_entity);
 
   void set_log_prefix(const std::string& log_prefix);
+
+  void SetServerClock(const server::ClockPtr& clock);
+
+  void SetRequestTimeout(int timeout_secs);
+  int request_timeout_secs();
 
  private:
   class Impl;

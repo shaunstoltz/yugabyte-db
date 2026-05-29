@@ -3,7 +3,7 @@
  * pathnode.c
  *	  Routines to manipulate pathlists and create path nodes
  *
- * Portions Copyright (c) 1996-2018, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2022, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  *
@@ -16,25 +16,31 @@
 
 #include <math.h>
 
-#include "miscadmin.h"
-#include "access/yb_scan.h"
 #include "foreign/fdwapi.h"
+#include "miscadmin.h"
 #include "nodes/extensible.h"
 #include "nodes/nodeFuncs.h"
+#include "optimizer/appendinfo.h"
 #include "optimizer/clauses.h"
 #include "optimizer/cost.h"
+#include "optimizer/optimizer.h"
 #include "optimizer/pathnode.h"
 #include "optimizer/paths.h"
+#include "optimizer/placeholder.h"
 #include "optimizer/planmain.h"
 #include "optimizer/prep.h"
 #include "optimizer/restrictinfo.h"
 #include "optimizer/tlist.h"
-#include "optimizer/var.h"
 #include "parser/parsetree.h"
 #include "utils/lsyscache.h"
 #include "utils/memutils.h"
 #include "utils/selfuncs.h"
 
+/* YB includes */
+#include "access/xact.h"
+#include "access/yb_scan.h"
+#include "catalog/pg_am.h"
+#include "optimizer/planner.h"
 #include "pg_yb_utils.h"
 
 typedef enum
@@ -53,11 +59,15 @@ typedef enum
 #define STD_FUZZ_FACTOR 1.01
 
 static List *translate_sub_tlist(List *tlist, int relid);
-static int	append_total_cost_compare(const void *a, const void *b);
-static int	append_startup_cost_compare(const void *a, const void *b);
+static int	append_total_cost_compare(const ListCell *a, const ListCell *b);
+static int	append_startup_cost_compare(const ListCell *a, const ListCell *b);
 static List *reparameterize_pathlist_by_child(PlannerInfo *root,
-								 List *pathlist,
-								 RelOptInfo *child_rel);
+											  List *pathlist,
+											  RelOptInfo *child_rel);
+static bool contain_references_to(PlannerInfo *root, Node *clause,
+								  Relids relids);
+static bool ris_contain_references_to(PlannerInfo *root, List *rinfos,
+									  Relids relids);
 
 
 /*****************************************************************************
@@ -72,6 +82,35 @@ static List *reparameterize_pathlist_by_child(PlannerInfo *root,
 int
 compare_path_costs(Path *path1, Path *path2, CostSelector criterion)
 {
+	if (IsYugaByteEnabled() && path1->parent != NULL && path2->parent != NULL &&
+		path1->parent->reloptkind == path2->parent->reloptkind)
+	{
+		/*
+		 * A hinted path should always 'win' over an unhinted one, regardless of cost. Need
+		 * to check in case an estimated cost exceeds a disabled cost. Also may need this if forcing
+		 * parallelism.
+		 */
+		if (path1->ybHasHintedUid && !(path2->ybHasHintedUid))
+		{
+			return -1;
+		}
+
+		if (!(path1->ybHasHintedUid) && path2->ybHasHintedUid)
+		{
+			return 1;
+		}
+
+		if (path1->ybIsHinted && !(path2->ybIsHinted))
+		{
+			return -1;
+		}
+
+		if (!(path1->ybIsHinted) && path2->ybIsHinted)
+		{
+			return 1;
+		}
+	}
+
 	if (criterion == STARTUP_COST)
 	{
 		if (path1->startup_cost < path2->startup_cost)
@@ -107,7 +146,7 @@ compare_path_costs(Path *path1, Path *path2, CostSelector criterion)
 }
 
 /*
- * compare_path_fractional_costs
+ * compare_fractional_path_costs
  *	  Return -1, 0, or +1 according as path1 is cheaper, the same cost,
  *	  or more expensive than path2 for fetching the specified fraction
  *	  of the total tuples.
@@ -170,6 +209,35 @@ compare_path_costs_fuzzily(Path *path1, Path *path2, double fuzz_factor)
 #define CONSIDER_PATH_STARTUP_COST(p)  \
 	((p)->param_info == NULL ? (p)->parent->consider_startup : (p)->parent->consider_param_startup)
 
+	if (IsYugaByteEnabled() && path1->parent != NULL && path2->parent != NULL &&
+		path1->parent->reloptkind == path2->parent->reloptkind)
+	{
+		/*
+		 * A hinted path should always 'win' over an unhinted one, regardless of cost. Need
+		 * to check in case an estimated cost exceeds a disabled cost. Also may need this if forcing
+		 * parallelism.
+		 */
+		if (path1->ybHasHintedUid && !(path2->ybHasHintedUid))
+		{
+			return COSTS_BETTER1;
+		}
+
+		if (!(path1->ybHasHintedUid) && path2->ybHasHintedUid)
+		{
+			return COSTS_BETTER2;
+		}
+
+		if (path1->ybIsHinted && !(path2->ybIsHinted))
+		{
+			return COSTS_BETTER1;
+		}
+
+		if (!(path1->ybIsHinted) && path2->ybIsHinted)
+		{
+			return COSTS_BETTER2;
+		}
+	}
+
 	/*
 	 * Check total cost first since it's more likely to be different; many
 	 * paths have zero startup cost.
@@ -213,6 +281,19 @@ compare_path_costs_fuzzily(Path *path1, Path *path2, double fuzz_factor)
 	return COSTS_EQUAL;
 
 #undef CONSIDER_PATH_STARTUP_COST
+}
+
+static BMS_Comparison
+yb_bms_compare_ppi(Path *path1, Path *path2)
+{
+	Relids		path1_batchinfo = YB_PATH_REQ_OUTER_BATCHED(path1);
+
+	Relids		path2_batchinfo = YB_PATH_REQ_OUTER_BATCHED(path2);
+
+	if (bms_is_empty(path1_batchinfo) ^ bms_is_empty(path2_batchinfo))
+		return BMS_DIFFERENT;
+
+	return bms_subset_compare(PATH_REQ_OUTER(path1), PATH_REQ_OUTER(path2));
 }
 
 /*
@@ -285,8 +366,8 @@ set_cheapest(RelOptInfo *parent_rel)
 				best_param_path = path;
 			else
 			{
-				switch (bms_subset_compare(PATH_REQ_OUTER(path),
-										   PATH_REQ_OUTER(best_param_path)))
+				switch (yb_bms_compare_ppi(path,
+										   best_param_path))
 				{
 					case BMS_EQUAL:
 						/* keep the cheaper one */
@@ -414,6 +495,9 @@ set_cheapest(RelOptInfo *parent_rel)
  *	  Path.  Currently this occurs only for IndexPath objects, which may be
  *	  referenced as children of BitmapHeapPaths as well as being paths in
  *	  their own right.  Hence, we don't pfree IndexPaths when rejecting them.
+ *	  YB: We ensure that such behavior is avoided for distinct pushdown paths
+ *	  in create_distinct_paths by avoiding distinctifying already distinct
+ *	  paths.
  *
  * 'parent_rel' is the relation entry to which the path corresponds.
  * 'new_path' is a potential path for parent_rel.
@@ -424,11 +508,9 @@ void
 add_path(RelOptInfo *parent_rel, Path *new_path)
 {
 	bool		accept_new = true;	/* unless we find a superior old path */
-	ListCell   *insert_after = NULL;	/* where to insert new item */
+	int			insert_at = 0;	/* where to insert new item */
 	List	   *new_path_pathkeys;
 	ListCell   *p1;
-	ListCell   *p1_prev;
-	ListCell   *p1_next;
 
 	/*
 	 * This is a convenient place to check for query cancel --- no part of the
@@ -443,12 +525,8 @@ add_path(RelOptInfo *parent_rel, Path *new_path)
 	 * Loop to check proposed new path against old paths.  Note it is possible
 	 * for more than one old path to be tossed out because new_path dominates
 	 * it.
-	 *
-	 * We can't use foreach here because the loop body may delete the current
-	 * list cell.
 	 */
-	p1_prev = NULL;
-	for (p1 = list_head(parent_rel->pathlist); p1 != NULL; p1 = p1_next)
+	foreach(p1, parent_rel->pathlist)
 	{
 		Path	   *old_path = (Path *) lfirst(p1);
 		bool		remove_old = false; /* unless new proves superior */
@@ -456,13 +534,55 @@ add_path(RelOptInfo *parent_rel, Path *new_path)
 		PathKeysComparison keyscmp;
 		BMS_Comparison outercmp;
 
-		p1_next = lnext(p1);
+		if (IsYugaByteEnabled() && yb_enable_planner_trace && parent_rel->ybRoot != NULL)
+		{
+			char		msgBuf[30];
+
+			sprintf(msgBuf, "(UID %u) ", ybGetNextUid(parent_rel->ybRoot->glob));
+
+			ereport(DEBUG1,
+					(errmsg("\n%s add_path NODE %u add_path NODE %u\n", msgBuf, old_path->ybUniqueId,
+							new_path->ybUniqueId)));
+			ybTracePath(parent_rel->ybRoot, old_path, "old path");
+			ybTracePath(parent_rel->ybRoot, new_path, "new path");
+		}
 
 		/*
 		 * Do a fuzzy cost comparison with standard fuzziness limit.
 		 */
 		costcmp = compare_path_costs_fuzzily(new_path, old_path,
 											 STD_FUZZ_FACTOR);
+
+		if (IsYugaByteEnabled() && yb_enable_planner_trace && parent_rel->ybRoot != NULL)
+		{
+			char		msgBuf[30];
+
+			sprintf(msgBuf, "(UID %u) ", ybGetNextUid(parent_rel->ybRoot->glob));
+
+			char	   *cmpValue;
+
+			switch (costcmp)
+			{
+				case COSTS_EQUAL:
+					cmpValue = "costs equal";
+					break;
+				case COSTS_BETTER1:
+					cmpValue = "new path cheaper";
+					break;
+				case COSTS_BETTER2:
+					cmpValue = "old path cheaper";
+					break;
+				case COSTS_DIFFERENT:
+					cmpValue = "costs different";
+					break;
+				default:
+					cmpValue = NULL;
+					Assert(false);
+					break;
+			}
+
+			ereport(DEBUG1, (errmsg("\n%s compare_path_costs_fuzzily : %s\n", msgBuf, cmpValue)));
+		}
 
 		/*
 		 * If the two paths compare differently for startup and total cost,
@@ -483,6 +603,65 @@ add_path(RelOptInfo *parent_rel, Path *new_path)
 			old_path_pathkeys = old_path->param_info ? NIL : old_path->pathkeys;
 			keyscmp = compare_pathkeys(new_path_pathkeys,
 									   old_path_pathkeys);
+
+			/*
+			 * YB: If one is batched and the other isn't we consider
+			 * the two parameterizations to be different.
+			 */
+			bool		yb_does_new_path_req_batch = YB_PATH_NEEDS_BATCHED_RELS(new_path);
+
+			bool		yb_does_old_path_req_batch = YB_PATH_NEEDS_BATCHED_RELS(old_path);
+			bool		yb_has_diff_req_batch = (yb_does_new_path_req_batch !=
+												 yb_does_old_path_req_batch);
+
+			/*
+			 * YB: Force batch-requiring plans to not be pruned early. Without
+			 * this protection, they'd be pruned undesirably early as these
+			 * batched paths will output more rows than their unbatched
+			 * equivalents.
+			 */
+			bool		yb_keep_all_batched_plans;
+
+			yb_keep_all_batched_plans = (yb_has_diff_req_batch &&
+										 (yb_enable_base_scans_cost_model ||
+										  yb_legacy_bnl_cost));
+
+			if (yb_prefer_bnl &&
+				IsA(old_path, NestPath) && IsA(new_path, NestPath))
+			{
+				/*
+				 * YB: If yb_prefer_bnl is on and we are comparing a classic NL
+				 * with its BNL equivalent, prefer the BNL and remove the NL.
+				 * Assuming that if the costs are exactly equal, the two joins are
+				 * NL/BNL equivalents of each other.
+				 * 3fc44600e789aaad69df0d83a9d503c693d408d2 made sure that BNL/NL
+				 * equivalents have the exact same cost if
+				 * the CBO (yb_enable_base_scans_cost_model) is off.
+				 * TODO: Remove this entire branch once CBO is GA and let BNL's
+				 * naturally overcome NL's.
+				 */
+				bool		yb_old_is_bnl = yb_is_nestloop_batched((NestPath *) old_path);
+				bool		yb_new_is_bnl = yb_is_nestloop_batched((NestPath *) new_path);
+
+				Relids		yb_old_outer_rels = ((NestPath *) old_path)->jpath.outerjoinpath->parent->relids;
+				Relids		yb_new_outer_rels = ((NestPath *) new_path)->jpath.outerjoinpath->parent->relids;
+				bool		is_different_nl_batchedness = (yb_old_is_bnl !=
+														   yb_new_is_bnl);
+
+				if (yb_prefer_bnl && is_different_nl_batchedness &&
+					bms_equal(yb_old_outer_rels, yb_new_outer_rels) &&
+					compare_path_costs_fuzzily(new_path,
+											   old_path,
+											   1.0000000001) == COSTS_EQUAL)
+				{
+					if (yb_old_is_bnl)
+						accept_new = false; /* Reject new classic NL. */
+					else
+						remove_old = true;	/* Forget old classic NL. */
+					break;
+				}
+			}
+
 			if (keyscmp != PATHKEYS_DIFFERENT)
 			{
 				switch (costcmp)
@@ -490,6 +669,13 @@ add_path(RelOptInfo *parent_rel, Path *new_path)
 					case COSTS_EQUAL:
 						outercmp = bms_subset_compare(PATH_REQ_OUTER(new_path),
 													  PATH_REQ_OUTER(old_path));
+						if (yb_keep_all_batched_plans)
+						{
+							outercmp = BMS_DIFFERENT;
+							if (!yb_does_new_path_req_batch)
+								insert_at = foreach_current_index(p1) + 1;
+						}
+
 						if (keyscmp == PATHKEYS_BETTER1)
 						{
 							if ((outercmp == BMS_EQUAL ||
@@ -537,6 +723,22 @@ add_path(RelOptInfo *parent_rel, Path *new_path)
 									accept_new = false; /* old dominates new */
 								else if (compare_path_costs_fuzzily(new_path,
 																	old_path,
+																	1.0000000001) ==
+										 COSTS_EQUAL &&
+										 yb_has_diff_req_batch)
+								{
+									/*
+									 * YB: Keep both but put the batched path higher up
+									 * in the queue.
+									 */
+									accept_new = true;
+									if (yb_does_new_path_req_batch)
+										insert_at = 0;
+									else
+										insert_at = foreach_current_index(p1) + 1;
+								}
+								else if (compare_path_costs_fuzzily(new_path,
+																	old_path,
 																	1.0000000001) == COSTS_BETTER1)
 									remove_old = true;	/* new dominates old */
 								else
@@ -559,6 +761,14 @@ add_path(RelOptInfo *parent_rel, Path *new_path)
 						{
 							outercmp = bms_subset_compare(PATH_REQ_OUTER(new_path),
 														  PATH_REQ_OUTER(old_path));
+
+							if (yb_keep_all_batched_plans)
+							{
+								outercmp = BMS_DIFFERENT;
+								if (!yb_does_new_path_req_batch)
+									insert_at = foreach_current_index(p1) + 1;
+							}
+
 							if ((outercmp == BMS_EQUAL ||
 								 outercmp == BMS_SUBSET1) &&
 								new_path->rows <= old_path->rows &&
@@ -571,6 +781,14 @@ add_path(RelOptInfo *parent_rel, Path *new_path)
 						{
 							outercmp = bms_subset_compare(PATH_REQ_OUTER(new_path),
 														  PATH_REQ_OUTER(old_path));
+
+							if (yb_keep_all_batched_plans)
+							{
+								outercmp = BMS_DIFFERENT;
+								if (!yb_does_new_path_req_batch)
+									insert_at = foreach_current_index(p1) + 1;
+							}
+
 							if ((outercmp == BMS_EQUAL ||
 								 outercmp == BMS_SUBSET2) &&
 								new_path->rows >= old_path->rows &&
@@ -594,23 +812,42 @@ add_path(RelOptInfo *parent_rel, Path *new_path)
 		 */
 		if (remove_old)
 		{
-			parent_rel->pathlist = list_delete_cell(parent_rel->pathlist,
-													p1, p1_prev);
+			parent_rel->pathlist = foreach_delete_current(parent_rel->pathlist,
+														  p1);
 
 			/*
 			 * Delete the data pointed-to by the deleted cell, if possible
+			 * YB: UpperUniquePath is also generated by build_index_paths
+			 * and must be preserved.
 			 */
-			if (!IsA(old_path, IndexPath))
+			if (!IsA(old_path, IndexPath) && !IsA(old_path, UpperUniquePath))
 				pfree(old_path);
-			/* p1_prev does not advance */
 		}
 		else
 		{
-			/* new belongs after this old path if it has cost >= old's */
-			if (new_path->total_cost >= old_path->total_cost)
-				insert_after = p1;
-			/* p1_prev advances */
-			p1_prev = p1;
+			bool		ybNewPathCostsMore = false;
+
+			if (!(new_path->ybHasHintedUid) && old_path->ybHasHintedUid)
+			{
+				ybNewPathCostsMore = true;
+			}
+			else if (!(new_path->ybIsHinted) && old_path->ybIsHinted)
+			{
+				ybNewPathCostsMore = true;
+			}
+			else if (new_path->total_cost >= old_path->total_cost)
+			{
+				ybNewPathCostsMore = true;
+			}
+
+			if (ybNewPathCostsMore)
+			{
+				/*
+				 * If new path cost exceeds old path cost, and they are both hinted or both unhinted joins,
+				 * insert at appropriate position in list.
+				 */
+				insert_at = foreach_current_index(p1) + 1;
+			}
 		}
 
 		/*
@@ -625,15 +862,17 @@ add_path(RelOptInfo *parent_rel, Path *new_path)
 	if (accept_new)
 	{
 		/* Accept the new path: insert it at proper place in pathlist */
-		if (insert_after)
-			lappend_cell(parent_rel->pathlist, insert_after, new_path);
-		else
-			parent_rel->pathlist = lcons(new_path, parent_rel->pathlist);
+		parent_rel->pathlist =
+			list_insert_nth(parent_rel->pathlist, insert_at, new_path);
 	}
 	else
 	{
-		/* Reject and recycle the new path */
-		if (!IsA(new_path, IndexPath))
+		/*
+		 * Reject and recycle the new path
+		 * YB: UpperUniquePath is also generated by build_index_paths and must
+		 * be preserved.
+		 */
+		if (!IsA(new_path, IndexPath) && !IsA(new_path, UpperUniquePath))
 			pfree(new_path);
 	}
 }
@@ -764,10 +1003,8 @@ void
 add_partial_path(RelOptInfo *parent_rel, Path *new_path)
 {
 	bool		accept_new = true;	/* unless we find a superior old path */
-	ListCell   *insert_after = NULL;	/* where to insert new item */
+	int			insert_at = 0;	/* where to insert new item */
 	ListCell   *p1;
-	ListCell   *p1_prev;
-	ListCell   *p1_next;
 
 	/* Check for query cancel. */
 	CHECK_FOR_INTERRUPTS();
@@ -782,20 +1019,29 @@ add_partial_path(RelOptInfo *parent_rel, Path *new_path)
 	 * As in add_path, throw out any paths which are dominated by the new
 	 * path, but throw out the new path if some existing path dominates it.
 	 */
-	p1_prev = NULL;
-	for (p1 = list_head(parent_rel->partial_pathlist); p1 != NULL;
-		 p1 = p1_next)
+	foreach(p1, parent_rel->partial_pathlist)
 	{
 		Path	   *old_path = (Path *) lfirst(p1);
 		bool		remove_old = false; /* unless new proves superior */
 		PathKeysComparison keyscmp;
 
-		p1_next = lnext(p1);
-
 		/* Compare pathkeys. */
 		keyscmp = compare_pathkeys(new_path->pathkeys, old_path->pathkeys);
 
-		/* Unless pathkeys are incompable, keep just one of the two paths. */
+		if (IsYugaByteEnabled() && yb_enable_planner_trace && parent_rel->ybRoot != NULL)
+		{
+			char		msgBuf[30];
+
+			sprintf(msgBuf, "(UID %u) ", ybGetNextUid(parent_rel->ybRoot->glob));
+
+			ereport(DEBUG1,
+					(errmsg("\n%s add_partial_path NODE %u add_partial_path NODE %u\n", msgBuf, old_path->ybUniqueId,
+							new_path->ybUniqueId)));
+			ybTracePath(parent_rel->ybRoot, old_path, "old path");
+			ybTracePath(parent_rel->ybRoot, new_path, "new path");
+		}
+
+		/* Unless pathkeys are incompatible, keep just one of the two paths. */
 		if (keyscmp != PATHKEYS_DIFFERENT)
 		{
 			if (new_path->total_cost > old_path->total_cost * STD_FUZZ_FACTOR)
@@ -842,17 +1088,14 @@ add_partial_path(RelOptInfo *parent_rel, Path *new_path)
 		if (remove_old)
 		{
 			parent_rel->partial_pathlist =
-				list_delete_cell(parent_rel->partial_pathlist, p1, p1_prev);
+				foreach_delete_current(parent_rel->partial_pathlist, p1);
 			pfree(old_path);
-			/* p1_prev does not advance */
 		}
 		else
 		{
 			/* new belongs after this old path if it has cost >= old's */
 			if (new_path->total_cost >= old_path->total_cost)
-				insert_after = p1;
-			/* p1_prev advances */
-			p1_prev = p1;
+				insert_at = foreach_current_index(p1) + 1;
 		}
 
 		/*
@@ -867,11 +1110,8 @@ add_partial_path(RelOptInfo *parent_rel, Path *new_path)
 	if (accept_new)
 	{
 		/* Accept the new path: insert it at proper place */
-		if (insert_after)
-			lappend_cell(parent_rel->partial_pathlist, insert_after, new_path);
-		else
-			parent_rel->partial_pathlist =
-				lcons(new_path, parent_rel->partial_pathlist);
+		parent_rel->partial_pathlist =
+			list_insert_nth(parent_rel->partial_pathlist, insert_at, new_path);
 	}
 	else
 	{
@@ -942,6 +1182,78 @@ add_partial_path_precheck(RelOptInfo *parent_rel, Cost total_cost,
 	return true;
 }
 
+/*
+ * Propagate YugabyteDB fields between a parent and a single child.
+ *
+ * Path data generally flows upward, from children to parents. Therefore this
+ * function is expected to simply copy information from children to parents for
+ * future fields.
+ */
+static void
+yb_propagate_fields(YbPathInfo *parent_fields, YbPathInfo *child_fields)
+{
+	if (!IsYugaByteEnabled())
+		return;
+
+	parent_fields->yb_uniqkeys = list_copy(child_fields->yb_uniqkeys);
+}
+
+/*
+ * Propagate YugabyteDB fields between a parent and two children.
+ * See comment for yb_propagate_fields.
+ */
+static void
+yb_propagate_fields2(YbPathInfo *parent_fields, YbPathInfo *child1_fields,
+					 YbPathInfo *child2_fields)
+{
+	if (!IsYugaByteEnabled())
+		return;
+
+	/*
+	 * Compute uniqkeys for the parent only when uniqkeys are available on both
+	 * the children. We do this because uniqkeys = NIL does not mean that the
+	 * path has no uniqkeys. For example, consider a plain sequential scan such
+	 * as that from 'SELECT * FROM t'. The path has no uniqkeys, but it is
+	 * still distinct on its primary key. In other words, uniqkeys = NIL is a
+	 * proxy for uniqkeys being indeterminate and we should avoid setting
+	 * uniqkeys in such a case.
+	 */
+	if (child1_fields->yb_uniqkeys && child2_fields->yb_uniqkeys)
+		parent_fields->yb_uniqkeys =
+			list_concat(list_copy(child1_fields->yb_uniqkeys),
+						list_copy(child2_fields->yb_uniqkeys));
+}
+
+/*
+ * Propagate YugabyteDB fields between a parent and a list of children.
+ * See comment for yb_propagate_fields.
+ */
+static void
+yb_propagate_fields_list(YbPathInfo *parent_fields, List *child_paths)
+{
+	if (!IsYugaByteEnabled())
+		return;
+
+	/*
+	 * TODO: Leaving this for a future change since computing uniqkeys optimally
+	 * is involved. For example, we can set the parent's uniqkeys to those of
+	 * the children. However, we need to ensure that there are no duplicate
+	 * values across the child pathnodes before we can do that.
+	 */
+	parent_fields->yb_uniqkeys = NIL;
+}
+
+/*
+ * Propagate YugabyteDB fields between a parent and a list of MinMaxAggregate
+ * children.
+ * See comment for yb_propagate_fields.
+ */
+static void
+yb_propagate_mmagg_fields(YbPathInfo *parent_fields, List *mmaggregates)
+{
+	if (!IsYugaByteEnabled())
+		return;
+}
 
 /*****************************************************************************
  *		PATH NODE CREATION ROUTINES
@@ -960,10 +1272,11 @@ create_seqscan_path(PlannerInfo *root, RelOptInfo *rel,
 
 	pathnode->pathtype = T_SeqScan;
 	pathnode->parent = rel;
+	yb_assign_unique_path_node_id(root, pathnode);
 	pathnode->pathtarget = rel->reltarget;
 	pathnode->param_info = get_baserel_parampathinfo(root, rel,
 													 required_outer);
-	pathnode->parallel_aware = parallel_workers > 0 ? true : false;
+	pathnode->parallel_aware = (parallel_workers > 0);
 	pathnode->parallel_safe = rel->consider_parallel;
 	pathnode->parallel_workers = parallel_workers;
 	pathnode->pathkeys = NIL;	/* seqscan has unordered result */
@@ -974,14 +1287,21 @@ create_seqscan_path(PlannerInfo *root, RelOptInfo *rel,
 	 */
 	if (rel->is_yb_relation)
 	{
-		ybcCostEstimate(rel, YBC_FULL_SCAN_SELECTIVITY,
-						false, /* is_backward_scan */
-						true, /* is_seq_scan */
-						false, /* is_uncovered_idx_scan */
-						&pathnode->startup_cost,
-						&pathnode->total_cost,
-						rel->reltablespace);
-		pathnode->rows = rel->rows;
+		if (yb_enable_base_scans_cost_model)
+		{
+			yb_cost_seqscan(pathnode, root, rel, pathnode->param_info);
+		}
+		else
+		{
+			ybcCostEstimate(rel, YBC_FULL_SCAN_SELECTIVITY,
+							false,	/* is_backward_scan */
+							true,	/* is_seq_scan */
+							false,	/* is_uncovered_idx_scan */
+							&pathnode->startup_cost,
+							&pathnode->total_cost,
+							rel->reltablespace);
+			pathnode->rows = rel->rows;
+		}
 	}
 	else
 		cost_seqscan(pathnode, root, rel, pathnode->param_info);
@@ -1000,6 +1320,7 @@ create_samplescan_path(PlannerInfo *root, RelOptInfo *rel, Relids required_outer
 
 	pathnode->pathtype = T_SampleScan;
 	pathnode->parent = rel;
+	yb_assign_unique_path_node_id(root, pathnode);
 	pathnode->pathtarget = rel->reltarget;
 	pathnode->param_info = get_baserel_parampathinfo(root, rel,
 													 required_outer);
@@ -1018,10 +1339,11 @@ create_samplescan_path(PlannerInfo *root, RelOptInfo *rel, Relids required_outer
  *	  Creates a path node for an index scan.
  *
  * 'index' is a usable index.
- * 'indexclauses' is a list of RestrictInfo nodes representing clauses
- *			to be used as index qual conditions in the scan.
- * 'indexclausecols' is an integer list of index column numbers (zero based)
- *			the indexclauses can be used with.
+ * 'indexclauses' is a list of IndexClause nodes representing clauses
+ *			to be enforced as qual conditions in the scan.
+ * 'yb_bitmap_idx_pushdowns' is a set of pushable clauses for a bitmap index scan.
+ *    These are extracted during bitmap planning and allow pushdowns that are
+ *    not possible to determine at a later stage.
  * 'indexorderbys' is a list of bare expressions (no RestrictInfos)
  *			to be used as index ordering operators in the scan.
  * 'indexorderbycols' is an integer list of index column numbers (zero based)
@@ -1042,7 +1364,7 @@ IndexPath *
 create_index_path(PlannerInfo *root,
 				  IndexOptInfo *index,
 				  List *indexclauses,
-				  List *indexclausecols,
+				  List *yb_bitmap_idx_pushdowns,
 				  List *indexorderbys,
 				  List *indexorderbycols,
 				  List *pathkeys,
@@ -1050,15 +1372,15 @@ create_index_path(PlannerInfo *root,
 				  bool indexonly,
 				  Relids required_outer,
 				  double loop_count,
-				  bool partial_path)
+				  bool partial_path,
+				  List *yb_merge_scan_saop_cols)
 {
 	IndexPath  *pathnode = makeNode(IndexPath);
 	RelOptInfo *rel = index->rel;
-	List	   *indexquals,
-			   *indexqualcols;
 
 	pathnode->path.pathtype = indexonly ? T_IndexOnlyScan : T_IndexScan;
 	pathnode->path.parent = rel;
+	yb_assign_unique_path_node_id(root, (Path *) pathnode);
 	pathnode->path.pathtarget = rel->reltarget;
 	pathnode->path.param_info = get_baserel_parampathinfo(root, rel,
 														  required_outer);
@@ -1067,20 +1389,28 @@ create_index_path(PlannerInfo *root,
 	pathnode->path.parallel_workers = 0;
 	pathnode->path.pathkeys = pathkeys;
 
-	/* Convert clauses to indexquals the executor can handle */
-	expand_indexqual_conditions(index, indexclauses, indexclausecols,
-								&indexquals, &indexqualcols);
-
-	/* Fill in the pathnode */
 	pathnode->indexinfo = index;
 	pathnode->indexclauses = indexclauses;
-	pathnode->indexquals = indexquals;
-	pathnode->indexqualcols = indexqualcols;
+	pathnode->yb_bitmap_idx_pushdowns = yb_bitmap_idx_pushdowns;
 	pathnode->indexorderbys = indexorderbys;
 	pathnode->indexorderbycols = indexorderbycols;
-	pathnode->indexscandir = indexscandir;
+	pathnode->indexscandir = rel->is_yb_relation && pathkeys == NIL ?
+		NoMovementScanDirection : indexscandir;
 
-	cost_index(pathnode, root, loop_count, partial_path);
+	pathnode->yb_index_path_info.merge_scan_saop_cols =
+		yb_merge_scan_saop_cols;
+
+	if (IsYugaByteEnabled() &&
+		yb_enable_base_scans_cost_model &&
+		index->relam == LSM_AM_OID)
+	{
+		yb_cost_index(pathnode, root, loop_count, partial_path);
+	}
+	else
+	{
+		cost_index(pathnode, root, loop_count, partial_path);
+	}
+
 
 	return pathnode;
 }
@@ -1109,6 +1439,52 @@ create_bitmap_heap_path(PlannerInfo *root,
 
 	pathnode->path.pathtype = T_BitmapHeapScan;
 	pathnode->path.parent = rel;
+	yb_assign_unique_path_node_id(root, (Path *) pathnode);
+	pathnode->path.pathtarget = rel->reltarget;
+	pathnode->path.param_info = get_baserel_parampathinfo(root, rel,
+														  required_outer);
+	pathnode->path.parallel_aware = (parallel_degree > 0);
+	pathnode->path.parallel_safe = rel->consider_parallel;
+	pathnode->path.parallel_workers = parallel_degree;
+	pathnode->path.pathkeys = NIL;	/* always unordered */
+
+	yb_propagate_fields(&pathnode->path.yb_path_info,
+						&bitmapqual->yb_path_info);
+
+	pathnode->bitmapqual = bitmapqual;
+
+	cost_bitmap_heap_scan(&pathnode->path, root, rel,
+						  pathnode->path.param_info,
+						  bitmapqual, loop_count);
+
+	return pathnode;
+}
+
+/*
+ * create_yb_bitmap_table_path
+ *	  Creates a path node for a YB bitmap scan.
+ *
+ * 'bitmapqual' is a tree of IndexPath, BitmapAndPath, and BitmapOrPath nodes.
+ * 'required_outer' is the set of outer relids for a parameterized path.
+ * 'loop_count' is the number of repetitions of the indexscan to factor into
+ *		estimates of caching behavior.
+ *
+ * loop_count should match the value used when creating the component
+ * IndexPaths.
+ */
+YbBitmapTablePath *
+create_yb_bitmap_table_path(PlannerInfo *root,
+							RelOptInfo *rel,
+							Path *bitmapqual,
+							Relids required_outer,
+							double loop_count,
+							int parallel_degree)
+{
+	YbBitmapTablePath *pathnode = makeNode(YbBitmapTablePath);
+
+	pathnode->path.pathtype = T_YbBitmapTableScan;
+	pathnode->path.parent = rel;
+	yb_assign_unique_path_node_id(root, (Path *) pathnode);
 	pathnode->path.pathtarget = rel->reltarget;
 	pathnode->path.param_info = get_baserel_parampathinfo(root, rel,
 														  required_outer);
@@ -1117,11 +1493,19 @@ create_bitmap_heap_path(PlannerInfo *root,
 	pathnode->path.parallel_workers = parallel_degree;
 	pathnode->path.pathkeys = NIL;	/* always unordered */
 
+	yb_propagate_fields(&pathnode->path.yb_path_info,
+						&bitmapqual->yb_path_info);
+
 	pathnode->bitmapqual = bitmapqual;
 
-	cost_bitmap_heap_scan(&pathnode->path, root, rel,
-						  pathnode->path.param_info,
-						  bitmapqual, loop_count);
+	if (yb_enable_base_scans_cost_model)
+		yb_cost_bitmap_table_scan(&pathnode->path, root, rel,
+								  pathnode->path.param_info,
+								  bitmapqual, loop_count);
+	else
+		cost_bitmap_heap_scan(&pathnode->path, root, rel,
+							  pathnode->path.param_info,
+							  bitmapqual, loop_count);
 
 	return pathnode;
 }
@@ -1141,6 +1525,7 @@ create_bitmap_and_path(PlannerInfo *root,
 
 	pathnode->path.pathtype = T_BitmapAnd;
 	pathnode->path.parent = rel;
+	yb_assign_unique_path_node_id(root, (Path *) pathnode);
 	pathnode->path.pathtarget = rel->reltarget;
 
 	/*
@@ -1170,10 +1555,16 @@ create_bitmap_and_path(PlannerInfo *root,
 
 	pathnode->path.pathkeys = NIL;	/* always unordered */
 
+	yb_propagate_fields_list(&pathnode->path.yb_path_info, bitmapquals);
+
 	pathnode->bitmapquals = bitmapquals;
 
 	/* this sets bitmapselectivity as well as the regular cost fields: */
-	cost_bitmap_and_node(pathnode, root);
+	if (IsYugaByteEnabled() && yb_enable_base_scans_cost_model &&
+		pathnode->path.parent->is_yb_relation)
+		yb_cost_bitmap_and_node(pathnode, root);
+	else
+		cost_bitmap_and_node(pathnode, root);
 
 	return pathnode;
 }
@@ -1193,6 +1584,7 @@ create_bitmap_or_path(PlannerInfo *root,
 
 	pathnode->path.pathtype = T_BitmapOr;
 	pathnode->path.parent = rel;
+	yb_assign_unique_path_node_id(root, (Path *) pathnode);
 	pathnode->path.pathtarget = rel->reltarget;
 
 	/*
@@ -1222,10 +1614,16 @@ create_bitmap_or_path(PlannerInfo *root,
 
 	pathnode->path.pathkeys = NIL;	/* always unordered */
 
+	yb_propagate_fields_list(&pathnode->path.yb_path_info, bitmapquals);
+
 	pathnode->bitmapquals = bitmapquals;
 
 	/* this sets bitmapselectivity as well as the regular cost fields: */
-	cost_bitmap_or_node(pathnode, root);
+	if (IsYugaByteEnabled() && yb_enable_base_scans_cost_model &&
+		pathnode->path.parent->is_yb_relation)
+		yb_cost_bitmap_or_node(pathnode, root);
+	else
+		cost_bitmap_or_node(pathnode, root);
 
 	return pathnode;
 }
@@ -1242,6 +1640,7 @@ create_tidscan_path(PlannerInfo *root, RelOptInfo *rel, List *tidquals,
 
 	pathnode->path.pathtype = T_TidScan;
 	pathnode->path.parent = rel;
+	yb_assign_unique_path_node_id(root, (Path *) pathnode);
 	pathnode->path.pathtarget = rel->reltarget;
 	pathnode->path.param_info = get_baserel_parampathinfo(root, rel,
 														  required_outer);
@@ -1259,19 +1658,50 @@ create_tidscan_path(PlannerInfo *root, RelOptInfo *rel, List *tidquals,
 }
 
 /*
+ * create_tidrangescan_path
+ *	  Creates a path corresponding to a scan by a range of TIDs, returning
+ *	  the pathnode.
+ */
+TidRangePath *
+create_tidrangescan_path(PlannerInfo *root, RelOptInfo *rel,
+						 List *tidrangequals, Relids required_outer)
+{
+	TidRangePath *pathnode = makeNode(TidRangePath);
+
+	pathnode->path.pathtype = T_TidRangeScan;
+	pathnode->path.parent = rel;
+	yb_assign_unique_path_node_id(root, (Path *) pathnode);
+	pathnode->path.pathtarget = rel->reltarget;
+	pathnode->path.param_info = get_baserel_parampathinfo(root, rel,
+														  required_outer);
+	pathnode->path.parallel_aware = false;
+	pathnode->path.parallel_safe = rel->consider_parallel;
+	pathnode->path.parallel_workers = 0;
+	pathnode->path.pathkeys = NIL;	/* always unordered */
+
+	pathnode->tidrangequals = tidrangequals;
+
+	cost_tidrangescan(&pathnode->path, root, rel, tidrangequals,
+					  pathnode->path.param_info);
+
+	return pathnode;
+}
+
+/*
  * create_append_path
  *	  Creates a path corresponding to an Append plan, returning the
  *	  pathnode.
  *
  * Note that we must handle subpaths = NIL, representing a dummy access path.
+ * Also, there are callers that pass root = NULL.
  */
 AppendPath *
 create_append_path(PlannerInfo *root,
 				   RelOptInfo *rel,
 				   List *subpaths, List *partial_subpaths,
-				   Relids required_outer,
+				   List *pathkeys, Relids required_outer,
 				   int parallel_workers, bool parallel_aware,
-				   List *partitioned_rels, double rows)
+				   double rows)
 {
 	AppendPath *pathnode = makeNode(AppendPath);
 	ListCell   *l;
@@ -1280,22 +1710,35 @@ create_append_path(PlannerInfo *root,
 
 	pathnode->path.pathtype = T_Append;
 	pathnode->path.parent = rel;
+	yb_assign_unique_path_node_id(root, (Path *) pathnode);
 	pathnode->path.pathtarget = rel->reltarget;
 
 	/*
 	 * When generating an Append path for a partitioned table, there may be
-	 * parameters that are useful so we can eliminate certain partitions
-	 * during execution.  Here we'll go all the way and fully populate the
-	 * parameter info data as we do for normal base relations.  However, we
-	 * need only bother doing this for RELOPT_BASEREL rels, as
-	 * RELOPT_OTHER_MEMBER_REL's Append paths are merged into the base rel's
-	 * Append subpaths.  It would do no harm to do this, we just avoid it to
-	 * save wasting effort.
+	 * parameterized quals that are useful for run-time pruning.  Hence,
+	 * compute path.param_info the same way as for any other baserel, so that
+	 * such quals will be available for make_partition_pruneinfo().  (This
+	 * would not work right for a non-baserel, ie a scan on a non-leaf child
+	 * partition, and it's not necessary anyway in that case.  Must skip it if
+	 * we don't have "root", too.)
 	 */
-	if (partitioned_rels != NIL && root && rel->reloptkind == RELOPT_BASEREL)
+	if (root && rel->reloptkind == RELOPT_BASEREL && IS_PARTITIONED_REL(rel))
+	{
+		/* YB */
+		if (subpaths)
+		{
+			/* YB: Accumulate batching info from subpaths for this "baserel". */
+			Assert(yb_has_same_batching_reqs(subpaths));
+
+			root->yb_cur_batched_relids =
+				YB_PATH_REQ_OUTER_BATCHED((Path *) linitial(subpaths));
+		}
+
 		pathnode->path.param_info = get_baserel_parampathinfo(root,
 															  rel,
 															  required_outer);
+		root->yb_cur_batched_relids = NULL;
+	}
 	else
 		pathnode->path.param_info = get_appendrel_parampathinfo(rel,
 																required_outer);
@@ -1303,8 +1746,7 @@ create_append_path(PlannerInfo *root,
 	pathnode->path.parallel_aware = parallel_aware;
 	pathnode->path.parallel_safe = rel->consider_parallel;
 	pathnode->path.parallel_workers = parallel_workers;
-	pathnode->path.pathkeys = NIL;	/* result is always considered unsorted */
-	pathnode->partitioned_rels = list_copy(partitioned_rels);
+	pathnode->path.pathkeys = pathkeys;
 
 	/*
 	 * For parallel append, non-partial paths are sorted by descending total
@@ -1317,12 +1759,27 @@ create_append_path(PlannerInfo *root,
 	 */
 	if (pathnode->path.parallel_aware)
 	{
-		subpaths = list_qsort(subpaths, append_total_cost_compare);
-		partial_subpaths = list_qsort(partial_subpaths,
-									  append_startup_cost_compare);
+		/*
+		 * We mustn't fiddle with the order of subpaths when the Append has
+		 * pathkeys.  The order they're listed in is critical to keeping the
+		 * pathkeys valid.
+		 */
+		Assert(pathkeys == NIL);
+
+		list_sort(subpaths, append_total_cost_compare);
+		list_sort(partial_subpaths, append_startup_cost_compare);
 	}
 	pathnode->first_partial_path = list_length(subpaths);
 	pathnode->subpaths = list_concat(subpaths, partial_subpaths);
+
+	/*
+	 * Apply query-wide LIMIT if known and path is for sole base relation.
+	 * (Handling this at this low level is a bit klugy.)
+	 */
+	if (root != NULL && bms_equal(rel->relids, root->all_baserels))
+		pathnode->limit_tuples = root->limit_tuples;
+	else
+		pathnode->limit_tuples = -1.0;
 
 	foreach(l, pathnode->subpaths)
 	{
@@ -1335,9 +1792,29 @@ create_append_path(PlannerInfo *root,
 		Assert(bms_equal(PATH_REQ_OUTER(subpath), required_outer));
 	}
 
+	yb_propagate_fields_list(&pathnode->path.yb_path_info,
+							 pathnode->subpaths);
+
 	Assert(!parallel_aware || pathnode->path.parallel_safe);
 
-	cost_append(pathnode);
+	/*
+	 * If there's exactly one child path, the Append is a no-op and will be
+	 * discarded later (in setrefs.c); therefore, we can inherit the child's
+	 * size and cost, as well as its pathkeys if any (overriding whatever the
+	 * caller might've said).  Otherwise, we must do the normal costsize
+	 * calculation.
+	 */
+	if (list_length(pathnode->subpaths) == 1)
+	{
+		Path	   *child = (Path *) linitial(pathnode->subpaths);
+
+		pathnode->path.rows = child->rows;
+		pathnode->path.startup_cost = child->startup_cost;
+		pathnode->path.total_cost = child->total_cost;
+		pathnode->path.pathkeys = child->pathkeys;
+	}
+	else
+		cost_append(pathnode);
 
 	/* If the caller provided a row estimate, override the computed value. */
 	if (rows >= 0)
@@ -1348,17 +1825,18 @@ create_append_path(PlannerInfo *root,
 
 /*
  * append_total_cost_compare
- *	  qsort comparator for sorting append child paths by total_cost descending
+ *	  list_sort comparator for sorting append child paths
+ *	  by total_cost descending
  *
  * For equal total costs, we fall back to comparing startup costs; if those
  * are equal too, break ties using bms_compare on the paths' relids.
- * (This is to avoid getting unpredictable results from qsort.)
+ * (This is to avoid getting unpredictable results from list_sort.)
  */
 static int
-append_total_cost_compare(const void *a, const void *b)
+append_total_cost_compare(const ListCell *a, const ListCell *b)
 {
-	Path	   *path1 = (Path *) lfirst(*(ListCell **) a);
-	Path	   *path2 = (Path *) lfirst(*(ListCell **) b);
+	Path	   *path1 = (Path *) lfirst(a);
+	Path	   *path2 = (Path *) lfirst(b);
 	int			cmp;
 
 	cmp = compare_path_costs(path1, path2, TOTAL_COST);
@@ -1369,17 +1847,18 @@ append_total_cost_compare(const void *a, const void *b)
 
 /*
  * append_startup_cost_compare
- *	  qsort comparator for sorting append child paths by startup_cost descending
+ *	  list_sort comparator for sorting append child paths
+ *	  by startup_cost descending
  *
  * For equal startup costs, we fall back to comparing total costs; if those
  * are equal too, break ties using bms_compare on the paths' relids.
- * (This is to avoid getting unpredictable results from qsort.)
+ * (This is to avoid getting unpredictable results from list_sort.)
  */
 static int
-append_startup_cost_compare(const void *a, const void *b)
+append_startup_cost_compare(const ListCell *a, const ListCell *b)
 {
-	Path	   *path1 = (Path *) lfirst(*(ListCell **) a);
-	Path	   *path2 = (Path *) lfirst(*(ListCell **) b);
+	Path	   *path1 = (Path *) lfirst(a);
+	Path	   *path2 = (Path *) lfirst(b);
 	int			cmp;
 
 	cmp = compare_path_costs(path1, path2, STARTUP_COST);
@@ -1398,8 +1877,7 @@ create_merge_append_path(PlannerInfo *root,
 						 RelOptInfo *rel,
 						 List *subpaths,
 						 List *pathkeys,
-						 Relids required_outer,
-						 List *partitioned_rels)
+						 Relids required_outer)
 {
 	MergeAppendPath *pathnode = makeNode(MergeAppendPath);
 	Cost		input_startup_cost;
@@ -1408,6 +1886,7 @@ create_merge_append_path(PlannerInfo *root,
 
 	pathnode->path.pathtype = T_MergeAppend;
 	pathnode->path.parent = rel;
+	yb_assign_unique_path_node_id(root, (Path *) pathnode);
 	pathnode->path.pathtarget = rel->reltarget;
 	pathnode->path.param_info = get_appendrel_parampathinfo(rel,
 															required_outer);
@@ -1415,7 +1894,7 @@ create_merge_append_path(PlannerInfo *root,
 	pathnode->path.parallel_safe = rel->consider_parallel;
 	pathnode->path.parallel_workers = 0;
 	pathnode->path.pathkeys = pathkeys;
-	pathnode->partitioned_rels = list_copy(partitioned_rels);
+	yb_propagate_fields_list(&pathnode->path.yb_path_info, subpaths);
 	pathnode->subpaths = subpaths;
 
 	/*
@@ -1469,39 +1948,54 @@ create_merge_append_path(PlannerInfo *root,
 		Assert(bms_equal(PATH_REQ_OUTER(subpath), required_outer));
 	}
 
-	/* Now we can compute total costs of the MergeAppend */
-	cost_merge_append(&pathnode->path, root,
-					  pathkeys, list_length(subpaths),
-					  input_startup_cost, input_total_cost,
-					  pathnode->path.rows);
+	/*
+	 * Now we can compute total costs of the MergeAppend.  If there's exactly
+	 * one child path, the MergeAppend is a no-op and will be discarded later
+	 * (in setrefs.c); otherwise we do the normal cost calculation.
+	 */
+	if (list_length(subpaths) == 1)
+	{
+		pathnode->path.startup_cost = input_startup_cost;
+		pathnode->path.total_cost = input_total_cost;
+	}
+	else
+		cost_merge_append(&pathnode->path, root,
+						  pathkeys, list_length(subpaths),
+						  input_startup_cost, input_total_cost,
+						  pathnode->path.rows);
 
 	return pathnode;
 }
 
 /*
- * create_result_path
+ * create_group_result_path
  *	  Creates a path representing a Result-and-nothing-else plan.
  *
- * This is only used for degenerate cases, such as a query with an empty
- * jointree.
+ * This is only used for degenerate grouping cases, in which we know we
+ * need to produce one result row, possibly filtered by a HAVING qual.
  */
-ResultPath *
-create_result_path(PlannerInfo *root, RelOptInfo *rel,
-				   PathTarget *target, List *resconstantqual)
+GroupResultPath *
+create_group_result_path(PlannerInfo *root, RelOptInfo *rel,
+						 PathTarget *target, List *havingqual)
 {
-	ResultPath *pathnode = makeNode(ResultPath);
+	GroupResultPath *pathnode = makeNode(GroupResultPath);
 
 	pathnode->path.pathtype = T_Result;
 	pathnode->path.parent = rel;
+	yb_assign_unique_path_node_id(root, (Path *) pathnode);
 	pathnode->path.pathtarget = target;
 	pathnode->path.param_info = NULL;	/* there are no other rels... */
 	pathnode->path.parallel_aware = false;
 	pathnode->path.parallel_safe = rel->consider_parallel;
 	pathnode->path.parallel_workers = 0;
 	pathnode->path.pathkeys = NIL;
-	pathnode->quals = resconstantqual;
+	pathnode->quals = havingqual;
 
-	/* Hardly worth defining a cost_result() function ... just do it */
+	/*
+	 * We can't quite use cost_resultscan() because the quals we want to
+	 * account for are not baserestrict quals of the rel.  Might as well just
+	 * hack it here.
+	 */
 	pathnode->path.rows = 1;
 	pathnode->path.startup_cost = target->cost.startup;
 	pathnode->path.total_cost = target->cost.startup +
@@ -1511,12 +2005,12 @@ create_result_path(PlannerInfo *root, RelOptInfo *rel,
 	 * Add cost of qual, if any --- but we ignore its selectivity, since our
 	 * rowcount estimate should be 1 no matter what the qual is.
 	 */
-	if (resconstantqual)
+	if (havingqual)
 	{
 		QualCost	qual_cost;
 
-		cost_qual_eval(&qual_cost, resconstantqual, root);
-		/* resconstantqual is evaluated once at startup */
+		cost_qual_eval(&qual_cost, havingqual, root);
+		/* havingqual is evaluated once at startup */
 		pathnode->path.startup_cost += qual_cost.startup + qual_cost.per_tuple;
 		pathnode->path.total_cost += qual_cost.startup + qual_cost.per_tuple;
 	}
@@ -1546,6 +2040,9 @@ create_material_path(RelOptInfo *rel, Path *subpath)
 	pathnode->path.parallel_workers = subpath->parallel_workers;
 	pathnode->path.pathkeys = subpath->pathkeys;
 
+	yb_propagate_fields(&pathnode->path.yb_path_info,
+						&subpath->yb_path_info);
+
 	pathnode->subpath = subpath;
 
 	cost_material(&pathnode->path,
@@ -1553,6 +2050,56 @@ create_material_path(RelOptInfo *rel, Path *subpath)
 				  subpath->total_cost,
 				  subpath->rows,
 				  subpath->pathtarget->width);
+
+	return pathnode;
+}
+
+/*
+ * create_memoize_path
+ *	  Creates a path corresponding to a Memoize plan, returning the pathnode.
+ */
+MemoizePath *
+create_memoize_path(PlannerInfo *root, RelOptInfo *rel, Path *subpath,
+					List *param_exprs, List *hash_operators,
+					bool singlerow, bool binary_mode, double calls)
+{
+	MemoizePath *pathnode = makeNode(MemoizePath);
+
+	Assert(subpath->parent == rel);
+
+	pathnode->path.pathtype = T_Memoize;
+	pathnode->path.parent = rel;
+	yb_assign_unique_path_node_id(root, (Path *) pathnode);
+	pathnode->path.pathtarget = rel->reltarget;
+	pathnode->path.param_info = subpath->param_info;
+	pathnode->path.parallel_aware = false;
+	pathnode->path.parallel_safe = rel->consider_parallel &&
+		subpath->parallel_safe;
+	pathnode->path.parallel_workers = subpath->parallel_workers;
+	pathnode->path.pathkeys = subpath->pathkeys;
+
+	pathnode->subpath = subpath;
+	pathnode->hash_operators = hash_operators;
+	pathnode->param_exprs = param_exprs;
+	pathnode->singlerow = singlerow;
+	pathnode->binary_mode = binary_mode;
+	pathnode->calls = clamp_row_est(calls);
+
+	/*
+	 * For now we set est_entries to 0.  cost_memoize_rescan() does all the
+	 * hard work to determine how many cache entries there are likely to be,
+	 * so it seems best to leave it up to that function to fill this field in.
+	 * If left at 0, the executor will make a guess at a good value.
+	 */
+	pathnode->est_entries = 0;
+
+	/*
+	 * Add a small additional charge for caching the first entry.  All the
+	 * harder calculations for rescans are performed in cost_memoize_rescan().
+	 */
+	pathnode->path.startup_cost = subpath->startup_cost + cpu_tuple_cost;
+	pathnode->path.total_cost = subpath->total_cost + cpu_tuple_cost;
+	pathnode->path.rows = subpath->rows;
 
 	return pathnode;
 }
@@ -1609,6 +2156,7 @@ create_unique_path(PlannerInfo *root, RelOptInfo *rel, Path *subpath,
 
 	pathnode->path.pathtype = T_Unique;
 	pathnode->path.parent = rel;
+	yb_assign_unique_path_node_id(root, (Path *) pathnode);
 	pathnode->path.pathtarget = rel->reltarget;
 	pathnode->path.param_info = subpath->param_info;
 	pathnode->path.parallel_aware = false;
@@ -1622,9 +2170,17 @@ create_unique_path(PlannerInfo *root, RelOptInfo *rel, Path *subpath,
 	 */
 	pathnode->path.pathkeys = NIL;
 
+	yb_propagate_fields(&pathnode->path.yb_path_info,
+						&subpath->yb_path_info);
+
 	pathnode->subpath = subpath;
-	pathnode->in_operators = sjinfo->semi_operators;
-	pathnode->uniq_exprs = sjinfo->semi_rhs_exprs;
+
+	/*
+	 * Under GEQO, the sjinfo might be short-lived, so we'd better make copies
+	 * of data structures we extract from it.
+	 */
+	pathnode->in_operators = copyObject(sjinfo->semi_operators);
+	pathnode->uniq_exprs = copyObject(sjinfo->semi_rhs_exprs);
 
 	/*
 	 * If the input is a relation and it has a unique index that proves the
@@ -1694,6 +2250,7 @@ create_unique_path(PlannerInfo *root, RelOptInfo *rel, Path *subpath,
 	pathnode->path.rows = estimate_num_groups(root,
 											  sjinfo->semi_rhs_exprs,
 											  rel->rows,
+											  NULL,
 											  NULL);
 	numCols = list_length(sjinfo->semi_rhs_exprs);
 
@@ -1727,7 +2284,7 @@ create_unique_path(PlannerInfo *root, RelOptInfo *rel, Path *subpath,
 		 */
 		int			hashentrysize = subpath->pathtarget->width + 64;
 
-		if (hashentrysize * pathnode->path.rows > work_mem * 1024L)
+		if (hashentrysize * pathnode->path.rows > get_hash_memory_limit())
 		{
 			/*
 			 * We should not try to hash.  Hack the SpecialJoinInfo to
@@ -1742,7 +2299,8 @@ create_unique_path(PlannerInfo *root, RelOptInfo *rel, Path *subpath,
 					 NIL,
 					 subpath->startup_cost,
 					 subpath->total_cost,
-					 rel->rows);
+					 rel->rows,
+					 subpath->pathtarget->width);
 	}
 
 	if (sjinfo->semi_can_btree && sjinfo->semi_can_hash)
@@ -1801,13 +2359,23 @@ create_gather_merge_path(PlannerInfo *root, RelOptInfo *rel, Path *subpath,
 
 	pathnode->path.pathtype = T_GatherMerge;
 	pathnode->path.parent = rel;
+	yb_assign_unique_path_node_id(root, (Path *) pathnode);
 	pathnode->path.param_info = get_baserel_parampathinfo(root, rel,
 														  required_outer);
 	pathnode->path.parallel_aware = false;
 
+	if (IsYugaByteEnabled() && subpath->ybIsHinted)
+	{
+		pathnode->path.ybIsHinted = true;
+	}
+
 	pathnode->subpath = subpath;
 	pathnode->num_workers = subpath->parallel_workers;
 	pathnode->path.pathkeys = pathkeys;
+	yb_propagate_fields(&pathnode->path.yb_path_info,
+						&subpath->yb_path_info);
+	/* YB: Sub paths may contain duplicate rows. */
+	pathnode->path.yb_path_info.yb_uniqkeys = NIL;
 	pathnode->path.pathtarget = target ? target : rel->reltarget;
 	pathnode->path.rows += subpath->rows;
 
@@ -1888,6 +2456,7 @@ create_gather_path(PlannerInfo *root, RelOptInfo *rel, Path *subpath,
 
 	pathnode->path.pathtype = T_Gather;
 	pathnode->path.parent = rel;
+	yb_assign_unique_path_node_id(root, (Path *) pathnode);
 	pathnode->path.pathtarget = target;
 	pathnode->path.param_info = get_baserel_parampathinfo(root, rel,
 														  required_outer);
@@ -1895,6 +2464,16 @@ create_gather_path(PlannerInfo *root, RelOptInfo *rel, Path *subpath,
 	pathnode->path.parallel_safe = false;
 	pathnode->path.parallel_workers = 0;
 	pathnode->path.pathkeys = NIL;	/* Gather has unordered result */
+
+	if (IsYugaByteEnabled() && subpath->ybIsHinted)
+	{
+		pathnode->path.ybIsHinted = true;
+	}
+
+	yb_propagate_fields(&pathnode->path.yb_path_info,
+						&subpath->yb_path_info);
+	/* YB: There may be duplicate rows across sub paths. */
+	pathnode->path.yb_path_info.yb_uniqkeys = NIL;
 
 	pathnode->subpath = subpath;
 	pathnode->num_workers = subpath->parallel_workers;
@@ -1925,6 +2504,7 @@ create_subqueryscan_path(PlannerInfo *root, RelOptInfo *rel, Path *subpath,
 
 	pathnode->path.pathtype = T_SubqueryScan;
 	pathnode->path.parent = rel;
+	yb_assign_unique_path_node_id(root, (Path *) pathnode);
 	pathnode->path.pathtarget = rel->reltarget;
 	pathnode->path.param_info = get_baserel_parampathinfo(root, rel,
 														  required_outer);
@@ -1933,6 +2513,8 @@ create_subqueryscan_path(PlannerInfo *root, RelOptInfo *rel, Path *subpath,
 		subpath->parallel_safe;
 	pathnode->path.parallel_workers = subpath->parallel_workers;
 	pathnode->path.pathkeys = pathkeys;
+	yb_propagate_fields(&pathnode->path.yb_path_info,
+						&subpath->yb_path_info);
 	pathnode->subpath = subpath;
 
 	cost_subqueryscan(pathnode, root, rel, pathnode->path.param_info);
@@ -1953,6 +2535,7 @@ create_functionscan_path(PlannerInfo *root, RelOptInfo *rel,
 
 	pathnode->pathtype = T_FunctionScan;
 	pathnode->parent = rel;
+	yb_assign_unique_path_node_id(root, pathnode);
 	pathnode->pathtarget = rel->reltarget;
 	pathnode->param_info = get_baserel_parampathinfo(root, rel,
 													 required_outer);
@@ -1979,6 +2562,7 @@ create_tablefuncscan_path(PlannerInfo *root, RelOptInfo *rel,
 
 	pathnode->pathtype = T_TableFuncScan;
 	pathnode->parent = rel;
+	yb_assign_unique_path_node_id(root, pathnode);
 	pathnode->pathtarget = rel->reltarget;
 	pathnode->param_info = get_baserel_parampathinfo(root, rel,
 													 required_outer);
@@ -2005,6 +2589,7 @@ create_valuesscan_path(PlannerInfo *root, RelOptInfo *rel,
 
 	pathnode->pathtype = T_ValuesScan;
 	pathnode->parent = rel;
+	yb_assign_unique_path_node_id(root, pathnode);
 	pathnode->pathtarget = rel->reltarget;
 	pathnode->param_info = get_baserel_parampathinfo(root, rel,
 													 required_outer);
@@ -2030,6 +2615,7 @@ create_ctescan_path(PlannerInfo *root, RelOptInfo *rel, Relids required_outer)
 
 	pathnode->pathtype = T_CteScan;
 	pathnode->parent = rel;
+	yb_assign_unique_path_node_id(root, pathnode);
 	pathnode->pathtarget = rel->reltarget;
 	pathnode->param_info = get_baserel_parampathinfo(root, rel,
 													 required_outer);
@@ -2056,6 +2642,7 @@ create_namedtuplestorescan_path(PlannerInfo *root, RelOptInfo *rel,
 
 	pathnode->pathtype = T_NamedTuplestoreScan;
 	pathnode->parent = rel;
+	yb_assign_unique_path_node_id(root, pathnode);
 	pathnode->pathtarget = rel->reltarget;
 	pathnode->param_info = get_baserel_parampathinfo(root, rel,
 													 required_outer);
@@ -2065,6 +2652,33 @@ create_namedtuplestorescan_path(PlannerInfo *root, RelOptInfo *rel,
 	pathnode->pathkeys = NIL;	/* result is always unordered */
 
 	cost_namedtuplestorescan(pathnode, root, rel, pathnode->param_info);
+
+	return pathnode;
+}
+
+/*
+ * create_resultscan_path
+ *	  Creates a path corresponding to a scan of an RTE_RESULT relation,
+ *	  returning the pathnode.
+ */
+Path *
+create_resultscan_path(PlannerInfo *root, RelOptInfo *rel,
+					   Relids required_outer)
+{
+	Path	   *pathnode = makeNode(Path);
+
+	pathnode->pathtype = T_Result;
+	pathnode->parent = rel;
+	yb_assign_unique_path_node_id(root, pathnode);
+	pathnode->pathtarget = rel->reltarget;
+	pathnode->param_info = get_baserel_parampathinfo(root, rel,
+													 required_outer);
+	pathnode->parallel_aware = false;
+	pathnode->parallel_safe = rel->consider_parallel;
+	pathnode->parallel_workers = 0;
+	pathnode->pathkeys = NIL;	/* result is always unordered */
+
+	cost_resultscan(pathnode, root, rel, pathnode->param_info);
 
 	return pathnode;
 }
@@ -2082,6 +2696,7 @@ create_worktablescan_path(PlannerInfo *root, RelOptInfo *rel,
 
 	pathnode->pathtype = T_WorkTableScan;
 	pathnode->parent = rel;
+	yb_assign_unique_path_node_id(root, pathnode);
 	pathnode->pathtarget = rel->reltarget;
 	pathnode->param_info = get_baserel_parampathinfo(root, rel,
 													 required_outer);
@@ -2098,15 +2713,14 @@ create_worktablescan_path(PlannerInfo *root, RelOptInfo *rel,
 
 /*
  * create_foreignscan_path
- *	  Creates a path corresponding to a scan of a foreign table, foreign join,
- *	  or foreign upper-relation processing, returning the pathnode.
+ *	  Creates a path corresponding to a scan of a foreign base table,
+ *	  returning the pathnode.
  *
  * This function is never called from core Postgres; rather, it's expected
- * to be called by the GetForeignPaths, GetForeignJoinPaths, or
- * GetForeignUpperPaths function of a foreign data wrapper.  We make the FDW
- * supply all fields of the path, since we do not have any way to calculate
- * them in core.  However, there is a usually-sane default for the pathtarget
- * (rel->reltarget), so we let a NULL for "target" select that.
+ * to be called by the GetForeignPaths function of a foreign data wrapper.
+ * We make the FDW supply all fields of the path, since we do not have any way
+ * to calculate them in core.  However, there is a usually-sane default for
+ * the pathtarget (rel->reltarget), so we let a NULL for "target" select that.
  */
 ForeignPath *
 create_foreignscan_path(PlannerInfo *root, RelOptInfo *rel,
@@ -2119,32 +2733,112 @@ create_foreignscan_path(PlannerInfo *root, RelOptInfo *rel,
 {
 	ForeignPath *pathnode = makeNode(ForeignPath);
 
-	/*
-	 * Since the path's required_outer should always include all the rel's
-	 * lateral_relids, forcibly add those if necessary.  This is a bit of a
-	 * hack, but up till early 2019 the contrib FDWs failed to ensure that,
-	 * and it's likely that the same error has propagated into many external
-	 * FDWs.  Don't risk modifying the passed-in relid set here.
-	 */
-	if (rel->lateral_relids && !bms_is_subset(rel->lateral_relids,
-											  required_outer))
-		required_outer = bms_union(required_outer, rel->lateral_relids);
+	/* Historically some FDWs were confused about when to use this */
+	Assert(IS_SIMPLE_REL(rel));
+
+	pathnode->path.pathtype = T_ForeignScan;
+	pathnode->path.parent = rel;
+	yb_assign_unique_path_node_id(root, (Path *) pathnode);
+	pathnode->path.pathtarget = target ? target : rel->reltarget;
+	pathnode->path.param_info = get_baserel_parampathinfo(root, rel,
+														  required_outer);
+	pathnode->path.parallel_aware = false;
+	pathnode->path.parallel_safe = rel->consider_parallel;
+	pathnode->path.parallel_workers = 0;
+	pathnode->path.rows = rows;
+	pathnode->path.startup_cost = startup_cost;
+	pathnode->path.total_cost = total_cost;
+	pathnode->path.pathkeys = pathkeys;
+
+	pathnode->fdw_outerpath = fdw_outerpath;
+	pathnode->fdw_private = fdw_private;
+
+	return pathnode;
+}
+
+/*
+ * create_foreign_join_path
+ *	  Creates a path corresponding to a scan of a foreign join,
+ *	  returning the pathnode.
+ *
+ * This function is never called from core Postgres; rather, it's expected
+ * to be called by the GetForeignJoinPaths function of a foreign data wrapper.
+ * We make the FDW supply all fields of the path, since we do not have any way
+ * to calculate them in core.  However, there is a usually-sane default for
+ * the pathtarget (rel->reltarget), so we let a NULL for "target" select that.
+ */
+ForeignPath *
+create_foreign_join_path(PlannerInfo *root, RelOptInfo *rel,
+						 PathTarget *target,
+						 double rows, Cost startup_cost, Cost total_cost,
+						 List *pathkeys,
+						 Relids required_outer,
+						 Path *fdw_outerpath,
+						 List *fdw_private)
+{
+	ForeignPath *pathnode = makeNode(ForeignPath);
 
 	/*
-	 * Although this function is only designed to be used for scans of
-	 * baserels, before v12 postgres_fdw abused it to make paths for join and
-	 * upper rels.  It will work for such cases as long as required_outer is
-	 * empty (otherwise get_baserel_parampathinfo does the wrong thing), which
-	 * fortunately is the expected case for now.
+	 * We should use get_joinrel_parampathinfo to handle parameterized paths,
+	 * but the API of this function doesn't support it, and existing
+	 * extensions aren't yet trying to build such paths anyway.  For the
+	 * moment just throw an error if someone tries it; eventually we should
+	 * revisit this.
 	 */
-	if (!bms_is_empty(required_outer) && !IS_SIMPLE_REL(rel))
+	if (!bms_is_empty(required_outer) || !bms_is_empty(rel->lateral_relids))
 		elog(ERROR, "parameterized foreign joins are not supported yet");
 
 	pathnode->path.pathtype = T_ForeignScan;
 	pathnode->path.parent = rel;
+	yb_assign_unique_path_node_id(root, (Path *) pathnode);
 	pathnode->path.pathtarget = target ? target : rel->reltarget;
-	pathnode->path.param_info = get_baserel_parampathinfo(root, rel,
-														  required_outer);
+	pathnode->path.param_info = NULL;	/* XXX see above */
+	pathnode->path.parallel_aware = false;
+	pathnode->path.parallel_safe = rel->consider_parallel;
+	pathnode->path.parallel_workers = 0;
+	pathnode->path.rows = rows;
+	pathnode->path.startup_cost = startup_cost;
+	pathnode->path.total_cost = total_cost;
+	pathnode->path.pathkeys = pathkeys;
+
+	pathnode->fdw_outerpath = fdw_outerpath;
+	pathnode->fdw_private = fdw_private;
+
+	return pathnode;
+}
+
+/*
+ * create_foreign_upper_path
+ *	  Creates a path corresponding to an upper relation that's computed
+ *	  directly by an FDW, returning the pathnode.
+ *
+ * This function is never called from core Postgres; rather, it's expected to
+ * be called by the GetForeignUpperPaths function of a foreign data wrapper.
+ * We make the FDW supply all fields of the path, since we do not have any way
+ * to calculate them in core.  However, there is a usually-sane default for
+ * the pathtarget (rel->reltarget), so we let a NULL for "target" select that.
+ */
+ForeignPath *
+create_foreign_upper_path(PlannerInfo *root, RelOptInfo *rel,
+						  PathTarget *target,
+						  double rows, Cost startup_cost, Cost total_cost,
+						  List *pathkeys,
+						  Path *fdw_outerpath,
+						  List *fdw_private)
+{
+	ForeignPath *pathnode = makeNode(ForeignPath);
+
+	/*
+	 * Upper relations should never have any lateral references, since joining
+	 * is complete.
+	 */
+	Assert(bms_is_empty(rel->lateral_relids));
+
+	pathnode->path.pathtype = T_ForeignScan;
+	pathnode->path.parent = rel;
+	yb_assign_unique_path_node_id(root, (Path *) pathnode);
+	pathnode->path.pathtarget = target ? target : rel->reltarget;
+	pathnode->path.param_info = NULL;
 	pathnode->path.parallel_aware = false;
 	pathnode->path.parallel_safe = rel->consider_parallel;
 	pathnode->path.parallel_workers = 0;
@@ -2214,7 +2908,7 @@ calc_non_nestloop_required_outer(Path *outer_path, Path *inner_path)
 	return required_outer;
 }
 
-extern int yb_bnl_batch_size;
+extern int	yb_bnl_batch_size;
 
 /*
  * create_nestloop_path
@@ -2248,6 +2942,21 @@ create_nestloop_path(PlannerInfo *root,
 	NestPath   *pathnode = makeNode(NestPath);
 	Relids		inner_req_outer = PATH_REQ_OUTER(inner_path);
 
+	if (yb_enable_planner_trace)
+	{
+		StringInfoData buf;
+
+		initStringInfo(&buf);
+		char		msgBuf[30];
+
+		sprintf(msgBuf, "(UID %u)", ybGetNextUid(root->glob));
+		appendStringInfo(&buf, "%s %s", msgBuf, "create_nestloop_path");
+		ereport(DEBUG1, (errmsg("\n%s", buf.data)));
+		ybTracePath(root, outer_path, "outer path");
+		ybTracePath(root, inner_path, "inner path");
+		pfree(buf.data);
+	}
+
 	/*
 	 * If the inner path is parameterized by the outer, we must drop any
 	 * restrict_clauses that are due to be moved into the inner path.  We have
@@ -2255,17 +2964,14 @@ create_nestloop_path(PlannerInfo *root,
 	 * because the restrict_clauses list can affect the size and cost
 	 * estimates for this path.
 	 */
-	 ParamPathInfo *param_info = inner_path->param_info;
-	 Relids inner_req_batched = param_info == NULL
-		? NULL : param_info->yb_ppi_req_outer_batched;
-	 
-	 Relids outer_req_unbatched = outer_path->param_info ?
-	 	outer_path->param_info->yb_ppi_req_outer_unbatched :
-		NULL;
+	Relids		inner_req_batched = YB_PATH_REQ_OUTER_BATCHED(inner_path);
 
-	 bool is_batched = bms_overlap(inner_req_batched,
-	 							   outer_path->parent->relids) &&
-					   !bms_overlap(outer_req_unbatched, inner_req_batched);
+	Relids		outer_req_unbatched = YB_PATH_REQ_OUTER_UNBATCHED(outer_path);
+
+	bool		is_batched = (bms_overlap(inner_req_batched,
+										  outer_path->parent->relids) &&
+							  !bms_overlap(outer_req_unbatched, inner_req_batched));
+
 	if (!is_batched && bms_overlap(inner_req_outer, outer_path->parent->relids))
 	{
 		Relids		inner_and_outer = bms_union(inner_path->parent->relids,
@@ -2285,16 +2991,10 @@ create_nestloop_path(PlannerInfo *root,
 		restrict_clauses = jclauses;
 	}
 
-	if (is_batched)
-	{
-		Assert(yb_bnl_batch_size > 1);
-		pathkeys = NIL;
-	}
-
-	pathnode->path.pathtype = T_NestLoop;
-	pathnode->path.parent = joinrel;
-	pathnode->path.pathtarget = joinrel->reltarget;
-	pathnode->path.param_info =
+	pathnode->jpath.path.pathtype = T_NestLoop;
+	pathnode->jpath.path.parent = joinrel;
+	pathnode->jpath.path.pathtarget = joinrel->reltarget;
+	pathnode->jpath.path.param_info =
 		get_joinrel_parampathinfo(root,
 								  joinrel,
 								  outer_path,
@@ -2302,19 +3002,59 @@ create_nestloop_path(PlannerInfo *root,
 								  extra->sjinfo,
 								  required_outer,
 								  &restrict_clauses);
-	pathnode->path.parallel_aware = false;
-	pathnode->path.parallel_safe = joinrel->consider_parallel &&
+	pathnode->jpath.path.parallel_aware = false;
+	pathnode->jpath.path.parallel_safe = joinrel->consider_parallel &&
 		outer_path->parallel_safe && inner_path->parallel_safe;
 	/* This is a foolish way to estimate parallel_workers, but for now... */
-	pathnode->path.parallel_workers = outer_path->parallel_workers;
-	pathnode->path.pathkeys = pathkeys;
-	pathnode->jointype = jointype;
-	pathnode->inner_unique = extra->inner_unique;
-	pathnode->outerjoinpath = outer_path;
-	pathnode->innerjoinpath = inner_path;
-	pathnode->joinrestrictinfo = restrict_clauses;
+	pathnode->jpath.path.parallel_workers = outer_path->parallel_workers;
+	pathnode->jpath.path.pathkeys = pathkeys;
+	yb_propagate_fields2(&pathnode->jpath.path.yb_path_info,
+						 &inner_path->yb_path_info,
+						 &outer_path->yb_path_info);
+	pathnode->jpath.jointype = jointype;
+	pathnode->jpath.inner_unique = extra->inner_unique;
+	pathnode->jpath.outerjoinpath = outer_path;
+	pathnode->jpath.innerjoinpath = inner_path;
+	pathnode->jpath.joinrestrictinfo = restrict_clauses;
+
+	if (IsYugaByteEnabled())
+	{
+		yb_assign_unique_path_node_id(root, (Path *) pathnode);
+
+		pathnode->jpath.path.ybIsHinted
+			= ybFindHintedJoin(root, outer_path->parent->relids, inner_path->parent->relids,
+							   false /* do not swap */ );
+
+		if (pathnode->jpath.path.ybIsHinted)
+		{
+			if (ybFindProhibitedJoin(root, T_NestLoop, joinrel->relids))
+			{
+				/*
+				 * This is a prohibited NestLoop join (e.g., hinted with 'Leading(((t1 t2) t3)) noNestLoop(t1 t2)' so mark the path
+				 * as not a hinted join path (so costing code does not prefer it).
+				 */
+				pathnode->jpath.path.ybIsHinted = false;
+			}
+			else if (yb_is_nestloop_batched(pathnode) && ybFindProhibitedJoin(root, T_YbBatchedNestLoop, joinrel->relids))
+			{
+				/*
+				 * Ditto for a prohibited YbBatchedNestLoop join.
+				 */
+				pathnode->jpath.path.ybIsHinted = false;
+			}
+		}
+	}
 
 	final_cost_nestloop(root, pathnode, workspace, extra);
+
+	if (yb_enable_planner_trace)
+	{
+		StringInfoData buf;
+
+		initStringInfo(&buf);
+		appendStringInfo(&buf, "allocated join path %u", pathnode->jpath.path.ybUniqueId);
+		ybTracePath(root, (Path *) pathnode, "allocated join path");
+	}
 
 	return pathnode;
 }
@@ -2357,6 +3097,43 @@ create_mergejoin_path(PlannerInfo *root,
 
 	pathnode->jpath.path.pathtype = T_MergeJoin;
 	pathnode->jpath.path.parent = joinrel;
+
+	if (IsYugaByteEnabled())
+	{
+		if (yb_enable_planner_trace)
+		{
+			StringInfoData buf;
+
+			initStringInfo(&buf);
+			char		msgBuf[30];
+
+			sprintf(msgBuf, "(UID %u)", ybGetNextUid(root->glob));
+			appendStringInfo(&buf, "%s %s", msgBuf, "create_mergejoin_path");
+			ereport(DEBUG1, (errmsg("\n%s", buf.data)));
+			ybTracePath(root, outer_path, "outer path");
+			ybTracePath(root, inner_path, "inner path");
+			pfree(buf.data);
+		}
+
+		yb_assign_unique_path_node_id(root, (Path *) pathnode);
+
+		pathnode->jpath.path.ybIsHinted
+			= ybFindHintedJoin(root, outer_path->parent->relids, inner_path->parent->relids,
+							   false /* do not swap */ );
+
+		if (pathnode->jpath.path.ybIsHinted)
+		{
+			if (ybFindProhibitedJoin(root, T_MergeJoin, joinrel->relids))
+			{
+				/*
+				 * This is a prohibited MergeJoin join so mark the path as not a hinted join path
+				 * (so costing code does not prefer it).
+				 */
+				pathnode->jpath.path.ybIsHinted = false;
+			}
+		}
+	}
+
 	pathnode->jpath.path.pathtarget = joinrel->reltarget;
 	pathnode->jpath.path.param_info =
 		get_joinrel_parampathinfo(root,
@@ -2372,6 +3149,9 @@ create_mergejoin_path(PlannerInfo *root,
 	/* This is a foolish way to estimate parallel_workers, but for now... */
 	pathnode->jpath.path.parallel_workers = outer_path->parallel_workers;
 	pathnode->jpath.path.pathkeys = pathkeys;
+	yb_propagate_fields2(&pathnode->jpath.path.yb_path_info,
+						 &outer_path->yb_path_info,
+						 &inner_path->yb_path_info);
 	pathnode->jpath.jointype = jointype;
 	pathnode->jpath.inner_unique = extra->inner_unique;
 	pathnode->jpath.outerjoinpath = outer_path;
@@ -2384,6 +3164,15 @@ create_mergejoin_path(PlannerInfo *root,
 	/* pathnode->materialize_inner will be set by final_cost_mergejoin */
 
 	final_cost_mergejoin(root, pathnode, workspace, extra);
+
+	if (yb_enable_planner_trace)
+	{
+		StringInfoData buf;
+
+		initStringInfo(&buf);
+		appendStringInfo(&buf, "allocated join path %u", pathnode->jpath.path.ybUniqueId);
+		ybTracePath(root, (Path *) pathnode, "allocated join path");
+	}
 
 	return pathnode;
 }
@@ -2421,6 +3210,41 @@ create_hashjoin_path(PlannerInfo *root,
 
 	pathnode->jpath.path.pathtype = T_HashJoin;
 	pathnode->jpath.path.parent = joinrel;
+
+	if (IsYugaByteEnabled())
+	{
+		if (yb_enable_planner_trace)
+		{
+			StringInfoData buf;
+
+			initStringInfo(&buf);
+			char		msgBuf[30];
+
+			sprintf(msgBuf, "(UID %u)", ybGetNextUid(root->glob));
+			appendStringInfo(&buf, "%s %s", msgBuf, "create_hashjoin_path");
+			ereport(DEBUG1, (errmsg("\n%s", buf.data)));
+			ybTracePath(root, outer_path, "outer path");
+			ybTracePath(root, inner_path, "inner path");
+			pfree(buf.data);
+		}
+
+		yb_assign_unique_path_node_id(root, (Path *) pathnode);
+
+		pathnode->jpath.path.ybIsHinted
+			= ybFindHintedJoin(root, outer_path->parent->relids, inner_path->parent->relids, false /* do not swap */ );
+		if (pathnode->jpath.path.ybIsHinted)
+		{
+			if (ybFindProhibitedJoin(root, T_HashJoin, joinrel->relids))
+			{
+				/*
+				 * This is a prohibited HashJoin join so mark the path as not a hinted join path
+				 * (so costing code does not prefer it).
+				 */
+				pathnode->jpath.path.ybIsHinted = false;
+			}
+		}
+	}
+
 	pathnode->jpath.path.pathtarget = joinrel->reltarget;
 	pathnode->jpath.path.param_info =
 		get_joinrel_parampathinfo(root,
@@ -2449,6 +3273,9 @@ create_hashjoin_path(PlannerInfo *root,
 	 * outer rel than it does now.)
 	 */
 	pathnode->jpath.path.pathkeys = NIL;
+	yb_propagate_fields2(&pathnode->jpath.path.yb_path_info,
+						 &outer_path->yb_path_info,
+						 &inner_path->yb_path_info);
 	pathnode->jpath.jointype = jointype;
 	pathnode->jpath.inner_unique = extra->inner_unique;
 	pathnode->jpath.outerjoinpath = outer_path;
@@ -2458,6 +3285,15 @@ create_hashjoin_path(PlannerInfo *root,
 	/* final_cost_hashjoin will fill in pathnode->num_batches */
 
 	final_cost_hashjoin(root, pathnode, workspace, extra);
+
+	if (yb_enable_planner_trace)
+	{
+		StringInfoData buf;
+
+		initStringInfo(&buf);
+		appendStringInfo(&buf, "allocated join path %u", pathnode->jpath.path.ybUniqueId);
+		ybTracePath(root, (Path *) pathnode, "allocated join path");
+	}
 
 	return pathnode;
 }
@@ -2497,6 +3333,7 @@ create_projection_path(PlannerInfo *root,
 
 	pathnode->path.pathtype = T_Result;
 	pathnode->path.parent = rel;
+	yb_assign_unique_path_node_id(root, (Path *) pathnode);
 	pathnode->path.pathtarget = target;
 	/* For now, assume we are above any joins, so no parameterization */
 	pathnode->path.param_info = NULL;
@@ -2508,7 +3345,15 @@ create_projection_path(PlannerInfo *root,
 	/* Projection does not change the sort order */
 	pathnode->path.pathkeys = subpath->pathkeys;
 
+	yb_propagate_fields(&pathnode->path.yb_path_info,
+						&subpath->yb_path_info);
+
 	pathnode->subpath = subpath;
+
+	if (IsYugaByteEnabled() && subpath->ybIsHinted)
+	{
+		pathnode->path.ybIsHinted = true;
+	}
 
 	/*
 	 * We might not need a separate Result node.  If the input plan node type
@@ -2610,7 +3455,7 @@ apply_projection_to_path(PlannerInfo *root,
 	 * workers can help project.  But if there is something that is not
 	 * parallel-safe in the target expressions, then we can't.
 	 */
-	if ((IsA(path, GatherPath) ||IsA(path, GatherMergePath)) &&
+	if ((IsA(path, GatherPath) || IsA(path, GatherMergePath)) &&
 		is_parallel_safe(root, (Node *) target->exprs))
 	{
 		/*
@@ -2679,6 +3524,7 @@ create_set_projection_path(PlannerInfo *root,
 
 	pathnode->path.pathtype = T_ProjectSet;
 	pathnode->path.parent = rel;
+	yb_assign_unique_path_node_id(root, (Path *) pathnode);
 	pathnode->path.pathtarget = target;
 	/* For now, assume we are above any joins, so no parameterization */
 	pathnode->path.param_info = NULL;
@@ -2689,6 +3535,14 @@ create_set_projection_path(PlannerInfo *root,
 	pathnode->path.parallel_workers = subpath->parallel_workers;
 	/* Projection does not change the sort order XXX? */
 	pathnode->path.pathkeys = subpath->pathkeys;
+
+	yb_propagate_fields(&pathnode->path.yb_path_info,
+						&subpath->yb_path_info);
+	/*
+	 * YB: SRFs can produce multiple rows for each row.
+	 * Example: col1, GENERATE_SERIES(1, 1000) produces 1000 rows for each col1.
+	 */
+	pathnode->path.yb_path_info.yb_uniqkeys = NIL;
 
 	pathnode->subpath = subpath;
 
@@ -2702,7 +3556,7 @@ create_set_projection_path(PlannerInfo *root,
 		Node	   *node = (Node *) lfirst(lc);
 		double		itemrows;
 
-		itemrows = expression_returns_set_rows(node);
+		itemrows = expression_returns_set_rows(root, node);
 		if (tlist_rows < itemrows)
 			tlist_rows = itemrows;
 	}
@@ -2722,6 +3576,58 @@ create_set_projection_path(PlannerInfo *root,
 		(pathnode->path.rows - subpath->rows) * cpu_tuple_cost / 2;
 
 	return pathnode;
+}
+
+/*
+ * create_incremental_sort_path
+ *	  Creates a pathnode that represents performing an incremental sort.
+ *
+ * 'rel' is the parent relation associated with the result
+ * 'subpath' is the path representing the source of data
+ * 'pathkeys' represents the desired sort order
+ * 'presorted_keys' is the number of keys by which the input path is
+ *		already sorted
+ * 'limit_tuples' is the estimated bound on the number of output tuples,
+ *		or -1 if no LIMIT or couldn't estimate
+ */
+IncrementalSortPath *
+create_incremental_sort_path(PlannerInfo *root,
+							 RelOptInfo *rel,
+							 Path *subpath,
+							 List *pathkeys,
+							 int presorted_keys,
+							 double limit_tuples)
+{
+	IncrementalSortPath *sort = makeNode(IncrementalSortPath);
+	SortPath   *pathnode = &sort->spath;
+
+	pathnode->path.pathtype = T_IncrementalSort;
+	pathnode->path.parent = rel;
+	yb_assign_unique_path_node_id(root, (Path *) sort);
+	/* Sort doesn't project, so use source path's pathtarget */
+	pathnode->path.pathtarget = subpath->pathtarget;
+	/* For now, assume we are above any joins, so no parameterization */
+	pathnode->path.param_info = NULL;
+	pathnode->path.parallel_aware = false;
+	pathnode->path.parallel_safe = rel->consider_parallel &&
+		subpath->parallel_safe;
+	pathnode->path.parallel_workers = subpath->parallel_workers;
+	pathnode->path.pathkeys = pathkeys;
+
+	pathnode->subpath = subpath;
+
+	cost_incremental_sort(&pathnode->path,
+						  root, pathkeys, presorted_keys,
+						  subpath->startup_cost,
+						  subpath->total_cost,
+						  subpath->rows,
+						  subpath->pathtarget->width,
+						  0.0,	/* XXX comparison_cost shouldn't be 0? */
+						  work_mem, limit_tuples);
+
+	sort->nPresortedCols = presorted_keys;
+
+	return sort;
 }
 
 /*
@@ -2745,6 +3651,7 @@ create_sort_path(PlannerInfo *root,
 
 	pathnode->path.pathtype = T_Sort;
 	pathnode->path.parent = rel;
+	yb_assign_unique_path_node_id(root, (Path *) pathnode);
 	/* Sort doesn't project, so use source path's pathtarget */
 	pathnode->path.pathtarget = subpath->pathtarget;
 	/* For now, assume we are above any joins, so no parameterization */
@@ -2753,7 +3660,16 @@ create_sort_path(PlannerInfo *root,
 	pathnode->path.parallel_safe = rel->consider_parallel &&
 		subpath->parallel_safe;
 	pathnode->path.parallel_workers = subpath->parallel_workers;
+
+	if (IsYugaByteEnabled() && subpath->ybIsHinted)
+	{
+		pathnode->path.ybIsHinted = true;
+	}
+
 	pathnode->path.pathkeys = pathkeys;
+
+	yb_propagate_fields(&pathnode->path.yb_path_info,
+						&subpath->yb_path_info);
 
 	pathnode->subpath = subpath;
 
@@ -2791,6 +3707,7 @@ create_group_path(PlannerInfo *root,
 
 	pathnode->path.pathtype = T_Group;
 	pathnode->path.parent = rel;
+	yb_assign_unique_path_node_id(root, (Path *) pathnode);
 	pathnode->path.pathtarget = target;
 	/* For now, assume we are above any joins, so no parameterization */
 	pathnode->path.param_info = NULL;
@@ -2798,8 +3715,16 @@ create_group_path(PlannerInfo *root,
 	pathnode->path.parallel_safe = rel->consider_parallel &&
 		subpath->parallel_safe;
 	pathnode->path.parallel_workers = subpath->parallel_workers;
+
+	if (IsYugaByteEnabled() && subpath->ybIsHinted)
+	{
+		pathnode->path.ybIsHinted = true;
+	}
+
 	/* Group doesn't change sort ordering */
 	pathnode->path.pathkeys = subpath->pathkeys;
+
+	yb_propagate_fields(&pathnode->path.yb_path_info, &subpath->yb_path_info);
 
 	pathnode->subpath = subpath;
 
@@ -2848,6 +3773,7 @@ create_upper_unique_path(PlannerInfo *root,
 
 	pathnode->path.pathtype = T_Unique;
 	pathnode->path.parent = rel;
+	yb_assign_unique_path_node_id(root, (Path *) pathnode);
 	/* Unique doesn't project, so use source path's pathtarget */
 	pathnode->path.pathtarget = subpath->pathtarget;
 	/* For now, assume we are above any joins, so no parameterization */
@@ -2858,6 +3784,9 @@ create_upper_unique_path(PlannerInfo *root,
 	pathnode->path.parallel_workers = subpath->parallel_workers;
 	/* Unique doesn't change the input ordering */
 	pathnode->path.pathkeys = subpath->pathkeys;
+
+	yb_propagate_fields(&pathnode->path.yb_path_info,
+						&subpath->yb_path_info);
 
 	pathnode->subpath = subpath;
 	pathnode->numkeys = numCols;
@@ -2905,6 +3834,7 @@ create_agg_path(PlannerInfo *root,
 
 	pathnode->path.pathtype = T_Agg;
 	pathnode->path.parent = rel;
+	yb_assign_unique_path_node_id(root, (Path *) pathnode);
 	pathnode->path.pathtarget = target;
 	/* For now, assume we are above any joins, so no parameterization */
 	pathnode->path.param_info = NULL;
@@ -2912,15 +3842,24 @@ create_agg_path(PlannerInfo *root,
 	pathnode->path.parallel_safe = rel->consider_parallel &&
 		subpath->parallel_safe;
 	pathnode->path.parallel_workers = subpath->parallel_workers;
+
+	if (IsYugaByteEnabled() && subpath->ybIsHinted)
+	{
+		pathnode->path.ybIsHinted = true;
+	}
+
 	if (aggstrategy == AGG_SORTED)
 		pathnode->path.pathkeys = subpath->pathkeys;	/* preserves order */
 	else
 		pathnode->path.pathkeys = NIL;	/* output is unordered */
+	yb_propagate_fields(&pathnode->path.yb_path_info,
+						&subpath->yb_path_info);
 	pathnode->subpath = subpath;
 
 	pathnode->aggstrategy = aggstrategy;
 	pathnode->aggsplit = aggsplit;
 	pathnode->numGroups = numGroups;
+	pathnode->transitionSpace = aggcosts ? aggcosts->transitionSpace : 0;
 	pathnode->groupClause = groupClause;
 	pathnode->qual = qual;
 
@@ -2929,7 +3868,7 @@ create_agg_path(PlannerInfo *root,
 			 list_length(groupClause), numGroups,
 			 qual,
 			 subpath->startup_cost, subpath->total_cost,
-			 subpath->rows);
+			 subpath->rows, subpath->pathtarget->width);
 
 	/* add tlist eval cost for each output row */
 	pathnode->path.startup_cost += target->cost.startup;
@@ -2974,6 +3913,7 @@ create_groupingsets_path(PlannerInfo *root,
 	/* The topmost generated Plan node will be an Agg */
 	pathnode->path.pathtype = T_Agg;
 	pathnode->path.parent = rel;
+	yb_assign_unique_path_node_id(root, (Path *) pathnode);
 	pathnode->path.pathtarget = target;
 	pathnode->path.param_info = subpath->param_info;
 	pathnode->path.parallel_aware = false;
@@ -3005,9 +3945,15 @@ create_groupingsets_path(PlannerInfo *root,
 	else
 		pathnode->path.pathkeys = NIL;
 
+	yb_propagate_fields(&pathnode->path.yb_path_info,
+						&subpath->yb_path_info);
+	/* YB: Set of unique keys is not preserved. */
+	pathnode->path.yb_path_info.yb_uniqkeys = NIL;
+
 	pathnode->aggstrategy = aggstrategy;
 	pathnode->rollups = rollups;
 	pathnode->qual = having_qual;
+	pathnode->transitionSpace = agg_costs ? agg_costs->transitionSpace : 0;
 
 	Assert(rollups != NIL);
 	Assert(aggstrategy != AGG_PLAIN || list_length(rollups) == 1);
@@ -3039,7 +3985,8 @@ create_groupingsets_path(PlannerInfo *root,
 					 having_qual,
 					 subpath->startup_cost,
 					 subpath->total_cost,
-					 subpath->rows);
+					 subpath->rows,
+					 subpath->pathtarget->width);
 			is_first = false;
 			if (!rollup->is_hashed)
 				is_first_sort = false;
@@ -3062,7 +4009,8 @@ create_groupingsets_path(PlannerInfo *root,
 						 rollup->numGroups,
 						 having_qual,
 						 0.0, 0.0,
-						 subpath->rows);
+						 subpath->rows,
+						 subpath->pathtarget->width);
 				if (!rollup->is_hashed)
 					is_first_sort = false;
 			}
@@ -3087,7 +4035,8 @@ create_groupingsets_path(PlannerInfo *root,
 						 having_qual,
 						 sort_path.startup_cost,
 						 sort_path.total_cost,
-						 sort_path.rows);
+						 sort_path.rows,
+						 subpath->pathtarget->width);
 			}
 
 			pathnode->path.total_cost += agg_path.total_cost;
@@ -3126,16 +4075,19 @@ create_minmaxagg_path(PlannerInfo *root,
 	/* The topmost generated Plan node will be a Result */
 	pathnode->path.pathtype = T_Result;
 	pathnode->path.parent = rel;
+	yb_assign_unique_path_node_id(root, (Path *) pathnode);
 	pathnode->path.pathtarget = target;
 	/* For now, assume we are above any joins, so no parameterization */
 	pathnode->path.param_info = NULL;
 	pathnode->path.parallel_aware = false;
-	/* A MinMaxAggPath implies use of subplans, so cannot be parallel-safe */
+	/* A MinMaxAggPath implies use of initplans, so cannot be parallel-safe */
 	pathnode->path.parallel_safe = false;
 	pathnode->path.parallel_workers = 0;
 	/* Result is one unordered row */
 	pathnode->path.rows = 1;
 	pathnode->path.pathkeys = NIL;
+
+	yb_propagate_mmagg_fields(&pathnode->path.yb_path_info, mmaggregates);
 
 	pathnode->mmaggregates = mmaggregates;
 	pathnode->quals = quals;
@@ -3179,6 +4131,10 @@ create_minmaxagg_path(PlannerInfo *root,
  * 'target' is the PathTarget to be computed
  * 'windowFuncs' is a list of WindowFunc structs
  * 'winclause' is a WindowClause that is common to all the WindowFuncs
+ * 'qual' WindowClause.runconditions from lower-level WindowAggPaths.
+ *		Must always be NIL when topwindow == false
+ * 'topwindow' pass as true only for the top-level WindowAgg. False for all
+ *		intermediate WindowAggs.
  *
  * The input must be sorted according to the WindowClause's PARTITION keys
  * plus ORDER BY keys.
@@ -3189,12 +4145,18 @@ create_windowagg_path(PlannerInfo *root,
 					  Path *subpath,
 					  PathTarget *target,
 					  List *windowFuncs,
-					  WindowClause *winclause)
+					  WindowClause *winclause,
+					  List *qual,
+					  bool topwindow)
 {
 	WindowAggPath *pathnode = makeNode(WindowAggPath);
 
+	/* qual can only be set for the topwindow */
+	Assert(qual == NIL || topwindow);
+
 	pathnode->path.pathtype = T_WindowAgg;
 	pathnode->path.parent = rel;
+	yb_assign_unique_path_node_id(root, (Path *) pathnode);
 	pathnode->path.pathtarget = target;
 	/* For now, assume we are above any joins, so no parameterization */
 	pathnode->path.param_info = NULL;
@@ -3205,8 +4167,13 @@ create_windowagg_path(PlannerInfo *root,
 	/* WindowAgg preserves the input sort order */
 	pathnode->path.pathkeys = subpath->pathkeys;
 
+	yb_propagate_fields(&pathnode->path.yb_path_info,
+						&subpath->yb_path_info);
+
 	pathnode->subpath = subpath;
 	pathnode->winclause = winclause;
+	pathnode->qual = qual;
+	pathnode->topwindow = topwindow;
 
 	/*
 	 * For costing purposes, assume that there are no redundant partitioning
@@ -3261,6 +4228,7 @@ create_setop_path(PlannerInfo *root,
 
 	pathnode->path.pathtype = T_SetOp;
 	pathnode->path.parent = rel;
+	yb_assign_unique_path_node_id(root, (Path *) pathnode);
 	/* SetOp doesn't project, so use source path's pathtarget */
 	pathnode->path.pathtarget = subpath->pathtarget;
 	/* For now, assume we are above any joins, so no parameterization */
@@ -3272,6 +4240,9 @@ create_setop_path(PlannerInfo *root,
 	/* SetOp preserves the input sort order if in sort mode */
 	pathnode->path.pathkeys =
 		(strategy == SETOP_SORTED) ? subpath->pathkeys : NIL;
+
+	yb_propagate_fields(&pathnode->path.yb_path_info,
+						&subpath->yb_path_info);
 
 	pathnode->subpath = subpath;
 	pathnode->cmd = cmd;
@@ -3321,6 +4292,7 @@ create_recursiveunion_path(PlannerInfo *root,
 
 	pathnode->path.pathtype = T_RecursiveUnion;
 	pathnode->path.parent = rel;
+	yb_assign_unique_path_node_id(root, (Path *) pathnode);
 	pathnode->path.pathtarget = target;
 	/* For now, assume we are above any joins, so no parameterization */
 	pathnode->path.param_info = NULL;
@@ -3331,6 +4303,12 @@ create_recursiveunion_path(PlannerInfo *root,
 	pathnode->path.parallel_workers = leftpath->parallel_workers;
 	/* RecursiveUnion result is always unsorted */
 	pathnode->path.pathkeys = NIL;
+
+	yb_propagate_fields2(&pathnode->path.yb_path_info,
+						 &leftpath->yb_path_info,
+						 &rightpath->yb_path_info);
+	/* YB: Union may introduce duplicate rows. */
+	pathnode->path.yb_path_info.yb_uniqkeys = NIL;
 
 	pathnode->leftpath = leftpath;
 	pathnode->rightpath = rightpath;
@@ -3360,6 +4338,7 @@ create_lockrows_path(PlannerInfo *root, RelOptInfo *rel,
 
 	pathnode->path.pathtype = T_LockRows;
 	pathnode->path.parent = rel;
+	yb_assign_unique_path_node_id(root, (Path *) pathnode);
 	/* LockRows doesn't project, so use source path's pathtarget */
 	pathnode->path.pathtarget = subpath->pathtarget;
 	/* For now, assume we are above any joins, so no parameterization */
@@ -3374,6 +4353,9 @@ create_lockrows_path(PlannerInfo *root, RelOptInfo *rel,
 	 * key columns to be replaced with new values.
 	 */
 	pathnode->path.pathkeys = NIL;
+
+	yb_propagate_fields(&pathnode->path.yb_path_info,
+						&subpath->yb_path_info);
 
 	pathnode->subpath = subpath;
 	pathnode->rowMarks = rowMarks;
@@ -3393,43 +4375,45 @@ create_lockrows_path(PlannerInfo *root, RelOptInfo *rel,
 
 /*
  * create_modifytable_path
- *	  Creates a pathnode that represents performing INSERT/UPDATE/DELETE mods
+ *	  Creates a pathnode that represents performing INSERT/UPDATE/DELETE/MERGE
+ *	  mods
  *
  * 'rel' is the parent relation associated with the result
+ * 'subpath' is a Path producing source data
  * 'operation' is the operation type
  * 'canSetTag' is true if we set the command tag/es_processed
  * 'nominalRelation' is the parent RT index for use of EXPLAIN
- * 'partitioned_rels' is an integer list of RT indexes of non-leaf tables in
- *		the partition tree, if this is an UPDATE/DELETE to a partitioned table.
- *		Otherwise NIL.
+ * 'rootRelation' is the partitioned/inherited table root RTI, or 0 if none
  * 'partColsUpdated' is true if any partitioning columns are being updated,
  *		either from the target relation or a descendent partitioned table.
  * 'resultRelations' is an integer list of actual RT indexes of target rel(s)
- * 'subpaths' is a list of Path(s) producing source data (one per rel)
- * 'subroots' is a list of PlannerInfo structs (one per rel)
+ * 'updateColnosLists' is a list of UPDATE target column number lists
+ *		(one sublist per rel); or NIL if not an UPDATE
  * 'withCheckOptionLists' is a list of WCO lists (one per rel)
  * 'returningLists' is a list of RETURNING tlists (one per rel)
  * 'rowMarks' is a list of PlanRowMarks (non-locking only)
  * 'onconflict' is the ON CONFLICT clause, or NULL
  * 'epqParam' is the ID of Param for EvalPlanQual re-eval
+ * 'mergeActionLists' is a list of lists of MERGE actions (one per rel)
  */
 ModifyTablePath *
 create_modifytable_path(PlannerInfo *root, RelOptInfo *rel,
+						Path *subpath,
 						CmdType operation, bool canSetTag,
-						Index nominalRelation, List *partitioned_rels,
+						Index nominalRelation, Index rootRelation,
 						bool partColsUpdated,
-						List *resultRelations, List *subpaths,
-						List *subroots,
+						List *resultRelations,
+						List *updateColnosLists,
 						List *withCheckOptionLists, List *returningLists,
 						List *rowMarks, OnConflictExpr *onconflict,
-						int epqParam)
+						List *mergeActionLists, int epqParam)
 {
 	ModifyTablePath *pathnode = makeNode(ModifyTablePath);
-	double		total_size;
-	ListCell   *lc;
 
-	Assert(list_length(resultRelations) == list_length(subpaths));
-	Assert(list_length(resultRelations) == list_length(subroots));
+	Assert(operation == CMD_MERGE ||
+		   (operation == CMD_UPDATE ?
+			list_length(resultRelations) == list_length(updateColnosLists) :
+			updateColnosLists == NIL));
 	Assert(withCheckOptionLists == NIL ||
 		   list_length(resultRelations) == list_length(withCheckOptionLists));
 	Assert(returningLists == NIL ||
@@ -3437,6 +4421,7 @@ create_modifytable_path(PlannerInfo *root, RelOptInfo *rel,
 
 	pathnode->path.pathtype = T_ModifyTable;
 	pathnode->path.parent = rel;
+	yb_assign_unique_path_node_id(root, (Path *) pathnode);
 	/* pathtarget is not interesting, just make it minimally valid */
 	pathnode->path.pathtarget = rel->reltarget;
 	/* For now, assume we are above any joins, so no parameterization */
@@ -3446,8 +4431,10 @@ create_modifytable_path(PlannerInfo *root, RelOptInfo *rel,
 	pathnode->path.parallel_workers = 0;
 	pathnode->path.pathkeys = NIL;
 
+	yb_propagate_fields(&pathnode->path.yb_path_info, &subpath->yb_path_info);
+
 	/*
-	 * Compute cost & rowcount as sum of subpath costs & rowcounts.
+	 * Compute cost & rowcount as subpath cost & rowcount (if RETURNING)
 	 *
 	 * Currently, we don't charge anything extra for the actual table
 	 * modification work, nor for the WITH CHECK OPTIONS or RETURNING
@@ -3456,44 +4443,40 @@ create_modifytable_path(PlannerInfo *root, RelOptInfo *rel,
 	 * costs to change any higher-level planning choices.  But we might want
 	 * to make it look better sometime.
 	 */
-	pathnode->path.startup_cost = 0;
-	pathnode->path.total_cost = 0;
-	pathnode->path.rows = 0;
-	total_size = 0;
-	foreach(lc, subpaths)
+	pathnode->path.startup_cost = subpath->startup_cost;
+	pathnode->path.total_cost = subpath->total_cost;
+	if (returningLists != NIL)
 	{
-		Path	   *subpath = (Path *) lfirst(lc);
+		pathnode->path.rows = subpath->rows;
 
-		if (lc == list_head(subpaths))	/* first node? */
-			pathnode->path.startup_cost = subpath->startup_cost;
-		pathnode->path.total_cost += subpath->total_cost;
-		pathnode->path.rows += subpath->rows;
-		total_size += subpath->pathtarget->width * subpath->rows;
+		/*
+		 * Set width to match the subpath output.  XXX this is totally wrong:
+		 * we should return an average of the RETURNING tlist widths.  But
+		 * it's what happened historically, and improving it is a task for
+		 * another day.  (Again, it's mostly window dressing.)
+		 */
+		pathnode->path.pathtarget->width = subpath->pathtarget->width;
+	}
+	else
+	{
+		pathnode->path.rows = 0;
+		pathnode->path.pathtarget->width = 0;
 	}
 
-	/*
-	 * Set width to the average width of the subpath outputs.  XXX this is
-	 * totally wrong: we should report zero if no RETURNING, else an average
-	 * of the RETURNING tlist widths.  But it's what happened historically,
-	 * and improving it is a task for another day.
-	 */
-	if (pathnode->path.rows > 0)
-		total_size /= pathnode->path.rows;
-	pathnode->path.pathtarget->width = rint(total_size);
-
+	pathnode->subpath = subpath;
 	pathnode->operation = operation;
 	pathnode->canSetTag = canSetTag;
 	pathnode->nominalRelation = nominalRelation;
-	pathnode->partitioned_rels = list_copy(partitioned_rels);
+	pathnode->rootRelation = rootRelation;
 	pathnode->partColsUpdated = partColsUpdated;
 	pathnode->resultRelations = resultRelations;
-	pathnode->subpaths = subpaths;
-	pathnode->subroots = subroots;
+	pathnode->updateColnosLists = updateColnosLists;
 	pathnode->withCheckOptionLists = withCheckOptionLists;
 	pathnode->returningLists = returningLists;
 	pathnode->rowMarks = rowMarks;
 	pathnode->onconflict = onconflict;
 	pathnode->epqParam = epqParam;
+	pathnode->mergeActionLists = mergeActionLists;
 
 	return pathnode;
 }
@@ -3519,12 +4502,14 @@ LimitPath *
 create_limit_path(PlannerInfo *root, RelOptInfo *rel,
 				  Path *subpath,
 				  Node *limitOffset, Node *limitCount,
+				  LimitOption limitOption,
 				  int64 offset_est, int64 count_est)
 {
 	LimitPath  *pathnode = makeNode(LimitPath);
 
 	pathnode->path.pathtype = T_Limit;
 	pathnode->path.parent = rel;
+	yb_assign_unique_path_node_id(root, (Path *) pathnode);
 	/* Limit doesn't project, so use source path's pathtarget */
 	pathnode->path.pathtarget = subpath->pathtarget;
 	/* For now, assume we are above any joins, so no parameterization */
@@ -3537,23 +4522,56 @@ create_limit_path(PlannerInfo *root, RelOptInfo *rel,
 	pathnode->path.startup_cost = subpath->startup_cost;
 	pathnode->path.total_cost = subpath->total_cost;
 	pathnode->path.pathkeys = subpath->pathkeys;
+	yb_propagate_fields(&pathnode->path.yb_path_info,
+						&subpath->yb_path_info);
 	pathnode->subpath = subpath;
 	pathnode->limitOffset = limitOffset;
 	pathnode->limitCount = limitCount;
+	pathnode->limitOption = limitOption;
+
+	if (subpath->ybIsHinted)
+	{
+		pathnode->path.ybIsHinted = true;
+	}
 
 	/*
 	 * Adjust the output rows count and costs according to the offset/limit.
-	 * This is only a cosmetic issue if we are at top level, but if we are
-	 * building a subquery then it's important to report correct info to the
-	 * outer planner.
-	 *
-	 * When the offset or count couldn't be estimated, use 10% of the
-	 * estimated number of rows emitted from the subpath.
-	 *
-	 * XXX we don't bother to add eval costs of the offset/limit expressions
-	 * themselves to the path costs.  In theory we should, but in most cases
-	 * those expressions are trivial and it's just not worth the trouble.
 	 */
+	adjust_limit_rows_costs(&pathnode->path.rows,
+							&pathnode->path.startup_cost,
+							&pathnode->path.total_cost,
+							offset_est, count_est);
+
+	return pathnode;
+}
+
+/*
+ * adjust_limit_rows_costs
+ *	  Adjust the size and cost estimates for a LimitPath node according to the
+ *	  offset/limit.
+ *
+ * This is only a cosmetic issue if we are at top level, but if we are
+ * building a subquery then it's important to report correct info to the outer
+ * planner.
+ *
+ * When the offset or count couldn't be estimated, use 10% of the estimated
+ * number of rows emitted from the subpath.
+ *
+ * XXX we don't bother to add eval costs of the offset/limit expressions
+ * themselves to the path costs.  In theory we should, but in most cases those
+ * expressions are trivial and it's just not worth the trouble.
+ */
+void
+adjust_limit_rows_costs(double *rows,	/* in/out parameter */
+						Cost *startup_cost, /* in/out parameter */
+						Cost *total_cost,	/* in/out parameter */
+						int64 offset_est,
+						int64 count_est)
+{
+	double		input_rows = *rows;
+	Cost		input_startup_cost = *startup_cost;
+	Cost		input_total_cost = *total_cost;
+
 	if (offset_est != 0)
 	{
 		double		offset_rows;
@@ -3561,16 +4579,16 @@ create_limit_path(PlannerInfo *root, RelOptInfo *rel,
 		if (offset_est > 0)
 			offset_rows = (double) offset_est;
 		else
-			offset_rows = clamp_row_est(subpath->rows * 0.10);
-		if (offset_rows > pathnode->path.rows)
-			offset_rows = pathnode->path.rows;
-		if (subpath->rows > 0)
-			pathnode->path.startup_cost +=
-				(subpath->total_cost - subpath->startup_cost)
-				* offset_rows / subpath->rows;
-		pathnode->path.rows -= offset_rows;
-		if (pathnode->path.rows < 1)
-			pathnode->path.rows = 1;
+			offset_rows = clamp_row_est(input_rows * 0.10);
+		if (offset_rows > *rows)
+			offset_rows = *rows;
+		if (input_rows > 0)
+			*startup_cost +=
+				(input_total_cost - input_startup_cost)
+				* offset_rows / input_rows;
+		*rows -= offset_rows;
+		if (*rows < 1)
+			*rows = 1;
 	}
 
 	if (count_est != 0)
@@ -3580,19 +4598,17 @@ create_limit_path(PlannerInfo *root, RelOptInfo *rel,
 		if (count_est > 0)
 			count_rows = (double) count_est;
 		else
-			count_rows = clamp_row_est(subpath->rows * 0.10);
-		if (count_rows > pathnode->path.rows)
-			count_rows = pathnode->path.rows;
-		if (subpath->rows > 0)
-			pathnode->path.total_cost = pathnode->path.startup_cost +
-				(subpath->total_cost - subpath->startup_cost)
-				* count_rows / subpath->rows;
-		pathnode->path.rows = count_rows;
-		if (pathnode->path.rows < 1)
-			pathnode->path.rows = 1;
+			count_rows = clamp_row_est(input_rows * 0.10);
+		if (count_rows > *rows)
+			count_rows = *rows;
+		if (input_rows > 0)
+			*total_cost = *startup_cost +
+				(input_total_cost - input_startup_cost)
+				* count_rows / input_rows;
+		*rows = count_rows;
+		if (*rows < 1)
+			*rows = 1;
 	}
-
-	return pathnode;
 }
 
 
@@ -3643,6 +4659,7 @@ reparameterize_path(PlannerInfo *root, Path *path,
 				 * the cost estimate.
 				 */
 				memcpy(newpath, ipath, sizeof(IndexPath));
+				yb_assign_unique_path_node_id(root, (Path *) newpath);
 				newpath->path.param_info =
 					get_baserel_parampathinfo(root, rel, required_outer);
 				cost_index(newpath, root, loop_count, false);
@@ -3658,6 +4675,16 @@ reparameterize_path(PlannerInfo *root, Path *path,
 														required_outer,
 														loop_count, 0);
 			}
+		case T_YbBitmapTableScan:
+			{
+				YbBitmapTablePath *bpath = (YbBitmapTablePath *) path;
+
+				return (Path *) create_yb_bitmap_table_path(root,
+															rel,
+															bpath->bitmapqual,
+															required_outer,
+															loop_count, 0);
+			}
 		case T_SubqueryScan:
 			{
 				SubqueryScanPath *spath = (SubqueryScanPath *) path;
@@ -3668,6 +4695,11 @@ reparameterize_path(PlannerInfo *root, Path *path,
 														 spath->path.pathkeys,
 														 required_outer);
 			}
+		case T_Result:
+			/* Supported only for RTE_RESULT scan paths */
+			if (IsA(path, Path))
+				return create_resultscan_path(root, rel, required_outer);
+			break;
 		case T_Append:
 			{
 				AppendPath *apath = (AppendPath *) path;
@@ -3696,11 +4728,28 @@ reparameterize_path(PlannerInfo *root, Path *path,
 				}
 				return (Path *)
 					create_append_path(root, rel, childpaths, partialpaths,
-									   required_outer,
+									   apath->path.pathkeys, required_outer,
 									   apath->path.parallel_workers,
 									   apath->path.parallel_aware,
-									   apath->partitioned_rels,
 									   -1);
+			}
+		case T_Memoize:
+			{
+				MemoizePath *mpath = (MemoizePath *) path;
+				Path	   *spath = mpath->subpath;
+
+				spath = reparameterize_path(root, spath,
+											required_outer,
+											loop_count);
+				if (spath == NULL)
+					return NULL;
+				return (Path *) create_memoize_path(root, rel,
+													spath,
+													mpath->param_exprs,
+													mpath->hash_operators,
+													mpath->singlerow,
+													mpath->binary_mode,
+													mpath->calls);
 			}
 		default:
 			break;
@@ -3746,7 +4795,7 @@ do { \
 	(path) = reparameterize_path_by_child(root, (path), child_rel); \
 	if ((path) == NULL) \
 		return NULL; \
-} while(0);
+} while(0)
 
 #define REPARAMETERIZE_CHILD_PATH_LIST(pathlist) \
 do { \
@@ -3757,7 +4806,7 @@ do { \
 		if ((pathlist) == NIL) \
 			return NULL; \
 	} \
-} while(0);
+} while(0)
 
 	Path	   *new_path;
 	ParamPathInfo *new_ppi;
@@ -3787,6 +4836,40 @@ do { \
 	switch (nodeTag(path))
 	{
 		case T_Path:
+
+			/*
+			 * If the path's restriction clauses contain lateral references to
+			 * the other relation, we can't reparameterize, because we must
+			 * not change the RelOptInfo's contents here.  (Doing so would
+			 * break things if we end up using a non-partitionwise join.)
+			 */
+			if (ris_contain_references_to(root,
+										  path->parent->baserestrictinfo,
+										  child_rel->top_parent_relids))
+				return NULL;
+
+			/*
+			 * If it's a SampleScan with tablesample parameters referencing
+			 * the other relation, we can't reparameterize, because we must
+			 * not change the RTE's contents here.  (Doing so would break
+			 * things if we end up using a non-partitionwise join.)
+			 */
+			if (path->pathtype == T_SampleScan)
+			{
+				Index		scan_relid = path->parent->relid;
+				RangeTblEntry *rte;
+
+				/* it should be a base rel with a tablesample clause... */
+				Assert(scan_relid > 0);
+				rte = planner_rt_fetch(scan_relid, root);
+				Assert(rte->rtekind == RTE_RELATION);
+				Assert(rte->tablesample != NULL);
+
+				if (contain_references_to(root, (Node *) rte->tablesample,
+										  child_rel->top_parent_relids))
+					return NULL;
+			}
+
 			FLAT_COPY_PATH(new_path, path, Path);
 			break;
 
@@ -3794,9 +4877,20 @@ do { \
 			{
 				IndexPath  *ipath;
 
+				/*
+				 * If the path's restriction clauses contain lateral
+				 * references to the other relation, we can't reparameterize,
+				 * because we must not change the IndexOptInfo's contents
+				 * here.  (Doing so would break things if we end up using a
+				 * non-partitionwise join.)
+				 */
+				if (ris_contain_references_to(root,
+											  path->parent->baserestrictinfo,
+											  child_rel->top_parent_relids))
+					return NULL;
+
 				FLAT_COPY_PATH(ipath, path, IndexPath);
 				ADJUST_CHILD_ATTRS(ipath->indexclauses);
-				ADJUST_CHILD_ATTRS(ipath->indexquals);
 				new_path = (Path *) ipath;
 			}
 			break;
@@ -3805,7 +4899,29 @@ do { \
 			{
 				BitmapHeapPath *bhpath;
 
+				/*
+				 * If the path's restriction clauses contain lateral
+				 * references to the other relation, we can't reparameterize,
+				 * because we must not change the RelOptInfo's contents here.
+				 * (Doing so would break things if we end up using a
+				 * non-partitionwise join.)
+				 */
+				if (ris_contain_references_to(root,
+											  path->parent->baserestrictinfo,
+											  child_rel->top_parent_relids))
+					return NULL;
+
 				FLAT_COPY_PATH(bhpath, path, BitmapHeapPath);
+				REPARAMETERIZE_CHILD_PATH(bhpath->bitmapqual);
+				new_path = (Path *) bhpath;
+			}
+			break;
+
+		case T_YbBitmapTablePath:
+			{
+				YbBitmapTablePath *bhpath;
+
+				FLAT_COPY_PATH(bhpath, path, YbBitmapTablePath);
 				REPARAMETERIZE_CHILD_PATH(bhpath->bitmapqual);
 				new_path = (Path *) bhpath;
 			}
@@ -3836,6 +4952,18 @@ do { \
 				ForeignPath *fpath;
 				ReparameterizeForeignPathByChild_function rfpc_func;
 
+				/*
+				 * If the path's restriction clauses contain lateral
+				 * references to the other relation, we can't reparameterize,
+				 * because we must not change the RelOptInfo's contents here.
+				 * (Doing so would break things if we end up using a
+				 * non-partitionwise join.)
+				 */
+				if (ris_contain_references_to(root,
+											  path->parent->baserestrictinfo,
+											  child_rel->top_parent_relids))
+					return NULL;
+
 				FLAT_COPY_PATH(fpath, path, ForeignPath);
 				if (fpath->fdw_outerpath)
 					REPARAMETERIZE_CHILD_PATH(fpath->fdw_outerpath);
@@ -3854,6 +4982,18 @@ do { \
 			{
 				CustomPath *cpath;
 
+				/*
+				 * If the path's restriction clauses contain lateral
+				 * references to the other relation, we can't reparameterize,
+				 * because we must not change the RelOptInfo's contents here.
+				 * (Doing so would break things if we end up using a
+				 * non-partitionwise join.)
+				 */
+				if (ris_contain_references_to(root,
+											  path->parent->baserestrictinfo,
+											  child_rel->top_parent_relids))
+					return NULL;
+
 				FLAT_COPY_PATH(cpath, path, CustomPath);
 				REPARAMETERIZE_CHILD_PATH_LIST(cpath->custom_paths);
 				if (cpath->methods &&
@@ -3869,13 +5009,15 @@ do { \
 		case T_NestPath:
 			{
 				JoinPath   *jpath;
+				NestPath   *npath;
 
-				FLAT_COPY_PATH(jpath, path, NestPath);
+				FLAT_COPY_PATH(npath, path, NestPath);
 
+				jpath = (JoinPath *) npath;
 				REPARAMETERIZE_CHILD_PATH(jpath->outerjoinpath);
 				REPARAMETERIZE_CHILD_PATH(jpath->innerjoinpath);
 				ADJUST_CHILD_ATTRS(jpath->joinrestrictinfo);
-				new_path = (Path *) jpath;
+				new_path = (Path *) npath;
 			}
 			break;
 
@@ -3918,6 +5060,17 @@ do { \
 				FLAT_COPY_PATH(apath, path, AppendPath);
 				REPARAMETERIZE_CHILD_PATH_LIST(apath->subpaths);
 				new_path = (Path *) apath;
+			}
+			break;
+
+		case T_MemoizePath:
+			{
+				MemoizePath *mpath;
+
+				FLAT_COPY_PATH(mpath, path, MemoizePath);
+				REPARAMETERIZE_CHILD_PATH(mpath->subpath);
+				ADJUST_CHILD_ATTRS(mpath->param_exprs);
+				new_path = (Path *) mpath;
 			}
 			break;
 
@@ -3988,6 +5141,7 @@ do { \
 		ADJUST_CHILD_ATTRS(new_path->pathtarget->exprs);
 	}
 
+	yb_assign_unique_path_node_id(root, new_path);
 	return new_path;
 }
 
@@ -4018,4 +5172,410 @@ reparameterize_pathlist_by_child(PlannerInfo *root,
 	}
 
 	return result;
+}
+
+/*
+ * contain_references_to
+ *		Detect whether any Vars or PlaceHolderVars in the given clause contain
+ *		lateral references to the given 'relids'.
+ */
+static bool
+contain_references_to(PlannerInfo *root, Node *clause, Relids relids)
+{
+	bool		ret = false;
+	List	   *vars;
+	ListCell   *lc;
+
+	/*
+	 * Examine all Vars and PlaceHolderVars used in the clause.
+	 *
+	 * By omitting the relevant flags, this also gives us a cheap sanity check
+	 * that no aggregates or window functions appear in the clause.  We don't
+	 * expect any of those in scan-level restrictions or tablesamples.
+	 */
+	vars = pull_var_clause(clause, PVC_INCLUDE_PLACEHOLDERS);
+	foreach(lc, vars)
+	{
+		Node	   *node = (Node *) lfirst(lc);
+
+		if (IsA(node, Var))
+		{
+			Var		   *var = (Var *) node;
+
+			if (bms_is_member(var->varno, relids))
+			{
+				ret = true;
+				break;
+			}
+		}
+		else if (IsA(node, PlaceHolderVar))
+		{
+			PlaceHolderVar *phv = (PlaceHolderVar *) node;
+			PlaceHolderInfo *phinfo = find_placeholder_info(root, phv, false);
+
+			/*
+			 * We should check both ph_eval_at (in case the PHV is to be
+			 * computed at the other relation and then laterally referenced
+			 * here) and ph_lateral (in case the PHV is to be evaluated here
+			 * but contains lateral references to the other relation).  The
+			 * former case should not occur in baserestrictinfo clauses, but
+			 * it can occur in tablesample clauses.
+			 */
+			if (bms_overlap(phinfo->ph_eval_at, relids) ||
+				bms_overlap(phinfo->ph_lateral, relids))
+			{
+				ret = true;
+				break;
+			}
+		}
+		else
+			Assert(false);
+	}
+
+	list_free(vars);
+
+	return ret;
+}
+
+/*
+ * ris_contain_references_to
+ *		Apply contain_references_to() to a list of RestrictInfos.
+ *
+ * We need extra code for this because pull_var_clause() can't descend
+ * through RestrictInfos.
+ */
+static bool
+ris_contain_references_to(PlannerInfo *root, List *rinfos, Relids relids)
+{
+	ListCell   *lc;
+
+	foreach(lc, rinfos)
+	{
+		RestrictInfo *rinfo = lfirst_node(RestrictInfo, lc);
+
+		/* Pseudoconstant clauses can't contain any Vars or PHVs */
+		if (rinfo->pseudoconstant)
+			continue;
+		if (contain_references_to(root, (Node *) rinfo->clause, relids))
+			return true;
+	}
+	return false;
+}
+
+/*
+ * YB: yb_create_unique_path
+ *
+ * Reuses create_upper_unique_path since that path already provides most of
+ * the functionality required.
+ */
+static UpperUniquePath *
+yb_create_unique_path(PlannerInfo *root,
+					  RelOptInfo *rel,
+					  Path *subpath,
+					  int numCols,
+					  double numGroups)
+{
+	UpperUniquePath *pathnode;
+
+	pathnode = create_upper_unique_path(root, rel, subpath, numCols, numGroups);
+	/*
+	 * create_upper_unique_path does not copy param info since it assumes
+	 * that join paths are all already created.
+	 * Cannot make that assumption here since this is not an upper path.
+	 * XXX: Hopefully, no other such assumptions were made.
+	 */
+	pathnode->path.param_info = subpath->param_info;
+	/* Typically there aren't many duplicate values. */
+	pathnode->path.total_cost = subpath->total_cost + cpu_operator_cost;
+	return pathnode;
+}
+
+/*
+ * YB: yb_create_distinct_index_path
+ *
+ * A distinct index scan fetches distinct values of the index's prefix. A
+ * prefix is a list of leading columns of the 'index' that we want to be
+ * distinct.
+ *
+ * Creating a distinct index scan path is similar to creating a regular index
+ * scan path. For this reason, we copy the path 'basepath' and modify it as
+ * necessary. We make the following modifications:
+ *
+ * Prefix Length
+ * =============
+ * 'yb_distinct_prefixlen' represents the minimal number of columns that can
+ * cover the necessary distinct key columns for the scan. We choose a minimal
+ * prefix since shorter prefixes are more efficient. This also means that we
+ * want to exclude trailing columns that are constant from the prefix. Constants
+ * have two key properties that make this possible.
+ *
+ * a. Constants are included in index clauses. For example, if r2 is equal to
+ * 1, r2 = 1 is always an index clause. This means that the clause always seeps
+ * past the DISTINCT pushdown operation on the DocDB side. Here, r2 is a range
+ * column of the index.
+ *
+ * b. On top of that, there is at most one distinct value of a constant, i.e.
+ * there exists at most one distinct tuple that satisfies the constant
+ * constraint for each distinct tuple of other columns. This means that the
+ * constant column need not be included in the prefix because any tuple
+ * returned by the distinct index scan must satisfy the index conditions.
+ * Constant hash columns do not make index conditions.
+ * On the other hand, this property does not necessarily hold for other index
+ * conditions, say IN queries. For example, a constraint such as r2 IN (0, 1)
+ * cannot eliminate r2 from the prefix since there can be two distinct values of
+ * r2 that satisfy the constraint. And distinct values of r1 cannot pick up
+ * both values of r2. Here, r1 and r2 are leading range columns of the index.
+ *
+ * Furthermore, DocDB requires that the prefix length be at least 1 in
+ * range-partitioned tables and at least the number of hash columns in hash
+ * partitioned tables. If the prefix length is zero because all the columns
+ * are constant, we stick a unique node on top of the path to pick at most
+ * one tuple from the scan.
+ *
+ * Cost
+ * ====
+ * Distinct index scans are so useful because they are retrieved efficiently
+ * and pull fewer tuples from the underlying storage. Hence, we need to adjust
+ * the cost accordingly. For that, we first estimate the number of distinct
+ * tuples that will be returned by the prefix and then scale down the cost of
+ * the path by the selectivity of the scan.
+ *
+ * Unique Node
+ * ===========
+ * We discussed a few scenarios where we add a Unique node on top when all
+ * the columns are constant. However, we also require one when the
+ * distinct index scan itself may return duplicate values. This can happen when
+ * the table is range-partitioned. A distinct index scan only removes duplicate
+ * values within a tablet. See the long comment inside the function for
+ * examples and further details.
+ *
+ * Uniqkeys
+ * ========
+ * Uniqkeys represents the collective set of expressions that is distinct for
+ * the distinct index scan. These keys are pivotal to prove whether the
+ * distinct index scan is distinct enough for the query. The set of uniqkeys
+ * must include all trailing constant columns even though they are not part of
+ * the prefix, because all the unique columns are necessary to prove that the
+ * keys required by the query are distinct. On the other hand, when all the
+ * columns are constant, we do not include the leading column even though it is
+ * part of the prefix, since the unique node on top ensures that the constant
+ * columns are distinct.
+ *
+ * Here, we use a separate set of keys instead of using pathkeys directly.
+ * DISTINCT possesses some key properties that makes such an approach
+ * attractive.
+ *
+ * First, DISTINCT on a superset of distinct keys requested by the query
+ * produces at least all the required data for the final result.
+ * Example: SELECT DISTINCT r1, r2 includes all the rows produced by
+ * 			SELECT DISTINCT r2
+ * On the other hand, only prefixes of sort keys can be assumed sorted.
+ * Example: When tuples are sorted by r1, r2, they are also sorted by r1
+ * 			but not r2.
+ * This difference has an important implication: prefix based distinct index
+ * scans are not just useful for DISTINCT operations on prefixes but also
+ * arbitrary subsets of index key columns.
+ *
+ * Second, DISTINCT can permute its columns without changing the result.
+ * Example: Tuples ordered by r1, r2 are not equivalent to tuples ordered by
+ * r2, r1. However, DISTINCT r1, r2 is equivalent to DISTINCT r2, r1. The
+ * columns simply have to be rearranged.
+ * Having a separate list of keys lets us avoid being held back by pathkeys
+ * machinery that prevents us from making such inferences.
+ *
+ * Third, DISTINCT can distribute more easily than sort.
+ * Example: DISTINCT t1.r, t2.r FROM t1, t2 is, in many cases, same as
+ * 			(DISTINCT r FROM t1), (DISTINCT r FROM t2)
+ * Unlike pathkeys, uniqkeys can be propagated across joins using a union
+ * of the uniqkeys of the constituent relations (bar some exceptions).
+ *
+ * 'index' is the index on which the distinct index scan is performed.
+ * 'basepath' is the index scan path that is being modified to perform a
+ * 			distinct index scan. The path is copied before modification.
+ * 'yb_distinct_prefixlen' is the prefix length, in columns, of the distinct
+ * 			index scan. This value is sent to DocDB as a scan parameter.
+ * 'yb_distinct_nkeys' is the number of pathkeys corresponding to the distinct
+ * 			prefix.
+ *
+ * Returns a polymorphic path.
+ * - either a bare distinct index scan path
+ * - or an UpperUniquePath on top of a distinct index scan path
+ */
+Path *
+yb_create_distinct_index_path(PlannerInfo *root,
+							  IndexOptInfo *index,
+							  IndexPath *basepath,
+							  int yb_distinct_prefixlen,
+							  int yb_distinct_nkeys)
+{
+	IndexPath  *pathnode = makeNode(IndexPath);
+	int			numDistinctRows;
+	bool		ignore_prefix_for_uniqkeys;
+	List	   *prefixExprs;
+	ListCell   *lc;
+	int			i;
+	Selectivity selectivity;
+	double		run_cost = 0;
+
+	/*
+	 * XXX: Memcpy'ing the index scan path the same way it is done in the
+	 * reparameterize_path function.
+	 */
+	memcpy(pathnode, basepath, sizeof(IndexPath));
+	yb_assign_unique_path_node_id(root, (Path *) pathnode);
+
+	/*
+	 * Adjust prefix length appropriately.
+	 * Prefix length must be at least max(1, index->nhashcolumns).
+	 * Input prefix length is zero => all referenced columns are constant.
+	 */
+	Assert(yb_distinct_prefixlen >= 0);
+	ignore_prefix_for_uniqkeys = false;
+	if (yb_distinct_prefixlen == 0)
+	{
+		Assert(index->nhashcolumns > 0 || yb_distinct_nkeys == 0);
+		yb_distinct_prefixlen = 1;
+		ignore_prefix_for_uniqkeys = true;
+	}
+	if (yb_distinct_prefixlen < index->nhashcolumns)
+		yb_distinct_prefixlen = index->nhashcolumns;
+	pathnode->yb_index_path_info.yb_distinct_prefixlen = yb_distinct_prefixlen;
+
+	/*
+	 * Compute the set of uniqkeys.
+	 * Ignore prefix when all columns are constant.
+	 */
+	pathnode->path.yb_path_info.yb_uniqkeys =
+		yb_get_uniqkeys(index,
+						ignore_prefix_for_uniqkeys ? 0 : yb_distinct_prefixlen);
+
+	/* Estimate cost. */
+	prefixExprs = NIL;
+	i = 0;
+	foreach(lc, index->indextlist)
+	{
+		TargetEntry *tle;
+
+		if (i >= yb_distinct_prefixlen)
+			break;
+
+		tle = (TargetEntry *) lfirst(lc);
+		prefixExprs = lappend(prefixExprs, tle->expr);
+		i++;
+	}
+	pathnode->path.rows = clamp_row_est(pathnode->path.rows);
+	numDistinctRows = estimate_num_groups(root,
+										  prefixExprs,
+										  pathnode->path.rows,
+										  NULL,
+										  NULL);
+	selectivity = ((Cost) numDistinctRows) / ((Cost) pathnode->path.rows);
+
+	run_cost = pathnode->path.total_cost - pathnode->path.startup_cost;
+	run_cost *= selectivity;
+	pathnode->path.total_cost = pathnode->path.startup_cost + run_cost;
+	pathnode->path.rows = numDistinctRows;
+	pathnode->indextotalcost *= selectivity;
+	pathnode->indexselectivity *= selectivity;
+
+	Assert(yb_distinct_prefixlen >= index->nhashcolumns);
+	/*
+	 * DocDB may return duplicate rows from different tablets.
+	 * So, attach an upper unique node in that case.
+	 *
+	 * The decision to stick a Unique node is subtler than it looks.
+	 * Here are a few examples for further understanding.
+	 * h = hash column, r = range column.
+	 *
+	 * 1. SELECT DISTINCT r2
+	 * 	  This is an example where a distinct index scan works well but
+	 * 	  still insufficient. The planner further DISTINCT'ifies the column
+	 * 	  using either sort or agg methods.
+	 * 	  As a consequence, a Unique node on top is not very helpful.
+	 * 	  More importantly, the pathkey corresponding to r2 is not part of
+	 * 	  this pathnode's pathkeys since column r2 is not a prefix.
+	 *
+	 * 2. SELECT DISTINCT r1, r2, r3 WHERE r1 = r2
+	 * 	  This is another tricky example. The prefix length here is 3 since
+	 * 	  all the keys r1, r2, r3 must be DISTINCT. However, after filtering
+	 * 	  r1 and r2 are the same, requiring the Unique node only DISTINCTify
+	 * 	  r1 and r3. This is represented by a prefix of pathnode's pathkeys
+	 * 	  corresponding to the DISTINCT prefix requested.
+	 * 	  'yb_distinct_nkeys' represents precisely this.
+	 *
+	 * 3. SELECT DISTINCT h1, h2 WHERE h1 IN (0, 1) AND h2 IN (0, 1)
+	 * 	  Easy case. YB's LSM indexes support IN clauses natively,
+	 * 	  so the corresponding pathkeys are readily available.
+	 * 	  However, do not stick a unique node on top since hash columns
+	 * 	  seperate keys across the tablets cleanly unlike range columns.
+	 *
+	 * 4. SELECT DISTINCT h1, h2, r1
+	 * 	  Almost easy. Even though the query selects a range column, a hash
+	 * 	  prefix is sufficient to cleanly separate the keys.
+	 * 	  Again, a Unique node is not necessary in this case.
+	 *
+	 * 5. SELECT DISTINCT r2 WHERE r2 = 1
+	 * 	  yb_distinct_nkeys == 0. In this case all tuples are equal to 1.
+	 * 	  Hence, 0 or 1 tuples are returned with a unique node on top.
+	 *
+	 * 6. SELECT DISTINCT h1, h2 WHERE h1 = 1 AND h2 = 1
+	 * 	  No unique node necessary.
+	 *
+	 * Informal correctness argument:
+	 * - There exists at least one hash column => No unique node necessary.
+	 * 	 i.e. Unique Node => nhashcolumns == 0.
+	 * - yb_distinct_nkeys < 0 => Keys missing from prefix.
+	 * 	 At least one key missing from prefix => No unique node necessary
+	 * 	 because the keys are not sufficiently distinct for the query anyway.
+	 * 	 i.e. Unique Node => yb_distinct_nkeys >= 0.
+	 * Hence, a unique node is unnecessary when there are hash columns or
+	 * when some keys are missing from the prefix. For simplicity, the above
+	 * argument excluded the degenerate case where all the referenced columns
+	 * are constant, in which case we do add a unique node.
+	 */
+	if (index->nhashcolumns == 0)
+	{
+		/* Range partitioned */
+		if (yb_distinct_nkeys >= 0)
+			/* pathkeys available. Can use UpperUniquePath here. */
+			return (Path *)
+				yb_create_unique_path(root, index->rel, (Path *) pathnode,
+									  yb_distinct_nkeys, numDistinctRows);
+
+		/*
+		 * Unique path cannot be added on top => possible duplicate tuples
+		 * => no uniqkeys.
+		 */
+		pathnode->path.yb_path_info.yb_uniqkeys = NIL;
+	}
+
+	return (Path *) pathnode;
+}
+
+/*
+ * Assign a unique id to the Path.
+ */
+void
+yb_assign_unique_path_node_id(PlannerInfo *root, Path *path)
+{
+	/*
+	 * Need to check if root is NULL. One would think this is never the case.
+	 * An example of when it is NULL is when an Append path is created from
+	 * set_dummy_rel_pathlist((). mark_dummy_rel() also creates an Append path
+	 * without a PlannerInfo instance.
+	 */
+	if (root == NULL && path->parent != NULL)
+	{
+		root = path->parent->ybRoot;
+	}
+
+	if (root != NULL && root->glob != NULL)
+	{
+		path->ybUniqueId = ybGetNextNodeUid(root->glob);
+
+		if (root->glob->ybHintedUids != NIL && ybIsHintedUid(root->glob, path->ybUniqueId))
+		{
+			path->ybHasHintedUid = true;
+		}
+	}
 }

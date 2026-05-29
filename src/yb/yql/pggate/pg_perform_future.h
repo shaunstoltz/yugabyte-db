@@ -1,4 +1,4 @@
-// Copyright (c) YugaByte, Inc.
+// Copyright (c) YugabyteDB, Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License"); you may not use this file except
 // in compliance with the License.  You may obtain a copy of the License at
@@ -13,37 +13,37 @@
 
 #pragma once
 
-#include <future>
-
 #include "yb/common/common_fwd.h"
+#include "yb/common/hybrid_time.h"
 
 #include "yb/util/status_fwd.h"
 
 #include "yb/yql/pggate/pg_client.h"
 
-namespace yb {
-namespace pggate {
+namespace yb::pggate {
 
 class PgSession;
 
 class PerformFuture {
  public:
+  struct Data {
+    rpc::CallResponsePtr response;
+    HybridTime used_in_txn_limit;
+  };
+
   PerformFuture() = default;
-  PerformFuture(std::future<PerformResult> future, PgSession* session, PgObjectIds&& relations);
+  PerformFuture(PerformResultFuture&& future, PgObjectIds&& relations);
   PerformFuture(PerformFuture&&) = default;
   PerformFuture& operator=(PerformFuture&&) = default;
   ~PerformFuture();
 
   bool Valid() const;
   bool Ready() const;
-  Result<rpc::CallResponsePtr> Get();
-  Result<rpc::CallResponsePtr> Get(MonoDelta* wait_time);
+  Result<Data> Get(PgSession& session);
 
  private:
-  std::future<PerformResult> future_;
-  PgSession* session_ = nullptr;
+  PerformResultFuture future_;
   PgObjectIds relations_;
 };
 
-} // namespace pggate
-} // namespace yb
+} // namespace yb::pggate

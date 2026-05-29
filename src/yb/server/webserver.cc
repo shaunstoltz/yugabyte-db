@@ -15,9 +15,9 @@
 // specific language governing permissions and limitations
 // under the License.
 //
-// The following only applies to changes made to this file as part of YugaByte development.
+// The following only applies to changes made to this file as part of YugabyteDB development.
 //
-// Portions Copyright (c) YugaByte, Inc.
+// Portions Copyright (c) YugabyteDB, Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License"); you may not use this file except
 // in compliance with the License.  You may obtain a copy of the License at
@@ -55,8 +55,6 @@
 #include <vector>
 
 #include <boost/algorithm/string.hpp>
-#include <cds/init.h>
-#include <glog/logging.h>
 #include <squeasel.h>
 
 #include "yb/gutil/dynamic_annotations.h"
@@ -71,12 +69,15 @@
 
 #include "yb/util/env.h"
 #include "yb/util/flags.h"
+#include "yb/util/logging.h"
+#include "yb/util/mem_tracker.h"
 #include "yb/util/net/net_util.h"
 #include "yb/util/net/sockaddr.h"
 #include "yb/util/scope_exit.h"
 #include "yb/util/shared_lock.h"
 #include "yb/util/status.h"
 #include "yb/util/status_format.h"
+#include "yb/util/tcmalloc_util.h"
 #include "yb/util/url-coding.h"
 #include "yb/util/zlib.h"
 
@@ -102,8 +103,18 @@ TAG_FLAG(webserver_compression_threshold_kb, advanced);
 DEFINE_UNKNOWN_bool(webserver_redirect_http_to_https, false,
             "Redirect HTTP requests to the embedded webserver to HTTPS if HTTPS is enabled.");
 
-DEFINE_test_flag(bool, mini_cluster_mode, false,
-                 "Enable special fixes for MiniCluster test cluster.");
+DEFINE_RUNTIME_bool(webserver_strict_transport_security, false,
+    "Header is cached by the browser for the specified 'max-age' and forces it to redirect any "
+    "http request to https to avoid man-in-the-middle attacks. The original http request is never "
+    "sent.");
+
+// This flag is used to give different internal mini cluster TServers different values of flags like
+// --tserver_master_addrs at least as far as seen via the /varz endpoint; this is necessary because
+// yb-controller uses this endpoint to figure out information on how to contact TServers and
+// masters.
+DEFINE_test_flag(bool, use_custom_varz, false,
+    "Cause /varz endpoint of TServers to output for selected gflags their values at "
+    "startup rather than their current values.");
 
 namespace yb {
 
@@ -137,6 +148,21 @@ class Webserver::Impl {
   void set_footer_html(const std::string& html);
 
   bool IsSecure() const;
+
+  void SetAutoFlags(std::unordered_set<std::string>&& flags) EXCLUDES(flags_mutex_);
+
+  bool ContainsAutoFlag(const std::string& flag) const EXCLUDES(flags_mutex_);
+
+  void SetFlags(std::unordered_set<std::string>&& flags) EXCLUDES(flags_mutex_);
+
+  bool ContainsFlag(const std::string& flag) const EXCLUDES(flags_mutex_);
+
+  void SetLogging(bool enable_access_logging, bool enable_tcmalloc_logging) {
+    access_logging_enabled_.store(enable_access_logging, std::memory_order_release);
+    tcmalloc_logging_enabled_.store(enable_tcmalloc_logging, std::memory_order_release);
+  }
+
+  const std::string& DocRoot() const { return opts_.doc_root; }
 
  private:
   // Container class for a list of path handler callbacks for a single URL.
@@ -187,9 +213,6 @@ class Webserver::Impl {
   // BootstrapPageHeader.
   void BootstrapPageFooter(std::stringstream* output);
 
-  static int EnterWorkerThreadCallbackStatic();
-  static void LeaveWorkerThreadCallbackStatic();
-
   // Dispatch point for all incoming requests.
   // Static so that it can act as a function pointer, and then call the next method
   static sq_callback_result_t BeginRequestCallbackStatic(struct sq_connection* connection);
@@ -238,6 +261,19 @@ class Webserver::Impl {
 
   // Mutex guarding against concurrenct calls to Stop().
   std::mutex stop_mutex_;
+
+  // Variable to notify handlers to stop serving requests.
+  std::atomic<bool> stop_initiated = false;
+
+  mutable std::mutex flags_mutex_;
+  // The flags that are associated with this particular server. In LTO builds we use the same
+  // process for both yb-master and yb-tserver, so the running process may have more flags than
+  // this server needs. This is used to filter out the flags that are shown in the varz UI.
+  std::unordered_set<std::string> auto_flags_ GUARDED_BY(flags_mutex_);
+  std::unordered_set<std::string> process_flags_ GUARDED_BY(flags_mutex_);
+
+  std::atomic<bool> access_logging_enabled_ = false;
+  std::atomic<bool> tcmalloc_logging_enabled_ = false;
 };
 
 Webserver::Impl::Impl(const WebserverOptions& opts, const std::string& server_name)
@@ -276,6 +312,26 @@ bool Webserver::Impl::IsSecure() const {
   return !opts_.certificate_file.empty();
 }
 
+void Webserver::Impl::SetAutoFlags(std::unordered_set<std::string>&& flags) {
+  std::lock_guard l(flags_mutex_);
+  auto_flags_ = std::move(flags);
+}
+
+bool Webserver::Impl::ContainsAutoFlag(const std::string& flag) const {
+  std::lock_guard l(flags_mutex_);
+  return auto_flags_.contains(flag);
+}
+
+void Webserver::Impl::SetFlags(std::unordered_set<std::string>&& flags) {
+  std::lock_guard l(flags_mutex_);
+  process_flags_ = std::move(flags);
+}
+
+bool Webserver::Impl::ContainsFlag(const std::string& flag) const {
+  std::lock_guard l(flags_mutex_);
+  return process_flags_.contains(flag);
+}
+
 Status Webserver::Impl::BuildListenSpec(string* spec) const {
   std::vector<Endpoint> endpoints;
   RETURN_NOT_OK(ParseAddressList(http_address_, 80, &endpoints));
@@ -302,6 +358,10 @@ Status Webserver::Impl::BuildListenSpec(string* spec) const {
 
 Status Webserver::Impl::Start() {
   LOG(INFO) << "Starting webserver on " << http_address_;
+
+  // Mini-cluster tests can restart the webserver by calling Stop() and Start() on the same instance
+  // of the webserver. To support this, reset the state that was set during the previous shutdown.
+  stop_initiated = false;
 
   vector<const char*> options;
 
@@ -334,6 +394,18 @@ Status Webserver::Impl::Start() {
     // We already initialize OpenSSL, so no need for Squeasel to do it.
     options.push_back("ssl_global_init");
     options.push_back("no");
+
+    if (opts_.ssl_ciphers.c_str()) {
+      LOG(INFO) << "Webserver: Setting ssl_ciphers to " << opts_.ssl_ciphers;
+      options.push_back("ssl_ciphers");
+      options.push_back(opts_.ssl_ciphers.c_str());
+    }
+
+    if (opts_.ssl_min_version.c_str()) {
+      LOG(INFO) << "Webserver: Setting ssl_min_version to " << opts_.ssl_min_version;
+      options.push_back("ssl_min_version");
+      options.push_back(opts_.ssl_min_version.c_str());
+    }
   }
 
   if (!opts_.authentication_domain.empty()) {
@@ -376,8 +448,6 @@ Status Webserver::Impl::Start() {
   memset(&callbacks, 0, sizeof(callbacks));
   callbacks.begin_request = &Webserver::Impl::BeginRequestCallbackStatic;
   callbacks.log_message = &Webserver::Impl::LogMessageCallbackStatic;
-  callbacks.enter_worker_thread = &Webserver::Impl::EnterWorkerThreadCallbackStatic;
-  callbacks.leave_worker_thread = &Webserver::Impl::LeaveWorkerThreadCallbackStatic;
 
   // To work around not being able to pass member functions as C callbacks, we store a
   // pointer to this server in the per-server state, and register a static method as the
@@ -417,11 +487,19 @@ Status Webserver::Impl::Start() {
 }
 
 void Webserver::Impl::Stop() {
-  std::lock_guard<std::mutex> lock_(stop_mutex_);
+  // Indicate to the handlers that they can now stop serving requests. If any further signals are
+  // received to terminate the webserver, the handlers will no longer access non-static variables
+  // and will return immediately.
+  stop_initiated = true;
+
+  std::lock_guard lock_(stop_mutex_);
   if (context_ != nullptr) {
+    LOG(INFO) << "Stopping webserver on " << http_address_;
     sq_stop(context_);
     context_ = nullptr;
   }
+
+  LOG(INFO) << "Webserver stopped";
 }
 
 Status Webserver::Impl::GetInputHostPort(HostPort* hp) const {
@@ -447,20 +525,25 @@ Status Webserver::Impl::GetBoundAddresses(std::vector<Endpoint>* addrs_ptr) cons
   }
 
   struct sockaddr_storage** sockaddrs = nullptr;
-  int num_addrs;
+  int num_addrs = 0;
 
   if (sq_get_bound_addresses(context_, &sockaddrs, &num_addrs)) {
     return STATUS(NetworkError, "Unable to get bound addresses from Mongoose");
   }
-  auto cleanup = ScopeExit([sockaddrs, num_addrs] {
-    if (!sockaddrs) {
-      return;
-    }
-    for (int i = 0; i < num_addrs; ++i) {
-      free(sockaddrs[i]);
-    }
-    free(sockaddrs);
-  });
+
+  if (!num_addrs) {
+    return Status::OK();
+  }
+  DCHECK(sockaddrs);
+
+  ScopeExit cleanup{
+    [sockaddrs, num_addrs] {
+      for (int i = 0; i < num_addrs; ++i) {
+        free(sockaddrs[i]);
+      }
+      free(sockaddrs);
+    }};
+
   auto& addrs = *addrs_ptr;
   addrs.resize(num_addrs);
 
@@ -481,7 +564,7 @@ Status Webserver::Impl::GetBoundAddresses(std::vector<Endpoint>* addrs_ptr) cons
         break;
       }
       default: {
-        LOG(ERROR) << "Unexpected address family: " << sockaddrs[i]->ss_family;
+        LOG(DFATAL) << "Unexpected address family: " << sockaddrs[i]->ss_family;
         RSTATUS_DCHECK(false, IllegalState, "Unexpected address family");
         break;
       }
@@ -528,12 +611,37 @@ sq_callback_result_t Webserver::Impl::BeginRequestCallback(struct sq_connection*
     handler = it->second;
   }
 
-  return RunPathHandler(*handler, connection, request_info);
+  if (access_logging_enabled_.load(std::memory_order_acquire)) {
+    string params = request_info->query_string ? Format("?$0", request_info->query_string) : "";
+    LOG(INFO) << "webserver request: " << request_info->uri << params;
+  }
+
+  sq_callback_result_t result = RunPathHandler(*handler, connection, request_info);
+  MemTracker::GcTcmallocIfNeeded();
+
+#if YB_TCMALLOC_ENABLED
+  if (tcmalloc_logging_enabled_.load(std::memory_order_acquire))
+    LOG(INFO) << "webserver tcmalloc stats:"
+              << " heap size bytes: " << GetTCMallocPhysicalBytesUsed()
+              << ", total physical bytes: " << GetTCMallocCurrentHeapSizeBytes()
+              << ", current allocated bytes: " << GetTCMallocCurrentAllocatedBytes()
+              << ", page heap free bytes: " << GetTCMallocPageHeapFreeBytes()
+              << ", page heap unmapped bytes: " << GetTCMallocPageHeapUnmappedBytes();
+#endif
+
+  return result;
 }
 
 sq_callback_result_t Webserver::Impl::RunPathHandler(const PathHandler& handler,
                                                      struct sq_connection* connection,
                                                      struct sq_request_info* request_info) {
+  constexpr auto SERVICE_UNAVAILABLE_MSG = "HTTP/1.1 503 Service Unavailable\r\n\r\n";
+  // If we're in the process of stopping, do not parse or route the request. Just return.
+  if (PREDICT_FALSE(stop_initiated)) {
+    sq_printf(connection, SERVICE_UNAVAILABLE_MSG);
+    return SQ_HANDLED_CLOSE_CONNECTION;
+  }
+
   // Should we render with css styles?
   bool use_style = true;
 
@@ -544,7 +652,7 @@ sq_callback_result_t Webserver::Impl::RunPathHandler(const PathHandler& handler,
     BuildArgumentMap(request_info->query_string, &req.parsed_args);
   }
 
-  if (FLAGS_TEST_mini_cluster_mode) {
+  if (FLAGS_TEST_use_custom_varz) {
     // Pass custom G-flags into the request handler.
     req.parsed_args["TEST_custom_varz"] = opts_.TEST_custom_varz;
   }
@@ -598,7 +706,7 @@ sq_callback_result_t Webserver::Impl::RunPathHandler(const PathHandler& handler,
   for (const PathHandlerCallback& callback_ : handler.callbacks()) {
     callback_(req, resp_ptr);
     if (resp_ptr->code == 503) {
-      sq_printf(connection, "HTTP/1.1 503 Service Unavailable\r\n");
+      sq_printf(connection, SERVICE_UNAVAILABLE_MSG);
       return SQ_HANDLED_CLOSE_CONNECTION;
     }
   }
@@ -634,23 +742,25 @@ sq_callback_result_t Webserver::Impl::RunPathHandler(const PathHandler& handler,
     }
   }
 
+  // Generating headers and response.
   string str = output->str();
-  // Without styling, render the page as plain text
-  if (!use_style) {
-    sq_printf(connection, "HTTP/1.1 200 OK\r\n"
-              "Content-Type: text/plain\r\n"
-              "Content-Length: %zd\r\n"
-              "%s"
-              "Access-Control-Allow-Origin: *\r\n"
-              "\r\n", str.length(), is_compressed ? "Content-Encoding: gzip\r\n" : "");
-  } else {
-    sq_printf(connection, "HTTP/1.1 200 OK\r\n"
-              "Content-Type: text/html\r\n"
-              "Content-Length: %zd\r\n"
-              "%s"
-              "Access-Control-Allow-Origin: *\r\n"
-              "\r\n", str.length(), is_compressed ? "Content-Encoding: gzip\r\n" : "");
-  }
+  auto content_type = use_style ? "text/html" : "text/plain";
+  auto content_encoding = is_compressed ? "Content-Encoding: gzip\r\n" : "";
+  auto hsts = IsSecure() && FLAGS_webserver_strict_transport_security
+                  ? "Strict-Transport-Security: max-age=31536000\r\n"
+                  : "";
+
+  sq_printf(
+      connection,
+      "HTTP/1.1 200 OK\r\n"
+      "Content-Type: %s\r\n"
+      "Content-Length: %zd\r\n"
+      "X-Content-Type-Options: nosniff\r\n"
+      "%s"
+      "%s"
+      "Access-Control-Allow-Origin: *\r\n"
+      "\r\n",
+      content_type, str.length(), content_encoding, hsts);
 
   // Make sure to use sq_write for printing the body; sq_printf truncates at 8kb
   sq_write(connection, str.c_str(), str.length());
@@ -663,7 +773,7 @@ void Webserver::Impl::RegisterPathHandler(const string& path,
                                           bool is_styled,
                                           bool is_on_nav_bar,
                                           const std::string icon) {
-  std::lock_guard<std::shared_timed_mutex> lock(lock_);
+  std::lock_guard lock(lock_);
   auto it = path_handlers_.find(path);
   if (it == path_handlers_.end()) {
     it = path_handlers_.insert(
@@ -681,6 +791,8 @@ const char* const PAGE_HEADER = "<!DOCTYPE html>"
 "    <link href='/bootstrap/css/bootstrap-theme.min.css' rel='stylesheet' media='screen' />"
 "    <link href='/font-awesome/css/font-awesome.min.css' rel='stylesheet' media='screen' />"
 "    <link href='/yb.css' rel='stylesheet' media='screen' />"
+"    <script src='/libs/jquery/3.7.0/jquery-3.7.0.min.js'></script>"
+"    <script type='text/javascript' src='/collapse.js'></script>"
 "  </head>"
 "\n"
 "<body>"
@@ -724,7 +836,7 @@ bool Webserver::Impl::static_pages_available() const {
 }
 
 void Webserver::Impl::set_footer_html(const std::string& html) {
-  std::lock_guard<std::shared_timed_mutex> l(lock_);
+  std::lock_guard l(lock_);
   footer_html_ = html;
 }
 
@@ -737,19 +849,6 @@ void Webserver::Impl::BootstrapPageFooter(stringstream* output) {
     *output << "</div></footer>";
   }
   *output << "</body></html>\n";
-}
-
-int Webserver::Impl::EnterWorkerThreadCallbackStatic() {
-  try {
-    cds::threading::Manager::attachThread();
-  } catch (const std::system_error&) {
-    return 1;
-  }
-  return 0;
-}
-
-void Webserver::Impl::LeaveWorkerThreadCallbackStatic() {
-  cds::threading::Manager::detachThread();
 }
 
 Webserver::Webserver(const WebserverOptions& opts, const std::string& server_name)
@@ -774,6 +873,10 @@ Status Webserver::GetInputHostPort(HostPort* hp) const {
   return impl_->GetInputHostPort(hp);
 }
 
+void Webserver::SetLogging(bool enable_access_logging, bool enable_tcmalloc_logging) {
+  impl_->SetLogging(enable_access_logging, enable_tcmalloc_logging);
+}
+
 void Webserver::RegisterPathHandler(const std::string& path,
                                     const std::string& alias,
                                     const PathHandlerCallback& callback,
@@ -791,4 +894,21 @@ bool Webserver::IsSecure() const {
   return impl_->IsSecure();
 }
 
+void Webserver::SetAutoFlags(std::unordered_set<std::string>&& flags) {
+  impl_->SetAutoFlags(std::move(flags));
+}
+
+bool Webserver::ContainsAutoFlag(const std::string& flag) const {
+  return impl_->ContainsAutoFlag(flag);
+}
+
+void Webserver::SetFlags(std::unordered_set<std::string>&& flags) {
+  impl_->SetFlags(std::move(flags));
+}
+
+bool Webserver::ContainsFlag(const std::string& flag) const { return impl_->ContainsFlag(flag); }
+
+const std::string& Webserver::DocRoot() const {
+  return impl_->DocRoot();
+}
 } // namespace yb

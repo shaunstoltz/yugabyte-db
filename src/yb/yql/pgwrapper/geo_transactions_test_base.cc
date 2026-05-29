@@ -1,4 +1,4 @@
-// Copyright (c) YugaByte, Inc.
+// Copyright (c) YugabyteDB, Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License"); you may not use this file except
 // in compliance with the License.  You may obtain a copy of the License at
@@ -15,12 +15,19 @@
 #include "yb/client/transaction_pool.h"
 #include "yb/client/yb_table_name.h"
 
+#include "yb/master/catalog_entity_info.h"
 #include "yb/master/catalog_entity_info.pb.h"
+#include "yb/master/catalog_manager_if.h"
 #include "yb/master/master_defaults.h"
+#include "yb/master/mini_master.h"
+#include "yb/master/ts_descriptor.h"
+
+#include "yb/tablet/tablet_peer.h"
 
 #include "yb/tserver/tablet_server.h"
 
 #include "yb/util/backoff_waiter.h"
+#include "yb/util/tsan_util.h"
 
 #include "yb/yql/pgwrapper/geo_transactions_test_base.h"
 
@@ -38,15 +45,14 @@ DECLARE_bool(enable_ysql_tablespaces_for_placement);
 DECLARE_bool(force_global_transactions);
 DECLARE_bool(TEST_track_last_transaction);
 DECLARE_bool(TEST_name_transaction_tables_with_tablespace_id);
+DECLARE_int32(min_leader_stepdown_retry_interval_ms);
+DECLARE_bool(skip_prefix_locks);
 
-namespace yb {
-
-namespace client {
-
+namespace yb::client {
 namespace {
 
-const auto kStatusTabletCacheRefreshTimeout = MonoDelta::FromMilliseconds(20000);
-const auto kWaitLoadBalancerTimeout = MonoDelta::FromMilliseconds(30000);
+const auto kStatusTabletCacheRefreshTimeout = MonoDelta::FromMilliseconds(20000) * kTimeMultiplier;
+const auto kWaitLoadBalancerTimeout = MonoDelta::FromMilliseconds(60000) * kTimeMultiplier;
 
 }
 
@@ -61,7 +67,7 @@ void GeoTransactionsTestBase::SetUp() {
   ANNOTATE_UNPROTECTED_WRITE(FLAGS_TEST_track_last_transaction) = true;
   // These don't get set in automatically in tests.
   ANNOTATE_UNPROTECTED_WRITE(FLAGS_placement_cloud) = "cloud0";
-  ANNOTATE_UNPROTECTED_WRITE(FLAGS_placement_region) = "rack1";
+  ANNOTATE_UNPROTECTED_WRITE(FLAGS_placement_region) = "region1";
   ANNOTATE_UNPROTECTED_WRITE(FLAGS_placement_zone) = "zone";
   // Put everything in the same cloud.
   ANNOTATE_UNPROTECTED_WRITE(FLAGS_TEST_nodes_per_cloud) = 14;
@@ -73,8 +79,17 @@ void GeoTransactionsTestBase::SetUp() {
   ANNOTATE_UNPROTECTED_WRITE(FLAGS_load_balancer_max_concurrent_removals) = 10;
   ANNOTATE_UNPROTECTED_WRITE(FLAGS_load_balancer_max_concurrent_moves) = 10;
   ANNOTATE_UNPROTECTED_WRITE(FLAGS_load_balancer_max_concurrent_moves_per_table) = 10;
+  ANNOTATE_UNPROTECTED_WRITE(FLAGS_min_leader_stepdown_retry_interval_ms) = 0;
+  // disable skip_prefix_locks because serializable is being used
+  ANNOTATE_UNPROTECTED_WRITE(FLAGS_skip_prefix_locks) = false;
 
   pgwrapper::PgMiniTestBase::SetUp();
+  InitTransactionManagerAndPool();
+  // Wait for system.transactions to be created.
+  WaitForStatusTabletsVersion(1);
+}
+
+void GeoTransactionsTestBase::InitTransactionManagerAndPool() {
   transaction_pool_ = nullptr;
   for (size_t i = 0; i != cluster_->num_tablet_servers(); ++i) {
     auto mini_ts = cluster_->mini_tablet_server(i);
@@ -85,15 +100,6 @@ void GeoTransactionsTestBase::SetUp() {
     }
   }
   ASSERT_NE(transaction_pool_, nullptr);
-
-  // Wait for system.transactions to be created.
-  WaitForStatusTabletsVersion(1);
-}
-
-const std::shared_ptr<tserver::MiniTabletServer> GeoTransactionsTestBase::PickPgTabletServer(
-    const MiniCluster::MiniTabletServers& servers) {
-  // Force postgres to run on first TS.
-  return servers[0];
 }
 
 uint64_t GeoTransactionsTestBase::GetCurrentVersion() {
@@ -104,12 +110,12 @@ void GeoTransactionsTestBase::CreateTransactionTable(int region) {
   auto current_version = GetCurrentVersion();
 
   std::string name = strings::Substitute("transactions_region$0", region);
-  master::ReplicationInfoPB replication_info;
+  ReplicationInfoPB replication_info;
   auto replicas = replication_info.mutable_live_replicas();
   replicas->set_num_replicas(1);
   auto pb = replicas->add_placement_blocks();
   pb->mutable_cloud_info()->set_placement_cloud("cloud0");
-  pb->mutable_cloud_info()->set_placement_region(strings::Substitute("rack$0", region));
+  pb->mutable_cloud_info()->set_placement_region(strings::Substitute("region$0", region));
   pb->mutable_cloud_info()->set_placement_zone("zone");
   pb->set_min_num_replicas(1);
   ASSERT_OK(client_->CreateTransactionsStatusTable(name, &replication_info));
@@ -118,20 +124,25 @@ void GeoTransactionsTestBase::CreateTransactionTable(int region) {
 }
 
 Result<TableId> GeoTransactionsTestBase::GetTransactionTableId(int region) {
-  std::string name = strings::Substitute("transactions_region$0", region);
-  auto table_name = YBTableName(YQL_DATABASE_CQL, master::kSystemNamespaceName, name);
-  return client::GetTableId(client_.get(), table_name);
+  return GetTransactionTableId(Format("transactions_region$0", region));
 }
 
-void GeoTransactionsTestBase::StartDeleteTransactionTable(int region) {
+Result<TableId> GeoTransactionsTestBase::GetTransactionTableId(const std::string& name) {
+  return client::GetTableId(
+      client_.get(), YBTableName(YQL_DATABASE_CQL, master::kSystemNamespaceName, name));
+}
+
+void GeoTransactionsTestBase::StartDeleteTransactionTable(std::string_view tablespace) {
   auto current_version = GetCurrentVersion();
-  auto table_id = ASSERT_RESULT(GetTransactionTableId(region));
+  auto tablespace_oid = ASSERT_RESULT(GetTablespaceOid(tablespace));
+  auto table_id = ASSERT_RESULT(GetTransactionTableId(Format("transactions_$0", tablespace_oid)));
   ASSERT_OK(client_->DeleteTable(table_id, false /* wait */));
   WaitForStatusTabletsVersion(current_version + 1);
 }
 
-void GeoTransactionsTestBase::WaitForDeleteTransactionTableToFinish(int region) {
-  auto table_id = GetTransactionTableId(region);
+void GeoTransactionsTestBase::WaitForDeleteTransactionTableToFinish(std::string_view tablespace) {
+  auto tablespace_oid = ASSERT_RESULT(GetTablespaceOid(tablespace));
+  auto table_id = GetTransactionTableId(Format("transactions_$0", tablespace_oid));
   if (!table_id.ok() && table_id.status().IsNotFound()) {
     return;
   }
@@ -143,17 +154,17 @@ void GeoTransactionsTestBase::CreateMultiRegionTransactionTable() {
   auto current_version = GetCurrentVersion();
 
   std::string name = strings::Substitute("transactions_multiregion");
-  master::ReplicationInfoPB replication_info;
+  ReplicationInfoPB replication_info;
   auto replicas = replication_info.mutable_live_replicas();
   replicas->set_num_replicas(3);
   auto pb = replicas->add_placement_blocks();
   pb->mutable_cloud_info()->set_placement_cloud("cloud0");
-  pb->mutable_cloud_info()->set_placement_region("rack1");
+  pb->mutable_cloud_info()->set_placement_region("region1");
   pb->mutable_cloud_info()->set_placement_zone("zone");
   pb->set_min_num_replicas(1);
   pb = replicas->add_placement_blocks();
   pb->mutable_cloud_info()->set_placement_cloud("cloud0");
-  pb->mutable_cloud_info()->set_placement_region("rack2");
+  pb->mutable_cloud_info()->set_placement_region("region2");
   pb->mutable_cloud_info()->set_placement_zone("zone");
   pb->set_min_num_replicas(1);
   ASSERT_OK(client_->CreateTransactionsStatusTable(name, &replication_info));
@@ -161,8 +172,27 @@ void GeoTransactionsTestBase::CreateMultiRegionTransactionTable() {
   WaitForStatusTabletsVersion(current_version + 1);
 }
 
-void GeoTransactionsTestBase::SetupTables(size_t tables_per_region) {
+void GeoTransactionsTestBase::SetupTablespaces() {
   // Create tablespaces and tables.
+  ANNOTATE_UNPROTECTED_WRITE(FLAGS_force_global_transactions) = true;
+
+  auto conn = ASSERT_RESULT(Connect());
+  for (size_t i = 1; i <= NumRegions(); ++i) {
+    ASSERT_OK(conn.ExecuteFormat(R"#(
+        CREATE TABLESPACE tablespace$0 WITH (replica_placement='{
+          "num_replicas": 1,
+          "placement_blocks":[{
+            "cloud": "cloud0",
+            "region": "region$0",
+            "zone": "zone",
+            "min_num_replicas": 1
+          }]
+        }')
+    )#", i));
+  }
+}
+void GeoTransactionsTestBase::SetupTables(size_t tables_per_region) {
+  // Create tables.
   ANNOTATE_UNPROTECTED_WRITE(FLAGS_force_global_transactions) = true;
   tables_per_region_ = tables_per_region;
 
@@ -170,22 +200,32 @@ void GeoTransactionsTestBase::SetupTables(size_t tables_per_region) {
   bool wait_for_hash = ANNOTATE_UNPROTECTED_READ(FLAGS_auto_create_local_transaction_tables);
   auto current_version = GetCurrentVersion();
   for (size_t i = 1; i <= NumRegions(); ++i) {
-    ASSERT_OK(conn.ExecuteFormat(R"#(
-        CREATE TABLESPACE tablespace$0 WITH (replica_placement='{
-          "num_replicas": 1,
-          "placement_blocks":[{
-            "cloud": "cloud0",
-            "region": "rack$0",
-            "zone": "zone",
-            "min_num_replicas": 1
-          }]
-        }')
-    )#", i));
-
     for (size_t j = 1; j <= tables_per_region; ++j) {
       ASSERT_OK(conn.ExecuteFormat(
-          "CREATE TABLE $0$1_$2(value int) TABLESPACE tablespace$1", kTablePrefix, i, j));
+          "CREATE TABLE $0$1_$2(value int, other_value int) TABLESPACE tablespace$1",
+          kTablePrefix, i, j));
     }
+
+    if (wait_for_hash) {
+      WaitForStatusTabletsVersion(current_version + 1);
+      ++current_version;
+    }
+  }
+}
+
+void GeoTransactionsTestBase::SetupTablesAndTablespaces(size_t tables_per_region) {
+  SetupTablespaces();
+  SetupTables(tables_per_region);
+}
+
+void GeoTransactionsTestBase::DropTablespaces() {
+  // Drop tablespaces.
+  ANNOTATE_UNPROTECTED_WRITE(FLAGS_force_global_transactions) = true;
+  auto conn = ASSERT_RESULT(Connect());
+  bool wait_for_hash = ANNOTATE_UNPROTECTED_READ(FLAGS_auto_create_local_transaction_tables);
+  uint64_t current_version = GetCurrentVersion();
+  for (size_t i = 1; i <= NumRegions(); ++i) {
+    ASSERT_OK(conn.ExecuteFormat("DROP TABLESPACE tablespace$0", i));
 
     if (wait_for_hash) {
       WaitForStatusTabletsVersion(current_version + 1);
@@ -195,22 +235,18 @@ void GeoTransactionsTestBase::SetupTables(size_t tables_per_region) {
 }
 
 void GeoTransactionsTestBase::DropTables() {
-  // Drop tablespaces and tables.
-  ANNOTATE_UNPROTECTED_WRITE(FLAGS_force_global_transactions) = true;
+  // Drop tables.
   auto conn = ASSERT_RESULT(Connect());
-  bool wait_for_hash = ANNOTATE_UNPROTECTED_READ(FLAGS_auto_create_local_transaction_tables);
-  uint64_t current_version = GetCurrentVersion();
-  for (size_t i = 1; i <= NumTabletServers(); ++i) {
+  for (size_t i = 1; i <= NumRegions(); ++i) {
     for (size_t j = 1; j <= tables_per_region_; ++j) {
       ASSERT_OK(conn.ExecuteFormat("DROP TABLE $0$1_$2", kTablePrefix, i, j));
     }
-    ASSERT_OK(conn.ExecuteFormat("DROP TABLESPACE tablespace$0", i));
-
-    if (wait_for_hash) {
-      WaitForStatusTabletsVersion(current_version + 1);
-      ++current_version;
-    }
   }
+}
+
+void GeoTransactionsTestBase::DropTablesAndTablespaces() {
+  DropTables();
+  DropTablespaces();
 }
 
 void GeoTransactionsTestBase::WaitForStatusTabletsVersion(uint64_t version) {
@@ -234,11 +270,11 @@ void GeoTransactionsTestBase::WaitForLoadBalanceCompletion() {
 }
 
 Status GeoTransactionsTestBase::StartTabletServersByRegion(int region) {
-  return StartTabletServers(yb::Format("rack$0", region), std::nullopt /* zone_str */);
+  return StartTabletServers(yb::Format("region$0", region), std::nullopt /* zone_str */);
 }
 
 Status GeoTransactionsTestBase::ShutdownTabletServersByRegion(int region) {
-  return ShutdownTabletServers(yb::Format("rack$0", region), std::nullopt /* zone_str */);
+  return ShutdownTabletServers(yb::Format("region$0", region), std::nullopt /* zone_str */);
 }
 
 Status GeoTransactionsTestBase::StartTabletServers(
@@ -272,12 +308,94 @@ Status GeoTransactionsTestBase::StartShutdownTabletServers(
         tserver->Shutdown();
       } else {
         LOG(INFO) << "Starting tserver #" << i;
-        RETURN_NOT_OK(tserver->Start());
+        // With object locking enabled, pg connections would succeed only after RF tservers are up
+        // since opening a connection acquires few locks, which needs the capability of creating
+        // YBTransaction(s), which in turn requires the existence of YB transaction table. Hence
+        // dont't wait for pg connections here.
+        RETURN_NOT_OK(tserver->Start(tserver::WaitTabletsBootstrapped::kFalse));
       }
     }
   }
   return Status::OK();
 }
 
-} // namespace client
-} // namespace yb
+void GeoTransactionsTestBase::ValidateAllTabletLeaderInZone(std::vector<TabletId> tablet_uuids,
+                                                            int region) {
+  ASSERT_TRUE(AllTabletLeaderInZone(std::move(tablet_uuids), region));
+}
+
+bool GeoTransactionsTestBase::AllTabletLeaderInZone(
+    std::vector<TabletId> tablet_uuids, int region) {
+  std::string region_str = Format("region$0", region);
+  std::sort(tablet_uuids.begin(), tablet_uuids.end());
+  auto peers = ListTabletPeers(cluster_.get(), ListPeersFilter::kLeaders);
+  for (const auto& peer : peers) {
+    if (!std::binary_search(tablet_uuids.begin(), tablet_uuids.end(), peer->tablet_id())) {
+      continue;
+    }
+    auto ts = cluster_->find_tablet_server(peer->permanent_uuid());
+    ServerRegistrationPB reg;
+    CHECK_OK(ts->server()->GetRegistration(&reg));
+    if (reg.cloud_info().placement_region() != region_str) {
+      LOG(INFO) << Format(
+          "T $0 P $1: $2 in wrong zone", peer->tablet_id(), peer->permanent_uuid(), reg);
+      return false;
+    }
+  }
+  return true;
+}
+
+Result<PgTablespaceOid> GeoTransactionsTestBase::GetTablespaceOid(
+    std::string_view tablespace) const {
+  auto conn = VERIFY_RESULT(Connect());
+  return conn.FetchRow<pgwrapper::PGOid>(Format(
+      "SELECT oid FROM pg_catalog.pg_tablespace WHERE spcname = '$0'", tablespace));
+}
+
+Result<PgTablespaceOid> GeoTransactionsTestBase::GetTablespaceOidForRegion(int region) const {
+  return GetTablespaceOid("tablespace"s + std::to_string(region));
+}
+
+Result<std::vector<TabletId>> GeoTransactionsTestBase::GetStatusTabletsWithTableName(
+    const std::string& local_txn_table, ExpectedLocality locality) {
+  YBTableName table_name;
+  if (locality == ExpectedLocality::kNoCheck) {
+    return std::vector<TabletId>();
+  } else if (locality == ExpectedLocality::kGlobal) {
+    table_name = YBTableName(
+        YQL_DATABASE_CQL, master::kSystemNamespaceName, kGlobalTransactionsTableName);
+  } else {
+    table_name = YBTableName(
+        YQL_DATABASE_CQL, master::kSystemNamespaceName, local_txn_table);
+  }
+  std::vector<TabletId> tablet_uuids;
+  RETURN_NOT_OK(client_->GetTablets(
+      table_name, 1000 /* max_tablets */, &tablet_uuids, nullptr /* ranges */));
+  return tablet_uuids;
+}
+
+Result<std::vector<TabletId>> GeoTransactionsTestBase::GetStatusTablets(
+    std::string_view tablespace, ExpectedLocality locality) {
+  auto tablespace_oid = EXPECT_RESULT(GetTablespaceOid(tablespace));
+  return GetStatusTabletsWithTableName(Format("transactions_$0", tablespace_oid), locality);
+}
+
+Result<std::vector<TabletId>> GeoTransactionsTestBase::GetStatusTablets(
+    int region, ExpectedLocality locality) {
+  if (ANNOTATE_UNPROTECTED_READ(FLAGS_auto_create_local_transaction_tables)) {
+    auto tablespace_oid = EXPECT_RESULT(GetTablespaceOidForRegion(region));
+    return GetStatusTabletsWithTableName(Format("transactions_$0", tablespace_oid), locality);
+  } else {
+    return GetStatusTabletsWithTableName(Format("transactions_region$0", region), locality);
+  }
+}
+
+Status GeoTransactionsTestBase::WarmupTablespaceCache(
+    pgwrapper::PGConn& conn, std::string_view table) {
+  // Force tablespace information into cache.
+  // The purpose of ROLLBACK is to to ensure that in case object locking is enabled YB txn
+  // will not be reused.
+  return conn.ExecuteFormat("BEGIN;SELECT * FROM $0 LIMIT 1;ROLLBACK", table);
+}
+
+} // namespace yb::client

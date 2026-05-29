@@ -1,4 +1,4 @@
-// Copyright (c) YugaByte, Inc.
+// Copyright (c) YugabyteDB, Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License"); you may not use this file except
 // in compliance with the License.  You may obtain a copy of the License at
@@ -13,18 +13,22 @@
 
 #include "yb/tserver/db_server_base.h"
 
-#include "yb/client/async_initializer.h"
+#include "yb/client/client.h"
 #include "yb/client/transaction_manager.h"
 #include "yb/client/transaction_pool.h"
 
+#include "yb/common/init.h"
+
+#include "yb/common/wire_protocol.h"
+#include "yb/server/async_client_initializer.h"
 #include "yb/server/clock.h"
 
 #include "yb/tserver/tserver_util_fwd.h"
 #include "yb/tserver/tserver_shared_mem.h"
 
-#include "yb/util/init.h"
+#include "yb/util/jsonwriter.h"
+#include "yb/util/metrics.h"
 #include "yb/util/mem_tracker.h"
-#include "yb/util/scope_exit.h"
 #include "yb/util/shared_mem.h"
 #include "yb/util/status_log.h"
 
@@ -35,8 +39,7 @@ DbServerBase::DbServerBase(
     std::string name, const server::ServerBaseOptions& options,
     const std::string& metrics_namespace, std::shared_ptr<MemTracker> mem_tracker)
     : RpcAndWebServerBase(std::move(name), options, metrics_namespace, std::move(mem_tracker)),
-      shared_object_(new tserver::TServerSharedObject(
-          CHECK_RESULT(tserver::TServerSharedObject::Create()))) {
+      shared_mem_manager_(new SharedMemoryManager()) {
   MemTracker::GetRootTracker()->LogMemoryLimits();
 }
 
@@ -46,17 +49,26 @@ DbServerBase::~DbServerBase() {
 Status DbServerBase::Init() {
   RETURN_NOT_OK(RpcAndWebServerBase::Init());
 
-  async_client_init_ = std::make_unique<client::AsyncClientInitialiser>(
+  async_client_init_ = std::make_unique<client::AsyncClientInitializer>(
       "server_client", default_client_timeout(), permanent_uuid(), &options(), metric_entity(),
       mem_tracker(), messenger());
   SetupAsyncClientInit(async_client_init_.get());
+
+  RETURN_NOT_OK(shared_mem_manager_->InitializeTServer(permanent_uuid()));
+
+  const auto bound_addresses = rpc_server()->GetBoundAddresses();
+  if (!bound_addresses.empty()) {
+    ServerRegistrationPB reg;
+    RETURN_NOT_OK(GetRegistration(&reg, server::RpcOnly::kTrue));
+    shared_object()->SetHostEndpoint(bound_addresses.front(), PublicHostPort(reg).host());
+  }
 
   return Status::OK();
 }
 
 Status DbServerBase::Start() {
   RETURN_NOT_OK(RpcAndWebServerBase::Start());
-  async_client_init_->Start();
+  async_client_init_->Start(clock_);
 
   std::string host_name;
   RETURN_NOT_OK(GetHostname(&host_name));
@@ -73,8 +85,20 @@ Status DbServerBase::Start() {
 }
 
 void DbServerBase::Shutdown() {
-  client::TransactionManager* txn_manager;
-  txn_manager = transaction_manager_.load();
+  if (!shutting_down_.Set()) {
+    return;
+  }
+  auto* txn_manager = transaction_manager_.load();
+  if (txn_manager) {
+    txn_manager->SetClosing();
+  }
+  // Shut down the transaction pool before the txn manager because the txn manager holds the Rpcs
+  // object used to schedule transaction rpcs. We shut down RPC objects after we shut down their
+  // clients.
+  auto* transaction_pool = transaction_pool_.load();
+  if (transaction_pool) {
+    transaction_pool->Shutdown();
+  }
   if (txn_manager) {
     txn_manager->Shutdown();
   }
@@ -104,7 +128,7 @@ client::TransactionPool& DbServerBase::TransactionPool() {
 }
 
 void DbServerBase::EnsureTransactionPoolCreated() {
-  std::lock_guard<decltype(transaction_pool_mutex_)> lock(transaction_pool_mutex_);
+  std::lock_guard lock(transaction_pool_mutex_);
   if (transaction_pool_holder_) {
     return;
   }
@@ -116,12 +140,35 @@ void DbServerBase::EnsureTransactionPoolCreated() {
   transaction_pool_.store(transaction_pool_holder_.get(), std::memory_order_release);
 }
 
-tserver::TServerSharedData& DbServerBase::shared_object() {
-  return **shared_object_;
+Status DbServerBase::StartSharedMemoryNegotiation() {
+  return shared_mem_manager_->PrepareNegotiationTServer();
 }
 
-int DbServerBase::GetSharedMemoryFd() {
-  return shared_object_->GetFd();
+Status DbServerBase::StopSharedMemoryNegotiation() {
+  return shared_mem_manager_->ShutdownNegotiator();
+}
+
+Status DbServerBase::SkipSharedMemoryNegotiation() {
+  return shared_mem_manager_->SkipNegotiation();
+}
+
+int DbServerBase::SharedMemoryNegotiationFd() {
+  return shared_mem_manager_->NegotiationFd();
+}
+
+SharedMemoryManager* DbServerBase::shared_mem_manager() {
+  return shared_mem_manager_.get();
+}
+
+ConcurrentPointerReference<TServerSharedData> DbServerBase::shared_object() const {
+  return shared_mem_manager_->SharedData();
+}
+
+void DbServerBase::WriteMainMetaCacheAsJson(JsonWriter* writer) {
+  writer->String("MainMetaCache");
+  auto local_client_future = client_future();
+  auto local_client = local_client_future.get();
+  local_client->AddMetaCacheInfo(writer);
 }
 
 }  // namespace tserver

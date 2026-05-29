@@ -1,21 +1,22 @@
 /*
  * Created on Fri Feb 25 2022
  *
- * Copyright 2021 YugaByte, Inc. and Contributors
+ * Copyright 2021 YugabyteDB, Inc. and Contributors
  * Licensed under the Polyform Free Trial License 1.0.0 (the "License")
  * You may not use this file except in compliance with the License. You may obtain a copy of the License at
  * http://github.com/YugaByte/yugabyte-db/blob/master/licenses/POLYFORM-FREE-TRIAL-LICENSE-1.0.0.txt
  */
 
-import React, { FC, useState } from 'react';
+import { FC, useState } from 'react';
 import { BootstrapTable, TableHeaderColumn } from 'react-bootstrap-table';
 import { useMutation } from 'react-query';
 import { useSelector } from 'react-redux';
 import { toast } from 'react-toastify';
 import { IBackup } from '..';
 import { YBModalForm } from '../../common/forms';
-import { assignStorageConfig } from '../common/BackupAPI';
-import { IStorageConfig } from '../common/IBackup';
+// import { assignStorageConfig } from '../../backupv2';
+import { assignStorageConfig } from '../../backupv2/common/BackupAPI';
+import { CustomerConfig } from '../common/IBackup';
 
 import './AssignBackupStorageConfig.scss';
 
@@ -30,9 +31,9 @@ export const AssignBackupStorageConfig: FC<BackupStorageConfigProps> = ({
   onHide,
   backup
 }) => {
-  const configs: IStorageConfig[] = useSelector((state: any) => state.customer.configs.data);
+  const configs: CustomerConfig[] = useSelector((state: any) => state.customer.configs.data);
 
-  const [selectedConfig, setSelectedConfig] = useState<IStorageConfig | null>(null);
+  const [selectedConfig, setSelectedConfig] = useState<CustomerConfig | null>(null);
   const [showErrMsg, setshowErrMsg] = useState(false);
   const doAssignConfig = useMutation(() => assignStorageConfig(backup!, selectedConfig!), {
     onSuccess: () => {

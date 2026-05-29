@@ -1,13 +1,13 @@
 /*
  * Created on Tue Jun 07 2022
  *
- * Copyright 2021 YugaByte, Inc. and Contributors
+ * Copyright 2021 YugabyteDB, Inc. and Contributors
  * Licensed under the Polyform Free Trial License 1.0.0 (the "License")
  * You may not use this file except in compliance with the License. You may obtain a copy of the License at
  * http://github.com/YugaByte/yugabyte-db/blob/master/licenses/POLYFORM-FREE-TRIAL-LICENSE-1.0.0.txt
  */
 
-import React, { FC } from 'react';
+import { FC } from 'react';
 import * as Yup from 'yup';
 import { Field, FormikProps } from 'formik';
 import { toast } from 'react-toastify';
@@ -17,13 +17,18 @@ import { YBModalForm } from '../../common/forms';
 import { YBFormSelect, YBNumericInput } from '../../common/forms/fields';
 import { YBLoading } from '../../common/indicators';
 import { BACKUP_API_TYPES } from '../common/IBackup';
-import { TableTypeLabel } from '../../../redesign/helpers/dtos';
 import { createPITRConfig, getNameSpaces } from '../common/PitrAPI';
+import { useInterceptBackupTaskLinks } from '../../../redesign/features/tasks/TaskUtils';
+import { AllowedTasks, TableTypeLabel } from '../../../redesign/helpers/dtos';
+import { isActionFrozen } from '../../../redesign/helpers/utils';
+import { UNIVERSE_TASKS } from '../../../redesign/helpers/constants';
+
 import './PointInTimeRecoveryEnableModal.scss';
 
 interface PointInTimeRecoveryEnableModalProps {
   universeUUID: string;
   visible: boolean;
+  allowedTasks: AllowedTasks;
   onHide: () => void;
 }
 
@@ -44,15 +49,16 @@ const initialValues: Form_Values = {
   retention_interval: 7
 };
 
-const TOAST_AUTO_CLOSE_INTERVAL = 3000; //ms
 const REFETCH_CONFIGS_INTERVAL = 5000; //ms
 
 export const PointInTimeRecoveryEnableModal: FC<PointInTimeRecoveryEnableModalProps> = ({
   universeUUID,
   visible,
+  allowedTasks,
   onHide
 }) => {
   const queryClient = useQueryClient();
+  const interceptBackupLink = useInterceptBackupTaskLinks();
 
   const { data: nameSpaces, isLoading } = useQuery(
     [universeUUID, 'namespaces'],
@@ -66,10 +72,16 @@ export const PointInTimeRecoveryEnableModal: FC<PointInTimeRecoveryEnableModalPr
     (values: any) =>
       createPITRConfig(universeUUID, values.tableType, values.keyspaceName, values.payload),
     {
-      onSuccess: (_, variables) => {
-        toast.success(`Point-in-time recovery enabled successfully for ${variables.keyspaceName}`, {
-          autoClose: TOAST_AUTO_CLOSE_INTERVAL
-        });
+      onSuccess: (resp, variables) => {
+        toast.success(
+          <span>
+            Point-in-time recovery is being enabled for {variables.keyspaceName}. Click &nbsp;
+            {interceptBackupLink(<a href={`/tasks/${resp.data.taskUUID}`} target="_blank" rel="noopener noreferrer">
+              here
+            </a>)}
+            &nbsp; for task details.
+          </span>
+        );
         //refetch after 5 secs
         setTimeout(() => {
           queryClient.invalidateQueries(['scheduled_sanpshots']);
@@ -77,9 +89,7 @@ export const PointInTimeRecoveryEnableModal: FC<PointInTimeRecoveryEnableModalPr
         onHide();
       },
       onError: (err: any) => {
-        toast.error(err?.response?.data?.error ?? 'An Error occurred', {
-          autoClose: TOAST_AUTO_CLOSE_INTERVAL
-        });
+        toast.error(err?.response?.data?.error ?? 'An Error occurred');
         onHide();
       }
     }
@@ -106,15 +116,20 @@ export const PointInTimeRecoveryEnableModal: FC<PointInTimeRecoveryEnableModalPr
 
   if (isLoading) return <YBLoading />;
 
+  const isCreateActionFrozen = isActionFrozen(allowedTasks, UNIVERSE_TASKS.ENABLE_PITR);
+
   return (
     <YBModalForm
       title="Enable Point-in-time Recovery"
       visible={visible}
       onHide={onHide}
+      isButtonDisabled={isCreateActionFrozen}
       submitLabel="Enable"
       onFormSubmit={handleSubmit}
       showCancelButton
       dialogClassName="pitr-enable-modal"
+      submitTestId="EnablePitrSubmitBtn"
+      cancelTestId="EnablePitrCancelBtn"
       initialValues={initialValues}
       validationSchema={validationSchema}
       render={({ values, setFieldValue, errors }: FormikProps<Form_Values>) => {
@@ -144,6 +159,7 @@ export const PointInTimeRecoveryEnableModal: FC<PointInTimeRecoveryEnableModalPr
                   components={{
                     IndicatorSeparator: null
                   }}
+                  id="PitrApiTypeSelector"
                 />
               </Col>
             </Row>
@@ -160,6 +176,7 @@ export const PointInTimeRecoveryEnableModal: FC<PointInTimeRecoveryEnableModalPr
                   components={{
                     IndicatorSeparator: null
                   }}
+                  id="PitrDBNameSelector"
                 />
               </Col>
             </Row>
@@ -173,7 +190,8 @@ export const PointInTimeRecoveryEnableModal: FC<PointInTimeRecoveryEnableModalPr
                       component={YBNumericInput}
                       input={{
                         onChange: (val: number) => setFieldValue('retention_interval', val),
-                        value: values['retention_interval']
+                        value: values['retention_interval'],
+                        id: 'PitrRetentionPeriodInput'
                       }}
                       minVal={2}
                     />

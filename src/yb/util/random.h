@@ -2,9 +2,9 @@
 // Use of this source code is governed by a BSD-style license that can be
 // found in the LICENSE file. See the AUTHORS file for names of contributors.
 //
-// The following only applies to changes made to this file as part of YugaByte development.
+// The following only applies to changes made to this file as part of YugabyteDB development.
 //
-// Portions Copyright (c) YugaByte, Inc.
+// Portions Copyright (c) YugabyteDB, Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License"); you may not use this file except
 // in compliance with the License.  You may obtain a copy of the License at
@@ -179,59 +179,59 @@ class ThreadSafeRandom {
   }
 
   void Reset(uint32_t s) {
-    std::lock_guard<simple_spinlock> l(lock_);
+    std::lock_guard l(lock_);
     random_.Reset(s);
   }
 
   uint32_t Next() {
-    std::lock_guard<simple_spinlock> l(lock_);
+    std::lock_guard l(lock_);
     return random_.Next();
   }
 
   uint32_t Next32() {
-    std::lock_guard<simple_spinlock> l(lock_);
+    std::lock_guard l(lock_);
     return random_.Next32();
   }
 
   uint64_t Next64() {
-    std::lock_guard<simple_spinlock> l(lock_);
+    std::lock_guard l(lock_);
     return random_.Next64();
   }
 
   uint32_t Uniform(uint32_t n) {
-    std::lock_guard<simple_spinlock> l(lock_);
+    std::lock_guard l(lock_);
     return random_.Uniform(n);
   }
 
   uint32_t Uniform32(uint32_t n) {
-    std::lock_guard<simple_spinlock> l(lock_);
+    std::lock_guard l(lock_);
     return random_.Uniform32(n);
   }
 
   uint64_t Uniform64(uint64_t n) {
-    std::lock_guard<simple_spinlock> l(lock_);
+    std::lock_guard l(lock_);
     return random_.Uniform64(n);
   }
 
   bool OneIn(int n) {
-    std::lock_guard<simple_spinlock> l(lock_);
+    std::lock_guard l(lock_);
     return random_.OneIn(n);
   }
 
   uint32_t Skewed(int max_log) {
-    std::lock_guard<simple_spinlock> l(lock_);
+    std::lock_guard l(lock_);
     return random_.Skewed(max_log);
   }
 
   double Normal(double mean, double std_dev) {
-    std::lock_guard<simple_spinlock> l(lock_);
+    std::lock_guard l(lock_);
     return random_.Normal(mean, std_dev);
   }
 
   template<class Collection, class Set, class T>
   void ReservoirSample(const Collection& c, int k, const Set& avoid,
                        std::vector<T>* result) {
-    std::lock_guard<simple_spinlock> l(lock_);
+    std::lock_guard l(lock_);
     random_.ReservoirSample(c, k, avoid, result);
   }
 

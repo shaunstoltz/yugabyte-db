@@ -15,9 +15,9 @@
 // specific language governing permissions and limitations
 // under the License.
 //
-// The following only applies to changes made to this file as part of YugaByte development.
+// The following only applies to changes made to this file as part of YugabyteDB development.
 //
-// Portions Copyright (c) YugaByte, Inc.
+// Portions Copyright (c) YugabyteDB, Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License"); you may not use this file except
 // in compliance with the License.  You may obtain a copy of the License at
@@ -36,9 +36,10 @@
 
 #include <memory>
 
-#include <glog/logging.h>
+#include "yb/util/logging.h"
 
 #include "yb/gutil/macros.h"
+#include "yb/gutil/thread_annotations.h"
 
 namespace yb {
 
@@ -50,23 +51,23 @@ class StackTrace;
 //   Acquire(), TryAcquire() - the lock isn't already held.
 //   Release() - the lock is already held by this thread.
 //
-class Mutex {
+class CAPABILITY("mutex") Mutex {
  public:
   Mutex();
   ~Mutex();
 
-  void Acquire();
-  void Release();
-  bool TryAcquire();
+  void Acquire() ACQUIRE();
+  void Release() RELEASE();
+  bool TryAcquire() TRY_ACQUIRE(true);
 
-  void lock() { Acquire(); }
-  void unlock() { Release(); }
-  bool try_lock() { return TryAcquire(); }
+  void lock() ACQUIRE() { Acquire(); }
+  void unlock() RELEASE() { Release(); }
+  bool try_lock() TRY_ACQUIRE(true) { return TryAcquire(); }
 
 #ifndef NDEBUG
-  void AssertAcquired() const;
+  void AssertAcquired() const ASSERT_CAPABILITY(this);
 #else
-  void AssertAcquired() const {}
+  void AssertAcquired() const ASSERT_CAPABILITY(this) {}
 #endif
 
  private:
@@ -89,7 +90,7 @@ class Mutex {
 };
 
 // A helper class that acquires the given Lock while the MutexLock is in scope.
-class MutexLock {
+class SCOPED_CAPABILITY MutexLock {
  public:
   struct AlreadyAcquired {};
 
@@ -100,7 +101,7 @@ class MutexLock {
   //   MutexLock l(lock_); // acquired
   //   ...
   // } // released
-  explicit MutexLock(Mutex& lock) // NOLINT
+  explicit MutexLock(Mutex& lock) ACQUIRE(lock) // NOLINT
     : lock_(&lock),
       owned_(true) {
     lock_->Acquire();
@@ -115,26 +116,26 @@ class MutexLock {
   //   MutexLock l(lock_, AlreadyAcquired());
   //   ...
   // } // released
-  MutexLock(Mutex& lock, const AlreadyAcquired&) // NOLINT
+  MutexLock(Mutex& lock, const AlreadyAcquired&) REQUIRES(lock) // NOLINT
     : lock_(&lock),
       owned_(true) {
     lock_->AssertAcquired();
   }
 
-  void Lock() {
+  void Lock() ACQUIRE() {
     DCHECK(!owned_);
     lock_->Acquire();
     owned_ = true;
   }
 
-  void Unlock() {
+  void Unlock() RELEASE() {
     DCHECK(owned_);
     lock_->AssertAcquired();
     lock_->Release();
     owned_ = false;
   }
 
-  ~MutexLock() {
+  ~MutexLock() RELEASE() {
     if (owned_) {
       Unlock();
     }

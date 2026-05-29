@@ -1,4 +1,4 @@
-// Copyright (c) YugaByte, Inc.
+// Copyright (c) YugabyteDB, Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License"); you may not use this file except
 // in compliance with the License.  You may obtain a copy of the License at
@@ -24,8 +24,6 @@ class MetricEntity;
 
 namespace client {
 
-YB_STRONGLY_TYPED_BOOL(ForceGlobalTransaction);
-
 // Pool that maintains set of preallocated ready transactions.
 // The size of the pool is auto adjusted, i.e. the more transactions we request - the more
 // transactions will be allocated.
@@ -36,14 +34,19 @@ class TransactionPool {
   TransactionPool(TransactionManager* manager, MetricEntity* metric_entity);
   ~TransactionPool();
 
-  // Tries to take a new ready transaction from the pool.
-  // If pool is empty a newly created transaction is returned.
+  void Shutdown();
+
+  // When force_create_txn == ForceCreateTransaction::kTrue, a new txn is created and returned.
+  // Else, tries to take a new ready transaction from the pool. If pool is empty a newly created
+  // transaction is returned.
   // If force_global_transaction is true, the transaction will always use a global transaction
   // status tablet.
   //
   // Ready means that transaction is registered at status tablet and intents could be written
   // immediately.
-  YBTransactionPtr Take(ForceGlobalTransaction force_global_transaction, CoarseTimePoint deadline);
+  YBTransactionPtr Take(
+      TransactionFullLocality locality, CoarseTimePoint deadline,
+      ForceCreateTransaction force_create_txn = ForceCreateTransaction::kFalse);
 
   // Takes and initializes a transaction from the pool. See Take for details.
   Result<YBTransactionPtr> TakeAndInit(

@@ -1,4 +1,4 @@
-// Copyright (c) YugaByte, Inc.
+// Copyright (c) YugabyteDB, Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License"); you may not use this file except
 // in compliance with the License.  You may obtain a copy of the License at
@@ -21,23 +21,24 @@
 #include "yb/common/ql_protocol.fwd.h"
 #include "yb/common/redis_protocol.fwd.h"
 #include "yb/common/wire_protocol.fwd.h"
+#include "yb/util/memory/arena_fwd.h"
+#include "yb/util/strongly_typed_bool.h"
+
+namespace google::protobuf {
+template <typename Element> class RepeatedPtrField;
+}
 
 namespace yb {
 
 class ClockBase;
 class ColumnId;
 class ColumnSchema;
+class ConstContiguousRow;
 class DocHybridTime;
+class EncodedDocHybridTime;
 class HybridTime;
-class IndexInfo;
-class IndexMap;
-class Partition;
-class PartitionSchema;
-class PgsqlScanSpec;
-class QLResultSet;
-class QLRow;
-class QLRowBlock;
-class QLScanSpec;
+struct ReadRestartData;
+class MissingValueProvider;
 class TableProperties;
 class TransactionStatusManager;
 class TypeInfo;
@@ -48,19 +49,14 @@ typedef std::shared_ptr<Schema> SchemaPtr;
 typedef std::string PartitionKey;
 typedef std::shared_ptr<const PartitionKey> PartitionKeyPtr;
 
-class QLExprExecutor;
-typedef std::shared_ptr<QLExprExecutor> QLExprExecutorPtr;
-
-class QLTableRow;
 class QLType;
 class QLValue;
 
 struct DeletedColumn;
-struct IndexColumn;
 struct OpId;
 struct PgObjectId;
-struct QLTableColumn;
 struct ReadHybridTime;
+struct TransactionFullLocality;
 struct TransactionMetadata;
 struct TransactionOperationContext;
 struct TransactionStatusResult;
@@ -73,10 +69,60 @@ using QLTypePtr = std::shared_ptr<QLType>;
 using PgObjectIds = std::vector<PgObjectId>;
 
 enum class PgSystemAttrNum : int;
-enum class QLNameOption : int8_t;
-enum class YBHashSchema;
+enum class DataType;
 
-enum SortingType : uint8_t;
+enum class SortingType;
+
+YB_STRONGLY_TYPED_BOOL(ClampUncertaintyWindow);
+
+// Temporary typedef for lightweight protobuf migration
+using QLRSColDescMsg = LWQLRSColDescPB;
+using QLRSRowDescMsg = LWQLRSRowDescPB;
+using QLWriteRequestMsg = LWQLWriteRequestPB;
+using QLValueMsg = LWQLValuePB;
+using QLExpressionMsg = LWQLExpressionPB;
+using PgsqlExpressionMsg = LWPgsqlExpressionPB;
+using RedisResponseMsg = LWRedisResponsePB;
+using RedisWriteRequestMsg = LWRedisWriteRequestPB;
+using RedisReadRequestMsg = LWRedisReadRequestPB;
+using QLResponseMsg = LWQLResponsePB;
+using QLReadRequestMsg = LWQLReadRequestPB;
+using PgsqlResponseMsg = LWPgsqlResponsePB;
+using PgsqlWriteRequestMsg = LWPgsqlWriteRequestPB;
+using PgsqlReadRequestMsg = LWPgsqlReadRequestPB;
+using PgsqlLockRequestMsg = LWPgsqlLockRequestPB;
+using QLTypeMsg = LWQLTypePB;
+using ChildTransactionDataMsg = LWChildTransactionDataPB;
+using ChildTransactionResultMsg = LWChildTransactionResultPB;
+using QLJsonOperationMsg = LWQLJsonOperationPB;
+using QLReferencedColumnsMsg = LWQLReferencedColumnsPB;
+using QLConditionMsg = LWQLConditionPB;
+using QLColumnValueMsg = LWQLColumnValuePB;
+using PgsqlColumnValueMsg = LWPgsqlColumnValuePB;
+using PgVectorReadOptionsMsg = LWPgVectorReadOptionsPB;
+using RedisKeyValueMsg = LWRedisKeyValuePB;
+using TransactionMetadataMsg = LWTransactionMetadataPB;
+using SubTransactionMetadataMsg = LWSubTransactionMetadataPB;
+using RedisGetRequestMsg = LWRedisGetRequestPB;
+using RedisSubKeyBoundMsg = LWRedisSubKeyBoundPB;
+using RedisKeyValueSubKeyMsg = LWRedisKeyValueSubKeyPB;
+using RedisArrayMsg = LWRedisArrayPB;
+using QLMapValueMsg = LWQLMapValuePB;
+using PgsqlColRefMsg = LWPgsqlColRefPB;
+using PgsqlBatchArgumentMsg = LWPgsqlBatchArgumentPB;
+using PgsqlSamplingStateMsg = LWPgsqlSamplingStatePB;
+using PgsqlSampleBlockMsg = LWPgsqlSampleBlockPB;
+using SortedSetOptionsMsg = LWSortedSetOptionsPB;
+using RedisIndexBoundMsg = LWRedisIndexBoundPB;
+using RedisCollectionGetRangeRequestMsg = LWRedisCollectionGetRangeRequestPB;
+using PgsqlPagingStateMsg = LWPgsqlPagingStatePB;
+using PgsqlAdvisoryLockMsg = LWPgsqlAdvisoryLockPB;
+
+using QLReadRequestMsgs = ArenaList<QLReadRequestMsg>;
+using PgsqlBatchArgumentMsgs = ArenaList<PgsqlBatchArgumentMsg>;
+using PgsqlExpressionMsgs = ArenaList<PgsqlExpressionMsg>;
+using PgsqlReadRequestMsgs = ArenaList<PgsqlReadRequestMsg>;
+using QLExpressionMsgs = ArenaList<QLExpressionMsg>;
 
 namespace common {
 

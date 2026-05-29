@@ -1,5 +1,7 @@
 #!/usr/bin/env python
 
+import atexit
+import time
 import errno
 import logging
 import os
@@ -7,8 +9,17 @@ import shutil
 import signal
 import subprocess
 import sys
-from glob import glob
-
+import glob
+import traceback
+import threading
+import re
+import random
+import string
+from watchdog.observers import Observer
+from watchdog.events import FileSystemEventHandler
+from enum import Enum
+# Stop event to signal the background thread to stop.:
+bg_thread_stop_event = threading.Event()
 child_process = None
 
 # Set of signals which are propagated to the child process from this
@@ -43,6 +54,25 @@ PROPAGATE_SIGS = {
 }
 MAX_FILES_FROM_GLOB = 5
 CORE_GLOB = "*core*"
+# Check if environment overrides it, if not use the default.
+PG_UNIX_SOCKET_LOCK_FILE_PATH_GLOB = os.environ.get(
+    "PG_UNIX_SOCKET_LOCK_FILE_PATH_GLOB",
+    "/tmp/.yb.*/.s.PGSQL.*.lock")   # Default pattern
+MASTER_BINARY = "/home/yugabyte/bin/yb-master"
+TSERVER_BINARY = "/home/yugabyte/bin/yb-tserver"
+CONTROLLER_BINARY = "/home/yugabyte/controller/bin/yb-controller-server"
+GFLAGS_TEMPLATE_FILE = "/opt/{}/conf/server.conf.template"
+GFLAGS_GENERATED_FILE = "/tmp/yugabyte/{}/conf/server.conf"
+CERT_MANAGER_DIR = "/home/yugabyte/cert-manager"
+ACTUAL_CERTS_DIR = "/mnt/disk0/certs"
+CERT_DIR_EVENTS_TO_WATCH = ['deleted', 'moved', 'created']
+DEFAULT_WATCHER_DEBOUNCE_SEC = 2.0
+
+
+class ProcessType(Enum):
+    Master = "master"
+    Tserver = "tserver"
+    Controller = "controller"
 
 
 def signal_handler(signum, frame):
@@ -88,6 +118,90 @@ def create_core_dump_dir():
             )
 
 
+def delete_pg_lock_files():
+    file_pattern = PG_UNIX_SOCKET_LOCK_FILE_PATH_GLOB
+    files_to_delete = glob.glob(file_pattern)
+    # Check if any files were found
+    if not files_to_delete:
+        logging.info(f"No files found matching the pattern: {file_pattern}")
+        return
+    # Log a list of files to delete.
+    logging.info(f"Files to delete after expanded glob: {files_to_delete}")
+
+    # We don't want to catch exceptions but raise them as this will
+    # in debugging; pod goes into crashloop.
+    for file_path in files_to_delete:
+        logging.info(f"Trying to delete {file_path}")
+        os.remove(file_path)
+        logging.info(f"Deleted: {file_path}")
+
+
+def replace_var_env(match):
+    var = match.group(1)
+    if var in os.environ:
+        return os.environ[var]
+
+    return ""
+
+
+def random_string(length):
+    return ''.join(random.choice(string.ascii_lowercase) for i in range(length))
+
+
+def background_sub_env_gflags(sleep_time_seconds, command):
+    logging.info("Starting gflags file template substitution")
+    infile = GFLAGS_TEMPLATE_FILE.format(process_type(command).value)
+    outfile = GFLAGS_GENERATED_FILE.format(process_type(command).value)
+    tmp_outfile = outfile + '.' + random_string(8)
+    if not os.path.exists(infile):
+        logging.info("Template gflags file does not exist, ignoring substitution")
+        return
+    try:
+        os.makedirs(os.path.dirname(outfile), exist_ok=True)
+        os.makedirs(os.path.dirname(tmp_outfile), exist_ok=True)
+    except Exception as e:
+        logging.error("Error while creating gflag file: {}, traceback: {}"
+                      .format(e, traceback.format_exc()))
+    global bg_thread_stop_event
+    while not bg_thread_stop_event.is_set():
+        logging.info("Substituting env to gflag template")
+        try:
+            with open(infile, 'r') as instream:
+                content = instream.read()
+            content = re.sub("\\${(.*?)}", replace_var_env, content)
+            # Safe create the gflags file by creating tmp file and moving it
+            with open(tmp_outfile, 'w') as outstream:
+                outstream.write(content)
+            os.replace(tmp_outfile, outfile)
+            try:
+                os.remove(tmp_outfile)
+            except FileNotFoundError:
+                pass
+        except Exception as e:
+            logging.error(
+                "Error while substituting env to gflag template: {}, traceback: {}"
+                .format(e, traceback.format_exc()))
+        logging.info("Sleeping for {} seconds".format(sleep_time_seconds))
+        time.sleep(sleep_time_seconds)
+
+
+def background_copy_cores_wrapper(dst, sleep_time_seconds):
+    logging.info("Starting Collection")
+    global bg_thread_stop_event
+    copy_count = None
+    while not bg_thread_stop_event.is_set():
+        logging.info("Invoking copy_cores")
+        try:
+            copy_count = copy_cores(dst)
+        except Exception as e:
+            logging.error(
+                "Error while copying cores: {}, traceback: {}".format(
+                    e, traceback.format_exc()))
+        logging.info("Copied {} core files".format(copy_count))
+        logging.info("Sleeping for {} seconds".format(sleep_time_seconds))
+        time.sleep(sleep_time_seconds)
+
+
 def copy_cores(dst):
     # os.makedirs(dst, exist_ok=True)
     try:
@@ -118,7 +232,7 @@ def copy_cores(dst):
             MAX_FILES_FROM_GLOB, dst, core_glob
         )
     )
-    core_files = glob(core_glob)
+    core_files = glob.glob(core_glob)
 
     # TODO: handle cases where this list is huge, this is less likely
     # to happen with the current glob *core*, but can happen with a
@@ -158,16 +272,234 @@ def invoke_hook(hook_stage=None):
         logging.info("Output from hook {}".format(output))
 
 
+def is_master(command):
+    if MASTER_BINARY in command:
+        return True
+    return False
+
+
+def process_type(command):
+    if MASTER_BINARY in command:
+        return ProcessType.Master
+    elif TSERVER_BINARY in command:
+        return ProcessType.Tserver
+    elif CONTROLLER_BINARY in command:
+        return ProcessType.Controller
+
+
+def parse_zone_from_flags(command):
+    infile = GFLAGS_TEMPLATE_FILE.format(process_type(command).value)
+    zone = None
+    with open(infile, 'r') as instream:
+        content = instream.readlines()
+        for line in content:
+            if "--placement_zone" in line:
+                zone = line.split("=")[-1].strip()
+                break
+    return zone
+
+
+def set_exported_instance_env(command):
+    # Not used for controller process
+    if process_type(command) is ProcessType.Controller:
+        return
+    try:
+        if process_type(command) is ProcessType.Master:
+            pod_type = "yb-master"
+        else:
+            pod_type = "yb-tserver"
+        ordinal_index = os.getenv("HOSTNAME").split("-")[-1]
+        availability_zone = parse_zone_from_flags(command)
+        # if we cannot find zone for some reason, we should just call it yb-tserver-0
+        # in multi-zone deployments, we will have to format it like  yb-tserver-0_us-west1-ae
+        if availability_zone.strip():
+            # format yb-tserver-0_us-west1-a"
+            os.environ["EXPORTED_INSTANCE"] = "%s-%s_%s" % (
+                pod_type, ordinal_index, availability_zone)
+        else:
+            os.environ["EXPORTED_INSTANCE"] = "%s-%s" % (pod_type, ordinal_index)
+    except Exception as e:
+        logging.error("Error while setting exported instance env: {}, traceback: {}".format(
+            e, traceback.format_exc()))
+        # set it back to hostname in case there is an exception
+        os.environ["EXPORTED_INSTANCE"] = os.getenv("HOSTNAME")
+
+
+class DirEventHandler(FileSystemEventHandler):
+
+    def __init__(self, callback, events_to_watch, callback_args=None,
+                 debounce_sec=DEFAULT_WATCHER_DEBOUNCE_SEC):
+        """
+        Args:
+            callback: Function to call when relevant events occur.
+            events_to_watch: List of event types to watch (e.g., ['deleted', 'moved', 'created']).
+            callback_args: Tuple of arguments to pass to the callback function.
+            debounce_sec: Seconds to wait before triggering callback after last event.
+        """
+        self.callback = callback
+        self.callback_args = callback_args or ()
+        self.debounce_sec = debounce_sec
+        self.events_to_watch = events_to_watch
+        self._timer = None
+        self._lock = threading.Lock()
+
+    def on_any_event(self, event):
+        if event.is_directory:
+            return
+        if event.event_type in self.events_to_watch:
+            self._debounced_callback()
+
+    def _debounced_callback(self):
+        with self._lock:
+            if self._timer:
+                self._timer.cancel()
+
+            self._timer = threading.Timer(
+                self.debounce_sec,
+                self._run_callback,
+            )
+            self._timer.daemon = True
+            self._timer.start()
+
+    def _run_callback(self):
+        logging.info("Detected directory change, invoking callback")
+        try:
+            self.callback(*self.callback_args)
+        except Exception:
+            logging.exception("Callback failed")
+
+
+class DirWatcher:
+
+    def __init__(self, watch_dir, callback, events_to_watch, callback_args=None,
+                 debounce_sec=DEFAULT_WATCHER_DEBOUNCE_SEC, recursive=False):
+        """
+        Args:
+            watch_dir: Directory path to watch.
+            callback: Function to call when relevant events occur.
+            events_to_watch: List of event types to watch (e.g., ['deleted', 'moved', 'created']).
+            callback_args: Tuple of arguments to pass to the callback function.
+            debounce_sec: Seconds to wait before triggering callback after last event.
+            recursive: Whether to watch subdirectories recursively.
+        """
+        self.watch_dir = watch_dir
+        self.callback = callback
+        self.callback_args = callback_args or ()
+        self.debounce_sec = debounce_sec
+        self.events_to_watch = events_to_watch
+        self.recursive = recursive
+        self._observer = None
+
+    def start(self):
+        handler = DirEventHandler(
+            self.callback,
+            self.events_to_watch,
+            self.callback_args,
+            self.debounce_sec,
+        )
+
+        observer = Observer()
+        observer.schedule(
+            handler,
+            self.watch_dir,
+            recursive=self.recursive,
+        )
+        observer.start()
+        self._observer = observer
+        logging.info("Started directory watcher on %s", self.watch_dir)
+
+    def stop(self):
+        if self._observer:
+            logging.info("Stopping directory watcher on %s", self.watch_dir)
+            self._observer.stop()
+            self._observer.join()
+
+
+def start_cert_manager_watcher(server_fqdn):
+    watcher = DirWatcher(
+        watch_dir=CERT_MANAGER_DIR,
+        events_to_watch=CERT_DIR_EVENTS_TO_WATCH,
+        callback=reload_cert_manager_certs,
+        callback_args=(server_fqdn,),
+    )
+    watcher.start()
+    return watcher
+
+
+def reload_cert_manager_certs(server_fqdn):
+    try:
+        _copy_cert_manager_root_cert()
+        if _check_cert_manager_server_certs():
+            _copy_cert_manager_server_cert_and_key(server_fqdn)
+        else:
+            logging.error("Failed to verify tls certs, skipping copy")
+    except Exception as e:
+        logging.error("Error while reloading cert manager certs: {}, traceback: {}".format(
+            e, traceback.format_exc()))
+
+
+def _check_cert_manager_server_certs():
+    logging.info("Verifying cert manager server certs")
+    try:
+        result = subprocess.run(
+            [
+                "openssl", "verify",
+                "-CAfile", os.path.join(ACTUAL_CERTS_DIR, "ca.crt"),
+                "-untrusted", os.path.join(CERT_MANAGER_DIR, "tls.crt"),
+                os.path.join(CERT_MANAGER_DIR, "tls.crt"),
+            ],
+            capture_output=True,
+        )
+        return result.returncode == 0
+    except Exception as e:
+        logging.error("Error verifying certs: %s", e)
+        return False
+
+
+def _copy_cert_manager_root_cert():
+    src_cert_path = os.path.join(CERT_MANAGER_DIR, "ca.crt")
+    dst_cert_path = os.path.join(ACTUAL_CERTS_DIR, "ca.crt")
+    logging.info("Refreshing root cert")
+    shutil.copy(src_cert_path, dst_cert_path)
+    os.chmod(dst_cert_path, 0o600)
+
+
+def _copy_cert_manager_server_cert_and_key(server_fqdn):
+    src_cert_path = os.path.join(CERT_MANAGER_DIR, "tls.crt")
+    dst_cert_path = os.path.join(ACTUAL_CERTS_DIR, f"node.{server_fqdn}.crt")
+    logging.info("Refreshing server cert and key")
+    shutil.copy(src_cert_path, dst_cert_path)
+    dst_key_path = os.path.join(ACTUAL_CERTS_DIR, f"node.{server_fqdn}.key")
+    shutil.copy(os.path.join(CERT_MANAGER_DIR, "tls.key"), dst_key_path)
+    os.chmod(dst_cert_path, 0o600)
+    os.chmod(dst_key_path, 0o600)
+
+
+def get_server_fqdn():
+    fqdn = os.getenv("SERVER_FQDN")
+    if not fqdn:
+        logging.error("SERVER_FQDN environment variable must be set")
+        sys.exit(1)
+    return (
+        fqdn.replace("${HOSTNAME}", os.getenv("HOSTNAME", ""))
+        .replace("${NAMESPACE}", os.getenv("NAMESPACE", ""))
+    )
+
+
 if __name__ == "__main__":
     logging.basicConfig(
         format="%(asctime)s [%(levelname)s] %(filename)s: %(message)s",
         level=logging.INFO,
     )
-
+    core_collection_interval = 30  # Seconds
+    subs_env_gflags_interval = 20  # Seconds
     command = sys.argv[1:]
+
     if len(command) < 1:
         logging.critical("No command to run")
         sys.exit(1)
+
+    set_exported_instance_env(command)
 
     cores_dir = os.getenv("YBDEVOPS_CORECOPY_DIR")
     if cores_dir is None:
@@ -178,6 +510,29 @@ if __name__ == "__main__":
     # Make sure the directory from core_pattern is present, otherwise
     # core dumps are not collected.
     create_core_dump_dir()
+    # Copy cores once in 30s
+    copy_cores_thread = threading.Thread(
+        target=background_copy_cores_wrapper, args=(cores_dir, core_collection_interval))
+    copy_cores_thread.daemon = True
+    copy_cores_thread.start()
+    # Substitute environment varibles to gflag template file once in 20s
+    subs_env_gflags_thread = threading.Thread(
+        target=background_sub_env_gflags, args=(subs_env_gflags_interval, command))
+    subs_env_gflags_thread.daemon = True
+    subs_env_gflags_thread.start()
+
+    if os.getenv("CERT_MANAGER_ENABLED", "false").lower() == "true":
+        server_fqdn = get_server_fqdn()
+        cert_watcher = start_cert_manager_watcher(server_fqdn)
+        atexit.register(cert_watcher.stop)
+    # Delete PG Unix Socket Lock files that can be left after a previous
+    # ungraceful exit of the container.
+    if process_type(command) is ProcessType.Tserver:
+        _delete_pg_lock_file = os.environ.get(
+            "YB_DEL_PG_LOCK_FILE", "true").lower() in ('true', '1', 't')
+        logging.info("Deleting PG socket lock files: %s" % _delete_pg_lock_file)
+        if _delete_pg_lock_file:
+            delete_pg_lock_files()
     # invoking the prehook.
     invoke_hook(hook_stage="pre")
 
@@ -194,7 +549,11 @@ if __name__ == "__main__":
 
     # invoking the Post hook
     invoke_hook(hook_stage="post")
-
+    bg_thread_stop_event.set()
+    # Give some time for the thread to finish its job,
+    # we do a 2x core collection interval.
+    copy_cores_thread.join(2*core_collection_interval)
+    # There may be left over cores when we crash, so copy them now.
     # Do the core copy, and exit with child return code.
     files_copied = copy_cores(cores_dir)
     logging.info("Copied {} core files to '{}'".format(files_copied, cores_dir))

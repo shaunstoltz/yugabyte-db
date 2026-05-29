@@ -1,4 +1,4 @@
-import React, { ReactElement } from 'react';
+import { ReactElement } from 'react';
 import _ from 'lodash';
 import { useQuery } from 'react-query';
 import { useTranslation } from 'react-i18next';
@@ -37,7 +37,7 @@ export const DefaultRegionField = ({ disabled }: DefaultRegionsFieldProps): Reac
 
   return (
     <>
-      <Box display="flex" width="100%">
+      <Box display="flex" width="100%" data-testid="DefaultRegionField-Container">
         <YBLabel dataTestId="DefaultRegionField-Label">
           {t('universeForm.cloudConfig.defaultRegion')}
         </YBLabel>
@@ -60,7 +60,7 @@ export const DefaultRegionField = ({ disabled }: DefaultRegionsFieldProps): Reac
         </Box>
       </Box>
 
-      <Box display="flex" width="100%" mt={1}>
+      <Box display="flex" width="100%" mt={2}>
         <YBLabel dataTestId="DefaultRegionField-MastersLabel">
           {t('universeForm.cloudConfig.mastersInDefaultRegion')}
         </YBLabel>

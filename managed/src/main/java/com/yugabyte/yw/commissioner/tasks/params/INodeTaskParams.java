@@ -1,4 +1,4 @@
-// Copyright (c) YugaByte, Inc.
+// Copyright (c) YugabyteDB, Inc.
 
 package com.yugabyte.yw.commissioner.tasks.params;
 
@@ -25,7 +25,7 @@ public interface INodeTaskParams {
 
   @JsonIgnore
   default Region getRegion() {
-    return getAZ() == null ? null : getAZ().region;
+    return getAZ() == null ? null : getAZ().getRegion();
   }
 
   @JsonIgnore

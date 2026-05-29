@@ -3,9 +3,9 @@
 //  LICENSE file in the root directory of this source tree. An additional grant
 //  of patent rights can be found in the PATENTS file in the same directory.
 //
-// The following only applies to changes made to this file as part of YugaByte development.
+// The following only applies to changes made to this file as part of YugabyteDB development.
 //
-// Portions Copyright (c) YugaByte, Inc.
+// Portions Copyright (c) YugabyteDB, Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License"); you may not use this file except
 // in compliance with the License.  You may obtain a copy of the License at
@@ -53,6 +53,8 @@
 
 #include "yb/docdb/docdb_debug.h"
 
+#include "yb/util/format.h"
+#include "yb/util/kv_util.h"
 #include "yb/util/status_log.h"
 
 using yb::docdb::StorageDbType;
@@ -60,11 +62,10 @@ using yb::docdb::StorageDbType;
 namespace rocksdb {
 
 using std::dynamic_pointer_cast;
-using std::unique_ptr;
-using std::shared_ptr;
 
 std::string DocDBKVFormatter::Format(
-    const yb::Slice&, const yb::Slice&, yb::docdb::StorageDbType) const {
+    yb::Slice, yb::Slice, yb::docdb::StorageDbType, const std::string&,
+    yb::docdb::AllowEmptyValue) const {
   CHECK(false) << "unimplemented";
   return "";
 }
@@ -97,9 +98,7 @@ Status SstFileReader::GetTableReader(const std::string& file_path) {
   uint64_t magic_number;
 
   // read table magic number
-  Footer footer;
-
-  unique_ptr<RandomAccessFile> file;
+  std::unique_ptr<RandomAccessFile> file;
   uint64_t file_size;
   Status s = options_.env->NewRandomAccessFile(file_path, &file, soptions_);
   if (s.ok()) {
@@ -109,10 +108,10 @@ Status SstFileReader::GetTableReader(const std::string& file_path) {
   file_.reset(new RandomAccessFileReader(std::move(file)));
 
   if (s.ok()) {
-    s = ReadFooterFromFile(file_.get(), file_size, &footer);
+    s = ReadFooterFromFile(file_.get(), file_size, &footer_);
   }
   if (s.ok()) {
-    magic_number = footer.table_magic_number();
+    magic_number = footer_.table_magic_number();
   }
 
   if (s.ok()) {
@@ -135,10 +134,10 @@ Status SstFileReader::GetTableReader(const std::string& file_path) {
     s = NewTableReader(ioptions_, soptions_, *internal_comparator_, file_size,
                        &table_reader_);
     if (s.ok() && table_reader_->IsSplitSst()) {
-      unique_ptr<RandomAccessFile> data_file;
+      std::unique_ptr<RandomAccessFile> data_file;
       RETURN_NOT_OK(options_.env->NewRandomAccessFile(
           TableBaseToDataFileName(file_path), &data_file, soptions_));
-      unique_ptr<RandomAccessFileReader> data_file_reader(
+      std::unique_ptr<RandomAccessFileReader> data_file_reader(
           new RandomAccessFileReader(std::move(data_file)));
       table_reader_->SetDataFileReader(std::move(data_file_reader));
     }
@@ -149,10 +148,10 @@ Status SstFileReader::GetTableReader(const std::string& file_path) {
 Status SstFileReader::NewTableReader(
     const ImmutableCFOptions& ioptions, const EnvOptions& soptions,
     const InternalKeyComparator& internal_comparator, uint64_t file_size,
-    unique_ptr<TableReader>* table_reader) {
+    std::unique_ptr<TableReader>* table_reader) {
   // We need to turn off pre-fetching of index and filter nodes for
   // BlockBasedTable
-  shared_ptr<BlockBasedTableFactory> block_table_factory =
+  std::shared_ptr<BlockBasedTableFactory> block_table_factory =
       dynamic_pointer_cast<BlockBasedTableFactory>(options_.table_factory);
 
   if (block_table_factory) {
@@ -172,7 +171,7 @@ Status SstFileReader::NewTableReader(
 }
 
 Status SstFileReader::DumpTable(const std::string& out_filename) {
-  unique_ptr<WritableFile> out_file;
+  std::unique_ptr<WritableFile> out_file;
   Env* env = Env::Default();
   RETURN_NOT_OK(env->NewWritableFile(out_filename, &out_file, soptions_));
   Status s = table_reader_->DumpTable(out_file.get());
@@ -182,20 +181,20 @@ Status SstFileReader::DumpTable(const std::string& out_filename) {
 
 uint64_t SstFileReader::CalculateCompressedTableSize(
     const TableBuilderOptions& tb_options, size_t block_size) {
-  unique_ptr<WritableFile> out_file;
-  unique_ptr<Env> env(NewMemEnv(Env::Default()));
+  std::unique_ptr<WritableFile> out_file;
+  std::unique_ptr<Env> env(NewMemEnv(Env::Default()));
   CHECK_OK(env->NewWritableFile(testFileName, &out_file, soptions_));
-  unique_ptr<WritableFileWriter> dest_writer;
+  std::unique_ptr<WritableFileWriter> dest_writer;
   dest_writer.reset(new WritableFileWriter(std::move(out_file), soptions_));
   BlockBasedTableOptions table_options;
   table_options.block_size = block_size;
   BlockBasedTableFactory block_based_tf(table_options);
-  unique_ptr<TableBuilder> table_builder;
+  std::unique_ptr<TableBuilder> table_builder;
   table_builder = block_based_tf.NewTableBuilder(
       tb_options,
       TablePropertiesCollectorFactory::Context::kUnknownColumnFamily,
       dest_writer.get());
-  unique_ptr<InternalIterator> iter(table_reader_->NewIterator(ReadOptions()));
+  std::unique_ptr<InternalIterator> iter(table_reader_->NewIterator(ReadOptions()));
   for (iter->SeekToFirst(); iter->Valid(); iter->Next()) {
     if (!iter->status().ok()) {
       fputs(iter->status().ToString().c_str(), stderr);
@@ -340,6 +339,7 @@ Status SstFileReader::ReadSequential(bool print_kv,
     iter->SeekToFirst();
   }
   for (; iter->Valid(); iter->Next()) {
+    WARN_NOT_OK(iter->status(), "Iterator error: ");
     Slice key = iter->key();
     Slice value = iter->value();
     ++i;
@@ -371,10 +371,20 @@ Status SstFileReader::ReadSequential(bool print_kv,
         }
         case OutputFormat::kDecodedRegularDB:
         case OutputFormat::kDecodedIntentsDB:
-          auto storage_type =
+          const auto storage_type =
               (output_format_ == OutputFormat::kDecodedRegularDB ? StorageDbType::kRegular
                                                                  : StorageDbType::kIntents);
-          fprintf(stdout, "%s", docdb_kv_formatter_->Format(key, value, storage_type).c_str());
+          const auto is_deletion =
+              ikey.type == ValueType::kTypeDeletion || ikey.type == ValueType::kTypeSingleDeletion;
+          const auto key_suffix = is_deletion ?
+              yb::Format(" @ $0 : $1", ikey.sequence, std::to_underlying(ikey.type)) : "";
+          fprintf(
+              stdout, "%s\n",
+              docdb_kv_formatter_
+                  ->Format(
+                      ikey.user_key, value, storage_type, key_suffix,
+                      yb::docdb::AllowEmptyValue(is_deletion))
+                  .c_str());
           break;
       }
     }
@@ -385,6 +395,95 @@ Status SstFileReader::ReadSequential(bool print_kv,
   Status ret = iter->status();
   delete iter;
   return ret;
+}
+
+namespace {
+
+struct DataBlockInfo {
+  yb::KeyBuffer index_key;
+  BlockHandle handle;
+  size_t index_entry_pos = 0;
+  bool saved = false;
+};
+
+void PrintSaveBlockCommand(
+    const std::string& data_file_path, const std::string& ext, DataBlockInfo* info) {
+  if (info->saved) {
+    return;
+  }
+  std::cout << "dd if=\"" << data_file_path << "\" bs=1 skip=" << info->handle.offset()
+            << " count=" << info->handle.size() << " of=\"" << data_file_path << ".block_"
+            << info->index_entry_pos << ".offset_" << info->handle.offset() << ".size_"
+            << info->handle.size() << ".part" << ext << "\" # Data block #" << info->index_entry_pos
+            << " index_key: "
+            << info->index_key.AsSlice().PrefixNoLongerThan(256).ToDebugHexString() << std::endl;
+  info->saved = true;
+}
+
+} // namespace
+
+Status SstFileReader::CheckDataBlocks(DoUncompress do_uncompress) {
+  if (!table_reader_) {
+    return init_result_;
+  }
+  ReadOptions read_options;
+  read_options.verify_checksums = true;
+
+  std::unique_ptr<InternalIterator> index_iterator(table_reader_->NewIndexIterator(read_options));
+  RETURN_NOT_OK(index_iterator->status());
+
+  const auto data_file_path =
+      table_reader_->IsSplitSst() ? TableBaseToDataFileName(file_name_) : file_name_;
+  std::unique_ptr<RandomAccessFile> data_file;
+  RETURN_NOT_OK(options_.env->NewRandomAccessFile(data_file_path, &data_file, soptions_));
+  std::unique_ptr<RandomAccessFileReader> data_file_reader(
+      new RandomAccessFileReader(std::move(data_file)));
+
+  DataBlockInfo prev_block_info;
+  DataBlockInfo block_info;
+  bool save_block = false;
+  for (index_iterator->SeekToFirst(); index_iterator->Valid();
+       index_iterator->Next(), prev_block_info = block_info, ++block_info.index_entry_pos) {
+    block_info.index_key = index_iterator->Entry().key;
+    block_info.saved = false;
+    {
+      auto index_value_slice = index_iterator->Entry().value;
+      auto status = block_info.handle.DecodeFrom(&index_value_slice);
+      if (!status.ok()) {
+        LOG(WARNING) << "Failed to decode SST index entry #" << block_info.index_entry_pos
+                     << " (index_key: "
+                     << block_info.index_key.AsSlice().PrefixNoLongerThan(256).ToDebugHexString()
+                     << "): " << index_iterator->Entry().value.ToDebugHexString() << ". " << status;
+        continue;
+      }
+      LOG_IF(WARNING, index_value_slice.size() > 0)
+          << "Extra bytes (" << index_value_slice.size()
+          << ") in index entry: " << index_iterator->Entry().value.ToDebugHexString();
+    }
+    YB_LOG_EVERY_N_SECS(INFO, 30) << "Checking data block #" << block_info.index_entry_pos
+                                  << " handle: " << block_info.handle.ToDebugString();
+
+    BlockContents block_contents;
+    auto status = ReadBlockContents(
+        data_file_reader.get(), footer_, read_options, block_info.handle, &block_contents,
+        options_.env, /* mem_tracker = */ nullptr, do_uncompress);
+    if (!status.ok()) {
+      LOG(WARNING) << "Failed to read data block #" << block_info.index_entry_pos << " (index_key: "
+                   << block_info.index_key.AsSlice().PrefixNoLongerThan(256).ToDebugHexString()
+                   << "), block handle: " << block_info.handle.ToDebugString() << ". " << status;
+      if (prev_block_info.handle.IsSet()) {
+        PrintSaveBlockCommand(data_file_path, ".prev", &prev_block_info);
+      }
+      PrintSaveBlockCommand(data_file_path, ".corrupt", &block_info);
+      // Save next block as well.
+      save_block = true;
+    } else if (save_block) {
+      PrintSaveBlockCommand(data_file_path, ".next", &block_info);
+      save_block = false;
+    }
+  }
+
+  return Status::OK();
 }
 
 Status SstFileReader::ReadTableProperties(
@@ -401,16 +500,18 @@ namespace {
 
 void print_help() {
   fprintf(stderr,
-          "sst_dump [--command=check|scan|none|raw] [--verify_checksum] "
+          "sst_dump [--command=check|scan|check_data_blocks|none|raw] [--verify_checksum] "
           "--file=data_dir_OR_sst_file"
           " [--output_format=raw|hex|decoded_regulardb|decoded_intentsdb]"
+          " [--formatter_tablet_metadata=<path_to_tablet_metadata>"
           " [--input_key_hex]"
           " [--from=<user_key>]"
           " [--to=<user_key>]"
           " [--read_num=NUM]"
           " [--show_properties]"
           " [--show_compression_sizes]"
-          " [--show_compression_sizes [--set_block_size=<block_size>]]\n");
+          " [--show_compression_sizes [--set_block_size=<block_size>]]"
+          " [--skip_uncompress]\n");
 }
 
 }  // namespace
@@ -430,6 +531,7 @@ int SSTDumpTool::Run(int argc, char** argv) {
   bool show_properties = false;
   bool show_compression_sizes = false;
   bool set_block_size = false;
+  DoUncompress do_uncompress = DoUncompress ::kTrue;
   std::string from_key;
   std::string to_key;
   std::string block_size_str;
@@ -469,15 +571,23 @@ int SSTDumpTool::Run(int argc, char** argv) {
       show_properties = true;
     } else if (strcmp(argv[i], "--show_compression_sizes") == 0) {
       show_compression_sizes = true;
+    } else if (strcmp(argv[i], "--skip_uncompress") == 0) {
+      do_uncompress = DoUncompress::kFalse;
     } else if (strncmp(argv[i], "--set_block_size=", 17) == 0) {
       set_block_size = true;
       block_size_str = argv[i] + 17;
       std::istringstream iss(block_size_str);
       if (iss.fail()) {
-        fprintf(stderr, "block size must be numeric");
+        fprintf(stderr, "block size must be numeric\n");
         exit(1);
       }
       iss >> block_size;
+    } else if (strncmp(argv[i], "--formatter_", 12) == 0) {
+      auto status = formatter_->ProcessArgument(argv[i] + 12);
+      if (!status.ok()) {
+        fprintf(stderr, "%s\n", status.ToString().c_str());
+        exit(1);
+      }
     } else {
       print_help();
       exit(1);
@@ -568,6 +678,8 @@ int SSTDumpTool::Run(int argc, char** argv) {
       if (read_num > 0 && total_read > read_num) {
         break;
       }
+    } else if (command == "check_data_blocks") {
+      ERROR_NOT_OK(reader.CheckDataBlocks(do_uncompress), "Failed to scan SST file blocks:");
     }
     if (show_properties) {
       const rocksdb::TableProperties* table_properties;

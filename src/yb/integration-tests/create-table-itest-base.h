@@ -15,9 +15,9 @@
 // specific language governing permissions and limitations
 // under the License.
 //
-// The following only applies to changes made to this file as part of YugaByte development.
+// The following only applies to changes made to this file as part of YugabyteDB development.
 //
-// Portions Copyright (c) YugaByte, Inc.
+// Portions Copyright (c) YugabyteDB, Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License"); you may not use this file except
 // in compliance with the License.  You may obtain a copy of the License at
@@ -75,7 +75,7 @@ static const YBTableName kTableName(YQL_DATABASE_CQL, "my_keyspace", "test-table
 class CreateTableITestBase : public ExternalMiniClusterITestBase {
  public:
   Status CreateTableWithPlacement(
-      const master::ReplicationInfoPB& replication_info, const std::string& table_suffix,
+      const ReplicationInfoPB& replication_info, const std::string& table_suffix,
       const YBTableType table_type = YBTableType::YQL_TABLE_TYPE);
 
   Result<bool> VerifyTServerTablets(
@@ -84,7 +84,7 @@ class CreateTableITestBase : public ExternalMiniClusterITestBase {
 
   void PreparePlacementInfo(
       const std::unordered_map<std::string, int>& zone_to_replica_count, int num_replicas,
-      master::PlacementInfoPB* placement_info);
+      PlacementInfoPB* placement_info);
 
   void AddTServerInZone(const std::string& zone);
 };

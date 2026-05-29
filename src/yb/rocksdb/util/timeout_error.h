@@ -1,4 +1,4 @@
-// Copyright (c) YugaByte, Inc.
+// Copyright (c) YugabyteDB, Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License"); you may not use this file except
 // in compliance with the License.  You may obtain a copy of the License at
@@ -13,10 +13,14 @@
 
 #pragma once
 
+#include <string>
+#include <string_view>
+
 #include "yb/util/status_fwd.h"
 #include "yb/util/enums.h"
-#include "yb/util/math_util.h"
 #include "yb/util/status_ec.h"
+
+using namespace std::literals;
 
 namespace rocksdb {
 
@@ -24,12 +28,11 @@ YB_DEFINE_ENUM(TimeoutCode, (kMutex)(kLock)(kLockLimit));
 
 struct TimeoutErrorTag : yb::IntegralErrorTag<TimeoutCode> {
   // This category id is part of the wire protocol and should not be changed once released.
-  static constexpr uint8_t kCategory = 3;
+  static constexpr yb::CategoryDescriptor kCategory{3, "timeout"sv};
 
   static const std::string& ToMessage(Value value);
 };
 
-typedef yb::StatusErrorCodeImpl<TimeoutErrorTag> TimeoutError;
-
+using TimeoutError = yb::StatusErrorCodeImpl<TimeoutErrorTag>;
 
 } // namespace rocksdb

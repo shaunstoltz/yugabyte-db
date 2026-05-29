@@ -1,4 +1,4 @@
-// Copyright (c) YugaByte, Inc.
+// Copyright (c) YugabyteDB, Inc.
 
 package com.yugabyte.yw.metrics;
 
@@ -20,7 +20,7 @@ import java.util.List;
 import org.junit.Test;
 import org.junit.runner.RunWith;
 import org.mockito.InjectMocks;
-import org.mockito.runners.MockitoJUnitRunner;
+import org.mockito.junit.MockitoJUnitRunner;
 import play.libs.Json;
 
 @RunWith(MockitoJUnitRunner.class)
@@ -36,8 +36,10 @@ public class MetricQueryResponseTest {
     JsonNode responseJson =
         Json.parse(
             "{\"status\":\"success\",\"data\":{\"resultType\":\"vector\",\"result\":[{\"metric\":\n"
-                + " {\"node_prefix\": \"1-host\"},\"value\":[1479278137,\"0.027751899056199826\"]},{\"metric\":\n"
-                + " {\"node_prefix\": \"1-host\"}, \"value\":[1479278137,\"0.04329469299783263\"]}]}}");
+                + " {\"node_prefix\":"
+                + " \"1-host\"},\"value\":[1479278137,\"0.027751899056199826\"]},{\"metric\":\n"
+                + " {\"node_prefix\": \"1-host\"},"
+                + " \"value\":[1479278137,\"0.04329469299783263\"]}]}}");
 
     MetricQueryResponse queryResponse = Json.fromJson(responseJson, MetricQueryResponse.class);
 
@@ -153,5 +155,27 @@ public class MetricQueryResponseTest {
     for (int i = 0; i < data.size(); ++i) {
       assertTrue(layout.getYaxis().getAlias().values().contains(data.get(i).name));
     }
+  }
+
+  @Test
+  public void testContainerMetricsWithPodName() {
+    JsonNode responseJson =
+        Json.parse(
+            "{\"status\":\"success\",\"data\":{\"resultType\":\"vector\",\"result\":[{\"metric\":\n"
+                + " {\"pod_name\":\"yb-tserver-test-pod\",\"container_name\":\"yb-tserver\","
+                + "\"namespace\":\"test-namespace\"},\"value\":[1479278137,\"0.5\"]}]}}");
+
+    MetricQueryResponse queryResponse = Json.fromJson(responseJson, MetricQueryResponse.class);
+
+    List<MetricGraphData> data =
+        queryResponse.getGraphData(
+            "container_cpu_usage", new MetricConfigDefinition(), METRIC_SETTINGS);
+
+    assertEquals(data.size(), 1);
+    MetricGraphData metricData = data.get(0);
+    assertThat(metricData.instanceName, allOf(notNullValue(), equalTo("yb-tserver-test-pod")));
+    assertThat(metricData.type, allOf(notNullValue(), equalTo("scatter")));
+    assertThat(metricData.x, allOf(notNullValue(), instanceOf(ArrayNode.class)));
+    assertThat(metricData.y, allOf(notNullValue(), instanceOf(ArrayNode.class)));
   }
 }

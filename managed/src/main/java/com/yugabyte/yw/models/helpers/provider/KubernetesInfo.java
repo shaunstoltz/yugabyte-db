@@ -1,17 +1,18 @@
 package com.yugabyte.yw.models.helpers.provider;
 
-import java.util.HashMap;
-import java.util.Map;
-
 import com.fasterxml.jackson.annotation.JsonAlias;
 import com.fasterxml.jackson.annotation.JsonIgnore;
 import com.fasterxml.jackson.annotation.JsonIgnoreProperties;
 import com.fasterxml.jackson.annotation.JsonInclude;
+import com.yugabyte.yw.common.CloudProviderHelper.EditableInUseProvider;
+import com.yugabyte.yw.models.common.YbaApi;
+import com.yugabyte.yw.models.common.YbaApi.YbaApiVisibility;
 import com.yugabyte.yw.models.helpers.CloudInfoInterface;
 import com.yugabyte.yw.models.helpers.CommonUtils;
-
 import io.swagger.annotations.ApiModelProperty;
-
+import io.swagger.annotations.ApiModelProperty.AccessMode;
+import java.util.HashMap;
+import java.util.Map;
 import lombok.Data;
 
 @Data
@@ -20,48 +21,82 @@ import lombok.Data;
 public class KubernetesInfo implements CloudInfoInterface {
 
   @JsonAlias("KUBECONFIG_PROVIDER")
+  @EditableInUseProvider(name = "Kubernetes Provider", allowed = false)
   @ApiModelProperty
-  public String kubernetesProvider;
+  private String kubernetesProvider;
 
+  @YbaApi(visibility = YbaApiVisibility.DEPRECATED, sinceYBAVersion = "2.17.3.0")
   @JsonAlias("KUBECONFIG_SERVICE_ACCOUNT")
-  @ApiModelProperty
-  public String kubernetesServiceAccount;
+  @EditableInUseProvider(name = "Kubernetes Service Account", allowed = false)
+  @ApiModelProperty(
+      value =
+          "<b style=\"color:#ff0000\">Deprecated since YBA version 2.17.3.0.</b> kubernetes service"
+              + " account is not needed.")
+  private String kubernetesServiceAccount;
 
   @JsonAlias("KUBECONFIG_IMAGE_REGISTRY")
   @ApiModelProperty
-  public String kubernetesImageRegistry;
+  @EditableInUseProvider(name = "Kubernetes Image Registry", allowed = false)
+  private String kubernetesImageRegistry;
 
   @JsonAlias("KUBECONFIG_IMAGE_PULL_SECRET_NAME")
+  @EditableInUseProvider(name = "Kubernetes Image Pull Secret Name", allowed = true)
   @ApiModelProperty
-  public String kubernetesImagePullSecretName;
+  private String kubernetesImagePullSecretName;
 
   @JsonAlias("KUBECONFIG_PULL_SECRET")
-  @ApiModelProperty
-  public String kubernetesPullSecret;
+  @ApiModelProperty(accessMode = AccessMode.READ_ONLY)
+  private String kubernetesPullSecret;
 
   @JsonAlias("KUBECONFIG_NAME")
   @ApiModelProperty
-  public String kubeConfigName;
+  private String kubeConfigName;
 
   @JsonAlias("KUBECONFIG_CONTENT")
   @ApiModelProperty
-  public String kubeConfigContent;
+  private String kubeConfigContent;
 
+  /**
+   * Valid values include a file path (file can be empty) and an empty string (for using in-cluster
+   * credentials).
+   */
   @JsonAlias("KUBECONFIG")
-  @ApiModelProperty
-  public String kubeConfig;
+  @ApiModelProperty(accessMode = AccessMode.READ_ONLY)
+  private String kubeConfig;
 
   @JsonAlias("STORAGE_CLASS")
+  @EditableInUseProvider(name = "Kubernetes Storage Class", allowed = false)
   @ApiModelProperty
-  public String kubernetesStorageClass;
+  private String kubernetesStorageClass;
 
   @JsonAlias("KUBECONFIG_PULL_SECRET_CONTENT")
   @ApiModelProperty
-  public String kubernetesPullSecretContent;
+  @EditableInUseProvider(name = "Kubernetes Pull Secret", allowed = true)
+  private String kubernetesPullSecretContent;
 
   @JsonAlias("KUBECONFIG_PULL_SECRET_NAME")
   @ApiModelProperty
-  public String kubernetesPullSecretName;
+  @EditableInUseProvider(name = "Kubernetes Pull Secret Name", allowed = true)
+  private String kubernetesPullSecretName;
+
+  @ApiModelProperty(accessMode = AccessMode.READ_ONLY)
+  public boolean isKubernetesOperatorControlled = false;
+
+  // Flag for identifying the legacy k8s providers created before release 2.18.
+  @ApiModelProperty(hidden = true)
+  private boolean legacyK8sProvider = true;
+
+  // TODO(bhavin192): Should caFile, tokenFile, apiServerEndpoint, and
+  // kubeconfig be part of a subclass named kubeConfigInfo?
+
+  @ApiModelProperty(hidden = true)
+  private String kubeConfigCAFile;
+
+  @ApiModelProperty(hidden = true)
+  private String kubeConfigTokenFile;
+
+  @ApiModelProperty(hidden = true)
+  private String apiServerEndpoint;
 
   @JsonIgnore
   public Map<String, String> getEnvVars() {
@@ -70,9 +105,10 @@ public class KubernetesInfo implements CloudInfoInterface {
     if (kubeConfig != null) {
       envVars.put("KUBECONFIG", kubeConfig);
     }
-
     if (kubeConfigName != null) {
       envVars.put("KUBECONFIG_NAME", kubeConfigName);
+    }
+    if (kubeConfigContent != null) {
       envVars.put("KUBECONFIG_CONTENT", kubeConfigContent);
     }
     if (kubernetesServiceAccount != null) {
@@ -86,6 +122,8 @@ public class KubernetesInfo implements CloudInfoInterface {
     }
     if (kubernetesPullSecretName != null) {
       envVars.put("KUBECONFIG_PULL_SECRET_NAME", kubernetesPullSecretName);
+    }
+    if (kubernetesPullSecretContent != null) {
       envVars.put("KUBECONFIG_PULL_SECRET_CONTENT", kubernetesPullSecretContent);
     }
     if (kubernetesPullSecret != null) {
@@ -110,5 +148,31 @@ public class KubernetesInfo implements CloudInfoInterface {
     this.kubernetesImagePullSecretName = CommonUtils.getMaskedValue(kubernetesImagePullSecretName);
     this.kubernetesPullSecret = CommonUtils.getMaskedValue(kubernetesPullSecret);
     this.kubernetesPullSecretName = CommonUtils.getMaskedValue(kubernetesPullSecretName);
+    // Fields not accessible to the user
+    this.kubeConfigCAFile = null;
+    this.kubeConfigTokenFile = null;
+    this.apiServerEndpoint = null;
+  }
+
+  @JsonIgnore
+  public void mergeMaskedFields(CloudInfoInterface providerCloudInfo) {
+    KubernetesInfo kubernetesInfo = (KubernetesInfo) providerCloudInfo;
+    // If the modify request contains masked value, overwrite those using
+    // the existing ebean entity.
+    if (this.kubernetesImagePullSecretName != null
+        && this.kubernetesImagePullSecretName.contains("*")) {
+      this.kubernetesImagePullSecretName = kubernetesInfo.kubernetesImagePullSecretName;
+    }
+    if (this.kubernetesPullSecret != null && this.kubernetesPullSecret.contains("*")) {
+      this.kubernetesPullSecret = kubernetesInfo.kubernetesPullSecret;
+    }
+    if (this.kubernetesPullSecretName != null && this.kubernetesPullSecretName.contains("*")) {
+      this.kubernetesPullSecretName = kubernetesInfo.kubernetesPullSecretName;
+    }
+    this.legacyK8sProvider = kubernetesInfo.legacyK8sProvider;
+    // Restore fields not accessible to the user
+    this.kubeConfigCAFile = kubernetesInfo.kubeConfigCAFile;
+    this.kubeConfigTokenFile = kubernetesInfo.kubeConfigTokenFile;
+    this.apiServerEndpoint = kubernetesInfo.apiServerEndpoint;
   }
 }

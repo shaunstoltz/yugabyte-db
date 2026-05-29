@@ -27,9 +27,9 @@
  * (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
  * OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
  *
- * The following only applies to changes made to this file as part of YugaByte development.
+ * The following only applies to changes made to this file as part of YugabyteDB development.
  *
- * Portions Copyright (c) YugaByte, Inc.
+ * Portions Copyright (c) YugabyteDB, Inc.
  *
  * Licensed under the Apache License, Version 2.0 (the "License"); you may not use this file except
  * in compliance with the License.  You may obtain a copy of the License at
@@ -64,7 +64,7 @@ namespace base {
 
 class CAPABILITY("mutex") SpinLock {
  public:
-  SpinLock() : lockword_(kSpinLockFree) { }
+  constexpr SpinLock() : lockword_(kSpinLockFree) { }
 
   // Special constructor for use with static SpinLock objects.  E.g.,
   //
@@ -157,14 +157,12 @@ class SCOPED_CAPABILITY SpinLockHolder {
  private:
   SpinLock* lock_;
  public:
-  inline explicit SpinLockHolder(SpinLock* l) ACQUIRE(l)
+  [[nodiscard]] inline explicit SpinLockHolder(SpinLock* l) ACQUIRE(l)
       : lock_(l) {
     l->Lock();
   }
 
   inline ~SpinLockHolder() RELEASE() { lock_->Unlock(); }
 };
-// Catch bug where variable name is omitted, e.g. SpinLockHolder (&lock);
-#define SpinLockHolder(x) COMPILE_ASSERT(0, spin_lock_decl_missing_var_name)
 
 } // namespace base

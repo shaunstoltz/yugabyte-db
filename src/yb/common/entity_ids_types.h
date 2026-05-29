@@ -1,4 +1,4 @@
-// Copyright (c) YugaByte, Inc.
+// Copyright (c) YugabyteDB, Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License"); you may not use this file except
 // in compliance with the License.  You may obtain a copy of the License at
@@ -13,7 +13,10 @@
 
 #pragma once
 
+#include <memory>
 #include <string>
+#include <vector>
+#include <unordered_set>
 
 #include "yb/util/strongly_typed_string.h"
 
@@ -24,21 +27,25 @@ using NamespaceName = std::string;
 using TableName = std::string;
 using UDTypeName = std::string;
 using RoleName = std::string;
+using PgSchemaName = std::string;
 
 using NamespaceId = std::string;
+using NamespaceIdView = std::string_view;
 using ObjectId = std::string;
 using TableId = std::string;
+using TableIdView = std::string_view;
 using UDTypeId = std::string;
-using CDCStreamId = std::string;
 
 using PeerId = std::string;
 using SnapshotId = std::string;
 using TabletServerId = PeerId;
 using TabletId = std::string;
+using TabletIdView = std::string_view;
 using TablegroupId = std::string;
 using TablespaceId = std::string;
 
 YB_STRONGLY_TYPED_STRING(KvStoreId);
+YB_STRONGLY_TYPED_STRING(ReplicationSlotName);
 
 // TODO(#79): switch to YB_STRONGLY_TYPED_STRING
 using RaftGroupId = std::string;
@@ -48,5 +55,9 @@ using NamespaceIdTableNamePair = std::pair<NamespaceId, TableName>;
 using FlushRequestId = std::string;
 
 using RedisConfigKey = std::string;
+
+using TableIdSet = std::unordered_set<TableId>;
+using TableIds = std::vector<TableId>;
+using TableIdsPtr = std::shared_ptr<TableIds>;
 
 }  // namespace yb

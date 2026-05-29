@@ -1,4 +1,4 @@
-// Copyright (c) YugaByte, Inc.
+// Copyright (c) YugabyteDB, Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License"); you may not use this file except
 // in compliance with the License.  You may obtain a copy of the License at
@@ -13,24 +13,27 @@
 
 #pragma once
 
+#include <string>
+#include <string_view>
+
 #include "yb/master/master_types.pb.h"
 
 #include "yb/util/status_fwd.h"
 #include "yb/util/status_ec.h"
 
-namespace yb {
-namespace master {
+using namespace std::literals;
+
+namespace yb::master {
 
 struct MasterErrorTag : IntegralErrorTag<MasterErrorPB::Code> {
   // This category id is part of the wire protocol and should not be changed once released.
-  static constexpr uint8_t kCategory = 9;
+  static constexpr CategoryDescriptor kCategory{9, "master error"sv};
 
   static const std::string& ToMessage(Value code) {
     return MasterErrorPB::Code_Name(code);
   }
 };
 
-typedef StatusErrorCodeImpl<MasterErrorTag> MasterError;
+using MasterError = StatusErrorCodeImpl<MasterErrorTag>;
 
-} // namespace master
-} // namespace yb
+} // namespace yb::master

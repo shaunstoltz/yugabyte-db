@@ -1,4 +1,4 @@
-// Copyright (c) YugaByte, Inc.
+// Copyright (c) YugabyteDB, Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License"); you may not use this file except
 // in compliance with the License.  You may obtain a copy of the License at
@@ -33,8 +33,8 @@ public class GetUniverseReplicationRequest extends YRpc<GetUniverseReplicationRe
     assert header.isInitialized();
 
     final MasterReplicationOuterClass.GetUniverseReplicationRequestPB.Builder builder =
-      MasterReplicationOuterClass.GetUniverseReplicationRequestPB.newBuilder().setProducerId(
-          replicationGroupName);
+        MasterReplicationOuterClass.GetUniverseReplicationRequestPB.newBuilder()
+            .setReplicationGroupId(replicationGroupName);
 
     return toChannelBuffer(header, builder.build());
   }

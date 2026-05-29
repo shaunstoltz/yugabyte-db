@@ -1,5 +1,5 @@
 /*
- * Copyright 2021 YugaByte, Inc. and Contributors
+ * Copyright 2021 YugabyteDB, Inc. and Contributors
  *
  * Licensed under the Polyform Free Trial License 1.0.0 (the "License"); you
  * may not use this file except in compliance with the License. You
@@ -11,15 +11,13 @@
 
 package com.yugabyte.yw.common.kms.util.hashicorpvault;
 
+import com.bettercloud.vault.VaultException;
+import com.yugabyte.yw.common.kms.util.EncryptionAtRestUtil.KeyType;
 import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
 import java.util.Base64;
 import java.util.HashMap;
 import java.util.Map;
-
-import com.bettercloud.vault.VaultException;
-import com.yugabyte.yw.common.kms.util.EncryptionAtRestUtil.KeyType;
-
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 

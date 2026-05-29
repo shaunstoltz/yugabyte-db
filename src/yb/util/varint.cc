@@ -1,4 +1,4 @@
-// Copyright (c) YugaByte, Inc.
+// Copyright (c) YugabyteDB, Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License"); you may not use this file except
 // in compliance with the License.  You may obtain a copy of the License at
@@ -24,7 +24,6 @@
 using std::ostream;
 
 namespace yb {
-namespace util {
 
 void BigNumDeleter::operator()(BIGNUM* bn) const {
   BN_free(bn);
@@ -305,5 +304,4 @@ VarInt operator-(const VarInt& lhs, const VarInt& rhs) {
   return VarInt(std::move(temp));
 }
 
-} // namespace util
 } // namespace yb

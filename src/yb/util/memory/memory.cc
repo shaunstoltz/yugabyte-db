@@ -17,9 +17,9 @@
 // specific language governing permissions and limitations
 // under the License.
 //
-// The following only applies to changes made to this file as part of YugaByte development.
+// The following only applies to changes made to this file as part of YugabyteDB development.
 //
-// Portions Copyright (c) YugaByte, Inc.
+// Portions Copyright (c) YugabyteDB, Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License"); you may not use this file except
 // in compliance with the License.  You may obtain a copy of the License at
@@ -43,13 +43,9 @@
 #include "yb/util/flags.h"
 #include "yb/util/mem_tracker.h"
 #include "yb/util/size_literals.h"
+#include "yb/util/tcmalloc_impl_util.h"
 
-using std::copy;
-using std::max;
 using std::min;
-using std::reverse;
-using std::sort;
-using std::swap;
 
 namespace yb {
 
@@ -382,17 +378,17 @@ void MemoryTrackingBufferAllocator::FreeInternal(Buffer* buffer) {
 }
 
 std::string TcMallocStats() {
-#ifdef YB_TCMALLOC_ENABLED
-#if defined(YB_GOOGLE_TCMALLOC)
+#if !YB_TCMALLOC_ENABLED
+  return std::string();
+#endif
+#if YB_GOOGLE_TCMALLOC
   return ::tcmalloc::MallocExtension::GetStats();
-#else
+#endif
+#if YB_GPERFTOOLS_TCMALLOC
   char buf[20_KB];
   MallocExtension::instance()->GetStats(buf, sizeof(buf));
   return buf;
-#endif
-#else
-  return "";
-#endif
+#endif  // YB_GPERFTOOLS_TCMALLOC
 }
 
 

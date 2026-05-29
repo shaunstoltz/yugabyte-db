@@ -1,5 +1,5 @@
 /*
- * Copyright 2021 YugaByte, Inc. and Contributors
+ * Copyright 2021 YugabyteDB, Inc. and Contributors
  *
  * Licensed under the Polyform Free Trial License 1.0.0 (the "License"); you
  * may not use this file except in compliance with the License. You
@@ -10,7 +10,7 @@
 package com.yugabyte.yw.models.filters;
 
 import com.fasterxml.jackson.annotation.JsonIgnore;
-import com.yugabyte.yw.common.AlertTemplate;
+import com.yugabyte.yw.common.alerts.impl.AlertTemplateService.AlertTemplateDescription;
 import com.yugabyte.yw.models.AlertConfiguration;
 import lombok.Builder;
 import lombok.Value;
@@ -22,7 +22,7 @@ public class AlertTemplateFilter {
   AlertConfiguration.TargetType targetType;
 
   @JsonIgnore
-  public boolean matches(AlertTemplate template) {
+  public boolean matches(AlertTemplateDescription template) {
     if (name != null && !template.getName().equals(name)) {
       return false;
     }

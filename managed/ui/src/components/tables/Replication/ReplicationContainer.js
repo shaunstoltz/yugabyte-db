@@ -1,4 +1,4 @@
-// Copyright (c) YugaByte, Inc.
+// Copyright (c) YugabyteDB, Inc.
 
 import { connect } from 'react-redux';
 import Replication from './Replication';
@@ -11,8 +11,6 @@ import {
 import {
   fetchUniverseInfo,
   fetchUniverseInfoResponse,
-  getMasterLeader,
-  getMasterLeaderResponse,
   resetMasterLeader
 } from '../../../actions/universe';
 
@@ -30,12 +28,6 @@ const mapDispatchToProps = (dispatch) => {
     resetMetrics: () => {
       dispatch(resetMetrics());
     },
-    getMasterLeader: (uuid) => {
-      dispatch(getMasterLeader(uuid)).then((response) => {
-        dispatch(getMasterLeaderResponse(response.payload));
-      });
-    },
-
     resetMasterLeader: () => {
       dispatch(resetMasterLeader());
     },

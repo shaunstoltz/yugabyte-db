@@ -1,4 +1,4 @@
-// Copyright (c) YugaByte, Inc.
+// Copyright (c) YugabyteDB, Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License"); you may not use this file except
 // in compliance with the License.  You may obtain a copy of the License at
@@ -25,6 +25,8 @@
 
 #include "yb/yql/redis/redisserver/redis_fwd.h"
 #include "yb/yql/redis/redisserver/redis_server.h"
+
+#include "yb/util/memory/arena_fwd.h"
 
 namespace yb {
 namespace redisserver {
@@ -83,6 +85,7 @@ class BatchContext : public RefCountedThreadSafe<BatchContext> {
   virtual const RedisServer* server() = 0;
   virtual RedisServiceData* service_data() = 0;
   virtual void CleanYBTableFromCache() = 0;
+  virtual const ThreadSafeArenaPtr& arena() const = 0;
 
   virtual void Apply(
       size_t index,
@@ -100,6 +103,8 @@ class BatchContext : public RefCountedThreadSafe<BatchContext> {
       std::string partition_key,
       const rpc::RpcMethodMetrics& metrics,
       ManualResponse manual_response) = 0;
+
+  std::shared_ptr<LWRedisResponsePB> CreateResponse() const;
 
   virtual ~BatchContext() {}
 };
@@ -137,7 +142,7 @@ void FillRedisCommands(const scoped_refptr<MetricEntity>& metric_entity,
     BOOST_PP_CAT(METRIC_handler_latency_yb_redisserver_RedisServerService_, name)
 
 #define DEFINE_REDIS_histogram_EX(name_identifier, label_str, desc_str) \
-  METRIC_DEFINE_histogram_with_percentiles( \
+  METRIC_DEFINE_histogram( \
       server, BOOST_PP_CAT(handler_latency_yb_redisserver_RedisServerService_, name_identifier), \
       (label_str), yb::MetricUnit::kMicroseconds, \
       "Microseconds spent handling " desc_str " RPC requests", \

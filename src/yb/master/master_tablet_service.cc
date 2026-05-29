@@ -1,4 +1,4 @@
-// Copyright (c) YugaByte, Inc.
+// Copyright (c) YugabyteDB, Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License"); you may not use this file except
 // in compliance with the License.  You may obtain a copy of the License at
@@ -19,12 +19,13 @@
 #include "yb/common/entity_ids.h"
 #include "yb/common/wire_protocol.h"
 
-#include "yb/docdb/doc_key.h"
+#include "yb/dockv/doc_key.h"
 
 #include "yb/master/catalog_manager_if.h"
 #include "yb/master/master.h"
 #include "yb/master/scoped_leader_shared_lock.h"
 #include "yb/master/scoped_leader_shared_lock-internal.h"
+#include "yb/master/ysql/ysql_manager.h"
 
 #include "yb/rpc/rpc_context.h"
 
@@ -35,6 +36,9 @@
 
 DEFINE_test_flag(int32, ysql_catalog_write_rejection_percentage, 0,
     "Reject specified percentage of writes to the YSQL catalog tables.");
+
+DEFINE_test_flag(bool, ysql_require_force_catalog_modifications, false,
+    "Fail YSQL catalog writes requests if force_catalog_modifications is not set.");
 
 using namespace std::chrono_literals;
 
@@ -52,8 +56,9 @@ MasterTabletServiceImpl::MasterTabletServiceImpl(MasterTabletServer* server, Mas
 }
 
 Result<std::shared_ptr<tablet::AbstractTablet>> MasterTabletServiceImpl::GetTabletForRead(
-  const TabletId& tablet_id, tablet::TabletPeerPtr tablet_peer,
-  YBConsistencyLevel consistency_level, tserver::AllowSplitTablet allow_split_tablet) {
+  TabletIdView tablet_id, tablet::TabletPeerPtr tablet_peer,
+  YBConsistencyLevel consistency_level, tserver::AllowSplitTablet allow_split_tablet,
+  tserver::ReadResponseMsg* resp) {
   // Ignore looked_up_tablet_peer.
 
   SCOPED_LEADER_SHARED_LOCK(l, master_->catalog_manager_impl());
@@ -62,8 +67,29 @@ Result<std::shared_ptr<tablet::AbstractTablet>> MasterTabletServiceImpl::GetTabl
   return master_->catalog_manager()->GetSystemTablet(tablet_id);
 }
 
-void MasterTabletServiceImpl::Write(const tserver::WriteRequestPB* req,
-                                    tserver::WriteResponsePB* resp,
+void MasterTabletServiceImpl::AcquireObjectLocks(
+    const tserver::AcquireObjectLockRequestPB* req, tserver::AcquireObjectLockResponsePB* resp,
+    rpc::RpcContext context) {
+  context.RespondRpcFailure(
+      rpc::ErrorStatusPB::ERROR_APPLICATION,
+      STATUS(NotSupported, "AcquireObjectLocks is not implemented at masters"));
+}
+
+void MasterTabletServiceImpl::ReleaseObjectLocks(
+    const tserver::ReleaseObjectLockRequestPB* req, tserver::ReleaseObjectLockResponsePB* resp,
+    rpc::RpcContext context) {
+  context.RespondRpcFailure(
+      rpc::ErrorStatusPB::ERROR_APPLICATION,
+      STATUS(NotSupported, "ReleaseObjectLocks is not implemented at masters"));
+}
+
+Result<tserver::GetYSQLLeaseInfoResponsePB> MasterTabletServiceImpl::GetYSQLLeaseInfo(
+    const tserver::GetYSQLLeaseInfoRequestPB& req, CoarseTimePoint deadline) {
+  return STATUS(NotSupported, "GetYSQLLeaseInfo is not implemented at masters");
+}
+
+void MasterTabletServiceImpl::Write(const tserver::WriteRequestMsg* req,
+                                    tserver::WriteResponseMsg* resp,
                                     rpc::RpcContext context) {
   SCOPED_LEADER_SHARED_LOCK(l, master_->catalog_manager_impl());
   if (!l.CheckIsInitializedAndIsLeaderOrRespondTServer(resp, &context)) {
@@ -79,39 +105,63 @@ void MasterTabletServiceImpl::Write(const tserver::WriteRequestPB* req,
   }
 
   bool log_versions = false;
-  std::optional<uint32_t> db_oid;
-  for (const auto& pg_req : req->pgsql_write_batch()) {
+  std::unordered_set<uint32_t> db_oids;
+  for (const auto &pg_req : req->pgsql_write_batch()) {
+    if (FLAGS_TEST_ysql_require_force_catalog_modifications &&
+        !pg_req.force_catalog_modifications()) {
+      context.RespondRpcFailure(
+          rpc::ErrorStatusPB::ERROR_APPLICATION,
+          STATUS(
+              InternalError,
+              "Catalog update without force_catalog_modifications when "
+              "TEST_ysql_require_force_catalog_modifications is set"));
+      return;
+    }
+
+    {
+      auto write_allowed = master_->ysql_manager_impl().ValidateWriteToCatalogTableAllowed(
+          pg_req.table_id(), pg_req.force_catalog_modifications());
+      if (!write_allowed.ok()) {
+        VLOG(1) << "Write to catalog table while it is not allowed: " << pg_req.ShortDebugString();
+        context.RespondRpcFailure(rpc::ErrorStatusPB::ERROR_APPLICATION, std::move(write_allowed));
+        return;
+      }
+    }
+
     if (pg_req.is_ysql_catalog_change_using_protobuf()) {
-      const auto &res = master_->catalog_manager()->IncrementYsqlCatalogVersion();
+      const auto& res = master_->catalog_manager()->IncrementYsqlCatalogVersion();
       if (!res.ok()) {
         context.RespondRpcFailure(rpc::ErrorStatusPB::ERROR_APPLICATION,
             STATUS(InternalError, "Failed to increment YSQL catalog version"));
       }
     } else if (FLAGS_log_ysql_catalog_versions && pg_req.table_id() == kPgYbCatalogVersionTableId) {
       log_versions = true;
-      if (FLAGS_TEST_enable_db_catalog_version_mode) {
-        // The contents of req->pgsql_write_batch() are freed after the next call to
-        // tserver::TabletServiceImpl::Write, save db_oid to use for later debugging log.
+      // The contents of req->pgsql_write_batch() are freed after the next call to
+      // tserver::TabletServiceImpl::Write, save db_oid to use for later debugging log.
 
-        // The write op to increment the catalog version number is special and may not have
-        // set any of ysql_catalog_version, ysql_db_catalog_version, and ysql_db_oid. Therefore
-        // we need to get db oid by decoding from ybctid.
-        docdb::DocKey doc_key;
-        if (!pg_req.has_ybctid_column_value() ||
-            !doc_key.FullyDecodeFrom(pg_req.ybctid_column_value().value().binary_value()).ok() ||
-            doc_key.range_group().size() != 1) {
-          context.RespondRpcFailure(rpc::ErrorStatusPB::ERROR_APPLICATION,
-              STATUS(InternalError, "Failed to get db oid"));
-        }
-
-        // We do not expect to see more than one write ops that write to the table
-        // kPgYbCatalogVersionTableId.
-        DCHECK(!db_oid);
-        db_oid = doc_key.range_group()[0].GetUInt32();
+      // The write op to increment the catalog version number is special and may not have
+      // set any of ysql_catalog_version, ysql_db_catalog_version, and ysql_db_oid. Therefore
+      // we need to get db oid by decoding from ybctid.
+      dockv::DocKey doc_key;
+      if (!pg_req.has_ybctid_column_value() ||
+          !doc_key.FullyDecodeFrom(pg_req.ybctid_column_value().value().binary_value()).ok() ||
+          doc_key.range_group().size() != 1) {
+        context.RespondRpcFailure(rpc::ErrorStatusPB::ERROR_APPLICATION,
+            STATUS(InternalError, "Failed to get db oid"));
+      }
+      const uint32_t db_oid = doc_key.range_group()[0].GetUInt32();
+      // In per-db catalog version mode, there can be multiple write ops to the
+      // pg_yb_catalog_version table for different rows. We do not expect multiple write ops
+      // that write to the same db_oid because db_oid is the primary key and a duplicate-key
+      // error should be reported.
+      if (!db_oids.insert(db_oid).second) {
+        LOG(DFATAL) << "Unexpected multiple writes to db_oid "
+                    << db_oid << ", req: " << req->ShortDebugString();
       }
     }
   }
 
+  VLOG(5) << "Master write req: " << req->ShortDebugString();
   tserver::TabletServiceImpl::Write(req, resp, std::move(context));
 
   if (log_versions) {
@@ -120,20 +170,22 @@ void MasterTabletServiceImpl::Write(const tserver::WriteRequestPB* req,
     // The above Write is async, so delay a bit to hopefully read the newly written values.  If the
     // delay was not sufficient, it's not a big deal since this is just for logging.
     SleepFor(100ms);
-    if (db_oid) {
-      if (!master_->catalog_manager()->GetYsqlDBCatalogVersion(*db_oid, &catalog_version,
-                                                               &last_breaking_version).ok()) {
-        LOG_WITH_FUNC(ERROR) << "failed to get db catalog version for "
-                             << *db_oid << ", ignoring";
-      } else {
-        LOG_WITH_FUNC(INFO) << "db catalog version for " << *db_oid << ": "
-                            << catalog_version << ", breaking version: "
-                            << last_breaking_version;
+    if (!db_oids.empty()) {
+      for (const auto db_oid : db_oids) {
+        if (!master_->catalog_manager()->GetYsqlDBCatalogVersion(db_oid, &catalog_version,
+                                                                 &last_breaking_version).ok()) {
+          LOG_WITH_FUNC(DFATAL) << "failed to get db catalog version for "
+                                << db_oid << ", ignoring";
+        } else {
+          LOG_WITH_FUNC(INFO) << "db catalog version for " << db_oid << ": "
+                              << catalog_version << ", breaking version: "
+                              << last_breaking_version;
+        }
       }
     } else {
       if (!master_->catalog_manager()->GetYsqlCatalogVersion(&catalog_version,
                                                              &last_breaking_version).ok()) {
-        LOG_WITH_FUNC(ERROR) << "failed to get catalog version, ignoring";
+        LOG_WITH_FUNC(DFATAL) << "failed to get catalog version, ignoring";
       } else {
         LOG_WITH_FUNC(INFO) << "catalog version: " << catalog_version << ", breaking version: "
                             << last_breaking_version;
@@ -169,7 +221,13 @@ void HandleUnsupportedMethod(const char* method_name, rpc::RpcContext* context) 
                              STATUS_FORMAT(NotSupported, "$0 Not Supported!", method_name));
 }
 
-} // namespace
+}  // namespace
+
+void MasterTabletServiceImpl::ListMasterServers(
+    const tserver::ListMasterServersRequestPB* req, tserver::ListMasterServersResponsePB* resp,
+    rpc::RpcContext context) {
+  HandleUnsupportedMethod("ListMasterServers", &context);
+}
 
 void MasterTabletServiceImpl::ListTablets(const tserver::ListTabletsRequestPB* req,
                                           tserver::ListTabletsResponsePB* resp,
@@ -194,6 +252,12 @@ void MasterTabletServiceImpl::Checksum(const tserver::ChecksumRequestPB* req,
                                        tserver::ChecksumResponsePB* resp,
                                        rpc::RpcContext context)  {
   HandleUnsupportedMethod("Checksum", &context);
+}
+
+void MasterTabletServiceImpl::AdminExecutePgsql(
+    const tserver::AdminExecutePgsqlRequestPB* req, tserver::AdminExecutePgsqlResponsePB* resp,
+    rpc::RpcContext context) {
+  HandleUnsupportedMethod("AdminExecutePgsql", &context);
 }
 
 } // namespace master

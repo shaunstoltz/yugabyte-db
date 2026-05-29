@@ -15,9 +15,9 @@
 // specific language governing permissions and limitations
 // under the License.
 //
-// The following only applies to changes made to this file as part of YugaByte development.
+// The following only applies to changes made to this file as part of YugabyteDB development.
 //
-// Portions Copyright (c) YugaByte, Inc.
+// Portions Copyright (c) YugabyteDB, Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License"); you may not use this file except
 // in compliance with the License.  You may obtain a copy of the License at
@@ -37,6 +37,8 @@
 #include <mutex>
 #include <vector>
 
+#include "yb/common/hybrid_time.h"
+
 #include "yb/consensus/consensus.messages.h"
 #include "yb/consensus/consensus_util.h"
 #include "yb/consensus/log.h"
@@ -47,7 +49,6 @@
 #include "yb/gutil/map-util.h"
 #include "yb/gutil/strings/human_readable.h"
 
-#include "yb/util/flags.h"
 #include "yb/util/format.h"
 #include "yb/util/locks.h"
 #include "yb/util/logging.h"
@@ -57,9 +58,10 @@
 #include "yb/util/result.h"
 #include "yb/util/size_literals.h"
 #include "yb/util/status_format.h"
+#include "yb/util/sync_point.h"
 
-using std::vector;
 using std::string;
+using std::vector;
 
 using namespace std::literals;
 
@@ -97,16 +99,15 @@ METRIC_DEFINE_counter(tablet, log_cache_disk_reads, "Log Cache Disk Reads",
 
 DECLARE_bool(get_changes_honor_deadline);
 
-namespace yb {
-namespace consensus {
+namespace yb::consensus {
 
 namespace {
 
-const std::string kParentMemTrackerId = "log_cache"s;
+const std::string kParentMemTrackerId = "LogCache"s;
 
 }
 
-typedef vector<const ReplicateMsg*>::const_iterator MsgIter;
+using MsgIter = vector<const ReplicateMsg *>::const_iterator;
 
 LogCache::LogCache(const scoped_refptr<MetricEntity>& metric_entity,
                    const log::LogPtr& log,
@@ -130,9 +131,10 @@ LogCache::LogCache(const scoped_refptr<MetricEntity>& metric_entity,
 
   // And create a child tracker with the per-tablet limit.
   tracker_ = MemTracker::CreateTracker(
-      max_ops_size_bytes, Format("$0-$1", kParentMemTrackerId, tablet_id), parent_tracker_,
-      AddToParent::kTrue, CreateMetrics::kFalse);
-  tracker_->SetMetricEntity(metric_entity, kParentMemTrackerId);
+      max_ops_size_bytes, Format("$0-$1", kParentMemTrackerId, tablet_id),
+          /* metric_name */ "PerLogCache", parent_tracker_, AddToParent::kTrue,
+              CreateMetrics::kFalse);
+  tracker_->SetMetricEntity(metric_entity);
 
   // Put a fake message at index 0, since this simplifies a lot of our code paths elsewhere.
   auto zero_op = rpc::MakeSharedMessage<LWReplicateMsg>();
@@ -159,7 +161,7 @@ MemTrackerPtr LogCache::GetServerMemTracker(const MemTrackerPtr& server_tracker)
 LogCache::~LogCache() {
   tracker_->Release(tracker_->consumption());
   {
-    std::lock_guard<simple_spinlock> l(lock_);
+    std::lock_guard l(lock_);
     cache_.clear();
   }
 
@@ -167,7 +169,7 @@ LogCache::~LogCache() {
 }
 
 void LogCache::Init(const OpIdPB& preceding_op) {
-  std::lock_guard<simple_spinlock> l(lock_);
+  std::lock_guard l(lock_);
   CHECK_EQ(cache_.size(), 1) << "Cache should have only our special '0' op";
   next_sequential_op_index_ = preceding_op.index() + 1;
   min_pinned_op_index_ = next_sequential_op_index_;
@@ -179,7 +181,7 @@ LogCache::PrepareAppendResult LogCache::PrepareAppendOperations(const ReplicateM
   std::vector<CacheEntry> entries_to_insert;
   entries_to_insert.reserve(msgs.size());
   for (const auto& msg : msgs) {
-    CacheEntry e = { msg, msg->SpaceUsedLong() };
+    CacheEntry e = {.msg = msg, .mem_usage = msg->SpaceUsedLong()};
     result.mem_required += e.mem_usage;
     entries_to_insert.emplace_back(std::move(e));
   }
@@ -190,7 +192,7 @@ LogCache::PrepareAppendResult LogCache::PrepareAppendOperations(const ReplicateM
   // Capture the evicted messages and release the memory outside of lock.
   ReplicateMsgVector evicted_messages;
 
-  std::lock_guard<simple_spinlock> lock(lock_);
+  std::lock_guard lock(lock_);
   // If we're not appending a consecutive op we're likely overwriting and need to replace operations
   // in the cache.
   if (first_idx_in_batch != next_sequential_op_index_) {
@@ -241,12 +243,14 @@ Status LogCache::AppendOperations(const ReplicateMsgs& msgs, const OpId& committ
     prepare_result = PrepareAppendOperations(msgs);
   }
 
+  TracePtr current_trace(Trace::CurrentTrace());
   Status log_status = log_->AsyncAppendReplicates(
     msgs, committed_op_id, batch_mono_time,
     Bind(&LogCache::LogCallback,
          Unretained(this),
          prepare_result.overwritten_cache,
          prepare_result.last_idx_in_batch,
+         current_trace,
          callback));
 
   if (!log_status.ok()) {
@@ -262,10 +266,13 @@ Status LogCache::AppendOperations(const ReplicateMsgs& msgs, const OpId& committ
 
 void LogCache::LogCallback(bool overwritten_cache,
                            int64_t last_idx_in_batch,
+                           TracePtr trace,
                            const StatusCallback& user_callback,
                            const Status& log_status) {
+  ADOPT_TRACE(trace.get());
+  TRACE("Appended till idx $0 to the local log", last_idx_in_batch);
   if (overwritten_cache || log_status.ok()) {
-    std::lock_guard<simple_spinlock> l(lock_);
+    std::lock_guard l(lock_);
     if (overwritten_cache) {
       CHECK_GT(num_batches_overwritten_cache_, 0)
           << "num_batches_overwritten_cache_ is expected to be greater than 0, but actually is "
@@ -281,23 +288,61 @@ void LogCache::LogCallback(bool overwritten_cache,
   user_callback.Run(log_status);
 }
 
-int64_t LogCache::earliest_op_index() const {
-  auto ret = log_->GetLogReader()->GetMinReplicateIndex();
+Result<int64_t> LogCache::earliest_op_index() const {
+  auto ret = VERIFY_RESULT(log_->GetLogReader())->GetMinReplicateIndex();
   if (ret == -1) { // No finalized log files yet.  Query the active log.
     ret = log_->GetMinReplicateIndex();
   }
   return ret;
 }
 
+Result<log::ReadableLogSegmentPtr> CheckHasFooter(
+    const Result<log::ReadableLogSegmentPtr>& segment) {
+  RETURN_NOT_OK(segment);
+  if (!(*segment)->HasFooter()) {
+    return STATUS_FORMAT(
+        NotFound, "Footer for segment $0 not found", (*segment)->header().sequence_number());
+  }
+  return *segment;
+}
+
+Result<HybridTime> LogCache::GetMinStartTimeRunningTxnsFromSegmentFooter(
+    int64_t segment_number) const {
+  const auto segment = VERIFY_RESULT(CheckHasFooter(
+      VERIFY_RESULT(log_->GetLogReader())
+          ->GetSegmentBySequenceNumber(segment_number)));
+
+  // Segments from older DB versions will have a footer without min_start_time_running_txns
+  // stored in it. For such segments, return HybridTime::kInitial. This is to preserve the semantics
+  // that min_start_time_running_txns of a closed segment will always hold a valid HT value.
+  return segment->footer().has_min_start_time_running_txns()
+             ? HybridTime(segment->footer().min_start_time_running_txns())
+             : HybridTime::kInitial;
+}
+
+Result<int64_t> LogCache::GetMaxReplicateIndexFromSegmentFooter(int64_t segment_number) const {
+  TEST_SYNC_POINT("LogCache::GetMaxReplicateIndexFromSegmentFooter::Entered");
+  TEST_SYNC_POINT("LogCache::GetMaxReplicateIndexFromSegmentFooter::BeforeRead");
+  const auto segment = VERIFY_RESULT(CheckHasFooter(
+      VERIFY_RESULT(log_->GetLogReader())
+          ->GetSegmentBySequenceNumber(segment_number)));
+
+  return segment->footer().has_max_replicate_index() ? segment->footer().max_replicate_index() : 0;
+}
+
+int64_t LogCache::GetActiveSegmentNumber() const {
+  return log_->active_segment_sequence_number();
+}
+
 bool LogCache::HasOpBeenWritten(int64_t index) const {
-  std::lock_guard<simple_spinlock> l(lock_);
+  std::lock_guard l(lock_);
   return index < next_sequential_op_index_;
 }
 
 Result<yb::OpId> LogCache::LookupOpId(int64_t op_index) const {
   // First check the log cache itself.
   {
-    std::lock_guard<simple_spinlock> l(lock_);
+    std::lock_guard l(lock_);
 
     // We sometimes try to look up OpIds that have never been written on
     // the local node. In that case, don't try to read the op from the
@@ -314,7 +359,11 @@ Result<yb::OpId> LogCache::LookupOpId(int64_t op_index) const {
   }
 
   // If it misses, read from the log.
-  return log_->GetLogReader()->LookupOpId(op_index);
+  return VERIFY_RESULT(log_->GetLogReader())->LookupOpId(op_index);
+}
+
+Result<int64_t> LogCache::LookupOpWalSegmentNumber(int64_t op_index) const {
+  return VERIFY_RESULT(log_->GetLogReader())->LookupOpWalSegmentNumber(op_index);
 }
 
 namespace {
@@ -330,8 +379,9 @@ int64_t TotalByteSizeForMessage(const LWReplicateMsg& msg) {
 
 } // anonymous namespace
 
-Result<ReadOpsResult> LogCache::ReadOps(int64_t after_op_index, size_t max_size_bytes) {
-  return ReadOps(after_op_index, 0 /* to_op_index */, max_size_bytes);
+Result<ReadOpsResult> LogCache::ReadOps(
+    int64_t after_op_index, size_t max_size_bytes, log::ObeyMemoryLimit obey_memory_limit) {
+  return ReadOps(after_op_index, /*to_op_index=*/0, max_size_bytes, obey_memory_limit);
 }
 
 // Disabled thread safety analysis because the locking seems to be inconsistent, we capture
@@ -343,8 +393,10 @@ Result<ReadOpsResult> LogCache::ReadOps(
     int64_t after_op_index,
     int64_t to_op_index,
     size_t max_size_bytes,
+    log::ObeyMemoryLimit obey_memory_limit,
     CoarseTimePoint deadline,
-    bool fetch_single_entry) NO_THREAD_SAFETY_ANALYSIS {
+    bool fetch_single_entry,
+    const OpId* known_preceding_op) NO_THREAD_SAFETY_ANALYSIS {
   DCHECK_GE(after_op_index, 0);
 
   VLOG_WITH_PREFIX(4) << "ReadOps, after_op_index: " << after_op_index
@@ -354,7 +406,11 @@ Result<ReadOpsResult> LogCache::ReadOps(
   int64_t starting_op_segment_seq_num;
   int64_t next_index;
   int64_t to_index;
-  result.preceding_op = VERIFY_RESULT(LookupOpId(after_op_index));
+  if (known_preceding_op && known_preceding_op->index == after_op_index) {
+    result.preceding_op = *known_preceding_op;
+  } else {
+    result.preceding_op = VERIFY_RESULT(LookupOpId(after_op_index));
+  }
 
   std::unique_lock<simple_spinlock> l(lock_);
   next_index = after_op_index + 1;
@@ -371,16 +427,19 @@ Result<ReadOpsResult> LogCache::ReadOps(
   }
 
   // Return as many operations as we can, up to the limit.
+  bool hit_memory_limit = false;
   int64_t remaining_space = max_size_bytes;
-  while (remaining_space >= 0 &&
-         (fetch_single_entry ? next_index == to_index : next_index < to_index)) {
+  while (fetch_single_entry ? next_index == to_index : next_index < to_index) {
+    if (hit_memory_limit || remaining_space < 0) {
+      break;
+    }
     // Stop reading if a deadline was specified and the deadline has been exceeded.
     if (deadline != CoarseTimePoint::max() && CoarseMonoClock::Now() >= deadline) {
       break;
     }
 
     // If the messages the peer needs haven't been loaded into the queue yet, load them.
-    MessageCache::const_iterator iter = cache_.lower_bound(next_index);
+    auto iter = cache_.lower_bound(next_index);
     if (iter == cache_.end() || iter->first != next_index) {
       int64_t up_to;
       if (fetch_single_entry) {
@@ -398,15 +457,19 @@ Result<ReadOpsResult> LogCache::ReadOps(
       l.unlock();
 
       ReplicateMsgs raw_replicate_ptrs;
-      RETURN_NOT_OK_PREPEND(
-          log_->GetLogReader()->ReadReplicatesInRange(
-              next_index, up_to, remaining_space, &raw_replicate_ptrs, &starting_op_segment_seq_num,
-              deadline),
-          Substitute("Failed to read ops $0..$1", next_index, up_to));
+      auto s = VERIFY_RESULT(log_->GetLogReader())->ReadReplicatesInRange(
+          next_index, up_to, remaining_space, obey_memory_limit, &raw_replicate_ptrs,
+          &starting_op_segment_seq_num, deadline);
+      if (!s.ok()) {
+        if (s.IsBusy() && result.messages.size() > 0) {
+          hit_memory_limit = true;
+        } else {
+          RETURN_NOT_OK_PREPEND(s, Format("Failed to read ops $0..$1", next_index, up_to));
+        }
+      }
 
       metrics_.disk_reads->IncrementBy(raw_replicate_ptrs.size());
-      LOG_WITH_PREFIX(INFO)
-          << "Successfully read " << raw_replicate_ptrs.size() << " ops from disk.";
+      VLOG_WITH_PREFIX(1) << "Successfully read " << raw_replicate_ptrs.size() << " ops from disk.";
       l.lock();
 
       for (auto& msg : raw_replicate_ptrs) {
@@ -422,7 +485,8 @@ Result<ReadOpsResult> LogCache::ReadOps(
         next_index++;
       }
     } else {
-      const auto seg_num_result = log_->GetLogReader()->LookupOpWalSegmentNumber(next_index);
+      const auto seg_num_result =
+          VERIFY_RESULT(log_->GetLogReader())->LookupOpWalSegmentNumber(next_index);
       if (seg_num_result.ok()) {
         starting_op_segment_seq_num = *seg_num_result;
       } else if (!seg_num_result.status().IsNotFound()) {
@@ -452,7 +516,7 @@ Result<ReadOpsResult> LogCache::ReadOps(
       }
     }
   }
-  result.have_more_messages = HaveMoreMessages(remaining_space < 0);
+  result.have_more_messages = HaveMoreMessages(remaining_space < 0 || hit_memory_limit);
   return result;
 }
 
@@ -461,7 +525,7 @@ size_t LogCache::EvictThroughOp(int64_t index, int64_t bytes_to_evict) {
   ReplicateMsgVector evicted_messages;
   size_t bytes_evicted = 0;
   {
-    std::lock_guard<simple_spinlock> lock(lock_);
+    std::lock_guard lock(lock_);
     bytes_evicted = EvictSomeUnlocked(index, bytes_to_evict, &evicted_messages);
   }
 
@@ -528,7 +592,8 @@ Result<OpId> LogCache::TEST_GetLastOpIdWithType(int64_t max_allowed_index, Opera
   constexpr int kStepSize = 20;
   for (auto end = max_allowed_index; end > 0; end -= kStepSize) {
     auto result = VERIFY_RESULT(ReadOps(
-        std::max<int64_t>(0, end - kStepSize), end, std::numeric_limits<int>::max()));
+        std::max<int64_t>(0, end - kStepSize), end, std::numeric_limits<int>::max(),
+        log::ObeyMemoryLimit::kFalse));
     for (auto it = result.messages.end(); it != result.messages.begin();) {
       --it;
       if ((**it).op_type() == op_type) {
@@ -536,12 +601,13 @@ Result<OpId> LogCache::TEST_GetLastOpIdWithType(int64_t max_allowed_index, Opera
       }
     }
   }
-  return STATUS_FORMAT(NotFound, "Operation of type $0 not found before $1",
-                       OperationType_Name(op_type), max_allowed_index);
+  return STATUS_FORMAT(
+      NotFound, "Operation of type $0 not found before $1", OperationType_Name(op_type),
+      max_allowed_index);
 }
 
 string LogCache::StatsString() const {
-  std::lock_guard<simple_spinlock> lock(lock_);
+  std::lock_guard lock(lock_);
   return StatsStringUnlocked();
 }
 
@@ -553,7 +619,7 @@ string LogCache::StatsStringUnlocked() const REQUIRES(lock_) {
 }
 
 std::string LogCache::ToString() const {
-  std::lock_guard<simple_spinlock> lock(lock_);
+  std::lock_guard lock(lock_);
   return ToStringUnlocked();
 }
 
@@ -580,7 +646,7 @@ void LogCache::DumpToLog() const {
 }
 
 void LogCache::DumpToStrings(vector<string>* lines) const {
-  std::lock_guard<simple_spinlock> lock(lock_);
+  std::lock_guard lock(lock_);
   int counter = 0;
   lines->push_back(ToStringUnlocked());
   lines->push_back("Messages:");
@@ -597,7 +663,7 @@ void LogCache::DumpToStrings(vector<string>* lines) const {
 void LogCache::DumpToHtml(std::ostream& out) const {
   using std::endl;
 
-  std::lock_guard<simple_spinlock> lock(lock_);
+  std::lock_guard lock(lock_);
   out << "<h3>Messages:</h3>" << endl;
   out << "<table>" << endl;
   out << "<tr><th>Entry</th><th>OpId</th><th>Type</th><th>Size</th><th>Status</th></tr>" << endl;
@@ -623,7 +689,7 @@ void LogCache::TrackOperationsMemory(const OpIds& op_ids) {
   ReplicateMsgVector evicted_messages;
 
   {
-    std::lock_guard<simple_spinlock> lock(lock_);
+    std::lock_guard lock(lock_);
 
     size_t mem_required = 0;
     for (const auto& op_id : op_ids) {
@@ -671,5 +737,4 @@ LogCache::Metrics::Metrics(const scoped_refptr<MetricEntity>& metric_entity)
 }
 #undef INSTANTIATE_METRIC
 
-} // namespace consensus
-} // namespace yb
+} // namespace yb::consensus

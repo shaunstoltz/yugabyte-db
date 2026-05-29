@@ -3,9 +3,9 @@
 //  LICENSE file in the root directory of this source tree. An additional grant
 //  of patent rights can be found in the PATENTS file in the same directory.
 //
-// The following only applies to changes made to this file as part of YugaByte development.
+// The following only applies to changes made to this file as part of YugabyteDB development.
 //
-// Portions Copyright (c) YugaByte, Inc.
+// Portions Copyright (c) YugabyteDB, Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License"); you may not use this file except
 // in compliance with the License.  You may obtain a copy of the License at
@@ -310,7 +310,7 @@ class Repairer {
       Arena arena;
       ScopedArenaIterator iter(mem->NewIterator(ro, &arena));
       status = BuildTable(dbname_,
-                          env_,
+                          options_,
                           ioptions_,
                           env_options_,
                           table_cache_,
@@ -323,9 +323,8 @@ class Repairer {
                           kMaxSequenceNumber,
                           kNoCompression,
                           CompressionOptions(),
-                          /* paranoid_file_checks */ false,
-                          /* internal_stats */ nullptr,
-                          options_.boundary_extractor.get());
+                          /* paranoid_file_checks = */ false,
+                          /* internal_stats = */ nullptr);
     }
     delete mem->Unref();
     delete cf_mems_default;

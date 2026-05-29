@@ -1,4 +1,4 @@
-// Copyright (c) YugaByte, Inc.
+// Copyright (c) YugabyteDB, Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License"); you may not use this file except
 // in compliance with the License.  You may obtain a copy of the License at
@@ -21,10 +21,18 @@
 
 #include "yb/tserver/tserver_util_fwd.h"
 
+#include "yb/util/concurrent_value.h"
+#include "yb/util/one_time_bool.h"
+
+#include "yb/yql/pgwrapper/pg_wrapper_context.h"
+
 namespace yb {
+
+class JsonWriter;
+
 namespace tserver {
 
-class DbServerBase : public server::RpcAndWebServerBase {
+class DbServerBase : public server::RpcAndWebServerBase, public pgwrapper::PgWrapperContext {
  public:
   DbServerBase(
       std::string name, const server::ServerBaseOptions& options,
@@ -32,21 +40,30 @@ class DbServerBase : public server::RpcAndWebServerBase {
       std::shared_ptr<MemTracker> mem_tracker);
   ~DbServerBase();
 
-  int GetSharedMemoryFd();
-
   client::TransactionManager& TransactionManager();
 
   client::TransactionPool& TransactionPool();
 
   virtual MonoDelta default_client_timeout() = 0;
-  virtual const std::string& permanent_uuid() const = 0;
-  virtual void SetupAsyncClientInit(client::AsyncClientInitialiser* async_client_init) = 0;
+  virtual void SetupAsyncClientInit(client::AsyncClientInitializer* async_client_init) = 0;
 
   virtual client::LocalTabletFilter CreateLocalTabletFilter() = 0;
 
+  virtual void WriteServerMetaCacheAsJson(JsonWriter* writer) = 0;
+
   const std::shared_future<client::YBClient*>& client_future() const;
 
-  tserver::TServerSharedData& shared_object();
+  Status StartSharedMemoryNegotiation() override;
+
+  Status StopSharedMemoryNegotiation() override;
+
+  Status SkipSharedMemoryNegotiation();
+
+  int SharedMemoryNegotiationFd() override;
+
+  [[nodiscard]] SharedMemoryManager* shared_mem_manager();
+
+  ConcurrentPointerReference<TServerSharedData> shared_object() const;
 
   Status Init() override;
 
@@ -57,16 +74,18 @@ class DbServerBase : public server::RpcAndWebServerBase {
  protected:
   void EnsureTransactionPoolCreated();
 
-  // Shared memory owned by the tablet server.
-  std::unique_ptr<tserver::TServerSharedObject> shared_object_;
+  void WriteMainMetaCacheAsJson(JsonWriter* writer);
 
-  std::unique_ptr<client::AsyncClientInitialiser> async_client_init_;
+  std::unique_ptr<SharedMemoryManager> shared_mem_manager_;
+
+  std::unique_ptr<client::AsyncClientInitializer> async_client_init_;
 
   std::atomic<client::TransactionPool*> transaction_pool_{nullptr};
   std::atomic<client::TransactionManager*> transaction_manager_{nullptr};
   std::mutex transaction_pool_mutex_;
   std::unique_ptr<client::TransactionManager> transaction_manager_holder_;
   std::unique_ptr<client::TransactionPool> transaction_pool_holder_;
+  OneTimeBool shutting_down_;
 };
 
 }  // namespace tserver

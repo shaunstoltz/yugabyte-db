@@ -3,9 +3,9 @@
 //  LICENSE file in the root directory of this source tree. An additional grant
 //  of patent rights can be found in the PATENTS file in the same directory.
 //
-// The following only applies to changes made to this file as part of YugaByte development.
+// The following only applies to changes made to this file as part of YugabyteDB development.
 //
-// Portions Copyright (c) YugaByte, Inc.
+// Portions Copyright (c) YugabyteDB, Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License"); you may not use this file except
 // in compliance with the License.  You may obtain a copy of the License at
@@ -475,7 +475,7 @@ TEST_F(CompactionPickerTest, CompactionUniversalPickForFilesBeingCompacted) {
   compaction = universal_compaction_picker.PickCompaction(
       cf_name_, mutable_cf_options_, vstorage_.get(), &log_buffer_);
   ASSERT_NE(compaction, nullptr);
-  ASSERT_EQ(compaction->compaction_reason(), CompactionReason::kUniversalSortedRunNum);
+  ASSERT_EQ(compaction->compaction_reason(), CompactionReason::kUniversalSizeRatio);
   // Verify there are exactly 2 files being compacted.
   ASSERT_EQ(compaction->inputs(0)->size(), 2);
 }

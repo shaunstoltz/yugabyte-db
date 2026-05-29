@@ -1,4 +1,4 @@
-// Copyright (c) YugaByte, Inc.
+// Copyright (c) YugabyteDB, Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License"); you may not use this file except
 // in compliance with the License.  You may obtain a copy of the License at
@@ -14,6 +14,8 @@
 #pragma once
 
 #include <memory>
+
+#include "yb/gutil/casts.h"
 
 namespace yb {
 
@@ -102,5 +104,10 @@ class clone_ptr {
  private:
   T* t_;
 };
+
+template <class U, class T>
+clone_ptr<U> down_cast(clone_ptr<T>&& t) {
+  return clone_ptr<U>(yb::down_cast<U*>(t.release()));
+}
 
 } // namespace yb

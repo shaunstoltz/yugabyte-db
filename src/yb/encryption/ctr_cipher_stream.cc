@@ -1,4 +1,4 @@
-// Copyright (c) YugaByte, Inc.
+// Copyright (c) YugabyteDB, Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License"); you may not use this file except
 // in compliance with the License.  You may obtain a copy of the License at
@@ -150,7 +150,7 @@ Status BlockAccessCipherStream::EncryptByBlock(
   IncrementCounter(start_index, iv, counter_overflow_workaround);
 
   // Lock the encryption op since we modify encryption context.
-  std::lock_guard<simple_spinlock> l(mutex_);
+  std::lock_guard l(mutex_);
 
   const int init_result =
       EVP_EncryptInit_ex(encryption_context_.get(), /* cipher */ nullptr, /* impl */ nullptr,

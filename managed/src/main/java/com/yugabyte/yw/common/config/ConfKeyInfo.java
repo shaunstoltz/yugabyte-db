@@ -1,5 +1,5 @@
 /*
- * Copyright 2022 YugaByte, Inc. and Contributors
+ * Copyright 2022 YugabyteDB, Inc. and Contributors
  *
  * Licensed under the Polyform Free Trial License 1.0.0 (the "License"); you
  * may not use this file except in compliance with the License. You
@@ -11,11 +11,12 @@
 package com.yugabyte.yw.common.config;
 
 import com.yugabyte.yw.forms.RuntimeConfigFormData.ScopedConfig.ScopeType;
-import lombok.Data;
 import java.util.List;
+import lombok.Data;
 
 @Data
 public class ConfKeyInfo<T> {
+
   final String key;
 
   final ScopeType scope;
@@ -33,11 +34,9 @@ public class ConfKeyInfo<T> {
     PUBLIC,
     // Keys hidden from the UI
     INTERNAL,
-    // YBM Keys
-    YBM,
-    // Keys for which we dont have metadata yet
-    BETA,
-    // Keys with dedicated UI
-    UIDriven
+    // Keys for which we do not have metadata yet
+    // Feature flag keys. Only allowed data type: boolean.
+    // These can be viewed without authorising. Should only be set at global scope.
+    FEATURE_FLAG
   }
 }

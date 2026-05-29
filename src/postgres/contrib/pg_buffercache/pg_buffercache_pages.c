@@ -99,7 +99,7 @@ pg_buffercache_pages(PG_FUNCTION_ARGS)
 			elog(ERROR, "incorrect number of output arguments");
 
 		/* Construct a tuple descriptor for the result rows. */
-		tupledesc = CreateTemplateTupleDesc(expected_tupledesc->natts, false);
+		tupledesc = CreateTemplateTupleDesc(expected_tupledesc->natts);
 		TupleDescInitEntry(tupledesc, (AttrNumber) 1, "bufferid",
 						   INT4OID, -1, 0);
 		TupleDescInitEntry(tupledesc, (AttrNumber) 2, "relfilenode",
@@ -125,7 +125,7 @@ pg_buffercache_pages(PG_FUNCTION_ARGS)
 
 		/* Allocate NBuffers worth of BufferCachePagesRec records. */
 		fctx->record = (BufferCachePagesRec *)
-			MemoryContextAllocHuge(GetCurrentMemoryContext(),
+			MemoryContextAllocHuge(CurrentMemoryContext,
 								   sizeof(BufferCachePagesRec) * NBuffers);
 
 		/* Set max calls and remember the user function context. */

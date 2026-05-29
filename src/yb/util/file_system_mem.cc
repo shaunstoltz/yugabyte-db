@@ -1,4 +1,4 @@
-// Copyright (c) YugaByte, Inc.
+// Copyright (c) YugabyteDB, Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License"); you may not use this file except
 // in compliance with the License.  You may obtain a copy of the License at
@@ -18,6 +18,13 @@
 #include "yb/util/status_format.h"
 
 namespace yb {
+
+Status InMemoryWritableFile::AppendSlices(const Slice* slices, size_t num) {
+  for (const auto* end = slices + num; slices != end; ++slices) {
+    RETURN_NOT_OK(file_->Append(*slices));
+  }
+  return Status::OK();
+}
 
 Status InMemoryFileState::Read(uint64_t offset, size_t n, Slice* result, uint8_t* scratch) const {
   if (offset > size_) {

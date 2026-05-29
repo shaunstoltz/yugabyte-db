@@ -3,9 +3,9 @@
 # A "unit test" for Bash libraries used in build/test scripts.
 
 #
-# The following only applies to changes made to this file as part of YugaByte development.
+# The following only applies to changes made to this file as part of YugabyteDB development.
 #
-# Portions Copyright (c) YugaByte, Inc.
+# Portions Copyright (c) YugabyteDB, Inc.
 #
 # Licensed under the Apache License, Version 2.0 (the "License"); you may not use this file except
 # in compliance with the License.  You may obtain a copy of the License at
@@ -23,7 +23,6 @@ set -euo pipefail
 . "${0%/*}/common-build-env.sh"
 
 assert_equals() {
-  local yb_fatal_quiet=false
   if [[ $# -lt 2 ]]; then
     fatal "assert_equals requires at least 2 arguments"
   fi
@@ -58,7 +57,6 @@ test_build_type_detection_by_jenkins_job_name() {
   )
 }
 
-yb_log_quiet=true
 test_build_type_detection_by_jenkins_job_name asan my-asan-job
 test_build_type_detection_by_jenkins_job_name asan Asan-my-job
 test_build_type_detection_by_jenkins_job_name asan my-job-ASAN
@@ -91,7 +89,9 @@ test_compiler_detection_by_jenkins_job_name() {
     unset YB_COMPILER_TYPE
     JOB_NAME="$jenkins_job_name"
     set_compiler_type_based_on_jenkins_job_name
-    assert_equals "$expected_compiler_type" "$YB_COMPILER_TYPE" "compiler type"
+    if [[ ${YB_COMPILER_TYPE_WAS_ADJUSTED:-false} == "false" ]]; then
+      assert_equals "$expected_compiler_type" "$YB_COMPILER_TYPE" "compiler type"
+    fi
   )
 }
 
@@ -137,19 +137,18 @@ test_set_cmake_build_type_and_compiler_type() {
     unset cmake_build_type
     build_type=$_build_type
     OSTYPE=$os_type
-    yb_fatal_quiet=true
     set_cmake_build_type_and_compiler_type
     assert_equals "$expected_cmake_build_type" "$cmake_build_type" "$test_case_details" \
                   "Note: comparing CMake build type."
-    assert_equals "$expected_compiler_type" "$YB_COMPILER_TYPE" "$test_case_details" \
-                  "Note: comparing compiler type."
+    if [[ ${YB_COMPILER_TYPE_WAS_ADJUSTED:-false} == "false" ]]; then
+      assert_equals "$expected_compiler_type" "$YB_COMPILER_TYPE" "$test_case_details" \
+                    "Note: comparing compiler type."
+    fi
   )
   local exit_code=$?
   set -e
   assert_equals "$expected_exit_code" "$exit_code"
 }
-
-arch=$( uname -m )
 
 # Parameters:                               build_type OSTYPE    Compiler   Expected   Expected
 #                                                                type       build_type YB_COMPILER_
@@ -157,34 +156,64 @@ arch=$( uname -m )
 
 # The last parameter is expected exit code (0 or 1).
 
-test_set_cmake_build_type_and_compiler_type   asan       darwin    auto       fastdebug  clang   0
-test_set_cmake_build_type_and_compiler_type   asan       darwin    clang      fastdebug  clang   0
-test_set_cmake_build_type_and_compiler_type   asan       darwin    gcc        N/A        N/A     1
-test_set_cmake_build_type_and_compiler_type   asan       linux-gnu clang14    fastdebug  clang14 0
-test_set_cmake_build_type_and_compiler_type   asan       linux-gnu gcc        N/A        N/A     1
-test_set_cmake_build_type_and_compiler_type   asan       linux-gnu gcc11      N/A        gcc11   1
-test_set_cmake_build_type_and_compiler_type   tsan       linux-gnu clang14    fastdebug  clang14 0
-test_set_cmake_build_type_and_compiler_type   tsan       linux-gnu gcc        N/A        N/A     1
-test_set_cmake_build_type_and_compiler_type   tsan       linux-gnu gcc11      N/A        gcc11   1
-test_set_cmake_build_type_and_compiler_type   debug      darwin    auto       debug      clang   0
-test_set_cmake_build_type_and_compiler_type   debug      darwin    clang      debug      clang   0
-test_set_cmake_build_type_and_compiler_type   debug      linux-gnu clang      debug      clang   0
-test_set_cmake_build_type_and_compiler_type   debug      linux-gnu gcc        debug      gcc     0
-test_set_cmake_build_type_and_compiler_type   debug      linux-gnu gcc11      debug      gcc11   0
-test_set_cmake_build_type_and_compiler_type   FaStDeBuG  darwin    auto       fastdebug  clang   0
-test_set_cmake_build_type_and_compiler_type   FaStDeBuG  darwin    clang      fastdebug  clang   0
-test_set_cmake_build_type_and_compiler_type   FaStDeBuG  linux-gnu clang      fastdebug  clang   0
-test_set_cmake_build_type_and_compiler_type   FaStDeBuG  linux-gnu gcc        fastdebug  gcc     0
-test_set_cmake_build_type_and_compiler_type   release    darwin    auto       release    clang   0
-test_set_cmake_build_type_and_compiler_type   release    darwin    clang      release    clang   0
-test_set_cmake_build_type_and_compiler_type   release    linux-gnu clang      release    clang   0
-test_set_cmake_build_type_and_compiler_type   release    linux-gnu gcc        release    gcc     0
-test_set_cmake_build_type_and_compiler_type   release    linux-gnu gcc11      release    gcc11   0
-test_set_cmake_build_type_and_compiler_type   debug      linux-gnu auto       debug      clang15 0
-test_set_cmake_build_type_and_compiler_type   FaStDeBuG  linux-gnu auto       fastdebug  clang15 0
-test_set_cmake_build_type_and_compiler_type   release    linux-gnu auto       release    clang15 0
-test_set_cmake_build_type_and_compiler_type   tsan       linux-gnu auto       fastdebug  clang15 0
-test_set_cmake_build_type_and_compiler_type   asan       linux-gnu auto       fastdebug  clang15 0
+test_set_cmake_build_type_and_compiler_type asan         linux-gnu clang14 release_asserts clang14 0
+test_set_cmake_build_type_and_compiler_type asan         linux-gnu gcc     N/A             N/A     1
+test_set_cmake_build_type_and_compiler_type asan         linux-gnu gcc12   N/A             gcc12   1
+test_set_cmake_build_type_and_compiler_type tsan         linux-gnu clang14 release_asserts clang14 0
+test_set_cmake_build_type_and_compiler_type tsan         linux-gnu gcc     N/A             N/A     1
+test_set_cmake_build_type_and_compiler_type tsan         linux-gnu gcc12   N/A             gcc12   1
+test_set_cmake_build_type_and_compiler_type debug        darwin    auto    debug           clang21 0
+test_set_cmake_build_type_and_compiler_type debug        darwin    clang   debug           clang   0
+test_set_cmake_build_type_and_compiler_type debug        linux-gnu clang   debug           clang   0
+test_set_cmake_build_type_and_compiler_type debug        linux-gnu gcc     debug           gcc     0
+test_set_cmake_build_type_and_compiler_type debug        linux-gnu gcc12   debug           gcc12   0
+test_set_cmake_build_type_and_compiler_type FaStDeBuG    darwin    auto    fastdebug       clang21 0
+test_set_cmake_build_type_and_compiler_type FaStDeBuG    darwin    clang   fastdebug       clang   0
+test_set_cmake_build_type_and_compiler_type FaStDeBuG    linux-gnu clang   fastdebug       clang   0
+test_set_cmake_build_type_and_compiler_type FaStDeBuG    linux-gnu gcc     fastdebug       gcc     0
+test_set_cmake_build_type_and_compiler_type release      darwin    auto    release         clang21 0
+test_set_cmake_build_type_and_compiler_type release      darwin    clang   release         clang   0
+test_set_cmake_build_type_and_compiler_type release      linux-gnu clang   release         clang   0
+test_set_cmake_build_type_and_compiler_type release      linux-gnu gcc     release         gcc     0
+test_set_cmake_build_type_and_compiler_type release      linux-gnu gcc12   release         gcc12   0
+test_set_cmake_build_type_and_compiler_type debug        linux-gnu auto    debug           clang21 0
+test_set_cmake_build_type_and_compiler_type FaStDeBuG    linux-gnu auto    fastdebug       clang21 0
+test_set_cmake_build_type_and_compiler_type release      linux-gnu auto    release         clang21 0
+test_set_cmake_build_type_and_compiler_type tsan         linux-gnu auto    release_asserts clang21 0
+test_set_cmake_build_type_and_compiler_type tsan_slow    linux-gnu auto    debug           clang21 0
+test_set_cmake_build_type_and_compiler_type tsan_release linux-gnu auto    release         clang21 0
+test_set_cmake_build_type_and_compiler_type asan         linux-gnu auto    release_asserts clang21 0
+test_set_cmake_build_type_and_compiler_type asan_release linux-gnu auto    release         clang21 0
+
+# -------------------------------------------------------------------------------------------------
+# Test existence of scripts pointed to by specical "script path" variables.
+# -------------------------------------------------------------------------------------------------
+
+list_yb_script_path_var_names() {
+  env | grep -E '^YB_SCRIPT_PATH_' | sed 's/=.*//g'
+}
+
+# Unset all script path variables in case some of them are set from outside.
+for script_path_var_name in $( list_yb_script_path_var_names ); do
+  unset "${script_path_var_name}"
+done
+
+# Then set them again from scratch.
+yb_script_paths_are_set=false
+set_script_paths
+
+# Verify that the script pointed to by each of these variables exists.
+for script_path_var_name in $( list_yb_script_path_var_names ); do
+  script_path_var_value=${!script_path_var_name}
+  if [[ ! -f ${script_path_var_value} ]]; then
+    fatal "Script path variable '$script_path_var_name' points to a non-existent file: " \
+          "'$script_path_var_value'"
+  fi
+  if [[ ! -x ${script_path_var_value} ]]; then
+    fatal "Script path variable '$script_path_var_name' points to a non-executable file: " \
+          "'$script_path_var_value'"
+  fi
+done
 
 # -------------------------------------------------------------------------------------------------
 

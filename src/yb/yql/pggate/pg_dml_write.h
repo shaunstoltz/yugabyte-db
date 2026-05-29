@@ -1,5 +1,5 @@
 //--------------------------------------------------------------------------------------------------
-// Copyright (c) YugaByte, Inc.
+// Copyright (c) YugabyteDB, Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License"); you may not use this file except
 // in compliance with the License.  You may obtain a copy of the License at
@@ -14,23 +14,15 @@
 
 #pragma once
 
+#include <memory>
+#include <optional>
+
 #include "yb/yql/pggate/pg_dml.h"
 
-namespace yb {
-namespace pggate {
-
-//--------------------------------------------------------------------------------------------------
-// DML WRITE - Insert, Update, Delete.
-//--------------------------------------------------------------------------------------------------
+namespace yb::pggate {
 
 class PgDmlWrite : public PgDml {
  public:
-  // Abstract class without constructors.
-  virtual ~PgDmlWrite();
-
-  // Prepare write operations.
-  virtual Status Prepare();
-
   // Setup internal structures for binding values during prepare.
   void PrepareColumns();
 
@@ -46,52 +38,53 @@ class PgDmlWrite : public PgDml {
     DoSetCatalogCacheVersion(write_req_.get(), db_oid, catalog_cache_version);
   }
 
-  int32_t GetRowsAffectedCount() {
-    return rows_affected_count_;
+  void SetTablespaceOid(uint32_t tablespace_oid) override {
+    DoSetTablespaceOid(write_req_.get(), tablespace_oid);
   }
+
+  [[nodiscard]] int32_t GetRowsAffectedCount() { return rows_affected_count_; }
 
   Status SetWriteTime(const HybridTime& write_time);
 
- protected:
-  // Constructor.
-  PgDmlWrite(PgSession::ScopedRefPtr pg_session,
-             const PgObjectId& table_id,
-             bool is_single_row_txn,
-             bool is_region_local);
+  Status BindRow(uint64_t ybctid, YbcBindColumn* columns, int count);
 
-  // Allocate write request.
-  void AllocWriteRequest();
+  [[nodiscard]] bool packed() const { return packed_; }
+
+ protected:
+  PgDmlWrite(
+      const PgSessionPtr& pg_session, YbcPgTransactionSetting transaction_setting,
+      bool packed = false);
+
+  // Prepare write operations.
+  Status Prepare(const PgObjectId& table_id, const YbcPgTableLocalityInfo& locality_info,
+                 bool skip_intents_write);
 
   // Allocate column expression.
-  LWPgsqlExpressionPB *AllocColumnBindPB(PgColumn *col) override;
+  Result<LWPgsqlExpressionPB*> AllocColumnBindPB(PgColumn* col, PgExpr* expr) override;
 
   // Allocate target for selected or returned expressions.
-  LWPgsqlExpressionPB *AllocTargetPB() override;
-
-  // Allocate protobuf for a qual in the write request's where_clauses list.
-  LWPgsqlExpressionPB *AllocQualPB() override;
-
-  // Allocate protobuf for a column reference in the write request's col_refs list.
-  LWPgsqlColRefPB *AllocColRefPB() override;
-
-  // Clear the write request's col_refs list.
-  void ClearColRefPBs() override;
+  LWPgsqlExpressionPB* AllocTargetPB() override;
 
   // Allocate column expression.
-  LWPgsqlExpressionPB* AllocColumnAssignPB(PgColumn *col) override;
+  LWPgsqlExpressionPB* AllocColumnAssignPB(PgColumn* col) override;
 
   // Protobuf code.
   std::shared_ptr<LWPgsqlWriteRequestPB> write_req_;
 
-  bool is_single_row_txn_ = false; // default.
+  const YbcPgTransactionSetting transaction_setting_;
 
   int32_t rows_affected_count_ = 0;
 
+  bool packed_;
+
  private:
-  Status DeleteEmptyPrimaryBinds();
+  [[nodiscard]] ArenaList<LWPgsqlColRefPB>& ColRefPBs() override;
+
+  Status DeleteEmptyKeyBinds();
 
   virtual PgsqlWriteRequestPB::PgsqlStmtType stmt_type() const = 0;
+
+  Status BindPackedRow(uint64_t ybctid, YbcBindColumn* columns, int count);
 };
 
-}  // namespace pggate
-}  // namespace yb
+}  // namespace yb::pggate

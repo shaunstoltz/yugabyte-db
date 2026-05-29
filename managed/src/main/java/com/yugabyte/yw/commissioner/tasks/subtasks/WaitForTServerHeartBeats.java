@@ -1,5 +1,5 @@
 /*
- * Copyright 2019 YugaByte, Inc. and Contributors
+ * Copyright 2019 YugabyteDB, Inc. and Contributors
  *
  * Licensed under the Polyform Free Trial License 1.0.0 (the "License"); you
  * may not use this file except in compliance with the License. You
@@ -10,6 +10,7 @@
 
 package com.yugabyte.yw.commissioner.tasks.subtasks;
 
+import com.google.api.client.util.Throwables;
 import com.yugabyte.yw.commissioner.AbstractTaskBase;
 import com.yugabyte.yw.commissioner.BaseTaskDependencies;
 import com.yugabyte.yw.forms.UniverseTaskParams;
@@ -47,18 +48,19 @@ public class WaitForTServerHeartBeats extends AbstractTaskBase {
 
   @Override
   public String getName() {
-    return super.getName() + "(" + taskParams().universeUUID + ")";
+    return super.getName() + "(" + taskParams().getUniverseUUID() + ")";
   }
 
   @Override
   public void run() {
-    Universe universe = Universe.getOrBadRequest(taskParams().universeUUID);
-    String hostPorts = universe.getMasterAddresses();
-    String certificate = universe.getCertificateNodetoNode();
+    Universe universe = Universe.getOrBadRequest(taskParams().getUniverseUUID());
     int numTservers = universe.getTServers().size();
-    YBClient client = ybService.getClient(hostPorts, certificate);
-    try {
-      log.info("Running {}: hostPorts={}, numTservers={}.", getName(), hostPorts, numTservers);
+    try (YBClient client = ybService.getUniverseClient(universe)) {
+      log.info(
+          "Running {}: masterAddresses={}, numTservers={}.",
+          getName(),
+          universe.getMasterAddresses(),
+          numTservers);
       int numTries = 1;
       long start = System.currentTimeMillis();
       boolean timedOut = false;
@@ -90,8 +92,8 @@ public class WaitForTServerHeartBeats extends AbstractTaskBase {
       if (timedOut) {
         throw new RuntimeException(getName() + " timed out.");
       }
-    } finally {
-      ybService.closeClient(client, hostPorts);
+    } catch (Exception e) {
+      Throwables.propagate(e);
     }
   }
 }

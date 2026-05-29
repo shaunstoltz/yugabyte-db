@@ -1,10 +1,10 @@
-/**
-  * Compile the code in ES5 and minify it and then add the minify code at the
-  * end in the sidebar-tree.html file under `/layouts/partials/`.
-  */
-(() => {
-  'use strict';
+/* global jQuery, browserCookieUtils */
 
+/**
+ * Compile the code in ES5 and minify it and then add the minify code at the
+ * end in the sidebar-tree.html file under `/layouts/partials/`.
+ */
+(() => {
   /**
    * Check anchor multilines.
    */
@@ -20,60 +20,6 @@
         jQuery(event).removeAttr('data-lines');
       }
     });
-  }
-
-  /**
-   * Decode the cookie and return the appropriate cookie value if found
-   * Otherwise empty string is returned.
-   *
-   * return string
-   */
-  function ybGetCookie(cname) {
-    const cookieName = cname + '=';
-    const decodedCookie = decodeURIComponent(document.cookie);
-    const splittedCookie = decodedCookie.split(';');
-    const splittedLength = splittedCookie.length;
-
-    let checkCookie = '';
-    let fetchCookie = 0;
-    let matchedCookie = '';
-
-    while (fetchCookie < splittedLength) {
-      checkCookie = splittedCookie[fetchCookie];
-      while (checkCookie.charAt(0)) {
-        if (checkCookie.charAt(0) === ' ') {
-          checkCookie = checkCookie.substring(1);
-        } else {
-          break;
-        }
-      }
-
-      if (checkCookie.indexOf(cookieName) === 0) {
-        matchedCookie = checkCookie.substring(cookieName.length, checkCookie.length);
-        break;
-      }
-
-      fetchCookie += 1;
-    }
-
-    return matchedCookie;
-  }
-
-  /**
-   * Create Cookie.
-   */
-  function ybSetCookie(name, value, monthToLive) {
-    let cookie = name + '=' + encodeURIComponent(value);
-    if (typeof monthToLive !== 'number') {
-      monthToLive = 3;
-    }
-    cookie += '; max-age=' + (monthToLive * 30 * (24 * 60 * 60));
-    cookie += '; path=/';
-    if (location.hostname !== 'localhost') {
-      cookie += '; secure=true';
-    }
-
-    document.cookie = cookie;
   }
 
   /**
@@ -101,8 +47,8 @@
         maxWidth: '60px',
       });
     } else {
-      if (ybGetCookie('leftMenuWidth')) {
-        preWidth = ybGetCookie('leftMenuWidth');
+      if (browserCookieUtils.getCookie('leftMenuWidth')) {
+        preWidth = browserCookieUtils.getCookie('leftMenuWidth');
       }
 
       if (navSidebar.getAttribute('data-pwidth')) {
@@ -146,10 +92,11 @@
   }
 
   const currentLink = document.querySelector('.left-sidebar-wrap nav:not(.fixed-nav) > ul a.current');
-  const leftNavVisible = ybGetCookie('leftMenuShowHide');
-  const leftNavWidth = ybGetCookie('leftMenuWidth');
+  const leftNavVisible = browserCookieUtils.getCookie('leftMenuShowHide');
+  const leftNavWidth = browserCookieUtils.getCookie('leftMenuWidth');
   const navSidebar = document.querySelector('aside.td-sidebar');
   const sidenavCollapse = document.querySelector('.side-nav-collapse-toggle-2');
+  const sidenavExpand = document.querySelector('.left-sidebar-wrap');
 
   if (!navSidebar) {
     return;
@@ -159,6 +106,7 @@
     navSidebar.classList.add('toggled-sidebar');
     if (leftNavVisible === 'hide') {
       navSidebar.classList.add('stick-bar');
+      sidenavExpand.classList.add('click-to-expand');
       ybSideNavVisibility(leftNavVisible);
     }
   }
@@ -168,8 +116,8 @@
     if (leftNavVisible === 'hide') {
       navSidebar.setAttribute('data-pwidth', leftNavWidth);
     } else {
-      navSidebar.style.width = leftNavWidth + 'px';
-      navSidebar.style.maxWidth = leftNavWidth + 'px';
+      navSidebar.style.width = `${leftNavWidth}px`;
+      navSidebar.style.maxWidth = `${leftNavWidth}px`;
     }
 
     setTimeout(() => {
@@ -186,11 +134,26 @@
     navSidebar.classList.toggle('stick-bar');
     navSidebar.classList.add('toggled-sidebar');
     if (navSidebar.classList.contains('stick-bar')) {
-      ybSetCookie('leftMenuShowHide', 'hide', 3);
+      browserCookieUtils.setCookie('leftMenuShowHide', 'hide', {
+        timeToLive: 3,
+        unit: 'month'
+      });
       ybSideNavVisibility('hide');
+      sidenavExpand.classList.add('click-to-expand');
     } else {
-      ybSetCookie('leftMenuShowHide', 'show', 3);
+      browserCookieUtils.setCookie('leftMenuShowHide', 'show', {
+        timeToLive: 3,
+        unit: 'month'
+      });
       ybSideNavVisibility('show');
+      sidenavExpand.classList.remove('click-to-expand');
+    }
+  });
+
+  // Expand left navigation on clicking anywhere in whole left sidebar.
+  sidenavExpand.addEventListener('click', (event) => {
+    if (event.target.classList.contains('left-sidebar-wrap') && event.target.classList.contains('click-to-expand')) {
+      sidenavCollapse.click();
     }
   });
 })();

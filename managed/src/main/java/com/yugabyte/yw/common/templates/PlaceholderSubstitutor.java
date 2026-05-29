@@ -1,5 +1,5 @@
 /*
- * Copyright 2021 YugaByte, Inc. and Contributors
+ * Copyright 2021 YugabyteDB, Inc. and Contributors
  *
  * Licensed under the Polyform Free Trial License 1.0.0 (the "License"); you
  * may not use this file except in compliance with the License. You
@@ -15,7 +15,7 @@ import java.util.function.Function;
 /**
  * Replace placeholders, surrounded by prefix and suffix strings with some values from domain model.
  */
-public class PlaceholderSubstitutor {
+public class PlaceholderSubstitutor implements PlaceholderSubstitutorIF {
   private final String parameterPrefix;
   private final String parameterSuffix;
   private final Function<String, String> valueProvider;

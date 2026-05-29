@@ -3,9 +3,9 @@
 //  LICENSE file in the root directory of this source tree. An additional grant
 //  of patent rights can be found in the PATENTS file in the same directory.
 //
-// The following only applies to changes made to this file as part of YugaByte development.
+// The following only applies to changes made to this file as part of YugabyteDB development.
 //
-// Portions Copyright (c) YugaByte, Inc.
+// Portions Copyright (c) YugabyteDB, Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License"); you may not use this file except
 // in compliance with the License.  You may obtain a copy of the License at
@@ -30,13 +30,15 @@
 #include <unordered_map>
 #include <vector>
 
-#include <glog/logging.h>
+#include "yb/util/logging.h"
 
 #include "yb/rocksdb/comparator.h"
 #include "yb/rocksdb/table/block_hash_index.h"
 #include "yb/rocksdb/table/block_internal.h"
 #include "yb/rocksdb/table/block_prefix_index.h"
 #include "yb/rocksdb/table/format.h"
+#include "yb/rocksdb/table/internal_iterator.h"
+#include "yb/rocksdb/table/iterator_helpers_internal.h"
 #include "yb/rocksdb/util/coding.h"
 #include "yb/rocksdb/util/perf_context_imp.h"
 
@@ -51,14 +53,7 @@ namespace {
 // - 0 data keys
 // - uint32 for single restart point (first restart point is always 0 and present in block)
 // - num_restarts: uint32
-const size_t kMinBlockSize = 2*sizeof(uint32_t);
-
-inline uint32_t GetMiddleIndex(
-    const uint32_t total_number, const MiddlePointPolicy middle_point_policy) {
-  return total_number ? (total_number - yb::to_underlying(middle_point_policy)) / 2 : 0;
-}
-
-} // namespace
+const size_t kMinBlockSize = 2 * sizeof(uint32_t);
 
 // Helper routine: decode the next block entry starting at "p",
 // storing the number of shared key bytes, non_shared key bytes,
@@ -67,10 +62,10 @@ inline uint32_t GetMiddleIndex(
 //
 // If any errors are detected, returns nullptr.  Otherwise, returns a
 // pointer to the key delta (just past the three decoded values).
-static inline const char* DecodeEntry(const char* p, const char* limit,
-                                      uint32_t* shared,
-                                      uint32_t* non_shared,
-                                      uint32_t* value_length) {
+inline const char* DecodeEntry(const char* p, const char* limit,
+                               uint32_t* shared,
+                               uint32_t* non_shared,
+                               uint32_t* value_length) {
   if (limit - p < 3) return nullptr;
   *shared = reinterpret_cast<const unsigned char*>(p)[0];
   *non_shared = reinterpret_cast<const unsigned char*>(p)[1];
@@ -95,7 +90,7 @@ static inline const char* DecodeEntry(const char* p, const char* limit,
 // reusing bytes from previous key (see BlockBuilder::Add for more details).
 // This function should not read at or beyond `limit`.
 // Returns nullptr in case of decode failure.
-static inline const char* DecodeRestartEntry(
+inline const char* DecodeRestartEntry(
     const KeyValueEncodingFormat key_value_encoding_format, const char* p, const char* limit,
     const char* read_allowed_from, uint32_t* key_size) {
   uint32_t value_size;
@@ -116,7 +111,7 @@ static inline const char* DecodeRestartEntry(
       uint64_t shared_last_component_increase;
 
       auto* result = DecodeEntryThreeSharedParts(
-          p, limit, read_allowed_from, &shared_prefix_size, key_size, &non_shared_1_size_delta,
+          p, limit, &shared_prefix_size, key_size, &non_shared_1_size_delta,
           &is_something_shared, &non_shared_2_size, &non_shared_2_size_delta,
           &shared_last_component_size, &shared_last_component_increase, &value_size);
       if (PREDICT_FALSE(!result || is_something_shared)) {
@@ -130,37 +125,58 @@ static inline const char* DecodeRestartEntry(
   FATAL_INVALID_ENUM_VALUE(KeyValueEncodingFormat, key_value_encoding_format);
 }
 
-void BlockIter::Next() {
-  assert(Valid());
+} // namespace
+
+const KeyValueEntry& BlockIter::Next() {
+  DCHECK(Valid());
   ParseNextKey();
+  return Entry();
 }
 
-void BlockIter::Prev() {
-  assert(Valid());
+const KeyValueEntry& BlockIter::Prev() {
+  DCHECK(Valid());
 
-  // Scan backwards to a restart point before current_
-  const uint32_t original = current_;
-  while (GetRestartPoint(restart_index_) >= original) {
-    if (restart_index_ == 0) {
-      // No more entries
-      current_ = restarts_;
-      restart_index_ = num_restarts_;
-      return;
+  const auto current_offset = current_;
+
+  // Try to move to the previous entry if it is cached.
+  if (block_entry_cache_idx_ > 0) {
+    --block_entry_cache_idx_;
+    // Restoring current entry offset invariant.
+    if (block_entry_cache_idx_ == 0) {
+      current_ = GetRestartBlockOffset(restart_index_);
+    } else {
+      const auto& entry = block_entry_cache_[block_entry_cache_idx_ - 1].entry_;
+      DCHECK(entry.Valid()) << "at " << block_entry_cache_idx_ - 1;
+      current_ = static_cast<uint32_t>(entry.value.cend() - data_);
     }
-    restart_index_--;
+    return Entry();
   }
 
-  SeekToRestartPoint(restart_index_);
+  // Scan backwards to a restart point before current restart block.
+  while (GetRestartBlockOffset(restart_index_) >= current_offset) {
+    if (restart_index_) {
+      --restart_index_;
+      continue;
+    }
+
+    // No more entries.
+    SetInvalid();
+    return Entry();
+  }
+
+  MoveToRestartBlock(restart_index_);
   do {
     // Loop until end of current entry hits the start of original entry
-  } while (ParseNextKey() && NextEntryOffset() < original);
+  } while (ParseNextKey() && NextEntryOffset() < current_offset);
+  return Entry();
 }
 
 void BlockIter::Initialize(
     const Comparator* comparator, const char* data,
     const KeyValueEncodingFormat key_value_encoding_format,
     const uint32_t restarts, const uint32_t num_restarts,
-    const BlockHashIndex* hash_index, const BlockPrefixIndex* prefix_index) {
+    const BlockHashIndex* hash_index, const BlockPrefixIndex* prefix_index,
+    const size_t restart_block_cache_capacity) {
   DCHECK(data_ == nullptr); // Ensure it is called only once
   DCHECK_GT(num_restarts, 0); // Ensure the param is valid
 
@@ -169,18 +185,27 @@ void BlockIter::Initialize(
   key_value_encoding_format_ = key_value_encoding_format;
   restarts_ = restarts;
   num_restarts_ = num_restarts;
-  current_ = restarts_;
-  restart_index_ = num_restarts_;
   hash_index_ = hash_index;
   prefix_index_ = prefix_index;
+
+  Reset();
+
+  block_entry_cache_.clear();
+  block_entry_cache_.reserve(std::max(restart_block_cache_capacity, kRestartBlockCacheMinSize));
+  block_entry_cache_.emplace_back();
+
+  // It is impossible to rely on restart_block_cache_'s capacity value, because that value cannot
+  // be set to a value lower than the current one (in accordance with C++ stardard). That's why
+  // a separate variable is required to understand if restart block keys caching is turned on.
+  cache_restart_block_keys_ = restart_block_cache_capacity > 1;
 }
 
-
-void BlockIter::Seek(const Slice& target) {
+const KeyValueEntry& BlockIter::Seek(Slice target) {
   PERF_TIMER_GUARD(block_seek_nanos);
   if (data_ == nullptr) {  // Not init yet
-    return;
+    return Entry();
   }
+
   uint32_t index = 0;
   bool ok = false;
   if (prefix_index_) {
@@ -191,34 +216,36 @@ void BlockIter::Seek(const Slice& target) {
   }
 
   if (!ok) {
-    return;
+    return Entry();
   }
-  SeekToRestartPoint(index);
-  // Linear search (within restart block) for first key >= target
 
-  while (true) {
-    if (!ParseNextKey() || Compare(key_.GetKey(), target) >= 0) {
-      return;
-    }
-  }
+  MoveToRestartBlock(index);
+
+  // Linear search (within current restart block) for first key >= target
+  while (ParseNextKey() && Compare(CurrentEntry().key_.GetKey(), target) < 0) {}
+  return Entry();
 }
 
-void BlockIter::SeekToFirst() {
+const KeyValueEntry& BlockIter::SeekToFirst() {
   if (data_ == nullptr) {  // Not init yet
-    return;
+    return Entry();
   }
-  SeekToRestartPoint(0);
+
+  MoveToRestartBlock(0);
   ParseNextKey();
+  return Entry();
 }
 
-void BlockIter::SeekToLast() {
+const KeyValueEntry& BlockIter::SeekToLast() {
   if (data_ == nullptr) {  // Not init yet
-    return;
+    return Entry();
   }
-  SeekToRestartPoint(num_restarts_ - 1);
+
+  MoveToRestartBlock(num_restarts_ - 1);
   while (ParseNextKey() && NextEntryOffset() < restarts_) {
     // Keep skipping
   }
+  return Entry();
 }
 
 void BlockIter::SeekToRestart(uint32_t index) {
@@ -229,38 +256,8 @@ void BlockIter::SeekToRestart(uint32_t index) {
     return SetStatus(STATUS(IllegalState, "Restart index overflow"));
   }
 
-  SeekToRestartPoint(index);
+  MoveToRestartBlock(index);
   ParseNextKey();
-}
-
-bool BlockIter::ScanForward(
-    const Comparator* user_key_comparator, const Slice& upperbound,
-    KeyFilterCallback* key_filter_callback, ScanCallback* scan_callback) {
-  LOG_IF(DFATAL, !Valid()) << "Iterator should be valid.";
-
-  do {
-    const auto user_key = ExtractUserKey(key_.GetKey());
-    if (!upperbound.empty() && user_key_comparator->Compare(user_key, upperbound) >= 0) {
-      break;
-    }
-
-    bool skip_key = false;
-    if (key_filter_callback) {
-      auto kf_result =
-          (*key_filter_callback)(/*prefixed_key=*/ Slice(), /*shared_bytes=*/ 0, user_key);
-      skip_key = kf_result.skip_key;
-    }
-
-    if (!skip_key) {
-      if (!(*scan_callback)(user_key, value_)) {
-        return false;
-      }
-    }
-
-    Next();
-  } while (Valid());
-
-  return true;
 }
 
 namespace {
@@ -276,30 +273,26 @@ Status BadEntryInBlockError(const std::string& error_details) {
 } // namespace
 
 void BlockIter::SetError(const Status& error) {
-  current_ = restarts_;
-  restart_index_ = num_restarts_;
+  SetInvalid();
   status_ = error;
-  key_.Clear();
-  value_.clear();
 }
 
 void BlockIter::CorruptionError(const std::string& error_details) {
   SetError(BadEntryInBlockError(error_details));
 }
 
+namespace {
+
 // This function decodes next key-value pair starting at p and encoded with three_shared_parts
 // delta-encoding algorithm (see ThreeSharedPartsEncoder inside block_builder.cc).
 // limit specifies exclusive upper bound on where we allowed to decode from.
-// read_allowed_from specifies exclusive upper bound on where we allowed to read data from (used
-// for performance optimization in some cases to read by multi-bytes chunks), but still only data
-// before the limit will be used for decoding.
 //
 // The function relies on *key to contain previous decoded key and updates it with a next one.
 // *value is set to Slice pointing to corresponding key's value.
 //
 // Returns whether decoding was successful.
 inline bool ParseNextKeyThreeSharedParts(
-    const char* p, const char* limit, const char* read_allowed_from, IterKey* key, Slice* value) {
+    const char* p, const char* limit, IterKey* key, Slice* value) {
   uint32_t shared_prefix_size, non_shared_1_size, non_shared_2_size, shared_last_component_size,
       value_size;
   bool is_something_shared;
@@ -307,7 +300,7 @@ inline bool ParseNextKeyThreeSharedParts(
   uint64_t shared_last_component_increase;
 
   p = DecodeEntryThreeSharedParts(
-      p, limit, read_allowed_from, &shared_prefix_size, &non_shared_1_size,
+      p, limit, &shared_prefix_size, &non_shared_1_size,
       &non_shared_1_size_delta, &is_something_shared, &non_shared_2_size, &non_shared_2_size_delta,
       &shared_last_component_size, &shared_last_component_increase, &value_size);
   if (p == nullptr) {
@@ -338,7 +331,7 @@ inline bool ParseNextKeyThreeSharedParts(
   const auto shared_middle_size = key_size - prev_size_except_middle_shared;
 
   if ((shared_prefix_size + shared_middle_size + shared_last_component_size) == 0) {
-    // This is an error, because is_something_shared is true.x
+    // This is an error, because is_something_shared is true.
     return false;
   }
 
@@ -350,47 +343,99 @@ inline bool ParseNextKeyThreeSharedParts(
   return true;
 }
 
+} // namespace
+
 bool BlockIter::ParseNextKey() {
   current_ = NextEntryOffset();
-  const char* p = data_ + current_;
-  const char* limit = data_ + restarts_;  // Restarts come right after data
-  if (p >= limit) {
-    // No more entries to return.  Mark as invalid.
-    current_ = restarts_;
-    restart_index_ = num_restarts_;
+  const char* entry_data = data_ + current_;
+  const char* data_end = data_ + restarts_;  // Restarts come right after data.
+
+  if (entry_data >= data_end) {
+    // No more entries to return. Mark as invalid.
+    SetInvalid();
     return false;
   }
 
-  // Decode next entry
+  // Restore the invariant that restart_block_idx_ is the index of the restart block in which
+  // current entry falls.
+  const auto last_restart_block_idx = restart_index_;
+  while (restart_index_ + 1 < num_restarts_ &&
+         GetRestartBlockOffset(restart_index_ + 1) <= current_) {
+    ++restart_index_;
+  }
+
+  if (cache_restart_block_keys_) {
+    if (restart_index_ != last_restart_block_idx) {
+      // It is expected to be moved exactly to the next restart block.
+      DCHECK_EQ(restart_index_, last_restart_block_idx + 1);
+
+      // Cache position should be reset to fit all the entries from the new restart block.
+      block_entry_cache_idx_ = 0;
+
+      // Need to clean key_ as that cache element does not contain previously decoded key. And
+      // it is OK to clean that key as each restart block starts with a full key.
+      CurrentEntry().key_.Clear();
+    } else if (CurrentEntry().entry_.Valid()) {
+      // Cache expansion should be done only if the current element has already been initialized.
+      // It is expected that only the first element in the cache could be unitialized right before
+      // moving to a next or random restart block (see the sanity check in the next `else` block).
+
+      // Sanity checks for current position must not exceed the number of available elements.
+      DCHECK_LT(block_entry_cache_idx_, block_entry_cache_.size());
+
+      // Using previously decoded key, as a base for next key delta.
+      const auto base_key = CurrentEntry().entry_.key;
+
+      // Move to a next slot in the cache and ensure it is allocated.
+      if (++block_entry_cache_idx_ == block_entry_cache_.size()) {
+        block_entry_cache_.emplace_back();
+      }
+
+      CurrentEntry().key_.SetKey(base_key);
+    } else {
+      // Sanity check for the current element is not yet initialized, which is expected to happen
+      // for the very first element in the cache only.
+      DCHECK_EQ(block_entry_cache_idx_, 0);
+    }
+  }
+
+  // Decode next entry.
   bool valid_encoding_type = false;
   switch (key_value_encoding_format_) {
     case KeyValueEncodingFormat::kKeyDeltaEncodingSharedPrefix: {
       valid_encoding_type = true;
       uint32_t shared, non_shared, value_length;
-      p = DecodeEntry(p, limit, &shared, &non_shared, &value_length);
-      if (p == nullptr || key_.Size() < shared) {
+      entry_data = DecodeEntry(entry_data, data_end, &shared, &non_shared, &value_length);
+      if (entry_data == nullptr || CurrentEntry().key_.Size() < shared) {
         CorruptionError(yb::Format(
-            "p: $0, key_.Size(): $1, shared: $2", static_cast<const void*>(p), key_.Size(),
+            "p: $0, key_.Size(): $1, shared: $2",
+            static_cast<const void*>(entry_data),
+            CurrentEntry().key_.Size(),
             shared));
         return false;
       }
       if (shared == 0) {
         // If this key dont share any bytes with prev key then we dont need
         // to decode it and can use it's address in the block directly.
-        key_.SetKey(Slice(p, non_shared), false /* copy */);
+        CurrentEntry().key_.SetKey(Slice(entry_data, non_shared), false /* copy */);
       } else {
         // This key share `shared` bytes with prev key, we need to decode it
-        key_.TrimAppend(shared, p, non_shared);
+        CurrentEntry().key_.TrimAppend(shared, entry_data, non_shared);
       }
-      value_ = Slice(p + non_shared, value_length);
+      CurrentEntry().entry_ = KeyValueEntry {
+        .key   = CurrentEntry().key_.GetKey(),
+        .value = Slice(entry_data + non_shared, value_length),
+      };
       break;
     }
     case KeyValueEncodingFormat::kKeyDeltaEncodingThreeSharedParts: {
       valid_encoding_type = true;
-      if (!ParseNextKeyThreeSharedParts(p, limit, data_, &key_, &value_)) {
+      if (!ParseNextKeyThreeSharedParts(
+              entry_data, data_end, &CurrentEntry().key_, &CurrentEntry().entry_.value)) {
         CorruptionError("ParseNextKeyThreeSharedParts failed");
         return false;
       }
+      CurrentEntry().entry_.key = CurrentEntry().key_.GetKey();
       break;
     }
   }
@@ -399,23 +444,17 @@ bool BlockIter::ParseNextKey() {
     FATAL_INVALID_ENUM_VALUE(KeyValueEncodingFormat, key_value_encoding_format_);
   }
 
-  // Restore the invariant that restart_index_ is the index of restart block in which current_
-  // falls.
-  while (restart_index_ + 1 < num_restarts_ && GetRestartPoint(restart_index_ + 1) < current_) {
-    ++restart_index_;
-  }
   return true;
 }
 
 // Binary search in restart array to find the first restart point
 // with a key >= target (TODO: this comment is inaccurate)
-bool BlockIter::BinarySeek(const Slice& target, uint32_t left, uint32_t right,
-                  uint32_t* index) {
-  assert(left <= right);
+bool BlockIter::BinarySeek(const Slice& target, uint32_t left, uint32_t right, uint32_t* index) {
+  DCHECK_LE(left, right);
 
   while (left < right) {
     uint32_t mid = (left + right + 1) / 2;
-    uint32_t region_offset = GetRestartPoint(mid);
+    uint32_t region_offset = GetRestartBlockOffset(mid);
     uint32_t key_size;
     const char* key_ptr = DecodeRestartEntry(
         key_value_encoding_format_, data_ + region_offset, data_ + restarts_, data_, &key_size);
@@ -445,7 +484,7 @@ bool BlockIter::BinarySeek(const Slice& target, uint32_t left, uint32_t right,
 // Compare target key and the block key of the block of `block_index`.
 // Return -1 if error.
 int BlockIter::CompareBlockKey(uint32_t block_index, const Slice& target) {
-  uint32_t region_offset = GetRestartPoint(block_index);
+  uint32_t region_offset = GetRestartBlockOffset(block_index);
   uint32_t key_size;
   const char* key_ptr = DecodeRestartEntry(
       key_value_encoding_format_, data_ + region_offset, data_ + restarts_, data_, &key_size);
@@ -462,7 +501,7 @@ int BlockIter::CompareBlockKey(uint32_t block_index, const Slice& target) {
 bool BlockIter::BinaryBlockIndexSeek(const Slice& target, uint32_t* block_ids,
                           uint32_t left, uint32_t right,
                           uint32_t* index) {
-  assert(left <= right);
+  DCHECK_LE(left, right);
   uint32_t left_bound = left;
 
   while (left <= right) {
@@ -495,29 +534,29 @@ bool BlockIter::BinaryBlockIndexSeek(const Slice& target, uint32_t* block_ids,
     if (block_ids[left] > 0 &&
         (left == left_bound || block_ids[left - 1] != block_ids[left] - 1) &&
         CompareBlockKey(block_ids[left] - 1, target) > 0) {
-      current_ = restarts_;
+      SetInvalid();
       return false;
     }
 
     *index = block_ids[left];
     return true;
   } else {
-    assert(left > right);
-    // Mark iterator invalid
-    current_ = restarts_;
+    DCHECK_GT(left, right);
+    // Mark iterator invalid.
+    SetInvalid();
     return false;
   }
 }
 
 bool BlockIter::HashSeek(const Slice& target, uint32_t* index) {
-  assert(hash_index_);
+  DCHECK_ONLY_NOTNULL(hash_index_);
   auto restart_index = hash_index_->GetRestartIndex(target);
   if (restart_index == nullptr) {
-    current_ = restarts_;
+    SetInvalid();
     return false;
   }
 
-  // the elements in restart_array[index : index + num_blocks]
+  // The elements in restart_array[index : index + num_blocks]
   // are all with same prefix. We'll do binary search in that small range.
   auto left = restart_index->first_index;
   auto right = restart_index->first_index + restart_index->num_blocks - 1;
@@ -525,20 +564,20 @@ bool BlockIter::HashSeek(const Slice& target, uint32_t* index) {
 }
 
 bool BlockIter::PrefixSeek(const Slice& target, uint32_t* index) {
-  assert(prefix_index_);
+  DCHECK_ONLY_NOTNULL(prefix_index_);
   uint32_t* block_ids = nullptr;
   uint32_t num_blocks = prefix_index_->GetBlocks(target, &block_ids);
 
   if (num_blocks == 0) {
-    current_ = restarts_;
+    SetInvalid();
     return false;
-  } else  {
-    return BinaryBlockIndexSeek(target, block_ids, 0, num_blocks - 1, index);
   }
+
+  return BinaryBlockIndexSeek(target, block_ids, 0, num_blocks - 1, index);
 }
 
 uint32_t Block::NumRestarts() const {
-  assert(size_ >= kMinBlockSize);
+  DCHECK_GE(size_, kMinBlockSize);
   return DecodeFixed32(data_ + size_ - sizeof(uint32_t));
 }
 
@@ -559,15 +598,15 @@ Block::Block(BlockContents&& contents)
   }
 }
 
-InternalIterator* Block::NewIterator(
+BlockIter* Block::NewIterator(
     const Comparator* cmp, const KeyValueEncodingFormat key_value_encoding_format, BlockIter* iter,
-    const bool total_order_seek) const {
+    const bool total_order_seek, const size_t restart_block_cache_capacity) const {
   if (size_ < kMinBlockSize) {
     if (iter != nullptr) {
       iter->SetStatus(BadBlockContentsError());
       return iter;
     } else {
-      return NewErrorInternalIterator(BadBlockContentsError());
+      return NewErrorBlockIterator(BadBlockContentsError());
     }
   }
   const uint32_t num_restarts = NumRestarts();
@@ -576,7 +615,7 @@ InternalIterator* Block::NewIterator(
       iter->SetStatus(Status::OK());
       return iter;
     } else {
-      return NewEmptyInternalIterator();
+      return NewEmptyBlockIterator();
     }
   } else {
     BlockHashIndex* hash_index_ptr =
@@ -586,10 +625,10 @@ InternalIterator* Block::NewIterator(
 
     if (iter != nullptr) {
       iter->Initialize(cmp, data_, key_value_encoding_format, restart_offset_, num_restarts,
-                    hash_index_ptr, prefix_index_ptr);
+                    hash_index_ptr, prefix_index_ptr, restart_block_cache_capacity);
     } else {
       iter = new BlockIter(cmp, data_, key_value_encoding_format, restart_offset_, num_restarts,
-                           hash_index_ptr, prefix_index_ptr);
+                           hash_index_ptr, prefix_index_ptr, restart_block_cache_capacity);
     }
   }
 
@@ -642,7 +681,7 @@ yb::Result<std::string> Block::GetRestartBlockMiddleEntryKey(
   }
 
   // Second step is to advance to the middle record.
-  const auto middle_record_idx = GetMiddleIndex(records_count, middle_restart_policy);
+  const auto middle_record_idx = Block::GetMiddlePointIndex(records_count, middle_restart_policy);
   for (block_iter.SeekToFirst(), records_count = 0;
        block_iter.Valid() && (records_count < middle_record_idx);
        block_iter.Next()) {
@@ -686,11 +725,11 @@ yb::Result<std::string> Block::GetMiddleKey(
     const KeyValueEncodingFormat key_value_encoding_format, const Comparator* cmp,
     const MiddlePointPolicy middle_entry_policy) const {
   if (PREDICT_FALSE((NumRestarts() == 0))) {
-    // Not possible to have less than 1 restart at all, refer to the BlockBuilder's constuctor.
+    // Not possible to have less than 1 restart at all, refer to the BlockBuilder's constructor.
     return STATUS(Corruption, "Restarts number cannot be zero, this might be a data corruption!");
   }
   if (PREDICT_TRUE(NumRestarts() > 1)) {
-    const auto restart_idx = GetMiddleIndex(NumRestarts(), middle_entry_policy);
+    const auto restart_idx = Block::GetMiddlePointIndex(NumRestarts(), middle_entry_policy);
     const auto middle_key =
         VERIFY_RESULT(GetRestartKey(restart_idx, key_value_encoding_format));
     return middle_key.ToBuffer();
@@ -699,6 +738,36 @@ yb::Result<std::string> Block::GetMiddleKey(
   // Special case for single restart block.
   return VERIFY_RESULT(GetRestartBlockMiddleEntryKey(
       /* restart_idx = */ 0, cmp, key_value_encoding_format, middle_entry_policy));
+}
+
+class BlockIter::Empty : public BlockIter {
+ public:
+  explicit Empty(const Status& s) : status_(s) {}
+
+  const KeyValueEntry& Entry() const override { return KeyValueEntry::Invalid(); }
+  const KeyValueEntry& Seek(Slice target) override { return Entry(); }
+  const KeyValueEntry& SeekToFirst() override { return Entry(); }
+  const KeyValueEntry& SeekToLast() override { return Entry(); }
+  const KeyValueEntry& Next() override {
+    DCHECK(false) << "BlockIter::Empty::Next()";
+    return Entry();
+  }
+  const KeyValueEntry& Prev() override {
+    DCHECK(false) << "BlockIter::Empty::Prev()";
+    return Entry();
+  }
+  Status status() const override { return status_; }
+
+ private:
+  Status status_;
+};
+
+BlockIter* NewEmptyBlockIterator(Arena* arena) {
+  return NewEmptyIterator<BlockIter>(arena);
+}
+
+BlockIter* NewErrorBlockIterator(const Status& status, Arena* arena) {
+  return NewErrorIterator<BlockIter>(status, arena);
 }
 
 }  // namespace rocksdb

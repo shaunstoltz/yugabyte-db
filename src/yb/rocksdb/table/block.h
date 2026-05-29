@@ -3,9 +3,9 @@
 //  LICENSE file in the root directory of this source tree. An additional grant
 //  of patent rights can be found in the PATENTS file in the same directory.
 //
-// The following only applies to changes made to this file as part of YugaByte development.
+// The following only applies to changes made to this file as part of YugabyteDB development.
 //
-// Portions Copyright (c) YugaByte, Inc.
+// Portions Copyright (c) YugabyteDB, Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License"); you may not use this file except
 // in compliance with the License.  You may obtain a copy of the License at
@@ -22,8 +22,9 @@
 // found in the LICENSE file. See the AUTHORS file for names of contributors.
 
 #pragma once
-#include <stddef.h>
-#include <stdint.h>
+#include <cstddef>
+#include <cstdint>
+#include <list>
 #ifdef ROCKSDB_MALLOC_USABLE_SIZE
 #include <malloc.h>
 #endif
@@ -38,6 +39,7 @@
 #include "yb/rocksdb/table/internal_iterator.h"
 
 #include "yb/util/enums.h"
+#include "yb/util/malloc.h"
 
 namespace rocksdb {
 
@@ -65,7 +67,7 @@ class Block {
   size_t usable_size() const {
 #ifdef ROCKSDB_MALLOC_USABLE_SIZE
     if (contents_.allocation.get() != nullptr) {
-      return malloc_usable_size(contents_.allocation.get());
+      return yb::malloc_usable_size(contents_.allocation.get());
     }
 #endif  // ROCKSDB_MALLOC_USABLE_SIZE
     return size_;
@@ -90,12 +92,13 @@ class Block {
   // This option only applies for index block. For data block, hash_index_
   // and prefix_index_ are null, so this option does not matter.
   // key_value_encoding_format specifies what kind of algorithm to use for decoding entries.
-  InternalIterator* NewIterator(const Comparator* comparator,
+  BlockIter* NewIterator(const Comparator* comparator,
                                 KeyValueEncodingFormat key_value_encoding_format,
                                 BlockIter* iter = nullptr,
-                                bool total_order_seek = true) const;
+                                bool total_order_seek = true,
+                                size_t restart_block_cache_capacity = 0) const;
 
-  inline InternalIterator* NewIndexIterator(
+  inline BlockIter* NewIndexBlockIterator(
       const Comparator* comparator, BlockIter* iter = nullptr, bool total_order_seek = true) const {
     return NewIterator(
         comparator, kIndexBlockKeyValueEncodingFormat, iter, total_order_seek);
@@ -124,11 +127,16 @@ class Block {
       MiddlePointPolicy middle_entry_policy = MiddlePointPolicy::kMiddleLow
   ) const;
 
- private:
   // Returns key for corresponding restart block.
   yb::Result<Slice> GetRestartKey(
       uint32_t restart_idx, KeyValueEncodingFormat key_value_encoding_format) const;
 
+  static inline uint32_t GetMiddlePointIndex(
+      const uint32_t num_points, const MiddlePointPolicy middle_point_policy) {
+    return num_points ? (num_points - std::to_underlying(middle_point_policy)) / 2 : 0;
+  }
+
+ private:
   // Returns a key of a middle entry for the specificed restart point.
   yb::Result<std::string> GetRestartBlockMiddleEntryKey(
       uint32_t restart_idx, const Comparator* comparator,
@@ -149,6 +157,8 @@ class Block {
 
 class BlockIter : public InternalIterator {
  public:
+  class Empty;
+
   BlockIter()
       : comparator_(nullptr),
         data_(nullptr),
@@ -156,6 +166,8 @@ class BlockIter : public InternalIterator {
         num_restarts_(0),
         current_(0),
         restart_index_(0),
+        block_entry_cache_idx_(0),
+        cache_restart_block_keys_(false),
         status_(Status::OK()),
         hash_index_(nullptr),
         prefix_index_(nullptr) {}
@@ -163,46 +175,46 @@ class BlockIter : public InternalIterator {
   BlockIter(
       const Comparator* comparator, const char* data,
       KeyValueEncodingFormat key_value_encoding_format, uint32_t restarts, uint32_t num_restarts,
-      const BlockHashIndex* hash_index, const BlockPrefixIndex* prefix_index)
+      const BlockHashIndex* hash_index, const BlockPrefixIndex* prefix_index,
+      size_t restart_block_cache_capacity)
       : BlockIter() {
     Initialize(
         comparator, data, key_value_encoding_format, restarts, num_restarts, hash_index,
-        prefix_index);
+        prefix_index, restart_block_cache_capacity);
   }
 
   void Initialize(
       const Comparator* comparator, const char* data,
       KeyValueEncodingFormat key_value_encoding_format, uint32_t restarts, uint32_t num_restarts,
-      const BlockHashIndex* hash_index, const BlockPrefixIndex* prefix_index);
+      const BlockHashIndex* hash_index, const BlockPrefixIndex* prefix_index,
+      size_t restart_block_cache_capacity);
 
   void SetStatus(Status s) {
     status_ = s;
   }
 
-  virtual bool Valid() const override { return current_ < restarts_; }
   virtual Status status() const override { return status_; }
 
-  // Becomes invalid after iterator modification or destruction
-  virtual Slice key() const override {
-    assert(Valid());
-    return key_.GetKey();
+  virtual const KeyValueEntry& Entry() const override {
+    // The following invariand holds (except intermediary state changes inside private methods):
+    // current_ < restarts_, restart_index_ < num_restarts_ and CurrentEntry().entry_.Valid() are
+    // either all true or false. This is validated in Entry() method.
+    // NB! Is it a valid state to have an empty key.
+
+    DCHECK((current_ == restarts_) == (restart_index_ == num_restarts_));
+    DCHECK((current_ == restarts_) == !CurrentEntry().entry_.Valid());
+    return CurrentEntry().entry_;
   }
 
-  // Valid during a block life-time, even after iterator's destruction
-  virtual Slice value() const override {
-    assert(Valid());
-    return value_;
-  }
+  virtual const KeyValueEntry& Next() override;
 
-  virtual void Next() override;
+  virtual const KeyValueEntry& Prev() override;
 
-  virtual void Prev() override;
+  virtual const KeyValueEntry& Seek(Slice target) override;
 
-  virtual void Seek(const Slice& target) override;
+  virtual const KeyValueEntry& SeekToFirst() override;
 
-  virtual void SeekToFirst() override;
-
-  virtual void SeekToLast() override;
+  virtual const KeyValueEntry& SeekToLast() override;
 
   virtual Status PinData() override {
     // block data is always pinned.
@@ -210,11 +222,13 @@ class BlockIter : public InternalIterator {
   }
 
   virtual Status ReleasePinnedData() override {
-    // block data is always pinned.
+    // Block data is always pinned.
     return Status::OK();
   }
 
-  virtual bool IsKeyPinned() const override { return key_.IsKeyPinned(); }
+  virtual bool IsKeyPinned() const override {
+      return CurrentEntry().key_.IsKeyPinned();
+  }
 
   void SeekToRestart(uint32_t index);
 
@@ -222,22 +236,34 @@ class BlockIter : public InternalIterator {
     return restart_index_;
   }
 
-  bool ScanForward(
-      const Comparator* user_key_comparator, const Slice& upperbound,
-      KeyFilterCallback* key_filter_callback, ScanCallback* scan_callback) override;
+  inline uint32_t GetNumRestarts() const {
+    return num_restarts_;
+  }
 
  private:
-  const Comparator* comparator_;
-  const char* data_;       // underlying block contents
-  KeyValueEncodingFormat key_value_encoding_format_;
-  uint32_t restarts_;      // Offset of restart array (list of fixed32)
-  uint32_t num_restarts_;  // Number of uint32_t entries in restart array
+  // It is required to store at least one entry, even in case if restart block caching is off.
+  static constexpr const size_t kRestartBlockCacheMinSize = 1;
 
-  // current_ is offset in data_ of current entry.  >= restarts_ if !Valid
-  uint32_t current_;
-  uint32_t restart_index_;  // Index of restart block in which current_ falls
-  IterKey key_;
-  Slice value_;
+  // Used as a cache node for a current restart block.
+  struct BlockEntry {
+    // Stores a decoded key.
+    IterKey key_ {};
+
+    // References a key from BlockEntry::key_ and a value from a current block.
+    KeyValueEntry entry_ {};
+  };
+
+  const Comparator* comparator_;
+  const char* data_;       // Underlying block contents.
+  KeyValueEncodingFormat key_value_encoding_format_;
+  uint32_t restarts_;      // Offset of restart array (list of fixed32).
+  uint32_t num_restarts_;  // Number of uint32_t entries in restart array.
+
+  uint32_t current_;       // Offset in data_ where current entry starts.
+  uint32_t restart_index_; // Index of a restart block in which current entry falls.
+  boost::container::small_vector<BlockEntry, kRestartBlockCacheMinSize> block_entry_cache_;
+  uint32_t block_entry_cache_idx_; // Index of the current element from block entry cache.
+  bool cache_restart_block_keys_;
   Status status_;
   const BlockHashIndex* hash_index_;
   const BlockPrefixIndex* prefix_index_;
@@ -246,25 +272,45 @@ class BlockIter : public InternalIterator {
     return comparator_->Compare(a, b);
   }
 
+  inline BlockEntry& CurrentEntry() {
+    return block_entry_cache_[block_entry_cache_idx_];
+  }
+
+  inline const BlockEntry& CurrentEntry() const {
+    return block_entry_cache_[block_entry_cache_idx_];
+  }
+
   // Return the offset in data_ just past the end of the current entry.
   inline uint32_t NextEntryOffset() const {
     // NOTE: We don't support files bigger than 2GB
-    return static_cast<uint32_t>((value_.cdata() + value_.size()) - data_);
+    return static_cast<uint32_t>(CurrentEntry().entry_.value.cend() - data_);
   }
 
-  uint32_t GetRestartPoint(uint32_t index) {
+  uint32_t GetRestartBlockOffset(uint32_t index) {
     assert(index < num_restarts_);
     return DecodeFixed32(data_ + restarts_ + index * sizeof(uint32_t));
   }
 
-  void SeekToRestartPoint(uint32_t index) {
-    key_.Clear();
+  inline void MoveToRestartBlock(uint32_t index) {
     restart_index_ = index;
     // current_ will be fixed by ParseNextKey();
 
-    // ParseNextKey() starts at the end of value_, so set value_ accordingly
-    uint32_t offset = GetRestartPoint(index);
-    value_ = Slice(data_ + offset, 0UL);
+    block_entry_cache_idx_ = 0;
+    CurrentEntry().key_.Clear();
+    CurrentEntry().entry_.Reset();
+    CurrentEntry().entry_.value = Slice(data_ + GetRestartBlockOffset(index), 0UL);
+  }
+
+  inline void Reset() {
+    current_ = restarts_;
+    restart_index_ = num_restarts_;
+    block_entry_cache_idx_ = 0;
+  }
+
+  inline void SetInvalid() {
+    Reset();
+    CurrentEntry().entry_.Reset();
+    CurrentEntry().key_.Clear();
   }
 
   void SetError(const Status& error);
@@ -272,19 +318,22 @@ class BlockIter : public InternalIterator {
 
   bool ParseNextKey();
 
-  bool BinarySeek(const Slice& target, uint32_t left, uint32_t right,
-                  uint32_t* index);
+  bool BinarySeek(const Slice& target, uint32_t left, uint32_t right, uint32_t* index);
 
   int CompareBlockKey(uint32_t block_index, const Slice& target);
 
   bool BinaryBlockIndexSeek(const Slice& target, uint32_t* block_ids,
-                            uint32_t left, uint32_t right,
-                            uint32_t* index);
+                            uint32_t left, uint32_t right, uint32_t* index);
 
   bool HashSeek(const Slice& target, uint32_t* index);
 
   bool PrefixSeek(const Slice& target, uint32_t* index);
-
 };
+
+// Return an empty iterator (yields nothing) allocated from arena if specified.
+BlockIter* NewEmptyBlockIterator(Arena* arena = nullptr);
+
+// Return an empty iterator with the specified status, allocated arena if specified.
+BlockIter* NewErrorBlockIterator(const Status& status, Arena* arena = nullptr);
 
 }  // namespace rocksdb

@@ -1,4 +1,4 @@
-// Copyright (c) YugaByte, Inc.
+// Copyright (c) YugabyteDB, Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License"); you may not use this file except
 // in compliance with the License.  You may obtain a copy of the License at
@@ -27,8 +27,10 @@
 #include "yb/client/yb_op.h"
 
 #include "yb/common/common.pb.h"
-#include "yb/common/partial_row.h"
+#include "yb/common/ql_protocol.messages.h"
 #include "yb/common/ql_value.h"
+
+#include "yb/dockv/partial_row.h"
 
 #include "yb/gutil/strings/split.h"
 #include "yb/gutil/strings/substitute.h"
@@ -54,49 +56,30 @@ using std::string;
 using std::set;
 using std::ostream;
 using std::vector;
-using yb::Status;
-using yb::ThreadPool;
-using yb::ThreadPoolBuilder;
-using yb::MonoDelta;
-using yb::MemoryOrder;
-using yb::ConditionVariable;
-using yb::Mutex;
-using yb::MutexLock;
-using yb::CountDownLatch;
-using yb::Slice;
-using yb::YBPartialRow;
-using yb::TableType;
 
-using yb::client::YBClient;
-using yb::client::YBError;
 using yb::client::YBNoOp;
 using yb::client::YBSession;
-using yb::client::YBTable;
 using yb::redisserver::RedisReply;
 
-DEFINE_UNKNOWN_bool(load_gen_verbose,
+DEFINE_NON_RUNTIME_bool(load_gen_verbose,
             false,
             "Custom verbose log messages for debugging the load test tool");
 
-DEFINE_UNKNOWN_int32(load_gen_insertion_tracker_delay_ms,
+DEFINE_NON_RUNTIME_int32(load_gen_insertion_tracker_delay_ms,
              50,
              "The interval (ms) at which the load generator's \"insertion tracker thread\" "
              "wakes in up ");
 
-DEFINE_UNKNOWN_int32(load_gen_scanner_open_retries,
+DEFINE_NON_RUNTIME_int32(load_gen_scanner_open_retries,
              10,
              "Number of times to re-try when opening a scanner");
 
-DEFINE_UNKNOWN_int32(load_gen_wait_time_increment_step_ms,
+DEFINE_NON_RUNTIME_int32(load_gen_wait_time_increment_step_ms,
              100,
              "In retry loops used in the load test we increment the wait time by this number of "
              "milliseconds after every attempt.");
 
 namespace {
-
-void ConfigureYBSession(YBSession* session) {
-  session->SetTimeout(60s);
-}
 
 string FormatWithSize(const string& s) {
   return strings::Substitute("'$0' ($1 bytes)", s, s.size());
@@ -261,7 +244,7 @@ void MultiThreadedAction::Start() {
 }
 
 void MultiThreadedAction::WaitForCompletion() {
-  thread_pool_->Wait();
+  thread_pool_->WaitUntil(MonoTime::kUninitialized);
 }
 
 // ------------------------------------------------------------------------------------------------
@@ -399,13 +382,12 @@ bool RedisNoopSingleThreadedWriter::Write(
 }
 
 void YBSingleThreadedWriter::ConfigureSession() {
-  session_ = client_->NewSession();
-  ConfigureYBSession(session_.get());
+  session_ = client_->NewSession(60s);
 }
 
 bool YBSingleThreadedWriter::Write(
     int64_t key_index, const string& key_str, const string& value_str) {
-  auto insert = table_->NewInsertOp();
+  auto insert = table_->NewInsertOp(session_->arena());
   // Generate a Put for key_str, value_str
   QLAddStringHashValue(insert->mutable_request(), key_str);
   table_->AddStringColumnValue(insert->mutable_request(), "v", value_str);
@@ -568,14 +550,13 @@ void RedisSingleThreadedReader::CloseSession() {
 }
 
 void YBSingleThreadedReader::ConfigureSession() {
-  session_ = client_->NewSession();
-  ConfigureYBSession(session_.get());
+  session_ = client_->NewSession(60s);
 }
 
 bool NoopSingleThreadedWriter::Write(
     int64_t key_index, const string& key_str, const string& value_str) {
   YBNoOp noop(table_->table());
-  std::unique_ptr<YBPartialRow> row(table_->schema().NewRow());
+  auto row = table_->schema().NewRow();
   CHECK_OK(row->SetBinary("k", key_str));
   Status s = noop.Execute(client_, *row);
   if (s.ok()) {
@@ -590,11 +571,11 @@ ReadStatus YBSingleThreadedReader::PerformRead(
   uint64_t read_ts = client_->GetLatestObservedHybridTime();
 
   for (int i = 1;; ++i) {
-    auto read_op = table_->NewReadOp();
+    auto read_op = table_->NewReadOp(session_->arena());
     QLAddStringHashValue(read_op->mutable_request(), key_str);
     table_->AddColumns({"k", "v"}, read_op->mutable_request());
     auto status = session_->TEST_ApplyAndFlush(read_op);
-    boost::optional<QLRowBlock> row_block;
+    std::optional<qlexpr::QLRowBlock> row_block;
     if (status.ok()) {
       auto result = read_op->MakeRowBlock();
       if (!result.ok()) {

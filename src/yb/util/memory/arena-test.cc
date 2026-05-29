@@ -15,9 +15,9 @@
 // specific language governing permissions and limitations
 // under the License.
 //
-// The following only applies to changes made to this file as part of YugaByte development.
+// The following only applies to changes made to this file as part of YugabyteDB development.
 //
-// Portions Copyright (c) YugaByte, Inc.
+// Portions Copyright (c) YugabyteDB, Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License"); you may not use this file except
 // in compliance with the License.  You may obtain a copy of the License at
@@ -33,7 +33,7 @@
 #include <thread>
 #include <vector>
 
-#include <glog/logging.h>
+#include "yb/util/logging.h"
 #include <gtest/gtest.h>
 
 #include "yb/util/mem_tracker.h"
@@ -42,9 +42,9 @@
 #include "yb/util/memory/memory.h"
 #include "yb/util/flags.h"
 
-DEFINE_UNKNOWN_int32(num_threads, 16, "Number of threads to test");
-DEFINE_UNKNOWN_int32(allocs_per_thread, 10000, "Number of allocations each thread should do");
-DEFINE_UNKNOWN_int32(alloc_size, 4, "number of bytes in each allocation");
+DEFINE_NON_RUNTIME_int32(num_threads, 16, "Number of threads to test");
+DEFINE_NON_RUNTIME_int32(allocs_per_thread, 10000, "Number of allocations each thread should do");
+DEFINE_NON_RUNTIME_int32(alloc_size, 4, "number of bytes in each allocation");
 
 namespace yb {
 

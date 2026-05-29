@@ -1,4 +1,4 @@
-// Copyright (c) YugaByte, Inc.
+// Copyright (c) YugabyteDB, Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License"); you may not use this file except
 // in compliance with the License.  You may obtain a copy of the License at
@@ -19,7 +19,7 @@ import org.junit.Test;
 import org.junit.runner.RunWith;
 import org.yb.client.TestUtils;
 import org.yb.minicluster.MiniYBDaemon;
-import org.yb.util.YBTestRunnerNonTsanOnly;
+import org.yb.YBTestRunner;
 
 import com.google.common.net.HostAndPort;
 
@@ -37,7 +37,7 @@ import static org.yb.AssertionWrappers.assertEquals;
 // But postgres client connections are not encrypted.
 // Some extra work required to adopt BasePgSQLTest for using encrypted connection.
 // Encrypted client connections are tested in pg_wrapper-test test now.
-@RunWith(value=YBTestRunnerNonTsanOnly.class)
+@RunWith(value=YBTestRunner.class)
 public class TestSecureCluster extends BasePgSQLTest {
   private String srcCertsDir;
   private String certsDir;
@@ -46,7 +46,7 @@ public class TestSecureCluster extends BasePgSQLTest {
     super();
     FileSystem fs = FileSystems.getDefault();
     srcCertsDir = fs.getPath(TestUtils.getBinDir()).resolve(
-        fs.getPath("../ent/test_certs")).toString();
+        fs.getPath("../test_certs")).toString();
     certsDir = fs.getPath(TestUtils.getBaseTmpDir()).toString();
     FileUtils.copyDirectory(new File(srcCertsDir), new File(certsDir));
     useIpWithCertificate = true;
@@ -98,6 +98,10 @@ public class TestSecureCluster extends BasePgSQLTest {
                    "reload_certificates");
     }
     connection.close();
+    if (isTestRunningWithConnectionManager()) {
+      // In this test single control connection is created.
+      closeControlConnOnReloadConfig(1);
+    }
     connection = getConnectionBuilder().connect();
     try (Statement stmt = connection.createStatement()) {
       stmt.executeUpdate("INSERT INTO test VALUES(1, 1, 1), (2, 2, 2)");

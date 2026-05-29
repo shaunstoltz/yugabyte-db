@@ -1,4 +1,4 @@
-// Copyright (c) YugaByte, Inc.
+// Copyright (c) YugabyteDB, Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License"); you may not use this file except
 // in compliance with the License.  You may obtain a copy of the License at
@@ -37,7 +37,7 @@ class FixedSizeFilterTest : public RocksDBTest {
 };
 
 TEST_F(FixedSizeFilterTest, SingleChunk) {
-  FixedSizeFilterBlockBuilder builder(nullptr, table_options_);
+  FixedSizeFilterBlockBuilder builder(nullptr, table_options_, /* mem_tracker = */ nullptr);
   builder.StartBlock(0);
   builder.Add("foo");
   builder.Add("bar");
@@ -55,7 +55,7 @@ TEST_F(FixedSizeFilterTest, SingleChunk) {
 }
 
 TEST_F(FixedSizeFilterTest, MultipleChunks) {
-  FixedSizeFilterBlockBuilder builder(nullptr, table_options_);
+  FixedSizeFilterBlockBuilder builder(nullptr, table_options_, /* mem_tracker = */ nullptr);
 
   // First block
   builder.StartBlock(0);
@@ -119,31 +119,6 @@ TEST_F(FixedSizeFilterTest, MultipleChunks) {
   ASSERT_TRUE(!reader3.KeyMayMatch("c2"));
   ASSERT_TRUE(!reader3.KeyMayMatch("missing"));
   ASSERT_TRUE(!reader3.KeyMayMatch("other"));
-}
-
-TEST_F(FixedSizeFilterTest, ConcurrentReads) {
-  FixedSizeFilterBlockBuilder builder(nullptr, table_options_);
-  builder.StartBlock(0);
-  builder.Add("foo");
-  builder.Add("bar");
-  builder.Add("fox");
-
-  BlockContents block(builder.Finish(), false, kNoCompression);
-
-  // Multiple readers on the same block should not matter
-  FixedSizeFilterBlockReader reader1(nullptr, table_options_, true, std::move(block));
-  ASSERT_TRUE(reader1.KeyMayMatch("foo"));
-  ASSERT_TRUE(reader1.KeyMayMatch("bar"));
-  ASSERT_TRUE(reader1.KeyMayMatch("fox"));
-  ASSERT_TRUE(!reader1.KeyMayMatch("other"));
-  ASSERT_TRUE(!reader1.KeyMayMatch("missing"));
-
-  FixedSizeFilterBlockReader reader2(nullptr, table_options_, true, std::move(block));
-  ASSERT_TRUE(reader2.KeyMayMatch("foo"));
-  ASSERT_TRUE(reader2.KeyMayMatch("bar"));
-  ASSERT_TRUE(reader2.KeyMayMatch("fox"));
-  ASSERT_TRUE(!reader2.KeyMayMatch("other"));
-  ASSERT_TRUE(!reader2.KeyMayMatch("missing"));
 }
 
 }  // namespace rocksdb

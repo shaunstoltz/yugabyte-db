@@ -1,4 +1,4 @@
-// Copyright (c) YugaByte, Inc.
+// Copyright (c) YugabyteDB, Inc.
 package com.yugabyte.yw.common.metrics;
 
 import static com.yugabyte.yw.common.metrics.MetricService.STATUS_NOT_OK;
@@ -317,15 +317,14 @@ public class MetricServiceTest extends FakeDBApplication {
     assertThat(metric.getUpdateTime(), notNullValue());
     assertThat(metric.getExpireTime(), notNullValue());
     assertThat(metric.getCustomerUUID(), equalTo(customer.getUuid()));
-    assertThat(metric.getType(), equalTo(Metric.Type.GAUGE));
     assertThat(metric.getName(), equalTo(PlatformMetrics.ALERT_MANAGER_STATUS.getMetricName()));
     assertThat(metric.getValue(), equalTo(value));
     assertThat(metric.getLabelValue(KnownAlertLabels.SOURCE_TYPE), equalTo("universe"));
-    assertThat(metric.getLabelValue(KnownAlertLabels.SOURCE_NAME), equalTo(universe.name));
+    assertThat(metric.getLabelValue(KnownAlertLabels.SOURCE_NAME), equalTo(universe.getName()));
     assertThat(
         metric.getLabelValue(KnownAlertLabels.SOURCE_UUID),
         equalTo(universe.getUniverseUUID().toString()));
-    assertThat(metric.getLabelValue(KnownAlertLabels.UNIVERSE_NAME), equalTo(universe.name));
+    assertThat(metric.getLabelValue(KnownAlertLabels.UNIVERSE_NAME), equalTo(universe.getName()));
     assertThat(
         metric.getLabelValue(KnownAlertLabels.UNIVERSE_UUID),
         equalTo(universe.getUniverseUUID().toString()));

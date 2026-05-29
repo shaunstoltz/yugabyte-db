@@ -1,5 +1,5 @@
 /**
- * Copyright (c) YugaByte, Inc.
+ * Copyright (c) YugabyteDB, Inc.
  *
  * Licensed under the Apache License, Version 2.0 (the "License"); you may not use this file except
  * in compliance with the License.  You may obtain a copy of the License at
@@ -34,6 +34,10 @@ public final class BuildTypeUtil {
     return TestUtils.getBuildType().equals("asan");
   }
 
+  public static boolean isFastDebug() {
+    return TestUtils.getBuildType().equals("fastdebug");
+  }
+
   public static boolean isRelease() {
     return TestUtils.getBuildType().equals("release");
   }
@@ -62,11 +66,13 @@ public final class BuildTypeUtil {
 
   /** @return a timeout multiplier to apply in tests based on the build type */
   public static double getTimeoutMultiplier() {
+    if (isRelease())
+      return 1;
     if (isTSAN())
       return 3;
     if (isASAN())
       return 1.5;
-    return 1;
+    return 1.5;
   }
 
   public static long adjustTimeout(long timeout) {

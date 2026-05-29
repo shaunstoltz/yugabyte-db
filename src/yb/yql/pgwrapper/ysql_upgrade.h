@@ -1,5 +1,5 @@
 //--------------------------------------------------------------------------------------------------
-// Copyright (c) YugaByte, Inc.
+// Copyright (c) YugabyteDB, Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License"); you may not use this file except
 // in compliance with the License.  You may obtain a copy of the License at
@@ -49,7 +49,11 @@ class YsqlUpgradeHelper {
   Result<std::unique_ptr<DatabaseEntry>> MakeDatabaseEntry(std::string database_name);
 
   // Migrate a given database to the next version, updating it in the given database entry.
-  Status MigrateOnce(DatabaseEntry* db_entry);
+  // If historical_version isn't nullptr, use it to override db_entry->version_.
+  Status MigrateOnce(DatabaseEntry* db_entry, const Version* historical_version = nullptr);
+
+  // Check whether function yb_catalog_version exists in a database.
+  Result<bool> HasYbCatalogVersion(DatabaseEntry* db_entry);
 
   const HostPort ysql_proxy_addr_;
 
@@ -66,6 +70,17 @@ class YsqlUpgradeHelper {
   // Since it's a shared relation, it only needs to be applied once.
   bool catalog_version_migration_applied_ = false;
 
+  // True if we need to wait for the new catalog version to propagate. For a shared system
+  // relation (e.g., pg_catalog.pg_yb_profile), we first execute the migration file in
+  // template1 connection to create the shared relation. When executing the same migration
+  // file in the next connection (template0 connection) because YSQL allows negative caching
+  // for system tables, pg_catalog.pg_yb_profile will not be found in template0
+  // connection if the new catalog version hasn't propagated to template0 connection yet.
+  // If so then "IF NOT EXISTS" evaluates to true. This led to template0 connection trying
+  // to create the shared relation pg_catalog.pg_yb_profile again and caused upgrade to fail
+  // with an error like "ERROR:  table OID <oid> is in use".
+  bool pg_global_heartbeat_wait_ = false;
+
   // Latest version for which migration script is present.
   // 0.0 indicates that AnalyzeMigrationFiles() hasn't been called yet.
   Version latest_version_{0, 0};
@@ -74,6 +89,10 @@ class YsqlUpgradeHelper {
   std::map<Version, std::string> migration_filenames_map_{};
 
   std::string migrations_dir_{""};
+
+  // Last breaking version in pg_yb_catalog_version before the next migration
+  // script is executed. Not used if use_single_connection_ is true.
+  uint64_t last_breaking_version_ = 0;
 };
 
 }  // namespace pgwrapper

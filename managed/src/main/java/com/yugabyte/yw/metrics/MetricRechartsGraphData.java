@@ -1,9 +1,8 @@
-// Copyright (c) YugaByte, Inc.
+// Copyright (c) YugabyteDB, Inc.
 
 package com.yugabyte.yw.metrics;
 
 import com.fasterxml.jackson.databind.node.ArrayNode;
-
 import java.util.ArrayList;
 import java.util.Map;
 import play.libs.Json;

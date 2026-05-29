@@ -1,5 +1,5 @@
 //--------------------------------------------------------------------------------------------------
-// Copyright (c) YugaByte, Inc.
+// Copyright (c) YugabyteDB, Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License"); you may not use this file except
 // in compliance with the License.  You may obtain a copy of the License at
@@ -20,13 +20,11 @@
 namespace yb {
 namespace ql {
 
-using client::YBColumnSpec;
-
-Status Executor::PTUMinusToPB(const PTOperator1 *op_pt, QLExpressionPB *op_pb) {
+Status Executor::PTUMinusToPB(const PTOperator1 *op_pt, QLExpressionMsg *op_pb) {
   return PTUMinusToPB(op_pt, op_pb->mutable_value());
 }
 
-Status Executor::PTUMinusToPB(const PTOperator1 *op_pt, QLValuePB *const_pb) {
+Status Executor::PTUMinusToPB(const PTOperator1 *op_pt, QLValueMsg *const_pb) {
   // Negate the value.
   if (op_pt->is_constant()) {
     RETURN_NOT_OK(PTConstToPB(op_pt->op1(), const_pb, true));
@@ -38,7 +36,7 @@ Status Executor::PTUMinusToPB(const PTOperator1 *op_pt, QLValuePB *const_pb) {
 }
 
 Status Executor::PTJsonOperatorToPB(const PTJsonOperator::SharedPtr& json_pt,
-                                    QLJsonOperationPB *op_pb) {
+                                    QLJsonOperationMsg *op_pb) {
   switch (json_pt->json_operator()) {
     case JsonOperator::JSON_TEXT:
       op_pb->set_json_operator(JsonOperatorPB::JSON_TEXT);

@@ -1,4 +1,4 @@
-// Copyright (c) YugaByte, Inc.
+// Copyright (c) YugabyteDB, Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License"); you may not use this file except
 // in compliance with the License.  You may obtain a copy of the License at
@@ -23,7 +23,6 @@ import com.datastax.driver.core.PreparedStatement;
 import com.datastax.driver.core.ResultSet;
 import com.datastax.driver.core.Row;
 import com.datastax.driver.core.SimpleStatement;
-import com.google.common.collect.Lists;
 
 import org.junit.Test;
 import org.yb.client.TestUtils;
@@ -144,6 +143,17 @@ public class TestBindVariable extends BaseCQLTest {
       assertEquals("v1007", row.getString(5));
       row = rs.one();
       assertNull(row);
+    }
+
+    {
+      // Ensure that this doesn't crash the tserver
+      String selectStmt = "SELECT ? FROM test_bind;";
+      try {
+        ResultSet rs = session.execute(selectStmt, new Integer(1));
+        fail("Statement \"" + selectStmt + "\" did not fail undefined bind variable name");
+      } catch (com.datastax.driver.core.exceptions.InvalidQueryException e) {
+        LOG.info("Expected exception ", e);
+      }
     }
 
     LOG.info("End test");

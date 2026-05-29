@@ -1,10 +1,13 @@
-import React, { ReactElement } from 'react';
+import { ReactElement } from 'react';
+import { useQuery } from 'react-query';
 import { useTranslation } from 'react-i18next';
 import { useFormContext, useWatch } from 'react-hook-form';
 import { Box } from '@material-ui/core';
-import { YBLabel, YBHelper, YBToggleField } from '../../../../../../components';
+import { YBLabel, YBToggleField, YBTooltip } from '../../../../../../components';
+import { api, QUERY_KEY } from '../../../utils/api';
 import { CloudType, UniverseFormData } from '../../../utils/dto';
 import { TIME_SYNC_FIELD, PROVIDER_FIELD } from '../../../utils/constants';
+import InfoMessageIcon from '../../../../../../assets/info-message.svg?img';
 
 interface TimeSyncFieldProps {
   disabled: boolean;
@@ -20,28 +23,36 @@ export const TimeSyncField = ({ disabled }: TimeSyncFieldProps): ReactElement =>
   const { control } = useFormContext<UniverseFormData>();
   const { t } = useTranslation();
 
+  const { data } = useQuery(QUERY_KEY.getProvidersList, api.getProvidersList);
+
   //watchers
   const provider = useWatch({ name: PROVIDER_FIELD });
+
+  const isChronyEnabled = !!data?.find((p) => p?.uuid === provider.uuid)?.details?.setUpChrony;
+  const timeSyncTooltipText = t('universeForm.instanceConfig.useTimeSyncHelper', {
+    provider: PROVIDER_FRIENDLY_NAME[provider?.code]
+  });
 
   const stringMap = { provider: PROVIDER_FRIENDLY_NAME[provider?.code] };
 
   return (
     <Box display="flex" width="100%" data-testid="TimeSyncField-Container">
-      <YBLabel dataTestId="TimeSyncField-Label">
-        {t('universeForm.instanceConfig.useTimeSync', stringMap)}
-      </YBLabel>
+      <YBToggleField
+        name={TIME_SYNC_FIELD}
+        inputProps={{
+          'data-testid': 'TimeSyncField-Toggle'
+        }}
+        control={control}
+        disabled={disabled || isChronyEnabled}
+      />
       <Box flex={1}>
-        <YBToggleField
-          name={TIME_SYNC_FIELD}
-          inputProps={{
-            'data-testid': 'TimeSyncField-Toggle'
-          }}
-          control={control}
-          disabled={disabled}
-        />
-        <YBHelper dataTestId="TimeSyncField-Helper">
-          {t('universeForm.instanceConfig.useTimeSyncHelper', stringMap)}
-        </YBHelper>
+        <YBLabel dataTestId="TimeSyncField-Label">
+          {t('universeForm.instanceConfig.useTimeSync', stringMap)}
+          &nbsp;
+          <YBTooltip title={timeSyncTooltipText}>
+            <img alt="Info" src={InfoMessageIcon} />
+          </YBTooltip>
+        </YBLabel>
       </Box>
     </Box>
   );

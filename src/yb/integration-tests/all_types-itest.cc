@@ -15,9 +15,9 @@
 // specific language governing permissions and limitations
 // under the License.
 //
-// The following only applies to changes made to this file as part of YugaByte development.
+// The following only applies to changes made to this file as part of YugabyteDB development.
 //
-// Portions Copyright (c) YugaByte, Inc.
+// Portions Copyright (c) YugabyteDB, Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License"); you may not use this file except
 // in compliance with the License.  You may obtain a copy of the License at
@@ -35,7 +35,6 @@
 #include <unordered_map>
 #include <vector>
 
-#include <boost/optional/optional_fwd.hpp>
 #include <gtest/gtest.h>
 
 #include "yb/client/client_fwd.h"
@@ -72,7 +71,7 @@
 #include "yb/util/test_util.h"
 #include "yb/util/flags.h"
 
-DEFINE_UNKNOWN_int32(num_rows_per_tablet, 100,
+DEFINE_NON_RUNTIME_int32(num_rows_per_tablet, 100,
     "The number of rows to be inserted into each tablet");
 
 using std::vector;
@@ -98,7 +97,7 @@ struct TypeDescriptor;
 
 template<>
 struct TypeDescriptor<KeyTypeWrapper<yb::DataType::BINARY>> {
-  static void AddHashValue(QLWriteRequestPB* req, int value) {
+  static void AddHashValue(QLWriteRequestMsg* req, int value) {
     QLAddBinaryHashValue(req, StringPrintf("%016x", value));
   }
 
@@ -109,7 +108,7 @@ struct TypeDescriptor<KeyTypeWrapper<yb::DataType::BINARY>> {
 
 template<>
 struct TypeDescriptor<KeyTypeWrapper<yb::DataType::STRING>> {
-  static void AddHashValue(QLWriteRequestPB* req, int value) {
+  static void AddHashValue(QLWriteRequestMsg* req, int value) {
     QLAddStringHashValue(req, StringPrintf("%016x", value));
   }
 
@@ -120,7 +119,7 @@ struct TypeDescriptor<KeyTypeWrapper<yb::DataType::STRING>> {
 
 template<>
 struct TypeDescriptor<int64_t> {
-  static void AddHashValue(QLWriteRequestPB* req, int64_t value) {
+  static void AddHashValue(QLWriteRequestMsg* req, int64_t value) {
     QLAddInt64HashValue(req, value);
   }
 
@@ -131,7 +130,7 @@ struct TypeDescriptor<int64_t> {
 
 template<>
 struct TypeDescriptor<int32_t> {
-  static void AddHashValue(QLWriteRequestPB* req, int32_t value) {
+  static void AddHashValue(QLWriteRequestMsg* req, int32_t value) {
     QLAddInt32HashValue(req, value);
   }
 
@@ -142,7 +141,7 @@ struct TypeDescriptor<int32_t> {
 
 template<>
 struct TypeDescriptor<int16_t> {
-  static void AddHashValue(QLWriteRequestPB* req, int16_t value) {
+  static void AddHashValue(QLWriteRequestMsg* req, int16_t value) {
     QLAddInt16HashValue(req, value);
   }
 
@@ -153,7 +152,7 @@ struct TypeDescriptor<int16_t> {
 
 template<>
 struct TypeDescriptor<int8_t> {
-  static void AddHashValue(QLWriteRequestPB* req, int8_t value) {
+  static void AddHashValue(QLWriteRequestMsg* req, int8_t value) {
     QLAddInt8HashValue(req, value);
   }
 
@@ -180,7 +179,7 @@ struct SliceKeysTestSetup {
     TypeDescriptor<KeyTypeWrapper>::AddHashValue(insert->mutable_request(), row_key_num);
   }
 
-  int64_t KeyIntVal(const QLRow& row) const {
+  int64_t KeyIntVal(const qlexpr::QLRow& row) const {
     return TypeDescriptor<KeyTypeWrapper>::GetIntVal(row.column(0));
   }
 
@@ -230,7 +229,7 @@ struct IntKeysTestSetup {
     TypeDescriptor<CppType>::AddHashValue(insert->mutable_request(), val);
   }
 
-  int64_t KeyIntVal(const QLRow& row) const {
+  int64_t KeyIntVal(const qlexpr::QLRow& row) const {
     return TypeDescriptor<CppType>::GetIntVal(row.column(0));
   }
 
@@ -261,7 +260,7 @@ class AllTypesItest : public YBTest {
  public:
   AllTypesItest() {
     if (AllowSlowTests()) {
-      FLAGS_num_rows_per_tablet = 10000;
+      ANNOTATE_UNPROTECTED_WRITE(FLAGS_num_rows_per_tablet) = 10000;
     }
     setup_ = TestSetup();
   }
@@ -271,13 +270,13 @@ class AllTypesItest : public YBTest {
   void CreateAllTypesSchema() {
     YBSchemaBuilder builder;
     setup_.AddKeyColumnsToSchema(&builder);
-    builder.AddColumn("int8_val")->Type(INT8);
-    builder.AddColumn("int16_val")->Type(INT16);
-    builder.AddColumn("int32_val")->Type(INT32);
-    builder.AddColumn("int64_val")->Type(INT64);
-    builder.AddColumn("string_val")->Type(STRING);
-    builder.AddColumn("bool_val")->Type(BOOL);
-    builder.AddColumn("binary_val")->Type(BINARY);
+    builder.AddColumn("int8_val")->Type(DataType::INT8);
+    builder.AddColumn("int16_val")->Type(DataType::INT16);
+    builder.AddColumn("int32_val")->Type(DataType::INT32);
+    builder.AddColumn("int64_val")->Type(DataType::INT64);
+    builder.AddColumn("string_val")->Type(DataType::STRING);
+    builder.AddColumn("bool_val")->Type(DataType::BOOL);
+    builder.AddColumn("binary_val")->Type(DataType::BINARY);
     CHECK_OK(builder.Build(&schema_));
   }
 
@@ -312,7 +311,7 @@ class AllTypesItest : public YBTest {
   }
 
   Status GenerateRow(YBSession* session, int split_idx, int row_idx) {
-    auto insert = table_.NewInsertOp();
+    auto insert = table_.NewInsertOp(session->arena());
     setup_.GenerateRowKey(insert.get(), split_idx, row_idx);
     int int_val = (split_idx * setup_.GetRowsPerTablet()) + row_idx;
     auto req = insert->mutable_request();
@@ -322,8 +321,8 @@ class AllTypesItest : public YBTest {
     table_.AddInt64ColumnValue(req, "int64_val", int_val);
     std::string content = StringPrintf("hello %010x", int_val);
     table_.AddStringColumnValue(req, "string_val", content);
-    table_.AddBinaryColumnValue(req, "binary_val", content);
     table_.AddBoolColumnValue(req, "bool_val", int_val % 2);
+    table_.AddBinaryColumnValue(req, "binary_val", content);
     VLOG(1) << "Inserting row[" << split_idx << "," << row_idx << "]" << insert->ToString();
     session->Apply(insert);
     return Status::OK();
@@ -333,7 +332,7 @@ class AllTypesItest : public YBTest {
   // perfectly partitioned table, if the encoding of the keys was correct and the rows
   // ended up in the right place.
   Status InsertRows() {
-    shared_ptr<YBSession> session = client_->NewSession();
+    shared_ptr<YBSession> session = client_->NewSession(MonoDelta::FromSeconds(60));
     int max_rows_per_tablet = setup_.GetRowsPerTablet();
     for (int i = 0; i < kNumTablets; ++i) {
       for (int j = 0; j < max_rows_per_tablet; ++j) {
@@ -358,7 +357,7 @@ class AllTypesItest : public YBTest {
     projection->push_back("bool_val");
   }
 
-  void VerifyRow(const QLRow& row) {
+  void VerifyRow(const qlexpr::QLRow& row) {
     int64_t key_int_val = setup_.KeyIntVal(row);
     int64_t row_idx = key_int_val % setup_.Increment();;
     int64_t split_idx = key_int_val / setup_.Increment();
@@ -414,12 +413,12 @@ class AllTypesItest : public YBTest {
   TableHandle table_;
 };
 
-typedef ::testing::Types<IntKeysTestSetup<KeyTypeWrapper<INT8>>,
-                         IntKeysTestSetup<KeyTypeWrapper<INT16>>,
-                         IntKeysTestSetup<KeyTypeWrapper<INT32>>,
-                         IntKeysTestSetup<KeyTypeWrapper<INT64>>,
-                         SliceKeysTestSetup<KeyTypeWrapper<STRING>>,
-                         SliceKeysTestSetup<KeyTypeWrapper<BINARY>>
+typedef ::testing::Types<IntKeysTestSetup<KeyTypeWrapper<DataType::INT8>>,
+                         IntKeysTestSetup<KeyTypeWrapper<DataType::INT16>>,
+                         IntKeysTestSetup<KeyTypeWrapper<DataType::INT32>>,
+                         IntKeysTestSetup<KeyTypeWrapper<DataType::INT64>>,
+                         SliceKeysTestSetup<KeyTypeWrapper<DataType::STRING>>,
+                         SliceKeysTestSetup<KeyTypeWrapper<DataType::BINARY>>
                          > KeyTypes;
 
 TYPED_TEST_CASE(AllTypesItest, KeyTypes);

@@ -3,9 +3,9 @@
 //  LICENSE file in the root directory of this source tree. An additional grant
 //  of patent rights can be found in the PATENTS file in the same directory.
 //
-// The following only applies to changes made to this file as part of YugaByte development.
+// The following only applies to changes made to this file as part of YugabyteDB development.
 //
-// Portions Copyright (c) YugaByte, Inc.
+// Portions Copyright (c) YugabyteDB, Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License"); you may not use this file except
 // in compliance with the License.  You may obtain a copy of the License at
@@ -93,6 +93,7 @@ ImmutableCFOptions::ImmutableCFOptions(const Options& options)
       row_cache(options.row_cache),
       mem_tracker(options.mem_tracker),
       block_based_table_mem_tracker(options.block_based_table_mem_tracker),
+      block_based_table_builder_mem_tracker(options.block_based_table_builder_mem_tracker),
       iterator_replacer(options.iterator_replacer),
       compaction_file_filter_factory(options.compaction_file_filter_factory.get()),
       priority_thread_pool_metrics(options.priority_thread_pool_metrics) {}
@@ -159,6 +160,7 @@ ColumnFamilyOptions::ColumnFamilyOptions(const Options& options)
       compaction_filter_factory(options.compaction_filter_factory),
       write_buffer_size(options.write_buffer_size),
       max_write_buffer_number(options.max_write_buffer_number),
+      max_flushing_bytes(options.max_flushing_bytes),
       min_write_buffer_number_to_merge(
           options.min_write_buffer_number_to_merge),
       max_write_buffer_number_to_maintain(
@@ -718,6 +720,14 @@ std::atomic<int64_t> flush_tick_(1);
 
 int64_t FlushTick() {
   return flush_tick_.fetch_add(1, std::memory_order_acq_rel);
+}
+
+QueryOptions QueryOptions::FromReadOptions(const ReadOptions& read_options) {
+  return QueryOptions {
+    .query_id = read_options.query_id,
+    .no_io = read_options.read_tier == kBlockCacheTier,
+    .statistics = read_options.statistics,
+  };
 }
 
 }  // namespace rocksdb

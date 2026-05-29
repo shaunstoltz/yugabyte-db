@@ -1,5 +1,5 @@
 /*
- * Copyright 2019 YugaByte, Inc. and Contributors
+ * Copyright 2019 YugabyteDB, Inc. and Contributors
  *
  * Licensed under the Polyform Free Trial License 1.0.0 (the "License"); you
  * may not use this file except in compliance with the License. You
@@ -12,27 +12,22 @@ package com.yugabyte.yw.commissioner.tasks;
 
 import static com.yugabyte.yw.common.Util.areMastersUnderReplicated;
 
-import com.google.common.collect.ImmutableSet;
-import com.yugabyte.yw.commissioner.AbstractTaskBase;
 import com.yugabyte.yw.commissioner.BaseTaskDependencies;
+import com.yugabyte.yw.commissioner.ITask.Retryable;
 import com.yugabyte.yw.commissioner.UserTaskDetails.SubTaskGroupType;
-import com.yugabyte.yw.commissioner.tasks.UniverseTaskBase.ServerType;
 import com.yugabyte.yw.commissioner.tasks.params.NodeTaskParams;
-import com.yugabyte.yw.common.PlacementInfoUtil;
 import com.yugabyte.yw.models.Universe;
-import com.yugabyte.yw.models.Universe.UniverseUpdater;
 import com.yugabyte.yw.models.helpers.NodeDetails;
-import com.yugabyte.yw.models.helpers.NodeStatus;
 import com.yugabyte.yw.models.helpers.NodeDetails.MasterState;
 import com.yugabyte.yw.models.helpers.NodeDetails.NodeState;
-import java.util.Set;
+import java.util.Collections;
 import javax.inject.Inject;
 import lombok.extern.slf4j.Slf4j;
-import org.apache.commons.lang3.StringUtils;
 
 // Allows the addition of the master server to a node. Spawns master the process and ensures
 // the task waits for the right set of load balance primitives.
 @Slf4j
+@Retryable
 public class StartMasterOnNode extends UniverseDefinitionTaskBase {
 
   @Inject
@@ -45,53 +40,39 @@ public class StartMasterOnNode extends UniverseDefinitionTaskBase {
     return (NodeTaskParams) taskParams;
   }
 
-  @Override
-  public void run() {
-    log.info(
-        "Started {} task for node {} in univ uuid={}",
-        getName(),
-        taskParams().nodeName,
-        taskParams().universeUUID);
-    NodeDetails currentNode = null;
-    try {
-      checkUniverseVersion();
+  private void runBasicChecks(Universe universe) {
+    NodeDetails currentNode = universe.getNode(taskParams().nodeName);
+    if (currentNode == null) {
+      String msg = "No node " + taskParams().nodeName + " found in universe " + universe.getName();
+      log.error(msg);
+      throw new RuntimeException(msg);
+    }
+    if (currentNode.state == NodeState.Stopped
+        || currentNode.state == NodeState.Removed
+        || currentNode.state == NodeState.Decommissioned) {
+      String msg =
+          "Node "
+              + taskParams().nodeName
+              + " is in removed or decommissioned state"
+              + ", the Master process cannot be started. Use \"Start Node\" instead.";
+      log.error(msg);
+      throw new RuntimeException(msg);
+    }
 
-      // Update the DB to prevent other changes from happening.
-      Universe universe = lockUniverseForUpdate(taskParams().expectedUniverseVersion);
-
-      currentNode = universe.getNode(taskParams().nodeName);
-      if (currentNode == null) {
-        String msg = "No node " + taskParams().nodeName + " in universe " + universe.name;
-        log.error(msg);
-        throw new RuntimeException(msg);
-      }
-
-      taskParams().azUuid = currentNode.azUuid;
-      taskParams().placementUuid = currentNode.placementUuid;
-      if (!instanceExists(taskParams())) {
-        String msg = "No instance exists for " + taskParams().nodeName;
-        log.error(msg);
-        throw new RuntimeException(msg);
-      }
-
+    if (currentNode.dedicatedTo == ServerType.TSERVER) {
+      String msg =
+          "Unable to start the Master process on node "
+              + taskParams().nodeName
+              + ", node is dedicated to tserver.";
+      log.error(msg);
+      throw new RuntimeException(msg);
+    }
+    if (isFirstTry()) {
       if (currentNode.isMaster) {
         String msg = "Node " + taskParams().nodeName + " already has the Master process running.";
         log.error(msg);
         throw new RuntimeException(msg);
       }
-
-      if (currentNode.state == NodeState.Stopped
-          || currentNode.state == NodeState.Removed
-          || currentNode.state == NodeState.Decommissioned) {
-        String msg =
-            "Node "
-                + taskParams().nodeName
-                + " is in removed or decommissioned state"
-                + ", the Master process cannot be started. Use \"Start Node\" instead.";
-        log.error(msg);
-        throw new RuntimeException(msg);
-      }
-
       if (!areMastersUnderReplicated(currentNode, universe)) {
         String msg =
             "Unable to start the Master process on node "
@@ -100,37 +81,68 @@ public class StartMasterOnNode extends UniverseDefinitionTaskBase {
         log.error(msg);
         throw new RuntimeException(msg);
       }
+    }
+  }
 
-      if (currentNode.dedicatedTo == ServerType.TSERVER) {
-        String msg =
-            "Unable to start the Master process on node "
-                + taskParams().nodeName
-                + ", node is dedicated to tserver.";
-        log.error(msg);
-        throw new RuntimeException(msg);
-      }
+  @Override
+  public void validateParams(boolean isFirstTry) {
+    super.validateParams(isFirstTry);
+    runBasicChecks(getUniverse());
+  }
 
+  @Override
+  protected void createPrecheckTasks(Universe universe) {
+    // Check again after locking.
+    runBasicChecks(universe);
+    NodeDetails currentNode = universe.getNode(taskParams().nodeName);
+    taskParams().azUuid = currentNode.azUuid;
+    taskParams().placementUuid = currentNode.placementUuid;
+    if (!instanceExists(taskParams())) {
+      String msg = "No instance exists for " + taskParams().nodeName;
+      log.error(msg);
+      throw new RuntimeException(msg);
+    }
+    addBasicPrecheckTasks();
+  }
+
+  @Override
+  public void run() {
+    log.info(
+        "Started {} task for node {} in univ uuid={}",
+        getName(),
+        taskParams().nodeName,
+        taskParams().getUniverseUUID());
+    checkUniverseVersion();
+    Universe universe =
+        lockAndFreezeUniverseForUpdate(
+            taskParams().expectedUniverseVersion,
+            u -> {
+              NodeDetails node = u.getNode(taskParams().nodeName);
+              node.masterState = MasterState.ToStart;
+            });
+    try {
+      NodeDetails currentNode = universe.getNode(taskParams().nodeName);
       log.info(
           "Bringing up master for under replicated universe {} ({})",
-          universe.universeUUID,
-          universe.name);
+          universe.getUniverseUUID(),
+          universe.getName());
 
       preTaskActions();
 
-      if (currentNode.masterState == null) {
-        saveNodeStatus(
-            taskParams().nodeName, NodeStatus.builder().masterState(MasterState.ToStart).build());
-      }
-
       // Update node state to Starting Master.
       createSetNodeStateTask(currentNode, NodeState.Starting)
+          .setSubTaskGroupType(SubTaskGroupType.StartingMasterProcess);
+
+      // Make sure clock skew is low enough on the node.
+      createWaitForClockSyncTasks(universe, Collections.singleton(currentNode))
           .setSubTaskGroupType(SubTaskGroupType.StartingMasterProcess);
 
       // This starts master and if it fails after setting isMaster=true, this task cannot be run as
       // the node state moves to Starting.
       // and this node is already a master.
       // TODO Fix the above issue when there is a better state management of processes.
-      createStartMasterOnNodeTasks(universe, currentNode, null);
+      createStartMasterOnNodeTasks(
+          universe, currentNode, null, false /* stoppable */, false /* ignoreStopError */);
 
       // Update node state to running.
       createSetNodeStateTask(currentNode, NodeDetails.NodeState.Live)
@@ -157,6 +169,6 @@ public class StartMasterOnNode extends UniverseDefinitionTaskBase {
         "Finished {} task for node {} in univ uuid={}",
         getName(),
         taskParams().nodeName,
-        taskParams().universeUUID);
+        taskParams().getUniverseUUID());
   }
 }

@@ -1,4 +1,4 @@
-// Copyright (c) YugaByte, Inc.
+// Copyright (c) YugabyteDB, Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License"); you may not use this file except
 // in compliance with the License.  You may obtain a copy of the License at
@@ -17,9 +17,13 @@ import org.junit.runner.RunWith;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
-import org.yb.util.YBTestRunnerNonTsanAsan;
+import org.yb.YBTestRunner;
+import org.yb.util.SkipOnASAN;
+import org.yb.util.SkipOnTSAN;
 
-@RunWith(value=YBTestRunnerNonTsanAsan.class)
+@SkipOnTSAN
+@SkipOnASAN
+@RunWith(value=YBTestRunner.class)
 public class TestBigNumShards extends BaseCQLTest {
   private static final Logger LOG = LoggerFactory.getLogger(TestBigNumShards.class);
 

@@ -3,9 +3,9 @@
 //  LICENSE file in the root directory of this source tree. An additional grant
 //  of patent rights can be found in the PATENTS file in the same directory.
 //
-// The following only applies to changes made to this file as part of YugaByte development.
+// The following only applies to changes made to this file as part of YugabyteDB development.
 //
-// Portions Copyright (c) YugaByte, Inc.
+// Portions Copyright (c) YugabyteDB, Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License"); you may not use this file except
 // in compliance with the License.  You may obtain a copy of the License at
@@ -66,7 +66,7 @@ class TestFilterBitsReader : public FilterBitsReader {
   explicit TestFilterBitsReader(const Slice& contents)
       : data_(contents.cdata()), len_(static_cast<uint32_t>(contents.size())) {}
 
-  bool MayMatch(const Slice& entry) override {
+  bool MayMatch(Slice entry) override {
     uint32_t h = Hash(entry.data(), entry.size(), 1);
     for (size_t i = 0; i + 4 <= len_; i += 4) {
       if (h == DecodeFixed32(data_ + i)) {

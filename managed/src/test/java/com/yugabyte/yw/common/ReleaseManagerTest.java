@@ -1,35 +1,49 @@
-// Copyright (c) YugaByte, Inc.
+// Copyright (c) YugabyteDB, Inc.
 package com.yugabyte.yw.common;
 
+import static com.yugabyte.yw.common.AssertHelper.assertPlatformException;
 import static com.yugabyte.yw.common.AssertHelper.assertValue;
 import static com.yugabyte.yw.common.ConfigHelper.ConfigType.SoftwareReleases;
+import static com.yugabyte.yw.common.ConfigHelper.ConfigType.YbcSoftwareReleases;
 import static com.yugabyte.yw.common.TestHelper.createTempFile;
 import static org.hamcrest.CoreMatchers.allOf;
 import static org.hamcrest.CoreMatchers.equalTo;
 import static org.hamcrest.CoreMatchers.notNullValue;
 import static org.junit.Assert.assertEquals;
+import static org.junit.Assert.assertFalse;
 import static org.junit.Assert.assertNotNull;
 import static org.junit.Assert.assertNull;
 import static org.junit.Assert.assertThat;
 import static org.junit.Assert.assertTrue;
+import static org.junit.Assert.fail;
 import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.ArgumentMatchers.anyMap;
 import static org.mockito.Mockito.times;
-import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.when;
 
 import com.fasterxml.jackson.databind.JsonNode;
 import com.google.common.collect.ImmutableList;
 import com.google.common.collect.ImmutableMap;
+import com.typesafe.config.Config;
 import com.yugabyte.yw.cloud.PublicCloudConstants.Architecture;
+import com.yugabyte.yw.commissioner.tasks.UniverseTaskBase;
 import com.yugabyte.yw.common.ReleaseManager.ReleaseMetadata;
-import com.yugabyte.yw.common.gflags.GFlagsValidation;
+import com.yugabyte.yw.common.config.GlobalConfKeys;
+import com.yugabyte.yw.common.config.RuntimeConfGetter;
+import com.yugabyte.yw.models.Release;
+import com.yugabyte.yw.models.ReleaseArtifact;
+import com.yugabyte.yw.models.ReleaseLocalFile;
+import com.yugabyte.yw.models.Universe;
+import java.io.ByteArrayInputStream;
 import java.io.File;
 import java.io.IOException;
+import java.io.InputStream;
+import java.nio.charset.StandardCharsets;
 import java.util.Collections;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.Optional;
 import org.apache.commons.io.FileUtils;
 import org.junit.After;
 import org.junit.Before;
@@ -40,8 +54,10 @@ import org.mockito.InjectMocks;
 import org.mockito.Mock;
 import org.mockito.Mockito;
 import org.mockito.Spy;
-import org.mockito.runners.MockitoJUnitRunner;
-import play.Configuration;
+import org.mockito.invocation.InvocationOnMock;
+import org.mockito.junit.MockitoJUnitRunner;
+import org.mockito.stubbing.Answer;
+import play.Environment;
 import play.libs.Json;
 
 @RunWith(MockitoJUnitRunner.class)
@@ -49,17 +65,43 @@ public class ReleaseManagerTest extends FakeDBApplication {
   String TMP_STORAGE_PATH = "/tmp/yugaware_tests/" + getClass().getSimpleName() + "/releases";
   String TMP_DOCKER_STORAGE_PATH =
       "/tmp/yugaware_tests/" + getClass().getSimpleName() + "/docker/releases";
+  String TMP_REPLACE_STORAGE_PATH =
+      "/tmp/yugaware_replace_tests/" + getClass().getSimpleName() + "/releases";
 
   @InjectMocks ReleaseManager releaseManager;
 
-  @Mock Configuration appConfig;
+  @Mock Config appConfig;
 
   @Spy ConfigHelper configHelper;
+
+  @Mock RuntimeConfGetter confGetter;
+
+  @Mock Environment environment;
+
+  @Mock ReleaseContainerFactory releaseContainerFactory;
+
+  @Mock ReleasesUtils mockReleasesUtils;
 
   @Before
   public void beforeTest() throws IOException {
     new File(TMP_STORAGE_PATH).mkdirs();
+    new File(TMP_REPLACE_STORAGE_PATH).mkdirs();
     new File(TMP_DOCKER_STORAGE_PATH).mkdirs();
+    String versionJson = "{\"version_number\": \"2.16.3.4\", \"build_number\":\"12\"}";
+    when(environment.resourceAsStream("version_metadata.json"))
+        .thenAnswer(
+            new Answer<InputStream>() {
+              @Override
+              public InputStream answer(InvocationOnMock invocation) {
+                return new ByteArrayInputStream(versionJson.getBytes(StandardCharsets.UTF_8));
+              }
+            });
+    when(appConfig.getString("yb.releases.path")).thenReturn(TMP_STORAGE_PATH);
+    when(confGetter.getGlobalConf(GlobalConfKeys.ybdbReleasePathRegex))
+        .thenReturn("[^.]+yugabyte-(?:ee-)?(.*)-(alma|centos|linux|el8|darwin)(.*).tar.gz");
+    when(confGetter.getGlobalConf(GlobalConfKeys.ybdbHelmReleasePathRegex))
+        .thenReturn("[^.]+yugabyte-(.*)-helm.tar.gz");
+    when(confGetter.getGlobalConf(GlobalConfKeys.enableReleasesRedesign)).thenReturn(false);
   }
 
   @After
@@ -248,14 +290,13 @@ public class ReleaseManagerTest extends FakeDBApplication {
   @Test
   public void testLoadReleasesWithReleasePath() throws IOException {
     when(appConfig.getString("yb.releases.path")).thenReturn(TMP_STORAGE_PATH);
-    List<String> versions = ImmutableList.of("0.0.1");
+    List<String> versions = ImmutableList.of("0.0.0.1-b1");
     createDummyReleases(versions, false, false);
-    when(mockGFlagsValidation.getMissingGFlagFileList(any()))
-        .thenReturn(GFlagsValidation.GFLAG_FILENAME_LIST);
+    when(confGetter.getGlobalConf(GlobalConfKeys.ybdbReleasePathRegex))
+        .thenReturn("[^.]+yugabyte-(?:ee-)?(.*)-(alma|centos|linux|el8|darwin)(.*).tar.gz");
+    when(confGetter.getGlobalConf(GlobalConfKeys.ybdbHelmReleasePathRegex))
+        .thenReturn("[^.]+yugabyte-(.*)-helm.tar.gz");
     releaseManager.importLocalReleases();
-    verify(mockGFlagsValidation, times(1))
-        .fetchGFlagFilesFromTarGZipInputStream(any(), any(), any(), any());
-
     ArgumentCaptor<ConfigHelper.ConfigType> configType;
     ArgumentCaptor<HashMap> releaseMap;
     configType = ArgumentCaptor.forClass(ConfigHelper.ConfigType.class);
@@ -264,12 +305,13 @@ public class ReleaseManagerTest extends FakeDBApplication {
         .loadConfigToDB(configType.capture(), releaseMap.capture());
     Map expectedMap =
         ImmutableMap.of(
-            "0.0.1",
-            ReleaseManager.ReleaseMetadata.create("0.0.1")
-                .withFilePath(TMP_STORAGE_PATH + "/0.0.1/yugabyte-ee-0.0.1-centos-x86_64.tar.gz")
-                .withChartPath(TMP_STORAGE_PATH + "/0.0.1/yugabyte-0.0.1-helm.tar.gz")
+            "0.0.0.1-b1",
+            ReleaseManager.ReleaseMetadata.create("0.0.0.1-b1")
+                .withFilePath(
+                    TMP_STORAGE_PATH + "/0.0.0.1-b1/yugabyte-ee-0.0.0.1-b1-centos-x86_64.tar.gz")
+                .withChartPath(TMP_STORAGE_PATH + "/0.0.0.1-b1/yugabyte-0.0.0.1-b1-helm.tar.gz")
                 .withPackage(
-                    TMP_STORAGE_PATH + "/0.0.1/yugabyte-ee-0.0.1-centos-x86_64.tar.gz",
+                    TMP_STORAGE_PATH + "/0.0.0.1-b1/yugabyte-ee-0.0.0.1-b1-centos-x86_64.tar.gz",
                     Architecture.x86_64));
     assertReleases(expectedMap, releaseMap.getValue());
   }
@@ -277,13 +319,13 @@ public class ReleaseManagerTest extends FakeDBApplication {
   @Test
   public void testLoadReleasesWithLinuxOSReleasePath() throws IOException {
     when(appConfig.getString("yb.releases.path")).thenReturn(TMP_STORAGE_PATH);
-    List<String> versions = ImmutableList.of("0.0.1");
+    List<String> versions = ImmutableList.of("0.0.0.1-b1");
     createDummyReleases(versions, false, false, true, true, false, "linux");
-    when(mockGFlagsValidation.getMissingGFlagFileList(any()))
-        .thenReturn(GFlagsValidation.GFLAG_FILENAME_LIST);
+    when(confGetter.getGlobalConf(GlobalConfKeys.ybdbReleasePathRegex))
+        .thenReturn("[^.]+yugabyte-(?:ee-)?(.*)-(alma|centos|linux|el8|darwin)(.*).tar.gz");
+    when(confGetter.getGlobalConf(GlobalConfKeys.ybdbHelmReleasePathRegex))
+        .thenReturn("[^.]+yugabyte-(.*)-helm.tar.gz");
     releaseManager.importLocalReleases();
-    verify(mockGFlagsValidation, times(1))
-        .fetchGFlagFilesFromTarGZipInputStream(any(), any(), any(), any());
 
     ArgumentCaptor<ConfigHelper.ConfigType> configType;
     ArgumentCaptor<HashMap> releaseMap;
@@ -293,12 +335,13 @@ public class ReleaseManagerTest extends FakeDBApplication {
         .loadConfigToDB(configType.capture(), releaseMap.capture());
     Map expectedMap =
         ImmutableMap.of(
-            "0.0.1",
-            ReleaseManager.ReleaseMetadata.create("0.0.1")
-                .withFilePath(TMP_STORAGE_PATH + "/0.0.1/yugabyte-ee-0.0.1-linux-x86_64.tar.gz")
-                .withChartPath(TMP_STORAGE_PATH + "/0.0.1/yugabyte-0.0.1-helm.tar.gz")
+            "0.0.0.1-b1",
+            ReleaseManager.ReleaseMetadata.create("0.0.0.1-b1")
+                .withFilePath(
+                    TMP_STORAGE_PATH + "/0.0.0.1-b1/yugabyte-ee-0.0.0.1-b1-linux-x86_64.tar.gz")
+                .withChartPath(TMP_STORAGE_PATH + "/0.0.0.1-b1/yugabyte-0.0.0.1-b1-helm.tar.gz")
                 .withPackage(
-                    TMP_STORAGE_PATH + "/0.0.1/yugabyte-ee-0.0.1-linux-x86_64.tar.gz",
+                    TMP_STORAGE_PATH + "/0.0.0.1-b1/yugabyte-ee-0.0.0.1-b1-linux-x86_64.tar.gz",
                     Architecture.x86_64));
     assertReleases(expectedMap, releaseMap.getValue());
   }
@@ -306,13 +349,13 @@ public class ReleaseManagerTest extends FakeDBApplication {
   @Test
   public void testLoadReleasesWithEl8OSReleasePath() throws IOException {
     when(appConfig.getString("yb.releases.path")).thenReturn(TMP_STORAGE_PATH);
-    List<String> versions = ImmutableList.of("0.0.1");
+    List<String> versions = ImmutableList.of("0.0.0.1-b1");
     createDummyReleases(versions, false, false, true, true, false, "el8");
-    when(mockGFlagsValidation.getMissingGFlagFileList(any()))
-        .thenReturn(GFlagsValidation.GFLAG_FILENAME_LIST);
+    when(confGetter.getGlobalConf(GlobalConfKeys.ybdbReleasePathRegex))
+        .thenReturn("[^.]+yugabyte-(?:ee-)?(.*)-(alma|centos|linux|el8|darwin)(.*).tar.gz");
+    when(confGetter.getGlobalConf(GlobalConfKeys.ybdbHelmReleasePathRegex))
+        .thenReturn("[^.]+yugabyte-(.*)-helm.tar.gz");
     releaseManager.importLocalReleases();
-    verify(mockGFlagsValidation, times(1))
-        .fetchGFlagFilesFromTarGZipInputStream(any(), any(), any(), any());
 
     ArgumentCaptor<ConfigHelper.ConfigType> configType;
     ArgumentCaptor<HashMap> releaseMap;
@@ -322,12 +365,13 @@ public class ReleaseManagerTest extends FakeDBApplication {
         .loadConfigToDB(configType.capture(), releaseMap.capture());
     Map expectedMap =
         ImmutableMap.of(
-            "0.0.1",
-            ReleaseManager.ReleaseMetadata.create("0.0.1")
-                .withFilePath(TMP_STORAGE_PATH + "/0.0.1/yugabyte-ee-0.0.1-el8-x86_64.tar.gz")
-                .withChartPath(TMP_STORAGE_PATH + "/0.0.1/yugabyte-0.0.1-helm.tar.gz")
+            "0.0.0.1-b1",
+            ReleaseManager.ReleaseMetadata.create("0.0.0.1-b1")
+                .withFilePath(
+                    TMP_STORAGE_PATH + "/0.0.0.1-b1/yugabyte-ee-0.0.0.1-b1-el8-x86_64.tar.gz")
+                .withChartPath(TMP_STORAGE_PATH + "/0.0.0.1-b1/yugabyte-0.0.0.1-b1-helm.tar.gz")
                 .withPackage(
-                    TMP_STORAGE_PATH + "/0.0.1/yugabyte-ee-0.0.1-el8-x86_64.tar.gz",
+                    TMP_STORAGE_PATH + "/0.0.0.1-b1/yugabyte-ee-0.0.0.1-b1-el8-x86_64.tar.gz",
                     Architecture.x86_64));
     assertReleases(expectedMap, releaseMap.getValue());
   }
@@ -335,13 +379,13 @@ public class ReleaseManagerTest extends FakeDBApplication {
   @Test
   public void testLoadReleasesWithoutChart() throws IOException {
     when(appConfig.getString("yb.releases.path")).thenReturn(TMP_STORAGE_PATH);
-    List<String> versions = ImmutableList.of("0.0.1");
+    List<String> versions = ImmutableList.of("0.0.0.1-b1");
     createDummyReleases(versions, false, false, true, false, false);
-    when(mockGFlagsValidation.getMissingGFlagFileList(any()))
-        .thenReturn(GFlagsValidation.GFLAG_FILENAME_LIST);
+    when(confGetter.getGlobalConf(GlobalConfKeys.ybdbReleasePathRegex))
+        .thenReturn("[^.]+yugabyte-(?:ee-)?(.*)-(alma|centos|linux|el8|darwin)(.*).tar.gz");
+    when(confGetter.getGlobalConf(GlobalConfKeys.ybdbHelmReleasePathRegex))
+        .thenReturn("[^.]+yugabyte-(.*)-helm.tar.gz");
     releaseManager.importLocalReleases();
-    verify(mockGFlagsValidation, times(1))
-        .fetchGFlagFilesFromTarGZipInputStream(any(), any(), any(), any());
 
     ArgumentCaptor<ConfigHelper.ConfigType> configType;
     ArgumentCaptor<HashMap> releaseMap;
@@ -351,12 +395,13 @@ public class ReleaseManagerTest extends FakeDBApplication {
         .loadConfigToDB(configType.capture(), releaseMap.capture());
     Map expectedMap =
         ImmutableMap.of(
-            "0.0.1",
-            ReleaseManager.ReleaseMetadata.create("0.0.1")
-                .withFilePath(TMP_STORAGE_PATH + "/0.0.1/yugabyte-ee-0.0.1-centos-x86_64.tar.gz")
+            "0.0.0.1-b1",
+            ReleaseManager.ReleaseMetadata.create("0.0.0.1-b1")
+                .withFilePath(
+                    TMP_STORAGE_PATH + "/0.0.0.1-b1/yugabyte-ee-0.0.0.1-b1-centos-x86_64.tar.gz")
                 .withChartPath("")
                 .withPackage(
-                    TMP_STORAGE_PATH + "/0.0.1/yugabyte-ee-0.0.1-centos-x86_64.tar.gz",
+                    TMP_STORAGE_PATH + "/0.0.0.1-b1/yugabyte-ee-0.0.0.1-b1-centos-x86_64.tar.gz",
                     Architecture.x86_64));
     assertReleases(expectedMap, releaseMap.getValue());
   }
@@ -366,14 +411,18 @@ public class ReleaseManagerTest extends FakeDBApplication {
     when(appConfig.getString("yb.releases.path")).thenReturn(TMP_STORAGE_PATH);
     when(appConfig.getString("yb.docker.release")).thenReturn(TMP_DOCKER_STORAGE_PATH);
     when(appConfig.getString("yb.helm.packagePath")).thenReturn(TMP_DOCKER_STORAGE_PATH);
-    List<String> versions = ImmutableList.of("0.0.1");
+    List<String> versions = ImmutableList.of("0.0.0.1-b1");
     createDummyReleases(versions, false, false);
-    List<String> dockerVersions = ImmutableList.of("0.0.2-b2");
+    List<String> dockerVersions = ImmutableList.of("0.0.0.2-b2");
     createDummyReleases(dockerVersions, false, true);
-    List<String> dockerVersionsWithoutEe = ImmutableList.of("0.0.3-b3");
+    List<String> dockerVersionsWithoutEe = ImmutableList.of("0.0.0.3-b3");
     createDummyReleases(dockerVersionsWithoutEe, false, true, false, true, false);
-    List<String> multipleVersionRelease = ImmutableList.of("0.0.4-b4");
+    List<String> multipleVersionRelease = ImmutableList.of("0.0.0.4-b4");
     createDummyReleases(multipleVersionRelease, false, false, false, true, true);
+    when(confGetter.getGlobalConf(GlobalConfKeys.ybdbReleasePathRegex))
+        .thenReturn("[^.]+yugabyte-(?:ee-)?(.*)-(alma|centos|linux|el8|darwin)(.*).tar.gz");
+    when(confGetter.getGlobalConf(GlobalConfKeys.ybdbHelmReleasePathRegex))
+        .thenReturn("[^.]+yugabyte-(.*)-helm.tar.gz");
     releaseManager.importLocalReleases();
     ArgumentCaptor<ConfigHelper.ConfigType> configType;
     ArgumentCaptor<HashMap> releaseMap;
@@ -383,40 +432,44 @@ public class ReleaseManagerTest extends FakeDBApplication {
         .loadConfigToDB(configType.capture(), releaseMap.capture());
     Map expectedMap =
         ImmutableMap.of(
-            "0.0.1",
-                ReleaseManager.ReleaseMetadata.create("0.0.1")
+            "0.0.0.1-b1",
+                ReleaseManager.ReleaseMetadata.create("0.0.0.1-b1")
                     .withFilePath(
-                        TMP_STORAGE_PATH + "/0.0.1/yugabyte-ee-0.0.1-centos-x86_64.tar.gz")
-                    .withChartPath(TMP_STORAGE_PATH + "/0.0.1/yugabyte-0.0.1-helm.tar.gz")
+                        TMP_STORAGE_PATH
+                            + "/0.0.0.1-b1/yugabyte-ee-0.0.0.1-b1-centos-x86_64.tar.gz")
+                    .withChartPath(TMP_STORAGE_PATH + "/0.0.0.1-b1/yugabyte-0.0.0.1-b1-helm.tar.gz")
                     .withPackage(
-                        TMP_STORAGE_PATH + "/0.0.1/yugabyte-ee-0.0.1-centos-x86_64.tar.gz",
+                        TMP_STORAGE_PATH
+                            + "/0.0.0.1-b1/yugabyte-ee-0.0.0.1-b1-centos-x86_64.tar.gz",
                         Architecture.x86_64),
-            "0.0.2-b2",
-                ReleaseManager.ReleaseMetadata.create("0.0.2-b2")
+            "0.0.0.2-b2",
+                ReleaseManager.ReleaseMetadata.create("0.0.0.2-b2")
                     .withFilePath(
-                        TMP_STORAGE_PATH + "/0.0.2-b2/yugabyte-ee-0.0.2-b2-centos-x86_64.tar.gz")
-                    .withChartPath(TMP_STORAGE_PATH + "/0.0.2-b2/yugabyte-0.0.2-b2-helm.tar.gz")
+                        TMP_STORAGE_PATH
+                            + "/0.0.0.2-b2/yugabyte-ee-0.0.0.2-b2-centos-x86_64.tar.gz")
+                    .withChartPath(TMP_STORAGE_PATH + "/0.0.0.2-b2/yugabyte-0.0.0.2-b2-helm.tar.gz")
                     .withPackage(
-                        TMP_STORAGE_PATH + "/0.0.2-b2/yugabyte-ee-0.0.2-b2-centos-x86_64.tar.gz",
+                        TMP_STORAGE_PATH
+                            + "/0.0.0.2-b2/yugabyte-ee-0.0.0.2-b2-centos-x86_64.tar.gz",
                         Architecture.x86_64),
-            "0.0.3-b3",
-                ReleaseManager.ReleaseMetadata.create("0.0.3-b3")
+            "0.0.0.3-b3",
+                ReleaseManager.ReleaseMetadata.create("0.0.0.3-b3")
                     .withFilePath(
-                        TMP_STORAGE_PATH + "/0.0.3-b3/yugabyte-0.0.3-b3-centos-x86_64.tar.gz")
-                    .withChartPath(TMP_STORAGE_PATH + "/0.0.3-b3/yugabyte-0.0.3-b3-helm.tar.gz")
+                        TMP_STORAGE_PATH + "/0.0.0.3-b3/yugabyte-0.0.0.3-b3-centos-x86_64.tar.gz")
+                    .withChartPath(TMP_STORAGE_PATH + "/0.0.0.3-b3/yugabyte-0.0.0.3-b3-helm.tar.gz")
                     .withPackage(
-                        TMP_STORAGE_PATH + "/0.0.3-b3/yugabyte-0.0.3-b3-centos-x86_64.tar.gz",
+                        TMP_STORAGE_PATH + "/0.0.0.3-b3/yugabyte-0.0.0.3-b3-centos-x86_64.tar.gz",
                         Architecture.x86_64),
-            "0.0.4-b4",
-                ReleaseManager.ReleaseMetadata.create("0.0.4-b4")
+            "0.0.0.4-b4",
+                ReleaseManager.ReleaseMetadata.create("0.0.0.4-b4")
                     .withFilePath(
-                        TMP_STORAGE_PATH + "/0.0.4-b4/yugabyte-0.0.4-b4-centos-x86_64.tar.gz")
-                    .withChartPath(TMP_STORAGE_PATH + "/0.0.4-b4/yugabyte-0.0.4-b4-helm.tar.gz")
+                        TMP_STORAGE_PATH + "/0.0.0.4-b4/yugabyte-0.0.0.4-b4-centos-x86_64.tar.gz")
+                    .withChartPath(TMP_STORAGE_PATH + "/0.0.0.4-b4/yugabyte-0.0.0.4-b4-helm.tar.gz")
                     .withPackage(
-                        TMP_STORAGE_PATH + "/0.0.4-b4/yugabyte-0.0.4-b4-centos-x86_64.tar.gz",
+                        TMP_STORAGE_PATH + "/0.0.0.4-b4/yugabyte-0.0.0.4-b4-centos-x86_64.tar.gz",
                         Architecture.x86_64)
                     .withPackage(
-                        TMP_STORAGE_PATH + "/0.0.4-b4/yugabyte-0.0.4-b4-centos-aarch64.tar.gz",
+                        TMP_STORAGE_PATH + "/0.0.0.4-b4/yugabyte-0.0.0.4-b4-centos-aarch64.tar.gz",
                         Architecture.aarch64));
 
     assertEquals(SoftwareReleases, configType.getValue());
@@ -427,15 +480,15 @@ public class ReleaseManagerTest extends FakeDBApplication {
   public void testLoadReleasesWithReleaseAndDockerPathDuplicate() throws IOException {
     when(appConfig.getString("yb.releases.path")).thenReturn(TMP_STORAGE_PATH);
     when(appConfig.getString("yb.docker.release")).thenReturn(TMP_DOCKER_STORAGE_PATH);
-    List<String> versions = ImmutableList.of("0.0.2-b2");
+    List<String> versions = ImmutableList.of("0.0.0.2-b2");
     createDummyReleases(versions, false, false);
-    List<String> dockerVersions = ImmutableList.of("0.0.2-b2");
+    List<String> dockerVersions = ImmutableList.of("0.0.0.2-b2");
     createDummyReleases(dockerVersions, false, true);
-    when(mockGFlagsValidation.getMissingGFlagFileList(any()))
-        .thenReturn(GFlagsValidation.GFLAG_FILENAME_LIST);
+    when(confGetter.getGlobalConf(GlobalConfKeys.ybdbReleasePathRegex))
+        .thenReturn("[^.]+yugabyte-(?:ee-)?(.*)-(alma|centos|linux|el8|darwin)(.*).tar.gz");
+    when(confGetter.getGlobalConf(GlobalConfKeys.ybdbHelmReleasePathRegex))
+        .thenReturn("[^.]+yugabyte-(.*)-helm.tar.gz");
     releaseManager.importLocalReleases();
-    verify(mockGFlagsValidation, times(1))
-        .fetchGFlagFilesFromTarGZipInputStream(any(), any(), any(), any());
     ArgumentCaptor<ConfigHelper.ConfigType> configType;
     ArgumentCaptor<HashMap> releaseMap;
     configType = ArgumentCaptor.forClass(ConfigHelper.ConfigType.class);
@@ -444,13 +497,13 @@ public class ReleaseManagerTest extends FakeDBApplication {
         .loadConfigToDB(configType.capture(), releaseMap.capture());
     Map expectedMap =
         ImmutableMap.of(
-            "0.0.2-b2",
-            ReleaseManager.ReleaseMetadata.create("0.0.2-b2")
+            "0.0.0.2-b2",
+            ReleaseManager.ReleaseMetadata.create("0.0.0.2-b2")
                 .withFilePath(
-                    TMP_STORAGE_PATH + "/0.0.2-b2/yugabyte-ee-0.0.2-b2-centos-x86_64.tar.gz")
-                .withChartPath(TMP_STORAGE_PATH + "/0.0.2-b2/yugabyte-0.0.2-b2-helm.tar.gz")
+                    TMP_STORAGE_PATH + "/0.0.0.2-b2/yugabyte-ee-0.0.0.2-b2-centos-x86_64.tar.gz")
+                .withChartPath(TMP_STORAGE_PATH + "/0.0.0.2-b2/yugabyte-0.0.0.2-b2-helm.tar.gz")
                 .withPackage(
-                    TMP_STORAGE_PATH + "/0.0.2-b2/yugabyte-ee-0.0.2-b2-centos-x86_64.tar.gz",
+                    TMP_STORAGE_PATH + "/0.0.0.2-b2/yugabyte-ee-0.0.0.2-b2-centos-x86_64.tar.gz",
                     Architecture.x86_64));
     assertReleases(expectedMap, releaseMap.getValue());
     assertEquals(SoftwareReleases, configType.getValue());
@@ -459,13 +512,13 @@ public class ReleaseManagerTest extends FakeDBApplication {
   @Test
   public void testLoadReleasesWithAlmaPath() throws IOException {
     when(appConfig.getString("yb.releases.path")).thenReturn(TMP_STORAGE_PATH);
-    List<String> versions = ImmutableList.of("0.0.2-b2");
+    List<String> versions = ImmutableList.of("0.0.0.2-b2");
     createDummyReleases(versions, false, false, false, true, true, "almalinux8");
-    when(mockGFlagsValidation.getMissingGFlagFileList(any()))
-        .thenReturn(GFlagsValidation.GFLAG_FILENAME_LIST);
+    when(confGetter.getGlobalConf(GlobalConfKeys.ybdbReleasePathRegex))
+        .thenReturn("[^.]+yugabyte-(?:ee-)?(.*)-(alma|centos|linux|el8|darwin)(.*).tar.gz");
+    when(confGetter.getGlobalConf(GlobalConfKeys.ybdbHelmReleasePathRegex))
+        .thenReturn("[^.]+yugabyte-(.*)-helm.tar.gz");
     releaseManager.importLocalReleases();
-    verify(mockGFlagsValidation, times(1))
-        .fetchGFlagFilesFromTarGZipInputStream(any(), any(), any(), any());
     ArgumentCaptor<ConfigHelper.ConfigType> configType;
     ArgumentCaptor<HashMap> releaseMap;
     configType = ArgumentCaptor.forClass(ConfigHelper.ConfigType.class);
@@ -474,16 +527,16 @@ public class ReleaseManagerTest extends FakeDBApplication {
         .loadConfigToDB(configType.capture(), releaseMap.capture());
     Map expectedMap =
         ImmutableMap.of(
-            "0.0.2-b2",
-            ReleaseManager.ReleaseMetadata.create("0.0.2-b2")
+            "0.0.0.2-b2",
+            ReleaseManager.ReleaseMetadata.create("0.0.0.2-b2")
                 .withFilePath(
-                    TMP_STORAGE_PATH + "/0.0.2-b2/yugabyte-0.0.2-b2-almalinux8-x86_64.tar.gz")
-                .withChartPath(TMP_STORAGE_PATH + "/0.0.2-b2/yugabyte-0.0.2-b2-helm.tar.gz")
+                    TMP_STORAGE_PATH + "/0.0.0.2-b2/yugabyte-0.0.0.2-b2-almalinux8-x86_64.tar.gz")
+                .withChartPath(TMP_STORAGE_PATH + "/0.0.0.2-b2/yugabyte-0.0.0.2-b2-helm.tar.gz")
                 .withPackage(
-                    TMP_STORAGE_PATH + "/0.0.2-b2/yugabyte-0.0.2-b2-almalinux8-x86_64.tar.gz",
+                    TMP_STORAGE_PATH + "/0.0.0.2-b2/yugabyte-0.0.0.2-b2-almalinux8-x86_64.tar.gz",
                     Architecture.x86_64)
                 .withPackage(
-                    TMP_STORAGE_PATH + "/0.0.2-b2/yugabyte-0.0.2-b2-almalinux8-aarch64.tar.gz",
+                    TMP_STORAGE_PATH + "/0.0.0.2-b2/yugabyte-0.0.0.2-b2-almalinux8-aarch64.tar.gz",
                     Architecture.aarch64));
     assertReleases(expectedMap, releaseMap.getValue());
     assertEquals(SoftwareReleases, configType.getValue());
@@ -503,14 +556,24 @@ public class ReleaseManagerTest extends FakeDBApplication {
     ReleaseManager.ReleaseMetadata metadata =
         ReleaseManager.ReleaseMetadata.fromLegacy("0.0.1", "/path/to/yugabyte-0.0.1.tar.gz");
     when(configHelper.getConfig(SoftwareReleases)).thenReturn(ImmutableMap.of("0.0.1", metadata));
-    ReleaseManager.ReleaseMetadata release = releaseManager.getReleaseByVersion("0.0.1");
-    assertThat(release.filePath, allOf(notNullValue(), equalTo("/path/to/yugabyte-0.0.1.tar.gz")));
+    when(releaseContainerFactory.newReleaseContainer(any(ReleaseManager.ReleaseMetadata.class)))
+        .thenAnswer(
+            i ->
+                new ReleaseContainer(
+                    (ReleaseManager.ReleaseMetadata) i.getArguments()[0],
+                    mockCloudUtilFactory,
+                    appConfig,
+                    mockReleasesUtils));
+    ReleaseContainer release = releaseManager.getReleaseByVersion("0.0.1");
+    assertThat(
+        release.getMetadata().filePath,
+        allOf(notNullValue(), equalTo("/path/to/yugabyte-0.0.1.tar.gz")));
   }
 
   @Test
   public void testGetReleaseByVersionWithoutConfig() {
     when(configHelper.getConfig(SoftwareReleases)).thenReturn(Collections.emptyMap());
-    ReleaseManager.ReleaseMetadata release = releaseManager.getReleaseByVersion("0.0.1");
+    ReleaseContainer release = releaseManager.getReleaseByVersion("0.0.1");
     assertNull(release);
   }
 
@@ -519,15 +582,32 @@ public class ReleaseManagerTest extends FakeDBApplication {
     HashMap releases = new HashMap();
     releases.put("0.0.1", "/path/to/yugabyte-0.0.1.tar.gz");
     when(configHelper.getConfig(SoftwareReleases)).thenReturn(releases);
-    ReleaseManager.ReleaseMetadata release = releaseManager.getReleaseByVersion("0.0.1");
-    assertThat(release.filePath, allOf(notNullValue(), equalTo("/path/to/yugabyte-0.0.1.tar.gz")));
+    when(releaseContainerFactory.newReleaseContainer(any(ReleaseManager.ReleaseMetadata.class)))
+        .thenAnswer(
+            i ->
+                new ReleaseContainer(
+                    (ReleaseManager.ReleaseMetadata) i.getArguments()[0],
+                    mockCloudUtilFactory,
+                    appConfig,
+                    mockReleasesUtils));
+    ReleaseContainer release = releaseManager.getReleaseByVersion("0.0.1");
+    assertThat(
+        release.getMetadata().filePath,
+        allOf(notNullValue(), equalTo("/path/to/yugabyte-0.0.1.tar.gz")));
   }
 
   @Test
   public void testAddRelease() {
+    when(confGetter.getGlobalConf(GlobalConfKeys.allowDbVersionMoreThanYbaVersion))
+        .thenReturn(false);
+    when(confGetter.getGlobalConf(GlobalConfKeys.skipVersionChecks)).thenReturn(false);
     ReleaseManager.ReleaseMetadata metadata =
-        ReleaseManager.ReleaseMetadata.fromLegacy("0.0.1", "/path/to/yugabyte-0.0.1.tar.gz");
-    releaseManager.addReleaseWithMetadata("0.0.1", metadata);
+        ReleaseManager.ReleaseMetadata.fromLegacy(
+            "0.0.0.1-b1", "/path/to/yyugabyte-0.0.0.1-b1.tar.gz");
+    when(releaseContainerFactory.newReleaseContainer(metadata))
+        .thenReturn(
+            new ReleaseContainer(metadata, mockCloudUtilFactory, appConfig, mockReleasesUtils));
+    releaseManager.addReleaseWithMetadata("0.0.0.1-b1", metadata);
     ArgumentCaptor<ConfigHelper.ConfigType> configType;
     ArgumentCaptor<HashMap> releaseMap;
     configType = ArgumentCaptor.forClass(ConfigHelper.ConfigType.class);
@@ -535,20 +615,58 @@ public class ReleaseManagerTest extends FakeDBApplication {
     Mockito.verify(configHelper, times(1))
         .loadConfigToDB(configType.capture(), releaseMap.capture());
     Map releaseInfo = releaseMap.getValue();
-    assertTrue(releaseInfo.containsKey("0.0.1"));
-    JsonNode releaseMetadata = Json.toJson(releaseInfo.get("0.0.1"));
-    assertValue(releaseMetadata, "imageTag", "0.0.1");
+    assertTrue(releaseInfo.containsKey("0.0.0.1-b1"));
+    JsonNode releaseMetadata = Json.toJson(releaseInfo.get("0.0.0.1-b1"));
+    assertValue(releaseMetadata, "imageTag", "0.0.0.1-b1");
+  }
+
+  @Test
+  public void testAddReleaseVersionMoreThanYbaVersionDisallowed() {
+    when(confGetter.getGlobalConf(GlobalConfKeys.allowDbVersionMoreThanYbaVersion))
+        .thenReturn(false);
+    when(confGetter.getGlobalConf(GlobalConfKeys.skipVersionChecks)).thenReturn(false);
+    ReleaseMetadata metadata = ReleaseMetadata.create("99.99.99.99-b99");
+    assertPlatformException(
+        () -> releaseManager.addReleaseWithMetadata("99.99.99.99-b99", metadata));
+    Mockito.verify(configHelper, times(0)).loadConfigToDB(any(), any());
+  }
+
+  @Test
+  public void testAddReleaseVersionMoreThanYbaVersionAllowed() {
+    when(confGetter.getGlobalConf(GlobalConfKeys.allowDbVersionMoreThanYbaVersion))
+        .thenReturn(true);
+    ReleaseMetadata metadata = ReleaseMetadata.create("99.99.99.99-b99");
+    when(releaseContainerFactory.newReleaseContainer(metadata))
+        .thenReturn(
+            new ReleaseContainer(metadata, mockCloudUtilFactory, appConfig, mockReleasesUtils));
+    releaseManager.addReleaseWithMetadata("99.99.99.99-b99", metadata);
+    ArgumentCaptor<ConfigHelper.ConfigType> configType;
+    ArgumentCaptor<HashMap> releaseMap;
+    configType = ArgumentCaptor.forClass(ConfigHelper.ConfigType.class);
+    releaseMap = ArgumentCaptor.forClass(HashMap.class);
+    Mockito.verify(configHelper, times(1))
+        .loadConfigToDB(configType.capture(), releaseMap.capture());
+    Map releaseInfo = releaseMap.getValue();
+    assertTrue(releaseInfo.containsKey("99.99.99.99-b99"));
+    JsonNode releaseMetadata = Json.toJson(releaseInfo.get("99.99.99.99-b99"));
+    assertValue(releaseMetadata, "imageTag", "99.99.99.99-b99");
   }
 
   @Test
   public void testAddReleaseWithFullMetadata() {
-    ReleaseMetadata metadata = ReleaseManager.ReleaseMetadata.create("0.0.1");
+    when(confGetter.getGlobalConf(GlobalConfKeys.allowDbVersionMoreThanYbaVersion))
+        .thenReturn(false);
+    when(confGetter.getGlobalConf(GlobalConfKeys.skipVersionChecks)).thenReturn(false);
+    ReleaseMetadata metadata = ReleaseManager.ReleaseMetadata.create("0.0.0.1-b1");
+    when(releaseContainerFactory.newReleaseContainer(metadata))
+        .thenReturn(
+            new ReleaseContainer(metadata, mockCloudUtilFactory, appConfig, mockReleasesUtils));
     metadata.s3 = new ReleaseMetadata.S3Location();
     metadata.s3.paths = new ReleaseMetadata.PackagePaths();
     metadata.s3.paths.x86_64 = "s3://foo";
     metadata.s3.accessKeyId = "abc";
     metadata.s3.secretAccessKey = "abc";
-    releaseManager.addReleaseWithMetadata("0.0.1", metadata);
+    releaseManager.addReleaseWithMetadata("0.0.0.1-b1", metadata);
     ArgumentCaptor<ConfigHelper.ConfigType> configType;
     ArgumentCaptor<HashMap> releaseMap;
     configType = ArgumentCaptor.forClass(ConfigHelper.ConfigType.class);
@@ -556,13 +674,13 @@ public class ReleaseManagerTest extends FakeDBApplication {
     Mockito.verify(configHelper, times(1))
         .loadConfigToDB(configType.capture(), releaseMap.capture());
     Map releaseInfo = releaseMap.getValue();
-    assertTrue(releaseInfo.containsKey("0.0.1"));
-    JsonNode releaseMetadata = Json.toJson(releaseInfo.get("0.0.1"));
-    assertValue(releaseMetadata, "imageTag", "0.0.1");
+    assertTrue(releaseInfo.containsKey("0.0.0.1-b1"));
+    JsonNode releaseMetadata = Json.toJson(releaseInfo.get("0.0.0.1-b1"));
+    assertValue(releaseMetadata, "imageTag", "0.0.0.1-b1");
 
     Map<String, Object> allReleases = releaseManager.getReleaseMetadata();
     assertEquals(allReleases.size(), 1);
-    Object foundObj = allReleases.get("0.0.1");
+    Object foundObj = allReleases.get("0.0.0.1-b1");
     ReleaseMetadata foundMetadata = Json.fromJson(Json.toJson(foundObj), ReleaseMetadata.class);
     assertEquals(foundMetadata.s3.accessKeyId, metadata.s3.accessKeyId);
     assertEquals(foundMetadata.s3.secretAccessKey, metadata.s3.secretAccessKey);
@@ -572,12 +690,14 @@ public class ReleaseManagerTest extends FakeDBApplication {
   @Test
   public void testAddExistingRelease() {
     ReleaseMetadata metadata =
-        ReleaseManager.ReleaseMetadata.fromLegacy("0.0.1", "/path/to/yugabyte-0.0.1.tar.gz");
-    when(configHelper.getConfig(SoftwareReleases)).thenReturn(ImmutableMap.of("0.0.1", metadata));
+        ReleaseManager.ReleaseMetadata.fromLegacy(
+            "0.0.0.1-b1", "/path/to/yugabyte-0.0.0.1-b1.tar.gz");
+    when(configHelper.getConfig(SoftwareReleases))
+        .thenReturn(ImmutableMap.of("0.0.0.1-b1", metadata));
     try {
-      releaseManager.addReleaseWithMetadata("0.0.1", metadata);
+      releaseManager.addReleaseWithMetadata("0.0.0.1-b1", metadata);
     } catch (RuntimeException re) {
-      assertEquals("Release already exists for version 0.0.1", re.getMessage());
+      assertEquals("Release already exists for version 0.0.0.1-b1", re.getMessage());
     }
   }
 
@@ -662,15 +782,15 @@ public class ReleaseManagerTest extends FakeDBApplication {
   public void testUpdateCurrentReleasesFromPackage() {
     Map expectedMap =
         ImmutableMap.of(
-            "0.0.4-b4",
-            ReleaseManager.ReleaseMetadata.create("0.0.4-b4")
-                .withFilePath(TMP_STORAGE_PATH + "/0.0.4-b4/yugabyte-0.0.4-b4-centos-x86_64.tar.gz")
-                .withChartPath(TMP_STORAGE_PATH + "/0.0.4-b4/yugabyte-0.0.4-b4-helm.tar.gz")
+            "0.0.4",
+            ReleaseManager.ReleaseMetadata.create("0.0.4")
+                .withFilePath(TMP_STORAGE_PATH + "/0.0.4/yugabyte-0.0.4-centos-x86_64.tar.gz")
+                .withChartPath(TMP_STORAGE_PATH + "/0.0.4/yugabyte-0.0.4-helm.tar.gz")
                 .withPackage(
-                    TMP_STORAGE_PATH + "/0.0.4-b4/yugabyte-0.0.4-b4-centos-x86_64.tar.gz",
+                    TMP_STORAGE_PATH + "/0.0.4/yugabyte-0.0.4-centos-x86_64.tar.gz",
                     Architecture.x86_64)
                 .withPackage(
-                    TMP_STORAGE_PATH + "/0.0.4-b4/yugabyte-0.0.4-b4-centos-aarch64.tar.gz",
+                    TMP_STORAGE_PATH + "/0.0.4/yugabyte-0.0.4-centos-aarch64.tar.gz",
                     Architecture.aarch64));
     when(configHelper.getConfig(SoftwareReleases)).thenReturn(expectedMap);
     releaseManager.updateCurrentReleases();
@@ -684,16 +804,277 @@ public class ReleaseManagerTest extends FakeDBApplication {
   }
 
   @Test
-  public void testAddGFlagMetadataForCloudRelease() {
+  public void testFixFilePathsReleaseMetadata() {
+    // Create s3 release that will not change.
     ReleaseMetadata metadata = ReleaseManager.ReleaseMetadata.create("0.0.1");
     metadata.s3 = new ReleaseMetadata.S3Location();
     metadata.s3.paths = new ReleaseMetadata.PackagePaths();
     metadata.s3.paths.x86_64 = "s3://foo";
     metadata.s3.accessKeyId = "abc";
     metadata.s3.secretAccessKey = "abc";
-    when(mockGFlagsValidation.getMissingGFlagFileList(any()))
-        .thenReturn(GFlagsValidation.GFLAG_FILENAME_LIST);
-    releaseManager.addGFlagsMetadataFiles("0.0.1", metadata);
-    verify(mockCommissioner, times(1)).submit(any(), any());
+    Map<String, Object> temp = new HashMap<String, Object>();
+    temp.put("0.0.1", metadata);
+    when(configHelper.getConfig(SoftwareReleases)).thenReturn(temp);
+
+    // Create dummy releases that will get imported.
+    List<String> versions = ImmutableList.of("0.0.0.2-b1", "0.0.0.3-b2");
+    createDummyReleases(versions, false, false, false, true, true);
+    when(appConfig.getString("yb.releases.path"))
+        .thenReturn(TMP_STORAGE_PATH)
+        .thenReturn(TMP_REPLACE_STORAGE_PATH);
+    when(appConfig.getString("yb.releases.artifacts.upload_path"))
+        .thenReturn(TMP_REPLACE_STORAGE_PATH);
+    when(confGetter.getGlobalConf(GlobalConfKeys.ybdbReleasePathRegex))
+        .thenReturn("[^.]+yugabyte-(?:ee-)?(.*)-(alma|centos|linux|el8|darwin)(.*).tar.gz");
+    when(confGetter.getGlobalConf(GlobalConfKeys.ybdbHelmReleasePathRegex))
+        .thenReturn("[^.]+yugabyte-(.*)-helm.tar.gz");
+    releaseManager.importLocalReleases();
+
+    // Create new release files for 0.0.0.2-b1.
+    String version = "0.0.0.2-b1";
+    String newVersionPath = String.format("%s/%s/", TMP_REPLACE_STORAGE_PATH, version);
+    String fileFormat = "yugabyte-%s-%s.tar.gz";
+    new File(newVersionPath).mkdirs();
+    createTempFile(
+        newVersionPath, String.format(fileFormat, version, "centos-x86_64"), "SampleRelease");
+    createTempFile(
+        newVersionPath, String.format(fileFormat, version, "centos-aarch64"), "SampleRelease");
+    createTempFile(newVersionPath, String.format(fileFormat, version, "helm"), "SampleHelm");
+    releaseManager.fixFilePaths();
+
+    // Validate release metadata.
+    Map expectedMap =
+        ImmutableMap.of(
+            "0.0.1",
+            metadata,
+            "0.0.0.2-b1",
+            ReleaseManager.ReleaseMetadata.create("0.0.0.2-b1")
+                .withFilePath(newVersionPath + String.format(fileFormat, version, "centos-x86_64"))
+                .withChartPath(newVersionPath + String.format(fileFormat, version, "helm"))
+                .withPackage(
+                    newVersionPath + String.format(fileFormat, version, "centos-x86_64"),
+                    Architecture.x86_64)
+                .withPackage(
+                    newVersionPath + String.format(fileFormat, version, "centos-aarch64"),
+                    Architecture.aarch64),
+            "0.0.0.3-b2",
+            ReleaseManager.ReleaseMetadata.create("0.0.0.3-b2")
+                .withFilePath(
+                    TMP_STORAGE_PATH + "/0.0.0.3-b2/yugabyte-0.0.0.3-b2-centos-x86_64.tar.gz")
+                .withChartPath(TMP_STORAGE_PATH + "/0.0.0.3-b2/yugabyte-0.0.0.3-b2-helm.tar.gz")
+                .withPackage(
+                    TMP_STORAGE_PATH + "/0.0.0.3-b2/yugabyte-0.0.0.3-b2-centos-x86_64.tar.gz",
+                    Architecture.x86_64)
+                .withPackage(
+                    TMP_STORAGE_PATH + "/0.0.0.3-b2/yugabyte-0.0.0.3-b2-centos-aarch64.tar.gz",
+                    Architecture.aarch64));
+    ArgumentCaptor<ConfigHelper.ConfigType> configType =
+        ArgumentCaptor.forClass(ConfigHelper.ConfigType.class);
+    ArgumentCaptor<HashMap> releaseMap = ArgumentCaptor.forClass(HashMap.class);
+    Mockito.verify(configHelper, times(3))
+        .loadConfigToDB(configType.capture(), releaseMap.capture());
+    List<HashMap> capturedReleases = releaseMap.getAllValues();
+    assertReleases(expectedMap, capturedReleases.get(1));
+  }
+
+  @Test
+  public void testFixFilePathsYbcMetadata() {
+    // Create ybc metadata to update.
+    String version = "1.0.0-b1";
+    ReleaseMetadata metadata =
+        ReleaseManager.ReleaseMetadata.create(version)
+            .withFilePath(TMP_STORAGE_PATH + "/1.0.0-b1/ybc-1.0.0-b1-linux-x86_64.tar.gz")
+            .withPackage(
+                TMP_STORAGE_PATH + "/1.0.0-b1/ybc-1.0.0-b1-linux-x86_64.tar.gz",
+                Architecture.x86_64);
+    String version2 = "2.0.0-b2";
+    ReleaseMetadata metadata2 =
+        ReleaseManager.ReleaseMetadata.create(version2)
+            .withFilePath(TMP_STORAGE_PATH + "/2.0.0-b2/ybc-2.0.0-b2-el8-aarch64.tar.gz")
+            .withPackage(
+                TMP_STORAGE_PATH + "/2.0.0-b2/ybc-2.0.0-b2-el8-aarch64.tar.gz",
+                Architecture.aarch64);
+    Map<String, Object> temp = new HashMap<String, Object>();
+    temp.put("1.0.0-b1", metadata);
+    temp.put("2.0.0-b2", metadata2);
+    when(configHelper.getConfig(YbcSoftwareReleases)).thenReturn(temp);
+    when(appConfig.getString("ybc.releases.path")).thenReturn(TMP_REPLACE_STORAGE_PATH);
+    String newVersionPath = String.format("%s/%s/", TMP_REPLACE_STORAGE_PATH, version);
+    new File(newVersionPath).mkdirs();
+    createTempFile(newVersionPath, "ybc-1.0.0-b1-linux-x86_64.tar.gz", "ybcData");
+    releaseManager.fixFilePaths();
+    Map expectedMap =
+        ImmutableMap.of(
+            "1.0.0-b1",
+            ReleaseManager.ReleaseMetadata.create(version)
+                .withFilePath(
+                    TMP_REPLACE_STORAGE_PATH + "/1.0.0-b1/ybc-1.0.0-b1-linux-x86_64.tar.gz")
+                .withPackage(
+                    TMP_REPLACE_STORAGE_PATH + "/1.0.0-b1/ybc-1.0.0-b1-linux-x86_64.tar.gz",
+                    Architecture.x86_64),
+            "2.0.0-b2",
+            metadata2);
+    ArgumentCaptor<ConfigHelper.ConfigType> configType =
+        ArgumentCaptor.forClass(ConfigHelper.ConfigType.class);
+    ArgumentCaptor<HashMap> releaseMap = ArgumentCaptor.forClass(HashMap.class);
+    Mockito.verify(configHelper, times(2))
+        .loadConfigToDB(configType.capture(), releaseMap.capture());
+    List<HashMap> capturedReleases = releaseMap.getAllValues();
+    assertReleases(expectedMap, capturedReleases.get(1));
+  }
+
+  @Test
+  public void testGetLocalReleasePathStringForArchitecture() throws IOException {
+    // Remote URL returns empty.
+    Release release1 = Release.create("1.0.0-b1", "LTS");
+    release1.addArtifact(
+        ReleaseArtifact.create(
+            "sha256",
+            ReleaseArtifact.Platform.LINUX,
+            Architecture.aarch64,
+            "https://example.com/pkg.tgz"));
+    ReleaseContainer container1 =
+        new ReleaseContainer(release1, mockCloudUtilFactory, appConfig, mockReleasesUtils);
+    assertTrue(container1.getLocalReleasePathStringForArchitecture(Architecture.aarch64).isEmpty());
+
+    // Local file exists returns path.
+    String localPath =
+        createTempFile(TMP_STORAGE_PATH, "yugabyte-1.0.0-el8-aarch64.tar.gz", "data");
+    Release release2 = Release.create("1.0.0-b2", "LTS");
+    release2.addArtifact(
+        ReleaseArtifact.create(
+            "sha256",
+            ReleaseArtifact.Platform.LINUX,
+            Architecture.aarch64,
+            ReleaseLocalFile.create(localPath).getFileUUID()));
+    ReleaseContainer container2 =
+        new ReleaseContainer(release2, mockCloudUtilFactory, appConfig, mockReleasesUtils);
+    Optional<String> path2 =
+        container2.getLocalReleasePathStringForArchitecture(Architecture.aarch64);
+    assertTrue(path2.isPresent());
+    assertEquals(localPath, path2.get());
+
+    // No artifact for arch throws.
+    Release release3 = Release.create("1.0.0-b3", "LTS");
+    release3.addArtifact(
+        ReleaseArtifact.create(
+            "sha256",
+            ReleaseArtifact.Platform.LINUX,
+            Architecture.x86_64,
+            "https://x86.example.com/pkg.tgz"));
+    ReleaseContainer container3 =
+        new ReleaseContainer(release3, mockCloudUtilFactory, appConfig, mockReleasesUtils);
+    try {
+      container3.getLocalReleasePathStringForArchitecture(Architecture.aarch64);
+      fail("Expected RuntimeException");
+    } catch (RuntimeException e) {
+      // expected
+    }
+
+    // Local file missing throws.
+    String missingPath = "/nonexistent/yugabyte-1.0.0-el8-aarch64.tar.gz";
+    Release release4 = Release.create("1.0.0-b4", "LTS");
+    release4.addArtifact(
+        ReleaseArtifact.create(
+            "sha256",
+            ReleaseArtifact.Platform.LINUX,
+            Architecture.aarch64,
+            ReleaseLocalFile.create(missingPath).getFileUUID()));
+    ReleaseContainer container4 =
+        new ReleaseContainer(release4, mockCloudUtilFactory, appConfig, mockReleasesUtils);
+    try {
+      container4.getLocalReleasePathStringForArchitecture(Architecture.aarch64);
+      fail("Expected RuntimeException");
+    } catch (RuntimeException e) {
+      // expected
+    }
+  }
+
+  @Test
+  public void testValidateLocalFilepath() throws IOException {
+    // Release null returns false.
+    Universe universe = ModelFactory.createUniverse(ModelFactory.testCustomer().getId());
+    universe.getUniverseDetails().arch = Architecture.aarch64;
+    assertFalse(UniverseTaskBase.validateLocalFilepath(universe, null));
+
+    // Arch set, remote artifact returns true.
+    Release release1 = Release.create("1.0.0-b5", "LTS");
+    release1.addArtifact(
+        ReleaseArtifact.create(
+            "sha256",
+            ReleaseArtifact.Platform.LINUX,
+            Architecture.aarch64,
+            "https://example.com/pkg.tgz"));
+    ReleaseContainer container1 =
+        new ReleaseContainer(release1, mockCloudUtilFactory, appConfig, mockReleasesUtils);
+    assertTrue(UniverseTaskBase.validateLocalFilepath(universe, container1));
+
+    // Arch set, local file exists returns true.
+    String localPath =
+        createTempFile(TMP_STORAGE_PATH, "yugabyte-1.0.0-el8-aarch64.tar.gz", "data");
+    Release release2 = Release.create("1.0.0-b6", "LTS");
+    release2.addArtifact(
+        ReleaseArtifact.create(
+            "sha256",
+            ReleaseArtifact.Platform.LINUX,
+            Architecture.aarch64,
+            ReleaseLocalFile.create(localPath).getFileUUID()));
+    ReleaseContainer container2 =
+        new ReleaseContainer(release2, mockCloudUtilFactory, appConfig, mockReleasesUtils);
+    assertTrue(UniverseTaskBase.validateLocalFilepath(universe, container2));
+
+    // Arch set, local file missing returns false.
+    String missingPath = "/nonexistent/yugabyte-1.0.0-el8-aarch64.tar.gz";
+    Release release3 = Release.create("1.0.0-b7", "LTS");
+    release3.addArtifact(
+        ReleaseArtifact.create(
+            "sha256",
+            ReleaseArtifact.Platform.LINUX,
+            Architecture.aarch64,
+            ReleaseLocalFile.create(missingPath).getFileUUID()));
+    ReleaseContainer container3 =
+        new ReleaseContainer(release3, mockCloudUtilFactory, appConfig, mockReleasesUtils);
+    assertFalse(UniverseTaskBase.validateLocalFilepath(universe, container3));
+
+    // Arch null, all local paths exist returns true.
+    Universe universeNullArch = ModelFactory.createUniverse(ModelFactory.testCustomer().getId());
+    universeNullArch.getUniverseDetails().arch = null;
+    String pathX86 = createTempFile(TMP_STORAGE_PATH, "yugabyte-1.0.0-el8-x86_64.tar.gz", "data");
+    String pathArm = createTempFile(TMP_STORAGE_PATH, "yugabyte-1.0.0-el8-aarch64.tar.gz", "data");
+    Release release4 = Release.create("1.0.0-b8", "LTS");
+    release4.addArtifact(
+        ReleaseArtifact.create(
+            "sha256",
+            ReleaseArtifact.Platform.LINUX,
+            Architecture.x86_64,
+            ReleaseLocalFile.create(pathX86).getFileUUID()));
+    release4.addArtifact(
+        ReleaseArtifact.create(
+            "sha256",
+            ReleaseArtifact.Platform.LINUX,
+            Architecture.aarch64,
+            ReleaseLocalFile.create(pathArm).getFileUUID()));
+    ReleaseContainer container4 =
+        new ReleaseContainer(release4, mockCloudUtilFactory, appConfig, mockReleasesUtils);
+    assertTrue(UniverseTaskBase.validateLocalFilepath(universeNullArch, container4));
+
+    // Arch null, one local path missing returns false.
+    String missingPath2 = TMP_STORAGE_PATH + "/missing-aarch64.tar.gz";
+    Release release5 = Release.create("1.0.0-b9", "LTS");
+    release5.addArtifact(
+        ReleaseArtifact.create(
+            "sha256",
+            ReleaseArtifact.Platform.LINUX,
+            Architecture.x86_64,
+            ReleaseLocalFile.create(pathX86).getFileUUID()));
+    release5.addArtifact(
+        ReleaseArtifact.create(
+            "sha256",
+            ReleaseArtifact.Platform.LINUX,
+            Architecture.aarch64,
+            ReleaseLocalFile.create(missingPath2).getFileUUID()));
+    ReleaseContainer container5 =
+        new ReleaseContainer(release5, mockCloudUtilFactory, appConfig, mockReleasesUtils);
+    assertFalse(UniverseTaskBase.validateLocalFilepath(universeNullArch, container5));
   }
 }

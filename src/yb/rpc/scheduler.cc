@@ -1,5 +1,5 @@
 //
-// Copyright (c) YugaByte, Inc.
+// Copyright (c) YugabyteDB, Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License"); you may not use this file except
 // in compliance with the License.  You may obtain a copy of the License at
@@ -24,8 +24,6 @@
 #include <boost/multi_index/hashed_index.hpp>
 #include <boost/multi_index/mem_fun.hpp>
 #include <boost/multi_index/ordered_index.hpp>
-
-#include <glog/logging.h>
 
 #include "yb/util/errno.h"
 #include "yb/util/logging.h"
@@ -74,7 +72,7 @@ class Scheduler::Impl {
       strand_.dispatch([this] {
         boost::system::error_code ec;
         timer_.cancel(ec);
-        LOG_IF(ERROR, ec) << "Failed to cancel timer: " << ec.message();
+        LOG_IF(DFATAL, ec) << "Failed to cancel timer: " << ec.message();
 
         auto status = STATUS(
             ServiceUnavailable, "Scheduler is shutting down", "" /* msg2 */, Errno(ESHUTDOWN));
@@ -120,7 +118,7 @@ class Scheduler::Impl {
 
     boost::system::error_code ec;
     timer_.expires_at((*tasks_.begin())->time(), ec);
-    LOG_IF(ERROR, ec) << "Reschedule timer failed: " << ec.message();
+    LOG_IF(DFATAL, ec) << "Reschedule timer failed: " << ec.message();
     ++timer_counter_;
     timer_.async_wait(strand_.wrap(std::bind(&Impl::HandleTimer, this, _1)));
   }
@@ -130,7 +128,8 @@ class Scheduler::Impl {
     --timer_counter_;
 
     if (ec) {
-      LOG_IF(ERROR, ec != boost::asio::error::operation_aborted) << "Wait failed: " << ec.message();
+      LOG_IF(DFATAL, ec != boost::asio::error::operation_aborted)
+          << "Wait failed: " << ec.message();
       return;
     }
     if (closing_.load(std::memory_order_acquire)) {
@@ -196,8 +195,18 @@ IoService& Scheduler::io_service() {
   return impl_->io_service();
 }
 
-ScheduledTaskTracker::ScheduledTaskTracker(Scheduler* scheduler)
-    : scheduler_(DCHECK_NOTNULL(scheduler)) {}
+ScheduledTaskTracker::ScheduledTaskTracker(const std::string& name, Scheduler* scheduler)
+    : log_prefix_(Format("$0($1): ", name, static_cast<void*>(this))),
+      scheduler_(DCHECK_NOTNULL(scheduler)) {}
+
+ScheduledTaskTracker::~ScheduledTaskTracker() {
+  auto last_scheduled_task_id = last_scheduled_task_id_.load(std::memory_order_acquire);
+  if (last_scheduled_task_id != rpc::kInvalidTaskId) {
+    auto num_scheduled = num_scheduled_.load(std::memory_order_acquire);
+    LOG_IF_WITH_PREFIX(DFATAL, num_scheduled != kShutdownMark)
+        << "Shutdown did not complete on ScheduledTaskTracker";
+  }
+}
 
 void ScheduledTaskTracker::Abort() {
   auto last_scheduled_task_id = last_scheduled_task_id_.load(std::memory_order_acquire);
@@ -213,14 +222,18 @@ void ScheduledTaskTracker::StartShutdown() {
   }
 }
 
+bool ScheduledTaskTracker::ReadyToShutdown() const {
+  return num_scheduled_.load(std::memory_order_acquire) == kShutdownMark;
+}
+
 void ScheduledTaskTracker::CompleteShutdown() {
   for (;;) {
     auto left = num_scheduled_.load(std::memory_order_acquire) - kShutdownMark;
     if (left <= 0) {
-      LOG_IF(DFATAL, left < 0) << "Negative number of tasks left: " << left;
+      LOG_IF_WITH_PREFIX(DFATAL, left < 0) << "Negative number of tasks left: " << left;
       break;
     }
-    YB_LOG_EVERY_N_SECS(INFO, 1) << "Waiting " << left << " tasks to complete";
+    YB_LOG_WITH_PREFIX_EVERY_N_SECS(INFO, 1) << "Waiting " << left << " tasks to complete";
     Abort();
     std::this_thread::sleep_for(1ms);
   }

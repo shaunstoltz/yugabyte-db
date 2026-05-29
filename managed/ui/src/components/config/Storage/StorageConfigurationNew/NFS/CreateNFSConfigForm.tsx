@@ -1,7 +1,7 @@
 /*
  * Created on Fri Jul 29 2022
  *
- * Copyright 2021 YugaByte, Inc. and Contributors
+ * Copyright 2021 YugabyteDB, Inc. and Contributors
  * Licensed under the Polyform Free Trial License 1.0.0 (the "License")
  * You may not use this file except in compliance with the License. You may obtain a copy of the License at
  * http://github.com/YugaByte/yugabyte-db/blob/master/licenses/POLYFORM-FREE-TRIAL-LICENSE-1.0.0.txt
@@ -15,7 +15,7 @@ import { OptionTypeBase } from 'react-select';
 import { YBControlledTextInput, YBFormInput, YBFormToggle } from '../../../../common/forms/fields';
 import { StorageConfigCreationForm, YBReduxFormSelect } from '../common/StorageConfigCreationForm';
 import { IStorageProviders } from '../IStorageConfigs';
-import Close from '../../../../universes/images/close.svg';
+import Close from '../../../../universes/images/close.svg?img';
 import { flatten, isEmpty, uniq, uniqBy } from 'lodash';
 import { CloudType } from '../../../../../redesign/helpers/dtos';
 import { useMutation } from 'react-query';

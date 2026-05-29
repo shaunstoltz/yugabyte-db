@@ -1,4 +1,4 @@
-// Copyright (c) YugaByte, Inc.
+// Copyright (c) YugabyteDB, Inc.
 
 import { connect } from 'react-redux';
 import { reduxForm } from 'redux-form';
@@ -41,11 +41,16 @@ const mapStateToProps = (state) => {
 const validate = (values) => {
   const errors = { regionsZonesList: [] };
   if (values.regionsZonesList && isNonEmptyArray(values.regionsZonesList)) {
+    const requestedRegions = new Set();
     values.regionsZonesList.forEach(function (regionZoneItem, rowIdx) {
       if (!isDefinedNotNull(regionZoneItem.code)) {
         errors.regionsZonesList[rowIdx] = { code: 'Required' };
       } else if (regionZoneItem.code.length > 25) {
         errors.regionsZonesList[rowIdx] = { code: 'max char limit is 25' };
+      } else if (requestedRegions.has(regionZoneItem.code)) {
+        errors.regionsZonesList[rowIdx] = { code: 'Duplicate region code is not allowed.' };
+      } else {
+        requestedRegions.add(regionZoneItem.code);
       }
       if (!isDefinedNotNull(regionZoneItem.location)) {
         errors.regionsZonesList[rowIdx] = { location: 'Required' };

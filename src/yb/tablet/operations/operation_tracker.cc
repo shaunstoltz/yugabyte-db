@@ -15,9 +15,9 @@
 // specific language governing permissions and limitations
 // under the License.
 //
-// The following only applies to changes made to this file as part of YugaByte development.
+// The following only applies to changes made to this file as part of YugabyteDB development.
 //
-// Portions Copyright (c) YugaByte, Inc.
+// Portions Copyright (c) YugabyteDB, Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License"); you may not use this file except
 // in compliance with the License.  You may obtain a copy of the License at
@@ -42,6 +42,7 @@
 #include "yb/tablet/operations/operation_driver.h"
 #include "yb/tablet/tablet.h"
 
+#include "yb/util/callsite_profiling.h"
 #include "yb/util/flags.h"
 #include "yb/util/logging.h"
 #include "yb/util/mem_tracker.h"
@@ -94,6 +95,10 @@ METRIC_DEFINE_gauge_uint64(tablet, history_cutoff_operations_inflight,
                            "History Cutoff Operations In Flight",
                            yb::MetricUnit::kOperations,
                            "Number of history cutoff operations currently in-flight");
+METRIC_DEFINE_gauge_uint64(tablet, clone_operations_inflight,
+                           "Clone Operations In Flight",
+                           yb::MetricUnit::kOperations,
+                           "Number of clone tablet operations currently in-flight");
 
 METRIC_DEFINE_counter(tablet, operation_memory_pressure_rejections,
                       "Operation Memory Pressure Rejections",
@@ -119,7 +124,7 @@ using strings::Substitute;
 #define MINIT(x) x(METRIC_##x.Instantiate(entity))
 #define GINIT(x) x(METRIC_##x.Instantiate(entity, 0))
 #define INSTANTIATE(upper, lower) \
-  operations_inflight[to_underlying(OperationType::BOOST_PP_CAT(k, upper))] = \
+  operations_inflight[std::to_underlying(OperationType::BOOST_PP_CAT(k, upper))] = \
       BOOST_PP_CAT(BOOST_PP_CAT(METRIC_, lower), _operations_inflight).Instantiate(entity, 0);
 OperationTracker::Metrics::Metrics(const scoped_refptr<MetricEntity>& entity)
     : GINIT(all_operations_inflight),
@@ -133,7 +138,8 @@ OperationTracker::Metrics::Metrics(const scoped_refptr<MetricEntity>& entity)
   INSTANTIATE(Empty, empty);
   INSTANTIATE(HistoryCutoff, history_cutoff);
   INSTANTIATE(ChangeAutoFlagsConfig, change_auto_flags_config);
-  static_assert(9== kElementsInOperationType, "Init metrics for all operation types");
+  INSTANTIATE(Clone, clone);
+  static_assert(kElementsInOperationType == 10, "Init metrics for all operation types");
 }
 #undef INSTANTIATE
 #undef GINIT
@@ -144,7 +150,7 @@ OperationTracker::OperationTracker(const std::string& log_prefix)
 }
 
 OperationTracker::~OperationTracker() {
-  std::lock_guard<std::mutex> lock(mutex_);
+  std::lock_guard lock(mutex_);
   CHECK_EQ(pending_operations_.size(), 0);
   if (mem_tracker_) {
     mem_tracker_->UnregisterFromParent();
@@ -153,7 +159,8 @@ OperationTracker::~OperationTracker() {
 
 Status OperationTracker::Add(OperationDriver* driver) {
   int64_t driver_mem_footprint = driver->SpaceUsed();
-  if (mem_tracker_ && !mem_tracker_->TryConsume(driver_mem_footprint)) {
+  MemTracker* blocking_mem_tracker = nullptr;
+  if (mem_tracker_ && !mem_tracker_->TryConsume(driver_mem_footprint, &blocking_mem_tracker)) {
     if (metrics_) {
       metrics_->operation_memory_pressure_rejections->Increment();
     }
@@ -164,13 +171,21 @@ Status OperationTracker::Add(OperationDriver* driver) {
     // May be nullptr in unit tests even when operation is not nullptr.
     TabletPtr tablet = operation ? operation->tablet_nullable() : nullptr;
 
+    if (!blocking_mem_tracker) {
+      blocking_mem_tracker = mem_tracker_.get();
+    }
+    auto consumption = blocking_mem_tracker->consumption();
+    auto limit = blocking_mem_tracker->limit();
+    auto blocked_by = AsString(blocking_mem_tracker);
+    auto operation_type = driver->operation_type();
     string msg = Substitute(
-        "Operation failed, tablet $0 operation memory consumption ($1) "
-        "has exceeded its limit ($2) or the limit of an ancestral tracker",
-        tablet ? tablet->tablet_id() : "(unknown)",
-        mem_tracker_->consumption(), mem_tracker_->limit());
+        "Operation of type $0 failed: tablet $1 hit the limit $3 of memory tracker $4 "
+        "while trying to consume an additional $5 bytes; "
+        "the memory tracker had already given out $2 bytes.",
+        AsString(operation_type), tablet ? tablet->tablet_id() : "(unknown)", consumption, limit,
+        blocked_by, driver_mem_footprint);
 
-    YB_LOG_EVERY_N_SECS(WARNING, 1) << msg << THROTTLE_MSG;
+    YB_LOG_EVERY_N_SECS(WARNING, 1) << msg;
 
     return STATUS(ServiceUnavailable, msg);
   }
@@ -181,7 +196,7 @@ Status OperationTracker::Add(OperationDriver* driver) {
   // again, as it may disappear between now and then.
   State st;
   st.memory_footprint = driver_mem_footprint;
-  std::lock_guard<std::mutex> lock(mutex_);
+  std::lock_guard lock(mutex_);
   CHECK(pending_operations_.emplace(driver, st).second);
   return Status::OK();
 }
@@ -192,7 +207,7 @@ void OperationTracker::IncrementCounters(const OperationDriver& driver) const {
   }
 
   metrics_->all_operations_inflight->Increment();
-  metrics_->operations_inflight[to_underlying(driver.operation_type())]->Increment();
+  metrics_->operations_inflight[std::to_underlying(driver.operation_type())]->Increment();
 }
 
 void OperationTracker::DecrementCounters(const OperationDriver& driver) const {
@@ -202,7 +217,7 @@ void OperationTracker::DecrementCounters(const OperationDriver& driver) const {
 
   DCHECK_GT(metrics_->all_operations_inflight->value(), 0);
   metrics_->all_operations_inflight->Decrement();
-  auto index = to_underlying(driver.operation_type());
+  auto index = std::to_underlying(driver.operation_type());
   DCHECK_GT(metrics_->operations_inflight[index]->value(), 0);
   metrics_->operations_inflight[index]->Decrement();
 }
@@ -217,7 +232,7 @@ void OperationTracker::Release(OperationDriver* driver, OpIds* applied_op_ids) {
   {
     // Remove the operation from the map, retaining the state for use
     // below.
-    std::lock_guard<std::mutex> lock(mutex_);
+    std::lock_guard lock(mutex_);
     state = FindOrDie(pending_operations_, driver);
     if (PREDICT_FALSE(pending_operations_.erase(driver) != 1)) {
       LOG_WITH_PREFIX(FATAL) << "Could not remove pending operation from map: "
@@ -226,7 +241,7 @@ void OperationTracker::Release(OperationDriver* driver, OpIds* applied_op_ids) {
     notify = pending_operations_.empty();
   }
   if (notify) {
-    cond_.notify_all();
+    YB_PROFILE(cond_.notify_all());
   }
 
   if (mem_tracker_ && state.memory_footprint) {
@@ -243,7 +258,7 @@ void OperationTracker::Release(OperationDriver* driver, OpIds* applied_op_ids) {
 }
 
 std::vector<scoped_refptr<OperationDriver>> OperationTracker::GetPendingOperations() const {
-  std::lock_guard<std::mutex> lock(mutex_);
+  std::lock_guard lock(mutex_);
   return GetPendingOperationsUnlocked();
 }
 
@@ -258,7 +273,7 @@ std::vector<scoped_refptr<OperationDriver>> OperationTracker::GetPendingOperatio
 
 
 size_t OperationTracker::TEST_GetNumPending() const {
-  std::lock_guard<std::mutex> l(mutex_);
+  std::lock_guard l(mutex_);
   return pending_operations_.size();
 }
 

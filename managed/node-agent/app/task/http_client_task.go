@@ -1,4 +1,4 @@
-// Copyright (c) YugaByte, Inc.
+// Copyright (c) YugabyteDB, Inc.
 
 package task
 
@@ -6,31 +6,12 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
-	"io/ioutil"
+	"io"
 	"net/http"
 	"node-agent/model"
 	"node-agent/util"
 	"runtime"
-	"sort"
 	"strings"
-)
-
-const (
-	mountPointsVolume    = "mount_points_volume"
-	mountPointsWritable  = "mount_points_writable"
-	masterHTTPPort       = "master_http_port"
-	masterRPCPort        = "master_rpc_port"
-	tserverHTTPPort      = "tserver_http_port"
-	tserverRPCPort       = "tserver_rpc_port"
-	ybControllerHTTPPort = "yb_controller_http_port"
-	ybControllerRPCPort  = "yb_controller_rpc_port"
-	redisServerHTTPPort  = "redis_server_http_port"
-	redisServerRPCPort   = "redis_server_rpc_port"
-	yqlServerHTTPPort    = "yql_server_http_port"
-	yqlServerRPCPort     = "yql_server_rpc_port"
-	ysqlServerHTTPPort   = "ysql_server_http_port"
-	ysqlServerRPCPort    = "ysql_server_rpc_port"
-	sshPort              = "ssh_port"
 )
 
 func httpClient() *util.HttpClient {
@@ -54,6 +35,7 @@ func (handler *AgentRegistrationHandler) Handle(ctx context.Context) (any, error
 	config := util.CurrentConfig()
 	// Call the platform to register the node-agent in the platform.
 	res, err := httpClient().Do(
+		ctx,
 		http.MethodPost,
 		util.PlatformRegisterAgentEndpoint(config.String(util.CustomerIdKey)),
 		platformHeadersWithAPIToken(handler.apiToken),
@@ -65,7 +47,7 @@ func (handler *AgentRegistrationHandler) Handle(ctx context.Context) (any, error
 	}
 	defer res.Body.Close()
 	handler.result = &model.RegisterResponseSuccess{}
-	return UnmarshalResponse(handler.result, res)
+	return UnmarshalResponse(ctx, handler.result, res)
 }
 
 func (handler *AgentRegistrationHandler) Result() *model.RegisterResponseSuccess {
@@ -83,11 +65,12 @@ func NewAgentUnregistrationHandler(apiToken string) *AgentUnregistrationHandler 
 
 func (handler *AgentUnregistrationHandler) Handle(ctx context.Context) (any, error) {
 	config := util.CurrentConfig()
-	headers, err := platformHeadersWithAuth(config, handler.apiToken)
+	headers, err := platformHeadersWithAuth(ctx, config, handler.apiToken)
 	if err != nil {
 		return nil, err
 	}
 	res, err := httpClient().Do(
+		ctx,
 		http.MethodDelete,
 		util.PlatformUnregisterAgentEndpoint(
 			config.String(util.CustomerIdKey),
@@ -102,7 +85,7 @@ func (handler *AgentUnregistrationHandler) Handle(ctx context.Context) (any, err
 	}
 	defer res.Body.Close()
 	handler.result = &model.ResponseMessage{}
-	return UnmarshalResponse(handler.result, res)
+	return UnmarshalResponse(ctx, handler.result, res)
 }
 
 func (handler *AgentUnregistrationHandler) Result() *model.ResponseMessage {
@@ -119,11 +102,12 @@ func NewGetInstanceTypeHandler() *GetInstanceTypeHandler {
 
 func (handler *GetInstanceTypeHandler) Handle(ctx context.Context) (any, error) {
 	config := util.CurrentConfig()
-	headers, err := platformHeadersWithJWT(config)
+	headers, err := platformHeadersWithJWT(ctx, config)
 	if err != nil {
 		return nil, err
 	}
 	res, err := httpClient().Do(
+		ctx,
 		http.MethodGet,
 		util.PlatformGetInstanceTypeEndpoint(
 			config.String(util.CustomerIdKey),
@@ -139,7 +123,7 @@ func (handler *GetInstanceTypeHandler) Handle(ctx context.Context) (any, error) 
 	}
 	defer res.Body.Close()
 	handler.result = &model.NodeInstanceType{}
-	return UnmarshalResponse(handler.result, res)
+	return UnmarshalResponse(ctx, handler.result, res)
 }
 
 func (handler *GetInstanceTypeHandler) Result() *model.NodeInstanceType {
@@ -147,23 +131,22 @@ func (handler *GetInstanceTypeHandler) Result() *model.NodeInstanceType {
 }
 
 type ValidateNodeInstanceHandler struct {
-	data   map[string]model.PreflightCheckVal
+	data   []model.NodeConfig
 	result *map[string]model.NodeInstanceValidationResponse
 }
 
-func NewValidateNodeInstanceHandler(
-	data map[string]model.PreflightCheckVal,
-) *ValidateNodeInstanceHandler {
+func NewValidateNodeInstanceHandler(data []model.NodeConfig) *ValidateNodeInstanceHandler {
 	return &ValidateNodeInstanceHandler{data: data}
 }
 
 func (handler *ValidateNodeInstanceHandler) Handle(ctx context.Context) (any, error) {
 	config := util.CurrentConfig()
-	headers, err := platformHeadersWithJWT(config)
+	headers, err := platformHeadersWithJWT(ctx, config)
 	if err != nil {
 		return nil, err
 	}
 	res, err := httpClient().Do(
+		ctx,
 		http.MethodPost,
 		util.PlatformValidateNodeInstanceEndpoint(
 			config.String(util.CustomerIdKey),
@@ -178,7 +161,7 @@ func (handler *ValidateNodeInstanceHandler) Handle(ctx context.Context) (any, er
 	}
 	defer res.Body.Close()
 	handler.result = &map[string]model.NodeInstanceValidationResponse{}
-	return UnmarshalResponse(handler.result, res)
+	return UnmarshalResponse(ctx, handler.result, res)
 }
 
 func (handler *ValidateNodeInstanceHandler) Result() *map[string]model.NodeInstanceValidationResponse {
@@ -186,23 +169,22 @@ func (handler *ValidateNodeInstanceHandler) Result() *map[string]model.NodeInsta
 }
 
 type PostNodeInstanceHandler struct {
-	data   map[string]model.PreflightCheckVal
+	data   []model.NodeConfig
 	result *map[string]model.NodeInstanceResponse
 }
 
-func NewPostNodeInstanceHandler(
-	data map[string]model.PreflightCheckVal,
-) *PostNodeInstanceHandler {
+func NewPostNodeInstanceHandler(data []model.NodeConfig) *PostNodeInstanceHandler {
 	return &PostNodeInstanceHandler{data: data}
 }
 
 func (handler *PostNodeInstanceHandler) Handle(ctx context.Context) (any, error) {
 	config := util.CurrentConfig()
-	headers, err := platformHeadersWithJWT(config)
+	headers, err := platformHeadersWithJWT(ctx, config)
 	if err != nil {
 		return nil, err
 	}
 	res, err := httpClient().Do(
+		ctx,
 		http.MethodPost,
 		util.PlatformPostNodeInstancesEndpoint(
 			config.String(util.CustomerIdKey),
@@ -217,10 +199,48 @@ func (handler *PostNodeInstanceHandler) Handle(ctx context.Context) (any, error)
 	}
 	defer res.Body.Close()
 	handler.result = &map[string]model.NodeInstanceResponse{}
-	return UnmarshalResponse(handler.result, res)
+	return UnmarshalResponse(ctx, handler.result, res)
 }
 
 func (handler *PostNodeInstanceHandler) Result() *map[string]model.NodeInstanceResponse {
+	return handler.result
+}
+
+type DeleteNodeInstanceHandler struct {
+	result *model.ResponseMessage
+}
+
+func NewDeleteNodeInstanceHandler() *DeleteNodeInstanceHandler {
+	return &DeleteNodeInstanceHandler{}
+}
+
+func (handler *DeleteNodeInstanceHandler) Handle(ctx context.Context) (any, error) {
+	config := util.CurrentConfig()
+	headers, err := platformHeadersWithJWT(ctx, config)
+	if err != nil {
+		return nil, err
+	}
+	res, err := httpClient().Do(
+		ctx,
+		http.MethodDelete,
+		util.PlatformDeleteNodeInstanceEndpoint(
+			config.String(util.CustomerIdKey),
+			config.String(util.ProviderIdKey),
+			config.String(util.NodeIpKey),
+		),
+		headers,
+		nil,
+		nil,
+	)
+	if err != nil {
+		return nil, err
+	}
+	defer res.Body.Close()
+	handler.result = &model.ResponseMessage{}
+	return UnmarshalResponse(ctx, handler.result, res)
+}
+
+func (handler *DeleteNodeInstanceHandler) Result() *model.ResponseMessage {
 	return handler.result
 }
 
@@ -235,11 +255,12 @@ func NewGetProvidersHandler(apiToken string) *GetProvidersHandler {
 
 func (handler *GetProvidersHandler) Handle(ctx context.Context) (any, error) {
 	config := util.CurrentConfig()
-	headers, err := platformHeadersWithAuth(config, handler.apiToken)
+	headers, err := platformHeadersWithAuth(ctx, config, handler.apiToken)
 	if err != nil {
 		return nil, err
 	}
 	res, err := httpClient().Do(
+		ctx,
 		http.MethodGet,
 		util.PlatformGetProvidersEndpoint(config.String(util.CustomerIdKey)),
 		headers,
@@ -251,7 +272,7 @@ func (handler *GetProvidersHandler) Handle(ctx context.Context) (any, error) {
 	}
 	defer res.Body.Close()
 	handler.result = &[]model.Provider{}
-	return UnmarshalResponse(handler.result, res)
+	return UnmarshalResponse(ctx, handler.result, res)
 }
 
 func (handler *GetProvidersHandler) Result() *[]model.Provider {
@@ -268,11 +289,12 @@ func NewGetProviderHandler() *GetProviderHandler {
 
 func (handler *GetProviderHandler) Handle(ctx context.Context) (any, error) {
 	config := util.CurrentConfig()
-	headers, err := platformHeadersWithJWT(config)
+	headers, err := platformHeadersWithJWT(ctx, config)
 	if err != nil {
 		return nil, err
 	}
 	res, err := httpClient().Do(
+		ctx,
 		http.MethodGet,
 		util.PlatformGetProviderEndpoint(config.String(util.CustomerIdKey), config.String(util.ProviderIdKey)),
 		headers,
@@ -284,50 +306,10 @@ func (handler *GetProviderHandler) Handle(ctx context.Context) (any, error) {
 	}
 	defer res.Body.Close()
 	handler.result = &model.Provider{}
-	return UnmarshalResponse(handler.result, res)
+	return UnmarshalResponse(ctx, handler.result, res)
 }
 
 func (handler *GetProviderHandler) Result() *model.Provider {
-	return handler.result
-}
-
-type GetAccessKeysHandler struct {
-	result *model.AccessKey
-}
-
-func NewGetAccessKeysHandler() *GetAccessKeysHandler {
-	return &GetAccessKeysHandler{}
-}
-
-func (handler *GetAccessKeysHandler) Handle(ctx context.Context) (any, error) {
-	config := util.CurrentConfig()
-	headers, err := platformHeadersWithJWT(config)
-	if err != nil {
-		return nil, err
-	}
-	res, err := httpClient().Do(
-		http.MethodGet,
-		util.PlatformGetAccessKeysEndpoint(config.String(util.CustomerIdKey), config.String(util.ProviderIdKey)),
-		headers,
-		nil,
-		nil,
-	)
-	if err != nil {
-		return nil, err
-	}
-	defer res.Body.Close()
-	accessKeys := []model.AccessKey{}
-	_, err = UnmarshalResponse(&accessKeys, res)
-	if err != nil {
-		return nil, err
-	}
-	// Sort to get the latest access key as done in platform.
-	sort.Sort(model.AccessKeys(accessKeys))
-	handler.result = &accessKeys[0]
-	return handler.result, nil
-}
-
-func (handler *GetAccessKeysHandler) Result() *model.AccessKey {
 	return handler.result
 }
 
@@ -342,11 +324,12 @@ func NewGetSessionInfoHandler(apiToken string) *GetSessionInfoHandler {
 
 func (handler *GetSessionInfoHandler) Handle(ctx context.Context) (any, error) {
 	config := util.CurrentConfig()
-	headers, err := platformHeadersWithAuth(config, handler.apiToken)
+	headers, err := platformHeadersWithAuth(ctx, config, handler.apiToken)
 	if err != nil {
 		return nil, err
 	}
 	res, err := httpClient().Do(
+		ctx,
 		http.MethodGet,
 		util.PlatformGetSessionInfoEndpoint(),
 		headers,
@@ -358,7 +341,7 @@ func (handler *GetSessionInfoHandler) Handle(ctx context.Context) (any, error) {
 	}
 	defer res.Body.Close()
 	handler.result = &model.SessionInfo{}
-	return UnmarshalResponse(handler.result, res)
+	return UnmarshalResponse(ctx, handler.result, res)
 }
 
 func (handler *GetSessionInfoHandler) Result() *model.SessionInfo {
@@ -376,11 +359,12 @@ func NewGetUserHandler(apiToken string) *GetUserHandler {
 
 func (handler *GetUserHandler) Handle(ctx context.Context) (any, error) {
 	config := util.CurrentConfig()
-	headers, err := platformHeadersWithAuth(config, handler.apiToken)
+	headers, err := platformHeadersWithAuth(ctx, config, handler.apiToken)
 	if err != nil {
 		return nil, err
 	}
 	res, err := httpClient().Do(
+		ctx,
 		http.MethodGet,
 		util.PlatformGetUserEndpoint(config.String(util.CustomerIdKey), config.String(util.UserIdKey)),
 		headers,
@@ -392,7 +376,7 @@ func (handler *GetUserHandler) Handle(ctx context.Context) (any, error) {
 	}
 	defer res.Body.Close()
 	handler.result = &model.User{}
-	return UnmarshalResponse(handler.result, res)
+	return UnmarshalResponse(ctx, handler.result, res)
 }
 
 func (handler *GetUserHandler) Result() *model.User {
@@ -410,11 +394,12 @@ func NewGetInstanceTypesHandler(apiToken string) *GetInstanceTypesHandler {
 
 func (handler *GetInstanceTypesHandler) Handle(ctx context.Context) (any, error) {
 	config := util.CurrentConfig()
-	headers, err := platformHeadersWithAuth(config, handler.apiToken)
+	headers, err := platformHeadersWithAuth(ctx, config, handler.apiToken)
 	if err != nil {
 		return nil, err
 	}
 	res, err := httpClient().Do(
+		ctx,
 		http.MethodGet,
 		util.PlatformGetInstanceTypesEndpoint(
 			config.String(util.CustomerIdKey),
@@ -429,7 +414,7 @@ func (handler *GetInstanceTypesHandler) Handle(ctx context.Context) (any, error)
 	}
 	defer res.Body.Close()
 	handler.result = &[]model.NodeInstanceType{}
-	return UnmarshalResponse(handler.result, res)
+	return UnmarshalResponse(ctx, handler.result, res)
 }
 
 func (handler *GetInstanceTypesHandler) Result() *[]model.NodeInstanceType {
@@ -448,11 +433,12 @@ func NewPutAgentStateHandler(state model.NodeState, version string) *PutAgentSta
 
 func (handler *PutAgentStateHandler) Handle(ctx context.Context) (any, error) {
 	config := util.CurrentConfig()
-	headers, err := platformHeadersWithJWT(config)
+	headers, err := platformHeadersWithJWT(ctx, config)
 	if err != nil {
 		return nil, err
 	}
 	res, err := httpClient().Do(
+		ctx,
 		http.MethodPut,
 		util.PlatformPutAgentStateEndpoint(
 			config.String(util.CustomerIdKey),
@@ -467,7 +453,7 @@ func (handler *PutAgentStateHandler) Handle(ctx context.Context) (any, error) {
 	}
 	defer res.Body.Close()
 	handler.result = &model.NodeAgent{}
-	return UnmarshalResponse(handler.result, res)
+	return UnmarshalResponse(ctx, handler.result, res)
 }
 
 func (handler *PutAgentStateHandler) Result() *model.NodeAgent {
@@ -483,16 +469,54 @@ func NewGetVersionHandler() *GetVersionHandler {
 }
 
 func (handler *GetVersionHandler) Handle(ctx context.Context) (any, error) {
-	res, err := httpClient().Do(http.MethodGet, util.GetVersionEndpoint, nil, nil, nil)
+	res, err := httpClient().Do(ctx, http.MethodGet, util.GetVersionEndpoint, nil, nil, nil)
 	if err != nil {
 		return nil, err
 	}
 	defer res.Body.Close()
 	handler.result = &model.VersionRequest{}
-	return UnmarshalResponse(handler.result, res)
+	return UnmarshalResponse(ctx, handler.result, res)
 }
 
 func (handler *GetVersionHandler) Result() *model.VersionRequest {
+	return handler.result
+}
+
+type GetNodeAgentHandler struct {
+	apiToken string
+	result   *model.NodeAgent
+}
+
+func NewGetNodeAgentHandler(apiToken string) *GetNodeAgentHandler {
+	return &GetNodeAgentHandler{apiToken: apiToken}
+}
+
+func (handler *GetNodeAgentHandler) Handle(ctx context.Context) (any, error) {
+	config := util.CurrentConfig()
+	headers, err := platformHeadersWithAuth(ctx, config, handler.apiToken)
+	if err != nil {
+		return nil, err
+	}
+	res, err := httpClient().Do(ctx, http.MethodGet,
+		util.PlatformGetNodeAgentEndpoint(config.String(util.CustomerIdKey), config.String(util.NodeIpKey)),
+		headers, nil, nil)
+	if err != nil {
+		return nil, err
+	}
+	defer res.Body.Close()
+	nodeAgents := []*model.NodeAgent{}
+	_, err = UnmarshalResponse(ctx, &nodeAgents, res)
+	if err != nil {
+		return nil, err
+	}
+	if len(nodeAgents) == 0 {
+		return nil, util.ErrNotExist
+	}
+	handler.result = nodeAgents[0]
+	return handler.result, nil
+}
+
+func (handler *GetNodeAgentHandler) Result() *model.NodeAgent {
 	return handler.result
 }
 
@@ -500,16 +524,16 @@ func (handler *GetVersionHandler) Result() *model.VersionRequest {
 // Tries to unmarshal the response into model.ResponseError if
 // the response status code is not 200.
 // If the unmarshaling fails, converts the response body to string.
-func UnmarshalResponse(successTarget any, res *http.Response) (any, error) {
-	body, err := ioutil.ReadAll(res.Body)
+func UnmarshalResponse(ctx context.Context, successTarget any, res *http.Response) (any, error) {
+	body, err := io.ReadAll(res.Body)
 	res.Body.Close()
 	if err != nil {
 		err = errors.New("Error reading the response body - " + err.Error())
-		util.FileLogger().Errorf(err.Error())
+		util.FileLogger().Error(ctx, err.Error())
 		return nil, err
 	}
-	if res.StatusCode != 200 {
-		util.FileLogger().Errorf(
+	if res.StatusCode < 200 || res.StatusCode >= 300 {
+		util.FileLogger().Errorf(ctx,
 			"API returned an error %s with %d status code",
 			string(body),
 			res.StatusCode,
@@ -527,28 +551,32 @@ func UnmarshalResponse(successTarget any, res *http.Response) (any, error) {
 	err = json.Unmarshal(body, successTarget)
 	if err != nil {
 		err = errors.New("Error while unmarshaling the response body - " + err.Error())
-		util.FileLogger().Errorf(err.Error())
+		util.FileLogger().Error(ctx, err.Error())
 		return nil, err
 	}
 	return successTarget, nil
 }
 
 // Creates platform headers with either the API token if it is set or JWT token.
-func platformHeadersWithAuth(config *util.Config, apiToken string) (map[string]string, error) {
+func platformHeadersWithAuth(
+	ctx context.Context,
+	config *util.Config,
+	apiToken string,
+) (map[string]string, error) {
 	apiToken = strings.TrimSpace(apiToken)
 	if apiToken == "" {
-		return platformHeadersWithJWT(config)
+		return platformHeadersWithJWT(ctx, config)
 	}
 	return platformHeadersWithAPIToken(apiToken), nil
 }
 
 // Creates platform headers using JWT.
-func platformHeadersWithJWT(config *util.Config) (map[string]string, error) {
+func platformHeadersWithJWT(ctx context.Context, config *util.Config) (map[string]string, error) {
 	m := make(map[string]string)
 	m["Content-Type"] = "application/json"
-	jwtToken, err := util.GenerateJWT(config)
+	jwtToken, err := util.GenerateJWT(ctx, config)
 	if err != nil {
-		util.FileLogger().Errorf("Error while creating the JWT - %s", err.Error())
+		util.FileLogger().Errorf(ctx, "Error while creating the JWT - %s", err.Error())
 		return m, err
 	}
 	m[util.PlatformJwtTokenHeader] = jwtToken
@@ -564,15 +592,12 @@ func platformHeadersWithAPIToken(apiToken string) map[string]string {
 }
 
 func createRegisterAgentRequest(config *util.Config) model.RegisterRequest {
-	req := model.RegisterRequest{}
-	req.Name = config.String(util.NodeNameKey)
-	req.IP = config.String(util.NodeIpKey)
-	req.Port = config.Int(util.NodePortKey)
-	req.Version = config.String(util.PlatformVersionKey)
-	req.ArchType = runtime.GOARCH
-	req.OSType = runtime.GOOS
-	req.State = model.Registering.Name()
-	return req
+	return model.RegisterRequest{
+		CommonInfo: createNodeAgentCommonInfo(
+			config, model.Registering,
+			config.String(util.PlatformVersionKey),
+		),
+	}
 }
 
 func createUpdateAgentStateRequest(
@@ -580,19 +605,30 @@ func createUpdateAgentStateRequest(
 	state model.NodeState,
 	version string,
 ) model.StateUpdateRequest {
-	req := model.StateUpdateRequest{}
-	req.Name = config.String(util.NodeNameKey)
-	req.IP = config.String(util.NodeIpKey)
-	req.Version = version
-	req.ArchType = runtime.GOARCH
-	req.OSType = runtime.GOOS
-	req.State = state.Name()
-	return req
+	return model.StateUpdateRequest{
+		CommonInfo: createNodeAgentCommonInfo(config, state, version),
+	}
+}
+
+func createNodeAgentCommonInfo(
+	config *util.Config,
+	state model.NodeState,
+	version string) model.CommonInfo {
+	info := model.CommonInfo{}
+	info.Name = config.String(util.NodeNameKey)
+	info.IP = config.String(util.NodeIpKey)
+	info.Port = config.Int(util.NodePortKey)
+	info.Version = version
+	info.ArchType = runtime.GOARCH
+	info.OSType = runtime.GOOS
+	info.State = state.Name()
+	info.Home = util.MustGetHomeDirectory()
+	return info
 }
 
 func createNodeDetailsRequest(
 	config *util.Config,
-	data map[string]model.PreflightCheckVal,
+	data []model.NodeConfig,
 ) model.NodeDetails {
 	nodeDetails := model.NodeDetails{}
 	nodeDetails.IP = config.String(util.NodeIpKey)
@@ -600,73 +636,13 @@ func createNodeDetailsRequest(
 	nodeDetails.Zone = config.String(util.NodeZoneKey)
 	nodeDetails.InstanceType = config.String(util.NodeInstanceTypeKey)
 	nodeDetails.InstanceName = config.String(util.NodeNameKey)
-	nodeDetails.NodeConfigs = getNodeConfig(data)
+	nodeDetails.NodeConfigs = data
 	return nodeDetails
 }
 
 func createNodeInstancesRequest(
 	config *util.Config,
-	data map[string]model.PreflightCheckVal,
+	data []model.NodeConfig,
 ) model.NodeInstances {
 	return model.NodeInstances{Nodes: []model.NodeDetails{createNodeDetailsRequest(config, data)}}
-}
-
-func getNodeConfig(data map[string]model.PreflightCheckVal) []model.NodeConfig {
-	mountPointsWritableMap := make(map[string]string)
-	mountPointsVolumeMap := make(map[string]string)
-	result := make([]model.NodeConfig, 0)
-	for k, v := range data {
-		kSplit := strings.Split(k, ":")
-		switch kSplit[0] {
-		case mountPointsWritable:
-			mountPointsWritableMap[kSplit[1]] = v.Value
-		case mountPointsVolume:
-			mountPointsVolumeMap[kSplit[1]] = v.Value
-		case masterHTTPPort, masterRPCPort, tserverHTTPPort, tserverRPCPort,
-			ybControllerHTTPPort, ybControllerRPCPort, redisServerHTTPPort,
-			redisServerRPCPort, yqlServerHTTPPort, yqlServerRPCPort,
-			ysqlServerHTTPPort, ysqlServerRPCPort, sshPort:
-			portMap := make(map[string]string)
-			portMap[kSplit[1]] = v.Value
-			result = appendMap(kSplit[0], portMap, result)
-		default:
-			// Try Getting Python Version.
-			vSplit := strings.Split(v.Value, " ")
-			if len(vSplit) > 0 && strings.EqualFold(vSplit[0], "Python") {
-				result = append(
-					result,
-					model.NodeConfig{Type: strings.ToUpper(kSplit[0]), Value: vSplit[1]},
-				)
-			} else {
-				result = append(result, model.NodeConfig{Type: strings.ToUpper(kSplit[0]), Value: v.Value})
-			}
-		}
-	}
-
-	// Marshal the existence of mount points in the request.
-	result = appendMap(mountPointsWritable, mountPointsWritableMap, result)
-
-	// Marshal the mount points volume in the request.
-	result = appendMap(mountPointsVolume, mountPointsVolumeMap, result)
-
-	return result
-}
-
-// Marshal helper function for maps.
-func appendMap(key string, valMap map[string]string, result []model.NodeConfig) []model.NodeConfig {
-	if len(valMap) > 0 {
-		valJSON, err := json.Marshal(valMap)
-		if err != nil {
-			panic("Error while marshaling map")
-		}
-		return append(
-			result,
-			model.NodeConfig{
-				Type:  strings.ToUpper(key),
-				Value: string(valJSON),
-			},
-		)
-	}
-
-	return result
 }

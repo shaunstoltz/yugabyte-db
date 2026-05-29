@@ -15,9 +15,9 @@
 // specific language governing permissions and limitations
 // under the License.
 //
-// The following only applies to changes made to this file as part of YugaByte development.
+// The following only applies to changes made to this file as part of YugabyteDB development.
 //
-// Portions Copyright (c) YugaByte, Inc.
+// Portions Copyright (c) YugabyteDB, Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License"); you may not use this file except
 // in compliance with the License.  You may obtain a copy of the License at
@@ -56,8 +56,7 @@
 
 using std::string;
 
-namespace yb {
-namespace tablet {
+namespace yb::tablet {
 
 using consensus::ConsensusBootstrapInfo;
 
@@ -81,7 +80,7 @@ const string TabletStatusListener::table_id() const {
   return meta_->table_id();
 }
 
-std::shared_ptr<Partition> TabletStatusListener::partition() const {
+std::shared_ptr<dockv::Partition> TabletStatusListener::partition() const {
   return meta_->partition();
 }
 
@@ -95,8 +94,46 @@ TabletStatusListener::~TabletStatusListener() {
 void TabletStatusListener::StatusMessage(const string& status) {
   LOG(INFO) << "T " << tablet_id() << " P " << meta_->fs_manager()->uuid() << ": "
             << status;
-  std::lock_guard<std::shared_timed_mutex> l(lock_);
+  std::lock_guard l(lock_);
   last_status_ = status;
+}
+
+void TabletStatusListener::SetStatusPrefix(const std::string& prefix) {
+  std::lock_guard l(lock_);
+  status_prefix_ = prefix + "\n";
+}
+
+std::optional<RbsProgressInfo> TabletStatusListener::GetRbsProgressInfo() {
+  std::lock_guard l(lock_);
+  return rbs_progress_info_;
+}
+
+void TabletStatusListener::SetInitialRbsProgressInfo(
+    const TabletServerId& source_ts_uuid, int64_t sst_bytes_to_download,
+    int64_t start_time_micros) {
+  std::lock_guard l(lock_);
+  rbs_progress_info_ = RbsProgressInfo {
+    .source_ts_uuid = source_ts_uuid,
+    .sst_bytes_to_download = sst_bytes_to_download,
+    .sst_bytes_downloaded = 0,
+    .sst_start_time_micros = start_time_micros,
+    .sst_end_time_micros = 0,
+  };
+}
+
+void TabletStatusListener::IncrementSstDownloadProgress(int64_t bytes_downloaded) {
+  std::lock_guard l(lock_);
+  rbs_progress_info_->sst_bytes_downloaded += bytes_downloaded;
+}
+
+void TabletStatusListener::SetSstDownloadDone() {
+  std::lock_guard l(lock_);
+  rbs_progress_info_->sst_end_time_micros = GetCurrentTimeMicros();
+}
+
+void TabletStatusListener::ClearRbsProgressInfo() {
+  std::lock_guard l(lock_);
+  rbs_progress_info_ = std::nullopt;
 }
 
 Status BootstrapTablet(
@@ -118,8 +155,7 @@ Status BootstrapTablet(
 }
 
 string DocDbOpIds::ToString() const {
-  return Format("{ regular: $0 intents: $1 }", regular, intents);
+  return YB_STRUCT_TO_STRING(regular, intents, vector_indexes);
 }
 
-} // namespace tablet
-} // namespace yb
+} // namespace yb::tablet

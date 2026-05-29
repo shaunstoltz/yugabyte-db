@@ -4,6 +4,8 @@ import { toast } from 'react-toastify';
 import {
   fetchRunTimeConfigs,
   fetchRunTimeConfigsResponse,
+  getRunTimeConfigKey,
+  getRunTimeConfigKeyResponse,
   setRunTimeConfig,
   setRunTimeConfigResponse,
   deleteRunTimeConfig,
@@ -12,6 +14,7 @@ import {
   DEFAULT_RUNTIME_GLOBAL_SCOPE
 } from '../../../actions/customers';
 import { RuntimeConfig } from './RuntimeConfig';
+import { ToastNotificationDuration } from '../../../redesign/helpers/constants';
 
 const mapDispatchToProps = (dispatch: any) => {
   return {
@@ -25,7 +28,7 @@ const mapDispatchToProps = (dispatch: any) => {
       value: string,
       scope: string = DEFAULT_RUNTIME_GLOBAL_SCOPE
     ) => {
-      dispatch(
+      return dispatch(
         setRunTimeConfig({
           key: key,
           value: value,
@@ -39,9 +42,13 @@ const mapDispatchToProps = (dispatch: any) => {
               typeof responseError !== 'string'
                 ? 'Could not save config, try again'
                 : responseError;
-            toast.error(errorMessage);
+            toast.error(errorMessage, {
+              autoClose: ToastNotificationDuration.SHORT
+            });
           } else {
-            toast.success('Config saved successfully');
+            toast.success('Config saved successfully', {
+              autoClose: ToastNotificationDuration.SHORT
+            });
             dispatch(setRunTimeConfigResponse(response.payload));
           }
         } catch (error) {
@@ -53,6 +60,14 @@ const mapDispatchToProps = (dispatch: any) => {
         }
       });
     },
+    getRuntimeConfig: (key: string, scope: string = DEFAULT_RUNTIME_GLOBAL_SCOPE) => {
+      return dispatch(
+        getRunTimeConfigKey({
+          key: key,
+          scope
+        })
+      ).then((response: any) => dispatch(getRunTimeConfigKeyResponse(response.payload)));
+    },
     deleteRunTimeConfig: (key: string, scope: string = DEFAULT_RUNTIME_GLOBAL_SCOPE) => {
       dispatch(
         deleteRunTimeConfig({
@@ -62,9 +77,13 @@ const mapDispatchToProps = (dispatch: any) => {
       ).then((response: any) => {
         try {
           if (response.payload.isAxiosError || response.payload.status !== 200) {
-            toast.error('Could not delete config, try again');
+            toast.error('Could not delete config, try again', {
+              autoClose: ToastNotificationDuration.SHORT
+            });
           } else {
-            toast.success('Config resetted to parent scope successfully');
+            toast.success('Config resetted to parent scope successfully', {
+              autoClose: ToastNotificationDuration.SHORT
+            });
             dispatch(deleteRunTimeConfigResponse(response.payload));
           }
         } catch (error) {

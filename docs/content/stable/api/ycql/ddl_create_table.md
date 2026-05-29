@@ -4,9 +4,11 @@ headerTitle: CREATE TABLE
 linkTitle: CREATE TABLE
 description: Use the CREATE TABLE statement to create a new table in a keyspace.
 menu:
-  stable:
+  stable_api:
     parent: api-cassandra
     weight: 1240
+aliases:
+  - /stable/api/ycql/ddl_create_table
 type: docs
 ---
 
@@ -76,6 +78,7 @@ Where
 - If primary key is set as a table constraint then:
   - The partition columns are given by the first entry in the primary key list: the nested column list (if given), otherwise the first column.
   - The clustering columns are the rest of the columns in the primary key list (if any).
+- Types `MAP`, `SET`, `LIST`, `JSONB`, `USER_DEFINED_TYPE` cannot be used in the primary key.
 
 #### PARTITION KEY
 
@@ -127,7 +130,7 @@ ycqlsh:example> CREATE TABLE devices(supplier_id INT,
 
 ### Use column constraint to define a static column
 
-You can do this as shown below.
+You can do this as follows:
 
 ```sql
 ycqlsh:example> CREATE TABLE items(supplier_id INT,
@@ -148,7 +151,7 @@ ycqlsh:example> INSERT INTO items(supplier_id, item_id, supplier_name, item_name
 ```
 
 ```sql
-ycqlsh:example> SELECT * FROM devices;
+ycqlsh:example> SELECT * FROM items;
 ```
 
 ```output
@@ -196,7 +199,7 @@ ycqlsh:example> SELECT * FROM user_actions;
 
 ### Use table property to define the default expiration time for rows
 
-You can do this as shown below.
+You can do this as follows:
 
 ```sql
 ycqlsh:example> CREATE TABLE sensor_data(sensor_id INT,

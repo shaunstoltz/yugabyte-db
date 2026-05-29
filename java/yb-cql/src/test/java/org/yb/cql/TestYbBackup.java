@@ -1,4 +1,4 @@
-// Copyright (c) YugaByte, Inc.
+// Copyright (c) YugabyteDB, Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License"); you may not use this file except
 // in compliance with the License.  You may obtain a copy of the License at
@@ -19,14 +19,19 @@ import org.junit.runner.RunWith;
 import org.json.JSONObject;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
-
+import org.yb.YBTestRunner;
+import org.yb.client.TestUtils;
+import org.yb.util.SkipOnASAN;
+import org.yb.util.SkipOnTSAN;
 import org.yb.util.YBBackupException;
 import org.yb.util.YBBackupUtil;
-import org.yb.util.YBTestRunnerNonTsanAsan;
 
+import static org.yb.AssertionWrappers.assertTrue;
 import static org.yb.AssertionWrappers.fail;
 
-@RunWith(value=YBTestRunnerNonTsanAsan.class)
+@SkipOnTSAN
+@SkipOnASAN
+@RunWith(value=YBTestRunner.class)
 public class TestYbBackup extends BaseYbBackupTest {
   private static final Logger LOG = LoggerFactory.getLogger(TestYbBackup.class);
 
@@ -50,7 +55,9 @@ public class TestYbBackup extends BaseYbBackupTest {
     String backupDir = YBBackupUtil.getTempBackupDir();
     String output = YBBackupUtil.runYbBackupCreate("--backup_location", backupDir,
         "--keyspace", DEFAULT_TEST_KEYSPACE);
-    backupDir = new JSONObject(output).getString("snapshot_url");
+    if (!TestUtils.useYbController()) {
+      backupDir = new JSONObject(output).getString("snapshot_url");
+    }
     session.execute("insert into test_tbl (i, j, k, l, m, n) values (2, 2, 2, 1, 1, 1);");
     YBBackupUtil.runYbBackupRestore(backupDir, "--keyspace", "ks6");
 
@@ -97,8 +104,9 @@ public class TestYbBackup extends BaseYbBackupTest {
     String backupDir = YBBackupUtil.getTempBackupDir();
     String output = YBBackupUtil.runYbBackupCreate("--backup_location", backupDir,
         "--keyspace", DEFAULT_TEST_KEYSPACE);
-    backupDir = new JSONObject(output).getString("snapshot_url");
-
+    if (!TestUtils.useYbController()) {
+      backupDir = new JSONObject(output).getString("snapshot_url");
+    }
     assertQuery("select count(*) from " + DEFAULT_TEST_KEYSPACE + ".test_json_tbl;",
                 "Row[2000]");
     session.execute("insert into test_json_tbl (h, j) " +
@@ -139,8 +147,10 @@ public class TestYbBackup extends BaseYbBackupTest {
     session.execute("alter table test_tbl drop a;");
     String backupDir = YBBackupUtil.getTempBackupDir();
     String output = YBBackupUtil.runYbBackupCreate("--backup_location", backupDir,
-        "--keyspace", DEFAULT_TEST_KEYSPACE, "--table", "test_tbl");
-    backupDir = new JSONObject(output).getString("snapshot_url");
+    "--keyspace", DEFAULT_TEST_KEYSPACE, "--table", "test_tbl");
+    if (!TestUtils.useYbController()) {
+      backupDir = new JSONObject(output).getString("snapshot_url");
+    }
     session.execute("insert into test_tbl (h, b) values (9999, 8.9)");
 
     YBBackupUtil.runYbBackupRestore(backupDir, "--keyspace", "ks1");
@@ -172,7 +182,9 @@ public class TestYbBackup extends BaseYbBackupTest {
     String backupDir = YBBackupUtil.getTempBackupDir();
     String output = YBBackupUtil.runYbBackupCreate("--backup_location", backupDir,
         "--keyspace", DEFAULT_TEST_KEYSPACE, "--table", "test_tbl");
-    backupDir = new JSONObject(output).getString("snapshot_url");
+    if (!TestUtils.useYbController()) {
+      backupDir = new JSONObject(output).getString("snapshot_url");
+    }
     session.execute("alter table test_tbl drop a;");
     session.execute("insert into test_tbl (h, b) values (9999, 8.9)");
 
@@ -183,7 +195,7 @@ public class TestYbBackup extends BaseYbBackupTest {
       LOG.info("Expected exception", ex);
     }
 
-    YBBackupUtil.runYbBackupRestore(backupDir, "--keyspace", "ks1");
+    YBBackupUtil.runYbBackupRestore(backupDir, "--keyspace", "ks2");
 
     assertQuery("select * from " + DEFAULT_TEST_KEYSPACE + ".test_tbl where h=1", "Row[1, 3.14]");
     assertQuery("select * from " + DEFAULT_TEST_KEYSPACE + ".test_tbl where h=2000",
@@ -191,11 +203,43 @@ public class TestYbBackup extends BaseYbBackupTest {
     assertQuery("select * from " + DEFAULT_TEST_KEYSPACE + ".test_tbl where h=9999",
                 "Row[9999, 8.9]");
 
-    assertQuery("select * from ks1.test_tbl where h=1", "Row[1, 101, 3.14]");
-    assertQuery("select b from ks1.test_tbl where h=1", "Row[3.14]");
-    assertQuery("select * from ks1.test_tbl where h=2000",
+    assertQuery("select * from ks2.test_tbl where h=1", "Row[1, 101, 3.14]");
+    assertQuery("select b from ks2.test_tbl where h=1", "Row[3.14]");
+    assertQuery("select * from ks2.test_tbl where h=2000",
                 "Row[2000, 2100, 2002.14]");
-    assertQuery("select h from ks1.test_tbl where h=2000", "Row[2000]");
-    assertQuery("select * from ks1.test_tbl where h=9999", "");
+    assertQuery("select h from ks2.test_tbl where h=2000", "Row[2000]");
+    assertQuery("select * from ks2.test_tbl where h=9999", "");
+  }
+
+  @Test
+  public void testYCQLIndexAfterBackupRestore() throws Exception {
+    session.execute("create table test_tbl (h int primary key, a int, b float) " +
+                    "with transactions = { 'enabled' : true }");
+    session.execute("create index on test_tbl(a) ");
+    for (int i = 1; i <= 100; ++i) {
+      session.execute("insert into test_tbl (h, a, b) values" +
+                      " (" + String.valueOf(i) +                     // h
+                      ", " + String.valueOf(100 + i) +               // a
+                      ", " + String.valueOf(2.14 + (float)i) + ")"); // b
+    }
+
+    String backupDir = YBBackupUtil.getTempBackupDir();
+    String output = YBBackupUtil.runYbBackupCreate("--backup_location", backupDir,
+        "--keyspace", DEFAULT_TEST_KEYSPACE, "--table", "test_tbl");
+    if (!TestUtils.useYbController()) {
+      backupDir = new JSONObject(output).getString("snapshot_url");
+    }
+    session.execute("drop table test_tbl");
+
+    // Restore into the same keyspace.
+    YBBackupUtil.runYbBackupRestore(backupDir, "--keyspace", DEFAULT_TEST_KEYSPACE);
+    LOG.info("The backup was restored.");
+
+    // Test the index 'test_tbl_a_idx' against all TSes twice.
+    for (int i = 1; i <= 2*miniCluster.getTabletServers().size(); ++i) {
+      session.execute("select a from " + DEFAULT_TEST_KEYSPACE +
+                      ".test_tbl where a=" + String.valueOf(1100 + i),
+                      "Row[" + String.valueOf(1100 + i) + "]");
+    }
   }
 }

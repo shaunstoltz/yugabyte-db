@@ -62,7 +62,10 @@ export const mainTheme = createTheme({
   shape: {
     borderRadius: variables.borderRadius,
     shadowLight: variables.shadowLight,
-    shadowThick: variables.shadowThick
+    shadowThick: variables.shadowThick,
+    ybaShadows: {
+      ...colors.ybaShadows
+    }
   },
   typography: {
     fontSize: 13,
@@ -90,6 +93,10 @@ export const mainTheme = createTheme({
     h5: {
       fontSize: 15,
       fontWeight: 700
+    },
+    h6: {
+      fontSize: 14,
+      fontWeight: 500
     },
     body1: {
       fontSize: 13,
@@ -204,7 +211,12 @@ export const mainTheme = createTheme({
         '&$disabled': {
           backgroundColor: colors.grey[300],
           color: colors.grey[600],
-          cursor: 'not-allowed'
+          cursor: 'not-allowed',
+          pointerEvents: 'unset',
+          '&:hover': {
+            backgroundColor: colors.grey[300],
+            color: colors.grey[600]
+          }
         }
       },
       // "secondary" variant
@@ -213,17 +225,22 @@ export const mainTheme = createTheme({
         backgroundColor: colors.common.white,
         border: `1px solid ${colors.ybacolors.ybGray}`,
         '&:hover': {
-          backgroundColor: colors.ybacolors.ybGrayHover,
-          borderColor: colors.ybacolors.ybGrayHover
+          backgroundColor: colors.ybacolors.ybBorderGray,
+          borderColor: colors.ybacolors.ybBorderGray
         },
         '&:active': {
           backgroundColor: colors.ybacolors.ybDarkGray2,
           borderColor: colors.ybacolors.ybDarkGray2
         },
         '&$disabled': {
-          backgroundColor: colors.ybacolors.backgroundDisabled,
-          color: colors.ybacolors.colorDisabled,
-          cursor: 'not-allowed'
+          opacity: 0.65,
+          color: colors.ybacolors.ybDarkGray,
+          cursor: 'not-allowed',
+          pointerEvents: 'unset',
+          '&:hover': {
+            opacity: 0.65,
+            color: colors.ybacolors.ybDarkGray
+          }
         }
       },
       // "ghost" variant
@@ -237,9 +254,26 @@ export const mainTheme = createTheme({
           backgroundColor: 'transparent'
         },
         '&$disabled': {
-          backgroundColor: colors.grey[300],
           color: colors.grey[600],
-          cursor: 'not-allowed'
+          cursor: 'not-allowed',
+          pointerEvents: 'unset',
+          '&:hover': {
+            color: colors.grey[600]
+          }
+        }
+      }
+    },
+    MuiToggleButtonGroup: {
+      groupedHorizontal: {
+        '&:not(:first-child)': {
+          borderLeft: `1px solid ${colors.ybacolors.ybBorderGray}`
+        }
+      }
+    },
+    MuiToggleButton: {
+      root: {
+        '&.Mui-selected': {
+          backgroundColor: '#e9eef9'
         }
       }
     },
@@ -255,15 +289,14 @@ export const mainTheme = createTheme({
     },
     MuiCheckbox: {
       root: {
-        // color: colors.primary[600],
         '& .MuiSvgIcon-root': {
-          width: 20,
-          height: 20
+          width: 16,
+          height: 16,
+          color: colors.primary[600]
         }
       },
       colorPrimary: {
-        // color: colors.primary[600],
-        '&&.Mui-checked': {
+        '&.Mui-checked': {
           color: colors.orange[500]
         }
       }
@@ -283,7 +316,7 @@ export const mainTheme = createTheme({
       },
       inputRoot: {
         minHeight: variables.inputHeight,
-        height: 'auto',
+        height: 'auto !important',
         padding: 4
       },
       tag: {
@@ -309,23 +342,25 @@ export const mainTheme = createTheme({
       option: {
         fontSize: 13,
         fontWeight: 400,
-        paddingTop: 6,
-        paddingBottom: 6,
+        padding: '6px 16px',
         minHeight: 32,
         lineHeight: 1.25,
-        paddingLeft: '16px !important',
         '&[aria-disabled=true]': {
-          pointerEvents: 'auto'
-        }
+          pointerEvents: 'none'
+        },
+        color: '#232329'
       },
       groupLabel: {
-        fontSize: 13,
-        fontWeight: 400,
-        paddingTop: 6,
-        paddingBottom: 6,
-        minHeight: 32,
-        lineHeight: 1.25,
-        paddingLeft: '16px !important'
+        fontSize: 11.5,
+        fontWeight: 600,
+        lineHeight: '16px',
+        color: '#67666C',
+        padding: '6px 16px',
+        minHeight: '32px',
+        marginTop: '8px'
+      },
+      groupUl: {
+        borderBottom: '1px solid #E9EEF2'
       },
       '&$disabled': {
         cursor: 'not-allowed'
@@ -345,7 +380,7 @@ export const mainTheme = createTheme({
         },
         '&$focused': {
           borderColor: colors.ybacolors.ybOrangeFocus,
-          boxShadow: colors.ybacolors.inputBoxShadow
+          boxShadow: colors.ybaShadows.inputBoxShadow
         },
         '&$error': {
           color: colors.error[500],
@@ -373,7 +408,7 @@ export const mainTheme = createTheme({
         }
       },
       input: {
-        padding: 8,
+        padding: 6,
         fontWeight: 400,
         fontSize: 13,
         '&::placeholder': {
@@ -389,6 +424,7 @@ export const mainTheme = createTheme({
     },
     MuiInputBase: {
       input: {
+        height: 'inherit',
         '&$disabled': {
           cursor: 'not-allowed'
         }
@@ -470,7 +506,8 @@ export const mainTheme = createTheme({
       },
       icon: {
         color: colors.grey[600],
-        right: 2
+        right: 2,
+        top: 'auto'
       }
     },
     MuiPaper: {
@@ -534,9 +571,15 @@ export const mainTheme = createTheme({
         }
       }
     },
+    MuiFormControl: {
+      root: {
+        justifyContent: 'center'
+      }
+    },
     MuiFormControlLabel: {
       root: {
         marginLeft: 0,
+        marginBottom: 0,
 
         '&$disabled': {
           cursor: 'not-allowed',
@@ -548,43 +591,6 @@ export const mainTheme = createTheme({
       paperAnchorDockedLeft: {
         border: 'none',
         boxShadow: `inset -1px 0 0 0 ${colors.grey[200]}`
-      }
-    },
-    MuiTab: {
-      root: {
-        fontSize: 13,
-        fontWeight: 400,
-        textTransform: 'none',
-        minHeight: '56px',
-
-        '&:hover': {
-          boxShadow: `inset 0px -3px 0px 0px ${colors.secondary[400]}`
-        },
-
-        '@media (min-width:600px)': {
-          minWidth: 'fit-content',
-          marginRight: 32,
-          paddingRight: 0,
-          paddingLeft: 0
-        }
-      },
-      textColorPrimary: {
-        color: colors.grey[900],
-        '&$selected': {
-          color: colors.grey[900]
-        }
-      }
-    },
-    MuiTabs: {
-      indicator: {
-        background: colors.secondary[900],
-        height: 3,
-        '&:hover': {
-          backgroundColor: colors.secondary[400]
-        }
-      },
-      fixed: {
-        boxShadow: `inset 0 -1px ${colors.grey[300] ?? ''}`
       }
     },
     MuiDialog: {
@@ -604,7 +610,10 @@ export const mainTheme = createTheme({
     MuiDialogActions: {
       root: {
         background: colors.grey[200],
-        padding: '16px'
+        padding: '16px',
+        '& .MuiButtonBase-root': {
+          height: 44
+        }
       }
     },
     MuiTooltip: {
@@ -628,6 +637,22 @@ export const mainTheme = createTheme({
         '@media (min-width: 600px)': {
           margin: '8px -2px'
         }
+      }
+    },
+    MuiTabs: {
+      root: {
+        '& .MuiTabs-indicator': {
+          backgroundColor: colors.orange[500],
+          height: 4
+        },
+        '& .MuiButtonBase-root': {
+          padding: 0,
+          textTransform: 'none',
+          fontSize: 14,
+          fontWeight: 500,
+          color: colors.ybacolors.labelBackground
+        },
+        borderBottom: `1px solid ${colors.ybacolors.ybBorderGray}`
       }
     },
     MuiSnackbar: {
@@ -777,7 +802,7 @@ export const mainTheme = createTheme({
       },
       sizeSmall: {
         padding: 0,
-        lineHeight: '32px'
+        lineHeight: '50px'
       },
       head: {
         fontSize: 11.5,

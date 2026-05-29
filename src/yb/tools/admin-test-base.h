@@ -1,4 +1,4 @@
-// Copyright (c) YugaByte, Inc.
+// Copyright (c) YugabyteDB, Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License"); you may not use this file except
 // in compliance with the License.  You may obtain a copy of the License at
@@ -14,6 +14,8 @@
 #pragma once
 
 #include <rapidjson/document.h>
+
+#include "yb/common/json_util.h"
 
 #include "yb/integration-tests/ts_itest-base.h"
 
@@ -32,13 +34,22 @@ class AdminTestBase : public tserver::TabletServerIntegrationTestBase {
  public:
   // Figure out where the admin tool is.
   std::string GetAdminToolPath() const;
+  std::string GetTSCliToolPath() const;
 
   std::string GetMasterAddresses() const;
+  std::string GetTServerAddress(int idx = 0) const;
 
   template <class... Args>
   Result<std::string> CallAdmin(Args&&... args) {
     return CallAdminVec(ToStringVector(
-        GetAdminToolPath(), "-master_addresses", GetMasterAddresses(),
+        GetAdminToolPath(), "--master_addresses", GetMasterAddresses(),
+        std::forward<Args>(args)...));
+  }
+
+  template <class... Args>
+  Result<std::string> CallTSCli(Args&&... args) {
+    return CallAdminVec(ToStringVector(
+        GetTSCliToolPath(), "-server_address", GetTServerAddress(),
         std::forward<Args>(args)...));
   }
 
@@ -46,10 +57,8 @@ class AdminTestBase : public tserver::TabletServerIntegrationTestBase {
 
   template <class... Args>
   Result<rapidjson::Document> CallJsonAdmin(Args&&... args) {
-    return ParseJson(VERIFY_RESULT(CallAdmin(std::forward<Args>(args)...)));
+    return common::ParseJson(VERIFY_RESULT(CallAdmin(std::forward<Args>(args)...)));
   }
-
-  Result<rapidjson::Document> ParseJson(const std::string& raw);
 
   Result<CassandraSession> CqlConnect(const std::string& db_name = std::string());
 
@@ -57,14 +66,11 @@ class AdminTestBase : public tserver::TabletServerIntegrationTestBase {
   std::unique_ptr<CppCassandraDriver> cql_driver_;
 };
 
-Result<const rapidjson::Value&> Get(const rapidjson::Value& value, const char* name);
-Result<rapidjson::Value&> Get(rapidjson::Value* value, const char* name);
-
 // Run a yb-admin command and return the output.
 template <class... Args>
 Result<std::string> RunAdminToolCommand(const std::string& master_addresses, Args&&... args) {
   auto command = ToStringVector(
-      GetToolPath("yb-admin"), "-master_addresses", master_addresses,
+      GetToolPath("yb-admin"), "--master_addresses", master_addresses,
       "--never_fsync=true",
       std::forward<Args>(args)...);
   std::string result;

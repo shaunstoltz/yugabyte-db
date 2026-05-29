@@ -2,10 +2,16 @@ package com.yugabyte.yw.commissioner.tasks.subtasks.xcluster;
 
 import com.yugabyte.yw.commissioner.BaseTaskDependencies;
 import com.yugabyte.yw.commissioner.tasks.XClusterConfigTaskBase;
+import com.yugabyte.yw.common.XClusterUniverseService;
+import com.yugabyte.yw.common.config.RuntimeConfGetter;
+import com.yugabyte.yw.common.config.UniverseConfKeys;
+import com.yugabyte.yw.common.services.config.YbClientConfig;
+import com.yugabyte.yw.common.services.config.YbClientConfigFactory;
 import com.yugabyte.yw.forms.XClusterConfigTaskParams;
 import com.yugabyte.yw.models.HighAvailabilityConfig;
 import com.yugabyte.yw.models.Universe;
 import com.yugabyte.yw.models.XClusterConfig;
+import java.time.Duration;
 import javax.inject.Inject;
 import lombok.extern.slf4j.Slf4j;
 import org.yb.client.SetUniverseReplicationEnabledResponse;
@@ -14,9 +20,18 @@ import org.yb.client.YBClient;
 @Slf4j
 public class SetReplicationPaused extends XClusterConfigTaskBase {
 
+  private final RuntimeConfGetter confGetter;
+  private final YbClientConfigFactory ybClientConfigFactory;
+
   @Inject
-  protected SetReplicationPaused(BaseTaskDependencies baseTaskDependencies) {
-    super(baseTaskDependencies);
+  protected SetReplicationPaused(
+      BaseTaskDependencies baseTaskDependencies,
+      XClusterUniverseService xClusterUniverseService,
+      RuntimeConfGetter confGetter,
+      YbClientConfigFactory ybClientConfigFactory) {
+    super(baseTaskDependencies, xClusterUniverseService);
+    this.confGetter = confGetter;
+    this.ybClientConfigFactory = ybClientConfigFactory;
   }
 
   public static class Params extends XClusterConfigTaskParams {
@@ -44,22 +59,28 @@ public class SetReplicationPaused extends XClusterConfigTaskBase {
 
     XClusterConfig xClusterConfig = getXClusterConfigFromTaskParams();
 
-    // Cannot pause a paused replication or resume an enabled replication.
-    if (xClusterConfig.paused == taskParams().pause) {
-      if (xClusterConfig.paused) {
-        throw new RuntimeException(
-            String.format("XClusterConfig %s is already paused", xClusterConfig));
+    // If the config is already in the requested status, then return.
+    if (xClusterConfig.isPaused() == taskParams().pause) {
+      if (xClusterConfig.isPaused()) {
+        log.warn("XClusterConfig {} is already paused", xClusterConfig);
       } else {
-        throw new RuntimeException(
-            String.format("XClusterConfig %s is already enabled", xClusterConfig));
+        log.warn("XClusterConfig {} is already enabled", xClusterConfig);
       }
+      return;
     }
 
-    Universe targetUniverse = Universe.getOrBadRequest(xClusterConfig.targetUniverseUUID);
-    String targetUniverseMasterAddresses = targetUniverse.getMasterAddresses();
-    String targetUniverseCertificate = targetUniverse.getCertificateNodetoNode();
-    try (YBClient client =
-        ybService.getClient(targetUniverseMasterAddresses, targetUniverseCertificate)) {
+    Universe targetUniverse = Universe.getOrBadRequest(xClusterConfig.getTargetUniverseUUID());
+    Duration pauseRpcTimeout =
+        confGetter.getConfForScope(targetUniverse, UniverseConfKeys.xclusterPauseRpcTimeout);
+
+    YbClientConfig clientConfig =
+        this.ybClientConfigFactory.create(
+            targetUniverse.getMasterAddresses(),
+            targetUniverse.getCertificateNodetoNode(),
+            pauseRpcTimeout.toMillis(),
+            pauseRpcTimeout.toMillis(),
+            pauseRpcTimeout.toMillis());
+    try (YBClient client = ybService.getClientWithConfig(clientConfig)) {
       SetUniverseReplicationEnabledResponse resp =
           client.setUniverseReplicationEnabled(
               xClusterConfig.getReplicationGroupName(), !taskParams().pause /* active */);
@@ -71,11 +92,11 @@ public class SetReplicationPaused extends XClusterConfigTaskBase {
       }
 
       if (HighAvailabilityConfig.get().isPresent()) {
-        getUniverse(true).incrementVersion();
+        getUniverse().incrementVersion();
       }
 
       // Save the pause state in the DB.
-      xClusterConfig.setPaused(taskParams().pause);
+      xClusterConfig.updatePaused(taskParams().pause);
     } catch (Exception e) {
       log.error("{} hit error : {}", getName(), e.getMessage());
       throw new RuntimeException(e);

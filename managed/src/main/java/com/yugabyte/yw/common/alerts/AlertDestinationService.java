@@ -1,5 +1,5 @@
 /*
- * Copyright 2021 YugaByte, Inc. and Contributors
+ * Copyright 2021 YugabyteDB, Inc. and Contributors
  *
  * Licensed under the Polyform Free Trial License 1.0.0 (the "License"); you
  * may not use this file except in compliance with the License. You
@@ -69,8 +69,7 @@ public class AlertDestinationService {
               + "'. "
               + configurations.size()
               + " alert configurations are linked to it. Examples: "
-              + configurations
-                  .stream()
+              + configurations.stream()
                   .limit(5)
                   .map(AlertConfiguration::getName)
                   .collect(Collectors.toList()));
@@ -96,9 +95,7 @@ public class AlertDestinationService {
     // Next will check that all the channels exist.
     alertChannelService.getOrBadRequest(
         destination.getCustomerUUID(),
-        destination
-            .getChannelsList()
-            .stream()
+        destination.getChannelsList().stream()
             .map(AlertChannel::getUuid)
             .collect(Collectors.toList()));
 

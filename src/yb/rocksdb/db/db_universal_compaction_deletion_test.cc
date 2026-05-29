@@ -1,4 +1,4 @@
-// Copyright (c) YugaByte, Inc.
+// Copyright (c) YugabyteDB, Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License"); you may not use this file except
 // in compliance with the License.  You may obtain a copy of the License at
@@ -39,7 +39,7 @@ class OnFileCreationListener : public EventListener {
 
     bool do_pause;
     {
-      std::lock_guard<std::mutex> l(mutex_);
+      std::lock_guard l(mutex_);
       created_file_names_.push_back(file_name);
       do_pause = created_file_names_.size() > pause_after_num_files_created_;
     }
@@ -47,7 +47,7 @@ class OnFileCreationListener : public EventListener {
     if (do_pause) {
       ASSERT_OK(yb::LoggedWaitFor(
           [this, &file_name] {
-            std::lock_guard<std::mutex> l(mutex_);
+            std::lock_guard l(mutex_);
             return file_names_to_resume_.erase(file_name) > 0;
           }, kWaitTimeout, yb::Format("Pausing on $0 ...", file_name)));
     }
@@ -64,22 +64,22 @@ class OnFileCreationListener : public EventListener {
   }
 
   void ResumeFileName(const std::string& file_name) {
-    std::lock_guard<std::mutex> l(mutex_);
+    std::lock_guard l(mutex_);
     file_names_to_resume_.insert(file_name);
   }
 
   std::vector<std::string> CreatedFileNames() {
-    std::lock_guard<std::mutex> l(mutex_);
+    std::lock_guard l(mutex_);
     return created_file_names_;
   }
 
   const std::string& GetLastCreatedFileName() {
-    std::lock_guard<std::mutex> l(mutex_);
+    std::lock_guard l(mutex_);
     return created_file_names_.back();
   }
 
   size_t NumFilesCreated() {
-    std::lock_guard<std::mutex> l(mutex_);
+    std::lock_guard l(mutex_);
     return created_file_names_.size();
   }
 

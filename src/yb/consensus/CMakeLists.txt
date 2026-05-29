@@ -15,9 +15,9 @@
 # specific language governing permissions and limitations
 # under the License.
 #
-# The following only applies to changes made to this file as part of YugaByte development.
+# The following only applies to changes made to this file as part of YugabyteDB development.
 #
-# Portions Copyright (c) YugaByte, Inc.
+# Portions Copyright (c) YugabyteDB, Inc.
 #
 # Licensed under the Apache License, Version 2.0 (the "License"); you may not use this file except
 # in compliance with the License.  You may obtain a copy of the License at
@@ -31,7 +31,6 @@
 #
 
 set(YB_PCH_PREFIX consensus)
-set(YB_PCH_DEP_LIBS opid_proto)
 
 #########################################
 # consensus_metadata_proto
@@ -78,11 +77,6 @@ ADD_YB_LIBRARY(consensus_proto
   DEPS ${CONSENSUS_YRPC_LIBS}
   NONLINK_DEPS ${CONSENSUS_YRPC_TGTS})
 
-ADD_YB_LIBRARY(
-  consensus_error
-  SRCS consensus_error.cc
-  DEPS consensus_proto yb_util)
-
 #########################################
 # log_proto
 #########################################
@@ -106,7 +100,6 @@ set(LOG_SRCS
   log_index.cc
   log_reader.cc
   log_metrics.cc
-  ${LOG_SRCS_EXTENSIONS}
 )
 
 add_library(log ${LOG_SRCS})
@@ -138,10 +131,15 @@ set(CONSENSUS_SRCS
   retryable_requests.cc)
 
 ADD_YB_LIBRARY(consensus SRCS ${CONSENSUS_SRCS})
+
 add_dependencies(consensus gen_src_yb_rpc_any_proto)
+add_dependencies(consensus cdc_service_proto)
+add_dependencies(consensus gen_src_yb_master_master_client_proto)
+add_dependencies(consensus gen_src_yb_master_master_types_proto)
+add_dependencies(consensus gen_src_yb_tserver_pg_client_proto)
+add_dependencies(consensus gen_src_yb_tserver_tserver_service_proto)
 
 target_link_libraries(consensus
-  consensus_error
   consensus_proto
   yb_common
   log
@@ -152,7 +150,6 @@ set(YB_TEST_LINK_LIBS
   log
   rpc_test_util
   tserver
-  tablet_error
   yb_common_test_util
   yb_util
   yb_common_test_util
@@ -182,6 +179,8 @@ add_executable(log-dump log-dump.cc)
 target_link_libraries(log-dump
   log
   yb_docdb
-  yb_ql_common
+  encryption
+  yb_tools_util
+  tablet_metadata
   ${YB_BASE_LIBS})
 add_dependencies(log-dump gen_src_yb_rpc_any_proto)

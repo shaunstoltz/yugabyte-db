@@ -1,5 +1,5 @@
 /*
- * Copyright 2019 YugaByte, Inc. and Contributors
+ * Copyright 2019 YugabyteDB, Inc. and Contributors
  *
  * Licensed under the Polyform Free Trial License 1.0.0 (the "License"); you
  * may not use this file except in compliance with the License. You
@@ -45,7 +45,7 @@ public class UpdateSoftwareVersion extends UniverseTaskBase {
 
   @Override
   public String getName() {
-    return super.getName() + "(" + taskParams().universeUUID + ")";
+    return super.getName() + "(" + taskParams().getUniverseUUID() + ")";
   }
 
   @Override
@@ -62,7 +62,7 @@ public class UpdateSoftwareVersion extends UniverseTaskBase {
               UniverseDefinitionTaskParams universeDetails = universe.getUniverseDetails();
               if (!universeDetails.updateInProgress) {
                 String errMsg =
-                    "UserUniverse " + taskParams().universeUUID + " is not being edited.";
+                    "UserUniverse " + taskParams().getUniverseUUID() + " is not being edited.";
                 log.error(errMsg);
                 throw new RuntimeException(errMsg);
               }

@@ -1,29 +1,19 @@
-// Copyright (c) YugaByte, Inc.
+// Copyright (c) YugabyteDB, Inc.
 
 package com.yugabyte.yw.models;
 
 import static io.swagger.annotations.ApiModelProperty.AccessMode.READ_ONLY;
 
 import com.fasterxml.jackson.annotation.JsonProperty;
-import com.yugabyte.yw.metrics.MetricQueryContext;
-import com.yugabyte.yw.metrics.MetricSettings;
-import com.yugabyte.yw.metrics.NodeAggregation;
-import com.yugabyte.yw.metrics.TimeAggregation;
+import com.yugabyte.yw.metrics.*;
 import io.swagger.annotations.ApiModel;
 import io.swagger.annotations.ApiModelProperty;
-import java.util.ArrayList;
-import java.util.Arrays;
-import java.util.HashMap;
-import java.util.HashSet;
-import java.util.LinkedHashMap;
-import java.util.List;
-import java.util.Map;
-import java.util.Set;
+import java.util.*;
 import java.util.regex.Pattern;
 import java.util.stream.Collectors;
 import lombok.Data;
 import lombok.experimental.Accessors;
-import org.apache.commons.collections.CollectionUtils;
+import org.apache.commons.collections4.CollectionUtils;
 import org.apache.commons.lang3.StringUtils;
 
 @ApiModel(description = "Metric configuration definition")
@@ -75,6 +65,10 @@ public class MetricConfigDefinition {
 
   @ApiModelProperty(value = "Metric filters", accessMode = READ_ONLY)
   private Map<String, String> filters = new HashMap<>();
+
+  @ApiModelProperty(value = "Metric exclude filters", accessMode = READ_ONLY)
+  @JsonProperty("exclude_filters")
+  private Map<String, String> excludeFilters = new HashMap<>();
 
   @ApiModelProperty(value = "Fields, used to group metric query result", accessMode = READ_ONLY)
   @JsonProperty("group_by")
@@ -149,6 +143,25 @@ public class MetricConfigDefinition {
                   + " for top/bottom K query");
       }
     }
+    if (context.isSecondLevelAggregation()) {
+      String queryStr =
+          settings.getAggregatedValueFunction().getAggregationFunction() + "(" + query + ")";
+      if (groupBy != null) {
+        Set<String> groupBySet = new HashSet<>();
+        Set<String> additionalGroupBySet = MetricQueryExecutor.getAdditionalGroupBy(settings);
+        groupBySet.addAll(
+            Arrays.stream(groupBy.split(","))
+                // Drop labels used in the current metric split as want to aggregate across these.
+                .filter(
+                    (label) ->
+                        StringUtils.isNotBlank(label) && !additionalGroupBySet.contains(label))
+                .collect(Collectors.toSet()));
+        if (!groupBySet.isEmpty()) {
+          queryStr = String.format("%s by (%s)", queryStr, String.join(", ", groupBySet));
+        }
+      }
+      return queryStr;
+    }
     return query;
   }
 
@@ -180,7 +193,10 @@ public class MetricConfigDefinition {
       String sumQuery = getQuery(MetricSettings.defaultSettings(metricPrefix + "_sum"), context);
       String countQuery =
           getQuery(MetricSettings.defaultSettings(metricPrefix + "_count"), context);
-      return "(" + sumQuery + ") / (" + countQuery + ")";
+      return context.isSecondLevelAggregation()
+          // Filter out the `NaN` values from divide by 0 when performing second level aggregation.
+          ? String.format("(%s) / (%s != 0)", sumQuery, countQuery, countQuery)
+          : String.format("(%s) / (%s)", sumQuery, countQuery);
     } else if (metric.contains("/")) {
       String[] metricNames = metric.split("/");
       MetricConfigDefinition numerator = MetricConfig.get(metricNames[0]).getConfig();
@@ -189,7 +205,10 @@ public class MetricConfigDefinition {
           numerator.getQuery(MetricSettings.defaultSettings(numerator.metric), context);
       String denomQuery =
           denominator.getQuery(MetricSettings.defaultSettings(denominator.metric), context);
-      return String.format("((%s)/(%s))*100", numQuery, denomQuery);
+      return context.isSecondLevelAggregation()
+          // Filter out the `NaN` values from divide by 0 when performing second level aggregation.
+          ? String.format("((%s) / (%s != 0)) * 100", numQuery, denomQuery, denomQuery)
+          : String.format("((%s) / (%s)) * 100", numQuery, denomQuery);
     }
 
     String queryStr;
@@ -198,6 +217,7 @@ public class MetricConfigDefinition {
 
     // If we have additional filters, we add them
     Map<String, String> allFilters = new HashMap<>(filters);
+    Map<String, String> allExcludeFilters = new HashMap<>(excludeFilters);
     if (!context.getAdditionalFilters().isEmpty()) {
       allFilters.putAll(context.getAdditionalFilters());
       // The kubelet volume metrics only has the persistentvolumeclain field
@@ -212,9 +232,9 @@ public class MetricConfigDefinition {
         allFilters.remove("persistentvolumeclaim");
       }
     }
-
-    if (!allFilters.isEmpty()) {
-      query.append(filtersToString(allFilters, context.getExcludeFilters()));
+    allExcludeFilters.putAll(context.getExcludeFilters());
+    if (!allFilters.isEmpty() || !allExcludeFilters.isEmpty()) {
+      query.append(filtersToString(allFilters, allExcludeFilters));
     }
 
     // Range is applicable only when we have functions
@@ -252,6 +272,16 @@ public class MetricConfigDefinition {
         if (functionName.startsWith("quantile_over_time")) {
           String percentile = functionName.split("[.]")[1];
           queryStr = String.format("quantile_over_time(0.%s, %s)", percentile, queryStr);
+        } else if (functionName.equals("subtract_metric")) {
+          queryStr = String.format("%s - %s", queryStr, metric);
+        } else if (functionName.startsWith("topk") || functionName.startsWith("bottomk")) {
+          if (settings.getSplitMode() != SplitMode.NONE) {
+            // TopK/BottomK is requested explicitly. Just ignore default split.
+            continue;
+          }
+          String fun = functionName.split("[.]")[0];
+          String count = functionName.split("[.]")[1];
+          queryStr = String.format(fun + "(%s, %s)", count, queryStr);
         } else {
           queryStr = String.format("%s(%s)", functionName, queryStr);
         }

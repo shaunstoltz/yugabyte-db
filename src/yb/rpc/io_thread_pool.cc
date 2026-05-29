@@ -1,5 +1,5 @@
 //
-// Copyright (c) YugaByte, Inc.
+// Copyright (c) YugabyteDB, Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License"); you may not use this file except
 // in compliance with the License.  You may obtain a copy of the License at
@@ -18,9 +18,9 @@
 #include <thread>
 
 #include <boost/asio/io_service.hpp>
-#include <boost/optional.hpp>
-#include <glog/logging.h>
 
+#include "yb/util/cgroups.h"
+#include "yb/util/logging.h"
 #include "yb/util/status_log.h"
 #include "yb/util/thread.h"
 
@@ -31,7 +31,8 @@ namespace rpc {
 
 class IoThreadPool::Impl {
  public:
-  Impl(const std::string& name, size_t num_threads) : name_(name) {
+  Impl(const std::string& name, size_t num_threads, Cgroup* cgroup)
+      : name_(name), cgroup_(cgroup) {
     threads_.reserve(num_threads);
     size_t index = 0;
     while (threads_.size() != num_threads) {
@@ -59,7 +60,7 @@ class IoThreadPool::Impl {
     auto deadline = std::chrono::steady_clock::now() + 15s;
     while (!io_service_.stopped()) {
       if (std::chrono::steady_clock::now() >= deadline) {
-        LOG(ERROR) << "Io service failed to stop";
+        LOG(WARNING) << "Io service failed to stop";
         io_service_.stop();
         break;
       }
@@ -72,19 +73,26 @@ class IoThreadPool::Impl {
 
  private:
   void Execute() {
+#ifdef __linux__
+    if (cgroup_) {
+      WARN_NOT_OK(cgroup_->MoveCurrentThreadToGroup(),
+                  "Failed to move iotp thread to cgroup");
+    }
+#endif
     boost::system::error_code ec;
     io_service_.run(ec);
-    LOG_IF(ERROR, ec) << "Failed to run io service: " << ec;
+    LOG_IF(DFATAL, ec) << "Failed to run io service: " << ec;
   }
 
   std::string name_;
+  [[maybe_unused]] Cgroup* cgroup_;
   std::vector<ThreadPtr> threads_;
   IoService io_service_;
-  boost::optional<IoService::work> work_{io_service_};
+  std::optional<IoService::work> work_{io_service_};
 };
 
-IoThreadPool::IoThreadPool(const std::string& name, size_t num_threads)
-    : impl_(new Impl(name, num_threads)) {}
+IoThreadPool::IoThreadPool(const std::string& name, size_t num_threads, Cgroup* cgroup)
+    : impl_(new Impl(name, num_threads, cgroup)) {}
 
 IoThreadPool::~IoThreadPool() {}
 

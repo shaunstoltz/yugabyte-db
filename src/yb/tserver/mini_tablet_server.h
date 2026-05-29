@@ -15,9 +15,9 @@
 // specific language governing permissions and limitations
 // under the License.
 //
-// The following only applies to changes made to this file as part of YugaByte development.
+// The following only applies to changes made to this file as part of YugabyteDB development.
 //
-// Portions Copyright (c) YugaByte, Inc.
+// Portions Copyright (c) YugabyteDB, Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License"); you may not use this file except
 // in compliance with the License.  You may obtain a copy of the License at
@@ -31,10 +31,12 @@
 //
 #pragma once
 
+#include <functional>
 #include <string>
 
 #include "yb/common/common_fwd.h"
 #include "yb/common/common_types.pb.h"
+#include "yb/common/entity_ids_types.h"
 
 #include "yb/docdb/docdb_fwd.h"
 
@@ -42,6 +44,7 @@
 
 #include "yb/gutil/macros.h"
 #include "yb/tablet/tablet_fwd.h"
+#include "yb/tablet/tablet_types.pb.h"
 #include "yb/tserver/tablet_server_options.h"
 #include "yb/util/net/sockaddr.h"
 #include "yb/util/status_fwd.h"
@@ -50,13 +53,19 @@ namespace yb {
 
 class FsManager;
 
+namespace pgwrapper {
+struct PGConnSettings;
+}  // namespace pgwrapper
+
 namespace consensus {
 class RaftConfigPB;
-} // namespace consensus
+}  // namespace consensus
 
 namespace tserver {
 
 class TabletServer;
+
+YB_STRONGLY_TYPED_BOOL(WaitTabletsBootstrapped);
 
 // An in-process tablet server meant for use in test cases.
 class MiniTabletServer {
@@ -65,6 +74,9 @@ class MiniTabletServer {
       const std::string& fs_root,
       uint16_t rpc_port,
       int index = 0);
+
+  static Result<std::unique_ptr<MiniTabletServer>> CreateMiniTabletServer(
+    const std::vector<std::string>& fs_roots, uint16_t rpc_port, int index = 0);
 
   MiniTabletServer(const std::vector<std::string>& wal_paths,
                    const std::vector<std::string>& data_paths,
@@ -83,42 +95,63 @@ class MiniTabletServer {
   // an ephemeral port. To determine the address that the server
   // bound to, call MiniTabletServer::bound_addr().
   // The TS will be initialized asynchronously and then started.
-  Status Start();
+  // if wait_tablets_bootstrapped=true, then Waits for the tablet
+  // server to be fully initialized, including
+  // having all its tablets bootstrapped.
+  Status Start(
+      WaitTabletsBootstrapped wait_tablets_bootstrapped = WaitTabletsBootstrapped::kTrue);
+
+  Status StartPgIfConfigured();
+
+  std::string ToString() const;
 
   // Waits for the tablet server to be fully initialized, including
   // having all tablets bootstrapped.
   Status WaitStarted();
 
   void Shutdown();
+
+  // Deletes the specified tablet directly through the tablet manager.
+  // delete_state: should be either TABLET_DATA_DELETED or TABLET_DATA_TOMBSTONED.
+  // keep_on_disk: whether to keep data on disk.
+  Status DeleteTablet(
+      const TabletId& tablet_id, tablet::TabletDataState delete_state, bool keep_on_disk = false);
+
   Status FlushTablets(
       tablet::FlushMode mode = tablet::FlushMode::kSync,
       tablet::FlushFlags flags = tablet::FlushFlags::kAllDbs);
   Status CompactTablets(docdb::SkipFlush skip_flush = docdb::SkipFlush::kFalse);
+  Status CompactTablet(
+      const TabletId& tablet_id, docdb::SkipFlush skip_flush = docdb::SkipFlush::kFalse);
   Status SwitchMemtables();
   Status CleanTabletLogs();
 
   // Stop and start the tablet server on the same RPC and webserver ports. The tserver must be
   // running.
-  Status Restart();
-  Status RestartStoppedServer();
+  Status Restart(
+      WaitTabletsBootstrapped wait_tablets_bootstrapped = WaitTabletsBootstrapped::kFalse);
+  Status RestartStoppedServer(
+      WaitTabletsBootstrapped wait_tablets_bootstrapped = WaitTabletsBootstrapped::kFalse);
 
   // Add a new tablet to the test server, use the default consensus configuration.
   //
   // Requires that the server has already been started with Start().
-  Status AddTestTablet(const std::string& ns_id,
-                       const std::string& table_id,
-                       const std::string& tablet_id,
-                       const Schema& schema,
-                       TableType table_type);
+  Status AddTestTablet(
+      const std::string& ns_id,
+      const std::string& table_id,
+      const std::string& tablet_id,
+      const Schema& schema,
+      TableType table_type);
 
   // Add a new tablet to the test server and specify the consensus configuration
   // for the tablet.
-  Status AddTestTablet(const std::string& ns_id,
-                       const std::string& table_id,
-                       const std::string& tablet_id,
-                       const Schema& schema,
-                       const consensus::RaftConfigPB& config,
-                       TableType table_type);
+  Status AddTestTablet(
+      const std::string& ns_id,
+      const std::string& table_id,
+      const std::string& tablet_id,
+      const Schema& schema,
+      const consensus::RaftConfigPB& config,
+      TableType table_type);
 
   // Create a RaftConfigPB which should be used to create a local-only
   // tablet on the given tablet server.
@@ -142,18 +175,30 @@ class MiniTabletServer {
   Status Reconnect();
 
   FsManager& fs_manager() const;
+  MetricEntity& metric_entity() const;
+  const std::shared_ptr<MemTracker>& mem_tracker() const;
+  HybridTime Now() const;
+
+  void SetPgServerHandlers(
+      std::function<Status(void)> start_pg, std::function<void(void)> shutdown_pg,
+      std::function<pgwrapper::PGConnSettings(void)> get_pg_conn_settings);
+  void set_pgsql_proxy_bind_address(const std::string& pgsql_proxy_bind_address) {
+    pgsql_proxy_bind_address_ = pgsql_proxy_bind_address;
+  }
 
  private:
   bool started_;
   TabletServerOptions opts_;
   int index_;
 
-  std::unique_ptr<encryption::UniverseKeyManager> universe_key_manager_;
-  std::unique_ptr<yb::Env> encrypted_env_;
-  std::unique_ptr<rocksdb::Env> rocksdb_encrypted_env_;
   std::unique_ptr<TabletServer> server_;
   std::unique_ptr<Tunnel> tunnel_;
+
+  std::function<Status(void)> start_pg_;
+  std::function<void(void)> shutdown_pg_;
+  std::function<pgwrapper::PGConnSettings(void)> get_pg_conn_settings_;
+  std::string pgsql_proxy_bind_address_;
 };
 
-} // namespace tserver
+}  // namespace tserver
 } // namespace yb

@@ -1,8 +1,8 @@
 // Copyright 2012 Google Inc. All Rights Reserved.
 //
-// The following only applies to changes made to this file as part of YugaByte development.
+// The following only applies to changes made to this file as part of YugabyteDB development.
 //
-// Portions Copyright (c) YugaByte, Inc.
+// Portions Copyright (c) YugabyteDB, Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License"); you may not use this file except
 // in compliance with the License.  You may obtain a copy of the License at
@@ -47,7 +47,8 @@
 
 #include <memory>
 
-#include <glog/logging.h>
+#include "yb/util/logging.h"
+#include "yb/util/monotime.h"
 
 #if defined(__APPLE__)
 namespace walltime_internal {
@@ -259,4 +260,10 @@ void GetThreadUserAndSysCpuTimeMicros(MicrosecondsInt64 *user, MicrosecondsInt64
     *sys = usage.ru_stime.tv_sec * 1e6L + usage.ru_stime.tv_usec;
   }
 #endif
+}
+
+uint64_t FastClockNanos() {
+  timespec ts;
+  clock_gettime(CLOCK_MONOTONIC_RAW, &ts);
+  return ts.tv_sec * yb::MonoTime::kNanosecondsPerSecond + ts.tv_nsec;
 }

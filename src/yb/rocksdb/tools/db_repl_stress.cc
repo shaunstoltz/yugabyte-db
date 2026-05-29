@@ -3,9 +3,9 @@
 //  LICENSE file in the root directory of this source tree. An additional grant
 //  of patent rights can be found in the PATENTS file in the same directory.
 //
-// The following only applies to changes made to this file as part of YugaByte development.
+// The following only applies to changes made to this file as part of YugabyteDB development.
 //
-// Portions Copyright (c) YugaByte, Inc.
+// Portions Copyright (c) YugabyteDB, Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License"); you may not use this file except
 // in compliance with the License.  You may obtain a copy of the License at
@@ -106,11 +106,12 @@ static void ReplicationThreadBody(void* arg) {
   }
 }
 
-DEFINE_UNKNOWN_uint64(num_inserts, 1000, "the num of inserts the first thread should"
+DEFINE_NON_RUNTIME_uint64(num_inserts, 1000,
+    "the num of inserts the first thread should"
     " perform.");
-DEFINE_UNKNOWN_uint64(wal_ttl_seconds, 1000, "the wal ttl for the run(in seconds)");
-DEFINE_UNKNOWN_uint64(wal_size_limit_MB, 10, "the wal size limit for the run"
-    "(in MB)");
+DEFINE_NON_RUNTIME_uint64(wal_ttl_seconds, 1000, "the wal ttl for the run(in seconds)");
+DEFINE_NON_RUNTIME_uint64(wal_size_limit_MB, 10,
+    "the wal size limit for the run (in MB)");
 
 int db_repl_stress(int argc, const char** argv) {
   SetUsageMessage(

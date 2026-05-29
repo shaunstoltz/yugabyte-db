@@ -1,5 +1,5 @@
 /*
- * Copyright 2021 YugaByte, Inc. and Contributors
+ * Copyright 2021 YugabyteDB, Inc. and Contributors
  *
  * Licensed under the Polyform Free Trial License 1.0.0 (the "License"); you
  * may not use this file except in compliance with the License. You
@@ -10,40 +10,35 @@
  */
 package com.yugabyte.yw.common.kms.util.hashicorpvault;
 
-import com.yugabyte.yw.common.kms.util.HashicorpEARServiceUtil;
-import com.yugabyte.yw.common.kms.util.EncryptionAtRestUtil.KeyType;
-import com.yugabyte.yw.common.kms.util.hashicorpvault.VaultSecretEngineBase.KMSEngineType;
-import com.yugabyte.yw.common.kms.util.hashicorpvault.VaultSecretEngineBase.VaultOperations;
-
-import play.libs.Json;
+import static org.junit.Assert.assertEquals;
+import static org.junit.Assert.assertNotEquals;
+import static org.junit.Assert.assertTrue;
+import static org.mockito.ArgumentMatchers.anyString;
+import static org.mockito.Mockito.any;
+import static org.mockito.Mockito.mock;
+import static org.mockito.Mockito.mockingDetails;
+import static org.mockito.Mockito.times;
+import static org.mockito.Mockito.verify;
+import static org.mockito.Mockito.when;
 
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.fasterxml.jackson.databind.node.ObjectNode;
 import com.yugabyte.yw.common.FakeDBApplication;
-
+import com.yugabyte.yw.common.kms.util.EncryptionAtRestUtil.KeyType;
+import com.yugabyte.yw.common.kms.util.HashicorpEARServiceUtil;
+import com.yugabyte.yw.common.kms.util.hashicorpvault.VaultSecretEngineBase.KMSEngineType;
+import com.yugabyte.yw.common.kms.util.hashicorpvault.VaultSecretEngineBase.VaultOperations;
 import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
 import java.util.Base64;
 import java.util.HashMap;
 import java.util.Map;
 import java.util.UUID;
-
-import static org.mockito.ArgumentMatchers.anyString;
-import static org.mockito.Mockito.any;
-import static org.mockito.Mockito.mock;
-import static org.mockito.Mockito.times;
-import static org.mockito.Mockito.verify;
-import static org.mockito.Mockito.when;
-import static org.mockito.Mockito.mockingDetails;
-
-import static org.junit.Assert.assertEquals;
-import static org.junit.Assert.assertNotEquals;
-import static org.junit.Assert.assertTrue;
 import org.junit.Before;
 import org.junit.Test;
-
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
+import play.libs.Json;
 
 public class VaultTransitTest extends FakeDBApplication {
   protected static final Logger LOG = LoggerFactory.getLogger(VaultTransitTest.class);
@@ -158,8 +153,7 @@ public class VaultTransitTest extends FakeDBApplication {
 
     transitEngine = new VaultTransit(vAccessor, mountPath, KeyType.CMK);
 
-    String returnedName =
-        HashicorpEARServiceUtil.getVaultKeyForUniverse(configUUID, fakeAuthConfig);
+    String returnedName = HashicorpEARServiceUtil.getVaultKeyForUniverse(fakeAuthConfig);
     assertEquals(keyName, returnedName);
 
     boolean created = transitEngine.createNewKeyWithEngine(returnedName);

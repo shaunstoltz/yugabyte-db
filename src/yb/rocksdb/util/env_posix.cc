@@ -3,9 +3,9 @@
 //  LICENSE file in the root directory of this source tree. An additional grant
 //  of patent rights can be found in the PATENTS file in the same directory.
 //
-// The following only applies to changes made to this file as part of YugaByte development.
+// The following only applies to changes made to this file as part of YugabyteDB development.
 //
-// Portions Copyright (c) YugaByte, Inc.
+// Portions Copyright (c) YugabyteDB, Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License"); you may not use this file except
 // in compliance with the License.  You may obtain a copy of the License at
@@ -57,13 +57,13 @@
 #include "yb/rocksdb/util/thread_posix.h"
 #include "yb/rocksdb/util/posix_logger.h"
 #include "yb/rocksdb/util/random.h"
-#include "yb/rocksdb/util/sync_point.h"
 #include "yb/rocksdb/util/thread_local.h"
 
 #include "yb/util/logging.h"
 #include "yb/util/slice.h"
 #include "yb/util/stats/iostats_context_imp.h"
 #include "yb/util/string_util.h"
+#include "yb/util/sync_point.h"
 
 #if !defined(TMPFS_MAGIC)
 #define TMPFS_MAGIC 0x01021994
@@ -77,10 +77,7 @@
 
 #include "yb/util/file_system_posix.h"
 
-using std::unique_ptr;
-using std::shared_ptr;
-
-#define STATUS_IO_ERROR(context, err_number) STATUS(IOError, (context), strerror(err_number))
+DECLARE_int32(min_thread_stack_size_bytes);
 
 namespace rocksdb {
 
@@ -134,11 +131,7 @@ void SetFD_CLOEXEC(int fd, const EnvOptions* options) {
   }
 }
 
-class PosixFileLock : public FileLock {
- public:
-  int fd_;
-  std::string filename;
-};
+using yb::PosixFileLock;
 
 class PosixEnv : public Env {
  public:
@@ -155,26 +148,26 @@ class PosixEnv : public Env {
   }
 
   virtual Status NewSequentialFile(const std::string& fname,
-                                   unique_ptr<SequentialFile>* result,
+                                   std::unique_ptr<SequentialFile>* result,
                                    const EnvOptions& options) override {
     return file_factory_->NewSequentialFile(fname, result, options);
   }
 
   virtual Status NewRandomAccessFile(const std::string& fname,
-                                     unique_ptr<RandomAccessFile>* result,
+                                     std::unique_ptr<RandomAccessFile>* result,
                                      const EnvOptions& options) override {
     return file_factory_->NewRandomAccessFile(fname, result, options);
   }
 
   virtual Status NewWritableFile(const std::string& fname,
-                                 unique_ptr<WritableFile>* result,
+                                 std::unique_ptr<WritableFile>* result,
                                  const EnvOptions& options) override {
     return file_factory_->NewWritableFile(fname, result, options);
   }
 
   virtual Status ReuseWritableFile(const std::string& fname,
                                    const std::string& old_fname,
-                                   unique_ptr<WritableFile>* result,
+                                   std::unique_ptr<WritableFile>* result,
                                    const EnvOptions& options) override {
     return file_factory_->ReuseWritableFile(fname, old_fname, result, options);
   }
@@ -184,7 +177,7 @@ class PosixEnv : public Env {
   }
 
   virtual Status NewDirectory(const std::string& name,
-                              unique_ptr<Directory>* result) override {
+                              std::unique_ptr<Directory>* result) override {
     result->reset();
     int fd;
     {
@@ -386,7 +379,28 @@ class PosixEnv : public Env {
   }
 
   virtual Status NewLogger(const std::string& fname,
-                           shared_ptr<Logger>* result) override {
+                           std::shared_ptr<Logger>* result) override {
+#if defined(__APPLE__)
+    // On macOS, use raw fd to avoid the ~32K stdio FILE* stream limit (SHRT_MAX in Apple's libc).
+    int fd;
+    {
+      IOSTATS_TIMER_GUARD(open_nanos);
+      fd = open(fname.c_str(), O_WRONLY | O_CREAT | O_TRUNC, 0644);
+    }
+    if (fd < 0) {
+      result->reset();
+      return STATUS_IO_ERROR(fname, errno);
+    } else {
+#ifdef ROCKSDB_FALLOCATE_PRESENT
+      if (fallocate(fd, FALLOC_FL_KEEP_SIZE, 0, 4 * 1024) != 0) {
+        LOG(WARNING) << STATUS_IO_ERROR(fname, errno);
+      }
+#endif
+      SetFD_CLOEXEC(fd, nullptr);
+      result->reset(new PosixLogger(fname, fd, &PosixEnv::gettid, this));
+      return Status::OK();
+    }
+#else
     FILE* f;
     {
       IOSTATS_TIMER_GUARD(open_nanos);
@@ -398,12 +412,15 @@ class PosixEnv : public Env {
     } else {
       int fd = fileno(f);
 #ifdef ROCKSDB_FALLOCATE_PRESENT
-      fallocate(fd, FALLOC_FL_KEEP_SIZE, 0, 4 * 1024);
+      if (fallocate(fd, FALLOC_FL_KEEP_SIZE, 0, 4 * 1024) != 0) {
+        LOG(WARNING) << STATUS_IO_ERROR(fname, errno);
+      }
 #endif
       SetFD_CLOEXEC(fd, nullptr);
-      result->reset(new PosixLogger(f, &PosixEnv::gettid, this));
+      result->reset(new PosixLogger(fname, f, &PosixEnv::gettid, this));
       return Status::OK();
     }
+#endif // defined(__APPLE__)
   }
 
   uint64_t NowMicros() override {
@@ -428,6 +445,10 @@ class PosixEnv : public Env {
     return std::chrono::duration_cast<std::chrono::nanoseconds>(
        std::chrono::steady_clock::now().time_since_epoch()).count();
 #endif
+  }
+
+  uint64_t NowCpuCycles() override {
+    return CycleClock::Now();
   }
 
   void SleepForMicroseconds(int micros) override { usleep(micros); }
@@ -576,9 +597,25 @@ class PosixRocksDBFileFactory : public RocksDBFileFactory {
   ~PosixRocksDBFileFactory() {}
 
   Status NewSequentialFile(const std::string& fname,
-                           unique_ptr<SequentialFile>* result,
+                           std::unique_ptr<SequentialFile>* result,
                            const EnvOptions& options) override {
     result->reset();
+#if defined(__APPLE__)
+    // On macOS, use raw fd to avoid the ~32K stdio FILE* stream limit (SHRT_MAX in Apple's libc).
+    int fd = -1;
+    do {
+      IOSTATS_TIMER_GUARD(open_nanos);
+      fd = open(fname.c_str(), O_RDONLY);
+    } while (fd < 0 && errno == EINTR);
+    if (fd < 0) {
+      *result = nullptr;
+      return STATUS_IO_ERROR(fname, errno);
+    } else {
+      SetFD_CLOEXEC(fd, &options);
+      *result = std::make_unique<yb::PosixSequentialFile>(fname, fd, options);
+      return Status::OK();
+    }
+#else
     FILE* f = nullptr;
     do {
       IOSTATS_TIMER_GUARD(open_nanos);
@@ -593,10 +630,11 @@ class PosixRocksDBFileFactory : public RocksDBFileFactory {
       *result = std::make_unique<yb::PosixSequentialFile>(fname, f, options);
       return Status::OK();
     }
+#endif // defined(__APPLE__)
   }
 
   Status NewRandomAccessFile(const std::string& fname,
-                             unique_ptr<RandomAccessFile>* result,
+                             std::unique_ptr<RandomAccessFile>* result,
                              const EnvOptions& options) override {
     result->reset();
     Status s;
@@ -630,7 +668,7 @@ class PosixRocksDBFileFactory : public RocksDBFileFactory {
   }
 
   Status NewWritableFile(const std::string& fname,
-                         unique_ptr<WritableFile>* result,
+                         std::unique_ptr<WritableFile>* result,
                          const EnvOptions& options) override {
     result->reset();
     Status s;
@@ -659,7 +697,7 @@ class PosixRocksDBFileFactory : public RocksDBFileFactory {
         // disable mmap writes
         EnvOptions no_mmap_writes_options = options;
         no_mmap_writes_options.use_mmap_writes = false;
-        *result = std::make_unique<PosixWritableFile>(fname, fd, no_mmap_writes_options);
+        *result = std::make_unique<yb::PosixWritableFile>(fname, fd, no_mmap_writes_options);
       }
     }
     return s;
@@ -667,7 +705,7 @@ class PosixRocksDBFileFactory : public RocksDBFileFactory {
 
   Status ReuseWritableFile(const std::string& fname,
                            const std::string& old_fname,
-                           unique_ptr<WritableFile>* result,
+                           std::unique_ptr<WritableFile>* result,
                            const EnvOptions& options) override {
     result->reset();
     Status s;
@@ -703,7 +741,7 @@ class PosixRocksDBFileFactory : public RocksDBFileFactory {
         EnvOptions no_mmap_writes_options = options;
         no_mmap_writes_options.use_mmap_writes = false;
 
-        *result = std::make_unique<PosixWritableFile>(fname, fd, no_mmap_writes_options);
+        *result = std::make_unique<yb::PosixWritableFile>(fname, fd, no_mmap_writes_options);
       }
     }
     return s;
@@ -807,8 +845,17 @@ void PosixEnv::StartThread(void (*function)(void* arg), void* arg) {
   StartThreadState* state = new StartThreadState;
   state->user_function = function;
   state->arg = arg;
+
+  pthread_attr_t attr;
+  ThreadPool::PthreadCall("init thread attributes struct", pthread_attr_init(&attr));
+  if (FLAGS_min_thread_stack_size_bytes > 0) {
+    ThreadPool::PthreadCall(
+        "set min thread stack size",
+        pthread_attr_setstacksize(&attr, FLAGS_min_thread_stack_size_bytes));
+  }
   ThreadPool::PthreadCall(
-      "start thread", pthread_create(&t, nullptr, &StartThreadWrapper, state));
+      "start thread", pthread_create(&t, &attr, &StartThreadWrapper, state));
+
   ThreadPool::PthreadCall("lock", pthread_mutex_lock(&mu_));
   threads_to_join_.push_back(t);
   ThreadPool::PthreadCall("unlock", pthread_mutex_unlock(&mu_));
@@ -862,7 +909,7 @@ Env* Env::Default() {
   ThreadLocalPtr::InitSingletons();
   // Make sure that SyncPoint inited before PosixEnv, to be deleted after it.
 #ifndef NDEBUG
-  SyncPoint::GetInstance();
+  yb::SyncPoint::GetInstance();
 #endif
   static PosixEnv default_env;
   return &default_env;

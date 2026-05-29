@@ -1,4 +1,4 @@
-// Copyright (c) YugaByte, Inc.
+// Copyright (c) YugabyteDB, Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License"); you may not use this file except
 // in compliance with the License.  You may obtain a copy of the License at
@@ -15,11 +15,13 @@
 
 #include "yb/common/common_fwd.h"
 
+#include "yb/util/enums.h"
+
 namespace yb {
 
-// As a result of single dynamic tablet splitting operation we always have kNumSplitParts new
+// As a result of single dynamic tablet splitting operation we always have kDefaultNumSplitParts new
 // post-split tablets.
-constexpr const auto kNumSplitParts = 2;
+constexpr const auto kDefaultNumSplitParts = 2;
 
 constexpr const ColocationId kColocationIdNotSet = 0;
 
@@ -28,16 +30,19 @@ constexpr const ColocationId kColocationIdNotSet = 0;
 // This has been chosen to match FirstNormalObjectId from Postgres code.
 constexpr const ColocationId kFirstNormalColocationId = 16384;
 
-enum SortingType : uint8_t {
-  kNotSpecified = 0,
-  kAscending,          // ASC, NULLS FIRST
-  kDescending,         // DESC, NULLS FIRST
-  kAscendingNullsLast, // ASC, NULLS LAST
-  kDescendingNullsLast // DESC, NULLS LAST
-};
+YB_DEFINE_ENUM(SortingType,
+               (kNotSpecified)
+               (kAscending)           // ASC, NULLS FIRST
+               (kDescending)          // DESC, NULLS FIRST
+               (kAscendingNullsLast)  // ASC, NULLS LAST
+               (kDescendingNullsLast) // DESC, NULLS LAST
+);
 
 static const char* const kObsoleteShortPrimaryTableId = "sys.catalog.uuid";
 
 constexpr auto kPitrFeatureName = "PITR";
+constexpr auto kXClusterFailoverFeatureName = "xCluster failover";
+
+constexpr auto kCDCSDKSlotEntryTabletId = "dummy_id_for_replication_slot";
 
 } // namespace yb

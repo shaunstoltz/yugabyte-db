@@ -1,4 +1,4 @@
-// Copyright (c) YugaByte, Inc.
+// Copyright (c) YugabyteDB, Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License"); you may not use this file except
 // in compliance with the License.  You may obtain a copy of the License at
@@ -24,9 +24,6 @@
 #include "yb/util/status.h"
 #include "yb/util/test_macros.h"
 #include "yb/util/tostring.h"
-
-using std::to_string;
-using std::numeric_limits;
 
 namespace yb {
 namespace common {

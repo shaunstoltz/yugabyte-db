@@ -1,5 +1,5 @@
 //
-// Copyright (c) YugaByte, Inc.
+// Copyright (c) YugabyteDB, Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License"); you may not use this file except
 // in compliance with the License.  You may obtain a copy of the License at
@@ -15,9 +15,6 @@
 
 #include <shared_mutex>
 #include <thread>
-
-#include <boost/optional/optional.hpp>
-#include <boost/optional/optional_io.hpp>
 
 #include "yb/client/client-test-util.h"
 #include "yb/client/error.h"
@@ -38,7 +35,9 @@
 #include "yb/consensus/raft_consensus.h"
 
 #include "yb/docdb/consensus_frontier.h"
-#include "yb/docdb/doc_key.h"
+#include "yb/dockv/doc_key.h"
+#include "yb/docdb/docdb_rocksdb_util.h"
+#include "yb/docdb/docdb_test_util.h"
 
 #include "yb/gutil/casts.h"
 
@@ -65,14 +64,18 @@
 #include "yb/tserver/mini_tablet_server.h"
 #include "yb/tserver/tablet_server.h"
 #include "yb/tserver/ts_tablet_manager.h"
+#include "yb/tserver/tserver_error.h"
 #include "yb/tserver/tserver_service.proxy.h"
 
+#include "yb/tserver/tserver_xcluster_context_if.h"
 #include "yb/util/backoff_waiter.h"
+#include "yb/util/logging_test_util.h"
 #include "yb/util/random_util.h"
 #include "yb/util/range.h"
 #include "yb/util/shared_lock.h"
 #include "yb/util/status_format.h"
 #include "yb/util/stopwatch.h"
+#include "yb/util/test_thread_holder.h"
 #include "yb/util/tsan_util.h"
 
 #include "yb/yql/cql/ql/util/statement_result.h"
@@ -82,11 +85,13 @@ using std::string;
 
 using namespace std::literals; // NOLINT
 
+DECLARE_string(compression_type);
+DECLARE_int64(db_block_size_bytes);
+DECLARE_int64(db_write_buffer_size);
 DECLARE_uint64(initial_seqno);
 DECLARE_int32(leader_lease_duration_ms);
-DECLARE_int64(db_write_buffer_size);
+DECLARE_int32(ht_lease_duration_ms);
 DECLARE_string(time_source);
-DECLARE_int32(TEST_delay_execute_async_ms);
 DECLARE_int32(retryable_request_timeout_secs);
 DECLARE_bool(enable_lease_revocation);
 DECLARE_bool(rocksdb_disable_compactions);
@@ -95,23 +100,28 @@ DECLARE_int32(rocksdb_level0_stop_writes_trigger);
 DECLARE_bool(flush_rocksdb_on_shutdown);
 DECLARE_int32(memstore_size_mb);
 DECLARE_int64(global_memstore_size_mb_max);
-DECLARE_bool(TEST_allow_stop_writes);
 DECLARE_int32(yb_num_shards_per_tserver);
 DECLARE_int32(ysql_num_shards_per_tserver);
 DECLARE_int32(transaction_table_num_tablets);
 DECLARE_int32(transaction_table_num_tablets_per_tserver);
-DECLARE_int32(TEST_tablet_inject_latency_on_apply_write_txn_ms);
-DECLARE_bool(TEST_log_cache_skip_eviction);
 DECLARE_uint64(sst_files_hard_limit);
 DECLARE_uint64(sst_files_soft_limit);
 DECLARE_int32(timestamp_history_retention_interval_sec);
 DECLARE_int32(raft_heartbeat_interval_ms);
 DECLARE_int32(history_cutoff_propagation_interval_ms);
-DECLARE_int32(TEST_preparer_batch_inject_latency_ms);
 DECLARE_double(leader_failure_max_missed_heartbeat_periods);
+DECLARE_string(ycql_regular_tablets_data_block_key_value_encoding);
+DECLARE_bool(ycql_enable_packed_row);
+DECLARE_bool(ysql_enable_packed_row);
+
+DECLARE_bool(TEST_allow_stop_writes);
 DECLARE_int32(TEST_backfill_sabotage_frequency);
-DECLARE_string(regular_tablets_data_block_key_value_encoding);
-DECLARE_string(compression_type);
+DECLARE_int32(TEST_delay_execute_async_ms);
+DECLARE_bool(TEST_log_cache_skip_eviction);
+DECLARE_int32(TEST_preparer_batch_inject_latency_ms);
+DECLARE_int32(TEST_tablet_inject_latency_on_apply_write_txn_ms);
+DECLARE_int32(TEST_fetch_next_delay_ms);
+DECLARE_string(TEST_fetch_next_delay_column);
 
 namespace yb {
 namespace client {
@@ -140,21 +150,21 @@ class QLTabletTest : public QLDmlTestBase<MiniCluster> {
  protected:
   void SetUp() override {
     server::SkewedClock::Register();
-    FLAGS_time_source = server::SkewedClock::kName;
+    ANNOTATE_UNPROTECTED_WRITE(FLAGS_time_source) = server::SkewedClock::kName;
     QLDmlTestBase::SetUp();
   }
 
   void CreateTables(uint64_t initial_seqno1, uint64_t initial_seqno2) {
     google::FlagSaver saver;
-    FLAGS_initial_seqno = initial_seqno1;
+    ANNOTATE_UNPROTECTED_WRITE(FLAGS_initial_seqno) = initial_seqno1;
     CreateTable(kTable1Name, &table1_);
-    FLAGS_initial_seqno = initial_seqno2;
+    ANNOTATE_UNPROTECTED_WRITE(FLAGS_initial_seqno) = initial_seqno2;
     CreateTable(kTable2Name, &table2_);
   }
 
   std::shared_ptr<YBqlWriteOp> CreateSetValueOp(
-      int32_t key, int32_t value, const TableHandle& table) {
-    const auto op = table.NewWriteOp(QLWriteRequestPB::QL_STMT_INSERT);
+      const ThreadSafeArenaPtr& arena, int32_t key, int32_t value, const TableHandle& table) {
+    const auto op = table.NewWriteOp(arena, QLWriteRequestPB::QL_STMT_INSERT);
     auto* const req = op->mutable_request();
     QLAddInt32HashValue(req, key);
     table.AddInt32ColumnValue(req, kValueColumn, value);
@@ -162,19 +172,19 @@ class QLTabletTest : public QLDmlTestBase<MiniCluster> {
   }
 
   void SetValue(const YBSessionPtr& session, int32_t key, int32_t value, const TableHandle& table) {
-    auto op = CreateSetValueOp(key, value, table);
+    auto op = CreateSetValueOp(session->arena(), key, value, table);
     ASSERT_OK(session->TEST_ApplyAndFlush(op));
     ASSERT_EQ(QLResponsePB::YQL_STATUS_OK, op->response().status())
         << op->response().error_message();
   }
 
-  boost::optional<int32_t> GetValue(
+  std::optional<int32_t> GetValue(
       const YBSessionPtr& session, int32_t key, const TableHandle& table) {
-    const auto op = CreateReadOp(key, table);
+    const auto op = CreateReadOp(session->arena(), key, table);
     EXPECT_OK(session->TEST_ApplyAndFlush(op));
     auto rowblock = RowsResult(op.get()).GetRowBlock();
     if (rowblock->row_count() == 0) {
-      return boost::none;
+      return std::nullopt;
     }
     EXPECT_EQ(1, rowblock->row_count());
     const auto& value = rowblock->row(0).column(0);
@@ -182,16 +192,17 @@ class QLTabletTest : public QLDmlTestBase<MiniCluster> {
     return value.int32_value();
   }
 
-  std::shared_ptr<YBqlReadOp> CreateReadOp(int32_t key, const TableHandle& table) {
-    return client::CreateReadOp(key, table, kValueColumn);
+  std::shared_ptr<YBqlReadOp> CreateReadOp(
+      const ThreadSafeArenaPtr& arena, int32_t key, const TableHandle& table) {
+    return client::CreateReadOp(arena, key, table, kValueColumn);
   }
 
   void CreateTable(
       const YBTableName& table_name, TableHandle* table, int num_tablets = 0,
       bool transactional = false) {
     YBSchemaBuilder builder;
-    builder.AddColumn(kKeyColumn)->Type(INT32)->HashPrimaryKey()->NotNull();
-    builder.AddColumn(kValueColumn)->Type(INT32);
+    builder.AddColumn(kKeyColumn)->Type(DataType::INT32)->HashPrimaryKey()->NotNull();
+    builder.AddColumn(kValueColumn)->Type(DataType::INT32);
 
     if (num_tablets == 0) {
       num_tablets = CalcNumTablets(3);
@@ -205,20 +216,25 @@ class QLTabletTest : public QLDmlTestBase<MiniCluster> {
   }
 
   YBSessionPtr CreateSession() {
-    auto session = client_->NewSession();
-    session->SetTimeout(15s);
+    auto session = client_->NewSession(15s);
     return session;
   }
 
   void FillTable(int begin, int end, const TableHandle& table) {
+    ASSERT_OK(WaitForTableLeaders(cluster_.get(), table->id(), 10s * kTimeMultiplier));
+    ASSERT_OK(WaitAllReplicasSynchronizedWithLeader(cluster_.get(), 10s * kTimeMultiplier));
+    LOG(INFO) << "Start filling table";
     {
       auto session = CreateSession();
       for (int i = begin; i != end; ++i) {
         SetValue(session, i, ValueForKey(i), table);
       }
     }
+    LOG(INFO) << "Filled table";
     VerifyTable(begin, end, table);
+    LOG(INFO) << "Verified table";
     ASSERT_OK(WaitSync(begin, end, table));
+    LOG(INFO) << "All replicas are in-sync";
   }
 
   Status BatchedFillTable(
@@ -226,7 +242,7 @@ class QLTabletTest : public QLDmlTestBase<MiniCluster> {
     {
       auto session = CreateSession();
       for (int i = begin; i != end;) {
-        auto op = CreateSetValueOp(i, ValueForKey(i), table);
+        auto op = CreateSetValueOp(session->arena(), i, ValueForKey(i), table);
         ++i;
         if ((i - begin) % batch_size == 0 || i == end) {
           RETURN_NOT_OK(session->TEST_ApplyAndFlush(op));
@@ -242,7 +258,7 @@ class QLTabletTest : public QLDmlTestBase<MiniCluster> {
     auto session = CreateSession();
     for (int i = begin; i != end; ++i) {
       auto value = GetValue(session, i, table);
-      ASSERT_TRUE(value.is_initialized()) << "i: " << i << ", table: " << table->name().ToString();
+      ASSERT_TRUE(value.has_value()) << "i: " << i << ", table: " << table->name().ToString();
       ASSERT_EQ(ValueForKey(i), *value) << "i: " << i << ", table: " << table->name().ToString();
     }
   }
@@ -302,11 +318,11 @@ class QLTabletTest : public QLDmlTestBase<MiniCluster> {
           tserver::ReadRequestPB req;
           {
             std::string partition_key;
-            auto op = CreateReadOp(i, table);
+            auto op = CreateReadOp(SharedThreadSafeArena(), i, table);
             RETURN_NOT_OK(op->GetPartitionKey(&partition_key));
             auto* ql_batch = req.add_ql_batch();
-            *ql_batch = op->request();
-            const auto& hash_code = PartitionSchema::DecodeMultiColumnHashValue(partition_key);
+            *ql_batch = op->request().ToGoogleProtobuf();
+            auto hash_code = dockv::PartitionSchema::DecodeMultiColumnHashValue(partition_key);
             ql_batch->set_hash_code(hash_code);
             ql_batch->set_max_hash_code(hash_code);
           }
@@ -318,7 +334,11 @@ class QLTabletTest : public QLDmlTestBase<MiniCluster> {
 
           tserver::ReadResponsePB resp;
           RETURN_NOT_OK(proxy->Read(req, &resp, &controller));
-
+          if (resp.has_error()) {
+            RETURN_NOT_OK(
+                StatusFromPB(resp.error().status())
+                    .CloneAndAddErrorCode(tserver::TabletServerError(resp.error().code())));
+          }
           const auto& ql_batch = resp.ql_batch(0);
           if (ql_batch.status() != QLResponsePB_QLStatus_YQL_STATUS_OK) {
             return STATUS_FORMAT(RemoteError,
@@ -326,7 +346,7 @@ class QLTabletTest : public QLDmlTestBase<MiniCluster> {
                                  QLResponsePB_QLStatus_Name(ql_batch.status()));
           }
           Schema projection;
-          vector<ColumnId> column_refs;
+          std::vector<ColumnId> column_refs;
           column_refs.emplace_back(table.ColumnId(kValueColumn));
           Schema total_schema = client::internal::GetSchema(table->schema());
           RETURN_NOT_OK(total_schema.CreateProjectionByIdsIgnoreMissing(column_refs, &projection));
@@ -457,10 +477,12 @@ class QLTabletTest : public QLDmlTestBase<MiniCluster> {
       for (size_t j = 0; j != source_infos.size(); ++j) {
         auto source_peer = tablet_manager->LookupTablet(source_infos[j]->id());
         EXPECT_NE(nullptr, source_peer);
-        auto source_dir = source_peer->tablet()->metadata()->rocksdb_dir();
+        auto source_tablet = VERIFY_RESULT(source_peer->shared_tablet());
+        auto source_dir = source_tablet->metadata()->rocksdb_dir();
         auto dest_peer = tablet_manager->LookupTablet(dest_infos[j]->id());
         EXPECT_NE(nullptr, dest_peer);
-        auto status = dest_peer->tablet()->ImportData(source_dir);
+        auto dest_tablet = VERIFY_RESULT(dest_peer->shared_tablet());
+        auto status = dest_tablet->ImportData(source_dir);
         if (!status.ok() && !status.IsNotFound()) {
           return status;
         }
@@ -503,7 +525,56 @@ class QLTabletTest : public QLDmlTestBase<MiniCluster> {
     }, MonoDelta::FromSeconds(30), "Table Creation");
   }
 
+  // Make sure long reads are aborted by operation.
+  void TestLongReadAbort(std::function<Status()> operation) {
+    constexpr auto kNumRows = 100;
+
+    ASSERT_NO_FATALS(
+        CreateTable(kTable1Name, &table1_, /* num_tablets = */ 1, /* transactional = */ true));
+    LOG(INFO) << "Created table";
+
+    ASSERT_NO_FATALS(FillTable(0, kNumRows, table1_));
+    LOG(INFO) << "Inserted " << kNumRows << " rows";
+
+    std::vector<std::shared_ptr<tablet::Tablet>> shared_tablets;
+    {
+      for (const auto& peer : ListTabletPeers(cluster_.get(), ListPeersFilter::kAll)) {
+        shared_tablets.push_back(peer->shared_tablet_maybe_null());
+      }
+    }
+
+    ANNOTATE_UNPROTECTED_WRITE(FLAGS_TEST_fetch_next_delay_ms) = 100;
+    ANNOTATE_UNPROTECTED_WRITE(FLAGS_TEST_fetch_next_delay_column) = "int_val";
+
+    std::thread counter([this]{
+      auto session = CreateSession();
+
+      const auto start_time = CoarseMonoClock::now();
+
+      // Use high enough timeout to test aborting reads.
+      const auto rows_count_result =
+          CountRows(session, table1_, kNumRows * FLAGS_TEST_fetch_next_delay_ms * 1ms * 10);
+      LOG(INFO) << "Rows count result: " << rows_count_result;
+      // Request should be aborted during tablet shutdown.
+      ASSERT_FALSE(rows_count_result.ok());
+
+      const auto time_elapsed = CoarseMonoClock::now() - start_time;
+      // Abort should be fast.
+      ASSERT_LE(time_elapsed, 1s * kTimeMultiplier);
+    });
+
+    // Wait for test table scan start. It could be delayed, because FLAGS_TEST_fetch_next_delay_ms
+    // impacts master perf as well.
+    RegexWaiterLogSink log_waiter(R"#(.*Delaying read for.*int_val.*)#");
+    ASSERT_OK(log_waiter.WaitFor(30s));
+
+    ASSERT_OK(operation());
+
+    counter.join();
+  }
+
   void TestDeletePartialKey(int num_range_keys_in_delete);
+  void TestLeaderLeaseRevocation(bool ht_lease);
 
   void CreateAndVerifyIndexConsistency(int expected_number_rows_mismatched);
 
@@ -590,21 +661,21 @@ void QLTabletTest::CreateAndVerifyIndexConsistency(const int expected_number_row
 TEST_F(QLTabletTest, VerifyIndexRange) { CreateAndVerifyIndexConsistency(0); }
 
 TEST_F(QLTabletTest, VerifyIndexRangeWithInconsistentTable) {
-  FLAGS_TEST_backfill_sabotage_frequency = 10;
+  ANNOTATE_UNPROTECTED_WRITE(FLAGS_TEST_backfill_sabotage_frequency) = 10;
   const int kRowsDropped = kTotalKeys / FLAGS_TEST_backfill_sabotage_frequency;
   CreateAndVerifyIndexConsistency(kRowsDropped);
 }
 
 // Test expected number of tablets for transactions table - added for #2293.
 TEST_F(QLTabletTest, TransactionsTableTablets) {
-  FLAGS_yb_num_shards_per_tserver = 1;
-  FLAGS_ysql_num_shards_per_tserver = 2;
-  FLAGS_transaction_table_num_tablets = 0;
-  FLAGS_transaction_table_num_tablets_per_tserver = 4;
+  ANNOTATE_UNPROTECTED_WRITE(FLAGS_yb_num_shards_per_tserver) = 1;
+  ANNOTATE_UNPROTECTED_WRITE(FLAGS_ysql_num_shards_per_tserver) = 2;
+  ANNOTATE_UNPROTECTED_WRITE(FLAGS_transaction_table_num_tablets) = 0;
+  ANNOTATE_UNPROTECTED_WRITE(FLAGS_transaction_table_num_tablets_per_tserver) = 4;
 
   YBSchemaBuilder builder;
-  builder.AddColumn(kKeyColumn)->Type(INT32)->HashPrimaryKey()->NotNull();
-  builder.AddColumn(kValueColumn)->Type(INT32);
+  builder.AddColumn(kKeyColumn)->Type(DataType::INT32)->HashPrimaryKey()->NotNull();
+  builder.AddColumn(kValueColumn)->Type(DataType::INT32);
 
   // Create transactional table.
   TableProperties table_properties;
@@ -640,7 +711,8 @@ void VerifyLogIndicies(MiniCluster* cluster) {
 
     for (const auto& peer : peers) {
       int64_t index = ASSERT_RESULT(peer->GetEarliestNeededLogIndex());
-      ASSERT_EQ(peer->consensus()->GetLastCommittedOpId().index, index);
+      auto consensus = ASSERT_RESULT(peer->GetConsensus());
+      ASSERT_EQ(consensus->GetLastCommittedOpId().index, index);
     }
   }
 }
@@ -652,7 +724,7 @@ constexpr auto kRetryableRequestTimeoutSecs = 4;
 } // namespace
 
 TEST_F(QLTabletTest, GCLogWithoutWrites) {
-  SetAtomicFlag(kRetryableRequestTimeoutSecs, &FLAGS_retryable_request_timeout_secs);
+  ANNOTATE_UNPROTECTED_WRITE(FLAGS_retryable_request_timeout_secs) = kRetryableRequestTimeoutSecs;
 
   TableHandle table;
   CreateTable(kTable1Name, &table);
@@ -666,7 +738,7 @@ TEST_F(QLTabletTest, GCLogWithoutWrites) {
 }
 
 TEST_F(QLTabletTest, GCLogWithRestartWithoutWrites) {
-  SetAtomicFlag(kRetryableRequestTimeoutSecs, &FLAGS_retryable_request_timeout_secs);
+  ANNOTATE_UNPROTECTED_WRITE(FLAGS_retryable_request_timeout_secs) = kRetryableRequestTimeoutSecs;
 
   TableHandle table;
   CreateTable(kTable1Name, &table);
@@ -683,7 +755,7 @@ TEST_F(QLTabletTest, GCLogWithRestartWithoutWrites) {
 }
 
 TEST_F(QLTabletTest, LeaderLease) {
-  SetAtomicFlag(false, &FLAGS_enable_lease_revocation);
+  ANNOTATE_UNPROTECTED_WRITE(FLAGS_enable_lease_revocation) = false;
 
   TableHandle table;
   CreateTable(kTable1Name, &table);
@@ -691,8 +763,8 @@ TEST_F(QLTabletTest, LeaderLease) {
   LOG(INFO) << "Filling table";
   FillTable(0, kTotalKeys, table);
 
-  auto old_lease_ms = GetAtomicFlag(&FLAGS_leader_lease_duration_ms);
-  SetAtomicFlag(60 * 1000, &FLAGS_leader_lease_duration_ms);
+  auto old_lease_ms = FLAGS_leader_lease_duration_ms;
+  ANNOTATE_UNPROTECTED_WRITE(FLAGS_leader_lease_duration_ms) = 60 * 1000;
   // Wait for lease to sync.
   std::this_thread::sleep_for(2ms * old_lease_ms);
 
@@ -701,12 +773,12 @@ TEST_F(QLTabletTest, LeaderLease) {
 
   LOG(INFO) << "Write value";
   auto session = CreateSession();
-  const auto op = table.NewWriteOp(QLWriteRequestPB::QL_STMT_INSERT);
+  const auto op = table.NewWriteOp(session->arena(), QLWriteRequestPB::QL_STMT_INSERT);
   auto* const req = op->mutable_request();
   QLAddInt32HashValue(req, 1);
   table.AddInt32ColumnValue(req, kValueColumn, 1);
   auto status = session->TEST_ApplyAndFlush(op);
-  ASSERT_TRUE(status.IsIOError()) << "Status: " << status;
+  ASSERT_TRUE(status.IsTimedOut()) << "Status: " << status;
 }
 
 // This test tries to catch situation when some entries were applied and flushed in RocksDB,
@@ -722,9 +794,10 @@ TEST_F(QLTabletTest, WaitFlush) {
   google::FlagSaver saver;
 
   constexpr int kNumTablets = 1; // Use single tablet to increase chance of bad scenario.
-  FLAGS_db_write_buffer_size = 10; // Use small memtable to induce background flush on each write.
+  // Use small memtable to induce background flush on each write.
+  ANNOTATE_UNPROTECTED_WRITE(FLAGS_db_write_buffer_size) = 10;
 
-  TestWorkload workload(cluster_.get());
+  TestYcqlWorkload workload(cluster_.get());
   workload.set_table_name(kTable1Name);
   workload.set_write_timeout_millis(30000);
   workload.set_num_tablets(kNumTablets);
@@ -746,8 +819,10 @@ TEST_F(QLTabletTest, WaitFlush) {
   bool leader_found = false;
   while (!leader_found) {
     for (size_t i = 0; i != peers.size(); ++i) {
-      if (peers[i]->LeaderStatus() == consensus::LeaderStatus::LEADER_AND_READY) {
-        peers[(i + 1) % peers.size()]->log()->TEST_SetSleepDuration(500ms);
+      auto& next_peer = peers[(i + 1) % peers.size()];
+      if (peers[i]->LeaderStatus() == consensus::LeaderStatus::LEADER_AND_READY &&
+          next_peer->log_available()) {
+        next_peer->log()->TEST_SetSleepDuration(500ms);
         leader_found = true;
         break;
       }
@@ -757,7 +832,11 @@ TEST_F(QLTabletTest, WaitFlush) {
   auto deadline = CoarseMonoClock::Now() + 20s * kTimeMultiplier;
   while (CoarseMonoClock::Now() <= deadline) {
     for (const auto& peer : peers) {
-      auto flushed_op_id = ASSERT_RESULT(peer->tablet()->MaxPersistentOpId()).regular;
+      auto tablet = peer->shared_tablet_maybe_null();
+      if (!tablet) {
+        continue;
+      }
+      auto flushed_op_id = ASSERT_RESULT(tablet->MaxPersistentOpId()).regular;
       auto latest_entry_op_id = peer->log()->GetLatestEntryOpId();
       ASSERT_LE(flushed_op_id.index, latest_entry_op_id.index);
     }
@@ -765,7 +844,11 @@ TEST_F(QLTabletTest, WaitFlush) {
   }
 
   for (const auto& peer : peers) {
-    auto flushed_op_id = ASSERT_RESULT(peer->tablet()->MaxPersistentOpId()).regular;
+    auto tablet = peer->shared_tablet_maybe_null();
+    if (!tablet) {
+      continue;
+    }
+    auto flushed_op_id = ASSERT_RESULT(tablet->MaxPersistentOpId()).regular;
     ASSERT_GE(flushed_op_id.index, 100);
   }
 
@@ -824,7 +907,8 @@ TEST_F(QLTabletTest, BoundaryValues) {
     ASSERT_EQ(1, peers.size());
     auto& peer = *peers[0];
     auto op_id = peer.log()->GetLatestEntryOpId();
-    auto* db = peer.tablet()->TEST_db();
+    auto tablet = ASSERT_RESULT(peer.shared_tablet());
+    auto* db = tablet->regular_db();
     int64_t max_index = 0;
     int64_t min_index = std::numeric_limits<int64_t>::max();
     for (const auto& file : db->GetLiveFilesMetaData()) {
@@ -851,7 +935,7 @@ TEST_F(QLTabletTest, SkewedClocks) {
 
   auto delta_changers = SkewClocks(cluster_.get(), 50ms);
 
-  TestWorkload workload(cluster_.get());
+  TestYcqlWorkload workload(cluster_.get());
   workload.set_table_name(kTable1Name);
   workload.set_write_timeout_millis(30000);
   workload.set_num_tablets(12);
@@ -870,15 +954,15 @@ TEST_F(QLTabletTest, SkewedClocks) {
   auto session = CreateSession();
 
   for (int i = 0; i != 1000; ++i) {
-    auto op = table.NewReadOp();
+    auto op = table.NewReadOp(session->arena());
     auto req = op->mutable_request();
     QLAddInt32HashValue(req, i);
     auto value_column_id = table.ColumnId(kValueColumn);
     req->add_selected_exprs()->set_column_id(value_column_id);
     req->mutable_column_refs()->add_ids(value_column_id);
 
-    QLRSColDescPB *rscol_desc = req->mutable_rsrow_desc()->add_rscol_descs();
-    rscol_desc->set_name(kValueColumn);
+    auto *rscol_desc = req->mutable_rsrow_desc()->add_rscol_descs();
+    rscol_desc->ref_name(kValueColumn);
     table.ColumnType(kValueColumn)->ToQLTypePB(rscol_desc->mutable_ql_type());
     op->set_yb_consistency_level(YBConsistencyLevel::CONSISTENT_PREFIX);
     ASSERT_OK(session->TEST_ApplyAndFlush(op));
@@ -900,8 +984,7 @@ TEST_F(QLTabletTest, LeaderChange) {
 
   TableHandle table;
   CreateTable(kTable1Name, &table, kNumTablets);
-  auto session = client_->NewSession();
-  session->SetTimeout(60s);
+  auto session = client_->NewSession(60s);
 
   // Write kValue1
   SetValue(session, kKey, kValue1, table);
@@ -923,7 +1006,7 @@ TEST_F(QLTabletTest, LeaderChange) {
   ASSERT_NE(leader_id, "");
 
   LOG(INFO) << "CAS " << kValue1 << " => " << kValue2;
-  const auto write_op = table.NewWriteOp(QLWriteRequestPB::QL_STMT_INSERT);
+  const auto write_op = table.NewWriteOp(session->arena(), QLWriteRequestPB::QL_STMT_INSERT);
   auto* const req = write_op->mutable_request();
   QLAddInt32HashValue(req, kKey);
   table.AddInt32ColumnValue(req, kValueColumn, kValue2);
@@ -934,11 +1017,11 @@ TEST_F(QLTabletTest, LeaderChange) {
   req->mutable_column_refs()->add_ids(table.ColumnId(kValueColumn));
   session->Apply(write_op);
 
-  SetAtomicFlag(30000, &FLAGS_TEST_delay_execute_async_ms);
+  ANNOTATE_UNPROTECTED_WRITE(FLAGS_TEST_delay_execute_async_ms) = 30000;
   auto flush_future = session->FlushFuture();
   std::this_thread::sleep_for(2s);
 
-  SetAtomicFlag(0, &FLAGS_TEST_delay_execute_async_ms);
+  ANNOTATE_UNPROTECTED_WRITE(FLAGS_TEST_delay_execute_async_ms) = 0;
 
   LOG(INFO) << "Step down old leader";
   StepDownAllTablets(cluster_.get());
@@ -960,11 +1043,11 @@ TEST_F(QLTabletTest, LeaderChange) {
     for (const auto& peer : peers) {
       if (peer->LeaderStatus() != consensus::LeaderStatus::NOT_LEADER) {
         LOG(INFO) << "Request step down: " << server->permanent_uuid() << " => " << leader_id;
-        consensus::LeaderStepDownRequestPB req;
-        req.set_tablet_id(peer->tablet_id());
-        req.set_new_leader_uuid(leader_id);
+        consensus::LeaderStepDownRequestPB stepdown_request;
+        stepdown_request.set_tablet_id(peer->tablet_id());
+        stepdown_request.set_new_leader_uuid(leader_id);
         consensus::LeaderStepDownResponsePB resp;
-        ASSERT_OK(peer->consensus()->StepDown(&req, &resp));
+        ASSERT_OK(ASSERT_RESULT(peer->GetConsensus())->StepDown(&stepdown_request, &resp));
         found = true;
         break;
       }
@@ -982,23 +1065,22 @@ TEST_F(QLTabletTest, LeaderChange) {
 
 void QLTabletTest::TestDeletePartialKey(int num_range_keys_in_delete) {
   YBSchemaBuilder builder;
-  builder.AddColumn(kKeyColumn)->Type(INT32)->HashPrimaryKey()->NotNull();
-  builder.AddColumn(kRangeKey1Column)->Type(INT32)->PrimaryKey()->NotNull();
-  builder.AddColumn(kRangeKey2Column)->Type(INT32)->PrimaryKey()->NotNull();
-  builder.AddColumn(kValueColumn)->Type(INT32);
+  builder.AddColumn(kKeyColumn)->Type(DataType::INT32)->HashPrimaryKey()->NotNull();
+  builder.AddColumn(kRangeKey1Column)->Type(DataType::INT32)->PrimaryKey()->NotNull();
+  builder.AddColumn(kRangeKey2Column)->Type(DataType::INT32)->PrimaryKey()->NotNull();
+  builder.AddColumn(kValueColumn)->Type(DataType::INT32);
 
   TableHandle table;
   ASSERT_OK(table.Create(kTable1Name, 1 /* num_tablets */, client_.get(), &builder));
 
   const auto kValue1 = 2;
   const auto kValue2 = 3;
-  const auto kTotalKeys = 200;
 
   auto session1 = CreateSession();
   auto session2 = CreateSession();
   for (int key = 1; key != kTotalKeys; ++key) {
     {
-      const auto op = table.NewWriteOp(QLWriteRequestPB::QL_STMT_INSERT);
+      const auto op = table.NewWriteOp(session1->arena(), QLWriteRequestPB::QL_STMT_INSERT);
       auto* const req = op->mutable_request();
       QLAddInt32HashValue(req, key);
       QLAddInt32RangeValue(req, key);
@@ -1008,7 +1090,7 @@ void QLTabletTest::TestDeletePartialKey(int num_range_keys_in_delete) {
       ASSERT_EQ(QLResponsePB::YQL_STATUS_OK, op->response().status());
     }
 
-    const auto op_del = table.NewWriteOp(QLWriteRequestPB::QL_STMT_DELETE);
+    const auto op_del = table.NewWriteOp(session1->arena(), QLWriteRequestPB::QL_STMT_DELETE);
     {
       auto* const req = op_del->mutable_request();
       QLAddInt32HashValue(req, key);
@@ -1018,7 +1100,7 @@ void QLTabletTest::TestDeletePartialKey(int num_range_keys_in_delete) {
       session1->Apply(op_del);
     }
 
-    const auto op_update = table.NewWriteOp(QLWriteRequestPB::QL_STMT_UPDATE);
+    const auto op_update = table.NewWriteOp(session2->arena(), QLWriteRequestPB::QL_STMT_UPDATE);
     {
       auto* const req = op_update->mutable_request();
       QLAddInt32HashValue(req, key);
@@ -1049,18 +1131,19 @@ TEST_F(QLTabletTest, DeleteByHashAndPartialRangeKey) {
 }
 
 TEST_F(QLTabletTest, ManySstFilesBootstrap) {
-  FLAGS_flush_rocksdb_on_shutdown = false;
+  ANNOTATE_UNPROTECTED_WRITE(FLAGS_flush_rocksdb_on_shutdown) = false;
 
   int key = 0;
   {
     google::FlagSaver flag_saver;
 
     size_t original_rocksdb_level0_stop_writes_trigger = 48;
-    FLAGS_sst_files_hard_limit = std::numeric_limits<uint64_t>::max() / 4;
-    FLAGS_sst_files_soft_limit = FLAGS_sst_files_hard_limit;
-    FLAGS_rocksdb_level0_stop_writes_trigger = 10000;
-    FLAGS_rocksdb_level0_slowdown_writes_trigger = 10000;
-    FLAGS_rocksdb_disable_compactions = true;
+    ANNOTATE_UNPROTECTED_WRITE(FLAGS_sst_files_hard_limit) =
+        std::numeric_limits<uint64_t>::max() / 4;
+    ANNOTATE_UNPROTECTED_WRITE(FLAGS_sst_files_soft_limit) = FLAGS_sst_files_hard_limit;
+    ANNOTATE_UNPROTECTED_WRITE(FLAGS_rocksdb_level0_stop_writes_trigger) = 10000;
+    ANNOTATE_UNPROTECTED_WRITE(FLAGS_rocksdb_level0_slowdown_writes_trigger) = 10000;
+    ANNOTATE_UNPROTECTED_WRITE(FLAGS_rocksdb_disable_compactions) = true;
     CreateTable(kTable1Name, &table1_, 1);
 
     auto session = CreateSession();
@@ -1069,13 +1152,14 @@ TEST_F(QLTabletTest, ManySstFilesBootstrap) {
     LOG(INFO) << "Leader: " << peers[0]->permanent_uuid();
     int stop_key = 0;
     for (;;) {
-      auto meta = peers[0]->tablet()->TEST_db()->GetLiveFilesMetaData();
+      auto tablet = ASSERT_RESULT(peers[0]->shared_tablet());
+      auto meta = tablet->regular_db()->GetLiveFilesMetaData();
       LOG(INFO) << "Total files: " << meta.size();
 
       ++key;
       SetValue(session, key, ValueForKey(key), table1_);
       if (meta.size() <= original_rocksdb_level0_stop_writes_trigger) {
-        ASSERT_OK(peers[0]->tablet()->Flush(tablet::FlushMode::kSync));
+        ASSERT_OK(tablet->Flush(tablet::FlushMode::kSync, rocksdb::FlushReason::kTestOnly));
         stop_key = key + 10;
       } else if (key >= stop_key) {
         break;
@@ -1097,16 +1181,16 @@ TEST_F(QLTabletTest, ManySstFilesBootstrap) {
 class QLTabletTestSmallMemstore : public QLTabletTest {
  public:
   void SetUp() override {
-    FLAGS_memstore_size_mb = 1;
-    FLAGS_global_memstore_size_mb_max = 1;
+    ANNOTATE_UNPROTECTED_WRITE(FLAGS_memstore_size_mb) = 1;
+    ANNOTATE_UNPROTECTED_WRITE(FLAGS_global_memstore_size_mb_max) = 1;
     QLTabletTest::SetUp();
   }
 };
 
 TEST_F_EX(QLTabletTest, DoubleFlush, QLTabletTestSmallMemstore) {
-  SetAtomicFlag(false, &FLAGS_TEST_allow_stop_writes);
+  ANNOTATE_UNPROTECTED_WRITE(FLAGS_TEST_allow_stop_writes) = false;
 
-  TestWorkload workload(cluster_.get());
+  TestYcqlWorkload workload(cluster_.get());
   workload.set_table_name(kTable1Name);
   workload.set_write_timeout_millis(30000);
   workload.set_num_tablets(1);
@@ -1123,36 +1207,36 @@ TEST_F_EX(QLTabletTest, DoubleFlush, QLTabletTestSmallMemstore) {
   workload.StopAndJoin();
 
   // Flush on rocksdb shutdown could produce second immutable memtable, that will stop writes.
-  SetAtomicFlag(true, &FLAGS_TEST_allow_stop_writes);
+  ANNOTATE_UNPROTECTED_WRITE(FLAGS_TEST_allow_stop_writes) = true;
   cluster_->Shutdown(); // Need to shutdown cluster before resetting clock back.
   cluster_.reset();
 }
 
 TEST_F(QLTabletTest, OperationMemTracking) {
-  FLAGS_TEST_log_cache_skip_eviction = true;
+  ANNOTATE_UNPROTECTED_WRITE(FLAGS_TEST_log_cache_skip_eviction) = true;
 
   constexpr ssize_t kValueSize = 64_KB;
   const auto kWaitInterval = 50ms;
 
   YBSchemaBuilder builder;
-  builder.AddColumn(kKeyColumn)->Type(INT32)->HashPrimaryKey()->NotNull();
-  builder.AddColumn(kValueColumn)->Type(STRING);
+  builder.AddColumn(kKeyColumn)->Type(DataType::INT32)->HashPrimaryKey()->NotNull();
+  builder.AddColumn(kValueColumn)->Type(DataType::STRING);
 
   TableHandle table;
   ASSERT_OK(table.Create(kTable1Name, CalcNumTablets(3), client_.get(), &builder));
 
-  FLAGS_TEST_tablet_inject_latency_on_apply_write_txn_ms = 1000;
+  ANNOTATE_UNPROTECTED_WRITE(FLAGS_TEST_tablet_inject_latency_on_apply_write_txn_ms) = 1000;
 
-  const auto op = table.NewWriteOp(QLWriteRequestPB::QL_STMT_INSERT);
+  auto session = CreateSession();
+  const auto op = table.NewWriteOp(session->arena(), QLWriteRequestPB::QL_STMT_INSERT);
   auto* const req = op->mutable_request();
   QLAddInt32HashValue(req, 42);
-  auto session = CreateSession();
   table.AddStringColumnValue(req, kValueColumn, std::string(kValueSize, 'X'));
   session->Apply(op);
   auto future = session->FlushFuture();
   auto server_tracker = MemTracker::GetRootTracker()->FindChild("server 1");
-  auto tablets_tracker = server_tracker->FindChild("Tablets");
-  auto log_tracker = server_tracker->FindChild("log_cache");
+  auto tablets_tracker = server_tracker->FindChild("Tablets_overhead");
+  auto log_tracker = server_tracker->FindChild("LogCache");
 
   std::chrono::steady_clock::time_point deadline;
   bool tracked_by_tablets = false;
@@ -1173,7 +1257,7 @@ TEST_F(QLTabletTest, OperationMemTracking) {
     // We have overhead in both log cache and tablets.
     // So if value is double tracked then sum consumption will be higher than double value size.
     ASSERT_LE(operation_tracker_consumption + log_cache_consumption, kValueSize * 2)
-        << DumpMemoryUsage();
+        << [] { DumpMemoryUsage(); return ""; }();
     if (std::chrono::steady_clock::time_point() == deadline) { // operation did not finish yet
       if (future.wait_for(kWaitInterval) == std::future_status::ready) {
         LOG(INFO) << "Value written";
@@ -1224,9 +1308,10 @@ TEST_F(QLTabletTest, BlockCacheMemTracking) {
   ASSERT_OK(client_->DeleteTable(kTable1Name, true));
   std::this_thread::sleep_for(kSleepTime);
 
-  // after table deletion, assert that there is no longer a block cache memtracker
+  // after table deletion, assert that there are no longer any tablet-level block cache memtrackers
   block_cache_tracker = server_tracker->FindChild(kBlockTrackerName);
-  ASSERT_FALSE(block_cache_tracker);
+  ASSERT_TRUE(block_cache_tracker);
+  ASSERT_TRUE(block_cache_tracker->ListChildren().empty());
 }
 
 // Checks history cutoff for cluster against previous state.
@@ -1260,23 +1345,27 @@ void VerifyHistoryCutoff(MiniCluster* cluster, HybridTime* prev_committed,
     bool complete = false;
     for (size_t i = 0; i < peers.size(); ++i) {
       auto peer = peers[i];
-      SCOPED_TRACE(Format("Peer: $0", peer->permanent_uuid()));
+      SCOPED_TRACE(Format("Peer: $0, Trace: $1", peer->permanent_uuid(), trace));
       if (peer->state() != tablet::RaftGroupStatePB::RUNNING) {
         complete = false;
         break;
       }
-      auto peer_history_cutoff =
-          peer->tablet()->RetentionPolicy()->GetRetentionDirective().history_cutoff;
+      auto tablet = ASSERT_RESULT(peer->shared_tablet());
+      auto cutoff = tablet->RetentionPolicy()->GetRetentionDirective().history_cutoff;
+      ASSERT_EQ(cutoff.cotables_cutoff_ht, HybridTime::kInvalid);
+      auto peer_history_cutoff = cutoff.primary_cutoff_ht;
       committed = std::max(peer_history_cutoff, committed);
-      auto min_allowed = std::min(peer->clock_ptr()->Now().AddMicroseconds(committed_delta_us),
-                                  peer->tablet()->mvcc_manager()->LastReplicatedHybridTime());
+      auto min_allowed = std::min(
+          peer->clock_ptr()->Now().AddMicroseconds(committed_delta_us),
+          tablet->mvcc_manager()->LastReplicatedHybridTime());
       if (peer_history_cutoff < min_allowed) {
         LOG(INFO) << "Committed did not catch up for " << peer->permanent_uuid() << ": "
                   << peer_history_cutoff << " vs " << min_allowed;
         complete = false;
         break;
       }
-      if (peer->consensus()->GetLeaderStatus() == consensus::LeaderStatus::LEADER_AND_READY) {
+      if (ASSERT_RESULT(peer->GetConsensus())->GetLeaderStatus() ==
+          consensus::LeaderStatus::LEADER_AND_READY) {
         complete = true;
       }
     }
@@ -1291,8 +1380,8 @@ void VerifyHistoryCutoff(MiniCluster* cluster, HybridTime* prev_committed,
 
 // Basic check for history cutoff evolution
 TEST_F(QLTabletTest, HistoryCutoff) {
-  FLAGS_timestamp_history_retention_interval_sec = kTimeMultiplier;
-  FLAGS_history_cutoff_propagation_interval_ms = 100;
+  ANNOTATE_UNPROTECTED_WRITE(FLAGS_timestamp_history_retention_interval_sec) = kTimeMultiplier;
+  ANNOTATE_UNPROTECTED_WRITE(FLAGS_history_cutoff_propagation_interval_ms) = 100;
 
   CreateTable(kTable1Name, &table1_, /* num_tablets= */ 1);
   HybridTime committed_history_cutoff = HybridTime::kMin;
@@ -1304,32 +1393,44 @@ TEST_F(QLTabletTest, HistoryCutoff) {
   for (size_t i = 0; i != cluster_->num_tablet_servers(); ++i) {
     auto peers = cluster_->mini_tablet_server(i)->server()->tablet_manager()->GetTabletPeers();
     ASSERT_EQ(peers.size(), 1);
-    peer_committed[i] =
-        peers[0]->tablet()->RetentionPolicy()->GetRetentionDirective().history_cutoff;
+    auto tablet = ASSERT_RESULT(peers[0]->shared_tablet());
+    auto cutoff = tablet->RetentionPolicy()->GetRetentionDirective().history_cutoff;
+    ASSERT_EQ(cutoff.cotables_cutoff_ht, HybridTime::kInvalid);
+    peer_committed[i] = cutoff.primary_cutoff_ht;
     LOG(INFO) << "Peer: " << peers[0]->permanent_uuid() << ", index: " << i
               << ", committed: " << peer_committed[i];
     cluster_->mini_tablet_server(i)->Shutdown();
   }
 
   for (size_t i = 0; i != cluster_->num_tablet_servers(); ++i) {
-    ASSERT_OK(cluster_->mini_tablet_server(i)->Start());
+    ASSERT_OK(cluster_->mini_tablet_server(i)->Start(tserver::WaitTabletsBootstrapped::kFalse));
     for (;;) {
-      auto peers = cluster_->mini_tablet_server(i)->server()->tablet_manager()->GetTabletPeers();
+      auto tserver = cluster_->mini_tablet_server(i)->server();
+      auto peers = tserver->tablet_manager()->GetTabletPeers();
       ASSERT_LE(peers.size(), 1);
       if (peers.empty() || peers[0]->state() != tablet::RaftGroupStatePB::RUNNING) {
         std::this_thread::sleep_for(100ms);
         continue;
       }
+      auto tablet = peers[0]->shared_tablet_maybe_null();
+      if (!tablet) {
+        continue;
+      }
+      if (!tserver->GetXClusterContext().GetSafeTime(tablet->metadata()->namespace_id()).ok()) {
+        std::this_thread::sleep_for(100ms);
+        continue;
+      }
       SCOPED_TRACE(Format("Peer: $0, index: $1", peers[0]->permanent_uuid(), i));
-      ASSERT_GE(peers[0]->tablet()->RetentionPolicy()->GetRetentionDirective().history_cutoff,
-                peer_committed[i]);
+      auto cutoff = tablet->RetentionPolicy()->GetRetentionDirective().history_cutoff;
+      ASSERT_EQ(cutoff.cotables_cutoff_ht, HybridTime::kInvalid);
+      ASSERT_GE(cutoff.primary_cutoff_ht, peer_committed[i]);
       break;
     }
     cluster_->mini_tablet_server(i)->Shutdown();
   }
 
   for (size_t i = 0; i != cluster_->num_tablet_servers(); ++i) {
-    ASSERT_OK(cluster_->mini_tablet_server(i)->Start());
+    ASSERT_OK(cluster_->mini_tablet_server(i)->Start(tserver::WaitTabletsBootstrapped::kFalse));
   }
   ASSERT_NO_FATALS(VerifyHistoryCutoff(cluster_.get(), &committed_history_cutoff, "After restart"));
 
@@ -1349,12 +1450,24 @@ class QLTabletRf1Test : public QLTabletTest {
   }
 };
 
+class QLTabletRf1TestToggleEnablePackedRow :
+    public QLTabletRf1Test, public ::testing::WithParamInterface<bool> {
+ public:
+  void SetFlags() override {
+    QLTabletRf1Test::SetFlags();
+    ASSERT_OK(SET_FLAG(ycql_enable_packed_row, GetParam()));
+    ASSERT_OK(SET_FLAG(ysql_enable_packed_row, GetParam()));
+  }
+};
+
+INSTANTIATE_TEST_SUITE_P(, QLTabletRf1TestToggleEnablePackedRow, ::testing::Bool());
+
 // For this test we don't need actually RF3 setup which also makes test flaky because of
 // https://github.com/yugabyte/yugabyte-db/issues/4663.
-TEST_F_EX(QLTabletTest, GetMiddleKey, QLTabletRf1Test) {
-  FLAGS_db_write_buffer_size = 20_KB;
+TEST_P(QLTabletRf1TestToggleEnablePackedRow, GetMiddleKey) {
+  ANNOTATE_UNPROTECTED_WRITE(FLAGS_db_write_buffer_size) = 20_KB;
 
-  TestWorkload workload(cluster_.get());
+  TestYcqlWorkload workload(cluster_.get());
   workload.set_table_name(kTable1Name);
   workload.set_write_timeout_millis(30000);
   workload.set_num_tablets(1);
@@ -1370,12 +1483,14 @@ TEST_F_EX(QLTabletTest, GetMiddleKey, QLTabletRf1Test) {
 
   const auto peers = ListTabletPeers(cluster_.get(), ListPeersFilter::kLeaders);
   ASSERT_EQ(peers.size(), 1);
-  const auto& tablet = *ASSERT_NOTNULL(peers[0]->tablet());
+  const auto& tablet = *ASSERT_NOTNULL(peers[0]->shared_tablet_maybe_null());
 
   // We want some compactions to happen, so largest SST file will become large enough for its
   // approximate middle key to roughly split the whole tablet into two parts that are close in size.
-  while (tablet.TEST_db()->GetCurrentVersionDataSstFilesSize() <
-         implicit_cast<size_t>(20 * FLAGS_db_write_buffer_size)) {
+  // Need to have the largest file to be more than 50% of total size of all SST -- setting to 600KB
+  // is enough to achive this condition (should give ~65% of total size when packed rows are on).
+  while (tablet.regular_db()->GetCurrentVersionDataSstFilesSize() <
+         implicit_cast<size_t>(30 * FLAGS_db_write_buffer_size)) {
     std::this_thread::sleep_for(100ms);
   }
 
@@ -1384,24 +1499,25 @@ TEST_F_EX(QLTabletTest, GetMiddleKey, QLTabletRf1Test) {
   LOG(INFO) << "Workload stopped, it took: " << AsString(s.elapsed());
 
   LOG(INFO) << "Rows inserted: " << workload.rows_inserted();
-  LOG(INFO) << "Number of SST files: " << tablet.TEST_db()->GetCurrentVersionNumSSTFiles();
+  LOG(INFO) << "Number of SST files: " << tablet.regular_db()->GetCurrentVersionNumSSTFiles();
 
   ASSERT_OK(cluster_->FlushTablets());
 
-  const auto encoded_split_key = ASSERT_RESULT(tablet.GetEncodedMiddleSplitKey());
+  const auto split_keys = ASSERT_RESULT(tablet.GetSplitKeys(kDefaultNumSplitParts));
+  const auto& encoded_split_key = split_keys.encoded_keys.front();
   LOG(INFO) << "Encoded split key: " << Slice(encoded_split_key).ToDebugString();
 
   if (tablet.metadata()->partition_schema()->IsHashPartitioning()) {
-    docdb::DocKey split_key;
+    dockv::DocKey split_key;
     Slice key_slice = encoded_split_key;
-    ASSERT_OK(split_key.DecodeFrom(&key_slice, docdb::DocKeyPart::kUpToHashCode));
+    ASSERT_OK(split_key.DecodeFrom(&key_slice, dockv::DocKeyPart::kUpToHashCode));
     ASSERT_TRUE(key_slice.empty()) << "Extra bytes after decoding: " << key_slice.ToDebugString();
     ASSERT_EQ(split_key.hashed_group().size() + split_key.range_group().size(), 0)
         << "Hash-based partition: middle key should only have encoded hash code";
     LOG(INFO) << "Split key: " << AsString(split_key);
   } else {
-    docdb::SubDocKey split_key;
-    ASSERT_OK(split_key.FullyDecodeFrom(encoded_split_key, docdb::HybridTimeRequired::kFalse));
+    dockv::SubDocKey split_key;
+    ASSERT_OK(split_key.FullyDecodeFrom(encoded_split_key, dockv::HybridTimeRequired::kFalse));
     ASSERT_EQ(split_key.num_subkeys(), 0)
         << "Range-based partition: middle doc key should not have sub doc key components";
     LOG(INFO) << "Split key: " << AsString(split_key);
@@ -1413,9 +1529,9 @@ TEST_F_EX(QLTabletTest, GetMiddleKey, QLTabletRf1Test) {
 
   rocksdb::ReadOptions read_opts;
   read_opts.query_id = rocksdb::kDefaultQueryId;
-  std::unique_ptr<rocksdb::Iterator> iter(tablet.TEST_db()->NewIterator(read_opts));
+  std::unique_ptr<rocksdb::Iterator> iter(tablet.regular_db()->NewIterator(read_opts));
 
-  for (iter->SeekToFirst(); iter->Valid(); iter->Next()) {
+  for (iter->SeekToFirst(); ASSERT_RESULT(iter->CheckedValid()); iter->Next()) {
     Slice key = iter->key();
     if (key.Less(encoded_split_key)) {
       ++num_keys_less;
@@ -1440,7 +1556,7 @@ namespace {
 std::vector<OpId> GetLastAppliedOpIds(const std::vector<tablet::TabletPeerPtr>& peers) {
   std::vector<OpId> last_applied_op_ids;
   for (auto& peer : peers) {
-    const auto last_applied_op_id = peer->consensus()->GetLastAppliedOpId();
+    const auto last_applied_op_id = CHECK_RESULT(peer->GetConsensus())->GetLastAppliedOpId();
     VLOG(1) << "Peer: " << AsString(peer->permanent_uuid())
             << ", last applied op ID: " << AsString(last_applied_op_id);
     last_applied_op_ids.push_back(last_applied_op_id);
@@ -1451,7 +1567,7 @@ std::vector<OpId> GetLastAppliedOpIds(const std::vector<tablet::TabletPeerPtr>& 
 Result<OpId> GetAllAppliedOpId(const std::vector<tablet::TabletPeerPtr>& peers) {
   for (auto& peer : peers) {
     if (peer->LeaderStatus() == consensus::LeaderStatus::LEADER_AND_READY) {
-      return peer->raft_consensus()->GetAllAppliedOpId();
+      return VERIFY_RESULT(peer->GetRaftConsensus())->GetAllAppliedOpId();
     }
   }
   return STATUS(NotFound, "No leader found");
@@ -1480,8 +1596,7 @@ TEST_F(QLTabletTest, LastAppliedOpIdTracking) {
 
   TableHandle table;
   CreateTable(kTable1Name, &table, /* num_tablets =*/1);
-  auto session = client_->NewSession();
-  session->SetTimeout(60s);
+  auto session = client_->NewSession(60s);
 
   LOG(INFO) << "Writing data...";
   int key = 0;
@@ -1527,7 +1642,7 @@ TEST_F(QLTabletTest, LastAppliedOpIdTracking) {
   ASSERT_GT(max_applied_op_id, all_applied_op_id);
 
   LOG(INFO) << "Restarting TS-0";
-  ASSERT_OK(cluster_->mini_tablet_server(0)->Start());
+  ASSERT_OK(cluster_->mini_tablet_server(0)->Start(tserver::WaitTabletsBootstrapped::kFalse));
 
   // TS-0 should catch up on applied ops.
   ASSERT_OK(WaitFor(
@@ -1542,14 +1657,13 @@ TEST_F(QLTabletTest, LastAppliedOpIdTracking) {
 }
 
 TEST_F(QLTabletTest, SlowPrepare) {
-  FLAGS_TEST_preparer_batch_inject_latency_ms = 100;
+  ANNOTATE_UNPROTECTED_WRITE(FLAGS_TEST_preparer_batch_inject_latency_ms) = 100;
 
   const int kNumTablets = 1;
 
-  auto session = client_->NewSession();
-  session->SetTimeout(60s);
+  auto session = client_->NewSession(60s);
 
-  TestWorkload workload(cluster_.get());
+  TestYcqlWorkload workload(cluster_.get());
   workload.set_table_name(kTable1Name);
   workload.set_write_timeout_millis(30000 * kTimeMultiplier);
   workload.set_num_tablets(kNumTablets);
@@ -1592,16 +1706,17 @@ TEST_F(QLTabletTest, ElectUnsynchronizedFollower) {
     req.set_new_leader_uuid(unsynchronized_follower);
     consensus::LeaderStepDownResponsePB resp;
 
-    FLAGS_leader_failure_max_missed_heartbeat_periods = 10000;
-    ASSERT_OK(peers.front()->raft_consensus()->StepDown(&req, &resp));
+    ANNOTATE_UNPROTECTED_WRITE(FLAGS_leader_failure_max_missed_heartbeat_periods) = 10000;
+    ASSERT_OK(ASSERT_RESULT(peers.front()->GetRaftConsensus())->StepDown(&req, &resp));
     ASSERT_FALSE(resp.has_error()) << resp.error().ShortDebugString();
   }
 
-  ASSERT_OK(cluster_->mini_tablet_server(0)->Start());
+  ASSERT_OK(cluster_->mini_tablet_server(0)->Start(tserver::WaitTabletsBootstrapped::kFalse));
 
   ASSERT_NO_FATALS(SetValue(session, 2, -2, table));
 
-  ASSERT_OK(cluster_->mini_tablet_server(follower_idx)->Start());
+  ASSERT_OK(cluster_->mini_tablet_server(follower_idx)->Start(
+    tserver::WaitTabletsBootstrapped::kFalse));
 }
 
 TEST_F(QLTabletTest, FollowerRestartDuringWrite) {
@@ -1619,7 +1734,8 @@ TEST_F(QLTabletTest, FollowerRestartDuringWrite) {
     LOG(INFO) << "Follower: "  << follower->permanent_uuid();
     auto follower_peers = follower->tablet_manager()->GetTabletPeers();
     for (const auto& peer : follower_peers) {
-      peer->raft_consensus()->TEST_DelayUpdate(FLAGS_raft_heartbeat_interval_ms / 2 * 1ms);
+      ASSERT_RESULT(peer->GetRaftConsensus())
+          ->TEST_DelayUpdate(FLAGS_raft_heartbeat_interval_ms / 2 * 1ms);
     }
 
     SetValue(session, 2, -2, table);
@@ -1635,7 +1751,8 @@ TEST_F(QLTabletTest, FollowerRestartDuringWrite) {
 
     SetValue(session, 4, -4, table);
 
-    ASSERT_OK(cluster_->mini_tablet_server(follower_idx)->Start());
+    ASSERT_OK(cluster_->mini_tablet_server(follower_idx)->Start(
+      tserver::WaitTabletsBootstrapped::kFalse));
 
     // Wait until newly started follower receive a new operation.
     // Without fix for GH #7145 it would crash in this case.
@@ -1646,6 +1763,12 @@ TEST_F(QLTabletTest, FollowerRestartDuringWrite) {
 }
 
 TEST_F_EX(QLTabletTest, DataBlockKeyValueEncoding, QLTabletRf1Test) {
+  // Key encoding gives benefits only when keys are nearly similar, for instance different columns
+  // of the same row.
+  // For packed row the benefit is smaller, so we disable packed row for this test, to check
+  // whether encoding works at all.
+  docdb::DisableYcqlPackedRow();
+
   constexpr auto kNumRows = 4000;
   constexpr auto kNumRowsPerBatch = 100;
   // We are testing delta encoding, but not compression.
@@ -1663,7 +1786,7 @@ TEST_F_EX(QLTabletTest, DataBlockKeyValueEncoding, QLTabletRf1Test) {
       rocksdb::KeyValueEncodingFormat::kKeyDeltaEncodingThreeSharedParts;
 
   for (auto encoding : {kEncodingSharedPrefix, kEncodingThreeSharedParts}) {
-    ANNOTATE_UNPROTECTED_WRITE(FLAGS_regular_tablets_data_block_key_value_encoding) =
+    ANNOTATE_UNPROTECTED_WRITE(FLAGS_ycql_regular_tablets_data_block_key_value_encoding) =
         KeyValueEncodingFormatToString(encoding);
     const YBTableName table_name(
         YQL_DATABASE_CQL, "my_keyspace", Format("ql_client_test_table_$0", encoding));
@@ -1681,16 +1804,18 @@ TEST_F_EX(QLTabletTest, DataBlockKeyValueEncoding, QLTabletRf1Test) {
     ASSERT_OK(cluster_->FlushTablets());
 
     auto get_tablet_size = [](tablet::Tablet* tablet) -> Result<size_t> {
-      RETURN_NOT_OK(tablet->Flush(tablet::FlushMode::kSync));
-      RETURN_NOT_OK(tablet->ForceFullRocksDBCompact(rocksdb::CompactionReason::kManualCompaction));
+      RETURN_NOT_OK(tablet->Flush(tablet::FlushMode::kSync, rocksdb::FlushReason::kTestOnly));
+      RETURN_NOT_OK(tablet->ForceManualRocksDBCompact());
       return tablet->GetCurrentVersionSstFilesSize();
     };
 
     for (const auto& tablet_peer : ListTableTabletPeers(cluster_.get(), table->id())) {
-      sst_sizes[encoding].regular_table += ASSERT_RESULT(get_tablet_size(tablet_peer->tablet()));
+      auto tablet = ASSERT_RESULT(tablet_peer->shared_tablet());
+      sst_sizes[encoding].regular_table += ASSERT_RESULT(get_tablet_size(tablet.get()));
     }
     for (const auto& tablet_peer : ListTableTabletPeers(cluster_.get(), index_table->id())) {
-      sst_sizes[encoding].index_table += ASSERT_RESULT(get_tablet_size(tablet_peer->tablet()));
+      auto tablet = ASSERT_RESULT(tablet_peer->shared_tablet());
+      sst_sizes[encoding].index_table += ASSERT_RESULT(get_tablet_size(tablet.get()));
     }
   }
   ASSERT_GT(
@@ -1702,21 +1827,21 @@ TEST_F_EX(QLTabletTest, DataBlockKeyValueEncoding, QLTabletRf1Test) {
 }
 
 TEST_F_EX(QLTabletTest, CompactDeletedColumn, QLTabletRf1Test) {
-  FLAGS_timestamp_history_retention_interval_sec = 0;
-  FLAGS_history_cutoff_propagation_interval_ms = 1;
+  ANNOTATE_UNPROTECTED_WRITE(FLAGS_timestamp_history_retention_interval_sec) = 0;
+  ANNOTATE_UNPROTECTED_WRITE(FLAGS_history_cutoff_propagation_interval_ms) = 1;
 
   constexpr int kKeys = 100;
   const std::string kStringColumn = "str_column";
 
   YBSchemaBuilder builder;
-  builder.AddColumn(kKeyColumn)->Type(INT32)->HashPrimaryKey()->NotNull();
+  builder.AddColumn(kKeyColumn)->Type(DataType::INT32)->HashPrimaryKey()->NotNull();
   builder.AddColumn(kValueColumn)->Type(DataType::INT32);
   builder.AddColumn(kStringColumn)->Type(DataType::STRING);
   TableHandle table;
   ASSERT_OK(table.Create(kTable1Name, 1, client_.get(), &builder));
   auto session = CreateSession();
   for (int key : Range(kKeys)) {
-    const auto op = table.NewWriteOp(QLWriteRequestPB::QL_STMT_INSERT);
+    const auto op = table.NewWriteOp(session->arena(), QLWriteRequestPB::QL_STMT_INSERT);
     auto* const req = op->mutable_request();
     QLAddInt32HashValue(req, key);
     table.AddInt32ColumnValue(req, kValueColumn, -key);
@@ -1727,7 +1852,11 @@ TEST_F_EX(QLTabletTest, CompactDeletedColumn, QLTabletRf1Test) {
   ASSERT_OK(cluster_->FlushTablets());
   uint64_t files_size = 0;
   for (const auto& peer : ListTabletPeers(cluster_.get(), ListPeersFilter::kAll)) {
-    files_size += peer->tablet()->GetCurrentVersionSstFilesUncompressedSize();
+    auto tablet = peer->shared_tablet_maybe_null();
+    if (!tablet) {
+      continue;
+    }
+    files_size += tablet->GetCurrentVersionSstFilesUncompressedSize();
   }
 
   ASSERT_OK(client_->NewTableAlterer(kTable1Name)->DropColumn(kStringColumn)->Alter());
@@ -1736,7 +1865,11 @@ TEST_F_EX(QLTabletTest, CompactDeletedColumn, QLTabletRf1Test) {
 
   uint64_t new_files_size = 0;
   for (const auto& peer : ListTabletPeers(cluster_.get(), ListPeersFilter::kAll)) {
-    new_files_size += peer->tablet()->GetCurrentVersionSstFilesUncompressedSize();
+    auto tablet = peer->shared_tablet_maybe_null();
+    if (!tablet) {
+      continue;
+    }
+    new_files_size += tablet->GetCurrentVersionSstFilesUncompressedSize();
   }
 
   LOG(INFO) << "Old files size: " << files_size << ", new files size: " << new_files_size;
@@ -1744,7 +1877,7 @@ TEST_F_EX(QLTabletTest, CompactDeletedColumn, QLTabletRf1Test) {
 }
 
 TEST_F_EX(QLTabletTest, ShortPKCompactionTime, QLTabletRf1Test) {
-  FLAGS_timestamp_history_retention_interval_sec = 0;
+  ANNOTATE_UNPROTECTED_WRITE(FLAGS_timestamp_history_retention_interval_sec) = 0;
 
   ActivateCompactionTimeLogging(cluster_.get());
 
@@ -1753,14 +1886,14 @@ TEST_F_EX(QLTabletTest, ShortPKCompactionTime, QLTabletRf1Test) {
   constexpr int kTabletFlushStep = kKeys / kFiles;
 
   YBSchemaBuilder builder;
-  builder.AddColumn(kKeyColumn)->Type(INT32)->HashPrimaryKey()->NotNull();
+  builder.AddColumn(kKeyColumn)->Type(DataType::INT32)->HashPrimaryKey()->NotNull();
   builder.AddColumn(kValueColumn)->Type(DataType::INT32);
   TableHandle table;
   ASSERT_OK(table.Create(kTable1Name, 1, client_.get(), &builder));
   auto session = CreateSession();
   int next_tablet_flush = kTabletFlushStep;
   for (int key : Range(kKeys)) {
-    const auto op = table.NewWriteOp(QLWriteRequestPB::QL_STMT_INSERT);
+    const auto op = table.NewWriteOp(session->arena(), QLWriteRequestPB::QL_STMT_INSERT);
     auto* const req = op->mutable_request();
     QLAddInt32HashValue(req, key);
     table.AddInt32ColumnValue(req, kValueColumn, -key);
@@ -1776,6 +1909,544 @@ TEST_F_EX(QLTabletTest, ShortPKCompactionTime, QLTabletRf1Test) {
   ASSERT_OK(session->TEST_Flush());
 
   ASSERT_OK(cluster_->CompactTablets());
+}
+
+TEST_F_EX(QLTabletTest, CorruptData, QLTabletRf1Test) {
+  // This test corrupts cluster by intention.
+  DontVerifyClusterBeforeNextTearDown();
+
+  constexpr auto kNumRows = 1000;
+
+  CreateTable(kTable1Name, &table1_, /* num_tablets = */ 1, /* transactional = */ false);
+  LOG(INFO) << "Created table";
+
+  FillTable(0, kNumRows, table1_);
+  LOG(INFO) << "Inserted " << kNumRows << " rows";
+
+  ASSERT_OK(cluster_->FlushTablets());
+  ASSERT_OK(cluster_->RestartSync());
+
+  auto peers = ListTabletPeers(cluster_.get(), ListPeersFilter::kAll);
+  for (const auto& peer : peers) {
+    auto tablet = peer->shared_tablet_maybe_null();
+    if (!tablet) {
+      continue;
+    }
+    auto* db = tablet->regular_db();
+    for (const auto& sst_file : db->GetLiveFilesMetaData()) {
+      LOG(INFO) << "Found SST file: " << AsString(sst_file);
+      const auto path_to_corrupt = sst_file.DataFilePath();
+      LOG(INFO) << "Corrupting file: " << path_to_corrupt;
+      ASSERT_OK(CorruptFile(
+          path_to_corrupt, /* offset = */ -1024, /* bytes_to_corrupt = */ 512,
+          CorruptionType::kXor55));
+    }
+  }
+
+  auto session = CreateSession();
+  const auto rows_count_result = CountRows(session, table1_);
+  LOG(INFO) << "Rows count result: " << rows_count_result;
+  ASSERT_FALSE(rows_count_result.ok());
+}
+
+// Make sure long reads are aborted by table drop.
+TEST_F_EX(QLTabletTest, DeleteTableDuringLongRead, QLTabletRf1Test) {
+  TestLongReadAbort([&]{
+    return client_->DeleteTable(
+        table1_.table()->id(), /* wait = */ true, /* txn = */ nullptr,
+        kMinSubTransactionId, CoarseMonoClock::now() + 1s * kTimeMultiplier);
+  });
+}
+
+// Make sure long reads are aborted by table truncate.
+TEST_F_EX(QLTabletTest, TruncateTableDuringLongRead, QLTabletRf1Test) {
+  TestLongReadAbort([&]{
+    return client_->TruncateTable(table1_.table()->id(), /* wait = */ true);
+  });
+}
+
+// This test check scenario when and old leader loose connectivity with remaining nodes.
+// And leader changed twice after this split.
+// So the newest leader has correct information about lease of the original leader.
+void QLTabletTest::TestLeaderLeaseRevocation(bool ht_lease) {
+  CreateTable(kTable1Name, &table1_, /* num_tablets= */ 1, /* transactional= */ false);
+  FillTable(0, 10, table1_);
+
+  auto peers = ListTabletPeers(cluster_.get(), ListPeersFilter::kLeaders);
+  ASSERT_EQ(peers.size(), 1);
+  auto old_leader_peer = peers[0];
+  size_t old_leader_idx = 0;
+  for (size_t i = 0; i != cluster_->num_tablet_servers(); ++i) {
+    if (cluster_->mini_tablet_server(i)->server()->permanent_uuid() ==
+            old_leader_peer->permanent_uuid()) {
+      old_leader_idx = i;
+      break;
+    }
+  }
+  auto old_leader_ts = cluster_->mini_tablet_server(old_leader_idx);
+  for (size_t i = 0; i != cluster_->num_tablet_servers(); ++i) {
+    if (i == old_leader_idx) {
+      continue;
+    }
+    ASSERT_OK(BreakConnectivity(cluster_.get(), old_leader_idx, i));
+  }
+  ASSERT_OK(WaitFor([this, old_leader_peer, &peers] {
+    peers = ListTabletPeers(cluster_.get(), ListPeersFilter::kLeaders);
+    for (const auto& peer : peers) {
+      if (peer != old_leader_peer) {
+        return true;
+      }
+    }
+    return false;
+  }, 20s, "Wait new leader"));
+  // If old leader already decided that he is not leader anymore just add it to peer artificially.
+  if (peers.size() < 2) {
+    peers.push_back(old_leader_peer);
+  }
+  // Old leader first and new leader second.
+  if (peers[0] != old_leader_peer) {
+    std::swap(peers[0], peers[1]);
+  }
+
+  auto intermediate_leader_ts = cluster_->find_tablet_server(peers[1]->permanent_uuid());
+  tserver::MiniTabletServer* final_leader_ts = nullptr;
+  for (size_t i = 0; i != cluster_->num_tablet_servers(); ++i) {
+    auto ts = cluster_->mini_tablet_server(i);
+    if (ts == old_leader_ts || ts == intermediate_leader_ts) {
+      continue;
+    }
+    final_leader_ts = ts;
+  }
+  ASSERT_NE(final_leader_ts, nullptr);
+  LOG(INFO) << "Old leader: " << old_leader_peer->permanent_uuid()
+            << ", intermediate leader: " << intermediate_leader_ts->server()->permanent_uuid()
+            << ", final leader: " << final_leader_ts->server()->permanent_uuid();
+
+  {
+    auto intermediate_leader_consensus = ASSERT_RESULT(peers[1]->GetRaftConsensus());
+    ASSERT_OK(WaitFor([intermediate_leader_consensus] {
+      return intermediate_leader_consensus->GetLeaderLeaseStatusIfLeader(nullptr) !=
+                 consensus::LeaderLeaseStatus::NO_MAJORITY_REPLICATED_LEASE;
+    }, 10s, "Intermediate leader replicated lease"));
+    consensus::LeaderStepDownRequestPB req;
+    consensus::LeaderStepDownResponsePB resp;
+    req.set_tablet_id(intermediate_leader_consensus->tablet_id());
+    req.set_new_leader_uuid(final_leader_ts->server()->permanent_uuid());
+    ASSERT_OK(intermediate_leader_consensus->StepDown(&req, &resp));
+  }
+  peers = ListTabletPeers(cluster_.get(), ListPeersFilter::kAll);
+  ASSERT_EQ(peers.size(), 3);
+  std::vector<std::string> uuids = {
+    old_leader_ts->server()->permanent_uuid(),
+    intermediate_leader_ts->server()->permanent_uuid(),
+    final_leader_ts->server()->permanent_uuid(),
+  };
+  for (int i = 0;; ++i) {
+    std::array<consensus::LeaderLeaseStatus, 3> statuses;
+    for (const auto& peer : peers) {
+      auto status = ASSERT_RESULT(peer->GetRaftConsensus())->GetLeaderLeaseStatusIfLeader(nullptr);
+      auto it = std::find(uuids.begin(), uuids.end(), peer->permanent_uuid());
+      ASSERT_NE(it, uuids.end());
+      statuses[it - uuids.begin()] = status;
+    }
+    LOG(INFO) << "LEASES: " << AsString(statuses);
+    ASSERT_NE(statuses[1], consensus::LeaderLeaseStatus::HAS_LEASE);
+    if (statuses[2] == consensus::LeaderLeaseStatus::HAS_LEASE) {
+      ASSERT_NE(statuses[0], consensus::LeaderLeaseStatus::HAS_LEASE);
+      break;
+    }
+    std::this_thread::sleep_for(250ms * kTimeMultiplier);
+    ASSERT_LE(i, 100);
+  }
+
+  if (ht_lease) {
+    auto session = CreateSession();
+    session->SetTimeout(5s * kTimeMultiplier);
+    auto op = CreateSetValueOp(session->arena(), 42, ValueForKey(42), table1_);
+    auto status = session->TEST_ApplyAndFlush(op);
+    // Fail because the old leader have lease and it cannot be revoked because lack of connectivity.
+    ASSERT_NOK(status);
+    ASSERT_STR_CONTAINS(status.ToString(), "Leader does not have a valid lease");
+  }
+}
+
+TEST_F(QLTabletTest, LeaderLeaseRevocation) {
+  ANNOTATE_UNPROTECTED_WRITE(FLAGS_leader_lease_duration_ms) = 10000;
+  TestLeaderLeaseRevocation(/* ht_lease= */ false);
+}
+
+TEST_F(QLTabletTest, LeaderHtLeaseRevocation) {
+  ANNOTATE_UNPROTECTED_WRITE(FLAGS_ht_lease_duration_ms) = 30000;
+  TestLeaderLeaseRevocation(/* ht_lease= */ true);
+}
+
+class GetTabletKeyRangesTest : public QLTabletRf1TestToggleEnablePackedRow {
+ protected:
+  void SetUp() override {
+    ANNOTATE_UNPROTECTED_WRITE(FLAGS_db_block_size_bytes) = 4_KB;
+    ANNOTATE_UNPROTECTED_WRITE(FLAGS_db_write_buffer_size) = 200_KB;
+    QLTabletRf1TestToggleEnablePackedRow::SetUp();
+  }
+
+  Result<TableHandle> CreateTestTable() {
+    TableHandle table;
+
+    YBSchemaBuilder builder;
+    // TODO(get_table_key_ranges): also test for hash-based sharding as soon as it is properly
+    // supported by GetTabletKeyRanges.
+    builder.AddColumn(kKeyColumn)->Type(DataType::INT32)->PrimaryKey()->NotNull();
+    builder.AddColumn(kValueColumn)->Type(DataType::STRING);
+    RETURN_NOT_OK(table.Create(kTable1Name, /* num_tablets = */ 1, client_.get(), &builder));
+    return table;
+  }
+
+  Result<tablet::TabletPtr> WriteData(
+      const TableHandle& table,
+      std::function<std::shared_ptr<YBqlWriteOp>(const ThreadSafeArenaPtr&)> write_op_generator) {
+    std::atomic<size_t> num_rows_inserted{0};
+    TestThreadHolder write_threads;
+
+    LOG(INFO) << "Starting workload ...";
+    Stopwatch s(Stopwatch::ALL_THREADS);
+    s.start();
+
+    for (auto t = 0; t < kNumWriteThreads; ++t) {
+      write_threads.AddThreadFunctor([this, &stop_requested = write_threads.stop_flag(),
+                                      &num_rows_inserted, &write_op_generator] {
+        auto session = CreateSession();
+        size_t num_ops_applied = 0;
+
+        while (!stop_requested) {
+          auto write_op = write_op_generator(session->arena());
+          session->Apply(write_op);
+          if (++num_ops_applied == kWriteBatchSize) {
+            const auto flush_status = session->TEST_FlushAndGetOpsErrors();
+            ASSERT_OK(flush_status.status);
+            ASSERT_EQ(flush_status.errors.size(), 0);
+            num_rows_inserted.fetch_add(num_ops_applied);
+            num_ops_applied = 0;
+          }
+        }
+      });
+    }
+
+    const auto peers = ListTabletPeers(cluster_.get(), ListPeersFilter::kLeaders);
+    SCHECK_EQ(peers.size(), 1, InternalError, "Expected single tablet");
+    const auto tablet = peers[0]->shared_tablet_maybe_null();
+    SCHECK_NOTNULL(tablet);
+    auto* db = tablet->regular_db();
+
+    while (std::cmp_less(
+               db->GetCurrentVersionSstFilesUncompressedSize(),
+               kNumFlushes * FLAGS_db_write_buffer_size) ||
+           db->GetCurrentVersionNumSSTFiles() < kNumSstFiles) {
+      std::this_thread::sleep_for(100ms);
+    }
+
+    write_threads.Stop();
+    s.stop();
+    LOG(INFO) << "Workload stopped, it took: " << AsString(s.elapsed());
+
+    LOG(INFO) << "Rows inserted: " << num_rows_inserted;
+    LOG(INFO) << "Number of SST files: " << db->GetCurrentVersionNumSSTFiles();
+    LOG(INFO) << "SST data size: " << db->GetCurrentVersionSstFilesUncompressedSize();
+    return tablet;
+  }
+
+  static constexpr auto kValueSize = 16;
+  static constexpr auto kWriteBatchSize = 128;
+  static constexpr auto kNumWriteThreads = 2;
+
+  static constexpr auto kNumSstFiles = 4;
+  static constexpr auto kNumFlushes = 15;
+
+  static constexpr auto kNumWorkers = 5;
+  static constexpr auto kMinMaxKeysRatioLimit = 0.75;
+};
+
+INSTANTIATE_TEST_SUITE_P(, GetTabletKeyRangesTest, ::testing::Bool());
+
+namespace {
+
+Status CalcKeysDistributionAcrossWorkers(
+    tablet::Tablet* tablet, std::vector<std::string> range_end_keys, const size_t num_workers,
+    const double min_max_keys_ratio_limit, tablet::Direction direction) {
+  std::vector<size_t> keys_per_worker(num_workers);
+
+  auto iter = CreateRocksDBIterator(
+      tablet->doc_db().regular, tablet->doc_db().key_bounds,
+      docdb::BloomFilterOptions::Inactive(), rocksdb::kDefaultQueryId,
+      /* file_filter = */ nullptr, /* iterate_upper_bound = */ nullptr,
+      rocksdb::CacheRestartBlockKeys { direction == tablet::Direction::kBackward });
+  if (direction == tablet::Direction::kForward) {
+    iter.SeekToFirst();
+  } else {
+    iter.SeekToLast();
+  }
+  std::string current_range_start_key;
+
+  auto range_key_iter = range_end_keys.begin();
+  size_t current_range_idx = 0;
+  size_t entries_in_current_range = 0;
+  while (iter.Valid() || range_key_iter != range_end_keys.end()) {
+    while (range_key_iter != range_end_keys.end() &&
+           (!iter.Valid() || (!range_key_iter->empty() && (direction == tablet::Direction::kForward
+                                                               ? iter.key() >= *range_key_iter
+                                                               : iter.key() <= *range_key_iter)))) {
+      LOG(INFO) << "Range #" << current_range_idx << "["
+                << Slice(current_range_start_key).ToDebugHexString() << ", "
+                << Slice(*range_key_iter).ToDebugHexString() << ") has " << entries_in_current_range
+                << " rocksdb records";
+      keys_per_worker[current_range_idx % num_workers] += entries_in_current_range;
+      current_range_start_key = *range_key_iter;
+      ++range_key_iter;
+      ++current_range_idx;
+      entries_in_current_range = 0;
+    }
+    if (iter.Valid()) {
+      ++entries_in_current_range;
+      if (direction == tablet::Direction::kForward) {
+        iter.Next();
+      } else {
+        iter.Prev();
+      }
+    }
+  }
+  RETURN_NOT_OK(iter.status());
+
+  LOG(INFO) << "Keys per worker: " << AsString(keys_per_worker);
+
+  const auto [min_keys_per_worker, max_keys_per_worker] =
+      std::minmax_element(keys_per_worker.begin(), keys_per_worker.end());
+  const double ratio = 1.0 * *min_keys_per_worker / *max_keys_per_worker;
+
+  SCHECK_GE(
+      ratio, min_max_keys_ratio_limit, InternalError,
+      Format(
+          "Expected min/max keys per worker ratio to be not less than $0 but got $1, "
+          "min_keys_per_worker: $2, max_keys_per_worker: $3",
+          min_max_keys_ratio_limit, ratio, *min_keys_per_worker, *max_keys_per_worker));
+  return Status::OK();
+}
+
+Status CheckRangeKeysOrder(
+    const std::vector<std::string>& range_boundary_keys, tablet::Direction direction) {
+  SCHECK_GE(
+      range_boundary_keys.size(), size_t(1), InternalError, "We should have at least 1 range.");
+
+  for (size_t i = 0; i + 2 < range_boundary_keys.size(); ++i) {
+    switch (direction) {
+      case tablet::Direction::kForward:
+        SCHECK_LT(range_boundary_keys[i], range_boundary_keys[i + 1], InternalError, "Wrong order");
+        continue;
+      case tablet::Direction::kBackward:
+        SCHECK_GT(range_boundary_keys[i], range_boundary_keys[i + 1], InternalError, "Wrong order");
+        continue;
+    }
+    FATAL_INVALID_ENUM_VALUE(tablet::Direction, direction);
+  }
+  return Status::OK();
+}
+
+Status CheckBoundariesAreExcluded(
+    const std::vector<std::string>& test_range_keys, tablet::Tablet* tablet,
+    uint64_t max_num_ranges, uint64_t range_size_bytes, tablet::Direction direction,
+    uint32_t max_key_length) {
+  auto is_not_empty = [](const std::string& key) { return !key.empty(); };
+  Slice first_key = test_range_keys.front();
+  if (first_key.empty()) {
+    SCHECK_EQ(
+        test_range_keys.size(), 1, InternalError,
+        "Shouldn't have empty first range key when it is not the only one.");
+    return Status::OK();
+  }
+  Slice last_key =
+      *std::find_if(test_range_keys.rbegin(), test_range_keys.rend(), is_not_empty);
+
+  Slice lower_bound_key = std::min(first_key, last_key);
+  Slice upper_bound_key = std::max(first_key, last_key);
+
+  LOG(INFO) << "Check for boundaries to be exclusive, lower_bound_key: "
+            << lower_bound_key.ToDebugHexString()
+            << " upper_bound_key: " << upper_bound_key.ToDebugHexString();
+
+  std::vector<std::string> range_keys;
+  RETURN_NOT_OK(tablet->TEST_GetTabletKeyRanges(
+      lower_bound_key, upper_bound_key, max_num_ranges, range_size_bytes, direction,
+      max_key_length, [&range_keys](Slice key) {
+        LOG(INFO) << "Got range boundary key: " << key.ToDebugHexString();
+        range_keys.push_back(key.ToBuffer());
+      }));
+
+  RETURN_NOT_OK(CheckRangeKeysOrder(range_keys, direction));
+
+  for (auto& key : range_keys) {
+    if (key.empty()) {
+      continue;
+    }
+    SCHECK_GT(key, lower_bound_key, InternalError, "Expected key to be greater than lower bound");
+    SCHECK_LT(key, upper_bound_key, InternalError, "Expected key to be less than upper bound");
+  }
+  return Status::OK();
+}
+
+} // namespace
+
+TEST_P(GetTabletKeyRangesTest, Distribution) {
+  auto table = ASSERT_RESULT(CreateTestTable());
+
+  auto tablet = ASSERT_RESULT(WriteData(table, [&table](const ThreadSafeArenaPtr& arena) {
+    auto insert = table.NewInsertOp(arena);
+    auto req = insert->mutable_request();
+    const auto key = RandomUniformInt<int32_t>();
+
+    QLAddInt32RangeValue(req, key);
+    table.AddStringColumnValue(req, kValueColumn, RandomString(kValueSize));
+    return insert;
+  }));
+  auto* db = tablet->regular_db();
+
+  NO_PENDING_FATALS();
+
+  const auto range_size_bytes = db->GetCurrentVersionSstFilesUncompressedSize() / 50;
+
+  for (auto direction : {tablet::Direction::kForward, tablet::Direction::kBackward}) {
+    for (uint32_t max_key_length : {1024, 16, 8, 4, 2}) {
+      LOG(INFO) << "max_key_length: " << max_key_length << " direction: " << AsString(direction);
+
+      // List of range end/start keys depending on whether is_forward is true/false.
+      std::vector<std::string> range_boundary_keys;
+      auto add_range_boundary_key = [&range_boundary_keys](Slice key) {
+        LOG(INFO) << "Got range boundary key: " << key.ToDebugHexString();
+        range_boundary_keys.push_back(key.ToBuffer());
+      };
+
+      ASSERT_OK(tablet->TEST_GetTabletKeyRanges(
+          Slice(), Slice(), std::numeric_limits<uint64_t>::max(), range_size_bytes,
+          direction, max_key_length, add_range_boundary_key));
+
+      LOG(INFO) << "Ranges count: " << range_boundary_keys.size();
+
+      ASSERT_OK(CheckRangeKeysOrder(range_boundary_keys, direction));
+      ASSERT_EQ(range_boundary_keys.back(), "");
+
+      // TODO(get_table_key_ranges): For now we are returning full DocKeys and skipping ones that
+      // are longer than max_key_length, because truncated DocKeys are not supported as lower/upper
+      // bounds for scans. So, if DocKeys are longer than max_key_length we can have very uneven
+      // distribution across ranges/workers.
+      const auto min_max_keys_ratio_limit = max_key_length > 8 ? kMinMaxKeysRatioLimit : 0;
+
+      ASSERT_OK(CalcKeysDistributionAcrossWorkers(
+          tablet.get(), range_boundary_keys, kNumWorkers, min_max_keys_ratio_limit, direction));
+
+      // Get ranges in multiple batches, verify it covers the whole space.
+      constexpr auto kNumRangesPerBatch = 5;
+      std::string start_key = "";
+
+      std::vector<string> range_boundary_keys_from_batches;
+      for (;;) {
+        std::vector<string> range_boundary_keys_batch;
+        LOG(INFO) << "Getting tablet key ranges starting from: "
+                  << Slice(start_key).ToDebugHexString() << " direction: " << AsString(direction);
+
+        {
+          auto lower_bound_key = direction == tablet::Direction::kForward ? start_key : Slice();
+          auto upper_bound_key = direction == tablet::Direction::kForward ? Slice() : start_key;
+
+          ASSERT_OK(tablet->TEST_GetTabletKeyRanges(
+              lower_bound_key, upper_bound_key, kNumRangesPerBatch,
+              range_size_bytes, direction, max_key_length, [&range_boundary_keys_batch](Slice key) {
+                LOG(INFO) << "Got range boundary key: " << key.ToDebugHexString();
+                range_boundary_keys_batch.push_back(key.ToBuffer());
+              }));
+
+          ASSERT_LE(range_boundary_keys_batch.size(), kNumRangesPerBatch);
+
+          // We should have at least 1 range.
+          ASSERT_GE(range_boundary_keys_batch.size(), 1);
+
+          for (const auto& key : range_boundary_keys_batch) {
+            if (!key.empty()) {
+              ASSERT_GT(key, lower_bound_key);
+            }
+            if (!upper_bound_key.empty()) {
+              ASSERT_LT(key, upper_bound_key);
+            }
+            range_boundary_keys_from_batches.push_back(key);
+          }
+        }
+
+        ASSERT_OK(CheckBoundariesAreExcluded(
+            range_boundary_keys, tablet.get(), kNumRangesPerBatch, range_size_bytes, direction,
+            max_key_length));
+
+        if (range_boundary_keys_batch.back().empty()) {
+          // We've reached the end.
+          break;
+        }
+
+        ASSERT_EQ(range_boundary_keys_batch.size(), kNumRangesPerBatch);
+
+        // Use last returned key as start key for next batch of ranges.
+        start_key = range_boundary_keys_batch.back();
+      }
+
+      ASSERT_OK(CalcKeysDistributionAcrossWorkers(
+          tablet.get(), range_boundary_keys_from_batches, kNumWorkers, min_max_keys_ratio_limit,
+          direction));
+    }
+  }
+}
+
+TEST_P(GetTabletKeyRangesTest, Boundaries) {
+  constexpr auto kNumDifferentKeys = 3;
+  constexpr auto kMaxKeyLength = 1024;
+
+  auto table = ASSERT_RESULT(CreateTestTable());
+
+  std::atomic<int32_t> ops_generated{0};
+
+  auto tablet = ASSERT_RESULT(WriteData(
+      table, [&table, &ops_generated](const ThreadSafeArenaPtr& arena){
+    const auto ops_already_generated = ops_generated.fetch_add(1);
+    const auto key = ops_already_generated % kNumDifferentKeys;
+
+    auto insert = table.NewInsertOp(arena);
+    auto req = insert->mutable_request();
+
+    QLAddInt32RangeValue(req, key);
+    table.AddStringColumnValue(req, kValueColumn, RandomString(kValueSize));
+    return insert;
+  }));
+  auto* db = tablet->regular_db();
+
+  NO_PENDING_FATALS();
+
+  const auto range_size_bytes = db->GetCurrentVersionSstFilesUncompressedSize() / 50;
+
+  for (auto direction : {tablet::Direction::kForward, tablet::Direction::kBackward}) {
+    LOG(INFO) << "direction: " << AsString(direction);
+
+    std::vector<std::string> range_boundary_keys;
+    auto add_range_boundary_key = [&range_boundary_keys](Slice key) {
+      LOG(INFO) << "Got range boundary key: " << key.ToDebugHexString();
+      range_boundary_keys.push_back(key.ToBuffer());
+    };
+
+    ASSERT_OK(tablet->TEST_GetTabletKeyRanges(
+        Slice(), Slice(), std::numeric_limits<uint64_t>::max(), range_size_bytes, direction,
+        kMaxKeyLength, add_range_boundary_key));
+
+    LOG(INFO) << "Ranges count: " << range_boundary_keys.size();
+
+    ASSERT_OK(CheckRangeKeysOrder(range_boundary_keys, direction));
+    ASSERT_TRUE(range_boundary_keys.back().empty());
+    ASSERT_GT(range_boundary_keys.size(), 2);
+
+    ASSERT_OK(CheckBoundariesAreExcluded(
+        range_boundary_keys, tablet.get(), std::numeric_limits<uint64_t>::max(), range_size_bytes,
+        direction, kMaxKeyLength));
+  }
 }
 
 } // namespace client

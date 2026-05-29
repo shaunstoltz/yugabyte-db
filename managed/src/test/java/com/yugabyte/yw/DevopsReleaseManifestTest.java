@@ -1,5 +1,5 @@
 /*
- * Copyright 2021 YugaByte, Inc. and Contributors
+ * Copyright 2021 YugabyteDB, Inc. and Contributors
  *
  * Licensed under the Polyform Free Trial License 1.0.0 (the "License"); you
  * may not use this file except in compliance with the License. You
@@ -38,7 +38,6 @@ public class DevopsReleaseManifestTest {
                   "create_instance.yml",
                   "local_role.yml",
                   "python3_requirements.txt",
-                  "python_requirements.txt",
                   "replicated.yml",
                   "version.txt",
                   "yb_release",
@@ -47,13 +46,13 @@ public class DevopsReleaseManifestTest {
           .put(
               "bin",
               ImmutableSet.of(
-                  "ansible-playbook.sh",
                   "ansible_runner.sh",
                   "diagnostics.sh",
                   "filter_ansible_output.py",
                   "freeze_python_requirements.sh",
                   "refresh_roles_in_release_manifest.py",
                   "remove_leaf_yaml_nodes.py",
+                  "run_add_superadmin_tests.sh",
                   "run_in_virtualenv.sh",
                   "run_tests.sh",
                   "yb_platform_util.py"))

@@ -1,4 +1,4 @@
-// Copyright (c) YugaByte, Inc.
+// Copyright (c) YugabyteDB, Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License"); you may not use this file except
 // in compliance with the License.  You may obtain a copy of the License at
@@ -15,14 +15,14 @@ package org.yb.pgsql;
 import org.junit.Test;
 import org.junit.runner.RunWith;
 import org.yb.client.TestUtils;
-import org.yb.util.YBTestRunnerNonTsanOnly;
+import org.yb.YBTestRunner;
 
 import java.io.File;
 
 import java.util.Map;
 
-@RunWith(value = YBTestRunnerNonTsanOnly.class)
-public class TestPgRegressContribPasswordCheck extends BasePgSQLTest {
+@RunWith(value = YBTestRunner.class)
+public class TestPgRegressContribPasswordCheck extends BasePgRegressTest {
     @Override
     public int getTestMethodTimeoutSec() {
         return 1800;
@@ -31,7 +31,7 @@ public class TestPgRegressContribPasswordCheck extends BasePgSQLTest {
     @Override
     protected Map<String, String> getTServerFlags() {
         Map<String, String> flagMap = super.getTServerFlags();
-        flagMap.put("ysql_pg_conf", "shared_preload_libraries='passwordcheck'");
+        appendToYsqlPgConf(flagMap, "shared_preload_libraries='passwordcheck'");
         return flagMap;
     }
 

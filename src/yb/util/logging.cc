@@ -15,9 +15,9 @@
 // specific language governing permissions and limitations
 // under the License.
 //
-// The following only applies to changes made to this file as part of YugaByte development.
+// The following only applies to changes made to this file as part of YugabyteDB development.
 //
-// Portions Copyright (c) YugaByte, Inc.
+// Portions Copyright (c) YugabyteDB, Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License"); you may not use this file except
 // in compliance with the License.  You may obtain a copy of the License at
@@ -41,18 +41,17 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-#include "yb/util/logging.h"
-
 #include <signal.h>
 #include <stdio.h>
 
 #include <fstream>
 #include <iostream>
+#include <iomanip>
 #include <regex>
 
 #include <boost/uuid/uuid_generators.hpp>
 #include <boost/uuid/uuid_io.hpp>
-#include <glog/logging.h>
+#include "yb/util/logging.h"
 
 #include "yb/gutil/callback.h"
 #include "yb/gutil/ref_counted.h"
@@ -61,21 +60,30 @@
 #include "yb/util/debug-util.h"
 #include "yb/util/flags.h"
 #include "yb/util/format.h"
+#include "yb/util/path_util.h"
+#include "yb/util/symbolize.h"
+#include "yb/util/thread.h"
 
-DEFINE_UNKNOWN_string(log_filename, "",
+DEFINE_NON_RUNTIME_string(log_filename, "",
     "Prefix of log filename - "
     "full path is <log_dir>/<log_filename>.[INFO|WARN|ERROR|FATAL]");
 TAG_FLAG(log_filename, stable);
 
-DEFINE_UNKNOWN_string(fatal_details_path_prefix, "",
+DEFINE_RUNTIME_string(fatal_details_path_prefix, "",
               "A prefix to use for the path of a file to save fatal failure stack trace and "
               "other details to.");
-DEFINE_UNKNOWN_string(minicluster_daemon_id, "",
+DEFINE_RUNTIME_string(minicluster_daemon_id, "",
               "A human-readable 'daemon id', e.g. 'm-1' or 'ts-2', used in tests.");
 
-DEFINE_UNKNOWN_string(ref_counted_debug_type_name_regex, "",
+DEFINE_NON_RUNTIME_string(ref_counted_debug_type_name_regex, "",
               "Regex for type names for debugging RefCounted / scoped_refptr based classes. "
               "An empty string disables RefCounted debug logging.");
+
+DEFINE_RUNTIME_bool(disable_core_dumps_on_fatal, true,
+    "Whether to disable core dumps when a FATAL log is encountered. "
+    "Set to false to allow full core dumps on FATAL for debugging purposes.");
+
+DECLARE_bool(TEST_running_test);
 
 const char* kProjName = "yb";
 
@@ -203,6 +211,10 @@ void InitializeGoogleLogging(const char *arg) {
   google::InitGoogleLogging(arg);
 
   google::InstallFailureFunction(DumpStackTraceAndExit);
+
+  if (FLAGS_TEST_running_test) {
+    google::SetLogPrefix(&TEST_GetThreadLogPrefix);
+  }
 
   log_fatal_handler_sink = std::make_unique<LogFatalHandlerSink>();
 }
@@ -358,6 +370,30 @@ void GetFullLogFilename(google::LogSeverity severity, string* filename) {
   *filename = ss.str();
 }
 
+string GetLogFilePathnamePrefix() {
+  if (FLAGS_log_dir.empty() || FLAGS_log_filename.empty()) {
+    return "<empty_log_dir_or_filename>";
+  }
+  return JoinPathSegments(FLAGS_log_dir, FLAGS_log_filename);
+}
+
+// This code is a copy of the google/glog C++ library code to build the
+// time_pid_string used in CreateLogfile() for log file name suffix.
+// This helper function is used to print the suffix in tserver.err/master.err
+// at boot time to help locate the right log file during incident troubleshooting.
+string GetTimePidString(uint64_t now_micros, int pid) {
+  time_t now_seconds = static_cast<time_t>(now_micros / 1000000);
+  struct ::tm tm_time;
+  localtime_r(&now_seconds, &tm_time);
+  ostringstream time_pid_stream;
+  time_pid_stream.fill('0');
+  time_pid_stream << 1900 + tm_time.tm_year << setw(2) << 1 + tm_time.tm_mon
+                  << setw(2) << tm_time.tm_mday << '-' << setw(2)
+                  << tm_time.tm_hour << setw(2) << tm_time.tm_min << setw(2)
+                  << tm_time.tm_sec << '.' << pid;
+  return time_pid_stream.str();
+}
+
 void ShutdownLoggingSafe() {
   SpinLockHolder l(&logging_mutex);
   if (!logging_initialized) return;
@@ -371,22 +407,11 @@ void ShutdownLoggingSafe() {
   logging_initialized = false;
 }
 
-// Support for the special THROTTLE_MSG token in a log message stream.
-ostream& operator<<(ostream &os, const PRIVATE_ThrottleMsg&) {
-  using google::LogMessage;
-#ifdef DISABLE_RTTI
-  LogMessage::LogStream *log = static_cast<LogMessage::LogStream*>(&os);
-#else
-  LogMessage::LogStream *log = dynamic_cast<LogMessage::LogStream*>(&os);
-#endif
-  CHECK(log && log == log->self())
-      << "You must not use COUNTER with non-glog ostream";
-  int ctr = log->ctr();
-  if (ctr > 0) {
-    os << " [suppressed " << ctr << " similar messages]";
-  }
-  return os;
+namespace logging_internal {
+ThrottledLogWriter MakeThrottledLogWriter(google::LogMessage&& log_writer, const char* prefix) {
+  return ThrottledLogWriter(std::move(log_writer), prefix);
 }
+} // namespace logging_internal
 
 void DisableCoreDumps() {
   struct rlimit lim;
@@ -440,36 +465,41 @@ LogFatalHandlerSink::~LogFatalHandlerSink() {
 void LogFatalHandlerSink::send(
     google::LogSeverity severity, const char* full_filename, const char* base_filename,
     int line_number, const struct tm* tm_time, const char* message, size_t message_len) {
-  if (severity == LogSeverity::SEVERITY_FATAL) {
-    DisableCoreDumps();
-    string timestamp_for_filename;
-    StringAppendStrftime(&timestamp_for_filename, "%Y-%m-%dT%H_%M_%S", tm_time);
-    const string output_path = Format(
-        "$0.$1.pid$2.txt", GetFatalDetailsPathPrefix(), timestamp_for_filename, getpid());
-    // Use a line format similar to glog with a couple of slight differences:
-    // - Report full file path.
-    // - Time has no microsecond component.
-    string output_str = "F";
-    StringAppendStrftime(&output_str, "%Y%m%d %H:%M:%S", tm_time);
-    // TODO: append thread id if we need to.
-    StringAppendF(&output_str, " %s:%d] ", full_filename, line_number);
-    output_str += std::string(message, message_len);
-    output_str += "\n";
-    output_str += GetStackTrace();
-
-    ofstream out_f(output_path);
-    if (out_f) {
-      out_f << output_str << endl;
-    }
-    if (out_f.bad()) {
-      cerr << "Failed to write fatal failure details to " << output_path << endl;
-    } else {
-      cerr << "Fatal failure details written to " << output_path << endl;
-    }
-    // Also output fatal failure details to stderr so make sure we have a properly symbolized stack
-    // trace in the context of a test.
-    cerr << output_str << endl;
+  if (severity != LogSeverity::SEVERITY_FATAL) {
+    return;
   }
+
+  if (FLAGS_disable_core_dumps_on_fatal) {
+    DisableCoreDumps();
+  }
+
+  string timestamp_for_filename;
+  StringAppendStrftime(&timestamp_for_filename, "%Y-%m-%dT%H_%M_%S", tm_time);
+  const string output_path = Format(
+      "$0.$1.pid$2.txt", GetFatalDetailsPathPrefix(), timestamp_for_filename, getpid());
+  // Use a line format similar to glog with a couple of slight differences:
+  // - Report full file path.
+  // - Time has no microsecond component.
+  string output_str = "F";
+  StringAppendStrftime(&output_str, "%Y%m%d %H:%M:%S", tm_time);
+  // TODO: append thread id if we need to.
+  StringAppendF(&output_str, " %s:%d] ", full_filename, line_number);
+  output_str += std::string(message, message_len);
+  output_str += "\n";
+  output_str += GetStackTrace();
+
+  ofstream out_f(output_path);
+  if (out_f) {
+    out_f << output_str << endl;
+  }
+  if (out_f.bad()) {
+    cerr << "Failed to write fatal failure details to " << output_path << endl;
+  } else {
+    cerr << "Fatal failure details written to " << output_path << endl;
+  }
+  // Also output fatal failure details to stderr so make sure we have a properly symbolized stack
+  // trace in the context of a test.
+  cerr << output_str << endl;
 }
 
 namespace logging_internal {
@@ -478,7 +508,7 @@ bool LogRateThrottler::TooMany() {
   const auto now = CoarseMonoClock::Now();
   const auto drop_limit = now - duration_;
   const auto queue_size = queue_.size();
-  std::lock_guard<std::mutex> lock(mutex_);
+  std::lock_guard lock(mutex_);
   while (count_ > 0 && queue_[head_] < drop_limit) {
     ++head_;
     if (head_ >= queue_size) {
@@ -499,5 +529,14 @@ bool LogRateThrottler::TooMany() {
 }
 
 } // namespace logging_internal
+
+std::string RemoveLogPrefixColon(const std::string& log_prefix) {
+  DCHECK(log_prefix.ends_with(": "));
+  return log_prefix.substr(0, log_prefix.size() - 2);
+}
+
+std::string AddSuffixToLogPrefix(const std::string& log_prefix, const std::string& suffix) {
+  return RemoveLogPrefixColon(log_prefix) + suffix + ": ";
+}
 
 } // namespace yb

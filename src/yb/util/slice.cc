@@ -15,9 +15,9 @@
 // specific language governing permissions and limitations
 // under the License.
 //
-// The following only applies to changes made to this file as part of YugaByte development.
+// The following only applies to changes made to this file as part of YugabyteDB development.
 //
-// Portions Copyright (c) YugaByte, Inc.
+// Portions Copyright (c) YugabyteDB, Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License"); you may not use this file except
 // in compliance with the License.  You may obtain a copy of the License at
@@ -73,6 +73,7 @@ std::string Slice::ToDebugHexString() const {
 }
 
 std::string Slice::ToDebugString(size_t max_len) const {
+  constexpr auto kMaxAbbreviatedSuffixLength = 40;
   size_t bytes_to_print = size();
   bool abbreviated = false;
   if (max_len != 0 && bytes_to_print > max_len) {
@@ -87,30 +88,40 @@ std::string Slice::ToDebugString(size_t max_len) const {
     }
   }
 
-  if (num_not_graph * 100 >
-      bytes_to_print * FLAGS_non_graph_characters_percentage_to_use_hexadecimal_rendering) {
+  const auto print_as_hex =
+      num_not_graph * 100 >
+      bytes_to_print * FLAGS_non_graph_characters_percentage_to_use_hexadecimal_rendering;
+
+  if (print_as_hex && !abbreviated) {
     return ToDebugHexString();
   }
-  size_t size = bytes_to_print + 3 * num_not_graph + (abbreviated ? 20 : 0);
 
   std::string ret;
+  size_t size = (print_as_hex ? 2 * bytes_to_print : bytes_to_print + 3 * num_not_graph) +
+                (abbreviated ? kMaxAbbreviatedSuffixLength : 0);
   ret.reserve(size);
-  for (size_t i = 0; i < bytes_to_print; i++) {
-    auto ch = begin_[i];
-    if (!isgraph(ch)) {
-      if (ch == '\r') {
-        ret += "\\r";
-      } else if (ch == '\n') {
-        ret += "\\n";
-      } else if (ch == ' ') {
-        ret += ' ';
+
+  if (print_as_hex) {
+    ret.append(PrefixNoLongerThan(bytes_to_print).ToDebugHexString());
+  } else {
+    for (size_t i = 0; i < bytes_to_print; i++) {
+      auto ch = begin_[i];
+      if (!isgraph(ch)) {
+        if (ch == '\r') {
+          ret += "\\r";
+        } else if (ch == '\n') {
+          ret += "\\n";
+        } else if (ch == ' ') {
+          ret += ' ';
+        } else {
+          StringAppendF(&ret, "\\x%02x", ch & 0xff);
+        }
       } else {
-        StringAppendF(&ret, "\\x%02x", ch & 0xff);
+        ret.push_back(ch);
       }
-    } else {
-      ret.push_back(ch);
     }
   }
+
   if (abbreviated) {
     StringAppendF(&ret, "...<%zd bytes total>", this->size());
   }
@@ -145,7 +156,7 @@ uint8_t Slice::operator[](size_t n) const {
   return begin_[n];
 }
 
-void Slice::remove_prefix(size_t n) {
+void Slice::RemovePrefix(size_t n) {
   DCHECK_LE(n, size());
   begin_ += n;
 }
@@ -155,12 +166,16 @@ Slice Slice::Prefix(size_t n) const {
   return Slice(begin_, n);
 }
 
+Slice Slice::PrefixNoLongerThan(size_t n) const {
+  return Slice(begin_, std::min(n, size()));
+}
+
 Slice Slice::WithoutPrefix(size_t n) const {
   DCHECK_LE(n, size());
   return Slice(begin_ + n, end_);
 }
 
-void Slice::remove_suffix(size_t n) {
+void Slice::RemoveSuffix(size_t n) {
   DCHECK_LE(n, size());
   end_ -= n;
 }
@@ -180,9 +195,21 @@ void Slice::truncate(size_t n) {
   end_ = begin_ + n;
 }
 
+void Slice::MakeNoLongerThan(size_t n) {
+  if (n >= size()) {
+    return;
+  }
+  end_ = begin_ + n;
+}
+
 char Slice::consume_byte() {
   DCHECK_GT(end_, begin_);
   return *begin_++;
+}
+
+char Slice::consume_byte_back() {
+  DCHECK_GT(end_, begin_);
+  return *(--end_);
 }
 
 void Slice::AppendTo(std::string* out) const {
@@ -197,7 +224,7 @@ void Slice::AppendTo(faststring* out) const {
   out->append(cdata(), size());
 }
 
-bool Slice::Contains(const Slice& rhs) const {
+bool Slice::Contains(Slice rhs) const {
   return std::string_view(*this).find(rhs) != std::string::npos;
 }
 

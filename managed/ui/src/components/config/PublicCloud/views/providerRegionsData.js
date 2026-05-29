@@ -1,5 +1,12 @@
+// The following region arrays are used in the old provider form.
+// Please also add any new regions and zones to:
+// src/components/configRedesign/providerRedesign/providerRegionsData.ts
+// so that the new kubernetes provider UI stays in sync.
+// The old provider UI and its related components/constants/types will be removed once
+// it is no longer used as a fallback option.
+
 // These should match the metadata in devops under opscli/ybops/data/aws-metadata.yml
-export const regionsData = [
+export const AWS_REGIONS = [
   {
     destVpcRegion: 'ap-northeast-1',
     zones: ['ap-northeast-1a', 'ap-northeast-1c', 'ap-northeast-1d']
@@ -25,6 +32,10 @@ export const regionsData = [
   {
     destVpcRegion: 'ap-southeast-2',
     zones: ['ap-southeast-2a', 'ap-southeast-2b', 'ap-southeast-2c']
+  },
+  {
+    destVpcRegion: 'ap-southeast-3',
+    zones: ['ap-southeast-3a', 'ap-southeast-3b', 'ap-southeast-3c']
   },
   {
     destVpcRegion: 'ca-central-1',
@@ -65,7 +76,82 @@ export const regionsData = [
   {
     destVpcRegion: 'us-west-2',
     zones: ['us-west-2a', 'us-west-2b', 'us-west-2c']
+  },
+  {
+    destVpcRegion: 'mx-central-1',
+    zones: ['mx-central-1a', 'mx-central-1b', 'mx-central-1c']
+  },
+  {
+    destVpcRegion: 'af-south-1',
+    zones: ['af-south-1a', 'af-south-1b', 'af-south-1c']
+  },
+  {
+    destVpcRegion: 'me-south-1',
+    zones: ['me-south-1a', 'me-south-1b', 'me-south-1c']
+  },
+  {
+    destVpcRegion: 'me-central-1',
+    zones: ['me-central-1a', 'me-central-1b', 'me-central-1c']
+  },
+  {
+    destVpcRegion: 'ap-east-1',
+    zones: ['ap-east-1a', 'ap-east-1b', 'ap-east-1c']
+  },
+  {
+    destVpcRegion: 'eu-south-1',
+    zones: ['eu-south-1a', 'eu-south-1b', 'eu-south-1c']
+  },
+  {
+    destVpcRegion: 'eu-north-1',
+    zones: ['eu-north-1a', 'eu-north-1b', 'eu-north-1c']
+  },
+  {
+    destVpcRegion: 'us-gov-east-1',
+    zones: ['us-gov-east-1a', 'us-gov-east-1b', 'us-gov-east-1c']
+  },
+  {
+    destVpcRegion: 'us-gov-west-1',
+    zones: ['us-gov-west-1a', 'us-gov-west-1b', 'us-gov-west-1c']
   }
+];
+export const OCI_KMS_Region = [
+  { value: 'us-ashburn-1', label: 'US East (Ashburn)' },
+  { value: 'us-phoenix-1', label: 'US West (Phoenix)' },
+  { value: 'eu-frankfurt-1', label: 'Germany Central (Frankfurt)' },
+  { value: 'ca-montreal-1', label: 'Canada Southeast (Montreal)' },
+  { value: 'uk-london-1', label: 'UK South (London)' },
+  { value: 'ap-sydney-1', label: 'Australia East (Sydney)' },
+  { value: 'ap-tokyo-1', label: 'Japan East (Tokyo)' },
+  { value: 'ap-mumbai-1', label: 'India West (Mumbai)' },
+  { value: 'ap-seoul-1', label: 'AP Northeast (Seoul)' },
+  { value: 'ap-osaka-1', label: 'Japan Central (Osaka)' },
+  { value: 'ca-toronto-1', label: 'Canada Southeast (Toronto)' },
+  { value: 'sa-saopaulo-1', label: 'Brazil East (Sao Paulo)' },
+  { value: 'sa-santiago-1', label: 'Chile Central (Santiago)' },
+  { value: 'eu-amsterdam-1', label: 'Netherlands Northwest (Amsterdam)' },
+  { value: 'me-jeddah-1', label: 'Saudi Arabia West (Jeddah)' },
+  { value: 'ap-singapore-1', label: 'AP Southeast (Singapore)' },
+  { value: 'eu-zurich-1', label: 'EU Central (Zurich)' },
+  { value: 'ap-melbourne-1', label: 'Australia Southeast (Melbourne)' },
+  { value: 'eu-marseille-1', label: 'France South (Marseille)' },
+  { value: 'ap-hyderabad-1', label: 'India South (Hyderabad)' },
+  { value: 'ap-chuncheon-1', label: 'AP Northeast (Chuncheon)' },
+  { value: 'me-abudhabi-1', label: 'Middle East (Abu Dhabi)' },
+  { value: 'me-dubai-1', label: 'Middle East (Dubai)' },
+  { value: 'ap-chiyoda-1', label: 'AP Northeast (Chiyoda)' },
+  { value: 'ap-ibaraki-1', label: 'AP Northeast (Ibaraki)' },
+  { value: 'il-jerusalem-1', label: 'Israel Central (Jerusalem)' },
+  { value: 'eu-milan-1', label: 'Italy Northwest (Milan)' },
+  { value: 'eu-stockholm-1', label: 'EU North (Stockholm)' },
+  { value: 'af-johannesburg-1', label: 'Africa South (Johannesburg)' },
+  { value: 'ap-singapore-1', label: 'Singapore' },
+  { value: 'mx-queretaro-1', label: 'Mexico Central (Queretaro)' },
+  { value: 'eu-paris-1', label: 'France Central (Paris)' },
+  { value: 'us-saltlake-2', label: 'US West (Salt Lake)' },
+  { value: 'us-chicago-1', label: 'US Central (Chicago)' },
+  { value: 'us-montreal-1', label: 'Canada Southeast (Montreal)' },
+  { value: 'sa-vinhedo-1', label: 'Brazil SouthEast (Vinhedo)' },
+  { value: 'us-sanjose-1', label: 'US West (San Jose)' }
 ];
 
 export const GCP_KMS_REGIONS = [
@@ -100,10 +186,13 @@ export const GCP_KMS_REGIONS = [
       { value: 'us-central1', label: 'Iowa (us-central1)' },
       { value: 'us-east1', label: 'South Carolina (us-east1)' },
       { value: 'us-east4', label: 'N. Virginia (us-east4)' },
+      { value: 'us-east5', label: 'Ohio (us-east5)' },
+      { value: 'us-south1', label: 'Texas (us-south1)' },
       { value: 'us-west1', label: 'Oregon (us-west1)' },
       { value: 'us-west2', label: 'Los Angeles (us-west2)' },
       { value: 'us-west3', label: 'Salt Lake City (us-west3)' },
-      { value: 'us-west4', label: 'Las Vegas (us-west4)' }
+      { value: 'us-west4', label: 'Las Vegas (us-west4)' },
+      { value: 'northamerica-south1', label: 'Queretaro (northamerica-south1)'}
     ]
   },
   {

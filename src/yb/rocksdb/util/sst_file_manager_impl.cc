@@ -3,9 +3,9 @@
 //  LICENSE file in the root directory of this source tree. An additional grant
 //  of patent rights can be found in the PATENTS file in the same directory.
 //
-// The following only applies to changes made to this file as part of YugaByte development.
+// The following only applies to changes made to this file as part of YugabyteDB development.
 //
-// Portions Copyright (c) YugaByte, Inc.
+// Portions Copyright (c) YugabyteDB, Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License"); you may not use this file except
 // in compliance with the License.  You may obtain a copy of the License at
@@ -25,9 +25,9 @@
 #include "yb/rocksdb/port/port.h"
 #include "yb/rocksdb/env.h"
 #include "yb/rocksdb/util/mutexlock.h"
-#include "yb/rocksdb/util/sync_point.h"
 
 #include "yb/util/result.h"
+#include "yb/util/sync_point.h"
 
 namespace rocksdb {
 
@@ -50,7 +50,7 @@ Status SstFileManagerImpl::OnAddFile(const std::string& file_path) {
     MutexLock l(&mu_);
     OnAddFileImpl(file_path, file_size);
   }
-  TEST_SYNC_POINT("SstFileManagerImpl::OnAddFile");
+  DEBUG_ONLY_TEST_SYNC_POINT("SstFileManagerImpl::OnAddFile");
   return s;
 }
 
@@ -59,7 +59,7 @@ Status SstFileManagerImpl::OnDeleteFile(const std::string& file_path) {
     MutexLock l(&mu_);
     OnDeleteFileImpl(file_path);
   }
-  TEST_SYNC_POINT("SstFileManagerImpl::OnDeleteFile");
+  DEBUG_ONLY_TEST_SYNC_POINT("SstFileManagerImpl::OnDeleteFile");
   return Status::OK();
 }
 
@@ -70,7 +70,7 @@ Status SstFileManagerImpl::OnMoveFile(const std::string& old_path,
     OnAddFileImpl(new_path, tracked_files_[old_path]);
     OnDeleteFileImpl(old_path);
   }
-  TEST_SYNC_POINT("SstFileManagerImpl::OnMoveFile");
+  DEBUG_ONLY_TEST_SYNC_POINT("SstFileManagerImpl::OnMoveFile");
   return Status::OK();
 }
 

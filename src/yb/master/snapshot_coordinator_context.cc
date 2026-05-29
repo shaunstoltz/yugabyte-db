@@ -1,4 +1,4 @@
-// Copyright (c) YugaByte, Inc.
+// Copyright (c) YugabyteDB, Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License"); you may not use this file except
 // in compliance with the License.  You may obtain a copy of the License at
@@ -15,9 +15,9 @@
 
 #include "yb/common/schema.h"
 
-#include "yb/docdb/doc_key.h"
-#include "yb/docdb/key_bytes.h"
-#include "yb/docdb/primitive_value.h"
+#include "yb/dockv/doc_key.h"
+#include "yb/dockv/key_bytes.h"
+#include "yb/dockv/primitive_value.h"
 
 #include "yb/master/sys_catalog_constants.h"
 
@@ -34,12 +34,12 @@ Result<ColumnId> MetadataColumnId(SnapshotCoordinatorContext* context) {
 
 } // namespace
 
-Result<docdb::KeyBytes> EncodedKey(
+Result<dockv::KeyBytes> EncodedKey(
     SysRowEntryType type, const Slice& id, SnapshotCoordinatorContext* context) {
-  docdb::DocKey doc_key({ docdb::KeyEntryValue::Int32(type),
-                          docdb::KeyEntryValue(id.ToBuffer()) });
-  docdb::SubDocKey sub_doc_key(
-      doc_key, docdb::KeyEntryValue::MakeColumnId(VERIFY_RESULT(MetadataColumnId(context))));
+  dockv::DocKey doc_key({ dockv::KeyEntryValue::Int32(type),
+                          dockv::KeyEntryValue(id.ToBuffer()) });
+  dockv::SubDocKey sub_doc_key(
+      doc_key, dockv::KeyEntryValue::MakeColumnId(VERIFY_RESULT(MetadataColumnId(context))));
   return sub_doc_key.Encode();
 }
 

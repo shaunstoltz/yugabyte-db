@@ -15,9 +15,9 @@
 // specific language governing permissions and limitations
 // under the License.
 //
-// The following only applies to changes made to this file as part of YugaByte development.
+// The following only applies to changes made to this file as part of YugabyteDB development.
 //
-// Portions Copyright (c) YugaByte, Inc.
+// Portions Copyright (c) YugabyteDB, Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License"); you may not use this file except
 // in compliance with the License.  You may obtain a copy of the License at
@@ -71,12 +71,12 @@ TEST_F(YBAdminMultiMasterTest, InitialMasterAddresses) {
   HostPort non_leader_hp = non_leader->bound_rpc_hostport();
   std::string output1;
   ASSERT_OK(Subprocess::Call(ToStringVector(
-      admin_path, "-init_master_addrs", non_leader_hp.ToString(),
+      admin_path, "--init_master_addrs", non_leader_hp.ToString(),
       "list_all_masters"), &output1));
   LOG(INFO) << "init_master_addrs: list_all_masters: " << output1;
   std::string output2;
   ASSERT_OK(Subprocess::Call(ToStringVector(
-      admin_path, "-master_addresses", cluster_->GetMasterAddresses(),
+      admin_path, "--master_addresses", cluster_->GetMasterAddresses(),
       "list_all_masters"), &output2));
   LOG(INFO) << "full master_addresses: list_all_masters: " << output2;
   ASSERT_EQ(output1, output2);
@@ -85,12 +85,12 @@ TEST_F(YBAdminMultiMasterTest, InitialMasterAddresses) {
   output2.clear();
 
   ASSERT_OK(Subprocess::Call(ToStringVector(
-      admin_path, "-init_master_addrs", non_leader_hp.ToString(),
+      admin_path, "--init_master_addrs", non_leader_hp.ToString(),
       "get_universe_config"), &output1));
   // Remove the time output from list_all_tablet_servers since it doesn't match
   LOG(INFO) << "init_master_addrs: get_universe_config: " << output1;
   ASSERT_OK(Subprocess::Call(ToStringVector(
-      admin_path, "-master_addresses", cluster_->GetMasterAddresses(),
+      admin_path, "--master_addresses", cluster_->GetMasterAddresses(),
       "get_universe_config"), &output2));
   LOG(INFO) << "full master_addresses: get_universe_config: " << output2;
   ASSERT_EQ(output1, output2);
@@ -108,7 +108,7 @@ void YBAdminMultiMasterTest::TestRemoveDownMaster(UseUUID use_uuid) {
 
   std::string output2;
   ASSERT_OK(Subprocess::Call(ToStringVector(
-      admin_path, "-master_addresses", cluster_->GetMasterAddresses(),
+      admin_path, "--master_addresses", cluster_->GetMasterAddresses(),
       "list_all_masters"), &output2));
   LOG(INFO) << "list_all_masters \n" << output2;
   const auto lines2 = StringSplit(output2, '\n');
@@ -116,7 +116,7 @@ void YBAdminMultiMasterTest::TestRemoveDownMaster(UseUUID use_uuid) {
 
   std::string output3;
   auto args = ToStringVector(
-      admin_path, "-master_addresses", cluster_->GetMasterAddresses(), "change_master_config",
+      admin_path, "--master_addresses", cluster_->GetMasterAddresses(), "change_master_config",
       "REMOVE_SERVER", addr.host(), addr.port());
   if (use_uuid) {
     args.push_back(uuid);
@@ -126,7 +126,7 @@ void YBAdminMultiMasterTest::TestRemoveDownMaster(UseUUID use_uuid) {
 
   std::string output4;
   ASSERT_OK(Subprocess::Call(ToStringVector(
-      admin_path, "-master_addresses", cluster_->GetMasterAddresses(),
+      admin_path, "--master_addresses", cluster_->GetMasterAddresses(),
       "list_all_masters"), &output4));
   LOG(INFO) << "list_all_masters \n" << output4;
   const auto lines4 = StringSplit(output4, '\n');
@@ -149,31 +149,150 @@ TEST_F(YBAdminMultiMasterTest, AddShellMaster) {
 
   std::string output2;
   ASSERT_OK(Subprocess::Call(ToStringVector(
-      admin_path, "-master_addresses", cluster_->GetMasterAddresses(),
+      admin_path, "--master_addresses", cluster_->GetMasterAddresses(),
       "list_all_masters"), &output2));
   LOG(INFO) << "list_all_masters \n" << output2;
   const auto lines2 = StringSplit(output2, '\n');
   ASSERT_EQ(lines2.size(), kNumInitMasters + 1);
 
-  ExternalMaster* shell_master = nullptr;
-  cluster_->StartShellMaster(&shell_master);
+  auto shell_master = ASSERT_RESULT(cluster_->StartShellMaster());
   ASSERT_NE(shell_master, nullptr);
   scoped_refptr<ExternalMaster> shell_master_ref(shell_master);
   const auto shell_addr = shell_master->bound_rpc_addr();
 
   std::string output3;
   ASSERT_OK(Subprocess::Call(ToStringVector(
-      admin_path, "-master_addresses", cluster_->GetMasterAddresses(),
+      admin_path, "--master_addresses", cluster_->GetMasterAddresses(),
       "change_master_config", "ADD_SERVER", shell_addr.host(), shell_addr.port()), &output3));
   LOG(INFO) << "change_master_config: ADD_SERVER\n" << output3;
 
   std::string output4;
   ASSERT_OK(Subprocess::Call(ToStringVector(
-      admin_path, "-master_addresses", cluster_->GetMasterAddresses(),
+      admin_path, "--master_addresses", cluster_->GetMasterAddresses(),
       "list_all_masters"), &output4));
   LOG(INFO) << "list_all_masters \n" << output4;
   const auto lines4 = StringSplit(output4, '\n');
   ASSERT_EQ(lines4.size(), kNumInitMasters + 2);
+}
+
+TEST_F(YBAdminMultiMasterTest, FlushSysCatalog) {
+  const auto admin_path = GetToolPath(kAdminToolName);
+  const int kNumMasters = 2;
+  ASSERT_NO_FATALS(StartCluster({}, {}, 1 /* num tservers */, kNumMasters));
+
+  LOG(INFO) << "FlushSysCatalog: master addresses: " << cluster_->GetMasterAddresses();
+
+  // Set up a LogWaiter per master to verify the success log line.
+  const auto kFlushLogMessage = "FlushSysCatalog completed: OK";
+  std::vector<std::unique_ptr<LogWaiter>> log_waiters;
+  for (int i = 0; i < kNumMasters; i++) {
+    log_waiters.push_back(
+        std::make_unique<LogWaiter>(cluster_->master(i), kFlushLogMessage));
+  }
+
+  // Default: run on every master; outputs "Successful" per master.
+  std::string output;
+  ASSERT_OK(Subprocess::Call(ToStringVector(
+      admin_path, "--master_addresses", cluster_->GetMasterAddresses(),
+      "flush_sys_catalog"), &output));
+  LOG(INFO) << "flush_sys_catalog (all masters):\n" << output;
+  auto lines = StringSplit(output, '\n');
+  int successful_count = 0;
+  for (const auto& line : lines) {
+    if (line.find("Successful") != std::string::npos) {
+      successful_count++;
+    }
+  }
+  ASSERT_EQ(successful_count, kNumMasters);
+
+  // Verify the success log line appeared on every master.
+  for (int i = 0; i < kNumMasters; i++) {
+    ASSERT_OK(log_waiters[i]->WaitFor(10s));
+  }
+
+  // Set up LogWaiters again to look for future loglines.
+  log_waiters.clear();
+  for (int i = 0; i < kNumMasters; i++) {
+    log_waiters.push_back(
+        std::make_unique<LogWaiter>(cluster_->master(i), kFlushLogMessage));
+  }
+
+  // with 'leader_only': old behavior to only run on the leader.
+  // No output => success.
+  ASSERT_OK(Subprocess::Call(ToStringVector(
+      admin_path, "--master_addresses", cluster_->GetMasterAddresses(),
+      "flush_sys_catalog", "leader_only"), &output));
+  ASSERT_TRUE(output.empty()) << "Expected empty output, got: " << output;
+
+  // Verify the log line appeared only on the leader.
+  auto leader_idx = ASSERT_RESULT(cluster_->GetLeaderMasterIndex());
+  ASSERT_OK(log_waiters[leader_idx]->WaitFor(10s));
+  for (int i = 0; i < kNumMasters; i++) {
+    if (static_cast<size_t>(i) != leader_idx) {
+      ASSERT_FALSE(log_waiters[i]->IsEventOccurred())
+          << "FlushSysCatalog log unexpectedly found on follower master " << i;
+    }
+  }
+}
+
+TEST_F(YBAdminMultiMasterTest, CompactSysCatalog) {
+  const auto admin_path = GetToolPath(kAdminToolName);
+  const int kNumMasters = 2;
+  ASSERT_NO_FATALS(StartCluster({}, {}, 1 /* num tservers */, kNumMasters));
+
+  LOG(INFO) << "CompactSysCatalog: master addresses: " << cluster_->GetMasterAddresses();
+
+  // Set up a LogWaiter per master to verify the success log line.
+  const auto kCompactLogMessage = "CompactSysCatalog completed: OK";
+  std::vector<std::unique_ptr<LogWaiter>> log_waiters;
+  for (int i = 0; i < kNumMasters; i++) {
+    log_waiters.push_back(
+        std::make_unique<LogWaiter>(cluster_->master(i), kCompactLogMessage));
+  }
+
+  // Default: run on every master; outputs "Successful" per master.
+  std::string output;
+  ASSERT_OK(Subprocess::Call(ToStringVector(
+      admin_path, "--master_addresses", cluster_->GetMasterAddresses(),
+      "compact_sys_catalog"), &output));
+  LOG(INFO) << "compact_sys_catalog (all masters):\n" << output;
+  auto lines = StringSplit(output, '\n');
+  int successful_count = 0;
+  for (const auto& line : lines) {
+    if (line.find("Successful") != std::string::npos) {
+      successful_count++;
+    }
+  }
+  ASSERT_EQ(successful_count, kNumMasters);
+
+  // Verify the success log line appeared on every master.
+  for (int i = 0; i < kNumMasters; i++) {
+    ASSERT_OK(log_waiters[i]->WaitFor(10s));
+  }
+
+  // Set up LogWaiters again to look for future loglines.
+  log_waiters.clear();
+  for (int i = 0; i < kNumMasters; i++) {
+    log_waiters.push_back(
+        std::make_unique<LogWaiter>(cluster_->master(i), kCompactLogMessage));
+  }
+
+  // with 'leader_only': old behavior to only run on the leader.
+  // No output => success.
+  ASSERT_OK(Subprocess::Call(ToStringVector(
+    admin_path, "--master_addresses", cluster_->GetMasterAddresses(),
+    "compact_sys_catalog", "leader_only"), &output));
+  ASSERT_TRUE(output.empty()) << "Expected empty output, got: " << output;
+
+  // Verify the log line appeared only on the leader.
+  auto leader_idx = ASSERT_RESULT(cluster_->GetLeaderMasterIndex());
+  ASSERT_OK(log_waiters[leader_idx]->WaitFor(10s));
+  for (int i = 0; i < kNumMasters; i++) {
+    if (static_cast<size_t>(i) != leader_idx) {
+      ASSERT_FALSE(log_waiters[i]->IsEventOccurred())
+          << "CompactSysCatalog log unexpectedly found on follower master " << i;
+    }
+  }
 }
 
 TEST_F(YBAdminMultiMasterTest, TestMasterLeaderStepdown) {
@@ -185,7 +304,7 @@ TEST_F(YBAdminMultiMasterTest, TestMasterLeaderStepdown) {
       admin_path = GetToolPath(kAdminToolName),
       master_address = ToString(cluster_->GetMasterAddresses())] (
       const std::initializer_list<std::string>& args) mutable {
-    auto cmds = ToStringVector(admin_path, "-master_addresses", master_address);
+    auto cmds = ToStringVector(admin_path, "--master_addresses", master_address);
     std::copy(args.begin(), args.end(), std::back_inserter(cmds));
     return Subprocess::Call(cmds, &out);
   };

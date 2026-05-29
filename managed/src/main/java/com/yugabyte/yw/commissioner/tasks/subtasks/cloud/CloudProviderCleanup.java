@@ -1,5 +1,5 @@
 /*
- * Copyright 2019 YugaByte, Inc. and Contributors
+ * Copyright 2019 YugabyteDB, Inc. and Contributors
  *
  * Licensed under the Polyform Free Trial License 1.0.0 (the "License"); you
  * may not use this file except in compliance with the License. You
@@ -33,8 +33,8 @@ public class CloudProviderCleanup extends CloudTaskBase {
       priceComponents.forEach(priceComponent -> priceComponent.delete());
     }
     // We would delete the provider, keys etc only when all the regions are cleaned up.
-    if (getProvider().regions.isEmpty()) {
-      List<AccessKey> accessKeyList = AccessKey.getAll(provider.uuid);
+    if (getProvider().getRegions().isEmpty()) {
+      List<AccessKey> accessKeyList = AccessKey.getAll(provider.getUuid());
       accessKeyList.forEach(accessKey -> accessKey.delete());
       provider.delete();
     }

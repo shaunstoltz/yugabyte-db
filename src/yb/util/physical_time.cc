@@ -1,4 +1,4 @@
-// Copyright (c) YugaByte, Inc.
+// Copyright (c) YugabyteDB, Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License"); you may not use this file except
 // in compliance with the License.  You may obtain a copy of the License at
@@ -56,11 +56,11 @@ class WallClockImpl : public PhysicalClock {
   Result<PhysicalTime> Now() override {
     return CheckClockSyncError(
         { static_cast<MicrosTime>(GetCurrentTimeMicros()),
-          GetAtomicFlag(&FLAGS_max_clock_skew_usec) });
+          FLAGS_max_clock_skew_usec });
   }
 
   MicrosTime MaxGlobalTime(PhysicalTime time) override {
-    return time.time_point + GetAtomicFlag(&FLAGS_max_clock_skew_usec);
+    return time.time_point + FLAGS_max_clock_skew_usec;
   }
 };
 
@@ -81,7 +81,7 @@ Status CallAdjTime(timex* tx) {
                     ErrnoToString(errno));
     case TIME_ERROR:
       if (FLAGS_disable_clock_sync_error) {
-        YB_LOG_EVERY_N_SECS(ERROR, 15) << "Clock unsynchronized, status: " << tx->status;
+        YB_LOG_EVERY_N_SECS(DFATAL, 15) << "Clock unsynchronized, status: " << tx->status;
         return Status::OK();
       }
       return STATUS_FORMAT(
@@ -89,8 +89,8 @@ Status CallAdjTime(timex* tx) {
           tx->status);
     default:
       // TODO what to do about leap seconds? see KUDU-146
-      YB_LOG_FIRST_N(ERROR, 1) << "Server undergoing leap second. This may cause consistency "
-                               << "issues (rc=" << rc << ")";
+      YB_LOG_FIRST_N(DFATAL, 1) << "Server undergoing leap second. This may cause consistency "
+                                << "issues (rc=" << rc << ")";
       return Status::OK();
   }
 }
@@ -113,11 +113,16 @@ class AdjTimeClockImpl : public PhysicalClock {
   }
 
   MicrosTime MaxGlobalTime(PhysicalTime time) override {
-    return time.time_point + GetAtomicFlag(&FLAGS_max_clock_skew_usec);
+    return time.time_point + FLAGS_max_clock_skew_usec;
   }
 };
 
 #endif
+
+PhysicalTime kFailedTime = {
+  .time_point = std::numeric_limits<MicrosTime>::max(),
+  .max_error = std::numeric_limits<MicrosTime>::max(),
+};
 
 } // namespace
 
@@ -138,11 +143,26 @@ const PhysicalClockPtr& AdjTimeClock() {
 #endif
 
 Result<PhysicalTime> MockClock::Now() {
-  return CheckClockSyncError(value_.load(boost::memory_order_acquire));
+  auto value = value_.load(std::memory_order_acquire);
+  if (value.time_point == kFailedTime.time_point) {
+    std::lock_guard lock(status_mutex_);
+    DCHECK(!mock_status_.ok());
+    return mock_status_;
+  }
+  return CheckClockSyncError(value);
 }
 
 void MockClock::Set(const PhysicalTime& value) {
-  value_.store(value, boost::memory_order_release);
+  value_.store(value, std::memory_order_release);
+}
+
+void MockClock::Set(Status status) {
+  DCHECK(!status.ok());
+  {
+    std::lock_guard lock(status_mutex_);
+    mock_status_ = std::move(status);
+  }
+  value_.store(kFailedTime, std::memory_order_release);
 }
 
 PhysicalClockPtr MockClock::AsClock() {

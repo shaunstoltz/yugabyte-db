@@ -1,4 +1,4 @@
-// Copyright (c) YugaByte, Inc.
+// Copyright (c) YugabyteDB, Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License"); you may not use this file except
 // in compliance with the License.  You may obtain a copy of the License at
@@ -12,6 +12,8 @@
 //
 
 #pragma once
+
+#include <optional>
 
 #include <google/protobuf/wire_format_lite.h>
 
@@ -41,6 +43,8 @@ std::string ReplaceNamespaceDelimiters(const std::string& arg_full_name);
 std::string RelativeClassPath(const std::string& clazz, const std::string& service);
 std::string UnnestedName(
     const google::protobuf::Descriptor* message, Lightweight lightweight, FullPath full_path);
+std::string UnnestedName(
+    const google::protobuf::EnumDescriptor* enum_desc, Lightweight lightweight, FullPath full_path);
 std::string MapFieldType(const google::protobuf::FieldDescriptor* field, Lightweight lightweight);
 bool IsMessage(const google::protobuf::FieldDescriptor* field);
 bool IsSimple(const google::protobuf::FieldDescriptor* field);
@@ -52,6 +56,8 @@ bool IsLwAny(const google::protobuf::Descriptor* message);
 
 std::string RemoveProtoExtension(const std::string& fname);
 std::vector<std::string> ListDependencies(const google::protobuf::FileDescriptor* file);
+
+std::optional<std::string> LightweightName(const google::protobuf::EnumDescriptor* enum_desc);
 
 } // namespace gen_yrpc
 } // namespace yb

@@ -1,4 +1,4 @@
-// Copyright (c) YugaByte, Inc.
+// Copyright (c) YugabyteDB, Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License"); you may not use this file except
 // in compliance with the License.  You may obtain a copy of the License at
@@ -24,9 +24,47 @@ TEST(LRUCacheTest, Simple) {
   cache.insert(2);
   cache.insert(3);
   ASSERT_EQ(AsString(cache), "[3, 2]");
+  ASSERT_TRUE(cache.contains(3));
+  ASSERT_FALSE(cache.contains(1));
   ASSERT_EQ(0, cache.erase(1));
   ASSERT_EQ(1, cache.erase(3));
   ASSERT_EQ(AsString(cache), "[2]");
+  ASSERT_TRUE(cache.contains(2));
+  ASSERT_FALSE(cache.contains(3));
+}
+
+TEST(LRUCacheTest, Erase) {
+  LRUCache<int> cache(5);
+  cache.insert(1);
+  cache.insert(2);
+  cache.insert(3);
+  cache.insert(4);
+  cache.insert(5);
+  auto last = std::prev(cache.end());
+  ASSERT_EQ(*last, 1);
+  auto end = cache.erase(last);
+  ASSERT_EQ(end, cache.end());
+  ASSERT_EQ(AsString(cache), "[5, 4, 3, 2]");
+  last = std::prev(cache.end());
+  auto i = cache.erase(std::next(cache.begin()), std::prev(cache.end()));
+  ASSERT_EQ(*i, 2);
+  ASSERT_EQ(AsString(cache), "[5, 2]");
+}
+
+TEST(LRUCacheTest, Find) {
+  LRUCache<int> cache(5);
+  cache.insert(1);
+  cache.insert(2);
+  cache.insert(3);
+  cache.insert(4);
+  cache.insert(5);
+  auto last = std::prev(cache.end());
+  ASSERT_EQ(*last, 1);
+  auto i = cache.find(10);
+  ASSERT_EQ(i, cache.end());
+  i = cache.find(1);
+  ASSERT_NE(i, cache.end());
+  ASSERT_EQ(AsString(cache), "[1, 5, 4, 3, 2]");
 }
 
 } // namespace yb

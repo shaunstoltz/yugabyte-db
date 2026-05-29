@@ -15,9 +15,9 @@
 // specific language governing permissions and limitations
 // under the License.
 //
-// The following only applies to changes made to this file as part of YugaByte development.
+// The following only applies to changes made to this file as part of YugabyteDB development.
 //
-// Portions Copyright (c) YugaByte, Inc.
+// Portions Copyright (c) YugabyteDB, Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License"); you may not use this file except
 // in compliance with the License.  You may obtain a copy of the License at
@@ -63,9 +63,6 @@ using namespace std::literals;
 namespace yb {
 
 using client::YBClient;
-using client::YBClientBuilder;
-using client::YBTableType;
-using client::YBError;
 using client::YBqlWriteOp;
 using client::YBSchema;
 using client::YBSchemaBuilder;
@@ -74,7 +71,6 @@ using client::YBTable;
 using client::YBTableAlterer;
 using client::YBTableCreator;
 using client::YBTableName;
-using client::YBValue;
 using std::shared_ptr;
 using std::make_pair;
 using std::map;
@@ -243,7 +239,7 @@ struct MirrorTable {
                                                       kTableName.namespace_type()));
     YBSchema schema;
     YBSchemaBuilder b;
-    b.AddColumn("key")->Type(INT32)->HashPrimaryKey()->NotNull();
+    b.AddColumn("key")->Type(DataType::INT32)->HashPrimaryKey()->NotNull();
     CHECK_OK(b.Build(&schema));
     std::unique_ptr<YBTableCreator> table_creator(client_->NewTableCreator());
     return table_creator->table_name(kTableName)
@@ -318,7 +314,7 @@ struct MirrorTable {
     // Add to the real table.
     std::unique_ptr<YBTableAlterer> table_alterer(client_->NewTableAlterer(kTableName));
 
-    table_alterer->AddColumn(name)->Type(INT32);
+    table_alterer->AddColumn(name)->Type(DataType::INT32);
     ASSERT_OK(table_alterer->Alter());
 
     // Add to the mirror state.
@@ -368,12 +364,11 @@ struct MirrorTable {
 
   Status DoRealOp(const vector<pair<string, int32_t>>& data, OpType op_type) {
     auto deadline = MonoTime::Now() + 15s;
-    shared_ptr<YBSession> session = client_->NewSession();
-    session->SetTimeout(15s);
+    auto session = client_->NewSession(15s);
     shared_ptr<YBTable> table;
     RETURN_NOT_OK(client_->OpenTable(kTableName, &table));
     for (;;) {
-      auto op = CreateOp(table, op_type);
+      auto op = CreateOp(table, session->arena(), op_type);
       auto* const req = op->mutable_request();
       bool first = true;
       auto schema = table->schema();
@@ -412,14 +407,15 @@ struct MirrorTable {
     }
   }
 
-  shared_ptr<YBqlWriteOp> CreateOp(const shared_ptr<YBTable>& table, OpType op_type) {
+  shared_ptr<YBqlWriteOp> CreateOp(
+      const client::YBTablePtr& table, ThreadSafeArenaPtr arena, OpType op_type) {
     switch (op_type) {
       case INSERT:
-        return shared_ptr<YBqlWriteOp>(table->NewQLInsert());
+        return shared_ptr<YBqlWriteOp>(table->NewQLInsert(std::move(arena)));
       case UPDATE:
-        return shared_ptr<YBqlWriteOp>(table->NewQLUpdate());
+        return shared_ptr<YBqlWriteOp>(table->NewQLUpdate(std::move(arena)));
       case DELETE:
-        return shared_ptr<YBqlWriteOp>(table->NewQLDelete());
+        return shared_ptr<YBqlWriteOp>(table->NewQLDelete(std::move(arena)));
     }
     return shared_ptr<YBqlWriteOp>();
   }

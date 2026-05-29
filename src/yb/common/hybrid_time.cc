@@ -15,9 +15,9 @@
 // specific language governing permissions and limitations
 // under the License.
 //
-// The following only applies to changes made to this file as part of YugaByte development.
+// The following only applies to changes made to this file as part of YugabyteDB development.
 //
-// Portions Copyright (c) YugaByte, Inc.
+// Portions Copyright (c) YugabyteDB, Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License"); you may not use this file except
 // in compliance with the License.  You may obtain a copy of the License at
@@ -39,8 +39,13 @@
 #include <boost/date_time/posix_time/time_formatters.hpp>
 
 #include "yb/util/date_time.h"
+#include "yb/util/flags/flag_tags.h"
 #include "yb/util/memcmpable_varint.h"
 #include "yb/util/result.h"
+
+DEFINE_RUNTIME_bool(no_pretty_hybrid_times, false,
+    "If true, hybrid times converted to human readable form will always formatted as plain "
+    "numbers.");
 
 using std::string;
 
@@ -48,14 +53,10 @@ namespace yb {
 
 namespace {
 
+// This is overridden by FLAGS_no_pretty_hybrid_times when that flag is true.
 std::atomic<bool> pretty_to_string_mode_{false};
 
 }
-
-const HybridTime HybridTime::kMin(kMinHybridTimeValue);
-const HybridTime HybridTime::kMax(kMaxHybridTimeValue);
-const HybridTime HybridTime::kInitial(kInitialHybridTimeValue);
-const HybridTime HybridTime::kInvalid(kInvalidHybridTimeValue);
 
 bool HybridTime::DecodeFrom(Slice *input) {
   return GetMemcmpableVarint64(input, &v).ok();
@@ -81,7 +82,7 @@ string HybridTime::ToString() const {
       return "<initial>";
     default:
       auto logical = GetLogicalValue();
-      if (!pretty_to_string_mode_.load(std::memory_order_acquire)) {
+      if (FLAGS_no_pretty_hybrid_times || !pretty_to_string_mode_.load(std::memory_order_acquire)) {
         if (logical) {
           return Format("{ physical: $0 logical: $1 }", GetPhysicalValueMicros(), logical);
         } else {
@@ -139,7 +140,6 @@ MicrosTime HybridTime::CeilPhysicalValueMicros() const {
 Result<HybridTime> HybridTime::ParseHybridTime(std::string input) {
   boost::trim(input);
 
-  HybridTime ht;
   // The HybridTime is given in microseconds and will contain 16 chars.
   static const std::regex int_regex("[0-9]{16}");
   if (std::regex_match(input, int_regex)) {
@@ -155,6 +155,43 @@ Result<HybridTime> HybridTime::ParseHybridTime(std::string input) {
   return HybridTime::FromMicros(ts.ToInt64());
 }
 
+uint64_t HybridTime::GetPhysicalValueMillis() const {
+  return GetPhysicalValueMicros() / MonoTime::kMicrosecondsPerMillisecond;
+}
+
+uint64_t HybridTime::GetPhysicalValueNanos() const {
+  // Conversion to nanoseconds here is safe from overflow since 2^kBitsForLogicalComponent is less
+  // than MonoTime::kNanosecondsPerMicrosecond. Although, we still just check for sanity.
+  uint64_t micros = GetPhysicalValueMicros();
+  CHECK_LE(micros, std::numeric_limits<uint64_t>::max() / MonoTime::kNanosecondsPerMicrosecond);
+  return micros * MonoTime::kNanosecondsPerMicrosecond;
+}
+
 const char* const HybridTime::kHybridTimeDebugStrPrefix = "HT";
+
+int CompareHybridTimesToDelta(HybridTime begin, HybridTime end, MonoDelta delta) {
+  if (end < begin) {
+    return -1;
+  }
+  // We use nanoseconds since MonoDelta has nanosecond granularity.
+  uint64_t begin_nanos = begin.GetPhysicalValueNanos();
+  uint64_t end_nanos = end.GetPhysicalValueNanos();
+  uint64_t delta_nanos = delta.ToNanoseconds();
+  if (end_nanos - begin_nanos > delta_nanos) {
+    return 1;
+  } else if (end_nanos - begin_nanos == delta_nanos) {
+    uint64_t begin_logical = begin.GetLogicalValue();
+    uint64_t end_logical = end.GetLogicalValue();
+    if (end_logical > begin_logical) {
+      return 1;
+    } else if (end_logical < begin_logical) {
+      return -1;
+    } else {
+      return 0;
+    }
+  } else {
+    return -1;
+  }
+}
 
 }  // namespace yb

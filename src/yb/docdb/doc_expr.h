@@ -1,17 +1,17 @@
 //--------------------------------------------------------------------------------------------------
-// Copyright (c) YugaByte, Inc.
+// Copyright (c) YugabyteDB, Inc.
 //
 // This module defines and executes expression-related operations in DocDB.
 //--------------------------------------------------------------------------------------------------
 
 #pragma once
 
-#include "yb/common/ql_expr.h"
+#include "yb/qlexpr/ql_expr.h"
 
 namespace yb {
 namespace docdb {
 
-class DocExprExecutor : public QLExprExecutor {
+class DocExprExecutor : public qlexpr::QLExprExecutor {
  public:
   // Public types.
   typedef std::shared_ptr<DocExprExecutor> SharedPtr;
@@ -22,54 +22,80 @@ class DocExprExecutor : public QLExprExecutor {
   DocExprExecutor();
   virtual ~DocExprExecutor();
 
-  // Evaluate column reference.
-  Status EvalColumnRef(ColumnIdRep col_id,
-                       const QLTableRow* table_row,
-                       QLExprResultWriter result_writer) override;
-
   // Evaluate call to tablet-server builtin operator.
   Status EvalTSCall(const QLBCallPB& ql_expr,
-                    const QLTableRow& table_row,
-                    QLValuePB *result,
+                    const qlexpr::QLTableRow& table_row,
+                    QLValuePB* result,
+                    const Schema *schema = nullptr) override;
+
+  Status EvalTSCall(const LWQLBCallPB& ql_expr,
+                    const qlexpr::QLTableRow& table_row,
+                    LWQLValuePB* result,
                     const Schema *schema = nullptr) override;
 
   Status EvalTSCall(const PgsqlBCallPB& ql_expr,
-                    const QLTableRow& table_row,
-                    QLValuePB *result,
+                    const dockv::PgTableRow& table_row,
+                    QLValuePB* result,
+                    const Schema *schema) override;
+
+  Status EvalTSCall(const LWPgsqlBCallPB& ql_expr,
+                    const dockv::PgTableRow& table_row,
+                    LWQLValuePB* result,
                     const Schema *schema) override;
 
  protected:
+  template <class PB, class Value>
+  Status DoEvalTSCall(const PB& ql_expr,
+                      const qlexpr::QLTableRow& table_row,
+                      Value* result,
+                      const Schema *schema = nullptr);
+
+  template <class PB, class Value>
+  Status DoEvalTSCall(const PB& ql_expr,
+                      const dockv::PgTableRow& table_row,
+                      Value* result,
+                      const Schema *schema = nullptr);
+
   // Evaluate aggregate functions for each row.
-  template <class Val>
-  Status EvalCount(Val *aggr_count);
+  template <class Value>
+  Status EvalCount(Value* aggr_count);
 
-  template <class Val>
-  Status EvalSum(const Val& val, Val *aggr_sum);
+  template <class Value>
+  Status EvalSum(const Value& val, Value* aggr_sum);
 
-  template <class Expr, class Val, class Extractor>
+  template <class Expr, class Row, class Val, class Extractor>
   Status EvalSumInt(
-      const Expr& expr, const QLTableRow& table_row, Val *aggr_sum, const Extractor& extractor);
+      const Expr& expr, const Row& table_row, Val* aggr_sum, const Extractor& extractor);
 
-  template <class Expr, class Val, class Extractor, class Setter>
+  template <class Expr, class Row, class Val, class Extractor, class Setter>
   Status EvalSumReal(
-      const Expr& expr, const QLTableRow& table_row, Val *aggr_sum,
+      const Expr& expr, const Row& table_row, Val* aggr_sum,
       const Extractor& extractor, const Setter& setter);
 
   template <class Val>
-  Status EvalMax(const Val& val, Val *aggr_max);
+  Status EvalMax(const Val& val, Val* aggr_max);
 
   template <class Val>
-  Status EvalMin(const Val& val, Val *aggr_min);
+  Status EvalMin(const Val& val, Val* aggr_min);
 
   template <class Val>
-  Status EvalAvg(const Val& val, Val *aggr_avg);
+  Status EvalAvg(const Val& val, Val* aggr_avg);
 
-  Result<QLValuePB> EvalParametricToJson(const QLExpressionPB& operand,
-                                         const QLTableRow& table_row,
-                                         const Schema *schema);
+  template<class PB, class Val>
+  Status EvalParametricToJson(
+      const PB& operand, const qlexpr::QLTableRow& table_row, const Schema *schema, Val* value);
 
-  virtual Status GetTupleId(QLValuePB *result) const;
-  std::vector<QLExprResult> aggr_result_;
+  // Ensures aggr_result_ contains `size` entries bound to an aggregate-private arena.
+  // If that arena's memory footprint has grown beyond a fixed threshold, the running
+  // aggregate values are migrated to a fresh arena and the old one is dropped. This
+  // bounds peak memory usage while iterating over many rows (e.g. SUM/MIN/MAX over
+  // millions of rows with string/decimal/varint columns), where each row's column
+  // read otherwise accumulates on the long-lived request arena.
+  void PrepareAggregateResults(size_t size);
+
+  ThreadSafeArenaPtr aggr_result_arena_;
+  std::vector<qlexpr::LWExprResult> aggr_result_;
+  size_t aggr_invocations_since_reset_ = 0;
 };
 
 } // namespace docdb

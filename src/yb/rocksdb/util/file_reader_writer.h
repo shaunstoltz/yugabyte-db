@@ -3,9 +3,9 @@
 //  LICENSE file in the root directory of this source tree. An additional grant
 //  of patent rights can be found in the PATENTS file in the same directory.
 //
-// The following only applies to changes made to this file as part of YugaByte development.
+// The following only applies to changes made to this file as part of YugabyteDB development.
 //
-// Portions Copyright (c) YugaByte, Inc.
+// Portions Copyright (c) YugabyteDB, Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License"); you may not use this file except
 // in compliance with the License.  You may obtain a copy of the License at
@@ -47,6 +47,8 @@ namespace rocksdb {
 class Statistics;
 class HistogramImpl;
 
+YB_STRONGLY_TYPED_BOOL(AllocateBuffer);
+
 std::unique_ptr<RandomAccessFile> NewReadaheadRandomAccessFile(
   std::unique_ptr<RandomAccessFile>&& file, size_t readahead_size);
 
@@ -82,7 +84,7 @@ class RandomAccessFileReader {
   std::unique_ptr<RandomAccessFile> file_;
   Env*            env_;
   Statistics*     stats_;
-  uint32_t        hist_type_;
+  Histograms      hist_type_;
   HistogramImpl*  file_read_hist_;
 
  public:
@@ -113,9 +115,13 @@ class RandomAccessFileReader {
   RandomAccessFileReader(const RandomAccessFileReader&) = delete;
   RandomAccessFileReader& operator=(const RandomAccessFileReader&) = delete;
 
-  Status Read(uint64_t offset, size_t n, Slice* result, char* scratch) const;
+  Status Read(uint64_t offset, size_t n, Slice* result, char* scratch,
+              Statistics* statistics = nullptr) const;
   Status ReadAndValidate(
-      uint64_t offset, size_t n, Slice* result, char* scratch, const yb::ReadValidator& validator);
+      uint64_t offset, size_t n, Slice* result, char* scratch, const yb::ReadValidator& validator,
+      Statistics* statistics = nullptr);
+
+  void Readahead(size_t offset, size_t length) { file_->Readahead(offset, length); }
 
   RandomAccessFile* file() { return file_.get(); }
 };
@@ -146,9 +152,11 @@ class WritableFileWriter {
   yb::PriorityThreadPoolSuspender* suspender_;
 
  public:
-  WritableFileWriter(std::unique_ptr<WritableFile>&& file,
-                     const EnvOptions& options,
-                     yb::PriorityThreadPoolSuspender* suspender = nullptr)
+  WritableFileWriter(
+      std::unique_ptr<WritableFile>&& file,
+      const EnvOptions& options,
+      yb::PriorityThreadPoolSuspender* suspender = nullptr,
+      AllocateBuffer allocate_buffer = AllocateBuffer::kTrue)
       : writable_file_(std::move(file)),
         buf_(),
         max_buffer_size_(options.writable_file_max_buffer_size),
@@ -164,7 +172,9 @@ class WritableFileWriter {
         suspender_(suspender) {
 
     buf_.Alignment(writable_file_->GetRequiredBufferAlignment());
-    buf_.AllocateNewBuffer(FLAGS_rocksdb_file_starting_buffer_size);
+    if (allocate_buffer) {
+      buf_.AllocateNewBuffer(FLAGS_rocksdb_file_starting_buffer_size);
+    }
   }
 
   WritableFileWriter(const WritableFileWriter&) = delete;
@@ -206,4 +216,12 @@ class WritableFileWriter {
 extern Status NewWritableFile(Env* env, const std::string& fname,
                               std::unique_ptr<WritableFile>* result,
                               const EnvOptions& options);
+
+// Returns an error if file ends with check_size zeros. If check_size is larger than file size it is
+// automatically reset to file size.
+// Returns an error if check_size == 0.
+// Returned error contains size of contiguous zeroed array placed at the end of the file.
+Status CheckFileTailForZeros(
+    Env* env, const EnvOptions& env_options, const std::string& file_path, size_t check_size);
+
 }  // namespace rocksdb

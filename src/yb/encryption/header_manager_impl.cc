@@ -1,4 +1,4 @@
-// Copyright (c) YugaByte, Inc.
+// Copyright (c) YugabyteDB, Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License"); you may not use this file except
 // in compliance with the License.  You may obtain a copy of the License at
@@ -28,8 +28,6 @@
 #include "yb/util/status_format.h"
 
 using std::string;
-
-static const string kEncryptionMagic = "encrypt!";
 
 namespace yb {
 namespace encryption {
@@ -73,11 +71,12 @@ class HeaderManagerImpl : public HeaderManager {
     char header_size[sizeof(uint32_t)];
     BigEndian::Store32(header_size, narrow_cast<uint32_t>(metadata_str.size()));
 
-    return kEncryptionMagic + string(header_size, sizeof(header_size)) + metadata_str;
+    return string(kEncryptionMagic) + string(header_size, sizeof(header_size)) + metadata_str;
   }
 
   Result<EncryptionParamsPtr>
-  DecodeEncryptionParamsFromEncryptionMetadata(const Slice& s) override {
+  DecodeEncryptionParamsFromEncryptionMetadata(
+      const Slice& s, std::string* universe_key_id_output) override {
     Slice s_mutable(s);
     // 1. Get the size of the universe key id.
     RETURN_NOT_OK(CheckSliceCanBeDecoded(s_mutable, sizeof(uint32_t), "universe key id size"));
@@ -87,6 +86,9 @@ class HeaderManagerImpl : public HeaderManager {
     // 2. Get the universe key id.
     RETURN_NOT_OK(CheckSliceCanBeDecoded(s_mutable, universe_key_size, "universe key id"));
     std::string universe_key_id(s_mutable.cdata(), universe_key_size);
+    if (universe_key_id_output) {
+      *universe_key_id_output = universe_key_id;
+    }
     s_mutable.remove_prefix(universe_key_size);
 
     // 3. Create an encryption stream from the universe key.
@@ -114,20 +116,25 @@ class HeaderManagerImpl : public HeaderManager {
   }
 
   uint32_t GetEncryptionMetadataStartIndex() override {
-    return narrow_cast<uint32_t>(kEncryptionMagic.size() + sizeof(uint32_t));
+    return narrow_cast<uint32_t>(kEncryptionMagicLen + sizeof(uint32_t));
   }
 
   Result<FileEncryptionStatus> GetFileEncryptionStatusFromPrefix(
       const Slice& s) override {
     FileEncryptionStatus status;
-    status.is_encrypted = s.compare_prefix(Slice(kEncryptionMagic)) == 0;
+    status.is_encrypted = s.compare_prefix(Slice(kEncryptionMagic, kEncryptionMagicLen)) == 0;
     if (status.is_encrypted) {
-      status.header_size = BigEndian::Load32(s.data() + kEncryptionMagic.size());
+      status.header_size = BigEndian::Load32(s.data() + kEncryptionMagicLen);
     }
     return status;
   }
 
-  bool IsEncryptionEnabled() override {
+  Result<std::string> GetLatestUniverseKeyId() override {
+    auto universe_params = VERIFY_RESULT(universe_key_manager_->GetLatestUniverseParams());
+    return universe_params.version_id;
+  }
+
+  Result<bool> IsEncryptionEnabled() override {
     return universe_key_manager_->IsEncryptionEnabled();
   }
 

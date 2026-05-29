@@ -1,4 +1,5 @@
-import React, { FC, useEffect, useState } from 'react';
+import { FC, useEffect, useState } from 'react';
+import { find } from 'lodash';
 import { DropdownButton, OverlayTrigger, MenuItem, Tooltip } from 'react-bootstrap';
 import { BootstrapTable, TableHeaderColumn } from 'react-bootstrap-table';
 import { useTranslation } from 'react-i18next';
@@ -7,10 +8,16 @@ import { YBCheckBox } from '../common/forms/fields';
 import { YBErrorIndicator, YBLoading } from '../common/indicators';
 import { EditConfig } from './EditConfig';
 import { ResetConfig } from './ResetConfig';
-import { RunTimeConfigData } from '../../redesign/helpers/dtos';
+import { RunTimeConfigData, RunTimeConfigScope } from '../../redesign/utils/dtos';
 import { getPromiseState } from '../../utils/PromiseUtils';
 import { isNonEmptyArray } from '../../utils/ObjectUtils';
-
+import {
+  RbacValidator,
+  hasNecessaryPerm
+} from '../../redesign/features/rbac/common/RbacApiPermValidator';
+import { ApiPermissionMap } from '../../redesign/features/rbac/ApiAndUserPermMapping';
+import { Action } from '../../redesign/features/rbac';
+import { DEFAULT_RUNTIME_GLOBAL_SCOPE } from '../../actions/customers';
 import './AdvancedConfig.scss';
 
 const DEFAULT_RUNTIME_TAG_FILTER = ['PUBLIC'];
@@ -21,33 +28,33 @@ const ConfigScopePriority = {
   PROVIDER: 4
 };
 
-interface GlobalConfigProps {
+interface ConfigDataProps {
+  getRuntimeConfig: (key: string, scope?: string) => void;
   setRuntimeConfig: (key: string, value: string, scope?: string) => void;
   deleteRunTimeConfig: (key: string, scope?: string) => void;
   scope: string;
-  configTagFilter: string[] | undefined;
   universeUUID?: string;
   providerUUID?: string;
   customerUUID?: string;
 }
 
-export const ConfigData: FC<GlobalConfigProps> = ({
+export const ConfigData: FC<ConfigDataProps> = ({
+  getRuntimeConfig,
   setRuntimeConfig,
   deleteRunTimeConfig,
   scope,
-  configTagFilter,
   universeUUID,
   providerUUID,
   customerUUID
 }) => {
   const { t } = useTranslation();
-  const tagFilter = configTagFilter ?? DEFAULT_RUNTIME_TAG_FILTER;
+  const [tagFilter, setTagFilter] = useState<string[]>(DEFAULT_RUNTIME_TAG_FILTER);
   const runtimeConfigs = useSelector((state: any) => state.customer.runtimeConfigs);
   const runtimeConfigsKeyMetadata = useSelector(
     (state: any) => state.customer.runtimeConfigsKeyMetadata
   );
   // Helps in deciding if the logged in user can mutate the config values
-  const isScopeMutable = runtimeConfigs?.data?.mutableScope;
+  const [searchText, setSearchText] = useState<string>('');
   const [editConfig, setEditConfig] = useState<boolean>(false);
   const [resetConfig, setResetConfig] = useState<boolean>(false);
   const [showOverridenValues, setShowOverridenValues] = useState<boolean>(false);
@@ -106,7 +113,21 @@ export const ConfigData: FC<GlobalConfigProps> = ({
         });
       setListItems(runtimeConfigItems);
     }
-  }, [scope, universeUUID, providerUUID, customerUUID, runtimeConfigEntries]); // eslint-disable-line react-hooks/exhaustive-deps
+  }, [scope, universeUUID, providerUUID, customerUUID, runtimeConfigEntries, tagFilter]); // eslint-disable-line react-hooks/exhaustive-deps
+
+  useEffect(() => {
+    fetchUiTagFilter();
+  }, [scope]);
+
+  const fetchUiTagFilter = async () => {
+    const uiTagFilterResponse: any = await getRuntimeConfig(
+      'yb.runtime_conf_ui.tag_filter',
+      DEFAULT_RUNTIME_GLOBAL_SCOPE
+    );
+    if (isNonEmptyArray(uiTagFilterResponse?.payload?.data)) {
+      setTagFilter(uiTagFilterResponse?.payload?.data);
+    }
+  };
 
   const openEditConfig = (row: any) => {
     setEditConfig(true);
@@ -147,22 +168,40 @@ export const ConfigData: FC<GlobalConfigProps> = ({
         id="runtime-config-nested-dropdown middle-aligned-table"
         pullRight
       >
-        <MenuItem
-          onClick={() => {
-            openEditConfig(row);
-          }}
+        <RbacValidator
+          customValidateFunction={(userPerm) =>
+            scope === RunTimeConfigScope.GLOBAL
+              ? find(userPerm, { actions: [Action.SUPER_ADMIN_ACTIONS] }) !== undefined
+              : hasNecessaryPerm(ApiPermissionMap.MODIFY_RUNTIME_CONFIG_BY_KEY)
+          }
+          isControl
         >
-          {t('admin.advanced.globalConfig.ModelEditConfigTitle')}
-        </MenuItem>
-
-        {!row.isConfigInherited && (
           <MenuItem
             onClick={() => {
-              openResetConfig(row);
+              openEditConfig(row);
             }}
           >
-            {t('admin.advanced.globalConfig.ModelResetConfigTitle')}
+            {t('admin.advanced.globalConfig.ModelEditConfigTitle')}
           </MenuItem>
+        </RbacValidator>
+        {!row.isConfigInherited && (
+          <RbacValidator
+            customValidateFunction={(userPerm) =>
+              scope === RunTimeConfigScope.GLOBAL
+                ? find(userPerm, { actions: [Action.SUPER_ADMIN_ACTIONS] }) !== undefined
+                : hasNecessaryPerm(ApiPermissionMap.MODIFY_RUNTIME_CONFIG_BY_KEY)
+            }
+            isControl
+            overrideStyle={{ display: 'block' }}
+          >
+            <MenuItem
+              onClick={() => {
+                openResetConfig(row);
+              }}
+            >
+              {t('admin.advanced.globalConfig.ModelResetConfigTitle')}
+            </MenuItem>
+          </RbacValidator>
         )}
       </DropdownButton>
     );
@@ -180,6 +219,10 @@ export const ConfigData: FC<GlobalConfigProps> = ({
 
   const rowClassNameFormat = (row: any) => {
     return row.isConfigInherited ? 'config-inherited-row' : 'config-non-inherited-row';
+  };
+
+  const onSearchChange = (searchText: string) => {
+    setSearchText(searchText);
   };
 
   return (
@@ -205,6 +248,11 @@ export const ConfigData: FC<GlobalConfigProps> = ({
         search
         multiColumnSearch
         trClassName={rowClassNameFormat}
+        options={{
+          clearSearch: false,
+          onSearchChange: onSearchChange,
+          defaultSearch: searchText
+        }}
       >
         <TableHeaderColumn dataField="configID" isKey={true} hidden={true} />
         <TableHeaderColumn
@@ -232,22 +280,21 @@ export const ConfigData: FC<GlobalConfigProps> = ({
         >
           Config Value
         </TableHeaderColumn>
-        {isScopeMutable && (
-          <TableHeaderColumn
-            dataField={'actions'}
-            columnClassName={'yb-actions-cell'}
-            width="10%"
-            dataFormat={formatActionButtons}
-          >
-            Actions
-          </TableHeaderColumn>
-        )}
+        <TableHeaderColumn
+          dataField={'actions'}
+          columnClassName={'yb-actions-cell'}
+          width="10%"
+          dataFormat={formatActionButtons}
+        >
+          Actions
+        </TableHeaderColumn>
       </BootstrapTable>
       {editConfig && (
         <EditConfig
           configData={configData}
           onHide={() => setEditConfig(false)}
           setRuntimeConfig={setRuntimeConfig}
+          fetchUiTagFilter={fetchUiTagFilter}
           scope={scope}
           universeUUID={universeUUID}
           providerUUID={providerUUID}
@@ -259,6 +306,7 @@ export const ConfigData: FC<GlobalConfigProps> = ({
           configData={configData}
           onHide={() => setResetConfig(false)}
           deleteRunTimeConfig={deleteRunTimeConfig}
+          fetchUiTagFilter={fetchUiTagFilter}
           scope={scope}
           universeUUID={universeUUID}
           providerUUID={providerUUID}

@@ -1,4 +1,4 @@
-// Copyright (c) YugaByte, Inc.
+// Copyright (c) YugabyteDB, Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License"); you may not use this file except
 // in compliance with the License.  You may obtain a copy of the License at
@@ -13,11 +13,14 @@
 
 #include "yb/master/sys_catalog_initialization.h"
 
+#include "yb/ash/wait_state.h"
+
 #include "yb/common/wire_protocol.h"
 
 #include "yb/master/catalog_entity_info.h"
 #include "yb/master/sys_catalog.h"
 
+#include "yb/master/ysql/ysql_manager_if.h"
 #include "yb/tablet/operations/change_metadata_operation.h"
 #include "yb/tablet/operations/snapshot_operation.h"
 #include "yb/tablet/tablet.h"
@@ -46,8 +49,8 @@ TAG_FLAG(create_initial_sys_catalog_snapshot, hidden);
 DEFINE_test_flag(bool, fail_initdb_after_snapshot_restore, false,
                  "Kill the master process after successfully restoring the sys catalog snapshot.");
 
-using yb::CountDownLatch;
-using yb::tserver::TabletSnapshotOpRequestPB;
+DECLARE_bool(enable_ysql);
+
 using yb::tserver::TabletSnapshotOpResponsePB;
 using yb::tablet::SnapshotOperation;
 using yb::pb_util::ReadPBContainerFromPath;
@@ -79,7 +82,8 @@ void InitialSysCatalogSnapshotWriter::AddMetadataChange(
 Status InitialSysCatalogSnapshotWriter::WriteSnapshot(
     tablet::Tablet* sys_catalog_tablet,
     const std::string& dest_path) {
-  RETURN_NOT_OK(sys_catalog_tablet->Flush(yb::tablet::FlushMode::kSync));
+  RETURN_NOT_OK(sys_catalog_tablet->Flush(
+      yb::tablet::FlushMode::kSync, rocksdb::FlushReason::kSysCatalogFlush));
   RETURN_NOT_OK(Env::Default()->CreateDir(dest_path));
   RETURN_NOT_OK(sys_catalog_tablet->snapshots().CreateCheckpoint(
       JoinPathSegments(dest_path, kSysCatalogSnapshotRocksDbSubDir)));
@@ -93,6 +97,7 @@ Status InitialSysCatalogSnapshotWriter::WriteSnapshot(
   const string metadata_changes_file = JoinPathSegments(
       dest_path,
       kSysCatalogSnapshotTabletMetadataChangesFile);
+  SCOPED_WAIT_STATUS(WriteSysCatalogSnapshotToDisk);
   RETURN_NOT_OK(WritePBContainerToPath(
       Env::Default(),
       metadata_changes_file,
@@ -114,8 +119,8 @@ Status RestoreInitialSysCatalogSnapshot(
     const std::string& initial_snapshot_path,
     tablet::TabletPeer* sys_catalog_tablet_peer,
     int64_t term) {
-  auto operation = std::make_unique<SnapshotOperation>(
-      VERIFY_RESULT(sys_catalog_tablet_peer->shared_tablet_safe()));
+  auto operation =
+      std::make_unique<SnapshotOperation>(VERIFY_RESULT(sys_catalog_tablet_peer->shared_tablet()));
 
   auto& tablet_snapshot_req = *operation->AllocateRequest();
   tablet_snapshot_req.set_operation(yb::tserver::TabletSnapshotOpRequestPB::RESTORE_ON_TABLET);
@@ -207,17 +212,11 @@ void SetDefaultInitialSysCatalogSnapshotFlags() {
 }
 
 Status MakeYsqlSysCatalogTablesTransactional(
-    TableIndex::TablesRange tables,
-    SysCatalogTable* sys_catalog,
-    SysConfigInfo* ysql_catalog_config,
-    int64_t term) {
-  {
-    auto ysql_catalog_config_lock = ysql_catalog_config->LockForRead();
-    const auto& ysql_catalog_config_pb = ysql_catalog_config_lock->pb.ysql_catalog_config();
-    if (ysql_catalog_config_pb.transactional_sys_catalog_enabled()) {
-      LOG(INFO) << "YSQL catalog tables are already transactional";
-      return Status::OK();
-    }
+    TableIndex::TablesRange tables, SysCatalogTable* sys_catalog, YsqlManagerIf& ysql_manager,
+    const LeaderEpoch& epoch) {
+  if (ysql_manager.IsTransactionalSysCatalogEnabled()) {
+    LOG(INFO) << "YSQL catalog tables are already transactional";
+    return Status::OK();
   }
 
   int num_updated_tables = 0;
@@ -230,11 +229,11 @@ Status MakeYsqlSysCatalogTablesTransactional(
     }
 
     {
-      TabletInfos tablet_infos = table_info.GetTablets();
+      TabletInfos tablet_infos = VERIFY_RESULT(table_info.GetTablets());
       if (tablet_infos.size() != 1 || tablet_infos.front()->tablet_id() != kSysCatalogTabletId) {
         continue;
       }
-     }
+    }
 
     auto table_lock = table_info.LockForWrite();
     auto& schema = *table_lock.mutable_data()->mutable_schema();
@@ -267,11 +266,11 @@ Status MakeYsqlSysCatalogTablesTransactional(
     metadata_table_properties.set_is_transactional(true);
 
     RETURN_NOT_OK(tablet::SyncReplicateChangeMetadataOperation(
-        &change_req, sys_catalog->tablet_peer().get(), term));
+        &change_req, sys_catalog->tablet_peer().get(), epoch.leader_term));
 
     // Change table properties in the sys catalog. We do this after updating tablet metadata, so
     // that if a restart happens before this step succeeds, we'll retry updating both next time.
-    RETURN_NOT_OK(sys_catalog->Upsert(term, &table_info));
+    RETURN_NOT_OK(sys_catalog->Upsert(epoch, &table_info));
     table_lock.Commit();
   }
 
@@ -279,15 +278,7 @@ Status MakeYsqlSysCatalogTablesTransactional(
     LOG(INFO) << "Made " << num_updated_tables << " YSQL sys catalog tables transactional";
   }
 
-  LOG(INFO) << "Marking YSQL system catalog as transactional in YSQL catalog config";
-  {
-    auto ysql_catalog_lock = ysql_catalog_config->LockForWrite();
-    auto* ysql_catalog_config_pb =
-        ysql_catalog_lock.mutable_data()->pb.mutable_ysql_catalog_config();
-    ysql_catalog_config_pb->set_transactional_sys_catalog_enabled(true);
-    RETURN_NOT_OK(sys_catalog->Upsert(term, ysql_catalog_config));
-    ysql_catalog_lock.Commit();
-  }
+  RETURN_NOT_OK(ysql_manager.SetTransactionalSysCatalogEnabled(epoch));
 
   return Status::OK();
 }

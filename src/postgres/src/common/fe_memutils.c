@@ -3,7 +3,7 @@
  * fe_memutils.c
  *	  memory management support for frontend code
  *
- * Portions Copyright (c) 1996-2018, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2022, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  *
@@ -18,6 +18,9 @@
 #endif
 
 #include "postgres_fe.h"
+
+/* YB includes */
+#include "yb/util/debug/leak_annotations.h"
 
 static inline void *
 pg_malloc_internal(size_t size, int flags)
@@ -40,6 +43,8 @@ pg_malloc_internal(size_t size, int flags)
 
 	if ((flags & MCXT_ALLOC_ZERO) != 0)
 		MemSet(tmp, 0, size);
+
+	__lsan_ignore_object(tmp);
 	return tmp;
 }
 
@@ -98,6 +103,7 @@ pg_strdup(const char *in)
 		fprintf(stderr, _("out of memory\n"));
 		exit(EXIT_FAILURE);
 	}
+	__lsan_ignore_object(tmp);
 	return tmp;
 }
 
@@ -140,6 +146,33 @@ char *
 pstrdup(const char *in)
 {
 	return pg_strdup(in);
+}
+
+char *
+pnstrdup(const char *in, Size size)
+{
+	char	   *tmp;
+	int			len;
+
+	if (!in)
+	{
+		fprintf(stderr,
+				_("cannot duplicate null pointer (internal error)\n"));
+		exit(EXIT_FAILURE);
+	}
+
+	len = strnlen(in, size);
+	tmp = malloc(len + 1);
+	if (tmp == NULL)
+	{
+		fprintf(stderr, _("out of memory\n"));
+		exit(EXIT_FAILURE);
+	}
+
+	memcpy(tmp, in, len);
+	tmp[len] = '\0';
+
+	return tmp;
 }
 
 void *

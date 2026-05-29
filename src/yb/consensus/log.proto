@@ -15,9 +15,9 @@
 // specific language governing permissions and limitations
 // under the License.
 //
-// The following only applies to changes made to this file as part of YugaByte development.
+// The following only applies to changes made to this file as part of YugabyteDB development.
 //
-// Portions Copyright (c) YugaByte, Inc.
+// Portions Copyright (c) YugabyteDB, Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License"); you may not use this file except
 // in compliance with the License.  You may obtain a copy of the License at
@@ -36,9 +36,9 @@ package yb.log;
 option java_package = "org.yb.log";
 
 import "yb/common/common.proto";
+import "yb/common/opid.proto";
 import "yb/consensus/consensus.proto";
 import "yb/rpc/lightweight_message.proto";
-import "yb/util/opid.proto";
 
 // ===========================================================================
 //  Log Entries - Log specific messages + single node messages
@@ -52,9 +52,12 @@ enum LogEntryTypePB {
   // Marker entries are for dummy log messages. These will never end up in the log.
 
   // Roll over active log segment before writing the next entry if active segment is not empty.
-  ROLLOVER_MARKER = 998;
+  SYNC_ROLLOVER_MARKER = 998;
   // Serve the purpose of making sure that all entries up to the FLUSH_MARKER entry are flushed.
   FLUSH_MARKER = 999;
+  // Async roll over active log segment, and halve the cur_max_segment_size of the next segment
+  // if it's greater than initial_max_segment_size.
+  ASYNC_ROLLOVER_AT_FLUSH_MARKER = 1000;
 };
 
 // An entry in the WAL/state machine log.
@@ -131,4 +134,14 @@ message LogSegmentFooterPB {
   // Offset of the first index block. Absence means there is no log index stored in this log
   // segment.
   optional int64 index_start_offset = 5;
+  // Minimum start time of running transactions right before closing of the log segment. It can be
+  // either of the following values:
+  // 1. Minimum start HT of running txns (if any)
+  // 2. Tablet leader safe time
+  // 3. HybridTime::kInitial if both the previous values were HybridTime::kInvalid or not
+  // fetched successfully.
+  optional uint64 min_start_time_running_txns = 6;
+
+  // Log HT of the last appended WAL Op in the segment.
+  optional uint64 last_wal_op_log_ht = 7;
 }

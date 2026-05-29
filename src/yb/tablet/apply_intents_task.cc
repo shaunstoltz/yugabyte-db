@@ -1,4 +1,4 @@
-// Copyright (c) YugaByte, Inc.
+// Copyright (c) YugabyteDB, Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License"); you may not use this file except
 // in compliance with the License.  You may obtain a copy of the License at
@@ -47,6 +47,7 @@ bool ApplyIntentsTask::Prepare(RunningTransactionPtr transaction, ScopedRWOperat
   if (!used_.compare_exchange_strong(expected, true, std::memory_order_acq_rel)) {
     return false;
   }
+  CHECK(!apply_data_.op_id.empty());
 
   transaction_ = std::move(transaction);
   operation_ = std::move(*DCHECK_NOTNULL(operation));
@@ -71,17 +72,12 @@ void ApplyIntentsTask::Run() {
       continue;
     }
 
-    auto result = applier_.ApplyIntents(apply_data_);
-    if (!result.ok()) {
-      LOG_WITH_PREFIX(DFATAL)
-          << "Failed to apply intents " << apply_data_.ToString() << ": " << result.status();
-      break;
-    }
+    auto apply_data = applier_.ApplyIntents(apply_data_);
 
-    transaction_->SetApplyData(*result);
-    VLOG_WITH_PREFIX(2) << "Performed next apply step: " << result->ToString();
+    transaction_->SetApplyData(apply_data);
+    VLOG_WITH_PREFIX(2) << "Performed next apply step: " << apply_data.ToString();
 
-    if (!result->active()) {
+    if (!apply_data.active()) {
       break;
     }
   }

@@ -15,9 +15,9 @@
 // specific language governing permissions and limitations
 // under the License.
 //
-// The following only applies to changes made to this file as part of YugaByte development.
+// The following only applies to changes made to this file as part of YugabyteDB development.
 //
-// Portions Copyright (c) YugaByte, Inc.
+// Portions Copyright (c) YugabyteDB, Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License"); you may not use this file except
 // in compliance with the License.  You may obtain a copy of the License at
@@ -34,11 +34,11 @@
 
 #include "yb/tablet/maintenance_manager.h"
 #include "yb/tablet/tablet_peer.h"
-#include "yb/util/stopwatch.h"
+#include "yb/util/semaphore.h"
 
 namespace yb {
 
-class Histogram;
+class EventStats;
 template<class T>
 class AtomicGauge;
 
@@ -58,15 +58,41 @@ class LogGCOp : public MaintenanceOp {
 
   virtual void Perform() override;
 
-  virtual scoped_refptr<Histogram> DurationHistogram() const override;
+  virtual scoped_refptr<EventStats> DurationHistogram() const override;
 
   virtual scoped_refptr<AtomicGauge<uint32_t> > RunningGauge() const override;
 
  private:
   TabletPtr tablet_;
   TabletPeer *const tablet_peer_;
-  scoped_refptr<Histogram> log_gc_duration_;
+  scoped_refptr<EventStats> log_gc_duration_;
   scoped_refptr<AtomicGauge<uint32_t> > log_gc_running_;
+  mutable Semaphore sem_;
+};
+
+// Maintenance task that resets CDC retention barriers when they go stale.
+//
+// Only one ResetStaleRetentionBarriers op can run at a time.
+class ResetStaleRetentionBarriersOp : public MaintenanceOp {
+ public:
+  explicit ResetStaleRetentionBarriersOp(TabletPeer* tablet_peer, const TabletPtr& tablet);
+
+  virtual void UpdateStats(MaintenanceOpStats* stats) override;
+
+  virtual bool Prepare() override;
+
+  virtual void Perform() override;
+
+  virtual scoped_refptr<EventStats> DurationHistogram() const override;
+
+  virtual scoped_refptr<AtomicGauge<uint32_t> > RunningGauge() const override;
+
+ private:
+  TabletPtr tablet_;
+  TabletPeer* const tablet_peer_;
+  MonoTime op_last_successful_run_time_;
+  scoped_refptr<EventStats> cdcsdk_reset_retention_barriers_op_duration_;
+  scoped_refptr<AtomicGauge<uint32_t> > cdcsdk_reset_retention_barriers_ops_running_;
   mutable Semaphore sem_;
 };
 

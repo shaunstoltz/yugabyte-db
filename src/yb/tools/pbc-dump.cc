@@ -15,9 +15,9 @@
 // specific language governing permissions and limitations
 // under the License.
 //
-// The following only applies to changes made to this file as part of YugaByte development.
+// The following only applies to changes made to this file as part of YugabyteDB development.
 //
-// Portions Copyright (c) YugaByte, Inc.
+// Portions Copyright (c) YugabyteDB, Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License"); you may not use this file except
 // in compliance with the License.  You may obtain a copy of the License at
@@ -33,7 +33,7 @@
 #include <iostream>
 #include <string>
 
-#include <glog/logging.h>
+#include "yb/tools/pbc_tools_lib.h"
 
 #include "yb/util/env.h"
 #include "yb/util/flags.h"
@@ -41,40 +41,48 @@
 #include "yb/util/pb_util.h"
 #include "yb/util/status.h"
 
+
+using yb::encryption::UniverseKeyManager;
 using yb::Status;
 using std::cerr;
 using std::endl;
 using std::string;
 
-DEFINE_UNKNOWN_bool(oneline, false, "print each protobuf on a single line");
+DEFINE_NON_RUNTIME_bool(oneline, false, "print each protobuf on a single line");
 TAG_FLAG(oneline, stable);
 
-namespace yb {
-namespace pb_util {
+namespace yb::pb_util {
 
-Status DumpPBContainerFile(const string& filename) {
-  Env* env = Env::Default();
+Status DumpPBContainerFile(const string& filename, const string& keyfile,
+                           const string& keyid) {
+  auto tool_env = VERIFY_RESULT(PBToolEnv::Create(keyid, keyfile));
   std::unique_ptr<RandomAccessFile> reader;
-  RETURN_NOT_OK(env->NewRandomAccessFile(filename, &reader));
+  RETURN_NOT_OK(tool_env.env().NewRandomAccessFile(filename, &reader));
   ReadablePBContainerFile pb_reader(std::move(reader));
   RETURN_NOT_OK(pb_reader.Init());
   RETURN_NOT_OK(pb_reader.Dump(&std::cout, FLAGS_oneline));
-
   return Status::OK();
 }
 
-} // namespace pb_util
-} // namespace yb
+}  // namespace yb::pb_util
 
 int main(int argc, char **argv) {
   yb::ParseCommandLineFlags(&argc, &argv, true);
   yb::InitGoogleLoggingSafe(argv[0]);
-  if (argc != 2) {
-    cerr << "usage: " << argv[0] << " [--oneline] <protobuf container filename>" << endl;
+  if (argc != 2 && argc != 4) {
+    cerr << "usage: " << argv[0] << "<protobuf container filename> [<keyfile> <keyid>]" << endl;
+    cerr << "For encrypted files, provide the universe key file and the id of universe key" << endl;
     return 2;
   }
 
-  Status s = yb::pb_util::DumpPBContainerFile(argv[1]);
+  std::string protobuf_file = argv[1];
+  // The keyfile and keyid are optional. If not provided, the default key will be used.
+  // The keyfile is the path to the file containing the universe key.
+  // The keyid is the ID of the universe key.
+  std::string keyfile = (argc > 2) ? argv[2] : "";
+  std::string keyid = (argc > 3) ? argv[3] : "";
+
+  Status s = yb::pb_util::DumpPBContainerFile(protobuf_file, keyfile, keyid);
   if (s.ok()) {
     return 0;
   } else {

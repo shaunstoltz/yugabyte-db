@@ -15,9 +15,9 @@
 // specific language governing permissions and limitations
 // under the License.
 //
-// The following only applies to changes made to this file as part of YugaByte development.
+// The following only applies to changes made to this file as part of YugabyteDB development.
 //
-// Portions Copyright (c) YugaByte, Inc.
+// Portions Copyright (c) YugabyteDB, Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License"); you may not use this file except
 // in compliance with the License.  You may obtain a copy of the License at
@@ -64,6 +64,7 @@ class CalculatorServiceMethods {
   static const constexpr auto kAddMethodName = "Add";
   static const constexpr auto kDisconnectMethodName = "Disconnect";
   static const constexpr auto kEchoMethodName = "Echo";
+  static const constexpr auto kRepeatedEchoMethodName = "RepeatedEcho";
   static const constexpr auto kSendStringsMethodName = "SendStrings";
   static const constexpr auto kSleepMethodName = "Sleep";
 
@@ -82,6 +83,12 @@ class CalculatorServiceMethods {
   static RemoteMethod* EchoMethod() {
     static RemoteMethod method(
         rpc_test::CalculatorServiceIf::static_service_name(), kEchoMethodName);
+    return &method;
+  }
+
+  static RemoteMethod* RepeatedEchoMethod() {
+    static RemoteMethod method(
+        rpc_test::CalculatorServiceIf::static_service_name(), kRepeatedEchoMethodName);
     return &method;
   }
 
@@ -113,6 +120,10 @@ class GenericCalculatorService : public ServiceIf {
   void FillEndpoints(const RpcServicePtr& service, RpcEndpointMap* map) override;
   void Handle(InboundCallPtr incoming) override;
 
+  std::string metric_name() const override {
+    return rpc_test::CalculatorServiceIf::static_service_name();
+  }
+
   std::string service_name() const override {
     return rpc_test::CalculatorServiceIf::static_service_name();
   }
@@ -124,6 +135,7 @@ class GenericCalculatorService : public ServiceIf {
   void DoSendStrings(InboundCall* incoming);
   void DoSleep(InboundCall *incoming);
   void DoEcho(InboundCall *incoming);
+  void DoRepeatedEcho(InboundCall *incoming);
   void AddMethodToMap(
       const RpcServicePtr& service, RpcEndpointMap* map, const char* method_name, Method method);
 
@@ -166,7 +178,7 @@ class TestServer {
 
  private:
   std::unique_ptr<Messenger> messenger_;
-  std::unique_ptr<ThreadPool> thread_pool_;
+  ThreadPoolPtr thread_pool_;
   scoped_refptr<ServicePool> service_pool_;
   Endpoint bound_endpoint_;
 };

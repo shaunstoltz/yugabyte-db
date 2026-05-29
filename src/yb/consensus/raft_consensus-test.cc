@@ -15,9 +15,9 @@
 // specific language governing permissions and limitations
 // under the License.
 //
-// The following only applies to changes made to this file as part of YugaByte development.
+// The following only applies to changes made to this file as part of YugabyteDB development.
 //
-// Portions Copyright (c) YugaByte, Inc.
+// Portions Copyright (c) YugabyteDB, Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License"); you may not use this file except
 // in compliance with the License.  You may obtain a copy of the License at
@@ -40,21 +40,23 @@
 #include "yb/consensus/consensus_types.h"
 #include "yb/consensus/log.h"
 #include "yb/consensus/peer_manager.h"
+#include "yb/consensus/retryable_requests.h"
 
 #include "yb/fs/fs_manager.h"
 
 #include "yb/gutil/bind.h"
-#include "yb/gutil/stl_util.h"
+
+#include "yb/rpc/thread_pool.h"
 
 #include "yb/server/logical_clock.h"
 
-#include "yb/util/async_util.h"
 #include "yb/util/mem_tracker.h"
 #include "yb/util/metrics.h"
 #include "yb/util/status_log.h"
 #include "yb/util/test_macros.h"
 #include "yb/util/test_util.h"
 
+DECLARE_int32(retryable_request_timeout_secs);
 DECLARE_bool(enable_leader_failure_detection);
 DECLARE_bool(never_fsync);
 
@@ -65,19 +67,16 @@ using std::shared_ptr;
 using std::string;
 using std::vector;
 
-namespace yb {
-namespace consensus {
+namespace yb::consensus {
 
 using log::Log;
 using log::LogOptions;
 using ::testing::_;
 using ::testing::AnyNumber;
 using ::testing::AtLeast;
-using ::testing::Eq;
 using ::testing::InSequence;
 using ::testing::Invoke;
 using ::testing::Mock;
-using ::testing::Property;
 using ::testing::Return;
 
 const char* kTestTable = "TestTable";
@@ -85,17 +84,17 @@ const char* kTestTablet = "TestTablet";
 const char* kLocalPeerUuid = "peer-0";
 
 // A simple map to collect the results of a sequence of transactions.
-typedef std::map<OpIdPB, Status, OpIdCompareFunctor> StatusesMap;
+using StatusesMap = std::map<OpIdPB, Status, OpIdCompareFunctor>;
 
 class MockQueue : public PeerMessageQueue {
  public:
   explicit MockQueue(const scoped_refptr<MetricEntity>& tablet_metric_entity, log::Log* log,
                      const server::ClockPtr& clock,
-                     std::unique_ptr<ThreadPoolToken> raft_pool_observers_token)
+                     std::unique_ptr<rpc::Strand> observers_strand)
       : PeerMessageQueue(
           tablet_metric_entity, log, nullptr /* server_tracker */, nullptr /* parent_tracker */,
-          FakeRaftPeerPB(kLocalPeerUuid), kTestTablet, clock, nullptr /* consensus_queue */,
-          std::move(raft_pool_observers_token)) {}
+          FakeRaftPeerPB(kLocalPeerUuid), kTestTablet, clock, /*context=*/nullptr,
+          std::move(observers_strand)) {}
 
   MOCK_METHOD1(Init, void(const OpId& locally_replicated_index));
   MOCK_METHOD4(SetLeaderMode, void(const OpId& committed_opid,
@@ -111,7 +110,6 @@ class MockQueue : public PeerMessageQueue {
   MOCK_METHOD3(AppendOperationsMock, Status(const ReplicateMsgs& msgs,
                                             const yb::OpId& committed_op_id,
                                             RestartSafeCoarseTimePoint time));
-  MOCK_METHOD1(TrackPeer, void(const string&));
   MOCK_METHOD1(UntrackPeer, void(const string&));
   MOCK_METHOD6(RequestForPeer, Status(const std::string& uuid,
                                       LWConsensusRequestPB* request,
@@ -126,7 +124,10 @@ class MockQueue : public PeerMessageQueue {
 
 class MockPeerManager : public PeerManager {
  public:
-  MockPeerManager() : PeerManager("", "", nullptr, nullptr, nullptr, nullptr) {}
+  MockPeerManager()
+      : PeerManager(
+            "", "", /*peer_proxy_factory=*/nullptr, /*queue=*/nullptr, /*raft_pool_token=*/nullptr,
+            /*multi_raft_manager=*/nullptr) {}
   MOCK_METHOD1(UpdateRaftConfig, void(const consensus::RaftConfigPB& config));
   MOCK_METHOD1(SignalRequest, void(RequestTriggerMode trigger_mode));
   MOCK_METHOD0(Close, void());
@@ -134,7 +135,7 @@ class MockPeerManager : public PeerManager {
 
 class RaftConsensusSpy : public RaftConsensus {
  public:
-  typedef Callback<Status(const scoped_refptr<ConsensusRound>& round)> AppendCallback;
+  using AppendCallback = Callback<Status (const scoped_refptr<ConsensusRound> &)>;
 
   RaftConsensusSpy(const ConsensusOptions& options,
                    std::unique_ptr<ConsensusMetadata> cmeta,
@@ -142,6 +143,7 @@ class RaftConsensusSpy : public RaftConsensus {
                    std::unique_ptr<PeerMessageQueue> queue,
                    std::unique_ptr<PeerManager> peer_manager,
                    std::unique_ptr<ThreadPoolToken> raft_pool_token,
+                   std::unique_ptr<consensus::RetryableRequests> retryable_requests,
                    const scoped_refptr<MetricEntity>& table_metric_entity,
                    const scoped_refptr<MetricEntity>& tablet_metric_entity,
                    const std::string& peer_uuid,
@@ -166,7 +168,7 @@ class RaftConsensusSpy : public RaftConsensus {
                     parent_mem_tracker,
                     mark_dirty_clbk,
                     YQL_TABLE_TYPE,
-                    nullptr /* retryable_requests */) {
+                    retryable_requests.get()) {
     // These "aliases" allow us to count invocations and assert on them.
     ON_CALL(*this, StartConsensusOnlyRoundUnlocked(_))
         .WillByDefault(Invoke(this,
@@ -217,7 +219,7 @@ class RaftConsensusTest : public YBTest {
         tablet_metric_entity_(
           METRIC_ENTITY_tablet.Instantiate(&metric_registry_, "raft-consensus-test-tablet")),
         schema_(GetSimpleTestSchema()) {
-    FLAGS_enable_leader_failure_detection = false;
+    ANNOTATE_UNPROTECTED_WRITE(FLAGS_enable_leader_failure_detection) = false;
     options_.tablet_id = kTestTablet;
   }
 
@@ -239,21 +241,24 @@ class RaftConsensusTest : public YBTest {
                        fs_manager_->GetFirstTabletWalDirOrDie(kTestTable, kTestTablet),
                        fs_manager_->uuid(),
                        schema_,
-                       0, // schema_version
-                       nullptr, // table_metric_entity
-                       nullptr, // tablet_metric_entity
+                       /*schema_version=*/0,
+                       /*table_metric_entity=*/nullptr,
+                       /*tablet_metric_entity=*/nullptr,
+                       /*read_wal_mem_tracker=*/nullptr,
                        log_thread_pool_.get(),
                        log_thread_pool_.get(),
                        log_thread_pool_.get(),
-                       std::numeric_limits<int64_t>::max(), // cdc_min_replicated_index
                        &log_));
 
     log_->TEST_SetAllOpIdsSafe(true);
 
     ASSERT_OK(ThreadPoolBuilder("raft-pool").Build(&raft_pool_));
-    std::unique_ptr<ThreadPoolToken> raft_pool_token =
-        raft_pool_->NewToken(ThreadPool::ExecutionMode::CONCURRENT);
-    queue_ = new MockQueue(tablet_metric_entity_, log_.get(), clock_, std::move(raft_pool_token));
+    raft_notifications_pool_ = std::make_unique<rpc::ThreadPool>(rpc::ThreadPoolOptions {
+      .name = "raft_notifications",
+      .max_workers = rpc::ThreadPoolOptions::kUnlimitedWorkers
+    });
+    queue_ = new MockQueue(tablet_metric_entity_, log_.get(), clock_,
+                           std::make_unique<rpc::Strand>(raft_notifications_pool_.get()));
     peer_manager_ = new MockPeerManager;
     operation_factory_.reset(new MockOperationFactory);
 
@@ -269,19 +274,25 @@ class RaftConsensusTest : public YBTest {
 
     string peer_uuid = config_.peers(num_peers - 1).permanent_uuid();
 
-    std::unique_ptr<ConsensusMetadata> cmeta;
-    ASSERT_OK(ConsensusMetadata::Create(fs_manager_.get(), kTestTablet, peer_uuid,
-                                       config_, initial_term, &cmeta));
+    std::unique_ptr<ConsensusMetadata> cmeta = ASSERT_RESULT(ConsensusMetadata::Create(
+        fs_manager_.get(), kTestTablet, peer_uuid, config_, initial_term));
 
     std::unique_ptr<ThreadPoolToken> raft_pool_token =
         raft_pool_->NewToken(ThreadPool::ExecutionMode::CONCURRENT);
 
+    std::unique_ptr<consensus::RetryableRequests> retryable_requests =
+        std::make_unique<consensus::RetryableRequests>(
+            MemTracker::GetRootTracker(),
+            "");
+    retryable_requests->SetServerClock(clock_);
+    retryable_requests->SetRequestTimeout(FLAGS_retryable_request_timeout_secs);
     consensus_.reset(new RaftConsensusSpy(options_,
                                           std::move(cmeta),
                                           std::move(proxy_factory),
                                           std::unique_ptr<PeerMessageQueue>(queue_),
                                           std::unique_ptr<PeerManager>(peer_manager_),
                                           std::move(raft_pool_token),
+                                          std::move(retryable_requests),
                                           table_metric_entity_,
                                           tablet_metric_entity_,
                                           peer_uuid,
@@ -392,6 +403,7 @@ class RaftConsensusTest : public YBTest {
   MockQueue* queue_;
   MockPeerManager* peer_manager_;
   std::unique_ptr<MockOperationFactory> operation_factory_;
+  std::unique_ptr<rpc::ThreadPool> raft_notifications_pool_;
 };
 
 ConsensusRequestPB RaftConsensusTest::MakeConsensusRequest(int64_t caller_term,
@@ -529,17 +541,16 @@ TEST_F(RaftConsensusTest, TestPendingOperations) {
   // Emulate a stateful system by having a bunch of operations in flight when consensus starts.
   // Specifically we emulate we're on term 10, with 10 operations that have not been committed yet.
   ConsensusBootstrapInfo info;
-  info.last_id.set_term(10);
+  info.last_id.term = 10;
   for (int i = 0; i < 10; i++) {
     auto replicate = rpc::MakeSharedMessage<LWReplicateMsg>();
     replicate->set_op_type(NO_OP);
-    info.last_id.set_index(100 + i);
-    replicate->mutable_id()->CopyFrom(info.last_id);
+    info.last_id.index = 100 + i;
+    info.last_id.ToPB(replicate->mutable_id());
     info.orphaned_replicates.push_back(replicate);
   }
 
-  info.last_committed_id.set_term(10);
-  info.last_committed_id.set_index(99);
+  info.last_committed_id = OpId(10, 99);
 
   {
     InSequence dummy;
@@ -600,8 +611,8 @@ TEST_F(RaftConsensusTest, TestPendingOperations) {
   consensus_->TEST_UpdateMajorityReplicated(
       OpId::FromPB(info.orphaned_replicates.back()->id()), &committed_index, &last_applied_op_id);
   // Should still be the last committed in the wal.
-  ASSERT_EQ(committed_index, OpId::FromPB(info.last_committed_id));
-  ASSERT_EQ(last_applied_op_id, OpId::FromPB(info.last_committed_id));
+  ASSERT_EQ(committed_index, info.last_committed_id);
+  ASSERT_EQ(last_applied_op_id, info.last_committed_id);
 
   // Now mark the last operation (the no-op round) as committed.
   // This should advance the committed index, since that round in on our current term,
@@ -910,5 +921,4 @@ TEST_F(RaftConsensusTest, TestLastLeaderReceivedNotMinimum) {
   ASSERT_EQ(OpId::FromPB(response.status().last_received_current_leader()),  replicating_op_id);
 }
 
-}  // namespace consensus
-}  // namespace yb
+} // namespace yb::consensus

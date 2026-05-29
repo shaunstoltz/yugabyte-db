@@ -11,7 +11,7 @@
  *	cpu_tuple_cost		Cost of typical CPU time to process a tuple
  *	cpu_index_tuple_cost  Cost of typical CPU time to process an index tuple
  *	cpu_operator_cost	Cost of CPU time to execute an operator or function
- *	parallel_tuple_cost Cost of CPU time to pass a tuple from worker to master backend
+ *	parallel_tuple_cost Cost of CPU time to pass a tuple from worker to leader backend
  *	parallel_setup_cost Cost of setting up shared memory for parallelism
  *
  * We expect that the kernel will typically do some amount of read-ahead
@@ -60,7 +60,7 @@
  * values.
  *
  *
- * Portions Copyright (c) 1996-2018, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2022, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  * IDENTIFICATION
@@ -71,20 +71,22 @@
 
 #include "postgres.h"
 
-#ifdef _MSC_VER
-#include <float.h>				/* for _isnan */
-#endif
+#include <limits.h>
 #include <math.h>
 
 #include "access/amapi.h"
 #include "access/htup_details.h"
 #include "access/tsmapi.h"
 #include "executor/executor.h"
+#include "executor/nodeAgg.h"
 #include "executor/nodeHash.h"
+#include "executor/nodeMemoize.h"
 #include "miscadmin.h"
+#include "nodes/makefuncs.h"
 #include "nodes/nodeFuncs.h"
 #include "optimizer/clauses.h"
 #include "optimizer/cost.h"
+#include "optimizer/optimizer.h"
 #include "optimizer/pathnode.h"
 #include "optimizer/paths.h"
 #include "optimizer/placeholder.h"
@@ -97,6 +99,17 @@
 #include "utils/spccache.h"
 #include "utils/tuplesort.h"
 
+/* YB includes */
+#include "access/sysattr.h"
+#include "access/table.h"
+#include "catalog/pg_statistic.h"
+#include "catalog/pg_statistic_ext.h"
+#include "catalog/pg_type_d.h"
+#include "executor/ybExpr.h"
+#include "optimizer/ybplan.h"
+#include "pg_yb_utils.h"
+#include "utils/syscache.h"
+
 
 #define LOG2(x)  (log(x) / 0.693147180559945)
 
@@ -107,6 +120,29 @@
  */
 #define APPEND_CPU_COST_MULTIPLIER 0.5
 
+/*
+ * Maximum value for row estimates.  We cap row estimates to this to help
+ * ensure that costs based on these estimates remain within the range of what
+ * double can represent.  add_path() wouldn't act sanely given infinite or NaN
+ * cost values.
+ */
+#define MAXIMUM_ROWCOUNT 1e100
+
+/*
+ * Total size of the hidden columns in each relation.
+ */
+#define HIDDEN_COLUMNS_SIZE 4
+
+#define MEGA 1048576
+/*
+ * 1 Byte for null indicator
+ * 8 Bytes for size of YBCTID
+ * 1 Byte for value type (kUInt16Hash)
+ * 19 Bytes for binary representation of UUID
+ * 2 Bytes for double null termination
+ * 2 Bytes for group termination (kGroupEnd)
+ */
+#define UUID_YBCTID_WIDTH 33
 
 double		seq_page_cost = DEFAULT_SEQ_PAGE_COST;
 double		random_page_cost = DEFAULT_RANDOM_PAGE_COST;
@@ -116,15 +152,38 @@ double		cpu_operator_cost = DEFAULT_CPU_OPERATOR_COST;
 double		parallel_tuple_cost = DEFAULT_PARALLEL_TUPLE_COST;
 double		parallel_setup_cost = DEFAULT_PARALLEL_SETUP_COST;
 
+/* Following parameters are used by the older heuristics-based cost model */
+double		yb_network_fetch_cost = YB_DEFAULT_FETCH_COST;
 double		yb_intercloud_cost = YB_DEFAULT_INTERCLOUD_COST;
 double		yb_interregion_cost = YB_DEFAULT_INTERREGION_COST;
 double		yb_interzone_cost = YB_DEFAULT_INTERZONE_COST;
-
 double		yb_local_cost = YB_DEFAULT_LOCAL_COST;
+
+/*
+ * Following parameters are used in the newer cost model that aims to model the
+ * pggate and DocDB storage layer and LSM index lookup more precisely.
+ */
+double		yb_seq_block_cost = DEFAULT_SEQ_PAGE_COST;
+double		yb_random_block_cost = DEFAULT_RANDOM_PAGE_COST;
+double		yb_docdb_next_cpu_cycles = YB_DEFAULT_DOCDB_NEXT_CPU_CYCLES;
+double		yb_seek_cost_factor = YB_DEFAULT_SEEK_COST_FACTOR;
+int			yb_docdb_merge_cpu_cycles = YB_DEFAULT_DOCDB_MERGE_CPU_CYCLES;
+int			yb_docdb_remote_filter_overhead_cycles = YB_DEFAULT_DOCDB_REMOTE_FILTER_OVERHEAD_CYCLES;
+
+double		yb_inter_region_roundtrip_cost = YB_DEFAULT_INTER_REGION_ROUNDTRIP_COST;
+double		yb_inter_region_transfer_cost = YB_DEFAULT_INTER_REGION_TRANSFER_COST;
+double		yb_inter_zone_roundtrip_cost = YB_DEFAULT_INTER_ZONE_ROUNDTRIP_COST;
+double		yb_inter_zone_transfer_cost = YB_DEFAULT_INTER_ZONE_TRANSFER_COST;
+double		yb_local_roundtrip_cost = YB_DEFAULT_LOCAL_ROUNDTRIP_COST;
+double		yb_local_transfer_cost = YB_DEFAULT_LOCAL_TRANSFER_COST;
+
+
+double		recursive_worktable_factor = DEFAULT_RECURSIVE_WORKTABLE_FACTOR;
 
 int			effective_cache_size = DEFAULT_EFFECTIVE_CACHE_SIZE;
 
 Cost		disable_cost = 1.0e10;
+Cost		bitmap_exceeded_work_mem_disable_cost = 5.0e9;
 
 int			max_parallel_workers_per_gather = 2;
 
@@ -132,11 +191,14 @@ bool		enable_seqscan = true;
 bool		enable_indexscan = true;
 bool		enable_indexonlyscan = true;
 bool		enable_bitmapscan = true;
+bool		yb_enable_bitmapscan = false;
 bool		enable_tidscan = true;
 bool		enable_sort = true;
+bool		enable_incremental_sort = true;
 bool		enable_hashagg = true;
 bool		enable_nestloop = true;
 bool		enable_material = true;
+bool		enable_memoize = true;
 bool		enable_mergejoin = true;
 bool		enable_hashjoin = true;
 bool		enable_gathermerge = true;
@@ -145,9 +207,15 @@ bool		enable_partitionwise_aggregate = false;
 bool		enable_parallel_append = true;
 bool		enable_parallel_hash = true;
 bool		enable_partition_pruning = true;
+bool		enable_async_append = true;
 bool		yb_enable_geolocation_costing = true;
+bool		yb_enable_batchednl = false;
+YbCostModel yb_enable_cbo = YB_COST_MODEL_LEGACY;
+bool		yb_ignore_stats = false;
+bool		yb_legacy_bnl_cost = false;
+bool		yb_ignore_bool_cond_for_legacy_estimate = false;
 
-extern int yb_bnl_batch_size;
+extern int	yb_bnl_batch_size;
 
 typedef struct
 {
@@ -155,34 +223,44 @@ typedef struct
 	QualCost	total;
 } cost_qual_eval_context;
 
-static List *extract_nonindex_conditions(List *qual_clauses, List *indexquals);
+typedef enum YbIndexCondTypes
+{
+	NO_CONDITIONS = 1,
+	EQUALITY_EXPR = 2,
+	IN_EXPR = 4,
+	LOWER_BOUND_INEQUALITY_EXPR = 8,
+	UPPER_BOUND_INEQUALITY_EXPR = 16
+} YbIndexCondTypes;
+
+static List *extract_nonindex_conditions(List *qual_clauses, List *indexclauses);
 static MergeScanSelCache *cached_scansel(PlannerInfo *root,
-			   RestrictInfo *rinfo,
-			   PathKey *pathkey);
+										 RestrictInfo *rinfo,
+										 PathKey *pathkey);
 static void cost_rescan(PlannerInfo *root, Path *path,
-			Cost *rescan_startup_cost, Cost *rescan_total_cost);
+						Cost *rescan_startup_cost, Cost *rescan_total_cost);
 static bool cost_qual_eval_walker(Node *node, cost_qual_eval_context *context);
 static void get_restriction_qual_cost(PlannerInfo *root, RelOptInfo *baserel,
-						  ParamPathInfo *param_info,
-						  QualCost *qpqual_cost);
-static bool has_indexed_join_quals(NestPath *joinpath);
+									  ParamPathInfo *param_info,
+									  QualCost *qpqual_cost);
+static List *yb_get_bnl_extra_quals(JoinPath *joinpath);
+static bool has_indexed_join_quals(NestPath *path);
 static double approx_tuple_count(PlannerInfo *root, JoinPath *path,
-				   List *quals);
+								 List *quals);
 static double calc_joinrel_size_estimate(PlannerInfo *root,
-						   RelOptInfo *joinrel,
-						   RelOptInfo *outer_rel,
-						   RelOptInfo *inner_rel,
-						   double outer_rows,
-						   double inner_rows,
-						   SpecialJoinInfo *sjinfo,
-						   List *restrictlist);
+										 RelOptInfo *joinrel,
+										 RelOptInfo *outer_rel,
+										 RelOptInfo *inner_rel,
+										 double outer_rows,
+										 double inner_rows,
+										 SpecialJoinInfo *sjinfo,
+										 List *restrictlist);
 static Selectivity get_foreign_key_join_selectivity(PlannerInfo *root,
-								 Relids outer_relids,
-								 Relids inner_relids,
-								 SpecialJoinInfo *sjinfo,
-								 List **restrictlist);
+													Relids outer_relids,
+													Relids inner_relids,
+													SpecialJoinInfo *sjinfo,
+													List **restrictlist);
 static Cost append_nonpartial_cost(List *subpaths, int numpaths,
-					   int parallel_workers);
+								   int parallel_workers);
 static void set_rel_width(PlannerInfo *root, RelOptInfo *rel);
 static double relation_byte_size(double tuples, int width);
 static double page_size(double tuples, int width);
@@ -197,16 +275,45 @@ double
 clamp_row_est(double nrows)
 {
 	/*
-	 * Force estimate to be at least one row, to make explain output look
-	 * better and to avoid possible divide-by-zero when interpolating costs.
-	 * Make it an integer, too.
+	 * Avoid infinite and NaN row estimates.  Costs derived from such values
+	 * are going to be useless.  Also force the estimate to be at least one
+	 * row, to make explain output look better and to avoid possible
+	 * divide-by-zero when interpolating costs.  Make it an integer, too.
 	 */
-	if (nrows <= 1.0)
+	if (nrows > MAXIMUM_ROWCOUNT || isnan(nrows))
+		nrows = MAXIMUM_ROWCOUNT;
+	else if (nrows <= 1.0)
 		nrows = 1.0;
 	else
 		nrows = rint(nrows);
 
 	return nrows;
+}
+
+/*
+ * clamp_cardinality_to_long
+ *		Cast a Cardinality value to a sane long value.
+ */
+long
+clamp_cardinality_to_long(Cardinality x)
+{
+	/*
+	 * Just for paranoia's sake, ensure we do something sane with negative or
+	 * NaN values.
+	 */
+	if (isnan(x))
+		return LONG_MAX;
+	if (x <= 0)
+		return 0;
+
+	/*
+	 * If "long" is 64 bits, then LONG_MAX cannot be represented exactly as a
+	 * double.  Casting it to double and back may well result in overflow due
+	 * to rounding, so avoid doing that.  We trust that any double value that
+	 * compares strictly less than "(double) LONG_MAX" will cast to a
+	 * representable "long" value.
+	 */
+	return (x < (double) LONG_MAX) ? (long) x : LONG_MAX;
 }
 
 
@@ -497,8 +604,8 @@ cost_index(IndexPath *path, PlannerInfo *root, double loop_count,
 	Cost		indexStartupCost;
 	Cost		indexTotalCost;
 	Selectivity indexSelectivity;
-	double		indexCorrelation = 0;
-	double		csquared;
+	double		indexCorrelation,
+				csquared;
 	double		spc_seq_page_cost,
 				spc_random_page_cost;
 	Cost		min_IO_cost,
@@ -527,18 +634,17 @@ cost_index(IndexPath *path, PlannerInfo *root, double loop_count,
 	{
 		path->path.rows = path->path.param_info->ppi_rows;
 		/* qpquals come from the rel's restriction clauses and ppi_clauses */
-		qpquals = list_concat(
-							  extract_nonindex_conditions(path->indexinfo->indrestrictinfo,
-														  path->indexquals),
+		qpquals = list_concat(extract_nonindex_conditions(path->indexinfo->indrestrictinfo,
+														  path->indexclauses),
 							  extract_nonindex_conditions(path->path.param_info->ppi_clauses,
-														  path->indexquals));
+														  path->indexclauses));
 	}
 	else
 	{
 		path->path.rows = baserel->rows;
 		/* qpquals come from just the rel's restriction clauses */
 		qpquals = extract_nonindex_conditions(path->indexinfo->indrestrictinfo,
-											  path->indexquals);
+											  path->indexclauses);
 	}
 
 	if (!enable_indexscan)
@@ -550,7 +656,7 @@ cost_index(IndexPath *path, PlannerInfo *root, double loop_count,
 	 * for scanning the index, as well as the selectivity of the index (ie,
 	 * the fraction of main-table tuples we will have to retrieve) and its
 	 * correlation to the main-table tuple order.  We need a cast here because
-	 * relation.h uses a weak function type to avoid including amapi.h.
+	 * pathnodes.h uses a weak function type to avoid including amapi.h.
 	 */
 	amcostestimate = (amcostestimate_function) index->amcostestimate;
 	amcostestimate(root, path, loop_count,
@@ -575,8 +681,8 @@ cost_index(IndexPath *path, PlannerInfo *root, double loop_count,
 
 	/* fetch estimated page costs for tablespace containing table */
 	get_tablespace_page_costs(baserel->reltablespace,
-							&spc_random_page_cost,
-							&spc_seq_page_cost);
+							  &spc_random_page_cost,
+							  &spc_seq_page_cost);
 
 	/*----------
 	 * Estimate number of main-table pages fetched, and compute I/O cost.
@@ -763,20 +869,19 @@ cost_index(IndexPath *path, PlannerInfo *root, double loop_count,
  *
  * Given a list of quals to be enforced in an indexscan, extract the ones that
  * will have to be applied as qpquals (ie, the index machinery won't handle
- * them).  The actual rules for this appear in create_indexscan_plan() in
- * createplan.c, but the full rules are fairly expensive and we don't want to
- * go to that much effort for index paths that don't get selected for the
- * final plan.  So we approximate it as quals that don't appear directly in
- * indexquals and also are not redundant children of the same EquivalenceClass
- * as some indexqual.  This method neglects some infrequently-relevant
- * considerations, specifically clauses that needn't be checked because they
- * are implied by an indexqual.  It does not seem worth the cycles to try to
- * factor that in at this stage, even though createplan.c will take pains to
- * remove such unnecessary clauses from the qpquals list if this path is
- * selected for use.
+ * them).  Here we detect only whether a qual clause is directly redundant
+ * with some indexclause.  If the index path is chosen for use, createplan.c
+ * will try a bit harder to get rid of redundant qual conditions; specifically
+ * it will see if quals can be proven to be implied by the indexquals.  But
+ * it does not seem worth the cycles to try to factor that in at this stage,
+ * since we're only trying to estimate qual eval costs.  Otherwise this must
+ * match the logic in create_indexscan_plan().
+ *
+ * qual_clauses, and the result, are lists of RestrictInfos.
+ * indexclauses is a list of IndexClauses.
  */
 static List *
-extract_nonindex_conditions(List *qual_clauses, List *indexquals)
+extract_nonindex_conditions(List *qual_clauses, List *indexclauses)
 {
 	List	   *result = NIL;
 	ListCell   *lc;
@@ -787,16 +892,14 @@ extract_nonindex_conditions(List *qual_clauses, List *indexquals)
 
 		if (rinfo->pseudoconstant)
 			continue;			/* we may drop pseudoconstants here */
-		if (list_member_ptr(indexquals, rinfo))
-			continue;			/* simple duplicate */
-		if (is_redundant_derived_clause(rinfo, indexquals))
-			continue;			/* derived from same EquivalenceClass */
-		
+		if (is_redundant_with_indexclauses(rinfo, indexclauses))
+			continue;			/* dup or derived from same EquivalenceClass */
+
 		Assert(list_length(rinfo->yb_batched_rinfo) <= 2);
 		if (rinfo->yb_batched_rinfo &&
-			(list_member_ptr(indexquals, linitial(rinfo->yb_batched_rinfo)) ||
+			(list_member_ptr(indexclauses, linitial(rinfo->yb_batched_rinfo)) ||
 			 (list_length(rinfo->yb_batched_rinfo) >= 2 &&
-			   list_member_ptr(indexquals, lsecond(rinfo->yb_batched_rinfo)))))
+			  list_member_ptr(indexclauses, lsecond(rinfo->yb_batched_rinfo)))))
 			continue;
 		/* ... skip the predicate proof attempt createplan.c will try ... */
 		result = lappend(result, rinfo);
@@ -836,7 +939,7 @@ extract_nonindex_conditions(List *qual_clauses, List *indexquals)
  * product rather than calculating it here.  "pages" is the number of pages
  * in the object under consideration (either an index or a table).
  * "index_pages" is the amount to add to the total table space, which was
- * computed for us by query_planner.
+ * computed for us by make_one_rel.
  *
  * Caller is expected to have ensured that tuples_fetched is greater than zero
  * and rounded to integer (see clamp_row_est).  The result will likewise be
@@ -1186,6 +1289,242 @@ cost_bitmap_or_node(BitmapOrPath *path, PlannerInfo *root)
 }
 
 /*
+ * yb_cost_bitmap_tree_node
+ *		Extract cost and selectivity from a bitmap tree node (index/and/or)
+ */
+void
+yb_cost_bitmap_tree_node(Path *path, Cost *cost, Selectivity *selec, int *ybctid_width)
+{
+	Assert(yb_enable_base_scans_cost_model);
+
+	if (IsA(path, IndexPath))
+	{
+		IndexPath  *ipath = (IndexPath *) path;
+
+		*cost = ipath->indextotalcost;
+		*selec = ipath->indexselectivity;
+
+		/*
+		 * Do not select Bitmap Scan if we expect to exceed work_mem, because
+		 * we become extremely inefficient when we exceed work_mem.
+		 */
+		long		maxentries = yb_tbm_calculate_entries(work_mem * 1024L,
+														  ipath->ybctid_width);
+
+		Cardinality	bitmap_rows =
+				clamp_row_est(ipath->indexselectivity *
+							  ipath->path.parent->tuples);
+
+		if (bitmap_rows > maxentries && *cost < bitmap_exceeded_work_mem_disable_cost)
+			*cost += bitmap_exceeded_work_mem_disable_cost;
+
+		/* Update the node cost with new calculations */
+		ipath->indextotalcost = *cost;
+
+		if (ybctid_width)
+			*ybctid_width = ipath->ybctid_width;
+
+		/*
+		 * Charge a small amount per retrieved tuple to reflect the costs of
+		 * manipulating the bitmap.  This is mostly to make sure that a bitmap
+		 * scan doesn't look to be the same cost as an indexscan to retrieve a
+		 * single tuple.
+		 */
+		*cost += 0.1 * cpu_operator_cost * path->rows;
+	}
+	else if (IsA(path, BitmapAndPath))
+	{
+		*cost = path->total_cost;
+		*selec = ((BitmapAndPath *) path)->bitmapselectivity;
+		if (ybctid_width)
+			*ybctid_width = ((BitmapAndPath *) path)->ybctid_width;
+	}
+	else if (IsA(path, BitmapOrPath))
+	{
+		*cost = path->total_cost;
+		*selec = ((BitmapOrPath *) path)->bitmapselectivity;
+		if (ybctid_width)
+			*ybctid_width = ((BitmapOrPath *) path)->ybctid_width;
+	}
+	else
+	{
+		elog(ERROR, "unrecognized node type: %d", nodeTag(path));
+		*cost = *selec = 0;		/* keep compiler quiet */
+	}
+}
+
+/*
+ * yb_cost_bitmap_and_node
+ *		Estimate the cost of a BitmapAnd node
+ *
+ * Note that this considers only the costs of index scanning and bitmap
+ * creation, not the eventual table access.  In that sense the object isn't
+ * truly a Path, but it has enough path-like properties (costs in particular)
+ * to warrant treating it as one.
+ */
+void
+yb_cost_bitmap_and_node(BitmapAndPath *path, PlannerInfo *root)
+{
+	Cost		startup_cost;
+	Cost		run_cost;
+	Selectivity selec;
+	Cardinality	least_rows;
+	ListCell   *l;
+	int			ybctid_width_sum;
+	bool		exceeded_work_mem;
+
+	Assert(yb_enable_base_scans_cost_model);
+
+	/*
+	 * We estimate AND selectivity on the assumption that the inputs are
+	 * independent.  This is probably often wrong, but we don't have the info
+	 * to do better.
+	 *
+	 * The runtime cost of the BitmapAnd itself is estimated at
+	 *   cpu_operator_cost * [estimated number of rows from each subpath]
+	 *
+	 * We estimate the number of rows returned as
+	 *   [the smallest bitmap] * [the estimated selectivity of the AND node]
+	 *
+	 * We simply estimate the average ybctid width as
+	 *   avg(ybctid_width for subpath.ybctid_width in subpaths]
+	 * We make no effort to account for some subpaths contributing more rows,
+	 * because the difference is negligible.
+	 */
+	startup_cost = 0.0;
+	run_cost = 0.0;
+	selec = 1.0;
+	least_rows = path->path.parent->rows;
+	ybctid_width_sum = 0;
+	exceeded_work_mem = false;
+
+	foreach(l, path->bitmapquals)
+	{
+		Path	   *subpath = (Path *) lfirst(l);
+		Cost		subcost;
+		Selectivity subselec;
+		int			subybctidwidth;
+
+		yb_cost_bitmap_tree_node(subpath, &subcost, &subselec, &subybctidwidth);
+
+		selec *= subselec;
+
+		if (subcost < bitmap_exceeded_work_mem_disable_cost)
+			startup_cost += subcost;
+		else
+		{
+			startup_cost += subcost - bitmap_exceeded_work_mem_disable_cost;
+			exceeded_work_mem = true;
+		}
+
+		if (l != list_head(path->bitmapquals))
+			run_cost += subpath->rows * cpu_operator_cost;
+
+		least_rows = Min(least_rows, subpath->rows);
+
+		ybctid_width_sum += subybctidwidth;
+	}
+
+	if (exceeded_work_mem)
+		startup_cost += bitmap_exceeded_work_mem_disable_cost;
+
+	path->bitmapselectivity = selec;
+	path->path.rows = least_rows * selec;
+	path->ybctid_width = ybctid_width_sum / list_length(path->bitmapquals);
+	path->path.startup_cost = startup_cost;
+	path->path.total_cost = startup_cost + run_cost;
+}
+
+/*
+ * yb_cost_bitmap_or_node
+ *		Estimate the cost of a BitmapOr node
+ *
+ * See comments for yb_cost_bitmap_and_node.
+ */
+void
+yb_cost_bitmap_or_node(BitmapOrPath *path, PlannerInfo *root)
+{
+	Cost		startup_cost;
+	Cost		run_cost;
+	Selectivity selec;
+	double		total_rows;
+	ListCell   *l;
+	int			ybctid_width_sum;
+	bool		exceeded_work_mem;
+
+	Assert(yb_enable_base_scans_cost_model);
+
+	/*
+	 * We estimate OR selectivity on the assumption that the inputs are
+	 * non-overlapping, since that's often the case in "x IN (list)" type
+	 * situations.  Of course, we clamp to 1.0 at the end.
+	 *
+	 * We are aware that the unions are optimized out when the inputs are
+	 * BitmapIndexScans. The runtime cost of the BitmapOr itself is estimated at
+	 *   cpu_operator_cost * [estimated rows from each non-index subpath]
+	 *
+	 * We estimate the number of rows returned as
+	 *   Min([total unioned rows], [baserel rows]) * selectivity
+	 *
+	 * We simply estimate the average ybctid width as
+	 *   avg(ybctid_width for subpath.ybctid_width in subpaths]
+	 * We make no effort to account for some subpaths contributing more rows,
+	 * because the difference is negligible.
+	 */
+	startup_cost = 0.0;
+	run_cost = 0.0;
+	selec = 0.0;
+	total_rows = 0.0;
+	ybctid_width_sum = 0;
+	exceeded_work_mem = false;
+
+	foreach(l, path->bitmapquals)
+	{
+		Path	   *subpath = (Path *) lfirst(l);
+		Cost		subcost;
+		Selectivity subselec;
+		int			subybctidwidth;
+
+		yb_cost_bitmap_tree_node(subpath, &subcost, &subselec, &subybctidwidth);
+
+		selec += subselec;
+
+		if (subcost < bitmap_exceeded_work_mem_disable_cost)
+			startup_cost += subcost;
+		else
+		{
+			startup_cost += subcost - bitmap_exceeded_work_mem_disable_cost;
+			exceeded_work_mem = true;
+		}
+
+		if (l != list_head(path->bitmapquals) &&
+			!IsA(subpath, IndexPath))
+			startup_cost += subpath->rows * cpu_operator_cost;
+
+		total_rows += subpath->rows;
+
+		ybctid_width_sum += subybctidwidth;
+	}
+
+	/*
+	 * Bitmap Or can increase the bitmap size, resulting in exceeding work_mem.
+	 * If any of the subpaths or this node itself is estimated to exceed
+	 * work_mem, mark this as so.
+	 */
+	if (exceeded_work_mem ||
+		path->path.rows > yb_tbm_calculate_entries(work_mem * 1024L,
+												   path->ybctid_width))
+		startup_cost += bitmap_exceeded_work_mem_disable_cost;
+
+	path->bitmapselectivity = Min(selec, 1.0);
+	path->path.rows = (Min(path->path.parent->rows, total_rows) *
+					   path->bitmapselectivity);
+	path->ybctid_width = ybctid_width_sum / list_length(path->bitmapquals);
+	path->path.startup_cost = startup_cost;
+	path->path.total_cost = startup_cost + run_cost;
+}
+
+/*
  * cost_tidscan
  *	  Determines and returns the cost of scanning a relation using TIDs.
  *
@@ -1221,15 +1560,18 @@ cost_tidscan(Path *path, PlannerInfo *root,
 	ntuples = 0;
 	foreach(l, tidquals)
 	{
-		if (IsA(lfirst(l), ScalarArrayOpExpr))
+		RestrictInfo *rinfo = lfirst_node(RestrictInfo, l);
+		Expr	   *qual = rinfo->clause;
+
+		if (IsA(qual, ScalarArrayOpExpr))
 		{
 			/* Each element of the array yields 1 tuple */
-			ScalarArrayOpExpr *saop = (ScalarArrayOpExpr *) lfirst(l);
+			ScalarArrayOpExpr *saop = (ScalarArrayOpExpr *) qual;
 			Node	   *arraynode = (Node *) lsecond(saop->args);
 
 			ntuples += estimate_array_length(arraynode);
 		}
-		else if (IsA(lfirst(l), CurrentOfExpr))
+		else if (IsA(qual, CurrentOfExpr))
 		{
 			/* CURRENT OF yields 1 tuple */
 			isCurrentOf = true;
@@ -1290,6 +1632,101 @@ cost_tidscan(Path *path, PlannerInfo *root,
 }
 
 /*
+ * cost_tidrangescan
+ *	  Determines and sets the costs of scanning a relation using a range of
+ *	  TIDs for 'path'
+ *
+ * 'baserel' is the relation to be scanned
+ * 'tidrangequals' is the list of TID-checkable range quals
+ * 'param_info' is the ParamPathInfo if this is a parameterized path, else NULL
+ */
+void
+cost_tidrangescan(Path *path, PlannerInfo *root,
+				  RelOptInfo *baserel, List *tidrangequals,
+				  ParamPathInfo *param_info)
+{
+	Selectivity selectivity;
+	double		pages;
+	Cost		startup_cost = 0;
+	Cost		run_cost = 0;
+	QualCost	qpqual_cost;
+	Cost		cpu_per_tuple;
+	QualCost	tid_qual_cost;
+	double		ntuples;
+	double		nseqpages;
+	double		spc_random_page_cost;
+	double		spc_seq_page_cost;
+
+	/* Should only be applied to base relations */
+	Assert(baserel->relid > 0);
+	Assert(baserel->rtekind == RTE_RELATION);
+
+	/* Mark the path with the correct row estimate */
+	if (param_info)
+		path->rows = param_info->ppi_rows;
+	else
+		path->rows = baserel->rows;
+
+	/* Count how many tuples and pages we expect to scan */
+	selectivity = clauselist_selectivity(root, tidrangequals, baserel->relid,
+										 JOIN_INNER, NULL);
+	pages = ceil(selectivity * baserel->pages);
+
+	if (pages <= 0.0)
+		pages = 1.0;
+
+	/*
+	 * The first page in a range requires a random seek, but each subsequent
+	 * page is just a normal sequential page read. NOTE: it's desirable for
+	 * TID Range Scans to cost more than the equivalent Sequential Scans,
+	 * because Seq Scans have some performance advantages such as scan
+	 * synchronization and parallelizability, and we'd prefer one of them to
+	 * be picked unless a TID Range Scan really is better.
+	 */
+	ntuples = selectivity * baserel->tuples;
+	nseqpages = pages - 1.0;
+
+	if (!enable_tidscan)
+		startup_cost += disable_cost;
+
+	/*
+	 * The TID qual expressions will be computed once, any other baserestrict
+	 * quals once per retrieved tuple.
+	 */
+	cost_qual_eval(&tid_qual_cost, tidrangequals, root);
+
+	/* fetch estimated page cost for tablespace containing table */
+	get_tablespace_page_costs(baserel->reltablespace,
+							  &spc_random_page_cost,
+							  &spc_seq_page_cost);
+
+	/* disk costs; 1 random page and the remainder as seq pages */
+	run_cost += spc_random_page_cost + spc_seq_page_cost * nseqpages;
+
+	/* Add scanning CPU costs */
+	get_restriction_qual_cost(root, baserel, param_info, &qpqual_cost);
+
+	/*
+	 * XXX currently we assume TID quals are a subset of qpquals at this
+	 * point; they will be removed (if possible) when we create the plan, so
+	 * we subtract their cost from the total qpqual cost.  (If the TID quals
+	 * can't be removed, this is a mistake and we're going to underestimate
+	 * the CPU cost a bit.)
+	 */
+	startup_cost += qpqual_cost.startup + tid_qual_cost.per_tuple;
+	cpu_per_tuple = cpu_tuple_cost + qpqual_cost.per_tuple -
+		tid_qual_cost.per_tuple;
+	run_cost += cpu_per_tuple * ntuples;
+
+	/* tlist eval costs are paid per output row, not per tuple scanned */
+	startup_cost += path->pathtarget->cost.startup;
+	run_cost += path->pathtarget->cost.per_tuple * path->rows;
+
+	path->startup_cost = startup_cost;
+	path->total_cost = startup_cost + run_cost;
+}
+
+/*
  * cost_subqueryscan
  *	  Determines and returns the cost of scanning a subquery RTE.
  *
@@ -1302,6 +1739,7 @@ cost_subqueryscan(SubqueryScanPath *path, PlannerInfo *root,
 {
 	Cost		startup_cost;
 	Cost		run_cost;
+	List	   *qpquals;
 	QualCost	qpqual_cost;
 	Cost		cpu_per_tuple;
 
@@ -1309,11 +1747,24 @@ cost_subqueryscan(SubqueryScanPath *path, PlannerInfo *root,
 	Assert(baserel->relid > 0);
 	Assert(baserel->rtekind == RTE_SUBQUERY);
 
-	/* Mark the path with the correct row estimate */
+	/*
+	 * We compute the rowcount estimate as the subplan's estimate times the
+	 * selectivity of relevant restriction clauses.  In simple cases this will
+	 * come out the same as baserel->rows; but when dealing with parallelized
+	 * paths we must do it like this to get the right answer.
+	 */
 	if (param_info)
-		path->path.rows = param_info->ppi_rows;
+		qpquals = list_concat_copy(param_info->ppi_clauses,
+								   baserel->baserestrictinfo);
 	else
-		path->path.rows = baserel->rows;
+		qpquals = baserel->baserestrictinfo;
+
+	path->path.rows = clamp_row_est(path->subpath->rows *
+									clauselist_selectivity(root,
+														   qpquals,
+														   0,
+														   JOIN_INNER,
+														   NULL));
 
 	/*
 	 * Cost of path is cost of evaluating the subplan, plus cost of evaluating
@@ -1328,7 +1779,7 @@ cost_subqueryscan(SubqueryScanPath *path, PlannerInfo *root,
 
 	startup_cost = qpqual_cost.startup;
 	cpu_per_tuple = cpu_tuple_cost + qpqual_cost.per_tuple;
-	run_cost = cpu_per_tuple * baserel->tuples;
+	run_cost = cpu_per_tuple * path->subpath->rows;
 
 	/* tlist eval costs are paid per output row, not per tuple scanned */
 	startup_cost += path->path.pathtarget->cost.startup;
@@ -1587,6 +2038,40 @@ cost_namedtuplestorescan(Path *path, PlannerInfo *root,
 }
 
 /*
+ * cost_resultscan
+ *	  Determines and returns the cost of scanning an RTE_RESULT relation.
+ */
+void
+cost_resultscan(Path *path, PlannerInfo *root,
+				RelOptInfo *baserel, ParamPathInfo *param_info)
+{
+	Cost		startup_cost = 0;
+	Cost		run_cost = 0;
+	QualCost	qpqual_cost;
+	Cost		cpu_per_tuple;
+
+	/* Should only be applied to RTE_RESULT base relations */
+	Assert(baserel->relid > 0);
+	Assert(baserel->rtekind == RTE_RESULT);
+
+	/* Mark the path with the correct row estimate */
+	if (param_info)
+		path->rows = param_info->ppi_rows;
+	else
+		path->rows = baserel->rows;
+
+	/* We charge qual cost plus cpu_tuple_cost */
+	get_restriction_qual_cost(root, baserel, param_info, &qpqual_cost);
+
+	startup_cost += qpqual_cost.startup;
+	cpu_per_tuple = cpu_tuple_cost + qpqual_cost.per_tuple;
+	run_cost += cpu_per_tuple * baserel->tuples;
+
+	path->startup_cost = startup_cost;
+	path->total_cost = startup_cost + run_cost;
+}
+
+/*
  * cost_recursive_union
  *	  Determines and returns the cost of performing a recursive union,
  *	  and also the estimated output size.
@@ -1629,9 +2114,9 @@ cost_recursive_union(Path *runion, Path *nrterm, Path *rterm)
 }
 
 /*
- * cost_sort
- *	  Determines and returns the cost of sorting a relation, including
- *	  the cost of reading the input data.
+ * cost_tuplesort
+ *	  Determines and returns the cost of sorting a relation using tuplesort,
+ *    not including the cost of reading the input data.
  *
  * If the total volume of data to sort is less than sort_mem, we will do
  * an in-memory sort, which requires no I/O and about t*log2(t) tuple
@@ -1658,38 +2143,22 @@ cost_recursive_union(Path *runion, Path *nrterm, Path *rterm)
  * specifying nonzero comparison_cost; typically that's used for any extra
  * work that has to be done to prepare the inputs to the comparison operators.
  *
- * 'pathkeys' is a list of sort keys
- * 'input_cost' is the total cost for reading the input data
  * 'tuples' is the number of tuples in the relation
  * 'width' is the average tuple width in bytes
  * 'comparison_cost' is the extra cost per comparison, if any
  * 'sort_mem' is the number of kilobytes of work memory allowed for the sort
  * 'limit_tuples' is the bound on the number of output tuples; -1 if no bound
- *
- * NOTE: some callers currently pass NIL for pathkeys because they
- * can't conveniently supply the sort keys.  Since this routine doesn't
- * currently do anything with pathkeys anyway, that doesn't matter...
- * but if it ever does, it should react gracefully to lack of key data.
- * (Actually, the thing we'd most likely be interested in is just the number
- * of sort keys, which all callers *could* supply.)
  */
-void
-cost_sort(Path *path, PlannerInfo *root,
-		  List *pathkeys, Cost input_cost, double tuples, int width,
-		  Cost comparison_cost, int sort_mem,
-		  double limit_tuples)
+static void
+cost_tuplesort(Cost *startup_cost, Cost *run_cost,
+			   double tuples, int width,
+			   Cost comparison_cost, int sort_mem,
+			   double limit_tuples)
 {
-	Cost		startup_cost = input_cost;
-	Cost		run_cost = 0;
 	double		input_bytes = relation_byte_size(tuples, width);
 	double		output_bytes;
 	double		output_tuples;
 	long		sort_mem_bytes = sort_mem * 1024L;
-
-	if (!enable_sort)
-		startup_cost += disable_cost;
-
-	path->rows = tuples;
 
 	/*
 	 * We want to be sure the cost of a sort is never estimated as zero, even
@@ -1729,7 +2198,7 @@ cost_sort(Path *path, PlannerInfo *root,
 		 *
 		 * Assume about N log2 N comparisons
 		 */
-		startup_cost += comparison_cost * tuples * LOG2(tuples);
+		*startup_cost = comparison_cost * tuples * LOG2(tuples);
 
 		/* Disk costs */
 
@@ -1740,7 +2209,7 @@ cost_sort(Path *path, PlannerInfo *root,
 			log_runs = 1.0;
 		npageaccesses = 2.0 * npages * log_runs;
 		/* Assume 3/4ths of accesses are sequential, 1/4th are not */
-		startup_cost += npageaccesses *
+		*startup_cost += npageaccesses *
 			(seq_page_cost * 0.75 + random_page_cost * 0.25);
 	}
 	else if (tuples > 2 * output_tuples || input_bytes > sort_mem_bytes)
@@ -1751,12 +2220,12 @@ cost_sort(Path *path, PlannerInfo *root,
 		 * factor is a bit higher than for quicksort.  Tweak it so that the
 		 * cost curve is continuous at the crossover point.
 		 */
-		startup_cost += comparison_cost * tuples * LOG2(2.0 * output_tuples);
+		*startup_cost = comparison_cost * tuples * LOG2(2.0 * output_tuples);
 	}
 	else
 	{
 		/* We'll use plain quicksort on all the input tuples */
-		startup_cost += comparison_cost * tuples * LOG2(tuples);
+		*startup_cost = comparison_cost * tuples * LOG2(tuples);
 	}
 
 	/*
@@ -1767,8 +2236,182 @@ cost_sort(Path *path, PlannerInfo *root,
 	 * here --- the upper LIMIT will pro-rate the run cost so we'd be double
 	 * counting the LIMIT otherwise.
 	 */
-	run_cost += cpu_operator_cost * tuples;
+	*run_cost = cpu_operator_cost * tuples;
+}
 
+/*
+ * cost_incremental_sort
+ * 	Determines and returns the cost of sorting a relation incrementally, when
+ *  the input path is presorted by a prefix of the pathkeys.
+ *
+ * 'presorted_keys' is the number of leading pathkeys by which the input path
+ * is sorted.
+ *
+ * We estimate the number of groups into which the relation is divided by the
+ * leading pathkeys, and then calculate the cost of sorting a single group
+ * with tuplesort using cost_tuplesort().
+ */
+void
+cost_incremental_sort(Path *path,
+					  PlannerInfo *root, List *pathkeys, int presorted_keys,
+					  Cost input_startup_cost, Cost input_total_cost,
+					  double input_tuples, int width, Cost comparison_cost, int sort_mem,
+					  double limit_tuples)
+{
+	Cost		startup_cost = 0,
+				run_cost = 0,
+				input_run_cost = input_total_cost - input_startup_cost;
+	double		group_tuples,
+				input_groups;
+	Cost		group_startup_cost,
+				group_run_cost,
+				group_input_run_cost;
+	List	   *presortedExprs = NIL;
+	ListCell   *l;
+	int			i = 0;
+	bool		unknown_varno = false;
+
+	Assert(presorted_keys != 0);
+
+	/*
+	 * We want to be sure the cost of a sort is never estimated as zero, even
+	 * if passed-in tuple count is zero.  Besides, mustn't do log(0)...
+	 */
+	if (input_tuples < 2.0)
+		input_tuples = 2.0;
+
+	/* Default estimate of number of groups, capped to one group per row. */
+	input_groups = Min(input_tuples, DEFAULT_NUM_DISTINCT);
+
+	/*
+	 * Extract presorted keys as list of expressions.
+	 *
+	 * We need to be careful about Vars containing "varno 0" which might have
+	 * been introduced by generate_append_tlist, which would confuse
+	 * estimate_num_groups (in fact it'd fail for such expressions). See
+	 * recurse_set_operations which has to deal with the same issue.
+	 *
+	 * Unlike recurse_set_operations we can't access the original target list
+	 * here, and even if we could it's not very clear how useful would that be
+	 * for a set operation combining multiple tables. So we simply detect if
+	 * there are any expressions with "varno 0" and use the default
+	 * DEFAULT_NUM_DISTINCT in that case.
+	 *
+	 * We might also use either 1.0 (a single group) or input_tuples (each row
+	 * being a separate group), pretty much the worst and best case for
+	 * incremental sort. But those are extreme cases and using something in
+	 * between seems reasonable. Furthermore, generate_append_tlist is used
+	 * for set operations, which are likely to produce mostly unique output
+	 * anyway - from that standpoint the DEFAULT_NUM_DISTINCT is defensive
+	 * while maintaining lower startup cost.
+	 */
+	foreach(l, pathkeys)
+	{
+		PathKey    *key = (PathKey *) lfirst(l);
+		EquivalenceMember *member = (EquivalenceMember *)
+			linitial(key->pk_eclass->ec_members);
+
+		/*
+		 * Check if the expression contains Var with "varno 0" so that we
+		 * don't call estimate_num_groups in that case.
+		 */
+		if (bms_is_member(0, pull_varnos(root, (Node *) member->em_expr)))
+		{
+			unknown_varno = true;
+			break;
+		}
+
+		/* expression not containing any Vars with "varno 0" */
+		presortedExprs = lappend(presortedExprs, member->em_expr);
+
+		i++;
+		if (i >= presorted_keys)
+			break;
+	}
+
+	/* Estimate number of groups with equal presorted keys. */
+	if (!unknown_varno)
+		input_groups = estimate_num_groups(root, presortedExprs, input_tuples,
+										   NULL, NULL);
+
+	group_tuples = input_tuples / input_groups;
+	group_input_run_cost = input_run_cost / input_groups;
+
+	/*
+	 * Estimate average cost of sorting of one group where presorted keys are
+	 * equal.  Incremental sort is sensitive to distribution of tuples to the
+	 * groups, where we're relying on quite rough assumptions.  Thus, we're
+	 * pessimistic about incremental sort performance and increase its average
+	 * group size by half.
+	 */
+	cost_tuplesort(&group_startup_cost, &group_run_cost,
+				   1.5 * group_tuples, width, comparison_cost, sort_mem,
+				   limit_tuples);
+
+	/*
+	 * Startup cost of incremental sort is the startup cost of its first group
+	 * plus the cost of its input.
+	 */
+	startup_cost += group_startup_cost
+		+ input_startup_cost + group_input_run_cost;
+
+	/*
+	 * After we started producing tuples from the first group, the cost of
+	 * producing all the tuples is given by the cost to finish processing this
+	 * group, plus the total cost to process the remaining groups, plus the
+	 * remaining cost of input.
+	 */
+	run_cost += group_run_cost
+		+ (group_run_cost + group_startup_cost) * (input_groups - 1)
+		+ group_input_run_cost * (input_groups - 1);
+
+	/*
+	 * Incremental sort adds some overhead by itself. Firstly, it has to
+	 * detect the sort groups. This is roughly equal to one extra copy and
+	 * comparison per tuple. Secondly, it has to reset the tuplesort context
+	 * for every group.
+	 */
+	run_cost += (cpu_tuple_cost + comparison_cost) * input_tuples;
+	run_cost += 2.0 * cpu_tuple_cost * input_groups;
+
+	path->rows = input_tuples;
+	path->startup_cost = startup_cost;
+	path->total_cost = startup_cost + run_cost;
+}
+
+/*
+ * cost_sort
+ *	  Determines and returns the cost of sorting a relation, including
+ *	  the cost of reading the input data.
+ *
+ * NOTE: some callers currently pass NIL for pathkeys because they
+ * can't conveniently supply the sort keys.  Since this routine doesn't
+ * currently do anything with pathkeys anyway, that doesn't matter...
+ * but if it ever does, it should react gracefully to lack of key data.
+ * (Actually, the thing we'd most likely be interested in is just the number
+ * of sort keys, which all callers *could* supply.)
+ */
+void
+cost_sort(Path *path, PlannerInfo *root,
+		  List *pathkeys, Cost input_cost, double tuples, int width,
+		  Cost comparison_cost, int sort_mem,
+		  double limit_tuples)
+
+{
+	Cost		startup_cost;
+	Cost		run_cost;
+
+	cost_tuplesort(&startup_cost, &run_cost,
+				   tuples, width,
+				   comparison_cost, sort_mem,
+				   limit_tuples);
+
+	if (!enable_sort)
+		startup_cost += disable_cost;
+
+	startup_cost += input_cost;
+
+	path->rows = tuples;
 	path->startup_cost = startup_cost;
 	path->total_cost = startup_cost + run_cost;
 }
@@ -1795,7 +2438,7 @@ append_nonpartial_cost(List *subpaths, int numpaths, int parallel_workers)
 		return 0;
 
 	/*
-	 * Array length is number of workers or number of relevants paths,
+	 * Array length is number of workers or number of relevant paths,
 	 * whichever is less.
 	 */
 	arrlen = Min(parallel_workers, numpaths);
@@ -1822,7 +2465,7 @@ append_nonpartial_cost(List *subpaths, int numpaths, int parallel_workers)
 	 * For each of the remaining subpaths, add its cost to the array element
 	 * with minimum cost.
 	 */
-	for_each_cell(l, cell)
+	for_each_cell(l, subpaths, cell)
 	{
 		Path	   *subpath = (Path *) lfirst(l);
 		int			i;
@@ -1862,33 +2505,92 @@ cost_append(AppendPath *apath)
 
 	apath->path.startup_cost = 0;
 	apath->path.total_cost = 0;
+	apath->path.rows = 0;
 
 	if (apath->subpaths == NIL)
 		return;
 
 	if (!apath->path.parallel_aware)
 	{
-		Path	   *subpath = (Path *) linitial(apath->subpaths);
+		List	   *pathkeys = apath->path.pathkeys;
 
-		/*
-		 * Startup cost of non-parallel-aware Append is the startup cost of
-		 * first subpath.
-		 */
-		apath->path.startup_cost = subpath->startup_cost;
-
-		/* Compute rows and costs as sums of subplan rows and costs. */
-		foreach(l, apath->subpaths)
+		if (pathkeys == NIL)
 		{
-			Path	   *subpath = (Path *) lfirst(l);
+			Path	   *subpath = (Path *) linitial(apath->subpaths);
 
-			apath->path.rows += subpath->rows;
-			apath->path.total_cost += subpath->total_cost;
+			/*
+			 * For an unordered, non-parallel-aware Append we take the startup
+			 * cost as the startup cost of the first subpath.
+			 */
+			apath->path.startup_cost = subpath->startup_cost;
+
+			/* Compute rows and costs as sums of subplan rows and costs. */
+			foreach(l, apath->subpaths)
+			{
+				Path	   *subpath = (Path *) lfirst(l);
+
+				apath->path.rows += subpath->rows;
+				apath->path.total_cost += subpath->total_cost;
+			}
+		}
+		else
+		{
+			/*
+			 * For an ordered, non-parallel-aware Append we take the startup
+			 * cost as the sum of the subpath startup costs.  This ensures
+			 * that we don't underestimate the startup cost when a query's
+			 * LIMIT is such that several of the children have to be run to
+			 * satisfy it.  This might be overkill --- another plausible hack
+			 * would be to take the Append's startup cost as the maximum of
+			 * the child startup costs.  But we don't want to risk believing
+			 * that an ORDER BY LIMIT query can be satisfied at small cost
+			 * when the first child has small startup cost but later ones
+			 * don't.  (If we had the ability to deal with nonlinear cost
+			 * interpolation for partial retrievals, we would not need to be
+			 * so conservative about this.)
+			 *
+			 * This case is also different from the above in that we have to
+			 * account for possibly injecting sorts into subpaths that aren't
+			 * natively ordered.
+			 */
+			foreach(l, apath->subpaths)
+			{
+				Path	   *subpath = (Path *) lfirst(l);
+				Path		sort_path;	/* dummy for result of cost_sort */
+
+				if (!pathkeys_contained_in(pathkeys, subpath->pathkeys))
+				{
+					/*
+					 * We'll need to insert a Sort node, so include costs for
+					 * that.  We can use the parent's LIMIT if any, since we
+					 * certainly won't pull more than that many tuples from
+					 * any child.
+					 */
+					cost_sort(&sort_path,
+							  NULL, /* doesn't currently need root */
+							  pathkeys,
+							  subpath->total_cost,
+							  subpath->rows,
+							  subpath->pathtarget->width,
+							  0.0,
+							  work_mem,
+							  apath->limit_tuples);
+					subpath = &sort_path;
+				}
+
+				apath->path.rows += subpath->rows;
+				apath->path.startup_cost += subpath->startup_cost;
+				apath->path.total_cost += subpath->total_cost;
+			}
 		}
 	}
 	else						/* parallel-aware */
 	{
 		int			i = 0;
 		double		parallel_divisor = get_parallel_divisor(&apath->path);
+
+		/* Parallel-aware Append never produces ordered output. */
+		Assert(apath->path.pathkeys == NIL);
 
 		/* Calculate startup cost. */
 		foreach(l, apath->subpaths)
@@ -2062,6 +2764,147 @@ cost_material(Path *path,
 }
 
 /*
+ * cost_memoize_rescan
+ *	  Determines the estimated cost of rescanning a Memoize node.
+ *
+ * In order to estimate this, we must gain knowledge of how often we expect to
+ * be called and how many distinct sets of parameters we are likely to be
+ * called with. If we expect a good cache hit ratio, then we can set our
+ * costs to account for that hit ratio, plus a little bit of cost for the
+ * caching itself.  Caching will not work out well if we expect to be called
+ * with too many distinct parameter values.  The worst-case here is that we
+ * never see any parameter value twice, in which case we'd never get a cache
+ * hit and caching would be a complete waste of effort.
+ */
+static void
+cost_memoize_rescan(PlannerInfo *root, MemoizePath *mpath,
+					Cost *rescan_startup_cost, Cost *rescan_total_cost)
+{
+	EstimationInfo estinfo;
+	Cost		input_startup_cost = mpath->subpath->startup_cost;
+	Cost		input_total_cost = mpath->subpath->total_cost;
+	double		tuples = mpath->subpath->rows;
+	double		calls = mpath->calls;
+	int			width = mpath->subpath->pathtarget->width;
+
+	double		hash_mem_bytes;
+	double		est_entry_bytes;
+	double		est_cache_entries;
+	double		ndistinct;
+	double		evict_ratio;
+	double		hit_ratio;
+	Cost		startup_cost;
+	Cost		total_cost;
+
+	/* available cache space */
+	hash_mem_bytes = get_hash_memory_limit();
+
+	/*
+	 * Set the number of bytes each cache entry should consume in the cache.
+	 * To provide us with better estimations on how many cache entries we can
+	 * store at once, we make a call to the executor here to ask it what
+	 * memory overheads there are for a single cache entry.
+	 *
+	 * XXX we also store the cache key, but that's not accounted for here.
+	 */
+	est_entry_bytes = relation_byte_size(tuples, width) +
+		ExecEstimateCacheEntryOverheadBytes(tuples);
+
+	/* estimate on the upper limit of cache entries we can hold at once */
+	est_cache_entries = floor(hash_mem_bytes / est_entry_bytes);
+
+	/* estimate on the distinct number of parameter values */
+	ndistinct = estimate_num_groups(root, mpath->param_exprs, calls, NULL,
+									&estinfo);
+
+	/*
+	 * When the estimation fell back on using a default value, it's a bit too
+	 * risky to assume that it's ok to use a Memoize node.  The use of a
+	 * default could cause us to use a Memoize node when it's really
+	 * inappropriate to do so.  If we see that this has been done, then we'll
+	 * assume that every call will have unique parameters, which will almost
+	 * certainly mean a MemoizePath will never survive add_path().
+	 */
+	if ((estinfo.flags & SELFLAG_USED_DEFAULT) != 0)
+		ndistinct = calls;
+
+	/*
+	 * Since we've already estimated the maximum number of entries we can
+	 * store at once and know the estimated number of distinct values we'll be
+	 * called with, we'll take this opportunity to set the path's est_entries.
+	 * This will ultimately determine the hash table size that the executor
+	 * will use.  If we leave this at zero, the executor will just choose the
+	 * size itself.  Really this is not the right place to do this, but it's
+	 * convenient since everything is already calculated.
+	 */
+	mpath->est_entries = Min(Min(ndistinct, est_cache_entries),
+							 PG_UINT32_MAX);
+
+	/*
+	 * When the number of distinct parameter values is above the amount we can
+	 * store in the cache, then we'll have to evict some entries from the
+	 * cache.  This is not free. Here we estimate how often we'll incur the
+	 * cost of that eviction.
+	 */
+	evict_ratio = 1.0 - Min(est_cache_entries, ndistinct) / ndistinct;
+
+	/*
+	 * In order to estimate how costly a single scan will be, we need to
+	 * attempt to estimate what the cache hit ratio will be.  To do that we
+	 * must look at how many scans are estimated in total for this node and
+	 * how many of those scans we expect to get a cache hit.
+	 */
+	hit_ratio = 1.0 / ndistinct * Min(est_cache_entries, ndistinct) -
+		(ndistinct / calls);
+
+	/* Ensure we don't go negative */
+	hit_ratio = Max(hit_ratio, 0.0);
+
+	/*
+	 * Set the total_cost accounting for the expected cache hit ratio.  We
+	 * also add on a cpu_operator_cost to account for a cache lookup. This
+	 * will happen regardless of whether it's a cache hit or not.
+	 */
+	total_cost = input_total_cost * (1.0 - hit_ratio) + cpu_operator_cost;
+
+	/* Now adjust the total cost to account for cache evictions */
+
+	/* Charge a cpu_tuple_cost for evicting the actual cache entry */
+	total_cost += cpu_tuple_cost * evict_ratio;
+
+	/*
+	 * Charge a 10th of cpu_operator_cost to evict every tuple in that entry.
+	 * The per-tuple eviction is really just a pfree, so charging a whole
+	 * cpu_operator_cost seems a little excessive.
+	 */
+	total_cost += cpu_operator_cost / 10.0 * evict_ratio * tuples;
+
+	/*
+	 * Now adjust for storing things in the cache, since that's not free
+	 * either.  Everything must go in the cache.  We don't proportion this
+	 * over any ratio, just apply it once for the scan.  We charge a
+	 * cpu_tuple_cost for the creation of the cache entry and also a
+	 * cpu_operator_cost for each tuple we expect to cache.
+	 */
+	total_cost += cpu_tuple_cost + cpu_operator_cost * tuples;
+
+	/*
+	 * Getting the first row must be also be proportioned according to the
+	 * expected cache hit ratio.
+	 */
+	startup_cost = input_startup_cost * (1.0 - hit_ratio);
+
+	/*
+	 * Additionally we charge a cpu_tuple_cost to account for cache lookups,
+	 * which we'll do regardless of whether it was a cache hit or not.
+	 */
+	startup_cost += cpu_tuple_cost;
+
+	*rescan_startup_cost = startup_cost;
+	*rescan_total_cost = total_cost;
+}
+
+/*
  * cost_agg
  *		Determines and returns the cost of performing an Agg plan node,
  *		including the cost of its input.
@@ -2078,7 +2921,7 @@ cost_agg(Path *path, PlannerInfo *root,
 		 int numGroupCols, double numGroups,
 		 List *quals,
 		 Cost input_startup_cost, Cost input_total_cost,
-		 double input_tuples)
+		 double input_tuples, double input_width)
 {
 	double		output_tuples;
 	Cost		startup_cost;
@@ -2096,9 +2939,9 @@ cost_agg(Path *path, PlannerInfo *root,
 	/*
 	 * The transCost.per_tuple component of aggcosts should be charged once
 	 * per input tuple, corresponding to the costs of evaluating the aggregate
-	 * transfns and their input expressions (with any startup cost of course
-	 * charged but once).  The finalCost component is charged once per output
-	 * tuple, corresponding to the costs of evaluating the finalfns.
+	 * transfns and their input expressions. The finalCost.per_tuple component
+	 * is charged once per output tuple, corresponding to the costs of
+	 * evaluating the finalfns.  Startup costs are of course charged but once.
 	 *
 	 * If we are grouping, we charge an additional cpu_operator_cost per
 	 * grouping column per input tuple for grouping comparisons.
@@ -2120,7 +2963,8 @@ cost_agg(Path *path, PlannerInfo *root,
 		startup_cost = input_total_cost;
 		startup_cost += aggcosts->transCost.startup;
 		startup_cost += aggcosts->transCost.per_tuple * input_tuples;
-		startup_cost += aggcosts->finalCost;
+		startup_cost += aggcosts->finalCost.startup;
+		startup_cost += aggcosts->finalCost.per_tuple;
 		/* we aren't grouping */
 		total_cost = startup_cost + cpu_tuple_cost;
 		output_tuples = 1;
@@ -2139,7 +2983,8 @@ cost_agg(Path *path, PlannerInfo *root,
 		total_cost += aggcosts->transCost.startup;
 		total_cost += aggcosts->transCost.per_tuple * input_tuples;
 		total_cost += (cpu_operator_cost * numGroupCols) * input_tuples;
-		total_cost += aggcosts->finalCost * numGroups;
+		total_cost += aggcosts->finalCost.startup;
+		total_cost += aggcosts->finalCost.per_tuple * numGroups;
 		total_cost += cpu_tuple_cost * numGroups;
 		output_tuples = numGroups;
 	}
@@ -2151,11 +2996,89 @@ cost_agg(Path *path, PlannerInfo *root,
 			startup_cost += disable_cost;
 		startup_cost += aggcosts->transCost.startup;
 		startup_cost += aggcosts->transCost.per_tuple * input_tuples;
+		/* cost of computing hash value */
 		startup_cost += (cpu_operator_cost * numGroupCols) * input_tuples;
+		startup_cost += aggcosts->finalCost.startup;
+
 		total_cost = startup_cost;
-		total_cost += aggcosts->finalCost * numGroups;
+		total_cost += aggcosts->finalCost.per_tuple * numGroups;
+		/* cost of retrieving from hash table */
 		total_cost += cpu_tuple_cost * numGroups;
 		output_tuples = numGroups;
+	}
+
+	/*
+	 * Add the disk costs of hash aggregation that spills to disk.
+	 *
+	 * Groups that go into the hash table stay in memory until finalized, so
+	 * spilling and reprocessing tuples doesn't incur additional invocations
+	 * of transCost or finalCost. Furthermore, the computed hash value is
+	 * stored with the spilled tuples, so we don't incur extra invocations of
+	 * the hash function.
+	 *
+	 * Hash Agg begins returning tuples after the first batch is complete.
+	 * Accrue writes (spilled tuples) to startup_cost and to total_cost;
+	 * accrue reads only to total_cost.
+	 */
+	if (aggstrategy == AGG_HASHED || aggstrategy == AGG_MIXED)
+	{
+		double		pages;
+		double		pages_written = 0.0;
+		double		pages_read = 0.0;
+		double		spill_cost;
+		double		hashentrysize;
+		double		nbatches;
+		Size		mem_limit;
+		uint64		ngroups_limit;
+		int			num_partitions;
+		int			depth;
+
+		/*
+		 * Estimate number of batches based on the computed limits. If less
+		 * than or equal to one, all groups are expected to fit in memory;
+		 * otherwise we expect to spill.
+		 */
+		hashentrysize = hash_agg_entry_size(list_length(root->aggtransinfos),
+											input_width,
+											aggcosts->transitionSpace);
+		hash_agg_set_limits(hashentrysize, numGroups, 0, &mem_limit,
+							&ngroups_limit, &num_partitions);
+
+		nbatches = Max((numGroups * hashentrysize) / mem_limit,
+					   numGroups / ngroups_limit);
+
+		nbatches = Max(ceil(nbatches), 1.0);
+		num_partitions = Max(num_partitions, 2);
+
+		/*
+		 * The number of partitions can change at different levels of
+		 * recursion; but for the purposes of this calculation assume it stays
+		 * constant.
+		 */
+		depth = ceil(log(nbatches) / log(num_partitions));
+
+		/*
+		 * Estimate number of pages read and written. For each level of
+		 * recursion, a tuple must be written and then later read.
+		 */
+		pages = relation_byte_size(input_tuples, input_width) / BLCKSZ;
+		pages_written = pages_read = pages * depth;
+
+		/*
+		 * HashAgg has somewhat worse IO behavior than Sort on typical
+		 * hardware/OS combinations. Account for this with a generic penalty.
+		 */
+		pages_read *= 2.0;
+		pages_written *= 2.0;
+
+		startup_cost += pages_written * random_page_cost;
+		total_cost += pages_written * random_page_cost;
+		total_cost += pages_read * seq_page_cost;
+
+		/* account for CPU cost of spilling a tuple and reading it back */
+		spill_cost = depth * input_tuples * 2.0 * cpu_tuple_cost;
+		startup_cost += spill_cost;
+		total_cost += spill_cost;
 	}
 
 	/*
@@ -2218,7 +3141,11 @@ cost_windowagg(Path *path, PlannerInfo *root,
 		Cost		wfunccost;
 		QualCost	argcosts;
 
-		wfunccost = get_func_cost(wfunc->winfnoid) * cpu_operator_cost;
+		argcosts.startup = argcosts.per_tuple = 0;
+		add_function_cost(root, wfunc->winfnoid, (Node *) wfunc,
+						  &argcosts);
+		startup_cost += argcosts.startup;
+		wfunccost = argcosts.per_tuple;
 
 		/* also add the input expressions' cost to per-input-row costs */
 		cost_qual_eval_node(&argcosts, (Node *) wfunc->args, root);
@@ -2350,15 +3277,18 @@ initial_cost_nestloop(PlannerInfo *root, JoinCostWorkspace *workspace,
 				&inner_rescan_total_cost);
 
 	/* cost of source data */
-	int yb_batch_size = 1;
-	if (IsYugaByteEnabled())
+	int			yb_batch_size = 1;
+	bool		yb_is_batched = false;
+
+	if (IsYugaByteEnabled() &&
+		(yb_enable_base_scans_cost_model || yb_legacy_bnl_cost))
 	{
-		bool is_batched = yb_is_outer_inner_batched(outer_path, inner_path);
-		if (is_batched)
-			yb_batch_size =
-				yb_bnl_batch_size > outer_path_rows ?
-					outer_path_rows : yb_bnl_batch_size;
+		yb_is_batched = yb_is_outer_inner_batched(outer_path, inner_path);
+		if (yb_is_batched)
+			yb_batch_size = yb_bnl_batch_size;
 	}
+
+	bool		yb_costing_bnl = yb_batch_size > 1 && !yb_legacy_bnl_cost;
 
 	/*
 	 * NOTE: clearly, we must pay both outer and inner paths' startup_cost
@@ -2368,15 +3298,15 @@ initial_cost_nestloop(PlannerInfo *root, JoinCostWorkspace *workspace,
 	 */
 	startup_cost += outer_path->startup_cost + inner_path->startup_cost;
 	run_cost += outer_path->total_cost - outer_path->startup_cost;
-	if (outer_path_rows > 1)
-		run_cost += (outer_path_rows - 1) * inner_rescan_start_cost
+	if (outer_path_rows > yb_batch_size)
+		run_cost += (outer_path_rows - yb_batch_size) * inner_rescan_start_cost
 			/ yb_batch_size;
 
 	inner_run_cost = inner_path->total_cost - inner_path->startup_cost;
-	inner_rescan_run_cost = (inner_rescan_total_cost - inner_rescan_start_cost) / yb_batch_size;
+	inner_rescan_run_cost = (inner_rescan_total_cost - inner_rescan_start_cost);
 
-	if (jointype == JOIN_SEMI || jointype == JOIN_ANTI ||
-		extra->inner_unique)
+	if ((jointype == JOIN_SEMI || jointype == JOIN_ANTI ||
+		 extra->inner_unique) && !yb_costing_bnl)
 	{
 		/*
 		 * With a SEMI or ANTI join, or if the innerrel is known unique, the
@@ -2393,9 +3323,15 @@ initial_cost_nestloop(PlannerInfo *root, JoinCostWorkspace *workspace,
 	else
 	{
 		/* Normal case; we'll scan whole input rel for each outer row */
+		/*
+		 * In the case of a BNL, yb_batch_size would be whatever the batch
+		 * batch size of outer tuples we are working with. We effectively
+		 * rescan the inner path for each outer tuple batch.
+		 */
 		run_cost += inner_run_cost;
-		if (outer_path_rows > 1)
-			run_cost += (outer_path_rows - 1) * inner_rescan_run_cost;
+		if (outer_path_rows > yb_batch_size)
+			run_cost += ((outer_path_rows - yb_batch_size) / yb_batch_size) *
+				inner_rescan_run_cost;
 	}
 
 	/* CPU costs left for later */
@@ -2420,8 +3356,8 @@ final_cost_nestloop(PlannerInfo *root, NestPath *path,
 					JoinCostWorkspace *workspace,
 					JoinPathExtraData *extra)
 {
-	Path	   *outer_path = path->outerjoinpath;
-	Path	   *inner_path = path->innerjoinpath;
+	Path	   *outer_path = path->jpath.outerjoinpath;
+	Path	   *inner_path = path->jpath.innerjoinpath;
 	double		outer_path_rows = outer_path->rows;
 	double		inner_path_rows = inner_path->rows;
 	Cost		startup_cost = workspace->startup_cost;
@@ -2430,25 +3366,34 @@ final_cost_nestloop(PlannerInfo *root, NestPath *path,
 	QualCost	restrict_qual_cost;
 	double		ntuples;
 
-	/* Protect some assumptions below that rowcounts aren't zero or NaN */
-	if (outer_path_rows <= 0 || isnan(outer_path_rows))
+	/* Protect some assumptions below that rowcounts aren't zero */
+	if (outer_path_rows <= 0)
 		outer_path_rows = 1;
-	if (inner_path_rows <= 0 || isnan(inner_path_rows))
+	if (inner_path_rows <= 0)
 		inner_path_rows = 1;
-
 	/* Mark the path with the correct row estimate */
-	if (path->path.param_info)
-		path->path.rows = path->path.param_info->ppi_rows;
+	if (path->jpath.path.param_info)
+		path->jpath.path.rows = path->jpath.path.param_info->ppi_rows;
 	else
-		path->path.rows = path->path.parent->rows;
+		path->jpath.path.rows = path->jpath.path.parent->rows;
+
+	int			yb_batch_size = 1;
+	bool		yb_is_batched = IsYugaByteEnabled() && yb_is_nestloop_batched(path);
+
+	if (IsYugaByteEnabled() && yb_is_batched &&
+		(yb_enable_base_scans_cost_model || yb_legacy_bnl_cost))
+		yb_batch_size = yb_bnl_batch_size;
+
+	bool		yb_costing_bnl = yb_batch_size > 1 && !yb_legacy_bnl_cost;
+	int			yb_legacy_bnl_bs = (yb_legacy_bnl_cost? yb_batch_size : 1);
 
 	/* For partial paths, scale row estimate. */
-	if (path->path.parallel_workers > 0)
+	if (path->jpath.path.parallel_workers > 0)
 	{
-		double		parallel_divisor = get_parallel_divisor(&path->path);
+		double		parallel_divisor = get_parallel_divisor(&path->jpath.path);
 
-		path->path.rows =
-			clamp_row_est(path->path.rows / parallel_divisor);
+		path->jpath.path.rows =
+			clamp_row_est(path->jpath.path.rows / parallel_divisor);
 	}
 
 	/*
@@ -2456,13 +3401,24 @@ final_cost_nestloop(PlannerInfo *root, NestPath *path,
 	 * would amount to optimizing for the case where the join method is
 	 * disabled, which doesn't seem like the way to bet.
 	 */
-	if (!enable_nestloop)
+	/*
+	 * YB: If yb_prefer_bnl is on and normal nestloops are allowed for this join
+	 * we do not add the disable cost penalty. See #21129 for more information.
+	 */
+	if ((!yb_is_batched && !enable_nestloop) ||
+		(yb_is_batched && !yb_enable_batchednl &&
+		 !(yb_prefer_bnl && enable_nestloop)))
 		startup_cost += disable_cost;
 
 	/* cost of inner-relation source data (we already dealt with outer rel) */
 
-	if (path->jointype == JOIN_SEMI || path->jointype == JOIN_ANTI ||
-		extra->inner_unique)
+	/*
+	 * YB: We exclude BNL semi/anti joins from this because BNL's still pull
+	 * all innerrel tuples instead of stopping prematurely. It still needs
+	 * the adjustment to ntuples that is done after this branch statement.
+	 */
+	if ((path->jpath.jointype == JOIN_SEMI || path->jpath.jointype == JOIN_ANTI ||
+		 extra->inner_unique) && !yb_costing_bnl)
 	{
 		/*
 		 * With a SEMI or ANTI join, or if the innerrel is known unique, the
@@ -2491,7 +3447,9 @@ final_cost_nestloop(PlannerInfo *root, NestPath *path,
 		 * Compute number of tuples processed (not number emitted!).  First,
 		 * account for successfully-matched outer rows.
 		 */
-		ntuples = outer_matched_rows * inner_path_rows * inner_scan_frac;
+
+		ntuples = ((outer_matched_rows / yb_legacy_bnl_bs) *
+				   inner_path_rows * inner_scan_frac);
 
 		/*
 		 * Now we need to estimate the actual costs of scanning the inner
@@ -2518,9 +3476,13 @@ final_cost_nestloop(PlannerInfo *root, NestPath *path,
 			 * case, use inner_run_cost for the first matched tuple and
 			 * inner_rescan_run_cost for additional ones.
 			 */
-			run_cost += inner_run_cost * inner_scan_frac;
-			if (outer_matched_rows > 1)
-				run_cost += (outer_matched_rows - 1) * inner_rescan_run_cost * inner_scan_frac;
+			if (outer_matched_rows > 0)
+				run_cost += inner_run_cost * inner_scan_frac;
+
+			if (outer_matched_rows > yb_legacy_bnl_bs)
+				run_cost += (((outer_matched_rows - yb_legacy_bnl_bs) /
+							  yb_legacy_bnl_bs) *
+							 inner_rescan_run_cost * inner_scan_frac);
 
 			/*
 			 * Add the cost of inner-scan executions for unmatched outer rows.
@@ -2528,8 +3490,10 @@ final_cost_nestloop(PlannerInfo *root, NestPath *path,
 			 * of a nonempty scan.  We consider that these are all rescans,
 			 * since we used inner_run_cost once already.
 			 */
-			run_cost += outer_unmatched_rows *
-				inner_rescan_run_cost / inner_path_rows;
+
+			if (yb_legacy_bnl_bs == 1)
+				run_cost += (outer_unmatched_rows *
+							 inner_rescan_run_cost / inner_path_rows);
 
 			/*
 			 * We won't be evaluating any quals at all for unmatched rows, so
@@ -2552,22 +3516,27 @@ final_cost_nestloop(PlannerInfo *root, NestPath *path,
 			 */
 
 			/* First, count all unmatched join tuples as being processed */
-			ntuples += outer_unmatched_rows * inner_path_rows;
+			ntuples += ((outer_unmatched_rows / yb_legacy_bnl_bs) *
+						inner_path_rows);
 
 			/* Now add the forced full scan, and decrement appropriate count */
 			run_cost += inner_run_cost;
-			if (outer_unmatched_rows >= 1)
-				outer_unmatched_rows -= 1;
+			if (outer_unmatched_rows >= yb_legacy_bnl_bs)
+				outer_unmatched_rows -= yb_legacy_bnl_bs;
+			else if (outer_matched_rows < yb_legacy_bnl_bs)
+				outer_matched_rows -= outer_matched_rows;
 			else
-				outer_matched_rows -= 1;
+				outer_matched_rows -= yb_legacy_bnl_bs;
 
 			/* Add inner run cost for additional outer tuples having matches */
 			if (outer_matched_rows > 0)
-				run_cost += outer_matched_rows * inner_rescan_run_cost * inner_scan_frac;
+				run_cost += ((outer_matched_rows / yb_legacy_bnl_bs) *
+							 inner_rescan_run_cost * inner_scan_frac);
 
 			/* Add inner run cost for additional unmatched outer tuples */
 			if (outer_unmatched_rows > 0)
-				run_cost += outer_unmatched_rows * inner_rescan_run_cost;
+				run_cost += ((outer_unmatched_rows / yb_legacy_bnl_bs) *
+							 inner_rescan_run_cost);
 		}
 	}
 	else
@@ -2575,21 +3544,53 @@ final_cost_nestloop(PlannerInfo *root, NestPath *path,
 		/* Normal-case source costs were included in preliminary estimate */
 
 		/* Compute number of tuples processed (not number emitted!) */
-		ntuples = outer_path_rows * inner_path_rows;
+		ntuples = (outer_path_rows / yb_batch_size) * inner_path_rows;
+
+		if ((path->jpath.jointype == JOIN_SEMI || path->jpath.jointype == JOIN_ANTI
+			 || extra->inner_unique) && !yb_legacy_bnl_cost)
+		{
+			Assert(yb_is_batched);
+			double		outer_matched_rows;
+			Selectivity inner_scan_frac;
+
+			outer_matched_rows =
+				rint(outer_path_rows * extra->semifactors.outer_match_frac);
+			inner_scan_frac = 2.0 / (extra->semifactors.match_count + 1.0);
+			ntuples = outer_matched_rows * inner_path_rows * inner_scan_frac;
+		}
 	}
 
 	/* CPU costs */
-	cost_qual_eval(&restrict_qual_cost, path->joinrestrictinfo, root);
+	cost_qual_eval(&restrict_qual_cost, path->jpath.joinrestrictinfo, root);
+
+	/*
+	 * YB: If BNL is enabled, it is possible for the enhanced CBO to be
+	 * disabled. In this case, the batched join filter will inaccurately
+	 * cost the BNL higher than its classic NL counterpart. This is a
+	 * temporary measure to sidestep that until we enable the CBO by default
+	 * and this measure is no longer necessary.
+	 * TODO: Get rid of this after CBO is GA.
+	 */
+	if (IsYugaByteEnabled() &&
+		yb_is_outer_inner_batched(outer_path, inner_path) &&
+		!yb_enable_base_scans_cost_model && !yb_legacy_bnl_cost)
+	{
+		restrict_qual_cost.startup = 0.0;
+		restrict_qual_cost.per_tuple = 0.0;
+		cost_qual_eval(&restrict_qual_cost,
+					   yb_get_bnl_extra_quals(&path->jpath), root);
+	}
+
 	startup_cost += restrict_qual_cost.startup;
 	cpu_per_tuple = cpu_tuple_cost + restrict_qual_cost.per_tuple;
 	run_cost += cpu_per_tuple * ntuples;
 
 	/* tlist eval costs are paid per output row, not per tuple scanned */
-	startup_cost += path->path.pathtarget->cost.startup;
-	run_cost += path->path.pathtarget->cost.per_tuple * path->path.rows;
+	startup_cost += path->jpath.path.pathtarget->cost.startup;
+	run_cost += path->jpath.path.pathtarget->cost.per_tuple * path->jpath.path.rows;
 
-	path->path.startup_cost = startup_cost;
-	path->path.total_cost = startup_cost + run_cost;
+	path->jpath.path.startup_cost = startup_cost;
+	path->jpath.path.total_cost = startup_cost + run_cost;
 }
 
 /*
@@ -2645,10 +3646,10 @@ initial_cost_mergejoin(PlannerInfo *root, JoinCostWorkspace *workspace,
 				innerendsel;
 	Path		sort_path;		/* dummy for result of cost_sort */
 
-	/* Protect some assumptions below that rowcounts aren't zero or NaN */
-	if (outer_path_rows <= 0 || isnan(outer_path_rows))
+	/* Protect some assumptions below that rowcounts aren't zero */
+	if (outer_path_rows <= 0)
 		outer_path_rows = 1;
-	if (inner_path_rows <= 0 || isnan(inner_path_rows))
+	if (inner_path_rows <= 0)
 		inner_path_rows = 1;
 
 	/*
@@ -2878,8 +3879,8 @@ final_cost_mergejoin(PlannerInfo *root, MergePath *path,
 				rescannedtuples;
 	double		rescanratio;
 
-	/* Protect some assumptions below that rowcounts aren't zero or NaN */
-	if (inner_path_rows <= 0 || isnan(inner_path_rows))
+	/* Protect some assumptions below that rowcounts aren't zero */
+	if (inner_path_rows <= 0)
 		inner_path_rows = 1;
 
 	/* Mark the path with the correct row estimate */
@@ -2961,7 +3962,7 @@ final_cost_mergejoin(PlannerInfo *root, MergePath *path,
 	 * The whole issue is moot if we are working from a unique-ified outer
 	 * input, or if we know we don't need to mark/restore at all.
 	 */
-	if (IsA(outer_path, UniquePath) ||path->skip_mark_restore)
+	if (IsA(outer_path, UniquePath) || path->skip_mark_restore)
 		rescannedtuples = 0;
 	else
 	{
@@ -3231,7 +4232,7 @@ initial_cost_hashjoin(PlannerInfo *root, JoinCostWorkspace *workspace,
 	 * Get hash table size that executor would use for inner relation.
 	 *
 	 * XXX for the moment, always assume that skew optimization will be
-	 * performed.  As long as SKEW_WORK_MEM_PERCENT is small, it's not worth
+	 * performed.  As long as SKEW_HASH_MEM_PERCENT is small, it's not worth
 	 * trying to determine that for sure.
 	 *
 	 * XXX at some point it might be interesting to try to account for skew
@@ -3240,7 +4241,7 @@ initial_cost_hashjoin(PlannerInfo *root, JoinCostWorkspace *workspace,
 	ExecChooseHashTableSize(inner_path_rows_total,
 							inner_path->pathtarget->width,
 							true,	/* useskew */
-							parallel_hash,	/* try_combined_work_mem */
+							parallel_hash,	/* try_combined_hash_mem */
 							outer_path->parallel_workers,
 							&space_allowed,
 							&numbuckets,
@@ -3421,16 +4422,15 @@ final_cost_hashjoin(PlannerInfo *root, HashPath *path,
 	}
 
 	/*
-	 * If the bucket holding the inner MCV would exceed work_mem, we don't
+	 * If the bucket holding the inner MCV would exceed hash_mem, we don't
 	 * want to hash unless there is really no other alternative, so apply
 	 * disable_cost.  (The executor normally copes with excessive memory usage
 	 * by splitting batches, but obviously it cannot separate equal values
-	 * that way, so it will be unable to drive the batch size below work_mem
+	 * that way, so it will be unable to drive the batch size below hash_mem
 	 * when this is true.)
 	 */
 	if (relation_byte_size(clamp_row_est(inner_path_rows * innermcvfreq),
-						   inner_path->pathtarget->width) >
-		(work_mem * 1024L))
+						   inner_path->pathtarget->width) > get_hash_memory_limit())
 		startup_cost += disable_cost;
 
 	/*
@@ -3726,6 +4726,11 @@ cost_rescan(PlannerInfo *root, Path *path,
 				*rescan_total_cost = run_cost;
 			}
 			break;
+		case T_Memoize:
+			/* All the hard work is done by cost_memoize_rescan */
+			cost_memoize_rescan(root, (MemoizePath *) path,
+								rescan_startup_cost, rescan_total_cost);
+			break;
 		default:
 			*rescan_startup_cost = path->startup_cost;
 			*rescan_total_cost = path->total_cost;
@@ -3858,8 +4863,8 @@ cost_qual_eval_walker(Node *node, cost_qual_eval_context *context)
 	 */
 	if (IsA(node, FuncExpr))
 	{
-		context->total.per_tuple +=
-			get_func_cost(((FuncExpr *) node)->funcid) * cpu_operator_cost;
+		add_function_cost(context->root, ((FuncExpr *) node)->funcid, node,
+						  &context->total);
 	}
 	else if (IsA(node, OpExpr) ||
 			 IsA(node, DistinctExpr) ||
@@ -3867,21 +4872,55 @@ cost_qual_eval_walker(Node *node, cost_qual_eval_context *context)
 	{
 		/* rely on struct equivalence to treat these all alike */
 		set_opfuncid((OpExpr *) node);
-		context->total.per_tuple +=
-			get_func_cost(((OpExpr *) node)->opfuncid) * cpu_operator_cost;
+		add_function_cost(context->root, ((OpExpr *) node)->opfuncid, node,
+						  &context->total);
 	}
 	else if (IsA(node, ScalarArrayOpExpr))
 	{
-		/*
-		 * Estimate that the operator will be applied to about half of the
-		 * array elements before the answer is determined.
-		 */
 		ScalarArrayOpExpr *saop = (ScalarArrayOpExpr *) node;
 		Node	   *arraynode = (Node *) lsecond(saop->args);
+		QualCost	sacosts;
+		QualCost	hcosts;
+		int			estarraylen = estimate_array_length(arraynode);
 
 		set_sa_opfuncid(saop);
-		context->total.per_tuple += get_func_cost(saop->opfuncid) *
-			cpu_operator_cost * estimate_array_length(arraynode) * 0.5;
+		sacosts.startup = sacosts.per_tuple = 0;
+		add_function_cost(context->root, saop->opfuncid, NULL,
+						  &sacosts);
+
+		if (OidIsValid(saop->hashfuncid))
+		{
+			/* Handle costs for hashed ScalarArrayOpExpr */
+			hcosts.startup = hcosts.per_tuple = 0;
+
+			add_function_cost(context->root, saop->hashfuncid, NULL, &hcosts);
+			context->total.startup += sacosts.startup + hcosts.startup;
+
+			/* Estimate the cost of building the hashtable. */
+			context->total.startup += estarraylen * hcosts.per_tuple;
+
+			/*
+			 * XXX should we charge a little bit for sacosts.per_tuple when
+			 * building the table, or is it ok to assume there will be zero
+			 * hash collision?
+			 */
+
+			/*
+			 * Charge for hashtable lookups.  Charge a single hash and a
+			 * single comparison.
+			 */
+			context->total.per_tuple += hcosts.per_tuple + sacosts.per_tuple;
+		}
+		else
+		{
+			/*
+			 * Estimate that the operator will be applied to about half of the
+			 * array elements before the answer is determined.
+			 */
+			context->total.startup += sacosts.startup;
+			context->total.per_tuple += sacosts.per_tuple *
+				estimate_array_length(arraynode) * 0.5;
+		}
 	}
 	else if (IsA(node, Aggref) ||
 			 IsA(node, WindowFunc))
@@ -3913,11 +4952,13 @@ cost_qual_eval_walker(Node *node, cost_qual_eval_context *context)
 		/* check the result type's input function */
 		getTypeInputInfo(iocoerce->resulttype,
 						 &iofunc, &typioparam);
-		context->total.per_tuple += get_func_cost(iofunc) * cpu_operator_cost;
+		add_function_cost(context->root, iofunc, NULL,
+						  &context->total);
 		/* check the input type's output function */
 		getTypeOutputInfo(exprType((Node *) iocoerce->arg),
 						  &iofunc, &typisvarlena);
-		context->total.per_tuple += get_func_cost(iofunc) * cpu_operator_cost;
+		add_function_cost(context->root, iofunc, NULL,
+						  &context->total);
 	}
 	else if (IsA(node, ArrayCoerceExpr))
 	{
@@ -3941,8 +4982,8 @@ cost_qual_eval_walker(Node *node, cost_qual_eval_context *context)
 		{
 			Oid			opid = lfirst_oid(lc);
 
-			context->total.per_tuple += get_func_cost(get_opcode(opid)) *
-				cpu_operator_cost;
+			add_function_cost(context->root, get_opcode(opid), NULL,
+							  &context->total);
 		}
 	}
 	else if (IsA(node, MinMaxExpr) ||
@@ -4068,7 +5109,7 @@ get_restriction_qual_cost(PlannerInfo *root, RelOptInfo *baserel,
  *	sjinfo: SpecialJoinInfo relevant to this join
  *	restrictlist: join quals
  * Output parameters:
- *	*semifactors is filled in (see relation.h for field definitions)
+ *	*semifactors is filled in (see pathnodes.h for field definitions)
  */
 void
 compute_semi_anti_join_factors(PlannerInfo *root,
@@ -4083,7 +5124,7 @@ compute_semi_anti_join_factors(PlannerInfo *root,
 	Selectivity jselec;
 	Selectivity nselec;
 	Selectivity avgmatch;
-	SpecialJoinInfo norm_sjinfo;
+	SpecialJoinInfo temp_sjinfo;
 	List	   *joinquals;
 	ListCell   *l;
 
@@ -4109,36 +5150,54 @@ compute_semi_anti_join_factors(PlannerInfo *root,
 		joinquals = restrictlist;
 
 	/*
+	 * YB: The following code was modified to fix a PG bug detailed in #19021.
+	 * Note to PG15 mergers: temp_sjinfo was previously known as "norm_sjinfo".
+	 */
+	temp_sjinfo.type = T_SpecialJoinInfo;
+	temp_sjinfo.min_lefthand = outerrel->relids;
+	temp_sjinfo.min_righthand = innerrel->relids;
+	temp_sjinfo.syn_lefthand = outerrel->relids;
+	temp_sjinfo.syn_righthand = innerrel->relids;
+	temp_sjinfo.jointype = (jointype == JOIN_ANTI) ? JOIN_ANTI : JOIN_SEMI;
+	/* we don't bother trying to make the remaining fields valid */
+	temp_sjinfo.lhs_strict = false;
+	temp_sjinfo.delay_upper_joins = false;
+	temp_sjinfo.semi_can_btree = false;
+	temp_sjinfo.semi_can_hash = false;
+	temp_sjinfo.semi_operators = NIL;
+	temp_sjinfo.semi_rhs_exprs = NIL;
+
+	/*
 	 * Get the JOIN_SEMI or JOIN_ANTI selectivity of the join clauses.
 	 */
 	jselec = clauselist_selectivity(root,
 									joinquals,
 									0,
 									(jointype == JOIN_ANTI) ? JOIN_ANTI : JOIN_SEMI,
-									sjinfo);
+									&temp_sjinfo);
 
 	/*
 	 * Also get the normal inner-join selectivity of the join clauses.
 	 */
-	norm_sjinfo.type = T_SpecialJoinInfo;
-	norm_sjinfo.min_lefthand = outerrel->relids;
-	norm_sjinfo.min_righthand = innerrel->relids;
-	norm_sjinfo.syn_lefthand = outerrel->relids;
-	norm_sjinfo.syn_righthand = innerrel->relids;
-	norm_sjinfo.jointype = JOIN_INNER;
+	temp_sjinfo.type = T_SpecialJoinInfo;
+	temp_sjinfo.min_lefthand = outerrel->relids;
+	temp_sjinfo.min_righthand = innerrel->relids;
+	temp_sjinfo.syn_lefthand = outerrel->relids;
+	temp_sjinfo.syn_righthand = innerrel->relids;
+	temp_sjinfo.jointype = JOIN_INNER;
 	/* we don't bother trying to make the remaining fields valid */
-	norm_sjinfo.lhs_strict = false;
-	norm_sjinfo.delay_upper_joins = false;
-	norm_sjinfo.semi_can_btree = false;
-	norm_sjinfo.semi_can_hash = false;
-	norm_sjinfo.semi_operators = NIL;
-	norm_sjinfo.semi_rhs_exprs = NIL;
+	temp_sjinfo.lhs_strict = false;
+	temp_sjinfo.delay_upper_joins = false;
+	temp_sjinfo.semi_can_btree = false;
+	temp_sjinfo.semi_can_hash = false;
+	temp_sjinfo.semi_operators = NIL;
+	temp_sjinfo.semi_rhs_exprs = NIL;
 
 	nselec = clauselist_selectivity(root,
 									joinquals,
 									0,
 									JOIN_INNER,
-									&norm_sjinfo);
+									&temp_sjinfo);
 
 	/* Avoid leaking a lot of ListCells */
 	if (IS_OUTER_JOIN(jointype))
@@ -4169,6 +5228,29 @@ compute_semi_anti_join_factors(PlannerInfo *root,
 	semifactors->match_count = avgmatch;
 }
 
+static List *
+yb_get_bnl_extra_quals(JoinPath *joinpath)
+{
+	bool		yb_is_batched = yb_is_outer_inner_batched(joinpath->outerjoinpath,
+														  joinpath->innerjoinpath);
+
+	if (!yb_is_batched)
+		return joinpath->joinrestrictinfo;
+
+	List	   *bnl_extra_quals = NULL;
+	ListCell   *lc;
+
+	foreach(lc, joinpath->joinrestrictinfo)
+	{
+		RestrictInfo *rinfo = (RestrictInfo *) lfirst(lc);
+
+		if (!yb_can_batch_rinfo(rinfo, joinpath->outerjoinpath->parent->relids,
+								joinpath->innerjoinpath->parent->relids))
+			bnl_extra_quals = lappend(bnl_extra_quals, rinfo);
+	}
+	return bnl_extra_quals;
+}
+
 /*
  * has_indexed_join_quals
  *	  Check whether all the joinquals of a nestloop join are used as
@@ -4180,8 +5262,9 @@ compute_semi_anti_join_factors(PlannerInfo *root,
  * expensive.
  */
 static bool
-has_indexed_join_quals(NestPath *joinpath)
+has_indexed_join_quals(NestPath *path)
 {
+	JoinPath   *joinpath = &path->jpath;
 	Relids		joinrelids = joinpath->path.parent->relids;
 	Path	   *innerpath = joinpath->innerjoinpath;
 	List	   *indexclauses;
@@ -4189,7 +5272,13 @@ has_indexed_join_quals(NestPath *joinpath)
 	ListCell   *lc;
 
 	/* If join still has quals to evaluate, it's not fast */
-	if (joinpath->joinrestrictinfo != NIL)
+	/*
+	 * YB: Technically, we can remove the first condition as it is redundant
+	 * with the second. However, keeping it around to aid those who are merging
+	 * future PG code.
+	 */
+	if (joinpath->joinrestrictinfo != NIL &&
+		yb_get_bnl_extra_quals(joinpath))
 		return false;
 	/* Nor if the inner path isn't parameterized at all */
 	if (innerpath->param_info == NULL)
@@ -4206,6 +5295,17 @@ has_indexed_join_quals(NestPath *joinpath)
 			{
 				/* Accept only a simple bitmap scan, not AND/OR cases */
 				Path	   *bmqual = ((BitmapHeapPath *) innerpath)->bitmapqual;
+
+				if (IsA(bmqual, IndexPath))
+					indexclauses = ((IndexPath *) bmqual)->indexclauses;
+				else
+					return false;
+				break;
+			}
+		case T_YbBitmapTableScan:
+			{
+				/* Accept only a simple bitmap scan, not AND/OR cases */
+				Path	   *bmqual = ((YbBitmapTablePath *) innerpath)->bitmapqual;
 
 				if (IsA(bmqual, IndexPath))
 					indexclauses = ((IndexPath *) bmqual)->indexclauses;
@@ -4238,8 +5338,7 @@ has_indexed_join_quals(NestPath *joinpath)
 										innerpath->parent->relids,
 										joinrelids))
 		{
-			if (!(list_member_ptr(indexclauses, rinfo) ||
-				  is_redundant_derived_clause(rinfo, indexclauses)))
+			if (!is_redundant_with_indexclauses(rinfo, indexclauses))
 				return false;
 			found_one = true;
 		}
@@ -4371,8 +5470,7 @@ get_parameterized_baserel_size(PlannerInfo *root, RelOptInfo *rel,
 	 * restriction clauses.  Note that we force the clauses to be treated as
 	 * non-join clauses during selectivity estimation.
 	 */
-	allclauses = list_concat(list_copy(param_clauses),
-							 rel->baserestrictinfo);
+	allclauses = list_concat_copy(param_clauses, rel->baserestrictinfo);
 	nrows = rel->tuples *
 		clauselist_selectivity(root,
 							   allclauses,
@@ -4652,8 +5750,6 @@ get_foreign_key_join_selectivity(PlannerInfo *root,
 		bool		ref_is_outer;
 		List	   *removedlist;
 		ListCell   *cell;
-		ListCell   *prev;
-		ListCell   *next;
 
 		/*
 		 * This FK is not relevant unless it connects a baserel on one side of
@@ -4694,14 +5790,12 @@ get_foreign_key_join_selectivity(PlannerInfo *root,
 			worklist = list_copy(worklist);
 
 		removedlist = NIL;
-		prev = NULL;
-		for (cell = list_head(worklist); cell; cell = next)
+		foreach(cell, worklist)
 		{
 			RestrictInfo *rinfo = (RestrictInfo *) lfirst(cell);
 			bool		remove_it = false;
 			int			i;
 
-			next = lnext(cell);
 			/* Drop this clause if it matches any column of the FK */
 			for (i = 0; i < fkinfo->nkeys; i++)
 			{
@@ -4741,11 +5835,9 @@ get_foreign_key_join_selectivity(PlannerInfo *root,
 			}
 			if (remove_it)
 			{
-				worklist = list_delete_cell(worklist, cell, prev);
+				worklist = foreach_delete_current(worklist, cell);
 				removedlist = lappend(removedlist, rinfo);
 			}
-			else
-				prev = cell;
 		}
 
 		/*
@@ -4755,9 +5847,16 @@ get_foreign_key_join_selectivity(PlannerInfo *root,
 		 * remove back into the worklist.
 		 *
 		 * Since the matching clauses are known not outerjoin-delayed, they
-		 * should certainly have appeared in the initial joinclause list.  If
-		 * we didn't find them, they must have been matched to, and removed
-		 * by, some other FK in a previous iteration of this loop.  (A likely
+		 * would normally have appeared in the initial joinclause list.  If we
+		 * didn't find them, there are two possibilities:
+		 *
+		 * 1. If the FK match is based on an EC that is ec_has_const, it won't
+		 * have generated any join clauses at all.  We discount such ECs while
+		 * checking to see if we have "all" the clauses.  (Below, we'll adjust
+		 * the selectivity estimate for this case.)
+		 *
+		 * 2. The clauses were matched to some other FK in a previous
+		 * iteration of this loop, and thus removed from worklist.  (A likely
 		 * case is that two FKs are matched to the same EC; there will be only
 		 * one EC-derived clause in the initial list, so the first FK will
 		 * consume it.)  Applying both FKs' selectivity independently risks
@@ -4767,8 +5866,9 @@ get_foreign_key_join_selectivity(PlannerInfo *root,
 		 * Later we might think of a reasonable way to combine the estimates,
 		 * but for now, just punt, since this is a fairly uncommon situation.
 		 */
-		if (list_length(removedlist) !=
-			(fkinfo->nmatched_ec + fkinfo->nmatched_ri))
+		if (removedlist == NIL ||
+			list_length(removedlist) !=
+			(fkinfo->nmatched_ec - fkinfo->nconst_ec + fkinfo->nmatched_ri))
 		{
 			worklist = list_concat(worklist, removedlist);
 			continue;
@@ -4827,9 +5927,48 @@ get_foreign_key_join_selectivity(PlannerInfo *root,
 
 			fkselec *= 1.0 / ref_tuples;
 		}
+
+		/*
+		 * If any of the FK columns participated in ec_has_const ECs, then
+		 * equivclass.c will have generated "var = const" restrictions for
+		 * each side of the join, thus reducing the sizes of both input
+		 * relations.  Taking the fkselec at face value would amount to
+		 * double-counting the selectivity of the constant restriction for the
+		 * referencing Var.  Hence, look for the restriction clause(s) that
+		 * were applied to the referencing Var(s), and divide out their
+		 * selectivity to correct for this.
+		 */
+		if (fkinfo->nconst_ec > 0)
+		{
+			for (int i = 0; i < fkinfo->nkeys; i++)
+			{
+				EquivalenceClass *ec = fkinfo->eclass[i];
+
+				if (ec && ec->ec_has_const)
+				{
+					EquivalenceMember *em = fkinfo->fk_eclass_member[i];
+					RestrictInfo *rinfo = find_derived_clause_for_ec_member(ec,
+																			em);
+
+					if (rinfo)
+					{
+						Selectivity s0;
+
+						s0 = clause_selectivity(root,
+												(Node *) rinfo,
+												0,
+												jointype,
+												sjinfo);
+						if (s0 > 0)
+							fkselec /= s0;
+					}
+				}
+			}
+		}
 	}
 
 	*restrictlist = worklist;
+	CLAMP_PROBABILITY(fkselec);
 	return fkselec;
 }
 
@@ -4942,7 +6081,7 @@ set_function_size_estimates(PlannerInfo *root, RelOptInfo *rel)
 	foreach(lc, rte->functions)
 	{
 		RangeTblFunction *rtfunc = (RangeTblFunction *) lfirst(lc);
-		double		ntup = expression_returns_set_rows(rtfunc->funcexpr);
+		double		ntup = expression_returns_set_rows(root, rtfunc->funcexpr);
 
 		if (ntup > rel->tuples)
 			rel->tuples = ntup;
@@ -5028,10 +6167,11 @@ set_cte_size_estimates(PlannerInfo *root, RelOptInfo *rel, double cte_rows)
 	if (rte->self_reference)
 	{
 		/*
-		 * In a self-reference, arbitrarily assume the average worktable size
-		 * is about 10 times the nonrecursive term's size.
+		 * In a self-reference, we assume the average worktable size is a
+		 * multiple of the nonrecursive term's size.  The best multiplier will
+		 * vary depending on query "fan-out", so make its value adjustable.
 		 */
-		rel->tuples = 10 * cte_rows;
+		rel->tuples = clamp_row_est(recursive_worktable_factor * cte_rows);
 	}
 	else
 	{
@@ -5071,6 +6211,29 @@ set_namedtuplestore_size_estimates(PlannerInfo *root, RelOptInfo *rel)
 	rel->tuples = rte->enrtuples;
 	if (rel->tuples < 0)
 		rel->tuples = 1000;
+
+	/* Now estimate number of output rows, etc */
+	set_baserel_size_estimates(root, rel);
+}
+
+/*
+ * set_result_size_estimates
+ *		Set the size estimates for an RTE_RESULT base relation
+ *
+ * The rel's targetlist and restrictinfo list must have been constructed
+ * already.
+ *
+ * We set the same fields as set_baserel_size_estimates.
+ */
+void
+set_result_size_estimates(PlannerInfo *root, RelOptInfo *rel)
+{
+	/* Should only be applied to RTE_RESULT base relations */
+	Assert(rel->relid > 0);
+	Assert(planner_rt_fetch(rel->relid, root)->rtekind == RTE_RESULT);
+
+	/* RTE_RESULT always generates a single row, natively */
+	rel->tuples = 1;
 
 	/* Now estimate number of output rows, etc */
 	set_baserel_size_estimates(root, rel);
@@ -5307,7 +6470,8 @@ set_pathtarget_cost_width(PlannerInfo *root, PathTarget *target)
 			Assert(var->varlevelsup == 0);
 
 			/* Try to get data from RelOptInfo cache */
-			if (var->varno < root->simple_rel_array_size)
+			if (!IS_SPECIAL_VARNO(var->varno) &&
+				var->varno < root->simple_rel_array_size)
 			{
 				RelOptInfo *rel = root->simple_rel_array[var->varno];
 
@@ -5495,7 +6659,7 @@ compute_bitmap_pages(PlannerInfo *root, RelOptInfo *baserel, Path *bitmapqual,
 		exact_pages = heap_pages - lossy_pages;
 
 		/*
-		 * If there are lossy pages then recompute the  number of tuples
+		 * If there are lossy pages then recompute the number of tuples
 		 * processed by the bitmap heap node.  We assume here that the chance
 		 * of a given tuple coming from an exact page is the same as the
 		 * chance that a given page is exact.  This might not be true, but
@@ -5514,4 +6678,2376 @@ compute_bitmap_pages(PlannerInfo *root, RelOptInfo *baserel, Path *bitmapqual,
 		*tuple = tuples_fetched;
 
 	return pages_fetched;
+}
+
+static Cost
+yb_data_transfer_cost(Cardinality round_trips,
+					  Cardinality data_size,
+					  Cost roundtrip_cost,
+					  Cost transfer_cost)
+{
+	/*
+	 * yb_local_roundtrip_cost: DocDB - PG one way communication cost
+	 * yb_local_transfer_cost: per MB data transfer cost
+	 */
+	return (roundtrip_cost * round_trips +
+			transfer_cost * data_size / MEGA);
+}
+
+/*
+ * yb_get_pagination_metrics
+ *		Computes the page count and size based on the `yb_fetch_size_limit` and
+ * `yb_fetch_row_limit` GUC parameter values.
+ *  The `page_size` can be a NULL pointer.
+ */
+static void
+yb_get_pagination_metrics(Cardinality result_tuples,
+						  int32 result_width,
+						  Cardinality *num_pages,
+						  Cardinality *page_size)
+{
+	Cardinality	psize;
+
+	if (yb_fetch_size_limit == 0 &&
+		yb_fetch_row_limit == 0)
+	{
+		*num_pages = 1;
+		psize = result_tuples * result_width;
+	}
+	else if (yb_fetch_size_limit > 0 &&
+			 (yb_fetch_row_limit == 0 ||
+			  result_width * yb_fetch_row_limit > yb_fetch_size_limit))
+	{
+		int			max_results_per_page = yb_fetch_size_limit / result_width;
+
+		*num_pages = ceil(result_tuples / max_results_per_page);
+		psize = fmin(result_tuples, max_results_per_page) * result_width;
+	}
+	else
+	{
+		*num_pages = ceil(result_tuples / yb_fetch_row_limit);
+		psize = fmin(result_tuples, yb_fetch_row_limit) * result_width;
+	}
+
+	if (page_size)
+		*page_size = psize;
+}
+
+/*
+ * yb_get_relation_data_width
+ *		Returns the tuple width of the relation.
+ */
+static int32
+yb_get_relation_data_width(RelOptInfo *relinfo, Oid reloid)
+{
+	int32		baserel_tuple_width = 0;
+
+	if (reloid != InvalidOid)
+	{
+		/* Real relation, so estimate true tuple width */
+		baserel_tuple_width =
+			get_relation_data_width(reloid,
+									relinfo->attr_widths - relinfo->min_attr);
+	}
+	else
+	{
+		/* Do what we can with info for a phony rel */
+		AttrNumber	i;
+
+		for (i = 1; i <= relinfo->max_attr; i++)
+			baserel_tuple_width +=
+				relinfo->attr_widths[i - relinfo->min_attr];
+	}
+	baserel_tuple_width += HIDDEN_COLUMNS_SIZE;
+	return baserel_tuple_width;
+}
+
+/*
+ * yb_get_lsm_seek_cost
+ * 	  Estimates the cost of looking up a key in the LSM Index
+ *
+ * We use a simplified time complexity formula for computing the cost of lookup
+ * which deliberately overlooks some factors that affect performance because
+ * currently we cannot accurately estimate the effect of those.
+ * * We ignore the effect of multiple levels in LSM and assume the complexity of
+ *   lookup is O(log(n)) where n is the number of keys.
+ * * We ignore that DocDB can limit the number of SST files that need to be
+ *   searched by looking at the filters and min/max values for various key
+ *   columns in each SST file. We assume that each SST file must be searched.
+ */
+static Cost
+yb_get_lsm_seek_cost(Cardinality num_tuples, int num_key_value_pairs_per_tuple,
+					 int num_sst_files)
+{
+	Cost		seek_cost;
+
+	seek_cost = (log2(num_tuples * num_key_value_pairs_per_tuple) *
+				 num_sst_files * yb_seek_cost_factor * cpu_operator_cost);
+	return seek_cost;
+}
+
+/*
+ * yb_get_baserel_primary_index
+ *		Return the primary index of the base table or NULL if no primary index
+ *		exists
+ */
+static IndexOptInfo *
+yb_get_baserel_primary_index(RelOptInfo *baserel)
+{
+	IndexOptInfo *pk_index = NULL;
+	ListCell   *lc;
+
+	foreach(lc, baserel->indexlist)
+	{
+		IndexOptInfo *index = (IndexOptInfo *) lfirst(lc);
+
+		if (!index->hypothetical)
+		{
+			Relation	index_rel = RelationIdGetRelation(index->indexoid);
+
+			if (index_rel->rd_index->indisprimary)
+			{
+				pk_index = index;
+				RelationClose(index_rel);
+				break;
+			}
+			RelationClose(index_rel);
+		}
+	}
+	return pk_index;
+}
+
+
+/*
+ * yb_get_ybctid_width
+ *		Returns the width of the ybctid for the `index` of the `baserel`.
+ */
+static int32
+yb_get_ybctid_width(Oid baserel_oid, RelOptInfo *baserel,
+					IndexOptInfo *index, bool is_primary_index)
+{
+	int32		ybctid_width = 0;
+
+	if (index != NULL && index->yb_cached_ybctid_size > 0)
+	{
+		/*
+		 * Aside from performance improvement, this caching has another
+		 * purpose. When a hint is used to influence the choice of an index,
+		 * pg_hint_plan extension removes the index choice available in
+		 * restrict_indexes.
+		 *
+		 * To compute the width of the secondary index ybctid, we need to find
+		 * the primary index. However, as explained above, if the user forces
+		 * using a secondary index with a hint, then the primary index of the
+		 * base table becomes invisible to the cost model, instead it seems as
+		 * if the base table does not have a primary index.
+		 *
+		 * Since all paths are explored before the hint plan is applied, by
+		 * caching the ybctid widht during this first pass, we can avoid the
+		 * above problem.
+		 */
+		ybctid_width = index->yb_cached_ybctid_size;
+	}
+	else
+	{
+		if (index == NULL)
+		{
+			/* Base table has no primary key */
+			ybctid_width = UUID_YBCTID_WIDTH;
+		}
+		else
+		{
+			/*
+			 * Add 1 byte for null indicator and 8 bytes for size of the ybctid.
+			 */
+			ybctid_width += 9;
+
+			/* Aggregate the width of the key columns in the index */
+			for (int i = 0; i < index->nkeycolumns; i++)
+			{
+				/* We ignore system columns for which index->indexkeys[i] < 0 */
+				if (index->indexkeys[i] == 0)	/* Index key is an expression */
+				{
+					ybctid_width += get_attavgwidth(index->indexoid, i + 1) + 1;
+
+					if (!index->hypothetical)
+					{
+						Relation	indexrel = index_open(index->indexoid,
+														  NoLock);
+						Form_pg_attribute att = TupleDescAttr(indexrel->rd_att,
+															  i + 1);
+
+						if (att->attlen < 0)
+						{
+							/*
+							 * attlen is negative if the attribute has variable
+							 * length. Add 1 byte because DocDB uses double
+							 * null termination.
+							 */
+							++ybctid_width;
+						}
+
+						index_close(indexrel, NoLock);
+					}
+				}
+				else if (index->indexkeys[i] > 0)	/* Index key is user
+													 * column */
+				{
+					/*
+					 * For each key column, add 1 byte for value type and
+					 * estimated average width of the column.
+					 */
+					ybctid_width +=
+						get_attavgwidth(baserel_oid, index->indexkeys[i]) + 1;
+
+					Relation	baserel = table_open(baserel_oid, NoLock);
+					Form_pg_attribute att = TupleDescAttr(baserel->rd_att,
+														  index->indexkeys[i] - 1);
+
+					if (att->attlen < 0)
+					{
+						/*
+						 * attlen is negative if the attribute has variable
+						 * length. Add 1 byte because DocDB uses double
+						 * null termination.
+						 */
+						++ybctid_width;
+					}
+					table_close(baserel, NoLock);
+				}
+			}
+
+			/* Add 1 byte for the kGroupEnd(!). */
+			++ybctid_width;
+
+			if (index->nhashcolumns > 0)
+			{
+				/*
+				 * If there were hash and range keys, then the key is prefixed
+				 * with a 16 bit hash value of the hash columns. Add 1 byte
+				 * for the hash value type and 2 bytes for the hash value. Also
+				 * add 1 byte for group termination between hash and range keys.
+				 */
+				ybctid_width += 4;
+			}
+
+			if (!is_primary_index)
+			{
+				/*
+				 * In the secondary index, the ybctid of the base table is part of
+				 * the secondary index key. It is stored in string encoded format.
+				 */
+				IndexOptInfo *base_table_primary_index = yb_get_baserel_primary_index(baserel);
+				int32		base_table_ybctid_width = yb_get_ybctid_width(baserel_oid,
+																		  baserel,
+																		  base_table_primary_index,
+																		  true /* is_primary_index */ );
+
+				/*
+				 * We need to subtract 2 from the base table ybctid length to
+				 * get the length of the string encoding. The ybctid length
+				 * includes 9 bytes for the null indicator and size of the
+				 * ybctid, which are not part of the string encoding. However,
+				 * the string encoding needs 7 additional bytes, 1 for the
+				 * value type, 4 bytes for separator and 2 bytes for double
+				 * null termination.
+				 */
+				ybctid_width += base_table_ybctid_width - 2;
+			}
+
+			index->yb_cached_ybctid_size = ybctid_width;
+		}
+	}
+
+	return ybctid_width;
+}
+
+/*
+ * yb_get_docdb_result_width
+ *		Determines width of the result that is transferred from DocDB to pggate.
+ *
+ * DocDB sends ybctid in the cases where no columns are being projected
+ * from the table. This happens when there is no columns in the select list
+ * and no local filters. Additionally, this also happens when the select
+ * list contains count(*). In these cases, pathtarget->width is 0.
+ *
+ * One exception to the above rule is when no columns are being projected
+ * but filters are used in the query which are pushed down as index
+ * conditions for Index Scan. In this case also, the pathtarget->width is
+ * 0, but DocDB returns the index key columns that are used in the filters.
+ *
+ * When columns are being projected, either in select list or in local
+ * filters then these columns are returned from DocDB.
+ */
+static int32
+yb_get_docdb_result_width(Path *path, PlannerInfo *root, bool is_index_path,
+						  bool is_primary_index, bool is_index_only,
+						  List *index_conditions, List *local_clauses,
+						  RelOptInfo *baserel, Oid baserel_oid)
+{
+	ListCell   *lc;
+	Bitmapset  *attrs = NULL;
+	int32		result_width = 0;
+	IndexPath  *index_path = NULL;
+
+	if (is_index_path)
+	{
+		index_path = (IndexPath *) path;
+	}
+
+	if (is_index_path &&
+		path->pathtarget->width == 0 &&
+		list_length(local_clauses) == 0)
+	{
+		foreach(lc, index_conditions)
+		{
+			RestrictInfo *ri = lfirst_node(RestrictInfo, lc);
+
+			pull_varattnos_min_attr((Node *) ri->clause, baserel->relid,
+									&attrs,
+									YBFirstLowInvalidAttributeNumber + 1);
+		}
+	}
+	else
+	{
+		/*
+		 * Collect the attributes used in each expression in the target
+		 * list.
+		 */
+
+		/*
+		 * TODO(#20955) : pathtarget->exprs may have aggregate functions
+		 * which are pushed down to DocDB. We cannot detect aggregate
+		 * pushdown during query planning at this time. So we haven't
+		 * modeled this properly here for now.
+		 *
+		 * We assume that agg functions cannot be pushed down, and all
+		 * columns used as input to these functions will need to be
+		 * transferred. This produces inaccurate results in some cases,
+		 * documented in the test TestPgEstimatedDocdbResultWidth.java in
+		 * method testDocdbResultWidthEstimationAggregateFunctions().
+		 */
+		foreach(lc, path->pathtarget->exprs)
+		{
+			Node	   *expr = (Node *) lfirst(lc);
+
+			pull_varattnos_min_attr(expr, baserel->relid, &attrs,
+									YBFirstLowInvalidAttributeNumber + 1);
+		}
+
+		/*
+		 * Collect the attributes used in each expression in the local
+		 * filters.
+		 */
+		foreach(lc, local_clauses)
+		{
+			Node	   *node = lfirst(lc);
+			Expr	   *local_qual = (IsA(node, RestrictInfo) ?
+									  ((RestrictInfo *) node)->clause :
+									  (Expr *) node);
+
+			pull_varattnos_min_attr((Node *) local_qual, baserel->relid, &attrs,
+									YBFirstLowInvalidAttributeNumber + 1);
+		}
+	}
+
+	/* TODO(#20956): Columns needed for rechecking need to be added */
+	if (bms_num_members(attrs) > 0)
+	{
+		int			bms_index = -1;
+
+		while ((bms_index = bms_first_member(attrs)) >= 0)
+		{
+			/* Add 1 byte for null indicator */
+			result_width += 1;
+
+			/* Adjust for system attributes. */
+			AttrNumber	attnum = YBBmsIndexToAttnumWithMinAttr(YBFirstLowInvalidAttributeNumber,
+															   bms_index);
+
+			if (attnum < 0)
+			{
+				/* Ignore system attributes */
+				continue;
+			}
+
+			Relation	baserel = table_open(baserel_oid, NoLock);
+			Form_pg_attribute att = TupleDescAttr(baserel->rd_att, attnum);
+
+			if (att->attlen < 0)
+			{
+				/*
+				 * attlen is negative for variable size types. DocDB
+				 * prefixes the value with the 8 bytes length.
+				 */
+				result_width += 8;
+			}
+			table_close(baserel, NoLock);
+
+			result_width += get_attavgwidth(baserel_oid, attnum + 1);
+		}
+	}
+
+	/*
+	 * result_width may be 0 in following cases,
+	 * * No columns are projected from the base table,
+	 *   - eg. SELECT 0 FROM test;
+	 *   - In this case, DocDB will return the ybctid for each row.
+	 * * Aggregate function such as count(*) is pushed down to DocDB.
+	 *   - In this case, DocDB will return the count of rows in INT type.
+	 */
+	if (result_width == 0)
+	{
+		if (root->parse->hasAggs)
+		{
+			/*
+			 * For queries with count(*), the pathtarget->width is 0.
+			 * Additionally, count(*) gets pushed down to DocDB only if there
+			 * are no local filters. We try to handle that case here.
+			 *
+			 * We may false positively identify some cases where count(*)
+			 * cannot be pushed down to DocDB here and this should be improved
+			 * in TODO(#20955).
+			 *
+			 * When count(*) is pushed down, DocDB returns 9 bytes which
+			 * includes 1 byte for null indicator and 8 bytes for number of
+			 * rows.
+			 */
+			result_width = 9;
+		}
+		else if (is_index_path && list_length(index_conditions) == 0)
+		{
+			Assert(index_path != NULL);
+			result_width = yb_get_ybctid_width(baserel_oid,
+											   baserel,
+											   index_path->indexinfo,
+											   is_primary_index);
+		}
+		else
+		{
+			/**
+			 * This happens when no columns are projected eg. `SELECT 0 FROM ...`.
+			 * In this case, DocDB returns the ybctid for each row that matches
+			 * the filter. To compute the network cost, we need to estimate the
+			 * size of the ybctid.
+			 *
+			 * If the query has local filters (to be executed on PG side), then
+			 * DocDB sends the columns needed for these filters, and does not need
+			 * to send the ybctid.
+			 */
+			IndexOptInfo *primary_index = yb_get_baserel_primary_index(baserel);
+
+			result_width =
+				yb_get_ybctid_width(baserel_oid, baserel, primary_index,
+									true /* is_primary_index */ );
+		}
+	}
+
+	return result_width;
+}
+
+/*
+ * yb_get_roundtrip_transfer_costs
+ *
+ * 	Returns the round trip and transfer costs for the given tablespace.
+ *  We get the "distance" of the tablespace from the local zone and use that
+ *  to determine the round trip and transfer costs.
+ */
+void
+yb_get_roundtrip_transfer_costs(Oid tablespace_id,
+								Cost *roundtrip_cost,
+								Cost *transfer_cost)
+{
+	Assert(IsYugaByteEnabled());
+
+	if (!yb_enable_geolocation_costing)
+	{
+		*roundtrip_cost = yb_local_roundtrip_cost;
+		*transfer_cost = yb_local_transfer_cost;
+	}
+	else
+	{
+		YbGeolocationDistance distance = get_geolocation_distance(tablespace_id);
+
+		switch (distance)
+		{
+			case UNKNOWN_DISTANCE:
+				yb_switch_fallthrough();
+			case ZONE_LOCAL:
+				*roundtrip_cost = yb_local_roundtrip_cost;
+				*transfer_cost = yb_local_transfer_cost;
+				break;
+			case REGION_LOCAL:
+				*roundtrip_cost = yb_inter_zone_roundtrip_cost;
+				*transfer_cost = yb_inter_zone_transfer_cost;
+				break;
+			case CLOUD_LOCAL:
+				yb_switch_fallthrough();
+			case INTER_CLOUD:
+				*roundtrip_cost = yb_inter_region_roundtrip_cost;
+				*transfer_cost = yb_inter_region_transfer_cost;
+				break;
+		}
+	}
+
+	return;
+}
+
+static void
+yb_add_remote_filter_cost(PlannerInfo *root,
+						  List *filters,
+						  Cardinality num_tuples,
+						  Cost *startup_cost,
+						  Cost *run_cost)
+{
+	QualCost	qual_cost;
+	Cost		per_tuple_qual_cost;
+
+	cost_qual_eval(&qual_cost, filters, root);
+	per_tuple_qual_cost = (qual_cost.per_tuple +
+						   (yb_docdb_remote_filter_overhead_cycles *
+							cpu_operator_cost));
+
+	*startup_cost += qual_cost.startup;
+	*run_cost += per_tuple_qual_cost * num_tuples;
+}
+
+/*
+ * yb_cost_seqscan
+ *		Determines and returns the cost of scanning a relation sequentially.
+ *		This is simlar to cost_seqscan function but tailored for YB.
+ *
+ * 'baserel' is the relation to be scanned
+ * 'param_info' is the ParamPathInfo if this is a parameterized path, else NULL
+ *
+ * TODO(#20955) : Aggregate pushdown to DocDB is not modeled. We should detect
+ * if aggregate functions are being pushed down, in which case we need not
+ * transfer rows from DocDB to pggate.
+ */
+void
+yb_cost_seqscan(Path *path, PlannerInfo *root, RelOptInfo *baserel,
+				ParamPathInfo *param_info)
+{
+	Cost		startup_cost = 0;
+	Cost		run_cost = 0;
+	int32		tuple_width = 0;
+	Oid			reloid = planner_rt_fetch(baserel->relid, root)->relid;
+	Cardinality	num_blocks;
+	QualCost	qual_cost;
+
+	/* TODO: Plug here the actual number of key-value pairs per tuple */
+	int			num_key_value_pairs_per_tuple = YB_DEFAULT_NUM_KEY_VALUE_PAIRS_PER_TUPLE;
+
+	/* TODO: Plug here the actual number of SST files for this index */
+	int			num_sst_files = YB_DEFAULT_NUM_SST_FILES_PER_TABLE;
+	Cost		per_merge_cost = 0.0;
+	Cost		per_seek_cost = 0.0;
+	Cost		per_next_cost = 0.0;
+	Cost		result_transfer_cost = 0.0;
+	List	   *pushed_down_clauses = NIL;
+	List	   *local_clauses = NIL;
+	ListCell   *lc;
+	Cardinality	remote_filtered_rows;
+	Cardinality	num_result_pages;
+	Cardinality	num_nexts;
+	Cardinality	num_seeks;
+	int32		docdb_result_width;
+	Cardinality	adjusted_baserel_tuples = baserel->tuples;
+	Cost		roundtrip_cost;
+	Cost		transfer_cost;
+
+	/* Fetch required info about the relation */
+	Relation	relation = relation_open(reloid, NoLock);
+	Oid			tablespace_id = relation->rd_rel->reltablespace;
+
+	RelationClose(relation);
+
+	/* Mark the path with the correct row estimate */
+	if (param_info)
+		path->rows = param_info->ppi_rows;
+	else
+		path->rows = baserel->rows;
+
+	if (!enable_seqscan)
+	{
+		startup_cost += disable_cost;
+	}
+
+	/* DocDB costs */
+	/* Compute tuple width */
+	tuple_width = yb_get_relation_data_width(baserel, reloid);
+
+	/* Block fetch cost from disk */
+	num_blocks = ceil(baserel->tuples * tuple_width / YB_DEFAULT_DOCDB_BLOCK_SIZE);
+	startup_cost += yb_seq_block_cost;
+	run_cost += (num_blocks - 1) * yb_seq_block_cost;
+
+	/* DocDB costs for merging key-value pairs to form tuples */
+	per_merge_cost = (num_key_value_pairs_per_tuple *
+					  yb_docdb_merge_cpu_cycles *
+					  cpu_operator_cost);
+
+	/* Seek to first key cost */
+	if (baserel->tuples > 0)
+	{
+		per_seek_cost = (yb_get_lsm_seek_cost(baserel->tuples,
+											  num_key_value_pairs_per_tuple,
+											  num_sst_files) +
+						 per_merge_cost);
+	}
+
+	/* Next for remaining keys */
+	per_next_cost = ((yb_docdb_next_cpu_cycles * cpu_operator_cost) +
+					 per_merge_cost);
+
+	/* Identify pushed down clauses */
+	foreach(lc, baserel->baserestrictinfo)
+	{
+		RestrictInfo *ri = lfirst_node(RestrictInfo, lc);
+
+		if (ri->yb_pushable)
+			pushed_down_clauses = lappend(pushed_down_clauses, ri);
+		else
+			local_clauses = lappend(local_clauses, ri);
+	}
+
+	remote_filtered_rows =
+		clamp_row_est(baserel->tuples *
+					  clauselist_selectivity(root, pushed_down_clauses,
+											 baserel->relid, JOIN_INNER, NULL));
+
+	docdb_result_width = yb_get_docdb_result_width(path, root,
+												   false,	/* is_index_path */
+												   false,	/* is_primary_index */
+												   false,	/* is_index_only */
+												   NIL, /* index_conditions */
+												   local_clauses,
+												   baserel, reloid);
+
+	yb_get_roundtrip_transfer_costs(tablespace_id,
+									&roundtrip_cost,
+									&transfer_cost);
+
+	/* Adjust costing for parallelism, if used. */
+	if (path->parallel_workers > 0)
+	{
+		double		parallel_divisor = get_parallel_divisor(path);
+
+		num_result_pages = ceil(baserel->tuples * tuple_width /
+								(double) yb_parallel_range_size /
+								parallel_divisor);
+
+		remote_filtered_rows = clamp_row_est(remote_filtered_rows /
+											 parallel_divisor);
+
+		adjusted_baserel_tuples = clamp_row_est(baserel->tuples /
+												parallel_divisor);
+
+		path->rows = clamp_row_est(path->rows / parallel_divisor);
+	}
+	else
+		yb_get_pagination_metrics(remote_filtered_rows, docdb_result_width,
+								  &num_result_pages, NULL);
+
+	num_seeks = num_result_pages;
+	num_nexts = (num_result_pages - 1) + (adjusted_baserel_tuples - 1);
+
+	/* Add cost of first seek to startup cost */
+	startup_cost += per_seek_cost;
+	run_cost += (num_seeks - 1) * per_seek_cost;
+	run_cost += num_nexts * per_next_cost;
+
+	result_transfer_cost = yb_data_transfer_cost(num_result_pages,
+												 remote_filtered_rows *
+												 docdb_result_width,
+												 roundtrip_cost,
+												 transfer_cost);
+
+	/* Network roundtrip cost is added to startup cost */
+	startup_cost += roundtrip_cost;
+	run_cost += result_transfer_cost - roundtrip_cost;
+
+	yb_add_remote_filter_cost(root, pushed_down_clauses,
+							  adjusted_baserel_tuples,
+							  &startup_cost, &run_cost);
+
+	/* tlist eval costs are paid per output row, not per tuple scanned */
+	startup_cost += path->pathtarget->cost.startup;
+	run_cost += path->pathtarget->cost.per_tuple * path->rows;
+
+	path->yb_plan_info.estimated_docdb_result_width = docdb_result_width;
+	path->yb_plan_info.estimated_num_seeks = num_seeks;
+	path->yb_plan_info.estimated_num_nexts_prevs = num_nexts;
+	path->yb_plan_info.estimated_num_table_result_pages = num_result_pages;
+	path->yb_plan_info.estimated_num_index_result_pages = 0;
+	path->yb_plan_info.estimated_num_bmscan_nexts_prevs = 0;
+	path->yb_plan_info.estimated_num_bmscan_seeks = 0;
+	path->yb_plan_info.estimated_num_bmscan_result_pages = 0;
+
+	/* Local filter costs */
+	cost_qual_eval(&qual_cost, local_clauses, root);
+	startup_cost += qual_cost.startup;
+	run_cost += qual_cost.per_tuple * remote_filtered_rows;
+	path->startup_cost = startup_cost;
+	path->total_cost = startup_cost + run_cost;
+}
+
+/*
+ * yb_get_index_tuple_width
+ *		Returns the tuple width of the index.
+ *
+ * In case of primary index, this function will return the width of the baserel
+ * since the primary index is the same as the base table in YB. For a secondary
+ * index it will aggregate the width of the columns used.
+ */
+static int32
+yb_get_index_tuple_width(IndexOptInfo *index, Oid baserel_oid,
+						 bool is_primary_index)
+{
+	int32		index_tuple_width = 0;
+	int32		baserel_tuple_width = yb_get_relation_data_width(index->rel,
+																 baserel_oid);
+
+	if (is_primary_index)
+	{
+		/* Primary index is same as the baserel */
+		index_tuple_width = baserel_tuple_width;
+	}
+	else
+	{
+		/* Aggregate the width of the columns in the secondary index */
+		for (int i = 0; i < index->ncolumns; i++)
+		{
+			index_tuple_width +=
+				index->rel->attr_widths[index->indexkeys[i] - index->rel->min_attr];
+		}
+		index_tuple_width += HIDDEN_COLUMNS_SIZE;
+	}
+	return index_tuple_width;
+}
+
+static bool
+yb_exist_conditions_on_all_hash_keys(IndexOptInfo *index,
+									 List **index_conditions_on_each_column)
+{
+	for (int index_col = 0; index_col < index->nhashcolumns; ++index_col)
+	{
+		if (index_conditions_on_each_column[index_col] == NIL)
+			return false;
+	}
+	return true;
+}
+
+
+/*
+ * Analyze the conditions on the current column, and identify the type of
+ * strictest condition. Equality is the strictest, followed by IN
+ * expression and inequality conditions.
+ *
+ * When more than one index conditions exist on a key, only the strictest
+ * condition is used for looking up the index, and the other conditions is
+ * applied as a filter. This decision is taken later down the line in
+ * `YbBindScanKeys` function.
+ *
+ * TODO(#20724) : Currently the cost model does not realize that other
+ * conditions are applied as filters and does not account for the cost of
+ * applying these conditions as filters.
+ *
+ * This logic can be reused to identify non-strictest index conditions, and use
+ * them as filters instead. The decision should also be propagated forward to
+ * pggate to remove duplicate logic from `YbBindScanKeys`.
+ */
+static void
+yb_analyze_conditions_on_current_column(PlannerInfo *root,
+										RelOptInfo *baserel,
+										IndexOptInfo *index,
+										int index_col,
+										List *index_conditions,
+										YbIndexCondTypes *strictest_condition_type,
+										int *strictest_in_expr_array_length)
+{
+	/* Check if exist equality or IN conditions on the index column */
+	bool		in_expr = false;
+	bool		equality_expr = false;
+	bool		lower_bound_inequality_expr = false;
+	bool		upper_bound_inequality_expr = false;
+	ListCell   *lc;
+
+	*strictest_in_expr_array_length = INT_MAX;
+
+	foreach(lc, index_conditions)
+	{
+		RestrictInfo *rinfo = lfirst_node(RestrictInfo, lc);
+		Expr	   *clause = rinfo->clause;
+		Oid			clause_op = InvalidOid;
+		Node	   *other_operand = NULL;
+
+		if (IsA(clause, OpExpr))
+		{
+			OpExpr	   *op = (OpExpr *) clause;
+
+			clause_op = op->opno;
+			int			op_strategy;
+
+			op_strategy = get_op_opfamily_strategy(clause_op,
+												   index->opfamily[index_col]);
+
+			other_operand = get_rightop(clause);
+			if (op_strategy == BTEqualStrategyNumber)
+			{
+				if (IsA(other_operand, YbBatchedExpr))
+				{
+					in_expr = true;
+
+					int			in_expr_array_length;
+
+					in_expr_array_length = yb_batch_expr_size(root,
+															  baserel->relid,
+															  other_operand);
+
+					if (*strictest_in_expr_array_length > in_expr_array_length)
+					{
+						*strictest_in_expr_array_length = in_expr_array_length;
+					}
+				}
+				else
+				{
+					equality_expr = true;
+
+					/*
+					 * Strictest form of condition, so no need to check
+					 * further
+					 */
+					break;
+				}
+			}
+			else if (op_strategy == BTLessEqualStrategyNumber ||
+					 op_strategy == BTLessStrategyNumber)
+			{
+				upper_bound_inequality_expr = true;
+			}
+
+			else if (op_strategy == BTGreaterEqualStrategyNumber ||
+					 op_strategy == BTGreaterStrategyNumber)
+			{
+				lower_bound_inequality_expr = true;
+			}
+		}
+		else if (IsA(clause, RowCompareExpr))
+		{
+			equality_expr = true;
+			/* Strictest form of condition, so no need to check further */
+			break;
+		}
+		else if (IsA(clause, ScalarArrayOpExpr))
+		{
+			in_expr = true;
+			ScalarArrayOpExpr *saop = (ScalarArrayOpExpr *) clause;
+
+			clause_op = saop->opno;
+			other_operand = (Node *) lsecond(saop->args);
+
+			int			in_expr_array_length;
+
+			in_expr_array_length = estimate_array_length(other_operand);
+			if (*strictest_in_expr_array_length > in_expr_array_length)
+			{
+				*strictest_in_expr_array_length = in_expr_array_length;
+			}
+		}
+		else if (IsA(clause, NullTest))
+		{
+			equality_expr = true;
+			/* Strictest form of condition, so no need to check further */
+			break;
+		}
+		else
+			elog(ERROR, "unsupported indexqual type: %d",
+				 (int) nodeTag(clause));
+	}
+
+	*strictest_condition_type = 0;
+	if (equality_expr)
+	{
+		*strictest_condition_type |= EQUALITY_EXPR;
+	}
+	else if (in_expr)
+	{
+		*strictest_condition_type |= IN_EXPR;
+	}
+	else if (lower_bound_inequality_expr || upper_bound_inequality_expr)
+	{
+		/* Inequality conditions */
+		if (lower_bound_inequality_expr)
+		{
+			*strictest_condition_type |= LOWER_BOUND_INEQUALITY_EXPR;
+		}
+		if (upper_bound_inequality_expr)
+		{
+			*strictest_condition_type |= UPPER_BOUND_INEQUALITY_EXPR;
+		}
+	}
+	else
+	{
+		/* No conditions */
+		*strictest_condition_type |= NO_CONDITIONS;
+	}
+}
+
+static void
+yb_estimate_seeks_nexts_in_index_scan(PlannerInfo *root,
+									  IndexOptInfo *index,
+									  RelOptInfo *baserel,
+									  Oid baserel_oid,
+									  Selectivity index_conditions_selectivity,
+									  List **index_conditions_on_each_column,
+									  Cardinality *num_seeks,
+									  Cardinality *num_nexts)
+{
+	Cardinality *num_groups_of_index_key_prefixes;
+	List	   *index_key_list = NIL;
+
+	Assert(*num_seeks == 0);
+	Assert(*num_nexts == 0);
+
+	/*
+	 * Compute the distinct count of each group of prefix keys in the index,
+	 * eg. (k1), (k1, k2), (k1, k2, k3).
+	 */
+	num_groups_of_index_key_prefixes = palloc(sizeof(double) * index->nkeycolumns);
+	for (int index_col = 0; index_col < index->nkeycolumns; ++index_col)
+	{
+		index_key_list = lappend
+			(index_key_list,
+			 ((TargetEntry *) lfirst(list_nth_cell(index->indextlist, index_col)))->expr);
+		num_groups_of_index_key_prefixes[index_col] =
+			yb_estimate_num_groups(root, index_key_list, index->tuples, NULL, NULL);
+	}
+
+	/*
+	 * The idea is to start from the last index key, and compute the number of
+	 * seeks and nexts needed for each unique combination of keys preceding the
+	 * current key.
+	 *
+	 * Consider an index with keys (k1, k2, k3, k4),
+	 * * We iterate on the keys backwards, starting from the last key, k4.
+	 *
+	 * * For k4, we first estimate the selectivity of all conditions on all
+	 *   keys, and divide that by the distinct count of the group of preceding
+	 *   keys (k1, k2, k3). This gives us the number of result rows for each
+	 *   unique combination of (k1, k2, k3). This will be used to compute the
+	 *   number of nexts needed for each unique combination of (k1, k2, k3).
+	 *
+	 *   Next, we analyze the conditions on k4 and compute the number of
+	 *   seeks and nexts needed to apply these conditions. For example, if an
+	 *   index  condition like k4 >= 5 exists, we must seek to k4 = 5, this is
+	 *   called a seek-in. If another index condition like k4 < 10 exists, we
+	 *   can do nexts until k4=10 and then we must seek to the last value of k4.
+	 *   This is called a seek-out. Various types of conditions may require
+	 *   different number of seeks and nexts.
+	 *
+	 * * Moving onto k3, we will estimate the unique values of k3 for each
+	 *   unique combination of (k1, k2). We multiply the seeks and nexts
+	 *   calculated so far by this number. To this number, we add seeks and
+	 *   nexts needed to apply the index conditions on k3. If there are no
+	 *   conditions on k3, we don't need to add additional seeks and nexts.
+	 *
+	 * Note: We currently assume that seek-forward optimization does not yield
+	 * any benefit. This is because we do not have a way to estimate the number
+	 * of rows that will be skipped by seek-forward optimization.
+	 */
+
+	/*
+	 * Iterate in reverse on the keys in the index.
+	 */
+	YbIndexCondTypes previous_column_strictest_cond_type = NO_CONDITIONS;
+
+	for (int index_col = index->nkeycolumns - 1; index_col >= 0; --index_col)
+	{
+		YbIndexCondTypes current_column_strictest_cond_type = 0;
+		int			strictest_in_expr_array_length;
+
+		yb_analyze_conditions_on_current_column(root, baserel, index,
+												index_col,
+												index_conditions_on_each_column[index_col],
+												&current_column_strictest_cond_type,
+												&strictest_in_expr_array_length);
+
+		Selectivity selectivity_current_key_conds;
+
+		selectivity_current_key_conds =
+			clauselist_selectivity(root,
+								   index_conditions_on_each_column[index_col],
+								   baserel->relid, JOIN_INNER, NULL);
+
+		if (index_col == index->nkeycolumns - 1)
+		{
+			/*
+			 * out_rows_per_prefix_key_group will contain the number of
+			 * rows that match the conditions on the keys preceding the current
+			 * key, including the current key, divided by the distinct count
+			 * of the group of preceding keys.
+			 */
+			Cardinality	out_rows_per_prefix_key_group;
+
+			if (index_col > 0)
+			{
+				out_rows_per_prefix_key_group =
+					clamp_row_est(index->tuples * selectivity_current_key_conds /
+								  num_groups_of_index_key_prefixes[index_col - 1]);
+			}
+			else
+			{
+				/*
+				 * Only one key in the index.
+				 */
+				out_rows_per_prefix_key_group =
+					clamp_row_est(index->tuples * selectivity_current_key_conds);
+			}
+
+			if (current_column_strictest_cond_type & IN_EXPR)
+			{
+				/*
+				 * We assume that a seek will be needed for each value in the
+				 * IN array and seek-forward optimization will not help. However
+				 * we cap the number of seeks by the number of unique values
+				 * of current key for each group of prefix keys. Otherwise we
+				 * may absurdbly over-estimate seeks for IN filters.
+				 */
+				if (index_col > 0)
+				{
+					Cardinality	num_unique_values_per_prefix_group =
+						num_groups_of_index_key_prefixes[index_col] /
+						num_groups_of_index_key_prefixes[index_col - 1];
+
+					if (num_unique_values_per_prefix_group <
+						strictest_in_expr_array_length)
+					{
+						*num_seeks += num_unique_values_per_prefix_group;
+						*num_nexts += MAX_NEXTS_TO_AVOID_SEEK *
+							num_unique_values_per_prefix_group;
+					}
+					else
+					{
+						*num_seeks += strictest_in_expr_array_length;
+						*num_nexts += MAX_NEXTS_TO_AVOID_SEEK *
+							strictest_in_expr_array_length;
+					}
+				}
+				else
+				{
+					*num_seeks += strictest_in_expr_array_length;
+					*num_nexts += MAX_NEXTS_TO_AVOID_SEEK *
+						strictest_in_expr_array_length;
+				}
+
+				/*
+				 * A filter like `k in (1, 2, 3, 4)` may result in more rows
+				 * than the number of values in the IN list. The number of
+				 * results this filter will select is estimated in
+				 * `out_rows_per_prefix_key_group`. We must estimate additional
+				 * nexts for these rows.
+				 */
+				if (out_rows_per_prefix_key_group >
+					strictest_in_expr_array_length)
+				{
+					*num_nexts += out_rows_per_prefix_key_group -
+						strictest_in_expr_array_length;
+				}
+			}
+			else if (current_column_strictest_cond_type &
+					 (EQUALITY_EXPR | LOWER_BOUND_INEQUALITY_EXPR))
+			{
+				/*
+				 * One seek needed to find the first value that matches. Nexts
+				 * for subsequent matches.
+				 */
+				++(*num_seeks);
+				*num_nexts += MAX_NEXTS_TO_AVOID_SEEK;
+				*num_nexts += out_rows_per_prefix_key_group - 1;
+			}
+			else
+			{
+				/* No conditions or only UPPER_BOUND_INEQUALITY_EXPR */
+				Assert(current_column_strictest_cond_type &
+					   (NO_CONDITIONS | UPPER_BOUND_INEQUALITY_EXPR));
+
+				/* No seeks needed, only nexts. */
+				*num_nexts += out_rows_per_prefix_key_group;
+			}
+		}
+		else
+		{
+			/*
+			 * num_unique_values_per_prefix_key_group will contain the number
+			 * of unique values of current key that match the condition on the
+			 * current key, divided by the distinct count of the group of
+			 * preceding keys. This gives us the number unique values of
+			 * current key, for each unique group of preceding keys.
+			 *
+			 */
+			Cardinality	num_unique_values_per_prefix_key_group;
+
+			if (index_col > 0)
+			{
+				num_unique_values_per_prefix_key_group =
+					clamp_row_est(selectivity_current_key_conds *
+								  num_groups_of_index_key_prefixes[index_col] /
+								  num_groups_of_index_key_prefixes[index_col - 1]);
+			}
+			else
+			{
+				num_unique_values_per_prefix_key_group =
+					clamp_row_est(selectivity_current_key_conds *
+								  yb_get_attdistinctcount(baserel_oid,
+														  index->indexkeys[0]));
+			}
+
+			if ((current_column_strictest_cond_type &
+				 (LOWER_BOUND_INEQUALITY_EXPR |
+				  UPPER_BOUND_INEQUALITY_EXPR |
+				  NO_CONDITIONS)) &&
+				(previous_column_strictest_cond_type &
+				 (UPPER_BOUND_INEQUALITY_EXPR |
+				  IN_EXPR |
+				  EQUALITY_EXPR)))
+			{
+				/*
+				 * In some cases, we must add an additional seek.
+				 *
+				 * eg. Assume a table T with index keys k1, k2, k3, k4. Assume
+				 * a query, SELECT * FROM T WHERE k3 < 10.
+				 * For each value of k2, after reaching k3 = 10, we would
+				 * have to seek to the (k1, k2, +inf) to get to the next value
+				 * of k2. This seek is refered to as a seek-out.
+				 *
+				 * Remember, we are iterating backwards on the index keys. A
+				 * seek-out is needed if the current key has an inequality
+				 * condition or no conditions. In these cases, we do not know
+				 * the next value of the current key. However, a seek-out is
+				 * only needed if the previous column had an equality
+				 * condition, an in condition of an upper bound inequality
+				 * condition. In these cases, we did not need to scan all the
+				 * values of the previous key.
+				 *
+				 * We add one seek and nexts due to the seek-forward
+				 * optimization, which we assume would not help in this
+				 * scenario.
+				 */
+				*num_seeks += 1;
+				*num_nexts += MAX_NEXTS_TO_AVOID_SEEK;
+			}
+
+			/*
+			 * For each unique value of current key, we will repeat the seeks
+			 * and nexts we have estimated for the keys we've iterated over so
+			 * far.
+			 */
+			*num_seeks *= num_unique_values_per_prefix_key_group;
+			*num_nexts *= num_unique_values_per_prefix_key_group;
+
+			if (!(previous_column_strictest_cond_type &
+				  (IN_EXPR |
+				   EQUALITY_EXPR |
+				   LOWER_BOUND_INEQUALITY_EXPR)))
+			{
+				/*
+				 * If the current column has a condition with a lower bound, we
+				 * may need to add seeks. However, this won't be needed if the
+				 * previous key also had a condition with a lower bound because
+				 * we have already counted seeks and won't need another one.
+				 *
+				 * For example, SELECT * FROM T WHERE k2 = 5 and k3 = 10.
+				 *
+				 * When iterating over k3, k4 had no condition and so we
+				 * counted one seek for to k3 = 10 for each unique combination
+				 * of (k1, k2).
+				 *
+				 * Now when counting seeks for k2, we need not add additional
+				 * seek for k2 = 5 for each value of k1, because we can
+				 * directly seek to k2 = 5 and k3 = 10.
+				 */
+				if (current_column_strictest_cond_type & IN_EXPR)
+				{
+					*num_seeks += strictest_in_expr_array_length;
+					*num_nexts += MAX_NEXTS_TO_AVOID_SEEK *
+						strictest_in_expr_array_length;
+				}
+				else if (current_column_strictest_cond_type &
+						 (EQUALITY_EXPR |
+						  LOWER_BOUND_INEQUALITY_EXPR))
+				{
+					++(*num_seeks);
+					*num_nexts += MAX_NEXTS_TO_AVOID_SEEK;
+				}
+			}
+		}
+
+		previous_column_strictest_cond_type = current_column_strictest_cond_type;
+	}
+
+	if (*num_seeks == 0)
+	{
+		++(*num_seeks);
+	}
+
+	pfree(num_groups_of_index_key_prefixes);
+}
+
+static Bitmapset *
+yb_get_non_pushable_attnums(IndexOptInfo *index)
+{
+	Bitmapset  *non_pushable_attnums = NULL;
+	int			phys_natts = index->ncolumns - index->yb_num_decoded_pk_cols;
+
+		for (int i = phys_natts; i < index->ncolumns; i++)
+			non_pushable_attnums = bms_add_member(non_pushable_attnums,
+												  index->indexkeys[i]);
+	return non_pushable_attnums;
+}
+
+static Selectivity
+yb_bitmap_index_selectivity(IndexPath *path,
+							PlannerInfo *root,
+							List *qpquals,
+							Oid baserel_oid,
+							List *index_conds)
+{
+	IndexOptInfo *index = path->indexinfo;
+	List	   *filter_quals;
+	List	   *all_index_quals = NIL;
+	List	   *index_remote_quals = NIL;
+	Selectivity	sel;
+
+	if (path->yb_bitmap_idx_pushdowns)
+		filter_quals = path->yb_bitmap_idx_pushdowns;
+	else
+		filter_quals = qpquals;		/* single scan node bitmap plan */
+
+	if (filter_quals)
+	{
+		bool		index_only = (path->path.pathtype == T_IndexOnlyScan);
+		List	   *local_quals = NIL;
+		List	   *rel_remote_quals = NIL;
+		List	   *rel_colrefs = NIL;
+		List	   *index_colrefs = NIL;
+		Bitmapset  *non_pushable_attnums = NULL;
+
+		if (index_only && index->yb_num_decoded_pk_cols > 0)
+			non_pushable_attnums = yb_get_non_pushable_attnums(index);
+
+		yb_extract_pushdown_clauses(filter_quals,
+									index,
+									true,	/* bitmapindex */
+									&local_quals,
+									&rel_remote_quals,
+									&rel_colrefs,
+									&index_remote_quals,
+									&index_colrefs,
+									baserel_oid,
+									non_pushable_attnums);
+
+		bms_free(non_pushable_attnums);
+		list_free(local_quals);
+		list_free(rel_remote_quals);
+		list_free(rel_colrefs);
+		list_free(index_colrefs);
+	}
+
+	all_index_quals = list_concat(index_remote_quals, index_conds);
+
+	sel = clauselist_selectivity(root, all_index_quals,
+								 index->rel->relid, JOIN_INNER, NULL);
+
+	list_free(all_index_quals);
+
+	return sel;
+}
+
+static void
+yb_add_base_table_fetch_cost(Path *path,
+							 Cardinality tuples,
+							 Cardinality result_tuples,
+							 int32 docdb_result_width,
+							 Cost per_seek_cost,
+							 Cost per_next_cost,
+							 Oid tablespace_id,
+							 Cardinality *num_seeks,
+							 Cardinality *num_nexts_prevs,
+							 Cost *startup_cost,
+							 Cost *run_cost,
+							 Cardinality *result_pages)
+{
+	Cost		per_roundtrip_cost;
+	Cost		per_mb_transfer_cost;
+	Cost		result_transfer_cost;
+
+	/* Base table lookup cost */
+	*num_seeks += tuples;
+	*num_nexts_prevs += tuples;
+
+	/* Add cost of first seek to startup cost */
+	*startup_cost += per_seek_cost;
+	*run_cost += (tuples - 1) * per_seek_cost;
+	*run_cost += tuples * per_next_cost;
+
+	/* Result transfer cost */
+	yb_get_roundtrip_transfer_costs(tablespace_id,
+									&per_roundtrip_cost,
+									&per_mb_transfer_cost);
+
+	/* Adjust costing for parallelism, if used. */
+	if (path->parallel_workers > 0)
+		*result_pages = ceil(result_tuples * docdb_result_width /
+							 yb_parallel_range_size);
+	else
+		yb_get_pagination_metrics(result_tuples, docdb_result_width,
+								  result_pages, NULL);
+
+	result_transfer_cost = yb_data_transfer_cost(*result_pages,
+												 (result_tuples *
+												  docdb_result_width),
+												 per_roundtrip_cost,
+												 per_mb_transfer_cost);
+
+	/* Network roundtrip cost is added to startup cost */
+	*startup_cost += per_roundtrip_cost;
+	*run_cost += result_transfer_cost - per_roundtrip_cost;
+
+	*num_seeks += *result_pages - 1;
+	*run_cost += (*result_pages - 1) * per_seek_cost;
+}
+
+/*
+ * yb_cost_index
+ *		Determines and returns the cost of scanning a relation using an index.
+ *		This is simlar to cost_index function but tailored for YB.
+ *
+ * 'path' describes the indexscan under consideration, and is complete
+ *		except for the fields to be set by this routine
+ * 'loop_count' is the number of repetitions of the indexscan to factor into
+ *		estimates of caching behavior.
+ *
+ * In addition to rows, startup_cost and total_cost, yb_cost_index() sets the
+ * path's indextotalcost and indexselectivity fields, and yb_plan_info's
+ * estimated_num_bmscan_* fields.  These values will be needed if the IndexPath
+ * is used in a BitmapIndexScan.
+ *
+ * NOTE: path->indexquals must contain only clauses usable as index
+ * restrictions.  Any additional quals evaluated as qpquals may reduce the
+ * number of returned tuples, but they won't reduce the number of tuples
+ * we have to fetch from the table, so they don't reduce the scan cost.
+ *
+ * YB specific cost components:
+ *								PK	Non-PK	  Non-PK  Index-  Bitmap
+ *									non-colo  colo	  Only	  Scan
+ * =================================================================
+ * (a) index SST file reads			   o		o		o	  Non-PK
+ * (b) index seeks/nexts		 o	   o		o		o		o
+ * (c) ybctid xfer					   o						o
+ * (d) table SST file reads		 o	   o		o				PK
+ * (e) base table seeks/nexts		   o		o
+ * (f) result xfer				 o	   o		o		o
+ *
+ *	 - YB PK storage is the base table itself.	No separate base table fetch
+ *	   step involved in IndexScan path using PK.  No (a), (c) and (e).
+ *	 - Colocated non-PK IndexScan doesn't transfer the ybctids back and forth
+ *	   between DocDB and PG.  No (c).
+ *	 - An IndexScan path represents both IndexScan and BitmapIndexScan
+ *	   execution nodes.	 (See "NOTE" bove.)	 In a bitmap plan, ybctids from
+ *	   multiple BitmapIndexScan nodes are combined together then YbBitmapTableScan
+ *	   fetches corresponding base table rows.  The cost of base table access is
+ *	   computed by `yb_cost_bitmap_table_scan`.
+ *
+ * TODO(#20955) : Aggregate pushdown to DocDB is not modeled. We should detect
+ * if aggregate functions are being pushed down, in which case we need not
+ * transfer rows from DocDB to pggate.
+ */
+void
+yb_cost_index(IndexPath *path, PlannerInfo *root, double loop_count,
+			  bool partial_path)
+{
+	IndexOptInfo *index = path->indexinfo;
+	bool		is_primary_index;
+	Oid			index_tablespace_id = index->reltablespace;
+
+	if (index->hypothetical)
+	{
+		is_primary_index = false;
+	}
+	else
+	{
+		Relation	index_rel = RelationIdGetRelation(index->indexoid);
+
+		is_primary_index = index_rel->rd_index->indisprimary;
+		RelationClose(index_rel);
+	}
+	RelOptInfo *baserel = index->rel;
+	bool		index_only = (path->path.pathtype == T_IndexOnlyScan);
+	List	   *qpquals;
+	Cost		startup_cost = 0;
+	Cost		run_cost = 0;
+	Selectivity index_conditions_selectivity;
+	Selectivity index_selectivity;
+	Selectivity all_conditions_and_remote_filters_selectivity;
+	Cardinality	num_index_tuples_matched;
+	List	   *index_conditions;
+	int			index_col;
+	ListCell   *lc;
+	RangeTblEntry *rte;
+	Oid			baserel_oid;
+	int32		index_tuple_width;
+
+	/* TODO: Plug here the actual number of key-value pairs per tuple */
+	int			num_key_value_pairs_per_tuple = YB_DEFAULT_NUM_KEY_VALUE_PAIRS_PER_TUPLE;
+
+	/* TODO: Plug here the actual number of SST files for this index */
+	int			num_sst_files = YB_DEFAULT_NUM_SST_FILES_PER_TABLE;
+	Cost		per_merge_cost;
+	Cost		index_per_seek_cost;
+	Cost		baserel_per_seek_cost;
+
+	/* TODO: Plug here the actual number of key-value pairs per tuple */
+	int			num_key_value_pairs_per_tuple_baserel = YB_DEFAULT_NUM_KEY_VALUE_PAIRS_PER_TUPLE;
+
+	/* TODO: Plug here the actual number of SST files for this index */
+	int			num_sst_files_baserel = YB_DEFAULT_NUM_SST_FILES_PER_TABLE;
+	Cost		per_next_cost;
+	QualCost	qual_cost;
+	List	   *base_table_pushed_down_filters = NIL;
+	List	   *base_table_colrefs = NIL;
+	List	   *index_pushed_down_filters = NIL;
+	List	   *index_colrefs = NIL;
+	List	   *local_clauses = NIL;
+	Cardinality	index_total_pages;
+	Cardinality	index_pages_fetched;
+	Cardinality	index_random_pages_fetched;
+	Cardinality	index_sequential_pages_fetched;
+	List	  **index_conditions_on_each_column;
+	int32		baserel_tuple_width = 0;
+	int32		docdb_result_width;
+	int32		ybctid_width;
+	bool		baserel_is_colocated;
+	bool		need_remote_index_filters;
+	double		parallel_divisor = 1.0;
+	Cost		index_roundtrip_cost;
+	Cost		index_transfer_cost;
+
+	/* Should only be applied to base relations */
+	Assert(IsA(baserel, RelOptInfo) && IsA(index, IndexOptInfo));
+	Assert(baserel->relid > 0);
+	Assert(baserel->rtekind == RTE_RELATION);
+
+	yb_get_roundtrip_transfer_costs(index_tablespace_id,
+									&index_roundtrip_cost,
+									&index_transfer_cost);
+
+	rte = planner_rt_fetch(baserel->relid, root);
+	Assert(rte->rtekind == RTE_RELATION);
+	baserel_oid = rte->relid;
+	baserel_is_colocated = YbGetTablePropertiesById(baserel_oid)->is_colocated;
+
+	if (partial_path)
+	{
+		if (baserel->is_yb_relation)
+		{
+			Oid			rel_oid = ((is_primary_index || index->hypothetical) ?
+								   baserel_oid :
+								   path->indexinfo->indexoid);
+
+			path->path.parallel_workers =
+				yb_compute_parallel_worker(baserel,
+										   YbGetTableDistributionById(rel_oid),
+										   max_parallel_workers_per_gather);
+		}
+		else
+			path->path.parallel_workers =
+				compute_parallel_worker(baserel, -1, -1,
+										max_parallel_workers_per_gather);
+
+		/*
+		 * Fall out if workers can't be assigned for parallel scan, because in
+		 * such a case this path will be rejected.  So there is no benefit in
+		 * doing extra computation.
+		 */
+		if (path->path.parallel_workers <= 0)
+			return;
+
+		path->path.parallel_aware = true;
+	}
+
+	/*
+	 * Extract non-index conditions ie. filters.
+	 *
+	 * We need not check any quals that are implied by the index's predicate,
+	 * so we can use indrestrictinfo not baserestrictinfo as the list of
+	 * relevant restriction clauses for the rel.
+	 */
+	if (path->path.param_info)
+	{
+		path->path.rows = path->path.param_info->ppi_rows;
+		/* qpquals come from the rel's restriction clauses and ppi_clauses */
+		qpquals =
+			list_concat(extract_nonindex_conditions(path->indexinfo->indrestrictinfo,
+													path->indexclauses),
+						extract_nonindex_conditions(path->path.param_info->ppi_clauses,
+													path->indexclauses));
+	}
+	else
+	{
+		path->path.rows = baserel->rows;
+		/* qpquals come from just the rel's restriction clauses */
+		qpquals = extract_nonindex_conditions(path->indexinfo->indrestrictinfo,
+											  path->indexclauses);
+	}
+
+	/*
+	 * Sort the filters into `local_clauses`, `base_table_pushed_down_clauses`
+	 * and `index_pushed_down_clauses`.
+	 *
+	 * Remote index filters are needed for secondary index scans.
+	 * * In case of primary index scan and index only scan, we group all filters
+	 *   under `base_table_pushed_down_filters`.
+	 */
+	need_remote_index_filters =
+		!index_only && !index->hypothetical && !is_primary_index;
+
+	Bitmapset  *non_pushable_attnums = NULL;
+
+	if (index_only && index->yb_num_decoded_pk_cols > 0)
+		non_pushable_attnums = yb_get_non_pushable_attnums(index);
+
+	yb_extract_pushdown_clauses(qpquals,
+								need_remote_index_filters ? index : NULL,
+								false,	/* bitmapindex */
+								&local_clauses,
+								&base_table_pushed_down_filters,
+								&base_table_colrefs,
+								&index_pushed_down_filters,
+								&index_colrefs,
+								baserel_oid,
+								non_pushable_attnums);
+
+	bms_free(non_pushable_attnums);
+
+	/*
+	 * Sort the index conditions into `index_conditions_on_each_column`.
+	 */
+	index_conditions_on_each_column = palloc0(sizeof(List *) * index->nkeycolumns);
+	index_conditions = NIL;
+	index_col = 0;
+
+	foreach(lc, path->indexclauses)
+	{
+		IndexClause *iclause = lfirst_node(IndexClause, lc);
+		ListCell   *lc2;
+		int			index_qual_col = iclause->indexcol;
+
+		while (index_col != index_qual_col)
+		{
+			++index_col;
+			Assert(index_col < index->nkeycolumns);
+		}
+
+		foreach(lc2, iclause->indexquals)
+		{
+			RestrictInfo *rinfo = lfirst_node(RestrictInfo, lc2);
+
+			if (path->path.param_info)
+			{
+				Relids		batched = YB_PATH_REQ_OUTER_BATCHED(&path->path);
+				RestrictInfo *batched_rinfo;
+
+				batched_rinfo =
+					yb_get_batched_restrictinfo(rinfo, batched,
+												path->path.parent->relids);
+				if (batched_rinfo)
+					rinfo = batched_rinfo;
+			}
+			index_conditions_on_each_column[index_col] =
+				lappend(index_conditions_on_each_column[index_col], rinfo);
+			index_conditions = lappend(index_conditions, rinfo);
+		}
+	}
+
+	bool		yb_exist_conditions_on_all_hash_keys_;
+
+	yb_exist_conditions_on_all_hash_keys_ =
+		yb_exist_conditions_on_all_hash_keys(index,
+											 index_conditions_on_each_column);
+
+	if (list_length(index_conditions) > 0 && !yb_exist_conditions_on_all_hash_keys_)
+	{
+		/*
+		 * TODO (#22005) In Index scan of hash index, if filter on any hash key
+		 * is missing, then the index conditions do not get enforced on DocDB.
+		 */
+		list_free(index_conditions);
+		index_conditions = NIL;
+		for (int index_col = 0; index_col < index->nkeycolumns; ++index_col)
+		{
+			if (list_length(index_conditions_on_each_column[index_col]) > 0)
+			{
+				list_free(index_conditions_on_each_column[index_col]);
+				index_conditions_on_each_column[index_col] = NIL;
+			}
+		}
+	}
+
+	if (list_length(index_conditions) > 0)
+		index_conditions_selectivity =
+			clauselist_selectivity(root, index_conditions,
+								   baserel->relid, JOIN_INNER, NULL);
+	else
+		index_conditions_selectivity = 1.0;
+
+	/*
+	 * Estimate number of seeks and only the number of nexts caused by hybrid
+	 * scan.
+	 */
+	Cardinality	num_seeks = 0;
+	Cardinality	num_nexts_prevs = 0;
+
+	if (yb_exist_conditions_on_all_hash_keys_)
+	{
+		yb_estimate_seeks_nexts_in_index_scan(root, index, baserel, baserel_oid,
+											  index_conditions_selectivity,
+											  index_conditions_on_each_column,
+											  &num_seeks, &num_nexts_prevs);
+	}
+	else
+	{
+		/*
+		 * TODO (#22005) In Index scan of hash index, if filter on any hash key
+		 * is missing, then the index conditions do not get enforced on DocDB.
+		 *
+		 * In this case, we will do one seek to start of the index and nexts to
+		 * find the next keys.
+		 */
+		num_seeks = 1;
+		num_nexts_prevs = index->tuples;
+	}
+
+	if (path->indexscandir == BackwardScanDirection && !YbUseFastBackwardScan())
+	{
+		/*
+		 * In case of backward index scan without the fast backward scan
+		 * optimization, we need to do additional seeks and nexts.
+		 *
+		 * The seek and next estimates to look up the index for the index
+		 * conditions are the same, but for each row that matches, we must
+		 * first seek to the first key-value pair in DocDB and then do nexts
+		 * to build the tuple.
+		 *
+		 * However, for each tuple we must first seek to the first key-value
+		 * pair for the tuple and then do nexts to build the tuple. At the
+		 * end, we must seek back to the first key-value pair for the tuple
+		 * and do prev to find the last key-value pair of the previous
+		 * tuple. This is why we must add 2 seeks and 1 prev for each tuple.
+		 *
+		 * There is additional logic in this implementation that has not
+		 * been modeled here for the sake of simplicity.
+		 */
+		num_seeks += (index_conditions_selectivity * index->tuples * 2);
+		num_nexts_prevs += (index_conditions_selectivity * index->tuples);
+	}
+
+	pfree(index_conditions_on_each_column);
+
+	/*
+	 * Estimate the seek and next costs for the index.
+	 */
+	per_merge_cost = (num_key_value_pairs_per_tuple *
+					  yb_docdb_merge_cpu_cycles *
+					  cpu_operator_cost);
+
+	index_per_seek_cost = 0;
+	if (index->tuples > 0)
+	{
+		index_per_seek_cost = (yb_get_lsm_seek_cost(index->tuples,
+													num_key_value_pairs_per_tuple,
+													num_sst_files) +
+							   per_merge_cost);
+	}
+	baserel_per_seek_cost = 0;
+	if (baserel->tuples > 0)
+	{
+		baserel_per_seek_cost =
+			yb_get_lsm_seek_cost(baserel->tuples,
+								 num_key_value_pairs_per_tuple_baserel,
+								 num_sst_files_baserel) +
+			per_merge_cost;
+	}
+	per_next_cost = ((yb_docdb_next_cpu_cycles * cpu_operator_cost) +
+					 per_merge_cost);
+
+	/* Adjust costing for parallelism, if used. */
+	Cardinality	adjusted_index_tuples = index->tuples;
+
+	if (path->path.parallel_workers > 0)
+	{
+		parallel_divisor = get_parallel_divisor(&path->path);
+		adjusted_index_tuples = index->tuples / parallel_divisor;
+		num_seeks = ceil(num_seeks / parallel_divisor);
+		num_nexts_prevs = ceil(num_nexts_prevs / parallel_divisor);
+	}
+
+	/* Add cost of first seek to startup cost */
+	startup_cost += index_per_seek_cost;
+	run_cost += (num_seeks - 1) * index_per_seek_cost;
+	run_cost += num_nexts_prevs * per_next_cost;
+
+	/* Estimate the cost of evaulating the remote index filters. */
+	if (list_length(index_pushed_down_filters) > 0)
+	{
+		yb_add_remote_filter_cost(root, index_pushed_down_filters,
+								  clamp_row_est(index_conditions_selectivity *
+												adjusted_index_tuples),
+								  &startup_cost, &run_cost);
+	}
+
+	/*
+	 * The BitmapIndexScan costs dirverges from here as it returns ybctids to
+	 * pggate regardless of colocation whether PK or not.
+	 */
+	Cardinality	bmscan_num_seeks = num_seeks;
+	Cardinality	bmscan_num_nexts_prevs = num_nexts_prevs;
+	Cost		bmscan_total_cost = startup_cost + run_cost;
+
+	/*
+	 * Estimate number of index tuples that match the index conditions
+	 * and remote index filters.
+	 */
+	List	   *index_conditions_and_filters = NIL;
+
+	index_conditions_and_filters = list_concat(index_conditions_and_filters,
+											   list_copy(index_conditions));
+	if (need_remote_index_filters)
+	{
+		index_conditions_and_filters = list_concat(index_conditions_and_filters,
+												   list_copy(index_pushed_down_filters));
+	}
+	else
+	{
+		/* Either index only lookup, or primary index lookup */
+		index_conditions_and_filters = list_concat(index_conditions_and_filters,
+												   list_copy(base_table_pushed_down_filters));
+	}
+
+	if (list_length(index_conditions_and_filters) > 0)
+		index_selectivity =
+			clauselist_selectivity(root, index_conditions_and_filters,
+								   baserel->relid, JOIN_INNER, NULL);
+	else
+		index_selectivity = 1.0;
+
+	num_index_tuples_matched =
+		clamp_row_est(index_selectivity * adjusted_index_tuples);
+
+	/*
+	 * Estimate the selectivity of the final result. We already computed
+	 * selectivity of index conditions and filters above. But some filters
+	 * may be pushed down to the base table.
+	 */
+	List	   *all_conditions_and_remote_filters = NIL;
+
+	all_conditions_and_remote_filters =
+		list_concat_unique(all_conditions_and_remote_filters,
+						   list_copy(index_conditions_and_filters));
+	all_conditions_and_remote_filters =
+		list_concat_unique(all_conditions_and_remote_filters,
+						   list_copy(base_table_pushed_down_filters));
+
+	if (list_length(all_conditions_and_remote_filters) > 0)
+		all_conditions_and_remote_filters_selectivity =
+			clauselist_selectivity(root, all_conditions_and_remote_filters,
+								   baserel->relid, JOIN_INNER, NULL);
+	else
+		all_conditions_and_remote_filters_selectivity = 1.0;
+
+	/*
+	 * To compute the cardinality of the result here, we multiple the
+	 * selectivity with the number of tuples in the index, instead of the
+	 * number of tuples in the base table, because the index may be a
+	 * partial index. In this case, the predicate used for the partial index
+	 * is not included in the list of filters applied, but that filter is
+	 * implicitly applied through the partial index.
+	 *
+	 * If we multiply the selectivity with the number of tuples in base table,
+	 * we may not prefer the partial index anymore.
+	 */
+	Cardinality	num_baserel_result_rows;
+
+	num_baserel_result_rows =
+		clamp_row_est(adjusted_index_tuples *
+					  all_conditions_and_remote_filters_selectivity);
+
+	/*
+	 * Disk fetch cost.
+	 *
+	 * In YB, primary index is same as the base table, so we don't need to
+	 * estimate the cost of fetching the index from disk to memory. In case
+	 * of an index only scan, we don't need to estimate the cost of
+	 * fetching the base table from disk. However, in case of secondary
+	 * index scan, we will add the costs of fetching both the index and base
+	 * tables from the disk.
+	 *
+	 * Compute disk fetch costs. We make following assumptions.
+	 * 1. The number of index pages actually fetched is based on selectivity of
+	 *    the filter.
+	 * 2. Ratio of index pages fetched at random and in sequence is same as the
+	 *    ratio of seeks to nexts.
+	 * 3. `cost_index` uses `loop_count` for estimating the effect of caching
+	 *    when the index is rescanned. For now, we assume that tables
+	 *    need to be fetched once and remain in cache. We should reconsider this
+	 *    in future.
+	 */
+	Cost		index_sst_read_cost = 0;
+	Cost		table_sst_read_cost = 0;
+
+	index_tuple_width = yb_get_index_tuple_width(index, baserel_oid,
+												 is_primary_index);
+
+	if (!is_primary_index)
+	{
+		/* Compute the cost of fetching index from disk to memory */
+		index_total_pages =
+			ceil(adjusted_index_tuples * index_tuple_width /
+				 YB_DEFAULT_DOCDB_BLOCK_SIZE);
+		index_pages_fetched = clamp_row_est(index_selectivity * index_total_pages);
+		index_random_pages_fetched =
+			ceil(num_seeks / (num_seeks + num_nexts_prevs)) * index_pages_fetched;
+		index_sequential_pages_fetched =
+			index_pages_fetched - index_random_pages_fetched;
+
+		index_sst_read_cost = index_random_pages_fetched * yb_random_block_cost;
+		index_sst_read_cost += index_sequential_pages_fetched * yb_seq_block_cost;
+
+		startup_cost += yb_random_block_cost;
+		run_cost += index_sst_read_cost - yb_random_block_cost;
+	}
+	if (!index_only || is_primary_index)
+	{
+		/* Compute the cost of fetching the base table from disk to memory */
+		baserel_tuple_width = yb_get_relation_data_width(baserel, baserel_oid);
+		Cardinality	num_docdb_blocks_fetched = ceil(num_index_tuples_matched *
+													baserel_tuple_width /
+													YB_DEFAULT_DOCDB_BLOCK_SIZE);
+
+		/*
+		 * If this is a primary index scan, pages from the disk will likely be
+		 * fetched in sequential order as they are sorted by the primary key.
+		 * If this is a secondary index scan, we assume that the pages are
+		 * fetched in random order.
+		 */
+		Cost		per_block_cost = (is_primary_index ? yb_seq_block_cost :
+									  yb_random_block_cost);
+
+		table_sst_read_cost = num_docdb_blocks_fetched * per_block_cost;
+
+		startup_cost += per_block_cost;
+		run_cost += table_sst_read_cost - per_block_cost;
+	}
+
+	if (is_primary_index)
+		bmscan_total_cost += table_sst_read_cost;
+	else
+		bmscan_total_cost += index_sst_read_cost;
+
+	/*
+	 * Compute ybctid and the final result width.
+	 */
+	ybctid_width = yb_get_ybctid_width(baserel_oid, baserel, index, false);
+	path->ybctid_width = ybctid_width;
+
+	docdb_result_width = yb_get_docdb_result_width(&path->path, root,
+												   true,	/* is_index_path */
+												   is_primary_index,
+												   index_only,
+												   index_conditions,
+												   local_clauses,
+												   baserel, baserel_oid);
+
+	/*
+	 * Compute the cost of transfering ybctids from DocDB.
+	 */
+	Cost		ybctid_transfer_cost;
+	Cardinality	ybctid_num_pages;
+
+	if (path->path.parallel_workers > 0)
+		ybctid_num_pages = ceil(num_index_tuples_matched *
+								ybctid_width / yb_parallel_range_size);
+	else
+		yb_get_pagination_metrics(num_index_tuples_matched, ybctid_width,
+								  &ybctid_num_pages, NULL);
+
+	ybctid_transfer_cost = yb_data_transfer_cost(ybctid_num_pages,
+												 num_index_tuples_matched *
+												 ybctid_width,
+												 index_roundtrip_cost,
+												 index_transfer_cost);
+
+	/*
+	 * Compute and add the cost of transferring the index access results over
+	 * the network from DocDB to pggate.  Nothing to add at this step if it is
+	 * a non-colocated non-PK, non-index-only path.
+	 */
+	Cardinality	index_result_num_pages = 0;
+
+	if (is_primary_index || index_only || !baserel_is_colocated)
+	{
+		Cost		index_result_transfer_cost;
+
+		if (is_primary_index || index_only)
+		{
+			/* outputs the values */
+			if (path->path.parallel_workers > 0)
+				index_result_num_pages = ceil(num_index_tuples_matched *
+											  docdb_result_width /
+											  yb_parallel_range_size);
+			else
+				yb_get_pagination_metrics(num_index_tuples_matched,
+										  docdb_result_width,
+										  &index_result_num_pages, NULL);
+
+			index_result_transfer_cost =
+				yb_data_transfer_cost(index_result_num_pages,
+									  num_index_tuples_matched *
+									  docdb_result_width,
+									  index_roundtrip_cost,
+									  index_transfer_cost);
+		}
+		else
+		{
+			/* non-colocated non-PK non-index-only scan outputs ybctids */
+			index_result_num_pages = ybctid_num_pages;
+			index_result_transfer_cost = ybctid_transfer_cost;
+		}
+
+		/* Network roundtrip cost is added to startup cost */
+		startup_cost += index_roundtrip_cost;
+		run_cost += index_result_transfer_cost - index_roundtrip_cost;
+
+		/* add pagination seeks and cost only for the subsequent pages */
+		num_seeks += index_result_num_pages - 1;
+		run_cost += (index_result_num_pages - 1) * index_per_seek_cost;
+	}
+
+	/* ybctid transfer cost for bitmap scan */
+	bmscan_total_cost += ybctid_transfer_cost * ybctid_num_pages;
+
+	/* pagination cost */
+	bmscan_num_seeks += ybctid_num_pages - 1;
+	bmscan_total_cost += (ybctid_num_pages - 1) * index_per_seek_cost;
+
+	path->indextotalcost = bmscan_total_cost;
+	path->indexselectivity = yb_bitmap_index_selectivity(path,
+														 root,
+														 qpquals,
+														 baserel_oid,
+														 index_conditions);
+
+	Cardinality	num_baserel_result_pages = 0;
+
+	/* base table access costs if this is a non-pk IndexScan path */
+	if (!is_primary_index && !index_only)
+	{
+		Relation	base_rel = RelationIdGetRelation(baserel_oid);
+		Oid			baserel_tablespace_id = base_rel->rd_rel->reltablespace;
+
+		RelationClose(base_rel);
+
+		yb_add_base_table_fetch_cost(&path->path,
+									 num_index_tuples_matched,
+									 num_baserel_result_rows,
+									 docdb_result_width,
+									 baserel_per_seek_cost, per_next_cost,
+									 baserel_tablespace_id,
+									 &num_seeks, &num_nexts_prevs,
+									 &startup_cost, &run_cost,
+									 &num_baserel_result_pages);
+
+		/*
+		 * Estimate the cost of executing the base_table_pushed_down_filters on
+		 * the base table.
+		 */
+		if (list_length(base_table_pushed_down_filters) > 0)
+		{
+			yb_add_remote_filter_cost(root, base_table_pushed_down_filters,
+									  num_index_tuples_matched,
+									  &startup_cost, &run_cost);
+		}
+	}
+
+	path->yb_plan_info.estimated_ybctid_width = ybctid_width;
+	path->yb_plan_info.estimated_docdb_result_width = docdb_result_width;
+	path->yb_plan_info.estimated_num_seeks = num_seeks;
+	path->yb_plan_info.estimated_num_nexts_prevs = num_nexts_prevs;
+	path->yb_plan_info.estimated_num_table_result_pages = num_baserel_result_pages;
+	path->yb_plan_info.estimated_num_index_result_pages = index_result_num_pages;
+	path->yb_plan_info.estimated_num_bmscan_seeks = bmscan_num_seeks;
+	path->yb_plan_info.estimated_num_bmscan_nexts_prevs = bmscan_num_nexts_prevs;
+	path->yb_plan_info.estimated_num_bmscan_result_pages = ybctid_num_pages;
+
+	/* Local filter costs */
+	cost_qual_eval(&qual_cost, local_clauses, root);
+	startup_cost += qual_cost.startup;
+	run_cost += qual_cost.per_tuple * num_baserel_result_rows;
+
+	/* tlist eval costs are paid per output row, not per tuple scanned */
+	startup_cost += path->path.pathtarget->cost.startup;
+	run_cost += path->path.pathtarget->cost.per_tuple * path->path.rows;
+
+	/* we don't need to check enable_index_onlyscan; indxpath.c does that */
+	if (!enable_indexscan)
+		startup_cost += disable_cost;
+
+	/* TODO(#29078): cost this better. */
+	if (path->yb_index_path_info.merge_scan_saop_cols)
+	{
+		/*
+		 * We need merge index scans to cost higher than plain index scans to
+		 * avoid doing merge scan where it doesn't give any gains for upper
+		 * nodes.  Make them cost twice of STD_FUZZ_FACTOR higher, where
+		 * STD_FUZZ_FACTOR = 1.01.
+		 */
+		startup_cost *= 1.02;
+		run_cost *= 1.02;
+	}
+
+	path->path.startup_cost = startup_cost;
+	path->path.total_cost = startup_cost + run_cost;
+}
+
+/*
+ * yb_get_bitmap_index_quals
+ *	  Return the list of quals used by the Bitmap Index Scans. This includes the
+ *	  index conditions themselves, and any additional remote filters that are
+ *	  applied by each Bitmap Index Scan.
+ *
+ * 'bitmapqual' is a tree of IndexPaths, BitmapAndPaths, and BitmapOrPaths
+ * 'scan_clauses' is a list of all conditions given to the bitmap path
+ */
+List *
+yb_get_bitmap_index_quals(PlannerInfo *root, Path *bitmapqual,
+						  List *scan_clauses)
+{
+	if (IsA(bitmapqual, BitmapAndPath))
+	{
+		BitmapAndPath *apath = (BitmapAndPath *) bitmapqual;
+		List	   *subindexquals = NIL;
+		ListCell   *l;
+
+		foreach(l, apath->bitmapquals)
+		{
+			List	   *subindexqual = yb_get_bitmap_index_quals(root,
+																 (Path *) lfirst(l),
+																 scan_clauses);
+
+			subindexquals = list_concat_unique(subindexquals, subindexqual);
+		}
+
+		return subindexquals;
+	}
+	else if (IsA(bitmapqual, BitmapOrPath))
+	{
+		BitmapOrPath *opath = (BitmapOrPath *) bitmapqual;
+		List	   *subindexquals = NIL;
+		ListCell   *l;
+
+		foreach(l, opath->bitmapquals)
+		{
+			List	   *subindexqual = yb_get_bitmap_index_quals(root,
+																 (Path *) lfirst(l),
+																 scan_clauses);
+
+			subindexquals = lappend(subindexquals,
+									make_ands_explicit(subindexqual));
+		}
+
+		if (list_length(subindexquals) <= 1)
+			return subindexquals;
+		return list_make1(make_orclause(subindexquals));
+	}
+	else if (IsA(bitmapqual, IndexPath))
+	{
+		IndexPath  *ipath = (IndexPath *) bitmapqual;
+		IndexScan  *iscan;
+		List	   *subquals;
+		List	   *subindexquals;
+		ListCell   *l;
+
+		/* Use the regular indexscan plan build machinery... */
+		iscan = castNode(IndexScan,
+						 create_indexscan_plan(root, ipath,
+											   NIL, scan_clauses,
+											   false /* indexonly */ ,
+											   true /* bitmapindex */ ));
+
+		/* Extract original index clauses, actual index quals, relevant ECs */
+		subquals = NIL;
+		subindexquals = NIL;
+		foreach(l, ipath->indexclauses)
+		{
+			IndexClause *iclause = (IndexClause *) lfirst(l);
+			RestrictInfo *rinfo = iclause->rinfo;
+
+			Assert(!rinfo->pseudoconstant);
+			subquals = lappend(subquals, rinfo->clause);
+			subindexquals = list_concat(subindexquals,
+										get_actual_clauses(iclause->indexquals));
+		}
+		/* We can add any index predicate conditions, too */
+		foreach(l, ipath->indexinfo->indpred)
+		{
+			Expr	   *pred = (Expr *) lfirst(l);
+
+			/*
+			 * We know that the index predicate must have been implied by the
+			 * query condition as a whole, but it may or may not be implied by
+			 * the conditions that got pushed into the bitmapqual.  Avoid
+			 * generating redundant conditions.
+			 */
+			if (!predicate_implied_by(list_make1(pred), subquals, false))
+				subindexquals = lappend(subindexquals, pred);
+		}
+
+		if (iscan->yb_idx_pushdown.quals)
+			subindexquals = lappend(subindexquals,
+									make_ands_explicit(iscan->yb_idx_pushdown.quals));
+
+		pfree(iscan);
+
+		return subindexquals;
+	}
+	else
+	{
+		elog(ERROR, "unrecognized node type: %d", nodeTag(bitmapqual));
+	}
+}
+
+/*
+ * yb_cost_bitmap_table_scan
+ *	  Determines and returns the cost of scanning a relation using a YB bitmap
+ *	  index-then-table plan.
+ *
+ * 'baserel' is the relation to be scanned
+ * 'param_info' is the ParamPathInfo if this is a parameterized path, else NULL
+ * 'bitmapqual' is a tree of IndexPaths, BitmapAndPaths, and BitmapOrPaths
+ * 'loop_count' is the number of repetitions of the indexscan to factor into
+ *		estimates of caching behavior
+ *
+ * Note: the component IndexPaths in bitmapqual should have been costed
+ * using the same loop_count.
+ */
+void
+yb_cost_bitmap_table_scan(Path *path, PlannerInfo *root, RelOptInfo *baserel,
+						  ParamPathInfo *param_info,
+						  Path *bitmapqual, double loop_count)
+{
+	Cost		startup_cost = 0;
+	Cost		run_cost = 0;
+	Selectivity indexSelectivity;
+	Cost		indexTotalCost;
+	int32		tuple_width = 0;
+	Oid			baserel_oid = planner_rt_fetch(baserel->relid, root)->relid;
+
+	/* TODO: Plug here the actual number of key-value pairs per tuple */
+	int			num_key_value_pairs_per_tuple = YB_DEFAULT_NUM_KEY_VALUE_PAIRS_PER_TUPLE;
+
+	/* TODO: Plug here the actual number of SST files for this index */
+	int			num_sst_files = YB_DEFAULT_NUM_SST_FILES_PER_TABLE;
+	Cost		per_merge_cost = 0.0;
+	Cost		per_seek_cost = 0.0;
+	Cost		per_next_cost = 0.0;
+	List	   *local_clauses = NIL;
+	List	   *non_index_clauses = NIL;
+	int			docdb_result_width;
+	Cardinality	tuples_fetched;
+	Cardinality	pages_fetched;
+	Cardinality	result_tuples;
+	QualCost	qual_cost;
+	List	   *indexquals;
+	ListCell   *l;
+	Cardinality	adjusted_baserel_tuples = baserel->tuples;
+	Relation	base_rel = RelationIdGetRelation(baserel_oid);
+	Oid			baserel_tablespace_id = base_rel->rd_rel->reltablespace;
+
+	RelationClose(base_rel);
+
+	/* Should only be applied to Yugabyte base relations */
+	Assert(IsA(baserel, RelOptInfo));
+	Assert(baserel->relid > 0);
+	Assert(baserel->rtekind == RTE_RELATION);
+	Assert(baserel->is_yb_relation);
+	Assert(yb_enable_bitmapscan);
+
+	/* Mark the path with the correct row estimate */
+	if (param_info)
+		path->rows = param_info->ppi_rows;
+	else
+		path->rows = baserel->rows;
+
+	if (!enable_bitmapscan)
+		startup_cost += disable_cost;
+
+	/* Adjust costing for parallelism, if used. */
+	if (path->parallel_workers > 0)
+	{
+		double		parallel_divisor = get_parallel_divisor(path);
+
+		adjusted_baserel_tuples = clamp_row_est(baserel->tuples /
+												parallel_divisor);
+		path->rows = clamp_row_est(path->rows / parallel_divisor);
+	}
+
+	/* DocDB costs */
+	/* Compute tuple width */
+	tuple_width = yb_get_relation_data_width(baserel, baserel_oid);
+
+	/*
+	 * Fetch total cost of obtaining the bitmap, as well as its total
+	 * selectivity.
+	 */
+	yb_cost_bitmap_tree_node(bitmapqual, &indexTotalCost, &indexSelectivity, NULL);
+	startup_cost += indexTotalCost;
+
+	/* add seqscan cost for the fall-back scenario when we exceed work_mem */
+	if (indexTotalCost > bitmap_exceeded_work_mem_disable_cost)
+	{
+		yb_cost_seqscan(path, root, baserel, param_info);
+		if (path->startup_cost > disable_cost)
+		{
+			path->startup_cost -= disable_cost;
+			path->total_cost -= disable_cost;
+		}
+		path->startup_cost += startup_cost;
+		path->total_cost += startup_cost;
+		return;
+	}
+
+	indexquals = yb_get_bitmap_index_quals(root, bitmapqual,
+										   baserel->baserestrictinfo);
+
+	/* Determine what clauses remain to be checked by this node */
+	foreach(l, baserel->baserestrictinfo)
+	{
+		RestrictInfo *rinfo = lfirst_node(RestrictInfo, l);
+		Node	   *clause = (Node *) rinfo->clause;
+
+		if (rinfo->pseudoconstant)
+			continue;			/* we may drop pseudoconstants here */
+		if (list_member(indexquals, clause))
+			continue;			/* simple duplicate */
+		if (!contain_mutable_functions(clause) &&
+			predicate_implied_by(list_make1(clause), indexquals, false))
+			continue;			/* provably implied by indexquals */
+		non_index_clauses = lappend(non_index_clauses, rinfo);
+	}
+
+	/* Determine remote and local quals */
+	List	   *remote_table_quals = NIL;
+	List	   *table_colrefs = NIL;
+
+	yb_extract_pushdown_clauses(non_index_clauses,
+								NULL,	/* index_info */
+								false,	/* bitmapindex */
+								&local_clauses,
+								&remote_table_quals,
+								&table_colrefs,
+								NULL,	/* idx_remote_quals */
+								NULL,	/* idx_colrefs */
+								baserel_oid,
+								NULL);
+
+	tuples_fetched = clamp_row_est(adjusted_baserel_tuples *
+								   clauselist_selectivity(root, indexquals,
+														  baserel->relid,
+														  JOIN_INNER, NULL));
+
+	result_tuples =
+		clamp_row_est(adjusted_baserel_tuples *
+					  clauselist_selectivity(root,
+											 list_union(indexquals,
+														remote_table_quals),
+											 baserel->relid, JOIN_INNER, NULL));
+
+	/* Block fetch cost from disk */
+	pages_fetched = ceil(tuples_fetched * tuple_width / YB_DEFAULT_DOCDB_BLOCK_SIZE);
+	startup_cost += yb_random_block_cost;
+	run_cost += (pages_fetched - 1) * yb_random_block_cost;
+
+	/* DocDB costs for merging key-value pairs to form tuples */
+	per_merge_cost = (num_key_value_pairs_per_tuple *
+					  yb_docdb_merge_cpu_cycles *
+					  cpu_operator_cost);
+
+	/* Seek to first key cost */
+	if (tuples_fetched > 0)
+	{
+		per_seek_cost = (yb_get_lsm_seek_cost(baserel->tuples,
+											  num_key_value_pairs_per_tuple,
+											  num_sst_files) +
+						 per_merge_cost);
+	}
+
+	/* Next for remaining keys */
+	per_next_cost = ((yb_docdb_next_cpu_cycles * cpu_operator_cost) +
+					 per_merge_cost);
+
+	docdb_result_width = yb_get_docdb_result_width(path, root,
+												   false,	/* is_index_path */
+												   false,	/* is_primary_index */
+												   false,	/* is_index_only */
+												   NIL, /* index_conditions */
+												   local_clauses,
+												   baserel, baserel_oid);
+
+	Cardinality	num_seeks = 0;
+	Cardinality	num_nexts_prevs = 0;
+	Cardinality	result_pages = 0;
+	yb_add_base_table_fetch_cost(path,
+								 tuples_fetched,
+								 result_tuples,
+								 docdb_result_width,
+								 per_seek_cost,
+								 per_next_cost,
+								 baserel_tablespace_id,
+								 &num_seeks,
+								 &num_nexts_prevs,
+								 &startup_cost,
+								 &run_cost,
+								 &result_pages);
+
+	yb_add_remote_filter_cost(root, remote_table_quals,
+							  tuples_fetched,
+							  &startup_cost, &run_cost);
+
+	path->yb_plan_info.estimated_docdb_result_width = docdb_result_width;
+	path->yb_plan_info.estimated_num_seeks = num_seeks;
+	path->yb_plan_info.estimated_num_nexts_prevs = num_nexts_prevs;
+	path->yb_plan_info.estimated_num_table_result_pages = result_pages;
+	path->yb_plan_info.estimated_num_bmscan_seeks = 0;
+	path->yb_plan_info.estimated_num_bmscan_nexts_prevs = 0;
+	/*
+	 * Initialize to -1 to indicate the values are not set.
+	 *
+	 * YB_TODO(#27232) : Enhance EXPLAIN to show round trips for
+	 * bitmap scans and check to see if we still need to set these
+	 * valuess to -1.
+	 */
+	path->yb_plan_info.estimated_num_index_result_pages = -1;
+	path->yb_plan_info.estimated_num_bmscan_result_pages = -1;
+
+	/* Local filter costs */
+	cost_qual_eval(&qual_cost, local_clauses, root);
+	startup_cost += qual_cost.startup;
+	run_cost += qual_cost.per_tuple * result_tuples;
+
+	/* tlist eval costs are paid per output row, not per tuple scanned */
+	startup_cost += path->pathtarget->cost.startup;
+	run_cost += path->pathtarget->cost.per_tuple * path->rows;
+
+	path->startup_cost = startup_cost;
+	path->total_cost = startup_cost + run_cost;
 }

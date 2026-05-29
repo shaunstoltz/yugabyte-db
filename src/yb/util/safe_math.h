@@ -15,9 +15,9 @@
 // specific language governing permissions and limitations
 // under the License.
 //
-// The following only applies to changes made to this file as part of YugaByte development.
+// The following only applies to changes made to this file as part of YugabyteDB development.
 //
-// Portions Copyright (c) YugaByte, Inc.
+// Portions Copyright (c) YugabyteDB, Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License"); you may not use this file except
 // in compliance with the License.  You may obtain a copy of the License at
@@ -76,6 +76,12 @@ inline Type AddWithOverflowCheck(Type a, Type b, bool *overflowed) {
   // Pick the right specialization based on whether Type is signed.
   typedef safe_math_internal::WithOverflowCheck<Type, MathLimits<Type>::kIsSigned> my_struct;
   return my_struct::Add(a, b, overflowed);
+}
+
+template <class In>
+requires (std::is_unsigned_v<In> && sizeof(In) == sizeof(size_t))
+bool HasOverflow(In in) {
+  return in & (static_cast<In>(1) << (sizeof(In) * 8 - 1));
 }
 
 } // namespace yb

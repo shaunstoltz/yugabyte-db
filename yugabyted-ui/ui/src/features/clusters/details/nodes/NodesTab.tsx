@@ -1,7 +1,7 @@
 import React, { FC, useMemo, useState } from 'react';
 import { useForm } from 'react-hook-form';
 import { Box, MenuItem, Typography, makeStyles, LinearProgress } from '@material-ui/core';
-import { useTranslation } from 'react-i18next';
+import { TFunction, useTranslation } from 'react-i18next';
 import {
     YBTable,
     YBLoadingBox,
@@ -13,7 +13,6 @@ import {
     YBSelect
 } from '@app/components';
 import { getHumanInterval, getMemorySizeUnits, roundDecimal } from '@app/helpers';
-import { useGetClusterNodesQuery, useGetIsLoadBalancerIdleQuery } from '@app/api/src';
 import { getHumanVersion } from '@app/features/clusters/ClusterDBVersionBadge';
 import { NodeCountWidget } from './NodeCountWidget';
 import type { ClassNameMap } from '@material-ui/styles';
@@ -21,12 +20,20 @@ import type { MUISortOptions } from 'mui-datatables';
 import EditIcon from '@app/assets/edit.svg';
 import RefreshIcon from '@app/assets/refresh.svg';
 import { StateEnum, StatusEntity, YBSmartStatus } from '@app/components/YBStatus/YBSmartStatus';
-
-// TODO: We will need to use query params later for filtering so that we can navigate to this page
-// with preset filters
-// import { StringParam, useQueryParams, withDefault } from 'use-query-params';
+import { StringParam, useQueryParams, withDefault } from 'use-query-params';
+import { useNodes } from './NodeHooks';
+import {
+    useGetGflagsQuery,
+    GflagsInfo,
+    useGetClusterConnectionsQuery,
+} from "@app/api/src";
+import { YBTextBadge } from '@app/components/YBTextBadge/YBTextBadge';
 
 const useStyles = makeStyles((theme) => ({
+    title: {
+      marginTop: theme.spacing(3),
+      marginBottom: theme.spacing(2.5),
+    },
     loadingCount: {
       height: theme.spacing(2.5),
       width: theme.spacing(20),
@@ -40,7 +47,7 @@ const useStyles = makeStyles((theme) => ({
     },
     nodeComponent: {
         display: 'flex',
-        padding: '16px',
+        padding: '12px 32px',
         alignItems: 'center'
     },
     nodeName: {
@@ -56,7 +63,11 @@ const useStyles = makeStyles((theme) => ({
         alignItems: 'center'
     },
     regionZoneComponent: {
-        padding: '16px'
+        display: 'flex',
+        justifyContent: 'space-between',
+        alignItems: 'center',
+        gap: '10px',
+        padding: '12px 32px',
     },
     selectBox: {
         width: '180px'
@@ -71,33 +82,41 @@ const useStyles = makeStyles((theme) => ({
     modalCheckboxChild: {
         marginLeft: '32px'
     },
+    filterContainer: {
+        display: 'flex',
+        marginBottom: theme.spacing(2),
+    },
     filterRow: {
-        display: 'flex'
+        display: 'flex',
+        gap: '10px',
+        alignItems: 'center',
     },
     filterRowButtons: {
         marginLeft: 'auto'
     },
     checkbox: {
         padding: '6px 6px 6px 6px'
-    }
+    },
   }));
 
 // const StatusComponent = (isHealthy: boolean) => (
-//   <YBStatus type={isHealthy ? STATUS_TYPES.SUCCESS : STATUS_TYPES.ERROR} />
+//   <YBStatus type={isHealthy ? STATUS_TYPES.SUCCESS : STATUS_TYPES.ERROR} tooltip />
 // );
 
-const NodeComponent = (classes: ClassNameMap) => (
+const NodeComponent = (classes: ClassNameMap, t: TFunction) => (
     node_data: {
         status: boolean,
         name: string,
         host: string,
-        bootstrapping: boolean
-    }
+        bootstrapping: boolean,
+        is_read_replica: boolean,
+    },
 ) => {
+
     return (
     <Box className={classes.nodeComponent}>
-        <YBStatus type={node_data.status ? STATUS_TYPES.SUCCESS : STATUS_TYPES.ERROR} />
-        <Box>
+        <YBStatus type={node_data.status ? STATUS_TYPES.SUCCESS : STATUS_TYPES.ERROR} tooltip />
+        <Box display="flex" gridGap={10} alignItems="center">
             <Typography variant='body1' className={classes.nodeName}>
                 {node_data.name}
             </Typography>
@@ -107,33 +126,46 @@ const NodeComponent = (classes: ClassNameMap) => (
             {/* <Typography variant='subtitle1' className={classes.nodeHost}>
                 {node_data.host}
             </Typography> */}
+            {node_data.is_read_replica &&
+                <YBTextBadge>{t('clusterDetail.nodes.readReplica')}</YBTextBadge>
+            }
         </Box>
         {node_data.bootstrapping && (
             <div className={classes.nodeBootstrappingIcon}>
-                <YBStatus type={STATUS_TYPES.IN_PROGRESS}/>
+                <YBStatus type={STATUS_TYPES.IN_PROGRESS} tooltip />
             </div>
         )}
     </Box>
     );
 }
 
-const RegionZoneComponent = (classes: ClassNameMap) => (
+const RegionZoneComponent = (classes: ClassNameMap, t: TFunction) => (
     region_and_zone: {
         region: string,
-        zone: string
+        zone: string,
+        preference: number | undefined
     }
 ) => {
     return (
     <Box className={classes.regionZoneComponent}>
-        <Typography variant='body2' className={classes.nodeName}>
-            {region_and_zone.region}
-        </Typography>
-        <Typography variant='subtitle1' className={classes.nodeHost}>
-            {region_and_zone.zone}
-        </Typography>
+        <Box>
+            <Typography variant='body2' className={classes.nodeName}>
+                {region_and_zone.region}
+            </Typography>
+            <Typography variant='subtitle1' className={classes.nodeHost}>
+                {region_and_zone.zone}
+            </Typography>
+        </Box>
+        {region_and_zone.preference !== undefined && region_and_zone.preference !== -1 &&
+            <YBTextBadge>
+                {t('clusterDetail.nodes.preference', { preference: region_and_zone.preference })}
+            </YBTextBadge>
+        }
     </Box>
     );
 }
+
+const NODE_COLUMNS_LS_KEY = "node-columns";
 
 export const NodesTab: FC = () => {
   const classes = useStyles();
@@ -141,31 +173,46 @@ export const NodesTab: FC = () => {
 
   const [showEditColumns, setShowEditColumns] = useState(false);
 
-  const ALL_STATUSES = { label: t('clusterDetail.nodes.allNodeStatuses'), value: '' };
-//   const [queryParams, setQueryParams] = useQueryParams({
-//     filter: withDefault(StringParam, ALL_STATUSES.value)
-//   });
-  const [filter, setFilter] = useState<string | undefined>(ALL_STATUSES.value);
-  //(queryParams.filter);
+  const [queryParams, setQueryParams] = useQueryParams({
+    filter: withDefault(StringParam, ''),
+    node: withDefault(StringParam, ''),
+  });
+  const [filter, setFilter] = useState<string | undefined>(queryParams.filter);
+  const [nodeFilter, setNodeFilter] = useState<string>(queryParams.node);
 
   const handleChangeFilter = (
     newFilter: string,
   ) => {
     setFilter(newFilter);
-    // setQueryParams({
-    //   filter: newFilter
-    // });
+    setQueryParams({
+      filter: newFilter || undefined
+    });
   };
-  // Get nodes
-  const { data: nodesResponse, isLoading: fetchingNodes, refetch: refetchNodes } =
-    useGetClusterNodesQuery();
 
-  // We get load balancer separately for now since we rely on yb-admin which is slow
-  const {
-    data: isLoadBalancerIdleResponse,
-    isLoading: fetchingIsLoadBalancerIdle,
-    refetch: refetchIsLoadBalancerIdle
-  } = useGetIsLoadBalancerIdleQuery();
+  const handleChangeNodeFilter = (
+    newNodeFilter: string,
+  ) => {
+    setNodeFilter(newNodeFilter);
+    setQueryParams({
+      node: newNodeFilter || undefined
+    });
+  };
+
+  // Get nodes, including master-only nodes
+  const { data: nodesResponse, isFetching: fetchingNodes, refetch: refetchNodes } = useNodes(true);
+  // address of a live tserver
+  const tserverAddress = nodesResponse?.data?.find((node) => node.is_node_up)?.host ?? "";
+  const { data: gflagsResponse, isFetching: fetchingGflags, refetch: refetchGflags }
+      = useGetGflagsQuery<GflagsInfo>(
+        { node_address: tserverAddress },
+      );
+  const isConnMgrEnabled = useMemo(() => {
+    return gflagsResponse?.tserver_flags?.some(flag =>
+        flag.name === "enable_ysql_conn_mgr" && flag.value === "true")
+  }, [gflagsResponse, nodesResponse]);
+
+  const { data: connectionsResponse, isFetching: fetchingConn, refetch: refetchConn }
+      = useGetClusterConnectionsQuery();
 
   // These define which checkboxes are checked by default in the Edit Columns modal
   const defaultValues : Record<string, boolean> = {
@@ -183,7 +230,13 @@ export const NodesTab: FC = () => {
       read_write_ops: true,
       read_ops: true,
       write_ops: true,
-      active_connections: false,
+      ...((isConnMgrEnabled)
+          ? {
+              active_logical_connections: false,
+              active_physical_connections: false,
+              active_connections_ycql: false
+            }
+          : {active_connections: false}),
       number_of_tablets: true,
       peer_tablets: true,
       leader_tablets: true,
@@ -201,7 +254,10 @@ export const NodesTab: FC = () => {
       master_tserver_status: false,
       master_tserver_uptime: false
   };
-  const [columns, setColumns] = useState(defaultValues);
+  const [columns, setColumns] = useState({
+    ...defaultValues,
+    ...(JSON.parse(localStorage.getItem(NODE_COLUMNS_LS_KEY)!) || {})
+  });
   const { control, handleSubmit, reset, setValue, getValues } = useForm({
     mode: 'onChange',
     defaultValues: columns
@@ -213,21 +269,13 @@ export const NodesTab: FC = () => {
   };
   const applyColumnChanges = handleSubmit((formData) => {
     setColumns(formData);
+    localStorage.setItem(NODE_COLUMNS_LS_KEY, JSON.stringify(formData));
     closeQueryOptionsModal();
   });
 
   const nodesData = useMemo(() => {
     if (nodesResponse?.data) {
-      return nodesResponse.data.map(node => {
-        node.is_bootstrapping = fetchingIsLoadBalancerIdle
-        ? false
-        : !node.is_node_up || !node.is_master_up
-        ? false
-        : node.metrics.uptime_seconds < 60 && !isLoadBalancerIdleResponse?.is_idle ||
-          node.metrics.user_tablets_leaders + node.metrics.system_tablets_leaders == 0;
-        return node;
-      })
-      .filter((node) => {
+      return nodesResponse.data.filter((node) => {
         switch (filter) {
             case 'running':
                 return node.is_node_up;
@@ -239,17 +287,29 @@ export const NodesTab: FC = () => {
                 return true;
         }
       })
+      .filter((node) => {
+        switch (nodeFilter) {
+            case 'primary':
+                return !node.is_read_replica;
+            case 'readreplica':
+                return node.is_read_replica;
+            default:
+                return true;
+        }
+      })
       .map((node) => ({
         ...node,
         node_data: {
             status: node.is_node_up,
             name: node.name,
             host: node.host,
-            bootstrapping: node.is_bootstrapping
+            bootstrapping: node.is_bootstrapping,
+            is_read_replica: node.is_read_replica
         },
         region_and_zone: {
             region: node.cloud_info.region,
-            zone: node.cloud_info.zone
+            zone: node.cloud_info.zone,
+            preference: node.preference_order,
         },
         status: node.is_node_up,
         name: node.name,
@@ -269,7 +329,13 @@ export const NodesTab: FC = () => {
         read_write_ops:
             [roundDecimal(node.metrics.read_ops_per_sec),
              roundDecimal(node.metrics.write_ops_per_sec),
-             node.metrics.active_connections.ysql + node.metrics.active_connections.ycql],
+             ...((isConnMgrEnabled)
+                 ? [connectionsResponse?.data?.[node.host]
+                        ?.reduce((sum, pool) => sum + pool.active_logical_connections, 0) ?? 0,
+                    connectionsResponse?.data?.[node.host]
+                        ?.reduce((sum, pool) => sum + pool.active_physical_connections, 0) ?? 0,
+                    node.metrics.active_connections.ycql]
+                 : [node.metrics.active_connections.ysql + node.metrics.active_connections.ycql])],
         node_status_column:
             [node.is_node_up ? node.metrics.uptime_seconds : -1,
              node.metrics.time_since_hb_sec],
@@ -281,7 +347,9 @@ export const NodesTab: FC = () => {
         processes_column: [
             {
                 tserver: node.is_node_up,
-                master: node.is_master_up
+                master: node.is_master_up,
+                is_tserver: node.is_tserver,
+                is_master: node.is_master
             },
             {
                 tserver: node.is_node_up && node.metrics
@@ -289,20 +357,24 @@ export const NodesTab: FC = () => {
                   : -1,
                 master: node.is_master_up && node.metrics
                   ? node.metrics.master_uptime_us
-                  : -1
+                  : -1,
+                is_tserver: node.is_tserver,
+                is_master: node.is_master
             }
         ]
       }));
     }
     return [];
-  }, [nodesResponse, isLoadBalancerIdleResponse, filter]);
+  }, [nodesResponse, filter, nodeFilter, connectionsResponse, isConnMgrEnabled]);
 
-  if (fetchingNodes) {
+  const hasReadReplica = !!nodesResponse?.data.find(node => node.is_read_replica);
+
+  if (fetchingNodes || fetchingGflags || fetchingConn) {
     return (
       <>
         <Box mt={3} mb={2.5}>
           <LinearProgress />
-          <div className={classes.loadingCount} />
+          {/* <div className={classes.loadingCount} /> */}
         </Box>
         <div className={classes.loadingBox} />
       </>
@@ -335,9 +407,9 @@ export const NodesTab: FC = () => {
       },
       options: {
         filter: true,
-        customBodyRender: NodeComponent(classes),
+        customBodyRender: NodeComponent(classes, t),
         display: columns.node_data,
-        setCellHeaderProps: () => ({style:{whiteSpace: 'nowrap', padding: '8px 8px 8px 44px'}})
+        setCellHeaderProps: () => ({style:{whiteSpace: 'nowrap', padding: '8px 8px 8px 34px' }})
       }
     },
     {
@@ -362,8 +434,8 @@ export const NodesTab: FC = () => {
           },
         options: {
           filter: true,
-          customBodyRender: RegionZoneComponent(classes),
-          setCellHeaderProps: () => ({style:{whiteSpace: 'nowrap', padding: '8px 8px 8px 16px'}}),
+          customBodyRender: RegionZoneComponent(classes, t),
+          setCellHeaderProps: () => ({style:{whiteSpace: 'nowrap', padding: '8px 32px' }}),
           display: columns.region_and_zone
         }
     },
@@ -372,7 +444,9 @@ export const NodesTab: FC = () => {
         label: t('clusterDetail.nodes.performance'),
         options: {
           filter: true,
-          display: columns.read_ops || columns.write_ops || columns.active_connections
+          display: columns.read_ops || columns.write_ops || columns.active_connections ||
+                   columns.active_logical_connections || columns.active_physical_connections ||
+                   columns.active_connections_ycql
         },
         subColumns: [
           {
@@ -384,8 +458,8 @@ export const NodesTab: FC = () => {
                   // We hard code widths for subcolumns for now to ensure the body cells line
                   // up with the header cells. For this to happen automatically, we'll
                   // need to modify YBTable further, which we may or may not want to do.
-                  setCellProps: () => ({ style: { width: '120px' } }),
-                  setCellHeaderProps: () => ({ style: { width: '120px' } })
+                  setCellProps: () => ({ style: { width: '150px', padding: '0 32px' } }),
+                  setCellHeaderProps: () => ({ style: { width: '150px', padding: '8px 32px' } })
               }
           },
           {
@@ -394,20 +468,64 @@ export const NodesTab: FC = () => {
               options: {
                   filter: true,
                   display: columns.write_ops,
-                  setCellProps: () => ({ style: { width: '120px' } }),
-                  setCellHeaderProps: () => ({ style: { width: '120px' } })
+                  setCellProps: () => ({ style: { width: '150px', padding: '0 32px' } }),
+                  setCellHeaderProps: () => ({ style: { width: '150px', padding: '8px 32px' } })
               }
           },
-          {
-            name: 'active_connections',
-            label: t('clusterDetail.nodes.activeConnections'),
-            options: {
-                filter: true,
-                display: columns.active_connections,
-                setCellProps: () => ({ style: { width: '150px' } }),
-                setCellHeaderProps: () => ({ style: { width: '150px' } })
-            }
-          },
+          ...((isConnMgrEnabled)
+              ? [
+                    {
+                        name: 'active_logical_connections',
+                        label: t('clusterDetail.nodes.activeLogicalConnectionsYsql'),
+                        options: {
+                            filter: true,
+                            display: columns.active_logical_connections,
+                            setCellProps: () => ({ style: { width: '260px', padding: '0 32px' } }),
+                            setCellHeaderProps: () => ({
+                                style: { width: '260px', padding: '8px 32px' }
+                            })
+                        }
+                    },
+                    {
+                        name: 'active_physical_connections',
+                        label: t('clusterDetail.nodes.activePhysicalConnectionsYsql'),
+                        options: {
+                            filter: true,
+                            display: columns.active_physical_connections,
+                            setCellProps: () => ({ style: { width: '260px', padding: '0 32px' } }),
+                            setCellHeaderProps: () => ({
+                                style: { width: '260px', padding: '8px 32px' }
+                            })
+                        }
+                    },
+                    {
+                        name: 'active_connections_ycql',
+                        label: t('clusterDetail.nodes.activeConnectionsYcql'),
+                        options: {
+                            filter: true,
+                            display: columns.active_connections_ycql,
+                            setCellProps: () => ({ style: { width: '220px', padding: '0 32px' } }),
+                            setCellHeaderProps: () => ({
+                                style: { width: '220px', padding: '8px 32px' }
+                            })
+                        }
+                    }
+                ]
+              : [
+                    {
+                        name: 'active_connections',
+                        label: t('clusterDetail.nodes.activeConnections'),
+                        options: {
+                            filter: true,
+                            display: columns.active_connections,
+                            setCellProps: () => ({ style: { width: '180px', padding: '0 32px' } }),
+                            setCellHeaderProps: () => ({
+                                style: { width: '180px', padding: '8px 32px' }
+                            })
+                        }
+                    }
+                ]
+          ),
         ],
     },
     {
@@ -424,8 +542,8 @@ export const NodesTab: FC = () => {
               options: {
                   filter: true,
                   display: columns.peer_tablets,
-                  setCellProps: () => ({ style: { width: '90px' } }),
-                  setCellHeaderProps: () => ({ style: { width: '90px' } })
+                  setCellProps: () => ({ style: { width: '100px', padding: '0 32px' } }),
+                  setCellHeaderProps: () => ({ style: { width: '100px', padding: '8px 32px' } })
               }
           },
           {
@@ -434,8 +552,8 @@ export const NodesTab: FC = () => {
               options: {
                   filter: true,
                   display: columns.leader_tablets,
-                  setCellProps: () => ({ style: { width: '90px' } }),
-                  setCellHeaderProps: () => ({ style: { width: '90px' } })
+                  setCellProps: () => ({ style: { width: '100px', padding: '0 32px' } }),
+                  setCellHeaderProps: () => ({ style: { width: '100px', padding: '8px 32px' } })
               }
           },
           {
@@ -444,8 +562,8 @@ export const NodesTab: FC = () => {
             options: {
                 filter: true,
                 display: columns.total_tablets,
-                setCellProps: () => ({ style: { width: '90px' } }),
-                setCellHeaderProps: () => ({ style: { width: '90px' } })
+                setCellProps: () => ({ style: { width: '100px', padding: '0 32px' } }),
+                setCellHeaderProps: () => ({ style: { width: '100px', padding: '8px 32px' } })
             }
           },
         ],
@@ -464,8 +582,8 @@ export const NodesTab: FC = () => {
                 options: {
                     filter: true,
                     display: columns.uptime_seconds,
-                    setCellProps: () => ({ style: { width: '120px' } }),
-                    setCellHeaderProps: () => ({ style: { width: '120px' } })
+                    setCellProps: () => ({ style: { width: '120px', padding: '0 32px' } }),
+                    setCellHeaderProps: () => ({ style: { width: '120px', padding: '8px 32px' } })
                 }
             },
             {
@@ -474,8 +592,8 @@ export const NodesTab: FC = () => {
                 options: {
                     filter: true,
                     display: columns.time_since_hb_sec,
-                    setCellProps: () => ({ style: { width: '160px' } }),
-                    setCellHeaderProps: () => ({ style: { width: '160px' } })
+                    setCellProps: () => ({ style: { width: '200px', padding: '0 32px' } }),
+                    setCellHeaderProps: () => ({ style: { width: '200px', padding: '8px 32px' } })
                 }
             }
         ],
@@ -507,8 +625,8 @@ export const NodesTab: FC = () => {
                 options: {
                     filter: true,
                     display: columns.ram_used,
-                    setCellProps: () => ({ style: { width: '90px' } }),
-                    setCellHeaderProps: () => ({ style: { width: '90px' } })
+                    setCellProps: () => ({ style: { width: '120px', padding: '0 32px' } }),
+                    setCellHeaderProps: () => ({ style: { width: '120px', padding: '8px 32px' } })
                 }
             },
             {
@@ -517,8 +635,8 @@ export const NodesTab: FC = () => {
                 options: {
                     filter: true,
                     display: columns.ram_provisioned,
-                    setCellProps: () => ({ style: { width: '110px' } }),
-                    setCellHeaderProps: () => ({ style: { width: '110px' } })
+                    setCellProps: () => ({ style: { width: '140px', padding: '0 32px' } }),
+                    setCellHeaderProps: () => ({ style: { width: '140px', padding: '8px 32px' } })
                 }
             }
         ],
@@ -540,8 +658,8 @@ export const NodesTab: FC = () => {
                 options: {
                     filter: true,
                     display: columns.sst_size,
-                    setCellProps: () => ({ style: { width: '90px' } }),
-                    setCellHeaderProps: () => ({ style: { width: '90px' } })
+                    setCellProps: () => ({ style: { width: '120px', padding: '0 32px' } }),
+                    setCellHeaderProps: () => ({ style: { width: '120px', padding: '8px 32px' } })
                 }
             },
             {
@@ -550,8 +668,8 @@ export const NodesTab: FC = () => {
                 options: {
                     filter: true,
                     display: columns.uncompressed_sst_size,
-                    setCellProps: () => ({ style: { width: '180px' } }),
-                    setCellHeaderProps: () => ({ style: { width: '180px' } })
+                    setCellProps: () => ({ style: { width: '200px', padding: '0 32px' } }),
+                    setCellHeaderProps: () => ({ style: { width: '200px', padding: '8px 32px' } })
                 }
             },
             {
@@ -560,8 +678,8 @@ export const NodesTab: FC = () => {
                 options: {
                     filter: true,
                     display: columns.disk_provisioned,
-                    setCellProps: () => ({ style: { width: '140px' } }),
-                    setCellHeaderProps: () => ({ style: { width: '140px' } })
+                    setCellProps: () => ({ style: { width: '160px', padding: '0 32px' } }),
+                    setCellHeaderProps: () => ({ style: { width: '160px', padding: '8px 32px' } })
                 }
             }
         ],
@@ -601,8 +719,8 @@ export const NodesTab: FC = () => {
                 options: {
                     filter: true,
                     display: columns.master_tserver_status,
-                    setCellProps: () => ({ style: { width: '90px' } }),
-                    setCellHeaderProps: () => ({ style: { width: '90px' } })
+                    setCellProps: () => ({ style: { width: '140px', padding: '0 32px 0' } }),
+                    setCellHeaderProps: () => ({ style: { width: '140px', padding: '8px 32px' } })
                 }
             },
             {
@@ -611,8 +729,8 @@ export const NodesTab: FC = () => {
                 options: {
                     filter: true,
                     display: columns.master_tserver_uptime,
-                    setCellProps: () => ({ style: { width: '90px' } }),
-                    setCellHeaderProps: () => ({ style: { width: '90px' } })
+                    setCellProps: () => ({ style: { width: '100px', padding: '0 32px' } }),
+                    setCellHeaderProps: () => ({ style: { width: '100px', padding: '8px 32px' } })
                 }
             }
         ],
@@ -620,35 +738,35 @@ export const NodesTab: FC = () => {
             if (index == 0) {
                 return (
                     <>
-                        <div>
+                        {value.is_tserver && <div style={{ 'margin': '6px 0' }}>
                             <YBSmartStatus
                                 status={value.tserver ? StateEnum.Succeeded : StateEnum.Failed}
                                 entity={StatusEntity.Tserver}
                             />
-                        </div>
-                        <div>
+                        </div>}
+                        {value.is_master && <div style={{ 'margin': '6px 0' }}>
                             <YBSmartStatus
                                 status={value.master ? StateEnum.Succeeded : StateEnum.Failed}
                                 entity={StatusEntity.Master}
                             />
-                        </div>
+                        </div>}
                     </>
                 );
             } else if (index == 1) {
                 return (
                     <>
-                        <div>
+                        {value.is_tserver && <div style={{ 'margin': '8px 0' }}>
                             {value.tserver >= 0
                                 ? getHumanInterval(new Date(0).toString(),
                                     new Date(value.tserver * 1000).toString())
                                 : '-'}
-                        </div>
-                        <div>
+                        </div>}
+                        {value.is_master && <div style={{ 'margin': '12px 0 8px 0' }}>
                             {value.master >= 0
                                 ? getHumanInterval(new Date(0).toString(),
-                                    new Date(value.tserver * 1000).toString())
+                                    new Date(value.master / 1000).toString())
                                 : '-'}
-                        </div>
+                        </div>}
                     </>
                 );
             }
@@ -664,7 +782,13 @@ export const NodesTab: FC = () => {
     region_and_zone: 'general',
     read_ops: 'performance',
     write_ops: 'performance',
-    active_connections: 'performance',
+    ...((isConnMgrEnabled)
+        ? {
+            active_logical_connections: 'performance',
+            active_physical_connections: 'performance',
+            active_connections_ycql: 'performance'
+          }
+        : {active_connections: 'performance'}),
     ram_used: 'memory',
     ram_provisioned: 'memory',
     peer_tablets: 'scalability',
@@ -691,7 +815,7 @@ export const NodesTab: FC = () => {
             {
                 name: 'region_and_zone',
                 label: t('clusterDetail.nodes.regionAndZone')
-            }
+            },
         ]
     },
     performance: {
@@ -705,10 +829,28 @@ export const NodesTab: FC = () => {
                 name: 'write_ops',
                 label: t('clusterDetail.nodes.writeOpsPerSec')
             },
-            {
-                name: 'active_connections',
-                label: t('clusterDetail.nodes.activeConnections')
-            }
+            ...((isConnMgrEnabled)
+                ? [
+                    {
+                        name: 'active_logical_connections',
+                        label: t('clusterDetail.nodes.activeLogicalConnectionsYsql')
+                    },
+                    {
+                        name: 'active_physical_connections',
+                        label: t('clusterDetail.nodes.activePhysicalConnectionsYsql')
+                    },
+                    {
+                        name: 'active_connections_ycql',
+                        label: t('clusterDetail.nodes.activeConnectionsYcql')
+                    }
+                  ]
+                : [
+                    {
+                        name: 'active_connections',
+                        label: t('clusterDetail.nodes.activeConnections')
+                    }
+                  ]
+            ),
         ]
     },
     scalability: {
@@ -848,43 +990,64 @@ export const NodesTab: FC = () => {
   return (
     <>
       <Box mt={3} mb={2}>
-        <NodeCountWidget
-            nodes={nodesResponse}
-            isLoadBalancerIdle={isLoadBalancerIdleResponse?.is_idle}
-            fetchingIsLoadBalancerIdle={fetchingIsLoadBalancerIdle}/>
+        <NodeCountWidget nodes={nodesResponse} />
       </Box>
-      <Box className={classes.filterRow}>
-        <YBSelect
-            className={classes.selectBox}
-            value={filter}
-            onChange={(e) => {
-            handleChangeFilter(
-                (e.target as HTMLInputElement).value
-            );
-            }}
-        >
-                <MenuItem value={''}>
-                {t('clusterDetail.nodes.allNodeStatuses')}
-                </MenuItem>
-                <MenuItem value={'running'}>
-                <YBStatus type={STATUS_TYPES.SUCCESS}/>
-                {t('clusterDetail.nodes.running')}</MenuItem>
-                <MenuItem value={'bootstrapping'}>
-                <YBStatus type={STATUS_TYPES.IN_PROGRESS}/>
-                {t('clusterDetail.nodes.bootstrapping')}
-                </MenuItem>
-                <MenuItem value={'down'}>
-                <YBStatus type={STATUS_TYPES.ERROR}/>
-                {t('clusterDetail.nodes.down')}
-                </MenuItem>
-        </YBSelect>
+      <Box className={classes.filterContainer}>
+        <Box className={classes.filterRow}>
+            <YBSelect
+                className={classes.selectBox}
+                value={filter}
+                onChange={(e) => {
+                    handleChangeFilter(
+                        (e.target as HTMLInputElement).value
+                    );
+                }}
+            >
+                    <MenuItem value={''}>
+                    {t('clusterDetail.nodes.allNodeStatuses')}
+                    </MenuItem>
+                    <MenuItem value={'running'}>
+                    <YBStatus type={STATUS_TYPES.SUCCESS}/>
+                    {t('clusterDetail.nodes.running')}</MenuItem>
+                    <MenuItem value={'bootstrapping'}>
+                    <YBStatus type={STATUS_TYPES.IN_PROGRESS}/>
+                    {t('clusterDetail.nodes.bootstrapping')}
+                    </MenuItem>
+                    <MenuItem value={'down'}>
+                    <YBStatus type={STATUS_TYPES.ERROR}/>
+                    {t('clusterDetail.nodes.down')}
+                    </MenuItem>
+            </YBSelect>
+            {hasReadReplica &&
+                <YBSelect
+                    className={classes.selectBox}
+                    value={nodeFilter}
+                    onChange={(e) => {
+                        handleChangeNodeFilter(
+                            (e.target as HTMLInputElement).value
+                        );
+                    }}
+                >
+                        <MenuItem value={''}>
+                            {t('clusterDetail.nodes.allNodes')}
+                        </MenuItem>
+                        <MenuItem value={'primary'}>
+                            {t('clusterDetail.nodes.primaryNodes')}
+                        </MenuItem>
+                        <MenuItem value={'readreplica'}>
+                            {t('clusterDetail.nodes.readReplicaNodes')}
+                        </MenuItem>
+                </YBSelect>
+            }
+        </Box>
         <Box className={classes.filterRowButtons}>
             <YBButton
                 variant="ghost"
                 startIcon={<RefreshIcon />}
                 onClick={() =>  {
                     refetchNodes();
-                    refetchIsLoadBalancerIdle();
+                    refetchGflags();
+                    refetchConn();
                 }}
                 >
                 {t('clusterDetail.nodes.refresh')}
@@ -917,13 +1080,14 @@ export const NodesTab: FC = () => {
         {MODAL_CHECKBOXES_COMPONENT}
       </YBModal>
       { nodesData.length ?
-        <Box pb={4} pt={1}>
+        <Box pb={4}>
             <YBTable
                 data={nodesData}
                 columns={NODES_TABLE_COLUMNS}
                 options={{ pagination: false }}
                 touchBorder
                 cellBorder
+                noCellBottomBorder
                 alternateRowShading
             />
         </Box>

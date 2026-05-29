@@ -1,8 +1,6 @@
-// Copyright (c) YugaByte, Inc.
+// Copyright (c) YugabyteDB, Inc.
 
 #include "yb/tablet/operations/snapshot_operation.h"
-
-#include <glog/logging.h>
 
 #include "yb/common/snapshot.h"
 
@@ -26,7 +24,7 @@
 
 using std::string;
 
-DEFINE_UNKNOWN_bool(consistent_restore, false,
+DEFINE_UNKNOWN_bool(consistent_restore, true,
     "Whether to enable consistent restoration of snapshots");
 
 DEFINE_test_flag(bool, modify_flushed_frontier_snapshot_op, true,
@@ -179,6 +177,7 @@ bool SnapshotOperation::ShouldAllowOpDuringRestore(consensus::OperationType op_t
     case consensus::TRUNCATE_OP: FALLTHROUGH_INTENDED;
     case consensus::SPLIT_OP: FALLTHROUGH_INTENDED;
     case consensus::CHANGE_AUTO_FLAGS_CONFIG_OP:
+    case consensus::CLONE_OP:
       return true;
     case consensus::UPDATE_TRANSACTION_OP: FALLTHROUGH_INTENDED;
     case consensus::WRITE_OP:
@@ -223,7 +222,7 @@ Status SnapshotOperation::DoReplicated(int64_t leader_term, Status* complete_sta
     docdb::ConsensusFrontier frontier;
     frontier.set_op_id(op_id());
     frontier.set_hybrid_time(hybrid_time());
-    LOG(INFO) << "Forcing modify flushed frontier to " << frontier.op_id();
+    LOG(DETAIL) << "Forcing modify flushed frontier to " << frontier.op_id();
     return VERIFY_RESULT(tablet_safe())->ModifyFlushedFrontier(
         frontier, rocksdb::FrontierModificationMode::kUpdate);
   }

@@ -1,4 +1,4 @@
-// Copyright (c) YugaByte, Inc.
+// Copyright (c) YugabyteDB, Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License"); you may not use this file except
 // in compliance with the License.  You may obtain a copy of the License at
@@ -28,9 +28,9 @@ import org.junit.Before;
 import org.junit.Test;
 
 import org.yb.cdc.CdcService.RowMessage.Op;
-import org.yb.util.YBTestRunnerNonTsanOnly;
+import org.yb.YBTestRunner;
 
-@RunWith(value = YBTestRunnerNonTsanOnly.class)
+@RunWith(value = YBTestRunner.class)
 public class TestColumnRenaming extends CDCBaseClass {
   private final static Logger LOG = LoggerFactory.getLogger(TestColumnRenaming.class);
 
@@ -112,14 +112,19 @@ public class TestColumnRenaming extends CDCBaseClass {
       };
 
 
+      int expectedRecordCount = 0;
       for (int i = 0; i < outputList.size(); ++i) {
         switch (outputList.get(i).getRowMessage().getOp()) {
           case DDL:
-            verifyColNameInDDLRecord(outputList.get(i), expectedRecords[i]);
+            verifyColNameInDDLRecord(outputList.get(i), expectedRecords[expectedRecordCount]);
+            expectedRecordCount++;
             break;
           case INSERT:
-            verifyColNameInInsertRecord(outputList.get(i), expectedRecords[i]);
+            verifyColNameInInsertRecord(outputList.get(i), expectedRecords[expectedRecordCount]);
+            expectedRecordCount++;
             break;
+          case BEGIN:
+          case COMMIT: break;
         }
       }
 

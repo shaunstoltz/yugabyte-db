@@ -1,4 +1,4 @@
-// Copyright (c) YugaByte, Inc.
+// Copyright (c) YugabyteDB, Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License"); you may not use this file except
 // in compliance with the License.  You may obtain a copy of the License at
@@ -15,7 +15,7 @@
 
 #include <stdint.h>
 
-#include <glog/logging.h>
+#include "yb/util/logging.h"
 
 #include "yb/common/ql_type.h"
 #include "yb/common/schema.h"
@@ -35,9 +35,9 @@ YQLKeyspacesVTable::YQLKeyspacesVTable(const TableName& table_name,
     : YQLVirtualTable(table_name, namespace_name, master, CreateSchema()) {
 }
 
-Result<std::shared_ptr<QLRowBlock>> YQLKeyspacesVTable::RetrieveData(
-    const QLReadRequestPB& request) const {
-  auto vtable = std::make_shared<QLRowBlock>(schema());
+Result<VTableDataPtr> YQLKeyspacesVTable::RetrieveData(
+    const QLReadRequestMsg& request) const {
+  auto vtable = std::make_shared<qlexpr::QLRowBlock>(schema());
   std::vector<scoped_refptr<NamespaceInfo> > namespaces;
   catalog_manager().GetAllNamespaces(&namespaces, true);
   for (scoped_refptr<NamespaceInfo> ns : namespaces) {
@@ -46,7 +46,7 @@ Result<std::shared_ptr<QLRowBlock>> YQLKeyspacesVTable::RetrieveData(
       continue;
     }
 
-    QLRow& row = vtable->Extend();
+    auto& row = vtable->Extend();
     RETURN_NOT_OK(SetColumnValue(kKeyspaceName, ns->name(), &row));
     RETURN_NOT_OK(SetColumnValue(kDurableWrites, true, &row));
 

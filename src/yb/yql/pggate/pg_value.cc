@@ -1,5 +1,5 @@
 //--------------------------------------------------------------------------------------------------
-// Copyright (c) YugaByte, Inc.
+// Copyright (c) YugabyteDB, Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License"); you may not use this file except
 // in compliance with the License.  You may obtain a copy of the License at
@@ -15,6 +15,9 @@
 #include "yb/yql/pggate/pg_value.h"
 
 #include "yb/common/ql_value.h"
+#include "yb/common/value.messages.h"
+
+#include "yb/dockv/pg_row.h"
 
 #include "yb/util/decimal.h"
 #include "yb/util/status.h"
@@ -25,128 +28,70 @@
 namespace yb {
 namespace pggate {
 
-
-Status PgValueFromPB(const YBCPgTypeEntity *type_entity,
-                     YBCPgTypeAttrs type_attrs,
-                     const QLValuePB& ql_value,
-                     uint64_t* datum,
-                     bool *is_null) {
-
-  // Handling null values.
-  if (ql_value.value_case() == QLValuePB::VALUE_NOT_SET) {
-    *is_null = true;
-    *datum = 0;
-    return Status::OK();
-  }
-
-  *is_null = false;
+Status PgValueToDatum(const YbcPgTypeEntity *type_entity,
+                      YbcPgTypeAttrs type_attrs,
+                      const dockv::PgValue& value,
+                      uint64_t* datum) {
   switch (type_entity->yb_type) {
+    case YB_YQL_DATA_TYPE_GIN_NULL: FALLTHROUGH_INTENDED;
+    case YB_YQL_DATA_TYPE_BOOL: FALLTHROUGH_INTENDED;
     case YB_YQL_DATA_TYPE_INT8: {
-      SCHECK(ql_value.has_int8_value(), InternalError, "Unexpected type in the QL value");
-      int8_t val = ql_value.int8_value();
+      int8_t val = value.int8_value();
       *datum = type_entity->yb_to_datum(reinterpret_cast<uint8_t *>(&val), 0, &type_attrs);
       break;
     }
 
     case YB_YQL_DATA_TYPE_INT16: {
-      SCHECK(ql_value.has_int16_value(), InternalError, "Unexpected type in the QL value");
-      int16_t val = ql_value.int16_value();
+      int16_t val = value.int16_value();
       *datum = type_entity->yb_to_datum(reinterpret_cast<uint8_t *>(&val), 0, &type_attrs);
       break;
     }
+
+    case YB_YQL_DATA_TYPE_FLOAT: FALLTHROUGH_INTENDED;
+      // Float is represented using int32 in network byte order.
+    case YB_YQL_DATA_TYPE_UINT32: FALLTHROUGH_INTENDED;
     case YB_YQL_DATA_TYPE_INT32: {
-      SCHECK(ql_value.has_int32_value(), InternalError, "Unexpected type in the QL value");
-      int32_t val = ql_value.int32_value();
+      int32_t val = value.int32_value();
       *datum = type_entity->yb_to_datum(reinterpret_cast<uint8_t *>(&val), 0, &type_attrs);
       break;
     }
 
+    case YB_YQL_DATA_TYPE_DOUBLE: FALLTHROUGH_INTENDED;
+      // Double is represented using int64 in network byte order.
+    case YB_YQL_DATA_TYPE_TIMESTAMP: FALLTHROUGH_INTENDED;
+    case YB_YQL_DATA_TYPE_UINT64: FALLTHROUGH_INTENDED;
     case YB_YQL_DATA_TYPE_INT64: {
-      SCHECK(ql_value.has_int64_value(), InternalError, "Unexpected type in the QL value");
-      int64_t val = ql_value.int64_value();
-      *datum = type_entity->yb_to_datum(reinterpret_cast<uint8_t *>(&val), 0, &type_attrs);
-      break;
-    }
-
-    case YB_YQL_DATA_TYPE_UINT32: {
-      SCHECK(ql_value.has_uint32_value(), InternalError, "Unexpected type in the QL value");
-      uint32_t val = ql_value.uint32_value();
-      *datum = type_entity->yb_to_datum(reinterpret_cast<uint8_t *>(&val), 0, &type_attrs);
-      break;
-    }
-
-    case YB_YQL_DATA_TYPE_UINT64: {
-      SCHECK(ql_value.has_uint64_value(), InternalError, "Unexpected type in the QL value");
-      uint64_t val = ql_value.uint64_value();
+      int64_t val = value.int64_value();
       *datum = type_entity->yb_to_datum(reinterpret_cast<uint8_t *>(&val), 0, &type_attrs);
       break;
     }
 
     case YB_YQL_DATA_TYPE_STRING: {
-      SCHECK(ql_value.has_string_value(), InternalError, "Unexpected type in the QL value");
-      auto size = ql_value.string_value().size();
-      auto val = const_cast<char *>(ql_value.string_value().c_str());
-      *datum = type_entity->yb_to_datum(reinterpret_cast<uint8_t *>(val), size, &type_attrs);
+      auto str = value.string_value();
+      *datum = type_entity->yb_to_datum(str.data(), str.size(), &type_attrs);
       break;
     }
 
-    case YB_YQL_DATA_TYPE_BOOL: {
-      SCHECK(ql_value.has_bool_value(), InternalError, "Unexpected type in the QL value");
-      bool val = ql_value.bool_value();
-      *datum = type_entity->yb_to_datum(reinterpret_cast<uint8_t *>(&val), 0, &type_attrs);
-      break;
-    }
-
-    case YB_YQL_DATA_TYPE_FLOAT: {
-      SCHECK(ql_value.has_float_value(), InternalError, "Unexpected type in the QL value");
-      float val = ql_value.float_value();
-      *datum = type_entity->yb_to_datum(reinterpret_cast<uint8_t *>(&val), 0, &type_attrs);
-      break;
-    }
-
-    case YB_YQL_DATA_TYPE_DOUBLE: {
-      SCHECK(ql_value.has_double_value(), InternalError, "Unexpected type in the QL value");
-      double val = ql_value.double_value();
-      *datum = type_entity->yb_to_datum(reinterpret_cast<uint8_t *>(&val), 0, &type_attrs);
-      break;
-    }
-
+    case YB_YQL_DATA_TYPE_VECTOR: FALLTHROUGH_INTENDED;
+    case YB_YQL_DATA_TYPE_BSON: FALLTHROUGH_INTENDED;
     case YB_YQL_DATA_TYPE_BINARY: {
-      SCHECK(ql_value.has_binary_value(), InternalError, "Unexpected type in the QL value");
-      auto size = ql_value.binary_value().size();
-      auto val = const_cast<char *>(ql_value.binary_value().c_str());
-      *datum = type_entity->yb_to_datum(reinterpret_cast<uint8_t *>(val), size, &type_attrs);
-      break;
-    }
-
-    case YB_YQL_DATA_TYPE_TIMESTAMP: {
-      // Timestamp encoded as int64 (QL) value.
-      SCHECK(ql_value.has_int64_value(), InternalError, "Unexpected type in the QL value");
-      int64_t val = ql_value.int64_value();
-      *datum = type_entity->yb_to_datum(reinterpret_cast<uint8_t *>(&val), 0, &type_attrs);
+      auto str = value.binary_value();
+      *datum = type_entity->yb_to_datum(str.data(), str.size(), &type_attrs);
       break;
     }
 
     case YB_YQL_DATA_TYPE_DECIMAL: {
-      SCHECK(ql_value.has_decimal_value(), InternalError, "Unexpected type in the QL value");
       util::Decimal yb_decimal;
-      if (!yb_decimal.DecodeFromComparable(ql_value.decimal_value()).ok()) {
+      if (!yb_decimal.DecodeFromComparable(value.decimal_value()).ok()) {
         return STATUS_SUBSTITUTE(InternalError,
                                   "Failed to deserialize DECIMAL from $1",
-                                  ql_value.decimal_value());
+                                  value.decimal_value().ToDebugHexString());
       }
       auto plaintext = yb_decimal.ToString();
       auto val = const_cast<char *>(plaintext.c_str());
       *datum = type_entity->yb_to_datum(reinterpret_cast<uint8_t *>(val),
                                         plaintext.size(),
                                         &type_attrs);
-      break;
-    }
-
-    case YB_YQL_DATA_TYPE_GIN_NULL: {
-      SCHECK(ql_value.has_gin_null_value(), InternalError, "Unexpected type in the QL value");
-      uint8_t val = ql_value.gin_null_value();
-      *datum = type_entity->yb_to_datum(&val, 0, &type_attrs);
       break;
     }
 
@@ -158,11 +103,132 @@ Status PgValueFromPB(const YBCPgTypeEntity *type_entity,
   return Status::OK();
 }
 
+Status PBToDatum(const YbcPgTypeEntity *type_entity,
+                 YbcPgTypeAttrs type_attrs,
+                 const QLValuePB& value,
+                 uint64_t* datum,
+                 bool* is_null) {
+  if (IsNull(value)) {
+    *is_null = true;
+    return Status::OK();
+  }
+  *is_null = false;
 
-Status PgValueToPB(const YBCPgTypeEntity *type_entity,
-                   uint64_t datum,
-                   bool is_null,
-                   QLValuePB* ql_value) {
+  switch (type_entity->yb_type) {
+    case YB_YQL_DATA_TYPE_INT8: {
+      int8_t val = value.int8_value();
+      *datum = type_entity->yb_to_datum(reinterpret_cast<uint8_t *>(&val), 0, &type_attrs);
+      break;
+    }
+
+    case YB_YQL_DATA_TYPE_INT16: {
+      int16_t val = value.int16_value();
+      *datum = type_entity->yb_to_datum(reinterpret_cast<uint8_t *>(&val), 0, &type_attrs);
+      break;
+    }
+
+    case YB_YQL_DATA_TYPE_INT32: {
+      int32_t val = value.int32_value();
+      *datum = type_entity->yb_to_datum(reinterpret_cast<uint8_t *>(&val), 0, &type_attrs);
+      break;
+    }
+
+    case YB_YQL_DATA_TYPE_INT64: {
+      int64_t val = value.int64_value();
+      *datum = type_entity->yb_to_datum(reinterpret_cast<uint8_t *>(&val), 0, &type_attrs);
+      break;
+    }
+
+    case YB_YQL_DATA_TYPE_UINT32: {
+      int32_t val = value.uint32_value();
+      *datum = type_entity->yb_to_datum(reinterpret_cast<uint8_t *>(&val), 0, &type_attrs);
+      break;
+    }
+
+    case YB_YQL_DATA_TYPE_UINT64: {
+      int64_t val = value.uint64_value();
+      *datum = type_entity->yb_to_datum(reinterpret_cast<uint8_t *>(&val), 0, &type_attrs);
+      break;
+    }
+
+    case YB_YQL_DATA_TYPE_STRING: {
+      auto str = value.string_value();
+      *datum = type_entity->yb_to_datum(str.data(), str.size(), &type_attrs);
+      break;
+    }
+
+    case YB_YQL_DATA_TYPE_BOOL: {
+      auto val = value.bool_value();
+      *datum = type_entity->yb_to_datum(reinterpret_cast<uint8_t *>(&val), 0, &type_attrs);
+      break;
+    }
+
+    case YB_YQL_DATA_TYPE_FLOAT: {
+      auto val = value.float_value();
+      *datum = type_entity->yb_to_datum(reinterpret_cast<uint8_t *>(&val), 0, &type_attrs);
+      break;
+    }
+
+    case YB_YQL_DATA_TYPE_DOUBLE: {
+      auto val = value.double_value();
+      *datum = type_entity->yb_to_datum(reinterpret_cast<uint8_t *>(&val), 0, &type_attrs);
+      break;
+    }
+
+    case YB_YQL_DATA_TYPE_VECTOR: FALLTHROUGH_INTENDED;
+    case YB_YQL_DATA_TYPE_BINARY: {
+      auto str = value.binary_value();
+      *datum = type_entity->yb_to_datum(str.data(), str.size(), &type_attrs);
+      break;
+    }
+    case YB_YQL_DATA_TYPE_BSON: {
+      auto str = value.bson_value();
+      *datum = type_entity->yb_to_datum(str.data(), str.size(), &type_attrs);
+      break;
+    }
+
+    case YB_YQL_DATA_TYPE_TIMESTAMP: {
+      auto val = value.int64_value();
+      *datum = type_entity->yb_to_datum(reinterpret_cast<uint8_t *>(&val), 0, &type_attrs);
+      break;
+    }
+
+    case YB_YQL_DATA_TYPE_DECIMAL: {
+      util::Decimal yb_decimal;
+      RETURN_NOT_OK_PREPEND(
+          yb_decimal.DecodeFromComparable(value.decimal_value()),
+          Format("Failed to deserialize DECIMAL from $0", value.decimal_value()));
+
+      std::string plaintext;
+      RETURN_NOT_OK(yb_decimal.ToPointString(&plaintext, std::numeric_limits<int32_t>::max()));
+      auto val = const_cast<char *>(plaintext.c_str());
+      *datum = type_entity->yb_to_datum(reinterpret_cast<uint8_t *>(val),
+                                        plaintext.size(),
+                                        &type_attrs);
+      break;
+    }
+
+    case YB_YQL_DATA_TYPE_GIN_NULL: {
+      auto val = value.gin_null_value();
+      *datum = type_entity->yb_to_datum(reinterpret_cast<uint8_t *>(&val), 0, &type_attrs);
+      break;
+    }
+
+    YB_PG_UNSUPPORTED_TYPES_IN_SWITCH:
+    YB_PG_INVALID_TYPES_IN_SWITCH:
+      return STATUS_SUBSTITUTE(InternalError, "unsupported type $0", type_entity->yb_type);
+  }
+
+  return Status::OK();
+}
+
+namespace {
+
+template <class Value>
+Status DoPgValueToPB(const YbcPgTypeEntity *type_entity,
+                     uint64_t datum,
+                     bool is_null,
+                     Value* ql_value) {
   if (is_null) {
     SetNull(ql_value);
     return Status::OK();
@@ -209,7 +275,11 @@ Status PgValueToPB(const YBCPgTypeEntity *type_entity,
       char *value;
       int64_t bytes = type_entity->datum_fixed_size;
       type_entity->datum_to_yb(datum, &value, &bytes);
-      ql_value->set_string_value(value, bytes);
+      if constexpr (std::is_same_v<Value, QLValuePB>) {
+        ql_value->set_string_value(value, bytes);
+      } else {
+        ql_value->dup_string_value(Slice(value, bytes));
+      }
       break;
     }
     case YB_YQL_DATA_TYPE_BOOL: {
@@ -230,11 +300,27 @@ Status PgValueToPB(const YBCPgTypeEntity *type_entity,
       ql_value->set_double_value(value);
       break;
     }
+    case YB_YQL_DATA_TYPE_VECTOR: FALLTHROUGH_INTENDED;
     case YB_YQL_DATA_TYPE_BINARY: {
       uint8_t *value;
       int64_t bytes = type_entity->datum_fixed_size;
       type_entity->datum_to_yb(datum, &value, &bytes);
-      ql_value->set_binary_value(value, bytes);
+      if constexpr (std::is_same_v<Value, QLValuePB>) {
+        ql_value->set_binary_value(value, bytes);
+      } else {
+        ql_value->dup_binary_value(Slice(value, bytes));
+      }
+      break;
+    }
+    case YB_YQL_DATA_TYPE_BSON: {
+      uint8_t* value;
+      int64_t bytes = type_entity->datum_fixed_size;
+      type_entity->datum_to_yb(datum, &value, &bytes);
+      if constexpr (std::is_same_v<Value, QLValuePB>) {
+        ql_value->set_bson_value(value, bytes);
+      } else {
+        ql_value->dup_bson_value(Slice(value, bytes));
+      }
       break;
     }
     case YB_YQL_DATA_TYPE_TIMESTAMP: {
@@ -247,7 +333,12 @@ Status PgValueToPB(const YBCPgTypeEntity *type_entity,
       char* plaintext;
       type_entity->datum_to_yb(datum, &plaintext, nullptr);
       util::Decimal yb_decimal(plaintext);
-      ql_value->set_decimal_value(yb_decimal.EncodeToComparable());
+      auto value = yb_decimal.EncodeToComparable();
+      if constexpr (std::is_same_v<Value, QLValuePB>) {
+        ql_value->set_decimal_value(std::move(value));
+      } else {
+        ql_value->dup_decimal_value(value);
+      }
       break;
     }
     case YB_YQL_DATA_TYPE_GIN_NULL: {
@@ -261,6 +352,22 @@ Status PgValueToPB(const YBCPgTypeEntity *type_entity,
       return STATUS_SUBSTITUTE(InternalError, "unsupported type $0", type_entity->yb_type);
   }
   return Status::OK();
+}
+
+} // namespace
+
+Status PgValueToPB(const YbcPgTypeEntity *type_entity,
+                   uint64_t datum,
+                   bool is_null,
+                   QLValuePB* ql_value) {
+  return DoPgValueToPB(type_entity, datum, is_null, ql_value);
+}
+
+Status PgValueToPB(const YbcPgTypeEntity *type_entity,
+                   uint64_t datum,
+                   bool is_null,
+                   LWQLValuePB* ql_value) {
+  return DoPgValueToPB(type_entity, datum, is_null, ql_value);
 }
 
 }  // namespace pggate

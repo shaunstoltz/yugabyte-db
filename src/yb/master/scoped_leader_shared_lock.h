@@ -15,9 +15,9 @@
 // specific language governing permissions and limitations
 // under the License.
 //
-// The following only applies to changes made to this file as part of YugaByte development.
+// The following only applies to changes made to this file as part of YugabyteDB development.
 //
-// Portions Copyright (c) YugaByte, Inc.
+// Portions Copyright (c) YugabyteDB, Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License"); you may not use this file except
 // in compliance with the License.  You may obtain a copy of the License at
@@ -36,12 +36,14 @@
 #include <string>
 #include <unordered_map>
 
-#include <glog/logging.h>
+#include "yb/common/opid.h"
 
+#include "yb/master/leader_epoch.h"
 #include "yb/master/master_fwd.h"
 
 #include "yb/rpc/service_if.h"
 
+#include "yb/util/logging.h"
 #include "yb/util/status_fwd.h"
 #include "yb/util/rw_mutex.h"
 
@@ -50,9 +52,9 @@ namespace master {
 
 // This is how we should instantiate ScopedLeaderSharedLock. Captures context information so we can
 // use it in logging and debugging.
-#define SCOPED_LEADER_SHARED_LOCK(lock_name, catalog_manager) \
+#define SCOPED_LEADER_SHARED_LOCK(lock_name, ...) \
     ::yb::master::ScopedLeaderSharedLock lock_name( \
-        (catalog_manager), __FILE__, __LINE__, __func__)
+        __VA_ARGS__, __FILE__, __LINE__, __func__)
 
 // Scoped "shared lock" to serialize master leader elections.
 //
@@ -77,19 +79,21 @@ namespace master {
 //
 class ScopedLeaderSharedLock {
  public:
-  // Creates a new shared lock, acquiring the catalog manager's leader_lock_
+  // Creates a new shared lock, acquiring the catalog manager's leader_mutex_
   // for reading in the process. The lock is released when this object is
   // destroyed.
   //
   // 'catalog' must outlive this object.
-  explicit ScopedLeaderSharedLock(
+  ScopedLeaderSharedLock(
       CatalogManager* catalog,
       const char* file_name,
       int line_number,
-      const char* function_name);
+      const char* function_name) :
+      ScopedLeaderSharedLock(catalog, OpId::kUnknownTerm, file_name, line_number, function_name) {}
 
-  explicit ScopedLeaderSharedLock(
-      enterprise::CatalogManager* catalog,
+  ScopedLeaderSharedLock(
+      CatalogManager* catalog,
+      int64_t expected_term,
       const char* file_name,
       int line_number,
       const char* function_name);
@@ -137,6 +141,10 @@ class ScopedLeaderSharedLock {
     return "Status success.";
   }
 
+  const LeaderEpoch& epoch() const {
+    return epoch_;
+  }
+
   // Check that the catalog manager is initialized. It may or may not be the
   // leader of its Raft configuration.
   //
@@ -174,12 +182,14 @@ class ScopedLeaderSharedLock {
   bool CheckIsInitializedOrRespondInternal(RespClass* resp, rpc::RpcContext* rpc,
                                            bool set_error = true);
 
+  Status Lock();
+
   CatalogManager* catalog_;
   std::shared_lock<RWMutex> leader_shared_lock_;
   Status catalog_status_;
   Status leader_status_;
   std::chrono::steady_clock::time_point start_;
-  int64_t leader_ready_term_;
+  LeaderEpoch epoch_;
 
   const char* file_name_;
   int line_number_;

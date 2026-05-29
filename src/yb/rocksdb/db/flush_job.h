@@ -3,9 +3,9 @@
 //  LICENSE file in the root directory of this source tree. An additional grant
 //  of patent rights can be found in the PATENTS file in the same directory.
 //
-// The following only applies to changes made to this file as part of YugaByte development.
+// The following only applies to changes made to this file as part of YugabyteDB development.
 //
-// Portions Copyright (c) YugaByte, Inc.
+// Portions Copyright (c) YugabyteDB, Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License"); you may not use this file except
 // in compliance with the License.  You may obtain a copy of the License at
@@ -31,6 +31,8 @@
 #include <string>
 #include <utility>
 #include <vector>
+
+#include "yb/ash/ash_fwd.h"
 
 #include "yb/rocksdb/db.h"
 #include "yb/rocksdb/db/column_family.h"
@@ -68,20 +70,15 @@ class FlushJob {
  public:
   // TODO(icanadi) make effort to reduce number of parameters here
   // IMPORTANT: mutable_cf_options needs to be alive while FlushJob is alive
-  FlushJob(const std::string& dbname, ColumnFamilyData* cfd,
-           const DBOptions& db_options,
-           const MutableCFOptions& mutable_cf_options,
-           const EnvOptions& env_options, VersionSet* versions,
-           InstrumentedMutex* db_mutex, std::atomic<bool>* shutting_down,
-           std::atomic<bool>* disable_flush_on_shutdown_,
-           std::vector<SequenceNumber> existing_snapshots,
-           SequenceNumber earliest_write_conflict_snapshot,
-           MemTableFilter mem_table_flush_filter,
-           FileNumbersProvider* file_number_provider,
-           JobContext* job_context, LogBuffer* log_buffer,
-           Directory* db_directory, Directory* output_file_directory,
-           CompressionType output_compression, Statistics* stats,
-           EventLogger* event_logger);
+  FlushJob(
+      const std::string& dbname, ColumnFamilyData* cfd, const DBOptions& db_options,
+      const MutableCFOptions& mutable_cf_options, const EnvOptions& env_options,
+      VersionSet* versions, InstrumentedMutex* db_mutex, std::atomic<bool>* shutting_down,
+      std::atomic<bool>* disable_flush_on_shutdown_, std::vector<SequenceNumber> existing_snapshots,
+      SequenceNumber earliest_write_conflict_snapshot, MemTableFilter mem_table_flush_filter,
+      FileNumbersProvider* file_number_provider, JobContext* job_context, LogBuffer* log_buffer,
+      Directory* db_directory, Directory* output_file_directory, CompressionType output_compression,
+      Statistics* stats, FlushReason flush_reason, EventLogger* event_logger);
 
   ~FlushJob();
 
@@ -112,7 +109,9 @@ class FlushJob {
   Directory* output_file_directory_;
   CompressionType output_compression_;
   Statistics* stats_;
+  const FlushReason flush_reason_;
   EventLogger* event_logger_;
+  yb::ash::WaitStateInfoPtr wait_state_;
   TableProperties table_properties_;
 };
 

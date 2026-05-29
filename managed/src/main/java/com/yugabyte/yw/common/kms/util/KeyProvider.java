@@ -1,5 +1,5 @@
 /*
- * Copyright 2019 YugaByte, Inc. and Contributors
+ * Copyright 2019 YugabyteDB, Inc. and Contributors
  *
  * Licensed under the Polyform Free Trial License 1.0.0 (the "License"); you
  * may not use this file except in compliance with the License. You
@@ -11,12 +11,14 @@
 package com.yugabyte.yw.common.kms.util;
 
 import com.yugabyte.yw.common.kms.algorithms.SupportedAlgorithmInterface;
-import com.yugabyte.yw.common.kms.services.EncryptionAtRestService;
-import com.yugabyte.yw.common.kms.services.GcpEARService;
 import com.yugabyte.yw.common.kms.services.AwsEARService;
 import com.yugabyte.yw.common.kms.services.AzuEARService;
-import com.yugabyte.yw.common.kms.services.SmartKeyEARService;
+import com.yugabyte.yw.common.kms.services.CiphertrustEARService;
+import com.yugabyte.yw.common.kms.services.EncryptionAtRestService;
+import com.yugabyte.yw.common.kms.services.GcpEARService;
 import com.yugabyte.yw.common.kms.services.HashicorpEARService;
+import com.yugabyte.yw.common.kms.services.OciEARService;
+import com.yugabyte.yw.common.kms.services.SmartKeyEARService;
 import io.ebean.annotation.EnumValue;
 
 /**
@@ -36,8 +38,14 @@ public enum KeyProvider {
   @EnumValue("GCP")
   GCP(GcpEARService.class),
 
+  @EnumValue("OCI")
+  OCI(OciEARService.class),
+
   @EnumValue("AZU")
-  AZU(AzuEARService.class);
+  AZU(AzuEARService.class),
+
+  @EnumValue("CIPHERTRUST")
+  CIPHERTRUST(CiphertrustEARService.class);
 
   private final Class<?> providerService;
 

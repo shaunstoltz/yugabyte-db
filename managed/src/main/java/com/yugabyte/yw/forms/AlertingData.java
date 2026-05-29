@@ -1,5 +1,5 @@
 /*
- * Copyright 2021 YugaByte, Inc. and Contributors
+ * Copyright 2021 YugabyteDB, Inc. and Contributors
  *
  * Licensed under the Polyform Free Trial License 1.0.0 (the "License"); you
  * may not use this file except in compliance with the License. You
@@ -11,13 +11,10 @@ package com.yugabyte.yw.forms;
 
 import io.swagger.annotations.ApiModel;
 import io.swagger.annotations.ApiModelProperty;
-import play.data.validation.Constraints;
 
 @ApiModel(description = "Alerting configuration")
 public class AlertingData {
 
-  @Constraints.Email
-  @Constraints.MinLength(5)
   @ApiModelProperty(value = "Alert email address", example = "test@example.com")
   public String alertingEmail;
 

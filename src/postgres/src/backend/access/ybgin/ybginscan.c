@@ -3,7 +3,7 @@
  * ybginscan.c
  *	  routines to manage scans of Yugabyte inverted index relations
  *
- * Copyright (c) YugaByte, Inc.
+ * Copyright (c) YugabyteDB, Inc.
  *
  * Licensed under the Apache License, Version 2.0 (the "License"); you may not
  * use this file except in compliance with the License.  You may obtain a copy
@@ -27,15 +27,15 @@
 #include "access/genam.h"
 #include "access/relscan.h"
 #include "access/skey.h"
+#include "access/yb_scan.h"
 #include "access/ybgin.h"
 #include "access/ybgin_private.h"
-#include "commands/tablegroup.h"
+#include "commands/yb_tablegroup.h"
 #include "miscadmin.h"
-#include "utils/palloc.h"
-#include "utils/memutils.h"
-#include "utils/rel.h"
-
 #include "pg_yb_utils.h"
+#include "utils/memutils.h"
+#include "utils/palloc.h"
+#include "utils/rel.h"
 #include "yb/yql/pggate/ybc_pggate.h"
 
 /*
@@ -58,10 +58,10 @@ ybginbeginscan(Relation rel, int nkeys, int norderbys)
 	so = (GinScanOpaque) palloc(sizeof(YbginScanOpaqueData));
 	so->keys = NULL;
 	so->nkeys = 0;
-	so->tempCtx = AllocSetContextCreate(GetCurrentMemoryContext(),
+	so->tempCtx = AllocSetContextCreate(CurrentMemoryContext,
 										"Ybgin scan temporary context",
 										ALLOCSET_DEFAULT_SIZES);
-	so->keyCtx = AllocSetContextCreate(GetCurrentMemoryContext(),
+	so->keyCtx = AllocSetContextCreate(CurrentMemoryContext,
 									   "Ybgin scan key context",
 									   ALLOCSET_DEFAULT_SIZES);
 	initGinState(&so->ginstate, scan->indexRelation);
@@ -76,24 +76,20 @@ ybginrescan(IndexScanDesc scan, ScanKey scankey, int nscankeys,
 			ScanKey orderbys, int norderbys)
 {
 	YbginScanOpaque ybso = (YbginScanOpaque) scan->opaque;
+	YbcPgPrepareParameters prepare_params = {
+		.index_relfilenode_oid = YbGetRelfileNodeId(scan->indexRelation),
+		.index_only_scan = scan->xs_want_itup,
+		.embedded_idx = YbIsScanningEmbeddedIdx(scan->heapRelation,
+												scan->indexRelation),
+	};
 
 	/* Initialize non-yb gin scan opaque fields. */
 	ginrescan(scan, scankey, nscankeys, orderbys, norderbys);
 
-	bool is_colocated = YbGetTableProperties(scan->heapRelation)->is_colocated;
+	ybso->handle = YbNewSelect(scan->heapRelation, &prepare_params);
 
-	/* Initialize ybgin scan opaque handle. */
-	YBCPgPrepareParameters prepare_params = {
-		.index_oid = RelationGetRelid(scan->indexRelation),
-		.index_only_scan = scan->xs_want_itup,
-		.use_secondary_index = true,	/* can't have ybgin primary index */
-		.querying_colocated_table = is_colocated,
-	};
-	HandleYBStatus(YBCPgNewSelect(YBCGetDatabaseOid(scan->heapRelation),
-								  YbGetStorageRelid(scan->heapRelation),
-								  &prepare_params,
-								  YBCIsRegionLocal(scan->heapRelation),
-								  &ybso->handle));
+	YbApplyPrimaryPushdown(ybso->handle, scan->yb_rel_pushdown);
+	YbApplySecondaryIndexPushdown(ybso->handle, scan->yb_idx_pushdown);
 
 	/* Initialize ybgin scan opaque is_exec_done. */
 	ybso->is_exec_done = false;

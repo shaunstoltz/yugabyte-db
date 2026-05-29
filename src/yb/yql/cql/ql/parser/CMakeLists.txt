@@ -1,4 +1,4 @@
-# Copyright (c) YugaByte, Inc.
+# Copyright (c) YugabyteDB, Inc.
 #
 # Licensed under the Apache License, Version 2.0 (the "License"); you may not use this file except
 # in compliance with the License.  You may obtain a copy of the License at
@@ -51,8 +51,13 @@ set(PARSER_CUSTOM_FLAGS
     "-Wno-tautological-undefined-compare -Wno-implicit-fallthrough -Wno-null-conversion")
 
 set(PARSER_CUSTOM_FLAGS "${PARSER_CUSTOM_FLAGS} -Wno-shorten-64-to-32")
-if(IS_CLANG AND "${COMPILER_VERSION}" VERSION_GREATER_EQUAL "15.0.0")
+if(IS_CLANG AND "${COMPILER_VERSION}" VERSION_GREATER_EQUAL "14.0.0")
   set(PARSER_CUSTOM_FLAGS "${PARSER_CUSTOM_FLAGS} -Wno-unused-but-set-variable")
+endif()
+if(IS_GCC AND "${COMPILER_VERSION}" MATCHES "^13[.].*$")
+  # To work around this issue:
+  # https://gist.githubusercontent.com/mbautin/199bb4a5011148ae93afe38887bc120a/raw
+  string(APPEND PARSER_CUSTOM_FLAGS " -Wno-nonnull-compare")
 endif()
 
 set_source_files_properties(${SCANNER_LEX_L_CC} ${PARSER_GRAM_Y_CC_FINAL} PROPERTIES

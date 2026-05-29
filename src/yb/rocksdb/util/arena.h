@@ -3,9 +3,9 @@
 //  LICENSE file in the root directory of this source tree. An additional grant
 //  of patent rights can be found in the PATENTS file in the same directory.
 //
-// The following only applies to changes made to this file as part of YugaByte development.
+// The following only applies to changes made to this file as part of YugabyteDB development.
 //
-// Portions Copyright (c) YugaByte, Inc.
+// Portions Copyright (c) YugabyteDB, Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License"); you may not use this file except
 // in compliance with the License.  You may obtain a copy of the License at
@@ -83,6 +83,12 @@ class Arena : public Allocator {
   // Otherwise, the error message will be printed out to stderr directly.
   char* AllocateAligned(size_t bytes, size_t huge_page_size = 0,
                         Logger* logger = nullptr) override;
+
+  template <class T, class... Args>
+  T* NewObject(Args&&... args) {
+    void *mem = AllocateAligned(sizeof(T));
+    return new (mem) T(std::forward<Args>(args)...);
+  }
 
   // Returns an estimate of the total memory usage of data allocated
   // by the arena (exclude the space allocated but not yet used for future

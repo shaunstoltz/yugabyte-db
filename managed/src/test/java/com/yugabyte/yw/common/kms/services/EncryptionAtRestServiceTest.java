@@ -1,5 +1,5 @@
 /*
- * Copyright 2019 YugaByte, Inc. and Contributors
+ * Copyright 2019 YugabyteDB, Inc. and Contributors
  *
  * Licensed under the Polyform Free Trial License 1.0.0 (the "License"); you
  * may not use this file except in compliance with the License. You
@@ -19,6 +19,7 @@ import com.yugabyte.yw.common.ApiHelper;
 import com.yugabyte.yw.common.FakeDBApplication;
 import com.yugabyte.yw.common.kms.EncryptionAtRestManager;
 import com.yugabyte.yw.common.kms.algorithms.SupportedAlgorithmInterface;
+import com.yugabyte.yw.common.kms.util.EncryptionAtRestUtil.EncryptionKey;
 import com.yugabyte.yw.common.kms.util.KeyProvider;
 import com.yugabyte.yw.forms.EncryptionAtRestConfig;
 import java.util.Arrays;
@@ -27,7 +28,7 @@ import java.util.UUID;
 import org.junit.Before;
 import org.junit.Test;
 import org.junit.runner.RunWith;
-import org.mockito.runners.MockitoJUnitRunner;
+import org.mockito.junit.MockitoJUnitRunner;
 import play.libs.Json;
 
 enum TestAlgorithm implements SupportedAlgorithmInterface {
@@ -67,33 +68,46 @@ class TestEncryptionAtRestService extends EncryptionAtRestService<TestAlgorithm>
   }
 
   @Override
-  protected byte[] createKeyWithService(
+  protected EncryptionKey createKeyWithService(
       UUID universeUUID, UUID configUUID, EncryptionAtRestConfig config) {
-    return "some_key_id".getBytes();
+    return new EncryptionKey("some_key_id".getBytes());
   }
 
   @Override
-  protected byte[] rotateKeyWithService(
+  protected EncryptionKey rotateKeyWithService(
       UUID universeUUID, UUID configUUID, EncryptionAtRestConfig config) {
-    return "some_key_id".getBytes();
+    return new EncryptionKey("some_key_id".getBytes());
   }
 
   @Override
   public byte[] retrieveKeyWithService(
-      UUID universeUUID, UUID configUUID, byte[] keyRef, EncryptionAtRestConfig config) {
+      UUID configUUID, byte[] keyRef, ObjectNode encryptionContext) {
     this.createRequest = !this.createRequest;
     return this.createRequest ? null : "some_key_value".getBytes();
   }
 
   @Override
   public byte[] validateRetrieveKeyWithService(
-      UUID universeUUID,
-      UUID configUUID,
-      byte[] keyRef,
-      EncryptionAtRestConfig config,
-      ObjectNode authConig) {
+      UUID configUUID, byte[] keyRef, ObjectNode encryptionContext, ObjectNode authConig) {
     this.createRequest = !this.createRequest;
     return this.createRequest ? null : "some_key_value".getBytes();
+  }
+
+  @Override
+  public ObjectNode getKeyMetadata(UUID configUUID) {
+    // Does nothing here because we test for individual KMS providers.
+    return null;
+  }
+
+  @Override
+  public EncryptionKey encryptKeyWithService(UUID configUUID, byte[] universeKey) {
+    return null;
+  }
+
+  @Override
+  public void refreshKmsWithService(UUID configUUID, ObjectNode authConfig) throws Exception {
+    // Does nothing here
+    throw new UnsupportedOperationException("Unimplemented method 'refreshKmsWithService'");
   }
 }
 
@@ -133,8 +147,9 @@ public class EncryptionAtRestServiceTest extends FakeDBApplication {
     service.createAuthConfig(
         customerUUID, "some_config_name", Json.newObject().put("some_key", "some_value"));
     EncryptionAtRestConfig testConfig = config.clone();
-    byte[] key = service.createKey(universeUUID, customerUUID, testConfig);
+    EncryptionKey key = service.createKey(universeUUID, customerUUID, testConfig);
     assertNotNull(key);
-    assertEquals("some_key_id", new String(key));
+    assertNotNull(key.getKeyBytes());
+    assertEquals("some_key_id", new String(key.getKeyBytes()));
   }
 }

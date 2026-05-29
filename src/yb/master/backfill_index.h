@@ -1,4 +1,4 @@
-// Copyright (c) YugaByte, Inc.
+// Copyright (c) YugabyteDB, Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License"); you may not use this file except
 // in compliance with the License.  You may obtain a copy of the License at
@@ -24,27 +24,33 @@
 #include <vector>
 
 #include <boost/mpl/and.hpp>
-#include "yb/util/flags.h"
 
+#include "yb/ash/wait_state.h"
 #include "yb/common/entity_ids.h"
-#include "yb/common/index.h"
-#include "yb/common/partition.h"
+#include "yb/common/transaction.h"
+#include "yb/dockv/partition.h"
 
 #include "yb/gutil/integral_types.h"
 #include "yb/gutil/ref_counted.h"
 
-#include "yb/master/async_rpc_tasks.h"
+#include "yb/master/async_rpc_tasks_base.h"
 #include "yb/master/catalog_entity_info.h"
+#include "yb/master/ysql_ddl_verification_task.h"
+
+#include "yb/qlexpr/index.h"
 
 #include "yb/server/monitored_task.h"
 
-#include "yb/util/status_fwd.h"
+#include "yb/util/flags.h"
 #include "yb/util/format.h"
 #include "yb/util/locks.h"
 #include "yb/util/monotime.h"
 #include "yb/util/shared_lock.h"
+#include "yb/util/status_fwd.h"
 #include "yb/util/tostring.h"
 #include "yb/util/type_traits.h"
+
+#include "yb/tserver/tserver_admin.pb.h"
 
 namespace yb {
 namespace master {
@@ -63,14 +69,18 @@ class MultiStageAlterTable {
   // INDEX_PERM_DELETE_ONLY -> INDEX_PERM_WRITE_AND_DELETE -> BACKFILL
   static Status LaunchNextTableInfoVersionIfNecessary(
       CatalogManager* mgr, const scoped_refptr<TableInfo>& Info, uint32_t current_version,
-      bool respect_backfill_deferrals = true);
+      const LeaderEpoch& epoch,
+      std::optional<TransactionMetadata> requester_transaction,
+      bool respect_backfill_deferrals = true,
+      bool update_ysql_to_backfill = false);
 
   // Clears the fully_applied_* state for the given table and optionally sets it to RUNNING.
   // If the version has changed and does not match the expected version no
   // change is made.
   static Status ClearFullyAppliedAndUpdateState(
       CatalogManager* mgr, const scoped_refptr<TableInfo>& table,
-      boost::optional<uint32_t> expected_version, bool update_state_to_running);
+      std::optional<uint32_t> expected_version, bool update_state_to_running,
+      const LeaderEpoch& epoch);
 
   // Copies the current schema, schema_version, indexes and index_info
   // into their fully_applied_* equivalents. This is useful to ensure
@@ -83,16 +93,18 @@ class MultiStageAlterTable {
   // Returns whether any permissions were actually updated (leading to a version being incremented).
   static Result<bool> UpdateIndexPermission(
       CatalogManager* mgr, const scoped_refptr<TableInfo>& indexed_table,
-      const std::unordered_map<TableId, IndexPermissions>& perm_mapping,
-      boost::optional<uint32_t> current_version = boost::none);
+      const std::unordered_map<TableId, IndexPermissions>& perm_mapping, const LeaderEpoch& epoch,
+      std::optional<uint32_t> current_version = std::nullopt);
 
-  // TODO(jason): make this private when closing issue #6218.
+ private:
   // Start Index Backfill process/step for the specified table/index.
-  static Status
-  StartBackfillingData(CatalogManager *catalog_manager,
-                       const scoped_refptr<TableInfo> &indexed_table,
-                       const std::vector<IndexInfoPB>& idx_infos,
-                       boost::optional<uint32_t> expected_version);
+  // If requester_transaction is provided it will be used to monitor the liveness of the
+  // PG backend that initiated the backfill.
+  static Status StartBackfillingData(
+      CatalogManager* catalog_manager, const scoped_refptr<TableInfo>& indexed_table,
+      const std::vector<IndexInfoPB>& idx_infos, std::optional<uint32_t> expected_version,
+      const LeaderEpoch& epoch,
+      std::optional<TransactionMetadata> requester_transaction);
 };
 
 class BackfillTablet;
@@ -106,11 +118,13 @@ class BackfillTable : public std::enable_shared_from_this<BackfillTable> {
   BackfillTable(Master *master, ThreadPool *callback_pool,
                 const scoped_refptr<TableInfo> &indexed_table,
                 std::vector<IndexInfoPB> indexes,
-                const scoped_refptr<NamespaceInfo> &ns_info);
+                const scoped_refptr<NamespaceInfo> &ns_info,
+                LeaderEpoch epoch,
+                std::optional<TransactionMetadata> requester_transaction);
 
   Status Launch();
 
-  Status UpdateSafeTime(const Status& s, HybridTime ht);
+  Status UpdateSafeTime(const Status& s, HybridTime ht) EXCLUDES(mutex_);
 
   Status Done(const Status& s, const std::unordered_set<TableId>& failed_indexes);
 
@@ -126,21 +140,27 @@ class BackfillTable : public std::enable_shared_from_this<BackfillTable> {
 
   std::string description() const;
 
+  enum class State : uint8_t {
+    kRunning,
+    kSuccess,
+    kFailed,
+  };
+
+  State state() const {
+    return state_.load(std::memory_order_acquire);
+  }
+
   bool done() const {
-    return done_.load(std::memory_order_acquire);
+    return state() != State::kRunning;
   }
 
   bool timestamp_chosen() const {
     return timestamp_chosen_.load(std::memory_order_acquire);
   }
 
-  HybridTime read_time_for_backfill() const {
-    std::lock_guard<simple_spinlock> l(mutex_);
+  HybridTime read_time_for_backfill() const EXCLUDES(mutex_) {
+    std::lock_guard l(mutex_);
     return read_time_for_backfill_;
-  }
-
-  int64_t leader_term() const {
-    return leader_term_;
   }
 
   const std::string GetNamespaceName() const;
@@ -151,15 +171,29 @@ class BackfillTable : public std::enable_shared_from_this<BackfillTable> {
 
   const TableId& indexed_table_id() const { return indexed_table_->id(); }
 
-  Status UpdateRowsProcessedForIndexTable(const uint64_t number_rows_processed);
+  scoped_refptr<TableInfo> table() { return indexed_table_; }
 
-  const uint64_t number_rows_processed() const { return number_rows_processed_; }
+  Status UpdateRowsProcessedForIndexTable(
+      const uint64_t num_rows_read_from_table_for_backfill,
+      const std::unordered_map<TableId, double>& num_rows_backfilled_in_index);
+
+  const LeaderEpoch& epoch() const { return epoch_; }
+
+  bool using_table_locks() const { return using_table_locks_.load(std::memory_order_acquire); }
+
+  const ash::WaitStateInfoPtr& wait_state() const { return wait_state_; }
+
+  static bool GetIndexTableRetainsDeleteMarkers(const PersistentTableInfo& index_table);
+
+  static void UnsetIndexTableRetainsDeleteMarkers(PersistentTableInfo* index_table);
+
+  Status Abort(bool from_liveness = false);
 
  private:
   void LaunchBackfillOrAbort();
   Status WaitForTabletSplitting();
   Status DoLaunchBackfill();
-  Status LaunchComputeSafeTimeForRead();
+  Status LaunchComputeSafeTimeForRead() EXCLUDES(mutex_);
   Status DoBackfill();
 
   Status MarkAllIndexesAsFailed();
@@ -174,10 +208,15 @@ class BackfillTable : public std::enable_shared_from_this<BackfillTable> {
   Status AlterTableStateToAbort();
   Status AlterTableStateToSuccess();
 
-  Status Abort();
+  void StartRequesterLivenessMonitor();
+  void StopLivenessMonitor();
   Status CheckIfDone();
   Status UpdateIndexPermissionsForIndexes();
   Status ClearCheckpointStateInTablets();
+  Status SetSafeTimeAndStartBackfill(const HybridTime& read_time) EXCLUDES(mutex_);
+
+  // Persist the value in read_time_for_backfill_ to the sys-catalog and start the backfill job.
+  Status PersistSafeTimeAndStartBackfill() EXCLUDES(mutex_);
 
   // We want to prevent major compactions from garbage collecting delete markers
   // on an index table, until the backfill process is complete.
@@ -187,23 +226,22 @@ class BackfillTable : public std::enable_shared_from_this<BackfillTable> {
 
   // Send the "backfill done request" to all tablets of the specified table.
   Status SendRpcToAllowCompactionsToGCDeleteMarkers(
-      const scoped_refptr<TableInfo> &index_table);
+      const TableInfoPtr& index_table);
   // Send the "backfill done request" to the specified tablet.
   Status SendRpcToAllowCompactionsToGCDeleteMarkers(
-      const scoped_refptr<TabletInfo> &index_table_tablet, const std::string &table_id);
+      const TabletInfoPtr& index_table_tablet, const std::string& table_id);
 
   Master* master_;
   ThreadPool* callback_pool_;
   const scoped_refptr<TableInfo> indexed_table_;
   const std::vector<IndexInfoPB> index_infos_;
   int32_t schema_version_;
-  int64_t leader_term_;
-  std::atomic<uint64> number_rows_processed_;
 
-  std::atomic_bool done_{false};
+  std::atomic<State> state_{State::kRunning};
   std::atomic_bool timestamp_chosen_{false};
   std::atomic<size_t> tablets_pending_;
   std::atomic<size_t> num_tablets_;
+  std::atomic_bool using_table_locks_{false};
   std::shared_ptr<BackfillTableJob> backfill_job_;
   mutable simple_spinlock mutex_;
   HybridTime read_time_for_backfill_ GUARDED_BY(mutex_){HybridTime::kMin};
@@ -211,13 +249,17 @@ class BackfillTable : public std::enable_shared_from_this<BackfillTable> {
   const std::string requested_index_names_;
 
   const scoped_refptr<NamespaceInfo> ns_info_;
+  LeaderEpoch epoch_;
+  ash::WaitStateInfoPtr wait_state_;
+  std::optional<TransactionMetadata> requester_transaction_;
+  std::weak_ptr<DdlRequesterLivenessTask> liveness_task_ GUARDED_BY(mutex_);
 };
+
 
 class BackfillTableJob : public server::MonitoredTask {
  public:
   explicit BackfillTableJob(std::shared_ptr<BackfillTable> backfill_table)
-      : start_timestamp_(MonoTime::Now()),
-        backfill_table_(backfill_table),
+      : backfill_table_(backfill_table),
         requested_index_names_(backfill_table_->requested_index_names()) {}
 
   server::MonitoredTaskType type() const override {
@@ -226,30 +268,16 @@ class BackfillTableJob : public server::MonitoredTask {
 
   std::string type_name() const override { return "Backfill Table"; }
 
-  MonoTime start_timestamp() const override { return start_timestamp_; }
-
-  MonoTime completion_timestamp() const override {
-    return completion_timestamp_;
-  }
-
   std::string description() const override;
-
-  server::MonitoredTaskState state() const override {
-    return state_.load(std::memory_order_acquire);
-  }
 
   void SetState(server::MonitoredTaskState new_state);
 
-  server::MonitoredTaskState AbortAndReturnPrevState(const Status& status) override;
+  server::MonitoredTaskState AbortAndReturnPrevState(
+      const Status& status, bool call_task_finisher) override;
 
-  void MarkDone() {
-    completion_timestamp_ = MonoTime::Now();
-    backfill_table_ = nullptr;
-  }
+  void MarkDone();
 
  private:
-  MonoTime start_timestamp_, completion_timestamp_;
-  std::atomic<server::MonitoredTaskState> state_{server::MonitoredTaskState::kWaiting};
   std::shared_ptr<BackfillTable> backfill_table_;
   const std::string requested_index_names_;
 };
@@ -259,15 +287,16 @@ class BackfillTableJob : public server::MonitoredTask {
 class BackfillTablet : public std::enable_shared_from_this<BackfillTablet> {
  public:
   BackfillTablet(
-      std::shared_ptr<BackfillTable> backfill_table, const scoped_refptr<TabletInfo>& tablet);
+      std::shared_ptr<BackfillTable> backfill_table, TabletInfoPtr&& tablet);
 
   Status Launch() { return LaunchNextChunkOrDone(); }
 
   Status LaunchNextChunkOrDone();
   Status Done(
       const Status& status,
-      const boost::optional<std::string>& backfilled_until,
-      const uint64_t number_rows_processed,
+      const std::optional<std::string>& backfilled_until,
+      const uint64_t num_rows_read_from_table_for_backfill,
+      const std::unordered_map<TableId, double>& num_rows_backfilled_in_index,
       const std::unordered_set<TableId>& failed_indexes);
 
   Master* master() { return backfill_table_->master(); }
@@ -288,7 +317,7 @@ class BackfillTablet : public std::enable_shared_from_this<BackfillTablet> {
 
   int32_t schema_version() { return backfill_table_->schema_version(); }
 
-  const scoped_refptr<TabletInfo> tablet() { return tablet_; }
+  const TabletInfoPtr& tablet() { return tablet_; }
 
   bool done() const {
     return done_.load(std::memory_order_acquire);
@@ -298,13 +327,18 @@ class BackfillTablet : public std::enable_shared_from_this<BackfillTablet> {
 
   const std::string GetNamespaceName() const { return backfill_table_->GetNamespaceName(); }
 
+  const ash::WaitStateInfoPtr& wait_state() const {
+    return backfill_table_->wait_state();
+  }
+
  private:
   Status UpdateBackfilledUntil(
-      const std::string& backfilled_until, const uint64_t number_rows_processed);
+      const std::string& backfilled_until, const uint64_t num_rows_read_from_table_for_backfill,
+      const std::unordered_map<TableId, double>& num_rows_backfilled_in_index);
 
   std::shared_ptr<BackfillTable> backfill_table_;
-  const scoped_refptr<TabletInfo> tablet_;
-  Partition partition_;
+  const TabletInfoPtr tablet_;
+  dockv::Partition partition_;
 
   // if non-empty, corresponds to the row in the tablet up to which
   // backfill has been already processed (non-inclusive). The next
@@ -314,20 +348,23 @@ class BackfillTablet : public std::enable_shared_from_this<BackfillTablet> {
   std::atomic_bool done_{false};
 };
 
-class GetSafeTimeForTablet : public RetryingTSRpcTask {
+class GetSafeTimeForTablet : public RetryingTSRpcTaskWithTable {
  public:
   GetSafeTimeForTablet(
       std::shared_ptr<BackfillTable> backfill_table,
-      const scoped_refptr<TabletInfo>& tablet,
-      HybridTime min_cutoff)
-      : RetryingTSRpcTask(
+      const TabletInfoPtr& tablet,
+      HybridTime min_cutoff,
+      LeaderEpoch epoch)
+      : RetryingTSRpcTaskWithTable(
             backfill_table->master(), backfill_table->threadpool(),
-            std::unique_ptr<TSPicker>(new PickLeaderReplica(tablet)), tablet->table().get(),
+            std::unique_ptr<TSPicker>(new PickLeaderReplica(tablet)), tablet->table(),
+            std::move(epoch),
             /* async_task_throttler */ nullptr),
         backfill_table_(backfill_table),
         tablet_(tablet),
         min_cutoff_(min_cutoff) {
-    deadline_ = MonoTime::Max();  // Never time out.
+    // No deadline for the task, refer to ComputeDeadline() for a single attempt deadline.
+    deadline_ = MonoTime::Max();
   }
 
   Status Launch();
@@ -352,20 +389,19 @@ class GetSafeTimeForTablet : public RetryingTSRpcTask {
 
   void UnregisterAsyncTaskCallback() override;
 
-  TabletServerId permanent_uuid();
-
   tserver::GetSafeTimeResponsePB resp_;
   const std::shared_ptr<BackfillTable> backfill_table_;
-  const scoped_refptr<TabletInfo> tablet_;
+  const TabletInfoPtr tablet_;
   const HybridTime min_cutoff_;
 };
 
 // A background task which is responsible for backfilling rows in the partitions
 // [start, end) on the indexed table.
-class BackfillChunk : public RetryingTSRpcTask {
+class BackfillChunk : public RetryingTSRpcTaskWithTable {
  public:
   BackfillChunk(std::shared_ptr<BackfillTablet> backfill_tablet,
-                const std::string& start_key);
+                const std::string& start_key,
+                LeaderEpoch epoch);
 
   Status Launch();
 
@@ -377,7 +413,7 @@ class BackfillChunk : public RetryingTSRpcTask {
 
   std::string description() const override;
 
-  MonoTime ComputeDeadline() override;
+  MonoTime ComputeDeadline() const override;
 
  private:
   TabletId tablet_id() const override { return backfill_tablet_->tablet()->id(); }
@@ -388,8 +424,6 @@ class BackfillChunk : public RetryingTSRpcTask {
 
   void UnregisterAsyncTaskCallback() override;
 
-  TabletServerId permanent_uuid();
-
   int num_max_retries() override;
   int max_delay_ms() override;
 
@@ -398,6 +432,7 @@ class BackfillChunk : public RetryingTSRpcTask {
   }
 
   const std::unordered_set<TableId> indexes_being_backfilled_;
+  std::unordered_map<TableId, double> num_rows_backfilled_in_index_;
   tserver::BackfillIndexResponsePB resp_;
   std::shared_ptr<BackfillTablet> backfill_tablet_;
   std::string start_key_;

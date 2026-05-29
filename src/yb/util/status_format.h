@@ -1,5 +1,5 @@
 //
-// Copyright (c) YugaByte, Inc.
+// Copyright (c) YugabyteDB, Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License"); you may not use this file except
 // in compliance with the License.  You may obtain a copy of the License at
@@ -43,6 +43,12 @@
     if (PREDICT_FALSE(!(expr))) return STATUS_FORMAT(status_type, (msg), __VA_ARGS__); \
   } while (0)
 
+#define SCHECK_EC_FORMAT(expr, status_type, error_code, msg, ...) \
+  do { \
+    if (PREDICT_FALSE(!(expr))) \
+      return STATUS_EC_FORMAT(status_type, error_code, (msg), __VA_ARGS__); \
+  } while (0)
+
 #define SCHECK_OP(var1, op, var2, status_type, msg) \
   do { \
     const auto& v1_tmp = (var1); \
@@ -62,19 +68,28 @@
   } while (0)
 
 #define SCHECK_EQ(var1, var2, status_type, msg) \
-  SCHECK_OP_FUNC(var1, yb::std_util::cmp_equal, var2, status_type, msg)
+  SCHECK_OP_FUNC(var1, ::yb::cmp_equal, var2, status_type, msg)
 #define SCHECK_NE(var1, var2, status_type, msg) SCHECK_OP(var1, !=, var2, status_type, msg)
 #define SCHECK_GT(var1, var2, status_type, msg) \
-  SCHECK_OP_FUNC(var1, yb::std_util::cmp_greater, var2, status_type, msg)
+  SCHECK_OP_FUNC(var1, ::yb::cmp_greater, var2, status_type, msg)
 #define SCHECK_GE(var1, var2, status_type, msg) SCHECK_OP(var1, >=, var2, status_type, msg)
 #define SCHECK_LT(var1, var2, status_type, msg) \
-  SCHECK_OP_FUNC(var1, yb::std_util::cmp_less, var2, status_type, msg)
+  SCHECK_OP_FUNC(var1, ::yb::cmp_less, var2, status_type, msg)
 #define SCHECK_LE(var1, var2, status_type, msg) SCHECK_OP(var1, <=, var2, status_type, msg)
 #define SCHECK_BOUNDS(var1, lbound, rbound, status_type, msg) \
     do { \
       SCHECK_GE(var1, lbound, status_type, msg); \
       SCHECK_LE(var1, rbound, status_type, msg); \
     } while(false)
+
+#define SCHECK_STR_CONTAINS(str, substr) \
+  SCHECK_NE( \
+      str.find((substr)), std::string::npos, NotFound, \
+      Format("'$0' does not contain '$1'", str, (substr)))
+
+#define SCHECK_STR_NOT_CONTAINS(str, substr) \
+  SCHECK_EQ( \
+      str.find(substr), std::string::npos, IllegalState, Format("'$0' contain '$1'", str, substr))
 
 #ifndef NDEBUG
 
@@ -114,3 +129,8 @@
       return STATUS_FORMAT(status_type, __VA_ARGS__); \
     } \
   } while (0)
+
+#define RSTATUS_DCHECK_NOTNULL(expr) \
+    RSTATUS_DCHECK((expr) != nullptr, \
+                   RuntimeError, \
+                   "$0 is null in $1", BOOST_PP_STRINGIZE(expr), __PRETTY_FUNCTION__)

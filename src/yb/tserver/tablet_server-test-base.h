@@ -15,9 +15,9 @@
 // specific language governing permissions and limitations
 // under the License.
 //
-// The following only applies to changes made to this file as part of YugaByte development.
+// The following only applies to changes made to this file as part of YugabyteDB development.
 //
-// Portions Copyright (c) YugaByte, Inc.
+// Portions Copyright (c) YugabyteDB, Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License"); you may not use this file except
 // in compliance with the License.  You may obtain a copy of the License at
@@ -32,10 +32,16 @@
 
 #pragma once
 
+#include <optional>
+
 #include "yb/common/common_fwd.h"
 #include "yb/common/schema.h"
 
 #include "yb/rpc/rpc_fwd.h"
+
+#include "yb/tablet/tablet_fwd.h"
+
+#include "yb/tserver/backup.proxy.h"
 
 #include "yb/util/metrics.h"
 #include "yb/util/test_util.h"
@@ -118,9 +124,17 @@ class TabletServerTestBase : public YBTest {
   Status ShutdownAndRebuildTablet();
 
   // Verifies that a set of expected rows (key, value) is present in the tablet.
-  void VerifyRows(const Schema& schema, const std::vector<KeyValue>& expected);
+  void VerifyRows(
+      const Schema& schema, const std::vector<KeyValue>& expected,
+      std::optional<tablet::TabletPeerPtr> tablet_peer = std::nullopt);
 
  protected:
+  Result<std::unique_ptr<MiniTabletServer>> CreateMiniTabletServer();
+
+  virtual int NumDrives() {
+    return 1;
+  }
+
   static const client::YBTableName kTableName;
   static const char* kTabletId;
 
@@ -137,7 +151,7 @@ class TabletServerTestBase : public YBTest {
   std::unique_ptr<TabletServerAdminServiceProxy> admin_proxy_;
   std::unique_ptr<consensus::ConsensusServiceProxy> consensus_proxy_;
   std::unique_ptr<server::GenericServiceProxy> generic_proxy_;
-
+  std::unique_ptr<TabletServerBackupServiceProxy> backup_proxy_;
 
   MetricRegistry ts_test_metric_registry_;
   scoped_refptr<MetricEntity> ts_test_metric_entity_;

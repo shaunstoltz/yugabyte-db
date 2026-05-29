@@ -1,4 +1,4 @@
-// Copyright (c) YugaByte, Inc.
+// Copyright (c) YugabyteDB, Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License"); you may not use this file except
 // in compliance with the License.  You may obtain a copy of the License at
@@ -13,44 +13,71 @@
 
 #pragma once
 
-#include <type_traits>
+#include <optional>
 #include <utility>
 
-#include "yb/util/status_fwd.h"
+#include "yb/gutil/macros.h"
+
+#include "yb/util/concepts.h"
 
 namespace yb {
 
-template <class F>
-class NODISCARD_CLASS ScopeExitLambda {
+// Execute the lambda when object goes out of scope.
+// The class has the Cancel method to dismiss execution the lambda and release the resources held
+// by it immediately.
+// The class is useful to perform cleanup due to unexpected exits, such as
+// VERIFY_RESULT and RETURN_NOT_OK. Whereas in the success case, the cleanup is not needed.
+//
+// Ex:
+//  Status DoStuff(const Identifier& id) {
+//    std::lock_guard l(mutex_);
+//    AddToMap(id);
+//    auto se = CancelableScopeExit([&id]{ RemoveFromMap(id); });
+//
+//    RETURN_NOT_OK(Commit(VERIFY_RESULT(DoInternalStuff(id))));
+//
+//    se.Cancel();
+//    return Status::OK();
+//  }
+template <InvocableAs<void()> F>
+class [[nodiscard]] CancelableScopeExit {
  public:
-  ScopeExitLambda(const ScopeExitLambda&) = delete;
-  void operator=(const ScopeExitLambda&) = delete;
-
-  ScopeExitLambda(ScopeExitLambda&& rhs) : f_(std::move(rhs.f_)), moved_(false) {
-    rhs.moved_ = true;
+  explicit CancelableScopeExit(const F& f) : f_(f) {}
+  explicit CancelableScopeExit(F&& f) : f_(std::move(f)) {}
+  explicit CancelableScopeExit(CancelableScopeExit<F>&& rhs) : f_(std::move(rhs.f_)) {
+    rhs.f_.reset();
   }
 
-  explicit ScopeExitLambda(const F& f) : f_(f), moved_(false) {}
-  explicit ScopeExitLambda(F&& f) : f_(std::move(f)), moved_(false) {}
-
-  ~ScopeExitLambda() {
-    if (!moved_) {
-      f_();
+  ~CancelableScopeExit() {
+    if (f_) {
+      (*f_)();
     }
   }
+
+  void Cancel() { f_.reset(); }
+
  private:
-  F f_;
-  bool moved_;
+  std::optional<F> f_;
+
+  DISALLOW_COPY_AND_ASSIGN(CancelableScopeExit);
 };
 
-template <class F>
-ScopeExitLambda<F> ScopeExit(const F& f) {
-  return ScopeExitLambda<F>(f);
-}
+// Execute the lambda when object goes out of scope.
+// Unlike CancelableScopeExit execution can't be dismissed (no Cancel method)
+template <InvocableAs<void()> F>
+class [[nodiscard]] ScopeExit {
+ public:
+  explicit ScopeExit(const F& f) : impl_(f) {}
+  explicit ScopeExit(F&& f) : impl_(std::move(f)) {}
+  explicit ScopeExit(ScopeExit<F>&&) = default;
 
-template <class F>
-ScopeExitLambda<typename std::remove_reference<F>::type> ScopeExit(F&& f) {
-  return ScopeExitLambda<typename std::remove_reference<F>::type>(std::forward<F>(f));
+ private:
+  CancelableScopeExit<F> impl_;
+};
+
+template <InvocableAs<void()> F>
+auto MakeOptionalScopeExit(F&& f) {
+  return std::optional<ScopeExit<std::decay_t<F>>>{std::forward<F>(f)};
 }
 
 } // namespace yb

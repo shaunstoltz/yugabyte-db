@@ -3,9 +3,9 @@
 //  LICENSE file in the root directory of this source tree. An additional grant
 //  of patent rights can be found in the PATENTS file in the same directory.
 //
-// The following only applies to changes made to this file as part of YugaByte development.
+// The following only applies to changes made to this file as part of YugabyteDB development.
 //
-// Portions Copyright (c) YugaByte, Inc.
+// Portions Copyright (c) YugabyteDB, Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License"); you may not use this file except
 // in compliance with the License.  You may obtain a copy of the License at
@@ -22,11 +22,11 @@
 #include "yb/rocksdb/convenience.h"
 #include "yb/rocksdb/db_dump_tool.h"
 
-DEFINE_UNKNOWN_string(dump_location, "", "Path to the dump file that will be loaded");
-DEFINE_UNKNOWN_string(db_path, "", "Path to the db that we will undump the file into");
-DEFINE_UNKNOWN_bool(compact, false, "Compact the db after loading the dumped file");
-DEFINE_UNKNOWN_string(db_options, "",
-              "Options string used to open the database that will be loaded");
+DEFINE_NON_RUNTIME_string(dump_location, "", "Path to the dump file that will be loaded");
+DEFINE_NON_RUNTIME_string(db_path, "", "Path to the db that we will undump the file into");
+DEFINE_NON_RUNTIME_bool(compact, false, "Compact the db after loading the dumped file");
+DEFINE_NON_RUNTIME_string(db_options, "",
+    "Options string used to open the database that will be loaded");
 
 int main(int argc, char **argv) {
   GFLAGS::ParseCommandLineFlags(&argc, &argv, true);

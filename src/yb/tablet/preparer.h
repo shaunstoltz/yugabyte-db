@@ -1,4 +1,4 @@
-// Copyright (c) YugaByte, Inc.
+// Copyright (c) YugabyteDB, Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License"); you may not use this file except
 // in compliance with the License.  You may obtain a copy of the License at
@@ -21,6 +21,7 @@
 DECLARE_int32(prepare_queue_max_size);
 
 namespace yb {
+class Cgroup;
 class ThreadPool;
 
 namespace consensus {
@@ -47,6 +48,10 @@ class Preparer {
 
   Status Submit(OperationDriver* txn_driver);
   ThreadPoolToken* PoolToken();
+
+  void DumpStatusHtml(std::ostream& out);
+
+  void SetPerDbCgroup(Cgroup* cgroup);
 
  private:
   std::unique_ptr<PreparerImpl> impl_;

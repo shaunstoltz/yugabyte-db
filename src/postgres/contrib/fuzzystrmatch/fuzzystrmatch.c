@@ -6,7 +6,7 @@
  * Joe Conway <mail@joeconway.com>
  *
  * contrib/fuzzystrmatch/fuzzystrmatch.c
- * Copyright (c) 2001-2018, PostgreSQL Global Development Group
+ * Copyright (c) 2001-2022, PostgreSQL Global Development Group
  * ALL RIGHTS RESERVED;
  *
  * metaphone()
@@ -43,6 +43,9 @@
 #include "mb/pg_wchar.h"
 #include "utils/builtins.h"
 #include "utils/varlena.h"
+
+/* YB includes */
+#include "common/pg_yb_common.h"
 
 PG_MODULE_MAGIC;
 
@@ -147,6 +150,9 @@ PG_FUNCTION_INFO_V1(levenshtein_with_costs);
 Datum
 levenshtein_with_costs(PG_FUNCTION_ARGS)
 {
+	if (YBIsEnabledInPostgresEnvVar())
+		return yb_levenshtein_with_costs(fcinfo);
+
 	text	   *src = PG_GETARG_TEXT_PP(0);
 	text	   *dst = PG_GETARG_TEXT_PP(1);
 	int			ins_c = PG_GETARG_INT32(2);
@@ -173,6 +179,9 @@ PG_FUNCTION_INFO_V1(levenshtein);
 Datum
 levenshtein(PG_FUNCTION_ARGS)
 {
+	if (YBIsEnabledInPostgresEnvVar())
+		return yb_levenshtein(fcinfo);
+
 	text	   *src = PG_GETARG_TEXT_PP(0);
 	text	   *dst = PG_GETARG_TEXT_PP(1);
 	const char *s_data;
@@ -196,6 +205,9 @@ PG_FUNCTION_INFO_V1(levenshtein_less_equal_with_costs);
 Datum
 levenshtein_less_equal_with_costs(PG_FUNCTION_ARGS)
 {
+	if (YBIsEnabledInPostgresEnvVar())
+		return yb_levenshtein_less_equal_with_costs(fcinfo);
+
 	text	   *src = PG_GETARG_TEXT_PP(0);
 	text	   *dst = PG_GETARG_TEXT_PP(1);
 	int			ins_c = PG_GETARG_INT32(2);
@@ -225,6 +237,9 @@ PG_FUNCTION_INFO_V1(levenshtein_less_equal);
 Datum
 levenshtein_less_equal(PG_FUNCTION_ARGS)
 {
+	if (YBIsEnabledInPostgresEnvVar())
+		return yb_levenshtein_less_equal(fcinfo);
+
 	text	   *src = PG_GETARG_TEXT_PP(0);
 	text	   *dst = PG_GETARG_TEXT_PP(1);
 	int			max_d = PG_GETARG_INT32(2);
@@ -698,8 +713,6 @@ _metaphone(char *word,			/* IN */
 	}							/* END FOR */
 
 	End_Phoned_Word;
-
-	return;
 }								/* END metaphone */
 
 
@@ -729,16 +742,14 @@ _soundex(const char *instr, char *outstr)
 	AssertArg(instr);
 	AssertArg(outstr);
 
-	outstr[SOUNDEX_LEN] = '\0';
-
 	/* Skip leading non-alphabetic characters */
-	while (!isalpha((unsigned char) instr[0]) && instr[0])
+	while (*instr && !isalpha((unsigned char) *instr))
 		++instr;
 
-	/* No string left */
-	if (!instr[0])
+	/* If no string left, return all-zeroes buffer */
+	if (!*instr)
 	{
-		outstr[0] = (char) 0;
+		memset(outstr, '\0', SOUNDEX_LEN + 1);
 		return;
 	}
 
@@ -751,7 +762,7 @@ _soundex(const char *instr, char *outstr)
 		if (isalpha((unsigned char) *instr) &&
 			soundex_code(*instr) != soundex_code(*(instr - 1)))
 		{
-			*outstr = soundex_code(instr[0]);
+			*outstr = soundex_code(*instr);
 			if (*outstr != '0')
 			{
 				++outstr;
@@ -768,6 +779,9 @@ _soundex(const char *instr, char *outstr)
 		++outstr;
 		++count;
 	}
+
+	/* And null-terminate */
+	*outstr = '\0';
 }
 
 PG_FUNCTION_INFO_V1(difference);

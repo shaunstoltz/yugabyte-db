@@ -1,4 +1,4 @@
-// Copyright (c) YugaByte, Inc.
+// Copyright (c) YugabyteDB, Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License"); you may not use this file except
 // in compliance with the License.  You may obtain a copy of the License at
@@ -10,17 +10,29 @@
 // or implied.  See the License for the specific language governing permissions and limitations
 // under the License.
 //
-#include "yb/common/partition.h"
-#include "yb/common/wire_protocol.h"
 
 #include "yb/master/catalog_manager_util.h"
 
-#include "yb/master/catalog_entity_info.h"
+#include "yb/common/common_net.h"
+#include "yb/common/schema_pbutil.h"
+#include "yb/common/wire_protocol.h"
 
+#include "yb/dockv/partition.h"
+
+#include "yb/master/catalog_entity_info.h"
+#include "yb/master/catalog_manager_if.h"
 #include "yb/master/master_cluster.pb.h"
+#include "yb/master/master_ddl.pb.h"
+#include "yb/master/master_util.h"
+#include "yb/master/ysql_tablespace_manager.h"
+
+#include "yb/tserver/tserver_service.pb.h"
+#include "yb/tserver/tserver_service.proxy.h"
+
 #include "yb/util/flags.h"
 #include "yb/util/math_util.h"
 #include "yb/util/string_util.h"
+#include "yb/util/trace.h"
 
 using std::string;
 using std::vector;
@@ -31,6 +43,8 @@ DEFINE_UNKNOWN_double(balancer_load_max_standard_deviation, 2.0,
 TAG_FLAG(balancer_load_max_standard_deviation, advanced);
 
 DECLARE_bool(transaction_tables_use_preferred_zones);
+
+DECLARE_int32(replication_factor);
 
 namespace yb {
 namespace master {
@@ -68,94 +82,91 @@ Status CatalogManagerUtil::IsLoadBalanced(const master::TSDescriptorVector& ts_d
   return Status::OK();
 }
 
-Status CatalogManagerUtil::AreLeadersOnPreferredOnly(
-    const TSDescriptorVector& ts_descs,
-    const ReplicationInfoPB& replication_info,
-    const vector<scoped_refptr<TableInfo>>& tables) {
-  if (PREDICT_FALSE(ts_descs.empty())) {
-    return Status::OK();
-  }
-
-  // Variables for checking transaction leader spread.
-  auto num_servers = ts_descs.size();
-  std::map<std::string, int> txn_map;
-  int num_txn_tablets = 0;
-  int max_txn_leaders_per_node = 0;
-  int min_txn_leaders_per_node = 0;
-
-  if (!FLAGS_transaction_tables_use_preferred_zones) {
-    CalculateTxnLeaderMap(&txn_map, &num_txn_tablets, tables);
-    max_txn_leaders_per_node = num_txn_tablets / num_servers;
-    min_txn_leaders_per_node = max_txn_leaders_per_node;
-    if (num_txn_tablets % num_servers) {
-      ++max_txn_leaders_per_node;
+Result<ReplicationInfoPB> CatalogManagerUtil::GetTableReplicationInfo(
+    const scoped_refptr<const TableInfo>& table,
+    const std::shared_ptr<const YsqlTablespaceManager>
+        tablespace_manager,
+    const ReplicationInfoPB& cluster_replication_info) {
+  {
+    auto table_lock = table->LockForRead();
+    // Check that the replication info is present and is valid (could be set to invalid null value
+    // due to restore issue, see #15698).
+    auto replication_info = table_lock->pb.replication_info();
+    if (IsReplicationInfoSet(replication_info)) {
+      VLOG(3) << "Returning table replication info obtained from SysTablesEntryPB: "
+              << replication_info.ShortDebugString() << " for table " << table->id();
+      return replication_info;
     }
   }
 
-  // If transaction_tables_use_preferred_zones = true, don't check for transaction leader spread.
-  // This results in txn_map being empty, num_txn_tablets = 0, max_txn_leaders_per_node = 0, and
-  // system_tablets_leaders = 0.
-  // Thus all comparisons for transaction leader spread will be ignored (all 0 < 0, etc).
-
-  for (const auto& ts_desc : ts_descs) {
-    auto tserver = txn_map.find(ts_desc->permanent_uuid());
-    int system_tablets_leaders = 0;
-    if (!(tserver == txn_map.end())) {
-      system_tablets_leaders = tserver->second;
-    }
-
-    // If enabled, check if transaction tablet leaders are evenly spread.
-    if (system_tablets_leaders > max_txn_leaders_per_node) {
-      return STATUS(
-          IllegalState,
-          Substitute("Too many txn status leaders found on tserver $0. Found $1, Expected $2.",
-                      ts_desc->permanent_uuid(),
-                      system_tablets_leaders,
-                      max_txn_leaders_per_node));
-    }
-    if (system_tablets_leaders < min_txn_leaders_per_node) {
-      return STATUS(
-          IllegalState,
-          Substitute("Tserver $0 expected to have at least $1 txn status leader(s), but has $2.",
-                      ts_desc->permanent_uuid(),
-                      min_txn_leaders_per_node,
-                      system_tablets_leaders));
-    }
-
-    // Check that leaders are on preferred ts only.
-    // If transaction tables follow preferred nodes, then we verify that there are 0 leaders.
-    // Otherwise, we need to check that there are 0 non-txn leaders on the ts.
-    if (!ts_desc->IsAcceptingLeaderLoad(replication_info) &&
-        ts_desc->leader_count() > system_tablets_leaders) {
-      // This is a ts that shouldn't have leader load (asides from txn leaders) but does.
-      return STATUS(
-          IllegalState,
-          Substitute("Expected no leader load on tserver $0, found $1.",
-                     ts_desc->permanent_uuid(), ts_desc->leader_count() - system_tablets_leaders));
+  // For non-system tables, return table-level replication info if available.
+  if (!table->is_system() && tablespace_manager) {
+    auto repl_info_opt = VERIFY_RESULT(tablespace_manager->GetTableReplicationInfo(table));
+    if (repl_info_opt) {
+      VLOG(3) << "Returning table replication info obtained from pg_tablespace: "
+              << repl_info_opt->ShortDebugString() << " for table " << table->id();
+      return *repl_info_opt;
     }
   }
-  return Status::OK();
+
+  VLOG(3) << "Returning table replication info obtained from cluster config: "
+          << cluster_replication_info.ShortDebugString() << " for table " << table->id();
+  return cluster_replication_info;
 }
 
-void CatalogManagerUtil::CalculateTxnLeaderMap(std::map<std::string, int>* txn_map,
-                                               int* num_txn_tablets,
-                                               vector<scoped_refptr<TableInfo>> tables) {
+Status CatalogManagerUtil::AreLeadersOnPreferredOnly(
+    const TSDescriptorVector& ts_descs,
+    const ReplicationInfoPB& cluster_replication_info,
+    const std::shared_ptr<const YsqlTablespaceManager>
+        tablespace_manager,
+    const vector<scoped_refptr<TableInfo>>& tables) {
+  const auto find_tservers_accepting_load =
+      [](std::unordered_set<std::string>& accepting_leader_load,
+         const TSDescriptorVector& ts_descs,
+         const ReplicationInfoPB& replication_info) {
+        for (const auto& ts_desc : ts_descs) {
+          if (ts_desc->IsAcceptingLeaderLoad(replication_info)) {
+            accepting_leader_load.insert(ts_desc->id());
+          }
+        }
+      };
+
   for (const auto& table : tables) {
-    bool is_txn_table = table->GetTableType() == TRANSACTION_STATUS_TABLE_TYPE;
-    if (!is_txn_table) {
+    auto table_lock = table->LockForRead();
+
+    if (table_lock->table_type() == TRANSACTION_STATUS_TABLE_TYPE &&
+        !FLAGS_transaction_tables_use_preferred_zones) {
       continue;
     }
-    TabletInfos tablets = table->GetTablets();
-    (*num_txn_tablets) += tablets.size();
-    for (const auto& tablet : tablets) {
-      auto replication_locations = tablet->GetReplicaLocations();
+
+    const auto replication_info =
+        VERIFY_RESULT(GetTableReplicationInfo(table, tablespace_manager, cluster_replication_info));
+
+    std::unordered_set<std::string> accepting_leader_load;
+
+    find_tservers_accepting_load(accepting_leader_load,
+        ts_descs,
+        replication_info);
+
+    for (const auto& tablet : VERIFY_RESULT(table->GetTablets())) {
+      auto tablet_lock = tablet->LockForRead();
+      const auto replication_locations = tablet->GetReplicaLocations();
       for (const auto& replica : *replication_locations) {
-        if (replica.second.role == PeerRole::LEADER) {
-          (*txn_map)[replica.first]++;
+        if (replica.second.role != PeerRole::LEADER) {
+          continue;
+        }
+
+        if (!accepting_leader_load.contains(replica.first)) {
+          return STATUS(
+              IllegalState,
+              Substitute("Tserver $0 not expected to have leader of tablet $1",
+                  replica.first, tablet->id()));
         }
       }
     }
   }
+
+  return Status::OK();
 }
 
 Status CatalogManagerUtil::GetPerZoneTSDesc(const TSDescriptorVector& ts_descs,
@@ -176,39 +187,6 @@ Status CatalogManagerUtil::GetPerZoneTSDesc(const TSDescriptorVector& ts_descs,
   return Status::OK();
 }
 
-bool CatalogManagerUtil::IsCloudInfoEqual(const CloudInfoPB& lhs, const CloudInfoPB& rhs) {
-  return (lhs.placement_cloud() == rhs.placement_cloud() &&
-          lhs.placement_region() == rhs.placement_region() &&
-          lhs.placement_zone() == rhs.placement_zone());
-}
-
-bool CatalogManagerUtil::DoesPlacementInfoContainCloudInfo(const PlacementInfoPB& placement_info,
-                                                           const CloudInfoPB& cloud_info) {
-  for (const auto& placement_block : placement_info.placement_blocks()) {
-    if (IsCloudInfoEqual(placement_block.cloud_info(), cloud_info)) {
-      return true;
-    }
-  }
-  return false;
-}
-
-bool CatalogManagerUtil::DoesPlacementInfoSpanMultipleRegions(
-    const PlacementInfoPB& placement_info) {
-  int num_blocks = placement_info.placement_blocks_size();
-  if (num_blocks < 2) {
-    return false;
-  }
-  const auto& first_block = placement_info.placement_blocks(0).cloud_info();
-  for (int i = 1; i < num_blocks; ++i) {
-    const auto& cur_block = placement_info.placement_blocks(i).cloud_info();
-    if (first_block.placement_cloud() != cur_block.placement_cloud() ||
-        first_block.placement_region() != cur_block.placement_region()) {
-      return true;
-    }
-  }
-  return false;
-}
-
 Result<std::string> CatalogManagerUtil::GetPlacementUuidFromRaftPeer(
     const ReplicationInfoPB& replication_info, const consensus::RaftPeerPB& peer) {
   switch (peer.member_type()) {
@@ -222,8 +200,7 @@ Result<std::string> CatalogManagerUtil::GetPlacementUuidFromRaftPeer(
       // This peer is a read replica.
       std::vector<std::string> placement_uuid_matches;
       for (const auto& placement_info : replication_info.read_replicas()) {
-        if (CatalogManagerUtil::DoesPlacementInfoContainCloudInfo(
-                placement_info, peer.cloud_info())) {
+        if (PlacementInfoContainsCloudInfo(placement_info, peer.cloud_info())) {
           placement_uuid_matches.push_back(placement_info.placement_uuid());
         }
       }
@@ -246,7 +223,7 @@ Result<std::string> CatalogManagerUtil::GetPlacementUuidFromRaftPeer(
 }
 
 Status CatalogManagerUtil::CheckIfCanDeleteSingleTablet(
-    const scoped_refptr<TabletInfo>& tablet) {
+    const TabletInfoPtr& tablet) {
   static const auto stringify_partition_key = [](const Slice& key) {
     return key.empty() ? "{empty}" : key.ToDebugString();
   };
@@ -260,8 +237,8 @@ Status CatalogManagerUtil::CheckIfCanDeleteSingleTablet(
   const auto partition = tablet_pb.partition();
 
   VLOG(3) << "Tablet " << tablet_id << " " << AsString(partition);
-  TabletInfos tablets_in_range = tablet->table()->GetTabletsInRange(
-      partition.partition_key_start(), partition.partition_key_end());
+  TabletInfos tablets_in_range = VERIFY_RESULT(tablet->table()->GetTabletsInRange(
+      partition.partition_key_start(), partition.partition_key_end()));
 
   std::string partition_key = partition.partition_key_start();
   for (const auto& inner_tablet : tablets_in_range) {
@@ -348,8 +325,8 @@ Status CatalogManagerUtil::IsPlacementInfoValid(const PlacementInfoPB& placement
       cloud_info_string.insert(ci_string);
     } else {
       return STATUS(IllegalState,
-                    Substitute("Placement information specified should not contain duplicates."
-                    "Given placement block: $0 isn't a prefix", ci.ShortDebugString()));
+                    Substitute("Placement information specified should not contain duplicates. "
+                    "Given placement block: $0 is a duplicate", ci.ShortDebugString()));
     }
   }
 
@@ -405,6 +382,17 @@ Status CatalogManagerUtil::IsPlacementInfoValid(const PlacementInfoPB& placement
       }
     }
   }
+
+  int total_min_replica_count = 0;
+  for (auto& placement_block : placement_info.placement_blocks()) {
+    total_min_replica_count += placement_block.min_num_replicas();
+  }
+  if (total_min_replica_count > placement_info.num_replicas()) {
+    return STATUS_FORMAT(IllegalState, "num_replicas ($0) should be greater than or equal to the "
+        "total of replica counts specified in placement_info ($1).", placement_info.num_replicas(),
+        total_min_replica_count);
+  }
+
   return Status::OK();
 }
 
@@ -419,7 +407,7 @@ Status ValidateAndAddPreferredZone(
         cloud_info_str);
   }
 
-  if (!CatalogManagerUtil::DoesPlacementInfoContainCloudInfo(placement_info, cloud_info)) {
+  if (!CloudInfoMatchesPlacementInfo(cloud_info, placement_info)) {
     return STATUS_FORMAT(
         InvalidArgument, "Preferred zone '$0' not found in Placement info '$1'", cloud_info_str,
         placement_info);
@@ -508,16 +496,44 @@ Status CatalogManagerUtil::CheckValidLeaderAffinity(const ReplicationInfoPB& rep
   return Status::OK();
 }
 
+Result<bool> CatalogManagerUtil::GetIsTruncateTableDone(
+    const TableInfoPtr& table, IsTruncateTableDoneResponsePB* resp) {
+  LOG(INFO) << "Run IsTruncateTableDone for table id " << table->id();
+  TRACE("Locking table");
+  RETURN_NOT_OK(CheckIfTableDeletedOrNotVisibleToClient(table->LockForRead(),
+                                                        DCHECK_NOTNULL(resp)));
+  return !table->HasTasks(server::MonitoredTaskType::kTruncateTablet);
+}
+
 void CatalogManagerUtil::FillTableInfoPB(
     const TableId& table_id, const std::string& table_name, const TableType& table_type,
-    const Schema& schema, uint32_t schema_version, const PartitionSchema& partition_schema,
+    const Schema& schema, uint32_t schema_version, const dockv::PartitionSchema& partition_schema,
+    tablet::TableInfoPB* pb) {
+  SchemaPB schema_pb;
+  SchemaToPB(schema, &schema_pb);
+  PartitionSchemaPB partition_schema_pb;
+  partition_schema.ToPB(&partition_schema_pb);
+  FillTableInfoPB(
+      table_id, table_name, table_type, schema_pb, schema_version, partition_schema_pb, pb);
+}
+
+void CatalogManagerUtil::FillTableInfoPB(
+    const TableId& table_id, const std::string& table_name, const TableType& table_type,
+    const SchemaPB& schema, uint32_t schema_version, const PartitionSchemaPB& partition_schema,
     tablet::TableInfoPB* pb) {
   pb->set_table_id(table_id);
   pb->set_table_name(table_name);
   pb->set_table_type(table_type);
-  SchemaToPB(schema, pb->mutable_schema());
+  pb->mutable_schema()->CopyFrom(schema);
   pb->set_schema_version(schema_version);
-  partition_schema.ToPB(pb->mutable_partition_schema());
+  pb->mutable_partition_schema()->CopyFrom(partition_schema);
+}
+
+size_t CatalogManagerUtil::GetReplicationFactor(const ReplicationInfoPB& replication_info) {
+  if (replication_info.has_live_replicas()) {
+    return GetNumReplicasOrGlobalReplicationFactor(replication_info.live_replicas());
+  }
+  return FLAGS_replication_factor;
 }
 
 Result<bool> CMPerTableLoadState::CompareReplicaLoads(
@@ -546,6 +562,88 @@ void CMPerTableLoadState::SortLoad() {
   Comparator comp(this);
   std::sort(sorted_replica_load_.begin(), sorted_replica_load_.end(), comp);
 }
+
+int32_t GetNumReplicasOrGlobalReplicationFactor(const PlacementInfoPB& placement_info) {
+  return placement_info.num_replicas() > 0 ? placement_info.num_replicas()
+                                           : FLAGS_replication_factor;
+}
+
+const BlacklistPB& GetBlacklist(const SysClusterConfigEntryPB& pb, bool blacklist_leader) {
+  return blacklist_leader ? pb.leader_blacklist() : pb.server_blacklist();
+}
+
+Status ExecutePgsqlStatements(
+    const std::string& database_name, const std::vector<std::string>& statements,
+    CatalogManagerIf& catalog_manager, CoarseTimePoint deadline, StdStatusCallback callback) {
+  SCHECK(!database_name.empty(), InvalidArgument, "Database name is empty");
+  if (statements.empty()) {
+    return Status::OK();
+  }
+
+  auto closest_tserver = VERIFY_RESULT(catalog_manager.GetClosestLiveTserver());
+  std::shared_ptr<tserver::TabletServerServiceProxy> proxy;
+  RETURN_NOT_OK(closest_tserver->GetProxy(&proxy));
+
+  tserver::AdminExecutePgsqlRequestPB req;
+  req.set_database_name(database_name);
+  for (const auto& statement : statements) {
+    req.add_pgsql_statements(statement);
+  }
+
+  auto resp = std::make_shared<tserver::AdminExecutePgsqlResponsePB>();
+  auto controller = std::make_shared<rpc::RpcController>();
+  controller->set_deadline(deadline);
+
+  proxy->AdminExecutePgsqlAsync(
+      req, resp.get(), controller.get(), [controller, resp, cb = std::move(callback)]() {
+        Status status = controller->status();
+        if (status.ok() && resp->has_error()) {
+          // Underlying error code could be NetworkError from libpq. Convert it to IllegalState.
+          status = STATUS_FORMAT(
+              IllegalState, "Error executing pgsql statements: $0",
+              resp->error().status().message());
+        }
+        cb(status);
+      });
+
+  return Status::OK();
+}
+
+bool UseRelfilenodeForTableMatch(const SnapshotInfoPB& snapshot_pb) {
+  return snapshot_pb.format_version() == kUseRelfilenodeFormatVersion;
+}
+
+template <class LoadState>
+Status CatalogManagerUtil::FillTableLoadState(
+    const scoped_refptr<TableInfo>& table_info, LoadState* state) {
+  auto tablets = VERIFY_RESULT(table_info->GetTabletsIncludeInactive());
+
+  for (const auto& tablet : tablets) {
+    // Ignore if tablet is not running.
+    {
+      auto tablet_lock = tablet->LockForRead();
+      if (!tablet_lock->is_running()) {
+        continue;
+      }
+    }
+    auto replica_locs = tablet->GetReplicaLocations();
+
+    for (const auto& loc : *replica_locs) {
+      // Ignore replica if not present in the tserver list passed.
+      if (state->per_ts_replica_load_.count(loc.first) == 0) {
+        continue;
+      }
+      // Account for this load.
+      state->per_ts_replica_load_[loc.first]++;
+    }
+  }
+  return Status::OK();
+}
+
+template Status CatalogManagerUtil::FillTableLoadState(
+    const scoped_refptr<TableInfo>& table_info, CMPerTableLoadState* state);
+template Status CatalogManagerUtil::FillTableLoadState(
+    const scoped_refptr<TableInfo>& table_info, CMGlobalLoadState* state);
 
 } // namespace master
 } // namespace yb

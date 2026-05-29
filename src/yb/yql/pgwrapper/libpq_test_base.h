@@ -1,4 +1,4 @@
-// Copyright (c) YugaByte, Inc.
+// Copyright (c) YugabyteDB, Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License"); you may not use this file except
 // in compliance with the License.  You may obtain a copy of the License at
@@ -22,6 +22,27 @@
 namespace yb {
 namespace pgwrapper {
 
+struct YsqlMetric {
+  std::string name;
+  std::unordered_map<std::string, std::string> labels;
+  int64_t value;
+  int64_t time;
+  std::string type;
+  std::string description;
+  int64_t sum;
+
+  YsqlMetric(
+      std::string name, std::unordered_map<std::string, std::string> labels, int64_t value,
+      int64_t time, std::string type = "", std::string description = "", int64_t sum = 0)
+      : name(std::move(name)),
+        labels(std::move(labels)),
+        value(value),
+        time(time),
+        type(type),
+        description(description),
+        sum(sum) {}
+};
+
 class LibPqTestBase : public PgWrapperTestBase {
  protected:
   void SetUp() override;
@@ -31,12 +52,36 @@ class LibPqTestBase : public PgWrapperTestBase {
       const std::string& db_name,
       const std::string& user,
       bool simple_query_protocol = false);
+  Result<PGConn> ConnectToTs(const ExternalTabletServer& pg_ts);
+  Result<PGConn> ConnectToTsForDB(const ExternalTabletServer& pg_ts, const std::string& db_name);
+  Result<PGConn> ConnectToTsAsUser(
+      const ExternalTabletServer& pg_ts,
+      const std::string& user);
   Result<PGConn> ConnectUsingString(
       const std::string& conn_str,
       CoarseTimePoint deadline = CoarseMonoClock::Now() + MonoDelta::FromSeconds(10),
       bool simple_query_protocol = false);
+  Result<PGConn> ConnectToDBWithReplication(const std::string& db_name);
+  void SerializableColoringHelper(int min_duration_seconds = 0);
   static bool TransactionalFailure(const Status& status);
+  static Status BumpCatalogVersion(int num_bumps, PGConn* conn,
+                                   const std::string& alter_value = "");
+  static void UpdateMiniClusterFailOnConflict(ExternalMiniClusterOptions* options);
+  static std::vector<YsqlMetric> ParsePrometheusMetrics(const std::string& metrics_output);
+  static std::vector<YsqlMetric> ParseJsonMetrics(const std::string& metrics_output);
+  std::vector<YsqlMetric> GetJsonMetrics(size_t ts_idx = 0);
+  std::vector<YsqlMetric> GetPrometheusMetrics();
+  static int64_t GetMetricValue(
+      const std::vector<YsqlMetric>& metrics,
+      const std::string& metric_name);
+  static void WaitForCatalogVersionToPropagate();
+  Result<int64_t> GetCatCacheTableMissMetric(const std::string& table_name);
+  Result<int64_t> GetCatCacheListMissMetric(const std::string& table_name);
+  Result<int64_t> GetCatCacheNegMissMetric(const std::string& table_name);
 };
+
+Result<PgOid> GetDatabaseOid(PGConn* conn, const std::string& db_name);
+Result<std::string> GetPGVersionString(PGConn* conn);
 
 } // namespace pgwrapper
 } // namespace yb

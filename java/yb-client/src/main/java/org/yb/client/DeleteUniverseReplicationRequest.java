@@ -1,4 +1,4 @@
-// Copyright (c) YugaByte, Inc.
+// Copyright (c) YugabyteDB, Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License"); you may not use this file except
 // in compliance with the License.  You may obtain a copy of the License at
@@ -39,7 +39,7 @@ public class DeleteUniverseReplicationRequest extends YRpc<DeleteUniverseReplica
 
     final MasterReplicationOuterClass.DeleteUniverseReplicationRequestPB.Builder builder =
         MasterReplicationOuterClass.DeleteUniverseReplicationRequestPB.newBuilder()
-            .setProducerId(replicationGroupName)
+            .setReplicationGroupId(replicationGroupName)
             .setIgnoreErrors(ignoreErrors);
 
     return toChannelBuffer(header, builder.build());

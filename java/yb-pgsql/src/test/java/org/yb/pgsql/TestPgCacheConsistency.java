@@ -1,4 +1,4 @@
-// Copyright (c) YugaByte, Inc.
+// Copyright (c) YugabyteDB, Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License"); you may not use this file except
 // in compliance with the License.  You may obtain a copy of the License at
@@ -15,31 +15,47 @@ package org.yb.pgsql;
 
 import static org.yb.AssertionWrappers.*;
 
+import com.google.common.net.HostAndPort;
+import com.yugabyte.util.PSQLException;
 import org.hamcrest.CoreMatchers;
+import org.junit.Assume;
 import org.junit.Ignore;
 import org.junit.Test;
 import org.junit.runner.RunWith;
-import com.yugabyte.util.PSQLException;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.yb.minicluster.MiniYBCluster;
 import org.yb.util.ThrowingRunnable;
-import org.yb.util.YBTestRunnerNonTsanOnly;
+import org.yb.YBTestRunner;
 
 import java.sql.Connection;
 import java.sql.ResultSet;
+import java.sql.SQLException;
 import java.sql.Statement;
 import java.util.Arrays;
 import java.util.HashSet;
 import java.util.List;
 import java.util.Optional;
 import java.util.Set;
+import java.util.Map;
 import java.util.stream.Collectors;
 import java.util.stream.IntStream;
 
-@RunWith(value = YBTestRunnerNonTsanOnly.class)
+@RunWith(value = YBTestRunner.class)
 public class TestPgCacheConsistency extends BasePgSQLTest {
   private static final Logger LOG = LoggerFactory.getLogger(TestPgCacheConsistency.class);
+
+  @Override
+  protected Map<String, String> getTServerFlags() {
+    Map<String, String> flags = super.getTServerFlags();
+    appendToYsqlPgConf(flags, "log_statement=all");
+    // The test suite asserts for DML failing with catalog version mismatch when run
+    // immediately after DDLs, which isn't true with object locking enabled.
+    flags.put("enable_object_locking_for_table_locks", "false");
+    // TODO(29142): Fix the test with txn ddl and reenable.
+    flags.put("ysql_yb_ddl_transaction_block_enabled", "false");
+    return flags;
+  }
 
   @Test
   public void testBasicDDLOperations() throws Exception {
@@ -121,10 +137,14 @@ public class TestPgCacheConsistency extends BasePgSQLTest {
         statement2.execute("INSERT INTO cache_test2(a,b) VALUES (true, 11)");
         expectedRows.add(new Row(true, 11));
       } catch (PSQLException psqle) {
-        // Any failure should be due to a catalog version mismatch.
+        // Any failure should be due to a stale catalog cache that hasn't learned about column b.
         assertThat(
             psqle.getMessage(),
-            CoreMatchers.containsString("Catalog Version Mismatch")
+            CoreMatchers.anyOf(
+                CoreMatchers.containsString(
+                  "column \"b\" of relation \"cache_test2\" does not exist"),
+                CoreMatchers.containsString("schema version mismatch")
+            )
         );
       }
 
@@ -262,40 +282,80 @@ public class TestPgCacheConsistency extends BasePgSQLTest {
       // Force a cache refresh on connection 2.
       statement2.execute("SELECT * FROM test_table");
 
+      // For the non-ConnMgr path, disable heartbeats so that catalog version
+      // updates from each ALTER on connection 1 are not propagated to
+      // connection 2's tserver during the loop. Without this, the prologue
+      // check in YBCheckSharedCatalogCacheVersion may refresh connection 2's
+      // catcache before the SELECT runs, hiding the expected "Catalog Version
+      // Mismatch" error. The race window is widened under TSAN where ALTER
+      // runtimes span multiple heartbeat intervals. The ConnMgr path
+      // intentionally waits for the heartbeat (DDL sleeps), so keep heartbeats
+      // enabled there to preserve the separate "no failures" assertion below.
+      final boolean disableHeartbeats = !isTestRunningWithConnectionManager();
+
       final int attempts = 5;
-      List<Throwable> errors = IntStream.range(0, attempts)
-          .boxed()
-          .map((i) -> captureThrow(() -> {
-            // Add some artificial delay to space out attempts.
-            Thread.sleep(MiniYBCluster.TSERVER_HEARTBEAT_INTERVAL_MS / attempts);
+      final List<Throwable> errors;
+      try {
+        if (disableHeartbeats) {
+          for (HostAndPort hp : miniCluster.getTabletServers().keySet()) {
+            assertTrue(miniCluster.getClient().setFlag(
+                hp, "TEST_tserver_disable_heartbeat", "true", true));
+          }
+        }
 
-            // Add new row from connection 1.
-            statement1.execute("ALTER TABLE test_table ADD COLUMN x" + i + " int");
+        errors = IntStream.range(0, attempts)
+            .boxed()
+            .map((i) -> captureThrow(() -> {
+              // Add some artificial delay to space out attempts.
+              Thread.sleep(MiniYBCluster.TSERVER_HEARTBEAT_INTERVAL_MS / attempts);
 
-            // Immediately try selecting row from connection 2.
-            statement2.execute("SELECT x" + i + " FROM test_table");
-          }))
-          .filter(Optional::isPresent)
-          .map(Optional::get)
-          .collect(Collectors.toList());
+              // Add new row from connection 1.
+              statement1.execute("ALTER TABLE test_table ADD COLUMN x" + i + " int");
 
-      // At least half the select statements should fail.
-      assertGreaterThanOrEqualTo(
-          String.format(
-              "Expected at least %d failures out of %d attempts, got %d",
-              attempts / 2,
-              attempts,
-              errors.size()
-          ),
-          errors.size(),
-          attempts / 2
-      );
+              // Immediately try selecting row from connection 2.
+              statement2.execute("SELECT x" + i + " FROM test_table");
+            }))
+            .filter(Optional::isPresent)
+            .map(Optional::get)
+            .collect(Collectors.toList());
+      } finally {
+        if (disableHeartbeats) {
+          for (HostAndPort hp : miniCluster.getTabletServers().keySet()) {
+            assertTrue(miniCluster.getClient().setFlag(
+                hp, "TEST_tserver_disable_heartbeat", "false", true));
+          }
+        }
+      }
 
-      // All errors should be catalog version mismatches.
+      if (isTestRunningWithConnectionManager()) {
+        // Due to DDL sleeps with Connection Manager, all select statements
+        // should succeed.
+        assertEquals("No failures are expected with Connection Manager enabled",
+         errors.size(),
+         0);
+      } else {
+        // Expect at least one of the select statements to fail (the transparent retry can mask
+        // most of them, but the very first attempt typically races the heartbeat).
+        assertGreaterThanOrEqualTo(
+            String.format(
+                "Expected at least 1 failure out of %d attempts, got %d",
+                attempts,
+                errors.size()
+              ),
+            errors.size(),
+            1
+          );
+      }
+
+      // All errors should be due to a stale catalog cache (either the new column is not yet
+      // visible in pg's parser, or docdb returns a schema version mismatch).
       for (Throwable error : errors) {
         assertThat(
             error.getMessage(),
-            CoreMatchers.containsString("Catalog Version Mismatch")
+            CoreMatchers.anyOf(
+                CoreMatchers.containsString("schema version mismatch"),
+                CoreMatchers.containsString("does not exist")
+            )
         );
       }
     }
@@ -346,8 +406,8 @@ public class TestPgCacheConsistency extends BasePgSQLTest {
 
       waitForTServerHeartbeat();
 
-      // Select should fail because the alter modified the table (catalog version mismatch).
-      runInvalidQuery(statement2,"SELECT * FROM test_table", "Catalog Version Mismatch");
+      // Select should fail because the alter modified the table (schema version mismatch).
+      runInvalidQuery(statement2,"SELECT * FROM test_table", "schema version mismatch");
 
       // COMMIT will succeed as a command but will rollback the transaction due to the error above.
       statement2.execute("COMMIT");
@@ -433,7 +493,7 @@ public class TestPgCacheConsistency extends BasePgSQLTest {
           statement2,
           "EXPLAIN (COSTS OFF) SELECT u FROM test_table WHERE u = 1",
           new Row("Seq Scan on test_table"),
-          new Row("  Remote Filter: (u = 1)")
+          new Row("  Storage Filter: (u = 1)")
       );
     }
   }
@@ -581,6 +641,11 @@ public class TestPgCacheConsistency extends BasePgSQLTest {
         assertEquals(getRowList(stmt1, query).size(), getRowList(stmt2, query).size());
       }
 
+      String enable_invalidation_messages = miniCluster.getClient().getFlag(
+            miniCluster.getTabletServers().keySet().iterator().next(),
+            "ysql_yb_enable_invalidation_messages");
+      LOG.info("enable_invalidation_messages: " + enable_invalidation_messages);
+
       // Now repeat the same test as above, but start a transaction in stmt2 in
       // the loop. Snapshot isolation guarantees here should ensure that the
       // transaction in stmt2 should not see the new partition or the data inserted
@@ -596,10 +661,189 @@ public class TestPgCacheConsistency extends BasePgSQLTest {
               "INSERT INTO prt_p%d(a,b) VALUES (%d, 'abc')",
               ii + 1, startPartition + 1));
         waitForTServerHeartbeat();
-        assertEquals(getRowList(stmt1, query).size() - 1, getRowList(stmt2, query).size());
+        // When we do invalidation messages instead of full catalog cache refresh,
+        // we can defer the loading of the parent table until referenced on stmt2.
+        // At this time the new partition is already created and it will be reflected
+        // on the metadata of the parent table. That's why on stmt2 we will see the
+        // new partition and the data inserted on stmt1. The ii == numIterations case
+        // is special because there was no catalog version increment between the
+        // previous assertEquals and "BEGIN", so the getRowList(stmt2, query) above
+        // made a reference of the parent table which loaded it into the cache.
+        // Therefore the cached entry does not have the next new partition reflected.
+        if (ii == numIterations || enable_invalidation_messages.equals("false")) {
+          assertEquals(getRowList(stmt1, query).size() - 1, getRowList(stmt2, query).size());
+        } else {
+          assertEquals(getRowList(stmt1, query).size(), getRowList(stmt2, query).size());
+        }
         stmt2.execute("END");
       }
 
+      // Test that dropping a partition in one connection is reflected in the other.
+      stmt1.executeUpdate("DROP TABLE prt_p1");
+      waitForTServerHeartbeat();
+      final String error_msg = "no partition of relation \"prt\" found for row";
+      runInvalidQuery(stmt2, "INSERT INTO prt VALUES (1)", error_msg);
+
+      // Test that attaching a partition in one connection is reflected in the other.
+      stmt1.executeUpdate("CREATE TABLE prt_p1 (a int, b varchar)");
+      stmt1.executeUpdate("ALTER TABLE prt ATTACH PARTITION prt_p1 FOR VALUES FROM (0) TO (10)");
+      waitForTServerHeartbeat();
+      stmt2.executeUpdate("INSERT INTO prt VALUES (1)");
+
+      // Test whether detaching a partition in one connection is reflected in the other.
+      stmt1.executeUpdate("ALTER TABLE prt DETACH PARTITION prt_p1");
+      waitForTServerHeartbeat();
+      runInvalidQuery(stmt2, "INSERT INTO prt VALUES (1)", error_msg);
+
+      // Test that adding a default partition in one connection is reflected in the other.
+      stmt1.executeUpdate("CREATE TABLE prt_default (a int, b varchar)");
+      stmt1.executeUpdate("ALTER TABLE prt ATTACH PARTITION prt_default DEFAULT");
+      waitForTServerHeartbeat();
+      stmt2.executeUpdate("INSERT INTO prt VALUES (1)");
+
+      // Test that dropping a default partition in one connection is reflected in the other.
+      stmt1.executeUpdate("DROP TABLE prt_default");
+      waitForTServerHeartbeat();
+      runInvalidQuery(stmt2, "INSERT INTO prt VALUES (1)", error_msg);
+
+      // Test adding a new partitioned table as a partition.
+      stmt1.executeUpdate("CREATE TABLE prt2 (a int, b varchar) PARTITION BY RANGE(a)");
+      stmt1.executeUpdate("CREATE TABLE prt2_p1 PARTITION OF prt2 FOR VALUES FROM (2) TO (8)");
+      stmt1.executeUpdate("ALTER TABLE prt ATTACH PARTITION prt2 FOR VALUES FROM (0) TO (10)");
+      waitForTServerHeartbeat();
+      stmt2.executeUpdate("INSERT INTO prt VALUES (3)");
+
+      // Test adding a subpartition.
+      stmt1.executeUpdate("CREATE TABLE prt2_p2 PARTITION OF prt2 FOR VALUES FROM (8) TO (10)");
+      waitForTServerHeartbeat();
+      stmt2.executeUpdate("INSERT INTO prt VALUES (9)");
+
+      // Test dropping a subpartition.
+      stmt1.executeUpdate("DROP TABLE prt2_p2");
+      waitForTServerHeartbeat();
+      final String error_msg2 = "no partition of relation \"prt2\" found for row";
+      runInvalidQuery(stmt2, "INSERT INTO prt VALUES (9)", error_msg2);
+
+      // Test adding a default subpartition
+      stmt1.executeUpdate("CREATE TABLE prt2_default PARTITION OF prt2 DEFAULT");
+      waitForTServerHeartbeat();
+      stmt2.executeUpdate("INSERT INTO prt VALUES (9)");
+
+      // Test dropping a default subpartition
+      stmt1.executeUpdate("ALTER TABLE prt2 DETACH PARTITION prt2_default");
+      waitForTServerHeartbeat();
+      runInvalidQuery(stmt2, "INSERT INTO prt VALUES (9)", error_msg2);
+
+      // Test dropping child partitioned table.
+      stmt1.executeUpdate("DROP TABLE prt2");
+      waitForTServerHeartbeat();
+      runInvalidQuery(stmt2, "INSERT INTO prt VALUES (3)", error_msg);
+    }
+  }
+
+  @Test
+  public void testInheritance() throws Exception {
+    try (Connection connection1 = getConnectionBuilder().withTServer(0).connect();
+    Connection connection2 = getConnectionBuilder().withTServer(1).connect();
+    Statement stmt1 = connection1.createStatement();
+    Statement stmt2 = connection2.createStatement()) {
+
+      stmt1.executeUpdate("CREATE TABLE parent(a int, b text, c int, d int)");
+      stmt1.executeUpdate("INSERT INTO parent values (1,'parent',1, 1)");
+      stmt1.executeUpdate("CREATE TABLE child(ch_a int) inherits (parent)");
+      stmt1.executeUpdate("INSERT INTO child values (100,'child',100, 100, 100)");
+      waitForTServerHeartbeat();
+      assertEquals(2, getRowList(stmt2, "SELECT a FROM parent").size());
+
+
+      // drop col from parent, verify write on child is aborted
+      final String[] abort_errors =
+      { "expired or aborted by a conflict", "Transaction aborted: kAborted" };
+
+      stmt2.execute("BEGIN");
+      stmt2.executeUpdate("INSERT INTO child VALUES (101, 'child', 101, 101, 101)");
+      stmt1.executeUpdate("ALTER TABLE parent DROP COLUMN d");
+      runInvalidQuery(stmt2, "COMMIT", abort_errors);
+      waitForTServerHeartbeat();
+      assertEquals(2, getRowList(stmt2, "SELECT * FROM parent").size());
+      stmt2.executeUpdate("INSERT INTO child VALUES (101, 'child', 101, 101)");
+      assertEquals(3, getRowList(stmt2, "SELECT * FROM parent").size());
+
+
+      // drop col from only parent, verify write on child is unaffected
+      stmt2.execute("BEGIN");
+      stmt2.executeUpdate("INSERT INTO child VALUES (102, 'child', 102, 102)");
+      stmt1.executeUpdate("ALTER TABLE ONLY parent DROP COLUMN c");
+      stmt2.execute("COMMIT");
+      waitForTServerHeartbeat();
+      assertEquals(4, getRowList(stmt2, "SELECT * FROM parent").size());
+
+      // remove inheritance, verify select does not read child
+      stmt1.executeUpdate("ALTER TABLE child NO INHERIT parent");
+      waitForTServerHeartbeat();
+      assertEquals(1, getRowList(stmt2, "SELECT * FROM parent").size());
+
+      // add inheritance, verify select reads all rows
+      stmt1.executeUpdate("ALTER TABLE child INHERIT parent");
+      waitForTServerHeartbeat();
+      assertEquals(4, getRowList(stmt2, "SELECT * FROM parent").size());
+
+      // create table inherits, verify select reads all rows
+      stmt1.executeUpdate("CREATE TABLE newchild(newch_a int) INHERITS (parent)");
+      stmt1.executeUpdate("INSERT INTO newchild VALUES (200, 'newchild', 200)");
+      waitForTServerHeartbeat();
+      assertEquals(5, getRowList(stmt2, "SELECT * FROM parent").size());
+
+      // drop table, verify select does not read child
+      stmt1.executeUpdate("DROP TABLE child");
+      waitForTServerHeartbeat();
+      assertEquals(2, getRowList(stmt2, "SELECT * FROM parent").size());
+
+    }
+  }
+
+  @Test
+  public void testDefaultPartitionConsistency() throws Exception {
+    try (Connection connection1 = getConnectionBuilder().withTServer(0).connect();
+         Connection connection2 = getConnectionBuilder().withTServer(1).connect();
+         Statement stmt1 = connection1.createStatement();
+         Statement stmt2 = connection2.createStatement()) {
+
+      // Create a partitioned table and and a default partition in connection1.
+      stmt1.executeUpdate("CREATE TABLE prt (a int, b varchar) PARTITION BY RANGE(a)");
+      stmt1.executeUpdate("CREATE TABLE prt_default PARTITION OF prt DEFAULT");
+
+      // Concurrently create/attach a new partition in connection 2 while inserting data into the
+      // parent partitioned table in connection 1. Verify that the insert transaction gets aborted
+      // due to concurrent DDL.
+      final String[] abort_errors =
+        { "expired or aborted by a conflict", "Transaction aborted: kAborted" };
+      for (int part_idx = 0; part_idx < 50; ++part_idx) {
+        final int startPartition = 10 * part_idx;
+        final int endPartition = 10 * (part_idx + 1);
+
+        stmt1.execute("BEGIN");
+        stmt1.executeUpdate(String.format("INSERT INTO prt(a,b) VALUES (%d, 'abc')",
+                                          startPartition + 1));
+
+        // Alternatively test creating a new partition and attaching a new partition.
+        if (part_idx % 2 == 0) {
+          stmt2.executeUpdate(String.format("CREATE TABLE prt_p%d (a int, b varchar)",
+                                            part_idx + 1));
+          stmt2.executeUpdate(String.format(
+              "ALTER TABLE prt ATTACH PARTITION prt_p%d FOR VALUES FROM (%d) TO (%d)",
+              part_idx + 1, startPartition, endPartition));
+        } else {
+          stmt2.executeUpdate(String.format(
+                  "CREATE TABLE prt_p%d PARTITION OF prt FOR VALUES FROM (%d) TO (%d)",
+                  part_idx + 1, startPartition, endPartition));
+        }
+
+        runInvalidQuery(stmt1, "COMMIT", abort_errors);
+
+        // There should be no rows in the default partition.
+        assertEquals(getRowList(stmt1, "SELECT * FROM prt_default WHERE a>0").size(), 0);
+      }
     }
   }
 
@@ -609,6 +853,56 @@ public class TestPgCacheConsistency extends BasePgSQLTest {
       return Optional.empty();
     } catch (Throwable t) {
       return Optional.of(t);
+    }
+  }
+
+  // Check that when a query fails due to a stale catalog cache, the original error information
+  // (including the hint) is preserved.
+  @Test
+  public void testCatalogVersionLogging() throws Exception {
+    Assume.assumeFalse("Disabling heartbeats causes Connection Manager DDL sleeps to hang",
+        isTestRunningWithConnectionManager());
+
+    try (Connection connection1 = getConnectionBuilder().withTServer(0).connect();
+         Connection connection2 = getConnectionBuilder().withTServer(1).connect();
+         Statement statement1 = connection1.createStatement();
+         Statement statement2 = connection2.createStatement()) {
+
+      statement1.execute("CREATE TABLE test_table(id int, x0 int)");
+
+      waitForTServerHeartbeat();
+
+      // Force a cache refresh on connection 2.
+      statement2.execute("SELECT * FROM test_table");
+
+      // Disable heartbeats so the catalog version bump from the ALTER
+      // cannot propagate to tserver 1 before the SELECT x1.
+      for (HostAndPort hostAndPort : miniCluster.getTabletServers().keySet()) {
+        assertTrue(miniCluster.getClient().setFlag(
+            hostAndPort, "TEST_tserver_disable_heartbeat", "true", true));
+      }
+
+      statement1.execute("ALTER TABLE test_table ADD COLUMN x1 int");
+
+      // Connection 2's tserver still has stale catalog; SELECT x1 must fail.
+      String query = "SELECT x1 FROM test_table";
+      try {
+        statement2.execute(query);
+        fail(String.format("Statement did not fail: %s", query));
+      } catch (SQLException error) {
+        LOG.info(error.getMessage());
+        // The original hint must be preserved (we used to also append a "Catalog Version
+        // Mismatch" context; this assertion guards against regressing to a "(null)" hint).
+        assertThat(
+          error.getMessage(),
+          CoreMatchers.containsString("Hint: Perhaps you meant to reference the column " +
+            "\"test_table.x0\"")
+        );
+        assertThat(
+          error.getMessage(),
+          CoreMatchers.not(CoreMatchers.containsString("(null)"))
+        );
+      }
     }
   }
 }

@@ -15,9 +15,9 @@
 // specific language governing permissions and limitations
 // under the License.
 //
-// The following only applies to changes made to this file as part of YugaByte development.
+// The following only applies to changes made to this file as part of YugabyteDB development.
 //
-// Portions Copyright (c) YugaByte, Inc.
+// Portions Copyright (c) YugabyteDB, Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License"); you may not use this file except
 // in compliance with the License.  You may obtain a copy of the License at
@@ -34,7 +34,7 @@
 
 #include <string>
 
-#include <glog/logging.h>
+#include "yb/util/logging.h"
 
 #include "yb/master/catalog_manager.h"
 #include "yb/master/master.h"
@@ -45,11 +45,11 @@
 #include "yb/util/net/sockaddr.h"
 #include "yb/util/net/tunnel.h"
 #include "yb/util/status.h"
+#include "yb/util/thread.h"
 
 using std::string;
 using std::vector;
 
-using strings::Substitute;
 
 DECLARE_bool(TEST_simulate_fs_create_failure);
 DECLARE_bool(rpc_server_allow_ephemeral_ports);
@@ -77,6 +77,7 @@ MiniMaster::~MiniMaster() {
 
 Status MiniMaster::Start(bool TEST_simulate_fs_create_failure) {
   CHECK(!running_);
+
   FLAGS_rpc_server_allow_ephemeral_ports = true;
   FLAGS_TEST_simulate_fs_create_failure = TEST_simulate_fs_create_failure;
   // Disable WAL fsync for tests
@@ -91,7 +92,12 @@ Status MiniMaster::StartDistributedMaster(const vector<uint16_t>& peer_ports) {
   return StartDistributedMasterOnPorts(rpc_port_, web_port_, peer_ports);
 }
 
+std::string MiniMaster::ToString() const {
+  return Format("m-$0", index_);
+}
+
 void MiniMaster::Shutdown() {
+  TEST_SetThreadPrefixScoped prefix_se(Format("m-$0", index_));
   if (tunnel_) {
     tunnel_->Shutdown();
   }
@@ -122,17 +128,16 @@ Status MiniMaster::StartOnPorts(uint16_t rpc_port, uint16_t web_port) {
   }
   MasterOptions opts(master_addresses);
 
-  Status start_status = StartOnPorts(rpc_port, web_port, &opts);
-  if (!start_status.ok()) {
-    LOG(ERROR) << "MiniMaster failed to start on RPC port " << rpc_port
-               << ", web port " << web_port << ": " << start_status;
-    // Don't crash here. Handle the error in the caller (e.g. could retry there).
-  }
-  return start_status;
+  // Don't crash here. Handle the error in the caller (e.g. could retry there).
+  RETURN_NOT_OK_WITH_WARNING(
+      StartOnPorts(rpc_port, web_port, &opts),
+      Format("MiniMaster failed to start on RPC port $0, web port $1", rpc_port, web_port));
+  return Status::OK();
 }
 
 Status MiniMaster::StartOnPorts(uint16_t rpc_port, uint16_t web_port,
                                 MasterOptions* opts) {
+  TEST_SetThreadPrefixScoped prefix_se(Format("m-$0", index_));
   if (use_custom_addresses_) {
     opts->rpc_opts.rpc_bind_addresses = Format(
         "$0:$1", custom_rpc_addresses_[0], rpc_port);
@@ -161,10 +166,10 @@ Status MiniMaster::StartOnPorts(uint16_t rpc_port, uint16_t web_port,
   if (!opts->has_placement_cloud()) {
     opts->SetPlacement(
         Format("cloud$0", (index_ + 1) / FLAGS_TEST_nodes_per_cloud),
-        Format("rack$0", index_), "zone");
+        Format("region$0", index_), "zone");
   }
 
-  std::unique_ptr<Master> server(new enterprise::Master(*opts));
+  std::unique_ptr<Master> server(new Master(*opts));
   RETURN_NOT_OK(server->Init());
 
   server::TEST_SetupConnectivity(server->messenger(), index_);
@@ -208,7 +213,7 @@ Status MiniMaster::StartDistributedMasterOnPorts(uint16_t rpc_port, uint16_t web
   return StartOnPorts(rpc_port, web_port, &opts);
 }
 
-Status MiniMaster::Restart() {
+Status MiniMaster::Restart(bool wait_until_catalog_manager_is_leader) {
   CHECK(running_);
 
   auto prev_rpc = bound_rpc_addr();
@@ -219,7 +224,11 @@ Status MiniMaster::Restart() {
   MasterOptions opts(master_addresses);
   RETURN_NOT_OK(StartOnPorts(prev_rpc.port(), prev_http.port(), &opts));
   CHECK(running_);
-  return WaitForCatalogManagerInit();
+  RETURN_NOT_OK(WaitForCatalogManagerInit());
+  if (!wait_until_catalog_manager_is_leader) {
+    return Status::OK();
+  }
+  return WaitUntilCatalogManagerIsLeaderAndReadyForTests();
 }
 
 Status MiniMaster::WaitForCatalogManagerInit() {
@@ -293,6 +302,10 @@ master::FlushManager& MiniMaster::flush_manager() const {
 
 FsManager& MiniMaster::fs_manager() const {
   return *master_->fs_manager();
+}
+
+HybridTime MiniMaster::Now() const {
+  return master_->clock()->Now();
 }
 
 } // namespace master

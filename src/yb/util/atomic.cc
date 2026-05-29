@@ -15,9 +15,9 @@
 // specific language governing permissions and limitations
 // under the License.
 //
-// The following only applies to changes made to this file as part of YugaByte development.
+// The following only applies to changes made to this file as part of YugabyteDB development.
 //
-// Portions Copyright (c) YugaByte, Inc.
+// Portions Copyright (c) YugabyteDB, Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License"); you may not use this file except
 // in compliance with the License.  You may obtain a copy of the License at
@@ -32,24 +32,8 @@
 
 #include "yb/util/atomic.h"
 
-#include <stdint.h>
-
-#include <glog/logging.h>
-
 namespace yb {
 
-template<typename T>
-AtomicInt<T>::AtomicInt(T initial_value) {
-  Store(initial_value, kMemOrderNoBarrier);
-}
-
-template<typename T>
-void AtomicInt<T>::FatalMemOrderNotSupported(const char* caller,
-                                             const char* requested,
-                                             const char* supported) {
-  LOG(FATAL) << caller << " does not support " << requested << ": only "
-             << supported << " are supported.";
-}
 
 template
 class AtomicInt<int32_t>;

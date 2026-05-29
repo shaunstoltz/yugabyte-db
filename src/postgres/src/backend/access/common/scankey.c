@@ -3,7 +3,7 @@
  * scankey.c
  *	  scan key support code
  *
- * Portions Copyright (c) 1996-2018, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2022, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  *
@@ -24,7 +24,7 @@
  *		The target procedure is specified by OID (but can be invalid
  *		if SK_SEARCHNULL or SK_SEARCHNOTNULL is set).
  *
- * Note: GetCurrentMemoryContext() at call should be as long-lived as the ScanKey
+ * Note: CurrentMemoryContext at call should be as long-lived as the ScanKey
  * itself, because that's what will be used for any subsidiary info attached
  * to the ScanKey's FmgrInfo record.
  */
@@ -64,11 +64,11 @@ ScanKeyEntryInitialize(ScanKey entry,
  * It cannot handle NULL arguments, unary operators, or nondefault operators,
  * but we need none of those features for most hardwired lookups.
  *
- * We set collation to DEFAULT_COLLATION_OID always.  This is appropriate
- * for textual columns in system catalogs, and it will be ignored for
- * non-textual columns, so it's not worth trying to be more finicky.
+ * We set collation to C_COLLATION_OID always.  This is the correct value
+ * for all collation-aware columns in system catalogs, and it will be ignored
+ * for other column types, so it's not worth trying to be more finicky.
  *
- * Note: GetCurrentMemoryContext() at call should be as long-lived as the ScanKey
+ * Note: CurrentMemoryContext at call should be as long-lived as the ScanKey
  * itself, because that's what will be used for any subsidiary info attached
  * to the ScanKey's FmgrInfo record.
  */
@@ -83,7 +83,7 @@ ScanKeyInit(ScanKey entry,
 	entry->sk_attno = attributeNumber;
 	entry->sk_strategy = strategy;
 	entry->sk_subtype = InvalidOid;
-	entry->sk_collation = DEFAULT_COLLATION_OID;
+	entry->sk_collation = C_COLLATION_OID;
 	entry->sk_argument = argument;
 	fmgr_info(procedure, &entry->sk_func);
 }
@@ -93,7 +93,7 @@ ScanKeyInit(ScanKey entry,
  *		Initializes a scan key entry using an already-completed FmgrInfo
  *		function lookup record.
  *
- * Note: GetCurrentMemoryContext() at call should be as long-lived as the ScanKey
+ * Note: CurrentMemoryContext at call should be as long-lived as the ScanKey
  * itself, because that's what will be used for any subsidiary info attached
  * to the ScanKey's FmgrInfo record.
  */
@@ -113,5 +113,5 @@ ScanKeyEntryInitializeWithInfo(ScanKey entry,
 	entry->sk_subtype = subtype;
 	entry->sk_collation = collation;
 	entry->sk_argument = argument;
-	fmgr_info_copy(&entry->sk_func, finfo, GetCurrentMemoryContext());
+	fmgr_info_copy(&entry->sk_func, finfo, CurrentMemoryContext);
 }

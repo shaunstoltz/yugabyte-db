@@ -1,4 +1,4 @@
-// Copyright (c) YugaByte, Inc.
+// Copyright (c) YugabyteDB, Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License"); you may not use this file except
 // in compliance with the License.  You may obtain a copy of the License at
@@ -15,13 +15,13 @@ package org.yb.pgsql;
 
 import org.junit.Test;
 import org.junit.runner.RunWith;
-import org.yb.util.YBTestRunnerNonTsanOnly;
+import org.yb.YBTestRunner;
 
 /**
  * Runs the pg_regress test suite on YB code.
  */
-@RunWith(value=YBTestRunnerNonTsanOnly.class)
-public class TestPgRegressPgStat extends BasePgSQLTest {
+@RunWith(value=YBTestRunner.class)
+public class TestPgRegressPgStat extends BasePgRegressTest {
   @Override
   public int getTestMethodTimeoutSec() {
     return 1800;
@@ -29,6 +29,13 @@ public class TestPgRegressPgStat extends BasePgSQLTest {
 
   @Test
   public void testPgStat() throws Exception {
+    // Restart the cluster when test is ran with connection manager to ensure
+    // that the pg_stat_activity table is empty. Before entering into the test
+    // as part of initial setup some queries are executed in initPostgresBefore
+    // on connection manager port. It affects the rows in pg_stat_activity
+    // table with respect to connection manager.
+    skipYsqlConnMgr(BasePgSQLTest.DIFF_BACKEND_TYPE_PG_STAT_ACTIVITY,
+        /* restartCluster */ true);
     runPgRegressTest("yb_pg_stat_schedule");
   }
 }

@@ -1,4 +1,4 @@
-# Copyright (c) Yugabyte, Inc.
+# Copyright (c) YugabyteDB, Inc.
 #
 # Licensed under the Apache License, Version 2.0 (the "License"); you may not use this file except
 # in compliance with the License.  You may obtain a copy of the License at
@@ -86,12 +86,10 @@ macro(yb_find_third_party_dependencies)
   message("OPENSSL_LIBRARIES=${OPENSSL_LIBRARIES}")
   message("OPENSSL_VERSION=${OPENSSL_VERSION}")
 
-  cmake_path(IS_PREFIX YB_THIRDPARTY_DIR "${OPENSSL_CRYPTO_LIBRARY}" NORMALIZE result)
-  if (NOT result)
+  if (NOT "${OPENSSL_CRYPTO_LIBRARY}" MATCHES "^${YB_THIRDPARTY_DIR}/.*")
     message(FATAL_ERROR "OPENSSL_CRYPTO_LIBRARY not in ${YB_THIRDPARTY_DIR}.")
   endif()
-  cmake_path(IS_PREFIX YB_THIRDPARTY_DIR "${OPENSSL_SSL_LIBRARY}" NORMALIZE result)
-  if (NOT result)
+  if (NOT "${OPENSSL_SSL_LIBRARY}" MATCHES "^${YB_THIRDPARTY_DIR}/.*")
     message(FATAL_ERROR "OPENSSL_SSL_LIBRARY not in ${YB_THIRDPARTY_DIR}.")
   endif()
 
@@ -102,12 +100,6 @@ macro(yb_find_third_party_dependencies)
     STATIC_LIB "${GLOG_STATIC_LIB}"
     SHARED_LIB "${GLOG_SHARED_LIB}")
   list(APPEND YB_BASE_LIBS glog)
-
-  find_package(CDS REQUIRED)
-  include_directories(SYSTEM ${CDS_INCLUDE_DIR})
-  ADD_THIRDPARTY_LIB(cds
-    STATIC_LIB "${CDS_STATIC_LIB}"
-    SHARED_LIB "${CDS_SHARED_LIB}")
 
   if (NOT APPLE)
     ## libunwind (dependent of glog)
@@ -144,6 +136,10 @@ macro(yb_find_third_party_dependencies)
     STATIC_LIB "${GFLAGS_STATIC_LIB}"
     SHARED_LIB "${GFLAGS_SHARED_LIB}")
   list(APPEND YB_BASE_LIBS gflags)
+
+  ## JwtCpp
+  find_package(JwtCpp REQUIRED)
+  include_directories(SYSTEM ${JWTCPP_INCLUDE_DIR})
 
   ## GTest
   find_package(GTest REQUIRED)
@@ -215,13 +211,19 @@ macro(yb_find_third_party_dependencies)
   include_directories(SYSTEM ${HIREDIS_INCLUDE_DIR})
   ADD_THIRDPARTY_LIB(hiredis STATIC_LIB "${HIREDIS_STATIC_LIB}")
 
-  # -------------------------------------------------------------------------------------------------
+  # Abseil
+  find_package(Abseil REQUIRED)
+  ADD_THIRDPARTY_LIB(abseil
+    STATIC_LIB "${ABSEIL_STATIC_LIB}"
+    SHARED_LIB "${ABSEIL_SHARED_LIB}")
+
+  # ------------------------------------------------------------------------------------------------
   # Deciding whether to use tcmalloc
-  # -------------------------------------------------------------------------------------------------
+  # ------------------------------------------------------------------------------------------------
 
   # Do not use tcmalloc for ASAN/TSAN.
   if ("${YB_TCMALLOC_ENABLED}" STREQUAL "")
-    if ("${YB_BUILD_TYPE}" MATCHES "^(asan|tsan)$")
+    if (IS_SANITIZER)
       set(YB_TCMALLOC_ENABLED "0")
       message("Not using tcmalloc due to build type ${YB_BUILD_TYPE}")
     else()
@@ -243,12 +245,6 @@ macro(yb_find_third_party_dependencies)
     if ("${YB_GOOGLE_TCMALLOC}" STREQUAL "1")
       message("Using google/tcmalloc")
       find_package(TCMalloc REQUIRED)
-
-      # Use abseil (which tcmalloc depends on).
-      find_package(Abseil REQUIRED)
-      ADD_THIRDPARTY_LIB(abseil
-        STATIC_LIB "${ABSEIL_STATIC_LIB}"
-        SHARED_LIB "${ABSEIL_SHARED_LIB}")
       ADD_CXX_FLAGS("-DYB_GOOGLE_TCMALLOC")
     else()
       ## Google PerfTools
@@ -272,7 +268,7 @@ macro(yb_find_third_party_dependencies)
   endif()
 
   #
-  # -------------------------------------------------------------------------------------------------
+  # ------------------------------------------------------------------------------------------------
 
   ## curl
   find_package(CURL REQUIRED)
@@ -313,10 +309,17 @@ macro(yb_find_third_party_dependencies)
   set(Boost_NO_SYSTEM_PATHS ON)
 
   if("${YB_COMPILER_TYPE}" MATCHES "^gcc[0-9]+$")
-    # TODO: display this only if using a devtoolset compiler on CentOS, and ideally only if the error
-    # actually happens.
+    # TODO: display this only if using a devtoolset compiler on CentOS, and ideally only if the
+    # error actually happens.
     message("Note: if Boost fails to find Threads, you might need to install the "
-            "devtoolset-N-libatomic-devel package for the devtoolset you are using.")
+            "gcc-toolset-N-libatomic-devel package, or devtoolset-N-libatomic-devel package for "
+            "older RedHat/CentOS versions, where N is the toolset version number.")
+  endif()
+
+  # This is needed for CMake 3.30+ which removes the FindBoost module:
+  # https://cmake.org/cmake/help/latest/policy/CMP0167.html.
+  if(POLICY CMP0167)
+      cmake_policy(SET CMP0167 OLD)
   endif()
 
   # Find Boost static libraries.
@@ -386,4 +389,56 @@ macro(yb_find_third_party_dependencies)
   find_package(Cassandra REQUIRED)
   include_directories(SYSTEM ${LIBCASSANDRA_INCLUDE_DIR})
   ADD_THIRDPARTY_LIB(cassandra SHARED_LIB "${LIBCASSANDRA_SHARED_LIB}")
+
+  ## Hdr Histogram
+  find_package(HdrHistogram REQUIRED)
+  include_directories(SYSTEM ${LIBHDR__HISTOGRAM_INCLUDE_DIR})
+  ADD_THIRDPARTY_LIB(hdr_histogram STATIC_LIB "${LIBHDR_HISTOGRAM_STATIC_LIB}")
+
+  ## AWS clockbound
+  find_package(Clockbound REQUIRED)
+  # Adding the include directory using target_include_directories since
+  # include_directories does not work here for some odd reason.
+  ADD_THIRDPARTY_LIB(clockbound
+    STATIC_LIB ${CLOCKBOUND_STATIC_LIB}
+    INCLUDE_DIRS ${CLOCKBOUND_INCLUDE_DIR})
+
+  ## Bson
+  find_package(Bson REQUIRED)
+  include_directories(SYSTEM ${BSON_INCLUDE_DIR})
+  ADD_THIRDPARTY_LIB(bson
+    STATIC_LIB "${BSON_STATIC_LIB}")
+
+  ## Bid
+  if(NOT "${CMAKE_SYSTEM_PROCESSOR}" STREQUAL "aarch64")
+    find_package(Bid REQUIRED)
+    include_directories(SYSTEM ${BID_INCLUDE_DIR})
+    ADD_THIRDPARTY_LIB(bid
+      STATIC_LIB "${BID_STATIC_LIB}")
+  endif()
+
+  ## Pcre2
+  find_package(Pcre REQUIRED)
+  include_directories(SYSTEM ${PCRE_INCLUDE_DIR})
+  ADD_THIRDPARTY_LIB(pcre
+    STATIC_LIB "${PCRE_STATIC_LIB}")
+
+  ## OpenTelemetry
+  find_package(Otel REQUIRED)
+  include_directories(SYSTEM ${OTEL_INCLUDE_DIR})
+
+  ADD_THIRDPARTY_LIB(opentelemetry_trace
+   SHARED_LIB "${OTEL_TRACE_SHARED_LIB}")
+  ADD_THIRDPARTY_LIB(opentelemetry_exporter_otlp_http
+   SHARED_LIB "${OTEL_EXPORTER_OTLP_HTTP_SHARED_LIB}")
+  ADD_THIRDPARTY_LIB(opentelemetry_resources
+   SHARED_LIB "${OTEL_RESOURCES_SHARED_LIB}")
+  ADD_THIRDPARTY_LIB(opentelemetry_proto
+   SHARED_LIB "${OTEL_PROTO_SHARED_LIB}")
+
+  ## libxml2
+  find_package(LibXml2 MODULE REQUIRED)
+  include_directories(SYSTEM ${LIBXML2_INCLUDE_DIR})
+  ADD_THIRDPARTY_LIB(libxml2 SHARED_LIB "${LIBXML2_SHARED_LIB}")
+
 endmacro()

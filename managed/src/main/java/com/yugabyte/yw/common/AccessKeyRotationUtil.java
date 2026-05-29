@@ -26,7 +26,7 @@ import java.util.UUID;
 import java.util.concurrent.TimeUnit;
 import java.util.function.Function;
 import java.util.stream.Collectors;
-import org.apache.commons.collections.CollectionUtils;
+import org.apache.commons.collections4.CollectionUtils;
 import org.apache.commons.lang3.StringUtils;
 import org.apache.commons.lang3.time.DateUtils;
 import play.libs.Json;
@@ -45,8 +45,7 @@ public class AccessKeyRotationUtil {
   public Set<UUID> getScheduledAccessKeyRotationUniverses(UUID customerUUID, UUID providerUUID) {
     Set<UUID> universeUUIDs = new HashSet<UUID>();
     // populate universeUUIDs with all universes in rotation for the given provider
-    Schedule.getAllByCustomerUUIDAndType(customerUUID, TaskType.CreateAndRotateAccessKey)
-        .stream()
+    Schedule.getAllByCustomerUUIDAndType(customerUUID, TaskType.CreateAndRotateAccessKey).stream()
         .filter(schedule -> (schedule.getOwnerUUID().equals(providerUUID)))
         .filter(schedule -> (schedule.getStatus().equals(Schedule.State.Active)))
         .forEach(
@@ -107,16 +106,16 @@ public class AccessKeyRotationUtil {
     for (Region region : regions) {
       newAccessKey =
           accessManager.addKey(
-              region.uuid,
+              region.getUuid(),
               newKeyCode,
               null,
-              provider.details.sshUser,
-              provider.details.sshPort,
-              provider.details.airGapInstall,
-              provider.details.skipProvisioning,
-              provider.details.setUpChrony,
-              provider.details.ntpServers,
-              provider.details.showSetUpChrony);
+              provider.getDetails().sshUser,
+              provider.getDetails().sshPort,
+              provider.getDetails().airGapInstall,
+              provider.getDetails().skipProvisioning,
+              provider.getDetails().setUpChrony,
+              provider.getDetails().ntpServers,
+              provider.getDetails().showSetUpChrony);
     }
 
     if (newAccessKey == null) {
@@ -128,19 +127,17 @@ public class AccessKeyRotationUtil {
 
   public List<UUID> removeDeletedUniverses(List<UUID> universeUUIDs) {
     List<UUID> filteredUniverses =
-        Universe.getAllWithoutResources(new HashSet<UUID>(universeUUIDs))
-            .stream()
-            .map(universe -> universe.universeUUID)
+        Universe.getAllWithoutResources(new HashSet<UUID>(universeUUIDs)).stream()
+            .map(universe -> universe.getUniverseUUID())
             .collect(Collectors.toList());
     return filteredUniverses;
   }
 
   public List<UUID> removePausedUniverses(List<UUID> universeUUIDs) {
     List<UUID> filteredUniverses =
-        Universe.getAllWithoutResources(new HashSet<UUID>(universeUUIDs))
-            .stream()
+        Universe.getAllWithoutResources(new HashSet<UUID>(universeUUIDs)).stream()
             .filter(universe -> !universe.getUniverseDetails().universePaused)
-            .map(universe -> universe.universeUUID)
+            .map(universe -> universe.getUniverseUUID())
             .collect(Collectors.toList());
     return filteredUniverses;
   }
@@ -167,8 +164,7 @@ public class AccessKeyRotationUtil {
     }
     // if expiration is disabled and no key has an explicitly expiration set
     if (!expirationEnabled
-        && universeAccessKeys
-            .stream()
+        && universeAccessKeys.stream()
             .allMatch(clusterAccessKey -> (clusterAccessKey.getExpirationDate() == null))) {
       return null;
     }
@@ -208,9 +204,8 @@ public class AccessKeyRotationUtil {
 
   public Map<AccessKeyId, AccessKey> createAllAccessKeysMap() {
     Map<AccessKeyId, AccessKey> accessKeys =
-        AccessKey.getAll()
-            .stream()
-            .collect(Collectors.toMap(accessKey -> accessKey.idKey, Function.identity()));
+        AccessKey.getAll().stream()
+            .collect(Collectors.toMap(accessKey -> accessKey.getIdKey(), Function.identity()));
     return accessKeys;
   }
 }

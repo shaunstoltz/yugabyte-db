@@ -15,9 +15,9 @@
 // specific language governing permissions and limitations
 // under the License.
 //
-// The following only applies to changes made to this file as part of YugaByte development.
+// The following only applies to changes made to this file as part of YugabyteDB development.
 //
-// Portions Copyright (c) YugaByte, Inc.
+// Portions Copyright (c) YugabyteDB, Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License"); you may not use this file except
 // in compliance with the License.  You may obtain a copy of the License at
@@ -38,27 +38,27 @@ METRIC_DEFINE_counter(tablet, log_bytes_logged, "Bytes Written to WAL",
                       yb::MetricUnit::kBytes,
                       "Number of bytes logged since service start");
 
-METRIC_DEFINE_counter(tablet, log_wal_size, "Size of WAL Files",
-                      yb::MetricUnit::kBytes,
-                      "Size of wal files");
+METRIC_DEFINE_gauge_uint64(tablet, log_wal_size, "Size of WAL Files",
+                           yb::MetricUnit::kBytes,
+                           "Size of wal files");
 
-METRIC_DEFINE_coarse_histogram(table, log_sync_latency, "Log Sync Latency",
+METRIC_DEFINE_event_stats(table, log_sync_latency, "Log Sync Latency",
                                yb::MetricUnit::kMicroseconds,
                                "Microseconds spent on synchronizing the log segment file");
 
-METRIC_DEFINE_coarse_histogram(table, log_append_latency, "Log Append Latency",
+METRIC_DEFINE_event_stats(table, log_append_latency, "Log Append Latency",
                         yb::MetricUnit::kMicroseconds,
                         "Microseconds spent on appending to the log segment file");
 
-METRIC_DEFINE_coarse_histogram(table, log_group_commit_latency, "Log Group Commit Latency",
+METRIC_DEFINE_event_stats(table, log_group_commit_latency, "Log Group Commit Latency",
                         yb::MetricUnit::kMicroseconds,
                         "Microseconds spent on committing an entire group");
 
-METRIC_DEFINE_coarse_histogram(table, log_roll_latency, "Log Roll Latency",
+METRIC_DEFINE_event_stats(table, log_roll_latency, "Log Roll Latency",
                         yb::MetricUnit::kMicroseconds,
                         "Microseconds spent on rolling over to a new log segment file");
 
-METRIC_DEFINE_coarse_histogram(table, log_entry_batches_per_group, "Log Group Commit Batch Size",
+METRIC_DEFINE_event_stats(table, log_entry_batches_per_group, "Log Group Commit Batch Size",
                         yb::MetricUnit::kRequests,
                         "Number of log entry batches in a group commit group");
 
@@ -66,10 +66,11 @@ namespace yb {
 namespace log {
 
 #define MINIT(metric_entity, x) x(METRIC_log_##x.Instantiate(metric_entity))
+#define GINIT(metric_entity, x) x(METRIC_log_##x.Instantiate(metric_entity, 0))
 LogMetrics::LogMetrics(const scoped_refptr<MetricEntity>& table_metric_entity,
                        const scoped_refptr<MetricEntity>& tablet_metric_entity)
     : MINIT(tablet_metric_entity, bytes_logged),
-      MINIT(tablet_metric_entity, wal_size),
+      GINIT(tablet_metric_entity, wal_size),
       MINIT(table_metric_entity, sync_latency),
       MINIT(table_metric_entity, append_latency),
       MINIT(table_metric_entity, group_commit_latency),

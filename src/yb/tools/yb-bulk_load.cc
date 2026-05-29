@@ -1,4 +1,4 @@
-// Copyright (c) YugaByte, Inc.
+// Copyright (c) YugabyteDB, Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License"); you may not use this file except
 // in compliance with the License.  You may obtain a copy of the License at
@@ -14,7 +14,6 @@
 #include <thread>
 
 #include <boost/algorithm/string.hpp>
-#include <glog/logging.h>
 
 #include "yb/client/client.h"
 #include "yb/client/schema.h"
@@ -23,15 +22,16 @@
 #include "yb/common/entity_ids.h"
 #include "yb/common/hybrid_time.h"
 #include "yb/common/jsonb.h"
-#include "yb/common/ql_protocol.pb.h"
+#include "yb/common/ql_protocol.messages.h"
 #include "yb/common/ql_value.h"
-#include "yb/common/partition.h"
 #include "yb/common/schema.h"
 #include "yb/common/wire_protocol.h"
 
 #include "yb/docdb/cql_operation.h"
 #include "yb/docdb/doc_operation.h"
 #include "yb/docdb/doc_read_context.h"
+
+#include "yb/dockv/partition.h"
 
 #include "yb/master/master_client.pb.h"
 #include "yb/master/master_util.h"
@@ -71,35 +71,36 @@ using yb::client::YBTable;
 using yb::client::YBTableName;
 using yb::docdb::DocWriteBatch;
 using yb::docdb::InitMarkerBehavior;
-using yb::operator"" _GB;
+using yb::operator""_GB;
 
-DEFINE_UNKNOWN_string(master_addresses, "", "Comma-separated list of YB Master server addresses");
-DEFINE_UNKNOWN_string(table_name, "", "Name of the table to generate partitions for");
-DEFINE_UNKNOWN_string(namespace_name, "", "Namespace of the table");
-DEFINE_UNKNOWN_string(base_dir, "", "Base directory where we will store all the SSTable files");
-DEFINE_UNKNOWN_int64(memtable_size_bytes, 1_GB, "Amount of bytes to use for the rocksdb memtable");
-DEFINE_UNKNOWN_uint64(row_batch_size, 1000,
+DEFINE_NON_RUNTIME_string(master_addresses, "",
+    "Comma-separated list of YB Master server addresses");
+DEFINE_NON_RUNTIME_string(table_name, "", "Name of the table to generate partitions for");
+DEFINE_NON_RUNTIME_string(namespace_name, "", "Namespace of the table");
+DEFINE_NON_RUNTIME_string(base_dir, "", "Base directory where we will store all the SSTable files");
+DEFINE_NON_RUNTIME_int64(memtable_size_bytes, 1_GB,
+    "Amount of bytes to use for the rocksdb memtable");
+DEFINE_NON_RUNTIME_uint64(row_batch_size, 1000,
     "The number of rows to batch together in each rocksdb write");
-DEFINE_UNKNOWN_bool(flush_batch_for_tests, false,
+DEFINE_NON_RUNTIME_bool(flush_batch_for_tests, false,
     "Option used only in tests to flush after each batch. "
     "Used to generate multiple SST files in conjuction with small row_batch_size");
-DEFINE_UNKNOWN_string(bulk_load_helper_script, "./bulk_load_helper.sh",
+DEFINE_NON_RUNTIME_string(bulk_load_helper_script, "./bulk_load_helper.sh",
     "Relative path for bulk load helper"
     " script");
-DEFINE_UNKNOWN_string(bulk_load_cleanup_script, "./bulk_load_cleanup.sh",
+DEFINE_NON_RUNTIME_string(bulk_load_cleanup_script, "./bulk_load_cleanup.sh",
     "Relative path for bulk load "
     "cleanup script");
-DEFINE_UNKNOWN_string(ssh_key_file, "", "SSH key to push SSTable files to production cluster");
-DEFINE_UNKNOWN_bool(export_files, false,
+DEFINE_NON_RUNTIME_string(ssh_key_file, "", "SSH key to push SSTable files to production cluster");
+DEFINE_NON_RUNTIME_bool(export_files, false,
     "Whether or not the files should be exported to a production "
     "cluster.");
-DEFINE_UNKNOWN_int32(bulk_load_num_threads, 16, "Number of threads to use for bulk load");
-DEFINE_UNKNOWN_int32(bulk_load_threadpool_queue_size, 10000,
-             "Maximum number of entries to queue in the threadpool");
-DEFINE_UNKNOWN_int32(bulk_load_num_memtables, 3, "Number of memtables to use for rocksdb");
-DEFINE_UNKNOWN_int32(bulk_load_max_background_flushes, 2,
+DEFINE_NON_RUNTIME_int32(bulk_load_num_threads, 16, "Number of threads to use for bulk load");
+DEPRECATE_FLAG(int32, bulk_load_threadpool_queue_size, "05_2026");
+DEFINE_NON_RUNTIME_int32(bulk_load_num_memtables, 3, "Number of memtables to use for rocksdb");
+DEFINE_NON_RUNTIME_int32(bulk_load_max_background_flushes, 2,
     "Number of flushes to perform in the background");
-DEFINE_UNKNOWN_uint64(bulk_load_num_files_per_tablet, 5,
+DEFINE_NON_RUNTIME_uint64(bulk_load_num_files_per_tablet, 5,
               "Determines how to compact the data of a tablet to ensure we have only a certain "
               "number of sst files per tablet");
 
@@ -118,11 +119,11 @@ class BulkLoadTask : public Runnable {
  private:
   Status PopulateColumnValue(const string &column,
                              const DataType data_type,
-                             QLExpressionPB *column_value);
+                             QLExpressionMsg *column_value);
   Status InsertRow(const string &row,
                    const Schema &schema,
                    uint32_t schema_version,
-                   const IndexMap& index_map,
+                   const qlexpr::IndexMap& index_map,
                    BulkLoadDocDBUtil *const db_fixture,
                    docdb::DocWriteBatch *const doc_write_batch,
                    YBPartitionGenerator *const partition_generator);
@@ -131,6 +132,8 @@ class BulkLoadTask : public Runnable {
   BulkLoadDocDBUtil *const db_fixture_;
   const YBTable *const table_;
   YBPartitionGenerator *const partition_generator_;
+  dockv::SchemaPackingRegistryPtr schema_packing_registry_ =
+      std::make_shared<dockv::SchemaPackingRegistry>("BULK LOAD: ");
 };
 
 class CompactionTask: public Runnable {
@@ -189,8 +192,9 @@ BulkLoadTask::BulkLoadTask(vector<pair<TabletId, string>> rows,
 }
 
 void BulkLoadTask::Run() {
+  auto dummy_pending_op = ScopedRWOperation();
   DocWriteBatch doc_write_batch(docdb::DocDB::FromRegularUnbounded(db_fixture_->rocksdb()),
-                                InitMarkerBehavior::kOptional);
+                                InitMarkerBehavior::kOptional, dummy_pending_op);
 
   for (const auto &entry : rows_) {
     const string &row = entry.second;
@@ -206,13 +210,13 @@ void BulkLoadTask::Run() {
       /* decode_dockey */ false, /* increment_write_id */ false));
 
   if (FLAGS_flush_batch_for_tests) {
-    CHECK_OK(db_fixture_->FlushRocksDbAndWait());
+    CHECK_OK(db_fixture_->FlushRocksDbAndWait(rocksdb::FlushReason::kYbBulkLoadTool));
   }
 }
 
 Status BulkLoadTask::PopulateColumnValue(const string &column,
                                          const DataType data_type,
-                                         QLExpressionPB *column_value) {
+                                         QLExpressionMsg *column_value) {
   auto ql_valuepb = column_value->mutable_value();
   switch (data_type) {
     YB_SET_INT_VALUE(ql_valuepb, column, 8);
@@ -232,13 +236,13 @@ Status BulkLoadTask::PopulateColumnValue(const string &column,
       break;
     }
     case DataType::STRING: {
-      ql_valuepb->set_string_value(column);
+      ql_valuepb->dup_string_value(column);
       break;
     }
     case DataType::JSONB: {
       common::Jsonb jsonb;
       RETURN_NOT_OK(jsonb.FromString(column));
-      ql_valuepb->set_jsonb_value(jsonb.MoveSerializedJsonb());
+      ql_valuepb->dup_jsonb_value(jsonb.MoveSerializedJsonb());
       break;
     }
     case DataType::TIMESTAMP: {
@@ -248,7 +252,7 @@ Status BulkLoadTask::PopulateColumnValue(const string &column,
       break;
     }
     case DataType::BINARY: {
-      ql_valuepb->set_binary_value(column);
+      ql_valuepb->dup_binary_value(column);
       break;
     }
     default:
@@ -260,7 +264,7 @@ Status BulkLoadTask::PopulateColumnValue(const string &column,
 Status BulkLoadTask::InsertRow(const string &row,
                                const Schema &schema,
                                uint32_t schema_version,
-                               const IndexMap& index_map,
+                               const qlexpr::IndexMap& index_map,
                                BulkLoadDocDBUtil *const db_fixture,
                                docdb::DocWriteBatch *const doc_write_batch,
                                YBPartitionGenerator *const partition_generator) {
@@ -272,8 +276,9 @@ Status BulkLoadTask::InsertRow(const string &row,
                              ncolumns, schema.num_columns());
   }
 
-  QLResponsePB resp;
-  QLWriteRequestPB req;
+  auto arena = SharedThreadSafeArena();
+  auto& resp = *arena->NewArenaObject<LWQLResponsePB>();
+  auto& req = *arena->NewArenaObject<LWQLWriteRequestPB>();
   req.set_type(QLWriteRequestPB_QLStmtType_QL_STMT_INSERT);
   req.set_client(YQL_CLIENT_CQL);
 
@@ -288,7 +293,7 @@ Status BulkLoadTask::InsertRow(const string &row,
       return STATUS_SUBSTITUTE(IllegalState, "Primary key cannot be null: $0", *it);
     }
 
-    QLExpressionPB *column_value = nullptr;
+    QLExpressionMsg *column_value = nullptr;
     if (schema.is_hash_key_column(i)) {
       column_value = req.add_hashed_column_values();
     } else {
@@ -304,7 +309,7 @@ Status BulkLoadTask::InsertRow(const string &row,
     if (skipped_cols_.find(col_id) != skipped_cols_.end()) {
       continue;
     }
-    QLColumnValuePB *column_value = req.add_column_values();
+    auto *column_value = req.add_column_values();
     column_value->set_column_id(narrow_cast<int32_t>(kFirstColumnId + i));
     if (IsNull(*it)) {
       // Use empty value for null.
@@ -321,25 +326,29 @@ Status BulkLoadTask::InsertRow(const string &row,
   string partition_key;
   RETURN_NOT_OK(partition_generator->LookupTabletIdWithTokenizer(
       tokenizer, skipped_cols_, &tablet_id, &partition_key));
-  req.set_hash_code(PartitionSchema::DecodeMultiColumnHashValue(partition_key));
+  req.set_hash_code(dockv::PartitionSchema::DecodeMultiColumnHashValue(partition_key));
 
   // Finally apply the operation to the doc_write_batch.
   // TODO(dtxn) pass correct TransactionContext.
   // Comment from PritamD: Don't need cross shard transaction support in bulk load, but I guess
   // once we have secondary indexes we probably might need to ensure bulk load builds the indexes
   // as well.
+  auto doc_read_context = std::make_shared<docdb::DocReadContext>(
+      "BULK LOAD: ", TableType::YQL_TABLE_TYPE, docdb::Index::kFalse, schema_packing_registry_,
+      schema, schema_version);
   docdb::QLWriteOperation op(
-      req, std::make_shared<docdb::DocReadContext>("BULK LOAD: ", schema, schema_version),
-      index_map, nullptr /* unique_index_key_schema */, TransactionOperationContext());
+      req, schema_version, doc_read_context, index_map,
+      /* unique_index_key_projection= */ nullptr, TransactionOperationContext());
   RETURN_NOT_OK(op.Init(&resp));
   RETURN_NOT_OK(op.Apply(docdb::DocOperationApplyData{
       .doc_write_batch = doc_write_batch,
-      .deadline = CoarseTimePoint::max(),
-      .read_time = ReadHybridTime::SingleTime(HybridTime::FromMicros(kYugaByteMicrosecondEpoch)),
-      .restart_read_ht = nullptr}));
+      .read_operation_data = docdb::ReadOperationData::FromSingleReadTime(
+          HybridTime::FromMicros(kYugaByteMicrosecondEpoch)),
+      .read_restart_data = nullptr,
+      .schema_packing_provider = db_fixture,
+  }));
   return Status::OK();
 }
-
 
 Status BulkLoad::RetryableSubmit(vector<pair<TabletId, string>> rows) {
   auto runnable = std::make_shared<BulkLoadTask>(
@@ -418,7 +427,7 @@ Status BulkLoad::FinishTabletProcessing(const TabletId &tablet_id,
   thread_pool_->Wait();
 
   // Now flush the DB.
-  RETURN_NOT_OK(db_fixture_->FlushRocksDbAndWait());
+  RETURN_NOT_OK(db_fixture_->FlushRocksDbAndWait(rocksdb::FlushReason::kYbBulkLoadTool));
 
   // Perform the necessary compactions.
   RETURN_NOT_OK(CompactFiles());
@@ -428,11 +437,13 @@ Status BulkLoad::FinishTabletProcessing(const TabletId &tablet_id,
   }
 
   // Find replicas for the tablet.
-  master::TabletLocationsPB tablet_locations;
-  RETURN_NOT_OK(client_->GetTabletLocation(tablet_id, &tablet_locations));
+  auto resp = VERIFY_RESULT(client_->GetTabletLocations({tablet_id}));
+  RSTATUS_DCHECK(
+      resp.tablet_locations_size() == 1, InternalError,
+      Format("Unexpected number of tablet locations in response: $0", resp.ShortDebugString()));
   string csv_replicas;
   std::map<string, int32_t> host_to_rpcport;
-  for (const master::TabletLocationsPB_ReplicaPB &replica : tablet_locations.replicas()) {
+  for (const master::TabletLocationsPB_ReplicaPB &replica : resp.tablet_locations(0).replicas()) {
     if (!csv_replicas.empty()) {
       csv_replicas += ",";
     }
@@ -521,7 +532,6 @@ Status BulkLoad::InitYBBulkLoad() {
       ThreadPoolBuilder("bulk_load_tasks")
           .set_min_threads(FLAGS_bulk_load_num_threads)
           .set_max_threads(FLAGS_bulk_load_num_threads)
-          .set_max_queue_size(FLAGS_bulk_load_threadpool_queue_size)
           .set_idle_timeout(MonoDelta::FromMilliseconds(5000))
           .Build(&thread_pool_));
   return Status::OK();
@@ -549,8 +559,9 @@ Status BulkLoad::RunBulkLoad() {
 
     // Reinitialize rocksdb if needed.
     if (current_tablet_id.empty() || current_tablet_id != tablet_id) {
-      // Flush all of the data before opening a new rocksdb.
+      // Flush all of the data for this tablet before opening a new rocksdb for the new tablet.
       RETURN_NOT_OK(FinishTabletProcessing(current_tablet_id, std::move(rows)));
+      rows.clear();
       RETURN_NOT_OK(InitDBUtil(tablet_id));
     }
     current_tablet_id = tablet_id;
@@ -559,6 +570,7 @@ Status BulkLoad::RunBulkLoad() {
     // Flush the batch if necessary.
     if (rows.size() >= FLAGS_row_batch_size) {
       RETURN_NOT_OK(RetryableSubmit(std::move(rows)));
+      rows.clear();
     }
   }
 

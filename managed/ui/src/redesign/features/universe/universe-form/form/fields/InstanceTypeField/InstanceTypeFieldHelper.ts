@@ -1,7 +1,9 @@
 import _ from 'lodash';
 import { CloudType, InstanceType, InstanceTypeWithGroup, RunTimeConfigEntry } from '../../../utils/dto';
 
-const INSTANCE_WITH_EPHEMERAL_STORAGE_ONLY = ['i3', 'c5d', 'c6gd'];
+const INSTANCE_WITH_EPHEMERAL_STORAGE_ONLY = ['g5','g6','g6e',
+  'gr6','i3','i3en','i4g','i4i','im4gn',
+  'is4gen','p5','p5e','trn1','trn1n','x1','x1e'];
 
 export const AZURE_INSTANCE_TYPE_GROUPS = {
   'B-Series': /^standard_b.+/i,
@@ -21,24 +23,35 @@ export const getDefaultInstanceType = (providerCode: string, runtimeConfigs: any
 
   if (providerCode === CloudType.aws) {
     instanceType = runtimeConfigs?.configEntries?.find(
-      (c: RunTimeConfigEntry) => c.key === 'yb.internal.default_aws_instance_type'
+      (c: RunTimeConfigEntry) => c.key === 'yb.aws.default_instance_type'
     )?.value;
   } else if(providerCode === CloudType.gcp) {
     instanceType = runtimeConfigs?.configEntries?.find(
-      (c: RunTimeConfigEntry) => c.key === 'yb.internal.default_gcp_instance_type'
+      (c: RunTimeConfigEntry) => c.key === 'yb.gcp.default_instance_type'
     )?.value;
   } else if(providerCode === CloudType.kubernetes) {
     instanceType = runtimeConfigs?.configEntries?.find(
-      (c: RunTimeConfigEntry) => c.key === 'yb.internal.default_kubernetes_instance_type'
+      (c: RunTimeConfigEntry) => c.key === 'yb.kubernetes.default_instance_type'
+    )?.value;
+  } else if (providerCode === CloudType.azu) {
+    instanceType = runtimeConfigs?.configEntries?.find(
+      (c: RunTimeConfigEntry) => c.key === 'yb.azure.default_instance_type'
     )?.value;
   }
   return instanceType;
 }
 
+export const canUseSpotInstance = (runtimeConfigs: any) => {
+  return runtimeConfigs?.configEntries?.find(
+    (c: RunTimeConfigEntry) => c.key === 'yb.use_spot_instances'
+  )?.value === 'true';
+}
+
 export const isEphemeralAwsStorageInstance = (instance: InstanceType) => {
   return (
     instance.providerCode === CloudType.aws &&
-    INSTANCE_WITH_EPHEMERAL_STORAGE_ONLY.includes(instance.instanceTypeCode?.split?.('.')[0])
+    (INSTANCE_WITH_EPHEMERAL_STORAGE_ONLY.includes(instance.instanceTypeCode?.split?.('.')[0]) ||
+    instance.instanceTypeCode?.split?.('.')[0].includes('d'))
   );
 };
 
@@ -70,6 +83,7 @@ export const sortAndGroup = (data?: InstanceType[], cloud?: CloudType): Instance
     };
   });
 
+
   // sort by group names and label
-  return _.sortBy(result, ['groupName', 'label']);
+  return _.sortBy(result, ['groupName', 'label', 'numCores']);
 };

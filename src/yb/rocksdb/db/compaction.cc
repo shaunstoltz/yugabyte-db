@@ -3,9 +3,9 @@
 //  LICENSE file in the root directory of this source tree. An additional grant
 //  of patent rights can be found in the PATENTS file in the same directory.
 //
-// The following only applies to changes made to this file as part of YugaByte development.
+// The following only applies to changes made to this file as part of YugabyteDB development.
 //
-// Portions Copyright (c) YugaByte, Inc.
+// Portions Copyright (c) YugabyteDB, Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License"); you may not use this file except
 // in compliance with the License.  You may obtain a copy of the License at
@@ -39,11 +39,11 @@
 #include "yb/rocksdb/db/compaction_picker.h"
 #include "yb/rocksdb/db/version_set.h"
 #include "yb/rocksdb/util/logging.h"
-#include "yb/rocksdb/util/sync_point.h"
 
 #include "yb/util/format.h"
 #include "yb/util/logging.h"
 #include "yb/util/size_literals.h"
+#include "yb/util/sync_point.h"
 
 using namespace yb::size_literals;
 
@@ -67,6 +67,9 @@ LightweightBoundaries::LightweightBoundaries(Arena* arena,
     arena->AllocateAligned(sizeof(UserBoundaryTag) * num_user_values));
   user_values = reinterpret_cast<Slice*>(
     arena->AllocateAligned(sizeof(Slice) * num_user_values));
+  if (source.user_frontier) {
+    hybrid_time = source.user_frontier->GetHybridTimeAsUInt64();
+  }
   for (size_t i = 0; i != num_user_values; ++i) {
     const UserBoundaryValue& value = source.user_values[i];
     new (user_tags + i) UserBoundaryTag(value.tag);
@@ -77,7 +80,7 @@ LightweightBoundaries::LightweightBoundaries(Arena* arena,
 FdWithBoundaries::FdWithBoundaries(Arena* arena, const FileMetaData& source)
     : fd(source.fd), smallest(arena, source.smallest), largest(arena, source.largest) {
   if (source.largest.user_frontier) {
-    auto filter = source.largest.user_frontier->Filter();
+    auto filter = source.largest.user_frontier->FilterAsSlice();
     if (!filter.empty()) {
       user_filter_data = SliceDup(arena, filter);
     }
@@ -222,8 +225,10 @@ std::unique_ptr<Compaction> Compaction::Create(
     VersionStorageInfo* vstorage, const MutableCFOptions& _mutable_cf_options,
     std::vector<CompactionInputFiles> inputs, int output_level, uint64_t target_file_size,
     uint64_t max_grandparent_overlap_bytes, uint32_t output_path_id, CompressionType compression,
-    std::vector<FileMetaData*> grandparents, Logger* info_log, bool manual_compaction, double score,
-    bool deletion_compaction, CompactionReason compaction_reason) {
+    std::vector<FileMetaData*> grandparents, const yb::MemTrackerPtr& mem_tracker, Logger* info_log,
+    bool manual_compaction, double score, bool deletion_compaction,
+    CompactionReason compaction_reason,
+    SkipCorruptDataBlocksUnsafe skip_corrupt_data_blocks_unsafe) {
   bool has_input_files = false;
   for (auto& input : inputs) {
     yb::EraseIf([info_log](FileMetaData* file) {
@@ -253,20 +258,19 @@ std::unique_ptr<Compaction> Compaction::Create(
 
   return std::unique_ptr<Compaction>(new Compaction(
       vstorage, _mutable_cf_options, inputs, output_level, target_file_size,
-      max_grandparent_overlap_bytes, output_path_id, compression, grandparents, manual_compaction,
-      score, deletion_compaction, compaction_reason));
+      max_grandparent_overlap_bytes, output_path_id, compression, grandparents, mem_tracker,
+      manual_compaction, score, deletion_compaction, compaction_reason,
+      skip_corrupt_data_blocks_unsafe));
 }
 
-Compaction::Compaction(VersionStorageInfo* vstorage,
-                       const MutableCFOptions& _mutable_cf_options,
-                       std::vector<CompactionInputFiles> _inputs,
-                       int _output_level, uint64_t _target_file_size,
-                       uint64_t _max_grandparent_overlap_bytes,
-                       uint32_t _output_path_id, CompressionType _compression,
-                       std::vector<FileMetaData*> _grandparents,
-                       bool _manual_compaction, double _score,
-                       bool _deletion_compaction,
-                       CompactionReason _compaction_reason)
+Compaction::Compaction(
+    VersionStorageInfo* vstorage, const MutableCFOptions& _mutable_cf_options,
+    std::vector<CompactionInputFiles> _inputs, int _output_level, uint64_t _target_file_size,
+    uint64_t _max_grandparent_overlap_bytes, uint32_t _output_path_id, CompressionType _compression,
+    std::vector<FileMetaData*> _grandparents, const yb::MemTrackerPtr& mem_tracker,
+    bool _manual_compaction, double _score, bool _deletion_compaction,
+    CompactionReason _compaction_reason,
+    SkipCorruptDataBlocksUnsafe skip_corrupt_data_blocks_unsafe)
     : start_level_(_inputs[0].level),
       output_level_(_output_level),
       max_output_file_size_(_target_file_size),
@@ -286,7 +290,12 @@ Compaction::Compaction(VersionStorageInfo* vstorage,
       bottommost_level_(IsBottommostLevel(output_level_, vstorage, inputs_)),
       is_full_compaction_(IsFullCompaction(vstorage, inputs_)),
       is_manual_compaction_(_manual_compaction),
-      compaction_reason_(_compaction_reason) {
+      compaction_reason_(_compaction_reason),
+      skip_corrupt_data_blocks_unsafe_(skip_corrupt_data_blocks_unsafe) {
+  if (mem_tracker) {
+    arena_.SetMemTracker(mem_tracker);
+  }
+
   seen_key_.store(false, std::memory_order_release);
   MarkFilesBeingCompacted(true);
 
@@ -334,10 +343,10 @@ bool Compaction::InputCompressionMatchesOutput() const {
   bool matches = (GetCompressionType(*cfd_->ioptions(), start_level_,
                                      base_level) == output_compression_);
   if (matches) {
-    TEST_SYNC_POINT("Compaction::InputCompressionMatchesOutput:Matches");
+    DEBUG_ONLY_TEST_SYNC_POINT("Compaction::InputCompressionMatchesOutput:Matches");
     return true;
   }
-  TEST_SYNC_POINT("Compaction::InputCompressionMatchesOutput:DidntMatch");
+  DEBUG_ONLY_TEST_SYNC_POINT("Compaction::InputCompressionMatchesOutput:DidntMatch");
   return matches;
 }
 

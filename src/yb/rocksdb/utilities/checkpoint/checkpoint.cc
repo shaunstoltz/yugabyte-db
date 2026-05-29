@@ -3,9 +3,9 @@
 //  LICENSE file in the root directory of this source tree. An additional grant
 //  of patent rights can be found in the PATENTS file in the same directory.
 //
-// The following only applies to changes made to this file as part of YugaByte development.
+// The following only applies to changes made to this file as part of YugabyteDB development.
 //
-// Portions Copyright (c) YugaByte, Inc.
+// Portions Copyright (c) YugabyteDB, Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License"); you may not use this file except
 // in compliance with the License.  You may obtain a copy of the License at
@@ -31,6 +31,9 @@
 #include <inttypes.h>
 #include <algorithm>
 #include <string>
+
+#include "yb/ash/wait_state.h"
+
 #include "yb/rocksdb/db/filename.h"
 #include "yb/rocksdb/db/wal_manager.h"
 #include "yb/rocksdb/db.h"
@@ -38,6 +41,7 @@
 #include "yb/rocksdb/transaction_log.h"
 #include "yb/rocksdb/util/file_util.h"
 #include "yb/rocksdb/port/port.h"
+
 #include "yb/util/random_util.h"
 #include "yb/util/status_log.h"
 #include "yb/util/string_util.h"
@@ -55,6 +59,7 @@ namespace checkpoint {
 // The directory should not already exist and will be created by this API.
 // The directory will be an absolute path
 Status CreateCheckpoint(DB* db, const std::string& checkpoint_dir) {
+  SCOPED_WAIT_STATUS(RocksDB_CreateCheckpoint);
   if (!db->GetCheckpointEnv()->IsPlainText()) {
     return STATUS(InvalidArgument, "db's checkpoint env is not plaintext.");
   }
@@ -76,7 +81,7 @@ Status CreateCheckpoint(DB* db, const std::string& checkpoint_dir) {
   s = db->DisableFileDeletions();
   if (s.ok()) {
     // this will return live_files prefixed with "/"
-    s = db->GetLiveFiles(live_files, &manifest_file_size, true);
+    s = db->GetLiveFiles(live_files, &manifest_file_size, true, FlushReason::kCheckpointCreation);
   }
   // if we have more than one column family, we need to also get WAL files
   if (s.ok()) {
@@ -88,9 +93,8 @@ Status CreateCheckpoint(DB* db, const std::string& checkpoint_dir) {
   }
 
   size_t wal_size = live_wal_files.size();
-  RLOG(db->GetOptions().info_log,
-       "Started the snapshot process -- creating snapshot in directory %s",
-       checkpoint_dir.c_str());
+  VLOG(1) << "Started the snapshot process -- creating snapshot in directory "
+          << checkpoint_dir.c_str();
 
   const std::string full_private_path =
       checkpoint_dir + ".tmp." + ToString(yb::RandomUniformInt<uint64_t>());
@@ -119,7 +123,7 @@ Status CreateCheckpoint(DB* db, const std::string& checkpoint_dir) {
     // * always copy if cross-device link
     bool is_table_file = type == kTableFile || type == kTableSBlockFile;
     if (is_table_file && same_fs) {
-      RLOG(db->GetOptions().info_log, "Hard Linking %s", src_fname.c_str());
+      VLOG(1) << "Hard Linking " << src_fname.c_str();
       s = db->GetCheckpointEnv()->LinkFile(db->GetName() + src_fname,
                                  full_private_path + src_fname);
       if (s.IsNotSupported()) {
@@ -128,14 +132,13 @@ Status CreateCheckpoint(DB* db, const std::string& checkpoint_dir) {
       }
     }
     if (!is_table_file || !same_fs) {
-      RLOG(db->GetOptions().info_log, "Copying %s", src_fname.c_str());
+      VLOG(1) << "Copying " << src_fname.c_str();
       std::string dest_name = full_private_path + src_fname;
       s = CopyFile(db->GetCheckpointEnv(), db->GetName() + src_fname, dest_name,
-                   type == kDescriptorFile ? manifest_file_size : 0);
+                   type == kDescriptorFile ? manifest_file_size : 0, CopyFileSync::kTrue);
     }
   }
-  RLOG(db->GetOptions().info_log, "Number of log files %" ROCKSDB_PRIszt,
-       live_wal_files.size());
+  VLOG(1) << "Number of log files " << live_wal_files.size();
 
   // Link WAL files. Copy exact size of last one because it is the only one
   // that has changes after the last flush.
@@ -143,18 +146,16 @@ Status CreateCheckpoint(DB* db, const std::string& checkpoint_dir) {
     if ((live_wal_files[i]->Type() == kAliveLogFile) &&
         (live_wal_files[i]->StartSequence() >= sequence_number)) {
       if (i + 1 == wal_size) {
-        RLOG(db->GetOptions().info_log, "Copying %s",
-             live_wal_files[i]->PathName().c_str());
+        VLOG(1) << "Copying " << live_wal_files[i]->PathName().c_str();
         s = CopyFile(db->GetCheckpointEnv(),
                      db->GetOptions().wal_dir + live_wal_files[i]->PathName(),
                      full_private_path + live_wal_files[i]->PathName(),
-                     live_wal_files[i]->SizeFileBytes());
+                     live_wal_files[i]->SizeFileBytes(), CopyFileSync::kTrue);
         break;
       }
       if (same_fs) {
         // we only care about live log files
-        RLOG(db->GetOptions().info_log, "Hard Linking %s",
-             live_wal_files[i]->PathName().c_str());
+        VLOG(1) << "Hard Linking " << live_wal_files[i]->PathName().c_str();
         s = db->GetCheckpointEnv()->LinkFile(
              db->GetOptions().wal_dir + live_wal_files[i]->PathName(),
              full_private_path + live_wal_files[i]->PathName());
@@ -164,11 +165,10 @@ Status CreateCheckpoint(DB* db, const std::string& checkpoint_dir) {
         }
       }
       if (!same_fs) {
-        RLOG(db->GetOptions().info_log, "Copying %s",
-             live_wal_files[i]->PathName().c_str());
+        VLOG(1) << "Copying " << live_wal_files[i]->PathName().c_str();
         s = CopyFile(db->GetCheckpointEnv(),
                      db->GetOptions().wal_dir + live_wal_files[i]->PathName(),
-                     full_private_path + live_wal_files[i]->PathName(), 0);
+                     full_private_path + live_wal_files[i]->PathName(), 0, CopyFileSync::kTrue);
       }
     }
   }
@@ -179,9 +179,7 @@ Status CreateCheckpoint(DB* db, const std::string& checkpoint_dir) {
   if (s.ok()) {
     if (delete_checkpoint_dir) {
       const Status s_del = DeleteRecursively(db->GetCheckpointEnv(), checkpoint_dir);
-      RLOG(
-          db->GetOptions().info_log, "Deleted dir %s -- %s",
-          checkpoint_dir.c_str(), s_del.ToString().c_str());
+      VLOG(1) << "Deleted dir " << checkpoint_dir.c_str() << " -- " << s_del.ToString().c_str();
     }
 
     // move tmp private backup to real snapshot directory
@@ -208,9 +206,8 @@ Status CreateCheckpoint(DB* db, const std::string& checkpoint_dir) {
   }
 
   // here we know that we succeeded and installed the new snapshot
-  RLOG(db->GetOptions().info_log, "Checkpoint DONE. All is good");
-  RLOG(db->GetOptions().info_log, "Checkpoint sequence number: %" PRIu64,
-      sequence_number);
+  VLOG(1) << "Checkpoint DONE. All is good";
+  VLOG(1) << "Checkpoint sequence number: " << sequence_number;
 
   return s;
 }

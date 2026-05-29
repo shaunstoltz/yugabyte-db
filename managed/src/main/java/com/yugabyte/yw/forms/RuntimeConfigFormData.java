@@ -1,5 +1,5 @@
 /*
- * Copyright 2021 YugaByte, Inc. and Contributors
+ * Copyright 2021 YugabyteDB, Inc. and Contributors
  *
  * Licensed under the Polyform Free Trial License 1.0.0 (the "License"); you
  * may not use this file except in compliance with the License. You
@@ -49,13 +49,15 @@ public class RuntimeConfigFormData {
 
     @ApiModelProperty(value = "Scope UIID")
     public final UUID uuid;
+
     /**
      * global scope is mutable only if user is super admin other scopes can be mutated by the
      * customer
      */
     @ApiModelProperty(
         value =
-            "Mutability of the scope. Only super admin users can change global scope; other scopes are customer-mutable.")
+            "Mutability of the scope. Only super admin users can change global scope; other scopes"
+                + " are customer-mutable.")
     public final boolean mutableScope;
 
     @ApiModelProperty(value = "List of configurations")

@@ -3,8 +3,10 @@ title: Create server certificates
 headerTitle: Create server certificates
 linkTitle: Create server certificates
 description: Generate server certificates and prepare YugabyteDB nodes for server-to-server encryption.
-headcontent: Generate server certificates and prepare YugabyteDB nodes for server-to-server encryption.
-image: /images/section_icons/secure/prepare-nodes.png
+headcontent: Generate server certificates and prepare YugabyteDB nodes for server-to-server encryption
+aliases:
+  - /secure/tls-encryption/prepare-nodes
+  - /stable/secure/tls-encryption/prepare-nodes
 menu:
   stable:
     identifier: prepare-nodes
@@ -137,10 +139,11 @@ chmod 400 secure-data/ca.key
 Generate the root certificate file `ca.crt` by running the following `openssl req` command:
 
 ```sh
-openssl req -new                      \
-            -x509                       \
+openssl req -new \
+            -x509 \
+            -days 3650 \
             -config secure-data/ca.conf \
-            -key secure-data/ca.key     \
+            -key secure-data/ca.key \
             -out secure-data/ca.crt
 ```
 
@@ -158,7 +161,7 @@ openssl x509 -in secure-data/ca.crt -text -noout
 
 You should see an output similar to the following:
 
-```
+```output
 Certificate:
     Data:
         Version: 3 (0x2)
@@ -246,24 +249,24 @@ Repeat the following steps for each node, replacing `<node-ip-address>` with the
    #################################
    # Example node configuration file
    #################################
-   
+
    [ req ]
    prompt=no
    distinguished_name = my_distinguished_name
-      
+
    [ my_distinguished_name ]
    organizationName = Yugabyte
    # Required value for commonName, do not change
    commonName = <node-ip-address>
-      
-   # Multiple subject alternative names (SANs) such as IP Address, 
+
+   # Multiple subject alternative names (SANs) such as IP Address,
    # DNS Name, Email, URI, and so on, can be specified under this section
    [ req_ext]
-   SubjectAltName = @alt_names
+   subjectAltName = @alt_names
    [alt_names]
    IP.1 = <IP Address>
    IP.2 = <IP Address>
-   DNS.1 = <DNS Name> 
+   DNS.1 = <DNS Name>
    DNS.2 = <DNS Name>
    ```
 
@@ -304,7 +307,9 @@ openssl ca -config secure-data/ca.conf \
            -outdir <node-ip-address>/ \
            -in <node-ip-address>/node.csr \
            -days 3650 \
-           -batch
+           -batch \
+           -extfile <node-ip-address>/node.conf \
+           -extensions req_ext
 ```
 
 For the `127.0.0.1` node, you should see an output similar to the following:
@@ -344,7 +349,7 @@ The files needed for each node are:
 2. `node.<commonName>.crt` (for example, `node.127.0.0.1.crt`)
 3. `node.<commonName>.key` (for example, `node.127.0.0.1.key`)
 
-You can remove all other files in the node directories, since they are unnecessary.
+You can remove all other files in the node directories, as they are unnecessary.
 
 Upload the necessary information to each target node.
 
@@ -369,4 +374,3 @@ scp <node-ip-address>/node.<node-ip-address>.key <user>@<node-ip-address>:~/cert
 ```
 
 You can now delete, or appropriately secure, the directories you created for the nodes on the local machine.
-

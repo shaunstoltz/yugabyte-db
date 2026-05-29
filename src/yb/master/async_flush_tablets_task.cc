@@ -1,4 +1,4 @@
-// Copyright (c) YugaByte, Inc.
+// Copyright (c) YugabyteDB, Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License"); you may not use this file except
 // in compliance with the License.  You may obtain a copy of the License at
@@ -20,8 +20,7 @@
 
 #include "yb/tserver/tserver_admin.proxy.h"
 
-namespace yb {
-namespace master {
+namespace yb::master {
 
 using std::string;
 using std::vector;
@@ -30,18 +29,26 @@ using tserver::TabletServerErrorPB;
 ////////////////////////////////////////////////////////////
 // AsyncFlushTablets
 ////////////////////////////////////////////////////////////
-AsyncFlushTablets::AsyncFlushTablets(Master *master,
-                                     ThreadPool* callback_pool,
-                                     const TabletServerId& ts_uuid,
-                                     const scoped_refptr<TableInfo>& table,
-                                     const vector<TabletId>& tablet_ids,
-                                     const FlushRequestId& flush_id,
-                                     bool is_compaction)
-    : RetrySpecificTSRpcTask(master, callback_pool, ts_uuid, table,
-                             /* async_task_throttler */ nullptr),
-      tablet_ids_(tablet_ids),
-      flush_id_(flush_id),
-      is_compaction_(is_compaction) {
+AsyncFlushTablets::AsyncFlushTablets(
+      Master *master,
+      ThreadPool* callback_pool,
+      const TabletServerId& ts_uuid,
+      const scoped_refptr<TableInfo>& table,
+      const vector<TabletId>& tablet_ids,
+      const FlushRequestId& flush_id,
+      bool is_compaction,
+      tablet::FlushCompactFlags flags,
+      LeaderEpoch epoch,
+      MonoTime deadline)
+      : RetrySpecificTSRpcTaskWithTable(
+            master, callback_pool, ts_uuid, table, std::move(epoch),
+            /* async_task_throttler = */ nullptr),
+        tablet_ids_(tablet_ids),
+        flush_id_(flush_id),
+        is_compaction_(is_compaction),
+        flags_(flags) {
+  // May not honor unresponsive deadline, refer to UnresponsiveDeadline().
+  deadline_ = deadline != MonoTime::Max() ? deadline : UnresponsiveDeadline();
 }
 
 string AsyncFlushTablets::description() const {
@@ -64,6 +71,9 @@ void AsyncFlushTablets::HandleResponse(int attempt) {
         LOG(WARNING) << "TS " << permanent_uuid() << ": flush tablets failed because tablet "
                      << resp_.failed_tablet_id() << " was not found. "
                      << "No further retry: " << status.ToString();
+        // Mark response_handling_ as true to denote task state is transitioned
+        // to complete and there will be no retries.
+        response_handling_ = true;
         TransitionToCompleteState();
         break;
       default:
@@ -71,6 +81,7 @@ void AsyncFlushTablets::HandleResponse(int attempt) {
                      << status.ToString();
     }
   } else {
+    response_handling_ = true;
     TransitionToCompleteState();
     VLOG(1) << "TS " << permanent_uuid() << ": flush tablets complete";
   }
@@ -82,6 +93,9 @@ void AsyncFlushTablets::HandleResponse(int attempt) {
         flush_id_, permanent_uuid_,
         resp_.has_error() ? StatusFromPB(resp_.error().status()) : Status::OK());
   } else {
+    if (response_handling_) {
+      LOG(DFATAL) << "Expected task to be transitioned to complete state";
+    }
     VLOG(1) << "FlushTablets task is not completed";
   }
 }
@@ -97,6 +111,17 @@ bool AsyncFlushTablets::SendRequest(int attempt) {
     req.add_tablet_ids(id);
   }
 
+  // If specified table is a vector index, do the operation for vector indexes only.
+  auto new_flags = flags_;
+  if (table()->is_vector_index()) {
+    req.add_vector_index_ids(table()->id());
+    new_flags = tablet::FLUSH_COMPACT_VECTOR_INDEX_ONLY;
+    LOG_IF_WITH_PREFIX(INFO, flags_ != new_flags) <<
+        Format("Flush or compact flags changed from $0 to $1", flags_, new_flags);
+  }
+  req.set_flags(new_flags);
+
+  response_handling_ = false;
   ts_admin_proxy_->FlushTabletsAsync(req, &resp_, &rpc_, BindRpcCallback());
   VLOG(1) << "Send flush tablets request to " << permanent_uuid_
           << " (attempt " << attempt << "):\n"
@@ -104,5 +129,11 @@ bool AsyncFlushTablets::SendRequest(int attempt) {
   return true;
 }
 
-} // namespace master
-} // namespace yb
+void AsyncFlushTablets::Finished(const Status& status) {
+  // Call explicit handling only if response is not handled in AsyncFlushTablets::HandleResponse.
+  if (!response_handling_) {
+    master_->flush_manager()->HandleFlushTabletsRpcFinish(flush_id_, permanent_uuid_, status);
+  }
+}
+
+} // namespace yb::master

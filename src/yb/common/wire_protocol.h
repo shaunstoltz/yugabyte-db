@@ -15,9 +15,9 @@
 // specific language governing permissions and limitations
 // under the License.
 //
-// The following only applies to changes made to this file as part of YugaByte development.
+// The following only applies to changes made to this file as part of YugabyteDB development.
 //
-// Portions Copyright (c) YugaByte, Inc.
+// Portions Copyright (c) YugabyteDB, Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License"); you may not use this file except
 // in compliance with the License.  You may obtain a copy of the License at
@@ -32,6 +32,8 @@
 // Helpers for dealing with the protobufs defined in wire_protocol.proto.
 #pragma once
 
+#include <string>
+#include <string_view>
 #include <vector>
 
 #include "yb/common/common_fwd.h"
@@ -49,14 +51,12 @@
 #include "yb/util/type_traits.h"
 #include "yb/util/result.h"
 
+using namespace std::literals;
+
 namespace yb {
 
-class ColumnId;
-class ColumnSchema;
 class faststring;
 class HostPort;
-class RowChangeList;
-class Schema;
 class Slice;
 
 // Convert the given C++ Status object into the equivalent Protobuf.
@@ -70,6 +70,8 @@ Status StatusFromPB(const LWAppStatusPB& pb);
 
 // Convert the specified HostPort to protobuf.
 void HostPortToPB(const HostPort& host_port, HostPortPB* host_port_pb);
+void HostPortToPB(const HostPort& host_port, LWHostPortPB* host_port_pb);
+HostPortPB HostPortToPB(const HostPort& host_port);
 
 // Returns the HostPort created from the specified protobuf.
 HostPort HostPortFromPB(const HostPortPB& host_port_pb);
@@ -92,54 +94,6 @@ void HostPortsToPBs(const std::vector<HostPort>& addrs,
 // Convert list of HostPortPBs into host ports.
 void HostPortsFromPBs(const google::protobuf::RepeatedPtrField<HostPortPB>& pbs,
                       std::vector<HostPort>* addrs);
-
-enum SchemaPBConversionFlags {
-  SCHEMA_PB_WITHOUT_IDS = 1 << 0,
-};
-
-// Convert the specified schema to protobuf.
-// 'flags' is a bitfield of SchemaPBConversionFlags values.
-void SchemaToPB(const Schema& schema, SchemaPB* pb, int flags = 0);
-
-// Convert the specified schema to protobuf without column IDs.
-void SchemaToPBWithoutIds(const Schema& schema, SchemaPB *pb);
-
-// Returns the Schema created from the specified protobuf.
-// If the schema is invalid, return a non-OK status.
-Status SchemaFromPB(const SchemaPB& pb, Schema *schema);
-
-// Convert the specified column schema to protobuf.
-// 'flags' is a bitfield of SchemaPBConversionFlags values.
-void ColumnSchemaToPB(const ColumnSchema& schema, ColumnSchemaPB *pb, int flags = 0);
-
-// Return the ColumnSchema created from the specified protobuf.
-ColumnSchema ColumnSchemaFromPB(const ColumnSchemaPB& pb);
-
-// Convert the given list of ColumnSchemaPB objects into a Schema object.
-//
-// Returns InvalidArgument if the provided columns don't make a valid Schema
-// (eg if the keys are non-contiguous or nullable).
-Status ColumnPBsToSchema(
-  const google::protobuf::RepeatedPtrField<ColumnSchemaPB>& column_pbs,
-  Schema* schema);
-
-// Returns the required information from column pbs to build the column part of SchemaPB.
-Status ColumnPBsToColumnTuple(
-    const google::protobuf::RepeatedPtrField<ColumnSchemaPB>& column_pbs,
-    std::vector<ColumnSchema>* columns , std::vector<ColumnId>* column_ids, int* num_key_columns);
-
-// Extract the columns of the given Schema into protobuf objects.
-//
-// The 'cols' list is replaced by this method.
-// 'flags' is a bitfield of SchemaPBConversionFlags values.
-void SchemaToColumnPBs(
-  const Schema& schema,
-  google::protobuf::RepeatedPtrField<ColumnSchemaPB>* cols,
-  int flags = 0);
-
-// Extract the colocated table information of the given schema into a protobuf object.
-void SchemaToColocatedTableIdentifierPB(
-    const Schema& schema, ColocatedTableIdentifierPB* colocated_pb);
 
 YB_DEFINE_ENUM(UsePrivateIpMode, (cloud)(region)(zone)(never));
 
@@ -194,11 +148,11 @@ Status ResponseStatus(
 
 struct SplitChildTabletIdsTag : yb::StringVectorBackedErrorTag {
   // It is part of the wire protocol and should not be changed once released.
-  static constexpr uint8_t kCategory = 14;
+  static constexpr CategoryDescriptor kCategory{14, "split child tablet IDs"sv};
 
   static std::string ToMessage(const Value& value);
 };
 
-typedef yb::StatusErrorCodeImpl<SplitChildTabletIdsTag> SplitChildTabletIdsData;
+using SplitChildTabletIdsData = yb::StatusErrorCodeImpl<SplitChildTabletIdsTag>;
 
 } // namespace yb

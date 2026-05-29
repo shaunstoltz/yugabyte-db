@@ -4,9 +4,11 @@ headerTitle: ALTER SEQUENCE
 linkTitle: ALTER SEQUENCE
 description: Use the ALTER SEQUENCE statement to change the definition of a sequence in the current schema.
 menu:
-  stable:
+  stable_api:
     identifier: ddl_alter_sequence
     parent: statements
+aliases:
+  - /stable/api/ysql/commands/ddl_alter_sequence/
 type: docs
 ---
 
@@ -16,29 +18,10 @@ Use the `ALTER SEQUENCE` statement to change the definition of a sequence in the
 
 ## Syntax
 
-<ul class="nav nav-tabs nav-tabs-yb">
-  <li >
-    <a href="#grammar" class="nav-link active" id="grammar-tab" data-toggle="tab" role="tab" aria-controls="grammar" aria-selected="true">
-      <img src="/icons/file-lines.svg" alt="Grammar Icon">
-      Grammar
-    </a>
-  </li>
-  <li>
-    <a href="#diagram" class="nav-link" id="diagram-tab" data-toggle="tab" role="tab" aria-controls="diagram" aria-selected="false">
-      <img src="/icons/diagram.svg" alt="Diagram Icon">
-      Diagram
-    </a>
-  </li>
-</ul>
-
-<div class="tab-content">
-  <div id="grammar" class="tab-pane fade show active" role="tabpanel" aria-labelledby="grammar-tab">
-  {{% includeMarkdown "../../syntax_resources/the-sql-language/statements/alter_sequence,name,alter_sequence_options.grammar.md" %}}
-  </div>
-  <div id="diagram" class="tab-pane fade" role="tabpanel" aria-labelledby="diagram-tab">
-  {{% includeMarkdown "../../syntax_resources/the-sql-language/statements/alter_sequence,name,alter_sequence_options.diagram.md" %}}
-  </div>
-</div>
+{{%ebnf%}}
+  alter_sequence,
+  alter_sequence_options
+{{%/ebnf%}}
 
 ## Semantics
 
@@ -50,39 +33,65 @@ Specify the name of the sequence (*sequence_name*). An error is raised if a sequ
 
 ### *sequence_options*
 
-#### AS *datatype*
+#### AS *seq_data_type*
 
 Changes the data type of a sequence. This automatically changes the minimum and maximum values of the sequence if the previous values were beyond what the new type allows. Valid types are `smallint`, `integer`, and `bigint`.
 
-#### INCREMENT BY *increment*
+#### INCREMENT BY *int_literal*
 
 Specify the difference between consecutive values in the sequence. Default is `1`.
 
-#### MINVALUE *minvalue* | NO MINVALUE
+#### MINVALUE *int_literal* | NO MINVALUE
 
  Specify the minimum value allowed in the sequence. If this value is reached (in a sequence with a negative increment), `nextval()` will return an error. If `NO MINVALUE` is specified, the default value will be used. Default is 1.
 
-#### MAXVALUE *maxvalue* | NO MAXVALUE
+#### MAXVALUE *int_literal* | NO MAXVALUE
 
-Specify the maximum value allowed in the sequence. If this value is reached, `nextval()` will return an error. If `NO MAXVALUE` is specified, the default will be used. Default is `2<sup>63</sup> - 1`.
+Specify the maximum value allowed in the sequence. If this value is reached, `nextval()` will return an error. If `NO MAXVALUE` is specified, the default will be used. Default is `2⁶³-1`.
 
-#### START WITH *start*
+#### START WITH *int_literal*
 
 Specify the first value in the sequence. `start` cannot be less than `minvalue`. Default is `1`.
 
-#### RESTART [ [ WITH ] *restart* ] ]
+#### RESTART [ [ WITH ] *int_literal* ] ]
 
 Change the current value of the sequence. If no value is specified, the current value will be set to the last value specified with `START [ WITH ]` when the sequence was created or altered.
 
-#### CACHE *cache*
+#### CACHE *int_literal*
 
 Specify how many numbers from the sequence to cache in the client. Default is `1`.
 
 When YB-TServer [ysql_sequence_cache_minval](../../../../../reference/configuration/yb-tserver/#ysql-sequence-cache-minval) configuration flag is not explicitly turned off (set to `0`), the maximum value of the flag and the cache clause will be used.
 
+#### [ NO ] CYCLE
+
+If `CYCLE` is specified, the sequence will wrap around once it has reached `minvalue` or `maxvalue`. If `maxvalue` was reached, `minvalue` will be the next number in the sequence. If `minvalue` was reached (for a descending sequence), `maxvalue` will be the next number in a sequence. `NO CYCLE` is the default.
+
 #### OWNED BY *table_name.table_column* | NONE
 
 It gives ownership of the sequence to the specified column (if any). This means that if the column (or the table to which it belongs to) is dropped, the sequence will be automatically dropped. If `NONE` is specified, any previous ownership will be deleted.
+
+#### SET LOGGED | UNLOGGED
+
+Change the sequence from unlogged to logged or vice-versa. Cannot be applied to a temporary sequence.
+
+Currently the *UNLOGGED* option is ignored. It's handled as *LOGGED* default persistence.
+
+#### SET SCHEMA *schema_name*
+
+Change the schema of the sequence.
+
+#### OWNER TO  *new_owner* | *CURRENT_USER* | *SESSION_USER*
+
+Change the owner of the schema.
+
+CURRENT_USER - username of current execution context.
+
+SESSION_USER - username of current session.
+
+#### RENAME TO *new_name*
+
+Rename the sequence to the specified sequence name.
 
 ## Examples
 
@@ -92,7 +101,7 @@ Create a simple sequence.
 yugabyte=# CREATE SEQUENCE s;
 ```
 
-```
+```output
 CEATE SEQUENCE
 ```
 
@@ -102,7 +111,7 @@ Modify the increment value.
 yugabyte=# ALTER SEQUENCE s INCREMENT BY 5;
 ```
 
-```
+```output
 ALTER SEQUENCE
 ```
 
@@ -110,7 +119,7 @@ ALTER SEQUENCE
 yugabyte=# SELECT nextval('s');
 ```
 
-```
+```output
  nextval
 ---------
        1
@@ -121,7 +130,7 @@ yugabyte=# SELECT nextval('s');
 yugabyte=# SELECT nextval('s');
 ```
 
-```
+```output
  nextval
 ---------
        6
@@ -134,7 +143,7 @@ Modify the starting value.
 yugabyte=# ALTER SEQUENCE s RESTART WITH 2;
 ```
 
-```
+```output
 ALTER SEQUENCE
 ```
 
@@ -142,7 +151,7 @@ ALTER SEQUENCE
 yugabyte=# SELECT nextval('s');
 ```
 
-```
+```output
  nextval
 ---------
        2
@@ -153,7 +162,7 @@ yugabyte=# SELECT nextval('s');
 yugabyte=# SELECT nextval('s');
 ```
 
-```
+```output
  nextval
 ---------
        7
@@ -162,8 +171,8 @@ yugabyte=# SELECT nextval('s');
 
 ## See also
 
-- [`CREATE SEQUENCE`](../ddl_create_sequence)
-- [`DROP SEQUENCE`](../ddl_drop_sequence)
-- [`currval()`](../../../exprs/func_currval)
-- [`lastval()`](../../../exprs/func_lastval)
-- [`nextval()`](../../../exprs/func_nextval)
+- [CREATE SEQUENCE](../ddl_create_sequence)
+- [DROP SEQUENCE](../ddl_drop_sequence)
+- [currval()](../../../exprs/sequence_functions/func_currval)
+- [lastval()](../../../exprs/sequence_functions/func_lastval)
+- [nextval()](../../../exprs/sequence_functions/func_nextval)

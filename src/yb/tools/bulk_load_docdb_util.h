@@ -1,4 +1,4 @@
-// Copyright (c) YugaByte, Inc.
+// Copyright (c) YugabyteDB, Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License"); you may not use this file except
 // in compliance with the License.  You may obtain a copy of the License at
@@ -27,6 +27,7 @@ class BulkLoadDocDBUtil : public docdb::DocDBRocksDBUtil {
   std::string tablet_id() override;
   size_t block_cache_size() const override  { return 0; }
   const std::string& rocksdb_dir();
+  Schema CreateSchema() override { return Schema(); }
 
  private:
   const std::string tablet_id_;

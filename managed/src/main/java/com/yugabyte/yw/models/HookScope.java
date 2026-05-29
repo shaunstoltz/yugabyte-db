@@ -1,31 +1,36 @@
-// Copyright (c) YugaByte, Inc.
+// Copyright (c) YugabyteDB, Inc.
 
 package com.yugabyte.yw.models;
 
 import static io.swagger.annotations.ApiModelProperty.AccessMode.READ_ONLY;
 import static play.mvc.Http.Status.BAD_REQUEST;
+import static play.mvc.Http.Status.NOT_FOUND;
 
 import com.fasterxml.jackson.annotation.JsonIdentityInfo;
 import com.fasterxml.jackson.annotation.ObjectIdGenerators;
-import io.ebean.Model;
-import io.ebean.Finder;
-import io.ebean.ExpressionList;
-import io.ebean.annotation.EnumValue;
-import java.util.UUID;
-import java.util.Set;
-import java.util.List;
-import java.util.Optional;
-import javax.persistence.Entity;
-import javax.persistence.Column;
-import javax.persistence.Id;
-import javax.persistence.OneToMany;
 import com.yugabyte.yw.common.PlatformServiceException;
+import io.ebean.ExpressionList;
+import io.ebean.Finder;
+import io.ebean.Model;
+import io.ebean.annotation.EnumValue;
 import io.swagger.annotations.ApiModel;
 import io.swagger.annotations.ApiModelProperty;
+import jakarta.persistence.Column;
+import jakarta.persistence.Entity;
+import jakarta.persistence.Id;
+import jakarta.persistence.OneToMany;
+import java.util.List;
+import java.util.Optional;
+import java.util.Set;
+import java.util.UUID;
+import lombok.Getter;
+import lombok.Setter;
 
 @JsonIdentityInfo(generator = ObjectIdGenerators.PropertyGenerator.class, property = "uuid")
 @Entity
 @ApiModel(description = "A custom hook's scope")
+@Getter
+@Setter
 public class HookScope extends Model {
 
   public enum TriggerType {
@@ -92,7 +97,19 @@ public class HookScope extends Model {
     PreThirdpartySoftwareUpgrade,
 
     @EnumValue("PostThirdpartySoftwareUpgrade")
-    PostThirdpartySoftwareUpgrade;
+    PostThirdpartySoftwareUpgrade,
+
+    @EnumValue("PreConfigureDBApisNodeUpgrade")
+    PreConfigureDBApisNodeUpgrade,
+
+    @EnumValue("PostConfigureDBApisNodeUpgrade")
+    PostConfigureDBApisNodeUpgrade,
+
+    @EnumValue("PreConfigureDBApis")
+    PreConfigureDBApis,
+
+    @EnumValue("PostConfigureDBApis")
+    PostConfigureDBApis;
 
     public static Optional<TriggerType> maybeResolve(String triggerName) {
       for (TriggerType triggerType : TriggerType.values()) {
@@ -105,52 +122,48 @@ public class HookScope extends Model {
   @Id
   @Column(nullable = false, unique = true)
   @ApiModelProperty(value = "Hook scope UUID", accessMode = READ_ONLY)
-  public UUID uuid = UUID.randomUUID();
+  private UUID uuid = UUID.randomUUID();
 
   @Column(nullable = false)
   @ApiModelProperty(value = "Customer UUID", accessMode = READ_ONLY)
-  public UUID customerUUID;
+  private UUID customerUUID;
 
   @Column(nullable = false)
   @ApiModelProperty(value = "Trigger", accessMode = READ_ONLY)
-  public TriggerType triggerType;
+  private TriggerType triggerType;
 
   @Column(nullable = true)
-  public UUID universeUUID;
+  private UUID universeUUID;
 
   @Column(nullable = true)
-  public UUID providerUUID;
+  private UUID providerUUID;
 
   @Column(nullable = true)
-  public UUID clusterUUID;
+  private UUID clusterUUID;
 
   @OneToMany private Set<Hook> hooks;
 
-  public Set<Hook> getHooks() {
-    return hooks;
-  }
-
   public void addHook(Hook hook) {
-    hook.hookScope = this;
+    hook.setHookScope(this);
     hook.update();
   }
 
   public static HookScope create(UUID customerUUID, TriggerType triggerType) {
     HookScope hookScope = new HookScope();
-    hookScope.customerUUID = customerUUID;
-    hookScope.triggerType = triggerType;
-    hookScope.universeUUID = null;
-    hookScope.providerUUID = null;
+    hookScope.setCustomerUUID(customerUUID);
+    hookScope.setTriggerType(triggerType);
+    hookScope.setUniverseUUID(null);
+    hookScope.setProviderUUID(null);
     hookScope.save();
     return hookScope;
   }
 
   public static HookScope create(UUID customerUUID, TriggerType triggerType, Provider provider) {
     HookScope hookScope = new HookScope();
-    hookScope.customerUUID = customerUUID;
-    hookScope.triggerType = triggerType;
-    hookScope.universeUUID = null;
-    hookScope.providerUUID = provider.uuid;
+    hookScope.setCustomerUUID(customerUUID);
+    hookScope.setTriggerType(triggerType);
+    hookScope.setUniverseUUID(null);
+    hookScope.setProviderUUID(provider.getUuid());
     hookScope.save();
     return hookScope;
   }
@@ -158,11 +171,11 @@ public class HookScope extends Model {
   public static HookScope create(
       UUID customerUUID, TriggerType triggerType, Universe universe, UUID clusterUUID) {
     HookScope hookScope = new HookScope();
-    hookScope.customerUUID = customerUUID;
-    hookScope.triggerType = triggerType;
-    hookScope.universeUUID = universe.universeUUID;
-    hookScope.providerUUID = null;
-    hookScope.clusterUUID = clusterUUID;
+    hookScope.setCustomerUUID(customerUUID);
+    hookScope.setTriggerType(triggerType);
+    hookScope.setUniverseUUID(universe.getUniverseUUID());
+    hookScope.setProviderUUID(null);
+    hookScope.setClusterUUID(clusterUUID);
     hookScope.save();
     return hookScope;
   }
@@ -174,7 +187,7 @@ public class HookScope extends Model {
     HookScope hookScope =
         find.query().where().eq("customer_uuid", customerUUID).eq("uuid", hookScopeUUID).findOne();
     if (hookScope == null) {
-      throw new PlatformServiceException(BAD_REQUEST, "Invalid HookScope UUID:" + hookScopeUUID);
+      throw new PlatformServiceException(NOT_FOUND, "Invalid HookScope UUID:" + hookScopeUUID);
     }
     return hookScope;
   }

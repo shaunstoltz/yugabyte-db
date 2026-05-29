@@ -2,20 +2,18 @@ package com.yugabyte.yw.controllers;
 
 import static junit.framework.TestCase.fail;
 
-import java.io.File;
-import java.io.IOException;
-import java.io.InputStream;
-
 import com.fasterxml.jackson.core.util.DefaultPrettyPrinter;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.fasterxml.jackson.databind.ObjectWriter;
 import com.fasterxml.jackson.databind.node.ObjectNode;
 import com.yugabyte.yw.common.FakeDBApplication;
 import com.yugabyte.yw.metrics.MetricGrafanaGen;
-
-import org.junit.Test;
-
+import java.io.File;
+import java.io.IOException;
+import java.io.InputStream;
+import javax.annotation.Nullable;
 import lombok.extern.slf4j.Slf4j;
+import org.junit.Test;
 import play.Environment;
 import play.Mode;
 import play.libs.Json;
@@ -35,31 +33,42 @@ public class GrafanaGenTest extends FakeDBApplication {
     ObjectNode expectedDashboard = getExpectedDashboard();
     ObjectNode currentDashboard = getCurrentDashboard();
     if (currentDashboard == null || !currentDashboard.has("panels")) {
-      failDashboardMatch("Grafana dashboard not found!", expectedDashboard);
+      failDashboardMatch("Grafana dashboard not found!", expectedDashboard, currentDashboard);
     } else if (expectedDashboard.get("panels").size() != currentDashboard.get("panels").size()) {
       failDashboardMatch(
-          "Number of panels mismatch with expected grafana dashboard!\n", expectedDashboard);
+          "Number of panels mismatch with expected grafana dashboard!\n",
+          expectedDashboard,
+          currentDashboard);
     } else {
       boolean match = expectedDashboard.equals(currentDashboard);
       if (!match) {
         failDashboardMatch(
-            "Panels content mismatch with expected grafana dashboard!\n", expectedDashboard);
+            "Panels content mismatch with expected grafana dashboard!\n",
+            expectedDashboard,
+            currentDashboard);
       }
     }
   }
 
-  public void failDashboardMatch(String failMessage, ObjectNode expectedDashboard) {
+  public void failDashboardMatch(
+      String failMessage, ObjectNode expectedDashboard, @Nullable ObjectNode currentDashboard) {
     try {
-      File outFile = File.createTempFile("Dashboards", "json");
+      File expectedOutFile = File.createTempFile("ExpectedDashboards", "json");
+      File currentOutFile = File.createTempFile("CurrentDashboards", "json");
       ObjectMapper mapper = new ObjectMapper();
       ObjectWriter fileWriter = mapper.writer(new DefaultPrettyPrinter());
-      fileWriter.writeValue(outFile, expectedDashboard);
+      fileWriter.writeValue(expectedOutFile, expectedDashboard);
+      if (currentDashboard != null) {
+        fileWriter.writeValue(currentOutFile, currentDashboard);
+      }
       fail(
           "\n============================================================\n"
               + failMessage
               + "Run $sbt grafanaGen to generate a new dashboard\n"
               + "The expected dashboard file written to temp file:\n"
-              + outFile.getAbsolutePath()
+              + expectedOutFile.getAbsolutePath()
+              + "\n\nThe current dashboard file written to temp file:\n"
+              + currentOutFile.getAbsolutePath()
               + "\n========================================================\n");
     } catch (IOException exception) {
       log.error("Error in writing to Dashboard.json temp file: " + exception);
@@ -96,7 +105,7 @@ public class GrafanaGenTest extends FakeDBApplication {
     GrafanaGenTest metricGenTest = new GrafanaGenTest();
     String dashboardGenPath = args[0];
     try {
-      metricGenTest.startPlay();
+      metricGenTest.startServer();
       ObjectNode expectedDashboard = metricGenTest.getExpectedDashboard();
       ObjectNode currentDashboard = metricGenTest.getCurrentDashboard();
       boolean match = expectedDashboard.equals(currentDashboard);
@@ -108,7 +117,7 @@ public class GrafanaGenTest extends FakeDBApplication {
         MetricGrafanaGen.writeJSON(expectedDashboard, dashboardGenPath);
       }
     } finally {
-      metricGenTest.stopPlay();
+      metricGenTest.stopServer();
     }
   }
 }

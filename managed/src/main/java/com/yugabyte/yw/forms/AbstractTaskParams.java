@@ -1,21 +1,19 @@
-// Copyright (c) YugaByte, Inc.
+// Copyright (c) YugabyteDB, Inc.
 
 package com.yugabyte.yw.forms;
 
-import static com.yugabyte.yw.models.YugawareProperty.get;
-
+import com.fasterxml.jackson.annotation.JsonIgnore;
+import com.yugabyte.yw.models.helpers.TaskType;
 import io.swagger.annotations.ApiModelProperty;
 import java.util.UUID;
 
 public class AbstractTaskParams implements ITaskParams {
 
-  public String platformVersion = platformVersionFromDB();
-
   @ApiModelProperty(value = "Previous task UUID of a retry")
   private UUID previousTaskUUID;
 
   @ApiModelProperty(value = "Error message")
-  public String errorString = null;
+  private String errorString = null;
 
   @Override
   public void setErrorString(String errorString) {
@@ -37,15 +35,9 @@ public class AbstractTaskParams implements ITaskParams {
     return previousTaskUUID;
   }
 
-  public String getPlatformVersion() {
-    return platformVersion;
-  }
-
-  private String platformVersionFromDB() {
-    try {
-      return get("SoftwareVersion").getValue().get("version").asText();
-    } catch (NullPointerException e) {
-      return "";
-    }
+  @JsonIgnore
+  @Override
+  public UUID getTargetUuid(TaskType taskType) {
+    return null;
   }
 }

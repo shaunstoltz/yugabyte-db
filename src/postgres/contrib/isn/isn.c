@@ -4,7 +4,7 @@
  *	  PostgreSQL type definitions for ISNs (ISBN, ISMN, ISSN, EAN13, UPC)
  *
  * Author:	German Mendez Bravo (Kronuz)
- * Portions Copyright (c) 1996-2018, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2022, PostgreSQL Global Development Group
  *
  * IDENTIFICATION
  *	  contrib/isn/isn.c
@@ -14,15 +14,14 @@
 
 #include "postgres.h"
 
-#include "fmgr.h"
-#include "utils/builtins.h"
-
-#include "isn.h"
 #include "EAN13.h"
 #include "ISBN.h"
 #include "ISMN.h"
 #include "ISSN.h"
 #include "UPC.h"
+#include "fmgr.h"
+#include "isn.h"
+#include "utils/builtins.h"
 
 PG_MODULE_MAGIC;
 
@@ -852,7 +851,7 @@ string2ean(const char *str, bool errorOK, ean13 *result,
 		case UPC:
 			buf[2] = '0';
 			valid = (valid && ((rcheck = checkdig(buf + 2, 13)) == check || magic));
-			break;
+			yb_switch_fallthrough();
 		default:
 			break;
 	}

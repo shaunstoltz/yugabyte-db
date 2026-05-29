@@ -1,47 +1,54 @@
 package com.yugabyte.yw.commissioner.tasks.subtasks;
 
-import java.io.File;
-import java.util.Arrays;
-import java.util.List;
-import java.util.Optional;
-import java.util.UUID;
-
 import com.google.inject.Inject;
+import com.typesafe.config.Config;
 import com.yugabyte.yw.commissioner.AbstractTaskBase;
 import com.yugabyte.yw.commissioner.BaseTaskDependencies;
-import com.yugabyte.yw.common.NodeUniverseManager;
+import com.yugabyte.yw.commissioner.tasks.UniverseTaskBase.ServerType;
 import com.yugabyte.yw.common.ShellProcessContext;
+import com.yugabyte.yw.common.Util;
+import com.yugabyte.yw.common.config.GlobalConfKeys;
+import com.yugabyte.yw.common.gflags.GFlagsUtil;
+import com.yugabyte.yw.common.utils.FileUtils;
 import com.yugabyte.yw.forms.AbstractTaskParams;
+import com.yugabyte.yw.forms.UniverseDefinitionTaskParams;
+import com.yugabyte.yw.models.Provider;
 import com.yugabyte.yw.models.Universe;
 import com.yugabyte.yw.models.helpers.NodeDetails;
-
+import java.io.File;
+import java.nio.file.Path;
+import java.util.Arrays;
+import java.util.HashMap;
+import java.util.List;
+import java.util.Map;
+import java.util.Optional;
+import java.util.UUID;
+import java.util.stream.Collectors;
+import javax.annotation.Nullable;
 import lombok.extern.slf4j.Slf4j;
 
 @Slf4j
 public class InstallThirdPartySoftwareK8s extends AbstractTaskBase {
 
   public enum SoftwareUpgradeType {
-    XXHSUM
+    XXHSUM,
+    JWT_JWKS
   }
 
-  private final long UPLOAD_XXSUM_PACKAGE_TIMEOUT_SEC = 60;
+  private final long UPLOAD_PACKAGE_TIMEOUT_SEC = 60;
   private final String PACKAGE_PERMISSIONS = "755";
-  private NodeUniverseManager nodeUniverseManager;
-  private play.Configuration appConfig;
+  private Config appConfig;
 
   @Inject
-  public InstallThirdPartySoftwareK8s(
-      BaseTaskDependencies baseTaskDependencies,
-      NodeUniverseManager nodeUniverseManager,
-      play.Configuration appConfig) {
+  public InstallThirdPartySoftwareK8s(BaseTaskDependencies baseTaskDependencies, Config appConfig) {
     super(baseTaskDependencies);
-    this.nodeUniverseManager = nodeUniverseManager;
     this.appConfig = appConfig;
   }
 
   public static class Params extends AbstractTaskParams {
     public UUID universeUUID;
     public SoftwareUpgradeType softwareType;
+    @Nullable public UniverseDefinitionTaskParams universeParams;
   }
 
   @Override
@@ -50,13 +57,86 @@ public class InstallThirdPartySoftwareK8s extends AbstractTaskBase {
   }
 
   @Override
+  public String getName() {
+    return super.getName()
+        + "("
+        + taskParams().universeUUID
+        + ", type: "
+        + taskParams().softwareType
+        + ")";
+  }
+
+  @Override
   public void run() {
     Universe universe = Universe.getOrBadRequest(taskParams().universeUUID);
+    // Set universe details clusters as task params clusters
+    // Required for tasks like EditKubernetesUniverse where new AZs are added
+    // and haven't been saved yet. Node details are saved.
+    if (taskParams().universeParams != null) {
+      universe.getUniverseDetails().clusters = taskParams().universeParams.clusters;
+    }
     SoftwareUpgradeType softwareType = taskParams().softwareType;
     switch (softwareType) {
       case XXHSUM:
         installThirdPartyPackagesTaskK8s(universe);
         break;
+      case JWT_JWKS:
+        copyJWSKeys(universe);
+        break;
+    }
+  }
+
+  private void copyJWSKeys(Universe universe) {
+    ShellProcessContext context =
+        ShellProcessContext.builder()
+            .logCmdOutput(false)
+            .traceLogging(true)
+            .timeoutSecs(UPLOAD_PACKAGE_TIMEOUT_SEC)
+            .build();
+    for (UniverseDefinitionTaskParams.Cluster cluster : universe.getUniverseDetails().clusters) {
+      Map<String, String> tServerMap = new HashMap<>();
+      try {
+        tServerMap =
+            cluster
+                .userIntent
+                .specificGFlags
+                .getPerProcessFlags()
+                .value
+                .getOrDefault(ServerType.TSERVER, tServerMap);
+      } catch (Exception e) {
+        log.warn("gFlag not associated with universe, skipping. {}", e.getMessage());
+        continue;
+      }
+
+      if (tServerMap.containsKey(GFlagsUtil.YSQL_HBA_CONF_CSV)) {
+        String hbaConfValue = tServerMap.get(GFlagsUtil.YSQL_HBA_CONF_CSV);
+        if (hbaConfValue.contains(GFlagsUtil.JWT_AUTH)) {
+          Path tmpDirectoryPath =
+              FileUtils.getOrCreateTmpDirectory(
+                  confGetter.getGlobalConf(GlobalConfKeys.ybTmpDirectoryPath));
+          Path localGflagFilePath = tmpDirectoryPath.resolve(cluster.uuid.toString());
+          Provider provider = Util.getSingleProvider(cluster);
+          String ybHomeDir = provider.getYbHome();
+          String remoteGFlagPath = ybHomeDir + GFlagsUtil.GFLAG_REMOTE_FILES_PATH;
+          List<NodeDetails> activeNodes =
+              universe.getUniverseDetails().getNodesInCluster(cluster.uuid).stream()
+                  .filter(NodeDetails::isActive)
+                  .collect(Collectors.toList());
+
+          for (NodeDetails node : activeNodes) {
+            nodeUniverseManager.uploadFileToNode(
+                node,
+                universe,
+                localGflagFilePath.toString(),
+                remoteGFlagPath,
+                PACKAGE_PERMISSIONS,
+                context);
+          }
+
+          // Delete the local directory.
+          FileUtils.deleteDirectory(localGflagFilePath.toFile());
+        }
+      }
     }
   }
 
@@ -88,17 +168,17 @@ public class InstallThirdPartySoftwareK8s extends AbstractTaskBase {
         ShellProcessContext.builder()
             .logCmdOutput(false)
             .traceLogging(true)
-            .timeoutSecs(UPLOAD_XXSUM_PACKAGE_TIMEOUT_SEC)
+            .timeoutSecs(UPLOAD_PACKAGE_TIMEOUT_SEC)
             .build();
     for (NodeDetails node : universe.getNodes()) {
-      String xxhsumTargetPath = nodeUniverseManager.getYbHomeDir(node, universe) + "/bin";
-      nodeUniverseManager
-          .uploadFileToNode(
-              node, universe, xxhsumPackagePath, xxhsumTargetPath, PACKAGE_PERMISSIONS, context)
-          .processErrors();
+      String xxhsumTargetPathParent = nodeUniverseManager.getYbTmpDir();
+      String xxhsumTargetPath = xxhsumTargetPathParent + "/xxhash.tar.gz";
+      nodeUniverseManager.uploadFileToNode(
+          node, universe, xxhsumPackagePath, xxhsumTargetPath, PACKAGE_PERMISSIONS, context);
 
       String extractxxhSumBinaryCmd =
-          String.format("cd %s && tar -xvf xxhash.tar.gz && rm xxhash.tar.gz", xxhsumTargetPath);
+          String.format(
+              "cd %s && tar -xvf xxhash.tar.gz && rm xxhash.tar.gz", xxhsumTargetPathParent);
       List<String> unTarxxhSumBinariesCmd = Arrays.asList("bash", "-c", extractxxhSumBinaryCmd);
       nodeUniverseManager
           .runCommand(node, universe, unTarxxhSumBinariesCmd, context)

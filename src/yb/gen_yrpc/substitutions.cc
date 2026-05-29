@@ -1,4 +1,4 @@
-// Copyright (c) YugaByte, Inc.
+// Copyright (c) YugabyteDB, Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License"); you may not use this file except
 // in compliance with the License.  You may obtain a copy of the License at
@@ -57,6 +57,16 @@ std::string GenerateCloseNamespace(const string &str) {
     out = Format("} // namespace $0\n", c) + out;
   }
   return out;
+}
+
+bool ShouldSendMetadata(const google::protobuf::MethodDescriptor* method) {
+  if (method->options().GetExtension(rpc::send_metadata)) {
+    return true;
+  }
+  if (method->options().GetExtension(rpc::exclude_metadata)) {
+    return false;
+  }
+  return method->service()->options().GetExtension(rpc::service_send_metadata);
 }
 
 } // namespace
@@ -121,6 +131,17 @@ Substitutions CreateSubstitutions(const google::protobuf::Descriptor* message) {
   return result;
 }
 
+Substitutions CreateSubstitutions(const google::protobuf::EnumDescriptor* enum_desc) {
+  Substitutions result;
+  result.emplace_back(
+      "enum_name", UnnestedName(enum_desc, Lightweight::kFalse, FullPath::kFalse));
+  auto lw_name = LightweightName(enum_desc);
+  if (lw_name) {
+    result.emplace_back("enum_lw_name", std::move(*lw_name));
+  }
+  return result;
+}
+
 Substitutions CreateSubstitutions(
     const google::protobuf::MethodDescriptor* method, rpc::RpcSides side) {
   Substitutions result;
@@ -130,19 +151,28 @@ Substitutions CreateSubstitutions(
   result.emplace_back("rpc_full_name_plainchars",
                       StringReplace(method->full_name(), ".", "_", true));
 
+  const auto& service_full_name = method->service()->full_name();
   auto request_type = method->input_type()->full_name();
   auto response_type = method->output_type()->full_name();
+
+  result.emplace_back("pb_request", RelativeClassPath(request_type, service_full_name));
+  result.emplace_back("pb_response", RelativeClassPath(response_type, service_full_name));
+
   if (IsLightweightMethod(method, side)) {
     request_type = MakeLightweightName(request_type);
     response_type = MakeLightweightName(response_type);
+    result.emplace_back("lw_request", RelativeClassPath(request_type, service_full_name));
+    result.emplace_back("lw_response", RelativeClassPath(response_type, service_full_name));
     result.emplace_back("params", "RpcCallLWParams");
   } else {
     result.emplace_back("params", "RpcCallPBParams");
   }
-  result.emplace_back("request", RelativeClassPath(request_type, method->service()->full_name()));
-  result.emplace_back(
-      "response", RelativeClassPath(response_type,  method->service()->full_name()));
+  result.emplace_back("request", RelativeClassPath(request_type, service_full_name));
+  result.emplace_back("response", RelativeClassPath(response_type, service_full_name));
+
   result.emplace_back("metric_enum_key", Format("k$0", method->name()));
+
+  result.emplace_back("send_metadata", ShouldSendMetadata(method) ? "true" : "false");
 
   return result;
 }
@@ -183,16 +213,17 @@ Substitutions CreateSubstitutions(const google::protobuf::FieldDescriptor* field
     field_name += "_";
   }
   result.emplace_back("field_name", field_name);
-  if (field->containing_oneof()) {
+  if (field->real_containing_oneof()) {
     if (StoredAsSlice(field)) {
       result.emplace_back("field_accessor", "direct_" + field_name + "()");
     } else {
       result.emplace_back("field_accessor",
-                          Format("$0_.$1_", field->containing_oneof()->name(), field_name));
+                          Format("$0_.$1_", field->real_containing_oneof()->name(), field_name));
     }
-    result.emplace_back("field_containing_oneof_name", field->containing_oneof()->name());
+    result.emplace_back("field_containing_oneof_name", field->real_containing_oneof()->name());
     result.emplace_back(
-        "field_containing_oneof_cap_name", SnakeToCamelCase(field->containing_oneof()->name()));
+        "field_containing_oneof_cap_name",
+        SnakeToCamelCase(field->real_containing_oneof()->name()));
   } else {
     result.emplace_back("field_accessor", field_name + "_");
   }
@@ -221,6 +252,10 @@ Substitutions CreateSubstitutions(const google::protobuf::FieldDescriptor* field
       field->is_packed() ? "Packed" : field->is_repeated() ? "Repeated" : "Single");
   if (field->has_default_value()) {
     result.emplace_back("field_default_value", DefaultValueToString(field, field_type));
+  } else if (field->cpp_type() == google::protobuf::FieldDescriptor::CPPTYPE_ENUM) {
+    result.emplace_back(
+        "field_default_value",
+        "::" + ReplaceNamespaceDelimiters(field->enum_type()->value(0)->full_name()));
   } else {
     result.emplace_back("field_default_value", field_type + "()");
   }

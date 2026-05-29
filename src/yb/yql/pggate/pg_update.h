@@ -1,5 +1,5 @@
 //--------------------------------------------------------------------------------------------------
-// Copyright (c) YugaByte, Inc.
+// Copyright (c) YugabyteDB, Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License"); you may not use this file except
 // in compliance with the License.  You may obtain a copy of the License at
@@ -14,31 +14,32 @@
 
 #pragma once
 
-#include "yb/yql/pggate/pg_session.h"
+#include <memory>
+
+#include "yb/util/result.h"
+
 #include "yb/yql/pggate/pg_dml_write.h"
 
-namespace yb {
-namespace pggate {
+namespace yb::pggate {
 
-//--------------------------------------------------------------------------------------------------
-// UPDATE
-//--------------------------------------------------------------------------------------------------
-
-class PgUpdate : public PgDmlWrite {
+class PgUpdate final : public PgStatementLeafBase<PgDmlWrite, StmtOp::kUpdate> {
  public:
-  PgUpdate(PgSession::ScopedRefPtr pg_session,
-           const PgObjectId& table_id,
-           bool is_single_row_txn,
-           bool is_region_local)
-      : PgDmlWrite(std::move(pg_session), table_id, is_single_row_txn, is_region_local) {}
-
-  StmtOp stmt_op() const override { return StmtOp::STMT_UPDATE; }
+  static Result<std::unique_ptr<PgUpdate>> Make(
+      const PgSessionPtr& pg_session, const PgObjectId& table_id,
+      const YbcPgTableLocalityInfo& locality_info,
+      YbcPgTransactionSetting transaction_setting, bool skip_intents_write) {
+    std::unique_ptr<PgUpdate> result{new PgUpdate{pg_session, transaction_setting}};
+    RETURN_NOT_OK(result->Prepare(table_id, locality_info, skip_intents_write));
+    return result;
+  }
 
  private:
+  PgUpdate(const PgSessionPtr& pg_session, YbcPgTransactionSetting transaction_setting)
+      : BaseType(pg_session, transaction_setting) {}
+
   PgsqlWriteRequestPB::PgsqlStmtType stmt_type() const override {
     return PgsqlWriteRequestPB::PGSQL_UPDATE;
   }
 };
 
-}  // namespace pggate
-}  // namespace yb
+}  // namespace yb::pggate

@@ -1,4 +1,4 @@
-// Copyright (c) YugaByte, Inc.
+// Copyright (c) YugabyteDB, Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License"); you may not use this file except
 // in compliance with the License.  You may obtain a copy of the License at
@@ -15,22 +15,26 @@
 #include <atomic>
 #include <optional>
 #include <string>
+#include <variant>
+#include <vector>
 
 #include "yb/gutil/ref_counted.h"
-#include "yb/util/flags.h"
-#include "yb/util/subprocess.h"
-#include "yb/util/status_fwd.h"
+
 #include "yb/util/enums.h"
+#include "yb/util/flags.h"
+#include "yb/util/status_fwd.h"
+#include "yb/util/subprocess.h"
+
+#include "yb/yql/pggate/ybc_pg_typedefs.h"
+
+#include "yb/yql/pgwrapper/pg_wrapper_context.h"
+
+#include "yb/yql/process_wrapper/common_config.h"
+#include "yb/yql/process_wrapper/process_wrapper.h"
 
 namespace yb {
 
 class Thread;
-
-namespace tserver {
-
-class TabletServerIf;
-
-} // namespace tserver
 
 namespace pgwrapper {
 
@@ -38,13 +42,13 @@ namespace pgwrapper {
 std::string GetPostgresInstallRoot();
 
 // Configuration for an external PostgreSQL server.
-struct PgProcessConf {
+struct PgProcessConf : public ProcessWrapperCommonConfig {
   static constexpr uint16_t kDefaultPort = 5433;
+  static constexpr uint16_t kDefaultPortWithConnMgr = 6433;
 
   static Result<PgProcessConf> CreateValidateAndRunInitDb(
       const std::string& bind_addresses,
-      const std::string& data_dir,
-      const int tserver_shm_fd);
+      const std::string& data_dir);
 
   std::string ToString();
 
@@ -52,109 +56,167 @@ struct PgProcessConf {
   uint16_t pg_port = kDefaultPort;
   std::string listen_addresses = "0.0.0.0";
   std::string master_addresses;
-  std::string certs_dir;
-  std::string certs_for_client_dir;
-  std::string cert_base_name;
-  bool enable_tls = false;
-
-  // File descriptor of the local tserver's shared memory.
-  int tserver_shm_fd = -1;
 
   // If this is true, we will not log to the file, even if the log file is specified.
   bool force_disable_log_file = false;
+
+  // Start the PostgreSQL server in binary upgrade mode.
+  bool run_in_binary_upgrade = false;
 };
 
 // Invokes a PostgreSQL child process once. Also allows invoking initdb. Not thread-safe.
-class PgWrapper {
+class PgWrapper : public ProcessWrapper {
  public:
   explicit PgWrapper(PgProcessConf conf);
 
   // Checks if we have a valid configuration in order to be able to run PostgreSQL.
-  Status PreflightCheck();
+  Status PreflightCheck() override;
 
-  Status Start();
+  Status Start() override;
 
-  Status ReloadConfig();
+  Status ReloadConfig() override;
+  Status UpdateAndReloadConfig() override;
+  void Shutdown() override;
 
-  Status UpdateAndReloadConfig();
-
-  void Kill();
-
-  // Calls initdb if the data directory does not exist. This is intended to use during tablet server
-  // initialization.
+  // Calls initdb if the data directory does not exist, or if the tablet server is transitioning
+  // from one major PG version to another. (The data directory's version must match the PG major
+  // version.) This function is intended to be used during tablet server initialization.
   Status InitDbLocalOnlyIfNeeded();
 
-  // Calls PostgreSQL's initdb program for initial database initialization.
-  // yb_enabled - whether initdb should be talking to YugaByte cluster, or just initialize a
-  //              PostgreSQL data directory. The former is only done once from outside of the YB
-  //              cluster, and the latter is done on every tablet server startup.
-  Status InitDb(bool yb_enabled);
-
-  // Waits for the running PostgreSQL process to complete. Returns the exit code or an error.
-  // Non-zero exit codes are considered non-error cases for the purpose of this function.
-  Result<int> Wait();
+  // Cleanup the data directory, and any associated symlinks.
+  static Status CleanupPgData(const std::string& data_dir);
 
   // Run initdb in a mode that sets up the required metadata in the YB cluster. This is done
   // only once after the cluster has started up. tmp_dir_base is used as a base directory to
   // create a temporary PostgreSQL directory that is later deleted.
   static Status InitDbForYSQL(
-      const std::string& master_addresses, const std::string& tmp_dir_base, int tserver_shm_fd);
+      PgWrapperContext* server, const server::ServerBaseOptions& options, FsManager& fs_manager,
+      const std::string& tmp_dir_base, std::vector<std::pair<std::string, YbcPgOid>> db_to_oid,
+      bool is_major_upgrade);
+
+  void PrepareSharedMemoryNegotiation(PgWrapperContext* server);
+
+  Status SetYsqlConnManagerStatsShmKey(key_t statsshmkey);
+
+  static std::string GetPostgresExecutablePath();
+
+  struct PgUpgradeParams {
+    std::string ysql_user_name;
+    std::string data_dir;
+    std::string old_version_pg_address;
+    std::string old_version_socket_dir;
+    uint16_t old_version_pg_port;
+    std::string new_version_socket_dir;
+    uint16_t new_version_pg_port;
+    bool no_statistics;
+  };
+
+  static Status RunPgUpgrade(const PgUpgradeParams& param);
 
  private:
-  static std::string GetPostgresExecutablePath();
+  struct LocalInitdbParams {
+    std::string versioned_data_dir;
+  };
+  struct GlobalInitdbParams {
+    std::vector<std::pair<std::string, YbcPgOid>> db_to_oid;
+    bool is_major_upgrade = false;
+  };
+  using InitdbParams = std::variant<LocalInitdbParams, GlobalInitdbParams>;
+
+  // Calls PostgreSQL's initdb program for initial database initialization.
+  //
+  // initdb_params - initdb is run in one of two modes: 1) local initdb, which initializes a
+  //                 PostgreSQL data directory and does not access the YB cluster; or 2) global
+  //                 cluster initdb, which does initialization of catalogs and system objects
+  //                 against the YugabyteDB cluster.
+  //
+  //                 In local initdb mode, the caller must pass the data directory to use, which
+  //                 is expected to be a directory that's versioned to support online upgrade.
+  //
+  //                 In global cluster initdb mode, the caller must pass a mapping from database
+  //                 name to database OID. If there is already an existing cluster and it's going
+  //                 through an online upgrade, the caller must pass entries for all existing
+  //                 system-generated databases other than template1 (typically template0,
+  //                 postgres, yugabyte, and system platform), so that such OIDs can be reused in
+  //                 the new version of PostgreSQL. The template1 database is special because it's
+  //                 created by the bootstrap phase of initdb (see file comment for initdb.c for
+  //                 more details). The template1 database always has OID 1.
+  //
+  //                 For a new cluster, the caller must pass an empty map, which indicates that
+  //                 default OIDs are to be used.
+  Status InitDb(InitdbParams initdb_params);
+
+  // Creates a directory name "<conf_.data_dir>_<version>".
+  std::string MakeVersionedDataDir(int32_t version);
+
+  static std::string GetPostgresSuppressionsPath();
   static std::string GetPostgresLibPath();
   static std::string GetPostgresThirdPartyLibPath();
   static std::string GetInitDbExecutablePath();
-  static Status CheckExecutableValid(const std::string& executable_path);
+
+  Status CleanupPreviousPostgres();
+  Status CleanupLockFileAndKillHungPg(const std::string& lock_file);
 
   // Set common environment for a child process (initdb or postgres itself).
   void SetCommonEnv(Subprocess* proc, bool yb_enabled);
-
   PgProcessConf conf_;
-  std::optional<Subprocess> pg_proc_;
+  int address_negotiator_fd_ = -1;
+  std::string shared_mem_uuid_;
+  key_t ysql_conn_mgr_stats_shmem_key_;
 };
 
-YB_DEFINE_ENUM(PgProcessState,
-    (kNotStarted)
-    (kRunning)
-    (kStopping)
-    (kStopped));
-
-// Keeps a PostgreSQL process running in the background, and restarts in case it crashes.
+// Keeps a PostgreSQL process running in the background, and restarts it in case it crashes.
 // Starts a separate thread to monitor the child process.
-class PgSupervisor {
+class PgSupervisor : public ProcessSupervisor {
  public:
-  explicit PgSupervisor(PgProcessConf conf, tserver::TabletServerIf* tserver);
+  explicit PgSupervisor(PgProcessConf conf, PgWrapperContext* server);
   ~PgSupervisor();
 
-  Status Start();
-  void Stop();
-  PgProcessState GetState();
+  void Stop() override;
 
-  const PgProcessConf& conf() const {
-    return conf_;
-  }
+  const PgProcessConf& conf() const { return conf_; }
+
+  // todo(zdrudi): maybe rename this?
+  // what we want is to verify that the process can be started, and then potentially pause it.
+  // So the semantics should maybe be different.
+  Status StartAndMaybePause();
 
   Status ReloadConfig();
-
   Status UpdateAndReloadConfig();
+  std::shared_ptr<ProcessWrapper> CreateProcessWrapper() override;
+
+  // Writes all PG config files (GUC, HBA, ident) into tmp_dir using the given CSV overrides
+  // and returns the paths to the generated files. The real postgresql.conf is copied from
+  // data_dir so that WritePostgresConfig can read it as a base.
+  Result<PgConfigPaths> WritePgConfigFiles(
+      const std::string& tmp_dir, const std::string& ysql_pg_conf_csv,
+      const std::string& hba_conf_csv, const std::string& ident_conf_csv);
+
+  // Get the shared memory key to be used by ysql connection manager to publish stats
+  key_t GetYsqlConnManagerStatsShmkey();
 
  private:
-  Status ExpectStateUnlocked(PgProcessState state);
-  Status StartServerUnlocked();
-  void RunThread();
-  Status CleanupOldServerUnlocked();
   Status RegisterPgFlagChangeNotifications() REQUIRES(mtx_);
-  Status RegisterReloadPgConfigCallback(const void* flag_ptr) REQUIRES(mtx_);
+  Status RegisterReloadConfigCallback(const void* flag_ptr) REQUIRES(mtx_);
   void DeregisterPgFlagChangeNotifications() REQUIRES(mtx_);
 
+  void PrepareForStop() REQUIRES(mtx_) override;
+  Status PrepareForStart() REQUIRES(mtx_) override;
+
   PgProcessConf conf_;
-  std::optional<PgWrapper> pg_wrapper_;
-  PgProcessState state_ = PgProcessState::kNotStarted;
-  scoped_refptr<Thread> supervisor_thread_;
+  PgWrapperContext* server_;
   std::vector<FlagCallbackRegistration> flag_callbacks_ GUARDED_BY(mtx_);
-  std::mutex mtx_;
+  key_t ysql_conn_mgr_stats_shmem_key_ = 0;
+
+  std::string GetProcessName() override {
+    return "PostgreSQL";
+  }
 };
+
+// Formats a gflag value for use in postgresql.conf.
+// String-type flags are single-quoted (with internal quotes escaped), unless already quoted.
+// Non-string-type flags are returned as-is.
+std::string FormatPgGFlagValue(const std::string& value, const std::string& type);
 
 }  // namespace pgwrapper
 }  // namespace yb

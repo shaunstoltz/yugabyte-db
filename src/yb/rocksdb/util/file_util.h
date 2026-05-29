@@ -3,9 +3,9 @@
 //  LICENSE file in the root directory of this source tree. An additional grant
 //  of patent rights can be found in the PATENTS file in the same directory.
 //
-// The following only applies to changes made to this file as part of YugaByte development.
+// The following only applies to changes made to this file as part of YugabyteDB development.
 //
-// Portions Copyright (c) YugaByte, Inc.
+// Portions Copyright (c) YugabyteDB, Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License"); you may not use this file except
 // in compliance with the License.  You may obtain a copy of the License at
@@ -24,13 +24,18 @@
 #include <string>
 
 #include "yb/rocksdb/env.h"
+#include "yb/util/strongly_typed_bool.h"
+
+YB_STRONGLY_TYPED_BOOL(CopyFileSync);
 
 namespace rocksdb {
 
 // Copy a file up to a specified size. If passed size is 0 - copy the whole file.
 // Will return "file too small" error status if `size` is larger than size of the source file.
+// If sync is true, the destination file will be synced to disk before returning.
 Status CopyFile(
-    Env* env, const std::string& source, const std::string& destination, uint64_t size = 0);
+    Env* env, const std::string& source, const std::string& destination, uint64_t size = 0,
+    CopyFileSync sync = CopyFileSync::kFalse);
 
 // Recursively delete the specified directory.
 Status DeleteRecursively(Env* env, const std::string& dirname);

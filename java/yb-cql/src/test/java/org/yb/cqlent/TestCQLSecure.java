@@ -1,4 +1,4 @@
-// Copyright (c) YugaByte, Inc.
+// Copyright (c) YugabyteDB, Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License"); you may not use this file except
 // in compliance with the License.  You may obtain a copy of the License at
@@ -85,6 +85,6 @@ public class TestCQLSecure extends BaseCQLTest {
 
   private static String certsDir() {
     FileSystem fs = FileSystems.getDefault();
-    return fs.getPath(TestUtils.getBinDir()).resolve(fs.getPath("../ent/test_certs")).toString();
+    return fs.getPath(TestUtils.getBinDir()).resolve(fs.getPath("../test_certs")).toString();
   }
 }

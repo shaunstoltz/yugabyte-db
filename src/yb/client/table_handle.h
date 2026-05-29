@@ -1,4 +1,4 @@
-// Copyright (c) YugaByte, Inc.
+// Copyright (c) YugabyteDB, Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License"); you may not use this file except
 // in compliance with the License.  You may obtain a copy of the License at
@@ -16,15 +16,15 @@
 #include <unordered_map>
 
 #include <boost/functional/hash.hpp>
-#include <boost/optional.hpp>
 
 #include "yb/client/client_fwd.h"
 
 #include "yb/common/column_id.h"
 #include "yb/common/ql_protocol.pb.h"
 #include "yb/common/ql_protocol_util.h"
-#include "yb/common/ql_rowblock.h"
 #include "yb/common/read_hybrid_time.h"
+
+#include "yb/qlexpr/ql_rowblock.h"
 
 #include "yb/util/async_util.h"
 #include "yb/util/strongly_typed_bool.h"
@@ -42,23 +42,47 @@ class YBSchemaBuilder;
 class TableIterator;
 class TableRange;
 
-#define TABLE_HANDLE_TYPE_DECLARATIONS_IMPL(name, lname, type) \
+#define TABLE_HANDLE_TYPE_DECLARATIONS_IMPL(name, lname, type, pb_set, lw_set) \
   void PP_CAT3(Add, name, ColumnValue)( \
-      QLWriteRequestPB * req, const std::string& column_name, type value) const; \
-\
+      QLWriteRequestPB * req, std::string_view column_name, type value) const; \
+  void PP_CAT3(Add, name, ColumnValue)( \
+      LWQLWriteRequestPB * req, std::string_view column_name, type value) const; \
+  \
   void PP_CAT3(Set, name, Condition)( \
-      QLConditionPB* const condition, const std::string& column_name, const QLOperator op, \
+      QLConditionPB* const condition, std::string_view column_name, const QLOperator op, \
       type value) const; \
   void PP_CAT3(Add, name, Condition)( \
-      QLConditionPB* const condition, const std::string& column_name, const QLOperator op, \
-      type value) const;
+      QLConditionPB* const condition, std::string_view column_name, const QLOperator op, \
+      type value) const; \
+  void PP_CAT3(Set, name, Condition)( \
+      LWQLConditionPB* const condition, std::string_view column_name, const QLOperator op, \
+      type value) const; \
+  void PP_CAT3(Add, name, Condition)( \
+      LWQLConditionPB* const condition, std::string_view column_name, const QLOperator op, \
+      type value) const; \
+  /**/
 
 #define TABLE_HANDLE_TYPE_DECLARATIONS(i, data, entry) TABLE_HANDLE_TYPE_DECLARATIONS_IMPL entry
 
-QLMapValuePB* AddMapColumn(QLWriteRequestPB* req, const int32_t& column_id);
+void UpdateMapUpsertKeyValue(
+    QLWriteRequestPB* req, int32_t column_id, std::string_view entry_key,
+    std::string_view entry_value);
+void UpdateMapUpsertKeyValue(
+    LWQLWriteRequestPB* req, int32_t column_id, std::string_view entry_key,
+    std::string_view entry_value);
+
+void UpdateMapRemoveKey(
+    QLWriteRequestPB* req, int32_t column_id, std::string_view entry_key);
+void UpdateMapRemoveKey(
+    LWQLWriteRequestPB* req, int32_t column_id, std::string_view entry_key);
+
+QLMapValuePB* AddMapColumn(QLWriteRequestPB* req, int32_t column_id);
+LWQLMapValuePB* AddMapColumn(LWQLWriteRequestPB* req, int32_t column_id);
 
 void AddMapEntryToColumn(
-    QLMapValuePB* map_value_pb, const std::string& entry_key, const std::string& entry_value);
+    QLMapValuePB* map_value_pb, std::string_view entry_key, std::string_view entry_value);
+void AddMapEntryToColumn(
+    LWQLMapValuePB* map_value_pb, std::string_view entry_key, std::string_view entry_value);
 
 // Utility class for manually filling QL operations.
 class TableHandle {
@@ -79,28 +103,29 @@ class TableHandle {
 
   Status Reopen();
 
-  std::shared_ptr<YBqlWriteOp> NewWriteOp(QLWriteRequestPB::QLStmtType type) const;
+  std::shared_ptr<YBqlWriteOp> NewWriteOp(
+      const ThreadSafeArenaPtr& arena, QLWriteRequestPB::QLStmtType type) const;
 
-  std::shared_ptr<YBqlWriteOp> NewInsertOp() const {
-    return NewWriteOp(QLWriteRequestPB::QL_STMT_INSERT);
+  std::shared_ptr<YBqlWriteOp> NewInsertOp(const ThreadSafeArenaPtr& arena) const {
+    return NewWriteOp(arena, QLWriteRequestPB::QL_STMT_INSERT);
   }
 
-  std::shared_ptr<YBqlWriteOp> NewUpdateOp() const {
-    return NewWriteOp(QLWriteRequestPB::QL_STMT_UPDATE);
+  std::shared_ptr<YBqlWriteOp> NewUpdateOp(const ThreadSafeArenaPtr& arena) const {
+    return NewWriteOp(arena, QLWriteRequestPB::QL_STMT_UPDATE);
   }
 
-  std::shared_ptr<YBqlWriteOp> NewDeleteOp() const {
-    return NewWriteOp(QLWriteRequestPB::QL_STMT_DELETE);
+  std::shared_ptr<YBqlWriteOp> NewDeleteOp(const ThreadSafeArenaPtr& arena) const {
+    return NewWriteOp(arena, QLWriteRequestPB::QL_STMT_DELETE);
   }
 
-  std::shared_ptr<YBqlReadOp> NewReadOp() const;
+  std::shared_ptr<YBqlReadOp> NewReadOp(const ThreadSafeArenaPtr& arena) const;
 
-  int32_t ColumnId(const std::string& column_name) const {
+  int32_t ColumnId(std::string_view column_name) const {
     auto it = column_ids_.find(column_name);
     return it != column_ids_.end() ? it->second : -1;
   }
 
-  const std::shared_ptr<QLType>& ColumnType(const std::string& column_name) const {
+  const std::shared_ptr<QLType>& ColumnType(std::string_view column_name) const {
     static std::shared_ptr<QLType> not_found;
     auto it = column_types_.find(yb::ColumnId(ColumnId(column_name)));
     return it != column_types_.end() ? it->second : not_found;
@@ -109,13 +134,15 @@ class TableHandle {
   BOOST_PP_SEQ_FOR_EACH(TABLE_HANDLE_TYPE_DECLARATIONS, ~, QL_PROTOCOL_TYPES);
 
   // Set a column id without value - for DELETE
-  void SetColumn(QLColumnValuePB* column_value, const std::string& column_name) const;
+  void SetColumn(QLColumnValuePB* column_value, std::string_view column_name) const;
+  void SetColumn(LWQLColumnValuePB* column_value, std::string_view column_name) const;
 
   // Add a simple comparison operation under a logical comparison condition.
   // E.g. Add <EXISTS> under "... AND <EXISTS>".
   void AddCondition(QLConditionPB* const condition, const QLOperator op) const;
+  void AddCondition(LWQLConditionPB* const condition, const QLOperator op) const;
 
-  void AddColumns(const std::vector<std::string>& columns, QLReadRequestPB* req) const;
+  void AddColumns(const std::vector<std::string>& columns, LWQLReadRequestPB* req) const;
 
   const YBTablePtr& table() const { return table_; }
 
@@ -131,14 +158,16 @@ class TableHandle {
 
   std::vector<std::string> AllColumnNames() const;
 
-  QLValuePB* PrepareColumn(QLWriteRequestPB* req, const std::string& column_name) const;
+  QLValuePB* PrepareColumn(QLWriteRequestPB* req, std::string_view column_name) const;
+  LWQLValuePB* PrepareColumn(LWQLWriteRequestPB* req, std::string_view column_name) const;
   QLValuePB* PrepareCondition(
-      QLConditionPB* const condition, const std::string& column_name, const QLOperator op) const;
+      QLConditionPB* const condition, std::string_view column_name, const QLOperator op) const;
+  LWQLValuePB* PrepareCondition(
+      LWQLConditionPB* const condition, std::string_view column_name, const QLOperator op) const;
 
  private:
-  typedef std::unordered_map<std::string, yb::ColumnId> ColumnIdsMap;
-  using ColumnTypesMap =
-      std::unordered_map<yb::ColumnId, const std::shared_ptr<QLType>, boost::hash<yb::ColumnId>>;
+  using ColumnIdsMap = UnorderedStringMap<std::string, yb::ColumnId>;
+  using ColumnTypesMap = std::unordered_map<yb::ColumnId, const std::shared_ptr<QLType>>;
 
   YBClient* client_;
   YBTablePtr table_;
@@ -146,21 +175,23 @@ class TableHandle {
   ColumnTypesMap column_types_;
 };
 
-typedef std::function<void(const TableHandle&, QLConditionPB*)> TableFilter;
+using TableFilter = std::function<void(const TableHandle&, LWQLConditionPB*)>;
 
 struct TableIteratorOptions {
   TableIteratorOptions();
 
   YBConsistencyLevel consistency = YBConsistencyLevel::STRONG;
-  boost::optional<std::vector<std::string>> columns;
+  std::optional<std::vector<std::string>> columns;
   TableFilter filter;
   ReadHybridTime read_time;
   std::string tablet;
   StatusFunctor error_handler;
+  MonoDelta timeout = MonoDelta::FromSeconds(60);
 };
 
 class TableIterator : public std::iterator<
-                          std::forward_iterator_tag, QLRow, ptrdiff_t, const QLRow*, const QLRow&> {
+    std::forward_iterator_tag, qlexpr::QLRow, ptrdiff_t, const qlexpr::QLRow*,
+    const qlexpr::QLRow&> {
  public:
   TableIterator();
   explicit TableIterator(const TableHandle* table, const TableIteratorOptions& options);
@@ -175,9 +206,9 @@ class TableIterator : public std::iterator<
     return result;
   }
 
-  const QLRow& operator*() const;
+  const qlexpr::QLRow& operator*() const;
 
-  const QLRow* operator->() const { return &**this; }
+  const qlexpr::QLRow* operator->() const { return &**this; }
 
  private:
   bool ExecuteOps();
@@ -190,8 +221,8 @@ class TableIterator : public std::iterator<
   std::vector<std::string> partition_key_ends_;
   size_t executed_ops_ = 0;
   size_t ops_index_ = 0;
-  boost::optional<QLRowBlock> current_block_;
-  const QLPagingStatePB* paging_state_ = nullptr;
+  std::optional<qlexpr::QLRowBlock> current_block_;
+  const LWQLPagingStatePB* paging_state_ = nullptr;
   size_t row_index_;
   YBSessionPtr session_;
   StatusFunctor error_handler_;
@@ -240,7 +271,7 @@ class FilterBetweenImpl {
         upper_inclusive_(upper_inclusive),
         column_(std::move(column)) {}
 
-  void operator()(const TableHandle& table, QLConditionPB* condition) const;
+  void operator()(const TableHandle& table, LWQLConditionPB* condition) const;
 
  private:
   T lower_bound_;
@@ -262,7 +293,7 @@ class FilterGreater {
   FilterGreater(int32_t bound, Inclusive inclusive, std::string column = "key")
       : bound_(bound), inclusive_(inclusive), column_(std::move(column)) {}
 
-  void operator()(const TableHandle& table, QLConditionPB* condition) const;
+  void operator()(const TableHandle& table, LWQLConditionPB* condition) const;
 
  private:
   int32_t bound_;
@@ -275,7 +306,7 @@ class FilterLess {
   FilterLess(int32_t bound, Inclusive inclusive, std::string column = "key")
       : bound_(bound), inclusive_(inclusive), column_(std::move(column)) {}
 
-  void operator()(const TableHandle& table, QLConditionPB* condition) const;
+  void operator()(const TableHandle& table, LWQLConditionPB* condition) const;
 
  private:
   int32_t bound_;
@@ -288,7 +319,7 @@ class FilterEqualImpl {
  public:
   FilterEqualImpl(const T& t, std::string column) : t_(t), column_(std::move(column)) {}
 
-  void operator()(const TableHandle& table, QLConditionPB* condition) const;
+  void operator()(const TableHandle& table, LWQLConditionPB* condition) const;
 
  private:
   T t_;

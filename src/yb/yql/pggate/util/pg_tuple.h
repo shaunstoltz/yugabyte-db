@@ -1,5 +1,5 @@
 //--------------------------------------------------------------------------------------------------
-// Copyright (c) YugaByte, Inc.
+// Copyright (c) YugabyteDB, Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License"); you may not use this file except
 // in compliance with the License.  You may obtain a copy of the License at
@@ -17,8 +17,9 @@
 #include "yb/yql/pggate/util/pg_wire.h"
 #include "yb/yql/pggate/ybc_pg_typedefs.h"
 
-namespace yb {
-namespace pggate {
+#include "yb/util/debug-util.h"
+
+namespace yb::pggate {
 
 // PgTuple.
 // TODO(neil) This code needs to be optimize. We might be able to use DocDB buffer directly for
@@ -28,27 +29,24 @@ namespace pggate {
 // Currently we allocate one individual buffer per column and write result there.
 class PgTuple {
  public:
-  PgTuple(uint64_t *datums, bool *isnulls, PgSysColumns *syscols);
+  PgTuple(uint64_t* datums, bool* isnulls, YbcPgSysColumns* syscols, size_t nattrs);
 
-  // Write null value.
-  void WriteNull(int index, const PgWireDataHeader& header);
+  void CopyFrom(const PgTuple& other, size_t nattrs);
 
-  // Write datum to tuple slot.
-  void WriteDatum(int index, uint64_t datum);
+  void WriteNull(int index) { DoWrite(index); }
 
-  // Write data in Postgres format.
-  void Write(uint8_t **pgbuf, const PgWireDataHeader& header, const uint8_t *value, int64_t bytes);
+  void WriteDatum(int index, uint64_t datum) { DoWrite(index, /* isnull= */ false, datum); }
 
   // Get returning-space for system columns. Tuple writer will save values in this struct.
-  PgSysColumns *syscols() {
-    return syscols_;
-  }
+  YbcPgSysColumns* syscols() { return syscols_; }
 
  private:
-  uint64_t *datums_;
-  bool *isnulls_;
-  PgSysColumns *syscols_;
+  void DoWrite(int index, bool isnull = true, uint64_t datum = 0);
+
+  uint64_t* datums_;
+  bool* isnulls_;
+  YbcPgSysColumns* syscols_;
+  DEBUG_ONLY(size_t nattrs_);
 };
 
-}  // namespace pggate
-}  // namespace yb
+}  // namespace yb::pggate

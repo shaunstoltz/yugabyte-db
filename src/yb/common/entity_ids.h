@@ -1,4 +1,4 @@
-// Copyright (c) YugaByte, Inc.
+// Copyright (c) YugabyteDB, Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License"); you may not use this file except
 // in compliance with the License.  You may obtain a copy of the License at
@@ -30,6 +30,13 @@ static const uint32_t kPgNamespaceTableOid = 2615; // Hardcoded for pg_namespace
 static const uint32_t kPgClassTableOid = 1259;  // Hardcoded for pg_class. (in pg_class.h)
 static const uint32_t kPgDatabaseTableOid = 1262;  // Hardcoded for pg_database. (in pg_database.h)
 static const uint32_t kPgFirstNormalObjectId = 16384; // Hardcoded in transam.h
+// We include some OIDs that would be signed with int32_t to allow checking the Postgres logic that
+// handles those.  See PgLibPqLargeOidTest.LargeOid test.
+static const uint32_t kPgUpperBoundNormalObjectId = 2'199'999'999; // upper bound is exclusive
+// Secondary OID space is used by xCluster when a database is a target.  Starting point has been
+// chosen so it starts at a nice human readable number, 2'200'000'000 = 0x83'21'56'00.
+static const uint32_t kPgFirstSecondarySpaceObjectId = kPgUpperBoundNormalObjectId + 1;
+static const uint32_t kPgUpperBoundSecondarySpaceObjectId = 0xff'ff'ff'ff; // exclusive
 static const uint32_t kPgYbTablegroupTableOid = 8036;  // Hardcoded in pg_yb_tablegroup.h
 static const uint32_t kPgSequencesTableOid = 2224;  // Hardcoded for pg_sequence. (in pg_sequence.h)
 static const uint32_t kPgYbMigrationTableOid = 8027;  // Hardcoded for pg_yb_migration.
@@ -40,8 +47,25 @@ static const uint32_t kPgEnumTableOid = 3501;         // Hardcoded for pg_enum (
 static const uint32_t kPgTypeTableOid = 1247;         // Hardcoded for pg_type (in pg_type.h)
 static const uint32_t kTemplate1Oid = 1;              // Hardcoded for template1. (in initdb.c)
 
+// Returns true for database OIDs that are system-internal and should not get
+// per-DB cgroup/pool treatment under QoS.  Currently: system_postgres (the
+// synthetic namespace that holds sequences_data, OID 0xFFFF) and template1.
+inline bool IsQosSystemDatabaseOid(uint32_t db_oid) {
+  return db_oid == kPgSequencesDataDatabaseOid || db_oid == kTemplate1Oid;
+}
+
+// Hardcoded for pg_yb_invalidation_messages hardcoded (in pg_yb_invalidation_messages.h).
+static const uint32_t kPgYbInvalidationMessagesTableOid = 8080;
+
+// Hardcoded for pg_yb_catalog_version (in pg_yb_catalog_version.h).
+static const uint32_t kPgYbCatalogVersionTableOid = 8010;
+
+// Hardcoded for pg_publication_rel (in pg_publication_rel.h).
+static const uint32_t kPgPublicationRelOid = 6106;
+
 extern const TableId kPgProcTableId;
 extern const TableId kPgYbCatalogVersionTableId;
+extern const TableId kPgYbCatalogVersionTableIdPriorVersion;
 extern const TableId kPgTablespaceTableId;
 extern const TableId kPgSequencesDataTableId;
 extern const std::string kPgSequencesDataNamespaceId;
@@ -59,15 +83,34 @@ TablegroupId GetPgsqlTablegroupId(uint32_t database_oid, uint32_t tablegroup_oid
 TablespaceId GetPgsqlTablespaceId(uint32_t tablespace_oid);
 
 // Is the namespace/table id a Postgres database or table id?
-bool IsPgsqlId(const std::string& id);
+bool IsPgsqlId(std::string_view id);
 
 // Get Postgres database and table oids from a YB namespace/table id.
-Result<uint32_t> GetPgsqlDatabaseOid(const NamespaceId& namespace_id);
-Result<uint32_t> GetPgsqlTableOid(const TableId& table_id);
+Result<uint32_t> GetPgsqlDatabaseOid(NamespaceIdView namespace_id);
+Result<uint32_t> GetPgsqlTableOid(TableIdView table_id);
 Result<uint32_t> GetPgsqlTablegroupOid(const TablegroupId& tablegroup_id);
 Result<uint32_t> GetPgsqlTablegroupOidByTableId(const TableId& table_id);
 Result<uint32_t> GetPgsqlDatabaseOidByTableId(const TableId& table_id);
 Result<uint32_t> GetPgsqlDatabaseOidByTablegroupId(const TablegroupId& tablegroup_id);
 Result<uint32_t> GetPgsqlTablespaceOid(const TablespaceId& tablespace_id);
+
+// Construct the tablegroup id for the restore side corresponding to the backup tablegroup id.
+Result<TableId> GetRestoreTargetTablegroupId(
+    const NamespaceId& restore_target_namespace_id, const TableId& backup_source_tablegroup_id);
+// Construct the table id at the restore target side that corresponds to the old table
+// coming from backup side.
+Result<TableId> GetRestoreTargetTableIdUsingRelfilenode(
+    const NamespaceId& restore_target_namespace_id, const TableId& backup_source_table_id);
+
+// NOTE: Only catalog table oids are allowed.
+TableId GetPriorVersionYsqlCatalogTableId(uint32_t database_oid, uint32_t table_oid);
+
+// If this is a YSQL catalog table, then is it the previous version?
+// Returns false for user tables.
+bool IsPriorVersionYsqlCatalogTable(const TableId& table_id);
+
+// If this is a YSQL catalog table, then is it the current version?
+// Returns false for user tables.
+bool IsCurrentVersionYsqlCatalogTable(TableIdView table_id);
 
 }  // namespace yb

@@ -1,7 +1,8 @@
-// Copyright (c) YugaByte, Inc.
+// Copyright (c) YugabyteDB, Inc.
 
 package com.yugabyte.yw.models.helpers;
 
+import static java.util.Map.entry;
 import static play.mvc.Http.Status.BAD_REQUEST;
 
 import com.fasterxml.jackson.core.type.TypeReference;
@@ -18,7 +19,10 @@ import com.jayway.jsonpath.spi.mapper.JacksonMappingProvider;
 import com.yugabyte.yw.common.PlatformServiceException;
 import com.yugabyte.yw.common.ShellResponse;
 import com.yugabyte.yw.common.utils.Pair;
+import com.yugabyte.yw.controllers.RequestContext;
+import com.yugabyte.yw.controllers.TokenAuthenticator;
 import com.yugabyte.yw.forms.UniverseDefinitionTaskParams;
+import com.yugabyte.yw.models.Provider;
 import com.yugabyte.yw.models.Universe;
 import com.yugabyte.yw.models.Users;
 import com.yugabyte.yw.models.extended.UserWithFeatures;
@@ -31,25 +35,11 @@ import io.ebean.PagedList;
 import io.ebean.Query;
 import io.ebean.common.BeanList;
 import java.lang.annotation.Annotation;
-import java.time.Duration;
 import java.time.Instant;
 import java.time.temporal.ChronoUnit;
 import java.time.temporal.TemporalUnit;
-import java.util.ArrayList;
-import java.util.Arrays;
-import java.util.Collection;
-import java.util.Collections;
-import java.util.Date;
-import java.util.HashMap;
-import java.util.Iterator;
-import java.util.List;
-import java.util.Map;
+import java.util.*;
 import java.util.Map.Entry;
-import java.util.Optional;
-import java.util.Random;
-import java.util.Scanner;
-import java.util.Set;
-import java.util.UUID;
 import java.util.function.BiFunction;
 import java.util.function.Function;
 import java.util.function.Predicate;
@@ -57,29 +47,36 @@ import java.util.regex.Matcher;
 import java.util.regex.Pattern;
 import java.util.stream.Collectors;
 import lombok.extern.slf4j.Slf4j;
-import org.apache.commons.collections.CollectionUtils;
-import org.apache.commons.collections.MapUtils;
+import org.apache.commons.collections4.CollectionUtils;
+import org.apache.commons.collections4.MapUtils;
 import org.apache.commons.lang3.StringUtils;
 import org.springframework.security.crypto.encrypt.Encryptors;
 import org.springframework.security.crypto.encrypt.TextEncryptor;
 import play.libs.Json;
-import play.mvc.Http;
 
 @Slf4j
 public class CommonUtils {
 
+  public static final String RESULT_SUCCESS = "success";
+  public static final String RESULT_FAILURE = "failure";
+
   public static final String DEFAULT_YB_HOME_DIR = "/home/yugabyte";
+  public static final String DEFAULT_YBC_DIR = "%s/yugabyte";
 
   private static final Pattern RELEASE_REGEX =
-      Pattern.compile("^(\\d+)\\.(\\d+)\\.(\\d+)\\.(\\d+).*$");
+      Pattern.compile("^(\\d+)\\.(\\d+)\\.(\\d+)\\.(\\d+)(.+)?$");
 
-  private static final String maskRegex = "(?<!^.?).(?!.?$)";
+  public static final String maskRegex = "(?<!^.?).(?!.?$)";
 
   private static final String MASKED_FIELD_VALUE = "********";
 
   public static final int DB_MAX_IN_CLAUSE_ITEMS = 1000;
   public static final int DB_IN_CLAUSE_TO_WARN = 50000;
   public static final int DB_OR_CHAIN_TO_WARN = 100;
+
+  public static final String MIN_PROMOTE_AUTO_FLAG_RELEASE = "2.17.0.0";
+
+  public static final String MIN_LIVE_TABLET_SERVERS_RELEASE = "2.8.0.0";
 
   private static final Configuration JSONPATH_CONFIG =
       Configuration.builder()
@@ -90,7 +87,19 @@ public class CommonUtils {
   // Sensisitve field substrings
   private static final List<String> sensitiveFieldSubstrings =
       Arrays.asList(
-          "KEY", "SECRET", "CREDENTIALS", "API", "POLICY", "HC_VAULT_TOKEN", "vaultToken");
+          "KEY",
+          "SECRET",
+          "CREDENTIALS",
+          "API",
+          "POLICY",
+          "HC_VAULT_TOKEN",
+          "VAULTTOKEN",
+          "SAS_TOKEN",
+          "REFRESH_TOKEN",
+          "PASSWORD");
+  // Sensitive field exact names (case-insensitive). Used when a substring match would be too broad.
+  // For example, "token" should be masked but "authTokenIssueDate" should not.
+  private static final List<String> sensitiveFieldExactNames = Arrays.asList("TOKEN");
   // Exclude following strings from being sensitive fields
   private static final List<String> excludedFieldNames =
       Arrays.asList(
@@ -105,7 +114,80 @@ public class CommonUtils {
           "HC_VAULT_KEY_NAME",
           "KEYSPACETABLELIST",
           // General API field
-          "KEYSPACE");
+          "KEYSPACE",
+          "APITOKENVERSION",
+          // CipherTrust KMS fields
+          "KEY_ALGORITHM",
+          "KEY_SIZE",
+          "KEY_NAME");
+
+  public static final Map<Character, Character> CHAR_MAP =
+      Map.ofEntries(
+          entry('A', '#'),
+          entry('B', '@'),
+          entry('C', '*'),
+          entry('D', '$'),
+          entry('E', '%'),
+          entry('F', '^'),
+          entry('G', '&'),
+          entry('H', '!'),
+          entry('I', '~'),
+          entry('J', '+'),
+          entry('K', '-'),
+          entry('L', '='),
+          entry('M', ':'),
+          entry('N', ';'),
+          entry('O', '?'),
+          entry('P', '<'),
+          entry('Q', '>'),
+          entry('R', '('),
+          entry('S', ')'),
+          entry('T', '{'),
+          entry('U', '}'),
+          entry('V', '['),
+          entry('W', ']'),
+          entry('X', '/'),
+          entry('Y', '|'),
+          entry('Z', '.'),
+          entry('a', '#'),
+          entry('b', '@'),
+          entry('c', '*'),
+          entry('d', '$'),
+          entry('e', '%'),
+          entry('f', '^'),
+          entry('g', '&'),
+          entry('h', '!'),
+          entry('i', '~'),
+          entry('j', '+'),
+          entry('k', '-'),
+          entry('l', '='),
+          entry('m', ':'),
+          entry('n', ';'),
+          entry('o', '?'),
+          entry('p', '<'),
+          entry('q', '>'),
+          entry('r', '('),
+          entry('s', ')'),
+          entry('t', '{'),
+          entry('u', '}'),
+          entry('v', '['),
+          entry('w', ']'),
+          entry('x', '/'),
+          entry('y', '|'),
+          entry('z', '.'),
+          entry('0', '\''),
+          entry('1', '\''),
+          entry('2', '\''),
+          entry('3', '\''),
+          entry('4', '\''),
+          entry('5', '\''),
+          entry('6', '\''),
+          entry('7', '\''),
+          entry('8', '\''),
+          entry('9', '\''),
+          entry(' ', '\''));
+
+  public static final String FIPS_ENABLED = "yb.fips.enabled";
 
   /**
    * Checks whether the field name represents a field with a sensitive data or not.
@@ -123,6 +205,12 @@ public class CommonUtils {
     // Can add more exclusions if required
     if (excludedFieldNames.contains(ucFieldname)) {
       return false;
+    }
+
+    // Exact-name matches: used when a substring would be too broad.
+    // e.g. "token" must match but "authTokenIssueDate" must not.
+    if (sensitiveFieldExactNames.contains(ucFieldname)) {
+      return true;
     }
 
     // Check if any of sensitiveFieldSubstrings are substrings in ucFieldname and mark as sensitive
@@ -175,6 +263,13 @@ public class CommonUtils {
     return isStrictlySensitiveField(key) || (value == null) || value.length() < 5
         ? MASKED_FIELD_VALUE
         : value.replaceAll(maskRegex, "*");
+  }
+
+  public static String getEmptiableMaskedValue(String key, String value) {
+    if (StringUtils.isBlank(value)) {
+      return "";
+    }
+    return getMaskedValue(key, value);
   }
 
   public static JsonNode getMaskedValue(JsonNode value, List<String> toMaskKeys) {
@@ -488,12 +583,11 @@ public class CommonUtils {
       List<T> list, T entry, BiFunction<T, T, Boolean> equalityCheck) {
     if (list instanceof BeanList) {
       BeanList<T> beanList = (BeanList<T>) list;
-      Set<T> removedBeans = beanList.getModifyRemovals();
+      Set<T> removedBeans = beanList.modifyRemovals();
       if (CollectionUtils.isEmpty(removedBeans)) {
         return null;
       }
-      return removedBeans
-          .stream()
+      return removedBeans.stream()
           .filter(e -> equalityCheck.apply(e, entry))
           .findFirst()
           .orElse(null);
@@ -561,12 +655,11 @@ public class CommonUtils {
   }
 
   public static long getDurationSeconds(Date startTime, Date endTime) {
-    return getDurationSeconds(startTime.toInstant(), endTime.toInstant());
+    return getElapsedTime(startTime.toInstant(), endTime.toInstant(), ChronoUnit.SECONDS);
   }
 
-  public static long getDurationSeconds(Instant startTime, Instant endTime) {
-    Duration duration = Duration.between(startTime, endTime);
-    return duration.getSeconds();
+  public static long getElapsedTime(Instant startTime, Instant endTime, TemporalUnit unit) {
+    return unit.between(startTime, endTime);
   }
 
   /**
@@ -589,9 +682,7 @@ public class CommonUtils {
             .flatMap(map -> map.entrySet().stream())
             .map(entry -> new Pair<>(entry.getKey(), entry.getValue()))
             .collect(Collectors.groupingBy(Function.identity(), Collectors.counting()));
-    return pairCount
-        .entrySet()
-        .stream()
+    return pairCount.entrySet().stream()
         .filter(entry -> entry.getValue() == mapsCount)
         .map(Map.Entry::getKey)
         .collect(Collectors.toMap(Pair::getFirst, Pair::getSecond));
@@ -611,6 +702,22 @@ public class CommonUtils {
         && isReleaseBefore(maxRelease, actualRelease);
   }
 
+  public static boolean isReleaseEqual(String thresholdRelease, String actualRelease) {
+    return compareReleases(thresholdRelease, actualRelease, false, false, true);
+  }
+
+  /**
+   * This method compares 2 version strings. Make sure to only compare stable with stable and
+   * preview with preview if using this function. If you are not sure of either, use method {@link
+   * com.yugabyte.yw.common.Util#compareYBVersions}.
+   *
+   * @param thresholdRelease
+   * @param actualRelease
+   * @param beforeMatches
+   * @param afterMatches
+   * @param equalMatches
+   * @return
+   */
   private static boolean compareReleases(
       String thresholdRelease,
       String actualRelease,
@@ -629,9 +736,16 @@ public class CommonUtils {
           actualRelease);
       return afterMatches;
     }
-    for (int i = 1; i < 5; i++) {
-      int thresholdPart = Integer.parseInt(thresholdMatcher.group(i));
-      int actualPart = Integer.parseInt(actualMatcher.group(i));
+    for (int i = 1; i < 6; i++) {
+      String thresholdPartStr = thresholdMatcher.group(i);
+      String actualPartStr = actualMatcher.group(i);
+      if (i == 5) {
+        // Build number.
+        thresholdPartStr = String.valueOf(convertBuildNumberForComparison(thresholdPartStr, true));
+        actualPartStr = String.valueOf(convertBuildNumberForComparison(actualPartStr, false));
+      }
+      int thresholdPart = Integer.parseInt(thresholdPartStr);
+      int actualPart = Integer.parseInt(actualPartStr);
       if (actualPart > thresholdPart) {
         return afterMatches;
       }
@@ -641,6 +755,20 @@ public class CommonUtils {
     }
     // Equal releases.
     return equalMatches;
+  }
+
+  private static int convertBuildNumberForComparison(String buildNumberStr, boolean threshold) {
+    if (StringUtils.isEmpty(buildNumberStr) || !buildNumberStr.startsWith("-b")) {
+      // Threshold without a build or with invalid build is treated as -b0,
+      // while actual build is custom build and is always treated as later build.
+      return threshold ? 0 : Integer.MAX_VALUE;
+    }
+    try {
+      return Integer.parseInt(buildNumberStr.substring(2));
+    } catch (Exception e) {
+      // Same logic as above.
+      return threshold ? 0 : Integer.MAX_VALUE;
+    }
   }
 
   @FunctionalInterface
@@ -667,51 +795,114 @@ public class CommonUtils {
     return isAnnotatedWith(clazz.getSuperclass(), annotationClass);
   }
 
-  /**
-   * Prints the stack for called function
-   *
-   * @return printable string of stack information.
-   */
-  public static String getStackTraceHere() {
-    String rVal;
-    rVal = "***Stack trace Here****:\n";
-    StackTraceElement[] elements = Thread.currentThread().getStackTrace();
-    int depth = elements.length;
-    if (depth > 10) depth = 10; // limit stack trace length
-    for (int i = 2; i < depth; i++) {
-      StackTraceElement s = elements[i];
-      rVal += "\tat " + s.getClassName() + "." + s.getMethodName();
-      rVal += "(" + s.getFileName() + ":" + s.getLineNumber() + ")\n";
-    }
-    return rVal;
-  }
-
   public static NodeDetails getARandomLiveTServer(Universe universe) {
     UniverseDefinitionTaskParams.Cluster primaryCluster =
         universe.getUniverseDetails().getPrimaryCluster();
+    NodeDetails randomLiveTServer =
+        getARandomLiveTServer(universe.getUniverseDetails().getNodesInCluster(primaryCluster.uuid));
+    if (randomLiveTServer == null) {
+      throw new IllegalStateException(
+          "No live TServers found for Universe UUID: " + universe.getUniverseUUID());
+    }
+    return randomLiveTServer;
+  }
+
+  public static NodeDetails getServerToRunYsqlQuery(Universe universe) {
+    return getServerToRunYsqlQuery(universe, false);
+  }
+
+  public static NodeDetails getServerToRunYsqlQuery(Universe universe, boolean useToBeRemoved) {
+    // Prefer the master leader since that will result in a faster query.
+    // If the master leader is not a tserver - prefer tserver in the same region.
+    // If no tserver in the same region either - use random live tserver.
+    NodeDetails masterLeader = universe.getMasterLeaderNode();
+    if (masterLeader != null) {
+      if (masterLeader.isTserver) {
+        // If master leader is a TServer - use that.
+        return masterLeader;
+      }
+      UniverseDefinitionTaskParams.Cluster primaryCluster =
+          universe.getUniverseDetails().getPrimaryCluster();
+      List<NodeDetails> sameRegionNodes =
+          universe.getUniverseDetails().getNodesInCluster(primaryCluster.uuid).stream()
+              .filter(n -> n.getRegion().equals(masterLeader.getRegion()))
+              .toList();
+      NodeDetails sameRegionTServer;
+      if (useToBeRemoved) {
+        sameRegionTServer = getARandomLiveOrToBeRemovedTServer(sameRegionNodes);
+      } else {
+        sameRegionTServer = getARandomLiveTServer(sameRegionNodes);
+      }
+      if (sameRegionTServer != null) {
+        // Live TServer present in master leader region - use that.
+        return sameRegionTServer;
+      }
+    }
+    if (useToBeRemoved) {
+      return getARandomLiveOrToBeRemovedTServer(universe);
+    }
+    return getARandomLiveTServer(universe);
+  }
+
+  private static NodeDetails getARandomLiveTServer(Collection<NodeDetails> nodes) {
     List<NodeDetails> tserverLiveNodes =
-        universe
-            .getUniverseDetails()
-            .getNodesInCluster(primaryCluster.uuid)
-            .stream()
+        nodes.stream()
             .filter(nodeDetails -> nodeDetails.isTserver)
             .filter(nodeDetails -> nodeDetails.state == NodeState.Live)
             .collect(Collectors.toList());
     if (tserverLiveNodes.isEmpty()) {
-      throw new IllegalStateException(
-          "No live TServers found for Universe UUID: " + universe.universeUUID);
+      return null;
     }
     return tserverLiveNodes.get(new Random().nextInt(tserverLiveNodes.size()));
   }
 
-  public static NodeDetails getServerToRunYsqlQuery(Universe universe) {
-    // Prefer the master leader since that will result in a faster query.
-    // If the leader does not have a tserver process though, select any random tserver.
-    NodeDetails nodeToUse = universe.getMasterLeaderNode();
-    if (nodeToUse == null || !nodeToUse.isTserver) {
-      nodeToUse = getARandomLiveTServer(universe);
+  public static NodeDetails getARandomLiveOrToBeRemovedTServer(Universe universe) {
+    NodeDetails randomLiveOrRemovedTServer =
+        getARandomLiveOrToBeRemovedTServer(universe.getTServersInPrimaryCluster());
+    if (randomLiveOrRemovedTServer == null) {
+      throw new IllegalStateException(
+          "No live or toBeRemoved TServers found for Universe UUID: " + universe.getUniverseUUID());
     }
-    return nodeToUse;
+    return randomLiveOrRemovedTServer;
+  }
+
+  public static UniverseDefinitionTaskParams.ClusterType getClusterType(
+      Provider provider, Universe universe) {
+    String primaryUUIDStr = universe.getUniverseDetails().getPrimaryCluster().userIntent.provider;
+    return provider.getUuid().toString().equals(primaryUUIDStr)
+        ? UniverseDefinitionTaskParams.ClusterType.PRIMARY
+        : UniverseDefinitionTaskParams.ClusterType.ASYNC;
+  }
+
+  private static NodeDetails getARandomLiveOrToBeRemovedTServer(Collection<NodeDetails> nodes) {
+    List<NodeDetails> tserverLiveNodes =
+        nodes.stream()
+            .filter(nodeDetails -> nodeDetails.isTserver)
+            .filter(nodeDetails -> nodeDetails.state == NodeState.Live)
+            .collect(Collectors.toList());
+    if (tserverLiveNodes.isEmpty()) {
+      tserverLiveNodes =
+          nodes.stream()
+              .filter(nodeDetails -> nodeDetails.isTserver)
+              .filter(nodeDetails -> nodeDetails.state == NodeState.ToBeRemoved)
+              .collect(Collectors.toList());
+    }
+    if (tserverLiveNodes.isEmpty()) {
+      return null;
+    }
+    return tserverLiveNodes.get(new Random().nextInt(tserverLiveNodes.size()));
+  }
+
+  public static String logTableName(String tableName) {
+    if (StringUtils.isBlank(tableName)) {
+      return "";
+    }
+    char[] logTableName = new char[tableName.length() * 2];
+    for (int i = 0; i < tableName.length(); i++) {
+      logTableName[2 * i] = tableName.charAt(i);
+      logTableName[2 * i + 1] = CHAR_MAP.getOrDefault(tableName.charAt(i), tableName.charAt(i));
+    }
+    return new String(logTableName).trim();
   }
 
   /**
@@ -720,19 +911,29 @@ public class CommonUtils {
    * response on line number 3
    */
   public static String extractJsonisedSqlResponse(ShellResponse shellResponse) {
-    String data = null;
-    if (shellResponse.message != null && !shellResponse.message.isEmpty()) {
-      Scanner scanner = new Scanner(shellResponse.message);
-      int i = 0;
-      while (scanner.hasNextLine()) {
-        data = new String(scanner.nextLine());
-        if (i++ == 3) {
-          break;
+    StringBuilder data = new StringBuilder();
+    if (StringUtils.isNotBlank(shellResponse.message)) {
+      try (Scanner scanner = new Scanner(shellResponse.message)) {
+        boolean headerStarted = false;
+        while (scanner.hasNextLine()) {
+          String line = scanner.nextLine();
+          if (!headerStarted && !line.startsWith("-")) {
+            // Read till header start
+            continue;
+          } else if (line.startsWith("-")) {
+            // Read '------...' header
+            headerStarted = true;
+            continue;
+          }
+          if (line.startsWith("(1 row)")) {
+            // jsonb_agg(x) always returns 1 row - it's the last line
+            break;
+          }
+          data.append(line);
         }
       }
-      scanner.close();
     }
-    return data;
+    return data.toString();
   }
 
   /**
@@ -764,8 +965,57 @@ public class CommonUtils {
     return stateLogMsg;
   }
 
-  /** Get the user sending the API request from the HTTP context. */
-  public static Users getUserFromContext(Http.Context ctx) {
-    return ((UserWithFeatures) ctx.args.get("user")).getUser();
+  /**
+   * Get the user sending the API request from the HTTP context. It throws exception if the context
+   * is not set.
+   */
+  public static Users getUserFromContext() {
+    return RequestContext.get(TokenAuthenticator.USER).getUser();
+  }
+
+  /** Get the user sending the API request from the HTTP context if present. */
+  public static Optional<Users> maybeGetUserFromContext() {
+    UserWithFeatures value = RequestContext.getIfPresent(TokenAuthenticator.USER);
+    return value == null ? Optional.empty() : Optional.ofNullable(value.getUser());
+  }
+
+  public static boolean isAutoFlagSupported(String dbVersion) {
+    return isReleaseEqualOrAfter(MIN_PROMOTE_AUTO_FLAG_RELEASE, dbVersion);
+  }
+
+  // Only replace path at the beginning.
+  public static String replaceBeginningPath(
+      String pathToModify, String initialRoot, String finalRoot) {
+    String regex = "^" + Pattern.quote(initialRoot);
+    return pathToModify.replaceAll(regex, finalRoot);
+  }
+
+  public static Optional<String> getEnvBothCase(String var) {
+    String ret = System.getenv(var);
+    if (StringUtils.isBlank(ret)) {
+      ret = System.getenv(var.toUpperCase());
+      if (StringUtils.isBlank(ret)) {
+        ret = null;
+      }
+    }
+    return Optional.ofNullable(ret);
+  }
+
+  public static void logEnvVar(String name) {
+    Optional<String> value = getEnvBothCase(name);
+    if (value.isEmpty()) {
+      log.info("Environment variable '{}' is not set", name);
+    } else {
+      log.info("Environment variable '{}' is set to '{}'", name, value.get());
+    }
+  }
+
+  public static void logSystemProperty(String name) {
+    String value = System.getProperty(name);
+    if (value == null) {
+      log.info("System property '{}' is not set", name);
+    } else {
+      log.info("System property '{}' is set to '{}'", name, value);
+    }
   }
 }

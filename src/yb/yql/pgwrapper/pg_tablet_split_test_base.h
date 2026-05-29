@@ -1,4 +1,4 @@
-// Copyright (c) YugaByte, Inc.
+// Copyright (c) YugabyteDB, Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License"); you may not use this file except
 // in compliance with the License.  You may obtain a copy of the License at
@@ -21,7 +21,7 @@
 namespace yb {
 namespace pgwrapper {
 
-using PartitionKeyTabletMap = std::map<std::string_view, master::TabletInfoPtr>;
+using PartitionKeyTabletMap = std::map<std::string, master::TabletInfoPtr>;
 using VerifyTabletsCallback = std::function<Status(const PartitionKeyTabletMap&)>;
 using SelectTabletCallback =
     std::function<Result<master::TabletInfoPtr>(const PartitionKeyTabletMap& tablets)>;
@@ -58,23 +58,22 @@ class PgTabletSplitTestBase : public PgMiniTestBase {
  protected:
   void SetUp() override;
 
+  Result<TabletId> GetOnlyTabletId(const TableId& table_id);
+  Status SplitTablet(const TabletId& tablet_id);
   Status SplitSingleTablet(const TableId& table_id);
-  Status InvokeSplitTabletRpc(const std::string& tablet_id);
-  Status InvokeSplitTabletRpcAndWaitForSplitCompleted(const std::string& tablet_id);
-  Status InvokeSplitsAndWaitForCompletion(
+  Status SplitSingleTabletAndWaitForActiveChildTablets(const TableId& table_id);
+  Status InvokeSplitsAndWaitForDataCompacted(
       const TableId& table_id, SelectTabletCallback select_tablet);
   Status DisableCompaction(std::vector<tablet::TabletPeerPtr>* peers);
 
- private:
-  virtual size_t NumTabletServers() override;
+  Status WaitForSplitCompletion(const TableId& table_id, size_t expected_active_leaders = 2);
 
-  Status DoInvokeSplitTabletRpcAndWaitForCompletion(
-    const master::TableInfoPtr& table_info, const master::TabletInfoPtr& tablet_info);
+  virtual size_t NumTabletServers() override;
 
   std::unique_ptr<rpc::ProxyCache> proxy_cache_;
 };
 
-PartitionKeyTabletMap GetTabletsByPartitionKey(const master::TableInfoPtr& table);
+Result<PartitionKeyTabletMap> GetTabletsByPartitionKey(const master::TableInfoPtr& table);
 
 } // namespace pgwrapper
 } // namespace yb

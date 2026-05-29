@@ -1,4 +1,4 @@
-// Copyright (c) YugaByte, Inc.
+// Copyright (c) YugabyteDB, Inc.
 
 package com.yugabyte.yw.metrics;
 
@@ -28,6 +28,7 @@ public class MetricQueryExecutor implements Callable<JsonNode> {
 
   private final MetricUrlProvider metricUrlProvider;
 
+  private final Map<String, String> headers = new HashMap<>();
   private final Map<String, String> queryParam = new HashMap<>();
   private final Map<String, String> additionalFilters = new HashMap<>();
   private int queryRangeSecs = 0;
@@ -38,11 +39,13 @@ public class MetricQueryExecutor implements Callable<JsonNode> {
   public MetricQueryExecutor(
       MetricUrlProvider metricUrlProvider,
       ApiHelper apiHelper,
+      Map<String, String> headers,
       Map<String, String> queryParam,
       Map<String, String> additionalFilters) {
     this(
         metricUrlProvider,
         apiHelper,
+        headers,
         queryParam,
         additionalFilters,
         MetricSettings.defaultSettings(queryParam.get("queryKey")),
@@ -52,12 +55,14 @@ public class MetricQueryExecutor implements Callable<JsonNode> {
   public MetricQueryExecutor(
       MetricUrlProvider metricUrlProvider,
       ApiHelper apiHelper,
+      Map<String, String> headers,
       Map<String, String> queryParam,
       Map<String, String> additionalFilters,
       MetricSettings metricSettings,
       boolean isRecharts) {
     this.apiHelper = apiHelper;
     this.metricUrlProvider = metricUrlProvider;
+    this.headers.putAll(headers);
     this.queryParam.putAll(queryParam);
     this.additionalFilters.putAll(additionalFilters);
     this.metricSettings = metricSettings;
@@ -78,20 +83,22 @@ public class MetricQueryExecutor implements Callable<JsonNode> {
   private JsonNode getMetrics(Map<String, String> queryParam) {
     String queryUrl;
     if (queryParam.containsKey("end")) {
-      queryUrl = metricUrlProvider.getMetricsUrl() + "/query_range";
+      queryUrl = metricUrlProvider.getMetricsApiUrl() + "/query_range";
     } else {
-      queryUrl = metricUrlProvider.getMetricsUrl() + "/query";
+      queryUrl = metricUrlProvider.getMetricsApiUrl() + "/query";
     }
 
     log.trace("Executing metric query {}: {}", queryUrl, queryParam);
-    return apiHelper.getRequest(queryUrl, new HashMap<>(), queryParam);
+    return apiHelper.getRequest(queryUrl, headers, queryParam);
   }
 
-  private String getDirectURL(String queryExpr) {
+  private String getDirectURL(List<String> queryExpr) {
     long endUnixTime = Long.parseLong(queryParam.getOrDefault("end", "0"));
     long startUnixTime = Long.parseLong(queryParam.getOrDefault("start", "0"));
+    String stepStr = queryParam.get("step");
+    Long step = stepStr != null ? Long.parseLong(stepStr) : null;
 
-    return metricUrlProvider.getExpressionUrl(queryExpr, startUnixTime, endUnixTime);
+    return metricUrlProvider.getExpressionUrl(queryExpr, startUnixTime, endUnixTime, step);
   }
 
   @Override
@@ -125,11 +132,7 @@ public class MetricQueryExecutor implements Callable<JsonNode> {
         if (metricSettings.isReturnAggregatedValue()) {
           try {
             MetricQueryContext aggregatedContext =
-                context
-                    .toBuilder()
-                    .removeGroupBy(context.getAdditionalGroupBy())
-                    .additionalGroupBy(Collections.emptySet())
-                    .build();
+                context.toBuilder().secondLevelAggregation(true).build();
             aggregatedQueries = configDefinition.getQueries(this.metricSettings, aggregatedContext);
           } catch (Exception e) {
             log.error("Error while generating aggregated queries for " + metricName, e);
@@ -144,6 +147,9 @@ public class MetricQueryExecutor implements Callable<JsonNode> {
       MetricRechartsGraphData rechartsOutput = new MetricRechartsGraphData();
       List<MetricGraphData> output = new ArrayList<>();
       ArrayNode directURLs = responseJson.putArray("directURLs");
+      responseJson.put(
+          "metricsLinkUseBrowserFqdn", metricUrlProvider.getMetricsLinkUseBrowserFqdn());
+      List<String> queryExpressions = new ArrayList<>();
       for (Map.Entry<String, String> e : queries.entrySet()) {
         String metric = e.getKey();
         String queryExpr = e.getValue();
@@ -157,15 +163,14 @@ public class MetricQueryExecutor implements Callable<JsonNode> {
         }
         queryParam.put("query", queryExpr);
         try {
-          directURLs.add(getDirectURL(queryExpr));
+          queryExpressions.add(queryExpr);
         } catch (Exception de) {
           log.trace("Error getting direct url", de);
         }
         JsonNode queryResponseJson = getMetrics();
         if (queryResponseJson == null) {
-          responseJson.set("data", Json.toJson(new ArrayList<>()));
-
-          return responseJson;
+          responseJson.put("error", "Metric storage response for " + metric + " is empty");
+          break;
         }
         MetricQueryResponse queryResponse =
             Json.fromJson(queryResponseJson, MetricQueryResponse.class);
@@ -176,6 +181,7 @@ public class MetricQueryExecutor implements Callable<JsonNode> {
           output.addAll(queryResponse.getGraphData(metric, configDefinition, metricSettings));
         }
       }
+      directURLs.add(getDirectURL(queryExpressions));
       if (isRecharts) {
         responseJson.set("data", Json.toJson(rechartsOutput));
       } else {
@@ -205,17 +211,30 @@ public class MetricQueryExecutor implements Callable<JsonNode> {
     return configDefinition.getQueries(this.metricSettings, context);
   }
 
-  private Set<String> getAdditionalGroupBy(MetricSettings metricSettings) {
+  public static Set<String> getAdditionalGroupBy(MetricSettings metricSettings) {
     switch (metricSettings.getSplitType()) {
       case NODE:
+        // For container volume metrics, use pvc instead of exported_instance
+        if (metricSettings
+            .getMetric()
+            .startsWith(MetricQueryHelper.CONTAINER_VOLUME_METRIC_PREFIX)) {
+          return ImmutableSet.of(
+              MetricQueryHelper.PVC, MetricQueryHelper.NAMESPACE, MetricQueryHelper.AZ_NAME);
+        }
+        // For container metrics, use pod_name instead of exported_instance
+        if (metricSettings.getMetric().startsWith(MetricQueryHelper.CONTAINER_METRIC_PREFIX)) {
+          return ImmutableSet.of(
+              MetricQueryHelper.POD_NAME, MetricQueryHelper.NAMESPACE, MetricQueryHelper.AZ_NAME);
+        }
         return ImmutableSet.of(MetricQueryHelper.EXPORTED_INSTANCE);
       case TABLE:
         return ImmutableSet.of(
             MetricQueryHelper.NAMESPACE_NAME,
+            MetricQueryHelper.NAMESPACE_ID,
             MetricQueryHelper.TABLE_ID,
             MetricQueryHelper.TABLE_NAME);
       case NAMESPACE:
-        return ImmutableSet.of(MetricQueryHelper.NAMESPACE_NAME);
+        return ImmutableSet.of(MetricQueryHelper.NAMESPACE_NAME, MetricQueryHelper.NAMESPACE_ID);
       default:
         return Collections.emptySet();
     }

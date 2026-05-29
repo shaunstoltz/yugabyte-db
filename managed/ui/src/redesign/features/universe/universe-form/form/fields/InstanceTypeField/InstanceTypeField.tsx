@@ -1,25 +1,48 @@
-import React, { ChangeEvent, FC } from 'react';
+import { ChangeEvent, ReactElement } from 'react';
 import pluralize from 'pluralize';
 import { useQuery } from 'react-query';
-import { useUpdateEffect } from 'react-use';
 import { useTranslation } from 'react-i18next';
+import { useUpdateEffect } from 'react-use';
 import { Controller, useFormContext, useWatch } from 'react-hook-form';
 import { Box } from '@material-ui/core';
-import { YBLabel, YBAutoComplete, YBHelper, YBHelperVariants } from '../../../../../../components';
+import {
+  YBLabel,
+  YBAutoComplete,
+  YBHelper,
+  YBHelperVariants,
+  YBToggleField
+} from '../../../../../../components';
 import { api, QUERY_KEY } from '../../../utils/api';
 import {
   sortAndGroup,
   getDefaultInstanceType,
-  isEphemeralAwsStorageInstance
+  isEphemeralAwsStorageInstance,
+  canUseSpotInstance
 } from './InstanceTypeFieldHelper';
+import { NodeType } from '../../../../../../utils/dtos';
+import { IsOsPatchingEnabled } from '../../../../../../../components/configRedesign/providerRedesign/components/linuxVersionCatalog/LinuxVersionUtils';
+import { useGetAllZones } from '../PlacementsField/PlacementsFieldHelper';
+
 import {
   CloudType,
   InstanceType,
   InstanceTypeWithGroup,
+  MasterPlacementMode,
+  Placement,
   StorageType,
   UniverseFormData
 } from '../../../utils/dto';
-import { INSTANCE_TYPE_FIELD, PROVIDER_FIELD, DEVICE_INFO_FIELD } from '../../../utils/constants';
+import {
+  INSTANCE_TYPE_FIELD,
+  PROVIDER_FIELD,
+  DEVICE_INFO_FIELD,
+  MASTER_INSTANCE_TYPE_FIELD,
+  MASTER_DEVICE_INFO_FIELD,
+  MASTER_PLACEMENT_FIELD,
+  SPOT_INSTANCE_FIELD,
+  CPU_ARCHITECTURE_FIELD
+} from '../../../utils/constants';
+import { useFormFieldStyles } from '../../../universeMainStyle';
 
 const getOptionLabel = (op: Record<string, string>): string => {
   if (!op) return '';
@@ -37,16 +60,36 @@ const renderOption = (option: Record<string, string>) => {
   return <>{getOptionLabel(option)}</>;
 };
 
-export const InstanceTypeField: FC = () => {
+interface InstanceTypeFieldProps {
+  isEditMode?: boolean;
+  isMaster?: boolean;
+  disabled: boolean;
+}
+
+export const InstanceTypeField = ({
+  isEditMode,
+  isMaster,
+  disabled
+}: InstanceTypeFieldProps): ReactElement => {
   const { control, setValue, getValues } = useFormContext<UniverseFormData>();
+  const classes = useFormFieldStyles();
   const { t } = useTranslation();
+  const nodeTypeTag = isMaster ? NodeType.Master : NodeType.TServer;
+
+  // To set value based on master or tserver field in dedicated mode
+  const UPDATE_FIELD = isMaster ? MASTER_INSTANCE_TYPE_FIELD : INSTANCE_TYPE_FIELD;
 
   //watchers
   const provider = useWatch({ name: PROVIDER_FIELD });
-  const deviceInfo = useWatch({ name: DEVICE_INFO_FIELD });
+  const cpuArch = useWatch({ name: CPU_ARCHITECTURE_FIELD });
 
+  const deviceInfo = isMaster
+    ? useWatch({ name: MASTER_DEVICE_INFO_FIELD })
+    : useWatch({ name: DEVICE_INFO_FIELD });
+  const masterPlacement = useWatch({ name: MASTER_PLACEMENT_FIELD });
+  const zones = useGetAllZones().map((zone: Placement) => zone.name);
   const handleChange = (e: ChangeEvent<{}>, option: any) => {
-    setValue(INSTANCE_TYPE_FIELD, option?.instanceTypeCode, { shouldValidate: true });
+    setValue(UPDATE_FIELD, option?.instanceTypeCode, { shouldValidate: true });
   };
 
   //fetch run time configs
@@ -57,18 +100,35 @@ export const InstanceTypeField: FC = () => {
     api.fetchRunTimeConfigs(true, provider?.uuid)
   );
 
+  const isOsPatchingEnabled = IsOsPatchingEnabled();
+
   const { data, isLoading, refetch } = useQuery(
-    [QUERY_KEY.getInstanceTypes, provider?.uuid],
-    () => api.getInstanceTypes(provider?.uuid),
+    [
+      QUERY_KEY.getInstanceTypes,
+      provider?.uuid,
+      JSON.stringify(zones),
+      isOsPatchingEnabled ? cpuArch : null
+    ],
+    () => api.getInstanceTypes(provider?.uuid, zones, isOsPatchingEnabled ? cpuArch : null),
     {
-      enabled: !!provider?.uuid,
+      enabled: !!provider?.uuid && zones.length > 0,
       onSuccess: (data) => {
+        if (!data.length) return;
+
+        const currentInstanceType = getValues(UPDATE_FIELD);
+
+        //do instance type exists on the last fetched list
+        const instanceExists = (instanceType: string) =>
+          !!data.find(
+            (instance: InstanceType) => instance.instanceTypeCode === instanceType // default instance type exists in the list
+          );
+
         // set default/first item as instance type after provider changes
-        if (!getValues(INSTANCE_TYPE_FIELD) && provider?.code && data.length) {
-          const defaultInstanceType =
-            getDefaultInstanceType(provider.code, providerRuntimeConfigs) ??
-            data[0].instanceTypeCode;
-          setValue(INSTANCE_TYPE_FIELD, defaultInstanceType, { shouldValidate: true });
+        if (!currentInstanceType || !instanceExists(currentInstanceType)) {
+          const defaultInstanceType = getDefaultInstanceType(provider.code, providerRuntimeConfigs);
+          if (instanceExists(defaultInstanceType))
+            setValue(UPDATE_FIELD, defaultInstanceType, { shouldValidate: true });
+          else setValue(UPDATE_FIELD, data[0].instanceTypeCode, { shouldValidate: true });
         }
       }
     }
@@ -78,18 +138,18 @@ export const InstanceTypeField: FC = () => {
     const getProviderRuntimeConfigs = async () => {
       await providerConfigsRefetch();
       //Reset instance type after provider change
-      setValue(INSTANCE_TYPE_FIELD, null);
+      setValue(UPDATE_FIELD, null);
       //refetch instances based on changed provider
       refetch();
     };
     getProviderRuntimeConfigs();
-  }, [provider]);
+  }, [provider?.uuid]);
 
   const instanceTypes = sortAndGroup(data, provider?.code);
 
   return (
     <Controller
-      name={INSTANCE_TYPE_FIELD}
+      name={UPDATE_FIELD}
       control={control}
       rules={{
         required: t('universeForm.validation.required', {
@@ -110,37 +170,77 @@ export const InstanceTypeField: FC = () => {
           deviceInfo?.storageType === StorageType.Scratch;
 
         return (
-          <Box display="flex" width="100%" data-testid="InstanceTypeField-Container">
-            <YBLabel dataTestId="InstanceTypeField-Label">
-              {t('universeForm.instanceConfig.instanceType')}
-            </YBLabel>
-            <Box flex={1}>
-              <YBAutoComplete
-                loading={isLoading}
-                value={(value as unknown) as Record<string, string>}
-                options={(instanceTypes as unknown) as Record<string, string>[]}
-                getOptionLabel={getOptionLabel}
-                renderOption={renderOption}
-                onChange={handleChange}
-                ybInputProps={{
-                  error: !!fieldState.error,
-                  helperText: fieldState.error?.message,
-                  'data-testid': 'InstanceTypeField-AutoComplete'
-                }}
-                groupBy={
-                  [CloudType.aws, CloudType.gcp, CloudType.azu].includes(provider?.code)
-                    ? (option: Record<string, string>) => option.groupName
-                    : undefined
+          <>
+            <Box
+              display="flex"
+              width="100%"
+              data-testid={`InstanceTypeField-${nodeTypeTag}-Container`}
+              mt={2}
+            >
+              <YBLabel dataTestId={`InstanceTypeField-${nodeTypeTag}-Label`}>
+                {t('universeForm.instanceConfig.instanceType')}
+              </YBLabel>
+              <Box
+                flex={1}
+                className={
+                  masterPlacement === MasterPlacementMode.COLOCATED
+                    ? classes.defaultTextBox
+                    : classes.instanceConfigTextBox
                 }
-              />
+              >
+                <YBAutoComplete
+                  loading={isLoading}
+                  disabled={disabled}
+                  value={(value as unknown) as Record<string, string>}
+                  options={(instanceTypes as unknown) as Record<string, string>[]}
+                  getOptionLabel={getOptionLabel}
+                  renderOption={renderOption}
+                  onChange={handleChange}
+                  ybInputProps={{
+                    error: !!fieldState.error,
+                    helperText: fieldState.error?.message,
+                    'data-testid': `InstanceTypeField-${nodeTypeTag}-AutoComplete`
+                  }}
+                  groupBy={
+                    [CloudType.aws, CloudType.gcp, CloudType.azu].includes(provider?.code)
+                      ? (option: Record<string, string>) => option.groupName
+                      : undefined
+                  }
+                />
 
-              {(isAWSEphemeralStorage || isGCPEphemeralStorage) && (
-                <YBHelper dataTestId="InstanceTypeField-Helper" variant={YBHelperVariants.warning}>
-                  {t('universeForm.instanceConfig.ephemeralStorage')}
-                </YBHelper>
-              )}
+                {(isAWSEphemeralStorage || isGCPEphemeralStorage) && (
+                  <YBHelper
+                    dataTestId={`InstanceTypeField-${nodeTypeTag}-Helper`}
+                    variant={YBHelperVariants.warning}
+                  >
+                    {t('universeForm.instanceConfig.ephemeralStorage')}
+                  </YBHelper>
+                )}
+              </Box>
             </Box>
-          </Box>
+            {[CloudType.aws, CloudType.gcp, CloudType.azu].includes(provider?.code) &&
+              canUseSpotInstance(providerRuntimeConfigs) && (
+                <Box display="flex" width="100%" mt={2}>
+                  <YBLabel dataTestId={`SpotInstanceField-${nodeTypeTag}-Label`}>
+                    {t('universeForm.instanceConfig.useSpotInstance')}
+                  </YBLabel>
+                  <Box
+                    flex={1}
+                    className={
+                      masterPlacement === MasterPlacementMode.COLOCATED
+                        ? classes.defaultTextBox
+                        : classes.instanceConfigTextBox
+                    }
+                  >
+                    <YBToggleField
+                      disabled={isEditMode}
+                      name={SPOT_INSTANCE_FIELD}
+                      control={control}
+                    />
+                  </Box>
+                </Box>
+              )}
+          </>
         );
       }}
     />

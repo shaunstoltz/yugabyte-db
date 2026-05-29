@@ -1,5 +1,5 @@
 /*
- * Copyright 2021 YugaByte, Inc. and Contributors
+ * Copyright 2021 YugabyteDB, Inc. and Contributors
  *
  * Licensed under the Polyform Free Trial License 1.0.0 (the "License"); you
  * may not use this file except in compliance with the License. You
@@ -12,24 +12,17 @@ package com.yugabyte.yw.common.config;
 import static com.yugabyte.yw.models.ScopedRuntimeConfig.GLOBAL_SCOPE_UUID;
 
 import com.google.common.annotations.VisibleForTesting;
-import com.typesafe.config.Config;
-import com.yugabyte.yw.common.config.impl.MetricCollectionLevelListener;
-import com.yugabyte.yw.common.config.impl.WSClientKeyListener;
+import com.yugabyte.yw.common.AppConfigHelper;
+import com.yugabyte.yw.common.config.impl.*;
 import com.yugabyte.yw.models.Customer;
+import com.yugabyte.yw.models.Provider;
 import com.yugabyte.yw.models.Universe;
-import java.util.ArrayList;
-import java.util.HashMap;
-import java.util.List;
-import java.util.Map;
-import java.util.UUID;
-import java.util.stream.Collectors;
+import java.util.*;
 import javax.inject.Inject;
 import javax.inject.Singleton;
 
 @Singleton
 public class RuntimeConfigChangeNotifier {
-
-  private static final String WS_RUNTIME_CONFIG_SUFFIX = ".ws";
 
   private final Map<String, List<RuntimeConfigChangeListener>> listenerMap = new HashMap<>();
 
@@ -40,17 +33,26 @@ public class RuntimeConfigChangeNotifier {
 
   @Inject
   public RuntimeConfigChangeNotifier(
-      Config config, MetricCollectionLevelListener metricCollectionLevelListener) {
-    List<String> refreshableClients =
-        config
-            .getStringList(RuntimeConfService.INCLUDED_OBJECTS_KEY)
-            .stream()
-            .filter(object -> object.endsWith(WS_RUNTIME_CONFIG_SUFFIX))
-            .collect(Collectors.toList());
+      AccessLogExcludeListener accessLogExcludeListener,
+      LogWSRequestsListener logWSRequestsListener,
+      MetricCollectionLevelListener metricCollectionLevelListener,
+      MonitoredMountRootsListener monitoredMountRootsListener,
+      UseNewRbacAuthzListener useNewRbacAuthzListener,
+      BootstrapRequiredRpcPoolMaxThreadListener bootstrapRequiredRpcPoolMaxThreadListener,
+      CpuUsageIntervalListener cpuUsageIntervalListener,
+      MetricsScrapeIntervalStandbyListener metricsScrapeIntervalStandbyListener) {
+    List<String> refreshableClients = AppConfigHelper.getRefreshableClients();
     for (String wsClientKey : refreshableClients) {
       addListener(new WSClientKeyListener(wsClientKey));
     }
+    addListener(accessLogExcludeListener);
+    addListener(logWSRequestsListener);
     addListener(metricCollectionLevelListener);
+    addListener(monitoredMountRootsListener);
+    addListener(useNewRbacAuthzListener);
+    addListener(bootstrapRequiredRpcPoolMaxThreadListener);
+    addListener(cpuUsageIntervalListener);
+    addListener(metricsScrapeIntervalStandbyListener);
   }
 
   public void notifyListeners(UUID scopeUUID, String path) {
@@ -64,13 +66,18 @@ public class RuntimeConfigChangeNotifier {
       Customer customer = Customer.get(scopeUUID);
       if (customer != null) {
         listeners.forEach(listener -> listener.processCustomer(customer));
-      } else {
-        Universe.maybeGet(scopeUUID)
-            .ifPresent(
-                universe -> {
-                  listeners.forEach(listener -> listener.processUniverse(universe));
-                });
+        return;
       }
+      Provider provider = Provider.get(scopeUUID);
+      if (provider != null) {
+        listeners.forEach(listener -> listener.processProvider(provider));
+        return;
+      }
+      Universe.maybeGet(scopeUUID)
+          .ifPresent(
+              universe -> {
+                listeners.forEach(listener -> listener.processUniverse(universe));
+              });
     }
   }
 }

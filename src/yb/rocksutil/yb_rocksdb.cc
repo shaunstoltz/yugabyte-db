@@ -1,4 +1,4 @@
-// Copyright (c) YugaByte, Inc.
+// Copyright (c) YugabyteDB, Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License"); you may not use this file except
 // in compliance with the License.  You may obtain a copy of the License at
@@ -16,12 +16,7 @@
 
 #include "yb/util/bytes_formatter.h"
 
-using std::shared_ptr;
 using std::string;
-using strings::Substitute;
-
-using yb::FormatBytesAsStr;
-using yb::QuotesType;
 
 namespace yb {
 

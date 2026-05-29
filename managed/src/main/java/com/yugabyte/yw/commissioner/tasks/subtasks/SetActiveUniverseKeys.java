@@ -1,4 +1,4 @@
-// Copyright (c) Yugabyte, Inc.
+// Copyright (c) YugabyteDB, Inc.
 package com.yugabyte.yw.commissioner.tasks.subtasks;
 
 import com.yugabyte.yw.commissioner.AbstractTaskBase;
@@ -31,7 +31,7 @@ public class SetActiveUniverseKeys extends AbstractTaskBase {
   @Override
   public void run() {
     try {
-      Universe u = Universe.getOrBadRequest(taskParams().universeUUID);
+      Universe u = Universe.getOrBadRequest(taskParams().getUniverseUUID());
       setUniverseKeys.setUniverseKey(u, SET_ACTIVE_KEYS_FORCEFULLY);
     } catch (Exception e) {
       throw e;

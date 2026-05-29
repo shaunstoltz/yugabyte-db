@@ -1,16 +1,16 @@
-import React, { FC, useEffect, useState } from 'react';
+import { FC, useEffect, useState } from 'react';
 import { MenuItem, Dropdown } from 'react-bootstrap';
 import { useTranslation } from 'react-i18next';
 import { useQuery } from 'react-query';
 import { fetchProviderList } from '../../../api/admin';
-import { RunTimeConfigScope, RuntimeConfigScopeProps } from '../../../redesign/helpers/dtos';
+import { RunTimeConfigScope, RuntimeConfigScopeProps } from '../../../redesign/utils/dtos';
 import { ConfigData } from '../ConfigData';
 import { YBErrorIndicator, YBLoading } from '../../common/indicators';
 
 import '../AdvancedConfig.scss';
 
 export const ProviderRuntimeConfig: FC<RuntimeConfigScopeProps> = ({
-  configTagFilter,
+  getRuntimeConfig,
   fetchRuntimeConfigs,
   setRuntimeConfig,
   deleteRunTimeConfig,
@@ -84,11 +84,11 @@ export const ProviderRuntimeConfig: FC<RuntimeConfigScopeProps> = ({
         </Dropdown>
       </div>
       <ConfigData
+        getRuntimeConfig={getRuntimeConfig}
         setRuntimeConfig={setRuntimeConfig}
         deleteRunTimeConfig={deleteRunTimeConfig}
         scope={RunTimeConfigScope.PROVIDER}
         providerUUID={providerUUID}
-        configTagFilter={configTagFilter}
       />
     </div>
   );

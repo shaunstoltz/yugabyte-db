@@ -1,4 +1,4 @@
-// Copyright (c) YugaByte, Inc.
+// Copyright (c) YugabyteDB, Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License"); you may not use this file except
 // in compliance with the License.  You may obtain a copy of the License at
@@ -23,6 +23,7 @@
 #include <unordered_set>
 #include <vector>
 
+#include "yb/docdb/doc_operation.h"
 #include "yb/docdb/docdb_fwd.h"
 #include "yb/docdb/docdb_types.h"
 
@@ -33,11 +34,13 @@ namespace yb {
 namespace docdb {
 
 std::string EntryToString(
-    const rocksdb::Iterator& iterator, const SchemaPackingStorage& schema_packing_storage,
+    const rocksdb::Iterator& iterator,
+    SchemaPackingProvider* schema_packing_provider /*null ok*/,
     StorageDbType db_type = StorageDbType::kRegular);
 std::string EntryToString(
-    const Slice& key, const Slice& value, const SchemaPackingStorage& schema_packing_storage,
-    StorageDbType db_type = StorageDbType::kRegular);
+    Slice key, Slice value, SchemaPackingProvider* schema_packing_provider /*null ok*/,
+    StorageDbType db_type = StorageDbType::kRegular, const std::string& key_suffix = "",
+    AllowEmptyValue allow_empty_value = AllowEmptyValue::kFalse);
 
 // Create a debug dump of the document database. Tries to decode all keys/values despite failures.
 // Reports all errors to the output stream and returns the status of the first failed operation,
@@ -45,25 +48,53 @@ std::string EntryToString(
 void DocDBDebugDump(
     rocksdb::DB* rocksdb,
     std::ostream& out,
-    const SchemaPackingStorage& schema_packing_storage,
+    SchemaPackingProvider* schema_packing_provider /*null ok*/,
     StorageDbType db_type,
-    IncludeBinary include_binary = IncludeBinary::kFalse);
+    IncludeBinary include_binary = IncludeBinary::kFalse,
+    IncludeWriteTime include_write_time = IncludeWriteTime::kTrue);
+
+inline void DocDBDebugDump(
+    rocksdb::DB* rocksdb,
+    std::ostream& out,
+    SchemaPackingProvider* schema_packing_provider /*null ok*/,
+    StorageDbType db_type,
+    IncludeWriteTime include_write_time) {
+  return DocDBDebugDump(
+      rocksdb, out, schema_packing_provider, db_type, IncludeBinary::kFalse, include_write_time);
+}
 
 std::string DocDBDebugDumpToStr(
-    rocksdb::DB* rocksdb, const SchemaPackingStorage& schema_packing_storage,
+    rocksdb::DB* rocksdb,
+    SchemaPackingProvider* schema_packing_provider /*null ok*/,
     StorageDbType db_type = StorageDbType::kRegular,
     IncludeBinary include_binary = IncludeBinary::kFalse);
 
 std::string DocDBDebugDumpToStr(
-    DocDB docdb, const SchemaPackingStorage& schema_packing_storage,
-    IncludeBinary include_binary = IncludeBinary::kFalse);
+    DocDB docdb,
+    SchemaPackingProvider* schema_packing_provider /*null ok*/,
+    IncludeBinary include_binary = IncludeBinary::kFalse,
+    IncludeWriteTime include_write_time = IncludeWriteTime::kTrue);
+
+std::string DocDBDebugDumpToStr(
+    DocDB docdb,
+    SchemaPackingProvider* schema_packing_provider /*null ok*/,
+    IncludeWriteTime include_write_time);
+
+std::string DocDBDebugDumpToStr(const DocOperationApplyData& data);
 
 void DocDBDebugDumpToContainer(
-    DocDB docdb, const SchemaPackingStorage& schema_packing_storage,
-    std::unordered_set<std::string>* out);
+    std::unordered_set<std::string>& out, DocDB docdb,
+    SchemaPackingProvider* schema_packing_provider /*null ok*/,
+    IncludeWriteTime include_write_time = IncludeWriteTime::kTrue);
+
+void DocDBDebugDumpToContainer(
+    std::vector<std::string>& out, DocDB docdb,
+    SchemaPackingProvider* schema_packing_provider /*null ok*/,
+    IncludeWriteTime include_write_time = IncludeWriteTime::kTrue);
 
 void DumpRocksDBToLog(
-    rocksdb::DB* rocksdb, const SchemaPackingStorage& schema_packing_storage,
+    rocksdb::DB* rocksdb,
+    SchemaPackingProvider* schema_packing_provider /*null ok*/,
     StorageDbType db_type = StorageDbType::kRegular, const std::string& log_prefix = std::string());
 
 }  // namespace docdb

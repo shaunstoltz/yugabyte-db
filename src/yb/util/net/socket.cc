@@ -15,9 +15,9 @@
 // specific language governing permissions and limitations
 // under the License.
 //
-// The following only applies to changes made to this file as part of YugaByte development.
+// The following only applies to changes made to this file as part of YugabyteDB development.
 //
-// Portions Copyright (c) YugaByte, Inc.
+// Portions Copyright (c) YugabyteDB, Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License"); you may not use this file except
 // in compliance with the License.  You may obtain a copy of the License at
@@ -38,7 +38,7 @@
 #include <limits>
 #include <string>
 
-#include <glog/logging.h>
+#include "yb/util/logging.h"
 
 #include "yb/gutil/casts.h"
 #include "yb/gutil/stringprintf.h"
@@ -320,6 +320,7 @@ Status Socket::GetPeerAddress(Endpoint* out) const {
 
 Status Socket::Bind(const Endpoint& endpoint, bool explain_addr_in_use) {
   DCHECK_GE(fd_, 0);
+  VLOG_WITH_FUNC(2) << "Binding socket " << fd_ << " to " << AsString(endpoint);
   if (PREDICT_FALSE(::bind(fd_, endpoint.data(), narrow_cast<socklen_t>(endpoint.size())) != 0)) {
     Errno err(errno);
     Status s = STATUS(NetworkError, Format("Error binding socket to $0", endpoint), err);
@@ -378,6 +379,7 @@ Status Socket::BindForOutgoingConnection() {
     << "Invalid local IP set for 'local_ip_for_outbound_sockets': '"
     << FLAGS_local_ip_for_outbound_sockets << "': " << ec;
 
+  VLOG_WITH_FUNC(2) << "Binding outgoing socket";
   RETURN_NOT_OK(Bind(Endpoint(bind_address, 0)));
   return Status::OK();
 }

@@ -15,9 +15,9 @@
 // specific language governing permissions and limitations
 // under the License.
 //
-// The following only applies to changes made to this file as part of YugaByte development.
+// The following only applies to changes made to this file as part of YugabyteDB development.
 //
-// Portions Copyright (c) YugaByte, Inc.
+// Portions Copyright (c) YugabyteDB, Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License"); you may not use this file except
 // in compliance with the License.  You may obtain a copy of the License at
@@ -37,15 +37,22 @@ option java_package = "org.yb.tserver";
 
 import "yb/common/common.proto";
 import "yb/common/common_types.proto";
+import "yb/common/opid.proto";
 import "yb/common/redis_protocol.proto";
 import "yb/common/ql_protocol.proto";
 import "yb/common/pgsql_protocol.proto";
 import "yb/common/transaction.proto";
 import "yb/common/wire_protocol.proto";
+import "yb/consensus/metadata.proto";
 import "yb/docdb/docdb.proto";
 import "yb/tablet/operations.proto";
 import "yb/tablet/tablet.proto";
 import "yb/tserver/tserver_types.proto";
+
+message TabletConsensusInfoPB {
+  optional bytes tablet_id = 1;
+  optional consensus.ConsensusStatePB consensus_state = 2;
+}
 
 // A batched set of insert/mutate requests.
 message WriteRequestPB {
@@ -66,6 +73,9 @@ message WriteRequestPB {
   // A batch of Pgsql operations.
   repeated PgsqlWriteRequestPB pgsql_write_batch = 13;
 
+   // A batch of Pgsql locks.
+  repeated PgsqlLockRequestPB pgsql_lock_batch = 25;
+
   // A hybrid_time obtained by the client from a previous request.
   // TODO crypto sign this and propagate the signature along with
   // the hybrid_time.
@@ -85,6 +95,18 @@ message WriteRequestPB {
   optional fixed64 external_hybrid_time = 19;
 
   optional uint64 batch_idx = 20;
+
+  optional int64 leader_term = 21;
+
+  optional uint64 start_time_micros = 22;
+
+  reserved 23; // ASH metadata is now passed in RequestHeader PB
+
+  optional int64 raft_config_opid_index = 24;
+
+  optional bool use_async_write = 26;
+
+  optional uint32 xrepl_origin_id = 27;
 }
 
 message WriteResponsePB {
@@ -128,10 +150,28 @@ message WriteResponsePB {
   optional ReadHybridTimePB used_read_time = 13;
 
   optional fixed64 local_limit_ht = 14;
+
+  optional TabletConsensusInfoPB tablet_consensus_info = 15;
+
+  // key causing read restart. Present when restart_read_time is.
+  optional string restart_read_key = 16;
+
+  // Only set if use_async_write is true.
+  // If this is set, then the client needs to wait for the async write to
+  // complete using WaitForAsyncWrite before committing the transaction.
+  optional OpIdPB async_write_op_id = 17;
 }
+
+message WaitForAsyncWriteRequestPB {
+  required bytes tablet_id = 1;
+  optional OpIdPB op_id = 2;
+}
+
+message WaitForAsyncWriteResponsePB { optional TabletServerErrorPB error = 1; }
 
 // A list tablets request
 message ListTabletsRequestPB {
+  optional bool include_user_tablets_only = 1 [ default = false ];
 }
 
 // A list tablets response
@@ -220,6 +260,21 @@ message ReadRequestPB {
   optional double rejection_score = 13;
 
   optional uint64 batch_idx = 14;
+
+  optional uint64 start_time_micros = 16;
+
+  reserved 17; // ASH metadata is now passed in RequestHeader PB
+
+  optional int64 raft_config_opid_index = 18;
+
+  reserved 19; // leader_term is no longer used for async writes
+
+  // If this read requires to perform write operations like locking rows, then use async write.
+  optional bool use_async_write = 20;
+
+  // OpId of a pending async write on this tablet that the server should verify is present in
+  // its local log before serving the read (see TabletPeer::VerifyAsyncWriteReceived).
+  optional OpIdPB pending_async_write_op_id = 21;
 }
 
 message ReadResponsePB {
@@ -244,6 +299,32 @@ message ReadResponsePB {
   optional ReadHybridTimePB used_read_time = 9;
 
   optional fixed64 local_limit_ht = 10;
+
+  optional TabletConsensusInfoPB tablet_consensus_info = 11;
+
+  // key causing read restart. Present when restart_read_time is.
+  optional string restart_read_key = 12;
+
+  // Only set if use_async_write is true and the read requires a write operation like a lock.
+  // If this is set, then the client needs to wait for the async write to
+  // complete using WaitForAsyncWrite before committing the transaction.
+  optional OpIdPB async_write_op_id = 13;
+}
+
+message GetTabletKeyRangesRequestPB {
+  optional bytes tablet_id = 1;
+  optional fixed64 propagated_hybrid_time = 2;
+  optional bytes lower_bound_key = 3;
+  optional bytes upper_bound_key = 4;
+  optional uint64 max_num_ranges = 5;
+  optional uint64 range_size_bytes = 6;
+  optional bool is_forward = 7 [ default = true ];
+  optional uint32 max_key_length = 8;
+}
+
+message GetTabletKeyRangesResponsePB {
+  optional TabletServerErrorPB error = 1;
+  optional fixed64 propagated_hybrid_time = 2;
 }
 
 // Truncate tablet request.
@@ -315,4 +396,161 @@ message ListMasterServersResponsePB {
   }
 
   repeated MasterServerAndTypePB master_server_and_type = 2;
+}
+
+// Gets the schema version of the schema that is compatible with the requested schema.
+message GetCompatibleSchemaVersionRequestPB {
+  optional bytes tablet_id = 1;
+  optional SchemaPB schema = 2;
+}
+
+// Update Schema version mapping response PB.
+message GetCompatibleSchemaVersionResponsePB {
+  optional TabletServerErrorPB error = 1;
+  optional uint32 compatible_schema_version = 2;
+  // Added on Oct 2024 (v2025.1), will not be set for older versions.
+  // Value is set in the case of a schema mismatch.
+  optional uint32 latest_schema_version = 3;
+}
+
+message CheckTserverTabletHealthRequestPB {
+  repeated bytes tablet_ids = 1;
+}
+
+message CheckTserverTabletHealthResponsePB {
+  message TabletHealthPB {
+    optional bytes tablet_id = 1;
+    optional PeerRole role = 2;
+    // Only valid if role is not LEADER.
+    optional int64 follower_lag_ms = 3;
+  }
+  optional TabletServerErrorPB error = 1;
+  repeated TabletHealthPB tablet_healths = 2;
+}
+
+message ClearAllMetaCachesOnServerRequestPB {}
+
+message ClearAllMetaCachesOnServerResponsePB {}
+
+message ClearMetacacheRequestPB {
+  // Only Ysql namespace can be cleared from metacache.
+  optional string namespace_id = 1;
+}
+
+message ClearMetacacheResponsePB {
+  optional TabletServerErrorPB error = 1;
+}
+
+message ClearYCQLMetaDataCacheOnServerRequestPB {}
+
+message ClearYCQLMetaDataCacheOnServerResponsePB {
+  optional TabletServerErrorPB error = 1;
+}
+
+message ClearUniverseUuidRequestPB {
+}
+
+message ClearUniverseUuidResponsePB {
+  optional TabletServerErrorPB error = 1;
+}
+
+message AcquireObjectLockRequestPB {
+  optional bytes txn_id = 1;
+  optional uint32 subtxn_id = 2;
+  repeated docdb.ObjectLockPB object_locks = 3;
+  // The field is used only on the master side. Master remembers which tserver requested the
+  // exclusive lock(s) so that it can issue a cleanup when the tserver looses its lease.
+  optional bytes session_host_uuid = 4;
+  // The lease epoch of the requesting tserver.
+  optional uint64 lease_epoch = 5;
+  optional fixed64 ignore_after_hybrid_time = 6;
+  optional fixed64 propagated_hybrid_time = 7;
+  reserved 8; // ASH metadata is now passed in RequestHeader PB
+  optional bytes status_tablet = 9;
+  // The expected lease epoch of the recipient tserver.
+  optional uint64 recipient_lease_epoch = 10;
+  // Used for ignoring conflicts between transactional object locks and host session object locks.
+  optional bytes background_transaction_id = 11;
+}
+
+message AcquireObjectLockResponsePB {
+  optional TabletServerErrorPB error = 1;
+  optional fixed64 propagated_hybrid_time = 2;
+}
+
+message YsqlCatalogVersionPB {
+  optional uint32 db_oid = 1;
+  optional uint64 current_version = 2;
+  optional uint64 last_breaking_version = 3;
+}
+
+message DBCatalogVersionDataPB {
+  repeated YsqlCatalogVersionPB db_catalog_versions = 1;
+  optional bool ignore_catalog_version_staleness_check = 2 [ default = false ];
+}
+
+// This matches a row in pg_yb_invalidation_messages table, which has a composite primary
+// key of (db_oid, current_version). For each pair of (db_oid, current_version), there is
+// a list of invalidation messages. The table pg_yb_invalidation_messages also has a message
+// time column that is used to delete old messages from pg_yb_invalidation_messages, but it is
+// not needed by tserver so it is skipped here.
+message YsqlCatalogInvalMessagesPB {
+  optional uint32 db_oid = 1;
+  optional uint64 current_version = 2;
+  // Serialized/encoded message list related to PG catalog cache invalidation.
+  optional bytes message_list = 3;
+}
+
+message DBCatalogInvalMessagesDataPB {
+  repeated YsqlCatalogInvalMessagesPB db_catalog_inval_messages = 1;
+}
+
+message ReleaseObjectLockRequestPB {
+  optional bytes txn_id = 1;
+  // When set, only locks owned by the given subtxn id are released. If unset, releases
+  // all locks held by <txn_id>.
+  optional uint32 subtxn_id = 2;
+
+  optional bytes session_host_uuid = 3;
+  // The lease epoch of the requesting tserver.
+  optional uint64 lease_epoch = 4;
+  // If there is any Acquire request that failed, and may be pending
+  // on any of the tservers/master. apply_after should be set to the
+  // max of the deadlines used for the acquire requests. This ensures
+  // that the release will only be applied after the Acquire, to prevent
+  // out of order acquire request from leaking locks.
+  optional fixed64 apply_after_hybrid_time = 5;
+  optional fixed64 propagated_hybrid_time = 6;
+
+  // Note: These fields represent the db_catalog_* information as of when the
+  // ReleaseObjectLockRequestPB is created. Thus, may not stale/out-of-date and
+  // *not* represent the latest db_catalog_* information at the master. This
+  // information is added here to optimize the case where a DDL release causes
+  // the catalog-version to increase -- where the release request can update the
+  // TServers instead of waiting for the next heartbeat. However, for a lot of
+  // other cases (including retries of this request), the information presented
+  // here may even be stale than what is present at the TServer. This is not a
+  // problem as as the TServer would just not update it's db_catalog_*
+  // information.
+  optional DBCatalogVersionDataPB db_catalog_version_data = 7;
+  // Used for tracking in-progress DDL unlock requests at the master.
+  optional uint64 request_id = 8;
+  reserved 9; // ASH metadata is now passed in RequestHeader PB
+  optional DBCatalogInvalMessagesDataPB db_catalog_inval_messages_data = 10;
+  optional bool populate_db_catalog_info = 11 [ default = true ];
+  // The expected lease epoch of the recipient tserver.
+  optional uint64 recipient_lease_epoch = 12;
+
+  repeated docdb.ObjectLockPB object_locks = 13;
+  // If any new field is added here. Do not forget to update
+  // ReleaseRequestToPersist accordingly.
+}
+
+message ReleaseObjectLockResponsePB {
+  optional TabletServerErrorPB error = 1;
+  optional fixed64 propagated_hybrid_time = 2;
+}
+
+message DdlLockEntriesPB {
+  repeated AcquireObjectLockRequestPB lock_entries = 1;
 }

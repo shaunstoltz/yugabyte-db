@@ -1,4 +1,4 @@
-// Copyright (c) YugaByte, Inc.
+// Copyright (c) YugabyteDB, Inc.
 
 package com.yugabyte.yw.common;
 
@@ -7,6 +7,8 @@ import static play.mvc.Http.Status.INTERNAL_SERVER_ERROR;
 import com.fasterxml.jackson.databind.JsonNode;
 import com.google.inject.Inject;
 import com.google.inject.Singleton;
+import com.typesafe.config.Config;
+import com.yugabyte.yw.common.config.GlobalConfKeys;
 import com.yugabyte.yw.models.AccessKey;
 import com.yugabyte.yw.models.Provider;
 import com.yugabyte.yw.models.ProviderDetails;
@@ -14,13 +16,15 @@ import java.io.File;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.UUID;
+import lombok.extern.slf4j.Slf4j;
 
 @Singleton
+@Slf4j
 public class TemplateManager extends DevopsBase {
   private static final String COMMAND_TYPE = "instance";
   public static final String PROVISION_SCRIPT = "provision_instance.py";
 
-  @Inject play.Configuration appConfig;
+  @Inject Config appConfig;
 
   @Override
   protected String getCommandType() {
@@ -64,14 +68,16 @@ public class TemplateManager extends DevopsBase {
     commandArgs.add(path);
 
     Provider provider = Provider.getOrBadRequest(accessKey.getProviderUUID());
-    ProviderDetails details = provider.details;
+    ProviderDetails details = provider.getDetails();
+
+    if (details.sshUser == null) {
+      log.warn(
+          "skip provision script templating, provider {} has no ssh user defined",
+          provider.getName());
+      return;
+    }
     commandArgs.add("--ssh_user");
     commandArgs.add(details.sshUser);
-
-    commandArgs.add("--vars_file");
-    commandArgs.add(keyInfo.vaultFile);
-    commandArgs.add("--vault_password_file");
-    commandArgs.add(keyInfo.vaultPasswordFile);
     commandArgs.add("--private_key_file");
     commandArgs.add(keyInfo.privateKey);
     commandArgs.add("--local_package_path");
@@ -79,6 +85,8 @@ public class TemplateManager extends DevopsBase {
 
     commandArgs.add("--custom_ssh_port");
     commandArgs.add(details.sshPort.toString());
+    commandArgs.add("--provider_id");
+    commandArgs.add(provider.getUuid().toString());
 
     if (airGapInstall) {
       commandArgs.add("--air_gap");
@@ -106,8 +114,19 @@ public class TemplateManager extends DevopsBase {
       }
     }
 
+    if (nodeAgentClient.isClientEnabled(provider, null /* Universe */)) {
+      commandArgs.add("--install_node_agent");
+      commandArgs.add("--node_agent_port");
+      commandArgs.add(String.valueOf(confGetter.getGlobalConf(GlobalConfKeys.nodeAgentServerPort)));
+    }
+
     JsonNode result =
-        execAndParseCommandCloud(accessKey.getProviderUUID(), "template", commandArgs);
+        execAndParseShellResponse(
+            DevopsCommand.builder()
+                .providerUUID(accessKey.getProviderUUID())
+                .command("template")
+                .commandArgs(commandArgs)
+                .build());
 
     if (result.get("error") == null) {
       details.passwordlessSudoAccess = passwordlessSudoAccess;

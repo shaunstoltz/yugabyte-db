@@ -34,20 +34,51 @@
 #include <ctype.h>
 
 #include "parser/scansup.h"
-#include "utils/backend_random.h"
-#include "utils/builtins.h"
-#include "utils/uuid.h"
-
-#include "px.h"
-#include "px-crypt.h"
 #include "pgcrypto.h"
+#include "px-crypt.h"
+#include "px.h"
+#include "utils/builtins.h"
+#include "utils/guc.h"
+#include "utils/uuid.h"
 
 PG_MODULE_MAGIC;
 
+void _PG_init(void);
+
 /* private stuff */
+
+static const struct config_enum_entry builtin_crypto_options[] = {
+	{"on", BC_ON, false},
+	{"off", BC_OFF, false},
+	{"fips", BC_FIPS, false},
+	{NULL, 0, false}
+};
 
 typedef int (*PFN) (const char *name, void **res);
 static void *find_provider(text *name, PFN pf, const char *desc, int silent);
+
+int			builtin_crypto_enabled = BC_ON;
+
+/*
+ * Entrypoint of this module.
+ */
+void
+_PG_init(void)
+{
+	DefineCustomEnumVariable("pgcrypto.builtin_crypto_enabled",
+							 "Sets if builtin crypto functions are enabled.",
+							 "\"on\" enables builtin crypto, \"off\" unconditionally disables and \"fips\" "
+							 "will disable builtin crypto if OpenSSL is in FIPS mode",
+							 &builtin_crypto_enabled,
+							 BC_ON,
+							 builtin_crypto_options,
+							 PGC_SUSET,
+							 0,
+							 NULL,
+							 NULL,
+							 NULL);
+	MarkGUCPrefixReserved("pgcrypto");
+}
 
 /* SQL function: hash(bytea, text) returns bytea */
 PG_FUNCTION_INFO_V1(pg_digest);
@@ -423,7 +454,6 @@ PG_FUNCTION_INFO_V1(pg_random_bytes);
 Datum
 pg_random_bytes(PG_FUNCTION_ARGS)
 {
-#ifdef HAVE_STRONG_RANDOM
 	int			len = PG_GETARG_INT32(0);
 	bytea	   *res;
 
@@ -440,9 +470,6 @@ pg_random_bytes(PG_FUNCTION_ARGS)
 		px_THROW_ERROR(PXE_NO_RANDOM);
 
 	PG_RETURN_BYTEA_P(res);
-#else
-	px_THROW_ERROR(PXE_NO_RANDOM);
-#endif
 }
 
 /* SQL function: gen_random_uuid() returns uuid */
@@ -451,24 +478,16 @@ PG_FUNCTION_INFO_V1(pg_random_uuid);
 Datum
 pg_random_uuid(PG_FUNCTION_ARGS)
 {
-#ifdef HAVE_STRONG_RANDOM
-	uint8	   *buf = (uint8 *) palloc(UUID_LEN);
+	/* redirect to built-in function */
+	return gen_random_uuid(fcinfo);
+}
 
-	/* Generate random bits. */
-	if (!pg_backend_random((char *) buf, UUID_LEN))
-		px_THROW_ERROR(PXE_NO_RANDOM);
+PG_FUNCTION_INFO_V1(pg_check_fipsmode);
 
-	/*
-	 * Set magic numbers for a "version 4" (pseudorandom) UUID, see
-	 * http://tools.ietf.org/html/rfc4122#section-4.4
-	 */
-	buf[6] = (buf[6] & 0x0f) | 0x40;	/* "version" field */
-	buf[8] = (buf[8] & 0x3f) | 0x80;	/* "variant" field */
-
-	PG_RETURN_UUID_P((pg_uuid_t *) buf);
-#else
-	px_THROW_ERROR(PXE_NO_RANDOM);
-#endif
+Datum
+pg_check_fipsmode(PG_FUNCTION_ARGS)
+{
+	PG_RETURN_BOOL(CheckFIPSMode());
 }
 
 static void *

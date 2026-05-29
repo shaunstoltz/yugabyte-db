@@ -1,4 +1,4 @@
-// Copyright (c) YugaByte, Inc.
+// Copyright (c) YugabyteDB, Inc.
 
 package com.yugabyte.yw.common;
 
@@ -14,12 +14,14 @@ import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.Future;
+import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.function.Consumer;
 import javax.inject.Inject;
 import javax.inject.Singleton;
+import kamon.Kamon;
 import lombok.Getter;
 import lombok.extern.slf4j.Slf4j;
-import play.inject.ApplicationLifecycle;
+import org.apache.pekko.actor.CoordinatedShutdown;
 
 /**
  * This allows setting order of shutdown hook execution. ApplicationLifecycle of play framework
@@ -31,9 +33,9 @@ import play.inject.ApplicationLifecycle;
 @Singleton
 public class ShutdownHookHandler {
 
-  private final ApplicationLifecycle lifecycle;
   private final ExecutorService shutdownExecutor;
   private final Map<Object, Hook<?>> hooks;
+  private final AtomicBoolean isShutdown = new AtomicBoolean();
   // Setting this to true makes it behave like addStopHook of ApplicationLifecycle
   // that invokes the hooks serially.
   private boolean isSerialShutdown = false;
@@ -79,13 +81,15 @@ public class ShutdownHookHandler {
   }
 
   @Inject
-  public ShutdownHookHandler(ApplicationLifecycle lifecycle) {
-    this.lifecycle = lifecycle;
+  public ShutdownHookHandler(CoordinatedShutdown coordinatedShutdown) {
     this.shutdownExecutor = Executors.newCachedThreadPool();
     this.hooks = new WeakHashMap<>();
-    this.lifecycle.addStopHook(
+    coordinatedShutdown.addTask(
+        CoordinatedShutdown.PhaseServiceRequestsDone(),
+        getClass().getSimpleName(),
         () -> {
-          return CompletableFuture.runAsync(this::onApplicationShutdown, shutdownExecutor);
+          onApplicationShutdown();
+          return CompletableFuture.completedFuture(null);
         });
   }
 
@@ -114,8 +118,22 @@ public class ShutdownHookHandler {
     hooks.put(referent, new Hook<T>(referent, consumer, weight, lastTime++));
   }
 
+  /**
+   * Method to check if shutdown is triggered.
+   *
+   * @return Returns true if it is being shut down, else false.
+   */
+  public boolean isShutdown() {
+    return isShutdown.get();
+  }
+
   @VisibleForTesting
   void onApplicationShutdown() {
+    if (!isShutdown.compareAndSet(false, true)) {
+      log.error("Application is already shut down");
+      return;
+    }
+    Util.YBA_SHUTDOWN_STARTED = true;
     List<Hook<?>> list = new ArrayList<>(hooks.values());
     Collections.sort(list);
     int pos = 0;
@@ -147,6 +165,7 @@ public class ShutdownHookHandler {
                 }
               });
     }
+    Kamon.stop();
     shutdownExecutor.shutdownNow();
   }
 }

@@ -1,27 +1,32 @@
-// Copyright (c) YugaByte, Inc.
+// Copyright (c) YugabyteDB, Inc.
 
-import React, { FC, useEffect } from 'react';
+import { FC, useEffect, useState } from 'react';
 import { useDispatch, useSelector } from 'react-redux';
 
 import {
+  resetMetrics,
   queryMetrics,
   queryMetricsSuccess,
   queryMetricsFailure,
   currentTabSelected
 } from '../../../actions/graph';
-import {
-  getTabContent
-} from '../../../utils/GraphUtils';
-import {
-  isNonEmptyArray,
-  isNonEmptyString,
-} from '../../../utils/ObjectUtils';
-import {
-  MetricsData,
-  GraphFilter,
-  MetricQueryParams
-} from '../../../redesign/helpers/dtos';
-import { MetricMeasure, MetricConsts, SplitType, MetricTypes } from '../../metrics/constants';
+import { getTabContent } from '../../../utils/GraphUtils';
+import { isNonEmptyArray, isNonEmptyString } from '../../../utils/ObjectUtils';
+import { GraphFilter, MetricsQueryParams } from '../../../redesign/helpers/dtos';
+import { MetricMeasure, MetricConsts, MetricTypes, NodeType } from '../../metrics/constants';
+import { SplitType, NodeAggregation } from '../dtos';
+
+interface MetricsData {
+  type: string;
+  metricsKey: string[];
+  nodePrefixes: string;
+  selectedUniverse: any;
+  title: string;
+  tableName?: string;
+  isGranularMetricsEnabled: boolean;
+  isMetricsTimezoneEnabled: boolean;
+  printMode: boolean;
+}
 
 export const GraphTab: FC<MetricsData> = ({
   type,
@@ -29,16 +34,19 @@ export const GraphTab: FC<MetricsData> = ({
   nodePrefixes,
   selectedUniverse,
   title,
-  tableName
+  tableName,
+  isGranularMetricsEnabled,
+  isMetricsTimezoneEnabled,
+  printMode = false
 }) => {
   let tabContent = null;
-  const insecureLoginToken = useSelector((state: any) => state.customer.INSECURE_apiToken);
   const { currentUser } = useSelector((state: any) => state.customer);
   const graph = useSelector((state: any) => state.graph);
   const {
     startMoment,
     endMoment,
     nodeName,
+    currentSelectedNodeType,
     nodePrefix,
     currentSelectedRegion,
     metricMeasure,
@@ -49,31 +57,38 @@ export const GraphTab: FC<MetricsData> = ({
     selectedZoneName
   }: GraphFilter = graph.graphFilter;
   const dispatch: any = useDispatch();
+  const [timestamp, setTimestamp] = useState({
+    startTimestamp: startMoment,
+    endTimestamp: endMoment
+  });
+  const startTimestamp = timestamp.startTimestamp;
+  const endTimestamp = timestamp.endTimestamp;
 
   const queryMetricsType = () => {
     const metricsWithSettings = metricsKey.map((metricKey) => {
       const settings: any = {
-        metric: metricKey,
+        metric: metricKey
       };
       if (metricMeasure === MetricMeasure.OUTLIER) {
-        settings.nodeAggregation = "AVG";
+        settings.nodeAggregation = NodeAggregation.AVERAGE;
         settings.splitMode = outlierType;
         settings.splitCount = outlierNumNodes;
         settings.splitType = SplitType.NODE;
         // Top K tables section will be displayed only in case of Metrics Measure "Overall"
-      } else if (type === MetricTypes.OUTLIER_TABLES) {
+      } else if (type === MetricTypes.OUTLIER_TABLES || type === MetricTypes.OUTLIER_DATABASES) {
         settings.splitMode = outlierType;
         settings.splitCount = outlierNumNodes;
         settings.returnAggregatedValue = false;
-        settings.splitType = SplitType.TABLE;
+        settings.splitType =
+          type === MetricTypes.OUTLIER_TABLES ? SplitType.TABLE : SplitType.NAMESPACE;
       }
       return settings;
     });
 
     const params: any = {
       metricsWithSettings: metricsWithSettings,
-      start: startMoment.format('X'),
-      end: endMoment.format('X'),
+      start: typeof startTimestamp === 'object' ? startTimestamp.format('X') : startTimestamp,
+      end: typeof endTimestamp === 'object' ? endTimestamp.format('X') : endTimestamp
     };
     if (isNonEmptyString(nodePrefix) && nodePrefix !== MetricConsts.ALL) {
       params.nodePrefix = nodePrefix;
@@ -85,12 +100,20 @@ export const GraphTab: FC<MetricsData> = ({
     }
 
     // Top K tables section should not have the below query params
-    if (isNonEmptyString(nodeName) && nodeName !== MetricConsts.ALL && nodeName !== MetricConsts.TOP) {
+    if (
+      isNonEmptyString(nodeName) &&
+      nodeName !== MetricConsts.ALL &&
+      nodeName !== MetricConsts.TOP
+    ) {
       params.nodeNames = [nodeName];
     }
     // If specific region or cluster is selected from region dropdown, pass clusterUUID and region code
     if (isNonEmptyString(selectedRegionClusterUUID)) {
       params.clusterUuids = [selectedRegionClusterUUID];
+    }
+
+    if (isNonEmptyString(currentSelectedNodeType) && currentSelectedNodeType !== NodeType.ALL) {
+      params.serverType = currentSelectedNodeType?.toUpperCase();
     }
 
     if (isNonEmptyString(selectedZoneName)) {
@@ -108,7 +131,8 @@ export const GraphTab: FC<MetricsData> = ({
     queryMetricsVaues(params, type);
   };
 
-  const queryMetricsVaues = (params: MetricQueryParams, type: string) => {
+  const queryMetricsVaues = (params: MetricsQueryParams, type: string) => {
+    dispatch(resetMetrics());
     dispatch(queryMetrics(params)).then((response: any) => {
       if (!response.error) {
         dispatch(queryMetricsSuccess(response.payload, type));
@@ -118,17 +142,30 @@ export const GraphTab: FC<MetricsData> = ({
     });
   };
 
+  const updateTimestamp = (start: 'object' | number, end: 'object' | number) => {
+    setTimestamp({
+      startTimestamp: start,
+      endTimestamp: end
+    });
+  };
+
   const setSelectedTabName = (type: string) => {
     dispatch(currentTabSelected(type));
   };
 
   useEffect(() => {
+    updateTimestamp(startMoment, endMoment);
+  }, [startMoment, endMoment]);
+
+  useEffect(() => {
     setSelectedTabName(type);
     queryMetricsType();
-  }, [nodeName, // eslint-disable-line react-hooks/exhaustive-deps
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [
+    nodeName,
     nodePrefix,
-    startMoment,
-    endMoment,
+    startTimestamp,
+    endTimestamp,
     currentSelectedRegion,
     metricMeasure,
     outlierType,
@@ -142,12 +179,11 @@ export const GraphTab: FC<MetricsData> = ({
     metricsKey,
     title,
     currentUser,
-    insecureLoginToken
+    isGranularMetricsEnabled,
+    isMetricsTimezoneEnabled,
+    updateTimestamp,
+    printMode
   );
 
-  return (
-    <>
-      {tabContent}
-    </>
-  );
+  return <>{tabContent}</>;
 };

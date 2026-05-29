@@ -3,9 +3,9 @@
 //  LICENSE file in the root directory of this source tree. An additional grant
 //  of patent rights can be found in the PATENTS file in the same directory.
 //
-// The following only applies to changes made to this file as part of YugaByte development.
+// The following only applies to changes made to this file as part of YugabyteDB development.
 //
-// Portions Copyright (c) YugaByte, Inc.
+// Portions Copyright (c) YugabyteDB, Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License"); you may not use this file except
 // in compliance with the License.  You may obtain a copy of the License at
@@ -124,30 +124,25 @@ TEST_F(SliceTransformDBTest, CapPrefix) {
   unique_ptr<Iterator> iter(db()->NewIterator(ro));
 
   iter->Seek("foo");
-  ASSERT_OK(iter->status());
-  ASSERT_TRUE(iter->Valid());
+  ASSERT_TRUE(ASSERT_RESULT(iter->CheckedValid()));
   ASSERT_EQ(iter->value().ToString(), "bar");
   ASSERT_EQ(TestGetTickerCount(last_options_, BLOOM_FILTER_PREFIX_USEFUL), 0U);
 
   iter->Seek("foo2");
-  ASSERT_OK(iter->status());
-  ASSERT_TRUE(!iter->Valid());
+  ASSERT_TRUE(!ASSERT_RESULT(iter->CheckedValid()));
   ASSERT_EQ(TestGetTickerCount(last_options_, BLOOM_FILTER_PREFIX_USEFUL), 1U);
 
   iter->Seek("barbarbar");
-  ASSERT_OK(iter->status());
-  ASSERT_TRUE(iter->Valid());
+  ASSERT_TRUE(ASSERT_RESULT(iter->CheckedValid()));
   ASSERT_EQ(iter->value().ToString(), "foo");
   ASSERT_EQ(TestGetTickerCount(last_options_, BLOOM_FILTER_PREFIX_USEFUL), 1U);
 
   iter->Seek("barfoofoo");
-  ASSERT_OK(iter->status());
-  ASSERT_TRUE(!iter->Valid());
+  ASSERT_TRUE(!ASSERT_RESULT(iter->CheckedValid()));
   ASSERT_EQ(TestGetTickerCount(last_options_, BLOOM_FILTER_PREFIX_USEFUL), 2U);
 
   iter->Seek("foobarbar");
-  ASSERT_OK(iter->status());
-  ASSERT_TRUE(!iter->Valid());
+  ASSERT_TRUE(!ASSERT_RESULT(iter->CheckedValid()));
   ASSERT_EQ(TestGetTickerCount(last_options_, BLOOM_FILTER_PREFIX_USEFUL), 3U);
 }
 

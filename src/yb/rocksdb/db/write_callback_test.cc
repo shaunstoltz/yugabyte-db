@@ -3,9 +3,9 @@
 //  LICENSE file in the root directory of this source tree. An additional grant
 //  of patent rights can be found in the PATENTS file in the same directory.
 //
-// The following only applies to changes made to this file as part of YugaByte development.
+// The following only applies to changes made to this file as part of YugabyteDB development.
 //
-// Portions Copyright (c) YugaByte, Inc.
+// Portions Copyright (c) YugabyteDB, Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License"); you may not use this file except
 // in compliance with the License.  You may obtain a copy of the License at
@@ -30,10 +30,10 @@
 #include "yb/rocksdb/write_batch.h"
 #include "yb/rocksdb/util/logging.h"
 #include "yb/rocksdb/util/random.h"
-#include "yb/rocksdb/util/sync_point.h"
 #include "yb/rocksdb/util/testharness.h"
 #include "yb/rocksdb/util/testutil.h"
 
+#include "yb/util/sync_point.h"
 #include "yb/util/test_util.h"
 
 using std::atomic;
@@ -162,7 +162,7 @@ TEST_F(WriteCallbackTest, WriteWithCallbackTest) {
           std::atomic<uint64_t> seq(db_impl->GetLatestSequenceNumber());
           ASSERT_EQ(db_impl->GetLatestSequenceNumber(), 0);
 
-          rocksdb::SyncPoint::GetInstance()->SetCallBack(
+          yb::SyncPoint::GetInstance()->SetCallBack(
               "WriteThread::JoinBatchGroup:Wait", [&](void* arg) {
                 uint64_t cur_threads_waiting = 0;
                 bool is_leader = false;
@@ -202,7 +202,7 @@ TEST_F(WriteCallbackTest, WriteWithCallbackTest) {
                 }
               });
 
-          rocksdb::SyncPoint::GetInstance()->SetCallBack(
+          yb::SyncPoint::GetInstance()->SetCallBack(
               "WriteThread::JoinBatchGroup:DoneWaiting", [&](void* arg) {
                 // check my state
                 auto* writer = reinterpret_cast<WriteThread::Writer*>(arg);
@@ -266,7 +266,7 @@ TEST_F(WriteCallbackTest, WriteWithCallbackTest) {
             }
           };
 
-          rocksdb::SyncPoint::GetInstance()->EnableProcessing();
+          yb::SyncPoint::GetInstance()->EnableProcessing();
 
           // do all the writes
           std::vector<std::thread> threads;
@@ -277,7 +277,7 @@ TEST_F(WriteCallbackTest, WriteWithCallbackTest) {
             t.join();
           }
 
-          rocksdb::SyncPoint::GetInstance()->DisableProcessing();
+          yb::SyncPoint::GetInstance()->DisableProcessing();
 
           // check for keys
           string value;

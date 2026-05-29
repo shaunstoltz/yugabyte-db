@@ -3,9 +3,9 @@
 //  LICENSE file in the root directory of this source tree. An additional grant
 //  of patent rights can be found in the PATENTS file in the same directory.
 //
-// The following only applies to changes made to this file as part of YugaByte development.
+// The following only applies to changes made to this file as part of YugabyteDB development.
 //
-// Portions Copyright (c) YugaByte, Inc.
+// Portions Copyright (c) YugabyteDB, Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License"); you may not use this file except
 // in compliance with the License.  You may obtain a copy of the License at
@@ -70,23 +70,23 @@ class ForwardIterator : public InternalIterator {
                   ColumnFamilyData* cfd, SuperVersion* current_sv = nullptr);
   virtual ~ForwardIterator();
 
-  void SeekToLast() override {
+  const KeyValueEntry& SeekToLast() override {
     status_ = STATUS(NotSupported, "ForwardIterator::SeekToLast()");
-    valid_ = false;
+    entry_.Reset();
+    return entry_;
   }
-  void Prev() override {
+  const KeyValueEntry& Prev() override {
     status_ = STATUS(NotSupported, "ForwardIterator::Prev");
-    valid_ = false;
+    entry_.Reset();
+    return entry_;
   }
 
-  virtual bool Valid() const override;
-  void SeekToFirst() override;
-  virtual void Seek(const Slice& target) override;
-  virtual void Next() override;
-  virtual Slice key() const override;
-  virtual Slice value() const override;
-  virtual Status status() const override;
-  virtual Status GetProperty(std::string prop_name, std::string* prop) override;
+  const KeyValueEntry& Entry() const final;
+  const KeyValueEntry& SeekToFirst() final;
+  const KeyValueEntry& Seek(Slice target) final;
+  const KeyValueEntry& Next() final;
+  Status status() const final;
+  Status GetProperty(std::string prop_name, std::string* prop) final;
 
   bool TEST_CheckDeletedIters(int* deleted_iters, int* num_iters);
 
@@ -120,7 +120,7 @@ class ForwardIterator : public InternalIterator {
   std::vector<InternalIterator*> l0_iters_;
   std::vector<LevelIterator*> level_iters_;
   InternalIterator* current_;
-  bool valid_;
+  KeyValueEntry entry_;
 
   // Internal iterator status; set only by one of the unsupported methods.
   Status status_;

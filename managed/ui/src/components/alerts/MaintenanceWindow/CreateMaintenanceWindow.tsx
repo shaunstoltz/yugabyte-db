@@ -16,20 +16,16 @@ import { useMutation } from 'react-query';
 import {
   convertUTCStringToDate,
   createMaintenanceWindow,
-  formatDateToUTC,
   MaintenanceWindowSchema,
   updateMaintenanceWindow
 } from '.';
 import { toast } from 'react-toastify';
 import { createErrorMessage } from '../../../utils/ObjectUtils';
+import { convertToISODateString, YBTimeFormats } from '../../../redesign/helpers/DateUtils';
 
-// eslint-disable-next-line @typescript-eslint/no-var-requires
-const reactWidgets = require('react-widgets');
-// eslint-disable-next-line @typescript-eslint/no-var-requires
-const momentLocalizer = require('react-widgets-moment');
-require('react-widgets/dist/css/react-widgets.css');
-
-const { DateTimePicker } = reactWidgets;
+import { DateTimePicker } from 'react-widgets';
+import momentLocalizer from 'react-widgets-moment';
+import 'react-widgets/dist/css/react-widgets.css';
 momentLocalizer(moment);
 
 interface CreateMaintenanceWindowProps {
@@ -49,12 +45,21 @@ const targetOptions = [
   { label: 'Selected Universes', value: TARGET_OPTIONS.SELECTED }
 ];
 
+const supressUniverseOptions = [
+  { label: 'All Universes', value: true },
+  { label: 'Selected Universes', value: false }
+];
+
 const initialValues = {
   target: TARGET_OPTIONS.ALL,
-  selectedUniverse: []
+  selectedUniverse: [],
+  suppressHealthCheckNotificationsConfig: {
+    suppressAllUniverses: true,
+    universeUUIDSet: [] as any[]
+  }
 };
 
-const DATE_FORMAT = 'YYYY-DD-MMMM';
+const DATE_FORMAT = YBTimeFormats.YB_DATE_ONLY_TIMESTAMP;
 
 const validationSchema = Yup.object().shape({
   name: Yup.string().required('Enter name'),
@@ -65,6 +70,12 @@ const validationSchema = Yup.object().shape({
   selectedUniverse: Yup.array().when('target', {
     is: TARGET_OPTIONS.SELECTED,
     then: Yup.array().min(1, 'atleast one universe has to be selected')
+  }),
+  suppressHealthCheckNotificationsConfig: Yup.object().shape({
+    universeUUIDSet: Yup.array().when('suppressAllUniverses', {
+      is: (e) => !e,
+      then: Yup.array().min(1, 'atleast one universe has to be selected')
+    })
   })
 });
 
@@ -90,6 +101,13 @@ export const CreateMaintenanceWindow: FC<CreateMaintenanceWindowProps> = ({
             all: values['target'] === TARGET_OPTIONS.ALL,
             uuids: values['selectedUniverse'].map((universe: any) => universe.value)
           }
+        },
+        suppressHealthCheckNotificationsConfig: {
+          suppressAllUniverses:
+            values['suppressHealthCheckNotificationsConfig'].suppressAllUniverses,
+          universeUUIDSet: values['suppressHealthCheckNotificationsConfig'].universeUUIDSet.map(
+            (universe: any) => universe.value
+          )
         }
       });
     },
@@ -115,6 +133,13 @@ export const CreateMaintenanceWindow: FC<CreateMaintenanceWindowProps> = ({
             all: values['target'] === TARGET_OPTIONS.ALL,
             uuids: values['selectedUniverse'].map((universe: any) => universe.value)
           }
+        },
+        suppressHealthCheckNotificationsConfig: {
+          suppressAllUniverses:
+            values['suppressHealthCheckNotificationsConfig'].suppressAllUniverses,
+          universeUUIDSet: values['suppressHealthCheckNotificationsConfig'].universeUUIDSet.map(
+            (universe: any) => universe.value
+          )
         }
       });
     },
@@ -147,12 +172,21 @@ export const CreateMaintenanceWindow: FC<CreateMaintenanceWindowProps> = ({
     const selectedUniverse = findUniverseNamesByUUIDs(
       selectedWindow?.alertConfigurationFilter.target.uuids
     );
+    const universeUUIDSet = findUniverseNamesByUUIDs(
+      selectedWindow?.suppressHealthCheckNotificationsConfig.universeUUIDSet
+    );
+
     return {
       ...selectedWindow,
       target: selectedWindow?.alertConfigurationFilter.target.all
         ? TARGET_OPTIONS.ALL
         : TARGET_OPTIONS.SELECTED,
-      selectedUniverse
+      selectedUniverse,
+      suppressHealthCheckNotificationsConfig: {
+        suppressAllUniverses:
+          selectedWindow.suppressHealthCheckNotificationsConfig.suppressAllUniverses,
+        universeUUIDSet
+      }
     };
   };
 
@@ -161,8 +195,8 @@ export const CreateMaintenanceWindow: FC<CreateMaintenanceWindowProps> = ({
       initialValues={getInitialValues()}
       onSubmit={(values) =>
         selectedWindow === null
-          ? createWindow.mutateAsync(values as MaintenanceWindowSchema)
-          : updateWindow.mutateAsync(values as MaintenanceWindowSchema)
+          ? createWindow.mutateAsync((values as unknown) as MaintenanceWindowSchema)
+          : updateWindow.mutateAsync((values as unknown) as MaintenanceWindowSchema)
       }
       validationSchema={validationSchema}
       validateOnBlur={false}
@@ -208,7 +242,7 @@ export const CreateMaintenanceWindow: FC<CreateMaintenanceWindowProps> = ({
                 formats={DATE_FORMAT}
                 min={new Date()}
                 onChange={(time: Date) =>
-                  setFieldValue('startTime' as never, formatDateToUTC(time), false)
+                  setFieldValue('startTime' as never, convertToISODateString(time), false)
                 }
                 defaultValue={
                   values['startTime'] ? convertUTCStringToDate(values['startTime']) : null
@@ -224,7 +258,7 @@ export const CreateMaintenanceWindow: FC<CreateMaintenanceWindowProps> = ({
                 step={10}
                 min={moment(new Date()).add(1, 'm').toDate()}
                 onChange={(time: Date) =>
-                  setFieldValue('endTime' as never, formatDateToUTC(time), false)
+                  setFieldValue('endTime' as never, convertToISODateString(time), false)
                 }
                 defaultValue={values['endTime'] ? convertUTCStringToDate(values['endTime']) : null}
               />
@@ -264,6 +298,58 @@ export const CreateMaintenanceWindow: FC<CreateMaintenanceWindowProps> = ({
                 className={values['target'] !== 'selected' ? 'hide-field' : ''}
               />
               <span className="field-error">{errors['selectedUniverse']}</span>
+            </Col>
+          </Row>
+          <Row>
+            <Col md={6}>
+              <div className="form-item-custom-label">Suppress Health Check Notifications</div>
+              {supressUniverseOptions.map((target) => (
+                <label className="btn-group btn-group-radio" key={target.value + ''}>
+                  <Field
+                    name="suppressHealthCheckNotificationsConfig.suppressAllUniverses"
+                    component="input"
+                    defaultChecked={
+                      values['suppressHealthCheckNotificationsConfig'].suppressAllUniverses ===
+                      target.value
+                    }
+                    onChange={(e: React.ChangeEvent<HTMLInputElement>) =>
+                      setFieldValue(
+                        'suppressHealthCheckNotificationsConfig.suppressAllUniverses' as never,
+                        target.value,
+                        false
+                      )
+                    }
+                    type="radio"
+                    value={target.value}
+                  />
+                  {target.label}
+                </label>
+              ))}
+              <Field
+                component={YBMultiSelectWithLabel}
+                options={universes}
+                hideSelectedOptions={false}
+                isMulti={true}
+                input={{
+                  defaultValue: values['suppressHealthCheckNotificationsConfig'].universeUUIDSet,
+                  onChange: (values: string[]) => {
+                    setFieldValue(
+                      'suppressHealthCheckNotificationsConfig.universeUUIDSet' as never,
+                      values ?? [],
+                      false
+                    );
+                  }
+                }}
+                validate={false}
+                className={
+                  values['suppressHealthCheckNotificationsConfig'].suppressAllUniverses
+                    ? 'hide-field'
+                    : ''
+                }
+              />
+              <span className="field-error">
+                {errors['suppressHealthCheckNotificationsConfig']?.universeUUIDSet}
+              </span>
             </Col>
           </Row>
           <Row className="action-btns-margin">

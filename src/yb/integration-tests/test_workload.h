@@ -15,9 +15,9 @@
 // specific language governing permissions and limitations
 // under the License.
 //
-// The following only applies to changes made to this file as part of YugaByte development.
+// The following only applies to changes made to this file as part of YugabyteDB development.
 //
-// Portions Copyright (c) YugaByte, Inc.
+// Portions Copyright (c) YugabyteDB, Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License"); you may not use this file except
 // in compliance with the License.  You may obtain a copy of the License at
@@ -28,7 +28,7 @@
 // is distributed on an "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express
 // or implied.  See the License for the specific language governing permissions and limitations
 // under the License.
-//
+
 #pragma once
 
 #include "yb/client/client_fwd.h"
@@ -46,14 +46,15 @@ class Thread;
 
 struct TestWorkloadOptions {
   static const client::YBTableName kDefaultTableName;
+  static const std::string kDefaultPayload;
 
   size_t payload_bytes = 11;
   int num_write_threads = 4;
   int num_read_threads = 0;
   int write_batch_size = 50;
   int write_interval_millis = 0;
-  int ttl = -1;
-  int table_ttl = -1;
+  int ttl_sec = -1;
+  int table_ttl_sec = -1;
   MonoDelta default_rpc_timeout = std::chrono::seconds(60);
   std::chrono::milliseconds write_timeout = std::chrono::seconds(20);
   bool timeout_allowed = false;
@@ -69,22 +70,22 @@ struct TestWorkloadOptions {
   client::YBTableName table_name = kDefaultTableName;
 
   bool is_transactional() const { return isolation_level != IsolationLevel::NON_TRANSACTIONAL; }
-  bool has_table_ttl() const { return table_ttl != -1; }
+  bool has_table_ttl() const { return table_ttl_sec != -1; }
 };
 
-// Utility class for generating a workload against a test cluster.
+// Utility class for generating a YCQL workload against a test cluster.
 //
 // The actual data inserted is random, and thus can't be verified for
 // integrity. However, this is still useful in conjunction with ClusterVerifier
 // to verify that replicas do not diverge.
-class TestWorkload {
+class TestYcqlWorkload {
  public:
-  explicit TestWorkload(MiniClusterBase* cluster);
-  ~TestWorkload();
+  explicit TestYcqlWorkload(MiniClusterBase* cluster);
+  ~TestYcqlWorkload();
 
-  TestWorkload(TestWorkload&& rhs);
+  TestYcqlWorkload(TestYcqlWorkload&& rhs);
 
-  void operator=(TestWorkload&& rhs);
+  void operator=(TestYcqlWorkload&& rhs);
 
   void set_payload_bytes(size_t n) {
     options_.payload_bytes = n;
@@ -106,12 +107,12 @@ class TestWorkload {
     options_.write_interval_millis = t;
   }
 
-  void set_ttl(int ttl) {
-    options_.ttl = ttl;
+  void set_ttl(int ttl_sec) {
+    options_.ttl_sec = ttl_sec;
   }
 
   void set_table_ttl(int ttl_sec) {
-    options_.table_ttl = ttl_sec;
+    options_.table_ttl_sec = ttl_sec;
   }
 
   void set_client_default_rpc_timeout_millis(int t) {

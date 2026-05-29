@@ -3,9 +3,9 @@
 //  LICENSE file in the root directory of this source tree. An additional grant
 //  of patent rights can be found in the PATENTS file in the same directory.
 //
-// The following only applies to changes made to this file as part of YugaByte development.
+// The following only applies to changes made to this file as part of YugabyteDB development.
 //
-// Portions Copyright (c) YugaByte, Inc.
+// Portions Copyright (c) YugabyteDB, Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License"); you may not use this file except
 // in compliance with the License.  You may obtain a copy of the License at
@@ -27,6 +27,8 @@
 
 #include <string>
 
+#include "yb/gutil/casts.h"
+
 #include "yb/rocksdb/db.h"
 #include "yb/rocksdb/db/memtable.h"
 #include "yb/rocksdb/db/version_set.h"
@@ -47,8 +49,20 @@ class InternalKeyComparator;
 class Mutex;
 class VersionSet;
 
+void MemTableListVersion::VerifyNumFlushginBytes() const {
+#ifndef NDEBUG
+  size_t total_data_size = 0;
+  for (const auto* mem_table : memlist_) {
+    total_data_size += mem_table->data_size();
+  }
+  DCHECK_EQ(total_data_size, total_data_size_);
+#endif
+}
+
 void MemTableListVersion::AddMemTable(MemTable* m) {
   memlist_.push_front(m);
+  total_data_size_ += m->data_size();
+  VerifyNumFlushginBytes();
   *parent_memtable_list_memory_usage_ += m->ApproximateMemoryUsage();
 }
 
@@ -68,10 +82,12 @@ MemTableListVersion::MemTableListVersion(
           old->max_write_buffer_number_to_maintain_),
       parent_memtable_list_memory_usage_(parent_memtable_list_memory_usage) {
   if (old != nullptr) {
+    total_data_size_ = old->total_data_size_;
     memlist_ = old->memlist_;
     for (auto& m : memlist_) {
       m->Ref();
     }
+    VerifyNumFlushginBytes();
 
     memlist_history_ = old->memlist_history_;
     for (auto& m : memlist_history_) {
@@ -106,6 +122,10 @@ void MemTableListVersion::Unref(autovector<MemTable*>* to_delete) {
   }
 }
 
+size_t MemTableList::TotalDataSize() const {
+  return current_->total_data_size_;
+}
+
 int MemTableList::NumNotFlushed() const {
   int size = static_cast<int>(current_->memlist_.size());
   assert(num_flush_not_started_ <= size);
@@ -114,7 +134,8 @@ int MemTableList::NumNotFlushed() const {
 
 // Usually immutable mem table list is empty, and frontier could be taken from active mem table.
 // So we implement logic to avoid doing clone when there is just one frontier source.
-UserFrontierPtr MemTableList::GetFrontier(UserFrontierPtr frontier, UpdateUserValueType type) {
+yb::storage::UserFrontierPtr MemTableList::GetFrontier(
+    yb::storage::UserFrontierPtr frontier, yb::storage::UpdateUserValueType type) {
   for (const auto& mem : current_->memlist_) {
     auto current = mem->GetFrontier(type);
     if (!current) {
@@ -127,6 +148,17 @@ UserFrontierPtr MemTableList::GetFrontier(UserFrontierPtr frontier, UpdateUserVa
     frontier->Update(*current, type);
   }
   return frontier;
+}
+
+UserFrontierRange MemTableList::MergeFrontiersWith(UserFrontierRange result) {
+  using yb::storage::UserFrontier;
+  using yb::storage::UpdateUserValueType;
+  for (const auto& mem : current_->memlist_) {
+    auto current = mem->GetFrontiers();
+    UserFrontier::Update(current.first.get(), UpdateUserValueType::kSmallest, &result.first);
+    UserFrontier::Update(current.second.get(), UpdateUserValueType::kLargest, &result.second);
+  }
+  return result;
 }
 
 int MemTableList::NumFlushed() const {
@@ -240,6 +272,8 @@ void MemTableListVersion::Remove(MemTable* m,
                                  autovector<MemTable*>* to_delete) {
   assert(refs_ == 1);  // only when refs_ == 1 is MemTableListVersion mutable
   memlist_.remove(m);
+  total_data_size_ -= m->data_size();
+  VerifyNumFlushginBytes();
 
   if (max_write_buffer_number_to_maintain_ > 0) {
     memlist_history_.push_front(m);
@@ -273,45 +307,52 @@ bool MemTableList::IsFlushPending() const {
 }
 
 // Returns the memtables that need to be flushed.
-void MemTableList::PickMemtablesToFlush(autovector<MemTable*>* ret, const MemTableFilter& filter) {
+void MemTableList::PickMemtablesToFlush(
+    autovector<MemTable*>* ret, const MemTableFilter& filter,
+    const MutableCFOptions* mutable_cf_options) {
   const auto& memlist = current_->memlist_;
   bool all_memtables_logged = false;
+  bool write_blocked =
+      mutable_cf_options &&
+      yb::make_signed(current_->memlist_.size()) >= mutable_cf_options->max_write_buffer_number;
   for (auto it = memlist.rbegin(); it != memlist.rend(); ++it) {
     MemTable* m = *it;
-    if (!m->flush_in_progress_) {
-      if (filter) {
-        Result<bool> filter_result = filter(*m);
-        if (filter_result.ok()) {
-          if (!filter_result.get()) {
-            // The filter succeeded and said that this memtable cannot be flushed yet.
-            continue;
-          }
-        } else {
-          // This failure usually means that there is an empty immutable memtable. We need to output
-          // additional diagnostics in that case.
-          ostringstream ss;
-          if (!all_memtables_logged) {
-            ss << ". All memtables:\n";
-            for (const MemTable* memtable_for_logging : memlist) {
-              ss << "  " << memtable_for_logging->ToString() << "\n";
-            }
-            all_memtables_logged = true;
-          }
-          LOG(ERROR) << "Failed when checking if memtable can be flushed (will still flush it): "
-                     << filter_result.status() << ". Memtable: " << m->ToString()
-                     << ss.str();
-          // Still flush the memtable so that this error does not keep occurring.
-        }
-      }
-      assert(!m->flush_completed_);
-      num_flush_not_started_--;
-      if (num_flush_not_started_ == 0) {
-        imm_flush_needed.store(false, std::memory_order_release);
-      }
-      m->flush_in_progress_ = true;  // flushing will start very soon
-      ret->push_back(m);
+    if (m->flush_in_progress_) {
+      continue;
     }
+    if (filter) {
+      Result<bool> filter_result = filter(*m, write_blocked);
+      if (filter_result.ok()) {
+        if (!filter_result.get()) {
+          // The filter succeeded and said that this memtable cannot be flushed yet.
+          break;
+        }
+      } else {
+        // This failure usually means that there is an empty immutable memtable. We need to output
+        // additional diagnostics in that case.
+        ostringstream ss;
+        if (!all_memtables_logged) {
+          ss << ". All memtables:\n";
+          for (const MemTable* memtable_for_logging : memlist) {
+            ss << "  " << memtable_for_logging->ToString() << "\n";
+          }
+          all_memtables_logged = true;
+        }
+        LOG(DFATAL) << "Failed when checking if memtable can be flushed (will still flush it): "
+                    << filter_result.status() << ". Memtable: " << m->ToString()
+                    << ss.str();
+        // Still flush the memtable so that this error does not keep occurring.
+      }
+    }
+    assert(!m->flush_completed_);
+    num_flush_not_started_--;
+    if (num_flush_not_started_ == 0) {
+      imm_flush_needed.store(false, std::memory_order_release);
+    }
+    m->flush_in_progress_ = true;  // flushing will start very soon
+    ret->push_back(m);
   }
+
   flush_requested_ = false;  // start-flush request is complete
 }
 
@@ -342,7 +383,7 @@ Status MemTableList::InstallMemtableFlushResults(
   mu->AssertHeld();
 
   // flush was successful
-  std::unique_ptr<UserFrontiers> frontiers;
+  yb::storage::UserFrontiersPtr frontiers;
   for (size_t i = 0; i < mems.size(); ++i) {
     // All the edits are associated with the first memtable of this batch.
     DCHECK(i == 0 || mems[i]->GetEdits()->NumEntries() == 0);
@@ -350,11 +391,7 @@ Status MemTableList::InstallMemtableFlushResults(
     mems[i]->flush_completed_ = true;
     auto temp_range = mems[i]->Frontiers();
     if (temp_range) {
-      if (frontiers) {
-        frontiers->MergeFrontiers(*temp_range);
-      } else {
-        frontiers = temp_range->Clone();
-      }
+      UpdateFrontiers(frontiers, *temp_range);
     }
     mems[i]->file_number_holder_ = file_number_holder;
     mems[i]->file_number_ = file_number;
@@ -381,8 +418,8 @@ Status MemTableList::InstallMemtableFlushResults(
       break;
     }
 
-    LOG_TO_BUFFER(log_buffer, "[%s] Level-0 commit table #%" PRIu64 " started",
-                cfd->GetName().c_str(), m->file_number_);
+    LOG_TO_BUFFER_DETAIL(log_buffer, "[%s] Level-0 commit table #%" PRIu64 " started",
+                         cfd->GetName().c_str(), m->file_number_);
 
     // this can release and reacquire the mutex.
     s = vset->LogAndApply(cfd, mutable_cf_options, &m->edit_, mu, db_directory);
@@ -396,9 +433,9 @@ Status MemTableList::InstallMemtableFlushResults(
     uint64_t mem_id = 1;  // how many memtables have been flushed.
     do {
       if (s.ok()) { // commit new state
-        LOG_TO_BUFFER(log_buffer, "[%s] Level-0 commit table #%" PRIu64
-                                ": memtable #%" PRIu64 " done",
-                    cfd->GetName().c_str(), m->file_number_, mem_id);
+        LOG_TO_BUFFER_DETAIL(log_buffer, "[%s] Level-0 commit table #%" PRIu64
+                                         ": memtable #%" PRIu64 " done",
+                             cfd->GetName().c_str(), m->file_number_, mem_id);
         assert(m->file_number_ > 0);
         current_->Remove(m, to_delete);
       } else {

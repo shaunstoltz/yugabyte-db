@@ -5,9 +5,9 @@
 //  LICENSE file in the root directory of this source tree. An additional grant
 //  of patent rights can be found in the PATENTS file in the same directory.
 //
-// The following only applies to changes made to this file as part of YugaByte development.
+// The following only applies to changes made to this file as part of YugabyteDB development.
 //
-// Portions Copyright (c) YugaByte, Inc.
+// Portions Copyright (c) YugabyteDB, Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License"); you may not use this file except
 // in compliance with the License.  You may obtain a copy of the License at
@@ -49,8 +49,13 @@ stl_wrappers::KVMap MakeMockFile(
   return stl_wrappers::KVMap(l, stl_wrappers::LessOfComparator(&icmp_));
 }
 
-InternalIterator* MockTableReader::NewIterator(const ReadOptions&, Arena* arena,
-                                               bool skip_filters) {
+InternalIterator* MockTableReader::NewIterator(
+    const ReadOptions&, Arena* arena, bool skip_filters,
+    SkipCorruptDataBlocksUnsafe skip_corrupt_data_blocks_unsafe) {
+  if (skip_corrupt_data_blocks_unsafe) {
+    return NewErrorInternalIterator(
+        STATUS(InvalidArgument, "skip_corrupt_data_blocks_unsafe not supported"), arena);
+  }
   return new MockTableIterator(table_);
 }
 

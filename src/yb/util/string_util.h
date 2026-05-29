@@ -3,9 +3,9 @@
 //  LICENSE file in the root directory of this source tree. An additional grant
 //  of patent rights can be found in the PATENTS file in the same directory.
 //
-// The following only applies to changes made to this file as part of YugaByte development.
+// The following only applies to changes made to this file as part of YugabyteDB development.
 //
-// Portions Copyright (c) YugaByte, Inc.
+// Portions Copyright (c) YugabyteDB, Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License"); you may not use this file except
 // in compliance with the License.  You may obtain a copy of the License at
@@ -20,8 +20,10 @@
 
 #pragma once
 
+#include <algorithm>
 #include <sstream>
 #include <string>
+#include <string_view>
 #include <vector>
 
 #include <boost/range/iterator_range.hpp>
@@ -70,7 +72,8 @@ struct ToStringVectorHelper<Unpacker<T> > {
   }
 
   template<class... Args>
-  static void Append(std::vector<std::string>* dest, const Unpacker<T>& unpacker, const Args&... args) {
+  static void Append(
+      std::vector<std::string>* dest, const Unpacker<T>& unpacker, const Args&... args) {
     for(auto&& i : unpacker.container) {
       dest->push_back(ToString(i));
     }
@@ -120,8 +123,11 @@ inline std::string VectorToString(const std::vector<T>& vec) {
 // Examples:
 // - abcd == ABCD
 // - AbCd == aBCD
-bool EqualsIgnoreCase(const std::string &string1,
-                      const std::string &string2);
+bool EqualsIgnoreCase(Slice a, Slice b);
+inline bool EqualsIgnoreCase(
+    const std::string &string1, const std::string &string2) {
+  return EqualsIgnoreCase(Slice(string1), Slice(string2));
+}
 
 template <class T>
 std::string RightPadToWidth(const T& val, int width) {
@@ -192,6 +198,18 @@ inline void EnlargeBufferIfNeeded(std::string* buffer, const size_t new_capacity
 std::vector<std::string> SplitAndFlatten(
     const std::vector<std::string>& input,
     const char* separators = ",");
+
+template<class Iterator>
+Iterator FindSubstring(std::string_view str, const Iterator& begin, const Iterator& end) {
+  return std::find_if(
+      begin, end, [str](const auto& substr) { return str.find(substr) != std::string::npos; });
+}
+
+template<class Container>
+bool HasSubstring(std::string_view str, const Container& container) {
+  auto end = std::end(container);
+  return FindSubstring(str, std::begin(container), end) != end;
+}
 
 }  // namespace yb
 

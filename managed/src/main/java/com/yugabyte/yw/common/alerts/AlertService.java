@@ -1,5 +1,5 @@
 /*
- * Copyright 2021 YugaByte, Inc. and Contributors
+ * Copyright 2021 YugabyteDB, Inc. and Contributors
  *
  * Licensed under the Polyform Free Trial License 1.0.0 (the "License"); you
  * may not use this file except in compliance with the License. You
@@ -27,9 +27,11 @@ import com.yugabyte.yw.models.helpers.KnownAlertLabels;
 import com.yugabyte.yw.models.paging.AlertPagedQuery;
 import com.yugabyte.yw.models.paging.AlertPagedResponse;
 import com.yugabyte.yw.models.paging.PagedQuery.SortDirection;
+import io.ebean.DB;
 import io.ebean.Query;
 import io.ebean.annotation.Transactional;
 import java.util.Collections;
+import java.util.Date;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
@@ -40,7 +42,7 @@ import java.util.stream.Collectors;
 import javax.inject.Inject;
 import javax.inject.Singleton;
 import lombok.extern.slf4j.Slf4j;
-import org.apache.commons.collections.CollectionUtils;
+import org.apache.commons.collections4.CollectionUtils;
 
 @Singleton
 @Slf4j
@@ -61,8 +63,7 @@ public class AlertService {
 
     List<Alert> beforeAlerts = Collections.emptyList();
     Set<UUID> alertUuids =
-        alerts
-            .stream()
+        alerts.stream()
             .filter(alert -> !alert.isNew())
             .map(Alert::getUuid)
             .collect(Collectors.toSet());
@@ -74,8 +75,7 @@ public class AlertService {
         beforeAlerts.stream().collect(Collectors.toMap(Alert::getUuid, Function.identity()));
 
     Map<EntityOperation, List<Alert>> toCreateAndUpdate =
-        alerts
-            .stream()
+        alerts.stream()
             .map(alert -> prepareForSave(alert, beforeAlertMap.get(alert.getUuid())))
             .filter(alert -> filterForSave(alert, beforeAlertMap.get(alert.getUuid())))
             .peek(alert -> validate(alert, beforeAlertMap.get(alert.getUuid())))
@@ -84,12 +84,12 @@ public class AlertService {
     List<Alert> toCreate = toCreateAndUpdate.getOrDefault(CREATE, Collections.emptyList());
     if (!toCreate.isEmpty()) {
       toCreate.forEach(Alert::generateUUID);
-      Alert.db().saveAll(toCreate);
+      DB.getDefault().saveAll(toCreate);
     }
 
     List<Alert> toUpdate = toCreateAndUpdate.getOrDefault(UPDATE, Collections.emptyList());
     if (!toUpdate.isEmpty()) {
-      Alert.db().updateAll(toUpdate);
+      DB.getDefault().updateAll(toUpdate);
     }
 
     log.trace("{} alerts saved", toCreate.size() + toUpdate.size());
@@ -119,12 +119,19 @@ public class AlertService {
     return alert;
   }
 
+  public Alert getOrBadRequest(UUID customerUUID, UUID uuid) {
+    Alert alert = getOrBadRequest(uuid);
+    if (!(alert.getCustomerUUID().equals(customerUUID))) {
+      throw new PlatformServiceException(BAD_REQUEST, "Invalid Alert UUID: " + uuid);
+    }
+    return alert;
+  }
+
   @Transactional
   public List<Alert> markResolved(AlertFilter filter) {
     AlertFilter notResolved = filter.toBuilder().states(State.getFiringStates()).build();
     List<Alert> resolved =
-        list(notResolved)
-            .stream()
+        list(notResolved).stream()
             .peek(
                 alert -> {
                   boolean wasInitiallySuspended =
@@ -154,8 +161,7 @@ public class AlertService {
   public List<Alert> acknowledge(AlertFilter filter) {
     AlertFilter notResolved = filter.toBuilder().state(Alert.State.ACTIVE, State.SUSPENDED).build();
     List<Alert> resolved =
-        list(notResolved)
-            .stream()
+        list(notResolved).stream()
             .map(
                 alert ->
                     alert
@@ -286,5 +292,13 @@ public class AlertService {
           .forField("", "can't update missing alert '" + alert.getUuid() + "'")
           .throwError();
     }
+  }
+
+  public List<Alert> listByCustomerSince(UUID customerUuid, Date cutoff) {
+    return Alert.createQueryByFilter(AlertFilter.builder().customerUuid(customerUuid).build())
+        .ge("createTime", cutoff)
+        .orderBy()
+        .desc("createTime")
+        .findList();
   }
 }

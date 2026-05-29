@@ -15,9 +15,9 @@
 // specific language governing permissions and limitations
 // under the License.
 //
-// The following only applies to changes made to this file as part of YugaByte development.
+// The following only applies to changes made to this file as part of YugabyteDB development.
 //
-// Portions Copyright (c) YugaByte, Inc.
+// Portions Copyright (c) YugabyteDB, Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License"); you may not use this file except
 // in compliance with the License.  You may obtain a copy of the License at
@@ -47,8 +47,6 @@
 namespace yb {
 namespace consensus {
 
-using std::vector;
-
 // TODO: Share a test harness with ConsensusMetadataTest?
 const char* kTabletId = "TestTablet";
 
@@ -71,9 +69,8 @@ class RaftConsensusStateTest : public YBTest {
     peer->set_permanent_uuid(fs_manager_.uuid());
     peer->set_member_type(PeerMemberType::VOTER);
 
-    std::unique_ptr<ConsensusMetadata> cmeta;
-    ASSERT_OK(ConsensusMetadata::Create(&fs_manager_, kTabletId, fs_manager_.uuid(),
-                                        config_, kMinimumTerm, &cmeta));
+    std::unique_ptr<ConsensusMetadata> cmeta = ASSERT_RESULT(ConsensusMetadata::Create(
+        &fs_manager_, kTabletId, fs_manager_.uuid(), config_, kMinimumTerm));
     state_.reset(new ReplicaState(
         ConsensusOptions(), fs_manager_.uuid(), std::move(cmeta), operation_factory_.get(),
         nullptr /* safe_op_id_waiter */, nullptr /* retryable_requests */,
@@ -82,7 +79,7 @@ class RaftConsensusStateTest : public YBTest {
     // Start up the ReplicaState.
     ReplicaState::UniqueLock lock;
     ASSERT_OK(state_->LockForStart(&lock));
-    ASSERT_OK(state_->StartUnlocked(MinimumOpId()));
+    ASSERT_OK(state_->StartUnlocked(OpId::Min()));
   }
 
  protected:

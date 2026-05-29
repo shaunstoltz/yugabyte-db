@@ -1,5 +1,5 @@
 //
-// Copyright (c) YugaByte, Inc.
+// Copyright (c) YugabyteDB, Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License"); you may not use this file except
 // in compliance with the License.  You may obtain a copy of the License at
@@ -33,9 +33,8 @@ namespace yb {
 HAS_MEMBER_FUNCTION(DynamicMemoryUsage);
 HAS_FREE_FUNCTION(DynamicMemoryUsageOf);
 
-template <class T>
-typename std::enable_if<HasMemberFunction_DynamicMemoryUsage<T>::value, std::size_t>::type
-DynamicMemoryUsageOf(const T& value) {
+template <class T> requires (HasMemberFunction_DynamicMemoryUsage<T>::value)
+std::size_t DynamicMemoryUsageOf(const T& value) {
   return value.DynamicMemoryUsage();
 }
 
@@ -67,9 +66,15 @@ inline std::size_t DynamicMemoryUsageOf(const std::string& value) {
   if (capacity <= kStdStringInternalCapacity) {
     return 0;
   } else {
-    // std::string allocates 16*n bytes for capacity from [16*(n - 1); 16*n - 1].
+#if defined(YB_GPERFTOOLS_TCMALLOC)
+    // gperftools tcmalloc allocates exactly capacity + 1 bytes.
+    return capacity + 1;
+#else
+    // Google tcmalloc allocates 16*n bytes for std::string capacity
+    // from [16*(n - 1); 16*n - 1].
     // 48 bytes for capacity in [32; 47], 64 bytes for capacity in [48; 63] and so on...
     return (capacity + 16) & ~(size_t(0xf));
+#endif
   }
 }
 
@@ -142,8 +147,8 @@ size_t DynamicMemoryUsageOf(const boost::container::small_vector<T, InternalCapa
 }
 
 template <class T>
-typename std::enable_if<IsCollection<T>::value, std::size_t>::type
-DynamicMemoryUsageOf(const T& value) {
+    requires (IsCollection<T>::value && !HasMemberFunction_DynamicMemoryUsage<T>::value)
+std::size_t DynamicMemoryUsageOf(const T& value) {
   return DynamicMemoryUsageOfCollection(value);
 }
 
@@ -156,9 +161,18 @@ std::size_t DynamicMemoryUsageOfCollection(const Collection& collection) {
   return result;
 }
 
-template <typename T, typename... Types>
+template <typename T, typename... Types> requires (sizeof...(Types) > 0)
 std::size_t DynamicMemoryUsageOf(const T& entity, const Types&... rest_entities) {
   return DynamicMemoryUsageOf(entity) + DynamicMemoryUsageOf(rest_entities...);
+}
+
+template <typename T>
+std::size_t DynamicMemoryUsageOrSizeOf(const T& value) {
+  if constexpr (HasFreeFunction_DynamicMemoryUsageOf<T>::value) {
+    return DynamicMemoryUsageOf(value);
+  } else {
+    return sizeof(value);
+  }
 }
 
 }  // namespace yb

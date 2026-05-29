@@ -3,9 +3,9 @@
 //  LICENSE file in the root directory of this source tree. An additional grant
 //  of patent rights can be found in the PATENTS file in the same directory.
 //
-// The following only applies to changes made to this file as part of YugaByte development.
+// The following only applies to changes made to this file as part of YugabyteDB development.
 //
-// Portions Copyright (c) YugaByte, Inc.
+// Portions Copyright (c) YugabyteDB, Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License"); you may not use this file except
 // in compliance with the License.  You may obtain a copy of the License at
@@ -97,7 +97,7 @@ struct BatchContentClassifier : public WriteBatch::Handler {
     return Status::OK();
   }
 
-  Status Frontiers(const UserFrontiers& range) override {
+  Status Frontiers(const yb::storage::UserFrontiers& range) override {
     content_flags |= ContentFlags::HAS_FRONTIERS;
     return Status::OK();
   }
@@ -166,7 +166,7 @@ struct SavePoint {
   size_t size;  // size of rep_
   uint32_t count;    // count of elements in rep_
   uint32_t content_flags;
-  const UserFrontiers* frontiers;
+  const yb::storage::UserFrontiers* frontiers;
 };
 
 struct SavePoints {
@@ -251,7 +251,7 @@ uint32_t WriteBatch::ComputeContentFlags() const {
   if ((rv & ContentFlags::DEFERRED) != 0) {
     BatchContentClassifier classifier;
     auto status = Iterate(&classifier);
-    LOG_IF(ERROR, !status.ok()) << "Iterate failed during ComputeContentFlags: " << status;
+    LOG_IF(WARNING, !status.ok()) << "Iterate failed during ComputeContentFlags: " << status;
     rv = classifier.content_flags;
 
     // this method is conceptually const, because it is performing a lazy
@@ -355,8 +355,12 @@ Status WriteBatch::Iterate(Handler* handler) const {
       s = result.status();
     }
   }
-  if (frontiers_) {
+  if (s.ok() && frontiers_) {
     s = handler->Frontiers(*frontiers_);
+    if (handler_for_logging_) {
+      WARN_NOT_OK(
+          handler_for_logging_->Frontiers(*frontiers_), "Logging handler failed on Frontiers");
+    }
   }
   while (s.ok() && !input.empty() && handler->Continue()) {
     char tag = 0;
@@ -374,6 +378,12 @@ Status WriteBatch::Iterate(Handler* handler) const {
         assert(content_flags_.load(std::memory_order_relaxed) &
                (ContentFlags::DEFERRED | ContentFlags::HAS_PUT));
         s = handler->PutCF(column_family, SliceParts(&key, 1), SliceParts(&value, 1));
+        if (handler_for_logging_) {
+          WARN_NOT_OK(
+              handler_for_logging_->PutCF(
+                  column_family, SliceParts(&key, 1), SliceParts(&value, 1)),
+              "Logging handler failed on PutCF");
+        }
         found++;
         break;
       case kTypeColumnFamilyDeletion:
@@ -381,6 +391,11 @@ Status WriteBatch::Iterate(Handler* handler) const {
         assert(content_flags_.load(std::memory_order_relaxed) &
                (ContentFlags::DEFERRED | ContentFlags::HAS_DELETE));
         s = handler->DeleteCF(column_family, key);
+        if (handler_for_logging_) {
+          WARN_NOT_OK(
+              handler_for_logging_->DeleteCF(column_family, key),
+              "Logging handler failed on DeleteCF");
+        }
         found++;
         break;
       case kTypeColumnFamilySingleDeletion:
@@ -388,6 +403,11 @@ Status WriteBatch::Iterate(Handler* handler) const {
         assert(content_flags_.load(std::memory_order_relaxed) &
                (ContentFlags::DEFERRED | ContentFlags::HAS_SINGLE_DELETE));
         s = handler->SingleDeleteCF(column_family, key);
+        if (handler_for_logging_) {
+          WARN_NOT_OK(
+              handler_for_logging_->SingleDeleteCF(column_family, key),
+              "Logging handler failed on SingleDeleteCF");
+        }
         found++;
         break;
       case kTypeColumnFamilyMerge:
@@ -395,10 +415,18 @@ Status WriteBatch::Iterate(Handler* handler) const {
         assert(content_flags_.load(std::memory_order_relaxed) &
                (ContentFlags::DEFERRED | ContentFlags::HAS_MERGE));
         s = handler->MergeCF(column_family, key, value);
+        if (handler_for_logging_) {
+          WARN_NOT_OK(
+              handler_for_logging_->MergeCF(column_family, key, value),
+              "Logging handler failed on MergeCF");
+        }
         found++;
         break;
       case kTypeLogData:
         handler->LogData(blob);
+        if (handler_for_logging_) {
+          handler_for_logging_->LogData(blob);
+        }
         break;
       default:
         return STATUS(Corruption, "unknown WriteBatch tag");
@@ -860,12 +888,10 @@ class MemTableInserter : public WriteBatch::Handler {
       std::string new_value;
       bool merge_success = false;
       {
-        StopWatchNano timer(Env::Default(), moptions->statistics != nullptr);
+        StopWatchNano timer(Env::Default(), moptions->statistics, MERGE_OPERATION_TOTAL_TIME);
         PERF_TIMER_GUARD(merge_operator_time_nanos);
         merge_success = merge_operator->FullMerge(
             key, &get_value_slice, operands, &new_value, moptions->info_log);
-        RecordTick(moptions->statistics, MERGE_OPERATION_TOTAL_TIME,
-                   timer.ElapsedNanos());
       }
 
       if (!merge_success) {
@@ -891,7 +917,7 @@ class MemTableInserter : public WriteBatch::Handler {
     return Status::OK();
   }
 
-  Status Frontiers(const UserFrontiers& frontiers) override {
+  Status Frontiers(const yb::storage::UserFrontiers& frontiers) override {
     Status seek_status;
     if (!SeekToColumnFamily(0, &seek_status)) {
       return seek_status;
@@ -985,6 +1011,13 @@ size_t WriteBatchInternal::AppendedByteSize(size_t leftByteSize,
 
 Result<size_t> DirectInsert(
     WriteBatch::Handler* handler, DirectWriter* writer, WriteBatch::Handler* handler_for_logging) {
+#ifndef NDEBUG
+  if (dynamic_cast<MemTableInserter*>(handler) == nullptr) {
+    LOG(FATAL) << "WriteBatch::Iterate cannot be used with write batches using direct writers due "
+                  "to incomplete implementation of direct writers";
+  }
+#endif
+
   auto mem_table_inserter = down_cast<MemTableInserter*>(handler);
   auto* mems = mem_table_inserter->cf_mems_;
   auto current = mems->current();
@@ -994,7 +1027,7 @@ Result<size_t> DirectInsert(
   }
   DirectWriteHandlerImpl direct_write_handler(
       current->mem(), mem_table_inserter->sequence_, handler_for_logging);
-  RETURN_NOT_OK(writer->Apply(&direct_write_handler));
+  RETURN_NOT_OK(writer->Apply(direct_write_handler));
   auto result = direct_write_handler.Complete();
   mem_table_inserter->CheckMemtableFull();
   return result;

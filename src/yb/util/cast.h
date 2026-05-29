@@ -1,4 +1,4 @@
-// Copyright (c) YugaByte, Inc.
+// Copyright (c) YugabyteDB, Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License"); you may not use this file except
 // in compliance with the License.  You may obtain a copy of the License at
@@ -30,6 +30,14 @@ inline uint8_t* to_uchar_ptr(char *ptr) {
 }
 
 inline const uint8_t* to_uchar_ptr(const char *ptr) {
+  return reinterpret_cast<const uint8_t *>(ptr);
+}
+
+inline uint8_t* to_uchar_ptr(std::byte *ptr) {
+  return reinterpret_cast<uint8_t *>(ptr);
+}
+
+inline const uint8_t* to_uchar_ptr(const std::byte *ptr) {
   return reinterpret_cast<const uint8_t *>(ptr);
 }
 

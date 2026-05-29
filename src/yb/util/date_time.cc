@@ -1,5 +1,5 @@
 //--------------------------------------------------------------------------------------------------
-// Copyright (c) YugaByte, Inc.
+// Copyright (c) YugabyteDB, Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License"); you may not use this file except
 // in compliance with the License.  You may obtain a copy of the License at
@@ -156,14 +156,20 @@ Result<string> GetTimezone(string timezoneID) {
   return buffer;
 }
 
-Result<time_zone_ptr> StringToTimezone(const std::string& tz, bool use_utc) {
+Result<time_zone_ptr> StringToTimezone(const string& tz, bool use_utc) {
+  string time_zone;
   if (tz.empty()) {
-    return use_utc ? kUtcTimezone : boost::make_shared<posix_time_zone>(GetSystemTimezone());
+    if (use_utc) {
+      return kUtcTimezone;
+    }
+    time_zone = GetSystemTimezone();
+  } else if (FLAGS_use_icu_timezones) {
+    time_zone = VERIFY_RESULT(GetTimezone(tz));
+  } else {
+    time_zone = tz;
   }
-  if (FLAGS_use_icu_timezones) {
-    return boost::make_shared<posix_time_zone>(VERIFY_RESULT(GetTimezone(tz)));
-  }
-  return boost::make_shared<posix_time_zone>(tz);
+
+  return boost::make_shared<posix_time_zone>(time_zone);
 }
 
 } // namespace
@@ -220,6 +226,10 @@ string DateTime::TimestampToString(const Timestamp timestamp, const OutputFormat
 
 Timestamp DateTime::TimestampNow() {
   return ToTimestamp(local_microsec_clock::local_time(kUtcTimezone));
+}
+
+string DateTime::SystemTimezone() {
+  return GetSystemTimezone();
 }
 
 //------------------------------------------------------------------------------------------------
@@ -385,6 +395,13 @@ int64_t DateTime::AdjustPrecision(int64_t val,
     input_precision -= 1;
   }
   return val;
+}
+
+// returns floor of the timestamp rounded to output_precision
+int64_t DateTime::FloorTimestamp(
+    int64_t val, size_t input_precision, const size_t output_precision) {
+  auto interim_val = AdjustPrecision(val, input_precision, output_precision);
+  return AdjustPrecision(interim_val, output_precision, input_precision);
 }
 
 namespace {

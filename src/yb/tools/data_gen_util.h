@@ -15,9 +15,9 @@
 // specific language governing permissions and limitations
 // under the License.
 //
-// The following only applies to changes made to this file as part of YugaByte development.
+// The following only applies to changes made to this file as part of YugabyteDB development.
 //
-// Portions Copyright (c) YugaByte, Inc.
+// Portions Copyright (c) YugabyteDB, Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License"); you may not use this file except
 // in compliance with the License.  You may obtain a copy of the License at
@@ -36,10 +36,10 @@
 #include <stddef.h>
 #include <stdint.h>
 
+#include "yb/common/common_fwd.h"
+
 namespace yb {
 
-class QLValuePB;
-class QLWriteRequestPB;
 class Random;
 
 namespace client {
@@ -56,12 +56,12 @@ namespace tools {
 void WriteValueToColumn(const client::YBSchema& schema,
                         size_t col_idx,
                         uint64_t value,
-                        QLValuePB* out);
+                        QLValueMsg* out);
 
 // Generate row data for an arbitrary schema. Initial column value determined
 // by the value of 'record_id'.
 void GenerateDataForRow(const client::YBSchema& schema, uint64_t record_id,
-                        Random* random, QLWriteRequestPB* req);
+                        Random* random, QLWriteRequestMsg* req);
 
 } // namespace tools
 } // namespace yb

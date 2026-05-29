@@ -1,12 +1,12 @@
 <project xmlns="http://maven.apache.org/POM/4.0.0"
-	xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
-	xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 http://maven.apache.org/xsd/maven-4.0.0.xsd">
+xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 http://maven.apache.org/xsd/maven-4.0.0.xsd">
 	<modelVersion>4.0.0</modelVersion>
 
 	<parent>
 		<groupId>org.yb</groupId>
 		<artifactId>yb-anywhere-modules</artifactId>
-		<version>${revision}</version>
+		<version>0.0.1-SNAPSHOT</version>
 		<relativePath>../parent-module/pom.xml</relativePath>
 	</parent>
 
@@ -66,22 +66,23 @@
 						</goals>
 						<configuration>
 							<executable>${basedir}/build.sh</executable>
+							<skip>${skipPrepare}</skip>
 							<arguments>
 								<argument>prepare</argument>
 							</arguments>
 						</configuration>
 					</execution>
 					<execution>
-						<id>Build Node Agent</id>
+						<id>Release Node Agent Locally</id>
 						<phase>compile</phase>
 						<goals>
 							<goal>exec</goal>
 						</goals>
 						<configuration>
-							<executable>${basedir}/build.sh</executable>
-							<skip>${platformDependenciesOnly}</skip>
+							<executable>${basedir}/yb_release</executable>
+							<skip>${skipLocalRelease}</skip>
 							<arguments>
-								<argument>build</argument>
+								<argument>--local</argument>
 							</arguments>
 						</configuration>
 					</execution>

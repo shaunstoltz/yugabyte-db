@@ -3,12 +3,8 @@ package helpers
 import (
         "encoding/json"
         "errors"
-        "fmt"
-        "io/ioutil"
         "net"
-        "net/http"
-        "regexp"
-        "time"
+        "net/url"
 )
 
 type PathMetrics struct {
@@ -40,6 +36,7 @@ type TabletServer struct {
         Cloud                        string        `json:"cloud"`
         Region                       string        `json:"region"`
         Zone                         string        `json:"zone"`
+        PermanentUuid                string        `json:"permanent_uuid"`
 }
 
 type TabletServersFuture struct {
@@ -47,23 +44,16 @@ type TabletServersFuture struct {
         Error   error
 }
 
-func GetTabletServersFuture(nodeHost string, future chan TabletServersFuture) {
+func (h *HelperContainer) GetTabletServersFuture(nodeHost string, future chan TabletServersFuture) {
         tabletServers := TabletServersFuture{
                 Tablets: map[string]map[string]TabletServer{},
                 Error:   nil,
         }
-        httpClient := &http.Client{
-                Timeout: time.Second * 10,
-        }
-        url := fmt.Sprintf("http://%s:7000/api/v1/tablet-servers", nodeHost)
-        resp, err := httpClient.Get(url)
-        if err != nil {
-                tabletServers.Error = err
-                future <- tabletServers
-                return
-        }
-        defer resp.Body.Close()
-        body, err := ioutil.ReadAll(resp.Body)
+        body, err := h.BuildMasterURLsAndAttemptGetRequests(
+            "api/v1/tablet-servers", // path
+            url.Values{}, // params
+            true, // expectJson
+        )
         if err != nil {
                 tabletServers.Error = err
                 future <- tabletServers
@@ -84,10 +74,25 @@ func GetTabletServersFuture(nodeHost string, future chan TabletServersFuture) {
         err = json.Unmarshal([]byte(body), &tabletServers.Tablets)
         tabletServers.Error = err
         future <- tabletServers
+        // Update cache if successful. Note that this will happen in the background asynchronously.
+        if err == nil {
+            tserverAddresses := h.GetNodesList(tabletServers)
+            for index, host := range tserverAddresses {
+                if host == HOST {
+                    // Swap helpers.HOST to front of slice
+                    tserverAddresses[0], tserverAddresses[index] =
+                        tserverAddresses[index], tserverAddresses[0]
+                    break
+                }
+            }
+            TserverAddressCache.Update(tserverAddresses)
+            h.logger.Debugf("updated cached tserver addresses %v", tserverAddresses)
+        }
 }
 
-// Helper for getting the hostnames of each node given a TabletServersFuture response
-func GetNodesList(tablets TabletServersFuture) []string {
+// Helper for getting the hostnames of each node given a TabletServersFuture response.
+// Assumes TabletServersFuture.Error is nil.
+func (h *HelperContainer) GetNodesList(tablets TabletServersFuture) []string {
         hostNames := []string{}
         for _, obj := range tablets.Tablets {
                 for hostport := range obj {
@@ -100,37 +105,35 @@ func GetNodesList(tablets TabletServersFuture) []string {
         return hostNames
 }
 
-// Helper for getting a map between hostnames and uuids for tservers
-// For now, we hit the /tablet-servers endpoint and parse the html
-func GetHostToUuidMap(nodeHost string) (map[string]string, error) {
-        hostToUuidMap := map[string]string{}
-        httpClient := &http.Client{
-                Timeout: time.Second * 10,
+// Helper for getting a map between hostnames and uuids for tservers given a
+// TabletServersFuture response
+func (h *HelperContainer) GetHostToUuidMap(nodeHost string) (map[string]string, error) {
+    tabletServersFuture := make(chan TabletServersFuture)
+    go h.GetTabletServersFuture(nodeHost, tabletServersFuture)
+    tabletServersResponse := <-tabletServersFuture
+    if tabletServersResponse.Error != nil {
+        return map[string]string{}, tabletServersResponse.Error
+    }
+    hostToUuid := h.GetHostToUuidMapFromFuture(tabletServersResponse)
+    return hostToUuid, nil
+}
+
+// Helper for getting a map between hostnames and uuids for tservers given a
+// TabletServersFuture response. Assumes TabletServersFuture.Error is nil.
+func (h *HelperContainer) GetHostToUuidMapFromFuture(
+    tserversFuture TabletServersFuture,
+) map[string]string {
+    hostToUuid := map[string]string{}
+    for _, obj := range tserversFuture.Tablets {
+        for hostport, tserverData := range obj {
+            host, _, err := net.SplitHostPort(hostport)
+            if err == nil {
+                hostToUuid[host] = tserverData.PermanentUuid
+            } else {
+                h.logger.Warnf("failed to split hostport %s, couldn't get uuid of node", hostport)
+            }
         }
-        url := fmt.Sprintf("http://%s:7000/tablet-servers", HOST)
-        resp, err := httpClient.Get(url)
-        if err != nil {
-                return hostToUuidMap, err
-        }
-        defer resp.Body.Close()
-        body, err := ioutil.ReadAll(resp.Body)
-        if err != nil {
-                return hostToUuidMap, err
-        }
-        // Now we parse the html to get the hostnames and uuids
-        // This regex will not work if the layout of the page changes. In the future, it would be
-        // better if this information can be found in a json endpoint.
-        regex, err := regexp.Compile(`<\/tr>\s*<tr>\s*<td><a href=.*?>(.*?)<\/a><\/br>\s*(.*?)<\/td>`)
-        if err != nil {
-                return hostToUuidMap, err
-        }
-        matches := regex.FindAllSubmatch(body, -1)
-        for _, v := range matches {
-                host, _, err := net.SplitHostPort(string(v[1]))
-                if err != nil {
-                        return hostToUuidMap, err
-                }
-                hostToUuidMap[host] = string(v[2])
-        }
-        return hostToUuidMap, nil
+    }
+    h.logger.Debugf("host to uuid map: %v", hostToUuid)
+    return hostToUuid
 }

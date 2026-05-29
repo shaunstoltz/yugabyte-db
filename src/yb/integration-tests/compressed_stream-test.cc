@@ -1,4 +1,4 @@
-// Copyright (c) YugaByte, Inc.
+// Copyright (c) YugabyteDB, Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License"); you may not use this file except
 // in compliance with the License.  You may obtain a copy of the License at
@@ -37,8 +37,8 @@ namespace yb {
 class CompressedStreamTest : public client::KeyValueTableTest<MiniCluster> {
  public:
   void SetUp() override {
-    FLAGS_enable_stream_compression = true;
-    FLAGS_stream_compression_algo = 1;
+    ANNOTATE_UNPROTECTED_WRITE(FLAGS_enable_stream_compression) = true;
+    ANNOTATE_UNPROTECTED_WRITE(FLAGS_stream_compression_algo) = 1;
     KeyValueTableTest::SetUp();
   }
 
@@ -69,8 +69,8 @@ TEST_F(CompressedStreamTest, Simple) {
 
 TEST_F(CompressedStreamTest, BigWrite) {
   client::YBSchemaBuilder builder;
-  builder.AddColumn(kKeyColumn)->Type(INT32)->HashPrimaryKey()->NotNull();
-  builder.AddColumn(kValueColumn)->Type(STRING);
+  builder.AddColumn(kKeyColumn)->Type(DataType::INT32)->HashPrimaryKey()->NotNull();
+  builder.AddColumn(kValueColumn)->Type(DataType::STRING);
 
   ASSERT_OK(table_.Create(client::kTableName, 1, client_.get(), &builder));
 
@@ -79,7 +79,7 @@ TEST_F(CompressedStreamTest, BigWrite) {
 
   auto session = NewSession();
   {
-    const auto op = table_.NewWriteOp(QLWriteRequestPB::QL_STMT_INSERT);
+    const auto op = table_.NewWriteOp(session->arena(), QLWriteRequestPB::QL_STMT_INSERT);
     auto* const req = op->mutable_request();
     QLAddInt32HashValue(req, kKey);
     table_.AddStringColumnValue(req, kValueColumn, kValue);
@@ -88,7 +88,7 @@ TEST_F(CompressedStreamTest, BigWrite) {
   }
 
   {
-    const auto op = table_.NewReadOp();
+    const auto op = table_.NewReadOp(session->arena());
     auto* const req = op->mutable_request();
     QLAddInt32HashValue(req, kKey);
     table_.AddColumns({kValueColumn}, req);

@@ -15,37 +15,44 @@ export CASS_DRIVER_NO_CYTHON=1
 # Used for function return values to make execution clear in main.
 POINTER=""
 
-# Generate the PEX file that support multiple platforms and Python Versions.
-# Currently supports all Linux Platforms newer than manylinux_2014, and all Python
-# Versions from 3.6 to 3.9. macOS support might also be added in the future.
+PYTHON_REQUIREMENTS_FILE=""
+
+# Generate the PEX file that supports multiple platforms and Python versions.
+# Currently targets manylinux_2_28 and Python versions listed in common.sh
+# (currently 3.10 through 3.13). macOS support might also be added in the future.
 function generateMultiPlatformPex {
 
     echo "Generating the PEX file ... "
     # Executable command to generate the PEX file. Components:
-    # Line 1: Required Python dependencies (python3_requirements_frozen.txt)
-    # Line 2: Required Python versions (3.6, 3.7, 3.8, 3.9)
-    # Line 3: Required Linux Platforms (manyLinux2014, one for each Python version)
-    # Line 4: Data directories to bundle into the PEX (opscli)
-    # Line 5: --resolve-local-platforms flag (Ensure wheels built in the pex match
-    # the platform specifications)
-    # Line 6: Created PEX file output (named as pexEnv.pex)
-    pex_command_exec=(python3 -m pex -r ../python3_requirements_frozen.txt
+    # -r Required Python dependencies (python3_requirements_frozen.txt)
+    # --python Required Python versions (currently 3.10, 3.11, 3.12, 3.13)
+    # --platform Required Linux Platforms (manyLinux2014, one for each Python version)
+    # -D Data directories to bundle into the PEX (opscli)
+    # --resolve-local-platforms flag (Ensure wheels built in the pex match platform specifications)
+    # --venv prepend scripts to PATH
+    # --include-tools to generate venv with PEX_TOOLS=1 on target side
+    # --venv-copies copies over python executable directly into PEX rather than symlink to system
+    # -o Created PEX file output (named as pexEnv.pex)
+    pex_command_exec=(python3.12 -m pex -r "$PYTHON_REQUIREMENTS_FILE"
     ${PYTHON3_VERSIONS[@]/#/--python=}
     ${LINUX_PLATFORMS[@]/#/--platform=}
     -D ../opscli
-    --resolve-local-platforms
+    --resolve-local-platforms --venv prepend --include-tools --venv-copies
      -o pexEnv.pex)
 
     ${pex_command_exec[*]}
 }
 
-# Repair the manylinux2014_x86_64 wheels present in the PEX file using auditwheel.
+# Repair the manylinux_2_28_x86_64 wheels present in the PEX file using auditwheel.
 # (extract the created PEX into a folder in order to do so). Note that macOS wheels
 # are not currently packaged into the created PEXfile, but might be so in the
 # future).
 function repairPexWheels {
     pexFile=$POINTER
     unzip $pexFile -d pexEnv
+    find . -type f \( -name "*.key" -o -name "*.pem" \) \
+        \( -path "*/slapdtest/certs/*" -o -path "*/httplib2/tests/tls/*" \) \
+        -delete 2>/dev/null || true
     cd pexEnv/.deps
     mkdir extractedWheels
     for whl in *; do
@@ -63,12 +70,12 @@ function repairPexWheels {
                 echo "Skipping non-platform wheel $whl"
             fi
     else
-        auditwheel repair --plat manylinux2014_x86_64 $whl --no-update-tags
+        auditwheel repair --plat manylinux_2_28_x86_64 $whl --no-update-tags
     fi
 done
 }
 
-# Reconstruct the repaired manylinux2014_x86_64 wheels back into the PEX
+# Reconstruct the repaired manylinux_2_28_x86_64 wheels back into the PEX
 # by using wheel unpack and renaming the wheel directories.
 function reconstructPex {
     extractedWheels=$POINTER
@@ -108,6 +115,10 @@ function reconstructPex {
     rm -rf wheelhouse
     cd /code/pex/
     rm -rf pexEnv.pex
+    cd ..
+    find . -type f \( -name "*.key" -o -name "*.pem" \) \
+        \( -path "*/slapdtest/certs/*" -o -path "*/httplib2/tests/tls/*" \) -delete
+    cd /code/pex
 
 }
 
@@ -116,10 +127,41 @@ function reconstructPex {
 function testRepairedPex {
     pexEnv=$POINTER
     echo "Testing that the repaired PEX folder works and imports all modules."
-    python3 $pexEnv /code/pex/pexEnvTest.py
+    python3 $pexEnv /code/pex/pexEnvTest.py -r "$PYTHON_REQUIREMENTS_FILE"
 }
 
 FOLDER="pexEnv"
+
+print_help() {
+  cat <<-EOT
+Builds pex env for a provided requirements file.
+Usage: ${0##*/} <options>
+Options:
+  -h, --help
+    Show usage.
+  -r, --requirements
+    Python requirements file for building pex env.
+EOT
+}
+
+while [ $# -gt 0 ]; do
+  case "$1" in
+    -h|--help)
+      print_help
+      exit 0
+    ;;
+    -r|--requirements)
+      PYTHON_REQUIREMENTS_FILE="$2"
+      shift
+    ;;
+  esac
+  shift
+done
+
+if [[ $PYTHON_REQUIREMENTS_FILE == "" ]]; then
+  PYTHON_REQUIREMENTS_FILE="../python3_requirements_frozen.txt"
+  echo "No python requirements file provided. Using the default requirements file."
+fi
 
 if [ ! -d "$FOLDER" ]; then
     # pexEnv.pex is returned by generateMultiPlatformPex (original PEX file), which

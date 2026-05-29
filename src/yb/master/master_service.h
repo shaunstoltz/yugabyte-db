@@ -15,9 +15,9 @@
 // specific language governing permissions and limitations
 // under the License.
 //
-// The following only applies to changes made to this file as part of YugaByte development.
+// The following only applies to changes made to this file as part of YugabyteDB development.
 //
-// Portions Copyright (c) YugaByte, Inc.
+// Portions Copyright (c) YugabyteDB, Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License"); you may not use this file except
 // in compliance with the License.  You may obtain a copy of the License at
@@ -39,6 +39,7 @@ namespace yb {
 namespace master {
 
 std::unique_ptr<rpc::ServiceIf> MakeMasterAdminService(Master* master);
+std::unique_ptr<rpc::ServiceIf> MakeMasterBackupService(Master* master);
 std::unique_ptr<rpc::ServiceIf> MakeMasterClientService(Master* master);
 std::unique_ptr<rpc::ServiceIf> MakeMasterClusterService(Master* master);
 std::unique_ptr<rpc::ServiceIf> MakeMasterDclService(Master* master);
@@ -46,6 +47,7 @@ std::unique_ptr<rpc::ServiceIf> MakeMasterDdlService(Master* master);
 std::unique_ptr<rpc::ServiceIf> MakeMasterEncryptionService(Master* master);
 std::unique_ptr<rpc::ServiceIf> MakeMasterHeartbeatService(Master* master);
 std::unique_ptr<rpc::ServiceIf> MakeMasterReplicationService(Master* master);
+std::unique_ptr<rpc::ServiceIf> MakeMasterTestService(Master* master);
 
 } // namespace master
 } // namespace yb

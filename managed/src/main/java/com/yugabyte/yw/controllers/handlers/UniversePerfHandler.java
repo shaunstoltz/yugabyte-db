@@ -1,5 +1,5 @@
 /*
- * Copyright 2022 YugaByte, Inc. and Contributors
+ * Copyright 2022 YugabyteDB, Inc. and Contributors
  *
  * Licensed under the Polyform Free Trial License 1.0.0 (the "License"); you
  * may not use this file except in compliance with the License. You
@@ -8,6 +8,9 @@
  * http://github.com/YugaByte/yugabyte-db/blob/master/licenses/POLYFORM-FREE-TRIAL-LICENSE-1.0.0.txt
  */
 package com.yugabyte.yw.controllers.handlers;
+
+import static java.lang.Math.max;
+import static play.mvc.Http.Status.INTERNAL_SERVER_ERROR;
 
 import com.fasterxml.jackson.core.type.TypeReference;
 import com.fasterxml.jackson.databind.ObjectMapper;
@@ -22,9 +25,6 @@ import com.yugabyte.yw.models.QueryDistributionSuggestionResponse;
 import com.yugabyte.yw.models.Universe;
 import com.yugabyte.yw.models.helpers.CommonUtils;
 import com.yugabyte.yw.models.helpers.NodeDetails;
-import lombok.AllArgsConstructor;
-import lombok.extern.slf4j.Slf4j;
-
 import java.io.IOException;
 import java.time.Duration;
 import java.time.OffsetDateTime;
@@ -37,9 +37,8 @@ import java.util.Queue;
 import java.util.UUID;
 import java.util.regex.Pattern;
 import java.util.stream.Collectors;
-
-import static java.lang.Math.max;
-import static play.mvc.Http.Status.INTERNAL_SERVER_ERROR;
+import lombok.AllArgsConstructor;
+import lombok.extern.slf4j.Slf4j;
 
 @Singleton
 @Slf4j
@@ -72,10 +71,7 @@ public class UniversePerfHandler {
     UniverseDefinitionTaskParams.Cluster primaryCluster =
         universe.getUniverseDetails().getPrimaryCluster();
     List<NodeDetails> liveNodes =
-        universe
-            .getUniverseDetails()
-            .getNodesInCluster(primaryCluster.uuid)
-            .stream()
+        universe.getUniverseDetails().getNodesInCluster(primaryCluster.uuid).stream()
             .filter(nodeDetails -> nodeDetails.state == NodeDetails.NodeState.Live)
             .collect(Collectors.toList());
 

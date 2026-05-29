@@ -15,9 +15,9 @@
 // specific language governing permissions and limitations
 // under the License.
 //
-// The following only applies to changes made to this file as part of YugaByte development.
+// The following only applies to changes made to this file as part of YugabyteDB development.
 //
-// Portions Copyright (c) YugaByte, Inc.
+// Portions Copyright (c) YugabyteDB, Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License"); you may not use this file except
 // in compliance with the License.  You may obtain a copy of the License at
@@ -37,9 +37,6 @@
 
 #include <gtest/gtest.h>
 
-#include "yb/common/common.pb.h"
-#include "yb/common/index.h"
-#include "yb/common/partition.h"
 #include "yb/common/schema.h"
 
 #include "yb/consensus/consensus.messages.h"
@@ -51,12 +48,15 @@
 
 #include "yb/fs/fs_manager.h"
 
+#include "yb/gutil/bits.h"
+
 #include "yb/master/master_heartbeat.pb.h"
 
+#include "yb/rocksdb/cache.h"
 #include "yb/rocksdb/db.h"
 #include "yb/rocksdb/rate_limiter.h"
 
-#include "yb/tablet/tablet-harness.h"
+#include "yb/tablet/tablet-test-harness.h"
 #include "yb/tablet/tablet.h"
 #include "yb/tablet/tablet_metadata.h"
 #include "yb/tablet/tablet_peer.h"
@@ -68,6 +68,8 @@
 #include "yb/tserver/ts_tablet_manager.h"
 
 #include "yb/util/format.h"
+#include "yb/util/random_util.h"
+#include "yb/util/status_format.h"
 #include "yb/util/test_util.h"
 
 using std::string;
@@ -85,15 +87,17 @@ DECLARE_string(rocksdb_compact_flush_rate_limit_sharing_mode);
 DECLARE_bool(disable_auto_flags_management);
 DECLARE_int32(scheduled_full_compaction_frequency_hours);
 DECLARE_int32(scheduled_full_compaction_jitter_factor_percentage);
+DECLARE_int32(auto_compact_memory_cleanup_interval_sec);
+DECLARE_bool(allow_encryption_at_rest);
+DECLARE_int32(db_block_cache_num_shard_bits);
+DECLARE_int32(num_cpus);
 
-namespace yb {
-namespace tserver {
+namespace yb::tserver {
 
 using consensus::kInvalidOpIdIndex;
 using consensus::RaftConfigPB;
 using consensus::ConsensusRound;
 using consensus::ConsensusRoundPtr;
-using consensus::ReplicateMsg;
 using docdb::RateLimiterSharingMode;
 using master::ReportedTabletPB;
 using master::TabletReportPB;
@@ -110,7 +114,7 @@ static const int kDrivesNum = 4;
 class TsTabletManagerTest : public YBTest {
  public:
   TsTabletManagerTest()
-    : schema_({ ColumnSchema("key", UINT32) }, 1) {
+    : schema_({ ColumnSchema("key", DataType::UINT32, ColumnKind::RANGE_ASC_NULL_FIRST) }) {
   }
 
   string GetDrivePath(int index) {
@@ -129,7 +133,10 @@ class TsTabletManagerTest : public YBTest {
 
     // Disable AutoFlags management as we dont have a master. AutoFlags will be enabled based on
     // FLAGS_TEST_promote_all_auto_flags in test_main.cc.
-    FLAGS_disable_auto_flags_management = true;
+    ANNOTATE_UNPROTECTED_WRITE(FLAGS_disable_auto_flags_management) = true;
+
+    // Disallow encryption at rest as there is no master.
+    ANNOTATE_UNPROTECTED_WRITE(FLAGS_allow_encryption_at_rest) = false;
 
     mini_server_ = std::make_unique<MiniTabletServer>(paths, paths, 0, *options_result, 0);
   }
@@ -144,10 +151,11 @@ class TsTabletManagerTest : public YBTest {
 
     ANNOTATE_UNPROTECTED_WRITE(FLAGS_scheduled_full_compaction_frequency_hours) = 30 * 24;
     ANNOTATE_UNPROTECTED_WRITE(FLAGS_scheduled_full_compaction_jitter_factor_percentage) = 33;
+    ANNOTATE_UNPROTECTED_WRITE(FLAGS_auto_compact_memory_cleanup_interval_sec) = 3600;
 
     test_data_root_ = GetTestPath("TsTabletManagerTest-fsroot");
     CreateMiniTabletServer();
-    ASSERT_OK(mini_server_->Start());
+    ASSERT_OK(mini_server_->Start(tserver::WaitTabletsBootstrapped::kFalse));
     mini_server_->FailHeartbeats();
 
     config_ = mini_server_->CreateLocalConfig();
@@ -167,12 +175,11 @@ class TsTabletManagerTest : public YBTest {
                          const Schema& schema,
                          std::shared_ptr<tablet::TabletPeer>* out_tablet_peer) {
     Schema full_schema = SchemaBuilder(schema).Build();
-    std::pair<PartitionSchema, Partition> partition = tablet::CreateDefaultPartition(full_schema);
+    auto partition = tablet::CreateDefaultPartition(full_schema);
 
-    auto table_info = std::make_shared<tablet::TableInfo>(
-        "TEST: ", tablet::Primary::kTrue, table_id, tablet_id, tablet_id,
-        TableType::DEFAULT_TABLE_TYPE, full_schema, IndexMap(), boost::none /* index_info */,
-        0 /* schema_version */, partition.first);
+    auto table_info = tablet::TableInfo::TEST_Create(
+        table_id, table_id + "_namespace", table_id + "_table_name",
+        TableType::DEFAULT_TABLE_TYPE, full_schema, partition.first);
     auto tablet_peer = VERIFY_RESULT(tablet_manager_->CreateNewTablet(
         table_info, tablet_id, partition.second, config_));
     if (out_tablet_peer) {
@@ -182,7 +189,7 @@ class TsTabletManagerTest : public YBTest {
     RETURN_NOT_OK(tablet_peer->WaitUntilConsensusRunning(
           MonoDelta::FromMilliseconds(kConsensusRunningWaitMs)));
 
-    return tablet_peer->consensus()->EmulateElection();
+    return VERIFY_RESULT(tablet_peer->GetConsensus())->EmulateElection();
   }
 
   void Reload() {
@@ -191,27 +198,26 @@ class TsTabletManagerTest : public YBTest {
     LOG(INFO) << "Restarting tablet manager";
     ASSERT_NO_FATAL_FAILURE(CreateMiniTabletServer());
     ASSERT_OK(mini_server_->Start());
-    ASSERT_OK(mini_server_->WaitStarted());
     tablet_manager_ = mini_server_->server()->tablet_manager();
   }
 
-  void AddTablets(size_t num, TSTabletManager::TabletPeers* peers = nullptr) {
+  // Return the actual size of peers if adding of `num` tablets was successful.
+  Result<size_t> AddTabletPeers(TSTabletManager::TabletPeers* peers, size_t num = 2) {
+    SCHECK_NOTNULL(peers);
+    SCHECK_NE(num, 0UL, InvalidArgument, "");
+
     // Add series of tablets
-    ASSERT_NE(num, 0);
     for (size_t i = 0; i < num; ++i) {
       std::shared_ptr<TabletPeer> peer;
-      const auto tid = Format("tablet-$0", peers->size());
-      ASSERT_OK(CreateNewTablet(kTableId, tid, schema_, &peer));
-      ASSERT_EQ(tid, peer->tablet()->tablet_id());
-      if (peers) {
-        peers->push_back(peer);
-      }
+      RETURN_NOT_OK(CreateNewTablet(kTableId, Format("tablet-$0", peers->size()), schema_, &peer));
+      peers->push_back(peer);
     }
+    return peers->size();
   }
 
   Result<TSTabletManager::TabletPeers> GetPeers(
-      boost::optional<size_t> expected_count = boost::none) {
-    auto peers = tablet_manager_->GetTabletPeers(nullptr);
+      std::optional<size_t> expected_count = std::nullopt) {
+    auto peers = tablet_manager_->GetTabletPeers(/*tablet_ptrs=*/nullptr);
     if (expected_count.has_value()) {
       SCHECK_EQ(*expected_count, peers.size(), IllegalState, "Unexpected number of peers");
     }
@@ -229,11 +235,69 @@ class TsTabletManagerTest : public YBTest {
   string test_data_root_;
 };
 
+TEST_F_EX(TsTabletManagerTest, TestDbBlockCacheNumShardBits, YBTest) {
+  auto make_pair_same_kv = [](int32_t arg) {
+    return std::make_pair(arg, arg);
+  };
+
+  auto random_pair_same_kv = [](int32_t range_min, int32_t range_max) {
+    const auto rand_num = RandomUniformInt<int32_t>(range_min, range_max);
+    return std::make_pair(rand_num, rand_num);
+  };
+
+  auto random_pair_log_v = [](int32_t range_min, int32_t range_max) {
+    const auto rand_num = RandomUniformInt<int32_t>(range_min, range_max);
+    return std::make_pair(rand_num, Bits::Log2Ceiling(rand_num));
+  };
+
+  const std::vector<std::pair<int32_t, int32_t>> kNumShardBitsByFlag {
+    { 0, 0 }, { 1, 1 }, random_pair_same_kv(2, rocksdb::kSharedLRUCacheMaxNumShardBits - 2),
+    make_pair_same_kv(rocksdb::kSharedLRUCacheMaxNumShardBits - 1),
+    make_pair_same_kv(rocksdb::kSharedLRUCacheMaxNumShardBits),
+    { rocksdb::kSharedLRUCacheMaxNumShardBits + 1, rocksdb::kSharedLRUCacheMaxNumShardBits },
+    { RandomUniformInt<int32_t>(rocksdb::kSharedLRUCacheMaxNumShardBits + 2,
+                                std::numeric_limits<int32_t>::max()),
+      rocksdb::kSharedLRUCacheMaxNumShardBits }
+  };
+
+  for (const auto& num_shard_bits_by_flag_info : kNumShardBitsByFlag) {
+    ANNOTATE_UNPROTECTED_WRITE(FLAGS_db_block_cache_num_shard_bits) =
+        num_shard_bits_by_flag_info.first;
+    const auto num_shard_bits = yb::tserver::GetDbBlockCacheNumShardBits();
+    ASSERT_EQ(num_shard_bits, num_shard_bits_by_flag_info.second);
+  }
+
+  const std::vector<std::pair<int32_t, int32_t>> kNumShardBitsByCpuNum {
+    { 1, 4 }, { 2, 4 }, { 3, 4 }, { 4, 4 }, { RandomUniformInt<int32_t>(5, 15), 4 }, { 16, 4 },
+    { 17, 5 }, { 18, 5 }, { RandomUniformInt<int32_t>(19, 30), 5 }, { 31, 5 }, { 32, 5 },
+    { 33, 6 }, { RandomUniformInt<int32_t>(34, 62), 6 }, { 63, 6 }, { 64, 6 }, { 65, 7 },
+    { RandomUniformInt<int32_t>(66, 126), 7 }, { 127, 7 }, { 128, 7 }, { 129, 8 },
+    { RandomUniformInt<int32_t>(130, 254), 8 }, { 255, 8 }, { 256, 8 }, { 257, 9 },
+    random_pair_log_v(258, std::pow(2, rocksdb::kSharedLRUCacheMaxNumShardBits) - 1),
+    { RandomUniformInt<int32_t>(std::pow(2, rocksdb::kSharedLRUCacheMaxNumShardBits) + 1,
+                                std::pow(2, 30)),
+      rocksdb::kSharedLRUCacheMaxNumShardBits }
+  };
+
+  const std::vector<int32_t> kNegativeFlagValues {
+    -1, RandomUniformInt(std::numeric_limits<int32_t>::min(), -2)
+  };
+  for (const auto flag_value : kNegativeFlagValues) {
+    ANNOTATE_UNPROTECTED_WRITE(FLAGS_db_block_cache_num_shard_bits) = flag_value;
+    for (const auto& num_shard_bits_by_cpu_num_info : kNumShardBitsByCpuNum) {
+      ANNOTATE_UNPROTECTED_WRITE(FLAGS_num_cpus) = num_shard_bits_by_cpu_num_info.first;
+      const auto num_shard_bits = yb::tserver::GetDbBlockCacheNumShardBits();
+      ASSERT_EQ(num_shard_bits, num_shard_bits_by_cpu_num_info.second);
+    }
+  }
+}
+
 TEST_F(TsTabletManagerTest, TestCreateTablet) {
   // Create a new tablet.
   std::shared_ptr<TabletPeer> peer;
   ASSERT_OK(CreateNewTablet(kTableId, kTabletId, schema_, &peer));
-  ASSERT_EQ(kTabletId, peer->tablet()->tablet_id());
+  auto tablet = ASSERT_RESULT(peer->shared_tablet());
+  ASSERT_EQ(kTabletId, tablet->tablet_id());
   peer.reset();
 
   // Re-load the tablet manager from the filesystem.
@@ -242,12 +306,11 @@ TEST_F(TsTabletManagerTest, TestCreateTablet) {
   LOG(INFO) << "Restarting tablet manager";
   CreateMiniTabletServer();
   ASSERT_OK(mini_server_->Start());
-  ASSERT_OK(mini_server_->WaitStarted());
   tablet_manager_ = mini_server_->server()->tablet_manager();
 
   // Ensure that the tablet got re-loaded and re-opened off disk.
   peer = ASSERT_RESULT(tablet_manager_->GetTablet(kTabletId));
-  ASSERT_EQ(kTabletId, peer->tablet()->tablet_id());
+  ASSERT_EQ(kTabletId, tablet->tablet_id());
 }
 
 TEST_F(TsTabletManagerTest, TestTombstonedTabletsAreUnregistered) {
@@ -262,7 +325,6 @@ TEST_F(TsTabletManagerTest, TestTombstonedTabletsAreUnregistered) {
     LOG(INFO) << "Restarting tablet manager";
     CreateMiniTabletServer();
     ASSERT_OK(mini_server_->Start());
-    ASSERT_OK(mini_server_->WaitStarted());
     tablet_manager_ = mini_server_->server()->tablet_manager();
   };
 
@@ -298,10 +360,12 @@ TEST_F(TsTabletManagerTest, TestTombstonedTabletsAreUnregistered) {
   // Create a new tablet.
   std::shared_ptr<TabletPeer> peer;
   ASSERT_OK(CreateNewTablet(kTableId, kTabletId1, schema_, &peer));
-  ASSERT_EQ(kTabletId1, peer->tablet()->tablet_id());
+  auto tablet = ASSERT_RESULT(peer->shared_tablet());
+  ASSERT_EQ(kTabletId1, tablet->tablet_id());
   peer.reset();
   ASSERT_OK(CreateNewTablet(kTableId, kTabletId2, schema_, &peer));
-  ASSERT_EQ(kTabletId2, peer->tablet()->tablet_id());
+  tablet = ASSERT_RESULT(peer->shared_tablet());
+  ASSERT_EQ(kTabletId2, tablet->tablet_id());
 
   assert_tablet_assignment_count(kTabletId1, 1);
   assert_tablet_assignment_count(kTabletId2, 1);
@@ -311,14 +375,11 @@ TEST_F(TsTabletManagerTest, TestTombstonedTabletsAreUnregistered) {
   assert_tablet_assignment_count(kTabletId1, 1);
   assert_tablet_assignment_count(kTabletId2, 1);
 
-  boost::optional<int64_t> cas_config_opid_index_less_or_equal;
-  boost::optional<TabletServerErrorPB::Code> error_code;
-  ASSERT_OK(tablet_manager_->DeleteTablet(kTabletId1,
-      tablet::TABLET_DATA_TOMBSTONED,
-      tablet::ShouldAbortActiveTransactions::kFalse,
-      cas_config_opid_index_less_or_equal,
-      false /* hide_only */,
-      false /* keep_data */,
+  std::optional<int64_t> cas_config_opid_index_less_or_equal;
+  std::optional<TabletServerErrorPB::Code> error_code;
+  ASSERT_OK(tablet_manager_->DeleteTablet(
+      kTabletId1, tablet::TABLET_DATA_TOMBSTONED, tablet::ShouldAbortActiveTransactions::kFalse,
+      cas_config_opid_index_less_or_equal, false /* hide_only */, false /* keep_data */,
       &error_code));
 
   assert_tablet_assignment_count(kTabletId1, 0);
@@ -348,7 +409,7 @@ TEST_F(TsTabletManagerTest, TestTombstonedTabletsAreUnregistered) {
 
 TEST_F(TsTabletManagerTest, TestProperBackgroundFlushOnStartup) {
   FlagSaver flag_saver;
-  FLAGS_TEST_pretend_memory_exceeded_enforce_flush = true;
+  ANNOTATE_UNPROTECTED_WRITE(FLAGS_TEST_pretend_memory_exceeded_enforce_flush) = true;
 
   const int kNumTablets = 2;
   const int kNumRestarts = 3;
@@ -361,16 +422,18 @@ TEST_F(TsTabletManagerTest, TestProperBackgroundFlushOnStartup) {
     const auto tablet_id = Format("my-tablet-$0", i + 1);
     tablet_ids.emplace_back(tablet_id);
     ASSERT_OK(CreateNewTablet(kTableId, tablet_id, schema_, &peer));
-    ASSERT_EQ(tablet_id, peer->tablet()->tablet_id());
+    auto tablet = ASSERT_RESULT(peer->shared_tablet());
+    ASSERT_EQ(tablet_id, tablet->tablet_id());
 
     auto replicate_ptr = rpc::MakeSharedMessage<consensus::LWReplicateMsg>();
     replicate_ptr->set_op_type(consensus::NO_OP);
     replicate_ptr->set_hybrid_time(peer->clock().Now().ToUint64());
-    ConsensusRoundPtr round(new ConsensusRound(peer->consensus(), std::move(replicate_ptr)));
+    auto consensus = ASSERT_RESULT(peer->GetConsensus());
+    ConsensusRoundPtr round(new ConsensusRound(consensus.get(), std::move(replicate_ptr)));
     consensus_rounds.emplace_back(round);
-    round->BindToTerm(peer->raft_consensus()->TEST_LeaderTerm());
+    round->BindToTerm(ASSERT_RESULT(peer->GetRaftConsensus())->TEST_LeaderTerm());
     round->SetCallback(consensus::MakeNonTrackedRoundCallback(round.get(), [](const Status&){}));
-    ASSERT_OK(peer->consensus()->TEST_Replicate(round));
+    ASSERT_OK(ASSERT_RESULT(peer->GetConsensus())->TEST_Replicate(round));
   }
 
   for (int i = 0; i < kNumRestarts; ++i) {
@@ -378,14 +441,15 @@ TEST_F(TsTabletManagerTest, TestProperBackgroundFlushOnStartup) {
     mini_server_->Shutdown();
     LOG(INFO) << "Restarting tablet manager";
     CreateMiniTabletServer();
-    ASSERT_OK(mini_server_->Start());
+    ASSERT_OK(mini_server_->Start(tserver::WaitTabletsBootstrapped::kFalse));
     auto* tablet_manager = mini_server_->server()->tablet_manager();
     ASSERT_NE(nullptr, tablet_manager);
     tablet_manager->tablet_memory_manager()->FlushTabletIfLimitExceeded();
     ASSERT_OK(mini_server_->WaitStarted());
     for (auto& tablet_id : tablet_ids) {
       auto peer = ASSERT_RESULT(tablet_manager->GetTablet(tablet_id));
-      ASSERT_EQ(tablet_id, peer->tablet()->tablet_id());
+      auto tablet = ASSERT_RESULT(peer->shared_tablet());
+      ASSERT_EQ(tablet_id, tablet->tablet_id());
     }
   }
 }
@@ -580,121 +644,191 @@ void SetRateLimiterSharingMode(RateLimiterSharingMode mode) {
   ANNOTATE_UNPROTECTED_WRITE(FLAGS_rocksdb_compact_flush_rate_limit_sharing_mode) = ToString(mode);
 }
 
-Result<size_t> CountUniqueLimiters(const TSTabletManager::TabletPeers& peers,
-                                   const size_t start_idx = 0) {
-  SCHECK_LT(start_idx, peers.size(), IllegalState,
-            "Start index must be less than number of peers");
-  std::unordered_set<rocksdb::RateLimiter*> unique;
-  for (size_t i = start_idx; i < peers.size(); ++i) {
-    auto db = peers[i]->tablet()->TEST_db();
-    SCHECK_NOTNULL(db);
-    auto rl = db->GetDBOptions().rate_limiter.get();
-    if (rl) {
-      unique.insert(rl);
+Status SetRateLimiterBytesPerSec(int64_t bytes_per_sec) {
+  return SET_FLAG(rocksdb_compact_flush_rate_limit_bytes_per_sec, bytes_per_sec);
+}
+
+std::unordered_map<const rocksdb::RateLimiter*, int64_t> GetUniqueRateLimiterWithBurstBytes(
+    const TSTabletManager::TabletPeers& peers) {
+  std::unordered_map<const rocksdb::RateLimiter*, int64_t> result;
+  for (const auto& peer : peers) {
+    auto tablet_result = peer->shared_tablet();
+    if (!tablet_result.ok()) {
+      LOG(INFO) << "Unable to get tablet: " << tablet_result.status();
+      continue;
+    }
+    auto tablet = *tablet_result;
+    for (auto db : {tablet->regular_db(), tablet->intents_db()}) {
+      if (db && db->GetDBOptions().rate_limiter) {
+        result.emplace(db->GetDBOptions().rate_limiter.get(),
+                       db->GetDBOptions().rate_limiter->GetSingleBurstBytes());
+      }
     }
   }
-  return unique.size();
+  return result;
+}
+
+Status CheckExpectedBurst(
+    const TSTabletManager::TabletPeers& peers,
+    size_t expected_num_limiters,
+    int64_t expected_burst = 0) {
+  auto burst_per_limiter = GetUniqueRateLimiterWithBurstBytes(peers);
+  SCHECK_EQ(expected_num_limiters, burst_per_limiter.size(), IllegalState, "Num limiters");
+  if (expected_num_limiters) {
+    SCHECK_GT(expected_burst, 0, InvalidArgument, "expected_burst");
+    for (const auto& it : burst_per_limiter) {
+      SCHECK_EQ(expected_burst, it.second,  IllegalState, "Burst");
+    }
+  }
+  return Status::OK();
+}
+
+std::string TransactToString(const testing::TestParamInfo<bool>& param_info) {
+  return param_info.param ? "Transactional" : "NonTransactional";
 }
 
 } // namespace
 
-TEST_F(TsTabletManagerTest, RateLimiterSharing) {
+class TsTabletManagerRateLimiterTest
+    : public TsTabletManagerTest,
+      public testing::WithParamInterface<bool> {
+ protected:
+  constexpr static int64_t kRateLimitBPS = 100_MB;
+
+  void SetUp() override {
+    schema_.mutable_table_properties()->SetTransactional(GetParam());
+    CHECK_OK(SetRateLimiterBytesPerSec(kRateLimitBPS));
+    SetRateLimiterSharingMode(RateLimiterSharingMode::NONE);
+
+    TsTabletManagerTest::SetUp();
+  }
+};
+
+INSTANTIATE_TEST_SUITE_P(, TsTabletManagerRateLimiterTest, ::testing::Bool(), TransactToString);
+
+TEST_P(TsTabletManagerRateLimiterTest, SharingMode) {
   // The test checks rocksdb::RateLimiter is correctly shared between RocksDB instances
   // depending on the flags `FLAGS_rocksdb_compact_flush_rate_limit_bytes_per_sec` and
   // `FLAGS_rocksdb_compact_flush_rate_limit_sharing_mode`, inlcuding possible effect
-  // of changing flags on-the-fly (emulating forced changed)
-
-  // No tablets exist, reset flags and reload
+  // of changing flags on-the-fly (emulating forced changed).
   size_t peers_num = 0;
-  constexpr auto kBPS = 128_MB;
-  SetRateLimiterSharingMode(RateLimiterSharingMode::NONE);
-  ANNOTATE_UNPROTECTED_WRITE(FLAGS_rocksdb_compact_flush_rate_limit_bytes_per_sec) = kBPS;
-  ASSERT_NO_FATAL_FAILURE(Reload());
   TSTabletManager::TabletPeers peers = ASSERT_RESULT(GetPeers(peers_num));
 
-  // `NONE`: add tablets and make sure they have unique limiters
-  ASSERT_NO_FATAL_FAILURE(AddTablets(2, &peers));
-  ASSERT_EQ(peers_num + 2, ASSERT_RESULT(CountUniqueLimiters(peers)));
-  peers_num = peers.size();
+  // `NONE`: add tablets and make sure they have unique limiters.
+  peers_num = ASSERT_RESULT(AddTabletPeers(&peers));
+  auto burst_per_limiter = GetUniqueRateLimiterWithBurstBytes(peers);
+  ASSERT_EQ(peers_num, burst_per_limiter.size());
+  const auto full_burst = burst_per_limiter.begin()->second; // Corresponds to kRateLimitBPS.
 
-  // `NONE`: emulating forced change for bps flag: make sure new unique limiters are created
-  ANNOTATE_UNPROTECTED_WRITE(FLAGS_rocksdb_compact_flush_rate_limit_bytes_per_sec) = kBPS / 2;
-  ASSERT_NO_FATAL_FAILURE(AddTablets(2, &peers));
-  ASSERT_EQ(peers_num + 2, ASSERT_RESULT(CountUniqueLimiters(peers)));
-  peers_num = peers.size();
+  // `NONE`: emulating forced change for bps flag: make sure new unique limiters are created.
+  burst_per_limiter = GetUniqueRateLimiterWithBurstBytes(peers);
+  ASSERT_EQ(peers_num, burst_per_limiter.size());
+  ASSERT_OK(SetRateLimiterBytesPerSec(kRateLimitBPS / 2));
+  peers_num = ASSERT_RESULT(AddTabletPeers(&peers));
+  {
+    auto burst_per_limiter_old = burst_per_limiter;
+    burst_per_limiter = GetUniqueRateLimiterWithBurstBytes(peers);
+    ASSERT_EQ(peers_num, burst_per_limiter.size());
+    size_t match_count = 0;
+    for (const auto& it : burst_per_limiter) {
+      auto old = burst_per_limiter_old.find(it.first);
+      if (old == burst_per_limiter_old.end()) {
+        ASSERT_EQ(2 * it.second, full_burst);
+      } else {
+        ASSERT_EQ(2 * it.second, burst_per_limiter_old[it.first]);
+        ++match_count;
+      }
+    }
+    ASSERT_EQ(match_count, burst_per_limiter_old.size());
+  }
 
-  // `NONE`: emulating forced reset for bps flag: make sure new tablets are added with no limiters
-  ANNOTATE_UNPROTECTED_WRITE(FLAGS_rocksdb_compact_flush_rate_limit_bytes_per_sec) = 0;
-  ASSERT_NO_FATAL_FAILURE(AddTablets(2, &peers));
-  ASSERT_EQ(0, ASSERT_RESULT(CountUniqueLimiters(peers, peers_num)));
-  peers_num = peers.size();
+  // `NONE`: emulating forced reset for bps flag: make sure new tablets are added with no limiters.
+  // Current peers should not change their limit.
+  ASSERT_OK(SetRateLimiterBytesPerSec(/* bytes_per_second = */ 0));
+  peers_num = ASSERT_RESULT(AddTabletPeers(&peers));
+  {
+    auto burst_per_limiter_old = burst_per_limiter;
+    burst_per_limiter = GetUniqueRateLimiterWithBurstBytes(peers);
+    ASSERT_EQ(burst_per_limiter_old.size(), burst_per_limiter.size());
+    for (const auto& it : burst_per_limiter) {
+      ASSERT_TRUE(burst_per_limiter_old.contains(it.first));
+      ASSERT_EQ(it.second, burst_per_limiter_old[it.first]);
+    }
+  }
 
-  // `NONE` + no bps: reload the cluster with bps flag unset to make sure no limiters are created
+  // `NONE` + no bps: reload the cluster with bps flag unset to make sure no limiters are created.
   ASSERT_NO_FATAL_FAILURE(Reload());
   peers = ASSERT_RESULT(GetPeers(peers_num));
-  ASSERT_EQ(0, ASSERT_RESULT(CountUniqueLimiters(peers)));
+  ASSERT_OK(CheckExpectedBurst(peers, /* expected_num_limiters = */ 0));
 
-  // `NONE` + no bps: add tablets and make sure limiters are not created
-  ASSERT_NO_FATAL_FAILURE(AddTablets(2, &peers));
-  ASSERT_EQ(0, ASSERT_RESULT(CountUniqueLimiters(peers)));
-  peers_num = peers.size();
+  // `NONE` + no bps: add tablets and make sure limiters are not created.
+  peers_num = ASSERT_RESULT(AddTabletPeers(&peers));
+  ASSERT_OK(CheckExpectedBurst(peers, /* expected_num_limiters = */ 0));
 
-  // `NONE`: reload the cluster with bps flag set and make sure all limiter are unique
-  ANNOTATE_UNPROTECTED_WRITE(FLAGS_rocksdb_compact_flush_rate_limit_bytes_per_sec) = kBPS;
+  // `NONE`: reload the cluster with bps flag set and make sure all limiters are unique.
+  ASSERT_OK(SetRateLimiterBytesPerSec(kRateLimitBPS));
   ASSERT_NO_FATAL_FAILURE(Reload());
   peers = ASSERT_RESULT(GetPeers(peers_num));
-  ASSERT_EQ(peers_num, ASSERT_RESULT(CountUniqueLimiters(peers)));
+  ASSERT_OK(CheckExpectedBurst(peers, peers_num, full_burst));
 
-  // `NONE`: emulating forced change for mode flag: should act as if `NONE` is still set
+  // `NONE`: emulating forced change for mode flag: should act as if `NONE` is still set.
   SetRateLimiterSharingMode(RateLimiterSharingMode::TSERVER);
-  ASSERT_NO_FATAL_FAILURE(AddTablets(2, &peers));
-  ASSERT_EQ(peers_num + 2, ASSERT_RESULT(CountUniqueLimiters(peers)));
-  peers_num = peers.size();
+  peers_num = ASSERT_RESULT(AddTabletPeers(&peers));
+  ASSERT_OK(CheckExpectedBurst(peers, peers_num, full_burst));
 
-  // `TSERVER`: reload the cluster to apply `TSERVER` sharing mode
-  // and make sure all tablets share the same rate limiter
+  // `NONE`: emulating forced change for both flags: should act as if `NONE` is still set.
+  ASSERT_OK(SetRateLimiterBytesPerSec(kRateLimitBPS / 2));
+  peers_num = ASSERT_RESULT(AddTabletPeers(&peers));
+  ASSERT_OK(CheckExpectedBurst(peers, peers_num, full_burst / 2));
+
+  // `TSERVER`: reload the cluster to apply `TSERVER` sharing mode and make sure all tablets
+  // share the same rate limiter.
   ASSERT_NO_FATAL_FAILURE(Reload());
   peers = ASSERT_RESULT(GetPeers(peers_num));
-  ASSERT_EQ(1, ASSERT_RESULT(CountUniqueLimiters(peers)));
+  burst_per_limiter = GetUniqueRateLimiterWithBurstBytes(peers);
+  ASSERT_OK(CheckExpectedBurst(peers, /* expected_num_limiters = */ 1, full_burst / 2));
 
-  // `TSERVER`: emulating forced change for bps flag: make sure this has no effect on sharing
-  ANNOTATE_UNPROTECTED_WRITE(FLAGS_rocksdb_compact_flush_rate_limit_bytes_per_sec) = kBPS / 2;
-  ASSERT_NO_FATAL_FAILURE(AddTablets(2, &peers));
-  ASSERT_EQ(1, ASSERT_RESULT(CountUniqueLimiters(peers)));
-  peers_num = peers.size();
+  // `TSERVER`: emulating forced change for bps flag: make sure this has no effect on sharing.
+  ASSERT_OK(SetRateLimiterBytesPerSec(kRateLimitBPS));
+  peers_num = ASSERT_RESULT(AddTabletPeers(&peers));
+  ASSERT_OK(CheckExpectedBurst(peers, /* expected_num_limiters = */ 1, full_burst));
 
-  // `TSERVER`: emulating forced reset for bps flag: make sure this has no effect on sharing
-  ANNOTATE_UNPROTECTED_WRITE(FLAGS_rocksdb_compact_flush_rate_limit_bytes_per_sec) = 0;
-  ASSERT_NO_FATAL_FAILURE(AddTablets(2, &peers));
-  ASSERT_EQ(1, ASSERT_RESULT(CountUniqueLimiters(peers)));
-  peers_num = peers.size();
+  // `TSERVER`: emulating forced reset for bps flag: make sure this has no effect on sharing.
+  ASSERT_OK(SetRateLimiterBytesPerSec(/* bytes_per_second = */ 0));
+  peers_num = ASSERT_RESULT(AddTabletPeers(&peers));
+  ASSERT_OK(CheckExpectedBurst(peers, /* expected_num_limiters = */ 1, full_burst));
 
-  // `TSERVER`: emulating forced change for mode flag:
-  // should act as if `TSERVER` is still set
+  // `TSERVER`: emulating forced change for mode flag: should act as if `TSERVER` is still set.
   SetRateLimiterSharingMode(RateLimiterSharingMode::NONE);
-  ASSERT_NO_FATAL_FAILURE(AddTablets(2, &peers));
-  ASSERT_EQ(1, ASSERT_RESULT(CountUniqueLimiters(peers)));
-  peers_num = peers.size();
+  peers_num = ASSERT_RESULT(AddTabletPeers(&peers));
+  ASSERT_OK(CheckExpectedBurst(peers, /* expected_num_limiters = */ 1, full_burst));
 
-  // `TSERVER` + no bps: reload the cluster
-  //  with bps flag unset to make sure no limiters are created
+  // `TSERVER` + no bps: reload the cluster with bps flag unset: no limiters are created.
   SetRateLimiterSharingMode(RateLimiterSharingMode::TSERVER);
   ASSERT_NO_FATAL_FAILURE(Reload());
   peers = ASSERT_RESULT(GetPeers(peers_num));
-  ASSERT_EQ(0, ASSERT_RESULT(CountUniqueLimiters(peers)));
+  ASSERT_OK(CheckExpectedBurst(peers, /* expected_num_limiters = */ 0));
 
-  // `TSERVER` + no bps: add tablets and make sure no limiters are created
-  ASSERT_NO_FATAL_FAILURE(AddTablets(2, &peers));
-  ASSERT_EQ(0, ASSERT_RESULT(CountUniqueLimiters(peers)));
-  peers_num = peers.size();
+  // `TSERVER` + no bps: add tablets and make sure no limiters are created.
+  peers_num = ASSERT_RESULT(AddTabletPeers(&peers));
+  ASSERT_OK(CheckExpectedBurst(peers, /* expected_num_limiters = */ 0));
 
-  // `TSERVER` + no bps: emulating forced change for both flags:
-  // should act as a `NONE` is applied with some bps set
+  // `TSERVER` + no bps: emulating forced change for both flags: should act as if `NONE`
+  // is applied with some bps set.
   SetRateLimiterSharingMode(RateLimiterSharingMode::NONE);
-  ANNOTATE_UNPROTECTED_WRITE(FLAGS_rocksdb_compact_flush_rate_limit_bytes_per_sec) = kBPS;
-  ASSERT_NO_FATAL_FAILURE(AddTablets(2, &peers));
-  ASSERT_EQ(2, ASSERT_RESULT(CountUniqueLimiters(peers, peers_num)));
-  peers_num = peers.size();
+  ASSERT_OK(SetRateLimiterBytesPerSec(kRateLimitBPS));
+  peers_num = ASSERT_RESULT(AddTabletPeers(&peers));
+  ASSERT_OK(CheckExpectedBurst(peers, /* expected_num_limiters = */ 2, full_burst));
+
+  // Get back to shared rate limiter.
+  SetRateLimiterSharingMode(RateLimiterSharingMode::TSERVER);
+  ASSERT_NO_FATAL_FAILURE(Reload());
+  peers = ASSERT_RESULT(GetPeers(peers_num));
+
+  // Covering the case for forced change of sharing mode without restart.
+  SetRateLimiterSharingMode(RateLimiterSharingMode::NONE);
+  ASSERT_OK(SetRateLimiterBytesPerSec(kRateLimitBPS / 2));
+  ASSERT_OK(CheckExpectedBurst(peers, /* expected_num_limiters = */ 1, full_burst / 2));
 }
 
 TEST_F(TsTabletManagerTest, DataAndWalFilesLocations) {
@@ -709,6 +843,46 @@ TEST_F(TsTabletManagerTest, DataAndWalFilesLocations) {
                                                  &wal);
     ASSERT_EQ(data.substr(0, drive_path_len), wal.substr(0, drive_path_len));
   }
+}
+
+TEST_F(TsTabletManagerTest, EvenDriveSelection) {
+  std::string wal;
+  std::string data;
+  auto drive_path_len = GetDrivePath(0).size();
+  constexpr size_t kNumTables = 1000;
+  constexpr size_t kNumTablets = kDrivesNum / 2;
+  std::unordered_map<std::string, size_t> num_tablets_assigned_to_drive;
+  for (size_t i = 0; i < kNumTables; ++i) {
+    std::string prev_data_drive;
+    for (size_t j = 0; j < kNumTablets; ++j) {
+      tablet_manager_->GetAndRegisterDataAndWalDir(fs_manager_,
+                                                  Substitute("table-$0", i+ 1),
+                                                  Substitute("tablet-$0", j + 1),
+                                                  &data,
+                                                  &wal);
+      const auto chosen_data_drive = data.substr(0, drive_path_len);
+      const auto chosen_wal_drive = data.substr(0, drive_path_len);
+      ASSERT_EQ(chosen_data_drive, chosen_wal_drive);
+      ASSERT_NE(chosen_data_drive, prev_data_drive);
+      num_tablets_assigned_to_drive[chosen_wal_drive] += 1;
+      prev_data_drive = chosen_data_drive;
+    }
+  }
+  LOG(INFO) << "Data drive distribution " << yb::ToString(num_tablets_assigned_to_drive);
+  auto comparator = [](std::pair<std::string, size_t> a, std::pair<std::string, size_t> b) -> bool {
+    return a.second > b.second;
+  };
+  size_t max_count =
+      std::max_element(
+          num_tablets_assigned_to_drive.begin(), num_tablets_assigned_to_drive.end(), comparator)
+          ->second;
+  ASSERT_LE(max_count, ceil(1.0 * kNumTables * kNumTablets / kDrivesNum));
+  size_t min_count =
+      std::min_element(
+          num_tablets_assigned_to_drive.begin(), num_tablets_assigned_to_drive.end(), comparator)
+          ->second;
+  ASSERT_GE(min_count, floor(1.0 * kNumTables * kNumTablets / kDrivesNum));
+  ASSERT_LE(max_count - min_count, 1);
 }
 
 namespace {
@@ -730,9 +904,6 @@ TEST_F(TsTabletManagerTest, FullCompactionCalculateNextCompaction) {
     // The expected max jitter delta, determined by
     // compaction_frequency * jitter_factor_percentage / 100.
     MonoDelta expected_max_jitter;
-    // The expected amount of jitter, determined by pseudorandom 0 to 1 from hash of
-    // tablet id and last compaction time * max jitter delta.
-    MonoDelta expected_jitter;
   };
 
   // Recent compaction time is several minutes before now.
@@ -742,73 +913,106 @@ TEST_F(TsTabletManagerTest, FullCompactionCalculateNextCompaction) {
   const MonoDelta kStandardFrequency = MonoDelta::FromDays(30);
   const int32_t kStandardJitterFactor = 33;
   const MonoDelta kStandardMaxJitter = kStandardFrequency * kStandardJitterFactor / 100;
-  const MonoDelta jitter_factor_ten_tablet_id = MonoDelta::FromNanoseconds(11493522086400);
   auto compaction_manager = tablet_manager_->full_compaction_manager();
 
   std::vector<JitterToTest> jitter_to_test = {
-    // 1) Standard compaction frequency and jitter factor, with no last compaction time.
-    {kTabletId, kStandardFrequency, kStandardJitterFactor, kNoLastCompact,
-        kStandardMaxJitter /* expected_max_jitter */,
-        MonoDelta::FromNanoseconds(652715357120640) /* expected_jitter */},
+      // 0) Standard compaction frequency and jitter factor, with no last compaction time.
+      {.tablet_id = kTabletId,
+       .compaction_frequency = kStandardFrequency,
+       .jitter_factor_percentage = kStandardJitterFactor,
+       .last_compact_time = kNoLastCompact,
+       .expected_max_jitter = kStandardMaxJitter},
 
-    // 2) Standard compaction frequency and jitter factor with no last compaction time,
-    //    using a different tablet id.
-    {TabletId("another-tablet-id"), kStandardFrequency, kStandardJitterFactor, kNoLastCompact,
-        kStandardMaxJitter /* expected_max_jitter */,
-        MonoDelta::FromNanoseconds(756909369279360) /* expected_jitter */},
+      // 1) Standard compaction frequency and jitter factor, with no last compaction time
+      //    (same tablet ID, same expected output as #0).
+      {.tablet_id = kTabletId,
+       .compaction_frequency = kStandardFrequency,
+       .jitter_factor_percentage = kStandardJitterFactor,
+       .last_compact_time = kNoLastCompact,
+       .expected_max_jitter = kStandardMaxJitter},
 
-    // 3) Standard compaction frequency and jitter factor, with a recent compaction.
-    {kTabletId, kStandardFrequency, kStandardJitterFactor, kRecentCompactionTime,
-        kStandardMaxJitter /* expected_max_jitter */,
-        MonoDelta::FromNanoseconds(37928622885120) /* expected_jitter */},
+      // 2) Standard compaction frequency and jitter factor with no last compaction time,
+      //    using a different tablet id (different expected output as #0).
+      {.tablet_id = TabletId("another-tablet-id"),
+       .compaction_frequency = kStandardFrequency,
+       .jitter_factor_percentage = kStandardJitterFactor,
+       .last_compact_time = kNoLastCompact,
+       .expected_max_jitter = kStandardMaxJitter},
 
-    // 4) Standard compaction frequency and jitter factor, with a recent compaction
-    //    (different tablet id).
-    {TabletId("another-tablet-id"), kStandardFrequency, kStandardJitterFactor, kTimeRecent,
-        kStandardMaxJitter /* expected_max_jitter */,
-        MonoDelta::FromNanoseconds(724436812408320) /* expected_jitter */},
+      // 3) Standard compaction frequency and jitter factor, with a recent compaction
+      //    (different expected output as #0).
+      {.tablet_id = kTabletId,
+       .compaction_frequency = kStandardFrequency,
+       .jitter_factor_percentage = kStandardJitterFactor,
+       .last_compact_time = kRecentCompactionTime,
+       .expected_max_jitter = kStandardMaxJitter},
 
-    // 5) Invalid jitter factor, will default to kDefaultJitterFactorPercentage
-    //    (same expected output as #3).
-    {kTabletId, kStandardFrequency, -1, kRecentCompactionTime,
-        kStandardMaxJitter /* expected_max_jitter */,
-        MonoDelta::FromNanoseconds(37928622885120) /* expected_jitter */},
+      // 4) Standard compaction frequency and jitter factor, with a recent compaction
+      //    (different tablet id, different expected output as #3).
+      {.tablet_id = TabletId("another-tablet-id"),
+       .compaction_frequency = kStandardFrequency,
+       .jitter_factor_percentage = kStandardJitterFactor,
+       .last_compact_time = kRecentCompactionTime,
+       .expected_max_jitter = kStandardMaxJitter},
 
-    // 6) Invalid jitter factor, will default to kDefaultJitterFactorPercentage
-    //    (same expected output as #3 and #5).
-    {kTabletId, kStandardFrequency, 200, kRecentCompactionTime,
-        kStandardMaxJitter /* expected_max_jitter */,
-        MonoDelta::FromNanoseconds(37928622885120) /* expected_jitter */},
+      // 5) Invalid jitter factor, will default to kDefaultJitterFactorPercentage
+      //    (same expected output as #3).
+      {.tablet_id = kTabletId,
+       .compaction_frequency = kStandardFrequency,
+       .jitter_factor_percentage = -1,
+       .last_compact_time = kRecentCompactionTime,
+       .expected_max_jitter = kStandardMaxJitter},
 
-    // 7) Longer compaction frequency with recent compaction time and standard jitter.
-    {kTabletId, kStandardFrequency * 3, kStandardJitterFactor, kRecentCompactionTime,
-        kStandardMaxJitter * 3 /* expected_max_jitter */,
-        MonoDelta::FromNanoseconds(113785868655360) /* expected_jitter */},
+      // 6) Invalid jitter factor, will default to kDefaultJitterFactorPercentage
+      //    (same expected output as #3 and #5).
+      {.tablet_id = kTabletId,
+       .compaction_frequency = kStandardFrequency,
+       .jitter_factor_percentage = 200,
+       .last_compact_time = kRecentCompactionTime,
+       .expected_max_jitter = kStandardMaxJitter},
 
-    // 8) Standard compaction frequency with recent compaction time and no jitter.
-    {kTabletId, kStandardFrequency, 0, kRecentCompactionTime,
-        MonoDelta::FromNanoseconds(0) /* expected_max_jitter */,
-        MonoDelta::FromNanoseconds(0) /* expected_jitter */},
+      // 7) Longer compaction frequency with recent compaction time and standard jitter.
+      {.tablet_id = kTabletId,
+       .compaction_frequency = kStandardFrequency * 3,
+       .jitter_factor_percentage = kStandardJitterFactor,
+       .last_compact_time = kRecentCompactionTime,
+       .expected_max_jitter = kStandardMaxJitter * 3},
 
-    // 9) Standard compaction frequency with jitter factor of 10%.
-    {kTabletId, kStandardFrequency, 10, kRecentCompactionTime,
-        kStandardFrequency / 10 /* expected_max_jitter */,
-        jitter_factor_ten_tablet_id /* expected_jitter */},
+      // 8) Standard compaction frequency with recent compaction time and no jitter
+      //    (expected jitter of 0).
+      {.tablet_id = kTabletId,
+       .compaction_frequency = kStandardFrequency,
+       .jitter_factor_percentage = 0,
+       .last_compact_time = kRecentCompactionTime,
+       .expected_max_jitter = MonoDelta::FromNanoseconds(0)},
 
-    // 10) Standard compaction frequency with jitter factor of 100%.
-    //     (Expected jitter should be exactly 10X the expected jitter of #9).
-    {kTabletId, kStandardFrequency, 100, kRecentCompactionTime,
-        kStandardFrequency /* expected_max_jitter */,
-        jitter_factor_ten_tablet_id * 10 /* expected_jitter */},
+      // 9) Standard compaction frequency with jitter factor of 10%.
+      {.tablet_id = kTabletId,
+       .compaction_frequency = kStandardFrequency,
+       .jitter_factor_percentage = 10,
+       .last_compact_time = kRecentCompactionTime,
+       .expected_max_jitter = kStandardFrequency / 10},
 
-    // 11) Standard compaction frequency with jitter factor of 100% and no previous
-    //     full compaction time.
-    {kTabletId, kStandardFrequency, 100, kNoLastCompact,
-        kStandardFrequency /* expected_max_jitter */,
-        MonoDelta::FromNanoseconds(1977925324608000) /* expected_jitter */},
+      // 10) Standard compaction frequency with jitter factor of 100%.
+      //     (expected jitter should be exactly 10X the expected jitter of #9).
+      {.tablet_id = kTabletId,
+       .compaction_frequency = kStandardFrequency,
+       .jitter_factor_percentage = 100,
+       .last_compact_time = kRecentCompactionTime,
+       .expected_max_jitter = kStandardFrequency},
+
+      // 11) Standard compaction frequency with jitter factor of 100% and no previous
+      //     full compaction time.
+      {.tablet_id = kTabletId,
+       .compaction_frequency = kStandardFrequency,
+       .jitter_factor_percentage = 100,
+       .last_compact_time = kNoLastCompact,
+       .expected_max_jitter = kStandardFrequency},
   };
 
-  int i = 1;
+  std::vector<MonoDelta> jitter_results;
+
+  int i = 0;
   for (auto jtt : jitter_to_test) {
     LOG(INFO) << "Calculating next compaction time for scenario " << i++;
     compaction_manager->ResetFrequencyAndJitterIfNeeded(
@@ -820,16 +1024,36 @@ TEST_F(TsTabletManagerTest, FullCompactionCalculateNextCompaction) {
             jtt.tablet_id, now, jtt.last_compact_time, jitter);
 
     ASSERT_EQ(jtt.expected_max_jitter, compaction_manager->max_jitter());
-    ASSERT_EQ(jtt.expected_jitter, jitter);
+    ASSERT_GE(jitter, MonoDelta::FromNanoseconds(0));
+    ASSERT_LE(jitter, jtt.expected_max_jitter);
+    jitter_results.push_back(jitter);
 
     // Expected time of next compaction based on the current time, previous compaction
     // time compaction, compaction frequency, and jitter. If the previous compaction
     // time is 0, uses the current time + jitter.
     HybridTime expected_next_compact_time = jtt.last_compact_time.is_special() ?
         now.AddDelta(jitter) :
-        jtt.last_compact_time.AddDelta(jtt.compaction_frequency - jtt.expected_jitter);
+        jtt.last_compact_time.AddDelta(jtt.compaction_frequency - jitter);
     ASSERT_EQ(next_compact_time, expected_next_compact_time);
   }
+
+  // Check jitter value special cases.
+  // Jitter for tests 0 and 1 should match.
+  ASSERT_EQ(jitter_results[0], jitter_results[1]);
+  // Jitter for tests 0 and 2 should NOT match.
+  ASSERT_NE(jitter_results[0], jitter_results[2]);
+  // Jitter for tests 0 and 3 should NOT match.
+  ASSERT_NE(jitter_results[0], jitter_results[3]);
+  // Jitter for tests 3 and 4 should NOT match.
+  ASSERT_NE(jitter_results[3], jitter_results[4]);
+  // Jitter for tests 3 and 5 should match.
+  ASSERT_EQ(jitter_results[3], jitter_results[5]);
+  // Jitter for tests 3 and 6 should match.
+  ASSERT_EQ(jitter_results[3], jitter_results[6]);
+  // Jitter for test 8 should be 0.
+  ASSERT_EQ(jitter_results[8], MonoDelta::FromNanoseconds(0));
+  // Jitter for test 10 should be 10x jitter of test 9.
+  ASSERT_EQ(jitter_results[10], jitter_results[9] * 10);
 }
 
 // Tests that scheduled compaction times are roughly evenly spread based on jitter factor.
@@ -884,5 +1108,48 @@ TEST_F(TsTabletManagerTest, CompactionsEvenlySpreadByJitter) {
   }
 }
 
-} // namespace tserver
-} // namespace yb
+// Tests that the cleanup function works as expected.
+TEST_F(TsTabletManagerTest, FullCompactionManagerCleanup) {
+  const std::string kTableId = "my-table-id";
+  const std::string kTabletId1 = "my-tablet-id-1";
+  const std::string kTabletId2 = "my-tablet-id-2";
+  const std::string kTabletId3 = "my-tablet-id-3";
+  auto compaction_manager = tablet_manager_->full_compaction_manager();
+
+  // Create 3 new tablets.
+  std::shared_ptr<TabletPeer> peer;
+  ASSERT_OK(CreateNewTablet(kTableId, kTabletId1, schema_, &peer));
+  peer.reset();
+  ASSERT_OK(CreateNewTablet(kTableId, kTabletId2, schema_, &peer));
+  peer.reset();
+  ASSERT_OK(CreateNewTablet(kTableId, kTabletId3, schema_, &peer));
+  compaction_manager->ScheduleFullCompactions();
+  ASSERT_TRUE(compaction_manager->TEST_TabletIdInStatsWindowMap(kTabletId1));
+  ASSERT_TRUE(compaction_manager->TEST_TabletIdInStatsWindowMap(kTabletId2));
+  ASSERT_TRUE(compaction_manager->TEST_TabletIdInStatsWindowMap(kTabletId3));
+
+  // Delete tablet 1 using TABLET_DATA_DELETED, so peer is removed completely from TsTabletManager.
+  std::optional<TabletServerErrorPB::Code> error_code;
+  ASSERT_OK(tablet_manager_->DeleteTablet(
+      kTabletId1, tablet::TABLET_DATA_DELETED, tablet::ShouldAbortActiveTransactions::kFalse,
+      std::optional<int64_t>{}, false /* hide_only */, false /* keep_data */, &error_code));
+
+  // Run ScheduleFullCompactions again. Cleanup will not be triggered in the stats window map
+  // because we only execute cleanup every hour, and the number of extra tablet_ids don't meet the
+  // threshold.
+  compaction_manager->ScheduleFullCompactions();
+  ASSERT_TRUE(compaction_manager->TEST_TabletIdInStatsWindowMap(kTabletId1));
+  ASSERT_TRUE(compaction_manager->TEST_TabletIdInStatsWindowMap(kTabletId2));
+  ASSERT_TRUE(compaction_manager->TEST_TabletIdInStatsWindowMap(kTabletId3));
+
+  // Change the frequency with which we run the cleanup, and run ScheduleFullCompactions again.
+  // This time, my-tablet-id-1 should be removed from the stats window map.
+  ANNOTATE_UNPROTECTED_WRITE(FLAGS_auto_compact_memory_cleanup_interval_sec) = 1;
+  SleepFor(MonoDelta::FromSeconds(2));
+  compaction_manager->ScheduleFullCompactions();
+  ASSERT_FALSE(compaction_manager->TEST_TabletIdInStatsWindowMap(kTabletId1));
+  ASSERT_TRUE(compaction_manager->TEST_TabletIdInStatsWindowMap(kTabletId2));
+  ASSERT_TRUE(compaction_manager->TEST_TabletIdInStatsWindowMap(kTabletId3));
+}
+
+} // namespace yb::tserver

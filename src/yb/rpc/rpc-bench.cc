@@ -15,9 +15,9 @@
 // specific language governing permissions and limitations
 // under the License.
 //
-// The following only applies to changes made to this file as part of YugaByte development.
+// The following only applies to changes made to this file as part of YugabyteDB development.
 //
-// Portions Copyright (c) YugaByte, Inc.
+// Portions Copyright (c) YugabyteDB, Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License"); you may not use this file except
 // in compliance with the License.  You may obtain a copy of the License at
@@ -49,7 +49,6 @@
 using namespace std::literals; // NOLINT
 
 using std::string;
-using std::shared_ptr;
 
 namespace yb {
 namespace rpc {
@@ -73,15 +72,16 @@ class ClientThread {
   }
 
   void Start() {
-    thread_.reset(new std::thread(&ClientThread::Run, this));
+    CHECK_OK(Thread::Create("rpc_bench", "client", &ClientThread::Run, this, &thread_));
   }
 
   void Join() {
-    thread_->join();
+    if (thread_) {
+      thread_->Join();
+    }
   }
 
   void Run() {
-    CDSAttacher attacher;
     auto client_messenger = CreateAutoShutdownMessengerHolder(bench_->CreateMessenger("Client"));
     ProxyCache proxy_cache(client_messenger.get());
 
@@ -100,7 +100,7 @@ class ClientThread {
     }
   }
 
-  std::unique_ptr<std::thread> thread_;
+  scoped_refptr<Thread> thread_;
   RpcBench *bench_;
   int request_count_;
 };

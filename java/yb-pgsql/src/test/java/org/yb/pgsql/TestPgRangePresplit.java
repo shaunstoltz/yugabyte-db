@@ -1,4 +1,4 @@
-// Copyright (c) YugaByte, Inc.
+// Copyright (c) YugabyteDB, Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License"); you may not use this file except
 // in compliance with the License.  You may obtain a copy of the License at
@@ -19,7 +19,7 @@ import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.yb.client.ListTablesResponse;
 import org.yb.client.YBClient;
-import org.yb.util.YBTestRunnerNonTsanOnly;
+import org.yb.YBTestRunner;
 import org.yb.master.MasterDdlOuterClass;
 
 import java.sql.ResultSet;
@@ -29,7 +29,7 @@ import java.util.List;
 
 import static org.yb.AssertionWrappers.assertEquals;
 
-@RunWith(value=YBTestRunnerNonTsanOnly.class)
+@RunWith(value=YBTestRunner.class)
 public class TestPgRangePresplit extends BasePgSQLTest {
   private static final Logger LOG = LoggerFactory.getLogger(TestPgRangePresplit.class);
 
@@ -80,7 +80,8 @@ public class TestPgRangePresplit extends BasePgSQLTest {
       for (int id = 90; id < 105; id++) {
         expectedRows.add(new Row(id));
       }
-      try (ResultSet rs = statement.executeQuery("SELECT * FROM t WHERE id < 105 AND id >= 90")) {
+      try (ResultSet rs = statement.executeQuery(
+          "SELECT * FROM t WHERE id < 105 AND id >= 90 ORDER BY id")) {
         assertEquals(expectedRows, getRowList(rs));
       }
 
@@ -202,7 +203,7 @@ public class TestPgRangePresplit extends BasePgSQLTest {
       // Single row update.
       expectedRows.clear();
       expectedRows.add(new Row("Update on t3"));
-      expectedRows.add(new Row("  ->  Result"));
+      expectedRows.add(new Row("  ->  Result t3"));
       try (ResultSet rs = statement.executeQuery(
           "EXPLAIN(costs off) UPDATE t3 SET v = 0 WHERE a = 10 AND b = 10")) {
         assertEquals(expectedRows, getRowList(rs));
@@ -237,7 +238,7 @@ public class TestPgRangePresplit extends BasePgSQLTest {
       // Single row delete.
       expectedRows.clear();
       expectedRows.add(new Row("Delete on t3"));
-      expectedRows.add(new Row("  ->  Result"));
+      expectedRows.add(new Row("  ->  Result t3"));
       try (ResultSet rs = statement.executeQuery(
           "EXPLAIN(costs off) DELETE FROM t3 WHERE a = 10 AND b = 10")) {
         assertEquals(expectedRows, getRowList(rs));

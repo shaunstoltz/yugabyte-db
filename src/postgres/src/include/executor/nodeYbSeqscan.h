@@ -2,7 +2,7 @@
  *
  * nodeYbSeqscan.h
  *
- * Copyright (c) YugaByte, Inc.
+ * Copyright (c) YugabyteDB, Inc.
  *
  * Licensed under the Apache License, Version 2.0 (the "License"); you may not use this file except
  * in compliance with the License.  You may obtain a copy of the License at
@@ -24,11 +24,22 @@
 #ifndef NODEYBSEQSCAN_H
 #define NODEYBSEQSCAN_H
 
+#include "access/parallel.h"
 #include "nodes/execnodes.h"
 
 extern YbSeqScanState *ExecInitYbSeqScan(YbSeqScan *node, EState *estate,
-				  int eflags);
+										 int eflags);
 extern void ExecEndYbSeqScan(YbSeqScanState *node);
 extern void ExecReScanYbSeqScan(YbSeqScanState *node);
+
+/* parallel scan support */
+extern void ExecYbSeqScanEstimate(YbSeqScanState *node,
+								  ParallelContext *pcxt);
+extern void ExecYbSeqScanInitializeDSM(YbSeqScanState *node,
+									   ParallelContext *pcxt);
+extern void ExecYbSeqScanReInitializeDSM(YbSeqScanState *node,
+										 ParallelContext *pcxt);
+extern void ExecYbSeqScanInitializeWorker(YbSeqScanState *node,
+										  ParallelWorkerContext *pwcxt);
 
 #endif							/* NODEYBSEQSCAN_H */

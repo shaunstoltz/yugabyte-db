@@ -1,4 +1,4 @@
-// Copyright (c) YugaByte, Inc.
+// Copyright (c) YugabyteDB, Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License"); you may not use this file except
 // in compliance with the License.  You may obtain a copy of the License at
@@ -23,6 +23,15 @@ namespace consensus {
 
 struct ConsensusOptions {
   std::string tablet_id;
+};
+
+// Return value for GetFollowerCommunicationTimes.
+struct FollowerCommunicationTime {
+  std::string peer_uuid;
+  MonoTime last_successful_communication;
+
+  explicit FollowerCommunicationTime(std::string peer_uuid, MonoTime last_successful_communication)
+      : peer_uuid(peer_uuid), last_successful_communication(last_successful_communication) {}
 };
 
 } // namespace consensus

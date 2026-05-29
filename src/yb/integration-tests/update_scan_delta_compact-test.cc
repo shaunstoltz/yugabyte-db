@@ -15,9 +15,9 @@
 // specific language governing permissions and limitations
 // under the License.
 //
-// The following only applies to changes made to this file as part of YugaByte development.
+// The following only applies to changes made to this file as part of YugabyteDB development.
 //
-// Portions Copyright (c) YugaByte, Inc.
+// Portions Copyright (c) YugabyteDB, Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License"); you may not use this file except
 // in compliance with the License.  You may obtain a copy of the License at
@@ -36,7 +36,6 @@
 
 #include <boost/range/iterator_range.hpp>
 
-#include "yb/client/callbacks.h"
 #include "yb/client/client.h"
 #include "yb/client/error.h"
 #include "yb/client/schema.h"
@@ -66,24 +65,20 @@ using namespace std::literals;
 
 DECLARE_int32(log_segment_size_mb);
 DECLARE_int32(maintenance_manager_polling_interval_ms);
-DEFINE_UNKNOWN_int32(mbs_for_flushes_and_rolls, 1, "How many MBs are needed to flush and roll");
-DEFINE_UNKNOWN_int32(row_count, 2000, "How many rows will be used in this test for the base data");
-DEFINE_UNKNOWN_int32(seconds_to_run, 4,
+DEFINE_NON_RUNTIME_int32(mbs_for_flushes_and_rolls, 1,
+             "How many MBs are needed to flush and roll");
+DEFINE_NON_RUNTIME_int32(row_count, 2000,
+             "How many rows will be used in this test for the base data");
+DEFINE_NON_RUNTIME_int32(seconds_to_run, 4,
              "How long this test runs for, after inserting the base data, in seconds");
 
 namespace yb {
 namespace tablet {
 
 using client::YBClient;
-using client::YBClientBuilder;
-using client::YBColumnSchema;
 using client::YBSchema;
 using client::YBSchemaBuilder;
 using client::YBSession;
-using client::YBStatusCallback;
-using client::YBStatusMemberCallback;
-using client::YBTable;
-using client::YBTableCreator;
 using client::YBTableName;
 using std::shared_ptr;
 using std::vector;
@@ -98,9 +93,9 @@ class UpdateScanDeltaCompactionTest : public YBMiniClusterTestBase<MiniCluster> 
  protected:
   UpdateScanDeltaCompactionTest() {
     YBSchemaBuilder b;
-    b.AddColumn("key")->Type(INT64)->NotNull()->HashPrimaryKey();
-    b.AddColumn("string")->Type(STRING)->NotNull();
-    b.AddColumn("int64")->Type(INT64)->NotNull();
+    b.AddColumn("key")->Type(DataType::INT64)->NotNull()->HashPrimaryKey();
+    b.AddColumn("string")->Type(DataType::STRING)->NotNull();
+    b.AddColumn("int64")->Type(DataType::INT64)->NotNull();
     CHECK_OK(b.Build(&schema_));
   }
 
@@ -140,10 +135,8 @@ class UpdateScanDeltaCompactionTest : public YBMiniClusterTestBase<MiniCluster> 
   }
 
   shared_ptr<YBSession> CreateSession() {
-    shared_ptr<YBSession> session = client_->NewSession();
     // Bumped this up from 5 sec to 30 sec in hope to fix the flakiness in this test.
-    session->SetTimeout(30s);
-    return session;
+    return client_->NewSession(30s);
   }
 
   // Continuously updates the existing data until 'stop_latch' drops to 0.
@@ -157,7 +150,7 @@ class UpdateScanDeltaCompactionTest : public YBMiniClusterTestBase<MiniCluster> 
 
   // Sets the passed values on the row.
   // TODO randomize the string column.
-  void MakeRow(int64_t key, int64_t val, QLWriteRequestPB* req) const;
+  void MakeRow(int64_t key, int64_t val, QLWriteRequestMsg* req) const;
 
   // If 'key' is a multiple of kSessionBatchSize, it uses 'flush_future' to wait for the previous
   // batch to finish and then flushes the current one.
@@ -180,10 +173,10 @@ TEST_F(UpdateScanDeltaCompactionTest, TestAll) {
   OverrideFlagForSlowTests("mbs_for_flushes_and_rolls", "8");
   // Setting this high enough that we see the effects of flushes and compactions.
   OverrideFlagForSlowTests("maintenance_manager_polling_interval_ms", "2000");
-  FLAGS_log_segment_size_mb = FLAGS_mbs_for_flushes_and_rolls;
+  ANNOTATE_UNPROTECTED_WRITE(FLAGS_log_segment_size_mb) = FLAGS_mbs_for_flushes_and_rolls;
   if (!AllowSlowTests()) {
     // Make it run more often since it's not a long test.
-    FLAGS_maintenance_manager_polling_interval_ms = 50;
+    ANNOTATE_UNPROTECTED_WRITE(FLAGS_maintenance_manager_polling_interval_ms) = 50;
   }
 
   ASSERT_NO_FATALS(CreateTable());
@@ -199,7 +192,7 @@ void UpdateScanDeltaCompactionTest::InsertBaseData() {
 
   LOG_TIMING(INFO, "Insert") {
     for (int64_t key = 0; key < FLAGS_row_count; key++) {
-      auto insert = table_.NewInsertOp();
+      auto insert = table_.NewInsertOp(session->arena());
       MakeRow(key, 0, insert->mutable_request());
       session->Apply(insert);
       ASSERT_OK(WaitForLastBatchAndFlush(key, &flush_future, session));
@@ -260,7 +253,7 @@ void UpdateScanDeltaCompactionTest::UpdateRows(CountDownLatch* stop_latch) {
       auto flush_future = promise.get_future();
       promise.set_value(client::FlushStatus());
       for (int64_t key = 0; key < FLAGS_row_count && stop_latch->count() > 0; key++) {
-        auto update = table_.NewUpdateOp();
+        auto update = table_.NewUpdateOp(session->arena());
         MakeRow(key, iteration, update->mutable_request());
         session->Apply(update);
         CHECK_OK(WaitForLastBatchAndFlush(key, &flush_future, session));
@@ -302,7 +295,7 @@ void UpdateScanDeltaCompactionTest::CurlWebPages(CountDownLatch* stop_latch) con
 
 void UpdateScanDeltaCompactionTest::MakeRow(int64_t key,
                                             int64_t val,
-                                            QLWriteRequestPB* req) const {
+                                            QLWriteRequestMsg* req) const {
   QLAddInt64HashValue(req, key);
   table_.AddStringColumnValue(req, "string", "TODO random string");
   table_.AddInt64ColumnValue(req, "int64", val);

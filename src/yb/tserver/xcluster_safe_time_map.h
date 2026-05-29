@@ -1,4 +1,4 @@
-// Copyright (c) YugaByte, Inc.
+// Copyright (c) YugabyteDB, Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License"); you may not use this file except
 // in compliance with the License.  You may obtain a copy of the License at
@@ -13,6 +13,7 @@
 
 #pragma once
 
+#include <optional>
 #include <string>
 
 #include <google/protobuf/map.h>
@@ -23,24 +24,32 @@
 namespace yb {
 
 // Map[NamespaceId]:xClusterSafeTime
-typedef google::protobuf::Map<std::string, google::protobuf::uint64>
-    XClusterNamespaceToSafeTimePBMap;
+using XClusterNamespaceToSafeTimePBMap =
+    google::protobuf::Map<std::string, google::protobuf::uint64>;
 
 class XClusterSafeTimeMap {
  public:
   XClusterSafeTimeMap();
 
-  Result<HybridTime> GetSafeTime(const NamespaceId& namespace_id) const
+  // Gets the xcluster safe time for the given namespace. If the namespace does not have a xcluster
+  // safe time, either because it is not part of replication or because the cluster is in ACTIVE
+  // role, then this will return nullopt. System namespace will always return nullopt.
+  Result<std::optional<HybridTime>> GetSafeTime(NamespaceIdView namespace_id) const
       EXCLUDES(xcluster_safe_time_map_mutex_);
 
-  void Update(XClusterNamespaceToSafeTimePBMap safe_time_map)
+  bool HasNamespace(NamespaceIdView namespace_id) const;
+
+  void Update(const XClusterNamespaceToSafeTimePBMap& safe_time_map)
       EXCLUDES(xcluster_safe_time_map_mutex_);
+
+  bool empty() const { return empty_.load(std::memory_order_acquire); }
 
  private:
   mutable rw_spinlock xcluster_safe_time_map_mutex_;
   bool map_initialized_ GUARDED_BY(xcluster_safe_time_map_mutex_);
   XClusterNamespaceToSafeTimePBMap xcluster_safe_time_map_
       GUARDED_BY(xcluster_safe_time_map_mutex_);
+  std::atomic<bool> empty_ = false;
 };
 
 }  // namespace yb

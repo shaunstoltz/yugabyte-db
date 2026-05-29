@@ -15,9 +15,9 @@
 // specific language governing permissions and limitations
 // under the License.
 //
-// The following only applies to changes made to this file as part of YugaByte development.
+// The following only applies to changes made to this file as part of YugabyteDB development.
 //
-// Portions Copyright (c) YugaByte, Inc.
+// Portions Copyright (c) YugabyteDB, Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License"); you may not use this file except
 // in compliance with the License.  You may obtain a copy of the License at
@@ -35,8 +35,6 @@
 
 #include <memory>
 #include <vector>
-
-#include <glog/logging.h>
 
 #include "yb/client/client.h"
 #include "yb/client/error.h"
@@ -61,8 +59,8 @@
 
 using namespace std::literals;
 
-DEFINE_UNKNOWN_string(master_address, "localhost",
-              "Comma separated list of master addresses to run against.");
+DEFINE_NON_RUNTIME_string(master_address, "localhost",
+    "Comma separated list of master addresses to run against.");
 
 namespace yb {
 namespace tools {
@@ -70,12 +68,9 @@ namespace tools {
 using std::string;
 using std::vector;
 
-using client::YBClient;
 using client::YBClientBuilder;
-using client::YBColumnSchema;
 using client::YBSchema;
 using client::YBSession;
-using client::YBTable;
 using client::YBTableName;
 using std::shared_ptr;
 
@@ -109,14 +104,13 @@ static int WriteRandomDataToTable(int argc, char** argv) {
   CHECK_OK(table.Open(table_name, client.get()));
   YBSchema schema = table->schema();
 
-  shared_ptr<YBSession> session = client->NewSession();
-  session->SetTimeout(5s); // Time out after 5 seconds.
+  auto session = client->NewSession(5s);  // Time out after 5 seconds.
 
   Random random(GetRandomSeed32());
 
   LOG(INFO) << "Inserting random rows...";
   for (uint64_t record_id = 0; true; ++record_id) {
-    auto insert = table.NewInsertOp();
+    auto insert = table.NewInsertOp(session->arena());
     auto req = insert->mutable_request();
     GenerateDataForRow(schema, record_id, &random, req);
 

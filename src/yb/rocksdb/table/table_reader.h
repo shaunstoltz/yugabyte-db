@@ -3,9 +3,9 @@
 //  LICENSE file in the root directory of this source tree. An additional grant
 //  of patent rights can be found in the PATENTS file in the same directory.
 //
-// The following only applies to changes made to this file as part of YugaByte development.
+// The following only applies to changes made to this file as part of YugabyteDB development.
 //
-// Portions Copyright (c) YugaByte, Inc.
+// Portions Copyright (c) YugabyteDB, Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License"); you may not use this file except
 // in compliance with the License.  You may obtain a copy of the License at
@@ -31,15 +31,16 @@
 
 namespace rocksdb {
 
-class Iterator;
 struct ParsedInternalKey;
-class Arena;
 struct ReadOptions;
 struct TableProperties;
+
+class Arena;
+class DataBlockAwareIndexInternalIterator;
 class GetContext;
 class InternalIterator;
+class Iterator;
 class RandomAccessFileReader;
-class WritableFile;
 
 // A Table is a sorted map from strings to strings.  Tables are
 // immutable and persistent.  A Table may be safely accessed from
@@ -63,9 +64,17 @@ class TableReader {
   //        all the states but those allocated in arena.
   // skip_filters: disables checking the bloom filters even if they exist. This
   //               option is effective only for block-based table format.
-  virtual InternalIterator* NewIterator(const ReadOptions&,
-                                        Arena* arena = nullptr,
-                                        bool skip_filters = false) = 0;
+  // skip_corrupt_data_blocks_unsafe: see CompactRangeOptions for more details.
+  virtual InternalIterator* NewIterator(
+      const ReadOptions&, Arena* arena = nullptr, bool skip_filters = false,
+      SkipCorruptDataBlocksUnsafe skip_corrupt_data_blocks_unsafe =
+          SkipCorruptDataBlocksUnsafe::kFalse) = 0;
+
+  // TODO(index_iter): consider allocating index iterator on arena, try and measure potential
+  // performance improvements.
+  virtual InternalIterator* NewIndexIterator(const ReadOptions& read_options) = 0;
+  virtual DataBlockAwareIndexInternalIterator* NewDataBlockAwareIndexIterator(
+      const ReadOptions& read_options) = 0;
 
   // Given a key, return an approximate byte offset in the file where
   // the data for that key begins (or would begin if the key were
@@ -98,7 +107,7 @@ class TableReader {
   // internal_key is the internal key (encoded representation of InternalKey) to search for
   // skip_filters: disables checking the bloom filters even if they exist. This
   //               option is effective only for block-based table format.
-  virtual Status Get(const ReadOptions& readOptions, const Slice& internal_key,
+  virtual Status Get(const ReadOptions& read_options, const Slice& internal_key,
                      GetContext* get_context, bool skip_filters = false) = 0;
 
   // Prefetch data corresponding to a give range of keys
@@ -118,9 +127,9 @@ class TableReader {
     return STATUS(NotSupported, "DumpTable() not supported");
   }
 
-  // Returns approximate middle key which divides SST file into two parts containing roughly the
-  // same amount of keys.
-  virtual yb::Result<std::string> GetMiddleKey() {
+  // Returns approximate middle key that divides the SST file, starting from the lower bound key,
+  // into two parts containing roughly the same number of keys.
+  virtual yb::Result<std::string> GetMiddleKey(Slice lower_bound_key) {
     return STATUS(NotSupported, "GetMiddleKey() not supported");
   }
 };

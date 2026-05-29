@@ -3,9 +3,9 @@
 //  LICENSE file in the root directory of this source tree. An additional grant
 //  of patent rights can be found in the PATENTS file in the same directory.
 //
-// The following only applies to changes made to this file as part of YugaByte development.
+// The following only applies to changes made to this file as part of YugabyteDB development.
 //
-// Portions Copyright (c) YugaByte, Inc.
+// Portions Copyright (c) YugabyteDB, Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License"); you may not use this file except
 // in compliance with the License.  You may obtain a copy of the License at
@@ -90,16 +90,21 @@ const char* InternalKeyComparator::Name() const {
   return name_.c_str();
 }
 
-int InternalKeyComparator::Compare(const Slice& akey, const Slice& bkey) const {
+int InternalKeyComparator::Compare(Slice akey, Slice bkey) const {
   // Order by:
   //    increasing user key (according to user-supplied comparator)
   //    decreasing sequence number
   //    decreasing type (though sequence# should be enough to disambiguate)
-  int r = user_comparator_->Compare(ExtractUserKey(akey), ExtractUserKey(bkey));
+  DCHECK_GE(akey.size(), kLastInternalComponentSize);
+  auto user_key_end_a = akey.end() - kLastInternalComponentSize;
+  DCHECK_GE(bkey.size(), kLastInternalComponentSize);
+  auto user_key_end_b = bkey.end() - kLastInternalComponentSize;
+  int r = user_comparator_->Compare(
+      Slice(akey.data(), user_key_end_a), Slice(bkey.data(), user_key_end_b));
   PERF_COUNTER_ADD(user_key_comparison_count, 1);
   if (r == 0) {
-    const uint64_t anum = DecodeFixed64(akey.end() - 8);
-    const uint64_t bnum = DecodeFixed64(bkey.end() - 8);
+    const uint64_t anum = DecodeFixed64(user_key_end_a);
+    const uint64_t bnum = DecodeFixed64(user_key_end_b);
     if (anum > bnum) {
       r = -1;
     } else if (anum < bnum) {

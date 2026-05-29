@@ -1,4 +1,4 @@
-// Copyright (c) YugaByte, Inc.
+// Copyright (c) YugabyteDB, Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License"); you may not use this file except
 // in compliance with the License.  You may obtain a copy of the License at
@@ -155,7 +155,7 @@ std::string CassandraValue::ToString() const {
       return result;
     }
     default:
-      return "Not supported: " + std::to_string(to_underlying(value_type));
+      return "Not supported: " + std::to_string(std::to_underlying(value_type));
   }
 }
 
@@ -363,7 +363,12 @@ Result<CassandraSession> CassandraSession::Create(CassCluster* cluster) {
   return result;
 }
 
-Status CassandraSession::Execute(const CassandraStatement& statement) {
+Status CassandraSession::Execute(const CassandraStatement& statement, uint32_t timeout_ms) {
+  if (timeout_ms > 0) {
+    LOG(INFO) << "Set custom request timeout (ms): " << timeout_ms;
+    cass_statement_set_request_timeout(statement.cass_statement_.get(), timeout_ms);
+  }
+
   CassandraFuture future(cass_session_execute(
       cass_session_.get(), statement.cass_statement_.get()));
   return future.Wait();
@@ -390,9 +395,9 @@ CassandraFuture CassandraSession::ExecuteGetFuture(const string& query) {
   return ExecuteGetFuture(CassandraStatement(query));
 }
 
-Status CassandraSession::ExecuteQuery(const string& query) {
+Status CassandraSession::ExecuteQuery(const string& query, uint32_t timeout_ms) {
   LOG(INFO) << "Execute query: " << query;
-  return Execute(CassandraStatement(query));
+  return Execute(CassandraStatement(query), timeout_ms);
 }
 
 Result<CassandraResult> CassandraSession::ExecuteWithResult(const string& query) {
@@ -446,7 +451,6 @@ CassandraStatement CassandraPrepared::Bind() {
 }
 
 const MonoDelta kCassandraTimeOut = 20s * kTimeMultiplier;
-const std::string kCqlTestKeyspace = "test";
 
 CppCassandraDriver::CppCassandraDriver(
     const std::vector<std::string>& hosts, uint16_t port,

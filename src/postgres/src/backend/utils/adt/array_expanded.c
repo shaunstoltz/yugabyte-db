@@ -3,7 +3,7 @@
  * array_expanded.c
  *	  Basic functions for manipulating expanded arrays.
  *
- * Portions Copyright (c) 1996-2018, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2022, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  *
@@ -23,7 +23,7 @@
 /* "Methods" required for an expanded object */
 static Size EA_get_flat_size(ExpandedObjectHeader *eohptr);
 static void EA_flatten_into(ExpandedObjectHeader *eohptr,
-				void *result, Size allocated_size);
+							void *result, Size allocated_size);
 
 static const ExpandedObjectMethods EA_methods =
 {
@@ -33,7 +33,7 @@ static const ExpandedObjectMethods EA_methods =
 
 /* Other local functions */
 static void copy_byval_expanded_array(ExpandedArrayHeader *eah,
-						  ExpandedArrayHeader *oldeah);
+									  ExpandedArrayHeader *oldeah);
 
 
 /*
@@ -361,7 +361,7 @@ DatumGetExpandedArray(Datum d)
 	}
 
 	/* Else expand the hard way */
-	d = expand_array(d, GetCurrentMemoryContext(), NULL);
+	d = expand_array(d, CurrentMemoryContext, NULL);
 	return (ExpandedArrayHeader *) DatumGetEOHP(d);
 }
 
@@ -389,7 +389,7 @@ DatumGetExpandedArrayX(Datum d, ArrayMetaState *metacache)
 	}
 
 	/* Else expand using caller's cache if any */
-	d = expand_array(d, GetCurrentMemoryContext(), metacache);
+	d = expand_array(d, CurrentMemoryContext, metacache);
 	return (ExpandedArrayHeader *) DatumGetEOHP(d);
 }
 

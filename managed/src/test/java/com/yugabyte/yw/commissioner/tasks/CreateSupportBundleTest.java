@@ -1,4 +1,4 @@
-// Copyright (c) YugaByte, Inc.
+// Copyright (c) YugabyteDB, Inc.
 
 package com.yugabyte.yw.commissioner.tasks;
 
@@ -7,51 +7,50 @@ import static org.junit.Assert.assertEquals;
 import static org.junit.Assert.assertNull;
 import static org.junit.Assert.assertTrue;
 import static org.mockito.ArgumentMatchers.any;
-import static org.mockito.Mockito.when;
 import static org.mockito.Mockito.atLeast;
 import static org.mockito.Mockito.doNothing;
 import static org.mockito.Mockito.verify;
+import static org.mockito.Mockito.when;
 
 import com.yugabyte.yw.commissioner.tasks.params.SupportBundleTaskParams;
-import com.yugabyte.yw.common.config.RuntimeConfigFactory;
 import com.yugabyte.yw.common.ModelFactory;
+import com.yugabyte.yw.common.config.RuntimeConfGetter;
+import com.yugabyte.yw.common.config.RuntimeConfigFactory;
 import com.yugabyte.yw.forms.SupportBundleFormData;
 import com.yugabyte.yw.models.Customer;
 import com.yugabyte.yw.models.SupportBundle;
-import com.yugabyte.yw.models.helpers.BundleDetails.ComponentType;
 import com.yugabyte.yw.models.TaskInfo;
 import com.yugabyte.yw.models.Universe;
+import com.yugabyte.yw.models.helpers.BundleDetails.ComponentType;
 import com.yugabyte.yw.models.helpers.TaskType;
-import java.util.UUID;
+import java.io.File;
+import java.io.IOException;
+import java.text.SimpleDateFormat;
 import java.util.Date;
 import java.util.EnumSet;
 import java.util.List;
-import java.io.File;
-import java.io.IOException;
-import org.junit.Before;
+import java.util.UUID;
 import org.junit.After;
+import org.junit.Before;
 import org.junit.Test;
 import org.junit.runner.RunWith;
-import org.mockito.Mock;
-import org.mockito.runners.MockitoJUnitRunner;
-import org.yb.client.YBClient;
+import org.mockito.ArgumentCaptor;
+import org.mockito.junit.MockitoJUnitRunner;
 
 @RunWith(MockitoJUnitRunner.class)
 public class CreateSupportBundleTest extends CommissionerBaseTest {
-  @Mock private YBClient mockYBClientActual;
-
   private Universe universe;
   private Customer customer;
   protected RuntimeConfigFactory runtimeConfigFactory;
+  protected RuntimeConfGetter runtimeConfGetter;
 
-  @Override
   @Before
   public void setUp() {
-    super.setUp();
+    when(mockOperatorStatusUpdaterFactory.create()).thenReturn(mockOperatorStatusUpdater);
     this.customer = ModelFactory.testCustomer();
-    this.universe = ModelFactory.createUniverse(customer.getCustomerId());
+    this.universe = ModelFactory.createUniverse(customer.getId());
     this.runtimeConfigFactory = mockBaseTaskDependencies.getRuntimeConfigFactory();
-    when(mockYBClient.getClient(any(), any())).thenReturn(mockYBClientActual);
+    this.runtimeConfGetter = mockBaseTaskDependencies.getConfGetter();
   }
 
   @After
@@ -73,7 +72,7 @@ public class CreateSupportBundleTest extends CommissionerBaseTest {
     bundleData.startDate = startDate;
     bundleData.endDate = endDate;
     bundleData.components = EnumSet.allOf(ComponentType.class);
-    SupportBundle supportBundle = SupportBundle.create(bundleData, universe);
+    SupportBundle supportBundle = SupportBundle.create(bundleData, universe, runtimeConfGetter);
     SupportBundleTaskParams bundleTaskParams =
         new SupportBundleTaskParams(supportBundle, bundleData, customer, universe);
     try {
@@ -91,7 +90,7 @@ public class CreateSupportBundleTest extends CommissionerBaseTest {
         .thenReturn(mockSupportBundleComponent);
     doNothing()
         .when(mockSupportBundleComponent)
-        .downloadComponentBetweenDates(any(), any(), any(), any(), any(), any());
+        .downloadComponentBetweenDates(any(), any(), any(), any(), any(), any(), any());
 
     // Check if task succeeded
     TaskInfo taskInfo = submitTask(new Date(), new Date());
@@ -99,7 +98,7 @@ public class CreateSupportBundleTest extends CommissionerBaseTest {
 
     // Check if the components are executed
     verify(mockSupportBundleComponent, atLeast(1))
-        .downloadComponentBetweenDates(any(), any(), any(), any(), any(), any());
+        .downloadComponentBetweenDates(any(), any(), any(), any(), any(), any(), any());
 
     // Check if bundle exists in db
     List<SupportBundle> supportBundleList = SupportBundle.getAll();
@@ -116,7 +115,7 @@ public class CreateSupportBundleTest extends CommissionerBaseTest {
         .thenReturn(mockSupportBundleComponent);
     doNothing()
         .when(mockSupportBundleComponent)
-        .downloadComponentBetweenDates(any(), any(), any(), any(), any(), any());
+        .downloadComponentBetweenDates(any(), any(), any(), any(), any(), any(), any());
 
     // Check if task succeeded
     TaskInfo taskInfo = submitTask(new Date(), null);
@@ -124,7 +123,7 @@ public class CreateSupportBundleTest extends CommissionerBaseTest {
 
     // Check if the components are executed
     verify(mockSupportBundleComponent, atLeast(1))
-        .downloadComponentBetweenDates(any(), any(), any(), any(), any(), any());
+        .downloadComponentBetweenDates(any(), any(), any(), any(), any(), any(), any());
 
     // Check if bundle exists in db
     List<SupportBundle> supportBundleList = SupportBundle.getAll();
@@ -141,7 +140,7 @@ public class CreateSupportBundleTest extends CommissionerBaseTest {
         .thenReturn(mockSupportBundleComponent);
     doNothing()
         .when(mockSupportBundleComponent)
-        .downloadComponentBetweenDates(any(), any(), any(), any(), any(), any());
+        .downloadComponentBetweenDates(any(), any(), any(), any(), any(), any(), any());
 
     // Check if task succeeded
     TaskInfo taskInfo = submitTask(null, new Date());
@@ -149,7 +148,7 @@ public class CreateSupportBundleTest extends CommissionerBaseTest {
 
     // Check if the components are executed
     verify(mockSupportBundleComponent, atLeast(1))
-        .downloadComponentBetweenDates(any(), any(), any(), any(), any(), any());
+        .downloadComponentBetweenDates(any(), any(), any(), any(), any(), any(), any());
 
     // Check if bundle exists in db
     List<SupportBundle> supportBundleList = SupportBundle.getAll();
@@ -161,12 +160,42 @@ public class CreateSupportBundleTest extends CommissionerBaseTest {
   }
 
   @Test
+  public void testCreateSupportBundlePreservesStartAndEndDateTime() throws Exception {
+    ArgumentCaptor<Date> startCaptor = ArgumentCaptor.forClass(Date.class);
+    ArgumentCaptor<Date> endCaptor = ArgumentCaptor.forClass(Date.class);
+
+    when(mockSupportBundleComponentFactory.getComponent(any()))
+        .thenReturn(mockSupportBundleComponent);
+    doNothing()
+        .when(mockSupportBundleComponent)
+        .downloadComponentBetweenDates(
+            any(), any(), any(), any(), startCaptor.capture(), endCaptor.capture(), any());
+
+    SimpleDateFormat sdf = new SimpleDateFormat("yyyy-MM-dd HH:mm:ss");
+    Date start = sdf.parse("2026-05-06 09:17:13");
+    Date end = sdf.parse("2026-05-06 15:30:45");
+
+    TaskInfo taskInfo = submitTask(start, end);
+    assertEquals(Success, taskInfo.getTaskState());
+
+    verify(mockSupportBundleComponent, atLeast(1))
+        .downloadComponentBetweenDates(any(), any(), any(), any(), any(), any(), any());
+
+    for (Date capturedStart : startCaptor.getAllValues()) {
+      assertEquals(start, capturedStart);
+    }
+    for (Date capturedEnd : endCaptor.getAllValues()) {
+      assertEquals(end, capturedEnd);
+    }
+  }
+
+  @Test
   public void testCreateSupportBundleWithNoDates() throws Exception {
     when(mockSupportBundleComponentFactory.getComponent(any()))
         .thenReturn(mockSupportBundleComponent);
     doNothing()
         .when(mockSupportBundleComponent)
-        .downloadComponentBetweenDates(any(), any(), any(), any(), any(), any());
+        .downloadComponentBetweenDates(any(), any(), any(), any(), any(), any(), any());
 
     // Check if task succeeded
     TaskInfo taskInfo = submitTask(null, null);
@@ -174,7 +203,7 @@ public class CreateSupportBundleTest extends CommissionerBaseTest {
 
     // Check if the components are executed
     verify(mockSupportBundleComponent, atLeast(1))
-        .downloadComponentBetweenDates(any(), any(), any(), any(), any(), any());
+        .downloadComponentBetweenDates(any(), any(), any(), any(), any(), any(), any());
 
     // Check if bundle exists in db
     List<SupportBundle> supportBundleList = SupportBundle.getAll();

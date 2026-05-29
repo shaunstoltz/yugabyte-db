@@ -3,9 +3,9 @@
 // LICENSE file in the root directory of this source tree. An additional grant
 // of patent rights can be found in the PATENTS file in the same directory.
 //
-// The following only applies to changes made to this file as part of YugaByte development.
+// The following only applies to changes made to this file as part of YugabyteDB development.
 //
-// Portions Copyright (c) YugaByte, Inc.
+// Portions Copyright (c) YugabyteDB, Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License"); you may not use this file except
 // in compliance with the License.  You may obtain a copy of the License at
@@ -39,32 +39,49 @@ class MapIterator : public InternalIterator {
  public:
   explicit MapIterator(const Data& data) : data_(data), pos_(data_.end()) {}
 
-  bool Valid() const override { return pos_ != data_.end(); }
+  const KeyValueEntry& SeekToFirst() override {
+    pos_ = data_.begin();
+    return Entry();
+  }
 
-  void SeekToFirst() override { pos_ = data_.begin(); }
-
-  void SeekToLast() override {
+  const KeyValueEntry& SeekToLast() override {
     pos_ = data_.end();
     --pos_;
+    return Entry();
   }
 
-  void Seek(const Slice& target) override {
+  const KeyValueEntry& Seek(Slice target) override {
     pos_ = data_.find(target.ToString());
+    return Entry();
   }
 
-  void Next() override { ++pos_; }
+  const KeyValueEntry& Next() override {
+    ++pos_;
+    return Entry();
+  }
 
-  void Prev() override { --pos_; }
+  const KeyValueEntry& Prev() override {
+    --pos_;
+    return Entry();
+  }
 
-  Slice key() const override { return pos_->first; }
-
-  Slice value() const override { return pos_->second; }
+  const KeyValueEntry& Entry() const override {
+    if (pos_ == data_.end()) {
+      return KeyValueEntry::Invalid();
+    }
+    entry_ = KeyValueEntry {
+      .key = pos_->first,
+      .value = pos_->second,
+    };
+    return entry_;
+  }
 
   Status status() const override { return Status::OK(); }
 
  private:
   const Data& data_;
   Data::const_iterator pos_;
+  mutable KeyValueEntry entry_;
 };
 
 class BlockTest : public RocksDBTest {};

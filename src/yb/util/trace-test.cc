@@ -15,9 +15,9 @@
 // specific language governing permissions and limitations
 // under the License.
 //
-// The following only applies to changes made to this file as part of YugaByte development.
+// The following only applies to changes made to this file as part of YugabyteDB development.
 //
-// Portions Copyright (c) YugaByte, Inc.
+// Portions Copyright (c) YugabyteDB, Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License"); you may not use this file except
 // in compliance with the License.  You may obtain a copy of the License at
@@ -50,6 +50,11 @@
 
 // Need to add rapidjson.h to the list of recognized third-party libraries in our linter.
 
+DECLARE_bool(enable_tracing);
+DECLARE_int32(sampled_trace_1_in_n);
+DECLARE_uint32(trace_max_dump_size);
+DECLARE_uint32(tracing_max_entries_per_trace);
+DECLARE_uint32(tracing_max_children_per_trace);
 
 using yb::debug::TraceLog;
 using yb::debug::TraceResultBuffer;
@@ -89,6 +94,191 @@ TEST_F(TraceTest, TestBasic) {
             result);
 }
 
+std::string GetLongString(size_t size) {
+  std::stringstream out;
+  std::string_view repeated_string("0123456789");
+  while (size > 0) {
+    size_t prefix_len = std::min(repeated_string.length(), size);
+    out << repeated_string.substr(0, prefix_len);
+    size -= prefix_len;
+  }
+  return out.str();
+}
+
+TEST_F(TraceTest, TestDumpLargeTrace) {
+  const size_t kGlogMessageSizeLimit = google::LogMessage::kMaxLogMessageLen;
+  ANNOTATE_UNPROTECTED_WRITE(FLAGS_tracing_max_entries_per_trace) = 0;
+
+  class LogSink : public google::LogSink {
+   public:
+    void send(
+        google::LogSeverity severity, const char* full_filename, const char* base_filename,
+        int line, const struct ::tm* tm_time, const char* message, size_t message_len) {
+      logged_bytes_ += message_len;
+    }
+
+    size_t logged_bytes() const { return logged_bytes_; }
+
+   private:
+    std::atomic<size_t> logged_bytes_{0};
+  } log_sink;
+
+  google::AddLogSink(&log_sink);
+  size_t size_before_logging;
+  size_t size_after_logging;
+
+  // Glog has a weird behavior of eating up the ending `\n` when sending the
+  // message to LogSink
+  string message_no_newline = "xy";
+  size_before_logging = log_sink.logged_bytes();
+  LOG(INFO) << message_no_newline;
+  size_after_logging = log_sink.logged_bytes();
+  ASSERT_EQ(size_after_logging - size_before_logging, message_no_newline.length());
+
+  string small_message_with_newline = "x\n";
+  size_before_logging = log_sink.logged_bytes();
+  LOG(INFO) << small_message_with_newline;
+  size_after_logging = log_sink.logged_bytes();
+  // GLog eats up the last '\n' while passing the message to the LogSink.
+  // This needs to be accounted for while calculating the expected size.
+  ASSERT_EQ(size_after_logging - size_before_logging, small_message_with_newline.length() - 1);
+
+  scoped_refptr<Trace> tsmall(new Trace);
+  TRACE_TO(tsmall, "A very small line");
+  const string kSmallTraceDump = tsmall->DumpToString(true);
+  size_t kSmallTraceDumpSize = kSmallTraceDump.size();
+  // DumpToString has a '\n' at the end
+  ASSERT_EQ(kSmallTraceDump[kSmallTraceDumpSize - 1], '\n');
+  size_before_logging = log_sink.logged_bytes();
+  LOG(INFO) << kSmallTraceDump;
+  size_after_logging = log_sink.logged_bytes();
+  // GLog eats up the last '\n' while passing the message to the LogSink.
+  // This needs to be accounted for while calculating the expected size.
+  ASSERT_EQ(size_after_logging - size_before_logging, kSmallTraceDumpSize - 1);
+
+  scoped_refptr<Trace> t(new Trace);
+  constexpr int kNumLines = 100;
+  const string kLongLine = GetLongString(1000);
+  const string kVeryLongLine = GetLongString(40000);
+  for (int i = 1; i <= kNumLines; i++) {
+    TRACE_TO(t, "Line $0 : $1", i, kLongLine);
+  }
+  TRACE_TO(t, "A very long line : $0", kVeryLongLine);
+
+  const string kContinuationMarker("\ntrace continues ...");
+  const string kTraceDump = t->DumpToString(true);
+  size_t kTraceDumpSize = kTraceDump.size();
+  // DumpToString has a '\n' at the end
+  ASSERT_EQ(kTraceDump[kTraceDumpSize - 1], '\n');
+
+  LOG(INFO) << "Dumping DumpToString may result in the trace getting truncated after ~30 lines";
+  size_before_logging = log_sink.logged_bytes();
+  LOG(INFO) << t->DumpToString(true);
+  size_after_logging = log_sink.logged_bytes();
+  ASSERT_LE(size_after_logging - size_before_logging, kGlogMessageSizeLimit);
+  ASSERT_LT(size_after_logging - size_before_logging, kTraceDumpSize);
+
+  ANNOTATE_UNPROTECTED_WRITE(FLAGS_trace_max_dump_size) = std::numeric_limits<uint32>::max();
+  LOG(INFO) << "DumpToLogInfo should not be truncated";
+  size_before_logging = log_sink.logged_bytes();
+  t->DumpToLogInfo(true);
+  size_after_logging = log_sink.logged_bytes();
+  ASSERT_GT(size_after_logging - size_before_logging, kGlogMessageSizeLimit);
+  constexpr size_t kNumExpectedParts = 6;
+  constexpr size_t kNumNewLinesRemovedByDumpToLogInfo = 4;
+  // We expect the output to be split into kNumExpectedParts lines.
+  // kNumNewLinesRemovedByDumpToLogInfo newlines will be removed while printing.
+  // the last newline will be eaten up by LogSink/glog.
+  // (kNumExpectedParts - 1) continuation markers added.
+  ASSERT_EQ(
+      size_after_logging - size_before_logging,
+      kTraceDumpSize - 1 + (kNumExpectedParts - 1) * kContinuationMarker.size() -
+          kNumNewLinesRemovedByDumpToLogInfo);
+
+  LOG(INFO) << "with trace_max_dump_size=30000 DumpToLogInfo should be truncated";
+  ANNOTATE_UNPROTECTED_WRITE(FLAGS_trace_max_dump_size) = 30000;
+  size_before_logging = log_sink.logged_bytes();
+  t->DumpToLogInfo(true);
+  size_after_logging = log_sink.logged_bytes();
+  ASSERT_LE(size_after_logging - size_before_logging, kGlogMessageSizeLimit);
+  ASSERT_LT(size_after_logging - size_before_logging, kTraceDumpSize);
+
+  ANNOTATE_UNPROTECTED_WRITE(FLAGS_trace_max_dump_size) = 0;
+  LOG(INFO) << "with trace_max_dump_size=0 DumpToLogInfo should not be truncated";
+  size_before_logging = log_sink.logged_bytes();
+  t->DumpToLogInfo(true);
+  size_after_logging = log_sink.logged_bytes();
+  ASSERT_GT(size_after_logging - size_before_logging, kGlogMessageSizeLimit);
+  // We expect the output to be split into kNumExpectedParts lines.
+  // kNumNewLinesRemovedByDumpToLogInfo newlines will be removed while printing.
+  // the last newline will be eaten up by LogSink/glog.
+  // (kNumExpectedParts - 1) continuation markers added.
+  ASSERT_EQ(
+      size_after_logging - size_before_logging,
+      kTraceDumpSize - 1 + (kNumExpectedParts - 1) * kContinuationMarker.size() -
+          kNumNewLinesRemovedByDumpToLogInfo);
+
+  google::RemoveLogSink(&log_sink);
+}
+
+TEST_F(TraceTest, TestTraceEntryLimit) {
+  constexpr uint32_t kMaxEntries = 5;
+  ANNOTATE_UNPROTECTED_WRITE(FLAGS_tracing_max_entries_per_trace) = kMaxEntries;
+
+  scoped_refptr<Trace> trace(new Trace());
+  for (size_t i = 0; i < kMaxEntries + 2; ++i) {
+    TRACE_TO(trace.get(), "Entry $0", i);
+  }
+
+  ASSERT_LE(trace->NumEntries(), kMaxEntries)
+      << "Expected at most " << kMaxEntries << " entries in trace, found " << trace->NumEntries();
+}
+
+TEST_F(TraceTest, TestTraceChildLimitWithSampling) {
+  constexpr uint32_t kMaxChildren = 3;
+  ANNOTATE_UNPROTECTED_WRITE(FLAGS_enable_tracing) = false;
+  ANNOTATE_UNPROTECTED_WRITE(FLAGS_tracing_max_children_per_trace) = kMaxChildren;
+  {
+    ANNOTATE_UNPROTECTED_WRITE(FLAGS_sampled_trace_1_in_n) = 0; // Disable sampling for this test.
+    scoped_refptr<Trace> parent(new Trace());
+    size_t num_child_traces = 0;
+    for (size_t i = 0; i < kMaxChildren + 2; ++i) {
+      if (auto child = Trace::MaybeGetNewTraceForParent(parent.get())) {
+        num_child_traces++;
+      }
+    }
+    ASSERT_EQ(parent->NumChildren(), kMaxChildren);
+    ASSERT_EQ(num_child_traces, kMaxChildren);
+  }
+
+  {
+    ANNOTATE_UNPROTECTED_WRITE(FLAGS_sampled_trace_1_in_n) = 1; // Enable sampling 100% of the time.
+    scoped_refptr<Trace> parent(new Trace());
+    size_t num_child_traces = 0;
+    for (size_t i = 0; i < kMaxChildren + 2; ++i) {
+      if (auto child = Trace::MaybeGetNewTraceForParent(parent.get())) {
+        num_child_traces++;
+      }
+    }
+    ASSERT_EQ(parent->NumChildren(), kMaxChildren);
+    ASSERT_EQ(num_child_traces, kMaxChildren + 2);
+  }
+}
+
+TEST_F(TraceTest, TestNoCrashWhenExceedingTraceLimits) {
+  ANNOTATE_UNPROTECTED_WRITE(FLAGS_tracing_max_entries_per_trace) = 1;
+  ANNOTATE_UNPROTECTED_WRITE(FLAGS_tracing_max_children_per_trace) = 1;
+
+  scoped_refptr<Trace> trace(new Trace());
+  TRACE_TO(trace.get(), "First entry");
+  TRACE_TO(trace.get(), "Second entry");
+  ASSERT_EQ(trace->NumEntries(), 1);
+
+  auto child1 = Trace::MaybeGetNewTraceForParent(trace.get());
+  auto child2 = Trace::MaybeGetNewTraceForParent(trace.get());
+  ASSERT_EQ(trace->NumChildren(), 1);
+}
+
 TEST_F(TraceTest, TestAttach) {
   scoped_refptr<Trace> traceA(new Trace);
   scoped_refptr<Trace> traceB(new Trace);
@@ -120,12 +310,14 @@ TEST_F(TraceTest, TestChildTrace) {
   TRACE("hello from traceA");
   {
     ADOPT_TRACE(traceB.get());
-    TRACE("hello from traceB");
+    TRACE("hello from traceB\nhello again from traceB");
   }
-  EXPECT_EQ("XXXX XX:XX:XX.XXXXXX trace-test.cc:XXX] hello from traceA\n"
-            "..  Related trace:\n"
-            "..  XXXX XX:XX:XX.XXXXXX trace-test.cc:XXX] hello from traceB\n",
-            XOutDigits(traceA->DumpToString(false)));
+  EXPECT_EQ(
+      "XXXX XX:XX:XX.XXXXXX trace-test.cc:XXX] hello from traceA\n"
+      "..  Related trace:\n"
+      "..  XXXX XX:XX:XX.XXXXXX trace-test.cc:XXX] hello from traceB\n"
+      "..  ..  hello again from traceB\n",
+      XOutDigits(traceA->DumpToString(false)));
 }
 
 static void GenerateTraceEvents(int thread_id,
@@ -813,7 +1005,8 @@ TEST_F(TraceEventSyntheticDelayTest, BeginParallel) {
 }
 
 TEST_F(TraceTest, TestVLogTrace) {
-  for (FLAGS_v = 0; FLAGS_v <= 1; FLAGS_v++) {
+  for(int i = 0; i <= 1; i++) {
+    ANNOTATE_UNPROTECTED_WRITE(FLAGS_v) = i;
     TraceLog* tl = TraceLog::GetInstance();
     tl->SetEnabled(CategoryFilter(CategoryFilter::kDefaultCategoryFilterString),
                    TraceLog::RECORDING_MODE,
@@ -836,14 +1029,14 @@ string FunctionWithSideEffect(bool* b) {
 // Test that, if tracing is not enabled, a VLOG_AND_TRACE doesn't evaluate its
 // arguments.
 TEST_F(TraceTest, TestVLogTraceLazyEvaluation) {
-  FLAGS_v = 0;
+  ANNOTATE_UNPROTECTED_WRITE(FLAGS_v) = 0;
   bool function_run = false;
   VLOG_AND_TRACE("test", 1) << FunctionWithSideEffect(&function_run);
   ASSERT_FALSE(function_run);
 
   // If we enable verbose logging, we should run the side effect even though
   // trace logging is disabled.
-  FLAGS_v = 1;
+  ANNOTATE_UNPROTECTED_WRITE(FLAGS_v) = 1;
   VLOG_AND_TRACE("test", 1) << FunctionWithSideEffect(&function_run);
   ASSERT_TRUE(function_run);
 }
@@ -853,7 +1046,7 @@ TEST_F(TraceTest, TestVLogAndEchoToConsole) {
   tl->SetEnabled(CategoryFilter(CategoryFilter::kDefaultCategoryFilterString),
                  TraceLog::RECORDING_MODE,
                  TraceLog::ECHO_TO_CONSOLE);
-  FLAGS_v = 1;
+  ANNOTATE_UNPROTECTED_WRITE(FLAGS_v) = 1;
   VLOG_AND_TRACE("test", 1) << "hello world";
   tl->SetDisabled();
 }

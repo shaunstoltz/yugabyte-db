@@ -1,17 +1,20 @@
-// Copyright (c) Yugabyte, Inc.
+// Copyright (c) YugabyteDB, Inc.
 
 package com.yugabyte.yw.common;
 
 import com.google.common.annotations.VisibleForTesting;
 import com.google.common.collect.ImmutableMap;
 import com.typesafe.config.Config;
+import com.yugabyte.yw.common.ConfigHelper.ConfigType;
 import com.yugabyte.yw.common.certmgmt.CertificateHelper;
 import com.yugabyte.yw.controllers.JWTVerifier;
 import com.yugabyte.yw.controllers.JWTVerifier.ClientType;
+import com.yugabyte.yw.models.FileData;
 import com.yugabyte.yw.models.NodeAgent;
 import com.yugabyte.yw.models.NodeAgent.ArchType;
 import com.yugabyte.yw.models.NodeAgent.OSType;
 import com.yugabyte.yw.models.NodeAgent.State;
+import io.ebean.annotation.Transactional;
 import io.jsonwebtoken.Jwts;
 import io.jsonwebtoken.SignatureAlgorithm;
 import java.io.BufferedInputStream;
@@ -26,13 +29,14 @@ import java.io.PrintWriter;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.Paths;
+import java.nio.file.StandardOpenOption;
 import java.security.KeyPair;
 import java.security.PrivateKey;
 import java.security.PublicKey;
 import java.security.cert.X509Certificate;
 import java.time.Instant;
+import java.util.Collections;
 import java.util.Date;
-import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Objects;
@@ -51,8 +55,7 @@ import lombok.extern.slf4j.Slf4j;
 import org.apache.commons.compress.archivers.tar.TarArchiveEntry;
 import org.apache.commons.compress.archivers.tar.TarArchiveInputStream;
 import org.apache.commons.compress.compressors.gzip.GzipCompressorInputStream;
-import org.apache.commons.compress.utils.IOUtils;
-import org.apache.commons.io.FileUtils;
+import org.apache.commons.io.IOUtils;
 import org.apache.commons.io.filefilter.WildcardFileFilter;
 import org.apache.commons.lang3.StringUtils;
 import org.apache.commons.lang3.tuple.ImmutablePair;
@@ -71,19 +74,27 @@ public class NodeAgentManager {
   public static final String CLAIM_SESSION_PROPERTY = "jwt-claims";
   public static final String NODE_AGENT_RELEASES_PATH_PROPERTY = "yb.node_agent.releases.path";
   public static final String NODE_AGENT_SERVER_INSTALL_PROPERTY = "yb.node_agent.server.install";
-  public static final int CERT_EXPIRY_YEARS = 5;
+  public static final String NODE_AGENT_INSTALLER_FILE = "node-agent-installer.sh";
+  public static final int NODE_AGENT_JWT_EXPIRY_SECS = 1800;
 
-  private static final String NODE_AGENT_INSTALLER_FILE = "node-agent-installer.sh";
   private static final String NODE_AGENT_FILE_FILTER_FORMAT = "node_agent-%s*-%s-%s.tar.gz";
   private static final String NODE_AGENT_FILE_REGEX_FORMAT = "^node_agent-(.+)-%s-%s.tar.gz$";
 
   private final Config appConfig;
   private final ConfigHelper configHelper;
+  private final CertificateHelper certificateHelper;
+  private final FileHelperService fileHelperService;
 
   @Inject
-  public NodeAgentManager(Config appConfig, ConfigHelper configHelper) {
+  public NodeAgentManager(
+      Config appConfig,
+      ConfigHelper configHelper,
+      CertificateHelper certificateHelper,
+      FileHelperService fileHelperService) {
     this.appConfig = appConfig;
     this.configHelper = configHelper;
+    this.certificateHelper = certificateHelper;
+    this.fileHelperService = fileHelperService;
   }
 
   @Getter
@@ -91,15 +102,27 @@ public class NodeAgentManager {
     @NonNull private final Path sourcePath;
     @NonNull private final Path targetPath;
     private final String permission;
+    private final boolean deleteAfterCopy;
 
     CopyFileInfo(Path sourcePath, Path targetPath) {
-      this(sourcePath, targetPath, null);
+      this(sourcePath, targetPath, null, false);
     }
 
-    CopyFileInfo(Path sourcePath, Path targetPath, String permission) {
+    CopyFileInfo(Path sourcePath, Path targetPath, String permission, boolean deleteAfterCopy) {
       this.sourcePath = sourcePath;
       this.targetPath = targetPath;
       this.permission = permission;
+      this.deleteAfterCopy = deleteAfterCopy;
+    }
+
+    public void cleanupAfterCopy() {
+      if (deleteAfterCopy) {
+        try {
+          Files.deleteIfExists(sourcePath);
+        } catch (IOException e) {
+          log.warn("Error deleting file {}: {}", sourcePath, e.getMessage());
+        }
+      }
     }
   }
 
@@ -108,19 +131,25 @@ public class NodeAgentManager {
   @Getter
   public static class InstallerFiles {
     @NonNull private String certDir;
-    @NonNull private Path packagePath;
+    @Nullable private Path packagePath;
     @Singular private List<Path> createDirs;
     @Singular private List<CopyFileInfo> copyFileInfos;
+
+    public void cleanupCopiedFiles() {
+      if (copyFileInfos != null) {
+        copyFileInfos.forEach(CopyFileInfo::cleanupAfterCopy);
+      }
+    }
   }
 
   @VisibleForTesting
   public Path getNodeAgentBaseCertDirectory(NodeAgent nodeAgent) {
     return Paths.get(
-        appConfig.getString("yb.storage.path"),
+        AppConfigHelper.getStoragePath(),
         "node-agent",
         "certs",
-        nodeAgent.customerUuid.toString(),
-        nodeAgent.uuid.toString());
+        nodeAgent.getCustomerUuid().toString(),
+        nodeAgent.getUuid().toString());
   }
 
   private Path getOrCreateCertDirectory(NodeAgent nodeAgent, String certDir) {
@@ -132,7 +161,7 @@ public class NodeAgentManager {
   // Certs are created in each directory <base-cert-dir>/<index>/.
   // The index keeps increasing.
   private Path getOrCreateNextCertDirectory(NodeAgent nodeAgent) {
-    String certDirPath = nodeAgent.config.get(NodeAgent.CERT_DIR_PATH_PROPERTY);
+    String certDirPath = nodeAgent.getConfig().getCertPath();
     if (StringUtils.isBlank(certDirPath)) {
       return getOrCreateCertDirectory(nodeAgent, "0");
     }
@@ -140,21 +169,21 @@ public class NodeAgentManager {
     return getOrCreateCertDirectory(nodeAgent, String.valueOf(Integer.parseInt(certDir) + 1));
   }
 
-  private static Pair<X509Certificate, KeyPair> createRootCert(
+  private Pair<X509Certificate, KeyPair> createRootCert(
       NodeAgent nodeAgent, String certPath, String keyPath) {
     try {
-      String certLabel = nodeAgent.uuid.toString();
+      int expiresAt = appConfig.getInt("yb.tlsCertificate.root.expiryInYears");
+      String certLabel = nodeAgent.getUuid().toString();
       KeyPair keyPair = CertificateHelper.getKeyPairObject();
-      X509Certificate x509 =
-          CertificateHelper.generateCACertificate(certLabel, keyPair, CERT_EXPIRY_YEARS);
+      X509Certificate x509 = certificateHelper.generateCACertificate(certLabel, keyPair, expiresAt);
       CertificateHelper.writeCertFileContentToCertPath(x509, certPath);
       CertificateHelper.writeKeyFileContentToKeyPath(keyPair.getPrivate(), keyPath);
       return new ImmutablePair<>(x509, keyPair);
     } catch (RuntimeException e) {
-      log.error("Failed to create root cert for node agent {}", nodeAgent.uuid, e);
+      log.error("Failed to create root cert for node agent {}", nodeAgent, e);
       throw e;
     } catch (Exception e) {
-      log.error("Failed to create root cert for node agent {}", nodeAgent.uuid, e);
+      log.error("Failed to create root cert for node agent {}", nodeAgent, e);
       throw new RuntimeException(e.getMessage(), e);
     }
   }
@@ -168,7 +197,11 @@ public class NodeAgentManager {
       int expiryYrs) {
     try {
       Map<String, Integer> sans =
-          ImmutableMap.<String, Integer>builder().put(nodeAgent.ip, GeneralName.iPAddress).build();
+          ImmutableMap.<String, Integer>builder()
+              .put(
+                  nodeAgent.getIp(),
+                  Util.isIpAddress(nodeAgent.getIp()) ? GeneralName.iPAddress : GeneralName.dNSName)
+              .build();
 
       // Add the security provider in case createSignedCertificate was never called.
       KeyPair keyPair = CertificateHelper.getKeyPairObject();
@@ -176,15 +209,15 @@ public class NodeAgentManager {
       X500Name subject = new JcaX509CertificateHolder(caCert).getSubject();
       X509Certificate x509 =
           CertificateHelper.createAndSignCertificate(
-              nodeAgent.ip, subject, keyPair, caCert, caPrivateKey, sans, expiryYrs);
+              nodeAgent.getIp(), subject, keyPair, caCert, caPrivateKey, sans, expiryYrs);
       CertificateHelper.writeCertFileContentToCertPath(x509, serverCertPath);
       CertificateHelper.writeKeyFileContentToKeyPath(keyPair.getPrivate(), serverKeyPath);
       return new ImmutablePair<>(x509, keyPair);
     } catch (RuntimeException e) {
-      log.error("Failed to create server cert for node agent {}", nodeAgent.uuid, e);
+      log.error("Failed to create server cert for node agent {}", nodeAgent, e);
       throw e;
     } catch (Exception e) {
-      log.error("Failed to create server cert for node agent {}", nodeAgent.uuid, e);
+      log.error("Failed to create server cert for node agent {}", nodeAgent, e);
       throw new RuntimeException(e.getMessage(), e);
     }
   }
@@ -200,7 +233,7 @@ public class NodeAgentManager {
       Pair<X509Certificate, KeyPair> pair = createRootCert(nodeAgent, caCertPath, caKeyPath);
       log.info(
           "Generated root cert for node agent: {} at key path: {} and cert path: {}",
-          nodeAgent.uuid,
+          nodeAgent,
           caKeyPath,
           caCertPath);
 
@@ -215,15 +248,15 @@ public class NodeAgentManager {
 
       log.info(
           "Generated self-signed server cert for node agent: {} at key path: {} and cert path: {}",
-          nodeAgent.uuid,
+          nodeAgent,
           serverKeyPath,
           serverKeyPath);
       return serverPair;
     } catch (RuntimeException e) {
-      log.error("Failed to generate certs for node agent {}", nodeAgent.uuid, e);
+      log.error("Failed to generate certs for node agent {}", nodeAgent, e);
       throw e;
     } catch (Exception e) {
-      log.error("Failed to generate certs for node agent {}", nodeAgent.uuid, e);
+      log.error("Failed to generate certs for node agent {}", nodeAgent, e);
       throw new RuntimeException(e.getMessage(), e);
     }
   }
@@ -233,10 +266,11 @@ public class NodeAgentManager {
     Path nextCertFilepath = nextCertDirPath.resolve(NodeAgent.ROOT_CA_CERT_NAME);
     Path mergedCertFilepath = nextCertDirPath.resolve(NodeAgent.MERGED_ROOT_CA_CERT_NAME);
     log.info(
-        "Creating merged cert file {} of curr {} and new {}",
+        "Creating merged cert file {} of curr {} and new {} for node agent {}",
         mergedCertFilepath,
         currCertFilepath,
-        nextCertFilepath);
+        nextCertFilepath,
+        nodeAgent);
     try (PrintWriter writer = new PrintWriter(mergedCertFilepath.toFile())) {
       Path[] paths = new Path[] {currCertFilepath, nextCertFilepath};
       for (Path path : paths) {
@@ -250,19 +284,10 @@ public class NodeAgentManager {
     } catch (Exception e) {
       throw new RuntimeException(
           String.format(
-              "Failed to merge two certificates %s and %s into %s. Error: %s",
-              currCertFilepath, nextCertFilepath, mergedCertFilepath, e.getMessage()),
+              "Failed to merge two certificates %s and %s into %s for node agent {}. Error: %s",
+              currCertFilepath, nextCertFilepath, mergedCertFilepath, nodeAgent, e.getMessage()),
           e);
     }
-  }
-
-  /**
-   * Returns if server needs to be installed on a node.
-   *
-   * @return true if yes, false otherwise.
-   */
-  public boolean isServerToBeInstalled() {
-    return appConfig.getBoolean(NODE_AGENT_SERVER_INSTALL_PROPERTY);
   }
 
   /**
@@ -293,22 +318,28 @@ public class NodeAgentManager {
     return nodeAgentOp.get().getPublicKey();
   }
 
+  public Date getServerCertExpiry(NodeAgent nodeAgent) {
+    return CertificateHelper.extractDatesFromCertBundle(
+            Collections.singletonList(nodeAgent.getServerX509Cert()))
+        .getRight();
+  }
+
   /**
    * Returns the JWT to authenticate a client request to the given node agent.
    *
    * @param nodeAgentUuid node agent UUID.
    * @return the JWT for sending request to the node agent.
    */
+  @VisibleForTesting
   public String getClientToken(UUID nodeAgentUuid, UUID userUuid) {
     PrivateKey privateKey = getNodeAgentPrivateKey(nodeAgentUuid);
     return Jwts.builder()
         .setIssuer("https://www.yugabyte.com")
         .setSubject(ClientType.NODE_AGENT.name())
-        .setIssuedAt(Date.from(Instant.now()))
-        .setExpiration(Date.from(Instant.now().plusSeconds(600)))
-        .claim(JWTVerifier.CLIENT_ID_CLAIM, nodeAgentUuid.toString())
-        .claim(JWTVerifier.USER_ID_CLAIM, userUuid.toString())
-        .signWith(SignatureAlgorithm.RS256, privateKey)
+        .setExpiration(Date.from(Instant.now().plusSeconds(NODE_AGENT_JWT_EXPIRY_SECS)))
+        .claim(JWTVerifier.CLIENT_ID_CLAIM.toString(), nodeAgentUuid.toString())
+        .claim(JWTVerifier.USER_ID_CLAIM.toString(), userUuid.toString())
+        .signWith(privateKey, SignatureAlgorithm.RS256)
         .compact();
   }
 
@@ -329,7 +360,7 @@ public class NodeAgentManager {
   // Returns the YBA software version.
   public String getSoftwareVersion() {
     return Objects.requireNonNull(
-        (String) configHelper.getConfig(ConfigHelper.ConfigType.SoftwareVersion).get("version"));
+        (String) configHelper.getConfig(ConfigType.SoftwareVersion).get("version"));
   }
 
   /**
@@ -361,16 +392,18 @@ public class NodeAgentManager {
                   osType.name().toLowerCase(),
                   archType.name().toLowerCase()));
       // Search for a pattern like node_agent-2.15.3.0*-linux-amd64.tar.gz.
-      FileFilter fileFilter = new WildcardFileFilter(pkgFileFilter);
+      FileFilter fileFilter = WildcardFileFilter.builder().setWildcards(pkgFileFilter).get();
       File[] files = releasesPath.toFile().listFiles(fileFilter);
-      for (File file : files) {
-        matcher = filePattern.matcher(file.getName());
-        if (matcher.find()) {
-          // Extract the version with build number e.g. 2.15.3.0-b1372.
-          String version = matcher.group(1);
-          // Compare the full versions. The comparison ignores non-numeric build numbers.
-          if (Util.compareYbVersions(softwareVersion, version, true) == 0) {
-            return file.toPath();
+      if (files != null) {
+        for (File file : files) {
+          matcher = filePattern.matcher(file.getName());
+          if (matcher.find()) {
+            // Extract the version with build number e.g. 2.15.3.0-b1372.
+            String version = matcher.group(1);
+            // Compare the full versions. The comparison ignores non-numeric build numbers.
+            if (Util.areYbVersionsEqual(softwareVersion, version, true)) {
+              return file.toPath();
+            }
           }
         }
       }
@@ -392,8 +425,8 @@ public class NodeAgentManager {
         new TarArchiveInputStream(
             new GzipCompressorInputStream(new FileInputStream(filepath.toFile())))) {
       TarArchiveEntry currEntry;
-      while ((currEntry = tarInput.getNextTarEntry()) != null) {
-        if (!currEntry.isFile() || !currEntry.getName().endsWith(NODE_AGENT_INSTALLER_FILE)) {
+      while ((currEntry = tarInput.getNextEntry()) != null) {
+        if (!currEntry.isFile() || !currEntry.getName().endsWith("/" + NODE_AGENT_INSTALLER_FILE)) {
           continue;
         }
         BufferedInputStream in = new BufferedInputStream(tarInput);
@@ -403,9 +436,31 @@ public class NodeAgentManager {
       }
     } catch (IOException e) {
       throw new PlatformServiceException(
-          Status.INTERNAL_SERVER_ERROR, "Error in reading the node-agent installer.");
+          Status.INTERNAL_SERVER_ERROR,
+          "Error in reading the node-agent installer - " + e.getMessage());
     }
     throw new PlatformServiceException(Status.NOT_FOUND, "Node-agent installer does not exist.");
+  }
+
+  /**
+   * Returns the installer script temp file path.
+   *
+   * @param prefix the temp file prefix.
+   * @return the temp file path containing the script.
+   */
+  public Path getInstallerScriptTempFile(String prefix) {
+    byte[] contents = getInstallerScript();
+    String tmpDirectory = fileHelperService.createTempFile(prefix, ".sh").toString();
+    try {
+      return Files.write(
+          Paths.get(tmpDirectory),
+          contents,
+          StandardOpenOption.CREATE,
+          StandardOpenOption.TRUNCATE_EXISTING);
+    } catch (IOException e) {
+      throw new PlatformServiceException(
+          Status.INTERNAL_SERVER_ERROR, "Error in writing to the temp file - " + e.getMessage());
+    }
   }
 
   /**
@@ -414,23 +469,30 @@ public class NodeAgentManager {
    * @param nodeAgent the node agent record to be created.
    * @return the updated node agent record along with cert and key in the config.
    */
-  public NodeAgent create(NodeAgent nodeAgent) {
-    nodeAgent.config = new HashMap<>();
-    nodeAgent.state = State.REGISTERING;
+  /**
+   * Create a node agent record in the DB.
+   *
+   * @param nodeAgent nodeAgent the node agent record to be created.
+   * @param includeCertContents if it is true, server cert and key contents are included.
+   * @return the updated node agent record along with cert and key in the config.
+   */
+  @Transactional
+  public NodeAgent create(NodeAgent nodeAgent, boolean includeCertContents) {
+    nodeAgent.setConfig(new NodeAgent.Config());
+    nodeAgent.setState(State.REGISTERING);
     nodeAgent.insert();
     Path certDirPath = getOrCreateNextCertDirectory(nodeAgent);
     Pair<X509Certificate, KeyPair> serverPair = generateNodeAgentCerts(nodeAgent, certDirPath);
-    nodeAgent.updateCertDirPath(certDirPath);
-    X509Certificate serverCert = serverPair.getLeft();
-    KeyPair serverKeyPair = serverPair.getRight();
-    nodeAgent.config =
-        ImmutableMap.<String, String>builder()
-            .putAll(nodeAgent.config)
-            .put(NodeAgent.SERVER_CERT_PROPERTY, CertificateHelper.getAsPemString(serverCert))
-            .put(
-                NodeAgent.SERVER_KEY_PROPERTY,
-                CertificateHelper.getAsPemString(serverKeyPair.getPrivate()))
-            .build();
+    nodeAgent.getConfig().setCertPath(certDirPath.toString());
+    nodeAgent.save();
+    if (includeCertContents) {
+      X509Certificate serverCert = serverPair.getLeft();
+      KeyPair serverKeyPair = serverPair.getRight();
+      nodeAgent.getConfig().setServerCert(CertificateHelper.getAsPemString(serverCert));
+      nodeAgent
+          .getConfig()
+          .setServerKey(CertificateHelper.getAsPemString(serverKeyPair.getPrivate()));
+    }
     return nodeAgent;
   }
 
@@ -439,46 +501,50 @@ public class NodeAgentManager {
    * The files may be copied via node agent RPC for upgrade or over SSH/SCP for installation.
    *
    * @param nodeAgent nodeAgent the node agent record.
-   * @param baseTargetDir Optional base directory on the target node. If it is null, the relative
-   *     path is generated.
+   * @param nodeAgentDirPath path to the node agent directory.
+   * @param certsOnly generate only the certs if it is true.
    * @return the installer files.
    */
-  public InstallerFiles getInstallerFiles(NodeAgent nodeAgent, @Nullable Path baseTargetDir) {
+  public InstallerFiles getInstallerFiles(
+      NodeAgent nodeAgent, Path nodeAgentDirPath, boolean certsOnly) {
     InstallerFiles.InstallerFilesBuilder builder = InstallerFiles.builder();
-    // Package tgz file to be copied.
-    Path packagePath = getNodeAgentPackagePath(nodeAgent.osType, nodeAgent.archType);
-    Path targetPackagePath = Paths.get("node-agent", "release", "node-agent.tgz");
-    if (baseTargetDir != null) {
-      targetPackagePath = baseTargetDir.resolve(targetPackagePath);
-    }
-    builder.packagePath(targetPackagePath);
-    builder.copyFileInfo(new CopyFileInfo(packagePath, targetPackagePath));
-
     Path certDirPath = null;
-    if (nodeAgent.state == State.REGISTERING) {
-      builder.createDir(targetPackagePath.getParent());
-      certDirPath = nodeAgent.getCertDirPath();
-    } else {
+    if (certsOnly) {
       certDirPath = generateCerts(nodeAgent);
+    } else {
+      // Package tgz file to be copied.
+      Path packagePath = getNodeAgentPackagePath(nodeAgent.getOsType(), nodeAgent.getArchType());
+      Path targetPackagePath = nodeAgentDirPath.resolve(Paths.get("release", "node-agent.tgz"));
+      builder.packagePath(targetPackagePath);
+      builder.copyFileInfo(new CopyFileInfo(packagePath, targetPackagePath));
+      if (nodeAgent.getState() == State.REGISTERING) {
+        builder.createDir(targetPackagePath.getParent());
+        certDirPath = nodeAgent.getCertDirPath();
+      } else {
+        certDirPath = generateCerts(nodeAgent);
+        // Upload the installer script for upgrade as the old one may not be forward compatible.
+        Path tmpInstallerScriptPath = getInstallerScriptTempFile("node-agent-installer-");
+        Path targetInstallerScriptPath =
+            nodeAgentDirPath.resolve(Paths.get("pkg", "bin", NODE_AGENT_INSTALLER_FILE));
+        builder.copyFileInfo(
+            new CopyFileInfo(tmpInstallerScriptPath, targetInstallerScriptPath, "755", true));
+      }
     }
 
     String targetCertDir = UUID.randomUUID().toString();
     builder.certDir(targetCertDir);
 
     // Cert file to be copied.
-    Path targetCertDirPath = Paths.get("node-agent", "cert", targetCertDir);
-    if (baseTargetDir != null) {
-      targetCertDirPath = baseTargetDir.resolve(targetCertDirPath);
-    }
+    Path targetCertDirPath = nodeAgentDirPath.resolve(Paths.get("cert", targetCertDir));
     builder.createDir(targetCertDirPath);
     Path caCertPath = certDirPath.resolve(NodeAgent.SERVER_CERT_NAME);
     Path targetCaCertPath = targetCertDirPath.resolve("node_agent.crt");
-    builder.copyFileInfo(new CopyFileInfo(caCertPath, targetCaCertPath));
+    builder.copyFileInfo(new CopyFileInfo(caCertPath, targetCaCertPath, "644", false));
 
     // Key file to be copied.
     Path keyPath = certDirPath.resolve(NodeAgent.SERVER_KEY_NAME);
     Path targetKeyPath = targetCertDirPath.resolve("node_agent.key");
-    builder.copyFileInfo(new CopyFileInfo(keyPath, targetKeyPath));
+    builder.copyFileInfo(new CopyFileInfo(keyPath, targetKeyPath, "644", false));
     return builder.build();
   }
 
@@ -503,20 +569,22 @@ public class NodeAgentManager {
     if (!Files.exists(newCertDirPath)) {
       throw new IllegalStateException(
           String.format(
-              "New cert directory %s does not exist for node agent {}",
-              newCertDirPath, nodeAgent.uuid));
+              "New cert directory %s does not exist for node agent %s", newCertDirPath, nodeAgent));
     }
     // Point to the new directory and persist in the DB before deleting.
-    log.info("Updating the cert dir to {} for node agent {}", newCertDirPath, nodeAgent.uuid);
-    nodeAgent.updateCertDirPath(newCertDirPath);
+    log.info("Updating the cert dir to {} for node agent {}", newCertDirPath, nodeAgent);
+    nodeAgent.updateCertDirPath(newCertDirPath, State.UPGRADED);
     try {
       // Delete the old cert directory.
-      log.info(
-          "Deleting current cert dir {} for node agent {}", currentCertDirPath, nodeAgent.uuid);
-      FileUtils.deleteDirectory(currentCertDirPath.toFile());
+      log.info("Deleting current cert dir {} for node agent {}", currentCertDirPath, nodeAgent);
+      FileData.deleteFiles(currentCertDirPath.toString(), true);
     } catch (Exception e) {
       // Ignore error.
-      log.warn("Error deleting old cert directory {}", currentCertDirPath, e);
+      log.warn(
+          "Error deleting old cert directory {} for node agent {}",
+          currentCertDirPath,
+          nodeAgent,
+          e);
     }
   }
 

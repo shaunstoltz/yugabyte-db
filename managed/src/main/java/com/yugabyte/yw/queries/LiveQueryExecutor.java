@@ -1,4 +1,4 @@
-// Copyright (c) YugaByte, Inc.
+// Copyright (c) YugabyteDB, Inc.
 
 package com.yugabyte.yw.queries;
 
@@ -14,9 +14,7 @@ import java.util.UUID;
 import java.util.concurrent.Callable;
 import lombok.extern.slf4j.Slf4j;
 import org.apache.commons.lang3.StringUtils;
-import play.api.Play;
 import play.libs.Json;
-import play.libs.ws.WSClient;
 
 @Slf4j
 public class LiveQueryExecutor implements Callable<JsonNode> {
@@ -28,12 +26,6 @@ public class LiveQueryExecutor implements Callable<JsonNode> {
   private final int port;
   private final QueryHelper.QueryApi apiType;
 
-  public LiveQueryExecutor(
-      String nodeName, String hostName, int port, QueryHelper.QueryApi api, WSClient wsClient) {
-    this(nodeName, hostName, port, api, new ApiHelper(wsClient));
-  }
-
-  @VisibleForTesting
   LiveQueryExecutor(
       String nodeName, String hostName, int port, QueryHelper.QueryApi api, ApiHelper apiHelper) {
     this.nodeName = nodeName;
@@ -69,7 +61,8 @@ public class LiveQueryExecutor implements Callable<JsonNode> {
     if (response.has("connections")) {
       for (JsonNode objNode : response.get("connections")) {
         if (objNode.has("backend_type")
-            && objNode.get("backend_type").asText().equalsIgnoreCase("client backend")
+            && (objNode.get("backend_type").asText().equalsIgnoreCase("client backend")
+                || objNode.get("backend_type").asText().startsWith("yb-conn-mgr"))
             && objNode.has("backend_status")
             && !objNode.get("backend_status").asText().equalsIgnoreCase("idle")) {
           try {
@@ -83,12 +76,20 @@ public class LiveQueryExecutor implements Callable<JsonNode> {
             rowData.put("privateIp", hostName);
             rowData.put("dbName", params.db_name);
             rowData.put("sessionStatus", params.backend_status);
-            rowData.put("query", params.query);
+            rowData.put("query", StringUtils.defaultString(params.query));
             rowData.put("elapsedMillis", params.query_running_for_ms);
             rowData.put("queryStartTime", params.query_start_time);
             rowData.put("appName", params.application_name);
             rowData.put("clientHost", params.host);
             rowData.put("clientPort", params.port);
+
+            // query_id and leader pid are only present on pg15 and above.
+            if (params.leader_pid != -1) {
+              rowData.put("leader_pid", params.leader_pid);
+            }
+            if (params.query_id != null) {
+              rowData.put("query_id", params.query_id);
+            }
 
             ArrayNode ysqlArray;
             if (!responseJson.has("ysql")) {

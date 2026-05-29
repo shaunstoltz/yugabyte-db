@@ -1,77 +1,119 @@
-/*
- * Copyright (c) YugaByte, Inc.
- */
+// Copyright (c) YugabyteDB, Inc.
+
 package util
 
 import (
+	"context"
 	"crypto"
+	"crypto/tls"
 	"crypto/x509"
+	"encoding/json"
 	"encoding/pem"
 	"errors"
 	"fmt"
-	"io/ioutil"
 	"os"
 	"path/filepath"
 	"time"
 
-	"github.com/golang-jwt/jwt/v4"
+	"github.com/golang-jwt/jwt/v5"
 )
 
 // Claims for the JWT.
 type Claims struct {
 	JwtClientIdClaim string `json:"clientId"`
 	JwtUserIdClaim   string `json:"userId"`
-	jwt.StandardClaims
+	jwt.RegisteredClaims
 }
 
 // Saves the cert and key to the certs directory.
-func SaveCerts(config *Config, cert string, key string, subDir string) error {
+func SaveCerts(ctx context.Context, config *Config, cert string, key string, subDir string) error {
 	certsDir := filepath.Join(CertsDir(), subDir)
 	err := os.MkdirAll(certsDir, os.ModePerm)
 	if err != nil {
-		FileLogger().Errorf("Error while creating current certs dir %s", certsDir)
+		FileLogger().Errorf(ctx, "Error while creating current certs dir %s", certsDir)
 		return err
 	}
 	certFilepath := filepath.Join(certsDir, NodeAgentCertFile)
-	err = ioutil.WriteFile(
+	err = os.WriteFile(
 		certFilepath,
 		[]byte(cert),
 		0644,
 	)
 	if err != nil {
-		FileLogger().Errorf("Error while saving certs to %s", certFilepath)
+		FileLogger().Errorf(ctx, "Error while saving certs to %s", certFilepath)
 		return err
 	}
 	keyFilepath := filepath.Join(certsDir, NodeAgentKeyFile)
-	err = ioutil.WriteFile(
+	err = os.WriteFile(
 		keyFilepath,
 		[]byte(key),
 		0644,
 	)
 	if err != nil {
-		FileLogger().Errorf("Error while saving key to %s", keyFilepath)
+		FileLogger().Errorf(ctx, "Error while saving key to %s", keyFilepath)
 		return err
 	}
-	FileLogger().Infof("Saved new certs to %s", certsDir)
+	FileLogger().Infof(ctx, "Saved new certs to %s", certsDir)
 	return nil
 }
 
-func DeleteCerts(subDir string) error {
-	certsDir := filepath.Join(CertsDir(), subDir)
-	FileLogger().Infof("Deleting certs %s", certsDir)
-	err := os.RemoveAll(certsDir)
+// DeleteCertsExcept deletes all the certs except the given cert directories.
+func DeleteCertsExcept(ctx context.Context, certDirs []string) error {
+	certDirsMap := map[string]struct{}{}
+	for _, certDir := range certDirs {
+		certDirsMap[certDir] = struct{}{}
+	}
+	return ScanDir(CertsDir(), func(fInfo os.FileInfo) (bool, error) {
+		name := fInfo.Name()
+		delete := false
+		if fInfo.IsDir() {
+			if certDirs == nil {
+				delete = true
+			} else if _, ok := certDirsMap[name]; !ok {
+				delete = true
+			}
+		}
+		if delete {
+			if err := DeleteCerts(ctx, name); err != nil {
+				return false, err
+			}
+		}
+		return true, nil
+	})
+}
+
+// DeleteCerts deletes all the certs in the given cert directory.
+func DeleteCerts(ctx context.Context, certDir string) error {
+	certsPath := filepath.Join(CertsDir(), certDir)
+	FileLogger().Infof(ctx, "Deleting certs %s", certsPath)
+	err := os.RemoveAll(certsPath)
 	if err != nil {
-		FileLogger().Errorf("Error while deleting certs %s, err %s", certsDir, err.Error())
+		FileLogger().Errorf(ctx, "Error while deleting certs %s, err %s", certsPath, err.Error())
 	}
 	return err
 }
 
-func DeleteRelease(release string) error {
+// DeleteReleasesExcept deletes all releases except the given release.
+func DeleteReleasesExcept(ctx context.Context, release string) error {
+	return ScanDir(ReleaseDir(), func(fInfo os.FileInfo) (bool, error) {
+		name := fInfo.Name()
+		if release != name && fInfo.IsDir() {
+			err := DeleteRelease(ctx, name)
+			if err != nil {
+				return false, err
+			}
+		}
+		return true, nil
+	})
+}
+
+// DeleteCerts deletes a release.
+func DeleteRelease(ctx context.Context, release string) error {
 	releaseDir := filepath.Join(ReleaseDir(), release)
-	FileLogger().Infof("Deleting release dir %s", releaseDir)
+	FileLogger().Infof(ctx, "Deleting release dir %s", releaseDir)
 	err := os.RemoveAll(releaseDir)
 	if err != nil {
-		FileLogger().Errorf("Error while deleting release dir %s, err %s", release, err.Error())
+		FileLogger().Errorf(ctx, "Error while deleting release dir %s, err %s", release, err.Error())
 	}
 	return err
 }
@@ -112,63 +154,65 @@ func ServerKeyPath(config *Config) string {
 
 // Creates a new JWT with the required claims: Node Id and User Id.
 // The JWT is signed using the key in the certs directory.
-func GenerateJWT(config *Config) (string, error) {
+func GenerateJWT(ctx context.Context, config *Config) (string, error) {
 	keyFilepath := ServerKeyPath(config)
-	privateKey, err := ioutil.ReadFile(keyFilepath)
+	privateKey, err := os.ReadFile(keyFilepath)
 	if err != nil {
-		FileLogger().Errorf("Error while reading the private key: %s", err.Error())
+		FileLogger().Errorf(ctx, "Error while reading the private key: %s", err.Error())
 		return "", err
 	}
 	key, err := jwt.ParseRSAPrivateKeyFromPEM(privateKey)
 	if err != nil {
-		FileLogger().Errorf("Error while parsing the private key: %s", err.Error())
+		FileLogger().Errorf(ctx, "Error while parsing the private key: %s", err.Error())
 		return "", err
 	}
 	claims := &Claims{
 		JwtClientIdClaim: config.String(NodeAgentIdKey),
 		JwtUserIdClaim:   config.String(UserIdKey),
-		StandardClaims: jwt.StandardClaims{
-			IssuedAt:  time.Now().Unix(),
-			ExpiresAt: time.Now().Unix() + JwtExpirationTime,
+		RegisteredClaims: jwt.RegisteredClaims{
+			IssuedAt:  jwt.NewNumericDate(time.Now()),
+			ExpiresAt: jwt.NewNumericDate(time.Now().Add(JwtExpirationSecs * time.Second)),
 			Issuer:    JwtIssuer,
 			Subject:   JwtSubject,
 		},
 	}
-	FileLogger().Infof("Created JWT using %s key", config.String(PlatformCertsKey))
+	FileLogger().Infof(ctx, "Created JWT using %s key", config.String(PlatformCertsKey))
 	token := jwt.NewWithClaims(jwt.SigningMethodRS256, claims)
 	return token.SignedString(key)
 }
 
 // PublicKeyFromCert extracts public key from a cert.
-func PublicKeyFromCert(certFilepath string) (crypto.PublicKey, error) {
-	bytes, err := ioutil.ReadFile(certFilepath)
+func PublicKeyFromCert(ctx context.Context, certFilepath string) (crypto.PublicKey, error) {
+	bytes, err := os.ReadFile(certFilepath)
 	if err != nil {
-		FileLogger().Errorf("Error while reading the certificate: %s", err.Error())
+		FileLogger().Errorf(ctx, "Error while reading the certificate: %s", err.Error())
 		return nil, err
 	}
 	block, _ := pem.Decode(bytes)
 	cert, err := x509.ParseCertificate(block.Bytes)
 	if err != nil {
-		FileLogger().Errorf("Error while parsing the certificate: %s", err.Error())
+		FileLogger().Errorf(ctx, "Error while parsing the certificate: %s", err.Error())
 		return nil, err
 	}
 	if cert.PublicKeyAlgorithm != x509.RSA {
 		err = errors.New("RSA public key is expected")
-		FileLogger().Errorf("Error - %s", err.Error())
+		FileLogger().Errorf(ctx, "Error - %s", err.Error())
 		return nil, err
 	}
 	return cert.PublicKey, nil
 }
 
-func PublicKey(config *Config) (crypto.PublicKey, error) {
-	return PublicKeyFromCert(ServerCertPath(config))
+// PublicKey returns the public key.
+func PublicKey(ctx context.Context, config *Config) (crypto.PublicKey, error) {
+	return PublicKeyFromCert(ctx, ServerCertPath(config))
 }
 
-func PublicKeys(config *Config) ([]crypto.PublicKey, error) {
+// PublicKey returns all the public keys including the new one.
+func PublicKeys(ctx context.Context, config *Config) ([]crypto.PublicKey, error) {
 	keys := []crypto.PublicKey{}
 	paths := ServerCertPaths(config)
 	for _, path := range paths {
-		key, err := PublicKeyFromCert(path)
+		key, err := PublicKeyFromCert(ctx, path)
 		if err != nil {
 			return keys, err
 		}
@@ -177,10 +221,55 @@ func PublicKeys(config *Config) ([]crypto.PublicKey, error) {
 	return keys, nil
 }
 
-func VerifyJWT(config *Config, authToken string) (*jwt.MapClaims, error) {
-	publicKeys, err := PublicKeys(config)
+// IntFromClaims returns the int value for key in the map claims.
+func IntFromClaims(claims *jwt.MapClaims, key string) (int64, bool) {
+	if claims != nil {
+		mp := map[string]interface{}(*claims)
+		if i, ok := mp[key]; ok {
+			switch dType := i.(type) {
+			case float64:
+				return int64(dType), true
+			case json.Number:
+				v, _ := dType.Int64()
+				return v, true
+			default:
+				if v, ok := i.(int64); ok {
+					return v, true
+				}
+			}
+		}
+	}
+	return 0, false
+}
+
+// StringFromClaims returns the string value for key in the map claims.
+func StringFromClaims(claims *jwt.MapClaims, key string) (string, bool) {
+	if claims != nil {
+		mp := map[string]interface{}(*claims)
+		if i, ok := mp[key]; ok {
+			if v, ok := i.(string); ok {
+				return v, true
+			}
+		}
+	}
+	return "", false
+}
+
+// ExtractClaims extracts the claims in the auth token.
+func ExtractClaims(ctx context.Context, config *Config, authToken string) (*jwt.MapClaims, error) {
+	parser := jwt.NewParser()
+	token, _, err := parser.ParseUnverified(authToken, &jwt.MapClaims{})
 	if err != nil {
-		FileLogger().Errorf("Error in getting the public key: %s", err.Error())
+		return nil, fmt.Errorf("Invalid token")
+	}
+	return token.Claims.(*jwt.MapClaims), nil
+}
+
+// VerifyJWT verifies the JWT and returns the claims.
+func VerifyJWT(ctx context.Context, config *Config, authToken string) (*jwt.MapClaims, error) {
+	publicKeys, err := PublicKeys(ctx, config)
+	if err != nil {
+		FileLogger().Errorf(ctx, "Error in getting the public key: %s", err.Error())
 		return nil, err
 	}
 	for idx, publicKey := range publicKeys {
@@ -200,8 +289,28 @@ func VerifyJWT(config *Config, authToken string) (*jwt.MapClaims, error) {
 		}
 		if idx == len(publicKeys)-1 {
 			// All keys are exhausted.
-			FileLogger().Errorf("Failed to validate claim - %s", err.Error())
+			FileLogger().Errorf(ctx, "Failed to validate claim - %s", err.Error())
 		}
 	}
 	return nil, fmt.Errorf("Invalid token")
+}
+
+// TlsConfig returns the common TLS config to be used.
+func TlsConfig(certs []tls.Certificate, nextProtos []string) *tls.Config {
+	whitelists := []uint16{}
+	for _, suites := range tls.CipherSuites() {
+		// Method excludes insecure ones but the check is just added to be more cautious.
+		if !suites.Insecure {
+			whitelists = append(whitelists, suites.ID)
+		}
+	}
+	tlsConfig := &tls.Config{
+		Certificates: certs,
+		MinVersion:   tls.VersionTLS12,
+		CipherSuites: whitelists,
+	}
+	if len(nextProtos) > 0 {
+		tlsConfig.NextProtos = nextProtos
+	}
+	return tlsConfig
 }

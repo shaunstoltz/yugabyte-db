@@ -1,5 +1,5 @@
 //--------------------------------------------------------------------------------------------------
-// Copyright (c) YugaByte, Inc.
+// Copyright (c) YugabyteDB, Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License"); you may not use this file except
 // in compliance with the License.  You may obtain a copy of the License at
@@ -21,9 +21,13 @@
 
 using std::function;
 using std::vector;
-using std::unordered_map;
 using std::string;
 using strings::Substitute;
+
+DEFINE_RUNTIME_bool(cql_revert_to_partial_microsecond_support, true,
+    "Use this to store timestamps with microseconds precision but cql layer will only support "
+    "milliseconds. Changing this might have unintended consequences. Please refer technical "
+    "advisory TA-23476 for more information.");
 
 namespace yb {
 namespace bfql {

@@ -1,4 +1,4 @@
-// Copyright (c) YugaByte, Inc.
+// Copyright (c) YugabyteDB, Inc.
 //
 // Author: Nishant Sharma(nishant.sharma@hashedin.com)
 //
@@ -21,52 +21,6 @@ export const storageConfigTypes = {
         id: 'NFS_BACKUP_LOCATION',
         label: 'NFS Storage Path',
         placeHolder: 'NFS Storage Path',
-        component: YBTextInputWithLabel
-      }
-    ]
-  },
-  GCS: {
-    title: 'GCS Storage',
-    fields: [
-      {
-        id: 'GCS_CONFIGURATION_NAME',
-        label: 'Configuration Name',
-        placeHolder: 'Configuration Name',
-        component: YBTextInputWithLabel
-      },
-      {
-        id: 'GCS_BACKUP_LOCATION',
-        label: 'GCS Bucket',
-        placeHolder: 'GCS Bucket',
-        component: YBTextInputWithLabel
-      },
-      {
-        id: 'GCS_CREDENTIALS_JSON',
-        label: 'GCS Credentials',
-        placeHolder: 'GCS Credentials JSON',
-        component: YBTextInputWithLabel
-      }
-    ]
-  },
-  AZ: {
-    title: 'Azure Storage',
-    fields: [
-      {
-        id: 'AZ_CONFIGURATION_NAME',
-        label: 'Configuration Name',
-        placeHolder: 'Configuration Name',
-        component: YBTextInputWithLabel
-      },
-      {
-        id: 'AZ_BACKUP_LOCATION',
-        label: 'Container URL',
-        placeHolder: 'Container URL',
-        component: YBTextInputWithLabel
-      },
-      {
-        id: 'AZURE_STORAGE_SAS_TOKEN',
-        label: 'SAS Token',
-        placeHolder: 'SAS Token',
         component: YBTextInputWithLabel
       }
     ]

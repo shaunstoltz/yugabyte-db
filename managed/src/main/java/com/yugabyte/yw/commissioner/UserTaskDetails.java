@@ -1,3 +1,5 @@
+// Copyright (c) YugabyteDB, Inc.
+
 package com.yugabyte.yw.commissioner;
 
 import com.fasterxml.jackson.databind.JsonNode;
@@ -13,22 +15,28 @@ public class UserTaskDetails {
 
   // The various groupings of user facing subtasks.
   public enum SubTaskGroupType {
+    // Default generic subtask group type. Do not use this to set as it's given special treatment.
+    Configuring,
+
     // Used for parent tasks which could have own details/errors. Only for UI/API
     // purposes, not stored in DB.
     Preparation,
 
-    // Ignore this subtask and do not display it to the user.
-    Invalid,
-
-    // Perform preflight checks to determine if the node is ready to be configured or provisioned.
+    // Perform preflight checks to determine if the task target is healthy.
     PreflightChecks,
 
     // Deploying machines in the desired cloud, fetching information (ip address, etc) of these
     // newly deployed machines, etc.
     Provisioning,
 
-    // Running software upgrade on YugaByte clusters.
+    // Running software upgrade on Yugabyte clusters.
     UpgradingSoftware,
+
+    // Rolling back software upgrade on Yugabyte Clusters.
+    RollingBackSoftware,
+
+    // Finalizing Yugabyte db software upgrade on Yugabyte clusters.
+    FinalizingUpgrade,
 
     // Download YB software locally but not install it.
     DownloadingSoftware,
@@ -40,6 +48,12 @@ public class UserTaskDetails {
     // Start the masters to create a new universe configuration, wait for leader elections, set
     // placement info, wait for the tservers to start up, etc.
     ConfigureUniverse,
+
+    // Querying the upstream LDAP server
+    QueryLdapServer,
+
+    // Db-Ldap Sync
+    DbLdapSync,
 
     // Increasing disk size
     ResizingDisk,
@@ -56,6 +70,9 @@ public class UserTaskDetails {
     // Updating GFlags
     UpdatingGFlags,
 
+    // Updating YBC GFlags
+    UpdatingYbcGFlags,
+
     // Bootstrap Cloud
     BootstrappingCloud,
 
@@ -70,6 +87,9 @@ public class UserTaskDetails {
 
     // Deleting all the xCluster replications and cleaning up their states on the universes.
     DeleteXClusterReplication,
+
+    // Deleting DR config.
+    DeleteDrConfig,
 
     // Rotate access key to all nodes of a universe
     RotateAccessKey,
@@ -131,6 +151,9 @@ public class UserTaskDetails {
     // Creating Table Backup
     CreatingTableBackup,
 
+    // Creating Universe Backup
+    CreatingUniverseBackup,
+
     // Restoring Table Backup
     RestoringTableBackup,
 
@@ -158,11 +181,17 @@ public class UserTaskDetails {
     // Delete Kubernetes volumes created by helm chart.
     KubernetesVolumeDelete,
 
+    // Delete Kubernetes Volumes for a shell mode master before creating it.
+    KubernetesVolumeDeleteMasterShellMode,
+
     // Delete kubernetes namespace
     KubernetesNamespaceDelete,
 
     // Fetch the Kubernetes pod information.
     KubernetesPodInfo,
+
+    // Delete all server type pods
+    DeleteAllServerTypePods,
 
     // Wait for Kubernetes pod deployment
     KubernetesWaitForPod,
@@ -176,8 +205,20 @@ public class UserTaskDetails {
     // Upgrade pod in Kubernetes.
     KubernetesUpgradePod,
 
+    // Copy package to YBC
+    KubernetesCopyPackage,
+
+    // Perform YBC Action
+    KubernetesYbcAction,
+
     // Run the initdb script in a tserver pod. (Deprecated)
     KubernetesInitYSQL,
+
+    // Delete Kubernetes Namespaced Service
+    KubernetesNamespacedServiceDelete,
+
+    // Handle Kubernetes Namespaced Service
+    KubernetesHandleNamespacedService,
 
     // Start master process on a node
     StartingMasterProcess,
@@ -190,6 +231,9 @@ public class UserTaskDetails {
 
     // Add certificates and toggle TLS gflags
     ToggleTls,
+
+    // Configure DB Apis
+    ConfigureDBApis,
 
     // Rebooting the node.
     RebootingNode,
@@ -213,7 +257,61 @@ public class UserTaskDetails {
     KubernetesVolumeInfo,
 
     // Install Third Party Packages
-    InstallingThirdPartySoftware
+    InstallingThirdPartySoftware,
+
+    // Promote Auto Flags
+    PromoteAutoFlags,
+
+    // Rollback Auto Flags
+    RollbackAutoFlags,
+
+    // Validate configurations.
+    ValidateConfigurations,
+
+    // Manage Otel Collector.
+    ManageOtelCollector,
+
+    // Validating nodes.
+    ValidatingNode,
+
+    // OS Patching.
+    OSPatching,
+
+    // Update Proxy Config
+    UpdateProxyConfig,
+
+    // Create Pod Disruption Budget Policy
+    CreatePodDisruptionBudgetPolicy,
+
+    // Remove Pod Disruption Budget Policy
+    RemovingPodDisruptionBudgetPolicy,
+
+    // Validate after upgrade
+    PostUpdateValidations,
+
+    // PITR Restore step during failover
+    PITRRestore,
+
+    // xCluster failover with on-demand snapshot
+    XClusterFailover,
+
+    // Pause replication
+    PauseReplication,
+
+    // Persist use clockbound
+    PersistUseClockbound,
+
+    // Persist enable multi-tenancy
+    PersistEnableMultiTenancy,
+
+    // Support bundle component download
+    SupportBundleComponentDownload,
+
+    // Persist immutable YBC
+    PersistYbdbInbuiltYbc,
+
+    // Migrate resources from YBA to operator
+    OperatorImportResource
   }
 
   public List<SubTaskDetails> taskDetails;
@@ -223,15 +321,17 @@ public class UserTaskDetails {
     String title;
     String description;
     switch (subTaskGroupType) {
+      case Configuring:
+        title = "Configuring";
+        description = "Applying the configuration.";
+        break;
       case Preparation:
         title = "Action preparation";
         description = "Preparing to execute a selected action.";
         break;
       case PreflightChecks:
         title = "Preflight Checks";
-        description =
-            "Perform preflight checks to determine if node is ready"
-                + " to be provisioned/configured.";
+        description = "Perform preflight checks to determine if the task target is healthy.";
         break;
       case Provisioning:
         title = "Provisioning";
@@ -242,6 +342,14 @@ public class UserTaskDetails {
       case UpgradingSoftware:
         title = "Upgrading software";
         description = "Upgrading YugaByte software on existing clusters.";
+        break;
+      case RollingBackSoftware:
+        title = "Rolling back Software";
+        description = "Rolling back software upgrade on existing clusters.";
+        break;
+      case FinalizingUpgrade:
+        title = "Finalizing upgrade";
+        description = "Finalizing Yugabyte DB Software version upgrade on universe";
         break;
       case InstallingSoftware:
         title = "Installing software";
@@ -254,6 +362,16 @@ public class UserTaskDetails {
         description =
             "Creating and populating the universe config, waiting for the various"
                 + " machines to discover one another.";
+        break;
+      case QueryLdapServer:
+        title = "Querying LDAP Server";
+        description = "Querying the LDAP Server for user-group mapping";
+        break;
+      case DbLdapSync:
+        title = "Syncing DB roles with LDAP groups";
+        description =
+            "Performing a manual sync of user groups and roles between the Universe DB nodes and"
+                + " the upstream LDAP Server.";
         break;
       case ResizingDisk:
         title = "Increasing disk size";
@@ -287,6 +405,10 @@ public class UserTaskDetails {
         title = "Updating gflags";
         description = "Updating GFlags on provisioned nodes.";
         break;
+      case UpdatingYbcGFlags:
+        title = "Updating YBC GFlags";
+        description = "Updating YBC GFlags on provisioned nodes.";
+        break;
       case UpdatingKubernetesOverrides:
         title = "Updating kubernetes overrides";
         description = "Updating kubernetes overrides on kubernetes pods.";
@@ -305,13 +427,17 @@ public class UserTaskDetails {
         break;
       case CreateAccessKey:
         title = "Creating AccessKey";
-        description = "Set up AccessKey in the given Provider Vault";
+        description = "Set up AccessKey for the given Provider";
         break;
       case DeleteXClusterReplication:
         title = "Deleting XCluster Replication";
         description =
             "Deleting xCluster replications and cleaning up their corresponding states "
                 + "on the participating universes.";
+        break;
+      case DeleteDrConfig:
+        title = "Deleting Dr Config";
+        description = "Deleting the disaster recovery config.";
         break;
       case InitializeCloudMetadata:
         title = "Initializing Cloud Metadata";
@@ -381,6 +507,10 @@ public class UserTaskDetails {
         title = "Creating Table Backup";
         description = "Creating backup for a table.";
         break;
+      case CreatingUniverseBackup:
+        title = "Creating Universe Backup";
+        description = "Creating backup for a Universe.";
+        break;
       case RestoringTableBackup:
         title = "Restoring Table Backup";
         description = "Restoring from a backup.";
@@ -413,10 +543,17 @@ public class UserTaskDetails {
         title = "Delete Kubernetes Volumes";
         description = "Delete Kubernetes Volumes";
         break;
+      case KubernetesVolumeDeleteMasterShellMode:
+        title = "Delete Kubernetes Volumes for a master before creating it in shell mode";
+        description = "Delete Kubernetes Volumes for master pod before creating it in shell mode";
+        break;
       case KubernetesNamespaceDelete:
         title = "Delete Kubernetes Namespace";
         description = "Delete Kubernetes Namespace";
         break;
+      case DeleteAllServerTypePods:
+        title = "Delete all pods of server type in AZ";
+        description = "Delete all pods of server type in AZ";
       case KubernetesWaitForPod:
         title = "Wait for Kubernetes pod to run";
         description = "Wait for Kubernetes pod to run";
@@ -428,6 +565,21 @@ public class UserTaskDetails {
       case KubernetesUpgradePod:
         title = "Upgrade Kubernetes Pod";
         description = "Upgrade Kubernetes Pod";
+        break;
+      case KubernetesNamespacedServiceDelete:
+        title = "Delete Kubernetes Namespaced Service";
+        description = "Delete Kubernetes Namespaced Service";
+        break;
+      case KubernetesHandleNamespacedService:
+        title = "Handle Kubernetes Namespaced Service";
+        description = "Handle Kubernetes Namespaced Service";
+      case KubernetesCopyPackage:
+        title = "Copy Package to Kubernetes Pod";
+        description = "Copy Package to Kubernetes Pod";
+        break;
+      case KubernetesYbcAction:
+        title = "Perform YBC Action in the Container";
+        description = "Perform YBC Action in the Container";
         break;
       case KubernetesInitYSQL:
         title = "Initialize YSQL in Kubernetes Universe";
@@ -465,6 +617,10 @@ public class UserTaskDetails {
         title = "Toggle TLS";
         description = "Add certificates and toggle TLS gflags";
         break;
+      case ConfigureDBApis:
+        title = "Configure DB APIs";
+        description = "Configuring DB APIs";
+        break;
       case RotateAccessKey:
         title = "Rotate Access Key";
         description = "Rotate the access key for a universe";
@@ -496,6 +652,77 @@ public class UserTaskDetails {
       case InstallingThirdPartySoftware:
         title = "Install Third Party Software Packages";
         description = "Installing Third party Software packages";
+        break;
+      case PromoteAutoFlags:
+        title = "Promote Auto flags";
+        description = "Promote Auto flags for a universe";
+        break;
+      case RollbackAutoFlags:
+        title = "Rollback Auto flags";
+        description = "Rollback Auto flags for a universe";
+        break;
+      case ValidateConfigurations:
+        title = "Validating configurations";
+        description = "Validating configurations before proceeding";
+        break;
+      case ManageOtelCollector:
+        title = "Managing OpenTelemetry Collector";
+        description = "Managing OpenTelemetry Collector";
+        break;
+      case ValidatingNode:
+        title = "Validating node status";
+        description = "Validating node's current state before proceeding";
+        break;
+      case OSPatching:
+        title = "OS Patching";
+        description = "Performing OS Patching on the universe nodes";
+        break;
+      case UpdateProxyConfig:
+        title = "Updating Proxy config";
+        description = "Updating Proxy Config for Universe nodes";
+        break;
+      case CreatePodDisruptionBudgetPolicy:
+        title = "Creating Pod Disruption Budget Policy";
+        description = "Creating Pod Disruption Budget Policy";
+        break;
+      case RemovingPodDisruptionBudgetPolicy:
+        title = "Removing Pod Disruption Budget Policy";
+        description = "Removing Pod Disruption Budget Policy";
+        break;
+      case PostUpdateValidations:
+        title = "Validating after updates";
+        description = "Validating updates applied correctly";
+        break;
+      case PITRRestore:
+        title = "PITR Restore";
+        description = "Restoring namespaces using PITR to a consistent cut";
+        break;
+      case XClusterFailover:
+        title = "xCluster Failover";
+        description = "Running xCluster failover with on-demand snapshots creation and restore";
+        break;
+      case PauseReplication:
+        title = "Pause Replication";
+        description = "Pause replication from source to target universe";
+      case SupportBundleComponentDownload:
+        title = "Downloading support bundle content";
+        description = "Downloading support bundle content from DB nodes";
+        break;
+      case PersistUseClockbound:
+        title = "Persist useClockbound";
+        description = "Persist useClockbound true/false in userIntent";
+        break;
+      case PersistEnableMultiTenancy:
+        title = "Persist multi-tenancy config";
+        description = "Persist multi-tenancy QoS configuration in userIntent";
+        break;
+      case PersistYbdbInbuiltYbc:
+        title = "Persist useYbdbInbuiltYbc";
+        description = "Persist useYbdbInbuiltYbc in userIntent";
+        break;
+      case OperatorImportResource:
+        title = "Importing Resource to Operator";
+        description = "Importing Resource from YBA to Operator";
         break;
       default:
         LOG.warn("UserTaskDetails: Missing SubTaskDetails for : {}", subTaskGroupType);

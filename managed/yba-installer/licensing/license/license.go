@@ -7,9 +7,12 @@ import (
 	"fmt"
 	"io/fs"
 	"os"
+	"path/filepath"
 	"strings"
 
-	"github.com/yugabyte/yugabyte-db/managed/yba-installer/common"
+	"github.com/yugabyte/yugabyte-db/managed/yba-installer/licensing/pubkey"
+	"github.com/yugabyte/yugabyte-db/managed/yba-installer/pkg/common"
+	log "github.com/yugabyte/yugabyte-db/managed/yba-installer/pkg/logging"
 )
 
 // ErrorInvalidLicenseFormat for incorrectly formatted license files
@@ -25,7 +28,12 @@ type License struct {
 // FromFile will create a license from the given license file.
 func FromFile(filePath string) (*License, error) {
 	var lic *License = &License{}
-
+	// If the path is not absolute, covert it to an absolute filepath
+	filePath, err := filepath.Abs(filePath)
+	if err != nil {
+		return lic, fmt.Errorf("failed parsing license filepath: %w", err)
+	}
+	log.Debug("installing license from " + filePath)
 	if _, err := os.Stat(filePath); errors.Is(err, fs.ErrNotExist) {
 		return lic, err
 	}
@@ -44,10 +52,10 @@ func FromFile(filePath string) (*License, error) {
 // embedded at build time (meaning, we are using a dev build)
 func FromInstalledLicense() (*License, error) {
 	// The installed license path doesn't exist, return an empty license.
-	if _, err := os.Stat(common.LicenseFileInstall); errors.Is(err, fs.ErrNotExist) {
+	if _, err := os.Stat(common.LicenseFile()); errors.Is(err, fs.ErrNotExist) {
 		return nil, err
 	}
-	return FromFile(common.LicenseFileInstall)
+	return FromFile(common.LicenseFile())
 }
 
 // FromParts creates a license from the individual parts of a license
@@ -83,9 +91,10 @@ func (l *License) ParseRaw() error {
 func (l License) WriteToLocation(newLocation string) error {
 	if _, err := os.Stat(newLocation); !errors.Is(err, fs.ErrNotExist) {
 		if err == nil {
-			err = fmt.Errorf("cannot write license to %s - already exists", newLocation)
+			log.Debug("Found existing license... overwritting it")
+		} else {
+			return err
 		}
-		return err
 	}
 
 	dstFile, err := os.Create(newLocation)
@@ -102,4 +111,18 @@ func (l License) WriteToLocation(newLocation string) error {
 func (l License) Sha256Data() []byte {
 	data := sha256.Sum256([]byte(l.EncodedData))
 	return data[:]
+}
+
+// Validate will check if the given license is actually valid.
+func (l License) Validate() bool {
+	sha256Data := l.Sha256Data()
+	sha256String := string(sha256Data)
+	for _, bad := range revokedLicenses() {
+		if bad == sha256String {
+			fmt.Println("license has been blacklisted")
+			return false
+		}
+	}
+
+	return pubkey.Validate(sha256Data, l.Signature)
 }

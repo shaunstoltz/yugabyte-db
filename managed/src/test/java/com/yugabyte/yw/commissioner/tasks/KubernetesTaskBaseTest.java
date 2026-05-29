@@ -1,4 +1,4 @@
-// Copyright (c) YugaByte, Inc.
+// Copyright (c) YugabyteDB, Inc.
 
 package com.yugabyte.yw.commissioner.tasks;
 
@@ -7,17 +7,16 @@ import static org.mockito.Mockito.CALLS_REAL_METHODS;
 import static org.mockito.Mockito.mock;
 
 import com.yugabyte.yw.commissioner.tasks.UniverseTaskBase.ServerType;
+import com.yugabyte.yw.common.KubernetesUtil;
 import com.yugabyte.yw.models.helpers.NodeDetails;
-
+import junitparams.JUnitParamsRunner;
+import junitparams.Parameters;
 import org.junit.Rule;
 import org.junit.Test;
 import org.junit.runner.RunWith;
 import org.mockito.InjectMocks;
 import org.mockito.junit.MockitoJUnit;
 import org.mockito.junit.MockitoRule;
-
-import junitparams.JUnitParamsRunner;
-import junitparams.Parameters;
 
 @RunWith(JUnitParamsRunner.class)
 public class KubernetesTaskBaseTest {
@@ -35,7 +34,7 @@ public class KubernetesTaskBaseTest {
   public void testGetK8sNodeName(String podName, String server, boolean isMultiAz) {
     ServerType serverType = server.equals("master") ? ServerType.MASTER : ServerType.TSERVER;
     NodeDetails node =
-        kubernetesTaskBase.getKubernetesNodeName(1, "az-1", serverType, isMultiAz, false);
+        KubernetesUtil.getKubernetesNodeName(1, "az-1", serverType, isMultiAz, false, 0);
     assertEquals(podName, node.nodeName);
   }
 
@@ -56,7 +55,7 @@ public class KubernetesTaskBaseTest {
       boolean isReadOnlyCluster) {
     ServerType serverType = server.equals("master") ? ServerType.MASTER : ServerType.TSERVER;
     String pod =
-        kubernetesTaskBase.getPodName(
+        KubernetesUtil.getPodName(
             1,
             "az-1",
             serverType,
@@ -64,7 +63,8 @@ public class KubernetesTaskBaseTest {
             isMultiAz,
             newNamingStyle,
             "demo-universe",
-            isReadOnlyCluster);
+            isReadOnlyCluster,
+            0);
     assertEquals(podName, pod);
   }
 }

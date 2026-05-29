@@ -1,5 +1,5 @@
 //
-// Copyright (c) YugaByte, Inc.
+// Copyright (c) YugabyteDB, Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License"); you may not use this file except
 // in compliance with the License.  You may obtain a copy of the License at
@@ -15,12 +15,16 @@
 
 #pragma once
 
-#include <memory>
+#include "yb/rpc/rpc_fwd.h"
 
 #include "yb/util/slice.h"
 
 namespace yb {
 namespace rpc {
+
+struct MessengerShutdownDeleter {
+  void operator()(Messenger* messenger) const;
+};
 
 // Returns slice pointing to global buffer for reading data which we want to ignore, for example in
 // case of hitting memory limit.

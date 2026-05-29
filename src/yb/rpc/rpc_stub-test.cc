@@ -15,9 +15,9 @@
 // specific language governing permissions and limitations
 // under the License.
 //
-// The following only applies to changes made to this file as part of YugaByte development.
+// The following only applies to changes made to this file as part of YugabyteDB development.
 //
-// Portions Copyright (c) YugaByte, Inc.
+// Portions Copyright (c) YugabyteDB, Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License"); you may not use this file except
 // in compliance with the License.  You may obtain a copy of the License at
@@ -37,6 +37,8 @@
 
 #include <gtest/gtest.h>
 
+#include "yb/ash/rpc_wait_state.h"
+
 #include "yb/gutil/stl_util.h"
 
 #include "yb/rpc/proxy.h"
@@ -49,6 +51,7 @@
 
 #include "yb/util/countdown_latch.h"
 #include "yb/util/metrics.h"
+#include "yb/util/range.h"
 #include "yb/util/result.h"
 #include "yb/util/size_literals.h"
 #include "yb/util/status_log.h"
@@ -60,7 +63,7 @@
 #include "yb/util/user.h"
 #include "yb/util/flags.h"
 
-DEFINE_UNKNOWN_bool(is_panic_test_child, false, "Used by TestRpcPanic");
+DEFINE_NON_RUNTIME_bool(is_panic_test_child, false, "Used by TestRpcPanic");
 DECLARE_bool(socket_inject_short_recvs);
 DECLARE_int32(rpc_slow_query_threshold_ms);
 DECLARE_int32(TEST_delay_connect_ms);
@@ -74,6 +77,23 @@ using namespace std::chrono_literals;
 
 namespace yb {
 namespace rpc {
+
+namespace {
+
+ash::AshMetadata GenerateRandomMetadata() {
+  return ash::AshMetadata{
+      .root_request_id{Uuid::Generate()},
+      .top_level_node_id{Uuid::Generate()},
+      .query_id = RandomUniformInt<uint64_t>(),
+      .pid = RandomUniformInt<pid_t>(),
+      .database_id = RandomUniformInt<uint32_t>(),
+      .rpc_request_id = RandomUniformInt<int64_t>(),
+      .client_host_port = HostPort(
+          Format("host-$0", RandomUniformInt<uint16_t>(0, 10)),
+          RandomUniformInt<uint16_t>())};
+}
+
+} // namespace
 
 using base::subtle::NoBarrier_Load;
 
@@ -97,6 +117,7 @@ using std::string;
 
 using rpc_test::AddRequestPartialPB;
 using rpc_test::CalculatorServiceProxy;
+using rpc_test::AshTestServiceProxy;
 
 class RpcStubTest : public RpcTestBase {
  public:
@@ -104,6 +125,10 @@ class RpcStubTest : public RpcTestBase {
     RpcTestBase::SetUp();
     StartTestServerWithGeneratedCode(&server_hostport_);
     client_messenger_ = CreateAutoShutdownMessengerHolder("Client");
+    if (FLAGS_ysql_yb_enable_ash) {
+      client_messenger_->SetMetadataSerializerFactory(
+          std::make_unique<ash::MetadataSerializerFactory>());
+    }
     proxy_cache_ = std::make_unique<ProxyCache>(client_messenger_.get());
   }
 
@@ -152,7 +177,7 @@ TEST_F(RpcStubTest, TestSimpleCall) {
 }
 
 TEST_F(RpcStubTest, ConnectTimeout) {
-  FLAGS_TEST_delay_connect_ms = 5000;
+  ANNOTATE_UNPROTECTED_WRITE(FLAGS_TEST_delay_connect_ms) = 5000;
   CalculatorServiceProxy p(proxy_cache_.get(), server_hostport_);
   const MonoDelta kWaitTime = 1s;
   const MonoDelta kAllowedError = 100ms;
@@ -177,7 +202,8 @@ TEST_F(RpcStubTest, RandomTimeout) {
   const size_t kTotalCalls = 1000;
   const MonoDelta kMaxTimeout = 2s;
 
-  FLAGS_TEST_delay_connect_ms = narrow_cast<int>(kMaxTimeout.ToMilliseconds() / 2);
+  ANNOTATE_UNPROTECTED_WRITE(
+      FLAGS_TEST_delay_connect_ms) = narrow_cast<int>(kMaxTimeout.ToMilliseconds() / 2);
   CalculatorServiceProxy p(proxy_cache_.get(), server_hostport_);
 
   struct CallData {
@@ -223,7 +249,7 @@ TEST_F(RpcStubTest, RandomTimeout) {
 // reads and then makes a number of calls.
 TEST_F(RpcStubTest, TestShortRecvs) {
   google::FlagSaver saver;
-  FLAGS_socket_inject_short_recvs = true;
+  ANNOTATE_UNPROTECTED_WRITE(FLAGS_socket_inject_short_recvs) = true;
 
   CalculatorServiceProxy p(proxy_cache_.get(), server_hostport_);
 
@@ -695,11 +721,12 @@ class PingTestHelper {
   bool finished_ = false;
 };
 
-DEFINE_UNKNOWN_uint64(test_rpc_concurrency, 20, "Number of concurrent RPC requests");
-DEFINE_UNKNOWN_int32(test_rpc_count, 50000, "Total number of RPC requests");
+DEFINE_NON_RUNTIME_uint64(test_rpc_concurrency, 20, "Number of concurrent RPC requests");
+DEFINE_NON_RUNTIME_int32(test_rpc_count, 50000, "Total number of RPC requests");
 
 TEST_F(RpcStubTest, TestRpcPerformance) {
-  FLAGS_rpc_slow_query_threshold_ms = std::numeric_limits<int32_t>::max();
+  ANNOTATE_UNPROTECTED_WRITE(FLAGS_rpc_slow_query_threshold_ms) =
+      std::numeric_limits<int32_t>::max();
 
   MessengerOptions messenger_options = kDefaultClientMessengerOptions;
   messenger_options.n_reactors = 4;
@@ -728,9 +755,7 @@ TEST_F(RpcStubTest, TestRpcPerformance) {
 #else
   const int kTimeMultiplier = 1;
 #endif
-  const MonoDelta kMaxLimit = MonoDelta::FromMilliseconds(50 * kTimeMultiplier);
   const MonoDelta kReplyAverageLimit = MonoDelta::FromMilliseconds(10 * kTimeMultiplier);
-  const MonoDelta kHandleAverageLimit = MonoDelta::FromMilliseconds(5 * kTimeMultiplier);
 
   MonoDelta min_processing = MonoDelta::kMax;
   MonoDelta max_processing = MonoDelta::kMin;
@@ -756,24 +781,32 @@ TEST_F(RpcStubTest, TestRpcPerformance) {
   auto reply_average = MonoDelta::FromNanoseconds(reply_sum.ToNanoseconds() / measured_calls);
   auto handle_average = MonoDelta::FromNanoseconds(handle_sum.ToNanoseconds() / measured_calls);
   auto passed_us = finish.GetDeltaSince(start).ToMicroseconds();
-  auto us_per_call = passed_us * 1.0 / measured_calls;
-  LOG(INFO) << "Min: " << min_processing.ToMicroseconds() << "us, "
-            << "max: " << max_processing.ToMicroseconds() << "us, "
-            << "reply avg: " << reply_average.ToMicroseconds() << "us, "
-            << "handle avg: " << handle_average.ToMicroseconds() << "us";
-  LOG(INFO) << "Total: " << passed_us << "us, "
+  auto time_per_call = MonoDelta::FromMicroseconds(passed_us * 1.0 / measured_calls);
+  LOG(INFO) << "Min: " << min_processing.ToPrettyString() << ", "
+            << "max: " << max_processing.ToPrettyString() << ", "
+            << "reply avg: " << reply_average.ToPrettyString() << ", "
+            << "handle avg: " << handle_average.ToPrettyString() << "";
+  LOG(INFO) << "Total: " << MonoDelta::FromMicroseconds(passed_us).ToPrettyString() << ", "
             << "calls per second: " << measured_calls * 1000000 / passed_us
-            << " (" << us_per_call << "us per call, NOT latency), "
+            << " (" << time_per_call.ToPrettyString() << " per call, NOT latency), "
             << " slow calls: " << slow_calls * 100.0 / measured_calls << "%";
+  // There are lot of tests running in Jenkins on a single Mac in parallel.
+  // Quite hard to use for performance measurements.
+  // So just ignore perf numbers.
+#if !defined(__APPLE__)
+  const MonoDelta kMaxLimit = MonoDelta::FromMilliseconds(50 * kTimeMultiplier);
+  const MonoDelta kHandleAverageLimit = MonoDelta::FromMilliseconds(5 * kTimeMultiplier);
+
   EXPECT_PERF_LE(slow_calls * 200, measured_calls);
   EXPECT_PERF_LE(max_processing, kMaxLimit);
   EXPECT_PERF_LE(reply_average, kReplyAverageLimit);
   EXPECT_PERF_LE(handle_average, kHandleAverageLimit);
+#endif
 }
 
 TEST_F(RpcStubTest, IPv6) {
   google::FlagSaver saver;
-  FLAGS_net_address_filter = "all";
+  ANNOTATE_UNPROTECTED_WRITE(FLAGS_net_address_filter) = "all";
   std::vector<IpAddress> addresses;
   ASSERT_OK(GetLocalAddresses(&addresses, AddressFilter::ANY));
 
@@ -810,7 +843,7 @@ TEST_F(RpcStubTest, ExpireInQueue) {
 
   struct Entry {
     EchoRequestPB req;
-    boost::optional<EchoResponsePB> resp;
+    std::optional<EchoResponsePB> resp;
     RpcController controller;
   };
 
@@ -823,8 +856,8 @@ TEST_F(RpcStubTest, ExpireInQueue) {
     entry.req.set_data(std::string(100_KB, 'X'));
     entry.resp.emplace();
     entry.controller.set_timeout(1ms);
-    proxy.EchoAsync(entry.req, entry.resp.get_ptr(), &entry.controller, [&entry, &latch] {
-      auto ptr = entry.resp.get_ptr();
+    proxy.EchoAsync(entry.req, &entry.resp.value(), &entry.controller, [&entry, &latch] {
+      auto ptr = &entry.resp.value();
       entry.resp.reset();
       memset(static_cast<void*>(ptr), 'X', sizeof(*ptr));
       latch.CountDown();
@@ -835,30 +868,38 @@ TEST_F(RpcStubTest, ExpireInQueue) {
 }
 
 TEST_F(RpcStubTest, TrafficMetrics) {
-  constexpr size_t kStringLen = 1_KB;
-  constexpr size_t kUpperBytesLimit = kStringLen + 64;
+  constexpr std::pair<size_t, size_t> kRequestBounds = std::make_pair(1, 72);
+  constexpr std::pair<size_t, size_t> kResponseBounds = std::make_pair(1_KB, 1_KB + 72);
 
   CalculatorServiceProxy proxy(proxy_cache_.get(), server_hostport_);
 
   RpcController controller;
-  rpc_test::EchoRequestPB req;
-  req.set_data(RandomHumanReadableString(kStringLen));
-  rpc_test::EchoResponsePB resp;
-  ASSERT_OK(proxy.Echo(req, &resp, &controller));
+  rpc_test::RepeatedEchoRequestPB req;
+  req.set_character('a');
+  req.set_count(kResponseBounds.first);
+  rpc_test::RepeatedEchoResponsePB resp;
+  ASSERT_OK(proxy.RepeatedEcho(req, &resp, &controller));
 
-  auto server_metrics = server_messenger()->metric_entity()->UnsafeMetricsMapForTests();
+  auto find_metric_by_name = [](const MetricEntity::MetricMap& map,
+                                const std::string& name) -> Result<Counter*> {
+    auto it = std::find_if(
+        map.begin(), map.end(), [&name](const auto& entry) { return entry.first->name() == name; });
+    if (it == map.end()) {
+      return STATUS_FORMAT(NotFound, "Couldn't find metric $0", name);
+    }
+    return down_cast<Counter*>(it->second.get());
+  };
+  auto server_metrics = server_messenger()->metric_entity()->TEST_UsageMetricsMap();
+  auto* service_request_bytes = ASSERT_RESULT(find_metric_by_name(
+      server_metrics, "service_request_bytes_yb_rpc_test_CalculatorService_RepeatedEcho"));
+  auto* service_response_bytes = ASSERT_RESULT(find_metric_by_name(
+      server_metrics, "service_response_bytes_yb_rpc_test_CalculatorService_RepeatedEcho"));
 
-  auto* service_request_bytes = down_cast<Counter*>(FindOrDie(
-      server_metrics, &METRIC_service_request_bytes_yb_rpc_test_CalculatorService_Echo).get());
-  auto* service_response_bytes = down_cast<Counter*>(FindOrDie(
-      server_metrics, &METRIC_service_response_bytes_yb_rpc_test_CalculatorService_Echo).get());
-
-  auto client_metrics = client_messenger_->metric_entity()->UnsafeMetricsMapForTests();
-
-  auto* proxy_request_bytes = down_cast<Counter*>(FindOrDie(
-      client_metrics, &METRIC_proxy_request_bytes_yb_rpc_test_CalculatorService_Echo).get());
-  auto* proxy_response_bytes = down_cast<Counter*>(FindOrDie(
-      client_metrics, &METRIC_proxy_response_bytes_yb_rpc_test_CalculatorService_Echo).get());
+  auto client_metrics = client_messenger_->metric_entity()->TEST_UsageMetricsMap();
+  auto* proxy_request_bytes = ASSERT_RESULT(find_metric_by_name(
+      client_metrics, "proxy_request_bytes_yb_rpc_test_CalculatorService_RepeatedEcho"));
+  auto* proxy_response_bytes = ASSERT_RESULT(find_metric_by_name(
+      client_metrics, "proxy_response_bytes_yb_rpc_test_CalculatorService_RepeatedEcho"));
 
   LOG(INFO) << "Inbound request bytes: " << service_request_bytes->value()
             << ", response bytes: " << service_response_bytes->value();
@@ -868,14 +909,14 @@ TEST_F(RpcStubTest, TrafficMetrics) {
   // We don't expect that sent and received bytes on client and server matches, because some
   // auxilary fields are not calculated.
   // For instance request size is taken into account on client, but not server.
-  ASSERT_GE(service_request_bytes->value(), kStringLen);
-  ASSERT_LT(service_request_bytes->value(), kUpperBytesLimit);
-  ASSERT_GE(service_response_bytes->value(), kStringLen);
-  ASSERT_LT(service_response_bytes->value(), kUpperBytesLimit);
-  ASSERT_GE(proxy_request_bytes->value(), kStringLen);
-  ASSERT_LT(proxy_request_bytes->value(), kUpperBytesLimit);
-  ASSERT_GE(proxy_request_bytes->value(), kStringLen);
-  ASSERT_LT(proxy_request_bytes->value(), kUpperBytesLimit);
+  EXPECT_GE(service_request_bytes->value(), kRequestBounds.first);
+  EXPECT_LT(service_request_bytes->value(), kRequestBounds.second);
+  EXPECT_GE(service_response_bytes->value(), kResponseBounds.first);
+  EXPECT_LT(service_response_bytes->value(), kResponseBounds.second);
+  EXPECT_GE(proxy_request_bytes->value(), kRequestBounds.first);
+  EXPECT_LT(proxy_request_bytes->value(), kRequestBounds.second);
+  EXPECT_GE(proxy_response_bytes->value(), kResponseBounds.first);
+  EXPECT_LT(proxy_response_bytes->value(), kResponseBounds.second);
 }
 
 template <class T>
@@ -1063,6 +1104,232 @@ TEST_F(RpcStubTest, Trivial) {
   ASSERT_OK(proxy.Trivial(req, &resp, &controller));
   ASSERT_TRUE(resp.has_error());
   ASSERT_EQ(resp.error().code(), Status::Code::kInvalidArgument);
+}
+
+TEST_F(RpcStubTest, OutboundSidecars) {
+  constexpr size_t kNumSidecars = 10;
+
+  CalculatorServiceProxy proxy(proxy_cache_.get(), server_hostport_);
+
+  RpcController controller;
+  controller.set_timeout(30s);
+
+  std::vector<std::string> values;
+  auto& sidecars = controller.outbound_sidecars();
+  for (auto i : Range(kNumSidecars)) {
+    auto data = RandomHumanReadableString(1_KB + 2_KB * i);
+    sidecars.Start().Append(Slice(data));
+    values.push_back(data);
+  }
+
+  rpc_test::SidecarRequestPB req;
+  req.set_num_sidecars(kNumSidecars);
+  rpc_test::SidecarResponsePB resp;
+  ASSERT_OK(proxy.Sidecar(req, &resp, &controller));
+
+  ASSERT_EQ(resp.num_sidecars(), kNumSidecars);
+  for (auto i : Range(kNumSidecars)) {
+    // Service reverses sidecar order.
+    auto received_sidecar = ASSERT_RESULT(controller.ExtractSidecar(kNumSidecars - i - 1));
+    ASSERT_EQ(values[i], received_sidecar.AsSlice());
+  }
+}
+
+TEST_F(RpcStubTest, StuckOutboundCallWithActiveConnection) {
+  SendSimpleCall();
+
+  rpc_test::ConcatRequestPB req;
+  req.set_lhs("yuga");
+  req.set_rhs("byte");
+  rpc_test::ConcatResponsePB resp;
+
+  RpcController controller;
+  controller.set_timeout(100ms);
+  controller.TEST_force_stuck_outbound_call();
+
+  rpc_test::AbacusServiceProxy proxy(proxy_cache_.get(), server_hostport_);
+  proxy.ConcatAsync(req, &resp, &controller, []() { LOG(INFO) << "Callback called"; });
+
+  std::this_thread::sleep_for(200ms);
+  ASSERT_FALSE(controller.finished());
+
+  // Dump the call state.
+  LOG(INFO) << controller.CallStateDebugString();
+
+  std::this_thread::sleep_for(2ms);
+
+  // Mark the call as failed.
+  controller.MarkCallAsFailed();
+
+  ASSERT_TRUE(controller.finished());
+  ASSERT_NOK(controller.status());
+}
+
+TEST_F(RpcStubTest, StuckOutboundCallWithClosedConnection) {
+  SendSimpleCall();
+
+  rpc_test::ConcatRequestPB req;
+  req.set_lhs("yuga");
+  req.set_rhs("byte");
+  rpc_test::ConcatResponsePB resp;
+
+  RpcController controller;
+  controller.set_timeout(100ms);
+  controller.TEST_force_stuck_outbound_call();
+
+  rpc_test::AbacusServiceProxy proxy(proxy_cache_.get(), server_hostport_);
+  proxy.ConcatAsync(req, &resp, &controller, []() { LOG(INFO) << "Callback called"; });
+
+  std::this_thread::sleep_for(100ms);
+
+  // Close the connection.
+  client_messenger_->BreakConnectivityTo(ASSERT_RESULT(HostToAddress(server_hostport_.host())));
+
+  ASSERT_FALSE(controller.finished());
+
+  // Dump the call state.
+  LOG(INFO) << controller.CallStateDebugString();
+
+  std::this_thread::sleep_for(2ms);
+
+  // Mark the call as failed.
+  controller.MarkCallAsFailed();
+
+  ASSERT_TRUE(controller.finished());
+  auto s = controller.status();
+  ASSERT_TRUE(s.IsTimedOut()) << s.ToString();
+}
+
+// Parameterized test for ASH functionality
+YB_DEFINE_ENUM(AshServiceType, (kCalculatorService)(kAshTestService));
+
+class RpcStubAshTest : public RpcStubTest,
+                       public ::testing::WithParamInterface<AshServiceType> {
+ public:
+  void SetUp() override {
+    RpcStubTest::SetUp();
+    service_type_ = GetParam();
+  }
+
+ protected:
+  template<typename ProxyType>
+  std::unique_ptr<ProxyType> CreateProxy() {
+    return std::make_unique<ProxyType>(proxy_cache_.get(), server_hostport_);
+  }
+
+  void TestAshMethod() {
+    RpcController controller;
+    controller.set_timeout(30s);
+
+    auto metadata = GenerateRandomMetadata();
+    const auto wait_state = ash::WaitStateInfo::CreateIfAshIsEnabled<ash::WaitStateInfo>();
+    wait_state->UpdateMetadata(metadata);
+    ADOPT_WAIT_STATE(wait_state);
+
+    auto random_int = RandomUniformInt<int32_t>();
+
+    rpc_test::AshRequestPB req;
+    rpc_test::AshResponsePB resp;
+    req.set_value(random_int);
+
+    if (service_type_ == AshServiceType::kCalculatorService) {
+      auto proxy = CreateProxy<CalculatorServiceProxy>();
+      ASSERT_OK(proxy->Ash(req, &resp, &controller));
+    } else {
+      auto proxy = CreateProxy<AshTestServiceProxy>();
+      ASSERT_OK(proxy->Ash(req, &resp, &controller));
+    }
+
+    ASSERT_EQ(random_int, resp.value());
+    VerifyMetadata(metadata, ash::AshMetadata::FromPB(resp.ash_metadata()));
+  }
+
+  void TestAshLightweightMethod() {
+    RpcController controller;
+    controller.set_timeout(30s);
+
+    auto metadata = GenerateRandomMetadata();
+    const auto wait_state = ash::WaitStateInfo::CreateIfAshIsEnabled<ash::WaitStateInfo>();
+    wait_state->UpdateMetadata(metadata);
+    ADOPT_WAIT_STATE(wait_state);
+
+    auto random_int = RandomUniformInt<int32_t>();
+
+    rpc_test::AshLightweightRequestPB req;
+    rpc_test::AshLightweightResponsePB resp;
+    req.set_value(random_int);
+
+    if (service_type_ == AshServiceType::kCalculatorService) {
+      auto proxy = CreateProxy<CalculatorServiceProxy>();
+      ASSERT_OK(proxy->AshLightweight(req, &resp, &controller));
+    } else {
+      auto proxy = CreateProxy<AshTestServiceProxy>();
+      ASSERT_OK(proxy->AshLightweight(req, &resp, &controller));
+    }
+
+    ASSERT_EQ(random_int, resp.value());
+    VerifyMetadata(metadata, ash::AshMetadata::FromPB(resp.ash_metadata()));
+  }
+
+  void VerifyMetadata(const ash::AshMetadata& expected, const ash::AshMetadata& actual) {
+    ASSERT_EQ(expected.root_request_id, actual.root_request_id);
+    ASSERT_EQ(expected.top_level_node_id, actual.top_level_node_id);
+    ASSERT_EQ(expected.query_id, actual.query_id);
+    ASSERT_EQ(expected.pid, actual.pid);
+    ASSERT_EQ(expected.database_id, actual.database_id);
+    ASSERT_EQ(expected.client_host_port, actual.client_host_port);
+  }
+
+  AshServiceType service_type_;
+};
+
+TEST_P(RpcStubAshTest, Ash) {
+  TestAshMethod();
+}
+
+TEST_P(RpcStubAshTest, AshLightweight) {
+  TestAshLightweightMethod();
+}
+
+INSTANTIATE_TEST_CASE_P(
+    ServiceTypes,
+    RpcStubAshTest,
+    ::testing::Values(
+        AshServiceType::kCalculatorService,
+        AshServiceType::kAshTestService
+    )
+);
+
+TEST_F(RpcStubTest, NoAsh) {
+  AshTestServiceProxy proxy(proxy_cache_.get(), server_hostport_);
+
+  RpcController controller;
+  controller.set_timeout(30s);
+
+  rpc_test::NoAshRequestPB req;
+  rpc_test::NoAshResponsePB resp;
+
+  auto metadata = GenerateRandomMetadata();
+  const auto wait_state = ash::WaitStateInfo::CreateIfAshIsEnabled<ash::WaitStateInfo>();
+  wait_state->UpdateMetadata(metadata);
+  ADOPT_WAIT_STATE(wait_state);
+
+  auto random_int = RandomUniformInt<int32_t>();
+  req.set_value(random_int);
+  ASSERT_OK(proxy.NoAsh(req, &resp, &controller));
+
+  ASSERT_EQ(random_int, resp.value());
+  auto resp_metadata = ash::AshMetadata::FromPB(resp.ash_metadata());
+
+  // NoAsh should return empty metadata
+  auto expected = ash::AshMetadata{};
+  auto actual = ash::AshMetadata::FromPB(resp.ash_metadata());
+  ASSERT_EQ(expected.root_request_id, actual.root_request_id);
+  ASSERT_EQ(expected.top_level_node_id, actual.top_level_node_id);
+  ASSERT_EQ(expected.query_id, actual.query_id);
+  ASSERT_EQ(expected.pid, actual.pid);
+  ASSERT_EQ(expected.database_id, actual.database_id);
+  ASSERT_EQ(expected.client_host_port, actual.client_host_port);
 }
 
 } // namespace rpc

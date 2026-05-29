@@ -1,4 +1,4 @@
-// Copyright (c) YugaByte, Inc.
+// Copyright (c) YugabyteDB, Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License"); you may not use this file except
 // in compliance with the License.  You may obtain a copy of the License at
@@ -15,7 +15,7 @@ package org.yb.loadtester;
 import org.junit.Before;
 import org.junit.Test;
 import org.junit.runner.RunWith;
-import org.yb.util.YBTestRunnerNonTsanOnly;
+import org.yb.YBTestRunner;
 
 import java.util.Arrays;
 
@@ -24,7 +24,7 @@ import java.util.Arrays;
  * without any significant impact to a running load test.
  */
 
-@RunWith(value=YBTestRunnerNonTsanOnly.class)
+@RunWith(value=YBTestRunner.class)
 public class TestClusterTserverRollingLeaderBlacklist extends TestClusterBase {
   @Test(timeout = TEST_TIMEOUT_SEC * 1000) // 20 minutes.
   public void testClusterTserverRollingLeaderBlacklist() throws Exception {

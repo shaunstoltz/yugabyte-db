@@ -1,5 +1,5 @@
 //--------------------------------------------------------------------------------------------------
-// Copyright (c) YugaByte, Inc.
+// Copyright (c) YugabyteDB, Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License"); you may not use this file except
 // in compliance with the License.  You may obtain a copy of the License at
@@ -61,6 +61,8 @@ class DateTime {
                                        const OutputFormat& output_format = CqlOutputFormat);
   static Timestamp TimestampNow();
 
+  static std::string SystemTimezone();
+
   //----------------------------------------------------------------------------------------------
   // Date represented as the number of days in uint32_t with the epoch (1970-01-01) at the center of
   // the range (2^31). Min and max possible dates are "-5877641-06-23" and "5881580-07-11".
@@ -89,6 +91,7 @@ class DateTime {
 
   //----------------------------------------------------------------------------------------------
   static int64_t AdjustPrecision(int64_t val, size_t input_precision, size_t output_precision);
+  static int64_t FloorTimestamp(int64_t val, size_t input_precision, size_t output_precision);
   static constexpr int64_t kInternalPrecision = 6; // microseconds
   static constexpr int64_t kMillisecondPrecision = 3; // milliseconds
 };

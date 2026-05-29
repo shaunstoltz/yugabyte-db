@@ -6,9 +6,9 @@
 // Use of this source code is governed by a BSD-style license that can be
 // found in the LICENSE file. See the AUTHORS file for names of contributors.
 //
-// The following only applies to changes made to this file as part of YugaByte development.
+// The following only applies to changes made to this file as part of YugabyteDB development.
 //
-// Portions Copyright (c) YugaByte, Inc.
+// Portions Copyright (c) YugabyteDB, Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License"); you may not use this file except
 // in compliance with the License.  You may obtain a copy of the License at
@@ -73,6 +73,10 @@ constexpr QueryId kDefaultQueryId = 0;
 constexpr QueryId kInMultiTouchId = -1;
 // Query ids to represent values that should not be in any cache.
 constexpr QueryId kNoCacheQueryId = -2;
+// Maximum permissible number of bits to use for sharding the block cache.
+constexpr int kSharedLRUCacheMaxNumShardBits = 19;
+// Default value of number of bits to use for sharding the block cache.
+constexpr int kSharedLRUCacheDefaultNumShardBits = 4;
 
 class Cache {
  public:

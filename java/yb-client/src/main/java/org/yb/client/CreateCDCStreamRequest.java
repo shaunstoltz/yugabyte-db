@@ -1,4 +1,4 @@
-// Copyright (c) YugaByte, Inc.
+// Copyright (c) YugabyteDB, Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License"); you may not use this file except
 // in compliance with the License.  You may obtain a copy of the License at
@@ -17,6 +17,7 @@ import com.google.protobuf.Message;
 import io.netty.buffer.ByteBuf;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
+import org.yb.CommonTypes;
 import org.yb.cdc.CdcService.CreateCDCStreamRequestPB;
 import org.yb.cdc.CdcService.CreateCDCStreamResponsePB;
 import org.yb.cdc.CdcService;
@@ -32,13 +33,19 @@ public class CreateCDCStreamRequest extends YRpc<CreateCDCStreamResponse> {
   private final CdcService.CDCCheckpointType checkpoint_type;
   private CdcService.CDCRecordType recordType;
 
+  private CommonTypes.YQLDatabase dbType;
+
+  private CommonTypes.CDCSDKSnapshotOption cdcsdkSnapshotOption;
+
   public CreateCDCStreamRequest(YBTable masterTable, String tableId,
                                 String namespaceName, String format,
-                                String checkpointType, String recordType) {
+                                String checkpointType, String recordType,
+                                CommonTypes.CDCSDKSnapshotOption cdcsdkSnapshotOption) {
     super(masterTable);
     this.tableId = tableId;
     this.namespaceName = namespaceName;
     this.source_type = CdcService.CDCRequestSource.CDCSDK;
+    this.cdcsdkSnapshotOption = cdcsdkSnapshotOption;
     if (format.equalsIgnoreCase("PROTO"))
       this.record_format = CdcService.CDCRecordFormat.PROTO;
     else {
@@ -56,16 +63,43 @@ public class CreateCDCStreamRequest extends YRpc<CreateCDCStreamResponse> {
     if (recordType != null && !recordType.isEmpty()) {
       if (recordType.equalsIgnoreCase("ALL")) {
         this.recordType = CdcService.CDCRecordType.ALL;
-      } else {
+      } else if (recordType.equalsIgnoreCase("FULL_ROW_NEW_IMAGE")) {
+        this.recordType = CdcService.CDCRecordType.FULL_ROW_NEW_IMAGE;
+      } else if (recordType.equalsIgnoreCase("MODIFIED_COLUMNS_OLD_AND_NEW_IMAGES")) {
+        this.recordType = CdcService.CDCRecordType.MODIFIED_COLUMNS_OLD_AND_NEW_IMAGES;
+      } else if (recordType.equalsIgnoreCase("CHANGE")) {
         this.recordType = CdcService.CDCRecordType.CHANGE;
+      } else if (recordType.equalsIgnoreCase("FULL")) {
+        this.recordType = CdcService.CDCRecordType.PG_FULL;
+      } else if (recordType.equalsIgnoreCase("CHANGE_OLD_NEW")) {
+        this.recordType = CdcService.CDCRecordType.PG_CHANGE_OLD_NEW;
+      } else if (recordType.equalsIgnoreCase("DEFAULT")) {
+        this.recordType = CdcService.CDCRecordType.PG_DEFAULT;
+      } else if (recordType.equalsIgnoreCase("NOTHING")) {
+        this.recordType = CdcService.CDCRecordType.PG_NOTHING;
+      } else {
+        throw new IllegalArgumentException("Invalid record type: " + recordType);
       }
+    } else {
+      this.recordType = CdcService.CDCRecordType.CHANGE;
     }
   }
 
   public CreateCDCStreamRequest(YBTable masterTable, String tableId,
                                 String namespaceName, String format,
                                 String checkpointType) {
-    this(masterTable, tableId, namespaceName, format, checkpointType, null);
+    this(masterTable, tableId, namespaceName, format, checkpointType, null, null);
+  }
+
+  public CreateCDCStreamRequest(YBTable masterTable, String tableId,
+                                String namespaceName, String format,
+                                String checkpointType, String recordType,
+                                CommonTypes.YQLDatabase dbType,
+                                CommonTypes.CDCSDKSnapshotOption cdcsdkSnapshotOption) {
+
+    this(masterTable, tableId, namespaceName, format, checkpointType, recordType,
+      cdcsdkSnapshotOption);
+    this.dbType = dbType;
   }
 
   @Override
@@ -83,6 +117,13 @@ public class CreateCDCStreamRequest extends YRpc<CreateCDCStreamResponse> {
       builder.setRecordType(this.recordType);
     }
 
+    if (dbType != null) {
+      builder.setDbType(this.dbType);
+    }
+
+    if (cdcsdkSnapshotOption != null) {
+      builder.setCdcsdkConsistentSnapshotOption(this.cdcsdkSnapshotOption);
+    }
     return toChannelBuffer(header, builder.build());
   }
 

@@ -1,5 +1,5 @@
 //--------------------------------------------------------------------------------------------------
-// Copyright (c) YugaByte, Inc.
+// Copyright (c) YugabyteDB, Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License"); you may not use this file except
 // in compliance with the License.  You may obtain a copy of the License at
@@ -21,10 +21,8 @@
 
 #pragma once
 
-
-
-namespace yb {
-namespace pggate {
+#include "yb/yql/pggate/ybc_pg_typedefs.h"
+namespace yb::pggate {
 
 //-----------------------------------------------------------------------------
 // Memory context.
@@ -54,12 +52,8 @@ void PgResetCurrentMemCtxThreadLocalVars();
 void* PgSetThreadLocalJumpBuffer(void* new_buffer);
 void* PgGetThreadLocalJumpBuffer();
 
-/*
- * Save/get the error message. Needs a separate function because it will be
- * generated separately in errmsg when using ereport (instead of elog).
- */
-void PgSetThreadLocalErrMsg(const void* new_msg);
-const void* PgGetThreadLocalErrMsg();
+void *PgSetThreadLocalErrStatus(void* new_status);
+void *PgGetThreadLocalErrStatus();
 
 //-----------------------------------------------------------------------------
 // Expression processing.
@@ -73,5 +67,22 @@ const void* PgGetThreadLocalErrMsg();
 void* PgGetThreadLocalStrTokPtr();
 void PgSetThreadLocalStrTokPtr(char *new_pg_strtok_ptr);
 
-} // namespace pggate
-} // namespace yb
+/*
+ * yb_expression_version (from readfuncs.c)
+ *
+ * Similar to the pg_strtok_ptr, this technically doesn't need to be a global,
+ * but passing this through to all the deserialization functions would be a
+ * large change that would make future merges difficult.
+ */
+int PgGetThreadLocalYbExpressionVersion();
+void PgSetThreadLocalYbExpressionVersion(int yb_expr_version);
+
+/*
+ * CachedRegexpHolder (from regex/regex.c)
+ * These are used to cache the compiled regexes
+ */
+YbcPgThreadLocalRegexpCache* PgGetThreadLocalRegexpCache();
+YbcPgThreadLocalRegexpCache* PgInitThreadLocalRegexpCache(
+    size_t buffer_size, YbcPgThreadLocalRegexpCacheCleanup cleanup);
+
+} // namespace yb::pggate

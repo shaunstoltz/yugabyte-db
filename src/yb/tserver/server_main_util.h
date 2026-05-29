@@ -1,4 +1,4 @@
-// Copyright (c) Yugabyte, Inc.
+// Copyright (c) YugabyteDB, Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License"); you may not use this file except
 // in compliance with the License.  You may obtain a copy of the License at
@@ -21,6 +21,17 @@
 
 namespace yb {
 
-Status MasterTServerParseFlagsAndInit(const std::string& server_type, int* argc, char*** argv);
+// If a memory limit gflag has this value after applying any command line flags then we replace its
+// value at process start with a computed value based on the available memory among other things.
+#define USE_RECOMMENDED_MEMORY_VALUE -1000
+
+// Special values for the db_block_cache_size_bytes and db_block_cache_size_percentage flags.
+// See the flag descriptions for their meaning.
+#define DB_CACHE_SIZE_USE_PERCENTAGE -1
+#define DB_CACHE_SIZE_CACHE_DISABLED -2
+#define DB_CACHE_SIZE_USE_DEFAULT -3
+
+Status MasterTServerParseFlagsAndInit(
+    const std::string& server_type, bool is_master, int* argc, char*** argv);
 
 }  // namespace yb

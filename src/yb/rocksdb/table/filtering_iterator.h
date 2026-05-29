@@ -1,4 +1,4 @@
-// Copyright (c) YugaByte, Inc.
+// Copyright (c) YugabyteDB, Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License"); you may not use this file except
 // in compliance with the License.  You may obtain a copy of the License at
@@ -40,41 +40,33 @@ class FilteringIterator : public InternalIterator {
       : iterator_(iterator, PossibleArenaDeleter(arena_mode)) {}
 
  private:
-  bool Valid() const override {
-    return iterator_->Valid();
+  const KeyValueEntry& Entry() const override {
+    return iterator_->Entry();
   }
 
-  void SeekToFirst() override {
+  const KeyValueEntry& SeekToFirst() override {
     iterator_->SeekToFirst();
-    ApplyFilter(/* backward = */ false);
+    return ApplyFilter(/* backward = */ false);
   }
 
-  void SeekToLast() override {
+  const KeyValueEntry& SeekToLast() override {
     iterator_->SeekToLast();
-    ApplyFilter(/* backward = */ true);
+    return ApplyFilter(/* backward = */ true);
   }
 
-  void Seek(const Slice& target) override {
+  const KeyValueEntry& Seek(Slice target) override {
     iterator_->Seek(target);
-    ApplyFilter(/* backward = */ false);
+    return ApplyFilter(/* backward = */ false);
   }
 
-  void Next() override {
+  const KeyValueEntry& Next() override {
     iterator_->Next();
-    ApplyFilter(/* backward = */ false);
+    return ApplyFilter(/* backward = */ false);
   }
 
-  void Prev() override {
+  const KeyValueEntry& Prev() override {
     iterator_->Prev();
-    ApplyFilter(/* backward = */ true);
-  }
-
-  Slice key() const override {
-    return iterator_->key();
-  }
-
-  Slice value() const override {
-    return iterator_->value();
+    return ApplyFilter(/* backward = */ true);
   }
 
   Status status() const override {
@@ -97,37 +89,23 @@ class FilteringIterator : public InternalIterator {
     return iterator_->GetProperty(std::move(prop_name), prop);
   }
 
-  bool ScanForward(
-      const Comparator* user_key_comparator, const Slice& upperbound,
-      KeyFilterCallback* key_filter_callback, ScanCallback* scan_callback) override {
-    KeyFilterCallback kf_callback = [this, key_filter_callback](
-                                        const Slice& prefixed_key, size_t shared_bytes,
-                                        const Slice& delta) -> KeyFilterCallbackResult {
-      // TODO: add support for shared prefix encoded key filter callback.
-      LOG_IF(DFATAL, shared_bytes != 0)
-          << "Key filter callback with shared prefix is not supported.";
-      if (!Satisfied(delta)) {
-        return KeyFilterCallbackResult{.skip_key = true, .cache_key = false};
-      }
-
-      return key_filter_callback ? (*key_filter_callback)(prefixed_key, shared_bytes, delta)
-                                 : KeyFilterCallbackResult{.skip_key = false, .cache_key = false};
-    };
-
-    return iterator_->ScanForward(user_key_comparator, upperbound, &kf_callback, scan_callback);
+  const KeyValueEntry& UpdateFilterKey(Slice user_key_for_filter, Slice seek_key) override {
+    return iterator_->UpdateFilterKey(user_key_for_filter, seek_key);
   }
 
-  void ApplyFilter(bool backward) {
-    while (iterator_->Valid()) {
-      if (Satisfied(ExtractUserKey(iterator_->key()))) {
-        break;
+  const KeyValueEntry& ApplyFilter(bool backward) {
+    const auto* entry = &iterator_->Entry();
+    while (*entry) {
+      if (Satisfied(ExtractUserKey(entry->key))) {
+        return *entry;
       }
       if (!backward) {
-        iterator_->Next();
+        entry = &iterator_->Next();
       } else {
-        iterator_->Prev();
+        entry = &iterator_->Prev();
       }
     }
+    return *entry;
   }
 
   virtual bool Satisfied(Slice user_key) = 0;

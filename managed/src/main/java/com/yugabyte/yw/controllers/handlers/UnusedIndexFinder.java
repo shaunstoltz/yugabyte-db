@@ -1,5 +1,5 @@
 /*
- * Copyright 2022 YugaByte, Inc. and Contributors
+ * Copyright 2022 YugabyteDB, Inc. and Contributors
  *
  * Licensed under the Polyform Free Trial License 1.0.0 (the "License"); you
  * may not use this file except in compliance with the License. You
@@ -9,9 +9,9 @@
  */
 package com.yugabyte.yw.controllers.handlers;
 
-import static play.mvc.Http.Status.INTERNAL_SERVER_ERROR;
-import static com.yugabyte.yw.common.TableSpaceStructures.UnusedIndexFinderResponse;
 import static com.yugabyte.yw.common.TableSpaceStructures.QueryUniverseDBListResponse;
+import static com.yugabyte.yw.common.TableSpaceStructures.UnusedIndexFinderResponse;
+import static play.mvc.Http.Status.INTERNAL_SERVER_ERROR;
 
 import com.fasterxml.jackson.core.type.TypeReference;
 import com.fasterxml.jackson.databind.ObjectMapper;
@@ -39,9 +39,11 @@ import java.util.concurrent.Executors;
 import java.util.concurrent.Future;
 import java.util.stream.Collectors;
 import javax.inject.Inject;
+import javax.inject.Singleton;
 import lombok.extern.slf4j.Slf4j;
 
 @Slf4j
+@Singleton
 public class UnusedIndexFinder {
 
   public static final String QUERY_EXECUTOR_THREAD_POOL_CONFIG_KEY = "yb.perf_advisor.max_threads";
@@ -186,14 +188,16 @@ public class UnusedIndexFinder {
       }
 
       for (UnusedIndexFinderResponse res : unusedIndexResponse) {
-        log.trace(
-            "Final JSON responses: current_database: {}, table_name: {}, "
-                + "index_name: {}, index_command: {}, description: {}",
-            res.currentDatabase,
-            res.tableName,
-            res.indexName,
-            res.indexCommand,
-            res.description);
+        if (log.isTraceEnabled()) {
+          log.trace(
+              "Final JSON responses: current_database: {}, table_name: {}, "
+                  + "index_name: {}, index_command: {}, description: {}",
+              res.currentDatabase,
+              CommonUtils.logTableName(res.tableName),
+              res.indexName,
+              res.indexCommand,
+              res.description);
+        }
       }
 
       return unusedIndexResponse;

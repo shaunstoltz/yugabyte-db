@@ -1,14 +1,16 @@
-// Copyright (c) YugaByte, Inc.
+// Copyright (c) YugabyteDB, Inc.
 
 package com.yugabyte.yw.commissioner.tasks.subtasks;
 
 import com.yugabyte.yw.commissioner.BaseTaskDependencies;
 import com.yugabyte.yw.commissioner.tasks.UniverseTaskBase;
+import com.yugabyte.yw.common.certmgmt.EncryptionInTransitUtil;
 import com.yugabyte.yw.forms.UniverseDefinitionTaskParams;
 import com.yugabyte.yw.forms.UniverseTaskParams;
 import com.yugabyte.yw.models.CertificateInfo;
 import java.io.File;
 import java.nio.charset.Charset;
+import java.nio.file.Files;
 import java.util.UUID;
 import javax.inject.Inject;
 import lombok.extern.slf4j.Slf4j;
@@ -17,8 +19,9 @@ import org.apache.commons.io.FileUtils;
 @Slf4j
 public class UniverseUpdateRootCert extends UniverseTaskBase {
 
-  public static String MULTI_ROOT_CERT = "%s.ca.multi.root.crt";
-  public static String MULTI_ROOT_CERT_KEY = "%s.ca.multi.root.key.pem";
+  // Format is <cert UUID>.<universe UUID>.<Suffix>.
+  private static final String MULTI_ROOT_CERT = "%s.%s.ca.multi.root.crt";
+  private static final String MULTI_ROOT_CERT_KEY = "%s.%s.ca.multi.root.key.pem";
 
   @Inject
   protected UniverseUpdateRootCert(BaseTaskDependencies baseTaskDependencies) {
@@ -34,6 +37,7 @@ public class UniverseUpdateRootCert extends UniverseTaskBase {
   public static class Params extends UniverseTaskParams {
     public UUID rootCA;
     public UpdateRootCertAction action;
+    public UUID temporaryRootCAUUID;
   }
 
   protected UniverseUpdateRootCert.Params taskParams() {
@@ -48,35 +52,50 @@ public class UniverseUpdateRootCert extends UniverseTaskBase {
         if (taskParams().rootCA != null
             && universeDetails.rootCA != null
             && !universeDetails.rootCA.equals(taskParams().rootCA)) {
-          CertificateInfo oldRootCert = CertificateInfo.get(universeDetails.rootCA);
-          CertificateInfo newRootCert = CertificateInfo.get(taskParams().rootCA);
-          if (!oldRootCert.checksum.equals(newRootCert.checksum)) {
-            // Create a new file in the same directory as current root cert
-            // Append the file with contents of both old and new root certs
-            File oldRootCertFile = new File(oldRootCert.certificate);
-            File newRootCertFile = new File(newRootCert.certificate);
+          CertificateInfo oldRootCert = CertificateInfo.getOrBadRequest(universeDetails.rootCA);
+          CertificateInfo newRootCert = CertificateInfo.getOrBadRequest(taskParams().rootCA);
+          if (!CertificateInfo.isTemporary(oldRootCert)
+              && !oldRootCert.getChecksum().equals(newRootCert.getChecksum())) {
+            // It is not already a temporary multi cert and the certs are different.
+            File oldRootCertFile = new File(oldRootCert.getCertificate());
+            File newRootCertFile = new File(newRootCert.getCertificate());
             File multiCertFile =
                 new File(
                     oldRootCertFile.getParent()
                         + File.separator
-                        + String.format(MULTI_ROOT_CERT, universeDetails.rootCA));
+                        + String.format(
+                            MULTI_ROOT_CERT,
+                            universeDetails.rootCA,
+                            universeDetails.getUniverseUUID()));
             String oldRootCertContent =
                 FileUtils.readFileToString(oldRootCertFile, Charset.defaultCharset());
             String newRootCertContent =
                 FileUtils.readFileToString(newRootCertFile, Charset.defaultCharset());
             FileUtils.write(multiCertFile, oldRootCertContent, Charset.defaultCharset());
             FileUtils.write(multiCertFile, newRootCertContent, Charset.defaultCharset(), true);
-            // Create a temporary certificate pointing to the new multi certificate
-            // Update universe details to temporarily point to the created certificate
-            CertificateInfo temporaryCert =
-                CertificateInfo.createCopy(
-                    oldRootCert,
-                    oldRootCert.label + " (TEMPORARY)",
-                    multiCertFile.getAbsolutePath());
+
+            CertificateInfo temporaryCert;
+            if (taskParams().temporaryRootCAUUID != null) {
+              temporaryCert = CertificateInfo.getOrBadRequest(taskParams().temporaryRootCAUUID);
+              temporaryCert.update(multiCertFile.getAbsolutePath());
+            } else {
+              // Create a temporary certificate pointing to the new multi certificate
+              // Update universe details to temporarily point to the created certificate
+              temporaryCert =
+                  CertificateInfo.createCopy(
+                      oldRootCert,
+                      String.join(
+                              "-",
+                              universeDetails.getUniverseUUID().toString(),
+                              oldRootCert.getLabel())
+                          + EncryptionInTransitUtil.MULTI_ROOT_CERT_TMP_LABEL_SUFFIX,
+                      multiCertFile.getAbsolutePath());
+            }
+
             saveUniverseDetails(
                 universe -> {
                   UniverseDefinitionTaskParams details = universe.getUniverseDetails();
-                  details.rootCA = temporaryCert.uuid;
+                  details.rootCA = temporaryCert.getUuid();
                   universe.setUniverseDetails(details);
                 });
           }
@@ -88,16 +107,17 @@ public class UniverseUpdateRootCert extends UniverseTaskBase {
         if (taskParams().rootCA != null && universeDetails.rootCA != null) {
           CertificateInfo multiCert = CertificateInfo.get(universeDetails.rootCA);
           CertificateInfo newRootCert = CertificateInfo.get(taskParams().rootCA);
+          // TODO why are these null checks needed if they must exist?
           if (newRootCert != null && multiCert != null && CertificateInfo.isTemporary(multiCert)) {
-            File multiCertFile = new File(multiCert.certificate);
+            File multiCertFile = new File(multiCert.getCertificate());
             // Temporary root cert file follows the below convention
             // <original-root-ca-uuid>.ca.multi.root.crt
             // Original rootCA uuid is extracted from the file name
             UUID oldRootCA = UUID.fromString(multiCertFile.getName().split("\\.")[0]);
             CertificateInfo oldRootCert = CertificateInfo.get(oldRootCA);
 
-            File oldRootCertFile = new File(oldRootCert.certificate);
-            File newRootCertFile = new File(newRootCert.certificate);
+            File oldRootCertFile = new File(oldRootCert.getCertificate());
+            File newRootCertFile = new File(newRootCert.getCertificate());
             String oldRootCertContent =
                 FileUtils.readFileToString(oldRootCertFile, Charset.defaultCharset());
             String newRootCertContent =
@@ -105,28 +125,32 @@ public class UniverseUpdateRootCert extends UniverseTaskBase {
             FileUtils.write(multiCertFile, newRootCertContent, Charset.defaultCharset());
             FileUtils.write(multiCertFile, oldRootCertContent, Charset.defaultCharset(), true);
 
-            if (newRootCert.privateKey != null) {
-              File newCertKeyFile = new File(newRootCert.privateKey);
+            if (newRootCert.getPrivateKey() != null) {
+              File newCertKeyFile = new File(newRootCert.getPrivateKey());
               String newCertKeyContent =
                   FileUtils.readFileToString(newCertKeyFile, Charset.defaultCharset());
               File tempCertKeyFile =
                   new File(
                       oldRootCertFile.getParent()
                           + File.separator
-                          + String.format(MULTI_ROOT_CERT_KEY, universeDetails.rootCA));
+                          + String.format(
+                              MULTI_ROOT_CERT_KEY,
+                              universeDetails.rootCA,
+                              universeDetails.getUniverseUUID()));
               FileUtils.write(tempCertKeyFile, newCertKeyContent, Charset.defaultCharset());
-              multiCert.privateKey = tempCertKeyFile.getAbsolutePath();
+              multiCert.setPrivateKey(tempCertKeyFile.getAbsolutePath());
             } else {
-              multiCert.privateKey = null;
+              multiCert.setPrivateKey(null);
             }
 
             // If certs rotation happening between different cert types:
             // SelfSigned -> HCVault or HCVault -> SelfSigned or HCVault -> HCVault
             // We should also update certConfigType and customCertInfo of multiCert
             // such that appropriate server certs are generated
-            if (oldRootCert.customCertInfo != null || newRootCert.customCertInfo != null) {
-              multiCert.certType = newRootCert.certType;
-              multiCert.customCertInfo = newRootCert.customCertInfo;
+            if (oldRootCert.getCustomCertInfo() != null
+                || newRootCert.getCustomCertInfo() != null) {
+              multiCert.setCertType(newRootCert.getCertType());
+              multiCert.setCustomCertInfo(newRootCert.getCustomCertInfo());
             }
 
             multiCert.update();
@@ -137,9 +161,9 @@ public class UniverseUpdateRootCert extends UniverseTaskBase {
         // Delete the temporary multi root cert file
         // Delete the temporary cert key file
         if (universeDetails.rootCA != null) {
-          CertificateInfo rootCert = CertificateInfo.get(universeDetails.rootCA);
+          CertificateInfo rootCert = CertificateInfo.getOrBadRequest(universeDetails.rootCA);
           if (CertificateInfo.isTemporary(rootCert)) {
-            File rootCertFile = new File(rootCert.certificate);
+            File rootCertFile = new File(rootCert.getCertificate());
             // Temporary root cert file follows the below convention
             // <original-root-ca-uuid>.ca.multi.root.crt
             // Original rootCA uuid is extracted from the file name
@@ -147,14 +171,16 @@ public class UniverseUpdateRootCert extends UniverseTaskBase {
             saveUniverseDetails(
                 universe -> {
                   UniverseDefinitionTaskParams details = universe.getUniverseDetails();
-                  details.rootCA = originalRootCA;
+                  details.rootCA =
+                      taskParams().rootCA == null ? originalRootCA : taskParams().rootCA;
                   universe.setUniverseDetails(details);
                 });
-
-            rootCertFile.delete();
-            if (rootCert.privateKey != null && rootCert.privateKey.contains("ca.multi.root")) {
-              File rootCertKey = new File(rootCert.privateKey);
-              rootCertKey.delete();
+            Files.deleteIfExists(rootCertFile.toPath());
+            if (rootCert.getPrivateKey() != null) {
+              File rootCertKey = new File(rootCert.getPrivateKey());
+              if (rootCertKey.getName().contains("ca.multi.root")) {
+                Files.deleteIfExists(rootCertKey.toPath());
+              }
             }
             rootCert.delete();
           }

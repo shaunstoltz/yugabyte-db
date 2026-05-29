@@ -1,5 +1,5 @@
 /*
- * Copyright 2021 YugaByte, Inc. and Contributors
+ * Copyright 2021 YugabyteDB, Inc. and Contributors
  *
  * Licensed under the Polyform Free Trial License 1.0.0 (the "License"); you
  * may not use this file except in compliance with the License. You
@@ -9,6 +9,7 @@
  */
 package com.yugabyte.yw.common.concurrent;
 
+import com.google.common.annotations.VisibleForTesting;
 import java.util.HashMap;
 import java.util.Map;
 import java.util.concurrent.locks.Lock;
@@ -40,6 +41,33 @@ public class KeyLock<T> {
     log.trace("Acquired lock for key {}", key);
   }
 
+  public boolean tryLock(T key) {
+    LockEntry lockEntry;
+    log.trace("Try acquiring lock for key {}", key);
+    boolean acquired = false;
+    globalLock.lock();
+    try {
+      lockEntry =
+          metricKeyLocks.computeIfAbsent(
+              key,
+              k -> {
+                log.trace("Adding lock entry for key {}", key);
+                return new LockEntry();
+              });
+      acquired = lockEntry.lock.tryLock();
+      if (acquired) {
+        lockEntry.usages++;
+      } else if (lockEntry.usages == 0) {
+        log.trace("Removing lock entry for key {}", key);
+        metricKeyLocks.remove(key);
+      }
+    } finally {
+      globalLock.unlock();
+    }
+    log.trace("Try lock status for key {} is {}", key, acquired);
+    return acquired;
+  }
+
   public void releaseLock(T key) {
     log.trace("Releasing lock for key {}", key);
     globalLock.lock();
@@ -52,6 +80,25 @@ public class KeyLock<T> {
       }
       lockEntry.lock.unlock();
       log.trace("Released lock for key {}", key);
+    } finally {
+      globalLock.unlock();
+    }
+  }
+
+  @VisibleForTesting
+  int getUsages(T key) {
+    LockEntry lockEntry = metricKeyLocks.get(key);
+    if (lockEntry == null) {
+      return 0;
+    }
+    return lockEntry.usages;
+  }
+
+  @VisibleForTesting
+  public boolean hasQueuedThreads() {
+    globalLock.lock();
+    try {
+      return metricKeyLocks.size() > 0;
     } finally {
       globalLock.unlock();
     }

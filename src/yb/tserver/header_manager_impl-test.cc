@@ -1,4 +1,4 @@
-// Copyright (c) YugaByte, Inc.
+// Copyright (c) YugabyteDB, Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License"); you may not use this file except
 // in compliance with the License.  You may obtain a copy of the License at
@@ -13,7 +13,7 @@
 
 #include <string>
 
-#include <glog/logging.h>
+#include "yb/util/logging.h"
 #include <gtest/gtest.h>
 
 #include "yb/encryption/encryption_util.h"
@@ -33,8 +33,6 @@ using yb::tserver::GenerateTestUniverseKeyManager;
 
 namespace yb {
 
-namespace enterprise {
-
 class TestHeaderManagerImpl : public YBTest {};
 
 TEST_F(TestHeaderManagerImpl, FileOps) {
@@ -52,5 +50,4 @@ TEST_F(TestHeaderManagerImpl, FileOps) {
   ASSERT_TRUE(params->Equals(*new_params.get()));
 }
 
-} // namespace enterprise
 } // namespace yb

@@ -1,4 +1,4 @@
-// Copyright (c) YugaByte, Inc.
+// Copyright (c) YugabyteDB, Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License"); you may not use this file except
 // in compliance with the License.  You may obtain a copy of the License at
@@ -15,7 +15,7 @@
 
 #include "yb/common/ql_value.h"
 
-#include <glog/logging.h>
+#include "yb/util/logging.h"
 
 #include "yb/common/jsonb.h"
 #include "yb/common/ql_protocol_util.h"
@@ -36,7 +36,7 @@
 #include "yb/util/varint.h"
 #include "yb/util/flags.h"
 
-using yb::operator"" _MB;
+using yb::operator""_MB;
 
 // Maximumum value size is 64MB
 DEFINE_UNKNOWN_int32(yql_max_value_size, 64_MB,
@@ -51,15 +51,13 @@ using std::vector;
 using util::Decimal;
 using common::Jsonb;
 
-template<typename T>
-static int GenericCompare(const T& lhs, const T& rhs) {
-  if (lhs < rhs) return -1;
-  if (lhs > rhs) return 1;
-  return 0;
+template <class T1, class T2>
+static int GenericCompare(const T1& lhs, const T2& rhs) {
+  return OrderingToInt(lhs <=> rhs);
 }
 
-template <class PB>
-int TupleCompare(const PB& lhs, const PB& rhs);
+template <class PB1, class PB2>
+int TupleCompare(const PB1& lhs, const PB2& rhs);
 
 //------------------------- instance methods for abstract QLValue class -----------------------
 
@@ -137,6 +135,7 @@ int QLValue::CompareTo(const QLValue& other) const {
     case InternalType::kGinNullValue: {
       return GenericCompare(gin_null_value(), other.gin_null_value());
     }
+    case InternalType::kBsonValue: return bson_value().compare(other.bson_value());
   }
 
   LOG(FATAL) << "Internal error: unsupported type " << type();
@@ -243,6 +242,10 @@ void DoAppendToKey(const PB& value_pb, string* bytes) {
       }
       break;
     }
+    case InternalType::kBsonValue: {
+      AppendBytesToKey(value_pb.bson_value(), bytes);
+      break;
+    }
     case InternalType::VALUE_NOT_SET:
       break;
     case InternalType::kMapValue: FALLTHROUGH_INTENDED;
@@ -256,7 +259,7 @@ void DoAppendToKey(const PB& value_pb, string* bytes) {
     case InternalType::kVirtualValue:
       LOG(FATAL) << "Runtime error: virtual value should not be used to construct hash key";
     case InternalType::kGinNullValue: {
-      LOG(ERROR) << "Runtime error: gin null value should not be used to construct hash key";
+      LOG(DFATAL) << "Runtime error: gin null value should not be used to construct hash key";
       YBPartition::AppendIntToKey<uint8, uint8>(value_pb.gin_null_value(), bytes);
       break;
     }
@@ -294,30 +297,30 @@ Status QLValue::Deserialize(
   }
 
   switch (ql_type->main()) {
-    case INT8:
+    case DataType::INT8:
       return CQLDeserializeNum(
           len, Load8, static_cast<void (QLValue::*)(int8_t)>(&QLValue::set_int8_value), data);
-    case INT16:
+    case DataType::INT16:
       return CQLDeserializeNum(
           len, NetworkByteOrder::Load16,
           static_cast<void (QLValue::*)(int16_t)>(&QLValue::set_int16_value), data);
-    case INT32:
+    case DataType::INT32:
       return CQLDeserializeNum(
           len, NetworkByteOrder::Load32,
           static_cast<void (QLValue::*)(int32_t)>(&QLValue::set_int32_value), data);
-    case INT64:
+    case DataType::INT64:
       return CQLDeserializeNum(
           len, NetworkByteOrder::Load64,
           static_cast<void (QLValue::*)(int64_t)>(&QLValue::set_int64_value), data);
-    case FLOAT:
+    case DataType::FLOAT:
       return CQLDeserializeFloat(
           len, NetworkByteOrder::Load32,
           static_cast<void (QLValue::*)(float)>(&QLValue::set_float_value), data);
-    case DOUBLE:
+    case DataType::DOUBLE:
       return CQLDeserializeFloat(
           len, NetworkByteOrder::Load64,
           static_cast<void (QLValue::*)(double)>(&QLValue::set_double_value), data);
-    case DECIMAL: {
+    case DataType::DECIMAL: {
       string value;
       RETURN_NOT_OK(CQLDecodeBytes(len, data, &value));
       Decimal decimal;
@@ -325,25 +328,25 @@ Status QLValue::Deserialize(
       set_decimal_value(decimal.EncodeToComparable());
       return Status::OK();
     }
-    case VARINT: {
+    case DataType::VARINT: {
       string value;
       RETURN_NOT_OK(CQLDecodeBytes(len, data, &value));
-      util::VarInt varint;
+      VarInt varint;
       RETURN_NOT_OK(varint.DecodeFromTwosComplement(value));
       set_varint_value(varint);
       return Status::OK();
     }
-    case STRING:
+    case DataType::STRING:
       return CQLDecodeBytes(len, data, mutable_string_value());
-    case BOOL: {
+    case DataType::BOOL: {
       uint8_t value = 0;
       RETURN_NOT_OK(CQLDecodeNum(len, Load8, data, &value));
       set_bool_value(value != 0);
       return Status::OK();
     }
-    case BINARY:
+    case DataType::BINARY:
       return CQLDecodeBytes(len, data, mutable_binary_value());
-    case TIMESTAMP: {
+    case DataType::TIMESTAMP: {
       int64_t value = 0;
       RETURN_NOT_OK(CQLDecodeNum(len, NetworkByteOrder::Load64, data, &value));
       value = DateTime::AdjustPrecision(value,
@@ -352,19 +355,19 @@ Status QLValue::Deserialize(
       set_timestamp_value(value);
       return Status::OK();
     }
-    case DATE: {
+    case DataType::DATE: {
       uint32_t value = 0;
       RETURN_NOT_OK(CQLDecodeNum(len, NetworkByteOrder::Load32, data, &value));
       set_date_value(value);
       return Status::OK();
     }
-    case TIME: {
+    case DataType::TIME: {
       int64_t value = 0;
       RETURN_NOT_OK(CQLDecodeNum(len, NetworkByteOrder::Load64, data, &value));
       set_time_value(value);
       return Status::OK();
     }
-    case INET: {
+    case DataType::INET: {
       string bytes;
       RETURN_NOT_OK(CQLDecodeBytes(len, data, &bytes));
       InetAddress addr;
@@ -372,7 +375,7 @@ Status QLValue::Deserialize(
       set_inetaddress_value(addr);
       return Status::OK();
     }
-    case JSONB: {
+    case DataType::JSONB: {
       string json;
       RETURN_NOT_OK(CQLDecodeBytes(len, data, &json));
       Jsonb jsonb;
@@ -380,13 +383,13 @@ Status QLValue::Deserialize(
       set_jsonb_value(jsonb.MoveSerializedJsonb());
       return Status::OK();
     }
-    case UUID: {
+    case DataType::UUID: {
       string bytes;
       RETURN_NOT_OK(CQLDecodeBytes(len, data, &bytes));
       set_uuid_value(VERIFY_RESULT(Uuid::FromSlice(bytes)));
       return Status::OK();
     }
-    case TIMEUUID: {
+    case DataType::TIMEUUID: {
       string bytes;
       RETURN_NOT_OK(CQLDecodeBytes(len, data, &bytes));
       Uuid uuid = VERIFY_RESULT(Uuid::FromSlice(bytes));
@@ -394,7 +397,7 @@ Status QLValue::Deserialize(
       set_timeuuid_value(uuid);
       return Status::OK();
     }
-    case MAP: {
+    case DataType::MAP: {
       const shared_ptr<QLType>& keys_type = ql_type->param_type(0);
       const shared_ptr<QLType>& values_type = ql_type->param_type(1);
       set_map_value();
@@ -412,7 +415,7 @@ Status QLValue::Deserialize(
       }
       return Status::OK();
     }
-    case SET: {
+    case DataType::SET: {
       const shared_ptr<QLType>& elems_type = ql_type->param_type(0);
       set_set_value();
       int32_t nr_elems = 0;
@@ -425,7 +428,7 @@ Status QLValue::Deserialize(
       }
       return Status::OK();
     }
-    case LIST: {
+    case DataType::LIST: {
       const shared_ptr<QLType>& elems_type = ql_type->param_type(0);
       set_list_value();
       int32_t nr_elems = 0;
@@ -439,7 +442,7 @@ Status QLValue::Deserialize(
       return Status::OK();
     }
 
-    case USER_DEFINED_TYPE: {
+    case DataType::USER_DEFINED_TYPE: {
       set_map_value();
       int fields_size = narrow_cast<int>(ql_type->udtype_field_names().size());
       for (int i = 0; i < fields_size; i++) {
@@ -454,11 +457,11 @@ Status QLValue::Deserialize(
       return Status::OK();
     }
 
-    case FROZEN: {
+    case DataType::FROZEN: {
       set_frozen_value();
       const auto& type = ql_type->param_type(0);
       switch (type->main()) {
-        case MAP: {
+        case DataType::MAP: {
           std::map<QLValue, QLValue> map_values;
           const shared_ptr<QLType> &keys_type = type->param_type(0);
           const shared_ptr<QLType> &values_type = type->param_type(1);
@@ -481,7 +484,7 @@ Status QLValue::Deserialize(
 
           return Status::OK();
         }
-        case SET: {
+        case DataType::SET: {
           const shared_ptr<QLType> &elems_type = type->param_type(0);
           int32_t nr_elems = 0;
 
@@ -498,7 +501,7 @@ Status QLValue::Deserialize(
           }
           return Status::OK();
         }
-        case LIST: {
+        case DataType::LIST: {
           const shared_ptr<QLType> &elems_type = type->param_type(0);
           int32_t nr_elems = 0;
           RETURN_NOT_OK(CQLDecodeNum(sizeof(nr_elems), NetworkByteOrder::Load32, data, &nr_elems));
@@ -511,7 +514,7 @@ Status QLValue::Deserialize(
           return Status::OK();
         }
 
-        case USER_DEFINED_TYPE: {
+        case DataType::USER_DEFINED_TYPE: {
           const int fields_size = narrow_cast<int>(type->udtype_field_names().size());
           for (int i = 0; i < fields_size; i++) {
             // TODO (mihnea) default to null if value missing (CQL behavior)
@@ -528,7 +531,7 @@ Status QLValue::Deserialize(
       break;
     }
 
-    case TUPLE: {
+    case DataType::TUPLE: {
       set_tuple_value();
       size_t num_elems = ql_type->params().size();
       for (size_t i = 0; i < num_elems; ++i) {
@@ -581,6 +584,7 @@ string QLValue::ToValueString(const QuotesType quotes_type) const {
     case InternalType::kTimeuuidValue: return timeuuid_value().ToString();
     case InternalType::kBoolValue: return (bool_value() ? "true" : "false");
     case InternalType::kBinaryValue: return "0x" + b2a_hex(binary_value());
+    case InternalType::kBsonValue: return "0x" + b2a_hex(bson_value());
 
     case InternalType::kMapValue: {
       std::stringstream ss;
@@ -757,17 +761,17 @@ Uuid QLValue::uuid_value(const LWQLValuePB& pb) {
   return CHECK_RESULT(Uuid::FromSlice(uuid_value_pb(pb)));
 }
 
-util::VarInt QLValue::varint_value(const QLValuePB& pb) {
+VarInt QLValue::varint_value(const QLValuePB& pb) {
   CHECK(pb.has_varint_value()) << "Value: " << pb.ShortDebugString();
-  util::VarInt varint;
+  VarInt varint;
   size_t num_decoded_bytes;
   CHECK_OK(varint.DecodeFromComparable(pb.varint_value(), &num_decoded_bytes));
   return varint;
 }
 
-util::VarInt QLValue::varint_value(const LWQLValuePB& pb) {
+VarInt QLValue::varint_value(const LWQLValuePB& pb) {
   CHECK(pb.has_varint_value()) << "Value: " << pb.ShortDebugString();
-  util::VarInt varint;
+  VarInt varint;
   size_t num_decoded_bytes;
   CHECK_OK(varint.DecodeFromComparable(pb.varint_value(), &num_decoded_bytes));
   return varint;
@@ -883,33 +887,29 @@ bool EitherIsNull(const LWQLValuePB& lhs, const LWQLValuePB& rhs) {
   return IsNull(lhs) || IsNull(rhs);
 }
 
-bool BothNotNull(const QLValuePB& lhs, const QLValuePB& rhs) {
+template <class PB1, class PB2>
+bool BothNotNull(const PB1& lhs, const PB2& rhs) {
   return !IsNull(lhs) && !IsNull(rhs);
 }
 
-bool BothNull(const QLValuePB& lhs, const QLValuePB& rhs) {
+template <class PB1, class PB2>
+bool BothNull(const PB1& lhs, const PB2& rhs) {
   return IsNull(lhs) && IsNull(rhs);
 }
 
-bool BothNull(const LWQLValuePB& lhs, const LWQLValuePB& rhs) {
-  return IsNull(lhs) && IsNull(rhs);
+bool IsVirtual(const QLValuePB& lhs) {
+  return lhs.value_case() == QLValuePB::kVirtualValue;
 }
 
-bool EitherIsVirtual(const QLValuePB& lhs, const QLValuePB& rhs) {
-  return lhs.value_case() == QLValuePB::kVirtualValue ||
-         rhs.value_case() == QLValuePB::kVirtualValue;
+bool IsVirtual(const LWQLValuePB& lhs) {
+  return lhs.value_case() == QLValuePB::kVirtualValue;
 }
 
-bool EitherIsVirtual(const LWQLValuePB& lhs, const LWQLValuePB& rhs) {
-  return lhs.value_case() == QLValuePB::kVirtualValue ||
-         rhs.value_case() == QLValuePB::kVirtualValue;
-}
-
-template <class PB>
-bool DoComparable(const PB& lhs, const PB& rhs) {
-  return (lhs.value_case() == rhs.value_case() ||
-          EitherIsNull(lhs, rhs) ||
-          EitherIsVirtual(lhs, rhs));
+template <class PB1, class PB2>
+bool DoComparable(const PB1& lhs, const PB2& rhs) {
+  return lhs.value_case() == rhs.value_case() ||
+         IsNull(lhs) || IsNull(rhs) ||
+         IsVirtual(lhs) || IsVirtual(rhs);
 }
 
 bool Comparable(const QLValuePB& lhs, const QLValuePB& rhs) {
@@ -934,95 +934,10 @@ bool Comparable(const QLValuePB& lhs, const QLValue& rhs) {
           EitherIsVirtual(lhs, rhs));
 }
 
-bool BothNotNull(const QLValuePB& lhs, const QLValue& rhs) {
-  return !IsNull(lhs) && !rhs.IsNull();
-}
-
-bool BothNotNull(const LWQLValuePB& lhs, const LWQLValuePB& rhs) {
-  return !IsNull(lhs) && !IsNull(rhs);
-}
-
-bool BothNull(const QLValuePB& lhs, const QLValue& rhs) {
-  return IsNull(lhs) && rhs.IsNull();
-}
-
-std::vector<const QLValuePB*> GetTuplesSortedByOrdering(
-    const QLSeqValuePB& options, const Schema& schema, bool is_forward_scan,
-    const std::vector<int>& col_idxs) {
-  std::vector<const QLValuePB*> options_elems;
-  options_elems.reserve(options.elems_size());
-  for (const auto& value : options.elems()) {
-    options_elems.push_back(&value);
-  }
-  std::sort(
-      options_elems.begin(), options_elems.end(),
-      [&schema, is_forward_scan, &col_idxs](const auto& t1, const auto& t2) {
-        DCHECK(t1->has_tuple_value());
-        DCHECK(t2->has_tuple_value());
-        const auto& tuple1 = t1->tuple_value();
-        const auto& tuple2 = t2->tuple_value();
-        DCHECK(tuple1.elems().size() == tuple2.elems().size());
-        auto li = tuple1.elems().begin();
-        auto ri = tuple2.elems().begin();
-        int i = 0;
-        int cmp = 0;
-        for (i = 0; i < tuple1.elems().size(); ++i, ++li, ++ri) {
-          if (IsNull(*li)) {
-            if (!IsNull(*ri)) {
-              cmp = 1;
-              break;
-            }
-          } else {
-            if (IsNull(*ri)) {
-              cmp = 0;
-              break;
-            }
-            int result = Compare(*li, *ri);
-            if (result != 0) {
-              cmp = (result < 0);
-              break;
-            }
-          }
-        }
-
-        if (i != tuple1.elems().size()) {
-          auto sorting_type = schema.column(col_idxs[i]).sorting_type();
-          auto is_reverse_order = is_forward_scan ^ (sorting_type == SortingType::kAscending ||
-                                                     sorting_type == kAscendingNullsLast);
-          cmp ^= is_reverse_order;
-        }
-        return cmp;
-      });
-  return options_elems;
-}
-
-template <class PB>
-int TupleCompare(const PB& lhs_tuple, const PB& rhs_tuple) {
-  DCHECK(lhs_tuple.elems().size() == rhs_tuple.elems().size());
-  auto li = lhs_tuple.elems().begin();
-  auto ri = rhs_tuple.elems().begin();
-  for (auto i = lhs_tuple.elems().size(); i > 0; --i, ++li, ++ri) {
-    if (IsNull(*li)) {
-      if (!IsNull(*ri)) {
-        return -1;
-      }
-    } else {
-      if (IsNull(*ri)) {
-        return 1;
-      }
-      int result = Compare(*li, *ri);
-      if (result != 0) {
-        return result;
-      }
-    }
-  }
-  return 0;
-}
-
-template <class Seq>
-int SeqCompare(const Seq& lhs, const Seq& rhs) {
+template <class Seq1, class Seq2>
+int SeqCompare(const Seq1& lhs, const Seq2& rhs) {
   // Compare elements one by one.
-  auto min_size = std::min(lhs.elems().size(), rhs.elems().size());
+  auto min_size = std::min<size_t>(lhs.elems().size(), rhs.elems().size());
   auto li = lhs.elems().begin();
   auto ri = rhs.elems().begin();
   for (auto i = min_size; i > 0; --i, ++li, ++ri) {
@@ -1042,11 +957,18 @@ int SeqCompare(const Seq& lhs, const Seq& rhs) {
   }
 
   // If elements are equal, compare lengths.
-  return GenericCompare(lhs.elems().size(), rhs.elems().size());
+  return GenericCompare(
+      static_cast<size_t>(lhs.elems().size()), static_cast<size_t>(rhs.elems().size()));
 }
 
-template <class PB>
-int DoCompare(const PB& lhs, const PB& rhs) {
+template <class PB1, class PB2>
+int TupleCompare(const PB1& lhs_tuple, const PB2& rhs_tuple) {
+  DCHECK_EQ(lhs_tuple.elems().size(), rhs_tuple.elems().size());
+  return SeqCompare(lhs_tuple, rhs_tuple);
+}
+
+template <class PB1, class PB2>
+int DoCompare(const PB1& lhs, const PB2& rhs) {
   if (rhs.value_case() == QLValuePB::kVirtualValue &&
       lhs.value_case() != QLValuePB::kVirtualValue) {
     return -DoCompare(rhs, lhs);
@@ -1116,6 +1038,8 @@ int DoCompare(const PB& lhs, const PB& rhs) {
       break;
     case QLValuePB::kGinNullValue:
       return GenericCompare(lhs.gin_null_value(), rhs.gin_null_value());
+    case QLValuePB::kBsonValue:
+      return lhs.bson_value().compare(rhs.bson_value());
 
     // default: fall through
   }
@@ -1202,6 +1126,8 @@ int Compare(const QLValuePB& lhs, const QLValue& rhs) {
       break;
     case QLValuePB::kGinNullValue:
       return GenericCompare<uint8_t>(lhs.gin_null_value(), rhs.gin_null_value());
+    case QLValuePB::kBsonValue:
+      return lhs.bson_value().compare(rhs.bson_value());
 
     // default: fall through
   }
@@ -1288,6 +1214,17 @@ bool operator ==(const LWQLValuePB& lhs, const LWQLValuePB& rhs) {
   return !IsNull(rhs) && DoCompare(lhs, rhs) == 0;
 }
 
+bool operator ==(const QLValuePB& lhs, const LWQLValuePB& rhs) {
+  if (IsNull(lhs)) {
+    return IsNull(rhs);
+  }
+  return !IsNull(rhs) && DoCompare(lhs, rhs) == 0;
+}
+
+bool operator ==(const LWQLValuePB& lhs, const QLValuePB& rhs) {
+  return rhs == lhs;
+}
+
 bool operator !=(const LWQLValuePB& lhs, const LWQLValuePB& rhs) {
   return !(lhs == rhs);
 }
@@ -1305,6 +1242,14 @@ void ConcatStrings(const Slice& lhs, const Slice& rhs, LWQLValuePB* result) {
   memcpy(data, lhs.cdata(), lhs.size());
   memcpy(data + lhs.size(), rhs.cdata(), rhs.size());
   result->ref_string_value(Slice(data, lhs.size() + rhs.size()));
+}
+
+void SetStringValue(QLValuePB& key, std::string_view value) {
+  key.set_string_value(value.data(), value.size());
+}
+
+void SetStringValue(LWQLValuePB& key, std::string_view value) {
+  key.dup_string_value(value);
 }
 
 } // namespace yb

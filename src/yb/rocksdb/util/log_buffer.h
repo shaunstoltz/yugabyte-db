@@ -3,9 +3,9 @@
 // LICENSE file in the root directory of this source tree. An additional grant
 // of patent rights can be found in the PATENTS file in the same directory.
 //
-// The following only applies to changes made to this file as part of YugaByte development.
+// The following only applies to changes made to this file as part of YugabyteDB development.
 //
-// Portions Copyright (c) YugaByte, Inc.
+// Portions Copyright (c) YugabyteDB, Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License"); you may not use this file except
 // in compliance with the License.  You may obtain a copy of the License at
@@ -27,6 +27,10 @@
 
 #define LOG_TO_BUFFER(...) LogToBufferWithContext(__FILE__, __LINE__, ##__VA_ARGS__)
 
+// LOG_TO_BUFFER_DETAIL logs at DETAIL_LEVEL. This internally uses INFO level
+// logging with a "DETAIL: " prefix.
+#define LOG_TO_BUFFER_DETAIL(...) LogToBufferWithContextDetail(__FILE__, __LINE__, ##__VA_ARGS__)
+
 namespace rocksdb {
 
 class Logger;
@@ -40,12 +44,22 @@ class LogBuffer {
 
   ~LogBuffer();
 
-  // Add a log entry to the buffer. Use default max_log_size.
+  // Add a log entry to the buffer at the buffer's default log level.
+  // Use default max_log_size.
   // max_log_size indicates maximize log size, including some metadata.
   void AddLogToBuffer(
       const char* file,
       const int line,
       size_t max_log_size,
+      const char* format,
+      va_list ap);
+
+  // Add a log entry to the buffer at a specific log level.
+  void AddLogToBuffer(
+      const char* file,
+      const int line,
+      size_t max_log_size,
+      InfoLogLevel entry_log_level,
       const char* format,
       va_list ap);
 
@@ -58,12 +72,13 @@ class LogBuffer {
     return offsetof(BufferedLog, message);
   }
  private:
-  // One log entry with its timestamp
+  // One log entry with its timestamp and log level
   struct BufferedLog {
     const char* file_;
     int line_;
-    struct timeval now_tv;  // Timestamp of the log
-    char message[1];        // Beginning of log message
+    InfoLogLevel log_level_;  // Per-entry log level
+    struct timeval now_tv;    // Timestamp of the log
+    char message[1];          // Beginning of log message
   };
 
   const InfoLogLevel log_level_;
@@ -84,6 +99,22 @@ extern void LogToBufferWithContext(
     ...);
 // Same as previous function, but with default max log size.
 extern void LogToBufferWithContext(
+    const char* file,
+    const int line,
+    LogBuffer* log_buffer,
+    const char* format,
+    ...);
+
+// Add a DETAIL level log to the LogBuffer with delayed logging.
+extern void LogToBufferWithContextDetail(
+    const char* file,
+    const int line,
+    LogBuffer* log_buffer,
+    size_t max_log_size,
+    const char* format,
+    ...);
+// Same as previous function, but with default max log size.
+extern void LogToBufferWithContextDetail(
     const char* file,
     const int line,
     LogBuffer* log_buffer,

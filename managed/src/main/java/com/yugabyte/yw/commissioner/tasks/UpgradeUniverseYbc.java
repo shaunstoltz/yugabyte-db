@@ -1,12 +1,11 @@
-// Copyright (c) YugaByte, Inc.
+// Copyright (c) YugabyteDB, Inc.
 
 package com.yugabyte.yw.commissioner.tasks;
 
 import com.google.inject.Inject;
 import com.yugabyte.yw.commissioner.BaseTaskDependencies;
 import com.yugabyte.yw.commissioner.UserTaskDetails.SubTaskGroupType;
-import com.yugabyte.yw.common.ReleaseManager;
-import com.yugabyte.yw.common.YbcManager;
+import com.yugabyte.yw.common.backuprestore.ybc.YbcManager;
 import com.yugabyte.yw.common.utils.Pair;
 import com.yugabyte.yw.forms.UniverseDefinitionTaskParams;
 import com.yugabyte.yw.models.Universe;
@@ -15,7 +14,6 @@ import lombok.extern.slf4j.Slf4j;
 @Slf4j
 public class UpgradeUniverseYbc extends UniverseTaskBase {
 
-  @Inject private ReleaseManager releaseManager;
   @Inject private YbcManager ybcManager;
 
   @Inject
@@ -35,12 +33,13 @@ public class UpgradeUniverseYbc extends UniverseTaskBase {
       // to lock out the universe completely in case this task fails.
       lockUniverse(-1 /* expectedUniverseVersion */);
 
-      Universe universe = Universe.getOrBadRequest(taskParams().universeUUID);
+      Universe universe = Universe.getOrBadRequest(taskParams().getUniverseUUID());
       UniverseDefinitionTaskParams universeDetails = universe.getUniverseDetails();
 
-      if (!universeDetails.enableYbc || !universeDetails.ybcInstalled) {
+      if (!universeDetails.isEnableYbc() || !universeDetails.isYbcInstalled()) {
         throw new RuntimeException(
-            "Ybc is either not installed or enabled on the universe: " + universe.universeUUID);
+            "Ybc is either not installed or enabled on the universe: "
+                + universe.getUniverseUUID());
       }
 
       // Check whether the target ybc version is present in YB-Anywhere for each node.
@@ -51,13 +50,13 @@ public class UpgradeUniverseYbc extends UniverseTaskBase {
                 Pair<String, String> ybcPackageDetails =
                     ybcManager.getYbcPackageDetailsForNode(universe, node);
                 if (releaseManager.getYbcReleaseByVersion(
-                        taskParams().ybcSoftwareVersion,
+                        taskParams().getYbcSoftwareVersion(),
                         ybcPackageDetails.getFirst(),
                         ybcPackageDetails.getSecond())
                     == null) {
                   throw new RuntimeException(
                       "Target ybc package "
-                          + taskParams().ybcSoftwareVersion
+                          + taskParams().getYbcSoftwareVersion()
                           + " does not exists for node"
                           + node.nodeName);
                 }
@@ -65,8 +64,8 @@ public class UpgradeUniverseYbc extends UniverseTaskBase {
 
       // create task for upgrading ybc version on universe.
       createUpgradeYbcTask(
-              taskParams().universeUUID,
-              taskParams().ybcSoftwareVersion,
+              taskParams().getUniverseUUID(),
+              taskParams().getYbcSoftwareVersion(),
               false /* ValidateOnlyMasterLeader */)
           .setSubTaskGroupType(SubTaskGroupType.UpgradingYbc);
 

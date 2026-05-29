@@ -1,5 +1,5 @@
 //--------------------------------------------------------------------------------------------------
-// Copyright (c) YugaByte, Inc.
+// Copyright (c) YugabyteDB, Inc.
 //--------------------------------------------------------------------------------------------------
 
 #include "yb/docdb/doc_expr.h"
@@ -25,11 +25,26 @@
 #include "yb/util/date_time.h"
 #include "yb/util/decimal.h"
 #include "yb/util/enums.h"
+#include "yb/util/flags.h"
 #include "yb/util/logging.h"
+#include "yb/util/memory/arena.h"
 #include "yb/util/net/inetaddress.h"
 #include "yb/util/result.h"
+#include "yb/util/size_literals.h"
 #include "yb/util/status_format.h"
 #include "yb/util/uuid.h"
+
+using namespace yb::size_literals;
+
+DEFINE_RUNTIME_uint64(aggregate_arena_reset_threshold_bytes, 16_KB,
+    "When the aggregate-private arena grows beyond this footprint (in bytes), it is replaced "
+    "with a fresh arena and the running aggregate values are migrated. Bounds the peak memory "
+    "consumed while scanning many rows for SUM/MIN/MAX/AVG/COUNT.");
+
+DEFINE_RUNTIME_uint64(aggregate_arena_reset_min_invocations, 5,
+    "Minimum number of PrepareAggregateResults invocations that must elapse between aggregate "
+    "arena recreations. Avoids paying the migration cost on short aggregate scans where the "
+    "footprint check might otherwise trip on a single oversized row.");
 
 using std::string;
 using std::vector;
@@ -37,47 +52,63 @@ using std::vector;
 namespace yb {
 namespace docdb {
 
-using yb::util::Decimal;
+using util::Decimal;
+using qlexpr::QLExprResult;
+using qlexpr::QLTableRow;
 
 //--------------------------------------------------------------------------------------------------
 
-DocExprExecutor::DocExprExecutor() {}
+DocExprExecutor::DocExprExecutor() = default;
 
-DocExprExecutor::~DocExprExecutor() {}
+DocExprExecutor::~DocExprExecutor() = default;
 
-Status DocExprExecutor::EvalColumnRef(ColumnIdRep col_id,
-                                      const QLTableRow* table_row,
-                                      QLExprResultWriter result_writer) {
-  // Return NULL value if row is not provided.
-  if (table_row == nullptr) {
-    result_writer.SetNull();
-    return Status::OK();
+void DocExprExecutor::PrepareAggregateResults(size_t size) {
+  DCHECK(aggr_result_.empty() || aggr_result_.size() == size);
+  ++aggr_invocations_since_reset_;
+
+  if (aggr_result_arena_ &&
+      aggr_invocations_since_reset_ >= FLAGS_aggregate_arena_reset_min_invocations &&
+      aggr_result_arena_->memory_footprint() >= FLAGS_aggregate_arena_reset_threshold_bytes) {
+    auto new_arena = SharedThreadSafeArena();
+    std::vector<qlexpr::LWExprResult> new_results;
+    new_results.reserve(aggr_result_.size());
+    for (auto& old_result : aggr_result_) {
+      auto& new_result = new_results.emplace_back(new_arena.get());
+      old_result.MoveTo(&new_result.Writer().NewValue());
+    }
+    aggr_result_ = std::move(new_results);
+    aggr_result_arena_ = std::move(new_arena);
+    aggr_invocations_since_reset_ = 0;
+  } else if (!aggr_result_arena_) {
+    aggr_result_arena_ = SharedThreadSafeArena();
+    aggr_result_.reserve(size);
+    while (aggr_result_.size() < size) {
+      aggr_result_.emplace_back(aggr_result_arena_.get());
+    }
   }
-
-  // Read value from given row.
-  if (col_id >= 0) {
-    return table_row->ReadColumn(col_id, result_writer);
-  }
-
-  // Read key of the given row.
-  if (col_id == static_cast<int>(PgSystemAttrNum::kYBTupleId)) {
-    return GetTupleId(&result_writer.NewValue());
-  }
-
-  return STATUS_SUBSTITUTE(InvalidArgument, "Invalid column ID: $0", col_id);
-}
-
-Status DocExprExecutor::GetTupleId(QLValuePB *result) const {
-  SetNull(result);
-  return Status::OK();
 }
 
 //--------------------------------------------------------------------------------------------------
 
 Status DocExprExecutor::EvalTSCall(const QLBCallPB& tscall,
                                    const QLTableRow& table_row,
-                                   QLValuePB *result,
-                                   const Schema *schema) {
+                                   QLValuePB* result,
+                                   const Schema* schema) {
+  return DoEvalTSCall(tscall, table_row, result, schema);
+}
+
+Status DocExprExecutor::EvalTSCall(const LWQLBCallPB& tscall,
+                                   const QLTableRow& table_row,
+                                   LWQLValuePB* result,
+                                   const Schema* schema) {
+  return DoEvalTSCall(tscall, table_row, result, schema);
+}
+
+template <class PB, class Value>
+Status DocExprExecutor::DoEvalTSCall(const PB& tscall,
+                                     const QLTableRow& table_row,
+                                     Value* result,
+                                     const Schema *schema) {
   bfql::TSOpcode tsopcode = static_cast<bfql::TSOpcode>(tscall.opcode());
   switch (tsopcode) {
     case bfql::TSOpcode::kNoOp:
@@ -89,7 +120,7 @@ Status DocExprExecutor::EvalTSCall(const QLBCallPB& tscall,
     case bfql::TSOpcode::kTtl: {
       DCHECK_EQ(tscall.operands().size(), 1) << "WriteTime takes only one argument, a column";
       int64_t ttl_seconds = -1;
-      RETURN_NOT_OK(table_row.GetTTL(tscall.operands(0).column_id(), &ttl_seconds));
+      RETURN_NOT_OK(table_row.GetTTL(tscall.operands().begin()->column_id(), &ttl_seconds));
       if (ttl_seconds != -1) {
         result->set_int64_value(ttl_seconds);
       } else {
@@ -101,16 +132,16 @@ Status DocExprExecutor::EvalTSCall(const QLBCallPB& tscall,
     case bfql::TSOpcode::kWriteTime: {
       DCHECK_EQ(tscall.operands().size(), 1) << "WriteTime takes only one argument, a column";
       int64_t write_time = 0;
-      RETURN_NOT_OK(table_row.GetWriteTime(tscall.operands(0).column_id(), &write_time));
+      RETURN_NOT_OK(table_row.GetWriteTime(tscall.operands().begin()->column_id(), &write_time));
       result->set_int64_value(write_time);
       return Status::OK();
     }
 
     case bfql::TSOpcode::kCount:
-      if (tscall.operands(0).has_column_id()) {
+      if (tscall.operands().begin()->has_column_id()) {
         // Check if column value is NULL. CQL does not count NULL value of a column.
-        QLExprResult arg_result;
-        RETURN_NOT_OK(EvalExpr(tscall.operands(0), table_row, arg_result.Writer()));
+        qlexpr::ExprResult<Value> arg_result(result);
+        RETURN_NOT_OK(EvalExpr(*tscall.operands().begin(), table_row, arg_result.Writer()));
         if (IsNull(arg_result.Value())) {
           return Status::OK();
         }
@@ -118,26 +149,26 @@ Status DocExprExecutor::EvalTSCall(const QLBCallPB& tscall,
       return EvalCount(result);
 
     case bfql::TSOpcode::kSum: {
-      QLExprResult arg_result;
-      RETURN_NOT_OK(EvalExpr(tscall.operands(0), table_row, arg_result.Writer()));
+      qlexpr::ExprResult<Value> arg_result(result);
+      RETURN_NOT_OK(EvalExpr(*tscall.operands().begin(), table_row, arg_result.Writer()));
       return EvalSum(arg_result.Value(), result);
     }
 
     case bfql::TSOpcode::kMin: {
-      QLExprResult arg_result;
-      RETURN_NOT_OK(EvalExpr(tscall.operands(0), table_row, arg_result.Writer()));
+      qlexpr::ExprResult<Value> arg_result(result);
+      RETURN_NOT_OK(EvalExpr(*tscall.operands().begin(), table_row, arg_result.Writer()));
       return EvalMin(arg_result.Value(), result);
     }
 
     case bfql::TSOpcode::kMax: {
-      QLExprResult arg_result;
-      RETURN_NOT_OK(EvalExpr(tscall.operands(0), table_row, arg_result.Writer()));
+      qlexpr::ExprResult<Value> arg_result(result);
+      RETURN_NOT_OK(EvalExpr(*tscall.operands().begin(), table_row, arg_result.Writer()));
       return EvalMax(arg_result.Value(), result);
     }
 
     case bfql::TSOpcode::kAvg: {
-      QLExprResult arg_result;
-      RETURN_NOT_OK(EvalExpr(tscall.operands(0), table_row, arg_result.Writer()));
+      qlexpr::ExprResult<Value> arg_result(result);
+      RETURN_NOT_OK(EvalExpr(*tscall.operands().begin(), table_row, arg_result.Writer()));
       return EvalAvg(arg_result.Value(), result);
     }
 
@@ -147,35 +178,33 @@ Status DocExprExecutor::EvalTSCall(const QLBCallPB& tscall,
     case bfql::TSOpcode::kSetRemove: FALLTHROUGH_INTENDED;
     case bfql::TSOpcode::kListAppend: {
       // Return the value of the second operand. The first operand must be a column ID.
-      QLExprResult temp;
-      RETURN_NOT_OK(EvalExpr(tscall.operands(1), table_row, temp.Writer()));
+      qlexpr::ExprResult<Value> temp(result);
+      RETURN_NOT_OK(EvalExpr(*std::next(tscall.operands().begin()), table_row, temp.Writer()));
       temp.MoveTo(result);
       return Status::OK();
     }
     case bfql::TSOpcode::kListPrepend: {
       // Return the value of the first operand. The second operand is a column ID.
-      QLExprResult temp;
-      RETURN_NOT_OK(EvalExpr(tscall.operands(0), table_row, temp.Writer()));
+      qlexpr::ExprResult<Value> temp(result);
+      RETURN_NOT_OK(EvalExpr(*tscall.operands().begin(), table_row, temp.Writer()));
       temp.MoveTo(result);
       return Status::OK();
     }
     case bfql::TSOpcode::kListRemove: {
-      QLExprResult org_list_result;
-      QLExprResult sub_list_result;
+      qlexpr::ExprResult<Value> org_list_result(result);
+      qlexpr::ExprResult<Value> sub_list_result(result);
       RETURN_NOT_OK(EvalOperands(
           this, tscall.operands(), table_row, org_list_result.Writer(), sub_list_result.Writer()));
-      QLValue org_list_value;
-      QLValue sub_list_value;
-      org_list_result.MoveTo(org_list_value.mutable_value());
-      sub_list_result.MoveTo(sub_list_value.mutable_value());
+      const auto& org_list_value = org_list_result.Value();
+      const auto& sub_list_value = sub_list_result.Value();
 
       result->mutable_list_value();
-      if (!org_list_value.IsNull() && !sub_list_value.IsNull()) {
-        QLSeqValuePB* org_list = org_list_value.mutable_list_value();
-        QLSeqValuePB* sub_list = sub_list_value.mutable_list_value();
-        for (QLValuePB& org_elem : *org_list->mutable_elems()) {
+      if (!IsNull(org_list_value) && !IsNull(sub_list_value)) {
+        const auto& org_list = org_list_value.list_value();
+        const auto& sub_list = sub_list_value.list_value();
+        for (const auto& org_elem : org_list.elems()) {
           bool should_remove = false;
-          for (QLValuePB& sub_elem : *sub_list->mutable_elems()) {
+          for (const auto& sub_elem : sub_list.elems()) {
             if (org_elem == sub_elem) {
               should_remove = true;
               break;
@@ -190,8 +219,7 @@ Status DocExprExecutor::EvalTSCall(const QLBCallPB& tscall,
     }
 
     case bfql::TSOpcode::kToJson:
-      *result = VERIFY_RESULT(EvalParametricToJson(tscall.operands(0), table_row, schema));
-      return Status::OK();
+      return EvalParametricToJson(*tscall.operands().begin(), table_row, schema, result);
   }
 
   SetNull(result);
@@ -199,9 +227,24 @@ Status DocExprExecutor::EvalTSCall(const QLBCallPB& tscall,
 }
 
 Status DocExprExecutor::EvalTSCall(const PgsqlBCallPB& tscall,
-                                   const QLTableRow& table_row,
-                                   QLValuePB *result,
+                                   const dockv::PgTableRow& table_row,
+                                   QLValuePB* result,
                                    const Schema *schema) {
+  return DoEvalTSCall(tscall, table_row, result, schema);
+}
+
+Status DocExprExecutor::EvalTSCall(const LWPgsqlBCallPB& tscall,
+                                   const dockv::PgTableRow& table_row,
+                                   LWQLValuePB* result,
+                                   const Schema *schema) {
+  return DoEvalTSCall(tscall, table_row, result, schema);
+}
+
+template <class PB, class Value>
+Status DocExprExecutor::DoEvalTSCall(const PB& tscall,
+                                     const dockv::PgTableRow& table_row,
+                                     Value* result,
+                                     const Schema *schema) {
   bfpg::TSOpcode tsopcode = static_cast<bfpg::TSOpcode>(tscall.opcode());
   switch (tsopcode) {
     case bfpg::TSOpcode::kCount: {
@@ -209,7 +252,7 @@ Status DocExprExecutor::EvalTSCall(const PgsqlBCallPB& tscall,
       if (operand.has_column_id()) {
         // Check if column value is NULL. Postgres does not count NULL value of a column, unless
         // it's COUNT(*).
-        QLExprResult arg_result(result);
+        qlexpr::ExprResult<Value> arg_result(result);
         RETURN_NOT_OK(EvalExpr(operand, table_row, arg_result.Writer()));
         if (IsNull(arg_result.Value())) {
           return Status::OK();
@@ -254,13 +297,13 @@ Status DocExprExecutor::EvalTSCall(const PgsqlBCallPB& tscall,
           [](double value, auto* out) { return out->set_double_value(value); });
 
     case bfpg::TSOpcode::kMin: {
-      QLExprResult arg_result(result);
+      qlexpr::ExprResult<Value> arg_result(result);
       RETURN_NOT_OK(EvalExpr(*tscall.operands().begin(), table_row, arg_result.Writer()));
       return EvalMin(arg_result.Value(), result);
     }
 
     case bfpg::TSOpcode::kMax: {
-      QLExprResult arg_result(result);
+      qlexpr::ExprResult<Value> arg_result(result);
       RETURN_NOT_OK(EvalExpr(*tscall.operands().begin(), table_row, arg_result.Writer()));
       return EvalMax(arg_result.Value(), result);
     }
@@ -284,8 +327,8 @@ Status DocExprExecutor::EvalTSCall(const PgsqlBCallPB& tscall,
 
 //--------------------------------------------------------------------------------------------------
 
-template <class Val>
-Status DocExprExecutor::EvalCount(Val *aggr_count) {
+template <class Value>
+Status DocExprExecutor::EvalCount(Value* aggr_count) {
   if (IsNull(*aggr_count)) {
     aggr_count->set_int64_value(1);
   } else {
@@ -294,8 +337,8 @@ Status DocExprExecutor::EvalCount(Val *aggr_count) {
   return Status::OK();
 }
 
-template <class Val>
-Status DocExprExecutor::EvalSum(const Val& val, Val *aggr_sum) {
+template <class Value>
+Status DocExprExecutor::EvalSum(const Value& val, Value* aggr_sum) {
   if (IsNull(val)) {
     return Status::OK();
   }
@@ -318,10 +361,15 @@ Status DocExprExecutor::EvalSum(const Val& val, Val *aggr_sum) {
     case InternalType::kInt64Value:
       aggr_sum->set_int64_value(aggr_sum->int64_value() + val.int64_value());
       break;
-    case InternalType::kVarintValue:
-      aggr_sum->set_varint_value(
-          (QLValue::varint_value(*aggr_sum) + QLValue::varint_value(val)).EncodeToComparable());
+    case InternalType::kVarintValue: {
+      auto value = (QLValue::varint_value(*aggr_sum) + QLValue::varint_value(val));
+      if constexpr (std::is_same_v<Value, QLValuePB>) {
+        aggr_sum->set_varint_value(value.EncodeToComparable());
+      } else {
+        aggr_sum->dup_varint_value(value.EncodeToComparable());
+      }
       break;
+    }
     case InternalType::kFloatValue:
       aggr_sum->set_float_value(aggr_sum->float_value() + val.float_value());
       break;
@@ -333,7 +381,11 @@ Status DocExprExecutor::EvalSum(const Val& val, Val *aggr_sum) {
       RETURN_NOT_OK(sum.DecodeFromComparable(aggr_sum->decimal_value()));
       RETURN_NOT_OK(value.DecodeFromComparable(val.decimal_value()));
       sum = sum + value;
-      aggr_sum->set_decimal_value(sum.EncodeToComparable());
+      if constexpr (std::is_same_v<Value, QLValuePB>) {
+        aggr_sum->set_decimal_value(sum.EncodeToComparable());
+      } else {
+        aggr_sum->dup_decimal_value(sum.EncodeToComparable());
+      }
       break;
     }
     default:
@@ -342,11 +394,11 @@ Status DocExprExecutor::EvalSum(const Val& val, Val *aggr_sum) {
   return Status::OK();
 }
 
-template <class Expr, class Val, class Extractor>
+template <class Expr, class Row, class Value, class Extractor>
 Status DocExprExecutor::EvalSumInt(
-    const Expr& operand, const QLTableRow& table_row, Val *aggr_sum,
+    const Expr& operand, const Row& table_row, Value* aggr_sum,
     const Extractor& extractor) {
-  ExprResult<Val> arg_result(aggr_sum);
+  qlexpr::ExprResult<Value> arg_result(aggr_sum);
   RETURN_NOT_OK(EvalExpr(operand, table_row, arg_result.Writer()));
   const auto& val = arg_result.Value();
 
@@ -363,11 +415,11 @@ Status DocExprExecutor::EvalSumInt(
   return Status::OK();
 }
 
-template <class Expr, class Val, class Extractor, class Setter>
+template <class Expr, class Row, class Value, class Extractor, class Setter>
 Status DocExprExecutor::EvalSumReal(
-    const Expr& operand, const QLTableRow& table_row, Val *aggr_sum,
+    const Expr& operand, const Row& table_row, Value* aggr_sum,
     const Extractor& extractor, const Setter& setter) {
-  ExprResult<Val> arg_result(aggr_sum);
+  qlexpr::ExprResult<Value> arg_result(aggr_sum);
   RETURN_NOT_OK(EvalExpr(operand, table_row, arg_result.Writer()));
   const auto& val = arg_result.Value();
 
@@ -384,37 +436,38 @@ Status DocExprExecutor::EvalSumReal(
   return Status::OK();
 }
 
-template <class Val>
-Status DocExprExecutor::EvalMax(const Val& val, Val *aggr_max) {
+template <class Value>
+Status DocExprExecutor::EvalMax(const Value& val, Value* aggr_max) {
   if (!IsNull(val) && (IsNull(*aggr_max) || *aggr_max < val)) {
     *aggr_max = val;
   }
   return Status::OK();
 }
 
-template <class Val>
-Status DocExprExecutor::EvalMin(const Val& val, Val *aggr_min) {
+template <class Value>
+Status DocExprExecutor::EvalMin(const Value& val, Value* aggr_min) {
   if (!IsNull(val) && (IsNull(*aggr_min) || *aggr_min > val)) {
     *aggr_min = val;
   }
   return Status::OK();
 }
 
-template <class Val>
-Status DocExprExecutor::EvalAvg(const Val& val, Val *aggr_avg) {
+template <class Value>
+Status DocExprExecutor::EvalAvg(const Value& val, Value* aggr_avg) {
   if (IsNull(val)) {
     return Status::OK();
   }
 
-  if (IsNull(*aggr_avg)) {
-    aggr_avg->mutable_map_value()->add_keys()->set_int64_value(1);
-    *aggr_avg->mutable_map_value()->add_values() = val;
+  bool was_null = IsNull(*aggr_avg);
+  auto& map = *aggr_avg->mutable_map_value();
+  if (was_null) {
+    map.add_keys()->set_int64_value(1);
+    *map.add_values() = val;
     return Status::OK();
   }
 
-  QLMapValuePB* map = aggr_avg->mutable_map_value();
-  RETURN_NOT_OK(EvalSum(val, map->mutable_values(0)));
-  map->mutable_keys(0)->set_int64_value(map->keys(0).int64_value() + 1);
+  RETURN_NOT_OK(EvalSum(val, &*map.mutable_values()->begin()));
+  map.mutable_keys()->begin()->set_int64_value(map.keys().begin()->int64_value() + 1);
   return Status::OK();
 }
 
@@ -422,82 +475,120 @@ Status DocExprExecutor::EvalAvg(const Val& val, Val *aggr_avg) {
 
 namespace {
 
-void UnpackUDTAndFrozen(const QLType::SharedPtr& type, QLValuePB* value) {
+template <class Seq, class Value>
+void DoUnpackFronzenUDT(
+    const std::vector<std::string>& field_names, const Seq& seq, Value* value) {
+  DCHECK_EQ(seq.elems_size(), field_names.size());
+  auto& map = *value->mutable_map_value();
+
+  if (implicit_cast<size_t>(seq.elems_size()) == field_names.size()) {
+    int i = 0;
+    for (const auto& elem : seq.elems()) {
+      SetStringValue(*map.add_keys(), field_names[i]);
+      *map.add_values() = elem;
+      ++i;
+    }
+  }
+}
+
+void UnpackFrozenUDT(
+    const std::vector<std::string>& field_names, QLSeqValuePB seq, QLValuePB* value) {
+  DoUnpackFronzenUDT(field_names, seq, value);
+}
+
+void UnpackFrozenUDT(
+    const std::vector<std::string>& field_names, const LWQLSeqValuePB& seq, LWQLValuePB* value) {
+  DoUnpackFronzenUDT(field_names, seq, value);
+}
+
+void UnpackFrozenMap(const QLType& param_type, QLSeqValuePB seq, QLValuePB* value);
+void UnpackFrozenMap(const QLType& param_type, const LWQLSeqValuePB& seq, LWQLValuePB* value);
+
+template <class Value>
+void UnpackUDTAndFrozen(const QLType::SharedPtr& type, Value* value) {
   if (type->IsUserDefined() && value->value_case() == QLValuePB::kMapValue) {
     // Change MAP<field_index:field_value> into MAP<field_name:field_value>
     // in case of UDT.
-    const vector<string> field_names = type->udtype_field_names();
-    QLMapValuePB* map = value->mutable_map_value();
-    for (int i = 0; i < map->keys_size(); ++i) {
-      map->mutable_keys(i)->set_string_value(field_names[i]);
+    const auto& field_names = type->udtype_field_names();
+    auto& map = *value->mutable_map_value();
+    int i = 0;
+    auto value_it = map.mutable_values()->begin();
+    for (auto& key : *map.mutable_keys()) {
+      SetStringValue(key, field_names[i]);
+      // Unpack nested FROZEN<UDT>, FROZEN<MAP>, etc.
+      UnpackUDTAndFrozen(type->param_type(i), &*value_it);
+      ++i;
+      ++value_it;
     }
   } else if (type->IsFrozen() && value->value_case() == QLValuePB::kFrozenValue) {
     if (type->param_type()->IsUserDefined()) {
       // Change FROZEN[field_value,...] into MAP<field_name:field_value>
       // in case of FROZEN<UDT>.
-      const vector<string> field_names = type->param_type()->udtype_field_names();
-      QLSeqValuePB seq(value->frozen_value());
-      DCHECK_EQ(seq.elems_size(), field_names.size());
-      QLMapValuePB* map = value->mutable_map_value();
-
-      if (implicit_cast<size_t>(seq.elems_size()) == field_names.size()) {
-        for (int i = 0; i < seq.elems_size(); ++i) {
-          map->add_keys()->set_string_value(field_names[i]);
-          *(map->add_values()) = seq.elems(i);
-        }
-      }
-    } else if (type->param_type()->main() == MAP) {
+      UnpackFrozenUDT(type->param_type()->udtype_field_names(), value->frozen_value(), value);
+    } else if (type->param_type()->main() == DataType::MAP) {
       // Case: FROZEN<MAP>=[Key1,Value1,Key2,Value2] -> MAP<Key1:Value1, Key2:Value2>.
-      QLSeqValuePB seq(value->frozen_value());
-      DCHECK_EQ(seq.elems_size() % 2, 0);
-      QLMapValuePB* map = value->mutable_map_value();
-
-      for (int i = 0; i < seq.elems_size();) {
-        auto* const key = map->add_keys();
-        *key = seq.elems(i++);
-        UnpackUDTAndFrozen(type->param_type()->keys_type(), key);
-
-        auto* const value = map->add_values();
-        *value = seq.elems(i++);
-        UnpackUDTAndFrozen(type->param_type()->values_type(), value);
-      }
+      UnpackFrozenMap(*type->param_type(), value->frozen_value(), value);
     } else {
-      DCHECK(type->param_type()->main() == LIST || type->param_type()->main() == SET);
+      DCHECK(type->param_type()->main() == DataType::LIST ||
+             type->param_type()->main() == DataType::SET);
       // Case: FROZEN<LIST/SET>
-      QLSeqValuePB* seq = value->mutable_frozen_value();
-      for (int i = 0; i < seq->elems_size(); ++i) {
-        UnpackUDTAndFrozen(type->param_type()->param_type(), seq->mutable_elems(i));
+      for (auto& elem : *value->mutable_frozen_value()->mutable_elems()) {
+        UnpackUDTAndFrozen(type->param_type()->param_type(), &elem);
       }
     }
-  } else if (type->main() == LIST && value->value_case() == QLValuePB::kListValue) {
-    QLSeqValuePB* seq = value->mutable_list_value();
-    for (int i = 0; i < seq->elems_size(); ++i) {
-      UnpackUDTAndFrozen(type->param_type(), seq->mutable_elems(i));
+  } else if (type->main() == DataType::LIST && value->value_case() == QLValuePB::kListValue) {
+    for (auto& elem : *value->mutable_list_value()->mutable_elems()) {
+      UnpackUDTAndFrozen(type->param_type(), &elem);
     }
-  } else if (type->main() == SET && value->value_case() == QLValuePB::kSetValue) {
-    QLSeqValuePB* seq = value->mutable_set_value();
-    for (int i = 0; i < seq->elems_size(); ++i) {
-      UnpackUDTAndFrozen(type->param_type(), seq->mutable_elems(i));
+  } else if (type->main() == DataType::SET && value->value_case() == QLValuePB::kSetValue) {
+    for (auto& elem : *value->mutable_set_value()->mutable_elems()) {
+      UnpackUDTAndFrozen(type->param_type(), &elem);
     }
-  } else if (type->main() == MAP && value->value_case() == QLValuePB::kMapValue) {
-    QLMapValuePB* map = value->mutable_map_value();
-    DCHECK_EQ(map->keys_size(), map->values_size());
-    for (int i = 0; i < map->keys_size(); ++i) {
-      UnpackUDTAndFrozen(type->keys_type(), map->mutable_keys(i));
-      UnpackUDTAndFrozen(type->values_type(), map->mutable_values(i));
+  } else if (type->main() == DataType::MAP && value->value_case() == QLValuePB::kMapValue) {
+    auto& map = *value->mutable_map_value();
+    DCHECK_EQ(map.keys_size(), map.values_size());
+    for (auto& elem : *map.mutable_keys()) {
+      UnpackUDTAndFrozen(type->keys_type(), &elem);
     }
-  } else if (type->main() == TUPLE) {
+    for (auto& elem : *map.mutable_values()) {
+      UnpackUDTAndFrozen(type->values_type(), &elem);
+    }
+  } else if (type->main() == DataType::TUPLE) {
     // https://github.com/YugaByte/yugabyte-db/issues/936
     LOG(FATAL) << "Tuple type not implemented yet";
   }
 }
 
+template <class Seq, class Value>
+void DoUnpackFronzenMap(const QLType& param_type, const Seq& seq, Value* value) {
+  DCHECK_EQ(seq.elems_size() % 2, 0);
+  auto& map = *value->mutable_map_value();
+
+  for (auto it = seq.elems().begin(); it != seq.elems().end();) {
+    auto* const key = map.add_keys();
+    *key = *it++;
+    UnpackUDTAndFrozen(param_type.keys_type(), key);
+
+    auto* const val = map.add_values();
+    *val = *it++;
+    UnpackUDTAndFrozen(param_type.values_type(), val);
+  }
+}
+
+void UnpackFrozenMap(const QLType& param_type, QLSeqValuePB seq, QLValuePB* value) {
+  DoUnpackFronzenMap(param_type, seq, value);
+}
+
+void UnpackFrozenMap(const QLType& param_type, const LWQLSeqValuePB& seq, LWQLValuePB* value) {
+  DoUnpackFronzenMap(param_type, seq, value);
+}
+
 } // namespace
 
-Result<QLValuePB> DocExprExecutor::EvalParametricToJson(const QLExpressionPB& operand,
-                                                        const QLTableRow& table_row,
-                                                        const Schema *schema) {
-  QLExprResult val;
+template <class PB, class Value>
+Status DocExprExecutor::EvalParametricToJson(
+    const PB& operand, const QLTableRow& table_row, const Schema *schema, Value* value) {
+  qlexpr::ExprResult<Value> val(&operand);
   RETURN_NOT_OK(EvalExpr(operand, table_row, val.Writer(), schema));
 
   // Repack parametric types like UDT, FROZEN, SET<FROZEN>, etc.
@@ -511,7 +602,8 @@ Result<QLValuePB> DocExprExecutor::EvalParametricToJson(const QLExpressionPB& op
   }
 
   // Direct call of ToJson() for elementary type.
-  return bfql::ToJson(val.Value(), bfql::BFFactory());
+  *value = std::move(VERIFY_RESULT(bfql::ToJson(val.Value(), bfql::BFFactory())));
+  return Status::OK();
 }
 
 //--------------------------------------------------------------------------------------------------

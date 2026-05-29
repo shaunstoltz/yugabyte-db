@@ -1,7 +1,7 @@
 /*
  * Created on Thu Feb 10 2022
  *
- * Copyright 2021 YugaByte, Inc. and Contributors
+ * Copyright 2021 YugabyteDB, Inc. and Contributors
  * Licensed under the Polyform Free Trial License 1.0.0 (the "License")
  * You may not use this file except in compliance with the License. You may obtain a copy of the License at
  * http://github.com/YugaByte/yugabyte-db/blob/master/licenses/POLYFORM-FREE-TRIAL-LICENSE-1.0.0.txt
@@ -14,42 +14,56 @@ import { RemoteObjSpec, SortOrder, TableHeaderColumn } from 'react-bootstrap-tab
 import { useQuery } from 'react-query';
 import { useSelector } from 'react-redux';
 import Select, { OptionTypeBase } from 'react-select';
-import { Backup_States, getBackupsList, IBackup, TIME_RANGE_STATE } from '..';
+import clsx from 'clsx';
+import { Backup_States, IBackup, CustomerConfig, TIME_RANGE_STATE } from '..';
+import { getBackupsList } from '../common/BackupAPI';
 import { StatusBadge } from '../../common/badge/StatusBadge';
 import { YBButton, YBMultiSelectRedesiged } from '../../common/forms/fields';
 import { YBLoading } from '../../common/indicators';
-import { BackupDetails } from './BackupDetails';
+import { Box, Typography, makeStyles } from '@material-ui/core';
+import { YBTooltip } from '../../../redesign/components';
+import { BackupDetails, IncrementalBackupProps } from './BackupDetails';
 import {
   BACKUP_REFETCH_INTERVAL,
   BACKUP_STATUS_OPTIONS,
   CALDENDAR_ICON,
   convertArrayToMap,
+  convertBackupToFormValues,
   DATE_FORMAT,
   ENTITY_NOT_AVAILABLE,
-  FormatUnixTimeStampTimeToTimezone
+  isBackupPITREnabled
 } from '../common/BackupUtils';
-import './BackupList.scss';
 import { BackupCancelModal, BackupDeleteModal } from './BackupDeleteModal';
 import { BackupRestoreModal } from './BackupRestoreModal';
+import { default as BackupRestoreModalWithPITR } from '../../../redesign/features/backup/restore/BackupRestoreModal';
+import BackupRestoreNewModal from './restore/BackupRestoreNewModal';
 import { YBSearchInput } from '../../common/forms/fields/YBSearchInput';
 import { BackupCreateModal } from './BackupCreateModal';
 import { useSearchParam } from 'react-use';
 import { AssignBackupStorageConfig } from './AssignBackupStorageConfig';
-import { formatBytes } from '../../xcluster/ReplicationUtils';
-import clsx from 'clsx';
+import { formatBytes } from '@app/utils/Formatters';
+
 import { AccountLevelBackupEmpty, UniverseLevelBackupEmpty } from './BackupEmpty';
 import { YBTable } from '../../common/YBTable';
-import { find } from 'lodash';
+import { find, isEmpty, get } from 'lodash';
 import { fetchTablesInUniverse } from '../../../actions/xClusterReplication';
-import { TableTypeLabel } from '../../../redesign/helpers/dtos';
+import { api } from '../../../redesign/features/universe/universe-form/utils/api';
+import { AllowedTasks, TableTypeLabel } from '../../../redesign/helpers/dtos';
+import { ybFormatDate } from '../../../redesign/helpers/DateUtils';
+import {
+  RbacValidator,
+  customPermValidateFunction,
+  hasNecessaryPerm
+} from '../../../redesign/features/rbac/common/RbacApiPermValidator';
+import { ApiPermissionMap } from '../../../redesign/features/rbac/ApiAndUserPermMapping';
+import { Action, Resource } from '../../../redesign/features/rbac';
+import { TaskDetailSimpleComp } from '../../../redesign/features/tasks/components/TaskDetailSimpleComp';
+import { DateTimePicker } from 'react-widgets';
+import momentLocalizer from 'react-widgets-moment';
 
-// eslint-disable-next-line @typescript-eslint/no-var-requires
-const reactWidgets = require('react-widgets');
-// eslint-disable-next-line @typescript-eslint/no-var-requires
-const momentLocalizer = require('react-widgets-moment');
-require('react-widgets/dist/css/react-widgets.css');
+import './BackupList.scss';
+import 'react-widgets/dist/css/react-widgets.css';
 
-const { DateTimePicker } = reactWidgets;
 momentLocalizer(moment);
 
 const DEFAULT_SORT_COLUMN = 'createTime';
@@ -119,9 +133,49 @@ export const DEFAULT_TIME_STATE: TIME_RANGE_STATE = {
 interface BackupListOptions {
   allowTakingBackup?: boolean;
   universeUUID?: string;
+  allowedTasks: AllowedTasks;
 }
 
-export const BackupList: FC<BackupListOptions> = ({ allowTakingBackup, universeUUID }) => {
+const useTooltipStyles = makeStyles((theme) => ({
+  customWidth: {
+    maxWidth: 'none'
+  },
+  customWidthRolesMax: {
+    width: '264px',
+    height: '66px'
+  },
+  tooltipHeader: {
+    padding: theme.spacing(1.5, 2),
+    borderBottom: '1px solid #E5E5E9'
+  },
+  toolTipTitle: {
+    fontWeight: 600,
+    fontSize: 15
+  },
+  tooltipBody: {
+    display: 'flex',
+    flexDirection: 'column',
+    padding: theme.spacing(2.5, 2)
+  },
+  windowContainer: {
+    padding: theme.spacing(1.5, 2),
+    backgroundColor: '#F7F9FB',
+    borderRadius: '8px',
+    border: '1px solid #E5E5E9',
+    gap: '10px',
+    margin: theme.spacing(0.75, 0)
+  },
+  dottedBorder: {
+    borderBottom: '1px dotted #0B1117',
+    width: 'fit-content'
+  }
+}));
+
+export const BackupList: FC<BackupListOptions> = ({
+  allowTakingBackup,
+  universeUUID,
+  allowedTasks
+}) => {
   const [sizePerPage, setSizePerPage] = useState(10);
   const [page, setPage] = useState(1);
   const [searchText, setSearchText] = useState('');
@@ -133,11 +187,26 @@ export const BackupList: FC<BackupListOptions> = ({ allowTakingBackup, universeU
   const [showRestoreModal, setShowRestoreModal] = useState(false);
   const [showBackupCreateModal, setShowBackupCreateModal] = useState(false);
   const [showAssignConfigModal, setShowAssignConfigModal] = useState(false);
+  const [showEditBackupModal, setShowEditBackupModal] = useState(false);
   const [isRestoreEntireBackup, setRestoreEntireBackup] = useState(false);
+  const [incrementalBackupProps, setIncrementalBackupsProps] = useState<IncrementalBackupProps>({});
 
   const [selectedBackups, setSelectedBackups] = useState<IBackup[]>([]);
   const [status, setStatus] = useState<any[]>([BACKUP_STATUS_OPTIONS[0]]);
   const [moreFilters, setMoreFilters] = useState<any>([]);
+
+  const featureFlags = useSelector((state: any) => state.featureFlags);
+
+  const classes = useTooltipStyles();
+  const isNewRestoreModalEnabled =
+    featureFlags.test.enableNewRestoreModal || featureFlags.released.enableNewRestoreModal;
+
+  const { data: runtimeConfigs, isLoading: runtimeConfigLoading } = useQuery(
+    ['runtimeConfigs', universeUUID],
+    () => api.fetchRunTimeConfigs(true, universeUUID)
+  );
+
+  const enableBackupPITR = !runtimeConfigLoading && isBackupPITREnabled(runtimeConfigs!);
 
   const timeReducer = (_state: TIME_RANGE_STATE, action: OptionTypeBase) => {
     if (action.label === 'Custom') {
@@ -149,7 +218,7 @@ export const BackupList: FC<BackupListOptions> = ({ allowTakingBackup, universeU
 
     return {
       label: action.label,
-      startTime: moment().subtract(action.value[0], action.value[1]),
+      startTime: moment().subtract(action.value[0], action.value[1]).toDate(),
       endTime: new Date()
     };
   };
@@ -234,6 +303,21 @@ export const BackupList: FC<BackupListOptions> = ({ allowTakingBackup, universeU
     );
   };
 
+  const canCreateBackup = hasNecessaryPerm({
+    ...ApiPermissionMap.CREATE_BACKUP,
+    onResource: universeUUID ?? ''
+  });
+
+  const canDeleteBackup = hasNecessaryPerm(ApiPermissionMap.DELETE_BACKUP);
+
+  const canRestoreBackup = customPermValidateFunction(
+    (userPerm) =>
+      find(userPerm, { actions: [Action.BACKUP_RESTORE], resourceType: Resource.UNIVERSE }) !==
+      undefined
+  );
+
+  const canChangeRetentionPeriod = hasNecessaryPerm(ApiPermissionMap.EDIT_BACKUP);
+
   const getActions = (row: IBackup) => {
     if (row.commonBackupInfo.state === Backup_States.DELETED) {
       return '';
@@ -250,6 +334,7 @@ export const BackupList: FC<BackupListOptions> = ({ allowTakingBackup, universeU
         />
       );
     }
+
     return (
       <DropdownButton
         className="actions-btn"
@@ -259,44 +344,106 @@ export const BackupList: FC<BackupListOptions> = ({ allowTakingBackup, universeU
         pullRight
         onClick={(e) => e.stopPropagation()}
       >
-        <MenuItem
-          disabled={
-            row.commonBackupInfo.state !== Backup_States.COMPLETED || !row.isStorageConfigPresent
+        <RbacValidator
+          customValidateFunction={(userPerm) =>
+            find(userPerm, {
+              actions: [Action.BACKUP_RESTORE],
+              resourceType: Resource.UNIVERSE
+            }) !== undefined
           }
-          onClick={(e) => {
-            e.stopPropagation();
-            if (
+          isControl
+          overrideStyle={{ display: 'block' }}
+        >
+          <MenuItem
+            disabled={
               row.commonBackupInfo.state !== Backup_States.COMPLETED ||
-              !row.isStorageConfigPresent
-            ) {
-              return;
+              !row.isStorageConfigPresent ||
+              !canRestoreBackup
             }
-            setRestoreEntireBackup(true);
-            setRestoreDetails(row);
-            setShowRestoreModal(true);
-          }}
+            onClick={(e) => {
+              e.stopPropagation();
+              if (
+                row.commonBackupInfo.state !== Backup_States.COMPLETED ||
+                !row.isStorageConfigPresent ||
+                !canRestoreBackup
+              ) {
+                return;
+              }
+              setRestoreEntireBackup(true);
+              setRestoreDetails(row);
+              setShowRestoreModal(true);
+            }}
+          >
+            Restore Entire Backup
+          </MenuItem>
+        </RbacValidator>
+        <RbacValidator
+          accessRequiredOn={ApiPermissionMap.DELETE_BACKUP}
+          isControl
+          overrideStyle={{ display: 'block' }}
         >
-          Restore Entire Backup
-        </MenuItem>
-        <MenuItem
-          onClick={(e) => {
-            e.stopPropagation();
-            if (!row.isStorageConfigPresent) return;
-            setSelectedBackups([row]);
-            setShowDeleteModal(true);
-          }}
-          disabled={!row.isStorageConfigPresent}
-          className="action-danger"
+          <MenuItem
+            onClick={(e) => {
+              e.stopPropagation();
+              if (!row.isStorageConfigPresent || !canDeleteBackup) return;
+              setSelectedBackups([row]);
+              setShowDeleteModal(true);
+            }}
+            disabled={!row.isStorageConfigPresent || !canDeleteBackup}
+            className="action-danger"
+          >
+            Delete Backup
+          </MenuItem>
+        </RbacValidator>
+        <RbacValidator
+          accessRequiredOn={ApiPermissionMap.EDIT_BACKUP}
+          isControl
+          overrideStyle={{ display: 'block' }}
         >
-          Delete Backup
-        </MenuItem>
+          <MenuItem
+            onClick={(e) => {
+              e.stopPropagation();
+              if (
+                row.commonBackupInfo.state !== Backup_States.COMPLETED ||
+                !row.isStorageConfigPresent ||
+                !canChangeRetentionPeriod
+              ) {
+                return;
+              }
+
+              setSelectedBackups([row]);
+              setShowEditBackupModal(true);
+            }}
+            disabled={
+              row.commonBackupInfo.state !== Backup_States.COMPLETED ||
+              !row.isStorageConfigPresent ||
+              !canChangeRetentionPeriod
+            }
+          >
+            Change Retention Period
+          </MenuItem>
+        </RbacValidator>
       </DropdownButton>
     );
   };
 
   const backups: IBackup[] = backupsList?.data.entities.map((b: IBackup) => {
-    return { ...b, backupUUID: b.commonBackupInfo.backupUUID };
+    const windowPITRArr = b.commonBackupInfo.responseList.filter(
+      (r) => !isEmpty(r?.backupPointInTimeRestoreWindow)
+    );
+    const statusPITR = isEmpty(windowPITRArr) ? 'Not Enabled' : 'Enabled';
+    return { ...b, backupUUID: b.commonBackupInfo.backupUUID, statusPITR, windowPITRArr };
   });
+
+  const isBackupNotSucceeded = (state: Backup_States) =>
+    [
+      Backup_States.IN_PROGRESS,
+      Backup_States.STOPPING,
+      Backup_States.FAILED,
+      Backup_States.FAILED_TO_DELETE,
+      Backup_States.SKIPPED,
+      Backup_States.STOPPED
+    ].includes(state);
 
   if (!isFilterApplied() && backups?.length === 0) {
     return allowTakingBackup ? (
@@ -308,8 +455,10 @@ export const BackupList: FC<BackupListOptions> = ({ allowTakingBackup, universeU
           disabled={
             tablesInUniverse?.data.length === 0 ||
             currentUniverse?.data?.universeConfig?.takeBackups === 'false' ||
-            currentUniverse?.data?.universeDetails?.universePaused
+            currentUniverse?.data?.universeDetails?.universePaused ||
+            !canCreateBackup
           }
+          hasPerm={canCreateBackup}
         />
         <BackupCreateModal
           visible={showBackupCreateModal}
@@ -317,6 +466,7 @@ export const BackupList: FC<BackupListOptions> = ({ allowTakingBackup, universeU
             setShowBackupCreateModal(false);
           }}
           currentUniverseUUID={universeUUID}
+          allowedTasks={allowedTasks}
         />
       </>
     ) : (
@@ -422,28 +572,38 @@ export const BackupList: FC<BackupListOptions> = ({ allowTakingBackup, universeU
             defaultValue={TIME_RANGE_OPTIONS.find((t) => t.label === 'All time')}
             maxMenuHeight={300}
           ></Select>
-          <YBButton
-            btnText="Delete"
-            btnIcon="fa fa-trash-o"
-            onClick={() => setShowDeleteModal(true)}
-            disabled={selectedBackups.length === 0}
-          />
+          <RbacValidator accessRequiredOn={ApiPermissionMap.DELETE_BACKUP} isControl>
+            <YBButton
+              btnText="Delete"
+              btnIcon="fa fa-trash-o"
+              onClick={() => setShowDeleteModal(true)}
+              disabled={selectedBackups.length === 0}
+            />
+          </RbacValidator>
           {allowTakingBackup && (
             <>
-              <YBButton
-                loading={isTableListLoading}
-                btnText="Backup now"
-                onClick={() => {
-                  setShowBackupCreateModal(true);
+              <RbacValidator
+                accessRequiredOn={{
+                  onResource: universeUUID,
+                  ...ApiPermissionMap.CREATE_BACKUP
                 }}
-                btnClass="btn btn-orange backup-now-button"
-                btnIcon="fa fa-upload"
-                disabled={
-                  tablesInUniverse?.data.length === 0 ||
-                  currentUniverse?.data?.universeConfig?.takeBackups === 'false' ||
-                  currentUniverse?.data?.universeDetails?.universePaused
-                }
-              />
+                isControl
+              >
+                <YBButton
+                  loading={isTableListLoading}
+                  btnText="Backup now"
+                  onClick={() => {
+                    setShowBackupCreateModal(true);
+                  }}
+                  btnClass="btn btn-orange backup-now-button"
+                  btnIcon="fa fa-upload"
+                  disabled={
+                    tablesInUniverse?.data.length === 0 ||
+                    currentUniverse?.data?.universeConfig?.takeBackups === 'false' ||
+                    currentUniverse?.data?.universeDetails?.universePaused
+                  }
+                />
+              </RbacValidator>
             </>
           )}
         </div>
@@ -525,7 +685,9 @@ export const BackupList: FC<BackupListOptions> = ({ allowTakingBackup, universeU
             }
             width="20%"
           >
-            Incremental Backups
+            Incremental
+            <br />
+            Backups
           </TableHeaderColumn>
           <TableHeaderColumn
             dataField="backupType"
@@ -534,11 +696,76 @@ export const BackupList: FC<BackupListOptions> = ({ allowTakingBackup, universeU
           >
             API Type
           </TableHeaderColumn>
+          {enableBackupPITR && (
+            <TableHeaderColumn
+              dataField="statusPITR"
+              dataFormat={(statusPITR, row) => {
+                const startWindowTime = get(
+                  row,
+                  'windowPITRArr[0].backupPointInTimeRestoreWindow.timestampRetentionWindowStartMillis',
+                  false
+                );
+                const endWindowTime = get(
+                  row,
+                  'windowPITRArr[0].backupPointInTimeRestoreWindow.timestampRetentionWindowEndMillis',
+                  false
+                );
+                const windowExists = startWindowTime && endWindowTime;
+                return (
+                  <YBTooltip
+                    interactive={true}
+                    classes={{ tooltip: classes.customWidth }}
+                    title={
+                      windowExists ? (
+                        <Box display="flex" flexDirection="column" width="auto">
+                          <Box className={classes.tooltipHeader}>
+                            <Typography className={classes.toolTipTitle}>Restore Window</Typography>
+                          </Box>
+                          <Box className={classes.tooltipBody}>
+                            <Typography variant="body2">
+                              You may restore to any time between:
+                            </Typography>
+                            <Box className={classes.windowContainer}>
+                              <Typography variant="body2">
+                                <b>{ybFormatDate(startWindowTime)}</b> to &nbsp;
+                                <b>{ybFormatDate(endWindowTime)}</b>
+                              </Typography>
+                            </Box>
+                          </Box>
+                        </Box>
+                      ) : (
+                        ''
+                      )
+                    }
+                  >
+                    <div className={windowExists ? classes.dottedBorder : ''}>{statusPITR}</div>
+                  </YBTooltip>
+                );
+              }}
+              width="10%"
+              dataSort
+            >
+              Point-in-Time
+              <br />
+              Restore
+            </TableHeaderColumn>
+          )}
+          <TableHeaderColumn
+            dataField="useRoles"
+            dataFormat={(_, row: IBackup) => {
+              return (
+                <div onClick={(e) => e.stopPropagation()}>
+                  {row.useRoles ? 'Included' : 'Not Included'}
+                </div>
+              );
+            }}
+            width="12%"
+          >
+            Roles and Grants
+          </TableHeaderColumn>
           <TableHeaderColumn
             dataField="createTime"
-            dataFormat={(_, row: IBackup) => (
-              <FormatUnixTimeStampTimeToTimezone timestamp={row.commonBackupInfo.createTime} />
-            )}
+            dataFormat={(_, row: IBackup) => ybFormatDate(row.commonBackupInfo.createTime)}
             width="20%"
             dataSort
           >
@@ -546,9 +773,7 @@ export const BackupList: FC<BackupListOptions> = ({ allowTakingBackup, universeU
           </TableHeaderColumn>
           <TableHeaderColumn
             dataField="expiryTime"
-            dataFormat={(time) =>
-              time ? <FormatUnixTimeStampTimeToTimezone timestamp={time} /> : "Won't Expire"
-            }
+            dataFormat={(time) => (time ? ybFormatDate(time) : "Won't Expire")}
             width="20%"
           >
             Expiration
@@ -560,16 +785,23 @@ export const BackupList: FC<BackupListOptions> = ({ allowTakingBackup, universeU
                 row.fullChainSizeInBytes || row.commonBackupInfo.totalBackupSizeInBytes
               );
             }}
-            width="20%"
+            width="10%"
           >
             Size
           </TableHeaderColumn>
           <TableHeaderColumn
             dataField="lastBackupState"
-            dataFormat={(lastBackupState) => {
-              return <StatusBadge statusType={lastBackupState} />;
+            dataFormat={(lastBackupState, row: IBackup) => {
+              return (
+                <div onClick={(e) => e.stopPropagation()} className="backup-status">
+                  <StatusBadge statusType={lastBackupState} />
+                  {isBackupNotSucceeded(row.commonBackupInfo.state) && (
+                    <TaskDetailSimpleComp taskUUID={row.commonBackupInfo.taskUUID} />
+                  )}
+                </div>
+              );
             }}
-            width="15%"
+            width="25%"
           >
             Last Status
           </TableHeaderColumn>
@@ -592,8 +824,9 @@ export const BackupList: FC<BackupListOptions> = ({ allowTakingBackup, universeU
           setSelectedBackups([showDetails] as IBackup[]);
           setShowDeleteModal(true);
         }}
-        onRestore={(customDetails?: IBackup) => {
-          setRestoreEntireBackup(customDetails ? false : true);
+        onRestore={(customDetails?: IBackup, incrementalBackupProps?: IncrementalBackupProps) => {
+          setRestoreEntireBackup(incrementalBackupProps?.isRestoreEntireBackup ?? false);
+          setIncrementalBackupsProps(incrementalBackupProps ?? {});
           setRestoreDetails(customDetails ?? showDetails);
           setShowRestoreModal(true);
         }}
@@ -602,15 +835,21 @@ export const BackupList: FC<BackupListOptions> = ({ allowTakingBackup, universeU
           setShowAssignConfigModal(true);
         }}
         currentUniverseUUID={universeUUID}
+        onEdit={() => {
+          setSelectedBackups([showDetails] as IBackup[]);
+          setShowEditBackupModal(true);
+        }}
+        tablesInUniverse={tablesInUniverse?.data}
       />
       <BackupDeleteModal
         backupsList={selectedBackups}
         visible={showDeleteModal}
         onHide={() => setShowDeleteModal(false)}
       />
-      {restoreDetails && (
+      {!isNewRestoreModalEnabled && restoreDetails && (
         <BackupRestoreModal
           backup_details={restoreDetails}
+          allowedTasks={allowedTasks}
           visible={showRestoreModal}
           isRestoreEntireBackup={isRestoreEntireBackup}
           onHide={() => {
@@ -628,6 +867,7 @@ export const BackupList: FC<BackupListOptions> = ({ allowTakingBackup, universeU
         onHide={() => {
           setShowBackupCreateModal(false);
         }}
+        allowedTasks={allowedTasks}
         currentUniverseUUID={universeUUID}
       />
       <AssignBackupStorageConfig
@@ -637,6 +877,50 @@ export const BackupList: FC<BackupListOptions> = ({ allowTakingBackup, universeU
           setShowAssignConfigModal(false);
         }}
       />
+      <BackupCreateModal
+        allowedTasks={allowedTasks}
+        visible={showEditBackupModal}
+        onHide={() => setShowEditBackupModal(false)}
+        currentUniverseUUID={selectedBackups[0]?.universeUUID}
+        isEditBackupMode={true}
+        isEditMode={true}
+        isIncrementalBackup={selectedBackups[0]?.hasIncrementalBackups}
+        isScheduledBackup={selectedBackups.length !== 0 && !selectedBackups[0].onDemand}
+        editValues={
+          selectedBackups[0] &&
+          convertBackupToFormValues(
+            selectedBackups[0],
+            storageConfigs?.data.find((e: CustomerConfig) => {
+              return e.configUUID === selectedBackups[0].commonBackupInfo.storageConfigUUID;
+            })
+          )
+        }
+      />
+      {isNewRestoreModalEnabled &&
+        restoreDetails &&
+        (!enableBackupPITR ? (
+          <BackupRestoreNewModal
+            backupDetails={restoreDetails as any}
+            visible={true}
+            onHide={() => {
+              setRestoreDetails(null);
+              setRestoreEntireBackup(false);
+              setIncrementalBackupsProps({});
+            }}
+            incrementalBackupProps={incrementalBackupProps}
+          />
+        ) : (
+          <BackupRestoreModalWithPITR
+            backupDetails={restoreDetails as any}
+            onHide={() => {
+              setRestoreDetails(null);
+              setRestoreEntireBackup(false);
+              setIncrementalBackupsProps({});
+            }}
+            visible={true}
+            incrementalBackupProps={incrementalBackupProps}
+          />
+        ))}
     </Row>
   );
 };

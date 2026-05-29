@@ -1,5 +1,5 @@
 //
-// Copyright (c) YugaByte, Inc.
+// Copyright (c) YugabyteDB, Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License"); you may not use this file except
 // in compliance with the License.  You may obtain a copy of the License at
@@ -37,7 +37,6 @@ class HybridTime;
     ((GetTransactionStatus, WITHOUT_REQUEST)) \
     ((GetTransactionStatusAtParticipant, WITHOUT_REQUEST)) \
     ((AbortTransaction, WITHOUT_REQUEST)) \
-    ((UpdateTransactionStatusLocation, WITHOUT_REQUEST)) \
     ((UpdateTransactionWaitingForStatus, WITHOUT_REQUEST)) \
     ((ProbeTransactionDeadlock, WITH_REQUEST))
 

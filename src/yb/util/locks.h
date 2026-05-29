@@ -15,9 +15,9 @@
 // specific language governing permissions and limitations
 // under the License.
 //
-// The following only applies to changes made to this file as part of YugaByte development.
+// The following only applies to changes made to this file as part of YugabyteDB development.
 //
-// Portions Copyright (c) YugaByte, Inc.
+// Portions Copyright (c) YugabyteDB, Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License"); you may not use this file except
 // in compliance with the License.  You may obtain a copy of the License at
@@ -33,8 +33,9 @@
 
 #include <algorithm>
 #include <mutex>
+#include <thread>
 
-#include <glog/logging.h>
+#include "yb/util/logging.h"
 
 #include "yb/gutil/atomicops.h"
 #include "yb/gutil/dynamic_annotations.h"
@@ -53,7 +54,7 @@ namespace yb {
 // expected by Boost.
 class CAPABILITY("mutex") simple_spinlock {
  public:
-  simple_spinlock() {}
+  constexpr simple_spinlock() {}
 
   void lock() ACQUIRE() {
     l_.Lock();
@@ -146,61 +147,47 @@ class CAPABILITY("mutex") rw_spinlock  {
   rw_semaphore sem_;
 };
 
-// A reader-writer lock implementation which is biased for use cases where
+// A reader-writer mutex implementation which is biased for use cases where
 // the write lock is taken infrequently, but the read lock is used often.
 //
 // Internally, this creates N underlying mutexes, one per CPU. When a thread
-// wants to lock in read (shared) mode, it locks only its own CPU's mutex. When it
-// wants to lock in write (exclusive) mode, it locks all CPU's mutexes.
+// wants to lock in read (shared) mode, it locks only its own CPU's mutex for read. When it
+// wants to lock in write (exclusive) mode, it locks all CPU's mutexes execlusively.
 //
 // This means that in the read-mostly case, different readers will not cause any
 // cacheline contention.
 //
 // Usage:
-//   percpu_rwlock mylock;
+//   PerCpuRwMutex mylock;
 //
 //   // Lock shared:
 //   {
-//     SharedLock<rw_spinlock> lock(mylock.get_lock());
+//     PerCpuRwSharedLock lock(mylock);
 //     ...
 //   }
 //
 //   // Lock exclusive:
 //
 //   {
-//     boost::lock_guard<percpu_rwlock> lock(mylock);
+//     boost::lock_guard<PerCpuRwMutex> lock(mylock);
 //     ...
 //   }
-class percpu_rwlock {
+class CAPABILITY("mutex") PerCpuRwMutex {
  public:
-  percpu_rwlock() {
+  PerCpuRwMutex() {
     errno = 0;
     n_cpus_ = base::MaxCPUIndex() + 1;
     CHECK_EQ(errno, 0) << ErrnoToString(errno);
     CHECK_GT(n_cpus_, 0);
-    locks_ = new padded_lock[n_cpus_];
+    locks_ = new PaddedLock[n_cpus_];
   }
 
-  ~percpu_rwlock() {
+  ~PerCpuRwMutex() {
     delete [] locks_;
   }
 
-  rw_spinlock &get_lock() {
-#if defined(__APPLE__)
-    // OSX doesn't have a way to get the CPU, so we'll pick a random one.
-    int cpu = reinterpret_cast<uintptr_t>(this) % n_cpus_;
-#else
-    int cpu = sched_getcpu();
-    if (cpu < 0) {
-      LOG(FATAL) << ErrnoToString(errno);
-    }
-    CHECK_LT(cpu, n_cpus_);
-#endif  // defined(__APPLE__)
-    return locks_[cpu].lock;
-  }
-
-  bool try_lock() {
-    for (int i = 0; i < n_cpus_; i++) {
+  bool try_lock() TRY_ACQUIRE(true) {
+    for (size_t i = 0; i < n_cpus_; i++) {
       if (!locks_[i].lock.try_lock()) {
         while (i--) {
           locks_[i].lock.unlock();
@@ -214,20 +201,20 @@ class percpu_rwlock {
   // Return true if this lock is held on any CPU.
   // See simple_spinlock::is_locked() for details about where this is useful.
   bool is_locked() const {
-    for (int i = 0; i < n_cpus_; i++) {
+    for (size_t i = 0; i < n_cpus_; i++) {
       if (locks_[i].lock.is_locked()) return true;
     }
     return false;
   }
 
-  void lock() {
-    for (int i = 0; i < n_cpus_; i++) {
+  void lock() ACQUIRE() {
+    for (size_t i = 0; i < n_cpus_; i++) {
       locks_[i].lock.lock();
     }
   }
 
-  void unlock() {
-    for (int i = 0; i < n_cpus_; i++) {
+  void unlock() RELEASE() {
+    for (size_t i = 0; i < n_cpus_; i++) {
       locks_[i].lock.unlock();
     }
   }
@@ -241,21 +228,51 @@ class percpu_rwlock {
   size_t memory_footprint_including_this() const;
 
  private:
-  struct padded_lock {
+  friend class PerCpuRwSharedLock;
+
+  struct alignas(CACHELINE_SIZE) PaddedLock {
     rw_spinlock lock;
-    static constexpr size_t kPaddingSize = CACHELINE_SIZE - (sizeof(rw_spinlock) % CACHELINE_SIZE);
-    char padding[kPaddingSize];
   };
 
-  int n_cpus_;
-  padded_lock *locks_;
+  PaddedLock& get_lock() {
+#if defined(__APPLE__)
+    // OSX doesn't have a way to get the CPU, so we'll pick a random one.
+    auto cpu = reinterpret_cast<uintptr_t>(this) % n_cpus_;
+#else
+    auto cpu = sched_getcpu();
+    LOG_IF(FATAL, cpu < 0) << ErrnoToString(errno);
+    CHECK_LT(cpu, n_cpus_);
+#endif  // defined(__APPLE__)
+    return locks_[cpu];
+  }
+
+  size_t n_cpus_;
+  PaddedLock* locks_;
+};
+
+// A scoped lock for PerCpuRwMutex. Works by choosing the current CPU and locking the lock for that
+// CPU. The lock is released when the guard goes out of scope.
+class SCOPED_CAPABILITY PerCpuRwSharedLock {
+ public:
+  explicit PerCpuRwSharedLock(PerCpuRwMutex& per_cpu_rwlock)  // NOLINT
+      ACQUIRE_SHARED(per_cpu_rwlock)
+      : current_cpu_lock_(&per_cpu_rwlock.get_lock()) {
+    current_cpu_lock_->lock.lock_shared();
+  }
+
+  ~PerCpuRwSharedLock() RELEASE() {
+    current_cpu_lock_->lock.unlock_shared();
+  }
+
+ private:
+  PerCpuRwMutex::PaddedLock* current_cpu_lock_;
 };
 
 template <class Container>
 auto ToVector(const Container& container, std::mutex* mutex) {
   std::vector<typename Container::value_type> result;
   {
-    std::lock_guard<std::mutex> lock(*mutex);
+    std::lock_guard lock(*mutex);
     result.reserve(container.size());
     result.assign(container.begin(), container.end());
   }
@@ -296,6 +313,68 @@ class ReverseLock {
 
  private:
   Lock& lock_;
+};
+
+template <class Semaphore>
+class SemaphoreLock {
+ public:
+  explicit SemaphoreLock(Semaphore& semaphore) : semaphore_(semaphore) {
+    semaphore.acquire();
+  }
+
+  ~SemaphoreLock() {
+    semaphore_.release();
+  }
+
+ private:
+  Semaphore& semaphore_;
+};
+
+// simple_spinlock is something intermediate between spinlock and mutex, because it could fallback
+// waiting on futex. Also, it collects stats, etc.
+// TrivialSpinlock does not have such overhead and is more performant. For instance while testing
+// RWQueue in conjunction with it, the execution time was 1.5 times lower.
+class CAPABILITY("mutex") TrivialSpinlock {
+ public:
+  TrivialSpinlock() = default;
+
+  ~TrivialSpinlock() {
+    DCHECK(!is_locked());
+  }
+
+  void lock() ACQUIRE() {
+    size_t lock_counter = 16;
+    while (!try_lock()) {
+      while (is_locked()) {
+        // Max of 32752 pauses before we fallback to yield.
+        if (lock_counter <= 16 * 1024) {
+          for (size_t n = 0; n < lock_counter; ++n) {
+            base::subtle::PauseCPU();
+          }
+          lock_counter *= 2;
+        } else {
+          std::this_thread::yield();
+        }
+      }
+    }
+  }
+
+  void unlock() RELEASE() {
+    lockword_.store(false, std::memory_order_release);
+  }
+
+  bool try_lock() TRY_ACQUIRE(true) {
+    return !lockword_.exchange(true, std::memory_order_acquire);
+  }
+
+  bool is_locked() {
+    return lockword_.load(std::memory_order_relaxed);
+  }
+
+ private:
+  std::atomic<bool> lockword_{false};
+
+  DISALLOW_COPY_AND_ASSIGN(TrivialSpinlock);
 };
 
 } // namespace yb

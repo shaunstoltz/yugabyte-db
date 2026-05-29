@@ -1,4 +1,4 @@
-# Copyright (c) YugaByte, Inc.
+# Copyright (c) YugabyteDB, Inc.
 #
 # Licensed under the Apache License, Version 2.0 (the "License"); you may not use this file except
 # in compliance with the License.  You may obtain a copy of the License at
@@ -10,8 +10,8 @@
 # or implied.  See the License for the specific language governing permissions and limitations
 # under the License.
 
-
-set(POSTGRES_EXTRA_C_CXX_FLAGS "")
+# YB change: Enable catcache stats.
+set(POSTGRES_EXTRA_C_CXX_FLAGS "-DCATCACHE_STATS")
 set(POSTGRES_EXTRA_LD_FLAGS "")
 
 get_property(yb_cmake_include_dirs DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}
@@ -63,36 +63,39 @@ if(IS_GCC)
 endif()
 
 if(IS_CLANG)
-  if("${COMPILER_VERSION}" VERSION_GREATER_EQUAL "13.0.0" AND NOT IS_APPLE_CLANG)
+  if("${COMPILER_VERSION}" VERSION_GREATER_EQUAL "14.0.0")
     add_pg_c_cxx_flags(-Wno-error=unused-but-set-variable)
   endif()
 
-  if("${COMPILER_VERSION}" VERSION_GREATER_EQUAL "15.0.0")
+  if(("${COMPILER_VERSION}" VERSION_GREATER_EQUAL "15.0.0") OR
+     (IS_APPLE_CLANG AND "${COMPILER_VERSION}" VERSION_GREATER_EQUAL "14.0.3"))
     add_pg_c_cxx_flags(-Wno-error=deprecated-non-prototype)
   endif()
+endif()
+
+if(APPLE)
+  # To silence warning from stdio.h
+  # https://gist.github.com/hari90/3480c6073dd5a92ff1e7027295bc2bf3
+  # and malloc.h
+  # https://gist.github.com/hari90/11c8d5cf89056b3c730eab62d216023b
+  add_pg_c_cxx_flags(
+    -Wno-nullability-completeness
+    -Wno-availability
+  )
 endif()
 
 if("${CMAKE_SYSTEM_PROCESSOR}" STREQUAL "x86_64")
   add_pg_c_cxx_flags(-DUSE_SSE42_CRC32C=1)
 endif()
 
-if(NOT APPLE AND
-   "${YB_BUILD_TYPE}" STREQUAL "asan" AND
-   IS_CLANG AND
-   "${COMPILER_VERSION}" VERSION_GREATER_EQUAL "10.0.0")
+if(NOT APPLE AND IS_ASAN AND IS_CLANG AND "${COMPILER_VERSION}" VERSION_GREATER_EQUAL "10.0.0")
   add_pg_ld_flags(-ldl)
 endif()
 
 get_filename_component(OPENSSL_LIB_DIR "${OPENSSL_CRYPTO_LIBRARY}" DIRECTORY)
 message("OPENSSL_LIB_DIR=${OPENSSL_LIB_DIR}")
 
-set(POSTGRES_PKG_CONFIG_PATH "${YB_THIRDPARTY_INSTALLED_DEPS_DIR}/lib/pkgconfig")
-
-set(build_postgres_args
-    "${CMAKE_COMMAND}"
-    -E
-    env "YB_BUILD_ROOT=$ENV{YB_BUILD_ROOT}"
-    env "PKG_CONFIG_PATH=${POSTGRES_PKG_CONFIG_PATH}")
+set(build_postgres_args "")
 
 if (APPLE AND "${CMAKE_SYSTEM_PROCESSOR}" STREQUAL "arm64")
   list(APPEND build_postgres_args arch -arm64)
@@ -104,8 +107,40 @@ if(APPLE AND NOT "${MACOS_SDK_INCLUDE_DIR}" STREQUAL "")
          " -isystem ${MACOS_SDK_INCLUDE_DIR}")
 endif()
 
-set(PG_INCLUDE_DIRS "${YB_PREFIX_COMMON}/include")
-set(PG_LIB_DIRS "${YB_PREFIX_COMMON}/lib")
+if(NOT "$ENV{YB_VALGRIND_PATH}" STREQUAL "")
+
+  string(APPEND POSTGRES_EXTRA_PREPROCESSOR_FLAGS " -DUSE_VALGRIND")
+
+  find_path(VALGRIND_INCLUDE_PATH "valgrind/valgrind.h"
+            "/usr/include"
+            "/usr/local/include"
+            $ENV{CPATH})
+
+  if (${VALGRIND_INCLUDE_PATH} STREQUAL "VALGRIND_INCLUDE_PATH-NOTFOUND")
+    message(FATAL_ERROR "Compiling with Valgrind support, but could not find Valgrind's header"
+      " files. If you have Valgrind installed in an atypical location, add the include directory"
+      " to CPATH and retry.")
+  endif()
+endif()
+
+concat_thirdparty_prefix_dirs_with_suffix(PG_INCLUDE_DIRS " " "/include")
+concat_thirdparty_prefix_dirs_with_suffix(PG_LIB_DIRS " " "/lib")
+
+# We only use YB_ADD_LIB_DIR("${YB_THIRDPARTY_MAYBE_INSTRUMENTED_DIR}/lib") in the top-level
+# CMakeLists because the corresponding RPATH ends up on the linker command line in some other way,
+# presumably, due to library dependencies. However, for Postgres, we have to add this RPATH
+# explicitly.
+add_pg_ld_flags("${YB_THIRDPARTY_MAYBE_INSTRUMENTED_RPATH_ARG}")
+
+if(IS_GCC AND "${COMPILER_VERSION}" VERSION_GREATER_EQUAL "15.0.0")
+  # GCC 15+ defaults to C23 which does not build. Postgres generally builds with gnu99, but there
+  # are some places where it isn't set, and the compiler default gets used.
+  string(APPEND CMAKE_C_FLAGS " -std=gnu99")
+  # False positive -Wclobbered warnings appear in debug, e.g.:
+  #    error: variable '({anonymous})' might be clobbered by 'longjmp' or 'vfork'
+  add_pg_c_cxx_flags(-Wno-clobbered)
+endif()
+
 if(APPLE AND NOT IS_APPLE_CLANG)
   add_pg_ld_flags("-L${CMAKE_OSX_SYSROOT}/usr/lib")
   add_pg_c_cxx_flags("-isysroot ${CMAKE_OSX_SYSROOT}")
@@ -126,6 +161,12 @@ yb_deduplicate_arguments(POSTGRES_FINAL_EXE_LD_FLAGS)
 
 set(PG_EXE_LD_FLAGS_AFTER_YB_LIBS "")
 if("${YB_TCMALLOC_ENABLED}" STREQUAL "1")
+  # We link with tcmalloc statically, but tcmalloc depends on some other shared libraries being
+  # present on the linker command line.
+  #
+  # The libraries we add here should be kept consistent with the libraries added in
+  # the add_executable wrapper in YugabyteFunctions.cmake.
+  #
   # We don't add libtcmalloc and libprofiler to POSTGRES_FINAL_EXE_LD_FLAGS because when building
   # with GCC we use the standard ld linker, which cares about the order of libraries when using
   # static libraries. Symbols from libtcmalloc and libprofiler are needed by e.g. libyb_util, so
@@ -140,7 +181,9 @@ if("${YB_TCMALLOC_ENABLED}" STREQUAL "1")
     set(PG_EXE_LD_FLAGS_AFTER_YB_LIBS "${TCMALLOC_STATIC_LIB_LD_FLAGS} -lprofiler")
   endif()
 
-  if(IS_CLANG)
+  if(IS_CLANG AND NOT IS_ASAN)
+    # Skip adding -lc++ when ASAN is enabled, as it's already added globally via ADD_LINKER_FLAGS
+    # in YugabyteFunctions.cmake to avoid duplicate library warnings.
     string(APPEND PG_EXE_LD_FLAGS_AFTER_YB_LIBS " -lc++")
   endif()
   if(IS_GCC)
@@ -151,7 +194,7 @@ if("${YB_TCMALLOC_ENABLED}" STREQUAL "1")
   endif()
 endif()
 
-yb_put_vars_into_cache(
+yb_put_string_vars_into_cache(
   POSTGRES_FINAL_C_FLAGS
   POSTGRES_FINAL_CXX_FLAGS
   POSTGRES_FINAL_LD_FLAGS
@@ -178,16 +221,22 @@ endif()
 # We add spaces before every "flags" parameter so that Python's argparse does not interpret them as
 # its own flags.
 add_custom_target(configure_postgres ALL COMMAND ${build_postgres_args} --step configure)
+add_custom_target(postgres_genbki ALL COMMAND ${build_postgres_args} --step genbki)
 add_custom_target(
     postgres ALL
     COMMAND ${build_postgres_args} --step make
-    BYPRODUCTS "${LIBPQ_SHARED_LIB}" "${YB_PGBACKEND_SHARED_LIB}")
+    BYPRODUCTS
+      "${LIBPQ_SHARED_LIB}"
+      "${YB_PGBACKEND_SHARED_LIB}"
+      "${PG_COMMON_STATIC_LIB}"
+      "${PG_PORT_STATIC_LIB}")
 
-add_dependencies(postgres configure_postgres)
+add_dependencies(postgres_genbki configure_postgres)
+add_dependencies(postgres configure_postgres postgres_genbki)
 
 # ------------------------------------------------------------------------------------------------
 # Dependencies between postgres and other targets
 # ------------------------------------------------------------------------------------------------
 
 # Libraries that we link into the postgres binary.
-add_dependencies(postgres yb_pggate server_process)
+add_dependencies(postgres yb_pggate server_process yb_pggate_webserver ysql_bench_metrics_handler hdr_histogram yb_pgresult_util)

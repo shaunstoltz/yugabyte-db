@@ -3,9 +3,9 @@
 //  LICENSE file in the root directory of this source tree. An additional grant
 //  of patent rights can be found in the PATENTS file in the same directory.
 //
-// The following only applies to changes made to this file as part of YugaByte development.
+// The following only applies to changes made to this file as part of YugabyteDB development.
 //
-// Portions Copyright (c) YugaByte, Inc.
+// Portions Copyright (c) YugabyteDB, Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License"); you may not use this file except
 // in compliance with the License.  You may obtain a copy of the License at
@@ -64,9 +64,9 @@ ReadOptions CreateMetaBlockReadOptions(RandomAccessFileReader* file) {
 
 }  // namespace
 
-MetaIndexBuilder::MetaIndexBuilder()
+MetaIndexBuilder::MetaIndexBuilder(const yb::MemTrackerPtr& mem_tracker)
     : meta_index_block_(new BlockBuilder(
-          kMetaIndexBlockRestartInterval, kMetaIndexBlockKeyValueEncodingFormat)) {}
+          kMetaIndexBlockRestartInterval, kMetaIndexBlockKeyValueEncodingFormat, mem_tracker)) {}
 
 void MetaIndexBuilder::Add(const std::string& key,
                            const BlockHandle& handle) {
@@ -82,9 +82,9 @@ Slice MetaIndexBuilder::Finish() {
   return meta_index_block_->Finish();
 }
 
-PropertyBlockBuilder::PropertyBlockBuilder()
-    : properties_block_(
-          new BlockBuilder(kPropertyBlockRestartInterval, kPropertyBlockKeyValueEncodingFormat)) {}
+PropertyBlockBuilder::PropertyBlockBuilder(const yb::MemTrackerPtr& mem_tracker)
+    : properties_block_(new BlockBuilder(
+          kPropertyBlockRestartInterval, kPropertyBlockKeyValueEncodingFormat, mem_tracker)) {}
 
 void PropertyBlockBuilder::Add(const std::string& name,
                                const std::string& val) {

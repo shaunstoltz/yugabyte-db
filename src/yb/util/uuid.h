@@ -1,4 +1,4 @@
-// Copyright (c) YugaByte, Inc.
+// Copyright (c) YugabyteDB, Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License"); you may not use this file except
 // in compliance with the License.  You may obtain a copy of the License at
@@ -20,6 +20,8 @@
 
 #include <boost/functional/hash.hpp>
 #include <boost/uuid/uuid.hpp>
+
+#include "yb/gutil/stl_util.h"
 
 #include "yb/util/cast.h"
 #include "yb/util/status_fwd.h"
@@ -53,8 +55,6 @@ class Uuid {
 
   explicit Uuid(const uuid_t copy);
 
-  Uuid(const Uuid& other);
-
   // Generate a new boost uuid
   static Uuid Generate();
   static Uuid Generate(std::mt19937_64* rng);
@@ -80,6 +80,7 @@ class Uuid {
   Slice AsSlice() const;
 
   // Encodes the UUID into the time comparable uuid to be stored in RocksDB.
+  std::string EncodedToComparable() const;
   void EncodeToComparable(uint8_t* output) const;
   void EncodeToComparable(std::string* bytes) const;
 
@@ -93,6 +94,10 @@ class Uuid {
   // Given a string representation of uuid in hex where the bytes are in host byte order, build
   // an appropriate UUID object.
   static Result<Uuid> FromHexString(const std::string& hex_string);
+  // FromHexString above expects the string to have bytes in the host byte order (little endian)
+  // this variant is useful to generate a uuid where the bytes are in network order (big endian)
+  // Functionally, accepts strings similar to FromString, however the dashes are not required.
+  static Result<Uuid> FromHexStringBigEndian(const std::string& hex_string);
 
   std::string ToHexString() const;
 
@@ -126,35 +131,6 @@ class Uuid {
     return boost_uuid_.is_nil();
   }
 
-  bool operator==(const Uuid& other) const {
-    return (boost_uuid_ == other.boost_uuid_);
-  }
-
-  bool operator!=(const Uuid& other) const {
-    return !(*this == other);
-  }
-
-  // A custom comparator that compares UUID v1 according to their timestamp.
-  // If not, it will compare the version first and then lexicographically.
-  bool operator<(const Uuid& other) const;
-
-  bool operator>(const Uuid& other) const {
-    return (other < *this);
-  }
-
-  bool operator<=(const Uuid& other) const {
-    return !(other < *this);
-  }
-
-  bool operator>=(const Uuid& other) const {
-    return !(*this < other);
-  }
-
-  Uuid& operator=(const Uuid& other) {
-    boost_uuid_ = other.boost_uuid_;
-    return *this;
-  }
-
   const boost::uuids::uuid& impl() const {
     return boost_uuid_;
   }
@@ -179,7 +155,35 @@ class Uuid {
     return boost_uuid_.version();
   }
 
+  friend bool operator==(const Uuid& lhs, const Uuid& rhs) noexcept {
+    return (lhs.boost_uuid_ == rhs.boost_uuid_);
+  }
+
+  friend bool operator!=(const Uuid& lhs, const Uuid& rhs) noexcept {
+    return !(lhs == rhs);
+  }
+
+  friend bool operator>(const Uuid& lhs, const Uuid& rhs) {
+    return (rhs < lhs);
+  }
+
+  friend bool operator<=(const Uuid& lhs, const Uuid& rhs) {
+    return !(rhs < lhs);
+  }
+
+  friend bool operator>=(const Uuid& lhs, const Uuid& rhs) {
+    return !(lhs < rhs);
+  }
+
+  // A custom comparator that compares UUID v1 according to their timestamp.
+  // If not, it will compare the version first and then lexicographically.
+  friend bool operator<(const Uuid& lhs, const Uuid& rhs);
+
  private:
+  friend std::strong_ordering operator<=>(const Uuid& lhs, const Uuid& rhs) {
+    return NaiveCompare(lhs, rhs);
+  }
+
   boost::uuids::uuid boost_uuid_;
 
   // Encodes the MSB of the uuid into a timestamp based byte stream as follows.
@@ -273,3 +277,6 @@ inline size_t hash_value(const Uuid& uuid) {
 using UuidHash = boost::hash<Uuid>;
 
 } // namespace yb
+
+template <>
+struct std::hash<yb::Uuid> : public yb::UuidHash {};

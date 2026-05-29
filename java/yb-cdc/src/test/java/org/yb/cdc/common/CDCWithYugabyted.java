@@ -1,4 +1,4 @@
-// Copyright (c) YugaByte, Inc.
+// Copyright (c) YugabyteDB, Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License"); you may not use this file except
 // in compliance with the License.  You may obtain a copy of the License at
@@ -16,7 +16,7 @@ package org.yb.cdc.common;
 import com.google.common.net.HostAndPort;
 import org.junit.AfterClass;
 import org.junit.BeforeClass;
-import org.yb.cdc.util.TestUtils;
+import org.yb.cdc.util.CDCTestUtils;
 
 import java.sql.Connection;
 import java.sql.DriverManager;
@@ -37,12 +37,12 @@ public class CDCWithYugabyted {
 
   @BeforeClass
   public static void startYugabyte() {
-    TestUtils.startYugabyted();
+    CDCTestUtils.startYugabyted();
   }
 
   @AfterClass
   public static void destroyYugabyte() {
-    TestUtils.destroyYugabyted();
+    CDCTestUtils.destroyYugabyted();
   }
 
   public void setUp() throws Exception {

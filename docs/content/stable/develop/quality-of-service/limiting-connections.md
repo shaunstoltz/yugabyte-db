@@ -3,10 +3,9 @@ title: Rate limiting connections
 headerTitle: Rate limiting connections
 linkTitle: Rate limiting connections
 description: Rate limiting connections in YugabyteDB.
-headcontent: Rate limiting connections in YugabyteDB.
-image: <div class="icon"><i class="fa-solid fa-file-invoice-dollar"></i></div>
+headcontent: Rate limiting connections in YugabyteDB
 menu:
-  stable:
+  stable_develop:
     name: Rate limiting connections
     identifier: develop-quality-of-service-limiting-connections
     parent: develop-quality-of-service
@@ -16,7 +15,7 @@ type: docs
 
 Each connection to a YugabyteDB cluster uses CPU and memory, so it is important to consider how many connections are needed for the application. YugabyteDB uses a `max_connections` setting to limit the number of connections per node in the cluster (and thereby the resources that are consumed by connections) to prevent run-away connection behavior from overwhelming your deployment's resources.
 
-You can check the value of `max_connections` with your admin user and `ysqlsh`.
+You can check the value of `max_connections` with your admin user and ysqlsh.
 
 ```sql
 SHOW max_connections;
@@ -121,3 +120,7 @@ The second connection should fail.
 ```output
 ysqlsh: FATAL:  too many connections for database "test_connection"
 ```
+
+## Learn more
+
+- [YSQL Connection Manager](../../../additional-features/connection-manager-ysql/)

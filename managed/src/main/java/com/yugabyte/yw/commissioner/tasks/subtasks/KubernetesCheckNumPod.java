@@ -1,5 +1,5 @@
 /*
- * Copyright 2019 YugaByte, Inc. and Contributors
+ * Copyright 2019 YugabyteDB, Inc. and Contributors
  *
  * Licensed under the Polyform Free Trial License 1.0.0 (the "License"); you
  * may not use this file except in compliance with the License. You
@@ -16,9 +16,8 @@ import com.yugabyte.yw.commissioner.BaseTaskDependencies;
 import com.yugabyte.yw.commissioner.UserTaskDetails;
 import com.yugabyte.yw.common.KubernetesManagerFactory;
 import com.yugabyte.yw.forms.AbstractTaskParams;
-import com.yugabyte.yw.models.helpers.CloudInfoInterface;
-import com.yugabyte.yw.models.helpers.provider.KubernetesInfo;
 import com.yugabyte.yw.models.Provider;
+import com.yugabyte.yw.models.helpers.CloudInfoInterface;
 import io.fabric8.kubernetes.api.model.Pod;
 import java.time.Duration;
 import java.util.List;

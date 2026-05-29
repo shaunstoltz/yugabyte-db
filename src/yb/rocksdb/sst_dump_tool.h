@@ -3,9 +3,9 @@
 // LICENSE file in the root directory of this source tree. An additional grant
 // of patent rights can be found in the PATENTS file in the same directory.
 //
-// The following only applies to changes made to this file as part of YugaByte development.
+// The following only applies to changes made to this file as part of YugabyteDB development.
 //
-// Portions Copyright (c) YugaByte, Inc.
+// Portions Copyright (c) YugabyteDB, Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License"); you may not use this file except
 // in compliance with the License.  You may obtain a copy of the License at
@@ -20,9 +20,12 @@
 
 #pragma once
 
-#include <glog/logging.h>
+#include "yb/util/logging.h"
 
 #include "yb/docdb/docdb_types.h"
+
+#include "yb/rocksdb/status.h"
+
 #include "yb/util/enums.h"
 #include "yb/util/slice.h"
 
@@ -35,18 +38,21 @@ class DocDBKVFormatter {
   virtual ~DocDBKVFormatter() = default;
 
   virtual std::string Format(
-      const yb::Slice&, const yb::Slice&, yb::docdb::StorageDbType) const = 0;
+      yb::Slice user_key, yb::Slice value, yb::docdb::StorageDbType,
+      const std::string& key_suffix, yb::docdb::AllowEmptyValue allow_empty_value) const = 0;
+
+  virtual Status ProcessArgument(const std::string& argument) = 0;
 };
 
 class SSTDumpTool {
  public:
-  explicit SSTDumpTool(const rocksdb::DocDBKVFormatter* formatter = nullptr)
+  explicit SSTDumpTool(rocksdb::DocDBKVFormatter* formatter = nullptr)
       : formatter_(formatter) {}
 
   int Run(int argc, char** argv);
 
  private:
-  const rocksdb::DocDBKVFormatter* formatter_;
+  rocksdb::DocDBKVFormatter* formatter_;
 };
 
 }  // namespace rocksdb

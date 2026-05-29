@@ -1,7 +1,7 @@
 /*
  * Created on Thu Apr 22 2022
  *
- * Copyright 2021 YugaByte, Inc. and Contributors
+ * Copyright 2021 YugabyteDB, Inc. and Contributors
  * Licensed under the Polyform Free Trial License 1.0.0 (the "License")
  * You may not use this file except in compliance with the License. You may obtain a copy of the License at
  * http://github.com/YugaByte/yugabyte-db/blob/master/licenses/POLYFORM-FREE-TRIAL-LICENSE-1.0.0.txt
@@ -24,7 +24,7 @@ const DEFAULT_MULTI_ENTRY_INPUT_STYLE: Partial<Styles> = {
   control: (base) => ({ ...base, borderRadius: '8px', minHeight: '42px' })
 };
 
-interface YBMultiEntryInputProps {
+export interface YBMultiEntryInputProps {
   defaultOptions?: Option[];
   delimiters?: string[];
   onChange?: (val: Option[]) => void;
@@ -112,8 +112,9 @@ export const YBMultiEntryInput: FC<YBMultiEntryInputProps> = ({
   );
 };
 
-export const YBLabelledMultiEntryInput : FC<YBMultiEntryInputProps & {label:string, meta: any, form: any, field: any}> = ({label, meta, form, field, ...rest}) => {
-
+export const YBLabelledMultiEntryInput: FC<
+  YBMultiEntryInputProps & { label: string; meta: any; form: any; field: any }
+> = ({ label, meta, form, field, ...rest }) => {
   let errorMsg;
   let hasError = false;
   let touched;
@@ -130,17 +131,11 @@ export const YBLabelledMultiEntryInput : FC<YBMultiEntryInputProps & {label:stri
     hasError = touched && isNonEmptyString(errorMsg);
   }
   return (
-    <YBLabel
-      label={label}
-   
-    >
-      <YBMultiEntryInput styles={{ menu: provided => ({ ...provided, zIndex: 2 }) }} {...rest}/>
+    <YBLabel label={label}>
+      <YBMultiEntryInput styles={{ menu: (provided) => ({ ...provided, zIndex: 2 }) }} {...rest} />
       {hasError && (
-        <div
-          className={`help-block standard-error`}
-          data-testid="yb-label-validation-error"
-        >
-          <span className='field-error'>{errorMsg}</span>
+        <div className={`help-block standard-error`} data-testid="yb-label-validation-error">
+          <span className="field-error">{errorMsg}</span>
         </div>
       )}
     </YBLabel>

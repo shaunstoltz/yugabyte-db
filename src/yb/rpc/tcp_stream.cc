@@ -1,4 +1,4 @@
-// Copyright (c) YugaByte, Inc.
+// Copyright (c) YugabyteDB, Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License"); you may not use this file except
 // in compliance with the License.  You may obtain a copy of the License at
@@ -10,6 +10,8 @@
 // or implied.  See the License for the specific language governing permissions and limitations
 // under the License.
 //
+
+#include <deque>
 
 #include "yb/rpc/tcp_stream.h"
 
@@ -112,7 +114,7 @@ Status TcpStream::DoStart(ev::loop_ref* loop, bool connect) {
   is_epoll_registered_ = true;
 
   if (connected_) {
-    context_->Connected();
+    RETURN_NOT_OK(context_->Connected());
   }
 
   return Status::OK();
@@ -281,11 +283,16 @@ void TcpStream::Handler(ev::io& watcher, int revents) {  // NOLINT
     bool just_connected = !connected_;
     if (just_connected) {
       connected_ = true;
-      context_->Connected();
+      status = context_->Connected();
+      if (!status.ok()) {
+        VLOG_WITH_PREFIX(3) << "Connected() returned error: " << status;
+      }
     }
-    status = WriteHandler(just_connected);
-    if (!status.ok()) {
-      VLOG_WITH_PREFIX(3) << "WriteHandler() returned error: " << status;
+    if (status.ok()) {
+      status = WriteHandler(just_connected);
+      if (!status.ok()) {
+        VLOG_WITH_PREFIX(3) << "WriteHandler() returned error: " << status;
+      }
     }
   }
 
@@ -461,7 +468,7 @@ Result<size_t> TcpStream::Send(OutboundDataPtr data) {
   // transferred.
   size_t result = data_blocks_sent_ + sending_.size();
 
-  DVLOG_WITH_PREFIX(6) << "TcpStream::Send queueing: " << AsString(*data);
+  DVLOG_WITH_PREFIX(6) << "TcpStream::Send queuing: " << AsString(*data);
   // Serialize the actual bytes to be put on the wire.
   sending_.emplace_back(std::move(data), mem_tracker_);
   queued_bytes_to_send_ += sending_.back().bytes_size();

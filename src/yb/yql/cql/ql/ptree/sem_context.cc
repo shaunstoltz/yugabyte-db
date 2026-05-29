@@ -1,5 +1,5 @@
 //--------------------------------------------------------------------------------------------------
-// Copyright (c) YugaByte, Inc.
+// Copyright (c) YugabyteDB, Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License"); you may not use this file except
 // in compliance with the License.  You may obtain a copy of the License at
@@ -50,11 +50,11 @@ using client::YBSchema;
 
 //--------------------------------------------------------------------------------------------------
 
-SemContext::SemContext(ParseTreePtr parse_tree, QLEnv *ql_env)
+SemContext::SemContext(ParseTreePtr parse_tree, QLEnv *ql_env, const QLMetrics *ql_metrics)
     : ProcessContext(std::move(parse_tree)),
+      ql_metrics_(ql_metrics),
       symtab_(PTempMem()),
-      ql_env_(ql_env) {
-}
+      ql_env_(ql_env) {}
 
 SemContext::~SemContext() {
 }

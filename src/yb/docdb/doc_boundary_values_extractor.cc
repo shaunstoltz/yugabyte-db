@@ -1,5 +1,5 @@
 //
-// Copyright (c) YugaByte, Inc.
+// Copyright (c) YugabyteDB, Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License"); you may not use this file except
 // in compliance with the License.  You may obtain a copy of the License at
@@ -16,8 +16,8 @@
 #include "yb/rocksdb/db/dbformat.h"
 
 #include "yb/docdb/consensus_frontier.h"
-#include "yb/docdb/doc_key.h"
-#include "yb/docdb/value_type.h"
+#include "yb/dockv/doc_key.h"
+#include "yb/dockv/value_type.h"
 
 #include "yb/gutil/casts.h"
 #include "yb/util/status_format.h"
@@ -39,7 +39,7 @@ class DocBoundaryValuesExtractor : public rocksdb::BoundaryValuesExtractor {
   virtual ~DocBoundaryValuesExtractor() {}
 
   Status Extract(Slice user_key, rocksdb::UserBoundaryValueRefs* values) override {
-    if (docdb::IsInternalRecordKeyType(docdb::DecodeKeyEntryType(user_key))) {
+    if (dockv::IsMetaKeyType(dockv::DecodeKeyEntryType(user_key))) {
       // Skipping internal DocDB records.
       return Status::OK();
     }
@@ -47,7 +47,7 @@ class DocBoundaryValuesExtractor : public rocksdb::BoundaryValuesExtractor {
     CHECK_NOTNULL(values);
     boost::container::small_vector<Slice, 20> slices;
     auto user_key_copy = user_key;
-    RETURN_NOT_OK(SubDocKey::PartiallyDecode(&user_key_copy, &slices));
+    RETURN_NOT_OK(dockv::SubDocKey::PartiallyDecode(&user_key_copy, &slices));
     size_t size = slices.size();
     if (size == 0) {
       return STATUS(Corruption, "Key does not contain hybrid time", user_key.ToDebugString());
@@ -65,7 +65,7 @@ class DocBoundaryValuesExtractor : public rocksdb::BoundaryValuesExtractor {
     return Status::OK();
   }
 
-  rocksdb::UserFrontierPtr CreateFrontier() override {
+  storage::UserFrontierPtr CreateFrontier() override {
     return new docdb::ConsensusFrontier();
   }
 };
@@ -79,13 +79,13 @@ std::shared_ptr<rocksdb::BoundaryValuesExtractor> DocBoundaryValuesExtractorInst
 }
 
 // Used in tests
-Result<KeyEntryValue> TEST_GetKeyEntryValue(
+Result<dockv::KeyEntryValue> TEST_GetKeyEntryValue(
     const rocksdb::UserBoundaryValues& values, size_t index) {
   auto value = rocksdb::TEST_UserValueWithTag(values, TagForRangeComponent(index));
   if (!value) {
     return STATUS_SUBSTITUTE(NotFound, "Not found value for index $0", index);
   }
-  return KeyEntryValue::FullyDecodeFromKey(value->AsSlice());
+  return dockv::KeyEntryValue::FullyDecodeFromKey(value->AsSlice());
 }
 
 rocksdb::UserBoundaryTag TagForRangeComponent(size_t index) {

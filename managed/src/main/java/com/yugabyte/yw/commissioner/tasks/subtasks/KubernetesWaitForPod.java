@@ -1,5 +1,5 @@
 /*
- * Copyright 2019 YugaByte, Inc. and Contributors
+ * Copyright 2019 YugabyteDB, Inc. and Contributors
  *
  * Licensed under the Polyform Free Trial License 1.0.0 (the "License"); you
  * may not use this file except in compliance with the License. You
@@ -16,15 +16,14 @@ import com.yugabyte.yw.commissioner.BaseTaskDependencies;
 import com.yugabyte.yw.commissioner.UserTaskDetails;
 import com.yugabyte.yw.common.KubernetesManagerFactory;
 import com.yugabyte.yw.forms.AbstractTaskParams;
-import com.yugabyte.yw.models.helpers.CloudInfoInterface;
 import com.yugabyte.yw.models.Provider;
+import com.yugabyte.yw.models.helpers.CloudInfoInterface;
+import io.fabric8.kubernetes.api.model.Pod;
 import io.fabric8.kubernetes.api.model.PodCondition;
 import io.fabric8.kubernetes.api.model.PodStatus;
-import io.fabric8.kubernetes.api.model.Pod;
 import java.time.Duration;
 import java.util.Map;
 import java.util.UUID;
-
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -51,6 +50,11 @@ public class KubernetesWaitForPod extends AbstractTaskBase {
       KubernetesManagerFactory kubernetesManagerFactory) {
     super(baseTaskDependencies);
     this.kubernetesManagerFactory = kubernetesManagerFactory;
+  }
+
+  @Override
+  public String getName() {
+    return super.getName() + "(" + taskParams().namespace + "/" + taskParams().podName + ")";
   }
 
   // Number of iterations to wait for the pod to come up.
@@ -84,7 +88,12 @@ public class KubernetesWaitForPod extends AbstractTaskBase {
         int iters = 0;
         boolean podReady;
         do {
-          podReady = isPodReady();
+          try {
+            podReady = isPodReady();
+          } catch (Exception e) {
+            LOG.info("Exception occurred (ignored) while waiting for pod: {}", e.getMessage());
+            podReady = false;
+          }
           iters++;
           if (podReady) {
             break;

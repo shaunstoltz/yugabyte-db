@@ -15,9 +15,9 @@
 // specific language governing permissions and limitations
 // under the License.
 //
-// The following only applies to changes made to this file as part of YugaByte development.
+// The following only applies to changes made to this file as part of YugabyteDB development.
 //
-// Portions Copyright (c) YugaByte, Inc.
+// Portions Copyright (c) YugabyteDB, Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License"); you may not use this file except
 // in compliance with the License.  You may obtain a copy of the License at
@@ -34,22 +34,55 @@
 #include <signal.h>
 #include <spawn.h>
 
+#include <atomic>
 #include <map>
 #include <mutex>
 #include <string>
 #include <unordered_set>
 #include <vector>
 
-#include <glog/logging.h>
-
 #include "yb/gutil/macros.h"
+#include "yb/gutil/ref_counted.h"
 #include "yb/gutil/thread_annotations.h"
 
 #include "yb/util/enums.h"
-#include "yb/util/math_util.h"
 #include "yb/util/status.h"
 
+namespace google {
+class LogMessage;
+}
+
 namespace yb {
+
+class Thread;
+
+class LogTailerThread {
+ public:
+  LogTailerThread(
+      const std::string& process_name, const int child_fd, int severity);
+
+  ~LogTailerThread();
+
+ private:
+  void Run(const int child_fd);
+
+  std::string SeverityStr() const;
+
+ private:
+  std::atomic<bool> stopped_{false};
+  const std::string process_name_;
+  const int severity_;
+  scoped_refptr<Thread> thread_;
+};
+
+namespace util {
+
+// Handle and log the status code from waitpid().
+// The status code is encoded. We need to call the proper macro
+// to decode it to be readable.
+void LogWaitCode(int ret_code, const std::string &process_name);
+
+} // namespace util
 
 YB_DEFINE_ENUM(StdFdType,
                ((kIn, STDIN_FILENO))
@@ -84,18 +117,30 @@ class Subprocess {
   ~Subprocess();
 
   // Disable subprocess stream output.  Must be called before subprocess starts.
-  void DisableStderr();
-  void DisableStdout();
+  void DisableStderr() EXCLUDES(state_lock_);
+  void DisableStdout() EXCLUDES(state_lock_);
 
   // Share a stream with parent. Must be called before subprocess starts.
   // Cannot set sharing at all if stream is disabled.
-  void ShareParentStdin() { SetFdShared(STDIN_FILENO, SubprocessStreamMode::kShared); }
-  void ShareParentStdout() { SetFdShared(STDOUT_FILENO, SubprocessStreamMode::kShared); }
-  void ShareParentStderr() { SetFdShared(STDERR_FILENO, SubprocessStreamMode::kShared); }
+  void ShareParentStdin() EXCLUDES(state_lock_) {
+    SetFdShared(STDIN_FILENO, SubprocessStreamMode::kShared);
+  }
+  void ShareParentStdout() EXCLUDES(state_lock_) {
+    SetFdShared(STDOUT_FILENO, SubprocessStreamMode::kShared);
+  }
+  void ShareParentStderr() EXCLUDES(state_lock_) {
+    SetFdShared(STDERR_FILENO, SubprocessStreamMode::kShared);
+  }
 
-  void PipeParentStdin() { SetFdShared(STDIN_FILENO, SubprocessStreamMode::kPiped); }
-  void PipeParentStdout() { SetFdShared(STDOUT_FILENO, SubprocessStreamMode::kPiped); }
-  void PipeParentStderr() { SetFdShared(STDERR_FILENO, SubprocessStreamMode::kPiped); }
+  void PipeParentStdin() EXCLUDES(state_lock_) {
+    SetFdShared(STDIN_FILENO, SubprocessStreamMode::kPiped);
+  }
+  void PipeParentStdout() EXCLUDES(state_lock_) {
+    SetFdShared(STDOUT_FILENO, SubprocessStreamMode::kPiped);
+  }
+  void PipeParentStderr() EXCLUDES(state_lock_) {
+    SetFdShared(STDERR_FILENO, SubprocessStreamMode::kPiped);
+  }
 
   // Marks a non-standard file descriptor which should not be closed after
   // forking the child process.
@@ -107,7 +152,11 @@ class Subprocess {
   // note that if the executable path was incorrect such that
   // exec() fails, this will still return Status::OK. You must
   // use Wait() to check for failure.
-  Status Start();
+  Status Start() EXCLUDES(state_lock_);
+
+  // Similar to Call. Starts the sub process and waits for it to exit.
+  // log_stdout_and_stderr: Captures and logs the stdout and stderr to glog.
+  Status Run(bool log_stdout_and_stderr = true) EXCLUDES(state_lock_);
 
   // Wait for the subprocess to exit. The return value is the same as
   // that of the waitpid() syscall. Only call after starting.
@@ -124,9 +173,9 @@ class Subprocess {
   // itself as an argument, not a pointer to it, as is done in wait() and waitpid()!):
   // WCONTINUED, WCOREDUMP, WEXITSTATUS, WIFCONTINUED, WIFEXITED, WIFSIGNALED, WIFSTOPPED,
   // WNOHANG, WSTOPSIG, WTERMSIG, WUNTRACED.
-  Status Wait(int* ret);
+  Status Wait(int* ret) EXCLUDES(state_lock_);
 
-  Result<int> Wait();
+  Status Wait() EXCLUDES(state_lock_);
 
   // Like the above, but does not block. This returns Status::TimedOut
   // immediately if the child has not exited. Otherwise returns Status::OK
@@ -135,18 +184,18 @@ class Subprocess {
   // NOTE: unlike the standard wait(2) call, this may be called multiple
   // times. If the process has exited, it will repeatedly return the same
   // exit code.
-  Status WaitNoBlock(int* ret);
+  Status WaitNoBlock(int* ret) EXCLUDES(state_lock_);
 
   // Send a signal to the subprocess.
   // Note that this does not reap the process -- you must still Wait()
   // in order to reap it. Only call after starting.
-  Status Kill(int signal);
+  Status Kill(int signal) EXCLUDES(state_lock_);
 
   // Similar to Kill, but does not enforce that the process must be running.
-  Status KillNoCheckIfRunning(int signal);
+  Status KillNoCheckIfRunning(int signal) EXCLUDES(state_lock_);
 
   // Returns true if the process is running.
-  bool IsRunning() const;
+  bool IsRunning() const EXCLUDES(state_lock_);
 
   // Helper method that creates a Subprocess, issues a Start() then a Wait().
   // Expects a blank-separated list of arguments, with the first being the
@@ -157,39 +206,34 @@ class Subprocess {
 
   // Same as above, but accepts a vector that includes the path to the
   // executable as argv[0] and the arguments to the program in argv[1..n].
-  static Status Call(const std::vector<std::string>& argv);
+  static Status Call(const std::vector<std::string>& argv, bool log_stdout_and_stderr = false);
 
   // Same as above, but collects the output from the child process stdout into
   // the output parameter.
-  // If read_stderr is set to true, stderr is collected instead.
   static Status Call(
-      const std::vector<std::string>& argv,
-      std::string* output, StdFdTypes read_fds = StdFdTypes{StdFdType::kOut});
+      const std::vector<std::string>& argv, std::string* output, std::string* error = nullptr);
 
   // Return the pipe fd to the child's standard stream.
   // Stream should not be disabled or shared.
-  int to_child_stdin_fd()    const { return CheckAndOffer(STDIN_FILENO); }
-  int from_child_stdout_fd() const { return CheckAndOffer(STDOUT_FILENO); }
-  int from_child_stderr_fd() const { return CheckAndOffer(STDERR_FILENO); }
+  int to_child_stdin_fd() const EXCLUDES(state_lock_) { return CheckAndOffer(STDIN_FILENO); }
+  int from_child_stdout_fd() const EXCLUDES(state_lock_) { return CheckAndOffer(STDOUT_FILENO); }
+  int from_child_stderr_fd() const EXCLUDES(state_lock_) { return CheckAndOffer(STDERR_FILENO); }
 
   // Release control of the file descriptor for the child's stream, only if piped.
   // Writes to this FD show up on stdin in the subprocess
-  int ReleaseChildStdinFd()  { return ReleaseChildFd(STDIN_FILENO ); }
+  int ReleaseChildStdinFd() EXCLUDES(state_lock_) { return ReleaseChildFd(STDIN_FILENO); }
   // Reads from this FD come from stdout of the subprocess
-  int ReleaseChildStdoutFd() { return ReleaseChildFd(STDOUT_FILENO); }
+  int ReleaseChildStdoutFd() EXCLUDES(state_lock_) { return ReleaseChildFd(STDOUT_FILENO); }
   // Reads from this FD come from stderr of the subprocess
-  int ReleaseChildStderrFd() { return ReleaseChildFd(STDERR_FILENO); }
+  int ReleaseChildStderrFd() EXCLUDES(state_lock_) { return ReleaseChildFd(STDERR_FILENO); }
 
   pid_t pid() const;
 
   void SetEnv(const std::string& key, const std::string& value);
 
-  // Issues Start() then Wait() and collects the output from the child process
-  // (stdout or stderr) into the output parameter.
-  Status Call(std::string* output, StdFdTypes read_fds = StdFdTypes{StdFdType::kOut});
-
-  // Writes pid to cgroup specified by path
-  void AddPIDToCGroup(const std::string& path, pid_t pid);
+  // Issues Start() then Wait() and collects the desired streams from the child process
+  // into the output parameter(s).
+  Status Call(std::string* output, std::string* error = nullptr);
 
  private:
 
@@ -202,12 +246,12 @@ class Subprocess {
   Status StartWithForkExec() REQUIRES(state_lock_);
   Status StartWithPosixSpawn() REQUIRES(state_lock_);
 
-  void SetFdShared(int stdfd, SubprocessStreamMode mode);
-  int CheckAndOffer(int stdfd) const;
-  int ReleaseChildFd(int stdfd);
-  Status DoWait(int* ret, int options);
-  SubprocessState state() const;
-  Status KillInternal(int signal, bool must_be_running);
+  void SetFdShared(int stdfd, SubprocessStreamMode mode) EXCLUDES(state_lock_);
+  int CheckAndOffer(int stdfd) const EXCLUDES(state_lock_);
+  int ReleaseChildFd(int stdfd) EXCLUDES(state_lock_);
+  Status DoWait(int* ret, int options) EXCLUDES(state_lock_);
+  SubprocessState state() const EXCLUDES(state_lock_);
+  Status KillInternal(int signal, bool must_be_running) EXCLUDES(state_lock_);
 
   // Combine the existing environment with the overrides from env_, and return it as a vector
   // of name=value strings and a pointer array terminated with a null, referring to the vector,
@@ -233,7 +277,7 @@ class Subprocess {
 
   void FinalizeParentSideOfPipes(const ChildPipes& child_pipes) REQUIRES(state_lock_);
 
-  void ConfigureOutputStreamAfterFork(int out_stream_fd, int child_write_fd);
+  void ConfigureOutputStreamAfterFork(int out_stream_fd, int child_write_fd) REQUIRES(state_lock_);
 
   // ----------------------------------------------------------------------------------------------
   // Fields
@@ -244,13 +288,13 @@ class Subprocess {
 
   mutable std::mutex state_lock_;
   SubprocessState state_;
-  pid_t child_pid_;
-  SubprocessStreamMode fd_state_[3];
-  int child_fds_[3];
+  pid_t child_pid_ GUARDED_BY(state_lock_);
+  SubprocessStreamMode fd_state_[3] GUARDED_BY(state_lock_);
+  int child_fds_[3] GUARDED_BY(state_lock_);
 
   // The cached exit result code if Wait() has been called.
   // Only valid if state_ == kExited.
-  int cached_rc_;
+  int cached_rc_ GUARDED_BY(state_lock_);
 
   std::map<std::string, std::string> env_;
 

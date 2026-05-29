@@ -1,15 +1,15 @@
 package com.yugabyte.yw.models.helpers.provider.region;
 
-import java.util.HashMap;
-import java.util.Map;
-
 import com.fasterxml.jackson.annotation.JsonAlias;
 import com.fasterxml.jackson.annotation.JsonIgnore;
 import com.yugabyte.yw.cloud.PublicCloudConstants.Architecture;
+import com.yugabyte.yw.models.common.YbaApi;
+import com.yugabyte.yw.models.common.YbaApi.YbaApiVisibility;
 import com.yugabyte.yw.models.helpers.CloudInfoInterface;
-
 import io.swagger.annotations.ApiModelProperty;
 import io.swagger.annotations.ApiModelProperty.AccessMode;
+import java.util.HashMap;
+import java.util.Map;
 import lombok.Data;
 import lombok.EqualsAndHashCode;
 
@@ -26,11 +26,19 @@ public class AWSRegionCloudInfo implements CloudInfoInterface {
   public String securityGroupId;
 
   @ApiModelProperty(
-      value = "The AMI to be used in this region.",
+      value =
+          "<b style=\"color:#ff0000\">Deprecated since YBA version 2.20.0.</b> Use"
+              + " provider.imageBundle instead",
       accessMode = AccessMode.READ_WRITE)
+  @YbaApi(visibility = YbaApiVisibility.DEPRECATED, sinceYBAVersion = "2.20.0")
   public String ybImage;
 
-  @ApiModelProperty(accessMode = AccessMode.READ_ONLY)
+  @ApiModelProperty(
+      value =
+          "<b style=\"color:#ff0000\">Deprecated since YBA version 2.20.0.</b> Use"
+              + " provider.imageBundle instead",
+      accessMode = AccessMode.READ_WRITE)
+  @YbaApi(visibility = YbaApiVisibility.DEPRECATED, sinceYBAVersion = "2.20.0")
   public Architecture arch;
 
   @JsonIgnore
@@ -61,5 +69,10 @@ public class AWSRegionCloudInfo implements CloudInfoInterface {
   @JsonIgnore
   public void withSensitiveDataMasked() {
     // pass
+  }
+
+  @JsonIgnore
+  public void mergeMaskedFields(CloudInfoInterface providerCloudInfo) {
+    // Pass
   }
 }

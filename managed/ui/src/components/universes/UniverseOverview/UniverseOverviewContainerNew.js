@@ -1,4 +1,4 @@
-// Copyright YugaByte Inc.
+// Copyright YugabyteDB, Inc.
 
 import { UniverseOverviewNew } from '../../universes';
 import { connect } from 'react-redux';
@@ -19,10 +19,6 @@ const mapDispatchToProps = (dispatch) => {
 };
 
 function mapStateToProps(state) {
-  const {
-    featureFlags: { test, released }
-  } = state;
-
   return {
     currentCustomer: state.customer.currentCustomer,
     runtimeConfigs: state.customer.runtimeConfigs,
@@ -31,7 +27,7 @@ function mapStateToProps(state) {
     tasks: state.tasks,
     modal: state.modal,
     tables: state.tables,
-    enableTopKMetrics: test.enableTopKMetrics || released.enableTopKMetrics
+    featureFlags: state.featureFlags
   };
 }
 

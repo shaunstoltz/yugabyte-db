@@ -15,9 +15,9 @@
 // specific language governing permissions and limitations
 // under the License.
 //
-// The following only applies to changes made to this file as part of YugaByte development.
+// The following only applies to changes made to this file as part of YugabyteDB development.
 //
-// Portions Copyright (c) YugaByte, Inc.
+// Portions Copyright (c) YugabyteDB, Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License"); you may not use this file except
 // in compliance with the License.  You may obtain a copy of the License at
@@ -213,6 +213,23 @@ TEST_F(NetUtilTest, TestLsof) {
 
   ASSERT_GE(lsof_lines.size(), 3);
   ASSERT_STR_CONTAINS(lsof_lines[2], "net_util-test");
+}
+
+TEST_F(NetUtilTest, YB_DISABLE_TEST_ON_MACOS(TestChronyc)) {
+  vector<string> tracking_lines;
+  TryRunChronycTracking(&tracking_lines);
+  ASSERT_GE(tracking_lines[1].size(), 2);
+  ASSERT_STR_CONTAINS(tracking_lines[1], "Reference ID");
+  ASSERT_STR_CONTAINS(tracking_lines[1], "Stratum");
+  ASSERT_STR_CONTAINS(tracking_lines[1], "Residual freq");
+  ASSERT_STR_CONTAINS(tracking_lines[1], "Skew");
+
+  vector<string> sourcestats_lines;
+  TryRunChronycSourceInfo(&sourcestats_lines);
+  ASSERT_GE(sourcestats_lines[1].size(), 2);
+  ASSERT_STR_CONTAINS(sourcestats_lines[1], "Freq Skew");
+  ASSERT_STR_CONTAINS(sourcestats_lines[1], "Offset");
+  ASSERT_STR_CONTAINS(sourcestats_lines[1], "Std Dev");
 }
 
 TEST_F(NetUtilTest, TestGetFQDN) {

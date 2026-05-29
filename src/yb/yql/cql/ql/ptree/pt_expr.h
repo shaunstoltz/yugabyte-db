@@ -1,5 +1,5 @@
 //--------------------------------------------------------------------------------------------------
-// Copyright (c) YugaByte, Inc.
+// Copyright (c) YugabyteDB, Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License"); you may not use this file except
 // in compliance with the License.  You may obtain a copy of the License at
@@ -17,11 +17,9 @@
 
 #pragma once
 
-#include <boost/optional.hpp>
-
 #include "yb/common/common_fwd.h"
 #include "yb/common/ql_datatype.h"
-#include "yb/common/ql_name.h"
+#include "yb/qlexpr/ql_name.h"
 
 #include "yb/util/net/net_fwd.h"
 
@@ -30,6 +28,7 @@
 #include "yb/yql/cql/ql/ptree/pt_expr_types.h"
 #include "yb/yql/cql/ql/ptree/sem_state.h"
 #include "yb/yql/cql/ql/ptree/tree_node.h"
+#include "yb/yql/cql/ql/ql_fwd.h"
 
 namespace yb {
 
@@ -145,7 +144,7 @@ class PTExpr : public TreeNode {
   }
 
   // Expression return result set column type in QL format.
-  virtual void rscol_type_PB(QLTypePB *pb_type ) const;
+  virtual void rscol_type_PB(QLTypeMsg *pb_type ) const;
 
   virtual void set_ql_type(const std::shared_ptr<QLType>& ql_type) {
     ql_type_ = ql_type;
@@ -201,7 +200,8 @@ class PTExpr : public TreeNode {
   //     When loading column descriptor from Catalog::Table and Catalog::IndexTable, we might want
   //     to read the name that is kept in the Catalog. Unmangled name for regular column, and
   //     mangled name for index-expression column.
-  virtual std::string QLName(QLNameOption option = QLNameOption::kUserOriginalName) const {
+  virtual std::string QLName(
+      qlexpr::QLNameOption option = qlexpr::QLNameOption::kUserOriginalName) const {
     LOG(INFO) << "Missing QLName for expression("
               << static_cast<int>(expr_op())
               << ") that is being selected";
@@ -209,7 +209,7 @@ class PTExpr : public TreeNode {
   }
 
   virtual std::string MangledName() const {
-    return QLName(QLNameOption::kMangledName);
+    return QLName(qlexpr::QLNameOption::kMangledName);
   }
 
   virtual std::string MetadataName() const;
@@ -787,7 +787,7 @@ class PTExprConst : public PTExpr0<itype, ytype>,
     return Status::OK();
   };
 
-  virtual std::string QLName(QLNameOption option = QLNameOption::kUserOriginalName)
+  virtual std::string QLName(qlexpr::QLNameOption option = qlexpr::QLNameOption::kUserOriginalName)
       const override {
     return LiteralType::ToQLName(LiteralType::value());
   }
@@ -824,7 +824,8 @@ class PTStar : public PTNull {
     return MCMakeShared<PTStar>(memctx, std::forward<TypeArgs>(args)...);
   }
 
-  virtual std::string QLName(QLNameOption option = QLNameOption::kUserOriginalName) const override {
+  virtual std::string QLName(
+      qlexpr::QLNameOption option = qlexpr::QLNameOption::kUserOriginalName) const override {
     return "";
   }
 
@@ -847,16 +848,23 @@ class PTLiteralString : public PTLiteral<MCSharedPtr<MCString>> {
   Status ToDouble(long double *value, bool negate) const;
   Status ToDecimal(util::Decimal *value, bool negate) const;
   Status ToDecimal(std::string *value, bool negate) const;
+  Result<Slice> ToDecimal(ThreadSafeArena& arena, bool negate) const;
   Status ToVarInt(std::string *value, bool negate) const;
+  Result<Slice> ToVarInt(ThreadSafeArena& arena, bool negate) const;
 
   std::string ToString() const;
+  Slice ToString(ThreadSafeArena& arena) const;
 
   Status ToString(std::string *value) const;
-  Status ToTimestamp(int64_t *value) const;
+  Status ToTimestamp(int64_t *value, const QLMetrics *ql_metrics) const;
   Status ToDate(uint32_t *value) const;
   Status ToTime(int64_t *value) const;
 
   Status ToInetaddress(InetAddress *value) const;
+
+ private:
+  template <class T>
+  Result<T> FromString(bool negate) const;
 };
 
 // Class representing a json operator.
@@ -894,12 +902,13 @@ class PTJsonOperator : public PTExpr {
   }
 
   // Selected name.
-  std::string QLName(QLNameOption option = QLNameOption::kUserOriginalName) const override {
+  std::string QLName(
+      qlexpr::QLNameOption option = qlexpr::QLNameOption::kUserOriginalName) const override {
     std::string jquote = "'";
     std::string op_name = json_operator_ == JsonOperator::JSON_OBJECT ? "->" : "->>";
     std::string jattr = arg_->QLName(option);
-    if (option == QLNameOption::kMangledName) {
-      jattr = YcqlName::MangleJsonAttrName(jattr);
+    if (option == qlexpr::QLNameOption::kMangledName) {
+      jattr = qlexpr::YcqlName::MangleJsonAttrName(jattr);
     }
 
     return op_name + jquote + jattr + jquote;
@@ -971,7 +980,8 @@ class PTRelationExpr : public PTExpr {
                                          PTExprPtr op1,
                                          PTExprPtr op2,
                                          PTExprPtr op3) override;
-  std::string QLName(QLNameOption option = QLNameOption::kUserOriginalName) const override;
+  std::string QLName(
+      qlexpr::QLNameOption option = qlexpr::QLNameOption::kUserOriginalName) const override;
 };
 
 //--------------------------------------------------------------------------------------------------
@@ -1030,11 +1040,12 @@ class PTRef : public PTOperator0 {
 
   // Add the name of column that is being referenced to output parameter.
   void CollectReferencedIndexColnames(MCSet<std::string> *col_names) const override {
-    col_names->insert(QLName(QLNameOption::kMangledName));
+    col_names->insert(QLName(qlexpr::QLNameOption::kMangledName));
   }
 
   // Selected name.
-  std::string QLName(QLNameOption option = QLNameOption::kUserOriginalName) const override;
+  std::string QLName(
+      qlexpr::QLNameOption option = qlexpr::QLNameOption::kUserOriginalName) const override;
 
   // Access function for name.
   const PTQualifiedNamePtr& name() const {
@@ -1097,11 +1108,12 @@ class PTJsonColumnWithOperators : public PTOperator0 {
 
   // Add the name of this JSONB expression to output parameter.
   void CollectReferencedIndexColnames(MCSet<std::string> *col_names) const override {
-    col_names->insert(QLName(QLNameOption::kMangledName));
+    col_names->insert(QLName(qlexpr::QLNameOption::kMangledName));
   }
 
   // Selected name.
-  std::string QLName(QLNameOption option = QLNameOption::kUserOriginalName) const override;
+  std::string QLName(
+      qlexpr::QLNameOption option = qlexpr::QLNameOption::kUserOriginalName) const override;
 
   const PTExprListNode::SharedPtr& operators() const {
     return operators_;
@@ -1183,7 +1195,8 @@ class PTSubscriptedColumn : public PTOperator0 {
   // Analyze LHS expression.
   virtual Status CheckLhsExpr(SemContext *sem_context) override;
 
-  virtual std::string QLName(QLNameOption option = QLNameOption::kUserOriginalName) const override;
+  virtual std::string QLName(
+      qlexpr::QLNameOption option = qlexpr::QLNameOption::kUserOriginalName) const override;
 
  private:
   PTQualifiedNamePtr name_;
@@ -1221,7 +1234,8 @@ class PTAllColumns : public PTOperator0 {
     return TreeNodeOpcode::kPTAllColumns;
   }
 
-  std::string QLName(QLNameOption option = QLNameOption::kUserOriginalName) const override {
+  std::string QLName(
+      qlexpr::QLNameOption option = qlexpr::QLNameOption::kUserOriginalName) const override {
     // We should not get here as '*' should have been converted into a list of column name before
     // the selected tuple is constructed and described.
     VLOG(3) << "Calling QLName for '*' is not expected";
@@ -1265,12 +1279,13 @@ class PTExprAlias : public PTOperator1 {
   using PTOperatorExpr::AnalyzeOperator;
   virtual Status AnalyzeOperator(SemContext *sem_context, PTExprPtr op1) override;
 
-  std::string QLName(QLNameOption option = QLNameOption::kUserOriginalName) const override {
+  std::string QLName(
+      qlexpr::QLNameOption option = qlexpr::QLNameOption::kUserOriginalName) const override {
     return alias_->c_str();
   }
 
   // Alias result set column type in QL format.
-  virtual void rscol_type_PB(QLTypePB *pb_type) const override {
+  virtual void rscol_type_PB(QLTypeMsg *pb_type) const override {
     return op1_->rscol_type_PB(pb_type);
   }
 
@@ -1347,8 +1362,10 @@ class PTBindVar : public PTExpr {
     return TreeNodeOpcode::kPTBindVar;
   }
 
-  std::string QLName(QLNameOption option = QLNameOption::kUserOriginalName) const override {
-    std::string qlname = (user_pos_) ? user_pos_->ToString() : name()->c_str();
+  std::string QLName(
+      qlexpr::QLNameOption option = qlexpr::QLNameOption::kUserOriginalName) const override {
+    std::string qlname = (user_pos_) ? user_pos_->ToString()
+                                     : (name() ? name()->c_str() : default_bindvar_name().c_str());
     return ":" +  qlname;
   }
 
@@ -1417,8 +1434,8 @@ class PTBindVar : public PTExpr {
 
  private:
   // 0-based position.
-  PTConstVarInt::SharedPtr user_pos_; // pos used for parsing.
-  boost::optional<int64_t> pos_; // pos after parsing is done.
+  PTConstVarInt::SharedPtr user_pos_;  // pos used for parsing.
+  std::optional<int64_t> pos_;         // pos after parsing is done.
   // Variable name.
   MCSharedPtr<MCString> name_;
   MCSharedPtr<MCVector<MCSharedPtr<MCString>>> alternative_names_;

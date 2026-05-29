@@ -1,4 +1,4 @@
-// Copyright (c) YugaByte, Inc.
+// Copyright (c) YugabyteDB, Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License"); you may not use this file except
 // in compliance with the License.  You may obtain a copy of the License at
@@ -49,7 +49,7 @@ namespace integration_tests {
 const auto kDefaultTimeout = 30000ms;
 constexpr int kNumTables = 3;
 constexpr int kMovesPerTable = 1;
-constexpr int kNumTxnTablets = 6;
+constexpr int kNumSystemTablets = 6;
 
 // We need multiple tables in order to test load_balancer_max_concurrent_moves_per_table.
 class LoadBalancerColocatedTablesTest : public YBTableTestBase {
@@ -77,10 +77,15 @@ class LoadBalancerColocatedTablesTest : public YBTableTestBase {
     opts->extra_master_flags.push_back("--load_balancer_max_concurrent_moves_per_table="
                                        + std::to_string(kMovesPerTable));
     opts->extra_master_flags.push_back("--enable_global_load_balancing=true");
-    // This value needs to be divisible by three so that the transaction tablets are evenly divided
+    // This value needs to be divisible by three so that the system tablets are evenly divided
     // amongst the three tservers that we end up creating.
-    opts->extra_master_flags.push_back("--transaction_table_num_tablets="
-                                       + std::to_string(kNumTxnTablets));
+    // System tablets such as those from the transactions table and advisory lock table.
+    opts->extra_master_flags.push_back("--TEST_system_table_num_tablets="
+                                       + std::to_string(kNumSystemTablets));
+    // Disable auto analyze service in the test because one stateful service table can only
+    // have one tablet, causing the tests flaky.
+    opts->extra_master_flags.push_back("--ysql_enable_auto_analyze_infra=false");
+    opts->extra_tserver_flags.push_back("--ysql_enable_auto_analyze_infra=false");
   }
 
   virtual void CreateTables() {
@@ -100,12 +105,10 @@ class LoadBalancerColocatedTablesTest : public YBTableTestBase {
                                    tbl_name));
 
       // Get the colocated database oid and the colocated table oid.
-      res = ASSERT_RESULT(conn.FetchFormat("SELECT oid FROM pg_database WHERE datname = '$0'",
-                                            dbname));
-      const uint32_t db_oid = ASSERT_RESULT(pgwrapper::GetInt32(res.get(), 0, 0));
-      res = ASSERT_RESULT(conn.FetchFormat("SELECT oid FROM pg_class WHERE relname = '$0'",
-                                            tbl_name));
-      const uint32_t table_oid = ASSERT_RESULT(pgwrapper::GetInt32(res.get(), 0, 0));
+      const auto db_oid = ASSERT_RESULT(conn.FetchRow<pgwrapper::PGOid>(Format(
+          "SELECT oid FROM pg_database WHERE datname = '$0'", dbname)));
+      const auto table_oid = ASSERT_RESULT(conn.FetchRow<pgwrapper::PGOid>(Format(
+          "SELECT oid FROM pg_class WHERE relname = '$0'", tbl_name)));
       table_names_.emplace_back(YQL_DATABASE_PGSQL,
                                 GetPgsqlNamespaceId(db_oid),
                                 dbname,
@@ -138,8 +141,8 @@ class LoadBalancerColocatedTablesTest : public YBTableTestBase {
   Result<pgwrapper::PGConn> ConnectToDB(
       const std::string& dbname = "", bool simple_query_protocol = false) {
     return pgwrapper::PGConnBuilder({
-      .host = external_mini_cluster_->pgsql_hostport(0).host(),
-      .port = external_mini_cluster_->pgsql_hostport(0).port(),
+      .host = external_mini_cluster_->ysql_hostport(0).host(),
+      .port = external_mini_cluster_->ysql_hostport(0).port(),
       .dbname = dbname
     }).Connect(simple_query_protocol);
   }
@@ -162,7 +165,8 @@ class LoadBalancerColocatedTablesTest : public YBTableTestBase {
         kDefaultTimeout));
 
     // Wait for load balancing to complete.
-    WaitForLoadBalanceCompletion();
+    auto base_timeout = MonoDelta::FromMilliseconds(kDefaultLoadBalanceTimeoutMs);
+    WaitForLoadBalanceCompletion(yb::IsTsan() ? base_timeout * 5 : base_timeout);
 
     // Assert that each table is balanced, and that we are globally balanced (Before global load
     // balancing, colocated parent tablets would not move) - Each colocated database or tablegroup
@@ -191,7 +195,7 @@ class LoadBalancerTablegroupsTest : public LoadBalancerColocatedTablesTest {
       // Currently just using 1111, 2222, 3333, etc.
       const uint32_t db_oid = i * 1000 + i * 100 + i * 10 + i;
       const uint32_t tablegroup_oid = db_oid * kNumTables + 1;
-      const uint32_t table_oid = tablegroup_oid * kNumTxnTablets + 1;
+      const uint32_t table_oid = tablegroup_oid + 1;
       table_names_.emplace_back(
           YQL_DATABASE_PGSQL,
           GetPgsqlNamespaceId(db_oid),
@@ -205,23 +209,18 @@ class LoadBalancerTablegroupsTest : public LoadBalancerColocatedTablesTest {
 
     for (const auto& tn : table_names_) {
       ASSERT_OK(client_->CreateNamespaceIfNotExists(
-          tn.namespace_name(),
-          tn.namespace_type(),
-          "",                /* creator_role_name */
-          tn.namespace_id(), /* namespace_id */
-          "",                /* source_namespace_id */
-          boost::none,       /* next_pg_oid */
+          tn.namespace_name(), tn.namespace_type(), "", /* creator_role_name */
+          tn.namespace_id(),                            /* namespace_id */
+          "",                                           /* source_namespace_id */
+          std::nullopt,                                 /* next_pg_oid */
           false /* colocated */));
 
       ASSERT_OK(client_->CreateTablegroup(
-          tn.namespace_name(),
-          tn.namespace_id(),
-          ns_id_to_tg_id[tn.namespace_id()],
-          "" /* tablespace_id */,
-          nullptr /* txn */));
+          tn.namespace_name(), tn.namespace_id(), ns_id_to_tg_id[tn.namespace_id()],
+          "" /* tablespace_id */, nullptr /* txn */));
       client::YBSchemaBuilder b;
-      b.AddColumn("k")->Type(BINARY)->NotNull()->PrimaryKey();
-      b.AddColumn("v")->Type(BINARY)->NotNull();
+      b.AddColumn("k")->Type(DataType::BINARY)->NotNull()->PrimaryKey();
+      b.AddColumn("v")->Type(DataType::BINARY)->NotNull();
       ASSERT_OK(b.Build(&schema_));
 
       ASSERT_OK(NewTableCreator()
@@ -241,7 +240,7 @@ class LoadBalancerTablegroupsTest : public LoadBalancerColocatedTablesTest {
   }
 };
 
-TEST_F(LoadBalancerTablegroupsTest, YB_DISABLE_TEST_IN_TSAN(GlobalLoadBalancingWithTablegroups)) {
+TEST_F(LoadBalancerTablegroupsTest, GlobalLoadBalancingWithTablegroups) {
   // Start with 3 tables, 1 table per tablegroup.
   TestGlobalLoadBalancingWithColocatedTables();
 }
@@ -271,19 +270,20 @@ class LoadBalancerLegacyColocatedDBColocatedTablesTest : public LoadBalancerColo
                                                     "",                 /* creator_role_name */
                                                     tn.namespace_id(),  /* namespace_id */
                                                     "",                 /* source_namespace_id */
-                                                    boost::none,        /* next_pg_oid */
+                                                    std::nullopt,        /* next_pg_oid */
                                                     true                /* colocated */));
 
       client::YBSchemaBuilder b;
-      b.AddColumn("k")->Type(BINARY)->NotNull()->PrimaryKey();
-      b.AddColumn("v")->Type(BINARY)->NotNull();
+      b.AddColumn("k")->Type(DataType::BINARY)->NotNull()->PrimaryKey();
+      b.AddColumn("v")->Type(DataType::BINARY)->NotNull();
       ASSERT_OK(b.Build(&schema_));
 
-      ASSERT_OK(NewTableCreator()->table_name(tn)
-                                  .table_id(tn.table_id())
-                                  .schema(&schema_)
-                                  .is_colocated_via_database(true)
-                                  .Create());
+      ASSERT_OK(NewTableCreator()
+                    ->table_name(tn)
+                    .table_id(tn.table_id())
+                    .schema(&schema_)
+                    .is_colocated_via_database(true)
+                    .Create());
     }
   }
 
@@ -299,7 +299,7 @@ class LoadBalancerLegacyColocatedDBColocatedTablesTest : public LoadBalancerColo
 };
 
 TEST_F(LoadBalancerLegacyColocatedDBColocatedTablesTest,
-       YB_DISABLE_TEST_IN_TSAN(GlobalLoadBalancingWithLegacyColocatedDBColocatedTables)) {
+       GlobalLoadBalancingWithLegacyColocatedDBColocatedTables) {
   // Start with 3 legacy colocated databases with one table each, so 3 tablets in total.
   TestGlobalLoadBalancingWithColocatedTables();
 }

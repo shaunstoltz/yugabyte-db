@@ -1,5 +1,5 @@
 /*
- * Copyright (c) YugaByte, Inc.
+ * Copyright (c) YugabyteDB, Inc.
  *
  * Define the status command and other useful utils for gathering service Status.
  */
@@ -7,14 +7,16 @@ package cmd
 
 import (
 	"fmt"
+	"log"
 
 	"github.com/spf13/cobra"
-	"github.com/yugabyte/yugabyte-db/managed/yba-installer/common"
+	"github.com/yugabyte/yugabyte-db/managed/yba-installer/pkg/common"
+	"github.com/yugabyte/yugabyte-db/managed/yba-installer/pkg/ybactlstate"
 )
 
 var statusCmd = &cobra.Command{
 	Use: "status",
-	Short: "The status command prints out the status of service(s) running as " +
+	Short: "Print the status of service(s) running as " +
 		"part of your YugabyteDB Anywhere installation.",
 	Long: `
     The status command is used to print out the information corresponding to the
@@ -24,23 +26,36 @@ var statusCmd = &cobra.Command{
     applicable systemd and config files, and the running status of the service
     (active or inactive)`,
 	Args:      cobra.MatchAll(cobra.MaximumNArgs(1), cobra.OnlyValidArgs),
-	ValidArgs: []string{"postgres", "prometheus", "yb-platform"},
+	ValidArgs: []string{"postgres", "prometheus", "yb-platform", "yb-perf-advisor"},
 	Run: func(cmd *cobra.Command, args []string) {
 		// Print status for given service.
+		state, err := ybactlstate.Initialize()
+		if err != nil {
+			log.Fatal("unable to load yba installer state: " + err.Error())
+		}
 		if len(args) == 1 {
-			service, exists := services[args[0]]
-			if !exists {
+			service := serviceManager.ServiceByName(args[0])
+			if service == nil {
 				fmt.Printf("Service %s was not installed\n", args[0])
 				return
 			}
-			common.PrintStatus(service.Status())
+			status, err := service.Status()
+			if err != nil {
+				log.Fatal("Failed to get status: " + err.Error())
+			}
+			common.PrintStatus(state.CurrentStatus.String(), status)
 		} else {
 			// Print status for all services.
 			var statuses []common.Status
-			for _, service := range services {
-				statuses = append(statuses, service.Status())
+			for service := range serviceManager.Services() {
+				status, err := service.Status()
+				if err != nil {
+					log.Fatal("Failed to get status: " + err.Error())
+				}
+				statuses = append(statuses, status)
 			}
-			common.PrintStatus(statuses...)
+
+			common.PrintStatus(state.CurrentStatus.String(), statuses...)
 		}
 	},
 }

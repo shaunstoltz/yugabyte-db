@@ -15,9 +15,9 @@
 // specific language governing permissions and limitations
 // under the License.
 //
-// The following only applies to changes made to this file as part of YugaByte development.
+// The following only applies to changes made to this file as part of YugabyteDB development.
 //
-// Portions Copyright (c) YugaByte, Inc.
+// Portions Copyright (c) YugabyteDB, Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License"); you may not use this file except
 // in compliance with the License.  You may obtain a copy of the License at
@@ -38,8 +38,6 @@
 #include <utility>
 #include <vector>
 
-#include <boost/optional/optional.hpp>
-#include <glog/logging.h>
 #include <gtest/gtest.h>
 
 #include "yb/client/client.h"
@@ -50,7 +48,7 @@
 #include "yb/common/common.pb.h"
 #include "yb/common/entity_ids_types.h"
 #include "yb/common/hybrid_time.h"
-#include "yb/common/partition.h"
+#include "yb/dockv/partition.h"
 
 #include "yb/gutil/algorithm.h"
 
@@ -60,6 +58,7 @@
 #include "yb/master/master.h"
 #include "yb/master/mini_master.h"
 
+#include "yb/util/logging.h"
 #include "yb/util/memory/arena_fwd.h"
 #include "yb/util/status.h"
 #include "yb/util/status_log.h"
@@ -74,13 +73,10 @@ namespace master {
 
 using client::YBClient;
 using client::YBClientBuilder;
-using client::YBColumnSchema;
 using client::YBSchema;
 using client::YBSchemaBuilder;
-using client::YBTable;
 using client::YBTableCreator;
 using client::YBTableName;
-using std::shared_ptr;
 using std::string;
 
 const std::string kKeyspaceName("my_keyspace");
@@ -143,14 +139,14 @@ class MasterReplicationTest : public YBMiniClusterTestBase<MiniCluster> {
                      const YBTableName& table_name) {
     YBSchema schema;
     YBSchemaBuilder b;
-    b.AddColumn("key")->Type(INT32)->NotNull()->PrimaryKey();
-    b.AddColumn("int_val")->Type(INT32)->NotNull();
-    b.AddColumn("string_val")->Type(STRING)->NotNull();
+    b.AddColumn("key")->Type(DataType::INT32)->NotNull()->PrimaryKey();
+    b.AddColumn("int_val")->Type(DataType::INT32)->NotNull();
+    b.AddColumn("string_val")->Type(DataType::STRING)->NotNull();
     CHECK_OK(b.Build(&schema));
     std::unique_ptr<YBTableCreator> table_creator(client->NewTableCreator());
     return table_creator->table_name(table_name)
         .schema(&schema)
-        .hash_schema(YBHashSchema::kMultiColumnHash)
+        .hash_schema(dockv::YBHashSchema::kMultiColumnHash)
         .Create();
   }
 

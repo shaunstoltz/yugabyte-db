@@ -1,4 +1,4 @@
-// Copyright (c) YugaByte, Inc.
+// Copyright (c) YugabyteDB, Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License"); you may not use this file except
 // in compliance with the License.  You may obtain a copy of the License at
@@ -17,6 +17,7 @@
 
 #include <functional>
 #include <mutex>
+#include <span>
 #include <type_traits>
 
 #include "yb/util/flags.h"
@@ -72,11 +73,15 @@ class RunningTransactionContext {
       const TransactionId& id, RemoveReason reason, MinRunningNotifier* min_running_notifier) = 0;
 
   virtual void EnqueueRemoveUnlocked(
-      const TransactionId& id, RemoveReason reason, MinRunningNotifier* min_running_notifier) = 0;
+      const TransactionId& id, RemoveReason reason, MinRunningNotifier* min_running_notifier,
+      const Status& expected_deadlock_status) = 0;
 
   int64_t NextRequestIdUnlocked() {
     return ++request_serial_;
   }
+
+  // Used tp signal the wait-queue that the transaction has been aborted.
+  virtual void SignalAborted(const TransactionId& id) = 0;
 
   virtual const std::string& LogPrefix() const = 0;
 
@@ -84,7 +89,12 @@ class RunningTransactionContext {
     return delayer_;
   }
 
+  virtual std::weak_ptr<void> RetainWeak() = 0;
+
   virtual bool Closing() const = 0;
+
+  virtual FastModeTransactionScope CreateFastModeTransactionScope(
+      const TransactionMetadata& metadata) = 0;
 
  protected:
   friend class RunningTransaction;
@@ -98,6 +108,19 @@ class RunningTransactionContext {
   // Used only in tests.
   Delayer delayer_;
 };
+
+// Wraps a callback so it only executes while the weak_ptr target is alive.
+// The locked shared_ptr is held for the callback's duration, preventing destruction mid-callback.
+template <class Callback>
+auto GuardedByWeak(std::weak_ptr<void> weak, Callback&& callback) {
+  return [weak = std::move(weak), callback = std::forward<Callback>(callback)](auto&&... args) {
+    auto guard = weak.lock();
+    if (!guard) {
+      return;
+    }
+    callback(std::forward<decltype(args)>(args)...);
+  };
+}
 
 } // namespace tablet
 } // namespace yb

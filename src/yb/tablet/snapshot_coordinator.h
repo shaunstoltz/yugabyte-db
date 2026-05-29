@@ -1,4 +1,4 @@
-// Copyright (c) YugaByte, Inc.
+// Copyright (c) YugabyteDB, Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License"); you may not use this file except
 // in compliance with the License.  You may obtain a copy of the License at
@@ -26,11 +26,9 @@ namespace tablet {
 // Interface for snapshot coordinator.
 class SnapshotCoordinator {
  public:
-  virtual Status CreateReplicated(
-      int64_t leader_term, const SnapshotOperation& operation) = 0;
+  virtual Status CreateReplicated(int64_t leader_term, const SnapshotOperation& operation) = 0;
 
-  virtual Status DeleteReplicated(
-      int64_t leader_term, const SnapshotOperation& operation) = 0;
+  virtual Status DeleteReplicated(int64_t leader_term, const SnapshotOperation& operation) = 0;
 
   virtual Status RestoreSysCatalogReplicated(
       int64_t leader_term, const SnapshotOperation& operation, Status* complete_status) = 0;

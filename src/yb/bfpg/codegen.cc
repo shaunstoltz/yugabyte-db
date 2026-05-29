@@ -1,5 +1,5 @@
 //--------------------------------------------------------------------------------------------------
-// Copyright (c) YugaByte, Inc.
+// Copyright (c) YugabyteDB, Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License"); you may not use this file except
 // in compliance with the License.  You may obtain a copy of the License at
@@ -15,7 +15,7 @@
 #include <fstream>
 #include <vector>
 
-#include <glog/logging.h>
+#include "yb/util/logging.h"
 
 #include "yb/bfpg/directory.h"
 #include "yb/common/ql_type.h"
@@ -25,14 +25,13 @@ using std::endl;
 using std::map;
 using std::ofstream;
 using std::string;
-using std::to_string;
 using std::vector;
 
 namespace yb {
 namespace bfpg {
 
 static const char *kFileStart =
-  "// Copyright (c) YugaByte, Inc.\n\n";
+  "// Copyright (c) YugabyteDB, Inc.\n\n";
 
 static const char *kFileNamespace =
   "namespace yb {\n"

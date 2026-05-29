@@ -15,9 +15,9 @@
 // specific language governing permissions and limitations
 // under the License.
 //
-// The following only applies to changes made to this file as part of YugaByte development.
+// The following only applies to changes made to this file as part of YugabyteDB development.
 //
-// Portions Copyright (c) YugaByte, Inc.
+// Portions Copyright (c) YugabyteDB, Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License"); you may not use this file except
 // in compliance with the License.  You may obtain a copy of the License at
@@ -32,16 +32,26 @@
 
 #pragma once
 
+#include <boost/asio/io_context.hpp>
+#include <boost/asio/strand.hpp>
+
 #include "yb/client/client_fwd.h"
-#include "yb/client/yb_table_name.h"
+
 #include "yb/common/hybrid_time.h"
-#include "yb/master/catalog_manager.h"
-#include "yb/master/xcluster/xcluster_consumer_metrics.h"
-#include "yb/rpc/scheduler.h"
-#include "yb/util/threadpool.h"
+#include "yb/common/xcluster_util.h"
+
 #include "yb/gutil/thread_annotations.h"
 
+#include "yb/master/master_defaults.h"
+#include "yb/master/xcluster/xcluster_consumer_metrics.h"
+#include "yb/master/xcluster/xcluster_manager_if.h"
+
+#include "yb/rpc/poller.h"
+
 namespace yb {
+
+class MetricRegistry;
+
 namespace master {
 
 // Periodically compute the xCluster safe time and store it in sys catalog.
@@ -53,48 +63,37 @@ class XClusterSafeTimeService {
       Master* master, CatalogManager* catalog_manager, MetricRegistry* metric_registry);
   virtual ~XClusterSafeTimeService();
 
-  Status Init();
   void Shutdown();
 
   Status CreateXClusterSafeTimeTableIfNotFound();
 
-  void ScheduleTaskIfNeeded() EXCLUDES(shutdown_cond_lock_, task_enqueue_lock_);
+  void ScheduleTaskIfNeeded();
 
   // Calculate the max_safe_time - min_safe_time for each namespace.
-  Result<std::unordered_map<NamespaceId, uint64_t>> GetEstimatedDataLossMicroSec();
+  Result<std::unordered_map<NamespaceId, uint64_t>> GetEstimatedDataLossMicroSec(
+      const LeaderEpoch& epoch);
 
-  Result<XClusterNamespaceToSafeTimeMap> RefreshAndGetXClusterNamespaceToSafeTimeMap();
+  // Computes the safe time map and fills it in the response.
+  Status ComputeAndGetXClusterSafeTimeInfo(
+      const LeaderEpoch& epoch, GetXClusterSafeTimeResponsePB& resp);
+
+  Result<HybridTime> GetXClusterSafeTimeForNamespace(
+      const NamespaceId& namespace_id, const XClusterSafeTimeFilter& filter) const;
 
   xcluster::XClusterConsumerClusterMetrics* TEST_GetMetricsForNamespace(
       const NamespaceId& namespace_id);
 
- private:
-  friend class XClusterSafeTimeServiceMocked;
-  FRIEND_TEST(XClusterSafeTimeServiceTest, ComputeSafeTime);
-
-  struct ProducerTabletInfo {
-    std::string cluster_uuid;
-    TabletId tablet_id;
-
-    bool operator==(const ProducerTabletInfo& rhs) const {
-      return cluster_uuid == rhs.cluster_uuid && tablet_id == rhs.tablet_id;
-    }
-
-    bool operator<(const ProducerTabletInfo& rhs) const {
-      if (cluster_uuid == rhs.cluster_uuid) {
-        return tablet_id < rhs.tablet_id;
-      }
-      return cluster_uuid < rhs.cluster_uuid;
-    }
-  };
-
-  void ProcessTaskPeriodically() EXCLUDES(task_enqueue_lock_);
-
-  typedef std::map<ProducerTabletInfo, HybridTime> ProducerTabletToSafeTimeMap;
-
   // Returns true if we need to run again.
   Result<bool> ComputeSafeTime(const int64_t leader_term, bool update_metrics = false)
       EXCLUDES(mutex_);
+
+ private:
+  friend class XClusterSafeTimeServiceMocked;
+  friend class XClusterSafeTimeServiceTest;
+
+  void ProcessTaskPeriodically();
+
+  typedef std::map<xcluster::SafeTimeTablePK, HybridTime> ProducerTabletToSafeTimeMap;
 
   virtual Result<ProducerTabletToSafeTimeMap> GetSafeTimeFromTable() REQUIRES(mutex_);
 
@@ -107,15 +106,17 @@ class XClusterSafeTimeService {
 
   virtual Result<bool> CreateTableRequired() REQUIRES(mutex_);
 
-  virtual Result<XClusterNamespaceToSafeTimeMap> GetXClusterNamespaceToSafeTimeMap();
+  virtual XClusterNamespaceToSafeTimeMap GetXClusterNamespaceToSafeTimeMap() const;
 
   virtual Status SetXClusterSafeTime(
       const int64_t leader_term, const XClusterNamespaceToSafeTimeMap& new_safe_time_map);
 
-  virtual Status CleanupEntriesFromTable(const std::vector<ProducerTabletInfo>& entries_to_delete)
-      REQUIRES(mutex_);
+  virtual Status CleanupEntriesFromTable(
+      const std::vector<xcluster::SafeTimeTablePK>& entries_to_delete) REQUIRES(mutex_);
 
   Result<int64_t> GetLeaderTermFromCatalogManager();
+
+  virtual Result<HybridTime> GetLeaderSafeTimeFromCatalogManager();
 
   void UpdateMetrics(
       const ProducerTabletToSafeTimeMap& tablet_to_safe_time_map,
@@ -123,25 +124,28 @@ class XClusterSafeTimeService {
 
   void EnterIdleMode(const std::string& reason);
 
+  Result<XClusterNamespaceToSafeTimeMap> GetFilteredXClusterSafeTimeMap(
+      const XClusterSafeTimeFilter& filter) const REQUIRES_SHARED(mutex_);
+
   Master* const master_;
   CatalogManager* const catalog_manager_;
 
-  std::atomic<bool> shutdown_;
-  Mutex shutdown_cond_lock_;
-  ConditionVariable shutdown_cond_;
+  rpc::Poller poller_;
+  std::optional<boost::asio::io_context::strand> poll_strand_;
 
-  std::mutex task_enqueue_lock_;
-  bool task_enqueued_ GUARDED_BY(task_enqueue_lock_);
-  std::unique_ptr<ThreadPool> thread_pool_;
-  std::unique_ptr<ThreadPoolToken> thread_pool_token_;
-
-  std::mutex mutex_;
-  bool safe_time_table_ready_ GUARDED_BY(mutex_);
+  mutable std::shared_mutex mutex_;
+  bool safe_time_table_ready_ GUARDED_BY(mutex_) = false;
 
   std::unique_ptr<client::TableHandle> safe_time_table_;
 
-  int32_t cluster_config_version_ GUARDED_BY(mutex_);
-  std::map<ProducerTabletInfo, NamespaceId> producer_tablet_namespace_map_ GUARDED_BY(mutex_);
+  int32_t cluster_config_version_ GUARDED_BY(mutex_) = kInvalidClusterConfigVersion;
+  std::map<xcluster::SafeTimeTablePK, NamespaceId> producer_tablet_namespace_map_
+      GUARDED_BY(mutex_);
+
+  // List of tablet ids for ddl_queue tables, used to find safe times without this stream.
+  std::unordered_set<TabletId> ddl_queue_tablet_ids_ GUARDED_BY(mutex_);
+
+  XClusterNamespaceToSafeTimeMap safe_time_map_without_ddl_queue_ GUARDED_BY(mutex_);
 
   MetricRegistry* metric_registry_ GUARDED_BY(mutex_);
   std::unordered_map<NamespaceId, std::unique_ptr<xcluster::XClusterConsumerClusterMetrics>>

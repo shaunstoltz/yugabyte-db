@@ -1,4 +1,4 @@
-// Copyright (c) YugaByte, Inc.
+// Copyright (c) YugabyteDB, Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License"); you may not use this file except
 // in compliance with the License.  You may obtain a copy of the License at
@@ -12,8 +12,11 @@
 //
 
 #include "yb/tserver/remote_bootstrap_file_downloader.h"
+#include "yb/tserver/remote_client_base.h"
 
 #include <iomanip>
+
+#include "yb/ash/wait_state.h"
 
 #include "yb/common/wire_protocol.h"
 
@@ -25,6 +28,7 @@
 
 #include "yb/tserver/remote_bootstrap.proxy.h"
 
+#include "yb/util/backoff_waiter.h"
 #include "yb/util/crc.h"
 #include "yb/util/flags.h"
 #include "yb/util/logging.h"
@@ -36,12 +40,12 @@
 using namespace yb::size_literals;
 
 DECLARE_uint64(rpc_max_message_size);
-DEFINE_UNKNOWN_int32(remote_bootstrap_max_chunk_size, 64_MB,
+DEFINE_RUNTIME_int32(remote_bootstrap_max_chunk_size, 64_MB,
              "Maximum chunk size to be transferred at a time during remote bootstrap.");
 
 DEPRECATE_FLAG(int64, remote_boostrap_rate_limit_bytes_per_sec, "10_2022");
 
-DEFINE_UNKNOWN_int64(remote_bootstrap_rate_limit_bytes_per_sec, 256_MB,
+DEFINE_RUNTIME_int64(remote_bootstrap_rate_limit_bytes_per_sec, 256_MB,
              "Maximum transmission rate during a remote bootstrap. This is across all the remote "
              "bootstrap sessions for which this process is acting as a sender or receiver. So "
              "the total limit will be 2 * remote_bootstrap_rate_limit_bytes_per_sec because a "
@@ -77,7 +81,6 @@ Status ExtractRemoteError(
 
 } // namespace
 
-extern std::atomic<int32_t> remote_bootstrap_clients_started_;
 
 RemoteBootstrapFileDownloader::RemoteBootstrapFileDownloader(
     const std::string* log_prefix, FsManager* fs_manager)
@@ -85,9 +88,11 @@ RemoteBootstrapFileDownloader::RemoteBootstrapFileDownloader(
 }
 
 void RemoteBootstrapFileDownloader::Start(
-    std::shared_ptr<RemoteBootstrapServiceProxy> proxy, std::string session_id,
-    MonoDelta session_idle_timeout) {
-  proxy_ = std::move(proxy);
+    FetchDataFunction fetch_data, std::string session_id,
+    MonoDelta session_idle_timeout,
+    std::optional<FetchDataFunction> uncompressed_fetch_data) {
+  fetch_data_ = std::move(fetch_data);
+  fetch_data_uncompressed_ = std::move(uncompressed_fetch_data);
   session_id_ = std::move(session_id);
   session_idle_timeout_ = session_idle_timeout;
 }
@@ -97,7 +102,8 @@ Env& RemoteBootstrapFileDownloader::env() const {
 }
 
 Status RemoteBootstrapFileDownloader::DownloadFile(
-    const tablet::FilePB& file_pb, const std::string& dir, DataIdPB *data_id) {
+    const tablet::FilePB& file_pb, const std::string& dir, DataIdPB *data_id,
+    std::function<void(size_t)> chunk_download_cb, bool skip_compression) {
   auto file_path = JoinPathSegments(dir, file_pb.name());
   RETURN_NOT_OK(env().CreateDirs(DirName(file_path)));
 
@@ -111,8 +117,8 @@ Status RemoteBootstrapFileDownloader::DownloadFile(
         return Status::OK();
       }
       // TODO fallback to copy.
-      LOG_WITH_PREFIX(ERROR) << "Failed to link file: " << file_path << " => " << it->second
-                             << ": " << link_status;
+      LOG_WITH_PREFIX(WARNING)
+          << "Failed to link file: " << file_path << " => " << it->second << ": " << link_status;
     }
   }
 
@@ -124,9 +130,10 @@ Status RemoteBootstrapFileDownloader::DownloadFile(
   RETURN_NOT_OK(env().NewWritableFile(file_path, &file));
 
   data_id->set_file_name(file_pb.name());
-  RETURN_NOT_OK_PREPEND(DownloadFile(*data_id, file.get()),
-                        Format("Unable to download $0 file $1",
-                               DataIdPB::IdType_Name(data_id->type()), file_path));
+  RETURN_NOT_OK_PREPEND(
+      DownloadFile(*data_id, file.get(), chunk_download_cb, skip_compression),
+      Format("Unable to download $0 file $1",
+             DataIdPB::IdType_Name(data_id->type()), file_path));
   VLOG_WITH_PREFIX(2) << "Downloaded file " << file_path;
 
   if (file_pb.inode() != 0) {
@@ -138,7 +145,8 @@ Status RemoteBootstrapFileDownloader::DownloadFile(
 
 template<class Appendable>
 Status RemoteBootstrapFileDownloader::DownloadFile(
-    const DataIdPB& data_id, Appendable* appendable) {
+    const DataIdPB& data_id, Appendable* appendable,
+    std::function<void(size_t)> chunk_download_cb, bool skip_compression) {
   constexpr int kBytesReservedForMessageHeaders = 16384;
 
   // For periodic sync, indicates number of bytes which need to be sync'ed.
@@ -151,11 +159,10 @@ Status RemoteBootstrapFileDownloader::DownloadFile(
 
   if (FLAGS_remote_bootstrap_rate_limit_bytes_per_sec > 0) {
     static auto rate_updater = []() {
-      auto remote_bootstrap_clients_started =
-          remote_bootstrap_clients_started_.load(std::memory_order_acquire);
+      auto remote_bootstrap_clients_started = RemoteClientBase::StartedClientsCount();
       if (remote_bootstrap_clients_started < 1) {
-        YB_LOG_EVERY_N(ERROR, 100) << "Invalid number of remote bootstrap sessions: "
-                                   << remote_bootstrap_clients_started;
+        YB_LOG_EVERY_N(DFATAL, 100) << "Invalid number of remote bootstrap sessions: "
+                                     << remote_bootstrap_clients_started;
         return static_cast<uint64_t>(FLAGS_remote_bootstrap_rate_limit_bytes_per_sec);
       }
       return static_cast<uint64_t>(
@@ -180,25 +187,50 @@ Status RemoteBootstrapFileDownloader::DownloadFile(
 
   bool done = false;
   while (!done) {
-    controller.Reset();
-    req.set_session_id(session_id_);
-    req.mutable_data_id()->CopyFrom(data_id);
-    req.set_offset(offset);
-    if (rate_limiter->active()) {
-      auto max_size = rate_limiter->GetMaxSizeForNextTransmission();
-      if (max_size > std::numeric_limits<decltype(max_length)>::max()) {
-        max_size = std::numeric_limits<decltype(max_length)>::max();
-      }
-      max_length = std::min(max_length, decltype(max_length)(max_size));
-    }
-    req.set_max_length(max_length);
-
     FetchDataResponsePB resp;
-    auto status = rate_limiter->SendOrReceiveData([this, &req, &resp, &controller]() {
-      return proxy_->FetchData(req, &resp, &controller);
-    }, [&resp]() { return resp.ByteSize(); });
+    auto deadline = CoarseMonoClock::Now() + session_idle_timeout_;
+    auto status = RetryFunc(
+        deadline, "FetchData", Format("FetchData timedout after deadline: $0", deadline),
+        [&](CoarseTimePoint, bool *retry) -> Status {
+          resp.Clear();
+          controller.Reset();
+          req.set_session_id(session_id_);
+          req.mutable_data_id()->CopyFrom(data_id);
+          req.set_offset(offset);
+          if (rate_limiter->active()) {
+            auto max_size = rate_limiter->GetMaxSizeForNextTransmission();
+            max_length = std::min(max_length, decltype(max_length)(max_size));
+          }
+          req.set_max_length(max_length);
+          Status status;
+          {
+            SCOPED_WAIT_STATUS(RemoteBootstrap_RateLimiter);
+            status = rate_limiter->SendOrReceiveData(
+                  [this, &req, &resp, &controller, skip_compression]() {
+              SCOPED_WAIT_STATUS(RemoteBootstrap_FetchData);
+              if (skip_compression && fetch_data_uncompressed_) {
+                return (*fetch_data_uncompressed_)(req, &resp, &controller);
+              }
+              return fetch_data_(req, &resp, &controller);
+            }, [&resp]() { return resp.ByteSize(); });
+          }
+          if (!status.ok()) {
+            status = UnwindRemoteError(status, controller);
+            // When fetching WAL segments, we keep try to fetch segments in ascending order of
+            // sequence numbers until the server responds with a NOT_FOUND (i.e the last active
+            // segment was already sent). Hence retry all other errors.
+            if (!status.IsNotFound()) {
+              LOG_AND_RETURN(
+                  INFO,
+                  status.CloneAndPrepend("Unable to fetch data from remote, will retry"));
+            }
+          }
+          *retry = false;
+          return status;
+        });
     RETURN_NOT_OK_UNWIND_PREPEND(status, controller, "Unable to fetch data from remote");
-    DCHECK_LE(resp.chunk().data().size(), max_length);
+    const auto chunk_size = resp.chunk().data().size();
+    DCHECK_LE(chunk_size, max_length);
     iterations++;
 
     // Sanity-check for corruption.
@@ -213,21 +245,23 @@ Status RemoteBootstrapFileDownloader::DownloadFile(
     RETURN_NOT_OK(appendable->Append(resp.chunk().data()));
     append_data_timer.stop();
     VLOG_WITH_PREFIX(3) << "Verified and appended successfully: resp size: " << resp.ByteSize()
-                        << ", chunk size: " << resp.chunk().data().size();
+                        << ", chunk size: " << chunk_size;
 
-    if (offset + resp.chunk().data().size() ==
-            implicit_cast<size_t>(resp.chunk().total_data_length())) {
+    if (offset + chunk_size == implicit_cast<size_t>(resp.chunk().total_data_length())) {
       done = true;
     }
-    offset += resp.chunk().data().size();
+    offset += chunk_size;
     if (FLAGS_bytes_remote_bootstrap_durable_write_mb != 0) {
-      periodic_sync_unsynced_bytes += resp.chunk().data().size();
+      periodic_sync_unsynced_bytes += chunk_size;
       if (periodic_sync_unsynced_bytes > FLAGS_bytes_remote_bootstrap_durable_write_mb * 1_MB) {
         sync_timer.resume();
         RETURN_NOT_OK(appendable->Sync());
         sync_timer.stop();
         periodic_sync_unsynced_bytes = 0;
       }
+    }
+    if (chunk_download_cb) {
+      chunk_download_cb(chunk_size);
     }
   }
 

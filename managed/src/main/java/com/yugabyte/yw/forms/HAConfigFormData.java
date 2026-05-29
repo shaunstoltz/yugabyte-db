@@ -1,5 +1,5 @@
 /*
- * Copyright 2021 YugaByte, Inc. and Contributors
+ * Copyright 2021 YugabyteDB, Inc. and Contributors
  *
  * Licensed under the Polyform Free Trial License 1.0.0 (the "License"); you
  * may not use this file except in compliance with the License. You
@@ -17,4 +17,7 @@ public class HAConfigFormData {
   @Constraints.MinLength(44)
   @Constraints.MaxLength(44)
   public String cluster_key;
+
+  // Default to disable cert validation
+  public boolean accept_any_certificate = true;
 }

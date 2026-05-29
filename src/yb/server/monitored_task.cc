@@ -1,4 +1,4 @@
-// Copyright (c) YugaByte, Inc.
+// Copyright (c) YugabyteDB, Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License"); you may not use this file except
 // in compliance with the License.  You may obtain a copy of the License at
@@ -14,12 +14,21 @@
 #include "yb/server/monitored_task.h"
 
 #include "yb/util/format.h"
+#include "yb/util/status.h"
 
 namespace yb {
 namespace server {
 
 std::string MonitoredTask::ToString() const {
   return Format("{ type: $0 description: $1 }", type(), description());
+}
+
+Status RunnableMonitoredTask::BeforeSubmitToTaskPool() {
+  return Status::OK();
+}
+
+Status RunnableMonitoredTask::OnSubmitFailure() {
+  return Status::OK();
 }
 
 } // namespace server

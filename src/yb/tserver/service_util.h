@@ -1,5 +1,5 @@
 //
-// Copyright (c) YugaByte, Inc.
+// Copyright (c) YugabyteDB, Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License"); you may not use this file except
 // in compliance with the License.  You may obtain a copy of the License at
@@ -17,11 +17,14 @@
 
 #include <functional>
 
-#include <boost/optional.hpp>
+#include "yb/cdc/cdc_service.pb.h"
 
 #include "yb/common/wire_protocol.h"
+#include "yb/consensus/consensus.h"
 #include "yb/consensus/consensus_error.h"
+#include "yb/consensus/raft_consensus.h"
 
+#include "yb/master/master_heartbeat.fwd.h"
 #include "yb/rpc/rpc_context.h"
 #include "yb/server/clock.h"
 
@@ -30,18 +33,15 @@
 
 #include "yb/tserver/tablet_peer_lookup.h"
 #include "yb/tablet/tablet_error.h"
+#include "yb/tserver/tablet_server_interface.h"
 #include "yb/tserver/tserver_error.h"
-#include "yb/tserver/tserver_fwd.h"
 
 #include "yb/util/logging.h"
 #include "yb/util/result.h"
 #include "yb/util/status_callback.h"
 #include "yb/util/status_format.h"
 
-DECLARE_bool(TEST_enable_db_catalog_version_mode);
-
-namespace yb {
-namespace tserver {
+namespace yb::tserver {
 
 // Non-template helpers.
 
@@ -54,8 +54,6 @@ void SetupErrorAndRespond(TabletServerErrorPB* error,
                           const Status& s,
                           rpc::RpcContext* context);
 
-void SetupError(TabletServerErrorPB* error, const Status& s);
-
 void SetupErrorAndRespond(LWTabletServerErrorPB* error,
                           const Status& s,
                           TabletServerErrorPB::Code code,
@@ -65,9 +63,14 @@ void SetupErrorAndRespond(LWTabletServerErrorPB* error,
                           const Status& s,
                           rpc::RpcContext* context);
 
-void SetupError(LWTabletServerErrorPB* error, const Status& s);
-
 Result<int64_t> LeaderTerm(const tablet::TabletPeer& tablet_peer);
+
+std::shared_ptr<TabletConsensusInfoPB> GetTabletConsensusInfoFromTabletPeer(
+    const tablet::TabletPeerPtr& peer);
+
+std::string CatalogInvalMessagesDataDebugString(const master::TSHeartbeatResponsePB& resp);
+std::string CatalogInvalMessagesDataDebugString(
+    const tserver::DBCatalogInvalMessagesDataPB& db_catalog_inval_messages_data);
 
 // Template helpers.
 
@@ -81,11 +84,7 @@ Result<bool> CheckUuidMatch(TabletPeerLookupIf* tablet_manager,
     // Maintain compat in release mode, but complain.
     std::string msg = strings::Substitute("$0: Missing destination UUID in request from $1: $2",
         method_name, requestor_string, req->ShortDebugString());
-#ifdef NDEBUG
-    YB_LOG_EVERY_N(ERROR, 100) << msg;
-#else
-    LOG(FATAL) << msg;
-#endif
+    YB_LOG_EVERY_N(DFATAL, 100) << msg;
     return true;
   }
   if (PREDICT_FALSE(req->dest_uuid() != local_uuid)) {
@@ -115,17 +114,17 @@ bool CheckUuidMatchOrRespond(TabletPeerLookupIf* tablet_manager,
 }
 
 template <class RespType>
-void HandleErrorResponse(RespType* resp, rpc::RpcContext* context, const Status& s,
-    const boost::optional<TabletServerErrorPB::Code>& error_code = boost::none) {
+void HandleErrorResponse(
+    RespType* resp, rpc::RpcContext* context, const Status& s,
+    const std::optional<TabletServerErrorPB::Code>& error_code = std::nullopt) {
   resp->Clear();
-  SetupErrorAndRespond(resp->mutable_error(), s,
-      error_code.get_value_or(TabletServerErrorPB::UNKNOWN_ERROR), context);
+  SetupErrorAndRespond(
+      resp->mutable_error(), s, error_code.value_or(TabletServerErrorPB::UNKNOWN_ERROR), context);
 }
 
 template <class RespType>
-void HandleResponse(RespType* resp,
-                    const std::shared_ptr<rpc::RpcContext>& context,
-                    const Status& s) {
+void HandleResponse(
+    RespType* resp, const std::shared_ptr<rpc::RpcContext>& context, const Status& s) {
   if (PREDICT_FALSE(!s.ok())) {
     HandleErrorResponse(resp, context.get(), s);
     return;
@@ -151,11 +150,9 @@ struct TabletPeerTablet {
 // Returns true if successful.
 Result<TabletPeerTablet> LookupTabletPeer(
     TabletPeerLookupIf* tablet_manager,
-    const TabletId& tablet_id);
+    TabletIdView tablet_id);
 
-Result<TabletPeerTablet> LookupTabletPeer(
-    TabletPeerLookupIf* tablet_manager,
-    const Slice& tablet_id);
+bool IsErrorCodeNotTheLeader(const Status& status);
 
 template<class RespClass, class Key>
 Result<TabletPeerTablet> LookupTabletPeerOrRespond(
@@ -172,6 +169,34 @@ Result<TabletPeerTablet> LookupTabletPeerOrRespond(
 }
 
 template <class Response>
+concept HasSetPropagatedHybridTimeField =
+    requires(Response response) { response.propagated_hybrid_time(); };
+
+template <class Response>
+requires(HasSetPropagatedHybridTimeField<Response>)
+void SetPropagatedHybridTimeIfHasField(Response& response, server::Clock& clock) {
+  response.set_propagated_hybrid_time(clock.Now().ToUint64());
+}
+
+template <class Response>
+void SetPropagatedHybridTimeIfHasField(Response& response, server::Clock& clock) {}
+
+template <class Response>
+concept HasErrorField = requires(Response resp) { resp.error(); };
+
+template <class Response>
+  requires(HasErrorField<Response>)
+void SetupErrorAndRespond(Response& resp, const Status& status, rpc::RpcContext& context) {
+  SetupErrorAndRespond(resp.mutable_error(), status, &context);
+}
+
+template <class Response>
+void SetupErrorAndRespond(Response& resp, const Status& status, rpc::RpcContext& context) {
+  StatusToPB(status, resp.mutable_status());
+  context.RespondSuccess();
+}
+
+template <class Response>
 auto MakeRpcOperationCompletionCallback(
     rpc::RpcContext context,
     Response* response,
@@ -179,10 +204,10 @@ auto MakeRpcOperationCompletionCallback(
   return [context = std::make_shared<rpc::RpcContext>(std::move(context)),
           response, clock](const Status& status) {
     if (clock) {
-      response->set_propagated_hybrid_time(clock->Now().ToUint64());
+      SetPropagatedHybridTimeIfHasField(*response, *clock);
     }
     if (!status.ok()) {
-      SetupErrorAndRespond(response->mutable_error(), status, context.get());
+      SetupErrorAndRespond(*response, status, *context);
     } else {
       context->RespondSuccess();
     }
@@ -202,10 +227,73 @@ struct LeaderTabletPeer {
   void FillTabletPeer(TabletPeerTablet source);
 };
 
+// Note this method expects that the Resp class must have a field tablet_consensus_info field;
+// it is used to piggyback a TabletConsensusInfo for the receiver of this response to refresh
+// its meta-cache.
+template <class Resp>
+void FillTabletConsensusInfo(Resp* resp, TabletIdView tablet_id, tablet::TabletPeerPtr peer) {
+  if constexpr (HasTabletConsensusInfo<Resp>::value) {
+    auto outgoing_tablet_consensus_info = resp->mutable_tablet_consensus_info();
+    if constexpr (std::is_same_v<decltype(outgoing_tablet_consensus_info),
+                                 TabletConsensusInfoPB*>) {
+      outgoing_tablet_consensus_info->set_tablet_id(tablet_id.data(), tablet_id.size());
+    } else {
+      outgoing_tablet_consensus_info->dup_tablet_id(tablet_id);
+    }
+
+    if (auto consensus = peer->GetRaftConsensus()) {
+      *(outgoing_tablet_consensus_info->mutable_consensus_state()) =
+          consensus.get()->GetConsensusStateFromCache();
+      VLOG(1) << "Sending out Consensus state for tablet: " << tablet_id << ", leader TServer is: "
+              << outgoing_tablet_consensus_info->consensus_state().leader_uuid();
+    }
+  }
+}
+
+template <class Resp>
 Result<LeaderTabletPeer> LookupLeaderTablet(
-    TabletPeerLookupIf* tablet_manager,
-    const std::string& tablet_id,
-    TabletPeerTablet peer = TabletPeerTablet());
+    TabletPeerLookupIf* tablet_manager, TabletIdView tablet_id, Resp* resp,
+    TabletPeerTablet peer = TabletPeerTablet()) {
+  if (peer.tablet_peer) {
+    LOG_IF(DFATAL, peer.tablet_peer->tablet_id() != tablet_id)
+        << "Mismatching table ids: peer " << peer.tablet_peer->tablet_id() << " vs " << tablet_id;
+    LOG_IF(DFATAL, !peer.tablet) << "Empty tablet pointer for tablet id : " << tablet_id;
+  } else {
+    peer = VERIFY_RESULT(LookupTabletPeer(tablet_manager, tablet_id));
+  }
+  LeaderTabletPeer result;
+  result.FillTabletPeer(std::move(peer));
+  auto status = result.FillTerm();
+  if(!status.ok()) {
+    if(IsErrorCodeNotTheLeader(status)) {
+      FillTabletConsensusInfo(resp, tablet_id, result.peer);
+    }
+    return status;
+  }
+  return result;
+}
+
+template <class Req, class Resp>
+void FillTabletConsensusInfoIfRequestOpIdStale(
+    tablet::TabletPeerPtr peer, const Req* req, Resp* resp) {
+  if constexpr (HasTabletConsensusInfo<Resp>::value) {
+    auto outgoing_tablet_consensus_info = resp->mutable_tablet_consensus_info();
+    if (auto consensus = peer->GetRaftConsensus()) {
+      auto cstate = consensus.get()->GetConsensusStateFromCache();
+      if (cstate.has_config() && req->raft_config_opid_index() < cstate.config().opid_index()) {
+        if constexpr (rpc::IsGoogleProtobuf<Resp>) {
+          outgoing_tablet_consensus_info->set_tablet_id(peer->tablet_id());
+        } else {
+          outgoing_tablet_consensus_info->dup_tablet_id(peer->tablet_id());
+        }
+        *(outgoing_tablet_consensus_info->mutable_consensus_state()) = cstate;
+        VLOG(1) << "Sending out Consensus state for tablet: " << peer->tablet_id()
+                  << ", leader TServer is: "
+                  << outgoing_tablet_consensus_info->consensus_state().leader_uuid();
+      }
+    }
+  }
+}
 
 // The "peer" argument could be provided by the caller in case the caller has already performed
 // the LookupTabletPeerOrRespond call, and we only need to fill the leader term.
@@ -216,7 +304,7 @@ LeaderTabletPeer LookupLeaderTabletOrRespond(
     RespClass* resp,
     rpc::RpcContext* context,
     TabletPeerTablet peer = TabletPeerTablet()) {
-  auto result = LookupLeaderTablet(tablet_manager, tablet_id, std::move(peer));
+  auto result = LookupLeaderTablet(tablet_manager, tablet_id, resp, std::move(peer));
   if (!result.ok()) {
     SetupErrorAndRespond(resp->mutable_error(), result.status(), context);
     return LeaderTabletPeer();
@@ -232,12 +320,12 @@ Status CheckPeerIsLeader(const tablet::TabletPeer& tablet_peer);
 // allow_split_tablet specifies whether to reject requests to tablets which have been already
 // split.
 Status CheckPeerIsReady(
-    const tablet::TabletPeer& tablet_peer, AllowSplitTablet allow_split_tablet);
+  const tablet::TabletPeer& tablet_peer, AllowSplitTablet allow_split_tablet);
 
 Result<std::shared_ptr<tablet::AbstractTablet>> GetTablet(
-    TabletPeerLookupIf* tablet_manager, const TabletId& tablet_id,
+    TabletPeerLookupIf* tablet_manager, TabletIdView tablet_id,
     tablet::TabletPeerPtr tablet_peer, YBConsistencyLevel consistency_level,
-    AllowSplitTablet allow_split_tablet);
+    AllowSplitTablet allow_split_tablet, ReadResponseMsg* resp = nullptr);
 
 Status CheckWriteThrottling(double score, tablet::TabletPeer* tablet_peer);
 
@@ -248,7 +336,12 @@ class CatalogVersionChecker {
 
   template<class PB>
   Status operator()(const PB& request) {
-    if (!(request.has_ysql_db_catalog_version() || request.has_ysql_catalog_version())) {
+    /*
+     * Disable catalog version checks during major version upgrade,
+     * as we don't expect the catalog version to be incremented during the upgrade.
+     */
+    if (!(request.has_ysql_db_catalog_version() || request.has_ysql_catalog_version()) ||
+        tablet_server_.SkipCatalogVersionChecks()) {
       return Status::OK();
     }
     SCHECK(!(request.has_ysql_db_catalog_version() && request.has_ysql_catalog_version()),
@@ -266,7 +359,9 @@ class CatalogVersionChecker {
           InvalidArgument, "Different db_oid values are not expected");
       if (version_info.version < tserver_version_info_->version) {
         return STATUS(
-            QLError, "The catalog snapshot used for this transaction has been invalidated",
+            QLError,
+            Format("The catalog snapshot used for this transaction has been invalidated: "
+                   "expected: $0, got: $1", tserver_version_info_->version, version_info.version),
             TabletServerError(TabletServerErrorPB::MISMATCHED_SCHEMA));
       }
     }
@@ -274,7 +369,7 @@ class CatalogVersionChecker {
   }
 
  private:
-  using DbOid = boost::optional<uint32_t>;
+  using DbOid = std::optional<uint32_t>;
 
   struct VersionInfo {
     DbOid db_oid;
@@ -286,15 +381,12 @@ class CatalogVersionChecker {
     friend bool operator==(const VersionInfo&, const VersionInfo&) = default;
   };
 
-  template<class PB>
+  template <class PB>
   Result<VersionInfo> FetchVersionInfo(const PB& request) const {
     if (request.has_ysql_catalog_version()) {
-      return VersionInfo(boost::none, request.ysql_catalog_version());
+      return VersionInfo(std::nullopt, request.ysql_catalog_version());
     }
     DCHECK(request.has_ysql_db_catalog_version());
-    SCHECK(FLAGS_TEST_enable_db_catalog_version_mode,
-           InvalidArgument,
-           "enable_db_catalog_version_mode is not enabled");
     SCHECK(request.has_ysql_db_oid(), InvalidArgument, "ysql_db_oid is not specified");
     return VersionInfo(request.ysql_db_oid(), request.ysql_db_catalog_version());
   }
@@ -302,11 +394,10 @@ class CatalogVersionChecker {
   [[nodiscard]] uint64_t GetLastBreakingVersion(DbOid db_oid) const;
 
   TabletServerIf& tablet_server_;
-  boost::optional<VersionInfo> tserver_version_info_;
+  std::optional<VersionInfo> tserver_version_info_;
 };
 
-}  // namespace tserver
-}  // namespace yb
+}  // namespace yb::tserver
 
 // Macro helpers.
 

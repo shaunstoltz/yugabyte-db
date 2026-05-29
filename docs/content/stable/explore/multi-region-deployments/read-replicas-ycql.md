@@ -1,48 +1,32 @@
 ---
-title: Read replicas
+title: Read replicas and follower reads in YugabyteDB YCQL
 headerTitle: Read replicas
 linkTitle: Read replicas
-description: Read replicas
+description: Explore read replicas in YugabyteDB using YCQL
 headContent: Replicate data asynchronously to one or more read replica clusters
 menu:
   stable:
     name: Read replicas
     identifier: explore-multi-region-deployments-read-replicas-ycql
     parent: explore-multi-region-deployments
-    weight: 750
+    weight: 755
 type: docs
 ---
 
-<ul class="nav nav-tabs-alt nav-tabs-yb">
-
-  <li >
-    <a href="../read-replicas-ysql/" class="nav-link">
-      <i class="icon-postgres" aria-hidden="true"></i>
-      YSQL
-    </a>
-  </li>
-
-  <li >
-    <a href="../read-replicas-ycql/" class="nav-link active">
-      <i class="icon-cassandra" aria-hidden="true"></i>
-      YCQL
-    </a>
-  </li>
-
-</ul>
+{{<api-tabs>}}
 
 YugabyteDB supports the following types of reads:
 
-- [Follower reads](../../ysql-language-features/going-beyond-sql/follower-reads-ycql/) that enable spreading the read workload across all replicas in the primary cluster.
-- Observer reads that use read replicas. The latter obtain their data via [xCluster replication](../asynchronous-replication-ycql/) which allows for the read workload to be offloaded from the primary cluster. Read replicas are created as a separate cluster that may be located in a different region, possibly closer to the consumers of the data which would result in lower-latency access and enhanced support of analytics workloads.
+- [Follower reads](../../going-beyond-sql/follower-reads-ycql/) that enable spreading the read workload across all replicas in the primary cluster.
+- Observer reads that use read replicas. Read replicas are created as a separate cluster that may be located in a different region, possibly closer to the consumers of the data which would result in lower-latency access and enhanced support of analytics workloads.
 
-A data center (also known as a [universe](../../../architecture/concepts/universe/#universe-vs-cluster)) can have one primary cluster and several read replica clusters.
+A data center (also known as a [universe](../../../architecture/key-concepts/#universe)) can have one primary cluster and several read replica clusters.
 
 Stale reads are possible with an upper bound on the amount of staleness. Reads are guaranteed to be timeline-consistent. You need to set the consistency level to `ONE` in your application to work with follower reads or observer reads. In addition, you have to set the application's local data center to the read replica cluster's region.
 
 ## Prerequisites
 
-Ensure that you have downloaded and configured YugabyteDB, as described in [Quick start](../../../quick-start/).
+Ensure that you have downloaded and configured YugabyteDB, as described in [Quick start](/stable/quick-start/macos/).
 
 {{< note title="Note" >}}
 
@@ -68,7 +52,6 @@ Waiting for cluster to be ready.
 | JDBC            : jdbc:postgresql://127.0.0.1:5433/yugabyte |
 | YSQL Shell      : bin/ysqlsh                                |
 | YCQL Shell      : bin/ycqlsh                                |
-| YEDIS Shell     : bin/redis-cli                             |
 | Web UI          : http://127.0.0.1:7000/                    |
 | Cluster Data    : /Users/yourname/yugabyte-data             |
 ---------------------------------------------------------------
@@ -79,7 +62,7 @@ For more info, please use: yb-ctl status
 The following command instructs the masters to create three replicas for each tablet distributed across the three zones:
 
 ```shell
-$ ./bin/yb-admin -master_addresses 127.0.0.1:7100,127.0.0.2:7100,127.0.0.3:7100 modify_placement_info c.r.z1,c.r.z2,c.r.z3 3 live
+$ ./bin/yb-admin --master_addresses 127.0.0.1:7100,127.0.0.2:7100,127.0.0.3:7100 modify_placement_info c.r.z1,c.r.z2,c.r.z3 3 live
 ```
 
 The following illustration demonstrates the primary cluster visible via [YugabyteDB Anywhere](../../../yugabyte-platform/):
@@ -183,7 +166,7 @@ The following commands add three new nodes to a read replica cluster in region `
 ./bin/yb-ctl add_node --placement_info "c.r2.z22" --tserver_flags "placement_uuid=rr"
 ./bin/yb-ctl add_node --placement_info "c.r2.z23" --tserver_flags "placement_uuid=rr"
 
-./bin/yb-admin -master_addresses 127.0.0.1:7100,127.0.0.2,127.0.0.3 add_read_replica_placement_info c.r2.z21:1,c.r2.z22:1,c.r2.z23:1 3 rr
+./bin/yb-admin --master_addresses 127.0.0.1:7100,127.0.0.2,127.0.0.3 add_read_replica_placement_info c.r2.z21:1,c.r2.z22:1,c.r2.z23:1 3 rr
 ```
 
 The following illustration demonstrates the setup of the two clusters, one of which is primary and another one is read replica visible via YugabyteDB Anywhere:
@@ -226,7 +209,7 @@ For information on deploying read replicas, see [Read Replica Clusters](../../..
 
 ## Fault tolerance
 
-In the strong consistency mode (default), more failures can be tolerated by increasing the number of replicas: to tolerate a `k` number of failures, `2k+1` replicas are required in the RAFT group. However, follower reads and observer reads can provide Cassandra-style `CL.ONE` fault tolerance. The  `max_stale_read_bound_time_ms` GFlag controls how far behind the followers are allowed to be before they redirect reads back to the RAFT leader (the default is 60 seconds). For "write once, read many times" workloads, this number could be increased. By stopping nodes, you can induce behavior of follower and observer reads such that they continue to read (which would not be possible without follower reads).
+In the strong consistency mode (default), more failures can be tolerated by increasing the number of replicas: to tolerate a `k` number of failures, `2k+1` replicas are required in the Raft group. However, follower reads and observer reads can provide Cassandra-style `CL.ONE` fault tolerance. The  `max_stale_read_bound_time_ms` GFlag controls how far behind the followers are allowed to be before they redirect reads back to the Raft leader (the default is 60 seconds). For "write once, read many times" workloads, this number could be increased. By stopping nodes, you can induce behavior of follower and observer reads such that they continue to read (which would not be possible without follower reads).
 
 The following command starts a read-only workload:
 
@@ -295,3 +278,8 @@ The following illustration demonstrates that the entire read load moved to the o
 ![Primary cluster with two stopped nodes](/images/explore/multi-region-deployments/read-replicas11.png)
 
 For additional information, see [Fault Tolerance](../../fault-tolerance/macos/).
+
+## Learn more
+
+- [Read replica architecture](../../../architecture/docdb-replication/read-replicas)
+- [Follower reads](../../going-beyond-sql/follower-reads-ycql/)

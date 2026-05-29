@@ -3,7 +3,7 @@
  * ybgin.h
  *	  Public header file for Yugabyte Generalized Inverted Index access method.
  *
- * Copyright (c) YugaByte, Inc.
+ * Copyright (c) YugabyteDB, Inc.
  *
  * Licensed under the Apache License, Version 2.0 (the "License"); you may not
  * use this file except in compliance with the License.  You may obtain a copy
@@ -48,6 +48,12 @@ extern void ybgincostestimate(struct PlannerInfo *root,
 							  double *indexPages);
 extern bytea *ybginoptions(Datum reloptions, bool validate);
 extern bool ybginvalidate(Oid opclassoid);
+extern void ybginbindschema(YbcPgStatement handle,
+							struct IndexInfo *indexInfo,
+							TupleDesc indexTupleDesc,
+							int16 *coloptions,
+							Oid *opclassIds,
+							Datum reloptions);
 extern IndexScanDesc ybginbeginscan(Relation rel, int nkeys, int norderbys);
 extern void ybginrescan(IndexScanDesc scan, ScanKey scankey, int nscankeys,
 						ScanKey orderbys, int norderbys);
@@ -64,3 +70,6 @@ extern IndexBuildResult *ybginbackfill(Relation heap, Relation index,
 									   struct IndexInfo *indexInfo,
 									   struct YbBackfillInfo *bfinfo,
 									   struct YbPgExecOutParam *bfresult);
+extern bool ybginmightrecheck(Scan *scan,
+							  Relation heapRelation, Relation indexRelation,
+							  bool xs_want_itup, ScanKey keys, int nkeys);

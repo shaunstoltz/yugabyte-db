@@ -1,4 +1,4 @@
-// Copyright (c) YugaByte, Inc.
+// Copyright (c) YugabyteDB, Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License"); you may not use this file except
 // in compliance with the License.  You may obtain a copy of the License at
@@ -10,21 +10,32 @@
 // or implied.  See the License for the specific language governing permissions and limitations
 // under the License.
 
-#include "yb/gutil/walltime.h"
 #include "yb/master/master_call_home.h"
+
 #include "yb/master/catalog_manager_if.h"
+#include "yb/master/master.h"
 #include "yb/master/master_ddl.pb.h"
 #include "yb/master/ts_descriptor.h"
 #include "yb/master/ts_manager.h"
-#include "yb/util/version_info.h"
+
+#include "yb/rpc/rpc_controller.h"
+
+#include "yb/tserver/tserver_service.proxy.h"
+#include "yb/tserver/ysql_call_home_stats.h"
+
+#include "yb/util/flags.h"
+#include "yb/util/format.h"
+
+DEFINE_RUNTIME_int32(callhome_ysql_cluster_stats_rpc_timeout_ms, 90000,
+    "Timeout in milliseconds for the CollectYsqlCallHomeStats RPC from the master leader "
+    "to the closest TServer during YSQL call-home stats collection.");
+
+DECLARE_bool(enable_ysql);
 
 using std::string;
 using std::vector;
 
 using strings::Substitute;
-using yb::master::ListTablesRequestPB;
-using yb::master::ListTablesResponsePB;
-using yb::master::TSDescriptor;
 
 namespace yb {
 
@@ -35,26 +46,17 @@ class BasicCollector : public MasterCollector {
   using MasterCollector::MasterCollector;
 
   void Collect(CollectionLevel collection_level) override {
-    master::SysClusterConfigEntryPB config;
-    auto status = master()->catalog_manager()->GetClusterConfig(&config);
-    if (status.ok()) {
-      AppendPairToJson("cluster_uuid", config.cluster_uuid(), &json_);
-    }
-    AppendPairToJson("node_uuid", master()->fs_manager()->uuid(), &json_);
     AppendPairToJson("server_type", "master", &json_);
 
-    // Only collect hostname and username if collection level is medium or high.
-    if (collection_level != CollectionLevel::LOW) {
-      AppendPairToJson("hostname", master()->get_hostname(), &json_);
-      AppendPairToJson("current_user", GetCurrentUser(), &json_);
+    auto config = master()->catalog_manager()->GetClusterConfig();
+    if (config.ok()) {
+      AppendPairToJson("cluster_uuid", config->cluster_uuid(), &json_);
     }
-    json_ += ",\"version_info\":" + VersionInfo::GetAllVersionInfoJson();
-    AppendPairToJson("timestamp", std::to_string(WallTime_Now()), &json_);
   }
 
   string collector_name() override { return "BasicCollector"; }
 
-  virtual CollectionLevel collection_level() override { return CollectionLevel::LOW; }
+  CollectionLevel collection_level() override { return CollectionLevel::LOW; }
 };
 
 class TablesCollector : public MasterCollector {
@@ -80,7 +82,7 @@ class TablesCollector : public MasterCollector {
 
   string collector_name() override { return "TablesCollector"; }
 
-  virtual CollectionLevel collection_level() override { return CollectionLevel::ALL; }
+  CollectionLevel collection_level() override { return CollectionLevel::ALL; }
 };
 
 class MasterInfoCollector : public MasterCollector {
@@ -102,7 +104,7 @@ class MasterInfoCollector : public MasterCollector {
 
   string collector_name() override { return "MasterInfoCollector"; }
 
-  virtual CollectionLevel collection_level() override { return CollectionLevel::ALL; }
+  CollectionLevel collection_level() override { return CollectionLevel::ALL; }
 };
 
 class TServersInfoCollector : public MasterCollector {
@@ -110,19 +112,12 @@ class TServersInfoCollector : public MasterCollector {
   using MasterCollector::MasterCollector;
 
   void Collect(CollectionLevel collection_level) override {
-    vector<std::shared_ptr<TSDescriptor>> descs;
-    master()->ts_manager()->GetAllDescriptors(&descs);
-    if (collection_level == CollectionLevel::LOW) {
-      json_ = Substitute("\"tservers\":$0", descs.size());
-    } else {
-      // TODO(hector): Add more details.
-      json_ = Substitute("\"tservers\":$0", descs.size());
-    }
+    json_ = Substitute("\"tservers\":$0", master()->ts_manager()->NumDescriptors());
   }
 
   string collector_name() override { return "TServersInfoCollector"; }
 
-  virtual CollectionLevel collection_level() override { return CollectionLevel::ALL; }
+  CollectionLevel collection_level() override { return CollectionLevel::ALL; }
 };
 
 class TabletsCollector : public MasterCollector {
@@ -136,7 +131,52 @@ class TabletsCollector : public MasterCollector {
 
   string collector_name() override { return "TabletsCollector"; }
 
-  virtual CollectionLevel collection_level() override { return CollectionLevel::ALL; }
+  CollectionLevel collection_level() override { return CollectionLevel::ALL; }
+};
+
+// Collects YSQL cluster-wide statistics via RPC to the closest TServer.
+class YsqlClusterStatsCollector : public MasterCollector {
+ public:
+  using MasterCollector::MasterCollector;
+
+  void Collect(CollectionLevel collection_level) override {
+    if (!throttle_.ShouldCollect()) {
+      return;
+    }
+    auto result = CollectViaRpc();
+    if (!result.ok()) {
+      LOG(WARNING) << "YSQL Call Home Stats: Failed to collect cluster stats: "
+                   << result.status();
+      return;
+    }
+    json_ = Format("\"ysql_cluster_stats\":$0", *result);
+  }
+
+  string collector_name() override { return "YsqlClusterStatsCollector"; }
+
+  CollectionLevel collection_level() override { return CollectionLevel::ALL; }
+
+ private:
+  tserver::YsqlCollectionThrottle throttle_;
+  Result<string> CollectViaRpc() {
+    auto closest_ts = VERIFY_RESULT(master()->catalog_manager()->GetClosestLiveTserver());
+
+    std::shared_ptr<tserver::TabletServerServiceProxy> proxy;
+    RETURN_NOT_OK(closest_ts->GetProxy(&proxy));
+
+    tserver::CollectYsqlCallHomeStatsRequestPB req;
+    tserver::CollectYsqlCallHomeStatsResponsePB resp;
+    rpc::RpcController controller;
+    controller.set_timeout(
+        MonoDelta::FromMilliseconds(FLAGS_callhome_ysql_cluster_stats_rpc_timeout_ms));
+
+    RETURN_NOT_OK(proxy->CollectYsqlCallHomeStats(req, &resp, &controller));
+
+    if (resp.has_error()) {
+      return StatusFromPB(resp.error().status());
+    }
+    return resp.json_stats();
+  }
 };
 
 MasterCallHome::MasterCallHome(Master* server) : CallHome(server) {
@@ -145,6 +185,9 @@ MasterCallHome::MasterCallHome(Master* server) : CallHome(server) {
   AddCollector<TServersInfoCollector>();
   AddCollector<TablesCollector>();
   AddCollector<TabletsCollector>();
+  if (FLAGS_enable_ysql) {
+    AddCollector<YsqlClusterStatsCollector>();
+  }
 }
 
 bool MasterCallHome::SkipCallHome() {

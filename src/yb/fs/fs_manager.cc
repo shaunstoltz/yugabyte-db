@@ -15,9 +15,9 @@
 // specific language governing permissions and limitations
 // under the License.
 //
-// The following only applies to changes made to this file as part of YugaByte development.
+// The following only applies to changes made to this file as part of YugabyteDB development.
 //
-// Portions Copyright (c) YugaByte, Inc.
+// Portions Copyright (c) YugabyteDB, Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License"); you may not use this file except
 // in compliance with the License.  You may obtain a copy of the License at
@@ -38,9 +38,10 @@
 
 #include <boost/algorithm/string/predicate.hpp>
 #include <boost/preprocessor/cat.hpp>
-#include <glog/logging.h>
 #include <glog/stl_logging.h>
 #include <google/protobuf/message.h>
+
+#include "yb/ash/wait_state.h"
 
 #include "yb/fs/fs.pb.h"
 
@@ -56,12 +57,15 @@
 #include "yb/util/env_util.h"
 #include "yb/util/flags.h"
 #include "yb/util/format.h"
+#include "yb/util/logging.h"
 #include "yb/util/metric_entity.h"
+#include "yb/util/metrics.h"
 #include "yb/util/net/net_util.h"
 #include "yb/util/oid_generator.h"
 #include "yb/util/path_util.h"
 #include "yb/util/pb_util.h"
 #include "yb/util/result.h"
+#include "yb/util/string_util.h"
 
 DEFINE_UNKNOWN_bool(enable_data_block_fsync, true,
             "Whether to enable fsync() of data blocks, metadata, and their parent directories. "
@@ -125,7 +129,6 @@ const char kConsensusMetadataDirName[] = "consensus-meta";
 const char kLogsDirName[] = "logs";
 const char kTmpInfix[] = ".tmp";
 const char kCheckFileTemplate[] = "check.XXXXXX";
-const char kSecureCertsDirName[] = "certs";
 const char kPrefixMetricId[] = "drive:";
 
 std::string DataDir(const std::string& root, const std::string& server_type) {
@@ -262,7 +265,7 @@ Status FsManager::Init() {
 Status FsManager::ReadAutoFlagsConfig(Message* msg) {
   RETURN_NOT_OK(Init());
 
-  std::lock_guard<std::mutex> lock(auto_flag_mutex_);
+  std::lock_guard lock(auto_flag_mutex_);
 
   // First call after process startup: Iterate over all data roots to see if a config file was
   // previously created.
@@ -305,7 +308,7 @@ Status FsManager::ReadAutoFlagsConfig(Message* msg) {
 Status FsManager::WriteAutoFlagsConfig(const Message* msg) {
   RETURN_NOT_OK(Init());
 
-  std::lock_guard<std::mutex> lock(auto_flag_mutex_);
+  std::lock_guard lock(auto_flag_mutex_);
 
   // auto_flags_config_path_ is set when we attempt to read the file.
   // We expect at least one read of the file to happen before the write.
@@ -323,8 +326,35 @@ Status FsManager::WriteAutoFlagsConfig(const Message* msg) {
 }
 
 std::string FsManager::GetAutoFlagsConfigPath() const {
-  std::lock_guard<std::mutex> lock(auto_flag_mutex_);
+  std::lock_guard lock(auto_flag_mutex_);
   return auto_flags_config_path_;
+}
+
+Result<std::string> FsManager::GetUniverseUuidFromTserverInstanceMetadata() const {
+  std::lock_guard lock(metadata_mutex_);
+  SCHECK_NOTNULL(metadata_);
+  return metadata_->tserver_instance_metadata().universe_uuid();
+}
+
+Status FsManager::SetUniverseUuidOnTserverInstanceMetadata(
+    const UniverseUuid& universe_uuid) {
+  std::lock_guard lock(metadata_mutex_);
+  SCHECK_NOTNULL(metadata_);
+  LOG(INFO) << "Setting the universe_uuid to " << universe_uuid;
+  metadata_->mutable_tserver_instance_metadata()->set_universe_uuid(universe_uuid.ToString());
+  auto instance_metadata_path = VERIFY_RESULT(GetExistingInstanceMetadataPath());
+  return pb_util::WritePBContainerToPath(
+      env_, instance_metadata_path, *metadata_.get(), pb_util::OVERWRITE, pb_util::SYNC);
+}
+
+Status FsManager::ClearUniverseUuidOnTserverInstanceMetadata() {
+  std::lock_guard lock(metadata_mutex_);
+  SCHECK_NOTNULL(metadata_);
+  LOG(INFO) << "Clearing the universe_uuid from Instance Metadata";
+  metadata_->mutable_tserver_instance_metadata()->clear_universe_uuid();
+  auto instance_metadata_path = VERIFY_RESULT(GetExistingInstanceMetadataPath());
+  return pb_util::WritePBContainerToPath(
+      env_, instance_metadata_path, *metadata_.get(), pb_util::OVERWRITE, pb_util::SYNC);
 }
 
 Status FsManager::CheckAndOpenFileSystemRoots() {
@@ -335,6 +365,10 @@ Status FsManager::CheckAndOpenFileSystemRoots() {
   }
 
   bool create_roots = false;
+
+  // Currently, this path is only called on Init and does not race with any other threads trying
+  // to access metadata_. To future proof this however, we will still obtain a lock.
+  std::lock_guard lock(metadata_mutex_);
   for (const string& root : canonicalized_all_fs_roots_) {
     auto pb = std::make_unique<InstanceMetadataPB>();
     auto read_result = pb_util::ReadPBContainerFromPath(env_, GetInstanceMetadataPath(root),
@@ -670,10 +704,12 @@ Status FsManager::CreateDirIfMissingAndSync(const std::string& path, bool* creat
 }
 
 const string& FsManager::uuid() const {
+  std::lock_guard lock(metadata_mutex_);
   return CHECK_NOTNULL(metadata_.get())->uuid();
 }
 
 bool FsManager::initdb_done_set_after_sys_catalog_restore() const {
+  std::lock_guard lock(metadata_mutex_);
   return CHECK_NOTNULL(metadata_.get())->initdb_done_set_after_sys_catalog_restore();
 }
 
@@ -721,12 +757,13 @@ Result<std::string> FsManager::GetRaftGroupMetadataPath(const string& tablet_id)
 
 void FsManager::SetTabletPathByDataPath(const string& tablet_id, const string& path) {
   string tablet_path = path.empty() ? GetDefaultRootDir() : DirName(path);
-  std::lock_guard<std::mutex> lock(data_mutex_);
+  LOG_WITH_FUNC(INFO) << "Tablet " << tablet_id << " metadata path being set to " << tablet_path;
+  std::lock_guard lock(data_mutex_);
   InsertOrUpdate(&tablet_id_to_path_, tablet_id, tablet_path);
 }
 
 Result<std::string> FsManager::GetTabletPath(const std::string &tablet_id) const {
-  std::lock_guard<std::mutex> lock(data_mutex_);
+  std::lock_guard lock(data_mutex_);
   auto tabet_path_it = tablet_id_to_path_.find(tablet_id);
   if (tabet_path_it == tablet_id_to_path_.end()) {
     return STATUS(NotFound, Format("Metadata dir not found for tablet $0", tablet_id));
@@ -737,7 +774,7 @@ Result<std::string> FsManager::GetTabletPath(const std::string &tablet_id) const
 bool FsManager::LookupTablet(const std::string &tablet_id) {
   for (const auto& dir : GetRaftGroupMetadataDirs()) {
     if (env_->FileExists(JoinPathSegments(dir, tablet_id))) {
-      std::lock_guard<std::mutex> lock(data_mutex_);
+      std::lock_guard lock(data_mutex_);
       tablet_id_to_path_.insert({tablet_id, DirName(dir)});
       return true;
     }
@@ -746,10 +783,21 @@ bool FsManager::LookupTablet(const std::string &tablet_id) {
 }
 
 namespace {
+
 // Return true if 'fname' is a valid tablet ID.
-bool IsValidTabletId(const std::string& fname) {
+bool CheckTabletId(Env* env, const std::string& dir, const std::string& fname) {
   if (fname.find(kTmpInfix) != string::npos) {
-    LOG(WARNING) << "Ignoring tmp file in tablet metadata dir: " << fname;
+    auto msg_suffix = "temporary tablet metadata: " + fname;
+    if (env) {
+      auto status = env->DeleteFile(JoinPathSegments(dir, fname));
+      if (status.ok()) {
+        LOG(INFO) << "Removed " << msg_suffix;
+      } else {
+        LOG(WARNING) << "Failed to remove " << msg_suffix << ": " << status;
+      }
+    } else {
+      LOG(INFO) << "Ignored " << msg_suffix;
+    }
     return false;
   }
 
@@ -763,23 +811,42 @@ bool IsValidTabletId(const std::string& fname) {
 }
 } // anonymous namespace
 
-Result<std::vector<std::string>> FsManager::ListTabletIds() {
-  std::lock_guard<std::mutex> lock(data_mutex_);
-  std::vector<std::string> tablet_ids;
+Result<std::vector<std::string>> FsManager::ListTabletIds(
+    CleanupTemporaryFiles cleanup_temporary_files) {
+  std::lock_guard lock(data_mutex_);
+  std::unordered_set<std::string> tablet_ids;
   for (const auto& dir : GetRaftGroupMetadataDirs()) {
-    vector<string> children;
-    RETURN_NOT_OK_PREPEND(ListDir(dir, &children),
-                          Substitute("Couldn't list tablets in metadata directory $0", dir));
+    std::vector<std::string> children = VERIFY_RESULT_PREPEND(ListDir(dir),
+        Substitute("Couldn't list tablets in metadata directory $0", dir));
 
-    for (const string& child : children) {
-      if (!IsValidTabletId(child)) {
+    for (const auto& child : children) {
+      if (!CheckTabletId(cleanup_temporary_files ? env_ : nullptr, dir, child)) {
         continue;
       }
-      tablet_id_to_path_.emplace(child, DirName(dir));
-      tablet_ids.push_back(child);
+      auto tablet_dirname = DirName(dir);
+      LOG(INFO) << "Found tablet " << child << " metadata at " << tablet_dirname;
+      auto [_, inserted] = tablet_ids.emplace(child);
+      if (!inserted) {
+        return STATUS_FORMAT(IllegalState,
+            "Found two tablet metadata folders $0 and $1 with the same tablet_id $2. Remove the "
+            "duplicate one to avoid the error.", tablet_dirname, tablet_id_to_path_[child], child);
+      }
+      tablet_id_to_path_.emplace(child, tablet_dirname);
     }
   }
-  return tablet_ids;
+  return std::vector<std::string>(tablet_ids.begin(), tablet_ids.end());
+}
+
+Result<std::string> FsManager::GetExistingInstanceMetadataPath() const {
+  for (const string& root : canonicalized_all_fs_roots_) {
+    auto instance_metadata_path = GetInstanceMetadataPath(root);
+    if (env_->FileExists(GetInstanceMetadataPath(root))) {
+      return instance_metadata_path;
+    }
+  }
+  return STATUS(IllegalState,
+      Format("No instance metadata found in root dirs $0",
+      RangeToString(canonicalized_all_fs_roots_.begin(), canonicalized_all_fs_roots_.end())));
 }
 
 std::string FsManager::GetInstanceMetadataPath(const string& root) const {
@@ -793,10 +860,6 @@ std::string FsManager::GetFsLockFilePath(const string& root) const {
 std::string FsManager::GetDefaultRootDir() const {
   DCHECK(initted_);
   return GetServerTypeDataPath(canonicalized_default_fs_root_, server_type_);
-}
-
-std::string FsManager::GetCertsDir(const std::string& root_dir) {
-  return JoinPathSegments(root_dir, kSecureCertsDirName);
 }
 
 std::vector<std::string> FsManager::GetConsensusMetadataDirs() const {
@@ -858,7 +921,7 @@ void FsManager::DumpFileSystemTree(ostream& out) {
     std::vector<string> objects;
     Status s = env_->GetChildren(root, &objects);
     if (!s.ok()) {
-      LOG(ERROR) << "Unable to list the fs-tree: " << s.ToString();
+      LOG(DFATAL) << "Unable to list the fs-tree: " << s.ToString();
       return;
     }
 
@@ -884,13 +947,15 @@ void FsManager::DumpFileSystemTree(ostream& out, const string& prefix,
 }
 
 Result<std::vector<std::string>> FsManager::ListDir(const std::string& path) const {
-  std::vector<std::string> result;
-  RETURN_NOT_OK(env_->GetChildren(path, ExcludeDots::kTrue, &result));
-  return result;
+  return env_->GetChildren(path, ExcludeDots::kTrue);
 }
 
 Status FsManager::ListDir(const std::string& path, std::vector<std::string> *objects) const {
   return env_->GetChildren(path, objects);
+}
+
+Result<uint64> FsManager::GetFreeSpaceBytes(const std::string& path) const {
+  return env_->GetFreeSpaceBytes(path);
 }
 
 } // namespace yb

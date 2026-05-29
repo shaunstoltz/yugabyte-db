@@ -1,5 +1,5 @@
 //
-// Copyright (c) YugaByte, Inc.
+// Copyright (c) YugabyteDB, Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License"); you may not use this file except
 // in compliance with the License.  You may obtain a copy of the License at
@@ -196,7 +196,9 @@ TEST(FormatTest, Time) {
   ASSERT_EQ("Time: 10.000s", Format("Time: $0", 10s));
   ASSERT_EQ("Time: 0.001s", Format("Time: $0", 1ms));
   std::ostringstream out;
-  out << 15s;
+  // libc++ that comes with LLVM 17 defines stream output operators for std::duration, so we
+  // convert the duration to MonoDelta for consistency.
+  out << MonoDelta(15s);
   ASSERT_EQ("15.000s", out.str());
 }
 

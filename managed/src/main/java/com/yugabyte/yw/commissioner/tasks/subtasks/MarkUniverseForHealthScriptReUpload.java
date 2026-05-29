@@ -1,5 +1,5 @@
 /*
- * Copyright 2022 YugaByte, Inc. and Contributors
+ * Copyright 2022 YugabyteDB, Inc. and Contributors
  *
  * Licensed under the Polyform Free Trial License 1.0.0 (the "License"); you
  * may not use this file except in compliance with the License. You
@@ -11,7 +11,6 @@
 package com.yugabyte.yw.commissioner.tasks.subtasks;
 
 import com.yugabyte.yw.commissioner.BaseTaskDependencies;
-import com.yugabyte.yw.commissioner.HealthChecker;
 import com.yugabyte.yw.commissioner.tasks.UniverseTaskBase;
 import javax.inject.Inject;
 import lombok.extern.slf4j.Slf4j;
@@ -19,18 +18,14 @@ import lombok.extern.slf4j.Slf4j;
 @Slf4j
 public class MarkUniverseForHealthScriptReUpload extends UniverseTaskBase {
 
-  private final HealthChecker healthChecker;
-
   @Inject
-  protected MarkUniverseForHealthScriptReUpload(
-      BaseTaskDependencies baseTaskDependencies, HealthChecker healthChecker) {
+  protected MarkUniverseForHealthScriptReUpload(BaseTaskDependencies baseTaskDependencies) {
     super(baseTaskDependencies);
-    this.healthChecker = healthChecker;
   }
 
   @Override
   public String getName() {
-    return super.getName() + "(" + taskParams().universeUUID + ")";
+    return super.getName() + "(" + taskParams().getUniverseUUID() + ")";
   }
 
   @Override

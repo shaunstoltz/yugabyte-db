@@ -1,23 +1,25 @@
-// Copyright (c) YugaByte, Inc.
+// Copyright (c) YugabyteDB, Inc.
 
 package com.yugabyte.yw.models.configs;
 
 import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.Mockito.lenient;
 import static org.mockito.Mockito.mock;
+import static org.mockito.Mockito.when;
 
-import com.amazonaws.services.s3.AmazonS3;
-import com.amazonaws.services.s3.AmazonS3Client;
-import com.amazonaws.services.s3.model.AmazonS3Exception;
-import com.amazonaws.services.s3.model.ListObjectsV2Result;
 import com.azure.storage.blob.BlobContainerClient;
 import com.azure.storage.blob.models.BlobStorageException;
-import com.fasterxml.jackson.databind.JsonNode;
 import com.google.api.gax.paging.Page;
 import com.google.cloud.storage.Blob;
 import com.google.cloud.storage.Storage;
 import com.google.cloud.storage.Storage.BlobListOption;
+import com.yugabyte.yw.common.AWSUtil;
+import com.yugabyte.yw.common.AZUtil;
 import com.yugabyte.yw.common.BeanValidator;
+import com.yugabyte.yw.common.GCPUtil;
+import com.yugabyte.yw.common.StorageUtilFactory;
+import com.yugabyte.yw.common.config.RuntimeConfGetter;
+import com.yugabyte.yw.models.configs.data.CustomerConfigStorageAzureData;
 import com.yugabyte.yw.models.configs.data.CustomerConfigStorageGCSData;
 import com.yugabyte.yw.models.configs.data.CustomerConfigStorageS3Data;
 import com.yugabyte.yw.models.helpers.CustomerConfigValidator;
@@ -25,6 +27,12 @@ import java.io.IOException;
 import java.io.UnsupportedEncodingException;
 import java.util.Collections;
 import java.util.List;
+import java.util.function.Consumer;
+import software.amazon.awssdk.services.s3.S3Client;
+import software.amazon.awssdk.services.s3.model.HeadBucketRequest;
+import software.amazon.awssdk.services.s3.model.ListObjectsV2Request;
+import software.amazon.awssdk.services.s3.model.ListObjectsV2Response;
+import software.amazon.awssdk.services.s3.model.S3Exception;
 
 // @formatter:off
 /*
@@ -39,29 +47,51 @@ import java.util.List;
 public class StubbedCustomerConfigValidator extends CustomerConfigValidator
     implements CloudClientsFactory {
 
-  private final AmazonS3Client s3Client = mock(AmazonS3Client.class);
+  public final S3Client s3Client = mock(S3Client.class);
 
-  private final Storage gcpStorage = mock(Storage.class);
+  public final Storage gcpStorage = mock(Storage.class);
 
   public final BlobContainerClient blobContainerClient = mock(BlobContainerClient.class);
 
   private final BlobStorageException blobStorageException = mock(BlobStorageException.class);
 
+  private final AWSUtil awsUtil = mock(AWSUtil.class);
+
   private boolean refuseKeys = false;
 
-  public StubbedCustomerConfigValidator(BeanValidator beanValidator, List<String> allowedBuckets) {
-    super(beanValidator);
+  public StubbedCustomerConfigValidator(
+      BeanValidator beanValidator,
+      List<String> allowedBuckets,
+      StorageUtilFactory storageUtilFactory,
+      RuntimeConfGetter runtimeConfGetter,
+      AWSUtil awsUtil,
+      AZUtil azUtil,
+      GCPUtil gcpUtil) {
+    super(beanValidator, storageUtilFactory, runtimeConfGetter, awsUtil, azUtil, gcpUtil);
 
     lenient()
-        .when(s3Client.doesBucketExistV2(any(String.class)))
-        .thenAnswer(invocation -> allowedBuckets.contains(invocation.getArguments()[0]));
-    lenient()
-        .when(s3Client.listObjectsV2(any(String.class), any(String.class)))
+        .when(s3Client.headBucket(any(Consumer.class)))
         .thenAnswer(
             invocation -> {
-              boolean allowedBucket = allowedBuckets.contains(invocation.getArguments()[0]);
-              ListObjectsV2Result result = new ListObjectsV2Result();
-              result.setKeyCount(allowedBucket ? 1 : 0);
+              Consumer<HeadBucketRequest.Builder> builderConsumer = invocation.getArgument(0);
+              HeadBucketRequest.Builder builder = HeadBucketRequest.builder();
+              builderConsumer.accept(builder);
+              HeadBucketRequest request = builder.build();
+              String bucketName = request.bucket();
+              if (!allowedBuckets.contains(bucketName)) {
+                throw S3Exception.builder().statusCode(404).build();
+              }
+              return null;
+            });
+    lenient()
+        .when(s3Client.listObjectsV2(any(ListObjectsV2Request.class)))
+        .thenAnswer(
+            invocation -> {
+              ListObjectsV2Request request = invocation.getArgument(0);
+              String bucketName = request.bucket();
+              boolean allowedBucket = allowedBuckets.contains(bucketName);
+              ListObjectsV2Response result =
+                  ListObjectsV2Response.builder().keyCount(allowedBucket ? 1 : 0).build();
               return result;
             });
 
@@ -101,14 +131,14 @@ public class StubbedCustomerConfigValidator extends CustomerConfigValidator
               }
               return mock(Page.class);
             });
-    lenient().when(blobContainerClient.exists()).thenReturn(true);
   }
 
   @Override
-  public AmazonS3 createS3Client(CustomerConfigStorageS3Data configData) {
+  public S3Client createS3Client(CustomerConfigStorageS3Data configData) {
     if (refuseKeys) {
-      throw new AmazonS3Exception(
-          "The AWS Access Key Id you provided does not exist in our records.");
+      throw S3Exception.builder()
+          .message("The AWS Access Key Id you provided does not exist in our records.")
+          .build();
     }
     return s3Client;
   }
@@ -124,8 +154,9 @@ public class StubbedCustomerConfigValidator extends CustomerConfigValidator
 
   @Override
   public BlobContainerClient createBlobContainerClient(
-      String azUrl, String azSasToken, String container) {
+      CustomerConfigStorageAzureData configData, String azureUrl, String container) {
     if (refuseKeys) {
+      when(blobStorageException.getMessage()).thenReturn("Invalid credentials!");
       throw blobStorageException;
     }
     return blobContainerClient;

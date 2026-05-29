@@ -1,4 +1,4 @@
-// Copyright (c) YugaByte, Inc.
+// Copyright (c) YugabyteDB, Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License"); you may not use this file except
 // in compliance with the License.  You may obtain a copy of the License at
@@ -31,15 +31,17 @@ class HeaderManagerMockImpl : public HeaderManager {
       const EncryptionParams& encryption_info) override;
 
   Result<EncryptionParamsPtr> DecodeEncryptionParamsFromEncryptionMetadata(
-      const Slice& s) override;
+      const Slice& s, std::string* universe_key_id_output) override;
 
   uint32_t GetEncryptionMetadataStartIndex() override;
   Result<FileEncryptionStatus> GetFileEncryptionStatusFromPrefix(const Slice& s) override;
-  bool IsEncryptionEnabled() override;
+  Result<std::string> GetLatestUniverseKeyId() override;
+  Result<bool> IsEncryptionEnabled() override;
 
  private:
   EncryptionParamsPtr encryption_params_;
   bool file_encrypted_ = false;
+  const std::string universe_key_id_ = "0";
 };
 
 std::unique_ptr<HeaderManager> GetMockHeaderManager();

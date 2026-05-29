@@ -2,9 +2,9 @@
 // Use of this source code is governed by a BSD-style license that can be
 // found in the LICENSE file.
 //
-// The following only applies to changes made to this file as part of YugaByte development.
+// The following only applies to changes made to this file as part of YugabyteDB development.
 //
-// Portions Copyright (c) YugaByte, Inc.
+// Portions Copyright (c) YugabyteDB, Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License"); you may not use this file except
 // in compliance with the License.  You may obtain a copy of the License at
@@ -22,7 +22,7 @@
 #include <atomic>
 #include <regex>
 
-#include <glog/logging.h>
+#include "yb/util/logging.h"
 
 #include "yb/gutil/threading/thread_collision_warner.h"
 
@@ -72,6 +72,10 @@ bool RefCountedBase::Release() const {
 
 bool RefCountedThreadSafeBase::HasOneRef() const {
   return ref_count_.load(std::memory_order_acquire) == 1;
+}
+
+bool RefCountedThreadSafeBase::HasTwoRef() const {
+  return ref_count_.load(std::memory_order_acquire) == 2;
 }
 
 RefCountedThreadSafeBase::~RefCountedThreadSafeBase() {

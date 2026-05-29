@@ -15,9 +15,9 @@
 // specific language governing permissions and limitations
 // under the License.
 //
-// The following only applies to changes made to this file as part of YugaByte development.
+// The following only applies to changes made to this file as part of YugabyteDB development.
 //
-// Portions Copyright (c) YugaByte, Inc.
+// Portions Copyright (c) YugabyteDB, Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License"); you may not use this file except
 // in compliance with the License.  You may obtain a copy of the License at
@@ -41,8 +41,9 @@
 #include <utility>
 #include <vector>
 
-#include <boost/optional/optional_io.hpp>
-#include <glog/logging.h>
+#include <boost/range/adaptors.hpp>
+
+#include "yb/ash/wait_state.h"
 
 #include "yb/client/async_rpc.h"
 #include "yb/client/client-internal.h"
@@ -65,12 +66,17 @@
 #include "yb/gutil/stl_util.h"
 #include "yb/gutil/strings/join.h"
 
+#include "yb/master/sys_catalog_constants.h"
+
+#include "yb/tserver/tserver.messages.h"
+
 #include "yb/util/debug-util.h"
 #include "yb/util/flags.h"
 #include "yb/util/format.h"
 #include "yb/util/logging.h"
 #include "yb/util/result.h"
 #include "yb/util/status_format.h"
+#include "yb/util/sync_point.h"
 #include "yb/util/trace.h"
 
 // When this flag is set to false and we have separate errors for operation, then batcher would
@@ -81,20 +87,18 @@ DEFINE_test_flag(bool, combine_batcher_errors, false,
 DEFINE_test_flag(double, simulate_tablet_lookup_does_not_match_partition_key_probability, 0.0,
                  "Probability for simulating the error that happens when a key is not in the key "
                  "range of the resolved tablet's partition.");
+DEFINE_test_flag(bool, fail_batcher_rpc, false, "Fail batcher RPCs for testing purposes.");
+
+DEFINE_RUNTIME_PREVIEW_bool(ysql_enable_write_pipelining, false,
+    "Enable pipelining of write statements within a transaction. When enabled, multiple read and "
+    "write statements in a transaction are executed concurrently, reducing overall latency.");
 
 using std::pair;
-using std::set;
-using std::unique_ptr;
 using std::shared_ptr;
-using std::unordered_map;
-using strings::Substitute;
 
 using namespace std::placeholders;
 
 namespace yb {
-
-using tserver::WriteResponsePB;
-using tserver::WriteResponsePB_PerRowErrorPB;
 
 namespace client {
 
@@ -108,6 +112,12 @@ const std::string Batcher::kErrorReachingOutToTServersMsg(
 namespace {
 
 const auto kGeneralErrorStatus = STATUS(IOError, Batcher::kErrorReachingOutToTServersMsg);
+
+bool UseAsyncWrites(YBTableType table_type, TransactionId txn_id) {
+  // Use async writes for transactional writes in YSQL, or if the test flag is enabled.
+  return FLAGS_ysql_enable_write_pipelining && table_type == YBTableType::PGSQL_TABLE_TYPE &&
+         !txn_id.IsNil();
+}
 
 }  // namespace
 
@@ -124,18 +134,22 @@ const auto kGeneralErrorStatus = STATUS(IOError, Batcher::kErrorReachingOutToTSe
 // locks are non-reentrant).
 // ------------------------------------------------------------
 
-Batcher::Batcher(YBClient* client,
-                 const YBSessionPtr& session,
-                 YBTransactionPtr transaction,
-                 ConsistentReadPoint* read_point,
-                 bool force_consistent_read)
-  : client_(client),
-    weak_session_(session),
-    async_rpc_metrics_(session->async_rpc_metrics()),
-    transaction_(std::move(transaction)),
-    read_point_(read_point),
-    force_consistent_read_(force_consistent_read) {
-}
+Batcher::Batcher(
+    YBClient* client,
+    const YBSessionPtr& session,
+    YBTransactionPtr transaction,
+    ConsistentReadPoint* read_point,
+    bool force_consistent_read,
+    int64_t leader_term,
+    ThreadSafeArenaPtr arena)
+    : client_(client),
+      weak_session_(session),
+      async_rpc_metrics_(session->async_rpc_metrics()),
+      transaction_(std::move(transaction)),
+      read_point_(read_point),
+      force_consistent_read_(force_consistent_read),
+      leader_term_(leader_term),
+      arena_(std::move(arena)) {}
 
 Batcher::~Batcher() {
   LOG_IF_WITH_PREFIX(DFATAL, outstanding_rpcs_ != 0)
@@ -159,6 +173,10 @@ void Batcher::Abort(const Status& status) {
 
 void Batcher::SetDeadline(CoarseTimePoint deadline) {
   deadline_ = deadline;
+}
+
+void Batcher::SetPoolTag(rpc::ThreadPoolTag pool_tag) {
+  pool_tag_ = pool_tag;
 }
 
 bool Batcher::HasPendingOperations() const {
@@ -237,6 +255,7 @@ void Batcher::FlushAsync(
   // expected by transaction.
   if (transaction && !is_within_transaction_retry) {
     transaction->batcher_if().ExpectOperations(operations_count);
+    SetSubTransactionMetadataPB(transaction->GetSubTransactionMetadataPB());
   }
 
   ops_queue_.reserve(ops_.size());
@@ -247,11 +266,14 @@ void Batcher::FlushAsync(
 
     if (status.ok() && yb_op->table()->partition_schema().IsHashPartitioning()) {
       if (in_flight_op.partition_key.empty()) {
-        if (!yb_op->read_only()) {
+        // Partition key is empty for advisory unlock all op(s). Instead, the tablet is set.
+        if (!yb_op->read_only() &&
+            yb_op->type() != YBOperation::Type::PGSQL_LOCK && !yb_op->tablet()) {
           status = STATUS_FORMAT(IllegalState, "Hash partition key is empty for $0", yb_op);
         }
       } else {
-        yb_op->SetHashCode(PartitionSchema::DecodeMultiColumnHashValue(in_flight_op.partition_key));
+        yb_op->SetHashCode(
+            dockv::PartitionSchema::DecodeMultiColumnHashValue(in_flight_op.partition_key));
       }
     }
 
@@ -262,6 +284,8 @@ void Batcher::FlushAsync(
     }
   }
 
+  ASH_ENABLE_CONCURRENT_UPDATES();
+  SET_WAIT_STATUS(YBClient_WaitingOnDocDB);
   for (auto& op : ops_queue_) {
     VLOG_WITH_PREFIX(4) << "Looking up tablet for " << op.ToString()
                         << " partition key: " << Slice(op.partition_key).ToDebugHexString();
@@ -274,7 +298,7 @@ void Batcher::FlushAsync(
   }
 }
 
-bool Batcher::Has(const std::shared_ptr<YBOperation>& yb_op) const {
+bool Batcher::Has(const YBOperationPtr& yb_op) const {
   for (const auto& op : ops_) {
     if (op == yb_op) {
       return true;
@@ -283,14 +307,25 @@ bool Batcher::Has(const std::shared_ptr<YBOperation>& yb_op) const {
   return false;
 }
 
-void Batcher::Add(std::shared_ptr<YBOperation> op) {
+void Batcher::Add(YBOperationPtr op) {
   if (state_ != BatcherState::kGatheringOps) {
     LOG_WITH_PREFIX(DFATAL)
         << "Adding op to batcher in a wrong state: " << state_ << "\n" << GetStackTrace();
     return;
   }
 
-  ops_.push_back(op);
+  const bool skip_intents =
+      (op->type() == YBOperation::Type::PGSQL_WRITE &&
+       down_cast<YBPgsqlWriteOp*>(op.get())->skip_intents()) ||
+      (op->type() == YBOperation::Type::PGSQL_READ &&
+       down_cast<YBPgsqlReadOp*>(op.get())->skip_intents());
+  if (ops_.empty()) {
+    skip_intents_ = skip_intents;
+  } else {
+    CHECK_EQ(skip_intents_, skip_intents)
+        << "PG should only send all skip intents ops, or all normal ops.";
+  }
+  ops_.emplace_back(std::move(op));
 }
 
 void Batcher::CombineError(const InFlightOp& in_flight_op) {
@@ -315,9 +350,14 @@ void Batcher::CombineError(const InFlightOp& in_flight_op) {
 
 void Batcher::LookupTabletFor(InFlightOp* op) {
   auto shared_this = shared_from_this();
+  TracePtr trace(Trace::CurrentTrace());
+  ash::WaitStateInfoPtr wait_state{ash::WaitStateInfo::CurrentWaitState()};
+  SET_WAIT_STATUS(YBClient_LookingUpTablet);
   client_->data_->meta_cache_->LookupTabletByKey(
       op->yb_op->mutable_table(), op->partition_key, deadline_,
-      [shared_this, op](const auto& lookup_result) {
+      [shared_this, op, trace, wait_state](const auto& lookup_result) {
+        ADOPT_WAIT_STATE(wait_state);
+        ADOPT_TRACE(trace.get());
         shared_this->TabletLookupFinished(op, lookup_result);
       },
       FailOnPartitionListRefreshed::kTrue);
@@ -325,7 +365,7 @@ void Batcher::LookupTabletFor(InFlightOp* op) {
 
 void Batcher::TabletLookupFinished(
     InFlightOp* op, Result<internal::RemoteTabletPtr> lookup_result) {
-  VLOG_WITH_PREFIX_AND_FUNC(lookup_result.ok() ? 4 : 3)
+  VLOG_WITH_PREFIX_AND_FUNC(3)
       << "Op: " << op->ToString() << ", result: " << AsString(lookup_result);
 
   if (lookup_result.ok()) {
@@ -348,7 +388,9 @@ void Batcher::TabletLookupFinished(
   }
 }
 
-void Batcher::TransactionReady(const Status& status) {
+void Batcher::TransactionReady(ash::WaitStateInfoPtr wait_state, const Status& status) {
+  ADOPT_WAIT_STATE(wait_state);
+  SCOPED_WAIT_STATUS(OnCpu_Active);
   if (status.ok()) {
     ExecuteOperations(Initial::kFalse);
   } else {
@@ -362,7 +404,7 @@ std::pair<std::map<PartitionKey, Status>, std::map<RetryableRequestId, Status>>
   std::map<RetryableRequestId, Status> errors_by_request_id;
   for (auto& op : ops_queue_) {
     if (op.tablet) {
-      const Partition& partition = op.tablet->partition();
+      const auto& partition = op.tablet->partition();
 
       bool partition_contains_row = false;
       const auto& partition_key = op.partition_key;
@@ -371,6 +413,7 @@ std::pair<std::map<PartitionKey, Status>, std::map<RetryableRequestId, Status>>
         case YBOperation::QL_WRITE: FALLTHROUGH_INTENDED;
         case YBOperation::PGSQL_READ: FALLTHROUGH_INTENDED;
         case YBOperation::PGSQL_WRITE: FALLTHROUGH_INTENDED;
+        case YBOperation::PGSQL_LOCK: FALLTHROUGH_INTENDED;
         case YBOperation::REDIS_READ: FALLTHROUGH_INTENDED;
         case YBOperation::REDIS_WRITE: {
           partition_contains_row = partition.ContainsKey(partition_key);
@@ -384,7 +427,7 @@ std::pair<std::map<PartitionKey, Status>, std::map<RetryableRequestId, Status>>
                   FLAGS_TEST_simulate_tablet_lookup_does_not_match_partition_key_probability) &&
               op.yb_op->table()->name().namespace_name() == "yb_test"))) {
         const Schema& schema = GetSchema(op.yb_op->table()->schema());
-        const PartitionSchema& partition_schema = op.yb_op->table()->partition_schema();
+        const auto& partition_schema = op.yb_op->table()->partition_schema();
         const auto msg = Format(
             "Row $0 not in partition $1, partition key: $2, tablet: $3",
             op.yb_op->ToString(),
@@ -415,6 +458,8 @@ void Batcher::AllLookupsDone() {
   // 1. The batcher is in the "resolving tablets" state (i.e. FlushAsync was called).
   // 2. All outstanding ops have finished lookup. Why? To avoid a situation
   //    where ops are flushed one by one as they finish lookup.
+  SET_WAIT_STATUS(YBClient_WaitingOnDocDB);
+  SCOPED_WAIT_STATUS(OnCpu_Active);
 
   if (state_ != BatcherState::kResolvingTablets) {
     LOG(DFATAL) << __func__ << " is invoked in wrong state: " << state_;
@@ -427,8 +472,9 @@ void Batcher::AllLookupsDone() {
 
   state_ = BatcherState::kTransactionPrepare;
 
-  VLOG_WITH_PREFIX_AND_FUNC(4)
-      << "Errors: " << errors_by_partition_key.size() << ", ops queue: " << ops_queue_.size();
+  VLOG_WITH_PREFIX_AND_FUNC(4) << "Number of partition keys with lookup errors: "
+                               << errors_by_partition_key.size()
+                               << ", ops queue: " << ops_queue_.size();
 
   if (!errors_by_partition_key.empty()) {
     // If some operation tablet lookup failed - set this error for all operations designated for
@@ -513,6 +559,9 @@ void Batcher::AllLookupsDone() {
 void Batcher::ExecuteOperations(Initial initial) {
   VLOG_WITH_PREFIX_AND_FUNC(3) << "initial: " << initial;
   auto transaction = this->transaction();
+  ADOPT_TRACE(transaction ? transaction->trace() : Trace::CurrentTrace());
+  ops_info_.metadata.background_transaction_meta = background_transaction_meta_;
+  ops_info_.metadata.object_locking_txn_meta = object_locking_txn_meta_;
   if (transaction) {
     // If this Batcher is executed in context of transaction,
     // then this transaction should initialize metadata used by RPC calls.
@@ -521,7 +570,8 @@ void Batcher::ExecuteOperations(Initial initial) {
     // it could be done.
     if (!transaction->batcher_if().Prepare(
         &ops_info_, force_consistent_read_, deadline_, initial,
-        std::bind(&Batcher::TransactionReady, shared_from_this(), _1))) {
+        std::bind(&Batcher::TransactionReady, shared_from_this(),
+        ash::WaitStateInfo::CurrentWaitState(), _1))) {
       return;
     }
   } else if (force_consistent_read_ &&
@@ -544,7 +594,8 @@ void Batcher::ExecuteOperations(Initial initial) {
   }
   state_ = BatcherState::kTransactionReady;
 
-  const bool force_consistent_read = force_consistent_read_ || this->transaction();
+  const bool force_consistent_read =
+      force_consistent_read_ || this->transaction();
 
   // Use big enough value for preallocated storage, to avoid unnecessary allocations.
   boost::container::small_vector<std::shared_ptr<AsyncRpc>,
@@ -553,22 +604,33 @@ void Batcher::ExecuteOperations(Initial initial) {
 
   // Now flush the ops for each group.
   // Consistent read is not required when whole batch fits into one command.
+  VLOG_WITH_PREFIX_AND_FUNC(3) << "force_consistent_read=" << force_consistent_read
+                               << ", ops_info_.groups.size()=" << ops_info_.groups.size();
   const auto need_consistent_read = force_consistent_read || ops_info_.groups.size() > 1;
 
+  // Set batcher's 'rpcs_start_time_micros_' only when it is uninitialized, i.e, only for
+  // a new batcher and not a retry_batcher.
+  if (Clock() && rpcs_start_time_micros() == 0) {
+    SetRpcStartTime(Clock()->Now().GetPhysicalValueMicros());
+  }
   auto self = shared_from_this();
   for (const auto& group : ops_info_.groups) {
     // Allow local calls for last group only.
     const auto allow_local_calls =
         allow_local_calls_in_curr_thread_ && (&group == &ops_info_.groups.back());
-    rpcs.push_back(CreateRpc(
-        self, group.begin->tablet.get(), group, allow_local_calls, need_consistent_read));
+    auto rpc_result = CreateRpc(
+        self, group.begin->tablet.get(), group, allow_local_calls, need_consistent_read);
+    if (!rpc_result.ok()) {
+      VLOG_WITH_PREFIX(1) << "Aborting batcher: failed to create RPC for tablet "
+                          << group.begin->tablet->tablet_id() << ": " << rpc_result.status();
+      Abort(rpc_result.status());
+      return;
+    }
+    rpcs.push_back(std::move(*rpc_result));
   }
 
   outstanding_rpcs_.store(rpcs.size());
   for (const auto& rpc : rpcs) {
-    if (transaction && transaction->trace() && rpc->trace()) {
-      transaction->trace()->AddChildTrace(rpc->trace());
-    }
     rpc->SendRpc();
   }
 }
@@ -582,6 +644,9 @@ rpc::ProxyCache& Batcher::proxy_cache() const {
 }
 
 YBTransactionPtr Batcher::transaction() const {
+  if (skip_intents_) {
+    return nullptr;
+  }
   return transaction_;
 }
 
@@ -593,20 +658,34 @@ const ClientId& Batcher::client_id() const {
   return client_->id();
 }
 
+server::Clock* Batcher::Clock() const {
+  return client_->Clock();
+}
+
 std::pair<RetryableRequestId, RetryableRequestId> Batcher::NextRequestIdAndMinRunningRequestId() {
-  const auto& pair = client_->NextRequestIdAndMinRunningRequestId();
-  RegisterRequest(pair.first);
-  return pair;
+  return client_->NextRequestIdAndMinRunningRequestId();
 }
 
 void Batcher::RequestsFinished() {
-  client_->RequestsFinished(retryable_request_ids_);
+  client_->RequestsFinished(retryable_requests_ | boost::adaptors::map_keys);
 }
 
-std::shared_ptr<AsyncRpc> Batcher::CreateRpc(
+void Batcher::MoveRequestDetailsFrom(const BatcherPtr& other, RetryableRequestId id) {
+  auto it = other->retryable_requests_.find(id);
+  if (it == other->retryable_requests_.end()) {
+    // The request id has been moved.
+    DCHECK(retryable_requests_.contains(id));
+    return;
+  }
+  retryable_requests_.insert(std::move(*it));
+  other->retryable_requests_.erase(it);
+}
+
+Result<std::shared_ptr<AsyncRpc>> Batcher::CreateRpc(
     const BatcherPtr& self, RemoteTablet* tablet, const InFlightOpsGroup& group,
     const bool allow_local_calls_in_curr_thread, const bool need_consistent_read) {
-  VLOG_WITH_PREFIX_AND_FUNC(3) << "tablet: " << tablet->tablet_id();
+  const auto& tablet_id = tablet->tablet_id();
+  VLOG_WITH_PREFIX_AND_FUNC(3) << "tablet: " << tablet_id;
 
   CHECK(group.begin != group.end);
 
@@ -618,28 +697,47 @@ std::shared_ptr<AsyncRpc> Batcher::CreateRpc(
 
   // Split the read operations according to consistency levels since based on consistency
   // levels the read algorithm would differ.
-  const auto op_group = (*group.begin).yb_op->group();
-  AsyncRpcData data {
+
+  AsyncRpcData data{
     .batcher = self,
     .tablet = tablet,
     .allow_local_calls_in_curr_thread = allow_local_calls_in_curr_thread,
     .need_consistent_read = need_consistent_read,
+    .skip_intents = skip_intents_,
+    .arena = arena_,
     .ops = InFlightOps(group.begin, group.end),
     .need_metadata = group.need_metadata
   };
 
+  const auto& first_op = group.begin->yb_op;
+  auto transaction = this->transaction();
+  if (transaction) {
+    data.pending_async_write_op_id = VERIFY_RESULT(
+        transaction->GetAsyncWriteOpIdForReadCheck(tablet_id));
+    if (data.pending_async_write_op_id.valid()) {
+      data.need_metadata = true;
+    }
+  }
+
+  const auto op_group = first_op->group();
   switch (op_group) {
-    case OpGroup::kWrite:
-      return std::make_shared<WriteRpc>(data);
-    case OpGroup::kLeaderRead:
-      return std::make_shared<ReadRpc>(data, YBConsistencyLevel::STRONG);
+    case OpGroup::kWrite: [[fallthrough]];
+    case OpGroup::kLock: [[fallthrough]];
+    case OpGroup::kUnlock: {
+      data.use_async_write = UseAsyncWrites(
+          first_op->table()->table_type(), ops_info_.metadata.transaction.transaction_id);
+      return std::make_shared<WriteRpc>(data, pool_tag_);
+    }
+    case OpGroup::kLeaderRead: {
+      data.use_async_write = UseAsyncWrites(
+          first_op->table()->table_type(), ops_info_.metadata.transaction.transaction_id);
+      return std::make_shared<ReadRpc>(data, YBConsistencyLevel::STRONG, pool_tag_);
+    }
     case OpGroup::kConsistentPrefixRead:
-      return std::make_shared<ReadRpc>(data, YBConsistencyLevel::CONSISTENT_PREFIX);
+      return std::make_shared<ReadRpc>(data, YBConsistencyLevel::CONSISTENT_PREFIX, pool_tag_);
   }
   FATAL_INVALID_ENUM_VALUE(OpGroup, op_group);
 }
-
-using tserver::ReadResponsePB;
 
 void Batcher::AddOpCountMismatchError() {
   // TODO: how to handle this kind of error where the array of response PB's don't match
@@ -663,7 +761,8 @@ void Batcher::Flushed(
       // See comments for YBTransaction::Impl::running_requests_ and
       // YBSession::AddErrorsAndRunCallback.
       // https://github.com/yugabyte/yugabyte-db/issues/7984.
-      transaction->batcher_if().Flushed(ops, flush_extra_result.used_read_time, status);
+      transaction->batcher_if().Flushed(
+          ops, ops_info_.metadata.subtransaction_pb, flush_extra_result.used_read_time, status);
     }
   }
   if (status.ok() && read_point_) {
@@ -689,23 +788,47 @@ void Batcher::ProcessRpcStatus(const AsyncRpc &rpc, const Status &s) {
     return;
   }
 
-  if (PREDICT_FALSE(!s.ok())) {
+  TEST_SYNC_POINT("Batcher::ProcessRpcStatus1");
+  TEST_SYNC_POINT("Batcher::ProcessRpcStatus2");
+
+  auto status = s;
+  if (FLAGS_TEST_fail_batcher_rpc) {
+    status = STATUS(
+        TryAgain, "FLAGS_TEST_fail_batcher_rpc",
+        ClientError(ClientErrorCode::kTabletNotYetRunning));
+  }
+
+  if (PREDICT_FALSE(!status.ok())) {
     // Mark each of the ops as failed, since the whole RPC failed.
     for (auto& in_flight_op : rpc.ops()) {
-      in_flight_op.error = s;
+      in_flight_op.error = status;
     }
   }
 }
 
 void Batcher::ProcessReadResponse(const ReadRpc &rpc, const Status &s) {
   ProcessRpcStatus(rpc, s);
+
+  if (s.ok()) {
+    const auto& resp = rpc.resp();
+    if (resp.has_async_write_op_id()) {
+      HandleAsyncWriteResponse(resp.async_write_op_id(), rpc.tablet(), rpc.table());
+    }
+  }
 }
 
 void Batcher::ProcessWriteResponse(const WriteRpc &rpc, const Status &s) {
   ProcessRpcStatus(rpc, s);
 
-  if (s.ok() && rpc.resp().has_propagated_hybrid_time()) {
-    client_->data_->UpdateLatestObservedHybridTime(rpc.resp().propagated_hybrid_time());
+  if (s.ok()) {
+    const auto& resp = rpc.resp();
+    if (resp.has_async_write_op_id()) {
+      HandleAsyncWriteResponse(resp.async_write_op_id(), rpc.tablet(), rpc.table());
+    }
+
+    if (resp.has_propagated_hybrid_time()) {
+      client_->data_->UpdateLatestObservedHybridTime(resp.propagated_hybrid_time());
+    }
   }
 
   // Check individual row errors.
@@ -715,10 +838,11 @@ void Batcher::ProcessWriteResponse(const WriteRpc &rpc, const Status &s) {
 
     size_t row_index = err_pb.row_index();
     if (row_index >= rpc.ops().size()) {
-      LOG_WITH_PREFIX(ERROR) << "Received a per_row_error for an out-of-bound op index "
-                             << row_index << " (sent only " << rpc.ops().size() << " ops)";
-      LOG_WITH_PREFIX(ERROR) << "Response from tablet " << rpc.tablet().tablet_id() << ":\n"
-                             << rpc.resp().DebugString();
+      LOG_WITH_PREFIX(DFATAL)
+          << "Received a per_row_error for an out-of-bound op index " << row_index
+          << " (sent only " << rpc.ops().size() << " ops)\n"
+          << "Response from tablet " << rpc.tablet().tablet_id() << ":\n"
+          << rpc.resp().ShortDebugString();
       continue;
     }
     shared_ptr<YBOperation> yb_op = rpc.ops()[row_index].yb_op;
@@ -744,6 +868,67 @@ std::string Batcher::LogPrefix() const {
   const void* self = this;
   return Format(
       "Batcher ($0), session ($1): ", self, static_cast<void*>(weak_session_.lock().get()));
+}
+
+void Batcher::SetRpcStartTime(MicrosTime rpcs_start_time_micros) {
+  DCHECK_EQ(rpcs_start_time_micros_, 0) << LogPrefix() << "rpcs_start_time_micros_ being reset.";
+  rpcs_start_time_micros_ = rpcs_start_time_micros;
+}
+
+void Batcher::InitFromFailedBatcher(const BatcherPtr& failed_batcher,
+                                    const CollectedErrors& errors) {
+  SetDeadline(failed_batcher->deadline());
+  SetRpcStartTime(failed_batcher->rpcs_start_time_micros());
+  for (auto& error : errors) {
+    VLOG_WITH_FUNC(5) << "Retrying " << AsString(error->failed_op())
+                      << " due to: " << error->status();
+    const auto op = error->shared_failed_op();
+    op->ResetTablet();
+    // Transmit failed request id to retry_batcher.
+    if (op->request_id()) {
+      MoveRequestDetailsFrom(failed_batcher, *op->request_id());
+    }
+    Add(op);
+  }
+  SetSubTransactionMetadataPB(failed_batcher->GetSubTransactionMetadataPB());
+}
+
+void Batcher::RecordAsyncWriteCompletion(
+    const TabletId& tablet_id, const OpId& op_id, const Status& status) {
+  auto transaction = this->transaction();
+  if (transaction) {
+    transaction->RecordAsyncWriteCompletion(tablet_id, op_id, status);
+  }
+}
+
+void Batcher::WaitForAsyncWrites(const TabletId& tablet_id, StdStatusCallback&& callback) {
+  auto transaction = this->transaction();
+  if (!transaction) {
+    callback(Status::OK());
+    return;
+  }
+  transaction->WaitForAsyncWrites(tablet_id, std::move(callback));
+}
+
+void Batcher::HandleAsyncWriteResponse(
+    const LWOpIdPB& async_write_op_id, const RemoteTablet& tablet,
+    const std::shared_ptr<const YBTable>& table) {
+  // We have a async write. Record the OpId, and send a async RPC to track its completion.
+  // At time of final commit, we will wait for all these async writes to complete.
+  auto transaction = this->transaction();
+  if (!transaction) {
+    LOG_WITH_PREFIX(DFATAL) << "No transaction found for async write response";
+    return;
+  }
+
+  const auto op_id = OpId::FromPB(async_write_op_id);
+  if (transaction->RecordAsyncWrite(tablet.tablet_id(), op_id)) {
+    // Multiple write operations can get combined into the same async write RPC resulting in
+    // duplicate OpIds.
+    auto wait_for_async_write_rpc = std::make_shared<WaitForAsyncWriteRpc>(
+        shared_from_this(), tablet.tablet_id(), table, op_id);
+    wait_for_async_write_rpc->SendRpc();
+  }
 }
 
 InFlightOpsGroup::InFlightOpsGroup(const Iterator& group_begin, const Iterator& group_end)

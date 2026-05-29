@@ -15,9 +15,9 @@
 // specific language governing permissions and limitations
 // under the License.
 //
-// The following only applies to changes made to this file as part of YugaByte development.
+// The following only applies to changes made to this file as part of YugabyteDB development.
 //
-// Portions Copyright (c) YugaByte, Inc.
+// Portions Copyright (c) YugabyteDB, Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License"); you may not use this file except
 // in compliance with the License.  You may obtain a copy of the License at
@@ -39,11 +39,11 @@
 
 #include <time.h>
 
-#include <glog/logging.h>
+#include "yb/util/logging.h"
 
 #include "yb/client/table.h"
 
-#include "yb/common/ql_expr.h"
+#include "yb/qlexpr/ql_expr.h"
 
 #include "yb/docdb/ql_rowwise_iterator_interface.h"
 
@@ -53,30 +53,36 @@
 #include "yb/tablet/local_tablet_writer.h"
 #include "yb/tablet/tablet-test-base.h"
 #include "yb/tablet/tablet.h"
+#include "yb/tablet/tablet_metrics.h"
 #include "yb/tablet/tablet_bootstrap_if.h"
 
+#include "yb/rocksdb/db/db_impl.h"
+#include "yb/rocksdb/db/write_controller.h"
+
+#include "yb/util/cast.h"
 #include "yb/util/enums.h"
+#include "yb/util/scope_exit.h"
 #include "yb/util/slice.h"
 #include "yb/util/status_log.h"
 #include "yb/util/test_macros.h"
 #include "yb/util/flags.h"
 
-using std::shared_ptr;
-using std::unordered_set;
+DECLARE_bool(TEST_skip_write_stop_check_in_should_apply_write);
+
 using std::string;
 using std::vector;
 
 namespace yb {
 namespace tablet {
 
-DEFINE_UNKNOWN_int32(testiterator_num_inserts, 1000,
+DEFINE_NON_RUNTIME_int32(testiterator_num_inserts, 1000,
              "Number of rows inserted in TestRowIterator/TestInsert");
 
-static_assert(static_cast<int>(to_underlying(TableType::YQL_TABLE_TYPE)) ==
-                  to_underlying(client::YBTableType::YQL_TABLE_TYPE),
+static_assert(static_cast<int>(std::to_underlying(TableType::YQL_TABLE_TYPE)) ==
+                  std::to_underlying(client::YBTableType::YQL_TABLE_TYPE),
               "Numeric code for YQL_TABLE_TYPE table type must be consistent");
-static_assert(static_cast<int>(to_underlying(TableType::REDIS_TABLE_TYPE)) ==
-                  to_underlying(client::YBTableType::REDIS_TABLE_TYPE),
+static_assert(static_cast<int>(std::to_underlying(TableType::REDIS_TABLE_TYPE)) ==
+                  std::to_underlying(client::YBTableType::REDIS_TABLE_TYPE),
               "Numeric code for REDIS_TABLE_TYPE table type must be consistent");
 
 template<class SETUP>
@@ -145,7 +151,7 @@ TYPED_TEST(TestTablet, TestRowIteratorComplex) {
 
   // Collect the expected rows.
   vector<string> rows;
-  ASSERT_OK(yb::tablet::DumpTablet(*this->tablet(), this->client_schema_, &rows));
+  ASSERT_OK(yb::tablet::DumpTablet(*this->tablet(), &rows));
   ASSERT_EQ(max_rows, rows.size());
 }
 
@@ -189,14 +195,12 @@ TYPED_TEST(TestTablet, TestMetricsInit) {
   MetricRegistry* registry = this->harness()->metrics_registry();
   std::stringstream out;
   JsonWriter writer(&out, JsonWriter::PRETTY);
-  MetricEntityOptions entity_opts;
-  entity_opts.metrics.push_back("*");
-  ASSERT_OK(registry->WriteAsJson(&writer, entity_opts, MetricJsonOptions()));
+  ASSERT_OK(registry->WriteAsJson(&writer, MetricJsonOptions()));
   // Open tablet, should still work. Need a new writer though, as we should not overwrite an already
   // existing root.
   ASSERT_OK(this->harness()->Open());
   JsonWriter new_writer(&out, JsonWriter::PRETTY);
-  ASSERT_OK(registry->WriteAsJson(&new_writer, entity_opts, MetricJsonOptions()));
+  ASSERT_OK(registry->WriteAsJson(&new_writer, MetricJsonOptions()));
 }
 
 TYPED_TEST(TestTablet, TestFlushedOpId) {
@@ -206,7 +210,7 @@ TYPED_TEST(TestTablet, TestFlushedOpId) {
 
   // Insert & flush one row to start index counting.
   ASSERT_OK(this->InsertTestRow(&writer, 0, 333));
-  ASSERT_OK(tablet->Flush(FlushMode::kSync));
+  ASSERT_OK(tablet->Flush(FlushMode::kSync, rocksdb::FlushReason::kTestOnly));
   OpId id = ASSERT_RESULT(tablet->MaxPersistentOpId()).regular;
   const int64_t start_index = id.index;
 
@@ -214,7 +218,7 @@ TYPED_TEST(TestTablet, TestFlushedOpId) {
   id = ASSERT_RESULT(tablet->MaxPersistentOpId()).regular;
   ASSERT_EQ(id.index, start_index);
 
-  ASSERT_OK(tablet->Flush(FlushMode::kSync));
+  ASSERT_OK(tablet->Flush(FlushMode::kSync, rocksdb::FlushReason::kTestOnly));
   id = ASSERT_RESULT(tablet->MaxPersistentOpId()).regular;
   ASSERT_EQ(id.index, start_index + kCount);
 
@@ -222,9 +226,154 @@ TYPED_TEST(TestTablet, TestFlushedOpId) {
   id = ASSERT_RESULT(tablet->MaxPersistentOpId()).regular;
   ASSERT_EQ(id.index, start_index + kCount);
 
-  ASSERT_OK(tablet->Flush(FlushMode::kSync));
+  ASSERT_OK(tablet->Flush(FlushMode::kSync, rocksdb::FlushReason::kTestOnly));
   id = ASSERT_RESULT(tablet->MaxPersistentOpId()).regular;
   ASSERT_EQ(id.index, start_index + 2*kCount);
+}
+
+TYPED_TEST(TestTablet, TestDocKeyMetrics) {
+  auto metrics = this->harness()->tablet()->metrics();
+
+  ASSERT_EQ(metrics->Get(TabletCounters::kDocDBKeysFound), 0);
+  ASSERT_EQ(metrics->Get(TabletCounters::kDocDBObsoleteKeysFound), 0);
+
+  LocalTabletWriter writer(this->tablet());
+  ASSERT_OK(this->InsertTestRow(&writer, 0, 0));
+  ASSERT_OK(this->InsertTestRow(&writer, 1, 0));
+  ASSERT_OK(this->InsertTestRow(&writer, 2, 0));
+  ASSERT_OK(this->InsertTestRow(&writer, 3, 0));
+  ASSERT_OK(this->InsertTestRow(&writer, 4, 0));
+
+  this->VerifyTestRows(0, 5);
+
+  ASSERT_EQ(metrics->Get(TabletCounters::kDocDBKeysFound), 5);
+  ASSERT_EQ(metrics->Get(TabletCounters::kDocDBObsoleteKeysFound), 0);
+  auto prev_total_keys = metrics->Get(TabletCounters::kDocDBKeysFound);
+
+  ASSERT_OK(this->DeleteTestRow(&writer, 0));
+  std::vector<std::string> str;
+  ASSERT_OK(this->IterateToStringList(&str));
+
+  ASSERT_EQ(metrics->Get(TabletCounters::kDocDBKeysFound) - prev_total_keys, 5);
+  ASSERT_EQ(metrics->Get(TabletCounters::kDocDBObsoleteKeysFound), 1);
+}
+
+TYPED_TEST(TestTablet, ShouldApplyWriteRespectsWriteStop) {
+  auto* db = down_cast<rocksdb::DBImpl*>(this->tablet()->regular_db());
+  auto& write_controller = db->TEST_write_controler();
+
+  ASSERT_TRUE(this->tablet()->ShouldApplyWrite());
+
+  {
+    auto stop_token = write_controller.GetStopToken();
+    ASSERT_TRUE(write_controller.IsStopped());
+    ASSERT_FALSE(write_controller.NeedsDelay());
+    ASSERT_FALSE(this->tablet()->ShouldApplyWrite());
+
+    auto stop_token_2 = write_controller.GetStopToken();
+    ASSERT_FALSE(this->tablet()->ShouldApplyWrite());
+
+    stop_token.reset();
+    ASSERT_TRUE(write_controller.IsStopped());
+    ASSERT_FALSE(this->tablet()->ShouldApplyWrite());
+  }
+  ASSERT_FALSE(write_controller.IsStopped());
+  ASSERT_TRUE(this->tablet()->ShouldApplyWrite());
+}
+
+TYPED_TEST(TestTablet, ShouldApplyWriteRespectsWriteDelay) {
+  auto* db = down_cast<rocksdb::DBImpl*>(this->tablet()->regular_db());
+  auto& write_controller = db->TEST_write_controler();
+
+  ASSERT_TRUE(this->tablet()->ShouldApplyWrite());
+
+  {
+    auto delay_token = write_controller.GetDelayToken(1024);
+    ASSERT_FALSE(write_controller.IsStopped());
+    ASSERT_TRUE(write_controller.NeedsDelay());
+    ASSERT_FALSE(this->tablet()->ShouldApplyWrite());
+  }
+  ASSERT_TRUE(this->tablet()->ShouldApplyWrite());
+}
+
+// Demonstrates that without the AreWritesStopped() check (controlled via
+// TEST_skip_write_stop_check_in_should_apply_write), ShouldApplyWrite() does
+// not detect kStop-type stalls triggered by db_max_flushing_bytes. See #30728.
+TYPED_TEST(TestTablet, ShouldApplyWriteWithoutStopCheckIgnoresWriteStop) {
+  ANNOTATE_UNPROTECTED_WRITE(FLAGS_TEST_skip_write_stop_check_in_should_apply_write) = true;
+  auto se = ScopeExit([&] {
+    ANNOTATE_UNPROTECTED_WRITE(FLAGS_TEST_skip_write_stop_check_in_should_apply_write) = false;
+  });
+
+  auto* db = down_cast<rocksdb::DBImpl*>(this->tablet()->regular_db());
+  auto& write_controller = db->TEST_write_controler();
+
+  // NeedsDelay() only checks total_delayed_, not total_stopped_.
+  // So a stop token is invisible when the AreWritesStopped() check is skipped.
+  auto stop_token = write_controller.GetStopToken();
+  ASSERT_TRUE(write_controller.IsStopped());
+  ASSERT_TRUE(this->tablet()->ShouldApplyWrite());
+
+  stop_token.reset();
+
+  // Delay tokens use total_delayed_ and are still detected by NeedsDelay().
+  auto delay_token = write_controller.GetDelayToken(1024);
+  ASSERT_FALSE(this->tablet()->ShouldApplyWrite());
+  delay_token.reset();
+}
+
+TYPED_TEST(TestTablet, ShouldApplyWriteRespectsStopAndDelaySimultaneously) {
+  auto* db = down_cast<rocksdb::DBImpl*>(this->tablet()->regular_db());
+  auto& write_controller = db->TEST_write_controler();
+
+  auto stop_token = write_controller.GetStopToken();
+  auto delay_token = write_controller.GetDelayToken(1024);
+  ASSERT_TRUE(write_controller.IsStopped());
+  ASSERT_TRUE(write_controller.NeedsDelay());
+  ASSERT_FALSE(this->tablet()->ShouldApplyWrite());
+
+  stop_token.reset();
+  ASSERT_FALSE(write_controller.IsStopped());
+  ASSERT_TRUE(write_controller.NeedsDelay());
+  ASSERT_FALSE(this->tablet()->ShouldApplyWrite());
+
+  delay_token.reset();
+  ASSERT_TRUE(this->tablet()->ShouldApplyWrite());
+}
+
+// Tablet::AreWritesStopped() is the lightweight check used by the early rejection
+// in RaftConsensus::Update() before acquiring update_mutex_. It only checks for hard
+// stops (WriteController::IsStopped()), not delays. See #30728.
+TYPED_TEST(TestTablet, AreWritesStoppedDetectsHardStop) {
+  auto* db = down_cast<rocksdb::DBImpl*>(this->tablet()->regular_db());
+  auto& write_controller = db->TEST_write_controler();
+
+  ASSERT_FALSE(this->tablet()->AreWritesStopped());
+
+  {
+    auto stop_token = write_controller.GetStopToken();
+    ASSERT_TRUE(this->tablet()->AreWritesStopped());
+
+    auto stop_token_2 = write_controller.GetStopToken();
+    ASSERT_TRUE(this->tablet()->AreWritesStopped());
+
+    stop_token.reset();
+    ASSERT_TRUE(this->tablet()->AreWritesStopped());
+  }
+  ASSERT_FALSE(this->tablet()->AreWritesStopped());
+}
+
+// AreWritesStopped() does not react to delay tokens -- only hard stops.
+// This is intentional: the early rejection in RaftConsensus::Update() should only
+// fire for hard stops where DelayWrite() would block indefinitely on bg_cv_.Wait().
+// Delay tokens cause a bounded sleep, not an indefinite block.
+TYPED_TEST(TestTablet, AreWritesStoppedIgnoresDelay) {
+  auto* db = down_cast<rocksdb::DBImpl*>(this->tablet()->regular_db());
+  auto& write_controller = db->TEST_write_controler();
+
+  auto delay_token = write_controller.GetDelayToken(1024);
+  ASSERT_TRUE(write_controller.NeedsDelay());
+  ASSERT_FALSE(this->tablet()->AreWritesStopped());
 }
 
 } // namespace tablet

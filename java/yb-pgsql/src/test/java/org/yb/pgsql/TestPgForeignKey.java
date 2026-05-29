@@ -1,4 +1,4 @@
-// Copyright (c) YugaByte, Inc.
+// Copyright (c) YugabyteDB, Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License"); you may not use this file except
 // in compliance with the License.  You may obtain a copy of the License at
@@ -19,33 +19,39 @@ import org.junit.*;
 import org.junit.runner.RunWith;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
-import org.yb.util.YBTestRunnerNonTsanOnly;
+import org.yb.YBTestRunner;
 
 import java.sql.Connection;
+import java.util.Collections;
+import java.util.Map;
 import java.sql.ResultSet;
 import java.sql.Statement;
 import java.util.HashSet;
 import java.util.Set;
 
-@RunWith(value=YBTestRunnerNonTsanOnly.class)
+@RunWith(value=YBTestRunner.class)
 public class TestPgForeignKey extends BasePgSQLTest {
   private static final Logger LOG = LoggerFactory.getLogger(TestPgForeignKey.class);
+  private boolean skipPrefixLocks = false;
 
   @Override
-  public int getTestMethodTimeoutSec() {
-    return 1800;
+  protected Map<String, String> getTServerFlags() {
+    Map<String, String> flagMap = super.getTServerFlags();
+    flagMap.put("skip_prefix_locks", String.valueOf(skipPrefixLocks));
+    if (skipPrefixLocks) {
+      flagMap.put("ysql_enable_packed_row", "true");
+    }
+    // This test depends on fail-on-conflict concurrency control to perform its validation.
+    // TODO(wait-queues): https://github.com/yugabyte/yugabyte-db/issues/17871
+    setFailOnConflictFlags(flagMap);
+    return flagMap;
   }
 
-  @After
-  public void cleanUpAfter() throws Exception {
-    // For this test tear down entire cluster between tests.
-    tearDownAfter();
-    pgInitialized = false;
-  }
-
-  @Test
-  public void testPgRegress() throws Exception {
-    runPgRegressTest("yb_foreign_key_serial_schedule");
+  private void restartWithSkipPrefixLocks() throws Exception {
+    skipPrefixLocks = true;
+    Map<String, String> flagMap = getTServerFlags();
+    flagMap.put("skip_prefix_locks", String.valueOf(skipPrefixLocks));
+    restartClusterWithFlags(Collections.emptyMap(), flagMap);
   }
 
   private void checkRows(Statement statement,
@@ -59,10 +65,14 @@ public class TestPgForeignKey extends BasePgSQLTest {
   @Test
   public void testForeignKeyConflictsWithSerializableIsolation() throws Exception {
     testForeignKeyConflicts(Connection.TRANSACTION_SERIALIZABLE);
+    restartWithSkipPrefixLocks();
+    testForeignKeyConflicts(Connection.TRANSACTION_SERIALIZABLE);
   }
 
   @Test
   public void testForeignKeyConflictsWithSnapshotIsolation() throws Exception {
+    testForeignKeyConflicts(Connection.TRANSACTION_REPEATABLE_READ);
+    restartWithSkipPrefixLocks();
     testForeignKeyConflicts(Connection.TRANSACTION_REPEATABLE_READ);
   }
 
@@ -164,6 +174,12 @@ public class TestPgForeignKey extends BasePgSQLTest {
   // Ensure that foreign key caching maintains data correctness and referential integrity.
   @Test
   public void testForeignKeyCaching() throws Exception {
+    testForeignKeyCachingHelper();
+    restartWithSkipPrefixLocks();
+    testForeignKeyCachingHelper();
+  }
+
+  private void testForeignKeyCachingHelper() throws Exception {
     Set<Row> expectedPkRows = new HashSet<>();
     Set<Row> expectedFkPrimaryRows = new HashSet<>();
     Set<Row> expectedFkUniqueRows = new HashSet<>();
@@ -256,8 +272,9 @@ public class TestPgForeignKey extends BasePgSQLTest {
       extraStmt.execute("BEGIN");
       extraStmt.execute("SELECT * FROM parent WHERE k = 1 FOR UPDATE");
 
-      runInvalidQuery(
-        stmt, "INSERT INTO child VALUES(1, 1)", "Conflicts with higher priority transaction");
+      runInvalidQuery(stmt, "INSERT INTO child VALUES(1, 1)", false,
+        "could not serialize access due to concurrent update",
+        "current transaction is expired or aborted");
       extraStmt.execute("ROLLBACK");
       assertNoRows(stmt, "SELECT * FROM child");
 
@@ -274,10 +291,14 @@ public class TestPgForeignKey extends BasePgSQLTest {
   @Test
   public void testRowLockSerializableIsolation() throws Exception {
     testRowLock(Connection.TRANSACTION_SERIALIZABLE);
+    restartWithSkipPrefixLocks();
+    testRowLock(Connection.TRANSACTION_SERIALIZABLE);
   }
 
   @Test
   public void testRowLockSnapshotIsolation() throws Exception {
+    testRowLock(Connection.TRANSACTION_REPEATABLE_READ);
+    restartWithSkipPrefixLocks();
     testRowLock(Connection.TRANSACTION_REPEATABLE_READ);
   }
 
@@ -285,6 +306,9 @@ public class TestPgForeignKey extends BasePgSQLTest {
     try (Statement stmt = connection.createStatement();
          Connection extraConnection = getConnectionBuilder().connect();
          Statement extraStmt = extraConnection.createStatement()) {
+      stmt.execute("SET yb_transaction_priority_lower_bound = 0.5");
+      extraStmt.execute("SET yb_transaction_priority_upper_bound = 0.4");
+
       stmt.execute("CREATE TABLE parent(k int PRIMARY KEY) SPLIT INTO 1 TABLETS");
       stmt.execute("CREATE TABLE child(pk int PRIMARY KEY," +
         "CONSTRAINT parent_fk FOREIGN KEY(pk) REFERENCES parent(k)) SPLIT INTO 1 TABLETS");
@@ -294,6 +318,16 @@ public class TestPgForeignKey extends BasePgSQLTest {
       stmt.execute("INSERT INTO parent VALUES(1)");
       stmt.execute("INSERT INTO child VALUES(1)");
       extraStmt.execute("BEGIN");
+
+      boolean conflict_expected = skipPrefixLocks &&
+                                  pgIsolationLevel == Connection.TRANSACTION_SERIALIZABLE;
+      if (conflict_expected) {
+        runInvalidQuery(extraStmt, "INSERT INTO parent VALUES(2)",
+                        "could not serialize access due to concurrent update");
+        extraStmt.execute("ROLLBACK");
+        return;
+      }
+
       extraStmt.execute("INSERT INTO parent VALUES(2)");
       extraStmt.execute("INSERT INTO child VALUES(2)");
       stmt.execute("COMMIT");
@@ -304,10 +338,59 @@ public class TestPgForeignKey extends BasePgSQLTest {
   @Test
   public void testInsertConcurrencySnapshotIsolation() throws Exception {
     testInsertConcurrency(Connection.TRANSACTION_REPEATABLE_READ);
+    restartWithSkipPrefixLocks();
+    testInsertConcurrency(Connection.TRANSACTION_REPEATABLE_READ);
   }
+
   @Test
   public void testInsertConcurrencySerializableIsolation() throws Exception {
     testInsertConcurrency(Connection.TRANSACTION_SERIALIZABLE);
+    restartWithSkipPrefixLocks();
+    testInsertConcurrency(Connection.TRANSACTION_SERIALIZABLE);
   }
 
+  @Test
+  public void testAddForeignKeyConcurrent() throws Exception {
+    testAddForeignKeyConcurrentHelper();
+    restartWithSkipPrefixLocks();
+    testAddForeignKeyConcurrentHelper();
+  }
+
+  private void testAddForeignKeyConcurrentHelper() throws Exception {
+    try (Statement stmt = connection.createStatement();
+         Connection ddlConnection = getConnectionBuilder().connect();
+         Statement ddlStmt = ddlConnection.createStatement()) {
+      // Create two tables
+      ddlStmt.execute("CREATE TABLE parent(k int PRIMARY KEY)");
+      ddlStmt.execute("CREATE TABLE child(k int)");
+
+      // Insert data into parent table
+      stmt.execute("INSERT INTO parent VALUES (1), (2), (3)");
+
+      // Start inserting data into child table
+      stmt.execute("INSERT INTO child VALUES (1)");
+      stmt.execute("INSERT INTO child VALUES (2)");
+
+      // On DDL connection, add foreign key constraint
+      ddlStmt.execute("ALTER TABLE child ADD CONSTRAINT fk_child_parent " +
+                      "FOREIGN KEY (k) REFERENCES parent(k)");
+
+      // Try inserting a valid row on DML connection
+      stmt.execute("INSERT INTO child VALUES (3)");
+
+      // Try inserting an invalid row on DML connection
+      runInvalidQuery(stmt,
+        "INSERT INTO child VALUES (4)",
+        "violates foreign key constraint \"fk_child_parent\"");
+
+      // Try inserting an invalid row on the DDL connection
+      runInvalidQuery(ddlStmt,
+        "INSERT INTO child VALUES (4)",
+        "violates foreign key constraint \"fk_child_parent\"");
+
+      // Verify the data
+      assertQuery(stmt, "SELECT k FROM child ORDER BY k",
+          new Row(1), new Row(2), new Row(3));
+    }
+  }
 }

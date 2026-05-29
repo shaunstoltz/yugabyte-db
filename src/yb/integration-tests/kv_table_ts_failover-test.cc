@@ -1,4 +1,4 @@
-// Copyright (c) YugaByte, Inc.
+// Copyright (c) YugabyteDB, Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License"); you may not use this file except
 // in compliance with the License.  You may obtain a copy of the License at
@@ -26,18 +26,11 @@
 #include "yb/util/test_util.h"
 #include "yb/util/flags.h"
 
-DEFINE_UNKNOWN_int32(test_num_iter,
+DEFINE_NON_RUNTIME_int32(test_num_iter,
              1,
              "Number of iterations for key-value table tablet server failover test");
 
 namespace yb {
-
-using std::unique_ptr;
-
-using client::YBClient;
-using client::YBClientBuilder;
-using client::YBTable;
-using std::shared_ptr;
 
 using integration_tests::YBTableTestBase;
 

@@ -1,4 +1,4 @@
-// Copyright (c) YugaByte, Inc.
+// Copyright (c) YugabyteDB, Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License"); you may not use this file except
 // in compliance with the License.  You may obtain a copy of the License at
@@ -19,8 +19,14 @@
 #include <boost/preprocessor/cat.hpp>
 #include <boost/preprocessor/stringize.hpp>
 
-#include "yb/client/async_initializer.h"
+#include "yb/cdc/cdc_service.h"
+#include "yb/cdc/cdc_service_context.h"
+
+#include "yb/client/client.h"
+#include "yb/client/transaction_pool.h"
+
 #include "yb/common/pg_types.h"
+#include "yb/common/wire_protocol.h"
 
 #include "yb/master/catalog_manager_if.h"
 #include "yb/master/master.h"
@@ -30,24 +36,83 @@
 #include "yb/tablet/tablet_peer.h"
 
 #include "yb/tserver/tserver.pb.h"
+#include "yb/tserver/pg_client.pb.h"
+#include "yb/tserver/pg_client_session.h"
 
 #include "yb/util/atomic.h"
 #include "yb/util/metric_entity.h"
 #include "yb/util/monotime.h"
 #include "yb/util/status_format.h"
 
-DECLARE_bool(create_initial_sys_catalog_snapshot);
+#include "yb/yql/pgwrapper/libpq_utils.h"
 
-namespace yb {
-namespace master {
+DEFINE_NON_RUNTIME_int32(master_xrepl_get_changes_concurrency, 3,
+  "This determines the max number of concurrent GetChanges RPCs that can be "
+  "processed on master.");
+TAG_FLAG(master_xrepl_get_changes_concurrency, advanced);
+
+DEFINE_RUNTIME_int32(update_min_cdc_indices_master_interval_secs, 300 /* 5 minutes */,
+  "How often to read cdc_state table on master and move the retention barriers for the sys "
+  "catalog tablet.");
+
+DEFINE_RUNTIME_bool(enable_update_local_peer_min_index_master, false,
+    "When false, the master leader updates retention barriers on all master peers (including "
+    "followers) for the sys catalog tablet, instead of each peer updating its own.");
+
+DECLARE_bool(create_initial_sys_catalog_snapshot);
+DECLARE_bool(ysql_yb_enable_implicit_dynamic_tables_logical_replication);
+
+namespace yb::master {
 
 using consensus::StartRemoteBootstrapRequestPB;
+
+class MasterCDCServiceContextImpl : public cdc::CDCServiceContext {
+ public:
+  explicit MasterCDCServiceContextImpl(MasterTabletServer* master_tablet_server)
+      : master_tablet_server_(*master_tablet_server) {}
+
+  tablet::TabletPeerPtr LookupTablet(const TabletId& tablet_id) const override {
+    auto serving_tablet_res = master_tablet_server_.GetServingTablet(tablet_id);
+    return serving_tablet_res.ok() ? *serving_tablet_res : nullptr;
+  }
+
+  Result<tablet::TabletPeerPtr> GetTablet(const TabletId& tablet_id) const override {
+    SCHECK_EQ(
+        tablet_id, kSysCatalogTabletId, NotFound, Format("Tablet ID $0 not found.", tablet_id));
+    return master_tablet_server_.GetServingTablet(tablet_id);
+  }
+
+  Result<tablet::TabletPeerPtr> GetServingTablet(const TabletId& tablet_id) const override {
+    SCHECK_EQ(
+        tablet_id, kSysCatalogTabletId, NotFound, Format("Tablet ID $0 not found.", tablet_id));
+    return master_tablet_server_.GetServingTablet(tablet_id);
+  }
+
+  const std::string& permanent_uuid() const override {
+    return master_tablet_server_.permanent_uuid();
+  }
+
+  Result<uint32> GetAutoFlagsConfigVersion() const override {
+    return STATUS(InternalError, "Unexpected call to GetAutoFlagsConfigVersion in master_tserver.");
+  }
+
+  Result<HostPort> GetDesiredHostPortForLocal() const override {
+    return STATUS(NotSupported, "GetDesiredHostPortForLocal not supported on master");
+  }
+
+  bool ShouldLocalPeerUpdateOwnBarriers() const override {
+    return FLAGS_enable_update_local_peer_min_index_master;
+  }
+
+ private:
+  MasterTabletServer& master_tablet_server_;
+};
 
 MasterTabletServer::MasterTabletServer(Master* master, scoped_refptr<MetricEntity> metric_entity)
     : master_(master), metric_entity_(metric_entity) {
 }
 
-tserver::TSTabletManager* MasterTabletServer::tablet_manager() {
+tserver::TSTabletManager* MasterTabletServer::tablet_manager() const {
   return nullptr;
 }
 
@@ -63,16 +128,17 @@ const scoped_refptr<MetricEntity>& MasterTabletServer::MetricEnt() const {
   return metric_entity_;
 }
 
+tserver::TSLocalLockManagerPtr MasterTabletServer::ts_local_lock_manager() const {
+  return nullptr;
+}
+
 Result<tablet::TabletPeerPtr> MasterTabletServer::GetServingTablet(
     const TabletId& tablet_id) const {
-  return GetServingTablet(Slice(tablet_id));
+  return master_->catalog_manager()->GetServingTablet(tablet_id);
 }
 
 Result<tablet::TabletPeerPtr> MasterTabletServer::GetServingTablet(const Slice& tablet_id) const {
-  if (tablet_id == kSysCatalogTabletId) {
-    return master_->catalog_manager()->tablet_peer();
-  }
-  return STATUS_FORMAT(NotFound, "Tablet $0 not found", tablet_id);
+  return master_->catalog_manager()->GetServingTablet(tablet_id);
 }
 
 Status MasterTabletServer::GetTabletStatus(const tserver::GetTabletStatusRequestPB* req,
@@ -105,14 +171,14 @@ Status MasterTabletServer::StartRemoteBootstrap(const StartRemoteBootstrapReques
   return STATUS(NotSupported, "Remote bootstrap not supported by master tserver");
 }
 
-void MasterTabletServer::get_ysql_catalog_version(uint64_t* current_version,
-                                                  uint64_t* last_breaking_version) const {
-  get_ysql_db_catalog_version(kPgInvalidOid, current_version, last_breaking_version);
+void MasterTabletServer::get_ysql_catalog_version(
+    uint64_t* current_version, uint64_t* last_breaking_version, bool use_cache) const {
+  get_ysql_db_catalog_version(kPgInvalidOid, current_version, last_breaking_version, use_cache);
 }
 
-void MasterTabletServer::get_ysql_db_catalog_version(uint32_t db_oid,
-                                                     uint64_t* current_version,
-                                                     uint64_t* last_breaking_version) const {
+void MasterTabletServer::get_ysql_db_catalog_version(
+    uint32_t db_oid, uint64_t* current_version, uint64_t* last_breaking_version,
+    bool use_cache) const {
   auto fill_vers = [current_version, last_breaking_version](){
     /*
      * This should never happen, but if it does then we cannot guarantee that user requests
@@ -137,36 +203,65 @@ void MasterTabletServer::get_ysql_db_catalog_version(uint32_t db_oid,
     }
   }
 
-  Status s = db_oid == kPgInvalidOid ?
-    master_->catalog_manager()->GetYsqlCatalogVersion(current_version, last_breaking_version) :
-    master_->catalog_manager()->GetYsqlDBCatalogVersion(
-        db_oid, current_version, last_breaking_version);
+  Status s = db_oid == kPgInvalidOid
+                 ? master_->catalog_manager()->GetYsqlCatalogVersion(
+                       current_version, last_breaking_version, use_cache)
+                 : master_->catalog_manager()->GetYsqlDBCatalogVersion(
+                       db_oid, current_version, last_breaking_version, use_cache);
   if (!s.ok()) {
-    LOG(ERROR) << "Could not get YSQL catalog version for master's tserver API: "
-               << s.ToUserMessage();
+    LOG(WARNING) << "Could not get YSQL catalog version for master's tserver API: " << s;
     fill_vers();
   }
 }
 
-tserver::TServerSharedData& MasterTabletServer::SharedObject() {
+ConcurrentPointerReference<tserver::TServerSharedData> MasterTabletServer::SharedObject() {
   return master_->shared_object();
 }
 
 Status MasterTabletServer::get_ysql_db_oid_to_cat_version_info_map(
-    bool size_only, tserver::GetTserverCatalogVersionInfoResponsePB *resp) const {
-  if (FLAGS_create_initial_sys_catalog_snapshot) {
-    return master_->get_ysql_db_oid_to_cat_version_info_map(size_only, resp);
-  }
-  return STATUS_FORMAT(NotSupported, "Unexpected call of $0", __FUNCTION__);
+    const tserver::GetTserverCatalogVersionInfoRequestPB& req,
+    tserver::GetTserverCatalogVersionInfoResponsePB* resp) const {
+  return master_->get_ysql_db_oid_to_cat_version_info_map(req, resp);
+}
+
+Status MasterTabletServer::GetTserverCatalogMessageLists(
+    const tserver::GetTserverCatalogMessageListsRequestPB& req,
+    tserver::GetTserverCatalogMessageListsResponsePB *resp) const {
+  return master_->GetTserverCatalogMessageLists(req, resp);
+}
+
+Status MasterTabletServer::SetTserverCatalogMessageList(
+    uint32_t db_oid, bool is_breaking_change, uint64_t new_catalog_version,
+    const std::optional<std::string>& message_list) {
+  return master_->SetTserverCatalogMessageList(db_oid, is_breaking_change,
+                                               new_catalog_version, message_list);
+}
+
+void MasterTabletServer::TriggerRelcacheInitConnection(
+    const tserver::TriggerRelcacheInitConnectionRequestPB& req,
+    StdStatusCallback callback) {
+  master_->TriggerRelcacheInitConnection(req, std::move(callback));
 }
 
 const std::shared_future<client::YBClient*>& MasterTabletServer::client_future() const {
-  return master_->async_client_initializer().get_client_future();
+  return master_->client_future();
 }
 
 Status MasterTabletServer::GetLiveTServers(
     std::vector<master::TSInformationPB> *live_tservers) const {
   return Status::OK();
+}
+
+Result<std::vector<client::internal::RemoteTabletServerPtr>>
+    MasterTabletServer::GetRemoteTabletServers() const {
+  return STATUS_FORMAT(NotSupported,
+                       Format("GetRemoteTabletServers not implemented for master_tserver"));
+}
+
+Result<std::vector<client::internal::RemoteTabletServerPtr>>
+    MasterTabletServer::GetRemoteTabletServers(const std::unordered_set<std::string>&) const {
+  return STATUS_FORMAT(NotSupported,
+                       Format("GetRemoteTabletServers not implemented for master_tserver"));
 }
 
 const std::shared_ptr<MemTracker>& MasterTabletServer::mem_tracker() const {
@@ -182,5 +277,110 @@ client::TransactionPool& MasterTabletServer::TransactionPool() {
   return *temp;
 }
 
-} // namespace master
-} // namespace yb
+rpc::Messenger* MasterTabletServer::GetMessenger(ash::Component component) const {
+  return nullptr;
+}
+
+void MasterTabletServer::ClearAllMetaCachesOnServer() {
+  client()->ClearAllMetaCachesOnServer();
+}
+
+Status MasterTabletServer::ClearMetacache(const std::string& namespace_id) {
+  return client()->ClearMetacache(namespace_id);
+}
+
+Status MasterTabletServer::YCQLStatementStats(const tserver::PgYCQLStatementStatsRequestPB& req,
+    tserver::PgYCQLStatementStatsResponsePB* resp) const {
+  LOG(DFATAL) << "Unexpected call of YCQLStatementStats()";
+  return STATUS_FORMAT(NotSupported, "YCQLStatementStats not implemented for master_tserver");
+}
+
+Status MasterTabletServer::ClearYCQLMetaDataCache() {
+  LOG(DFATAL) << "Unexpected call of ClearYCQLMetaDataCache()";
+  return STATUS_FORMAT(NotSupported, "ClearYCQLMetaDataCache not implemented for master_tserver");
+}
+
+Result<std::vector<tablet::TabletStatusPB>> MasterTabletServer::GetLocalTabletsMetadata() const {
+  LOG(DFATAL) << "Unexpected call of GetLocalTabletsMetadata()";
+  return STATUS_FORMAT(InternalError, "Unexpected call of GetLocalTabletsMetadata()");
+}
+
+Result<std::vector<TserverMetricsInfoPB>> MasterTabletServer::GetMetrics() const {
+  LOG(DFATAL) << "Unexpected call of GetMetrics()";
+  return STATUS_FORMAT(InternalError, "Unexpected call of GetMetrics()");
+}
+
+Result<pgwrapper::PGConn> MasterTabletServer::CreateInternalPGConn(
+    const std::string& database_name, bool simple_query_protocol,
+    const std::optional<CoarseTimePoint>& deadline) {
+  LOG(DFATAL) << "Unexpected call of CreateInternalPGConn()";
+  return STATUS_FORMAT(InternalError, "Unexpected call of CreateInternalPGConn()");
+}
+
+Result<tserver::PgTxnSnapshot> MasterTabletServer::GetLocalPgTxnSnapshot(
+  const tserver::PgTxnSnapshotLocalId& snapshot_id) {
+  LOG(WARNING) << "Unexpected call of " << __PRETTY_FUNCTION__;
+  return STATUS_FORMAT(InternalError, "Unexpected call of $0", __PRETTY_FUNCTION__);
+}
+
+bool MasterTabletServer::SkipCatalogVersionChecks() {
+  return master_->catalog_manager()->SkipCatalogVersionChecks();
+}
+
+Result<tserver::YSQLLeaseInfo> MasterTabletServer::GetYSQLLeaseInfo() const {
+  return STATUS(InternalError, "Unexpected call of GetYSQLLeaseInfo");
+}
+
+const std::string& MasterTabletServer::permanent_uuid() const {
+  return master_->permanent_uuid();
+}
+
+Result<std::string> MasterTabletServer::GetUniverseUuid() const {
+  LOG(DFATAL) << "Unexpected call of GetUniverseUuid()";
+  return STATUS_FORMAT(InternalError, "Unexpected call of GetUniverseUuid()");
+}
+
+rpc::ServiceIfPtr MasterTabletServer::CreateCDCService(
+    const scoped_refptr<MetricEntity>& metric_entity,
+    const std::shared_future<client::YBClient*>& client_future, MetricRegistry* metric_registry) {
+  cdc_service_ = std::make_shared<cdc::CDCServiceImpl>(
+      std::make_unique<MasterCDCServiceContextImpl>(this), metric_entity, metric_registry,
+      FLAGS_master_xrepl_get_changes_concurrency, client_future,
+      []() { return FLAGS_update_min_cdc_indices_master_interval_secs; }, true /* is_master */);
+
+  return std::static_pointer_cast<rpc::ServiceIf>(cdc_service_);
+}
+
+void MasterTabletServer::EnableCDCService() {
+  if (!FLAGS_ysql_yb_enable_implicit_dynamic_tables_logical_replication) {
+    return;
+  }
+
+  CHECK_NOTNULL(cdc_service_);
+  cdc_service_->SetCDCServiceEnabled();
+  LOG(INFO) << "CDC service enabled on master";
+}
+
+tserver::ConnectivityStateResponsePB MasterTabletServer::ConnectivityState() {
+  return tserver::ConnectivityStateResponsePB{};
+}
+
+ReplicationInfoPB MasterTabletServer::GetClusterReplicationInfo() const {
+  auto config = master_->catalog_manager()->GetClusterConfig();
+  if (!config.ok()) {
+    LOG(WARNING) << "Failed to get cluster config for replication info: " << config.status();
+    return {};
+  }
+  return config->replication_info();
+}
+
+int32_t MasterTabletServer::cluster_config_version() const {
+  auto config = master_->catalog_manager()->GetClusterConfig();
+  if (!config.ok()) {
+    LOG(WARNING) << "Failed to get cluster config version: " << config.status();
+    return -1;
+  }
+  return config->version();
+}
+
+} // namespace yb::master

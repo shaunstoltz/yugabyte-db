@@ -4,9 +4,12 @@ headerTitle: DROP ROLE
 linkTitle: DROP ROLE
 description: Use the DROP ROLE statement to delete an existing role.
 menu:
-  stable:
+  stable_api:
     parent: api-cassandra
     weight: 1265
+aliases:
+  - /stable/api/cassandra/ddl_drop_role
+  - /stable/api/ycql/ddl_drop_role
 type: docs
 ---
 
@@ -41,8 +44,6 @@ Where
 - Only a client with the permission `DROP` on `ALL ROLES` or on the specified `role_name`, or with the `SUPERUSER` status can delete another role.
 
 ## Examples
-
-You can do this as shown below.
 
 ```sql
 ycqlsh:example> DROP ROLE role1;

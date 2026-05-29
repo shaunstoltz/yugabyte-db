@@ -15,9 +15,9 @@
 // specific language governing permissions and limitations
 // under the License.
 //
-// The following only applies to changes made to this file as part of YugaByte development.
+// The following only applies to changes made to this file as part of YugabyteDB development.
 //
-// Portions Copyright (c) YugaByte, Inc.
+// Portions Copyright (c) YugabyteDB, Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License"); you may not use this file except
 // in compliance with the License.  You may obtain a copy of the License at
@@ -44,6 +44,7 @@
 
 #include <memory>
 #include <string>
+#include <unordered_set>
 #include <vector>
 
 #include "yb/server/webserver_options.h"
@@ -78,6 +79,8 @@ class Webserver : public WebCallbackRegistry {
   // Return the single HostPort that this server was asked to bind on
   Status GetInputHostPort(HostPort* hp) const;
 
+  void SetLogging(bool enable_access_logging, bool enable_tcmalloc_logging);
+
   void RegisterPathHandler(const std::string& path,
                            const std::string& alias,
                            const PathHandlerCallback& callback,
@@ -90,6 +93,16 @@ class Webserver : public WebCallbackRegistry {
 
   // True if serving all traffic over SSL, false otherwise
   bool IsSecure() const;
+
+  void SetAutoFlags(std::unordered_set<std::string>&& flags);
+
+  bool ContainsAutoFlag(const std::string& flag) const;
+
+  void SetFlags(std::unordered_set<std::string>&& flags);
+
+  bool ContainsFlag(const std::string& flag) const;
+
+  const std::string& DocRoot() const;
 
  private:
   class Impl;

@@ -1,4 +1,4 @@
-// Copyright (c) YugaByte, Inc.
+// Copyright (c) YugabyteDB, Inc.
 
 package model
 
@@ -8,23 +8,179 @@ import (
 )
 
 type BasicInfo struct {
-	Uuid   string `json:"uuid"`
-	Code   string `json:"code"`
-	Name   string `json:"name"`
-	Active bool   `json:"active"`
+	Uuid    string `json:"uuid,omitempty"`
+	Code    string `json:"code,omitempty"`
+	Name    string `json:"name,omitempty"`
+	Active  bool   `json:"active,omitempty"`
+	Version int64  `json:"version,omitempty"`
 }
 
+// Provider is the provider object.
 type Provider struct {
+	Extra
 	BasicInfo
-	Cuuid               string            `json:"customerUUID"`
-	AirGapInstall       bool              `json:"airGapInstall"`
-	SshPort             int               `json:"sshPort"`
-	OverrideKeyValidate bool              `json:"overrideKeyValidate"`
-	SetUpChrony         bool              `json:"setUpChrony"`
-	NtpServers          []string          `json:"ntpServers"`
-	ShowSetUpChrony     bool              `json:"showSetUpChrony"`
-	Config              map[string]string `json:"config"`
-	Regions             []Region          `json:"regions"`
+	Cuuid               string            `json:"customerUUID,omitempty"`
+	AirGapInstall       bool              `json:"airGapInstall,omitempty"`
+	SshPort             int               `json:"sshPort,omitempty"`
+	OverrideKeyValidate bool              `json:"overrideKeyValidate,omitempty"`
+	SetUpChrony         bool              `json:"setUpChrony,omitempty"`
+	NtpServers          []string          `json:"ntpServers,omitempty"`
+	ShowSetUpChrony     bool              `json:"showSetUpChrony,omitempty"`
+	Config              map[string]string `json:"config,omitempty"`
+	Regions             []Region          `json:"regions,omitempty"`
+	Details             ProviderDetails   `json:"details,omitempty"`
+	AllAccessKeys       []AccessKey       `json:"allAccessKeys,omitempty"`
+}
+
+func (p Provider) MarshalJSON() ([]byte, error) {
+	type Alias Provider
+	alias := Alias(p)
+	return marshalUnknownExtraFields(&alias)
+}
+
+func (p *Provider) UnmarshalJSON(data []byte) error {
+	type Alias Provider
+	alias := &Alias{}
+	if err := unmarshalUnknownExtraFields(data, alias); err != nil {
+		return err
+	}
+	*p = Provider(*alias)
+	return nil
+}
+
+// ProviderDetails contains the details object within a provider.
+// Only the required fields are added here.
+type ProviderDetails struct {
+	Extra
+	CloudInfo           CloudInfo `json:"cloudInfo"`
+	AirGapInstall       bool      `json:"airGapInstall,omitempty"`
+	InstallNodeExporter bool      `json:"installNodeExporter,omitempty"`
+	NodeExporterPort    int       `json:"nodeExporterPort,omitempty"`
+	NodeExporterUser    string    `json:"nodeExporterUser,omitempty"`
+	NtpServers          []string  `json:"ntpServers,omitempty"`
+	SkipProvisioning    bool      `json:"skipProvisioning,omitempty"`
+	EnableNodeAgent     bool      `json:"enableNodeAgent,omitempty"`
+}
+
+// Register custom marshaller.
+func (p ProviderDetails) MarshalJSON() ([]byte, error) {
+	type Alias ProviderDetails
+	alias := Alias(p)
+	return marshalUnknownExtraFields(&alias)
+}
+
+// Register custom unmarshaller.
+func (p *ProviderDetails) UnmarshalJSON(data []byte) error {
+	type Alias ProviderDetails
+	alias := &Alias{}
+	if err := unmarshalUnknownExtraFields(data, alias); err != nil {
+		return err
+	}
+	*p = ProviderDetails(*alias)
+	return nil
+}
+
+type CloudInfo struct {
+	Extra
+	Onprem OnPremCloudInfo `json:"onprem,omitempty"`
+}
+
+// Register custom marshaller.
+func (p CloudInfo) MarshalJSON() ([]byte, error) {
+	// Create an alias to avoid infinite recursion.
+	type Alias CloudInfo
+	alias := Alias(p)
+	return marshalUnknownExtraFields(&alias)
+}
+
+// Register custom unmarshaller.
+func (p *CloudInfo) UnmarshalJSON(data []byte) error {
+	// Create an alias to avoid infinite recursion.
+	type Alias CloudInfo
+	alias := &Alias{}
+	if err := unmarshalUnknownExtraFields(data, alias); err != nil {
+		return err
+	}
+	*p = CloudInfo(*alias)
+	return nil
+}
+
+type OnPremCloudInfo struct {
+	Extra
+	YbHomeDir          string `json:"ybHomeDir,omitempty"`
+	UseClockbound      bool   `json:"useClockbound,omitempty"`
+	EnableMultiTenancy bool   `json:"enableMultiTenancy,omitempty"`
+}
+
+// Register custom marshaller.
+func (p OnPremCloudInfo) MarshalJSON() ([]byte, error) {
+	type Alias OnPremCloudInfo
+	alias := Alias(p)
+	return marshalUnknownExtraFields(&alias)
+}
+
+// Register custom unmarshaller.
+func (p *OnPremCloudInfo) UnmarshalJSON(data []byte) error {
+	// Create an alias to avoid infinite recursion.
+	type Alias OnPremCloudInfo
+	alias := &Alias{}
+	if err := unmarshalUnknownExtraFields(data, alias); err != nil {
+		return err
+	}
+	*p = OnPremCloudInfo(*alias)
+	return nil
+}
+
+type AccessKey struct {
+	Extra
+	KeyInfo KeyInfo `json:"keyInfo"`
+}
+
+// Register custom marshaller.
+func (p AccessKey) MarshalJSON() ([]byte, error) {
+	// Create an alias to avoid infinite recursion.
+	type Alias AccessKey
+	alias := Alias(p)
+	return marshalUnknownExtraFields(&alias)
+}
+
+// Register custom unmarshaller.
+func (p *AccessKey) UnmarshalJSON(data []byte) error {
+	// Create an alias to avoid infinite recursion.
+	type Alias AccessKey
+	alias := &Alias{}
+	if err := unmarshalUnknownExtraFields(data, alias); err != nil {
+		return err
+	}
+	*p = AccessKey(*alias)
+	return nil
+}
+
+type KeyInfo struct {
+	Extra
+	KeyPairName              string `json:"keyPairName,omitempty"`
+	SshPrivateKeyContent     string `json:"sshPrivateKeyContent,omitempty"`
+	SkipKeyValidateAndUpload bool   `json:"skipKeyValidateAndUpload,omitempty"`
+}
+
+// Register custom mashaller.
+func (p KeyInfo) MarshalJSON() ([]byte, error) {
+	// Create an alias to avoid infinite recursion.
+	type Alias KeyInfo
+	alias := Alias(p)
+	return marshalUnknownExtraFields(&alias)
+}
+
+// Register custom unmarshaller.
+func (p *KeyInfo) UnmarshalJSON(data []byte) error {
+	// Create an alias to avoid infinite recursion.
+	type Alias KeyInfo
+	alias := &Alias{}
+	if err := unmarshalUnknownExtraFields(data, alias); err != nil {
+		return err
+	}
+	*p = KeyInfo(*alias)
+	return nil
 }
 
 // yyyy-MM-dd HH:mm:ss
@@ -39,124 +195,166 @@ func (date *Date) UnmarshalJSON(b []byte) error {
 	return nil
 }
 
-type AccessKeyInfo struct {
-	SshUser                string   `json:"sshUser"`
-	SshPort                int      `json:"sshPort"`
-	AirGapInstall          bool     `json:"airGapInstall"`
-	PasswordlessSudoAccess bool     `json:"passwordlessSudoAccess"`
-	InstallNodeExporter    bool     `json:"installNodeExporter"`
-	NodeExporterPort       int      `json:"nodeExporterPort"`
-	NodeExporterUser       string   `json:"nodeExporterUser"`
-	SetUpChrony            bool     `json:"setUpChrony"`
-	NtpServers             []string `json:"ntpServers"`
-	CreatetionDate         Date     `json:"creationDate"`
-	SkipProvisioning       bool     `json:"skipProvisioning"`
-}
-
-type AccessKey struct {
-	KeyInfo AccessKeyInfo `json:"keyInfo"`
-}
-
-type AccessKeys []AccessKey
-
-// Implement sort.Interface.
-func (keys AccessKeys) Len() int {
-	return len(keys)
-}
-
-// Implement sort.Interface in descending order of
-// creation time.
-func (keys AccessKeys) Less(i, j int) bool {
-	keyInfo1 := keys[i].KeyInfo
-	keyInfo2 := keys[j].KeyInfo
-	cTime1 := time.Time(keyInfo1.CreatetionDate)
-	cTime2 := time.Time(keyInfo2.CreatetionDate)
-	return cTime1.Before(cTime2)
-}
-
-// Implement sort.Interface.
-func (keys AccessKeys) Swap(i, j int) {
-	keys[i], keys[j] = keys[j], keys[i]
-}
-
 type Region struct {
 	BasicInfo
-	Longitude float64           `json:"longitude"`
-	Latitude  float64           `json:"latitude"`
-	Config    map[string]string `json:"config"`
-	Zones     []Zone            `json:"zones"`
+	Longitude float64           `json:"longitude,omitempty"`
+	Latitude  float64           `json:"latitude,omitempty"`
+	Config    map[string]string `json:"config,omitempty"`
+	Zones     []Zone            `json:"zones,omitempty"`
 }
 
 type Zone struct {
 	BasicInfo
 }
 
+type InstanceTypeKey struct {
+	InstanceTypeCode string `json:"instanceTypeCode,omitempty"`
+}
 type NodeInstanceType struct {
-	Active           bool                    `json:"active"`
-	NumCores         float64                 `json:"numCores"`
-	MemSizeGB        float64                 `json:"memSizeGB"`
-	Details          NodeInstanceTypeDetails `json:"instanceTypeDetails"`
-	InstanceTypeCode string                  `json:"instanceTypeCode"`
-	ProviderUuid     string                  `json:"providerUuid"`
+	IDKey            InstanceTypeKey         `json:"idKey,omitempty"`
+	Active           bool                    `json:"active,omitempty"`
+	NumCores         float64                 `json:"numCores,omitempty"`
+	MemSizeGB        float64                 `json:"memSizeGB,omitempty"`
+	InstanceTypeCode string                  `json:"instanceTypeCode,omitempty"`
+	ProviderUuid     string                  `json:"providerUuid,omitempty"`
+	Details          NodeInstanceTypeDetails `json:"instanceTypeDetails,omitempty"`
 }
 
 type NodeInstanceTypeDetails struct {
-	VolumeDetailsList []VolumeDetails `json:"volumeDetailsList"`
+	VolumeDetailsList []VolumeDetails `json:"volumeDetailsList,omitempty"`
 }
 
 type VolumeDetails struct {
-	VolumeSize float64 `json:"volumeSizeGB"` //in GB
-	MountPath  string  `json:"mountPath"`
+	VolumeType string  `json:"volumeType,omitempty"`
+	VolumeSize float64 `json:"volumeSizeGB,omitempty"` //in GB
+	MountPath  string  `json:"mountPath,omitempty"`
 }
 
 type PreflightCheckVal struct {
-	Value string `json:"value"`
+	Value string `json:"value,omitempty"`
 }
 
 type NodeInstances struct {
 	Nodes []NodeDetails `json:"nodes"`
 }
 
+type NodeInstance struct {
+	NodeUuid             string      `json:"nodeUuid,omitempty"`
+	NodeInstanceTypeCode string      `json:"instanceTypeCode,omitempty"`
+	NodeName             string      `json:"nodeName,omitempty"`
+	InstanceName         string      `json:"instanceName,omitempty"`
+	ZoneUuid             string      `json:"zoneUuid,omitempty"`
+	State                string      `json:"state,omitempty"`
+	Details              NodeDetails `json:"details,omitempty"`
+}
+
 type NodeInstanceResponse struct {
-	NodeUuid string `json:"nodeUuid"`
+	NodeUuid string `json:"nodeUuid,omitempty"`
 }
 
 type NodeDetails struct {
-	IP           string       `json:"ip"`
-	Region       string       `json:"region"`
-	Zone         string       `json:"zone"`
-	InstanceType string       `json:"instanceType"`
-	InstanceName string       `json:"instanceName"`
-	NodeName     string       `json:"nodeName"`
-	SshUser      string       `json:"sshUser"`
-	NodeConfigs  []NodeConfig `json:"nodeConfigs"`
+	IP           string       `json:"ip,omitempty"`
+	Region       string       `json:"region,omitempty"`
+	Zone         string       `json:"zone,omitempty"`
+	InstanceType string       `json:"instanceType,omitempty"`
+	InstanceName string       `json:"instanceName,omitempty"`
+	NodeName     string       `json:"nodeName,omitempty"`
+	SshUser      string       `json:"sshUser,omitempty"`
+	NodeConfigs  []NodeConfig `json:"nodeConfigs,omitempty"`
+}
+
+// PreflightCheckParam is the param for PreflightCheckHandler.
+type PreflightCheckParam struct {
+	SkipProvisioning     bool     `json:"skipProvisioning,omitempty"`
+	AirGapInstall        bool     `json:"airGapInstall,omitempty"`
+	InstallNodeExporter  bool     `json:"installNodeExporter,omitempty"`
+	YbHomeDir            string   `json:"ybHomeDir,omitempty"`
+	SshPort              int      `json:"sshPort,omitempty"`
+	MountPaths           []string `json:"mountPaths,omitempty"`
+	MasterHttpPort       int      `json:"masterHttpPort,omitempty"`
+	MasterRpcPort        int      `json:"masterRpcPort,omitempty"`
+	TserverHttpPort      int      `json:"tserverHttpPort,omitempty"`
+	TserverRpcPort       int      `json:"tserverRpcPort,omitempty"`
+	RedisServerHttpPort  int      `json:"redisServerHttpPort,omitempty"`
+	RedisServerRpcPort   int      `json:"redisServerRpcPort,omitempty"`
+	NodeExporterPort     int      `json:"nodeExporterPort,omitempty"`
+	YcqlServerHttpPort   int      `json:"ycqlServerHttpPort,omitempty"`
+	YcqlServerRpcPort    int      `json:"ycqlServerRpcPort,omitempty"`
+	YsqlServerHttpPort   int      `json:"ysqlServerHttpPort,omitempty"`
+	YsqlServerRpcPort    int      `json:"ysqlServerRpcPort,omitempty"`
+	YbControllerHttpPort int      `json:"ybControllerHttpPort,omitempty"`
+	YbControllerRpcPort  int      `json:"ybControllerRpcPort,omitempty"`
 }
 
 type NodeConfig struct {
-	Type  string `json:"type"`
-	Value string `json:"value"`
+	Type  string `json:"type,omitempty"`
+	Value string `json:"value,omitempty"`
 }
 
 type NodeInstanceValidationResponse struct {
-	Type        string `json:"string"`
-	Valid       bool   `json:"valid"`
-	Required    bool   `json:"required"`
-	Description string `json:"description"`
-	Value       string `json:"value"`
+	Type        string `json:"type,omitempty"`
+	Valid       bool   `json:"valid,omitempty"`
+	Required    bool   `json:"required,omitempty"`
+	Description string `json:"description,omitempty"`
+	Value       string `json:"value,omitempty"`
 }
 
-func (p Provider) ToString() string {
-	return fmt.Sprintf("Provider ID: %s, Provider Name: %s", p.Uuid, p.Name)
+// Id implements the method in DisplayInterface.
+func (p Provider) Id() string {
+	return p.Uuid
 }
 
-func (i NodeInstanceType) ToString() string {
+// String implements the method in DisplayInterface.
+func (p Provider) String() string {
+	return fmt.Sprintf("Provider ID: %s, Provider Name: %s", p.Uuid, p.Name())
+}
+
+// Name implements the method in DisplayInterface.
+func (p Provider) Name() string {
+	return p.BasicInfo.Name
+}
+
+// Id implements the method in DisplayInterface.
+func (i NodeInstanceType) Id() string {
+	return i.InstanceTypeCode
+}
+
+// String implements the method in DisplayInterface.
+func (i NodeInstanceType) String() string {
 	return fmt.Sprintf("Instance Code: %s", i.InstanceTypeCode)
 }
 
-func (r Region) ToString() string {
+// Name implements the method in DisplayInterface.
+func (i NodeInstanceType) Name() string {
+	return i.InstanceTypeCode
+}
+
+// Id implements the method in DisplayInterface.
+func (r Region) Id() string {
+	return r.Code
+}
+
+// String implements the method in DisplayInterface.
+func (r Region) String() string {
 	return fmt.Sprintf("Region ID: %s, Region Code: %s", r.Uuid, r.Code)
 }
 
-func (z Zone) ToString() string {
-	return fmt.Sprintf("Zone ID: %s, Zone Name: %s", z.Uuid, z.Name)
+// Name implements the method in DisplayInterface.
+func (r Region) Name() string {
+	return r.BasicInfo.Name
+}
+
+// Id implements the method in DisplayInterface.
+func (z Zone) Id() string {
+	return z.Code
+}
+
+// String implements the method in DisplayInterface.
+func (z Zone) String() string {
+	return fmt.Sprintf("Zone ID: %s, Zone Code: %s", z.Uuid, z.Code)
+}
+
+// Name implements the method in DisplayInterface.
+func (z Zone) Name() string {
+	return z.BasicInfo.Name
 }

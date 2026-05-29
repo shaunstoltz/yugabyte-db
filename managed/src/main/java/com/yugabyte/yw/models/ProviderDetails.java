@@ -1,5 +1,5 @@
 /*
- * Copyright 2022 YugaByte, Inc. and Contributors
+ * Copyright 2022 YugabyteDB, Inc. and Contributors
  *
  * Licensed under the Polyform Free Trial License 1.0.0 (the "License"); you
  * may not use this file except in compliance with the License. You
@@ -10,19 +10,21 @@
 
 package com.yugabyte.yw.models;
 
+import com.fasterxml.jackson.annotation.JsonIgnore;
 import com.fasterxml.jackson.annotation.JsonInclude;
-
-import io.swagger.annotations.ApiModelProperty;
-import lombok.Data;
-import lombok.EqualsAndHashCode;
-import lombok.ToString;
-
 import com.yugabyte.yw.models.AccessKey.MigratedKeyInfoFields;
 import com.yugabyte.yw.models.helpers.provider.AWSCloudInfo;
 import com.yugabyte.yw.models.helpers.provider.AzureCloudInfo;
 import com.yugabyte.yw.models.helpers.provider.GCPCloudInfo;
 import com.yugabyte.yw.models.helpers.provider.KubernetesInfo;
+import com.yugabyte.yw.models.helpers.provider.LocalCloudInfo;
 import com.yugabyte.yw.models.helpers.provider.OnPremCloudInfo;
+import io.swagger.annotations.ApiModelProperty;
+import io.swagger.annotations.ApiModelProperty.AccessMode;
+import java.util.Objects;
+import lombok.Data;
+import lombok.EqualsAndHashCode;
+import lombok.ToString;
 
 @JsonInclude(JsonInclude.Include.NON_NULL)
 @Data
@@ -41,7 +43,17 @@ public class ProviderDetails extends MigratedKeyInfoFields {
     @ApiModelProperty public GCPCloudInfo gcp;
     @ApiModelProperty public KubernetesInfo kubernetes;
     @ApiModelProperty public OnPremCloudInfo onprem;
+    @ApiModelProperty public LocalCloudInfo local;
   }
 
-  @ApiModelProperty public CloudInfo cloudInfo;
+  @ApiModelProperty private CloudInfo cloudInfo;
+
+  // Flag to enable node agent for this provider depending on the runtime config settings.
+  @ApiModelProperty(accessMode = AccessMode.READ_ONLY)
+  public boolean enableNodeAgent;
+
+  @JsonIgnore
+  public boolean isUpdateNeeded(ProviderDetails details) {
+    return !Objects.equals(this.getCloudInfo(), details.getCloudInfo());
+  }
 }

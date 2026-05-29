@@ -1,4 +1,4 @@
-// Copyright (c) YugaByte, Inc.
+// Copyright (c) YugabyteDB, Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License"); you may not use this file except
 // in compliance with the License.  You may obtain a copy of the License at
@@ -12,6 +12,10 @@
 //
 
 #pragma once
+
+#include <compare>
+#include <iterator>
+#include <type_traits>
 
 namespace yb {
 
@@ -75,10 +79,16 @@ class ContainerRangeObject {
 template <class Int>
 class RangeIterator : public std::iterator<std::random_access_iterator_tag, Int> {
  public:
+  using difference_type = std::ptrdiff_t;
+
   RangeIterator(Int pos, Int step) : pos_(pos), step_(step) {}
 
   Int operator*() const {
     return pos_;
+  }
+
+  Int operator[](difference_type n) const {
+    return pos_ + static_cast<Int>(n) * step_;
   }
 
   RangeIterator& operator++() {
@@ -92,17 +102,74 @@ class RangeIterator : public std::iterator<std::random_access_iterator_tag, Int>
     return result;
   }
 
+  RangeIterator& operator--() {
+    pos_ -= step_;
+    return *this;
+  }
+
+  RangeIterator operator--(int) {
+    RangeIterator result = *this;
+    pos_ -= step_;
+    return result;
+  }
+
+  RangeIterator& operator+=(difference_type n) {
+    pos_ += static_cast<Int>(n) * step_;
+    return *this;
+  }
+
+  RangeIterator& operator-=(difference_type n) {
+    pos_ -= static_cast<Int>(n) * step_;
+    return *this;
+  }
+
  private:
+  friend RangeIterator operator+(RangeIterator it, difference_type n) {
+    it += n;
+    return it;
+  }
+
+  friend RangeIterator operator+(difference_type n, RangeIterator it) {
+    it += n;
+    return it;
+  }
+
+  friend RangeIterator operator-(RangeIterator it, difference_type n) {
+    it -= n;
+    return it;
+  }
+
+  friend difference_type operator-(const RangeIterator<Int>& lhs, const RangeIterator<Int>& rhs) {
+    return static_cast<difference_type>((lhs.pos_ - rhs.pos_) / lhs.step_);
+  }
+
   friend bool operator==(const RangeIterator<Int>& lhs, const RangeIterator<Int>& rhs) {
     return lhs.pos_ == rhs.pos_;
   }
 
-  friend bool operator!=(const RangeIterator<Int>& lhs, const RangeIterator<Int>& rhs) {
-    return lhs.pos_ != rhs.pos_;
+  friend auto operator<=>(const RangeIterator<Int>& lhs, const RangeIterator<Int>& rhs) {
+    return lhs.step_ > 0 ? lhs.pos_ <=> rhs.pos_ : rhs.pos_ <=> lhs.pos_;
   }
 
   Int pos_;
   Int step_;
+};
+
+template <class Int>
+class RangeObject;
+
+template <class Int>
+class RangeObjectToContainerHelper {
+ public:
+  explicit RangeObjectToContainerHelper(const RangeObject<Int>& range) : range_(range) {}
+
+  template <class Out>
+  operator Out() const {
+    return Out(range_.begin(), range_.end());
+  }
+
+ private:
+  const RangeObject<Int>& range_;
 };
 
 template <class Int>
@@ -111,22 +178,48 @@ class RangeObject {
   using const_iterator = RangeIterator<Int>;
 
   RangeObject(Int start, Int stop, Int step)
-      : start_(start), stop_(start + (stop - start + step - 1) / step * step), step_(step) {}
+      : start_(start), stop_(NormalizedStop(start, stop, step)), step_(step) {
+  }
 
-  const_iterator begin() const {
+  [[nodiscard]] size_t size() const {
+    return (stop_ - start_) / step_;
+  }
+
+  [[nodiscard]] const_iterator begin() const {
     return const_iterator(start_, step_);
   }
 
-  const_iterator end() const {
+  [[nodiscard]] const_iterator end() const {
     return const_iterator(stop_, step_);
   }
 
   template <class T>
-  auto operator[](const T& container) const {
+  [[nodiscard]] auto operator[](const T& container) const {
     return ContainerRangeObject<RangeObject<Int>, T>(*this, container);
   }
 
+  [[nodiscard]] RangeObject<Int> Reversed() const {
+    static_assert(std::is_signed_v<Int>);
+    const auto new_step = -step_;
+    auto new_start = stop_ - (new_step > 0 ? -1 : 1);
+    auto new_stop = new_start + static_cast<Int>(size()) * new_step;
+    return {new_start, new_stop, new_step};
+  }
+
+  RangeObjectToContainerHelper<Int> ToContainer() const {
+    return RangeObjectToContainerHelper(*this);
+  }
+
  private:
+  [[nodiscard]] static Int NormalizedStop(Int start, Int stop, Int step) {
+    auto diff = stop - start;
+    auto step_count = diff / step;
+    if (diff % step) {
+      ++step_count;
+    }
+    return start + step_count * step;
+  }
+
   Int start_;
   Int stop_;
   Int step_;

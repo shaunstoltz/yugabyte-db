@@ -15,9 +15,9 @@
 // specific language governing permissions and limitations
 // under the License.
 //
-// The following only applies to changes made to this file as part of YugaByte development.
+// The following only applies to changes made to this file as part of YugabyteDB development.
 //
-// Portions Copyright (c) YugaByte, Inc.
+// Portions Copyright (c) YugabyteDB, Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License"); you may not use this file except
 // in compliance with the License.  You may obtain a copy of the License at
@@ -32,8 +32,9 @@
 
 #include <cstddef>
 
-#include <glog/logging.h>
+#include "yb/util/logging.h"
 
+#include "yb/common/opid.h"
 #include "yb/common/ql_protocol_util.h"
 #include "yb/common/schema.h"
 #include "yb/common/wire_protocol-test-util.h"
@@ -49,7 +50,6 @@
 #include "yb/tablet/tablet_metadata.h"
 #include "yb/tablet/tablet_snapshots.h"
 
-#include "yb/util/opid.h"
 #include "yb/util/status_log.h"
 
 using std::string;
@@ -89,16 +89,16 @@ TEST_F(TestRaftGroupMetadata, TestLoadFromSuperBlock) {
   QLWriteRequestPB req;
   BuildPartialRow(0, 0, "foo", &req);
   ASSERT_OK(writer_->Write(&req));
-  ASSERT_OK(harness_->tablet()->Flush(tablet::FlushMode::kSync));
+  ASSERT_OK(harness_->tablet()->Flush(tablet::FlushMode::kSync, rocksdb::FlushReason::kTestOnly));
 
   // Create one more row. Write and flush.
   BuildPartialRow(1, 1, "bar", &req);
   ASSERT_OK(writer_->Write(&req));
-  ASSERT_OK(harness_->tablet()->Flush(tablet::FlushMode::kSync));
+  ASSERT_OK(harness_->tablet()->Flush(tablet::FlushMode::kSync, rocksdb::FlushReason::kTestOnly));
 
   // Shut down the tablet.
   harness_->tablet()->StartShutdown();
-  harness_->tablet()->CompleteShutdown(DisableFlushOnShutdown::kFalse);
+  harness_->tablet()->CompleteShutdown(DisableFlushOnShutdown::kFalse, AbortOps::kFalse);
 
   RaftGroupMetadata* meta = harness_->tablet()->metadata();
 
@@ -130,12 +130,12 @@ TEST_F(TestRaftGroupMetadata, TestDeleteTabletDataClearsDisk) {
   QLWriteRequestPB req;
   BuildPartialRow(0, 0, "foo", &req);
   ASSERT_OK(writer_->Write(&req));
-  ASSERT_OK(tablet->Flush(tablet::FlushMode::kSync));
+  ASSERT_OK(tablet->Flush(tablet::FlushMode::kSync, rocksdb::FlushReason::kTestOnly));
 
   // Create one more row. Write and flush.
   BuildPartialRow(1, 1, "bar", &req);
   ASSERT_OK(writer_->Write(&req));
-  ASSERT_OK(tablet->Flush(tablet::FlushMode::kSync));
+  ASSERT_OK(tablet->Flush(tablet::FlushMode::kSync, rocksdb::FlushReason::kTestOnly));
 
   const string snapshotId = "0123456789ABCDEF0123456789ABCDEF";
   tserver::TabletSnapshotOpRequestPB request;
@@ -156,6 +156,54 @@ TEST_F(TestRaftGroupMetadata, TestDeleteTabletDataClearsDisk) {
   ASSERT_FALSE(env_->DirExists(tablet->metadata()->rocksdb_dir()));
   ASSERT_FALSE(env_->DirExists(tablet->metadata()->intents_rocksdb_dir()));
   ASSERT_FALSE(env_->DirExists(tablet->metadata()->snapshots_dir()));
+}
+
+TEST_F(TestRaftGroupMetadata, NamespaceIdPreservedAcrossSchemaChanges) {
+  // Verify that namespace_id is preserved across schema updates and packed schema insertions.
+  auto tablet = harness_->tablet();
+  auto* meta = tablet->metadata();
+
+  // Simulate namespace backfill.
+  const NamespaceId kNamespaceId = "0123456789abcdef0123456789abcdef";
+  ASSERT_OK(meta->set_namespace_id(kNamespaceId));
+  ASSERT_EQ(meta->primary_table_info()->namespace_id, kNamespaceId);
+
+  auto initial_table_info = meta->primary_table_info();
+  const Schema initial_schema = initial_table_info->schema();
+  const auto initial_version = initial_table_info->schema_version;
+  const qlexpr::IndexMap& index_map = *initial_table_info->index_map;
+  const TableId& table_id = initial_table_info->table_id;
+
+  // Perform schema changes and verify that namespace_id is preserved.
+
+  // 1. SetSchema.
+  meta->SetSchema(
+      initial_schema, index_map, /* deleted_cols */ {}, initial_version + 1, OpId() /* op_id */,
+      table_id);
+  ASSERT_EQ(meta->primary_table_info()->namespace_id, kNamespaceId);
+
+  // 2. InsertPackedSchemaForXClusterTarget.
+  meta->InsertPackedSchemaForXClusterTarget(
+      initial_schema, index_map, initial_version + 3, OpId() /* op_id */, table_id);
+  ASSERT_EQ(meta->primary_table_info()->namespace_id, kNamespaceId);
+}
+
+// Verify that index_map() returns NotFound for a nonexistent colocated table rather than crashing.
+// Before the fix, index_map() used CHECK_RESULT(GetTableInfo(table_id)) which would FATAL on a
+// missing table. This test would crash (not just fail) without the fix.
+TEST_F(TestRaftGroupMetadata, IndexMapReturnsNotFoundForMissingTable) {
+  auto* meta = harness_->tablet()->metadata();
+
+  // Primary table (empty table_id) should always succeed.
+  auto primary_result = meta->index_map();
+  ASSERT_OK(primary_result);
+  ASSERT_NE(*primary_result, nullptr);
+
+  // A nonexistent table_id should return NotFound, not crash.
+  const TableId kNonexistentTableId = "deadbeefdeadbeefdeadbeefdeadbeef";
+  auto missing_result = meta->index_map(kNonexistentTableId);
+  ASSERT_NOK(missing_result);
+  ASSERT_TRUE(missing_result.status().IsNotFound()) << missing_result.status();
 }
 
 } // namespace tablet

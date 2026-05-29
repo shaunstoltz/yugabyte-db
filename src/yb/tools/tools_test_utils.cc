@@ -1,4 +1,4 @@
-// Copyright (c) YugaByte, Inc.
+// Copyright (c) YugabyteDB, Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License"); you may not use this file except
 // in compliance with the License.  You may obtain a copy of the License at
@@ -13,7 +13,8 @@
 
 #include "yb/tools/tools_test_utils.h"
 
-#include "yb/util/jsonreader.h"
+#include "yb/integration-tests/mini_cluster_base.h"
+#include "yb/util/json_document.h"
 #include "yb/util/net/net_util.h"
 #include "yb/util/path_util.h"
 #include "yb/util/random_util.h"
@@ -21,10 +22,11 @@
 #include "yb/util/subprocess.h"
 #include "yb/util/test_util.h"
 #include "yb/util/flags.h"
+#include "yb/integration-tests/external_yb_controller.h"
 
 using std::string;
 
-DEFINE_UNKNOWN_bool(verbose_yb_backup, false, "Add --verbose flag to yb_backup.py.");
+DEFINE_NON_RUNTIME_bool(verbose_yb_backup, false, "Add --verbose flag to yb_backup.py.");
 
 namespace yb {
 namespace tools {
@@ -76,22 +78,20 @@ Status RunBackupCommand(
   RETURN_NOT_OK(Subprocess::Call(args, &output));
   LOG(INFO) << "Tool output: " << output;
 
-  JsonReader r(output);
-  RETURN_NOT_OK(r.Init());
+  JsonDocument doc;
+  auto root = VERIFY_RESULT(doc.Parse(output));
   string error;
-  Status s = r.ExtractString(r.root(), "error", &error);
-  if (s.ok()) {
-    LOG(ERROR) << "yb_backup.py error: " << error;
-    return STATUS(RuntimeError, "yb_backup.py error", error);
+  Result<std::string> res = root["error"].GetString();
+  if (res.ok()) {
+    LOG(ERROR) << "yb_backup.py error: " << *res;
+    return STATUS(RuntimeError, "yb_backup.py error", *res);
   }
 
   if (backup_cmd == "create") {
-    string url;
-    RETURN_NOT_OK(r.ExtractString(r.root(), "snapshot_url", &url));
+    auto url = VERIFY_RESULT(root["snapshot_url"].GetString());
     LOG(INFO) << "Backup-create operation result - snapshot url: " << url;
   } else if (backup_cmd == "restore") {
-    bool result_ok = false;
-    RETURN_NOT_OK(r.ExtractBool(r.root(), "success", &result_ok));
+    auto result_ok = VERIFY_RESULT(root["success"].GetBool());
     LOG(INFO) << "Backup-restore operation result: " << result_ok;
     if (!result_ok) {
       return STATUS(RuntimeError, "Failed backup restore operation");
@@ -101,6 +101,62 @@ Status RunBackupCommand(
   }
 
   return Status::OK();
+}
+
+Status RunYbControllerCommand(
+    MiniClusterBase* cluster, const std::string& tmp_dir, const std::vector<std::string>& args) {
+  auto ybc_daemons = cluster->yb_controller_daemons();
+  LOG_IF(DFATAL, ybc_daemons.empty()) << "YB Controller not started";
+  auto yb_controller = ybc_daemons[0].get();
+
+  string backupDir, ns, ns_type, backup_command;
+  bool use_tablespaces = false;
+  for (size_t idx = 0; idx < args.size(); idx++) {
+    string arg = args[idx];
+    if (arg == "--keyspace") {
+      string keyspace = args[idx + 1];
+      if (keyspace.starts_with("ysql.")) {
+        ns_type = "ysql";
+        ns = keyspace.substr(keyspace.find(".") + 1);
+      } else {
+        ns_type = "ycql";
+        ns = keyspace;
+      }
+    } else if (arg == "--backup_location") {
+      backupDir = args[idx + 1];
+    } else if (arg == "create") {
+      backup_command = "backup";
+    } else if (arg == "restore") {
+      backup_command = arg;
+    } else if (arg == "--use_tablespaces") {
+      use_tablespaces = true;
+    }
+  }
+  return yb_controller->RunBackupCommand(
+      backupDir, backup_command, ns, ns_type, tmp_dir, use_tablespaces);
+}
+
+namespace {
+Result<std::string> RunYSQLDumpHelper(
+    HostPort& pg_host_port, const std::string& database_name, const std::string& dump_type) {
+  const auto kHostFlag = "--host=" + pg_host_port.host();
+  const auto kPortFlag = "--port=" + std::to_string(pg_host_port.port());
+  std::vector<std::string> args = {GetPgToolPath("ysql_dump"), kHostFlag,    kPortFlag, dump_type,
+                                   "--include-yb-metadata",    database_name};
+  LOG(INFO) << "Run tool: " << AsString(args);
+  std::string output;
+  RETURN_NOT_OK(Subprocess::Call(args, &output));
+  LOG(INFO) << "Tool output: " << output;
+  return output;
+}
+}  // namespace
+
+Result<std::string> RunYSQLDump(HostPort& pg_host_port, const std::string& database_name) {
+  return RunYSQLDumpHelper(pg_host_port, database_name, "--schema-only");
+}
+
+Result<std::string> RunYSQLDataOnlyDump(HostPort& pg_host_port, const std::string& database_name) {
+  return RunYSQLDumpHelper(pg_host_port, database_name, "--data-only");
 }
 
 TmpDirProvider::~TmpDirProvider() {
@@ -118,8 +174,10 @@ std::string TmpDirProvider::operator*() {
   if (dir_.empty()) {
     std::string temp;
     CHECK_OK(Env::Default()->GetTestDirectory(&temp));
+    auto test_name = std::string(CURRENT_TEST_CASE_NAME());
+    std::replace(test_name.begin(), test_name.end(), '/', '_');
     dir_ = JoinPathSegments(
-        temp, std::string(CURRENT_TEST_CASE_NAME()) + '_' + RandomHumanReadableString(8));
+        temp, test_name + '_' + RandomHumanReadableString(8));
   }
   // Create the directory if it doesn't exist.
   if (!Env::Default()->DirExists(dir_)) {

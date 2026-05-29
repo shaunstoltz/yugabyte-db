@@ -15,9 +15,9 @@
 // specific language governing permissions and limitations
 // under the License.
 //
-// The following only applies to changes made to this file as part of YugaByte development.
+// The following only applies to changes made to this file as part of YugabyteDB development.
 //
-// Portions Copyright (c) YugaByte, Inc.
+// Portions Copyright (c) YugabyteDB, Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License"); you may not use this file except
 // in compliance with the License.  You may obtain a copy of the License at
@@ -32,11 +32,12 @@
 #pragma once
 
 #include <string>
-#include <vector>
 #include <unordered_map>
+#include <vector>
 
 #include "yb/common/pg_types.h"
 #include "yb/common/ql_protocol.pb.h"
+#include "yb/common/read_hybrid_time.h"
 
 #include "yb/consensus/consensus_fwd.h"
 #include "yb/consensus/metadata.pb.h"
@@ -45,10 +46,10 @@
 
 #include "yb/gutil/callback.h"
 
+#include "yb/master/leader_epoch.h"
 #include "yb/master/master_fwd.h"
+#include "yb/master/sys_catalog_types.h"
 #include "yb/master/sys_catalog_constants.h"
-
-#include "yb/tablet/snapshot_coordinator.h"
 
 #include "yb/tserver/tablet_memory_manager.h"
 
@@ -56,6 +57,8 @@
 #include "yb/util/metrics_fwd.h"
 #include "yb/util/pb_util.h"
 #include "yb/util/status_fwd.h"
+#include "yb/util/tostring.h"
+#include "yb/util/unique_lock.h"
 
 namespace yb {
 
@@ -76,10 +79,31 @@ class MasterOptions;
 class VisitorBase;
 class SysCatalogWriter;
 
-struct PgTypeInfo {
-  char typtype;
-  uint32_t typbasetype;
-  PgTypeInfo(char typtype_, uint32_t typbasetype_) : typtype(typtype_), typbasetype(typbasetype_) {}
+struct PgTableReadData {
+  TableId table_id;
+  tablet::TabletPtr tablet;
+  tablet::TableInfoPtr table_info;
+  ReadHybridTime read_hybrid_time;
+
+  const Schema& schema() const;
+  Result<ColumnId> ColumnByName(const std::string& name) const;
+
+  Result<docdb::DocRowwiseIteratorPtr> NewUninitializedIterator(
+      const dockv::ReaderProjection& projection) const;
+
+  Result<std::unique_ptr<docdb::YQLRowwiseIteratorIf>> NewIterator(
+      const dockv::ReaderProjection& projection) const;
+};
+
+// Instances of this are used to accumulate the maximum OID simultaneously for both OID spaces.
+class MaxOidPerSpace {
+ public:
+  void UpdateWithOid(uint32_t oid);
+
+  uint32_t for_normal_space_ = kPgFirstNormalObjectId;
+  uint32_t for_secondary_space_ = kPgFirstSecondarySpaceObjectId;
+
+  std::string ToString() const;
 };
 
 // SysCatalogTable is a YB table that keeps track of table and
@@ -89,7 +113,7 @@ struct PgTypeInfo {
 //   as a "normal table", instead we have Master APIs to query the table.
 class SysCatalogTable {
  public:
-  typedef Callback<Status()> ElectedLeaderCallback;
+  using ElectedLeaderCallback = Callback<Status ()>;
 
   // 'leader_cb_' is invoked whenever this node is elected as a leader
   // of the consensus configuration for this tablet, including for local standalone
@@ -100,9 +124,11 @@ class SysCatalogTable {
   // the consensus configuration's progress, any long running tasks (e.g., scanning
   // tablets) should be performed asynchronously (by, e.g., submitting
   // them to a to a separate threadpool).
-  SysCatalogTable(Master* master, MetricRegistry* metrics, ElectedLeaderCallback leader_cb);
+  SysCatalogTable(Master* master, MetricRegistry* metrics);
 
   ~SysCatalogTable();
+
+  Status Start(ElectedLeaderCallback leader_cb);
 
   // Allow for orderly shutdown of tablet peer, etc.
   void StartShutdown();
@@ -120,12 +146,41 @@ class SysCatalogTable {
   template <class... Items>
   Status Upsert(int64_t leader_term, Items&&... items);
 
+  // Required to write TableInfo or TabletInfo. This method checks the `namespace` parameter to
+  // prevent writes of stale data read before a PITR to clobber object state overwritten by PITR.
+  template <class... Items>
+  Status Upsert(const LeaderEpoch& epoch, Items&&... items);
+
+  template <class... Items>
+  Status ForceUpsert(int64_t leader_term, Items&&... items);
+
   template <class... Items>
   Status Delete(int64_t leader_term, Items&&... items);
 
+  // Required to delete TableInfo or TabletInfo. This method checks the `namespace` parameter to
+  // prevent deletes of stale data read before a PITR to clobber object state overwritten by PITR.
+  template <class... Items>
+  Status Delete(const LeaderEpoch& epoch, Items&&... items);
+
+  template <class... Items>
+  Status Mutate(QLWriteRequestPB::QLStmtType op_type, int64_t leader_term, Items&&... items);
+
+  // Required to mutate TableInfo or TabletInfo. This method checks the `namespace` parameter to
+  // prevent mutations of stale data read before a PITR to clobber object state overwritten by PITR.
   template <class... Items>
   Status Mutate(
+      QLWriteRequestPB::QLStmtType op_type, const LeaderEpoch& epoch, Items&&... items);
+
+  template <class... Items>
+  Status ForceMutate(
       QLWriteRequestPB::QLStmtType op_type, int64_t leader_term, Items&&... items);
+
+  Status ForceWrite(
+      int8_t type, const std::string& item_id, const google::protobuf::Message& new_pb,
+      QLWriteRequestPB::QLStmtType op_type, int64_t leader_term);
+
+  Result<bool> GetYsqlYbSystemTableInfo(
+      PgOid relnamespace, const TableName& table_name, PgOid* oid, PgOid* relfilenode);
 
   // ==================================================================
   // Static schema related methods.
@@ -134,7 +189,12 @@ class SysCatalogTable {
   static std::string schema_column_id();
   static std::string schema_column_metadata();
 
+  // Return the schema of the table.
+  // NOTE: This is the "server-side" schema, so it must have the column IDs.
+  static Schema BuildTableSchema();
+
   ThreadPool* raft_pool() const { return raft_pool_.get(); }
+  rpc::ThreadPool* raft_notifications_pool() const { return raft_notifications_pool_.get(); }
   ThreadPool* tablet_prepare_pool() const { return tablet_prepare_pool_.get(); }
   ThreadPool* append_pool() const { return append_pool_.get(); }
   ThreadPool* log_sync_pool() const { return log_sync_pool_.get(); }
@@ -142,6 +202,13 @@ class SysCatalogTable {
   std::shared_ptr<tablet::TabletPeer> tablet_peer() const {
     return std::atomic_load(&tablet_peer_);
   }
+
+  Result<tablet::TabletPtr> Tablet() const;
+
+  Result<PgTableReadData> TableReadData(
+      const TableId& original_table_id, const ReadHybridTime& read_ht) const;
+  Result<PgTableReadData> TableReadData(
+      uint32_t database_oid, uint32_t table_oid, const ReadHybridTime& read_ht) const;
 
   // Create a new tablet peer with information from the metadata
   void SetupTabletPeer(const scoped_refptr<tablet::RaftGroupMetadata>& metadata);
@@ -160,20 +227,44 @@ class SysCatalogTable {
 
   Status Visit(VisitorBase* visitor);
 
+  template <template <class> class Loader, typename CatalogEntityWrapper>
+  Status Load(const std::string& type, CatalogEntityWrapper& catalog_entity_wrapper) {
+    Loader<CatalogEntityWrapper> loader(catalog_entity_wrapper);
+    RETURN_NOT_OK_PREPEND(Visit(&loader), "Failed while visiting " + type + " in sys catalog");
+    return Status::OK();
+  }
+
+  template <typename Loader, typename CatalogEntityPB>
+  Status Load(
+      const std::string& type, std::function<Status(const std::string&, const CatalogEntityPB&)>
+                                   catalog_entity_inserter_func) {
+    Loader loader(catalog_entity_inserter_func);
+    RETURN_NOT_OK_PREPEND(Visit(&loader), "Failed while visiting " + type + " in sys catalog");
+    return Status::OK();
+  }
+
+  using ReadRestartFn = std::function<Status (const ReadHybridTime &, HybridTime *)>;
+  Status ReadWithRestarts(
+      const ReadRestartFn& fn,
+      tablet::RequireLease require_lease = tablet::RequireLease::kTrue) const;
+
   // Read the global ysql catalog version info from the pg_yb_catalog_version catalog table.
-  Status ReadYsqlCatalogVersion(TableId ysql_catalog_table_id,
+  Status ReadYsqlCatalogVersion(const TableId& ysql_catalog_table_id,
                                 uint64_t* catalog_version,
                                 uint64_t* last_breaking_version);
   // Read the per-db ysql catalog version info from the pg_yb_catalog_version catalog table.
-  Status ReadYsqlDBCatalogVersion(TableId ysql_catalog_table_id,
+  Status ReadYsqlDBCatalogVersion(const TableId& ysql_catalog_table_id,
                                   uint32_t db_oid,
                                   uint64_t* catalog_version,
                                   uint64_t* last_breaking_version);
   // Read the ysql catalog version info for all databases from the pg_yb_catalog_version
   // catalog table.
   Status ReadYsqlAllDBCatalogVersions(
-      TableId ysql_catalog_table_id,
+      const TableId& ysql_catalog_table_id,
       DbOidToCatalogVersionMap* versions);
+  // Read the ysql catalog cache invalidation messages info for all databases from the
+  // pg_yb_invalidation_messages catalog table.
+  Result<DbOidVersionToMessageListMap> ReadYsqlCatalogInvalationMessages();
 
   // Read the pg_class catalog table. There is a separate pg_class table in each
   // YSQL database, read the information in the pg_class table for the database
@@ -188,14 +279,31 @@ class SysCatalogTable {
     bool is_colocated_database,
     TableToTablespaceIdMap *table_tablespace_map);
 
-  // Read relnamespace OID from the pg_class catalog table.
-  Result<uint32_t> ReadPgClassColumnWithOidValue(const uint32_t database_oid,
-                                                 const uint32_t table_oid,
-                                                 const std::string& column_name);
+  // Read read all 'column_name' (e.g. relnamespace) OIDs from the pg_class catalog table.
+  // Return map: oid -> 'column_name' oid.
+  Result<PgOidToOidMap> ReadPgClassColumnWithOidValueMap(const PgOid database_oid,
+                                                         const std::string& column_name);
+
+  // Read 'column_name' (e.g. relnamespace) OID from the pg_class catalog table.
+  Result<PgOid> ReadPgClassColumnWithOidValue(const PgOid database_oid,
+                                              const PgOid table_oid,
+                                              const std::string& column_name,
+                                              const ReadHybridTime& read_time = ReadHybridTime());
+
+  // Read 'column_name' (e.g. indisvalid/indisready/indislive) boolean value from the pg_index
+  // catalog table for the given index OID.
+  Result<bool> ReadPgIndexBoolColumn(
+      const PgOid database_oid, const PgOid index_oid, const std::string& column_name,
+      const ReadHybridTime& read_time = ReadHybridTime());
+
+  // Read all nspname strings from the pg_namespace catalog table.
+  // Return map: relnamespace oid -> nspname string.
+  Result<PgOidToStringMap> ReadPgNamespaceNspnameMap(const PgOid database_oid);
 
   // Read nspname string from the pg_namespace catalog table.
-  Result<std::string> ReadPgNamespaceNspname(const uint32_t database_oid,
-                                             const uint32_t relnamespace_oid);
+  Result<std::string> ReadPgNamespaceNspname(const PgOid database_oid,
+                                             const PgOid relnamespace_oid,
+                                             const ReadHybridTime& read_time = ReadHybridTime());
 
   // Read attname and atttypid from pg_attribute catalog table.
   Result<std::unordered_map<std::string, uint32_t>> ReadPgAttNameTypidMap(
@@ -219,10 +327,20 @@ class SysCatalogTable {
   Result<RelTypeOIDMap> ReadCompositeTypeFromPgClass(
       uint32_t database_oid, uint32_t type_oid = kPgInvalidOid);
 
+  // Read the pg_yb_tablegroup catalog and return the OID of the tablegroup named <grpname>.
+  Result<uint32_t> ReadPgYbTablegroupOid(const uint32_t database_oid,
+                                         const std::string& grpname);
+
+  // Scan database database_oid's catalog tables to find the highest normal and secondary space OIDs
+  // that xCluster needs to preserve and return them.
+  Result<MaxOidPerSpace> ReadHighestPreservableOids(uint32_t database_oid);
+
   // Copy the content of co-located tables in sys catalog as a batch.
   Status CopyPgsqlTables(const std::vector<TableId>& source_table_ids,
                          const std::vector<TableId>& target_table_ids,
                          int64_t leader_term);
+
+  Status DeleteAllYsqlCatalogTableRows(const std::vector<TableId>& table_ids, int64_t leader_term);
 
   // Drop YSQL table by removing the table metadata in sys-catalog.
   Status DeleteYsqlSystemTable(const std::string& table_id, int64_t term);
@@ -241,17 +359,33 @@ class SysCatalogTable {
       Schema* schema,
       uint32_t* schema_version);
 
+  PitrCount pitr_count() {
+    return pitr_count_.load();
+  }
+
+  void IncrementPitrCount() EXCLUDES(pitr_count_lock_) {
+    // We acquire pitr_count_lock_ to synchronize with sys catalog writes to tables or tablets.
+    // We want to be sure such writes complete before PITR updates any sys catalog state.
+    UniqueLock<std::shared_mutex> l(pitr_count_lock_);
+    pitr_count_.fetch_add(1);
+  }
+
+  tablet::TabletPeerPtr TEST_GetTabletPeer() {
+    return tablet_peer_;
+  }
+
+  Result<int64_t> CountPgYbMigrationRows(
+      uint32_t database_oid, const ReadHybridTime& read_time = ReadHybridTime());
+
+  Result<PgOid> GetYsqlDatabaseOid(const NamespaceName& ns_name);
+
  private:
   friend class CatalogManager;
-  friend class enterprise::CatalogManager;
+  friend class ScopedLeaderSharedLock;
 
   inline std::unique_ptr<SysCatalogWriter> NewWriter(int64_t leader_term);
 
   const char *table_name() const { return kSysCatalogTableName; }
-
-  // Return the schema of the table.
-  // NOTE: This is the "server-side" schema, so it must have the column IDs.
-  Schema BuildTableSchema();
 
   // Returns 'Status::OK()' if the WriteTranasction completed
   Status SyncWrite(SysCatalogWriter* writer);
@@ -295,11 +429,44 @@ class SysCatalogTable {
   // all rows in the table and db_oid is ignored.
   // Either 'catalog_version/last_breaking_version' or 'versions' should be set but not both.
   Status ReadYsqlDBCatalogVersionImpl(
-      TableId ysql_catalog_table_id,
+      const TableId& ysql_catalog_table_id,
       uint32_t db_oid,
       uint64_t* catalog_version,
       uint64_t* last_breaking_version,
       DbOidToCatalogVersionMap* versions);
+  Status ReadYsqlDBCatalogVersionImplWithReadTime(
+      const TableId& ysql_catalog_table_id,
+      uint32_t db_oid,
+      const ReadHybridTime& read_time,
+      HybridTime* read_restart_ht,
+      uint64_t* catalog_version,
+      uint64_t* last_breaking_version,
+      DbOidToCatalogVersionMap* versions);
+  // Similar to reading from pg_yb_catalog_version, read the latest pg_yb_invalidation_messages
+  // via read with restarts.
+  Status ReadYsqlCatalogInvalationMessagesImpl(
+      const ReadHybridTime& read_time,
+      HybridTime* read_restart_ht,
+      DbOidVersionToMessageListMap& messages);
+
+  // During a batch write operation, if the max batch bytes have been exceeded, performs a write and
+  // creates a new writer. To avoid running the expensive ByteSizeLong calculation too frequently,
+  // this method checks whether the max batch bytes have been exceeded only once every 128 rows.
+  //
+  // The batch itself is atomically written, but there is no atomicity guarantee between two
+  // different batches even if they use the same writer.
+  // NOTE: FinishWrite must be called to flush any partial batches at the end of the write.
+  Status WriteBatchIfNeeded(size_t max_batch_bytes,
+                            size_t rows_so_far,
+                            int64_t leader_term,
+                            std::unique_ptr<SysCatalogWriter>& writer,
+                            size_t& total_bytes,
+                            size_t& batch_count);
+
+  // During a batch write operation, does the final write if any batch operations remain queued.
+  Status FinishWrite(std::unique_ptr<SysCatalogWriter>& writer,
+                     size_t& total_bytes,
+                     size_t& batch_count);
 
   // Table schema, with IDs, used for the YQL write path.
   std::unique_ptr<docdb::DocReadContext> doc_read_context_;
@@ -312,6 +479,9 @@ class SysCatalogTable {
 
   // Thread pool for Raft-related operations
   std::unique_ptr<ThreadPool> raft_pool_;
+
+  // Thread pool for callbacks on Raft replication events.
+  std::unique_ptr<rpc::ThreadPool> raft_notifications_pool_;
 
   // Thread pool for preparing transactions, shared between all tablets.
   std::unique_ptr<ThreadPool> tablet_prepare_pool_;
@@ -331,7 +501,13 @@ class SysCatalogTable {
 
   consensus::RaftPeerPB local_peer_pb_;
 
-  scoped_refptr<Histogram> setup_config_dns_histogram_;
+  std::atomic<PitrCount> pitr_count_{0};
+
+  // This lock is used to synchronize increments of pitr_count_ and sys catalog writes to ensure any
+  // in flight sys catalog writes are complete before PITR updates any state.
+  mutable std::shared_mutex pitr_count_lock_;
+
+  scoped_refptr<EventStats> setup_config_dns_stats_;
 
   scoped_refptr<Counter> peer_write_count;
 

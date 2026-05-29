@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 #
-# Copyright 2021 YugaByte, Inc. and Contributors
+# Copyright 2021 YugabyteDB, Inc. and Contributors
 #
 # Licensed under the Polyform Free Trial License 1.0.0 (the "License"); you
 # may not use this file except in compliance with the License. You
@@ -58,11 +58,13 @@ PIDFILE=${YB_HOME_DIR}/collect_metrics.pid
 if [ -f $PIDFILE ]
 then
   PID=$(cat "$PIDFILE")
-  PID_CHECK_STATUS=$(ps -p $PID > /dev/null 2>&1; echo $?)
+  PID_CHECK_STATUS=$(ps -f -p $PID | grep collect_metrics.sh > /dev/null 2>&1; echo $?)
   if [ "$PID_CHECK_STATUS" -eq 0 ]
   then
     echo "Process $PID already running"
     exit 1
+  else
+    rm -f "$PIDFILE"
   fi
 fi
 
@@ -74,8 +76,12 @@ then
 fi
 
 if [ "$output" = "file" ]; then
-  mkdir -p "$(dirname "$filename")"
-  ${YB_HOME_DIR}/bin/node_health.py --metrics_only True --metrics_file "$filename"
+  metrics_dir="$(dirname "$filename")"
+  mkdir -p "$metrics_dir"
+  temp_output_file="$metrics_dir/process_stats.json"
+  ${YB_HOME_DIR}/bin/node_health.py --metrics_only True --metrics_file "$filename" \
+  --temp_output_file "$temp_output_file"
+  chmod o+r "$filename" || true
 else
   ${YB_HOME_DIR}/bin/node_health.py --metrics_only True
 fi

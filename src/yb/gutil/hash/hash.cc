@@ -1,8 +1,8 @@
 // Copyright 2011 Google Inc. All Rights Reserved.
 //
-// The following only applies to changes made to this file as part of YugaByte development.
+// The following only applies to changes made to this file as part of YugabyteDB development.
 //
-// Portions Copyright (c) YugaByte, Inc.
+// Portions Copyright (c) YugabyteDB, Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License"); you may not use this file except
 // in compliance with the License.  You may obtain a copy of the License at
@@ -24,7 +24,7 @@
 #include "yb/gutil/hash/hash.h"
 
 #include "yb/gutil/integral_types.h"
-#include <glog/logging.h>
+#include "yb/util/logging.h"
 #include "yb/gutil/hash/jenkins.h"
 #include "yb/gutil/hash/jenkins_lookup2.h"
 #include "yb/gutil/macros.h"

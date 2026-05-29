@@ -4,7 +4,7 @@ headerTitle: The plain timestamp and timestamptz data types
 linkTitle: Plain timestamp and timestamptz
 description: The semantics of the plain timestamp and timestamptz data types. [YSQL]
 menu:
-  stable:
+  stable_api:
     identifier: type-timestamp
     parent: date-time-data-types-semantics
     weight: 30
@@ -32,7 +32,7 @@ For example, you might choose plain _timestamp_ to send the representation of a 
 
 Plain _timestamp_ values represent the date and the time-of-day of some moment in a [local time](../../conceptual-background/#wall-clock-time-and-local-time) regime. There is no timezone-sensitivity, neither when a plain _timestamp_ value is created, nor when it is read. Such a value therefore represents a moment at some unspecified location—just as a clockwork wall-clock that shows the date does. You can picture a _timestamp_ value as the number of microseconds to the present moment from the start of some epoch.
 
-Because there's no timezone-sensitivity, there's no sensitivity to Daylight Savings regimes either: every day runs from midnight (inclusive) through the next midnight (exclusive). (PostgresSQL, and therefore YSQL, don't support [leap seconds](https://www.timeanddate.com/time/leapseconds.html).) However the same quirk that allows _'24:00:00'_ as a _time_ value allows this as the time-of-day component when you specify a _timestamp_ value. Try this:
+Because there's no timezone-sensitivity, there's no sensitivity to Daylight Savings regimes either: every day runs from midnight (inclusive) through the next midnight (exclusive). (PostgreSQL, and therefore YSQL, don't support [leap seconds](https://www.timeanddate.com/time/leapseconds.html).) However the same quirk that allows _'24:00:00'_ as a _time_ value allows this as the time-of-day component when you specify a _timestamp_ value. Try this:
 
 ```plpgsql
 select

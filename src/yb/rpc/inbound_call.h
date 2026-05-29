@@ -15,9 +15,9 @@
 // specific language governing permissions and limitations
 // under the License.
 //
-// The following only applies to changes made to this file as part of YugaByte development.
+// The following only applies to changes made to this file as part of YugabyteDB development.
 //
-// Portions Copyright (c) YugaByte, Inc.
+// Portions Copyright (c) YugabyteDB, Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License"); you may not use this file except
 // in compliance with the License.  You may obtain a copy of the License at
@@ -32,43 +32,34 @@
 #pragma once
 
 #include <string>
-#include <vector>
 
-#include <boost/optional/optional.hpp>
-#include <glog/logging.h>
+#include "yb/ash/wait_state.h"
 
-#include "yb/gutil/stl_util.h"
 #include "yb/gutil/macros.h"
 #include "yb/gutil/ref_counted.h"
 
 #include "yb/rpc/rpc_fwd.h"
 #include "yb/rpc/call_data.h"
 #include "yb/rpc/rpc_call.h"
-#include "yb/rpc/remote_method.h"
 #include "yb/rpc/rpc_header.pb.h"
 #include "yb/rpc/thread_pool.h"
+#include "yb/rpc/wait_state_if.h"
 
-#include "yb/yql/cql/ql/ql_session.h"
-
-#include "yb/util/faststring.h"
 #include "yb/util/lockfree.h"
 #include "yb/util/locks.h"
 #include "yb/util/metrics_fwd.h"
-#include "yb/util/memory/memory.h"
 #include "yb/util/monotime.h"
 #include "yb/util/net/net_fwd.h"
-#include "yb/util/ref_cnt_buffer.h"
 #include "yb/util/slice.h"
 #include "yb/util/status_fwd.h"
 
-namespace google {
-namespace protobuf {
+namespace google::protobuf {
 class Message;
-}  // namespace protobuf
-}  // namespace google
+} // namespace google::protobuf
+
 
 namespace yb {
-
+class EventStats;
 class Histogram;
 class Trace;
 
@@ -86,7 +77,7 @@ class InboundCallHandler {
 
   virtual void Failure(const InboundCallPtr& call, const Status& status) = 0;
 
-  virtual boost::optional<int64_t> CallQueued(int64_t rpc_queue_limit) = 0;
+  virtual std::optional<int64_t> CallQueued(int64_t rpc_queue_limit) = 0;
 
   virtual void CallDequeued() = 0;
 
@@ -104,13 +95,17 @@ class InboundCall : public RpcCall, public MPSCQueueEntry<InboundCall> {
   };
 
   InboundCall(ConnectionPtr conn, RpcMetrics* rpc_metrics,
-              CallProcessedListener* call_processed_listener);
-  virtual ~InboundCall();
+              CallProcessedListener* call_processed_listener,
+              CallStateListenerFactory* call_state_listener_factory);
+  ~InboundCall() override;
 
   void SetRpcMethodMetrics(std::reference_wrapper<const RpcMethodMetrics> value);
 
+  // Is this a local call?
+  virtual bool IsLocalCall() const { return false; }
+
   // Return the serialized request parameter protobuf.
-  const Slice &serialized_request() const {
+  Slice serialized_request() const {
     return serialized_request_;
   }
 
@@ -128,7 +123,9 @@ class InboundCall : public RpcCall, public MPSCQueueEntry<InboundCall> {
   ConnectionPtr connection() const;
   ConnectionContext& connection_context() const;
 
-  Trace* trace();
+  inline Trace* trace() const EXCLUDES(mutex_) {
+    return trace_.load(std::memory_order_acquire);
+  }
 
   // When this InboundCall was received (instantiated).
   // Should only be called once on a given instance.
@@ -139,7 +136,9 @@ class InboundCall : public RpcCall, public MPSCQueueEntry<InboundCall> {
   // Updates the Histogram with time elapsed since the call was received,
   // and should only be called once on a given instance.
   // Not thread-safe. Should only be called by the current "owner" thread.
-  virtual void RecordHandlingStarted(scoped_refptr<Histogram> incoming_queue_time);
+  virtual void RecordHandlingStarted(scoped_refptr<EventStats> incoming_queue_time);
+
+  void RecordCallRejectedDueToMemoryPressure() const;
 
   // When RPC call Handle() completed execution on the server side.
   // Updates the Histogram with time elapsed since the call was started,
@@ -171,6 +170,10 @@ class InboundCall : public RpcCall, public MPSCQueueEntry<InboundCall> {
     call_processed_listener_ = nullptr;
   }
 
+  virtual ThreadPoolTag pool_tag() const {
+    return 0;
+  }
+
   virtual Slice serialized_remote_method() const = 0;
   virtual Slice method_name() const = 0;
 
@@ -199,7 +202,13 @@ class InboundCall : public RpcCall, public MPSCQueueEntry<InboundCall> {
 
   template <class T, class ...Args>
   static std::shared_ptr<T> Create(Args&&... args) {
-    auto result = std::make_shared<T>(std::forward<Args>(args)...);
+    // Not using make_shared here to make sure we can deallocate the object while the control block
+    // is still kept allocated due to weak stored by ServicePool::QueuedCheckDeadline.
+    // See #17726 for this bug and #17759 to track the "proper" fix in ServicePoolImpl.
+    auto* call_ptr = new T(std::forward<Args>(args)...);
+    auto result = std::shared_ptr<T>(call_ptr);
+    // Needs to be done after assigning it to a shared_ptr.
+    result->InitializeWaitState();
     result->RecordCallReceived();
     return result;
   }
@@ -214,12 +223,35 @@ class InboundCall : public RpcCall, public MPSCQueueEntry<InboundCall> {
 
   // For requests that have requested traces to be collected, we will ensure
   // that trace_ is not null and can be used for collecting the requested data.
-  void EnsureTraceCreated();
+  void EnsureTraceCreated() EXCLUDES(mutex_);
+
+  // Allows us to set a call processed listener if not already set.
+  // Used in the context of a local inbound call to track pending local calls.
+  void SetCallProcessedListener(CallProcessedListener* call_processed_listener);
+
+  // Returns the WaitStateInfo associated with this call. This is used to
+  // track what this RPC is currently waiting on.
+  // TODO(#27659): Remove usage of ash namespace from here
+  const ash::WaitStateInfoPtr& wait_state() const {
+    if (call_state_listener_) {
+      return call_state_listener_->wait_state();
+    }
+    static const ash::WaitStateInfoPtr kNullPtr = nullptr;
+    return kNullPtr;
+  }
+
+  int64_t instance_id() const {
+    return instance_id_;
+  }
+
+  CallStateListener* call_state_listener() {
+    return call_state_listener_.get();
+  }
 
  protected:
   ThreadPoolTask* BindTask(InboundCallHandler* handler, int64_t rpc_queue_limit);
 
-  void NotifyTransferred(const Status& status, Connection* conn) override;
+  void NotifyTransferred(const Status& status, const ConnectionPtr& conn) override;
 
   virtual void Clear();
 
@@ -231,16 +263,14 @@ class InboundCall : public RpcCall, public MPSCQueueEntry<InboundCall> {
 
   void QueueResponse(bool is_success);
 
+  void InitializeWaitState();
+
   // The serialized bytes of the request param protobuf. Set by ParseFrom().
   // This references memory held by 'request_data_'.
   Slice serialized_request_;
 
   // Data source of this call.
   CallData request_data_;
-  std::atomic<size_t> request_data_memory_usage_{0};
-
-  // The trace buffer.
-  scoped_refptr<Trace> trace_;
 
   // Timing information related to this RPC call.
   InboundCallTiming timing_;
@@ -252,14 +282,21 @@ class InboundCall : public RpcCall, public MPSCQueueEntry<InboundCall> {
   scoped_refptr<Counter> rpc_method_response_bytes_;
   scoped_refptr<Histogram> rpc_method_handler_latency_;
 
-  bool cleared_ = false;
   mutable simple_spinlock mutex_;
+  bool cleared_ GUARDED_BY(mutex_) = false;
 
  private:
+  // The trace buffer.
+  scoped_refptr<Trace> trace_holder_ GUARDED_BY(mutex_);
+  std::atomic<Trace*> trace_ = nullptr;
+
+  const int64_t instance_id_;
+
   // The connection on which this inbound call arrived. Can be null for LocalYBInboundCall.
   ConnectionPtr conn_ = nullptr;
   RpcMetrics* rpc_metrics_;
   CallProcessedListener* call_processed_listener_;
+  std::unique_ptr<CallStateListener> call_state_listener_;
 
   class InboundCallTask : public ThreadPoolTask {
    public:
@@ -272,7 +309,7 @@ class InboundCall : public RpcCall, public MPSCQueueEntry<InboundCall> {
 
     void Done(const Status& status) override;
 
-    virtual ~InboundCallTask() = default;
+    ~InboundCallTask() override = default;
 
    private:
     InboundCallHandler* handler_;

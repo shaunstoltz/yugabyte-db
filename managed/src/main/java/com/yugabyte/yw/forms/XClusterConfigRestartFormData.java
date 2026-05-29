@@ -1,4 +1,4 @@
-// Copyright (c) YugaByte, Inc.
+// Copyright (c) YugabyteDB, Inc.
 package com.yugabyte.yw.forms;
 
 import io.swagger.annotations.ApiModel;
@@ -31,6 +31,6 @@ public class XClusterConfigRestartFormData {
   public static class RestartBootstrapParams {
     @Constraints.Required
     @ApiModelProperty(value = "Parameters used to do Backup/restore", required = true)
-    public XClusterConfigCreateFormData.BootstrapParams.BootstarpBackupParams backupRequestParams;
+    public XClusterConfigCreateFormData.BootstrapParams.BootstrapBackupParams backupRequestParams;
   }
 }

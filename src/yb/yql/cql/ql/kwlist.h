@@ -33,9 +33,9 @@
 
 /* name, value, category */
 //
-// The following only applies to changes made to this file as part of YugaByte development.
+// The following only applies to changes made to this file as part of YugabyteDB development.
 //
-// Copyright (c) YugaByte, Inc.
+// Copyright (c) YugabyteDB, Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License"); you may not use this file except
 // in compliance with the License.  You may obtain a copy of the License at
@@ -117,6 +117,7 @@ PG_KEYWORD("conflict", CONFLICT, UNRESERVED_KEYWORD)
 PG_KEYWORD("connection", CONNECTION, UNRESERVED_KEYWORD)
 PG_KEYWORD("constraint", CONSTRAINT, RESERVED_KEYWORD)
 PG_KEYWORD("constraints", CONSTRAINTS, UNRESERVED_KEYWORD)
+PG_KEYWORD("contains", CONTAINS, UNRESERVED_KEYWORD)
 PG_KEYWORD("content", CONTENT_P, UNRESERVED_KEYWORD)
 PG_KEYWORD("continue", CONTINUE_P, UNRESERVED_KEYWORD)
 PG_KEYWORD("conversion", CONVERSION_P, UNRESERVED_KEYWORD)
@@ -380,7 +381,6 @@ PG_KEYWORD("rows", ROWS, UNRESERVED_KEYWORD)
 PG_KEYWORD("rule", RULE, UNRESERVED_KEYWORD)
 PG_KEYWORD("savepoint", SAVEPOINT, UNRESERVED_KEYWORD)
 PG_KEYWORD("schema", SCHEMA, RESERVED_KEYWORD)
-PG_KEYWORD("scheme", SCHEME, UNRESERVED_KEYWORD)
 PG_KEYWORD("scroll", SCROLL, UNRESERVED_KEYWORD)
 PG_KEYWORD("search", SEARCH, UNRESERVED_KEYWORD)
 PG_KEYWORD("second", SECOND_P, UNRESERVED_KEYWORD)

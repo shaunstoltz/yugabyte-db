@@ -3,9 +3,9 @@
 //  LICENSE file in the root directory of this source tree. An additional grant
 //  of patent rights can be found in the PATENTS file in the same directory.
 //
-// The following only applies to changes made to this file as part of YugaByte development.
+// The following only applies to changes made to this file as part of YugabyteDB development.
 //
-// Portions Copyright (c) YugaByte, Inc.
+// Portions Copyright (c) YugabyteDB, Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License"); you may not use this file except
 // in compliance with the License.  You may obtain a copy of the License at
@@ -288,6 +288,7 @@ TEST_F(DBTestCompactionFilter, CompactionFilter) {
       }
       iter->Next();
     }
+    ASSERT_OK(iter->status());
   }
   ASSERT_EQ(total, 100000);
   ASSERT_EQ(count, 1);
@@ -350,7 +351,7 @@ TEST_F(DBTestCompactionFilter, CompactionFilter) {
         db_->NewIterator(ReadOptions(), handles_[1]));
     iter->SeekToFirst();
     count = 0;
-    while (iter->Valid()) {
+    while (ASSERT_RESULT(iter->CheckedValid())) {
       count++;
       iter->Next();
     }
@@ -373,6 +374,7 @@ TEST_F(DBTestCompactionFilter, CompactionFilter) {
       count++;
       iter->Next();
     }
+    ASSERT_OK(iter->status());
     ASSERT_EQ(count, 0);
   }
 }
@@ -405,7 +407,7 @@ TEST_F(DBTestCompactionFilter, CompactionFilterDeletesAll) {
   Iterator* itr = db_->NewIterator(ReadOptions());
   itr->SeekToFirst();
   // empty db
-  ASSERT_TRUE(!itr->Valid());
+  ASSERT_TRUE(!ASSERT_RESULT(itr->CheckedValid()));
 
   delete itr;
 }
@@ -604,6 +606,7 @@ TEST_F(DBTestCompactionFilter, CompactionFilterContextManual) {
       }
       iter->Next();
     }
+    ASSERT_OK(iter->status());
     ASSERT_EQ(total, 700);
     ASSERT_EQ(count, 2);
   }
@@ -713,7 +716,7 @@ TEST_F(DBTestCompactionFilter, CompactionFilterIgnoreSnapshot) {
     std::unique_ptr<Iterator> iter(db_->NewIterator(read_options));
     iter->SeekToFirst();
     int count = 0;
-    while (iter->Valid()) {
+    while (ASSERT_RESULT(iter->CheckedValid())) {
       count++;
       iter->Next();
     }
@@ -722,7 +725,7 @@ TEST_F(DBTestCompactionFilter, CompactionFilterIgnoreSnapshot) {
     std::unique_ptr<Iterator> iter1(db_->NewIterator(read_options));
     iter1->SeekToFirst();
     count = 0;
-    while (iter1->Valid()) {
+    while (ASSERT_RESULT(iter1->CheckedValid())) {
       count++;
       iter1->Next();
     }

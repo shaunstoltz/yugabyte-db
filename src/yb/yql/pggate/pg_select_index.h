@@ -1,5 +1,5 @@
 //--------------------------------------------------------------------------------------------------
-// Copyright (c) YugaByte, Inc.
+// Copyright (c) YugabyteDB, Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License"); you may not use this file except
 // in compliance with the License.  You may obtain a copy of the License at
@@ -14,49 +14,53 @@
 
 #pragma once
 
+#include <memory>
+#include <optional>
+
+#include <boost/container/small_vector.hpp>
+
+#include "yb/util/result.h"
+#include "yb/util/slice.h"
+#include "yb/util/status.h"
+
 #include "yb/yql/pggate/pg_select.h"
+#include "yb/yql/pggate/pg_session.h"
+#include "yb/yql/pggate/pg_tools.h"
 
-namespace yb {
-namespace pggate {
-
-//--------------------------------------------------------------------------------------------------
-// SELECT FROM Secondary Index Table
-//--------------------------------------------------------------------------------------------------
+namespace yb::pggate {
 
 class PgSelectIndex : public PgSelect {
  public:
-  PgSelectIndex(PgSession::ScopedRefPtr pg_session,
-                const PgObjectId& table_id,
-                const PgObjectId& index_id,
-                const PgPrepareParameters *prepare_params,
-                bool is_region_local);
+  Result<std::optional<YbctidBatch>> FetchYbctidBatch();
 
-  // Prepare NESTED query for secondary index. This function is called when Postgres layer is
-  // accessing the IndexTable via an outer select (Sequential or primary scans)
-  Status PrepareSubquery(std::shared_ptr<LWPgsqlReadRequestPB> read_req);
+  [[nodiscard]] bool IsPgSelectIndex() const override { return true; }
 
-  Result<PgTableDescPtr> LoadTable() override;
+  static Result<std::unique_ptr<PgSelectIndex>> Make(
+      const PgSessionPtr& pg_session, const PgObjectId& index_id,
+      const YbcPgTableLocalityInfo& locality_info, bool skip_intents_read,
+      std::shared_ptr<LWPgsqlReadRequestPB>&& read_req = {});
 
-  bool UseSecondaryIndex() const override;
-
-  // The output parameter "ybctids" are pointer to the data buffer in "ybctid_batch_".
-  virtual Result<bool> FetchYbctidBatch(const std::vector<Slice> **ybctids);
-
-  // Get next batch of ybctids from either PgGate::cache or server.
-  Result<bool> GetNextYbctidBatch();
-
-  void set_is_executed(bool value) {
-    is_executed_ = value;
-  }
-
-  bool is_executed() {
-    return is_executed_;
-  }
+ protected:
+  explicit PgSelectIndex(const PgSessionPtr& pg_session);
 
  private:
-  // This secondary query should be executed just one time.
-  bool is_executed_ = false;
+  // Prepare NESTED query for secondary index. This function is called when Postgres layer is
+  // accessing the IndexTable via an outer select (Sequential or primary scans)
+  Status PrepareSubquery(
+      const PgObjectId& index_id, bool skip_intents_read,
+      std::shared_ptr<LWPgsqlReadRequestPB>&& read_req);
+
+  struct Ybctids {
+    boost::container::small_vector<Slice, 8> values;
+    DocResultYbctidRetention retention;
+
+    void Clear() {
+        values.clear();
+        retention.Clear();
+    }
+  };
+
+  Ybctids ybctids_;
 };
 
-}  // namespace pggate
-}  // namespace yb
+}  // namespace yb::pggate

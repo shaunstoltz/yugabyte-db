@@ -1,5 +1,5 @@
 /*
- * Copyright 2021 YugaByte, Inc. and Contributors
+ * Copyright 2021 YugabyteDB, Inc. and Contributors
  *
  * Licensed under the Polyform Free Trial License 1.0.0 (the "License"); you
  * may not use this file except in compliance with the License. You
@@ -28,4 +28,9 @@ public class AlertData {
 
   @ApiModelProperty(value = "Url to alert expression evaluation", accessMode = READ_ONLY)
   private String alertExpressionUrl;
+
+  @ApiModelProperty(
+      value = "Flag, which specifies if metrics link should use browser FQDN",
+      accessMode = READ_ONLY)
+  private Boolean metricsLinkUseBrowserFqdn;
 }

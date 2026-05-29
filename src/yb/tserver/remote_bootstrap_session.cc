@@ -15,9 +15,9 @@
 // specific language governing permissions and limitations
 // under the License.
 //
-// The following only applies to changes made to this file as part of YugaByte development.
+// The following only applies to changes made to this file as part of YugabyteDB development.
 //
-// Portions Copyright (c) YugaByte, Inc.
+// Portions Copyright (c) YugabyteDB, Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License"); you may not use this file except
 // in compliance with the License.  You may obtain a copy of the License at
@@ -32,8 +32,7 @@
 
 #include "yb/tserver/remote_bootstrap_session.h"
 
-#include <boost/optional.hpp>
-#include <glog/logging.h>
+#include "yb/ash/wait_state.h"
 
 #include "yb/consensus/consensus.h"
 #include "yb/consensus/log.h"
@@ -44,6 +43,7 @@
 #include "yb/gutil/type_traits.h"
 
 #include "yb/tablet/tablet.h"
+#include "yb/tablet/tablet_bootstrap_if.h"
 #include "yb/tablet/tablet_metadata.h"
 #include "yb/tablet/tablet_peer.h"
 #include "yb/tablet/tablet_snapshots.h"
@@ -51,6 +51,7 @@
 #include "yb/tserver/remote_bootstrap_snapshots.h"
 
 #include "yb/util/env_util.h"
+#include "yb/util/fault_injection.h"
 #include "yb/util/logging.h"
 #include "yb/util/size_literals.h"
 #include "yb/util/status_format.h"
@@ -60,6 +61,19 @@
 
 DECLARE_uint64(rpc_max_message_size);
 DECLARE_int64(remote_bootstrap_rate_limit_bytes_per_sec);
+DECLARE_bool(enable_flush_retryable_requests);
+
+DEFINE_test_flag(int32, rbs_sleep_after_taking_metadata_ms, 0,
+                 "Sleep after tablet metadata was taken during remote boostrap session init.");
+
+DEFINE_RUNTIME_int32(rbs_init_max_number_of_retries, 5,
+                     "Max number of retries during remote bootstrap session initialisation, "
+                     "when metadata before and after checkpoint does not match. "
+                     "0 - to disable retry logic.");
+
+DEFINE_test_flag(bool, rbs_fail_checkpoint, false,
+                 "Fail all attempts to checkpoint data when retries still exist.");
+
 
 namespace yb {
 namespace tserver {
@@ -69,15 +83,11 @@ using std::vector;
 using std::string;
 
 using consensus::MinimumOpId;
-using consensus::PeerMemberType;
-using consensus::RaftPeerPB;
-using log::LogAnchorRegistry;
-using log::ReadableLogSegment;
 using strings::Substitute;
-using tablet::RaftGroupMetadata;
 using tablet::RaftGroupMetadataPtr;
 using tablet::TabletPeer;
-using tablet::RaftGroupReplicaSuperBlockPB;
+
+const std::string kRetryableRequestsFileName = "retryable_requests";
 
 RemoteBootstrapSession::RemoteBootstrapSession(
     const std::shared_ptr<TabletPeer>& tablet_peer, std::string session_id,
@@ -93,101 +103,44 @@ RemoteBootstrapSession::RemoteBootstrapSession(
 }
 
 RemoteBootstrapSession::~RemoteBootstrapSession() {
-  if (rbs_anchor_client_) {
-    WARN_NOT_OK(
-        rbs_anchor_client_->UnregisterLogAnchor(),
-        Format("Couldn't delete log anchor session $0", session_id_));
-  }
+  WARN_NOT_OK(UnregisterRemotelogAnchor(),
+              Format("$0Couldn't unregister remote log anchor session", LogPrefix()));
 
   // No lock taken in the destructor, should only be 1 thread with access now.
   CHECK_OK(UnregisterAnchorIfNeededUnlocked());
-
-  // Delete checkpoint directory.
-  if (!checkpoint_dir_.empty()) {
-    auto s = env()->DeleteRecursively(checkpoint_dir_);
-    if (!s.ok()) {
-      LOG(WARNING) << "Unable to delete checkpoint directory " << checkpoint_dir_;
-    } else {
-      LOG(INFO) << "Successfully deleted checkpoint directory " << checkpoint_dir_;
-    }
-  } else {
-    LOG(INFO) << "No checkpoint directory was created for this session";
-  }
-
-}
-
-Status RemoteBootstrapSession::ChangeRole() {
-  CHECK(Succeeded());
-
-  LOG(INFO) << "Attempting to ChangeRole for peer " << requestor_uuid_ << " in bootstrap session "
-            << session_id_;
-  return rbs_anchor_client_ ? rbs_anchor_client_->ChangePeerRole()
-                            : tablet_peer_->ChangeRole(requestor_uuid_);
+  RemoveCheckpointDir();
 }
 
 Status RemoteBootstrapSession::SetInitialCommittedState() {
-  shared_ptr <consensus::Consensus> consensus = tablet_peer_->shared_consensus();
-  if (!consensus) {
-    tablet::RaftGroupStatePB tablet_state = tablet_peer_->state();
-    return STATUS(IllegalState,
-                  Substitute("Unable to initialize remote bootstrap session "
-                             "for tablet $0. Consensus is not available. Tablet state: $1 ($2)",
-                             tablet_peer_->tablet_id(), tablet::RaftGroupStatePB_Name(tablet_state),
-                             tablet_state));
-  }
+  auto consensus = VERIFY_RESULT_PREPEND(
+      tablet_peer_->GetConsensus(), "Unable to initialize remote bootstrap session");
   initial_committed_cstate_ = consensus->ConsensusState(consensus::CONSENSUS_CONFIG_COMMITTED);
   return Status::OK();
 }
 
-Result<google::protobuf::RepeatedPtrField<tablet::FilePB>> ListFiles(const std::string& dir) {
-  std::vector<std::string> files;
-  auto env = Env::Default();
-  auto status = env->GetChildren(dir, ExcludeDots::kTrue, &files);
-  if (!status.ok()) {
-    return STATUS(IllegalState, Substitute("Unable to get RocksDB files in dir $0: $1", dir,
-                                           status.ToString()));
-  }
-
-  google::protobuf::RepeatedPtrField<tablet::FilePB> result;
-  result.Reserve(narrow_cast<int>(files.size()));
-  for (const auto& file : files) {
-    auto full_path = JoinPathSegments(dir, file);
-    if (VERIFY_RESULT(env->IsDirectory(full_path))) {
-      auto sub_files = VERIFY_RESULT(ListFiles(full_path));
-      for (auto& subfile : sub_files) {
-        subfile.set_name(JoinPathSegments(file, subfile.name()));
-        *result.Add() = std::move(subfile);
-      }
-      continue;
-    }
-    auto file_pb = result.Add();
-    file_pb->set_name(file);
-    file_pb->set_size_bytes(VERIFY_RESULT(env->GetFileSize(full_path)));
-    file_pb->set_inode(VERIFY_RESULT(env->GetFileINode(full_path)));
-  }
-
-  return result;
-}
-
 const std::string RemoteBootstrapSession::kCheckpointsDir = "checkpoints";
 
-Status RemoteBootstrapSession::Init() {
+Status RemoteBootstrapSession::InitSnapshotTransferSession() {
   // Take locks to support re-initialization of the same session.
-  std::lock_guard<std::mutex> lock(mutex_);
-  RETURN_NOT_OK(UnregisterAnchorIfNeededUnlocked());
+  std::lock_guard lock(mutex_);
 
-  const string& tablet_id = tablet_peer_->tablet_id();
+  RETURN_NOT_OK(ReadSuperblockFromDisk());
+  RETURN_NOT_OK(GetRunningTablet());
+  RETURN_NOT_OK(InitSources());
 
-  // Prevent log GC while we grab log segments and Tablet metadata.
-  string anchor_owner_token = Substitute("RemoteBootstrap-$0", session_id_);
-  tablet_peer_->log_anchor_registry()->Register(
-      MinimumOpId().index(), anchor_owner_token, &log_anchor_);
+  start_time_ = MonoTime::Now();
 
+  return Status::OK();
+}
+
+Result<OpId> RemoteBootstrapSession::CreateSnapshot(int retry) {
   // Read the SuperBlock from disk.
-  const RaftGroupMetadataPtr& metadata = tablet_peer_->tablet_metadata();
-  RETURN_NOT_OK_PREPEND(metadata->ReadSuperBlockFromDisk(&tablet_superblock_),
-                        Substitute("Unable to access superblock for tablet $0",
-                                   tablet_id));
+  RETURN_NOT_OK(ReadSuperblockFromDisk());
+  if (retry == 0 && FLAGS_TEST_rbs_sleep_after_taking_metadata_ms > 0) {
+    LOG(INFO) << "TEST: Sleeping after taking tablet metadata";
+    std::this_thread::sleep_for(
+        std::chrono::milliseconds(FLAGS_TEST_rbs_sleep_after_taking_metadata_ms));
+  }
 
   if (!tablet_peer_->log_available()) {
     return STATUS(IllegalState, "Tablet is not running (log is uninitialized)");
@@ -195,10 +148,7 @@ Status RemoteBootstrapSession::Init() {
   // Get the latest opid in the log at this point in time so we can re-anchor.
   auto last_logged_opid = tablet_peer_->GetLatestLogEntryOpId();
 
-  auto tablet = tablet_peer_->shared_tablet();
-  if (PREDICT_FALSE(!tablet)) {
-    return STATUS(IllegalState, "Tablet is not running");
-  }
+  auto tablet = VERIFY_RESULT(GetRunningTablet());
 
   MonoTime now = MonoTime::Now();
   auto* kv_store = tablet_superblock_.mutable_kv_store();
@@ -210,23 +160,189 @@ Status RemoteBootstrapSession::Init() {
   // Clear any previous RocksDB files in the superblock. Each session should create a new list
   // based the checkpoint directory files.
   kv_store->clear_rocksdb_files();
-  auto status = tablet->snapshots().CreateCheckpoint(checkpoint_dir_);
+  auto status = tablet->snapshots().CreateCheckpoint(checkpoint_dir_,
+      tablet::CreateCheckpointIn::kSubDir,
+      tablet::TabletSnapshots::UseTryLock::kTrue);
   if (status.ok()) {
-    *kv_store->mutable_rocksdb_files() = VERIFY_RESULT(ListFiles(checkpoint_dir_));
+    auto max_retries = FLAGS_rbs_init_max_number_of_retries;
+    if (max_retries != 0) {
+      tablet::RaftGroupReplicaSuperBlockPB new_superblock;
+      RETURN_NOT_OK(ReadSuperblockFromDisk(&new_superblock));
+      if (AsString(tablet_superblock_) != AsString(new_superblock)) {
+        auto msg = "Metadata changed while creating checkpoint";
+        status = retry >= max_retries ? STATUS(IllegalState, msg) : STATUS(TryAgain, msg);
+        LOG(INFO) << status;
+        return status;
+      }
+      if (PREDICT_FALSE(FLAGS_TEST_rbs_fail_checkpoint) && retry + 1 < max_retries) {
+        LOG_AND_RETURN(WARNING, STATUS_FORMAT(TryAgain, "FLAGS_TEST_rbs_fail_checkpoint set"));
+      }
+    }
+
+    *kv_store->mutable_rocksdb_files() = VERIFY_RESULT(tablet::ListFiles(checkpoint_dir_));
   } else if (!status.IsNotSupported()) {
     RETURN_NOT_OK(status);
   }
 
-  for (const auto& source : sources_) {
-    if (source) {
-      RETURN_NOT_OK(source->Init());
+  return last_logged_opid;
+}
+
+void RemoteBootstrapSession::RemoveCheckpointDir() {
+  // Delete checkpoint directory.
+  if (checkpoint_dir_.empty()) {
+    LOG(INFO) << "No checkpoint directory was created for this session";
+    return;
+  }
+  auto s = env()->DeleteRecursively(checkpoint_dir_);
+  if (!s.ok()) {
+    LOG(WARNING) << Format("Unable to delete checkpoint directory $0: $1", checkpoint_dir_, s);
+    return;
+  }
+  LOG(INFO) << "Successfully deleted checkpoint directory " << checkpoint_dir_;
+}
+
+Status RemoteBootstrapSession::InitBootstrapSession() {
+  // Take locks to support re-initialization of the same session.
+  std::lock_guard lock(mutex_);
+  RETURN_NOT_OK(UnregisterAnchorIfNeededUnlocked());
+
+  // Determine the earliest WAL op index that the source still needs to retain. This is the same
+  // predicate Log::GC() consults: any segment that GC would consider for deletion is already
+  // covered by RocksDB SSTs (or other persistent state) and therefore redundant once the
+  // destination installs the checkpoint. We must compute this BEFORE registering our own log
+  // anchor, because the registry-based GetEarliestRegisteredLogIndex() floor inside
+  // GetEarliestNeededLogIndex() would otherwise pin the result to whatever value we register at.
+  const int64_t rbs_min_op_idx = VERIFY_RESULT(tablet_peer_->GetEarliestNeededLogIndex());
+
+  // Prevent log GC from going below rbs_min_op_idx while we grab log segments and tablet
+  // metadata. Pre-fix this code path did Register(MinimumOpId().index() = 0) here and later
+  // UpdateRegistration'd to the first kept segment's min_replicate_index; because the pre-fix
+  // path also kept every on-disk segment, that subsequent bump landed at the oldest on-disk
+  // segment's minimum, effectively pinning GC at the bottom of the log for the duration of the
+  // session. On a slow or repeatedly-retried RBS the same source would then accumulate more and
+  // more redundant segments behind that anchor, forming a vicious cycle in which each new RBS
+  // attempt had to ship strictly more data than the last. Registering at rbs_min_op_idx (the
+  // earliest op index any consumer still needs) breaks that cycle: GC can continue reclaiming
+  // everything strictly below this floor while the session is alive.
+  string anchor_owner_token = Substitute("RemoteBootstrap-$0", session_id_);
+  tablet_peer_->log_anchor_registry()->Register(
+      rbs_min_op_idx, anchor_owner_token, &log_anchor_);
+
+  OpId last_logged_opid;
+  for (int retry = 0;; ++retry) {
+    auto res = CreateSnapshot(retry);
+    if (res.ok()) {
+      last_logged_opid = *res;
+      break;
+    }
+    RemoveCheckpointDir();
+    if (!res.status().IsTryAgain()) {
+      return res.status();
     }
   }
 
-  // Get the current segments from the log, including the active segment.
-  // The Log doesn't add the active segment to the log reader's list until
-  // a header has been written to it (but it will not have a footer).
+  // When the current peer is a follower and is serving rbs, make the leader anchor its log at
+  // the last_logged_opid of the current peer. Since all data until that index will anyways be
+  // served by this peer, we need not register the anchor at a preceeding index.
+  remote_log_anchor_index_ = last_logged_opid.index;
+  RETURN_NOT_OK(RegisterRemoteLogAnchorUnlocked());
+
+  std::optional<OpId> min_synced_op_id;
+  // Copy the retryable requests if it exists.
+  if (FLAGS_enable_flush_retryable_requests) {
+    Status s = tablet_peer_->FlushBootstrapState();
+    if (s.ok() || s.IsAlreadyPresent()) {
+      retryable_requests_filepath_ = JoinPathSegments(checkpoint_dir_, kRetryableRequestsFileName);
+      auto copy_result = tablet_peer_->CopyBootstrapStateTo(*retryable_requests_filepath_);
+      if (!copy_result.ok()) {
+        LOG(WARNING) << "Copy retryable requests failed: " << s;
+        retryable_requests_filepath_.reset();
+      } else {
+        min_synced_op_id = *copy_result;
+      }
+    } else {
+      LOG(WARNING) << "Remote bootstrap session: flush retryable requests failed: " << s;
+    }
+  }
+
+  RETURN_NOT_OK(InitSources());
+
+  // It's possible that the wal segment is not synced and the retryable requests file
+  // is newer than the data of wal file downloaded by remote peer. The remote peer will
+  // reject newer ops that covered by retryable requests but not in the wal segment by
+  // incorrectly detect them as duplicate.
+  if (min_synced_op_id) {
+    auto log_msg = Format("wait for OP($0) to be synced", *min_synced_op_id);
+    LOG(INFO) << "Start to " << log_msg;
+    auto wait_result = tablet_peer_->log()->WaitForSafeOpIdToApply(*min_synced_op_id);
+    if (wait_result.empty()) {
+      return STATUS_FORMAT(TimedOut, "Failed to $0", log_msg);
+    }
+  }
+
+  // Get the current segments from the log, including the active segment. The Log doesn't add the
+  // active segment to the log reader's list until a header has been written to it (but it will
+  // not have a footer).
   RETURN_NOT_OK(tablet_peer_->log()->GetSegmentsSnapshot(&log_segments_));
+
+  // Compute the contiguous prefix of segments that the destination does not need directly from
+  // the local `log_segments_` snapshot, instead of re-querying Log::GetSegmentsToGC. Driving the
+  // trim off the frozen snapshot we just took eliminates a race with the GC thread: between
+  // GetSegmentsSnapshot and a second call back into Log, GC could physically reclaim a segment
+  // below rbs_min_op_idx (allowed by our anchor, which only pins at rbs_min_op_idx and above).
+  // The two calls would then disagree about which segments exist, num_to_skip would under-count,
+  // log_segments_ would retain references to a segment whose file is gone, and the destination's
+  // later FetchData would hit WAL_SEGMENT_NOT_FOUND -- the exact vicious-cycle symptom this fix
+  // is meant to break.
+  //
+  // The predicate below mirrors the index-based portion of LogReader::GetSegmentPrefixNotIncluding
+  // (stop at the active footer-less segment; stop at the first segment that still contains entries
+  // we need). The xCluster/CDC/time/min-segments retention bumps that Log::GetSegmentsToGC layers
+  // on top are source-side retention concerns; segments strictly below rbs_min_op_idx are by
+  // definition unneeded by the destination regardless of those source-side policies, so we omit
+  // them here.
+  size_t num_to_skip = 0;
+  for (const auto& segment : log_segments_) {
+    if (!segment->HasFooter()) {
+      break;
+    }
+    if (segment->footer().max_replicate_index() >= rbs_min_op_idx) {
+      break;
+    }
+    ++num_to_skip;
+  }
+
+  // When lazy superblock flush is enabled on this tablet (currently colocated tables only),
+  // local bootstrap on the destination needs to replay at least
+  // kMinSegmentsToReplayWithLazySuperblockFlush trailing WAL segments to pick up
+  // committed-but-unflushed CHANGE_METADATA_OPs. GetEarliestNeededLogIndex already accounts
+  // for the actual MinUnflushedChangeMetadataOpId, but bound num_to_skip defensively so the
+  // destination always receives at least min(K, log_segments_.size()) trailing segments. The
+  // min() handles the case where the source itself has fewer than K segments -- e.g. the brief
+  // window during a segment rollover where the new active segment has been allocated and given
+  // a footer-less old active, but the new active has not yet been registered with LogReader
+  // via AppendEmptySegment -- by shipping everything we have rather than letting the snapshot
+  // scan trim further. See the long comment around kMinSegmentsToReplayWithLazySuperblockFlush
+  // in tablet_bootstrap.cc.
+  if (tablet_peer_->tablet_metadata()->IsLazySuperblockFlushEnabled()) {
+    const size_t min_segments_to_keep = std::min(
+        tablet::kMinSegmentsToReplayWithLazySuperblockFlush, log_segments_.size());
+    num_to_skip = std::min(num_to_skip, log_segments_.size() - min_segments_to_keep);
+  }
+
+  LOG_WITH_PREFIX(INFO)
+      << "Computed WAL segments to ship: keeping=" << log_segments_.size() - num_to_skip
+      << " (skipping " << num_to_skip << " of " << log_segments_.size()
+      << " on-disk segments below earliest-needed op index " << rbs_min_op_idx
+      << ", lazy_sb_flush="
+      << tablet_peer_->tablet_metadata()->IsLazySuperblockFlushEnabled()
+      << ", last_logged_opid=" << last_logged_opid << ")";
+
+  while (!log_segments_.empty() && num_to_skip) {
+    RETURN_NOT_OK(log_segments_.pop_front());
+    num_to_skip--;
+  }
+
   log_anchor_index_ = last_logged_opid.index;
   for (const auto& log_segment : log_segments_) {
     if (log_segment->HasFooter() && log_segment->footer().has_min_replicate_index()) {
@@ -235,11 +351,6 @@ Status RemoteBootstrapSession::Init() {
     }
   }
 
-  if (rbs_anchor_client_) {
-    RETURN_NOT_OK(rbs_anchor_client_->RegisterLogAnchor(
-        tablet_peer_->tablet_id(), last_logged_opid));
-    rbs_anchor_session_created_ = true;
-  }
   // Re-anchor on the highest OpId that was in the log right before we
   // snapshotted the log segments. This helps ensure that we don't end up in a
   // remote bootstrap loop due to a follower falling too far behind the
@@ -374,6 +485,8 @@ Status RemoteBootstrapSession::ValidateDataId(const yb::tserver::DataIdPB& data_
             data_id.ShortDebugString());
       }
       return Status::OK();
+    case DataIdPB::RETRYABLE_REQUESTS:
+      return Status::OK();
     case DataIdPB::SNAPSHOT_FILE: FALLTHROUGH_INTENDED;
     case DataIdPB::UNKNOWN:
       return STATUS(InvalidArgument, "Type not supported", data_id.ShortDebugString());
@@ -382,6 +495,7 @@ Status RemoteBootstrapSession::ValidateDataId(const yb::tserver::DataIdPB& data_
 }
 
 Status RemoteBootstrapSession::GetDataPiece(const DataIdPB& data_id, GetDataPieceInfo* info) {
+  SCOPED_WAIT_STATUS(RemoteBootstrap_ReadDataFromFile);
   const auto& source = sources_[data_id.type()];
 
   if (source) {
@@ -407,6 +521,12 @@ Status RemoteBootstrapSession::GetDataPiece(const DataIdPB& data_id, GetDataPiec
                             "Unable to get piece of RocksDB file");
       break;
     }
+    case DataIdPB::RETRYABLE_REQUESTS: {
+      // Fetching the retryable requests file (may be abscent).
+      RETURN_NOT_OK_PREPEND(GetRetryableRequestsFilePiece(info),
+                            "Unable to get piece of retryable requests file");
+      break;
+    }
     default:
       info->error_code = RemoteBootstrapErrorPB::INVALID_REMOTE_BOOTSTRAP_REQUEST;
       return STATUS_SUBSTITUTE(InvalidArgument, "Invalid request type $0", data_id.type());
@@ -421,7 +541,7 @@ Status RemoteBootstrapSession::GetDataPiece(const DataIdPB& data_id, GetDataPiec
 Status RemoteBootstrapSession::GetLogSegmentPiece(uint64_t segment_seqno, GetDataPieceInfo* info) {
   std::shared_ptr<RandomAccessFile> file;
   {
-    std::lock_guard<std::mutex> lock(mutex_);
+    std::lock_guard lock(mutex_);
     if (opened_log_segment_seqno_ != segment_seqno) {
       RETURN_NOT_OK(OpenLogSegment(segment_seqno, &info->error_code));
     }
@@ -439,6 +559,13 @@ Status RemoteBootstrapSession::GetLogSegmentPiece(uint64_t segment_seqno, GetDat
 Status RemoteBootstrapSession::GetRocksDBFilePiece(
     const std::string& file_name, GetDataPieceInfo* info) {
   return GetFilePiece(checkpoint_dir_, file_name, env(), info);
+}
+
+Status RemoteBootstrapSession::GetRetryableRequestsFilePiece(GetDataPieceInfo* info) {
+  if (!retryable_requests_filepath_.has_value()) {
+    return Status::OK();
+  }
+  return GetFilePiece(checkpoint_dir_, kRetryableRequestsFileName, env(), info);
 }
 
 Status RemoteBootstrapSession::GetFilePiece(
@@ -485,13 +612,43 @@ static Status AddImmutableFileToMap(Collection* const cache,
   return Status::OK();
 }
 
+Status RemoteBootstrapSession::ReadSuperblockFromDisk(tablet::RaftGroupReplicaSuperBlockPB* out) {
+  const string& tablet_id = tablet_peer_->tablet_id();
+
+  // Read the SuperBlock from disk.
+  const RaftGroupMetadataPtr& metadata = tablet_peer_->tablet_metadata();
+  RETURN_NOT_OK(metadata->Flush(tablet::OnlyIfDirty::kTrue));
+  RETURN_NOT_OK_PREPEND(
+      metadata->ReadSuperBlockFromDisk(out ? out : &tablet_superblock_),
+      Substitute("Unable to access superblock for tablet $0", tablet_id));
+
+  return Status::OK();
+}
+
+Result<tablet::TabletPtr> RemoteBootstrapSession::GetRunningTablet() {
+  auto tablet = tablet_peer_->shared_tablet_maybe_null();
+  if (PREDICT_FALSE(!tablet)) {
+    return STATUS(IllegalState, "Tablet is not running");
+  }
+  return tablet;
+}
+
+Status RemoteBootstrapSession::InitSources() {
+  for (const auto& source : sources_) {
+    if (source) {
+      RETURN_NOT_OK(source->Init());
+    }
+  }
+  return Status::OK();
+}
+
 Status RemoteBootstrapSession::OpenLogSegment(
     uint64_t segment_seqno, RemoteBootstrapErrorPB::Code* error_code) {
   auto active_seqno = tablet_peer_->log()->active_segment_sequence_number();
   auto log_segment_result = tablet_peer_->log()->GetSegmentBySequenceNumber(segment_seqno);
   // Usually active log segment is extended, while sent of the wire. So we cannot send next segment,
   // Otherwise entries at end of previously active log segment could be missing.
-  if (opened_log_segment_active_) {
+  if (opened_log_segment_active_ && segment_seqno != opened_log_segment_seqno_) {
     *error_code = RemoteBootstrapErrorPB::WAL_SEGMENT_NOT_FOUND;
     return STATUS_FORMAT(NotFound, "Already sent active log segment, don't send $0", segment_seqno);
   }
@@ -511,19 +668,17 @@ Status RemoteBootstrapSession::OpenLogSegment(
       log_segment->footer().min_replicate_index() > log_anchor_index_) {
     log_anchor_index_ = log_segment->footer().min_replicate_index();
 
-    // Update log anchor on the tablet leader side
-    if (rbs_anchor_client_) {
-      // return if the tablet leader is not able to anchor on the opid
-      RETURN_NOT_OK(rbs_anchor_client_->UpdateLogAnchorAsync(
-          OpId(tablet_peer_->LeaderTerm(), log_anchor_index_)));
-    }
-
     // Update log anchor, since we don't need older logs anymore.
     auto status = tablet_peer_->log_anchor_registry()->UpdateRegistration(
         log_anchor_index_, &log_anchor_);
     if (!status.ok()) {
       *error_code = RemoteBootstrapErrorPB::UNKNOWN_ERROR;
       return status;
+    }
+    // Update remote log anchor on the leader when the current peer serving rbs is a follower.
+    if (log_anchor_index_ > remote_log_anchor_index_) {
+      remote_log_anchor_index_ = log_anchor_index_;
+      RETURN_NOT_OK(UpdateRemoteLogAnchorUnlocked());
     }
   }
 
@@ -535,12 +690,16 @@ Status RemoteBootstrapSession::UnregisterAnchorIfNeededUnlocked() {
 }
 
 void RemoteBootstrapSession::SetSuccess() {
-  std::lock_guard<std::mutex> lock(mutex_);
+  std::lock_guard lock(mutex_);
   succeeded_ = true;
+  // Can early clear the checkpoints dir since the session already succeeded (data sent to client),
+  // and we don't need the snapshot anymore. In case of failure, the session is removed right away
+  // which would anyways clear the checkpoints dir.
+  RemoveCheckpointDir();
 }
 
 bool RemoteBootstrapSession::Succeeded() {
-  std::lock_guard<std::mutex> lock(mutex_);
+  std::lock_guard lock(mutex_);
   return succeeded_;
 }
 
@@ -552,7 +711,7 @@ void RemoteBootstrapSession::EnsureRateLimiterIsInitialized() {
 
 Status RemoteBootstrapSession::RefreshRemoteLogAnchorSessionAsync() {
   if (rbs_anchor_client_ && rbs_anchor_session_created_) {
-    RETURN_NOT_OK(rbs_anchor_client_->KeepLogAnchorAliveAsync());
+    RETURN_NOT_OK(rbs_anchor_client_->KeepLogAnchorAliveAsync(Succeeded()));
   }
   return Status::OK();
 }
@@ -563,9 +722,9 @@ void RemoteBootstrapSession::InitRateLimiter() {
     rate_limiter_.SetTargetRateUpdater([this]() -> uint64_t {
       DCHECK_GT(FLAGS_remote_bootstrap_rate_limit_bytes_per_sec, 0);
       if (FLAGS_remote_bootstrap_rate_limit_bytes_per_sec <= 0) {
-        YB_LOG_EVERY_N(ERROR, 1000)
-          << "Invalid value for remote_bootstrap_rate_limit_bytes_per_sec: "
-          << FLAGS_remote_bootstrap_rate_limit_bytes_per_sec;
+        YB_LOG_EVERY_N(WARNING, 1000)
+            << "Invalid value for remote_bootstrap_rate_limit_bytes_per_sec: "
+            << FLAGS_remote_bootstrap_rate_limit_bytes_per_sec;
         // Since the rate limiter is initialized, it's expected that the value of
         // FLAGS_remote_bootstrap_rate_limit_bytes_per_sec is greater than 0. Since this is not the
         // case, we'll log an error, and set the rate to 50 MB/s.
@@ -581,6 +740,32 @@ void RemoteBootstrapSession::InitRateLimiter() {
     });
   }
   rate_limiter_.Init();
+}
+
+Status RemoteBootstrapSession::RegisterRemoteLogAnchorUnlocked() {
+  if (rbs_anchor_client_) {
+    VLOG_WITH_PREFIX_AND_FUNC(4) << "index=" << remote_log_anchor_index_;
+    RETURN_NOT_OK(rbs_anchor_client_->RegisterLogAnchor(
+        tablet_peer_->tablet_id(), remote_log_anchor_index_, succeeded_));
+    rbs_anchor_session_created_ = true;
+  }
+  return Status::OK();
+}
+
+Status RemoteBootstrapSession::UpdateRemoteLogAnchorUnlocked() {
+  if (rbs_anchor_client_) {
+    VLOG_WITH_PREFIX_AND_FUNC(4) << "index=" << remote_log_anchor_index_;
+    RETURN_NOT_OK(rbs_anchor_client_->UpdateLogAnchorAsync(remote_log_anchor_index_, succeeded_));
+  }
+  return Status::OK();
+}
+
+Status RemoteBootstrapSession::UnregisterRemotelogAnchor() {
+  if (rbs_anchor_client_) {
+    VLOG_WITH_PREFIX_AND_FUNC(4);
+    RETURN_NOT_OK(rbs_anchor_client_->UnregisterLogAnchor());
+  }
+  return Status::OK();
 }
 
 } // namespace tserver

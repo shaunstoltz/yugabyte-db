@@ -3,9 +3,9 @@
 //  LICENSE file in the root directory of this source tree. An additional grant
 //  of patent rights can be found in the PATENTS file in the same directory.
 //
-// The following only applies to changes made to this file as part of YugaByte development.
+// The following only applies to changes made to this file as part of YugabyteDB development.
 //
-// Portions Copyright (c) YugaByte, Inc.
+// Portions Copyright (c) YugabyteDB, Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License"); you may not use this file except
 // in compliance with the License.  You may obtain a copy of the License at
@@ -25,6 +25,8 @@
 
 #include <algorithm>
 #include <chrono>
+
+#include "yb/gutil/sysinfo.h"
 
 #include "yb/rocksdb/port/sys_time.h"
 #include "yb/rocksdb/rate_limiter.h"
@@ -159,6 +161,8 @@ class MemFile {
     return modified_time_;
   }
 
+  const std::string& filename() const { return fn_; }
+
  private:
   uint64_t Now() {
     int64_t unix_time;
@@ -291,11 +295,13 @@ class MockWritableFile : public WritableFile {
   }
   Status Close() override { return file_->Fsync(); }
 
-  Status Flush() override { return Status::OK(); }
+  Status Flush(FlushMode mode) override { return Status::OK(); }
 
   Status Sync() override { return file_->Fsync(); }
 
-  uint64_t GetFileSize() override { return file_->Size(); }
+  uint64_t Size() const override { return file_->Size(); }
+
+  const std::string& filename() const override { return file_->filename(); }
 
  private:
   inline size_t RequestToken(size_t bytes) {
@@ -699,6 +705,11 @@ uint64_t MockEnv::NowMicros() {
 
 uint64_t MockEnv::NowNanos() {
   return EnvWrapper::NowNanos() + fake_sleep_micros_.load() * 1000;
+}
+
+uint64_t MockEnv::NowCpuCycles() {
+  return EnvWrapper::NowCpuCycles() + fake_sleep_micros_.load() * base::CyclesPerSecond() /
+                                          UnitsInSecond(TimeResolution::kMicros);
 }
 
 // Non-virtual functions, specific to MockEnv

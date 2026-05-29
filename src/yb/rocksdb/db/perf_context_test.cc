@@ -3,9 +3,9 @@
 //  LICENSE file in the root directory of this source tree. An additional grant
 //  of patent rights can be found in the PATENTS file in the same directory.
 //
-// The following only applies to changes made to this file as part of YugaByte development.
+// The following only applies to changes made to this file as part of YugabyteDB development.
 //
-// Portions Copyright (c) YugaByte, Inc.
+// Portions Copyright (c) YugabyteDB, Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License"); you may not use this file except
 // in compliance with the License.  You may obtain a copy of the License at
@@ -103,10 +103,12 @@ TEST_F(PerfContextTest, SeekIntoDeletion) {
     std::string value;
 
     perf_context.Reset();
-    StopWatchNano timer(Env::Default());
-    timer.Start();
-    auto status = db->Get(read_options, key, &value);
-    auto elapsed_nanos = timer.ElapsedNanos();
+    uint64_t elapsed_nanos;
+    Status status;
+    {
+      StopWatchNano timer(Env::Default(), &elapsed_nanos);
+      status = db->Get(read_options, key, &value);
+    }
     ASSERT_TRUE(status.IsNotFound());
     hist_get.Add(perf_context.user_key_comparison_count);
     hist_get_time.Add(elapsed_nanos);
@@ -122,10 +124,13 @@ TEST_F(PerfContextTest, SeekIntoDeletion) {
     std::unique_ptr<Iterator> iter(db->NewIterator(read_options));
 
     perf_context.Reset();
-    StopWatchNano timer(Env::Default(), true);
-    iter->SeekToFirst();
+    uint64_t elapsed_nanos;
+    {
+      StopWatchNano timer(Env::Default(), &elapsed_nanos);
+      iter->SeekToFirst();
+    }
     hist_seek_to_first.Add(perf_context.user_key_comparison_count);
-    auto elapsed_nanos = timer.ElapsedNanos();
+    ASSERT_TRUE(ASSERT_RESULT(iter->CheckedValid()));
 
     if (FLAGS_verbose) {
       std::cout << "SeekToFirst uesr key comparison: \n"
@@ -144,9 +149,12 @@ TEST_F(PerfContextTest, SeekIntoDeletion) {
     std::string key = "k" + ToString(i);
 
     perf_context.Reset();
-    StopWatchNano timer(Env::Default(), true);
-    iter->Seek(key);
-    auto elapsed_nanos = timer.ElapsedNanos();
+    uint64_t elapsed_nanos;
+    {
+      StopWatchNano timer(Env::Default(), &elapsed_nanos);
+      iter->Seek(key);
+    }
+    ASSERT_TRUE(ASSERT_RESULT(iter->CheckedValid()));
     hist_seek.Add(perf_context.user_key_comparison_count);
     if (FLAGS_verbose) {
       std::cout << "seek cmp: " << perf_context.user_key_comparison_count
@@ -157,57 +165,34 @@ TEST_F(PerfContextTest, SeekIntoDeletion) {
     }
 
     perf_context.Reset();
-    ASSERT_TRUE(iter->Valid());
-    StopWatchNano timer2(Env::Default(), true);
-    iter->Next();
-    auto elapsed_nanos2 = timer2.ElapsedNanos();
+    {
+      StopWatchNano timer(Env::Default(), &elapsed_nanos);
+      iter->Next();
+    }
+    ASSERT_OK(ResultToStatus(iter->CheckedValid()));
     if (FLAGS_verbose) {
       std::cout << "next cmp: " << perf_context.user_key_comparison_count
-                << "elapsed: " << elapsed_nanos2 << "ns\n";
+                << "elapsed: " << elapsed_nanos << "ns\n";
     }
   }
 
   if (FLAGS_verbose) {
-    std::cout << "Seek uesr key comparison: \n" << hist_seek.ToString();
-  }
-}
-
-TEST_F(PerfContextTest, StopWatchNanoOverhead) {
-  // profile the timer cost by itself!
-  const int kTotalIterations = 1000000;
-  std::vector<uint64_t> timings(kTotalIterations);
-
-  StopWatchNano timer(Env::Default(), true);
-  for (auto& timing : timings) {
-    timing = timer.ElapsedNanos(true /* reset */);
-  }
-
-  HistogramImpl histogram;
-  for (const auto timing : timings) {
-    histogram.Add(timing);
-  }
-
-  if (FLAGS_verbose) {
-    std::cout << histogram.ToString();
+    std::cout << "Seek user key comparison: \n" << hist_seek.ToString();
   }
 }
 
 TEST_F(PerfContextTest, StopWatchOverhead) {
   // profile the timer cost by itself!
   const int kTotalIterations = 1000000;
-  uint64_t elapsed = 0;
   std::vector<uint64_t> timings(kTotalIterations);
 
-  StopWatch timer(Env::Default(), nullptr, 0, &elapsed);
   for (auto& timing : timings) {
-    timing = elapsed;
+    StopWatchNano timer(Env::Default(), &timing);
   }
 
   HistogramImpl histogram;
-  uint64_t prev_timing = 0;
   for (const auto timing : timings) {
-    histogram.Add(timing - prev_timing);
-    prev_timing = timing;
+    histogram.Add(timing);
   }
 
   if (FLAGS_verbose) {
@@ -504,15 +489,16 @@ TEST_F(PerfContextTest, SeekKeyComparison) {
   HistogramImpl hist_time_diff;
 
   SetPerfLevel(PerfLevel::kEnableTime);
-  StopWatchNano timer(Env::Default());
   for (const int i : keys) {
     std::string key = "k" + ToString(i);
     std::string value = "v" + ToString(i);
 
     perf_context.Reset();
-    timer.Start();
-    ASSERT_OK(db->Put(write_options, key, value));
-    auto put_time = timer.ElapsedNanos();
+    uint64_t put_time;
+    {
+      StopWatchNano timer(Env::Default(), &put_time);
+      ASSERT_OK(db->Put(write_options, key, value));
+    }
     hist_put_time.Add(put_time);
     hist_wal_time.Add(perf_context.write_wal_time);
     hist_time_diff.Add(put_time - perf_context.write_wal_time);
@@ -534,13 +520,13 @@ TEST_F(PerfContextTest, SeekKeyComparison) {
     std::unique_ptr<Iterator> iter(db->NewIterator(read_options));
     perf_context.Reset();
     iter->Seek(key);
-    ASSERT_TRUE(iter->Valid());
+    ASSERT_TRUE(ASSERT_RESULT(iter->CheckedValid()));
     ASSERT_EQ(iter->value().ToString(), value);
     hist_seek.Add(perf_context.user_key_comparison_count);
   }
 
   std::unique_ptr<Iterator> iter(db->NewIterator(read_options));
-  for (iter->SeekToFirst(); iter->Valid();) {
+  for (iter->SeekToFirst(); ASSERT_RESULT(iter->CheckedValid());) {
     perf_context.Reset();
     iter->Next();
     hist_next.Add(perf_context.user_key_comparison_count);
@@ -621,26 +607,26 @@ int main(int argc, char** argv) {
     char junk;
 
     if (sscanf(argv[i], "--write_buffer_size=%d%c", &n, &junk) == 1) {
-      FLAGS_write_buffer_size = n;
+      ANNOTATE_UNPROTECTED_WRITE(FLAGS_write_buffer_size) = n;
     }
 
     if (sscanf(argv[i], "--total_keys=%d%c", &n, &junk) == 1) {
-      FLAGS_total_keys = n;
+      ANNOTATE_UNPROTECTED_WRITE(FLAGS_total_keys) = n;
     }
 
     if (sscanf(argv[i], "--random_key=%d%c", &n, &junk) == 1 &&
         (n == 0 || n == 1)) {
-      FLAGS_random_key = n;
+      ANNOTATE_UNPROTECTED_WRITE(FLAGS_random_key) = n;
     }
 
     if (sscanf(argv[i], "--use_set_based_memetable=%d%c", &n, &junk) == 1 &&
         (n == 0 || n == 1)) {
-      FLAGS_use_set_based_memetable = n;
+      ANNOTATE_UNPROTECTED_WRITE(FLAGS_use_set_based_memetable) = n;
     }
 
     if (sscanf(argv[i], "--verbose=%d%c", &n, &junk) == 1 &&
         (n == 0 || n == 1)) {
-      FLAGS_verbose = n;
+      ANNOTATE_UNPROTECTED_WRITE(FLAGS_verbose) = n;
     }
   }
 

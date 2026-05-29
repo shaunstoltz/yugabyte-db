@@ -15,9 +15,9 @@
 // specific language governing permissions and limitations
 // under the License.
 //
-// The following only applies to changes made to this file as part of YugaByte development.
+// The following only applies to changes made to this file as part of YugabyteDB development.
 //
-// Portions Copyright (c) YugaByte, Inc.
+// Portions Copyright (c) YugabyteDB, Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License"); you may not use this file except
 // in compliance with the License.  You may obtain a copy of the License at
@@ -45,7 +45,7 @@
 #include "yb/gutil/strings/substitute.h"
 #include "yb/gutil/threading/thread_collision_warner.h"
 
-#include "yb/util/atomic.h" // For GetAtomicFlag
+#include "yb/util/atomic.h"
 #include "yb/util/locks.h"
 #include "yb/util/memory/arena_fwd.h"
 #include "yb/util/monotime.h"
@@ -70,8 +70,8 @@ DECLARE_int32(tracing_level);
 
 #define VTRACE_TO(level, trace, format, substitutions...) \
   do { \
-    if ((trace) && level <= GetAtomicFlag(&FLAGS_tracing_level)) { \
-      const bool use_fine_ts = GetAtomicFlag(&FLAGS_use_monotime_for_traces); \
+    if ((trace) && level <= FLAGS_tracing_level) { \
+      const bool use_fine_ts = FLAGS_use_monotime_for_traces; \
       auto time = (use_fine_ts ? ToCoarse(MonoTime::Now()) : CoarseMonoClock::Now()); \
       TRACE_TO_WITH_TIME(trace, time, format, ##substitutions); \
     } \
@@ -97,6 +97,8 @@ DECLARE_int32(tracing_level);
 
 #define TRACE_FUNC() \
   TRACE(__func__)
+
+#define TRACE_BEGIN_END_FUNC(t) yb::ScopedBeginEndFunc _begin_end_scope(__func__);
 
 #define PLAIN_TRACE_TO(trace, message) \
   do { \
@@ -170,6 +172,25 @@ class Trace : public RefCountedThreadSafe<Trace> {
   void Dump(std::ostream* out, bool include_time_deltas) const;
   void Dump(std::ostream* out, int32_t tracing_depth, bool include_time_deltas) const;
 
+  // Dumps the trace to Log(INFO)
+  void DumpToLogInfo(bool include_time_deltas = true) const;
+
+  // Sets the given flag to true, and
+  // returns and empty string ("")
+  //
+  // Useful to chain with probabilistic macros such as YB_LOG_EVERY_xxx()
+  //
+  // Example usage:
+  //   bool was_printed = false;
+  //   LOG_EVERY_N(INFO, 1000) << Trace::SetTrue(&was_printed) << "rpc took too long : Trace :";
+  //   if (was_printed) {
+  //     trace_->DumpToLogInfo(true);
+  //   }
+  static std::string SetTrue(bool* flag) {
+    *flag = true;
+    return "";
+  }
+
   // Dump the trace buffer as a string.
   std::string DumpToString(int32_t tracing_depth, bool include_time_deltas) const;
   std::string DumpToString(bool include_time_deltas) const {
@@ -184,8 +205,18 @@ class Trace : public RefCountedThreadSafe<Trace> {
     return threadlocal_trace_;
   }
 
-  static scoped_refptr<Trace> NewTrace();
-  static scoped_refptr<Trace> NewTraceForParent(Trace* parent);
+  // Returns a new Trace object, or nullptr either based on
+  // 1) sampling, if sampled_trace_1_in_n > 0 or
+  // 2) unconditionally, if enable_tracing is true.
+  static scoped_refptr<Trace> MaybeGetNewTrace();
+  // Similar to MaybeGetNewTrace.
+  // Returns a new Trace object, or nullptr either based on
+  // 1) sampling, if sampled_trace_1_in_n > 0 or
+  // 2) unconditionally, if
+  //        a) enable_tracing is true or
+  //        b) parent is not null.
+  // The created trace will also be added as a child trace to the parent.
+  static scoped_refptr<Trace> MaybeGetNewTraceForParent(Trace* parent);
 
   // Simple function to dump the current trace to stderr, if one is
   // available. This is meant for usage when debugging in gdb via
@@ -195,29 +226,32 @@ class Trace : public RefCountedThreadSafe<Trace> {
   size_t ObjectSize() const { return sizeof(*this); }
   size_t DynamicMemoryUsage() const;
 
-  bool must_print() const {
-    std::lock_guard<simple_spinlock> l(lock_);
-    return must_print_;
-  }
+  bool must_print() const;
 
   void set_must_print(bool flag) {
-    std::lock_guard<simple_spinlock> l(lock_);
+    std::lock_guard l(lock_);
     must_print_ = flag;
   }
 
   bool end_to_end_traces_requested() const {
-    std::lock_guard<simple_spinlock> l(lock_);
+    std::lock_guard l(lock_);
     return end_to_end_traces_requested_;
   }
 
   void set_end_to_end_traces_requested(bool flag) {
-    std::lock_guard<simple_spinlock> l(lock_);
+    std::lock_guard l(lock_);
     end_to_end_traces_requested_ = flag;
   }
+
+  static void DumpTraceIfNecessary(
+      Trace* trace, int print_trace_every_n, bool must_print = false);
 
  private:
   friend class ScopedAdoptTrace;
   friend class RefCountedThreadSafe<Trace>;
+  FRIEND_TEST(TraceTest, TestTraceEntryLimit);
+  FRIEND_TEST(TraceTest, TestTraceChildLimitWithSampling);
+  FRIEND_TEST(TraceTest, TestNoCrashWhenExceedingTraceLimits);
   ~Trace();
 
   ThreadSafeArena* GetAndInitArena();
@@ -234,22 +268,26 @@ class Trace : public RefCountedThreadSafe<Trace> {
   // Add the entry to the linked list of entries.
   void AddEntry(TraceEntry* entry);
 
+  size_t NumEntries() const;
+  size_t NumChildren() const;
+
   std::atomic<ThreadSafeArena*> arena_ = {nullptr};
 
   // Lock protecting the entries linked list.
   mutable simple_spinlock lock_;
   // The head of the linked list of entries (allocated inside arena_)
-  TraceEntry* entries_head_ = nullptr;
+  TraceEntry* entries_head_ GUARDED_BY(lock_) = nullptr;
   // The tail of the linked list of entries (allocated inside arena_)
-  TraceEntry* entries_tail_ = nullptr;
+  TraceEntry* entries_tail_ GUARDED_BY(lock_) = nullptr;
+  std::atomic<size_t> entries_count_{0};
 
   int64_t trace_start_time_usec_ = 0;
 
   // A hint to request that the collected trace be printed.
-  bool must_print_ = false;
-  bool end_to_end_traces_requested_ = false;
+  bool must_print_ GUARDED_BY(lock_) = false;
+  bool end_to_end_traces_requested_ GUARDED_BY(lock_) = false;
 
-  std::vector<scoped_refptr<Trace> > child_traces_;
+  std::vector<scoped_refptr<Trace> > child_traces_ GUARDED_BY(lock_);
 
   DISALLOW_COPY_AND_ASSIGN(Trace);
 };
@@ -271,6 +309,24 @@ class ScopedAdoptTrace {
   scoped_refptr<Trace> trace_;
 
   DISALLOW_COPY_AND_ASSIGN(ScopedAdoptTrace);
+};
+
+// Adds a Begin/End trace call in the constructor/destructor.
+// This should only be used on the stack (and thus created and destroyed
+// on the same thread).
+class ScopedBeginEndFunc {
+ public:
+  explicit ScopedBeginEndFunc(std::string function) : function_name_(std::move(function)) {
+    TRACE("Begin: $0", function_name_);
+  }
+  ~ScopedBeginEndFunc() {
+    TRACE("End: $0", function_name_);
+  }
+
+ private:
+  std::string function_name_;
+
+  DISALLOW_COPY_AND_ASSIGN(ScopedBeginEndFunc);
 };
 
 // PlainTrace could be used in simple cases when we trace only up to 20 entries with const message.
@@ -297,13 +353,13 @@ class PlainTrace {
     const char* message;
     CoarseTimePoint timestamp;
 
-    void Dump(std::ostream* out) const;
+    void Dump(std::ostream* out, const std::string& nesting_prefix = "") const;
   };
 
   mutable simple_spinlock mutex_;
   int64_t trace_start_time_usec_ = 0;
   size_t size_ = 0;
-  Entry entries_[kMaxEntries];
+  Entry entries_[kMaxEntries] GUARDED_BY(mutex_);
 };
 
 } // namespace yb

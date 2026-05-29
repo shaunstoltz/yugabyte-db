@@ -2,39 +2,39 @@
 
 package db.migration.default_.common;
 
-import java.sql.Connection;
-import java.util.HashMap;
-import java.util.List;
-import java.util.Map;
-
+import com.fasterxml.jackson.core.JsonProcessingException;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.fasterxml.jackson.databind.node.ObjectNode;
 import com.google.common.collect.ImmutableList;
 import com.yugabyte.yw.commissioner.Common.CloudType;
-import com.yugabyte.yw.controllers.handlers.CloudProviderHandler;
-import com.yugabyte.yw.models.AvailabilityZone;
-import com.yugabyte.yw.models.helpers.CloudInfoInterface;
-import com.yugabyte.yw.models.Customer;
+import com.yugabyte.yw.common.CloudProviderHelper;
 import com.yugabyte.yw.models.helpers.provider.GCPCloudInfo;
-import com.yugabyte.yw.models.Provider;
-import com.yugabyte.yw.models.Region;
-
-import io.ebean.Ebean;
+import com.yugabyte.yw.models.migrations.V231.AvailabilityZone;
+import com.yugabyte.yw.models.migrations.V231.CloudInfoInterface_Clone;
+import com.yugabyte.yw.models.migrations.V231.Customer;
+import com.yugabyte.yw.models.migrations.V231.Provider;
+import com.yugabyte.yw.models.migrations.V231.Region;
+import io.ebean.DB;
+import java.util.HashMap;
+import java.util.List;
+import java.util.Map;
+import lombok.extern.slf4j.Slf4j;
+import org.flywaydb.core.api.migration.BaseJavaMigration;
+import org.flywaydb.core.api.migration.Context;
 import play.libs.Json;
 
-import org.flywaydb.core.api.migration.jdbc.BaseJdbcMigration;
-
-public class V231__ProviderDetailsPersist extends BaseJdbcMigration {
+@Slf4j
+public class V231__ProviderDetailsPersist extends BaseJavaMigration {
 
   @Override
-  public void migrate(Connection connection) throws Exception {
-    Ebean.execute(V231__ProviderDetailsPersist::migrateConfigToDetails);
+  public void migrate(Context context) {
+    DB.execute(V231__ProviderDetailsPersist::migrateConfigToDetails);
   }
 
   public static void migrateConfigToDetails() {
-    for (Customer customer : Customer.getAll()) {
-      for (Provider provider : Provider.getAll(customer.uuid)) {
-        Map<String, String> config = provider.config;
+    for (Customer customer : Customer.find.all()) {
+      for (Provider provider : Provider.getAll(customer.getUuid())) {
+        Map<String, String> config = provider.getConfig();
         if (config == null) {
           continue;
         }
@@ -45,16 +45,16 @@ public class V231__ProviderDetailsPersist extends BaseJdbcMigration {
           providerConfig = V231__ProviderDetailsPersist.translateGCPConfigToDetails(config);
         }
 
-        for (Region region : provider.regions) {
+        for (Region region : provider.getRegions()) {
           V231__ProviderDetailsPersist.migrateRegionDetails(region);
-          for (AvailabilityZone az : region.zones) {
-            CloudInfoInterface.setCloudProviderInfoFromConfig(az, az.config);
+          for (AvailabilityZone az : region.getZones()) {
+            CloudInfoInterface_Clone.setCloudProviderInfoFromConfig(az, az.getConfig());
             az.save();
           }
           region.save();
         }
 
-        CloudInfoInterface.setCloudProviderInfoFromConfig(provider, providerConfig);
+        CloudInfoInterface_Clone.setCloudProviderInfoFromConfig(provider, providerConfig);
         provider.save();
         if (provider.getCloudCode().equals(CloudType.gcp)) {
           V231__ProviderDetailsPersist.populateGCPCredential(provider, config);
@@ -68,15 +68,15 @@ public class V231__ProviderDetailsPersist extends BaseJdbcMigration {
     if (region.ybImage != null) {
       region.setYbImage(region.ybImage);
     }
-    if (region.details != null) {
-      if (region.details.sg_id != null) {
-        region.setSecurityGroupId(region.details.sg_id);
+    if (region.getDetails() != null) {
+      if (region.getDetails().sg_id != null) {
+        region.setSecurityGroupId(region.getDetails().sg_id);
       }
-      if (region.details.vnet != null) {
-        region.setVnetName(region.details.vnet);
+      if (region.getDetails().vnet != null) {
+        region.setVnetName(region.getDetails().vnet);
       }
-      if (region.details.arch != null) {
-        region.setArchitecture(region.details.arch);
+      if (region.getDetails().arch != null) {
+        region.setArchitecture(region.getDetails().arch);
       }
     }
   }
@@ -87,10 +87,11 @@ public class V231__ProviderDetailsPersist extends BaseJdbcMigration {
     final Map<String, String> oldToNewConfigKeyMap =
         new HashMap<String, String>() {
           {
-            put("project_id", "host_project_id");
+            put("GCE_HOST_PROJECT", "host_project_id");
+            put("project_id", "project_id");
             put("GOOGLE_APPLICATION_CREDENTIALS", "config_file_path");
             put("CUSTOM_GCE_NETWORK", "network");
-            put(CloudProviderHandler.YB_FIREWALL_TAGS, CloudProviderHandler.YB_FIREWALL_TAGS);
+            put(CloudProviderHelper.YB_FIREWALL_TAGS, CloudProviderHelper.YB_FIREWALL_TAGS);
           }
         };
 
@@ -124,13 +125,18 @@ public class V231__ProviderDetailsPersist extends BaseJdbcMigration {
       }
     }
 
-    if (provider.details == null) {
+    if (provider.getDetails() == null) {
       return;
     }
-    GCPCloudInfo gcpCloudInfo = provider.details.cloudInfo.gcp;
+    GCPCloudInfo gcpCloudInfo = provider.getDetails().getCloudInfo().gcp;
     if (gcpCloudInfo == null) {
       return;
     }
-    gcpCloudInfo.gceApplicationCredentials = gcpCredentials;
+    try {
+      gcpCloudInfo.setGceApplicationCredentials(mapper.writeValueAsString(gcpCredentials));
+    } catch (JsonProcessingException e) {
+      log.error(
+          String.format("Failed to populate GCP credential info, %s", e.getLocalizedMessage()));
+    }
   }
 }

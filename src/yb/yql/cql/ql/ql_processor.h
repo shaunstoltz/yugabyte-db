@@ -1,4 +1,4 @@
-// Copyright (c) YugaByte, Inc.
+// Copyright (c) YugabyteDB, Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License"); you may not use this file except
 // in compliance with the License.  You may obtain a copy of the License at
@@ -17,6 +17,8 @@
 // different ExecContexts, so non-thread-safe fields should not be referenced there.
 //--------------------------------------------------------------------------------------------------
 #pragma once
+
+#include "yb/ash/wait_state.h"
 
 #include "yb/client/client_fwd.h"
 
@@ -59,6 +61,8 @@ class QLMetrics {
   scoped_refptr<yb::Histogram> ql_transaction_;
 
   scoped_refptr<yb::Histogram> ql_response_size_bytes_;
+
+  scoped_refptr<Counter> microseconds_timestamps_used_;
 };
 
 class QLProcessor : public Rescheduler {
@@ -93,8 +97,8 @@ class QLProcessor : public Rescheduler {
 
   // Run (parse, analyze and execute) a SQL statement. The statement string and the parameters must
   // not be destroyed until the statement has been executed.
-  void RunAsync(const std::string& stmt, const StatementParameters& params,
-                StatementExecutedCallback cb, bool reparsed = false);
+  TreeNodeOpcode RunAsync(const std::string& stmt, const StatementParameters& params,
+                          StatementExecutedCallback cb, bool reparsed = false);
 
  protected:
   void SetCurrentSession(const QLSessionPtr& ql_session) {
@@ -153,6 +157,8 @@ class QLProcessor : public Rescheduler {
       stmt_ = &stmt;
       params_ = &params;
       cb_ = std::move(cb);
+      wait_state_ = ash::WaitStateInfo::CurrentWaitState();
+      ASH_ENABLE_CONCURRENT_UPDATES();
       return *this;
     }
 
@@ -162,6 +168,8 @@ class QLProcessor : public Rescheduler {
     void Run() override {
       auto processor = processor_;
       processor_ = nullptr;
+      ADOPT_WAIT_STATE(wait_state_);
+      wait_state_ = nullptr;
       processor->RunAsync(*stmt_, *params_, std::move(cb_), true /* reparsed */);
     }
 
@@ -170,6 +178,7 @@ class QLProcessor : public Rescheduler {
     QLProcessor* processor_ = nullptr;
     const std::string* stmt_ = nullptr;
     const StatementParameters* params_ = nullptr;
+    ash::WaitStateInfoPtr wait_state_ = nullptr;
     StatementExecutedCallback cb_;
   };
 

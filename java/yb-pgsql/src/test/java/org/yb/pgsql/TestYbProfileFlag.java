@@ -1,4 +1,4 @@
-// Copyright (c) YugaByte, Inc.
+// Copyright (c) YugabyteDB, Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License"); you may not use this file except
 // in compliance with the License.  You may obtain a copy of the License at
@@ -22,11 +22,11 @@ import org.junit.Test;
 import org.junit.runner.RunWith;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
-import org.yb.util.YBTestRunnerNonTsanOnly;
+import org.yb.YBTestRunner;
 
 import com.yugabyte.util.PSQLException;
 
-@RunWith(value = YBTestRunnerNonTsanOnly.class)
+@RunWith(value = YBTestRunner.class)
 public class TestYbProfileFlag extends BasePgSQLTest {
 
   private static final Logger LOG = LoggerFactory.getLogger(TestPgSequences.class);
@@ -48,42 +48,42 @@ public class TestYbProfileFlag extends BasePgSQLTest {
     }
   }
 
-  @Test(expected = PSQLException.class)
+  @Test(expected=PSQLException.class)
   public void testCreateProfileIsDisabled() throws Exception {
     try (Statement stmt = connection.createStatement()) {
       stmt.execute("CREATE PROFILE p1 FAILED_LOGIN_ATTEMPTS 3");
     }
   }
 
-  @Test(expected = PSQLException.class)
+  @Test(expected=PSQLException.class)
   public void testDropProfileIsDisabled() throws Exception {
     try (Statement stmt = connection.createStatement()) {
       stmt.execute("DROP PROFILE p1");
     }
   }
 
-  @Test(expected = PSQLException.class)
+  @Test(expected=PSQLException.class)
   public void testAttachProfileIsDisabled() throws Exception {
     try (Statement stmt = connection.createStatement()) {
       stmt.execute(String.format("ALTER USER %s PROFILE %s", USERNAME, PROFILE_1_NAME));
     }
   }
 
-  @Test(expected = PSQLException.class)
+  @Test(expected=PSQLException.class)
   public void testDetachProfileIsDisabled() throws Exception {
     try (Statement stmt = connection.createStatement()) {
       stmt.execute(String.format("ALTER USER %s NOPROFILE", USERNAME));
     }
   }
 
-  @Test(expected = PSQLException.class)
+  @Test(expected=PSQLException.class)
   public void testUnlockUserIsDisabled() throws Exception {
     try (Statement stmt = connection.createStatement()) {
       stmt.execute(String.format("ALTER USER %s ACCOUNT UNLOCK", USERNAME));
     }
   }
 
-  @Test(expected = PSQLException.class)
+  @Test(expected=PSQLException.class)
   public void testLockUserIsDisabled() throws Exception {
     try (Statement stmt = connection.createStatement()) {
       stmt.execute(String.format("ALTER USER %s ACCOUNT LOCK", USERNAME));

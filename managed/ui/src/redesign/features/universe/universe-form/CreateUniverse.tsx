@@ -1,16 +1,21 @@
-import React, { FC, useContext } from 'react';
+import { FC, useContext } from 'react';
+import { useQuery, useQueryClient } from 'react-query';
 import { useSelector } from 'react-redux';
 import { browserHistory } from 'react-router';
 import { useTranslation } from 'react-i18next';
 import { useUpdateEffect, useEffectOnce } from 'react-use';
+import { set, get } from 'lodash';
 import { UniverseFormContext } from './UniverseFormContainer';
 import { UniverseForm } from './form/UniverseForm';
 import { YBLoading } from '../../../../components/common/indicators';
 import { getPlacements } from './form/fields/PlacementsField/PlacementsFieldHelper';
+import { QUERY_KEY, api } from './utils/api';
 import {
   createUniverse,
   filterFormDataByClusterType,
-  getAsyncCopyFields,
+  getAsyncCluster,
+  getPrimaryCluster,
+  getPrimaryInheritedValues,
   getUserIntent
 } from './utils/helpers';
 import {
@@ -21,12 +26,17 @@ import {
   UniverseFormData,
   CloudType,
   UniverseConfigure,
-  DEFAULT_FORM_DATA
+  DEFAULT_FORM_DATA,
+  RunTimeConfigEntry
 } from './utils/dto';
+import { PROVIDER_FIELD } from './utils/constants';
+import { RuntimeConfigKey } from '../../../helpers/constants';
 
 export const CreateUniverse: FC = () => {
   const { t } = useTranslation();
   const [contextState, contextMethods]: any = useContext(UniverseFormContext);
+  // Create a deep copy of the DEFAULT_FORM_DATA object
+  const DEFAULT_FORM_DATA_COPY = JSON.parse(JSON.stringify(DEFAULT_FORM_DATA));
   const {
     asyncFormData,
     clusterType,
@@ -43,6 +53,11 @@ export const CreateUniverse: FC = () => {
   } = contextMethods;
   const featureFlags = useSelector((state: any) => state.featureFlags);
   const isPrimary = clusterType === ClusterType.PRIMARY;
+  const globalRuntimeConfigQuery = useQuery(QUERY_KEY.fetchGlobalRunTimeConfigs, () =>
+    api.fetchRunTimeConfigs(true)
+  );
+
+  const queryClient = useQueryClient();
 
   useEffectOnce(() => {
     initializeForm({
@@ -88,13 +103,27 @@ export const CreateUniverse: FC = () => {
     });
   };
 
-  const onCancel = () => browserHistory.goBack();
+  const onCancel = () => browserHistory.push('/universes');
 
   const onSubmit = (primaryData: UniverseFormData, asyncData: UniverseFormData) => {
+    const primaryCluster = getPrimaryCluster(universeConfigureTemplate);
+    const primaryUserIntent = {
+      ...primaryCluster?.userIntent,
+      ...getUserIntent({ formData: primaryData }, ClusterType.PRIMARY, featureFlags)
+    };
+
+    const isK8sUniverse = get(primaryData, PROVIDER_FIELD).code === CloudType.kubernetes;
+
     const configurePayload: UniverseConfigure = {
       clusterOperation: ClusterModes.CREATE,
       currentClusterType: contextState.clusterType,
       rootCA: primaryData.instanceConfig.rootCA,
+      clientRootCA: primaryData.instanceConfig.rootAndClientRootCASame
+        ? ''
+        : primaryData.instanceConfig.clientRootCA,
+      rootAndClientRootCASame: isK8sUniverse
+        ? true
+        : primaryData.instanceConfig.rootAndClientRootCASame,
       userAZSelected: false,
       resetAZConfig: false,
       enableYbc: featureFlags.released.enableYbc || featureFlags.test.enableYbc,
@@ -103,10 +132,11 @@ export const CreateUniverse: FC = () => {
       encryptionAtRestConfig: {
         key_op: primaryData.instanceConfig.enableEncryptionAtRest ? 'ENABLE' : 'UNDEFINED'
       },
+      arch: primaryData.instanceConfig.arch!,
       clusters: [
         {
           clusterType: ClusterType.PRIMARY,
-          userIntent: getUserIntent({ formData: primaryData }),
+          userIntent: primaryUserIntent,
           placementInfo: {
             cloudList: [
               {
@@ -121,9 +151,20 @@ export const CreateUniverse: FC = () => {
       ]
     };
     if (asyncData) {
+      const asyncCluster = getAsyncCluster(universeConfigureTemplate);
+      const asyncUserIntent = {
+        ...asyncCluster?.userIntent,
+        ...getUserIntent(
+          {
+            formData: { ...asyncData, ...getPrimaryInheritedValues(primaryData) } //copy primary field values (inherited fields) to RR during fresh Universe+RR creation
+          },
+          ClusterType.ASYNC,
+          featureFlags
+        )
+      };
       configurePayload.clusters?.push({
         clusterType: ClusterType.ASYNC,
-        userIntent: getUserIntent({ formData: asyncData }),
+        userIntent: asyncUserIntent,
         placementInfo: {
           cloudList: [
             {
@@ -134,6 +175,14 @@ export const CreateUniverse: FC = () => {
           ]
         }
       });
+      // the getPrimaryInheritedValues overrides the async clusters imageBundleUUID.
+      // we are manually overriding it
+      const asyncIndex = configurePayload.clusters!.length - 1;
+      set(
+        configurePayload,
+        `clusters.[${asyncIndex}].userIntent.imageBundleUUID`,
+        asyncData.instanceConfig.imageBundleUUID
+      );
     }
 
     if (
@@ -144,18 +193,38 @@ export const CreateUniverse: FC = () => {
       configurePayload.encryptionAtRestConfig.configUUID = primaryData.instanceConfig.kmsConfig;
     }
     createUniverse({ configurePayload, universeContextData: contextState });
+    setTimeout(() => {
+      queryClient.invalidateQueries('user_permissions');
+    }, 2000);
   };
 
   if (isLoading) return <YBLoading />;
 
+  // Retrieve userTags when running local dev environment
+  if (globalRuntimeConfigQuery.isSuccess && globalRuntimeConfigQuery.data) {
+    const isTagsEnforcedObject = globalRuntimeConfigQuery?.data?.configEntries?.find(
+      (c: RunTimeConfigEntry) => c.key === RuntimeConfigKey.IS_TAGS_ENFORCED
+    );
+    const isTagsEnforced = isTagsEnforcedObject?.value === 'true';
+    const defaultDevTags = globalRuntimeConfigQuery?.data?.configEntries?.find(
+      (c: RunTimeConfigEntry) => c.key === RuntimeConfigKey.DEFAULT_DEV_TAGS
+    )?.value;
+
+    if (isTagsEnforced && defaultDevTags) {
+      DEFAULT_FORM_DATA_COPY.instanceTags = JSON.parse(defaultDevTags);
+    }
+  }
+
   if (isPrimary)
     return (
       <UniverseForm
-        defaultFormData={primaryFormData ?? DEFAULT_FORM_DATA}
+        defaultFormData={primaryFormData ?? DEFAULT_FORM_DATA_COPY}
         onFormSubmit={(data: UniverseFormData) =>
           onSubmit(
             data,
-            asyncFormData ? { ...asyncFormData, ...getAsyncCopyFields(primaryFormData) } : null
+            asyncFormData
+              ? { ...asyncFormData, ...getPrimaryInheritedValues(primaryFormData) }
+              : null
           )
         }
         submitLabel={t('common.create')}
@@ -174,7 +243,7 @@ export const CreateUniverse: FC = () => {
       <UniverseForm
         defaultFormData={
           asyncFormData
-            ? { ...asyncFormData, ...getAsyncCopyFields(primaryFormData) } //Not all the fields needs to be copied from primary -> async
+            ? { ...asyncFormData, ...getPrimaryInheritedValues(primaryFormData) } //Not all the fields needs to be copied from primary -> async
             : filterFormDataByClusterType(primaryFormData, ClusterType.ASYNC)
         }
         onFormSubmit={(data: UniverseFormData) => onSubmit(primaryFormData, data)}

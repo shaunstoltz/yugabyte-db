@@ -1,7 +1,7 @@
 /*
  * Created on Thu Feb 10 2022
  *
- * Copyright 2021 YugaByte, Inc. and Contributors
+ * Copyright 2021 YugabyteDB, Inc. and Contributors
  * Licensed under the Polyform Free Trial License 1.0.0 (the "License")
  * You may not use this file except in compliance with the License. You may obtain a copy of the License at
  * http://github.com/YugaByte/yugabyte-db/blob/master/licenses/POLYFORM-FREE-TRIAL-LICENSE-1.0.0.txt
@@ -23,6 +23,8 @@ export enum Badge_Types {
   QUEUED_FOR_DELETION = 'QueuedForDeletion',
   SUCCESS = 'Success',
   CREATED = 'Created',
+  EXPIRED = 'Expired',
+  PAUSED = 'Paused'
 }
 
 interface StatusBadgeProps extends React.HTMLAttributes<HTMLDivElement> {
@@ -49,15 +51,22 @@ const getIcon = (statusType: Badge_Types) => {
     case Badge_Types.QUEUED_FOR_DELETION:
       icon = 'fa-clock-o';
       break;
+
+    case Badge_Types.EXPIRED:
+      icon = 'fa-ban';
+      break;
   }
   return icon ? <i className={`fa ${icon} badge-icon ${statusType}`} /> : null;
 };
 
 export const StatusBadge: FC<StatusBadgeProps> = ({ statusType, customLabel, ...others }) => {
-  const label = customLabel ?? BACKUP_LABEL_MAP[statusType];
+  const label =
+    customLabel ??
+    (BACKUP_LABEL_MAP as Record<string, string | undefined>)[statusType] ??
+    statusType;
   return (
     <span {...others} className={`status-badge ${statusType}`}>
-      {label} 
+      {label}
       {getIcon(statusType)}
     </span>
   );

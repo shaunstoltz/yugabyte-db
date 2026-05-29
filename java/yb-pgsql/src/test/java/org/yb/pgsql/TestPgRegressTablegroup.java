@@ -1,4 +1,4 @@
-// Copyright (c) YugaByte, Inc.
+// Copyright (c) YugabyteDB, Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License"); you may not use this file except
 // in compliance with the License.  You may obtain a copy of the License at
@@ -19,13 +19,15 @@ import org.junit.Test;
 import org.junit.runner.RunWith;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
-import org.yb.util.YBTestRunnerNonTsanOnly;
+import org.yb.YBTestRunner;
+import org.yb.util.SkipOnTSAN;
 
 import com.google.common.collect.ImmutableMap;
 
 // Runs the pg_regress test suite on YB code.
-@RunWith(value=YBTestRunnerNonTsanOnly.class)
-public class TestPgRegressTablegroup extends BasePgSQLTest {
+@SkipOnTSAN
+@RunWith(value=YBTestRunner.class)
+public class TestPgRegressTablegroup extends BasePgRegressTest {
   private static final Logger LOG = LoggerFactory.getLogger(TestPgRegressTablegroup.class);
 
   @Override
@@ -47,7 +49,6 @@ public class TestPgRegressTablegroup extends BasePgSQLTest {
 
   @Test
   public void testPgRegressTablegroupDeprecation() throws Exception {
-    markClusterNeedsRecreation();
     restartClusterWithFlags(Collections.emptyMap(),
                             ImmutableMap.of(
                                 "ysql_beta_features", "false",

@@ -1,4 +1,4 @@
-// Copyright (c) YugaByte, Inc.
+// Copyright (c) YugabyteDB, Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License"); you may not use this file except
 // in compliance with the License.  You may obtain a copy of the License at
@@ -27,6 +27,14 @@ const auto kTableName = "test"s;
 }
 
 class PgCacheRefreshTest : public LibPqTestBase {
+ public:
+  void UpdateMiniClusterOptions(ExternalMiniClusterOptions* opts) override {
+    LibPqTestBase::UpdateMiniClusterOptions(opts);
+    // Tests here run DDLs concurrently with DMLs. Such behavior will not be possible
+    // with table locks enabled.
+    opts->extra_tserver_flags.emplace_back("--enable_object_locking_for_table_locks=false");
+  }
+
  protected:
   void TestSetup(PGConn* conn) {
     ASSERT_OK(conn->ExecuteFormat("CREATE TABLE $0(id int)", kTableName));
@@ -132,7 +140,7 @@ class PgCacheRefreshTest : public LibPqTestBase {
   }
 };
 
-TEST_F(PgCacheRefreshTest, YB_DISABLE_TEST_IN_TSAN(ExistingConnectionTransparentRetry)) {
+TEST_F(PgCacheRefreshTest, ExistingConnectionTransparentRetry) {
   // Create a table.
   auto stmt_conn = ASSERT_RESULT(Connect());
   TestSetup(&stmt_conn);
@@ -159,7 +167,7 @@ TEST_F(PgCacheRefreshTest, YB_DISABLE_TEST_IN_TSAN(ExistingConnectionTransparent
   ASSERT_OK(executeInsert(&stmt_conn));
 }
 
-TEST_F(PgCacheRefreshTest, YB_DISABLE_TEST_IN_TSAN(NewConnectionTransparentRetry)) {
+TEST_F(PgCacheRefreshTest, NewConnectionTransparentRetry) {
   auto stmt_conn = ASSERT_RESULT(Connect());
   TestSetup(&stmt_conn);
 
@@ -172,8 +180,11 @@ TEST_F(PgCacheRefreshTest, YB_DISABLE_TEST_IN_TSAN(NewConnectionTransparentRetry
 
   // In a different connection to a different node, run a DDL statement.
   testConcurrentDDLFromDifferentNode("col2");
-  // TODO: Test commented out due to #14327
-  // ASSERT_OK(executeInsert());
+
+  // Wait for heartbeat to propagate across all the TServers and invalidate the table cache
+  // across all nodes.
+  SleepFor(MonoDelta::FromMilliseconds(2 * FLAGS_heartbeat_interval_ms));
+  ASSERT_OK(executeInsert());
 
   // Cause schema version increment in a different connection to the same TServer.
   testConcurrentSchemaVersionIncrement("col3");
@@ -184,7 +195,7 @@ TEST_F(PgCacheRefreshTest, YB_DISABLE_TEST_IN_TSAN(NewConnectionTransparentRetry
   ASSERT_OK(executeInsert());
 }
 
-TEST_F(PgCacheRefreshTest, YB_DISABLE_TEST_IN_TSAN(ExistingConnTransparentRetryTxn)) {
+TEST_F(PgCacheRefreshTest, ExistingConnTransparentRetryTxn) {
   auto stmt_conn = ASSERT_RESULT(Connect());
   TestSetup(&stmt_conn);
 
@@ -213,7 +224,7 @@ TEST_F(PgCacheRefreshTest, YB_DISABLE_TEST_IN_TSAN(ExistingConnTransparentRetryT
   });
 }
 
-TEST_F(PgCacheRefreshTest, YB_DISABLE_TEST_IN_TSAN(NewConnectionTransparentRetryTxn)) {
+TEST_F(PgCacheRefreshTest, NewConnectionTransparentRetryTxn) {
   auto stmt_conn = ASSERT_RESULT(Connect());
   TestSetup(&stmt_conn);
 
@@ -235,12 +246,9 @@ TEST_F(PgCacheRefreshTest, YB_DISABLE_TEST_IN_TSAN(NewConnectionTransparentRetry
   // across all nodes.
   SleepFor(MonoDelta::FromMilliseconds(2 * FLAGS_heartbeat_interval_ms));
 
-  // Test DML transaction interleaved with an operation that only causes schema version mismatch
-  // through a connection to the same TServer. Here the alter operation causes table cache
-  // invalidation on the TServer, therefore no retry is needed.
-  testSuccessfulTxnSchemaVersionMismatch([this] {
-    testConcurrentSchemaVersionIncrement("col3");
-  });
+  // Cause a schema version increment operation through the same TServer so that the table schema
+  // gets cached.
+  testConcurrentSchemaVersionIncrement("col3");
 
   // Test DML transaction interleaved with an operation that only causes schema version mismatch
   // through a connection to a different TServer.

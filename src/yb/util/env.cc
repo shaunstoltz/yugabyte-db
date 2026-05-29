@@ -2,9 +2,9 @@
 // Use of this source code is governed by a BSD-style license that can be
 // found in the LICENSE file. See the AUTHORS file for names of contributors.
 //
-// The following only applies to changes made to this file as part of YugaByte development.
+// The following only applies to changes made to this file as part of YugabyteDB development.
 //
-// Portions Copyright (c) YugaByte, Inc.
+// Portions Copyright (c) YugabyteDB, Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License"); you may not use this file except
 // in compliance with the License.  You may obtain a copy of the License at
@@ -42,13 +42,6 @@ Status EnvWrapper::Env::CreateDirs(const std::string& dirname) {
 }
 
 RandomAccessFile::~RandomAccessFile() {
-}
-
-Status WritableFile::AppendVector(const std::vector<Slice>& data_vector) {
-  return AppendSlices(data_vector.data(), data_vector.size());
-}
-
-WritableFile::~WritableFile() {
 }
 
 RWFile::~RWFile() {
@@ -166,6 +159,9 @@ Status DeleteIfExists(const std::string& path, Env* env) {
   if (env->FileExists(path)) {
     return env->DeleteFile(path);
   }
+
+  RETURN_NOT_OK(env->DeleteSymlinkIfExists(path));
+
   return Status::OK();
 }
 
@@ -209,36 +205,8 @@ Status FileFactoryWrapper::NewRWFile(const RWFileOptions& opts,
   return target_->NewRWFile(opts, fname, result);
 }
 
-Status WritableFile::AppendSlices(const Slice* begin, const Slice* end) {
-  return AppendSlices(begin, end - begin);
-}
-
 Result<uint64_t> FileFactoryWrapper::GetFileSize(const std::string& fname) {
   return target_->GetFileSize(fname);
-}
-
-Status WritableFileWrapper::PreAllocate(uint64_t size) {
-  return target_->PreAllocate(size);
-}
-
-Status WritableFileWrapper::Append(const Slice& data) {
-  return target_->Append(data);
-}
-
-Status WritableFileWrapper::AppendSlices(const Slice* slices, size_t num) {
-  return target_->AppendSlices(slices, num);
-}
-
-Status WritableFileWrapper::Close() {
-  return target_->Close();
-}
-
-Status WritableFileWrapper::Flush(FlushMode mode) {
-  return target_->Flush(mode);
-}
-
-Status WritableFileWrapper::Sync() {
-  return target_->Sync();
 }
 
 Status EnvWrapper::NewSequentialFile(const std::string& f,
@@ -324,6 +292,14 @@ Status EnvWrapper::LinkFile(const std::string& s, const std::string& t) {
   return target_->LinkFile(s, t);
 }
 
+Status EnvWrapper::SymlinkPath(const std::string& pointed_to, const std::string& new_symlink) {
+  return target_->SymlinkPath(pointed_to, new_symlink);
+}
+
+Status EnvWrapper::DeleteSymlinkIfExists(const std::string& path) {
+  return target_->DeleteSymlinkIfExists(path);
+}
+
 Result<std::string> EnvWrapper::ReadLink(const std::string& s) {
   return target_->ReadLink(s);
 }
@@ -350,6 +326,10 @@ Status EnvWrapper::GetExecutablePath(std::string* path) {
 
 Status EnvWrapper::IsDirectory(const std::string& path, bool* is_dir) {
   return target_->IsDirectory(path, is_dir);
+}
+
+Result<bool> EnvWrapper::IsSymlink(const std::string& path) {
+  return target_->IsSymlink(path);
 }
 
 Result<bool> EnvWrapper::IsExecutableFile(const std::string& path) {

@@ -1,10 +1,10 @@
-// Copyright (c) YugaByte, Inc.
+// Copyright (c) YugabyteDB, Inc.
 
 package com.yugabyte.yw.models;
 
+import jakarta.persistence.Embeddable;
 import java.io.Serializable;
 import java.util.UUID;
-import javax.persistence.Embeddable;
 import lombok.Data;
 import lombok.experimental.Accessors;
 

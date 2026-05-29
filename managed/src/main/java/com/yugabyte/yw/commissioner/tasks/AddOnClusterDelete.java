@@ -1,5 +1,5 @@
 /*
- * Copyright 2022 YugaByte, Inc. and Contributors
+ * Copyright 2022 YugabyteDB, Inc. and Contributors
  *
  * Licensed under the Polyform Free Trial License 1.0.0 (the "License"); you
  * may not use this file except in compliance with the License. You
@@ -11,6 +11,7 @@ package com.yugabyte.yw.commissioner.tasks;
 
 import com.yugabyte.yw.commissioner.BaseTaskDependencies;
 import com.yugabyte.yw.commissioner.UserTaskDetails.SubTaskGroupType;
+import com.yugabyte.yw.common.UniverseInProgressException;
 import com.yugabyte.yw.forms.UniverseDefinitionTaskParams;
 import com.yugabyte.yw.forms.UniverseDefinitionTaskParams.Cluster;
 import com.yugabyte.yw.forms.UniverseDefinitionTaskParams.ClusterType;
@@ -40,29 +41,32 @@ public class AddOnClusterDelete extends UniverseDefinitionTaskBase {
   }
 
   @Override
-  public void run() {
-    log.info("Started {} task for uuid={}", getName(), params().universeUUID);
-
+  protected void validateUniverseState(Universe universe) {
     try {
-
-      if (params().clusterUUID == null) {
-        log.error("Cluster UUID is null. Aborting.");
-        throw new RuntimeException("Cluster UUID is null");
+      super.validateUniverseState(universe);
+    } catch (UniverseInProgressException e) {
+      if (!params().isForceDelete) {
+        throw e;
       }
+    }
+  }
 
-      Universe universe = null;
-      if (params().isForceDelete) {
-        universe = forceLockUniverseForUpdate(-1 /* expectedUniverseVersion */);
-      } else {
-        universe = lockUniverseForUpdate(params().expectedUniverseVersion);
-      }
-
+  @Override
+  public void run() {
+    log.info("Started {} task for uuid={}", getName(), params().getUniverseUUID());
+    if (params().clusterUUID == null) {
+      log.error("Cluster UUID is null. Aborting.");
+      throw new RuntimeException("Cluster UUID is null");
+    }
+    Universe universe =
+        lockAndFreezeUniverseForUpdate(params().expectedUniverseVersion, null /* Txn callback */);
+    try {
       Cluster clusterToDelete = universe.getCluster(params().clusterUUID);
 
       if (clusterToDelete == null || clusterToDelete.clusterType != ClusterType.ADDON) {
         String msg =
             "Unable to delete add-on cluster from universe \""
-                + universe.name
+                + universe.getName()
                 + "\" as it doesn't have the specified add-on cluster.";
         log.error(msg);
         throw new RuntimeException(msg);
@@ -79,9 +83,10 @@ public class AddOnClusterDelete extends UniverseDefinitionTaskBase {
       createDestroyServerTasks(
               universe,
               nodesToBeRemoved,
-              params().isForceDelete,
+              node -> params().isForceDelete,
               true /* deleteNodeFromDB */,
-              true /* deleteRootVolumes */)
+              true /* deleteRootVolumes */,
+              false /* skipDestroyPrecheck */)
           .setSubTaskGroupType(SubTaskGroupType.RemovingUnusedServers);
 
       // Remove the cluster entry from the universe db entry.

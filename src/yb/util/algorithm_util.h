@@ -1,4 +1,4 @@
-// Copyright (c) YugaByte, Inc.
+// Copyright (c) YugabyteDB, Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License"); you may not use this file except
 // in compliance with the License.  You may obtain a copy of the License at
@@ -96,6 +96,18 @@ auto StableSorted(const Col& collection, const Extractor& extractor) {
     return lhs.key < rhs.key || (lhs.key == rhs.key && lhs.original_index < rhs.original_index);
   });
   return order;
+}
+
+// Erases elements from container until predicate is satisfied.
+template<typename Container, typename Predicate>
+size_t EraseElementsUntil(Container& container, const Predicate& predicate) {
+  size_t erased = 0;
+  auto itr = container.begin();
+  while (itr != container.end() && !predicate(*itr)) {
+    itr = container.erase(itr);
+    ++erased;
+  }
+  return erased;
 }
 
 };  // namespace yb

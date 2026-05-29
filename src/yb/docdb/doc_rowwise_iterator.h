@@ -1,4 +1,4 @@
-// Copyright (c) YugaByte, Inc.
+// Copyright (c) YugabyteDB, Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License"); you may not use this file except
 // in compliance with the License.  You may obtain a copy of the License at
@@ -17,213 +17,289 @@
 #include <string>
 #include <variant>
 
-#include "yb/docdb/doc_reader.h"
-#include "yb/rocksdb/db.h"
-
 #include "yb/common/hybrid_time.h"
-#include "yb/common/ql_scanspec.h"
 #include "yb/common/read_hybrid_time.h"
 #include "yb/common/schema.h"
 
+#include "yb/docdb/deadline_info.h"
 #include "yb/docdb/doc_pgsql_scanspec.h"
 #include "yb/docdb/doc_ql_scanspec.h"
+#include "yb/docdb/doc_reader.h"
+#include "yb/docdb/intent_aware_iterator.h"
 #include "yb/docdb/key_bounds.h"
 #include "yb/docdb/ql_rowwise_iterator_interface.h"
-#include "yb/docdb/subdocument.h"
-#include "yb/docdb/value.h"
+#include "yb/docdb/read_operation_data.h"
 
-#include "yb/util/status_fwd.h"
+#include "yb/dockv/pg_key_decoder.h"
+#include "yb/dockv/subdocument.h"
+#include "yb/dockv/value.h"
+
+#include "yb/qlexpr/ql_scanspec.h"
+
+#include "yb/rocksdb/db.h"
+
 #include "yb/util/operation_counter.h"
-#include "yb/docdb/doc_read_context.h"
+#include "yb/util/status_fwd.h"
 
-namespace yb {
-namespace docdb {
+namespace yb::docdb {
 
-class IntentAwareIterator;
-class ScanChoices;
+YB_STRONGLY_TYPED_BOOL(AddTablePrefixToKey);
+
+// In tests we could set doc mode to kAny to allow fetching PgTableRow for CQL table.
+YB_DEFINE_ENUM(DocMode, (kGeneric)(kFlat)(kAny));
 
 // An SQL-mapped-to-document-DB iterator.
-class DocRowwiseIterator : public YQLRowwiseIteratorIf {
+class DocRowwiseIterator final : public YQLRowwiseIteratorIf {
  public:
-  DocRowwiseIterator(const Schema &projection,
+  DocRowwiseIterator(const dockv::ReaderProjection &projection,
                      std::reference_wrapper<const DocReadContext> doc_read_context,
                      const TransactionOperationContext& txn_op_context,
                      const DocDB& doc_db,
-                     CoarseTimePoint deadline,
-                     const ReadHybridTime& read_time,
-                     RWOperationCounter* pending_op_counter = nullptr);
+                     const ReadOperationData& read_operation_data,
+                     std::reference_wrapper<const ScopedRWOperation> pending_op);
 
-  DocRowwiseIterator(std::unique_ptr<Schema> projection,
-                     const std::shared_ptr<DocReadContext>& doc_read_context,
+  DocRowwiseIterator(const dockv::ReaderProjection& projection,
+                     std::shared_ptr<DocReadContext> doc_read_context,
                      const TransactionOperationContext& txn_op_context,
                      const DocDB& doc_db,
-                     CoarseTimePoint deadline,
-                     const ReadHybridTime& read_time,
-                     RWOperationCounter* pending_op_counter = nullptr);
+                     const ReadOperationData& read_operation_data,
+                     ScopedRWOperation&& pending_op);
 
-  DocRowwiseIterator(std::unique_ptr<Schema> projection,
-                     std::reference_wrapper<const DocReadContext> doc_read_context,
-                     const TransactionOperationContext& txn_op_context,
-                     const DocDB& doc_db,
-                     CoarseTimePoint deadline,
-                     const ReadHybridTime& read_time,
-                     RWOperationCounter* pending_op_counter = nullptr);
+  ~DocRowwiseIterator() override;
 
-  void SetupProjectionSubkeys();
-
-  virtual ~DocRowwiseIterator();
+  void SetSchema(const Schema& schema);
 
   // Init scan iterator.
-  Status Init(TableType table_type, const Slice& sub_doc_key = Slice());
+  Status InitForTableType(
+      TableType table_type, Slice sub_doc_key = Slice(), SkipSeek skip_seek = SkipSeek::kFalse,
+      AddTablePrefixToKey add_table_prefix_to_key = AddTablePrefixToKey::kFalse);
   // Init QL read scan.
-  Status Init(const QLScanSpec& spec);
-  Status Init(const PgsqlScanSpec& spec);
+  Status Init(
+      const qlexpr::YQLScanSpec& spec, SkipSeek skip_seek = SkipSeek::kFalse,
+      AllowVariableBloomFilter allow_variable_bloom_filter = AllowVariableBloomFilter::kFalse,
+      AvoidUselessNextInsteadOfSeek avoid_useless_next_instead_of_seek =
+          AvoidUselessNextInsteadOfSeek::kFalse);
 
-  // This must always be called before NextRow. The implementation actually finds the
-  // first row to scan, and NextRow expects the RocksDB iterator to already be properly
-  // positioned.
-  Result<bool> HasNext() override;
+  bool IsFetchedRowStatic() const override;
+
+  Slice row_key() const { return row_key_; }
+
+  // Returns the tuple id of the current tuple. The tuple id returned is the serialized DocKey
+  // and without the cotable id.
+  Slice GetTupleId() const override;
+
+  // Seeks to the given tuple by its id. The tuple id should be the serialized DocKey and without
+  // the cotable id.
+  void SeekTuple(
+      Slice tuple_id, UpdateFilterKey update_filter_key = UpdateFilterKey::kTrue) override;
+
+  // Returns true if tuple was fetched, false otherwise.
+  Result<bool> FetchTuple(Slice tuple_id, qlexpr::QLTableRow* row) override;
+
+  // Retrieves the next key to read after the iterator finishes for the given page.
+  Result<dockv::SubDocKey> GetSubDocKey(ReadKey read_key) override;
+
+  Slice GetRowKey() const override;
+
+  void set_debug_dump(bool value) { debug_dump_ = value; }
+
+  const Schema& schema() const {
+    return *schema_;
+  }
+
+  const dockv::SchemaPackingStorage& schema_packing_storage();
 
   std::string ToString() const override;
-
-  const Schema& schema() const override {
-    // Note: this is the schema only for the columns in the projection, not all columns.
-    return projection_;
-  }
-
-  // Is the next row to read a row with a static column?
-  bool IsNextStaticColumn() const override;
-
-  const Slice& row_key() const {
-    return row_key_;
-  }
 
   // Check if liveness column exists. Should be called only after HasNext() has been called to
   // verify the row exists.
   bool LivenessColumnExists() const;
 
-  // Skip the current row.
-  void SkipRow() override;
+  Result<ReadRestartData> GetReadRestartData() override;
 
-  HybridTime RestartReadHt() override;
+  void UpdateFilterKey(Slice user_key_for_filter);
+  void Seek(Slice key);
 
-  // Returns the tuple id of the current tuple. The tuple id returned is the serialized DocKey
-  // and without the cotable id.
-  Result<Slice> GetTupleId() const override;
+  void SeekToDocKeyPrefix(Slice doc_key_prefix) override;
 
-  // Seeks to the given tuple by its id. The tuple id should be the serialized DocKey and without
-  // the cotable id.
-  Result<bool> SeekTuple(const Slice& tuple_id) override;
+  // Refreshes the iterator if it was in finished state.
+  // filter - filter mode that should be used with refreshed iterator.
+  void Refresh(SeekFilter filter);
 
-  // Retrieves the next key to read after the iterator finishes for the given page.
-  Status GetNextReadSubDocKey(SubDocKey* sub_doc_key) override;
+  HybridTime TEST_MaxSeenHt() override;
 
-  // Iterates over records until callback fails or returns false to stop iteration.
-  Status Iterate(const YQLScanCallback& callback) override;
+  // key slice should point to block of memory, that contains kHighest after the end.
+  // So extended slice could be used as upperbound.
+  Result<bool> PgFetchNext(dockv::PgTableRow* table_row) override;
 
-  void set_debug_dump(bool value) {
-    debug_dump_ = value;
+  bool TEST_is_flat_doc() const {
+    return doc_mode_ == DocMode::kFlat;
   }
 
-  static bool is_hybrid_scan_enabled();
+  void TEST_force_allow_fetch_pg_table_row() {
+    CHECK(!use_fast_backward_scan_); // Refer to doc_mode_ description.
+    doc_mode_ = DocMode::kAny;
+  }
+
+  bool TEST_use_fast_backward_scan() const {
+    return use_fast_backward_scan_;
+  }
 
  private:
-  template <class T>
-  Status DoInit(const T& spec);
+  void CheckInitOnce();
+
+  // Initialize iter_key_ and update the row_key_.
+  // full_row - whether is keys is related to full row value. For instance packed row.
+  Status InitIterKey(Slice key, bool full_row);
+
+  // Parse the row_key_ and copy key required key columns to row.
+  Status CopyKeyColumnsToRow(const dockv::ReaderProjection& projection, qlexpr::QLTableRow* row);
+  Status CopyKeyColumnsToRow(const dockv::ReaderProjection& projection, dockv::PgTableRow* row);
+
+  template <class Row>
+  Status DoCopyKeyColumnsToRow(const dockv::ReaderProjection& projection, Row* row);
+
+  Result<DocHybridTime> GetTableTombstoneTime(Slice root_doc_key) const;
+
+  // Increments statistics for total keys found, obsolete keys (past cutoff or no) if applicable.
+  //
+  // Obsolete keys include keys that are tombstoned, TTL expired, and read-time filtered.
+  // If an obsolete key has a write time before the current history cutoff, records
+  // a separate statistic in addition as they can be cleaned in a compaction.
+  void IncrementKeyFoundStats(const bool obsolete, const EncodedDocHybridTime& write_time);
+
+  void FinalizeKeyFoundStats();
+
+  Slice shared_key_prefix() const;
+  Slice upperbound() const;
+
+  Status InitIterator(
+      const BloomFilterOptions& bloom_filter,
+      AvoidUselessNextInsteadOfSeek avoid_useless_next_instead_of_seek,
+      const rocksdb::QueryId query_id = rocksdb::kDefaultQueryId,
+      std::shared_ptr<rocksdb::ReadFileFilter> file_filter = nullptr);
+
+  Result<bool> DoFetchNext(
+      qlexpr::QLTableRow* table_row,
+      const dockv::ReaderProjection* projection,
+      qlexpr::QLTableRow* static_row,
+      const dockv::ReaderProjection* static_projection) override;
+
+  template <class TableRow>
+  Result<bool> FetchNextImpl(TableRow table_row);
+
+  void SeekPrevDocKey(Slice key);
+
   void ConfigureForYsql();
   void InitResult();
-
-  Result<bool> InitScanChoices(
-      const DocQLScanSpec& doc_spec, const KeyBytes& lower_doc_key, const KeyBytes& upper_doc_key);
-
-  Result<bool> InitScanChoices(
-      const DocPgsqlScanSpec& doc_spec, const KeyBytes& lower_doc_key,
-      const KeyBytes& upper_doc_key);
 
   // For reverse scans, moves the iterator to the first kv-pair of the previous row after having
   // constructed the current row. For forward scans nothing is necessary because GetSubDocument
   // ensures that the iterator will be positioned on the first kv-pair of the next row.
-  Status AdvanceIteratorToNextDesiredRow() const;
+  // row_finished - true when current row was fully iterated. So we would not have to perform
+  // extra Seek in case of full scan.
+  // current_fetched_row_skipped is true if we skipped processing the most recently fetched row.
+  Status AdvanceIteratorToNextDesiredRow(bool row_finished,
+                                         bool current_fetched_row_skipped);
 
   // Read next row into a value map using the specified projection.
-  Status DoNextRow(boost::optional<const Schema&> projection, QLTableRow* table_row) override;
+  Status FillRow(qlexpr::QLTableRow* table_row, const dockv::ReaderProjection* projection);
 
-  // Returns OK if row_key_ is pointing to a system key.
-  Status ValidateSystemKey();
+  struct QLTableRowPair {
+    qlexpr::QLTableRow* table_row;
+    const dockv::ReaderProjection* projection;
+    qlexpr::QLTableRow* static_row;
+    const dockv::ReaderProjection* static_projection;
+  };
 
-  const Schema& projection_;
-  // Used to maintain ownership of projection_.
-  // Separate field is used since ownership could be optional.
-  const std::unique_ptr<Schema> projection_owner_;
+  Result<DocReaderResult> FetchRow(const FetchedEntry& fetched_entry, dockv::PgTableRow* table_row);
+  Result<DocReaderResult> FetchRow(const FetchedEntry& fetched_entry, QLTableRowPair table_row);
 
+  Status FillRow(QLTableRowPair table_row);
+  Status FillRow(dockv::PgTableRow* table_row);
+
+  bool is_initialized_ = false;
+
+ private:
   // The schema for all columns, not just the columns we're scanning.
-  const DocReadContext& doc_read_context_;
+  const std::shared_ptr<DocReadContext> doc_read_context_holder_;
   // Used to maintain ownership of doc_read_context_.
-  const std::shared_ptr<DocReadContext> doc_read_context_user_;
+  const DocReadContext& doc_read_context_;
+  const Schema* schema_;
 
   const TransactionOperationContext txn_op_context_;
 
   bool is_forward_scan_ = true;
 
-  const CoarseTimePoint deadline_;
-
-  const ReadHybridTime read_time_;
+  const ReadOperationData read_operation_data_;
 
   const DocDB doc_db_;
 
   // A copy of the bound key of the end of the scan range (if any). We stop scan if iterator
   // reaches this point. This is exclusive bound for forward scans and inclusive bound for
   // reverse scans.
-  bool has_bound_key_;
-  KeyBytes bound_key_;
+  bool has_bound_key_ = false;
+  dockv::KeyBytes bound_key_;
 
+  IntentAwareIteratorPtr db_iter_;
   std::unique_ptr<ScanChoices> scan_choices_;
-  std::unique_ptr<IntentAwareIterator> db_iter_;
 
   // We keep the "pending operation" counter incremented for the lifetime of this iterator so that
   // RocksDB does not get destroyed while the iterator is still in use.
-  ScopedRWOperation pending_op_;
+  ScopedRWOperation pending_op_holder_;
+  const ScopedRWOperation& pending_op_ref_;
 
   // Indicates whether we've already finished iterating.
-  bool done_;
+  bool done_ = false;
 
-  IsFlatDoc is_flat_doc_ = IsFlatDoc::kFalse;
-
-  // HasNext constructs the whole row's SubDocument or vector of values.
-  std::variant<std::monostate, SubDocument, std::vector<PrimitiveValue>> result_;
-  // Points to appropriate alternative owned by result_ field.
-  SubDocument* row_;
-  std::vector<PrimitiveValue>* values_;
+  bool fetched_row_static_ = false;
 
   // The current row's primary key. It is set to lower bound in the beginning.
-  Slice row_key_;
+  dockv::KeyBytes row_key_;
 
-  // The current row's hash part of primary key.
-  Slice row_hash_key_;
-
-  // The current row's iterator key.
-  KeyBytes iter_key_;
-
-  // When HasNext constructs a row, row_ready_ is set to true.
-  // When NextRow consumes the row, this variable is set to false.
-  // It is initialized to false, to make sure first HasNext constructs a new row.
-  bool row_ready_;
-
-  std::vector<KeyEntryValue> projection_subkeys_;
-
-  // Used for keeping track of errors in HasNext.
-  Status has_next_status_;
+  const dockv::ReaderProjection& projection_;
+  std::optional<dockv::PgKeyDecoder> pg_key_decoder_;
 
   // Key for seeking a YSQL tuple. Used only when the table has a cotable id.
-  boost::optional<KeyBytes> tuple_key_;
-
-  std::unique_ptr<DocDBTableReader> doc_reader_;
+  std::optional<dockv::KeyBytes> tuple_key_;
 
   TableType table_type_;
   bool ignore_ttl_ = false;
 
   bool debug_dump_ = false;
+
+  // History cutoff is derived from the retention policy (if present) for statistics
+  // collection.
+  // If no retention policy is present, an "invalid" history cutoff will be used by default
+  // (i.e. all write times will be before the cutoff).
+  EncodedDocHybridTime history_cutoff_;
+  size_t keys_found_ = 0;
+  size_t obsolete_keys_found_ = 0;
+  size_t obsolete_keys_found_past_cutoff_ = 0;
+
+  KeyBuffer prefix_buffer_;
+  std::optional<IntentAwareIteratorUpperboundScope> upperbound_scope_;
+  std::optional<IntentAwareIteratorLowerboundScope> lowerbound_scope_;
+
+  // NB! Doc mode runtime change is not supported as it's value may be used in InitIterator()
+  // to configure usage of fast backward scan.
+  DocMode doc_mode_ = DocMode::kGeneric;
+
+  // Points to appropriate alternative owned by result_ field.
+  std::optional<dockv::SubDocument> row_;
+
+  std::unique_ptr<DocDBTableReader> doc_reader_;
+
+  // DocReader result returned by the previous fetch.
+  DocReaderResult prev_doc_found_ = DocReaderResult::kNotFound;
+
+  bool use_fast_backward_scan_ = false;
+
+  DeadlineInfo deadline_info_;
+
+  SeekFilter seek_filter_ = SeekFilter::kAll;
+
+  EncodedDocHybridTime max_seen_ht_checkpoint_{DocHybridTime::kMin};
 };
 
-}  // namespace docdb
-}  // namespace yb
+}  // namespace yb::docdb

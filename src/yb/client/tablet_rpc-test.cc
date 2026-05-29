@@ -1,5 +1,5 @@
 //
-// Copyright (c) YugaByte, Inc.
+// Copyright (c) YugabyteDB, Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License"); you may not use this file except
 // in compliance with the License.  You may obtain a copy of the License at
@@ -72,11 +72,11 @@ TEST_F(TabletRpcTest, TabletInvokerSelectTabletServerRace) {
     ts_map.emplace(uuid, std::make_unique<RemoteTabletServer>(uuid, nullptr, nullptr));
   }
 
-  Partition partition;
-  Partition::FromPB(tablet_locations.partition(), &partition);
+  dockv::Partition partition;
+  dockv::Partition::FromPB(tablet_locations.partition(), &partition);
   internal::RemoteTabletPtr remote_tablet = new internal::RemoteTablet(
       tablet_locations.tablet_id(), partition, /* partition_list_version = */ 0,
-      /* split_depth = */ 0, /* split_parent_id = */ "");
+      /* split_depth = */ 0, /* split_parent_id = */ "", RemoteTablet::kUnknownOpIdIndex);
 
   std::atomic<bool> stop_requested{false};
   std::thread replicas_refresher(

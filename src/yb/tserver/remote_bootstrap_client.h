@@ -15,9 +15,9 @@
 // specific language governing permissions and limitations
 // under the License.
 //
-// The following only applies to changes made to this file as part of YugaByte development.
+// The following only applies to changes made to this file as part of YugabyteDB development.
 //
-// Portions Copyright (c) YugaByte, Inc.
+// Portions Copyright (c) YugabyteDB, Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License"); you may not use this file except
 // in compliance with the License.  You may obtain a copy of the License at
@@ -31,57 +31,15 @@
 //
 #pragma once
 
-#include <atomic>
-#include <string>
-#include <memory>
-#include <vector>
-#include <unordered_map>
+#include <functional>
 
-#include <gtest/gtest_prod.h>
-
-#include "yb/consensus/consensus_fwd.h"
-#include "yb/gutil/macros.h"
-#include "yb/gutil/ref_counted.h"
-#include "yb/rpc/rpc_fwd.h"
-#include "yb/tserver/remote_bootstrap.pb.h"
-#include "yb/tserver/remote_bootstrap_file_downloader.h"
-#include "yb/util/status_fwd.h"
+#include "yb/tserver/remote_client_base.h"
 
 namespace yb {
 
-class BlockIdPB;
-class Env;
-class FsManager;
-class HostPort;
 class RemoteBootstrapITest;
 
-namespace consensus {
-class ConsensusMetadata;
-class ConsensusStatePB;
-class RaftConfigPB;
-class RaftPeerPB;
-} // namespace consensus
-
-namespace tablet {
-class RaftGroupMetadata;
-class TabletPeer;
-class TabletStatusListener;
-class RaftGroupReplicaSuperBlockPB;
-} // namespace tablet
-
 namespace tserver {
-class DataIdPB;
-class DataChunkPB;
-class RemoteBootstrapServiceProxy;
-class TSTabletManager;
-
-class RemoteBootstrapComponent {
- public:
-  virtual Status CreateDirectories(const std::string& db_dir, FsManager* fs) = 0;
-  virtual Status Download() = 0;
-
-  virtual ~RemoteBootstrapComponent() = default;
-};
 
 // Client class for using remote bootstrap to copy a tablet from another host.
 // This class is not thread-safe.
@@ -89,16 +47,16 @@ class RemoteBootstrapComponent {
 // TODO:
 // * Parallelize download of blocks and WAL segments.
 //
-class RemoteBootstrapClient {
+class RemoteBootstrapClient : public RemoteClientBase {
  public:
 
   // Construct the remote bootstrap client.
   // 'fs_manager' and 'messenger' must remain valid until this object is destroyed.
-  RemoteBootstrapClient(std::string tablet_id, FsManager* fs_manager);
+  RemoteBootstrapClient(const TabletId& tablet_id, FsManager* fs_manager);
 
   // Attempt to clean up resources on the remote end by sending an
   // EndRemoteBootstrapSession() RPC
-  ~RemoteBootstrapClient();
+  virtual ~RemoteBootstrapClient();
 
   // Pass in the existing metadata for a tombstoned tablet, which will be
   // replaced if validation checks pass in Start().
@@ -132,15 +90,17 @@ class RemoteBootstrapClient {
 
   // After downloading all files successfully, write out the completed
   // replacement superblock.
-  Status Finish();
+  Status Finish() override;
 
   // Verify that the remote bootstrap was completed successfully by verifying that the ChangeConfig
-  // request was propagated.
+  // request was propagated. `is_cancelled`, if set, is polled each iteration; when it returns true
+  // the verification is abandoned and a `ShutdownInProgress` status is returned so the RBS flow
+  // can exit promptly (e.g. during tserver shutdown, where the leader may never promote this
+  // peer to VOTER because the peer is on its way down). Callers should treat
+  // `IsShutdownInProgress()` as an expected outcome distinct from a real timeout.
   Status VerifyChangeRoleSucceeded(
-      const std::shared_ptr<consensus::Consensus>& shared_consensus);
-
-  // Removes session at server.
-  Status Remove();
+      const std::shared_ptr<consensus::Consensus>& shared_consensus,
+      const std::function<bool()>& is_cancelled = {});
 
  private:
   FRIEND_TEST(RemoteBootstrapRocksDBClientTest, TestBeginEndSession);
@@ -163,6 +123,10 @@ class RemoteBootstrapClient {
   // WAL file is opened with options so that it will fsync() on close.
   Status DownloadWAL(uint64_t wal_segment_seqno);
 
+  // Download the retryable request file.
+  // It might be abscent at the remote peer.
+  Status DownloadTabletBootstrapStateFile();
+
   // Write out the Consensus Metadata file based on the ConsensusStatePB
   // downloaded as part of initiating the remote bootstrap session.
   Status WriteConsensusMetadata();
@@ -171,31 +135,14 @@ class RemoteBootstrapClient {
 
   Status DownloadRocksDBFiles();
 
-  // End the remote bootstrap session.
-  Status EndRemoteSession();
+  uint64_t GetTotalDataSizeBytes(const tablet::RaftGroupReplicaSuperBlockPB& superblock) const;
 
-  // Return standard log prefix.
-  const std::string& LogPrefix() const {
-    return log_prefix_;
-  }
+  // Check whether local disk has enough disk space for rocksdb files in superblock.
+  Status CheckDiskSpace(
+      const tablet::RaftGroupReplicaSuperBlockPB& superblock, const std::string& rocksdb_dir);
 
-  const std::string& session_id() const {
-    return downloader_.session_id();
-  }
+  void SetInitialRbsProgressInfo();
 
-  FsManager& fs_manager() const {
-    return downloader_.fs_manager();
-  }
-
-  Env& env() const;
-
-  const std::string& permanent_uuid() const;
-
-  // Set-once members.
-  const std::string tablet_id_;
-
-  // State flags that enforce the progress of remote bootstrap.
-  bool started_ = false;            // Session started.
   // Total number of remote bootstrap sessions. Used to calculate the transmission rate across all
   // the sessions.
   bool downloaded_wal_ = false;     // WAL segments downloaded.
@@ -205,8 +152,6 @@ class RemoteBootstrapClient {
   // Session-specific data items.
   bool replace_tombstoned_tablet_ = false;
 
-  bool remove_required_ = false;
-
   // Local tablet metadata file.
   scoped_refptr<tablet::RaftGroupMetadata> meta_;
 
@@ -215,8 +160,6 @@ class RemoteBootstrapClient {
   std::unique_ptr<consensus::ConsensusMetadata> cmeta_;
 
   tablet::TabletStatusListener* status_listener_ = nullptr;
-  std::shared_ptr<RemoteBootstrapServiceProxy> proxy_;
-  std::unique_ptr<tablet::RaftGroupReplicaSuperBlockPB> superblock_;
   tablet::RaftGroupReplicaSuperBlockPB new_superblock_;
   std::unique_ptr<consensus::ConsensusStatePB> remote_committed_cstate_;
   tablet::TabletDataState remote_tablet_data_state_;
@@ -229,14 +172,9 @@ class RemoteBootstrapClient {
   // First available WAL segment.
   uint64_t first_wal_seqno_ = 0;
 
-  int64_t start_time_micros_ = 0;
+  bool download_retryable_requests_;
 
-  // We track whether this session succeeded and send this information as part of the
-  // EndRemoteBootstrapSessionRequestPB request.
-  bool succeeded_ = false;
-
-  const std::string log_prefix_;
-  RemoteBootstrapFileDownloader downloader_;
+  std::string bootstrap_source_uuid_;
 
   DISALLOW_COPY_AND_ASSIGN(RemoteBootstrapClient);
 };

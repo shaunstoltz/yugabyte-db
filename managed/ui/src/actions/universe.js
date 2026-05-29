@@ -1,4 +1,4 @@
-// Copyright (c) YugaByte, Inc.
+// Copyright (c) YugabyteDB, Inc.
 
 import axios from 'axios';
 import { ROOT_URL } from '../config';
@@ -39,6 +39,10 @@ export const PAUSE_UNIVERSE_RESPONSE = 'PAUSE_UNIVERSE_RESPONSE';
 export const RESTART_UNIVERSE = 'RESTART_UNIVERSE';
 export const RESTART_UNIVERSE_RESPONSE = 'RESTART_UNIVERSE_RESPONSE';
 
+// Get Universe load balancer state
+export const FETCH_UNIVERSE_LB_STATE = 'FETCH_UNIVERSE_LB_STATE';
+export const FETCH_UNIVERSE_LB_STATE_RESPONSE = 'FETCH_UNIVERSE_LB_STATE_RESPONSE';
+
 // Read replicas
 export const ADD_READ_REPLICA = 'ADD_READ_REPLICA';
 export const ADD_READ_REPLICA_RESPONSE = 'ADD_READ_REPLICA_RESPONSE';
@@ -48,6 +52,14 @@ export const DELETE_READ_REPLICA = 'DELETE_READ_REPLICA';
 export const DELETE_READ_REPLICA_RESPONSE = 'DELETE_READ_REPLICA_RESPONSE';
 
 // Get the Master Leader for a Universe
+export const GET_MASTER_INFO = 'GET_MASTER_INFO';
+export const GET_MASTER_INFO_RESPONSE = 'GET_MASTER_INFO_RESPONSE';
+
+export const GET_UNIVERSE_PA_REGISTRATION_STATUS = 'GET_UNIVERSE_PA_REGISTRATION_STATUS';
+export const GET_UNIVERSE_PA_REGISTRATION_STATUS_RESPONSE =
+  'GET_UNIVERSE_PA_REGISTRATION_STATUS_RESPONSE';
+
+// Get the Master Nodes Info for a Universe
 export const GET_MASTER_LEADER = 'GET_MASTER_LEADER';
 export const GET_MASTER_LEADER_RESPONSE = 'GET_MASTER_LEADER_RESPONSE';
 export const RESET_MASTER_LEADER = 'RESET_MASTER_LEADER';
@@ -116,14 +128,6 @@ export const GET_HEALTH_CHECK_RESPONSE = 'GET_HEALTH_CHECK_RESPONSE';
 export const SET_ENCRYPTION_KEY = 'SET_ENCRYPTION_KEY';
 export const SET_ENCRYPTION_KEY_RESPONSE = 'SET_ENCRYPTION_KEY_RESPONSE';
 
-export const IMPORT_UNIVERSE = 'IMPORT_UNIVERSE';
-export const IMPORT_UNIVERSE_INIT = 'IMPORT_UNIVERSE_INIT';
-export const IMPORT_UNIVERSE_RESPONSE = 'IMPORT_UNIVERSE_RESPONSE';
-export const IMPORT_UNIVERSE_RESET = 'IMPORT_UNIVERSE_RESET';
-
-export const SET_ALERTS_CONFIG = 'SET_ALERTS_CONFIG';
-export const SET_ALERTS_CONFIG_RESPONSE = 'SET_ALERTS_CONFIG_RESPONSE';
-
 export const UPDATE_BACKUP_STATE = 'UPDATE_BACKUP_STATE';
 export const UPDATE_BACKUP_STATE_RESPONSE = 'UPDATE_BACKUP_STATE_RESPONSE';
 
@@ -185,6 +189,24 @@ export function resetUniverseInfo() {
 export function fetchUniverseInfoResponse(response) {
   return {
     type: FETCH_UNIVERSE_INFO_RESPONSE,
+    payload: response
+  };
+}
+
+export function fetchUniverseLbState(universeUUID) {
+  const cUUID = localStorage.getItem('customerId');
+  const request = axios.get(
+    `${ROOT_URL}/customers/${cUUID}/universes/${universeUUID}/master_lb_state`
+  );
+  return {
+    type: FETCH_UNIVERSE_LB_STATE,
+    payload: request
+  };
+}
+
+export function fetchUniverseLbStateResponse(response) {
+  return {
+    type: FETCH_UNIVERSE_LB_STATE_RESPONSE,
     payload: response
   };
 }
@@ -537,9 +559,14 @@ export function getUniversePerNodeMetricsResponse(response) {
   };
 }
 
-export function performUniverseNodeAction(universeUUID, nodeName, actionType) {
+export function performUniverseNodeAction(
+  universeUUID,
+  nodeName,
+  actionType,
+  runOnlyPrechecks = false
+) {
   const requestUrl = `${getCustomerEndpoint()}/universes/${universeUUID}/nodes/${nodeName}`;
-  const request = axios.put(requestUrl, { nodeAction: actionType });
+  const request = axios.put(requestUrl, { nodeAction: actionType, runOnlyPrechecks });
   return {
     type: PERFORM_UNIVERSE_NODE_ACTION,
     payload: request
@@ -564,6 +591,38 @@ export function getMasterLeader(universeUUID) {
 export function getMasterLeaderResponse(response) {
   return {
     type: GET_MASTER_LEADER_RESPONSE,
+    payload: response
+  };
+}
+
+export function getMasterInfos(universeUUID) {
+  const request = axios.get(`${getCustomerEndpoint()}/universes/${universeUUID}/master_infos`);
+  return {
+    type: GET_MASTER_INFO,
+    payload: request
+  };
+}
+
+export function getMasterInfosResponse(response) {
+  return {
+    type: GET_MASTER_INFO_RESPONSE,
+    payload: response
+  };
+}
+
+export function getUniversePaRegistrationStatus(universeUUID) {
+  const request = axios.get(
+    `${getCustomerEndpoint()}/universes/${universeUUID}/pa_collector`
+  );
+  return {
+    type: GET_UNIVERSE_PA_REGISTRATION_STATUS,
+    payload: request
+  };
+}
+
+export function getUniversePaRegistrationStatusResponse(response) {
+  return {
+    type: GET_UNIVERSE_PA_REGISTRATION_STATUS_RESPONSE,
     payload: response
   };
 }
@@ -692,51 +751,6 @@ export function setEncryptionKeyResponse(response) {
   };
 }
 
-export function importUniverseInit() {
-  return {
-    type: IMPORT_UNIVERSE_INIT
-  };
-}
-
-export function importUniverse(values) {
-  const customerUUID = localStorage.getItem('customerId');
-  const request = axios.post(`${ROOT_URL}/customers/${customerUUID}/universes/import`, values);
-  return {
-    type: IMPORT_UNIVERSE,
-    payload: request
-  };
-}
-
-export function importUniverseResponse(response) {
-  return {
-    type: IMPORT_UNIVERSE_RESPONSE,
-    payload: response
-  };
-}
-
-export function importUniverseReset() {
-  return {
-    type: IMPORT_UNIVERSE_RESET
-  };
-}
-
-export function setAlertsConfig(universeUUID, data) {
-  const customerUUID = localStorage.getItem('customerId');
-  const endpoint = `${ROOT_URL}/customers/${customerUUID}/universes/${universeUUID}/config_alerts`;
-  const request = axios.post(endpoint, data);
-  return {
-    type: SET_ALERTS_CONFIG,
-    payload: request
-  };
-}
-
-export function setAlertsConfigResponse(response) {
-  return {
-    type: SET_ALERTS_CONFIG_RESPONSE,
-    payload: response
-  };
-}
-
 export function updateBackupState(universeUUID, flag) {
   const customerUUID = localStorage.getItem('customerId');
   const endpoint = `${ROOT_URL}/customers/${customerUUID}/universes/${universeUUID}/update_backup_state?markActive=${flag}`;
@@ -775,33 +789,6 @@ export function fetchSlowQueries(universeUUID, cancelFn) {
   }
 
   return request;
-}
-
-export async function fetchUnusedIndexesSuggestions(universeUUID) {
-  const customerUUID = localStorage.getItem('customerId');
-  try {
-    return await axios.get(`${ROOT_URL}/customers/${customerUUID}/universes/${universeUUID}/unused_indexes`);
-  } catch (e) {
-    return e.response;
-  }
-}
-
-export async function fetchQueryLoadSkewSuggestions(universeUUID) {
-  const customerUUID = localStorage.getItem('customerId');
-  try {
-    return await axios.get(`${ROOT_URL}/customers/${customerUUID}/universes/${universeUUID}/query_distribution_suggestions`);
-  } catch (e) {
-    return e.response;
-  }
-}
-
-export async function fetchRangeShardingSuggestions(universeUUID) {
-  const customerUUID = localStorage.getItem('customerId');
-  try {
-    return await axios.get(`${ROOT_URL}/customers/${customerUUID}/universes/${universeUUID}/range_hash`);
-  } catch (e) {
-    return e.response;
-  }
 }
 
 export function resetSlowQueries(universeUUID) {
@@ -895,5 +882,15 @@ export function validateHelmYAML(UniverseConfigureTaskParams) {
   return axios.post(`${ROOT_URL}/customers/${cUUID}/validate_kubernetes_overrides`, {
     ...UniverseConfigureTaskParams
   });
+}
 
+export async function fetchNodeDetails(universeUUID, nodeName) {
+  const customerUUID = localStorage.getItem('customerId');
+  try {
+    return await axios.get(
+      `${ROOT_URL}/customers/${customerUUID}/universes/${universeUUID}/nodes/${nodeName}/details`
+    );
+  } catch (e) {
+    throw e.response.data;
+  }
 }

@@ -6,34 +6,42 @@ import static play.mvc.Http.Status.BAD_REQUEST;
 
 import com.fasterxml.jackson.annotation.JsonBackReference;
 import com.fasterxml.jackson.annotation.JsonFormat;
+import com.fasterxml.jackson.annotation.JsonIgnore;
+import com.fasterxml.jackson.annotation.JsonProperty;
 import com.yugabyte.yw.common.PlatformServiceException;
+import com.yugabyte.yw.common.operator.KubernetesResourceDetails;
 import com.yugabyte.yw.forms.CreatePitrConfigParams;
+import io.ebean.DB;
 import io.ebean.Finder;
 import io.ebean.Model;
+import io.ebean.SqlRow;
 import io.swagger.annotations.ApiModel;
 import io.swagger.annotations.ApiModelProperty;
+import jakarta.persistence.Column;
+import jakarta.persistence.Entity;
+import jakarta.persistence.EnumType;
+import jakarta.persistence.Enumerated;
+import jakarta.persistence.Id;
+import jakarta.persistence.JoinColumn;
+import jakarta.persistence.ManyToOne;
+import jakarta.persistence.Transient;
 import java.util.Date;
 import java.util.List;
 import java.util.Optional;
 import java.util.UUID;
-import javax.persistence.Column;
-import javax.persistence.Entity;
-import javax.persistence.EnumType;
-import javax.persistence.Enumerated;
-import javax.persistence.Id;
-import javax.persistence.JoinColumn;
-import javax.persistence.ManyToOne;
-import javax.persistence.Transient;
+import java.util.stream.Collectors;
 import lombok.Data;
 import lombok.EqualsAndHashCode;
+import lombok.Getter;
+import lombok.Setter;
 import lombok.extern.slf4j.Slf4j;
 import org.yb.CommonTypes.TableType;
 import org.yb.master.CatalogEntityInfo.SysSnapshotEntryPB.State;
 
 @ApiModel(description = "PITR config created on the universe")
 @Entity
-@Slf4j
 @Data
+@Slf4j
 @EqualsAndHashCode(callSuper = false)
 public class PitrConfig extends Model {
 
@@ -42,72 +50,96 @@ public class PitrConfig extends Model {
 
   @Id
   @ApiModelProperty(value = "PITR config UUID")
-  public UUID uuid;
+  private UUID uuid;
 
   @Column
   @ApiModelProperty(value = "PITR config name")
-  public String name;
+  private String name;
 
   @ApiModelProperty(value = "Customer UUID of this config", accessMode = READ_WRITE)
   @Column(nullable = false)
-  public UUID customerUUID;
+  private UUID customerUUID;
 
   @ApiModelProperty(value = "Universe UUID of this config", accessMode = READ_WRITE)
   @ManyToOne
   @JoinColumn(name = "universe_uuid", referencedColumnName = "universe_uuid")
   @JsonBackReference
-  public Universe universe;
+  private Universe universe;
 
-  @Transient State state;
+  @Transient private State state;
 
-  @Transient long minRecoverTimeInMillis;
+  @Transient private long minRecoverTimeInMillis;
 
-  @Transient long maxRecoverTimeInMillis;
+  @Transient private long maxRecoverTimeInMillis;
 
   @ApiModelProperty(value = "Table Type", accessMode = READ_WRITE)
   @Column(nullable = false)
   @Enumerated(EnumType.STRING)
-  public TableType tableType;
+  private TableType tableType;
 
   @ApiModelProperty(value = "DB Name", accessMode = READ_WRITE)
   @Column(nullable = false)
-  public String dbName;
+  private String dbName;
+
+  @ApiModelProperty(value = "Created for DR", accessMode = READ_ONLY)
+  @Column(nullable = false)
+  private boolean createdForDr = false;
 
   @ApiModelProperty(value = "Interval between snasphots in seconds", accessMode = READ_WRITE)
   @Column(nullable = false)
-  public long scheduleInterval = 86400L;
+  private long scheduleInterval = 86400L;
 
   @ApiModelProperty(value = "Retention Period in seconds", accessMode = READ_WRITE)
   @Column(nullable = false)
-  public long retentionPeriod = 86400L * 7L;
+  private long retentionPeriod = 86400L * 7L;
 
-  @ApiModelProperty(value = "Create time of the PITR config", accessMode = READ_ONLY)
-  @JsonFormat(shape = JsonFormat.Shape.STRING, pattern = "yyyy-MM-dd'T'HH:mm:ssZ")
+  @ApiModelProperty(
+      value = "Intermittent min recovery time in millis if retention period is increased",
+      accessMode = READ_WRITE)
+  @Column(nullable = false)
+  private long intermittentMinRecoverTimeInMillis = 0L;
+
+  @ApiModelProperty(
+      value = "Create time of the PITR config",
+      accessMode = READ_ONLY,
+      example = "2022-12-12T13:07:18Z")
+  @JsonFormat(shape = JsonFormat.Shape.STRING, pattern = "yyyy-MM-dd'T'HH:mm:ss'Z'")
   @Column
   private Date createTime;
 
-  @ApiModelProperty(value = "Update time of the PITR con", accessMode = READ_WRITE)
-  @JsonFormat(shape = JsonFormat.Shape.STRING, pattern = "yyyy-MM-dd'T'HH:mm:ssZ")
+  @ApiModelProperty(
+      value = "Update time of the PITR con",
+      accessMode = READ_WRITE,
+      example = "2022-12-12T13:07:18Z")
+  @JsonFormat(shape = JsonFormat.Shape.STRING, pattern = "yyyy-MM-dd'T'HH:mm:ss'Z'")
   @Column
   private Date updateTime;
 
-  public UUID getUuid() {
-    return uuid;
-  }
+  @ApiModelProperty(value = "Whether the PITR config is disabled", accessMode = READ_ONLY)
+  @Column(nullable = false)
+  private boolean disabled = false;
+
+  @ApiModelProperty(hidden = true)
+  @Getter
+  @Setter
+  @Transient
+  private KubernetesResourceDetails kubernetesResourceDetails;
 
   public static PitrConfig create(UUID scheduleUUID, CreatePitrConfigParams params) {
     PitrConfig pitrConfig = new PitrConfig();
-    pitrConfig.uuid = scheduleUUID;
-    pitrConfig.name = params.name;
-    pitrConfig.customerUUID = params.customerUUID;
-    pitrConfig.universe = Universe.getOrBadRequest(params.universeUUID);
-    pitrConfig.tableType = params.tableType;
-    pitrConfig.dbName = params.keyspaceName;
-    pitrConfig.scheduleInterval = params.intervalInSeconds;
-    pitrConfig.retentionPeriod = params.retentionPeriodInSeconds;
+    pitrConfig.setUuid(scheduleUUID);
+    pitrConfig.setName(params.name);
+    pitrConfig.setCustomerUUID(params.customerUUID);
+    pitrConfig.setUniverse(Universe.getOrBadRequest(params.getUniverseUUID()));
+    pitrConfig.setTableType(params.tableType);
+    pitrConfig.setDbName(params.keyspaceName);
+    pitrConfig.setScheduleInterval(params.intervalInSeconds);
+    pitrConfig.setRetentionPeriod(params.retentionPeriodInSeconds);
+    pitrConfig.setCreatedForDr(params.createdForDr);
+    pitrConfig.setDisabled(false);
     Date currentDate = new Date();
-    pitrConfig.createTime = currentDate;
-    pitrConfig.updateTime = currentDate;
+    pitrConfig.setCreateTime(currentDate);
+    pitrConfig.setUpdateTime(currentDate);
     pitrConfig.save();
     return pitrConfig;
   }
@@ -118,6 +150,35 @@ public class PitrConfig extends Model {
 
   public static List<PitrConfig> getByUniverseUUID(UUID universeUUID) {
     return find.query().where().eq("universe_uuid", universeUUID).findList();
+  }
+
+  public static Optional<PitrConfig> maybeGetByName(UUID universeUUID, String name) {
+    return find.query().where().eq("universe_uuid", universeUUID).eq("name", name).findOneOrEmpty();
+  }
+
+  public static List<PitrConfig> getDisabledByUniverseUUID(UUID universeUUID) {
+    return find.query().where().eq("universe_uuid", universeUUID).eq("disabled", true).findList();
+  }
+
+  public void updateDisabledStatus(boolean disabled) {
+    this.disabled = disabled;
+    this.updateTime = new Date();
+    this.save();
+  }
+
+  public static boolean updateDisabledStatus(UUID configUUID, boolean disabled) {
+    PitrConfig pitrConfig = get(configUUID);
+    if (pitrConfig != null) {
+      pitrConfig.updateDisabledStatus(disabled);
+      return true;
+    }
+    return false;
+  }
+
+  public void updateIntermittentMinRecoverTimeInMillis(long intermittentMinRecoverTimeInMillis) {
+    this.intermittentMinRecoverTimeInMillis = intermittentMinRecoverTimeInMillis;
+    this.updateTime = new Date();
+    this.save();
   }
 
   public static PitrConfig get(UUID configUUID) {
@@ -144,5 +205,35 @@ public class PitrConfig extends Model {
         .eq("table_type", tableType.toString())
         .eq("db_name", dbName)
         .findOneOrEmpty();
+  }
+
+  @JsonProperty
+  public boolean isUsedForXCluster() {
+    String sqlStatement = "SELECT xcluster_uuid FROM xcluster_pitr WHERE pitr_uuid = :pitrUuid";
+    List<SqlRow> sqlRow = DB.sqlQuery(sqlStatement).setParameter("pitrUuid", this.uuid).findList();
+    return !sqlRow.isEmpty();
+  }
+
+  @JsonIgnore
+  public List<XClusterConfig> getXClusterConfigs() {
+    String sqlStatement = "SELECT xcluster_uuid FROM xcluster_pitr WHERE pitr_uuid = :pitrUuid";
+    List<SqlRow> sqlRow = DB.sqlQuery(sqlStatement).setParameter("pitrUuid", this.uuid).findList();
+    return sqlRow.stream()
+        .map(row -> XClusterConfig.getOrBadRequest(UUID.fromString(row.getString("xcluster_uuid"))))
+        .collect(Collectors.toList());
+  }
+
+  @JsonIgnore
+  public CreatePitrConfigParams toCreatePitrConfigParams() {
+    CreatePitrConfigParams params = new CreatePitrConfigParams();
+    params.setUniverseUUID(this.universe.getUniverseUUID());
+    params.customerUUID = this.customerUUID;
+    params.name = this.name;
+    params.keyspaceName = this.dbName;
+    params.tableType = this.tableType;
+    params.retentionPeriodInSeconds = this.retentionPeriod;
+    params.intervalInSeconds = this.scheduleInterval;
+    params.createdForDr = this.createdForDr;
+    return params;
   }
 }

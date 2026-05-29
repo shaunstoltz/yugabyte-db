@@ -1,4 +1,4 @@
-// Copyright (c) YugaByte, Inc.
+// Copyright (c) YugabyteDB, Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License"); you may not use this file except
 // in compliance with the License.  You may obtain a copy of the License at
@@ -326,6 +326,13 @@ Status DecodeFromDigitPairs(
   while (!digits->empty() && !digits->back()) {
     digits->pop_back();
   }
+  return Status::OK();
+}
+
+Status Decimal::DecodeFromComparable(Slice* slice) {
+  size_t num_decoded_bytes;
+  RETURN_NOT_OK(DecodeFromComparable(*slice, &num_decoded_bytes));
+  slice->remove_prefix(num_decoded_bytes);
   return Status::OK();
 }
 

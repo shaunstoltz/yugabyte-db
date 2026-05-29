@@ -1,4 +1,4 @@
-// Copyright (c) YugaByte, Inc.
+// Copyright (c) YugabyteDB, Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License"); you may not use this file except
 // in compliance with the License.  You may obtain a copy of the License at
@@ -24,7 +24,7 @@
 
 #include "yb/util/object_pool.h"
 
-#include "yb/yql/cql/cqlserver/cqlserver_fwd.h"
+#include "yb/yql/cql/cqlserver/cql_processor.h"
 #include "yb/yql/cql/cqlserver/cql_server_options.h"
 #include "yb/yql/cql/cqlserver/cql_service.service.h"
 #include "yb/yql/cql/cqlserver/cql_statement.h"
@@ -32,16 +32,30 @@
 #include "yb/yql/cql/ql/parser/parser_fwd.h"
 #include "yb/yql/cql/ql/util/cql_message.h"
 
+#include "ybgate/ybgate_api.h"
+
 namespace yb {
+
+namespace tserver {
+class PgYCQLStatementStatsRequestPB;
+class PgYCQLStatementStatsResponsePB;
+}
+
+class JsonWriter;
 
 namespace cqlserver {
 
 extern const char* const kRoleColumnNameSaltedHash;
 extern const char* const kRoleColumnNameCanLogin;
+extern const char* const kJwtIdentMapName;
 
 class CQLMetrics;
 class CQLProcessor;
 class CQLServer;
+
+using StmtCountersMap = std::unordered_map<ql::CQLMessage::QueryId, StmtCounters>;
+
+YB_DEFINE_ENUM(StmtType, (kPrepared)(kUnprepared)(kBatch));
 
 class CQLServiceImpl : public CQLServerServiceIf,
                        public GarbageCollector,
@@ -51,7 +65,7 @@ class CQLServiceImpl : public CQLServerServiceIf,
   CQLServiceImpl(CQLServer* server, const CQLServerOptions& opts);
   ~CQLServiceImpl();
 
-  void CompleteInit();
+  Status CompleteInit();
 
   void Shutdown() override;
 
@@ -66,9 +80,11 @@ class CQLServiceImpl : public CQLServerServiceIf,
   // Return CQL processor at pos as available.
   void ReturnProcessor(const CQLProcessorListPos& pos);
 
-  // Allocate a prepared statement. If the statement already exists, return it instead.
-  std::shared_ptr<CQLStatement> AllocatePreparedStatement(
-      const ql::CQLMessage::QueryId& id, const std::string& query, ql::QLEnv* ql_env);
+  // Allocate a statement in the specified cache. If the statement already exists, return it
+  // instead. For batch statements, is_prepared indicates whether all children were prepared.
+  std::shared_ptr<CQLStatement> AllocateStatement(
+      const ql::CQLMessage::QueryId& id, const std::string& query, ql::QLEnv* ql_env,
+      StmtType stmt_type, std::optional<bool> is_prepared = std::nullopt);
 
   // Look up a prepared statement by its id. Nullptr will be returned if the statement is not found.
   Result<std::shared_ptr<const CQLStatement>> GetPreparedStatement(
@@ -76,19 +92,23 @@ class CQLServiceImpl : public CQLServerServiceIf,
 
   std::shared_ptr<ql::Statement> GetAuthPreparedStatement() const { return auth_prepared_stmt_; }
 
-  // Delete the prepared statement from the cache.
-  void DeletePreparedStatement(const std::shared_ptr<const CQLStatement>& stmt);
+  // Delete the statement from the cache.
+  void DeleteStatement(const std::shared_ptr<const CQLStatement>& stmt, StmtType stmt_type);
 
   // Check that the password and hash match.  Leverages shared LRU cache.
   bool CheckPassword(const std::string plain, const std::string expected_bcrypt_hash);
 
-  // Return the memory tracker for prepared statements.
-  const MemTrackerPtr& prepared_stmts_mem_tracker() const {
-    return prepared_stmts_mem_tracker_;
+  // Return the memory tracker for prepared and unprepared statements.
+  const MemTrackerPtr& stmts_mem_tracker() const {
+    return stmts_mem_tracker_;
   }
 
   const MemTrackerPtr& processors_mem_tracker() const {
     return processors_mem_tracker_;
+  }
+
+  const MemTrackerPtr& requests_mem_tracker() const {
+    return requests_mem_tracker_;
   }
 
   // Return the YBClient to communicate with either master or tserver.
@@ -111,23 +131,89 @@ class CQLServiceImpl : public CQLServerServiceIf,
 
   std::shared_ptr<SystemQueryCache> system_cache() { return system_cache_; }
 
+  void DumpStatementMetricsAsJson(JsonWriter* jw);
+
+  // Get the list of statement metrics in an inmemory vector.
+  StmtCountersMap GetStatementCountersForMetrics(StmtType stmt_type);
+
+  // Update the counters for statements in the specified cache. Acquires the corresponding mutex.
+  void UpdateStmtCounters(
+      const ql::CQLMessage::QueryId& query_id, double execute_time_in_msec, StmtType stmt_type);
+
+  // Returns the counters corresponding to the query with the given query id.
+  // Returns nullptr if query doesn't exist in the prepared_stmt_map_.
+  std::shared_ptr<StmtCounters> GetWritablePrepStmtCounters(const std::string& query_id);
+
+  // Reset counters for prepared and unprepared statements.
+  void ResetStatementsCounters();
+
+  // Fetch the statement stats for prepared and unprepared statements
+  Status YCQLStatementStats(const tserver::PgYCQLStatementStatsRequestPB& req,
+      tserver::PgYCQLStatementStatsResponsePB* resp);
+
+  const std::string& GetJwtJwks() const {
+    return jwt_jwks_;
+  }
+
+  const std::string& GetJwtMatchingClaimKey() const {
+    return jwt_matching_claim_key_;
+  }
+
+  const std::vector<std::string>& GetJwtAllowedIssuers() const {
+    return jwt_allowed_issuers_;
+  }
+
+  const std::vector<std::string>& GetJwtAllowedAudience() const {
+    return jwt_allowed_audience_;
+  }
+
+  const YbgMemoryContext& GetJwtIdentMemCtx() const {
+    return jwt_ident_memctx_;
+  }
+
  private:
   constexpr static int kRpcTimeoutSec = 5;
 
-  // Insert a prepared statement at the front of the LRU list. "prepared_stmts_mutex_" needs to be
-  // locked before this call.
-  void InsertLruPreparedStatementUnlocked(const std::shared_ptr<CQLStatement>& stmt);
+  struct StatementCacheRefs {
+    CQLStatementMap& map;
+    CQLStatementList& list;
+    std::mutex& mutex;
+  };
 
-  // Move a prepared statement to the front of the LRU list. "prepared_stmts_mutex_" needs to be
-  // locked before this call.
-  void MoveLruPreparedStatementUnlocked(const std::shared_ptr<CQLStatement>& stmt);
+  StatementCacheRefs GetStatementCacheRefs(StmtType stmt_type);
 
-  // Delete a prepared statement from the cache and the LRU list. "prepared_stmts_mutex_" needs to
-  // be locked before this call.
-  void DeletePreparedStatementUnlocked(const std::shared_ptr<const CQLStatement> stmt);
+  // Insert a statement at the front of the LRU list.
+  // The corresponding mutex needs to be locked before this call.
+  void InsertLruStatementUnlocked(
+      const std::shared_ptr<CQLStatement>& stmt, CQLStatementList* stmts_list);
 
-  // Delete the least recently used prepared statement from the cache to free up memory.
+  // Move a statement to the front of the LRU list.
+  // The corresponding mutex needs to be locked before this call.
+  void MoveLruStatementUnlocked(
+      const std::shared_ptr<CQLStatement>& stmt, CQLStatementList* stmts_list);
+
+  // Delete a statement from the cache and the LRU list.
+  // The corresponding mutex needs to be locked before this call.
+  void DeleteLruStatementUnlocked(
+      const std::shared_ptr<const CQLStatement> stmt, CQLStatementList* stmts_list,
+      CQLStatementMap* stmts_map);
+
+  // Delete the least recently used statement from the largest cache to free up memory.
   void CollectGarbage(size_t required) override;
+
+  // Executes the update counters for both prepared and unprepared statements.
+  // The corresponding mutex needs to be locked before this call.
+  void UpdateCountersUnlocked(
+      double execute_time_in_msec, std::shared_ptr<StmtCounters> stmt_counters);
+
+  // Resets prepared statement counters.
+  void ResetPreparedStatementsCounters();
+
+  Status InitJwtAuth();
+  Status LoadJwtOptions(std::string* jwks_url);
+  Status LoadJwtJwks(const std::string& jwks_url);
+  Status LoadIdentConf();
+  Status ValidateJwtConfig();
 
   // CQLServer of this service.
   CQLServer* const server_;
@@ -147,21 +233,44 @@ class CQLServiceImpl : public CQLServerServiceIf,
   // Mutex that protects access to processors_.
   std::mutex processors_mutex_;
 
+  bool processors_closed_ = false;
+
   // Prepared statements cache.
   CQLStatementMap prepared_stmts_map_;
+
+  // Cache for unprepared statements counters.
+  CQLStatementMap unprepared_stmts_map_;
+
+  // Cache for batch statements counters.
+  CQLStatementMap batch_stmts_map_;
 
   // Prepared statements LRU list (least recently used one at the end).
   CQLStatementList prepared_stmts_list_;
 
+  // Unprepared statements LRU list.
+  CQLStatementList unprepared_stmts_list_;
+
+  // Batch statements LRU list.
+  CQLStatementList batch_stmts_list_;
+
   // Mutex that protects the prepared statements and the LRU list.
   std::mutex prepared_stmts_mutex_;
 
+  // Mutex that protects query statements cache.
+  std::mutex unprepared_stmts_mutex_;
+
+  // Mutex that protects batch statements cache.
+  std::mutex batch_stmts_mutex_;
+
   std::shared_ptr<ql::Statement> auth_prepared_stmt_;
 
-  // Tracker to measure and limit memory usage of prepared statements.
-  MemTrackerPtr prepared_stmts_mem_tracker_;
+  // Tracker to measure and limit memory usage of statements (prepared, unprepared, and batch).
+  MemTrackerPtr stmts_mem_tracker_;
 
   MemTrackerPtr processors_mem_tracker_;
+
+  // Tracker to measure the memory usage of CQL requests.
+  MemTrackerPtr requests_mem_tracker_;
 
   // Password and hash cache. Stores each password-hash pair as a compound key;
   // see implementation for rationale.
@@ -182,6 +291,14 @@ class CQLServiceImpl : public CQLServerServiceIf,
   rpc::Messenger* messenger_ = nullptr;
 
   int64_t num_allocated_processors_ = 0;
+
+  // JWT auth specific fields.
+  // Initialized once and used by CQLProcessor during JWT authentication.
+  std::string jwt_jwks_;
+  std::string jwt_matching_claim_key_ = "sub";
+  std::vector<std::string> jwt_allowed_audience_;
+  std::vector<std::string> jwt_allowed_issuers_;
+  YbgMemoryContext jwt_ident_memctx_;
 };
 
 }  // namespace cqlserver

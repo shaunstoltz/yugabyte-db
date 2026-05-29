@@ -1,5 +1,5 @@
 /*
- * Copyright 2019 YugaByte, Inc. and Contributors
+ * Copyright 2019 YugabyteDB, Inc. and Contributors
  *
  * Licensed under the Polyform Free Trial License 1.0.0 (the "License"); you
  * may not use this file except in compliance with the License. You
@@ -36,11 +36,12 @@ public class BackupUniverseKeys extends AbstractTaskBase {
 
   @Override
   public void run() {
-    Universe universe = Universe.getOrBadRequest(taskParams().universeUUID);
+    Universe universe = Universe.getOrBadRequest(taskParams().getUniverseUUID());
     String hostPorts = universe.getMasterAddresses();
     try {
       log.info("Running {}: hostPorts={}.", getName(), hostPorts);
-      keyManager.backupUniverseKeyHistory(taskParams().universeUUID, taskParams().storageLocation);
+      keyManager.backupUniverseKeyHistory(
+          taskParams().getUniverseUUID(), taskParams().storageLocation);
     } catch (Exception e) {
       log.error("{} hit error : {}", getName(), e.getMessage(), e);
       throw new RuntimeException(e);

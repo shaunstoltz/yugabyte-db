@@ -1,4 +1,4 @@
-// Copyright (c) YugaByte, Inc.
+// Copyright (c) YugabyteDB, Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License"); you may not use this file except
 // in compliance with the License.  You may obtain a copy of the License at
@@ -13,10 +13,17 @@
 
 #include "yb/rpc/rpc_util.h"
 
+#include "yb/rpc/messenger.h"
+
 #include "yb/util/size_literals.h"
 
 namespace yb {
 namespace rpc {
+
+void MessengerShutdownDeleter::operator()(Messenger* messenger) const {
+  messenger->Shutdown();
+  delete messenger;
+}
 
 Slice GetGlobalSkipBuffer() {
 #if (!defined(THREAD_SANITIZER))

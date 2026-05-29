@@ -15,9 +15,9 @@
 // specific language governing permissions and limitations
 // under the License.
 //
-// The following only applies to changes made to this file as part of YugaByte development.
+// The following only applies to changes made to this file as part of YugabyteDB development.
 //
-// Portions Copyright (c) YugaByte, Inc.
+// Portions Copyright (c) YugabyteDB, Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License"); you may not use this file except
 // in compliance with the License.  You may obtain a copy of the License at
@@ -52,23 +52,28 @@
 #include "yb/integration-tests/cluster_itest_util.h"
 #include "yb/integration-tests/test_workload.h"
 
-#include "yb/master/catalog_entity_info.h"
-#include "yb/master/master_defaults.h"
 #include "yb/master/master_client.pb.h"
+#include "yb/master/master_cluster_client.h"
+#include "yb/master/master_defaults.h"
 
 #include "yb/tools/admin-test-base.h"
 
+#include "yb/tools/tools_test_utils.h"
 #include "yb/util/backoff_waiter.h"
+#include "yb/util/date_time.h"
 #include "yb/util/format.h"
-#include "yb/util/jsonreader.h"
+#include "yb/util/json_document.h"
 #include "yb/util/net/net_util.h"
-#include "yb/util/port_picker.h"
-#include "yb/util/random_util.h"
 #include "yb/util/status_format.h"
-#include "yb/util/string_util.h"
 #include "yb/util/subprocess.h"
 
+#include "yb/yql/pgwrapper/libpq_utils.h"
+
 using namespace std::literals;
+
+using yb::common::GetMemberAsArray;
+using yb::common::GetMemberAsStr;
+using yb::common::PrettyWriteRapidJsonToString;
 
 namespace yb {
 namespace tools {
@@ -108,28 +113,21 @@ namespace {
 class BlacklistChecker {
  public:
   BlacklistChecker(const string& yb_admin_exe, const string& master_address) :
-      args_{yb_admin_exe, "-master_addresses", master_address, "get_universe_config"} {
+      args_{yb_admin_exe, "--master_addresses", master_address, "get_universe_config"} {
   }
 
   Status operator()(const vector<HostPort>& servers) const {
     string out;
     RETURN_NOT_OK(Subprocess::Call(args_, &out));
     boost::erase_all(out, "\n");
-    JsonReader reader(out);
+    JsonDocument doc;
+    auto root = VERIFY_RESULT(doc.Parse(out));
 
-    vector<const rapidjson::Value *> blacklistEntries;
-    const rapidjson::Value *blacklistRoot;
-    RETURN_NOT_OK(reader.Init());
-    RETURN_NOT_OK(
-        reader.ExtractObject(reader.root(), "serverBlacklist", &blacklistRoot));
-    RETURN_NOT_OK(
-        reader.ExtractObjectArray(blacklistRoot, "hosts", &blacklistEntries));
+    auto blacklistEntries = VERIFY_RESULT(root["serverBlacklist"]["hosts"].GetArray());
 
-    for (const rapidjson::Value *entry : blacklistEntries) {
-      std::string host;
-      int32_t port;
-      RETURN_NOT_OK(reader.ExtractString(entry, "host", &host));
-      RETURN_NOT_OK(reader.ExtractInt32(entry, "port", &port));
+    for (const auto &entry : blacklistEntries) {
+      auto host = VERIFY_RESULT(entry["host"].GetString());
+      auto port = VERIFY_RESULT(entry["port"].GetInt32());
       HostPort blacklistServer(host, port);
       if (std::find(servers.begin(), servers.end(), blacklistServer) ==
           servers.end()) {
@@ -151,9 +149,58 @@ class BlacklistChecker {
   vector<string> args_;
 };
 
+Result<std::string> ReadFileToString(const std::string& file_path) {
+  faststring contents;
+  RETURN_NOT_OK(yb::ReadFileToString(Env::Default(), file_path, &contents));
+  return contents.ToString();
+}
+
 } // namespace
 
+const auto kRollbackAutoFlagsCmd = "rollback_auto_flags";
+const auto kPromoteAutoFlagsCmd = "promote_auto_flags";
+const auto kClusterConfigEntryTypeName =
+    master::SysRowEntryType_Name(master::SysRowEntryType::CLUSTER_CONFIG);
+const auto kTableEntryTypeName = master::SysRowEntryType_Name(master::SysRowEntryType::TABLE);
+
+YB_STRONGLY_TYPED_BOOL(EmergencyRepairMode);
+
 class AdminCliTest : public AdminTestBase {
+ public:
+  Result<std::string> GetClusterUuid() {
+    master::GetMasterClusterConfigRequestPB config_req;
+    master::GetMasterClusterConfigResponsePB config_resp;
+    rpc::RpcController rpc;
+    rpc.set_timeout(30s);
+    RETURN_NOT_OK(
+        cluster_->GetLeaderMasterProxy<master::MasterClusterProxy>().GetMasterClusterConfig(
+            config_req, &config_resp, &rpc));
+    if (config_resp.has_error()) {
+      return StatusFromPB(config_resp.error().status());
+    }
+    return config_resp.cluster_config().cluster_uuid();
+  }
+
+  Status RestartMaster(EmergencyRepairMode mode) {
+    const auto kEmergencyRepairModeFlag = "emergency_repair_mode";
+    auto* leader_master = cluster_->GetLeaderMaster();
+    if (mode) {
+      leader_master->AddExtraFlag(kEmergencyRepairModeFlag, "true");
+    } else {
+      leader_master->RemoveExtraFlag(kEmergencyRepairModeFlag);
+    }
+
+    leader_master->Shutdown();
+    return leader_master->Restart();
+  }
+
+  std::string GetTempDir() { return *tmp_dir_; }
+
+  // Dump the cluster config catalog_entry and verify that the dump contains the correct
+  // cluster_uuid.
+  Status TestDumpSysCatalogEntry(const std::string& cluster_uuid);
+
+  TmpDirProvider tmp_dir_;
 };
 
 // Test yb-admin config change while running a workload.
@@ -163,12 +210,11 @@ class AdminCliTest : public AdminTestBase {
 // 4. Wait until the new server bootstraps.
 // 5. Profit!
 TEST_F(AdminCliTest, TestChangeConfig) {
-  FLAGS_num_tablet_servers = 3;
-  FLAGS_num_replicas = 2;
+  ANNOTATE_UNPROTECTED_WRITE(FLAGS_num_tablet_servers) = 3;
+  ANNOTATE_UNPROTECTED_WRITE(FLAGS_num_replicas) = 2;
 
   std::vector<std::string> master_flags = {
     "--catalog_manager_wait_for_new_tablets_to_elect_leader=false"s,
-    "--replication_factor=2"s,
     "--use_create_table_leader_hint=false"s,
   };
   std::vector<std::string> ts_flags = {
@@ -203,7 +249,7 @@ TEST_F(AdminCliTest, TestChangeConfig) {
   ASSERT_OK(WaitForServersToAgree(MonoDelta::FromSeconds(30), active_tablet_servers,
                                   tablet_id_, 1));
 
-  TestWorkload workload(cluster_.get());
+  TestYcqlWorkload workload(cluster_.get());
   workload.set_table_name(kTableName);
   workload.set_timeout_allowed(true);
   workload.set_write_timeout_millis(10000);
@@ -259,11 +305,10 @@ TEST_F(AdminCliTest, TestChangeConfig) {
 }
 
 TEST_F(AdminCliTest, TestDeleteTable) {
-  FLAGS_num_tablet_servers = 1;
-  FLAGS_num_replicas = 1;
+  ANNOTATE_UNPROTECTED_WRITE(FLAGS_num_tablet_servers) = 1;
+  ANNOTATE_UNPROTECTED_WRITE(FLAGS_num_replicas) = 1;
 
   vector<string> ts_flags, master_flags;
-  master_flags.push_back("--replication_factor=1");
   BuildAndStart(ts_flags, master_flags);
   string master_address = ToString(cluster_->master()->bound_rpc_addr());
 
@@ -283,11 +328,10 @@ TEST_F(AdminCliTest, TestDeleteTable) {
 }
 
 TEST_F(AdminCliTest, TestDeleteIndex) {
-  FLAGS_num_tablet_servers = 1;
-  FLAGS_num_replicas = 1;
+  ANNOTATE_UNPROTECTED_WRITE(FLAGS_num_tablet_servers) = 1;
+  ANNOTATE_UNPROTECTED_WRITE(FLAGS_num_replicas) = 1;
 
   vector<string> ts_flags, master_flags;
-  master_flags.push_back("--replication_factor=1");
   ts_flags.push_back("--index_backfill_upperbound_for_user_enforced_txn_duration_ms=12000");
   BuildAndStart(ts_flags, master_flags);
   string master_address = ToString(cluster_->master()->bound_rpc_addr());
@@ -307,7 +351,7 @@ TEST_F(AdminCliTest, TestDeleteIndex) {
 
   YBSchema index_schema;
   YBSchemaBuilder b;
-  b.AddColumn("C$_key")->Type(INT32)->NotNull()->HashPrimaryKey();
+  b.AddColumn("C$_key")->Type(DataType::INT32)->NotNull()->HashPrimaryKey();
   ASSERT_OK(b.Build(&index_schema));
 
   // Create index.
@@ -374,8 +418,8 @@ TEST_F(AdminCliTest, InvalidMasterAddresses) {
   string unreachable_host = Substitute("127.0.0.1:$0", port);
   std::string error_string;
   ASSERT_NOK(Subprocess::Call(ToStringVector(
-      GetAdminToolPath(), "-master_addresses", unreachable_host,
-      "-timeout_ms", "1000", "list_tables"), &error_string, StdFdTypes{StdFdType::kErr}));
+      GetAdminToolPath(), "--master_addresses", unreachable_host,
+      "--timeout_ms", "1000", "list_tables"), /* output */ nullptr, &error_string));
   ASSERT_STR_CONTAINS(error_string, "verify the addresses");
 }
 
@@ -390,7 +434,7 @@ TEST_F(AdminCliTest, CheckTableIdUsage) {
   const auto table_id = tables.front().table_id();
   const auto table_id_arg = Format("tableid.$0", table_id);
   auto args = ToStringVector(
-      exe_path, "-master_addresses", master_address, "list_tablets", table_id_arg);
+      exe_path, "--master_addresses", master_address, "list_tablets", table_id_arg);
   const auto args_size = args.size();
   ASSERT_OK(Subprocess::Call(args));
   // Check good optional integer argument.
@@ -399,22 +443,21 @@ TEST_F(AdminCliTest, CheckTableIdUsage) {
   // Check bad optional integer argument.
   args.resize(args_size);
   args.push_back("bad");
-  std::string output;
-  ASSERT_NOK(Subprocess::Call(args, &output, StdFdTypes{StdFdType::kErr}));
+  std::string error;
+  ASSERT_NOK(Subprocess::Call(args, /* output */ nullptr, &error));
   // Due to greedy algorithm all bad arguments are treated as table identifier.
-  ASSERT_NE(output.find("Namespace 'bad' of type 'ycql' not found"), std::string::npos);
+  ASSERT_NE(error.find("Namespace 'bad' of type 'ycql' not found"), std::string::npos);
   // Check multiple tables when single one is expected.
   args.resize(args_size);
   args.push_back(table_id_arg);
-  ASSERT_NOK(Subprocess::Call(args, &output, StdFdTypes{StdFdType::kErr}));
-  ASSERT_NE(output.find("Single table expected, 2 found"), std::string::npos);
+  ASSERT_NOK(Subprocess::Call(args, /* output */ nullptr, &error));
+  ASSERT_NE(error.find("Single table expected, 2 found"), std::string::npos);
   // Check wrong table id.
   args.resize(args_size - 1);
   const auto bad_table_id = table_id + "_bad";
   args.push_back(Format("tableid.$0", bad_table_id));
-  ASSERT_NOK(Subprocess::Call(args, &output, StdFdTypes{StdFdType::kErr}));
-  ASSERT_NE(
-      output.find(Format("Table with id '$0' not found", bad_table_id)), std::string::npos);
+  ASSERT_NOK(Subprocess::Call(args, /*output*/ nullptr, &error));
+  ASSERT_NE(error.find(Format("Table with id '$0' not found", bad_table_id)), std::string::npos);
 }
 
 TEST_F(AdminCliTest, TestSnapshotCreation) {
@@ -422,11 +465,11 @@ TEST_F(AdminCliTest, TestSnapshotCreation) {
   const auto extra_table = YBTableName(YQLDatabase::YQL_DATABASE_CQL,
                                        kTableName.namespace_name(),
                                        "extra-table");
-  YBSchemaBuilder schemaBuilder;
-  schemaBuilder.AddColumn("k")->HashPrimaryKey()->Type(yb::BINARY)->NotNull();
-  schemaBuilder.AddColumn("v")->Type(yb::BINARY)->NotNull();
+  YBSchemaBuilder schema_builder;
+  schema_builder.AddColumn("k")->HashPrimaryKey()->Type(DataType::BINARY)->NotNull();
+  schema_builder.AddColumn("v")->Type(DataType::BINARY)->NotNull();
   YBSchema schema;
-  ASSERT_OK(schemaBuilder.Build(&schema));
+  ASSERT_OK(schema_builder.Build(&schema));
   ASSERT_OK(client_->NewTableCreator()->table_name(extra_table)
       .schema(&schema).table_type(yb::client::YBTableType::YQL_TABLE_TYPE).Create());
   const auto tables = ASSERT_RESULT(client_->ListTables(kTableName.table_name(),
@@ -468,12 +511,13 @@ TEST_F(AdminCliTest, GetIsLoadBalancerIdle) {
       .add_master_server_addr(master_address)
       .Build());
 
-  // Load balancer IsIdle() logic has been changed to the following - unless a task was explicitly
-  // triggered by the load balancer (AsyncAddServerTask / AsyncRemoveServerTask / AsyncTryStepDown)
-  // then the task does not count towards determining whether the load balancer is active. If no
-  // pending LB tasks of the aforementioned types exist, the load balancer will report idle.
+  // Cluster balancer IsIdle() logic has been changed to the following - unless a task was
+  // explicitly triggered by the cluster balancer (AsyncAddServerTask / AsyncRemoveServerTask /
+  // AsyncTryStepDown) then the task does not count towards determining whether the cluster balancer
+  // is active. If no pending cluster balancer tasks of the aforementioned types exist, the cluster
+  // balancer will report idle.
 
-  // Delete table should not activate the load balancer.
+  // Delete table should not activate the cluster balancer.
   ASSERT_OK(client->DeleteTable(kTableName, false /* wait */));
   // This should timeout.
   Status s = WaitFor(
@@ -482,7 +526,7 @@ TEST_F(AdminCliTest, GetIsLoadBalancerIdle) {
         return output.compare("Idle = 0\n") == 0;
       },
       kWaitTime,
-      "wait for load balancer to stay idle");
+      "wait for cluster balancer to stay idle");
 
   ASSERT_FALSE(s.ok());
 }
@@ -503,7 +547,20 @@ TEST_F(AdminCliTest, TestLeaderStepdown) {
   const auto tablet_id = ASSERT_RESULT(regex_fetch_first(R"(\s+([a-z0-9]{32})\s+)"));
   out = ASSERT_RESULT(CallAdmin("list_tablet_servers", tablet_id));
   const auto tserver_id = ASSERT_RESULT(regex_fetch_first(R"(\s+([a-z0-9]{32})\s+\S+\s+FOLLOWER)"));
-  ASSERT_OK(CallAdmin("leader_stepdown", tablet_id, tserver_id));
+
+  // On a freshly-started cluster the chosen follower may not yet be caught up to the leader,
+  // in which case leader_stepdown returns "Suggested peer is not caught up yet". Retry until
+  // the follower catches up.
+  ASSERT_OK(WaitFor([&]() -> Result<bool> {
+    auto result = CallAdmin("leader_stepdown", tablet_id, tserver_id);
+    if (result.ok()) {
+      return true;
+    }
+    if (result.status().ToString().find("not caught up") != std::string::npos) {
+      return false;
+    }
+    return result.status();
+  }, 10s, "Leader stepdown call succeeds"));
 
   ASSERT_OK(WaitFor([&]() -> Result<bool> {
     out = VERIFY_RESULT(CallAdmin("list_tablet_servers", tablet_id));
@@ -520,6 +577,205 @@ Result<string> RegexFetchFirst(const string out, const string &exp) {
   return match[1];
 }
 } // namespace
+
+class AdminCliTestForTableLocks : public AdminCliTest {
+ public:
+  void UpdateMiniClusterOptions(ExternalMiniClusterOptions* options) override {
+    options->enable_ysql = true;
+    options->extra_tserver_flags.push_back("--enable_object_locking_for_table_locks=true");
+    options->extra_tserver_flags.push_back("--ysql_yb_ddl_transaction_block_enabled=true");
+  }
+
+ protected:
+  Result<std::pair<std::string, std::string>> ExtractTxnAndSubtxnIdFrom(
+      const HostPort& addr, const std::string& page) {
+    EasyCurl curl;
+    const std::regex txn_regex(
+        "\\{txn: ([a-z0-9]{8}-[a-z0-9]{4}-[a-z0-9]{4}-[a-z0-9]{4}-[a-z0-9]{12}) subtxn_id: "
+        "([0-9]+)\\}");
+    faststring buf;
+    auto url = strings::Substitute("http://$0/$1", ToString(addr), page);
+    RETURN_NOT_OK(curl.FetchURL(url, &buf));
+    auto lt_out = buf.ToString();
+    VLOG(1) << "Response from url: " << url << " :\n" << lt_out;
+    std::smatch match;
+    if (!std::regex_search(lt_out.cbegin(), lt_out.cend(), match, txn_regex)) {
+      return STATUS(NotFound, "Pattern not found");
+    }
+    for (std::size_t i = 0; i < match.size(); ++i) {
+      VLOG(1) << i << ": " << match[i] << '\n';
+    }
+    auto txn_id = match[1];
+    auto subtxn_id = match[2];
+    VLOG(1) << "Transaction ID: " << txn_id;
+    VLOG(1) << "Subtransaction ID: " << subtxn_id;
+    return std::make_pair(txn_id, subtxn_id);
+  }
+
+  Result<std::pair<std::string, std::string>> ExtractTxnAndSubtxnIdFromMaster() {
+    return ExtractTxnAndSubtxnIdFrom(
+        cluster_->GetLeaderMaster()->bound_http_hostport(), "ObjectLockManager");
+  }
+
+  Result<std::pair<std::string, std::string>> ExtractTxnAndSubtxnIdFromTServer(int index) {
+    return ExtractTxnAndSubtxnIdFrom(
+        cluster_->tablet_server(index)->bound_http_hostport(), "TSLocalLockManager");
+  }
+
+  Result<bool> HasLocksTServer(int index) {
+    return HasLocks(cluster_->tablet_server(index)->bound_http_hostport(), "TSLocalLockManager");
+  }
+
+  Result<bool> HasLocksMaster() {
+    return HasLocks(cluster_->GetLeaderMaster()->bound_http_hostport(), "ObjectLockManager");
+  }
+
+  Result<bool> HasLocks(const HostPort& addr, const std::string& page) {
+    auto res = ExtractTxnAndSubtxnIdFrom(addr, page);
+    if (res.ok()) {
+      return true;
+    } else if (res.status().IsNotFound()) {
+      return false;
+    } else {
+      return res.status();
+    }
+  }
+};
+
+TEST_F(AdminCliTestForTableLocks, ReleaseExclusiveLocksUsingTxnIdAndSubtxnId) {
+  BuildAndStart();
+  const std::string db_name{"yugabyte"};
+  const int kTServerIndex = 0;
+  auto conn1 = ASSERT_RESULT(cluster_->ConnectToDB(db_name, kTServerIndex));
+
+  const std::string table_name = "test_table";
+  ASSERT_OK(conn1.ExecuteFormat("CREATE TABLE $0 (id INT PRIMARY KEY, value TEXT)", table_name));
+
+  ASSERT_OK(WaitFor(
+      [&]() -> Result<bool> {
+        return !VERIFY_RESULT(HasLocksMaster());
+      },
+      10s * kTimeMultiplier, "Wait for master to be release locks asynchronously"));
+
+  ASSERT_OK(conn1.Execute("BEGIN"));
+  ASSERT_FALSE(ASSERT_RESULT(HasLocksMaster()));
+  ASSERT_FALSE(ASSERT_RESULT(HasLocksTServer(kTServerIndex)));
+  ASSERT_OK(conn1.ExecuteFormat("LOCK TABLE $0 IN ACCESS EXCLUSIVE MODE", table_name));
+  ASSERT_TRUE(ASSERT_RESULT(HasLocksMaster()));
+  ASSERT_TRUE(ASSERT_RESULT(HasLocksTServer(kTServerIndex)));
+  std::string txn_id;
+  std::string subtxn_id;
+  std::tie(txn_id, subtxn_id) = ASSERT_RESULT(ExtractTxnAndSubtxnIdFromMaster());
+
+  ASSERT_OK(CallAdmin("unsafe_release_object_locks_global", txn_id, subtxn_id));
+  ASSERT_FALSE(ASSERT_RESULT(HasLocksMaster()));
+
+  // Sanity check that other tranactions can acquire locks.
+  auto conn2 = ASSERT_RESULT(cluster_->ConnectToDB(db_name, kTServerIndex));
+  ASSERT_OK(conn2.Execute("BEGIN"));
+  ASSERT_OK(conn2.ExecuteFormat("LOCK TABLE $0 IN ACCESS EXCLUSIVE MODE", table_name));
+  ASSERT_OK(conn2.Execute("COMMIT"));
+}
+
+TEST_F(AdminCliTestForTableLocks, ReleaseExclusiveLocksUsingTxnId) {
+  BuildAndStart();
+  const std::string db_name{"yugabyte"};
+  const int kTServerIndex = 0;
+  auto conn1 = ASSERT_RESULT(cluster_->ConnectToDB(db_name, kTServerIndex));
+
+  const std::string table_name = "test_table";
+  ASSERT_OK(conn1.ExecuteFormat("CREATE TABLE $0 (id INT PRIMARY KEY, value TEXT)", table_name));
+
+  ASSERT_OK(WaitFor(
+      [&]() -> Result<bool> {
+        return !VERIFY_RESULT(HasLocksMaster());
+      },
+      10s * kTimeMultiplier, "Wait for master to be release locks asynchronously"));
+
+  ASSERT_OK(conn1.Execute("BEGIN"));
+  ASSERT_FALSE(ASSERT_RESULT(HasLocksMaster()));
+  ASSERT_FALSE(ASSERT_RESULT(HasLocksTServer(kTServerIndex)));
+  ASSERT_OK(conn1.ExecuteFormat("LOCK TABLE $0 IN ACCESS EXCLUSIVE MODE", table_name));
+  ASSERT_TRUE(ASSERT_RESULT(HasLocksMaster()));
+  ASSERT_TRUE(ASSERT_RESULT(HasLocksTServer(kTServerIndex)));
+  std::string txn_id;
+  std::tie(txn_id, std::ignore) = ASSERT_RESULT(ExtractTxnAndSubtxnIdFromMaster());
+
+  ASSERT_OK(CallAdmin("unsafe_release_object_locks_global", txn_id));
+  ASSERT_FALSE(ASSERT_RESULT(HasLocksMaster()));
+  ASSERT_FALSE(ASSERT_RESULT(HasLocksTServer(kTServerIndex)));
+
+  // Sanity check that other tranactions can acquire locks.
+  auto conn2 = ASSERT_RESULT(cluster_->ConnectToDB(db_name, kTServerIndex));
+  ASSERT_OK(conn2.Execute("BEGIN"));
+  ASSERT_OK(conn2.ExecuteFormat("LOCK TABLE $0 IN ACCESS EXCLUSIVE MODE", table_name));
+  ASSERT_OK(conn2.Execute("COMMIT"));
+}
+
+TEST_F(AdminCliTestForTableLocks, ReleaseSharedLocksAtTServer) {
+  BuildAndStart();
+  const std::string db_name{"yugabyte"};
+  const int kTServerIndex = 0;
+  auto conn1 = ASSERT_RESULT(cluster_->ConnectToDB(db_name, kTServerIndex));
+
+  const std::string table_name = "test_table";
+  ASSERT_OK(conn1.ExecuteFormat("CREATE TABLE $0 (id INT PRIMARY KEY, value TEXT)", table_name));
+
+  ASSERT_OK(conn1.Execute("BEGIN"));
+  ASSERT_OK(conn1.ExecuteFormat("LOCK TABLE $0 IN ACCESS SHARE MODE", table_name));
+  ASSERT_FALSE(ASSERT_RESULT(HasLocksMaster()));
+  ASSERT_TRUE(ASSERT_RESULT(HasLocksTServer(kTServerIndex)));
+  std::string txn_id;
+  std::tie(txn_id, std::ignore) = ASSERT_RESULT(ExtractTxnAndSubtxnIdFromTServer(kTServerIndex));
+
+  // Having this test flag allows us to release locks for unknown transactions at the master.
+  ASSERT_OK(cluster_->SetFlagOnMasters("TEST_allow_unknown_txn_release_request", "false"));
+  ASSERT_NOK(CallAdmin("unsafe_release_object_locks_global", txn_id));
+  ASSERT_TRUE(ASSERT_RESULT(HasLocksTServer(kTServerIndex)));
+
+  ASSERT_OK(CallTSCli("unsafe_release_all_locks_for_txn", txn_id));
+  ASSERT_FALSE(ASSERT_RESULT(HasLocksTServer(kTServerIndex)));
+
+  // Sanity check that other tranactions can acquire locks.
+  auto conn2 = ASSERT_RESULT(cluster_->ConnectToDB(db_name, kTServerIndex));
+  ASSERT_OK(conn2.Execute("BEGIN"));
+  ASSERT_OK(conn2.ExecuteFormat("LOCK TABLE $0 IN ACCESS EXCLUSIVE MODE", table_name));
+  ASSERT_OK(conn2.Execute("COMMIT"));
+}
+
+TEST_F(AdminCliTestForTableLocks, ReleaseSharedLocksThroughMaster) {
+  BuildAndStart();
+  const std::string db_name{"yugabyte"};
+  const int kTServerIndex = 0;
+  auto conn1 = ASSERT_RESULT(cluster_->ConnectToDB(db_name, kTServerIndex));
+
+  const std::string table_name = "test_table";
+  ASSERT_OK(conn1.ExecuteFormat("CREATE TABLE $0 (id INT PRIMARY KEY, value TEXT)", table_name));
+
+  ASSERT_OK(WaitFor(
+      [&]() -> Result<bool> {
+        return !VERIFY_RESULT(HasLocksMaster());
+      },
+      10s * kTimeMultiplier, "Wait for master to be release locks asynchronously"));
+
+  ASSERT_OK(conn1.Execute("BEGIN"));
+  ASSERT_OK(conn1.ExecuteFormat("LOCK TABLE $0 IN ACCESS SHARE MODE", table_name));
+  ASSERT_FALSE(ASSERT_RESULT(HasLocksMaster()));
+  ASSERT_TRUE(ASSERT_RESULT(HasLocksTServer(kTServerIndex)));
+  std::string txn_id = ASSERT_RESULT(ExtractTxnAndSubtxnIdFromTServer(kTServerIndex)).first;
+
+  // Having this test flag allows us to release locks for unknown transactions at the master.
+  ASSERT_OK(cluster_->SetFlagOnMasters("TEST_allow_unknown_txn_release_request", "true"));
+
+  ASSERT_OK(CallAdmin("unsafe_release_object_locks_global", txn_id));
+  ASSERT_FALSE(ASSERT_RESULT(HasLocksTServer(kTServerIndex)));
+
+  // Sanity check that other tranactions can acquire locks.
+  auto conn2 = ASSERT_RESULT(cluster_->ConnectToDB(db_name, kTServerIndex));
+  ASSERT_OK(conn2.Execute("BEGIN"));
+  ASSERT_OK(conn2.ExecuteFormat("LOCK TABLE $0 IN ACCESS EXCLUSIVE MODE", table_name));
+  ASSERT_OK(conn2.Execute("COMMIT"));
+}
 
 // Use list_tablets to list one single tablet for the table.
 // Parse out the tablet from the output.
@@ -574,46 +830,193 @@ TEST_F(AdminCliTest, TestFollowersTableList) {
       "list_tablets", kTableName.namespace_name(), kTableName.table_name(),
       "json", "include_followers"));
   boost::erase_all(lt_json_out, "\n");
-  JsonReader reader(lt_json_out);
+  JsonDocument doc;
+  auto root = ASSERT_RESULT(doc.Parse(lt_json_out));
 
-  ASSERT_OK(reader.Init());
-  vector<const rapidjson::Value *> tablets;
-  ASSERT_OK(reader.ExtractObjectArray(reader.root(), "tablets", &tablets));
-
-  for (const rapidjson::Value *entry : tablets) {
-    string tid;
-    ASSERT_OK(reader.ExtractString(entry, "id", &tid));
+  for (const auto& entry : ASSERT_RESULT(root["tablets"].GetArray())) {
+    auto tid = ASSERT_RESULT(entry["id"].GetString());
     // Testing only for the tablet received in list_tablets <table id> 1 include_followers.
     if (tid != tablet_id) {
       continue;
     }
-    const rapidjson::Value *leader;
-    ASSERT_OK(reader.ExtractObject(entry, "leader", &leader));
-    string lhp;
-    string luuid;
-    string role;
-    ASSERT_OK(reader.ExtractString(leader, "endpoint", &lhp));
-    ASSERT_OK(reader.ExtractString(leader, "uuid", &luuid));
-    ASSERT_OK(reader.ExtractString(leader, "role", &role));
+    auto leader = entry["leader"];
+    auto lhp = ASSERT_RESULT(leader["endpoint"].GetString());
+    auto luuid = ASSERT_RESULT(leader["uuid"].GetString());
+    auto role = ASSERT_RESULT(leader["role"].GetString());
     ASSERT_STR_EQ(lhp, leader_host_port);
     ASSERT_STR_EQ(luuid, leader_uuid);
     ASSERT_STR_EQ(role, PeerRole_Name(PeerRole::LEADER));
 
-    vector<const rapidjson::Value *> follower_json;
-    ASSERT_OK(reader.ExtractObjectArray(entry, "followers", &follower_json));
-    for (const rapidjson::Value *f : follower_json) {
-      string fhp;
-      string fuuid;
-      string frole;
-      ASSERT_OK(reader.ExtractString(f, "endpoint", &fhp));
-      ASSERT_OK(reader.ExtractString(f, "uuid", &fuuid));
-      ASSERT_OK(reader.ExtractString(f, "role", &frole));
+    for (const auto& f : ASSERT_RESULT(entry["followers"].GetArray())) {
+      auto fhp = ASSERT_RESULT(f["endpoint"].GetString());
+      auto fuuid = ASSERT_RESULT(f["uuid"].GetString());
+      auto frole = ASSERT_RESULT(f["role"].GetString());
       auto got = follower_hp_to_uuid_map.find(fhp);
       ASSERT_TRUE(got != follower_hp_to_uuid_map.end());
       ASSERT_STR_EQ(got->second, fuuid);
       ASSERT_STR_EQ(frole, PeerRole_Name(PeerRole::FOLLOWER));
     }
   }
+}
+
+class AdminCliTestWithYSQL : public AdminCliTest {
+ public:
+  void UpdateMiniClusterOptions(ExternalMiniClusterOptions* options) override {
+    options->enable_ysql = true;
+  }
+};
+
+// Test that partition ranges are displayed in correct format for both hash and range partitioning
+// (similar to the :9000/tablets endpoint format)
+TEST_F(AdminCliTestWithYSQL, TestPartitionRangeFormat) {
+  BuildAndStart();
+
+  // Test 1: Hash partitioned table (default CQL table)
+  string hash_table_out = ASSERT_RESULT(
+      CallAdmin("list_tablets", kTableName.namespace_name(), kTableName.table_name()));
+
+  LOG(INFO) << "Hash partitioned table output: " << hash_table_out;
+
+  // Verify hash partition format: hash_split: [0x0000, 0x3332]
+  ASSERT_NE(hash_table_out.find("hash_split:"), string::npos)
+      << "Expected hash_split format for hash table, got: " << hash_table_out;
+
+  ASSERT_NE(hash_table_out.find("0x"), string::npos)
+      << "Expected hex format ranges for hash table, got: " << hash_table_out;
+
+  // Verify that octal escape sequences are no longer present
+  ASSERT_EQ(hash_table_out.find("\\"), string::npos)
+      << "Expected no octal escape sequences in hash table, got: " << hash_table_out;
+
+  // Verify that all hex values follow the 0x0000 pattern (4 digits after 0x)
+  std::regex hex_pattern(R"(0x[0-9A-Fa-f]{4})");
+  size_t hex_count = 0;
+  std::string::const_iterator search_start(hash_table_out.cbegin());
+  std::smatch match;
+  while (std::regex_search(search_start, hash_table_out.cend(), match, hex_pattern)) {
+    hex_count++;
+    search_start = match.suffix().first;
+  }
+
+  // Should have at least 2 hex values (start and end for at least one tablet)
+  ASSERT_GE(hex_count, 2) << "Expected at least 2 hex values in 0x0000 format for hash table, got: "
+                          << hex_count;
+
+  // Test 2: Range partitioned table (YSQL table with range partitioning)
+  // Create a range partitioned table using YSQL
+  auto conn = ASSERT_RESULT(cluster_->ConnectToDB("yugabyte"));
+
+  // Create a range partitioned table with explicit splits (using ASC to force range partitioning)
+  ASSERT_OK(conn.Execute("DROP TABLE IF EXISTS range_test_table"));
+  ASSERT_OK(
+      conn.Execute("CREATE TABLE range_test_table (k int, v text, PRIMARY KEY (k ASC)) SPLIT AT "
+                   "VALUES ((10), (20), (30))"));
+
+  string range_table_out =
+      ASSERT_RESULT(CallAdmin("list_tablets", "ysql.yugabyte", "range_test_table"));
+
+  LOG(INFO) << "Range partitioned table output: " << range_table_out;
+
+  // Verify range partition format: range: [<start>, DocKey([], [20])) or range: [DocKey([], [20]),
+  // DocKey([], [40]))
+  ASSERT_NE(range_table_out.find("range:"), string::npos)
+      << "Expected range format for range table, got: " << range_table_out;
+
+  ASSERT_TRUE(
+      range_table_out.find("<start>") != string::npos ||
+      range_table_out.find("DocKey") != string::npos)
+      << "Expected <start> or DocKey format for range table, got: " << range_table_out;
+
+  ASSERT_TRUE(
+      range_table_out.find("<end>") != string::npos ||
+      range_table_out.find("DocKey") != string::npos)
+      << "Expected <end> or DocKey format for range table, got: " << range_table_out;
+
+  // Verify that range table doesn't have hex format (should have DocKey format instead)
+  ASSERT_EQ(range_table_out.find("0x"), string::npos)
+      << "Range table should not have hex format, got: " << range_table_out;
+
+  // Clean up
+  ASSERT_OK(conn.Execute("DROP TABLE range_test_table"));
+
+  // Test 3: YSQL index formatting
+  ASSERT_OK(conn.Execute("DROP TABLE IF EXISTS prf_ysql_idx_tbl"));
+  ASSERT_OK(
+      conn.Execute("CREATE TABLE prf_ysql_idx_tbl (k int, v text, PRIMARY KEY (k ASC)) SPLIT AT "
+                   "VALUES ((10), (20))"));
+  ASSERT_OK(conn.Execute("CREATE INDEX prf_ysql_idx ON prf_ysql_idx_tbl (v)"));
+
+  const string ysql_idx_out =
+      ASSERT_RESULT(CallAdmin("list_tablets", "ysql.yugabyte", "prf_ysql_idx"));
+  LOG(INFO) << "YSQL index partition output: " << ysql_idx_out;
+  const bool ysql_idx_has_hash = ysql_idx_out.find("hash_split:") != string::npos;
+  const bool ysql_idx_has_range = ysql_idx_out.find("range:") != string::npos;
+  ASSERT_TRUE(ysql_idx_has_hash || ysql_idx_has_range)
+      << "Expected either hash_split or range format for YSQL index, got: " << ysql_idx_out;
+  if (ysql_idx_has_hash) {
+    ASSERT_NE(ysql_idx_out.find("0x"), string::npos)
+        << "Expected hex ranges for hash partitioned YSQL index, got: " << ysql_idx_out;
+    ASSERT_EQ(ysql_idx_out.find("\\"), string::npos)
+        << "Expected no octal escapes for hash partitioned YSQL index, got: " << ysql_idx_out;
+  } else {
+    ASSERT_TRUE(
+        ysql_idx_out.find("<start>") != string::npos || ysql_idx_out.find("DocKey") != string::npos)
+        << "Expected <start>/<end> or DocKey for range partitioned YSQL index, got: "
+        << ysql_idx_out;
+    ASSERT_EQ(ysql_idx_out.find("0x"), string::npos)
+        << "Range partitioned YSQL index should not have hex ranges, got: " << ysql_idx_out;
+  }
+
+  // Cleanup YSQL objects
+  ASSERT_OK(conn.Execute("DROP TABLE prf_ysql_idx_tbl"));
+
+  // Test 3b: YSQL non-range table index formatting (default hash partitioned table)
+  ASSERT_OK(conn.Execute("DROP TABLE IF EXISTS prf_ysql_idx_tbl2"));
+  ASSERT_OK(conn.Execute("CREATE TABLE prf_ysql_idx_tbl2 (k int PRIMARY KEY, v int)"));
+  ASSERT_OK(conn.Execute("CREATE INDEX prf_ysql_idx2 ON prf_ysql_idx_tbl2 (v)"));
+
+  const string ysql_idx2_out =
+      ASSERT_RESULT(CallAdmin("list_tablets", "ysql.yugabyte", "prf_ysql_idx2"));
+  LOG(INFO) << "YSQL non-range index partition output: " << ysql_idx2_out;
+  ASSERT_NE(ysql_idx2_out.find("hash_split:"), string::npos)
+      << "Expected hash_split for default-partitioned YSQL index, got: " << ysql_idx2_out;
+  ASSERT_NE(ysql_idx2_out.find("0x"), string::npos)
+      << "Expected hex ranges for default-partitioned YSQL index, got: " << ysql_idx2_out;
+  ASSERT_EQ(ysql_idx2_out.find("\\"), string::npos)
+      << "Expected no octal escapes for default-partitioned YSQL index, got: " << ysql_idx2_out;
+
+  ASSERT_OK(conn.Execute("DROP TABLE prf_ysql_idx_tbl2"));
+
+  // Test 4: YCQL table and YCQL secondary index formatting
+  auto session = ASSERT_RESULT(CqlConnect());
+  const std::string ks = "ks_prf";
+  ASSERT_OK(session.ExecuteQueryFormat("CREATE KEYSPACE IF NOT EXISTS $0", ks));
+  ASSERT_OK(session.ExecuteQueryFormat("USE $0", ks));
+
+  // Create YCQL table with 5 tablets using YB client API.
+  // Create YCQL table with transactions enabled via CQL (tablet count may be defaulted).
+  ASSERT_OK(
+      session.ExecuteQuery("CREATE TABLE IF NOT EXISTS t1 (k INT PRIMARY KEY, v TEXT) WITH "
+                           "transactions = { 'enabled' : true }"));
+  ASSERT_OK(session.ExecuteQuery("CREATE INDEX IF NOT EXISTS t1_idx ON t1 (v)"));
+
+  const string ycql_tbl_out = ASSERT_RESULT(CallAdmin("list_tablets", ks, "t1"));
+  LOG(INFO) << "YCQL table partition output: " << ycql_tbl_out;
+  ASSERT_NE(ycql_tbl_out.find("hash_split:"), string::npos)
+      << "Expected hash_split for YCQL table, got: " << ycql_tbl_out;
+  ASSERT_NE(ycql_tbl_out.find("0x"), string::npos)
+      << "Expected hex ranges for YCQL table, got: " << ycql_tbl_out;
+  ASSERT_EQ(ycql_tbl_out.find("\\"), string::npos)
+      << "Expected no octal escapes for YCQL table, got: " << ycql_tbl_out;
+
+  const string ycql_idx_out = ASSERT_RESULT(CallAdmin("list_tablets", ks, "t1_idx"));
+  LOG(INFO) << "YCQL index partition output: " << ycql_idx_out;
+  ASSERT_NE(ycql_idx_out.find("hash_split:"), string::npos)
+      << "Expected hash_split for YCQL index, got: " << ycql_idx_out;
+  ASSERT_NE(ycql_idx_out.find("0x"), string::npos)
+      << "Expected hex ranges for YCQL index, got: " << ycql_idx_out;
+  ASSERT_EQ(ycql_idx_out.find("\\"), string::npos)
+      << "Expected no octal escapes for YCQL index, got: " << ycql_idx_out;
 }
 
 TEST_F(AdminCliTest, TestGetClusterLoadBalancerState) {
@@ -633,7 +1036,7 @@ TEST_F(AdminCliTest, TestGetClusterLoadBalancerState) {
 
   output = ASSERT_RESULT(CallAdmin("set_load_balancer_enabled", "0"));
 
-  ASSERT_EQ(output.find("Unable to change load balancer state"), std::string::npos);
+  ASSERT_EQ(output.find("Unable to change cluster balancer state"), std::string::npos);
 
   output = ASSERT_RESULT(CallAdmin("get_load_balancer_state"));
 
@@ -641,7 +1044,7 @@ TEST_F(AdminCliTest, TestGetClusterLoadBalancerState) {
 
   output = ASSERT_RESULT(CallAdmin("set_load_balancer_enabled", "1"));
 
-  ASSERT_EQ(output.find("Unable to change load balancer state"), std::string::npos);
+  ASSERT_EQ(output.find("Unable to change cluster balancer state"), std::string::npos);
 
   output = ASSERT_RESULT(CallAdmin("get_load_balancer_state"));
 
@@ -666,8 +1069,8 @@ TEST_F(AdminCliTest, TestModifyPlacementPolicy) {
 
 TEST_F(AdminCliTest, TestModifyTablePlacementPolicy) {
   // Start a cluster with 3 tservers, each corresponding to a different zone.
-  FLAGS_num_tablet_servers = 3;
-  FLAGS_num_replicas = 2;
+  ANNOTATE_UNPROTECTED_WRITE(FLAGS_num_tablet_servers) = 3;
+  ANNOTATE_UNPROTECTED_WRITE(FLAGS_num_replicas) = 2;
   std::vector<std::string> master_flags;
   master_flags.push_back("--enable_load_balancing=true");
   master_flags.push_back("--catalog_manager_wait_for_new_tablets_to_elect_leader=false");
@@ -690,7 +1093,7 @@ TEST_F(AdminCliTest, TestModifyTablePlacementPolicy) {
                                        kTableName.namespace_name(),
                                        "extra-table");
   // Start a workload.
-  TestWorkload workload(cluster_.get());
+  TestYcqlWorkload workload(cluster_.get());
   workload.set_table_name(extra_table);
   workload.set_timeout_allowed(true);
   workload.set_sequential_write(true);
@@ -716,16 +1119,16 @@ TEST_F(AdminCliTest, TestModifyTablePlacementPolicy) {
       "c.r.z0,c.r.z1,c.r.z2", 3, random_placement_uuid));
 
   ASSERT_OK(client->OpenTable(extra_table, &table));
-  ASSERT_TRUE(table->replication_info().get().live_replicas().placement_uuid().empty());
+  ASSERT_TRUE(table->replication_info()->live_replicas().placement_uuid().empty());
 
   // Fetch the placement policy for the table and verify that it matches
   // the custom info set previously.
   ASSERT_OK(client->OpenTable(extra_table, &table));
   vector<bool> found_zones;
   found_zones.assign(3, false);
-  ASSERT_EQ(table->replication_info().get().live_replicas().placement_blocks_size(), 3);
+  ASSERT_EQ(table->replication_info()->live_replicas().placement_blocks_size(), 3);
   for (int ii = 0; ii < 3; ++ii) {
-    auto pb = table->replication_info().get().live_replicas().placement_blocks(ii).cloud_info();
+    auto pb = table->replication_info()->live_replicas().placement_blocks(ii).cloud_info();
     ASSERT_EQ(pb.placement_cloud(), "c");
     ASSERT_EQ(pb.placement_region(), "r");
     if (pb.placement_zone() == "z0") {
@@ -748,17 +1151,17 @@ TEST_F(AdminCliTest, TestModifyTablePlacementPolicy) {
 
   // Verify that changing the placement _uuid for a table fails if the
   // placement_uuid does not match the cluster live placement_uuid.
-  ASSERT_NOK(CallAdmin(
-      "modify_table_placement_info", table_id, "c.r.z1", 1, random_placement_uuid));
+  ASSERT_NOK(
+      CallAdmin("modify_table_placement_info", table_id, "c.r.z1", 1, random_placement_uuid));
 
   ASSERT_OK(client->OpenTable(extra_table, &table));
-  ASSERT_TRUE(table->replication_info().get().live_replicas().placement_uuid().empty());
+  ASSERT_TRUE(table->replication_info()->live_replicas().placement_uuid().empty());
 
   // Fetch the placement policy for the table and verify that it matches
   // the custom info set previously.
   ASSERT_OK(client->OpenTable(extra_table, &table));
-  ASSERT_EQ(table->replication_info().get().live_replicas().placement_blocks_size(), 1);
-  auto pb = table->replication_info().get().live_replicas().placement_blocks(0).cloud_info();
+  ASSERT_EQ(table->replication_info()->live_replicas().placement_blocks_size(), 1);
+  auto pb = table->replication_info()->live_replicas().placement_blocks(0).cloud_info();
   ASSERT_EQ(pb.placement_cloud(), "c");
   ASSERT_EQ(pb.placement_region(), "r");
   ASSERT_EQ(pb.placement_zone(), "z1");
@@ -780,8 +1183,8 @@ TEST_F(AdminCliTest, TestModifyTablePlacementPolicy) {
 
 TEST_F(AdminCliTest, TestCreateTransactionStatusTablesWithPlacements) {
   // Start a cluster with 3 tservers, each corresponding to a different zone.
-  FLAGS_num_tablet_servers = 3;
-  FLAGS_num_replicas = 3;
+  ANNOTATE_UNPROTECTED_WRITE(FLAGS_num_tablet_servers) = 3;
+  ANNOTATE_UNPROTECTED_WRITE(FLAGS_num_replicas) = 3;
   std::vector<std::string> master_flags;
   master_flags.push_back("--enable_load_balancing=true");
   master_flags.push_back("--catalog_manager_wait_for_new_tablets_to_elect_leader=false");
@@ -796,7 +1199,7 @@ TEST_F(AdminCliTest, TestCreateTransactionStatusTablesWithPlacements) {
                                        kTableName.namespace_name(),
                                        "extra-table");
   // Start a workload.
-  TestWorkload workload(cluster_.get());
+  TestYcqlWorkload workload(cluster_.get());
   workload.set_table_name(extra_table);
   workload.set_timeout_allowed(true);
   workload.set_sequential_write(true);
@@ -819,13 +1222,12 @@ TEST_F(AdminCliTest, TestCreateTransactionStatusTablesWithPlacements) {
   // Verify that the tables are all in transaction status tables in the right zone.
   std::shared_ptr<client::YBTable> table;
   for (int i = 0; i < 3; ++i) {
-    const auto table_name = YBTableName(YQLDatabase::YQL_DATABASE_CQL,
-                                        "system",
-                                        Substitute("transactions_z$0", i));
+    const auto table_name =
+        YBTableName(YQLDatabase::YQL_DATABASE_CQL, "system", Substitute("transactions_z$0", i));
     ASSERT_OK(client->OpenTable(table_name, &table));
     ASSERT_EQ(table->table_type(), YBTableType::TRANSACTION_STATUS_TABLE_TYPE);
-    ASSERT_EQ(table->replication_info().get().live_replicas().placement_blocks_size(), 1);
-    auto pb = table->replication_info().get().live_replicas().placement_blocks(0).cloud_info();
+    ASSERT_EQ(table->replication_info()->live_replicas().placement_blocks_size(), 1);
+    auto pb = table->replication_info()->live_replicas().placement_blocks(0).cloud_info();
     ASSERT_EQ(pb.placement_zone(), Substitute("z$0", i));
   }
 
@@ -863,8 +1265,8 @@ TEST_F(AdminCliTest, TestCreateTransactionStatusTablesWithPlacements) {
 
 TEST_F(AdminCliTest, TestClearPlacementPolicy) {
   // Start a cluster with 3 tservers.
-  FLAGS_num_tablet_servers = 3;
-  FLAGS_num_replicas = 2;
+  ANNOTATE_UNPROTECTED_WRITE(FLAGS_num_tablet_servers) = 3;
+  ANNOTATE_UNPROTECTED_WRITE(FLAGS_num_replicas) = 2;
   std::vector<std::string> master_flags;
   master_flags.push_back("--enable_load_balancing=true");
   std::vector<std::string> ts_flags;
@@ -915,39 +1317,54 @@ TEST_F(AdminCliTest, DdlLog) {
 
   auto document = ASSERT_RESULT(CallJsonAdmin("ddl_log"));
 
-  auto log = ASSERT_RESULT(Get(document, "log")).get().GetArray();
+  auto log = ASSERT_RESULT(GetMemberAsArray(document, "log"));
   ASSERT_EQ(log.Size(), 3);
   std::vector<std::string> actions;
+  actions.reserve(log.Size());
   for (const auto& entry : log) {
-    LOG(INFO) << "Entry: " << common::PrettyWriteRapidJsonToString(entry);
+    LOG(INFO) << "Entry: " << PrettyWriteRapidJsonToString(entry);
     TableType type;
     bool parse_result = TableType_Parse(
-        ASSERT_RESULT(Get(entry, "table_type")).get().GetString(), &type);
+        std::string(ASSERT_RESULT(GetMemberAsStr(entry, "table_type"))), &type);
     ASSERT_TRUE(parse_result);
     ASSERT_EQ(type, TableType::YQL_TABLE_TYPE);
-    auto namespace_name = ASSERT_RESULT(Get(entry, "namespace")).get().GetString();
+    auto namespace_name = ASSERT_RESULT(GetMemberAsStr(entry, "namespace"));
     ASSERT_EQ(namespace_name, kNamespaceName);
-    auto table_name = ASSERT_RESULT(Get(entry, "table")).get().GetString();
+    auto table_name = ASSERT_RESULT(GetMemberAsStr(entry, "table"));
     ASSERT_EQ(table_name, kTableName);
-    actions.emplace_back(ASSERT_RESULT(Get(entry, "action")).get().GetString());
+    actions.emplace_back(ASSERT_RESULT(GetMemberAsStr(entry, "action")));
   }
   ASSERT_EQ(actions[0], "Drop column text_column");
   ASSERT_EQ(actions[1], "Drop index test_idx");
-  ASSERT_EQ(actions[2], "Add column int_column[int32 NULLABLE NOT A PARTITION KEY]");
+  ASSERT_EQ(actions[2], "Add column int_column[int32 NULLABLE VALUE]");
 }
 
-TEST_F(AdminCliTest, FlushSysCatalog) {
+TEST_F(AdminCliTest, FlushSysCatalogAll) {
   BuildAndStart();
   string master_address = ToString(cluster_->master()->bound_rpc_addr());
   auto client = ASSERT_RESULT(YBClientBuilder().add_master_server_addr(master_address).Build());
   ASSERT_OK(CallAdmin("flush_sys_catalog"));
 }
 
-TEST_F(AdminCliTest, CompactSysCatalog) {
+TEST_F(AdminCliTest, FlushSysCatalogLeaderOnly) {
+  BuildAndStart();
+  string master_address = ToString(cluster_->master()->bound_rpc_addr());
+  auto client = ASSERT_RESULT(YBClientBuilder().add_master_server_addr(master_address).Build());
+  ASSERT_OK(CallAdmin("flush_sys_catalog", "leader_only"));
+}
+
+TEST_F(AdminCliTest, CompactSysCatalogAll) {
   BuildAndStart();
   string master_address = ToString(cluster_->master()->bound_rpc_addr());
   auto client = ASSERT_RESULT(YBClientBuilder().add_master_server_addr(master_address).Build());
   ASSERT_OK(CallAdmin("compact_sys_catalog"));
+}
+
+TEST_F(AdminCliTest, CompactSysCatalogLeaderOnly) {
+  BuildAndStart();
+  string master_address = ToString(cluster_->master()->bound_rpc_addr());
+  auto client = ASSERT_RESULT(YBClientBuilder().add_master_server_addr(master_address).Build());
+  ASSERT_OK(CallAdmin("compact_sys_catalog", "leader_only"));
 }
 
 // A simple smoke test to ensure it working and
@@ -1064,18 +1481,17 @@ class AdminCliListTabletsTest : public AdminCliTest {
 
   template <class... Args>
   Result<std::size_t> GetListTabletsCount(Args&&... args) {
-    JsonReader reader(VERIFY_RESULT(ListTablets(std::forward<Args>(args)..., "json")));
-    RETURN_NOT_OK(reader.Init());
-    vector<const rapidjson::Value*> tablets;
-    RETURN_NOT_OK(reader.ExtractObjectArray(reader.root(), "tablets", &tablets));
-    return tablets.size();
+    JsonDocument doc;
+    auto root = VERIFY_RESULT(doc.Parse(VERIFY_RESULT(ListTablets(std::forward<Args>(args)...,
+                                                                  "json"))));
+    return root["tablets"].size();
   }
 
  private:
   template <class... Args>
   Result<std::string> ListTablets(Args&&... args) {
     return CallAdminVec(ToStringVector(
-        GetAdminToolPath(), "-master_addresses", GetMasterAddresses(), "list_tablets",
+        GetAdminToolPath(), "--master_addresses", GetMasterAddresses(), "list_tablets",
         std::forward<Args>(args)...));
   }
 };
@@ -1118,16 +1534,16 @@ TEST_F_EX(AdminCliTest, CheckTableNameAndNamespaceUsage, AdminCliListTabletsTest
 }
 
 TEST_F_EX(AdminCliTest, ListTabletDefaultTenTablets, AdminCliListTabletsTest) {
-  FLAGS_num_tablet_servers = 1;
-  FLAGS_num_replicas = 1;
+  ANNOTATE_UNPROTECTED_WRITE(FLAGS_num_tablet_servers) = 1;
+  ANNOTATE_UNPROTECTED_WRITE(FLAGS_num_replicas) = 1;
 
-  ASSERT_NO_FATALS(BuildAndStart({}, {"--replication_factor=1"}));
+  ASSERT_NO_FATALS(BuildAndStart({}, {}));
 
   YBSchema schema;
-  YBSchemaBuilder schemaBuilder;
-  schemaBuilder.AddColumn("k")->HashPrimaryKey()->Type(yb::BINARY)->NotNull();
-  schemaBuilder.AddColumn("v")->Type(yb::BINARY)->NotNull();
-  ASSERT_OK(schemaBuilder.Build(&schema));
+  YBSchemaBuilder schema_builder;
+  schema_builder.AddColumn("k")->HashPrimaryKey()->Type(DataType::BINARY)->NotNull();
+  schema_builder.AddColumn("v")->Type(DataType::BINARY)->NotNull();
+  ASSERT_OK(schema_builder.Build(&schema));
 
   const auto client =
       ASSERT_RESULT(YBClientBuilder().add_master_server_addr(GetMasterAddresses()).Build());
@@ -1151,47 +1567,217 @@ TEST_F_EX(AdminCliTest, ListTabletDefaultTenTablets, AdminCliListTabletsTest) {
   ASSERT_EQ(count, 20);
 }
 
-// A simple smoke test to ensure it working and
-// nothing is broken by future changes.
+TEST_F_EX(AdminCliTest, TestSplitTabletDefault, AdminCliListTabletsTest) {
+  BuildAndStart();
+  const auto& keyspace = kTableName.namespace_name();
+  const auto& table_name = kTableName.table_name();
+
+  // Insert some rows.
+  TestYcqlWorkload workload(cluster_.get());
+  workload.set_table_name(kTableName);
+  workload.set_timeout_allowed(true);
+  workload.Setup();
+  workload.Start();
+  workload.WaitInserted(100);
+  workload.StopAndJoin();
+  LOG(INFO) << "Number of rows inserted: " << workload.rows_inserted();
+
+  // Flush to SST. The middle key determination Tablet::GetEncodedMiddleSplitKey() works off SSTs.
+  ASSERT_OK(CallAdmin("flush_table", keyspace, table_name));
+
+  // Split tablet.
+  ASSERT_OK(cluster_->SetFlagOnMasters("TEST_enable_multi_way_tablet_split", "false"));
+  ASSERT_OK(CallAdmin("split_tablet", tablet_id_));
+
+  // Verify the default split creates 2 child tablets.
+  constexpr int kSplitFactor = 2;
+  ASSERT_OK(WaitFor(
+      [&]() -> Result<bool> {
+        return kSplitFactor == VERIFY_RESULT(GetListTabletsCount(keyspace, table_name));
+      }, 30s, "Wait for tablet split to complete"));
+}
+
+TEST_F_EX(AdminCliTest, TestSplitTabletMultiWay, AdminCliListTabletsTest) {
+  BuildAndStart();
+  const auto& keyspace = kTableName.namespace_name();
+  const auto& table_name = kTableName.table_name();
+
+  // Insert some rows.
+  TestYcqlWorkload workload(cluster_.get());
+  workload.set_table_name(kTableName);
+  workload.set_timeout_allowed(true);
+  workload.Setup();
+  workload.Start();
+  workload.WaitInserted(100);
+  workload.StopAndJoin();
+  LOG(INFO) << "Number of rows inserted: " << workload.rows_inserted();
+
+  // Verify multi-way split is disallowed when gFlag is disabled.
+  constexpr int kSplitFactor = 5;
+  ASSERT_OK(cluster_->SetFlagOnMasters("TEST_enable_multi_way_tablet_split", "false"));
+  ASSERT_NOK_STR_CONTAINS(
+      CallAdmin("split_tablet", tablet_id_, kSplitFactor),
+      "Split factor must be 2");
+
+  // Verify multi-way split is allowed when gFlag is enabled.
+  ASSERT_OK(cluster_->SetFlagOnMasters("TEST_enable_multi_way_tablet_split", "true"));
+  ASSERT_OK(CallAdmin("split_tablet", tablet_id_, kSplitFactor));
+
+  // Verify the split creates 5 child tablets.
+  ASSERT_OK(WaitFor(
+      [&]() -> Result<bool> {
+        return kSplitFactor == VERIFY_RESULT(GetListTabletsCount(keyspace, table_name));
+      }, 30s, "Wait for tablet split to complete"));
+}
+
+TEST_F(AdminCliTest, GetAutoFlagsConfig) {
+  BuildAndStart();
+  auto message = ASSERT_RESULT(CallAdmin("get_auto_flags_config"));
+  ASSERT_STR_CONTAINS(message, R"#(AutoFlags config:
+config_version: 1
+promoted_flags {)#");
+}
+
 TEST_F(AdminCliTest, PromoteAutoFlags) {
   BuildAndStart();
   const auto master_address = ToString(cluster_->master()->bound_rpc_addr());
 
-  {
-    const auto status = CallAdmin("promote_auto_flags", "invalid");
-    ASSERT_NOK(status);
-    ASSERT_NE(
-        status.ToString().find("Invalid value provided for max_flags_class"), std::string::npos);
-  }
+  ASSERT_NOK_STR_CONTAINS(
+      CallAdmin(kPromoteAutoFlagsCmd, "invalid"), "Invalid value provided for max_flags_class");
+  ASSERT_NOK_STR_CONTAINS(
+      CallAdmin(kPromoteAutoFlagsCmd, "kExternal", "invalid"), "Invalid arguments for operation");
+  ASSERT_NOK_STR_CONTAINS(
+      CallAdmin(kPromoteAutoFlagsCmd, "kExternal", "force", "invalid"),
+      "Invalid arguments for operation");
 
-  {
-    const auto status = CallAdmin("promote_auto_flags", "kExternal", "invalid");
-    ASSERT_NOK(status);
-    ASSERT_NE(
-        status.ToString().find("Invalid value provided for promote_non_runtime_flags"),
-        std::string::npos);
-  }
+  ASSERT_OK(CallAdmin(kPromoteAutoFlagsCmd, "kLocalVolatile"));
+  ASSERT_OK(CallAdmin(kPromoteAutoFlagsCmd, "kLocalPersisted"));
+  ASSERT_OK(CallAdmin(kPromoteAutoFlagsCmd, "kExternal"));
 
-  {
-    const auto status = CallAdmin("promote_auto_flags", "kExternal", "true", "invalid");
-    ASSERT_NOK(status);
-    ASSERT_NE(status.ToString().find("Invalid arguments for operation"), std::string::npos);
-  }
+  auto result = ASSERT_RESULT(CallAdmin(kPromoteAutoFlagsCmd, "kLocalVolatile"));
+  ASSERT_STR_CONTAINS(
+      result,
+      "PromoteAutoFlags completed successfully\n"
+      "No new AutoFlags eligible to promote\n"
+      "Current config version: 1");
 
-  ASSERT_OK(CallAdmin("promote_auto_flags", "kLocalVolatile", "false"));
-  ASSERT_OK(CallAdmin("promote_auto_flags", "kLocalVolatile", "true"));
+  result = ASSERT_RESULT(CallAdmin(kPromoteAutoFlagsCmd, "kLocalVolatile", "force"));
+  ASSERT_STR_CONTAINS(
+      result,
+      "PromoteAutoFlags completed successfully\n"
+      "New AutoFlags were promoted\n"
+      "New config version: 2");
+}
 
-  ASSERT_OK(CallAdmin("promote_auto_flags", "kLocalPersisted", "false"));
-  ASSERT_OK(CallAdmin("promote_auto_flags", "kLocalPersisted", "true"));
+TEST_F(AdminCliTest, RollbackAutoFlags) {
+  BuildAndStart(
+      /* ts_flags = */ {}, /* master_flags = */ {"--limit_auto_flag_promote_for_new_universe=0"});
+  const auto master_address = ToString(cluster_->master()->bound_rpc_addr());
 
-  ASSERT_OK(CallAdmin("promote_auto_flags", "kExternal", "false"));
-  ASSERT_OK(CallAdmin("promote_auto_flags", "kExternal", "true"));
+  auto status = CallAdmin(kRollbackAutoFlagsCmd);
+  ASSERT_NOK(status);
+  ASSERT_NE(status.ToString().find("Invalid arguments for operation"), std::string::npos);
 
-  auto result = ASSERT_RESULT(CallAdmin("promote_auto_flags", "kLocalVolatile", "false"));
-  ASSERT_NE(result.find("No new AutoFlags to promote"), std::string::npos);
+  status = CallAdmin(kRollbackAutoFlagsCmd, "invalid");
+  ASSERT_NOK(status);
+  ASSERT_NE(status.ToString().find("invalid is not a valid number"), std::string::npos);
 
-  result = ASSERT_RESULT(CallAdmin("promote_auto_flags", "kLocalVolatile", "false", "force"));
-  ASSERT_NE(result.find("New AutoFlags were promoted. Config version"), std::string::npos);
+  status = CallAdmin(kRollbackAutoFlagsCmd, std::numeric_limits<int64_t>::max());
+  ASSERT_NOK(status);
+  ASSERT_STR_CONTAINS(status.ToString(), "rollback_version exceeds bounds");
+
+  auto result = ASSERT_RESULT(CallAdmin(kRollbackAutoFlagsCmd, 0));
+  ASSERT_STR_CONTAINS(
+      result,
+      "RollbackAutoFlags completed successfully\n"
+      "No AutoFlags have been promoted since version 0\n"
+      "Current config version: 0");
+
+  result = ASSERT_RESULT(CallAdmin(kPromoteAutoFlagsCmd, "kLocalVolatile"));
+  ASSERT_STR_CONTAINS(
+      result,
+      "New AutoFlags were promoted\n"
+      "New config version:");
+
+  result = ASSERT_RESULT(CallAdmin(kRollbackAutoFlagsCmd, 0));
+  ASSERT_STR_CONTAINS(
+      result,
+      "RollbackAutoFlags completed successfully\n"
+      "AutoFlags that were promoted after config version 0 were successfully rolled back\n"
+      "New config version: 2");
+
+  result = ASSERT_RESULT(CallAdmin(kRollbackAutoFlagsCmd, 0));
+  ASSERT_STR_CONTAINS(
+      result,
+      "RollbackAutoFlags completed successfully\n"
+      "No AutoFlags have been promoted since version 0\n"
+      "Current config version: 2");
+
+  result = ASSERT_RESULT(CallAdmin(kPromoteAutoFlagsCmd));
+  ASSERT_STR_CONTAINS(
+      result,
+      "PromoteAutoFlags completed successfully\n"
+      "New AutoFlags were promoted\n"
+      "New config version: 3");
+
+  // Rollback external AutoFlags should fail.
+  status = CallAdmin(kRollbackAutoFlagsCmd, 0);
+  ASSERT_NOK(status);
+  ASSERT_STR_CONTAINS(status.ToString(), "is not eligible for rollback");
+}
+
+TEST_F(AdminCliTest, PromoteDemoteSingleAutoFlag) {
+  BuildAndStart();
+  const auto kPromoteSingleFlaCmd = "promote_single_auto_flag";
+  const auto kDemoteSingleFlagCmd = "demote_single_auto_flag";
+
+  // Promote a single AutoFlag
+  auto result = CallAdmin(kPromoteSingleFlaCmd, "NAProcess", "NAFlag");
+  ASSERT_NOK(result);
+  ASSERT_STR_CONTAINS(result.ToString(), "Process NAProcess not found");
+
+  result = CallAdmin(kPromoteSingleFlaCmd, "yb-master", "NAFlag");
+  ASSERT_NOK(result);
+  ASSERT_STR_CONTAINS(result.ToString(), "AutoFlag NAFlag not found in process yb-master");
+
+  result = CallAdmin(kPromoteSingleFlaCmd, "yb-master", "TEST_auto_flags_initialized");
+  ASSERT_OK(result);
+  ASSERT_STR_CONTAINS(
+      result.ToString(),
+      "Failed to promote AutoFlag TEST_auto_flags_initialized from process yb-master. Check the "
+      "logs for more information\n"
+      "Current config version: 1");
+
+  // Demote a single AutoFlag
+  result = CallAdmin(kDemoteSingleFlagCmd, "NAProcess", "NAFlag", "force");
+  ASSERT_NOK(result);
+  ASSERT_STR_CONTAINS(result.ToString(), "Process NAProcess not found");
+
+  result = CallAdmin(kDemoteSingleFlagCmd, "yb-master", "NAFlag", "force");
+  ASSERT_NOK(result);
+  ASSERT_STR_CONTAINS(result.ToString(), "AutoFlag NAFlag not found in process yb-master");
+
+  result = CallAdmin(kDemoteSingleFlagCmd, "yb-master", "TEST_auto_flags_initialized", "force");
+  ASSERT_OK(result);
+  ASSERT_STR_CONTAINS(
+      result.ToString(),
+      "AutoFlag TEST_auto_flags_initialized from process yb-master was successfully demoted\n"
+      "New config version: 2");
+
+  result = CallAdmin(kDemoteSingleFlagCmd, "yb-master", "TEST_auto_flags_initialized", "force");
+  ASSERT_OK(result);
+  ASSERT_STR_CONTAINS(
+      result.ToString(),
+      "Unable to demote AutoFlag TEST_auto_flags_initialized from process yb-master because the "
+      "flag is not in promoted state\n"
+      "Current config version: 2");
+
+  result = CallAdmin(kPromoteSingleFlaCmd, "yb-master", "TEST_auto_flags_initialized");
+  ASSERT_OK(result);
+  ASSERT_STR_CONTAINS(
+      result.ToString(),
+      "AutoFlag TEST_auto_flags_initialized from process yb-master was successfully promoted\n"
+      "New config version: 3");
 }
 
 TEST_F(AdminCliTest, TestListNamespaces) {
@@ -1224,6 +1810,20 @@ TEST_F(AdminCliTest, TestListNamespaces) {
   ASSERT_LT(user_namespaces_pos, system_namespaces_pos);
   ASSERT_GT(user_namespace_match.position(0), user_namespaces_pos);
   ASSERT_LT(user_namespace_match.position(0), system_namespaces_pos);
+
+  // We test just YSQL namespaces here because YCQL namespaces get directly deleted without being
+  // in the DELETED state and thus there is nothing for include_nonrunning to see in that case.
+  ASSERT_OK(client_->CreateNamespace("new_user_namespace", YQL_DATABASE_PGSQL));
+
+  ASSERT_OK(CallAdmin("delete_namespace", "ysql.new_user_namespace"));
+
+  status = CallAdmin("list_namespaces");
+  ASSERT_OK(status);
+  ASSERT_STR_NOT_CONTAINS(status.ToString(), "new_user_namespace");
+
+  status = CallAdmin("list_namespaces", "include_nonrunning");
+  ASSERT_OK(status);
+  ASSERT_TRUE(std::regex_search(status.ToString(), std::regex("new_user_namespace.*DELETED")));
 }
 
 TEST_F(AdminCliTest, PrintArgumentExpressions) {
@@ -1249,6 +1849,488 @@ TEST_F(AdminCliTest, PrintArgumentExpressions) {
   ASSERT_EQ(status.ToString().find(namespace_expression), std::string::npos);
   ASSERT_EQ(status.ToString().find(table_expression), std::string::npos);
   ASSERT_EQ(status.ToString().find(index_expression), std::string::npos);
+}
+
+TEST_F(AdminCliTest, TestCompactionStatusBeforeCompaction) {
+  BuildAndStart();
+  const string master_address = ToString(cluster_->master()->bound_rpc_addr());
+  auto client = ASSERT_RESULT(YBClientBuilder().add_master_server_addr(master_address).Build());
+
+  ASSERT_OK(WaitFor(
+      [this]() -> Result<bool> {
+        const string output = VERIFY_RESULT(
+            CallAdmin("compaction_status", kTableName.namespace_name(), kTableName.table_name()));
+
+        std::smatch match;
+        const std::regex regex(
+            "No full compaction taking place\n"
+            "A full compaction has never been completed\n"
+            "An admin compaction has never been requested");
+        std::regex_search(output, match, regex);
+        return !match.empty();
+      },
+      30s, "Wait for initial metrics heartbeats to report full compaction statuses"));
+}
+
+TEST_F(AdminCliTest, TestCompactionStatusAfterCompactionFinishes) {
+  BuildAndStart();
+  const string master_address = ToString(cluster_->master()->bound_rpc_addr());
+  auto client = ASSERT_RESULT(YBClientBuilder().add_master_server_addr(master_address).Build());
+
+  const auto time_before_compaction = DateTime::TimestampNow();
+  ASSERT_OK(CallAdmin("compact_table", kTableName.namespace_name(), kTableName.table_name()));
+
+  string output;
+  std::smatch match;
+  ASSERT_OK(WaitFor(
+      [&]() {
+        const auto result =
+            CallAdmin("compaction_status", kTableName.namespace_name(), kTableName.table_name());
+        if (!result.ok()) {
+          return false;
+        }
+        output = *result;
+        const std::regex regex("No full compaction taking place");
+        std::regex_search(output, match, regex);
+        return !match.empty();
+      },
+      30s /* timeout */, "Wait for compaction status to report no compaction"));
+
+  const std::regex regex(
+      "Last full compaction completion time: (.+)\nLast admin compaction request time: (.+)");
+  std::regex_search(output, match, regex);
+  ASSERT_FALSE(match.empty());
+  const auto last_full_compaction_time =
+      ASSERT_RESULT(DateTime::TimestampFromString(match[1].str()));
+  ASSERT_GT(last_full_compaction_time, time_before_compaction);
+  const auto last_request_time = ASSERT_RESULT(DateTime::TimestampFromString(match[2].str()));
+  ASSERT_GT(last_request_time, time_before_compaction);
+}
+
+// Covers https://github.com/yugabyte/yugabyte-db/issues/19957
+TEST_F(AdminCliTest, TestAdminCommandTimeout) {
+  // The test checks that an admin command timeout for compactions and flushes is honored by
+  // FlushManager on yb-master side (no dependency on `master_ts_rpc_timeout_ms`).
+
+  BuildAndStart();
+  const string master_address = ToString(cluster_->master()->bound_rpc_addr());
+  auto client = ASSERT_RESULT(YBClientBuilder().add_master_server_addr(master_address).Build());
+
+  // No admin timeout higher than `master_ts_rpc_timeout_ms` was honored for flush and compaction
+  // operation (passed via FlushManager) before the fix, which means `master_ts_rpc_timeout_ms`
+  // was the max timeout available for the mentioned operations. It is definitely not enough at
+  // least for large compactions.
+  // In case of timeout by admin command timeout value, the admin tool gets the error:
+  // (1) `Timed out waiting for FlushTables`.
+  // In case of timeout by `master_ts_rpc_timeout_ms` value, the admin tool gets the error like:
+  // (2) `Flush operation for id: 9be5b8cbd0d14cfea3371da1a6cbccab failed`.
+  // With the fix, only the error (1) is thrown for timied out commands.
+  constexpr size_t kMasterRpcTimeout = 4000;
+  constexpr size_t kCompactionPause  = 2 * kMasterRpcTimeout;
+  constexpr size_t kAdminCmdTimeout  =
+      kMasterRpcTimeout + ((kCompactionPause - kMasterRpcTimeout) / 2);
+
+  // Update flags.
+  ASSERT_OK(cluster_->SetFlagOnMasters(
+    "refresh_waiter_timeout_ms", std::to_string(kMasterRpcTimeout)));
+  ASSERT_OK(cluster_->SetFlagOnMasters(
+      "master_ts_rpc_timeout_ms", std::to_string(kMasterRpcTimeout)));
+  ASSERT_OK(cluster_->SetFlagOnTServers(
+      "TEST_pause_tablet_compact_flush_ms", std::to_string(kCompactionPause)));
+  SleepFor(MonoDelta::FromSeconds(1));
+
+  const auto before_ts = DateTime::TimestampNow();
+  auto result = CallAdmin(
+      "compact_table", kTableName.namespace_name(), kTableName.table_name(),
+      std::to_string(kAdminCmdTimeout / MonoTime::kMillisecondsPerSecond));
+  auto duration = MonoDelta::FromMicroseconds(DateTime::TimestampNow().value() - before_ts.value());
+  LOG(INFO) << "Result: " << result << ", dutaion: " << duration;
+
+  // It is expected to always get the timeout error since kAdminCmdTimeout < kCompactionPause,
+  // additionaly it covers the cases kAdminCmdTimeout > kMasterRpcTimeout for the expected error.
+  bool timed_out = !result.ok() &&
+                    result.status().message().Contains("Timed out waiting for FlushTables");
+  ASSERT_TRUE(timed_out);
+
+  // The expectation is to have the call's duration approximately kAdminCmdTimeout amount.
+  ASSERT_GT(duration, MonoDelta::FromMilliseconds(kAdminCmdTimeout));
+  ASSERT_LT(duration, MonoDelta::FromMilliseconds(kAdminCmdTimeout * 1.25));
+
+  // Wait for some time to let the compaction be unpaused and completed.
+  SleepFor(MonoDelta::FromMilliseconds(1.1 * (kCompactionPause - kAdminCmdTimeout)));
+}
+
+// Covers https://github.com/yugabyte/yugabyte-db/issues/26722
+TEST_F(AdminCliTest, TestAdminRpcTimeout) {
+  // The test checks that an admin command timeout is honored when it is greater than admin's
+  // default RPC timeout, which is set by FLAGS_yb_client_admin_rpc_timeout_sec.
+
+  BuildAndStart();
+  const string master_address = ToString(cluster_->master()->bound_rpc_addr());
+  auto client = ASSERT_RESULT(YBClientBuilder().add_master_server_addr(master_address).Build());
+
+  // With the fix for https://github.com/yugabyte/yugabyte-db/issues/19957, no admin command
+  // timeout higher than 60 seconds was honored for any admin RPC operation (refer to
+  // YBClientBuilder::Data::default_rpc_timeout_). Which means any admin command was limited
+  // by the mentioned 60 seconds even if a user was specified the higher timeout.
+  // In case of timeout by admin command timeout value, the admin tool gets the error:
+  // (1) `Timed out waiting for FlushTables`.
+  // In case of timeout by default_rpc_timeout_ value, the admin tool gets the error like:
+  // (2) `Flush operation for id: 9be5b8cbd0d14cfea3371da1a6cbccab failed`.
+  // After the fix, only the error (1) is thrown for timed out commands.
+  constexpr size_t kAdminRpcTimeout  = 4000;
+  constexpr size_t kAdminCmdTimeout  = 2 * kAdminRpcTimeout;
+  constexpr size_t kCompactionPause  = 1.5 * kAdminCmdTimeout;
+  constexpr size_t kMasterRpcTimeout = kAdminRpcTimeout / 2;
+
+  // Update flags.
+  ASSERT_OK(cluster_->SetFlagOnMasters(
+    "refresh_waiter_timeout_ms", std::to_string(kMasterRpcTimeout)));
+  ASSERT_OK(cluster_->SetFlagOnMasters(
+      "master_ts_rpc_timeout_ms", std::to_string(kMasterRpcTimeout)));
+  ASSERT_OK(cluster_->SetFlagOnTServers(
+      "TEST_pause_tablet_compact_flush_ms", std::to_string(kCompactionPause)));
+  SleepFor(MonoDelta::FromSeconds(1));
+
+  const auto before_ts = DateTime::TimestampNow();
+  auto result = CallAdmin(
+      "--yb_client_admin_rpc_timeout_sec",
+      std::to_string(kAdminRpcTimeout / MonoTime::kMillisecondsPerSecond),
+      "compact_table", kTableName.namespace_name(), kTableName.table_name(),
+      std::to_string(kAdminCmdTimeout / MonoTime::kMillisecondsPerSecond));
+  auto duration = MonoDelta::FromMicroseconds(DateTime::TimestampNow().value() - before_ts.value());
+  LOG(INFO) << "Result: " << result;
+
+  // It is expected to always get the timeout error since kAdminCmdTimeout < kCompactionPause.
+  bool timed_out = !result.ok() &&
+                    result.status().message().Contains("Timed out waiting for FlushTables");
+  ASSERT_TRUE(timed_out);
+
+  // The expectation is to have the call's duration approximately kAdminCmdTimeout amount.
+  ASSERT_GT(duration, MonoDelta::FromMilliseconds(kAdminCmdTimeout));
+  ASSERT_LT(duration, MonoDelta::FromMilliseconds(kAdminCmdTimeout * 1.25));
+
+  // Wait for some time to let the compaction be unpaused and completed.
+  SleepFor(MonoDelta::FromMilliseconds(1.1 * (kCompactionPause - kAdminCmdTimeout)));
+}
+
+Status AdminCliTest::TestDumpSysCatalogEntry(const std::string& cluster_uuid) {
+  const auto dump_file_path = tmp_dir_ / Format("$0-", kClusterConfigEntryTypeName);
+
+  // We should be able to dump the data while not in emergency_repair_mode.
+  auto output =
+      VERIFY_RESULT(CallAdmin("dump_sys_catalog_entries", kClusterConfigEntryTypeName, *tmp_dir_));
+  SCHECK_STR_CONTAINS(output, dump_file_path);
+
+  auto file_contents = VERIFY_RESULT(ReadFileToString(dump_file_path));
+  SCHECK_STR_CONTAINS(file_contents, cluster_uuid);
+  return Status::OK();
+}
+
+TEST_F(AdminCliTest, TestDumpSysCatalogEntryInNonEmergencyMode) {
+  BuildAndStart();
+  const auto cluster_uuid = ASSERT_RESULT(GetClusterUuid());
+  ASSERT_OK(TestDumpSysCatalogEntry(cluster_uuid));
+}
+
+TEST_F(AdminCliTest, TestDumpSysCatalogEntryInEmergencyMode) {
+  BuildAndStart();
+  const auto cluster_uuid = ASSERT_RESULT(GetClusterUuid());
+  ASSERT_OK(RestartMaster(EmergencyRepairMode::kTrue));
+  ASSERT_OK(TestDumpSysCatalogEntry(cluster_uuid));
+  ASSERT_OK(RestartMaster(EmergencyRepairMode::kFalse));
+}
+
+// Make sure we cannot write to sys catalog when not in emergency repair mode.
+TEST_F(AdminCliTest, BlockWriteToSysCatalogEntryInNonEmergencyMode) {
+  BuildAndStart();
+
+  auto env = Env::Default();
+  const auto dump_file_path = tmp_dir_ / Format("$0-", kClusterConfigEntryTypeName);
+
+  master::SysClusterConfigEntryPB dummy_cluster_config;
+  dummy_cluster_config.set_cluster_uuid(Uuid::Generate().ToString());
+
+  ASSERT_OK(WriteStringToFileSync(env, dummy_cluster_config.DebugString(), dump_file_path));
+
+  const auto kExpectedError = "Updating sys_catalog is only allowed in emergency repair mode";
+
+  ASSERT_NOK_STR_CONTAINS(
+      CallAdmin("write_sys_catalog_entry", "delete", kClusterConfigEntryTypeName, "", "", "force"),
+      kExpectedError);
+
+  ASSERT_NOK_STR_CONTAINS(
+      CallAdmin(
+          "write_sys_catalog_entry", "insert", kClusterConfigEntryTypeName, "dummy", dump_file_path,
+          "force"),
+      kExpectedError);
+
+  ASSERT_NOK_STR_CONTAINS(
+      CallAdmin(
+          "write_sys_catalog_entry", "update", kClusterConfigEntryTypeName, "", dump_file_path,
+          "force"),
+      kExpectedError);
+}
+
+// Test insert and delete of CatalogEntity.
+TEST_F(AdminCliTest, TestInsertDeleteSysCatalogEntry) {
+  BuildAndStart();
+  ASSERT_OK(RestartMaster(EmergencyRepairMode::kTrue));
+
+  auto env = Env::Default();
+  const auto second_cluster_config_id = "second_cc";
+
+  master::SysClusterConfigEntryPB second_cluster_config;
+  second_cluster_config.set_cluster_uuid(Uuid::Generate().ToString());
+  const auto file_path =
+      tmp_dir_ / Format("$0-$1", kClusterConfigEntryTypeName, second_cluster_config_id);
+
+  ASSERT_OK(WriteStringToFileSync(env, second_cluster_config.DebugString(), file_path));
+
+  ASSERT_OK(CallAdmin(
+      "write_sys_catalog_entry", "insert", kClusterConfigEntryTypeName, second_cluster_config_id,
+      file_path, "force"));
+
+  auto validate_dump_cluster_config = [&]() -> Status {
+    RETURN_NOT_OK(env->DeleteFile(file_path));
+    auto output = VERIFY_RESULT(CallAdmin(
+        "dump_sys_catalog_entries", kClusterConfigEntryTypeName, *tmp_dir_,
+        second_cluster_config_id));
+    SCHECK_STR_CONTAINS(output, file_path);
+    auto file_contents = VERIFY_RESULT(ReadFileToString(file_path));
+    SCHECK_STR_CONTAINS(file_contents, second_cluster_config.cluster_uuid());
+    return Status::OK();
+  };
+
+  // Dump the new entry to make sure it was updated.
+  ASSERT_OK(validate_dump_cluster_config());
+
+  // Restart the master and dump the new entry to make sure it was persisted.
+  auto* leader_master = cluster_->GetLeaderMaster();
+  leader_master->Shutdown();
+  ASSERT_OK(leader_master->Restart());
+
+  ASSERT_OK(validate_dump_cluster_config());
+
+  // Delete the second entry.
+  ASSERT_OK(CallAdmin(
+      "write_sys_catalog_entry", "delete", kClusterConfigEntryTypeName, second_cluster_config_id,
+      "", "force"));
+
+  auto output = ASSERT_RESULT(CallAdmin(
+      "dump_sys_catalog_entries", kClusterConfigEntryTypeName, *tmp_dir_,
+      second_cluster_config_id));
+  ASSERT_STR_CONTAINS(output, "Found 0 entries of type CLUSTER_CONFIG");
+
+  // Restart the master to make sure it starts correctly. If the delete did not succeed the master
+  // would crash and fail to start.
+  ASSERT_OK(RestartMaster(EmergencyRepairMode::kFalse));
+  ASSERT_OK(cluster_->WaitForTabletServerCount(cluster_->num_tablet_servers(), 30s));
+}
+
+// Test insert and delete of TableEntry.
+TEST_F(AdminCliTest, TestInsertDeleteTableEntry) {
+  const auto new_table_name = "new_table";
+  const auto new_table_id = Uuid::Generate().ToString();
+  auto env = Env::Default();
+
+  BuildAndStart();
+  const auto tables =
+      ASSERT_RESULT(client_->ListTables(kTableName.table_name(), /* exclude_ysql */ true));
+  ASSERT_EQ(1, tables.size());
+  const auto& table_id = tables.front().table_id();
+
+  ASSERT_OK(RestartMaster(EmergencyRepairMode::kTrue));
+
+  const auto folder_path = *tmp_dir_;
+  const auto existing_table_file_path = tmp_dir_ / Format("$0-$1", kTableEntryTypeName, table_id);
+  const auto new_table_file_path = tmp_dir_ / Format("$0-$1", kTableEntryTypeName, new_table_id);
+  auto output = ASSERT_RESULT(
+      CallAdmin("dump_sys_catalog_entries", kTableEntryTypeName, folder_path, table_id));
+  ASSERT_STR_CONTAINS(output, existing_table_file_path);
+  auto file_contents = ASSERT_RESULT(ReadFileToString(existing_table_file_path));
+  boost::replace_all(file_contents, table_id, new_table_id);
+  boost::replace_all(file_contents, kTableName.table_name(), new_table_name);
+  ASSERT_OK(WriteStringToFileSync(env, file_contents, new_table_file_path));
+
+  ASSERT_OK(CallAdmin(
+      "write_sys_catalog_entry", "insert", kTableEntryTypeName, new_table_id, new_table_file_path,
+      "force"));
+
+  auto validate_dump_cluster_config = [&]() -> Status {
+    RETURN_NOT_OK(env->DeleteFile(new_table_file_path));
+    auto output = VERIFY_RESULT(
+        CallAdmin("dump_sys_catalog_entries", kTableEntryTypeName, folder_path, new_table_id));
+    SCHECK_STR_CONTAINS(output, new_table_file_path);
+    auto file_contents = VERIFY_RESULT(ReadFileToString(new_table_file_path));
+    SCHECK_STR_CONTAINS(file_contents, new_table_name);
+    return Status::OK();
+  };
+
+  // Dump the new entry to make sure it was inserted.
+  ASSERT_OK(validate_dump_cluster_config());
+
+  // Restart the master and dump the new entry to make sure it was persisted.
+  auto* leader_master = cluster_->GetLeaderMaster();
+  leader_master->Shutdown();
+  ASSERT_OK(leader_master->Restart());
+
+  ASSERT_OK(validate_dump_cluster_config());
+
+  // Delete the new table.
+  ASSERT_OK(CallAdmin(
+      "write_sys_catalog_entry", "delete", kTableEntryTypeName, new_table_id, "", "force"));
+
+  output = ASSERT_RESULT(
+      CallAdmin("dump_sys_catalog_entries", kTableEntryTypeName, *tmp_dir_, new_table_id));
+  ASSERT_STR_CONTAINS(output, "Found 0 entries of type TABLE");
+}
+
+// Update the ClusterConfig entry in the sys catalog and verify that the change is persisted across
+// master restarts.
+TEST_F(AdminCliTest, TestUpdateSysCatalogEntry) {
+  BuildAndStart();
+  const auto old_cluster_uuid = ASSERT_RESULT(GetClusterUuid());
+  ASSERT_OK(RestartMaster(EmergencyRepairMode::kTrue));
+
+  auto env = Env::Default();
+  const auto file_path = tmp_dir_ / Format("$0-", kClusterConfigEntryTypeName);
+
+  auto new_cluster_uuid = Uuid::Generate().ToString();
+  LOG(INFO) << "Replacing cluster_uuid " << old_cluster_uuid << " with " << new_cluster_uuid;
+
+  master::SysClusterConfigEntryPB new_cluster_config;
+  new_cluster_config.set_cluster_uuid(new_cluster_uuid);
+  ASSERT_OK(WriteStringToFileSync(env, new_cluster_config.DebugString(), file_path));
+
+  auto output = ASSERT_RESULT(CallAdmin(
+      "write_sys_catalog_entry", "update", kClusterConfigEntryTypeName, "", file_path, "force"));
+  ASSERT_STR_CONTAINS(output, new_cluster_uuid);
+
+  ASSERT_OK(RestartMaster(EmergencyRepairMode::kFalse));
+
+  const auto cluster_uuid = ASSERT_RESULT(GetClusterUuid());
+  ASSERT_EQ(cluster_uuid, new_cluster_uuid);
+
+  ASSERT_OK(env->DeleteFile(file_path));
+  output =
+      ASSERT_RESULT(CallAdmin("dump_sys_catalog_entries", kClusterConfigEntryTypeName, *tmp_dir_));
+  ASSERT_STR_CONTAINS(output, file_path);
+  auto file_contents = ASSERT_RESULT(ReadFileToString(file_path));
+  ASSERT_STR_NOT_CONTAINS(file_contents, old_cluster_uuid);
+  ASSERT_STR_CONTAINS(file_contents, new_cluster_uuid);
+}
+
+TEST_F(AdminCliTest, TestRemoveTabletServer) {
+  ANNOTATE_UNPROTECTED_WRITE(FLAGS_num_replicas) = 1;
+  BuildAndStart({}, {"--enable_load_balancing=false", "--tserver_unresponsive_timeout_ms=5000"});
+  ASSERT_OK(cluster_->AddTabletServer(true));
+  auto added_tserver = cluster_->tablet_server(cluster_->num_tablet_servers() - 1);
+  ASSERT_OK(cluster_->AddTServerToBlacklist(cluster_->master(), added_tserver));
+  added_tserver->Shutdown();
+  auto cluster_client =
+      master::MasterClusterClient(cluster_->GetLeaderMasterProxy<master::MasterClusterProxy>());
+  ASSERT_OK(WaitFor(
+      [&cluster_client, added_tserver]() -> Result<bool> {
+        auto tserver = VERIFY_RESULT(cluster_client.GetTabletServer(added_tserver->uuid()));
+        return tserver && !tserver->alive();
+      },
+      30s, "tserver not present or still alive"));
+  ASSERT_RESULT(CallAdmin("remove_tablet_server", added_tserver->uuid()));
+  auto find_tserver_result = ASSERT_RESULT(cluster_client.GetTabletServer(added_tserver->uuid()));
+  EXPECT_EQ(find_tserver_result, std::nullopt);
+}
+
+TEST_F(AdminCliTest, TestDisallowImplicitStreamCreation) {
+  std::string test_namespace = "pg_namespace_cdc";
+  BuildAndStart();
+  ASSERT_OK(client_->CreateNamespace(test_namespace, YQL_DATABASE_PGSQL));
+
+  ASSERT_NOK(CallAdmin("create_change_data_stream", "ysql." + test_namespace, "IMPLICIT"));
+}
+
+TEST_F(AdminCliTest, TestAllowImplicitStreamCreationWhenFlagEnabled) {
+  std::string test_namespace = "pg_namespace_cdc";
+  BuildAndStart(
+      {"--cdc_enable_implicit_checkpointing=true"}, {});
+  ASSERT_OK(client_->CreateNamespace(test_namespace, YQL_DATABASE_PGSQL));
+
+  auto output =
+      ASSERT_RESULT(CallAdmin("create_change_data_stream", "ysql." + test_namespace, "IMPLICIT"));
+
+  ASSERT_STR_CONTAINS(
+      output, "Creation of streams with IMPLICIT checkpointing is deprecated");
+}
+
+// Test yb-admin get_table_hash command for YCQL table.
+TEST_F(AdminCliTest, TestGetTableXorHash) {
+  BuildAndStart();
+  const auto table_name =
+      YBTableName(YQLDatabase::YQL_DATABASE_CQL, kTableName.namespace_name(), "my_table");
+
+  client::TableHandle table;
+  const auto num_tablets = 4;
+  ASSERT_OK(table.Create(table_name, num_tablets, client::YBSchema(schema_), client_.get()));
+
+  TestYcqlWorkload workload(cluster_.get());
+  workload.set_table_name(table_name);
+  workload.Setup();
+  workload.Start();
+  workload.WaitInserted(100);
+  auto ht1 = ASSERT_RESULT(cluster_->master()->GetServerTime());
+  // Insert 100 more rows.
+  workload.WaitInserted(workload.rows_inserted() + 100);
+  workload.StopAndJoin();
+
+  auto rows_inserted = boost::size(client::TableRange(table));
+  ASSERT_GE(rows_inserted, 200);
+
+  auto tables = ASSERT_RESULT(client_->ListTables(table_name.table_name()));
+  ASSERT_EQ(1, tables.size());
+  const auto table_id = tables.front().table_id();
+
+  auto extract_from_output = [&](const std::string& output) -> std::pair<uint64_t, uint64_t> {
+    LOG(INFO) << "Command output: " << output;
+    // Count the number of line with `Tablet ID:`
+    // Read HT: { days: 20466 time: 15:34:35.245376 }
+    // Tablet ID: 9bd7b975e43e4f41aa41d8bd9c2f8fb0
+    // Row count: 16100
+    // XOR hash: 5512406178816
+
+    // Total row count: 16100
+    // Total XOR hash: 5512406178816
+    size_t tablet_id_lines = 0;
+    const std::string table_id_str = "Tablet ID:";
+    size_t pos = 0;
+    while ((pos = output.find(table_id_str, pos)) != std::string::npos) {
+      ++tablet_id_lines;
+      pos += table_id_str.length();
+    }
+    CHECK_EQ(tablet_id_lines, num_tablets);
+
+    // Extract the row count from the output.
+    // Total row count: 100
+    // Total XOR hash: 1234567890
+    const auto total_row_count_prefix = "Total row count: ";
+    const auto total_xor_hash_prefix = "Total XOR hash: ";
+    auto row_count_pos = output.find(total_row_count_prefix);
+    auto xor_hash_pos = output.find(total_xor_hash_prefix);
+    auto row_count = std::stoull(output.substr(row_count_pos + strlen(total_row_count_prefix)));
+    auto xor_hash = std::stoull(output.substr(xor_hash_pos + strlen(total_xor_hash_prefix)));
+    LOG(INFO) << "Row count: " << row_count << ", XOR hash: " << xor_hash;
+    return std::make_pair(row_count, xor_hash);
+  };
+  auto output = ASSERT_RESULT(CallAdmin("get_table_hash", table_id));
+  auto [row_count, xor_hash] = extract_from_output(output);
+  ASSERT_EQ(row_count, rows_inserted);
+  ASSERT_NE(xor_hash, 0);
+
+  output = ASSERT_RESULT(CallAdmin("get_table_hash", table_id, ht1.ToUint64()));
+  auto [row_count2, xor_hash2] = extract_from_output(output);
+  ASSERT_LT(row_count2, rows_inserted);
+  ASSERT_GT(row_count2, 100);
+  ASSERT_NE(xor_hash2, 0);
+  ASSERT_NE(xor_hash, xor_hash2);
 }
 
 }  // namespace tools

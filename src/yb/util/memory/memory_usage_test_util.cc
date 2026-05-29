@@ -1,5 +1,5 @@
 //--------------------------------------------------------------------------------------------------
-// Copyright (c) YugaByte, Inc.
+// Copyright (c) YugabyteDB, Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License"); you may not use this file except
 // in compliance with the License.  You may obtain a copy of the License at
@@ -22,10 +22,10 @@
 
 // Malloc hooks are not suppported in Google's TCMalloc as of Dec 12 2022.
 // See issue: https://github.com/google/tcmalloc/issues/44.
-#if defined(YB_TCMALLOC_ENABLED) && defined(YB_GPERFTOOLS_TCMALLOC)
+#if YB_GPERFTOOLS_TCMALLOC
 #include <gperftools/malloc_hook.h>
 #define MEMORY_USAGE_SUPPORTED
-#endif // defined(YB_TCMALLOC_ENABLED) && defined(YB_GPERFTOOLS_TCMALLOC)
+#endif // YB_GPERFTOOLS_TCMALLOC
 
 #if !defined(MEMORY_USAGE_SUPPORTED)
 #include "yb/util/format.h"

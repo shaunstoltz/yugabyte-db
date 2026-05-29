@@ -1,4 +1,4 @@
-	/*-------------------------------------------------------------------------
+/*-------------------------------------------------------------------------
  *
  * memutils.h
  *	  This file contains declarations for memory allocation utility
@@ -7,7 +7,7 @@
  *	  of the API of the memory management subsystem.
  *
  *
- * Portions Copyright (c) 1996-2018, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2022, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  * src/include/utils/memutils.h
@@ -17,10 +17,13 @@
 #ifndef MEMUTILS_H
 #define MEMUTILS_H
 
-#include "c.h"
+#include "c.h"					/* YB include */
+
 #include "nodes/memnodes.h"
 
-#include "yb/common/ybc_util.h"
+/* YB includes */
+#include "yb/yql/pggate/util/ybc_util.h"
+
 
 /*
  * MaxAllocSize, MaxAllocHugeSize
@@ -80,15 +83,17 @@ extern void MemoryContextResetChildren(MemoryContext context);
 extern void MemoryContextDeleteChildren(MemoryContext context);
 extern void MemoryContextSetIdentifier(MemoryContext context, const char *id);
 extern void MemoryContextSetParent(MemoryContext context,
-					   MemoryContext new_parent);
+								   MemoryContext new_parent);
 extern Size GetMemoryChunkSpace(void *pointer);
 extern MemoryContext MemoryContextGetParent(MemoryContext context);
 extern bool MemoryContextIsEmpty(MemoryContext context);
+extern Size MemoryContextMemAllocated(MemoryContext context, bool recurse);
 extern void MemoryContextStats(MemoryContext context);
-extern void MemoryContextStatsDetail(MemoryContext context, int max_children);
-extern int64 MemoryContextStatsUsage(MemoryContext context, int max_children);
+extern void MemoryContextStatsDetail(MemoryContext context, int max_children,
+									 bool print_to_stderr);
 extern void MemoryContextAllowInCriticalSection(MemoryContext context,
-									bool allow);
+												bool allow);
+extern int64 MemoryContextStatsUsage(MemoryContext context, int max_children);
 
 #ifdef MEMORY_CONTEXT_CHECKING
 extern void MemoryContextCheck(MemoryContext context);
@@ -116,9 +121,12 @@ GetMemoryChunkContext(void *pointer)
 {
 	MemoryContext context;
 
-	if (pointer == NULL) {
+	/* YB */
+	if (pointer == NULL)
+	{
 		YBC_LOG_ERROR_STACK_TRACE("GetMemoryChunkContext: null pointer");
 	}
+
 	/*
 	 * Try to detect bogus pointers handed to us, poorly though we can.
 	 * Presumably, a pointer that isn't MAXALIGNED isn't pointing at an
@@ -144,48 +152,52 @@ GetMemoryChunkContext(void *pointer)
  * specific creation routines, and noplace else.
  */
 extern void MemoryContextCreate(MemoryContext node,
-					NodeTag tag,
-					const MemoryContextMethods *methods,
-					MemoryContext parent,
-					const char *name);
+								NodeTag tag,
+								const MemoryContextMethods *methods,
+								MemoryContext parent,
+								const char *name);
 
+extern void HandleLogMemoryContextInterrupt(void);
+extern void ProcessLogMemoryContextInterrupt(void);
 
 /*
  * Memory-context-type-specific functions
  */
 
 /* aset.c */
-extern MemoryContext AllocSetContextCreateExtended(MemoryContext parent,
-							  const char *name,
-							  Size minContextSize,
-							  Size initBlockSize,
-							  Size maxBlockSize);
+extern MemoryContext AllocSetContextCreateInternal(MemoryContext parent,
+												   const char *name,
+												   Size minContextSize,
+												   Size initBlockSize,
+												   Size maxBlockSize);
 
 /*
  * This wrapper macro exists to check for non-constant strings used as context
  * names; that's no longer supported.  (Use MemoryContextSetIdentifier if you
  * want to provide a variable identifier.)
  */
-#if defined(HAVE__BUILTIN_CONSTANT_P) && defined(HAVE__VA_ARGS)
+#ifdef HAVE__BUILTIN_CONSTANT_P
 #define AllocSetContextCreate(parent, name, ...) \
 	(StaticAssertExpr(__builtin_constant_p(name), \
 					  "memory context names must be constant strings"), \
-	 AllocSetContextCreateExtended(parent, name, __VA_ARGS__))
+	 AllocSetContextCreateInternal(parent, name, __VA_ARGS__))
 #else
 #define AllocSetContextCreate \
-	AllocSetContextCreateExtended
+	AllocSetContextCreateInternal
 #endif
 
 /* slab.c */
 extern MemoryContext SlabContextCreate(MemoryContext parent,
-				  const char *name,
-				  Size blockSize,
-				  Size chunkSize);
+									   const char *name,
+									   Size blockSize,
+									   Size chunkSize);
 
 /* generation.c */
 extern MemoryContext GenerationContextCreate(MemoryContext parent,
-						const char *name,
-						Size blockSize);
+											 const char *name,
+											 Size minContextSize,
+											 Size initBlockSize,
+											 Size maxBlockSize);
 
 /*
  * Recommended default alloc parameters, suitable for "ordinary" contexts
@@ -214,6 +226,7 @@ extern MemoryContext GenerationContextCreate(MemoryContext parent,
 #define ALLOCSET_START_SMALL_SIZES \
 	ALLOCSET_SMALL_MINSIZE, ALLOCSET_SMALL_INITSIZE, ALLOCSET_DEFAULT_MAXSIZE
 
+
 /*
  * Threshold above which a request in an AllocSet context is certain to be
  * allocated separately (and thereby have constant allocation overhead).
@@ -226,8 +239,8 @@ extern MemoryContext GenerationContextCreate(MemoryContext parent,
 #define SLAB_LARGE_BLOCK_SIZE		(8 * 1024 * 1024)
 
 /*
- * Tracking memory consumption for both PG backend and pggate tcmalloc acutal
- * heap consumption.
+ * YB: Tracking memory consumption for both PG backend and pggate tcmalloc
+ * actual heap consumption.
  * Global accessible in one PG backend process.
  */
 typedef struct YbPgMemTracker
@@ -236,21 +249,22 @@ typedef struct YbPgMemTracker
 	 * Current, at time of cutting Snapshot(), memory in bytes allocated by PG
 	 * (pggate is not included in this field)
 	 */
-	Size pg_cur_mem_bytes;
+	Size		pg_cur_mem_bytes;
 	/*
 	 * The current allocated memory including PG, pggate and cached memory.
 	 */
-	int64_t backend_cur_allocated_mem_bytes;
+	int64_t		backend_cur_allocated_mem_bytes;
 	/*
 	 * The maximum memory ever allocated by current statement including PG and
 	 * pggate
 	 */
-	Size stmt_max_mem_bytes;
+	Size		stmt_max_mem_bytes;
 	/*
 	 * The initial base memory already allocated by PG and paggate at the
-	 * beginning of current statement
+	 * beginning of current statement.
+	 * NOTE: Only set if yb_run_with_explain_analyze is true.
 	 */
-	Size stmt_max_mem_base_bytes;
+	Size		stmt_max_mem_base_bytes;
 
 	/*
 	 * A flag to tell if pggate is inititated. This is used to track the memory
@@ -259,7 +273,7 @@ typedef struct YbPgMemTracker
 	 * pggate. It pushes down fundamental memory work to it, while this layer
 	 * stays as light as possible in PG.
 	 */
-	bool pggate_alive;
+	bool		pggate_alive;
 } YbPgMemTracker;
 
 extern YbPgMemTracker PgMemTracker;
@@ -287,6 +301,6 @@ extern void YbPgMemResetStmtConsumption();
  * Returns the resident set size (physical memory use) of a process
  * measured in bytes, or -1 if the value cannot be determined on this OS.
  */
-extern int64_t YbPgGetCurRSSMemUsage(int pid);
+extern void YbPgGetCurRssPssMemUsage(int pid, int64_t *rss, int64_t *pss);
 
 #endif							/* MEMUTILS_H */

@@ -3,9 +3,9 @@
 //  LICENSE file in the root directory of this source tree. An additional grant
 //  of patent rights can be found in the PATENTS file in the same directory.
 //
-// The following only applies to changes made to this file as part of YugaByte development.
+// The following only applies to changes made to this file as part of YugabyteDB development.
 //
-// Portions Copyright (c) YugaByte, Inc.
+// Portions Copyright (c) YugabyteDB, Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License"); you may not use this file except
 // in compliance with the License.  You may obtain a copy of the License at
@@ -44,10 +44,10 @@
 #include "yb/rocksdb/util/file_reader_writer.h"
 #include "yb/rocksdb/util/logging.h"
 #include "yb/rocksdb/util/mutexlock.h"
-#include "yb/rocksdb/util/sync_point.h"
 
 #include "yb/util/status_log.h"
 #include "yb/util/string_util.h"
+#include "yb/util/sync_point.h"
 
 using std::unique_ptr;
 
@@ -69,8 +69,8 @@ Status WalManager::GetSortedWalFiles(VectorLogPtr* files) {
   // Reproduce the race condition where a log file is moved
   // to archived dir, between these two sync points, used in
   // (DBTest,TransactionLogIteratorRace)
-  TEST_SYNC_POINT("WalManager::GetSortedWalFiles:1");
-  TEST_SYNC_POINT("WalManager::GetSortedWalFiles:2");
+  DEBUG_ONLY_TEST_SYNC_POINT("WalManager::GetSortedWalFiles:1");
+  DEBUG_ONLY_TEST_SYNC_POINT("WalManager::GetSortedWalFiles:2");
 
   files->clear();
   // list wal files in archive dir.
@@ -279,10 +279,10 @@ void WalManager::PurgeObsoleteWALFiles() {
 void WalManager::ArchiveWALFile(const std::string& fname, uint64_t number) {
   auto archived_log_name = ArchivedLogFileName(db_options_.wal_dir, number);
   // The sync point below is used in (DBTest,TransactionLogIteratorRace)
-  TEST_SYNC_POINT("WalManager::PurgeObsoleteFiles:1");
+  DEBUG_ONLY_TEST_SYNC_POINT("WalManager::PurgeObsoleteFiles:1");
   Status s = env_->RenameFile(fname, archived_log_name);
   // The sync point below is used in (DBTest,TransactionLogIteratorRace)
-  TEST_SYNC_POINT("WalManager::PurgeObsoleteFiles:2");
+  DEBUG_ONLY_TEST_SYNC_POINT("WalManager::PurgeObsoleteFiles:2");
   RLOG(InfoLogLevel::INFO_LEVEL, db_options_.info_log,
       "Move log file %s to %s -- %s\n", fname.c_str(),
       archived_log_name.c_str(), s.ToString().c_str());
@@ -325,8 +325,8 @@ Status WalManager::GetSortedWalsOfType(const std::string& path,
       // Reproduce the race condition where a log file is moved
       // to archived dir, between these two sync points, used in
       // (DBTest,TransactionLogIteratorRace)
-      TEST_SYNC_POINT("WalManager::GetSortedWalsOfType:1");
-      TEST_SYNC_POINT("WalManager::GetSortedWalsOfType:2");
+      DEBUG_ONLY_TEST_SYNC_POINT("WalManager::GetSortedWalsOfType:1");
+      DEBUG_ONLY_TEST_SYNC_POINT("WalManager::GetSortedWalsOfType:2");
 
       uint64_t size_bytes;
       s = env_->GetFileSize(LogFileName(path, number), &size_bytes);

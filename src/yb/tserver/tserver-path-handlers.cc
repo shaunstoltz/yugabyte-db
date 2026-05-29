@@ -15,9 +15,9 @@
 // specific language governing permissions and limitations
 // under the License.
 //
-// The following only applies to changes made to this file as part of YugaByte development.
+// The following only applies to changes made to this file as part of YugabyteDB development.
 //
-// Portions Copyright (c) YugaByte, Inc.
+// Portions Copyright (c) YugabyteDB, Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License"); you may not use this file except
 // in compliance with the License.  You may obtain a copy of the License at
@@ -38,6 +38,11 @@
 #include <sstream>
 #include <string>
 #include <vector>
+
+#include "yb/cdc/cdc_service.h"
+#include "yb/cdc/xrepl_stream_stats.h"
+
+#include "yb/common/version_info.h"
 
 #include "yb/consensus/consensus.h"
 #include "yb/consensus/consensus.pb.h"
@@ -65,13 +70,17 @@
 
 #include "yb/tserver/service_util.h"
 #include "yb/tserver/tablet_server.h"
+#include "yb/tserver/ts_local_lock_manager.h"
 #include "yb/tserver/ts_tablet_manager.h"
+#include "yb/tserver/tserver_cgroup_manager.h"
+#include "yb/tserver/xcluster_consumer_if.h"
+#include "yb/tserver/xcluster_poller_stats.h"
 
-#include "yb/util/jsonwriter.h"
-#include "yb/util/url-coding.h"
-#include "yb/util/version_info.h"
-#include "yb/util/version_info.pb.h"
 #include "yb/util/flags.h"
+#include "yb/util/html_print_helper.h"
+#include "yb/util/jsonwriter.h"
+#include "yb/util/stol_utils.h"
+#include "yb/util/url-coding.h"
 
 using yb::consensus::GetConsensusRole;
 using yb::consensus::CONSENSUS_CONFIG_COMMITTED;
@@ -97,6 +106,8 @@ using namespace std::placeholders;  // NOLINT(build/namespaces)
 
 DEFINE_UNKNOWN_bool(enable_intentsdb_page, false,
     "Enable displaying the contents of intentsdb page.");
+
+DECLARE_bool(enable_xcluster_stat_collection);
 
 namespace {
 
@@ -241,7 +252,10 @@ void HandleTabletPage(
       {"tablet-consensus-status", "Consensus Status"},
       {"log-anchors", "Tablet Log Anchors"},
       {"transactions", "Transactions"},
-      {"rocksdb", "RocksDB" }};
+      {"rocksdb", "RocksDB" },
+      {"waitqueue", "Wait Queue"},
+      {"sharedlockmanager", "In-Memory Locks"},
+      {"preparer", "Preparer"}};
 
   auto encoded_tablet_id = UrlEncodeToString(tablet_id);
   for (const auto& entry : entries) {
@@ -277,21 +291,21 @@ void HandleConsensusStatusPage(
     const std::string& tablet_id, const tablet::TabletPeerPtr& peer,
     const Webserver::WebRequest& req, Webserver::WebResponse* resp) {
   std::stringstream *output = &resp->output;
-  shared_ptr<consensus::Consensus> consensus = peer->shared_consensus();
-  if (!consensus) {
+  auto consensus_result = peer->GetConsensus();
+  if (!consensus_result) {
     *output << "Tablet " << EscapeForHtmlToString(tablet_id) << " not running";
     return;
   }
 
   *output << "<h1>Tablet " << EscapeForHtmlToString(tablet_id) << "</h1>\n";
-  consensus->DumpStatusHtml(*output);
+  consensus_result.get()->DumpStatusHtml(*output);
 }
 
 void HandleTransactionsPage(
     const std::string& tablet_id, const tablet::TabletPeerPtr& peer,
     const Webserver::WebRequest& req, Webserver::WebResponse* resp) {
   std::stringstream *output = &resp->output;
-  auto tablet = peer->shared_tablet();
+  auto tablet = peer->shared_tablet_maybe_null();
   if (!tablet) {
     *output << "Tablet " << EscapeForHtmlToString(tablet_id) << " not running";
     return;
@@ -339,7 +353,7 @@ void DumpRocksDBOptions(rocksdb::DB* db, std::stringstream* out) {
     if (PREDICT_TRUE(status.ok())) {
       EscapeForHtml(content, out);
     } else {
-      *out << "Failed to get options: " << status << std::endl;
+      *out << "Failed to get options: " << EscapeForHtmlToString(status.ToString()) << std::endl;
     }
     *out << "</pre>" << std::endl;
     delete env;
@@ -354,7 +368,7 @@ void DumpRocksDB(const char* title, rocksdb::DB* db, std::stringstream* out) {
     auto files = db->GetLiveFilesMetaData();
     *out << "<pre>" << std::endl;
     for (const auto& file : files) {
-      *out << file.ToString() << std::endl;
+      *out << EscapeForHtmlToString(file.ToString()) << std::endl;
     }
     *out << "</pre>" << std::endl;
 
@@ -363,10 +377,10 @@ void DumpRocksDB(const char* title, rocksdb::DB* db, std::stringstream* out) {
     if (status.ok()) {
       for (const auto& p : properties) {
         *out << "<h3>" << EscapeForHtmlToString(p.first) << " properties</h3>" << std::endl;
-        *out << "<pre>" << p.second->ToString("\n") << "</pre>" << std::endl;
+        *out << "<pre>" << EscapeForHtmlToString(p.second->ToString("\n")) << "</pre>" << std::endl;
       }
     } else {
-      *out << "Failed to get properties: " << status << std::endl;
+      *out << "Failed to get properties: " << EscapeForHtmlToString(status.ToString()) << std::endl;
     }
   }
 }
@@ -377,14 +391,71 @@ void HandleRocksDBPage(
   std::stringstream *output = &resp->output;
   *output << "<h1>RocksDB for Tablet " << EscapeForHtmlToString(tablet_id) << "</h1>" << std::endl;
 
-  auto tablet_result = peer->shared_tablet_safe();
+  auto tablet_result = peer->shared_tablet();
   if (!tablet_result.ok()) {
-    *output << tablet_result.status();
+    *output << EscapeForHtmlToString(tablet_result.status().ToString());
     return;
   }
-  auto doc_db = (*tablet_result)->doc_db();
-  DumpRocksDB("Regular", doc_db.regular, output);
-  DumpRocksDB("Intents", doc_db.intents, output);
+  DumpRocksDB("Regular", (*tablet_result)->regular_db(), output);
+  DumpRocksDB("Intents", (*tablet_result)->intents_db(), output);
+}
+
+void HandleWaitQueuePage(
+    const std::string& tablet_id, const tablet::TabletPeerPtr& peer,
+    const Webserver::WebRequest& req, Webserver::WebResponse* resp) {
+  std::stringstream *out = &resp->output;
+  *out << "<h1>Waiters for Tablet " << EscapeForHtmlToString(tablet_id) << "</h1>" << std::endl;
+
+  auto tablet_result = peer->shared_tablet();
+  if (!tablet_result.ok()) {
+    *out << EscapeForHtmlToString(tablet_result.status().ToString());
+    return;
+  }
+  auto* tp = (*tablet_result)->transaction_participant();
+  docdb::WaitQueue* wq = nullptr;
+  if (tp) {
+    wq = tp->wait_queue();
+  }
+  if (wq) {
+    wq->DumpStatusHtml(*out);
+  } else {
+    *out << "<h3>" << "No wait queue found" << "</h3>" << std::endl;
+  }
+}
+
+void HandleInMemoryLocksPage(
+    const std::string& tablet_id, const tablet::TabletPeerPtr& peer,
+    const Webserver::WebRequest& req, Webserver::WebResponse* resp) {
+  std::stringstream *out = &resp->output;
+  *out << "<h1>In-Memory Locks for Tablet "
+       << EscapeForHtmlToString(tablet_id) << "</h1>" << std::endl;
+
+  auto tablet_result = peer->shared_tablet();
+  if (!tablet_result.ok()) {
+    *out << EscapeForHtmlToString(tablet_result.status().ToString());
+    return;
+  }
+  auto* shared_lock_manager = (*tablet_result)->shared_lock_manager();
+  if (shared_lock_manager) {
+    shared_lock_manager->DumpStatusHtml(*out);
+  } else {
+    *out << "<h3>" << "No shared lock manager found. This is unexpected." << "</h3>" << std::endl;
+  }
+}
+
+void HandlePreparerPage(
+    const std::string& tablet_id, const tablet::TabletPeerPtr& peer,
+    const Webserver::WebRequest& req, Webserver::WebResponse* resp) {
+  std::stringstream *out = &resp->output;
+  *out << "<h1>Prepare Info for Tablet "
+       << EscapeForHtmlToString(tablet_id) << "</h1>" << std::endl;
+
+  auto* preparer = DCHECK_NOTNULL(peer->DEBUG_GetPreparer());
+  if (preparer) {
+    preparer->DumpStatusHtml(*out);
+  } else {
+    *out << "<h3>" << "No preparer found. This is unexpected." << "</h3>" << std::endl;
+  }
 }
 
 template<class F>
@@ -418,11 +489,33 @@ Status TabletServerPathHandlers::Register(Webserver* server) {
       "/operations", "",
       std::bind(&TabletServerPathHandlers::HandleOperationsPage, this, _1, _2), true /* styled */,
       false /* is_on_nav_bar */);
+  server->RegisterPathHandler(
+      "/remotebootstraps", "",
+      std::bind(&TabletServerPathHandlers::HandleRemoteBootstrapsPage, this, _1, _2),
+      true /* styled */,
+      false /* is_on_nav_bar */);
+  server->RegisterPathHandler(
+      "/TSLocalLockManager", "",
+      std::bind(&TabletServerPathHandlers::HandleObjectLocksPage, this, _1, _2),
+      true /* styled */,
+      false /* is_on_nav_bar */);
+  server->RegisterPathHandler(
+      "/cgroups", "",
+      std::bind(&TabletServerPathHandlers::HandleCgroupsPage, this, _1, _2),
+      true /* styled */,
+      false /* is_on_nav_bar */);
   RegisterTabletPathHandler(
       server, tserver_, "/tablet-consensus-status", &HandleConsensusStatusPage);
   RegisterTabletPathHandler(server, tserver_, "/log-anchors", &HandleLogAnchorsPage);
   RegisterTabletPathHandler(server, tserver_, "/transactions", &HandleTransactionsPage);
   RegisterTabletPathHandler(server, tserver_, "/rocksdb", &HandleRocksDBPage);
+  RegisterTabletPathHandler(server, tserver_, "/waitqueue", &HandleWaitQueuePage);
+  RegisterTabletPathHandler(server, tserver_, "/sharedlockmanager", &HandleInMemoryLocksPage);
+  RegisterTabletPathHandler(server, tserver_, "/preparer", &HandlePreparerPage);
+  server->RegisterPathHandler(
+      "/snapshots", "Snapshots",
+      std::bind(&TabletServerPathHandlers::HandleSnapshotsPage, this, _1, _2), true /* styled */,
+      true /* is_on_nav_bar */, "fa fa-camera");
   server->RegisterPathHandler(
       "/", "Dashboards",
       std::bind(&TabletServerPathHandlers::HandleDashboardsPage, this, _1, _2), true /* styled */,
@@ -438,6 +531,12 @@ Status TabletServerPathHandlers::Register(Webserver* server) {
       std::bind(&TabletServerPathHandlers::HandleMaintenanceManagerPage, this, _1, _2),
       true /* styled */, false /* is_on_nav_bar */);
   server->RegisterPathHandler(
+      "/xcluster", "xCluster",
+      std::bind(&TabletServerPathHandlers::HandleXClusterPage, this, _1, _2), true /* styled */,
+      false /* is_on_nav_bar */);
+
+  // APIS.
+  server->RegisterPathHandler(
       "/api/v1/health-check", "TServer Health Check",
       std::bind(&TabletServerPathHandlers::HandleHealthCheck, this, _1, _2),
       false /* styled */, false /* is_on_nav_bar */);
@@ -449,6 +548,18 @@ Status TabletServerPathHandlers::Register(Webserver* server) {
       "/api/v1/masters", "Master servers and their role (Leader/Follower)",
       std::bind(&TabletServerPathHandlers::HandleListMasterServers, this, _1, _2),
       false /* styled */, false /* is_on_nav_bar */);
+  server->RegisterPathHandler(
+      "/api/v1/tablets", "Tablets",
+      std::bind(&TabletServerPathHandlers::HandleTabletsJSON, this, _1, _2),
+      false /* styled */, false /* is_on_nav_bar */);
+  server->RegisterPathHandler(
+      "/api/v1/meta-cache", "MetaCache",
+      std::bind(&TabletServerPathHandlers::HandleTabletMetaCacheJSON, this, _1, _2),
+      false /* styled */, false /* is_on_nav_bar */);
+  server->RegisterPathHandler(
+      "/api/v1/xcluster", "xcluster",
+      std::bind(&TabletServerPathHandlers::HandleXClusterJSON, this, _1, _2), false /* styled */,
+      false /* is_on_nav_bar */);
   return Status::OK();
 }
 
@@ -476,17 +587,17 @@ void TabletServerPathHandlers::HandleOperationsPage(const Webserver::WebRequest&
       arg.c_str(), false) ? Operation::TRACE_TXNS : Operation::NO_TRACE_TXNS;
 
   if (!as_text) {
-    *output << "<h1>Transactions</h1>\n";
+    *output << "<h1>Operations</h1>\n";
     *output << "<table class='table table-striped'>\n";
     *output << "   <tr><th>Tablet id</th><th>Op Id</th>"
-      "<th>Transaction Type</th><th>"
+      "<th>Operation Type</th><th>"
       "Total time in-flight</th><th>Description</th></tr>\n";
   }
 
   for (const std::shared_ptr<TabletPeer>& peer : peers) {
     vector<OperationStatusPB> inflight;
 
-    auto tablet = peer->shared_tablet();
+    auto tablet = peer->shared_tablet_maybe_null();
     if (tablet == nullptr) {
       continue;
     }
@@ -526,6 +637,61 @@ void TabletServerPathHandlers::HandleOperationsPage(const Webserver::WebRequest&
   }
 }
 
+void TabletServerPathHandlers::HandleRemoteBootstrapsPage(const Webserver::WebRequest& req,
+                                                          Webserver::WebResponse* resp) {
+  std::stringstream *output = &resp->output;
+  auto rbs_service_ptr = tserver_->GetRemoteBootstrapService();
+  if (!rbs_service_ptr) {
+    *output << "<h2>Could not locate the Remote Bootstrap Service, "
+            << "server might be shutting down...</h2>\n";
+    return;
+  }
+  rbs_service_ptr->DumpStatusHtml(*output);
+}
+
+void TabletServerPathHandlers::HandleObjectLocksPage(
+    const Webserver::WebRequest& req, Webserver::WebResponse* resp) {
+  std::stringstream *output = &resp->output;
+  auto ts_local_lock_manager = tserver_->ts_local_lock_manager();
+  if (!ts_local_lock_manager) {
+    *output << "<h2>Could not locate the TSLocalLockManager...</h2>\n";
+    return;
+  }
+  ts_local_lock_manager->DumpLocksToHtml(*output);
+}
+
+void TabletServerPathHandlers::HandleCgroupsPage(
+    const Webserver::WebRequest& req, Webserver::WebResponse* resp) {
+  std::stringstream *output = &resp->output;
+  *output << "<h2>Cgroups</h2>\n";
+#ifdef __linux__
+  auto cgroup_manager = tserver_->cgroup_manager();
+  if (!cgroup_manager) {
+    *output << "Cgroup management is not enabled.\n";
+    return;
+  }
+
+  auto it = req.parsed_args.find("sample_interval_ms");
+  // 1000ms is the maximum value for cfs_period_us, so we are guaranteed to sample at least one
+  // full period for all cgroups.
+  uint64_t sample_interval_ms = 1'000;
+  if (it != req.parsed_args.end()) {
+    auto result = CheckedStoull(it->second);
+    if (!result.ok()) {
+      *output << "Bad value for sample_interval_ms: ";
+      EscapeForHtml(AsString(result.status()), output);
+      *output << ".\n";
+      return;
+    }
+    sample_interval_ms = *result;
+  }
+
+  cgroup_manager->DumpCgroupsToHtml(*output, sample_interval_ms);
+#else
+  *output << "Only available on Linux builds\n";
+#endif
+}
+
 namespace {
 string TabletLink(const string& id) {
   return Substitute("<a href=\"/tablet?id=$0\">$1</a>",
@@ -541,16 +707,17 @@ bool CompareByTabletId(const std::shared_ptr<TabletPeer>& a,
 string GetOnDiskSizeInHtml(const yb::tablet::TabletOnDiskSizeInfo& info) {
   std::ostringstream disk_size_html;
   disk_size_html << "<ul>"
-                 << "<li>" << "Total: "
-                 << HumanReadableNumBytes::ToString(info.sum_on_disk_size)
-                 << "<li>" << "Consensus Metadata: "
-                 << HumanReadableNumBytes::ToString(info.consensus_metadata_disk_size)
-                 << "<li>" << "WAL Files: "
-                 << HumanReadableNumBytes::ToString(info.wal_files_disk_size)
+                 << "<li>" << "Total (may be stale): "
+                 << (info.total_on_disk_size > 0 ?
+                        HumanReadableNumBytes::ToString(info.total_on_disk_size) : "N/A")
+                 << "<ul>"
                  << "<li>" << "SST Files: "
                  << HumanReadableNumBytes::ToString(info.sst_files_disk_size)
-                 << "<li>" << "SST Files Uncompressed: "
-                 << HumanReadableNumBytes::ToString(info.uncompressed_sst_files_disk_size)
+                 << "<li>" << "WAL Files: "
+                 << HumanReadableNumBytes::ToString(info.wal_files_disk_size)
+                 << "<li>" << "Consensus Metadata: "
+                 << HumanReadableNumBytes::ToString(info.consensus_metadata_disk_size)
+                 << "</ul>"
                  << "</ul>";
   return disk_size_html.str();
 }
@@ -571,10 +738,10 @@ std::map<TableIdentifier, TableInfo> GetTablesInfo(
       continue;
     }
 
-    auto consensus = peer->shared_consensus();
+    auto consensus_result = peer->GetConsensus();
     auto raft_role = PeerRole::UNKNOWN_ROLE;
-    if (consensus) {
-      raft_role = consensus->role();
+    if (consensus_result) {
+      raft_role = consensus_result.get()->role();
     } else if (status.tablet_data_state() == TabletDataState::TABLET_DATA_COPYING) {
       raft_role = PeerRole::LEARNER;
     }
@@ -584,7 +751,7 @@ std::map<TableIdentifier, TableInfo> GetTablesInfo(
       .state = peer->HumanReadableState()
     };
 
-    auto tablet = peer->shared_tablet();
+    auto tablet = peer->shared_tablet_maybe_null();
     uint64_t num_sst_files = (tablet) ? tablet->GetCurrentVersionNumSSTFiles() : 0;
     bool is_hidden = status.is_hidden();
 
@@ -594,7 +761,7 @@ std::map<TableIdentifier, TableInfo> GetTablesInfo(
         .is_hidden = is_hidden,
         .num_sst_files = num_sst_files,
         .disk_size_info = yb::tablet::TabletOnDiskSizeInfo::FromPB(status),
-        .has_on_disk_size = status.has_estimated_on_disk_size(),
+        .has_on_disk_size = status.has_active_on_disk_size(),
         .raft_role = raft_role
     };
 
@@ -614,17 +781,14 @@ std::map<TableIdentifier, TableInfo> GetTablesInfo(
 void TabletServerPathHandlers::HandleTablesPage(const Webserver::WebRequest& req,
                                                 Webserver::WebResponse* resp) {
   std::stringstream *output = &resp->output;
+  HtmlPrintHelper html_print_helper(*output);
   auto peers = tserver_->tablet_manager()->GetTabletPeers();
   auto table_map = GetTablesInfo(peers);
   bool show_missing_size_footer = false;
 
-  *output << "<h1>Tables</h1>\n"
-          << "<table class='table table-striped'>\n"
-          << "  <tr>\n"
-          << "    <th>Namespace</th><th>Table name</th><th>Table UUID</th>\n"
-          << "    <th>State</th><th>Hidden</th><th>Num SST Files</th>\n"
-          << "    <th>On-disk size</th><th>Raft roles</th>\n"
-          << "  </tr>\n";
+  auto html_table = html_print_helper.CreateTablePrinter(
+      "table", {"Namespace", "Table name", "Table UUID", "State", "Num SST Files", "On-disk size",
+                "Raft roles"});
 
   for (const auto& table_iter : table_map) {
     const auto& identifier = table_iter.first;
@@ -644,20 +808,14 @@ void TabletServerPathHandlers::HandleTablesPage(const Webserver::WebRequest& req
     }
     role_counts_html << "</ul>";
 
-    *output << Substitute(
-        "<tr><td>$0</td><td>$1</td><td>$2</td><td>$3</td><td>$4</td>"
-        "<td>$5</td><td>$6</td><td>$7</td></tr>\n",
-        EscapeForHtmlToString(info.namespace_name),
-        EscapeForHtmlToString(info.name),
+    html_table.AddRow(
+        EscapeForHtmlToString(info.namespace_name), EscapeForHtmlToString(info.name),
         EscapeForHtmlToString(identifier.uuid),
-        EscapeForHtmlToString(identifier.state),
-        info.is_hidden,
-        info.num_sst_files,
-        tables_disk_size_html,
-        role_counts_html.str());
+        Format("$0$1", identifier.state, (info.is_hidden ? " (HIDDEN)" : "")), info.num_sst_files,
+        tables_disk_size_html, role_counts_html.str());
   }
 
-  *output << "</table>\n";
+  html_table.Print();
 
   if (show_missing_size_footer) {
     *output << "<p>* Some tablets did not provide disk size estimates,"
@@ -675,9 +833,9 @@ void TabletServerPathHandlers::HandleTabletsPage(const Webserver::WebRequest& re
   *output << "<table class='table table-striped'>\n";
   *output << "  <tr><th>Namespace</th><th>Table name</th><th>Table UUID</th><th>Tablet ID</th>"
              "<th>Partition</th>"
-             "<th>State</th><th>Hidden</th><th>Num SST Files</th><th>On-disk "
-             "size</th><th>RaftConfig</th>"
-             "<th>Last status</th></tr>\n";
+             "<th>State</th><th>Hidden</th><th>RaftConfig</th>"
+             "<th>Last status</th><th>Num SST Files</th><th>On-disk "
+             "size</th></tr>\n";
   for (const std::shared_ptr<TabletPeer>& peer : peers) {
     TabletStatusPB status;
     peer->GetTabletStatusPB(&status);
@@ -686,7 +844,7 @@ void TabletServerPathHandlers::HandleTabletsPage(const Webserver::WebRequest& re
     string table_name = status.table_name();
     string table_id = status.table_id();
     string tablet_id_or_link;
-    auto tablet = peer->shared_tablet();
+    auto tablet = peer->shared_tablet_maybe_null();
     if (tablet != nullptr) {
       tablet_id_or_link = TabletLink(id);
     } else {
@@ -704,11 +862,11 @@ void TabletServerPathHandlers::HandleTabletsPage(const Webserver::WebRequest& re
     uint64_t num_sst_files = (tablet) ? tablet->GetCurrentVersionNumSSTFiles() : 0;
 
     // TODO: would be nice to include some other stuff like memory usage
-    shared_ptr<consensus::Consensus> consensus = peer->shared_consensus();
+    auto consensus_result = peer->GetConsensus();
     (*output) << Format(
         // Namespace, Table name, UUID of table, tablet id, partition
         "<tr><td>$0</td><td>$1</td><td>$2</td><td>$3</td><td>$4</td>"
-        // State, Hidden, num SST files, on-disk size, consensus configuration, last status
+        // State, Hidden, consensus configuration, last status, num SST files, on-disk size
         "<td>$5</td><td>$6</td><td>$7</td><td>$8</td><td>$9</td><td>$10</td></tr>\n",
         EscapeForHtmlToString(namespace_name),              // $0
         EscapeForHtmlToString(table_name),                  // $1
@@ -717,11 +875,12 @@ void TabletServerPathHandlers::HandleTabletsPage(const Webserver::WebRequest& re
         EscapeForHtmlToString(partition),                   // $4
         EscapeForHtmlToString(peer->HumanReadableState()),  // $5
         status.is_hidden(),                                 // $6
-        num_sst_files,                                      // $7
-        tablets_disk_size_html,                             // $8
-        consensus ? ConsensusStatePBToHtml(consensus->ConsensusState(CONSENSUS_CONFIG_COMMITTED))
-                  : "",                                // $9
-        EscapeForHtmlToString(status.last_status()));  // $10
+        consensus_result ? ConsensusStatePBToHtml(
+                               consensus_result.get()->ConsensusState(CONSENSUS_CONFIG_COMMITTED))
+                         : "",                              // $7
+        EscapeForHtmlToString(status.last_status()),        // $8
+        num_sst_files,                                      // $9
+        tablets_disk_size_html);                            // $10
   }
   *output << "</table>\n";
 }
@@ -774,17 +933,56 @@ string TabletServerPathHandlers::ConsensusStatePBToHtml(const ConsensusStatePB& 
   return html.str();
 }
 
+void TabletServerPathHandlers::OutputConnectivity(std::ostream& output) {
+  output << "<h4>Connectivity</h4>\n";
+  output << "<table class='table table-striped'>\n";
+  output << "  <tr><th>Type</th><th>UUID</th><th>Master State</th><th>Last seen</th>"
+                 "<th>Endpoint</th><th>Ping</th></tr>\n";
+  auto state = tserver_->ConnectivityState();
+  std::ranges::sort(*state.mutable_entries(), [](const auto& lhs, const auto& rhs) {
+    return std::tuple(!lhs.alive(), lhs.server_type(), lhs.uuid()) <
+           std::tuple(!rhs.alive(), rhs.server_type(), rhs.uuid());
+  });
+  auto now = WallClock()->Now();
+  for (const auto& entry : state.entries()) {
+    output << Format(
+        "<tr><td>$0</td><td>$1</td><td style=\"color: $2;\">$3</td><td>$4</td><td>$5</td>"
+            "<td style=\"color: $6;\">$7</td></tr>\n",
+        ServerType_Name(entry.server_type()),
+        entry.uuid(),
+        entry.alive() ? "green" : "red",
+        entry.alive() ? "ALIVE" : "DEAD",
+        now.ok() ? MonoDelta::FromMicroseconds(
+                       now->time_point - entry.last_seen_us_since_epoch()).ToPrettyString()
+                 : "<UNKNOWN>",
+        HostPortFromPB(entry.endpoint()),
+        entry.last_failure().empty() ? "black" : "red",
+        entry.last_failure().empty()
+          ? MonoDelta::FromMicroseconds(entry.ping_us()).ToPrettyString()
+          : entry.last_failure());
+  }
+  output << "</table>\n";
+}
+
 void TabletServerPathHandlers::HandleDashboardsPage(const Webserver::WebRequest& req,
                                                     Webserver::WebResponse* resp) {
-  std::stringstream *output = &resp->output;
-  *output << "<h3>Dashboards</h3>\n";
-  *output << "<table class='table table-striped'>\n";
-  *output << "  <tr><th>Dashboard</th><th>Description</th></tr>\n";
-  *output << GetDashboardLine(
+  std::ostream& output = resp->output;
+  output << "<h3>Dashboards</h3>\n";
+  output << "<table class='table table-striped'>\n";
+  output << "  <tr><th>Dashboard</th><th>Description</th></tr>\n";
+  output << GetDashboardLine(
       "operations", "Operations", "List of operations that are currently replicating.");
-  *output << GetDashboardLine("maintenance-manager", "Maintenance Manager",
-                              "List of operations that are currently running and those "
-                              "that are registered.");
+  output << GetDashboardLine(
+      "remotebootstraps", "Remote Bootstraps Sessions being served",
+      "List of remote bootstrap sessions this tablet server is currently serving.");
+  output << GetDashboardLine("maintenance-manager", "Maintenance Manager",
+                             "List of operations that are currently running and those "
+                             "that are registered.");
+  output << GetDashboardLine(
+      "TSLocalLockManager", "Object locks held at the tserver local TSLocalLockManager",
+      "Dump of all granted and awaiting object locks at the local TSLocalLockManager");
+  output << "</table>\n";
+  OutputConnectivity(output);
 }
 
 void TabletServerPathHandlers::HandleIntentsDBPage(const Webserver::WebRequest& req,
@@ -828,7 +1026,7 @@ void TabletServerPathHandlers::HandleIntentsDBPage(const Webserver::WebRequest& 
 
   (*output) << Format("Intents size: $0<br>", intents.size()) << "\n";
   for (const auto& item : intents) {
-    (*output) << Format("$0<br>", item);
+    (*output) << Format("$0<br>", EscapeForHtmlToString(item));
   }
 }
 
@@ -885,19 +1083,228 @@ void TabletServerPathHandlers::HandleMaintenanceManagerPage(const Webserver::Web
   *output << "<h3>Non-running operations</h3>\n";
   *output << "<table class='table table-striped'>\n";
   *output << "  <tr><th>Name</th><th>Runnable</th><th>RAM anchored</th>\n"
-          << "       <th>Logs retained</th><th>Perf</th></tr>\n";
+          << "       <th>Logs retained</th><th>Perf</th>\n"
+          << "       <th>CDCSDK reset stale retention barrier</th></tr>\n";
   for (int i = 0; i < ops_count; i++) {
     MaintenanceManagerStatusPB_MaintenanceOpPB op_pb = pb.registered_operations(i);
     if (op_pb.running() == 0) {
-      *output << Substitute("<tr><td>$0</td><td>$1</td><td>$2</td><td>$3</td><td>$4</td></tr>\n",
-                            EscapeForHtmlToString(op_pb.name()),
-                            op_pb.runnable(),
-                            HumanReadableNumBytes::ToString(op_pb.ram_anchored_bytes()),
-                            HumanReadableNumBytes::ToString(op_pb.logs_retained_bytes()),
-                            op_pb.perf_improvement());
+      *output << Substitute(
+          "<tr><td>$0</td><td>$1</td><td>$2</td><td>$3</td><td>$4</td><td>$5</td></tr>\n",
+          EscapeForHtmlToString(op_pb.name()), op_pb.runnable(),
+          HumanReadableNumBytes::ToString(op_pb.ram_anchored_bytes()),
+          HumanReadableNumBytes::ToString(op_pb.logs_retained_bytes()), op_pb.perf_improvement(),
+          op_pb.cdcsdk_reset_stale_retention_barrier() ? "Yes" : "No");
     }
   }
   *output << "</table>\n";
+}
+
+namespace {
+
+std::vector<xrepl::StreamTabletStats> GetXClusterOutboundStreamStats(TabletServer* const tserver) {
+  auto cdc_service = tserver->GetCDCService();
+  if (!cdc_service || !cdc_service->CDCEnabled()) {
+    return {};
+  }
+  auto stream_tablet_stats = cdc_service->GetAllStreamTabletStats();
+  if (stream_tablet_stats.empty()) {
+    return {};
+  }
+
+  xrepl::StreamTabletStats agg_stats;
+  agg_stats.stream_id_str = "[Aggregate]";
+
+  std::sort(stream_tablet_stats.begin(), stream_tablet_stats.end());
+  for (const auto& stat : stream_tablet_stats) {
+    agg_stats += stat;
+  }
+  agg_stats /= stream_tablet_stats.size();
+  stream_tablet_stats.emplace_back(std::move(agg_stats));
+
+  return stream_tablet_stats;
+}
+
+std::vector<XClusterPollerStats> GetXClusterInboundStreamStats(TabletServer* const tserver) {
+  auto* xcluster_consumer = tserver->GetXClusterConsumer();
+  if (!xcluster_consumer) {
+    return {};
+  }
+
+  auto pollers_stats = xcluster_consumer->GetPollerStats();
+  if (pollers_stats.empty()) {
+    return pollers_stats;
+  }
+
+  std::sort(pollers_stats.begin(), pollers_stats.end());
+  XClusterPollerStats agg_stats("[Aggregate]");
+  for (const auto& stat : pollers_stats) {
+    agg_stats += stat;
+  }
+  agg_stats /= pollers_stats.size();
+  pollers_stats.emplace_back(std::move(agg_stats));
+  return pollers_stats;
+}
+}  // anonymous namespace
+
+void TabletServerPathHandlers::HandleXClusterPage(
+    const Webserver::WebRequest& req, Webserver::WebResponse* resp) {
+  std::stringstream& output = resp->output;
+  HtmlPrintHelper html_print_helper(output);
+
+  if (!FLAGS_enable_xcluster_stat_collection) {
+    output << "<h3>xCluster stats collection is not enabled. Set enable_xcluster_stat_collection "
+               "to enable it.</h3 >\n";
+    return;
+  }
+
+  const auto xcluster_outbound_stream_stats = GetXClusterOutboundStreamStats(tserver_);
+  const auto xcluster_inbound_stream_stats = GetXClusterInboundStreamStats(tserver_);
+  if (xcluster_outbound_stream_stats.empty() && xcluster_inbound_stream_stats.empty()) {
+    output << "<h3>xCluster replication is not enabled</h3 >\n";
+    return;
+  }
+
+  output << "<h1>xCluster state</h1>\n";
+
+  if (!xcluster_outbound_stream_stats.empty()) {
+    auto group_fs = html_print_helper.CreateFieldset("xCluster outbound streams");
+
+    auto xcluster_streams = html_print_helper.CreateTablePrinter(
+        "xcluster_streams",
+        {"Stream Id", "Produce Table Id", "Producer Tablet Id", "State", "Avg poll delay (ms)",
+         "Throughput (KiBps)", "Data sent (MiB)", "Records sent", "Avg GetChanges latency (ms)",
+         "WAL index sent", "WAL end index", "Last poll at", "Status"});
+
+    for (const auto& stat : xcluster_outbound_stream_stats) {
+      xcluster_streams
+          .AddRow(
+              stat.stream_id_str, stat.producer_table_id, stat.producer_tablet_id, stat.state,
+              stat.avg_poll_delay_ms, StringPrintf("%.3f", stat.avg_throughput_kbps),
+              StringPrintf("%.3f", stat.mbs_sent), stat.records_sent,
+              stat.avg_get_changes_latency_ms, stat.sent_index, stat.latest_index,
+              stat.last_poll_time.ToFormattedString(), stat.status)
+          .SetColor(stat.status);
+    }
+    xcluster_streams.Print();
+  }
+
+  if (!xcluster_inbound_stream_stats.empty()) {
+    auto group_fs = html_print_helper.CreateFieldset("xCluster inbound streams");
+    auto xcluster_pollers = html_print_helper.CreateTablePrinter(
+        "xcluster_pollers",
+        {"ReplicationGroup Id", "Stream Id", "Consumer Table Id", "Consumer Tablet Id",
+         "Producer Tablet Id", "State", "Avg poll delay (ms)", "Throughput (KiBps)",
+         "Data received (MiB)", "Records received", "Avg GetChanges latency (ms)",
+         "Avg apply latency (ms)", "WAL index received", "Last poll At", "Status"});
+
+    for (const auto& stat : xcluster_inbound_stream_stats) {
+      xcluster_pollers
+          .AddRow(
+              stat.replication_group_id, stat.stream_id_str, stat.consumer_table_id,
+              stat.consumer_tablet_id, stat.producer_tablet_id, stat.state, stat.avg_poll_delay_ms,
+              StringPrintf("%.3f", stat.avg_throughput_kbps),
+              StringPrintf("%.3f", stat.mbs_received), stat.records_received,
+              stat.avg_get_changes_latency_ms, stat.avg_apply_latency_ms, stat.received_index,
+              stat.last_poll_time.ToFormattedString(), stat.status)
+          .SetColor(stat.status);
+    }
+    xcluster_pollers.Print();
+  }
+
+  output << "\n<aside><h5>Note:</h5><p>This data is collected over the last few polls. Check "
+            "metrics or logs for older and detailed information.</p></aside>";
+}
+
+void TabletServerPathHandlers::HandleXClusterJSON(
+    const Webserver::WebRequest& req, Webserver::WebResponse* resp) {
+  if (!FLAGS_enable_xcluster_stat_collection) {
+    return;
+  }
+
+  std::stringstream* output = &resp->output;
+  const auto xcluster_outbound_stream_stats = GetXClusterOutboundStreamStats(tserver_);
+  const auto xcluster_inbound_stream_stats = GetXClusterInboundStreamStats(tserver_);
+
+  JsonWriter jw(output, JsonWriter::COMPACT);
+
+  jw.StartObject();
+  if (!xcluster_outbound_stream_stats.empty()) {
+    jw.String("outbound_streams");
+    jw.StartArray();
+
+    for (const auto& stat : xcluster_outbound_stream_stats) {
+      jw.StartObject();
+      jw.String("stream_id");
+      jw.String(stat.stream_id_str);
+      jw.String("producer_table_id");
+      jw.String(stat.producer_table_id);
+      jw.String("producer_tablet_id");
+      jw.String(stat.producer_tablet_id);
+      jw.String("state");
+      jw.String(stat.state);
+      jw.String("avg_poll_delay_ms");
+      jw.Uint64(stat.avg_poll_delay_ms);
+      jw.String("avg_throughput_KiBps");
+      jw.Double(stat.avg_throughput_kbps);
+      jw.String("MiBs_sent");
+      jw.Double(stat.mbs_sent);
+      jw.String("records_sent");
+      jw.Uint64(stat.records_sent);
+      jw.String("avg_get_changes_latency_ms");
+      jw.Uint64(stat.avg_get_changes_latency_ms);
+      jw.String("wal_sent_index");
+      jw.Int64(stat.sent_index);
+      jw.String("wal_end_index");
+      jw.Int64(stat.latest_index);
+      jw.String("last_poll_time");
+      jw.String(stat.last_poll_time.ToFormattedString());
+      jw.String("status");
+      jw.String(stat.status.ToString());
+      jw.EndObject();
+    }
+    jw.EndArray();
+  }
+
+  if (!xcluster_inbound_stream_stats.empty()) {
+    jw.String("inbound_streams");
+    jw.StartArray();
+    for (const auto& stat : xcluster_inbound_stream_stats) {
+      jw.StartObject();
+      jw.String("replication_group_id");
+      jw.String(stat.replication_group_id.ToString());
+      jw.String("stream_id");
+      jw.String(stat.stream_id_str);
+      jw.String("consumer_table_id");
+      jw.String(stat.consumer_table_id);
+      jw.String("consumer_tablet_id");
+      jw.String(stat.consumer_tablet_id);
+      jw.String("producer_tablet_id");
+      jw.String(stat.producer_tablet_id);
+      jw.String("state");
+      jw.String(stat.state);
+      jw.String("avg_poll_delay_ms");
+      jw.Uint64(stat.avg_poll_delay_ms);
+      jw.String("avg_throughput_KiBps");
+      jw.Double(stat.avg_throughput_kbps);
+      jw.String("MiBs_received");
+      jw.Double(stat.mbs_received);
+      jw.String("records_received");
+      jw.Uint64(stat.records_received);
+      jw.String("avg_get_changes_latency_ms");
+      jw.Uint64(stat.avg_get_changes_latency_ms);
+      jw.String("avg_apply_latency_ms");
+      jw.Uint64(stat.avg_apply_latency_ms);
+      jw.String("received_index");
+      jw.Int64(stat.received_index);
+      jw.String("last_poll_time");
+      jw.String(stat.last_poll_time.ToFormattedString());
+      jw.String("status");
+      jw.String(stat.status.ToString());
+      jw.EndObject();
+    }
+    jw.EndArray();
+  }
+  jw.EndObject();
 }
 
 void TabletServerPathHandlers::HandleHealthCheck(const Webserver::WebRequest& req,
@@ -916,6 +1323,115 @@ void TabletServerPathHandlers::HandleHealthCheck(const Webserver::WebRequest& re
   }
   jw.EndArray();
   jw.EndObject();
+}
+
+void TabletServerPathHandlers::HandleTabletsJSON(const Webserver::WebRequest& req,
+                                                 Webserver::WebResponse* resp) {
+  std::stringstream *output = &resp->output;
+  JsonWriter jw(output, JsonWriter::COMPACT);
+
+  auto peers = tserver_->tablet_manager()->GetTabletPeers();
+  std::sort(peers.begin(), peers.end(), &CompareByTabletId);
+  jw.StartObject();
+
+  for (const std::shared_ptr<TabletPeer>& peer : peers) {
+    TabletStatusPB status;
+    peer->GetTabletStatusPB(&status);
+    string id = status.tablet_id();
+    string tablets_disk_size_html = GetOnDiskSizeInHtml(
+        yb::tablet::TabletOnDiskSizeInfo::FromPB(status)
+    );
+
+    const auto& tablet_metadata = peer->tablet_metadata();
+    string partition = tablet_metadata->partition_schema()
+                            ->PartitionDebugString(*peer->status_listener()->partition(),
+                                                   *tablet_metadata->schema());
+
+    const auto& tablet = peer->shared_tablet_maybe_null();
+    uint64_t num_sst_files = (tablet) ? tablet->GetCurrentVersionNumSSTFiles() : 0;
+
+    // TODO: Would be nice to include some other stuff like memory usage.
+    const auto& consensus = peer->GetConsensus();
+
+    jw.String(id);
+    jw.StartObject();
+    jw.String("namespace");
+    jw.String(status.namespace_name());
+    jw.String("table_name");
+    jw.String(status.table_name());
+    jw.String("table_id");
+    jw.String(status.table_id());
+    jw.String("partition");
+    jw.String(partition);
+    jw.String("state");
+    jw.String(peer->HumanReadableState());
+    jw.String("hidden");
+    jw.Bool(status.is_hidden());
+    jw.String("num_sst_files");
+    jw.Uint64(num_sst_files);
+    jw.String("on_disk_size");
+
+    jw.StartObject();
+    const yb::tablet::TabletOnDiskSizeInfo& info = yb::tablet::TabletOnDiskSizeInfo::FromPB(status);
+    jw.String("total_size");
+    jw.String(HumanReadableNumBytes::ToString(info.active_on_disk_size));
+    jw.String("total_size_bytes");
+    jw.Uint64(info.active_on_disk_size);
+    jw.String("total_size_including_snapshots");
+    jw.String(HumanReadableNumBytes::ToString(info.total_on_disk_size));
+    jw.String("total_size_including_snapshots_bytes");
+    jw.Uint64(info.total_on_disk_size);
+    jw.String("consensus_metadata_size");
+    jw.String(HumanReadableNumBytes::ToString(info.consensus_metadata_disk_size));
+    jw.String("consensus_metadata_size_bytes");
+    jw.Uint64(info.consensus_metadata_disk_size);
+    jw.String("wal_files_size");
+    jw.String(HumanReadableNumBytes::ToString(info.wal_files_disk_size));
+    jw.String("wal_files_size_bytes");
+    jw.Uint64(info.wal_files_disk_size);
+    jw.String("sst_files_size");
+    jw.String(HumanReadableNumBytes::ToString(info.sst_files_disk_size));
+    jw.String("sst_files_size_bytes");
+    jw.Uint64(info.sst_files_disk_size);
+    jw.String("uncompressed_sst_files_size");
+    jw.String(HumanReadableNumBytes::ToString(info.uncompressed_sst_files_disk_size));
+    jw.String("uncompressed_sst_files_size_bytes");
+    jw.Uint64(info.uncompressed_sst_files_disk_size);
+    jw.EndObject();
+
+    jw.String("raft_config");
+    jw.StartArray();
+    if (consensus) {
+        const ConsensusStatePB& cstate =
+            consensus.get()->ConsensusState(CONSENSUS_CONFIG_COMMITTED);
+        std::vector<RaftPeerPB> sorted_peers;
+        sorted_peers.assign(cstate.config().peers().begin(), cstate.config().peers().end());
+        std::sort(sorted_peers.begin(), sorted_peers.end(), &CompareByMemberType);
+        for (const RaftPeerPB& peer : sorted_peers) {
+          jw.StartObject();
+          std::string peer_addr_or_uuid = !peer.last_known_private_addr().empty()
+              ? peer.last_known_private_addr()[0].host()
+              : peer.permanent_uuid();
+          peer_addr_or_uuid = EscapeForHtmlToString(peer_addr_or_uuid);
+          string role_name = PeerRole_Name(GetConsensusRole(peer.permanent_uuid(), cstate));
+          jw.String(role_name);
+          jw.String(peer_addr_or_uuid);
+          jw.EndObject();
+        }
+    }
+    jw.EndArray();
+    jw.String("status");
+    jw.String(status.last_status());
+    jw.EndObject();
+  }
+  jw.EndObject();
+}
+
+void TabletServerPathHandlers::HandleTabletMetaCacheJSON(
+    const Webserver::WebRequest& req, Webserver::WebResponse* resp) {
+  std::stringstream* output = &resp->output;
+  JsonWriter writer(output, JsonWriter::COMPACT);
+  tserver_->WriteServerMetaCacheAsJson(&writer);
 }
 
 }  // namespace tserver

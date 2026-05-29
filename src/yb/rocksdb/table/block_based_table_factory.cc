@@ -3,9 +3,9 @@
 //  LICENSE file in the root directory of this source tree. An additional grant
 //  of patent rights can be found in the PATENTS file in the same directory.
 //
-// The following only applies to changes made to this file as part of YugaByte development.
+// The following only applies to changes made to this file as part of YugabyteDB development.
 //
-// Portions Copyright (c) YugaByte, Inc.
+// Portions Copyright (c) YugabyteDB, Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License"); you may not use this file except
 // in compliance with the License.  You may obtain a copy of the License at
@@ -140,7 +140,7 @@ std::string BlockBasedTableFactory::GetPrintableTableOptions() const {
            table_options_.cache_index_and_filter_blocks);
   ret.append(buffer);
   snprintf(buffer, kBufferSize, "  index_type: %d\n",
-           yb::to_underlying(table_options_.index_type));
+           std::to_underlying(table_options_.index_type));
   ret.append(buffer);
   snprintf(buffer, kBufferSize, "  hash_index_allow_collision: %d\n",
            table_options_.hash_index_allow_collision);
@@ -198,10 +198,6 @@ std::string BlockBasedTableFactory::GetPrintableTableOptions() const {
 
 const BlockBasedTableOptions& BlockBasedTableFactory::table_options() const {
   return table_options_;
-}
-std::shared_ptr<TableAwareReadFileFilter> BlockBasedTableFactory::NewTableAwareReadFileFilter(
-    const ReadOptions &read_options, const Slice &user_key) const {
-  return std::make_shared<BloomFilterAwareFileFilter>(read_options, user_key);
 }
 
 TableFactory* NewBlockBasedTableFactory(

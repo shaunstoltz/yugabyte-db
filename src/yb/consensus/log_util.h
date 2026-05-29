@@ -15,9 +15,9 @@
 // specific language governing permissions and limitations
 // under the License.
 //
-// The following only applies to changes made to this file as part of YugaByte development.
+// The following only applies to changes made to this file as part of YugabyteDB development.
 //
-// Portions Copyright (c) YugaByte, Inc.
+// Portions Copyright (c) YugabyteDB, Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License"); you may not use this file except
 // in compliance with the License.  You may obtain a copy of the License at
@@ -32,14 +32,15 @@
 
 #pragma once
 
-#include <iosfwd>
-#include <map>
+#include <sys/stat.h>
+
 #include <memory>
 #include <string>
-#include <utility>
 #include <vector>
 
 #include <gtest/gtest_prod.h>
+
+#include "yb/common/opid.h"
 
 #include "yb/consensus/consensus_fwd.h"
 #include "yb/consensus/log_fwd.h"
@@ -52,7 +53,6 @@
 #include "yb/util/compare_util.h"
 #include "yb/util/env.h"
 #include "yb/util/monotime.h"
-#include "yb/util/opid.h"
 #include "yb/util/restart_safe_clock.h"
 #include "yb/util/status.h"
 #include "yb/util/tostring.h"
@@ -61,9 +61,11 @@
 DECLARE_bool(durable_wal_write);
 DECLARE_bool(require_durable_wal_write);
 DECLARE_string(fs_wal_dirs);
-DECLARE_string(fs_data_dirs);
 
 namespace yb {
+
+class MemTracker;
+
 namespace log {
 
 // Suffix for temporary files
@@ -128,7 +130,7 @@ struct LogEntryMetadata {
 };
 
 // A sequence of segments, ordered by increasing sequence number.
-typedef std::vector<std::shared_ptr<LWLogEntryPB>> LogEntries;
+using LogEntries = std::vector<std::shared_ptr<LWLogEntryPB>>;
 
 struct ReadEntriesResult {
   // Read entries
@@ -167,11 +169,14 @@ YB_DEFINE_ENUM(EntriesToRead, (kAll)(kReplicate));
 class ReadableLogSegment : public RefCountedThreadSafe<ReadableLogSegment> {
  public:
   // Factory method to construct a ReadableLogSegment from a file on the FS.
-  static Result<scoped_refptr<ReadableLogSegment>> Open(Env* env, const std::string& path);
+  static Result<scoped_refptr<ReadableLogSegment>> Open(
+      Env* env, const std::string& path, std::shared_ptr<MemTracker> read_wal_mem_tracker);
 
   // Build a readable segment to read entries from the provided path.
-  ReadableLogSegment(std::string path,
-                     std::shared_ptr<RandomAccessFile> readable_file);
+  // read_wal_mem_tracker may be nullptr in tests.
+  ReadableLogSegment(
+      std::string path, std::shared_ptr<RandomAccessFile> readable_file,
+      std::shared_ptr<MemTracker> read_wal_mem_tracker);
 
   // Initialize the ReadableLogSegment.
   // This initializer provides methods for avoiding disk IO when creating a
@@ -194,6 +199,8 @@ class ReadableLogSegment : public RefCountedThreadSafe<ReadableLogSegment> {
 
   // Reads all entries of the provided segment.
   //
+  // If start_offset_to_read is specified, should use it as the starting point to read.
+  //
   // If the log is corrupted (i.e. the returned 'Status' is 'Corruption') all
   // the log entries read up to the corrupted one are returned in the 'entries'
   // vector.
@@ -204,7 +211,8 @@ class ReadableLogSegment : public RefCountedThreadSafe<ReadableLogSegment> {
   // Will stop after reading max_entries_to_read entries.
   ReadEntriesResult ReadEntries(
       int64_t max_entries_to_read = std::numeric_limits<int64_t>::max(),
-      EntriesToRead entries_to_read = EntriesToRead::kAll);
+      EntriesToRead entries_to_read = EntriesToRead::kAll,
+      std::optional<int64_t> start_offset_to_read = std::nullopt);
 
   // Reads the metadata of the first entry in the segment
   Result<FirstEntryMetadata> ReadFirstEntryMetadata();
@@ -220,6 +228,17 @@ class ReadableLogSegment : public RefCountedThreadSafe<ReadableLogSegment> {
   // missing because we didn't have the time to write it out.
   Status RebuildFooterByScanning();
 
+  Status RebuildFooterByScanning(const ReadEntriesResult& read_entries);
+
+  // Restore footer_builder and log_index for log's active_segment.Similar to
+  // RebuildFooterByScanning(), this is also only used in the case of crash.
+  // The difference is, instead of rebuilding its footer and closing this
+  // uncompleted segment, we restore footer_builder_ and log_index_'s progress,
+  // and then reuse this segment as writable active_segment.
+  Status RestoreFooterBuilderAndLogIndex(LogSegmentFooterPB* footer_builder,
+                                         LogIndex* log_index,
+                                         const ReadEntriesResult& read_entries);
+
   // Copies log segment up to up_to_op_id into new segment at dest_path.
   Status CopyTo(
       Env* env, const WritableFileOptions& writable_file_options, const std::string& dest_path,
@@ -230,6 +249,10 @@ class ReadableLogSegment : public RefCountedThreadSafe<ReadableLogSegment> {
 
   bool IsInitialized() const {
     return is_initialized_;
+  }
+
+  bool HasLogIndexInFooter() const {
+    return HasFooter() && footer().index_start_offset() > 0;
   }
 
   // Returns the parent directory where log segments are stored.
@@ -282,6 +305,10 @@ class ReadableLogSegment : public RefCountedThreadSafe<ReadableLogSegment> {
     return readable_to_offset_.load(std::memory_order_acquire);
   }
 
+  bool footer_was_rebuilt() const {
+    return footer_was_rebuilt_;
+  }
+
  private:
   friend class RefCountedThreadSafe<ReadableLogSegment>;
   friend class LogReader;
@@ -298,7 +325,7 @@ class ReadableLogSegment : public RefCountedThreadSafe<ReadableLogSegment> {
     uint32_t header_crc;
   };
 
-  ~ReadableLogSegment() {}
+  ~ReadableLogSegment() = default;
 
   // Helper functions called by Init().
 
@@ -328,7 +355,10 @@ class ReadableLogSegment : public RefCountedThreadSafe<ReadableLogSegment> {
       size_t batch_number, int64_t batch_offset, std::vector<int64_t>* recent_offsets,
       const LogEntries& entries, const Status& status) const;
 
-  Result<std::shared_ptr<LWLogEntryBatchPB>> ReadEntryHeaderAndBatch(int64_t* offset);
+  // Returns status Busy if obey_memory_limit is set and there is insufficient memory to hold the
+  // batch.
+  Result<std::shared_ptr<LWLogEntryBatchPB>> ReadEntryHeaderAndBatch(
+      ObeyMemoryLimit obey_memory_limit, int64_t* offset);
 
   // Reads a log entry header from the segment.
   // Also increments the passed offset* by the length of the entry.
@@ -343,8 +373,11 @@ class ReadableLogSegment : public RefCountedThreadSafe<ReadableLogSegment> {
 
   // Reads a log entry batch from the provided readable segment, which gets decoded
   // into 'entry_batch' and increments 'offset' by the batch's length.
+  //
+  // Returns status Busy if obey_memory_limit is set and there is insufficient memory to hold the
+  // batch.
   Result<std::shared_ptr<LWLogEntryBatchPB>> ReadEntryBatch(
-      int64_t *offset, const EntryHeader& header);
+      ObeyMemoryLimit obey_memory_limit, int64_t* offset, const EntryHeader& header);
 
   void UpdateReadableToOffset(int64_t readable_to_offset);
 
@@ -381,6 +414,9 @@ class ReadableLogSegment : public RefCountedThreadSafe<ReadableLogSegment> {
   // the offset of the first entry in the log.
   int64_t first_entry_offset_;
 
+  // May be nullptr in tests.
+  std::shared_ptr<MemTracker> read_wal_mem_tracker_;
+
   DISALLOW_COPY_AND_ASSIGN(ReadableLogSegment);
 };
 
@@ -395,8 +431,13 @@ class WritableLogSegment {
   WritableLogSegment(std::string path,
                      std::shared_ptr<WritableFile> writable_file);
 
+  // This initializer method avoids writing header to disk when creating a WritableLogSegment
+  // from a ReadableLogSegment.
+  Status ReuseHeader(const LogSegmentHeaderPB& new_header,
+                            int64_t first_entry_offset);
+
   // Opens the segment by writing the header.
-  Status WriteHeaderAndOpen(const LogSegmentHeaderPB& new_header);
+  Status WriteHeader(const LogSegmentHeaderPB& new_header);
 
   // Closes the segment by writing the index, the footer, and then actually closing the
   // underlying WritableFile.
@@ -408,6 +449,10 @@ class WritableLogSegment {
 
   int64_t Size() const {
     return writable_file_->Size();
+  }
+
+  Result<uint64_t> SizeOnDisk() const {
+    return writable_file_->SizeOnDisk();
   }
 
   // Appends the provided batch of data, including a header
@@ -442,13 +487,21 @@ class WritableLogSegment {
     return path_;
   }
 
+  void set_path(const std::string& path) {
+    path_ = path;
+  }
+
   int64_t first_entry_offset() const {
     return first_entry_offset_;
   }
 
   int64_t written_offset() const {
-    return written_offset_;
+    return writable_file_->Size();
   }
+
+  // Write header without data. This help us to simulate crash
+  // in the middle of writing a entry
+  Status TEST_WriteCorruptedEntryBatchAndSync();
 
  private:
 
@@ -462,7 +515,7 @@ class WritableLogSegment {
   Status WriteIndexBlock(const LogIndexBlock& index_block);
 
   // The path to the log file.
-  const std::string path_;
+  std::string path_;
 
   // The writable file to which this LogSegment will be written.
   const std::shared_ptr<WritableFile> writable_file_;
@@ -477,9 +530,6 @@ class WritableLogSegment {
 
   // the offset of the first entry in the log
   int64_t first_entry_offset_;
-
-  // The offset where the last written entry ends.
-  int64_t written_offset_;
 
   faststring index_block_header_buffer_;
 

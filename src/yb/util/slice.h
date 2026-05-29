@@ -2,9 +2,9 @@
 // Use of this source code is governed by a BSD-style license that can be
 // found in the LICENSE file. See the AUTHORS file for names of contributors.
 //
-// The following only applies to changes made to this file as part of YugaByte development.
+// The following only applies to changes made to this file as part of YugabyteDB development.
 //
-// Portions Copyright (c) YugaByte, Inc.
+// Portions Copyright (c) YugabyteDB, Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License"); you may not use this file except
 // in compliance with the License.  You may obtain a copy of the License at
@@ -74,6 +74,9 @@ class Slice {
   Slice(const char* begin, const char* end)
       : Slice(to_uchar_ptr(begin), to_uchar_ptr(end)) {}
 
+  Slice(const std::byte* begin, const std::byte* end)
+      : Slice(pointer_cast<const uint8_t*>(begin), pointer_cast<const uint8_t*>(end)) {}
+
   // Create a slice that refers to the contents of "s"
   template <class CharTraits, class Allocator>
   Slice(const std::basic_string<char, CharTraits, Allocator>& s) // NOLINT(runtime/explicit)
@@ -116,13 +119,14 @@ class Slice {
   // Return true iff the length of the referenced data is zero
   bool empty() const { return begin_ == end_; }
 
+  // GreaterOrEqual and Less compare this slice with concatenation of slices arg0 + args.
   template <class... Args>
-  bool GreaterOrEqual(const Slice& arg0, Args&&... args) const {
+  bool GreaterOrEqual(Slice arg0, Args&&... args) const {
     return !Less(arg0, std::forward<Args>(args)...);
   }
 
   template <class... Args>
-  bool Less(const Slice& arg0, Args&&... args) const {
+  bool Less(Slice arg0, Args&&... args) const {
     return DoLess(arg0, std::forward<Args>(args)...);
   }
 
@@ -131,20 +135,35 @@ class Slice {
   uint8_t operator[](size_t n) const;
 
   // Change this slice to refer to an empty array
-  void clear() {
+  void Clear() {
     begin_ = to_uchar_ptr("");
     end_ = begin_;
   }
 
+  [[deprecated]] void clear() {
+    Clear();
+  }
+
   // Drop the first "n" bytes from this slice.
-  void remove_prefix(size_t n);
+  void RemovePrefix(size_t n);
+
+  [[deprecated]] void remove_prefix(size_t n) {
+    RemovePrefix(n);
+  }
 
   Slice Prefix(size_t n) const;
+
+  // N could be larger than current size than the current slice is returned.
+  Slice PrefixNoLongerThan(size_t n) const;
 
   Slice WithoutPrefix(size_t n) const;
 
   // Drop the last "n" bytes from this slice.
-  void remove_suffix(size_t n);
+  void RemoveSuffix(size_t n);
+
+  [[deprecated]] void remove_suffix(size_t n) {
+    RemoveSuffix(n);
+  }
 
   Slice Suffix(size_t n) const;
 
@@ -159,13 +178,23 @@ class Slice {
 
   void AppendTo(faststring* out) const;
 
-  // Truncate the slice to "n" bytes
+  // Truncate the slice to "n" bytes, "n" should be less or equal to the current size.
   void truncate(size_t n);
+
+  // Make the slice no longer than "n" bytes. N could be larger than current size than nothing is
+  // done.
+  void MakeNoLongerThan(size_t n);
 
   char consume_byte();
 
+  char consume_byte_back();
+
+  bool FirstByteIs(char c) const {
+    return !empty() && *begin_ == c;
+  }
+
   bool TryConsumeByte(char c) {
-    if (empty() || *begin_ != c) {
+    if (!FirstByteIs(c)) {
       return false;
     }
     ++begin_;
@@ -183,7 +212,7 @@ class Slice {
   Status check_size(size_t expected_size) const;
 
   // Compare two slices and returns the offset of the first byte where they differ.
-  size_t difference_offset(const Slice& b) const;
+  size_t difference_offset(Slice b) const;
 
   void CopyToBuffer(std::string* buffer) const;
 
@@ -206,13 +235,13 @@ class Slice {
   //   <  0 iff "*this" <  "b",
   //   == 0 iff "*this" == "b",
   //   >  0 iff "*this" >  "b"
-  int compare(const Slice& b) const;
-  int compare_prefix(const Slice& b) const;
+  int compare(Slice b) const;
+  int compare_prefix(Slice b) const;
 
   size_t hash() const noexcept;
 
   // Return true iff "x" is a prefix of "*this"
-  bool starts_with(const Slice& x) const {
+  bool starts_with(Slice x) const {
     return starts_with(x.data(), x.size());
   }
 
@@ -224,11 +253,11 @@ class Slice {
     return (this->size() >= size) && MemEqual(begin_, data, size);
   }
 
-  bool starts_with(char c) const {
-    return (size() >= 1) && (*begin_ == c);
+  bool starts_with(uint8_t c) const {
+    return (begin_ != end_) && (*begin_ == c);
   }
 
-  bool ends_with(const Slice& x) const {
+  bool ends_with(Slice x) const {
     size_t xsize = x.size();
     return (size() >= xsize) && MemEqual(end_ - xsize, x.begin_, xsize);
   }
@@ -239,13 +268,13 @@ class Slice {
 
   // Comparator struct, useful for ordered collections (like STL maps).
   struct Comparator {
-    bool operator()(const Slice& a, const Slice& b) const {
+    bool operator()(Slice a, Slice b) const {
       return a.compare(b) < 0;
     }
   };
 
   struct Hash {
-    size_t operator()(const Slice& a) const noexcept {
+    size_t operator()(Slice a) const noexcept {
       return a.hash();
     }
   };
@@ -263,7 +292,7 @@ class Slice {
 
   size_t DynamicMemoryUsage() const { return 0; }
 
-  bool Contains(const Slice& rhs) const;
+  bool Contains(Slice rhs) const;
 
   // Return a Slice representing bytes for any type which is laid out contiguously in memory.
   template<class T, class = typename std::enable_if<std::is_pod<T>::value, void>::type>
@@ -272,14 +301,10 @@ class Slice {
   }
 
  private:
-  friend bool operator==(const Slice& x, const Slice& y);
-
-  bool DoLess() const {
-    return !empty();
-  }
+  friend bool operator==(Slice x, Slice y);
 
   template <class... Args>
-  bool DoLess(const Slice& arg0, Args&&... args) const {
+  bool DoLess(Slice arg0, Args&&... args) const {
     auto arg0_size = arg0.size();
     if (size() < arg0_size) {
       return compare(arg0) < 0;
@@ -290,7 +315,12 @@ class Slice {
       return cmp < 0;
     }
 
-    return Slice(begin_ + arg0_size, end_).DoLess(std::forward<Args>(args)...);
+    if constexpr (sizeof...(Args)) {
+      return Slice(begin_ + arg0_size, end_).DoLess(std::forward<Args>(args)...);
+    }
+
+    // args is absent and this.starts_with(arg0) => definitely not less than arg0.
+    return false;
   }
 
   static bool MemEqual(const void* a, const void* b, size_t n) {
@@ -307,20 +337,19 @@ class Slice {
   // Intentionally copyable
 };
 
-inline bool operator==(const Slice& x, const Slice& y) {
-  return ((x.size() == y.size()) &&
-          (Slice::MemEqual(x.data(), y.data(), x.size())));
+inline bool operator==(Slice x, Slice y) {
+  return x.size() == y.size() && Slice::MemEqual(x.data(), y.data(), x.size());
 }
 
-inline bool operator!=(const Slice& x, const Slice& y) {
+inline bool operator!=(Slice x, Slice y) {
   return !(x == y);
 }
 
-inline std::ostream& operator<<(std::ostream& o, const Slice& s) {
-  return o << s.ToDebugString(16); // should be enough for anyone...
+inline std::ostream& operator<<(std::ostream& o, Slice s) {
+  return o << s.ToDebugString(32); // should be enough for anyone...
 }
 
-inline int Slice::compare(const Slice& b) const {
+inline int Slice::compare(Slice b) const {
   auto my_size = size();
   auto b_size = b.size();
   const size_t min_len = std::min(my_size, b_size);
@@ -332,7 +361,7 @@ inline int Slice::compare(const Slice& b) const {
   return r;
 }
 
-inline int Slice::compare_prefix(const Slice& b) const {
+inline int Slice::compare_prefix(Slice b) const {
   return Slice(begin_, std::min(size(), b.size())).compare(b);
 }
 
@@ -347,11 +376,11 @@ inline size_t Slice::hash() const noexcept {
   return result;
 }
 
-inline size_t hash_value(const Slice& slice) {
+inline size_t hash_value(Slice slice) {
   return slice.hash();
 }
 
-inline size_t Slice::difference_offset(const Slice& b) const {
+inline size_t Slice::difference_offset(Slice b) const {
   size_t off = 0;
   const size_t len = std::min(size(), b.size());
   for (; off < len; off++) {
@@ -361,31 +390,35 @@ inline size_t Slice::difference_offset(const Slice& b) const {
 }
 
 // Can be used with source implicitly convertible to Slice, for example std::string.
-inline void CopyToBuffer(const Slice& source, std::string* dest) {
+inline void CopyToBuffer(Slice source, std::string* dest) {
   // operator= or assign(const std::string&) will shrink the capacity on at least CentOS gcc
   // build, so we have to use assign(const char*, size_t) to preserve buffer capacity and avoid
   // unnecessary memory reallocations.
   source.CopyToBuffer(dest);
 }
 
-inline bool operator<(const Slice& lhs, const Slice& rhs) {
+inline bool operator<(Slice lhs, Slice rhs) {
   return lhs.compare(rhs) < 0;
 }
 
-inline bool operator<=(const Slice& lhs, const Slice& rhs) {
+inline bool operator<=(Slice lhs, Slice rhs) {
   return lhs.compare(rhs) <= 0;
 }
 
-inline bool operator>(const Slice& lhs, const Slice& rhs) {
+inline bool operator>(Slice lhs, Slice rhs) {
   return lhs.compare(rhs) > 0;
 }
 
-inline bool operator>=(const Slice& lhs, const Slice& rhs) {
+inline bool operator>=(Slice lhs, Slice rhs) {
   return lhs.compare(rhs) >= 0;
 }
 
-inline std::strong_ordering operator<=>(const Slice& lhs, const Slice& rhs) {
+inline std::strong_ordering operator<=>(Slice lhs, Slice rhs) {
   return lhs.compare(rhs) <=> 0;
+}
+
+inline std::string AsDebugHexString(Slice value) {
+  return value.ToDebugHexString();
 }
 
 }  // namespace yb

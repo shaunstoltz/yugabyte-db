@@ -18,7 +18,7 @@
  * everything that should be freed.  See utils/mmgr/README for more info.
  *
  *
- * Portions Copyright (c) 1996-2018, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2022, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  * src/include/utils/palloc.h
@@ -52,39 +52,51 @@ typedef struct MemoryContextCallback
 } MemoryContextCallback;
 
 /*
- * GetCurrentMemoryContext() is the default allocation context for palloc().
+ * CurrentMemoryContext is the default allocation context for palloc().
  * Avoid accessing it directly!  Instead, use MemoryContextSwitchTo()
  * to change the setting.
+ *
+ * YB: rename upstream PG's CurrentMemoryContext to YbCurrentMemoryContext and
+ * make CurrentMemoryContext a macro that calls YbGetCurrentMemoryContext.
+ * This lets us leave reads of CurrentMemoryContext untouched so that future
+ * upstream PG merges become easier.
  */
-extern PGDLLIMPORT MemoryContext CurrentMemoryContext;
+extern PGDLLIMPORT MemoryContext YbCurrentMemoryContext;
 
 /*
- * This enables running query-layer code in a multi-threaded constext by using
- * thread-local variables instead of globals.
- * Currently only used for expression evaluation in DocDB (i.e. for pushdown).
+ * YB: This enables running query-layer code in a multi-threaded constext by
+ * using thread-local variables instead of globals. Currently only used for
+ * expression evaluation in DocDB (i.e. for pushdown).
  */
-static inline bool IsMultiThreadedMode() {
+static inline bool
+IsMultiThreadedMode()
+{
 	/*
 	 * Just checking if the memory infrastructure is initialized.
 	 * TODO Consider using a specific global variable or compiler flag
 	 * for this.
 	 */
-	return CurrentMemoryContext == NULL;
+	return YbCurrentMemoryContext == NULL;
 }
 
 extern MemoryContext GetThreadLocalCurrentMemoryContext();
 extern MemoryContext SetThreadLocalCurrentMemoryContext(MemoryContext memctx);
 
-static inline MemoryContext GetCurrentMemoryContext() {
+static inline MemoryContext
+YbGetCurrentMemoryContext()
+{
 	if (IsMultiThreadedMode())
 	{
 		return (MemoryContext) GetThreadLocalCurrentMemoryContext();
 	}
 	else
 	{
-		return CurrentMemoryContext;
+		return YbCurrentMemoryContext;
 	}
 }
+
+/* YB: see above comment on YbCurrentMemoryContext. */
+#define CurrentMemoryContext (YbGetCurrentMemoryContext())
 
 extern MemoryContext CreateThreadLocalCurrentMemoryContext(MemoryContext parent,
 														   const char *name);
@@ -94,6 +106,12 @@ extern void PrepareThreadLocalCurrentMemoryContext();
 extern void ResetThreadLocalCurrentMemoryContext();
 
 extern void DeleteThreadLocalCurrentMemoryContext();
+
+extern void *YbSwitchPgGateMemoryContext(void *context);
+
+extern void *YbCreatePgGateMemoryContext(void *parent, const char *name);
+
+extern void YbDeletePgGateMemoryContext(void *context);
 
 struct PgMemctx *GetCurrentYbMemctx();
 
@@ -111,13 +129,35 @@ extern void *MemoryContextAlloc(MemoryContext context, Size size);
 extern void *MemoryContextAllocZero(MemoryContext context, Size size);
 extern void *MemoryContextAllocZeroAligned(MemoryContext context, Size size);
 extern void *MemoryContextAllocExtended(MemoryContext context,
-						   Size size, int flags);
+										Size size, int flags);
 
 extern void *palloc(Size size);
 extern void *palloc0(Size size);
 extern void *palloc_extended(Size size, int flags);
-extern void *repalloc(void *pointer, Size size);
+extern pg_nodiscard void *repalloc(void *pointer, Size size);
 extern void pfree(void *pointer);
+
+/*
+ * Variants with easier notation and more type safety
+ */
+
+/*
+ * Allocate space for one object of type "type"
+ */
+#define palloc_object(type) ((type *) palloc(sizeof(type)))
+#define palloc0_object(type) ((type *) palloc0(sizeof(type)))
+
+/*
+ * Allocate space for "count" objects of type "type"
+ */
+#define palloc_array(type, count) ((type *) palloc(sizeof(type) * (count)))
+#define palloc0_array(type, count) ((type *) palloc0(sizeof(type) * (count)))
+
+/*
+ * Change size of allocation pointed to by "pointer" to have space for "count"
+ * objects of type "type"
+ */
+#define repalloc_array(pointer, type, count) ((type *) repalloc(pointer, sizeof(type) * (count)))
 
 /*
  * The result of palloc() is always word-aligned, so we can skip testing
@@ -129,12 +169,12 @@ extern void pfree(void *pointer);
  */
 #define palloc0fast(sz) \
 	( MemSetTest(0, sz) ? \
-		MemoryContextAllocZeroAligned(GetCurrentMemoryContext(), sz) : \
-		MemoryContextAllocZero(GetCurrentMemoryContext(), sz) )
+		MemoryContextAllocZeroAligned(CurrentMemoryContext, sz) : \
+		MemoryContextAllocZero(CurrentMemoryContext, sz) )
 
 /* Higher-limit allocators. */
 extern void *MemoryContextAllocHuge(MemoryContext context, Size size);
-extern void *repalloc_huge(void *pointer, Size size);
+extern pg_nodiscard void *repalloc_huge(void *pointer, Size size);
 
 /*
  * Although this header file is nominally backend-only, certain frontend
@@ -153,9 +193,9 @@ MemoryContextSwitchTo(MemoryContext context)
 	}
 	else
 	{
-		MemoryContext old = GetCurrentMemoryContext();
+		MemoryContext old = CurrentMemoryContext;
 
-		CurrentMemoryContext = context;
+		YbCurrentMemoryContext = context;
 		return old;
 	}
 }
@@ -163,7 +203,7 @@ MemoryContextSwitchTo(MemoryContext context)
 
 /* Registration of memory context reset/delete callbacks */
 extern void MemoryContextRegisterResetCallback(MemoryContext context,
-								   MemoryContextCallback *cb);
+											   MemoryContextCallback *cb);
 
 /*
  * These are like standard strdup() except the copied string is

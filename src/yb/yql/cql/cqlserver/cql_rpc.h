@@ -1,5 +1,5 @@
 //
-// Copyright (c) YugaByte, Inc.
+// Copyright (c) YugabyteDB, Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License"); you may not use this file except
 // in compliance with the License.  You may obtain a copy of the License at
@@ -70,19 +70,21 @@ class CQLConnectionContext : public rpc::ConnectionContextWithCallId,
   static std::string Name() { return "CQL"; }
 
  private:
-  void Connected(const rpc::ConnectionPtr& connection) override {}
+  Status Connected(const rpc::ConnectionPtr& connection) override { return Status::OK(); }
 
   rpc::RpcConnectionPB::StateType State() override {
     return rpc::RpcConnectionPB::OPEN;
   }
 
   uint64_t ExtractCallId(rpc::InboundCall* call) override;
-  Result<rpc::ProcessCallsResult> ProcessCalls(const rpc::ConnectionPtr& connection,
-                                               const IoVecs& bytes_to_process,
-                                               rpc::ReadBufferFull read_buffer_full) override;
+  Result<rpc::ProcessCallsResult> ProcessCalls(
+      const rpc::ConnectionPtr& connection,
+      const IoVecs& bytes_to_process,
+      rpc::ReadBufferFull read_buffer_full) ON_REACTOR_THREAD override;
+
   // Takes ownership of call_data content.
   Status HandleCall(
-      const rpc::ConnectionPtr& connection, rpc::CallData* call_data) override;
+      const rpc::ConnectionPtr& connection, rpc::CallData* call_data) ON_REACTOR_THREAD override;
 
   rpc::StreamReadBuffer& ReadBuffer() override {
     return read_buffer_;
@@ -108,7 +110,8 @@ class CQLInboundCall : public rpc::InboundCall {
  public:
   explicit CQLInboundCall(rpc::ConnectionPtr conn,
                           CallProcessedListener* call_processed_listener,
-                          ql::QLSession::SharedPtr ql_session);
+                          ql::QLSession::SharedPtr ql_session,
+                          rpc::CallStateListenerFactory* call_state_listener_factory);
 
   // Takes ownership of call_data content.
   Status ParseFrom(const MemTrackerPtr& call_tracker, rpc::CallData* call_data);
@@ -145,11 +148,7 @@ class CQLInboundCall : public rpc::InboundCall {
   void GetCallDetails(rpc::RpcCallInProgressPB *call_in_progress_pb) const;
   void SetRequest(std::shared_ptr<const ql::CQLRequest> request, CQLServiceImpl* service_impl) {
     service_impl_ = service_impl;
-#ifdef THREAD_SANITIZER
-    request_ = request;
-#else
     std::atomic_store_explicit(&request_, request, std::memory_order_release);
-#endif
   }
 
   size_t ObjectSize() const override { return sizeof(*this); }

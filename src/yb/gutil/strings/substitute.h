@@ -1,8 +1,8 @@
 // Copyright 2008 Google Inc.  All rights reserved.
 //
-// The following only applies to changes made to this file as part of YugaByte development.
+// The following only applies to changes made to this file as part of YugabyteDB development.
 //
-// Portions Copyright (c) YugaByte, Inc.
+// Portions Copyright (c) YugabyteDB, Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License"); you may not use this file except
 // in compliance with the License.  You may obtain a copy of the License at
@@ -129,7 +129,7 @@ class SubstituteArg {
   // -V:scratch_:730
   inline SubstituteArg(unsigned long value)  // NOLINT
     : text_(scratch_),
-      size_((sizeof(value) == 4 ? FastUInt32ToBufferLeft(value, scratch_)
+      size_((sizeof(value) == 4 ? FastUInt32ToBufferLeft(static_cast<int32_t>(value), scratch_)
                                 : FastUInt64ToBufferLeft(value, scratch_))
             - scratch_) {}
   // -V:scratch_:730

@@ -1,4 +1,4 @@
-// Copyright (c) YugaByte, Inc.
+// Copyright (c) YugabyteDB, Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License"); you may not use this file except
 // in compliance with the License.  You may obtain a copy of the License at
@@ -19,14 +19,15 @@ import java.sql.Connection;
 import java.sql.ResultSet;
 import java.sql.Statement;
 import java.util.Collections;
+import java.util.Map;
 
 import org.junit.Test;
 import org.junit.runner.RunWith;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
-import org.yb.util.YBTestRunnerNonTsanOnly;
+import org.yb.YBTestRunner;
 
-@RunWith(value = YBTestRunnerNonTsanOnly.class)
+@RunWith(value = YBTestRunner.class)
 public class TestDropTableWithConcurrentTxn extends BasePgSQLTest {
   private static final Logger LOG = LoggerFactory.getLogger(TestDropTableWithConcurrentTxn.class);
 
@@ -44,6 +45,15 @@ public class TestDropTableWithConcurrentTxn extends BasePgSQLTest {
   private static final boolean executeDmlAfterDrop = false;
   private enum Resource { TABLE, INDEX, VIEW }
   private enum Dml { INSERT, SELECT }
+
+  @Override
+  protected Map<String, String> getTServerFlags() {
+    Map<String, String> flagMap = super.getTServerFlags();
+    // TODO(29141): Fix the test with txn ddl and enable.
+    flagMap.put("ysql_yb_ddl_transaction_block_enabled", "false");
+    flagMap.put("enable_object_locking_for_table_locks", "false");
+    return flagMap;
+  }
 
   private void prepareResources(Resource resourceToDrop, String tableName) throws Exception {
     // Separate connection is used to create and load the table to avoid
@@ -140,6 +150,16 @@ public class TestDropTableWithConcurrentTxn extends BasePgSQLTest {
         (withCachedMetadata ? "PgCached" : "NonPgCached") + resourceToDrop;
     prepareResources(resourceToDrop, tableName);
     String resource = ((Resource.VIEW).equals(resourceToDrop)) ? tableName + "_view" : tableName;
+
+    if (!withCachedMetadata) {
+      // It is possible that prepareResources contains a DDL that incremented
+      // the catalog version and therefore invalidated the relcache init file.
+      // Make a tmp connection as the first connection to rebuild the relcache init file.
+      // Otherwise, txnConnection below will become the first connection and it will rebuild
+      // the relcache init file. As part of that it would have cached the metadata
+      // of the table which contradicts with the condition "!withCachedMetadata"
+      Connection tmpConnection = getConnectionBuilder().connect();
+    }
 
     try (Connection txnConnection = getConnectionBuilder().connect();
         Statement statement1 = txnConnection.createStatement();
@@ -336,10 +356,8 @@ public class TestDropTableWithConcurrentTxn extends BasePgSQLTest {
     LOG.info("Run INSERT transaction AFTER drop");
     runDmlTxnWithDropOnCurrentResource(Dml.INSERT, indexDrop, withCachedMetadata,
         executeDmlAfterDrop, RESOURCE_NONEXISTING_ERROR);
-    // Postgres load relation's index info on cache refresh, as a result even without explicit index
-    // usage the error will be the same as with index usage.
     runDmlTxnWithDropOnCurrentResource(Dml.INSERT, indexDrop, !withCachedMetadata,
-        executeDmlAfterDrop, RESOURCE_NONEXISTING_ERROR);
+        executeDmlAfterDrop, NO_ERROR);
     LOG.info("Run SELECT transaction AFTER drop");
     runDmlTxnWithDropOnCurrentResource(Dml.SELECT, indexDrop, withCachedMetadata,
         executeDmlAfterDrop, SCHEMA_VERSION_MISMATCH_ERROR);
@@ -395,11 +413,13 @@ public class TestDropTableWithConcurrentTxn extends BasePgSQLTest {
 
   @Test
   public void testDmlTxnDrop() throws Exception {
+    skipYsqlConnMgr(BasePgSQLTest.CANNOT_GURANTEE_EXPECTED_PHYSICAL_CONN_FOR_CACHE);
     testDmlTxnDropInternal();
   }
 
   @Test
   public void testDmlTxnDropWithReadCommitted() throws Exception {
+    skipYsqlConnMgr(BasePgSQLTest.CANNOT_GURANTEE_EXPECTED_PHYSICAL_CONN_FOR_CACHE);
     restartClusterWithFlags(Collections.emptyMap(),
                             Collections.singletonMap("yb_enable_read_committed_isolation",
                                                      "true"));

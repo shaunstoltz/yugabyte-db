@@ -1,5 +1,5 @@
 /*
- * Copyright 2021 YugaByte, Inc. and Contributors
+ * Copyright 2021 YugabyteDB, Inc. and Contributors
  *
  * Licensed under the Polyform Free Trial License 1.0.0 (the "License"); you
  * may not use this file except in compliance with the License. You
@@ -10,6 +10,8 @@
 
 package com.yugabyte.yw.common.config;
 
+import static com.yugabyte.yw.models.ScopedRuntimeConfig.GLOBAL_SCOPE_UUID;
+
 import com.google.common.collect.ImmutableSet;
 import com.google.common.collect.Sets;
 import com.google.common.collect.Streams;
@@ -17,6 +19,7 @@ import com.google.inject.Inject;
 import com.typesafe.config.Config;
 import com.typesafe.config.ConfigRenderOptions;
 import com.yugabyte.yw.common.PlatformServiceException;
+import com.yugabyte.yw.common.config.ConfKeyInfo.ConfKeyTags;
 import com.yugabyte.yw.common.config.impl.RuntimeConfig;
 import com.yugabyte.yw.common.config.impl.SettableRuntimeConfigFactory;
 import com.yugabyte.yw.controllers.AuthenticatedController;
@@ -31,6 +34,7 @@ import com.yugabyte.yw.models.Universe;
 import com.yugabyte.yw.models.helpers.CommonUtils;
 import io.ebean.Model;
 import io.ebean.annotation.Transactional;
+import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
 import java.util.Map.Entry;
@@ -59,11 +63,14 @@ public class RuntimeConfService extends AuthenticatedController {
 
   private final Map<String, ConfKeyInfo<?>> keyMetaData;
 
+  private final Config staticConfig;
+
   @Inject
   public RuntimeConfService(
       SettableRuntimeConfigFactory settableRuntimeConfigFactory,
       RuntimeConfigPreChangeNotifier preChangeNotifier,
       RuntimeConfigChangeNotifier changeNotifier,
+      Config config,
       Map<String, ConfKeyInfo<?>> keyMetaData) {
     this.settableRuntimeConfigFactory = settableRuntimeConfigFactory;
     this.mutableObjects =
@@ -74,6 +81,7 @@ public class RuntimeConfService extends AuthenticatedController {
     this.preChangeNotifier = preChangeNotifier;
     this.changeNotifier = changeNotifier;
     this.keyMetaData = keyMetaData;
+    this.staticConfig = config;
     this.mutableKeys = buildMutableKeysSet();
   }
 
@@ -84,9 +92,7 @@ public class RuntimeConfService extends AuthenticatedController {
     return Streams.concat(
             keyMetaData.keySet().stream(),
             mutableObjects.stream(),
-            config
-                .entrySet()
-                .stream()
+            config.entrySet().stream()
                 .map(Entry::getKey)
                 .filter(
                     key ->
@@ -99,14 +105,40 @@ public class RuntimeConfService extends AuthenticatedController {
     return mutableKeys;
   }
 
-  public ScopedConfig getConfig(UUID customerUUID, UUID scopeUUID, boolean includeInherited) {
+  public List<String> getFeatureFlagKeys() {
+    return keyMetaData.values().stream()
+        .filter(
+            cki ->
+                (cki.tags.contains(ConfKeyTags.FEATURE_FLAG)
+                    && ScopeType.GLOBAL.equals(cki.getScope())))
+        .map(cki -> cki.getKey())
+        .collect(Collectors.toList());
+  }
+
+  public List<ConfigEntry> getFeatureFlagEntries() {
+    List<ConfigEntry> featureFlagEntries = new ArrayList<>();
+    Config globalConfig = settableRuntimeConfigFactory.globalRuntimeConf();
+    for (String k : getFeatureFlagKeys()) {
+      String value = globalConfig.getValue(k).render(ConfigRenderOptions.concise());
+      value = unwrap(value);
+      if (sensitiveKeys.contains(k)) {
+        value = CommonUtils.getEmptiableMaskedValue(k, value);
+      }
+      featureFlagEntries.add(new ConfigEntry(false, k, value));
+    }
+
+    return featureFlagEntries;
+  }
+
+  public ScopedConfig getConfig(
+      UUID customerUUID, UUID scopeUUID, boolean includeInherited, boolean isSuperAdmin) {
     log.trace(
         "customerUUID: {} scopeUUID: {} includeInherited: {}",
         customerUUID,
         scopeUUID,
         includeInherited);
 
-    ScopedConfig scopedConfig = getScopedConfigOrFail(customerUUID, scopeUUID);
+    ScopedConfig scopedConfig = getScopedConfigOrFail(customerUUID, scopeUUID, isSuperAdmin);
     Config fullConfig = scopedConfig.runtimeConfig(settableRuntimeConfigFactory);
     Map<String, String> overriddenInScope = RuntimeConfigEntry.getAsMapForScope(scopeUUID);
     for (String k : mutableKeys) {
@@ -114,10 +146,9 @@ public class RuntimeConfService extends AuthenticatedController {
       log.trace(
           "key: {} overriddenInScope: {} includeInherited: {}", k, isOverridden, includeInherited);
 
-      String value = fullConfig.getValue(k).render(ConfigRenderOptions.concise());
-      value = unwrap(value);
+      String value = getValueFromConfig(fullConfig, k);
       if (sensitiveKeys.contains(k)) {
-        value = CommonUtils.getMaskedValue(k, value);
+        value = CommonUtils.getEmptiableMaskedValue(k, value);
       }
 
       if (isOverridden) {
@@ -139,24 +170,74 @@ public class RuntimeConfService extends AuthenticatedController {
     return maybeQuoted;
   }
 
-  public String getKeyOrBadRequest(UUID customerUUID, UUID scopeUUID, String path) {
-    return maybeGetKey(customerUUID, scopeUUID, path)
-        .orElseThrow(
-            () ->
-                new PlatformServiceException(
-                    NOT_FOUND,
-                    String.format("Key %s is not defined in scope %s", path, scopeUUID)));
+  private String getValueFromConfig(Config config, String path) {
+    String value = config.getValue(path).render(ConfigRenderOptions.concise());
+    return unwrap(value);
   }
 
-  public String getKeyIfPresent(UUID customerUUID, UUID scopeUUID, String path) {
-    return maybeGetKey(customerUUID, scopeUUID, path).orElse(null);
+  public String getKeyOrBadRequest(
+      UUID customerUUID, UUID scopeUUID, String path, boolean isSuperAdmin) {
+    Optional<String> value = maybeGetKey(customerUUID, scopeUUID, path, isSuperAdmin);
+    if (value.isPresent()) {
+      return value.get();
+    } else if (isValidScope(path, scopeUUID)) {
+      ScopeType scope = getScopeType(scopeUUID);
+      switch (scope) {
+        case GLOBAL:
+          return getValueFromConfig(settableRuntimeConfigFactory.globalRuntimeConf(), path);
+        case CUSTOMER:
+          return getValueFromConfig(
+              settableRuntimeConfigFactory.forCustomer(Customer.get(scopeUUID)), path);
+        case PROVIDER:
+          return getValueFromConfig(
+              settableRuntimeConfigFactory.forProvider(Provider.maybeGet(scopeUUID).get()), path);
+        case UNIVERSE:
+          return getValueFromConfig(
+              settableRuntimeConfigFactory.forUniverse(Universe.maybeGet(scopeUUID).get()), path);
+        default:
+          // should never reach here.
+          return getValueFromConfig(settableRuntimeConfigFactory.staticApplicationConf(), path);
+      }
+    } else {
+      throw new PlatformServiceException(
+          NOT_FOUND, String.format("Key %s is not defined in scope %s", path, scopeUUID));
+    }
   }
 
-  public Optional<String> maybeGetKey(UUID customerUUID, UUID scopeUUID, String path) {
+  private ScopeType getScopeType(UUID scopeUUID) {
+    if (scopeUUID.equals(GLOBAL_SCOPE_UUID)) {
+      return ScopeType.GLOBAL;
+    } else if (Customer.get(scopeUUID) != null) {
+      return ScopeType.CUSTOMER;
+    } else if (Provider.maybeGet(scopeUUID).isPresent()) {
+      return ScopeType.PROVIDER;
+    } else if (Universe.maybeGet(scopeUUID).isPresent()) {
+      return ScopeType.UNIVERSE;
+    } else {
+      throw new PlatformServiceException(BAD_REQUEST, "Invalid Scope UUID!");
+    }
+  }
+
+  private boolean isValidScope(String path, UUID scopeUUID) {
+    if (keyMetaData.containsKey(path)) {
+      ScopeType scope = keyMetaData.get(path).getScope();
+      return scope.isValid(scopeUUID);
+    } else {
+      return true;
+    }
+  }
+
+  public String getKeyIfPresent(
+      UUID customerUUID, UUID scopeUUID, String path, boolean isSuperAdmin) {
+    return maybeGetKey(customerUUID, scopeUUID, path, isSuperAdmin).orElse(null);
+  }
+
+  public Optional<String> maybeGetKey(
+      UUID customerUUID, UUID scopeUUID, String path, boolean isSuperAdmin) {
     if (!mutableKeys.contains(path))
       throw new PlatformServiceException(NOT_FOUND, "No mutable key found: " + path);
 
-    Optional<ScopedConfig> scopedConfig = getScopedConfig(customerUUID, scopeUUID);
+    Optional<ScopedConfig> scopedConfig = getScopedConfig(customerUUID, scopeUUID, isSuperAdmin);
 
     if (!scopedConfig.isPresent()) {
       throw new PlatformServiceException(
@@ -176,7 +257,8 @@ public class RuntimeConfService extends AuthenticatedController {
   }
 
   @Transactional
-  public void setKey(UUID customerUUID, UUID scopeUUID, String path, String value) {
+  public void setKey(
+      UUID customerUUID, UUID scopeUUID, String path, String value, boolean isSuperAdmin) {
     if (!mutableKeys.contains(path)) {
       throw new PlatformServiceException(NOT_FOUND, "No mutable key found: " + path);
     }
@@ -185,6 +267,7 @@ public class RuntimeConfService extends AuthenticatedController {
     if (sensitiveKeys.contains(path)) {
       logValue = CommonUtils.getMaskedValue(path, logValue);
     }
+    preConfigChangeValidate(scopeUUID, path, value);
     log.info(
         "Setting runtime conf for key '{}' on scope {} to value '{}' of length {}",
         path,
@@ -192,8 +275,7 @@ public class RuntimeConfService extends AuthenticatedController {
         (logValue.length() < 50 ? logValue : "[long value hidden]"),
         logValue.length());
     final RuntimeConfig<?> mutableRuntimeConfig =
-        getMutableRuntimeConfigForScopeOrFail(customerUUID, scopeUUID);
-    preConfigChangeValidate(scopeUUID, path, value);
+        getMutableRuntimeConfigForScopeOrFail(customerUUID, scopeUUID, isSuperAdmin);
     if (mutableObjects.contains(path)) {
       mutableRuntimeConfig.setObject(path, value);
     } else {
@@ -216,18 +298,23 @@ public class RuntimeConfService extends AuthenticatedController {
     preChangeNotifier.notifyListeners(scopeUUID, path, newValue);
   }
 
-  public void deleteKey(UUID customerUUID, UUID scopeUUID, String path) {
+  private void preConfigDeleteValidate(UUID scopeUUID, String path) {
+    preChangeNotifier.notifyListenersDeleteConfig(scopeUUID, path);
+  }
+
+  public void deleteKey(UUID customerUUID, UUID scopeUUID, String path, boolean isSuperAdmin) {
     if (!mutableKeys.contains(path)) {
       throw new PlatformServiceException(NOT_FOUND, "No mutable key found: " + path);
     }
 
-    getMutableRuntimeConfigForScopeOrFail(customerUUID, scopeUUID).deleteEntry(path);
+    preConfigDeleteValidate(scopeUUID, path);
+    getMutableRuntimeConfigForScopeOrFail(customerUUID, scopeUUID, isSuperAdmin).deleteEntry(path);
     postConfigChange(scopeUUID, path);
   }
 
   private RuntimeConfig<? extends Model> getMutableRuntimeConfigForScopeOrFail(
-      UUID customerUUID, UUID scopeUUID) {
-    ScopedConfig scopedConfig = getScopedConfigOrFail(customerUUID, scopeUUID);
+      UUID customerUUID, UUID scopeUUID, boolean isSuperAdmin) {
+    ScopedConfig scopedConfig = getScopedConfigOrFail(customerUUID, scopeUUID, isSuperAdmin);
     if (!scopedConfig.mutableScope) {
       throw new PlatformServiceException(
           FORBIDDEN,
@@ -239,8 +326,9 @@ public class RuntimeConfService extends AuthenticatedController {
     return scopedConfig.runtimeConfig(settableRuntimeConfigFactory);
   }
 
-  private ScopedConfig getScopedConfigOrFail(UUID customerUUID, UUID scopeUUID) {
-    Optional<ScopedConfig> optScopedConfig = getScopedConfig(customerUUID, scopeUUID);
+  private ScopedConfig getScopedConfigOrFail(
+      UUID customerUUID, UUID scopeUUID, boolean isSuperAdmin) {
+    Optional<ScopedConfig> optScopedConfig = getScopedConfig(customerUUID, scopeUUID, isSuperAdmin);
     if (!optScopedConfig.isPresent()) {
       throw new PlatformServiceException(
           NOT_FOUND, String.format("No scope %s found for customer %s", scopeUUID, customerUUID));
@@ -248,12 +336,11 @@ public class RuntimeConfService extends AuthenticatedController {
     return optScopedConfig.get();
   }
 
-  public Optional<ScopedConfig> getScopedConfig(UUID customerUUID, UUID scopeUUID) {
+  public Optional<ScopedConfig> getScopedConfig(
+      UUID customerUUID, UUID scopeUUID, boolean isSuperAdmin) {
     RuntimeConfigFormData runtimeConfigFormData =
-        listScopes(Customer.getOrBadRequest(customerUUID), true);
-    return runtimeConfigFormData
-        .scopedConfigList
-        .stream()
+        listScopes(Customer.getOrBadRequest(customerUUID), isSuperAdmin);
+    return runtimeConfigFormData.scopedConfigList.stream()
         .filter(config -> config.uuid.equals(scopeUUID))
         .findFirst();
   }
@@ -261,11 +348,15 @@ public class RuntimeConfService extends AuthenticatedController {
   public RuntimeConfigFormData listScopes(Customer customer, boolean includeGlobal) {
     RuntimeConfigFormData formData = new RuntimeConfigFormData();
     formData.addGlobalScope(includeGlobal);
-    formData.addMutableScope(ScopeType.CUSTOMER, customer.uuid);
-    Provider.getAll(customer.uuid)
-        .forEach(provider -> formData.addMutableScope(ScopeType.PROVIDER, provider.uuid));
+    formData.addMutableScope(ScopeType.CUSTOMER, customer.getUuid());
+    Provider.getAll(customer.getUuid())
+        .forEach(provider -> formData.addMutableScope(ScopeType.PROVIDER, provider.getUuid()));
     Universe.getAllUUIDs(customer)
         .forEach(universeUUID -> formData.addMutableScope(ScopeType.UNIVERSE, universeUUID));
     return formData;
+  }
+
+  public List<RuntimeConfigEntry> getRuntimeConfigEntries(Set<UUID> scopeUuids) {
+    return RuntimeConfigEntry.getAll(scopeUuids);
   }
 }

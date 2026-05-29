@@ -1,5 +1,5 @@
 /*
- * Copyright 2019 YugaByte, Inc. and Contributors
+ * Copyright 2019 YugabyteDB, Inc. and Contributors
  *
  * Licensed under the Polyform Free Trial License 1.0.0 (the "License"); you
  * may not use this file except in compliance with the License. You
@@ -21,21 +21,28 @@ import com.yugabyte.yw.models.AccessKey;
 import com.yugabyte.yw.models.Provider;
 import com.yugabyte.yw.models.Region;
 import javax.inject.Inject;
-import play.api.Play;
+import lombok.extern.slf4j.Slf4j;
 
+@Slf4j
 public class CloudAccessKeySetup extends CloudTaskBase {
 
-  private TemplateManager templateManager;
+  private final TemplateManager templateManager;
+
+  private final AccessManager accessManager;
 
   @Inject
   protected CloudAccessKeySetup(
-      BaseTaskDependencies baseTaskDependencies, TemplateManager templateManager) {
+      BaseTaskDependencies baseTaskDependencies,
+      TemplateManager templateManager,
+      AccessManager accessManager) {
     super(baseTaskDependencies);
     this.templateManager = templateManager;
+    this.accessManager = accessManager;
   }
 
   public static class Params extends CloudBootstrap.Params {
     public String regionCode;
+    public boolean isFirstTry = true;
   }
 
   @Override
@@ -51,41 +58,47 @@ public class CloudAccessKeySetup extends CloudTaskBase {
     if (region == null) {
       throw new RuntimeException("Region " + regionCode + " not setup.");
     }
-    AccessManager accessManager = Play.current().injector().instanceOf(AccessManager.class);
-
-    // TODO(bogdan): validation at higher level?
     String accessKeyCode =
         Strings.isNullOrEmpty(taskParams().keyPairName)
             ? AccessKey.getDefaultKeyCode(provider)
             : taskParams().keyPairName;
 
-    if (!Strings.isNullOrEmpty(taskParams().sshPrivateKeyContent)) {
-      accessManager.saveAndAddKey(
-          region.uuid,
-          taskParams().sshPrivateKeyContent,
-          accessKeyCode,
-          AccessManager.KeyType.PRIVATE,
-          taskParams().sshUser,
-          taskParams().sshPort,
-          taskParams().airGapInstall,
-          false,
-          taskParams().setUpChrony,
-          taskParams().ntpServers,
-          taskParams().showSetUpChrony,
-          taskParams().skipKeyPairValidate);
-    } else {
-      // For add region, we should verify if the skipKeyPairValidate is set, so that we don't
-      // try to add the key unnecessarily. It is false by default, so unless someone explicitly
-      // sets it, the key will be added.
-      if (!taskParams().skipKeyPairValidate) {
+    boolean createAccessKeyRetry = false;
+    if (!taskParams().isFirstTry) {
+      try {
+        log.debug(
+            "Trying to retrieve accessKey {} in provider {}", accessKeyCode, provider.getName());
+        AccessKey accessKey = AccessKey.getOrBadRequest(provider.getUuid(), accessKeyCode);
+      } catch (Exception e) {
+        log.debug("AccessKey {} in provider does not exist. Creating one...", accessKeyCode);
+        createAccessKeyRetry = true;
+      }
+    }
+
+    if (taskParams().isFirstTry || createAccessKeyRetry) {
+      if (!Strings.isNullOrEmpty(taskParams().sshPrivateKeyContent)) {
+        accessManager.saveAndAddKey(
+            region.getUuid(),
+            taskParams().sshPrivateKeyContent,
+            accessKeyCode,
+            AccessManager.KeyType.PRIVATE,
+            taskParams().sshUser,
+            taskParams().sshPort,
+            taskParams().airGapInstall,
+            taskParams().skipProvisioning,
+            taskParams().setUpChrony,
+            taskParams().ntpServers,
+            taskParams().showSetUpChrony,
+            taskParams().skipKeyValidateAndUpload);
+      } else {
         accessManager.addKey(
-            region.uuid,
+            region.getUuid(),
             accessKeyCode,
             null,
             taskParams().sshUser,
             taskParams().sshPort,
             taskParams().airGapInstall,
-            false,
+            taskParams().skipProvisioning,
             taskParams().setUpChrony,
             taskParams().ntpServers,
             taskParams().showSetUpChrony);
@@ -95,16 +108,16 @@ public class CloudAccessKeySetup extends CloudTaskBase {
     if (provider.getCloudCode().equals(Common.CloudType.onprem)) {
       // In case of onprem provider, we add a couple of additional attributes like passwordlessSudo
       // and create a pre-provision script
-      AccessKey accessKey = AccessKey.getOrBadRequest(provider.uuid, accessKeyCode);
+      AccessKey accessKey = AccessKey.getOrBadRequest(provider.getUuid(), accessKeyCode);
       templateManager.createProvisionTemplate(
           accessKey,
-          provider.details.airGapInstall,
-          provider.details.passwordlessSudoAccess,
-          provider.details.installNodeExporter,
-          provider.details.nodeExporterPort,
-          provider.details.nodeExporterUser,
-          provider.details.setUpChrony,
-          provider.details.ntpServers);
+          provider.getDetails().airGapInstall,
+          provider.getDetails().passwordlessSudoAccess,
+          provider.getDetails().installNodeExporter,
+          provider.getDetails().nodeExporterPort,
+          provider.getDetails().nodeExporterUser,
+          provider.getDetails().setUpChrony,
+          provider.getDetails().ntpServers);
     }
   }
 }

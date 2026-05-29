@@ -1,4 +1,4 @@
-// Copyright (c) YugaByte, Inc.
+// Copyright (c) YugabyteDB, Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License"); you may not use this file except
 // in compliance with the License.  You may obtain a copy of the License at
@@ -36,9 +36,9 @@ import org.slf4j.LoggerFactory;
 
 import org.yb.util.BuildTypeUtil;
 import org.yb.util.ThreadUtil;
-import org.yb.util.YBTestRunnerNonTsanOnly;
+import org.yb.YBTestRunner;
 
-@RunWith(value = YBTestRunnerNonTsanOnly.class)
+@RunWith(value = YBTestRunner.class)
 public class TestIndexBackfill extends BasePgSQLTest {
   private static final Logger LOG = LoggerFactory.getLogger(TestIndexBackfill.class);
 

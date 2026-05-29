@@ -15,9 +15,9 @@
 // specific language governing permissions and limitations
 // under the License.
 //
-// The following only applies to changes made to this file as part of YugaByte development.
+// The following only applies to changes made to this file as part of YugabyteDB development.
 //
-// Portions Copyright (c) YugaByte, Inc.
+// Portions Copyright (c) YugabyteDB, Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License"); you may not use this file except
 // in compliance with the License.  You may obtain a copy of the License at
@@ -55,18 +55,20 @@ template<class T>
 class AtomicGauge;
 
 class Counter;
-class Histogram;
+class EventStats;
 class MetricEntity;
 class Socket;
 
 namespace rpc {
+
+using ThreadPoolProvider = std::function<ThreadPoolPtr(ThreadPoolTag)>;
 
 // A pool of threads that handle new incoming RPC calls.
 // Also includes a queue that calls get pushed onto for handling by the pool.
 class ServicePool : public RpcService {
  public:
   ServicePool(size_t max_tasks,
-              ThreadPool* thread_pool,
+              ThreadPoolProvider thread_pool_provider,
               Scheduler* scheduler,
               ServiceIfPtr service,
               const scoped_refptr<MetricEntity>& metric_entity);
@@ -76,8 +78,7 @@ class ServicePool : public RpcService {
   void CompleteShutdown() override;
 
   void FillEndpoints(RpcEndpointMap* map) override;
-  void QueueInboundCall(InboundCallPtr call) override;
-  void Handle(InboundCallPtr call) override;
+  void Process(InboundCallPtr call, Queue queue) override;
   const Counter* RpcsTimedOutInQueueMetricForTests() const;
   const Counter* RpcsQueueOverflowMetric() const;
   std::string service_name() const;

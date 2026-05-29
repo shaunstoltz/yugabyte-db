@@ -3,9 +3,9 @@
 //  LICENSE file in the root directory of this source tree. An additional grant
 //  of patent rights can be found in the PATENTS file in the same directory.
 //
-// The following only applies to changes made to this file as part of YugaByte development.
+// The following only applies to changes made to this file as part of YugabyteDB development.
 //
-// Portions Copyright (c) YugaByte, Inc.
+// Portions Copyright (c) YugabyteDB, Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License"); you may not use this file except
 // in compliance with the License.  You may obtain a copy of the License at
@@ -34,14 +34,13 @@
 #undef PLATFORM_IS_LITTLE_ENDIAN
 #define PLATFORM_IS_LITTLE_ENDIAN true
 
+#include <stdint.h>
 #include <windows.h>
+
 #include <string>
-#include <string.h>
 #include <mutex>
 #include <limits>
 #include <condition_variable>
-
-#include <stdint.h>
 
 #include "yb/rocksdb/options.h"
 
@@ -69,7 +68,7 @@ typedef SSIZE_T ssize_t;
 
 #define __attribute__(A)
 
-#ifdef ZLIB
+#ifdef YB_ZLIB
 #include <zlib.h>
 #endif
 
@@ -114,7 +113,7 @@ const uint64_t kMaxUint64 = std::numeric_limits<uint64_t>::max();
 
 const size_t kMaxSizet = std::numeric_limits<size_t>::max();
 
-#else //_MSC_VER
+#else // _MSC_VER
 
 // VS 15 has snprintf
 #define snprintf _snprintf
@@ -133,7 +132,7 @@ const size_t kMaxSizet = UINT64_MAX;
 const size_t kMaxSizet = UINT_MAX;
 #endif
 
-#endif //_MSC_VER
+#endif // _MSC_VER
 
 const bool kLittleEndian = true;
 
@@ -142,11 +141,11 @@ class CondVar;
 class Mutex {
  public:
 
-   /* implicit */ Mutex(bool adaptive = false)
+  /* implicit */ Mutex(bool adaptive = false) // NOLINT
 #ifndef NDEBUG
      : locked_(false)
 #endif
-   { }
+  { }
 
   ~Mutex();
 
@@ -244,7 +243,7 @@ struct OnceType {
     struct Init {};
 
     OnceType() {}
-    OnceType(const Init&) {}
+    explicit OnceType(const Init&) {}
     OnceType(const OnceType&) = delete;
     OnceType& operator=(const OnceType&) = delete;
 

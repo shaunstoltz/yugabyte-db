@@ -1,4 +1,4 @@
-// Copyright (c) YugaByte, Inc.
+// Copyright (c) YugabyteDB, Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License"); you may not use this file except
 // in compliance with the License.  You may obtain a copy of the License at
@@ -33,8 +33,7 @@ namespace consensus {
 
 // Specifies whether to send empty consensus requests from the leader to followers in case the queue
 // is empty.
-YB_DEFINE_ENUM(
-    RequestTriggerMode,
+YB_DEFINE_ENUM(RequestTriggerMode,
 
     // Only send a request if it is not empty.
     (kNonEmptyOnly)

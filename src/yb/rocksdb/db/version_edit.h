@@ -3,9 +3,9 @@
 //  LICENSE file in the root directory of this source tree. An additional grant
 //  of patent rights can be found in the PATENTS file in the same directory.
 //
-// The following only applies to changes made to this file as part of YugaByte development.
+// The following only applies to changes made to this file as part of YugabyteDB development.
 //
-// Portions Copyright (c) YugaByte, Inc.
+// Portions Copyright (c) YugabyteDB, Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License"); you may not use this file except
 // in compliance with the License.  You may obtain a copy of the License at
@@ -37,8 +37,6 @@
 #include <unordered_map>
 #include <utility>
 #include <vector>
-
-#include <boost/optional.hpp>
 
 #include "yb/gutil/atomicops.h"
 
@@ -188,8 +186,8 @@ class VersionEdit {
   void SetLastSequence(SequenceNumber seq) {
     last_sequence_ = seq;
   }
-  void UpdateFlushedFrontier(UserFrontierPtr value);
-  void ModifyFlushedFrontier(UserFrontierPtr value, FrontierModificationMode mode);
+  void UpdateFlushedFrontier(yb::storage::UserFrontierPtr value);
+  void ModifyFlushedFrontier(yb::storage::UserFrontierPtr value, FrontierModificationMode mode);
   void SetMaxColumnFamily(uint32_t max_column_family) {
     max_column_family_ = max_column_family;
   }
@@ -262,6 +260,13 @@ class VersionEdit {
     return DebugString();
   }
 
+  bool IsForceFlushedFrontier() const {
+    // Set to kForce when we're resetting the flushed frontier to a potentially lower value. This
+    // is needed when restoring from a backup into a new Raft group with an unrelated sequence of
+    // OpIds.
+    return frontier_modification_mode_ == FrontierModificationMode::kForce;
+  }
+
  private:
   friend class VersionSet;
   friend class Version;
@@ -269,17 +274,14 @@ class VersionEdit {
   bool EncodeTo(VersionEditPB* out) const;
 
   int max_level_;
-  boost::optional<std::string> comparator_;
-  boost::optional<uint64_t> log_number_;
-  boost::optional<uint64_t> prev_log_number_;
-  boost::optional<uint64_t> next_file_number_;
-  boost::optional<uint32_t> max_column_family_;
-  boost::optional<SequenceNumber> last_sequence_;
-  UserFrontierPtr flushed_frontier_;
-
-  // Used when we're resetting the flushed frontier to a potentially lower value. This is needed
-  // when restoring from a backup into a new Raft group with an unrelated sequence of OpIds.
-  bool force_flushed_frontier_ = false;
+  std::optional<std::string> comparator_;
+  std::optional<uint64_t> log_number_;
+  std::optional<uint64_t> prev_log_number_;
+  std::optional<uint64_t> next_file_number_;
+  std::optional<uint32_t> max_column_family_;
+  std::optional<SequenceNumber> last_sequence_;
+  yb::storage::UserFrontierPtr flushed_frontier_;
+  FrontierModificationMode frontier_modification_mode_ = FrontierModificationMode::kUpdate;
 
   DeletedFileSet deleted_files_;
   std::vector<std::pair<int, FileMetaData>> new_files_;
@@ -291,7 +293,7 @@ class VersionEdit {
   // column_family drop. If it's column family add,
   // it also includes column family name.
   bool is_column_family_drop_;
-  boost::optional<std::string> column_family_name_;
+  std::optional<std::string> column_family_name_;
 };
 
 }  // namespace rocksdb

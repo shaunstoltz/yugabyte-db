@@ -1,11 +1,11 @@
-// Copyright (c) YugaByte, Inc.
+// Copyright (c) YugabyteDB, Inc.
 
 package task
 
 import (
 	"bytes"
 	"context"
-	"io/ioutil"
+	"io"
 	"net/http"
 	"node-agent/model"
 	"node-agent/util"
@@ -79,11 +79,11 @@ func TestHandleAgentUnregistration(t *testing.T) {
 
 func TestUnmarshalResponse(t *testing.T) {
 	res := http.Response{
-		Body:       ioutil.NopCloser(bytes.NewBufferString("{\"test\":\"success\"}")),
+		Body:       io.NopCloser(bytes.NewBufferString("{\"test\":\"success\"}")),
 		StatusCode: 200,
 	}
 	var testValue map[string]string
-	data, err := UnmarshalResponse(&testValue, &res)
+	data, err := UnmarshalResponse(context.TODO(), &testValue, &res)
 	if err != nil {
 		t.Fatalf("Unmarshaling error.")
 	}
@@ -100,12 +100,9 @@ func TestUnmarshalResponse(t *testing.T) {
 }
 
 func TestGetNodeConfig(t *testing.T) {
-	data := getTestPreflightCheckVal()
-
-	testNodeConfigList := getNodeConfig(data)
-
+	testNodeConfigList := getTestPreflightCheckOutput()
 	mp, po, hds := false, false, false
-	for _, v := range testNodeConfigList {
+	for _, v := range *testNodeConfigList {
 		switch v.Type {
 		case "PORT_AVAILABLE":
 			po = true
@@ -135,8 +132,8 @@ func TestHandleGetInstanceType(t *testing.T) {
 }
 
 func TestHandlePostNodeInstance(t *testing.T) {
-	data := getTestPreflightCheckVal()
-	handler := NewPostNodeInstanceHandler(data)
+	output := getTestPreflightCheckOutput()
+	handler := NewPostNodeInstanceHandler(*output)
 	testResponseData, err := handler.Handle(context.Background())
 	if err != nil {
 		t.Fatalf("Unexpected Error %s ", err.Error())
@@ -152,7 +149,7 @@ func TestHandlePostNodeInstance(t *testing.T) {
 	}
 }
 
-func getTestPreflightCheckVal() map[string]model.PreflightCheckVal {
+func getTestPreflightCheckOutput() *[]model.NodeConfig {
 	data := make(map[string]model.PreflightCheckVal)
 	data["port_available:1"] = model.PreflightCheckVal{Value: "false"}
 	data["port_available:2"] = model.PreflightCheckVal{Value: "true"}
@@ -160,5 +157,5 @@ func getTestPreflightCheckVal() map[string]model.PreflightCheckVal {
 	data["home_dir_space"] = model.PreflightCheckVal{Value: "100"}
 	data["mount_point:/opt"] = model.PreflightCheckVal{Value: "true"}
 	data["mount_point:/tmp"] = model.PreflightCheckVal{Value: "true"}
-	return data
+	return getNodeConfig(data)
 }

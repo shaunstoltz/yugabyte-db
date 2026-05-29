@@ -4,4 +4,5 @@
 # YB Transaction Testsuite: Used for reporting supported/unsupported operations in context
 # of different transaction types.
 ####################################################################################################
-test: yb_transactions
+test: yb.orig.transactions
+test: yb.orig.internal_subtransactions

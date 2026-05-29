@@ -1,14 +1,18 @@
-// Copyright (c) Yugabyte, Inc.
+// Copyright (c) YugabyteDB, Inc.
 
 package com.yugabyte.yw.controllers;
 
 import com.google.inject.Inject;
 import com.yugabyte.yw.common.PlatformServiceException;
+import com.yugabyte.yw.common.Util;
 import com.yugabyte.yw.common.config.GlobalConfKeys;
 import com.yugabyte.yw.common.config.RuntimeConfGetter;
 import com.yugabyte.yw.common.config.RuntimeConfigFactory;
+import com.yugabyte.yw.common.rbac.PermissionInfo.Action;
+import com.yugabyte.yw.common.rbac.PermissionInfo.ResourceType;
 import com.yugabyte.yw.forms.HookScopeFormData;
 import com.yugabyte.yw.forms.PlatformResults;
+import com.yugabyte.yw.forms.PlatformResults.YBPError;
 import com.yugabyte.yw.forms.PlatformResults.YBPSuccess;
 import com.yugabyte.yw.models.Audit;
 import com.yugabyte.yw.models.Customer;
@@ -16,15 +20,23 @@ import com.yugabyte.yw.models.Hook;
 import com.yugabyte.yw.models.HookScope;
 import com.yugabyte.yw.models.Provider;
 import com.yugabyte.yw.models.Universe;
+import com.yugabyte.yw.rbac.annotations.AuthzPath;
+import com.yugabyte.yw.rbac.annotations.PermissionAttribute;
+import com.yugabyte.yw.rbac.annotations.RequiredPermissionOnResource;
+import com.yugabyte.yw.rbac.annotations.Resource;
+import com.yugabyte.yw.rbac.enums.SourceType;
 import io.swagger.annotations.Api;
 import io.swagger.annotations.ApiImplicitParam;
 import io.swagger.annotations.ApiImplicitParams;
 import io.swagger.annotations.ApiOperation;
+import io.swagger.annotations.ApiResponse;
+import io.swagger.annotations.ApiResponses;
 import io.swagger.annotations.Authorization;
 import java.util.List;
 import java.util.UUID;
 import lombok.extern.slf4j.Slf4j;
 import play.data.Form;
+import play.mvc.Http;
 import play.mvc.Result;
 
 @Slf4j
@@ -48,9 +60,15 @@ public class HookScopeController extends AuthenticatedController {
       nickname = "listScopes",
       response = HookScope.class,
       responseContainer = "List")
-  public Result list(UUID customerUUID) {
+  @AuthzPath({
+    @RequiredPermissionOnResource(
+        requiredPermission =
+            @PermissionAttribute(resourceType = ResourceType.OTHER, action = Action.READ),
+        resourceLocation = @Resource(path = Util.CUSTOMERS, sourceType = SourceType.ENDPOINT))
+  })
+  public Result list(UUID customerUUID, Http.Request request) {
     Customer customer = Customer.getOrBadRequest(customerUUID);
-    verifyAuth(customer);
+    verifyAuth(customer, request);
     List<HookScope> hookScopes = HookScope.getAll(customerUUID);
     return PlatformResults.withData(hookScopes);
   }
@@ -66,15 +84,22 @@ public class HookScopeController extends AuthenticatedController {
           paramType = "body",
           dataType = "com.yugabyte.yw.forms.HookScopeFormData",
           required = true))
-  public Result create(UUID customerUUID) {
+  @AuthzPath({
+    @RequiredPermissionOnResource(
+        requiredPermission =
+            @PermissionAttribute(resourceType = ResourceType.OTHER, action = Action.UPDATE),
+        resourceLocation = @Resource(path = Util.CUSTOMERS, sourceType = SourceType.ENDPOINT))
+  })
+  public Result create(UUID customerUUID, Http.Request request) {
     Customer customer = Customer.getOrBadRequest(customerUUID);
-    verifyAuth(customer);
-    Form<HookScopeFormData> formData = formFactory.getFormDataOrBadRequest(HookScopeFormData.class);
+    verifyAuth(customer, request);
+    Form<HookScopeFormData> formData =
+        formFactory.getFormDataOrBadRequest(request, HookScopeFormData.class);
     HookScopeFormData form = formData.get();
     form.verify(customerUUID);
     HookScope hookScope;
     if (form.getUniverseUUID() != null) { // Universe Scope
-      Universe universe = Universe.getValidUniverseOrBadRequest(form.getUniverseUUID(), customer);
+      Universe universe = Universe.getOrBadRequest(form.getUniverseUUID(), customer);
 
       // We can create hook_scopes for clusters that do not exist yet.
       // This is an explicit requirement for the CDC / AddOn cluster work where we want to have
@@ -89,12 +114,11 @@ public class HookScopeController extends AuthenticatedController {
     }
     auditService()
         .createAuditEntryWithReqBody(
-            ctx(),
+            request,
             Audit.TargetType.HookScope,
-            hookScope.uuid.toString(),
-            Audit.ActionType.CreateHookScope,
-            request().body().asJson());
-    log.info("Created hook scope with uuid {}", hookScope.uuid);
+            hookScope.getUuid().toString(),
+            Audit.ActionType.CreateHookScope);
+    log.info("Created hook scope with uuid {}", hookScope.getUuid());
     return PlatformResults.withData(hookScope);
   }
 
@@ -102,15 +126,25 @@ public class HookScopeController extends AuthenticatedController {
       value = "Delete a hook scope",
       nickname = "deleteHookScope",
       response = YBPSuccess.class)
-  public Result delete(UUID customerUUID, UUID hookScopeUUID) {
+  @AuthzPath({
+    @RequiredPermissionOnResource(
+        requiredPermission =
+            @PermissionAttribute(resourceType = ResourceType.OTHER, action = Action.DELETE),
+        resourceLocation = @Resource(path = Util.CUSTOMERS, sourceType = SourceType.ENDPOINT))
+  })
+  @ApiResponses(
+      value = {
+        @ApiResponse(code = 404, message = "Hook scope not found", response = YBPError.class)
+      })
+  public Result delete(UUID customerUUID, UUID hookScopeUUID, Http.Request request) {
     Customer customer = Customer.getOrBadRequest(customerUUID);
-    verifyAuth(customer);
+    verifyAuth(customer, request);
     HookScope hookScope = HookScope.getOrBadRequest(customerUUID, hookScopeUUID);
     log.info("Deleting hook scope with UUID {}", hookScopeUUID);
     hookScope.delete();
     auditService()
-        .createAuditEntryWithReqBody(
-            ctx(),
+        .createAuditEntry(
+            request,
             Audit.TargetType.HookScope,
             hookScopeUUID.toString(),
             Audit.ActionType.DeleteHookScope);
@@ -121,15 +155,29 @@ public class HookScopeController extends AuthenticatedController {
       value = "Add a hook to a hook scope",
       nickname = "addHook",
       response = HookScope.class)
-  public Result addHook(UUID customerUUID, UUID hookScopeUUID, UUID hookUUID) {
+  @AuthzPath({
+    @RequiredPermissionOnResource(
+        requiredPermission =
+            @PermissionAttribute(resourceType = ResourceType.OTHER, action = Action.UPDATE),
+        resourceLocation = @Resource(path = Util.CUSTOMERS, sourceType = SourceType.ENDPOINT))
+  })
+  @ApiResponses(
+      value = {
+        @ApiResponse(code = 404, message = "Hook scope not found", response = YBPError.class)
+      })
+  public Result addHook(
+      UUID customerUUID, UUID hookScopeUUID, UUID hookUUID, Http.Request request) {
     Customer customer = Customer.getOrBadRequest(customerUUID);
-    verifyAuth(customer);
+    verifyAuth(customer, request);
     HookScope hookScope = HookScope.getOrBadRequest(customerUUID, hookScopeUUID);
     Hook hook = Hook.getOrBadRequest(customerUUID, hookUUID);
     hookScope.addHook(hook);
     auditService()
-        .createAuditEntryWithReqBody(
-            ctx(), Audit.TargetType.HookScope, hookScopeUUID.toString(), Audit.ActionType.AddHook);
+        .createAuditEntry(
+            request,
+            Audit.TargetType.HookScope,
+            hookScopeUUID.toString(),
+            Audit.ActionType.AddHook);
     return PlatformResults.withData(hookScope);
   }
 
@@ -137,27 +185,38 @@ public class HookScopeController extends AuthenticatedController {
       value = "Remove a hook from a hook scope",
       nickname = "removeHook",
       response = HookScope.class)
-  public Result removeHook(UUID customerUUID, UUID hookScopeUUID, UUID hookUUID) {
+  @AuthzPath({
+    @RequiredPermissionOnResource(
+        requiredPermission =
+            @PermissionAttribute(resourceType = ResourceType.OTHER, action = Action.UPDATE),
+        resourceLocation = @Resource(path = Util.CUSTOMERS, sourceType = SourceType.ENDPOINT))
+  })
+  @ApiResponses(
+      value = {
+        @ApiResponse(code = 404, message = "Hook scope not found", response = YBPError.class)
+      })
+  public Result removeHook(
+      UUID customerUUID, UUID hookScopeUUID, UUID hookUUID, Http.Request request) {
     Customer customer = Customer.getOrBadRequest(customerUUID);
-    verifyAuth(customer);
+    verifyAuth(customer, request);
     HookScope hookScope = HookScope.getOrBadRequest(customerUUID, hookScopeUUID);
     Hook hook = Hook.getOrBadRequest(customerUUID, hookUUID);
-    if (hook.hookScope == null || !hook.hookScope.uuid.equals(hookScopeUUID)) {
+    if (hook.getHookScope() == null || !hook.getHookScope().getUuid().equals(hookScopeUUID)) {
       throw new PlatformServiceException(
           BAD_REQUEST, "Hook " + hookUUID + " is not attached to hook scope " + hookScopeUUID);
     }
-    hook.hookScope = null;
+    hook.setHookScope(null);
     hook.update();
     auditService()
-        .createAuditEntryWithReqBody(
-            ctx(),
+        .createAuditEntry(
+            request,
             Audit.TargetType.HookScope,
             hookScopeUUID.toString(),
             Audit.ActionType.RemoveHook);
     return PlatformResults.withData(hookScope);
   }
 
-  public void verifyAuth(Customer customer) {
+  public void verifyAuth(Customer customer, Http.Request request) {
     if (!confGetter.getGlobalConf(GlobalConfKeys.enableCustomHooks))
       throw new PlatformServiceException(
           UNAUTHORIZED, "Custom hooks is not enabled on this Anywhere instance");
@@ -166,10 +225,10 @@ public class HookScopeController extends AuthenticatedController {
       log.warn(
           "Not performing SuperAdmin authorization for this endpoint, customer={} as platform is in"
               + " cloud mode",
-          customer.uuid);
-      tokenAuthenticator.adminOrThrow(ctx());
+          customer.getUuid());
+      tokenAuthenticator.adminOrThrow(request);
     } else {
-      tokenAuthenticator.superAdminOrThrow(ctx());
+      tokenAuthenticator.superAdminOrThrow(request);
     }
   }
 }

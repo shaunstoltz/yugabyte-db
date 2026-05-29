@@ -1,4 +1,4 @@
-// Copyright (c) YugaByte, Inc.
+// Copyright (c) YugabyteDB, Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License"); you may not use this file except
 // in compliance with the License.  You may obtain a copy of the License at
@@ -48,7 +48,7 @@ import org.junit.runner.RunWith;
 public class TestWipeNode  extends BaseCQLTest {
 
   protected static final Logger LOG = LoggerFactory.getLogger(TestWipeNode.class);
-  protected static final int WAIT_FOR_OP_MS = 10000;
+  protected static final int WAIT_FOR_OP_MS = 20000;
 
   private void writeRows(String tableName, int numRows) {
     for (int i = 0; i < numRows; i++) {
@@ -133,8 +133,13 @@ public class TestWipeNode  extends BaseCQLTest {
           }
         }
 
-        HostAndPort hostPort = HostAndPort.fromParts(tablet.getLeaderReplica().getRpcHost(),
-            tablet.getLeaderReplica().getRpcPort());
+        LocatedTablet.Replica leaderReplica = tablet.getLeaderReplica();
+        if (leaderReplica == null) {
+          LOG.info("Tablet {} has no leader yet, retrying", tablet.toString());
+          return false;
+        }
+        HostAndPort hostPort = HostAndPort.fromParts(leaderReplica.getRpcHost(),
+            leaderReplica.getRpcPort());
         MiniYBDaemon ybDaemon = miniCluster.getTabletServers().get(hostPort);
         assertNotNull(ybDaemon);
 

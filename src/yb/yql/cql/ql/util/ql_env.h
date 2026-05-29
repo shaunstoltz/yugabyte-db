@@ -1,5 +1,5 @@
 //--------------------------------------------------------------------------------------------------
-// Copyright (c) YugaByte, Inc.
+// Copyright (c) YugabyteDB, Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License"); you may not use this file except
 // in compliance with the License.  You may obtain a copy of the License at
@@ -66,8 +66,8 @@ class QLEnv {
   virtual Status DeleteIndexTable(const client::YBTableName& name,
                                           client::YBTableName* indexed_table_name);
 
-  virtual Result<SchemaVersion> GetUpToDateTableSchemaVersion(
-      const client::YBTableName& table_name);
+  virtual Result<SchemaVersion> GetCachedTableSchemaVersion(const TableId& table_id);
+  virtual Result<SchemaVersion> GetUpToDateTableSchemaVersion(const TableId& table_id);
 
   virtual std::shared_ptr<client::YBTable> GetTableDesc(const client::YBTableName& table_name,
                                                         bool* cache_used);
@@ -80,7 +80,7 @@ class QLEnv {
   // Read/write related methods.
 
   // Create a read/write session.
-  client::YBSessionPtr NewSession();
+  client::YBSessionPtr NewSession(CoarseTimePoint deadline);
 
   // Create a new transaction.
   Result<client::YBTransactionPtr> NewTransaction(const client::YBTransactionPtr& transaction,
@@ -127,10 +127,9 @@ class QLEnv {
                                     const bool login, const bool superuser);
 
   // Alter an existing role with the given arguments.
-  virtual Status AlterRole(const std::string& role_name,
-                                   const boost::optional<std::string>& salted_hash,
-                                   const boost::optional<bool> login,
-                                   const boost::optional<bool> superuser);
+  virtual Status AlterRole(
+      const std::string& role_name, const std::optional<std::string>& salted_hash,
+      const std::optional<bool> login, const std::optional<bool> superuser);
 
   // Delete role by name.
   virtual Status DeleteRole(const std::string& role_name);

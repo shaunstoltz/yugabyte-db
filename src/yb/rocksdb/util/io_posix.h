@@ -3,9 +3,9 @@
 //  LICENSE file in the root directory of this source tree. An additional grant
 //  of patent rights can be found in the PATENTS file in the same directory.
 //
-// The following only applies to changes made to this file as part of YugaByte development.
+// The following only applies to changes made to this file as part of YugabyteDB development.
 //
-// Portions Copyright (c) YugaByte, Inc.
+// Portions Copyright (c) YugabyteDB, Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License"); you may not use this file except
 // in compliance with the License.  You may obtain a copy of the License at
@@ -37,7 +37,7 @@
 
 namespace rocksdb {
 
-#define STATUS_IO_ERROR(context, err_number) STATUS(IOError, (context), strerror(err_number))
+#define STATUS_IO_ERROR(context, err_number) STATUS_FROM_ERRNO(context, err_number)
 
 class PosixMmapReadableFile : public RandomAccessFile {
  private:
@@ -88,6 +88,8 @@ class PosixMmapFile : public WritableFile {
   Status UnmapCurrentRegion();
   Status Msync();
 
+  const std::string& filename() const override { return filename_; }
+
  public:
   PosixMmapFile(const std::string& fname, int fd, size_t page_size,
                 const EnvOptions& options);
@@ -98,10 +100,10 @@ class PosixMmapFile : public WritableFile {
   Status Truncate(uint64_t size) override;
   Status Close() override;
   Status Append(const Slice& data) override;
-  Status Flush() override;
+  Status Flush(FlushMode mode) override;
   Status Sync() override;
   Status Fsync() override;
-  uint64_t GetFileSize() override;
+  uint64_t Size() const override;
   Status InvalidateCache(size_t offset, size_t length) override;
 #ifdef ROCKSDB_FALLOCATE_PRESENT
   Status Allocate(uint64_t offset, uint64_t len) override;

@@ -1,5 +1,5 @@
 /*
- * Copyright 2019 YugaByte, Inc. and Contributors
+ * Copyright 2019 YugabyteDB, Inc. and Contributors
  *
  * Licensed under the Polyform Free Trial License 1.0.0 (the "License"); you
  * may not use this file except in compliance with the License. You
@@ -15,11 +15,13 @@ import com.yugabyte.yw.commissioner.BaseTaskDependencies;
 import com.yugabyte.yw.commissioner.ITask.Abortable;
 import com.yugabyte.yw.commissioner.ITask.Retryable;
 import com.yugabyte.yw.commissioner.UserTaskDetails.SubTaskGroupType;
+import com.yugabyte.yw.common.DnsManager;
 import com.yugabyte.yw.common.PlacementInfoUtil;
+import com.yugabyte.yw.common.utils.CapacityReservationUtil;
 import com.yugabyte.yw.forms.UniverseDefinitionTaskParams.Cluster;
 import com.yugabyte.yw.models.Universe;
 import com.yugabyte.yw.models.helpers.NodeDetails;
-import java.util.Collections;
+import java.util.Collection;
 import java.util.Set;
 import javax.inject.Inject;
 import lombok.extern.slf4j.Slf4j;
@@ -36,38 +38,57 @@ public class ReadOnlyClusterCreate extends UniverseDefinitionTaskBase {
   }
 
   @Override
+  protected void createPrecheckTasks(Universe universe) {
+    addBasicPrecheckTasks();
+    if (isFirstTry()) {
+      configureTaskParams(universe);
+    }
+  }
+
+  // This is invoked only on first try.
+  protected void configureTaskParams(Universe universe) {
+    // Set all the in-memory node names.
+    setNodeNames(universe);
+    // Set non on-prem node UUIDs.
+    setCloudNodeUuids(universe);
+    // Update on-prem node UUIDs in task params but do not commit yet.
+    updateOnPremNodeUuidsOnTaskParams(false);
+    Collection<Cluster> clusters = taskParams().getReadOnlyClusters();
+    // Create preflight node check tasks for on-prem nodes.
+    createPreflightNodeCheckTasks(universe, clusters);
+    createCheckCertificateConfigTask(universe, clusters);
+  }
+
+  protected void freezeUniverseInTxn(Universe universe) {
+    // Perform pre-task actions.
+    preTaskActions(universe);
+    // Confirm the nodes on hold.
+    commitReservedNodes();
+    setCommunicationPortsForNodes(false);
+    // Set the prepared data to universe in-memory.
+    updateUniverseNodesAndSettings(universe, taskParams(), true);
+    Cluster cluster = taskParams().getReadOnlyClusters().get(0);
+    universe
+        .getUniverseDetails()
+        .upsertCluster(
+            cluster.userIntent, cluster.getPartitions(), cluster.placementInfo, cluster.uuid);
+    updateTaskDetailsInDB(taskParams());
+  }
+
+  @Override
   public void run() {
-    log.info("Started {} task for uuid={}", getName(), taskParams().universeUUID);
-
+    if (maybeRunOnlyPrechecks()) {
+      return;
+    }
+    log.info("Started {} task for uuid={}", getName(), taskParams().getUniverseUUID());
+    Universe universe = null;
     try {
-
-      // Set the 'updateInProgress' flag to prevent other updates from happening.
-      Universe universe =
-          lockUniverseForUpdate(
-              taskParams().expectedUniverseVersion,
-              u -> {
-                if (isFirstTry()) {
-                  // Fetch the task params from the DB to start from fresh on retry.
-                  // Otherwise, some operations like name assignment can fail.
-                  fetchTaskDetailsFromDB();
-                  preTaskActions(u);
-                  // Set all the in-memory node names.
-                  setNodeNames(u);
-                  // Set non on-prem node UUIDs.
-                  setCloudNodeUuids(u);
-                  // Update on-prem node UUIDs.
-                  updateOnPremNodeUuidsOnTaskParams();
-                  // Set the prepared data to universe in-memory.
-                  setUserIntentToUniverse(u, taskParams(), true);
-                  // There is a rare possibility that this succeeds and
-                  // saving the Universe fails. It is ok because the retry
-                  // will just fail.
-                  updateTaskDetailsInDB(taskParams());
-                }
-              });
+      universe =
+          lockAndFreezeUniverseForUpdate(
+              taskParams().expectedUniverseVersion, this::freezeUniverseInTxn);
+      Cluster cluster = taskParams().getReadOnlyClusters().get(0);
 
       // Sanity checks for clusters list validity are performed in the controller.
-      Cluster cluster = taskParams().getReadOnlyClusters().get(0);
       Set<NodeDetails> readOnlyNodes = taskParams().getNodesInCluster(cluster.uuid);
       boolean ignoreUseCustomImageConfig = !readOnlyNodes.stream().allMatch(n -> n.ybPrebuiltAmi);
 
@@ -77,7 +98,6 @@ public class ReadOnlyClusterCreate extends UniverseDefinitionTaskBase {
         log.error("{} Nodes: {}", errMsg, readOnlyNodes);
         throw new IllegalArgumentException(errMsg);
       }
-
       Set<NodeDetails> nodesToProvision = PlacementInfoUtil.getNodesToProvision(readOnlyNodes);
 
       if (nodesToProvision.isEmpty()) {
@@ -85,31 +105,53 @@ public class ReadOnlyClusterCreate extends UniverseDefinitionTaskBase {
         log.error(errMsg);
         throw new IllegalArgumentException(errMsg);
       }
-
-      // Create preflight node check tasks for on-prem nodes.
-      createPreflightNodeCheckTasks(universe, Collections.singletonList(cluster));
+      boolean deleteCapacityReservation =
+          createCapacityReservationsIfNeeded(
+              nodesToProvision,
+              CapacityReservationUtil.OperationType.CREATE,
+              node ->
+                  node.state == NodeDetails.NodeState.ToBeAdded
+                      || node.state == NodeDetails.NodeState.Adding);
 
       // Provision the nodes.
       // State checking is enabled because the subtasks are not idempotent.
       createProvisionNodeTasks(
           universe,
           nodesToProvision,
-          true /* isShell */,
           false /* ignore node status check */,
-          ignoreUseCustomImageConfig);
+          true /* do validation of gflags */,
+          setupServerParams -> {
+            setupServerParams.ignoreUseCustomImageConfig = ignoreUseCustomImageConfig;
+            setupServerParams.rebootNodeAllowed = true;
+          },
+          installSoftwareParams -> {
+            installSoftwareParams.isMasterInShellMode = true;
+            installSoftwareParams.ignoreUseCustomImageConfig = ignoreUseCustomImageConfig;
+          },
+          gFlagsParams -> {
+            gFlagsParams.isMasterInShellMode = true;
+            gFlagsParams.resetMasterState = true;
+            gFlagsParams.ignoreUseCustomImageConfig = ignoreUseCustomImageConfig;
+          });
+      if (deleteCapacityReservation) {
+        createDeleteCapacityReservationTask();
+      }
 
       // Set of processes to be started, note that in this case it is same as nodes provisioned.
       Set<NodeDetails> newTservers = PlacementInfoUtil.getTserversToProvision(readOnlyNodes);
+
+      // Make sure clock skew is low enough.
+      createWaitForClockSyncTasks(universe, newTservers)
+          .setSubTaskGroupType(SubTaskGroupType.StartingNodeProcesses);
 
       // Start the tservers in the clusters.
       createStartTserverProcessTasks(
           newTservers, universe.getUniverseDetails().getPrimaryCluster().userIntent.enableYSQL);
 
       // Start ybc process on all the nodes
-      if (taskParams().enableYbc) {
-        createStartYbcProcessTasks(
-            newTservers, universe.getUniverseDetails().getPrimaryCluster().userIntent.useSystemd);
-        createUpdateYbcTask(taskParams().ybcSoftwareVersion)
+      if (taskParams().isEnableYbc()) {
+        createStartYbcProcessTasks(newTservers);
+        createUpdateYbcTask(taskParams().getYbcSoftwareVersion())
             .setSubTaskGroupType(SubTaskGroupType.ConfigureUniverse);
       }
 
@@ -119,6 +161,10 @@ public class ReadOnlyClusterCreate extends UniverseDefinitionTaskBase {
 
       // Update the async_replicas in the cluster config on master leader.
       createPlacementInfoTask(null /* blacklistNodes */)
+          .setSubTaskGroupType(SubTaskGroupType.ConfigureUniverse);
+
+      // Add read replica nodes to the DNS entry.
+      createDnsManipulationTask(DnsManager.DnsCommandType.Edit, false, universe)
           .setSubTaskGroupType(SubTaskGroupType.ConfigureUniverse);
 
       // Update the swamper target file.
@@ -132,22 +178,30 @@ public class ReadOnlyClusterCreate extends UniverseDefinitionTaskBase {
       getRunnableTask().runSubTasks();
     } catch (Throwable t) {
       log.error("Error executing task {} with error='{}'.", getName(), t.getMessage(), t);
+      clearCapacityReservationOnError(t, Universe.getOrBadRequest(universe.getUniverseUUID()));
       throw t;
     } finally {
-      // Mark the update of the universe as done. This will allow future edits/updates to the
-      // universe to happen.
-      Universe universe = unlockUniverseForUpdate();
-      if (universe.getConfig().getOrDefault(Universe.USE_CUSTOM_IMAGE, "false").equals("true")) {
-        universe.updateConfig(
-            ImmutableMap.of(
-                Universe.USE_CUSTOM_IMAGE,
-                Boolean.toString(
-                    universe
-                        .getUniverseDetails()
-                        .nodeDetailsSet
-                        .stream()
-                        .allMatch(n -> n.ybPrebuiltAmi))));
-        universe.save();
+      releaseReservedNodes();
+      if (universe != null) {
+        // Universe is locked by this task.
+        try {
+          // Fetch the latest universe.
+          universe = Universe.getOrBadRequest(universe.getUniverseUUID());
+          if (universe
+              .getConfig()
+              .getOrDefault(Universe.USE_CUSTOM_IMAGE, "false")
+              .equals("true")) {
+            universe.updateConfig(
+                ImmutableMap.of(
+                    Universe.USE_CUSTOM_IMAGE,
+                    Boolean.toString(
+                        universe.getUniverseDetails().nodeDetailsSet.stream()
+                            .allMatch(n -> n.ybPrebuiltAmi))));
+            universe.save();
+          }
+        } finally {
+          unlockUniverseForUpdate();
+        }
       }
     }
     log.info("Finished {} task.", getName());

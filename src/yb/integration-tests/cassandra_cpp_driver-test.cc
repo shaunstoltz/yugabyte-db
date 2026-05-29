@@ -1,4 +1,4 @@
-// Copyright (c) YugaByte, Inc.
+// Copyright (c) YugabyteDB, Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License"); you may not use this file except
 // in compliance with the License.  You may obtain a copy of the License at
@@ -31,7 +31,7 @@
 #include "yb/tserver/tserver_service.pb.h"
 
 #include "yb/util/backoff_waiter.h"
-#include "yb/util/jsonreader.h"
+#include "yb/util/json_document.h"
 #include "yb/util/metrics.h"
 #include "yb/util/random_util.h"
 #include "yb/util/size_literals.h"
@@ -49,13 +49,9 @@ using std::tuple;
 using std::get;
 using std::map;
 
-using rapidjson::Value;
 using strings::Substitute;
 
 using yb::CoarseBackoffWaiter;
-using yb::YQLDatabase;
-using yb::client::TableHandle;
-using yb::client::TransactionManager;
 using yb::client::YBTableName;
 using yb::client::YBTableInfo;
 using yb::client::YBqlWriteOpPtr;
@@ -69,6 +65,10 @@ METRIC_DECLARE_histogram(handler_latency_yb_client_read_local);
 
 METRIC_DECLARE_histogram(handler_latency_yb_cqlserver_SQLProcessor_InsertStmt);
 METRIC_DECLARE_histogram(handler_latency_yb_cqlserver_SQLProcessor_UseStmt);
+
+METRIC_DECLARE_histogram(handler_latency_yb_tserver_TabletServerAdminService_BackfillDone);
+METRIC_DECLARE_histogram(handler_latency_yb_tserver_TabletServerAdminService_BackfillIndex);
+METRIC_DECLARE_histogram(handler_latency_yb_tserver_TabletServerAdminService_GetSafeTime);
 
 DECLARE_int64(external_mini_cluster_max_log_bytes);
 DECLARE_int32(TEST_slowdown_backfill_job_deletion_ms);
@@ -125,11 +125,11 @@ class CppCassandraDriverTest : public ExternalMiniClusterITestBase {
     ASSERT_OK(admin_client_->Init());
   }
 
-  void SetUpCluster(ExternalMiniClusterOptions* opts) override {
-    ASSERT_NO_FATALS(ExternalMiniClusterITestBase::SetUpCluster(opts));
+  void SetUpOptions(ExternalMiniClusterOptions& opts) override {
+    ASSERT_NO_FATALS(ExternalMiniClusterITestBase::SetUpOptions(opts));
 
-    opts->bind_to_unique_loopback_addresses = true;
-    opts->use_same_ts_ports = true;
+    opts.bind_to_unique_loopback_addresses = true;
+    opts.use_same_ts_ports = true;
   }
 
   void TearDown() override {
@@ -259,7 +259,6 @@ class CppCassandraDriverTestIndexSlower : public CppCassandraDriverTestIndex {
   std::vector<std::string> ExtraMasterFlags() override {
     auto flags = CppCassandraDriverTestIndex::ExtraMasterFlags();
     flags.push_back("--TEST_slowdown_backfill_alter_table_rpcs_ms=3000");
-    flags.push_back("--vmodule=backfill_index=3");
     return flags;
   }
 };
@@ -448,11 +447,9 @@ class Metrics {
     const auto result = ts.GetMetricFromHost<int64>(
         host_port, &METRIC_ENTITY_server, entity_id, CHECK_NOTNULL(metric_proto), "total_count");
 
-    if (!result.ok()) {
-      LOG(ERROR) << "Failed to get metric " << metric_proto->name() << " from TS"
-          << ts_index << ": " << host_port << " with error " << result.status();
-    }
-    ASSERT_OK(result);
+    ASSERT_TRUE(result.ok())
+        << "Failed to get metric " << metric_proto->name() << " from TS"
+        << ts_index << ": " << host_port << " with error " << result.status();
     *CHECK_NOTNULL(value) = *result;
   }
 
@@ -473,6 +470,21 @@ class Metrics {
 std::ostream& operator <<(std::ostream& s, const Metrics& m) {
   return s << m.ToString();
 }
+
+struct BackfillMetrics : public Metrics {
+  explicit BackfillMetrics(const Metrics& m) : Metrics(m) {}
+
+  explicit BackfillMetrics(const ExternalMiniCluster& cluster) : Metrics(cluster, false) {
+    add_proto(
+        "backfill_index",
+        &METRIC_handler_latency_yb_tserver_TabletServerAdminService_BackfillIndex);
+    add_proto(
+        "backfill_done", &METRIC_handler_latency_yb_tserver_TabletServerAdminService_BackfillDone);
+    add_proto(
+        "get_safe_time", &METRIC_handler_latency_yb_tserver_TabletServerAdminService_GetSafeTime);
+    load();
+  }
+};
 
 struct IOMetrics : public Metrics {
   explicit IOMetrics(const Metrics& m) : Metrics(m) {}
@@ -852,50 +864,27 @@ TEST_F(CppCassandraDriverTest, TestJsonBType) {
 
 void VerifyLongJson(const string& json) {
   // Parse JSON.
-  JsonReader r(json);
-  ASSERT_OK(r.Init());
-  const Value* json_obj = nullptr;
-  EXPECT_OK(r.ExtractObject(r.root(), NULL, &json_obj));
-  EXPECT_EQ(rapidjson::kObjectType, CHECK_NOTNULL(json_obj)->GetType());
+  JsonDocument doc;
+  auto json_obj = EXPECT_RESULT(doc.Parse(json));
 
-  EXPECT_TRUE(json_obj->HasMember("b"));
-  EXPECT_EQ(rapidjson::kNumberType, (*json_obj)["b"].GetType());
-  EXPECT_EQ(1, (*json_obj)["b"].GetInt());
+  EXPECT_EQ(1, EXPECT_RESULT(json_obj["b"].GetInt32()));
 
-  EXPECT_TRUE(json_obj->HasMember("a1"));
-  EXPECT_EQ(rapidjson::kArrayType, (*json_obj)["a1"].GetType());
-  const Value::ConstArray arr = (*json_obj)["a1"].GetArray();
+  auto arr = json_obj["a1"];
 
-  EXPECT_EQ(rapidjson::kNumberType, arr[2].GetType());
-  EXPECT_EQ(3., arr[2].GetDouble());
+  EXPECT_EQ(3., EXPECT_RESULT(arr[2].GetDouble()));
 
-  EXPECT_EQ(rapidjson::kFalseType, arr[3].GetType());
-  EXPECT_EQ(false, arr[3].GetBool());
+  EXPECT_EQ(false, EXPECT_RESULT(arr[3].GetBool()));
 
-  EXPECT_EQ(rapidjson::kTrueType, arr[4].GetType());
-  EXPECT_EQ(true, arr[4].GetBool());
+  EXPECT_EQ(true, EXPECT_RESULT(arr[4].GetBool()));
 
-  EXPECT_EQ(rapidjson::kObjectType, arr[5].GetType());
-  const Value::ConstObject obj = arr[5].GetObject();
-  EXPECT_TRUE(obj.HasMember("k2"));
-  EXPECT_EQ(rapidjson::kArrayType, obj["k2"].GetType());
-  EXPECT_EQ(rapidjson::kNumberType, obj["k2"].GetArray()[1].GetType());
-  EXPECT_EQ(200, obj["k2"].GetArray()[1].GetInt());
+  auto obj = arr[5];
+  EXPECT_EQ(200, EXPECT_RESULT(obj["k2"][1].GetInt32()));
 
-  EXPECT_TRUE(json_obj->HasMember("a"));
-  EXPECT_EQ(rapidjson::kObjectType, (*json_obj)["a"].GetType());
-  const Value::ConstObject obj_a = (*json_obj)["a"].GetObject();
+  auto obj_a = json_obj["a"];
 
-  EXPECT_TRUE(obj_a.HasMember("q"));
-  EXPECT_EQ(rapidjson::kObjectType, obj_a["q"].GetType());
-  const Value::ConstObject obj_q = obj_a["q"].GetObject();
-  EXPECT_TRUE(obj_q.HasMember("s"));
-  EXPECT_EQ(rapidjson::kNumberType, obj_q["s"].GetType());
-  EXPECT_EQ(2147483647, obj_q["s"].GetInt());
+  EXPECT_EQ(2147483647, EXPECT_RESULT(obj_a["q"]["s"].GetInt32()));
 
-  EXPECT_TRUE(obj_a.HasMember("f"));
-  EXPECT_EQ(rapidjson::kStringType, obj_a["f"].GetType());
-  EXPECT_EQ("hello", string(obj_a["f"].GetString()));
+  EXPECT_EQ("hello", EXPECT_RESULT(obj_a["f"].GetString()));
 }
 
 TEST_F(CppCassandraDriverTest, TestLongJson) {
@@ -1088,7 +1077,7 @@ TEST_F_EX(CppCassandraDriverTest, TestDeferredIndexBackfillsAfterWait,
 
   // Launch Backfill through yb-admin
   constexpr auto kAdminRpcTimeout = 5;
-  auto yb_admin_client = std::make_unique<tools::enterprise::ClusterAdminClient>(
+  auto yb_admin_client = std::make_unique<tools::ClusterAdminClient>(
       cluster_->GetMasterAddresses(), MonoDelta::FromSeconds(kAdminRpcTimeout));
   ASSERT_OK(yb_admin_client->Init());
   ASSERT_OK(yb_admin_client->LaunchBackfillIndexForTable(table_name));
@@ -1242,14 +1231,15 @@ void TestBackfillIndexTable(
         if (!backfill_job) {
           return backfill_job.status();
         }
-        const auto number_rows_processed = backfill_job->num_rows_processed();
-        return number_rows_processed >= kLowerBound;
+        const auto num_rows_read_from_table_for_backfill =
+            backfill_job->num_rows_read_from_table_for_backfill();
+        return num_rows_read_from_table_for_backfill >= kLowerBound;
       }, kMaxWait),
       "Could not get BackfillJobPB. May be OK, if the backfill is already done.");
 
   IndexPermissions perm = ASSERT_RESULT(test->client_->WaitUntilIndexPermissionsAtLeast(
       table_name, index_table_name, IndexPermissions::INDEX_PERM_READ_WRITE_AND_DELETE, kMaxWait));
-  ASSERT_TRUE(perm == IndexPermissions::INDEX_PERM_READ_WRITE_AND_DELETE);
+  ASSERT_EQ(perm, IndexPermissions::INDEX_PERM_READ_WRITE_AND_DELETE);
 
   auto main_table_size = ASSERT_RESULT(GetTableSize(&test->session_, "key_value"));
   auto index_table_size = ASSERT_RESULT(GetTableSize(&test->session_, "index_by_value"));
@@ -1345,17 +1335,14 @@ TEST_F_EX(CppCassandraDriverTest, WaitForSplitsToComplete, CppCassandraDriverTes
   const std::string table_id = ASSERT_RESULT(GetTableIdByTableName(
       client_.get(), kNamespace, kTableName));
 
-  ASSERT_OK(client_->FlushTables(
-      {table_id},
-      false /* add_indexes */,
-      3 /* timeout_secs */,
-      false /* is_compaction */));
+  ASSERT_OK(client_->FlushTables({table_id}, MonoDelta::FromSeconds(3)));
 
   // Create a split that will not complete until we set the test flag to true.
   ASSERT_OK(cluster_->SetFlagOnTServers("TEST_pause_tserver_get_split_key", "true"));
   auto proxy = cluster_->GetLeaderMasterProxy<master::MasterAdminProxy>();
   master::SplitTabletRequestPB req;
   req.set_tablet_id(tablet_to_split);
+  req.set_split_factor(cluster_->GetSplitFactor());
   master::SplitTabletResponsePB resp;
   rpc::RpcController rpc;
   rpc::RpcController controller;
@@ -1620,7 +1607,7 @@ TEST_F_EX(CppCassandraDriverTest, TestCreateUniqueIndexIntent, CppCassandraDrive
                   "Overwrite failed");
       SleepFor(MonoDelta::FromMilliseconds(kSleepTimeMs));
     } else {
-      LOG(ERROR) << "Deleting & Inserting failed for " << i;
+      LOG(WARNING) << "Deleting & Inserting failed for " << i;
     }
   }
 
@@ -1643,7 +1630,7 @@ TEST_F_EX(CppCassandraDriverTest, TestCreateUniqueIndexIntent, CppCassandraDrive
                   "Overwrite failed");
       SleepFor(MonoDelta::FromMilliseconds(kSleepTimeMs));
     } else {
-      LOG(ERROR) << "Deleting & Inserting failed for " << i;
+      LOG(WARNING) << "Deleting & Inserting failed for " << i;
     }
   }
 
@@ -1701,7 +1688,7 @@ TEST_F_EX(
           "Overwrite failed");
       SleepFor(MonoDelta::FromMilliseconds(kSleepTimeMs));
     } else {
-      LOG(ERROR) << "Deleting & Inserting failed for " << i;
+      LOG(WARNING) << "Deleting & Inserting failed for " << i;
     }
   }
 
@@ -1725,7 +1712,7 @@ TEST_F_EX(
           "Overwrite failed");
       SleepFor(MonoDelta::FromMilliseconds(kSleepTimeMs));
     } else {
-      LOG(ERROR) << "Deleting & Inserting failed for " << i;
+      LOG(WARNING) << "Deleting & Inserting failed for " << i;
     }
   }
 
@@ -1997,7 +1984,114 @@ class CppCassandraDriverTestSlowTServer : public CppCassandraDriverTest {
     flags.push_back("--ysql_num_tablets=1");
     return flags;
   }
+
+ protected:
+  void TestBackfillBatching(bool batching_enabled);
 };
+
+void CppCassandraDriverTestSlowTServer::TestBackfillBatching(bool batching_enabled) {
+  ASSERT_OK(cluster_->SetFlagOnMasters(
+      "allow_batching_non_deferred_indexes", ToString(batching_enabled)));
+  constexpr int64_t kNumTabletsPerTable = 1;
+  ASSERT_OK(cluster_->SetFlagOnTServers("ycql_num_tablets", ToString(kNumTabletsPerTable)));
+
+  TestTable<cass_int32_t, string> table;
+  auto session = ASSERT_RESULT(EstablishSession());
+  constexpr auto kNamespace = "test";
+  const YBTableName table_name(YQL_DATABASE_CQL, kNamespace, "test_table");
+  ASSERT_OK(table.CreateTable(&session_, "test.test_table", {"k", "v"}, {"(k)"}, true));
+
+  constexpr int kNumIndexes = 10;
+  int num_deferred_indexes = 0;
+  BackfillMetrics before(*cluster_);
+  std::vector<YBTableName> indexes;
+  std::vector<CassandraFuture> futures;
+  for (int i = 0; i < kNumIndexes; ++i) {
+    const YBTableName index_name(YQL_DATABASE_CQL, kNamespace, Format("idx$0", i));
+    const bool defer = i % 2 == 0;
+    futures.push_back(session_.ExecuteGetFuture(
+        Format("CREATE $0 INDEX $1 ON test_table (v)",
+               (defer ? "DEFERRED" : ""), index_name.table_name())));
+    indexes.push_back(std::move(index_name));
+    num_deferred_indexes += defer;
+  }
+
+  auto deadline = CoarseMonoClock::Now() + 20s * kTimeMultiplier;
+  for (int i = 0; i < kNumIndexes; ++i) {
+    SCOPED_TRACE(Format("Index: $0", i));
+    ASSERT_OK(futures[i].WaitFor(deadline - CoarseMonoClock::Now()));
+  }
+
+  for (const auto& index_name : indexes) {
+    const auto expected_index_state = IndexPermissions::INDEX_PERM_READ_WRITE_AND_DELETE;
+    auto perm = ASSERT_RESULT(
+        client_->WaitUntilIndexPermissionsAtLeast(table_name, index_name, expected_index_state));
+    ASSERT_EQ(perm, expected_index_state);
+  }
+
+  BackfillMetrics after(*cluster_);
+  // When batching of non-deferred index backfills is allowed, we expect to see 1 batche.
+  const int64_t kNumBatchesExpected = batching_enabled ? 1 : kNumIndexes - num_deferred_indexes;
+  const int64_t kNumApiCallsExpected = kNumBatchesExpected * kNumTabletsPerTable;
+  ASSERT_EQ(0, before.get("backfill_index"));
+  ASSERT_EQ(kNumApiCallsExpected, after.get("backfill_index"));
+  ASSERT_EQ(0, before.get("get_safe_time"));
+  ASSERT_EQ(kNumApiCallsExpected, after.get("get_safe_time"));
+}
+
+TEST_F_EX(CppCassandraDriverTest, TestBackfillBatchingEnabled, CppCassandraDriverTestSlowTServer) {
+  TestBackfillBatching(true);
+}
+
+TEST_F_EX(CppCassandraDriverTest, TestBackfillBatchingDisabled, CppCassandraDriverTestSlowTServer) {
+  TestBackfillBatching(false);
+}
+
+TEST_F_EX(CppCassandraDriverTest, ConcurrentBackfillIndexFailures, CppCassandraDriverTest) {
+  ASSERT_OK(session_.ExecuteQuery("use test;"));
+  ASSERT_OK(
+      session_.ExecuteQuery("create table test.test_table (k int, v text, PRIMARY KEY (k)) "
+                            "with transactions = {'enabled' : true} AND tablets = 10;"));
+
+  LOG(INFO) << "Creating two indexes that will NOT backfill together";
+  ASSERT_OK(cluster_->SetFlagOnMasters("allow_batching_non_deferred_indexes", "false"));
+  ASSERT_OK(cluster_->SetFlagOnMasters("TEST_block_do_backfill", "true"));
+
+  ASSERT_OK(
+      cluster_->SetFlagOnTServers("TEST_index_backfill_fail_after_random_wait_upto_ms", "1000"));
+  ASSERT_OK(session_.ExecuteQuery("CREATE INDEX test_table_index_by_v0 ON test_table (v)"));
+  ASSERT_OK(session_.ExecuteQuery("CREATE INDEX test_table_index_by_v1 ON test_table (v)"));
+
+  constexpr auto kNamespace = "test";
+  const YBTableName table_name(YQL_DATABASE_CQL, kNamespace, "test_table");
+  const YBTableName index_table_name0(YQL_DATABASE_CQL, kNamespace, "test_table_index_by_v0");
+  const YBTableName index_table_name1(YQL_DATABASE_CQL, kNamespace, "test_table_index_by_v1");
+
+  for (const auto& idx : {index_table_name0, index_table_name1}) {
+    auto perm = ASSERT_RESULT(client_->WaitUntilIndexPermissionsAtLeast(
+        table_name, idx, IndexPermissions::INDEX_PERM_DO_BACKFILL));
+    ASSERT_EQ(perm, IndexPermissions::INDEX_PERM_DO_BACKFILL);
+  }
+
+  // Allow backfill to get past GetSafeTime
+  ASSERT_OK(WaitForBackfillSafeTimeOn(cluster_.get(), table_name));
+
+  ASSERT_OK(cluster_->SetFlagOnMasters("TEST_block_do_backfill", "false"));
+
+  // Wait for the backfill to actually run to completion/failure.
+  for (const auto& idx : {index_table_name0, index_table_name1}) {
+    auto res = client_->WaitUntilIndexPermissionsAtLeast(
+        table_name, idx, IndexPermissions::INDEX_PERM_NOT_USED);
+    EXPECT_NOK(res);
+    EXPECT_TRUE(res.status().IsNotFound());
+  }
+
+  // Wait for responses from "slower tablets" to also be received, as
+  // this is what caused the master to crash prior to #20510.
+  SleepFor(MonoDelta::FromSeconds(10));
+
+  ASSERT_TRUE(cluster_->master()->IsProcessAlive());
+}
 
 TEST_F_EX(
     CppCassandraDriverTest,
@@ -2007,6 +2101,7 @@ TEST_F_EX(
   ASSERT_OK(table.CreateTable(&session_, "test.test_table", {"k", "v"}, {"(k)"}, true));
 
   LOG(INFO) << "Creating two indexes that will backfill together";
+  ASSERT_OK(cluster_->SetFlagOnMasters("TEST_block_do_backfill", "true"));
   // Create 2 indexes that backfill together. One of them will be deleted while the backfill
   // is happening. The deleted index should be successfully deleted, and the other index will
   // be successfully backfilled.
@@ -2029,6 +2124,7 @@ TEST_F_EX(
   ASSERT_OK(session_.ExecuteQuery("drop index test_table_index_by_v1"));
 
   // Wait for the backfill to actually run to completion/failure.
+  ASSERT_OK(cluster_->SetFlagOnMasters("TEST_block_do_backfill", "false"));
   SleepFor(MonoDelta::FromSeconds(10));
   res = client_->WaitUntilIndexPermissionsAtLeast(
       table_name, index_table_name1, IndexPermissions::INDEX_PERM_NOT_USED, 50ms /* max_wait */);
@@ -2121,7 +2217,7 @@ TEST_F_EX(CppCassandraDriverTest, TestCreateUniqueIndexFails, CppCassandraDriver
       IndexPermissions::INDEX_PERM_NOT_USED,
       50ms /* max_wait */);
   ASSERT_TRUE(!res.ok());
-  ASSERT_TRUE(res.status().IsNotFound());
+  ASSERT_TRUE(res.status().IsNotFound()) << res.status();
 
   ASSERT_OK(LoggedWaitFor(
       [this, index_table_name]() {
@@ -2245,8 +2341,8 @@ void DoTestCreateUniqueIndexWithOnlineWrites(CppCassandraDriverTestIndex* test,
     if (!duplicate_insert_failed) {
       LOG(INFO) << "Successfully inserted the duplicate value";
     } else {
-      LOG(ERROR) << "Giving up on inserting the duplicate value after "
-                 << kMaxRetries << " tries.";
+      LOG(WARNING) << "Giving up on inserting the duplicate value after "
+                   << kMaxRetries << " tries.";
     }
 
     LOG(INFO) << "Waited on the Create Index to finish. Status  = "
@@ -2282,6 +2378,146 @@ void DoTestCreateUniqueIndexWithOnlineWrites(CppCassandraDriverTestIndex* test,
   }
 }
 
+// Test class with a short history retention interval so we can trigger SnapshotTooOld
+// by compacting a tablet after sleeping past the retention period.
+class CppCassandraDriverTestIndexSnapshotTooOld : public CppCassandraDriverTestIndexSlow {
+ public:
+  std::vector<std::string> ExtraTServerFlags() override {
+    auto flags = CppCassandraDriverTestIndexSlow::ExtraTServerFlags();
+    flags.push_back(Format(
+        "--timestamp_history_retention_interval_sec=$0", kHistoryRetentionSec));
+    return flags;
+  }
+
+ protected:
+  static constexpr int kHistoryRetentionSec = 3;
+  const MonoDelta kHistoryRetentionInterval = MonoDelta::FromSeconds(kHistoryRetentionSec);
+};
+
+// Verify that compacting the INDEX TABLE after the history retention interval does NOT cause
+// CQL unique index backfill writes to fail with "Snapshot too old".  Although the index
+// tablet's history cutoff advances past the backfill safe time, the index table has
+// retain_delete_markers=true during backfill.  This means compaction preserves all data
+// (delete markers and regular values), so RegisterReaderTimestamp skips the SnapshotTooOld
+// check and allows the read to proceed.
+//
+// A UNIQUE index is used because unique index backfill uses QL_STMT_INSERT
+// (which sets insert_into_unique_index_ = true, require_read_ = true, and thus
+// need_read_snapshot = true), whereas non-unique uses QL_STMT_INSERT without
+// the unique key projection (require_read_ = false, need_read_snapshot = false).
+TEST_F_EX(CppCassandraDriverTest, SnapshotTooOldOnIndexWritePath,
+          CppCassandraDriverTestIndexSnapshotTooOld) {
+  constexpr auto kNamespace = "test";
+  const YBTableName table_name(YQL_DATABASE_CQL, kNamespace, "test_table");
+  const YBTableName index_table_name(YQL_DATABASE_CQL, kNamespace, "test_table_index_by_v");
+
+  TestTable<cass_int32_t, cass_int32_t> table;
+  ASSERT_OK(table.CreateTable(
+      &session_, "test.test_table", {"k", "v"}, {"(k)"}, true));
+
+  // Insert a row so backfill has something to write to the index.
+  LOG(INFO) << "Inserting initial row (1, 10)";
+  ASSERT_OK(session_.ExecuteQuery("INSERT INTO test_table (k, v) VALUES (1, 10);"));
+
+  // Block backfill.
+  ASSERT_OK(cluster_->SetFlagOnMasters("TEST_block_do_backfill", "true"));
+
+  LOG(INFO) << "Creating unique index";
+  auto s = session_.ExecuteQuery(
+      "CREATE UNIQUE INDEX test_table_index_by_v ON test_table (v);");
+  ASSERT_TRUE(CreateTableSuccessOrTimedOut(s));
+  WARN_NOT_OK(s, "Create index command failed. " + s.ToString());
+
+  // Wait for backfill to reach safe time.
+  ASSERT_OK(WaitForBackfillSafeTimeOn(cluster_.get(), table_name));
+
+  // Insert additional rows while the index is at DO_BACKFILL state (indisready).
+  // These writes go through the online write path, populating the index table with SST
+  // data.  Without this, the index table is empty and flush/compact would not advance
+  // the history cutoff.
+  LOG(INFO) << "Inserting rows to generate index SST data via online write path";
+  for (int i = 2; i <= 10; i++) {
+    ASSERT_OK(session_.ExecuteQuery(
+        Format("INSERT INTO test_table (k, v) VALUES ($0, $1);", i, i * 10)));
+  }
+
+  LOG(INFO) << "Sleep past history retention (" << kHistoryRetentionSec << "s)...";
+  SleepFor(kHistoryRetentionInterval);
+
+  // Look up the index table id so we can compact it specifically.
+  LOG(INFO) << "Get index table id...";
+  const std::string index_table_id = ASSERT_RESULT(GetTableIdByTableName(
+      client_.get(), kNamespace, "test_table_index_by_v"));
+  LOG(INFO) << "Index table id: " << index_table_id;
+
+  // Flush and compact the INDEX table to advance the index tablet's history cutoff
+  // past the backfill safe time.
+  constexpr int kTimeoutSec = 3;
+  LOG(INFO) << "Flush and compact index table...";
+  ASSERT_OK(client_->FlushTables({index_table_id}, MonoDelta::FromSeconds(kTimeoutSec)));
+  ASSERT_OK(client_->CompactTables({index_table_id}, MonoDelta::FromSeconds(kTimeoutSec)));
+
+  // Unblock backfill.
+  LOG(INFO) << "Unblock backfill...";
+  ASSERT_OK(cluster_->SetFlagOnMasters("TEST_block_do_backfill", "false"));
+
+  // The backfill write should succeed despite the index tablet's history cutoff having
+  // advanced past the backfill safe time, because retain_delete_markers=true during
+  // backfill causes RegisterReaderTimestamp to skip the SnapshotTooOld check.
+  auto perm = ASSERT_RESULT(client_->WaitUntilIndexPermissionsAtLeast(
+      table_name, index_table_name, IndexPermissions::INDEX_PERM_READ_WRITE_AND_DELETE));
+  ASSERT_EQ(perm, IndexPermissions::INDEX_PERM_READ_WRITE_AND_DELETE)
+      << "Expected index creation to succeed (retain_delete_markers prevents "
+         "SnapshotTooOld during backfill), but got permission: " << perm;
+}
+// Table starts with one row (1, 'one'). After backfill safe time, we insert another
+// row (2, 'one') with the same indexed value. The CREATE UNIQUE INDEX should fail
+// because backfill sees the original row and the concurrent insert detects a collision.
+TEST_F_EX(CppCassandraDriverTest, DuplicateInsertDuringBackfill,
+          CppCassandraDriverTestIndexSlow) {
+  constexpr auto kNamespace = "test";
+  const YBTableName table_name(YQL_DATABASE_CQL, kNamespace, "test_table");
+  const YBTableName index_table_name(YQL_DATABASE_CQL, kNamespace, "test_table_index_by_v");
+
+  TestTable<cass_int32_t, string> table;
+  ASSERT_OK(table.CreateTable(&session_, "test.test_table", {"k", "v"}, {"(k)"}, true));
+
+  LOG(INFO) << "Inserting initial row (1, 'one')";
+  ASSERT_OK(session_.ExecuteQuery("INSERT INTO test_table (k, v) VALUES (1, 'one');"));
+
+  // Block backfill.
+  ASSERT_OK(cluster_->SetFlagOnMasters("TEST_block_do_backfill", "true"));
+
+  LOG(INFO) << "Creating unique index";
+  auto s = session_.ExecuteQuery(
+      "CREATE UNIQUE INDEX test_table_index_by_v ON test_table (v);");
+  ASSERT_TRUE(CreateTableSuccessOrTimedOut(s));
+  WARN_NOT_OK(s, "Create index command failed. " + s.ToString());
+
+  // Wait for backfill to reach safe time.
+  ASSERT_OK(WaitForBackfillSafeTimeOn(cluster_.get(), table_name));
+
+  // Insert a duplicate: another row with the same indexed value v='one'.
+  LOG(INFO) << "Inserting duplicate row (2, 'one')";
+  ASSERT_OK(session_.ExecuteQuery("INSERT INTO test_table (k, v) VALUES (2, 'one');"));
+
+  // Unblock backfill.
+  ASSERT_OK(cluster_->SetFlagOnMasters("TEST_block_do_backfill", "false"));
+
+  // Wait for the index to reach at least READ_WRITE_AND_DELETE (or beyond, e.g. NOT_USED).
+  // This avoids hanging if the index unexpectedly succeeds.
+  auto perm = ASSERT_RESULT(client_->WaitUntilIndexPermissionsAtLeast(
+      table_name, index_table_name, IndexPermissions::INDEX_PERM_READ_WRITE_AND_DELETE));
+  ASSERT_NE(perm, IndexPermissions::INDEX_PERM_READ_WRITE_AND_DELETE)
+      << "Expected index creation to fail due to duplicate value v='one', but it succeeded";
+
+  // Now confirm the index is cleaned up (deleted).
+  auto res = client_->WaitUntilIndexPermissionsAtLeast(
+      table_name, index_table_name, IndexPermissions::INDEX_PERM_NOT_USED, 50ms /* max_wait */);
+  ASSERT_TRUE(!res.ok());
+  ASSERT_TRUE(res.status().IsNotFound()) << res.status();
+}
+
 TEST_F_EX(CppCassandraDriverTest, TestTableBackfillInChunks,
           CppCassandraDriverTestIndexMultipleChunks) {
   TestBackfillIndexTable(this, PKOnlyIndex::kFalse, IsUnique::kFalse,
@@ -2306,7 +2542,6 @@ class CppCassandraDriverTestWithMasterFailover : public CppCassandraDriverTestIn
   virtual std::vector<std::string> ExtraMasterFlags() {
     auto flags = CppCassandraDriverTest::ExtraMasterFlags();
     flags.push_back("--TEST_slowdown_backfill_alter_table_rpcs_ms=200");
-    flags.push_back("--vmodule=backfill_index=3,async_rpc_tasks=3");
     return flags;
   }
 
@@ -2322,7 +2557,7 @@ class CppCassandraDriverTestWithMasterFailover : public CppCassandraDriverTestIn
 
 TEST_F_EX(
     CppCassandraDriverTest, TestLogSpewDuringBackfill, CppCassandraDriverTestWithMasterFailover) {
-  FLAGS_external_mini_cluster_max_log_bytes = 50_MB;
+  ANNOTATE_UNPROTECTED_WRITE(FLAGS_external_mini_cluster_max_log_bytes) = 50_MB;
   // TestBackfillIndexTable(this, PKOnlyIndex::kFalse, IsUnique::kTrue, IncludeAllColumns::kTrue,
   //                        UserEnforced::kFalse, StepdownMasterLeader::kTrue);
   // Wait for Log spew
@@ -2501,7 +2736,6 @@ TEST_F_EX(CppCassandraDriverTest, TestDeleteAndCreateIndex, CppCassandraDriverTe
       "Request timed out");
 
   std::thread write_thread([this, table, &stop] {
-    CDSAttacher attacher;
     auto session = CHECK_RESULT(driver_->CreateSession());
     auto prepared = ASSERT_RESULT(table.PrepareInsert(&session, 10s));
     int32_t key = 0;
@@ -2920,72 +3154,54 @@ TEST_F_EX(CppCassandraDriverTest, TestInsertLocality, CppCassandraDriverTestNoPa
 class CppCassandraDriverLowSoftLimitTest : public CppCassandraDriverTest {
  public:
   std::vector<std::string> ExtraTServerFlags() override {
-    return {"--memory_limit_soft_percentage=0"s,
-            "--throttle_cql_calls_on_soft_memory_limit=false"s};
+    return {"--TEST_write_rejection_percentage=90"s,
+            "--rpc_slow_query_threshold_ms=999999999"s,
+            Format("--client_read_write_timeout_ms=$0", 2000 * kTimeMultiplier)};
   }
 };
 
 TEST_F_EX(CppCassandraDriverTest, BatchWriteDuringSoftMemoryLimit,
           CppCassandraDriverLowSoftLimitTest) {
-  FLAGS_external_mini_cluster_max_log_bytes = 512_MB;
+  constexpr int kBatchSize = 20;
+  constexpr int kNumWrites = 100;
 
-  constexpr int kBatchSize = 500;
-  constexpr int kWriters = 4;
-  constexpr int kNumMetrics = 5;
-
-  typedef TestTable<std::string, int64_t, std::string> MyTable;
-  typedef MyTable::ColumnsTuple ColumnsType;
+  using MyTable = TestTable<int64_t, std::string>;
+  using ColumnsType = MyTable::ColumnsTuple;
   MyTable table;
   ASSERT_OK(table.CreateTable(
-      &session_, "test.batch_ts_metrics_raw", {"metric_id", "ts", "value"},
-      {"(metric_id, ts)"}));
+      &session_, "test.batch_ts_metrics_raw", {"ts", "value"}, {"(ts)"}));
 
   TestThreadHolder thread_holder;
-  std::array<std::atomic<int>, kNumMetrics> metric_ts;
-  std::atomic<int> total_writes(0);
-  for (int i = 0; i != kNumMetrics; ++i) {
-    metric_ts[i].store(0);
+
+  auto session = ASSERT_RESULT(EstablishSession());
+  std::vector<CassandraFuture> futures;
+  futures.reserve(kNumWrites);
+  auto prepared = ASSERT_RESULT(table.PrepareInsert(&session));
+  int ts = 0;
+  while (futures.size() < kNumWrites) {
+    CassandraBatch batch(CassBatchType::CASS_BATCH_TYPE_LOGGED);
+    for (int i = 0; i != kBatchSize; ++i) {
+      ColumnsType tuple(ts, "value_" + std::to_string(ts));
+      auto statement = prepared.Bind();
+      table.BindInsert(&statement, tuple);
+      batch.Add(&statement);
+      ++ts;
+    }
+    futures.push_back(session.SubmitBatch(batch));
+  }
+  std::this_thread::sleep_for(1s * kTimeMultiplier);
+  int total_writes = 0;
+  for (auto& future : futures) {
+    if (!future.Ready()) {
+      continue;
+    }
+    auto status = future.Wait();
+    if (status.ok()) {
+      ++total_writes;
+    }
   }
 
-  for (int i = 0; i != kWriters; ++i) {
-    thread_holder.AddThreadFunctor(
-        [this, &stop = thread_holder.stop_flag(), &table, &metric_ts, &total_writes] {
-      SetFlagOnExit set_flag_on_exit(&stop);
-      auto session = ASSERT_RESULT(EstablishSession());
-      std::vector<CassandraFuture> futures;
-      while (!stop.load()) {
-        CassandraBatch batch(CassBatchType::CASS_BATCH_TYPE_LOGGED);
-        auto prepared = table.PrepareInsert(&session);
-        if (!prepared.ok()) {
-          // Prepare could be failed because cluster has heavy load.
-          // It is ok to just retry in this case, because we expect total number of writes.
-          continue;
-        }
-        int metric_idx = RandomUniformInt(1, kNumMetrics);
-        auto metric = "metric_" + std::to_string(metric_idx);
-        int ts = metric_ts[metric_idx - 1].fetch_add(kBatchSize);
-        for (int i = 0; i != kBatchSize; ++i) {
-          ColumnsType tuple(metric, ts, "value_" + std::to_string(ts));
-          auto statement = prepared->Bind();
-          table.BindInsert(&statement, tuple);
-          batch.Add(&statement);
-          ++ts;
-        }
-        futures.push_back(session.SubmitBatch(batch));
-        ++total_writes;
-      }
-    });
-  }
-
-  thread_holder.WaitAndStop(30s);
-  auto total_writes_value = total_writes.load();
-  LOG(INFO) << "Total writes: " << total_writes_value;
-#ifndef NDEBUG
-  auto min_total_writes = RegularBuildVsDebugVsSanitizers(750, 500, 50);
-#else
-  auto min_total_writes = 1500;
-#endif
-  ASSERT_GE(total_writes_value, min_total_writes);
+  ASSERT_GE(total_writes, 2);
 }
 
 class CppCassandraDriverBackpressureTest : public CppCassandraDriverTest {
@@ -3073,7 +3289,7 @@ class CppCassandraDriverTestThreeMasters : public CppCassandraDriverTestNoPartit
 };
 
 TEST_F_EX(CppCassandraDriverTest, ManyTables, CppCassandraDriverTestThreeMasters) {
-  FLAGS_external_mini_cluster_max_log_bytes = 512_MB;
+  ANNOTATE_UNPROTECTED_WRITE(FLAGS_external_mini_cluster_max_log_bytes) = 512_MB;
 
   constexpr int kThreads = RegularBuildVsSanitizers(5, 2);
   constexpr int kTables = RegularBuildVsSanitizers(15, 5);
@@ -3218,7 +3434,8 @@ TEST_F_EX(CppCassandraDriverTest,
   // We are now just after a cache update, so we should expect that we only get the cached value
   // for the next kCacheRefreshSecs seconds.
 
-  // Add a table to update system.partitions again.
+  // Add a table to update system.partitions again. Don't invalidate the cache on this create.
+  ASSERT_OK(cluster_->SetFlagOnMasters("invalidate_yql_partitions_cache_on_create_table", "false"));
   ASSERT_OK(AddTable());
 
   // Check that we still get the same cached version as the bg task has not run yet.
@@ -3228,6 +3445,16 @@ TEST_F_EX(CppCassandraDriverTest,
   // Wait for the cache to update.
   SleepFor(MonoDelta::FromSeconds(kCacheRefreshSecs));
   // Verify that we get the new cached value.
+  new_results = ResultsToList(ASSERT_RESULT(session_.ExecuteWithResult(statement)));
+  ASSERT_NE(old_results, new_results);
+  old_results = new_results;
+
+  // Add another table to update system.partitions again, but this time enable the gflag to
+  // invalidate the cache.
+  ASSERT_OK(cluster_->SetFlagOnMasters("invalidate_yql_partitions_cache_on_create_table", "true"));
+  ASSERT_OK(AddTable());
+
+  // The cache was invalidated, so the new results should be updated.
   new_results = ResultsToList(ASSERT_RESULT(session_.ExecuteWithResult(statement)));
   ASSERT_NE(old_results, new_results);
   old_results = new_results;

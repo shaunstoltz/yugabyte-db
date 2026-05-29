@@ -31,10 +31,8 @@
 
 #include "postgres.h"
 
-#include "px.h"
 #include "px-crypt.h"
-
-#include "utils/backend_random.h"
+#include "px.h"
 
 static char *
 run_crypt_des(const char *psw, const char *salt,
@@ -93,6 +91,8 @@ px_crypt(const char *psw, const char *salt, char *buf, unsigned len)
 {
 	const struct px_crypt_algo *c;
 
+	CheckBuiltinCryptoMode();
+
 	for (c = px_crypt_list; c->id; c++)
 	{
 		if (!c->id_len)
@@ -137,6 +137,8 @@ px_gen_salt(const char *salt_type, char *buf, int rounds)
 	char	   *p;
 	char		rbuf[16];
 
+	CheckBuiltinCryptoMode();
+
 	for (g = gen_list; g->name; g++)
 		if (pg_strcasecmp(g->name, salt_type) == 0)
 			break;
@@ -153,7 +155,7 @@ px_gen_salt(const char *salt_type, char *buf, int rounds)
 			return PXE_BAD_SALT_ROUNDS;
 	}
 
-	if (!pg_backend_random(rbuf, g->input_len))
+	if (!pg_strong_random(rbuf, g->input_len))
 		return PXE_NO_RANDOM;
 
 	p = g->gen(rounds, rbuf, g->input_len, buf, PX_MAX_SALT_LEN);

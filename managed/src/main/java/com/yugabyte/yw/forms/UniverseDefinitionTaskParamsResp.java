@@ -1,5 +1,5 @@
 /*
- * Copyright 2021 YugaByte, Inc. and Contributors
+ * Copyright 2021 YugabyteDB, Inc. and Contributors
  *
  * Licensed under the Polyform Free Trial License 1.0.0 (the "License"); you
  * may not use this file except in compliance with the License. You
@@ -20,28 +20,42 @@ import java.util.stream.Collectors;
 public class UniverseDefinitionTaskParamsResp {
 
   @JsonUnwrapped
-  @JsonIgnoreProperties({"nodeDetailsSet"})
+  @JsonIgnoreProperties({"nodeDetailsSet", "platformUrl"})
   public final UniverseDefinitionTaskParams delegate;
 
   private final Set<NodeDetailsResp> nodeDetailsSet;
 
+  private final String platformUrl;
+
   public UniverseDefinitionTaskParamsResp(
-      UniverseDefinitionTaskParams universeDefinitionTaskParams, Universe universe) {
+      UniverseDefinitionTaskParams universeDefinitionTaskParams,
+      Universe universe,
+      String localInstanceAddress) {
     this.delegate = universeDefinitionTaskParams;
     if (universeDefinitionTaskParams.nodeDetailsSet == null) {
       nodeDetailsSet = null;
     } else {
       nodeDetailsSet =
-          universeDefinitionTaskParams
-              .nodeDetailsSet
-              .stream()
+          universeDefinitionTaskParams.nodeDetailsSet.stream()
               .map(nodeDetails -> new NodeDetailsResp(nodeDetails, universe))
               .collect(Collectors.toSet());
     }
+    // After an HA switchover, the stored platformUrl reflects the previous active YBA. Prefer the
+    // current local instance's address (resolved once by the caller) so the response matches the
+    // YBA that is actually serving the request.
+    this.platformUrl =
+        localInstanceAddress != null
+            ? localInstanceAddress
+            : universeDefinitionTaskParams.platformUrl;
   }
 
   @JsonProperty(access = JsonProperty.Access.READ_ONLY)
   public Set<NodeDetailsResp> getNodeDetailsSet() {
     return nodeDetailsSet;
+  }
+
+  @JsonProperty(access = JsonProperty.Access.READ_ONLY)
+  public String getPlatformUrl() {
+    return platformUrl;
   }
 }

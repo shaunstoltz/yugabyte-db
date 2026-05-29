@@ -15,9 +15,9 @@
 // specific language governing permissions and limitations
 // under the License.
 //
-// The following only applies to changes made to this file as part of YugaByte development.
+// The following only applies to changes made to this file as part of YugabyteDB development.
 //
-// Portions Copyright (c) YugaByte, Inc.
+// Portions Copyright (c) YugabyteDB, Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License"); you may not use this file except
 // in compliance with the License.  You may obtain a copy of the License at
@@ -45,7 +45,14 @@ namespace env_util {
 // immediately returned. Otherwise, we start walking up from the directory of the current executable
 // until we are in a directory that has a subdirectory with the given name. Then we return the path
 // of that directory (not of the subdirectory).
+//
+// In cases where we fail to get the directory of the current executable, GetRootDir will return a
+// default value of "".
+// In cases where we fail to find search_for_dir, GetRootDir returns the directory of the current
+// executable.
+// In both of the above cases, GetRootDirResult will instead return a non-OK status.
 std::string GetRootDir(const std::string& search_for_dir);
+Result<std::string> GetRootDirResult(const std::string& search_for_dir);
 
 Status OpenFileForWrite(Env *env, const std::string &path,
                         std::shared_ptr<WritableFile> *file);
@@ -89,6 +96,7 @@ Status CreateDirIfMissing(Env* env, const std::string& path,
 Status CopyFile(
     Env* env, const std::string& source_path, const std::string& dest_path,
     WritableFileOptions opts = WritableFileOptions());
+Status CopyFilePermissions(const std::string& source_path, const std::string& dest_path);
 
 // Deletes a file or directory when this object goes out of scope.
 //

@@ -15,9 +15,9 @@
 // specific language governing permissions and limitations
 // under the License.
 //
-// The following only applies to changes made to this file as part of YugaByte development.
+// The following only applies to changes made to this file as part of YugabyteDB development.
 //
-// Portions Copyright (c) YugaByte, Inc.
+// Portions Copyright (c) YugabyteDB, Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License"); you may not use this file except
 // in compliance with the License.  You may obtain a copy of the License at
@@ -60,14 +60,12 @@ DECLARE_int32(heartbeat_interval_ms);
 namespace yb {
 namespace tools {
 
-using client::YBColumnSchema;
 using client::YBSchemaBuilder;
 using client::YBSession;
 using client::YBTable;
 using client::YBTableCreator;
 using client::YBTableName;
 using std::shared_ptr;
-using std::static_pointer_cast;
 using std::string;
 using std::vector;
 using strings::Substitute;
@@ -79,8 +77,8 @@ class RemoteYsckTest : public YBTest {
   RemoteYsckTest()
     : random_(SeedRandom()) {
     YBSchemaBuilder b;
-    b.AddColumn("key")->Type(INT32)->NotNull()->HashPrimaryKey();
-    b.AddColumn("int_val")->Type(INT32)->NotNull();
+    b.AddColumn("key")->Type(DataType::INT32)->NotNull()->HashPrimaryKey();
+    b.AddColumn("int_val")->Type(DataType::INT32)->NotNull();
     CHECK_OK(b.Build(&schema_));
   }
 
@@ -88,7 +86,7 @@ class RemoteYsckTest : public YBTest {
     YBTest::SetUp();
 
     // Speed up testing, saves about 700ms per TEST_F.
-    FLAGS_heartbeat_interval_ms = 10;
+    ANNOTATE_UNPROTECTED_WRITE(FLAGS_heartbeat_interval_ms) = 10;
 
     MiniClusterOptions opts;
     opts.num_tablet_servers = 3;
@@ -137,11 +135,10 @@ class RemoteYsckTest : public YBTest {
       promise->Set(status);
       return;
     }
-    shared_ptr<YBSession> session(client_->NewSession());
-    session->SetTimeout(10s);
+    auto session = client_->NewSession(10s);
 
     for (uint64_t i = 0; continue_writing.Load(); i++) {
-      std::shared_ptr<client::YBqlWriteOp> insert(table->NewQLInsert());
+      std::shared_ptr<client::YBqlWriteOp> insert(table->NewQLInsert(session->arena()));
       GenerateDataForRow(table->schema(), i, &random_, insert->mutable_request());
       status = session->TEST_ApplyAndFlush(insert);
       if (!status.ok()) {
@@ -158,11 +155,10 @@ class RemoteYsckTest : public YBTest {
   Status GenerateRowWrites(uint64_t num_rows) {
     shared_ptr<YBTable> table;
     RETURN_NOT_OK(client_->OpenTable(kTableName, &table));
-    shared_ptr<YBSession> session(client_->NewSession());
-    session->SetTimeout(10s);
+    auto session = client_->NewSession(10s);
     for (uint64_t i = 0; i < num_rows; i++) {
       VLOG(1) << "Generating write for row id " << i;
-      std::shared_ptr<client::YBqlWriteOp> insert(table->NewQLInsert());
+      std::shared_ptr<client::YBqlWriteOp> insert(table->NewQLInsert(session->arena()));
       GenerateDataForRow(table->schema(), i, &random_, insert->mutable_request());
       session->Apply(insert);
 

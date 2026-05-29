@@ -1,4 +1,4 @@
-// Copyright (c) YugaByte, Inc.
+// Copyright (c) YugabyteDB, Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License"); you may not use this file except
 // in compliance with the License.  You may obtain a copy of the License at
@@ -15,11 +15,10 @@
 
 #pragma once
 
-#include "yb/common/ybc-internal.h"
-#include "yb/common/ybc_util.h"
-
 #include "yb/util/status_fwd.h"
 
+#include "yb/yql/pggate/util/ybc-internal.h"
+#include "yb/yql/pggate/util/ybc_util.h"
 #include "yb/yql/pggate/ybc_pg_typedefs.h"
 
 namespace yb {
@@ -38,10 +37,10 @@ template<typename c_type> struct ReturnTypeMapper {
   }
 };
 
-template<> struct ReturnTypeMapper<YBCStatus> {
+template<> struct ReturnTypeMapper<YbcStatus> {
   typedef Status cxx_ret_type;
 
-  static YBCStatus ToC(cxx_ret_type cxx_value) {
+  static YbcStatus ToC(cxx_ret_type cxx_value) {
     return ::yb::ToYBCStatus(cxx_value);
   }
 };

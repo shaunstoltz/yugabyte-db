@@ -1,3 +1,5 @@
 # contrib/pg_stat_statements/yb_schedule
 
-test: pg_stat_statements
+test: yb.port.pg_stat_statements
+test: yb.orig.pg_stat_statements
+test: yb.orig.backfill_queryid

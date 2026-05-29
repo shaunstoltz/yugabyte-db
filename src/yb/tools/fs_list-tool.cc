@@ -15,9 +15,9 @@
 // specific language governing permissions and limitations
 // under the License.
 //
-// The following only applies to changes made to this file as part of YugaByte development.
+// The following only applies to changes made to this file as part of YugabyteDB development.
 //
-// Portions Copyright (c) YugaByte, Inc.
+// Portions Copyright (c) YugabyteDB, Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License"); you may not use this file except
 // in compliance with the License.  You may obtain a copy of the License at
@@ -36,15 +36,12 @@
 #include <iostream>
 #include <vector>
 
-#include <glog/logging.h>
-
 #include "yb/util/flags.h"
 #include "yb/util/logging.h"
 #include "yb/util/status.h"
 #include "yb/util/status_log.h"
 
-DEFINE_UNKNOWN_bool(verbose, false,
-            "Print additional information (e.g., log segment headers)");
+DEFINE_NON_RUNTIME_bool(verbose, false, "Print additional information (e.g., log segment headers)");
 
 namespace yb {
 namespace tools {
@@ -80,7 +77,7 @@ const vector<CommandHandler> kCommandHandlers = {
 
 void PrintUsageToStream(const string& prog_name, std::ostream* out) {
   *out << "Usage: " << prog_name << " [-verbose] "
-       << "-fs_wal_dirs <dirs> -fs_data_dirs <dirs> <command> [option] "
+       << "--fs_wal_dirs <dirs> --fs_data_dirs <dirs> <command> [option] "
        << std::endl << std::endl
        << "Commands: " << std::endl;
   for (const CommandHandler& handler : kCommandHandlers) {

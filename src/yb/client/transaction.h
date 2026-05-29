@@ -1,5 +1,5 @@
 //
-// Copyright (c) YugaByte, Inc.
+// Copyright (c) YugabyteDB, Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License"); you may not use this file except
 // in compliance with the License.  You may obtain a copy of the License at
@@ -20,13 +20,17 @@
 #include <unordered_map>
 #include <unordered_set>
 
+#include "yb/ash/ash_fwd.h"
+
 #include "yb/common/consistent_read_point.h"
 #include "yb/common/read_hybrid_time.h"
 #include "yb/common/transaction.h"
 
 #include "yb/client/client_fwd.h"
 #include "yb/client/in_flight_op.h"
+#include "yb/common/pg_types.h"
 
+#include "yb/util/status_callback.h"
 #include "yb/util/status_fwd.h"
 
 namespace yb {
@@ -46,6 +50,7 @@ struct ChildTransactionData {
   ConsistentReadPoint::HybridTimeMap local_limits;
 
   static Result<ChildTransactionData> FromPB(const ChildTransactionDataPB& data);
+  static Result<ChildTransactionData> FromPB(const LWChildTransactionDataPB& data);
 };
 
 template<class T>
@@ -82,7 +87,7 @@ class YBTransaction : public std::enable_shared_from_this<YBTransaction> {
 
  public:
   explicit YBTransaction(TransactionManager* manager,
-                         TransactionLocality locality = TransactionLocality::GLOBAL);
+                         TransactionFullLocality locality = TransactionFullLocality::Global());
 
   // Trick to allow std::make_shared with this ctor only from methods of this class.
   YBTransaction(TransactionManager* manager, const TransactionMetadata& metadata, PrivateOnlyTag);
@@ -98,6 +103,7 @@ class YBTransaction : public std::enable_shared_from_this<YBTransaction> {
   ~YBTransaction();
 
   Trace *trace();
+  void EnsureTraceCreated();
   void SetPriority(uint64_t priority);
 
   uint64_t GetPriority() const;
@@ -106,6 +112,10 @@ class YBTransaction : public std::enable_shared_from_this<YBTransaction> {
   // Transaction is unusable before Init is called.
   Status Init(
       IsolationLevel isolation, const ReadHybridTime& read_time = ReadHybridTime());
+
+  void RestartStartTime();
+
+  void SetStartTimeIfNecessary();
 
   // Allows starting a transaction that reuses an existing read point.
   void InitWithReadPoint(IsolationLevel isolation, ConsistentReadPoint&& read_point);
@@ -126,8 +136,8 @@ class YBTransaction : public std::enable_shared_from_this<YBTransaction> {
   // Aborts this transaction.
   void Abort(CoarseTimePoint deadline = CoarseTimePoint());
 
-  // Promote a local transaction into a global transaction.
-  Status PromoteToGlobal(CoarseTimePoint deadline = CoarseTimePoint());
+  // Make sure transaction is global.
+  Status EnsureGlobal(CoarseTimePoint deadline = CoarseTimePoint());
 
   // Returns transaction ID.
   const TransactionId& id() const;
@@ -158,8 +168,12 @@ class YBTransaction : public std::enable_shared_from_this<YBTransaction> {
   // Apply results from child to this parent transaction.
   // `result` should be prepared with FinishChild of child transaction.
   Status ApplyChildResult(const ChildTransactionResultPB& result);
+  Status ApplyChildResult(const LWChildTransactionResultPB& result);
 
   std::shared_future<Result<TransactionMetadata>> GetMetadata(CoarseTimePoint deadline) const;
+
+  // Returns metadata iff the transaction is ready and hasn't failed yet.
+  Result<TransactionMetadata> metadata() const;
 
   std::string ToString() const;
 
@@ -171,11 +185,54 @@ class YBTransaction : public std::enable_shared_from_this<YBTransaction> {
 
   void SetActiveSubTransaction(SubTransactionId id);
 
+  std::optional<SubTransactionMetadataPB> GetSubTransactionMetadataPB() const;
+
+  SubTransactionId IncrementAndGetSubTransactionId();
+
+  SubTransactionId GetActiveSubTransactionId() const;
+
+  Status SetPgTxnStart(int64_t pg_txn_start_us, bool using_table_locks);
+
   Status RollbackToSubTransaction(SubTransactionId id, CoarseTimePoint deadline);
 
   bool HasSubTransaction(SubTransactionId id);
 
   void SetLogPrefixTag(const LogPrefixName& name, uint64_t value);
+
+  void IncreaseMutationCounts(
+      SubTransactionId subtxn_id, const TableId& table_id, uint64_t mutation_count);
+
+  // Get aggregated mutations for each table across the whole transaction (exclude aborted
+  // sub-transactions).
+  std::vector<std::pair<TableId, uint64_t>> GetTableMutationCounts() const;
+
+  bool OldTransactionAborted() const;
+
+  // For docdb transactions of type PgClientSessionKind::kPgSession, initializes the metadata
+  // necessary for deadlock detection etc. This info is plugged in into write rpcs and the target
+  // tablet's wait-queue relies on this information to resume deadlocked session advisory lock reqs.
+  void InitPgSessionRequestVersion();
+
+  // For transactions of kind PgClientSessionKind::kPgSession, we record the background txn,
+  // if any. This info is propagated to the status tablet, which then creates an internal wait-for
+  // probe from the session level waiter -> active transaction if any which is necessary for
+  // detection of deadlocks spanning advisory locks and row-level locks (same would apply for
+  // detection of deadlocks spanning object locks, advisory locks and row locks in future).
+  void SetBackgroundTransaction(const YBTransactionPtr& background_transaction);
+
+  const ash::WaitStateInfoPtr wait_state();
+
+  // Records the Async Write OpId. Returns true if the query was recorded, false if it already
+  // existed.
+  bool RecordAsyncWrite(const TabletId& tablet_id, const OpId& op_id);
+  void RecordAsyncWriteCompletion(
+      const TabletId& tablet_id, const OpId& op_id, const Status& status);
+  // Returns the op_id the server should verify before serving a read on this tablet, so the read
+  // sees all of this transaction's pending async writes. Returns OpId::Invalid() if there are no
+  // pending writes, or IllegalState if pending writes span 2+ terms (unsupported).
+  Result<OpId> GetAsyncWriteOpIdForReadCheck(const TabletId& tablet_id) const;
+  void WaitForAsyncWrites(const TabletId& tablet_id, StdStatusCallback&& callback);
+  void SetOriginId(uint32_t origin_id);
 
  private:
   class Impl;
@@ -185,7 +242,7 @@ class YBTransaction : public std::enable_shared_from_this<YBTransaction> {
 class YBSubTransaction {
  public:
   bool active() const {
-    return highest_subtransaction_id_ >= kMinSubTransactionId;
+    return !sub_txn_.IsDefaultState();
   }
 
   void SetActiveSubTransaction(SubTransactionId id);
@@ -194,7 +251,7 @@ class YBSubTransaction {
 
   bool HasSubTransaction(SubTransactionId id) const;
 
-  const SubTransactionMetadata& get();
+  const SubTransactionMetadata& get() const;
 
   std::string ToString() const;
 
@@ -205,7 +262,7 @@ class YBSubTransaction {
 
   // Tracks the highest observed subtransaction_id. Used during "ROLLBACK TO s" to abort from s to
   // the highest live subtransaction_id.
-  SubTransactionId highest_subtransaction_id_ = 0;
+  SubTransactionId highest_subtransaction_id_ = kMinSubTransactionId;
 };
 
 } // namespace client

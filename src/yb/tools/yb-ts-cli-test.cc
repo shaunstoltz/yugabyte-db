@@ -15,9 +15,9 @@
 // specific language governing permissions and limitations
 // under the License.
 //
-// The following only applies to changes made to this file as part of YugaByte development.
+// The following only applies to changes made to this file as part of YugabyteDB development.
 //
-// Portions Copyright (c) YugaByte, Inc.
+// Portions Copyright (c) YugabyteDB, Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License"); you may not use this file except
 // in compliance with the License.  You may obtain a copy of the License at
@@ -33,7 +33,7 @@
 
 #include <boost/assign/list_of.hpp>
 #include <gtest/gtest.h>
-#include <glog/logging.h>
+#include "yb/util/logging.h"
 
 #include "yb/consensus/consensus.pb.h"
 
@@ -64,8 +64,6 @@
 using std::string;
 using std::vector;
 
-using boost::assign::list_of;
-using strings::Split;
 using strings::Substitute;
 using yb::consensus::OpIdType;
 using yb::itest::FindTabletFollowers;
@@ -91,63 +89,42 @@ string YBTsCliTest::GetTsCliToolPath() const {
   return GetToolPath(kTsCliToolName);
 }
 
-// Test setting vmodule
-TEST_F(YBTsCliTest, TestVModuleUpdate) {
+TEST_F(YBTsCliTest, SetFlagTest) {
   std::vector<std::string> ts_flags = {
       "--vmodule=foo=0,bar=1",
   };
   std::vector<std::string> master_flags = {};
-  ASSERT_NO_FATALS(StartCluster(ts_flags, master_flags));
+  ASSERT_NO_FATALS(StartCluster(
+      ts_flags, master_flags, /* num_tablet_servers */ 3, /* num_masters */ 1,
+      /* enable_ysql */ true));
 
   string exe_path = GetTsCliToolPath();
-  vector<string> argv;
-  argv.push_back(exe_path);
-  argv.push_back("--server_address");
-  argv.push_back(yb::ToString(cluster_->tablet_server(0)->bound_rpc_addr()));
-  argv.push_back("set_flag");
-  argv.push_back("vmodule");
+  auto server_addr = yb::ToString(cluster_->tablet_server(0)->bound_rpc_addr());
 
-  {
-    // Should be able to update for specified modules.
-    argv.push_back("foo=1,bar=2");
-    ASSERT_OK(Subprocess::Call(argv));
-    argv.pop_back();
-  }
+  auto run_set_flag = [&](const string& flag, const string& value,
+                          const vector<string>& extra_args = {}) {
+    vector<string> argv = {exe_path, "--server_address", server_addr};
+    for (const auto& arg : extra_args) argv.push_back(arg);
+    argv.push_back("set_flag");
+    argv.push_back(flag);
+    argv.push_back(value);
+    return Subprocess::Call(argv);
+  };
 
-  {
-    // Should be able to update for a subset of the modules specified.
-    argv.push_back("foo=1");
-    ASSERT_OK(Subprocess::Call(argv));
-    argv.pop_back();
-  }
+  // --- vmodule tests ---
+  ASSERT_OK(run_set_flag("vmodule", "foo=1,bar=2"));
+  ASSERT_OK(run_set_flag("vmodule", "foo=1"));
+  ASSERT_OK(run_set_flag("vmodule", ""));
+  ASSERT_OK(run_set_flag("vmodule", "foo=1,baz=2"));
+  ASSERT_NOK(run_set_flag("vmodule", "foo=,baz=2"));
+  ASSERT_NOK(run_set_flag("vmodule", "foo=1,=2"));
 
-  {
-    // Test with an empty string.
-    argv.push_back("");
-    ASSERT_OK(Subprocess::Call(argv));
-    argv.pop_back();
-  }
+  // --- set_flag validation tests ---
+  // Basic gflag validation failure: malformed CSV.
+  ASSERT_NOK(run_set_flag("ysql_pg_conf_csv", "a,b=1"));
 
-  {
-    // Should be able to update for any module unspecified at start-up.
-    argv.push_back("foo=1,baz=2");
-    ASSERT_OK(Subprocess::Call(argv));
-    argv.pop_back();
-  }
-
-  {
-    // Test with an empty string.
-    argv.push_back("foo=,baz=2");
-    ASSERT_NOK(Subprocess::Call(argv));
-    argv.pop_back();
-  }
-
-  {
-    // Test with an empty string.
-    argv.push_back("foo=1,=2");
-    ASSERT_NOK(Subprocess::Call(argv));
-    argv.pop_back();
-  }
+  // Extended PG validation failure: invalid GUC value.
+  ASSERT_NOK(run_set_flag("ysql_pg_conf_csv", "log_min_messages=foo"));
 }
 
 // Test deleting a tablet.
@@ -162,7 +139,7 @@ TEST_F(YBTsCliTest, TestDeleteTablet) {
   };
   ASSERT_NO_FATALS(StartCluster(ts_flags, master_flags));
 
-  TestWorkload workload(cluster_.get());
+  TestYcqlWorkload workload(cluster_.get());
   workload.Setup(); // Easy way to create a new tablet.
 
   vector<tserver::ListTabletsResponsePB::StatusAndSchemaPB> tablets;
@@ -197,7 +174,7 @@ TEST_F(YBTsCliTest, TestTabletServerReadiness) {
   MonoDelta timeout = MonoDelta::FromSeconds(kTabletTimeout);
   ASSERT_NO_FATALS(StartCluster({ "--TEST_tablet_bootstrap_delay_ms=2000"s }));
 
-  TestWorkload workload(cluster_.get());
+  TestYcqlWorkload workload(cluster_.get());
   workload.Setup(); // Easy way to create a new tablet.
 
   vector<tserver::ListTabletsResponsePB::StatusAndSchemaPB> tablets;
@@ -232,7 +209,7 @@ TEST_F(YBTsCliTest, TestManualRemoteBootstrap) {
   MonoDelta timeout = MonoDelta::FromSeconds(kTabletTimeout);
   ASSERT_NO_FATALS(StartCluster({}, {}, 3 /*num tservers*/, 1 /*num masters*/));
 
-  TestWorkload workload(cluster_.get());
+  TestYcqlWorkload workload(cluster_.get());
   workload.Setup();
   workload.Start();
 
@@ -412,15 +389,13 @@ TEST_F(YBTsCliTest, TestRefreshFlags) {
   }, MonoDelta::FromSeconds(60), "Verify updated GFlag"));
 }
 
-class YBTsCliUnsafeChangeTest : public AdminTestBase {
+class YBTsCliIntegrationTest : public AdminTestBase {
  public:
   // Figure out where the admin tool is.
-  string GetTsCliToolPath() const;
+  string GetTsCliToolPath() const { return GetToolPath(kTsCliToolName); }
 };
 
-string YBTsCliUnsafeChangeTest::GetTsCliToolPath() const {
-  return GetToolPath(kTsCliToolName);
-}
+using YBTsCliUnsafeChangeTest = YBTsCliIntegrationTest;
 
 Status RunUnsafeChangeConfig(
     YBTsCliUnsafeChangeTest* test,
@@ -451,8 +426,8 @@ Status RunUnsafeChangeConfig(
 // 6. Verify that new config doesn't contain old leader and follower1.
 TEST_F(YBTsCliUnsafeChangeTest, TestUnsafeChangeConfigOnSingleFollower) {
   MonoDelta kTimeout = MonoDelta::FromSeconds(30);
-  FLAGS_num_tablet_servers = 5;
-  FLAGS_num_replicas = 3;
+  ANNOTATE_UNPROTECTED_WRITE(FLAGS_num_tablet_servers) = 5;
+  ANNOTATE_UNPROTECTED_WRITE(FLAGS_num_replicas) = 3;
   // tserver_unresponsive_timeout_ms is useful so that master considers
   // the live tservers for tablet re-replication.
   std::vector<std::string> master_flags;
@@ -546,8 +521,8 @@ TEST_F(YBTsCliUnsafeChangeTest, TestUnsafeChangeConfigOnSingleFollower) {
 // 5. Verify that new config does not contain old followers.
 TEST_F(YBTsCliUnsafeChangeTest, TestUnsafeChangeConfigOnSingleLeader) {
   MonoDelta kTimeout = MonoDelta::FromSeconds(30);
-  FLAGS_num_tablet_servers = 5;
-  FLAGS_num_replicas = 3;
+  ANNOTATE_UNPROTECTED_WRITE(FLAGS_num_tablet_servers) = 5;
+  ANNOTATE_UNPROTECTED_WRITE(FLAGS_num_replicas) = 3;
   std::vector<std::string> master_flags;
   std::vector<std::string> ts_flags;
   master_flags.push_back("--enable_load_balancing=true");
@@ -629,8 +604,8 @@ TEST_F(YBTsCliUnsafeChangeTest, TestUnsafeChangeConfigOnSingleLeader) {
 // 5. Verify that new config does not contain old leader.
 TEST_F(YBTsCliUnsafeChangeTest, TestUnsafeChangeConfigForConfigWithTwoNodes) {
   MonoDelta kTimeout = MonoDelta::FromSeconds(30);
-  FLAGS_num_tablet_servers = 4;
-  FLAGS_num_replicas = 3;
+  ANNOTATE_UNPROTECTED_WRITE(FLAGS_num_tablet_servers) = 4;
+  ANNOTATE_UNPROTECTED_WRITE(FLAGS_num_replicas) = 3;
   std::vector<std::string> master_flags;
   std::vector<std::string> ts_flags;
   master_flags.push_back("--enable_load_balancing=true");
@@ -713,8 +688,8 @@ TEST_F(YBTsCliUnsafeChangeTest, TestUnsafeChangeConfigForConfigWithTwoNodes) {
 // 5. Verify that new config does not contain old leader and old followers.
 TEST_F(YBTsCliUnsafeChangeTest, TestUnsafeChangeConfigWithFiveReplicaConfig) {
   MonoDelta kTimeout = MonoDelta::FromSeconds(30);
-  FLAGS_num_tablet_servers = 8;
-  FLAGS_num_replicas = 5;
+  ANNOTATE_UNPROTECTED_WRITE(FLAGS_num_tablet_servers) = 8;
+  ANNOTATE_UNPROTECTED_WRITE(FLAGS_num_replicas) = 5;
   std::vector<std::string> master_flags;
   std::vector<std::string> ts_flags;
   master_flags.push_back("--enable_load_balancing=true");
@@ -809,8 +784,8 @@ TEST_F(YBTsCliUnsafeChangeTest, TestUnsafeChangeConfigWithFiveReplicaConfig) {
 //    has populated the new config.
 TEST_F(YBTsCliUnsafeChangeTest, TestUnsafeChangeConfigLeaderWithPendingConfig) {
   MonoDelta kTimeout = MonoDelta::FromSeconds(30);
-  FLAGS_num_tablet_servers = 5;
-  FLAGS_num_replicas = 3;
+  ANNOTATE_UNPROTECTED_WRITE(FLAGS_num_tablet_servers) = 5;
+  ANNOTATE_UNPROTECTED_WRITE(FLAGS_num_replicas) = 3;
   std::vector<std::string> master_flags;
   std::vector<std::string> ts_flags;
   master_flags.push_back("--enable_load_balancing=true");
@@ -904,8 +879,8 @@ TEST_F(YBTsCliUnsafeChangeTest, TestUnsafeChangeConfigLeaderWithPendingConfig) {
 //    has populated the new config.
 TEST_F(YBTsCliUnsafeChangeTest, TestUnsafeChangeConfigFollowerWithPendingConfig) {
   MonoDelta kTimeout = MonoDelta::FromSeconds(30);
-  FLAGS_num_tablet_servers = 5;
-  FLAGS_num_replicas = 3;
+  ANNOTATE_UNPROTECTED_WRITE(FLAGS_num_tablet_servers) = 5;
+  ANNOTATE_UNPROTECTED_WRITE(FLAGS_num_replicas) = 3;
   std::vector<std::string> master_flags;
   std::vector<std::string> ts_flags;
   master_flags.push_back("--enable_load_balancing=true");
@@ -1009,8 +984,8 @@ TEST_F(YBTsCliUnsafeChangeTest, TestUnsafeChangeConfigFollowerWithPendingConfig)
 // 7. Verify that a new node has populated the new config with 3 voters.
 TEST_F(YBTsCliUnsafeChangeTest, TestUnsafeChangeConfigWithPendingConfigsOnWAL) {
   MonoDelta kTimeout = MonoDelta::FromSeconds(30);
-  FLAGS_num_tablet_servers = 5;
-  FLAGS_num_replicas = 3;
+  ANNOTATE_UNPROTECTED_WRITE(FLAGS_num_tablet_servers) = 5;
+  ANNOTATE_UNPROTECTED_WRITE(FLAGS_num_replicas) = 3;
   std::vector<std::string> master_flags;
   std::vector<std::string> ts_flags;
   master_flags.push_back("--enable_load_balancing=true");
@@ -1113,8 +1088,8 @@ TEST_F(YBTsCliUnsafeChangeTest, TestUnsafeChangeConfigWithPendingConfigsOnWAL) {
 // 5. Verify that new config does not contain old followers.
 TEST_F(YBTsCliUnsafeChangeTest, TestUnsafeChangeConfigWithMultiplePendingConfigs) {
   MonoDelta kTimeout = MonoDelta::FromSeconds(30);
-  FLAGS_num_tablet_servers = 9;
-  FLAGS_num_replicas = 5;
+  ANNOTATE_UNPROTECTED_WRITE(FLAGS_num_tablet_servers) = 9;
+  ANNOTATE_UNPROTECTED_WRITE(FLAGS_num_replicas) = 5;
   // Retire the dead servers early with these settings.
   std::vector<std::string> master_flags;
   std::vector<std::string> ts_flags;
@@ -1210,6 +1185,90 @@ TEST_F(YBTsCliUnsafeChangeTest, TestUnsafeChangeConfigWithMultiplePendingConfigs
       ASSERT_NE(replica.ts_info().permanent_uuid(), old_follower->uuid());
     }
   }
+}
+
+// Flush / Compact CLI tests
+
+TEST_F_EX(YBTsCliTest, FlushTablet, YBTsCliIntegrationTest) {
+  ASSERT_NO_FATALS(BuildAndStart());
+  ASSERT_OK(CallTSCli("flush_tablet", tablet_id_));
+}
+
+TEST_F_EX(YBTsCliTest, CompactTablet, YBTsCliIntegrationTest) {
+  ASSERT_NO_FATALS(BuildAndStart());
+  ASSERT_OK(CallTSCli("compact_tablet", tablet_id_));
+}
+
+TEST_F_EX(YBTsCliTest, FlushAllTablets, YBTsCliIntegrationTest) {
+  ASSERT_NO_FATALS(BuildAndStart());
+  ASSERT_OK(CallTSCli("flush_all_tablets"));
+}
+
+TEST_F_EX(YBTsCliTest, CompactAllTablets, YBTsCliIntegrationTest) {
+  ASSERT_NO_FATALS(BuildAndStart());
+  ASSERT_OK(CallTSCli("compact_all_tablets"));
+}
+
+TEST_F_EX(YBTsCliTest, CompactTabletExcludeVectorIndexes, YBTsCliIntegrationTest) {
+  ASSERT_NO_FATALS(BuildAndStart());
+  ASSERT_OK(CallTSCli("--exclude_vector_indexes", "compact_tablet", tablet_id_));
+}
+
+TEST_F_EX(YBTsCliTest, CompactAllTabletsExcludeVectorIndexes, YBTsCliIntegrationTest) {
+  ASSERT_NO_FATALS(BuildAndStart());
+  ASSERT_OK(CallTSCli("--exclude_vector_indexes", "compact_all_tablets"));
+}
+
+TEST_F_EX(YBTsCliTest, FlushTabletExcludeVectorIndexesRejected, YBTsCliIntegrationTest) {
+  ASSERT_NO_FATALS(BuildAndStart());
+  auto result = CallTSCli("--exclude_vector_indexes", "flush_tablet", tablet_id_);
+  ASSERT_NOK(result);
+  ASSERT_STR_CONTAINS(result.status().ToString(), "exclude-vector-indexes");
+}
+
+TEST_F_EX(YBTsCliTest, TestDumpTabletData, YBTsCliIntegrationTest) {
+  ASSERT_NO_FATALS(BuildAndStart());
+
+  TestYcqlWorkload workload(cluster_.get());
+  workload.Setup();
+  workload.set_table_name(kTableName);
+  workload.set_num_write_threads(1);
+  workload.set_write_batch_size(1);
+  workload.Start();
+  workload.WaitInserted(10);
+  workload.StopAndJoin();
+
+  const auto file_path =
+      JoinPathSegments(GetTestDataDirectory(), Format("dump_$0.txt", tablet_id_));
+
+  std::vector<std::string> basic_argv = {
+      GetTsCliToolPath(), "--server_address",
+      yb::ToString(cluster_->tablet_server(0)->bound_rpc_addr()), "dump_tablet_data", tablet_id_};
+  auto argv = basic_argv;
+  argv.push_back(file_path);
+
+  std::string output;
+  ASSERT_OK(Subprocess::Call(argv, &output));
+  LOG(INFO) << "Output: " << output;
+
+  const auto row_count_prefix = "Row count: ";
+  auto row_count =
+      std::stoull(output.substr(output.find(row_count_prefix) + strlen(row_count_prefix)));
+
+  auto env = Env::Default();
+  faststring file_contents;
+  ASSERT_OK(ReadFileToString(env, file_path, &file_contents));
+  auto string_contents = file_contents.ToString();
+  LOG(INFO) << "File contents: " << string_contents;
+  uint64_t payload_count = 0;
+  size_t pos = string_contents.find(TestWorkloadOptions::kDefaultPayload, 0);
+
+  while (pos != std::string::npos) {
+    payload_count++;
+    pos = string_contents.find(
+        TestWorkloadOptions::kDefaultPayload, pos + TestWorkloadOptions::kDefaultPayload.length());
+  }
+  ASSERT_EQ(payload_count, row_count);
 }
 
 } // namespace tools

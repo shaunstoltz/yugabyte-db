@@ -1,4 +1,4 @@
-# Copyright (c) YugaByte, Inc.
+# Copyright (c) YugabyteDB, Inc.
 #
 # Licensed under the Apache License, Version 2.0 (the "License"); you may not use this file except
 # in compliance with the License.  You may obtain a copy of the License at
@@ -12,7 +12,6 @@
 #
 
 set(YB_PCH_PREFIX cqlserver)
-set(YB_PCH_DEP_LIBS opid_proto)
 
 #########################################
 # cqlserver_service_proto
@@ -39,6 +38,9 @@ ADD_YB_LIBRARY(cql_service_proto
 # CQL server
 #########################################
 
+include_directories(${YB_BUILD_ROOT}/postgres/include/server)
+include_directories("${YB_BUILD_ROOT}/postgres_build/src/include")
+
 set(CQLSERVER_SRCS
   cql_processor.cc
   cql_rpc.cc
@@ -46,6 +48,7 @@ set(CQLSERVER_SRCS
   cql_server_options.cc
   cql_service.cc
   cql_statement.cc
+  statements-path-handler.cc
   system_query_cache.cc
 )
 
@@ -61,6 +64,7 @@ target_link_libraries(yb-cql
   server_process
   ldap
   lber)
+add_dependencies(yb-cql postgres)
 
 # Tests
 set(YB_TEST_LINK_LIBS yb-cql integration-tests ${YB_MIN_TEST_LIBS})

@@ -19,7 +19,7 @@
  *		to evaluate them in.
  *
  *
- * Portions Copyright (c) 1996-2018, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2022, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  *
@@ -330,7 +330,7 @@ domain_check(Datum value, bool isnull, Oid domainType,
 	DomainIOData *my_extra = NULL;
 
 	if (mcxt == NULL)
-		mcxt = GetCurrentMemoryContext();
+		mcxt = CurrentMemoryContext;
 
 	/*
 	 * We arrange to look up the needed info just once per series of calls,

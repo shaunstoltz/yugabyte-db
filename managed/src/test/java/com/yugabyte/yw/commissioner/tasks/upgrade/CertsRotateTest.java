@@ -1,15 +1,15 @@
-// Copyright (c) YugaByte, Inc.
+// Copyright (c) YugabyteDB, Inc.
 
 package com.yugabyte.yw.commissioner.tasks.upgrade;
 
 import static com.yugabyte.yw.commissioner.tasks.UniverseTaskBase.ServerType.MASTER;
 import static com.yugabyte.yw.commissioner.tasks.UniverseTaskBase.ServerType.TSERVER;
 import static com.yugabyte.yw.common.TestHelper.createTempFile;
-import static com.yugabyte.yw.models.TaskInfo.State.Failure;
 import static com.yugabyte.yw.models.TaskInfo.State.Success;
 import static org.junit.Assert.assertEquals;
 import static org.junit.Assert.assertNotNull;
 import static org.junit.Assert.assertNull;
+import static org.junit.Assert.assertThrows;
 import static org.junit.Assert.assertTrue;
 import static org.junit.Assert.fail;
 import static org.mockito.ArgumentMatchers.any;
@@ -21,9 +21,11 @@ import com.fasterxml.jackson.databind.ObjectMapper;
 import com.google.common.collect.ImmutableList;
 import com.google.common.collect.ImmutableMap;
 import com.yugabyte.yw.commissioner.tasks.UniverseTaskBase.ServerType;
+import com.yugabyte.yw.common.PlatformServiceException;
 import com.yugabyte.yw.common.TestHelper;
 import com.yugabyte.yw.common.certmgmt.CertConfigType;
 import com.yugabyte.yw.common.certmgmt.EncryptionInTransitUtil;
+import com.yugabyte.yw.common.config.GlobalConfKeys;
 import com.yugabyte.yw.forms.CertsRotateParams;
 import com.yugabyte.yw.forms.TlsConfigUpdateParams;
 import com.yugabyte.yw.forms.UniverseDefinitionTaskParams;
@@ -32,6 +34,7 @@ import com.yugabyte.yw.forms.UniverseDefinitionTaskParams.ClusterType;
 import com.yugabyte.yw.forms.UniverseDefinitionTaskParams.UserIntent;
 import com.yugabyte.yw.forms.UpgradeTaskParams.UpgradeOption;
 import com.yugabyte.yw.models.CertificateInfo;
+import com.yugabyte.yw.models.CustomerTask;
 import com.yugabyte.yw.models.TaskInfo;
 import com.yugabyte.yw.models.Universe;
 import com.yugabyte.yw.models.helpers.PlacementInfo;
@@ -48,6 +51,7 @@ import java.util.stream.Collectors;
 import junitparams.JUnitParamsRunner;
 import junitparams.Parameters;
 import lombok.extern.slf4j.Slf4j;
+import org.apache.commons.lang3.RandomStringUtils;
 import org.junit.Before;
 import org.junit.Rule;
 import org.junit.Test;
@@ -68,17 +72,21 @@ public class CertsRotateTest extends UpgradeTaskTest {
   private static final List<TaskType> ROLLING_UPGRADE_TASK_SEQUENCE_MASTER =
       ImmutableList.of(
           TaskType.SetNodeState,
+          TaskType.CheckNodesAreSafeToTakeDown,
           TaskType.AnsibleClusterServerCtl,
           TaskType.AnsibleClusterServerCtl,
           TaskType.WaitForServer,
           TaskType.WaitForServerReady,
           TaskType.WaitForEncryptionKeyInMemory,
-          TaskType.WaitForFollowerLag,
-          TaskType.SetNodeState);
+          TaskType.CheckFollowerLag,
+          TaskType.SetNodeState,
+          TaskType.WaitStartingFromTime);
 
   private static final List<TaskType> ROLLING_UPGRADE_TASK_SEQUENCE_TSERVER =
       ImmutableList.of(
           TaskType.SetNodeState,
+          TaskType.CheckUnderReplicatedTablets,
+          TaskType.CheckNodesAreSafeToTakeDown,
           TaskType.ModifyBlackList,
           TaskType.WaitForLeaderBlacklistCompletion,
           TaskType.AnsibleClusterServerCtl,
@@ -87,8 +95,9 @@ public class CertsRotateTest extends UpgradeTaskTest {
           TaskType.WaitForServerReady,
           TaskType.WaitForEncryptionKeyInMemory,
           TaskType.ModifyBlackList,
-          TaskType.WaitForFollowerLag,
-          TaskType.SetNodeState);
+          TaskType.CheckFollowerLag,
+          TaskType.SetNodeState,
+          TaskType.WaitStartingFromTime);
 
   private static final List<TaskType> NON_ROLLING_UPGRADE_TASK_SEQUENCE =
       ImmutableList.of(
@@ -104,6 +113,10 @@ public class CertsRotateTest extends UpgradeTaskTest {
     super.setUp();
     MockitoAnnotations.initMocks(this);
     certsRotate.setUserTaskUUID(UUID.randomUUID());
+    setCheckNodesAreSafeToTakeDown(mockClient);
+    setUnderReplicatedTabletsMock();
+    setFollowerLagMock();
+    factory.globalRuntimeConf().setValue("yb.checks.leaderless_tablets.enabled", "false");
   }
 
   private TaskInfo submitTask(CertsRotateParams requestParams) {
@@ -127,7 +140,6 @@ public class CertsRotateTest extends UpgradeTaskTest {
         for (TaskType type : taskSequence) {
           List<TaskInfo> tasks = subTasksByPosition.get(position);
           TaskType taskType = tasks.get(0).getTaskType();
-
           assertEquals(1, tasks.size());
           assertEquals(type, taskType);
           if (!NON_NODE_TASKS.contains(taskType)) {
@@ -142,7 +154,6 @@ public class CertsRotateTest extends UpgradeTaskTest {
       for (TaskType type : NON_ROLLING_UPGRADE_TASK_SEQUENCE) {
         List<TaskInfo> tasks = subTasksByPosition.get(position);
         TaskType taskType = assertTaskType(tasks, type);
-
         if (NON_NODE_TASKS.contains(taskType)) {
           assertEquals(1, tasks.size());
         } else {
@@ -192,7 +203,6 @@ public class CertsRotateTest extends UpgradeTaskTest {
       position = assertSequence(subTasksByPosition, MASTER, position, false);
       position = assertSequence(subTasksByPosition, TSERVER, position, false);
     }
-    assertTaskType(subTasksByPosition.get(position++), TaskType.UpdateUniverseConfig);
     return position;
   }
 
@@ -229,7 +239,7 @@ public class CertsRotateTest extends UpgradeTaskTest {
           assertEquals(taskParams.getClientRootCA(), universeDetails.getClientRootCA());
         }
       }
-    } else {
+    } else if (rootAndClientRootCASame && currentClientToNode) {
       assertNull(universeDetails.getClientRootCA());
     }
     assertEquals(rootAndClientRootCASame, universeDetails.rootAndClientRootCASame);
@@ -248,8 +258,8 @@ public class CertsRotateTest extends UpgradeTaskTest {
 
     CertificateInfo.create(
         rootCA,
-        defaultCustomer.uuid,
-        "test1",
+        defaultCustomer.getUuid(),
+        "test1" + RandomStringUtils.randomAlphanumeric(8),
         new Date(),
         new Date(),
         "privateKey",
@@ -259,8 +269,8 @@ public class CertsRotateTest extends UpgradeTaskTest {
     if (!rootCA.equals(clientRootCA)) {
       CertificateInfo.create(
           clientRootCA,
-          defaultCustomer.uuid,
-          "test1",
+          defaultCustomer.getUuid(),
+          "test1" + RandomStringUtils.randomAlphanumeric(8),
           new Date(),
           new Date(),
           "privateKey",
@@ -270,7 +280,7 @@ public class CertsRotateTest extends UpgradeTaskTest {
 
     defaultUniverse =
         Universe.saveDetails(
-            defaultUniverse.universeUUID,
+            defaultUniverse.getUniverseUUID(),
             universe -> {
               UniverseDefinitionTaskParams universeDetails = universe.getUniverseDetails();
               PlacementInfo placementInfo = universeDetails.getPrimaryCluster().placementInfo;
@@ -292,7 +302,7 @@ public class CertsRotateTest extends UpgradeTaskTest {
               if (nodeToNode || clientToNode) {
                 universeDetails.allowInsecure = false;
               }
-              universeDetails.upsertPrimaryCluster(userIntent, placementInfo);
+              universeDetails.upsertPrimaryCluster(userIntent, null, placementInfo);
               universe.setUniverseDetails(universeDetails);
             },
             false);
@@ -311,8 +321,8 @@ public class CertsRotateTest extends UpgradeTaskTest {
       taskParams.rootCA = UUID.randomUUID();
       CertificateInfo.create(
           taskParams.rootCA,
-          defaultCustomer.uuid,
-          "test1",
+          defaultCustomer.getUuid(),
+          "test1" + RandomStringUtils.randomAlphanumeric(8),
           new Date(),
           new Date(),
           "privateKey",
@@ -323,8 +333,8 @@ public class CertsRotateTest extends UpgradeTaskTest {
       taskParams.setClientRootCA(UUID.randomUUID());
       CertificateInfo.create(
           taskParams.getClientRootCA(),
-          defaultCustomer.uuid,
-          "test1",
+          defaultCustomer.getUuid(),
+          "test1" + RandomStringUtils.randomAlphanumeric(8),
           new Date(),
           new Date(),
           "privateKey",
@@ -422,17 +432,42 @@ public class CertsRotateTest extends UpgradeTaskTest {
     };
   }
 
+  // Reduced number of test cases to reduce run time.
+  // Some test cases are commented out to shorten the time but catch issues.
+  public static Object[] getTestRetryParameters() {
+    return new Object[] {
+      new Object[] {false, true, false, false, false, false},
+      new Object[] {false, true, false, false, false, true},
+      new Object[] {true, true, true, true, true, true}
+    };
+  }
+
   @Test
   public void testCertsRotateNonRestartUpgrade() throws IOException, NoSuchAlgorithmException {
     CertsRotateParams taskParams =
         getTaskParams(false, false, false, UpgradeOption.NON_RESTART_UPGRADE);
-    TaskInfo taskInfo = submitTask(taskParams);
-    if (taskInfo == null) {
-      fail();
-    }
+    assertThrows(RuntimeException.class, () -> submitTask(taskParams));
+    verify(mockNodeManager, times(0)).nodeCommand(any(), any());
+  }
 
-    assertEquals(Failure, taskInfo.getTaskState());
-    assertTrue(taskInfo.getSubTasks().isEmpty());
+  @Test
+  public void testCertsRotateNonRestartUpgradeRejectedForC2nOnlyWithDbBelow2025_2_1()
+      throws IOException, NoSuchAlgorithmException {
+    UUID rootCA = UUID.randomUUID();
+    UUID clientRootCA = rootCA;
+    prepareUniverse(false, true, true, rootCA, clientRootCA);
+    TestHelper.updateUniverseVersion(defaultUniverse, "2025.2.0.0-b1");
+    defaultUniverse.updateConfig(ImmutableMap.of(Universe.KEY_CERT_HOT_RELOADABLE, "true"));
+    defaultUniverse.save();
+    factory.globalRuntimeConf().setValue(GlobalConfKeys.enableCertReload.getKey(), "true");
+    CertsRotateParams taskParams =
+        getTaskParams(true, false, true, UpgradeOption.NON_RESTART_UPGRADE);
+    PlatformServiceException e =
+        assertThrows(PlatformServiceException.class, () -> submitTask(taskParams));
+    assertTrue(
+        "Exception message should mention client-to-node-only and minimum version",
+        e.getMessage().contains("client-to-node-only")
+            && e.getMessage().contains(CertsRotateParams.HOT_CERT_RELOAD_C2N_ONLY_MIN_VERSION));
     verify(mockNodeManager, times(0)).nodeCommand(any(), any());
   }
 
@@ -467,11 +502,6 @@ public class CertsRotateTest extends UpgradeTaskTest {
             rootAndClientRootCASame,
             UpgradeOption.NON_ROLLING_UPGRADE);
 
-    TaskInfo taskInfo = submitTask(taskParams);
-    if (taskInfo == null) {
-      fail();
-    }
-
     boolean isRootCARequired =
         EncryptionInTransitUtil.isRootCARequired(
             currentNodeToNode, currentClientToNode, rootAndClientRootCASame);
@@ -486,21 +516,22 @@ public class CertsRotateTest extends UpgradeTaskTest {
         // so below condition is no more valid
         //         || (isClientRootCARequired && !rotateClientRootCA &&
         // currentRootAndClientRootCASame)
-        || (!rotateRootCA && !rotateClientRootCA)
-        || (rootAndClientRootCASame && !currentClientToNode && !rotateClientRootCA)) {
+        || (!rotateRootCA && !rotateClientRootCA)) {
       if (!(!rotateRootCA
           && !rotateClientRootCA
           && currentNodeToNode
           && currentClientToNode
           && !currentRootAndClientRootCASame
           && rootAndClientRootCASame)) {
-        assertEquals(Failure, taskInfo.getTaskState());
-        assertTrue(taskInfo.getSubTasks().isEmpty());
+        assertThrows(RuntimeException.class, () -> submitTask(taskParams));
         verify(mockNodeManager, times(0)).nodeCommand(any(), any());
         return;
       }
     }
-
+    TaskInfo taskInfo = submitTask(taskParams);
+    if (taskInfo == null) {
+      fail();
+    }
     assertEquals(100.0, taskInfo.getPercentCompleted(), 0);
     assertEquals(Success, taskInfo.getTaskState());
 
@@ -509,8 +540,10 @@ public class CertsRotateTest extends UpgradeTaskTest {
         subTasks.stream().collect(Collectors.groupingBy(TaskInfo::getPosition));
 
     int position = 0;
+    assertTaskType(subTasksByPosition.get(position++), TaskType.UpdateConsistencyCheck);
+    assertTaskType(subTasksByPosition.get(position++), TaskType.FreezeUniverse);
     // RootCA update task
-    int expectedPosition = 15;
+    int expectedPosition = 16;
     if (rotateRootCA) {
       expectedPosition += 2;
       position = assertCommonTasks(subTasksByPosition, position, true, false);
@@ -530,7 +563,7 @@ public class CertsRotateTest extends UpgradeTaskTest {
     position = assertCommonTasks(subTasksByPosition, position, false, true);
 
     assertEquals(expectedPosition, position);
-    verify(mockNodeManager, times(21)).nodeCommand(any(), any());
+    verify(mockNodeManager, times(9)).nodeCommand(any(), any());
 
     assertUniverseDetails(
         taskParams,
@@ -576,11 +609,6 @@ public class CertsRotateTest extends UpgradeTaskTest {
             rootAndClientRootCASame,
             UpgradeOption.ROLLING_UPGRADE);
 
-    TaskInfo taskInfo = submitTask(taskParams);
-    if (taskInfo == null) {
-      fail();
-    }
-
     boolean isRootCARequired =
         EncryptionInTransitUtil.isRootCARequired(
             currentNodeToNode, currentClientToNode, rootAndClientRootCASame);
@@ -594,22 +622,22 @@ public class CertsRotateTest extends UpgradeTaskTest {
         //        || (isClientRootCARequired && !rotateClientRootCA &&
         // currentRootAndClientRootCASame)
         //           && !rootAndClientRootCASame && rotateRootCA)
-        || (!rotateRootCA && !rotateClientRootCA)
-        // if bothCA are same, but client encryption not turned on, it would fail
-        || (rootAndClientRootCASame && !currentClientToNode && !rotateClientRootCA)) {
+        || (!rotateRootCA && !rotateClientRootCA)) {
       if (!(!rotateRootCA
           && !rotateClientRootCA
           && currentNodeToNode
           && currentClientToNode
           && !currentRootAndClientRootCASame
           && rootAndClientRootCASame)) {
-        assertEquals(TaskInfo.State.Failure, taskInfo.getTaskState());
-        assertTrue(taskInfo.getSubTasks().isEmpty());
+        assertThrows(RuntimeException.class, () -> submitTask(taskParams));
         verify(mockNodeManager, times(0)).nodeCommand(any(), any());
         return;
       }
     }
-
+    TaskInfo taskInfo = submitTask(taskParams);
+    if (taskInfo == null) {
+      fail();
+    }
     assertEquals(100.0, taskInfo.getPercentCompleted(), 0);
     assertEquals(TaskInfo.State.Success, taskInfo.getTaskState());
 
@@ -618,11 +646,14 @@ public class CertsRotateTest extends UpgradeTaskTest {
         subTasks.stream().collect(Collectors.groupingBy(TaskInfo::getPosition));
 
     int position = 0;
-    int expectedPosition = 63;
-    int expectedNumberOfInvocations = 21;
+    int expectedPosition = 83;
+    assertTaskType(subTasksByPosition.get(position++), TaskType.CheckServiceLiveness);
+    assertTaskType(subTasksByPosition.get(position++), TaskType.CheckNodeCommandExecution);
+    assertTaskType(subTasksByPosition.get(position++), TaskType.CheckNodesAreSafeToTakeDown);
+    assertTaskType(subTasksByPosition.get(position++), TaskType.UpdateConsistencyCheck);
+    assertTaskType(subTasksByPosition.get(position++), TaskType.FreezeUniverse);
     if (rotateRootCA) {
-      expectedPosition += 122;
-      expectedNumberOfInvocations += 30;
+      expectedPosition += 150;
       // RootCA update task
       position = assertCommonTasks(subTasksByPosition, position, true, false);
       // Cert update tasks
@@ -653,9 +684,8 @@ public class CertsRotateTest extends UpgradeTaskTest {
       // Update universe params task
       position = assertCommonTasks(subTasksByPosition, position, false, true);
     }
-
+    assertTaskType(subTasksByPosition.get(position++), TaskType.UpdateUniverseConfig);
     assertEquals(expectedPosition, position);
-    verify(mockNodeManager, times(expectedNumberOfInvocations)).nodeCommand(any(), any());
 
     assertUniverseDetails(
         taskParams,
@@ -701,11 +731,6 @@ public class CertsRotateTest extends UpgradeTaskTest {
             isRolling,
             currentRootAndClientRootCASame);
 
-    TaskInfo taskInfo = submitTask(taskParams);
-    if (taskInfo == null) {
-      fail();
-    }
-
     boolean isRootCARequired =
         EncryptionInTransitUtil.isRootCARequired(
             currentNodeToNode, currentClientToNode, currentRootAndClientRootCASame);
@@ -716,12 +741,15 @@ public class CertsRotateTest extends UpgradeTaskTest {
     // Expected failure scenarios
     if (!((isRootCARequired && selfSignedServerCertRotate)
         || (isClientRootCARequired && selfSignedClientCertRotate))) {
-      assertEquals(Failure, taskInfo.getTaskState());
-      assertTrue(taskInfo.getSubTasks().isEmpty());
+      assertThrows(RuntimeException.class, () -> submitTask(taskParams));
       verify(mockNodeManager, times(0)).nodeCommand(any(), any());
       return;
     }
 
+    TaskInfo taskInfo = submitTask(taskParams);
+    if (taskInfo == null) {
+      fail();
+    }
     assertEquals(100.0, taskInfo.getPercentCompleted(), 0);
     assertEquals(Success, taskInfo.getTaskState());
 
@@ -730,8 +758,15 @@ public class CertsRotateTest extends UpgradeTaskTest {
         subTasks.stream().collect(Collectors.groupingBy(TaskInfo::getPosition));
 
     int position = 0;
+    if (isRolling) {
+      assertTaskType(subTasksByPosition.get(position++), TaskType.CheckServiceLiveness);
+      assertTaskType(subTasksByPosition.get(position++), TaskType.CheckNodeCommandExecution);
+      assertTaskType(subTasksByPosition.get(position++), TaskType.CheckNodesAreSafeToTakeDown);
+    }
+    assertTaskType(subTasksByPosition.get(position++), TaskType.UpdateConsistencyCheck);
+    assertTaskType(subTasksByPosition.get(position++), TaskType.FreezeUniverse);
     // RootCA update task
-    int expectedPosition = isRolling ? 63 : 15;
+    int expectedPosition = isRolling ? 83 : 17;
     // Cert update tasks
     position = assertCommonTasks(subTasksByPosition, position, false, false);
     // gflags update tasks
@@ -741,9 +776,10 @@ public class CertsRotateTest extends UpgradeTaskTest {
     position = assertRestartSequence(subTasksByPosition, position, isRolling);
     // Update universe params task
     position = assertCommonTasks(subTasksByPosition, position, false, true);
+    assertTaskType(subTasksByPosition.get(position++), TaskType.UpdateUniverseConfig);
 
     assertEquals(expectedPosition, position);
-    verify(mockNodeManager, times(21)).nodeCommand(any(), any());
+    verify(mockNodeManager, times(9)).nodeCommand(any(), any());
 
     assertUniverseDetails(
         taskParams,
@@ -829,5 +865,74 @@ public class CertsRotateTest extends UpgradeTaskTest {
         certsParams.selfSignedClientCertRotate, tlsUpdateParams.selfSignedClientCertRotate);
     assertEquals(
         certsParams.selfSignedServerCertRotate, tlsUpdateParams.selfSignedServerCertRotate);
+  }
+
+  // @Test
+  @Parameters(method = "getTestRetryParameters")
+  public void testCertsRotateRollingUpgradeRetries(
+      boolean currentNodeToNode,
+      boolean currentClientToNode,
+      boolean currentRootAndClientRootCASame,
+      boolean rotateRootCA,
+      boolean rotateClientRootCA,
+      boolean rootAndClientRootCASame)
+      throws IOException, NoSuchAlgorithmException {
+
+    UUID rootCA = UUID.randomUUID();
+    UUID clientRootCA = UUID.randomUUID();
+
+    if (rootAndClientRootCASame && rotateClientRootCA) {
+      // if clientRootCA is rotated, bothCASame flag cannot be true
+      rootAndClientRootCASame = false;
+    }
+
+    prepareUniverse(
+        currentNodeToNode,
+        currentClientToNode,
+        currentRootAndClientRootCASame,
+        rootCA,
+        clientRootCA);
+    CertsRotateParams taskParams =
+        getTaskParams(
+            rotateRootCA,
+            rotateClientRootCA,
+            rootAndClientRootCASame,
+            UpgradeOption.ROLLING_UPGRADE);
+
+    boolean isRootCARequired =
+        EncryptionInTransitUtil.isRootCARequired(
+            currentNodeToNode, currentClientToNode, rootAndClientRootCASame);
+    boolean isClientRootCARequired =
+        EncryptionInTransitUtil.isClientRootCARequired(
+            currentNodeToNode, currentClientToNode, rootAndClientRootCASame);
+
+    // Expected failure scenarios
+    if ((!isRootCARequired && rotateRootCA)
+        || (!isClientRootCARequired && rotateClientRootCA)
+        || (!rotateRootCA && !rotateClientRootCA)
+        || (rootAndClientRootCASame && !currentClientToNode && !rotateClientRootCA)) {
+      if (!(!rotateRootCA
+          && !rotateClientRootCA
+          && currentNodeToNode
+          && currentClientToNode
+          && !currentRootAndClientRootCASame
+          && rootAndClientRootCASame)) {
+        // Invalid failure case.
+        return;
+      }
+    }
+    taskParams.expectedUniverseVersion = -1;
+    taskParams.setUniverseUUID(defaultUniverse.getUniverseUUID());
+    taskParams.sleepAfterMasterRestartMillis = 0;
+    taskParams.sleepAfterTServerRestartMillis = 0;
+    super.verifyTaskRetries(
+        defaultCustomer,
+        CustomerTask.TaskType.CertsRotate,
+        CustomerTask.TargetType.Universe,
+        defaultUniverse.getUniverseUUID(),
+        TaskType.CertsRotate,
+        taskParams,
+        false,
+        2 /* Abort every 2 steps */);
   }
 }

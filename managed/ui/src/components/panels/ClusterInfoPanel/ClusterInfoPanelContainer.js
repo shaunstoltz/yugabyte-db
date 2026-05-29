@@ -1,12 +1,11 @@
-// Copyright YugaByte Inc.
+// Copyright YugabyteDB, Inc.
 
 import { ClusterInfoPanel } from '../../panels';
 import { connect } from 'react-redux';
 
 function mapStateToProps(state) {
   return {
-    providers: state.cloud.providers,
-    insecure: !!state.customer.INSECURE_apiToken
+    providers: state.cloud.providers
   };
 }
 

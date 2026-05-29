@@ -1,4 +1,4 @@
-// Copyright (c) YugaByte, Inc.
+// Copyright (c) YugabyteDB, Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License"); you may not use this file except
 // in compliance with the License.  You may obtain a copy of the License at
@@ -17,29 +17,42 @@
 
 #include "yb/common/schema.h"
 
-#include "yb/docdb/docdb_fwd.h"
-#include "yb/docdb/doc_path.h"
-#include "yb/docdb/doc_read_context.h"
-#include "yb/docdb/shared_lock_manager_fwd.h"
 #include "yb/docdb/doc_write_batch.h"
 #include "yb/docdb/docdb_compaction_context.h"
+#include "yb/docdb/docdb_fwd.h"
+#include "yb/dockv/doc_path.h"
 
 #include "yb/master/master_replication.pb.h"
 
 #include "yb/rocksdb/compaction_filter.h"
+#include "yb/rocksdb/listener.h"
 
 namespace yb {
-namespace docdb {
+
+class Env;
+
+}
+
+namespace yb::docdb {
+
+extern const std::string kIntentsDirName;
+extern const std::string kSnapshotsDirName;
 
 Status SetValueFromQLBinaryWrapper(
-    QLValuePB ql_value,
-    const int pg_data_type,
+    const QLValuePB& ql_value, int pg_data_type,
     const std::unordered_map<uint32_t, std::string>& enum_oid_label_map,
     const std::unordered_map<uint32_t, std::vector<master::PgAttributePB>>& composite_atts_map,
-    DatumMessagePB* cdc_datum_message = NULL);
+    DatumMessagePB& datum_message);
+
+Result<std::string> QLBinaryWrapperToString(
+    const QLValuePB& ql_value, int pg_data_type,
+    const std::unordered_map<uint32_t, std::string>& enum_oid_label_map,
+    const std::unordered_map<uint32_t, std::vector<master::PgAttributePB>>& composite_atts_map);
+
+void DeleteMemoryContextForCDCWrapper();
 
 struct ExternalIntent {
-  DocPath doc_path;
+  dockv::DocPath doc_path;
   std::string value;
 };
 
@@ -47,8 +60,7 @@ struct ExternalIntent {
 // compacting the history until a certain point. This is used in the bulk load tool. This is also
 // convenient base class for GTest test classes, because it exposes member functions such as
 // rocksdb() and write_options().
-class DocDBRocksDBUtil {
-
+class DocDBRocksDBUtil : public SchemaPackingProvider {
  public:
   DocDBRocksDBUtil();
   explicit DocDBRocksDBUtil(InitMarkerBehavior init_marker_behavior);
@@ -60,6 +72,7 @@ class DocDBRocksDBUtil {
   // function BlockCacheSize.
   virtual Status InitRocksDBOptions() = 0;
   virtual std::string tablet_id() = 0;
+  virtual Schema CreateSchema() = 0;
 
   // Size of block cache for RocksDB, 0 means don't use block cache.
   virtual size_t block_cache_size() const { return 16 * 1024 * 1024; }
@@ -68,8 +81,8 @@ class DocDBRocksDBUtil {
   rocksdb::DB* intents_db();
   DocDB doc_db() { return { rocksdb(), intents_db(), &KeyBounds::kNoBounds }; }
 
-  Status InitCommonRocksDBOptionsForTests();
-  Status InitCommonRocksDBOptionsForBulkLoad();
+  Status InitCommonRocksDBOptionsForTests(const TabletId& tablet_id);
+  Status InitCommonRocksDBOptionsForBulkLoad(const TabletId& tablet_id);
 
   const rocksdb::WriteOptions& write_options() const { return write_options_; }
 
@@ -90,7 +103,8 @@ class DocDBRocksDBUtil {
       HybridTime hybrid_time = HybridTime::kInvalid,
       bool decode_dockey = true,
       bool increment_write_id = true,
-      PartialRangeKeyIntents partial_range_key_intents = PartialRangeKeyIntents::kTrue) const;
+      dockv::PartialRangeKeyIntents partial_range_key_intents =
+          dockv::PartialRangeKeyIntents::kTrue) const;
 
   // Writes the given DocWriteBatch to RocksDB. We substitue the hybrid time, if provided.
   Status WriteToRocksDB(
@@ -98,7 +112,8 @@ class DocDBRocksDBUtil {
       const HybridTime& hybrid_time,
       bool decode_dockey = true,
       bool increment_write_id = true,
-      PartialRangeKeyIntents partial_range_key_intents = PartialRangeKeyIntents::kTrue);
+      dockv::PartialRangeKeyIntents partial_range_key_intents =
+          dockv::PartialRangeKeyIntents::kTrue);
 
   // The same as WriteToRocksDB but also clears the write batch afterwards.
   Status WriteToRocksDBAndClear(DocWriteBatch* dwb, const HybridTime& hybrid_time,
@@ -107,82 +122,140 @@ class DocDBRocksDBUtil {
   // Writes value fully determined by its index using DefaultWriteBatch.
   Status WriteSimple(int index);
 
+  // Writes value fully determined by its index using DefaultWriteBatch
+  // with a randomly generated cotable prefix.
+  Result<Uuid> WriteSimpleWithCotablePrefix(int index, HybridTime write_time, Uuid cotable_id);
+
   void SetHistoryCutoffHybridTime(HybridTime history_cutoff);
 
   // Produces a string listing the contents of the entire RocksDB database, with every key and value
   // decoded as a DocDB key/value and converted to a human-readable string representation.
   std::string DocDBDebugDumpToStr();
 
+  void DocDBDebugDumpToContainer(std::unordered_set<std::string>& out);
+
+  static std::shared_ptr<LWQLValuePB> MakeLWValue(const QLValuePB& value);
+
   // ----------------------------------------------------------------------------------------------
   // SetPrimitive taking a Value
 
   Status SetPrimitive(
-      const DocPath& doc_path,
+      const dockv::DocPath& doc_path,
       const ValueRef& value,
       HybridTime hybrid_time,
       const ReadHybridTime& read_ht = ReadHybridTime::Max()) {
-    return SetPrimitive(doc_path, ValueControlFields(), value, hybrid_time, read_ht);
+    return SetPrimitive(doc_path, dockv::ValueControlFields(), value, hybrid_time, read_ht);
   }
 
   Status SetPrimitive(
-      const DocPath& doc_path,
-      const ValueControlFields& control_fields,
+      const dockv::DocPath& doc_path,
+      const dockv::ValueControlFields& control_fields,
       const ValueRef& value,
       HybridTime hybrid_time,
       const ReadHybridTime& read_ht = ReadHybridTime::Max());
 
   Status SetPrimitive(
-      const DocPath& doc_path,
+      const dockv::DocPath& doc_path,
+      const dockv::ValueControlFields& control_fields,
       const QLValuePB& value,
+      HybridTime hybrid_time,
+      const ReadHybridTime& read_ht = ReadHybridTime::Max());
+
+  Status SetPrimitive(
+      const dockv::DocPath& doc_path,
+      const QLValuePB& value,
+      HybridTime hybrid_time,
+      const ReadHybridTime& read_ht = ReadHybridTime::Max());
+
+  Status SetPrimitive(
+      const dockv::DocPath& doc_path,
+      const LWQLValuePB& value,
       HybridTime hybrid_time,
       const ReadHybridTime& read_ht = ReadHybridTime::Max());
 
   Status AddExternalIntents(
       const TransactionId& txn_id,
+      SubTransactionId subtransaction_id,
       const std::vector<ExternalIntent>& intents,
       const Uuid& involved_tablet,
       HybridTime hybrid_time);
 
+  std::pair<dockv::KeyBytes, KeyBuffer> ProcessExternalIntents(
+      const TransactionId& txn_id, SubTransactionId subtransaction_id,
+      const std::vector<ExternalIntent>& intents, const Uuid& involved_tablet);
+
   Status InsertSubDocument(
-      const DocPath& doc_path,
+      const dockv::DocPath& doc_path,
       const ValueRef& value,
       HybridTime hybrid_time,
-      MonoDelta ttl = ValueControlFields::kMaxTtl,
+      MonoDelta ttl = dockv::ValueControlFields::kMaxTtl,
+      const ReadHybridTime& read_ht = ReadHybridTime::Max());
+
+  Status InsertSubDocument(
+      const dockv::DocPath& doc_path,
+      const QLValuePB& value,
+      HybridTime hybrid_time,
+      MonoDelta ttl = dockv::ValueControlFields::kMaxTtl,
+      const ReadHybridTime& read_ht = ReadHybridTime::Max()) {
+    return InsertSubDocument(
+        doc_path, ValueRef(*MakeLWValue(value)), hybrid_time, ttl, read_ht);
+  }
+
+  Status ExtendSubDocument(
+      const dockv::DocPath& doc_path,
+      const ValueRef& value,
+      HybridTime hybrid_time,
+      MonoDelta ttl = dockv::ValueControlFields::kMaxTtl,
       const ReadHybridTime& read_ht = ReadHybridTime::Max());
 
   Status ExtendSubDocument(
-      const DocPath& doc_path,
-      const ValueRef& value,
+      const dockv::DocPath& doc_path,
+      const QLValuePB& value,
       HybridTime hybrid_time,
-      MonoDelta ttl = ValueControlFields::kMaxTtl,
-      const ReadHybridTime& read_ht = ReadHybridTime::Max());
+      MonoDelta ttl = dockv::ValueControlFields::kMaxTtl,
+      const ReadHybridTime& read_ht = ReadHybridTime::Max()) {
+    return ExtendSubDocument(
+        doc_path, ValueRef(*MakeLWValue(value)), hybrid_time, ttl, read_ht);
+  }
 
   Status ExtendList(
-      const DocPath& doc_path,
+      const dockv::DocPath& doc_path,
       const ValueRef& value,
       HybridTime hybrid_time,
       const ReadHybridTime& read_ht = ReadHybridTime::Max());
 
   Status ReplaceInList(
-      const DocPath &doc_path,
+      const dockv::DocPath &doc_path,
       const int target_cql_index,
       const ValueRef& value,
       const ReadHybridTime& read_ht,
       const HybridTime& hybrid_time,
       const rocksdb::QueryId query_id,
-      MonoDelta default_ttl = ValueControlFields::kMaxTtl,
-      MonoDelta ttl = ValueControlFields::kMaxTtl,
-      UserTimeMicros user_timestamp = ValueControlFields::kInvalidTimestamp);
+      MonoDelta default_ttl = dockv::ValueControlFields::kMaxTtl,
+      MonoDelta ttl = dockv::ValueControlFields::kMaxTtl,
+      UserTimeMicros user_timestamp = dockv::ValueControlFields::kInvalidTimestamp);
+
+  Status ReplaceInList(
+      const dockv::DocPath &doc_path,
+      const int target_cql_index,
+      const QLValuePB& value,
+      const ReadHybridTime& read_ht,
+      const HybridTime& hybrid_time,
+      const rocksdb::QueryId query_id,
+      MonoDelta default_ttl = dockv::ValueControlFields::kMaxTtl,
+      MonoDelta ttl = dockv::ValueControlFields::kMaxTtl,
+      UserTimeMicros user_timestamp = dockv::ValueControlFields::kInvalidTimestamp);
 
   Status DeleteSubDoc(
-      const DocPath& doc_path,
+      const dockv::DocPath& doc_path,
       HybridTime hybrid_time,
       const ReadHybridTime& read_ht = ReadHybridTime::Max());
 
-  void DocDBDebugDumpToConsole(
-      const SchemaPackingStorage& schema_packing_storage = SchemaPackingStorage());
+  void DocDBDebugDumpToConsole();
 
-  Status FlushRocksDbAndWait();
+  // Waits for regular DB flush. Pass `kYbBulkLoadTool` from `yb-bulk_load`; DocDB tests
+  // typically pass `kTestOnly`.
+  Status FlushRocksDbAndWait(rocksdb::FlushReason flush_reason);
 
   void SetTableTTL(uint64_t ttl_msec);
 
@@ -204,7 +277,7 @@ class DocDBRocksDBUtil {
     return ReopenRocksDB();
   }
 
-  Status ReinitDBOptions();
+  Status ReinitDBOptions(const TabletId& tablet_id);
 
   std::atomic<int64_t>& monotonic_counter() {
     return monotonic_counter_;
@@ -218,6 +291,8 @@ class DocDBRocksDBUtil {
   // Returns DocWriteBatch created with MakeDocWriteBatch.
   // Could be used when single DocWriteBatch is enough.
   DocWriteBatch& DefaultDocWriteBatch();
+
+  DocReadContext& doc_read_context();
 
  protected:
   std::string IntentsDBDir();
@@ -236,20 +311,39 @@ class DocDBRocksDBUtil {
   std::shared_ptr<ManualHistoryRetentionPolicy> retention_policy_ {
       std::make_shared<ManualHistoryRetentionPolicy>() };
   std::shared_ptr<rocksdb::CompactionFileFilterFactory> compaction_file_filter_factory_;
-  std::shared_ptr<std::function<uint64_t()>> max_file_size_for_compaction_;
+  rocksdb::CompactionFileExcluderPtr exclude_from_compaction_;
 
   rocksdb::WriteOptions write_options_;
-  DocReadContext doc_read_context_;
-  boost::optional<TransactionId> current_txn_id_;
+  std::optional<TransactionId> current_txn_id_;
   mutable IntraTxnWriteId intra_txn_write_id_ = 0;
   IsolationLevel txn_isolation_level_ = IsolationLevel::NON_TRANSACTIONAL;
   InitMarkerBehavior init_marker_behavior_ = InitMarkerBehavior::kOptional;
   HybridTime delete_marker_retention_time_ = HybridTime::kMax;
 
+  Result<CompactionSchemaInfo> CotablePacking(
+      const Uuid& table_id, uint32_t schema_version, HybridTime history_cutoff) override;
+
+  Result<CompactionSchemaInfo> ColocationPacking(
+      ColocationId colocation_id, uint32_t schema_version, HybridTime history_cutoff) override;
+
  private:
   std::atomic<int64_t> monotonic_counter_{0};
-  boost::optional<DocWriteBatch> doc_write_batch_;
+  std::optional<DocWriteBatch> doc_write_batch_;
+  std::once_flag doc_reader_context_init_once_;
+  std::shared_ptr<DocReadContext> doc_read_context_;
+  // Dummy ScopedRWOperation. It doesn't prevent underlying RocksDB from being closed, that is
+  // rather guaranteed by DocDBRocksDBUtil usage patterns.
+  // If we want to support concurrent closing of RocksDB, we can use RWOperationCounter
+  // (see tablet.cc).
+  ScopedRWOperation dummy_scoped_rw_operation_;
 };
 
-}  // namespace docdb
-}  // namespace yb
+std::string GetStorageDir(const std::string& data_dir, const std::string& storage);
+std::string GetStorageCheckpointDir(const std::string& data_dir, const std::string& storage);
+std::string GetVectorIndexStorageName(const PgVectorIdxOptionsPB& options);
+std::string GetVectorIndexChunkFileExtension(const PgVectorIdxOptionsPB& options);
+
+Status MoveChild(Env& env, const std::string& data_dir, const std::string& child);
+Status MoveChildren(Env& env, const std::string& db_dir, IncludeIntents include_intents);
+
+}  // namespace yb::docdb

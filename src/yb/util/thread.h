@@ -15,9 +15,9 @@
 // specific language governing permissions and limitations
 // under the License.
 //
-// The following only applies to changes made to this file as part of YugaByte development.
+// The following only applies to changes made to this file as part of YugabyteDB development.
 //
-// Portions Copyright (c) YugaByte, Inc.
+// Portions Copyright (c) YugabyteDB, Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License"); you may not use this file except
 // in compliance with the License.  You may obtain a copy of the License at
@@ -54,6 +54,20 @@ namespace yb {
 class MetricEntity;
 class Thread;
 class WebCallbackRegistry;
+
+struct ThreadDescriptor;
+
+const char* TEST_GetThreadLogPrefix();
+std::string TEST_GetThreadUnformattedLogPrefix();
+
+class TEST_SetThreadPrefixScoped {
+ public:
+  explicit TEST_SetThreadPrefixScoped(const std::string& prefix);
+  ~TEST_SetThreadPrefixScoped();
+
+ private:
+  std::string old_prefix_;
+};
 
 // Utility to join on a thread, printing warning messages if it
 // takes too long. For example:
@@ -126,7 +140,7 @@ typedef scoped_refptr<Thread> ThreadPtr;
 // TODO: Consider allowing fragment IDs as category parameters.
 class Thread : public RefCountedThreadSafe<Thread> {
  public:
-  static const char kPaddingChar;
+  static constexpr char kPaddingChar = 'x';
 
   // This constructor pattern mimics that in std::thread. There is
   // one constructor for each number of arguments that the thread
@@ -220,6 +234,10 @@ class Thread : public RefCountedThreadSafe<Thread> {
   // This callback is guaranteed to be called except in the case of a process crash.
   void CallAtExit(const Closure& cb);
 
+  // Abandons the thread. We will no longer join it on destruction. This is needed if you fork(),
+  // since threads are not copied on fork(), but the Thread object is.
+  void Abandon();
+
   // The thread ID assigned to this thread by the operating system. If the OS does not
   // support retrieving the tid, returns Thread::INVALID_TID.
   int64_t tid() const { return tid_; }
@@ -244,6 +262,8 @@ class Thread : public RefCountedThreadSafe<Thread> {
   // The current thread of execution, or NULL if the current thread isn't a yb::Thread.
   // This call is signal-safe.
   static Thread* current_thread() { return tls_; }
+
+  static Status SendSignal(ThreadIdForStack tid, int signal);
 
   // Returns a unique, stable identifier for this thread. Note that this is a static
   // method and thus can be used on any thread, including the main thread of the
@@ -297,6 +317,8 @@ class Thread : public RefCountedThreadSafe<Thread> {
 #endif
   }
 
+  static Result<std::string> ThreadName(int64_t thread_id);
+
   void* user_data() {
     return user_data_;
   }
@@ -319,21 +341,17 @@ class Thread : public RefCountedThreadSafe<Thread> {
   // Function object that wraps the user-supplied function to run in a separate thread.
   typedef std::function<void()> ThreadFunctor;
 
-  Thread(std::string category, std::string name, ThreadFunctor functor)
-      : thread_(0),
-        category_(std::move(category)),
-        name_(std::move(name)),
-        tid_(CHILD_WAITING_TID),
-        functor_(std::move(functor)),
-        done_(1),
-        joinable_(false) {}
+  Thread(std::string category, std::string name, ThreadFunctor functor);
 
   // Library-specific thread ID.
+  ThreadDescriptor* descriptor_ = nullptr;
   pthread_t thread_;
 
   // Name and category for this thread.
+
   const std::string category_;
   const std::string name_;
+  const std::string TEST_log_prefix_;
 
   // OS-specific thread ID. Once the constructor finishes StartThread(),
   // guaranteed to be set either to a non-negative integer, or to INVALID_TID.
@@ -391,6 +409,8 @@ class Thread : public RefCountedThreadSafe<Thread> {
   // Invoked when the user-supplied function finishes or in the case of an
   // abrupt exit (i.e. pthread_exit()). Cleans up after SuperviseThread().
   static void FinishThread(void* arg);
+
+  static Status TryStartThread(Thread* t);
 };
 
 typedef scoped_refptr<Thread> ThreadPtr;
@@ -405,10 +425,8 @@ void InitThreading();
 
 void SetThreadName(const std::string& name);
 
-class CDSAttacher {
- public:
-  CDSAttacher();
-  ~CDSAttacher();
-};
+void RenderAllThreadStacks(std::ostream& output);
+size_t CountManagedThreads();
+size_t CountStartedThreads();
 
 } // namespace yb

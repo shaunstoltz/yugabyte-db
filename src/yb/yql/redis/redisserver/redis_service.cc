@@ -1,4 +1,4 @@
-// Copyright (c) YugaByte, Inc.
+// Copyright (c) YugabyteDB, Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License"); you may not use this file except
 // in compliance with the License.  You may obtain a copy of the License at
@@ -17,7 +17,7 @@
 
 #include <boost/algorithm/string/case_conv.hpp>
 #include <boost/lockfree/queue.hpp>
-#include "yb/util/flags.h"
+#include <boost/thread/locks.hpp>
 
 #include "yb/client/client.h"
 #include "yb/client/error.h"
@@ -29,20 +29,19 @@
 #include "yb/client/yb_table_name.h"
 
 #include "yb/common/redis_protocol.pb.h"
+#include "yb/common/wire_protocol.h"
 
 #include "yb/gutil/casts.h"
-#include "yb/gutil/strings/join.h"
 
 #include "yb/master/master_heartbeat.pb.h"
 
 #include "yb/rpc/connection.h"
 #include "yb/rpc/rpc_controller.h"
-#include "yb/rpc/rpc_introspection.pb.h"
 
 #include "yb/tserver/tablet_server_interface.h"
 #include "yb/tserver/tserver_service.proxy.h"
 
-#include "yb/util/locks.h"
+#include "yb/util/flags.h"
 #include "yb/util/logging.h"
 #include "yb/util/memory/mc_types.h"
 #include "yb/util/metrics.h"
@@ -58,7 +57,7 @@
 using std::string;
 using std::vector;
 
-using yb::operator"" _MB;
+using yb::operator""_MB;
 using namespace std::literals;
 using namespace std::placeholders;
 using yb::client::YBMetaDataCache;
@@ -107,8 +106,7 @@ DEFINE_UNKNOWN_uint64(redis_max_command_size, 253_MB, "Maximum size of the comma
 
 // Maximum value size is 64MB
 DEFINE_UNKNOWN_uint64(redis_max_value_size, 64_MB, "Maximum size of the value in redis");
-DEFINE_UNKNOWN_int32(redis_callbacks_threadpool_size, 64,
-             "The maximum size for the threadpool which handles callbacks from the ybclient layer");
+DEPRECATE_FLAG(int32, redis_callbacks_threadpool_size, "02_2024");
 
 DEFINE_UNKNOWN_int32(redis_password_caching_duration_ms, 5000,
              "The duration for which we will cache the redis passwords. 0 to disable.");
@@ -216,12 +214,12 @@ class Operation {
     return operation_ ? operation_->space_used_by_request() : 0;
   }
 
-  RedisResponsePB& response() {
+  RedisResponseMsg& response() {
     switch (type_) {
       case OperationType::kRead:
-        return *down_cast<YBRedisReadOp*>(operation_.get())->mutable_response();
+        return down_cast<YBRedisReadOp*>(operation_.get())->response();
       case OperationType::kWrite:
-        return *down_cast<YBRedisWriteOp*>(operation_.get())->mutable_response();
+        return down_cast<YBRedisWriteOp*>(operation_.get())->response();
       case OperationType::kNone: FALLTHROUGH_INTENDED;
       case OperationType::kLocal:
         FATAL_INVALID_ENUM_VALUE(OperationType, type_);
@@ -261,7 +259,7 @@ class Operation {
 
   void GetKeys(RedisKeyList* keys) const {
     if (FLAGS_redis_safe_batch) {
-      keys->emplace_back(operation_ ? operation_->GetKey() : Slice());
+      keys->emplace_back(operation_ ? operation_->GetKey() : std::string_view());
     }
   }
 
@@ -294,14 +292,14 @@ class Operation {
 
     if (status.ok()) {
       if (operation_) {
-        call_->RespondSuccess(index_, metrics_, &response());
+        call_->RespondSuccess(
+            index_, metrics_, std::shared_ptr<LWRedisResponsePB>(operation_, &response()));
       } else {
-        RedisResponsePB resp;
-        call_->RespondSuccess(index_, metrics_, &resp);
+        call_->RespondSuccess(index_, metrics_, rpc::MakeSharedMessage<LWRedisResponsePB>());
       }
     } else if ((type_ == OperationType::kRead || type_ == OperationType::kWrite) &&
                response().code() == RedisResponsePB_RedisStatusCode_SERVER_ERROR) {
-      call_->Respond(index_, false, &response());
+      call_->Respond(index_, false, std::shared_ptr<LWRedisResponsePB>(operation_, &response()));
     } else {
       call_->RespondFailure(index_, status);
     }
@@ -338,9 +336,8 @@ class SessionPool {
   std::shared_ptr<client::YBSession> Take() {
     client::YBSession* result = nullptr;
     if (!queue_.pop(result)) {
-      std::lock_guard<std::mutex> lock(mutex_);
-      auto session = client_->NewSession();
-      session->SetTimeout(
+      std::lock_guard lock(mutex_);
+      auto session = client_->NewSession(
           MonoDelta::FromMilliseconds(FLAGS_redis_service_yb_client_timeout_millis));
       sessions_.push_back(session);
       allocated_sessions_metric_->IncrementBy(1);
@@ -916,6 +913,10 @@ class BatchContextImpl : public BatchContext {
     return Format("{ tablets: $0 }", tablets_);
   }
 
+  const ThreadSafeArenaPtr& arena() const override {
+    return thread_safe_arena_;
+  };
+
  private:
   template <class... Args>
   void DoApply(Args&&... args) {
@@ -979,6 +980,7 @@ class BatchContextImpl : public BatchContext {
   std::atomic<bool> retry_lookups_;
   std::atomic<size_t> lookups_left_;
   MCUnorderedMap<Slice, TabletOperations, Slice::Hash> tablets_;
+  ThreadSafeArenaPtr thread_safe_arena_ = SharedThreadSafeArena();
 };
 
 } // namespace
@@ -1040,14 +1042,9 @@ RedisServiceImplData::RedisServiceImplData(RedisServer* server, string&& yb_tier
       initialized_(false),
       server_(server) {}
 
-yb::Result<std::shared_ptr<client::YBTable>> RedisServiceImplData::GetYBTableForDB(
-    const string& db_name) {
-  std::shared_ptr<client::YBTable> table;
+Result<client::YBTablePtr> RedisServiceImplData::GetYBTableForDB(const std::string& db_name) {
   YBTableName table_name = GetYBTableNameForRedisDatabase(db_name);
-  bool was_cached = false;
-  auto res = tables_cache_->GetTable(table_name, &table, &was_cached);
-  if (!res.ok()) return res;
-  return table;
+  return tables_cache_->GetTable(table_name);
 }
 
 void RedisServiceImplData::AppendToMonitors(Connection* conn) {
@@ -1225,7 +1222,7 @@ void RedisServiceImplData::ForwardToInterestedProxies(
     const string& channel, const string& message, const IntFunctor& f) {
   auto interested_servers = GetServerAddrsForChannel(channel);
   if (!interested_servers.ok()) {
-    LOG(ERROR) << "Could not get servers to forward to " << interested_servers.status();
+    LOG(DFATAL) << "Could not get servers to forward to " << interested_servers.status();
     return;
   }
   std::shared_ptr<PublishResponseHandler> resp_handler =
@@ -1297,7 +1294,9 @@ int RedisServiceImplData::PublishToLocalClients(
     // Handle Monitor and Subscribe clients.
     for (auto connection : *clients) {
       DVLOG(3) << "Publishing to subscribed client " << connection->ToString();
-      connection->QueueOutboundData(out);
+      auto queuing_status = connection->QueueOutboundData(out);
+      LOG_IF(DFATAL, !queuing_status.ok())
+          << "Failed to queue outbound data: " << queuing_status;
       num_pushed_to++;
     }
   }
@@ -1313,7 +1312,9 @@ int RedisServiceImplData::PublishToLocalClients(
       OutboundDataPtr out = std::make_shared<yb::rpc::StringOutboundData>(
           PMessageFor(pattern, channel, message), "Publishing to Channel");
       for (auto remote : clients_subscribed_to_pattern) {
-        remote->QueueOutboundData(out);
+        auto queuing_status = remote->QueueOutboundData(out);
+        LOG_IF(DFATAL, !queuing_status.ok())
+            << "Failed to queue outbound data: " << queuing_status;
         num_pushed_to++;
       }
     }
@@ -1369,7 +1370,7 @@ void RedisServiceImplData::CleanYBTableFromCacheForDB(const string& db) {
 Status RedisServiceImplData::GetRedisPasswords(vector<string>* passwords) {
   MonoTime now = MonoTime::Now();
 
-  std::lock_guard<std::mutex> lock(redis_password_mutex_);
+  std::lock_guard lock(redis_password_mutex_);
   if (redis_cached_password_validity_expiry_.Initialized() &&
       now < redis_cached_password_validity_expiry_) {
     *passwords = redis_cached_passwords_;
@@ -1415,7 +1416,7 @@ const RedisCommandInfo* RedisServiceImpl::Impl::FetchHandler(const RedisClientCo
   }
   auto iter = command_name_to_info_map_.find(Slice(lower_cmd, len));
   if (iter == command_name_to_info_map_.end()) {
-    YB_LOG_EVERY_N_SECS(ERROR, 60)
+    YB_LOG_EVERY_N_SECS(WARNING, 60)
         << "Command " << cmd_name << " not yet supported. "
         << "Arguments: " << ToString(cmd_args) << ". "
         << "Raw: " << Slice(cmd_args[0].data(), cmd_args.back().end()).ToDebugString();
@@ -1500,13 +1501,13 @@ void RedisServiceImpl::Impl::Handle(rpc::InboundCallPtr call_ptr) {
     size_t passed_arguments = c.size() - 1;
     if (!exact_count && passed_arguments < arity) {
       // -X means that the command needs >= X arguments.
-      YB_LOG_EVERY_N_SECS(ERROR, 60)
+      YB_LOG_EVERY_N_SECS(WARNING, 60)
           << "Requested command " << c[0] << " does not have enough arguments."
           << " At least " << arity << " expected, but " << passed_arguments << " found.";
       RespondWithFailure(call, idx, "Too few arguments.");
     } else if (exact_count && passed_arguments != arity) {
       // X (> 0) means that the command needs exactly X arguments.
-      YB_LOG_EVERY_N_SECS(ERROR, 60)
+      YB_LOG_EVERY_N_SECS(WARNING, 60)
           << "Requested command " << c[0] << " has wrong number of arguments. "
           << arity << " expected, but " << passed_arguments << " found.";
       RespondWithFailure(call, idx, "Wrong number of arguments.");

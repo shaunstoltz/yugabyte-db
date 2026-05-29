@@ -1,4 +1,4 @@
-// Copyright (c) YugaByte, Inc.
+// Copyright (c) YugabyteDB, Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License"); you may not use this file except
 // in compliance with the License. You may obtain a copy of the License at
@@ -15,7 +15,7 @@ package org.yb.pgsql;
 
 import org.junit.Test;
 import org.junit.runner.RunWith;
-import org.yb.util.YBTestRunnerNonTsanOnly;
+import org.yb.YBTestRunner;
 import java.sql.Connection;
 import java.sql.Statement;
 import java.util.Map;
@@ -23,7 +23,7 @@ import java.util.Map;
 /*
  * Tests whether users can access local file servers when --ysql_disable_server_file_access = true.
  */
-@RunWith(value = YBTestRunnerNonTsanOnly.class)
+@RunWith(value = YBTestRunner.class)
 public class TestServerFileAccess extends BasePgSQLTest {
   private static final String GFLAG_ERROR_MESSAGE = "ERROR: server file access disabled";
 

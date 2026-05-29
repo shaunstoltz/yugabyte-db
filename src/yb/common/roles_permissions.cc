@@ -1,4 +1,4 @@
-// Copyright (c) YugaByte, Inc.
+// Copyright (c) YugabyteDB, Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License"); you may not use this file except
 // in compliance with the License.  You may obtain a copy of the License at
@@ -13,7 +13,7 @@
 
 #include "yb/common/roles_permissions.h"
 
-#include <glog/logging.h>
+#include "yb/util/logging.h"
 
 #include "yb/gutil/strings/substitute.h"
 

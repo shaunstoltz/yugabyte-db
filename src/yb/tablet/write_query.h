@@ -1,4 +1,4 @@
-// Copyright (c) YugaByte, Inc.
+// Copyright (c) YugabyteDB, Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License"); you may not use this file except
 // in compliance with the License.  You may obtain a copy of the License at
@@ -18,18 +18,23 @@
 #include "yb/docdb/docdb_fwd.h"
 #include "yb/docdb/docdb.h"
 #include "yb/docdb/doc_operation.h"
+#include "yb/docdb/docdb_statistics.h"
 #include "yb/docdb/lock_batch.h"
 
 #include "yb/rpc/rpc_context.h"
 
 #include "yb/tablet/tablet_fwd.h"
+#include "yb/tablet/tablet_metrics.h"
+#include "yb/tablet/transaction_participant.h"
 
-#include "yb/tserver/tserver.fwd.h"
+#include "yb/tserver/tserver_fwd.h"
 
 #include "yb/util/operation_counter.h"
 
 namespace yb {
 namespace tablet {
+
+struct UpdateQLIndexesTask;
 
 class WriteQuery {
  public:
@@ -38,8 +43,7 @@ class WriteQuery {
              WriteQueryContext* context,
              TabletPtr tablet,
              rpc::RpcContext* rpc_context,
-             tserver::WriteResponsePB *response = nullptr,
-             docdb::OperationKind kind = docdb::OperationKind::kWrite);
+             tserver::WriteResponseMsg* response = nullptr);
 
   ~WriteQuery();
 
@@ -51,7 +55,7 @@ class WriteQuery {
 
   // Returns the prepared response to the client that will be sent when this
   // transaction is completed, if this transaction was started by a client.
-  tserver::WriteResponsePB* response() {
+  tserver::WriteResponseMsg* response() {
     return response_;
   }
 
@@ -69,14 +73,10 @@ class WriteQuery {
     return &pgsql_write_ops_;
   }
 
-  docdb::OperationKind kind() const {
-    return kind_;
-  }
-
   void AdjustYsqlQueryTransactionality(size_t ysql_batch_size);
 
   HybridTime restart_read_ht() const {
-    return restart_read_ht_;
+    return read_restart_data_.restart_time;
   }
 
   CoarseTimePoint deadline() const {
@@ -96,9 +96,9 @@ class WriteQuery {
     submit_token_ = std::move(token);
   }
 
-  void set_client_request(std::reference_wrapper<const tserver::WriteRequestPB> req);
+  void set_client_request(std::reference_wrapper<const tserver::WriteRequestMsg> req);
 
-  void set_client_request(std::unique_ptr<tserver::WriteRequestPB> req);
+  void set_client_request(std::unique_ptr<tserver::WriteRequestMsg> req);
 
   void set_read_time(const ReadHybridTime& read_time) {
     read_time_ = read_time;
@@ -112,17 +112,27 @@ class WriteQuery {
   // Cancel query even before sending underlying operation to the Raft.
   void Cancel(const Status& status);
 
-  const ReadHybridTime& read_time() const {
-    return read_time_;
-  }
-
-  const tserver::WriteRequestPB* client_request() {
+  const tserver::WriteRequestMsg* client_request() {
     return client_request_;
   }
 
   std::unique_ptr<WriteOperation> PrepareSubmit();
 
+  void SetRequestStartUs(uint64_t request_start_us) { request_start_us_ = request_start_us; }
+
+  uint64_t request_start_us() const { return request_start_us_; }
+
+  // Returns response and metrics_capture type if metrics capture is enabled, nullptr otherwise.
+  std::pair<PgsqlResponseMsg*, PgsqlMetricsCaptureType> GetPgsqlResponseAndMetricsCapture() const;
+
+  ScopedTabletMetrics scoped_tablet_metrics() { return scoped_tablet_metrics_; }
+  docdb::DocDBStatistics scoped_statistics() { return scoped_statistics_; }
+
+  // Called by ReadQuery for reads that perform internal writes (e.g. row locks).
+  void set_use_async_write(bool use_async_write) { use_async_write_ = use_async_write; }
+
  private:
+  friend struct UpdateQLIndexesTask;
   enum class ExecuteMode;
 
   // Actually starts the Mvcc transaction and assigns a hybrid_time to this transaction.
@@ -134,6 +144,8 @@ class WriteQuery {
 
   void Complete(const Status& status);
 
+  void InvokeCallback(const Status& status);
+
   Status InitExecute(ExecuteMode mode);
 
   void ExecuteDone(const Status& status);
@@ -141,11 +153,15 @@ class WriteQuery {
   Result<bool> PrepareExecute();
   Status DoExecute();
 
+  Status ExecuteUnlock();
+
   void NonTransactionalConflictsResolved(HybridTime now, HybridTime result);
 
   void TransactionalConflictsResolved();
 
   Status DoTransactionalConflictsResolved();
+
+  Status PickReadTimeIfNecessary();
 
   void CompleteExecute();
 
@@ -153,13 +169,17 @@ class WriteQuery {
 
   Result<bool> SimplePrepareExecute();
   Result<bool> RedisPrepareExecute();
+  Result<bool> CqlRePrepareExecuteIfNecessary();
   Result<bool> CqlPrepareExecute();
   Result<bool> PgsqlPrepareExecute();
+  Result<bool> PgsqlPrepareLock();
+  Result<bool> ExternalWritePrepareExecute();
 
   void SimpleExecuteDone(const Status& status);
   void RedisExecuteDone(const Status& status);
   void CqlExecuteDone(const Status& status);
   void PgsqlExecuteDone(const Status& status);
+  void PgsqlLockExecuteDone(const Status& status);
 
   using IndexOps = std::vector<std::pair<
       std::shared_ptr<client::YBqlWriteOp>, docdb::QLWriteOperation*>>;
@@ -171,13 +191,20 @@ class WriteQuery {
   void CompleteQLWriteBatch(const Status& status);
 
   template <class Code, class Resp>
-  void SchemaVersionMismatch(Code code, int size, Resp* resp);
+  void SchemaVersionMismatch(Code code, size_t size, Resp* resp);
 
-  bool CqlCheckSchemaVersion();
-  bool PgsqlCheckSchemaVersion();
+  Result<bool> ExecuteSchemaVersionCheck();
+  Result<bool> CqlCheckSchemaVersion();
+  Result<bool> PgsqlCheckSchemaVersion();
+
+  void CqlRespondSchemaVersionMismatch();
+  void PgsqlRespondSchemaVersionMismatch();
+
+  void IncrementActiveWriteQueryObjectsBy(int64_t value);
 
   Result<TabletPtr> tablet_safe() const;
 
+  TabletWeakPtr tablet_;
   std::unique_ptr<WriteOperation> operation_;
 
   // The QL write operations that return rowblocks that need to be returned as RPC sidecars
@@ -205,18 +232,19 @@ class WriteQuery {
   // Pointers to the rpc context, request and response, lifecycle
   // is managed by the rpc subsystem. These pointers maybe nullptr if the
   // operation was not initiated by an RPC call.
-  const tserver::WriteRequestPB* client_request_ = nullptr;
+  const tserver::WriteRequestMsg* client_request_ = nullptr;
+  RequestScope request_scope_;
   ReadHybridTime read_time_;
   bool allow_immediate_read_restart_ = false;
-  std::unique_ptr<tserver::WriteRequestPB> client_request_holder_;
-  tserver::WriteResponsePB* response_;
-
-  docdb::OperationKind kind_;
+  std::unique_ptr<tserver::WriteRequestMsg> client_request_holder_;
+  tserver::WriteResponseMsg* response_;
 
   // this transaction's start time
-  CoarseTimePoint start_time_;
+  MonoTime start_time_;
 
-  HybridTime restart_read_ht_;
+  ReadRestartData read_restart_data_;
+
+  bool schema_version_mismatch_ = false;
 
   docdb::DocOperations doc_ops_;
 
@@ -226,8 +254,30 @@ class WriteQuery {
   ExecuteMode execute_mode_;
   IsolationLevel isolation_level_;
   docdb::PrepareDocWriteOperationResult prepare_result_;
-  RequestScope request_scope_;
   std::unique_ptr<WriteQuery> self_; // Keep self while Execute is performed.
+  // Indicates whether this WriteQuery object is currently contributing to the
+  // 'kActiveWriteQueryObjects' tablet metric.
+  bool did_update_active_write_queries_metric_ = false;
+  // Stores the start time of the underlying rpc request that created this WriteQuery.
+  // The field is consistent across failed ReadRpc/WriteRpc retries.
+  uint64_t request_start_us_ = 0;
+
+  // Metrics that are stored for the lifetime of a WriteQuery object and returned
+  // with PgsqlResponsePB.
+  ScopedTabletMetrics scoped_tablet_metrics_;
+  TabletMetrics* global_tablet_metrics_ = nullptr;
+
+  // Stores either scoped_tablet_metrics_ or global_tablet_metrics_
+  // depending on the batch_tablet_metrics_update gflag. This points
+  // to global_tablet_metrics_ once the WriteQuery object is destroyed.
+  std::shared_ptr<TabletMetricsHolder> metrics_;
+  docdb::DocDBStatistics scoped_statistics_;
+
+  // Set when the txn is in fast mode of serialization, snapshot, or read committed isolation
+  // levels.
+  FastModeTransactionScope fast_mode_txn_scope_;
+
+  bool use_async_write_ = false;
 };
 
 }  // namespace tablet

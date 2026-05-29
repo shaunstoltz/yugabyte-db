@@ -30,9 +30,9 @@
  */
 #include "postgres.h"
 
-#include "px.h"
 #include "mbuf.h"
 #include "pgp.h"
+#include "px.h"
 
 static int
 read_pubkey_keyid(PullFilter *pkt, uint8 *keyid_buf)
@@ -169,7 +169,8 @@ pgp_get_keyid(MBuf *pgp_data, char *dst)
 				break;
 			case PGP_PKT_SYMENCRYPTED_SESSKEY:
 				got_symenc_key++;
-				switch_fallthrough();
+				/* fall through */
+				yb_switch_fallthrough();
 			case PGP_PKT_SIGNATURE:
 			case PGP_PKT_MARKER:
 			case PGP_PKT_TRUST:

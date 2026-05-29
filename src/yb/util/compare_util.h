@@ -1,4 +1,4 @@
-// Copyright (c) YugaByte, Inc.
+// Copyright (c) YugabyteDB, Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License"); you may not use this file except
 // in compliance with the License.  You may obtain a copy of the License at
@@ -101,7 +101,7 @@ bool MapsEqual(const UM& map1, const UM& map2, EqualityFn equality_fn) {
     true YB_FIELDS_EQUALS(BOOST_PP_NIL, __VA_ARGS__)
 
 #define YB_CLASS_EQUALS(...) \
-    true YB_FIELDS_TO_STRING((BOOST_PP_IDENTITY(_)), __VA_ARGS__)
+    true YB_FIELDS_EQUALS((BOOST_PP_IDENTITY(_)), __VA_ARGS__)
 
 #else
 #error "Compiler not supported -- BOOST_PP_VARIADICS is not set. See https://bit.ly/2ZF7rTu."

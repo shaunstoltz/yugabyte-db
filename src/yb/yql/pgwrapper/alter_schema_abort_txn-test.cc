@@ -1,4 +1,4 @@
-// Copyright (c) YugaByte, Inc.
+// Copyright (c) YugabyteDB, Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License"); you may not use this file except
 // in compliance with the License.  You may obtain a copy of the License at
@@ -21,12 +21,12 @@ namespace pgwrapper {
 class AlterSchemaAbortTxnTest : public PgMiniTestBase {
  public:
   void SetUp() override {
-    FLAGS_TEST_fail_alter_schema_after_abort_transactions = true;
+    ANNOTATE_UNPROTECTED_WRITE(FLAGS_TEST_fail_alter_schema_after_abort_transactions) = true;
     PgMiniTestBase::SetUp();
   }
 };
 
-TEST_F(AlterSchemaAbortTxnTest, YB_DISABLE_TEST_IN_TSAN(AlterSchemaFailure)) {
+TEST_F(AlterSchemaAbortTxnTest, AlterSchemaFailure) {
   auto resource_conn = ASSERT_RESULT(Connect());
   ASSERT_OK(resource_conn.Execute("CREATE TABLE p (a INT, b INT)"));
   ASSERT_OK(resource_conn.Execute("INSERT INTO p VALUES (1)"));
@@ -46,7 +46,7 @@ TEST_F(AlterSchemaAbortTxnTest, YB_DISABLE_TEST_IN_TSAN(AlterSchemaFailure)) {
   ASSERT_OK(txn_conn.Execute("COMMIT"));
 
 
-  auto value = ASSERT_RESULT(ddl_conn.FetchValue<PGUint64>(Format("SELECT COUNT(*) FROM $0", "p")));
+  auto value = ASSERT_RESULT(ddl_conn.FetchRow<PGUint64>(Format("SELECT COUNT(*) FROM $0", "p")));
   ASSERT_EQ(value, 2);
 }
 

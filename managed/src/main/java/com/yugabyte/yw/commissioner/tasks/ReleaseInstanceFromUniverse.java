@@ -1,5 +1,5 @@
 /*
- * Copyright 2019 YugaByte, Inc. and Contributors
+ * Copyright 2019 YugabyteDB, Inc. and Contributors
  *
  * Licensed under the Polyform Free Trial License 1.0.0 (the "License"); you
  * may not use this file except in compliance with the License. You
@@ -10,6 +10,8 @@
 
 package com.yugabyte.yw.commissioner.tasks;
 
+import static play.mvc.Http.Status.BAD_REQUEST;
+
 import com.yugabyte.yw.commissioner.BaseTaskDependencies;
 import com.yugabyte.yw.commissioner.Common.CloudType;
 import com.yugabyte.yw.commissioner.ITask.Retryable;
@@ -17,8 +19,10 @@ import com.yugabyte.yw.commissioner.UserTaskDetails.SubTaskGroupType;
 import com.yugabyte.yw.commissioner.tasks.params.NodeTaskParams;
 import com.yugabyte.yw.common.DnsManager;
 import com.yugabyte.yw.common.NodeActionType;
+import com.yugabyte.yw.common.PlatformServiceException;
 import com.yugabyte.yw.common.Util;
-import com.yugabyte.yw.forms.UniverseDefinitionTaskParams.UserIntent;
+import com.yugabyte.yw.models.NodeInstance;
+import com.yugabyte.yw.models.Provider;
 import com.yugabyte.yw.models.Universe;
 import com.yugabyte.yw.models.helpers.NodeDetails;
 import com.yugabyte.yw.models.helpers.NodeDetails.NodeState;
@@ -44,28 +48,61 @@ public class ReleaseInstanceFromUniverse extends UniverseTaskBase {
     return (NodeTaskParams) taskParams;
   }
 
+  private void runBasicChecks(Universe universe) {
+    NodeDetails currentNode = universe.getNode(taskParams().nodeName);
+    if (currentNode == null) {
+      String msg = "No node " + taskParams().nodeName + " found in universe " + universe.getName();
+      log.error(msg);
+      throw new RuntimeException(msg);
+    }
+
+    if (isFirstTry()) {
+      currentNode.validateActionOnState(NodeActionType.RELEASE);
+    }
+  }
+
+  @Override
+  public void validateParams(boolean isFirstTry) {
+    super.validateParams(isFirstTry);
+    runBasicChecks(getUniverse());
+  }
+
+  @Override
+  protected void createPrecheckTasks(Universe universe) {
+    super.createPrecheckTasks(universe);
+    // Check again after locking.
+    runBasicChecks(universe);
+    NodeDetails currentNode = universe.getNode(taskParams().nodeName);
+    Provider provider = Util.getProviderForNode(currentNode, universe);
+    if (provider.getCloudCode() == CloudType.onprem) {
+      NodeInstance.maybeGetByName(currentNode.nodeName, currentNode.nodeUuid)
+          .orElseThrow(
+              () -> {
+                String errMsg =
+                    String.format(
+                        "Node instance %s with UUID %s does not exist",
+                        currentNode.nodeName, currentNode.nodeUuid);
+                log.error(errMsg);
+                return new PlatformServiceException(BAD_REQUEST, errMsg);
+              });
+    }
+    createCheckNodeSafeToDeleteTasks(universe, Collections.singleton(currentNode));
+  }
+
   @Override
   public void run() {
     log.info(
         "Started {} task for node {} in univ uuid={}",
         getName(),
         taskParams().nodeName,
-        taskParams().universeUUID);
-    NodeDetails currentNode = null;
+        taskParams().getUniverseUUID());
+    checkUniverseVersion();
+    Universe universe =
+        lockAndFreezeUniverseForUpdate(
+            taskParams().expectedUniverseVersion, null /* Txn callback */);
     try {
-      checkUniverseVersion();
-
-      // Set the 'updateInProgress' flag to prevent other updates from happening.
-      Universe universe = lockUniverseForUpdate(taskParams().expectedUniverseVersion);
-
-      currentNode = universe.getNode(taskParams().nodeName);
-      if (currentNode == null) {
-        String msg = "No node " + taskParams().nodeName + " found in universe " + universe.name;
-        log.error(msg);
-        throw new RuntimeException(msg);
-      }
-
-      currentNode.validateActionOnState(NodeActionType.RELEASE);
+      NodeDetails currentNode = universe.getNode(taskParams().nodeName);
+      Provider provider = Util.getProviderForNode(currentNode, universe);
 
       preTaskActions();
 
@@ -78,47 +115,71 @@ public class ReleaseInstanceFromUniverse extends UniverseTaskBase {
       taskParams().nodeUuid = currentNode.nodeUuid;
       Collection<NodeDetails> currentNodeDetails = Collections.singleton(currentNode);
 
-      // Wait for Master Leader before doing Master operations, like blacklisting.
-      createWaitForMasterLeaderTask().setSubTaskGroupType(SubTaskGroupType.ReleasingInstance);
-      // If the node fails in Adding state during ADD action, IP may not be available.
-      // Check to make sure that the node IP is available.
-      if (Util.getNodeIp(universe, currentNode) != null) {
-        // Create a task for removal of this server from blacklist on master leader.
-        createModifyBlackListTask(
-                currentNodeDetails, false /* isAdd */, false /* isLeaderBlacklist */)
-            .setSubTaskGroupType(SubTaskGroupType.ReleasingInstance);
-      }
-      UserIntent userIntent =
-          universe.getUniverseDetails().getClusterByUuid(currentNode.placementUuid).userIntent;
+      boolean instanceExists = instanceExists(taskParams());
       // Method instanceExists also checks for on-prem.
-      if (instanceExists(taskParams())) {
-        if (userIntent.providerType == CloudType.onprem) {
+      if (instanceExists) {
+        if (provider.getCloudCode() == CloudType.onprem) {
           // Stop master and tservers.
-          createStopServerTasks(currentNodeDetails, ServerType.MASTER, true /* isForceDelete */)
+          createStopServerTasks(
+                  currentNodeDetails,
+                  ServerType.MASTER,
+                  params -> {
+                    params.isIgnoreError = true;
+                    params.deconfigure = true;
+                  })
               .setSubTaskGroupType(SubTaskGroupType.StoppingNodeProcesses);
-          createStopServerTasks(currentNodeDetails, ServerType.TSERVER, true /* isForceDelete */)
+          createStopServerTasks(
+                  currentNodeDetails,
+                  ServerType.TSERVER,
+                  params -> {
+                    params.isIgnoreError = true;
+                    params.deconfigure = true;
+                  })
               .setSubTaskGroupType(SubTaskGroupType.StoppingNodeProcesses);
           if (universe.isYbcEnabled()) {
             createStopYbControllerTasks(new HashSet<>(currentNodeDetails), true /*isIgnoreError*/)
                 .setSubTaskGroupType(SubTaskGroupType.StoppingNodeProcesses);
           }
         }
+      }
 
-        // Set the node states to Removing.
+      // Wait for Master Leader before doing Master operations, like blacklisting.
+      createWaitForMasterLeaderTask().setSubTaskGroupType(SubTaskGroupType.ReleasingInstance);
+
+      if (instanceExists) {
+        // Set the node states to Terminating.
         createSetNodeStateTasks(currentNodeDetails, NodeDetails.NodeState.Terminating)
             .setSubTaskGroupType(SubTaskGroupType.ReleasingInstance);
+
         // Create tasks to terminate that instance. Force delete and ignore errors.
         createDestroyServerTasks(
                 universe,
                 currentNodeDetails,
-                true /* isForceDelete */,
+                node -> true /* isForceDelete */,
                 false /* deleteNode */,
-                true /* deleteRootVolumes */)
+                true /* deleteRootVolumes */,
+                false /* skipDestroyPrecheck */)
+            .setSubTaskGroupType(SubTaskGroupType.ReleasingInstance);
+      } else {
+        createRemoveNodeAgentTasks(universe, currentNodeDetails, true /* isForceDelete */)
+            .setSubTaskGroupType(SubTaskGroupType.ReleasingInstance);
+
+        // Just in case node was manually deleted.
+        createMarkUniverseForHealthScriptReUploadTask();
+      }
+      // If the node fails in Adding state during ADD action, IP may not be available.
+      // Check to make sure that the node IP is available.
+      if (Util.getNodeIp(universe, currentNode) != null) {
+        // Create a task for removal of this server from blacklist on master leader.
+        createModifyBlackListTask(
+                null /* addNodes */,
+                currentNodeDetails /* removeNodes */,
+                false /* isLeaderBlacklist */)
             .setSubTaskGroupType(SubTaskGroupType.ReleasingInstance);
       }
 
       // Update the DNS entry for this universe.
-      createDnsManipulationTask(DnsManager.DnsCommandType.Edit, false, userIntent)
+      createDnsManipulationTask(DnsManager.DnsCommandType.Edit, false, universe)
           .setSubTaskGroupType(SubTaskGroupType.ConfigureUniverse);
 
       // Update the swamper target file.
@@ -135,13 +196,12 @@ public class ReleaseInstanceFromUniverse extends UniverseTaskBase {
       // Run all the tasks.
       getRunnableTask().runSubTasks();
     } catch (Throwable t) {
-      log.error("Error executing task {} with error='{}'.", getName(), t.getMessage(), t);
+      log.error("Error executing task {}, error='{}'", getName(), t.getMessage(), t);
       throw t;
     } finally {
-      // Mark the update of the universe as done. This will allow future edits/updates to the
-      // universe to happen.
       unlockUniverseForUpdate();
     }
+
     log.info("Finished {} task.", getName());
   }
 }

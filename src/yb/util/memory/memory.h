@@ -17,9 +17,9 @@
 // specific language governing permissions and limitations
 // under the License.
 //
-// The following only applies to changes made to this file as part of YugaByte development.
+// The following only applies to changes made to this file as part of YugabyteDB development.
 //
-// Portions Copyright (c) YugaByte, Inc.
+// Portions Copyright (c) YugabyteDB, Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License"); you may not use this file except
 // in compliance with the License.  You may obtain a copy of the License at
@@ -54,7 +54,7 @@
 
 #include <boost/mpl/if.hpp>
 #include <boost/type_traits/is_const.hpp>
-#include <glog/logging.h>
+#include "yb/util/logging.h"
 
 #include "yb/gutil/casts.h"
 #include "yb/gutil/logging-inl.h"
@@ -966,10 +966,10 @@ void Quota<thread_safe>::Free(size_t amount) {
   usage_ -= amount;
   // threads allocate/free memory concurrently via the same Quota object that is
   // not protected with a mutex (thread_safe == false).
-  if (usage_ > (std::numeric_limits<size_t>::max() - (1 << 28))) {
-    LOG(ERROR) << "Suspiciously big usage_ value: " << usage_
-               << " (could be a result size_t wrapping around below 0, "
-               << "for example as a result of race condition).";
+  if (usage_ > std::numeric_limits<size_t>::max() / 2) {
+    LOG(DFATAL) << "Suspiciously big usage_ value: " << usage_
+                << " (could be a result size_t wrapping around below 0, "
+                << "for example as a result of race condition).";
   }
 }
 
@@ -1018,6 +1018,12 @@ template <class U>
 std::shared_ptr<U> FakeSharedPtr(U* u) {
   return std::shared_ptr<U>(std::shared_ptr<U>(), u);
 }
+
+class LazySharedPtrFactory {
+ public:
+  template <class T>
+  operator std::shared_ptr<T>() const { return std::make_shared<T>(); }
+};
 
 // Returns empty string if TCMalloc is not enabled.
 std::string TcMallocStats();

@@ -1,4 +1,4 @@
-// Copyright (c) YugaByte, Inc.
+// Copyright (c) YugabyteDB, Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License"); you may not use this file except
 // in compliance with the License.  You may obtain a copy of the License at
@@ -14,9 +14,16 @@
 #pragma once
 
 #include <bitset>
+#include <cstddef>
+#include <cstdint>
+#include <istream>
+#include <ostream>
 #include <string>
+#include <type_traits>
+#include <typeinfo>
+#include <unordered_map>
+#include <utility>
 
-#include <boost/algorithm/string/predicate.hpp>
 #include <boost/core/demangle.hpp>
 #include <boost/preprocessor/cat.hpp>
 #include <boost/preprocessor/expr_if.hpp>
@@ -29,16 +36,8 @@
 #include <boost/preprocessor/stringize.hpp>
 
 #include "yb/util/math_util.h" // For constexpr_max
-#include "yb/util/result.h"
 
 namespace yb {
-
-// Convert a strongly typed enum to its underlying type.
-// Based on an answer to this StackOverflow question: https://goo.gl/zv2Wg3
-template <typename E>
-constexpr typename std::underlying_type<E>::type to_underlying(E e) {
-  return static_cast<typename std::underlying_type<E>::type>(e);
-}
 
 template <typename E>
 class EnumIterator {
@@ -104,10 +103,6 @@ class AllEnumItemsIterable {
     BOOST_PP_TUPLE_ELEM(2, 0, data):: \
         BOOST_PP_CAT(BOOST_PP_APPLY(BOOST_PP_TUPLE_ELEM(2, 1, data)), YB_ENUM_ITEM_NAME(elem))
 
-#define YB_ENUM_LIST_ITEM(s, data, elem) \
-    BOOST_PP_TUPLE_ELEM(2, 0, data):: \
-        BOOST_PP_CAT(BOOST_PP_APPLY(BOOST_PP_TUPLE_ELEM(2, 1, data)), YB_ENUM_ITEM_NAME(elem))
-
 #define YB_ENUM_CASE_NAME(s, data, elem) \
   case BOOST_PP_TUPLE_ELEM(2, 0, data):: \
       BOOST_PP_CAT(BOOST_PP_APPLY(BOOST_PP_TUPLE_ELEM(2, 1, data)), YB_ENUM_ITEM_NAME(elem)): \
@@ -123,8 +118,7 @@ class AllEnumItemsIterable {
 #define YB_ENUM_MAX_PREFIX(enum_name, prefix, value) prefix
 #define YB_ENUM_MAX_VALUE(enum_name, prefix, value) value
 
-#define YB_DEFINE_ENUM_IMPL(enum_name, prefix, list) \
-  enum class enum_name { \
+#define YB_DEFINE_ENUM_IMPL_BODY(enum_name, prefix, list) { \
     BOOST_PP_SEQ_FOR_EACH(YB_ENUM_ITEM, prefix, list) \
   }; \
   \
@@ -134,18 +128,20 @@ class AllEnumItemsIterable {
     } \
     return nullptr; \
   } \
-  \
   inline __attribute__((unused)) std::string ToString(enum_name value) { \
     const char* c_str = ToCString(value); \
     if (c_str != nullptr) \
       return c_str; \
     return "<unknown " BOOST_PP_STRINGIZE(enum_name) " : " + \
-           std::to_string(::yb::to_underlying(value)) + ">"; \
+           std::to_string(std::to_underlying(value)) + ">"; \
   } \
   inline __attribute__((unused)) std::ostream& operator<<(std::ostream& out, enum_name value) { \
     return out << ToString(value); \
   } \
-  \
+  inline __attribute__((unused)) std::istream& operator>>(std::istream& in, enum_name& value) { \
+    ::yb::internal::EnumFromInputStreamHelper<enum_name>(in, value); \
+    return in; \
+  } \
   constexpr __attribute__((unused)) size_t BOOST_PP_CAT(kElementsIn, enum_name) = \
       BOOST_PP_SEQ_SIZE(list); \
   constexpr __attribute__((unused)) size_t BOOST_PP_CAT(k, BOOST_PP_CAT(enum_name, MapSize)) =  \
@@ -172,9 +168,19 @@ class AllEnumItemsIterable {
   } \
   /**/
 
+#define YB_DEFINE_ENUM_IMPL(enum_name, prefix, list) \
+  enum class enum_name \
+  YB_DEFINE_ENUM_IMPL_BODY(enum_name, prefix, list)
+
+#define YB_DEFINE_ENUM_IMPL_TYPE(enum_name, type, prefix, list) \
+  enum class enum_name : type \
+  YB_DEFINE_ENUM_IMPL_BODY(enum_name, prefix, list)
+
 // Please see the usage of YB_DEFINE_ENUM before the auxiliary macros above.
 #define YB_DEFINE_ENUM(enum_name, list) YB_DEFINE_ENUM_IMPL(enum_name, BOOST_PP_NIL, list)
 #define YB_DEFINE_ENUM_EX(enum_name, prefix, list) YB_DEFINE_ENUM_IMPL(enum_name, (prefix), list)
+#define YB_DEFINE_TYPED_ENUM(enum_name, type, list) \
+  YB_DEFINE_ENUM_IMPL_TYPE(enum_name, type, BOOST_PP_NIL, list)
 
 // This macro can be used after exhaustive (compile-time-checked) switches on enums without a
 // default clause to handle invalid values due to memory corruption.
@@ -204,7 +210,7 @@ class AllEnumItemsIterable {
           BOOST_PP_STRINGIZE(enum_type)); \
       ::yb::FatalInvalidEnumValueInternal( \
           BOOST_PP_STRINGIZE(enum_type), ::yb::GetTypeName<enum_type>(), std::string(), \
-          ::yb::to_underlying(_value_copy), BOOST_PP_STRINGIZE(value_macro_arg), \
+          std::to_underlying(_value_copy), BOOST_PP_STRINGIZE(value_macro_arg), \
           __FILE__, __LINE__); \
     } while (0)
 
@@ -217,7 +223,7 @@ class AllEnumItemsIterable {
           BOOST_PP_STRINGIZE(enum_type)); \
       ::yb::FatalInvalidEnumValueInternal( \
           BOOST_PP_STRINGIZE(enum_type), ::yb::GetTypeName<enum_type>(), \
-          BOOST_PP_CAT(enum_type, _Name)(_value_copy), ::yb::to_underlying(_value_copy), \
+          BOOST_PP_CAT(enum_type, _Name)(_value_copy), std::to_underlying(_value_copy), \
           BOOST_PP_STRINGIZE(value_macro_arg), __FILE__, __LINE__); \
     } while (0)
 
@@ -242,7 +248,7 @@ std::string GetTypeName() {
 struct EnumHash {
   template <class T>
   size_t operator()(T t) const {
-    return to_underlying(t);
+    return std::to_underlying(t);
   }
 };
 
@@ -253,8 +259,12 @@ struct EnumHash {
 template <class Enum>
 class EnumBitSetIterator {
  public:
-  typedef typename decltype(List(static_cast<Enum*>(nullptr)))::const_iterator ImplIterator;
-  typedef std::bitset<MapSize(static_cast<Enum*>(nullptr))> BitSet;
+  using value_type = Enum;
+  using difference_type = ptrdiff_t;
+  using ImplIterator = typename decltype(List(static_cast<Enum*>(nullptr)))::const_iterator;
+  using BitSet = std::bitset<MapSize(static_cast<Enum*>(nullptr))>;
+
+  EnumBitSetIterator() = default;
 
   EnumBitSetIterator(ImplIterator iter, const BitSet* set) : iter_(iter), set_(set) {
     FindSetBit();
@@ -276,15 +286,16 @@ class EnumBitSetIterator {
     return result;
   }
 
- private:
-  void FindSetBit() {
-    while (iter_ != List(static_cast<Enum*>(nullptr)).end() && !set_->test(to_underlying(*iter_))) {
-      ++iter_;
-    }
+  friend bool operator==(const EnumBitSetIterator<Enum>& lhs, const EnumBitSetIterator<Enum>& rhs) {
+    return lhs.iter_ == rhs.iter_;
   }
 
-  friend bool operator!=(const EnumBitSetIterator<Enum>& lhs, const EnumBitSetIterator<Enum>& rhs) {
-    return lhs.iter_ != rhs.iter_;
+ private:
+  void FindSetBit() {
+    while (iter_ != List(static_cast<Enum*>(nullptr)).end() &&
+           !set_->test(std::to_underlying(*iter_))) {
+      ++iter_;
+    }
   }
 
   ImplIterator iter_;
@@ -303,12 +314,12 @@ class EnumBitSet {
 
   explicit EnumBitSet(const std::initializer_list<Enum>& inp) {
     for (auto i : inp) {
-      impl_.set(to_underlying(i));
+      impl_.set(std::to_underlying(i));
     }
   }
 
   bool Test(Enum value) const {
-    return impl_.test(to_underlying(value));
+    return impl_.test(std::to_underlying(value));
   }
 
   uintptr_t ToUIntPtr() const {
@@ -328,18 +339,18 @@ class EnumBitSet {
   }
 
   EnumBitSet& Set(Enum value, bool val = true) {
-    impl_.set(to_underlying(value), val);
+    impl_.set(std::to_underlying(value), val);
     return *this;
   }
 
   EnumBitSet& Reset(Enum value) {
-    impl_.reset(to_underlying(value));
+    impl_.reset(std::to_underlying(value));
     return *this;
   }
 
   EnumBitSet& SetIf(Enum value, bool do_it) {
     if (do_it) {
-      impl_.set(to_underlying(value));
+      impl_.set(std::to_underlying(value));
     }
     return *this;
   }
@@ -378,6 +389,12 @@ class EnumBitSet {
     return impl_.to_ullong() > rhs.impl_.to_ullong();
   }
 
+  EnumBitSet<Enum> operator~() const {
+    EnumBitSet<Enum> result;
+    result.impl_ = ~impl_;
+    return result;
+  }
+
  private:
   std::bitset<MapSize(static_cast<Enum*>(nullptr))> impl_;
 
@@ -394,32 +411,59 @@ class EnumBitSet {
   }
 };
 
-// Convert from the underlying type to enum value. This is slow as it takes linear time.
+namespace internal {
+
+// ASCII case-insensitive equality, locale-independent. Enum value names are C++ identifiers
+// (ASCII), so this is sufficient and avoids pulling in <cctype>/locale machinery.
+inline bool AsciiCaseInsensitiveEquals(const char* lhs, const char* rhs) {
+  const auto to_lower = [](char c) -> char {
+    return (c >= 'A' && c <= 'Z') ? static_cast<char>(c - 'A' + 'a') : c;
+  };
+  while (*lhs != '\0' && *rhs != '\0') {
+    if (to_lower(*lhs) != to_lower(*rhs)) {
+      return false;
+    }
+    ++lhs;
+    ++rhs;
+  }
+  return *lhs == *rhs;
+}
+
+// Case-insensitive parse of an enum value by its name. Returns true and assigns *value on a match.
+// This carries no Status/Result dependency, so it -- and the stream-extraction operator generated
+// by YB_DEFINE_ENUM -- live entirely in enums.h, keeping result.h out of every enum includer.
+// ParseEnumInsensitive() in enum_parse.h wraps this to additionally return a descriptive Status.
 template <typename EnumType>
-Result<EnumType> UnderlyingToEnumSlow(const typename std::underlying_type<EnumType>::type int_val) {
-  for (auto value : List(static_cast<EnumType*>(nullptr))) {
-    if (static_cast<typename std::underlying_type<EnumType>::type>(value) == int_val) {
-      return value;
+bool TryParseEnumInsensitive(const char* str, EnumType* value) {
+  for (auto candidate : List(static_cast<EnumType*>(nullptr))) {
+    if (AsciiCaseInsensitiveEquals(ToCString(candidate), str)) {
+      *value = candidate;
+      return true;
     }
   }
-  return STATUS_FORMAT(InvalidArgument, "$0 invalid value: $1", GetTypeName<EnumType>(), int_val);
+  return false;
 }
 
-// Parses string representation to enum value
 template <typename EnumType>
-Result<EnumType> ParseEnumInsensitive(const char* str) {
-  for (auto value : List(static_cast<EnumType*>(nullptr))) {
-    if (boost::iequals(ToCString(value), str)) {
-      return value;
-    }
+void EnumFromInputStreamHelper(std::istream& in, EnumType& value) {
+  std::string token;
+  in >> token;
+  if (in.fail()) {
+    return;
   }
-  return STATUS_FORMAT(InvalidArgument, "$0 invalid value: $1", GetTypeName<EnumType>(), str);
+  if (TryParseEnumInsensitive(token.c_str(), &value)) {
+    return;
+  }
+  // The vast majority of enums are defined with kFoo, kBar, etc. as their values.
+  if (TryParseEnumInsensitive(("k" + token).c_str(), &value)) {
+    return;
+  }
+  in.setstate(std::ios_base::failbit);
 }
 
-template<typename EnumType>
-Result<EnumType> ParseEnumInsensitive(const std::string& str) {
-  return ParseEnumInsensitive<EnumType>(str.c_str());
-}
+}  // namespace internal
 
+// UnderlyingToEnumSlow() and the Result-returning ParseEnumInsensitive() live in
+// yb/util/enum_parse.h (they require yb/util/result.h). Include that header to use them.
 
 }  // namespace yb

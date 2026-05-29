@@ -1,7 +1,8 @@
-// Copyright (c) YugaByte, Inc.
+// Copyright (c) YugabyteDB, Inc.
 
 package com.yugabyte.yw.common.alerts;
 
+import com.yugabyte.yw.forms.AlertChannelTemplatesExt;
 import com.yugabyte.yw.models.Alert;
 import com.yugabyte.yw.models.AlertChannel;
 import com.yugabyte.yw.models.Customer;
@@ -13,6 +14,10 @@ public interface AlertChannelInterface {
    *
    * @return An error if the action failed, or null otherwise.
    */
-  void sendNotification(Customer customer, Alert alert, AlertChannel channel)
+  void sendNotification(
+      Customer customer,
+      Alert alert,
+      AlertChannel channel,
+      AlertChannelTemplatesExt channelTemplates)
       throws PlatformNotificationException;
 }

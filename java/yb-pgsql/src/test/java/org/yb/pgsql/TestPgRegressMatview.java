@@ -1,4 +1,4 @@
-// Copyright (c) YugaByte, Inc.
+// Copyright (c) YugabyteDB, Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License"); you may not use this file except
 // in compliance with the License.  You may obtain a copy of the License at
@@ -14,18 +14,27 @@ package org.yb.pgsql;
 
 import org.junit.Test;
 import org.junit.runner.RunWith;
-import org.yb.util.YBTestRunnerNonTsanOnly;
+import org.yb.YBTestRunner;
 
 import java.util.Map;
 
 /**
  * Runs the pg_regress test suite on YB code.
  */
-@RunWith(value=YBTestRunnerNonTsanOnly.class)
-public class TestPgRegressMatview extends BasePgSQLTest {
+@RunWith(value=YBTestRunner.class)
+public class TestPgRegressMatview extends BasePgRegressTest {
   @Override
   public int getTestMethodTimeoutSec() {
     return 1800;
+  }
+
+  @Override
+  protected Map<String, String> getTServerFlags() {
+    Map<String, String> flags = super.getTServerFlags();
+    // TODO(#26734): Enable transactional DDL (& table locks) once savepoint for DDLs are supported.
+    flags.put("ysql_yb_ddl_transaction_block_enabled", "false");
+    flags.put("enable_object_locking_for_table_locks", "false");
+    return flags;
   }
 
   @Test

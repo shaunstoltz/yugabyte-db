@@ -15,9 +15,9 @@
 // specific language governing permissions and limitations
 // under the License.
 //
-// The following only applies to changes made to this file as part of YugaByte development.
+// The following only applies to changes made to this file as part of YugabyteDB development.
 //
-// Portions Copyright (c) YugaByte, Inc.
+// Portions Copyright (c) YugabyteDB, Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License"); you may not use this file except
 // in compliance with the License.  You may obtain a copy of the License at
@@ -33,7 +33,7 @@
 #include <memory>
 #include <thread>
 
-#include <glog/logging.h>
+#include "yb/util/logging.h"
 #include <glog/stl_logging.h>
 #include <gtest/gtest.h>
 
@@ -41,7 +41,7 @@
 #include "yb/client/schema.h"
 #include "yb/client/table_creator.h"
 
-#include "yb/common/partition.h"
+#include "yb/dockv/partition.h"
 #include "yb/common/wire_protocol.h"
 
 #include "yb/consensus/consensus.proxy.h"
@@ -53,6 +53,7 @@
 #include "yb/integration-tests/yb_mini_cluster_test_base.h"
 
 #include "yb/master/catalog_entity_info.h"
+#include "yb/master/catalog_loaders.h"
 #include "yb/master/catalog_manager_if.h"
 #include "yb/master/master-test-util.h"
 #include "yb/master/master.h"
@@ -93,22 +94,22 @@ using yb::rpc::Messenger;
 using yb::rpc::MessengerBuilder;
 using yb::rpc::RpcController;
 
-DECLARE_int32(heartbeat_interval_ms);
-DECLARE_bool(log_preallocate_segments);
 DECLARE_bool(TEST_enable_remote_bootstrap);
-DECLARE_int32(tserver_unresponsive_timeout_ms);
-DECLARE_int32(max_create_tablets_per_ts);
-DECLARE_int32(tablet_report_limit);
-DECLARE_uint64(TEST_inject_latency_during_tablet_report_ms);
-DECLARE_int32(heartbeat_rpc_timeout_ms);
+DECLARE_bool(log_preallocate_segments);
 DECLARE_int32(catalog_manager_report_batch_size);
+DECLARE_int32(heartbeat_interval_ms);
+DECLARE_int32(heartbeat_rpc_timeout_ms);
+DECLARE_int32(max_create_tablets_per_ts);
+DECLARE_int32(tablet_creation_timeout_ms);
 DECLARE_int32(tablet_report_limit);
+DECLARE_int32(tserver_unresponsive_timeout_ms);
+DECLARE_uint64(TEST_inject_latency_during_tablet_report_ms);
 
-DEFINE_UNKNOWN_int32(num_test_tablets, 60, "Number of tablets for stress test");
-DEFINE_UNKNOWN_int32(benchmark_runtime_secs, 5, "Number of seconds to run the benchmark");
-DEFINE_UNKNOWN_int32(benchmark_num_threads, 16, "Number of threads to run the benchmark");
+DEFINE_NON_RUNTIME_int32(num_test_tablets, 60, "Number of tablets for stress test");
+DEFINE_NON_RUNTIME_int32(benchmark_runtime_secs, 5, "Number of seconds to run the benchmark");
+DEFINE_NON_RUNTIME_int32(benchmark_num_threads, 16, "Number of threads to run the benchmark");
 // Increase this for actually using this as a benchmark test.
-DEFINE_UNKNOWN_int32(benchmark_num_tablets, 8, "Number of tablets to create");
+DEFINE_NON_RUNTIME_int32(benchmark_num_tablets, 8, "Number of tablets to create");
 
 METRIC_DECLARE_histogram(handler_latency_yb_master_MasterClient_GetTableLocations);
 
@@ -124,15 +125,15 @@ class CreateTableStressTest : public YBMiniClusterTestBase<MiniCluster> {
  public:
   CreateTableStressTest() {
     YBSchemaBuilder b;
-    b.AddColumn("key")->Type(INT32)->NotNull()->HashPrimaryKey();
-    b.AddColumn("v1")->Type(INT64)->NotNull();
-    b.AddColumn("v2")->Type(STRING)->NotNull();
+    b.AddColumn("key")->Type(DataType::INT32)->NotNull()->HashPrimaryKey();
+    b.AddColumn("v1")->Type(DataType::INT64)->NotNull();
+    b.AddColumn("v2")->Type(DataType::STRING)->NotNull();
     CHECK_OK(b.Build(&schema_));
   }
 
   void SetUp() override {
     // Make heartbeats faster to speed test runtime.
-    FLAGS_heartbeat_interval_ms = 10;
+    ANNOTATE_UNPROTECTED_WRITE(FLAGS_heartbeat_interval_ms) = 10;
 
     // Don't preallocate log segments, since we're creating thousands
     // of tablets here. If each preallocates 64M or so, we use
@@ -140,11 +141,11 @@ class CreateTableStressTest : public YBMiniClusterTestBase<MiniCluster> {
     // sized /tmp dirs.
     // TODO: once we collapse multiple tablets into shared WAL files,
     // this won't be necessary.
-    FLAGS_log_preallocate_segments = false;
+    ANNOTATE_UNPROTECTED_WRITE(FLAGS_log_preallocate_segments) = false;
 
     // Workaround KUDU-941: without this, it's likely that while shutting
     // down tablets, they'll get resuscitated by their existing leaders.
-    FLAGS_TEST_enable_remote_bootstrap = false;
+    ANNOTATE_UNPROTECTED_WRITE(FLAGS_TEST_enable_remote_bootstrap) = false;
 
     YBMiniClusterTestBase::SetUp();
     MiniClusterOptions opts;
@@ -270,29 +271,32 @@ TEST_F(CreateTableStressTest, GetTableLocationsBenchmark) {
 
   LOG(INFO) << "LOCK PROFILE\n" << profile.str();
   LOG(INFO) << "BENCHMARK HISTOGRAM:";
-  hist->histogram()->DumpHumanReadable(&LOG(INFO));
+  hist->underlying()->DumpHumanReadable(&LOG(INFO));
 }
 
 class CreateMultiHBTableStressTest : public CreateTableStressTest,
-                                     public testing::WithParamInterface<bool /* is_multiHb */> {
+                                     public testing::WithParamInterface<bool /* is_multi_hb */> {
   void SetUp() override {
     // "MultiHB" Tables are too large to be reported in a single heartbeat from a TS.
     // Setup so all 3 TS will have to break tablet report updates into multiple chunks.
-    bool is_multiHb = GetParam();
-    if (is_multiHb) {
+    if (GetParam()) {
       // 90 Tablets * 3 TS < 300 Tablets
-      FLAGS_tablet_report_limit = 90;
-      FLAGS_num_test_tablets = 300;
-      FLAGS_max_create_tablets_per_ts = FLAGS_num_test_tablets;
+      ANNOTATE_UNPROTECTED_WRITE(FLAGS_tablet_report_limit) = 90;
+      ANNOTATE_UNPROTECTED_WRITE(FLAGS_num_test_tablets) = 300;
+      ANNOTATE_UNPROTECTED_WRITE(FLAGS_max_create_tablets_per_ts) = FLAGS_num_test_tablets;
       // 1000 ms deadline / 20 ms wait/batch ~= 40 Tablets processed before Master hits deadline
-      FLAGS_TEST_inject_latency_during_tablet_report_ms = 20;
-      FLAGS_heartbeat_rpc_timeout_ms = 1000;
-      FLAGS_catalog_manager_report_batch_size = 1;
+      ANNOTATE_UNPROTECTED_WRITE(FLAGS_TEST_inject_latency_during_tablet_report_ms) = 20;
+      ANNOTATE_UNPROTECTED_WRITE(FLAGS_heartbeat_rpc_timeout_ms) = 1000;
+      ANNOTATE_UNPROTECTED_WRITE(FLAGS_catalog_manager_report_batch_size) = 1;
     }
     CreateTableStressTest::SetUp();
   }
 };
-INSTANTIATE_TEST_CASE_P(MultiHeartbeat, CreateMultiHBTableStressTest, ::testing::Bool());
+INSTANTIATE_TEST_CASE_P(
+    , CreateMultiHBTableStressTest, ::testing::Bool(),
+    [](const testing::TestParamInfo<bool>& info) {
+      return info.param ? "MultiHB" : "Plain";
+    });
 
 // Replaces itest version, which requires an External Mini Cluster.
 Status ListRunningTabletIds(std::shared_ptr<tserver::TabletServerServiceProxy> ts_proxy,
@@ -329,7 +333,7 @@ TEST_P(CreateMultiHBTableStressTest, CreateAndDeleteBigTable) {
   // messages have a max size.
   std::cout << "Response:\n" << resp.DebugString();
   std::cout << "CatalogManager state:\n";
-  cluster_->mini_master()->catalog_manager().DumpState(&std::cerr);
+  ASSERT_OK(cluster_->mini_master()->catalog_manager().DumpState(&std::cerr));
 
   // Store all relevant tablets for this big table we've created.
   std::vector<string> big_table_tablets;
@@ -366,16 +370,17 @@ TEST_P(CreateMultiHBTableStressTest, RestartServersAfterCreation) {
     LOG(INFO) << "Skipping slow test";
     return;
   }
+  ANNOTATE_UNPROTECTED_WRITE(FLAGS_tablet_creation_timeout_ms) = 10000 * kTimeMultiplier;
   YBTableName table_name(YQL_DATABASE_CQL, "my_keyspace", "test_table");
   ASSERT_NO_FATALS(CreateBigTable(table_name, FLAGS_num_test_tablets));
 
   for (int i = 0; i < 3; i++) {
     SleepFor(MonoDelta::FromMicroseconds(500));
-    LOG(INFO) << "Restarting master...";
+    LOG(INFO) << i << ") Restarting master...";
     ASSERT_OK(cluster_->mini_master()->Restart());
     ASSERT_OK(cluster_->mini_master()->master()->
         WaitUntilCatalogManagerIsLeaderAndReadyForTests());
-    LOG(INFO) << "Master restarted.";
+    LOG(INFO) << i << ") Master restarted.";
   }
 
   // Restart TS#2, which forces a full tablet report on TS #2 and incremental updates on the others.
@@ -385,7 +390,7 @@ TEST_P(CreateMultiHBTableStressTest, RestartServersAfterCreation) {
   Status s = WaitForRunningTabletCount(cluster_->mini_master(), table_name,
                                        FLAGS_num_test_tablets, &resp);
   if (!s.ok()) {
-    cluster_->mini_master()->catalog_manager().DumpState(&std::cerr);
+    ASSERT_OK(cluster_->mini_master()->catalog_manager().DumpState(&std::cerr));
     CHECK_OK(s);
   }
 }
@@ -393,9 +398,9 @@ TEST_P(CreateMultiHBTableStressTest, RestartServersAfterCreation) {
 class CreateSmallHBTableStressTest : public CreateTableStressTest {
   void SetUp() override {
     // 40 / 3 ~= 13 tablets / server.  2 / report >= 7 reports to finish a heartbeat
-    FLAGS_tablet_report_limit = 2;
-    FLAGS_num_test_tablets = 40;
-    FLAGS_max_create_tablets_per_ts = FLAGS_num_test_tablets;
+    ANNOTATE_UNPROTECTED_WRITE(FLAGS_tablet_report_limit) = 2;
+    ANNOTATE_UNPROTECTED_WRITE(FLAGS_num_test_tablets) = 40;
+    ANNOTATE_UNPROTECTED_WRITE(FLAGS_max_create_tablets_per_ts) = FLAGS_num_test_tablets;
 
     CreateTableStressTest::SetUp();
   }
@@ -406,6 +411,8 @@ TEST_F(CreateSmallHBTableStressTest, TestRestartMasterDuringFullHeartbeat) {
     LOG(INFO) << "Skipping slow test";
     return;
   }
+  ANNOTATE_UNPROTECTED_WRITE(FLAGS_tablet_creation_timeout_ms) = 30000;
+
   YBTableName table_name(YQL_DATABASE_CQL, "my_keyspace", "test_table");
   ASSERT_NO_FATALS(CreateBigTable(table_name, FLAGS_num_test_tablets));
 
@@ -437,12 +444,12 @@ TEST_F(CreateSmallHBTableStressTest, TestRestartMasterDuringFullHeartbeat) {
   Status s = WaitForRunningTabletCount(cluster_->mini_master(), table_name,
                                        FLAGS_num_test_tablets, &resp);
   if (!s.ok()) {
-    cluster_->mini_master()->catalog_manager().DumpState(&std::cerr);
+    ASSERT_OK(cluster_->mini_master()->catalog_manager().DumpState(&std::cerr));
     CHECK_OK(s);
   }
 }
 
-TEST_F(CreateTableStressTest, TestHeartbeatDeadline) {
+TEST_F(CreateTableStressTest, YB_DISABLE_TEST_ON_MACOS(TestHeartbeatDeadline)) {
   DontVerifyClusterBeforeNextTearDown();
 
   // 500ms deadline / 50 ms wait ~= 10 Tablets processed before Master hits deadline
@@ -459,16 +466,28 @@ TEST_F(CreateTableStressTest, TestHeartbeatDeadline) {
   ASSERT_OK(WaitForRunningTabletCount(cluster_->mini_master(), table_name,
     FLAGS_num_test_tablets, &resp));
 
-  // Grab TS#1 and Generate a Full Report for it.
-  auto ts_server = cluster_->mini_tablet_server(0)->server();
-  master::TSHeartbeatRequestPB hb_req;
-  hb_req.mutable_common()->mutable_ts_instance()->CopyFrom(ts_server->instance_pb());
-  ts_server->tablet_manager()->StartFullTabletReport(hb_req.mutable_tablet_report());
-  ASSERT_GT(hb_req.tablet_report().updated_tablets_size(),
-            FLAGS_heartbeat_rpc_timeout_ms / FLAGS_TEST_inject_latency_during_tablet_report_ms);
-  ASSERT_EQ(ts_server->tablet_manager()->GetReportLimit(), FLAGS_tablet_report_limit);
-  ASSERT_LE(hb_req.tablet_report().updated_tablets_size(), FLAGS_tablet_report_limit);
+  master::SysClusterConfigEntryPB config =
+      ASSERT_RESULT(cluster_->mini_master()->catalog_manager().GetClusterConfig());
+  auto universe_uuid = config.universe_uuid();
 
+  // Grab TS#1 and Generate a Full Report for it.
+  master::TSHeartbeatRequestPB hb_req;
+  {
+    // The TabletServer pointer is invalid after the Shutdown call below. So introduce a scope to
+    // explicitly contain the ts_server lifetime to when it is valid.
+    auto ts_server = cluster_->mini_tablet_server(0)->server();
+    hb_req.mutable_common()->mutable_ts_instance()->CopyFrom(ts_server->instance_pb());
+    hb_req.set_universe_uuid(universe_uuid);
+    ts_server->tablet_manager()->StartFullTabletReport(hb_req.mutable_tablet_report());
+    ASSERT_GT(
+        hb_req.tablet_report().updated_tablets_size(),
+        FLAGS_heartbeat_rpc_timeout_ms / FLAGS_TEST_inject_latency_during_tablet_report_ms);
+    ASSERT_EQ(ts_server->tablet_manager()->GetReportLimit(), FLAGS_tablet_report_limit);
+    ASSERT_LE(hb_req.tablet_report().updated_tablets_size(), FLAGS_tablet_report_limit);
+  }
+
+  // Stop TS#1 so their heartbeat doesn't interfere with our fake one.
+  cluster_->mini_tablet_server(0)->Shutdown();
   rpc::ProxyCache proxy_cache(messenger_.get());
   master::MasterHeartbeatProxy proxy(&proxy_cache, cluster_->mini_master()->bound_rpc_addr());
 
@@ -476,7 +495,11 @@ TEST_F(CreateTableStressTest, TestHeartbeatDeadline) {
   // This should go over the deadline and get truncated.
   master::TSHeartbeatResponsePB hb_resp;
   hb_req.mutable_tablet_report()->set_is_incremental(true);
-  hb_req.mutable_tablet_report()->set_sequence_number(1);
+  // Bump sequence number because the TS' heartbeat thread continues to run after we grab the
+  // sequence number so it may have already invalidated the sequence number we grabbed.
+  hb_req.mutable_tablet_report()->set_sequence_number(
+      hb_req.tablet_report().sequence_number() + 100);
+  hb_req.set_universe_uuid(universe_uuid);
   Status heartbeat_status;
   // Regression testbed often has stalls at this timing granularity.  Allow a couple hiccups.
   for (int tries = 0; tries < 3; ++tries) {
@@ -484,7 +507,8 @@ TEST_F(CreateTableStressTest, TestHeartbeatDeadline) {
     rpc.set_timeout(MonoDelta::FromMilliseconds(FLAGS_heartbeat_rpc_timeout_ms));
     heartbeat_status = proxy.TSHeartbeat(hb_req, &hb_resp, &rpc);
     if (heartbeat_status.ok()) break;
-    ASSERT_TRUE(heartbeat_status.IsTimedOut());
+    ASSERT_TRUE(heartbeat_status.IsTimedOut())
+        << Format("Heartbeat status is: $0", heartbeat_status);
   }
   ASSERT_OK(heartbeat_status);
   ASSERT_TRUE(hb_resp.tablet_report().processing_truncated());
@@ -573,8 +597,8 @@ DontVerifyClusterBeforeNextTearDown();
       master::GetTablesMode::kAll);
   for (const scoped_refptr<master::TableInfo>& table_info : tables) {
     LOG(INFO) << "Table: " << table_info->ToString();
-    auto tablets = table_info->GetTablets();
-    for (const scoped_refptr<master::TabletInfo>& tablet_info : tablets) {
+    auto tablets = ASSERT_RESULT(table_info->GetTablets());
+    for (const auto& tablet_info : tablets) {
       auto l_tablet = tablet_info->LockForRead();
       const master::SysTabletsEntryPB& metadata = l_tablet->pb;
       LOG(INFO) << "  Tablet: " << tablet_info->ToString()
@@ -594,19 +618,33 @@ DontVerifyClusterBeforeNextTearDown();
 // Creates tables and reloads on-disk metadata concurrently to test for races
 // between the two operations.
 TEST_F(CreateTableStressTest, TestConcurrentCreateTableAndReloadMetadata) {
+  // Because of sys catalog reload we could get into situation where tablet creation task was
+  // lost. Since we don't retry creating tablet on catalog load, we are getting into situation where
+  // table remains in PREPARING state forever. It breaks cluster verifier.
+  verify_cluster_before_next_tear_down_ = false;
+
+  // This test continuously reloads the sys catalog. These reloads cancel all inflight tasks, which
+  // can cancel some create replica tasks for tablet replicas. Given this test uses RF=3, if two
+  // create tablet requests succeed then a tablet leader will be elected and the master will
+  // transition the tablet to RUNNING state, preventing further tasks to fix the tablet. From here
+  // the tablet leader will initiate a remote bootstrap to create a tablet replica on the tablet
+  // peer missing the tablet. We explicitly enable remote bootstraps here so the tablet leader
+  // can successfully create the missing replica.
+  ANNOTATE_UNPROTECTED_WRITE(FLAGS_TEST_enable_remote_bootstrap) = true;
   AtomicBool stop(false);
 
   // Since this test constantly invokes VisitSysCatalog() which is the function
   // that runs after a new leader gets elected, during that period the leader rejects
-  // tablet server heart-beats (because it holds the leader_lock_), and this leads
+  // tablet server heart-beats (because it holds the leader_mutex_), and this leads
   // the master to mistakenly think that the tablet servers are dead. To avoid this
   // increase the TS unresponsive timeout so that the leader correctly thinks that
   // they are alive.
-  SetAtomicFlag(5 * 60 * 1000, &FLAGS_tserver_unresponsive_timeout_ms);
+  ANNOTATE_UNPROTECTED_WRITE(FLAGS_tserver_unresponsive_timeout_ms) = 5 * 60 * 1000;
 
   thread reload_metadata_thread([&]() {
     while (!stop.Load()) {
-      CHECK_OK(cluster_->mini_master()->catalog_manager().VisitSysCatalog(0));
+      master::SysCatalogLoadingState state{ master::LeaderEpoch(1) };
+      CHECK_OK(cluster_->mini_master()->catalog_manager_impl().VisitSysCatalog(&state));
       // Give table creation a chance to run.
       SleepFor(MonoDelta::FromMilliseconds(10 * kTimeMultiplier));
     }
@@ -627,7 +665,7 @@ TEST_F(CreateTableStressTest, TestConcurrentCreateTableAndReloadMetadata) {
       unique_ptr<YBTableCreator> table_creator(client_->NewTableCreator());
       s = table_creator->table_name(table_name)
           .schema(&schema_)
-          .hash_schema(YBHashSchema::kMultiColumnHash)
+          .hash_schema(dockv::YBHashSchema::kMultiColumnHash)
           .set_range_partition_columns({ "key" })
           .num_tablets(1)
           .wait(false)

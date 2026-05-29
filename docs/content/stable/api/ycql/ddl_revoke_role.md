@@ -4,9 +4,12 @@ headerTitle: REVOKE ROLE
 linkTitle: REVOKE ROLE
 description: Use the `REVOKE ROLE` statement to revoke a role (which represents a group of permissions and the SUPERUSER status) from another role.
 menu:
-  stable:
+  stable_api:
     parent: api-cassandra
     weight: 1284
+aliases:
+  - /stable/api/cassandra/ddl_revoke_role
+  - /stable/api/ycql/ddl_revoke_role
 type: docs
 ---
 
@@ -14,7 +17,7 @@ type: docs
 
 Use the `REVOKE ROLE` statement to revoke a role (which represents a group of permissions and the SUPERUSER status) from another role.
 
-This statement is enabled by setting the YB-TServer flag [`--use_cassandra_authentication`](../../../reference/configuration/yb-tserver/#config-flags) to `true`.
+This statement is enabled by setting the YB-TServer flag [--use_cassandra_authentication](../../../reference/configuration/yb-tserver/#ycql) to `true`.
 
 ## Syntax
 

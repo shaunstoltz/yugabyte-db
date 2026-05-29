@@ -4,7 +4,7 @@
  *	  prototypes for policy.c.
  *
  *
- * Portions Copyright (c) 1996-2018, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2022, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  * src/include/commands/policy.h
@@ -19,7 +19,10 @@
 #include "nodes/parsenodes.h"
 #include "utils/relcache.h"
 
-extern void RelationBuildRowSecurity(Relation relation);
+/* YB includes */
+#include "utils/yb_tuplecache.h"
+
+extern void RelationBuildRowSecurity(Relation relation, const YbTupleCache *yb_pg_policy_cache);
 
 extern void RemovePolicyById(Oid policy_id);
 
@@ -28,8 +31,8 @@ extern bool RemoveRoleFromObjectPolicy(Oid roleid, Oid classid, Oid objid);
 extern ObjectAddress CreatePolicy(CreatePolicyStmt *stmt);
 extern ObjectAddress AlterPolicy(AlterPolicyStmt *stmt);
 
-extern Oid get_relation_policy_oid(Oid relid, const char *policy_name,
-						bool missing_ok);
+extern Oid	get_relation_policy_oid(Oid relid, const char *policy_name,
+									bool missing_ok);
 
 extern ObjectAddress rename_policy(RenameStmt *stmt);
 

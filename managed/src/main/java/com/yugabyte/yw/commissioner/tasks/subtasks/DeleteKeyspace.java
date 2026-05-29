@@ -1,5 +1,5 @@
 /*
-* Copyright 2022 YugaByte, Inc. and Contributors
+* Copyright 2022 YugabyteDB, Inc. and Contributors
 *
 * Licensed under the Polyform Free Trial License 1.0.0 (the "License"); you
 * may not use this file except in compliance with the License. You
@@ -15,12 +15,12 @@ import static play.mvc.Http.Status.SERVICE_UNAVAILABLE;
 import com.yugabyte.yw.commissioner.BaseTaskDependencies;
 import com.yugabyte.yw.commissioner.tasks.UniverseTaskBase;
 import com.yugabyte.yw.common.PlatformServiceException;
-import com.yugabyte.yw.common.YsqlQueryExecutor;
 import com.yugabyte.yw.forms.BackupTableParams;
 import com.yugabyte.yw.models.Universe;
-import javax.inject.Inject;
+import com.yugabyte.yw.models.helpers.CommonUtils;
 import java.util.ArrayList;
 import java.util.List;
+import javax.inject.Inject;
 import lombok.extern.slf4j.Slf4j;
 import org.yb.CommonTypes.TableType;
 import org.yb.client.ListTablesResponse;
@@ -29,8 +29,6 @@ import org.yb.master.MasterDdlOuterClass.ListTablesResponsePB.TableInfo;
 
 @Slf4j
 public class DeleteKeyspace extends UniverseTaskBase {
-
-  @Inject private YsqlQueryExecutor ysqlQueryExecutor;
 
   private static final String MASTERS_UNAVAILABLE_ERR_MSG =
       "Expected error. Masters are not currently queryable.";
@@ -44,7 +42,9 @@ public class DeleteKeyspace extends UniverseTaskBase {
     super(baseTaskDependencies);
   }
 
-  public static class Params extends BackupTableParams {}
+  public static class Params extends BackupTableParams {
+    public boolean ysqlForce;
+  }
 
   @Override
   protected DeleteKeyspace.Params taskParams() {
@@ -54,15 +54,16 @@ public class DeleteKeyspace extends UniverseTaskBase {
   @Override
   public void run() {
     TableType tableType = taskParams().backupType;
-    Universe universe = Universe.getOrBadRequest(taskParams().universeUUID);
+    Universe universe = Universe.getOrBadRequest(taskParams().getUniverseUUID());
     final String keyspaceName = taskParams().getKeyspace();
-    YBClient client = null;
-    final String masterAddresses = universe.getMasterAddresses(true);
+    final String masterAddresses = universe.getMasterAddresses();
     if (tableType == TableType.PGSQL_TABLE_TYPE) {
       try {
         // Build the query to run.
         String query = String.format("DROP DATABASE IF EXISTS \"%s\"", keyspaceName);
-
+        if (taskParams().ysqlForce) {
+          query += " WITH (FORCE)";
+        }
         // Execute the query.
         log.info("Executing query {} to drop existing DB {}", query, keyspaceName);
         ysqlQueryExecutor.runUserDbCommands(query, DB_NAME, universe);
@@ -75,7 +76,6 @@ public class DeleteKeyspace extends UniverseTaskBase {
         throw new RuntimeException(exMsg);
       }
     } else if (tableType == TableType.YQL_TABLE_TYPE) {
-      String certificate = universe.getCertificateNodetoNode();
 
       if (masterAddresses.isEmpty()) {
         throw new PlatformServiceException(SERVICE_UNAVAILABLE, MASTERS_UNAVAILABLE_ERR_MSG);
@@ -84,9 +84,7 @@ public class DeleteKeyspace extends UniverseTaskBase {
           "Preparing to make a call on {} to delete keyspace {} if it exists",
           masterAddresses,
           keyspaceName);
-      try {
-        client = ybService.getClient(masterAddresses, certificate);
-
+      try (YBClient client = ybService.getUniverseClient(universe)) {
         // Get all tables in the keyspace name.
         ListTablesResponse response = client.getTablesList(null, false, keyspaceName);
         // Filter by table type YCQL.
@@ -99,12 +97,14 @@ public class DeleteKeyspace extends UniverseTaskBase {
         }
 
         // Delete YCQL tables in the keyspace.
-        YBClient finalClient = client;
         ycqlTableList.forEach(
             tableName -> {
               try {
-                finalClient.deleteTable(keyspaceName, tableName);
-                log.info("Dropped table {} from keyspace {}", tableName, keyspaceName);
+                client.deleteTable(keyspaceName, tableName);
+                log.info(
+                    "Dropped table {} from keyspace {}",
+                    CommonUtils.logTableName(tableName),
+                    keyspaceName);
               } catch (Exception e) {
                 throw new RuntimeException(e);
               }
@@ -117,13 +117,11 @@ public class DeleteKeyspace extends UniverseTaskBase {
         String msg = "Error " + e.getMessage() + " while deleting keyspace " + keyspaceName;
         log.error(msg, e);
         throw new RuntimeException(msg);
-      } finally {
-        ybService.closeClient(client, masterAddresses);
       }
     } else {
       String errMsg =
           String.format(
-              "Invalid table type: %s. Cannot delete keyspace {}", tableType, keyspaceName);
+              "Invalid table type: %s. Cannot delete keyspace %s", tableType, keyspaceName);
       throw new RuntimeException(errMsg);
     }
   }

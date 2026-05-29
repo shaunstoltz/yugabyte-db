@@ -15,9 +15,9 @@
 // specific language governing permissions and limitations
 // under the License.
 //
-// The following only applies to changes made to this file as part of YugaByte development.
+// The following only applies to changes made to this file as part of YugabyteDB development.
 //
-// Portions Copyright (c) YugaByte, Inc.
+// Portions Copyright (c) YugabyteDB, Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License"); you may not use this file except
 // in compliance with the License.  You may obtain a copy of the License at
@@ -42,9 +42,9 @@
 #include "yb/util/thread.h"
 #include "yb/util/flags.h"
 
-DEFINE_UNKNOWN_int32(histogram_test_num_threads, 16,
+DEFINE_NON_RUNTIME_int32(histogram_test_num_threads, 16,
     "Number of threads to spawn for mt-hdr_histogram test");
-DEFINE_UNKNOWN_uint64(histogram_test_num_increments_per_thread, 100000LU,
+DEFINE_NON_RUNTIME_uint64(histogram_test_num_increments_per_thread, 100000LU,
     "Number of times to call Increment() per thread in mt-hdr_histogram test");
 
 using std::vector;

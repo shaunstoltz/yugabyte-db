@@ -1,20 +1,31 @@
-// Copyright (c) YugaByte, Inc.
+// Copyright (c) YugabyteDB, Inc.
 
 package com.yugabyte.yw.models.helpers;
 
 import static play.mvc.Http.Status.BAD_REQUEST;
 
 import com.yugabyte.yw.cloud.PublicCloudConstants;
+import com.yugabyte.yw.commissioner.Common;
 import com.yugabyte.yw.common.PlatformServiceException;
+import com.yugabyte.yw.common.config.GlobalConfKeys;
+import com.yugabyte.yw.common.config.RuntimeConfGetter;
+import com.yugabyte.yw.common.inject.StaticInjectorHolder;
+import com.yugabyte.yw.common.kms.util.KeyProvider;
+import com.yugabyte.yw.common.utils.Pair;
+import com.yugabyte.yw.models.KmsConfig;
 import io.swagger.annotations.ApiModel;
 import io.swagger.annotations.ApiModelProperty;
 import java.util.Objects;
+import org.apache.commons.lang3.StringUtils;
 
 @ApiModel(description = "Device information")
 public class DeviceInfo {
 
   // The size of each volume in each instance (if specified).
-  @ApiModelProperty(value = "The size of each volume in each instance")
+  @ApiModelProperty(
+      value =
+          "The size of each volume in each instance. "
+              + "Could be modified in payload for /resize_node API call")
   public Integer volumeSize;
 
   // Number of volumes to be mounted on this instance at the default path (if specified).
@@ -41,6 +52,11 @@ public class DeviceInfo {
   @ApiModelProperty(value = "Storage type used for this instance")
   public PublicCloudConstants.StorageType storageType;
 
+  // This field is only used for AWS EBS volumes currently.
+  @ApiModelProperty(value = "Volume encryption settings for AWS EBS volumes")
+  public CloudVolumeEncryption cloudVolumeEncryption;
+
+  @Override
   public String toString() {
     StringBuilder sb = new StringBuilder("DeviceInfo: ");
     sb.append("volSize=").append(volumeSize);
@@ -48,10 +64,10 @@ public class DeviceInfo {
     sb.append(", mountPoints=").append(mountPoints);
     if (storageType != null) {
       sb.append(", storageType=").append(storageType);
-      if (storageType.isIopsProvisioning() && diskIops != null) {
+      if (diskIops != null && storageType.isIopsProvisioning()) {
         sb.append(", iops=").append(diskIops);
       }
-      if (storageType.isThroughputProvisioning() && throughput != null) {
+      if (throughput != null && storageType.isThroughputProvisioning()) {
         sb.append(", throughput=").append(throughput);
       }
     }
@@ -62,6 +78,7 @@ public class DeviceInfo {
     checkVolumeBaseInfo();
     checkDiskIops();
     checkThroughput();
+    checkVolumeEncryption();
   }
 
   public DeviceInfo clone() {
@@ -76,6 +93,64 @@ public class DeviceInfo {
     return result;
   }
 
+  public void mergeDeviceInfo(DeviceInfo other) {
+    if (other.storageType != null) {
+      this.storageType = other.storageType;
+    }
+    if (other.numVolumes != null) {
+      this.numVolumes = other.numVolumes;
+    }
+    if (other.mountPoints != null) {
+      this.mountPoints = other.mountPoints;
+    }
+    if (other.volumeSize != null) {
+      this.volumeSize = other.volumeSize;
+    }
+    if (other.diskIops != null) {
+      this.diskIops = other.diskIops;
+    }
+    if (StringUtils.isNotBlank(other.storageClass)) {
+      this.storageClass = other.storageClass;
+    }
+    if (other.throughput != null) {
+      this.throughput = other.throughput;
+    }
+  }
+
+  public void unsetFields(DeviceInfo other) {
+    if (other.storageType != null) {
+      this.storageType = null;
+    }
+    if (other.numVolumes != null) {
+      this.numVolumes = null;
+    }
+    if (other.mountPoints != null) {
+      this.mountPoints = null;
+    }
+    if (other.volumeSize != null) {
+      this.volumeSize = null;
+    }
+    if (other.diskIops != null) {
+      this.diskIops = null;
+    }
+    if (StringUtils.isNotBlank(other.storageClass)) {
+      this.storageClass = "";
+    }
+    if (other.throughput != null) {
+      this.throughput = null;
+    }
+  }
+
+  public boolean allNull() {
+    return this.storageType == null
+        && this.numVolumes == null
+        && this.mountPoints == null
+        && this.volumeSize == null
+        && this.diskIops == null
+        && StringUtils.isBlank(this.storageClass)
+        && this.throughput == null;
+  }
+
   @Override
   public boolean equals(Object o) {
     if (this == o) return true;
@@ -86,6 +161,8 @@ public class DeviceInfo {
         && Objects.equals(diskIops, that.diskIops)
         && Objects.equals(throughput, that.throughput)
         && Objects.equals(mountPoints, that.mountPoints)
+        && StringUtils.equals(
+            StringUtils.trimToEmpty(storageClass), StringUtils.trimToEmpty(that.storageClass))
         && storageType == that.storageType;
   }
 
@@ -95,15 +172,22 @@ public class DeviceInfo {
   }
 
   private void checkVolumeBaseInfo() {
+    RuntimeConfGetter runtimeConfGetter =
+        StaticInjectorHolder.injector().instanceOf(RuntimeConfGetter.class);
+    int maxVolumeCount = runtimeConfGetter.getGlobalConf(GlobalConfKeys.maxVolumeCount);
     if (volumeSize == null) {
       throw new PlatformServiceException(BAD_REQUEST, "Volume size field is mandatory");
     } else if (volumeSize <= 0) {
       throw new PlatformServiceException(BAD_REQUEST, "Volume size should be positive");
     }
+
     if (numVolumes == null) {
       throw new PlatformServiceException(BAD_REQUEST, "Number of volumes field is mandatory");
     } else if (numVolumes <= 0) {
       throw new PlatformServiceException(BAD_REQUEST, "Number of volumes should be positive");
+    } else if (numVolumes > maxVolumeCount) {
+      throw new PlatformServiceException(
+          BAD_REQUEST, "Volume number should not exceed maximum limit of " + maxVolumeCount);
     }
   }
 
@@ -111,13 +195,19 @@ public class DeviceInfo {
     if (storageType == null) {
       return;
     }
-    if (diskIops == null) {
-      if (storageType.isIopsProvisioning()) {
+    if (storageType.isIopsProvisioning()) {
+      if (diskIops == null) {
         throw new PlatformServiceException(
             BAD_REQUEST, "Disk IOPS is mandatory for " + storageType.name() + " storage");
       }
-    } else if (diskIops <= 0) {
-      throw new PlatformServiceException(BAD_REQUEST, "Disk IOPS should be positive");
+      Pair<Integer, Integer> iopsRange = storageType.getIopsRange();
+      if (diskIops < iopsRange.getFirst() || diskIops > iopsRange.getSecond()) {
+        throw new PlatformServiceException(
+            BAD_REQUEST,
+            String.format(
+                "Disk IOPS for storage type %s should be in range [%d, %d]",
+                storageType.name(), iopsRange.getFirst(), iopsRange.getSecond()));
+      }
     }
   }
 
@@ -125,13 +215,72 @@ public class DeviceInfo {
     if (storageType == null) {
       return;
     }
-    if (throughput == null) {
-      if (storageType.isThroughputProvisioning()) {
+    if (storageType.isThroughputProvisioning()) {
+      if (throughput == null) {
         throw new PlatformServiceException(
             BAD_REQUEST, "Disk throughput is mandatory for " + storageType.name() + " storage");
       }
-    } else if (throughput <= 0) {
-      throw new PlatformServiceException(BAD_REQUEST, "Disk throughput should be positive");
+      Pair<Integer, Integer> throughputRange = storageType.getThroughputRange();
+      if (throughput < throughputRange.getFirst() || throughput > throughputRange.getSecond()) {
+        throw new PlatformServiceException(
+            BAD_REQUEST,
+            String.format(
+                "Disk throughput for storage type %s should be in range [%d, %d]",
+                storageType.name(), throughputRange.getFirst(), throughputRange.getSecond()));
+      }
     }
+  }
+
+  private void checkVolumeEncryption() {
+    if (cloudVolumeEncryption == null) {
+      return;
+    }
+    // Check runtime conf for volume encryption
+    RuntimeConfGetter runtimeConfGetter =
+        StaticInjectorHolder.injector().instanceOf(RuntimeConfGetter.class);
+    boolean allowCloudVolumeEncryption =
+        runtimeConfGetter.getGlobalConf(GlobalConfKeys.allowCloudVolumeEncryption);
+    if (!allowCloudVolumeEncryption
+        && cloudVolumeEncryption != null
+        && cloudVolumeEncryption.enableVolumeEncryption) {
+      throw new PlatformServiceException(
+          BAD_REQUEST,
+          "Volume encryption runtime config is not enabled. Please turn on runtime config "
+              + "'yb.universe.allow_cloud_volume_encryption' to enable volume encryption.");
+    }
+    if (!Common.CloudType.aws.equals(storageType.getCloudType())) {
+      throw new PlatformServiceException(
+          BAD_REQUEST, "Volume encryption is currently supported only for AWS EBS volumes");
+    }
+    if (cloudVolumeEncryption.enableVolumeEncryption
+        && cloudVolumeEncryption.kmsConfigUUID == null) {
+      throw new PlatformServiceException(
+          BAD_REQUEST, "KMS config UUID is required if volume encryption is enabled");
+    }
+    if (!cloudVolumeEncryption.enableVolumeEncryption
+        && cloudVolumeEncryption.kmsConfigUUID != null) {
+      throw new PlatformServiceException(
+          BAD_REQUEST, "KMS config UUID should not be set when volume encryption is disabled");
+    }
+    KmsConfig kmsConfig = KmsConfig.getOrBadRequest(cloudVolumeEncryption.kmsConfigUUID);
+    if (!KeyProvider.AWS.equals(kmsConfig.getKeyProvider())) {
+      throw new PlatformServiceException(
+          BAD_REQUEST,
+          String.format(
+              "KMS config '%s' must be of provider AWS KMS instead of `%s` for volume"
+                  + " encryption.",
+              cloudVolumeEncryption.kmsConfigUUID, kmsConfig.getKeyProvider()));
+    }
+  }
+
+  public boolean onlyVolumeSizeChanged(DeviceInfo other) {
+    if (this.volumeSize < other.volumeSize) {
+      DeviceInfo thisClone = this.clone();
+      thisClone.volumeSize = other.volumeSize;
+      if (Objects.equals(thisClone, other)) {
+        return true;
+      }
+    }
+    return false;
   }
 }

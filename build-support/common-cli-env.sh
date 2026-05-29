@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 #@IgnoreInspection BashAddShebang
 
-# Copyright (c) YugaByte, Inc.
+# Copyright (c) YugabyteDB, Inc.
 #
 # Licensed under the Apache License, Version 2.0 (the "License"); you may not use this file except
 # in compliance with the License.  You may obtain a copy of the License at
@@ -37,12 +37,12 @@ readonly YB_COMMON_CLI_ENV_SOURCED=1
 # Get variable BUILD_ROOT if it is empty.
 # shellcheck disable=SC2120
 set_build_root_from_latest_if_unset() {
-  expect_num_args 0 "$@"
+  expect_no_args "$#"
   if [[ -z ${BUILD_ROOT:-} ]]; then
     pushd "$YB_SRC_ROOT"/build/latest
     cd -P .
     handle_build_root_from_current_dir
-    popd
+    popd +0
     # shellcheck disable=SC2119
     set_build_root
   else
@@ -54,7 +54,7 @@ set_build_root_from_latest_if_unset() {
 # Get variable YB_THIRDPARTY_DIR if it is empty.
 # shellcheck disable=SC2120
 set_yb_thirdparty_dir_if_unset() {
-  expect_num_args 0 "$@"
+  expect_no_args "$#"
   expect_vars_to_be_set BUILD_ROOT
   if [[ -z ${YB_THIRDPARTY_DIR:-} ]]; then
     find_or_download_thirdparty

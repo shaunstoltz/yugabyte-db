@@ -1,5 +1,5 @@
 //
-// Copyright (c) YugaByte, Inc.
+// Copyright (c) YugabyteDB, Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License"); you may not use this file except
 // in compliance with the License.  You may obtain a copy of the License at
@@ -24,6 +24,7 @@
 
 #include "yb/rpc/connection_context.h"
 #include "yb/rpc/inbound_call.h"
+#include "yb/rpc/reactor_thread_role.h"
 
 #include "yb/util/size_literals.h"
 
@@ -32,9 +33,14 @@ namespace rpc {
 
 class QueueableInboundCall : public InboundCall {
  public:
-  QueueableInboundCall(ConnectionPtr conn, size_t weight_in_bytes,
-                       CallProcessedListener* call_processed_listener)
-      : InboundCall(std::move(conn), nullptr /* rpc_metrics */, call_processed_listener),
+  QueueableInboundCall(ConnectionPtr conn,
+                       size_t weight_in_bytes,
+                       CallProcessedListener* call_processed_listener,
+                       rpc::CallStateListenerFactory* call_state_listener_factory)
+      : InboundCall(std::move(conn),
+                    nullptr /* rpc_metrics */,
+                    call_processed_listener,
+                    call_state_listener_factory),
         weight_in_bytes_(weight_in_bytes) {}
 
   void SetHasReply() {
@@ -76,23 +82,25 @@ class ConnectionContextWithQueue : public ConnectionContextBase,
     return queued_bytes_ <= max_queued_bytes_;
   }
 
-  void Enqueue(std::shared_ptr<QueueableInboundCall> call);
+  void Enqueue(std::shared_ptr<QueueableInboundCall> call) ON_REACTOR_THREAD;
 
   uint64_t ProcessedCallCount() override {
     return processed_call_count_.load(std::memory_order_acquire);
   }
 
-  void Shutdown(const Status& status) override;
+  void Shutdown(const Status& status) ON_REACTOR_THREAD override;
 
  private:
-  void AssignConnection(const ConnectionPtr& conn) override;
-  void DumpPB(const DumpRunningRpcsRequestPB& req, RpcConnectionPB* resp) override;
-  bool Idle(std::string* reason_not_idle = nullptr) override;
-  void QueueResponse(const ConnectionPtr& conn, InboundCallPtr call) override;
+  Status AssignConnection(const ConnectionPtr& conn) override;
+  void DumpPB(const DumpRunningRpcsRequestPB& req, RpcConnectionPB* resp)
+      ON_REACTOR_THREAD override;
+  bool Idle(std::string* reason_not_idle = nullptr)
+      ON_REACTOR_THREAD override;
+  Status QueueResponse(const ConnectionPtr& conn, InboundCallPtr call) override;
   void ListenIdle(IdleListener listener) override { idle_listener_ = std::move(listener); }
 
-  void CallProcessed(InboundCall* call) override;
-  void FlushOutboundQueue(Connection* conn);
+  void CallProcessed(InboundCall* call) ON_REACTOR_THREAD override;
+  void FlushOutboundQueue(Connection* conn) ON_REACTOR_THREAD;
   void FlushOutboundQueueAborted(const Status& status);
 
   const size_t max_concurrent_calls_;
@@ -106,7 +114,9 @@ class ConnectionContextWithQueue : public ConnectionContextBase,
   // first_without_reply_ points to the first of them.
   // There are not more than max_concurrent_calls_ entries in first two groups.
   // After end of queue there are calls that we received but processing did not start for them.
-  std::deque<std::shared_ptr<QueueableInboundCall>> calls_queue_;
+  std::deque<std::shared_ptr<QueueableInboundCall>> calls_queue_
+      GUARDED_BY_REACTOR_THREAD;
+
   std::shared_ptr<ReactorTask> flush_outbound_queue_task_;
 
   // First call that does not have reply yet.

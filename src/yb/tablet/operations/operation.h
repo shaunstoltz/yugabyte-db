@@ -15,9 +15,9 @@
 // specific language governing permissions and limitations
 // under the License.
 //
-// The following only applies to changes made to this file as part of YugaByte development.
+// The following only applies to changes made to this file as part of YugabyteDB development.
 //
-// Portions Copyright (c) YugaByte, Inc.
+// Portions Copyright (c) YugabyteDB, Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License"); you may not use this file except
 // in compliance with the License.  You may obtain a copy of the License at
@@ -35,9 +35,9 @@
 #include <mutex>
 #include <string>
 
-#include <boost/optional/optional.hpp>
-
 #include "yb/common/hybrid_time.h"
+#include "yb/common/opid.h"
+#include "yb/common/wire_protocol.h"
 
 #include "yb/consensus/consensus_fwd.h"
 #include "yb/consensus/consensus_round.h"
@@ -50,7 +50,6 @@
 #include "yb/util/status_fwd.h"
 #include "yb/util/locks.h"
 #include "yb/util/operation_counter.h"
-#include "yb/util/opid.h"
 
 namespace yb {
 
@@ -60,8 +59,7 @@ namespace tablet {
 
 using OperationCompletionCallback = std::function<void(const Status&)>;
 
-YB_DEFINE_ENUM(
-    OperationType,
+YB_DEFINE_ENUM(OperationType,
     ((kWrite, consensus::WRITE_OP))
     ((kChangeMetadata, consensus::CHANGE_METADATA_OP))
     ((kUpdateTransaction, consensus::UPDATE_TRANSACTION_OP))
@@ -70,7 +68,8 @@ YB_DEFINE_ENUM(
     ((kEmpty, consensus::UNKNOWN_OP))
     ((kHistoryCutoff, consensus::HISTORY_CUTOFF_OP))
     ((kSplit, consensus::SPLIT_OP))
-    ((kChangeAutoFlagsConfig, consensus::CHANGE_AUTO_FLAGS_CONFIG_OP)));
+    ((kChangeAutoFlagsConfig, consensus::CHANGE_AUTO_FLAGS_CONFIG_OP))
+    ((kClone, consensus::CLONE_OP)))
 
 YB_STRONGLY_TYPED_BOOL(WasPending);
 YB_STRONGLY_TYPED_BOOL(IsLeaderSide);
@@ -117,7 +116,7 @@ class Operation {
     preparing_token_ = std::move(preparing_token);
   }
 
-  void SubmittedToPreparer() {
+  void ResetPreparingToken() {
     preparing_token_ = ScopedOperation();
   }
 
@@ -170,6 +169,12 @@ class Operation {
     completion_clbk_ = std::move(completion_clbk);
   }
 
+  template <class ReplicateMsg>
+  void SetupFromReplicateMsg(const ReplicateMsg& replicate_msg) {
+    set_hybrid_time(HybridTime::FromPB(replicate_msg.hybrid_time()));
+    set_op_id(OpId::FromPB(replicate_msg.id()));
+  }
+
   // Sets the hybrid_time for the transaction
   void set_hybrid_time(const HybridTime& hybrid_time) EXCLUDES(mutex_);
 
@@ -194,7 +199,7 @@ class Operation {
   // The setter acquires the mutex for historical reasons, even though the corresponding getter does
   // not.
   void set_op_id(const OpId& op_id) EXCLUDES(mutex_) {
-    std::lock_guard<simple_spinlock> l(mutex_);
+    std::lock_guard l(mutex_);
     op_id_.store(op_id, std::memory_order_release);
   }
 

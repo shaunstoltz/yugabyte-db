@@ -1,5 +1,5 @@
 /*
- * Copyright 2021 YugaByte, Inc. and Contributors
+ * Copyright 2021 YugabyteDB, Inc. and Contributors
  *
  * Licensed under the Polyform Free Trial License 1.0.0 (the "License"); you
  * may not use this file except in compliance with the License. You
@@ -11,7 +11,7 @@ package com.yugabyte.yw.common.config.impl;
 
 import com.yugabyte.yw.common.WSClientRefresher;
 import com.yugabyte.yw.common.config.RuntimeConfigChangeListener;
-import play.api.Play;
+import com.yugabyte.yw.common.inject.StaticInjectorHolder;
 
 public class WSClientKeyListener implements RuntimeConfigChangeListener {
 
@@ -27,7 +27,7 @@ public class WSClientKeyListener implements RuntimeConfigChangeListener {
 
   public void processGlobal() {
     WSClientRefresher wsClientRefresher =
-        Play.current().injector().instanceOf(WSClientRefresher.class);
+        StaticInjectorHolder.injector().instanceOf(WSClientRefresher.class);
     wsClientRefresher.refreshWsClient(getKeyPath());
   }
 }

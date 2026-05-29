@@ -1,5 +1,5 @@
 //--------------------------------------------------------------------------------------------------
-// Copyright (c) YugaByte, Inc.
+// Copyright (c) YugabyteDB, Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License"); you may not use this file except
 // in compliance with the License.  You may obtain a copy of the License at
@@ -51,6 +51,8 @@
 #include "yb/util/uuid.h"
 #include "yb/util/yb_partition.h"
 
+DECLARE_bool(cql_revert_to_partial_microsecond_support);
+
 namespace yb {
 
 bool operator ==(const QLValuePB& lhs, const QLValuePB& rhs);
@@ -92,7 +94,8 @@ inline Result<BFRetValue> PartitionHash(const BFParams& params, BFFactory factor
   return result;
 }
 
-inline Result<BFRetValue> ToJson(const BFValue& col, BFFactory factory) {
+template <class Value>
+inline Result<BFRetValue> ToJson(const Value& col, BFFactory factory) {
   common::Jsonb jsonb;
   Status s = jsonb.FromQLValue(col);
 
@@ -207,7 +210,19 @@ inline Result<BFRetValue> NowTime(BFFactory factory) {
 
 inline Result<BFRetValue> NowTimestamp(BFFactory factory) {
   BFRetValue result = factory();
-  result.set_timestamp_value(DateTime::TimestampNow().ToInt64());
+  int64_t value_us = DateTime::TimestampNow().ToInt64();
+  int64_t value_ms = DateTime::FloorTimestamp(
+      value_us, DateTime::kInternalPrecision, DateTime::CqlInputFormat.input_precision);
+
+  if (value_ms != value_us) {
+    YB_LOG_EVERY_N_SECS(WARNING, 300)
+        << "timestamp is inserted in YCQL with microseconds precision";
+  }
+  int64_t value = value_us;
+  if (!FLAGS_cql_revert_to_partial_microsecond_support) {
+    value = value_ms;
+  }
+  result.set_timestamp_value(value);
   return result;
 }
 

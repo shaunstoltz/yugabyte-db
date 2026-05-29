@@ -1,4 +1,4 @@
-// Copyright (c) YugaByte, Inc.
+// Copyright (c) YugabyteDB, Inc.
 
 package model
 
@@ -12,7 +12,6 @@ const (
 	Registering NodeState = "REGISTERING"
 	Ready       NodeState = "READY"
 	Upgrade     NodeState = "UPGRADE"
-	Upgrading   NodeState = "UPGRADING"
 	Upgraded    NodeState = "UPGRADED"
 )
 
@@ -22,5 +21,5 @@ type StateUpdateRequest struct {
 }
 
 type VersionRequest struct {
-	Version string `json:"version"`
+	Version string `json:"version,omitempty"`
 }

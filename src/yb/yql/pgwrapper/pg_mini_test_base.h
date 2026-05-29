@@ -1,4 +1,4 @@
-// Copyright (c) YugaByte, Inc.
+// Copyright (c) YugabyteDB, Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License"); you may not use this file except
 // in compliance with the License.  You may obtain a copy of the License at
@@ -13,28 +13,31 @@
 
 #pragma once
 
-#include <functional>
+#include <memory>
+#include <string>
+#include <vector>
 
 #include "yb/integration-tests/mini_cluster.h"
 #include "yb/integration-tests/yb_mini_cluster_test_base.h"
 
 #include "yb/util/result.h"
+#include "yb/util/status.h"
 
 #include "yb/yql/pgwrapper/libpq_utils.h"
 #include "yb/yql/pgwrapper/pg_wrapper.h"
 
-namespace yb {
-namespace server {
-class RpcServerBase;
-}
-
-namespace pgwrapper {
+namespace yb::pgwrapper {
 
 class PgMiniTestBase : public MiniClusterTestWithClient<MiniCluster> {
  protected:
+  // Use TS-0 IP for PG server. YBC process and PG auto analyze service use this IP.
+  constexpr static size_t kPgTsIndex = 0;
+
   // This allows modifying flags before we start the postgres process in SetUp.
   virtual void BeforePgProcessStart() {
   }
+
+  virtual void EnableYSQLFlags();
 
   void DoTearDown() override;
 
@@ -51,56 +54,49 @@ class PgMiniTestBase : public MiniClusterTestWithClient<MiniCluster> {
   // This allows changing mini cluster options before the mini cluster is started.
   virtual void OverrideMiniClusterOptions(MiniClusterOptions* options);
 
-  // This allows modifying the logic to decide which tablet server to run postgres on -
-  // by default, randomly picked out of all the tablet servers.
-  virtual const std::shared_ptr<tserver::MiniTabletServer> PickPgTabletServer(
-     const MiniCluster::MiniTabletServers& servers);
-
   // This allows passing extra tserver options to the underlying mini cluster.
   virtual std::vector<tserver::TabletServerOptions> ExtraTServerOptions();
 
-  Result<PGConn> Connect() const {
+  PGConnSettings MakeConnSettings(const std::string& dbname = std::string()) const;
+
+  virtual Result<PGConn> Connect() const {
     return ConnectToDB(std::string() /* db_name */);
   }
 
-  Result<PGConn> ConnectToDB(const std::string& dbname) const {
-    return PGConnBuilder({
-      .host = pg_host_port_.host(),
-      .port = pg_host_port_.port(),
-      .dbname = dbname
-    }).Connect();
-  }
+  virtual Result<PGConn> ConnectToDB(const std::string& dbname, size_t timeout = 0) const;
 
   Status RestartCluster();
+
+  Status RestartMaster();
 
   const HostPort& pg_host_port() const {
     return pg_host_port_;
   }
 
-  Result<TableId> GetTableIDFromTableName(const std::string table_name);
+  Result<TableId> GetTableIDFromTableName(const std::string& table_name);
 
   Result<master::CatalogManagerIf*> catalog_manager() const;
+  Result<master::CatalogManager*> catalog_manager_impl() const;
 
- private:
-  Result<PgProcessConf> CreatePgProcessConf(uint16_t port);
+  void FlushAndCompactTablets();
+
+  virtual Status SetupConnection(PGConn* conn) const;
+
+  void EnableFailOnConflict();
+
+  Status SetupPGCallbacksAndStartPG(uint16_t pg_port, size_t pg_ts_idx);
+
+  Status RestartPostgres();
 
   std::unique_ptr<PgSupervisor> pg_supervisor_;
+
+ private:
+  Result<PgProcessConf> CreatePgProcessConf(uint16_t port, size_t ts_idx);
+  Status RecreatePgSupervisor();
+  void StopPostgres();
+  Status StartPostgres();
+
   HostPort pg_host_port_;
 };
 
-class MetricWatcher {
- public:
-  using DeltaFunctor = std::function<Status()>;
-  MetricWatcher(const server::RpcServerBase& server, const MetricPrototype& metric);
-
-  Result<size_t> Delta(const DeltaFunctor& functor) const;
-
- private:
-  Result<size_t> GetMetricCount() const;
-
-  const server::RpcServerBase& server_;
-  const MetricPrototype& metric_;
-};
-
-} // namespace pgwrapper
-} // namespace yb
+} // namespace yb::pgwrapper

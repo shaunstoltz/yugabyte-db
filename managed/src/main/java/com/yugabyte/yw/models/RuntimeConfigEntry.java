@@ -1,3 +1,5 @@
+// Copyright (c) YugabyteDB, Inc.
+
 package com.yugabyte.yw.models;
 
 import static com.yugabyte.yw.models.ScopedRuntimeConfig.GLOBAL_SCOPE_UUID;
@@ -9,15 +11,15 @@ import com.yugabyte.yw.models.helpers.CommonUtils;
 import io.ebean.Finder;
 import io.ebean.Model;
 import io.ebean.annotation.Transactional;
+import jakarta.persistence.EmbeddedId;
+import jakarta.persistence.Entity;
 import java.nio.charset.StandardCharsets;
 import java.util.HashMap;
 import java.util.List;
-import java.util.Optional;
 import java.util.Map;
+import java.util.Optional;
 import java.util.Set;
 import java.util.UUID;
-import javax.persistence.EmbeddedId;
-import javax.persistence.Entity;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -44,6 +46,10 @@ public class RuntimeConfigEntry extends Model {
     return idKey.getPath();
   }
 
+  public UUID getScopeUUID() {
+    return idKey.getScopeUUID();
+  }
+
   public String getValue() {
     return new String(this.value, StandardCharsets.UTF_8);
   }
@@ -60,6 +66,13 @@ public class RuntimeConfigEntry extends Model {
 
   public static List<RuntimeConfigEntry> getAll(UUID scope) {
     return findInScope.query().where().eq("scope_uuid", scope).findList();
+  }
+
+  public static List<RuntimeConfigEntry> getAll(Set<UUID> scopeUuids) {
+    if (scopeUuids == null || scopeUuids.isEmpty()) {
+      return List.of();
+    }
+    return find.query().where().in("scope_uuid", scopeUuids).findList();
   }
 
   @Deprecated
@@ -135,22 +148,24 @@ public class RuntimeConfigEntry extends Model {
 
   @Transactional
   public static RuntimeConfigEntry upsert(Customer customer, String path, String value) {
-    return upsertInternal(customer.uuid, path, value, () -> ScopedRuntimeConfig.ensure(customer));
+    return upsertInternal(
+        customer.getUuid(), path, value, () -> ScopedRuntimeConfig.ensure(customer));
   }
 
   @Transactional
   public static RuntimeConfigEntry upsert(Universe universe, String path, String value) {
     return upsertInternal(
-        universe.universeUUID, path, value, () -> ScopedRuntimeConfig.ensure(universe));
+        universe.getUniverseUUID(), path, value, () -> ScopedRuntimeConfig.ensure(universe));
   }
 
   @Transactional
   public static RuntimeConfigEntry upsert(Provider provider, String path, String value) {
-    return upsertInternal(provider.uuid, path, value, () -> ScopedRuntimeConfig.ensure(provider));
+    return upsertInternal(
+        provider.getUuid(), path, value, () -> ScopedRuntimeConfig.ensure(provider));
   }
 
   @Override
   public String toString() {
-    return "RuntimeConfigEntry{" + "idKey=" + idKey + ", value='" + value + '\'' + '}';
+    return "RuntimeConfigEntry{idKey=" + idKey + ", value='" + value + "\'}";
   }
 }

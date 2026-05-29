@@ -1,4 +1,4 @@
-// Copyright (c) YugaByte, Inc.
+// Copyright (c) YugabyteDB, Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License"); you may not use this file except
 // in compliance with the License.  You may obtain a copy of the License at
@@ -30,6 +30,26 @@ namespace pgwrapper {
 class PgOnConflictTest : public LibPqTestBase {
  protected:
   void TestOnConflict(bool kill_master, const MonoDelta& duration);
+
+  void UpdateMiniClusterOptions(ExternalMiniClusterOptions* opts) override {
+    // Disable tracing for this test to avoid generating too much logging output.
+    opts->extra_tserver_flags.push_back("--enable_tracing=false");
+    opts->extra_master_flags.push_back("--enable_tracing=false");
+  }
+};
+
+class PgFailOnConflictTest : public PgOnConflictTest {
+ protected:
+  void UpdateMiniClusterOptions(ExternalMiniClusterOptions* opts) override {
+    PgOnConflictTest::UpdateMiniClusterOptions(opts);
+    // This test depends on fail-on-conflict concurrency control to perform its validation.
+    // TODO(wait-queues): https://github.com/yugabyte/yugabyte-db/issues/17871
+    opts->extra_tserver_flags.push_back("--enable_wait_queues=false");
+    opts->extra_tserver_flags.push_back("--yb_enable_read_committed_isolation=true");
+    // Disable the tserver's lease expiry check as the window between killing and resuming a master
+    // can exceed the lease TTL.
+    opts->extra_tserver_flags.push_back("--TEST_enable_ysql_operation_lease_expiry_check=false");
+  }
 };
 
 namespace {
@@ -117,7 +137,7 @@ class OnConflictHelper {
 
   std::pair<int, char> RandomPair() {
     size_t i = RandomUniformInt<size_t>(0, concurrent_keys_ - 1);
-    std::lock_guard<std::mutex> lock(mutex_);
+    std::lock_guard lock(mutex_);
     auto& key = active_keys_[i];
     char append_char;
     if (RandomUniformBool()) {
@@ -133,7 +153,7 @@ class OnConflictHelper {
   }
 
   void Committed(TransactionInfo&& info) {
-    std::lock_guard<std::mutex> lock(mutex_);
+    std::lock_guard lock(mutex_);
     committed_.push_back(std::move(info));
   }
 
@@ -269,19 +289,13 @@ void PgOnConflictTest::TestOnConflict(bool kill_master, const MonoDelta& duratio
                 "UPDATE SET v = CONCAT(test.v, '$1')",
                 key_and_appended_char.first, value);
           } else {
-            auto result = connection.FetchFormat(
-                "SELECT v FROM test WHERE k = $0", key_and_appended_char.first);
+            auto result = connection.FetchRows<std::string>(Format(
+                "SELECT v FROM test WHERE k = $0", key_and_appended_char.first));
             if (!result.ok()) {
               status = result.status();
-            } else {
-              auto tuples = PQntuples(result->get());
-              if (tuples == 1) {
-                ASSERT_EQ(PQnfields(result->get()), 1);
-                current_batch.read_value = ASSERT_RESULT(
-                    GetString(result->get(), 0, 0));
-              } else {
-                ASSERT_EQ(tuples, 0);
-              }
+            } else if (!result->empty()) {
+              ASSERT_EQ(result->size(), 1);
+              current_batch.read_value = std::move(result->back());
             }
           }
           if (status.ok()) {
@@ -293,10 +307,9 @@ void PgOnConflictTest::TestOnConflict(bool kill_master, const MonoDelta& duratio
           }
           auto msg = status.message().ToBuffer();
           if (msg.find("Snapshot too old: Snapshot too old.") != std::string::npos ||
-              msg.find("Commit of expired transaction") != std::string::npos ||
+              msg.find("Attempted to commit expired transaction") != std::string::npos ||
               msg.find("Catalog Version Mismatch") != std::string::npos ||
               msg.find("Soft memory limit exceeded") != std::string::npos ||
-              msg.find("Missing metadata for transaction") != std::string::npos ||
               msg.find("timed out after deadline expired") != std::string::npos) {
             break;
           }
@@ -349,17 +362,12 @@ void PgOnConflictTest::TestOnConflict(bool kill_master, const MonoDelta& duratio
   }
 
   for (;;) {
-    auto res = conn.Fetch("SELECT * FROM test ORDER BY k");
-    if (!res.ok()) {
-      ASSERT_TRUE(TransactionalFailure(res.status())) << res.status();
+    auto rows_res = conn.FetchRows<int32_t, std::string>("SELECT * FROM test ORDER BY k");
+    if (!rows_res.ok()) {
+      ASSERT_TRUE(TransactionalFailure(rows_res.status())) << rows_res.status();
       continue;
     }
-    int cols = PQnfields(res->get());
-    ASSERT_EQ(cols, 2);
-    int rows = PQntuples(res->get());
-    for (int i = 0; i != rows; ++i) {
-      auto key = GetInt32(res->get(), i, 0);
-      auto value = GetString(res->get(), i, 1);
+    for (const auto& [key, value] : *rows_res) {
       LOG(INFO) << "  " << key << ": " << value;
     }
     LOG(INFO) << "Total processed: " << processed.load(std::memory_order_acquire);
@@ -369,18 +377,18 @@ void PgOnConflictTest::TestOnConflict(bool kill_master, const MonoDelta& duratio
   helper.Report();
 }
 
-TEST_F(PgOnConflictTest, YB_DISABLE_TEST_IN_TSAN(OnConflict)) {
+TEST_F_EX(PgOnConflictTest, OnConflict, PgFailOnConflictTest) {
   TestOnConflict(false /* kill_master */, 120s);
 }
 
-TEST_F(PgOnConflictTest, YB_DISABLE_TEST_IN_TSAN(OnConflictWithKillMaster)) {
+TEST_F_EX(PgOnConflictTest, OnConflictWithKillMaster, PgFailOnConflictTest) {
   TestOnConflict(true /* kill_master */, 180s);
 }
 
 // When auto-commit fails block state switched to TBLOCK_ABORT.
 // But correct state in this case is TBLOCK_DEFAULT.
 // https://github.com/YugaByte/yugabyte-db/commit/73e966e5735efc21bf2ad43f9d961a488afbe050
-TEST_F(PgOnConflictTest, YB_DISABLE_TEST_IN_TSAN(NoTxnOnConflict)) {
+TEST_F(PgOnConflictTest, NoTxnOnConflict) {
   constexpr int kWriters = 5;
   constexpr int kKeys = 20;
   auto conn = ASSERT_RESULT(Connect());
@@ -409,21 +417,143 @@ TEST_F(PgOnConflictTest, YB_DISABLE_TEST_IN_TSAN(NoTxnOnConflict)) {
   }
 
   thread_holder.WaitAndStop(30s);
-  LogResult(ASSERT_RESULT(conn.Fetch("SELECT * FROM test ORDER BY k")).get());
+  LOG(INFO) << yb::ToString(ASSERT_RESULT((conn.FetchRows<int32_t, std::string>(
+      "SELECT * FROM test ORDER BY k"))));
 }
 
-TEST_F(PgOnConflictTest, YB_DISABLE_TEST_IN_TSAN(ValidSessionAfterTxnCommitConflict)) {
+TEST_F_EX(PgOnConflictTest, ValidSessionAfterTxnCommitConflict, PgFailOnConflictTest) {
   auto conn = ASSERT_RESULT(Connect());
   ASSERT_OK(conn.Execute("CREATE TABLE test (k int PRIMARY KEY)"));
-  ASSERT_OK(conn.Execute("BEGIN"));
+  ASSERT_OK(conn.Execute("BEGIN TRANSACTION ISOLATION LEVEL REPEATABLE READ"));
   ASSERT_OK(conn.Execute("INSERT INTO test VALUES(1)"));
   auto extra_conn = ASSERT_RESULT(Connect());
   ASSERT_OK(extra_conn.Execute("INSERT INTO test VALUES(1)"));
   ASSERT_NOK(conn.Execute("COMMIT"));
   // Check connection is in valid state after failed COMMIT
-  auto result_ptr = ASSERT_RESULT(conn.Fetch("SELECT * FROM test"));
-  auto value = ASSERT_RESULT(GetInt32(result_ptr.get(), 0, 0));
-  ASSERT_EQ(value, 1);
+  ASSERT_EQ(ASSERT_RESULT(conn.FetchRow<int32_t>("SELECT * FROM test")), 1);
+}
+
+// When a single statement Read Committed transaction executed outside of a begin block faces a
+// kConflict, PG backend could sleep for a while delaying the next rpc which restarts the txn.
+// PgClientSession early aborts such transactions before returning kConflict to the PG backend
+// so as to progress other transactions waiting on a set of locks that could have been acquired
+// by the former transaction. The below test asserts that such transactions are early aborted at
+// PgClientSession.
+//
+// Note: The test is intended to be run with Fail-On-Conflict conflict management policy because
+// we only sleep between query layer retries in Fail-on-Conflict mode.
+TEST_F_EX(PgOnConflictTest, EarlyAbortSingleStatementReadCommittedTxn, PgFailOnConflictTest) {
+  constexpr int kClients = 3;
+  constexpr int kIters = 100;
+  constexpr int kStatementTimeoutMs = 10000 * kTimeMultiplier;
+
+  auto conn = ASSERT_RESULT(Connect());
+  ASSERT_OK(conn.Execute("CREATE TABLE foo(k INT PRIMARY KEY, v INT)"));
+  ASSERT_OK(conn.Execute("INSERT INTO foo SELECT generate_series(1, 10), 0"));
+
+  ASSERT_OK(conn.StartTransaction(IsolationLevel::READ_COMMITTED));
+  ASSERT_OK(conn.Fetch("SELECT * FROM foo WHERE k=1 FOR UPDATE"));
+
+  TestThreadHolder thread_holder;
+  for (int i = 0; i < kClients; i++) {
+    thread_holder.AddThreadFunctor([&]{
+      auto conn = ASSERT_RESULT(Connect());
+      ASSERT_OK(conn.ExecuteFormat("SET statement_timeout=$0", kStatementTimeoutMs * 2));
+      while (!thread_holder.stop_flag()) {
+        // RPCs to different tablets would be made in parallel, so the transaction would obtain
+        // locks at a few tablets and kConflict at the rest. PG backend would retry the transaction
+        // for a couple of times with sleeps in between, before the statement timesout.
+        ASSERT_NOK(conn.Execute("UPDATE foo SET v=1 WHERE k>=1"));
+      }
+    });
+  }
+
+  thread_holder.AddThreadFunctor([&]{
+    auto conn = ASSERT_RESULT(Connect());
+    ASSERT_OK(conn.ExecuteFormat("SET statement_timeout=$0", kStatementTimeoutMs / 2));
+    for (int i = 0; i < kIters; i++) {
+      // Since PgClientSession would early abort the above conflicting transactions before the sleep
+      // amidst retries in the backend, this statement should get enough window for the updates.
+      ASSERT_OK(conn.Execute("UPDATE foo SET v=1 WHERE k>=2"));
+    }
+  });
+  thread_holder.Wait(30s * kTimeMultiplier);
+}
+
+// Main thread: Dist write + fast path write
+// Issue #30551: fast path write may miss the dist write before it.
+// Case: INSERT --> UPDATE
+TEST_F(PgOnConflictTest, InconsistentFastPathUpdate) {
+  constexpr auto kTimeout = 300s;
+  constexpr int kBatchSize = 5000;
+  constexpr int kDeleterBatchThreshold = 2;
+
+  auto setup_conn = ASSERT_RESULT(Connect());
+  ASSERT_OK(setup_conn.Execute(
+      "CREATE TABLE monitor_probe ("
+      "  batch_id       BIGINT NOT NULL,"
+      "  sequence_num   BIGINT NOT NULL,"
+      "  update_payload TEXT,"
+      "  PRIMARY KEY ((batch_id, sequence_num) HASH)"
+      ")"));
+
+  TestThreadHolder thread_holder;
+  std::atomic<int64_t> completed_batches{0};
+  std::atomic<int64_t> deleter_last_deleted_batch{-1};
+
+  // Writer: INSERT + UPDATE each row (5000 rows/batch), tracks completed batches.
+  thread_holder.AddThreadFunctor(
+      [this, &stop = thread_holder.stop_flag(), &completed_batches] {
+    auto conn = ASSERT_RESULT(Connect());
+    int64_t batch_id = 0;
+    while (!stop.load()) {
+      for (int seq = 0; seq < kBatchSize && !stop.load(); ++seq) {
+        ASSERT_OK(conn.ExecuteFormat(
+            "INSERT INTO monitor_probe (batch_id, sequence_num, update_payload) "
+            "VALUES ($0, $1, 'inserted') ON CONFLICT (batch_id, sequence_num) DO NOTHING",
+            batch_id, seq));
+        auto res = ASSERT_RESULT(conn.FetchRows<std::string>(Format(
+            "UPDATE monitor_probe SET update_payload = 'updated' "
+            "WHERE batch_id = $0 AND sequence_num = $1 RETURNING update_payload",
+            batch_id, seq)));
+        ASSERT_EQ(res.size(), 1)
+            << "UPDATE affected 0 rows (row disappeared): batch=" << batch_id
+            << " seq=" << seq;
+      }
+      completed_batches.store(batch_id + 1);
+      LOG(INFO) << "Writer completed batch " << batch_id;
+      ++batch_id;
+    }
+  });
+
+  // Deleter: removes entire batches once writer is 2+ batches ahead.
+  thread_holder.AddThreadFunctor(
+      [this, &stop = thread_holder.stop_flag(),
+       &completed_batches, &deleter_last_deleted_batch] {
+    auto conn = ASSERT_RESULT(Connect());
+    while (!stop.load()) {
+      auto completed = completed_batches.load();
+      auto last_deleted = deleter_last_deleted_batch.load();
+      auto batch_to_delete = last_deleted + 1;
+      if (batch_to_delete < completed &&
+          (completed - 1 - last_deleted) >= kDeleterBatchThreshold) {
+        // Do not ASSERT that the DELETE is successful.
+        // DELETE may fail due to the issue described in #30563.
+        auto s = conn.ExecuteFormat(
+            "DELETE FROM monitor_probe WHERE batch_id = $0", batch_to_delete);
+        if (!s.ok()) {
+          LOG(WARNING) << "Delete of batch " << batch_to_delete << " failed: " << s;
+          continue;
+        }
+        deleter_last_deleted_batch.store(batch_to_delete);
+        LOG(INFO) << "Deleter completed batch " << batch_to_delete;
+      } else {
+        SleepFor(10ms);
+      }
+    }
+  });
+
+  thread_holder.WaitAndStop(kTimeout);
 }
 
 } // namespace pgwrapper

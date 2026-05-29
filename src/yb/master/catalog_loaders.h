@@ -15,9 +15,9 @@
 // specific language governing permissions and limitations
 // under the License.
 //
-// The following only applies to changes made to this file as part of YugaByte development.
+// The following only applies to changes made to this file as part of YugabyteDB development.
 //
-// Portions Copyright (c) YugaByte, Inc.
+// Portions Copyright (c) YugabyteDB, Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License"); you may not use this file except
 // in compliance with the License.  You may obtain a copy of the License at
@@ -36,8 +36,9 @@
 
 #include <boost/preprocessor/cat.hpp>
 
-#include "yb/master/master_fwd.h"
+#include "yb/master/catalog_loading_state.h"
 #include "yb/master/catalog_manager.h"
+#include "yb/master/master_fwd.h"
 #include "yb/master/permissions_manager.h"
 #include "yb/master/sys_catalog.h"
 
@@ -48,18 +49,17 @@ namespace master {
   class BOOST_PP_CAT(name, Loader) : \
       public Visitor<BOOST_PP_CAT(BOOST_PP_CAT(Persistent, name), Info)> { \
   public: \
-    explicit BOOST_PP_CAT(name, Loader)( \
-        CatalogManager* catalog_manager, int64_t term = OpId::kUnknownTerm) \
-        : catalog_manager_(catalog_manager), term_(term) {} \
+    explicit BOOST_PP_CAT(name, Loader)(CatalogManager* catalog_manager, \
+                                        SysCatalogLoadingState* state) \
+      : catalog_manager_(catalog_manager), state_(state) {} \
     \
   private: \
     Status Visit( \
         const key_type& key, \
-        const entry_pb_name& metadata) override REQUIRES(mutex); \
+        const entry_pb_name& metadata) REQUIRES(mutex) override; \
     \
-    CatalogManager *catalog_manager_; \
-    \
-    int64_t term_; \
+    CatalogManager* catalog_manager_; \
+    SysCatalogLoadingState* state_ MAYBE_UNUSED_MEMBER; \
     \
     DISALLOW_COPY_AND_ASSIGN(BOOST_PP_CAT(name, Loader)); \
   };
@@ -91,11 +91,11 @@ DECLARE_LOADER_CLASS(Namespace,     NamespaceId, SysNamespaceEntryPB,     catalo
 DECLARE_LOADER_CLASS(UDType,        UDTypeId,    SysUDTypeEntryPB,        catalog_manager_->mutex_);
 DECLARE_LOADER_CLASS(ClusterConfig, std::string, SysClusterConfigEntryPB, catalog_manager_->mutex_);
 DECLARE_LOADER_CLASS(RedisConfig,   std::string, SysRedisConfigEntryPB,   catalog_manager_->mutex_);
-DECLARE_LOADER_CLASS(Role,       RoleName,    SysRoleEntryPB,
-    catalog_manager_->permissions_manager()->mutex());
+DECLARE_LOADER_CLASS(ObjectLock,    std::string, SysObjectLockEntryPB,    catalog_manager_->mutex_);
+DECLARE_LOADER_CLASS(Role,          RoleName,    SysRoleEntryPB,
+                     catalog_manager_->permissions_manager()->mutex());
 DECLARE_LOADER_CLASS(SysConfig,     std::string, SysConfigEntryPB,
-    catalog_manager_->permissions_manager()->mutex());
-DECLARE_LOADER_CLASS(XClusterSafeTime, std::string, XClusterSafeTimePB, catalog_manager_->mutex_);
+                     catalog_manager_->permissions_manager()->mutex());
 
 #undef DECLARE_LOADER_CLASS
 

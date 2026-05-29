@@ -1,5 +1,5 @@
 //
-// Copyright (c) YugaByte, Inc.
+// Copyright (c) YugabyteDB, Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License"); you may not use this file except
 // in compliance with the License.  You may obtain a copy of the License at
@@ -15,16 +15,24 @@
 
 #pragma once
 
+#include <memory>
+#include <vector>
+
 #include "yb/gutil/ref_counted.h"
 
-namespace yb {
-namespace server {
+#include "yb/util/net/net_fwd.h"
+
+namespace yb::server {
 
 class Clock;
 class GenericServiceProxy;
 class MonitoredTask;
+class RpcServerBase;
+class RunnableMonitoredTask;
+enum class MonitoredTaskState : int;
 
 using ClockPtr = scoped_refptr<Clock>;
+using MasterAddresses = std::vector<std::vector<HostPort>>;
+using MasterAddressesPtr = std::shared_ptr<const MasterAddresses>;
 
-} // namespace server
-} // namespace yb
+} // namespace yb::server

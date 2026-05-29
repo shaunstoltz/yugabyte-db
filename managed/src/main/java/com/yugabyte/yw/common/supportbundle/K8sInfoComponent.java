@@ -1,5 +1,5 @@
 /*
- * Copyright 2022 YugaByte, Inc. and Contributors
+ * Copyright 2022 YugabyteDB, Inc. and Contributors
  *
  * Licensed under the Polyform Free Trial License 1.0.0 (the "License"); you
  * may not use this file except in compliance with the License. You
@@ -10,24 +10,28 @@
  */
 package com.yugabyte.yw.common.supportbundle;
 
+import com.google.inject.Inject;
+import com.google.inject.Singleton;
 import com.typesafe.config.Config;
+import com.yugabyte.yw.commissioner.tasks.params.SupportBundleTaskParams;
+import com.yugabyte.yw.common.KubernetesManager;
+import com.yugabyte.yw.common.KubernetesManagerFactory;
 import com.yugabyte.yw.common.KubernetesUtil;
+import com.yugabyte.yw.common.PlacementInfoUtil;
+import com.yugabyte.yw.common.SupportBundleUtil;
+import com.yugabyte.yw.common.SupportBundleUtil.KubernetesCluster;
+import com.yugabyte.yw.common.SupportBundleUtil.KubernetesResourceType;
+import com.yugabyte.yw.common.Util;
+import com.yugabyte.yw.forms.SupportBundleFormData;
 import com.yugabyte.yw.forms.UniverseDefinitionTaskParams;
 import com.yugabyte.yw.forms.UniverseDefinitionTaskParams.Cluster;
 import com.yugabyte.yw.forms.UniverseDefinitionTaskParams.ClusterType;
 import com.yugabyte.yw.models.AvailabilityZone;
 import com.yugabyte.yw.models.Customer;
 import com.yugabyte.yw.models.Provider;
-import com.google.inject.Inject;
-import com.google.inject.Singleton;
-import com.yugabyte.yw.common.KubernetesManager;
-import com.yugabyte.yw.common.KubernetesManagerFactory;
-import com.yugabyte.yw.common.PlacementInfoUtil;
-import com.yugabyte.yw.common.SupportBundleUtil;
-import com.yugabyte.yw.common.SupportBundleUtil.KubernetesCluster;
-import com.yugabyte.yw.common.SupportBundleUtil.KubernetesResourceType;
 import com.yugabyte.yw.models.Universe;
 import com.yugabyte.yw.models.helpers.NodeDetails;
+import java.io.IOException;
 import java.nio.file.Path;
 import java.util.ArrayList;
 import java.util.Arrays;
@@ -37,7 +41,6 @@ import java.util.List;
 import java.util.Map;
 import java.util.Set;
 import java.util.UUID;
-import java.io.IOException;
 import lombok.extern.slf4j.Slf4j;
 
 @Slf4j
@@ -90,13 +93,13 @@ class K8sInfoComponent implements SupportBundleComponent {
 
       // Run the kubectl get resource commands to the respective output files.
       for (KubernetesResourceType kubernetesResourceType : k8sResourcesWithOutput) {
+        String localFilePath =
+            String.format(
+                "%s/get_%s.%s",
+                dbNamespaceDirPath,
+                kubernetesResourceType.toString().toLowerCase(),
+                SupportBundleUtil.kubectlOutputFormat);
         try {
-          String localFilePath =
-              String.format(
-                  "%s/get_%s.%s",
-                  dbNamespaceDirPath,
-                  kubernetesResourceType.toString().toLowerCase(),
-                  SupportBundleUtil.kubectlOutputFormat);
 
           String resourceOutput =
               kubernetesManagerFactory
@@ -108,20 +111,23 @@ class K8sInfoComponent implements SupportBundleComponent {
                       SupportBundleUtil.kubectlOutputFormat);
           supportBundleUtil.writeStringToFile(resourceOutput, localFilePath);
         } catch (Exception e) {
-          log.error(
+          supportBundleUtil.logK8sError(
               String.format(
                   "Error when getting kubectl resource type '%s' on namespace '%s : ",
                   kubernetesResourceType.toString().toLowerCase(), namespaceToAzName.getKey()),
-              e);
+              e,
+              localFilePath);
         }
       }
 
+      String localFilePath =
+          dbNamespaceDirPath
+              + String.format(
+                  "/get_%s.txt", KubernetesResourceType.SECRETS.toString().toLowerCase());
+
       // Get just secrets names without specifying output format.
       try {
-        String localFilePath =
-            dbNamespaceDirPath
-                + String.format(
-                    "/get_%s.txt", KubernetesResourceType.SECRETS.toString().toLowerCase());
+
         String resourceOutput =
             kubernetesManagerFactory
                 .getManager()
@@ -132,33 +138,32 @@ class K8sInfoComponent implements SupportBundleComponent {
                     null);
         supportBundleUtil.writeStringToFile(resourceOutput, localFilePath);
       } catch (Exception e) {
-        log.error(
+        supportBundleUtil.logK8sError(
             String.format(
                 "Error when getting kubectl resource type '%s' on namespace '%s : ",
                 KubernetesResourceType.SECRETS.toString().toLowerCase(),
                 namespaceToAzName.getKey()),
-            e);
+            e,
+            localFilePath);
       }
 
       // Get all events with filtered output.
       try {
+        localFilePath = dbNamespaceDirPath + "/get_events.txt";
         kubernetesManagerFactory
             .getManager()
-            .getEvents(
-                kubernetesCluster.config,
-                namespaceToAzName.getKey(),
-                dbNamespaceDirPath + "/get_events.txt");
+            .getEvents(kubernetesCluster.config, namespaceToAzName.getKey(), localFilePath);
       } catch (Exception e) {
-        log.error(
+        supportBundleUtil.logK8sError(
             String.format(
                 "Error when getting kubectl resource type '%s' on namespace '%s : ",
                 KubernetesResourceType.EVENTS.toString().toLowerCase(), namespaceToAzName.getKey()),
-            e);
+            e,
+            localFilePath);
       }
 
       // Get helm values
-      Provider provider =
-          Provider.getOrBadRequest(UUID.fromString(universeCluster.userIntent.provider));
+      Provider provider = Util.getSingleProvider(universeCluster);
       boolean isMultiAz = PlacementInfoUtil.isMultiAZ(provider);
       boolean isReadOnlyUniverseCluster = universeCluster.clusterType == ClusterType.ASYNC;
       String helmReleaseName =
@@ -170,7 +175,7 @@ class K8sInfoComponent implements SupportBundleComponent {
               isReadOnlyUniverseCluster,
               newNamingStyle);
       try {
-        String localFilePath =
+        localFilePath =
             String.format(
                 "%s/get_helm_values.%s", dbNamespaceDirPath, SupportBundleUtil.kubectlOutputFormat);
         String resourceOutput =
@@ -183,10 +188,11 @@ class K8sInfoComponent implements SupportBundleComponent {
                     SupportBundleUtil.kubectlOutputFormat);
         supportBundleUtil.writeStringToFile(resourceOutput, localFilePath);
       } catch (Exception e) {
-        log.error(
+        supportBundleUtil.logK8sError(
             String.format(
                 "Error when getting helm values on namespace '%s' : ", namespaceToAzName.getKey()),
-            e);
+            e,
+            localFilePath);
       }
       log.debug("Finished running commands on the db namespace: " + namespaceToAzName.getKey());
     }
@@ -202,7 +208,7 @@ class K8sInfoComponent implements SupportBundleComponent {
   public void runCommandsOnPlatformNamespace(String platformNamespace, String destDir)
       throws IOException {
     // Create the platform namespace directory
-    String platformNamespaceDirPath = destDir + "/" + "platform_namespace_" + platformNamespace;
+    String platformNamespaceDirPath = destDir + "/platform_namespace_" + platformNamespace;
     supportBundleUtil.createDirectories(platformNamespaceDirPath);
 
     // Get pods, events, configmaps, services with full output to the platform namespace directory
@@ -213,13 +219,14 @@ class K8sInfoComponent implements SupportBundleComponent {
             KubernetesResourceType.CONFIGMAPS,
             KubernetesResourceType.SERVICES);
     for (KubernetesResourceType kubernetesResourceType : k8sResourcesWithOutput) {
+      String localFilePath =
+          String.format(
+              "%s/get_%s.%s",
+              platformNamespaceDirPath,
+              kubernetesResourceType.toString().toLowerCase(),
+              SupportBundleUtil.kubectlOutputFormat);
       try {
-        String localFilePath =
-            String.format(
-                "%s/get_%s.%s",
-                platformNamespaceDirPath,
-                kubernetesResourceType.toString().toLowerCase(),
-                SupportBundleUtil.kubectlOutputFormat);
+
         String resourceOutput =
             kubernetesManagerFactory
                 .getManager()
@@ -230,11 +237,12 @@ class K8sInfoComponent implements SupportBundleComponent {
                     SupportBundleUtil.kubectlOutputFormat);
         supportBundleUtil.writeStringToFile(resourceOutput, localFilePath);
       } catch (Exception e) {
-        log.error(
+        supportBundleUtil.logK8sError(
             String.format(
                 "Error when getting kubectl resource type '%s' on platform namespace '%s : ",
                 kubernetesResourceType.toString().toLowerCase(), platformNamespace),
-            e);
+            e,
+            localFilePath);
       }
     }
     log.debug("Finished running commands on the default platform namespace.");
@@ -265,7 +273,7 @@ class K8sInfoComponent implements SupportBundleComponent {
     for (Map.Entry<UUID, Map<String, String>> entry : azToConfig.entrySet()) {
       UUID azUuid = entry.getKey();
       Map<String, String> azConfig = entry.getValue();
-      String azName = AvailabilityZone.getOrBadRequest(azUuid).name;
+      String azName = AvailabilityZone.getOrBadRequest(azUuid).getName();
       String kubernetesClusterName =
           kubernetesManagerFactory.getManager().getCurrentContext(azConfig);
       String namespace =
@@ -292,14 +300,19 @@ class K8sInfoComponent implements SupportBundleComponent {
 
   @Override
   public void downloadComponent(
-      Customer customer, Universe universe, Path bundlePath, NodeDetails node) throws Exception {
+      SupportBundleTaskParams supportBundleTaskParams,
+      Customer customer,
+      Universe universe,
+      Path bundlePath,
+      NodeDetails node)
+      throws Exception {
     try {
       log.debug("Starting downloadComponent() on K8sInfoComponent");
 
       KubernetesManager kubernetesManager = kubernetesManagerFactory.getManager();
 
       // Create the component directory in the support bundle.
-      String destDir = bundlePath.toString() + "/" + "k8s_info";
+      String destDir = bundlePath.toString() + "/k8s_info";
       supportBundleUtil.createDirectories(destDir);
 
       // Get all clusters in the universe (primary, read replicas).
@@ -313,9 +326,8 @@ class K8sInfoComponent implements SupportBundleComponent {
       //     Run the kubectl commands and get the output to a file.
       for (Cluster universeCluster : universeClusters) {
         Map<UUID, Map<String, String>> azToConfig =
-            KubernetesUtil.getConfigPerAZ(universeCluster.placementInfo);
-        Provider provider =
-            Provider.getOrBadRequest(UUID.fromString(universeCluster.userIntent.provider));
+            KubernetesUtil.getConfigPerAZ(universeCluster.getOverallPlacement());
+        Provider provider = Util.getSingleProvider(universeCluster);
         boolean isMultiAz = PlacementInfoUtil.isMultiAZ(provider);
         boolean isReadOnlyUniverseCluster = universeCluster.clusterType == ClusterType.ASYNC;
 
@@ -339,40 +351,41 @@ class K8sInfoComponent implements SupportBundleComponent {
           supportBundleUtil.createDirectories(kubernetesClusterDir);
 
           // Get the kubectl version output to a file
+          String localFilePath =
+              String.format(
+                  "%s/kubectl_version.%s",
+                  kubernetesClusterDir, SupportBundleUtil.kubectlOutputFormat);
           try {
-            String localFilePath =
-                String.format(
-                    "%s/kubectl_version.%s",
-                    kubernetesClusterDir, SupportBundleUtil.kubectlOutputFormat);
+
             String resourceOutput =
                 kubernetesManager.getK8sVersion(
                     kubernetesCluster.config, SupportBundleUtil.kubectlOutputFormat);
             supportBundleUtil.writeStringToFile(resourceOutput, localFilePath);
           } catch (Exception e) {
-            log.error(
+            supportBundleUtil.logK8sError(
                 String.format(
                     "Error when getting kubectl version on universe (%s, %s) : ",
-                    universe.universeUUID.toString(), universe.name),
-                e);
+                    universe.getUniverseUUID().toString(), universe.getName()),
+                e,
+                localFilePath);
           }
 
           // Get the service account permissions on the cluster (with the service account name from
           // the provider config) to a file.
-          String serviceAccountName = supportBundleUtil.getServiceAccountName(provider);
+          String serviceAccountName =
+              supportBundleUtil.getServiceAccountName(
+                  provider, kubernetesManager, kubernetesCluster.config);
           String serviceAccountDir = kubernetesClusterDir + "/service_account_info";
           supportBundleUtil.createDirectories(serviceAccountDir);
-          try {
-            supportBundleUtil.getServiceAccountPermissionsToFile(
-                kubernetesManager, kubernetesCluster.config, serviceAccountName, serviceAccountDir);
-            log.debug("Finished getting service account permissions.");
-          } catch (Exception e) {
-            log.error(
-                String.format(
-                    "Error when getting service account permissions for "
-                        + "service account '%s' on universe (%s, %s) : ",
-                    serviceAccountName, universe.universeUUID.toString(), universe.name),
-                e);
-          }
+
+          supportBundleUtil.getServiceAccountPermissionsToFile(
+              kubernetesManager,
+              kubernetesCluster.config,
+              serviceAccountName,
+              serviceAccountDir,
+              universe.getUniverseUUID(),
+              universe.getName());
+          log.debug("Finished getting service account permissions.");
 
           runCommandsOnDbNamespaces(
               universeCluster,
@@ -384,7 +397,7 @@ class K8sInfoComponent implements SupportBundleComponent {
           // Get the storage class info for that cluster
           Set<String> allStorageClassNames =
               supportBundleUtil.getAllStorageClassNames(
-                  universe.name,
+                  universe.getName(),
                   kubernetesManager,
                   kubernetesCluster,
                   isMultiAz,
@@ -396,23 +409,23 @@ class K8sInfoComponent implements SupportBundleComponent {
                 String.format(
                     "%s/storageclass_%s.%s",
                     kubernetesClusterDir, storageClassName, SupportBundleUtil.kubectlOutputFormat);
+
+            localFilePath = storageClassFilePath;
             try {
-              String localFilePath = storageClassFilePath;
               String resourceOutput =
                   kubernetesManager.getStorageClass(
                       kubernetesCluster.config,
                       storageClassName,
-                      null,
                       SupportBundleUtil.kubectlOutputFormat);
               supportBundleUtil.writeStringToFile(resourceOutput, localFilePath);
             } catch (Exception e) {
-              log.error(
-                  "Error when getting storageclass info for "
-                      + "storageclass '{}' on universe ({}, {}) : ",
-                  storageClassName,
-                  universe.universeUUID.toString(),
-                  universe.name,
-                  e);
+              supportBundleUtil.logK8sError(
+                  String.format(
+                      "Error when getting storageclass info for "
+                          + "storageclass '%s' on universe (%s, %s) : ",
+                      storageClassName, universe.getUniverseUUID().toString(), universe.getName()),
+                  e,
+                  localFilePath);
             }
           }
         }
@@ -422,13 +435,14 @@ class K8sInfoComponent implements SupportBundleComponent {
       log.error(
           String.format(
               "Error when downloading K8sInfoComponent on universe (%s, %s) : ",
-              universe.universeUUID.toString(), universe.name),
+              universe.getUniverseUUID().toString(), universe.getName()),
           e);
     }
   }
 
   @Override
   public void downloadComponentBetweenDates(
+      SupportBundleTaskParams supportBundleTaskParams,
       Customer customer,
       Universe universe,
       Path bundlePath,
@@ -436,6 +450,22 @@ class K8sInfoComponent implements SupportBundleComponent {
       Date endDate,
       NodeDetails node)
       throws Exception {
-    this.downloadComponent(customer, universe, bundlePath, node);
+    this.downloadComponent(supportBundleTaskParams, customer, universe, bundlePath, node);
+  }
+
+  // This component collects few yaml conf files only, so instead of getting the actual file
+  // sizes from db nodes just adding 300KB. Shouldn't affect end
+  // result too much.
+  public Map<String, Long> getFilesListWithSizes(
+      Customer customer,
+      SupportBundleFormData bundleData,
+      Universe universe,
+      Date startDate,
+      Date endDate,
+      NodeDetails node)
+      throws Exception {
+    Map<String, Long> res = new HashMap<String, Long>();
+    res.put("default value", 300000L);
+    return res;
   }
 }

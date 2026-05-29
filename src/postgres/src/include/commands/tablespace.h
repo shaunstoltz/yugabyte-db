@@ -4,7 +4,7 @@
  *		Tablespace management commands (create/drop tablespace).
  *
  *
- * Portions Copyright (c) 1996-2018, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2022, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  * src/include/commands/tablespace.h
@@ -18,6 +18,8 @@
 #include "catalog/objectaddress.h"
 #include "lib/stringinfo.h"
 #include "nodes/parsenodes.h"
+
+extern PGDLLIMPORT bool allow_in_place_tablespaces;
 
 /* XLOG stuff */
 #define XLOG_TBLSPC_CREATE		0x00
@@ -40,15 +42,16 @@ typedef struct TableSpaceOpts
 	float8		random_page_cost;
 	float8		seq_page_cost;
 	int			effective_io_concurrency;
+	int			maintenance_io_concurrency;
 } TableSpaceOpts;
 
 typedef struct YBTableSpaceOpts
 {
-	int32   vl_len_;    /* varlena header (do not touch directly!) */
-	int    placement_offset;
+	int32		vl_len_;		/* varlena header (do not touch directly!) */
+	int			placement_offset;
+	int			read_replica_placement_offset;
 } YBTableSpaceOpts;
 
-extern void validatePlacementConfiguration(const char *value);
 extern Oid	CreateTableSpace(CreateTableSpaceStmt *stmt);
 extern void DropTableSpace(DropTableSpaceStmt *stmt);
 extern ObjectAddress RenameTableSpace(const char *oldname, const char *newname);
@@ -56,14 +59,12 @@ extern Oid	AlterTableSpaceOptions(AlterTableSpaceOptionsStmt *stmt);
 
 extern void TablespaceCreateDbspace(Oid spcNode, Oid dbNode, bool isRedo);
 
-extern Oid	GetDefaultTablespace(char relpersistence);
+extern Oid	GetDefaultTablespace(char relpersistence, bool partitioned);
 
 extern void PrepareTempTablespaces(void);
 
 extern Oid	get_tablespace_oid(const char *tablespacename, bool missing_ok);
 extern char *get_tablespace_name(Oid spc_oid);
-extern void yb_get_tablespace_options(Datum **options, int *num_options,
-									  Oid spc_oid);
 
 extern bool directory_is_empty(const char *path);
 extern void remove_tablespace_symlink(const char *linkloc);
@@ -71,5 +72,11 @@ extern void remove_tablespace_symlink(const char *linkloc);
 extern void tblspc_redo(XLogReaderState *rptr);
 extern void tblspc_desc(StringInfo buf, XLogReaderState *rptr);
 extern const char *tblspc_identify(uint8 info);
+
+/* YB */
+extern void validatePlacementConfigurations(const char *live_placement,
+											const char *read_replica_placement);
+extern void yb_get_tablespace_options(Datum **options, int *num_options,
+									  Oid spc_oid);
 
 #endif							/* TABLESPACE_H */

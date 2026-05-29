@@ -1,5 +1,5 @@
 //
-// Copyright (c) YugaByte, Inc.
+// Copyright (c) YugabyteDB, Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License"); you may not use this file except
 // in compliance with the License.  You may obtain a copy of the License at
@@ -16,6 +16,8 @@
 #include "yb/client/transaction_rpc.h"
 
 #include <boost/preprocessor/cat.hpp>
+
+#include "yb/ash/wait_state.h"
 
 #include "yb/client/client.h"
 #include "yb/client/tablet_rpc.h"
@@ -75,6 +77,10 @@ class TransactionRpcBase : public rpc::Rpc, public internal::TabletRpc {
     rpc::Rpc::Abort();
   }
 
+  internal::TabletInvoker& GetInvoker() {
+    return invoker_;
+  }
+
  private:
   void SendRpcToTserver(int attempt_num) override {
     InvokeAsync(invoker_.proxy().get(),
@@ -108,8 +114,27 @@ class TransactionRpc : public TransactionRpcBase {
 
   virtual ~TransactionRpc() {}
 
-  const tserver::TabletServerErrorPB* response_error() const override {
-    return resp_.has_error() ? &resp_.error() : nullptr;
+  TabletServerErrorPtr response_error() const override {
+    return TabletServerErrorPtr(resp_.has_error() ? &resp_.error() : nullptr);
+  }
+
+  bool RefreshMetaCacheWithResponse() override {
+    if constexpr (tserver::HasTabletConsensusInfo<typename Traits::Response>::value) {
+      DCHECK(client::internal::CheckIfConsensusInfoUnexpectedlyMissing(req_, resp_));
+      if (resp_.has_tablet_consensus_info()) {
+        return GetInvoker().RefreshTabletInfoWithConsensusInfo(resp_.tablet_consensus_info());
+      }
+      VLOG(1) << "Partial refresh of tablet for " << Traits::kName
+              << " RPC failed because the response did not "
+                 "have a tablet_consensus_info: " << AsString(resp_);
+    }
+    return false;
+  }
+
+  void SetRequestRaftConfigOpidIndex(int64_t opid_index) override {
+    if constexpr (tserver::HasRaftConfigOpidIndex<typename Traits::Request>::value) {
+      req_.set_raft_config_opid_index(opid_index);
+    }
   }
 
  private:
@@ -136,19 +161,18 @@ class TransactionRpc : public TransactionRpcBase {
   typename Traits::Callback callback_;
 };
 
-void PrepareRequest(...) {}
+template <class Req>
+void PrepareRequest(Req& req, rpc::RpcController& controller) {}
 
-void PrepareRequest(tserver::UpdateTransactionRequestPB* req) {
-  // If this is an external transaction, the transaction id should already be set so don't create
-  // a new one.
-  const auto& state = req->state();
-  if (!state.has_external_hybrid_time() &&
-      state.status() == TransactionStatus::CREATED) {
+void PrepareRequest(tserver::UpdateTransactionRequestPB& req, rpc::RpcController& controller) {
+  if (req.state().status() == TransactionStatus::CREATED) {
     auto id = TransactionId::GenerateRandom();
-    req->mutable_state()->set_transaction_id(id.data(), id.size());
-  } else {
-    DCHECK(state.has_transaction_id());
+    req.mutable_state()->set_transaction_id(id.data(), id.size());
   }
+}
+
+void PrepareRequest(tserver::GetTransactionStatusRequestPB& req, rpc::RpcController& controller) {
+  controller.set_invoke_callback_mode(rpc::InvokeCallbackMode::kThreadPoolHigh);
 }
 
 #define TRANSACTION_RPC_TRAITS_NAME(entry) BOOST_PP_CAT(TRANSACTION_RPC_NAME(entry), Traits)
@@ -179,7 +203,7 @@ struct TRANSACTION_RPC_TRAITS_NAME(entry) { \
                           Response* response, \
                           rpc::RpcController* controller, \
                           rpc::ResponseCallback callback) { \
-    PrepareRequest(request); \
+    PrepareRequest(*request, *controller); \
     proxy->BOOST_PP_CAT(TRANSACTION_RPC_NAME(entry), Async)( \
         *request, response, controller, std::move(callback)); \
   } \

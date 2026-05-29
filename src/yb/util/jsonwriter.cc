@@ -15,9 +15,9 @@
 // specific language governing permissions and limitations
 // under the License.
 //
-// The following only applies to changes made to this file as part of YugaByte development.
+// The following only applies to changes made to this file as part of YugabyteDB development.
 //
-// Portions Copyright (c) YugaByte, Inc.
+// Portions Copyright (c) YugabyteDB, Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License"); you may not use this file except
 // in compliance with the License.  You may obtain a copy of the License at
@@ -33,11 +33,12 @@
 
 #include <string>
 
-#include <glog/logging.h>
+#include "yb/util/logging.h"
 #include <google/protobuf/message.h>
 #include <rapidjson/prettywriter.h>
 
 #include "yb/gutil/casts.h"
+#include "yb/gutil/strings/escaping.h"
 
 using google::protobuf::FieldDescriptor;
 using google::protobuf::Message;
@@ -145,10 +146,21 @@ class JsonWriterImpl : public JsonWriterIf {
   void StartArray() override;
   void EndArray() override;
 
- private:
+ protected:
   UTF8StringStreamBuffer stream_;
   T writer_;
+ private:
   DISALLOW_COPY_AND_ASSIGN(JsonWriterImpl);
+};
+
+template<class T>
+class EscapedJsonWriterImpl : public JsonWriterImpl<T> {
+ public:
+  explicit EscapedJsonWriterImpl(stringstream* out) : JsonWriterImpl<T>(out) {}
+
+  void String(const char* str, size_t length) override;
+  void String(const char* str) override;
+  void String(const std::string& str) override;
 };
 
 //
@@ -165,6 +177,12 @@ JsonWriter::JsonWriter(stringstream* out, Mode m) {
       break;
     case COMPACT:
       impl_.reset(new JsonWriterImpl<CompactWriterClass>(DCHECK_NOTNULL(out)));
+      break;
+    case PRETTY_ESCAPE_STR:
+      impl_.reset(new EscapedJsonWriterImpl<PrettyWriterClass>(DCHECK_NOTNULL(out)));
+      break;
+    case COMPACT_ESCAPE_STR:
+      impl_.reset(new EscapedJsonWriterImpl<CompactWriterClass>(DCHECK_NOTNULL(out)));
       break;
   }
 }
@@ -372,5 +390,26 @@ template<class T>
 void JsonWriterImpl<T>::StartArray() { writer_.StartArray(); }
 template<class T>
 void JsonWriterImpl<T>::EndArray() { writer_.EndArray(); }
+
+//
+// EscapedJsonWriterImpl: implementation with escaping non-printable characters in strings.
+//
+
+template<class T>
+void EscapedJsonWriterImpl<T>::String(const string& str) {
+  const string escaped = CHexEscape(str);
+  JsonWriterImpl<T>::writer_.String(
+      escaped.c_str(), narrow_cast<rapidjson::SizeType>(escaped.length()));
+}
+
+template<class T>
+void EscapedJsonWriterImpl<T>::String(const char* str, size_t length) {
+  String(string(str, length));
+}
+
+template<class T>
+void EscapedJsonWriterImpl<T>::String(const char* str) {
+  String(string(str));
+}
 
 } // namespace yb

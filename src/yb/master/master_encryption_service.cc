@@ -1,4 +1,4 @@
-// Copyright (c) YugaByte, Inc.
+// Copyright (c) YugabyteDB, Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License"); you may not use this file except
 // in compliance with the License.  You may obtain a copy of the License at
@@ -28,9 +28,10 @@ class MasterEncryptionServiceImpl : public MasterServiceBase, public MasterEncry
       : MasterServiceBase(master), MasterEncryptionIf(master->metric_entity()) {}
 
   MASTER_SERVICE_IMPL_ON_LEADER_WITH_LOCK(
-    enterprise::CatalogManager,
+    CatalogManager,
     (ChangeEncryptionInfo)
     (IsEncryptionEnabled)
+    (GetFullUniverseKeyRegistry)
   )
 
   MASTER_SERVICE_IMPL_ON_ALL_MASTERS(

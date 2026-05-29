@@ -1,8 +1,16 @@
-// Copyright (c) YugaByte, Inc.
+// Copyright (c) YugabyteDB, Inc.
 
 import { connect } from 'react-redux';
 import { KeyManagementConfiguration } from '../../config';
-import { fetchCustomerConfigs, fetchCustomerConfigsResponse } from '../../../actions/customers';
+import {
+  fetchCustomerConfigs,
+  fetchCustomerConfigsResponse,
+  fetchCustomerRunTimeConfigs,
+  fetchCustomerRunTimeConfigsResponse,
+  fetchHostInfo,
+  fetchHostInfoSuccess,
+  fetchHostInfoFailure
+} from '../../../actions/customers';
 import {
   createKMSProviderConfig,
   createKMSProviderConfigResponse,
@@ -11,20 +19,24 @@ import {
   fetchAuthConfigList,
   fetchAuthConfigListResponse,
   deleteKMSProviderConfig,
-  deleteKMSProviderConfigResponse
+  deleteKMSProviderConfigResponse,
+  refreshKMSConfig
 } from '../../../actions/cloud';
 import { fetchTaskProgress, fetchTaskProgressResponse } from '../../../actions/tasks';
 import { toast } from 'react-toastify';
+import { handleCACertErrMsg } from '../../customCACerts';
 
 const mapStateToProps = (state) => {
   return {
     customerConfigs: state.customer.configs,
+    runtimeConfigs: state.customer.runtimeConfigs,
     configList: state.cloud.authConfig,
     visibleModal: state.modal.visibleModal,
     deleteConfig: state.customer.deleteConfig,
     modal: state.modal,
     featureFlags: state.featureFlags,
-    currentUserInfo: state.customer.currentUser.data
+    currentUserInfo: state.customer.currentUser.data,
+    hostInfo: state.customer.hostInfo
   };
 };
 
@@ -35,7 +47,11 @@ const mapDispatchToProps = (dispatch) => {
         dispatch(fetchCustomerConfigsResponse(response.payload))
       );
     },
-
+    fetchCustomerRuntimeConfigs: () => {
+      return dispatch(fetchCustomerRunTimeConfigs(true)).then((response) =>
+        dispatch(fetchCustomerRunTimeConfigsResponse(response.payload))
+      );
+    },
     fetchKMSConfigList: () => {
       return dispatch(fetchAuthConfigList())
         .then((response) => dispatch(fetchAuthConfigListResponse(response.payload)))
@@ -46,6 +62,9 @@ const mapDispatchToProps = (dispatch) => {
       return dispatch(createKMSProviderConfig(provider, body))
         .then?.((response) => {
           if (response.error) {
+            if (handleCACertErrMsg(response.payload)) {
+              return;
+            }
             const errorMessage =
               response.payload?.response?.data?.error || response.payload.message;
             toast.error(errorMessage, { autoClose: 2500 });
@@ -56,7 +75,17 @@ const mapDispatchToProps = (dispatch) => {
         })
         .catch((err) => toast.error(`Error submitting KMS configuration: ${err}`));
     },
-
+    refreshKMSConfig: (configUUID) => {
+        refreshKMSConfig(configUUID).then((response) => {
+          if (response.status === 200) {
+            toast.success(response.data.message);
+          } else {
+            toast.error(response.data.message);
+          }
+        }).catch((err) => {
+          toast.error(`Error refreshing KMS token: ${err}`);
+        });
+    },
     updateKMSConfig: (configUUID, body) => {
       return dispatch(editKMSProviderConfig(configUUID, body))
         .then?.((response) => {
@@ -90,6 +119,16 @@ const mapDispatchToProps = (dispatch) => {
         .catch((err) => {
           console.error(err);
         });
+    },
+
+    fetchHostInfo: () => {
+      dispatch(fetchHostInfo()).then((response) => {
+        if (response.payload.status !== 200) {
+          dispatch(fetchHostInfoFailure(response.payload));
+        } else {
+          dispatch(fetchHostInfoSuccess(response.payload));
+        }
+      });
     }
   };
 };

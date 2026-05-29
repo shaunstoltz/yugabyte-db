@@ -1,3 +1,5 @@
+// Copyright (c) YugabyteDB, Inc.
+
 package com.yugabyte.yw.common.logging;
 
 import java.util.concurrent.BlockingQueue;

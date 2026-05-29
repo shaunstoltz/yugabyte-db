@@ -1,4 +1,4 @@
-// Copyright (c) YugaByte, Inc.
+// Copyright (c) YugabyteDB, Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License"); you may not use this file except
 // in compliance with the License.  You may obtain a copy of the License at
@@ -25,14 +25,22 @@ import java.util.List;
 import static junit.framework.TestCase.assertEquals;
 import static junit.framework.TestCase.fail;
 
+import org.yb.minicluster.MiniYBClusterBuilder;
 import org.yb.YBTestRunner;
 
 import org.junit.runner.RunWith;
 
 @RunWith(value=YBTestRunner.class)
 public class TestHideRedis extends BaseCQLTest {
-
   private static final Logger LOG = LoggerFactory.getLogger(TestHideRedis.class);
+
+  @Override
+  protected void customizeMiniClusterBuilder(MiniYBClusterBuilder builder) {
+    super.customizeMiniClusterBuilder(builder);
+    // Just use simple caching for system.partitions verification. Otherwise, we add new tables
+    // immediately, but remove them lazily, so the ycql table could still show up at the end.
+    builder.yqlSystemPartitionsVtableRefreshSecs(0);
+  }
 
   @Test
   public void testHideRedis() throws Exception {

@@ -1,4 +1,4 @@
-// Copyright (c) YugaByte, Inc.
+// Copyright (c) YugabyteDB, Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License"); you may not use this file except
 // in compliance with the License.  You may obtain a copy of the License at
@@ -14,8 +14,8 @@
 #include "yb/master/snapshot_schedule_state.h"
 
 #include "yb/docdb/docdb.pb.h"
-#include "yb/docdb/key_bytes.h"
-#include "yb/docdb/value_type.h"
+#include "yb/dockv/key_bytes.h"
+#include "yb/dockv/value_type.h"
 
 #include "yb/master/catalog_entity_info.h"
 #include "yb/master/master_error.h"
@@ -49,12 +49,12 @@ SnapshotScheduleState::SnapshotScheduleState(
     : context_(*context), id_(SnapshotScheduleId::GenerateRandom()), options_(options) {
 }
 
-Result<docdb::KeyBytes> SnapshotScheduleState::EncodedKey(
+Result<dockv::KeyBytes> SnapshotScheduleState::EncodedKey(
     const SnapshotScheduleId& schedule_id, SnapshotCoordinatorContext* context) {
   return master::EncodedKey(SysRowEntryType::SNAPSHOT_SCHEDULE, schedule_id.AsSlice(), context);
 }
 
-Result<docdb::KeyBytes> SnapshotScheduleState::EncodedKey() const {
+Result<dockv::KeyBytes> SnapshotScheduleState::EncodedKey() const {
   return EncodedKey(id_, &context_);
 }
 
@@ -68,7 +68,7 @@ Status SnapshotScheduleState::StoreToWriteBatch(
   auto pair = out->add_write_pairs();
   pair->set_key(encoded_key.AsSlice().cdata(), encoded_key.size());
   auto* value = pair->mutable_value();
-  value->push_back(docdb::ValueEntryTypeAsChar::kString);
+  value->push_back(dockv::ValueEntryTypeAsChar::kString);
   return pb_util::AppendPartialToString(options, value);
 }
 

@@ -2,9 +2,9 @@
 // Use of this source code is governed by a BSD-style license that can be
 // found in the LICENSE file.
 //
-// The following only applies to changes made to this file as part of YugaByte development.
+// The following only applies to changes made to this file as part of YugabyteDB development.
 //
-// Portions Copyright (c) YugaByte, Inc.
+// Portions Copyright (c) YugabyteDB, Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License"); you may not use this file except
 // in compliance with the License.  You may obtain a copy of the License at
@@ -98,14 +98,16 @@ class ConditionVariable {
 
   // Wait() releases the caller's critical section atomically as it starts to
   // sleep, and the reacquires it when it is signaled.
+  // This function may spuriously wake up return even if no other thread has signaled it.
   void Wait() const;
 
   // Like Wait(), but only waits up to a limited amount of time.
   //
-  // Returns true if we were Signal()'ed, or false if 'max_time' elapsed.
+  // Returns true if we were Signal()'ed or spuriously woken up, or false if 'max_time' elapsed.
   bool TimedWait(const MonoDelta& max_time) const;
 
-  // Returns true if we were Signal()'ed, or false if wait_timeout_deadline is reached.
+  // Returns true if we were Signal()'ed or spuriously woken up, and false if wait_timeout_deadline
+  // is reached.
   bool WaitUntil(const MonoTime& wait_timeout_deadline) const;
 
   // Broadcast() revives all waiting threads.

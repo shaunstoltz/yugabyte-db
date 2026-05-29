@@ -1,4 +1,4 @@
-// Copyright (c) YugaByte, Inc.
+// Copyright (c) YugabyteDB, Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License"); you may not use this file except
 // in compliance with the License.  You may obtain a copy of the License at
@@ -12,22 +12,37 @@
 //
 package org.yb.pgsql;
 
+import java.util.Map;
+
 import org.junit.Test;
 import org.junit.runner.RunWith;
-import org.yb.util.YBTestRunnerNonTsanOnly;
+import org.yb.YBTestRunner;
+import org.yb.minicluster.MiniYBClusterBuilder;
+import org.yb.util.SkipOnTSAN;
 
 /**
  * Runs the pg_regress test suite on YB code.
  */
-@RunWith(value=YBTestRunnerNonTsanOnly.class)
-public class TestPgRegressPlanner extends BasePgSQLTest {
+@SkipOnTSAN
+@RunWith(value=YBTestRunner.class)
+public class TestPgRegressPlanner extends BasePgRegressTest {
     @Override
     public int getTestMethodTimeoutSec() {
         return 1800;
     }
 
+    // (Auto-Analyze #28057) Query plans change after enabling auto analyze.
+    protected Map<String, String> getTServerFlags() {
+        Map<String, String> flagMap = super.getTServerFlags();
+        flagMap.put("ysql_enable_auto_analyze", "false");
+        return flagMap;
+    }
+
     @Test
-    public void testPgRegressDml() throws Exception {
+    public void testPgRegressPlanner() throws Exception {
+        // (DB-13032) This test touches system tables, so enable stickiness for
+        // superuser connections when Connection Manager is enabled.
+        enableStickySuperuserConnsAndRestartCluster();
         runPgRegressTest("yb_planner_serial_schedule");
     }
 }

@@ -1,4 +1,4 @@
-// Copyright (c) YugaByte, Inc.
+// Copyright (c) YugabyteDB, Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License"); you may not use this file except
 // in compliance with the License.  You may obtain a copy of the License at
@@ -13,7 +13,9 @@
 
 #include "yb/rpc/secure_stream.h"
 
+#include <openssl/bio.h>
 #include <openssl/err.h>
+#include <openssl/provider.h>
 #include <openssl/ssl.h>
 #include <openssl/x509v3.h>
 
@@ -25,6 +27,7 @@
 
 #include "yb/rpc/outbound_data.h"
 #include "yb/rpc/refined_stream.h"
+#include "yb/rpc/reactor_thread_role.h"
 
 #include "yb/util/enums.h"
 #include "yb/util/errno.h"
@@ -34,6 +37,10 @@
 #include "yb/util/status_format.h"
 #include "yb/util/unique_lock.h"
 #include "yb/util/flags.h"
+#include "yb/util/env.h"
+#include "yb/util/env_util.h"
+#include "yb/util/path_util.h"
+#include "yb/util/subprocess.h"
 
 using namespace std::literals;
 
@@ -45,6 +52,8 @@ DEFINE_UNKNOWN_bool(verify_server_endpoint, true, "Whether server endpoint shoul
 DEFINE_UNKNOWN_string(ssl_protocols, "",
               "List of allowed SSL protocols (ssl2, ssl3, tls10, tls11, tls12). "
                   "Empty to allow TLS only.");
+
+DEFINE_NON_RUNTIME_bool(openssl_require_fips, false, "Use OpenSSL FIPS Provider.");
 
 DEFINE_UNKNOWN_string(cipher_list, "",
               "Define the list of available ciphers (TLSv1.2 and below).");
@@ -93,17 +102,25 @@ Result<BIOPtr> BIOFromSlice(const Slice& data) {
   return std::move(bio);
 }
 
-Result<X509Ptr> X509FromSlice(const Slice& data) {
+Result<std::vector<X509Ptr>> X509FromSlice(const Slice& data) {
+  std::vector<X509Ptr> certs;
   ERR_clear_error();
 
   auto bio = VERIFY_RESULT(BIOFromSlice(data));
 
-  X509Ptr cert(PEM_read_bio_X509(bio.get(), nullptr, nullptr, nullptr));
-  if (!cert) {
-    return SSL_STATUS(IOError, "Read cert failed: $0");
+  X509Ptr cert;
+  while (!BIO_eof(bio.get())) {
+    cert.reset(PEM_read_bio_X509(bio.get(), nullptr, nullptr, nullptr));
+    if (!cert) {
+      break;
+    }
+    certs.push_back(std::move(cert));
   }
 
-  return std::move(cert);
+  if (certs.empty()) {
+      return SSL_STATUS(IOError, "Read cert failed: $0");
+  }
+  return certs;
 }
 
 YB_RPC_SSL_TYPE(ASN1_INTEGER);
@@ -255,9 +272,48 @@ int64_t ProtocolsOption() {
   return result;
 }
 
+Result<std::string> ProviderSearchPath() {
+  // This is the provider search path for release package. For development builds,
+  // GetRootDirResult will result non-OK status, since we don't copy ossl-modules from
+  // thirdparty into the build directory. We instead rely on rpath to find providers
+  // within the thirdparty directory.
+  auto root = VERIFY_RESULT(env_util::GetRootDirResult("lib/ossl-modules"));
+  return JoinPathSegments(root, "lib", "ossl-modules");
+}
+
+Result<std::string> FIPSConfigPath() {
+  auto root = VERIFY_RESULT(env_util::GetRootDirResult("openssl-config"));
+  return JoinPathSegments(root, "openssl-config", "openssl-fips.cnf");
+}
+
 class OpenSSLInitializer {
  public:
+
   OpenSSLInitializer() {
+    if (FLAGS_openssl_require_fips) {
+      auto provider_path = ProviderSearchPath();
+      if (provider_path.ok()) {
+        LOG(INFO) << "Setting OpenSSL provider search path: " << provider_path;
+        if (!OSSL_PROVIDER_set_default_search_path(/* libctx= */ NULL, provider_path->c_str())) {
+          LOG(FATAL) << "Failed to set OpenSSL provider search path: "
+                     << SSLErrorMessage(ERR_get_error());
+        }
+      }
+
+      auto config_path = FIPSConfigPath();
+      CHECK_OK(config_path);
+      LOG(INFO) << "Loading OpenSSL config: " << config_path;
+      if (CONF_modules_load_file(config_path->c_str(), /* appname= */ NULL, /* flags= */ 0) <= 0) {
+        LOG(FATAL) << "Failed to load OpenSSL config: " << SSLErrorMessage(ERR_get_error());
+      }
+
+      CHECK(OSSL_PROVIDER_available(/* libctx= */ NULL, "fips"));
+      CHECK(OSSL_PROVIDER_available(/* libctx= */ NULL, "base"));
+      CHECK(!OSSL_PROVIDER_available(/* libctx= */ NULL, "default"));
+
+      LOG(INFO) << "OpenSSL FIPS enabled";
+    }
+
     SSL_library_init();
     SSL_load_error_strings();
     OpenSSL_add_all_algorithms();
@@ -274,10 +330,6 @@ class OpenSSLInitializer {
 };
 
 YB_STRONGLY_TYPED_BOOL(UseCertificateKeyPair);
-
-} // namespace
-
-namespace {
 
 // Matches pattern from RFC 2818:
 // Names may contain the wildcard character * which is considered to match any single domain name
@@ -374,6 +426,17 @@ std::string X509CertToString(X509* cert) {
 
 } // namespace
 
+void SetOpenSSLEnv(Subprocess* proc) {
+  if (FLAGS_openssl_require_fips) {
+    auto provider_path = ProviderSearchPath();
+    if (provider_path.ok()) {
+      proc->SetEnv("OPENSSL_MODULES", *provider_path);
+    }
+    auto config_path = FIPSConfigPath();
+    CHECK_OK(config_path);
+    proc->SetEnv("OPENSSL_CONF", *config_path);
+  }
+}
 
 bool AllowInsecureConnections() {
   return FLAGS_allow_insecure_connections;
@@ -442,20 +505,22 @@ class SecureContext::Impl {
   Status AddCertificateAuthorityFileUnlocked(const std::string& file) REQUIRES(mutex_);
 
   Status UseCertificateKeyPair(
-      const Slice& certificate_data, const Slice& pkey_data) REQUIRES(mutex_);
+     const Slice& certificate_data, const Slice& pkey_data) REQUIRES(mutex_);
 
-  Status UseCertificateKeyPair(X509Ptr&& certificate, EVP_PKEYPtr&& pkey) REQUIRES(mutex_);
+  Status UseCertificateKeyPair(
+    std::vector<X509Ptr>&& certificates,
+    EVP_PKEYPtr&& pkey) REQUIRES(mutex_);
 
   Status AddCertificateAuthority(X509* cert) REQUIRES(mutex_);
 
   Result<SSLPtr> Create(
-      const X509Ptr& certificate, const EVP_PKEYPtr& pkey,
+      const std::vector<X509Ptr>& certificates, const EVP_PKEYPtr& pkey,
       rpc::UseCertificateKeyPair use_certificate_key_pair) const REQUIRES_SHARED(mutex_);
 
   mutable rw_spinlock mutex_;
   SSL_CTXPtr context_ GUARDED_BY(mutex_);
   EVP_PKEYPtr pkey_ GUARDED_BY(mutex_);
-  X509Ptr certificate_ GUARDED_BY(mutex_);
+  std::vector<X509Ptr> certificates_ GUARDED_BY(mutex_);
 
   RequireClientCertificate require_client_certificate_;
   UseClientCertificate use_client_certificate_;
@@ -501,18 +566,29 @@ SecureContext::Impl::Impl(
 Result<SSLPtr> SecureContext::Impl::Create(
     rpc::UseCertificateKeyPair use_certificate_key_pair) const {
   SharedLock<rw_spinlock> lock(mutex_);
-  return Create(certificate_, pkey_, use_certificate_key_pair);
+  return Create(certificates_, pkey_, use_certificate_key_pair);
 }
 
 Result<SSLPtr> SecureContext::Impl::Create(
-    const X509Ptr& certificate, const EVP_PKEYPtr& pkey,
+    const std::vector<X509Ptr>& certificates, const EVP_PKEYPtr& pkey,
     rpc::UseCertificateKeyPair use_certificate_key_pair) const {
+
   auto ssl = SSLPtr(SSL_new(context_.get()));
   if (use_certificate_key_pair) {
-    auto res = SSL_use_certificate(ssl.get(), certificate.get());
+    DCHECK(!certificates.empty());
+    auto res = SSL_use_certificate(ssl.get(), certificates[0].get());
     if (res != 1) {
       return SSL_STATUS(InvalidArgument, "Failed to use certificate: $0");
     }
+    // Add any additional intermediate CA certs in the server cert to build the chain
+    for (size_t i = 1; i < certificates.size(); ++i) {
+      VLOG(2) << "adding chain cert #" << i;
+      auto chain_res = SSL_add1_chain_cert(ssl.get(), certificates[i].get());
+      if (chain_res != 1) {
+        return SSL_STATUS(InvalidArgument, "Failed to add chain certificate: $0");
+      }
+    }
+
     res = SSL_use_PrivateKey(ssl.get(), pkey.get());
     if (res != 1) {
       return SSL_STATUS(InvalidArgument, "Failed to use private key: $0");
@@ -522,7 +598,7 @@ Result<SSLPtr> SecureContext::Impl::Create(
 }
 
 Status SecureContext::Impl::AddCertificateAuthorityFile(const std::string& file) {
-  UNIQUE_LOCK(lock, mutex_);
+  UniqueLock lock(mutex_);
   return AddCertificateAuthorityFileUnlocked(file);
 }
 
@@ -561,7 +637,7 @@ Status SecureContext::Impl::AddCertificateAuthority(X509* cert) {
 Status SecureContext::Impl::UseCertificateKeyPair(
     const Slice& certificate_data, const Slice& pkey_data) {
   ERR_clear_error();
-  auto certificate = VERIFY_RESULT(X509FromSlice(certificate_data));
+  std::vector<X509Ptr> certificates = VERIFY_RESULT(X509FromSlice(certificate_data));
 
   ERR_clear_error();
   auto bio = VERIFY_RESULT(BIOFromSlice(pkey_data));
@@ -570,13 +646,15 @@ Status SecureContext::Impl::UseCertificateKeyPair(
     return SSL_STATUS(IOError, "Failed to read private key: $0");
   }
 
-  return UseCertificateKeyPair(std::move(certificate), EVP_PKEYPtr(pkey));
+  return UseCertificateKeyPair(std::move(certificates), EVP_PKEYPtr(pkey));
 }
 
-Status SecureContext::Impl::UseCertificateKeyPair(X509Ptr&& certificate, EVP_PKEYPtr&& pkey) {
-  RETURN_NOT_OK(Create(certificate, pkey, rpc::UseCertificateKeyPair::kTrue));
+Status SecureContext::Impl::UseCertificateKeyPair(
+    std::vector<X509Ptr>&& certificates,
+    EVP_PKEYPtr&& pkey) {
+  RETURN_NOT_OK(Create(certificates, pkey, rpc::UseCertificateKeyPair::kTrue));
 
-  certificate_ = std::move(certificate);
+  certificates_ = std::move(certificates);
   pkey_ = std::move(pkey);
 
   return Status::OK();
@@ -584,7 +662,7 @@ Status SecureContext::Impl::UseCertificateKeyPair(X509Ptr&& certificate, EVP_PKE
 
 Status SecureContext::Impl::UseCertificates(
     const std::string& ca_cert_file, const Slice& certificate_data, const Slice& pkey_data) {
-  UNIQUE_LOCK(lock, mutex_);
+  UniqueLock lock(mutex_);
 
   RETURN_NOT_OK(AddCertificateAuthorityFileUnlocked(ca_cert_file));
   RETURN_NOT_OK(UseCertificateKeyPair(certificate_data, pkey_data));
@@ -593,12 +671,15 @@ Status SecureContext::Impl::UseCertificates(
 }
 
 std::string SecureContext::Impl::GetCertificateDetails() {
-  UNIQUE_LOCK(lock, mutex_);
+  UniqueLock lock(mutex_);
 
   std::stringstream result;
-  if(certificate_) {
-    result << "Node certificate details: \n";
-    result << X509CertToString(certificate_.get());
+  result << "Node certificate details for " << certificates_.size() << " certs \n";
+  for (const auto& certificate : certificates_) {
+    if (certificate) {
+      result << "Single cert details: "
+             << X509CertToString(certificate.get());
+    }
   }
 
   // TODO: extend tabletserver to use certificate reloader callback like mechanism
@@ -618,9 +699,11 @@ Status SecureContext::Impl::TEST_GenerateKeys(int bits, const std::string& commo
     key = VERIFY_RESULT(GeneratePrivateKey(bits));
   }
 
-  UNIQUE_LOCK(lock, mutex_);
+  UniqueLock lock(mutex_);
   RETURN_NOT_OK(AddCertificateAuthority(ca_cert.get()));
-  RETURN_NOT_OK(UseCertificateKeyPair(std::move(cert), std::move(key)));
+  std::vector<X509Ptr> certs;
+  certs.push_back(std::move(cert));
+  RETURN_NOT_OK(UseCertificateKeyPair(std::move(certs), std::move(key)));
 
   return Status::OK();
 }
@@ -662,11 +745,11 @@ class SecureRefiner : public StreamRefiner {
     stream_ = stream;
   }
 
-  Status Handshake() override;
+  Status Handshake() ON_REACTOR_THREAD override;
   Status Init();
 
-  Status Send(OutboundDataPtr data) override;
-  Status ProcessHeader() override;
+  Status Send(OutboundDataPtr data) ON_REACTOR_THREAD override;
+  Status ProcessHeader() ON_REACTOR_THREAD override;
   Result<ReadBufferFull> Read(StreamReadBuffer* out) override;
 
   std::string ToString() const override {
@@ -682,10 +765,10 @@ class SecureRefiner : public StreamRefiner {
   bool MatchEndpoint(X509* cert, GENERAL_NAMES* gens);
   bool MatchUid(X509* cert, GENERAL_NAMES* gens);
   bool MatchUidEntry(const Slice& value, const char* name);
-  Result<bool> WriteEncrypted(OutboundDataPtr data);
+  Result<bool> WriteEncrypted(OutboundDataPtr data) ON_REACTOR_THREAD;
   void DecryptReceived();
 
-  Status Established(RefinedStreamState state) {
+  Status Established(RefinedStreamState state) ON_REACTOR_THREAD {
     VLOG_WITH_PREFIX(4) << "Established with state: " << state << ", used cipher: "
                         << SSL_get_cipher_name(ssl_.get());
 

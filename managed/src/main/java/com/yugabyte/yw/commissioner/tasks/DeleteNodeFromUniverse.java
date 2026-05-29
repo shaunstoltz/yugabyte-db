@@ -1,5 +1,5 @@
 /*
- * Copyright 2019 YugaByte, Inc. and Contributors
+ * Copyright 2019 YugabyteDB, Inc. and Contributors
  *
  * Licensed under the Polyform Free Trial License 1.0.0 (the "License"); you
  * may not use this file except in compliance with the License. You
@@ -11,12 +11,13 @@ package com.yugabyte.yw.commissioner.tasks;
 
 import com.google.common.collect.Sets;
 import com.yugabyte.yw.commissioner.BaseTaskDependencies;
-import com.yugabyte.yw.commissioner.UserTaskDetails;
 import com.yugabyte.yw.commissioner.Common.CloudType;
 import com.yugabyte.yw.commissioner.ITask.Retryable;
+import com.yugabyte.yw.commissioner.UserTaskDetails;
 import com.yugabyte.yw.commissioner.UserTaskDetails.SubTaskGroupType;
 import com.yugabyte.yw.commissioner.tasks.params.NodeTaskParams;
-import com.yugabyte.yw.forms.UniverseDefinitionTaskParams.UserIntent;
+import com.yugabyte.yw.common.Util;
+import com.yugabyte.yw.models.Provider;
 import com.yugabyte.yw.models.Universe;
 import com.yugabyte.yw.models.helpers.NodeDetails;
 import java.util.Collection;
@@ -38,49 +39,55 @@ public class DeleteNodeFromUniverse extends UniverseTaskBase {
   }
 
   @Override
+  public void validateParams(boolean isFirstTry) {
+    super.validateParams(isFirstTry);
+    Universe universe = getUniverse();
+    NodeDetails currentNode = universe.getNode(taskParams().nodeName);
+
+    if (currentNode == null) {
+      String msg =
+          String.format(
+              "No node %s is found in universe %s", taskParams().nodeName, universe.getName());
+      log.error(msg);
+      throw new RuntimeException(msg);
+    }
+
+    if (!currentNode.isRemovable()) {
+      String msg =
+          String.format(
+              "Node %s with state %s is not removable from universe %s",
+              currentNode.nodeName, currentNode.state, universe.getName());
+      log.error(msg);
+      throw new RuntimeException(msg);
+    }
+  }
+
+  @Override
   public void run() {
+    checkUniverseVersion();
+    Universe universe =
+        lockAndFreezeUniverseForUpdate(
+            taskParams().expectedUniverseVersion, null /* Txn callback */);
     try {
-      checkUniverseVersion();
-      // Update the universe DB with the update to be performed and set the 'updateInProgress' flag
-      // to prevent other updates from happening.
-      Universe universe = lockUniverseForUpdate(taskParams().expectedUniverseVersion);
+      NodeDetails currentNode = universe.getNode(taskParams().nodeName);
       log.info(
           "Delete Node with name {} from universe {}",
           taskParams().nodeName,
-          taskParams().universeUUID);
+          taskParams().getUniverseUUID());
 
       preTaskActions();
 
-      NodeDetails currentNode = universe.getNode(taskParams().nodeName);
-      if (currentNode == null) {
-        String msg =
-            String.format(
-                "No node %s is found in universe %s", taskParams().nodeName, universe.name);
-        log.error(msg);
-        throw new RuntimeException(msg);
-      }
-
-      // This same check is also done in DeleteNode subtask.
-      if (!currentNode.isRemovable()) {
-        String msg =
-            String.format(
-                "Node %s with state %s is not removable from universe %s",
-                currentNode.nodeName, currentNode.state, universe.name);
-        log.error(msg);
-        throw new IllegalStateException(msg);
-      }
-
-      UserIntent userIntent =
-          universe.getUniverseDetails().getClusterByUuid(currentNode.placementUuid).userIntent;
-      boolean isOnprem = CloudType.onprem.equals(userIntent.providerType);
+      Provider provider = Util.getProviderForNode(currentNode, universe);
+      boolean isOnprem = CloudType.onprem == provider.getCloudCode();
 
       taskParams().azUuid = currentNode.azUuid;
       taskParams().placementUuid = currentNode.placementUuid;
 
       // DELETE action is allowed on InstanceCreated, SoftwareInstalled states etc.
-      // A failed AddNodeToUniverse after ReleaseInstanceFromUniverse can leave instances behind.
+      // A failed AddNodeToUniverse after ReleaseInstanceFromUniverse can leave instances
+      // behind.
+      Collection<NodeDetails> currentNodeDetails = Sets.newHashSet(currentNode);
       if (instanceExists(taskParams()) || isOnprem) {
-        Collection<NodeDetails> currentNodeDetails = Sets.newHashSet(currentNode);
         // Create tasks to terminate that instance.
         // If destroy of the instance fails for some reason, this task can always be retried
         // because there is no change in the node state that can make this task move to one of
@@ -88,10 +95,17 @@ public class DeleteNodeFromUniverse extends UniverseTaskBase {
         createDestroyServerTasks(
                 universe,
                 currentNodeDetails,
-                true /* isForceDelete */,
+                node -> true /* isForceDelete */,
                 false /* deleteNode */,
-                true /* deleteRootVolumes */)
+                true /* deleteRootVolumes */,
+                false /* skipDestroyPrecheck */)
             .setSubTaskGroupType(SubTaskGroupType.DeletingNode);
+      } else {
+        createRemoveNodeAgentTasks(universe, currentNodeDetails, true /* isForceDelete */)
+            .setSubTaskGroupType(SubTaskGroupType.DeletingNode);
+
+        // Just in case node was manually deleted earlier
+        createMarkUniverseForHealthScriptReUploadTask();
       }
 
       createDeleteNodeFromUniverseTask(taskParams().nodeName)
@@ -101,9 +115,9 @@ public class DeleteNodeFromUniverse extends UniverseTaskBase {
       createMarkUniverseUpdateSuccessTasks()
           .setSubTaskGroupType(UserTaskDetails.SubTaskGroupType.DeletingNode);
       getRunnableTask().runSubTasks();
-    } catch (Throwable t) {
-      log.error(String.format("Error executing task %s, error %s", getName(), t.getMessage()), t);
-      throw t;
+    } catch (RuntimeException e) {
+      log.error("Error executing task {}, error='{}'", getName(), e.getMessage(), e);
+      throw e;
     } finally {
       unlockUniverseForUpdate();
     }

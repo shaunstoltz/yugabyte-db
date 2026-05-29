@@ -1,5 +1,5 @@
 //--------------------------------------------------------------------------------------------------
-// Copyright (c) YugaByte, Inc.
+// Copyright (c) YugabyteDB, Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License"); you may not use this file except
 // in compliance with the License.  You may obtain a copy of the License at
@@ -22,8 +22,10 @@
 #include "yb/client/table.h"
 
 #include "yb/common/common.pb.h"
-#include "yb/common/index.h"
-#include "yb/common/index_column.h"
+#include "yb/common/value.messages.h"
+#include "yb/common/value.pb.h"
+#include "yb/qlexpr/index.h"
+#include "yb/qlexpr/index_column.h"
 #include "yb/common/ql_type.h"
 
 #include "yb/gutil/casts.h"
@@ -31,6 +33,7 @@
 #include "yb/util/date_time.h"
 #include "yb/util/decimal.h"
 #include "yb/util/logging.h"
+#include "yb/util/metrics.h"
 #include "yb/util/net/inetaddress.h"
 #include "yb/util/net/net_util.h"
 #include "yb/util/stol_utils.h"
@@ -41,6 +44,9 @@
 #include "yb/yql/cql/ql/ptree/pt_type.h"
 #include "yb/yql/cql/ql/ptree/sem_context.h"
 #include "yb/yql/cql/ql/ptree/yb_location.h"
+#include "yb/yql/cql/ql/ql_processor.h"
+
+DECLARE_bool(cql_revert_to_partial_microsecond_support);
 
 namespace yb {
 namespace ql {
@@ -48,6 +54,8 @@ namespace ql {
 using client::YBColumnSchema;
 using std::shared_ptr;
 using std::string;
+
+using qlexpr::QLNameOption;
 
 //--------------------------------------------------------------------------------------------------
 
@@ -113,7 +121,7 @@ bool PTExpr::has_valid_internal_type() {
          internal_type_ != InternalType::VALUE_NOT_SET;
 }
 
-void PTExpr::rscol_type_PB(QLTypePB *pb_type ) const {
+void PTExpr::rscol_type_PB(QLTypeMsg *pb_type ) const {
   ql_type_->ToQLTypePB(pb_type);
 }
 
@@ -142,7 +150,7 @@ bool PTExpr::CheckIndexColumn(SemContext *sem_context) {
 }
 
 Status PTExpr::CheckOperator(SemContext *sem_context) {
-  // Where clause only allow AND, EQ, LT, LE, GT, and GE operators.
+  // Where clause only allow AND, EQ, LT, LE, GT, GE, CONTAINS AND CONTAINS KEY operators.
   if (sem_context->where_state() != nullptr) {
     switch (ql_op_) {
       case QL_OP_AND:
@@ -154,6 +162,8 @@ Status PTExpr::CheckOperator(SemContext *sem_context) {
       case QL_OP_IN:
       case QL_OP_NOT_IN:
       case QL_OP_NOT_EQUAL:
+      case QL_OP_CONTAINS_KEY:
+      case QL_OP_CONTAINS:
       case QL_OP_NOOP:
         break;
       default:
@@ -375,30 +385,41 @@ Status PTLiteralString::ToDecimal(util::Decimal *value, bool negate) const {
   }
 }
 
-Status PTLiteralString::ToDecimal(string *value, bool negate) const {
-  util::Decimal d;
+template <class T>
+Result<T> PTLiteralString::FromString(bool negate) const {
+  T t;
   if (negate) {
-    RETURN_NOT_OK(d.FromString(string("-") + value_->c_str()));
+    RETURN_NOT_OK(t.FromString(std::string("-") + value_->c_str()));
   } else {
-    RETURN_NOT_OK(d.FromString(value_->c_str()));
+    RETURN_NOT_OK(t.FromString(value_->c_str()));
   }
-  *value = d.EncodeToComparable();
+  return t;
+}
+
+Status PTLiteralString::ToDecimal(string *value, bool negate) const {
+  *value = VERIFY_RESULT(FromString<util::Decimal>(negate)).EncodeToComparable();
   return Status::OK();
 }
 
+Result<Slice> PTLiteralString::ToDecimal(ThreadSafeArena& arena, bool negate) const {
+  return arena.DupSlice(VERIFY_RESULT(FromString<util::Decimal>(negate)).EncodeToComparable());
+}
+
 Status PTLiteralString::ToVarInt(string *value, bool negate) const {
-  util::VarInt v;
-  if (negate) {
-    RETURN_NOT_OK(v.FromString(string("-") + value_->c_str()));
-  } else {
-    RETURN_NOT_OK(v.FromString(value_->c_str()));
-  }
-  *value = v.EncodeToComparable();
+  *value = VERIFY_RESULT(FromString<VarInt>(negate)).EncodeToComparable();
   return Status::OK();
+}
+
+Result<Slice> PTLiteralString::ToVarInt(ThreadSafeArena& arena, bool negate) const {
+  return arena.DupSlice(VERIFY_RESULT(FromString<VarInt>(negate)).EncodeToComparable());
 }
 
 std::string PTLiteralString::ToString() const {
   return string(value_->c_str());
+}
+
+Slice PTLiteralString::ToString(ThreadSafeArena& arena) const {
+  return arena.DupSlice(Slice(*value_));
 }
 
 Status PTLiteralString::ToString(string *value) const {
@@ -406,8 +427,23 @@ Status PTLiteralString::ToString(string *value) const {
   return Status::OK();
 }
 
-Status PTLiteralString::ToTimestamp(int64_t *value) const {
-  *value = VERIFY_RESULT(DateTime::TimestampFromString(value_->c_str())).ToInt64();
+Status PTLiteralString::ToTimestamp(int64_t *value, const QLMetrics *ql_metrics) const {
+  int64_t value_us = VERIFY_RESULT(DateTime::TimestampFromString(value_->c_str())).ToInt64();
+  int64_t value_ms = DateTime::FloorTimestamp(
+      value_us, DateTime::kInternalPrecision, DateTime::CqlInputFormat.input_precision);
+
+  if (value_ms != value_us) {
+    if (FLAGS_cql_revert_to_partial_microsecond_support && ql_metrics) {
+      IncrementCounter(ql_metrics->microseconds_timestamps_used_);
+    }
+    YB_LOG_EVERY_N_SECS(WARNING, 300)
+        << "timestamp is inserted in YCQL with microseconds precision";
+  }
+
+  *value = value_us;
+  if (!FLAGS_cql_revert_to_partial_microsecond_support) {
+    *value = value_ms;
+  }
   return Status::OK();
 }
 
@@ -516,8 +552,8 @@ Status PTCollectionExpr::Analyze(SemContext *sem_context) {
   size_t i = 0;
   // Checking type parameters.
   switch (expected_type->main()) {
-    case MAP: {
-      if (ql_type_->main() == SET && values_.size() > 0) {
+    case DataType::MAP: {
+      if (ql_type_->main() == DataType::SET && values_.size() > 0) {
         return sem_context->Error(this, ErrorCode::DATATYPE_MISMATCH);
       }
 
@@ -547,7 +583,7 @@ Status PTCollectionExpr::Analyze(SemContext *sem_context) {
       sem_state.ResetContextState();
       break;
     }
-    case SET: {
+    case DataType::SET: {
       // Process values.
       // Referencing column in collection is not allowed.
       SemState sem_state(sem_context);
@@ -565,7 +601,7 @@ Status PTCollectionExpr::Analyze(SemContext *sem_context) {
       break;
     }
 
-    case LIST: {
+    case DataType::LIST: {
       // Process values.
       // Referencing column in collection is not allowed.
       SemState sem_state(sem_context);
@@ -584,7 +620,7 @@ Status PTCollectionExpr::Analyze(SemContext *sem_context) {
       break;
     }
 
-    case USER_DEFINED_TYPE: {
+    case DataType::USER_DEFINED_TYPE: {
       // Process values.
       // Referencing column in collection is not allowed.
       SemState sem_state(sem_context);
@@ -608,8 +644,8 @@ Status PTCollectionExpr::Analyze(SemContext *sem_context) {
       break;
     }
 
-    case FROZEN: {
-      if (ql_type_->main() == FROZEN) {
+    case DataType::FROZEN: {
+      if (ql_type_->main() == DataType::FROZEN) {
         // Already analyzed (e.g. for indexes), just check if type matches.
         if (*ql_type_ != *expected_type) {
           return sem_context->Error(this, ErrorCode::DATATYPE_MISMATCH);
@@ -625,7 +661,7 @@ Status PTCollectionExpr::Analyze(SemContext *sem_context) {
       break;
     }
 
-    case TUPLE:
+    case DataType::TUPLE:
       i = 0;
       if (values_.size() != expected_type->params().size()) {
         return sem_context->Error(
@@ -670,7 +706,7 @@ Status PTCollectionExpr::Analyze(SemContext *sem_context) {
 
 Status PTLogicExpr::SetupSemStateForOp1(SemState *sem_state) {
   // Expect "bool" datatype for logic expression.
-  sem_state->SetExprState(QLType::Create(BOOL), InternalType::kBoolValue);
+  sem_state->SetExprState(QLType::Create(DataType::BOOL), InternalType::kBoolValue);
 
   // Pass down the state variables for IF clause "if_state".
   sem_state->CopyPreviousIfState();
@@ -684,7 +720,7 @@ Status PTLogicExpr::SetupSemStateForOp1(SemState *sem_state) {
 
 Status PTLogicExpr::SetupSemStateForOp2(SemState *sem_state) {
   // Expect "bool" datatype for logic expression.
-  sem_state->SetExprState(QLType::Create(BOOL), InternalType::kBoolValue);
+  sem_state->SetExprState(QLType::Create(DataType::BOOL), InternalType::kBoolValue);
 
   // Pass down the state variables for IF clause "if_state".
   sem_state->CopyPreviousIfState();
@@ -700,7 +736,7 @@ Status PTLogicExpr::AnalyzeOperator(SemContext *sem_context,
                                     PTExpr::SharedPtr op1) {
   switch (ql_op_) {
     case QL_OP_NOT:
-      if (op1->ql_type_id() != BOOL) {
+      if (op1->ql_type_id() != DataType::BOOL) {
         return sem_context->Error(this, "Only boolean value is allowed in this context",
                                   ErrorCode::INVALID_DATATYPE);
       }
@@ -724,11 +760,11 @@ Status PTLogicExpr::AnalyzeOperator(SemContext *sem_context,
   DCHECK(ql_op_ == QL_OP_AND || ql_op_ == QL_OP_OR);
 
   // "op1" and "op2" must have been analyzed before getting here
-  if (op1->ql_type_id() != BOOL) {
+  if (op1->ql_type_id() != DataType::BOOL) {
     return sem_context->Error(op1, "Only boolean value is allowed in this context",
                               ErrorCode::INVALID_DATATYPE);
   }
-  if (op2->ql_type_id() != BOOL) {
+  if (op2->ql_type_id() != DataType::BOOL) {
     return sem_context->Error(op2, "Only boolean value is allowed in this context",
                               ErrorCode::INVALID_DATATYPE);
   }
@@ -836,6 +872,33 @@ Status PTRelationExpr::SetupSemStateForOp2(SemState *sem_state) {
       break;
     }
 
+    case QL_OP_CONTAINS_KEY: {
+      // We will check for data type mismatch errors in AnalyzeOperator
+      if (operand1->expr_op() == ExprOperator::kRef &&
+          operand1->ql_type()->main() == yb::DataType::MAP) {
+        const PTRef *ref = static_cast<const PTRef *>(operand1.get());
+        auto ql_type = operand1->ql_type()->keys_type();
+        sem_state->SetExprState(
+            ql_type,
+            client::YBColumnSchema::ToInternalDataType(ql_type),
+            ref->bindvar_name(),
+            ref->desc());
+      }
+      break;
+    }
+
+    case QL_OP_CONTAINS: {
+      // We will check for data type mismatch errors in AnalyzeOperator.
+      if (operand1->expr_op() == ExprOperator::kRef && operand1->ql_type()->IsCollection()) {
+        const PTRef *ref = static_cast<const PTRef *>(operand1.get());
+        auto ql_type = operand1->ql_type()->values_type();
+        sem_state->SetExprState(ql_type,
+                                client::YBColumnSchema::ToInternalDataType(ql_type),
+                                ref->bindvar_name(),
+                                ref->desc());
+      }
+      break;
+    }
     case QL_OP_IN: FALLTHROUGH_INTENDED;
     case QL_OP_NOT_IN: {
       auto ql_type = QLType::CreateTypeList(operand1->ql_type());
@@ -931,6 +994,55 @@ Status PTRelationExpr::AnalyzeOperator(SemContext *sem_context,
                                   ErrorCode::INCOMPARABLE_DATATYPES);
       }
       break;
+
+    case QL_OP_CONTAINS: {
+      RETURN_NOT_OK(op1->CheckLhsExpr(sem_context));
+      RETURN_NOT_OK(op2->CheckRhsExpr(sem_context));
+      // We must check if LHS is collection.
+      if (!op1->ql_type()->IsCollection()) {
+        return sem_context->Error(this,
+            "CONTAINS is only supported for Collections that are not frozen.",
+            ErrorCode::DATATYPE_MISMATCH);
+      }
+
+      if (op2->is_null()) {
+        return sem_context->Error(
+            this, "CONTAINS does not support NULL", ErrorCode::INVALID_ARGUMENTS);
+      }
+
+      // For CONTAINS operator, we check compatibility between op1's value_type and op2's type.
+      auto value_type_lhs = op1->ql_type()->values_type();
+      if (!sem_context->IsComparable(value_type_lhs->main(), op2->ql_type_id())) {
+        return sem_context->Error(
+            this, "Cannot compare values of these datatypes", ErrorCode::INCOMPARABLE_DATATYPES);
+      }
+      break;
+    }
+
+    case QL_OP_CONTAINS_KEY: {
+      RETURN_NOT_OK(op1->CheckLhsExpr(sem_context));
+      RETURN_NOT_OK(op2->CheckRhsExpr(sem_context));
+      // We must check if LHS is map
+      if (op1->ql_type()->main() != yb::DataType::MAP) {
+        return sem_context->Error(
+            this,
+            "CONTAINS KEY is only supported for Maps that are not frozen.",
+            ErrorCode::DATATYPE_MISMATCH);
+      }
+
+      if (op2->is_null()) {
+        return sem_context->Error(
+            this, "CONTAINS KEY does not support NULL.", ErrorCode::INVALID_ARGUMENTS);
+      }
+
+      // For CONTAINS KEY operator, we check compatibility between op1's key type and op2's type.
+      auto value_type_lhs = op1->ql_type()->keys_type();
+      if (!sem_context->IsComparable(value_type_lhs->main(), op2->ql_type_id())) {
+        return sem_context->Error(
+            this, "Cannot compare values of these datatypes", ErrorCode::INCOMPARABLE_DATATYPES);
+      }
+      break;
+    }
 
     default:
       return sem_context->Error(this, "Operator not supported yet",
@@ -1132,6 +1244,10 @@ string PTRelationExpr::QLName(QLNameOption option) const {
       return op1()->QLName(option) + " IN " + op2()->QLName(option);
     case QL_OP_NOT_IN:
       return op1()->QLName(option) + " NOT IN " + op2()->QLName(option);
+    case QL_OP_CONTAINS:
+      return op1()->QLName(option) + " CONTAINS " + op2()->QLName(option);
+    case QL_OP_CONTAINS_KEY:
+      return op1()->QLName(option) + " CONTAINS KEY " + op2()->QLName(option);
 
     // Relation operators that take three operands.
     case QL_OP_BETWEEN:
@@ -1162,7 +1278,7 @@ const ColumnDesc *PTExpr::GetColumnDesc(const SemContext *sem_context,
                                         const MCString& col_name) const {
   if (sem_context->selecting_from_index()) {
     // Mangle column name when selecting from IndexTable.
-    MCString mangled_name(YcqlName::MangleColumnName(col_name.c_str()).c_str(),
+    MCString mangled_name(qlexpr::YcqlName::MangleColumnName(col_name.c_str()).c_str(),
                           sem_context->PTempMem());
     return GetColumnDesc(sem_context, mangled_name, sem_context->current_dml_stmt());
   }
@@ -1252,7 +1368,7 @@ std::string PTRef::QLName(QLNameOption option) const {
   }
 
   if (option == QLNameOption::kMangledName) {
-    return YcqlName::MangleColumnName(name_->QLName());
+    return qlexpr::YcqlName::MangleColumnName(name_->QLName());
   }
 
   return name_->QLName();
@@ -1407,7 +1523,7 @@ std::string PTJsonColumnWithOperators::QLName(QLNameOption option) const {
     DCHECK(desc_) << "Metadata is not yet loaded to this node";
     qlname = desc_->MetadataName();
   } else if (option == QLNameOption::kMangledName) {
-    qlname = YcqlName::MangleColumnName(name_->QLName());
+    qlname = qlexpr::YcqlName::MangleColumnName(name_->QLName());
   } else {
     qlname = name_->QLName();
   }
@@ -1648,7 +1764,7 @@ Status PTBindVar::Analyze(SemContext *sem_context) {
 
   if (sem_context->expr_expected_ql_type()->main() == DataType::UNKNOWN_DATA) {
     // By default bind variables are compatible with any type.
-    ql_type_ = QLType::Create(NULL_VALUE_TYPE);
+    ql_type_ = QLType::Create(DataType::NULL_VALUE_TYPE);
   } else {
     ql_type_ = sem_context->expr_expected_ql_type();
   }

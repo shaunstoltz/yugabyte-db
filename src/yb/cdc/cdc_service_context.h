@@ -1,4 +1,4 @@
-// Copyright (c) YugaByte, Inc.
+// Copyright (c) YugabyteDB, Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License"); you may not use this file except
 // in compliance with the License.  You may obtain a copy of the License at
@@ -16,6 +16,8 @@
 #include "yb/common/entity_ids_types.h"
 
 #include "yb/tablet/tablet_fwd.h"
+
+#include "yb/util/net/net_util.h"
 
 namespace yb {
 namespace cdc {
@@ -37,9 +39,16 @@ class CDCServiceContext {
   // Returns permanent UUID of this instance.
   virtual const std::string& permanent_uuid() const = 0;
 
-  // Creates async client initialiser with given name and default timeout.
-  virtual std::unique_ptr<client::AsyncClientInitialiser> MakeClientInitializer(
-      const std::string& client_name, MonoDelta default_timeout) const = 0;
+  virtual Result<uint32> GetAutoFlagsConfigVersion() const = 0;
+
+  // Returns the HostPort for RPC connections to the local server.
+  // Uses DesiredHostPort logic with the local server's cloud info to ensure
+  // endpoint verification succeeds with DNS-based server addresses.
+  virtual Result<HostPort> GetDesiredHostPortForLocal() const = 0;
+
+  // Whether each local peer should update its own retention barriers independently.
+  // When false, the leader propagates retention barriers to all peers.
+  virtual bool ShouldLocalPeerUpdateOwnBarriers() const = 0;
 
   virtual ~CDCServiceContext() = default;
 };

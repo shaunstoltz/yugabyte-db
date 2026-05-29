@@ -1,8 +1,7 @@
 import type {
   CommonColors,
   PaletteColor,
-  TypeBackground,
-  YBAColors
+  TypeBackground
 } from '@material-ui/core/styles/createPalette';
 
 export const colors = {
@@ -29,6 +28,7 @@ export const colors = {
     900: '#000041'
   } as PaletteColor,
   grey: {
+    50: '#F7F9FB',
     100: '#F0F4F7',
     200: '#E9EEF2',
     300: '#D7DEE4', // sometimes refered as #D7DDE1 in designs
@@ -40,6 +40,7 @@ export const colors = {
     900: '#0B1117'
   } as PaletteColor,
   error: {
+    50: '#FEEDED',
     100: '#FDE2E2',
     300: '#F9ACAC',
     500: '#DA1515',
@@ -47,6 +48,7 @@ export const colors = {
     900: '#590000'
   } as PaletteColor,
   warning: {
+    50: '#FFF6E3',
     100: '#FFEEC8',
     300: '#FFD383',
     500: '#FFA400',
@@ -54,6 +56,7 @@ export const colors = {
     900: '#9D6C00'
   } as PaletteColor,
   success: {
+    50: '#DCF8EC',
     100: '#CDEFE1',
     300: '#82D2B0',
     500: '#13A868',
@@ -121,19 +124,61 @@ export const colors = {
     bar2: '#262666'
   },
   ybacolors: {
-    ybOrangeFocus: '#EF582480',
-    ybGray: '#DEDEE0',
-    ybGrayHover: '#E5E5E9',
-    ybDarkGray: '#232329',
-    ybDarkGray1: '#9F9EA7',
-    ybDarkGray2: '#D9D9DB',
-    inputBackground: '#E6E6E6',
+    accent_2_1: '#EF5824',
+    backgroundBlueLight: '#F5F8FE',
     backgroundDisabled: '#EEE',
+    backgroundGrayDark: '#E5E5E9',
+    backgroundGrayLight: '#F7F7F7',
+    backgroundGrayLightest: '#FCFCFC',
+    backgroundGrayRegular: '#F1F1F1',
+    borderBlue: '#3771FD',
+    borderGray: '#C8C8C8',
     colorDisabled: '#555',
     darkBlue: '#303a78',
+    disabledIcon: '#E5E5E9',
+    error: '#E73E36',
+    inputBackground: '#E6E6E6',
+    labelBackground: '#151730',
+    tipBackgroundLightGray: '#F7F9FB',
+    primary4: '#44518B',
+    purple050: "#F2F3FE",
+    purple300: '#7879F1',
+    pillDangerBackground: '#FDE2E2',
+    pillDangerIcon: '#DA1515',
+    pillDangerText: '#8F0000',
+    pillInProgressBackground: '#CBDAFF',
+    pillInProgressIcon: '#2B59C3',
+    pillInProgressText: '#1A44A5',
+    pillInactiveBackground: '#E9EEF2',
+    pillInactiveText: '#4E5F6D',
+    pillReadyBackground: '#CDEFE0',
+    pillReadyIcon: '#097245',
+    pillReadyText: '#097245',
+    pillWarningBackground: '#FFEEC8',
+    pillWarningIcon: '#FFA400',
+    pillWarningText: '#9D6C00',
+    success: '#289B42',
+    textGray: '#818182',
+    textDarkGray: '#67666C',
+    textInProgress: '#44518B',
+    warning: '#FF9933',
+    ybIcon: '#EF5824',
+    ybBorderGray: '#E5E5E9',
+    ybBorderGrayDark: '#C8C7CE',
+    ybDarkGray1: '#9F9EA7',
+    ybDarkGray2: '#D9D9DB',
+    ybDarkGray: '#232329',
+    ybGray: '#DEDEE0',
+    ybOrangeFocus: '#EF582480',
+    ybPurple: '#5D5FEF',
+    grey005: '#FBFCFD',
+    grey050: '#F7F9FB',
+    success005: '#F0FAF6'
+  },
+  ybaShadows: {
     inputBoxShadow: 'inset 0 1px 1px rgb(0 0 0 / 8%), 0 0 8px rgb(239 88 36 / 20%)'
-  } as YBAColors
-};
+  }
+} as const;
 
 export const themeVariables = {
   screenMinWidth: 1024,

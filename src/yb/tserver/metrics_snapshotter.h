@@ -1,4 +1,4 @@
-// Copyright (c) YugaByte, Inc.
+// Copyright (c) YugabyteDB, Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License"); you may not use this file except
 // in compliance with the License.  You may obtain a copy of the License at
@@ -14,6 +14,7 @@
 #pragma once
 
 #include <memory>
+#include <vector>
 
 #include "yb/gutil/macros.h"
 
@@ -32,10 +33,13 @@ class MetricsSnapshotter {
   Status Stop();
 
   ~MetricsSnapshotter();
+  static Result<std::vector<double>> GetCpuUsageInInterval(int ms);
+  static Result<std::vector<uint64_t>> GetMemoryUsage();
 
  private:
   class Thread;
   std::unique_ptr<Thread> thread_;
+  static Result<std::vector<uint64_t>> GetCpuUsage();
   DISALLOW_COPY_AND_ASSIGN(MetricsSnapshotter);
 };
 

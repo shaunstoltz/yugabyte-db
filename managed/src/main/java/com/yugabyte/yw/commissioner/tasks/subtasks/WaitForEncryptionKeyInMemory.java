@@ -1,5 +1,5 @@
 /*
- * Copyright 2019 YugaByte, Inc. and Contributors
+ * Copyright 2019 YugabyteDB, Inc. and Contributors
  *
  * Licensed under the Polyform Free Trial License 1.0.0 (the "License"); you
  * may not use this file except in compliance with the License. You
@@ -12,7 +12,6 @@ package com.yugabyte.yw.commissioner.tasks.subtasks;
 import com.google.common.net.HostAndPort;
 import com.yugabyte.yw.commissioner.BaseTaskDependencies;
 import com.yugabyte.yw.commissioner.tasks.params.NodeTaskParams;
-import com.yugabyte.yw.common.NodeManager;
 import com.yugabyte.yw.common.kms.util.EncryptionAtRestUtil;
 import com.yugabyte.yw.models.KmsHistory;
 import com.yugabyte.yw.models.Universe;
@@ -26,9 +25,8 @@ public class WaitForEncryptionKeyInMemory extends NodeTaskBase {
   public static final int KEY_IN_MEMORY_TIMEOUT = 5000;
 
   @Inject
-  protected WaitForEncryptionKeyInMemory(
-      BaseTaskDependencies baseTaskDependencies, NodeManager nodeManager) {
-    super(baseTaskDependencies, nodeManager);
+  protected WaitForEncryptionKeyInMemory(BaseTaskDependencies baseTaskDependencies) {
+    super(baseTaskDependencies);
   }
 
   public static class Params extends NodeTaskParams {
@@ -42,23 +40,18 @@ public class WaitForEncryptionKeyInMemory extends NodeTaskBase {
 
   @Override
   public void run() {
-    Universe universe = Universe.getOrBadRequest(taskParams().universeUUID);
-    if (universe != null && EncryptionAtRestUtil.getNumKeyRotations(universe.universeUUID) > 0) {
-      YBClient client = null;
-      String hostPorts = universe.getMasterAddresses();
-      String certificate = universe.getCertificateNodetoNode();
-      try {
-        client = ybService.getClient(hostPorts, certificate);
-        KmsHistory activeKey = EncryptionAtRestUtil.getActiveKey(universe.universeUUID);
+    Universe universe = Universe.getOrBadRequest(taskParams().getUniverseUUID());
+    if (universe != null
+        && EncryptionAtRestUtil.getNumUniverseKeys(universe.getUniverseUUID()) > 0) {
+      try (YBClient client = ybService.getUniverseClient(universe)) {
+        KmsHistory activeKey = EncryptionAtRestUtil.getActiveKey(universe.getUniverseUUID());
         if (!client.waitForMasterHasUniverseKeyInMemory(
-            KEY_IN_MEMORY_TIMEOUT, activeKey.uuid.keyRef, taskParams().nodeAddress)) {
+            KEY_IN_MEMORY_TIMEOUT, activeKey.getUuid().keyRef, taskParams().nodeAddress)) {
           throw new RuntimeException(
               "Timeout occurred waiting for universe encryption key to be set in memory");
         }
       } catch (Exception e) {
         log.error("{} hit error : {}", getName(), e.getMessage());
-      } finally {
-        ybService.closeClient(client, hostPorts);
       }
     }
   }

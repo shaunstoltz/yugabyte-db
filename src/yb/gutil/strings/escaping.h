@@ -19,9 +19,9 @@
 // And probably many more places, as well.
 
 //
-// The following only applies to changes made to this file as part of YugaByte development.
+// The following only applies to changes made to this file as part of YugabyteDB development.
 //
-// Portions Copyright (c) YugaByte, Inc.
+// Portions Copyright (c) YugabyteDB, Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License"); you may not use this file except
 // in compliance with the License.  You may obtain a copy of the License at
@@ -40,7 +40,7 @@
 #include <string>
 #include <vector>
 
-#include <glog/logging.h>
+#include "yb/util/logging.h"
 
 #include "yb/gutil/strings/ascii_ctype.h"
 #include "yb/gutil/strings/charset.h"
@@ -373,7 +373,7 @@ void WebSafeBase64Escape(
 //    ASCII equivalents. src is not null terminated, instead specify len.
 //    RETURNS the length of dest, or -1 if src contains invalid chars.
 // ----------------------------------------------------------------------
-size_t Base32Unescape(const char* src, size_t slen, char* dest, size_t szdest);
+ssize_t Base32Unescape(const char* src, size_t slen, char* dest, size_t szdest);
 bool Base32Unescape(const char* src, size_t slen, std::string* dest);
 inline bool Base32Unescape(const std::string& src, std::string* dest) {
   return Base32Unescape(src.data(), src.size(), dest);
@@ -595,6 +595,10 @@ inline std::string ByteStringToAscii(const std::string& binary_string,
   std::string result;
   ByteStringToAscii(binary_string, bytes_to_read, &result);
   return result;
+}
+
+inline std::string ByteStringToAscii(const std::string& binary_string) {
+  return ByteStringToAscii(binary_string, binary_string.size());
 }
 
 // Converts the hex from ascii_string into binary data and

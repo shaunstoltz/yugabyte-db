@@ -1,6 +1,7 @@
 package com.yugabyte.yw.commissioner.tasks;
 
 import com.yugabyte.yw.commissioner.BaseTaskDependencies;
+import com.yugabyte.yw.commissioner.UserTaskDetails.SubTaskGroupType;
 import com.yugabyte.yw.common.PlacementInfoUtil;
 import com.yugabyte.yw.forms.UniverseDefinitionTaskParams;
 import com.yugabyte.yw.models.AvailabilityZone;
@@ -9,14 +10,14 @@ import com.yugabyte.yw.models.helpers.ClusterAZ;
 import com.yugabyte.yw.models.helpers.LoadBalancerConfig;
 import com.yugabyte.yw.models.helpers.LoadBalancerPlacement;
 import com.yugabyte.yw.models.helpers.PlacementInfo;
-import lombok.extern.slf4j.Slf4j;
-import org.apache.commons.collections.CollectionUtils;
-
-import javax.inject.Inject;
 import java.util.List;
 import java.util.Map;
 import java.util.UUID;
 import java.util.stream.Collectors;
+import javax.inject.Inject;
+import lombok.extern.slf4j.Slf4j;
+import org.apache.commons.collections4.CollectionUtils;
+import play.libs.Json;
 
 @Slf4j
 public class UpdateLoadBalancerConfig extends UniverseDefinitionTaskBase {
@@ -35,25 +36,25 @@ public class UpdateLoadBalancerConfig extends UniverseDefinitionTaskBase {
 
   @Override
   public void run() {
-    log.info("Started {} task for univ uuid={}", getName(), taskParams().universeUUID);
+    log.info("Started {} task for univ uuid={}", getName(), taskParams().getUniverseUUID());
     Universe universe = getUniverse();
     try {
-      // Update the universe DB with the changes to be performed and set the 'updateInProgress' flag
-      // to prevent other updates from happening.
-      universe =
-          lockUniverseForUpdate(
-              taskParams().expectedUniverseVersion,
-              u -> {
-                // Get expected LB config
-                Map<LoadBalancerPlacement, LoadBalancerConfig> newLbMap =
-                    createLoadBalancerMap(taskParams(), null, null, null);
-                // Get current LB config
-                Map<ClusterAZ, String> currentLBs = taskParams().existingLBs;
-                // Add old LBs to newLbMap so that nodes are removed from old LBs
-                compareLBs(taskParams(), newLbMap, currentLBs);
-                // Create manage load balancer task
-                createManageLoadBalancerTasks(newLbMap);
-              });
+      // Lock the universe but don't freeze it because this task doesn't perform critical updates to
+      // universe metadata.
+      universe = lockUniverse(-1 /* expectedUniverseVersion */);
+
+      // Get expected LB config
+      Map<LoadBalancerPlacement, LoadBalancerConfig> newLbMap =
+          createLoadBalancerMap(taskParams(), null, null, null);
+
+      // Get current LB config
+      Map<ClusterAZ, String> currentLBs = taskParams().existingLBs;
+      // Add old LBs to newLbMap so that nodes are removed from old LBs
+      log.info("Original newLbMap {}, currentLBs {}", Json.toJson(newLbMap), currentLBs);
+      compareLBs(taskParams(), newLbMap, currentLBs);
+      log.info("After comparing, newLbMap {}, currentLBs {}", Json.toJson(newLbMap), currentLBs);
+      // Create manage load balancer task
+      createManageLoadBalancerTasks(newLbMap);
 
       // Update universe to new LB config
       Universe.UniverseUpdater updater =
@@ -62,12 +63,15 @@ public class UpdateLoadBalancerConfig extends UniverseDefinitionTaskBase {
           };
       saveUniverseDetails(updater);
 
+      createMarkUniverseUpdateSuccessTasks()
+          .setSubTaskGroupType(SubTaskGroupType.ConfigureUniverse);
+
       getRunnableTask().runSubTasks();
     } catch (Exception e) {
       log.error("Task Errored out with: " + e);
       throw new RuntimeException(e);
     } finally {
-      unlockUniverseForUpdate(universe.universeUUID);
+      unlockUniverseForUpdate(universe.getUniverseUUID());
     }
   }
 
@@ -84,7 +88,7 @@ public class UpdateLoadBalancerConfig extends UniverseDefinitionTaskBase {
       AvailabilityZone az = clusterAZ.getAz();
 
       LoadBalancerPlacement lbPlacement =
-          new LoadBalancerPlacement(providerUUID, az.region.code, lbName);
+          new LoadBalancerPlacement(providerUUID, az.getRegion().getCode(), lbName);
       newLbMap.computeIfAbsent(lbPlacement, v -> new LoadBalancerConfig(lbName));
     }
   }
@@ -94,7 +98,7 @@ public class UpdateLoadBalancerConfig extends UniverseDefinitionTaskBase {
       // If this universe is not being edited, fail the request.
       UniverseDefinitionTaskParams universeDetails = universe.getUniverseDetails();
       if (!universeDetails.updateInProgress) {
-        String errMsg = "UserUniverse " + taskParams().universeUUID + " is not being edited.";
+        String errMsg = "UserUniverse " + taskParams().getUniverseUUID() + " is not being edited.";
         log.error(errMsg);
         throw new RuntimeException(errMsg);
       }

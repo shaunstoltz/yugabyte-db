@@ -1,4 +1,4 @@
-// Copyright (c) YugaByte, Inc.
+// Copyright (c) YugabyteDB, Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License"); you may not use this file except
 // in compliance with the License.  You may obtain a copy of the License at
@@ -28,12 +28,11 @@
 
 #include "yb/util/status_fwd.h"
 
-DECLARE_string(initial_sys_catalog_snapshot_path);
-DECLARE_bool(enable_ysql);
-DECLARE_bool(create_initial_sys_catalog_snapshot);
-
 namespace yb {
 namespace master {
+
+struct LeaderEpoch;
+class YsqlManagerIf;
 
 // Used by the catalog manager to prepare an initial sys catalog snapshot.
 class InitialSysCatalogSnapshotWriter {
@@ -63,10 +62,8 @@ void SetDefaultInitialSysCatalogSnapshotFlags();
 // A one-time migration procedure for existing clusters to set is_ysql_catalog_table and
 // is_transactional flags to true on YSQL system catalog tables.
 Status MakeYsqlSysCatalogTablesTransactional(
-    TableIndex::TablesRange tables,
-    SysCatalogTable* sys_catalog,
-    SysConfigInfo* ysql_catalog_config,
-    int64_t term);
+    TableIndex::TablesRange tables, SysCatalogTable* sys_catalog,
+    YsqlManagerIf& ysql_manager, const LeaderEpoch& epoch);
 
 }  // namespace master
 }  // namespace yb

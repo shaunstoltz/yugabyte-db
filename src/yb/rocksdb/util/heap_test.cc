@@ -3,9 +3,9 @@
 //  LICENSE file in the root directory of this source tree. An additional grant
 //  of patent rights can be found in the PATENTS file in the same directory.
 //
-// The following only applies to changes made to this file as part of YugaByte development.
+// The following only applies to changes made to this file as part of YugabyteDB development.
 //
-// Portions Copyright (c) YugaByte, Inc.
+// Portions Copyright (c) YugabyteDB, Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License"); you may not use this file except
 // in compliance with the License.  You may obtain a copy of the License at
@@ -32,10 +32,10 @@
 #include "yb/rocksdb/util/testutil.h"
 
 #ifndef GFLAGS
-const int64_t FLAGS_iters = 100000;
+const int64_t ANNOTATE_UNPROTECTED_WRITE(FLAGS_iters) = 100000;
 #else
 #include "yb/util/flags.h"
-DEFINE_UNKNOWN_int64(iters, 100000, "number of pseudo-random operations in each test");
+DEFINE_NON_RUNTIME_int64(iters, 100000, "number of pseudo-random operations in each test");
 #endif  // GFLAGS
 
 /*

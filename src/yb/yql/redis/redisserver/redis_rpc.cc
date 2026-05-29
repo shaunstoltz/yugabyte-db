@@ -1,5 +1,5 @@
 //
-// Copyright (c) YugaByte, Inc.
+// Copyright (c) YugabyteDB, Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License"); you may not use this file except
 // in compliance with the License.  You may obtain a copy of the License at
@@ -17,7 +17,7 @@
 
 #include "yb/client/client_fwd.h"
 
-#include "yb/common/redis_protocol.pb.h"
+#include "yb/common/redis_protocol.messages.h"
 
 #include "yb/rpc/connection.h"
 #include "yb/rpc/reactor.h"
@@ -42,6 +42,7 @@ using namespace std::placeholders;
 using namespace yb::size_literals;
 
 DECLARE_bool(rpc_dump_all_traces);
+DECLARE_int32(print_trace_every);
 DECLARE_int32(rpc_slow_query_threshold_ms);
 DEFINE_UNKNOWN_uint64(redis_max_concurrent_commands, 1,
               "Max number of redis commands received from single connection, "
@@ -55,8 +56,7 @@ DEFINE_UNKNOWN_uint64(redis_max_read_buffer_size, 128_MB,
 DEFINE_UNKNOWN_uint64(redis_max_queued_bytes, 128_MB,
               "Max number of bytes in queued redis commands.");
 
-DEFINE_UNKNOWN_int32(
-    redis_connection_soft_limit_grace_period_sec, 60,
+DEFINE_UNKNOWN_int32(redis_connection_soft_limit_grace_period_sec, 60,
     "The duration for which the outbound data needs to exceeed the softlimit "
     "before the connection gets closed down.");
 
@@ -126,10 +126,8 @@ Result<rpc::ProcessCallsResult> RedisConnectionContext::ProcessCalls(
 Status RedisConnectionContext::HandleInboundCall(const rpc::ConnectionPtr& connection,
                                                  size_t commands_in_batch,
                                                  rpc::CallData* data) {
-  auto reactor = connection->reactor();
-  DCHECK(reactor->IsCurrentThread());
-
-  auto call = rpc::InboundCall::Create<RedisInboundCall>(connection, data->size(), this);
+  auto call = rpc::InboundCall::Create<RedisInboundCall>(
+      connection, data->size(), this, connection->call_state_listener_factory());
 
   Status s = call->ParseFrom(call_mem_tracker_, commands_in_batch, data);
   if (!s.ok()) {
@@ -196,21 +194,23 @@ void RedisConnectionContext::Shutdown(const Status& status) {
 
 RedisInboundCall::RedisInboundCall(rpc::ConnectionPtr conn,
                                    size_t weight_in_bytes,
-                                   CallProcessedListener* call_processed_listener)
-    : QueueableInboundCall(std::move(conn), weight_in_bytes, call_processed_listener) {}
+                                   CallProcessedListener* call_processed_listener,
+                                   rpc::CallStateListenerFactory* call_state_listener_factory)
+    : QueueableInboundCall(std::move(conn),
+                           weight_in_bytes,
+                           call_processed_listener,
+                           call_state_listener_factory) {}
 
 RedisInboundCall::~RedisInboundCall() {
-  Status status;
+  Status status =
+      STATUS(ServiceUnavailable, "Shutdown connection", "" /* msg2 */, Errno(ESHUTDOWN));
   if (quit_.load(std::memory_order_acquire)) {
     rpc::ConnectionPtr conn = connection();
     rpc::Reactor* reactor = conn->reactor();
-    auto scheduled = reactor->ScheduleReactorTask(
-        MakeFunctorReactorTask(std::bind(&rpc::Reactor::DestroyConnection,
-                                         reactor,
-                                         conn.get(),
-                                         status),
-                               conn, SOURCE_LOCATION()));
-    LOG_IF(WARNING, !scheduled) << "Failed to schedule destroy";
+    auto scheduling_status = reactor->ScheduleReactorTask(MakeFunctorReactorTask(
+        std::bind(&rpc::Reactor::DestroyConnection, reactor, conn.get(), status), conn,
+        SOURCE_LOCATION()));
+    LOG_IF(DFATAL, !scheduling_status.ok()) << "Failed to schedule destroy";
   }
 }
 
@@ -221,7 +221,6 @@ Status RedisInboundCall::ParseFrom(
 
   consumption_ = ScopedTrackedConsumption(mem_tracker, data->size());
 
-  request_data_memory_usage_.store(data->size(), std::memory_order_release);
   request_data_ = std::move(*data);
   serialized_request_ = Slice(request_data_.data(), request_data_.size());
 
@@ -287,18 +286,15 @@ void RedisInboundCall::GetCallDetails(rpc::RpcCallInProgressPB *call_in_progress
 void RedisInboundCall::LogTrace() const {
   MonoTime now = MonoTime::Now();
   auto total_time = now.GetDeltaSince(timing_.time_received).ToMilliseconds();
-
-  if (PREDICT_FALSE(FLAGS_rpc_dump_all_traces
-          || (trace_ && trace_->must_print())
-          || total_time > FLAGS_rpc_slow_query_threshold_ms)) {
-    LOG(WARNING) << ToString() << " took " << total_time << "ms. Details:";
+  bool must_log_trace = false;
+  if (PREDICT_FALSE(FLAGS_rpc_dump_all_traces || total_time > FLAGS_rpc_slow_query_threshold_ms)) {
     rpc::RpcCallInProgressPB call_in_progress_pb;
     GetCallDetails(&call_in_progress_pb);
-    LOG(WARNING) << call_in_progress_pb.DebugString() << "Trace: ";
-    if (trace_) {
-      trace_->Dump(&LOG(WARNING), /* include_time_deltas */ true);
-    }
+    LOG(WARNING) << ToString() << " took " << total_time << "ms. Details:\n"
+                 << call_in_progress_pb.DebugString();
+    must_log_trace = true;
   }
+  Trace::DumpTraceIfNecessary(trace(), FLAGS_print_trace_every, must_log_trace);
 }
 
 string RedisInboundCall::ToString() const {
@@ -307,6 +303,7 @@ string RedisInboundCall::ToString() const {
 
 bool RedisInboundCall::DumpPB(const rpc::DumpRunningRpcsRequestPB& req,
                               rpc::RpcCallInProgressPB* resp) {
+  auto trace_ = trace();
   if (req.include_traces() && trace_) {
     resp->set_trace_buffer(trace_->DumpToString(true));
   }
@@ -326,9 +323,10 @@ Out DoSerializeResponses(const Collection& responses, Out out) {
   // TODO(Amit): As and when we implement get/set and its h* equivalents, we would have to
   // handle arrays, hashes etc. For now, we only support the string response.
 
-  for (const auto& redis_response : responses) {
-    string error_message = redis_response.error_message();
-    if (error_message == "") {
+  for (const auto& redis_response_ptr : responses) {
+    auto& redis_response = *redis_response_ptr;
+    Slice error_message = redis_response.error_message();
+    if (error_message.empty()) {
       error_message = "Unknown error";
     }
     // Several types of error cases:
@@ -393,14 +391,15 @@ void RedisInboundCall::RespondFailure(rpc::ErrorStatusPB::RpcErrorCodePB error_c
 }
 
 // We wait until all responses are ready for batch embedded in this call.
-void RedisInboundCall::Respond(size_t idx, bool is_success, RedisResponsePB* resp) {
+void RedisInboundCall::Respond(
+    size_t idx, bool is_success, std::shared_ptr<LWRedisResponsePB> resp) {
   // Did we set response for command at this index already?
   VLOG(2) << "Responding to '" << client_batch_[idx][0] << "' with " << resp->ShortDebugString();
   if (base::subtle::NoBarrier_AtomicIncrement(&ready_[idx], 1) == 1) {
     if (!is_success) {
       had_failures_.store(true, std::memory_order_release);
     }
-    responses_[idx].Swap(resp);
+    responses_[idx] = std::move(resp);
     // Did we get all responses and ready to send data.
     size_t responded = ready_count_.fetch_add(1, std::memory_order_release) + 1;
     if (responded == client_batch_.size()) {
@@ -412,17 +411,21 @@ void RedisInboundCall::Respond(size_t idx, bool is_success, RedisResponsePB* res
 
 void RedisInboundCall::RespondSuccess(size_t idx,
                                       const rpc::RpcMethodMetrics& metrics,
-                                      RedisResponsePB* resp) {
+                                      std::shared_ptr<LWRedisResponsePB> resp) {
   Respond(idx, true, resp);
   metrics.handler_latency->Increment((MonoTime::Now() - timing_.time_handled).ToMicroseconds());
 }
 
 void RedisInboundCall::RespondFailure(size_t idx, const Status& status) {
-  RedisResponsePB resp;
-  Slice message = status.message();
-  resp.set_code(RedisResponsePB_RedisStatusCode_PARSING_ERROR);
-  resp.set_error_message(message.data(), message.size());
-  Respond(idx, false, &resp);
+  auto resp = rpc::MakeSharedMessage<LWRedisResponsePB>();
+  resp->set_code(RedisResponsePB_RedisStatusCode_PARSING_ERROR);
+  resp->dup_error_message(status.message());
+  Respond(idx, false, std::move(resp));
+}
+
+size_t RedisInboundCall::DynamicMemoryUsage() const {
+  return QueueableInboundCall::DynamicMemoryUsage() +
+         DynamicMemoryUsageOf(responses_, ready_, client_batch_);
 }
 
 } // namespace redisserver

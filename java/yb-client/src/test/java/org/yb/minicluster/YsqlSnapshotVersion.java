@@ -1,4 +1,4 @@
-// Copyright (c) YugaByte, Inc.
+// Copyright (c) YugabyteDB, Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License"); you may not use this file except
 // in compliance with the License.  You may obtain a copy of the License at
@@ -14,8 +14,8 @@
 package org.yb.minicluster;
 
 public enum YsqlSnapshotVersion {
-  /** Earliest supported snapshot (v2.0.9). */
-  EARLIEST,
+  /** Snapshot captured during PG15.12 merge. */
+  PG15_12,
 
   /** Latest (current) snapshot. */
   LATEST

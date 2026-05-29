@@ -1,5 +1,5 @@
 //
-// Copyright (c) YugaByte, Inc.
+// Copyright (c) YugabyteDB, Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License"); you may not use this file except
 // in compliance with the License.  You may obtain a copy of the License at
@@ -17,6 +17,8 @@
 
 #include <atomic>
 #include <mutex>
+#include <string>
+#include <typeinfo>
 #include <unordered_map>
 
 namespace yb {

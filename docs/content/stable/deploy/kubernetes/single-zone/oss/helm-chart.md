@@ -3,6 +3,12 @@ title: Deploy on OSS Kubernetes using Helm Chart
 headerTitle: Open source Kubernetes
 linkTitle: Open source Kubernetes
 description: Deploy a YugabyteDB cluster on OSS Kubernetes using Helm Chart.
+aliases:
+  - /stable/deploy/kubernetes/oss/
+  - /stable/deploy/kubernetes/oss/helm-chart/
+  - /stable/deploy/kubernetes/single-zone/oss/
+  - /stable/deploy/kubernetes/helm-chart/
+  - /stable/deploy/kubernetes/helm-configuration/
 menu:
   stable:
     parent: deploy-kubernetes-sz
@@ -14,25 +20,18 @@ type: docs
 
 <ul class="nav nav-tabs-alt nav-tabs-yb">
   <li >
-    <a href="{{< relref "./helm-chart.md" >}}" class="nav-link active">
+    <a href="../helm-chart/" class="nav-link active">
       <i class="fa-regular fa-dharmachakra" aria-hidden="true"></i>
       Helm chart
     </a>
   </li>
   <li >
-    <a href="{{< relref "./yugabyte-operator.md" >}}" class="nav-link">
+    <a href="../yugabyte-operator/" class="nav-link">
       <i class="fa-solid fa-cubes" aria-hidden="true"></i>
-      YugabyteDB operator
-    </a>
-  </li>
-  <li >
-    <a href="{{< relref "./operator-hub.md" >}}" class="nav-link">
-      <i class="fa-solid fa-cubes" aria-hidden="true"></i>
-      Operator Hub
+      Kubernetes Operator
     </a>
   </li>
 </ul>
-
 
 [Helm](https://helm.sh/) is an open source packaging tool that helps install applications and services on Kubernetes. It uses a packaging format called `charts`. A Helm chart is a package containing all resource definitions necessary to create an instance of a Kubernetes application, tool, or service in a Kubernetes cluster.
 
@@ -45,7 +44,7 @@ The YugabyteDB Helm chart has been tested with the following software versions:
 - Kubernetes 1.20 or later with nodes such that a total of 12 CPU cores and 18 GB RAM can be allocated to YugabyteDB. This can be three nodes with 4 CPU core and 6 GB RAM allocated to YugabyteDB.
 - Helm 3.4 or later.
 - YugabyteDB Docker image (yugabytedb/yugabyte) 2.1.0 or later
-- For optimal performance, ensure you have set the appropriate [system limits using `ulimit`](../../../../manual-deployment/system-config/#ulimits) on each node in your Kubernetes cluster.
+- For optimal performance, ensure you have set the appropriate [system configuration](../../../../manual-deployment/system-config/) on each node in your Kubernetes cluster.
 
 Confirm that `helm` and `kubectl` are configured correctly, as follows:
 
@@ -98,7 +97,7 @@ yugabytedb/yugabyte  {{<yb-version version="stable" format="short">}}          {
 
 ### Install YugabyteDB
 
-Install YugabyteDB in the Kubernetes cluster using the commands desribed in the following sections.
+Install YugabyteDB in the Kubernetes cluster using the commands described in the following sections.
 
 #### On multi-node Kubernetes
 
@@ -125,7 +124,7 @@ helm install yb-demo yugabytedb/yugabyte \
 resource.tserver.requests.cpu=0.5,resource.tserver.requests.memory=0.5Gi --namespace yb-demo
 ```
 
-Note that in Minikube, the LoadBalancers for `yb-master-ui` and `yb-tserver-service` will remain in pending state since load balancers are not available in a Minikube environment. If you would like to disable these services, pass the `enableLoadBalancer=False` flag, as follows:
+Note that in Minikube, the LoadBalancers for `yb-master-ui` and `yb-tserver-service` will remain in pending state as load balancers are not available in a Minikube environment. If you would like to disable these services, pass the `enableLoadBalancer=False` flag, as follows:
 
 ```sh
 helm install yb-demo yugabytedb/yugabyte \
@@ -230,13 +229,13 @@ REVISION  UPDATED                   STATUS    CHART           APP VERSION   DESC
 
 ## Connect using YugabyteDB shells
 
-To connect and use the YSQL Shell (`ysqlsh`), run the following command:
+To connect and use the YSQL Shell (ysqlsh), run the following command:
 
 ```sh
 kubectl exec -n yb-demo -it yb-tserver-0 -- ysqlsh -h yb-tserver-0.yb-tservers.yb-demo
 ```
 
-To connect and use the YCQL Shell (`ycqlsh`), run the following command:
+To connect and use the YCQL Shell (ycqlsh), run the following command:
 
 ```sh
 kubectl exec -n yb-demo -it yb-tserver-0 -- ycqlsh yb-tserver-0.yb-tservers.yb-demo
@@ -303,17 +302,107 @@ partition:
   tserver: 3
 ```
 
-If you want to change the defaults, you can use the following command. You can even do `helm install` instead of `helm upgrade` when you are installing on a Kubernetes cluster with configuration different than the defaults:
+If you want to change the defaults, use the `helm upgrade --set` command; or, if you are installing on a Kubernetes cluster with a configuration different than the defaults, you can use `helm install` instead of `helm upgrade`.
+
+For example, to change the TServer resource:
 
 ```sh
 helm upgrade --set resource.tserver.requests.cpu=8,resource.tserver.requests.memory=15Gi yb-demo ./yugabyte
 ```
 
-Replica count can be changed using the following command. Note that only the YB-TServers need to be scaled in a replication factor 3 cluster which keeps the masters count at `3`:
+To change replica count:
 
 ```sh
 helm upgrade --set replicas.tserver=5 yb-demo ./yugabyte
 ```
+
+Note that only the YB-TServers need to be scaled in a replication factor 3 cluster, which keeps the masters count at 3.
+
+#### Memory limits for Kubernetes deployments
+
+For Kubernetes deployments, memory limits are controlled via Kubernetes resource specifications in the Helm chart (the `resource.master.limits.memory` and `resource.tserver.limits.memory` values).
+
+The Helm chart automatically converts these Kubernetes pod memory limits to the `--memory_limit_hard_bytes` command-line flag, which is passed to the YugabyteDB processes (yb-tserver and yb-master) when the pods start. The [--default_memory_limit_to_ram_ratio](../../../../../reference/configuration/yb-tserver/#default-memory-limit-to-ram-ratio) flag does not apply to Kubernetes universes because memory resources are specified natively in the Kubernetes YAML rather than as a percentage of system RAM.
+
+For example, if you set `resource.tserver.limits.memory: 4Gi` in your Helm chart, the Helm chart automatically converts this to bytes and sets `--memory_limit_hard_bytes=4294967296` as a command-line argument when starting the TServer pods.
+
+### Readiness probes
+
+Readiness probes provide readiness checks for your Kubernetes deployment. Probes are compatible with both direct Helm deployments and [YugabyteDB Anywhere-managed deployments](../../../../../yugabyte-platform/create-deployments/create-universe-multi-zone-kubernetes/#helm-overrides), and work with TLS enabled or restricted authorization environments. Use the probes to ensure pods are ready before being marked as available. The probes verify connectivity using ysqlsh for YSQL and ycqlsh for YCQL.
+
+The following probes are available:
+
+- YSQL Readiness. Uses ysqlsh to verify connectivity via local socket for credentialed setups.
+
+- YCQL Readiness. Uses ycqlsh to validate connectivity.
+
+- Master Readiness. Uses `httpGet` to probe master.
+
+- Custom Readiness. Supports custom readiness probe parameters, such as delays, timeouts, and thresholds.
+
+- Startup probes to delay enforcing of readiness probes.
+
+Readiness probes are disabled by default for compatibility.
+
+Enable probes via `values.yaml` or using Kubernetes overrides.
+
+```yaml
+master:
+  readinessProbe:
+    enabled: true
+
+tserver:
+  readinessProbe:
+    enabled: true
+```
+
+The following is example of custom readiness parameters:
+
+```yaml
+tserver:
+  customReadinessProbe:
+    initialDelaySeconds: 30
+    periodSeconds: 20
+    timeoutSeconds: 10
+```
+
+### Liveness probes
+
+[Liveness probes](https://kubernetes.io/docs/concepts/workloads/pods/pod-lifecycle/#container-probes) determine whether Kubernetes should restart the YugabyteDB container. After enough consecutive failures, the [kubelet](https://kubernetes.io/docs/reference/command-line-tools-reference/kubelet/) restarts the container. Readiness probes only govern whether traffic is sent to the pod.
+
+Like readiness, liveness behavior comes from the Helm chart used for direct installs and for [YugabyteDB Anywhere-managed deployments](../../../../../yugabyte-platform/create-deployments/create-universe-multi-zone-kubernetes/#helm-overrides).
+
+YB-Master and YB-TServer pods share the top-level `livenessProbe` and `customLivenessProbe` entries in [`values.yaml`](https://github.com/yugabyte/charts/blob/master/stable/yugabyte/values.yaml).
+
+With persistent volume storage (`storage.ephemeral` is false), the chart installs a default `exec` probe that writes a timestamp into `disk.check` under each data directory (`/mnt/disk0`, `/mnt/disk1`, and so on, according to the configured disk count) and runs `sync` on those files. That touches the data disks so stuck or read-only volumes are more likely to fail the probe than a socket-only check.
+
+If `storage.ephemeral` is true, the chart omits this disk-based liveness probe and the startup probes rendered in the same conditional block.
+
+`livenessProbe.enabled` defaults to true. Tune `failureThreshold`, `periodSeconds`, `successThreshold`, and `timeoutSeconds` on the default probe.
+
+Disable the default probe:
+
+```yaml
+livenessProbe:
+  enabled: false
+```
+
+Set `customLivenessProbe` to a complete Kubernetes probe specification (`exec`, `httpGet`, or `tcpSocket`) to replace the default disk probe.
+
+```yaml
+customLivenessProbe:
+  exec:
+    command:
+      - /custom/health/check
+  failureThreshold: 3
+  periodSeconds: 10
+  timeoutSeconds: 1
+  successThreshold: 1
+```
+
+On each `Services` entry for `yb-masters` or `yb-tservers`, `skipHealthChecks: true` skips the disk-based liveness and startup probes from that template; readiness is still configured on its own.
+
+Preflight values (`preflight.skipAll` and related flags) affect startup checks only and do not change liveness probes.
 
 ### Independent LoadBalancers
 
@@ -345,7 +434,6 @@ serviceEndpoints:
     type: "LoadBalancer"
     ports:
       tcp-yql-port: "9042"
-      tcp-yedis-port: "6379"
       tcp-ysql-port: "5433"
 ```
 
@@ -381,12 +469,29 @@ gflags.tserver.placement_cloud=myk8s-cloud,gflags.tserver.placement_region=myk8s
  --namespace yb-demo
 ```
 
-## Upgrade cluster
+## Upgrade the software version of YugabyteDB
 
-You can perform rolling upgrades on the YugabyteDB cluster with the following command. Change the `Image.tag` value to any valid tag from [YugabyteDB's listing on the Docker Hub registry](https://hub.docker.com/r/yugabytedb/yugabyte/tags/). By default, the installation uses the `latest` Docker image. In the following example, the Docker image specified is `2.1.6.0-b17`:
+You can upgrade the software on the YugabyteDB cluster with the following command. By default, this performs a [rolling update](https://github.com/yugabyte/charts/blob/853d7ac744cf6d637b5877f4681940825beda8f6/stable/yugabyte/values.yaml#L60) of the pods.
 
 ```sh
-helm upgrade yb-demo yugabytedb/yugabyte --set Image.tag=2.1.6.0-b17 --wait -n yb-demo
+helm repo update
+helm upgrade yb-demo yugabytedb/yugabyte --version {{<yb-version version="stable" format="short">}} --wait -n yb-demo
+```
+
+Then finalize the upgrade as follows:
+
+```sh
+kubectl exec -it yb-master-0 -- /home/yugabyte/bin/yb-admin --master_addresses yb-master-0.yb-masters.default.svc.cluster.local:7100 finalize_upgrade
+```
+
+Note that `finalize_upgrade` is a cluster-level operation; you don't need to run it on every node.
+
+## Update the configuration of YugabyteDB pods
+
+You can update most settings in the helm chart by running a `helm upgrade` with the new values. By default, this performs a [rolling update](https://github.com/yugabyte/charts/blob/853d7ac744cf6d637b5877f4681940825beda8f6/stable/yugabyte/values.yaml#L60) of the pods.
+
+```sh
+helm upgrade yb-demo yugabytedb/yugabyte --set resource.tserver.requests.cpu=4 --wait -n yb-demo
 ```
 
 ## Delete cluster

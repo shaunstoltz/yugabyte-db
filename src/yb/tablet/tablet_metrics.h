@@ -15,9 +15,9 @@
 // specific language governing permissions and limitations
 // under the License.
 //
-// The following only applies to changes made to this file as part of YugaByte development.
+// The following only applies to changes made to this file as part of YugabyteDB development.
 //
-// Portions Copyright (c) YugaByte, Inc.
+// Portions Copyright (c) YugabyteDB, Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License"); you may not use this file except
 // in compliance with the License.  You may obtain a copy of the License at
@@ -31,55 +31,193 @@
 //
 #pragma once
 
-#include "yb/gutil/macros.h"
+#include "yb/common/pgsql_protocol.fwd.h"
+
 #include "yb/gutil/ref_counted.h"
 
+#include "yb/util/aggregate_stats.h"
+#include "yb/util/enums.h"
 #include "yb/util/monotime.h"
 
 namespace yb {
 
-class Counter;
 template<class T>
 class AtomicGauge;
-class Histogram;
+class Counter;
+class EventStats;
 class MetricEntity;
+class PgsqlResponsePB;
+
+enum PgsqlMetricsCaptureType : int;
 
 namespace tablet {
 
+YB_DEFINE_ENUM(TabletEventStats,
+  (kCommitWaitDuration)
+  (kSnapshotReadInflightWaitDuration)
+  (kQlReadLatency)
+  (kWriteLockLatency)
+  (kQlWriteLatency)
+  (kWriteOpDurationCommitWaitConsistency)
+  (kReadTimeWait)
+  (kTotalWaitQueueTime)
+  (kIntentDbWriteThreadJoinDuration)
+  (kIntentDbRemoveThreadJoinDuration))
+
+// Make sure to add new counters to the list in src/yb/yql/pggate/pg_metrics_list.h as well.
+YB_DEFINE_ENUM(TabletCounters,
+  (kNotLeaderRejections)
+  (kLeaderMemoryPressureRejections)
+  (kMajoritySstFilesRejections)
+  (kTransactionConflicts)
+  (kExpiredTransactions)
+  (kRestartReadRequests)
+  (kConsistentPrefixReadRequests)
+  (kPickReadTimeOnDocDB)
+  (kPgsqlConsistentPrefixReadRows)
+  (kTabletDataCorruptions)
+  (kRowsInserted)
+  (kFailedBatchLock)
+  (kDocDBKeysFound)
+  (kDocDBObsoleteKeysFound)
+  (kDocDBObsoleteKeysFoundPastCutoff))
+
+YB_DEFINE_ENUM(TabletGauges, (kActiveWriteQueryObjects))
+
 // Container for all metrics specific to a single tablet.
-struct TabletMetrics {
-  TabletMetrics(const scoped_refptr<MetricEntity>& table_metric_entity,
-                const scoped_refptr<MetricEntity>& tablet_metric_entity);
-
-  // Probe stats
-  scoped_refptr<Histogram> commit_wait_duration;
-  scoped_refptr<Histogram> snapshot_read_inflight_wait_duration;
-  scoped_refptr<Histogram> ql_read_latency;
-  scoped_refptr<Histogram> write_lock_latency;
-  scoped_refptr<Histogram> ql_write_latency;
-  scoped_refptr<Histogram> write_op_duration_commit_wait_consistency;
-
-  scoped_refptr<Counter> not_leader_rejections;
-  scoped_refptr<Counter> leader_memory_pressure_rejections;
-  scoped_refptr<Counter> majority_sst_files_rejections;
-  scoped_refptr<Counter> transaction_conflicts;
-  scoped_refptr<Counter> expired_transactions;
-  scoped_refptr<Counter> restart_read_requests;
-  scoped_refptr<Counter> consistent_prefix_read_requests;
-  scoped_refptr<Counter> pgsql_consistent_prefix_read_rows;
-  scoped_refptr<Counter> tablet_data_corruptions;
-
-  scoped_refptr<Counter> rows_inserted;
-};
-
-class ScopedTabletMetricsTracker {
+class TabletMetrics {
  public:
-  explicit ScopedTabletMetricsTracker(scoped_refptr<Histogram> latency);
-  ~ScopedTabletMetricsTracker();
+  TabletMetrics();
+  virtual ~TabletMetrics() {}
+
+  uint64_t InstanceId() const { return instance_id_; }
+
+  virtual uint64_t Get(TabletCounters counter) const = 0;
+
+  virtual int64_t Get(TabletGauges gauge) const = 0;
+
+  void Increment(TabletCounters counter) {
+    IncrementBy(counter, 1);
+  }
+
+  virtual void IncrementBy(TabletCounters counter, uint64_t amount) = 0;
+
+  void Increment(TabletGauges gauge) {
+    IncrementBy(gauge, 1);
+  }
+
+  void Decrement(TabletGauges gauge) {
+    IncrementBy(gauge, -1);
+  }
+
+  virtual void IncrementBy(TabletGauges gauge, int64_t amount) = 0;
+
+  void Increment(TabletEventStats event_stats, uint64_t value) {
+    IncrementBy(event_stats, value, 1);
+  }
+
+  virtual void IncrementBy(TabletEventStats event_stats, uint64_t value, uint64_t amount) = 0;
+
+  virtual void AddAggregateStats(TabletEventStats event_stats, const AggregateStats& other) = 0;
 
  private:
-  scoped_refptr<Histogram> latency_;
+  // Keeps track of the number of instances created for verification that the metrics belong
+  // to the same tablet instance.
+  const uint64_t instance_id_;
+};
+
+std::unique_ptr<TabletMetrics> CreateTabletMetrics(
+    const scoped_refptr<MetricEntity>& table_metric_entity,
+    const scoped_refptr<MetricEntity>& tablet_metric_entity);
+
+class ScopedTabletMetrics final : public TabletMetrics {
+ public:
+  ScopedTabletMetrics();
+  ~ScopedTabletMetrics();
+
+  uint64_t Get(TabletCounters counter) const override;
+
+  int64_t Get(TabletGauges gauge) const override;
+
+  void IncrementBy(TabletCounters counter, uint64_t amount) override;
+
+  void IncrementBy(TabletGauges gauge, int64_t amount) override;
+
+  void IncrementBy(TabletEventStats event_stats, uint64_t value, uint64_t amount) override;
+
+  void AddAggregateStats(TabletEventStats event_stats, const AggregateStats& other) override;
+
+  void CopyToPgsqlResponse(
+      PgsqlResponsePB* response, PgsqlMetricsCaptureType metrics_capture) const;
+  void CopyToPgsqlResponse(
+      LWPgsqlResponsePB* response, PgsqlMetricsCaptureType metrics_capture) const;
+
+  // Returns number of metric changes dumped.
+  size_t Dump(std::stringstream* out) const;
+
+  void MergeAndClear(TabletMetrics* target);
+
+ private:
+  template <class PB>
+  void DoCopyToPgsqlResponse(PB* response, PgsqlMetricsCaptureType metrics_capture) const;
+
+  std::vector<uint64_t> counters_;
+  std::vector<int64_t> gauges_;
+  std::vector<AggregateStats> stats_;
+};
+
+class ScopedTabletMetricsLatencyTracker {
+ public:
+  ScopedTabletMetricsLatencyTracker(TabletMetrics* tablet_metrics, TabletEventStats event_stats);
+  ~ScopedTabletMetricsLatencyTracker();
+
+ private:
+  TabletMetrics* metrics_;
+  TabletEventStats event_stats_;
   MonoTime start_time_;
+};
+
+class TabletMetricsHolder {
+ public:
+  TabletMetricsHolder(
+      bool batch_tablet_metrics_update, TabletMetrics* global_metrics,
+      TabletMetrics* scoped_metrics)
+      : global_metrics_(global_metrics),
+        metrics_(batch_tablet_metrics_update && scoped_metrics
+            ? scoped_metrics : global_metrics_) {}
+
+  void Reset() {
+    std::lock_guard lock(mutex_);
+    metrics_ = global_metrics_;
+  }
+
+  void Increment(TabletEventStats event_stats, uint64_t value) {
+    std::lock_guard lock(mutex_);
+    DCHECK(metrics_ != nullptr);
+    metrics_->Increment(event_stats, value);
+  }
+
+  void Increment(TabletCounters counter) {
+    std::lock_guard lock(mutex_);
+    DCHECK(metrics_ != nullptr);
+    metrics_->Increment(counter);
+  }
+
+  void Increment(TabletGauges gauge) {
+    std::lock_guard lock(mutex_);
+    DCHECK(metrics_ != nullptr);
+    metrics_->Increment(gauge);
+  }
+
+  operator bool() const {
+    std::lock_guard lock(mutex_);
+    return metrics_ != nullptr;
+  }
+
+ private:
+  TabletMetrics* global_metrics_ = nullptr;
+  TabletMetrics* metrics_ = nullptr;
+  mutable std::mutex mutex_;
 };
 
 } // namespace tablet

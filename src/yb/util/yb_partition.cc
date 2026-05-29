@@ -1,4 +1,4 @@
-// Copyright (c) YugaByte, Inc.
+// Copyright (c) YugabyteDB, Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License"); you may not use this file except
 // in compliance with the License.  You may obtain a copy of the License at
@@ -39,7 +39,7 @@ void YBPartition::AppendBytesToKey(const char *bytes, size_t len, std::string *e
   encoded_key->append(bytes, len);
 }
 
-uint16_t YBPartition::HashColumnCompoundValue(const std::string &compound) {
+uint16_t YBPartition::HashColumnCompoundValue(std::string_view compound) {
   // In the future, if you wish to change the hashing behavior, you must introduce a new hashing
   // method for your newly-created tables.  Existing tables must continue to use their hashing
   // methods that was define by their PartitionSchema.

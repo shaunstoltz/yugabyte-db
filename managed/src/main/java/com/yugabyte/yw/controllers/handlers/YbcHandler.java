@@ -1,4 +1,4 @@
-// Copyright (c) YugaByte, Inc.
+// Copyright (c) YugabyteDB, Inc.
 
 package com.yugabyte.yw.controllers.handlers;
 
@@ -7,11 +7,16 @@ import static play.mvc.Http.Status.BAD_REQUEST;
 import com.google.inject.Inject;
 import com.google.inject.Singleton;
 import com.yugabyte.yw.commissioner.Commissioner;
+import com.yugabyte.yw.commissioner.Common;
 import com.yugabyte.yw.common.PlatformServiceException;
 import com.yugabyte.yw.common.Util;
-import com.yugabyte.yw.common.YbcManager;
+import com.yugabyte.yw.common.backuprestore.ybc.YbcManager;
+import com.yugabyte.yw.common.config.GlobalConfKeys;
+import com.yugabyte.yw.common.config.RuntimeConfGetter;
 import com.yugabyte.yw.forms.UniverseDefinitionTaskParams;
 import com.yugabyte.yw.forms.UniverseTaskParams;
+import com.yugabyte.yw.forms.YbcGflagsTaskParams;
+import com.yugabyte.yw.forms.YbcThrottleTaskParams;
 import com.yugabyte.yw.models.Customer;
 import com.yugabyte.yw.models.CustomerTask;
 import com.yugabyte.yw.models.Universe;
@@ -31,12 +36,14 @@ public class YbcHandler {
 
   @Inject private YbcManager ybcManager;
 
+  @Inject private RuntimeConfGetter confGetter;
+
   public UUID disable(UUID customerUUID, UUID universeUUID) {
     Customer customer = Customer.getOrBadRequest(customerUUID);
-    Universe universe = Universe.getOrBadRequest(universeUUID);
+    Universe universe = Universe.getOrBadRequest(universeUUID, customer);
 
     UniverseDefinitionTaskParams universeDetails = universe.getUniverseDetails();
-    if (!universeDetails.enableYbc || !universeDetails.ybcInstalled) {
+    if (!universeDetails.isEnableYbc() || !universeDetails.isYbcInstalled()) {
       throw new PlatformServiceException(
           BAD_REQUEST, "Ybc is either not installed or enabled on universe: " + universeUUID);
     }
@@ -45,14 +52,14 @@ public class YbcHandler {
       throw new PlatformServiceException(
           BAD_REQUEST,
           "Cannot disable ybc on universe "
-              + universe.universeUUID
+              + universe.getUniverseUUID()
               + " as it has nodes in one of "
               + NodeDetails.IN_TRANSIT_STATES
               + " states.");
     }
 
     UniverseTaskParams taskParams = new UniverseTaskParams();
-    taskParams.universeUUID = universeUUID;
+    taskParams.setUniverseUUID(universeUUID);
     UUID taskUUID = commissioner.submit(TaskType.DisableYbc, taskParams);
     LOG.info(
         "Saved task uuid {} in customer tasks for Disabling Ybc {} for universe {}.",
@@ -64,16 +71,16 @@ public class YbcHandler {
         taskUUID,
         CustomerTask.TargetType.Universe,
         CustomerTask.TaskType.DisableYbc,
-        universe.name);
+        universe.getName());
     return taskUUID;
   }
 
   public UUID upgrade(UUID customerUUID, UUID universeUUID, String ybcVersion) {
     Customer customer = Customer.getOrBadRequest(customerUUID);
-    Universe universe = Universe.getOrBadRequest(universeUUID);
+    Universe universe = Universe.getOrBadRequest(universeUUID, customer);
     UniverseDefinitionTaskParams universeDetails = universe.getUniverseDetails();
 
-    if (!universeDetails.ybcInstalled || !universeDetails.enableYbc) {
+    if (!universeDetails.isYbcInstalled() || !universeDetails.isEnableYbc()) {
       throw new PlatformServiceException(
           BAD_REQUEST, "Ybc is either not installed or enabled on universe: " + universeUUID);
     }
@@ -82,7 +89,7 @@ public class YbcHandler {
       throw new PlatformServiceException(
           BAD_REQUEST,
           "Cannot perform a ybc upgrade on universe "
-              + universe.universeUUID
+              + universe.getUniverseUUID()
               + " as it has nodes in one of "
               + NodeDetails.IN_TRANSIT_STATES
               + " states.");
@@ -93,15 +100,15 @@ public class YbcHandler {
       targetYbcVersion = ybcVersion;
     }
 
-    if (universeDetails.ybcSoftwareVersion.equals(targetYbcVersion)) {
+    if (universeDetails.getYbcSoftwareVersion().equals(targetYbcVersion)) {
       throw new PlatformServiceException(
           BAD_REQUEST,
           "Ybc version " + targetYbcVersion + " is already present on universe " + universeUUID);
     }
 
     UniverseDefinitionTaskParams taskParams = universe.getUniverseDetails();
-    taskParams.universeUUID = universeUUID;
-    taskParams.ybcSoftwareVersion = targetYbcVersion;
+    taskParams.setUniverseUUID(universeUUID);
+    taskParams.setYbcSoftwareVersion(targetYbcVersion);
     UUID taskUUID = commissioner.submit(TaskType.UpgradeUniverseYbc, taskParams);
     LOG.info(
         "Saved task uuid {} in customer tasks for upgrading Ybc {} for universe {}.",
@@ -113,19 +120,19 @@ public class YbcHandler {
         taskUUID,
         CustomerTask.TargetType.Universe,
         CustomerTask.TaskType.UpgradeUniverseYbc,
-        universe.name);
+        universe.getName());
     return taskUUID;
   }
 
   public UUID install(UUID customerUUID, UUID universeUUID, String ybcVersion) {
     Customer customer = Customer.getOrBadRequest(customerUUID);
-    Universe universe = Universe.getOrBadRequest(universeUUID);
+    Universe universe = Universe.getOrBadRequest(universeUUID, customer);
 
     if (universe.nodesInTransit()) {
       throw new PlatformServiceException(
           BAD_REQUEST,
           "Cannot perform a ybc installation on universe "
-              + universe.universeUUID
+              + universe.getUniverseUUID()
               + " as it has nodes in one of "
               + NodeDetails.IN_TRANSIT_STATES
               + " states.");
@@ -138,17 +145,18 @@ public class YbcHandler {
 
     if (Util.compareYbVersions(
             universe.getUniverseDetails().getPrimaryCluster().userIntent.ybSoftwareVersion,
-            Util.YBC_COMPATIBLE_DB_VERSION,
+            confGetter.getGlobalConf(GlobalConfKeys.ybcCompatibleDbVersion),
             true)
         < 0) {
       throw new PlatformServiceException(
           BAD_REQUEST,
-          "Cannot install universe with DB version lower than " + Util.YBC_COMPATIBLE_DB_VERSION);
+          "Cannot install universe with DB version lower than "
+              + confGetter.getGlobalConf(GlobalConfKeys.ybcCompatibleDbVersion));
     }
 
     UniverseDefinitionTaskParams taskParams = universe.getUniverseDetails();
-    taskParams.universeUUID = universeUUID;
-    taskParams.ybcSoftwareVersion = targetYbcVersion;
+    taskParams.setUniverseUUID(universeUUID);
+    taskParams.setYbcSoftwareVersion(targetYbcVersion);
     UUID taskUUID = commissioner.submit(TaskType.InstallYbcSoftware, taskParams);
     LOG.info(
         "Saved task uuid {} in customer tasks for installing Ybc {} for universe {}.",
@@ -160,7 +168,64 @@ public class YbcHandler {
         taskUUID,
         CustomerTask.TargetType.Universe,
         CustomerTask.TaskType.InstallYbcSoftware,
-        universe.name);
+        universe.getName());
+    return taskUUID;
+  }
+
+  public UUID upgradeYbcGflags(
+      UUID customerUUID, UUID universeUUID, YbcGflagsTaskParams taskParams) {
+    Customer customer = Customer.getOrBadRequest(customerUUID);
+    Universe universe = Universe.getOrBadRequest(universeUUID, customer);
+    taskParams.setUniverseUUID(universeUUID);
+    taskParams.customerUUID = customerUUID;
+    taskParams.verifyParams(universe, true /* isFirstTry */);
+    boolean isK8s =
+        universe
+            .getUniverseDetails()
+            .getPrimaryCluster()
+            .userIntent
+            .providerType
+            .equals(Common.CloudType.kubernetes);
+    UUID taskUUID =
+        commissioner.submit(
+            isK8s ? TaskType.UpgradeKubernetesYbcGFlags : TaskType.UpgradeYbcGFlags, taskParams);
+    CustomerTask.create(
+        customer,
+        universeUUID,
+        taskUUID,
+        CustomerTask.TargetType.Universe,
+        isK8s
+            ? CustomerTask.TaskType.UpgradeKubernetesYbcGFlags
+            : CustomerTask.TaskType.UpgradeYbcGFlags,
+        universe.getName());
+    return taskUUID;
+  }
+
+  public UUID createSetThrottleParamsTask(
+      UUID customerUUID, UUID universeUUID, YbcThrottleTaskParams taskParams) {
+    Customer customer = Customer.getOrBadRequest(customerUUID);
+    Universe universe = Universe.getOrBadRequest(universeUUID, customer);
+    taskParams.verifyParams(universe, true /* isFirstTry */);
+    boolean isK8s =
+        universe
+            .getUniverseDetails()
+            .getPrimaryCluster()
+            .userIntent
+            .providerType
+            .equals(Common.CloudType.kubernetes);
+    UUID taskUUID =
+        commissioner.submit(
+            isK8s ? TaskType.UpdateK8sYbcThrottleFlags : TaskType.UpdateYbcThrottleFlags,
+            taskParams);
+    CustomerTask.create(
+        customer,
+        universeUUID,
+        taskUUID,
+        CustomerTask.TargetType.Universe,
+        isK8s
+            ? CustomerTask.TaskType.UpdateK8sYbcThrottleFlags
+            : CustomerTask.TaskType.UpdateYbcThrottleFlags,
+        universe.getName());
     return taskUUID;
   }
 }

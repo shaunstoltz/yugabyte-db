@@ -1,6 +1,6 @@
 #@IgnoreInspection BashAddShebang
 #
-# Copyright 2019 YugaByte, Inc. and Contributors
+# Copyright 2019 YugabyteDB, Inc. and Contributors
 #
 # Licensed under the Polyform Free Trial License 1.0.0 (the "License"); you
 # may not use this file except in compliance with the License. You
@@ -50,9 +50,6 @@ regex_from_list() {
 set_python_executable() {
   PYTHON_EXECUTABLE=""
   executables=( "${PYTHON3_EXECUTABLES[@]}" )
-  if [[ $YB_MANAGED_DEVOPS_USE_PYTHON3 == "0" ]]; then
-    executables=( "${PYTHON2_EXECUTABLES[@]}" )
-  fi
 
   for py_executable in "${executables[@]}"; do
     if which "$py_executable" > /dev/null 2>&1; then
@@ -63,13 +60,7 @@ set_python_executable() {
   done
 
   if which python > /dev/null 2>&1; then
-    if python -c 'import sys; sys.exit(1) if sys.version_info[0] != 2 else sys.exit(0)';  then
-      if [[ "$YB_MANAGED_DEVOPS_USE_PYTHON3" == "0" ]]; then
-        PYTHON_EXECUTABLE="python"
-        export PYTHON_EXECUTABLE
-        return
-      fi
-    elif [[ "$YB_MANAGED_DEVOPS_USE_PYTHON3" == "1" ]]; then
+    if python -c 'import sys; sys.exit(1) if sys.version_info[0] != 3 else sys.exit(0)';  then
       PYTHON_EXECUTABLE="python"
       export PYTHON_EXECUTABLE
       return
@@ -83,22 +74,19 @@ set_python_executable() {
 # -------------------------------------------------------------------------------------------------
 # Constants
 # -------------------------------------------------------------------------------------------------
-readonly PYTHON2_EXECUTABLES=('python2' 'python2.7')
-readonly PYTHON3_EXECUTABLES=('python3.6' 'python3' 'python3.7' 'python3.8')
-readonly PYTHON3_VERSIONS=('python3.6' 'python3.7' 'python3.8' 'python3.9')
-readonly LINUX_PLATFORMS=('manylinux2014_x86_64-cp-36-cp36m' 'manylinux2014_x86_64-cp-37-cp37m' \
-                         'manylinux2014_x86_64-cp-38-cp38' 'manylinux2014_x86_64-cp-39-cp39')
-readonly MACOS_PLATFORMS=('macosx-10.10-x86_64-cp-36-cp36m' 'macosx-10.10-x86_64-cp-37-cp37m', \
-                         'macosx-10.10-x86_64-cp-38-cp38' 'macosx-10.10-x86_64-cp-39-cp39')
-DOCKER_IMAGE_NAME="yb-anywhere-pex-builder"
+# python3 must be the last executable in the list to ensure that if it is used, it is validated to
+# be the correct version.
+readonly PYTHON3_EXECUTABLES=('python3.10' 'python3.11' 'python3.12' 'python3.13' 'python3')
+readonly PYTHON3_VERSIONS=('python3.10' 'python3.11' 'python3.12' 'python3.13')
+readonly LINUX_PLATFORMS=('manylinux_2_28_x86_64-cp-310-cp310' 'manylinux_2_28_x86_64-cp-311-cp311'
+                          'manylinux_2_28_x86_64-cp-312-cp312'
+                          'manylinux_2_28_x86_64-cp-313-cp313')
+readonly MACOS_PLATFORMS=('macosx-10.10-x86_64-cp-310-cp310' 'macosx-10.10-x86_64-cp-311-cp311'
+                          'macosx-10.10-x86_64-cp-312-cp312'
+                          'macosx-10.10-x86_64-cp-313-cp313')
+DOCKER_PEX_IMAGE_NAME="yba-devops-pex-builder"
+DOCKER_VENV_IMAGE_NAME="yba-devops-venv-builder"
 PYTHON_EXECUTABLE=""
-
-readonly YB_MANAGED_DEVOPS_USE_PYTHON3=${YB_MANAGED_DEVOPS_USE_PYTHON3:-1}
-if [[ $YB_MANAGED_DEVOPS_USE_PYTHON3 != "0" &&
-      $YB_MANAGED_DEVOPS_USE_PYTHON3 != "1" ]]; then
-  fatal "Invalid value of YB_MANAGED_DEVOPS_USE_PYTHON3: $YB_MANAGED_DEVOPS_USE_PYTHON3," \
-        "expected 0 or 1"
-fi
 
 set_python_executable
 
@@ -106,15 +94,12 @@ readonly yb_script_name=${0##*/}
 readonly yb_script_name_no_extension=${yb_script_name%.sh}
 
 readonly yb_devops_home=$( cd "${BASH_SOURCE%/*}"/.. && pwd )
-if [[ ! -d $yb_devops_home/roles ]]; then
-  fatal "No 'roles' subdirectory found inside yb_devops_home ('$yb_devops_home')"
-fi
 
 if [ -L /opt/yugabyte/devops ]; then
  export yb_devops_home_link="/opt/yugabyte/devops"
 fi
 
-# We need to export yb_devops_home because we rely on it in ansible.cfg.
+# We need to export yb_devops_home.
 export yb_devops_home
 
 # We need this in addition to yb_devops_home, because we sometimes just install a subset of scripts
@@ -135,21 +120,13 @@ readonly MANAGED_PATH_ORIGINAL="${PATH:-}"
 set -u
 
 # Basename (i.e. name excluding the directory path) of our virtualenv.
-if [[ $YB_MANAGED_DEVOPS_USE_PYTHON3 == "1" ]]; then
-  readonly YB_VIRTUALENV_BASENAME=venv
-  readonly REQUIREMENTS_FILE_NAME="$yb_devops_home/python3_requirements.txt"
-  readonly FROZEN_REQUIREMENTS_FILE="$yb_devops_home/python3_requirements_frozen.txt"
-  readonly YB_PYTHON_MODULES_DIR="$yb_devops_home/python3_modules"
-  readonly YB_PYTHON_MODULES_PACKAGE="$yb_devops_home/python3_modules.tar.gz"
-  readonly YB_INSTALLED_MODULES_DIR="$yb_devops_home/python3_installed_modules"
-else
-  readonly YB_VIRTUALENV_BASENAME=python_virtual_env
-  readonly REQUIREMENTS_FILE_NAME="$yb_devops_home/python_requirements.txt"
-  readonly FROZEN_REQUIREMENTS_FILE="$yb_devops_home/python_requirements_frozen.txt"
-  readonly YB_PYTHON_MODULES_DIR="$yb_devops_home/python2_modules"
-  readonly YB_PYTHON_MODULES_PACKAGE="$yb_devops_home/python2_modules.tar.gz"
-  readonly YB_INSTALLED_MODULES_DIR="$yb_devops_home/python2_installed_modules"
-fi
+readonly YB_VIRTUALENV_BASENAME=venv
+readonly YB_PEXVENV_BASENAME=pexvenv
+readonly REQUIREMENTS_FILE_NAME="$yb_devops_home/python3_requirements.txt"
+readonly FROZEN_REQUIREMENTS_FILE="$yb_devops_home/python3_requirements_frozen.txt"
+readonly YB_PYTHON_MODULES_DIR="$yb_devops_home/python3_modules"
+readonly YB_PYTHON_MODULES_PACKAGE="$yb_devops_home/python3_modules.tar.gz"
+readonly YB_INSTALLED_MODULES_DIR="$yb_devops_home/python3_installed_modules"
 
 readonly YBOPS_TOP_LEVEL_DIR_BASENAME=opscli
 readonly YBOPS_PACKAGE_NAME=ybops
@@ -309,19 +286,11 @@ activate_virtualenv() {
   if [[ ! -d $virtualenv_dir ]]; then
     # We need to be using system python to install the virtualenv module or create a new virtualenv.
     deactivate_virtualenv
-    if [[ $YB_MANAGED_DEVOPS_USE_PYTHON3 == "0" ]]; then
-      pip_install "virtualenv<20"
-    fi
 
     (
       set -x
       cd "${virtualenv_dir%/*}"
-      if [[ $YB_MANAGED_DEVOPS_USE_PYTHON3 == "1" ]]; then
-        $PYTHON_EXECUTABLE -m venv "$YB_VIRTUALENV_BASENAME"
-      else
-        # Assuming that the default python binary is pointing to Python 2.7.
-        $PYTHON_EXECUTABLE -m virtualenv --no-setuptools "$YB_VIRTUALENV_BASENAME"
-      fi
+      $PYTHON_EXECUTABLE -m venv "$YB_VIRTUALENV_BASENAME"
     )
   elif [[ ${is_linux} == "true" ]]; then
     deactivate_virtualenv
@@ -345,11 +314,10 @@ activate_virtualenv() {
 create_pymodules_package() {
   rm -rf "$YB_PYTHON_MODULES_DIR"
   mkdir -p "$YB_PYTHON_MODULES_DIR"
+  chmod 777 "$YB_PYTHON_MODULES_DIR"
   extra_install_flags=""
-  if [[ $YB_MANAGED_DEVOPS_USE_PYTHON3 == "0" ]]; then
-    extra_install_flags="setuptools<45"
-  fi
-  # Download the scripts necessary (i.e. ansible). Remove the modules afterwards to avoid
+  run_pip install --upgrade pip > /dev/null
+  # Download the scripts necessary. Remove the modules afterwards to avoid
   # system-specific libraries.
   log "Downloading package scripts"
   run_pip install $extra_install_flags -r "$FROZEN_REQUIREMENTS_FILE" \
@@ -445,11 +413,7 @@ verbose_mkdir_p() {
 }
 
 run_pip() {
-  if [[ $YB_MANAGED_DEVOPS_USE_PYTHON3 == "1" ]]; then
-    "$PYTHON_EXECUTABLE" -m pip "$@"
-  else
-    $PYTHON_EXECUTABLE "$(which pip2.7)" "$@"
-  fi
+  "$PYTHON_EXECUTABLE" -m pip "$@"
 }
 
 pip_install() {
@@ -492,7 +456,6 @@ install_pip() {
     log "Installing python-pip (will need sudo privileges for that)..."
     if [[ ${is_debian} == "true" ]]; then
       # Need pip to install Python dependencies.
-      # http://docs.ansible.com/ansible/guide_gce.html
       sudo apt-get install python-pip
     elif [[ ${is_centos} == "true" ]]; then
       # TODO: can the two commands below be done as one command? Or does the
@@ -594,6 +557,12 @@ detect_os() {
   fi
 }
 
+cleanup_pexlock() {
+  if [ -f "$pex_lock" ]; then
+    rm -f $pex_lock
+  fi
+}
+
 # Function that is needed to activate the PEX environment. Note that using the PEX requires that
 # the PEX exists at the provided PEX_PATH location (which should happen automatically as part of
 # the Devops release generation process). Exports PEX_EXTRA_SYS_PATH when the PEX is used during the
@@ -605,13 +574,63 @@ activate_pex() {
   export PEX_EXTRA_SYS_PATH
   # Used by other devops scripts
   PEX_PATH="$yb_devops_home/pex/pexEnv"
+  export PEX_ROOT="$pex_venv_dir"
   SCRIPT_PATH="$yb_devops_home/opscli/ybops/scripts/ybcloud.py"
   export SCRIPT_PATH
-  mitogen_path=$($PYTHON_EXECUTABLE $PEX_PATH -c \
-                "import sys; print([x for x in sys.path if x.find('mitogen-') >= 0][0])")
-  SITE_PACKAGES="$yb_devops_home/pex/$mitogen_path"
-  export SITE_PACKAGES
-  export ANSIBLE_CONFIG="$yb_devops_home/ansible.cfg"
+  PY_VERSION_MARKER="$pex_venv_dir/.python_version"
+  trap "set +e cleanup_pexlock" EXIT INT TERM
+  # Create and activate virtualenv
+  (
+    flock 9 || log "Waiting for pex lock";
+    VENV_PY="$pex_venv_dir/bin/python"
+    # We need to regenerate the pex venv (By deleting it here) if:
+    # 1. there is no python version marker file
+    # 2. the python symlink is either broken or doesn't match the version in the marker file
+    if [[ ! -f $PY_VERSION_MARKER
+        || (-L $VENV_PY && (! -e $VENV_PY || $($VENV_PY --version) != $(cat $PY_VERSION_MARKER))) ]]; then
+      log "detected python version mismatch between pex venv and ${PYTHON_EXECUTABLE}."
+      log "Deleting pex venv to regenerate"
+      rm -rf "$pex_venv_dir"
+    fi
+    if [[ ! -e $pex_marker && -d $PEX_PATH ]]; then
+      log "Creating pex venv for first time"
+      rm -rf "$pex_venv_dir" 2> /dev/null || log "Error cleaning up $pex_venv_dir"
+      deactivate_virtualenv
+      export PEX_VERBOSE=3
+      # --collisions-ok is used to avoid overlapping .layout.json files in the pex venv.
+      PEX_TOOLS=1 $PYTHON_EXECUTABLE $PEX_PATH venv --collisions-ok $pex_venv_dir
+      unset PEX_VERBOSE
+      echo $($PYTHON_EXECUTABLE --version) > $PY_VERSION_MARKER
+    fi
+    if [[ ! -x "$VENV_PY" ]]; then
+      log "PEX virtual environment executable not found at $VENV_PY. Skipping pex activation."
+      return 0
+    fi
+    $VENV_PY -c "import ybops"
+    if [[ $? -eq 0 ]]; then
+      if [[ ! -f "$pex_marker" ]]; then
+        touch $pex_marker 2> /dev/null || log "Failed to create $pex_marker. Continuing..."
+      fi
+    else
+      log "Error importing ybops in pex environment, pexvenv may need to be regenerated"
+      rm -rf "$pex_venv_dir"
+      exit 1
+    fi
+  ) 9>>"$pex_lock"
+  set +e
+  cleanup_pexlock
+  set -e
+  if [[ ! -f "$pex_venv_dir/bin/activate" ]]; then
+    log "File '$pex_venv_dir/bin/activate' does not exist."
+    exit 0
+  fi
+  set +u
+  . "$pex_venv_dir"/bin/activate
+  set -u
+  PYTHON_EXECUTABLE="python"
+  log "Using pex virtualenv python executable now."
+  unset PYTHONPATH
+
 }
 
 # -------------------------------------------------------------------------------------------------
@@ -620,17 +639,12 @@ activate_pex() {
 
 detect_os
 
-#
-# We should not load up ansible.env in all our shells scripts anymore! This should be automatically
-# sourced in our env, or manually sourced in individial scripts that need credentials to be setup.
-# Otherwise, for production scripts, run from YW, they should get all the relevant vars from YW
-# directly!
-#
-
-export ANSIBLE_HOST_KEY_CHECKING=False
 export LANG=en_US.UTF-8
 export LC_ALL=en_US.UTF-8
 
 log_dir=$HOME/logs
 
 readonly virtualenv_dir=$yb_devops_home/$YB_VIRTUALENV_BASENAME
+readonly pex_venv_dir=$yb_devops_home/$YB_PEXVENV_BASENAME
+readonly pex_marker="$pex_venv_dir/pex_valid"
+readonly pex_lock="/tmp/pexlock"

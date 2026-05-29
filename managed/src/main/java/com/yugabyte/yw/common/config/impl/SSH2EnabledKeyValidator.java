@@ -1,5 +1,5 @@
 /*
- * Copyright 2021 YugaByte, Inc. and Contributors
+ * Copyright 2021 YugabyteDB, Inc. and Contributors
  *
  * Licensed under the Polyform Free Trial License 1.0.0 (the "License"); you
  * may not use this file except in compliance with the License. You
@@ -9,15 +9,14 @@
  */
 package com.yugabyte.yw.common.config.impl;
 
-import com.yugabyte.yw.common.config.RuntimeConfigPreChangeValidator;
-import com.yugabyte.yw.common.PlatformServiceException;
-import com.yugabyte.yw.forms.PlatformResults.YBPSuccess;
-import com.yugabyte.yw.models.RuntimeConfigEntry;
+import static play.mvc.Http.Status.BAD_REQUEST;
 
+import com.yugabyte.yw.common.PlatformServiceException;
+import com.yugabyte.yw.common.config.RuntimeConfigPreChangeValidator;
+import com.yugabyte.yw.models.RuntimeConfigEntry;
 import java.util.Optional;
 import java.util.UUID;
 import javax.inject.Singleton;
-import static play.mvc.Http.Status.BAD_REQUEST;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -42,5 +41,10 @@ public class SSH2EnabledKeyValidator implements RuntimeConfigPreChangeValidator 
       throw new PlatformServiceException(
           BAD_REQUEST, "yb.security.ssh2_enabled cannot be reinitialised");
     }
+  }
+
+  @Override
+  public void validateDeleteConfig(UUID scopeUUID, String path) {
+    throw new PlatformServiceException(BAD_REQUEST, "Cannot delete 'yb.security.ssh2_enabled'.");
   }
 }

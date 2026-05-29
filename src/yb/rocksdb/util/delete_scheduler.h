@@ -3,9 +3,9 @@
 //  LICENSE file in the root directory of this source tree. An additional grant
 //  of patent rights can be found in the PATENTS file in the same directory.
 //
-// The following only applies to changes made to this file as part of YugaByte development.
+// The following only applies to changes made to this file as part of YugabyteDB development.
 //
-// Portions Copyright (c) YugaByte, Inc.
+// Portions Copyright (c) YugabyteDB, Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License"); you may not use this file except
 // in compliance with the License.  You may obtain a copy of the License at
@@ -23,11 +23,15 @@
 #include <map>
 #include <queue>
 #include <string>
-#include <thread>
 
+#include "yb/gutil/ref_counted.h"
 #include "yb/rocksdb/port/port.h"
 
 #include "yb/rocksdb/status.h"
+
+namespace yb {
+class Thread;
+}
 
 namespace rocksdb {
 
@@ -93,7 +97,7 @@ class DeleteScheduler {
   //    - closing_ value is set to true
   port::CondVar cv_;
   // Background thread running BackgroundEmptyTrash
-  std::unique_ptr<std::thread> bg_thread_;
+  scoped_refptr<yb::Thread> bg_thread_;
   // Mutex to protect threads from file name conflicts
   port::Mutex file_move_mu_;
   Logger* info_log_;

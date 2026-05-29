@@ -1,4 +1,4 @@
-// Copyright (c) YugaByte, Inc.
+// Copyright (c) YugabyteDB, Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License"); you may not use this file except
 // in compliance with the License.  You may obtain a copy of the License at
@@ -15,13 +15,13 @@ package org.yb.pgsql;
 import java.util.Map;
 import org.junit.Test;
 import org.junit.runner.RunWith;
-import org.yb.util.YBTestRunnerNonTsanOnly;
+import org.yb.YBTestRunner;
 
 /**
  * Runs the pg_regress test suite on colocation queries to test legacy colocated database behaviors.
  */
-@RunWith(value=YBTestRunnerNonTsanOnly.class)
-public class TestPgRegressLegacyColocation extends BasePgSQLTest {
+@RunWith(value=YBTestRunner.class)
+public class TestPgRegressLegacyColocation extends BasePgRegressTest {
   @Override
   public int getTestMethodTimeoutSec() {
     return 1800;

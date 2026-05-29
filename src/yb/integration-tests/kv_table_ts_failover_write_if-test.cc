@@ -1,4 +1,4 @@
-// Copyright (c) YugaByte, Inc.
+// Copyright (c) YugabyteDB, Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License"); you may not use this file except
 // in compliance with the License.  You may obtain a copy of the License at
@@ -40,11 +40,9 @@ namespace yb {
 
 using client::YBSessionPtr;
 using client::YBSchemaBuilder;
-using client::YBqlReadOp;
 using client::YBqlWriteOp;
 using itest::TServerDetails;
 using std::shared_ptr;
-using std::unique_ptr;
 using std::vector;
 using std::string;
 
@@ -93,7 +91,7 @@ class KVTableTsFailoverWriteIfTest : public integration_tests::YBTableTestBase {
   }
 
   void SetValueAsync(const YBSessionPtr& session, int32_t key, int32_t value) {
-    const auto insert = table_.NewInsertOp();
+    const auto insert = table_.NewInsertOp(session->arena());
     auto* const req = insert->mutable_request();
     QLAddInt32HashValue(req, key);
     table_.AddInt32ColumnValue(req, kValueColumnName, value);
@@ -112,8 +110,9 @@ class KVTableTsFailoverWriteIfTest : public integration_tests::YBTableTestBase {
     });
   }
 
-  shared_ptr<YBqlWriteOp> CreateWriteIfOp(int32_t key, int32_t old_value, int32_t new_value) {
-    const auto op = table_.NewWriteOp(QLWriteRequestPB::QL_STMT_UPDATE);
+  shared_ptr<YBqlWriteOp> CreateWriteIfOp(
+      const ThreadSafeArenaPtr& arena, int32_t key, int32_t old_value, int32_t new_value) {
+    const auto op = table_.NewWriteOp(arena, QLWriteRequestPB::QL_STMT_UPDATE);
     auto* const req = op->mutable_request();
     // Set v = new_value.
     table_.AddInt32ColumnValue(req, kValueColumnName, new_value);
@@ -126,16 +125,16 @@ class KVTableTsFailoverWriteIfTest : public integration_tests::YBTableTestBase {
     return op;
   }
 
-  boost::optional<int32_t> GetValue(const YBSessionPtr& session, int32_t key) {
-    const auto op = client::CreateReadOp(key, table_, kValueColumnName);
+  std::optional<int32_t> GetValue(const YBSessionPtr& session, int32_t key) {
+    const auto op = client::CreateReadOp(session->arena(), key, table_, kValueColumnName);
     Status s = session->TEST_ApplyAndFlush(op);
     if (!s.ok()) {
-      return boost::none;
+      return std::nullopt;
     }
     auto rowblock = ql::RowsResult(op.get()).GetRowBlock();
     EXPECT_EQ(op->response().status(), QLResponsePB::YQL_STATUS_OK);
     if (rowblock->row_count() == 0) {
-      return boost::none;
+      return std::nullopt;
     }
     EXPECT_EQ(1, rowblock->row_count());
     return rowblock->row(0).column(0).int32_value();
@@ -148,8 +147,8 @@ class KVTableTsFailoverWriteIfTest : public integration_tests::YBTableTestBase {
                                                     table.namespace_type()));
 
       YBSchemaBuilder b;
-      b.AddColumn(kKeyColumnName)->Type(INT32)->NotNull()->HashPrimaryKey();
-      b.AddColumn(kValueColumnName)->Type(INT32)->NotNull();
+      b.AddColumn(kKeyColumnName)->Type(DataType::INT32)->NotNull()->HashPrimaryKey();
+      b.AddColumn(kValueColumnName)->Type(DataType::INT32)->NotNull();
       ASSERT_OK(b.Build(&schema_));
 
       ASSERT_OK(NewTableCreator()->table_name(table_name()).schema(&schema_).Create());
@@ -212,7 +211,7 @@ class KVTableTsFailoverWriteIfTest : public integration_tests::YBTableTestBase {
 
 // Test for ENG-3471 - shouldn't run write-if when leader hasn't yet committed all pendings ops.
 TEST_F(KVTableTsFailoverWriteIfTest, KillTabletServerDuringReplication) {
-  FLAGS_TEST_combine_batcher_errors = true;
+  ANNOTATE_UNPROTECTED_WRITE(FLAGS_TEST_combine_batcher_errors) = true;
 
   const int32_t key = 0;
   const int32_t initial_value = 10000;
@@ -220,6 +219,10 @@ TEST_F(KVTableTsFailoverWriteIfTest, KillTabletServerDuringReplication) {
 
   const auto cluster = external_mini_cluster();
   const auto num_ts = cluster->num_tablet_servers();
+
+  // This test pauses TServer process. Because of this stuck call detection mechanism detects
+  // running calls as stuck. So turning off detection in this test.
+  ASSERT_OK(cluster->SetFlagOnTServers("consensus_stuck_peer_call_threshold_ms", "0"));
 
   vector<string> tablet_ids;
   do {
@@ -333,10 +336,11 @@ TEST_F(KVTableTsFailoverWriteIfTest, KillTabletServerDuringReplication) {
   std::atomic<bool> cas_completed(false);
   const auto cas_old_value = initial_value;
   const auto cas_new_value = initial_value + 1;
-  const auto op = CreateWriteIfOp(key, cas_old_value, cas_new_value);
+  auto session = NewSession();
+  const auto op = CreateWriteIfOp(
+      session->arena(), key, cas_old_value, cas_new_value);
   const auto op_str = Format("$0: $1 -> $2", key, cas_old_value, cas_new_value);
   LOG(INFO) << "Sending CAS " << op_str;
-  auto session = NewSession();
   session->SetTimeout(15s);
   client::FlushCallback callback = [&session, &op, &op_str, &cas_completed,
                                     &callback](client::FlushStatus* flush_status) {

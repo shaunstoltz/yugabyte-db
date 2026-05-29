@@ -15,9 +15,9 @@
 // specific language governing permissions and limitations
 // under the License.
 //
-// The following only applies to changes made to this file as part of YugaByte development.
+// The following only applies to changes made to this file as part of YugabyteDB development.
 //
-// Portions Copyright (c) YugaByte, Inc.
+// Portions Copyright (c) YugabyteDB, Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License"); you may not use this file except
 // in compliance with the License.  You may obtain a copy of the License at
@@ -39,10 +39,11 @@
 #include "yb/rpc/serialization.h"
 #include "yb/rpc/service_if.h"
 
+#include "yb/ash/wait_state.h"
+
 #include "yb/util/memory/arena.h"
 #include "yb/util/ref_cnt_buffer.h"
 #include "yb/util/status.h"
-
 #include "yb/util/status_fwd.h"
 #include "yb/util/monotime.h"
 #include "yb/util/net/sockaddr.h"
@@ -66,13 +67,13 @@ class RpcCallParams {
  public:
   virtual ~RpcCallParams() = default;
 
-  virtual Result<size_t> ParseRequest(Slice param, const RefCntBuffer& buffer) = 0;
+  virtual Status ParseRequest(Slice param, const RefCntBuffer& buffer) = 0;
   virtual AnyMessageConstPtr SerializableResponse() = 0;
 };
 
 class RpcCallPBParams : public RpcCallParams {
  public:
-  Result<size_t> ParseRequest(Slice param, const RefCntBuffer& buffer) override;
+  Status ParseRequest(Slice param, const RefCntBuffer& buffer) override;
 
   AnyMessageConstPtr SerializableResponse() override;
 
@@ -107,7 +108,7 @@ class RpcCallPBParamsImpl : public RpcCallPBParams {
 
 class RpcCallLWParams : public RpcCallParams {
  public:
-  Result<size_t> ParseRequest(Slice param, const RefCntBuffer& buffer) override;
+  Status ParseRequest(Slice param, const RefCntBuffer& buffer) override;
   AnyMessageConstPtr SerializableResponse() override;
 
   virtual LightweightMessage& request() = 0;
@@ -185,6 +186,7 @@ class RpcContext {
   explicit RpcContext(std::shared_ptr<LocalYBInboundCall> call);
 
   RpcContext(RpcContext&& rhs) = default;
+  RpcContext& operator=(RpcContext&& rhs) = default;
 
   RpcContext(const RpcContext&) = delete;
   void operator=(const RpcContext&) = delete;
@@ -308,8 +310,13 @@ class RpcContext {
 
   // Closes connection that received this request.
   void CloseConnection();
+  void ListenConnectionShutdown(const std::function<void()>& listener);
 
   std::string ToString() const;
+
+  const ash::WaitStateInfoPtr& wait_state() const;
+
+  Result<RefCntSlice> ExtractSidecar(size_t idx) const;
 
  private:
   std::shared_ptr<YBInboundCall> call_;
@@ -317,12 +324,71 @@ class RpcContext {
   bool responded_ = false;
 };
 
+template <class Req, class Resp, template<class Rq, class Rsp> class Impl = RpcCallPBParamsImpl>
+class TypedPBRpcContextHolder {
+ public:
+  using Params = Impl<Req, Resp>;
+
+  Req& req() {
+    return down_cast<Params&>(context_.params()).request();
+  }
+
+  Resp& resp() {
+    return down_cast<Params&>(context_.params()).response();
+  }
+
+  RpcContext* operator->() {
+    return &context_;
+  }
+
+  RpcContext& operator*() {
+    return context_;
+  }
+
+  RpcContext& context() {
+    return context_;
+  }
+
+ private:
+  explicit TypedPBRpcContextHolder(RpcContext&& context) : context_(std::move(context)) {}
+
+  template <class TReq, class TResp>
+  friend auto MakeTypedPBRpcContextHolder(
+      const TReq& req, TResp* resp, RpcContext&& context);
+
+  RpcContext context_;
+};
+
+template <class TReq, class TResp>
+auto MakeTypedPBRpcContextHolder(
+    const TReq& req, TResp* resp, RpcContext&& context) {
+  if constexpr (IsGoogleProtobuf<TReq>) {
+    auto result = TypedPBRpcContextHolder<TReq, TResp, RpcCallPBParamsImpl>(std::move(context));
+    DCHECK_EQ(&result.req(), &req);
+    DCHECK_EQ(&result.resp(), resp);
+    return result;
+  } else {
+    auto result = TypedPBRpcContextHolder<TReq, TResp, RpcCallLWParamsImpl>(std::move(context));
+    DCHECK_EQ(&result.req(), &req);
+    DCHECK_EQ(&result.resp(), resp);
+    return result;
+  }
+}
+
 void PanicRpc(RpcContext* context, const char* file, int line_number, const std::string& message);
 
 #define PANIC_RPC(rpc_context, message) \
   do { \
     yb::rpc::PanicRpc((rpc_context), __FILE__, __LINE__, (message)); \
   } while (false)
+
+inline std::string RequestorString(yb::rpc::RpcContext* rpc) {
+  if (rpc) {
+    return rpc->requestor_string();
+  } else {
+    return "internal request";
+  }
+}
 
 } // namespace rpc
 } // namespace yb

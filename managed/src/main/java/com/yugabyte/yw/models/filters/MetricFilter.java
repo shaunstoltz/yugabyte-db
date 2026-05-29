@@ -1,5 +1,5 @@
 /*
- * Copyright 2021 YugaByte, Inc. and Contributors
+ * Copyright 2021 YugabyteDB, Inc. and Contributors
  *
  * Licensed under the Polyform Free Trial License 1.0.0 (the "License"); you
  * may not use this file except in compliance with the License. You
@@ -22,7 +22,7 @@ import java.util.stream.Collectors;
 import lombok.Builder;
 import lombok.NonNull;
 import lombok.Value;
-import org.apache.commons.collections.CollectionUtils;
+import org.apache.commons.collections4.CollectionUtils;
 
 @Value
 @Builder
@@ -81,8 +81,7 @@ public class MetricFilter {
 
     public MetricFilterBuilder metricNames(@NonNull Collection<PlatformMetrics> platformMetrics) {
       this.metricNames.addAll(
-          platformMetrics
-              .stream()
+          platformMetrics.stream()
               .map(PlatformMetrics::getMetricName)
               .collect(Collectors.toList()));
       return this;
@@ -155,10 +154,10 @@ public class MetricFilter {
       return false;
     }
     if (expired != null) {
-      if (expired && metric.getExpireTime().after(new Date())) {
+      if (expired && metric.getExpireTime() != null && metric.getExpireTime().after(new Date())) {
         return false;
       }
-      if (!expired && metric.getExpireTime().before(new Date())) {
+      if (!expired && metric.getExpireTime() != null && metric.getExpireTime().before(new Date())) {
         return false;
       }
     }

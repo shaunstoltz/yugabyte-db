@@ -2,9 +2,9 @@
 // Use of this source code is governed by a BSD-style license that can be
 // found in the LICENSE file. See the AUTHORS file for names of contributors.
 //
-// The following only applies to changes made to this file as part of YugaByte development.
+// The following only applies to changes made to this file as part of YugabyteDB development.
 //
-// Portions Copyright (c) YugaByte, Inc.
+// Portions Copyright (c) YugabyteDB, Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License"); you may not use this file except
 // in compliance with the License.  You may obtain a copy of the License at
@@ -31,6 +31,8 @@
 #include <sys/uio.h>
 #include <time.h>
 
+#include <fstream>
+#include <limits>
 #include <set>
 #include <vector>
 
@@ -43,8 +45,6 @@
 #endif  // defined(__APPLE__)
 #include <sys/resource.h>
 
-#include <glog/logging.h>
-
 #include "yb/gutil/atomicops.h"
 #include "yb/gutil/bind.h"
 #include "yb/gutil/callback.h"
@@ -56,6 +56,7 @@
 #include "yb/util/debug/trace_event.h"
 #include "yb/util/env.h"
 #include "yb/util/errno.h"
+#include "yb/util/faststring.h"
 #include "yb/util/file_system_posix.h"
 #include "yb/util/flags.h"
 #include "yb/util/format.h"
@@ -66,11 +67,13 @@
 #include "yb/util/path_util.h"
 #include "yb/util/result.h"
 #include "yb/util/slice.h"
+#include "yb/util/stack_trace_tracker.h"
 #include "yb/util/status.h"
 #include "yb/util/status_format.h"
 #include "yb/util/status_log.h"
 #include "yb/util/stopwatch.h"
 #include "yb/util/thread_restrictions.h"
+#include "yb/util/env_util.h"
 
 // Copied from falloc.h. Useful for older kernels that lack support for
 // hole punching; fallocate(2) will return EOPNOTSUPP.
@@ -112,6 +115,10 @@ DEFINE_UNKNOWN_bool(never_fsync, FLAGS_never_fsync_default,
 TAG_FLAG(never_fsync, advanced);
 TAG_FLAG(never_fsync, unsafe);
 
+DEFINE_NON_RUNTIME_bool(use_cgroups_memory, false,
+             "use cgroup memory max value instead of total memory of the node.");
+TAG_FLAG(use_cgroups_memory, advanced);
+
 DEFINE_UNKNOWN_int32(o_direct_block_size_bytes, 4096,
              "Size of the block to use when flag durable_wal_write is set.");
 TAG_FLAG(o_direct_block_size_bytes, advanced);
@@ -125,6 +132,8 @@ DEFINE_test_flag(bool, simulate_fs_without_fallocate, false,
 
 DEFINE_test_flag(int64, simulate_free_space_bytes, -1,
     "If a non-negative value, GetFreeSpaceBytes will return the specified value.");
+
+DEFINE_test_flag(bool, skip_file_close, false, "If true, file will not be closed.");
 
 using namespace std::placeholders;
 using base::subtle::Atomic64;
@@ -201,23 +210,6 @@ class ScopedFdCloser {
 
 #define STATUS_IO_ERROR(context, err_number) \
     STATUS_FROM_ERRNO_SPECIAL_EIO_HANDLING(context, err_number)
-
-static Status DoSync(int fd, const string& filename) {
-  ThreadRestrictions::AssertIOAllowed();
-  if (FLAGS_never_fsync) {
-    return Status::OK();
-  }
-  if (FLAGS_writable_file_use_fsync) {
-    if (fsync(fd) < 0) {
-      return STATUS_IO_ERROR(filename, errno);
-    }
-  } else {
-    if (fdatasync(fd) < 0) {
-      return STATUS_IO_ERROR(filename, errno);
-    }
-  }
-  return Status::OK();
-}
 
 static Status DoOpen(const string& filename, Env::CreateMode mode, int* fd, int extra_flags = 0) {
   ThreadRestrictions::AssertIOAllowed();
@@ -303,212 +295,6 @@ Result<struct statvfs> GetFilesystemStats(const std::string& path) {
   return stat;
 }
 
-// Use non-memory mapped POSIX files to write data to a file.
-//
-// TODO (perf) investigate zeroing a pre-allocated allocated area in
-// order to further improve Sync() performance.
-class PosixWritableFile : public WritableFile {
- public:
-  PosixWritableFile(const std::string& fname, int fd, uint64_t file_size,
-                    bool sync_on_close)
-      : filename_(fname),
-        fd_(fd),
-        sync_on_close_(sync_on_close),
-        filesize_(file_size),
-        pre_allocated_size_(0),
-        pending_sync_(false) {}
-
-  ~PosixWritableFile() {
-    if (fd_ >= 0) {
-      WARN_NOT_OK(Close(), "Failed to close " + filename_);
-    }
-  }
-
-  Status Append(const Slice& data) override {
-    vector<Slice> data_vector;
-    data_vector.push_back(data);
-    return AppendVector(data_vector);
-  }
-
-  Status AppendSlices(const Slice* slices, size_t num) override {
-    ThreadRestrictions::AssertIOAllowed();
-    static const size_t kIovMaxElements = IOV_MAX;
-
-    Status s;
-    for (size_t i = 0; i < num && s.ok(); i += kIovMaxElements) {
-      size_t n = std::min(num - i, kIovMaxElements);
-      s = DoWritev(slices + i, n);
-    }
-
-    pending_sync_ = true;
-    return s;
-  }
-
-  Status PreAllocate(uint64_t size) override {
-    TRACE_EVENT1("io", "PosixWritableFile::PreAllocate", "path", filename_);
-    ThreadRestrictions::AssertIOAllowed();
-    uint64_t offset = std::max(filesize_, pre_allocated_size_);
-    if (PREDICT_FALSE(FLAGS_TEST_simulate_fs_without_fallocate)) {
-      YB_LOG_FIRST_N(WARNING, 1) << "Simulating a filesystem without fallocate() support";
-      return Status::OK();
-    }
-    if (fallocate(fd_, 0, offset, size) < 0) {
-      if (errno == EOPNOTSUPP) {
-        YB_LOG_FIRST_N(WARNING, 1) << "The filesystem does not support fallocate().";
-      } else if (errno == ENOSYS) {
-        YB_LOG_FIRST_N(WARNING, 1) << "The kernel does not implement fallocate().";
-      } else {
-        return STATUS_IO_ERROR(filename_, errno);
-      }
-      // We don't want to modify pre_allocated_size_ since nothing was pre-allocated.
-      return Status::OK();
-    }
-    pre_allocated_size_ = offset + size;
-    return Status::OK();
-  }
-
-  Status Close() override {
-    TRACE_EVENT1("io", "PosixWritableFile::Close", "path", filename_);
-    ThreadRestrictions::AssertIOAllowed();
-    Status s;
-
-    // If we've allocated more space than we used, truncate to the
-    // actual size of the file and perform Sync().
-    if (filesize_ < pre_allocated_size_) {
-      if (ftruncate(fd_, filesize_) < 0) {
-        s = STATUS_IO_ERROR(filename_, errno);
-        pending_sync_ = true;
-      }
-    }
-
-    if (sync_on_close_) {
-      Status sync_status = Sync();
-      if (!sync_status.ok()) {
-        LOG(ERROR) << "Unable to Sync " << filename_ << ": " << sync_status.ToString();
-        if (s.ok()) {
-          s = sync_status;
-        }
-      }
-    }
-
-    if (close(fd_) < 0) {
-      if (s.ok()) {
-        s = STATUS_IO_ERROR(filename_, errno);
-      }
-    }
-
-    fd_ = -1;
-    return s;
-  }
-
-  Status Flush(FlushMode mode) override {
-    TRACE_EVENT1("io", "PosixWritableFile::Flush", "path", filename_);
-    ThreadRestrictions::AssertIOAllowed();
-    if (FLAGS_never_fsync) {
-      return Status::OK();
-    }
-#if defined(__linux__)
-    int flags = SYNC_FILE_RANGE_WRITE;
-    if (mode == FLUSH_SYNC) {
-      flags |= SYNC_FILE_RANGE_WAIT_AFTER;
-    }
-    if (sync_file_range(fd_, 0, 0, flags) < 0) {
-      return STATUS_IO_ERROR(filename_, errno);
-    }
-#else
-    if (fsync(fd_) < 0) {
-      return STATUS_IO_ERROR(filename_, errno);
-    }
-#endif
-    return Status::OK();
-  }
-
-  Status Sync() override {
-    TRACE_EVENT1("io", "PosixWritableFile::Sync", "path", filename_);
-    ThreadRestrictions::AssertIOAllowed();
-    LOG_SLOW_EXECUTION(WARNING, 1000, Substitute("sync call for $0", filename_)) {
-      if (pending_sync_) {
-        pending_sync_ = false;
-        RETURN_NOT_OK(DoSync(fd_, filename_));
-      }
-    }
-    return Status::OK();
-  }
-
-  uint64_t Size() const override {
-    return filesize_;
-  }
-
-  const string& filename() const override { return filename_; }
-
- protected:
-    void UnwrittenRemaining(struct iovec** remaining_iov, ssize_t written, int* remaining_count) {
-      size_t bytes_to_consume = written;
-      do {
-        if (bytes_to_consume >= (*remaining_iov)->iov_len) {
-          bytes_to_consume -= (*remaining_iov)->iov_len;
-          (*remaining_iov)++;
-          (*remaining_count)--;
-        } else {
-          (*remaining_iov)->iov_len -= bytes_to_consume;
-          (*remaining_iov)->iov_base =
-              static_cast<uint8_t*>((*remaining_iov)->iov_base) + bytes_to_consume;
-          bytes_to_consume = 0;
-        }
-      } while (bytes_to_consume > 0);
-    }
-
-    const std::string filename_;
-    int fd_;
-    bool sync_on_close_;
-    uint64_t filesize_;
-    uint64_t pre_allocated_size_;
-    std::atomic<bool> pending_sync_;
-
- private:
-  Status DoWritev(const Slice* slices, size_t n) {
-    ThreadRestrictions::AssertIOAllowed();
-    DCHECK_LE(n, IOV_MAX);
-
-    struct iovec iov[n];
-    ssize_t nbytes = 0;
-
-    for (size_t i = 0; i < n; ++i) {
-      const Slice& data = slices[i];
-      iov[i].iov_base = const_cast<uint8_t*>(data.data());
-      iov[i].iov_len = data.size();
-      nbytes += data.size();
-    }
-
-    struct iovec* remaining_iov = iov;
-    int remaining_count = narrow_cast<int>(n);
-    ssize_t total_written = 0;
-
-    while (remaining_count > 0) {
-      ssize_t written = writev(fd_, remaining_iov, remaining_count);
-      if (PREDICT_FALSE(written == -1)) {
-        if (errno == EINTR || errno == EAGAIN) {
-          continue;
-        }
-        return STATUS_IO_ERROR(filename_, errno);
-      }
-
-      UnwrittenRemaining(&remaining_iov, written, &remaining_count);
-      total_written += written;
-    }
-
-    filesize_ += total_written;
-
-    if (PREDICT_FALSE(total_written != nbytes)) {
-      return STATUS_FORMAT(
-          IOError, "writev error: expected to write $0 bytes, wrote $1 bytes instead",
-          nbytes, total_written);
-    }
-
-    return Status::OK();
-  }
-};
-
 #if defined(__linux__)
 class PosixDirectIOWritableFile final : public PosixWritableFile {
  public:
@@ -516,19 +302,14 @@ class PosixDirectIOWritableFile final : public PosixWritableFile {
                             bool sync_on_close)
       : PosixWritableFile(fname, fd, file_size, false /* sync_on_close */) {
 
-    if (file_size != 0) {
-      // For now, we don't support appending to an already existing file (of non-zero size).
-      // TODO(hector): If file size is not a multiple of block_size_, read the
-      // last aligned block.
-      LOG(FATAL) << "file size != 0";
-    }
-
-    next_write_offset_ = 0;
+    next_write_offset_ = file_size;
     last_block_used_bytes_ = 0;
     block_size_ = FLAGS_o_direct_block_size_bytes;
     last_block_idx_ = 0;
     has_new_data_ = false;
-    real_size_ = 0;
+    real_size_ = file_size;
+    LOG_IF(FATAL, file_size % block_size_ != 0) << "file_size is not a multiple of "
+      << "block_size_ during PosixDirectIOWritableFile's initialization";
     CHECK_GE(block_size_, 512);
   }
 
@@ -574,16 +355,22 @@ class PosixDirectIOWritableFile final : public PosixWritableFile {
   Status Close() override {
     TRACE_EVENT1("io", "PosixDirectIOWritableFile::Close", "path", filename_);
     ThreadRestrictions::AssertIOAllowed();
+    if (FLAGS_TEST_skip_file_close) {
+      return Status::OK();
+    }
     RETURN_NOT_OK(Sync());
     LOG(INFO) << "Closing file " << filename_ << " with " << block_ptr_vec_.size() << " blocks";
-    off_t fsize;
-    fsize = lseek(fd_, 0, SEEK_END);
-    CHECK_EQ(fsize, std::max(filesize_, pre_allocated_size_));
-
-    if (real_size_ < filesize_ || real_size_ < pre_allocated_size_) {
+    off_t size_on_disk = lseek(fd_, 0, SEEK_END);
+    if (size_on_disk < 0) {
+       return STATUS_IO_ERROR(filename_, errno);
+    }
+    // size_on_disk can be filesize_, pre_allocated_size_, or pre_allocated_size_
+    // from other previous writer.
+    if (real_size_ < implicit_cast<size_t>(size_on_disk)) {
       LOG(INFO) << filename_ << ": Truncating file from size: " << filesize_
                 << " to size: " << real_size_
-                << ". Preallocated size: " << pre_allocated_size_;
+                << ". Preallocated size: " << pre_allocated_size_
+                << ". Size on disk: " << size_on_disk;
       if (ftruncate(fd_, real_size_) != 0) {
         return STATUS_IO_ERROR(filename_, errno);
       }
@@ -687,6 +474,7 @@ class PosixDirectIOWritableFile final : public PosixWritableFile {
         }
         return STATUS_IO_ERROR(filename_, errno);
       }
+      TrackStackTrace(StackTraceTrackingGroup::kWriteIO, written);
       next_write_offset_ += written;
 
       UnwrittenRemaining(&remaining_iov, written, &remaining_blocks);
@@ -781,6 +569,7 @@ class PosixRWFile final : public RWFile {
         // An error: return a non-ok status.
         return STATUS_IO_ERROR(filename_, errno);
       }
+      TrackStackTrace(StackTraceTrackingGroup::kReadIO, r);
       Slice this_result(dst, r);
       DCHECK_LE(this_result.size(), rem);
       if (this_result.size() == 0) {
@@ -804,6 +593,7 @@ class PosixRWFile final : public RWFile {
       int err = errno;
       return STATUS_IO_ERROR(filename_, err);
     }
+    TrackStackTrace(StackTraceTrackingGroup::kWriteIO, written);
 
     if (PREDICT_FALSE(written != implicit_cast<ssize_t>(data.size()))) {
       return STATUS(IOError,
@@ -886,7 +676,7 @@ class PosixRWFile final : public RWFile {
       // Virtual function call in destructor.
       s = Sync();
       if (!s.ok()) {
-        LOG(ERROR) << "Unable to Sync " << filename_ << ": " << s.ToString();
+        LOG(WARNING) << "Unable to Sync " << filename_ << ": " << s;
       }
     }
 
@@ -900,15 +690,9 @@ class PosixRWFile final : public RWFile {
     return s;
   }
 
-  Status Size(uint64_t* size) const override {
+  Result<uint64_t> Size() const override {
     TRACE_EVENT1("io", "PosixRWFile::Size", "path", filename_);
-    ThreadRestrictions::AssertIOAllowed();
-    struct stat st;
-    if (fstat(fd_, &st) == -1) {
-      return STATUS_IO_ERROR(filename_, errno);
-    }
-    *size = st.st_size;
-    return Status::OK();
+    return GetLogicalFileSize(fd_, filename_);
   }
 
   const string& filename() const override {
@@ -932,7 +716,7 @@ static int LockOrUnlock(const std::string& fname,
                         int fd,
                         bool lock,
                         bool recursive_lock_ok) {
-  std::lock_guard<std::mutex> guard(mutex_locked_files);
+  std::lock_guard guard(mutex_locked_files);
   if (lock) {
     // If recursive locks on the same file must be disallowed, but the specified file name already
     // exists in the locked_files set, then it is already locked, so we fail this lock attempt.
@@ -965,12 +749,6 @@ static int LockOrUnlock(const std::string& fname,
   }
   return value;
 }
-
-class PosixFileLock : public FileLock {
- public:
-  int fd_;
-  std::string filename;
-};
 
 class PosixEnv : public Env {
  public:
@@ -1136,7 +914,27 @@ class PosixEnv : public Env {
       if (errno == EXDEV) {
         return STATUS(NotSupported, "No cross FS links allowed");
       }
-      return STATUS_IO_ERROR(src, errno);
+      return STATUS_IO_ERROR(Format("Link $0 => $1", target, src), errno);
+    }
+    return Status::OK();
+  }
+
+  Status SymlinkPath(const std::string& pointed_to, const std::string& new_symlink) override {
+    // Unlink if already linked.
+    RETURN_NOT_OK(DeleteSymlinkIfExists(new_symlink));
+
+    if (symlink(pointed_to.c_str(), new_symlink.c_str()) != 0) {
+      return STATUS_IO_ERROR(Format("Symlink $0 => $1", new_symlink, pointed_to), errno);
+    }
+    return Status::OK();
+  }
+
+  Status DeleteSymlinkIfExists(const std::string& path) override {
+    if (unlink(path.c_str()) != 0) {
+      // It's ok for the link not to exist already.
+      if (errno != ENOENT) {
+        return STATUS_IO_ERROR(Format("Unlink $0", path), errno);
+      }
     }
     return Status::OK();
   }
@@ -1209,7 +1007,9 @@ class PosixEnv : public Env {
       dir = buf;
     }
     // Directory may already exist
-    WARN_NOT_OK(CreateDir(dir), "Create test dir failed");
+    if (!DirExists(dir)) {
+      WARN_NOT_OK(CreateDir(dir), "Create test dir failed");
+    }
     // /tmp may be a symlink, so canonicalize the path.
     return Canonicalize(dir, result);
   }
@@ -1295,6 +1095,17 @@ class PosixEnv : public Env {
       *is_dir = S_ISDIR(sbuf.st_mode);
     }
     return s;
+  }
+
+  Result<bool> IsSymlink(const std::string& path) override {
+    TRACE_EVENT1("io", "PosixEnv::InSymlink", "path", path);
+    ThreadRestrictions::AssertIOAllowed();
+    struct stat sbuf;
+    if (lstat(path.c_str(), &sbuf) != 0) {
+      return STATUS_IO_ERROR(path, errno);
+    } else {
+      return S_ISLNK(sbuf.st_mode);
+    }
   }
 
   Result<bool> IsExecutableFile(const std::string& path) override {
@@ -1393,6 +1204,23 @@ class PosixEnv : public Env {
     return Status::OK();
   }
 
+  static constexpr int64_t kUndefinedMemoryLimit = -1;
+
+  int64_t ReadCgroupMemoryLimit(const std::string& path) {
+    faststring value;
+    Status s = ReadFileToString(Env::Default(), path, &value);
+    if (s.ok()) {
+      try {
+        return stoull(value.ToString());
+      } catch (const std::exception& e) {
+        LOG(WARNING) << "Unable to parse memory limit: " << e.what();
+      }
+    } else {
+      LOG(WARNING) << "Failed to read cgroup limit file: " << s.ToString();
+    }
+    return kUndefinedMemoryLimit;
+  }
+
   Status GetTotalRAMBytes(int64_t* ram) override {
 #if defined(__APPLE__)
     int mib[2];
@@ -1403,11 +1231,36 @@ class PosixEnv : public Env {
     mib[1] = HW_MEMSIZE;
     CHECK_ERR(sysctl(mib, 2, ram, &length, nullptr, 0)) << "sysctl CTL_HW HW_MEMSIZE failed";
 #else
+
+    if (FLAGS_use_cgroups_memory) {
+      const std::string kCGroupV2MemoryPath = "/sys/fs/cgroup/memory.max";
+      const std::string kCGroupV1MemoryPath = "/sys/fs/cgroup/memory/memory.limit_in_bytes";
+      const int64_t kCGroupMaxMemoryLimit = std::numeric_limits<int64_t>::max();
+
+      int64_t memory_limit = kUndefinedMemoryLimit;
+      // Read cgroup memory limit in order (V2, V1).
+      memory_limit = ReadCgroupMemoryLimit(kCGroupV2MemoryPath);
+      LOG(INFO) << "Memory limit from cgroup V2: " << memory_limit;
+      if (memory_limit == kUndefinedMemoryLimit) {
+        LOG(WARNING) << "Memory limit from cgroup V2: " << memory_limit
+                     << " fallback to cgroup v1";
+        memory_limit = ReadCgroupMemoryLimit(kCGroupV1MemoryPath);
+        LOG(INFO) << "Memory limit from cgroup V1: " << memory_limit;
+      }
+
+      if (memory_limit > 0 && memory_limit < kCGroupMaxMemoryLimit) {
+        *ram = memory_limit;
+        return Status::OK();
+      }
+    }
+
     struct sysinfo info;
     if (sysinfo(&info) < 0) {
       return STATUS_IO_ERROR("sysinfo() failed", errno);
     }
+    VLOG(1) << "Using memory limit from sysinfo(): " << info.totalram;
     *ram = info.totalram;
+
 #endif
     return Status::OK();
   }
@@ -1532,6 +1385,16 @@ class PosixFileFactory : public FileFactory {
       const std::string& fname, std::unique_ptr<SequentialFile>* result) override {
     TRACE_EVENT1("io", "PosixEnv::NewSequentialFile", "path", fname);
     ThreadRestrictions::AssertIOAllowed();
+#if defined(__APPLE__)
+    // On macOS, use raw fd to avoid the ~32K stdio FILE* stream limit (SHRT_MAX in Apple's libc).
+    int fd = open(fname.c_str(), O_RDONLY);
+    if (fd < 0) {
+      return STATUS_IO_ERROR(fname, errno);
+    } else {
+      result->reset(new yb::PosixSequentialFile(fname, fd, yb::FileSystemOptions::kDefault));
+      return Status::OK();
+    }
+#else
     FILE* f = fopen(fname.c_str(), "r");
     if (f == nullptr) {
       return STATUS_IO_ERROR(fname, errno);
@@ -1539,6 +1402,7 @@ class PosixFileFactory : public FileFactory {
       result->reset(new yb::PosixSequentialFile(fname, f, yb::FileSystemOptions::kDefault));
       return Status::OK();
     }
+#endif // defined(__APPLE__)
   }
 
   Status NewRandomAccessFile(const std::string& fname,
@@ -1631,17 +1495,45 @@ class PosixFileFactory : public FileFactory {
                                     std::unique_ptr<WritableFile>* result) {
     uint64_t file_size = 0;
     if (opts.mode == PosixEnv::OPEN_EXISTING) {
-      auto lseek_result = lseek(fd, 0, SEEK_END);
+      off_t lseek_result;
+      if (opts.initial_offset.has_value()) {
+        lseek_result = lseek(fd, opts.initial_offset.value(), SEEK_SET);
+      } else {
+        // Default starting offset will be at the end of file.
+        lseek_result = lseek(fd, 0, SEEK_END);
+      }
       if (lseek_result < 0) {
         return STATUS_IO_ERROR(fname, errno);
       }
       file_size = lseek_result;
     }
 #if defined(__linux__)
-    if (opts.o_direct)
-      *result = std::make_unique<PosixDirectIOWritableFile>(
-          fname, fd, file_size, opts.sync_on_close);
-    else
+    if (opts.o_direct) {
+      const size_t last_block_used_bytes = file_size % FLAGS_o_direct_block_size_bytes;
+      // We always initialize at the end of last aligned full block.
+      *result = std::make_unique<PosixDirectIOWritableFile>(fname, fd,
+                                                            file_size - last_block_used_bytes,
+                                                            opts.sync_on_close);
+      if (last_block_used_bytes != 0) {
+        // The o_direct option is turned on and file size is not a multiple of
+        // FLAGS_o_direct_block_size_bytes. In order to successfully reopen file
+        // for durable write, we read the last incomplete block data from disk,
+        // then append it to buffer.
+        Slice last_block_slice;
+        std::unique_ptr<uint8_t[]> last_block_scratch(new uint8_t[last_block_used_bytes]);
+        std::unique_ptr<RandomAccessFile> readable_file;
+        RETURN_NOT_OK(NewRandomAccessFile(fname, &readable_file));
+        RETURN_NOT_OK(env_util::ReadFully(readable_file.get(),
+                                          file_size - last_block_used_bytes,
+                                          last_block_used_bytes,
+                                          &last_block_slice, last_block_scratch.get()));
+        RETURN_NOT_OK((*result)->Append(last_block_slice));
+        RETURN_NOT_OK((*result)->Sync());
+        // Even after the Sync, this last_block_slice will still be in memory buffer until
+        // we have a full block flushed from memory to disk.
+      }
+      return Status::OK();
+    }
 #endif
     *result = std::make_unique<PosixWritableFile>(fname, fd, file_size, opts.sync_on_close);
     return Status::OK();

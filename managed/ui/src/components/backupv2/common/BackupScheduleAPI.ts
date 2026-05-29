@@ -1,7 +1,7 @@
 /*
  * Created on Thu Mar 31 2022
  *
- * Copyright 2021 YugaByte, Inc. and Contributors
+ * Copyright 2021 YugabyteDB, Inc. and Contributors
  * Licensed under the Polyform Free Trial License 1.0.0 (the "License")
  * You may not use this file except in compliance with the License. You may obtain a copy of the License at
  * http://github.com/YugaByte/yugabyte-db/blob/master/licenses/POLYFORM-FREE-TRIAL-LICENSE-1.0.0.txt
@@ -20,13 +20,14 @@ type Schedule_List_Reponse = {
   totalCount: number;
 };
 
-export const getScheduledBackupList = (pageno: number) => {
+export const getScheduledBackupList = (pageno: number, universeUUID: string) => {
   const cUUID = localStorage.getItem('customerId');
   const records_to_fetch = 500;
   const params = {
     direction: 'ASC',
     filter: {
-      taskTypes: ['BackupUniverse', 'MultiTableBackup', 'CreateBackup']
+      taskTypes: ['BackupUniverse', 'MultiTableBackup', 'CreateBackup'],
+      universeUUIDList: [universeUUID]
     },
     limit: records_to_fetch,
     offset: pageno * records_to_fetch,
@@ -36,23 +37,23 @@ export const getScheduledBackupList = (pageno: number) => {
 };
 
 export const editBackupSchedule = (
-  values: Partial<IBackupSchedule> & Pick<IBackupSchedule, 'scheduleUUID'>
+  values: Partial<IBackupSchedule> & Pick<IBackupSchedule, 'scheduleUUID'>,
+  currentUniverseUUID: string
 ) => {
   const cUUID = localStorage.getItem('customerId');
 
   if (values['cronExpression']) {
     delete values['frequency'];
   }
-
   return axios.put<IBackupSchedule[]>(
-    `${ROOT_URL}/customers/${cUUID}/schedules/${values['scheduleUUID']}`,
+    `${ROOT_URL}/customers/${cUUID}/universes/${currentUniverseUUID}/schedules/${values['scheduleUUID']}/edit_backup_schedule_async`,
     values
   );
 };
 
 export const createBackupSchedule = (values: Record<string, any>) => {
   const cUUID = localStorage.getItem('customerId');
-  const requestUrl = `${ROOT_URL}/customers/${cUUID}/create_backup_schedule`;
+  const requestUrl = `${ROOT_URL}/customers/${cUUID}/create_backup_schedule_async`;
 
   const payload = prepareBackupCreationPayload(values, cUUID);
 

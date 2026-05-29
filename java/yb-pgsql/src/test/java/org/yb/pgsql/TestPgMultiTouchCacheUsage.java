@@ -1,4 +1,4 @@
-// Copyright (c) YugaByte, Inc.
+// Copyright (c) YugabyteDB, Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License"); you may not use this file except
 // in compliance with the License.  You may obtain a copy of the License at
@@ -17,7 +17,7 @@ import org.junit.Test;
 import org.junit.runner.RunWith;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
-import org.yb.util.YBTestRunnerNonTsanOnly;
+import org.yb.YBTestRunner;
 import org.yb.client.YBClient;
 import org.yb.minicluster.MiniYBDaemon;
 import com.yugabyte.util.PSQLException;
@@ -40,7 +40,7 @@ import com.google.gson.JsonElement;
 import com.google.gson.JsonObject;
 import com.google.gson.JsonParser;
 
-@RunWith(value=YBTestRunnerNonTsanOnly.class)
+@RunWith(value=YBTestRunner.class)
 public class TestPgMultiTouchCacheUsage extends BasePgSQLTest {
   private static final Logger LOG = LoggerFactory.getLogger(TestPgSelect.class);
 
@@ -73,7 +73,7 @@ public class TestPgMultiTouchCacheUsage extends BasePgSQLTest {
       }
       String line = null;
       while ((line = br.readLine()) != null) {
-        if (line.contains("rocksdb_block_cache_multi_touch_hit")) {
+        if (line.contains("rocksdb_block_cache_multi_touch_hit{")) {
           String inp[] = line.split(" ");
           String x = inp[inp.length - 2].trim();
           int val = Integer.parseInt(x);

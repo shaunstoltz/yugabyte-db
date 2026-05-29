@@ -1,5 +1,5 @@
 /*
- * Copyright 2021 YugaByte, Inc. and Contributors
+ * Copyright 2021 YugabyteDB, Inc. and Contributors
  *
  * Licensed under the Polyform Free Trial License 1.0.0 (the "License"); you
  * may not use this file except in compliance with the License. You
@@ -93,7 +93,7 @@ public class AlertConfigurationWriterTest extends FakeDBApplication {
             maintenanceService);
 
     customer = ModelFactory.testCustomer();
-    universe = ModelFactory.createUniverse(customer.getCustomerId());
+    universe = ModelFactory.createUniverse(customer.getId());
 
     configuration = ModelFactory.createAlertConfiguration(customer, universe);
     definition = ModelFactory.createAlertDefinition(customer, universe, configuration);

@@ -15,9 +15,9 @@
 // specific language governing permissions and limitations
 // under the License.
 //
-// The following only applies to changes made to this file as part of YugaByte development.
+// The following only applies to changes made to this file as part of YugabyteDB development.
 //
-// Portions Copyright (c) YugaByte, Inc.
+// Portions Copyright (c) YugabyteDB, Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License"); you may not use this file except
 // in compliance with the License.  You may obtain a copy of the License at
@@ -47,21 +47,24 @@
 
 #include "yb/rpc/rpc_fwd.h"
 #include "yb/rpc/io_thread_pool.h"
+#include "yb/rpc/local_call.h"
 #include "yb/rpc/proxy_context.h"
 #include "yb/rpc/scheduler.h"
 
-#include "yb/util/metrics_fwd.h"
-#include "yb/util/status_fwd.h"
 #include "yb/util/async_util.h"
 #include "yb/util/atomic.h"
 #include "yb/util/locks.h"
+#include "yb/util/metrics_fwd.h"
 #include "yb/util/monotime.h"
 #include "yb/util/net/sockaddr.h"
+#include "yb/util/one_time_bool.h"
 #include "yb/util/operation_counter.h"
 #include "yb/util/stack_trace.h"
+#include "yb/util/status_fwd.h"
 
 namespace yb {
 
+class Cgroup;
 class MemTracker;
 class Socket;
 struct SourceLocation;
@@ -72,6 +75,8 @@ template <class ContextType>
 class ConnectionContextFactoryImpl;
 
 typedef std::unordered_map<const Protocol*, StreamFactoryPtr> StreamFactories;
+
+using ThreadPoolCgroupProvider = std::function<Cgroup*(TaggedThreadPools::Tag)>;
 
 // Used to construct a Messenger.
 class MessengerBuilder {
@@ -111,6 +116,26 @@ class MessengerBuilder {
     return *this;
   }
 
+  MessengerBuilder &SetUncompressedProtocol(const Protocol* protocol) {
+    uncompressed_protocol_ = protocol;
+    return *this;
+  }
+
+  MessengerBuilder& SetThreadPoolCgroupProvider(ThreadPoolCgroupProvider provider) {
+    cgroup_provider_ = std::move(provider);
+    return *this;
+  }
+
+  MessengerBuilder& SetSystemHighCgroup(Cgroup* cgroup) {
+    system_high_cgroup_ = cgroup;
+    return *this;
+  }
+
+  MessengerBuilder& SetSystemMedCgroup(Cgroup* cgroup) {
+    system_med_cgroup_ = cgroup;
+    return *this;
+  }
+
   template <class ContextType>
   MessengerBuilder &CreateConnectionContextFactory(
       size_t memory_limit, const std::shared_ptr<MemTracker>& parent_mem_tracker = nullptr) {
@@ -120,6 +145,11 @@ class MessengerBuilder {
     connection_context_factory_ =
         std::make_shared<ConnectionContextFactoryImpl<ContextType>>(
             memory_limit, parent_mem_tracker);
+    return *this;
+  }
+
+  MessengerBuilder& UseLocalHostOutboundIpBaseInTests() {
+    use_local_host_outbound_ip_base_in_tests_ = true;
     return *this;
   }
 
@@ -155,6 +185,14 @@ class MessengerBuilder {
     return last_used_parent_mem_tracker_;
   }
 
+  Cgroup* system_high_cgroup() const {
+    return system_high_cgroup_;
+  }
+
+  Cgroup* system_med_cgroup() const {
+    return system_med_cgroup_;
+  }
+
  private:
   const std::string name_;
   CoarseMonoClock::Duration connection_keepalive_time_;
@@ -164,9 +202,14 @@ class MessengerBuilder {
   ConnectionContextFactoryPtr connection_context_factory_;
   StreamFactories stream_factories_;
   const Protocol* listen_protocol_;
+  const Protocol* uncompressed_protocol_;
   size_t workers_limit_;
   int num_connections_to_server_;
   std::shared_ptr<MemTracker> last_used_parent_mem_tracker_;
+  bool use_local_host_outbound_ip_base_in_tests_ = false;
+  ThreadPoolCgroupProvider cgroup_provider_;
+  Cgroup* system_high_cgroup_ = nullptr;
+  Cgroup* system_med_cgroup_ = nullptr;
 };
 
 // A Messenger is a container for the reactor threads which run event loops for the RPC services.
@@ -215,7 +258,8 @@ class Messenger : public ProxyContext {
   // Invoke the RpcService to handle a call directly.
   void Handle(InboundCallPtr call, Queue queue) override;
 
-  const Protocol* DefaultProtocol() override { return listen_protocol_; }
+  const Protocol& DefaultProtocol() override { return listen_protocol_; }
+  const Protocol& UncompressedProtocol() override { return uncompressed_protocol_; }
 
   rpc::ThreadPool& CallbackThreadPool(ServicePriority priority) override {
     return ThreadPool(priority);
@@ -223,6 +267,10 @@ class Messenger : public ProxyContext {
 
   Status QueueEventOnAllReactors(
       ServerEventListPtr server_event, const SourceLocation& source_location);
+
+  Status QueueEventOnFilteredConnections(
+      ServerEventListPtr server_event, const SourceLocation& source_location,
+      ConnectionFilter connection_filter);
 
   // Dump the current RPCs into the given protobuf.
   Status DumpRunningRpcs(const DumpRunningRpcsRequestPB& req,
@@ -238,10 +286,8 @@ class Messenger : public ProxyContext {
   //
   // The status argument conveys whether 'func' was run correctly (i.e. after the elapsed time) or
   // not.
-  MUST_USE_RESULT ScheduledTaskId ScheduleOnReactor(
-      StatusFunctor func, MonoDelta when,
-      const SourceLocation& source_location,
-      rpc::Messenger* msgr);
+  Result<ScheduledTaskId> ScheduleOnReactor(
+      StatusFunctor func, MonoDelta when, const SourceLocation& source_location);
 
   std::string name() const {
     return name_;
@@ -277,6 +323,10 @@ class Messenger : public ProxyContext {
 
   rpc::ThreadPool& ThreadPool(ServicePriority priority = ServicePriority::kNormal);
 
+  const rpc::ThreadPoolPtr& ThreadPoolPtr(ServicePriority priority = ServicePriority::kNormal);
+
+  Result<rpc::ThreadPoolPtr> TaggedThreadPool(TaggedThreadPools::Tag pool_tag = 0);
+
   const std::shared_ptr<RpcMetrics>& rpc_metrics() override {
     return rpc_metrics_;
   }
@@ -301,13 +351,33 @@ class Messenger : public ProxyContext {
 
   Status TEST_GetReactorMetrics(size_t reactor_idx, ReactorMetrics* metrics);
 
+  ScheduledTaskId TEST_next_task_id() const {
+    return next_task_id_.load(std::memory_order_acquire);
+  }
+
+  void SetMetadataSerializerFactory(std::unique_ptr<MetadataSerializerFactory> factory) {
+    metadata_serializer_factory_ = std::move(factory);
+  }
+
+  MetadataSerializerFactory* metadata_serializer_factory() override {
+    return metadata_serializer_factory_.get();
+  }
+
+  void SetCallStateListenerFactory(std::unique_ptr<CallStateListenerFactory> factory) {
+    call_state_listener_factory_ = std::move(factory);
+  }
+
+  CallStateListenerFactory* call_state_listener_factory() override {
+    return call_state_listener_factory_.get();
+  }
+
  private:
   friend class DelayedTask;
 
   explicit Messenger(const MessengerBuilder &bld);
 
   Reactor* RemoteToReactor(const Endpoint& remote, uint32_t idx = 0);
-  Status Init();
+  Status Init(const MessengerBuilder &bld);
 
   void BreakConnectivity(const IpAddress& address, bool incoming, bool outgoing);
   void RestoreConnectivity(const IpAddress& address, bool incoming, bool outgoing);
@@ -318,32 +388,41 @@ class Messenger : public ProxyContext {
 
   bool TEST_ShouldArtificiallyRejectOutgoingCallsTo(const IpAddress &remote);
 
+  const std::string& LogPrefix() const {
+    return log_prefix_;
+  }
+
+  ThreadPoolOptions MakeNormalThreadPoolOptions(TaggedThreadPools::Tag tag) const;
+
   const std::string name_;
+
+  const std::string log_prefix_;
 
   ConnectionContextFactoryPtr connection_context_factory_;
 
   const StreamFactories stream_factories_;
 
-  const Protocol* const listen_protocol_;
+  const Protocol& listen_protocol_;
+  const Protocol& uncompressed_protocol_;
 
-  // Protects closing_, acceptor_pools_.
-  mutable percpu_rwlock lock_;
+  mutable PerCpuRwMutex lock_;
 
   std::atomic_bool closing_ = false;
 
   // RPC services that handle inbound requests.
   mutable RWOperationCounter rpc_services_counter_;
-  std::atomic_bool rpc_services_counter_stopped_ = false;
+  OneTimeBool rpc_services_stopped_;
   std::unordered_multimap<std::string, RpcServicePtr> rpc_services_;
   RpcEndpointMap rpc_endpoints_;
 
   std::vector<std::unique_ptr<Reactor>> reactors_;
+  LocalYBInboundCallTracker local_call_tracker_;
 
   const scoped_refptr<MetricEntity> metric_entity_;
   const scoped_refptr<Histogram> outgoing_queue_time_;
 
   // Acceptor which is listening on behalf of this messenger.
-  std::unique_ptr<Acceptor> acceptor_;
+  std::unique_ptr<Acceptor> acceptor_ GUARDED_BY(lock_);
   IpAddress outbound_address_v4_;
   IpAddress outbound_address_v6_;
 
@@ -353,25 +432,34 @@ class Messenger : public ProxyContext {
 
   std::mutex mutex_scheduled_tasks_;
 
-  std::unordered_map<ScheduledTaskId, std::shared_ptr<DelayedTask>> scheduled_tasks_;
+  std::unordered_map<ScheduledTaskId, std::shared_ptr<DelayedTask>> scheduled_tasks_
+      GUARDED_BY(mutex_scheduled_tasks_);
 
   // Flag that we have at least on address with artificially broken connectivity.
   std::atomic<bool> has_broken_connectivity_ = {false};
+  mutable PerCpuRwMutex broken_connectivity_lock_;
 
   // Set of addresses with artificially broken connectivity.
-  std::unordered_set<IpAddress, IpAddressHash> broken_connectivity_from_;
-  std::unordered_set<IpAddress, IpAddressHash> broken_connectivity_to_;
+  std::unordered_set<IpAddress, IpAddressHash> broken_connectivity_from_
+      GUARDED_BY(broken_connectivity_lock_);
+  std::unordered_set<IpAddress, IpAddressHash> broken_connectivity_to_
+      GUARDED_BY(broken_connectivity_lock_);
 
   IoThreadPool io_thread_pool_;
   Scheduler scheduler_;
 
+  size_t thread_pool_workers_limit_;
+
   // Thread pools that are used by services running in this messenger.
-  std::unique_ptr<rpc::ThreadPool> normal_thread_pool_;
+  std::unique_ptr<TaggedThreadPools> normal_thread_pools_;
+
+  rpc::ThreadPoolPtr default_normal_thread_pool_;
 
   std::mutex mutex_high_priority_thread_pool_;
 
   // This could be used for high-priority services such as Consensus.
-  AtomicUniquePtr<rpc::ThreadPool> high_priority_thread_pool_;
+  rpc::ThreadPoolPtr high_priority_thread_pool_;
+  std::atomic<bool> high_priority_thread_pool_ready_;
 
   std::unique_ptr<DnsResolver> resolver_;
 
@@ -383,6 +471,15 @@ class Messenger : public ProxyContext {
 
   // Number of outbound connections to create per each destination server address.
   int num_connections_to_server_;
+
+  std::unique_ptr<ReactorMonitor> reactor_monitor_ GUARDED_BY(lock_);
+
+  std::unique_ptr<CallStateListenerFactory> call_state_listener_factory_;
+  std::unique_ptr<MetadataSerializerFactory> metadata_serializer_factory_;
+
+  ThreadPoolCgroupProvider cgroup_provider_;
+  Cgroup* system_high_cgroup_ = nullptr;
+  Cgroup* system_med_cgroup_ = nullptr;
 
 #ifndef NDEBUG
   // This is so we can log where exactly a Messenger was instantiated to better diagnose a CHECK

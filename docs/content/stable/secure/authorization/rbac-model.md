@@ -4,7 +4,6 @@ linkTitle: Overview
 headerTitle: Role-based access overview
 description: Overview of the role-based access control (RBAC) model in YSQL.
 headcontent: How role-based access control works
-image: /images/section_icons/secure/rbac-model.png
 menu:
   stable:
     identifier: rbac-model
@@ -12,6 +11,8 @@ menu:
     weight: 716
 type: docs
 ---
+
+Role-based access control (RBAC) consists of a collection of permissions on resources given to roles.
 
 <ul class="nav nav-tabs-alt nav-tabs-yb">
 
@@ -31,8 +32,6 @@ type: docs
 
 </ul>
 
-The role-based access control (RBAC) model in YSQL is a collection of privileges on resources given to roles. Thus, the entire RBAC model is built around roles, resources, and privileges. It is essential to understand these concepts in order to understand the RBAC model.
-
 ## Roles
 
 Roles in YSQL can represent individual users or a group of users. They encapsulate a set of privileges that can be assigned to other roles (or users). Roles are essential to implementing and administering access control on a YugabyteDB cluster. Below are some important points about roles:
@@ -42,6 +41,8 @@ Roles in YSQL can represent individual users or a group of users. They encapsula
 * Roles can be granted to other roles, making it possible to organize roles into a hierarchy.
 
 * Roles inherit the privileges of all other roles granted to them.
+
+* Like PostgreSQL, roles do not inherit role attributes (such as SUPERUSER, INHERIT, CREATEROLE, CREATEDB, REPLICATION, BYPASSRLS), even if the membership grant has the INHERIT attribute. You must actually [SET ROLE](../../../api/ysql/the-sql-language/statements/dcl_set_role/) to a specific role having the attribute in order to make use of the attribute.
 
 YugabyteDB inherits a number of roles from PostgreSQL, including the `postgres` user, and adds several new roles. View the YugabyteDB-specific roles for your clusters with the following command (or use `\duS` to display all roles):
 
@@ -54,6 +55,7 @@ yugabyte=> \du
   Role name   |                         Attributes                         | Member of
 --------------+------------------------------------------------------------+-----------
  postgres     | Superuser, Create role, Create DB, Replication, Bypass RLS | {}
+ yb_db_admin  | No inheritance, Cannot login                               | {}
  yb_extension | Cannot login                                               | {}
  yb_fdw       | Cannot login                                               | {}
  yugabyte     | Superuser, Create role, Create DB, Replication, Bypass RLS | {}
@@ -65,6 +67,7 @@ The following table describes the default YSQL roles and users in YugabyteDB clu
 | Role | Description |
 | :--- | :---------- |
 | postgres | Superuser role created during database creation. |
+| yb_db_admin | Role that allows non-superuser users to create tablespaces and perform other privileged operations. |
 | yb_extension | Role that allows non-superuser users to create PostgreSQL extensions. |
 | yb_fdw | Role that allows non-superuser users to [CREATE](../../../api/ysql/the-sql-language/statements/ddl_create_foreign_data_wrapper/), [ALTER](../../../api/ysql/the-sql-language/statements/ddl_alter_foreign_data_wrapper/), and [DROP](../../../api/ysql/the-sql-language/statements/ddl_drop_foreign_data_wrapper/) [foreign data wrappers](../../../explore/ysql-language-features/advanced-features/foreign-data-wrappers/). |
 | yugabyte | Superuser role used during database creation, by Yugabyte support to perform maintenance operations, and for backups (using ysql_dump). |

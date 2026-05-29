@@ -15,9 +15,9 @@
 # specific language governing permissions and limitations
 # under the License.
 #
-# The following only applies to changes made to this file as part of YugaByte development.
+# The following only applies to changes made to this file as part of YugabyteDB development.
 #
-# Portions Copyright (c) YugaByte, Inc.
+# Portions Copyright (c) YugabyteDB, Inc.
 #
 # Licensed under the Apache License, Version 2.0 (the "License"); you may not use this file except
 # in compliance with the License.  You may obtain a copy of the License at
@@ -31,9 +31,7 @@
 #
 
 set(YB_PCH_PREFIX tserver)
-set(YB_PCH_DEP_LIBS opid_proto yb_test_util)
-
-YB_INCLUDE_EXTENSIONS()
+set(YB_PCH_DEP_LIBS yb_test_util)
 
 #########################################
 # tserver_proto
@@ -106,6 +104,7 @@ YRPC_GENERATE(
   PROTO_FILES pg_client.proto)
 set(PG_CLIENT_YRPC_LIBS
   master_proto
+  tserver_service_proto
   yrpc)
 ADD_YB_LIBRARY(pg_client_proto
   SRCS ${PG_CLIENT_YRPC_SRCS}
@@ -137,6 +136,7 @@ ADD_YB_LIBRARY(tserver_admin_proto
 
 YRPC_GENERATE(
   TSERVER_YRPC_SRCS TSERVER_YRPC_HDRS TSERVER_YRPC_TGTS
+  MESSAGES TRUE
   SOURCE_ROOT ${CMAKE_CURRENT_SOURCE_DIR}/../..
   BINARY_ROOT ${CMAKE_CURRENT_BINARY_DIR}/../..
   PROTO_FILES tserver_service.proto)
@@ -146,25 +146,84 @@ set(TSERVER_YRPC_LIBS
   protobuf
   remote_bootstrap_proto
   rpc_header_proto
-  tserver_proto)
+  tserver_proto
+  tserver_shared)
 ADD_YB_LIBRARY(tserver_service_proto
   SRCS ${TSERVER_YRPC_SRCS}
   DEPS ${TSERVER_YRPC_LIBS}
   NONLINK_DEPS ${TSERVER_YRPC_TGTS})
 
 #########################################
-# tserver_util
+# test_echo_service_proto
 #########################################
 
-set(TSERVER_UTIL_SRCS
+YRPC_GENERATE(
+  TSERVER_YRPC_SRCS TSERVER_YRPC_HDRS TSERVER_YRPC_TGTS
+  SOURCE_ROOT ${CMAKE_CURRENT_SOURCE_DIR}/../..
+  BINARY_ROOT ${CMAKE_CURRENT_BINARY_DIR}/../..
+  PROTO_FILES stateful_services/test_echo_service.proto)
+set(TSERVER_YRPC_LIBS
+  yrpc
+  yb_common_proto
+  protobuf)
+ADD_YB_LIBRARY(test_echo_service_proto
+  SRCS ${TSERVER_YRPC_SRCS}
+  DEPS ${TSERVER_YRPC_LIBS}
+  NONLINK_DEPS ${TSERVER_YRPC_TGTS})
+
+#########################################
+# pg_auto_analyze_service_proto
+#########################################
+
+YRPC_GENERATE(
+  TSERVER_YRPC_SRCS TSERVER_YRPC_HDRS TSERVER_YRPC_TGTS
+  SOURCE_ROOT ${CMAKE_CURRENT_SOURCE_DIR}/../..
+  BINARY_ROOT ${CMAKE_CURRENT_BINARY_DIR}/../..
+  PROTO_FILES stateful_services/pg_auto_analyze_service.proto)
+set(TSERVER_YRPC_LIBS
+  yrpc
+  yb_common_proto
+  protobuf)
+ADD_YB_LIBRARY(pg_auto_analyze_service_proto
+  SRCS ${TSERVER_YRPC_SRCS}
+  DEPS ${TSERVER_YRPC_LIBS}
+  NONLINK_DEPS ${TSERVER_YRPC_TGTS})
+
+#########################################
+# pg_cron_leader_service_proto
+#########################################
+
+YRPC_GENERATE(
+  TSERVER_YRPC_SRCS TSERVER_YRPC_HDRS TSERVER_YRPC_TGTS
+  SOURCE_ROOT ${CMAKE_CURRENT_SOURCE_DIR}/../..
+  BINARY_ROOT ${CMAKE_CURRENT_BINARY_DIR}/../..
+  PROTO_FILES stateful_services/pg_cron_leader_service.proto)
+set(TSERVER_YRPC_LIBS
+  yrpc
+  yb_common_proto
+  protobuf)
+ADD_YB_LIBRARY(pg_cron_leader_service_proto
+  SRCS ${TSERVER_YRPC_SRCS}
+  DEPS ${TSERVER_YRPC_LIBS}
+  NONLINK_DEPS ${TSERVER_YRPC_TGTS})
+
+#########################################
+# tserver_shared
+#########################################
+
+set(TSERVER_SHARED_SRCS
+  tserver_cgroup_manager.cc
+  tserver_error.cc
   tserver_flags.cc
-  tserver_error.cc)
-set(TSERVER_UTIL_LIBS
-  yb_util)
-ADD_YB_LIBRARY(tserver_util
-  SRCS ${TSERVER_UTIL_SRCS}
-  DEPS ${TSERVER_UTIL_LIBS})
-add_dependencies(tserver_util gen_proto)
+  tserver_shared_mem.cc)
+set(TSERVER_SHARED_LIBS
+  yb_docdb_shared
+  yb_util
+  yb_util_shmem)
+ADD_YB_LIBRARY(tserver_shared
+  SRCS ${TSERVER_SHARED_SRCS}
+  DEPS ${TSERVER_SHARED_LIBS})
+add_dependencies(tserver_shared gen_proto)
 
 #########################################
 # tserver
@@ -173,56 +232,102 @@ add_dependencies(tserver_util gen_proto)
 include_directories(${YB_BUILD_ROOT}/postgres/include/server)
 
 set(TSERVER_SRCS
+  backup_service.cc
+  connectivity_poller.cc
   db_server_base.cc
   full_compaction_manager.cc
   heartbeater.cc
   heartbeater_factory.cc
+  master_leader_poller.cc
   metrics_snapshotter.cc
   pg_client_service.cc
   pg_client_session.cc
   pg_create_table.cc
-  pg_table_cache.cc
+  pg_db_cache.cc
+  pg_mutation_counter.cc
   pg_response_cache.cc
+  pg_session_guard.cc
+  pg_sequence_cache.cc
+  pg_shared_mem_pool.cc
+  pg_table_cache.cc
+  pg_table_mutation_count_sender.cc
+  pg_txn_snapshot_manager.cc
+  tserver_xcluster_context.cc
   read_query.cc
   remote_bootstrap_anchor_client.cc
+  remote_client_base.cc
   remote_bootstrap_client.cc
+  remote_bootstrap_info.cc
   remote_bootstrap_file_downloader.cc
   remote_bootstrap_service.cc
   remote_bootstrap_session.cc
   remote_bootstrap_snapshots.cc
+  remote_snapshot_transfer_client.cc
   service_util.cc
+  tablet_limits.cc
   tablet_memory_manager.cc
   tablet_server.cc
   tablet_server_options.cc
   tablet_service.cc
+  tablet_validator.cc
+  ts_data_size_metrics.cc
+  ts_local_lock_manager.cc
+  ts_snapshots_page_handler.cc
   ts_tablet_manager.cc
   tserver-path-handlers.cc
+  tserver_auto_flags_manager.cc
   tserver_metrics_heartbeat_data_provider.cc
   server_main_util.cc
+  stateful_services/pg_auto_analyze_service.cc
+  stateful_services/pg_cron_leader_service.cc
+  stateful_services/stateful_service_base.cc
+  stateful_services/test_echo_service.cc
+  xcluster_async_executor.cc
   xcluster_safe_time_map.cc
-  ${TSERVER_SRCS_EXTENSIONS})
+  xcluster_consumer.cc
+  xcluster_consumer_auto_flags_info.cc
+  xcluster_consumer_replication_error.cc
+  xcluster_ddl_queue_handler.cc
+  xcluster_poller.cc
+  xcluster_poller_id.cc
+  xcluster_poller_stats.cc
+  xcluster_output_client.cc
+  xcluster_write_implementations.cc
+  ysql_advisory_lock_table.cc
+  ysql_call_home_stats.cc
+  ysql_lease_manager.cc
+  ysql_lease_poller.cc)
 
 set(TSERVER_DEPS
-  protobuf
+  auto_flags_manager_common
   backup_proto
-  tserver_proto
-  tserver_admin_proto
-  tserver_service_proto
-  remote_bootstrap_proto
-  master_rpc
-  master_proto
-  consensus_proto
-  log_proto
-  log
+  cdc
+  cdc_consumer_proto
   consensus
-  yrpc
+  consensus_proto
+  hnsw
+  log
+  log_proto
+  master_proto
+  master_rpc
+  protobuf
+  remote_bootstrap_proto
   server_common
   server_process
   tablet
+  tserver_admin_proto
+  tserver_proto
+  tserver_service_proto
+  xcluster_producer_proto
+  yb_ash
   yb_client
+  pq_utils
   yb_pggate_flags
+  yb_pgresult_util
+  yb_ysql_binary_runner
+  yrpc
   ysql_upgrade
-  ${TSERVER_LIB_EXTENSIONS})
+)
 
 ADD_YB_LIBRARY(tserver
   SRCS ${TSERVER_SRCS}
@@ -247,9 +352,13 @@ ADD_YB_LIBRARY(yb-tserver_util
 set(TSERVER_MAIN_DEPS
     tserver
     yb-tserver_util
+    yb_ash
     yb-cql
     yb-redis
+    yb_process_wrapper
     yb_pgwrapper
+    ysql_conn_mgr_wrapper
+    dist_rag_wrapper
     ${YB_BASE_LIBS})
 
 ADD_YB_LIBRARY(tserver_main_impl
@@ -284,37 +393,57 @@ add_library(tserver_test_util
 target_link_libraries(tserver_test_util tablet_test_util tserver yb_test_util yb_util)
 
 #########################################
+# tserver_mock
+#########################################
+
+set(tserver_mock_SRCS
+  tserver_xcluster_context_mock.cc)
+
+set(tserver_mock_LIBS
+  tserver
+  gmock
+  gtest)
+
+ADD_YB_LIBRARY(tserver_mock
+  SRCS ${tserver_mock_SRCS}
+  DEPS ${tserver_mock_LIBS})
+
+#########################################
 # tserver tests
 #########################################
 
 set(YB_TEST_LINK_LIBS
   rpc_test_util
   tserver
+  tserver_mock
   tserver_test_util
   yb_client # yb::client::YBTableName
   yb-tserver_util
   tablet_test_util
   ${YB_MIN_TEST_LIBS})
+ADD_YB_TEST(remote_bootstrap_file_downloader-test)
 ADD_YB_TEST(remote_bootstrap_rocksdb_client-test)
 ADD_YB_TEST(remote_bootstrap_rocksdb_session-test)
 ADD_YB_TEST(remote_bootstrap_service-test)
 ADD_YB_TEST(tablet_server-test)
 ADD_YB_TEST(tablet_server-stress-test RUN_SERIAL true)
+ADD_YB_TEST(ts_local_lock_manager-test)
 ADD_YB_TEST(ts_tablet_manager-test)
+if (NOT APPLE)
+  # We disable this test when running on Apple platform as it does not support cgroups.
+  ADD_YB_TEST(tserver_cgroup_manager-test)
+endif()
 ADD_YB_TEST(header_manager_impl-test)
+ADD_YB_TEST(backup_service-test)
+ADD_YB_TEST(clone_operation-test)
 
 ADD_YB_TEST(encrypted_sstable-test)
 YB_TEST_TARGET_LINK_LIBRARIES(encrypted_sstable-test encryption_test_util tserver_test_util tserver)
 
-# -------------------------------------------------------------------------------------------------
-# Tests in the "ent" directory
-# -------------------------------------------------------------------------------------------------
 
-if(YB_ENT_CURRENT_SOURCE_DIR)
-  # Set the test source file folder.
-  set(CMAKE_CURRENT_LIST_DIR ${YB_ENT_CURRENT_SOURCE_DIR})
+ADD_YB_TEST(remote_bootstrap_rocksdb_session-test_ent)
+ADD_YB_TEST(remote_bootstrap_rocksdb_client-test_ent)
 
-  foreach(test ${TSERVER_EXTENSIONS_TESTS})
-    ADD_YB_TEST(${test})
-  endforeach()
-endif()
+ADD_YB_TEST(xcluster_consumer_replication_error-test)
+ADD_YB_TEST(xcluster_consumer_auto_flags_info-test)
+ADD_YB_TEST(xcluster_ddl_queue_handler-test)

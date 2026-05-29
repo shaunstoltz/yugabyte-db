@@ -1,4 +1,4 @@
-// Copyright (c) YugaByte, Inc.
+// Copyright (c) YugabyteDB, Inc.
 
 package com.yugabyte.yw.commissioner;
 
@@ -23,7 +23,7 @@ public class CallHome {
   private final Environment environment;
 
   // Interval at which to send callhome diagnostics in minutes
-  private static final int YB_CALLHOME_INTERVAL = 60;
+  private static final Duration YB_CALLHOME_INTERVAL = Duration.ofDays(1);
 
   @Inject
   public CallHome(
@@ -43,21 +43,23 @@ public class CallHome {
     }
     log.info("Initialize callhome service");
     platformScheduler.schedule(
-        getClass().getSimpleName(),
-        Duration.ZERO,
-        Duration.ofMinutes(YB_CALLHOME_INTERVAL),
-        this::scheduleRunner);
+        getClass().getSimpleName(), Duration.ZERO, YB_CALLHOME_INTERVAL, this::scheduleRunner);
   }
 
   @VisibleForTesting
   void scheduleRunner() {
     try {
       log.info("Running scheduler");
+      try {
+        callHomeManager.sendPlatformDiagnostics();
+      } catch (Exception e) {
+        log.error("Error sending platform callhome", e);
+      }
       for (Customer c : Customer.getAll()) {
         try {
           callHomeManager.sendDiagnostics(c);
         } catch (Exception e) {
-          log.error("Error sending callhome for customer: " + c.uuid, e);
+          log.error("Error sending callhome for customer: " + c.getUuid(), e);
         }
       }
     } catch (Exception e) {

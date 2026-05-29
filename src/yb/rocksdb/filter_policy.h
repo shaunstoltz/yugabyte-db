@@ -6,9 +6,9 @@
 // Use of this source code is governed by a BSD-style license that can be
 // found in the LICENSE file. See the AUTHORS file for names of contributors.
 //
-// The following only applies to changes made to this file as part of YugaByte development.
+// The following only applies to changes made to this file as part of YugabyteDB development.
 //
-// Portions Copyright (c) YugaByte, Inc.
+// Portions Copyright (c) YugabyteDB, Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License"); you may not use this file except
 // in compliance with the License.  You may obtain a copy of the License at
@@ -67,7 +67,7 @@ class FilterBitsReader {
   virtual ~FilterBitsReader() {}
 
   // Check if the entry match the bits in filter
-  virtual bool MayMatch(const Slice& entry) = 0;
+  virtual bool MayMatch(Slice entry) = 0;
 };
 
 // We add a new format of filter block called full filter block

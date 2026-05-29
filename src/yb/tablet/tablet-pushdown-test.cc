@@ -15,9 +15,9 @@
 // specific language governing permissions and limitations
 // under the License.
 //
-// The following only applies to changes made to this file as part of YugaByte development.
+// The following only applies to changes made to this file as part of YugabyteDB development.
 //
-// Portions Copyright (c) YugaByte, Inc.
+// Portions Copyright (c) YugabyteDB, Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License"); you may not use this file except
 // in compliance with the License.  You may obtain a copy of the License at
@@ -36,15 +36,18 @@
 #include <unordered_set>
 #include <vector>
 
-#include <glog/logging.h>
+#include "yb/util/logging.h"
 #include <gtest/gtest.h>
 
 #include "yb/common/common_fwd.h"
 #include "yb/common/ql_protocol_util.h"
-#include "yb/common/ql_rowblock.h"
 #include "yb/common/schema.h"
 
+#include "yb/docdb/read_operation_data.h"
+
 #include "yb/gutil/strings/numbers.h"
+
+#include "yb/qlexpr/ql_rowblock.h"
 
 #include "yb/tablet/local_tablet_writer.h"
 #include "yb/tablet/read_result.h"
@@ -63,9 +66,9 @@ namespace tablet {
 class TabletPushdownTest : public YBTabletTest {
  public:
   TabletPushdownTest()
-    : YBTabletTest(Schema({ ColumnSchema("key", INT32, false, true),
-                            ColumnSchema("int_val", INT32),
-                            ColumnSchema("string_val", STRING) }, 1)) {
+    : YBTabletTest(Schema({ ColumnSchema("key", DataType::INT32, ColumnKind::HASH),
+                            ColumnSchema("int_val", DataType::INT32),
+                            ColumnSchema("string_val", DataType::STRING) })) {
   }
 
   void SetUp() override {
@@ -100,17 +103,20 @@ class TabletPushdownTest : public YBTabletTest {
     condition->set_op(QLOperator::QL_OP_AND);
     QLAddInt32Condition(condition, column_id, QL_OP_GREATER_THAN_EQUAL, lower);
     QLAddInt32Condition(condition, column_id, QL_OP_LESS_THAN_EQUAL, upper);
-    QLReadRequestResult result;
+    ThreadSafeArena arena;
+    QLReadRequestResult result(arena);
     TransactionMetadataPB transaction;
     QLAddColumns(schema_, {}, &req);
     WriteBuffer rows_data(1024);
     EXPECT_OK(tablet()->HandleQLReadRequest(
-        CoarseTimePoint::max() /* deadline */, read_time, req, transaction, &result, &rows_data));
+        docdb::ReadOperationData::FromReadTime(read_time), LWQLReadRequestPB(&arena, req),
+        LWTransactionMetadataPB(&arena, transaction), &result, &rows_data));
 
-    ASSERT_EQ(QLResponsePB::YQL_STATUS_OK, result.response.status())
-        << "Error: " << result.response.error_message();
+    ASSERT_EQ(QLResponsePB::YQL_STATUS_OK, result.response->status())
+        << "Error: " << result.response->error_message();
 
-    auto row_block = CreateRowBlock(QLClient::YQL_CLIENT_CQL, schema_, rows_data.ToBuffer());
+    auto row_block = qlexpr::CreateRowBlock(
+        QLClient::YQL_CLIENT_CQL, schema_, rows_data.ToBuffer());
     std::vector<std::string> results;
     for (const auto& row : row_block->rows()) {
       results.push_back(row.ToString());

@@ -15,9 +15,9 @@
 // specific language governing permissions and limitations
 // under the License.
 //
-// The following only applies to changes made to this file as part of YugaByte development.
+// The following only applies to changes made to this file as part of YugabyteDB development.
 //
-// Portions Copyright (c) YugaByte, Inc.
+// Portions Copyright (c) YugabyteDB, Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License"); you may not use this file except
 // in compliance with the License.  You may obtain a copy of the License at
@@ -35,6 +35,8 @@
 #include <functional>
 #include <string>
 #include <vector>
+
+#include "yb/common/entity_ids_types.h"
 
 #include "yb/gutil/macros.h"
 
@@ -66,6 +68,8 @@ class ExternalMiniClusterFsInspector {
   explicit ExternalMiniClusterFsInspector(ExternalMiniCluster* cluster);
   ~ExternalMiniClusterFsInspector();
 
+  Result<std::vector<std::string>> RecursivelyListFilesInDir(const std::string& path);
+  Status RecursivelyListFilesInDir(const std::string& path, std::vector<std::string>* entries);
   Status ListFilesInDir(const std::string& path, std::vector<std::string>* entries);
   size_t CountFilesInDir(const std::string& path);
   int CountWALSegmentsOnTS(size_t index);
@@ -76,6 +80,11 @@ class ExternalMiniClusterFsInspector {
   // List all of the tablets with tablet metadata on the given tablet server index.
   // This may include tablets that are tombstoned and not running.
   std::vector<std::string> ListTabletsOnTS(size_t index);
+
+  void TableWalDirsOnTS(size_t index,
+    std::function<void (const std::string&, const std::string&)> handler);
+  Result<std::vector<std::string>> ListTableWalFilesOnTS(size_t index, const TableId& table_id);
+  Result<std::vector<std::string>> ListTableSstFilesOnTS(size_t index, const TableId& table_id);
 
   // List all fs_data_roots with running tablets conut on the given tablet server index.
   std::unordered_map<std::string, std::vector<std::string>> DrivesOnTS(size_t index);

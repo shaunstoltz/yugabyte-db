@@ -15,9 +15,9 @@
 // specific language governing permissions and limitations
 // under the License.
 //
-// The following only applies to changes made to this file as part of YugaByte development.
+// The following only applies to changes made to this file as part of YugabyteDB development.
 //
-// Portions Copyright (c) YugaByte, Inc.
+// Portions Copyright (c) YugabyteDB, Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License"); you may not use this file except
 // in compliance with the License.  You may obtain a copy of the License at
@@ -32,6 +32,7 @@
 
 #include "yb/tools/ysck_remote.h"
 
+#include "yb/common/schema_pbutil.h"
 #include "yb/common/schema.h"
 #include "yb/common/wire_protocol.h"
 
@@ -56,10 +57,10 @@
 #include "yb/util/status_format.h"
 #include "yb/util/flags.h"
 
-DEFINE_UNKNOWN_bool(checksum_cache_blocks, false,
+DEFINE_NON_RUNTIME_bool(checksum_cache_blocks, false,
     "Should the checksum scanners cache the read blocks");
-DEFINE_UNKNOWN_int64(timeout_ms, 1000 * 60, "RPC timeout in milliseconds");
-DEFINE_UNKNOWN_int32(tablets_batch_size_max, 100,
+DEFINE_NON_RUNTIME_int64(timeout_ms, 1000 * 60, "RPC timeout in milliseconds");
+DEFINE_NON_RUNTIME_int32(tablets_batch_size_max, 100,
     "How many tablets to get from the Master per RPC");
 DECLARE_int64(outbound_rpc_block_size);
 DECLARE_int64(outbound_rpc_memory_limit);
@@ -77,7 +78,6 @@ using rpc::RpcController;
 using std::shared_ptr;
 using std::string;
 using std::vector;
-using strings::Substitute;
 using client::YBTableName;
 
 MonoDelta GetDefaultTimeout() {
@@ -283,6 +283,9 @@ Status RemoteYsckMaster::RetrieveTabletsList(const shared_ptr<YsckTable>& table)
   auto deadline = CoarseMonoClock::now() + 60s;
   while (more_tablets) {
     auto status = GetTabletsBatch(table->id(), table->name(), &last_key, &tablets, &more_tablets);
+    LOG_IF(INFO, !status.ok())
+        << "Failed to retrieve tablets list for: " << table->id() << "/" << table->name().ToString()
+        << ": " << status;
     if (status.IsTryAgain()) {
       if (CoarseMonoClock::now() >= deadline) {
         return status.CloneAndReplaceCode(Status::kTimedOut);

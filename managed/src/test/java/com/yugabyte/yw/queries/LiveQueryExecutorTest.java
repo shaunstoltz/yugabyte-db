@@ -1,5 +1,5 @@
 /*
- * Copyright 2021 YugaByte, Inc. and Contributors
+ * Copyright 2021 YugabyteDB, Inc. and Contributors
  *
  * Licensed under the Polyform Free Trial License 1.0.0 (the "License"); you
  * may not use this file except in compliance with the License. You
@@ -9,22 +9,22 @@
  */
 package com.yugabyte.yw.queries;
 
-import static org.hamcrest.MatcherAssert.assertThat;
 import static org.hamcrest.CoreMatchers.equalTo;
+import static org.hamcrest.MatcherAssert.assertThat;
 
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.node.ArrayNode;
 import com.fasterxml.jackson.databind.node.ObjectNode;
+import com.yugabyte.yw.common.ApiHelper;
 import com.yugabyte.yw.common.TestUtils;
 import com.yugabyte.yw.queries.QueryHelper.QueryApi;
 import org.junit.Before;
 import org.junit.Test;
 import org.mockito.Mock;
-import play.libs.ws.WSClient;
 
 public class LiveQueryExecutorTest {
 
-  @Mock WSClient mockClient;
+  @Mock ApiHelper mockClient;
   private LiveQueryExecutor liveQueryExecutor;
 
   @Before

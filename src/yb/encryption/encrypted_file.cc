@@ -1,4 +1,4 @@
-// Copyright (c) YugaByte, Inc.
+// Copyright (c) YugabyteDB, Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License"); you may not use this file except
 // in compliance with the License.  You may obtain a copy of the License at
@@ -37,6 +37,15 @@ Status EncryptedRandomAccessFile::Create(
   return CreateRandomAccessFile<EncryptedRandomAccessFile, uint8_t>(
       result, header_manager, std::move(underlying));
 }
+
+EncryptedRandomAccessFile::EncryptedRandomAccessFile(
+    std::unique_ptr<RandomAccessFile> file,
+    std::unique_ptr<BlockAccessCipherStream> stream,
+    uint64_t header_size)
+    : RandomAccessFileWrapper(std::move(file)), stream_(std::move(stream)),
+      header_size_(header_size) {}
+
+EncryptedRandomAccessFile::~EncryptedRandomAccessFile() = default;
 
 Status EncryptedRandomAccessFile::ReadInternal(
     uint64_t offset,

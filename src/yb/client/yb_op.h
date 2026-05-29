@@ -15,9 +15,9 @@
 // specific language governing permissions and limitations
 // under the License.
 //
-// The following only applies to changes made to this file as part of YugaByte development.
+// The following only applies to changes made to this file as part of YugabyteDB development.
 //
-// Portions Copyright (c) YugaByte, Inc.
+// Portions Copyright (c) YugabyteDB, Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License"); you may not use this file except
 // in compliance with the License.  You may obtain a copy of the License at
@@ -32,37 +32,30 @@
 #pragma once
 
 #include <memory>
+#include <optional>
 #include <string>
-
-#include <boost/optional.hpp>
 
 #include "yb/client/client_fwd.h"
 
 #include "yb/common/common_fwd.h"
 #include "yb/common/common_types.pb.h"
-#include "yb/common/partial_row.h"
+#include "yb/common/pgsql_protocol.pb.h"
+#include "yb/common/pgsql_protocol.messages.h"
+
+#include "yb/dockv/partial_row.h"
 #include "yb/common/read_hybrid_time.h"
 #include "yb/common/retryable_request.h"
 #include "yb/common/transaction.pb.h"
 
 #include "yb/docdb/docdb_fwd.h"
+#include "yb/dockv/partition.h"
 
 #include "yb/rpc/rpc_fwd.h"
 
+#include "yb/util/object_provider.h"
 #include "yb/util/ref_cnt_buffer.h"
 
-namespace yb {
-
-class RedisWriteRequestPB;
-class RedisReadRequestPB;
-class RedisResponsePB;
-
-class QLWriteRequestPB;
-class QLReadRequestPB;
-class QLResponsePB;
-class QLRowBlock;
-
-namespace client {
+namespace yb::client {
 
 namespace internal {
 class Batcher;
@@ -74,7 +67,7 @@ class YBSession;
 class YBStatusCallback;
 class YBTable;
 
-YB_DEFINE_ENUM(OpGroup, (kWrite)(kLeaderRead)(kConsistentPrefixRead));
+YB_DEFINE_ENUM(OpGroup, (kWrite)(kLock)(kUnlock)(kLeaderRead)(kConsistentPrefixRead));
 
 // A write or read operation operates on a single table and partial row.
 // The YBOperation class itself allows the batcher to get to the
@@ -99,21 +92,21 @@ class YBOperation {
     // Postgresql opcodes.
     PGSQL_WRITE = 8,
     PGSQL_READ = 9,
+    PGSQL_LOCK = 10,
   };
   virtual ~YBOperation();
 
-  std::shared_ptr<const YBTable> table() const { return table_; }
-  std::shared_ptr<YBTable> mutable_table() const { return table_; }
+  YBTableConstPtr table() const { return table_; }
+  YBTablePtr mutable_table() const { return table_; }
 
-  void ResetTable(std::shared_ptr<YBTable> new_table);
+  void ResetTable(const YBTablePtr& new_table);
 
   virtual std::string ToString() const = 0;
   virtual Type type() const = 0;
   virtual bool read_only() const = 0;
   virtual bool succeeded() const = 0;
-  virtual bool returns_sidecar() = 0;
 
-  virtual OpGroup group() {
+  virtual OpGroup group() const {
     return read_only() ? OpGroup::kLeaderRead : OpGroup::kWrite;
   }
 
@@ -121,7 +114,7 @@ class YBOperation {
     return succeeded();
   }
 
-  virtual bool should_add_intents(IsolationLevel isolation_level) {
+  virtual bool should_apply_intents(IsolationLevel isolation_level) {
     return !read_only() || isolation_level == IsolationLevel::SERIALIZABLE_ISOLATION;
   }
 
@@ -144,12 +137,8 @@ class YBOperation {
     request_id_ = id;
   }
 
-  std::optional<RetryableRequestId> min_running_request_id() const {
-    return min_running_request_id_;
-  }
-
-  void set_min_running_request_id(RetryableRequestId id) {
-    min_running_request_id_ = id;
+  void reset_request_id() {
+    request_id_.reset();
   }
 
   // Returns the partition key of the operation.
@@ -170,28 +159,26 @@ class YBOperation {
     partition_list_version_ = partition_list_version;
   }
 
-  boost::optional<PartitionListVersion> partition_list_version() const {
+  std::optional<PartitionListVersion> partition_list_version() const {
     return partition_list_version_;
   }
 
-  int64_t GetQueryId() const {
-    return reinterpret_cast<int64_t>(this);
-  }
+  int64_t GetQueryId() const { return reinterpret_cast<int64_t>(this); }
 
  protected:
-  explicit YBOperation(const std::shared_ptr<YBTable>& table);
+  explicit YBOperation(const YBTablePtr& table, const ThreadSafeArenaPtr& arena);
 
-  std::shared_ptr<YBTable> table_;
+  YBTablePtr table_;
+  ThreadSafeArenaPtr arena_;
 
  private:
-  friend class internal::AsyncRpc;
-
   scoped_refptr<internal::RemoteTablet> tablet_;
 
-  boost::optional<PartitionListVersion> partition_list_version_;
+  std::optional<PartitionListVersion> partition_list_version_;
 
+  // Persist retryable request ID across internal retries within the same YBSession
+  // to prevent duplicate writes due to internal retries.
   std::optional<RetryableRequestId> request_id_;
-  std::optional<RetryableRequestId> min_running_request_id_;
 
   DISALLOW_COPY_AND_ASSIGN(YBOperation);
 };
@@ -200,40 +187,73 @@ class YBOperation {
 // YBRedis Operators.
 //--------------------------------------------------------------------------------------------------
 
-class YBRedisOp : public YBOperation {
+template <class ResponsePB>
+class YBOperationBase : public YBOperation {
  public:
-  explicit YBRedisOp(const std::shared_ptr<YBTable>& table);
+  const ResponsePB& response() const {
+    EnsureResponse();
+    return *response_;
+  }
 
-  bool has_response() { return redis_response_ ? true : false; }
+  ResponsePB& response() {
+    EnsureResponse();
+    return *response_;
+  }
+
+  void set_response(const RefCntBuffer& data_holder, ResponsePB* response) {
+    LOG_IF(DFATAL, response_ != nullptr)
+        << "Response already present: " << AsString(*response_);
+    data_holder_ = data_holder;
+    response_ = response;
+  }
+
+  void ResetResponse() {
+    data_holder_.Reset();
+    response_ = nullptr;
+  }
+
+ protected:
+  explicit YBOperationBase(const YBTablePtr& table, const ThreadSafeArenaPtr& arena)
+      : YBOperation(table, arena) {}
+
+ private:
+  void EnsureResponse() const {
+    if (!response_) {
+      response_ = arena_->NewArenaObject<ResponsePB>();
+    }
+  }
+
+  RefCntBuffer data_holder_;
+  mutable ResponsePB* response_ = nullptr;
+};
+
+class YBRedisOp : public YBOperationBase<LWRedisResponsePB> {
+ public:
+  explicit YBRedisOp(const YBTablePtr& table);
+
   virtual size_t space_used_by_request() const = 0;
-
-  const RedisResponsePB& response() const;
-
-  RedisResponsePB* mutable_response();
 
   uint16_t hash_code() const { return hash_code_; }
 
-  // Redis does not use sidecars.
-  bool returns_sidecar() override { return false; }
-
-  virtual const std::string& GetKey() const = 0;
+  virtual std::string_view GetKey() const = 0;
 
  protected:
   uint16_t hash_code_ = 0;
-  std::unique_ptr<RedisResponsePB> redis_response_;
 };
 
 class YBRedisWriteOp : public YBRedisOp {
  public:
-  explicit YBRedisWriteOp(const std::shared_ptr<YBTable>& table);
+  explicit YBRedisWriteOp(const YBTablePtr& table);
 
   // Note: to avoid memory copy, this RedisWriteRequestPB is moved into tserver WriteRequestPB
   // when the request is sent to tserver. It is restored after response is received from tserver
   // (see WriteRpc's constructor).
-  const RedisWriteRequestPB& request() const { return *redis_write_request_; }
-  size_t space_used_by_request() const override;
+  const LWRedisWriteRequestPB& request() const { return *redis_write_request_; }
+  LWRedisWriteRequestPB& request() { return *redis_write_request_; }
 
-  RedisWriteRequestPB* mutable_request() { return redis_write_request_.get(); }
+  LWRedisWriteRequestPB* mutable_request() { return redis_write_request_; }
+
+  size_t space_used_by_request() const override;
 
   std::string ToString() const override;
 
@@ -243,31 +263,29 @@ class YBRedisWriteOp : public YBRedisOp {
   // Set the hash key in the WriteRequestPB.
   void SetHashCode(uint16_t hash_code) override;
 
-  const std::string& GetKey() const override;
+  std::string_view GetKey() const override;
 
   Status GetPartitionKey(std::string* partition_key) const override;
 
  protected:
-  virtual Type type() const override { return REDIS_WRITE; }
+  Type type() const override { return REDIS_WRITE; }
 
  private:
-  friend class YBTable;
-  std::unique_ptr<RedisWriteRequestPB> redis_write_request_;
-  std::unique_ptr<RedisResponsePB> redis_response_;
+  LWRedisWriteRequestPB* redis_write_request_;
 };
 
 
 class YBRedisReadOp : public YBRedisOp {
  public:
-  explicit YBRedisReadOp(const std::shared_ptr<YBTable>& table);
+  explicit YBRedisReadOp(const YBTablePtr& table);
 
   // Note: to avoid memory copy, this RedisReadRequestPB is moved into tserver ReadRequestPB
   // when the request is sent to tserver. It is restored after response is received from tserver
   // (see ReadRpc's constructor).
-  const RedisReadRequestPB& request() const { return *redis_read_request_; }
+  const LWRedisReadRequestPB& request() const { return *redis_read_request_; }
   size_t space_used_by_request() const override;
 
-  RedisReadRequestPB* mutable_request() { return redis_read_request_.get(); }
+  LWRedisReadRequestPB* mutable_request() { return redis_read_request_; }
 
   std::string ToString() const override;
 
@@ -277,30 +295,25 @@ class YBRedisReadOp : public YBRedisOp {
   // Set the hash key in the ReadRequestPB.
   void SetHashCode(uint16_t hash_code) override;
 
-  const std::string& GetKey() const override;
+  std::string_view GetKey() const override;
 
   Status GetPartitionKey(std::string* partition_key) const override;
 
  protected:
   Type type() const override { return REDIS_READ; }
-  OpGroup group() override;
+  OpGroup group() const override;
 
  private:
-  friend class YBTable;
-  std::unique_ptr<RedisReadRequestPB> redis_read_request_;
+  LWRedisReadRequestPB* redis_read_request_;
 };
 
 //--------------------------------------------------------------------------------------------------
 // YBCql Operators.
 //--------------------------------------------------------------------------------------------------
 
-class YBqlOp : public YBOperation {
+class YBqlOp : public YBOperationBase<LWQLResponsePB> {
  public:
   ~YBqlOp();
-
-  const QLResponsePB& response() const { return *ql_response_; }
-
-  QLResponsePB* mutable_response() { return ql_response_.get(); }
 
   const RefCntSlice& rows_data() { return rows_data_; }
 
@@ -311,28 +324,26 @@ class YBqlOp : public YBOperation {
   bool succeeded() const override;
 
  protected:
-  explicit YBqlOp(const std::shared_ptr<YBTable>& table);
-  std::unique_ptr<QLResponsePB> ql_response_;
+  YBqlOp(const YBTablePtr& table, const ThreadSafeArenaPtr& arena);
   RefCntSlice rows_data_;
 };
 
 class YBqlWriteOp : public YBqlOp {
  public:
-  explicit YBqlWriteOp(const std::shared_ptr<YBTable>& table);
+  YBqlWriteOp(
+      const YBTablePtr& table, const ThreadSafeArenaPtr& arena, LWQLWriteRequestPB* request);
   ~YBqlWriteOp();
 
   // Note: to avoid memory copy, this QLWriteRequestPB is moved into tserver WriteRequestPB
   // when the request is sent to tserver. It is restored after response is received from tserver
   // (see WriteRpc's constructor).
-  const QLWriteRequestPB& request() const { return *ql_write_request_; }
+  const LWQLWriteRequestPB& request() const { return *ql_write_request_; }
 
-  QLWriteRequestPB* mutable_request() { return ql_write_request_.get(); }
+  LWQLWriteRequestPB* mutable_request() { return ql_write_request_; }
 
   std::string ToString() const override;
 
   bool read_only() const override { return false; };
-
-  bool returns_sidecar() override;
 
   void SetHashCode(uint16_t hash_code) override;
 
@@ -362,10 +373,13 @@ class YBqlWriteOp : public YBqlOp {
 
  private:
   friend class YBTable;
-  static std::unique_ptr<YBqlWriteOp> NewInsert(const std::shared_ptr<YBTable>& table);
-  static std::unique_ptr<YBqlWriteOp> NewUpdate(const std::shared_ptr<YBTable>& table);
-  static std::unique_ptr<YBqlWriteOp> NewDelete(const std::shared_ptr<YBTable>& table);
-  std::unique_ptr<QLWriteRequestPB> ql_write_request_;
+  static std::unique_ptr<YBqlWriteOp> NewInsert(
+      const YBTablePtr& table, const ThreadSafeArenaPtr& arena);
+  static std::unique_ptr<YBqlWriteOp> NewUpdate(
+      const YBTablePtr& table, const ThreadSafeArenaPtr& arena);
+  static std::unique_ptr<YBqlWriteOp> NewDelete(
+      const YBTablePtr& table, const ThreadSafeArenaPtr& arena);
+  LWQLWriteRequestPB* ql_write_request_;
 
   // Does this operation write to the static or primary row?
   bool writes_static_row_ = false;
@@ -389,20 +403,19 @@ class YBqlReadOp : public YBqlOp {
  public:
   ~YBqlReadOp();
 
-  static std::unique_ptr<YBqlReadOp> NewSelect(const std::shared_ptr<YBTable>& table);
+  static std::unique_ptr<YBqlReadOp> NewSelect(
+      const YBTablePtr& table, const ThreadSafeArenaPtr& arena);
 
   // Note: to avoid memory copy, this QLReadRequestPB is moved into tserver ReadRequestPB
   // when the request is sent to tserver. It is restored after response is received from tserver
   // (see ReadRpc's constructor).
-  const QLReadRequestPB& request() const { return *ql_read_request_; }
+  const LWQLReadRequestPB& request() const { return *ql_read_request_; }
 
-  QLReadRequestPB* mutable_request() { return ql_read_request_.get(); }
+  LWQLReadRequestPB* mutable_request() { return ql_read_request_; }
 
   std::string ToString() const override;
 
   bool read_only() const override { return true; };
-
-  bool returns_sidecar() override { return true; }
 
   void SetHashCode(uint16_t hash_code) override;
 
@@ -419,86 +432,85 @@ class YBqlReadOp : public YBqlOp {
   }
 
   std::vector<ColumnSchema> MakeColumnSchemasFromRequest() const;
-  Result<QLRowBlock> MakeRowBlock() const;
+  Result<qlexpr::QLRowBlock> MakeRowBlock() const;
 
   const ReadHybridTime& read_time() const { return read_time_; }
   void SetReadTime(const ReadHybridTime& value) { read_time_ = value; }
 
  protected:
   Type type() const override { return QL_READ; }
-  OpGroup group() override;
+  OpGroup group() const override;
 
  private:
   friend class YBTable;
-  explicit YBqlReadOp(const std::shared_ptr<YBTable>& table);
-  std::unique_ptr<QLReadRequestPB> ql_read_request_;
+  YBqlReadOp(
+      const YBTablePtr& table, const ThreadSafeArenaPtr& arena, LWQLReadRequestPB* request);
+  LWQLReadRequestPB* ql_read_request_;
   YBConsistencyLevel yb_consistency_level_;
   ReadHybridTime read_time_;
 };
 
 std::vector<ColumnSchema> MakeColumnSchemasFromColDesc(
-  const google::protobuf::RepeatedPtrField<QLRSColDescPB>& rscol_descs);
+    const google::protobuf::RepeatedPtrField<QLRSColDescPB>& rscol_descs);
+std::vector<ColumnSchema> MakeColumnSchemasFromColDesc(
+    const ArenaList<LWQLRSColDescPB>& rscol_descs);
 
 //--------------------------------------------------------------------------------------------------
 // YB Postgresql Operators.
 //--------------------------------------------------------------------------------------------------
 
-class YBPgsqlOp : public YBOperation {
+class YBPgsqlOp : public YBOperationBase<LWPgsqlResponsePB> {
  public:
-  YBPgsqlOp(
-      const std::shared_ptr<YBTable>& table, rpc::Sidecars* sidecars);
-  ~YBPgsqlOp();
-
-  const PgsqlResponsePB& response() const { return *response_; }
-
-  PgsqlResponsePB* mutable_response() { return response_.get(); }
 
   bool succeeded() const override;
 
   bool applied() override;
 
-  void SetSidecarIndex(size_t idx) {
-    sidecar_index_ = idx;
-  }
-
-  bool has_sidecar() const {
-    return sidecar_index_ != -1;
-  }
-
-  size_t sidecar_index() const {
-    return sidecar_index_;
-  }
-
-  rpc::Sidecars& sidecars() const {
-    return sidecars_;
-  }
+  virtual std::optional<size_t> sidecar_index() const { return std::nullopt; }
 
  protected:
-  std::unique_ptr<PgsqlResponsePB> response_;
+  YBPgsqlOp(const YBTablePtr& table, const ThreadSafeArenaPtr& arena);
+};
+
+class YBPgsqlOpSidecarBase : public YBPgsqlOp {
+ public:
+  std::optional<size_t> sidecar_index() const override {
+      return sidecar_index_ < 0 ? std::nullopt : std::optional<size_t>(sidecar_index_);
+  }
+
+  void SetSidecarIndex(size_t idx) { sidecar_index_ = idx; }
+
+  rpc::Sidecars& sidecars() const { return sidecars_; }
+
+ protected:
+  YBPgsqlOpSidecarBase(
+      const YBTablePtr& table, const ThreadSafeArenaPtr& arena, rpc::Sidecars& sidecars);
+
+ private:
   int64_t sidecar_index_ = -1;
   rpc::Sidecars& sidecars_;
 };
 
-class YBPgsqlWriteOp : public YBPgsqlOp {
+class YBPgsqlWriteOp : public YBPgsqlOpSidecarBase {
  public:
   YBPgsqlWriteOp(
-      const std::shared_ptr<YBTable>& table, rpc::Sidecars* sidecars,
-      PgsqlWriteRequestPB* request = nullptr);
-  ~YBPgsqlWriteOp();
+      const YBTablePtr& table, const ThreadSafeArenaPtr& arena, rpc::Sidecars& sidecars,
+      LWPgsqlWriteRequestPB* request = nullptr);
 
   // Note: to avoid memory copy, this PgsqlWriteRequestPB is moved into tserver WriteRequestPB
   // when the request is sent to tserver. It is restored after response is received from tserver
   // (see WriteRpc's constructor).
-  const PgsqlWriteRequestPB& request() const { return *request_; }
+  const LWPgsqlWriteRequestPB& request() const { return *request_; }
 
-  PgsqlWriteRequestPB* mutable_request() { return request_; }
+  LWPgsqlWriteRequestPB* mutable_request() { return request_; }
 
   std::string ToString() const override;
 
   bool read_only() const override { return false; };
 
-  // TODO check for e.g. returning clause.
-  bool returns_sidecar() override { return true; }
+  bool skip_intents() const {
+    return request_->skip_intents_write();
+  }
 
   void SetHashCode(uint16_t hash_code) override;
 
@@ -509,48 +521,56 @@ class YBPgsqlWriteOp : public YBPgsqlOp {
   const HybridTime& write_time() const { return write_time_; }
   void SetWriteTime(const HybridTime& value) { write_time_ = value; }
 
+  uint32_t XreplOriginId() const { return xrepl_origin_id_; }
+  void SetXreplOriginId(uint32_t value) { xrepl_origin_id_ = value; }
+
   Status GetPartitionKey(std::string* partition_key) const override;
 
-  static YBPgsqlWriteOpPtr NewInsert(const YBTablePtr& table, rpc::Sidecars* sidecars);
-  static YBPgsqlWriteOpPtr NewUpdate(const YBTablePtr& table, rpc::Sidecars* sidecars);
-  static YBPgsqlWriteOpPtr NewDelete(const YBTablePtr& table, rpc::Sidecars* sidecars);
-  static YBPgsqlWriteOpPtr NewFetchSequence(const YBTablePtr& table, rpc::Sidecars* sidecars);
+  static YBPgsqlWriteOpPtr NewInsert(
+      const YBTablePtr& table, const ThreadSafeArenaPtr& arena, rpc::Sidecars* sidecars);
+  static YBPgsqlWriteOpPtr NewUpdate(
+      const YBTablePtr& table, const ThreadSafeArenaPtr& arena, rpc::Sidecars* sidecars);
+  static YBPgsqlWriteOpPtr NewDelete(
+      const YBTablePtr& table, const ThreadSafeArenaPtr& arena, rpc::Sidecars* sidecars);
+  static YBPgsqlWriteOpPtr NewFetchSequence(
+      const YBTablePtr& table, const ThreadSafeArenaPtr& arena, rpc::Sidecars* sidecars);
 
  protected:
-  virtual Type type() const override { return PGSQL_WRITE; }
+  Type type() const override { return PGSQL_WRITE; }
 
  private:
-  friend class YBTable;
-
-  PgsqlWriteRequestPB* request_;
-  std::unique_ptr<PgsqlWriteRequestPB> request_holder_;
+  LWPgsqlWriteRequestPB* request_;
+  bool own_request_;
   // Whether this operation should be run as a single row txn.
   // Else could be distributed transaction (or non-transactional) depending on target table type.
   bool is_single_row_txn_ = false;
   HybridTime write_time_;
+  uint32_t xrepl_origin_id_ = 0;
 };
 
-class YBPgsqlReadOp : public YBPgsqlOp {
+class YBPgsqlReadOp : public YBPgsqlOpSidecarBase {
  public:
   YBPgsqlReadOp(
-      const std::shared_ptr<YBTable>& table, rpc::Sidecars* sidecars,
-      PgsqlReadRequestPB* request = nullptr);
+      const YBTablePtr& table, const ThreadSafeArenaPtr& arena, rpc::Sidecars& sidecars,
+      LWPgsqlReadRequestPB* request = nullptr);
 
   static YBPgsqlReadOpPtr NewSelect(
-      const std::shared_ptr<YBTable>& table, rpc::Sidecars* sidecars);
+      const YBTablePtr& table, const ThreadSafeArenaPtr& arena, rpc::Sidecars* sidecars);
 
   // Note: to avoid memory copy, this PgsqlReadRequestPB is moved into tserver ReadRequestPB
   // when the request is sent to tserver. It is restored after response is received from tserver
   // (see ReadRpc's constructor).
-  const PgsqlReadRequestPB& request() const { return *request_; }
+  const LWPgsqlReadRequestPB& request() const { return *request_; }
 
-  PgsqlReadRequestPB* mutable_request() { return request_; }
+  LWPgsqlReadRequestPB* mutable_request() { return request_; }
 
   std::string ToString() const override;
 
   bool read_only() const override { return true; };
 
-  bool returns_sidecar() override { return true; }
+  bool skip_intents() const {
+    return request_->skip_intents_read();
+  }
 
   void SetHashCode(uint16_t hash_code) override;
 
@@ -564,26 +584,46 @@ class YBPgsqlReadOp : public YBPgsqlOp {
 
   std::vector<ColumnSchema> MakeColumnSchemasFromRequest() const;
 
-  static std::vector<ColumnSchema> MakeColumnSchemasFromColDesc(
-      const google::protobuf::RepeatedPtrField<PgsqlRSColDescPB>& rscol_descs);
-
-  bool should_add_intents(IsolationLevel isolation_level) override;
-  void SetUsedReadTime(const ReadHybridTime& used_time);
+  bool should_apply_intents(IsolationLevel isolation_level) override;
+  void SetUsedReadTime(const ReadHybridTime& used_time, const TabletId& tablet);
   const ReadHybridTime& used_read_time() const { return used_read_time_; }
+  const TabletId& used_tablet() const { return used_tablet_; }
 
   Status GetPartitionKey(std::string* partition_key) const override;
 
  protected:
-  virtual Type type() const override { return PGSQL_READ; }
-  OpGroup group() override;
+  Type type() const override { return PGSQL_READ; }
+  OpGroup group() const override;
 
  private:
-  friend class YBTable;
-
-  PgsqlReadRequestPB* request_;
-  std::unique_ptr<PgsqlReadRequestPB> request_holder_;
+  LWPgsqlReadRequestPB* request_;
+  bool own_request_;
   YBConsistencyLevel yb_consistency_level_ = YBConsistencyLevel::STRONG;
   ReadHybridTime used_read_time_;
+  // The tablet that served this operation.
+  TabletId used_tablet_;
+};
+
+class YBPgsqlLockOp : public YBPgsqlOp {
+ public:
+  explicit YBPgsqlLockOp(const YBTablePtr& table);
+
+  bool read_only() const override { return false; };
+  std::string ToString() const override;
+
+  void SetHashCode(uint16_t hash_code) override;
+  Status GetPartitionKey(std::string* partition_key) const override;
+
+  LWPgsqlLockRequestPB* mutable_request() { return &request_; }
+
+  static YBPgsqlLockOpPtr NewLock(const YBTablePtr& table);
+  static YBPgsqlLockOpPtr NewUnlock(const YBTablePtr& table);
+
+ private:
+  Type type() const override { return PGSQL_LOCK; }
+  OpGroup group() const override;
+
+  LWPgsqlLockRequestPB& request_;
 };
 
 // This class is not thread-safe, though different YBNoOp objects on
@@ -592,40 +632,48 @@ class YBNoOp {
  public:
   // Initialize the NoOp request object. The given 'table' object must remain valid
   // for the lifetime of this object.
-  explicit YBNoOp(const std::shared_ptr<YBTable>& table);
+  explicit YBNoOp(const YBTablePtr& table);
 
   // Executes a no-op request against the tablet server on which the row specified
   // by "key" lives.
-  Status Execute(YBClient* client, const YBPartialRow& key);
+  Status Execute(YBClient* client, const dockv::YBPartialRow& key);
  private:
-  const std::shared_ptr<YBTable> table_;
+  const YBTablePtr table_;
 
   DISALLOW_COPY_AND_ASSIGN(YBNoOp);
 };
 
 Status InitPartitionKey(
-    const Schema& schema, const PartitionSchema& partition_schema,
+    const Schema& schema, const dockv::PartitionSchema& partition_schema,
     const TablePartitionList& partitions, LWPgsqlReadRequestPB* request);
 
 Status InitPartitionKey(
-    const Schema& schema, const PartitionSchema& partition_schema, LWPgsqlWriteRequestPB* request);
+    const Schema& schema, const dockv::PartitionSchema& partition_schema,
+    LWPgsqlWriteRequestPB* request);
 
 Status GetRangePartitionBounds(
     const Schema& schema,
     const PgsqlReadRequestPB& request,
-    std::vector<docdb::KeyEntryValue>* lower_bound,
-    std::vector<docdb::KeyEntryValue>* upper_bound);
+    dockv::KeyEntryValues* lower_bound,
+    dockv::KeyEntryValues* upper_bound);
 
 Status GetRangePartitionBounds(
     const Schema& schema,
     const LWPgsqlReadRequestPB& request,
-    std::vector<docdb::KeyEntryValue>* lower_bound,
-    std::vector<docdb::KeyEntryValue>* upper_bound);
+    dockv::KeyEntryValues* lower_bound,
+    dockv::KeyEntryValues* upper_bound);
 
 bool IsTolerantToPartitionsChange(const YBOperation& op);
 
 Result<const PartitionKey&> TEST_FindPartitionKeyByUpperBound(
     const TablePartitionList& partitions, const PgsqlReadRequestPB& request);
 
-}  // namespace client
-}  // namespace yb
+template <typename Req>
+inline bool AreBoundsHashCode(const Req& request) {
+  return (request.has_lower_bound() &&
+          dockv::PartitionSchema::IsValidHashPartitionKeyBound(request.lower_bound().key())) ||
+         (request.has_upper_bound() &&
+          dockv::PartitionSchema::IsValidHashPartitionKeyBound(request.upper_bound().key()));
+}
+
+}  // namespace yb::client

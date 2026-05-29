@@ -1,6 +1,6 @@
 #!/usr/bin/env python
 #
-# Copyright 2019 YugaByte, Inc. and Contributors
+# Copyright 2019 YugabyteDB, Inc. and Contributors
 #
 # Licensed under the Polyform Free Trial License 1.0.0 (the "License"); you
 # may not use this file except in compliance with the License. You
@@ -17,13 +17,13 @@ from ybops.cloud.aws.method import AwsProvisionInstancesMethod, AwsCreateInstanc
     AwsDeleteDnsEntryMethod, AwsListDnsEntryMethod, AwsTagsMethod, AwsPauseInstancesMethod, \
     AwsResumeInstancesMethod, AwsCreateRootVolumesMethod, AwsReplaceRootVolumeMethod, \
     AwsChangeInstanceTypeMethod, AwsUpdateMountedDisksMethod, AwsQueryImageMethod, \
-    AwsDeleteRootVolumesMethod, AwsHardRebootInstancesMethod
+    AwsDeleteRootVolumesMethod, AwsHardRebootInstancesMethod, AwsUpdateDiskMethod, \
+    AwsQueryDeviceNames
 from ybops.cloud.common.command import InstanceCommand, NetworkCommand, AccessCommand, \
     QueryCommand, DnsCommand
-from ybops.cloud.common.method import ConfigureInstancesMethod, AccessCreateVaultMethod, \
-    InitYSQLMethod, UpdateDiskMethod, CronCheckMethod, AccessEditVaultMethod, \
-    TransferXClusterCerts, VerifySSHConnection, AddAuthorizedKey, RemoveAuthorizedKey, \
-    RebootInstancesMethod, RunHooks, WaitForSSHConnection
+from ybops.cloud.common.method import ConfigureInstancesMethod, InitYSQLMethod, CronCheckMethod, \
+    TransferXClusterCerts, VerifySSHConnection, RebootInstancesMethod, RunHooks, \
+    WaitForConnection, ManageOtelCollector
 
 
 class AwsInstanceCommand(InstanceCommand):
@@ -40,7 +40,7 @@ class AwsInstanceCommand(InstanceCommand):
         self.add_method(ConfigureInstancesMethod(self))
         self.add_method(AwsTagsMethod(self))
         self.add_method(InitYSQLMethod(self))
-        self.add_method(UpdateDiskMethod(self))
+        self.add_method(AwsUpdateDiskMethod(self))
         self.add_method(AwsUpdateMountedDisksMethod(self))
         self.add_method(CronCheckMethod(self))
         self.add_method(AwsPauseInstancesMethod(self))
@@ -51,12 +51,11 @@ class AwsInstanceCommand(InstanceCommand):
         self.add_method(AwsChangeInstanceTypeMethod(self))
         self.add_method(TransferXClusterCerts(self))
         self.add_method(VerifySSHConnection(self))
-        self.add_method(AddAuthorizedKey(self))
-        self.add_method(RemoveAuthorizedKey(self))
         self.add_method(RebootInstancesMethod(self))
         self.add_method(RunHooks(self))
-        self.add_method(WaitForSSHConnection(self))
+        self.add_method(WaitForConnection(self))
         self.add_method(AwsHardRebootInstancesMethod(self))
+        self.add_method(ManageOtelCollector(self))
 
 
 class AwsNetworkCommand(NetworkCommand):
@@ -76,8 +75,6 @@ class AwsAccessCommand(AccessCommand):
     def add_methods(self):
         self.add_method(AwsAccessAddKeyMethod(self))
         self.add_method(AwsAccessListKeysMethod(self))
-        self.add_method(AccessCreateVaultMethod(self))
-        self.add_method(AccessEditVaultMethod(self))
         self.add_method(AwsAccessDeleteKeyMethod(self))
 
 
@@ -93,6 +90,7 @@ class AwsQueryCommand(QueryCommand):
         self.add_method(AwsQueryVPCMethod(self))
         self.add_method(AwsQuerySpotPricingMethod(self))
         self.add_method(AwsQueryImageMethod(self))
+        self.add_method(AwsQueryDeviceNames(self))
 
 
 class AwsDnsCommand(DnsCommand):

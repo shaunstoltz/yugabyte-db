@@ -1,23 +1,26 @@
-// Copyright (c) YugaByte, Inc.
+// Copyright (c) YugabyteDB, Inc.
 
 package com.yugabyte.yw.common;
 
-import com.google.common.collect.ArrayListMultimap;
 import com.google.common.collect.Multimap;
+import com.google.common.collect.Multimaps;
 import com.google.inject.Inject;
+import com.yugabyte.yw.commissioner.Commissioner;
 import com.yugabyte.yw.commissioner.ITask;
 import com.yugabyte.yw.commissioner.tasks.params.IProviderTaskParams;
-import com.yugabyte.yw.common.config.RuntimeConfigFactory;
+import com.yugabyte.yw.common.concurrent.KeyLock;
+import com.yugabyte.yw.common.config.GlobalConfKeys;
+import com.yugabyte.yw.common.config.RuntimeConfGetter;
 import com.yugabyte.yw.forms.ITaskParams;
 import com.yugabyte.yw.forms.UniverseDefinitionTaskParams;
 import com.yugabyte.yw.forms.UniverseTaskParams;
+import com.yugabyte.yw.models.ScheduleTask;
 import com.yugabyte.yw.models.TaskInfo;
 import com.yugabyte.yw.models.Universe;
 import java.util.ArrayList;
 import java.util.Collection;
 import java.util.Collections;
 import java.util.EnumSet;
-import java.util.HashMap;
 import java.util.HashSet;
 import java.util.Map;
 import java.util.Optional;
@@ -25,36 +28,36 @@ import java.util.Set;
 import java.util.TreeSet;
 import java.util.UUID;
 import java.util.concurrent.ConcurrentHashMap;
-import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicReference;
-import java.util.concurrent.locks.Lock;
-import java.util.concurrent.locks.ReentrantLock;
 import java.util.function.Supplier;
+import java.util.stream.Collectors;
 import javax.inject.Singleton;
 import lombok.extern.slf4j.Slf4j;
+import org.slf4j.MDC;
 import play.mvc.Http;
 
 @Singleton
 @Slf4j
 public class ProviderEditRestrictionManager {
-  public static final String EDIT_PROVIDER_NEW_ENABLED_KEY = "yb.edit_provider.new.enabled";
+
   private static final long PROVIDER_LOCK_TIMEOUT_MILLIS = 30_000;
   private static final EnumSet<TaskInfo.State> ACTIVE_STATES =
       EnumSet.of(TaskInfo.State.Initializing, TaskInfo.State.Running, TaskInfo.State.Created);
 
-  private final RuntimeConfigFactory runtimeConfigFactory;
-  private final Map<UUID, ReentrantLock> providerLocks = new ConcurrentHashMap<>();
-  private final Map<UUID, UUID> editTaskIdByProvider = new HashMap<>();
-  private final Multimap<UUID, UUID> useTaskIdsByProvider = ArrayListMultimap.create();
+  private final RuntimeConfGetter runtimeConfGetter;
+  private final KeyLock<UUID> providerLocks = new KeyLock<>();
+  private final Map<UUID, UUID> editTaskIdByProvider = new ConcurrentHashMap<>();
+  private final Multimap<UUID, UUID> inUseTaskIdsByProvider =
+      Multimaps.newSetMultimap(new ConcurrentHashMap<>(), ConcurrentHashMap::newKeySet);
   private final Map<UUID, Collection<UUID>> providersByTask = new ConcurrentHashMap<>();
 
   @Inject
-  public ProviderEditRestrictionManager(RuntimeConfigFactory runtimeConfigFactory) {
-    this.runtimeConfigFactory = runtimeConfigFactory;
+  public ProviderEditRestrictionManager(RuntimeConfGetter runtimeConfGetter) {
+    this.runtimeConfGetter = runtimeConfGetter;
   }
 
   public void onTaskCreated(UUID taskId, ITask task, ITaskParams params) {
-    log.debug("On task created {}  params {} ", taskId, params.getClass());
+    log.debug("On task created {} params {} ", taskId, params.getClass());
     if (!isEnabled()) {
       return;
     }
@@ -77,13 +80,13 @@ public class ProviderEditRestrictionManager {
 
   protected Set<UUID> getProviderUUIDsToUse(UUID taskId, ITask task, ITaskParams params) {
     if (params instanceof UniverseTaskParams) {
-      UUID universeUUID = ((UniverseTaskParams) params).universeUUID;
+      UUID universeUUID = ((UniverseTaskParams) params).getUniverseUUID();
       Set<UUID> providerUUIDs = new HashSet<>();
       try {
         Universe universe = Universe.getOrBadRequest(universeUUID);
         for (UniverseDefinitionTaskParams.Cluster cluster :
             universe.getUniverseDetails().clusters) {
-          providerUUIDs.add(UUID.fromString(cluster.userIntent.provider));
+          providerUUIDs.addAll(cluster.userIntent.getAllProviderUUIDs());
         }
       } catch (Exception e) {
         log.error("Cannot find universe for id " + universeUUID);
@@ -116,7 +119,7 @@ public class ProviderEditRestrictionManager {
             providerUUID,
             () -> {
               if (!editTaskIdByProvider.remove(providerUUID, taskID)) {
-                useTaskIdsByProvider.remove(providerUUID, taskID);
+                inUseTaskIdsByProvider.remove(providerUUID, taskID);
               }
             });
       }
@@ -143,11 +146,36 @@ public class ProviderEditRestrictionManager {
     doInProviderLock(
         providerUUID,
         () -> {
-          verifyNotUnderEdit(providerUUID);
-          verifyNotUsed(providerUUID);
+          String probableTaskIdStr = MDC.get(Commissioner.TASK_ID);
+          if (probableTaskIdStr != null && editTaskIdByProvider.get(providerUUID) != null) {
+            UUID currentTaskId = editTaskIdByProvider.get(providerUUID);
+            UUID taskId = UUID.fromString(probableTaskIdStr);
+            if (!taskId.equals(currentTaskId)) {
+              throw new PlatformServiceException(
+                  Http.Status.CONFLICT,
+                  "Provider "
+                      + providerUUID
+                      + " resources are currently in use by task "
+                      + currentTaskId);
+            }
+          } else {
+            verifyNotUnderEdit(providerUUID);
+            verifyNotUsed(providerUUID, false);
+          }
           result.set(action.get());
         });
     return result.get();
+  }
+
+  public Collection<UUID> getTasksInUse(UUID providerUUID) {
+    log.debug("Get tasks in use for {}", providerUUID);
+    final Set<UUID> result = new HashSet<>();
+    doInProviderLock(
+        providerUUID,
+        () -> {
+          result.addAll(inUseTaskIdsByProvider.get(providerUUID));
+        });
+    return result;
   }
 
   private void tryEditProviderWithTask(UUID providerUUID, UUID taskID) {
@@ -156,7 +184,7 @@ public class ProviderEditRestrictionManager {
         providerUUID,
         () -> {
           verifyNotUnderEdit(providerUUID);
-          verifyNotUsed(providerUUID);
+          verifyNotUsed(providerUUID, isAllowAutoTasksBeforeEdit());
           log.debug("Edit provider {} with task {} ", providerUUID, taskID);
           editTaskIdByProvider.put(providerUUID, taskID);
         });
@@ -169,23 +197,32 @@ public class ProviderEditRestrictionManager {
         () -> {
           verifyNotUnderEdit(providerUUID);
           log.debug("Use provider {} with task {} ", providerUUID, taskID);
-          useTaskIdsByProvider.put(providerUUID, taskID);
+          inUseTaskIdsByProvider.put(providerUUID, taskID);
         });
   }
 
-  private void verifyNotUsed(UUID providerUUID) {
-    if (!useTaskIdsByProvider.get(providerUUID).isEmpty()) {
-      throw new PlatformServiceException(
-          Http.Status.SERVICE_UNAVAILABLE,
-          "Provider " + providerUUID + " resources are currently in use");
+  private void verifyNotUsed(UUID providerUUID, boolean allowAutoTasks) {
+    Collection<UUID> taskUUIDs = inUseTaskIdsByProvider.get(providerUUID);
+    if (allowAutoTasks) {
+      taskUUIDs = filterUserStartedTasks(taskUUIDs);
     }
+    if (!taskUUIDs.isEmpty()) {
+      throw new PlatformServiceException(
+          Http.Status.CONFLICT, "Provider " + providerUUID + " resources are currently in use");
+    }
+  }
+
+  private Collection<UUID> filterUserStartedTasks(Collection<UUID> taskUUIDs) {
+    return taskUUIDs.stream()
+        .filter(uuid -> ScheduleTask.fetchByTaskUUID(uuid) == null)
+        .collect(Collectors.toList());
   }
 
   private void verifyNotUnderEdit(UUID providerUUID) {
     UUID editTaskUUID = editTaskIdByProvider.get(providerUUID);
     if (editTaskUUID != null) {
       throw new PlatformServiceException(
-          Http.Status.SERVICE_UNAVAILABLE,
+          Http.Status.CONFLICT,
           "Provider " + providerUUID + " is currently edited by task " + editTaskUUID);
     }
   }
@@ -194,9 +231,9 @@ public class ProviderEditRestrictionManager {
     editTaskIdByProvider.compute(
         providerUUID,
         (key, editTaskUUID) -> checkIfTaskIsActive(editTaskUUID) ? editTaskUUID : null);
-    for (UUID taskUUID : new ArrayList<>(useTaskIdsByProvider.get(providerUUID))) {
+    for (UUID taskUUID : new ArrayList<>(inUseTaskIdsByProvider.get(providerUUID))) {
       if (!checkIfTaskIsActive(taskUUID)) {
-        useTaskIdsByProvider.remove(providerUUID, taskUUID);
+        inUseTaskIdsByProvider.remove(providerUUID, taskUUID);
       }
     }
   }
@@ -204,41 +241,35 @@ public class ProviderEditRestrictionManager {
   private void doInProviderLock(UUID providerUUID, Runnable runnable) {
     log.debug(
         "Trying to do provider {} lock with timeout {}", providerUUID, getLockTimeoutMillis());
-    Lock providerLock = getProviderLock(providerUUID);
-    boolean locked = false;
-    try {
-      locked = providerLock.tryLock(getLockTimeoutMillis(), TimeUnit.MILLISECONDS);
-    } catch (InterruptedException e) {
-      log.warn("Interrupted while waiting for lock", e);
-    }
+    boolean locked = providerLocks.tryLock(providerUUID);
     if (!locked) {
       throw new PlatformServiceException(
-          Http.Status.SERVICE_UNAVAILABLE, "Unable to lock provider " + providerUUID);
+          Http.Status.CONFLICT, "Unable to lock provider " + providerUUID);
     }
     try {
       log.debug("Locked {} provider", providerUUID);
       garbageCollectTasks(providerUUID);
       runnable.run();
     } finally {
-      providerLock.unlock();
+      providerLocks.releaseLock(providerUUID);
       log.debug("Released provider {} lock", providerUUID);
     }
-  }
-
-  private Lock getProviderLock(UUID providerUUID) {
-    return providerLocks.computeIfAbsent(providerUUID, (pid) -> new ReentrantLock());
   }
 
   private boolean checkIfTaskIsActive(UUID taskUUID) {
     if (taskUUID == null) {
       return false;
     }
-    TaskInfo taskInfo = TaskInfo.get(taskUUID); // Don't need exception if no task.
-    return taskInfo != null && ACTIVE_STATES.contains(taskInfo.getTaskState());
+    Optional<TaskInfo> optional = TaskInfo.maybeGet(taskUUID);
+    return optional.isPresent() && ACTIVE_STATES.contains(optional.get().getTaskState());
   }
 
   protected boolean isEnabled() {
-    return runtimeConfigFactory.globalRuntimeConf().getBoolean(EDIT_PROVIDER_NEW_ENABLED_KEY);
+    return true;
+  }
+
+  public boolean isAllowAutoTasksBeforeEdit() {
+    return runtimeConfGetter.getGlobalConf(GlobalConfKeys.editProviderWaitForTasks);
   }
 
   protected long getLockTimeoutMillis() {

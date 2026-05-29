@@ -3,6 +3,9 @@ title: Export and import for YCQL
 headerTitle: Export and import
 linkTitle: Export and import
 description: Export and import for YCQL
+aliases:
+  - /stable/manage/backup-restore/back-up-data-ycql/
+  - /stable/manage/backup-restore/restore-data-ycql/
 menu:
   stable:
     identifier: export-import-data-ycql
@@ -26,7 +29,7 @@ type: docs
   </li>
 </ul>
 
-You use the `ycqlsh` script to export and import YCQL data. For details on how to use the script to connect to a YugabyteDB cluster, as well as the full list of available options, see [ycqlsh reference](../../../admin/ycqlsh/).
+You use the ycqlsh script to export and import YCQL data. For details on how to use the script to connect to a YugabyteDB cluster, as well as the full list of available options, see [ycqlsh reference](../../../api/ycqlsh/).
 
 ## Export schema
 

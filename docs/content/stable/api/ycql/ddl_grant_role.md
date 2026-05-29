@@ -4,9 +4,12 @@ headerTitle: GRANT ROLE
 linkTitle: GRANT ROLE
 description: Use the GRANT ROLE statement to grant a role's permissions and SUPERUSER status to another role.
 menu:
-  stable:
+  stable_api:
     parent: api-cassandra
     weight: 1282
+aliases:
+  - /stable/api/cassandra/ddl_grant_role
+  - /stable/api/ycql/ddl_grant_role
 type: docs
 ---
 
@@ -16,7 +19,7 @@ Use the `GRANT ROLE` statement to grant a role's permissions and SUPERUSER statu
 
 Granted roles form an acyclic graph, in other words, a role cannot be granted to any of the roles granted to it either directly or indirectly. For example, if A is granted to B, and B granted to C, C cannot be granted to neither A, B, nor C.
 
-This statement is enabled by setting the YB-TServer flag [`--use_cassandra_authentication`](../../../reference/configuration/yb-tserver/#config-flags) to `true`.
+This statement is enabled by setting the YB-TServer flag [--use_cassandra_authentication](../../../reference/configuration/yb-tserver/#ycql) to `true`.
 
 ## Syntax
 

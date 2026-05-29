@@ -15,9 +15,9 @@
 // specific language governing permissions and limitations
 // under the License.
 //
-// The following only applies to changes made to this file as part of YugaByte development.
+// The following only applies to changes made to this file as part of YugabyteDB development.
 //
-// Portions Copyright (c) YugaByte, Inc.
+// Portions Copyright (c) YugabyteDB, Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License"); you may not use this file except
 // in compliance with the License.  You may obtain a copy of the License at
@@ -30,11 +30,12 @@
 // under the License.
 //
 
+#include "yb/common/opid.h"
+#include "yb/common/opid.pb.h"
+
 #include "yb/consensus/log_index.h"
 #include "yb/consensus/opid_util.h"
 
-#include "yb/util/opid.h"
-#include "yb/util/opid.pb.h"
 #include "yb/util/test_util.h"
 
 namespace yb {

@@ -1,5 +1,5 @@
 //--------------------------------------------------------------------------------------------------
-// Copyright (c) YugaByte, Inc.
+// Copyright (c) YugabyteDB, Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License"); you may not use this file except
 // in compliance with the License.  You may obtain a copy of the License at
@@ -17,13 +17,15 @@
 
 #pragma once
 
-#include "yb/common/partition.h"
 #include "yb/common/pg_types.h"
 #include "yb/common/pgsql_protocol.messages.h"
 #include "yb/common/schema.h"
 
 #include "yb/client/table.h"
 #include "yb/client/yb_table_name.h"
+
+#include "yb/dockv/partition.h"
+#include "yb/dockv/schema_packing.h"
 
 #include "yb/master/master_ddl.pb.h"
 
@@ -39,18 +41,23 @@ class PgClient;
 // This class can be used to describe any reference of a column.
 class PgTableDesc : public RefCountedThreadSafe<PgTableDesc> {
  public:
-  PgTableDesc(const PgObjectId& id, const master::GetTableSchemaResponsePB& resp,
+  PgTableDesc(const PgObjectId& relfilenode_id, const master::GetTableSchemaResponsePB& resp,
               client::VersionedTablePartitionList partition_list);
 
   Status Init();
 
-  const PgObjectId& id() const {
-    return id_;
+  const PgObjectId& relfilenode_id() const {
+    return relfilenode_id_;
+  }
+
+  PgObjectId pg_table_id() const {
+    return pg_table_id_ == kInvalidOid
+        ? relfilenode_id_ : PgObjectId(relfilenode_id_.database_oid, pg_table_id_);
   }
 
   const client::YBTableName& table_name() const;
 
-  const PartitionSchema& partition_schema() const;
+  const dockv::PartitionSchema& partition_schema() const;
 
   size_t num_range_key_columns() const;
   size_t num_hash_key_columns() const;
@@ -60,7 +67,9 @@ class PgTableDesc : public RefCountedThreadSafe<PgTableDesc> {
   // Find the column given the postgres attr number.
   Result<size_t> FindColumn(int attr_num) const;
 
-  Result<YBCPgColumnInfo> GetColumnInfo(int16_t attr_number) const;
+  const std::vector<std::pair<int, size_t>>& GetAttrNumMap() const;
+
+  Result<YbcPgColumnInfo> GetColumnInfo(int attr_number) const;
 
   bool IsHashPartitioned() const;
 
@@ -82,39 +91,38 @@ class PgTableDesc : public RefCountedThreadSafe<PgTableDesc> {
   // Seek the tablet partition where the row whose "ybctid" value was given can be found.
   Result<size_t> FindPartitionIndex(const Slice& ybctid) const;
 
-  // These values are set by PgGate to optimize query to narrow the scanning range of a query.
-  static Status SetScanBoundary(LWPgsqlReadRequestPB *req,
-                                const std::string& partition_lower_bound,
-                                bool lower_bound_is_inclusive,
-                                const std::string& partition_upper_bound,
-                                bool upper_bound_is_inclusive);
-
   const Schema& schema() const;
+
+  const dockv::SchemaPacking& schema_packing() const {
+    return *schema_packing_;
+  }
 
   // True if table is colocated (including tablegroups, excluding YSQL system tables).
   bool IsColocated() const;
 
-  YBCPgOid GetColocationId() const;
+  YbcPgOid GetColocationId() const;
 
-  YBCPgOid GetTablegroupOid() const;
+  YbcPgOid GetTablegroupOid() const;
 
   uint32_t schema_version() const;
 
   bool IsIndex() const;
 
  private:
-  PgObjectId id_;
+  PgObjectId relfilenode_id_;
+  YbcPgOid pg_table_id_{kInvalidOid};
   master::GetTableSchemaResponsePB resp_;
   client::VersionedTablePartitionList table_partition_list_;
   client::PartitionListVersion latest_known_table_partition_list_version_;
 
   client::YBTableName table_name_;
   Schema schema_;
-  PartitionSchema partition_schema_;
+  dockv::PartitionSchema partition_schema_;
+  std::optional<dockv::SchemaPacking> schema_packing_;
 
   // Attr number to column index map.
-  std::unordered_map<int, size_t> attr_num_map_;
-  YBCPgOid tablegroup_oid_{kInvalidOid};
+  std::vector<std::pair<int, size_t>> attr_num_map_;
+  YbcPgOid tablegroup_oid_{kInvalidOid};
 };
 
 }  // namespace pggate

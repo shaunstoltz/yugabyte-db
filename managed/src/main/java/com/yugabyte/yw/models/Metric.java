@@ -1,11 +1,10 @@
-// Copyright (c) YugaByte, Inc.
+// Copyright (c) YugabyteDB, Inc.
 
 package com.yugabyte.yw.models;
 
 import static com.yugabyte.yw.models.helpers.CommonUtils.nowWithoutMillis;
 
 import com.yugabyte.yw.models.helpers.KnownAlertLabels;
-import io.prometheus.client.Collector;
 import java.util.Date;
 import java.util.HashMap;
 import java.util.HashSet;
@@ -26,21 +25,6 @@ import lombok.extern.slf4j.Slf4j;
 @Slf4j
 public class Metric {
 
-  // For now only support gauge.
-  public enum Type {
-    GAUGE(Collector.Type.GAUGE);
-
-    private final Collector.Type prometheusType;
-
-    Type(Collector.Type prometheusType) {
-      this.prometheusType = prometheusType;
-    }
-
-    public Collector.Type getPrometheusType() {
-      return prometheusType;
-    }
-  }
-
   private UUID customerUUID;
 
   private String name;
@@ -48,8 +32,6 @@ public class Metric {
   private String help;
 
   private String unit;
-
-  private Type type;
 
   private Date createTime = nowWithoutMillis();
 
@@ -104,9 +86,7 @@ public class Metric {
   }
 
   public Map<String, String> getKeyLabelValues() {
-    return labels
-        .entrySet()
-        .stream()
+    return labels.entrySet().stream()
         .filter(e -> keyLabels.contains(e.getKey()))
         .collect(Collectors.toMap(Entry::getKey, Entry::getValue));
   }

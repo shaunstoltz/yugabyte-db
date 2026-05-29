@@ -3,7 +3,7 @@
  * tsvector.c
  *	  I/O functions for tsvector
  *
- * Portions Copyright (c) 1996-2018, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2022, PostgreSQL Global Development Group
  *
  *
  * IDENTIFICATION
@@ -41,8 +41,9 @@ compareWordEntryPos(const void *a, const void *b)
 }
 
 /*
- * Removes duplicate pos entries. If there's two entries with same pos
- * but different weight, the higher weight is retained.
+ * Removes duplicate pos entries. If there's two entries with same pos but
+ * different weight, the higher weight is retained, so we can't use
+ * qunique here.
  *
  * Returns new length.
  */
@@ -490,7 +491,7 @@ tsvectorrecv(PG_FUNCTION_ARGS)
 		 * But make sure the buffer is large enough first.
 		 */
 		while (hdrlen + SHORTALIGN(datalen + lex_len) +
-			   (npos + 1) * sizeof(WordEntryPos) >= len)
+			   sizeof(uint16) + npos * sizeof(WordEntryPos) >= len)
 		{
 			len *= 2;
 			vec = (TSVector) repalloc(vec, len);
@@ -536,7 +537,7 @@ tsvectorrecv(PG_FUNCTION_ARGS)
 					elog(ERROR, "position information is misordered");
 			}
 
-			datalen += (npos + 1) * sizeof(WordEntry);
+			datalen += sizeof(uint16) + npos * sizeof(WordEntryPos);
 		}
 	}
 

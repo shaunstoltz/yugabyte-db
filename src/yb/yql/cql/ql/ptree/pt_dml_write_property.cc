@@ -1,4 +1,4 @@
-// Copyright (c) YugaByte, Inc.
+// Copyright (c) YugabyteDB, Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License"); you may not use this file except
 // in compliance with the License.  You may obtain a copy of the License at
@@ -28,7 +28,6 @@ namespace yb {
 namespace ql {
 
 using strings::Substitute;
-using client::YBColumnSchema;
 
 // These property names need to be lowercase, since identifiers are converted to lowercase by the
 // scanner phase and as a result if we're doing string matching everything should be lowercase.
@@ -96,7 +95,7 @@ Status PTDmlWritePropertyListNode::Analyze(SemContext *sem_context) {
   for (PTDmlWriteProperty::SharedPtr tnode : node_list()) {
     if (tnode == nullptr) {
       // This shouldn't happen because AppendList ignores null nodes.
-      LOG(ERROR) << "Invalid null property";
+      LOG(DFATAL) << "Invalid null property";
       continue;
     }
     switch(tnode->property_type()) {

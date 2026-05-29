@@ -1,5 +1,5 @@
 /*
- * Copyright 2019 YugaByte, Inc. and Contributors
+ * Copyright 2019 YugabyteDB, Inc. and Contributors
  *
  * Licensed under the Polyform Free Trial License 1.0.0 (the "License"); you
  * may not use this file except in compliance with the License. You
@@ -47,9 +47,9 @@ public class UniverseUpdateSucceeded extends UniverseTaskBase {
               // If this universe is not being edited, fail the request.
               UniverseDefinitionTaskParams universeDetails = universe.getUniverseDetails();
               if (!universeDetails.updateInProgress) {
-                log.error("Universe " + taskParams().universeUUID + " is not being edited.");
+                log.error("Universe " + taskParams().getUniverseUUID() + " is not being edited.");
                 throw new RuntimeException(
-                    "Universe " + taskParams().universeUUID + " is not being edited");
+                    "Universe " + taskParams().getUniverseUUID() + " is not being edited");
               }
               // Set the operation success flag.
               universeDetails.updateSucceeded = true;

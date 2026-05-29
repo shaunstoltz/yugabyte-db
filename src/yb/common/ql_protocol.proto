@@ -1,4 +1,4 @@
-// Copyright (c) YugaByte, Inc.
+// Copyright (c) YugabyteDB, Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License"); you may not use this file except
 // in compliance with the License.  You may obtain a copy of the License at
@@ -20,12 +20,14 @@ import "yb/common/common.proto";
 import "yb/common/common_net.proto";
 import "yb/common/common_types.proto";
 
+import "yb/rpc/lightweight_message.proto";
+
 // A column value, optionally with subscripts, e.g. m['x'] or l[2]['x']
 message QLColumnValuePB {
   optional int32 column_id = 1;
   repeated QLExpressionPB subscript_args = 3;
   repeated QLJsonOperationPB json_args = 4;
-  optional QLExpressionPB expr = 2;
+  optional QLExpressionPB expr = 2 [(yb.rpc.lightweight_field).pointer = true];
 }
 
 // Paging state for continuing a read request.
@@ -198,6 +200,10 @@ message QLWriteRequestPB {
   // Does this request correspond to backfilling an index table?
   optional bool is_backfill = 19 [default = false];
   optional bool is_compatible_with_previous_version = 20 [ default = false ];
+
+  // Used to be ASH metadata, but it was not used in the server side.
+  // The one in WriteRequestPB is used.
+  reserved 21;
 }
 
 //-------------------------------------- Read request ----------------------------------------
@@ -273,7 +279,7 @@ message QLReadRequestPB {
 
   // The remote endpoint sending this request. This is filled in by the server and should not be
   // set.
-  optional HostPortPB remote_endpoint = 13;
+  optional HostPortPB remote_endpoint = 13 [(rpc.lightweight_field).pointer = true];
 
   // If this request comes from proxy, it should be filled with UUID of this proxy.
   optional string proxy_uuid = 20;
@@ -291,6 +297,10 @@ message QLReadRequestPB {
   // Flag for reading aggregate values.
   optional bool is_aggregate = 19 [default = false];
   optional bool is_compatible_with_previous_version = 22 [ default = false ];
+
+  // Used to be ASH metadata, but it was not used in the server side.
+  // The one in ReadRequestPB is used.
+  reserved 24;
 }
 
 //------------------------------ Response (for both read and write) -----------------------------

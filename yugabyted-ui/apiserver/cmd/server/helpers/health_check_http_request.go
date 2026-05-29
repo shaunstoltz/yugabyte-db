@@ -3,10 +3,7 @@ package helpers
 import (
     "encoding/json"
     "errors"
-    "fmt"
-    "io/ioutil"
-    "net/http"
-    "time"
+    "net/url"
 )
 
 type HealthCheckStruct struct {
@@ -20,23 +17,16 @@ type HealthCheckFuture struct {
     Error error
 }
 
-func GetHealthCheckFuture(nodeHost string, future chan HealthCheckFuture) {
+func (h *HelperContainer) GetHealthCheckFuture(nodeHost string, future chan HealthCheckFuture) {
     healthCheck := HealthCheckFuture{
         HealthCheck: HealthCheckStruct{},
         Error: nil,
     }
-    httpClient := &http.Client{
-        Timeout: time.Second * 10,
-    }
-    url := fmt.Sprintf("http://%s:7000/api/v1/health-check", nodeHost)
-    resp, err := httpClient.Get(url)
-    if err != nil {
-        healthCheck.Error = err
-        future <- healthCheck
-        return
-    }
-    defer resp.Body.Close()
-    body, err := ioutil.ReadAll(resp.Body)
+    body, err := h.BuildMasterURLsAndAttemptGetRequests(
+        "api/v1/health-check", // path
+        url.Values{}, // params
+        true, // expectJson
+    )
     if err != nil {
         healthCheck.Error = err
         future <- healthCheck

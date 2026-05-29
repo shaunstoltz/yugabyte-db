@@ -1,37 +1,43 @@
-// Copyright (c) Yugabyte, Inc.
+// Copyright (c) YugabyteDB, Inc.
 
 package com.yugabyte.yw.models;
 
 import static io.swagger.annotations.ApiModelProperty.AccessMode.READ_ONLY;
 import static play.mvc.Http.Status.BAD_REQUEST;
 
+import com.fasterxml.jackson.annotation.JsonFormat;
+import com.fasterxml.jackson.annotation.JsonProperty;
 import com.fasterxml.jackson.databind.JsonNode;
+import com.yugabyte.yw.commissioner.RedactSecretsFromAudit;
 import com.yugabyte.yw.common.PlatformServiceException;
 import io.ebean.Finder;
 import io.ebean.Model;
-import io.ebean.annotation.CreatedTimestamp;
 import io.ebean.annotation.DbJson;
 import io.ebean.annotation.EnumValue;
+import io.ebean.annotation.WhenCreated;
 import io.swagger.annotations.ApiModel;
 import io.swagger.annotations.ApiModelProperty;
+import jakarta.persistence.Column;
+import jakarta.persistence.Entity;
+import jakarta.persistence.EnumType;
+import jakarta.persistence.Enumerated;
+import jakarta.persistence.GeneratedValue;
+import jakarta.persistence.GenerationType;
+import jakarta.persistence.Id;
+import jakarta.persistence.SequenceGenerator;
 import java.util.Date;
 import java.util.List;
 import java.util.UUID;
-import java.util.function.Consumer;
-import javax.persistence.Column;
-import javax.persistence.Entity;
-import javax.persistence.EnumType;
-import javax.persistence.Enumerated;
-import javax.persistence.GeneratedValue;
-import javax.persistence.GenerationType;
-import javax.persistence.Id;
-import javax.persistence.SequenceGenerator;
+import lombok.Getter;
+import lombok.Setter;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import play.data.validation.Constraints;
 
 @ApiModel(description = "Audit logging for requests and responses")
 @Entity
+@Getter
+@Setter
 public class Audit extends Model {
 
   public static final Logger LOG = LoggerFactory.getLogger(Audit.class);
@@ -64,14 +70,23 @@ public class Audit extends Model {
     @EnumValue("Certificate")
     Certificate,
 
+    @EnumValue("CustomCACertificate")
+    CustomCACertificate,
+
     @EnumValue("Alert")
     Alert,
 
     @EnumValue("Alert Template Settings")
     AlertTemplateSettings,
 
+    @EnumValue("Alert Template Variables")
+    AlertTemplateVariables,
+
     @EnumValue("Alert Channel")
     AlertChannel,
+
+    @EnumValue("Alert Channel Templates")
+    AlertChannelTemplates,
 
     @EnumValue("Alert Destination")
     AlertDestination,
@@ -87,6 +102,9 @@ public class Audit extends Model {
 
     @EnumValue("XCluster Configuration")
     XClusterConfig,
+
+    @EnumValue("Disaster Recovery Configuration")
+    DrConfig,
 
     @EnumValue("Table")
     Table,
@@ -127,6 +145,12 @@ public class Audit extends Model {
     @EnumValue("Support Bundle")
     SupportBundle,
 
+    @EnumValue("Telemetry Provider")
+    TelemetryProvider,
+
+    @EnumValue("PA Collector")
+    PACollector,
+
     @EnumValue("GFlags")
     GFlags,
 
@@ -149,7 +173,25 @@ public class Audit extends Model {
     PerformanceAdvisorSettings,
 
     @EnumValue("PerformanceAdvisorRun")
-    PerformanceAdvisorRun
+    PerformanceAdvisorRun,
+
+    @EnumValue("Role")
+    Role,
+
+    @EnumValue("RoleBinding")
+    RoleBinding,
+
+    @EnumValue("Group Mapping")
+    GroupMapping,
+
+    @EnumValue("JobSchedule")
+    JobSchedule,
+
+    @EnumValue("ContinuousBackup")
+    ContinuousBackup,
+
+    @EnumValue("IsolatedBackup")
+    IsolatedBackup
   }
 
   public enum ActionType {
@@ -183,6 +225,9 @@ public class Audit extends Model {
     @EnumValue("Import")
     Import,
 
+    @EnumValue("Attach")
+    Attach,
+
     @EnumValue("Pause")
     Pause,
 
@@ -197,6 +242,9 @@ public class Audit extends Model {
 
     @EnumValue("Retry")
     Retry,
+
+    @EnumValue("Rollback")
+    Rollback,
 
     @EnumValue("Restore")
     Restore,
@@ -219,8 +267,20 @@ public class Audit extends Model {
     @EnumValue("Sync XCluster Configuration")
     SyncXClusterConfig,
 
+    @EnumValue("Sync disaster recovery Configuration")
+    SyncDrConfig,
+
+    @EnumValue("Failover")
+    Failover,
+
+    @EnumValue("Switchover")
+    Switchover,
+
     @EnumValue("Login")
     Login,
+
+    @EnumValue("ApiLogin")
+    ApiLogin,
 
     @EnumValue("Promote")
     Promote,
@@ -243,8 +303,35 @@ public class Audit extends Model {
     @EnumValue("Upgrade Software")
     UpgradeSoftware,
 
+    @EnumValue("Finalize Upgrade")
+    FinalizeUpgrade,
+
+    @EnumValue("Rollback Upgrade")
+    RollbackUpgrade,
+
     @EnumValue("Upgrade GFlags")
     UpgradeGFlags,
+
+    @EnumValue("Create Telemetry Provider Config")
+    CreateTelemetryConfig,
+
+    @EnumValue("Delete Telemetry Provider Config")
+    DeleteTelemetryConfig,
+
+    @EnumValue("Create PA Collector Config")
+    CreatePACollectorConfig,
+
+    @EnumValue("Edit PA Collector Config")
+    EditPACollectorConfig,
+
+    @EnumValue("Delete PA Collector Config")
+    DeletePACollectorConfig,
+
+    @EnumValue("Register Universe with PA Collector")
+    PACollectorRegister,
+
+    @EnumValue("Unregister Universe from PA Collector")
+    PACollectorUnregister,
 
     @EnumValue("Upgrade Kubernetes Overrides")
     UpgradeKubernetesOverrides,
@@ -327,6 +414,18 @@ public class Audit extends Model {
     @EnumValue("Toggle Universe's TLS State")
     ToggleTls,
 
+    @EnumValue("Modify Universe's Audit Logging Config")
+    ModifyAuditLogging,
+
+    @EnumValue("Modify Universe's Query Logging Config")
+    ModifyQueryLogging,
+
+    @EnumValue("Configure Metrics Export")
+    ConfigureMetricsExport,
+
+    @EnumValue("Configure Export Telemetry Config")
+    ConfigureExportTelemetryConfig,
+
     @EnumValue("Tls Configuration Update")
     TlsConfigUpdate,
 
@@ -377,6 +476,9 @@ public class Audit extends Model {
 
     @EnumValue("Create PITR Config")
     CreatePitrConfig,
+
+    @EnumValue("Update PITR Config")
+    UpdatePitrConfig,
 
     @EnumValue("Restore Snapshot Schedule")
     RestoreSnapshotSchedule,
@@ -492,8 +594,65 @@ public class Audit extends Model {
     @EnumValue("Install Ybc")
     InstallYbc,
 
+    @EnumValue("Upgrade Ybc GFlags")
+    UpgradeYbcGFlags,
+
     @EnumValue("Set YB-Controller throttle params")
-    SetThrottleParams
+    SetThrottleParams,
+
+    @EnumValue("Create Image Bundle")
+    CreateImageBundle,
+
+    @EnumValue("Delete Image Bundle")
+    DeleteImageBundle,
+
+    @EnumValue("Edit Image Bundle")
+    EditImageBundle,
+
+    @EnumValue("Detach")
+    Detach,
+
+    @EnumValue("Rollback Detach")
+    RollbackDetach,
+
+    @EnumValue("Delete Attach/Detach Metadata")
+    DeleteAttachDetachMetadata,
+
+    @EnumValue("Unlock Universe")
+    Unlock,
+
+    @EnumValue("Sync Universe with LDAP server")
+    LdapUniverseSync,
+
+    @EnumValue("Update Universe's Proxy Configuration")
+    UpdateProxyConfig,
+
+    @EnumValue("Provision Universe Nodes")
+    ProvisionUniverseNodes,
+
+    @EnumValue("Clone Namespace")
+    CloneNamespace,
+
+    @EnumValue("Update Additional Services State")
+    UpdateAdditionalServicesState,
+
+    @EnumValue("Set Immutable Ybc on Kubernetes Universe")
+    KubernetesToggleImmutableYbc,
+
+    @EnumValue("Import Universe to the Kubernetes Operator")
+    OperatorImportUniverse,
+
+    @EnumValue("Run Script on Database Nodes")
+    RunScript,
+
+    @EnumValue("Create File Collection from Database Nodes")
+    CreateFileCollection,
+
+    @EnumValue("Download File Collection to YBA")
+    DownloadFileCollection,
+
+    @EnumValue("Delete File Collection from Database Nodes")
+    DeleteFileCollection,
   }
 
   // An auto incrementing, user-friendly ID for the audit entry.
@@ -504,67 +663,40 @@ public class Audit extends Model {
   @Id
   @SequenceGenerator(name = "audit_id_seq", sequenceName = "audit_id_seq", allocationSize = 1)
   @GeneratedValue(strategy = GenerationType.SEQUENCE, generator = "audit_id_seq")
+  @JsonProperty("auditID")
   private Long id;
-
-  public Long getAuditID() {
-    return this.id;
-  }
 
   @ApiModelProperty(value = "User UUID", accessMode = READ_ONLY)
   @Constraints.Required
   @Column(nullable = false)
   private UUID userUUID;
 
-  public UUID getUserUUID() {
-    return this.userUUID;
-  }
-
   @ApiModelProperty(value = "User Email", accessMode = READ_ONLY)
   @Column(nullable = true)
   private String userEmail;
-
-  public String getUserEmail() {
-    return this.userEmail;
-  }
 
   @ApiModelProperty(value = "Customer UUID", accessMode = READ_ONLY)
   @Constraints.Required
   @Column(nullable = false)
   private UUID customerUUID;
 
-  public UUID getCustomerUUID() {
-    return this.customerUUID;
-  }
-
-  // The task creation time.
-  @CreatedTimestamp private final Date timestamp;
-
-  public Date getTimestamp() {
-    return this.timestamp;
-  }
+  @JsonFormat(shape = JsonFormat.Shape.STRING, pattern = "yyyy-MM-dd'T'HH:mm:ss'Z'")
+  @ApiModelProperty(
+      value = "The task creation time.",
+      accessMode = READ_ONLY,
+      example = "2022-12-12T13:07:18Z")
+  @WhenCreated
+  private final Date timestamp;
 
   @ApiModelProperty(value = "Audit UUID", accessMode = READ_ONLY, dataType = "Object")
   @Column(columnDefinition = "TEXT")
   @DbJson
   private JsonNode payload;
 
-  public JsonNode getPayload() {
-    return this.payload;
-  }
-
-  public void setPayload(JsonNode payload) {
-    this.payload = payload;
-    this.save();
-  }
-
   @ApiModelProperty(value = "Additional Details", accessMode = READ_ONLY, dataType = "Object")
   @Column(columnDefinition = "TEXT")
   @DbJson
   private JsonNode additionalDetails;
-
-  public JsonNode getAdditionalDetails() {
-    return this.additionalDetails;
-  }
 
   @ApiModelProperty(
       value = "API call",
@@ -574,73 +706,35 @@ public class Audit extends Model {
   @Column(columnDefinition = "TEXT", nullable = false)
   private String apiCall;
 
-  public String getApiCall() {
-    return this.apiCall;
-  }
-
   @ApiModelProperty(value = "API method", example = "GET", accessMode = READ_ONLY)
   @Constraints.Required
   @Column(columnDefinition = "TEXT", nullable = false)
   private String apiMethod;
 
-  public String getApiMethod() {
-    return this.apiMethod;
-  }
-
   @ApiModelProperty(value = "Target", example = "User", accessMode = READ_ONLY)
   @Enumerated(EnumType.STRING)
   private TargetType target;
-
-  public TargetType getTarget() {
-    return this.target;
-  }
-
-  public void setTarget(TargetType target) {
-    this.target = target;
-    this.save();
-  }
 
   @ApiModelProperty(value = "Target ID", accessMode = READ_ONLY)
   @Column(nullable = true)
   private String targetID;
 
-  public String getTargetID() {
-    return this.targetID;
-  }
-
   @ApiModelProperty(value = "Action", example = "Create User", accessMode = READ_ONLY)
   @Enumerated(EnumType.STRING)
   private ActionType action;
-
-  public ActionType getAction() {
-    return this.action;
-  }
-
-  public void setAction(ActionType action) {
-    this.action = action;
-    this.save();
-  }
 
   @ApiModelProperty(value = "Task UUID", accessMode = READ_ONLY)
   @Column(unique = true)
   private UUID taskUUID;
 
-  public void setTaskUUID(UUID uuid) {
-    this.taskUUID = uuid;
-    this.save();
-  }
-
-  public UUID getTaskUUID() {
-    return this.taskUUID;
-  }
-
   @ApiModelProperty(value = "User IP Address", accessMode = READ_ONLY)
   @Column(nullable = true)
   private String userAddress;
 
-  public String getUserAddress() {
-    return this.userAddress;
-  }
+  // Hide this from the API.
+  @ApiModelProperty(hidden = true)
+  @Column(nullable = false)
+  private int lastRedactedVersion;
 
   public Audit() {
     this.timestamp = new Date();
@@ -665,18 +759,18 @@ public class Audit extends Model {
       JsonNode details,
       String userAddress) {
     Audit entry = new Audit();
-    entry.customerUUID = user.customerUUID;
-    entry.userUUID = user.uuid;
-    entry.userEmail = user.email;
-    entry.apiCall = apiCall;
-    entry.apiMethod = apiMethod;
-    entry.target = target;
-    entry.targetID = targetID;
-    entry.action = action;
-    entry.taskUUID = taskUUID;
-    entry.payload = body;
-    entry.additionalDetails = details;
-    entry.userAddress = userAddress;
+    entry.setCustomerUUID(user.getCustomerUUID());
+    entry.setUserUUID(user.getUuid());
+    entry.setUserEmail(user.getEmail());
+    entry.setApiCall(apiCall);
+    entry.setApiMethod(apiMethod);
+    entry.setTarget(target);
+    entry.setTargetID(targetID);
+    entry.setAction(action);
+    entry.setTaskUUID(taskUUID);
+    entry.setPayload(body);
+    entry.setAdditionalDetails(details);
+    entry.setUserAddress(userAddress);
     entry.save();
     return entry;
   }
@@ -686,13 +780,24 @@ public class Audit extends Model {
   }
 
   public static Audit getFromTaskUUID(UUID taskUUID) {
-    return find.query().where().eq("task_uuid", taskUUID).findOne();
+    return find.query()
+        .where()
+        .eq("task_uuid", taskUUID)
+        .orderBy("timestamp asc")
+        .setMaxRows(1)
+        .findOne();
   }
 
   public static Audit getOrBadRequest(UUID customerUUID, UUID taskUUID) {
     Customer.getOrBadRequest(customerUUID);
     Audit entry =
-        find.query().where().eq("task_uuid", taskUUID).eq("customer_uuid", customerUUID).findOne();
+        find.query()
+            .where()
+            .eq("task_uuid", taskUUID)
+            .eq("customer_uuid", customerUUID)
+            .orderBy("timestamp asc")
+            .setMaxRows(1)
+            .findOne();
     if (entry == null) {
       throw new PlatformServiceException(
           BAD_REQUEST, "Task " + taskUUID + " does not belong to customer " + customerUUID);
@@ -700,11 +805,18 @@ public class Audit extends Model {
     return entry;
   }
 
+  public void updateAdditionalDetails(JsonNode additionalDetails) {
+    this.additionalDetails = additionalDetails;
+    this.update();
+  }
+
   public static List<Audit> getAllUserEntries(UUID userUUID) {
     return find.query().where().eq("user_uuid", userUUID).findList();
   }
 
-  public static void forEachEntry(Consumer<Audit> consumer) {
-    find.query().findEach(consumer);
+  @Override
+  public void save() {
+    setLastRedactedVersion(RedactSecretsFromAudit.getLastRedactedVersion());
+    super.save();
   }
 }

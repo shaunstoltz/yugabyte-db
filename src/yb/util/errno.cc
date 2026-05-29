@@ -15,9 +15,9 @@
 // specific language governing permissions and limitations
 // under the License.
 //
-// The following only applies to changes made to this file as part of YugaByte development.
+// The following only applies to changes made to this file as part of YugabyteDB development.
 //
-// Portions Copyright (c) YugaByte, Inc.
+// Portions Copyright (c) YugabyteDB, Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License"); you may not use this file except
 // in compliance with the License.  You may obtain a copy of the License at
@@ -31,9 +31,14 @@
 //
 
 #include "yb/util/errno.h"
-#include <errno.h>
 
+#include <errno.h>
 #include <string.h>
+
+#if defined(__APPLE__)
+#include <libproc.h>
+#include <sys/proc_info.h>
+#endif
 
 #include "yb/util/flags.h"
 #include "yb/util/status.h"
@@ -64,12 +69,31 @@ void ErrnoToCString(int err, char *buf, size_t buf_len) {
 #endif
 }
 
-static const std::string kErrnoCategoryName = "system error";
-
-static StatusCategoryRegisterer errno_category_registerer(
-    StatusCategoryDescription::Make<ErrnoTag>(&kErrnoCategoryName));
-
 namespace internal {
+
+#if defined(__APPLE__)
+int64_t NumOpenedFiles() {
+  auto pid = getpid();
+  auto buf_size = proc_pidinfo(pid, PROC_PIDLISTFDS, 0, nullptr, 0);
+  if (buf_size < 0) {
+    return buf_size;
+  }
+  std::vector<proc_fdinfo> buffer(buf_size / sizeof(proc_fdinfo));
+  for (;;) {
+    auto new_buf_size = proc_pidinfo(pid, PROC_PIDLISTFDS, 0, buffer.data(), buf_size);
+
+    if (new_buf_size < 0) {
+      return new_buf_size;
+    }
+    buffer.resize(new_buf_size / sizeof(proc_fdinfo));
+    if (new_buf_size < buf_size) {
+      break;
+    }
+    buf_size = new_buf_size;
+  }
+  return buffer.size();
+}
+#endif
 
 Status StatusFromErrno(const std::string& context, int err_number, const char* file, int line) {
   if (err_number == 0)
@@ -83,6 +107,12 @@ Status StatusFromErrno(const std::string& context, int err_number, const char* f
       return Status(Status::kAlreadyPresent, file, line, context, err);
     case EOPNOTSUPP:
       return Status(Status::kNotSupported, file, line, context, err);
+#if defined(__APPLE__)
+    case EMFILE:
+      return Status(
+          Status::kIOError, file, line,
+          Format("$0 (num opened files $1)", context, NumOpenedFiles()), err);
+#endif
   }
   return Status(Status::kIOError, file, line, context, err);
 }

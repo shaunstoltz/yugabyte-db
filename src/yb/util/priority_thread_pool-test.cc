@@ -1,4 +1,4 @@
-// Copyright (c) YugaByte, Inc.
+// Copyright (c) YugabyteDB, Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License"); you may not use this file except
 // in compliance with the License.  You may obtain a copy of the License at
@@ -132,7 +132,7 @@ class Task : public PriorityThreadPoolTask {
     return YB_CLASS_TO_STRING(index);
   }
 
-  void UpdateStatsStateChangedTo(PriorityThreadPoolTaskState state) override {
+  void StateChangedTo(PriorityThreadPoolTaskState state) override {
     if (!metrics_) {
       return;
     }
@@ -150,7 +150,7 @@ class Task : public PriorityThreadPoolTask {
     FATAL_INVALID_ENUM_VALUE(yb::PriorityThreadPoolTaskState, state);
   }
 
-  void UpdateStatsStateChangedFrom(PriorityThreadPoolTaskState state) override {
+  void StateChangedFrom(PriorityThreadPoolTaskState state) override {
     if (!metrics_) {
       return;
     }

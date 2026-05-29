@@ -1,5 +1,5 @@
 /*
- * Copyright 2019 YugaByte, Inc. and Contributors
+ * Copyright 2019 YugabyteDB, Inc. and Contributors
  *
  * Licensed under the Polyform Free Trial License 1.0.0 (the "License"); you
  * may not use this file except in compliance with the License. You
@@ -18,6 +18,11 @@ import com.fasterxml.jackson.core.type.TypeReference;
 import com.google.common.annotations.VisibleForTesting;
 import com.google.common.base.Joiner;
 import com.google.inject.Inject;
+import com.typesafe.config.Config;
+import com.yugabyte.yw.common.RedactingService.RedactionTarget;
+import com.yugabyte.yw.common.config.GlobalConfKeys;
+import com.yugabyte.yw.common.config.RuntimeConfGetter;
+import com.yugabyte.yw.common.logging.LogUtil;
 import java.io.BufferedReader;
 import java.io.File;
 import java.io.FileInputStream;
@@ -25,7 +30,6 @@ import java.io.FileNotFoundException;
 import java.io.IOException;
 import java.io.InputStreamReader;
 import java.time.Duration;
-import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
 import java.util.UUID;
@@ -35,9 +39,10 @@ import java.util.regex.Pattern;
 import java.util.stream.Collectors;
 import javax.inject.Singleton;
 import lombok.extern.slf4j.Slf4j;
-import org.apache.commons.collections.MapUtils;
+import org.apache.commons.collections4.MapUtils;
 import org.apache.commons.lang3.StringUtils;
 import org.apache.commons.lang3.tuple.Pair;
+import org.slf4j.MDC;
 import org.slf4j.Marker;
 import org.slf4j.MarkerFactory;
 import play.libs.Json;
@@ -48,24 +53,33 @@ public class ShellProcessHandler {
 
   private static final Duration DESTROY_GRACE_TIMEOUT = Duration.ofMinutes(5);
 
-  private final play.Configuration appConfig;
+  private final Config appConfig;
+  private final RuntimeConfGetter confGetter;
   private final boolean cloudLoggingEnabled;
   private final ShellLogsManager shellLogsManager;
 
   static final Pattern ANSIBLE_FAIL_PAT =
       Pattern.compile(
-          "(ybops.common.exceptions.YBOpsRuntimeError: Runtime error: "
-              + "Playbook run.* )with args.* (failed with.*? [0-9]+)");
+          "(ybops\\.common\\.exceptions\\.YB[^\\s]+Error:.*? Playbook run.*?)with args.* (failed"
+              + " with.*? [0-9]+)");
   static final Pattern ANSIBLE_FAILED_TASK_PAT =
-      Pattern.compile("TASK.*?fatal.*?FAILED.*", Pattern.DOTALL);
+      Pattern.compile("TASK\\s+\\[.+\\].*?(fatal:.*?FAILED.*|failed: (?!false).*)", Pattern.DOTALL);
   static final Pattern PYTHON_ERROR_PAT =
       Pattern.compile("(<yb-python-error>)(.*?)(</yb-python-error>)", Pattern.DOTALL);
   static final String ANSIBLE_IGNORING = "ignoring";
   static final String YB_LOGS_MAX_MSG_SIZE = "yb.logs.max_msg_size";
+  // GRPC and Node Agent environment variables.
+  static final String GRPC_KEEPALIVE_TIME_MS_ENV = "grpc_keepalive_time_ms";
+  static final String GRPC_KEEPALIVE_TIMEOUT_MS_ENV = "grpc_keepalive_timeout_ms";
+  static final String NODE_AGENT_DESCRIBE_POLL_DEADLINE_MS_ENV =
+      "node_agent_describe_poll_deadline";
+  static final String NODE_AGENT_REQUEST_LOG_LEVEL = "node_agent_request_log_level";
 
   @Inject
-  public ShellProcessHandler(play.Configuration appConfig, ShellLogsManager shellLogsManager) {
+  public ShellProcessHandler(
+      Config appConfig, RuntimeConfGetter confGetter, ShellLogsManager shellLogsManager) {
     this.appConfig = appConfig;
+    this.confGetter = confGetter;
     this.cloudLoggingEnabled = appConfig.getBoolean("yb.cloud.enabled");
     this.shellLogsManager = shellLogsManager;
   }
@@ -82,10 +96,25 @@ public class ShellProcessHandler {
       String description) {
     return run(
         command,
+        extraEnvVars,
+        logCmdOutput,
+        description,
+        RedactionTarget.QUERY_PARAMS /*shellOutputRedactionTarget*/);
+  }
+
+  public ShellResponse run(
+      List<String> command,
+      Map<String, String> extraEnvVars,
+      boolean logCmdOutput,
+      String description,
+      RedactionTarget shellOutputRedactionTarget) {
+    return run(
+        command,
         ShellProcessContext.builder()
             .extraEnvVars(extraEnvVars)
             .logCmdOutput(logCmdOutput)
             .description(description)
+            .shellOutputRedactionTarget(shellOutputRedactionTarget)
             .build());
   }
 
@@ -97,36 +126,32 @@ public class ShellProcessHandler {
    * @return shell response
    */
   public ShellResponse run(List<String> command, ShellProcessContext context) {
-
-    List<String> redactedCommand = new ArrayList<>(command);
-
-    // Redacting the sensitive data in the command which is used for logging.
-    if (context.getSensitiveData() != null) {
-      context
-          .getSensitiveData()
-          .forEach(
-              (key, value) -> {
-                redactedCommand.add(key);
-                command.add(key);
-                command.add(value);
-                redactedCommand.add(Util.redactString(value));
-              });
-    }
-    // If there are entries with redacted values, update them.
-    if (MapUtils.isNotEmpty(context.getRedactedVals())) {
-      redactedCommand.replaceAll(
-          entry ->
-              context.getRedactedVals().containsKey(entry)
-                  ? context.getRedactedVals().get(entry)
-                  : entry);
-    }
-
+    List<String> redactedCommand = context.redactCommand(command);
     ProcessBuilder pb = new ProcessBuilder(command);
     Map<String, String> envVars = pb.environment();
     Map<String, String> extraEnvVars = context.getExtraEnvVars();
     if (MapUtils.isNotEmpty(extraEnvVars)) {
-      envVars.putAll(context.getExtraEnvVars());
+      envVars.putAll(extraEnvVars);
     }
+    Duration keepAliveTime =
+        confGetter.getGlobalConf(GlobalConfKeys.nodeAgentConnectionKeepAliveTime);
+    Duration keepAliveTimeout =
+        confGetter.getGlobalConf(GlobalConfKeys.nodeAgentConnectionKeepAliveTimeout);
+    Duration describePollDeadline =
+        confGetter.getGlobalConf(GlobalConfKeys.nodeAgentDescribePollDeadline);
+    int requestLogLevel = confGetter.getGlobalConf(GlobalConfKeys.nodeAgentServerRequestLogLevel);
+    String correlationId = MDC.get(LogUtil.CORRELATION_ID);
+    if (StringUtils.isEmpty(correlationId)) {
+      correlationId = UUID.randomUUID().toString();
+      log.debug("Using correlation ID {}", correlationId);
+    }
+    envVars.put(LogUtil.CORRELATION_ID.replaceAll("-", "_"), correlationId);
+    envVars.put(NODE_AGENT_REQUEST_LOG_LEVEL, String.valueOf(requestLogLevel));
+    envVars.put(GRPC_KEEPALIVE_TIME_MS_ENV, String.valueOf(keepAliveTime.toMillis()));
+    envVars.put(GRPC_KEEPALIVE_TIMEOUT_MS_ENV, String.valueOf(keepAliveTimeout.toMillis()));
+    envVars.put(
+        NODE_AGENT_DESCRIBE_POLL_DEADLINE_MS_ENV, String.valueOf(describePollDeadline.toMillis()));
+
     String devopsHome = appConfig.getString("yb.devops.home");
     if (devopsHome != null) {
       pb.directory(new File(devopsHome));
@@ -136,7 +161,7 @@ public class ShellProcessHandler {
     response.code = ERROR_CODE_GENERIC_ERROR;
     String description =
         context.getDescription() == null
-            ? StringUtils.abbreviateMiddle(String.join(" ", command), " ... ", 140)
+            ? StringUtils.abbreviateMiddle(String.join(" ", redactedCommand), " ... ", 140)
             : context.getDescription();
     response.description = description;
 
@@ -159,7 +184,7 @@ public class ShellProcessHandler {
         log.info(logMsg);
       }
       String fullCommand = "'" + String.join("' '", redactedCommand) + "'";
-      if (appConfig.getBoolean("yb.log.logEnvVars", false) && extraEnvVars != null) {
+      if (appConfig.getBoolean("yb.log.logEnvVars") && extraEnvVars != null) {
         fullCommand = Joiner.on(" ").withKeyValueSeparator("=").join(extraEnvVars) + fullCommand;
       }
       logMsg =
@@ -172,15 +197,15 @@ public class ShellProcessHandler {
         log.info(logMsg);
       }
 
-      long endTimeSecs = 0;
+      long endTimeMs = 0;
       if (context.getTimeoutSecs() > 0) {
-        endTimeSecs = (System.currentTimeMillis() / 1000) + context.getTimeoutSecs();
+        endTimeMs = System.currentTimeMillis() + context.getTimeoutSecs() * 1000;
       }
       process = pb.start();
       if (context.getUuid() != null) {
         Util.setPID(context.getUuid(), process);
       }
-      waitForProcessExit(process, description, tempOutputFile, tempErrorFile, endTimeSecs);
+      waitForProcessExit(process, description, tempOutputFile, tempErrorFile, endTimeMs);
       // We will only read last 20MB of process stderr file.
       // stdout has `data` so we wont limit that.
       boolean logCmdOutput = context.isLogCmdOutput();
@@ -189,8 +214,10 @@ public class ShellProcessHandler {
         if (logCmdOutput) {
           log.debug("Proc stdout for '{}' :", response.description);
         }
-        String processOutput = getOutputLines(outputStream, logCmdOutput);
-        String processError = getOutputLines(errorStream, logCmdOutput);
+        String processOutput =
+            getOutputLines(outputStream, logCmdOutput, context.getShellOutputRedactionTarget());
+        String processError =
+            getOutputLines(errorStream, logCmdOutput, context.getShellOutputRedactionTarget());
         try {
           response.code = process.exitValue();
         } catch (IllegalThreadStateException itse) {
@@ -201,11 +228,12 @@ public class ShellProcessHandler {
               itse);
         }
         response.message = (response.code == ERROR_CODE_SUCCESS) ? processOutput : processError;
-        String specificErrMsg = getAnsibleErrMsg(response.code, processOutput, processError);
-        if (specificErrMsg == null) {
-          specificErrMsg = getPythonErrMsg(response.code, processOutput);
-        }
+        String specificErrMsg = getPythonErrMsg(response.code, processOutput);
         if (specificErrMsg != null) {
+          String ansibleErrMsg = getAnsibleErrMsg(response.code, specificErrMsg, processError);
+          if (ansibleErrMsg != null) {
+            specificErrMsg = ansibleErrMsg;
+          }
           response.message = specificErrMsg;
         }
       }
@@ -253,7 +281,7 @@ public class ShellProcessHandler {
     return response;
   }
 
-  private String getOutputLines(BufferedReader reader, boolean logOutput) {
+  private String getOutputLines(BufferedReader reader, boolean logOutput, RedactionTarget target) {
     Marker fileMarker = MarkerFactory.getMarker("fileOnly");
     Marker consoleMarker = MarkerFactory.getMarker("consoleOnly");
     String lines =
@@ -262,13 +290,13 @@ public class ShellProcessHandler {
             .peek(
                 line -> {
                   if (logOutput) {
-                    log.debug(fileMarker, line);
+                    log.debug(fileMarker, RedactingService.redactShellProcessOutput(line, target));
                   }
                 })
             .collect(Collectors.joining("\n"))
             .trim();
     if (logOutput && cloudLoggingEnabled && lines.length() > 0) {
-      log.debug(consoleMarker, lines);
+      log.debug(consoleMarker, RedactingService.redactShellProcessOutput(lines, target));
     }
     return lines;
   }
@@ -327,8 +355,35 @@ public class ShellProcessHandler {
             .build());
   }
 
+  // This method is copied mostly from Process.waitFor(long, TimeUnit) to make poll interval longer
+  // than the default 100ms.
+  private static boolean waitFor(Process process, Duration timeout, Duration pollInterval)
+      throws InterruptedException {
+    long remMs = timeout.toMillis();
+    long timeoutMs = timeout.toMillis();
+    long pollIntervalMs = pollInterval.toMillis();
+    long startTime = System.currentTimeMillis();
+
+    while (true) {
+      try {
+        process.exitValue();
+        return true;
+      } catch (IllegalThreadStateException e) {
+        if (remMs < 0) {
+          // A last call to exitValue() has been made once before exiting.
+          break;
+        }
+      }
+      remMs = timeoutMs - (System.currentTimeMillis() - startTime);
+      if (remMs > 0) {
+        Thread.sleep(Math.min(remMs + 1, pollIntervalMs));
+      }
+    }
+    return false;
+  }
+
   private static void waitForProcessExit(
-      Process process, String description, File outFile, File errFile, long endTimeSecs)
+      Process process, String description, File outFile, File errFile, long endTimeMs)
       throws IOException, InterruptedException {
     try (FileInputStream outputInputStream = new FileInputStream(outFile);
         InputStreamReader outputReader = new InputStreamReader(outputInputStream);
@@ -336,12 +391,12 @@ public class ShellProcessHandler {
         InputStreamReader errReader = new InputStreamReader(errInputStream);
         BufferedReader outputStream = new BufferedReader(outputReader);
         BufferedReader errorStream = new BufferedReader(errReader)) {
-      while (!process.waitFor(1, TimeUnit.SECONDS)) {
+      while (!waitFor(process, Duration.ofSeconds(1), Duration.ofMillis(500))) {
         // read a limited number of lines so that we don't
         // get stuck infinitely without getting to the time check
         tailStream(outputStream, 10000 /*maxLines*/);
         tailStream(errorStream, 10000 /*maxLines*/);
-        if (endTimeSecs > 0 && ((System.currentTimeMillis() / 1000) >= endTimeSecs)) {
+        if (endTimeMs > 0 && (System.currentTimeMillis() >= endTimeMs)) {
           log.warn("Aborting command {} forcibly because it took too long", description);
           destroyForcibly(process, description);
           break;
@@ -365,6 +420,7 @@ public class ShellProcessHandler {
     // with the process output being appended to this file but for the purposes
     // of logging, it is ok to log partial lines.
     while ((line = br.readLine()) != null) {
+      line = line.trim();
       if (line.contains("[app]")) {
         log.info(line);
       }
@@ -385,20 +441,21 @@ public class ShellProcessHandler {
     }
   }
 
-  private static String getAnsibleErrMsg(int code, String stdout, String stderr) {
+  private static String getAnsibleErrMsg(int code, String pythonErrMsg, String stderr) {
 
-    if (stderr == null || code == ERROR_CODE_SUCCESS) return null;
+    if (pythonErrMsg == null || stderr == null || code == ERROR_CODE_SUCCESS) return null;
 
     String result = null;
 
-    Matcher ansibleFailMatch = ANSIBLE_FAIL_PAT.matcher(stderr);
+    Matcher ansibleFailMatch = ANSIBLE_FAIL_PAT.matcher(pythonErrMsg);
     if (ansibleFailMatch.find()) {
       result = ansibleFailMatch.group(1) + ansibleFailMatch.group(2);
 
-      // Attempt to find a line in ansible stdout for the failed task.
+      // By default, python logging module writes to stderr.
+      // Attempt to find a line in ansible stderr for the failed task.
       // Logs for each task are separated by empty lines.
-      // Some fatal failures are ignored by ansible, so skip them
-      for (String s : stdout.split("\\R\\R")) {
+      // Some fatal failures are ignored by ansible, so skip them.
+      for (String s : stderr.split("\\R\\R")) {
         if (s.contains(ANSIBLE_IGNORING)) {
           continue;
         }

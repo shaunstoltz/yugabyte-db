@@ -1,4 +1,4 @@
-// Copyright (c) YugaByte, Inc.
+// Copyright (c) YugabyteDB, Inc.
 
 package com.yugabyte.yw.commissioner;
 
@@ -15,9 +15,6 @@ public class UserTaskDetailsTest {
   @Test
   public void testCreateSubTask() {
     for (SubTaskGroupType stgt : SubTaskGroupType.values()) {
-      if (stgt == SubTaskGroupType.Invalid) {
-        continue;
-      }
       SubTaskDetails details = UserTaskDetails.createSubTask(stgt);
       assertNotNull(details);
       assertFalse(StringUtils.isEmpty(details.getTitle()));

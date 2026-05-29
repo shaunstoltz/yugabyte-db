@@ -1,10 +1,11 @@
 //go:build testonly
 // +build testonly
 
-// Copyright (c) YugaByte, Inc.
+// Copyright (c) YugabyteDB, Inc.
 package util
 
 import (
+	"context"
 	"crypto/rand"
 	"crypto/rsa"
 	"crypto/x509"
@@ -36,7 +37,7 @@ func init() {
 func setUp() {
 	// Sets the env to test to load test config.
 	os.Setenv("env", "TEST")
-	SetCurrentConfig("test-config.conf")
+	SetCurrentConfig("test-config")
 	config := CurrentConfig()
 	server := MockServer()
 	config.Update(PlatformUrlKey, server.URL)
@@ -44,7 +45,8 @@ func setUp() {
 	config.Update(UserIdKey, "u1234")
 	config.Update(ProviderIdKey, "p1234")
 	config.Update(CustomerIdKey, "c1234")
-	config.Update(NodeIpKey, "127.0.0.1")
+	config.Update(NodeIpKey, "my-host")
+	config.Update(NodeBindIpKey, "127.0.0.1")
 	config.Update(RequestTimeoutKey, "100")
 	config.Update(NodeNameKey, "nodeName")
 	config.Update(NodeAgentIdKey, "n1234")
@@ -52,10 +54,17 @@ func setUp() {
 	config.Update(NodeZoneKey, dummyZone)
 	config.Update(NodeAzIdKey, "az1234")
 	config.Update(NodeInstanceTypeKey, dummyInstanceType)
-	config.Update(NodeLoggerKey, "node_agent_test.log")
+	config.Update(NodeAgentLoggerKey, "node_agent_test.log")
+	config.Update(NodeAgentGrpcLoggerKey, "grpc_test.log")
 	config.Update(PlatformCertsKey, "test")
 	private, public := GetPublicAndPrivateKey()
-	SaveCerts(config, string(public), string(private), config.String(PlatformCertsKey))
+	SaveCerts(
+		context.TODO(),
+		config,
+		string(public),
+		string(private),
+		config.String(PlatformCertsKey),
+	)
 }
 
 // Sets up a mock server to test http client calls.
@@ -161,7 +170,7 @@ func GetTestRegisterResponse() model.RegisterResponseSuccess {
 		NodeAgent: model.NodeAgent{
 			CommonInfo:   commonInfo,
 			Uuid:         "n1234",
-			UpdatedAt:    1234,
+			UpdatedAt:    time.Now(),
 			Config:       config,
 			CustomerUuid: "c1234",
 		},
@@ -193,21 +202,6 @@ func GetTestInstanceTypeData() model.NodeInstanceType {
 		Details:          nodeInstanceDetails,
 		InstanceTypeCode: "instance_type_0",
 		ProviderUuid:     GetTestProviderData().Uuid,
-	}
-	return result
-}
-
-func GetTestAccessKeyData(
-	installNodeExporter bool,
-	skipProvisioning bool,
-	airGapInstall bool,
-) model.AccessKey {
-	result := model.AccessKey{
-		KeyInfo: model.AccessKeyInfo{
-			InstallNodeExporter: installNodeExporter,
-			SkipProvisioning:    skipProvisioning,
-			AirGapInstall:       airGapInstall,
-		},
 	}
 	return result
 }

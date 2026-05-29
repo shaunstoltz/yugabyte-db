@@ -4,12 +4,6 @@ headerTitle: Quality of service
 linkTitle: Quality of service
 description: Quality of service and admission control
 headcontent: Quality of service and admission control
-image: /images/section_icons/api/ysql.png
-menu:
-  stable:
-    identifier: develop-quality-of-service
-    parent: develop
-    weight: 585
 type: indexpage
 ---
 

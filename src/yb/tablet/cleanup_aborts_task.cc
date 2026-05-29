@@ -1,4 +1,4 @@
-// Copyright (c) YugaByte, Inc.
+// Copyright (c) YugabyteDB, Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License"); you may not use this file except
 // in compliance with the License.  You may obtain a copy of the License at
@@ -17,6 +17,7 @@
 #include "yb/tablet/transaction_participant.h"
 #include "yb/tablet/transaction_participant_context.h"
 
+#include "yb/util/callsite_profiling.h"
 #include "yb/util/debug-util.h"
 #include "yb/util/logging.h"
 #include "yb/util/result.h"
@@ -70,13 +71,15 @@ void CleanupAbortsTask::Run() {
   VLOG_WITH_PREFIX(1) << "CleanupAbortsTask: applier safe time reached " << safetime
                       << " (was waiting for " << now << ")";
 
-  for (const TransactionId& transaction_id : transactions_to_cleanup_) {
+  for (auto it = transactions_to_cleanup_.begin(); it != transactions_to_cleanup_.end();) {
     // If transaction is committed, no action required
     // TODO(dtxn) : Do batch processing of transactions,
     // because LocalCommitData will acquire lock per each call.
-    auto commit_time = status_manager_.LocalCommitTime(transaction_id);
+    auto commit_time = status_manager_.LocalCommitTime(*it);
     if (commit_time.is_valid()) {
-      transactions_to_cleanup_.erase(transaction_id);
+      it = transactions_to_cleanup_.erase(it);
+    } else {
+      ++it;
     }
   }
 
@@ -116,15 +119,6 @@ void CleanupAbortsTask::FilterTransactions() {
 
   for (const TransactionId& transaction_id : transactions_to_cleanup_) {
     VLOG_WITH_PREFIX(1) << "Checking if transaction needs to be cleaned up: " << transaction_id;
-
-    auto is_external_transaction_result =
-        status_manager_.IsExternalTransactionResult(transaction_id);
-    if (is_external_transaction_result && *is_external_transaction_result) {
-      // Always clean up external transactions because they use a time based retention policy,
-      // and this task is only triggered for transactions that are older than the retention window.
-      --left_wait;
-      continue;
-    }
 
     // If transaction is committed, no action required
     auto commit_time = status_manager_.LocalCommitTime(transaction_id);
@@ -166,7 +160,7 @@ void CleanupAbortsTask::FilterTransactions() {
                                 << transaction_id << ", " << result;
           }
           if (--left_wait == 0) {
-            cond_.notify_one();
+            YB_PROFILE(cond_.notify_one());
           }
         }
     };

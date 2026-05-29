@@ -15,9 +15,9 @@
 // specific language governing permissions and limitations
 // under the License.
 //
-// The following only applies to changes made to this file as part of YugaByte development.
+// The following only applies to changes made to this file as part of YugabyteDB development.
 //
-// Portions Copyright (c) YugaByte, Inc.
+// Portions Copyright (c) YugabyteDB, Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License"); you may not use this file except
 // in compliance with the License.  You may obtain a copy of the License at
@@ -34,26 +34,24 @@
 #include <memory>
 #include <vector>
 
-#include <glog/logging.h>
-
 #include "yb/tools/fs_tool.h"
 #include "yb/util/flags.h"
 #include "yb/util/logging.h"
 #include "yb/util/status.h"
 #include "yb/util/status_log.h"
 
-DEFINE_UNKNOWN_int32(nrows, 0, "Number of rows to dump");
-DEFINE_UNKNOWN_bool(metadata_only, false, "Whether just to dump the block metadata, "
+DEFINE_NON_RUNTIME_int32(nrows, 0, "Number of rows to dump");
+DEFINE_NON_RUNTIME_bool(metadata_only, false, "Whether just to dump the block metadata, "
                                   "when printing blocks.");
 
 /*
   TODO: support specifying start and end keys
 
-  DEFINE_UNKNOWN_string(start_key, "", "Start key for rows to dump");
-  DEFINE_UNKNOWN_string(end_key, "", "Start key for rows to dump");
+  DEFINE_NON_RUNTIME_string(start_key, "", "Start key for rows to dump");
+  DEFINE_NON_RUNTIME_string(end_key, "", "Start key for rows to dump");
 */
 
-DEFINE_UNKNOWN_bool(headers_only, false, "Don't dump contents, dump headers only");
+DEFINE_NON_RUNTIME_bool(headers_only, false, "Don't dump contents, dump headers only");
 
 namespace yb {
 namespace tools {
@@ -89,8 +87,8 @@ const vector<CommandHandler> kCommandHandlers = {
 
 void PrintUsageToStream(const std::string& prog_name, std::ostream* out) {
   *out << "Usage: " << prog_name
-       << " [-headers_only] [-nrows <num rows>] "
-       << "-fs_wal_dirs <dirs> -fs_data_dirs <dirs> <command> <options> "
+       << " [--headers_only] [--nrows <num rows>] "
+       << "--fs_wal_dirs <dirs> --fs_data_dirs <dirs> <command> <options> "
        << std::endl << std::endl;
   *out << "Commands: " << std::endl;
   for (const CommandHandler& handler : kCommandHandlers) {

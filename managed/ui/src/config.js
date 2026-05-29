@@ -1,22 +1,26 @@
-// Copyright (c) YugaByte, Inc.
+// Copyright (c) YugabyteDB, Inc.
 import _ from 'lodash';
 import Cookies from 'js-cookie';
 
-export const IN_DEVELOPMENT_MODE = process.env.NODE_ENV === 'development';
+export const IN_DEVELOPMENT_MODE = import.meta.env.DEV;
 
-// NOTE: when using REACT_APP_YUGAWARE_API_URL at local development - after login with SSO it will
+// NOTE: when using VITE_YUGAWARE_API_URL at local development - after login with SSO it will
 // set auth cookies for API host domain and redirect to API host root instead of localhost:3000/
 // Need to manually set "userId", "customerId" and "PLAY_SESSION" cookies for localhost:3000
 export const ROOT_URL =
-  process.env.REACT_APP_YUGAWARE_API_URL ??
+  import.meta.env.VITE_YUGAWARE_API_URL ??
   (IN_DEVELOPMENT_MODE ? 'http://localhost:9000/api/v1' : '/api/v1');
 
-// Allow requests made to endpoints in ‘routes’ file.
-export const BASE_URL =
-  (IN_DEVELOPMENT_MODE ? "http://localhost:9000" : '');
+// Allow requests made to endpoints in 'routes' file.
+export const BASE_URL = IN_DEVELOPMENT_MODE ? 'http://localhost:9000' : '';
+
+export const REACT_TROUBLESHOOT_API_DEV_URL =
+  import.meta.env.VITE_TROUBLESHOOT_API_DEV_URL ?? `http://localhost:8080`;
+export const REACT_TROUBLESHOOT_API_PROD_URL =
+  import.meta.env.VITE_TROUBLESHOOT_API_PROD_URL ?? `https://10.9.15.156:8443/api`;
 
 export const MAP_SERVER_URL = IN_DEVELOPMENT_MODE
-  ? `https://s3-us-west-2.amazonaws.com/${process.env.REACT_APP_YB_MAP_URL}/map`
+  ? `https://s3-us-west-2.amazonaws.com/${import.meta.env.VITE_YB_MAP_URL}/yba-updated-map`
   : '/static/map';
 
 // get SSO flag from global config loaded in index.html before UI app started
@@ -27,6 +31,15 @@ export const isSSOLogin = () => Cookies.get('apiToken') ?? localStorage.getItem(
 export const isSSOEnabled = () => _.get(window, 'YB_Platform_Config.use_oauth', false);
 
 export const setSSO = (value) => _.set(window, 'YB_Platform_Config.use_oauth', value);
+
+export const setShowJWTTokenInfo = (value) =>
+  _.set(window, 'YB_Platform_Config.show_jwt_token_info', value);
+
+export const shouldShowJWTTokenInfo = () =>
+  _.get(window, 'YB_Platform_Config.show_jwt_token_info', false);
+
+export const isLocalLoginWithSSOAllowed = () =>
+  _.get(window, 'YB_Platform_Config.allow_local_login_with_sso', false);
 
 // TODO : probably fetch the provider metadata (name and code from backend)
 export const PROVIDER_TYPES = [
@@ -40,11 +53,17 @@ export const PROVIDER_TYPES = [
   { code: 'other', name: 'Other', label: 'Custom Datacenter' }
 ];
 
+// The following region array is used in the old kubernetes provider form.
+// Please also add any new K8s regions and zones to:
+// src/components/configRedesign/providerRedesign/providerRegionsData.ts
+// so that the new kubernetes provider UI stays in sync.
+// The old provider UI and its related components/constants/types will be removed once
+// it is no longer used as a fallback option.
 export const REGION_METADATA = [
   { code: 'us-west-1', name: 'US West (N. California)', latitude: 37, longitude: -121 },
   { code: 'us-west-2', name: 'US West (Oregon)', latitude: 44, longitude: -121 },
   { code: 'us-east-1', name: 'US East (N. Virginia)', latitude: 36.8, longitude: -79 },
-  { code: 'us-east-2', name: 'US East (Ohio)', latitude: 40, longitude:-83 },
+  { code: 'us-east-2', name: 'US East (Ohio)', latitude: 40, longitude: -83 },
   { code: 'us-south', name: 'US South', latitude: 28, longitude: -99 },
   { code: 'us-north', name: 'US North', latitude: 48, longitude: -118 },
   { code: 'south-asia', name: 'South Asia', latitude: 18.4, longitude: 78.4 },

@@ -1,4 +1,4 @@
-// Copyright (c) YugaByte, Inc.
+// Copyright (c) YugabyteDB, Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License"); you may not use this file except
 // in compliance with the License.  You may obtain a copy of the License at
@@ -15,11 +15,14 @@
 
 #include "yb/client/client.h"
 
-#include "yb/server/secure.h"
+#include "yb/client/stateful_services/stateful_service_client_base.h"
+#include "yb/server/hybrid_clock.h"
+#include "yb/rpc/secure.h"
 #include "yb/util/net/net_util.h"
 #include "yb/util/result.h"
 #include "yb/rpc/messenger.h"
 
+DECLARE_bool(TEST_enable_multi_way_tablet_split);
 DECLARE_bool(use_node_to_node_encryption);
 DECLARE_string(certs_dir);
 
@@ -30,19 +33,22 @@ Result<std::unique_ptr<client::YBClient>> CreateSecureClientInternal(
     const std::string& name, const std::string& host,
     std::unique_ptr<rpc::SecureContext>* secure_context, client::YBClientBuilder* builder) {
   rpc::MessengerBuilder messenger_builder("test_client");
-  *secure_context = VERIFY_RESULT(server::SetupSecureContext(
-      FLAGS_certs_dir, name, server::SecureContextType::kInternal, &messenger_builder));
+  *secure_context = VERIFY_RESULT(rpc::SetupSecureContext(
+      FLAGS_certs_dir, name, rpc::SecureContextType::kInternal, &messenger_builder));
   auto messenger = VERIFY_RESULT(messenger_builder.Build());
   messenger->TEST_SetOutboundIpBase(VERIFY_RESULT(HostToAddress(host)));
-
-  return builder->Build(std::move(messenger));
+  auto clock = make_scoped_refptr<server::HybridClock>();
+  RETURN_NOT_OK(clock->Init());
+  return builder->Build(std::move(messenger), clock);
 }
 }  // namespace
 
 Result<std::unique_ptr<client::YBClient>> MiniClusterBase::CreateClient(rpc::Messenger* messenger) {
   client::YBClientBuilder builder;
   ConfigureClientBuilder(&builder);
-  return builder.Build(messenger);
+  auto clock = make_scoped_refptr<server::HybridClock>();
+  RETURN_NOT_OK(clock->Init());
+  return builder.Build(messenger, clock);
 }
 
 // Created client will shutdown messenger on client shutdown.
@@ -60,7 +66,9 @@ Result<std::unique_ptr<client::YBClient>> MiniClusterBase::CreateClient(
   }
 
   ConfigureClientBuilder(builder);
-  return builder->Build();
+  auto clock = make_scoped_refptr<server::HybridClock>();
+  RETURN_NOT_OK(clock->Init());
+  return builder->Build(nullptr, clock);
 }
 
 Result<std::unique_ptr<client::YBClient>> MiniClusterBase::CreateSecureClient(
@@ -73,6 +81,23 @@ Result<std::unique_ptr<client::YBClient>> MiniClusterBase::CreateSecureClient(
 
 Result<HostPort> MiniClusterBase::GetLeaderMasterBoundRpcAddr() {
   return DoGetLeaderMasterBoundRpcAddr();
+}
+
+int MiniClusterBase::GetSplitFactor() {
+  return split_factor_;
+}
+
+void MiniClusterBase::SetSplitFactor(int split_factor) {
+  split_factor_ = split_factor;
+  LOG(INFO) << "Setting split factor to " << split_factor;
+  ANNOTATE_UNPROTECTED_WRITE(FLAGS_TEST_enable_multi_way_tablet_split) = true;
+}
+
+rpc::MessengerBuilder CreateMiniClusterMessengerBuilder() {
+  rpc::MessengerBuilder builder("minicluster-messenger");
+  builder.set_num_reactors(1);
+  builder.UseLocalHostOutboundIpBaseInTests();
+  return builder;
 }
 
 }  // namespace yb

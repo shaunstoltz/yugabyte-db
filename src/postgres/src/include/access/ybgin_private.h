@@ -4,7 +4,7 @@
  *	  header file for Yugabyte Generalized Inverted Index access method
  *	  implementation.
  *
- * Copyright (c) YugaByte, Inc.
+ * Copyright (c) YugabyteDB, Inc.
  *
  * Licensed under the Apache License, Version 2.0 (the "License"); you may not
  * use this file except in compliance with the License.  You may obtain a copy
@@ -27,7 +27,6 @@
 
 #include "access/gin_private.h"
 #include "utils/palloc.h"
-
 #include "yb/yql/pggate/ybc_pg_typedefs.h"
 
 typedef struct YbginScanOpaqueData
@@ -38,7 +37,7 @@ typedef struct YbginScanOpaqueData
 	 */
 	GinScanOpaqueData gin_scan_opaque;
 	/* The handle for the internal YB Select statement. */
-	YBCPgStatement handle;
+	YbcPgStatement handle;
 	/*
 	 * Whether the scan was executed so that later gettuple calls just fetch the
 	 * cached rows.

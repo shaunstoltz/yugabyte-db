@@ -3,7 +3,7 @@
  * llvmjit.c
  *	  Core part of the LLVM JIT provider.
  *
- * Copyright (c) 2016-2018, PostgreSQL Global Development Group
+ * Copyright (c) 2016-2022, PostgreSQL Global Development Group
  *
  * IDENTIFICATION
  *	  src/backend/jit/llvm/llvmjit.c
@@ -13,22 +13,14 @@
 
 #include "postgres.h"
 
-#include "jit/llvmjit.h"
-#include "jit/llvmjit_emit.h"
-
-#include "miscadmin.h"
-
-#include "utils/memutils.h"
-#include "utils/resowner_private.h"
-#include "portability/instr_time.h"
-#include "storage/ipc.h"
-
-
 #include <llvm-c/Analysis.h>
 #include <llvm-c/BitReader.h>
 #include <llvm-c/BitWriter.h>
 #include <llvm-c/Core.h>
 #include <llvm-c/ExecutionEngine.h>
+#if LLVM_VERSION_MAJOR > 16
+#include <llvm-c/Transforms/PassBuilder.h>
+#endif
 #if LLVM_VERSION_MAJOR > 11
 #include <llvm-c/Orc.h>
 #include <llvm-c/OrcEE.h>
@@ -38,13 +30,25 @@
 #endif
 #include <llvm-c/Support.h>
 #include <llvm-c/Target.h>
+#if LLVM_VERSION_MAJOR < 17
 #include <llvm-c/Transforms/IPO.h>
 #include <llvm-c/Transforms/PassManagerBuilder.h>
 #include <llvm-c/Transforms/Scalar.h>
 #if LLVM_VERSION_MAJOR > 6
 #include <llvm-c/Transforms/Utils.h>
 #endif
+#endif
 
+#include "jit/llvmjit.h"
+#include "jit/llvmjit_backport.h"
+#include "jit/llvmjit_emit.h"
+#include "miscadmin.h"
+#include "portability/instr_time.h"
+#include "storage/ipc.h"
+#include "utils/memutils.h"
+#include "utils/resowner_private.h"
+
+#define LLVMJIT_LLVM_CONTEXT_REUSE_MAX 100
 
 /* Handle of a module emitted via ORC JIT */
 typedef struct LLVMJitHandle
@@ -64,6 +68,7 @@ LLVMTypeRef TypeSizeT;
 LLVMTypeRef TypeParamBool;
 LLVMTypeRef TypeStorageBool;
 LLVMTypeRef TypePGFunction;
+LLVMTypeRef StructNullableDatum;
 LLVMTypeRef StructHeapTupleFieldsField3;
 LLVMTypeRef StructHeapTupleFields;
 LLVMTypeRef StructHeapTupleHeaderData;
@@ -74,8 +79,10 @@ LLVMTypeRef StructItemPointerData;
 LLVMTypeRef StructBlockId;
 LLVMTypeRef StructFormPgAttribute;
 LLVMTypeRef StructTupleConstr;
-LLVMTypeRef StructtupleDesc;
+LLVMTypeRef StructTupleDescData;
 LLVMTypeRef StructTupleTableSlot;
+LLVMTypeRef StructHeapTupleTableSlot;
+LLVMTypeRef StructMinimalTupleTableSlot;
 LLVMTypeRef StructMemoryContextData;
 LLVMTypeRef StructPGFinfoRecord;
 LLVMTypeRef StructFmgrInfo;
@@ -86,23 +93,25 @@ LLVMTypeRef StructExprState;
 LLVMTypeRef StructAggState;
 LLVMTypeRef StructAggStatePerGroupData;
 LLVMTypeRef StructAggStatePerTransData;
+LLVMTypeRef StructPlanState;
 
 LLVMValueRef AttributeTemplate;
-LLVMValueRef FuncStrlen;
-LLVMValueRef FuncVarsizeAny;
-LLVMValueRef FuncSlotGetsomeattrs;
-LLVMValueRef FuncSlotGetmissingattrs;
-LLVMValueRef FuncHeapGetsysattr;
-LLVMValueRef FuncMakeExpandedObjectReadOnlyInternal;
-LLVMValueRef FuncExecEvalArrayRefSubscript;
-LLVMValueRef FuncExecAggTransReparent;
-LLVMValueRef FuncExecAggInitGroup;
+LLVMValueRef ExecEvalSubroutineTemplate;
+LLVMValueRef ExecEvalBoolSubroutineTemplate;
 
+LLVMModuleRef llvm_types_module = NULL;
 
 static bool llvm_session_initialized = false;
 static size_t llvm_generation = 0;
+
+/* number of LLVMJitContexts that currently are in use */
+static size_t llvm_jit_context_in_use_count = 0;
+
+/* how many times has the current LLVMContextRef been used */
+static size_t llvm_llvm_context_reuse_count = 0;
 static const char *llvm_triple = NULL;
 static const char *llvm_layout = NULL;
+static LLVMContextRef llvm_context;
 
 
 static LLVMTargetRef llvm_targetref;
@@ -123,6 +132,8 @@ static void llvm_compile_module(LLVMJitContext *context);
 static void llvm_optimize_module(LLVMJitContext *context, LLVMModuleRef module);
 
 static void llvm_create_types(void);
+static void llvm_set_target(void);
+static void llvm_recreate_llvm_context(void);
 static uint64_t llvm_resolve_symbol(const char *name, void *ctx);
 
 #if LLVM_VERSION_MAJOR > 11
@@ -144,6 +155,63 @@ _PG_jit_provider_init(JitProviderCallbacks *cb)
 	cb->compile_expr = llvm_compile_expr;
 }
 
+
+/*
+ * Every now and then create a new LLVMContextRef. Unfortunately, during every
+ * round of inlining, types may "leak" (they can still be found/used via the
+ * context, but new types will be created the next time in inlining is
+ * performed). To prevent that from slowly accumulating problematic amounts of
+ * memory, recreate the LLVMContextRef we use. We don't want to do so too
+ * often, as that implies some overhead (particularly re-loading the module
+ * summaries / modules is fairly expensive). A future TODO would be to make
+ * this more finegrained and only drop/recreate the LLVMContextRef when we know
+ * there has been inlining. If we can get the size of the context from LLVM
+ * then that might be a better way to determine when to drop/recreate rather
+ * then the usagecount heuristic currently employed.
+ */
+static void
+llvm_recreate_llvm_context(void)
+{
+	if (!llvm_context)
+		elog(ERROR, "Trying to recreate a non-existing context");
+
+	/*
+	 * We can only safely recreate the LLVM context if no other code is being
+	 * JITed, otherwise we'd release the types in use for that.
+	 */
+	if (llvm_jit_context_in_use_count > 0)
+	{
+		llvm_llvm_context_reuse_count++;
+		return;
+	}
+
+	if (llvm_llvm_context_reuse_count <= LLVMJIT_LLVM_CONTEXT_REUSE_MAX)
+	{
+		llvm_llvm_context_reuse_count++;
+		return;
+	}
+
+	/*
+	 * Need to reset the modules that the inlining code caches before
+	 * disposing of the context. LLVM modules exist within a specific LLVM
+	 * context, therefore disposing of the context before resetting the cache
+	 * would lead to dangling pointers to modules.
+	 */
+	llvm_inline_reset_caches();
+
+	LLVMContextDispose(llvm_context);
+	llvm_context = LLVMContextCreate();
+	llvm_llvm_context_reuse_count = 0;
+
+	/*
+	 * Re-build cached type information, so code generation code can rely on
+	 * that information to be present (also prevents the variables to be
+	 * dangling references).
+	 */
+	llvm_create_types();
+}
+
+
 /*
  * Create a context for JITing work.
  *
@@ -160,6 +228,8 @@ llvm_create_context(int jitFlags)
 
 	llvm_session_initialize();
 
+	llvm_recreate_llvm_context();
+
 	ResourceOwnerEnlargeJIT(CurrentResourceOwner);
 
 	context = MemoryContextAllocZero(TopMemoryContext,
@@ -170,6 +240,8 @@ llvm_create_context(int jitFlags)
 	context->base.resowner = CurrentResourceOwner;
 	ResourceOwnerRememberJIT(CurrentResourceOwner, PointerGetDatum(context));
 
+	llvm_jit_context_in_use_count++;
+
 	return context;
 }
 
@@ -179,7 +251,14 @@ llvm_create_context(int jitFlags)
 static void
 llvm_release_context(JitContext *context)
 {
-	LLVMJitContext *llvm_context = (LLVMJitContext *) context;
+	LLVMJitContext *llvm_jit_context = (LLVMJitContext *) context;
+	ListCell   *lc;
+
+	/*
+	 * Consider as cleaned up even if we skip doing so below, that way we can
+	 * verify the tracking is correct (see llvm_shutdown()).
+	 */
+	llvm_jit_context_in_use_count--;
 
 	/*
 	 * When this backend is exiting, don't clean up LLVM. As an error might
@@ -191,18 +270,15 @@ llvm_release_context(JitContext *context)
 
 	llvm_enter_fatal_on_oom();
 
-	if (llvm_context->module)
+	if (llvm_jit_context->module)
 	{
-		LLVMDisposeModule(llvm_context->module);
-		llvm_context->module = NULL;
+		LLVMDisposeModule(llvm_jit_context->module);
+		llvm_jit_context->module = NULL;
 	}
 
-	while (llvm_context->handles != NIL)
+	foreach(lc, llvm_jit_context->handles)
 	{
-		LLVMJitHandle *jit_handle;
-
-		jit_handle = (LLVMJitHandle *) linitial(llvm_context->handles);
-		llvm_context->handles = list_delete_first(llvm_context->handles);
+		LLVMJitHandle *jit_handle = (LLVMJitHandle *) lfirst(lc);
 
 #if LLVM_VERSION_MAJOR > 11
 		{
@@ -230,6 +306,10 @@ llvm_release_context(JitContext *context)
 
 		pfree(jit_handle);
 	}
+	list_free(llvm_jit_context->handles);
+	llvm_jit_context->handles = NIL;
+
+	llvm_leave_fatal_on_oom();
 }
 
 /*
@@ -247,7 +327,7 @@ llvm_mutable_module(LLVMJitContext *context)
 	{
 		context->compiled = false;
 		context->module_generation = llvm_generation++;
-		context->module = LLVMModuleCreateWithName("pg");
+		context->module = LLVMModuleCreateWithNameInContext("pg", llvm_context);
 		LLVMSetTarget(context->module, llvm_triple);
 		LLVMSetDataLayout(context->module, llvm_layout);
 	}
@@ -377,51 +457,126 @@ llvm_get_function(LLVMJitContext *context, const char *funcname)
 }
 
 /*
- * Return declaration for passed function, adding it to the module if
- * necessary.
+ * Return type of a variable in llvmjit_types.c. This is useful to keep types
+ * in sync between plain C and JIT related code.
+ */
+LLVMTypeRef
+llvm_pg_var_type(const char *varname)
+{
+	LLVMValueRef v_srcvar;
+	LLVMTypeRef typ;
+
+	/* this'll return a *pointer* to the global */
+	v_srcvar = LLVMGetNamedGlobal(llvm_types_module, varname);
+	if (!v_srcvar)
+		elog(ERROR, "variable %s not in llvmjit_types.c", varname);
+
+	typ = LLVMGlobalGetValueType(v_srcvar);
+
+	return typ;
+}
+
+/*
+ * Return function type of a variable in llvmjit_types.c. This is useful to
+ * keep function types in sync between C and JITed code.
+ */
+LLVMTypeRef
+llvm_pg_var_func_type(const char *varname)
+{
+	LLVMValueRef v_srcvar;
+	LLVMTypeRef typ;
+
+	v_srcvar = LLVMGetNamedFunction(llvm_types_module, varname);
+	if (!v_srcvar)
+		elog(ERROR, "function %s not in llvmjit_types.c", varname);
+
+	typ = LLVMGetFunctionType(v_srcvar);
+
+	return typ;
+}
+
+/*
+ * Return declaration for a function referenced in llvmjit_types.c, adding it
+ * to the module if necessary.
  *
- * This is used to make functions imported by llvm_create_types() known to the
- * module that's currently being worked on.
+ * This is used to make functions discovered via llvm_create_types() known to
+ * the module that's currently being worked on.
  */
 LLVMValueRef
-llvm_get_decl(LLVMModuleRef mod, LLVMValueRef v_src)
+llvm_pg_func(LLVMModuleRef mod, const char *funcname)
 {
+	LLVMValueRef v_srcfn;
 	LLVMValueRef v_fn;
 
 	/* don't repeatedly add function */
-	v_fn = LLVMGetNamedFunction(mod, LLVMGetValueName(v_src));
+	v_fn = LLVMGetNamedFunction(mod, funcname);
 	if (v_fn)
 		return v_fn;
 
+	v_srcfn = LLVMGetNamedFunction(llvm_types_module, funcname);
+
+	if (!v_srcfn)
+		elog(ERROR, "function %s not in llvmjit_types.c", funcname);
+
 	v_fn = LLVMAddFunction(mod,
-						   LLVMGetValueName(v_src),
-						   LLVMGetElementType(LLVMTypeOf(v_src)));
-	llvm_copy_attributes(v_src, v_fn);
+						   funcname,
+						   LLVMGetFunctionType(v_srcfn));
+	llvm_copy_attributes(v_srcfn, v_fn);
 
 	return v_fn;
 }
 
 /*
- * Copy attributes from one function to another.
+ * Copy attributes from one function to another, for a specific index (an
+ * index can reference return value, function and parameter attributes).
+ */
+static void
+llvm_copy_attributes_at_index(LLVMValueRef v_from, LLVMValueRef v_to, uint32 index)
+{
+	int			num_attributes;
+	LLVMAttributeRef *attrs;
+
+	num_attributes = LLVMGetAttributeCountAtIndexPG(v_from, index);
+
+	/*
+	 * Not just for efficiency: LLVM <= 3.9 crashes when
+	 * LLVMGetAttributesAtIndex() is called for an index with 0 attributes.
+	 */
+	if (num_attributes == 0)
+		return;
+
+	attrs = palloc(sizeof(LLVMAttributeRef) * num_attributes);
+	LLVMGetAttributesAtIndex(v_from, index, attrs);
+
+	for (int attno = 0; attno < num_attributes; attno++)
+		LLVMAddAttributeAtIndex(v_to, index, attrs[attno]);
+
+	pfree(attrs);
+}
+
+/*
+ * Copy all attributes from one function to another. I.e. function, return and
+ * parameters will be copied.
  */
 void
 llvm_copy_attributes(LLVMValueRef v_from, LLVMValueRef v_to)
 {
-	int			num_attributes;
-	int			attno;
-	LLVMAttributeRef *attrs;
+	uint32		param_count;
 
-	num_attributes =
-		LLVMGetAttributeCountAtIndex(v_from, LLVMAttributeFunctionIndex);
+	/* copy function attributes */
+	llvm_copy_attributes_at_index(v_from, v_to, LLVMAttributeFunctionIndex);
 
-	attrs = palloc(sizeof(LLVMAttributeRef) * num_attributes);
-	LLVMGetAttributesAtIndex(v_from, LLVMAttributeFunctionIndex, attrs);
-
-	for (attno = 0; attno < num_attributes; attno++)
+	if (LLVMGetTypeKind(LLVMGetFunctionReturnType(v_to)) != LLVMVoidTypeKind)
 	{
-		LLVMAddAttributeAtIndex(v_to, LLVMAttributeFunctionIndex,
-								attrs[attno]);
+		/* and the return value attributes */
+		llvm_copy_attributes_at_index(v_from, v_to, LLVMAttributeReturnIndex);
 	}
+
+	/* and each function parameter's attribute */
+	param_count = LLVMCountParams(v_from);
+
+	for (int paramidx = 1; paramidx <= param_count; paramidx++)
+		llvm_copy_attributes_at_index(v_from, v_to, paramidx);
 }
 
 /*
@@ -464,7 +619,7 @@ llvm_function_reference(LLVMJitContext *context,
 							fcinfo->flinfo->fn_oid);
 		v_fn = LLVMGetNamedGlobal(mod, funcname);
 		if (v_fn != 0)
-			return LLVMBuildLoad(builder, v_fn, "");
+			return l_load(builder, TypePGFunction, v_fn, "");
 
 		v_fn_addr = l_ptr_const(fcinfo->flinfo->fn_addr, TypePGFunction);
 
@@ -474,7 +629,7 @@ llvm_function_reference(LLVMJitContext *context,
 		LLVMSetLinkage(v_fn, LLVMPrivateLinkage);
 		LLVMSetUnnamedAddr(v_fn, true);
 
-		return LLVMBuildLoad(builder, v_fn, "");
+		return l_load(builder, TypePGFunction, v_fn, "");
 	}
 
 	/* check if function already has been added */
@@ -482,7 +637,7 @@ llvm_function_reference(LLVMJitContext *context,
 	if (v_fn != 0)
 		return v_fn;
 
-	v_fn = LLVMAddFunction(mod, funcname, LLVMGetElementType(TypePGFunction));
+	v_fn = LLVMAddFunction(mod, funcname, LLVMGetFunctionType(AttributeTemplate));
 
 	return v_fn;
 }
@@ -493,6 +648,7 @@ llvm_function_reference(LLVMJitContext *context,
 static void
 llvm_optimize_module(LLVMJitContext *context, LLVMModuleRef module)
 {
+#if LLVM_VERSION_MAJOR < 17
 	LLVMPassManagerBuilderRef llvm_pmb;
 	LLVMPassManagerRef llvm_mpm;
 	LLVMPassManagerRef llvm_fpm;
@@ -515,7 +671,7 @@ llvm_optimize_module(LLVMJitContext *context, LLVMModuleRef module)
 
 	if (context->base.flags & PGJIT_OPT3)
 	{
-		/* TODO: Unscientifically determined threshhold */
+		/* TODO: Unscientifically determined threshold */
 		LLVMPassManagerBuilderUseInlinerWithThreshold(llvm_pmb, 512);
 	}
 	else
@@ -556,6 +712,31 @@ llvm_optimize_module(LLVMJitContext *context, LLVMModuleRef module)
 	LLVMDisposePassManager(llvm_mpm);
 
 	LLVMPassManagerBuilderDispose(llvm_pmb);
+#else
+	LLVMPassBuilderOptionsRef options;
+	LLVMErrorRef err;
+	const char *passes;
+
+	if (context->base.flags & PGJIT_OPT3)
+		passes = "default<O3>";
+	else
+		passes = "default<O0>,mem2reg";
+
+	options = LLVMCreatePassBuilderOptions();
+
+#ifdef LLVM_PASS_DEBUG
+	LLVMPassBuilderOptionsSetDebugLogging(options, 1);
+#endif
+
+	LLVMPassBuilderOptionsSetInlinerThreshold(options, 512);
+
+	err = LLVMRunPasses(module, passes, NULL, options);
+
+	if (err)
+		elog(ERROR, "failed to JIT module: %s", llvm_error_message(err));
+
+	LLVMDisposePassBuilderOptions(options);
+#endif
 }
 
 /*
@@ -703,10 +884,10 @@ llvm_compile_module(LLVMJitContext *context)
 	MemoryContextSwitchTo(oldcontext);
 
 	ereport(DEBUG1,
-			(errmsg("time to inline: %.3fs, opt: %.3fs, emit: %.3fs",
-					INSTR_TIME_GET_DOUBLE(context->base.instr.inlining_counter),
-					INSTR_TIME_GET_DOUBLE(context->base.instr.optimization_counter),
-					INSTR_TIME_GET_DOUBLE(context->base.instr.emission_counter)),
+			(errmsg_internal("time to inline: %.3fs, opt: %.3fs, emit: %.3fs",
+							 INSTR_TIME_GET_DOUBLE(context->base.instr.inlining_counter),
+							 INSTR_TIME_GET_DOUBLE(context->base.instr.optimization_counter),
+							 INSTR_TIME_GET_DOUBLE(context->base.instr.emission_counter)),
 			 errhidestmt(true),
 			 errhidecontext(true)));
 }
@@ -733,15 +914,41 @@ llvm_session_initialize(void)
 	LLVMInitializeNativeAsmPrinter();
 	LLVMInitializeNativeAsmParser();
 
+	if (llvm_context == NULL)
+	{
+		llvm_context = LLVMContextCreate();
+
+		llvm_jit_context_in_use_count = 0;
+		llvm_llvm_context_reuse_count = 0;
+	}
+
+	/*
+	 * When targeting LLVM 15, turn off opaque pointers for the context we
+	 * build our code in.  We don't need to do so for other contexts (e.g.
+	 * llvm_ts_context).  Once the IR is generated, it carries the necessary
+	 * information.
+	 *
+	 * For 16 and above, opaque pointers must be used, and we have special
+	 * code for that.
+	 */
+#if LLVM_VERSION_MAJOR == 15
+	LLVMContextSetOpaquePointers(LLVMGetGlobalContext(), false);
+#endif
+
 	/*
 	 * Synchronize types early, as that also includes inferring the target
 	 * triple.
 	 */
 	llvm_create_types();
 
+	/*
+	 * Extract target information from loaded module.
+	 */
+	llvm_set_target();
+
 	if (LLVMGetTargetFromTriple(llvm_triple, &llvm_targetref, &error) != 0)
 	{
-		elog(FATAL, "failed to query triple %s\n", error);
+		elog(FATAL, "failed to query triple %s", error);
 	}
 
 	/*
@@ -810,7 +1017,7 @@ llvm_session_initialize(void)
 	}
 #endif							/* LLVM_VERSION_MAJOR > 11 */
 
-	before_shmem_exit(llvm_shutdown, 0);
+	on_proc_exit(llvm_shutdown, 0);
 
 	llvm_session_initialized = true;
 
@@ -825,14 +1032,18 @@ llvm_shutdown(int code, Datum arg)
 	 * has occurred in the middle of LLVM code. It is not safe to call back
 	 * into LLVM (which is why a FATAL error was thrown).
 	 *
-	 * We do need to shutdown LLVM in other shutdown cases, otherwise
-	 * e.g. profiling data won't be written out.
+	 * We do need to shutdown LLVM in other shutdown cases, otherwise e.g.
+	 * profiling data won't be written out.
 	 */
 	if (llvm_in_fatal_on_oom())
 	{
 		Assert(proc_exit_inprogress);
 		return;
 	}
+
+	if (llvm_jit_context_in_use_count != 0)
+		elog(PANIC, "LLVMJitContext in use count not 0 at exit (is %zu)",
+			 llvm_jit_context_in_use_count);
 
 #if LLVM_VERSION_MAJOR > 11
 	{
@@ -879,26 +1090,6 @@ llvm_shutdown(int code, Datum arg)
 #endif							/* LLVM_VERSION_MAJOR > 11 */
 }
 
-/* helper for llvm_create_types, returning a global var's type */
-static LLVMTypeRef
-load_type(LLVMModuleRef mod, const char *name)
-{
-	LLVMValueRef value;
-	LLVMTypeRef typ;
-
-	/* this'll return a *pointer* to the global */
-	value = LLVMGetNamedGlobal(mod, name);
-	if (!value)
-		elog(ERROR, "type %s is unknown", name);
-
-	/* therefore look at the contained type and return that */
-	typ = LLVMTypeOf(value);
-	Assert(typ != NULL);
-	typ = LLVMGetElementType(typ);
-	Assert(typ != NULL);
-	return typ;
-}
-
 /* helper for llvm_create_types, returning a function's return type */
 static LLVMTypeRef
 load_return_type(LLVMModuleRef mod, const char *name)
@@ -911,17 +1102,26 @@ load_return_type(LLVMModuleRef mod, const char *name)
 	if (!value)
 		elog(ERROR, "function %s is unknown", name);
 
-	/* get type of function pointer */
-	typ = LLVMTypeOf(value);
-	Assert(typ != NULL);
-	/* dereference pointer */
-	typ = LLVMGetElementType(typ);
-	Assert(typ != NULL);
-	/* and look at return type */
-	typ = LLVMGetReturnType(typ);
-	Assert(typ != NULL);
+	typ = LLVMGetFunctionReturnType(value); /* in llvmjit_wrap.cpp */
 
 	return typ;
+}
+
+/*
+ * Load triple & layout from clang emitted file so we're guaranteed to be
+ * compatible.
+ */
+static void
+llvm_set_target(void)
+{
+	if (!llvm_types_module)
+		elog(ERROR, "failed to extract target information, llvmjit_types.c not loaded");
+
+	if (llvm_triple == NULL)
+		llvm_triple = pstrdup(LLVMGetTarget(llvm_types_module));
+
+	if (llvm_layout == NULL)
+		llvm_layout = pstrdup(LLVMGetDataLayoutStr(llvm_types_module));
 }
 
 /*
@@ -936,7 +1136,6 @@ llvm_create_types(void)
 	char		path[MAXPGPATH];
 	LLVMMemoryBufferRef buf;
 	char	   *msg;
-	LLVMModuleRef mod = NULL;
 
 	snprintf(path, MAXPGPATH, "%s/%s", pkglib_path, "llvmjit_types.bc");
 
@@ -948,52 +1147,37 @@ llvm_create_types(void)
 	}
 
 	/* eagerly load contents, going to need it all */
-	if (LLVMParseBitcode2(buf, &mod))
+	if (LLVMParseBitcodeInContext2(llvm_context, buf, &llvm_types_module))
 	{
-		elog(ERROR, "LLVMParseBitcode2 of %s failed", path);
+		elog(ERROR, "LLVMParseBitcodeInContext2 of %s failed", path);
 	}
 	LLVMDisposeMemoryBuffer(buf);
 
-	/*
-	 * Load triple & layout from clang emitted file so we're guaranteed to be
-	 * compatible.
-	 */
-	llvm_triple = pstrdup(LLVMGetTarget(mod));
-	llvm_layout = pstrdup(LLVMGetDataLayoutStr(mod));
+	TypeSizeT = llvm_pg_var_type("TypeSizeT");
+	TypeParamBool = load_return_type(llvm_types_module, "FunctionReturningBool");
+	TypeStorageBool = llvm_pg_var_type("TypeStorageBool");
+	TypePGFunction = llvm_pg_var_type("TypePGFunction");
+	StructNullableDatum = llvm_pg_var_type("StructNullableDatum");
+	StructExprContext = llvm_pg_var_type("StructExprContext");
+	StructExprEvalStep = llvm_pg_var_type("StructExprEvalStep");
+	StructExprState = llvm_pg_var_type("StructExprState");
+	StructFunctionCallInfoData = llvm_pg_var_type("StructFunctionCallInfoData");
+	StructMemoryContextData = llvm_pg_var_type("StructMemoryContextData");
+	StructTupleTableSlot = llvm_pg_var_type("StructTupleTableSlot");
+	StructHeapTupleTableSlot = llvm_pg_var_type("StructHeapTupleTableSlot");
+	StructMinimalTupleTableSlot = llvm_pg_var_type("StructMinimalTupleTableSlot");
+	StructHeapTupleData = llvm_pg_var_type("StructHeapTupleData");
+	StructHeapTupleHeaderData = llvm_pg_var_type("StructHeapTupleHeaderData");
+	StructTupleDescData = llvm_pg_var_type("StructTupleDescData");
+	StructAggState = llvm_pg_var_type("StructAggState");
+	StructAggStatePerGroupData = llvm_pg_var_type("StructAggStatePerGroupData");
+	StructAggStatePerTransData = llvm_pg_var_type("StructAggStatePerTransData");
+	StructPlanState = llvm_pg_var_type("StructPlanState");
+	StructMinimalTupleData = llvm_pg_var_type("StructMinimalTupleData");
 
-	TypeSizeT = load_type(mod, "TypeSizeT");
-	TypeParamBool = load_return_type(mod, "FunctionReturningBool");
-	TypeStorageBool = load_type(mod, "TypeStorageBool");
-	TypePGFunction = load_type(mod, "TypePGFunction");
-	StructExprContext = load_type(mod, "StructExprContext");
-	StructExprEvalStep = load_type(mod, "StructExprEvalStep");
-	StructExprState = load_type(mod, "StructExprState");
-	StructFunctionCallInfoData = load_type(mod, "StructFunctionCallInfoData");
-	StructMemoryContextData = load_type(mod, "StructMemoryContextData");
-	StructTupleTableSlot = load_type(mod, "StructTupleTableSlot");
-	StructHeapTupleData = load_type(mod, "StructHeapTupleData");
-	StructtupleDesc = load_type(mod, "StructtupleDesc");
-	StructAggState = load_type(mod, "StructAggState");
-	StructAggStatePerGroupData = load_type(mod, "StructAggStatePerGroupData");
-	StructAggStatePerTransData = load_type(mod, "StructAggStatePerTransData");
-
-	AttributeTemplate = LLVMGetNamedFunction(mod, "AttributeTemplate");
-	FuncStrlen = LLVMGetNamedFunction(mod, "strlen");
-	FuncVarsizeAny = LLVMGetNamedFunction(mod, "varsize_any");
-	FuncSlotGetsomeattrs = LLVMGetNamedFunction(mod, "slot_getsomeattrs");
-	FuncSlotGetmissingattrs = LLVMGetNamedFunction(mod, "slot_getmissingattrs");
-	FuncHeapGetsysattr = LLVMGetNamedFunction(mod, "heap_getsysattr");
-	FuncMakeExpandedObjectReadOnlyInternal = LLVMGetNamedFunction(mod, "MakeExpandedObjectReadOnlyInternal");
-	FuncExecEvalArrayRefSubscript = LLVMGetNamedFunction(mod, "ExecEvalArrayRefSubscript");
-	FuncExecAggTransReparent = LLVMGetNamedFunction(mod, "ExecAggTransReparent");
-	FuncExecAggInitGroup = LLVMGetNamedFunction(mod, "ExecAggInitGroup");
-
-	/*
-	 * Leave the module alive, otherwise references to function would be
-	 * dangling.
-	 */
-
-	return;
+	AttributeTemplate = LLVMGetNamedFunction(llvm_types_module, "AttributeTemplate");
+	ExecEvalSubroutineTemplate = LLVMGetNamedFunction(llvm_types_module, "ExecEvalSubroutineTemplate");
+	ExecEvalBoolSubroutineTemplate = LLVMGetNamedFunction(llvm_types_module, "ExecEvalBoolSubroutineTemplate");
 }
 
 /*
@@ -1013,7 +1197,7 @@ llvm_split_symbol_name(const char *name, char **modname, char **funcname)
 	{
 		/*
 		 * Symbol names cannot contain a ., therefore we can split based on
-		 * first and last occurance of one.
+		 * first and last occurrence of one.
 		 */
 		*funcname = rindex(name, '.');
 		(*funcname)++;			/* jump over . */
@@ -1077,11 +1261,15 @@ llvm_resolve_symbol(const char *symname, void *ctx)
 
 static LLVMErrorRef
 llvm_resolve_symbols(LLVMOrcDefinitionGeneratorRef GeneratorObj, void *Ctx,
-					 LLVMOrcLookupStateRef *LookupState, LLVMOrcLookupKind Kind,
+					 LLVMOrcLookupStateRef * LookupState, LLVMOrcLookupKind Kind,
 					 LLVMOrcJITDylibRef JD, LLVMOrcJITDylibLookupFlags JDLookupFlags,
 					 LLVMOrcCLookupSet LookupSet, size_t LookupSetSize)
 {
+#if LLVM_VERSION_MAJOR > 14
+	LLVMOrcCSymbolMapPairs symbols = palloc0(sizeof(LLVMOrcCSymbolMapPair) * LookupSetSize);
+#else
 	LLVMOrcCSymbolMapPairs symbols = palloc0(sizeof(LLVMJITCSymbolMapPair) * LookupSetSize);
+#endif
 	LLVMErrorRef error;
 	LLVMOrcMaterializationUnitRef mu;
 
@@ -1089,6 +1277,9 @@ llvm_resolve_symbols(LLVMOrcDefinitionGeneratorRef GeneratorObj, void *Ctx,
 	{
 		const char *name = LLVMOrcSymbolStringPoolEntryStr(LookupSet[i].Name);
 
+#if LLVM_VERSION_MAJOR > 12
+		LLVMOrcRetainSymbolStringPoolEntry(LookupSet[i].Name);
+#endif
 		symbols[i].Name = LookupSet[i].Name;
 		symbols[i].Sym.Address = llvm_resolve_symbol(name, NULL);
 		symbols[i].Sym.Flags.GenericFlags = LLVMJITSymbolGenericFlagsExported;
@@ -1126,8 +1317,13 @@ llvm_log_jit_error(void *ctx, LLVMErrorRef error)
 static LLVMOrcObjectLayerRef
 llvm_create_object_layer(void *Ctx, LLVMOrcExecutionSessionRef ES, const char *Triple)
 {
+#ifdef USE_LLVM_BACKPORT_SECTION_MEMORY_MANAGER
 	LLVMOrcObjectLayerRef objlayer =
-	LLVMOrcCreateRTDyldObjectLinkingLayerWithSectionMemoryManager(ES);
+		LLVMOrcCreateRTDyldObjectLinkingLayerWithSafeSectionMemoryManager(ES);
+#else
+	LLVMOrcObjectLayerRef objlayer =
+		LLVMOrcCreateRTDyldObjectLinkingLayerWithSectionMemoryManager(ES);
+#endif
 
 #if defined(HAVE_DECL_LLVMCREATEGDBREGISTRATIONLISTENER) && HAVE_DECL_LLVMCREATEGDBREGISTRATIONLISTENER
 	if (jit_debugging_support)
@@ -1196,7 +1392,11 @@ llvm_create_jit_instance(LLVMTargetMachineRef tm)
 	 * Symbol resolution support for "special" functions, e.g. a call into an
 	 * SQL callable function.
 	 */
+#if LLVM_VERSION_MAJOR > 14
+	ref_gen = LLVMOrcCreateCustomCAPIDefinitionGenerator(llvm_resolve_symbols, NULL, NULL);
+#else
 	ref_gen = LLVMOrcCreateCustomCAPIDefinitionGenerator(llvm_resolve_symbols, NULL);
+#endif
 	LLVMOrcJITDylibAddGenerator(LLVMOrcLLJITGetMainJITDylib(lljit), ref_gen);
 
 	return lljit;

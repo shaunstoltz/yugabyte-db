@@ -1,5 +1,5 @@
 //--------------------------------------------------------------------------------------------------
-// Copyright (c) YugaByte, Inc.
+// Copyright (c) YugabyteDB, Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License"); you may not use this file except
 // in compliance with the License.  You may obtain a copy of the License at
@@ -25,10 +25,7 @@
 namespace yb {
 namespace ql {
 
-using std::list;
-using std::shared_ptr;
 using std::string;
-using std::unique_ptr;
 
 Statement::Statement(const string& keyspace, const string& text)
     : keyspace_(keyspace), text_(text) {
@@ -41,7 +38,7 @@ Status Statement::Prepare(QLProcessor *processor, const MemTrackerPtr& mem_track
                           const bool internal, PreparedResult::UniPtr *result) {
   // Prepare the statement (parse and semantically analysis). Do so within an exclusive lock.
   if (!prepared_.load(std::memory_order_acquire)) {
-    std::lock_guard<std::mutex> guard(parse_tree_mutex_);
+    std::lock_guard guard(parse_tree_mutex_);
 
     if (parse_tree_ == nullptr) {
       ParseTree::UniPtr parse_tree;

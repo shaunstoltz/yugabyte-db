@@ -3,9 +3,9 @@
 //  LICENSE file in the root directory of this source tree. An additional grant
 //  of patent rights can be found in the PATENTS file in the same directory.
 //
-// The following only applies to changes made to this file as part of YugaByte development.
+// The following only applies to changes made to this file as part of YugabyteDB development.
 //
-// Portions Copyright (c) YugaByte, Inc.
+// Portions Copyright (c) YugabyteDB, Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License"); you may not use this file except
 // in compliance with the License.  You may obtain a copy of the License at
@@ -26,6 +26,8 @@
 #include <string>
 #include <vector>
 
+#include "yb/rocksdb/rocksdb_fwd.h"
+
 #include "yb/rocksdb/db.h"
 #include "yb/rocksdb/db/dbformat.h"
 #include "yb/rocksdb/db/memtable.h"
@@ -41,7 +43,6 @@ namespace rocksdb {
 class ColumnFamilyData;
 class InternalKeyComparator;
 class InstrumentedMutex;
-class MergeIteratorBuilder;
 
 // keeps a list of immutable memtables in a vector. the list is immutable
 // if refcount is bigger than one. It is used as a state for Get() and
@@ -123,10 +124,14 @@ class MemTableListVersion {
 
   void UnrefMemTable(autovector<MemTable*>* to_delete, MemTable* m);
 
+  void VerifyNumFlushginBytes() const;
+
   friend class MemTableList;
 
   // Immutable MemTables that have not yet been flushed.
   std::list<MemTable*> memlist_;
+
+  size_t total_data_size_ = 0;
 
   // MemTables that have already been flushed
   // (used during Transaction validation)
@@ -184,7 +189,10 @@ class MemTableList {
 
   // Returns accumulated frontier from all tables.
   // Initial value could be passed as `frontier`.
-  UserFrontierPtr GetFrontier(UserFrontierPtr frontier, UpdateUserValueType type);
+  yb::storage::UserFrontierPtr GetFrontier(
+      yb::storage::UserFrontierPtr frontier, yb::storage::UpdateUserValueType type);
+
+  UserFrontierRange MergeFrontiersWith(UserFrontierRange external_range);
 
   // Returns total number of memtables in the list that have been
   // completely flushed and logged.
@@ -197,7 +205,8 @@ class MemTableList {
   // Returns the earliest memtables that needs to be flushed. The returned
   // memtables are guaranteed to be in the ascending order of created time.
   void PickMemtablesToFlush(autovector<MemTable*>* mems,
-                            const MemTableFilter& filter = MemTableFilter());
+                            const MemTableFilter& filter = MemTableFilter(),
+                            const MutableCFOptions* mutable_cf_options = nullptr);
 
   // Reset status of the given memtable list back to pending state so that
   // they can get picked up again on the next round of flush.
@@ -228,6 +237,8 @@ class MemTableList {
   // parameter). This flush request will persist until the next time
   // PickMemtablesToFlush() is called.
   void FlushRequested() { flush_requested_ = true; }
+
+  size_t TotalDataSize() const;
 
   // Copying allowed
   // MemTableList(const MemTableList&);

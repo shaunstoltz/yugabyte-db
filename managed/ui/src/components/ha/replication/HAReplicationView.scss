@@ -1,10 +1,24 @@
-@import '../../../_style/colors';
+@use '../../../_style/colors';
 
 .ha-replication-view {
+  border: 1px solid colors.$YB_FORM_GROUP_BORDER;
+  border-radius: 8px;
+
+  &__header {
+    display: flex;
+    align-items: center;
+
+    padding: 8px 24px;
+
+    border-bottom: 1px solid colors.$YB_FORM_GROUP_BORDER;
+  }
+
   &__header-buttons {
     display: flex;
     justify-content: flex-end;
     align-items: center;
+
+    margin-left: auto;
 
     > .btn {
       margin-right: 8px;
@@ -21,7 +35,7 @@
   }
 
   &__label {
-    color: $YB_SUBTITLE_COLOR;
+    color: colors.$YB_SUBTITLE_COLOR;
   }
 
   &__value {
@@ -66,14 +80,13 @@
     border: none;
     padding: 0;
 
-    color: $YB_ORANGE;
+    color: colors.$YB_ORANGE;
     &:hover {
-      color: $YB_ORANGE_HOVER;
+      color: colors.$YB_ORANGE_HOVER;
       text-decoration: underline;
     }
     cursor: pointer;
   }
-  
 
   &__cert-container {
     display: flex;

@@ -1,42 +1,47 @@
-// Copyright (c) YugaByte, Inc.
+// Copyright (c) YugabyteDB, Inc.
 
 package com.yugabyte.yw.models;
 
 import static io.swagger.annotations.ApiModelProperty.AccessMode.READ_ONLY;
 
+import com.fasterxml.jackson.annotation.JsonFormat;
 import com.google.common.collect.ImmutableMultimap;
 import com.google.common.collect.ImmutableSet;
 import com.google.common.collect.Multimap;
-import com.yugabyte.yw.common.BackupUtil;
+import com.yugabyte.yw.common.backuprestore.BackupUtil;
 import com.yugabyte.yw.forms.BackupTableParams;
 import com.yugabyte.yw.forms.RestoreBackupParams;
 import io.ebean.ExpressionList;
 import io.ebean.Finder;
 import io.ebean.Model;
-import io.ebean.annotation.CreatedTimestamp;
+import io.ebean.annotation.DbJson;
 import io.ebean.annotation.EnumValue;
-import io.ebean.annotation.UpdatedTimestamp;
+import io.ebean.annotation.WhenCreated;
+import io.ebean.annotation.WhenModified;
 import io.swagger.annotations.ApiModel;
 import io.swagger.annotations.ApiModelProperty;
-import java.text.SimpleDateFormat;
+import jakarta.persistence.Column;
+import jakarta.persistence.Entity;
+import jakarta.persistence.EnumType;
+import jakarta.persistence.Enumerated;
+import jakarta.persistence.Id;
 import java.util.Date;
 import java.util.List;
+import java.util.Objects;
 import java.util.Optional;
 import java.util.UUID;
-import javax.persistence.Column;
-import javax.persistence.Entity;
-import javax.persistence.EnumType;
-import javax.persistence.Enumerated;
-import javax.persistence.Id;
+import lombok.Getter;
+import lombok.Setter;
+import org.apache.commons.collections4.CollectionUtils;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
-import play.libs.Json;
 
 @ApiModel(description = "Keyspace level restores")
 @Entity
+@Getter
+@Setter
 public class RestoreKeyspace extends Model {
   public static final Logger LOG = LoggerFactory.getLogger(RestoreKeyspace.class);
-  SimpleDateFormat tsFormat = new SimpleDateFormat("yyyy-MM-dd'T'HH:mm:ss");
   public static final Finder<UUID, RestoreKeyspace> find =
       new Finder<UUID, RestoreKeyspace>(RestoreKeyspace.class) {};
 
@@ -69,67 +74,48 @@ public class RestoreKeyspace extends Model {
 
   @ApiModelProperty(value = "Restore keyspace UUID", accessMode = READ_ONLY)
   @Id
-  public UUID uuid;
+  private UUID uuid;
 
   @ApiModelProperty(value = "Universe-level Restore UUID", accessMode = READ_ONLY)
   @Column(nullable = false)
-  public UUID restoreUUID;
+  private UUID restoreUUID;
 
   @ApiModelProperty(value = "Restore Keyspace task UUID", accessMode = READ_ONLY)
   @Column(nullable = false)
-  public UUID taskUUID;
-
-  public UUID getTaskUUID() {
-    return taskUUID;
-  }
-
-  public void setTaskUUID(UUID uuid) {
-    this.taskUUID = uuid;
-  }
+  private UUID taskUUID;
 
   @ApiModelProperty(value = "Source keyspace name", accessMode = READ_ONLY)
   @Column
-  public String sourceKeyspace;
+  private String sourceKeyspace;
 
   @ApiModelProperty(value = "Storage location name", accessMode = READ_ONLY)
   @Column
-  public String storageLocation;
+  private String storageLocation;
 
   @ApiModelProperty(value = "Target keyspace name", accessMode = READ_ONLY)
   @Column
-  public String targetKeyspace;
+  private String targetKeyspace;
+
+  @ApiModelProperty(value = "Restored Table name List", accessMode = READ_ONLY)
+  @Column(columnDefinition = "TEXT")
+  @DbJson
+  private List<String> tableNameList;
 
   @Enumerated(EnumType.STRING)
   @ApiModelProperty(value = "State of the keyspace restore", accessMode = READ_ONLY)
   private State state;
 
-  public State getState() {
-    return state;
-  }
+  @JsonFormat(shape = JsonFormat.Shape.STRING, pattern = "yyyy-MM-dd'T'HH:mm:ss'Z'")
+  @ApiModelProperty(value = "RestoreKeyspace task creation time", example = "2022-12-12T13:07:18Z")
+  @WhenCreated
+  private Date createTime;
 
-  public void setState(State state) {
-    this.state = state;
-  }
-
-  @CreatedTimestamp private Date createTime;
-
-  public Date getCreateTime() {
-    return createTime;
-  }
-
-  public void setCreateTime(Date createTime) {
-    this.createTime = createTime;
-  }
-
-  @UpdatedTimestamp private Date completeTime;
-
-  public Date getCompleteTime() {
-    return completeTime;
-  }
-
-  public void setCompleteTime(Date completeTime) {
-    this.completeTime = completeTime;
-  }
+  @JsonFormat(shape = JsonFormat.Shape.STRING, pattern = "yyyy-MM-dd'T'HH:mm:ss'Z'")
+  @ApiModelProperty(
+      value = "RestoreKeyspace task completion time",
+      example = "2022-12-12T13:07:18Z")
+  @WhenModified
+  private Date completeTime;
 
   private static final Multimap<State, State> ALLOWED_TRANSITIONS =
       ImmutableMultimap.<State, State>builder()
@@ -160,23 +146,29 @@ public class RestoreKeyspace extends Model {
 
   public static RestoreKeyspace create(UUID taskUUID, RestoreBackupParams taskDetails) {
     RestoreKeyspace restoreKeyspace = new RestoreKeyspace();
-    restoreKeyspace.uuid = UUID.randomUUID();
+    restoreKeyspace.setUuid(UUID.randomUUID());
 
-    restoreKeyspace.restoreUUID = taskDetails.prefixUUID;
-    restoreKeyspace.taskUUID = taskUUID;
+    restoreKeyspace.setRestoreUUID(taskDetails.prefixUUID);
+    restoreKeyspace.setTaskUUID(taskUUID);
 
-    RestoreBackupParams.BackupStorageInfo storageInfo = taskDetails.backupStorageInfoList.get(0);
-    restoreKeyspace.storageLocation = storageInfo.storageLocation;
-    restoreKeyspace.targetKeyspace = storageInfo.keyspace;
-    restoreKeyspace.sourceKeyspace =
-        BackupUtil.getKeyspaceFromStorageLocation(restoreKeyspace.storageLocation);
+    if (!CollectionUtils.isEmpty(taskDetails.backupStorageInfoList)) {
+      RestoreBackupParams.BackupStorageInfo storageInfo = taskDetails.backupStorageInfoList.get(0);
+      restoreKeyspace.setStorageLocation(storageInfo.storageLocation);
+      restoreKeyspace.setTargetKeyspace(storageInfo.keyspace);
+      restoreKeyspace.setSourceKeyspace(
+          BackupUtil.getKeyspaceFromStorageLocation(restoreKeyspace.getStorageLocation()));
+      restoreKeyspace.setTableNameList(storageInfo.tableNameList);
+    }
     restoreKeyspace.state = RestoreKeyspace.State.InProgress;
     restoreKeyspace.save();
     return restoreKeyspace;
   }
 
   public long getBackupSizeFromStorageLocation() {
-    long backupSize = getBackupSizeFromStorageLocation(storageLocation);
+    if (getStorageLocation() == null) {
+      return 0L;
+    }
+    long backupSize = getBackupSizeFromStorageLocation(getStorageLocation());
     return backupSize;
   }
 
@@ -184,17 +176,19 @@ public class RestoreKeyspace extends Model {
     Optional<BackupTableParams> backupParams =
         Backup.findBackupParamsWithStorageLocation(storageLocation);
     if (backupParams.isPresent()) {
-      return backupParams.get().backupSizeInBytes;
+      if (!Objects.isNull(backupParams.get().backupSizeInBytes)) {
+        return backupParams.get().backupSizeInBytes;
+      }
     }
     return 0L;
   }
 
   public static void update(Restore restore, TaskInfo.State parentState) {
     List<RestoreKeyspace> restoreKeyspaceList =
-        fetchRestoreKeyspaceFromRestoreUUID(restore.restoreUUID);
+        fetchRestoreKeyspaceFromRestoreUUID(restore.getRestoreUUID());
     State restoreKeyspaceState = fetchStateFromTaskInfoState(parentState);
     for (RestoreKeyspace restoreKeyspace : restoreKeyspaceList) {
-      restoreKeyspace.update(restoreKeyspace.taskUUID, restoreKeyspaceState);
+      restoreKeyspace.update(restoreKeyspace.getTaskUUID(), restoreKeyspaceState);
     }
   }
 
@@ -218,11 +212,14 @@ public class RestoreKeyspace extends Model {
     } else {
       LOG.error("Ignored INVALID STATE TRANSITION  {} -> {}", getState(), newRestoreKeyspaceState);
     }
-    setCompleteTime(taskInfo.getLastUpdateTime());
+    setCompleteTime(taskInfo.getUpdateTime());
     save();
   }
 
   public static Optional<RestoreKeyspace> fetchRestoreKeyspace(UUID restoreKeyspaceUUID) {
+    if (restoreKeyspaceUUID == null) {
+      return Optional.empty();
+    }
     RestoreKeyspace restoreKeyspace = find.byId(restoreKeyspaceUUID);
     if (restoreKeyspace == null) {
       LOG.trace("Cannot find restoreKeyspace {}", restoreKeyspaceUUID);
@@ -231,14 +228,15 @@ public class RestoreKeyspace extends Model {
     return Optional.of(restoreKeyspace);
   }
 
-  public static Optional<RestoreKeyspace> fetchRestoreKeyspaceByRestoreIdAndKeyspaceName(
-      UUID restoreUUID, String targetKeyspace) {
+  public static Optional<RestoreKeyspace> fetchRestoreKeyspace(
+      UUID restoreUUID, String targetKeyspace, String location) {
     ExpressionList<RestoreKeyspace> query =
         RestoreKeyspace.find
             .query()
             .where()
             .eq("restore_uuid", restoreUUID)
-            .eq("target_keyspace", targetKeyspace);
+            .eq("target_keyspace", targetKeyspace)
+            .eq("storage_location", location);
     List<RestoreKeyspace> restoreKeyspaceList = query.findList();
     if (restoreKeyspaceList.size() == 0) {
       LOG.trace(

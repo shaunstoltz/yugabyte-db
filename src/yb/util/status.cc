@@ -2,9 +2,9 @@
 // Use of this source code is governed by a BSD-style license that can be
 // found in the LICENSE file. See the AUTHORS file for names of contributors.
 //
-// The following only applies to changes made to this file as part of YugaByte development.
+// The following only applies to changes made to this file as part of YugabyteDB development.
 //
-// Portions Copyright (c) YugaByte, Inc.
+// Portions Copyright (c) YugabyteDB, Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License"); you may not use this file except
 // in compliance with the License.  You may obtain a copy of the License at
@@ -17,7 +17,7 @@
 // under the License.
 //
 
-// Portions Copyright (c) YugaByte, Inc.
+// Portions Copyright (c) YugabyteDB, Inc.
 #include "yb/util/status.h"
 
 #include <array>
@@ -31,16 +31,18 @@
 #include "yb/util/slice.h"
 #include "yb/util/status_ec.h"
 
+using namespace std::literals;
+
 namespace yb {
 
 namespace {
 
 #ifndef NDEBUG
 // This allows to dump stack traces whenever an error status matching a certain regex is generated.
-boost::optional<std::regex> StatusStackTraceRegEx() {
+std::optional<std::regex> StatusStackTraceRegEx() {
   const char* regex_str = getenv("YB_STACK_TRACE_ON_ERROR_STATUS_RE");
   if (!regex_str) {
-    return boost::none;
+    return std::nullopt;
   }
   return std::regex(regex_str);
 }
@@ -57,12 +59,12 @@ struct StatusCategories {
     bool first = true;
     for (size_t i = 0; i < categories.size(); ++i) {
       const auto& category = categories[i];
-      if (category.name != nullptr) {
+      if (!category.name.empty()) {
         if (!first) {
           ss << ", ";
         }
         first = false;
-        ss << i << "=" << *category.name;
+        ss << i << "=" << category.name;
       }
     }
     return ss.str();
@@ -79,24 +81,23 @@ struct StatusCategories {
   }
 
   void Register(const StatusCategoryDescription& description) {
-    CHECK(!categories[description.id].name);
-    categories[description.id] = description;
+    auto& category = categories[description.id];
+    CHECK(category.name.empty())
+        << "Conflict on " << static_cast<uint32_t>(description.id)
+        << " between '" << category.name << "' and '" << description.name << "'";
+    category = description;
   }
 
-  const std::string& CategoryName(uint8_t category) {
+  std::string_view CategoryName(uint8_t category) {
     const auto& description = categories[category];
-    if (!description.name) {
-      static std::string kUnknownCategory("unknown error category");
-      return kUnknownCategory;
-    }
-    return *description.name;
+    return description.name.empty() ? "unknown error category"sv : description.name;
   }
 
   // Returns data slice w/o category for error code starting with start.
   Slice GetSlice(const uint8_t* start) {
-    const uint8_t category_id = *start;
+    const auto category_id = *start;
     const auto& description = categories[category_id];
-    if (description.name == nullptr) {
+    if (description.name.empty()) {
       if (category_id > 0)
         ReportMissingCategory(category_id, __func__);
       return Slice();
@@ -105,9 +106,9 @@ struct StatusCategories {
   }
 
   std::string ToString(Slice encoded_err_code) {
-    const uint8_t category_id = *encoded_err_code.data();
+    const auto category_id = *encoded_err_code.data();
     const auto& description = categories[category_id];
-    if (description.name == nullptr) {
+    if (description.name.empty()) {
       if (category_id > 0)
         ReportMissingCategory(category_id, __func__);
       return std::string();
@@ -362,23 +363,17 @@ Status::StatePtr Status::State::Create(
   return result;
 }
 
-Status::Status(Code code,
-               const char* file_name,
-               int line_number,
-               const Slice& msg,
-               const Slice& msg2,
-               const StatusErrorCode* error,
-               size_t file_name_len)
+Status::Status(
+    Code code, const char* file_name, int line_number, const Slice& msg, const Slice& msg2,
+    const StatusErrorCode* error, size_t file_name_len)
     : state_(State::Create(code, file_name, line_number, msg, msg2, error, file_name_len)) {
 #ifndef NDEBUG
   static const bool print_stack_trace = getenv("YB_STACK_TRACE_ON_ERROR_STATUS") != nullptr;
-  static const boost::optional<std::regex> status_stack_trace_re =
-      StatusStackTraceRegEx();
+  static const std::optional<std::regex> status_stack_trace_re = StatusStackTraceRegEx();
 
   std::string string_rep;  // To avoid calling ToString() twice.
-  if (print_stack_trace ||
-      (status_stack_trace_re &&
-       std::regex_search(string_rep = ToString(), *status_stack_trace_re))) {
+  if (print_stack_trace || (status_stack_trace_re &&
+                            std::regex_search(string_rep = ToString(), *status_stack_trace_re))) {
     if (string_rep.empty()) {
       string_rep = ToString();
     }
@@ -409,7 +404,7 @@ Status::Status(StatePtr state)
     : state_(std::move(state)) {
 }
 
-Status::Status(YBCStatusStruct* state, AddRef add_ref)
+Status::Status(YbcStatusStruct* state, AddRef add_ref)
     : state_(pointer_cast<State*>(state), add_ref) {
 }
 
@@ -430,15 +425,15 @@ Status::Status(Code code,
     : Status(code, file_name, line_number, msg, error.Message(), error, file_name_len) {
 }
 
-YBCStatusStruct* Status::RetainStruct() const {
+YbcStatusStruct* Status::RetainStruct() const {
   if (state_) {
     intrusive_ptr_add_ref(state_.get());
   }
-  return pointer_cast<YBCStatusStruct*>(state_.get());
+  return pointer_cast<YbcStatusStruct*>(state_.get());
 }
 
-YBCStatusStruct* Status::DetachStruct() {
-  return pointer_cast<YBCStatusStruct*>(state_.detach());
+YbcStatusStruct* Status::DetachStruct() {
+  return pointer_cast<YbcStatusStruct*>(state_.detach());
 }
 
 const char* Status::CodeAsCString() const {
@@ -647,12 +642,8 @@ void Status::RegisterCategory(const StatusCategoryDescription& description) {
   status_categories().Register(description);
 }
 
-const std::string& Status::CategoryName(uint8_t category) {
+std::string_view Status::CategoryName(uint8_t category) {
   return status_categories().CategoryName(category);
-}
-
-StatusCategoryRegisterer::StatusCategoryRegisterer(const StatusCategoryDescription& description) {
-  Status::RegisterCategory(description);
 }
 
 std::string StringVectorBackedErrorTag::DecodeToString(const uint8_t* source) {
@@ -662,5 +653,26 @@ std::string StringVectorBackedErrorTag::DecodeToString(const uint8_t* source) {
 void StatusCheck(bool value) {
   CHECK(value);
 }
+
+Status StatusHolder::GetStatus() const {
+  if (PREDICT_TRUE(is_ok_.load(std::memory_order_acquire))) {
+    return Status::OK();
+  }
+  std::lock_guard lock(mutex_);
+  return status_;
+}
+
+void StatusHolder::SetError(const Status& status) {
+  std::lock_guard lock(mutex_);
+  status_ = status;
+  is_ok_.store(false, std::memory_order_release);
+}
+
+void StatusHolder::Reset() {
+  std::lock_guard lock(mutex_);
+  status_ = Status::OK();
+  is_ok_.store(true, std::memory_order_release);
+}
+
 
 }  // namespace yb

@@ -1,4 +1,4 @@
-// Copyright (c) YugaByte, Inc.
+// Copyright (c) YugabyteDB, Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License"); you may not use this file except
 // in compliance with the License.  You may obtain a copy of the License at
@@ -50,7 +50,7 @@ class PgLoadBalancerTest : public PgMiniTestBase {
   }
 };
 
-TEST_F(PgLoadBalancerTest, YB_DISABLE_TEST_IN_TSAN(LoadBalanceDuringLongRunningTransaction)) {
+TEST_F(PgLoadBalancerTest, LoadBalanceDuringLongRunningTransaction) {
   ANNOTATE_UNPROTECTED_WRITE(FLAGS_enable_automatic_tablet_splitting) = false;
   ANNOTATE_UNPROTECTED_WRITE(FLAGS_tserver_heartbeat_metrics_interval_ms) = 100;
   ANNOTATE_UNPROTECTED_WRITE(FLAGS_catalog_manager_bg_task_wait_ms) = 1000;
@@ -87,8 +87,7 @@ TEST_F(PgLoadBalancerTest, YB_DISABLE_TEST_IN_TSAN(LoadBalanceDuringLongRunningT
   ASSERT_OK(WaitFor([&]() -> Result<bool> {
     auto peers = cluster_->mini_tablet_server(0)->server()->tablet_manager()->GetTabletPeers();
     for (const auto& peer : peers) {
-      if (peer->tablet() &&
-          peer->TEST_table_type() == PGSQL_TABLE_TYPE &&
+      if (peer->shared_tablet_maybe_null() && peer->TEST_table_type() == PGSQL_TABLE_TYPE &&
           peer->data_state() == tablet::TABLET_DATA_TOMBSTONED) {
         return false;
       }

@@ -1,5 +1,5 @@
 /*
- * Copyright 2021 YugaByte, Inc. and Contributors
+ * Copyright 2021 YugabyteDB, Inc. and Contributors
  *
  * Licensed under the Polyform Free Trial License 1.0.0 (the "License"); you
  * may not use this file except in compliance with the License. You
@@ -21,8 +21,8 @@ import lombok.extern.slf4j.Slf4j;
 @Slf4j
 public class PauseServer extends NodeTaskBase {
   @Inject
-  protected PauseServer(BaseTaskDependencies baseTaskDependencies, NodeManager nodeManager) {
-    super(baseTaskDependencies, nodeManager);
+  protected PauseServer(BaseTaskDependencies baseTaskDependencies) {
+    super(baseTaskDependencies);
   }
 
   public static class Params extends NodeTaskParams {
@@ -36,23 +36,23 @@ public class PauseServer extends NodeTaskBase {
   }
 
   private void pauseUniverse(final String nodeName) {
-    Universe u = Universe.getOrBadRequest(taskParams().universeUUID);
+    Universe u = Universe.getOrBadRequest(taskParams().getUniverseUUID());
     if (u.getNode(nodeName) == null) {
       log.error("No node in universe with name " + nodeName);
       return;
     }
-    log.info("Paused the node " + nodeName + " from universe " + taskParams().universeUUID);
+    log.info("Paused the node " + nodeName + " from universe " + taskParams().getUniverseUUID());
   }
 
   @Override
   public void run() {
     try {
-      // Update the node state as stopping also can not set the node state to stopped
-      // as it will be not reachable.
-      setNodeState(NodeDetails.NodeState.Stopping);
+      // Update the node state as instance stopping also can not set the node state to stopped as it
+      // will be not reachable.
+      setNodeState(NodeDetails.NodeState.InstanceStopping);
       getNodeManager().nodeCommand(NodeManager.NodeCommandType.Pause, taskParams()).processErrors();
       pauseUniverse(taskParams().nodeName);
-      setNodeState(NodeDetails.NodeState.Stopped);
+      setNodeState(NodeDetails.NodeState.InstanceStopped);
     } catch (Exception e) {
       throw e;
     }

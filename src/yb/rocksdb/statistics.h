@@ -3,9 +3,9 @@
 // LICENSE file in the root directory of this source tree. An additional grant
 // of patent rights can be found in the PATENTS file in the same directory.
 //
-// The following only applies to changes made to this file as part of YugaByte development.
+// The following only applies to changes made to this file as part of YugabyteDB development.
 //
-// Portions Copyright (c) YugaByte, Inc.
+// Portions Copyright (c) YugabyteDB, Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License"); you may not use this file except
 // in compliance with the License.  You may obtain a copy of the License at
@@ -30,6 +30,7 @@
 
 namespace yb {
 class MetricEntity;
+class AggregateStats;
 }
 
 namespace rocksdb {
@@ -38,6 +39,8 @@ namespace rocksdb {
  * Keep adding ticker's here.
  *  1. Any ticker should be added before TICKER_ENUM_MAX.
  *  2. Add a readable string in TickersNameMap below for the newly added ticker.
+ *  3. Make sure to add the ticker to the list in src/yb/yql/pggate/pg_metrics_list.h and
+ *     src/yb/docdb/docdb_statistics.cc as well.
  */
 enum Tickers : uint32_t {
   // total block cache misses
@@ -66,8 +69,6 @@ enum Tickers : uint32_t {
   BLOCK_CACHE_DATA_MISS,
   // # of times cache hit when accessing data block from block cache.
   BLOCK_CACHE_DATA_HIT,
-  // # of bytes read from cache.
-  BLOCK_CACHE_BYTES_READ,
   // # of bytes written into cache.
   BLOCK_CACHE_BYTES_WRITE,
   // # of times bloom filter has avoided file reads.
@@ -204,16 +205,18 @@ enum Tickers : uint32_t {
   // Single-touch and multi-touch statistics.
   BLOCK_CACHE_SINGLE_TOUCH_HIT,
   BLOCK_CACHE_SINGLE_TOUCH_ADD,
-  BLOCK_CACHE_SINGLE_TOUCH_BYTES_READ,
   BLOCK_CACHE_SINGLE_TOUCH_BYTES_WRITE,
   BLOCK_CACHE_MULTI_TOUCH_HIT,
   BLOCK_CACHE_MULTI_TOUCH_ADD,
-  BLOCK_CACHE_MULTI_TOUCH_BYTES_READ,
   BLOCK_CACHE_MULTI_TOUCH_BYTES_WRITE,
 
   // Files filtered during compaction due to TTL expiration
   COMPACTION_FILES_FILTERED,
   COMPACTION_FILES_NOT_FILTERED,
+
+  READAHEAD_RESET,
+  READAHEAD_CALLS,
+  READAHEAD_BYTES_READ,
 
   // End of ticker enum.
   TICKER_ENUM_MAX,
@@ -221,104 +224,7 @@ enum Tickers : uint32_t {
 
 // The order of items listed in  Tickers should be the same as
 // the order listed in TickersNameMap
-const std::vector<std::pair<Tickers, std::string>> TickersNameMap = {
-    {BLOCK_CACHE_MISS, "rocksdb_block_cache_miss"},
-    {BLOCK_CACHE_HIT, "rocksdb_block_cache_hit"},
-    {BLOCK_CACHE_ADD, "rocksdb_block_cache_add"},
-    {BLOCK_CACHE_ADD_FAILURES, "rocksdb_block_cache_add_failures"},
-    {BLOCK_CACHE_INDEX_MISS, "rocksdb_block_cache_index_miss"},
-    {BLOCK_CACHE_INDEX_HIT, "rocksdb_block_cache_index_hit"},
-    {BLOCK_CACHE_FILTER_MISS, "rocksdb_block_cache_filter_miss"},
-    {BLOCK_CACHE_FILTER_HIT, "rocksdb_block_cache_filter_hit"},
-    {BLOCK_CACHE_DATA_MISS, "rocksdb_block_cache_data_miss"},
-    {BLOCK_CACHE_DATA_HIT, "rocksdb_block_cache_data_hit"},
-    {BLOCK_CACHE_BYTES_READ, "rocksdb_block_cache_bytes_read"},
-    {BLOCK_CACHE_BYTES_WRITE, "rocksdb_block_cache_bytes_write"},
-    {BLOOM_FILTER_USEFUL, "rocksdb_bloom_filter_useful"},
-    {BLOOM_FILTER_CHECKED, "rocksdb_bloom_filter_checked"},
-    {MEMTABLE_HIT, "rocksdb_memtable_hit"},
-    {MEMTABLE_MISS, "rocksdb_memtable_miss"},
-    {GET_HIT_L0, "rocksdb_l0_hit"},
-    {GET_HIT_L1, "rocksdb_l1_hit"},
-    {GET_HIT_L2_AND_UP, "rocksdb_l2andup_hit"},
-    {COMPACTION_KEY_DROP_NEWER_ENTRY, "rocksdb_compaction_key_drop_new"},
-    {COMPACTION_KEY_DROP_OBSOLETE, "rocksdb_compaction_key_drop_obsolete"},
-    {COMPACTION_KEY_DROP_USER, "rocksdb_compaction_key_drop_user"},
-    {NUMBER_KEYS_WRITTEN, "rocksdb_number_keys_written"},
-    {NUMBER_KEYS_READ, "rocksdb_number_keys_read"},
-    {NUMBER_KEYS_UPDATED, "rocksdb_number_keys_updated"},
-    {BYTES_WRITTEN, "rocksdb_bytes_written"},
-    {BYTES_READ, "rocksdb_bytes_read"},
-    {NUMBER_DB_SEEK, "rocksdb_number_db_seek"},
-    {NUMBER_DB_NEXT, "rocksdb_number_db_next"},
-    {NUMBER_DB_PREV, "rocksdb_number_db_prev"},
-    {NUMBER_DB_SEEK_FOUND, "rocksdb_number_db_seek_found"},
-    {NUMBER_DB_NEXT_FOUND, "rocksdb_number_db_next_found"},
-    {NUMBER_DB_PREV_FOUND, "rocksdb_number_db_prev_found"},
-    {ITER_BYTES_READ, "rocksdb_db_iter_bytes_read"},
-    {NO_FILE_CLOSES, "rocksdb_no_file_closes"},
-    {NO_FILE_OPENS, "rocksdb_no_file_opens"},
-    {NO_FILE_ERRORS, "rocksdb_no_file_errors"},
-    {STALL_L0_SLOWDOWN_MICROS, "rocksdb_l0_slowdown_micros"},
-    {STALL_MEMTABLE_COMPACTION_MICROS, "rocksdb_memtable_compaction_micros"},
-    {STALL_L0_NUM_FILES_MICROS, "rocksdb_l0_num_files_stall_micros"},
-    {STALL_MICROS, "rocksdb_stall_micros"},
-    {DB_MUTEX_WAIT_MICROS, "rocksdb_db_mutex_wait_micros"},
-    {RATE_LIMIT_DELAY_MILLIS, "rocksdb_rate_limit_delay_millis"},
-    {NO_ITERATORS, "rocksdb_num_iterators"},
-    {NUMBER_MULTIGET_CALLS, "rocksdb_number_multiget_get"},
-    {NUMBER_MULTIGET_KEYS_READ, "rocksdb_number_multiget_keys_read"},
-    {NUMBER_MULTIGET_BYTES_READ, "rocksdb_number_multiget_bytes_read"},
-    {NUMBER_FILTERED_DELETES, "rocksdb_number_deletes_filtered"},
-    {NUMBER_MERGE_FAILURES, "rocksdb_number_merge_failures"},
-    {SEQUENCE_NUMBER, "rocksdb_sequence_number"},
-    {BLOOM_FILTER_PREFIX_CHECKED, "rocksdb_bloom_filter_prefix_checked"},
-    {BLOOM_FILTER_PREFIX_USEFUL, "rocksdb_bloom_filter_prefix_useful"},
-    {NUMBER_OF_RESEEKS_IN_ITERATION, "rocksdb_number_reseeks_iteration"},
-    {GET_UPDATES_SINCE_CALLS, "rocksdb_getupdatessince_calls"},
-    {BLOCK_CACHE_COMPRESSED_MISS, "rocksdb_block_cachecompressed_miss"},
-    {BLOCK_CACHE_COMPRESSED_HIT, "rocksdb_block_cachecompressed_hit"},
-    {BLOCK_CACHE_COMPRESSED_ADD, "rocksdb_block_cachecompressed_add"},
-    {BLOCK_CACHE_COMPRESSED_ADD_FAILURES,
-     "rocksdb_block_cachecompressed_add_failures"},
-    {WAL_FILE_SYNCED, "rocksdb_wal_synced"},
-    {WAL_FILE_BYTES, "rocksdb_wal_bytes"},
-    {WRITE_DONE_BY_SELF, "rocksdb_write_self"},
-    {WRITE_DONE_BY_OTHER, "rocksdb_write_other"},
-    {WRITE_WITH_WAL, "rocksdb_write_wal"},
-    {COMPACT_READ_BYTES, "rocksdb_compact_read_bytes"},
-    {COMPACT_WRITE_BYTES, "rocksdb_compact_write_bytes"},
-    {FLUSH_WRITE_BYTES, "rocksdb_flush_write_bytes"},
-    {NUMBER_DIRECT_LOAD_TABLE_PROPERTIES,
-     "rocksdb_number_direct_load_table_properties"},
-    {NUMBER_SUPERVERSION_ACQUIRES, "rocksdb_number_superversion_acquires"},
-    {NUMBER_SUPERVERSION_RELEASES, "rocksdb_number_superversion_releases"},
-    {NUMBER_SUPERVERSION_CLEANUPS, "rocksdb_number_superversion_cleanups"},
-    {NUMBER_BLOCK_NOT_COMPRESSED, "rocksdb_number_block_not_compressed"},
-    {CURRENT_VERSION_SST_FILES_SIZE, "rocksdb_current_version_sst_files_size"},
-    {OLD_BK_COMPAT_CURRENT_VERSION_SST_FILES_SIZE, "rocksdb_total_sst_files_size"},
-
-    {CURRENT_VERSION_SST_FILES_UNCOMPRESSED_SIZE,
-          "rocksdb_current_version_sst_files_uncompressed_size"},
-
-    {CURRENT_VERSION_NUM_SST_FILES, "rocksdb_current_version_num_sst_files"},
-    {MERGE_OPERATION_TOTAL_TIME, "rocksdb_merge_operation_time_nanos"},
-    {FILTER_OPERATION_TOTAL_TIME, "rocksdb_filter_operation_time_nanos"},
-    {ROW_CACHE_HIT, "rocksdb_row_cache_hit"},
-    {ROW_CACHE_MISS, "rocksdb_row_cache_miss"},
-    {NO_TABLE_CACHE_ITERATORS, "rocksdb_no_table_cache_iterators"},
-    {BLOCK_CACHE_SINGLE_TOUCH_HIT, "rocksdb_block_cache_single_touch_hit"},
-    {BLOCK_CACHE_SINGLE_TOUCH_ADD, "rocksdb_block_cache_single_touch_add"},
-    {BLOCK_CACHE_SINGLE_TOUCH_BYTES_READ, "rocksdb_block_cache_single_touch_bytes_read"},
-    {BLOCK_CACHE_SINGLE_TOUCH_BYTES_WRITE, "rocksdb_block_cache_single_touch_bytes_write"},
-    {BLOCK_CACHE_MULTI_TOUCH_HIT, "rocksdb_block_cache_multi_touch_hit"},
-    {BLOCK_CACHE_MULTI_TOUCH_ADD, "rocksdb_block_cache_multi_touch_add"},
-    {BLOCK_CACHE_MULTI_TOUCH_BYTES_READ, "rocksdb_block_cache_multi_touch_bytes_read"},
-    {BLOCK_CACHE_MULTI_TOUCH_BYTES_WRITE, "rocksdb_block_cache_multi_touch_bytes_write"},
-
-    {COMPACTION_FILES_FILTERED, "rocksdb_compaction_files_filtered"},
-    {COMPACTION_FILES_NOT_FILTERED, "rocksdb_compaction_files_not_filtered"},
-};
+extern const std::pair<Tickers, const char *> TickersNameMap[];
 
 /**
  * Keep adding histogram's here.
@@ -343,36 +249,20 @@ enum Histograms : uint32_t {
   BYTES_PER_READ,
   BYTES_PER_WRITE,
   BYTES_PER_MULTIGET,
+  BLOOM_FILTER_TIME_NANOS,
+  GET_FIXED_SIZE_FILTER_BLOCK_HANDLE_NANOS,
+  GET_FILTER_BLOCK_FROM_CACHE_NANOS,
   HISTOGRAM_ENUM_MAX,  // TODO(ldemailly): enforce HistogramsNameMap match
 };
 
-const std::vector<std::pair<Histograms, std::string>> HistogramsNameMap = {
-    {DB_GET, "rocksdb_db_get_micros"},
-    {DB_WRITE, "rocksdb_db_write_micros"},
-    {COMPACTION_TIME, "rocksdb_compaction_times_micros"},
-    {WAL_FILE_SYNC_MICROS, "rocksdb_wal_file_sync_micros"},
-    {DB_MULTIGET, "rocksdb_db_multiget_micros"},
-    {READ_BLOCK_COMPACTION_MICROS, "rocksdb_read_block_compaction_micros"},
-    {READ_BLOCK_GET_MICROS, "rocksdb_read_block_get_micros"},
-    {WRITE_RAW_BLOCK_MICROS, "rocksdb_write_raw_block_micros"},
-    {NUM_FILES_IN_SINGLE_COMPACTION, "rocksdb_numfiles_in_singlecompaction"},
-    {DB_SEEK, "rocksdb_db_seek_micros"},
-    {SST_READ_MICROS, "rocksdb_sst_read_micros"},
-    {BYTES_PER_READ, "rocksdb_bytes_per_read"},
-    {BYTES_PER_WRITE, "rocksdb_bytes_per_write"},
-    {BYTES_PER_MULTIGET, "rocksdb_bytes_per_multiget"},
-};
+extern const std::pair<Histograms, const char *> HistogramsNameMap[];
 
 struct HistogramData {
   double count;
   double min;
   double max;
   double sum;
-  double median;
-  double percentile95;
-  double percentile99;
   double average;
-  double standard_deviation;
 };
 
 enum StatsLevel {
@@ -393,10 +283,11 @@ class Statistics {
   virtual uint64_t getTickerCount(uint32_t tickerType) const = 0;
   virtual void histogramData(uint32_t type,
                              HistogramData* const data) const = 0;
-  virtual std::string getHistogramString(uint32_t type) const { return ""; }
-  virtual void recordTick(uint32_t tickerType, uint64_t count = 0) = 0;
+  virtual const yb::AggregateStats& getAggregateStats(uint32_t histogramType) const = 0;
+  virtual void recordTick(uint32_t tickerType, uint64_t count = 1) = 0;
   virtual void setTickerCount(uint32_t tickerType, uint64_t count) = 0;
   virtual void measureTime(uint32_t histogramType, uint64_t time) = 0;
+  virtual void addHistogram(uint32_t histogramType, const yb::AggregateStats& stats) = 0;
   virtual void resetTickersForTest() = 0;
 
   virtual const char* GetTickerName(uint32_t ticker_type) const {
@@ -410,9 +301,7 @@ class Statistics {
   }
 
   // Override this function to disable particular histogram collection
-  virtual bool HistEnabledForType(uint32_t type) const {
-    return type < HISTOGRAM_ENUM_MAX;
-  }
+  virtual bool HistEnabledForType(uint32_t type) const;
 
   StatsLevel stats_level_ = kExceptTimeForMutex;
 };

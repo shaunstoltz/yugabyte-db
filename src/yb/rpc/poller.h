@@ -1,4 +1,4 @@
-// Copyright (c) YugaByte, Inc.
+// Copyright (c) YugabyteDB, Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License"); you may not use this file except
 // in compliance with the License.  You may obtain a copy of the License at
@@ -22,8 +22,7 @@
 #include "yb/util/status_fwd.h"
 #include "yb/util/monotime.h"
 
-namespace yb {
-namespace rpc {
+namespace yb::rpc {
 
 // Utility class to invoke specified callback with defined interval using scheduler.
 // TODO Add separate test for poller.
@@ -37,8 +36,15 @@ class Poller {
   Poller(Poller&&) = delete;
   void operator=(Poller&&) = delete;
 
+  void Start(Scheduler& scheduler, MonoDelta interval) {
+    Start(&scheduler, interval);
+  }
+
   void Start(Scheduler* scheduler, MonoDelta interval);
   void Shutdown();
+
+  void Pause();
+  void Resume();
 
  private:
   void Schedule() REQUIRES(mutex_);
@@ -51,14 +57,13 @@ class Poller {
   const std::string log_prefix_;
   const std::function<void()> callback_;
 
-  Scheduler* scheduler_ = nullptr;
-  MonoDelta interval_;
-
   std::mutex mutex_;
+  Scheduler* scheduler_ GUARDED_BY(mutex_) = nullptr;
+  MonoDelta interval_ GUARDED_BY(mutex_);
   bool closing_ GUARDED_BY(mutex_) = false;
   rpc::ScheduledTaskId poll_task_id_ GUARDED_BY(mutex_);
   std::condition_variable cond_ GUARDED_BY(mutex_);
+  bool paused_ GUARDED_BY(mutex_) = false;
 };
 
-} // namespace rpc
-} // namespace yb
+} // namespace yb::rpc

@@ -1,5 +1,5 @@
 /*
- * Copyright 2019 YugaByte, Inc. and Contributors
+ * Copyright 2019 YugabyteDB, Inc. and Contributors
  *
  * Licensed under the Polyform Free Trial License 1.0.0 (the "License"); you
  * may not use this file except in compliance with the License. You
@@ -11,7 +11,6 @@
 package com.yugabyte.yw.commissioner.tasks.subtasks;
 
 import com.yugabyte.yw.commissioner.BaseTaskDependencies;
-import com.yugabyte.yw.commissioner.HealthChecker;
 import com.yugabyte.yw.commissioner.tasks.DestroyUniverse;
 import com.yugabyte.yw.commissioner.tasks.UniverseTaskBase;
 import com.yugabyte.yw.models.AlertConfiguration;
@@ -20,13 +19,9 @@ import javax.inject.Inject;
 
 public class RemoveUniverseEntry extends UniverseTaskBase {
 
-  private final HealthChecker healthChecker;
-
   @Inject
-  protected RemoveUniverseEntry(
-      BaseTaskDependencies baseTaskDependencies, HealthChecker healthChecker) {
+  protected RemoveUniverseEntry(BaseTaskDependencies baseTaskDependencies) {
     super(baseTaskDependencies);
-    this.healthChecker = healthChecker;
   }
 
   @Override
@@ -36,13 +31,13 @@ public class RemoveUniverseEntry extends UniverseTaskBase {
 
   @Override
   public void run() {
-    Universe.delete(taskParams().universeUUID);
+    Universe.delete(taskParams().getUniverseUUID());
 
     alertConfigurationService.handleSourceRemoval(
         taskParams().customerUUID,
         AlertConfiguration.TargetType.UNIVERSE,
-        taskParams().universeUUID);
-    metricService.markSourceRemoved(taskParams().customerUUID, taskParams().universeUUID);
-    healthChecker.handleUniverseRemoval(taskParams().universeUUID);
+        taskParams().getUniverseUUID());
+    metricService.markSourceRemoved(taskParams().customerUUID, taskParams().getUniverseUUID());
+    healthChecker.handleUniverseRemoval(taskParams().getUniverseUUID());
   }
 }

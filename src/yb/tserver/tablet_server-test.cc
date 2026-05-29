@@ -15,9 +15,9 @@
 // specific language governing permissions and limitations
 // under the License.
 //
-// The following only applies to changes made to this file as part of YugaByte development.
+// The following only applies to changes made to this file as part of YugabyteDB development.
 //
-// Portions Copyright (c) YugaByte, Inc.
+// Portions Copyright (c) YugabyteDB, Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License"); you may not use this file except
 // in compliance with the License.  You may obtain a copy of the License at
@@ -30,12 +30,11 @@
 // under the License.
 //
 
-#include "yb/common/index.h"
-#include "yb/common/partition.h"
 #include "yb/common/ql_value.h"
-#include "yb/common/wire_protocol.h"
-
+#include "yb/common/schema_pbutil.h"
 #include "yb/consensus/log-test-base.h"
+
+#include "yb/dockv/partition.h"
 
 #include "yb/gutil/strings/escaping.h"
 #include "yb/gutil/strings/substitute.h"
@@ -45,6 +44,7 @@
 #include "yb/rpc/rpc_test_util.h"
 #include "yb/rpc/yb_rpc.h"
 
+#include "yb/server/call_home-test-util.h"
 #include "yb/server/hybrid_clock.h"
 #include "yb/server/server_base.pb.h"
 #include "yb/server/server_base.proxy.h"
@@ -52,6 +52,7 @@
 #include "yb/tablet/tablet.h"
 #include "yb/tablet/tablet_metadata.h"
 #include "yb/tablet/tablet_peer.h"
+#include "yb/tablet/tablet_types.pb.h"
 
 #include "yb/tserver/mini_tablet_server.h"
 #include "yb/tserver/tablet_server-test-base.h"
@@ -60,33 +61,26 @@
 #include "yb/tserver/ts_tablet_manager.h"
 #include "yb/tserver/tserver_admin.proxy.h"
 #include "yb/tserver/tserver_call_home.h"
-#include "yb/server/call_home-test-util.h"
 #include "yb/tserver/tserver_service.proxy.h"
 
 #include "yb/util/crc.h"
 #include "yb/util/curl_util.h"
 #include "yb/util/metrics.h"
+#include "yb/util/monotime.h"
+#include "yb/util/size_literals.h"
 #include "yb/util/status_log.h"
-#include "yb/util/flags.h"
 
-using yb::consensus::RaftConfigPB;
-using yb::consensus::RaftPeerPB;
-using yb::rpc::Messenger;
 using yb::rpc::MessengerBuilder;
 using yb::rpc::RpcController;
-using yb::server::Clock;
 using yb::server::HybridClock;
-using yb::tablet::Tablet;
-using yb::tablet::TabletPeer;
-using std::shared_ptr;
 using std::string;
 using strings::Substitute;
 
-DEFINE_UNKNOWN_int32(single_threaded_insert_latency_bench_warmup_rows, 100,
+DEFINE_NON_RUNTIME_int32(single_threaded_insert_latency_bench_warmup_rows, 100,
              "Number of rows to insert in the warmup phase of the single threaded"
              " tablet server insert latency micro-benchmark");
 
-DEFINE_UNKNOWN_int32(single_threaded_insert_latency_bench_insert_rows, 1000,
+DEFINE_NON_RUNTIME_int32(single_threaded_insert_latency_bench_insert_rows, 1000,
              "Number of rows to insert in the testing phase of the single threaded"
              " tablet server insert latency micro-benchmark");
 
@@ -100,9 +94,9 @@ DECLARE_string(metric_node_name);
 METRIC_DECLARE_counter(rows_inserted);
 METRIC_DECLARE_counter(rows_updated);
 METRIC_DECLARE_counter(rows_deleted);
+METRIC_DECLARE_gauge_uint64(untracked_memory);
 
-namespace yb {
-namespace tserver {
+namespace yb::tserver {
 
 class TabletServerTest : public TabletServerTestBase {
  public:
@@ -155,7 +149,7 @@ TEST_F(TabletServerTest, TestServerClock) {
   RpcController controller;
 
   ASSERT_OK(generic_proxy_->ServerClock(req, &resp, &controller));
-  ASSERT_GT(mini_server_->server()->clock()->Now().ToUint64(), resp.hybrid_time());
+  ASSERT_GT(mini_server_->Now().ToUint64(), resp.hybrid_time());
 }
 
 TEST_F(TabletServerTest, TestSetFlagsAndCheckWebPages) {
@@ -172,8 +166,8 @@ TEST_F(TabletServerTest, TestSetFlagsAndCheckWebPages) {
     req.set_value("bar");
     ASSERT_OK(proxy.SetFlag(req, &resp, &controller));
     SCOPED_TRACE(resp.DebugString());
-    EXPECT_EQ(server::SetFlagResponsePB::NO_SUCH_FLAG, resp.result());
-    EXPECT_EQ(resp.msg(), "Flag does not exist");
+    ASSERT_EQ(server::SetFlagResponsePB::NO_SUCH_FLAG, resp.result());
+    ASSERT_EQ(resp.msg(), "Flag does not exist");
   }
 
   // Set a valid flag to a valid value.
@@ -184,10 +178,10 @@ TEST_F(TabletServerTest, TestSetFlagsAndCheckWebPages) {
     req.set_value("12345");
     ASSERT_OK(proxy.SetFlag(req, &resp, &controller));
     SCOPED_TRACE(resp.DebugString());
-    EXPECT_EQ(server::SetFlagResponsePB::SUCCESS, resp.result());
-    EXPECT_EQ(resp.msg(), "metrics_retirement_age_ms set to 12345\n");
-    EXPECT_EQ(Substitute("$0", old_val), resp.old_value());
-    EXPECT_EQ(12345, FLAGS_metrics_retirement_age_ms);
+    ASSERT_EQ(server::SetFlagResponsePB::SUCCESS, resp.result());
+    ASSERT_EQ(resp.msg(), "metrics_retirement_age_ms set to 12345\n");
+    ASSERT_EQ(Substitute("$0", old_val), resp.old_value());
+    ASSERT_EQ(12345, FLAGS_metrics_retirement_age_ms);
   }
 
   // Set a valid flag to an invalid value.
@@ -197,30 +191,41 @@ TEST_F(TabletServerTest, TestSetFlagsAndCheckWebPages) {
     req.set_value("foo");
     ASSERT_OK(proxy.SetFlag(req, &resp, &controller));
     SCOPED_TRACE(resp.DebugString());
-    EXPECT_EQ(server::SetFlagResponsePB::BAD_VALUE, resp.result());
-    EXPECT_EQ(resp.msg(), "Unable to set flag: bad value. Check stderr for more information.");
-    EXPECT_EQ(12345, FLAGS_metrics_retirement_age_ms);
+    ASSERT_EQ(server::SetFlagResponsePB::BAD_VALUE, resp.result());
+    ASSERT_STR_CONTAINS(resp.msg(), "Unable to set flag: Bad value");
+    ASSERT_EQ(12345, FLAGS_metrics_retirement_age_ms);
+  }
+  // Set a valid flag to an value that is rejected by its validator.
+  {
+    RpcController controller;
+    req.set_flag("log_min_segments_to_retain");
+    req.set_value("0");
+    ASSERT_OK(proxy.SetFlag(req, &resp, &controller));
+    SCOPED_TRACE(resp.DebugString());
+    ASSERT_EQ(server::SetFlagResponsePB::BAD_VALUE, resp.result());
+    ASSERT_STR_CONTAINS(resp.msg(), "Must be greater than 0");
+    ASSERT_EQ(12345, FLAGS_metrics_retirement_age_ms);
   }
 
   // Try setting a flag which isn't runtime-modifiable
   {
     RpcController controller;
-    req.set_flag("tablet_do_dup_key_checks");
+    req.set_flag("tablet_do_compaction_cleanup_for_intents");
     req.set_value("true");
     ASSERT_OK(proxy.SetFlag(req, &resp, &controller));
     SCOPED_TRACE(resp.DebugString());
-    EXPECT_EQ(server::SetFlagResponsePB::NOT_SAFE, resp.result());
+    ASSERT_EQ(server::SetFlagResponsePB::NOT_SAFE, resp.result());
   }
 
   // Try again, but with the force flag.
   {
     RpcController controller;
-    req.set_flag("tablet_do_dup_key_checks");
+    req.set_flag("tablet_do_compaction_cleanup_for_intents");
     req.set_value("true");
     req.set_force(true);
     ASSERT_OK(proxy.SetFlag(req, &resp, &controller));
     SCOPED_TRACE(resp.DebugString());
-    EXPECT_EQ(server::SetFlagResponsePB::SUCCESS, resp.result());
+    ASSERT_EQ(server::SetFlagResponsePB::SUCCESS, resp.result());
   }
 
   EasyCurl c;
@@ -236,7 +241,7 @@ TEST_F(TabletServerTest, TestSetFlagsAndCheckWebPages) {
   ASSERT_OK(c.FetchURL(Substitute("http://$0/tablet?id=$1", addr, kTabletId),
                        &buf));
   ASSERT_STR_CONTAINS(buf.ToString(), "<th>key</th>");
-  ASSERT_STR_CONTAINS(buf.ToString(), "<td>string NULLABLE NOT A PARTITION KEY</td>");
+  ASSERT_STR_CONTAINS(buf.ToString(), "<td>string NULLABLE VALUE</td>");
 
   ASSERT_OK(c.FetchURL(Substitute("http://$0/tablet-consensus-status?id=$1",
                        addr, kTabletId), &buf));
@@ -248,7 +253,7 @@ TEST_F(TabletServerTest, TestSetFlagsAndCheckWebPages) {
   // metrics was accidentally un-referenced too early, we'd cause it to get retired.
   // If the metrics survive several passes of fetching, then we are pretty sure they will
   // stick around properly for the whole lifetime of the server.
-  FLAGS_metrics_retirement_age_ms = 0;
+  ANNOTATE_UNPROTECTED_WRITE(FLAGS_metrics_retirement_age_ms) = 0;
   for (int i = 0; i < 3; i++) {
     SCOPED_TRACE(i);
     ASSERT_OK(c.FetchURL(strings::Substitute("http://$0/jsonmetricz", addr, kTabletId),
@@ -265,7 +270,7 @@ TEST_F(TabletServerTest, TestSetFlagsAndCheckWebPages) {
     // bugs in the past.
     ASSERT_STR_CONTAINS(buf.ToString(), "hybrid_clock_hybrid_time");
     ASSERT_STR_CONTAINS(buf.ToString(), "threads_started");
-#ifdef YB_TCMALLOC_ENABLED
+#if YB_TCMALLOC_ENABLED
     ASSERT_STR_CONTAINS(buf.ToString(), "tcmalloc_max_total_thread_cache_bytes");
 #endif
     ASSERT_STR_CONTAINS(buf.ToString(), "glog_info_messages");
@@ -310,11 +315,20 @@ TEST_F(TabletServerTest, TestSetFlagsAndCheckWebPages) {
   ASSERT_OK(c.FetchURL(Substitute("http://$0/prometheus-metrics?reset_histograms=false", addr),
                 &buf));
   // Find our target metric and concatenate value zero to it. metric_instance_with_zero_value is a
-  // string looks like: handler_latency_yb_tserver_TabletServerService_Write{quantile=p50.....} 0
+  // string looks like: handler_latency_yb_tserver_TabletServerService_Write{...quantile=p50...} 0
   string page_content = buf.ToString();
-  std::size_t begin = page_content.find("handler_latency_yb_tserver_TabletServerService_Write"
-                                        "{quantile=\"p50\"");
-  std::size_t end = page_content.find("}", begin);
+  const auto kMetricLinePrefix = "handler_latency_yb_tserver_TabletServerService_Write{";
+  std::size_t begin = 0;
+  std::size_t end = 0;
+  while ((begin = page_content.find(kMetricLinePrefix, begin)) != std::string::npos) {
+    end = page_content.find("}", begin);
+    ASSERT_NE(end, std::string::npos);
+    if (page_content.find("quantile=\"p50\"", begin) < end) {
+      break;
+    }
+    begin = end + 1;
+  }
+  ASSERT_NE(begin, std::string::npos);
   string metric_instance_with_zero_value = page_content.substr(begin, end - begin + 1) + " 0";
 
   ASSERT_STR_CONTAINS(buf.ToString(), metric_instance_with_zero_value);
@@ -364,9 +378,10 @@ TEST_F(TabletServerTest, TestInsert) {
   WriteResponsePB resp;
   RpcController controller;
 
-  auto tablet = ASSERT_RESULT(mini_server_->server()->tablet_manager()->GetTablet(kTabletId));
+  auto peer = ASSERT_RESULT(mini_server_->server()->tablet_manager()->GetTablet(kTabletId));
+  auto tablet = ASSERT_RESULT(peer->shared_tablet());
   scoped_refptr<Counter> rows_inserted =
-      METRIC_rows_inserted.Instantiate(tablet->tablet()->GetTabletMetricsEntity());
+      METRIC_rows_inserted.Instantiate(tablet->GetTabletMetricsEntity());
   ASSERT_EQ(0, rows_inserted->value());
   tablet.reset();
 
@@ -405,14 +420,14 @@ TEST_F(TabletServerTest, TestInsert) {
   }
 
   // get the clock's current hybrid_time
-  HybridTime now_before = mini_server_->server()->clock()->Now();
+  HybridTime now_before = mini_server_->Now();
 
   rows_inserted = nullptr;
   ASSERT_OK(ShutdownAndRebuildTablet());
   VerifyRows(schema_, { KeyValue(1, 1), KeyValue(2, 1), KeyValue(1234, 5678) });
 
   // get the clock's hybrid_time after replay
-  HybridTime now_after = mini_server_->server()->clock()->Now();
+  HybridTime now_after = mini_server_->Now();
 
   // make sure 'now_after' is greater than or equal to 'now_before'
   ASSERT_GE(now_after.value(), now_before.value());
@@ -425,13 +440,10 @@ TEST_F(TabletServerTest, TestExternalConsistencyModes_ClientPropagated) {
   RpcController controller;
 
   auto tablet = ASSERT_RESULT(mini_server_->server()->tablet_manager()->GetTablet(kTabletId));
-  // get the current time
-  HybridTime current = mini_server_->server()->clock()->Now();
-  // advance current to some time in the future. we do 5 secs to make
+  // Advance current to some time in the future. we do 5 secs to make
   // sure this hybrid_time will still be in the future when it reaches the
   // server.
-  current = HybridClock::HybridTimeFromMicroseconds(
-      HybridClock::GetPhysicalValueMicros(current) + 5000000);
+  HybridTime current = mini_server_->Now().AddMicroseconds(5000000);
 
   AddTestRowInsert(1234, 5678, "hello world via RPC", &req);
 
@@ -446,11 +458,11 @@ TEST_F(TabletServerTest, TestExternalConsistencyModes_ClientPropagated) {
   // its clock with the client's value.
   HybridTime write_hybrid_time(resp.propagated_hybrid_time());
 
-  ASSERT_EQ(HybridClock::GetPhysicalValueMicros(current),
-            HybridClock::GetPhysicalValueMicros(write_hybrid_time));
+  ASSERT_EQ(current.GetPhysicalValueMicros(),
+            write_hybrid_time.GetPhysicalValueMicros());
 
-  ASSERT_LE(HybridClock::GetLogicalValue(current) + 1,
-            HybridClock::GetLogicalValue(write_hybrid_time));
+  ASSERT_LE(current.GetLogicalValue() + 1,
+            write_hybrid_time.GetLogicalValue());
 }
 
 TEST_F(TabletServerTest, TestInsertAndMutate) {
@@ -557,7 +569,7 @@ TEST_F(TabletServerTest, TestInsertAndMutate) {
   }
 
   // get the clock's current hybrid_time
-  HybridTime now_before = mini_server_->server()->clock()->Now();
+  HybridTime now_before = mini_server_->Now();
 
   ASSERT_NO_FATALS(WARN_NOT_OK(ShutdownAndRebuildTablet(), "Shutdown failed: "));
   VerifyRows(schema_,
@@ -565,7 +577,7 @@ TEST_F(TabletServerTest, TestInsertAndMutate) {
         KeyValue(1234, 2) });
 
   // get the clock's hybrid_time after replay
-  HybridTime now_after = mini_server_->server()->clock()->Now();
+  HybridTime now_after = mini_server_->Now();
 
   // make sure 'now_after' is greater that or equal to 'now_before'
   ASSERT_GE(now_after.value(), now_before.value());
@@ -575,7 +587,7 @@ TEST_F(TabletServerTest, TestInsertAndMutate) {
 // throws an exception.
 TEST_F(TabletServerTest, TestInvalidWriteRequest_BadSchema) {
   SchemaBuilder schema_builder(schema_);
-  ASSERT_OK(schema_builder.AddColumn("col_doesnt_exist", INT32));
+  ASSERT_OK(schema_builder.AddColumn("col_doesnt_exist", DataType::INT32));
   Schema bad_schema_with_ids = schema_builder.Build();
   Schema bad_schema = schema_builder.BuildWithoutIds();
 
@@ -601,7 +613,8 @@ TEST_F(TabletServerTest, TestInvalidWriteRequest_BadSchema) {
 TEST_F(TabletServerTest, TestClientGetsErrorBackWhenRecoveryFailed) {
   ASSERT_NO_FATALS(InsertTestRowsRemote(0, 1, 7));
 
-  ASSERT_OK(tablet_peer_->tablet()->Flush(tablet::FlushMode::kSync));
+  auto tablet = ASSERT_RESULT(tablet_peer_->shared_tablet());
+  ASSERT_OK(tablet->Flush(tablet::FlushMode::kSync, rocksdb::FlushReason::kTestOnly));
 
   // Save the log path before shutting down the tablet (and destroying
   // the tablet peer).
@@ -616,7 +629,7 @@ TEST_F(TabletServerTest, TestClientGetsErrorBackWhenRecoveryFailed) {
   // Connect to it.
   CreateTsClientProxies(HostPort::FromBoundEndpoint(mini_server_->bound_rpc_addr()),
                         proxy_cache_.get(),
-                        &proxy_, &admin_proxy_, &consensus_proxy_, &generic_proxy_);
+                        &proxy_, &admin_proxy_, &consensus_proxy_, &generic_proxy_, &backup_proxy_);
 
   WriteRequestPB req;
   req.set_tablet_id(kTabletId);
@@ -662,7 +675,8 @@ TEST_F(TabletServerTest, TestDeleteTablet) {
   // Put some data in the tablet. We flush and insert more rows to ensure that
   // there is data both in the MRS and on disk.
   ASSERT_NO_FATALS(InsertTestRowsRemote(0, 1, 1));
-  ASSERT_OK(tablet_peer_->tablet()->Flush(tablet::FlushMode::kSync));
+  auto tablet = ASSERT_RESULT(tablet_peer_->shared_tablet());
+  ASSERT_OK(tablet->Flush(tablet::FlushMode::kSync, rocksdb::FlushReason::kTestOnly));
   ASSERT_NO_FATALS(InsertTestRowsRemote(0, 2, 1));
 
   // Drop any local references to the tablet from within this test,
@@ -691,6 +705,9 @@ TEST_F(TabletServerTest, TestDeleteTablet) {
   ASSERT_TRUE(s.IsNotFound()) << s.ToString();
   ASSERT_TRUE(ResultToStatus(
       mini_server_->server()->tablet_manager()->GetTablet(kTabletId)).IsNotFound());
+
+  // Verify that the BlockBasedTable mem tracker is still attached to the server mem tracker.
+  ASSERT_TRUE(mini_server_->server()->mem_tracker()->FindChild("BlockBasedTable") != nullptr);
 }
 
 TEST_F(TabletServerTest, TestDeleteTablet_TabletNotCreated) {
@@ -741,12 +758,13 @@ TEST_F(TabletServerTest, TestConcurrentDeleteTablet) {
 
 TEST_F(TabletServerTest, TestInsertLatencyMicroBenchmark) {
   METRIC_DEFINE_entity(test);
-  METRIC_DEFINE_coarse_histogram(test, insert_latency,
+  METRIC_DEFINE_event_stats(test, insert_latency,
                           "Insert Latency",
                           MetricUnit::kMicroseconds,
-                          "TabletServer single threaded insert latency.");
+                          "TabletServer single threaded insert latency (microseconds).");
 
-  scoped_refptr<Histogram> histogram = METRIC_insert_latency.Instantiate(ts_test_metric_entity_);
+  scoped_refptr<EventStats> stats =
+      METRIC_insert_latency.Instantiate(ts_test_metric_entity_);
 
   auto warmup = AllowSlowTests() ?
       FLAGS_single_threaded_insert_latency_bench_warmup_rows : 10;
@@ -765,7 +783,7 @@ TEST_F(TabletServerTest, TestInsertLatencyMicroBenchmark) {
     InsertTestRowsRemote(0, i, 1);
     MonoTime after = MonoTime::Now();
     MonoDelta delta = after.GetDeltaSince(before);
-    histogram->Increment(delta.ToMicroseconds());
+    stats->Increment(delta.ToMicroseconds());
   }
 
   MonoTime end = MonoTime::Now();
@@ -774,7 +792,7 @@ TEST_F(TabletServerTest, TestInsertLatencyMicroBenchmark) {
   // Generate the JSON.
   std::stringstream out;
   JsonWriter writer(&out, JsonWriter::PRETTY);
-  ASSERT_OK(histogram->WriteAsJson(&writer, MetricJsonOptions()));
+  ASSERT_OK(stats->WriteAsJson(&writer, MetricJsonOptions()));
 
   LOG(INFO) << "Throughput: " << throughput << " rows/sec.";
   LOG(INFO) << out.str();
@@ -801,7 +819,7 @@ TEST_F(TabletServerTest, TestRpcServerCreateDestroy) {
 
 // Simple test to ensure we can create RpcServer with different bind address options.
 TEST_F(TabletServerTest, TestRpcServerRPCFlag) {
-  FLAGS_rpc_bind_addresses = "0.0.0.0:2000";
+  ANNOTATE_UNPROTECTED_WRITE(FLAGS_rpc_bind_addresses) = "0.0.0.0:2000";
   server::RpcServerOptions opts;
   ServerRegistrationPB reg;
   auto tbo = ASSERT_RESULT(TabletServerOptions::CreateTabletServerOptions());
@@ -812,13 +830,13 @@ TEST_F(TabletServerTest, TestRpcServerRPCFlag) {
       "server1", opts, rpc::CreateConnectionContextFactory<rpc::YBInboundConnectionContext>());
   ASSERT_OK(server1.Init(messenger.get()));
 
-  FLAGS_rpc_bind_addresses = "0.0.0.0:2000,0.0.0.1:2001";
+  ANNOTATE_UNPROTECTED_WRITE(FLAGS_rpc_bind_addresses) = "0.0.0.0:2000,0.0.0.1:2001";
   server::RpcServerOptions opts2;
   server::RpcServer server2(
       "server2", opts2, rpc::CreateConnectionContextFactory<rpc::YBInboundConnectionContext>());
   ASSERT_OK(server2.Init(messenger.get()));
 
-  FLAGS_rpc_bind_addresses = "10.20.30.40:2017";
+  ANNOTATE_UNPROTECTED_WRITE(FLAGS_rpc_bind_addresses) = "10.20.30.40:2017";
   server::RpcServerOptions opts3;
   server::RpcServer server3(
       "server3", opts3, rpc::CreateConnectionContextFactory<rpc::YBInboundConnectionContext>());
@@ -837,7 +855,7 @@ TEST_F(TabletServerTest, TestRpcServerRPCFlag) {
   ASSERT_EQ(2017, reg.private_rpc_addresses(0).port());
 
   reg.Clear();
-  FLAGS_rpc_bind_addresses = "10.20.30.40:2017,20.30.40.50:2018";
+  ANNOTATE_UNPROTECTED_WRITE(FLAGS_rpc_bind_addresses) = "10.20.30.40:2017,20.30.40.50:2018";
   server::RpcServerOptions opts4;
   tbo.rpc_opts = opts4;
   TabletServer tserver2(tbo);
@@ -855,14 +873,12 @@ TEST_F(TabletServerTest, TestWriteOutOfBounds) {
   const char *tabletId = "TestWriteOutOfBoundsTablet";
   Schema schema = SchemaBuilder(schema_).Build();
 
-  PartitionSchema partition_schema;
-  CHECK_OK(PartitionSchema::FromPB(PartitionSchemaPB(), schema, &partition_schema));
+  dockv::PartitionSchema partition_schema;
+  CHECK_OK(dockv::PartitionSchema::FromPB(PartitionSchemaPB(), schema, &partition_schema));
 
-  Partition partition;
-  auto table_info = std::make_shared<tablet::TableInfo>(
-      "TEST: ", tablet::Primary::kTrue, "TestWriteOutOfBoundsTable", "test_ns", tabletId,
-      YQL_TABLE_TYPE, schema, IndexMap(), boost::none /* index_info */, 0 /* schema_version */,
-      partition_schema);
+  dockv::Partition partition;
+  auto table_info = tablet::TableInfo::TEST_Create(
+      "TestWriteOutOfBoundsTable", "test_ns", tabletId, YQL_TABLE_TYPE, schema, partition_schema);
   ASSERT_OK(mini_server_->server()->tablet_manager()->CreateNewTablet(
       table_info, tabletId, partition, mini_server_->CreateLocalConfig()));
 
@@ -939,10 +955,12 @@ TEST_F(TabletServerTest, TestChecksumScan) {
 
   // Second row (null string field).
   key = 2;
-  InsertTestRowsRemote(0, key, 1, 1, nullptr, kTabletId, nullptr, nullptr, false);
+  InsertTestRowsRemote(
+      0, key, 1, 1, /*proxy=*/nullptr, kTabletId, /*write_hybrid_times_collector=*/nullptr,
+      /*ts=*/nullptr, /*string_field_defined=*/false);
   controller.Reset();
   ASSERT_OK(proxy_->Checksum(req, &resp, &controller));
-  CalcTestRowChecksum(&total_crc, key, false);
+  CalcTestRowChecksum(&total_crc, key, /*string_field_defined=*/false);
 
   ASSERT_FALSE(resp.has_error()) << resp.error().DebugString();
   ASSERT_EQ(total_crc, resp.checksum());
@@ -959,7 +977,7 @@ TEST_F(TabletServerTest, TestCallHome) {
   const auto webserver_dir = GetWebserverDir();
   CHECK_OK(env_->CreateDir(webserver_dir));
   TestCallHome<TabletServer, TserverCallHome>(
-      webserver_dir, {} /*additional_collections*/, mini_server_->server());
+      webserver_dir, {"ysql_node_stats"} /*additional_collections*/, mini_server_->server());
 }
 
 // This tests whether the enabling/disabling of callhome is happening dynamically
@@ -975,5 +993,144 @@ TEST_F(TabletServerTest, TestGFlagsCallHome) {
   TestGFlagsCallHome<TabletServer, TserverCallHome>(mini_server_->server());
 }
 
-} // namespace tserver
-} // namespace yb
+TEST_F(TabletServerTest, ThreadMetricsStability) {
+  ANNOTATE_UNPROTECTED_WRITE(FLAGS_metrics_retirement_age_ms) = 1;
+  auto ScrapeAndVerifyThreadMetrics = [&]() {
+    MetricPrometheusOptions opts;
+    opts.export_help_and_type = ExportHelpAndType::kFalse;
+    std::stringstream output;
+    PrometheusWriter writer(&output, opts);
+    ASSERT_OK(mini_server_->server()->metric_registry()->WriteForPrometheus(&writer, opts));
+
+    ASSERT_TRUE(output.str().contains("threads_running_"));
+    ASSERT_TRUE(output.str().contains("threads_started_"));
+  };
+
+  // Verify thread metrics are not retired despite FLAGS_metrics_retirement_age_ms = 0.
+  // Requires 3 scrapes because metric retirement is a two-phase process:
+  // - After scrape 1: cleanup thread marks unreferenced metrics for deletion
+  // - After scrape 2: cleanup thread deletes previously marked metrics
+  // - Scrape 3: confirms metrics still exist (if they were unreferenced, they'd be gone)
+
+  ScrapeAndVerifyThreadMetrics();
+  SleepFor(MonoDelta::FromSeconds(1));
+
+  ScrapeAndVerifyThreadMetrics();
+  SleepFor(MonoDelta::FromSeconds(1));
+
+  ScrapeAndVerifyThreadMetrics();
+}
+
+#if YB_TCMALLOC_ENABLED
+TEST_F(TabletServerTest, TestUntrackedMemory) {
+  auto server_metric_entity = mini_server_->server()->metric_entity();
+  ASSERT_TRUE(server_metric_entity->TEST_ContainsMetricName("untracked_memory"));
+
+  const size_t kBufferSize = 10_MB;
+  std::unique_ptr<char[]> alloc(new char[kBufferSize]);
+  // Clang in release mode can optimize out the above allocation unless
+  // we do something with the pointer... so we just log it.
+  VLOG(8) << static_cast<void*>(alloc.get());
+  ASSERT_LE(kBufferSize, server_metric_entity->FindOrNull<FunctionGauge<uint64_t>>(
+      METRIC_untracked_memory)->value());
+}
+#endif
+
+// FlushTablets RPC validation tests, parameterized by operation (FLUSH / COMPACT).
+class FlushTabletsTest
+    : public TabletServerTest,
+      public ::testing::WithParamInterface<FlushTabletsRequestPB::Operation> {
+ protected:
+  FlushTabletsRequestPB::Operation Op() const { return GetParam(); }
+
+  struct FlushResult {
+    FlushTabletsResponsePB resp;
+    Status rpc_status;
+  };
+
+  FlushResult CallFlushTablets(
+      tablet::FlushCompactFlags flags,
+      const std::vector<string>& vector_index_ids = {}) {
+    FlushTabletsRequestPB req;
+    req.set_dest_uuid(mini_server_->server()->fs_manager()->uuid());
+    req.add_tablet_ids(kTabletId);
+    req.set_operation(Op());
+    req.set_flags(flags);
+    for (const auto& id : vector_index_ids) {
+      req.add_vector_index_ids(id);
+    }
+    FlushResult result;
+    RpcController rpc;
+    result.rpc_status = admin_proxy_->FlushTablets(req, &result.resp, &rpc);
+    return result;
+  }
+
+  void AssertSuccess(
+      tablet::FlushCompactFlags flags,
+      const std::vector<string>& vector_index_ids = {}) {
+    auto result = CallFlushTablets(flags, vector_index_ids);
+    ASSERT_OK(result.rpc_status);
+    ASSERT_FALSE(result.resp.has_error()) << result.resp.error().DebugString();
+  }
+
+  void AssertInvalidArgument(
+      tablet::FlushCompactFlags flags,
+      const std::vector<string>& vector_index_ids = {}) {
+    auto result = CallFlushTablets(flags, vector_index_ids);
+    ASSERT_OK(result.rpc_status);
+    ASSERT_TRUE(result.resp.has_error()) << "Expected error but got success";
+    auto status = StatusFromPB(result.resp.error().status());
+    ASSERT_TRUE(status.IsInvalidArgument()) << "Expected InvalidArgument, got: " << status;
+  }
+};
+
+INSTANTIATE_TEST_SUITE_P(
+    FlushAndCompact,
+    FlushTabletsTest,
+    ::testing::Values(FlushTabletsRequestPB::FLUSH, FlushTabletsRequestPB::COMPACT),
+    [](const auto& info) {
+      return info.param == FlushTabletsRequestPB::FLUSH ? "Flush" : "Compact";
+    });
+
+// Tests common to both FLUSH and COMPACT.
+
+TEST_P(FlushTabletsTest, Default) {
+  AssertSuccess(tablet::FLUSH_COMPACT_DEFAULT);
+}
+
+TEST_P(FlushTabletsTest, All) {
+  AssertSuccess(tablet::FLUSH_COMPACT_ALL);
+}
+
+TEST_P(FlushTabletsTest, VectorIndexOnly) {
+  AssertSuccess(tablet::FLUSH_COMPACT_VECTOR_INDEX_ONLY);
+}
+
+TEST_P(FlushTabletsTest, VectorIndexExcludedWithIdsRejected) {
+  AssertInvalidArgument(
+      tablet::FLUSH_COMPACT_VECTOR_INDEX_EXCLUDED, {"fake-vector-index-id"});
+}
+
+TEST_P(FlushTabletsTest, DefaultWithVectorIds) {
+  AssertSuccess(tablet::FLUSH_COMPACT_DEFAULT, {"nonexistent-vector-index"});
+}
+
+// FLUSH accepts REGULAR_FOR_TEST_ONLY; COMPACT rejects it.
+TEST_P(FlushTabletsTest, RegularForTestOnly) {
+  if (Op() == FlushTabletsRequestPB::FLUSH) {
+    AssertSuccess(tablet::FLUSH_COMPACT_REGULAR_FOR_TEST_ONLY);
+  } else {
+    AssertInvalidArgument(tablet::FLUSH_COMPACT_REGULAR_FOR_TEST_ONLY);
+  }
+}
+
+// COMPACT accepts VECTOR_INDEX_EXCLUDED; FLUSH rejects it.
+TEST_P(FlushTabletsTest, VectorIndexExcluded) {
+  if (Op() == FlushTabletsRequestPB::COMPACT) {
+    AssertSuccess(tablet::FLUSH_COMPACT_VECTOR_INDEX_EXCLUDED);
+  } else {
+    AssertInvalidArgument(tablet::FLUSH_COMPACT_VECTOR_INDEX_EXCLUDED);
+  }
+}
+
+} // namespace yb::tserver

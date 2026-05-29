@@ -1,4 +1,4 @@
-// Copyright YugaByte Inc.
+// Copyright YugabyteDB, Inc.
 
 import { connect } from 'react-redux';
 import { browserHistory, withRouter } from 'react-router';
@@ -13,12 +13,19 @@ import {
   resetUniverseInfo,
   fetchUniverseMetadata
 } from '../../../actions/universe';
+import { createErrorMessage } from '../../../utils/ObjectUtils';
 
 const mapDispatchToProps = (dispatch) => {
   return {
     submitDeleteUniverse: (uuid, isForceDelete, isDeleteBackups) => {
       dispatch(deleteUniverse(uuid, isForceDelete, isDeleteBackups)).then((response) => {
-        dispatch(deleteUniverseResponse(response.payload));
+        if (response.error) {
+          if (response.payload.status !== 200) {
+            toast.error(createErrorMessage(response.payload));
+          }
+        } else {
+          dispatch(deleteUniverseResponse(response.payload));
+        }
       });
     },
     submitDeleteReadReplica: (clusterUUID, universeUUID, isForceDelete) => {

@@ -1,13 +1,13 @@
 /*
  * Created on Mon Apr 18 2022
  *
- * Copyright 2021 YugaByte, Inc. and Contributors
+ * Copyright 2021 YugabyteDB, Inc. and Contributors
  * Licensed under the Polyform Free Trial License 1.0.0 (the "License")
  * You may not use this file except in compliance with the License. You may obtain a copy of the License at
  * http://github.com/YugaByte/yugabyte-db/blob/master/licenses/POLYFORM-FREE-TRIAL-LICENSE-1.0.0.txt
  */
 
-import React, { FC, useState } from 'react';
+import { FC, useState } from 'react';
 import { Field as ReduxField } from 'redux-form';
 import { YBLabel } from '../../../common/descriptors';
 import { Field as FormikField } from 'formik';
@@ -147,7 +147,9 @@ export const NTPConfig: FC<NTPConfigProps> = ({
                   <YBMultiEntryInput
                     isDisabled={disabled || !isAllReqCompleted}
                     isLoading={!isAllReqCompleted}
-                    placeholder={isAllReqCompleted ? "Add NTP Servers" : "Loading NTP servers list..."}
+                    placeholder={
+                      isAllReqCompleted ? 'Add NTP Servers' : 'Loading NTP servers list...'
+                    }
                     defaultOptions={configured_ntp_servers.map((t: any) => {
                       return { value: t, label: t };
                     })}

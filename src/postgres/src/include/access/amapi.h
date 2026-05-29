@@ -3,7 +3,7 @@
  * amapi.h
  *	  API for Postgres index access methods.
  *
- * Copyright (c) 2015-2018, PostgreSQL Global Development Group
+ * Copyright (c) 2015-2022, PostgreSQL Global Development Group
  *
  * src/include/access/amapi.h
  *
@@ -26,7 +26,7 @@ struct IndexPath;
 struct IndexInfo;
 
 /*
- * BACKFILL input and output nodes.
+ * YB: BACKFILL input and output nodes.
  * As above, avoiding dependencies on execnodes.h and parsenodes.h.
  */
 struct YbBackfillInfo;
@@ -60,6 +60,46 @@ typedef enum IndexAMProperty
 	AMPROP_CAN_INCLUDE
 } IndexAMProperty;
 
+/*
+ * We use lists of this struct type to keep track of both operators and
+ * support functions while building or adding to an opclass or opfamily.
+ * amadjustmembers functions receive lists of these structs, and are allowed
+ * to alter their "ref" fields.
+ *
+ * The "ref" fields define how the pg_amop or pg_amproc entry should depend
+ * on the associated objects (that is, which dependency type to use, and
+ * which opclass or opfamily it should depend on).
+ *
+ * If ref_is_hard is true, the entry will have a NORMAL dependency on the
+ * operator or support func, and an INTERNAL dependency on the opclass or
+ * opfamily.  This forces the opclass or opfamily to be dropped if the
+ * operator or support func is dropped, and requires the CASCADE option
+ * to do so.  Nor will ALTER OPERATOR FAMILY DROP be allowed.  This is
+ * the right behavior for objects that are essential to an opclass.
+ *
+ * If ref_is_hard is false, the entry will have an AUTO dependency on the
+ * operator or support func, and also an AUTO dependency on the opclass or
+ * opfamily.  This allows ALTER OPERATOR FAMILY DROP, and causes that to
+ * happen automatically if the operator or support func is dropped.  This
+ * is the right behavior for inessential ("loose") objects.
+ *
+ * We also make dependencies on lefttype/righttype, of the same strength as
+ * the dependency on the operator or support func, unless these dependencies
+ * are redundant with the dependency on the operator or support func.
+ */
+typedef struct OpFamilyMember
+{
+	bool		is_func;		/* is this an operator, or support func? */
+	Oid			object;			/* operator or support func's OID */
+	int			number;			/* strategy or support func number */
+	Oid			lefttype;		/* lefttype */
+	Oid			righttype;		/* righttype */
+	Oid			sortfamily;		/* ordering operator's sort opfamily, or 0 */
+	bool		ref_is_hard;	/* hard or soft dependency? */
+	bool		ref_is_family;	/* is dependency on opclass or opfamily? */
+	Oid			refobjid;		/* OID of opclass or opfamily */
+} OpFamilyMember;
+
 
 /*
  * Callback function signatures --- see indexam.sgml for more info.
@@ -80,6 +120,7 @@ typedef bool (*aminsert_function) (Relation indexRelation,
 								   ItemPointer heap_tid,
 								   Relation heapRelation,
 								   IndexUniqueCheck checkUnique,
+								   bool indexUnchanged,
 								   struct IndexInfo *indexInfo);
 
 /* alternate insert callback for YugaByte-based index that passs ybctid instead of ctid */
@@ -100,12 +141,29 @@ typedef void (*yb_amdelete_function) (Relation indexRelation,
 									  Relation heapRelation,
 									  struct IndexInfo *indexInfo);
 
+/* update the tuple identified by 'oldYbctid' for a Yugabyte-based index */
+typedef void (*yb_amupdate_function) (Relation indexRelation,
+									  Datum *values,
+									  bool *isnull,
+									  Datum oldYbctid,
+									  Datum newYbctid,
+									  Relation heapRelation,
+									  struct IndexInfo *indexInfo);
+
 /* backfill this Yugabyte-based index */
 typedef IndexBuildResult *(*yb_ambackfill_function) (Relation heapRelation,
 													 Relation indexRelation,
 													 struct IndexInfo *indexInfo,
 													 struct YbBackfillInfo *bfinfo,
 													 struct YbPgExecOutParam *bfresult);
+
+/* return whether this Yugabyte-based index might recheck indexquals */
+typedef bool (*yb_ammightrecheck_function) (Scan *scan,
+											Relation heap,
+											Relation index,
+											bool xs_want_itup,
+											ScanKey keys,
+											int nkeys);
 
 /* bulk delete */
 typedef IndexBulkDeleteResult *(*ambulkdelete_function) (IndexVacuumInfo *info,
@@ -139,8 +197,17 @@ typedef bool (*amproperty_function) (Oid index_oid, int attno,
 									 IndexAMProperty prop, const char *propname,
 									 bool *res, bool *isnull);
 
+/* name of phase as used in progress reporting */
+typedef char *(*ambuildphasename_function) (int64 phasenum);
+
 /* validate definition of an opclass for this AM */
 typedef bool (*amvalidate_function) (Oid opclassoid);
+
+/* validate operators and support functions to be added to an opclass/family */
+typedef void (*amadjustmembers_function) (Oid opfamilyoid,
+										  Oid opclassoid,
+										  List *operators,
+										  List *functions);
 
 /* prepare for index scan */
 typedef IndexScanDesc (*ambeginscan_function) (Relation indexRelation,
@@ -161,6 +228,17 @@ typedef bool (*amgettuple_function) (IndexScanDesc scan,
 /* fetch all valid tuples */
 typedef int64 (*amgetbitmap_function) (IndexScanDesc scan,
 									   TIDBitmap *tbm);
+
+/* YB: fetch all valid tuples */
+typedef int64 (*yb_amgetbitmap_function) (IndexScanDesc scan,
+										  YbTIDBitmap *ybtbm);
+
+typedef void (*yb_ambindschema_function) (YbcPgStatement handle,
+										  struct IndexInfo *indexInfo,
+										  TupleDesc indexTupleDesc,
+										  int16 *coloptions,
+										  Oid *opclassOids,
+										  Datum reloptions);
 
 /* end index scan */
 typedef void (*amendscan_function) (IndexScanDesc scan);
@@ -199,6 +277,8 @@ typedef struct IndexAmRoutine
 	uint16		amstrategies;
 	/* total number of support functions that this AM uses */
 	uint16		amsupport;
+	/* opclass options support function number or 0 */
+	uint16		amoptsprocnum;
 	/* does AM support ORDER BY indexed column's value? */
 	bool		amcanorder;
 	/* does AM support ORDER BY result of an operator on indexed column? */
@@ -225,6 +305,12 @@ typedef struct IndexAmRoutine
 	bool		amcanparallel;
 	/* does AM support columns included with clause INCLUDE? */
 	bool		amcaninclude;
+	/* does AM use maintenance_work_mem? */
+	bool		amusemaintenanceworkmem;
+	/* OR of parallel vacuum flags.  See vacuum.h for flags. */
+	uint8		amparallelvacuumoptions;
+	/* YB: does AM support in-place update of non-key columns? */
+	bool		ybamcanupdatetupleinplace;
 	/* type of data stored in index, or InvalidOid if variable */
 	Oid			amkeytype;
 
@@ -244,7 +330,9 @@ typedef struct IndexAmRoutine
 	amcostestimate_function amcostestimate;
 	amoptions_function amoptions;
 	amproperty_function amproperty; /* can be NULL */
+	ambuildphasename_function ambuildphasename; /* can be NULL */
 	amvalidate_function amvalidate;
+	amadjustmembers_function amadjustmembers;	/* can be NULL */
 	ambeginscan_function ambeginscan;
 	amrescan_function amrescan;
 	amgettuple_function amgettuple; /* can be NULL */
@@ -258,10 +346,48 @@ typedef struct IndexAmRoutine
 	aminitparallelscan_function aminitparallelscan; /* can be NULL */
 	amparallelrescan_function amparallelrescan; /* can be NULL */
 
-	/* interface functions to support Yugabyte indexes */
+	/* YB properties */
+	/* Whether this AM is for YB relations. */
+	bool		yb_amisforybrelation;
+	bool		yb_amiscopartitioned;
+
+	/* YB functions */
 	yb_aminsert_function yb_aminsert;
 	yb_amdelete_function yb_amdelete;
+	yb_amupdate_function yb_amupdate;
+	/*
+	 * YB: Please note the non-obvious distinction between `ambuild` and
+	 * `yb_ambackfill`.
+	 *
+	 * - `ambuild` is the function invoked during the creation of an index in a
+	 *   non-concurrent manner. This means the index is built while holding exclusive
+	 *   locks, which blocks other operations on the table during the build process.
+	 *
+	 * - `yb_ambackfill`, on the other hand, is used specifically for concurrent
+	 *   index creation. This allows the index to be built in the background without
+	 *   blocking other operations on the table, enabling greater concurrency and
+	 *   reducing downtime for the database.
+	 *
+	 * If `yb_ambackfill` is set to NULL, it indicates that the access method does
+	 *   not support concurrent index creation. In such cases, the system must fall
+	 *   back to the non-concurrent code path, which relies on `ambuild` for index
+	 *   creation. This ensures compatibility with access methods that lack
+	 *   concurrent build capabilities.
+	 *
+	 * Understanding this distinction is crucial for implementing or modifying
+	 * index creation logic, as it directly impacts the concurrency and performance
+	 * characteristics of the database system.
+	 */
 	yb_ambackfill_function yb_ambackfill;
+	yb_ammightrecheck_function yb_ammightrecheck;
+	yb_amgetbitmap_function yb_amgetbitmap;
+
+	/*
+	 * Allows YB AM's to specify how they want to lay out their
+	 * DocDB schema and also gives them a chance to pass along any
+	 * additional metadata to the index creation statement.
+	 */
+	yb_ambindschema_function yb_ambindschema;
 
 } IndexAmRoutine;
 

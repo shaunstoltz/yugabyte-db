@@ -1,4 +1,4 @@
-# Copyright (c) YugaByte, Inc.
+# Copyright (c) YugabyteDB, Inc.
 #
 # Licensed under the Apache License, Version 2.0 (the "License"); you may not use this file except
 # in compliance with the License.  You may obtain a copy of the License at
@@ -12,7 +12,6 @@
 #
 
 set(YB_PCH_PREFIX ql)
-set(YB_PCH_DEP_LIBS opid_proto)
 set(YB_PCH_PATH ../)
 
 ADD_YB_LIBRARY(

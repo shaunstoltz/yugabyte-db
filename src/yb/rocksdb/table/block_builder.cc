@@ -3,9 +3,9 @@
 //  LICENSE file in the root directory of this source tree. An additional grant
 //  of patent rights can be found in the PATENTS file in the same directory.
 //
-// The following only applies to changes made to this file as part of YugaByte development.
+// The following only applies to changes made to this file as part of YugabyteDB development.
 //
-// Portions Copyright (c) YugaByte, Inc.
+// Portions Copyright (c) YugabyteDB, Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License"); you may not use this file except
 // in compliance with the License.  You may obtain a copy of the License at
@@ -62,10 +62,11 @@ namespace rocksdb {
 
 BlockBuilder::BlockBuilder(
     int block_restart_interval, const KeyValueEncodingFormat key_value_encoding_format,
-    const bool use_delta_encoding)
+    const yb::MemTrackerPtr& mem_tracker, const bool use_delta_encoding)
     : block_restart_interval_(block_restart_interval),
       use_delta_encoding_(use_delta_encoding),
       key_value_encoding_format_(key_value_encoding_format),
+      buffer_(mem_tracker),
       restarts_(),
       counter_(0),
       finished_(false) {
@@ -297,16 +298,19 @@ class ThreeSharedPartsEncoder {
 
   // Encodes components sizes + non-shared key parts and value into buffer.
   // See EncodeThreeSharedPartsSizes for description of how we encode component sizes.
-  inline void Encode(size_t shared_prefix_size, const Slice& value, std::string* buffer) {
+  template <size_t SmallLen, bool kTrackMemoryUsage>
+  inline void Encode(
+      size_t shared_prefix_size, const Slice& value,
+      yb::ByteBufferBase<SmallLen, kTrackMemoryUsage>* buffer) {
     const auto value_size = value.size();
 
     EncodeThreeSharedPartsSizes(
         shared_prefix_size, last_internal_component_reuse_size_, is_last_internal_component_inc_,
         rest_components_sizes_, prev_key_size_, key_size_, value_size, buffer);
 
-    yb::EnlargeBufferIfNeeded(
-        buffer, buffer->size() + rest_components_sizes_.non_shared_1_size +
-                    rest_components_sizes_.non_shared_2_size + value_size);
+    buffer->reserve(
+        buffer->size() + rest_components_sizes_.non_shared_1_size +
+        rest_components_sizes_.non_shared_2_size + value_size);
 
     // Add key deltas to buffer followed by value.
     buffer->append(key_.cdata() + shared_prefix_size, rest_components_sizes_.non_shared_1_size);
@@ -337,7 +341,7 @@ Slice BlockBuilder::Finish() {
   }
   PutFixed32(&buffer_, static_cast<uint32_t>(restarts_.size()));
   finished_ = true;
-  return Slice(buffer_);
+  return buffer_.AsSlice();
 }
 
 void BlockBuilder::Add(const Slice& key, const Slice& value) {

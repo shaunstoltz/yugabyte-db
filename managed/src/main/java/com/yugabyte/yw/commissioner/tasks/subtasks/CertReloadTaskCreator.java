@@ -37,15 +37,14 @@ public class CertReloadTaskCreator implements IUpgradeSubTask {
       List<NodeDetails> masterNodes) {
 
     if (taskExecutor == null || masterNodes == null || masterNodes.isEmpty()) {
-      throw new IllegalArgumentException("TaskGroup or MasterNodes )" + "cannot be empty");
+      throw new IllegalArgumentException("TaskGroup or MasterNodes cannot be empty");
     }
     this.universeUuid = universeId;
     this.userTaskUuid = userTaskId;
     this.taskExecutor = taskExecutor;
     this.runnableTask = runnableTask;
     List<String> masterHostPortList =
-        masterNodes
-            .stream()
+        masterNodes.stream()
             .map(n -> getHostPort(getHost(n), getMasterPort(n)))
             .collect(Collectors.toList());
     this.masterHostPorts = String.join(",", masterHostPortList);
@@ -82,7 +81,7 @@ public class CertReloadTaskCreator implements IUpgradeSubTask {
           String nodeHostPort = getHostPort(node, processTypes);
           NodeCertReloadTask task = NodeCertReloadTask.createTask();
           Params params = new Params();
-          params.universeUUID = universeUuid;
+          params.setUniverseUUID(universeUuid);
           params.azUuid = node.azUuid;
           params.nodeName = node.nodeName;
           params.setMasters(masterHostPorts);

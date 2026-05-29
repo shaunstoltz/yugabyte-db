@@ -1,6 +1,6 @@
 #!/bin/bash
 #
-# Copyright 2019 YugaByte, Inc. and Contributors
+# Copyright 2019 YugabyteDB, Inc. and Contributors
 #
 # Licensed under the Polyform Free Trial License 1.0.0 (the "License"); you
 # may not use this file except in compliance with the License. You
@@ -20,10 +20,10 @@ if [ "$is_mac" == false ] && \
    [[ -z ${YB_USE_VIRTUAL_ENV:-} ]] && \
    [ -d "$yb_devops_home/pex/pexEnv" ]; then
     activate_pex
-    $PYTHON_EXECUTABLE $PEX_PATH $SCRIPT_PATH "$@"
+    exec $PYTHON_EXECUTABLE $SCRIPT_PATH "$@"
 # The virtual environment is used in all other cases.
 else
     activate_virtualenv
     cd "$yb_devops_home"
-    "$PYTHON_EXECUTABLE" "$(which ybcloud.py)" "$@"
+    exec "$PYTHON_EXECUTABLE" "$(which ybcloud.py)" "$@"
 fi

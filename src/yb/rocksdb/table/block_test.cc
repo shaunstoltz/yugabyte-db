@@ -3,9 +3,9 @@
 //  LICENSE file in the root directory of this source tree. An additional grant
 //  of patent rights can be found in the PATENTS file in the same directory.
 //
-// The following only applies to changes made to this file as part of YugaByte development.
+// The following only applies to changes made to this file as part of YugabyteDB development.
 //
-// Portions Copyright (c) YugaByte, Inc.
+// Portions Copyright (c) YugabyteDB, Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License"); you may not use this file except
 // in compliance with the License.  You may obtain a copy of the License at
@@ -46,6 +46,8 @@ DECLARE_int32(v);
 
 namespace rocksdb {
 
+namespace {
+
 std::string GenerateKey(int primary_key, int secondary_key, int padding_size,
                         Random *rnd) {
   char buf[50];
@@ -81,6 +83,8 @@ void GenerateRandomKVs(std::vector<std::string> *keys,
   }
 }
 
+} // namespace
+
 class BlockTest : public RocksDBTest {};
 
 // block test
@@ -93,7 +97,7 @@ TEST_F(BlockTest, SimpleTest) {
 
     std::vector<std::string> keys;
     std::vector<std::string> values;
-    BlockBuilder builder(16, key_value_encoding_format);
+    BlockBuilder builder(16, key_value_encoding_format, test_mem_tracker());
     int num_records = 100000;
 
     GenerateRandomKVs(&keys, &values, 0, num_records);
@@ -150,7 +154,8 @@ BlockContents GetBlockContents(std::unique_ptr<BlockBuilder> *builder,
                                const std::vector<std::string> &values,
                                const KeyValueEncodingFormat key_value_encoding_format,
                                const int prefix_group_size = 1) {
-  builder->reset(new BlockBuilder(1 /* restart interval */, key_value_encoding_format));
+  builder->reset(
+      new BlockBuilder(1 /* restart interval */, key_value_encoding_format, test_mem_tracker()));
 
   // Add only half of the keys
   for (size_t i = 0; i < keys.size(); ++i) {
@@ -253,7 +258,7 @@ void CheckBlockContents(
     iter->Seek(higher_key);
     ASSERT_OK(iter->status());
     if (j == keys.size()) {
-      ASSERT_FALSE(iter->Valid());
+      ASSERT_FALSE(ASSERT_RESULT(iter->CheckedValid()));
       continue;
     }
     ASSERT_TRUE(iter->Valid());
@@ -385,7 +390,7 @@ std::string GetPaddedNum(int i) {
 yb::Result<std::string> GetMiddleKey(
     const KeyValueEncodingFormat key_value_encoding_format, const int num_keys,
     const int block_restart_interval, const MiddlePointPolicy middle_policy) {
-  BlockBuilder builder(block_restart_interval, key_value_encoding_format);
+  BlockBuilder builder(block_restart_interval, key_value_encoding_format, test_mem_tracker());
 
   for (int i = 1; i <= num_keys; ++i) {
     const auto padded_num = GetPaddedNum(i);
@@ -502,10 +507,10 @@ TEST_F(BlockTest, GetMiddleKey) {
       const auto get_expected_middle_key = [&](const int num_keys) {
         const auto num_restarts = get_num_restarts(num_keys);
         if (num_restarts > 1) {
-          const auto restart_idx = (num_restarts - yb::to_underlying(middle_policy)) / 2;
+          const auto restart_idx = (num_restarts - std::to_underlying(middle_policy)) / 2;
           return 1 + (restart_idx * block_restart_interval);
         } else {
-          const auto key_idx = (num_keys - yb::to_underlying(middle_policy)) / 2;
+          const auto key_idx = (num_keys - std::to_underlying(middle_policy)) / 2;
           return 1 + key_idx;
         }
       };
@@ -540,13 +545,13 @@ TEST_F(BlockTest, EncodeThreeSharedPartsSizes) {
                ? yb::RandomUniformInt<uint32_t>(0, kBigMaxCompSize)
                : yb::RandomUniformInt<uint32_t>(0, kSmallMaxCompSize);
   };
-  std::string buffer;
+  yb::MemTrackedByteBuffer<64> buffer(test_mem_tracker());
 
   for (auto i = 0; i < kNumIters; ++i) {
     YB_LOG_EVERY_N_SECS(INFO, 5) << "Iterations completed: " << i;
     buffer.clear();
     // Simulate there is something in buffer before encoded key.
-    buffer.append('X', yb::RandomUniformInt<size_t>(0, 8));
+    buffer.append(std::string('X', yb::RandomUniformInt<size_t>(0, 8)));
     const auto encoded_sizes_start_offset = buffer.size();
 
     size_t shared_prefix_size = gen_comp_size();
@@ -586,14 +591,17 @@ TEST_F(BlockTest, EncodeThreeSharedPartsSizes) {
                           rest_sizes.shared_middle_size + rest_sizes.non_shared_2_size +
                           last_internal_component_reuse_size;
     const auto value_size = gen_comp_size();
-
-    EncodeThreeSharedPartsSizes(
-        shared_prefix_size, last_internal_component_reuse_size, is_last_internal_component_inc,
-        rest_sizes, prev_key_size, key_size, value_size, &buffer);
-
-    const auto encoded_sizes_end_offset = buffer.size();
     const auto payload_size =
         rest_sizes.non_shared_1_size + rest_sizes.non_shared_2_size + value_size;
+
+    size_t encoded_sizes_end_offset;
+    auto encode_func = [&] {
+      EncodeThreeSharedPartsSizes(
+          shared_prefix_size, last_internal_component_reuse_size, is_last_internal_component_inc,
+          rest_sizes, prev_key_size, key_size, value_size, &buffer);
+      encoded_sizes_end_offset = buffer.size();
+    };
+    encode_func();
 
     uint32_t decoded_shared_prefix_size, decoded_non_shared_1_size, decoded_non_shared_2_size,
         decoded_shared_last_component_size, decoded_value_size;
@@ -601,14 +609,22 @@ TEST_F(BlockTest, EncodeThreeSharedPartsSizes) {
     int64_t decoded_non_shared_1_size_delta, decoded_non_shared_2_size_delta;
     uint64_t decoded_shared_last_component_increase;
 
-    auto* result = DecodeEntryThreeSharedParts(
-        buffer.data() + encoded_sizes_start_offset, buffer.data() + buffer.size() + payload_size,
-        buffer.data(), &decoded_shared_prefix_size, &decoded_non_shared_1_size,
-        &decoded_non_shared_1_size_delta, &decoded_is_something_shared, &decoded_non_shared_2_size,
-        &decoded_non_shared_2_size_delta, &decoded_shared_last_component_size,
-        &decoded_shared_last_component_increase, &decoded_value_size);
+    const char* result;
+    auto decode_func = [&] {
+      const auto* start = buffer.cdata() + encoded_sizes_start_offset;
+      // Don't allow decoder to read past encoded data and also add payload_size to the limit since
+      // decoder checks if payload fits within limit.
+      const auto* limit = buffer.cdata() + encoded_sizes_end_offset + payload_size;
+      result = DecodeEntryThreeSharedParts(
+          start, limit, &decoded_shared_prefix_size, &decoded_non_shared_1_size,
+          &decoded_non_shared_1_size_delta, &decoded_is_something_shared,
+          &decoded_non_shared_2_size, &decoded_non_shared_2_size_delta,
+          &decoded_shared_last_component_size, &decoded_shared_last_component_increase,
+          &decoded_value_size);
+    };
+    decode_func();
 
-    ASSERT_NE(result, nullptr);
+    EXPECT_NE(result, nullptr);
     EXPECT_EQ(decoded_shared_last_component_size, last_internal_component_reuse_size);
     EXPECT_EQ(decoded_shared_last_component_increase, 0x100 * is_last_internal_component_inc);
     EXPECT_EQ(
@@ -635,20 +651,13 @@ TEST_F(BlockTest, EncodeThreeSharedPartsSizes) {
     }
 
     EXPECT_EQ(decoded_value_size, value_size);
-    EXPECT_EQ(result, buffer.data() + encoded_sizes_end_offset);
+    EXPECT_EQ(result, buffer.cdata() + encoded_sizes_end_offset);
 
     if (testing::Test::HasFailure()) {
-      FLAGS_v = 4;
-      EncodeThreeSharedPartsSizes(
-          shared_prefix_size, last_internal_component_reuse_size, is_last_internal_component_inc,
-          rest_sizes, prev_key_size, key_size, value_size, &buffer);
-      result = DecodeEntryThreeSharedParts(
-          buffer.data() + encoded_sizes_start_offset, buffer.data() + buffer.capacity(),
-          buffer.data(), &decoded_shared_prefix_size, &decoded_non_shared_1_size,
-          &decoded_non_shared_1_size_delta, &decoded_is_something_shared,
-          &decoded_non_shared_2_size, &decoded_non_shared_2_size_delta,
-          &decoded_shared_last_component_size, &decoded_shared_last_component_increase,
-          &decoded_value_size);
+      ANNOTATE_UNPROTECTED_WRITE(FLAGS_v) = 4;
+      // Repeat encode-decode cycle with verbose logging for failure investigation.
+      encode_func();
+      decode_func();
       FAIL();
     }
   }
@@ -730,7 +739,8 @@ TEST_F(BlockTest, EncodeThreeSharedParts) {
 
     std::sort(keys.begin(), keys.end());
 
-    BlockBuilder builder(kBlockRestartInterval, kKeyValueEncodingFormat, use_delta_encoding);
+    BlockBuilder builder(
+        kBlockRestartInterval, kKeyValueEncodingFormat, test_mem_tracker(), use_delta_encoding);
 
     std::vector<std::string> values;
     {
@@ -762,7 +772,8 @@ void TestBlockScanPerf(
   constexpr auto kRestarts = 16;
   constexpr auto kIterations = 10;
 
-  BlockBuilder builder(kRestarts, key_value_encoding_format, use_delta_encoding);
+  BlockBuilder builder(
+      kRestarts, key_value_encoding_format, test_mem_tracker(), use_delta_encoding);
 
   Random rnd(302);
   std::string value;

@@ -3,9 +3,9 @@
 //  LICENSE file in the root directory of this source tree. An additional grant
 //  of patent rights can be found in the PATENTS file in the same directory.
 //
-// The following only applies to changes made to this file as part of YugaByte development.
+// The following only applies to changes made to this file as part of YugabyteDB development.
 //
-// Portions Copyright (c) YugaByte, Inc.
+// Portions Copyright (c) YugabyteDB, Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License"); you may not use this file except
 // in compliance with the License.  You may obtain a copy of the License at
@@ -19,8 +19,8 @@
 //
 
 #include "yb/rocksdb/db/db_test_util.h"
-#include "yb/rocksdb/util/sync_point.h"
 
+#include "yb/util/sync_point.h"
 
 namespace rocksdb {
 
@@ -65,10 +65,10 @@ class TestPropertiesCollectorFactory : public TablePropertiesCollectorFactory {
   const char* Name() const override { return "TestTablePropertiesCollector"; }
 };
 
-class TestCompactionListener : public EventListener {
+class CompactionListener : public EventListener {
  public:
   void OnCompactionCompleted(DB *db, const CompactionJobInfo& ci) override {
-    std::lock_guard<std::mutex> lock(mutex_);
+    std::lock_guard lock(mutex_);
     compacted_dbs_.push_back(db);
     ASSERT_GT(ci.input_files.size(), 0U);
     ASSERT_GT(ci.output_files.size(), 0U);
@@ -109,7 +109,7 @@ TEST_F(EventListenerTest, OnSingleDBCompactionTest) {
   options.table_properties_collector_factories.push_back(
       std::make_shared<TestPropertiesCollectorFactory>());
 
-  TestCompactionListener* listener = new TestCompactionListener();
+  CompactionListener* listener = new CompactionListener();
   options.listeners.emplace_back(listener);
   std::vector<std::string> cf_names = {
       "pikachu", "ilya", "muromec", "dobrynia",
@@ -373,7 +373,7 @@ TEST_F(EventListenerTest, DisableBGCompaction) {
 class TestCompactionReasonListener : public EventListener {
  public:
   void OnCompactionCompleted(DB* db, const CompactionJobInfo& ci) override {
-    std::lock_guard<std::mutex> lock(mutex_);
+    std::lock_guard lock(mutex_);
     compaction_reasons_.push_back(ci.compaction_reason);
   }
 
@@ -470,7 +470,7 @@ TEST_F(EventListenerTest, CompactionReasonUniversal) {
 
   ASSERT_GT(listener->compaction_reasons_.size(), 0);
   for (auto compaction_reason : listener->compaction_reasons_) {
-    ASSERT_EQ(compaction_reason, CompactionReason::kUniversalSortedRunNum);
+    ASSERT_EQ(compaction_reason, CompactionReason::kUniversalSizeRatio);
   }
 
   options.level0_file_num_compaction_trigger = 8;

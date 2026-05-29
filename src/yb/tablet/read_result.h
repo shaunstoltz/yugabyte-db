@@ -1,4 +1,4 @@
-// Copyright (c) YugaByte, Inc.
+// Copyright (c) YugabyteDB, Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License"); you may not use this file except
 // in compliance with the License.  You may obtain a copy of the License at
@@ -13,22 +13,26 @@
 
 #pragma once
 
-#include "yb/common/pgsql_protocol.pb.h"
-#include "yb/common/ql_protocol.pb.h"
+#include "yb/common/pgsql_protocol.messages.h"
+#include "yb/common/ql_protocol.messages.h"
 
 namespace yb {
 namespace tablet {
 
 struct QLReadRequestResult {
-  QLResponsePB response;
-  HybridTime restart_read_ht;
+  explicit QLReadRequestResult(ThreadSafeArena& arena)
+      : response(arena.NewArenaObject<LWQLResponsePB>()) {}
+
+  LWQLResponsePB* response;
+  ReadRestartData read_restart_data;
 };
 
 struct PgsqlReadRequestResult {
-  explicit PgsqlReadRequestResult(WriteBuffer* rows_data_) : rows_data(rows_data_) {}
+  PgsqlReadRequestResult(ThreadSafeArena& arena, WriteBuffer* rows_data_)
+      : response(arena.NewArenaObject<LWPgsqlResponsePB>()), rows_data(rows_data_) {}
 
-  PgsqlResponsePB response;
-  HybridTime restart_read_ht;
+  PgsqlResponseMsg* response;
+  ReadRestartData read_restart_data;
   size_t num_rows_read;
   WriteBuffer* rows_data;
 };

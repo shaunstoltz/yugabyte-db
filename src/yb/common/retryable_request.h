@@ -1,4 +1,4 @@
-// Copyright (c) YugaByte, Inc.
+// Copyright (c) YugabyteDB, Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License"); you may not use this file except
 // in compliance with the License.  You may obtain a copy of the License at
@@ -19,17 +19,19 @@
 #include <chrono>
 #include <sstream>
 #include <string>
+#include <string_view>
 #include <type_traits>
 
 #include <boost/functional/hash/hash.hpp>
 #include <boost/mpl/and.hpp>
-#include <boost/optional/optional.hpp>
 
 #include "yb/util/format.h"
 #include "yb/util/status_ec.h"
 #include "yb/util/strongly_typed_uuid.h"
 #include "yb/util/tostring.h"
 #include "yb/util/type_traits.h"
+
+using namespace std::literals;
 
 namespace yb {
 
@@ -38,7 +40,7 @@ typedef int64_t RetryableRequestId;
 
 struct MinRunningRequestIdTag : IntegralErrorTag<int64_t> {
   // It is part of the wire protocol and should not be changed once released.
-  static constexpr uint8_t kCategory = 13;
+  static constexpr CategoryDescriptor kCategory{13, "min running request ID"sv};
 
   static std::string ToMessage(Value value) {
     return Format("Min running request ID: $0", value);

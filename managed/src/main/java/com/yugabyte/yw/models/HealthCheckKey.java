@@ -1,12 +1,12 @@
-// Copyright (c) YugaByte, Inc.
+// Copyright (c) YugabyteDB, Inc.
 
 package com.yugabyte.yw.models;
 
+import jakarta.persistence.Embeddable;
+import jakarta.persistence.Entity;
 import java.io.Serializable;
 import java.util.Date;
 import java.util.UUID;
-import javax.persistence.Embeddable;
-import javax.persistence.Entity;
 
 @Entity
 @Embeddable

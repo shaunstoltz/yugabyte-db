@@ -1,5 +1,5 @@
 //
-// Copyright (c) YugaByte, Inc.
+// Copyright (c) YugabyteDB, Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License"); you may not use this file except
 // in compliance with the License.  You may obtain a copy of the License at
@@ -29,20 +29,30 @@ class LocalYBInboundCall;
 // A short-circuited outbound call.
 class LocalOutboundCall : public OutboundCall {
  public:
-  LocalOutboundCall(const RemoteMethod* remote_method,
+  LocalOutboundCall(const RemoteMethod& remote_method,
                     const std::shared_ptr<OutboundCallMetrics>& outbound_call_metrics,
-                    AnyMessagePtr response_storage, RpcController* controller,
-                    std::shared_ptr<RpcMetrics> rpc_metrics, ResponseCallback callback);
+                    AnyMessagePtr response_storage,
+                    RpcController* controller,
+                    std::shared_ptr<RpcMetrics> rpc_metrics,
+                    ResponseCallback callback,
+                    ThreadPool* callback_thread_pool);
 
-  Status SetRequestParam(AnyMessageConstPtr req, const MemTrackerPtr& mem_tracker) override;
+  Status SetRequestParam(
+      AnyMessageConstPtr req, std::unique_ptr<Sidecars> sidecars,
+      const MemTrackerPtr& mem_tracker) override;
 
-  const std::shared_ptr<LocalYBInboundCall>& CreateLocalInboundCall();
+  const std::shared_ptr<LocalYBInboundCall>& CreateLocalInboundCall(
+      CallStateListenerFactory* call_state_listener_factory);
 
   size_t ObjectSize() const override { return sizeof(*this); }
 
   const AnyMessageConstPtr& request() const {
     return req_;
   }
+
+  bool is_local() const override { return true; }
+
+  ThreadPoolTag pool_tag() const;
 
  protected:
   void Serialize(ByteBlocks* output) override;
@@ -63,13 +73,16 @@ class LocalYBInboundCall : public YBInboundCall, public RpcCallParams {
  public:
   LocalYBInboundCall(RpcMetrics* rpc_metrics, const RemoteMethod& remote_method,
                      std::weak_ptr<LocalOutboundCall> outbound_call,
-                     CoarseTimePoint deadline);
+                     CoarseTimePoint deadline,
+                     CallStateListenerFactory* call_state_listener_factory);
 
   bool IsLocalCall() const override { return true; }
 
   const Endpoint& remote_address() const override;
   const Endpoint& local_address() const override;
   CoarseTimePoint GetClientDeadline() const override { return deadline_; }
+
+  ThreadPoolTag pool_tag() const override;
 
   Status ParseParam(RpcCallParams* params) override;
 
@@ -79,13 +92,19 @@ class LocalYBInboundCall : public YBInboundCall, public RpcCallParams {
     return outbound_call_.lock();
   }
 
+  std::string ToString() const override {
+    return yb::Format("Local call. call-id : $0 ", call_id());
+  }
+
  protected:
   void Respond(AnyMessageConstPtr req, bool is_success) override;
+
+  void UpdateWaitStateInfo() override;
 
  private:
   friend class LocalOutboundCall;
 
-  Result<size_t> ParseRequest(Slice param, const RefCntBuffer& buffer) override;
+  Status ParseRequest(Slice param, const RefCntBuffer& buffer) override;
   AnyMessageConstPtr SerializableResponse() override;
 
   // Weak pointer back to the outbound call owning this inbound call to avoid circular reference.
@@ -116,6 +135,17 @@ auto HandleCall(InboundCallPtr call, F f) {
     }
   }
 }
+
+class LocalYBInboundCallTracker : public InboundCall::CallProcessedListener {
+ public:
+  void Enqueue(const InboundCallPtr& call) EXCLUDES(lock_);
+  void CallProcessed(InboundCall* call) override EXCLUDES(lock_);
+  Status DumpRunningRpcs(const DumpRunningRpcsRequestPB& req, DumpRunningRpcsResponsePB* resp);
+
+ private:
+  std::mutex lock_;
+  std::unordered_map<int64_t, InboundCallWeakPtr> calls_being_handled_ GUARDED_BY(lock_);
+};
 
 } // namespace rpc
 } // namespace yb

@@ -3,6 +3,11 @@ html {
 }
 
 /******* Container Styling **********/
+.row {
+  margin-left: -15px;
+  margin-right: -15px;
+}
+
 .left-menu-scrolling .td-main {
   aside.td-sidebar .left-sidebar-wrap {
     transition: none !important;
@@ -24,6 +29,7 @@ html {
   main {
     &:only-child {
       width: 100%;
+      position: relative;
     }
   }
 
@@ -89,7 +95,7 @@ html {
 
       > div {
         display: flex;
-        align-items: flex-start;
+        align-items: normal;
         max-width: 100%;
         width: 100%;
       }
@@ -141,7 +147,7 @@ html {
       width: 200px !important;
       padding: 0;
       padding-left: 24px;
-      padding-top: 80px;
+      padding-top: 105px;
       background: transparent;
       border: 0;
     }
@@ -153,7 +159,7 @@ html {
     .td-sidebar-toc.d-xl-block {
       width: 252px !important;
       padding-left: 0;
-      margin-left: 40px;
+      padding-left: 40px;
     }
   }
 }
@@ -177,11 +183,11 @@ html {
 @media (max-width: 1199px) {
   .td-main {
     .content-parent {
-      max-width: calc(100% - 250px);
       justify-content: center;
       padding-left: 20px;
       padding-right: 20px;
       margin-left: 0;
+      overflow: hidden;
 
       .content-child {
         max-width: 100%;
@@ -190,7 +196,6 @@ html {
 
       main {
         width: 100%;
-        max-width: 828px;
       }
     }
   }
@@ -250,12 +255,6 @@ html {
   aside.td-sidebar[style*="width: 4"] + div main:not(:only-child),
   aside.td-sidebar[style*="width: 5"] + div main:not(:only-child) {
     max-width: 100% !important;
-  }
-}
-
-@media (max-width: 1300px) and(min-width: 1200px) {
-  .td-main .content-parent {
-    padding: 0 85px;
   }
 }
 

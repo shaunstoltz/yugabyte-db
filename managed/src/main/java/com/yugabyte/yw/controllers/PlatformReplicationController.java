@@ -1,5 +1,5 @@
 /*
- * Copyright 2021 YugaByte, Inc. and Contributors
+ * Copyright 2021 YugabyteDB, Inc. and Contributors
  *
  * Licensed under the Polyform Free Trial License 1.0.0 (the "License"); you
  * may not use this file except in compliance with the License. You
@@ -11,16 +11,30 @@
 
 package com.yugabyte.yw.controllers;
 
+import com.fasterxml.jackson.databind.JsonNode;
 import com.google.inject.Inject;
-import com.yugabyte.yw.common.ApiResponse;
+import com.yugabyte.yw.common.PlatformServiceException;
+import com.yugabyte.yw.common.Util;
 import com.yugabyte.yw.common.ha.PlatformReplicationManager;
+import com.yugabyte.yw.common.rbac.PermissionInfo.Action;
+import com.yugabyte.yw.common.rbac.PermissionInfo.ResourceType;
 import com.yugabyte.yw.forms.PlatformBackupFrequencyFormData;
 import com.yugabyte.yw.forms.PlatformResults;
 import com.yugabyte.yw.models.Audit;
 import com.yugabyte.yw.models.HighAvailabilityConfig;
 import com.yugabyte.yw.models.PlatformInstance;
+import com.yugabyte.yw.models.common.YbaApi;
+import com.yugabyte.yw.rbac.annotations.AuthzPath;
+import com.yugabyte.yw.rbac.annotations.PermissionAttribute;
+import com.yugabyte.yw.rbac.annotations.RequiredPermissionOnResource;
+import com.yugabyte.yw.rbac.annotations.Resource;
+import com.yugabyte.yw.rbac.enums.SourceType;
+import io.swagger.annotations.Api;
+import io.swagger.annotations.ApiImplicitParam;
+import io.swagger.annotations.ApiImplicitParams;
+import io.swagger.annotations.ApiOperation;
+import io.swagger.annotations.Authorization;
 import java.io.File;
-import java.net.URL;
 import java.time.Duration;
 import java.util.Collections;
 import java.util.List;
@@ -28,111 +42,116 @@ import java.util.Optional;
 import java.util.UUID;
 import java.util.stream.Collectors;
 import org.apache.commons.lang3.StringUtils;
-import org.slf4j.Logger;
-import org.slf4j.LoggerFactory;
-import play.data.Form;
+import play.mvc.Http;
 import play.mvc.Result;
 
+@Api(
+    value = "Platform Replication",
+    authorizations = @Authorization(AbstractPlatformController.API_KEY_AUTH))
 public class PlatformReplicationController extends AuthenticatedController {
-
-  public static final Logger LOG = LoggerFactory.getLogger(PlatformReplicationController.class);
 
   @Inject private PlatformReplicationManager replicationManager;
 
-  public Result startPeriodicBackup(UUID configUUID) {
-    try {
-      Optional<HighAvailabilityConfig> config = HighAvailabilityConfig.get(configUUID);
-      if (!config.isPresent()) {
-        return ApiResponse.error(NOT_FOUND, "Invalid config UUID");
-      }
+  @ApiOperation(
+      notes = "Available since YBA version 2.20.0.",
+      value = "Start periodic backup",
+      response = JsonNode.class,
+      nickname = "startPeriodicBackup")
+  @ApiImplicitParams(
+      @ApiImplicitParam(
+          name = "PlatformBackupFrequencyRequest",
+          paramType = "body",
+          dataType = "com.yugabyte.yw.forms.PlatformBackupFrequencyFormData",
+          required = true))
+  @YbaApi(visibility = YbaApi.YbaApiVisibility.PUBLIC, sinceYBAVersion = "2.20.0")
+  @AuthzPath({
+    @RequiredPermissionOnResource(
+        requiredPermission =
+            @PermissionAttribute(
+                resourceType = ResourceType.OTHER,
+                action = Action.SUPER_ADMIN_ACTIONS),
+        resourceLocation = @Resource(path = Util.CUSTOMERS, sourceType = SourceType.ENDPOINT))
+  })
+  public Result startPeriodicBackup(UUID configUUID, Http.Request request) {
+    HighAvailabilityConfig haConfig = HighAvailabilityConfig.getOrBadRequest(configUUID);
+    JsonNode result =
+        HighAvailabilityConfig.doWithLock(
+            haConfig.getClusterKey(),
+            config -> {
+              PlatformBackupFrequencyFormData formData =
+                  parseJsonAndValidate(request, PlatformBackupFrequencyFormData.class);
 
-      Form<PlatformBackupFrequencyFormData> formData =
-          formFactory.getFormDataOrBadRequest(PlatformBackupFrequencyFormData.class);
-
-      if (!config.get().isLocalLeader()) {
-        return ApiResponse.error(BAD_REQUEST, "This platform instance is not a leader");
-      }
-
-      Duration frequency = Duration.ofMillis(formData.get().frequency_milliseconds);
-
-      // Restart the backup schedule with the new frequency.
-      auditService()
-          .createAuditEntryWithReqBody(
-              ctx(),
-              Audit.TargetType.HABackup,
-              configUUID.toString(),
-              Audit.ActionType.StartPeriodicBackup);
-      return ok(replicationManager.setFrequencyStartAndEnable(frequency));
-    } catch (Exception e) {
-      LOG.error("Error starting backup schedule", e);
-
-      return ApiResponse.error(INTERNAL_SERVER_ERROR, "Error starting replication schedule");
-    }
+              if (!config.isLocalLeader()) {
+                throw new PlatformServiceException(
+                    BAD_REQUEST, "This platform instance is not a leader");
+              }
+              Duration frequency = Duration.ofMillis(formData.frequency_milliseconds);
+              // Restart the backup schedule with the new frequency.
+              return replicationManager.setFrequencyStartAndEnable(frequency);
+            });
+    auditService()
+        .createAuditEntry(
+            request,
+            Audit.TargetType.HABackup,
+            configUUID.toString(),
+            Audit.ActionType.StartPeriodicBackup);
+    return ok(result);
   }
 
-  public Result stopPeriodicBackup(UUID configUUID) {
-    try {
-      Optional<HighAvailabilityConfig> config = HighAvailabilityConfig.get(configUUID);
-      if (!config.isPresent()) {
-        return ApiResponse.error(NOT_FOUND, "Invalid config UUID");
-      }
-
-      return ok(replicationManager.stopAndDisable());
-    } catch (Exception e) {
-      LOG.error("Error cancelling backup schedule", e);
-      auditService()
-          .createAuditEntryWithReqBody(
-              ctx(),
-              Audit.TargetType.HABackup,
-              configUUID.toString(),
-              Audit.ActionType.StopPeriodicBackup);
-      return ApiResponse.error(INTERNAL_SERVER_ERROR, "Error stopping replication schedule");
-    }
+  @AuthzPath({
+    @RequiredPermissionOnResource(
+        requiredPermission =
+            @PermissionAttribute(
+                resourceType = ResourceType.OTHER,
+                action = Action.SUPER_ADMIN_ACTIONS),
+        resourceLocation = @Resource(path = Util.CUSTOMERS, sourceType = SourceType.ENDPOINT))
+  })
+  public Result stopPeriodicBackup(UUID configUUID, Http.Request request) {
+    HighAvailabilityConfig haConfig = HighAvailabilityConfig.getOrBadRequest(configUUID);
+    JsonNode result =
+        HighAvailabilityConfig.doWithLock(
+            haConfig.getClusterKey(), config -> replicationManager.stopAndDisable());
+    auditService()
+        .createAuditEntry(
+            request,
+            Audit.TargetType.HABackup,
+            configUUID.toString(),
+            Audit.ActionType.StopPeriodicBackup);
+    return ok(result);
   }
 
+  @AuthzPath
   public Result getBackupInfo(UUID configUUID) {
-    try {
-      Optional<HighAvailabilityConfig> config = HighAvailabilityConfig.get(configUUID);
-      if (!config.isPresent()) {
-        return ApiResponse.error(NOT_FOUND, "Invalid config UUID");
-      }
-
-      return ok(replicationManager.getBackupInfo());
-    } catch (Exception e) {
-      LOG.error("Error retrieving backup frequency", e);
-
-      return ApiResponse.error(INTERNAL_SERVER_ERROR, "Error retrieving replication frequency");
-    }
+    HighAvailabilityConfig.maybeGet(configUUID)
+        .orElseThrow(() -> new PlatformServiceException(NOT_FOUND, "Invalid config UUID"));
+    return ok(replicationManager.getBackupInfo());
   }
 
+  @ApiOperation(
+      notes = "Available since YBA version 2.20.0.",
+      nickname = "listBackups",
+      value = "List backups",
+      response = String.class,
+      responseContainer = "List")
+  @YbaApi(visibility = YbaApi.YbaApiVisibility.PUBLIC, sinceYBAVersion = "2.20.0")
+  @AuthzPath
   public Result listBackups(UUID configUUID, String leaderAddr) {
-    try {
-      if (StringUtils.isBlank(leaderAddr)) {
-        Optional<HighAvailabilityConfig> config = HighAvailabilityConfig.get(configUUID);
-        if (!config.isPresent()) {
-          return ApiResponse.error(NOT_FOUND, "Invalid config UUID");
-        }
-
-        Optional<PlatformInstance> leaderInstance = config.get().getLeader();
-        if (!leaderInstance.isPresent()) {
-          return ApiResponse.error(BAD_REQUEST, "Could not find leader platform instance");
-        }
-
-        leaderAddr = leaderInstance.get().getAddress();
+    HighAvailabilityConfig config =
+        HighAvailabilityConfig.maybeGet(configUUID)
+            .orElseThrow(() -> new PlatformServiceException(NOT_FOUND, "Invalid config UUID"));
+    String leader = leaderAddr;
+    if (StringUtils.isBlank(leader)) {
+      Optional<PlatformInstance> leaderInstance = config.getLeader();
+      if (!leaderInstance.isPresent()) {
+        throw new PlatformServiceException(BAD_REQUEST, "Could not find leader platform instance");
       }
-
-      List<String> backups =
-          replicationManager
-              .listBackups(new URL(leaderAddr))
-              .stream()
-              .map(File::getName)
-              .sorted(Collections.reverseOrder())
-              .collect(Collectors.toList());
-      return PlatformResults.withData(backups);
-    } catch (Exception e) {
-      LOG.error("Error listing backups", e);
-
-      return ApiResponse.error(INTERNAL_SERVER_ERROR, "Error listing backups");
+      leader = leaderInstance.get().getAddress();
     }
+    List<String> backups =
+        replicationManager.listBackups(Util.toURL(leader)).stream()
+            .map(File::getName)
+            .sorted(Collections.reverseOrder())
+            .collect(Collectors.toList());
+    return PlatformResults.withData(backups);
   }
 }

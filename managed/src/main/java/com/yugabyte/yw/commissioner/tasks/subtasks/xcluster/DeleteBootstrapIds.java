@@ -2,11 +2,13 @@ package com.yugabyte.yw.commissioner.tasks.subtasks.xcluster;
 
 import com.yugabyte.yw.commissioner.BaseTaskDependencies;
 import com.yugabyte.yw.commissioner.tasks.XClusterConfigTaskBase;
+import com.yugabyte.yw.common.XClusterUniverseService;
 import com.yugabyte.yw.forms.XClusterConfigTaskParams;
 import com.yugabyte.yw.models.HighAvailabilityConfig;
 import com.yugabyte.yw.models.Universe;
 import com.yugabyte.yw.models.XClusterConfig;
 import com.yugabyte.yw.models.XClusterTableConfig;
+import java.util.Objects;
 import java.util.Set;
 import java.util.stream.Collectors;
 import javax.inject.Inject;
@@ -23,13 +25,19 @@ import org.yb.client.YBClient;
 public class DeleteBootstrapIds extends XClusterConfigTaskBase {
 
   @Inject
-  protected DeleteBootstrapIds(BaseTaskDependencies baseTaskDependencies) {
-    super(baseTaskDependencies);
+  protected DeleteBootstrapIds(
+      BaseTaskDependencies baseTaskDependencies, XClusterUniverseService xClusterUniverseService) {
+    super(baseTaskDependencies, xClusterUniverseService);
   }
 
   public static class Params extends XClusterConfigTaskParams {
     // The source universe UUID must be stored in universeUUID field.
     // The parent xCluster config must be stored in xClusterConfig field.
+
+    // The list of tables to remove the stream ids for. If null, it will be set to all tables in
+    // the xCluster config.
+    public Set<String> tableIds;
+
     // Whether the task must delete the bootstrap IDs even if they are in use.
     public boolean forceDelete;
   }
@@ -52,42 +60,43 @@ public class DeleteBootstrapIds extends XClusterConfigTaskBase {
 
     XClusterConfig xClusterConfig = getXClusterConfigFromTaskParams();
 
-    if (xClusterConfig.sourceUniverseUUID == null) {
+    if (Objects.isNull(taskParams().tableIds)) {
+      throw new IllegalArgumentException("taskParams().tableIds could not be null");
+    }
+    if (xClusterConfig.getSourceUniverseUUID() == null) {
       log.info("Skipped {}: the source universe is destroyed", getName());
       return;
     }
 
     // Force delete when it is requested by the user or target universe is deleted.
-    boolean forceDelete = taskParams().forceDelete || xClusterConfig.targetUniverseUUID == null;
+    boolean forceDelete =
+        taskParams().forceDelete || xClusterConfig.getTargetUniverseUUID() == null;
 
     // Get the bootstrap IDs to delete. Either the bootstrap flow had error, or the target universe
     // is deleted.
     Set<XClusterTableConfig> tableConfigsWithBootstrapId =
-        xClusterConfig
-            .tables
-            .stream()
-            .filter(tableConfig -> tableConfig.streamId != null)
+        xClusterConfig.getTableDetails().stream()
+            .filter(
+                tableConfig ->
+                    taskParams().tableIds.contains(tableConfig.getTableId())
+                        && tableConfig.getStreamId() != null)
             .collect(Collectors.toSet());
     Set<String> bootstrapIds =
-        tableConfigsWithBootstrapId
-            .stream()
-            .map(tableConfig -> tableConfig.streamId)
+        tableConfigsWithBootstrapId.stream()
+            .map(XClusterTableConfig::getStreamId)
             .collect(Collectors.toSet());
 
-    Universe sourceUniverse = Universe.getOrBadRequest(taskParams().universeUUID);
-    String sourceUniverseMasterAddresses = sourceUniverse.getMasterAddresses();
-    String sourceUniverseCertificate = sourceUniverse.getCertificateNodetoNode();
+    Universe sourceUniverse = Universe.getOrBadRequest(taskParams().getUniverseUUID());
     if (bootstrapIds.isEmpty()) {
       log.info(
           "Skipped {}: There is no BootstrapId to delete for source universe ({})",
           getName(),
-          sourceUniverse.universeUUID);
+          sourceUniverse.getUniverseUUID());
       return;
     }
     log.info("Bootstrap ids to be deleted: {}", bootstrapIds);
 
-    try (YBClient client =
-        ybService.getClient(sourceUniverseMasterAddresses, sourceUniverseCertificate)) {
+    try (YBClient client = ybService.getUniverseClient(sourceUniverse)) {
       // The `OBJECT_NOT_FOUND` error will be ignored.
       DeleteCDCStreamResponse resp =
           client.deleteCDCStream(bootstrapIds, true /* ignoreErrors */, forceDelete);
@@ -95,27 +104,31 @@ public class DeleteBootstrapIds extends XClusterConfigTaskBase {
         throw new RuntimeException(
             String.format(
                 "Failed to delete bootstrapIds(%s) in XClusterConfig(%s): %s",
-                bootstrapIds, xClusterConfig.uuid, resp.errorMessage()));
+                bootstrapIds, xClusterConfig.getUuid(), resp.errorMessage()));
       }
       log.info(
           "BootstrapIds ({}) deleted from source universe ({})",
           bootstrapIds,
-          sourceUniverse.universeUUID);
+          sourceUniverse.getUniverseUUID());
 
-      // Delete the bootstrap ID from DB.
+      // Delete the bootstrap ids from DB.
       tableConfigsWithBootstrapId.forEach(
           tableConfig -> {
-            tableConfig.streamId = null;
-            tableConfig.bootstrapCreateTime = null;
+            tableConfig.setStreamId(null);
+            tableConfig.setBootstrapCreateTime(null);
           });
       xClusterConfig.update();
 
       if (HighAvailabilityConfig.get().isPresent()) {
-        getUniverse(true).incrementVersion();
+        getUniverse().incrementVersion();
       }
     } catch (Exception e) {
       log.error("{} hit error : {}", getName(), e.getMessage());
-      throw new RuntimeException(e);
+      if (!forceDelete) {
+        throw new RuntimeException(e);
+      } else {
+        log.warn("Ignoring error because forceDelete is true: {}", e.getMessage());
+      }
     }
 
     log.info("Completed {}", getName());

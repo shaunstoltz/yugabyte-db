@@ -3,9 +3,9 @@
 //  LICENSE file in the root directory of this source tree. An additional grant
 //  of patent rights can be found in the PATENTS file in the same directory.
 //
-// The following only applies to changes made to this file as part of YugaByte development.
+// The following only applies to changes made to this file as part of YugabyteDB development.
 //
-// Portions Copyright (c) YugaByte, Inc.
+// Portions Copyright (c) YugabyteDB, Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License"); you may not use this file except
 // in compliance with the License.  You may obtain a copy of the License at
@@ -901,6 +901,9 @@ void InternalDumpCommand::DoCommand() {
   } else {
     fprintf(stdout, "Internal keys in range: %" PRId64 "\n", count);
   }
+  if (!iter->status().ok()) {
+    exec_state_ = LDBCommandExecuteResult::Failed(iter->status().ToString());
+  }
 }
 
 
@@ -1118,6 +1121,11 @@ void DBDumperCommand::DoDumpCommand() {
   } else {
     fprintf(stdout, "Keys in range: %" PRIu64 "\n", count);
   }
+
+  if (!iter->status().ok()) {
+    exec_state_ = LDBCommandExecuteResult::Failed(iter->status().ToString());
+  }
+
   // Clean up
   delete iter;
 }
@@ -1428,7 +1436,7 @@ class InMemoryHandler : public WriteBatch::Handler {
     row_ << LDBCommand::StringToHex(key.ToBuffer()) << " ";
   }
 
-  Status Frontiers(const UserFrontiers& range) override {
+  Status Frontiers(const yb::storage::UserFrontiers& range) override {
     row_ << " MARGIN_RANGE : " << range.ToString() << " ";
     return Status::OK();
   }
@@ -2120,7 +2128,7 @@ void DBFileDumperCommand::DoCommand() {
   std::vector<LiveFileMetaData> metadata;
   db_->GetLiveFilesMetaData(&metadata);
   for (auto& fileMetadata : metadata) {
-    std::string filename = fileMetadata.FullName();
+    std::string filename = fileMetadata.BaseFilePath();
     std::cout << filename << " level:" << fileMetadata.level << std::endl;
     std::cout << "------------------------------" << std::endl;
     DumpSstFile(filename, false, true);

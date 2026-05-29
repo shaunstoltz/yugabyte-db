@@ -1,4 +1,4 @@
-# Copyright 2019 YugaByte, Inc. and Contributors
+# Copyright 2019 YugabyteDB, Inc. and Contributors
 #
 # Licensed under the Polyform Free Trial License 1.0.0 (the "License"); you
 # may not use this file except in compliance with the License. You
@@ -13,25 +13,23 @@ import socket
 import time
 import json
 
-
 from googleapiclient import discovery
 from googleapiclient.errors import HttpError
-import oauth2client
+import google.auth
 from six.moves import http_client
 
 from ybops.common.exceptions import YBOpsRuntimeError
 from ybops.cloud.common.utils import request_retry_decorator
 
-
-RESOURCE_BASE_URL = "https://www.googleapis.com/compute/beta/projects/"
+RESOURCE_BASE_URL = "https://www.googleapis.com/compute/v1/projects/"
 REGIONS_RESOURCE_URL_FORMAT = RESOURCE_BASE_URL + "{}/regions/{}"
-PRICING_JSON_URL = "https://cloudpricingcalculator.appspot.com/static/data/pricelist.json"
+PRICING_JSON_URL = os.environ.get("YB_GCP_PRICING_JSON_URL",
+                                  "https://downloads.yugabyte.com/gcp_price_list/pricelist_gcp.json")
 IMAGE_NAME_PREFIX = "CP-COMPUTEENGINE-VMIMAGE-"
 IMAGE_NAME_PREEMPTIBLE_SUFFIX = "-PREEMPTIBLE"
 OPERATION_WAIT_TIME = 5
 MAX_NUM_RETRY_COUNT = 120
 LIST_MAX_RESULTS = 500
-
 
 YB_NETWORK_NAME = "yb-gcp-network"
 YB_SUBNET_FORMAT = "yb-subnet-{}"
@@ -48,7 +46,8 @@ META_KEYS = [STARTUP_SCRIPT_META_KEY, SERVER_TYPE_META_KEY, SSH_KEYS_META_KEY]
 
 GCP_SCRATCH = "scratch"
 GCP_PERSISTENT = "persistent"
-
+GCP_HYPERDISK_BALANCED = "hyperdisk_balanced"
+GCP_HYPERDISK_EXTREME = "hyperdisk_extreme"
 
 # Code 429 does not have a name in httplib.
 TOO_MANY_REQUESTS = 429
@@ -79,9 +78,7 @@ def gcp_exception_handler(e):
         # in a ValueError if the response was invalid. Until that is fixed in
         # oauth2client, need to handle it here.
         logging.warning('Response content was invalid (%s), retrying', e)
-    elif (isinstance(e, oauth2client.client.HttpAccessTokenRefreshError) and
-          (e.status == TOO_MANY_REQUESTS or
-           e.status >= 500)):
+    elif isinstance(e, google.auth.exceptions.RefreshError) and e.retryable:
         logging.warning('Caught transient credential refresh error (%s), retrying', e)
     elif (isinstance(e, HttpError) and
           (e.resp.status == TOO_MANY_REQUESTS or
@@ -130,7 +127,7 @@ class GcpMetadata():
         return GcpMetadata._query_endpoint("project/project-id")
 
     @staticmethod
-    def host_project():
+    def shared_vpc_project():
         network_data = GcpMetadata._query_endpoint("instance/network-interfaces/0/network")
         try:
             # Network data is of format projects/PROJECT_NUMBER/networks/NETWORK_NAME
@@ -171,6 +168,7 @@ class Waiter():
     def wait(self, operation, region=None, zone=None):
         # This allows easier chaining of waits on functions that are NOOPs if items already exist.
         if operation is None:
+            logging.warning("Returning waiting for a None Operation")
             return
         retry_count = 0
         name = operation["name"]
@@ -203,7 +201,8 @@ class Waiter():
 
 
 class NetworkManager():
-    def __init__(self, project, compute, metadata, dest_vpc_id, host_vpc_id, per_region_meta):
+    def __init__(self, project, compute, metadata, dest_vpc_id, host_vpc_id,
+                 per_region_meta, create_new_vpc=False):
         self.project = project
         self.compute = compute
         self.metadata = metadata
@@ -218,6 +217,7 @@ class NetworkManager():
         if self.host_vpc_id is not None:
             self.host_vpc_id = self.host_vpc_id.split("/")[-1]
         self.per_region_meta = per_region_meta
+        self.create_new_vpc = create_new_vpc
 
         self.waiter = Waiter(self.project, self.compute)
 
@@ -252,13 +252,23 @@ class NetworkManager():
         return self.network_info_as_json(network_name, output_region_to_subnet_map)
 
     def bootstrap(self):
-        # If given a target VPC, then don't create anything.
-        if self.dest_vpc_id:
+        # If create_new_vpc is not specified than use the specified the VPC.
+        if self.dest_vpc_id and not self.create_new_vpc:
+            # Try to fetch the specified network & fail in case it does not exist.
+            networks = self.get_networks(self.dest_vpc_id)
+            if len(networks) == 0:
+                raise YBOpsRuntimeError("Invalid target VPC: {}".format(self.dest_vpc_id))
             return self.get_network_data(self.dest_vpc_id)
-        # If we were not given a target VPC, then we'll try to provision our custom network.
+        # If create_new_vpc is specified we will be creating a new VPC with specified
+        # name if not present, else we will fail.
+        if self.dest_vpc_id:
+            global YB_NETWORK_NAME
+            YB_NETWORK_NAME = self.dest_vpc_id
         networks = self.get_networks(YB_NETWORK_NAME)
         if len(networks) > 0:
-            network_url = networks[0].get("selfLink")
+            raise YBOpsRuntimeError(
+                "Failed to create VPC as vpc with same name already exists: {}"
+                    .format(YB_NETWORK_NAME))
         else:
             # Create the network if it didn't already exist.
             op = self.waiter.wait(self.create_network())
@@ -539,9 +549,9 @@ class GoogleCloudAdmin():
         #   GOOGLE_APPLICATION_CREDENTIALS: set to the path of the credentials json file
         # If these are not provided, then get_application_default will try to use the service
         # account associated with the instance we're running on, if one exists.
-        self.credentials = oauth2client.client.GoogleCredentials.get_application_default()
+        self.credentials, _ = google.auth.default()
         self.compute = discovery.build(
-            "compute", "beta", credentials=self.credentials, num_retries=3)
+            "compute", "v1", credentials=self.credentials, num_retries=3)
         # If we have specified a GCE_PROJECT, use that, else, try the instance metadata, else fail.
         self.project = os.environ.get("GCE_PROJECT") or GcpMetadata.project()
         if self.project is None:
@@ -551,22 +561,24 @@ class GoogleCloudAdmin():
         self.metadata = metadata
         self.waiter = Waiter(self.project, self.compute)
 
-    def network(self, dest_vpc_id=None, host_vpc_id=None, per_region_meta=None):
+    def network(self, dest_vpc_id=None, host_vpc_id=None, per_region_meta=None,
+                create_new_vpc=False):
         if per_region_meta is None:
             per_region_meta = {}
         return NetworkManager(
-            self.project, self.compute, self.metadata, dest_vpc_id, host_vpc_id, per_region_meta)
+            self.get_shared_vpc_project(), self.compute, self.metadata, dest_vpc_id,
+            host_vpc_id, per_region_meta, create_new_vpc)
 
     @staticmethod
     def get_current_host_info():
         network = GcpMetadata.network()
-        host_project = GcpMetadata.host_project()
+        shared_vpc_project = GcpMetadata.shared_vpc_project()
         project = GcpMetadata.project()
         if network is None or project is None:
             raise YBOpsRuntimeError("Unable to auto-discover GCP provider information")
         return {
             "network": network.split("/")[-1],
-            "host_project": host_project,
+            "shared_vpc_project": shared_vpc_project,
             "project": project
         }
 
@@ -577,11 +589,12 @@ class GoogleCloudAdmin():
 
     def get_full_image_name(self, name, preemptible=False):
         return IMAGE_NAME_PREFIX + name.upper() + \
-            (IMAGE_NAME_PREEMPTIBLE_SUFFIX if preemptible else "")
+               (IMAGE_NAME_PREEMPTIBLE_SUFFIX if preemptible else "")
 
     def create_disk(self, zone, instance_tags, body):
         if instance_tags is not None:
             body.update({"labels": json.loads(instance_tags)})
+        # Create a persistent disk with wait
         operation = self.compute.disks().insert(project=self.project,
                                                 zone=zone,
                                                 body=body).execute()
@@ -642,48 +655,112 @@ class GoogleCloudAdmin():
             self.compute.disks().delete(project=self.project, zone=zone, disk=disk_name).execute()
 
     def mount_disk(self, zone, instance, body):
+        logging.info("Attaching disk on instance {} in zone {}".format(instance, zone))
         operation = self.compute.instances().attachDisk(project=self.project,
                                                         zone=zone,
                                                         instance=instance,
                                                         body=body).execute()
-        return self.waiter.wait(operation, zone=zone)
+        output = self.waiter.wait(operation, zone=zone)
+        response = self.compute.instances().get(project=self.project,
+                                                zone=zone,
+                                                instance=instance).execute()
+        for disk in response.get("disks"):
+            if disk.get("source") != body.get("source"):
+                continue
+            device_name = disk.get("deviceName")
+            logging.info("Setting disk auto delete for {} attached to {}"
+                         .format(device_name, instance))
+            # Even if this fails, volumes are already tagged for cleanup.
+            operation = self.compute.instances().setDiskAutoDelete(project=self.project,
+                                                                   zone=zone,
+                                                                   instance=instance,
+                                                                   deviceName=device_name,
+                                                                   autoDelete=True).execute()
+            self.waiter.wait(operation, zone=zone)
+            break
+        return output
 
     def unmount_disk(self, zone, instance, name):
+        logging.info("Detaching disk {} from instance {}".format(name, instance))
         operation = self.compute.instances().detachDisk(project=self.project,
                                                         zone=zone,
                                                         instance=instance,
                                                         deviceName=name).execute()
         return self.waiter.wait(operation, zone=zone)
 
+    def get_disk(self, zone, instance, volume_id):
+        logging.info("Retrieving the disk {}".format(volume_id))
+        try:
+            instance = self.compute.instances().get(project=self.project,
+                                                    zone=zone,
+                                                    instance=instance).execute()
+            for disk in instance.get("disks", []):
+                if disk.get("deviceName").strip().lower() == volume_id.strip().lower():
+                    disk_name = disk.get("source").split("/")[-1]
+
+                    # Fetch disk details separately to get the status
+                    disk_details = self.compute.disks().get(project=self.project,
+                                                            zone=zone,
+                                                            disk=disk_name).execute()
+                    return disk_details
+        except Exception as e:
+            logging.warning(f"Error checking GCP disk attachment: {e}")
+            return None
+
     def update_disk(self, args, instance):
         zone = args.zone
         instance_info = self.compute.instances().get(project=self.project, zone=zone,
                                                      instance=instance).execute()
-        body = {
-            "sizeGb": args.volume_size
-        }
         for disk in instance_info['disks']:
             # The source is the complete URL of the disk, with the last
             # component being the name.
             disk_name = self.get_disk_name(disk)
             # Bootdisk should be ignored.
-            # GCP does not allow disk resize to same volume size.
-            if disk['index'] != 0 and int(disk["diskSizeGb"]) != args.volume_size:
-                logging.info(
-                    "Instance %s's volume %s changed to %s",
-                    instance, disk_name, args.volume_size)
-                operation = self.compute.disks().resize(project=self.project,
-                                                        zone=zone,
-                                                        disk=disk_name,
-                                                        body=body).execute()
-                self.waiter.wait(operation, zone=zone)
-            elif disk['index'] != 0:
-                logging.info(
-                    "Instance %s's volume %s has not changed from %s",
-                    instance, disk["deviceName"], disk["diskSizeGb"])
+            if disk['index'] != 0:
+                disk_info = self.compute.disks().get(project=self.project,
+                                                     zone=zone,
+                                                     disk=disk_name).execute()
+                size_updated = int(disk["diskSizeGb"]) != args.volume_size
+                iops_updated = args.disk_iops is not None \
+                    and disk_info.get("provisionedIops") is not None \
+                    and args.disk_iops != int(disk_info["provisionedIops"])
+                throughput_updated = args.disk_throughput is not None \
+                    and disk_info.get("provisionedThroughput") is not None \
+                    and args.disk_throughput != int(disk_info["provisionedThroughput"])
+                # GCP does not allow disk resize to same volume size.
+                if size_updated or iops_updated or throughput_updated:
+                    update_mask_array = []
+                    logging.info(
+                        "Instance %s's volume %s changed to %s, iops %s, throughput %s",
+                        instance, disk_name, args.volume_size, args.disk_iops, args.disk_throughput)
+                    if size_updated:
+                        disk_info.update({
+                            "sizeGb": args.volume_size
+                        })
+                        update_mask_array.append("sizeGb")
+                    if iops_updated:
+                        disk_info.update({
+                            "provisionedIops": args.disk_iops
+                        })
+                        update_mask_array.append("provisionedIops")
+                    if throughput_updated:
+                        disk_info.update({
+                            "provisionedThroughput": args.disk_throughput
+                        })
+                        update_mask_array.append("provisionedThroughput")
+                    operation = self.compute.disks().update(project=self.project,
+                                                            zone=zone,
+                                                            disk=disk_name,
+                                                            updateMask=','.join(update_mask_array),
+                                                            body=disk_info).execute()
+                    self.waiter.wait(operation, zone=zone)
+                else:
+                    logging.info(
+                        "Instance %s's volume %s has not changed from %s",
+                        instance, disk["deviceName"], disk["diskSizeGb"])
 
-    def change_instance_type(self, zone, instance_name, newInstanceType):
-        new_machine_type = f"zones/{zone}/machineTypes/{newInstanceType}"
+    def change_instance_type(self, zone, instance_name, instance_type, capacity_reservation=None):
+        new_machine_type = f"zones/{zone}/machineTypes/{instance_type}"
         body = {
             "machineType": new_machine_type
         }
@@ -719,7 +796,27 @@ class GoogleCloudAdmin():
         if operation:
             self.waiter.wait(operation=operation, zone=zone)
 
-    def start_instance(self, zone, instance_name):
+    def start_instance(self, zone, instance_name, capacity_reservation=None):
+        if capacity_reservation:
+            logging.info(f'Setting capacity reservation: {capacity_reservation}')
+
+            # First, set the reservation affinity while instance is stopped
+            scheduling_body = {
+                "reservationAffinity": {
+                    "consumeReservationType": "ANY_RESERVATION"
+                }
+            }
+
+            # Set scheduling (including reservation affinity)
+            set_operation = self.compute.instances().setScheduling(
+                project=self.project,
+                zone=zone,
+                instance=instance_name,
+                body=scheduling_body
+            ).execute()
+
+            # Wait for the scheduling change to complete
+            self.waiter.wait(set_operation, zone=zone)
         operation = self.compute.instances().start(project=self.project,
                                                    zone=zone,
                                                    instance=instance_name).execute()
@@ -738,8 +835,8 @@ class GoogleCloudAdmin():
         return {}
 
     def get_subnetwork_by_name(self, region, name):
-        host_project = self.get_host_project()
-        return self.compute.subnetworks().get(project=host_project,
+        shared_vpc_project = self.get_shared_vpc_project()
+        return self.compute.subnetworks().get(project=shared_vpc_project,
                                               region=region, subnetwork=name).execute()
 
     def get_regions(self):
@@ -766,21 +863,25 @@ class GoogleCloudAdmin():
                                                                zone=zone).execute()
         return instance_type_items["items"]
 
-    def get_host_project(self):
-        return os.environ.get("GCE_HOST_PROJECT", self.project)
+    def get_shared_vpc_project(self):
+        return os.environ.get("GCE_SHARED_VPC_PROJECT", self.project)
 
     def get_pricing_map(self, ):
-        # Requests encounters an SSL bug when run on portal, so verify is set to false
-        pricing_url_response = requests.get(PRICING_JSON_URL, verify=False)
-        pricing_map_all = pricing_url_response.json()["gcp_price_list"]
-        pricing_map = {}
-        for key in pricing_map_all:
-            if key.startswith(IMAGE_NAME_PREFIX):
-                pricing_map[key] = pricing_map_all[key]
-        return pricing_map
+        try:
+            # Requests encounters an SSL bug when run on portal, so verify is set to false
+            pricing_url_response = requests.get(PRICING_JSON_URL, verify=False)
+            pricing_map_all = pricing_url_response.json()["gcp_price_list"]
+            pricing_map = {}
+            for key in pricing_map_all:
+                if key.startswith(IMAGE_NAME_PREFIX):
+                    pricing_map[key] = pricing_map_all[key]
+            return pricing_map
+        except Exception as e:
+            logging.warning("[app] Exception {} determining GCP pricing info".format(e))
+        return {}
 
     @gcp_request_limit_retry
-    def get_instances(self, zone, instance_name, get_all=False, filters=None):
+    def get_instances(self, zone, instance_name, get_all=False, filters=None, node_uuid=None):
         # TODO: filter should work to do (zone eq args.zone), but it doesn't right now...
         filter_params = []
         if filters:
@@ -812,6 +913,13 @@ class GoogleCloudAdmin():
             server_types = [i["value"] for i in metadata if i["key"] == "server_type"]
             node_uuid_tags = [i["value"] for i in metadata if i["key"] == "node-uuid"]
             universe_uuid_tags = [i["value"] for i in metadata if i["key"] == "universe-uuid"]
+            host_node_uuid = node_uuid_tags[0] if node_uuid_tags else None
+            # Matching label or no label for backward compatibility.
+            if host_node_uuid is not None and node_uuid is not None \
+                    and host_node_uuid != node_uuid:
+                logging.warning("VM {}({}) with node UUID {} is not found.".
+                                format(instance_name, host_node_uuid, node_uuid))
+                continue
             private_ip = None
             primary_subnet = None
             secondary_private_ip = None
@@ -850,27 +958,45 @@ class GoogleCloudAdmin():
                 zone=zone,
                 instance_type=machine_type,
                 server_type=server_types[0] if server_types else None,
-                node_uuid=node_uuid_tags[0] if node_uuid_tags else None,
+                node_uuid=host_node_uuid,
                 universe_uuid=universe_uuid_tags[0] if universe_uuid_tags else None,
                 launched_by=None,
                 launch_time=data.get("creationTimestamp"),
                 root_volume=root_vol.get("source") if root_vol else None,
                 root_volume_device_name=root_vol.get("deviceName") if root_vol else None,
                 instance_state=instance_state,
-                is_running=True if instance_state == "RUNNING" else False
+                is_running=True if instance_state == "RUNNING" else False,
+                metadata=data.get("metadata")
             )
             if not get_all:
                 return result
             results.append(result)
         return results
 
+    def get_image_disk_size(self, machine_image):
+        tokens = machine_image.split("/")
+        image_project = self.project
+        image_project_idx = tokens.index("projects")
+        if image_project_idx >= 0:
+            image_project = tokens[image_project_idx + 1]
+        image = self.get_image(tokens[-1], image_project)
+        return image["diskSizeGb"]
+
+    def _get_boot_disk_type(self, zone, instance_type):
+        # Create boot disk backed by a zonal persistent SSD by default.
+        boot_disk_type = "pd-ssd"
+        if instance_type.startswith(('c4', 'n4')):
+            boot_disk_type = "hyperdisk-balanced"
+        return "zones/{}/diskTypes/{}".format(zone, boot_disk_type)
+
     def create_instance(self, region, zone, cloud_subnet, instance_name, instance_type, server_type,
-                        use_preemptible, can_ip_forward, machine_image, num_volumes, volume_type,
+                        use_spot_instance, can_ip_forward, machine_image, num_volumes, volume_type,
                         volume_size, boot_disk_size_gb=None, assign_public_ip=True,
                         assign_static_public_ip=False, ssh_keys=None, boot_script=None,
-                        auto_delete_boot_disk=True, tags=None, cloud_subnet_secondary=None):
+                        auto_delete_boot_disk=True, tags=None, cloud_subnet_secondary=None,
+                        gcp_instance_template=None, disk_iops=None, disk_throughput=None, capacity_reservation=None):
         # Name of the project that target VPC network belongs to.
-        host_project = self.get_host_project()
+        shared_vpc_project = self.get_shared_vpc_project()
 
         boot_disk_json = {
             "autoDelete": auto_delete_boot_disk,
@@ -881,9 +1007,14 @@ class GoogleCloudAdmin():
         boot_disk_init_params["sourceImage"] = machine_image
         if boot_disk_size_gb is not None:
             # Default: 10GB
-            boot_disk_init_params["diskSizeGb"] = boot_disk_size_gb
-        # Create boot disk backed by a zonal persistent SSD
-        boot_disk_init_params["diskType"] = "zones/{}/diskTypes/pd-ssd".format(zone)
+            min_disk_size = self.get_image_disk_size(machine_image)
+            disk_size = min_disk_size if min_disk_size \
+                                         and int(min_disk_size) > int(boot_disk_size_gb) \
+                else boot_disk_size_gb
+            boot_disk_init_params["diskSizeGb"] = disk_size
+
+        disk_type = self._get_boot_disk_type(zone, instance_type)
+        boot_disk_init_params["diskType"] = disk_type
         boot_disk_json["initializeParams"] = boot_disk_init_params
 
         access_configs = [{"natIP": None}
@@ -896,10 +1027,16 @@ class GoogleCloudAdmin():
                 static_ip_name, instance_name, region)
             static_ip_body = {"name": static_ip_name, "description": static_ip_description}
             logging.info("[app] Creating " + static_ip_description)
-            self.waiter.wait(self.compute.addresses().insert(
-                project=self.project,
-                region=region,
-                body=static_ip_body).execute(), region=region)
+
+            try:
+                self.waiter.wait(self.compute.addresses().insert(
+                    project=self.project,
+                    region=region,
+                    body=static_ip_body).execute(), region=region)
+            except HttpError as e:
+                if e.resp.status == 409 and 'already exists' in str(e):
+                    logging.warning(f"{static_ip_name} already exists")
+
             static_ip = self.compute.addresses().get(
                 project=self.project,
                 region=region,
@@ -933,21 +1070,35 @@ class GoogleCloudAdmin():
             "networkInterfaces": [{
                 "accessConfigs": access_configs,
                 "subnetwork": "projects/{}/regions/{}/subnetworks/{}".format(
-                    host_project, region, cloud_subnet)
+                    shared_vpc_project, region, cloud_subnet)
             }],
             "tags": {
                 "items": get_firewall_tags()
-            },
-            "scheduling": {
-                "preemptible": use_preemptible
             }
         }
+
+        if capacity_reservation:
+            logging.info(f'[app] Using capacity reservation: {capacity_reservation}')
+            body["reservationAffinity"] = {
+                "consumeReservationType": "ANY_RESERVATION"
+            }
+
+        if use_spot_instance:
+            logging.info(f'[app] Using GCP spot instances')
+            body["scheduling"] = {
+                "provisioningModel": "SPOT"
+            }
+            # Spot instances cannot consume capacity reservations
+            if capacity_reservation:
+                logging.warning("[app] Warning: Spot instances cannot use capacity reservations. "
+                              "Reservation will be ignored.")
+                body.pop("reservationAffinity", None)
         # Attach a secondary network interface if present.
         if cloud_subnet_secondary:
             body["networkInterfaces"].append({
                 "accessConfigs": [{"natIP": None}],
                 "subnetwork": "projects/{}/regions/{}/subnetworks/{}".format(
-                    host_project, region, cloud_subnet_secondary)
+                    shared_vpc_project, region, cloud_subnet_secondary)
             })
 
         if boot_script:
@@ -958,6 +1109,7 @@ class GoogleCloudAdmin():
                 })
 
         initial_params = {}
+        disk_update_params = {}
         if volume_type == GCP_SCRATCH:
             initial_params.update({
                 "diskType": "zones/{}/diskTypes/local-ssd".format(zone)
@@ -965,9 +1117,28 @@ class GoogleCloudAdmin():
             # Default size: 375GB
         elif volume_type == GCP_PERSISTENT:
             initial_params.update({
-                "diskType": "zones/{}/diskTypes/pd-ssd".format(zone),
+                "diskType": "zones/{}/diskTypes/pd-ssd".format(zone)
+            })
+        elif volume_type == GCP_HYPERDISK_BALANCED:
+            initial_params.update({
+                "diskType": "zones/{}/diskTypes/hyperdisk-balanced".format(zone)
+            })
+        elif volume_type == GCP_HYPERDISK_EXTREME:
+            initial_params.update({
+                "diskType": "zones/{}/diskTypes/hyperdisk-extreme".format(zone)
+            })
+        if volume_type != GCP_SCRATCH:
+            initial_params.update({
                 "sourceImage": None,
                 "diskSizeGb": volume_size
+            })
+        if disk_iops is not None:
+            initial_params.update({
+                "provisionedIops": disk_iops
+            })
+        if disk_throughput is not None:
+            initial_params.update({
+                "provisionedThroughput": disk_throughput
             })
         disk_config = {
             "autoDelete": True,
@@ -987,12 +1158,20 @@ class GoogleCloudAdmin():
         for _ in range(num_volumes):
             body["disks"].append(disk_config)
 
+        args = {
+            "project": self.project,
+            "zone": zone,
+            "body": body
+        }
         logging.info("[app] About to create GCP VM {} in region {}.".format(
             instance_name, region))
-        self.waiter.wait(self.compute.instances().insert(
-            project=self.project,
-            zone=zone,
-            body=body).execute(), zone=zone)
+        if gcp_instance_template:
+            template_url_format = "projects/{}/global/instanceTemplates/{}"
+            template_url = template_url_format.format(self.project, gcp_instance_template)
+            logging.info("[app] Creating VM {} using instance template {}"
+                         .format(instance_name, gcp_instance_template))
+            args["sourceInstanceTemplate"] = template_url
+        self.waiter.wait(self.compute.instances().insert(**args).execute(), zone=zone)
         logging.info("[app] Created GCP VM {}".format(instance_name))
 
     def get_console_output(self, zone, instance_name):
@@ -1004,6 +1183,30 @@ class GoogleCloudAdmin():
         except HttpError:
             logging.exception('Failed to get console output from {}'.format(instance_name))
             return ''
+
+    def update_boot_script(self, args, instance, boot_script):
+        metadata = instance['metadata']
+        # Get the current metadata 'items' list or initialize it if not present
+        current_items = metadata.get('items', [])
+
+        # Find the index of the 'startup-script' metadata item, or -1 if not found
+        startup_script_index = next((index for index, item in enumerate(current_items)
+                                     if item['key'] == 'startup-script'), -1)
+
+        # If the 'startup-script' metadata item exists, update the value;
+        # otherwise, append a new item
+        if startup_script_index != -1:
+            current_items[startup_script_index]['value'] = boot_script
+        else:
+            current_items.append({'key': 'startup-script', 'value': boot_script})
+
+        # Update the instance metadata with the new items list
+        self.waiter.wait(self.compute.instances().setMetadata(
+            project=self.project,
+            zone=args.zone,
+            instance=instance['name'],
+            body={'fingerprint': metadata.get('fingerprint'), 'items': current_items}
+        ).execute(), zone=args.zone)
 
     def modify_tags(self, args, instance, tags_to_set_str, tags_to_remove_str):
         tags_to_set = json.loads(tags_to_set_str) if tags_to_set_str is not None else {}

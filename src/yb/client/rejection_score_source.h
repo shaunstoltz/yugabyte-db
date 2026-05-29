@@ -1,4 +1,4 @@
-// Copyright (c) YugaByte, Inc.
+// Copyright (c) YugabyteDB, Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License"); you may not use this file except
 // in compliance with the License.  You may obtain a copy of the License at
@@ -18,7 +18,7 @@
 #include <string>
 #include <vector>
 
-#include <glog/logging.h>
+#include "yb/util/logging.h"
 
 #include "yb/util/random_util.h"
 
@@ -30,9 +30,9 @@ class RejectionScoreSource {
  public:
   double Get(int attempt_num) {
     size_t idx = std::min<size_t>(attempt_num - 1, 20);
-    std::lock_guard<std::mutex> lock(mutex_);
+    std::lock_guard lock(mutex_);
     while (scores_.size() <= idx) {
-      scores_.push_back(RandomUniformReal<double>(0.01, 1.0));
+      scores_.push_back(RandomUniformReal<double>(1e-9, 1.0));
     }
     return scores_[idx];
   }

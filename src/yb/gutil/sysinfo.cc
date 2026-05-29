@@ -28,9 +28,9 @@
 // (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
 // OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 //
-// The following only applies to changes made to this file as part of YugaByte development.
+// The following only applies to changes made to this file as part of YugabyteDB development.
 //
-// Portions Copyright (c) YugaByte, Inc.
+// Portions Copyright (c) YugabyteDB, Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License"); you may not use this file except
 // in compliance with the License.  You may obtain a copy of the License at
@@ -72,16 +72,15 @@
 #include <thread>
 #include "yb/util/flags.h"
 
-#include <glog/logging.h>
+#include "yb/util/logging.h"
 
 #include "yb/gutil/casts.h"
 #include "yb/gutil/dynamic_annotations.h"   // for RunningOnValgrind
 #include "yb/gutil/macros.h"
 #include "yb/gutil/sysinfo.h"
 #include "yb/gutil/walltime.h"
-#include "yb/util/logging.h"
 
-DEFINE_UNKNOWN_int32(num_cpus, 0, "Number of CPU cores used in calculations");
+DEFINE_NON_RUNTIME_int32(num_cpus, 0, "Number of CPU cores used in calculations");
 
 // This isn't in the 'base' namespace in tcmallc. But, tcmalloc
 // exports these functions, so we need to namespace them to avoid

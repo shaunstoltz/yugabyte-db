@@ -1,4 +1,4 @@
-// Copyright (c) YugaByte, Inc.
+// Copyright (c) YugabyteDB, Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License"); you may not use this file except
 // in compliance with the License.  You may obtain a copy of the License at
@@ -63,10 +63,11 @@ void AppendItem(std::string* props, const TKey& key, const std::string& value) {
 // Generate new filter for fixed number of keys
 FixedSizeFilterBlockBuilder::FixedSizeFilterBlockBuilder(
     const SliceTransform* prefix_extractor,
-    const BlockBasedTableOptions& table_opt)
+    const BlockBasedTableOptions& table_opt, const yb::MemTrackerPtr& mem_tracker)
     : policy_(table_opt.filter_policy.get()),
       prefix_extractor_(prefix_extractor),
       whole_key_filtering_(table_opt.whole_key_filtering),
+      mem_tracker_(mem_tracker),
       bits_builder_(nullptr) {
 }
 
@@ -108,7 +109,7 @@ Slice FixedSizeFilterBlockBuilder::Finish() {
   assert(bits_builder_);
   Slice finished_slice = bits_builder_->Finish(&active_block_data_);
   bits_builder_.reset();
-  results_.push_back(std::move(active_block_data_));
+  results_.emplace_back(std::move(active_block_data_), finished_slice.size(), mem_tracker_);
   return finished_slice;
 }
 
@@ -125,7 +126,7 @@ FixedSizeFilterBlockReader::FixedSizeFilterBlockReader(
   reader_.reset(policy_->GetFilterBitsReader(contents_.data));
 }
 
-bool FixedSizeFilterBlockReader::KeyMayMatch(const Slice& key, uint64_t block_offset) {
+bool FixedSizeFilterBlockReader::KeyMayMatch(Slice key, uint64_t block_offset) {
   return whole_key_filtering_ ? MayMatch(key) : true;
 }
 
@@ -133,7 +134,7 @@ bool FixedSizeFilterBlockReader::PrefixMayMatch(const Slice& prefix, uint64_t bl
   return prefix_extractor_ ? MayMatch(prefix) : true;
 }
 
-bool FixedSizeFilterBlockReader::MayMatch(const Slice& entry) {
+bool FixedSizeFilterBlockReader::MayMatch(Slice entry) {
   if (reader_->MayMatch(entry)) {
     PERF_COUNTER_ADD(bloom_sst_hit_count, 1);
     return true;

@@ -15,9 +15,9 @@
 // specific language governing permissions and limitations
 // under the License.
 //
-// The following only applies to changes made to this file as part of YugaByte development.
+// The following only applies to changes made to this file as part of YugabyteDB development.
 //
-// Portions Copyright (c) YugaByte, Inc.
+// Portions Copyright (c) YugabyteDB, Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License"); you may not use this file except
 // in compliance with the License.  You may obtain a copy of the License at
@@ -42,14 +42,8 @@ namespace master {
 
 static const std::string kRelnamespaceNotFoundErrorStr =
     "Not found or invalid relnamespace oid for table oid ";
-
-inline Status SetupError(MasterErrorPB* error,
-                                 MasterErrorPB::Code code,
-                                 const Status& s) {
-  StatusToPB(s, error->mutable_status());
-  error->set_code(code);
-  return s;
-}
+static const std::string kCommittedPgsqlTableNotFoundErrorStr =
+    "No committed pgsql table was found for DocDB table ";
 
 inline Status CheckIfNoLongerLeader(const Status& s) {
   // TODO (KUDU-591): This is a bit of a hack, as right now
@@ -81,5 +75,23 @@ Status CheckIfNoLongerLeaderAndSetupError(const Status& s, RespClass* resp) {
   return s;
 }
 
+inline Status CheckStatus(const Status& status, const char* action) {
+  if (status.ok()) {
+    return status;
+  }
+
+  const Status s = status.CloneAndPrepend(std::string("An error occurred while ") + action);
+  LOG(WARNING) << s;
+  return s;
+}
+
+inline Status CheckLeaderStatus(const Status& status, const char* action) {
+  return CheckIfNoLongerLeader(CheckStatus(status, action));
+}
+
+template <class RespClass>
+Status CheckLeaderStatusAndSetupError(const Status& status, const char* action, RespClass* resp) {
+  return CheckIfNoLongerLeaderAndSetupError(CheckStatus(status, action), resp);
+}
 }  // namespace master
 }  // namespace yb

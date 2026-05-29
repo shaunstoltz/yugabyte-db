@@ -1,7 +1,7 @@
 /*
  * Created on Tue Aug 16 2022
  *
- * Copyright 2021 YugaByte, Inc. and Contributors
+ * Copyright 2021 YugabyteDB, Inc. and Contributors
  * Licensed under the Polyform Free Trial License 1.0.0 (the "License")
  * You may not use this file except in compliance with the License. You may obtain a copy of the License at
  * http://github.com/YugaByte/yugabyte-db/blob/master/licenses/POLYFORM-FREE-TRIAL-LICENSE-1.0.0.txt
@@ -9,6 +9,7 @@
 
 import axios from 'axios';
 import { ROOT_URL } from '../../../config';
+import { convertToISODateString } from '../../../redesign/helpers/DateUtils';
 import { TIME_RANGE_STATE } from './IBackup';
 
 export function getRestoreList(
@@ -20,8 +21,8 @@ export function getRestoreList(
   sortBy: string,
   direction: string,
   moreFilters: any[] | undefined,
-  universeUUID?: string,
-  storageConfigUUID?: string | null
+  isAccountLevelView: boolean,
+  universeUUID?: string
 ) {
   const payload = {
     sortBy,
@@ -33,23 +34,19 @@ export function getRestoreList(
   };
   if (searchText) {
     payload['filter'] = {
-      universeNameList: [searchText]
+      [isAccountLevelView ? 'universeNameList' : 'sourceUniverseNameList']: [searchText]
     };
   }
   if (universeUUID) {
     payload['filter']['universeUUIDList'] = [universeUUID];
   }
 
-  if (storageConfigUUID) {
-    payload['filter']['storageConfigUUIDList'] = [storageConfigUUID];
-  }
-
   if (states.length !== 0 && states[0].label !== 'All') {
     payload.filter['states'] = [states[0].value];
   }
   if (timeRange.startTime && timeRange.endTime) {
-    payload.filter['dateRangeStart'] = timeRange.startTime.toISOString();
-    payload.filter['dateRangeEnd'] = timeRange.endTime.toISOString();
+    payload.filter['dateRangeStart'] = convertToISODateString(timeRange.startTime);
+    payload.filter['dateRangeEnd'] = convertToISODateString(timeRange.endTime);
   }
 
   if (Array.isArray(moreFilters) && moreFilters?.length > 0) {

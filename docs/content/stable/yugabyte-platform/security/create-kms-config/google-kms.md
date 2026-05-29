@@ -1,59 +1,56 @@
 ---
 title: Create a KMS configuration using Google Cloud
-headerTitle: Create a KMS configuration using Google Cloud
+headerTitle: Create a KMS configuration
 linkTitle: Create a KMS configuration
 description: Use YugabyteDB Anywhere to create a KMS configuration for Google Cloud KMS.
 menu:
   stable_yugabyte-platform:
     parent: security
-    identifier: create-kms-config-1-google-kms
-    weight: 27
+    identifier: create-kms-config-2-google-kms
+    weight: 50
 type: docs
 ---
 
+Encryption at rest uses a master key to encrypt and decrypt universe keys. The master key details are stored in YugabyteDB Anywhere in key management service (KMS) configurations. You enable encryption at rest for a universe by assigning the universe a KMS configuration. The master key designated in the configuration is then used for generating the universe keys used for encrypting the universe data.
+
 <ul class="nav nav-tabs-alt nav-tabs-yb">
   <li >
-    <a href="{{< relref "./aws-kms.md" >}}" class="nav-link">
+    <a href="../aws-kms/" class="nav-link">
       <i class="fa-brands fa-aws" aria-hidden="true"></i>
-      AWS KMS
+      AWS
     </a>
   </li>
   <li >
-    <a href="{{< relref "./google-kms.md" >}}" class="nav-link active">
+    <a href="../google-kms/" class="nav-link active">
       <i class="fa-brands fa-google" aria-hidden="true"></i>
-      Google KMS
+      Google
     </a>
   </li>
 
   <li >
-    <a href="{{< relref "./azure-kms.md" >}}" class="nav-link">
+    <a href="../azure-kms/" class="nav-link">
       <i class="icon-azure" aria-hidden="true"></i>
-      &nbsp;&nbsp;&nbsp;&nbsp;Azure KMS
+      Azure
     </a>
   </li>
 
   <li >
-    <a href="{{< relref "./hashicorp-kms.md" >}}" class="nav-link">
-      <i class="icon-postgres" aria-hidden="true"></i>
-      HashiCorp Vault
+    <a href="../hashicorp-kms/" class="nav-link">
+      HashiCorp
+    </a>
+  </li>
+
+  <li >
+    <a href="../ciphertrust-kms/" class="nav-link">
+      CipherTrust
     </a>
   </li>
 
 </ul>
 
-<br>Encryption at rest uses universe keys to encrypt and decrypt universe data keys. You can use the YugabyteDB Anywhere UI to create key management service (KMS) configurations for generating the required universe keys for one or more YugabyteDB universes. Encryption at rest in YugabyteDB Anywhere supports the use of [Google Cloud KMS](https://cloud.google.com/security-key-management).
+Encryption at rest in YugabyteDB Anywhere supports the use of [Google Cloud KMS](https://cloud.google.com/security-key-management).
 
 Conceptually, Google Cloud KMS consists of a key ring containing one or more cryptographic keys, with each key capable of having multiple versions.
-
-The Google Cloud user associated with a KMS configuration requires a custom role assigned to the service account with the following KMS-related permissions:
-
-- `cloudkms.keyRings.create`
-- `cloudkms.keyRings.get`
-- `cloudkms.cryptoKeys.create`
-- `cloudkms.cryptoKeys.get`
-- `cloudkms.cryptoKeyVersions.useToEncrypt`
-- `cloudkms.cryptoKeyVersions.useToDecrypt`
-- `cloudkms.locations.generateRandomBytes`
 
 If you are planning to use an existing cryptographic key with the same name, it must meet the following criteria:
 
@@ -61,13 +58,21 @@ If you are planning to use an existing cryptographic key with the same name, it 
 - The purpose should be set to symmetric ENCRYPT_DECRYPT.
 - The key rotation period should be set to Never (manual rotation).
 
+Note that YugabyteDB Anywhere does not manage the key ring and deleting the KMS configuration does not destroy the key ring, cryptographic key, or its versions on Google Cloud KMS.
+
+## Prerequisites
+
+The Google Cloud user associated with a KMS configuration requires a custom role assigned to the service account. See [To use encryption at rest with YugabyteDB Anywhere](../../../prepare/cloud-permissions/cloud-permissions-ear/).
+
+## Create a KMS configuration
+
 You can create a KMS configuration that uses Google Cloud KMS, as follows:
 
-1. Use the YugabyteDB Anywhere UI to navigate to **Configs > Security > Encryption At Rest** to access the list of existing configurations.
+1. Navigate to **Integrations > Security > Encryption At Rest** to access the list of existing configurations.
 
 1. Click **Create New Config**.
 
-3. Enter the following configuration details in the form:
+1. Enter the following configuration details in the form:
 
     - **Configuration Name** — Enter a meaningful name for your configuration.
     - **KMS Provider** — Select **GCP KMS**.
@@ -80,12 +85,30 @@ You can create a KMS configuration that uses Google Cloud KMS, as follows:
 
     ![Google KMS](/images/yp/security/googlekms-config.png)
 
-3. Click **Save**.<br>
+1. Click **Save**.
 
-    Your new configuration should appear in the list of configurations. A saved KMS configuration can only be deleted if it is not in use by any existing universes.
+    Your new configuration should appear in the list of configurations.
 
-4. Optionally, to confirm that the information is correct, click **Show details**. Note that sensitive configuration values are displayed partially masked.
+1. Optionally, to confirm that the information is correct, click **Show details**. Note that sensitive configuration values are displayed partially masked.
 
+## Modify a KMS configuration
 
+You can modify an existing KMS configuration as follows:
 
-Note that YugabyteDB Anywhere does not manage the key ring and deleting the KMS configuration does not destroy the key ring, cryptographic key, or its versions on Google Cloud KMS.
+1. Navigate to **Integrations > Security > Encryption At Rest** to open a list of existing configurations.
+
+1. Find the configuration you want to modify and click its corresponding **Actions > Edit Configuration**.
+
+1. Provide new values for the **Vault Address** and **Secret Token** fields.
+
+1. Click **Save**.
+
+1. Optionally, to confirm that the information is correct, click **Show details** or **Actions > Details**.
+
+## Delete a KMS configuration
+
+{{<note title="Note">}}
+Without a KMS configuration, you would no longer be able to decrypt universe keys that were encrypted using the master key in the KMS configuration. Even after a key is rotated out of service, it may still be needed to decrypt data in backups and snapshots that were created while it was active. For this reason, you can only delete a KMS configuration if it has never been used by any universes.
+{{</note>}}
+
+To delete a KMS configuration, click its corresponding **Actions > Delete Configuration**.

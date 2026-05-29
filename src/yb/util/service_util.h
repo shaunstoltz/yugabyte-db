@@ -2,9 +2,9 @@
 // Use of this source code is governed by a BSD-style license that can be
 // found in the LICENSE file. See the AUTHORS file for names of contributors.
 //
-// The following only applies to changes made to this file as part of YugaByte development.
+// The following only applies to changes made to this file as part of YugabyteDB development.
 //
-// Portions Copyright (c) YugaByte, Inc.
+// Portions Copyright (c) YugabyteDB, Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License"); you may not use this file except
 // in compliance with the License.  You may obtain a copy of the License at
@@ -35,14 +35,16 @@
   } while (false)
 
 // Utility macro to setup error response and return if status is not OK.
-#define RPC_RESULT_RETURN_ERROR(result, error, code, context) \
+#define CHECK_RESULT_RETURN_RPC_ERROR(error, code, context) \
   do { \
-    if (PREDICT_FALSE(!result.ok())) { \
-      auto s_tmp = (result).status(); \
-      SetupErrorAndRespond(error, s_tmp, code, &(context)); \
+    if (PREDICT_FALSE(!__result.ok())) { \
+      SetupErrorAndRespond(error, __result.status(), code, &(context)); \
       return; \
     } \
   } while (false)
+
+#define RPC_VERIFY_RESULT(result, error, code, context) \
+  RESULT_CHECKER_HELPER(result, CHECK_RESULT_RETURN_RPC_ERROR(error, code, context))
 
 // Utility macros to perform the appropriate check. If the check fails,
 // returns the specified (error) Status, with the given message.

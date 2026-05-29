@@ -17,9 +17,9 @@
 // specific language governing permissions and limitations
 // under the License.
 //
-// The following only applies to changes made to this file as part of YugaByte development.
+// The following only applies to changes made to this file as part of YugabyteDB development.
 //
-// Portions Copyright (c) YugaByte, Inc.
+// Portions Copyright (c) YugabyteDB, Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License"); you may not use this file except
 // in compliance with the License.  You may obtain a copy of the License at
@@ -43,7 +43,7 @@
 #include <vector>
 
 #include <boost/signals2/dummy_mutex.hpp>
-#include <glog/logging.h>
+#include "yb/util/logging.h"
 
 #include "yb/gutil/dynamic_annotations.h"
 #include "yb/gutil/logging-inl.h"
@@ -62,8 +62,10 @@ YB_DEFINE_ENUM(ResetMode, (kKeepFirst)(kKeepLast));
 namespace internal {
 
 struct ThreadSafeArenaTraits {
-  typedef std::atomic<uint8_t*> pointer;
-  typedef std::mutex mutex_type;
+  using pointer = std::atomic<uint8_t*>;
+  using mutex_type = std::mutex;
+
+  static constexpr bool kLockBytesAllowed = false;
 
   template<class T>
   struct MakeAtomic {
@@ -84,6 +86,8 @@ struct ThreadSafeArenaTraits {
 struct ArenaTraits {
   using pointer = uint8_t*;
   using mutex_type = SingleThreadedMutex;
+
+  static constexpr bool kLockBytesAllowed = true;
 
   template<class T>
   struct MakeAtomic {
@@ -109,6 +113,9 @@ struct ArenaTraits {
 
 template <class Traits>
 class ArenaComponent;
+
+template <class Traits>
+class ArenaObjectFactory;
 
 // A helper class for storing variable-length blobs (e.g. strings). Once a blob
 // is added to the arena, its index stays fixed. No reallocation happens.
@@ -167,6 +174,14 @@ class ArenaBase {
     return Slice(AddSlice(value), value.size());
   }
 
+  Slice CatSlices(Slice slice1, Slice slice2) {
+    auto full_size = slice1.size() + slice2.size();
+    auto start = static_cast<std::byte*>(AllocateBytes(full_size));
+    memcpy(start, slice1.data(), slice1.size());
+    memcpy(start + slice1.size(), slice2.data(), slice2.size());
+    return Slice(start, full_size);
+  }
+
   // Handy wrapper for placement-new
   template<class T, class... Args>
   T *NewObject(Args&&... args);
@@ -175,6 +190,8 @@ class ArenaBase {
   T *NewArenaObject(Args&&... args) {
     return NewObject<T>(this, std::forward<Args>(args)...);
   }
+
+  internal::ArenaObjectFactory<Traits> ArenaObjectFactory();
 
   // Allocate shared_ptr object.
   template<class TObject, typename... TypeArgs>
@@ -198,6 +215,14 @@ class ArenaBase {
   void* AllocateBytes(const size_t size) {
     return AllocateBytesAligned(size, 1);
   }
+
+  template <typename U = Traits>
+  std::enable_if_t<U::kLockBytesAllowed && std::is_same_v<U, Traits>, Slice> LockBytes(
+      size_t min_size) {
+    return DoLockBytes(min_size);
+  }
+
+  void ConsumeBytes(size_t size);
 
   // Allocate bytes, ensuring a specified alignment.
   // NOTE: alignment MUST be a power of two, or else this will break.
@@ -231,6 +256,12 @@ class ArenaBase {
   // bytes allocated out of the arena.
   size_t memory_footprint() const;
 
+  // Returns how many bytes are used by this arena. This excludes any empty space in the last
+  // component.
+  size_t UsedBytes();
+
+  bool Contains(const void* ptr);
+
  private:
   typedef typename Traits::mutex_type mutex_type;
   // Encapsulates a single buffer in the arena.
@@ -238,6 +269,11 @@ class ArenaBase {
 
   // Fallback for AllocateBytes non-fast-path
   void* AllocateBytesFallback(const size_t size, const size_t align);
+
+  Slice LockBytesFallback(size_t min_size);
+
+  template <class Functor>
+  auto AllocateComponent(size_t min_size, Functor functor);
 
   // Tries to allocate of maximal size between minimum_size and requested_size
   Buffer NewBuffer(size_t requested_size, size_t minimum_size);
@@ -262,6 +298,8 @@ class ArenaBase {
   inline void ReleaseStoreCurrent(Component* c) {
     return current_.store(c, std::memory_order_release);
   }
+
+  Slice DoLockBytes(size_t min_size);
 
   BufferAllocator* const buffer_allocator_;
 
@@ -376,6 +414,14 @@ class ArenaComponent {
 
   uint8_t *AllocateBytesAligned(const size_t size, const size_t alignment);
 
+  // If there are at least `min_size` bytes free at the end of this component, then
+  // returns Slice pointing to begin of those bytes with size of total available bytes.
+  // Slice contains at least `min_size` bytes.
+  // Otherwise, returns empty Slice.
+  Slice LockBytes(size_t min_size);
+
+  void ConsumeBytes(size_t size);
+
   uint8_t* begin() {
     return const_cast<uint8_t*>(begin_of_this() + sizeof(*this));
   }
@@ -383,6 +429,8 @@ class ArenaComponent {
   uint8_t* end() { return end_; }
   size_t size() { return end() - begin(); }
   size_t full_size() { return end() - begin_of_this(); }
+
+  size_t free_bytes() { return end() - position_; }
 
   // Resets used memory of this component, destroys the rest of the component chain.
   // `allocator` should be the same as the one used to allocate memory for this component chain.
@@ -417,6 +465,10 @@ class ArenaComponent {
     auto* result = next_;
     next_ = next;
     return result;
+  }
+
+  bool Contains(const void* ptr) {
+    return ptr >= begin() && ptr < end();
   }
 
  private:
@@ -467,10 +519,34 @@ class ArenaObjectDeleter {
 };
 
 template <class Traits>
-template<class TObject>
+template <class TObject>
 std::shared_ptr<TObject> ArenaBase<Traits>::ToShared(TObject *raw_ptr) {
   ArenaAllocatorBase<TObject, Traits> allocator(this);
   return std::shared_ptr<TObject>(raw_ptr, ArenaObjectDeleter(), allocator);
+}
+
+template <class Traits>
+class ArenaObjectFactory {
+ public:
+  explicit ArenaObjectFactory(ArenaBase<Traits>* arena) : arena_(arena) {}
+
+  template <class T>
+  operator T*() const {
+    return arena_->template NewArenaObject<T>();
+  }
+
+  template <class T>
+  operator T&() const {
+    return *arena_->template NewArenaObject<T>();
+  }
+
+ private:
+  ArenaBase<Traits>* arena_;
+};
+
+template <class Traits>
+ArenaObjectFactory<Traits> ArenaBase<Traits>::ArenaObjectFactory() {
+  return internal::ArenaObjectFactory<Traits>(this);
 }
 
 } // namespace internal
@@ -482,7 +558,16 @@ std::shared_ptr<Result> ArenaMakeShared(
   return std::shared_ptr<Result>(arena, result);
 }
 
-std::shared_ptr<ThreadSafeArena> SharedArena();
+template <class Result, class Traits, class... Args>
+std::shared_ptr<Result> MakeSharedArenaObject(
+    const std::shared_ptr<internal::ArenaBase<Traits>>& arena, Args&&... args) {
+  auto result = arena->template NewArenaObject<Result>(std::forward<Args>(args)...);
+  return std::shared_ptr<Result>(arena, result);
+}
+
+ThreadSafeArenaPtr SharedThreadSafeArena();
+ArenaPtr SharedArena();
+ArenaPtr SharedSmallArena();
 
 } // namespace yb
 

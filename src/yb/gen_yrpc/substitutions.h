@@ -1,4 +1,4 @@
-// Copyright (c) YugaByte, Inc.
+// Copyright (c) YugabyteDB, Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License"); you may not use this file except
 // in compliance with the License.  You may obtain a copy of the License at
@@ -53,6 +53,7 @@ class FileSubstitutions {
 };
 
 Substitutions CreateSubstitutions(const google::protobuf::Descriptor* message);
+Substitutions CreateSubstitutions(const google::protobuf::EnumDescriptor* enum_desc);
 Substitutions CreateSubstitutions(
     const google::protobuf::MethodDescriptor* method, rpc::RpcSides side);
 Substitutions CreateSubstitutions(const google::protobuf::FieldDescriptor* field);

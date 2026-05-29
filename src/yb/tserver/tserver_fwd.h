@@ -1,4 +1,4 @@
-// Copyright (c) YugaByte, Inc.
+// Copyright (c) YugabyteDB, Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License"); you may not use this file except
 // in compliance with the License.  You may obtain a copy of the License at
@@ -14,17 +14,22 @@
 #pragma once
 
 #include <functional>
+#include <type_traits>
+#include <utility>
 
 #include "yb/tserver/backup.fwd.h"
+#include "yb/tserver/pg_client.fwd.h"
 #include "yb/tserver/tserver.fwd.h"
 #include "yb/tserver/tserver_service.fwd.h"
 
 #include "yb/util/strongly_typed_bool.h"
+#include "yb/util/strongly_typed_uuid.h"
 
 namespace yb {
 
 namespace client {
 
+class TransactionManager;
 class TransactionPool;
 class YBPgsqlOp;
 
@@ -32,12 +37,24 @@ class YBPgsqlOp;
 
 namespace tserver {
 
+class DbServerBase;
 class Heartbeater;
 class LocalTabletServer;
 class MetricsSnapshotter;
+class PgClientServiceMockImpl;
+class PgMutationCounter;
 class PgTableCache;
+class PgTablesQueryResult;
 class PgResponseCache;
+class PgSequenceCache;
+class PgSharedMemoryPool;
+class SharedExchange;
+class SharedMemoryManager;
+class SharedMemorySegmentHandle;
+class TServerCgroupManager;
+class TSLocalLockManager;
 class TSTabletManager;
+class TableMutationCountSender;
 class TabletPeerLookupIf;
 class TabletServer;
 class TabletServerAdminServiceProxy;
@@ -47,12 +64,62 @@ class TabletServerOptions;
 class TabletServerServiceProxy;
 class TabletServiceImpl;
 class TabletServerPathHandlers;
+class TserverXClusterContextIf;
+class YSQLLeaseManager;
+class YsqlAdvisoryLocksTable;
 
 enum class TabletServerServiceRpcMethodIndexes;
 
 YB_STRONGLY_TYPED_BOOL(AllowSplitTablet);
 
+using TSLocalLockManagerPtr = std::shared_ptr<TSLocalLockManager>;
+using TransactionManagerProvider = std::function<client::TransactionManager&()>;
 using TransactionPoolProvider = std::function<client::TransactionPool&()>;
+
+template <typename, typename = std::void_t<>>
+struct HasTabletConsensusInfo : std::false_type {};
+
+template <typename T>
+struct HasTabletConsensusInfo<
+    T, std::void_t<decltype(std::declval<T>().tablet_consensus_info())>>
+    : std::true_type {};
+
+template <typename, typename = std::void_t<>>
+struct HasRaftConfigOpidIndex : std::false_type {};
+
+template <typename T>
+struct HasRaftConfigOpidIndex<
+    T, std::void_t<decltype(std::declval<T>().raft_config_opid_index())>>
+    : std::true_type {};
+
+struct PgTxnSnapshot;
+YB_STRONGLY_TYPED_UUID_DECL(PgTxnSnapshotLocalId);
+
+// Temporary typedef for lightweight protobuf migration
+using TabletConsensusInfoMsg = LWTabletConsensusInfoPB;
+using ReadRequestMsg = LWReadRequestPB;
+using ReadResponseMsg = LWReadResponsePB;
+using WriteRequestMsg = LWWriteRequestPB;
+using WriteResponseMsg = LWWriteResponsePB;
+using PgPerformRequestMsg = LWPgPerformRequestPB;
+using PgPerformResponseMsg = LWPgPerformResponsePB;
+using PgAcquireObjectLockRequestMsg = LWPgAcquireObjectLockRequestPB;
+using PgAcquireObjectLockResponseMsg = LWPgAcquireObjectLockResponsePB;
+using PgInsertSequenceTupleRequestMsg = LWPgInsertSequenceTupleRequestPB;
+using PgInsertSequenceTupleResponseMsg = LWPgInsertSequenceTupleResponsePB;
+using PgUpdateSequenceTupleRequestMsg = LWPgUpdateSequenceTupleRequestPB;
+using PgUpdateSequenceTupleResponseMsg = LWPgUpdateSequenceTupleResponsePB;
+using PgFetchSequenceTupleRequestMsg = LWPgFetchSequenceTupleRequestPB;
+using PgFetchSequenceTupleResponseMsg = LWPgFetchSequenceTupleResponsePB;
+using PgReadSequenceTupleRequestMsg = LWPgReadSequenceTupleRequestPB;
+using PgReadSequenceTupleResponseMsg = LWPgReadSequenceTupleResponsePB;
+using PgDeleteSequenceTupleRequestMsg = LWPgDeleteSequenceTupleRequestPB;
+using PgDeleteSequenceTupleResponseMsg = LWPgDeleteSequenceTupleResponsePB;
+using PgDeleteDBSequencesRequestMsg = LWPgDeleteDBSequencesRequestPB;
+using PgDeleteDBSequencesResponseMsg = LWPgDeleteDBSequencesResponsePB;
+using PgGetTableKeyRangesRequestMsg = LWPgGetTableKeyRangesRequestPB;
+using PgGetTableKeyRangesResponseMsg = LWPgGetTableKeyRangesResponsePB;
+using TabletServerErrorMsg = LWTabletServerErrorPB;
 
 } // namespace tserver
 } // namespace yb

@@ -15,9 +15,9 @@
 // specific language governing permissions and limitations
 // under the License.
 //
-// The following only applies to changes made to this file as part of YugaByte development.
+// The following only applies to changes made to this file as part of YugabyteDB development.
 //
-// Portions Copyright (c) YugaByte, Inc.
+// Portions Copyright (c) YugabyteDB, Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License"); you may not use this file except
 // in compliance with the License.  You may obtain a copy of the License at
@@ -35,13 +35,12 @@
 
 #include <algorithm>
 
-#include <glog/logging.h>
-
 #include "yb/gutil/macros.h"
 
 #include "yb/util/fault_injection.h"
 #include "yb/util/logging.h"
 #include "yb/util/rwc_lock.h"
+#include "yb/util/status.h"
 
 namespace yb {
 
@@ -75,7 +74,7 @@ class CowObject {
 
   // Lock the object for write (preventing concurrent mutators), and make a safe
   // copy of the object to mutate.
-  void StartMutation() {
+  void StartMutation() NO_THREAD_SAFETY_ANALYSIS {
     lock_.WriteLock();
     // Clone our object.
     dirty_state_.reset(new State(state_));
@@ -83,7 +82,7 @@ class CowObject {
 
   // Abort the current mutation. This drops the write lock without applying any
   // changes made to the mutable copy.
-  void AbortMutation() {
+  void AbortMutation() NO_THREAD_SAFETY_ANALYSIS {
     dirty_state_.reset();
     is_dirty_ = false;
     lock_.WriteUnlock();
@@ -102,35 +101,33 @@ class CowObject {
   }
 
   // Return the current state, not reflecting any in-progress mutations.
-  State& state() {
-    DCHECK(lock_.HasReaders() || lock_.HasWriteLock());
-    return state_;
-  }
-
   const State& state() const {
-    DCHECK(lock_.HasReaders() || lock_.HasWriteLock());
+    DCHECK(lock_.HasReaders() || lock_.DEBUG_HasWriteLock());
     return state_;
   }
 
   // Returns the current dirty state (i.e reflecting in-progress mutations).
   // Should only be called by a thread who previously called StartMutation().
   State* mutable_dirty() {
-    DCHECK(lock_.HasWriteLock());
+    DCHECK(lock_.DEBUG_HasWriteLock());
     is_dirty_ = true;
-    return DCHECK_NOTNULL(dirty_state_.get());
+    return CHECK_NOTNULL(dirty_state_.get());
   }
 
-  const State& dirty() const {
-    return *DCHECK_NOTNULL(dirty_state_.get());
-  }
+  const State& dirty() const { return *CHECK_NOTNULL(dirty_state_.get()); }
 
   bool is_dirty() const {
-    DCHECK(lock_.HasReaders() || lock_.HasWriteLock());
+    DCHECK(lock_.HasReaders() || lock_.DEBUG_HasWriteLock());
     return is_dirty_;
   }
 
-  void WriteLockThreadChanged() {
-    lock_.WriteLockThreadChanged();
+  // [DEBUG mode only] Return true iff the current thread holds the write or commit lock.
+  bool DEBUG_HasWriteLock() const { return lock_.DEBUG_HasWriteLock(); }
+
+  // Should be invoked only from ctor of appropriate object.
+  State& DirectStateForInitialSetup() {
+    DCHECK(!lock_.HasReaders() && !lock_.DEBUG_HasWriteLock());
+    return state_;
   }
 
  private:
@@ -286,10 +283,6 @@ class CowWriteLock {
 
   bool locked() const {
     return cow_ != nullptr;
-  }
-
-  void ThreadChanged() {
-    cow_->WriteLockThreadChanged();
   }
 
   ~CowWriteLock() {

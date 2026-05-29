@@ -1,5 +1,5 @@
 /*
- * Copyright 2019 YugaByte, Inc. and Contributors
+ * Copyright 2019 YugabyteDB, Inc. and Contributors
  *
  * Licensed under the Polyform Free Trial License 1.0.0 (the "License"); you
  * may not use this file except in compliance with the License. You
@@ -14,7 +14,6 @@ import com.yugabyte.yw.commissioner.AbstractTaskBase;
 import com.yugabyte.yw.commissioner.BaseTaskDependencies;
 import com.yugabyte.yw.commissioner.tasks.params.KMSConfigTaskParams;
 import com.yugabyte.yw.common.kms.EncryptionAtRestManager;
-import com.yugabyte.yw.forms.ITaskParams;
 import javax.inject.Inject;
 
 public abstract class KMSConfigTaskBase extends AbstractTaskBase {
@@ -31,12 +30,5 @@ public abstract class KMSConfigTaskBase extends AbstractTaskBase {
   @Override
   protected KMSConfigTaskParams taskParams() {
     return (KMSConfigTaskParams) taskParams;
-  }
-
-  @Override
-  public void initialize(ITaskParams params) {
-    super.initialize(params);
-    // Create the threadpool for the subtasks to use.
-    createThreadpool();
   }
 }

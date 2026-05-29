@@ -60,9 +60,9 @@
 //
 
 //
-// The following only applies to changes made to this file as part of YugaByte development.
+// The following only applies to changes made to this file as part of YugabyteDB development.
 //
-// Portions Copyright (c) YugaByte, Inc.
+// Portions Copyright (c) YugabyteDB, Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License"); you may not use this file except
 // in compliance with the License.  You may obtain a copy of the License at
@@ -80,10 +80,9 @@
 #include <string>
 #include <vector>
 
-#include <glog/logging.h>
-
-
-
+#include "yb/util/logging.h"
+#include "yb/util/result.h"
+#include "yb/util/status_format.h"
 
 //
 // Find*()
@@ -143,6 +142,14 @@ FindOrDieNoPrint(Collection& collection,  // NOLINT
   return it->second;
 }
 
+#define FIND_OR_STATUS(collection, key) ({ \
+    Result<decltype(collection)::value_type::second_type> result = \
+        STATUS_FORMAT(NotFound, "Map key not found: $0", key); \
+    auto collection_it = collection.find(key); \
+    if (collection_it != collection.end()) \
+      result = collection_it->second; \
+    result;})
+
 // Returns a const reference to the value associated with the given key if it
 // exists, otherwise a const reference to the provided default value is
 // returned.
@@ -166,10 +173,9 @@ FindWithDefault(const Collection& collection,
 
 // Returns a pointer to the const value associated with the given key if it
 // exists, or NULL otherwise.
-template <class Collection>
+template <class Collection, class Key>
 const typename Collection::value_type::second_type*
-FindOrNull(const Collection& collection,
-           const typename Collection::value_type::first_type& key) {
+FindOrNull(const Collection& collection, const Key& key) {
   auto it = collection.find(key);
   if (it == collection.end()) {
     return 0;
@@ -178,10 +184,9 @@ FindOrNull(const Collection& collection,
 }
 
 // Same as above but returns a pointer to the non-const value.
-template <class Collection>
+template <class Collection, class Key>
 typename Collection::value_type::second_type*
-FindOrNull(Collection& collection,  // NOLINT
-           const typename Collection::value_type::first_type& key) {
+FindOrNull(Collection& collection, const Key& key) {
   auto it = collection.find(key);
   if (it == collection.end()) {
     return 0;
@@ -235,10 +240,9 @@ FindPtrOrNull(const Collection& collection,
 //
 // This function is needed for containers that propagate constness to the
 // pointee, such as boost::ptr_map.
-template <class Collection>
+template <class Collection, class Key>
 typename Collection::value_type::second_type
-FindPtrOrNull(Collection& collection,  // NOLINT
-              const typename Collection::value_type::first_type& key) {
+FindPtrOrNull(Collection& collection, const Key& key) {
   auto it = collection.find(key);
   if (it == collection.end()) {
     return typename Collection::value_type::second_type(0);

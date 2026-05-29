@@ -1,4 +1,4 @@
-// Copyright (c) YugaByte, Inc.
+// Copyright (c) YugabyteDB, Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License"); you may not use this file except
 // in compliance with the License.  You may obtain a copy of the License at
@@ -11,13 +11,16 @@
 // under the License.
 
 #include "yb/tserver/tserver_call_home.h"
-#include <boost/system/error_code.hpp>
-#include "yb/gutil/walltime.h"
+
+#include "yb/tserver/tablet_server.h"
 #include "yb/tserver/ts_tablet_manager.h"
+#include "yb/tserver/ysql_call_home_stats.h"
+
+#include "yb/util/format.h"
+
+DECLARE_bool(enable_ysql);
 
 using std::string;
-
-using strings::Substitute;
 
 namespace yb {
 
@@ -28,22 +31,13 @@ class BasicCollector : public TserverCollector {
   using TserverCollector::TserverCollector;
 
   void Collect(CollectionLevel collection_level) override {
-    AppendPairToJson("cluster_uuid", tserver()->cluster_uuid(), &json_);
-    AppendPairToJson("node_uuid", tserver()->permanent_uuid(), &json_);
     AppendPairToJson("server_type", "tserver", &json_);
-
-    // Only collect hostname and username if collection level is medium or high.
-    if (collection_level != CollectionLevel::LOW) {
-      AppendPairToJson("hostname", tserver()->get_hostname(), &json_);
-      AppendPairToJson("current_user", GetCurrentUser(), &json_);
-    }
-
-    AppendPairToJson("timestamp", std::to_string(WallTime_Now()), &json_);
+    AppendPairToJson("cluster_uuid", tserver()->cluster_uuid(), &json_);
   }
 
   string collector_name() override { return "BasicCollector"; }
 
-  virtual CollectionLevel collection_level() override { return CollectionLevel::LOW; }
+  CollectionLevel collection_level() override { return CollectionLevel::LOW; }
 };
 
 class TabletsCollector : public TserverCollector {
@@ -52,17 +46,40 @@ class TabletsCollector : public TserverCollector {
 
   void Collect(CollectionLevel collection_level) override {
     int ntablets = tserver()->tablet_manager()->GetNumLiveTablets();
-    json_ = Substitute("\"tablets\":$0", ntablets);
+    json_ = Format("\"tablets\":$0", ntablets);
   }
 
   string collector_name() override { return "TabletsCollector"; }
 
-  virtual CollectionLevel collection_level() override { return CollectionLevel::ALL; }
+  CollectionLevel collection_level() override { return CollectionLevel::ALL; }
+};
+
+class YsqlNodeStatsCollector : public TserverCollector {
+ public:
+  using TserverCollector::TserverCollector;
+
+  void Collect(CollectionLevel collection_level) override {
+    if (!throttle_.ShouldCollect()) {
+      return;
+    }
+    auto stats_json = BuildStatsJson(tserver(), {"template1"}, YsqlNodeQueries::kNodeLevel, {});
+    json_ = Format("\"ysql_node_stats\":$0", stats_json);
+  }
+
+  string collector_name() override { return "YsqlNodeStatsCollector"; }
+
+  CollectionLevel collection_level() override { return CollectionLevel::ALL; }
+
+ private:
+  YsqlCollectionThrottle throttle_;
 };
 
 TserverCallHome::TserverCallHome(TabletServer* server) : CallHome(server) {
   AddCollector<BasicCollector>();
   AddCollector<TabletsCollector>();
+  if (FLAGS_enable_ysql) {
+    AddCollector<YsqlNodeStatsCollector>();
+  }
 }
 
 }  // namespace tserver

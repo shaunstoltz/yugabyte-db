@@ -1,5 +1,5 @@
 //--------------------------------------------------------------------------------------------------
-// Copyright (c) YugaByte, Inc.
+// Copyright (c) YugabyteDB, Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License"); you may not use this file except
 // in compliance with the License.  You may obtain a copy of the License at
@@ -14,35 +14,30 @@
 
 #include "yb/yql/pggate/util/pg_tuple.h"
 
-#include <glog/logging.h>
+#include "yb/util/logging.h"
 
-#include "yb/common/ybc-internal.h"
+#include "yb/yql/pggate/util/ybc-internal.h"
 
-namespace yb {
-namespace pggate {
+namespace yb::pggate {
 
-PgTuple::PgTuple(uint64_t *datums, bool *isnulls, PgSysColumns *syscols)
+PgTuple::PgTuple(uint64_t* datums, bool* isnulls, YbcPgSysColumns* syscols, size_t nattrs)
     : datums_(datums), isnulls_(isnulls), syscols_(syscols) {
+  DEBUG_ONLY(nattrs_ = nattrs);
 }
 
-void PgTuple::WriteNull(int index, const PgWireDataHeader& header) {
-  isnulls_[index] = true;
-  datums_[index] = 0;
+void PgTuple::CopyFrom(const PgTuple& other, size_t nattrs) {
+  DEBUG_ONLY(DCHECK_LE(nattrs, nattrs_)  << "PgTuple index is out of bounds");
+  memcpy(datums_, other.datums_, nattrs * sizeof(*datums_));
+  memcpy(isnulls_, other.isnulls_, nattrs * sizeof(*isnulls_));
+  if (syscols_ && other.syscols_) {
+    memcpy(syscols_, other.syscols_, sizeof(YbcPgSysColumns));
+  }
 }
 
-void PgTuple::WriteDatum(int index, uint64_t datum) {
-  isnulls_[index] = false;
+void PgTuple::DoWrite(int index, bool isnull, uint64_t datum) {
+  DEBUG_ONLY(DCHECK_LT(index, nattrs_) << "PgTuple index is out of bounds");
+  isnulls_[index] = isnull;
   datums_[index] = datum;
 }
 
-void PgTuple::Write(uint8_t **pgbuf, const PgWireDataHeader& header, const uint8_t *value,
-                    int64_t bytes) {
-  // TODO: return a status instead of crashing.
-  CHECK_LE(bytes, kYBCMaxPostgresTextSizeBytes);
-  CHECK_GE(bytes, 0);
-  *pgbuf = static_cast<uint8_t*>(YBCCStringToTextWithLen(reinterpret_cast<const char*>(value),
-                                                         static_cast<int>(bytes)));
-}
-
-}  // namespace pggate
-}  // namespace yb
+}  // namespace yb::pggate

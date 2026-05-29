@@ -3,9 +3,9 @@
 //  LICENSE file in the root directory of this source tree. An additional grant
 //  of patent rights can be found in the PATENTS file in the same directory.
 //
-// The following only applies to changes made to this file as part of YugaByte development.
+// The following only applies to changes made to this file as part of YugabyteDB development.
 //
-// Portions Copyright (c) YugaByte, Inc.
+// Portions Copyright (c) YugabyteDB, Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License"); you may not use this file except
 // in compliance with the License.  You may obtain a copy of the License at
@@ -27,7 +27,7 @@ int main(int argc, char** argv) {
   rocksdb::Options options;
   yb::tablet::TabletOptions t_options;
   yb::docdb::InitRocksDBOptions(
-      &options, "" /* log_prefix */, nullptr /* statistics */, t_options);
+      &options, "" /* log_prefix */, "" /* tablet_id */, nullptr /* statistics */, t_options);
   rocksdb::LDBTool tool;
   tool.Run(argc, argv, options);
   return 0;

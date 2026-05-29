@@ -1,4 +1,4 @@
-// Copyright (c) YugaByte, Inc.
+// Copyright (c) YugabyteDB, Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License"); you may not use this file except
 // in compliance with the License.  You may obtain a copy of the License at
@@ -13,8 +13,10 @@
 package org.yb.pgsql;
 
 import org.apache.commons.lang3.RandomUtils;
+import org.junit.Assume;
 import org.junit.Test;
 import org.junit.runner.RunWith;
+import org.junit.runners.Parameterized;
 import com.yugabyte.core.TransactionState;
 import com.yugabyte.util.PSQLException;
 import com.yugabyte.util.PSQLState;
@@ -23,7 +25,7 @@ import org.slf4j.LoggerFactory;
 import org.yb.minicluster.MiniYBClusterBuilder;
 import org.yb.util.RandomUtil;
 import org.yb.util.BuildTypeUtil;
-import org.yb.util.YBTestRunnerNonTsanOnly;
+import org.yb.YBParameterizedTestRunner;
 
 import java.sql.Array;
 import java.sql.Connection;
@@ -42,16 +44,38 @@ import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Collections;
 import java.util.Random;
+import java.util.Map;
+import java.util.TreeMap;
 
 import static org.yb.AssertionWrappers.*;
 
-@RunWith(value=YBTestRunnerNonTsanOnly.class)
+@RunWith(value = YBParameterizedTestRunner.class)
 public class TestPgTransactions extends BasePgSQLTest {
 
   private static final Logger LOG = LoggerFactory.getLogger(TestPgTransactions.class);
+  private final boolean objectLockingEnabled;
+  private final boolean concurrentDDLEnabled;
+
+  public TestPgTransactions(boolean objectLockingEnabled, boolean concurrentDDLEnabled) {
+    this.objectLockingEnabled = objectLockingEnabled;
+    this.concurrentDDLEnabled = concurrentDDLEnabled;
+  }
+
+  @Parameterized.Parameters(name = "objectLocking={0}-concurrentDDL={1}")
+  public static List<Object[]> parameters() {
+    return Arrays.asList(
+        new Object[]{false, false},
+        new Object[]{true, false},
+        new Object[]{true, true});
+  }
 
   private static boolean isYBTransactionError(PSQLException ex) {
-    return ex.getSQLState().equals("40001");
+    // TODO: Refactor the function to check for specific error codes instead of checking multiple
+    // errors as few tests that shouldn't encounter a 40P01 would also get through on usage of a
+    // generic check. Refer https://github.com/yugabyte/yugabyte-db/issues/18477 for details.
+    //
+    // Return true on exceptions of kind SERIALIZATION_FAILURE or DEADLOCK_DETECTED.
+    return ex.getSQLState().equals("40001") || ex.getSQLState().equals("40P01");
   }
 
   private static boolean isTransactionAbortedError(PSQLException ex) {
@@ -70,9 +94,36 @@ public class TestPgTransactions extends BasePgSQLTest {
   }
 
   @Override
+  protected Map<String, String> getTServerFlags() {
+    Map<String, String> flags = super.getTServerFlags();
+    appendToYsqlPgConf(flags, maxQueryLayerRetriesConf(2));
+    // Auto Analyze makes testSerializableReadDelayWrite time out on a few build.
+    flags.put("ysql_enable_auto_analyze", "false");
+    flags.put("allowed_preview_flags_csv", "ysql_enable_concurrent_ddl");
+    flags.put("ysql_yb_ddl_transaction_block_enabled", String.valueOf(objectLockingEnabled));
+    flags.put("enable_object_locking_for_table_locks", String.valueOf(objectLockingEnabled));
+    flags.put("ysql_enable_concurrent_ddl", String.valueOf(concurrentDDLEnabled));
+    return flags;
+  }
+
+  @Override
   protected void customizeMiniClusterBuilder(MiniYBClusterBuilder builder) {
     super.customizeMiniClusterBuilder(builder);
     builder.enablePgTransactions(true);
+  }
+
+  void runWithFailOnConflict() throws Exception {
+    // Some of these tests depend on fail-on-conflict concurrency control to perform its validation.
+    // TODO(wait-queues): https://github.com/yugabyte/yugabyte-db/issues/17871
+    Map<String, String> FailOnConflictTestGflags = new TreeMap<String, String>()
+      {
+        {
+            put("enable_wait_queues", "false");
+            // The retries are set to 2 to speed up the tests.
+            put("ysql_pg_conf_csv", maxQueryLayerRetriesConf(2));
+        }
+      };
+    restartClusterWithFlags(FailOnConflictTestGflags, FailOnConflictTestGflags);
   }
 
   @Test
@@ -167,11 +218,15 @@ public class TestPgTransactions extends BasePgSQLTest {
 
   @Test
   public void testSnapshotReadDelayWrite() throws Exception {
+    Assume.assumeFalse("YB003 (internal error code) is exposed to the client with concurrent DDL",
+                       concurrentDDLEnabled);
     runReadDelayWriteTest(IsolationLevel.REPEATABLE_READ);
   }
 
   @Test
   public void testSerializableReadDelayWrite() throws Exception {
+    Assume.assumeFalse("YB003 (internal error code) is exposed to the client with concurrent DDL",
+                       concurrentDDLEnabled);
     runReadDelayWriteTest(IsolationLevel.SERIALIZABLE);
   }
 
@@ -334,6 +389,7 @@ public class TestPgTransactions extends BasePgSQLTest {
 
   @Test
   public void testSerializableWholeHashVsScanConflict() throws Exception {
+    runWithFailOnConflict();
     createSimpleTable("test", "v", PartitioningMode.HASH);
     final IsolationLevel isolation = IsolationLevel.SERIALIZABLE;
     try (
@@ -462,6 +518,7 @@ public class TestPgTransactions extends BasePgSQLTest {
    */
   @Test
   public void testTransactionConflicts() throws Exception {
+    runWithFailOnConflict();
     createSimpleTable("test", "v");
     final IsolationLevel isolation = IsolationLevel.REPEATABLE_READ;
 
@@ -797,11 +854,11 @@ public class TestPgTransactions extends BasePgSQLTest {
 
       // Expect begin transaction to always succeed.
       if (i % 2 == 0) {
-        statement1.execute("BEGIN");
-        statement2.execute("BEGIN");
+        statement1.execute("BEGIN TRANSACTION ISOLATION LEVEL REPEATABLE READ");
+        statement2.execute("BEGIN TRANSACTION ISOLATION LEVEL REPEATABLE READ");
       } else {
-        statement2.execute("BEGIN");
-        statement1.execute("BEGIN");
+        statement2.execute("BEGIN TRANSACTION ISOLATION LEVEL REPEATABLE READ");
+        statement1.execute("BEGIN TRANSACTION ISOLATION LEVEL REPEATABLE READ");
       }
 
       boolean txn1_success;
@@ -837,6 +894,8 @@ public class TestPgTransactions extends BasePgSQLTest {
 
   @Test
   public void testExplicitLocking() throws Exception {
+    runWithFailOnConflict();
+
     Statement statement = connection.createStatement();
 
     // Set up a simple key-value table.
@@ -994,6 +1053,7 @@ public class TestPgTransactions extends BasePgSQLTest {
 
         s1.execute("COMMIT");
         s1.execute("DROP TABLE test");
+        waitForTServerHeartbeatIfConnMgrEnabled();
       } catch (Exception ex) {
         fail(ex.getMessage());
       }
@@ -1061,5 +1121,276 @@ public class TestPgTransactions extends BasePgSQLTest {
       s1.execute("COMMIT");
       s1.execute("DROP TABLE test");
     }
+  }
+
+  /**
+   * GHI 22837
+   * Verify that inserts into a table with identity column are executed without transaction
+   *
+   * @throws Exception
+   */
+  @Test
+  public void testIdentityNoTransaction() throws Exception {
+    Statement statement = connection.createStatement();
+    // Identity column is a primary key
+    statement.execute("CREATE TABLE test_id_pk (" +
+                      "id int generated always as identity PRIMARY KEY, v int)");
+    verifyStatementTxnMetric(statement, "INSERT INTO test_id_pk(v) VALUES (1)", 1);
+    verifyStatementTxnMetric(statement, "INSERT INTO test_id_pk(v) VALUES (2)", 1);
+    verifyStatementTxnMetric(statement, "INSERT INTO test_id_pk(v) VALUES (3)", 1);
+    statement.execute("DROP TABLE test_id_pk");
+
+    // Identity column is not a primary key
+    statement.execute("CREATE TABLE test_id_non_pk (" +
+                      "id int generated always as identity, k int PRIMARY KEY, v int)");
+    verifyStatementTxnMetric(statement, "INSERT INTO test_id_non_pk(k, v) VALUES (1, 1)", 1);
+    verifyStatementTxnMetric(statement, "INSERT INTO test_id_non_pk(k, v) VALUES (2, 2)", 1);
+    verifyStatementTxnMetric(statement, "INSERT INTO test_id_non_pk(k, v) VALUES (3, 3)", 1);
+    statement.execute("DROP TABLE test_id_non_pk");
+  }
+
+  @Test
+  public void testParititionedTableFastPath() throws Exception {
+    Statement statement = connection.createStatement();
+    statement.execute("CREATE TABLE partitioned (a int) PARTITION BY LIST (a)");
+    statement.execute("CREATE TABLE partitioned_part PARTITION OF partitioned FOR VALUES IN (123)");
+    verifyStatementTxnMetric(statement, "INSERT INTO partitioned (a) VALUES (123)", 1);
+  }
+
+  public void statementExecutorHelper(List<String> queries, Connection conn, Statement stmt,
+      boolean auto_commit_mode, boolean batched) throws Exception {
+    conn.setAutoCommit(auto_commit_mode);
+    for (String query: queries) {
+      if (batched) {
+        stmt.addBatch(query);
+      } else {
+        stmt.execute(query);
+      }
+    }
+    if (batched) {
+      stmt.executeBatch();
+    }
+  }
+
+  @Test
+  public void testSetTransactionIsolationInRC() throws Exception {
+    restartClusterWithFlags(Collections.emptyMap(),
+                            Collections.singletonMap("yb_enable_read_committed_isolation", "true"));
+
+    Connection simple_query_conn = getConnectionBuilder().withPreferQueryMode("simple").connect();
+    Statement simple_query_stmt = simple_query_conn.createStatement();
+
+    Connection extended_query_conn =
+      getConnectionBuilder().withPreferQueryMode("extended").connect();
+    Statement extended_query_stmt = extended_query_conn.createStatement();
+
+    simple_query_stmt.execute("SET log_statement='all'");
+    extended_query_stmt.execute("SET log_statement='all'");
+
+    // Case 1: Simple query mode, auto commit on
+    statementExecutorHelper(
+      new ArrayList<String>(Arrays.asList(
+          "BEGIN",
+          "SET TRANSACTION ISOLATION LEVEL SERIALIZABLE",
+          "SELECT 1",
+          "ROLLBACK")),
+      simple_query_conn, simple_query_stmt, true /* auto_commit_mode */, false /* batched */
+    );
+
+    statementExecutorHelper(
+      new ArrayList<String>(Arrays.asList(
+          "BEGIN",
+          "SET TRANSACTION ISOLATION LEVEL SERIALIZABLE",
+          "SELECT 1",
+          "ROLLBACK")),
+      simple_query_conn, simple_query_stmt, true /* auto_commit_mode */, true /* batched */
+    );
+
+    // Case 2: Simple query mode, auto commit on, multi-statement query
+    statementExecutorHelper(
+      new ArrayList<String>(Arrays.asList(
+          "BEGIN; SET TRANSACTION ISOLATION LEVEL SERIALIZABLE; SELECT 1; ROLLBACK;")),
+      simple_query_conn, simple_query_stmt, true /* auto_commit_mode */, false /* batched */
+    );
+
+    // Case 3: Extended query mode, auto commit on
+    statementExecutorHelper(
+      new ArrayList<String>(Arrays.asList(
+          "BEGIN",
+          "SET TRANSACTION ISOLATION LEVEL SERIALIZABLE",
+          "SELECT 1",
+          "ROLLBACK")),
+      extended_query_conn, extended_query_stmt, true /* auto_commit_mode */, false /* batched */
+    );
+
+    statementExecutorHelper(
+      new ArrayList<String>(Arrays.asList(
+          "BEGIN",
+          "SET TRANSACTION ISOLATION LEVEL SERIALIZABLE",
+          "SELECT 1",
+          "ROLLBACK")),
+      extended_query_conn, extended_query_stmt, true /* auto_commit_mode */, true /* batched */
+    );
+
+    // Case 4: Extended query mode, auto commit on, multi-statement query
+    // (multi-statement query not possible in extended mode)
+
+    // Case 5: Simple query mode, auto commit off
+    statementExecutorHelper(
+      new ArrayList<String>(Arrays.asList(
+          "BEGIN",
+          "SET TRANSACTION ISOLATION LEVEL SERIALIZABLE",
+          "SELECT 1",
+          "ROLLBACK")),
+      simple_query_conn, simple_query_stmt, false /* auto_commit_mode */, false /* batched */
+    );
+
+    statementExecutorHelper(
+      new ArrayList<String>(Arrays.asList(
+          "BEGIN",
+          "SET TRANSACTION ISOLATION LEVEL SERIALIZABLE",
+          "SELECT 1",
+          "ROLLBACK")),
+      simple_query_conn, simple_query_stmt, false /* auto_commit_mode */, true /* batched */
+    );
+
+    // Case 6: Simple query mode, auto commit mode off, multi-statement query
+    statementExecutorHelper(
+      new ArrayList<String>(Arrays.asList(
+          "BEGIN; SET TRANSACTION ISOLATION LEVEL SERIALIZABLE; SELECT 1; ROLLBACK;")),
+      simple_query_conn, simple_query_stmt, false /* auto_commit_mode */, false /* batched */
+    );
+
+    // Case 7: Extended query mode, auto commit mode off
+    statementExecutorHelper(
+      new ArrayList<String>(Arrays.asList(
+          "BEGIN",
+          "SET TRANSACTION ISOLATION LEVEL SERIALIZABLE",
+          "SELECT 1",
+          "ROLLBACK")),
+      extended_query_conn, extended_query_stmt, false /* auto_commit_mode */, false /* batched */
+    );
+
+    statementExecutorHelper(
+      new ArrayList<String>(Arrays.asList(
+          "BEGIN",
+          "SET TRANSACTION ISOLATION LEVEL SERIALIZABLE",
+          "SELECT 1",
+          "ROLLBACK")),
+      extended_query_conn, extended_query_stmt, false /* auto_commit_mode */, true /* batched */
+    );
+
+    // Case 8: Extended query mode, auto commit off, multi-statement query
+    // (multi-statement query not possible in extended mode)
+
+    // Case 9: Simple query mode, auto commit off, multi-statement query, no BEGIN;
+    statementExecutorHelper(
+      new ArrayList<String>(Arrays.asList(
+          "SET TRANSACTION ISOLATION LEVEL SERIALIZABLE; SELECT 1; ROLLBACK;")),
+      simple_query_conn, simple_query_stmt, false /* auto_commit_mode */, false /* batched */
+    );
+
+    // Cosmetic test cases
+    // Case 10: Lower/ mixed case SET statement
+    statementExecutorHelper(
+      new ArrayList<String>(Arrays.asList(
+          "BEGIN;",
+          "set TRANSACTION ISOLATION LEVEL SERIALIZABLE;",
+          "SELECT 1;",
+          "ROLLBACK;")),
+      simple_query_conn, simple_query_stmt, true /* auto_commit_mode */, false /* batched */
+    );
+
+    statementExecutorHelper(
+      new ArrayList<String>(Arrays.asList(
+          "BEGIN;",
+          "sEt TRANSACTION ISOLATION LEVEL SERIALIZABLE;",
+          "SELECT 1;",
+          "ROLLBACK;")),
+      simple_query_conn, simple_query_stmt, true /* auto_commit_mode */, false /* batched */
+    );
+
+    // Case 11: Leading spaces before SET statement
+    statementExecutorHelper(
+      new ArrayList<String>(Arrays.asList(
+          "BEGIN;",
+          "    SET TRANSACTION ISOLATION LEVEL SERIALIZABLE;",
+          "SELECT 1;",
+          "ROLLBACK;")),
+      simple_query_conn, simple_query_stmt, true /* auto_commit_mode */, false /* batched */
+    );
+
+    // Case 12: Test with DEFERRABLE
+    statementExecutorHelper(
+      new ArrayList<String>(Arrays.asList(
+          "BEGIN;",
+          "SET TRANSACTION DEFERRABLE READ ONLY;",
+          "SET TRANSACTION ISOLATION LEVEL SERIALIZABLE",
+          "SELECT 1;",
+          "ROLLBACK;")),
+      simple_query_conn, simple_query_stmt, true /* auto_commit_mode */, false /* batched */
+    );
+
+    restartClusterWithFlags(Collections.emptyMap(), Collections.emptyMap());
+  }
+
+  // Test for #30739.
+  @Test
+  public void testCatalogSnapshotDoesNotCorruptReadPoint() throws Exception {
+    Assume.assumeFalse("This test requires concurrent DDL to be off", concurrentDDLEnabled);
+
+    try (Statement setup = connection.createStatement()) {
+      setup.execute("CREATE TYPE test_mood AS ENUM ('sad', 'ok', 'happy')");
+      setup.execute("CREATE TABLE test (id INT PRIMARY KEY, val INT, " +
+                    "m test_mood DEFAULT 'happy')");
+      setup.execute("INSERT INTO test VALUES (1, 0, 'happy')");
+    }
+
+    AtomicBoolean stop = new AtomicBoolean(false);
+    AtomicBoolean writerFailed = new AtomicBoolean(false);
+
+    Thread writer = new Thread(() -> {
+      try (Connection wConn = getConnectionBuilder().connect();
+           Statement wStmt = wConn.createStatement()) {
+        int i = 0;
+        while (!stop.get()) {
+          wStmt.execute(
+            String.format("UPDATE test SET val = %d WHERE id = 1", ++i));
+        }
+      } catch (Exception e) {
+        LOG.error("Writer thread failed", e);
+        writerFailed.set(true);
+      }
+    });
+    writer.start();
+
+    try {
+      try (Connection rConn = getConnectionBuilder().connect();
+           Statement rStmt = rConn.createStatement()) {
+        for (int attempt = 0; attempt < 20; attempt++) {
+          ResultSet rs = rStmt.executeQuery(
+              "SELECT t.val AS val_before, " +
+              "       (SELECT val FROM test WHERE id = t.id) AS val_after " +
+              "FROM test t " +
+              "WHERE t.id = 1 " +
+              "  AND pg_sleep(1) IS NOT NULL " +
+              "  AND enum_range(t.m) IS NOT NULL");
+          assertTrue(rs.next());
+          int valBefore = rs.getInt("val_before");
+          int valAfter = rs.getInt("val_after");
+          LOG.info("Attempt " + attempt + ": val_before=" + valBefore +
+                   ", val_after=" + valAfter);
+          assertEquals(
+              "Read point corrupted by GetCatalogSnapshot mid-statement: " +
+              "val_before=" + valBefore + " val_after=" + valAfter,
+              valBefore, valAfter);
+        }
+      }
+    } finally {
+      stop.set(true);
+      writer.join(5000);
+    }
+
+    assertFalse("Writer thread failed unexpectedly", writerFailed.get());
   }
 }

@@ -15,9 +15,9 @@
 // specific language governing permissions and limitations
 // under the License.
 //
-// The following only applies to changes made to this file as part of YugaByte development.
+// The following only applies to changes made to this file as part of YugabyteDB development.
 //
-// Portions Copyright (c) YugaByte, Inc.
+// Portions Copyright (c) YugabyteDB, Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License"); you may not use this file except
 // in compliance with the License.  You may obtain a copy of the License at
@@ -52,6 +52,7 @@
 #include "yb/client/yb_table_name.h"
 
 #include "yb/common/common.pb.h"
+#include "yb/common/ql_protocol.messages.h"
 #include "yb/common/ql_type.h"
 #include "yb/common/ql_value.h"
 
@@ -179,23 +180,25 @@ YBSchema YBSchemaFromSchema(const Schema& schema) {
 }
 
 std::shared_ptr<YBqlReadOp> CreateReadOp(
-    int32_t key, const TableHandle& table, const std::string& value_column) {
-  auto op = table.NewReadOp();
+    const ThreadSafeArenaPtr& arena, int32_t key, const TableHandle& table,
+    const std::string& value_column) {
+  auto op = table.NewReadOp(arena);
   auto req = op->mutable_request();
   QLAddInt32HashValue(req, key);
   auto value_column_id = table.ColumnId(value_column);
   req->add_selected_exprs()->set_column_id(value_column_id);
   req->mutable_column_refs()->add_ids(value_column_id);
 
-  QLRSColDescPB *rscol_desc = req->mutable_rsrow_desc()->add_rscol_descs();
-  rscol_desc->set_name(value_column);
+  auto *rscol_desc = req->mutable_rsrow_desc()->add_rscol_descs();
+  rscol_desc->dup_name(value_column);
   table.ColumnType(value_column)->ToQLTypePB(rscol_desc->mutable_ql_type());
   return op;
 }
 
 Result<string> GetNamespaceIdByNamespaceName(YBClient* client,
                                              const string& namespace_name) {
-  const auto namespaces = VERIFY_RESULT(client->ListNamespaces(YQL_DATABASE_PGSQL));
+  const auto namespaces = VERIFY_RESULT(
+      client->ListNamespaces(client::IncludeNonrunningNamespaces::kFalse, YQL_DATABASE_PGSQL));
   for (const auto& ns : namespaces) {
     if (ns.id.name() == namespace_name) {
       return ns.id.id();

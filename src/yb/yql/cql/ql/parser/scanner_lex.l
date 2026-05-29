@@ -10,7 +10,7 @@
  */
 
 /*--------------------------------------------------------------------------------------------------
- * Portions Copyright (c) YugaByte, Inc.
+ * Portions Copyright (c) YugabyteDB, Inc.
  * Portions Copyright (c) 1996-2015, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
@@ -51,6 +51,14 @@ using namespace yb::ql;
  */
 #if defined(__GNUC__)
 #pragma GCC diagnostic ignored "-Waddress"
+#endif
+
+/*
+ * Similar error is also raised for gcc 15.x.
+ * scanner_lex.l.cc:2996:34: error: 'nonnull' argument 'file' compared to NULL [-Werror=nonnull-compare]
+ */
+#if defined(__GNUC__) && __GNUC__ >= 15
+#pragma GCC diagnostic ignored "-Wnonnull-compare"
 #endif
 
 #undef YY_DECL

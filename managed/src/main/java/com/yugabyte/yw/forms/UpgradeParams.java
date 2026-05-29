@@ -14,8 +14,7 @@ public class UpgradeParams extends UniverseDefinitionTaskParams {
 
   // The software version to install. Do not set this value if no software needs to be installed.
   public String ybSoftwareVersion = null;
-  // Previous software version.
-  public String ybPrevSoftwareVersion = null;
+
   // Whenever we run system catalog upgrade after software upgrade or not
   public boolean upgradeSystemCatalog = true;
 
@@ -40,13 +39,6 @@ public class UpgradeParams extends UniverseDefinitionTaskParams {
   @Deprecated
   // This is deprecated use cluster.userIntent.tserverGFlags
   public Map<String, String> tserverGFlags = new HashMap<String, String>();
-
-  public static final int DEFAULT_SLEEP_AFTER_RESTART_MS = 180000;
-
-  // Time to sleep after a server restart, if there is no way to check/rpc if it is ready to server
-  // requests.
-  public Integer sleepAfterMasterRestartMillis = DEFAULT_SLEEP_AFTER_RESTART_MS;
-  public Integer sleepAfterTServerRestartMillis = DEFAULT_SLEEP_AFTER_RESTART_MS;
 
   public enum UpgradeOption {
     @JsonProperty("Rolling")

@@ -1,4 +1,4 @@
-// Copyright (c) YugaByte, Inc.
+// Copyright (c) YugabyteDB, Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License"); you may not use this file except
 // in compliance with the License.  You may obtain a copy of the License at
@@ -24,14 +24,14 @@ import org.yb.cdc.common.ExpectedRecordYSQL;
 
 import org.yb.cdc.CdcService.RowMessage.Op;
 import org.yb.cdc.util.CDCSubscriber;
-import org.yb.util.YBTestRunnerNonTsanOnly;
+import org.yb.YBTestRunner;
 
 import static org.yb.AssertionWrappers.*;
 
 import java.util.ArrayList;
 import java.util.List;
 
-@RunWith(value = YBTestRunnerNonTsanOnly.class)
+@RunWith(value = YBTestRunner.class)
 public class TestLargeTabletCount extends CDCBaseClass {
   private final static Logger LOG = LoggerFactory.getLogger(TestLargeTabletCount.class);
 

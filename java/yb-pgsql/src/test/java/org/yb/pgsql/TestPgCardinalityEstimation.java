@@ -1,4 +1,4 @@
-// Copyright (c) YugaByte, Inc.
+// Copyright (c) YugabyteDB, Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License"); you may not use this file except
 // in compliance with the License.  You may obtain a copy of the License at
@@ -19,7 +19,6 @@ import static org.yb.pgsql.ExplainAnalyzeUtils.NODE_LIMIT;
 import static org.yb.pgsql.ExplainAnalyzeUtils.NODE_MERGE_JOIN;
 import static org.yb.pgsql.ExplainAnalyzeUtils.NODE_SEQ_SCAN;
 import static org.yb.pgsql.ExplainAnalyzeUtils.NODE_SORT;
-import static org.yb.pgsql.ExplainAnalyzeUtils.NODE_YB_SEQ_SCAN;
 import org.yb.pgsql.ExplainAnalyzeUtils.PlanCheckerBuilder;
 import org.yb.pgsql.ExplainAnalyzeUtils.TopLevelCheckerBuilder;
 
@@ -28,12 +27,12 @@ import java.sql.Statement;
 import org.junit.Before;
 import org.junit.Test;
 import org.junit.runner.RunWith;
-import org.yb.util.YBTestRunnerNonTsanOnly;
+import org.yb.YBTestRunner;
 import org.yb.util.json.Checker;
 import org.yb.util.json.Checkers;
 import org.yb.util.json.JsonUtil;
 
-@RunWith(value=YBTestRunnerNonTsanOnly.class)
+@RunWith(value=YBTestRunner.class)
 public class TestPgCardinalityEstimation extends BasePgSQLTest {
   private static final String TABLE_NAME = "t50000";
   private static final int TABLE_ROWS = 50000;
@@ -151,7 +150,7 @@ public class TestPgCardinalityEstimation extends BasePgSQLTest {
           "ORDER BY t1.c_float, t2.c_text, t3.c_varchar DESC LIMIT %2$d OFFSET 50",
           TABLE_NAME, QUERY_LIMIT),
           makeTopLevelBuilder()
-              .storageReadRequests(Checkers.equal(0))
+              .storageReadRequests(Checkers.greater(1))
               .storageWriteRequests(Checkers.equal(0))
               .plan(makePlanBuilder()
                   .nodeType(NODE_LIMIT)
@@ -167,10 +166,12 @@ public class TestPgCardinalityEstimation extends BasePgSQLTest {
                               .planRows(Checkers.greater(1))
                               .plans(
                                   makePlanBuilder()
-                                      .nodeType(NODE_YB_SEQ_SCAN)
+                                      .nodeType(NODE_SEQ_SCAN)
                                       .relationName(TABLE_NAME)
                                       .alias("t2")
                                       .planRows(Checkers.equal(TABLE_ROWS))
+                                      .storageTableReadRequests(Checkers.greater(1))
+                                      .storageTableReadExecutionTime(Checkers.greater(0.0))
                                       .build(),
                                   makePlanBuilder()
                                       .nodeType(NODE_HASH)
@@ -183,20 +184,28 @@ public class TestPgCardinalityEstimation extends BasePgSQLTest {
                                                   .nodeType(NODE_SORT)
                                                   .planRows(Checkers.greater(1))
                                                   .plans(makePlanBuilder()
-                                                      .nodeType(NODE_YB_SEQ_SCAN)
+                                                      .nodeType(NODE_SEQ_SCAN)
                                                       .relationName(TABLE_NAME)
                                                       .alias("t1")
                                                       .planRows(Checkers.greater(1))
+                                                      .storageTableReadRequests(
+                                                        Checkers.greater(1))
+                                                      .storageTableReadExecutionTime(
+                                                        Checkers.greater(0.0))
                                                       .build())
                                                   .build(),
                                               makePlanBuilder()
                                                   .nodeType(NODE_SORT)
                                                   .planRows(Checkers.equal(TABLE_ROWS))
                                                   .plans(makePlanBuilder()
-                                                      .nodeType(NODE_YB_SEQ_SCAN)
+                                                      .nodeType(NODE_SEQ_SCAN)
                                                       .relationName(TABLE_NAME)
                                                       .alias("t3")
                                                       .planRows(Checkers.equal(TABLE_ROWS))
+                                                      .storageTableReadRequests(
+                                                        Checkers.greater(1))
+                                                      .storageTableReadExecutionTime(
+                                                        Checkers.greater(0.0))
                                                       .build())
                                                   .build())
                                           .build())

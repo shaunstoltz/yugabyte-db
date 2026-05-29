@@ -15,9 +15,9 @@
 // specific language governing permissions and limitations
 // under the License.
 //
-// The following only applies to changes made to this file as part of YugaByte development.
+// The following only applies to changes made to this file as part of YugabyteDB development.
 //
-// Portions Copyright (c) YugaByte, Inc.
+// Portions Copyright (c) YugabyteDB, Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License"); you may not use this file except
 // in compliance with the License.  You may obtain a copy of the License at
@@ -33,8 +33,9 @@
 
 #include <functional>
 #include <map>
-#include <vector>
+#include <memory>
 #include <string>
+#include <vector>
 
 #include <rapidjson/document.h>
 
@@ -50,8 +51,6 @@ class YBTableName;
 
 namespace tools {
 
-typedef enterprise::ClusterAdminClient ClusterAdminClientClass;
-
 // Tool to administer a cluster from the CLI.
 class ClusterAdminCli {
  public:
@@ -64,20 +63,20 @@ class ClusterAdminCli {
   static const Status kInvalidArguments;
 
  protected:
-  typedef std::function<Status(const CLIArguments&)> Action;
-  typedef std::function<Result<rapidjson::Document>(const CLIArguments&)> JsonAction;
+  typedef std::function<Status(const CLIArguments&, ClusterAdminClient* client)> Action;
 
   struct Command {
     std::string name_;
     std::string usage_arguments_;
     Action action_;
+    bool hidden_;
   };
 
-  void Register(std::string&& cmd_name, std::string&& cmd_args, Action&& action);
-  void RegisterJson(std::string&& cmd_name, std::string&& cmd_args, JsonAction&& action);
+  void Register(
+      std::string&& cmd_name, const std::string& cmd_args, Action&& action, bool hidden = false);
   void SetUsage(const std::string& prog_name);
 
-  virtual void RegisterCommandHandlers(ClusterAdminClientClass* client);
+  virtual void RegisterCommandHandlers();
 
  private:
   Status RunCommand(
@@ -85,6 +84,7 @@ class ClusterAdminCli {
   std::string GetArgumentExpressions(const std::string& usage_arguments);
   std::vector<Command> commands_;
   std::map<std::string, size_t> command_indexes_;
+  std::unique_ptr<ClusterAdminClient> client_;
 };
 
 using CLIArgumentsIterator = ClusterAdminCli::CLIArguments::const_iterator;
@@ -92,14 +92,14 @@ using TailArgumentsProcessor =
     std::function<Status(CLIArgumentsIterator, const CLIArgumentsIterator&)>;
 
 Result<std::vector<client::YBTableName>> ResolveTableNames(
-    ClusterAdminClientClass* client,
+    ClusterAdminClient* client,
     CLIArgumentsIterator i,
     const CLIArgumentsIterator& end,
     const TailArgumentsProcessor& tail_processor = TailArgumentsProcessor(),
     bool allow_namespace_only = false);
 
 Result<client::YBTableName> ResolveSingleTableName(
-    ClusterAdminClientClass* client,
+    ClusterAdminClient* client,
     CLIArgumentsIterator i,
     const CLIArgumentsIterator& end,
     TailArgumentsProcessor tail_processor = TailArgumentsProcessor());

@@ -1,4 +1,4 @@
-// Copyright (c) YugaByte, Inc.
+// Copyright (c) YugabyteDB, Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License"); you may not use this file except
 // in compliance with the License.  You may obtain a copy of the License at
@@ -19,9 +19,15 @@
 
 #include "yb/common/common_fwd.h"
 
+#include "yb/dockv/dockv_fwd.h"
+
 #include "yb/master/master_fwd.h"
 
+#include "yb/qlexpr/qlexpr_fwd.h"
+
+#include "yb/util/enums.h"
 #include "yb/util/locks.h"
+#include "yb/util/memory/arena_fwd.h"
 #include "yb/util/status_callback.h"
 #include "yb/util/status_fwd.h"
 
@@ -32,13 +38,9 @@ namespace client {
 
 // This must match TableType in common.proto.
 // We have static_assert's in tablet-test.cc to verify this.
-enum class YBTableType {
-  YQL_TABLE_TYPE = 2,
-  REDIS_TABLE_TYPE = 3,
-  PGSQL_TABLE_TYPE = 4,
-  TRANSACTION_STATUS_TABLE_TYPE = 5,
-  UNKNOWN_TABLE_TYPE = -1
-};
+YB_DEFINE_ENUM(YBTableType,
+               ((YQL_TABLE_TYPE, 2))((REDIS_TABLE_TYPE, 3))((PGSQL_TABLE_TYPE, 4))
+               ((TRANSACTION_STATUS_TABLE_TYPE, 5))((UNKNOWN_TABLE_TYPE, -1)));
 
 struct VersionedTablePartitionList {
   TablePartitionList keys;
@@ -79,11 +81,11 @@ class YBTable : public std::enable_shared_from_this<YBTable> {
   // Return the table's ID. This is an internal identifier which uniquely
   // identifies a table. If the table is deleted and recreated with the same
   // name, the ID will distinguish the old table from the new.
-  const std::string& id() const;
+  const TableId& id() const;
 
   const YBSchema& schema() const;
   const Schema& InternalSchema() const;
-  const PartitionSchema& partition_schema() const;
+  const dockv::PartitionSchema& partition_schema() const;
   bool IsHashPartitioned() const;
   bool IsRangePartitioned() const;
 
@@ -97,7 +99,7 @@ class YBTable : public std::enable_shared_from_this<YBTable> {
   PartitionListVersion GetPartitionListVersion() const;
 
   // Indexes available on the table.
-  const IndexMap& index_map() const;
+  const qlexpr::IndexMap& index_map() const;
 
   // Is this an index?
   bool IsIndex() const;
@@ -105,25 +107,27 @@ class YBTable : public std::enable_shared_from_this<YBTable> {
   bool IsUniqueIndex() const;
 
   // For index table: information about this index.
-  const IndexInfo& index_info() const;
+  const qlexpr::IndexInfo& index_info() const;
 
   // True if the table is colocated (including tablegroups, excluding YSQL system tables).
   bool colocated() const;
 
   // Returns the replication info for the table.
-  const boost::optional<master::ReplicationInfoPB>& replication_info() const;
+  const std::optional<ReplicationInfoPB>& replication_info() const;
 
   std::string ToString() const;
   //------------------------------------------------------------------------------------------------
   // CQL support
   // Create a new QL operation for this table.
-  std::unique_ptr<YBqlWriteOp> NewQLWrite();
-  std::unique_ptr<YBqlWriteOp> NewQLInsert();
-  std::unique_ptr<YBqlWriteOp> NewQLUpdate();
-  std::unique_ptr<YBqlWriteOp> NewQLDelete();
+  std::unique_ptr<YBqlWriteOp> NewQLWrite(
+      ThreadSafeArenaPtr arena, LWQLWriteRequestPB* request = nullptr);
+  std::unique_ptr<YBqlWriteOp> NewQLInsert(ThreadSafeArenaPtr arena);
+  std::unique_ptr<YBqlWriteOp> NewQLUpdate(ThreadSafeArenaPtr arena);
+  std::unique_ptr<YBqlWriteOp> NewQLDelete(ThreadSafeArenaPtr arena);
 
-  std::unique_ptr<YBqlReadOp> NewQLRead();
-  std::unique_ptr<YBqlReadOp> NewQLSelect();
+  std::unique_ptr<YBqlReadOp> NewQLRead(
+      ThreadSafeArenaPtr arena, LWQLReadRequestPB* request = nullptr);
+  std::unique_ptr<YBqlReadOp> NewQLSelect(ThreadSafeArenaPtr arena);
 
   // Finds partition start for specified partition_key.
   // Partitions could be grouped by group_by bunches, in this case start of such bunch is returned.
@@ -134,6 +138,8 @@ class YBTable : public std::enable_shared_from_this<YBTable> {
 
   // Asynchronously refreshes table partitions.
   void RefreshPartitions(YBClient* client, StdStatusCallback callback);
+
+  size_t DynamicMemoryUsage() const;
 
  private:
   friend class YBClient;

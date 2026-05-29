@@ -2,9 +2,9 @@
 // Use of this source code is governed by a BSD-style license that can be
 // found in the LICENSE file. See the AUTHORS file for names of contributors.
 //
-// The following only applies to changes made to this file as part of YugaByte development.
+// The following only applies to changes made to this file as part of YugabyteDB development.
 //
-// Portions Copyright (c) YugaByte, Inc.
+// Portions Copyright (c) YugabyteDB, Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License"); you may not use this file except
 // in compliance with the License.  You may obtain a copy of the License at
@@ -117,6 +117,12 @@ struct BlockBasedTableOptions {
 
   // If non-NULL use the specified cache for compressed blocks.
   // If NULL, rocksdb will not use a compressed block cache.
+  // 'block_cache_compressed' should be nullptr for now. If you want to configure it,
+  // the logic for generating the block cache key prefix must be modified.
+  // With 'block_cache_compressed' enabled, data will be put into the block cache
+  // during file generation. However, both the mtime and the CRC32 of the
+  // meta-block required for generating the block cache key prefix are not
+  // available during this process.
   std::shared_ptr<Cache> block_cache_compressed = nullptr;
 
   // Approximate size of user data packed per block, in bytes. Note that the
@@ -417,13 +423,6 @@ class TableFactory {
   // Developers should use DB::SetOption() instead to dynamically change
   // options while the DB is open.
   virtual void* GetOptions() { return nullptr; }
-
-  // Returns SST file filter for pruning out files which doesn't contain some part of user_key.
-  // It should be in sync with FilterPolicy used for bloom filter construction. For example,
-  // file filter should only consider hashed components of the key when using with
-  // DocDbAwareFilterPolicy and HashedComponentsExtractor.
-  virtual std::shared_ptr<TableAwareReadFileFilter> NewTableAwareReadFileFilter(
-      const ReadOptions &read_options, const Slice &user_key) const { return nullptr; }
 };
 
 // Create a special table factory that can open either of the supported

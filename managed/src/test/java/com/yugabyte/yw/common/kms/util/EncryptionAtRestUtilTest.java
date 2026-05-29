@@ -5,25 +5,26 @@ import static org.junit.Assert.assertNotNull;
 import static org.junit.Assert.assertNull;
 
 import com.fasterxml.jackson.databind.JsonNode;
-import com.fasterxml.jackson.databind.node.ObjectNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
-
+import com.fasterxml.jackson.databind.node.ObjectNode;
 import com.yugabyte.yw.common.FakeDBApplication;
 import com.yugabyte.yw.common.ModelFactory;
 import com.yugabyte.yw.common.kms.util.hashicorpvault.HashicorpVaultConfigParams;
 import com.yugabyte.yw.models.Customer;
 import com.yugabyte.yw.models.KmsConfig;
+import com.yugabyte.yw.models.KmsHistory;
 import com.yugabyte.yw.models.Universe;
 import java.util.Base64;
 import java.util.UUID;
+import lombok.extern.slf4j.Slf4j;
 import org.junit.Before;
 import org.junit.Ignore;
 import org.junit.Test;
-import play.libs.Json;
-
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
+import play.libs.Json;
 
+@Slf4j
 public class EncryptionAtRestUtilTest extends FakeDBApplication {
   protected static final Logger LOG = LoggerFactory.getLogger(EncryptionAtRestUtilTest.class);
 
@@ -40,7 +41,7 @@ public class EncryptionAtRestUtilTest extends FakeDBApplication {
     testUniverse = ModelFactory.createUniverse();
     testKMSConfig =
         KmsConfig.createKMSConfig(
-            testCustomer.uuid,
+            testCustomer.getUuid(),
             KeyProvider.AWS,
             Json.newObject().put("test_key", "test_val"),
             "some config name");
@@ -48,7 +49,7 @@ public class EncryptionAtRestUtilTest extends FakeDBApplication {
 
   @Test
   public void testGenerateSalt() {
-    String salt = encryptionUtil.generateSalt(testCustomer.uuid, KeyProvider.SMARTKEY);
+    String salt = encryptionUtil.generateSalt(testCustomer.getUuid(), KeyProvider.SMARTKEY);
     assertNotNull(salt);
   }
 
@@ -56,9 +57,9 @@ public class EncryptionAtRestUtilTest extends FakeDBApplication {
   public void testMaskAndUnmaskConfigData() {
     JsonNode originalObj = Json.newObject().put("test_key", "test_val");
     ObjectNode encryptedObj =
-        encryptionUtil.maskConfigData(testCustomer.uuid, originalObj, KeyProvider.SMARTKEY);
+        encryptionUtil.maskConfigData(testCustomer.getUuid(), originalObj, KeyProvider.SMARTKEY);
     JsonNode unencryptedObj =
-        encryptionUtil.unmaskConfigData(testCustomer.uuid, encryptedObj, KeyProvider.SMARTKEY);
+        encryptionUtil.unmaskConfigData(testCustomer.getUuid(), encryptedObj, KeyProvider.SMARTKEY);
     assertEquals(originalObj.get("test_key").asText(), unencryptedObj.get("test_key").asText());
   }
 
@@ -178,29 +179,34 @@ public class EncryptionAtRestUtilTest extends FakeDBApplication {
   }
 
   @Test
-  public void testGetNumKeyRotationsNoHistory() {
-    int numRotations = encryptionUtil.getNumKeyRotations(testUniverse.universeUUID);
+  public void testGetNumUniverseKeysNoHistory() {
+    int numRotations = encryptionUtil.getNumUniverseKeys(testUniverse.getUniverseUUID());
     assertEquals(numRotations, 0);
   }
 
   @Test
-  public void testGetNumKeyRotations() {
+  public void testGetNumUniverseKeys() {
     encryptionUtil.addKeyRef(
-        testUniverse.universeUUID, testKMSConfig.configUUID, "some_key_ref".getBytes());
-    int numRotations =
-        encryptionUtil.getNumKeyRotations(testUniverse.universeUUID, testKMSConfig.configUUID);
+        testUniverse.getUniverseUUID(), testKMSConfig.getConfigUUID(), "some_key_ref".getBytes());
+    int numRotations = encryptionUtil.getNumUniverseKeys(testUniverse.getUniverseUUID());
     assertEquals(1, numRotations);
+
+    // Check if the encryption context is set to empty ObjectNode.
+    KmsHistory kmsHistory =
+        encryptionUtil.getLatestConfigKey(
+            testUniverse.getUniverseUUID(), testKMSConfig.getConfigUUID());
+    assertEquals(Json.newObject(), kmsHistory.getEncryptionContext());
   }
 
   @Test
   public void testClearUniverseKeyHistory() {
     encryptionUtil.addKeyRef(
-        testUniverse.universeUUID, testKMSConfig.configUUID, "some_key_ref".getBytes());
-    int numRotations =
-        encryptionUtil.getNumKeyRotations(testUniverse.universeUUID, testKMSConfig.configUUID);
+        testUniverse.getUniverseUUID(), testKMSConfig.getConfigUUID(), "some_key_ref".getBytes());
+    int numRotations = encryptionUtil.getNumUniverseKeys(testUniverse.getUniverseUUID());
     assertEquals(numRotations, 1);
-    encryptionUtil.removeKeyRotationHistory(testUniverse.universeUUID, testKMSConfig.configUUID);
-    numRotations = encryptionUtil.getNumKeyRotations(testUniverse.universeUUID);
+    encryptionUtil.removeKeyRotationHistory(
+        testUniverse.getUniverseUUID(), testKMSConfig.getConfigUUID());
+    numRotations = encryptionUtil.getNumUniverseKeys(testUniverse.getUniverseUUID());
     assertEquals(0, numRotations);
   }
 }

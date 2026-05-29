@@ -1,4 +1,4 @@
-// Copyright (c) YugaByte, Inc.
+// Copyright (c) YugabyteDB, Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License"); you may not use this file except
 // in compliance with the License.  You may obtain a copy of the License at
@@ -34,7 +34,6 @@
 namespace yb {
 namespace ql {
 
-using std::make_shared;
 using std::string;
 using strings::Substitute;
 using std::dynamic_pointer_cast;
@@ -98,8 +97,8 @@ TEST_F(QLTestAnalyzer, TestCreateTablePropertyAnalyzer) {
   PTTableProperty::SharedPtr table_property = table_properties->element(0);
   EXPECT_EQ(std::string("default_time_to_live"), table_property->lhs()->c_str());
   PTConstVarInt::SharedPtr rhs = std::static_pointer_cast<PTConstVarInt>(table_property->rhs());
-  auto from_str = ASSERT_RESULT(util::VarInt::CreateFromString(rhs->Eval()->c_str()));
-  EXPECT_EQ(util::VarInt(1000), from_str);
+  auto from_str = ASSERT_RESULT(VarInt::CreateFromString(rhs->Eval()->c_str()));
+  EXPECT_EQ(VarInt(1000), from_str);
 }
 
 TEST_F(QLTestAnalyzer, TestCreateTableAnalyze) {
@@ -548,7 +547,7 @@ TEST_F(QLTestAnalyzer, TestIndexBasedOnJsonAttribute) {
                            "with transactions = {'enabled':true};"));
 
   EXPECT_OK(processor->Run("CREATE INDEX i1 ON t (j->>'a');"));
-  EXPECT_NOT_OK(processor->Run("CREATE INDEX i2 ON t (j->3);"));
+  EXPECT_NOK(processor->Run("CREATE INDEX i2 ON t (j->3);"));
 }
 
 TEST_F(QLTestAnalyzer, TestTruncate) {

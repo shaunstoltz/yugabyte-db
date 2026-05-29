@@ -1,6 +1,8 @@
-// Copyright (c) YugaByte, Inc.
+// Copyright (c) YugabyteDB, Inc.
 
 package com.yugabyte.yw.forms;
+
+import static io.swagger.annotations.ApiModelProperty.AccessMode.READ_ONLY;
 
 import com.yugabyte.yw.models.helpers.NodeConfig;
 import io.swagger.annotations.ApiModel;
@@ -27,8 +29,7 @@ public class NodeInstanceFormData {
     @ApiModelProperty(value = "IP address", example = "1.1.1.1", required = true)
     public String ip;
 
-    @NotNull
-    @ApiModelProperty(value = "SSH user", example = "centos", required = true)
+    @ApiModelProperty(value = "SSH user", example = "centos")
     public String sshUser;
 
     @NotNull
@@ -47,10 +48,17 @@ public class NodeInstanceFormData {
     @ApiModelProperty(value = "Node instance name", example = "Mumbai instance", required = true)
     public String instanceName;
 
-    @ApiModelProperty(value = "Node name", example = "India node")
+    @ApiModelProperty(
+        value = "Node name in a universe",
+        example = "universe_node1",
+        accessMode = READ_ONLY)
     public String nodeName;
 
-    @ApiModelProperty(value = "Node configurations")
+    @ApiModelProperty(value = "Node configurations", hidden = true)
+    /**
+     * Hide this as it is not persisted. See {{@link
+     * com.yugabyte.yw.models.NodeInstance#setDetails(NodeInstanceData)}
+     */
     public Set<NodeConfig> nodeConfigs;
   }
 }

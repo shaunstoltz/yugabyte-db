@@ -1,4 +1,4 @@
-// Copyright (c) YugaByte, Inc.
+// Copyright (c) YugabyteDB, Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License"); you may not use this file except
 // in compliance with the License.  You may obtain a copy of the License at
@@ -16,23 +16,35 @@
 #include "yb/client/table.h"
 #include "yb/client/yb_op.h"
 
-#include "yb/common/partition.h"
 #include "yb/common/pgsql_protocol.pb.h"
-#include "yb/common/ql_scanspec.h"
 #include "yb/common/ql_value.h"
 #include "yb/common/schema.h"
 
-#include "yb/docdb/doc_key.h"
-#include "yb/docdb/doc_scanspec_util.h"
-#include "yb/docdb/primitive_value_util.h"
+#include "yb/dockv/doc_key.h"
+#include "yb/dockv/partition.h"
+#include "yb/dockv/primitive_value_util.h"
 
-#include "yb/yql/pggate/pg_tabledesc.h"
-#include "yb/yql/pggate/pggate_flags.h"
+#include "yb/qlexpr/doc_scanspec_util.h"
 
+#include "yb/util/logging.h"
 #include "yb/util/scope_exit.h"
 
-namespace yb {
-namespace pggate {
+#include "yb/yql/pggate/pg_read_range.h"
+#include "yb/yql/pggate/pg_tabledesc.h"
+#include "yb/yql/pggate/pggate_flags.h"
+#include "yb/yql/pggate/util/ybc_util.h"
+
+namespace yb::pggate {
+namespace {
+
+template<class ReqPB>
+void Apply(ReqPB& req, const YbcPgTableLocalityInfo& info) {
+  if (info.tablespace_oid != kInvalidOid) {
+    req.set_tablespace_oid(info.tablespace_oid);
+  }
+}
+
+} // namespace
 
 Result<bool> PrepareNextRequest(const PgTableDesc& table, PgsqlReadOp* read_op) {
   // Set up paging state for next request.
@@ -55,6 +67,7 @@ Result<bool> PrepareNextRequest(const PgTableDesc& table, PgsqlReadOp* read_op) 
   // not reused, and upper_bound is configured instead to continue reading from the correct tablet.
   // This approach is not applicable for index read requests.
   const auto& paging_state = res.paging_state();
+  VLOG_WITH_FUNC(1) << "Response paging state: " << paging_state.ShortDebugString();
   if (&top_level_req == req &&
       !top_level_req.is_forward_scan() &&
       table.num_hash_key_columns() == 0 &&
@@ -62,16 +75,9 @@ Result<bool> PrepareNextRequest(const PgTableDesc& table, PgsqlReadOp* read_op) 
       !paging_state.has_next_row_key()) {
     const auto& current_next_partition_key = paging_state.next_partition_key();
 
-    // Need to check lower bound here because DocDB can check upper bound only.
-    std::vector<docdb::KeyEntryValue> lower_bound, _;
-    RETURN_NOT_OK(client::GetRangePartitionBounds(table.schema(), top_level_req, &lower_bound, &_));
-    if (!lower_bound.empty()) {
-      docdb::DocKey current_key(table.schema());
-      VERIFY_RESULT(current_key.DecodeFrom(
-          current_next_partition_key, docdb::DocKeyPart::kWholeDocKey, docdb::AllowSpecial::kTrue));
-      if (current_key.CompareTo(docdb::DocKey(std::move(lower_bound))) < 0) {
-        return false; // No need to continue, lower bound was reached.
-      }
+    // Need to check lower bound here because DocDB fails to do so.
+    if (req->has_lower_bound() && current_next_partition_key < req->lower_bound().key()) {
+      return false;
     }
 
     // Setting up upper bound for backward scan for the next request, returning false to indicate
@@ -91,7 +97,9 @@ Result<bool> PrepareNextRequest(const PgTableDesc& table, PgsqlReadOp* read_op) 
   req->clear_backfill_spec();
 
   if (paging_state.has_read_time()) {
-    read_op->set_read_time(ReadHybridTime::FromPB(paging_state.read_time()));
+    auto paging_read_hybrid_time = ReadHybridTime::FromPB(paging_state.read_time());
+    VLOG(4) << "Setting read time for next request: " << paging_read_hybrid_time;
+    read_op->set_read_time(paging_read_hybrid_time);
   }
 
   // Setup backfill_spec for the next request.
@@ -103,8 +111,9 @@ Result<bool> PrepareNextRequest(const PgTableDesc& table, PgsqlReadOp* read_op) 
   // number of rows. Here the operation fetches next page, so the estimation is proven incorrect.
   // So resetting the limit to prevent excessive RPCs due to too small fetch size, if the estimation
   // is too far from reality.
-  if (req->limit() < FLAGS_ysql_prefetch_limit) {
-    req->set_limit(FLAGS_ysql_prefetch_limit);
+  uint64_t prefetch_limit = yb_fetch_row_limit;
+  if (top_level_req.limit() != prefetch_limit) {
+    top_level_req.set_limit(prefetch_limit);
   }
 
   return true;
@@ -115,28 +124,34 @@ std::string PgsqlOp::ToString() const {
                 is_read() ? "READ" : "WRITE", active_, read_time_, RequestToString());
 }
 
-PgsqlReadOp::PgsqlReadOp(ThreadSafeArena* arena, bool is_region_local)
-    : PgsqlOp(arena, is_region_local), read_request_(arena) {
+PgsqlReadOp::PgsqlReadOp(ThreadSafeArena* arena, const YbcPgTableLocalityInfo& locality_info)
+    : PgsqlOp(arena, locality_info), read_request_(arena) {
 }
 
-PgsqlReadOp::PgsqlReadOp(ThreadSafeArena* arena, const PgTableDesc& desc, bool is_region_local)
-    : PgsqlReadOp(arena, is_region_local) {
+PgsqlReadOp::PgsqlReadOp(
+    ThreadSafeArena* arena, const PgTableDesc& desc, const YbcPgTableLocalityInfo& locality_info_,
+    PgsqlMetricsCaptureType metrics_capture)
+    : PgsqlReadOp(arena, locality_info_) {
   read_request_.set_client(YQL_CLIENT_PGSQL);
-  read_request_.dup_table_id(desc.id().GetYbTableId());
+  read_request_.dup_table_id(desc.relfilenode_id().GetYbTableId());
   read_request_.set_schema_version(desc.schema_version());
   read_request_.set_stmt_id(reinterpret_cast<int64_t>(&read_request_));
+  read_request_.set_metrics_capture(metrics_capture);
+  Apply(read_request_, locality_info());
 }
 
 Status PgsqlReadOp::InitPartitionKey(const PgTableDesc& table) {
+  if (!yb_allow_dockey_bounds && table.schema().num_hash_key_columns() > 0) {
+    RETURN_NOT_OK(PgReadRange::ConvertBoundsToHashCode(read_request_));
+  }
   return client::InitPartitionKey(
        table.schema(), table.partition_schema(), table.GetPartitionList(), &read_request_);
 }
 
-PgsqlOpPtr PgsqlReadOp::DeepCopy(const std::shared_ptr<void>& shared_ptr) const {
-  auto result = ArenaMakeShared<PgsqlReadOp>(
-      std::shared_ptr<ThreadSafeArena>(shared_ptr, &arena()), &arena(), is_region_local());
+PgsqlOpPtr PgsqlReadOp::DeepCopy(const std::shared_ptr<ThreadSafeArena>& arena_ptr) const {
+  auto result = ArenaMakeShared<PgsqlReadOp>(arena_ptr, &*arena_ptr, locality_info());
+  result->set_read_time(read_time());
   result->read_request() = read_request();
-  result->read_from_followers_ = read_from_followers_;
   return result;
 }
 
@@ -144,9 +159,11 @@ std::string PgsqlReadOp::RequestToString() const {
   return read_request_.ShortDebugString();
 }
 
-PgsqlWriteOp::PgsqlWriteOp(ThreadSafeArena* arena, bool need_transaction, bool is_region_local)
-    : PgsqlOp(arena, is_region_local), write_request_(arena),
+PgsqlWriteOp::PgsqlWriteOp(
+    ThreadSafeArena* arena, bool need_transaction, const YbcPgTableLocalityInfo& locality_info_)
+    : PgsqlOp(arena, locality_info_), write_request_(arena),
       need_transaction_(need_transaction) {
+  Apply(write_request_, locality_info());
 }
 
 Status PgsqlWriteOp::InitPartitionKey(const PgTableDesc& table) {
@@ -160,10 +177,9 @@ std::string PgsqlWriteOp::RequestToString() const {
 PgsqlOpPtr PgsqlWriteOp::DeepCopy(const std::shared_ptr<void>& shared_ptr) const {
   auto result = ArenaMakeShared<PgsqlWriteOp>(
       std::shared_ptr<ThreadSafeArena>(shared_ptr, &arena()), &arena(), need_transaction_,
-      is_region_local());
+      locality_info());
   result->write_request() = write_request();
   return result;
 }
 
-}  // namespace pggate
-}  // namespace yb
+}  // namespace yb::pggate

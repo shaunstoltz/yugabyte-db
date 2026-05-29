@@ -1,4 +1,4 @@
-// Copyright (c) YugaByte, Inc.
+// Copyright (c) YugabyteDB, Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License"); you may not use this file except
 // in compliance with the License.  You may obtain a copy of the License at
@@ -21,6 +21,7 @@
 
 #include "yb/rpc/scheduler.h"
 
+#include "yb/util/callsite_profiling.h"
 #include "yb/util/result.h"
 
 DECLARE_int32(update_permissions_cache_msecs);
@@ -90,11 +91,7 @@ PermissionsCache::PermissionsCache(client::YBClient* client,
 }
 
 PermissionsCache::~PermissionsCache() {
-  if (pool_) {
-    scheduler_->Shutdown();
-    pool_->Shutdown();
-    pool_->Join();
-  }
+  Shutdown();
 }
 
 bool PermissionsCache::WaitUntilReady(MonoDelta wait_for) {
@@ -156,10 +153,10 @@ void PermissionsCache::UpdateRolesPermissions(const GetPermissionsResponsePB& re
   }
   {
     // We need to hold the mutex before modifying ready_ to avoid a race condition with cond_.
-    std::lock_guard<std::mutex> l(mtx_);
+    std::lock_guard l(mtx_);
     ready_.store(true, std::memory_order_release);
   }
-  cond_.notify_all();
+  YB_PROFILE(cond_.notify_all());
 }
 
 void PermissionsCache::GetPermissionsFromMaster() {
@@ -199,6 +196,17 @@ Result<bool> PermissionsCache::can_login(const RoleName& role_name) {
     return STATUS(NotFound, "Role not found");
   }
   return it->second.can_login;
+}
+
+void PermissionsCache::Shutdown() {
+  if (!shutting_down_.Set()) {
+    return;
+  }
+  if (pool_) {
+    scheduler_->Shutdown();
+    pool_->Shutdown();
+    pool_->Join();
+  }
 }
 
 bool PermissionsCache::HasCanonicalResourcePermission(const std::string& canonical_resource,

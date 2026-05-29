@@ -1,4 +1,4 @@
-// Copyright (c) YugaByte, Inc.
+// Copyright (c) YugabyteDB, Inc.
 
 package com.yugabyte.yw.models.helpers;
 
@@ -12,6 +12,7 @@ import lombok.EqualsAndHashCode;
 import lombok.Getter;
 import lombok.NoArgsConstructor;
 import lombok.ToString;
+import lombok.extern.jackson.Jacksonized;
 
 /** Pair of node configuration type and its value. */
 @Data
@@ -30,12 +31,13 @@ public class NodeConfig {
 
   @Builder
   @Getter
+  @Jacksonized
   @ToString
   @ApiModel(description = "Validation result of a node config")
   public static class ValidationResult {
     private Type type;
-    private boolean isValid;
-    private boolean isRequired;
+    private boolean valid;
+    private boolean required;
     private String description;
     private String value;
   }
@@ -60,6 +62,8 @@ public class NodeConfig {
 
     HOME_DIR_EXISTS("Home directory exists"),
 
+    HOME_DIR_MATCHES("Home directory matches"),
+
     RAM_SIZE("Total RAM size in MB"),
 
     INTERNET_CONNECTION("Internet connectivity"),
@@ -72,11 +76,13 @@ public class NodeConfig {
 
     PAM_LIMITS_WRITABLE("PAM limits writable"),
 
-    PYTHON_VERSION("Min python version"),
+    PYTHON_VERSION("Supported python version"),
 
     MOUNT_POINTS_VOLUME("Disk space in MB for mount points"),
 
     CHRONYD_RUNNING("Chronyd running"),
+
+    LOCALE_PRESENT("Locale is present"),
 
     SSH_PORT("SSH port is open"),
 
@@ -98,6 +104,8 @@ public class NodeConfig {
 
     AZCOPY("Azcopy binary is installed"),
 
+    CHRONYC("Chronyc binary is installed"),
+
     GSUTIL("Gsutil binary is installed"),
 
     S3CMD("S3cmd binary is installed"),
@@ -114,9 +122,9 @@ public class NodeConfig {
 
     ULIMIT_USER_PROCESSES("Maximum number of processes available to a single user"),
 
-    SYSTEMD_SUDOER_ENTRY("Systemd Sudoer entry"),
-
     SSH_ACCESS("Ability to ssh into node as yugabyte user with key supplied in provider"),
+
+    NODE_AGENT_ACCESS("Reachability of node agent server"),
 
     MASTER_HTTP_PORT("Master http port is open"),
 
@@ -134,13 +142,21 @@ public class NodeConfig {
 
     REDIS_SERVER_RPC_PORT("Redis server rpc port is open"),
 
-    YQL_SERVER_HTTP_PORT("YCQL server http port is open"),
+    YB_HOME_DIR_CLEAN("Check if the home directory is clean"),
 
-    YQL_SERVER_RPC_PORT("YCQL server rpc port is open"),
+    DATA_DIR_CLEAN("Check if the directory is clean"),
+
+    YCQL_SERVER_HTTP_PORT("YCQL server http port is open"),
+
+    YCQL_SERVER_RPC_PORT("YCQL server rpc port is open"),
 
     YSQL_SERVER_HTTP_PORT("YSQL server http port is open"),
 
-    YSQL_SERVER_RPC_PORT("YSQL server rpc port is open");
+    YSQL_SERVER_RPC_PORT("YSQL server rpc port is open"),
+
+    VM_MAX_MAP_COUNT("VM max memory map count"),
+
+    NTP_SKEW("NTP time skew in acceptable range");
 
     private final String description;
 

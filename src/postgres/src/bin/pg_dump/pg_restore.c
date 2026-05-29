@@ -45,16 +45,13 @@
 #include <termios.h>
 #endif
 
-#include "getopt_long.h"
-
 #include "dumputils.h"
+#include "fe_utils/option_utils.h"
+#include "getopt_long.h"
 #include "parallel.h"
 #include "pg_backup_utils.h"
 
-
 static void usage(const char *progname);
-
-typedef struct option optType;
 
 int
 main(int argc, char **argv)
@@ -65,17 +62,27 @@ main(int argc, char **argv)
 	int			numWorkers = 1;
 	Archive    *AH;
 	char	   *inputFileSpec;
+	bool		data_only = false;
+	bool		schema_only = false;
 	static int	disable_triggers = 0;
 	static int	enable_row_security = 0;
 	static int	if_exists = 0;
 	static int	no_data_for_failed_tables = 0;
+	static int	outputNoTableAm = 0;
 	static int	outputNoTablespaces = 0;
 	static int	use_setsessauth = 0;
 	static int	no_comments = 0;
+	static int	no_data = 0;
 	static int	no_publications = 0;
+	static int	no_schema = 0;
 	static int	no_security_labels = 0;
+	static int	no_statistics = 0;
 	static int	no_subscriptions = 0;
 	static int	strict_names = 0;
+	static int	statistics_only = 0;
+	static int	with_data = 0;
+	static int	with_schema = 0;
+	static int	with_statistics = 0;
 
 	struct option cmdopts[] = {
 		{"clean", 0, NULL, 'c'},
@@ -115,19 +122,29 @@ main(int argc, char **argv)
 		{"enable-row-security", no_argument, &enable_row_security, 1},
 		{"if-exists", no_argument, &if_exists, 1},
 		{"no-data-for-failed-tables", no_argument, &no_data_for_failed_tables, 1},
+		{"no-table-access-method", no_argument, &outputNoTableAm, 1},
 		{"no-tablespaces", no_argument, &outputNoTablespaces, 1},
 		{"role", required_argument, NULL, 2},
 		{"section", required_argument, NULL, 3},
 		{"strict-names", no_argument, &strict_names, 1},
 		{"use-set-session-authorization", no_argument, &use_setsessauth, 1},
 		{"no-comments", no_argument, &no_comments, 1},
+		{"no-data", no_argument, &no_data, 1},
 		{"no-publications", no_argument, &no_publications, 1},
+		{"no-schema", no_argument, &no_schema, 1},
 		{"no-security-labels", no_argument, &no_security_labels, 1},
 		{"no-subscriptions", no_argument, &no_subscriptions, 1},
+		{"no-statistics", no_argument, &no_statistics, 1},
+		{"with-data", no_argument, &with_data, 1},
+		{"with-schema", no_argument, &with_schema, 1},
+		{"with-statistics", no_argument, &with_statistics, 1},
+		{"statistics-only", no_argument, &statistics_only, 1},
 
 		{NULL, 0, NULL, 0}
 	};
 
+	pg_logging_init(argv[0]);
+	pg_logging_set_level(PG_LOG_WARNING);
 	set_pglocale_pgservice(argv[0], PG_TEXTDOMAIN("ysql_dump"));
 
 	init_parallel_dump_utils();
@@ -156,7 +173,7 @@ main(int argc, char **argv)
 		switch (c)
 		{
 			case 'a':			/* Dump data only */
-				opts->dataOnly = 1;
+				data_only = true;
 				break;
 			case 'c':			/* clean (i.e., drop) schema prior to create */
 				opts->dropSchema = 1;
@@ -183,7 +200,10 @@ main(int argc, char **argv)
 				break;
 
 			case 'j':			/* number of restore jobs */
-				numWorkers = atoi(optarg);
+				if (!option_parse_int(optarg, "-j/--jobs", 1,
+									  PG_MAX_JOBS,
+									  &numWorkers))
+					exit(1);
 				break;
 
 			case 'l':			/* Dump the TOC summary */
@@ -229,7 +249,7 @@ main(int argc, char **argv)
 				simple_string_list_append(&opts->triggerNames, optarg);
 				break;
 			case 's':			/* dump schema only */
-				opts->schemaOnly = 1;
+				schema_only = true;
 				break;
 			case 'S':			/* Superuser username */
 				if (strlen(optarg) != 0)
@@ -247,6 +267,7 @@ main(int argc, char **argv)
 
 			case 'v':			/* verbose */
 				opts->verbose = 1;
+				pg_logging_increase_verbosity();
 				break;
 
 			case 'w':
@@ -282,7 +303,8 @@ main(int argc, char **argv)
 				break;
 
 			default:
-				fprintf(stderr, _("Try \"%s --help\" for more information.\n"), progname);
+				/* getopt_long already emitted a complaint */
+				pg_log_error_hint("Try \"%s --help\" for more information.", progname);
 				exit_nicely(1);
 		}
 	}
@@ -296,68 +318,84 @@ main(int argc, char **argv)
 	/* Complain if any arguments remain */
 	if (optind < argc)
 	{
-		fprintf(stderr, _("%s: too many command-line arguments (first is \"%s\")\n"),
-				progname, argv[optind]);
-		fprintf(stderr, _("Try \"%s --help\" for more information.\n"),
-				progname);
+		pg_log_error("too many command-line arguments (first is \"%s\")",
+					 argv[optind]);
+		pg_log_error_hint("Try \"%s --help\" for more information.", progname);
 		exit_nicely(1);
 	}
+
+	/* Complain if neither -f nor -d was specified (except if dumping TOC) */
+	if (!opts->cparams.dbname && !opts->filename && !opts->tocSummary)
+		pg_fatal("one of -d/--dbname and -f/--file must be specified");
 
 	/* Should get at most one of -d and -f, else user is confused */
 	if (opts->cparams.dbname)
 	{
 		if (opts->filename)
 		{
-			fprintf(stderr, _("%s: options -d/--dbname and -f/--file cannot be used together\n"),
-					progname);
-			fprintf(stderr, _("Try \"%s --help\" for more information.\n"),
-					progname);
+			pg_log_error("options -d/--dbname and -f/--file cannot be used together");
+			pg_log_error_hint("Try \"%s --help\" for more information.", progname);
 			exit_nicely(1);
 		}
 		opts->useDB = 1;
 	}
 
-	if (opts->dataOnly && opts->schemaOnly)
-	{
-		fprintf(stderr, _("%s: options -s/--schema-only and -a/--data-only cannot be used together\n"),
-				progname);
-		exit_nicely(1);
-	}
+	/* reject conflicting "-only" options */
+	if (data_only && schema_only)
+		pg_fatal("options -s/--schema-only and -a/--data-only cannot be used together");
+	if (schema_only && statistics_only)
+		pg_fatal("options -s/--schema-only and --statistics-only cannot be used together");
+	if (data_only && statistics_only)
+		pg_fatal("options -a/--data-only and --statistics-only cannot be used together");
 
-	if (opts->dataOnly && opts->dropSchema)
-	{
-		fprintf(stderr, _("%s: options -c/--clean and -a/--data-only cannot be used together\n"),
-				progname);
-		exit_nicely(1);
-	}
+	/* reject conflicting "-only" and "no-" options */
+	if (data_only && no_data)
+		pg_fatal("options -a/--data-only and --no-data cannot be used together");
+	if (schema_only && no_schema)
+		pg_fatal("options -s/--schema-only and --no-schema cannot be used together");
+	if (statistics_only && no_statistics)
+		pg_fatal("options --statistics-only and --no-statistics cannot be used together");
 
-	if (numWorkers <= 0)
-	{
-		fprintf(stderr, _("%s: invalid number of parallel jobs\n"), progname);
-		exit(1);
-	}
+	/* reject conflicting "with-" and "no-" options */
+	if (with_data && no_data)
+		pg_fatal("options --with-data and --no-data cannot be used together");
+	if (with_schema && no_schema)
+		pg_fatal("options --with-schema and --no-schema cannot be used together");
+	if (with_statistics && no_statistics)
+		pg_fatal("options --with-statistics and --no-statistics cannot be used together");
 
-	/* See comments in pg_dump.c */
-#ifdef WIN32
-	if (numWorkers > MAXIMUM_WAIT_OBJECTS)
-	{
-		fprintf(stderr, _("%s: maximum number of parallel jobs is %d\n"),
-				progname, MAXIMUM_WAIT_OBJECTS);
-		exit(1);
-	}
-#endif
+	if (data_only && opts->dropSchema)
+		pg_fatal("options -c/--clean and -a/--data-only cannot be used together");
+
+	/*
+	 * -C is not compatible with -1, because we can't create a database inside
+	 * a transaction block.
+	 */
+	if (opts->createDB && opts->single_txn)
+		pg_fatal("options -C/--create and -1/--single-transaction cannot be used together");
 
 	/* Can't do single-txn mode with multiple connections */
 	if (opts->single_txn && numWorkers > 1)
-	{
-		fprintf(stderr, _("%s: cannot specify both --single-transaction and multiple jobs\n"),
-				progname);
-		exit_nicely(1);
-	}
+		pg_fatal("cannot specify both --single-transaction and multiple jobs");
+
+	/*
+	 * Set derivative flags. An "-only" option may be overridden by an
+	 * explicit "with-" option; e.g. "--schema-only --with-statistics" will
+	 * include schema and statistics. Other ambiguous or nonsensical
+	 * combinations, e.g. "--schema-only --no-schema", will have already
+	 * caused an error in one of the checks above.
+	 */
+	opts->dumpData = ((opts->dumpData && !schema_only && !statistics_only) ||
+					  (data_only || with_data)) && !no_data;
+	opts->dumpSchema = ((opts->dumpSchema && !data_only && !statistics_only) ||
+						(schema_only || with_schema)) && !no_schema;
+	opts->dumpStatistics = ((opts->dumpStatistics && !schema_only && !data_only) ||
+							(statistics_only || with_statistics)) && !no_statistics;
 
 	opts->disable_triggers = disable_triggers;
 	opts->enable_row_security = enable_row_security;
 	opts->noDataForFailedTables = no_data_for_failed_tables;
+	opts->noTableAm = outputNoTableAm;
 	opts->noTablespace = outputNoTablespaces;
 	opts->use_setsessauth = use_setsessauth;
 	opts->no_comments = no_comments;
@@ -366,11 +404,7 @@ main(int argc, char **argv)
 	opts->no_subscriptions = no_subscriptions;
 
 	if (if_exists && !opts->dropSchema)
-	{
-		fprintf(stderr, _("%s: option --if-exists requires option -c/--clean\n"),
-				progname);
-		exit_nicely(1);
-	}
+		pg_fatal("option --if-exists requires option -c/--clean");
 	opts->if_exists = if_exists;
 	opts->strict_names = strict_names;
 
@@ -394,9 +428,8 @@ main(int argc, char **argv)
 				break;
 
 			default:
-				write_msg(NULL, "unrecognized archive format \"%s\"; please specify \"c\", \"d\", or \"t\"\n",
-						  opts->formatName);
-				exit_nicely(1);
+				pg_fatal("unrecognized archive format \"%s\"; please specify \"c\", \"d\", or \"t\"",
+						 opts->formatName);
 		}
 	}
 
@@ -434,8 +467,7 @@ main(int argc, char **argv)
 
 	/* done, print a summary of ignored errors */
 	if (AH->n_errors)
-		fprintf(stderr, _("WARNING: errors ignored on restore: %d\n"),
-				AH->n_errors);
+		pg_log_warning("errors ignored on restore: %d", AH->n_errors);
 
 	/* AH may be freed in CloseArchive? */
 	exit_code = AH->n_errors ? 1 : 0;
@@ -454,7 +486,7 @@ usage(const char *progname)
 
 	printf(_("\nGeneral options:\n"));
 	printf(_("  -d, --dbname=NAME        connect to database name\n"));
-	printf(_("  -f, --file=FILENAME      output file name\n"));
+	printf(_("  -f, --file=FILENAME      output file name (- for stdout)\n"));
 	printf(_("  -F, --format=c|d|t       backup file format (should be automatic)\n"));
 	printf(_("  -l, --list               print summarized TOC of the archive\n"));
 	printf(_("  -v, --verbose            verbose mode\n"));
@@ -484,18 +516,26 @@ usage(const char *progname)
 	printf(_("  --enable-row-security        enable row security\n"));
 	printf(_("  --if-exists                  use IF EXISTS when dropping objects\n"));
 	printf(_("  --no-comments                do not restore comments\n"));
+	printf(_("  --no-data                    do not restore data\n"));
 	printf(_("  --no-data-for-failed-tables  do not restore data of tables that could not be\n"
 			 "                               created\n"));
 	printf(_("  --no-publications            do not restore publications\n"));
+	printf(_("  --no-schema                  do not restore schema\n"));
 	printf(_("  --no-security-labels         do not restore security labels\n"));
+	printf(_("  --no-statistics              do not restore statistics\n"));
 	printf(_("  --no-subscriptions           do not restore subscriptions\n"));
+	printf(_("  --no-table-access-method     do not restore table access methods\n"));
 	printf(_("  --no-tablespaces             do not restore tablespace assignments\n"));
 	printf(_("  --section=SECTION            restore named section (pre-data, data, or post-data)\n"));
+	printf(_("  --statistics-only            restore only the statistics, not schema or data\n"));
 	printf(_("  --strict-names               require table and/or schema include patterns to\n"
 			 "                               match at least one entity each\n"));
 	printf(_("  --use-set-session-authorization\n"
 			 "                               use SET SESSION AUTHORIZATION commands instead of\n"
 			 "                               ALTER OWNER commands to set ownership\n"));
+	printf(_("  --with-data                  dump the data\n"));
+	printf(_("  --with-schema                dump the schema\n"));
+	printf(_("  --with-statistics            dump the statistics\n"));
 
 	printf(_("\nConnection options:\n"));
 	printf(_("  -h, --host=HOSTNAME      database server host or socket directory\n"));
@@ -509,5 +549,6 @@ usage(const char *progname)
 			 "The options -I, -n, -N, -P, -t, -T, and --section can be combined and specified\n"
 			 "multiple times to select multiple objects.\n"));
 	printf(_("\nIf no input file name is supplied, then standard input is used.\n\n"));
-	printf(_("Report bugs to <pgsql-bugs@postgresql.org>.\n"));
+	printf(_("Report bugs to <%s>.\n"), PACKAGE_BUGREPORT);
+	printf(_("%s home page: <%s>\n"), PACKAGE_NAME, PACKAGE_URL);
 }

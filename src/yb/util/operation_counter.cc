@@ -1,4 +1,4 @@
-// Copyright (c) YugaByte, Inc.
+// Copyright (c) YugabyteDB, Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License"); you may not use this file except
 // in compliance with the License.  You may obtain a copy of the License at
@@ -15,10 +15,9 @@
 
 #include <thread>
 
-#include <glog/logging.h>
-
 #include "yb/gutil/strings/substitute.h"
 
+#include "yb/util/debug-util.h"
 #include "yb/util/debug/long_operation_tracker.h"
 #include "yb/util/logging.h"
 #include "yb/util/status_format.h"
@@ -27,8 +26,6 @@
 #include "yb/util/tsan_util.h"
 
 using namespace std::literals;
-
-using strings::Substitute;
 
 namespace yb {
 
@@ -98,24 +95,25 @@ uint64_t RWOperationCounter::Update(uint64_t delta) {
   return result;
 }
 
-bool RWOperationCounter::WaitMutexAndIncrement(CoarseTimePoint deadline) {
+RWOperationCounter::IncrementResult RWOperationCounter::WaitMutexAndIncrement(
+    CoarseTimePoint deadline) {
   if (deadline == CoarseTimePoint()) {
     deadline = CoarseMonoClock::now() + 10ms * kTimeMultiplier;
   } else if (deadline == CoarseTimePoint::min()) {
-    return false;
+    return IncrementResult::kFailed;
   }
   for (;;) {
     std::unique_lock<decltype(disable_)> lock(disable_, deadline);
     if (!lock.owns_lock()) {
-      return false;
+      return IncrementResult::kFailed;
     }
 
     if (Increment()) {
-      return true;
+      return IncrementResult::kSuccess;
     }
 
     if (counters_.load(std::memory_order_acquire) & kStopDelta) {
-      return false;
+      return IncrementResult::kStopped;
     }
   }
 }
@@ -172,9 +170,9 @@ Status RWOperationCounter::WaitForOpsToFinish(
     if (now > deadline) {
       return STATUS_FORMAT(
           TimedOut,
-          "Timed out waiting for all pending operations to complete. "
-              "$0 transactions pending. Waited for $1",
-          num_pending_ops, waited_time);
+          "$0: Timed out waiting for all pending operations to complete. "
+              "$1 transactions pending. Waited for $2",
+          resource_name_, num_pending_ops, waited_time);
     }
     if (waited_time > num_complaints * complain_interval) {
       LOG(WARNING) << Format("Waiting for $0 pending operations to complete now for $1",
@@ -188,10 +186,16 @@ Status RWOperationCounter::WaitForOpsToFinish(
   return Status::OK();
 }
 
-ScopedRWOperation::ScopedRWOperation(RWOperationCounter* counter, const CoarseTimePoint& deadline)
-    : data_{counter, counter ? counter->resource_name() : ""
+ScopedRWOperation::ScopedRWOperation(
+    RWOperationCounter* counter, const StatusHolder* abort_status_holder,
+    const CoarseTimePoint& deadline)
+    : data_{
+        .counter_ = counter,
+        .abort_status_holder_ = abort_status_holder,
+        .resource_name_ = ""
 #ifndef NDEBUG
-            , counter ? LongOperationTracker("ScopedRWOperation", 1s) : LongOperationTracker()
+        , .long_operation_tracker_ = counter
+            ? LongOperationTracker("ScopedRWOperation", 1s) : LongOperationTracker()
 #endif
       } {
   if (counter != nullptr) {
@@ -199,8 +203,14 @@ ScopedRWOperation::ScopedRWOperation(RWOperationCounter* counter, const CoarseTi
     // anyone has started an exclusive operation since we did the increment, and don't proceed
     // with this shared-ownership operation in that case.
     VTRACE(1, "$0 $1", __func__, resource_name());
-    if (!counter->Increment() && !counter->WaitMutexAndIncrement(deadline)) {
-      data_.counter_ = nullptr;
+    if (!counter->Increment()) {
+      auto result = counter->WaitMutexAndIncrement(deadline);
+      if (result != RWOperationCounter::IncrementResult::kSuccess) {
+        data_.counter_ = nullptr;
+        data_.abort_status_holder_ = nullptr;
+        data_.resource_name_ = counter->resource_name();
+        data_.stopped_ = result == RWOperationCounter::IncrementResult::kStopped;
+      }
     }
   }
 }
@@ -215,7 +225,21 @@ void ScopedRWOperation::Reset() {
     data_.counter_->Decrement();
     data_.counter_ = nullptr;
   }
-  data_.resource_name_ = "";
+  data_.abort_status_holder_ = nullptr;
+}
+
+std::string ScopedRWOperation::resource_name() const {
+  if (data_.counter_) {
+    return data_.counter_->resource_name();
+  }
+  if (!data_.resource_name_.empty()) {
+    return data_.resource_name_;
+  }
+  return "null";
+}
+
+Status ScopedRWOperation::GetAbortedStatus() const {
+  return data_.abort_status_holder_ ? data_.abort_status_holder_->GetStatus() : Status::OK();
 }
 
 ScopedRWOperationPause::ScopedRWOperationPause(
@@ -253,8 +277,14 @@ void ScopedRWOperationPause::ReleaseMutexButKeepDisabled() {
 }
 
 Status MoveStatus(const ScopedRWOperation& scoped) {
-  return scoped.ok() ? Status::OK()
-                     : STATUS_FORMAT(TryAgain, "Resource unavailable: $0", scoped.resource_name());
+  if (scoped.ok()) {
+    return Status::OK();
+  }
+  if (scoped.stopped()) {
+    return STATUS_FORMAT(
+        ShutdownInProgress, "$0 is shutting down", scoped.resource_name());
+  }
+  return STATUS_FORMAT(TryAgain, "Resource unavailable: $0", scoped.resource_name());
 }
 
 }  // namespace yb

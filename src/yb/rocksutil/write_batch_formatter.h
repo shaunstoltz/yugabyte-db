@@ -1,4 +1,4 @@
-// Copyright (c) YugaByte, Inc.
+// Copyright (c) YugabyteDB, Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License"); you may not use this file except
 // in compliance with the License.  You may obtain a copy of the License at
@@ -61,7 +61,7 @@ class WriteBatchFormatter : public rocksdb::WriteBatch::Handler {
       const rocksdb::Slice& key,
       const rocksdb::Slice& value) override;
 
-  Status Frontiers(const rocksdb::UserFrontiers& range) override;
+  Status Frontiers(const yb::storage::UserFrontiers& range) override;
 
   std::string str() { return out_.str(); }
 

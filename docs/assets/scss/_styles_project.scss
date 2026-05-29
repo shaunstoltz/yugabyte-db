@@ -9,11 +9,20 @@
 @import "./_tables.scss";
 @import "./_footer.scss";
 @import "./_yb_image.scss";
+@import "./_yb_kapa_ai.scss";
 @import "./_yb_buttons.scss";
+@import "./_yb_page_finder.scss";
 @import "./_yb_page_style.scss";
 @import "./_yb_resources.scss";
 @import "./_yb_tags.scss";
 @import "./_yb_container.scss";
+
+@font-face {
+  font-family: 'SFMonoSemibold';
+  src: url('/fonts/sf-mono/SFMonoSemibold.woff2') format('woff2');
+  font-weight: normal;
+  font-style: normal;
+}
 
 html {
   padding: 0 !important;
@@ -21,10 +30,52 @@ html {
 
 * body {
   background: #fff;
-  font-size: 15px;
+  font-size: 15.75px;
   font-weight: 400;
-  line-height: 24px;
-  color: $yb-font-darkgray;
+  line-height: 28px;
+  color: $yb-font-gray;
+  text-rendering: optimizeLegibility;
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+}
+
+a {
+  color: #3176d9;
+  text-decoration: none;
+  background-color: transparent;
+}
+
+.tab-body {
+  color: inherit;
+}
+
+.tab-body > :last-child {
+  margin-bottom: inherit;
+}
+.td-content {
+  .highlight {
+    .click-to-copy {
+      display: none;
+    }
+  }
+}
+
+.dropdown-list .dropdown-menu[data-popper-placement="top-start"] {
+  margin-bottom: -2px !important;
+}
+
+.dropdown-list .dropdown-menu[data-popper-placement="bottom-start"] {
+  margin-top: -1px !important;
+}
+
+.navbar-expand > .container,
+.navbar-expand > .container-fluid,
+.navbar-expand > .container-sm,
+.navbar-expand > .container-md,
+.navbar-expand > .container-lg,
+.navbar-expand > .container-xl {
+  padding-right: 0;
+  padding-left: 0;
 }
 
 /******* Variables for Color Theme Switcher **********/
@@ -45,6 +96,15 @@ html {
 /******* Variables for Color Theme Switcher **********/
 .td-breadcrumbs {
   margin-bottom: 20px;
+  padding-right: 120px;
+
+	@media(max-width:991px) {
+    padding-right: 0;
+  }
+
+   + .td-content .dropdown-list {
+    margin-top: 14px!important;
+  }
 
   &:has(.breadcrumb-item:only-child) {
     height: 0;
@@ -56,9 +116,13 @@ html {
 
     .breadcrumb-item {
       font-size: 12px;
-      line-height: 28px;
+      line-height: 22px;
       display: flex;
       align-items: center;
+
+      &.active {
+        color: #4e5f6d;
+      }
 
       &:only-child {
         visibility: hidden;
@@ -82,7 +146,7 @@ html {
         }
       }
 
-      + .breadcrumb-item {
+      +.breadcrumb-item {
         padding-left: 0.25rem;
 
         &::before {
@@ -99,11 +163,12 @@ html {
 @media (min-width: 992px) {
   .td-main main {
     padding-top: 116px;
-    margin-top: 32px;
+    margin-top: 52px;
   }
 }
 
 @media (min-width: 768px) {
+
   .pl-md-5,
   .px-md-5 {
     padding-left: 1.5rem !important;
@@ -128,6 +193,15 @@ html {
   img {
     max-width: 66px;
     height: auto;
+  }
+
+	> i[class^="fa-"] {
+    font-size: 75px;
+		color: $YB_ORANGE;
+  }
+
+  > i.fa-brands {
+    font-size: 86px;
   }
 }
 
@@ -375,31 +449,39 @@ body:not(.td-home) .td-main main {
     margin-top: 16px;
     display: flex;
     align-items: center;
+    flex-flow: wrap;
     justify-content: space-between;
 
     @media (max-width: 991px) {
       margin-top: 0;
+      margin-bottom: 72px;
     }
 
     @media (min-width: 991px) {
-      margin: 20px 0;
+      margin: 20px 0 72px;
+    }
+
+    .header-version-dropdown {
+      width: 100%;
+      margin: 0 0 4px 0;
     }
   }
 }
 
 @media (min-width: 992px) {
+
   .td-max-width-on-larger-screens,
-  .td-content > .highlight,
-  .td-content > .lead,
-  .td-content > h1,
-  .td-content > h2,
-  .td-content > ul,
-  .td-content > ol,
-  .td-content > p,
-  .td-content > blockquote,
-  .td-content > dl dd,
+  .td-content>.highlight,
+  .td-content>.lead,
+  .td-content>h1,
+  .td-content>h2,
+  .td-content>ul,
+  .td-content>ol,
+  .td-content>p,
+  .td-content>blockquote,
+  .td-content>dl dd,
   .td-content .footnotes,
-  .td-content > .alert {
+  .td-content>.alert {
     max-width: 100%;
   }
 }
@@ -425,6 +507,7 @@ body:not(.td-home) .td-main main {
 }
 
 .td-content {
+
   .admonition a,
   th a,
   td a,

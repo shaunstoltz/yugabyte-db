@@ -1,5 +1,16 @@
+import { XCLUSTER_UNDEFINED_LAG_NUMERIC_REPRESENTATION } from '../components/xcluster/constants';
 import { TableType } from '../redesign/helpers/dtos';
 import { isDefinedNotNull } from './ObjectUtils';
+
+export const formatYbSoftwareVersionString = (
+  ybSoftwareVersion: string,
+  includeBuildTag = false
+) => {
+  // ybSoftwareVersion is made up of a version number and a build number joined
+  // by a `-`.
+  // <version number>-<build>
+  return includeBuildTag ? `v${ybSoftwareVersion}` : `v${ybSoftwareVersion.split('-', 1)}`;
+};
 
 /**
  * Format the duration into _d _h _m _s _ms format.
@@ -73,7 +84,13 @@ export const formatDuration = (milliseconds: number) => {
  * Wraps {@link formatDuration} with special formatting for lag metrics
  */
 export const formatLagMetric = (milliseconds: number | undefined) => {
-  if (milliseconds === undefined || !isFinite(milliseconds)) {
+  if (
+    milliseconds === undefined ||
+    milliseconds === XCLUSTER_UNDEFINED_LAG_NUMERIC_REPRESENTATION
+  ) {
+    return 'Not Reported';
+  }
+  if (!isFinite(milliseconds)) {
     return 'Unreachable';
   }
 
@@ -81,3 +98,94 @@ export const formatLagMetric = (milliseconds: number | undefined) => {
 };
 export const formatSchemaName = (tableType: TableType, schemaName: string) =>
   tableType === TableType.PGSQL_TABLE_TYPE ? schemaName : '-';
+
+/**
+ *
+ * @param inputNumber number to convert
+ * @returns number in text form
+ */
+export const formatNumberToText = (inputNumber: number) => {
+  if (inputNumber < 0) return '';
+  const single_digit = ['', 'One', 'Two', 'Three', 'Four', 'Five', 'Six', 'Seven', 'Eight', 'Nine'];
+  const double_digit = [
+    'Ten',
+    'Eleven',
+    'Twelve',
+    'Thirteen',
+    'Fourteen',
+    'Fifteen',
+    'Sixteen',
+    'Seventeen',
+    'Eighteen',
+    'Nineteen'
+  ];
+  const below_hundred = [
+    'Twenty',
+    'Thirty',
+    'Forty',
+    'Fifty',
+    'Sixty',
+    'Seventy',
+    'Eighty',
+    'Ninety'
+  ];
+
+  if (inputNumber === 0) return 'Zero';
+
+  function translate(num: number) {
+    let word = '';
+    if (num < 10) {
+      word = single_digit[num] + ' ';
+    } else if (num < 20) {
+      word = double_digit[num - 10] + ' ';
+    } else if (num < 100) {
+      const remainder = translate(num % 10);
+      word = below_hundred[(num - (num % 10)) / 10 - 2] + ' ' + remainder;
+    } else if (num < 1000) {
+      word = single_digit[Math.trunc(num / 100)] + ' Hundred ' + translate(num % 100);
+    } else if (num < 1000000) {
+      word = translate(Math.trunc(num / 1000)).trim() + ' Thousand ' + translate(num % 1000);
+    } else if (num < 1000000000) {
+      word = translate(Math.trunc(num / 1000000)).trim() + ' Million ' + translate(num % 1000000);
+    } else {
+      word =
+        translate(Math.trunc(num / 1000000000)).trim() + ' Billion ' + translate(num % 1000000000);
+    }
+    return word;
+  }
+  const result = translate(inputNumber);
+  return result;
+};
+
+/**
+ *
+ * @param sizeInBytes size in bytes
+ * @returns size in bytes with units
+ */
+export const formatBytes = function (sizeInBytes: any) {
+  if (Number.isInteger(sizeInBytes)) {
+    const bytes = sizeInBytes;
+    const sizes = ['B', 'KB', 'MB', 'GB', 'TB', 'PB', 'EB'];
+    const k = 1000;
+    if (bytes <= 0) {
+      return bytes + ' ' + sizes[0];
+    }
+
+    const sizeIndex = Math.floor(Math.log(bytes) / Math.log(k));
+    return parseFloat((bytes / Math.pow(k, sizeIndex)).toFixed(2)) + ' ' + sizes[sizeIndex];
+  } else {
+    return '-';
+  }
+};
+
+/**
+ * Formats a number based on the given locale and options.
+ * Defaults to en-US locale.
+ */
+export const formatNumber = (
+  value: number,
+  options: { locale?: string; formatOptions?: Intl.NumberFormatOptions } = {}
+): string => {
+  const { locale = 'en-US', formatOptions = {} } = options;
+  return new Intl.NumberFormat(locale, formatOptions).format(value);
+};

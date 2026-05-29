@@ -1,4 +1,4 @@
-// Copyright (c) YugaByte, Inc.
+// Copyright (c) YugabyteDB, Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License"); you may not use this file except
 // in compliance with the License.  You may obtain a copy of the License at
@@ -11,19 +11,45 @@
 // under the License.
 //
 
+#include <boost/algorithm/string.hpp>
+
 #include "yb/integration-tests/cql_test_base.h"
 #include "yb/integration-tests/packed_row_test_base.h"
+#include "yb/tablet/tablet_peer.h"
+#include "yb/tserver/mini_tablet_server.h"
+#include "yb/util/backoff_waiter.h"
 
 using namespace std::literals;
 
+DECLARE_bool(enable_global_load_balancing);
+DECLARE_bool(TEST_invalidate_last_change_metadata_op);
+DECLARE_bool(TEST_keep_intent_doc_ht);
+DECLARE_int32(remote_bootstrap_begin_session_timeout_ms);
 DECLARE_int32(timestamp_history_retention_interval_sec);
+DECLARE_int32(TEST_rbs_sleep_after_taking_metadata_ms);
 
 namespace yb {
 
 class CqlPackedRowTest : public PackedRowTestBase<CqlTestBase<MiniCluster>> {
  public:
   virtual ~CqlPackedRowTest() = default;
+
+  void TestRemoteBootstrap();
 };
+
+Status CheckTableContent(
+    CassandraSession* session, const std::string& expected,
+    const std::string& where = "", const std::string& table_name = "t") {
+  auto expr = "SELECT * FROM " + table_name;
+  if (!where.empty()) {
+    expr += " WHERE " + where;
+  }
+  auto content = VERIFY_RESULT(session->ExecuteAndRenderToString(expr));
+  SCHECK_EQ(content, expected, IllegalState,
+            Format("Wrong table '$0' content$1",
+                   table_name, where.empty() ? "" : Format("(WHERE $0)", where)));
+  return Status::OK();
+}
 
 TEST_F(CqlPackedRowTest, Simple) {
   auto session = ASSERT_RESULT(EstablishSession(driver_.get()));
@@ -32,21 +58,16 @@ TEST_F(CqlPackedRowTest, Simple) {
       "CREATE TABLE t (key INT PRIMARY KEY, v1 TEXT, v2 TEXT) WITH tablets = 1"));
   ASSERT_OK(session.ExecuteQuery("INSERT INTO t (key, v1, v2) VALUES (1, 'one', 'two')"));
 
-  auto value = ASSERT_RESULT(session.ExecuteAndRenderToString(
-      "SELECT v1, v2 FROM t WHERE key = 1"));
-  ASSERT_EQ(value, "one,two");
+  ASSERT_OK(CheckTableContent(&session, "1,one,two", "key = 1"));
 
   ASSERT_OK(session.ExecuteQuery("UPDATE t SET v2 = 'three' where key = 1"));
-  value = ASSERT_RESULT(session.ExecuteAndRenderToString("SELECT v1, v2 FROM t WHERE key = 1"));
-  ASSERT_EQ(value, "one,three");
+  ASSERT_OK(CheckTableContent(&session, "1,one,three", "key = 1"));
 
   ASSERT_OK(session.ExecuteQuery("DELETE FROM t WHERE key = 1"));
-  value = ASSERT_RESULT(session.ExecuteAndRenderToString("SELECT * FROM t"));
-  ASSERT_EQ(value, "");
+  ASSERT_OK(CheckTableContent(&session, ""));
 
   ASSERT_OK(session.ExecuteQuery("INSERT INTO t (key, v2, v1) VALUES (1, 'four', 'five')"));
-  value = ASSERT_RESULT(session.ExecuteAndRenderToString("SELECT v1, v2 FROM t WHERE key = 1"));
-  ASSERT_EQ(value, "five,four");
+  ASSERT_OK(CheckTableContent(&session, "1,five,four", "key = 1"));
 
   ASSERT_NO_FATALS(CheckNumRecords(cluster_.get(), 4));
 }
@@ -172,7 +193,7 @@ TEST_F(CqlPackedRowTest, WriteTime) {
 
 TEST_F(CqlPackedRowTest, RetainPacking) {
   // Set retention interval to 0, to repack all recently flushed entries.
-  FLAGS_timestamp_history_retention_interval_sec = 0;
+  ANNOTATE_UNPROTECTED_WRITE(FLAGS_timestamp_history_retention_interval_sec) = 0;
 
   auto session = ASSERT_RESULT(EstablishSession(driver_.get()));
 
@@ -194,6 +215,197 @@ TEST_F(CqlPackedRowTest, RetainPacking) {
 
   // Compaction with flush to check that we did not lost used schema versions.
   ASSERT_OK(cluster_->CompactTablets());
+}
+
+TEST_F(CqlPackedRowTest, NonFullInsert) {
+  ANNOTATE_UNPROTECTED_WRITE(FLAGS_timestamp_history_retention_interval_sec) = 0;
+
+  auto session = ASSERT_RESULT(EstablishSession(driver_.get()));
+
+  ASSERT_OK(session.ExecuteQuery(
+      "CREATE TABLE t (key INT PRIMARY KEY, v1 INT, v2 INT) WITH tablets = 1"));
+
+  ASSERT_OK(session.ExecuteQuery("INSERT INTO t (key, v1, v2) VALUES (1, 1, 1)"));
+  ASSERT_OK(session.ExecuteQuery("INSERT INTO t (key, v2) VALUES (1, 2)"));
+
+  auto value = ASSERT_RESULT(session.ExecuteAndRenderToString("SELECT * FROM t"));
+  ASSERT_EQ(value, "1,1,2");
+}
+
+TEST_F(CqlPackedRowTest, LivenessColumnExpiry) {
+  auto session = ASSERT_RESULT(EstablishSession(driver_.get()));
+
+  ASSERT_OK(session.ExecuteQuery(
+      "CREATE TABLE t (key INT PRIMARY KEY, v1 INT) WITH tablets = 1"));
+
+  ASSERT_OK(session.ExecuteQuery("INSERT INTO t (key, v1) VALUES (1, 1) USING TTL 1"));
+  ASSERT_OK(session.ExecuteQuery("UPDATE t SET v1 = 2 WHERE key = 1"));
+
+  std::this_thread::sleep_for(1s);
+
+  auto value = ASSERT_RESULT(session.ExecuteAndRenderToString("SELECT * FROM t"));
+  ASSERT_EQ(value, "1,2");
+
+  ASSERT_OK(session.ExecuteQuery("UPDATE t SET v1 = NULL WHERE key = 1"));
+
+  value = ASSERT_RESULT(session.ExecuteAndRenderToString("SELECT * FROM t"));
+  ASSERT_EQ(value, "");
+}
+
+TEST_F(CqlPackedRowTest, BadCast) {
+  auto session = ASSERT_RESULT(EstablishSession(driver_.get()));
+
+  ASSERT_OK(session.ExecuteQuery(
+      "CREATE TABLE test_cast (h int PRIMARY KEY, t text) WITH tablets = 1"));
+
+  ASSERT_NOK(session.ExecuteQuery("INSERT INTO test_cast (h, t) values (2, cast(22 as text))"));
+}
+
+TEST_F(CqlPackedRowTest, TimestampOverExpired) {
+  auto session = ASSERT_RESULT(EstablishSession(driver_.get()));
+
+  ASSERT_OK(session.ExecuteQuery("CREATE TABLE t (h INT, r INT, v INT, PRIMARY KEY((h), r))"));
+
+  ASSERT_OK(session.ExecuteQuery("INSERT INTO t (h, r, v) values (1, 2, 3) USING TTL 1"));
+  auto write_time = ASSERT_RESULT(session.FetchValue<int64_t>(
+      "SELECT writetime(v) FROM t WHERE h = 1 AND r = 2"));
+  ASSERT_OK(CheckTableContent(&session, "1,2,3", "h = 1 AND r = 2"));
+
+  std::this_thread::sleep_for(1s);
+  ASSERT_OK(CheckTableContent(&session, ""));
+
+  ASSERT_OK(session.ExecuteQuery(
+      "INSERT INTO t (h, r, v) values (1, 2, 4) USING TIMESTAMP " +
+      std::to_string(write_time - 1)));
+  ASSERT_OK(CheckTableContent(&session, ""));
+}
+
+TEST_F(CqlPackedRowTest, CompactUpdateToNull) {
+  ANNOTATE_UNPROTECTED_WRITE(FLAGS_timestamp_history_retention_interval_sec) = 0;
+
+  auto session = ASSERT_RESULT(EstablishSession(driver_.get()));
+
+  ASSERT_OK(session.ExecuteQuery(
+      "CREATE TABLE t (key INT PRIMARY KEY, v1 INT) WITH tablets = 1"));
+
+  ASSERT_OK(session.ExecuteQuery("INSERT INTO t (key, v1) VALUES (1, 1)"));
+  ASSERT_OK(session.ExecuteQuery("UPDATE t SET v1 = NULL WHERE key = 1"));
+
+  ASSERT_OK(cluster_->CompactTablets());
+
+  auto lines = DumpDocDBToStrings(cluster_.get(), ListPeersFilter::kLeaders);
+  ASSERT_EQ(lines.size(), 1);
+  ASSERT_TRUE(boost::algorithm::ends_with(
+      lines[0], Format("{ $0: NULL }\n", kFirstColumnId + 1))) << lines[0];
+}
+
+TEST_F(CqlPackedRowTest, CompactAfterTransaction) {
+  ANNOTATE_UNPROTECTED_WRITE(FLAGS_TEST_keep_intent_doc_ht) = true;
+  ANNOTATE_UNPROTECTED_WRITE(FLAGS_timestamp_history_retention_interval_sec) = 0;
+
+  auto session = ASSERT_RESULT(EstablishSession(driver_.get()));
+
+  ASSERT_OK(session.ExecuteQuery(
+      "CREATE TABLE t (key INT PRIMARY KEY, v1 TEXT, v2 TEXT) "
+      "WITH tablets = 1 AND transactions = {'enabled' : true};"));
+  ASSERT_OK(session.ExecuteQuery("CREATE INDEX t_v1 ON t(v1)"));
+  ASSERT_OK(session.ExecuteQuery("INSERT INTO t (key, v1, v2) VALUES (1, 'one', 'odin')"));
+
+  ASSERT_OK(session.ExecuteQueryFormat("UPDATE t SET v2 = 'dva' WHERE key = 1"));
+
+  ASSERT_OK(cluster_->CompactTablets());
+
+  ASSERT_OK(CheckTableContent(&session, "1,one,dva"));
+}
+
+TEST_F(CqlPackedRowTest, CompactWithoutLivenessColumn) {
+  ANNOTATE_UNPROTECTED_WRITE(FLAGS_timestamp_history_retention_interval_sec) = 0;
+
+  auto session = ASSERT_RESULT(EstablishSession(driver_.get()));
+
+  ASSERT_OK(session.ExecuteQuery(
+      "CREATE TABLE t (key INT PRIMARY KEY, value TEXT)WITH tablets = 1;"));
+  ASSERT_OK(session.ExecuteQuery("UPDATE t SET value = 'odin' WHERE key = 1"));
+  ASSERT_OK(cluster_->CompactTablets());
+  ASSERT_OK(session.ExecuteQueryFormat("UPDATE t SET value = NULL WHERE key = 1"));
+  ASSERT_OK(CheckTableContent(&session, ""));
+}
+
+void CqlPackedRowTest::TestRemoteBootstrap() {
+  // Global load balancing could break leader step down at the end of this test.
+  ANNOTATE_UNPROTECTED_WRITE(FLAGS_enable_global_load_balancing) = false;
+  ANNOTATE_UNPROTECTED_WRITE(FLAGS_remote_bootstrap_begin_session_timeout_ms) = 50000;
+  ANNOTATE_UNPROTECTED_WRITE(FLAGS_TEST_rbs_sleep_after_taking_metadata_ms) = 500;
+  constexpr size_t kNewTServerIdx = 3;
+
+  auto session = ASSERT_RESULT(EstablishSession(driver_.get()));
+
+  ASSERT_OK(session.ExecuteQuery(
+      "CREATE TABLE t (key INT PRIMARY KEY, v1 INT) WITH tablets = 1"));
+
+  ASSERT_OK(cluster_->AddTabletServer());
+  // Force load balancer to move one replica to newly added tserver.
+  // Starting remote bootstrap process.
+  ASSERT_OK(cluster_->AddTServerToBlacklist(0));
+
+  ASSERT_OK(session.ExecuteQuery("INSERT INTO t (key, v1) VALUES (1, 1)"));
+
+  auto leaders = ListActiveTabletLeadersPeers(cluster_.get());
+  ASSERT_EQ(leaders.size(), 1);
+
+  // Perform a lot of alters to the table to get the following situation during remote
+  // bootstrap session initialization.
+  // Alter table was applied after tablet metadata was taken, but before checkpoint was created.
+  for (int i = 0;; ++i) {
+    if ((i & 1) == 0) {
+      ASSERT_OK(session.ExecuteQuery("ALTER TABLE t ADD v2 INT"));
+      ASSERT_OK(session.ExecuteQueryFormat("INSERT INTO t (key, v1, v2) VALUES ($0, $0, $0)", i));
+    } else {
+      ASSERT_OK(session.ExecuteQuery("ALTER TABLE t DROP v2"));
+      ASSERT_OK(session.ExecuteQueryFormat("INSERT INTO t (key, v1) VALUES ($0, $0)", i));
+    }
+
+    auto peers = cluster_->GetTabletPeers(kNewTServerIdx);
+    auto bootstrapped = false;
+    for (const auto& peer : peers) {
+      if (peer->tablet_id() == leaders[0]->tablet_id() && peer->CheckRunning().ok()) {
+        bootstrapped = true;
+        break;
+      }
+    }
+    if (bootstrapped) {
+      break;
+    }
+  }
+
+  auto new_server_uuid = cluster_->mini_tablet_server(kNewTServerIdx)->fs_manager().uuid();
+  ASSERT_OK(WaitFor([this, &new_server_uuid] {
+    auto leaders = ListActiveTabletLeadersPeers(cluster_.get());
+    if (leaders.size() != 1) {
+      LOG(WARNING) << "Wrong number of leaders: " << AsString(leaders, [](const auto& peer) {
+        return Format("T $0 P $1", peer->tablet_id(), peer->permanent_uuid());
+      });
+      return false;
+    }
+    if (leaders[0]->permanent_uuid() == new_server_uuid) {
+      return true;
+    }
+    WARN_NOT_OK(StepDown(leaders[0], new_server_uuid, ForceStepDown::kTrue),
+                "Step down failed");
+    return false;
+  }, 20s * kTimeMultiplier, "Wait for leader change to " + new_server_uuid));
+
+  auto value = ASSERT_RESULT(session.ExecuteAndRenderToString("SELECT * FROM t"));
+  LOG(INFO) << "Value: " << value;
+}
+
+TEST_F(CqlPackedRowTest, RemoteBootstrap) {
+  ANNOTATE_UNPROTECTED_WRITE(FLAGS_TEST_invalidate_last_change_metadata_op) = true;
+  TestRemoteBootstrap();
+}
+
+TEST_F(CqlPackedRowTest, RemoteBootstrapWithNewChangeMetadataReplayLogic) {
+  TestRemoteBootstrap();
 }
 
 } // namespace yb

@@ -1,4 +1,4 @@
-// Copyright (c) YugaByte, Inc.
+// Copyright (c) YugabyteDB, Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License"); you may not use this file except
 // in compliance with the License.  You may obtain a copy of the License at
@@ -18,7 +18,6 @@
 #include "yb/util/slice.h"
 
 namespace yb {
-namespace util {
 
 class BigNumDeleter {
  public:
@@ -189,6 +188,4 @@ class VarInt {
 
 std::ostream& operator<<(std::ostream& os, const VarInt& v);
 
-
-} // namespace util
 } // namespace yb

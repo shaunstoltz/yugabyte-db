@@ -1,4 +1,4 @@
-// Copyright (c) YugaByte, Inc.
+// Copyright (c) YugabyteDB, Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License"); you may not use this file except
 // in compliance with the License.  You may obtain a copy of the License at
@@ -20,7 +20,7 @@
 #include "yb/client/yb_op.h"
 
 #include "yb/common/common.pb.h"
-#include "yb/common/ql_protocol.pb.h"
+#include "yb/common/ql_protocol.messages.h"
 #include "yb/common/ql_value.h"
 #include "yb/common/schema.h"
 
@@ -35,11 +35,9 @@
 namespace yb {
 namespace tools {
 
-using client::YBSchema;
 using client::YBTableName;
 using google::protobuf::RepeatedPtrField;
 using master::TabletLocationsPB;
-using std::map;
 using std::string;
 using std::vector;
 
@@ -97,8 +95,8 @@ Status YBPartitionGenerator::LookupTabletIdWithTokenizer(const CsvTokenizer& tok
         "key, found: $0 need atleast $1", ncolumns, schema.num_hash_key_columns());
   }
 
-  std::unique_ptr<client::YBqlReadOp> yb_op(table_->NewQLRead());
-  QLReadRequestPB* ql_read = yb_op->mutable_request();
+  std::unique_ptr<client::YBqlReadOp> yb_op(table_->NewQLRead(SharedThreadSafeArena()));
+  auto* ql_read = yb_op->mutable_request();
 
   // Set the hash column values to compute the partition key.
   auto it = tokenizer.begin();
@@ -120,7 +118,7 @@ Status YBPartitionGenerator::LookupTabletIdWithTokenizer(const CsvTokenizer& tok
       YB_SET_INT_VALUE(value_pb, *it, 32);
       YB_SET_INT_VALUE(value_pb, *it, 64);
       case DataType::STRING:
-        value_pb->set_string_value(*it);
+        value_pb->dup_string_value(*it);
         break;
       case DataType::TIMESTAMP: {
         auto ts = TimestampFromString(*it);

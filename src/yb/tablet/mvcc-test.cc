@@ -15,9 +15,9 @@
 // specific language governing permissions and limitations
 // under the License.
 //
-// The following only applies to changes made to this file as part of YugaByte development.
+// The following only applies to changes made to this file as part of YugabyteDB development.
 //
-// Portions Copyright (c) YugaByte, Inc.
+// Portions Copyright (c) YugabyteDB, Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License"); you may not use this file except
 // in compliance with the License.  You may obtain a copy of the License at
@@ -32,7 +32,7 @@
 
 #include <sstream>
 
-#include <glog/logging.h>
+#include "yb/util/logging.h"
 
 #include "yb/gutil/casts.h"
 
@@ -180,7 +180,7 @@ void MvccTest::RunRandomizedTest(bool use_ht_lease) {
 
   std::atomic<bool> stopped { false };
 
-  const auto get_count = [&counts](OpType op) { return counts[to_underlying(op)]; };
+  const auto get_count = [&counts](OpType op) { return counts[std::to_underlying(op)]; };
   LogicalClock* const logical_clock = down_cast<LogicalClock*>(clock_.get());
 
   std::atomic<uint64_t> max_ht_lease{0};
@@ -270,7 +270,7 @@ void MvccTest::RunRandomizedTest(bool use_ht_lease) {
         queue[alive[idx].ht] = idx;
       }
     }
-    ++counts[to_underlying(ops.back().type)];
+    ++counts[std::to_underlying(ops.back().type)];
 
     HybridTime safe_time;
     if (alive.empty()) {

@@ -1,4 +1,4 @@
-// Copyright (c) YugaByte, Inc.
+// Copyright (c) YugabyteDB, Inc.
 
 package com.yugabyte.yw.common;
 
@@ -9,15 +9,19 @@ import static org.hamcrest.CoreMatchers.equalTo;
 import static org.hamcrest.CoreMatchers.notNullValue;
 import static org.junit.Assert.assertNotEquals;
 import static org.junit.Assert.assertThat;
+import static org.mockito.ArgumentMatchers.eq;
 import static org.mockito.Mockito.when;
 
 import com.typesafe.config.Config;
+import com.yugabyte.yw.common.config.GlobalConfKeys;
+import com.yugabyte.yw.common.config.RuntimeConfGetter;
 import com.yugabyte.yw.common.config.RuntimeConfigFactory;
 import java.io.File;
 import java.io.IOException;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.Paths;
+import java.time.Duration;
 import java.util.ArrayList;
 import java.util.HashMap;
 import java.util.List;
@@ -34,13 +38,13 @@ import org.mockito.junit.MockitoJUnitRunner;
 public class ShellProcessHandlerTest extends TestCase {
   private ShellProcessHandler shellProcessHandler;
 
-  @Mock play.Configuration appConfig;
-
   @Mock RuntimeConfigFactory mockRuntimeConfigFactory;
 
   @Mock Config mockConfig;
 
   @Mock PlatformScheduler mockPlatformScheduler;
+
+  @Mock RuntimeConfGetter runtimeConfGetter;
 
   static String TMP_STORAGE_PATH = "/tmp/yugaware_tests/spht_certs";
   static final String COMMAND_OUTPUT_LOGS_DELETE = "yb.logs.cmdOutputDelete";
@@ -48,13 +52,22 @@ public class ShellProcessHandlerTest extends TestCase {
   @Before
   public void beforeTest() {
     new File(TMP_STORAGE_PATH).mkdirs();
-    when(appConfig.getString("yb.devops.home")).thenReturn(TMP_STORAGE_PATH);
+    when(mockConfig.getString("yb.devops.home")).thenReturn(TMP_STORAGE_PATH);
     when(mockRuntimeConfigFactory.globalRuntimeConf()).thenReturn(mockConfig);
     when(mockConfig.getBoolean(COMMAND_OUTPUT_LOGS_DELETE)).thenReturn(true);
-    when(appConfig.getBytes(YB_LOGS_MAX_MSG_SIZE)).thenReturn(2000L);
+    when(mockConfig.getBytes(YB_LOGS_MAX_MSG_SIZE)).thenReturn(2000L);
+    when(runtimeConfGetter.getGlobalConf(eq(GlobalConfKeys.ybTmpDirectoryPath))).thenReturn("/tmp");
+    when(runtimeConfGetter.getGlobalConf(eq(GlobalConfKeys.nodeAgentConnectionKeepAliveTime)))
+        .thenReturn(Duration.ofSeconds(10));
+    when(runtimeConfGetter.getGlobalConf(eq(GlobalConfKeys.nodeAgentConnectionKeepAliveTimeout)))
+        .thenReturn(Duration.ofSeconds(10));
+    when(runtimeConfGetter.getGlobalConf(eq(GlobalConfKeys.nodeAgentDescribePollDeadline)))
+        .thenReturn(Duration.ofSeconds(2));
+    when(runtimeConfGetter.getGlobalConf(eq(GlobalConfKeys.nodeAgentServerRequestLogLevel)))
+        .thenReturn(-1);
     ShellLogsManager shellLogsManager =
-        new ShellLogsManager(mockPlatformScheduler, mockRuntimeConfigFactory);
-    shellProcessHandler = new ShellProcessHandler(appConfig, shellLogsManager);
+        new ShellLogsManager(mockPlatformScheduler, mockRuntimeConfigFactory, runtimeConfGetter);
+    shellProcessHandler = new ShellProcessHandler(mockConfig, runtimeConfGetter, shellLogsManager);
   }
 
   @After
@@ -85,7 +98,7 @@ public class ShellProcessHandlerTest extends TestCase {
 
   @Test
   public void testRunWithInvalidDevopsHome() {
-    when(appConfig.getString("yb.devops.home")).thenReturn("/foo");
+    when(mockConfig.getString("yb.devops.home")).thenReturn("/foo");
     List<String> command = new ArrayList<String>();
     command.add("pwd");
     ShellResponse response = shellProcessHandler.run(command, new HashMap<>());

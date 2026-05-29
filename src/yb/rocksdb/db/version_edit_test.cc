@@ -3,9 +3,9 @@
 //  LICENSE file in the root directory of this source tree. An additional grant
 //  of patent rights can be found in the PATENTS file in the same directory.
 //
-// The following only applies to changes made to this file as part of YugaByte development.
+// The following only applies to changes made to this file as part of YugabyteDB development.
 //
-// Portions Copyright (c) YugaByte, Inc.
+// Portions Copyright (c) YugabyteDB, Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License"); you may not use this file except
 // in compliance with the License.  You may obtain a copy of the License at
@@ -25,9 +25,13 @@
 
 #include <string>
 #include <gtest/gtest.h>
+
 #include "yb/rocksdb/env.h"
-#include "yb/util/test_macros.h"
 #include "yb/rocksdb/util/testutil.h"
+
+#include "yb/storage/storage_test_util.h"
+
+#include "yb/util/test_macros.h"
 
 namespace rocksdb {
 
@@ -49,7 +53,7 @@ void TestEncodeDecode(const VersionEdit &edit) {
   ASSERT_EQ(encoded, encoded2);
 }
 
-const uint64_t kBig = 1ull << 50;
+constexpr uint64_t kBig = 1ull << 50;
 
 } // namespace
 
@@ -60,7 +64,7 @@ void SetupVersionEdit(VersionEdit* edit) {
   edit->SetLogNumber(kBig + 100);
   edit->SetNextFile(kBig + 200);
   edit->SetLastSequence(kBig + 1000);
-  test::TestUserFrontier frontier(kBig + 100);
+  yb::storage::TestUserFrontier frontier(kBig + 100);
   edit->UpdateFlushedFrontier(frontier.Clone());
 }
 
@@ -87,8 +91,6 @@ TEST_F(VersionEditTest, EncodeDecode) {
 }
 
 TEST_F(VersionEditTest, EncodeDecodeNewFile4) {
-  static const uint64_t kBig = 1ull << 50;
-
   VersionEdit edit;
   edit.AddTestFile(3,
                    FileDescriptor(300, 3, 100, 30),
@@ -127,7 +129,6 @@ TEST_F(VersionEditTest, EncodeDecodeNewFile4) {
 }
 
 TEST_F(VersionEditTest, ForwardCompatibleNewFile4) {
-  static const uint64_t kBig = 1ull << 50;
   VersionEdit edit;
   edit.AddTestFile(3,
                    FileDescriptor(300, 3, 100, 30),
@@ -160,7 +161,6 @@ TEST_F(VersionEditTest, ForwardCompatibleNewFile4) {
 }
 
 TEST_F(VersionEditTest, NewFile4NotSupportedField) {
-  static const uint64_t kBig = 1ull << 50;
   VersionEdit edit;
   edit.AddTestFile(3,
                    FileDescriptor(300, 3, 100, 30),

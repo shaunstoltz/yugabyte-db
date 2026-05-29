@@ -1,16 +1,17 @@
 package com.yugabyte.yw.models.helpers.provider;
 
-import java.util.HashMap;
-import java.util.Map;
-
 import com.fasterxml.jackson.annotation.JsonAlias;
 import com.fasterxml.jackson.annotation.JsonIgnore;
 import com.fasterxml.jackson.annotation.JsonIgnoreProperties;
 import com.fasterxml.jackson.annotation.JsonInclude;
 import com.google.common.collect.ImmutableMap;
+import com.yugabyte.yw.common.CloudProviderHelper.EditableInUseProvider;
+import com.yugabyte.yw.models.common.YbaApi;
+import com.yugabyte.yw.models.common.YbaApi.YbaApiVisibility;
 import com.yugabyte.yw.models.helpers.CloudInfoInterface;
-
 import io.swagger.annotations.ApiModelProperty;
+import java.util.HashMap;
+import java.util.Map;
 import lombok.Data;
 
 @Data
@@ -23,7 +24,18 @@ public class OnPremCloudInfo implements CloudInfoInterface {
 
   @JsonAlias("YB_HOME_DIR")
   @ApiModelProperty
+  @EditableInUseProvider(name = "Yugabyte Home directory", allowed = false)
   public String ybHomeDir;
+
+  @YbaApi(visibility = YbaApiVisibility.PREVIEW, sinceYBAVersion = "2.25.1.0")
+  @ApiModelProperty(value = "WARNING: This is a preview API that could change.")
+  @EditableInUseProvider(name = "Configure and use clockbound", allowed = true)
+  public boolean useClockbound;
+
+  @YbaApi(visibility = YbaApiVisibility.PREVIEW, sinceYBAVersion = "2026.1")
+  @ApiModelProperty(value = "WARNING: This is a preview API that could change.")
+  @EditableInUseProvider(name = "Enable multi-tenancy", allowed = true)
+  public boolean enableMultiTenancy;
 
   @JsonIgnore
   public Map<String, String> getEnvVars() {
@@ -49,6 +61,11 @@ public class OnPremCloudInfo implements CloudInfoInterface {
 
   @JsonIgnore
   public void withSensitiveDataMasked() {
+    // Pass
+  }
+
+  @JsonIgnore
+  public void mergeMaskedFields(CloudInfoInterface providerCloudInfo) {
     // Pass
   }
 }

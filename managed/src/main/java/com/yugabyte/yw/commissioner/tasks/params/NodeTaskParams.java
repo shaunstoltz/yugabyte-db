@@ -1,4 +1,4 @@
-// Copyright (c) YugaByte, Inc.
+// Copyright (c) YugabyteDB, Inc.
 
 package com.yugabyte.yw.commissioner.tasks.params;
 
@@ -30,9 +30,19 @@ public class NodeTaskParams extends UniverseDefinitionTaskParams implements INod
   public String instanceType;
 
   public boolean useSystemd;
-  // Using custom ssh user
 
-  public String sshUserOverride;
+  public Integer sshPortOverride;
+
+  public Map<String, String> tags;
+
+  public boolean isMaster;
+
+  public boolean isTserver;
+
+  // Target user intent for a node.
+  // Since we are not writing new userIntent into the universe till the end of the edit task,
+  // Need to keep track of it here.
+  public UserIntent userIntent;
 
   @JsonIgnore private AvailabilityZone zone;
 

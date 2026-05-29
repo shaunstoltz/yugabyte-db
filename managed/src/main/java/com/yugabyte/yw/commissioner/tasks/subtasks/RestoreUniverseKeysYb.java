@@ -1,13 +1,13 @@
 package com.yugabyte.yw.commissioner.tasks.subtasks;
 
-import com.fasterxml.jackson.databind.JsonNode;
 import com.yugabyte.yw.commissioner.BaseTaskDependencies;
 import com.yugabyte.yw.commissioner.RestoreUniverseKeysTaskBase;
 import com.yugabyte.yw.common.kms.EncryptionAtRestManager;
 import com.yugabyte.yw.common.kms.EncryptionAtRestManager.RestoreKeyResult;
+import com.yugabyte.yw.common.kms.util.EncryptionAtRestUtil;
+import com.yugabyte.yw.common.kms.util.EncryptionAtRestUtil.EncryptionKey;
 import com.yugabyte.yw.forms.RestoreBackupParams;
 import com.yugabyte.yw.models.Universe;
-import java.util.function.Consumer;
 import javax.inject.Inject;
 import lombok.extern.slf4j.Slf4j;
 import org.yb.client.YBClient;
@@ -28,16 +28,10 @@ public class RestoreUniverseKeysYb extends RestoreUniverseKeysTaskBase {
 
   @Override
   public void run() {
-    Universe universe = Universe.getOrBadRequest(taskParams().universeUUID);
-    String hostPorts = universe.getMasterAddresses();
-    String certificate = universe.getCertificateNodetoNode();
-    YBClient client = null;
-    byte[] activeKeyRef = null;
-    try {
-      log.info("Running {}: hostPorts={}.", getName(), hostPorts);
-      client = ybService.getClient(hostPorts, certificate);
-
-      Consumer<JsonNode> restoreToUniverse = getUniverseKeysConsumer();
+    Universe universe = Universe.getOrBadRequest(taskParams().getUniverseUUID());
+    EncryptionKey activeKeyRef = null;
+    try (YBClient client = ybService.getUniverseClient(universe)) {
+      log.info("Running {}: masterAddresses={}.", getName(), universe.getMasterAddresses());
 
       // Retrieve the universe key set (if one is set) to restore universe to original state
       // after restoration of backup completes
@@ -45,7 +39,10 @@ public class RestoreUniverseKeysYb extends RestoreUniverseKeysTaskBase {
 
       RestoreKeyResult restoreResult =
           keyManager.restoreUniverseKeyHistory(
-              taskParams().backupStorageInfoList.get(0).storageLocation, restoreToUniverse);
+              ybService,
+              taskParams().getUniverseUUID(),
+              taskParams().kmsConfigUUID,
+              taskParams().backupStorageInfoList.get(0).storageLocation);
 
       switch (restoreResult) {
         case RESTORE_SKIPPED:
@@ -55,7 +52,7 @@ public class RestoreUniverseKeysYb extends RestoreUniverseKeysTaskBase {
           log.info(
               String.format(
                   "Error occurred restoring encryption keys to universe %s",
-                  taskParams().universeUUID));
+                  taskParams().getUniverseUUID()));
         case RESTORE_SUCCEEDED:
           ///////////////
           // Restore state of encryption in universe having backup restored into
@@ -64,7 +61,9 @@ public class RestoreUniverseKeysYb extends RestoreUniverseKeysTaskBase {
             // Ensure the active universe key in YB is set back to what it was
             // before restore flow
             sendKeyToMasters(
-                activeKeyRef, universe.getUniverseDetails().encryptionAtRestConfig.kmsConfigUUID);
+                universe.getUniverseDetails().encryptionAtRestConfig.kmsConfigUUID,
+                activeKeyRef.getKeyBytes(),
+                activeKeyRef.getEncryptionContext());
           } else if (client.isEncryptionEnabled().getFirst()) {
             // If there is no active keyRef but encryption is enabled,
             // it means that the universe being restored into was not
@@ -72,14 +71,14 @@ public class RestoreUniverseKeysYb extends RestoreUniverseKeysTaskBase {
             // to that state
             client.disableEncryptionAtRestInMemory();
             universe.incrementVersion();
+            // Need to set KMS config UUID in the target universe since there are universe keys now.
+            EncryptionAtRestUtil.updateUniverseKMSConfigIfNotExists(
+                universe.getUniverseUUID(), taskParams().kmsConfigUUID);
           }
       }
     } catch (Exception e) {
       log.error("{} hit error : {}", getName(), e.getMessage(), e);
       throw new RuntimeException(e);
-    } finally {
-      // Close client
-      if (client != null) ybService.closeClient(client, hostPorts);
     }
   }
 }

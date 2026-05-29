@@ -13,6 +13,10 @@ type NodeData struct {
 
     IsTserver bool `json:"is_tserver"`
 
+    IsReadReplica bool `json:"is_read_replica"`
+
+    PreferenceOrder int32 `json:"preference_order"`
+
     IsMasterUp bool `json:"is_master_up"`
 
     IsBootstrapping bool `json:"is_bootstrapping"`

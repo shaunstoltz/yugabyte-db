@@ -3,9 +3,9 @@
 //  LICENSE file in the root directory of this source tree. An additional grant
 //  of patent rights can be found in the PATENTS file in the same directory.
 //
-// The following only applies to changes made to this file as part of YugaByte development.
+// The following only applies to changes made to this file as part of YugabyteDB development.
 //
-// Portions Copyright (c) YugaByte, Inc.
+// Portions Copyright (c) YugabyteDB, Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License"); you may not use this file except
 // in compliance with the License.  You may obtain a copy of the License at
@@ -27,8 +27,10 @@
 #define __STDC_FORMAT_MACROS
 #endif
 
-#include <inttypes.h>
-#include <stdio.h>
+#include <cinttypes>
+#include <cstdio>
+
+#include "yb/util/logging.h"
 #include "yb/util/slice.h"
 
 namespace rocksdb {
@@ -102,6 +104,13 @@ void AppendEscapedStringTo(std::string* str, const Slice& value) {
       str->append(buf);
     }
   }
+}
+
+std::string BytesToHumanString(uint64_t bytes) {
+  char buf[32];
+  const auto len = AppendHumanBytes(bytes, buf, sizeof(buf));
+  DCHECK_GT(len, 0);
+  return len > 0 ? std::string{ buf } : std::string{};
 }
 
 std::string NumberToString(uint64_t num) {

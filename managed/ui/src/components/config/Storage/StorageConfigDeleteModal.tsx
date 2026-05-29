@@ -1,15 +1,16 @@
 /*
  * Created on Thu Mar 24 2022
  *
- * Copyright 2021 YugaByte, Inc. and Contributors
+ * Copyright 2021 YugabyteDB, Inc. and Contributors
  * Licensed under the Polyform Free Trial License 1.0.0 (the "License")
  * You may not use this file except in compliance with the License. You may obtain a copy of the License at
  * http://github.com/YugaByte/yugabyte-db/blob/master/licenses/POLYFORM-FREE-TRIAL-LICENSE-1.0.0.txt
  */
 
-import React, { FC } from 'react';
+import { FC } from 'react';
 import { useQuery } from 'react-query';
-import { getBackupsList, IBackup } from '../../backupv2';
+import { IBackup } from '../../backupv2';
+import { getBackupsList } from '../../backupv2/common/BackupAPI';
 import { YBModal } from '../../common/forms/fields';
 import { YBLoading } from '../../common/indicators';
 import KeyIcon from '../../users/icons/warning_icon';
@@ -83,8 +84,8 @@ export const StorageConfigDeleteModal: FC<StorageConfigDeleteModalProps> = ({
         associatedBackups?.length !== 0
           ? null
           : () => {
-            onDelete();
-          }
+              onDelete();
+            }
       }
       visible={visible}
     >

@@ -1,10 +1,11 @@
-// Copyright (c) YugaByte, Inc.
+// Copyright (c) YugabyteDB, Inc.
 
 package com.yugabyte.yw.commissioner.tasks.subtasks;
 
 import com.google.api.client.util.Throwables;
 import com.yugabyte.yw.commissioner.AbstractTaskBase;
 import com.yugabyte.yw.commissioner.BaseTaskDependencies;
+import com.yugabyte.yw.common.config.UniverseConfKeys;
 import com.yugabyte.yw.forms.UniverseTaskParams;
 import com.yugabyte.yw.models.Universe;
 import java.time.Duration;
@@ -43,20 +44,17 @@ public class WaitForLeaderBlacklistCompletion extends AbstractTaskBase {
   @Override
   public void run() {
     String errorMsg = null;
-    YBClient client = null;
     int numErrors = 0;
     double percent = 0;
     int numIters = 0;
     double epsilon = 0.00001d;
     // Get the master addresses and certificate info.
-    Universe universe = Universe.getOrBadRequest(taskParams().universeUUID);
-    String masterAddresses = universe.getMasterAddresses();
-    String certificate = universe.getCertificateNodetoNode();
-    log.info("Running {} on masterAddress = {}.", getName(), masterAddresses);
+    Universe universe = Universe.getOrBadRequest(taskParams().getUniverseUUID());
+    log.info("Running {} on masterAddress = {}.", getName(), universe.getMasterAddresses());
     long startTime = System.currentTimeMillis();
-    try {
-
-      client = ybService.getClient(masterAddresses, certificate);
+    boolean failOnTimeout =
+        confGetter.getConfForScope(universe, UniverseConfKeys.leaderBlacklistFailOnTimeout);
+    try (YBClient client = ybService.getUniverseClient(universe)) {
       log.info("Leader Master UUID={}.", client.getLeaderMasterUUID());
 
       while (((double) 100 - percent) > epsilon) {
@@ -99,14 +97,19 @@ public class WaitForLeaderBlacklistCompletion extends AbstractTaskBase {
               numIters,
               percent,
               numErrors);
+          if (failOnTimeout) {
+            throw new RuntimeException(
+                String.format(
+                    "Wait for leader blacklisting timed out after %d milliseconds. Percent"
+                        + " completed: %f%%. Remaining tablets to leader blacklist: %d.",
+                    timeElaped, percent, response.getRemaining()));
+          }
           break;
         }
       }
     } catch (Exception e) {
       log.error("{} hit error {}.", getName(), e.getMessage(), e);
       Throwables.propagate(e);
-    } finally {
-      ybService.closeClient(client, masterAddresses);
     }
 
     if (errorMsg != null) {

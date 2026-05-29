@@ -1,4 +1,4 @@
-// Copyright (c) YugaByte, Inc.
+// Copyright (c) YugabyteDB, Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License"); you may not use this file except
 // in compliance with the License.  You may obtain a copy of the License at
@@ -86,6 +86,10 @@ public final class Checkers {
 
   public static ValueChecker<Double> greaterOrEqual(double value) {
     return doubleChecker(Range.atLeast(value));
+  }
+
+  public static ValueChecker<Double> closed(double lower_value, double upper_value) {
+    return doubleChecker(Range.closed(lower_value, upper_value));
   }
 
   // Array

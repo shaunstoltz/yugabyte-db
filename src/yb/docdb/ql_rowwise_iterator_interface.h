@@ -1,4 +1,4 @@
-// Copyright (c) YugaByte, Inc.
+// Copyright (c) YugabyteDB, Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License"); you may not use this file except
 // in compliance with the License.  You may obtain a copy of the License at
@@ -15,14 +15,11 @@
 
 #include <memory>
 
-#include "boost/function/function_fwd.hpp"
-#include "boost/optional.hpp"
-
 #include "yb/common/common_fwd.h"
 
 #include "yb/docdb/docdb_fwd.h"
 
-#include "yb/util/status_fwd.h"
+#include "yb/util/result.h"
 
 namespace yb {
 
@@ -30,31 +27,37 @@ class Slice;
 
 namespace docdb {
 
-YB_STRONGLY_TYPED_BOOL(ContinueScan);
-using YQLScanCallback = boost::function<Result<ContinueScan>(const QLTableRow& row)>;
+YB_STRONGLY_TYPED_BOOL(UpdateFilterKey);
+
+YB_DEFINE_ENUM(ReadKey, (kCurrent)(kNext));
 
 class YQLRowwiseIteratorIf {
  public:
   typedef std::unique_ptr<YQLRowwiseIteratorIf> UniPtr;
-  virtual ~YQLRowwiseIteratorIf() {}
+  virtual ~YQLRowwiseIteratorIf() = default;
 
   //------------------------------------------------------------------------------------------------
   // Pure virtual API methods.
   //------------------------------------------------------------------------------------------------
   // Checks whether next row exists.
-  virtual Result<bool> HasNext() = 0;
+  Result<bool> FetchNext(
+      qlexpr::QLTableRow* table_row,
+      const dockv::ReaderProjection* projection = nullptr,
+      qlexpr::QLTableRow* static_row = nullptr,
+      const dockv::ReaderProjection* static_projection = nullptr) {
+    return DoFetchNext(table_row, projection, static_row, static_projection);
+  }
 
-  // Skip the current row.
-  virtual void SkipRow() = 0;
+  virtual Result<bool> PgFetchNext(dockv::PgTableRow* table_row) = 0;
 
   // If restart is required returns restart hybrid time, based on iterated records.
   // Otherwise returns invalid hybrid time.
-  virtual HybridTime RestartReadHt() = 0;
+  virtual Result<ReadRestartData> GetReadRestartData() = 0;
+
+  // Returns max seen hybrid time. Only used by tests for validation.
+  virtual HybridTime TEST_MaxSeenHt();
 
   virtual std::string ToString() const = 0;
-
-  // Could be subset of actual table schema.
-  virtual const Schema& schema() const = 0;
 
   //------------------------------------------------------------------------------------------------
   // Virtual API methods.
@@ -63,36 +66,36 @@ class YQLRowwiseIteratorIf {
 
   // Apache Cassandra Only: CQL supports static columns while all other intefaces do not.
   // Is the next row column to read a static column?
-  virtual bool IsNextStaticColumn() const {
+  virtual bool IsFetchedRowStatic() const {
     return false;
   }
 
   // Retrieves the next key to read after the iterator finishes for the given page.
-  virtual Status GetNextReadSubDocKey(SubDocKey* sub_doc_key);
+  virtual Result<dockv::SubDocKey> GetSubDocKey(ReadKey read_key = ReadKey::kNext);
 
   // Returns the tuple id of the current tuple. See DocRowwiseIterator for details.
-  virtual Result<Slice> GetTupleId() const;
+  virtual Slice GetTupleId() const;
+
+  virtual Slice GetRowKey() const;
 
   // Seeks to the given tuple by its id. See DocRowwiseIterator for details.
-  virtual Result<bool> SeekTuple(const Slice& tuple_id);
+  virtual void SeekTuple(
+      Slice tuple_id, UpdateFilterKey update_filter_key = UpdateFilterKey::kTrue);
 
-  //------------------------------------------------------------------------------------------------
-  // Common API methods.
-  //------------------------------------------------------------------------------------------------
-  // Read next row using the specified projection.
-  // REQUIRES: projection should be a subset of schema().
-  Status NextRow(const Schema& projection, QLTableRow* table_row);
+  // Seeks to first record after specified doc_key_prefix. Also accepts RocksDB-shortened doc key
+  // (which could have last byte incremented, see rocksdb::ShortenedIndexBuilder).
+  // Requirement is that doc_key_prefix could not be in the middle of rocksdb records belonging
+  // to the same DocDB row.
+  virtual void SeekToDocKeyPrefix(Slice doc_key_prefix);
 
-  // Read next row using whole schema() as a projection.
-  Status NextRow(QLTableRow* table_row);
+  virtual Result<bool> FetchTuple(Slice tuple_id, qlexpr::QLTableRow* row);
 
-  // Iterates over the rows until --
-  //  - callback fails or returns false.
-  //  - Iterator reaches end of iteration.
-  virtual Status Iterate(const YQLScanCallback& callback);
-
- private:
-  virtual Status DoNextRow(boost::optional<const Schema&> projection, QLTableRow* table_row) = 0;
+ protected:
+  virtual Result<bool> DoFetchNext(
+      qlexpr::QLTableRow* table_row,
+      const dockv::ReaderProjection* projection,
+      qlexpr::QLTableRow* static_row,
+      const dockv::ReaderProjection* static_projection) = 0;
 };
 
 }  // namespace docdb

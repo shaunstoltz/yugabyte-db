@@ -1,4 +1,4 @@
-// Copyright (c) YugaByte, Inc.
+// Copyright (c) YugabyteDB, Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License"); you may not use this file except
 // in compliance with the License.  You may obtain a copy of the License at
@@ -33,20 +33,20 @@ import com.yugabyte.core.BaseConnection;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.yb.client.TestUtils;
-import org.yb.util.YBTestRunnerNonTsanOnly;
+import org.yb.YBTestRunner;
 
-@RunWith(value = YBTestRunnerNonTsanOnly.class)
+@RunWith(value = YBTestRunner.class)
 public class TestBatchCopyFrom extends BasePgSQLTest {
   private static final Logger LOG = LoggerFactory.getLogger(TestBatchCopyFrom.class);
 
   private static final String INVALID_BATCH_OPTION_USAGE_WARNING_MSG =
-      "Batched COPY is not supported";
+      "ROWS_PER_TRANSACTION is not supported";
   private static final String INVALID_BATCH_SIZE_ERROR_MSG =
       "argument to option \"rows_per_transaction\" must be a positive integer";
   private static final String INVALID_NUM_SKIPPED_ROWS_ERROR_MSG =
       "argument to option \"skip\" must be a nonnegative integer";
   private static final String INVALID_COPY_INPUT_ERROR_MSG =
-      "invalid input syntax for integer";
+      "invalid input syntax for type integer";
   private static final String INVALID_FOREIGN_KEY_ERROR_MSG =
       "violates foreign key constraint";
   private static final String BATCH_TXN_SESSION_VARIABLE_NAME =
@@ -56,27 +56,6 @@ public class TestBatchCopyFrom extends BasePgSQLTest {
       "yb_disable_transactional_writes";
   private static final String YB_ENABLE_UPSERT_MODE_VARIABLE_NAME =
       "yb_enable_upsert_mode";
-
-  private String getAbsFilePath(String fileName) {
-    return TestUtils.getBaseTmpDir() + "/" + fileName;
-  }
-
-  private void createFileInTmpDir(String absFilePath, int totalLines) throws IOException {
-    File myObj = new File(absFilePath);
-    myObj.createNewFile();
-
-    BufferedWriter writer = new BufferedWriter(new FileWriter(myObj));
-    writer.write("a,b,c,d\n");
-
-    int totalValues = totalLines * 4;
-    for (int i = 0; i < totalValues; i++) {
-      if (i != 0 && (i + 1) % 4 == 0)
-        writer.write("\n");
-      else
-        writer.write(i+",");
-    }
-    writer.close();
-  }
 
   private void writeToFileInTmpDir(String absFilePath, String line) throws IOException {
     File myObj = new File(absFilePath);
@@ -118,7 +97,7 @@ public class TestBatchCopyFrom extends BasePgSQLTest {
     int totalValidLines = 2500;
     int totalInvalidLines = 500;
 
-    createFileInTmpDir(absFilePath, totalValidLines);
+    createCopyFileInTmpDir(absFilePath, totalValidLines);
     appendInvalidLines(absFilePath, totalInvalidLines);
 
     try (Statement statement = connection.createStatement()) {
@@ -149,7 +128,7 @@ public class TestBatchCopyFrom extends BasePgSQLTest {
     int totalLines = 20;
     int batchSize = -1;
 
-    createFileInTmpDir(absFilePath, totalLines);
+    createCopyFileInTmpDir(absFilePath, totalLines);
 
     try (Statement statement = connection.createStatement()) {
       statement.execute(String.format(
@@ -171,7 +150,7 @@ public class TestBatchCopyFrom extends BasePgSQLTest {
     int totalLines = 100000;
     int batchSize = 100;
 
-    createFileInTmpDir(absFilePath, totalLines);
+    createCopyFileInTmpDir(absFilePath, totalLines);
 
     try (Statement statement = connection.createStatement()) {
       statement.execute(String.format("CREATE TABLE %s (a int, b int, c text, d int)", tableName));
@@ -190,7 +169,7 @@ public class TestBatchCopyFrom extends BasePgSQLTest {
     int totalLines = 100;
     int batchSize = 10000;
 
-    createFileInTmpDir(absFilePath, totalLines);
+    createCopyFileInTmpDir(absFilePath, totalLines);
 
     try (Statement statement = connection.createStatement()) {
       statement.execute(String.format(
@@ -211,7 +190,7 @@ public class TestBatchCopyFrom extends BasePgSQLTest {
     int totalLines = 7;
     int batchSize = 1;
 
-    createFileInTmpDir(absFilePath, totalLines);
+    createCopyFileInTmpDir(absFilePath, totalLines);
 
     try (Statement statement = connection.createStatement()) {
       statement.execute(String.format("CREATE TABLE %s (a int, b text, c int, d int)", tableName));
@@ -256,7 +235,7 @@ public class TestBatchCopyFrom extends BasePgSQLTest {
     int totalInvalidLines = 1;
     int batchSize = 1;
 
-    createFileInTmpDir(absFilePath, totalValidLines);
+    createCopyFileInTmpDir(absFilePath, totalValidLines);
     appendInvalidLines(absFilePath, totalInvalidLines);
 
     try (Statement statement = connection.createStatement()) {
@@ -307,7 +286,7 @@ public class TestBatchCopyFrom extends BasePgSQLTest {
     int totalLines = 20;
     int batchSize = 5;
 
-    createFileInTmpDir(absFilePath, totalLines);
+    createCopyFileInTmpDir(absFilePath, totalLines);
 
     try (Statement statement = connection.createStatement()) {
       statement.execute(String.format(
@@ -330,7 +309,7 @@ public class TestBatchCopyFrom extends BasePgSQLTest {
     int batchSize = 5;
     String dummyTableName = "sampleTable";
 
-    createFileInTmpDir(absFilePath, totalLines);
+    createCopyFileInTmpDir(absFilePath, totalLines);
 
     try (Statement statement = connection.createStatement()) {
       statement.execute(String.format(
@@ -358,7 +337,7 @@ public class TestBatchCopyFrom extends BasePgSQLTest {
     int totalLines = 5;
     int batchSize = 1;
 
-    createFileInTmpDir(absFilePath, totalLines);
+    createCopyFileInTmpDir(absFilePath, totalLines);
 
     try (Statement statement = connection.createStatement()) {
       statement.execute(String.format("CREATE TABLE %s (a int, b int, c int, d text)", tableName));
@@ -382,7 +361,7 @@ public class TestBatchCopyFrom extends BasePgSQLTest {
     int totalLines = 5;
     int batchSize = 1;
 
-    createFileInTmpDir(absFilePath, totalLines);
+    createCopyFileInTmpDir(absFilePath, totalLines);
 
     try (Statement statement = connection.createStatement()) {
       statement.execute(String.format("CREATE TABLE %s (a text, b int, c int, d int)", tableName));
@@ -413,7 +392,7 @@ public class TestBatchCopyFrom extends BasePgSQLTest {
     int totalInvalidLines = 1;
     int batchSize = 1;
 
-    createFileInTmpDir(absFilePath, totalValidLines);
+    createCopyFileInTmpDir(absFilePath, totalValidLines);
     appendInvalidLines(absFilePath, totalInvalidLines);
 
     try (Statement statement = connection.createStatement()) {
@@ -453,7 +432,7 @@ public class TestBatchCopyFrom extends BasePgSQLTest {
     int totalLines = 5;
     int batchSize = 2;
 
-    createFileInTmpDir(absFilePath, totalLines);
+    createCopyFileInTmpDir(absFilePath, totalLines);
 
     try (Statement statement = connection.createStatement()) {
       statement.execute(String.format("CREATE TABLE %s (a int, b int, c int, d int)", tableName));
@@ -484,7 +463,7 @@ public class TestBatchCopyFrom extends BasePgSQLTest {
     // since starting from the 8th row, entry is invalid.
     int expectedCopiedLines = batchSessionSize * 3;
 
-    createFileInTmpDir(absFilePath, totalValidLines);
+    createCopyFileInTmpDir(absFilePath, totalValidLines);
     appendInvalidLines(absFilePath, totalInvalidLines);
 
     try (Statement statement = connection.createStatement()) {
@@ -523,7 +502,7 @@ public class TestBatchCopyFrom extends BasePgSQLTest {
     int totalValidLines = 5;
     int expectedCopiedLines = totalValidLines;
 
-    createFileInTmpDir(absFilePath, totalValidLines);
+    createCopyFileInTmpDir(absFilePath, totalValidLines);
 
     try (Statement statement = connection.createStatement()) {
       // ensure non-txn session variable is off by default
@@ -555,7 +534,7 @@ public class TestBatchCopyFrom extends BasePgSQLTest {
     int totalValidLines = 5;
     int expectedCopiedLines = totalValidLines;
 
-    createFileInTmpDir(absFilePath, totalValidLines);
+    createCopyFileInTmpDir(absFilePath, totalValidLines);
 
     try (Statement statement = connection.createStatement()) {
       // check that yb_enable_upsert_mode session is off by default
@@ -588,9 +567,8 @@ public class TestBatchCopyFrom extends BasePgSQLTest {
     String absFilePath = getAbsFilePath("batch-copyfrom-upsertmode-index-sessionvar.txt");
     String tableName = "upsertModeSessionVarTableIndex";
     int totalValidLines = 5;
-    int expectedCopiedLines = totalValidLines;
 
-    createFileInTmpDir(absFilePath, totalValidLines);
+    createCopyFileInTmpDir(absFilePath, totalValidLines);
 
     // add CSV line that shares the same primary key value as
     // another row but updates the indexed column b
@@ -601,30 +579,19 @@ public class TestBatchCopyFrom extends BasePgSQLTest {
       // set enable-upsert session variable
       statement.execute("SET " + YB_ENABLE_UPSERT_MODE_VARIABLE_NAME + "=true");
 
-      // create and populate table with COPY command
-      // COPY command should not throw error even with the duplicate primary key
-      // since upsert mode is ON
       statement.execute(String.format(
         "CREATE TABLE %s (a INT PRIMARY KEY, b INT, c TEXT, d TEXT)", tableName));
       statement.execute(String.format("CREATE INDEX ON %s (b)", tableName));
-      statement.execute(String.format(
-        "COPY %s FROM \'%s\' WITH (FORMAT CSV, HEADER)", tableName, absFilePath));
 
-      // check every row was properly inserted into the table
-      assertOneRow(statement, "SELECT COUNT(*) FROM " + tableName, expectedCopiedLines);
+      // COPY should fail with duplicate key error because upsert mode is
+      // silently disabled on tables with secondary indexes.
+      runInvalidQuery(statement,
+          String.format(
+              "COPY %s FROM \'%s\' WITH (FORMAT CSV, HEADER)", tableName, absFilePath),
+          "duplicate key value violates unique constraint");
 
-      // check that row with shared primary key was overwritten
-      assertOneRow(statement, String.format("SELECT COUNT(*) FROM %s WHERE b=1", tableName), 1);
-
-      // verify index exists, is being used, and is properly updated
-      String explainOutput = getExplainAnalyzeOutput(statement, String.format(
-        "SELECT * from %s WHERE b=5;", tableName));
-      assertTrue("SELECT query should be an index scan", explainOutput.contains(
-        "Index Scan using upsertmodesessionvartableindex_b_idx on upsertmodesessionvartableindex"));
-      explainOutput = getExplainAnalyzeOutput(statement, String.format(
-        "SELECT * from %s WHERE b=5;", tableName));
-      assertTrue("Expect to fetch 2 rows from index scan",
-                 explainOutput.contains("rows=2 loops=1)"));
+      // No rows should have been copied (COPY is transactional).
+      assertOneRow(statement, "SELECT COUNT(*) FROM " + tableName, 0);
     }
   }
 
@@ -637,7 +604,7 @@ public class TestBatchCopyFrom extends BasePgSQLTest {
     int expectedForeignKeyLines = 5;
 
     // create tmp CSV file with header
-    createFileInTmpDir(foreignKeyFilePath, expectedForeignKeyLines);
+    createCopyFileInTmpDir(foreignKeyFilePath, expectedForeignKeyLines);
 
     // add CSV line that shares the same primary key as
     // another row but updates the foreign key column
@@ -659,30 +626,33 @@ public class TestBatchCopyFrom extends BasePgSQLTest {
       assertOneRow(statement, "SELECT COUNT(*) FROM " + primaryKeyTableName,
         expectedPrimaryKeyLines);
 
-      // create and bulk load the foreign key table
+      // create the foreign key table
       statement.execute(String.format(
         "CREATE TABLE %s (a INT PRIMARY KEY, b INT REFERENCES %s, c TEXT, d TEXT)",
           foreignKeyTableName, primaryKeyTableName));
-      statement.execute(String.format(
-        "COPY %s FROM \'%s\' WITH (FORMAT CSV, HEADER)", foreignKeyTableName, foreignKeyFilePath));
-      // check every row was properly inserted into the table
-      assertOneRow(statement, "SELECT COUNT(*) FROM " + foreignKeyTableName,
-        expectedForeignKeyLines);
 
-      // verify foreign key was updated
-      assertOneRow(statement, String.format(
-        "SELECT COUNT(*) FROM %s WHERE b=2", foreignKeyTableName), 1);
+      // COPY should fail with duplicate key error because upsert mode is
+      // silently disabled on tables with triggers (FK creates internal triggers).
+      runInvalidQuery(statement,
+          String.format(
+              "COPY %s FROM \'%s\' WITH (FORMAT CSV, HEADER)",
+              foreignKeyTableName, foreignKeyFilePath),
+          "duplicate key value violates unique constraint");
 
-      // clear table to test scenario where FK constraint is violated
-      statement.execute(String.format("TRUNCATE TABLE %s", foreignKeyTableName));
+      // No rows should have been copied (COPY is transactional).
+      assertOneRow(statement, "SELECT COUNT(*) FROM " + foreignKeyTableName, 0);
 
-      // add CSV row with foreign key that points to a non-existent ID
-      writeToFileInTmpDir(foreignKeyFilePath, "0,-1,3,4\n");
+      // Turn off upsert mode and test FK violation with a fresh CSV.
+      statement.execute("SET " + YB_ENABLE_UPSERT_MODE_VARIABLE_NAME + "=false");
+      String fkViolationFilePath = getAbsFilePath("batch-copyfrom-fk-violation.txt");
+      createCopyFileInTmpDir(fkViolationFilePath, 1);
+      writeToFileInTmpDir(fkViolationFilePath, "99,-1,3,4\n");
 
       // validate invalid FK is caught
       runInvalidQuery(statement,
         String.format(
-          "COPY %s FROM \'%s\' WITH (FORMAT CSV, HEADER)", foreignKeyTableName, foreignKeyFilePath),
+          "COPY %s FROM \'%s\' WITH (FORMAT CSV, HEADER)",
+          foreignKeyTableName, fkViolationFilePath),
           INVALID_FOREIGN_KEY_ERROR_MSG);
 
       // no rows should have been copied
@@ -697,7 +667,7 @@ public class TestBatchCopyFrom extends BasePgSQLTest {
     int totalValidLines = 5;
     int expectedCopiedLines = totalValidLines;
 
-    createFileInTmpDir(absFilePath, totalValidLines);
+    createCopyFileInTmpDir(absFilePath, totalValidLines);
 
     try (Statement statement = connection.createStatement()) {
       // create and populate table with COPY command
@@ -724,8 +694,7 @@ public class TestBatchCopyFrom extends BasePgSQLTest {
         statement,
         String.format("COPY %s FROM \'%s\' WITH (FORMAT CSV, HEADER)", tableName, absFilePath),
         Arrays.asList(
-          "Batched COPY is not supported on table with non RI trigger. " +
-            "Defaulting to using one transaction for the entire copy.",
+          "ROWS_PER_TRANSACTION is not supported on table with non RI trigger",
           "trigger_func(before_ins_stmt) called: action = INSERT, when = BEFORE, level = STATEMENT",
           "trigger_func(after_ins_stmt) called: action = INSERT, when = AFTER, level = STATEMENT"));
 
@@ -746,7 +715,7 @@ public class TestBatchCopyFrom extends BasePgSQLTest {
     // since starting from the 8th row, entry is invalid.
     int expectedCopiedLines = batchOptionSize;
 
-    createFileInTmpDir(absFilePath, totalValidLines);
+    createCopyFileInTmpDir(absFilePath, totalValidLines);
     appendInvalidLines(absFilePath, totalInvalidLines);
 
     try (Statement statement = connection.createStatement()) {
@@ -769,7 +738,7 @@ public class TestBatchCopyFrom extends BasePgSQLTest {
     int totalLines = 100000;
     int batchSize = 100;
 
-    createFileInTmpDir(absFilePath, totalLines);
+    createCopyFileInTmpDir(absFilePath, totalLines);
 
     final String createStmt = "CREATE TABLE %s (a int, b int, c text, d int) PARTITION BY %s(a)";
     final String createDefaultStmt = "CREATE TABLE %s PARTITION OF %s DEFAULT";
@@ -811,7 +780,7 @@ public class TestBatchCopyFrom extends BasePgSQLTest {
     int totalLines = 100;
     int batchSize = totalLines;
 
-    createFileInTmpDir(absFilePath, totalLines);
+    createCopyFileInTmpDir(absFilePath, totalLines);
 
     try (Statement statement = connection.createStatement()) {
       // Both reference table and main table have the same key set from 0 to totalLines - 1.
@@ -841,7 +810,7 @@ public class TestBatchCopyFrom extends BasePgSQLTest {
     int batchSize = totalLines;
     String referenceKey = "a_fkey";
 
-    createFileInTmpDir(absFilePath, totalLines);
+    createCopyFileInTmpDir(absFilePath, totalLines);
 
     String INVALID_FOREIGN_KEY_CHECK_ERROR_MSG =
         String.format("insert or update on table \"%s\" violates foreign key constraint \"%s_%s\"",
@@ -879,7 +848,7 @@ public class TestBatchCopyFrom extends BasePgSQLTest {
     int batchSize = 1;
     String referenceKey = "a_fkey";
 
-    createFileInTmpDir(absFilePath, totalLines);
+    createCopyFileInTmpDir(absFilePath, totalLines);
 
     String INVALID_FOREIGN_KEY_CHECK_ERROR_MSG =
         String.format("insert or update on table \"%s\" violates foreign key constraint \"%s_%s\"",
@@ -919,7 +888,7 @@ public class TestBatchCopyFrom extends BasePgSQLTest {
     int batchSize = 5;
     String INVALID_PRIMARY_KEY_TRIGGER_ERROR_MSG = "Primary key too large";
 
-    createFileInTmpDir(absFilePath, totalLines);
+    createCopyFileInTmpDir(absFilePath, totalLines);
 
     try (Statement statement = connection.createStatement()) {
       statement.execute(
@@ -960,7 +929,7 @@ public class TestBatchCopyFrom extends BasePgSQLTest {
     int skippedLines = 10;
     int expectedCopiedLines = totalLines - skippedLines;
 
-    createFileInTmpDir(absFilePath, totalLines);
+    createCopyFileInTmpDir(absFilePath, totalLines);
     try (Statement statement = connection.createStatement()) {
       statement.execute(String.format(
           "CREATE TABLE %s (a Integer, b serial, c varchar, d int)", tableName));
@@ -982,7 +951,7 @@ public class TestBatchCopyFrom extends BasePgSQLTest {
     int totalLines = 100;
     int skippedLines = 1000;
 
-    createFileInTmpDir(absFilePath, totalLines);
+    createCopyFileInTmpDir(absFilePath, totalLines);
 
     try (Statement statement = connection.createStatement()) {
       statement.execute(String.format(
@@ -1004,7 +973,7 @@ public class TestBatchCopyFrom extends BasePgSQLTest {
     int totalLines = 100;
     int skippedLines = -1;
 
-    createFileInTmpDir(absFilePath, totalLines);
+    createCopyFileInTmpDir(absFilePath, totalLines);
 
     try (Statement statement = connection.createStatement()) {
       statement.execute(String.format(
@@ -1031,7 +1000,7 @@ public class TestBatchCopyFrom extends BasePgSQLTest {
     int totalValidLines = 5;
     int skippedLines = totalInvalidLines;
 
-    createFileInTmpDir(absFilePath, 0);
+    createCopyFileInTmpDir(absFilePath, 0);
     appendInvalidLines(absFilePath, totalInvalidLines);
     appendValidLines(absFilePath, totalValidLines, 0);
 
@@ -1076,7 +1045,7 @@ public class TestBatchCopyFrom extends BasePgSQLTest {
         String.format("insert or update on table \"%s\" violates foreign key constraint \"%s_%s\"",
                       tableName, tableName, referenceKey);
 
-    createFileInTmpDir(absFilePath, totalLines);
+    createCopyFileInTmpDir(absFilePath, totalLines);
 
     try (Statement statement = connection.createStatement()) {
       // Create reference table without the keys among the skipped rows.
@@ -1126,7 +1095,7 @@ public class TestBatchCopyFrom extends BasePgSQLTest {
         String.format("insert or update on table \"%s\" violates foreign key constraint \"%s_%s\"",
                       tableName, tableName, referenceKey);
 
-    createFileInTmpDir(absFilePath, totalLines);
+    createCopyFileInTmpDir(absFilePath, totalLines);
 
     try (Statement statement = connection.createStatement()) {
       // Create reference table without the keys among the skipped tuples, and without the last key
@@ -1162,7 +1131,7 @@ public class TestBatchCopyFrom extends BasePgSQLTest {
     int totalLines = 100;
     String referenceKey = "a_fkey";
 
-    createFileInTmpDir(absFilePath, totalLines);
+    createCopyFileInTmpDir(absFilePath, totalLines);
 
     String INVALID_FOREIGN_KEY_CHECK_ERROR_MSG =
         String.format("insert or update on table \"%s\" violates foreign key constraint \"%s_%s\"",
@@ -1202,8 +1171,8 @@ public class TestBatchCopyFrom extends BasePgSQLTest {
 
     String tableName = "copy_with_replace";
     int totalLines = 100;
-    createFileInTmpDir(oldFilePath, totalLines / 2);
-    createFileInTmpDir(newFilePath, totalLines);
+    createCopyFileInTmpDir(oldFilePath, totalLines / 2);
+    createCopyFileInTmpDir(newFilePath, totalLines);
 
     try (Statement statement = connection.createStatement()) {
       statement.execute(

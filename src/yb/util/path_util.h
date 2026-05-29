@@ -15,9 +15,9 @@
 // specific language governing permissions and limitations
 // under the License.
 //
-// The following only applies to changes made to this file as part of YugaByte development.
+// The following only applies to changes made to this file as part of YugabyteDB development.
 //
-// Portions Copyright (c) YugaByte, Inc.
+// Portions Copyright (c) YugabyteDB, Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License"); you may not use this file except
 // in compliance with the License.  You may obtain a copy of the License at
@@ -35,16 +35,16 @@
 #include <string>
 
 #include "yb/util/status_fwd.h"
-
+#include "yb/util/result.h"
 namespace yb {
 
 class Env;
 
 // Appends path segments with the appropriate path separator, if necessary.
-void AppendPathSegments(std::string* out, const std::string &b);
+void AppendPathSegments(std::string* out, std::string_view b);
 
 template <class... Args>
-void AppendPathSegments(std::string* out, const std::string& a, Args&&... args) {
+void AppendPathSegments(std::string* out, std::string_view a, Args&&... args) {
   AppendPathSegments(out, a);
   AppendPathSegments(out, std::forward<Args>(args)...);
 }
@@ -80,4 +80,21 @@ Status SetupRootDir(
 // environment variable.
 Status CheckODirectTempFileCreationInDir(Env* env, const std::string& dir_path);
 
+namespace path_utils {
+
+// Return the path of a yb-tool.
+Result<std::string> GetToolPath(const std::string& rel_path, const std::string& tool_name);
+
+inline Result<std::string> GetToolPath(const std::string& tool_name) {
+  return GetToolPath("../bin", tool_name);
+}
+
+inline Result<std::string> GetPgToolPath(const std::string& tool_name) {
+  return GetToolPath("../postgres/bin", tool_name);
+}
+
+Result<std::vector<std::string>> GetVectorIndexFiles(
+    Env& env, const std::string& vector_index_storage_dir);
+
+} // namespace path_utils
 } // namespace yb

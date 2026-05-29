@@ -1,5 +1,5 @@
 /*
- * Copyright 2022 YugaByte, Inc. and Contributors
+ * Copyright 2022 YugabyteDB, Inc. and Contributors
  *
  * Licensed under the Polyform Free Trial License 1.0.0 (the "License"); you
  * may not use this file except in compliance with the License. You
@@ -18,16 +18,6 @@ import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.when;
 
-import java.security.PublicKey;
-import java.security.cert.X509Certificate;
-import java.util.Calendar;
-import java.util.Date;
-import java.util.HashMap;
-import java.util.List;
-import java.util.Map;
-import java.util.UUID;
-import java.util.concurrent.TimeUnit;
-
 import com.fasterxml.jackson.databind.JsonNode;
 import com.yugabyte.yw.common.FakeDBApplication;
 import com.yugabyte.yw.common.TestUtils;
@@ -37,7 +27,15 @@ import com.yugabyte.yw.common.certmgmt.providers.VaultPKI.VaultOperationsForCert
 import com.yugabyte.yw.common.kms.util.hashicorpvault.HashicorpVaultConfigParams;
 import com.yugabyte.yw.common.kms.util.hashicorpvault.VaultAccessor;
 import com.yugabyte.yw.common.kms.util.hashicorpvault.VaultEARServiceUtilTest;
-
+import java.security.PublicKey;
+import java.security.cert.X509Certificate;
+import java.util.Calendar;
+import java.util.Date;
+import java.util.HashMap;
+import java.util.List;
+import java.util.Map;
+import java.util.UUID;
+import java.util.concurrent.TimeUnit;
 import org.bouncycastle.asn1.x509.GeneralName;
 import org.bouncycastle.asn1.x509.GeneralNames;
 import org.junit.Before;
@@ -153,13 +151,13 @@ public class VaultPKITest extends FakeDBApplication {
     X509Certificate caCert =
         CertificateHelper.convertStringToX509Cert(((VaultPKI) certProvider).getCACertificate());
     PublicKey k = caCert.getPublicKey();
-    cert.verify(k, "BC");
+    cert.verify(k);
 
     // verify by fetching ca from mountPath.
     caCert = ((VaultPKI) certProvider).getCACertificateFromVault();
     assertNotEquals("", caCert);
     k = caCert.getPublicKey();
-    cert.verify(k, "BC");
+    cert.verify(k);
   }
 
   @Test

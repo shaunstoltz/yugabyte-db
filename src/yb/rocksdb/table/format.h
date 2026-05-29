@@ -3,9 +3,9 @@
 //  LICENSE file in the root directory of this source tree. An additional grant
 //  of patent rights can be found in the PATENTS file in the same directory.
 //
-// The following only applies to changes made to this file as part of YugaByte development.
+// The following only applies to changes made to this file as part of YugabyteDB development.
 //
-// Portions Copyright (c) YugaByte, Inc.
+// Portions Copyright (c) YugabyteDB, Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License"); you may not use this file except
 // in compliance with the License.  You may obtain a copy of the License at
@@ -210,7 +210,7 @@ static const size_t kBlockTrailerSize = 5;
 class TrackedAllocation {
  public:
   TrackedAllocation();
-  TrackedAllocation(std::unique_ptr<char[]>&& data, size_t size,
+  TrackedAllocation(std::unique_ptr<const char[]>&& data, size_t size,
                     std::shared_ptr<yb::MemTracker> mem_tracker);
   TrackedAllocation(TrackedAllocation&& other) = default;
 
@@ -218,11 +218,11 @@ class TrackedAllocation {
 
   ~TrackedAllocation();
 
-  char* get() const {
+  const char* get() const {
     return holder_.get();
   }
  private:
-  std::unique_ptr<char[]> holder_;
+  std::unique_ptr<const char[]> holder_;
   size_t size_;
   std::shared_ptr<yb::MemTracker> mem_tracker_;
 };

@@ -1,5 +1,5 @@
 /*
- * Copyright 2019 YugaByte, Inc. and Contributors
+ * Copyright 2019 YugabyteDB, Inc. and Contributors
  *
  * Licensed under the Polyform Free Trial License 1.0.0 (the "License"); you
  * may not use this file except in compliance with the License. You
@@ -20,6 +20,7 @@ import com.yugabyte.yw.commissioner.UserTaskDetails.SubTaskGroupType;
 import com.yugabyte.yw.commissioner.tasks.params.NodeTaskParams;
 import com.yugabyte.yw.common.DnsManager;
 import com.yugabyte.yw.common.PlacementInfoUtil;
+import com.yugabyte.yw.common.config.UniverseConfKeys;
 import com.yugabyte.yw.forms.UniverseDefinitionTaskParams;
 import com.yugabyte.yw.models.Universe;
 import com.yugabyte.yw.models.helpers.NodeDetails;
@@ -50,33 +51,60 @@ public class StartNodeInUniverse extends UniverseDefinitionTaskBase {
   }
 
   @Override
+  public void validateParams(boolean isFirstTry) {
+    super.validateParams(isFirstTry);
+    Universe universe = getUniverse();
+    NodeDetails currentNode = universe.getNode(taskParams().nodeName);
+    if (currentNode == null) {
+      String msg = "No node " + taskParams().nodeName + " found in universe " + universe.getName();
+      log.error(msg);
+      throw new RuntimeException(msg);
+    }
+  }
+
+  @Override
+  protected void createPrecheckTasks(Universe universe) {
+    // Check again after locking.
+    NodeDetails currentNode = universe.getNode(taskParams().nodeName);
+    if (currentNode == null) {
+      String msg = "No node " + taskParams().nodeName + " found in universe " + universe.getName();
+      log.error(msg);
+      throw new RuntimeException(msg);
+    }
+    taskParams().azUuid = currentNode.azUuid;
+    taskParams().placementUuid = currentNode.placementUuid;
+    if (!instanceExists(taskParams())) {
+      String msg = "No instance exists for " + taskParams().nodeName;
+      log.error(msg);
+      throw new RuntimeException(msg);
+    }
+    if (isFirstTry()) {
+      verifyClustersConsistency(Set.of(taskParams().nodeName));
+    }
+  }
+
   public void run() {
-    NodeDetails currentNode = null;
+    if (maybeRunOnlyPrechecks()) {
+      return;
+    }
+    log.info(
+        "Start Node with name {} from universe uuid={}",
+        taskParams().nodeName,
+        taskParams().getUniverseUUID());
+    checkUniverseVersion();
+    Universe universe =
+        lockAndFreezeUniverseForUpdate(
+            taskParams().expectedUniverseVersion, null /* Txn callback */);
+
     try {
-      checkUniverseVersion();
-      // Set the 'updateInProgress' flag to prevent other updates from happening.
-      Universe universe = lockUniverseForUpdate(taskParams().expectedUniverseVersion);
-      log.info(
-          "Start Node with name {} from universe {} ({})",
-          taskParams().nodeName,
-          taskParams().universeUUID,
-          universe.name);
-
-      currentNode = universe.getNode(taskParams().nodeName);
-      if (currentNode == null) {
-        String msg = "No node " + taskParams().nodeName + " found in universe " + universe.name;
-        log.error(msg);
-        throw new RuntimeException(msg);
-      }
+      NodeDetails currentNode = universe.getNode(taskParams().nodeName);
       UniverseDefinitionTaskParams.Cluster cluster = universe.getCluster(currentNode.placementUuid);
+      boolean followerLagCheckEnabled =
+          confGetter.getConfForScope(universe, UniverseConfKeys.followerLagCheckEnabled);
 
+      // Set again just in case not populated in validateParams().
       taskParams().azUuid = currentNode.azUuid;
       taskParams().placementUuid = currentNode.placementUuid;
-      if (!instanceExists(taskParams())) {
-        String msg = "No instance exists for " + taskParams().nodeName;
-        log.error(msg);
-        throw new RuntimeException(msg);
-      }
 
       preTaskActions();
 
@@ -107,20 +135,32 @@ public class StartNodeInUniverse extends UniverseDefinitionTaskBase {
         startMaster = !startTserver;
       }
 
+      final Set<NodeDetails> nodeCollection = ImmutableSet.of(currentNode);
+
+      // Make sure clock skew is low enough on the node.
+      createWaitForClockSyncTasks(universe, nodeCollection)
+          .setSubTaskGroupType(SubTaskGroupType.StartingNodeProcesses);
+
       if (startMaster) {
         if (currentNode.masterState == null) {
           saveNodeStatus(
               taskParams().nodeName, NodeStatus.builder().masterState(MasterState.ToStart).build());
         }
-        createStartMasterOnNodeTasks(universe, currentNode, null);
+        createStartMasterOnNodeTasks(
+            universe, currentNode, null, false /* stoppable */, false /* ignoreStopError */);
       }
-      final Set<NodeDetails> nodeCollection = ImmutableSet.of(currentNode);
+
       if (startTserver) {
         // Update master addresses for tservers.
         createConfigureServerTasks(nodeCollection, params -> params.updateMasterAddrsOnly = true)
             .setSubTaskGroupType(SubTaskGroupType.StartingNodeProcesses);
         // Start tservers on tserver nodes.
-        createStartTserverProcessTasks(nodeCollection, cluster.userIntent.isYSQLAuthEnabled());
+        createStartTserverProcessTasks(nodeCollection, cluster.userIntent.enableYSQL);
+
+        if (followerLagCheckEnabled) {
+          createCheckFollowerLagTask(currentNode, ServerType.TSERVER)
+              .setSubTaskGroupType(SubTaskGroupType.StartingNodeProcesses);
+        }
       }
 
       // Start yb-controller process
@@ -145,9 +185,11 @@ public class StartNodeInUniverse extends UniverseDefinitionTaskBase {
               null,
               ImmutableSet.of(currentNode)));
 
-      // Update the DNS entry for this universe.
-      createDnsManipulationTask(DnsManager.DnsCommandType.Edit, false, cluster.userIntent)
-          .setSubTaskGroupType(SubTaskGroupType.StartingNode);
+      if (startTserver) {
+        // Update the DNS entry for this universe.
+        createDnsManipulationTask(DnsManager.DnsCommandType.Edit, false, universe)
+            .setSubTaskGroupType(SubTaskGroupType.StartingNode);
+      }
 
       // Update the swamper target file.
       // It is required because the node could be removed from the swamper file

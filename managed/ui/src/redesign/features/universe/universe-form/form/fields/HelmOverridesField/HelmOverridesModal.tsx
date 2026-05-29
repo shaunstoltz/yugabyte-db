@@ -1,8 +1,9 @@
-import React, { ReactElement, useState } from 'react';
+import { ReactElement, useState } from 'react';
 import { useMutation } from 'react-query';
 import { useTranslation } from 'react-i18next';
 import { useFieldArray, FieldArrayPath, useForm } from 'react-hook-form';
 import { Box, Grid, IconButton, Typography, InputAdornment } from '@material-ui/core';
+import { toast } from 'react-toastify';
 import {
   YBButton,
   YBCheckbox,
@@ -19,10 +20,11 @@ import {
   HelmOverridesError,
   UniverseConfigure
 } from '../../../utils/dto';
+import { createErrorMessage } from '../../../utils/helpers';
 import { useFormMainStyles } from '../../../universeMainStyle';
 //Icons
 import { AZ_OVERRIDES_FIELD, UNIVERSE_OVERRIDES_FIELD } from '../../../utils/constants';
-import { ReactComponent as CloseIcon } from '../../../../../../assets/close.svg';
+import CloseIcon from '../../../../../../assets/close.svg';
 
 interface HelmOverridesModalProps {
   open: boolean;
@@ -66,6 +68,7 @@ export const HelmOverridesModal = ({
   const [validationError, setValidationError] = useState<HelmOverridesError>(
     INITIAL_VAIDATION_ERRORS
   );
+  const [isSubmitting, setIsSubmitting] = useState<boolean>(false);
   const [forceConfirm, setForceConfirm] = useState(false);
 
   const setOverides = (universeOverrides: string, azOverrides: Record<string, string>) => {
@@ -95,12 +98,18 @@ export const HelmOverridesModal = ({
           //apply overrides, close modal and clear error
           setOverides(reqValues.values.universeOverrides, reqValues.values.azOverrides);
         }
+        setIsSubmitting(false);
+        toast.success(t('universeForm.helmOverrides.validateAndSaveSuccess'));
       },
       onError: (err: any, reqValues) => {
         // sometimes, the backend throws 500 error, if the validation is failed. we don't want to block the user if that happens
         if (err.response.status === 500) {
           setOverides(reqValues.values.universeOverrides, reqValues.values.azOverrides);
+        } else {
+          // user can still use force apply option to apply overrides
+          toast.error(createErrorMessage(err));
         }
+        setIsSubmitting(false);
       }
     }
   );
@@ -123,6 +132,7 @@ export const HelmOverridesModal = ({
 
   const handleSave = () => {
     const formValues = getValues();
+    !forceConfirm && setIsSubmitting(true);
 
     const universeOverrides = formValues.universeOverrides;
     const azOverrides = formValues?.azOverrides
@@ -174,7 +184,13 @@ export const HelmOverridesModal = ({
       onClose={onClose}
       titleSeparator
       onSubmit={handleSave}
-      actionsInfo={
+      isSubmitting={isSubmitting}
+      buttonProps={{
+        primary: {
+          disabled: isSubmitting
+        }
+      }}
+      footerAccessory={
         <YBCheckbox
           checked={forceConfirm}
           onChange={() => setForceConfirm(!forceConfirm)}
@@ -221,7 +237,7 @@ export const HelmOverridesModal = ({
           control={control}
           fullWidth
           multiline
-          rows={8}
+          minRows={8}
           maxRows={8}
           placeholder={UNIVERSE_OVERRIDE_SAMPLE}
           inputProps={{
@@ -249,7 +265,7 @@ export const HelmOverridesModal = ({
                   control={control}
                   fullWidth
                   multiline
-                  rows={5}
+                  minRows={5}
                   maxRows={5}
                   placeholder={AZ_OVERRIDE_SAMPLE}
                   inputProps={{

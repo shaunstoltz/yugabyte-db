@@ -15,9 +15,9 @@
 // specific language governing permissions and limitations
 // under the License.
 //
-// The following only applies to changes made to this file as part of YugaByte development.
+// The following only applies to changes made to this file as part of YugabyteDB development.
 //
-// Portions Copyright (c) YugaByte, Inc.
+// Portions Copyright (c) YugabyteDB, Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License"); you may not use this file except
 // in compliance with the License.  You may obtain a copy of the License at
@@ -31,10 +31,14 @@
 //
 #pragma once
 
+#include <cerrno>
 #include <string>
+#include <string_view>
 
 #include "yb/util/status_fwd.h"
 #include "yb/util/status_ec.h"
+
+using namespace std::literals;
 
 DECLARE_bool(suicide_on_eio);
 
@@ -51,14 +55,14 @@ inline std::string ErrnoToString(int err) {
 
 struct ErrnoTag : IntegralErrorTag<int32_t> {
   // This category id is part of the wire protocol and should not be changed once released.
-  static constexpr uint8_t kCategory = 1;
+  static constexpr CategoryDescriptor kCategory{1, "system error"sv};
 
   static std::string ToMessage(Value value) {
     return ErrnoToString(value);
   }
 };
 
-typedef StatusErrorCodeImpl<ErrnoTag> Errno;
+using Errno = StatusErrorCodeImpl<ErrnoTag>;
 
 namespace internal {
 
@@ -71,6 +75,17 @@ Status StatusFromErrnoSpecialEioHandling(
 // error code stored in errno. This helper constructs a Status based on errno but only if the return
 // value (the rv parameter) is non-zero.
 Status StatusFromErrnoIfNonZero(const std::string& context, int rv, const char* file, int line);
+
+// For cases where we do actually care about the return value, but the call may return -1 and set
+// errno, e.g. open().
+template<typename T>
+Result<T> ResultWithStatusFromErrno(const std::string& context, T rv, const char* file, int line) {
+  if (rv == T(-1)) {
+    return StatusFromErrno(context, errno, file, line);
+  } else {
+    return rv;
+  }
+}
 
 }  // namespace internal
 
@@ -95,5 +110,15 @@ Status StatusFromErrnoIfNonZero(const std::string& context, int rv, const char* 
 
 #define RETURN_ON_ERRNO_RV_FN_CALL(...) \
     RETURN_NOT_OK(STATUS_FROM_ERRNO_RV_FN_CALL(__VA_ARGS__))
+
+#define RESULT_FROM_ERRNO_FN_CALL(fn_name, ...) \
+    ::yb::internal::ResultWithStatusFromErrno( \
+        BOOST_PP_STRINGIZE(fn_name), fn_name(__VA_ARGS__), __FILE__, __LINE__)
+
+#define VERIFY_ERRNO_FN_CALL(...) \
+    VERIFY_RESULT(RESULT_FROM_ERRNO_FN_CALL(__VA_ARGS__))
+
+#define RETURN_ON_ERRNO_FN_CALL(...) \
+    RETURN_NOT_OK(RESULT_FROM_ERRNO_FN_CALL(__VA_ARGS__))
 
 } // namespace yb

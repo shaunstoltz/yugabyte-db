@@ -3,9 +3,9 @@
 //  LICENSE file in the root directory of this source tree. An additional grant
 //  of patent rights can be found in the PATENTS file in the same directory.
 //
-// The following only applies to changes made to this file as part of YugaByte development.
+// The following only applies to changes made to this file as part of YugabyteDB development.
 //
-// Portions Copyright (c) YugaByte, Inc.
+// Portions Copyright (c) YugabyteDB, Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License"); you may not use this file except
 // in compliance with the License.  You may obtain a copy of the License at
@@ -308,7 +308,7 @@ Result<ChecksumData> ComputeChecksum(
           .actual = crc32c::Value(src_data.data(), src_data.size())
       };
     case kxxHash:
-      if (yb::std_util::cmp_greater(src_data.size(), std::numeric_limits<int>::max())) {
+      if (std::cmp_greater(src_data.size(), std::numeric_limits<int>::max())) {
         return STATUS_FORMAT(
             Corruption, "Block too large for xxHash ($0 bytes, but must be $1 or smaller)",
             src_data.size(), std::numeric_limits<int>::max());
@@ -340,8 +340,9 @@ Status VerifyBlockChecksum(
       ComputeChecksum(file, footer, handle, Slice(data, block_size + 1), raw_expected_checksum));
   if (checksum.actual != checksum.expected) {
     return STATUS_FORMAT(
-        Corruption, "Block checksum mismatch in file: $0, block handle: $1",
-        file->file()->filename(), handle.ToDebugString());
+        Corruption, "Block checksum mismatch in file: $0, block handle: $1, "
+        "expected checksum: $2, actual checksum: $3.",
+        file->file()->filename(), handle.ToDebugString(), checksum.expected, checksum.actual);
   }
   return Status::OK();
 }
@@ -386,7 +387,8 @@ Status ReadBlock(
       const size_t expected_read_size;
     } validator(file, footer, options, handle, expected_read_size);
 
-    s = file->ReadAndValidate(handle.offset(), expected_read_size, contents, buf, validator);
+    s = file->ReadAndValidate(handle.offset(), expected_read_size, contents, buf, validator,
+                              options.statistics);
   }
 
   PERF_COUNTER_ADD(block_read_count, 1);
@@ -402,7 +404,7 @@ TrackedAllocation::TrackedAllocation()
 }
 
 TrackedAllocation::TrackedAllocation(
-    std::unique_ptr<char[]>&& data, size_t size, yb::MemTrackerPtr mem_tracker)
+    std::unique_ptr<const char[]>&& data, size_t size, yb::MemTrackerPtr mem_tracker)
     : holder_(std::move(data)), size_(size), mem_tracker_(std::move(mem_tracker)) {
   if (holder_ && mem_tracker_) {
     mem_tracker_->Consume(size_);
@@ -461,7 +463,7 @@ Status ReadBlockContents(RandomAccessFileReader* file, const Footer& footer,
   status = ReadBlock(file, footer, options, handle, &slice, used_buf);
 
   if (!status.ok()) {
-    LOG(ERROR) << __func__ << ": " << status << "\n" << yb::GetStackTrace();
+    LOG_WITH_FUNC(WARNING) << status;
     return status;
   }
 

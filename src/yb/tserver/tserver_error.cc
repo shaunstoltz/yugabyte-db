@@ -1,5 +1,5 @@
 //
-// Copyright (c) YugaByte, Inc.
+// Copyright (c) YugabyteDB, Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License"); you may not use this file except
 // in compliance with the License.  You may obtain a copy of the License at
@@ -15,18 +15,23 @@
 
 #include "yb/tserver/tserver_error.h"
 
-namespace yb {
-namespace tserver {
+namespace yb::tserver {
 
-static const std::string kTabletServerErrorCategoryName = "tablet server error";
+void SetupError(TabletServerErrorPB* error, const Status& s) {
+  auto ts_error = TabletServerError::FromStatus(s);
+  auto code = ts_error ? ts_error->value() : TabletServerErrorPB::UNKNOWN_ERROR;
+  if (code == TabletServerErrorPB::UNKNOWN_ERROR) {
+    consensus::ConsensusError consensus_error(s);
+    if (consensus_error.value() == consensus::ConsensusErrorPB::TABLET_SPLIT) {
+      code = TabletServerErrorPB::TABLET_SPLIT;
+    }
+  }
+  StatusToPB(s, error->mutable_status());
+  error->set_code(code);
+}
 
-static StatusCategoryRegisterer tablet_server_error_category_registerer(
-    StatusCategoryDescription::Make<TabletServerErrorTag>(&kTabletServerErrorCategoryName));
+void SetupError(AppStatusPB* error, const Status& s) {
+  StatusToPB(s, error);
+}
 
-static const std::string kTabletServerDelayCategoryName = "tablet server delay";
-
-static StatusCategoryRegisterer tablet_server_delay_category_registerer(
-    StatusCategoryDescription::Make<TabletServerDelayTag>(&kTabletServerDelayCategoryName));
-
-} // namespace tserver
-} // namespace yb
+} // namespace yb::tserver

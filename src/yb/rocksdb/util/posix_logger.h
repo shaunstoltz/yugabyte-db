@@ -3,9 +3,9 @@
 //  LICENSE file in the root directory of this source tree. An additional grant
 //  of patent rights can be found in the PATENTS file in the same directory.
 //
-// The following only applies to changes made to this file as part of YugaByte development.
+// The following only applies to changes made to this file as part of YugabyteDB development.
 //
-// Portions Copyright (c) YugaByte, Inc.
+// Portions Copyright (c) YugabyteDB, Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License"); you may not use this file except
 // in compliance with the License.  You may obtain a copy of the License at
@@ -29,6 +29,7 @@
 #include <stdio.h>
 #include <time.h>
 #include <fcntl.h>
+#include <unistd.h>
 
 #include <algorithm>
 #include <atomic>
@@ -39,11 +40,13 @@
 #endif
 #endif
 
-#include "yb/rocksdb/port/sys_time.h"
-
 #include "yb/rocksdb/env.h"
+
+#include "yb/rocksdb/util/io_posix.h"
+
+#include "yb/util/sync_point.h"
+
 #include "yb/util/stats/iostats_context_imp.h"
-#include "yb/rocksdb/util/sync_point.h"
 
 namespace rocksdb {
 
@@ -51,30 +54,56 @@ const int kDebugLogChunkSize = 128 * 1024;
 
 class PosixLogger : public Logger {
  private:
+#if !defined(__APPLE__)
   FILE* file_;
+#endif
+  int fd_;
   uint64_t (*gettid_)();  // Return the thread id for the current thread
   std::atomic_size_t log_size_;
-  int fd_;
   static const uint64_t flush_every_seconds_ = 5;
   std::atomic_uint_fast64_t last_flush_micros_;
   Env* env_;
   std::atomic<bool> flush_pending_;
+  std::string fname_;
  public:
-  PosixLogger(FILE* f, uint64_t (*gettid)(), Env* env,
+#if defined(__APPLE__)
+  PosixLogger(const std::string& fname, int fd, uint64_t (*gettid)(), Env* env,
+              const InfoLogLevel log_level = InfoLogLevel::ERROR_LEVEL)
+      : Logger(log_level),
+        fd_(fd),
+        gettid_(gettid),
+        log_size_(0),
+        last_flush_micros_(0),
+        env_(env),
+        flush_pending_(false),
+        fname_(fname) {}
+  virtual ~PosixLogger() {
+    close(fd_);
+  }
+  virtual void Flush() override {
+    DEBUG_ONLY_TEST_SYNC_POINT_CALLBACK("PosixLogger::Flush:BeginCallback", nullptr);
+    // raw write() bypasses stdio buffering, so data is already in OS kernel buffers - no flush
+    // needed. Just reset the pending flag.
+    flush_pending_.store(false);
+    last_flush_micros_ = env_->NowMicros();
+  }
+#else
+  PosixLogger(const std::string& fname, FILE* f, uint64_t (*gettid)(), Env* env,
               const InfoLogLevel log_level = InfoLogLevel::ERROR_LEVEL)
       : Logger(log_level),
         file_(f),
+        fd_(fileno(f)),
         gettid_(gettid),
         log_size_(0),
-        fd_(fileno(f)),
         last_flush_micros_(0),
         env_(env),
-        flush_pending_(false) {}
+        flush_pending_(false),
+        fname_(fname) {}
   virtual ~PosixLogger() {
     fclose(file_);
   }
   virtual void Flush() override {
-    TEST_SYNC_POINT_CALLBACK("PosixLogger::Flush:BeginCallback", nullptr);
+    DEBUG_ONLY_TEST_SYNC_POINT_CALLBACK("PosixLogger::Flush:BeginCallback", nullptr);
     {
       bool expected_flush_pending = true;
       // TODO: use a weaker memory order?
@@ -84,6 +113,7 @@ class PosixLogger : public Logger {
     }
     last_flush_micros_ = env_->NowMicros();
   }
+#endif // defined(__APPLE__)
 
   using Logger::Logv;
   virtual void Logv(const char* format, va_list ap) override {
@@ -154,18 +184,39 @@ class PosixLogger : public Logger {
       // allocations from filesystem allocsize options.
       const size_t log_size = log_size_;
       const size_t last_allocation_chunk =
-        ((kDebugLogChunkSize - 1 + log_size) / kDebugLogChunkSize);
+          ((kDebugLogChunkSize - 1 + log_size) / kDebugLogChunkSize);
       const size_t desired_allocation_chunk =
-        ((kDebugLogChunkSize - 1 + log_size + write_size) /
-           kDebugLogChunkSize);
+          ((kDebugLogChunkSize - 1 + log_size + write_size) / kDebugLogChunkSize);
       if (last_allocation_chunk != desired_allocation_chunk) {
-        fallocate(
-            fd_, FALLOC_FL_KEEP_SIZE, 0,
-            static_cast<off_t>(desired_allocation_chunk * kDebugLogChunkSize));
+        if (fallocate(
+                fd_, FALLOC_FL_KEEP_SIZE, 0,
+                static_cast<off_t>(desired_allocation_chunk * kDebugLogChunkSize)) != 0) {
+          LOG(WARNING) << STATUS_IO_ERROR(fname_, errno)
+                       << " desired_allocation_chunk: " << desired_allocation_chunk
+                       << " kDebugLogChunkSize: " << kDebugLogChunkSize;
+        }
       }
 #endif
 
+#if defined(__APPLE__)
+      // Use raw fd I/O to avoid macOS stdio FILE* stream limit (~32K).
+      const char* src = base;
+      size_t left = write_size;
+      while (left > 0) {
+        ssize_t done = write(fd_, src, left);
+        if (done < 0) {
+          if (errno == EINTR) {
+            continue;
+          }
+          break;
+        }
+        src += done;
+        left -= done;
+      }
+      size_t sz = write_size - left;
+#else
       size_t sz = fwrite(base, 1, write_size, file_);
+#endif
       // TODO: use a weaker memory order?
       flush_pending_.store(true);
       assert(sz == write_size);

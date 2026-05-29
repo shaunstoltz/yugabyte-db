@@ -1,8 +1,9 @@
-// Copyright (c) YugaByte, Inc.
+// Copyright (c) YugabyteDB, Inc.
 package com.yugabyte.yw.commissioner.tasks.subtasks.xcluster;
 
 import com.yugabyte.yw.commissioner.BaseTaskDependencies;
 import com.yugabyte.yw.commissioner.tasks.XClusterConfigTaskBase;
+import com.yugabyte.yw.common.XClusterUniverseService;
 import com.yugabyte.yw.forms.XClusterConfigTaskParams;
 import com.yugabyte.yw.models.XClusterConfig;
 import com.yugabyte.yw.models.XClusterTableConfig;
@@ -14,8 +15,9 @@ import lombok.extern.slf4j.Slf4j;
 public class XClusterConfigSetStatusForTables extends XClusterConfigTaskBase {
 
   @Inject
-  protected XClusterConfigSetStatusForTables(BaseTaskDependencies baseTaskDependencies) {
-    super(baseTaskDependencies);
+  protected XClusterConfigSetStatusForTables(
+      BaseTaskDependencies baseTaskDependencies, XClusterUniverseService xClusterUniverseService) {
+    super(baseTaskDependencies, xClusterUniverseService);
   }
 
   public static class Params extends XClusterConfigTaskParams {
@@ -34,11 +36,8 @@ public class XClusterConfigSetStatusForTables extends XClusterConfigTaskBase {
   @Override
   public String getName() {
     return String.format(
-        "%s(xClusterConfig=%s,tableIds=%s,desiredStatus=%s)",
-        super.getName(),
-        taskParams().getXClusterConfig(),
-        taskParams().tableIds,
-        taskParams().desiredStatus);
+        "%s(xClusterConfig=%s,desiredStatus=%s)",
+        super.getName(), taskParams().getXClusterConfig(), taskParams().desiredStatus);
   }
 
   @Override
@@ -49,7 +48,7 @@ public class XClusterConfigSetStatusForTables extends XClusterConfigTaskBase {
 
     try {
       // Save the desired status in the DB.
-      xClusterConfig.setStatusForTables(taskParams().tableIds, taskParams().desiredStatus);
+      xClusterConfig.updateStatusForTables(taskParams().tableIds, taskParams().desiredStatus);
     } catch (Exception e) {
       log.error("{} hit error : {}", getName(), e.getMessage());
       throw new RuntimeException(e);

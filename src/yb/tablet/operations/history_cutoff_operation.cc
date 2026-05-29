@@ -1,4 +1,4 @@
-// Copyright (c) YugaByte, Inc.
+// Copyright (c) YugabyteDB, Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License"); you may not use this file except
 // in compliance with the License.  You may obtain a copy of the License at
@@ -40,17 +40,20 @@ consensus::LWHistoryCutoffPB* RequestTraits<consensus::LWHistoryCutoffPB>::Mutab
 }
 
 Status HistoryCutoffOperation::Apply(int64_t leader_term) {
-  HybridTime history_cutoff(request()->history_cutoff());
+  docdb::HistoryCutoff history_cutoff = {
+    .cotables_cutoff_ht = HybridTime::FromPB(request()->cotables_cutoff_ht()),
+    .primary_cutoff_ht = HybridTime::FromPB(request()->primary_cutoff_ht())
+  };
 
   VLOG_WITH_PREFIX(2) << "History cutoff replicated " << op_id() << ": " << history_cutoff;
 
   auto tablet = VERIFY_RESULT(tablet_safe());
   history_cutoff = tablet->RetentionPolicy()->UpdateCommittedHistoryCutoff(history_cutoff);
-  auto regular_db = tablet->doc_db().regular;
+  auto regular_db = tablet->regular_db();
   if (regular_db) {
     rocksdb::WriteBatch batch;
     docdb::ConsensusFrontiers frontiers;
-    frontiers.Largest().set_history_cutoff(history_cutoff);
+    frontiers.Largest().set_history_cutoff_information(history_cutoff);
     batch.SetFrontiers(&frontiers);
     rocksdb::WriteOptions options;
     RETURN_NOT_OK(regular_db->Write(options, &batch));

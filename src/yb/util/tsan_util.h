@@ -1,4 +1,4 @@
-// Copyright (c) YugaByte, Inc.
+// Copyright (c) YugabyteDB, Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License"); you may not use this file except
 // in compliance with the License.  You may obtain a copy of the License at
@@ -28,6 +28,14 @@ constexpr bool IsTsan() {
   return NonTsanVsTsan(false, true);
 }
 
+constexpr bool IsAsan() {
+#if ADDRESS_SANITIZER
+  return true;
+#else
+  return false;
+#endif
+}
+
 template <class T>
 constexpr T RegularBuildVsSanitizers(T regular_build_value, T sanitizer_value) {
 #if defined(THREAD_SANITIZER) || defined(ADDRESS_SANITIZER)
@@ -46,6 +54,30 @@ constexpr T RegularBuildVsDebugVsSanitizers(
   return regular_build_value;
 #else
   return debug_build_value;
+#endif
+}
+
+template <class T>
+constexpr T ReleaseVsDebugVsAsanVsTsan(
+    T release_build_value, T debug_build_value, T asan_value, T tsan_value) {
+#if defined(THREAD_SANITIZER)
+  return tsan_value;
+#elif defined(ADDRESS_SANITIZER)
+  return asan_value;
+#elif defined(NDEBUG)
+  return release_build_value;
+#else
+  return debug_build_value;
+#endif
+}
+
+template <class T>
+constexpr T ReleaseVsDebugVsAsanVsTsanVsApple(
+    T release_build_value, T debug_build_value, T asan_value, T tsan_value, T apple_value) {
+#if defined(__APPLE__)
+  return apple_value;
+#else
+  return ReleaseVsDebugVsAsanVsTsan(release_build_value, debug_build_value, asan_value, tsan_value);
 #endif
 }
 

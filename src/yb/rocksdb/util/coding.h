@@ -3,9 +3,9 @@
 //  LICENSE file in the root directory of this source tree. An additional grant
 //  of patent rights can be found in the PATENTS file in the same directory.
 //
-// The following only applies to changes made to this file as part of YugaByte development.
+// The following only applies to changes made to this file as part of YugabyteDB development.
 //
-// Portions Copyright (c) YugaByte, Inc.
+// Portions Copyright (c) YugabyteDB, Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License"); you may not use this file except
 // in compliance with the License.  You may obtain a copy of the License at
@@ -42,15 +42,6 @@
 
 namespace rocksdb {
 
-// Standard Put... routines append to a string
-extern void PutFixed32(std::string* dst, uint32_t value);
-extern void PutFixed64(std::string* dst, uint64_t value);
-extern void PutVarint32(std::string* dst, uint32_t value);
-extern void PutVarint64(std::string* dst, uint64_t value);
-extern void PutLengthPrefixedSlice(std::string* dst, const Slice& value);
-extern void PutLengthPrefixedSliceParts(std::string* dst,
-                                        const SliceParts& slice_parts);
-
 // Standard Get... routines parse a value from the beginning of a Slice
 // and advance the slice past the parsed value.
 extern bool GetFixed64(Slice* input, uint64_t* value);
@@ -71,11 +62,9 @@ extern const char* GetVarint64Ptr(const char* p, const char* limit, uint64_t* v)
 
 // Might use effective performance optimization that reads before src, but not before
 // read_allowed_from.
-inline const char* GetSignedVarint64Ptr(
-    const char* p, const char* limit, const char* read_allowed_from, int64_t* value) {
+inline const char* GetSignedVarint64Ptr(const char* p, const char* limit, int64_t* value) {
   size_t decoded_size;
-  if (!yb::util::FastDecodeSignedVarInt(p, limit - p, read_allowed_from, value, &decoded_size)
-           .ok()) {
+  if (!yb::FastDecodeSignedVarInt(p, limit - p, value, &decoded_size).ok()) {
     return nullptr;
   }
   return p + decoded_size;
@@ -197,11 +186,15 @@ inline void EncodeFixed64(char* buf, uint64_t value) {
 #endif
 }
 
-inline void PutFixed8(std::string* dst, uint8_t value) {
+// Standard Put... routines append to a string/buffer
+
+template <typename T>
+inline void PutFixed8(T* dst, uint8_t value) {
   dst->push_back(value);
 }
 
-inline void PutFixed32(std::string* dst, uint32_t value) {
+template <typename T>
+inline void PutFixed32(T* dst, uint32_t value) {
   char buf[sizeof(value)];
   EncodeFixed32(buf, value);
   dst->append(buf, sizeof(buf));
@@ -213,16 +206,18 @@ inline void PutFixed64(std::string* dst, uint64_t value) {
   dst->append(buf, sizeof(buf));
 }
 
-inline void PutVarint32(std::string* dst, uint32_t v) {
+template <typename T>
+inline void PutVarint32(T* dst, uint32_t v) {
   char buf[5];
   char* ptr = EncodeVarint32(buf, v);
   dst->append(buf, static_cast<size_t>(ptr - buf));
 }
 
-inline void PutSignedVarint(std::string* dst, int64_t v) {
-  char buf[yb::util::kMaxVarIntBufferSize];
+template <typename T>
+inline void PutSignedVarint(T* dst, int64_t v) {
+  char buf[yb::kMaxVarIntBufferSize];
   size_t encoded_size;
-  yb::util::FastEncodeSignedVarInt(v, pointer_cast<uint8_t*>(buf), &encoded_size);
+  yb::FastEncodeSignedVarInt(v, pointer_cast<uint8_t*>(buf), &encoded_size);
   dst->append(buf, encoded_size);
 }
 
@@ -250,8 +245,9 @@ inline void PutVarint64(std::string* dst, uint64_t v) {
   dst->append(buf, static_cast<size_t>(ptr - buf));
 }
 
-inline void FastPutVarint64(std::string* dst, uint64_t v) {
-  char buf[yb::util::kMaxVarIntBufferSize];
+template <typename T>
+inline void FastPutVarint64(T* dst, uint64_t v) {
+  char buf[yb::kMaxVarIntBufferSize];
   char* ptr = FastEncodeVarint64(buf, v);
   dst->append(buf, static_cast<size_t>(ptr - buf));
 }

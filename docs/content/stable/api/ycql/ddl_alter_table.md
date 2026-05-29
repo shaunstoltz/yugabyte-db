@@ -4,9 +4,12 @@ headerTitle: ALTER TABLE
 linkTitle: ALTER TABLE
 description: Use the ALTER TABLE statement to change the schema or definition of an existing table.
 menu:
-  stable:
+  stable_api:
     parent: api-cassandra
     weight: 1220
+aliases:
+  - /stable/api/cassandra/ddl_alter_table
+  - /stable/api/ycql/ddl_alter_table
 type: docs
 ---
 
@@ -121,7 +124,7 @@ CREATE TABLE example.employees (
 
 ### Update a table property
 
-You can do this as shown below.
+You can do this as follows:
 
 ```sql
 ycqlsh:example> ALTER TABLE employees WITH default_time_to_live = 5;

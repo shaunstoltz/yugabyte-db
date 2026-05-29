@@ -1,4 +1,4 @@
-import React, { ChangeEvent, ReactElement } from 'react';
+import { ChangeEvent, ReactElement } from 'react';
 import _ from 'lodash';
 import { useQuery } from 'react-query';
 import { useUpdateEffect } from 'react-use';
@@ -9,6 +9,7 @@ import { YBLabel, YBAutoComplete } from '../../../../../../components';
 import { api, QUERY_KEY } from '../../../utils/api';
 import { UniverseFormData } from '../../../utils/dto';
 import { PROVIDER_FIELD, REGIONS_FIELD } from '../../../utils/constants';
+import { useFormFieldStyles } from '../../../universeMainStyle';
 
 interface RegionsFieldProps {
   disabled?: boolean;
@@ -18,6 +19,7 @@ const getOptionLabel = (option: Record<string, string>): string => option?.name;
 
 export const RegionsField = ({ disabled }: RegionsFieldProps): ReactElement => {
   const { control, setValue, getValues } = useFormContext<UniverseFormData>();
+  const classes = useFormFieldStyles();
   const { t } = useTranslation();
 
   //watchers
@@ -50,7 +52,7 @@ export const RegionsField = ({ disabled }: RegionsFieldProps): ReactElement => {
   // reset selected regions on provider change
   useUpdateEffect(() => {
     setValue(REGIONS_FIELD, []);
-  }, [provider]);
+  }, [provider?.uuid]);
 
   return (
     <Box display="flex" width="100%" flexDirection={'row'} data-testid="RegionsField-Container">
@@ -69,7 +71,7 @@ export const RegionsField = ({ disabled }: RegionsFieldProps): ReactElement => {
               <YBLabel dataTestId="RegionsField-Label">
                 {t('universeForm.cloudConfig.regionsField')}
               </YBLabel>
-              <Box flex={1}>
+              <Box flex={1} className={classes.defaultTextBox}>
                 <YBAutoComplete
                   multiple={true}
                   loading={isFetching}
@@ -82,7 +84,10 @@ export const RegionsField = ({ disabled }: RegionsFieldProps): ReactElement => {
                   ybInputProps={{
                     error: !!fieldState.error,
                     helperText: fieldState.error?.message,
-                    'data-testid': 'RegionsField-AutoComplete'
+                    'data-testid': 'RegionsField-AutoComplete',
+                    placeholder: _.isEmpty(value)
+                      ? t('universeForm.cloudConfig.placeholder.selectRegions')
+                      : ''
                   }}
                 />
               </Box>

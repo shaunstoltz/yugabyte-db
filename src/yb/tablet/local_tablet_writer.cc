@@ -1,4 +1,4 @@
-// Copyright (c) YugaByte, Inc.
+// Copyright (c) YugabyteDB, Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License"); you may not use this file except
 // in compliance with the License.  You may obtain a copy of the License at
@@ -24,7 +24,7 @@
 #include "yb/tablet/tablet_metadata.h"
 #include "yb/tablet/write_query.h"
 
-#include "yb/tserver/tserver.pb.h"
+#include "yb/tserver/tserver.messages.h"
 
 #include "yb/util/status_format.h"
 #include "yb/util/status_log.h"
@@ -63,19 +63,24 @@ Status LocalTabletWriter::Write(QLWriteRequestPB* request) {
 Status LocalTabletWriter::WriteBatch(Batch* batch) {
   req_->Clear();
   for (auto& req : *batch) {
-    req.set_schema_version(tablet_->metadata()->schema_version());
+    req.set_schema_version(tablet_->metadata()->primary_table_schema_version());
     QLSetHashCode(&req);
   }
   req_->mutable_ql_write_batch()->Swap(batch);
 
+  auto arena = SharedThreadSafeArena();
+  auto resp = arena->NewArenaObject<tserver::LWWriteResponsePB>();
+
   auto query = std::make_unique<WriteQuery>(
       OpId::kUnknownTerm, CoarseTimePoint::max() /* deadline */, this,
-      tablet_, nullptr, resp_.get());
-  query->set_client_request(*req_);
+      tablet_, /* rpc_context= */ nullptr, resp);
+  query->set_client_request(*arena->NewArenaObject<tserver::LWWriteRequestPB>(*req_));
   write_promise_ = std::promise<Status>();
   tablet_->AcquireLocksAndPerformDocOperations(std::move(query));
 
-  return write_promise_.get_future().get();
+  RETURN_NOT_OK(write_promise_.get_future().get());
+  resp->ToGoogleProtobuf(resp_.get());
+  return Status::OK();
 }
 
 void LocalTabletWriter::Submit(std::unique_ptr<Operation> operation, int64_t term) {

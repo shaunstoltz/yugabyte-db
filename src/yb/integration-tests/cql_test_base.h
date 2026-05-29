@@ -1,4 +1,4 @@
-// Copyright (c) YugaByte, Inc.
+// Copyright (c) YugabyteDB, Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License"); you may not use this file except
 // in compliance with the License.  You may obtain a copy of the License at
@@ -49,6 +49,10 @@ class CqlTestBase : public MiniClusterTestWithClient<MiniClusterType> {
   }
 
   Status RunBackupCommand(const std::vector<std::string>& args);
+
+  static std::unique_ptr<cqlserver::CQLServer> MakeCQLServerForTServer(
+      MiniClusterType* cluster, int ts_idx, client::YBClient* client, std::string* cql_host,
+      uint16_t* cql_port);
 
  protected:
   void DoTearDown() override;

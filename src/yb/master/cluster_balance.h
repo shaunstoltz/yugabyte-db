@@ -1,4 +1,4 @@
-// Copyright (c) YugaByte, Inc.
+// Copyright (c) YugabyteDB, Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License"); you may not use this file except
 // in compliance with the License.  You may obtain a copy of the License at
@@ -27,7 +27,9 @@
 #include "yb/master/catalog_manager.h"
 #include "yb/master/master_fwd.h"
 #include "yb/master/cluster_balance_util.h"
+#include "yb/master/cluster_balance_activity_info.h"
 #include "yb/master/ts_descriptor.h"
+#include "yb/master/ysql_tablespace_manager.h"
 
 #include "yb/util/random.h"
 
@@ -81,16 +83,19 @@ class ClusterLoadBalancer {
 
   void InitMetrics();
 
-  // Executes one run of the load balancing algorithm. This currently does not persist any state,
+  // Executes one run of the cluster balancing algorithm. This currently does not persist any state,
   // so it needs to scan the in-memory tablet and TS data in the CatalogManager on every run and
   // create a new PerTableLoadState object.
-  void RunLoadBalancerWithOptions(Options* options);
+  void RunClusterBalancerWithOptions(
+      Options* options, const std::vector<TableInfoPtr>& tables, const TabletInfoMap& tablet_map);
 
-  // Runs the load balancer once for the live and all read only clusters, in order
+  // Runs the cluster balancer once for the live and all read only clusters, in order
   // of the cluster config.
-  virtual void RunLoadBalancer(Options* options = nullptr);
+  void RunClusterBalancer(
+      const LeaderEpoch& epoch, const std::vector<TableInfoPtr>& tables,
+      const TabletInfoMap& tablet_map);
 
-  // Sets whether to enable or disable the load balancer, on demand.
+  // Sets whether to enable or disable the cluster balancer, on demand.
   void SetLoadBalancerEnabled(bool is_enabled) { is_enabled_ = is_enabled; }
 
   bool IsLoadBalancerEnabled() const;
@@ -102,18 +107,18 @@ class ClusterLoadBalancer {
   MonoTime LastRunTime() const;
 
   Status IsIdle() const;
+  ClusterBalancerActivityInfo GetLatestActivityInfo() const;
 
-  // Returns the TableInfo of all the tables for whom load balancing is being skipped.
+  // Returns the TableInfo of all the tables for whom cluster balancing is being skipped.
   // As of today, this constitutes all the system tables, colocated user tables
   // and tables which have been marked as DELETING OR DELETED.
   // N.B. Currently this function is only used in test code. If using in production be mindful
   // that this function will not return colocated user tables as those are pre-filtered by the
-  // table API the load balancer uses.
-  std::vector<scoped_refptr<TableInfo>> GetAllTablesLoadBalancerSkipped();
+  // table API the cluster balancer uses.
+  std::vector<scoped_refptr<TableInfo>> GetAllTablesClusterBalancerSkipped();
 
   // Return the replication info for 'table'.
-  virtual Result<ReplicationInfoPB> GetTableReplicationInfo(
-      const scoped_refptr<const TableInfo>& table) const;
+  virtual ReplicationInfoPB GetTableReplicationInfo(const TableInfoPtr& table) const;
 
   //
   // Catalog manager indirection methods.
@@ -125,50 +130,39 @@ class ClusterLoadBalancer {
 
   void InitializeTSDescriptors();
 
-  // Get the list of all live TSDescriptors which reported their tablets.
-  virtual void GetAllReportedDescriptors(TSDescriptorVector* ts_descs) const;
-
   // Get the list of all TSDescriptors.
   virtual void GetAllDescriptors(TSDescriptorVector* ts_descs) const;
 
-    // Get access to the tablet map across the cluster.
-  virtual const TabletInfoMap& GetTabletMap() const REQUIRES_SHARED(catalog_manager_->mutex_);
+  virtual std::optional<std::reference_wrapper<const TabletInfoPtr>> GetTabletInfo(
+      const TabletId& id) const;
 
-  // Get an iterator for the tables.
-  virtual TableIndex::TablesRange GetTables() const
-      REQUIRES_SHARED(catalog_manager_->mutex_);
-
-  // Get the table info object for given table uuid.
-  virtual const scoped_refptr<TableInfo> GetTableInfo(const TableId& table_uuid) const
-    REQUIRES_SHARED(catalog_manager_->mutex_);
-
-  // Should skip load-balancing of this table?
-  virtual bool SkipLoadBalancing(const TableInfo& table) const
-      REQUIRES_SHARED(catalog_manager_->mutex_);
+  // Should skip cluster balancing of this table?
+  bool SkipLoadBalancing(const TableInfo& table) const;
 
   // Increment the provided variables by the number of pending tasks that were found. Do not call
   // more than once for the same table because it also modifies the internal state.
-  virtual Status CountPendingTasksUnlocked(const TableId& table_uuid,
-                                                   int* pending_add_replica_tasks,
-                                                   int* pending_remove_replica_tasks,
-                                                   int* pending_stepdown_leader_tasks)
-    REQUIRES_SHARED(catalog_manager_->mutex_);
+  Status CountPendingTasks(
+      const TableInfoPtr& table,
+      int* pending_add_replica_tasks,
+      int* pending_remove_replica_tasks,
+      int* pending_stepdown_leader_tasks);
 
   // Wrapper around CatalogManager::GetPendingTasks so it can be mocked by TestLoadBalancer.
-  virtual void GetPendingTasks(const std::string& table_uuid,
+  virtual void GetPendingTasks(const TableInfoPtr& table,
                                TabletToTabletServerMap* add_replica_tasks,
                                TabletToTabletServerMap* remove_replica_tasks,
-                               TabletToTabletServerMap* stepdown_leader_tasks)
-      REQUIRES_SHARED(catalog_manager_->mutex_);
+                               TabletToTabletServerMap* stepdown_leader_tasks);
 
-  // Issue the call to CatalogManager to change the config for this particular tablet, either
-  // adding or removing the peer at ts_uuid, based on the is_add argument. Removing the peer
-  // is optional. When neither adding nor removing peer, it means just moving a leader from one
-  // tablet server to another. If new_leader_ts_uuid is empty, a server will be picked by random
-  // to be the new leader. Also takes in the role of the tablet for the creation flow.
-  virtual Status SendReplicaChanges(
-      scoped_refptr<TabletInfo> tablet, const TabletServerId& ts_uuid, const bool is_add,
-      const bool should_remove_leader, const TabletServerId& new_leader_ts_uuid = "");
+  // Issue the calls to CatalogManager to change the config for this particular tablet.
+  virtual Status SendAddReplica(
+      const TabletInfoPtr& tablet, const TabletServerId& ts_uuid, const std::string& reason);
+  virtual Status SendRemoveReplica(
+      const TabletInfoPtr& tablet, const TabletServerId& ts_uuid, const std::string& reason);
+  // If new_leader_ts_uuid is empty, a server will be picked by random to be the new leader.
+  virtual Status SendMoveLeader(
+      const TabletInfoPtr& tablet, const TabletServerId& ts_uuid,
+      bool also_remove_replica, const std::string& reason,
+      const TabletServerId& new_leader_ts_uuid = "");
 
   // If type_ is live, return PRE_VOTER, otherwise, return PRE_OBSERVER.
   consensus::PeerMemberType GetDefaultMemberType();
@@ -187,40 +181,36 @@ class ClusterLoadBalancer {
   // Goes over the tablet_map_ and the set of live TSDescriptors to compute the load distribution
   // across the tablets for the given table. Returns an OK status if the method succeeded or an
   // error if there are transient errors in updating the internal state.
-  virtual Status AnalyzeTabletsUnlocked(const TableId& table_uuid)
-      REQUIRES_SHARED(catalog_manager_->mutex_);
+  Status AnalyzeTablets(const TableInfoPtr& table);
+
+  // Finds all under-replicated tablets and processes them in order of priority.
+  void ProcessUnderReplicatedTablets(
+      int& remaining_adds, bool& task_added, TabletId& out_tablet_id, TabletServerId& out_to_ts);
 
   // Processes any required replica additions, as part of moving load from a highly loaded TS to
   // one that is less loaded.
   //
   // Returns true if a move was actually made.
   Result<bool> HandleAddReplicas(
-      TabletId* out_tablet_id, TabletServerId* out_from_ts, TabletServerId* out_to_ts)
-      REQUIRES_SHARED(catalog_manager_->mutex_);
+      TabletId* out_tablet_id, TabletServerId* out_from_ts, TabletServerId* out_to_ts);
 
   // Processes any required replica removals, as part of having added an extra replica to a
   // tablet's set of peers, which caused its quorum to be larger than the configured number.
   //
   // Returns true if a move was actually made.
-  Result<bool> HandleRemoveReplicas(TabletId* out_tablet_id, TabletServerId* out_from_ts)
-      REQUIRES_SHARED(catalog_manager_->mutex_);
+  Result<bool> HandleRemoveReplicas(TabletId* out_tablet_id, TabletServerId* out_from_ts);
 
   // Methods for load preparation, called by ClusterLoadBalancer while analyzing tablets and
   // building the initial state.
 
   virtual void InitTablespaceManager();
 
-  // Method called when initially analyzing tablets, to build up load and usage information.
-  // Returns an OK status if the method succeeded or an error if there are transient errors in
-  // updating the internal state.
-  Status UpdateTabletInfo(TabletInfo* tablet);
-
   // If a tablet is under-replicated, or has certain placements that have less than the minimum
   // required number of replicas, we need to add extra tablets to its peer set.
+  // Takes in a specific tablet id which we will try to fix.
   //
   // Returns true if a move was actually made.
-  Result<bool> HandleAddIfMissingPlacement(TabletId* out_tablet_id, TabletServerId* out_to_ts)
-      REQUIRES_SHARED(catalog_manager_->mutex_);
+  Result<bool> HandleAddIfMissingPlacement(const TabletId& tablet_id, TabletServerId* out_to_ts);
 
   // If we find a tablet with peers that violate the placement information, we want to move load
   // away from the invalid placement peers, to new peers that are valid. To ensure we do not
@@ -229,34 +219,36 @@ class ClusterLoadBalancer {
   //
   // Returns true if a move was actually made.
   Result<bool> HandleAddIfWrongPlacement(
-      TabletId* out_tablet_id, TabletServerId* out_from_ts, TabletServerId* out_to_ts)
-      REQUIRES_SHARED(catalog_manager_->mutex_);
+      TabletId* out_tablet_id, TabletServerId* out_from_ts, TabletServerId* out_to_ts);
 
   // If we find a tablet with peers that violate the placement information, we first over-replicate
   // the peer group, in the add portion of the algorithm. We then eventually remove extra replicas
   // on the remove path, here.
   //
   // Returns true if a move was actually made.
-  Result<bool> HandleRemoveIfWrongPlacement(TabletId* out_tablet_id, TabletServerId* out_from_ts)
-      REQUIRES_SHARED(catalog_manager_->mutex_);
+  Result<bool> HandleRemoveIfWrongPlacement(TabletId* out_tablet_id, TabletServerId* out_from_ts);
 
+  struct LeaderMoveDetails {
+    TabletId tablet_id;
+    TabletServerId from_ts;
+    TabletServerId to_ts;
+    std::string to_ts_path;
+    std::string reason;
+    // Whether to also remove the replica after stepping down the leader.
+    bool also_remove_replica = false;
+  };
   // Move leaders load from a lower priority to a high priority TServers.
   // This is called before normal leader load balancing which balances load within each priority.
   //
-  // Returns true if we could find a leader to rebalance and sets the three output parameters.
+  // Returns true if we could find a leader to rebalance and sets the output parameters.
   // Returns false otherwise. If error is found, returns Status.
-  Result<bool> GetLeaderToMoveAcrossAffinitizedPriorities(
-      TabletId* moving_tablet_id,
-      TabletServerId* from_ts,
-      TabletServerId* to_ts,
-      std::string* to_ts_path);
+  Result<std::optional<LeaderMoveDetails>> GetLeaderToMoveAcrossAffinitizedPriorities();
 
   // Processes any tablet leaders that are on a highly loaded tablet server and need to be moved.
   //
   // Returns true if a move was actually made.
   Result<bool> HandleLeaderMoves(
-      TabletId* out_tablet_id, TabletServerId* out_from_ts, TabletServerId* out_to_ts)
-      REQUIRES_SHARED(catalog_manager_->mutex_);
+      TabletId* out_tablet_id, TabletServerId* out_from_ts, TabletServerId* out_to_ts);
 
   virtual void GetAllAffinitizedZones(
       const ReplicationInfoPB& replication_info,
@@ -265,13 +257,9 @@ class ClusterLoadBalancer {
   // Go through sorted_leader_load_ one priority at a time and move leaders so as to get an even
   // balance per table and globally.
   //
-  // Returns true if we could find a leader to rebalance and sets the three output parameters.
-  // Returns false otherwise. If error is found, returns Status.
-  Result<bool> GetLeaderToMoveWithinAffinitizedPriorities(
-      TabletId* moving_tablet_id,
-      TabletServerId* from_ts,
-      TabletServerId* to_ts,
-      std::string* to_ts_path);
+  // Returns leader if we could find a leader to rebalance and sets the output parameters.
+  // Returns std::nullopt otherwise. If error is found, returns Status.
+  Result<std::optional<LeaderMoveDetails>> GetLeaderToMoveWithinAffinitizedPriorities();
 
   // Go through sorted_load_ and figure out which tablet to rebalance and from which TS that is
   // serving it to which other TS.
@@ -279,46 +267,33 @@ class ClusterLoadBalancer {
   // Returns true if we could find a tablet to rebalance and sets the three output parameters.
   // Returns false otherwise.
   Result<bool> GetLoadToMove(
-      TabletId* moving_tablet_id, TabletServerId* from_ts, TabletServerId* to_ts)
-      REQUIRES_SHARED(catalog_manager_->mutex_);
+      TabletId* moving_tablet_id, TabletServerId* from_ts, TabletServerId* to_ts);
 
-  Result<bool> GetTabletToMove(
-      const TabletServerId& from_ts, const TabletServerId& to_ts, TabletId* moving_tablet_id)
-      REQUIRES_SHARED(catalog_manager_->mutex_);
+  Result<std::optional<TabletId>> GetTabletToMove(
+      const TabletServerId& from_ts, const TabletServerId& to_ts);
 
-  // Issue the change config and modify the in-memory state for moving a replica from one tablet
-  // server to another.
-  Status MoveReplica(
-      const TabletId& tablet_id, const TabletServerId& from_ts, const TabletServerId& to_ts)
-      REQUIRES_SHARED(catalog_manager_->mutex_);
-
-  // Issue the change config and modify the in-memory state for adding a replica on the specified
-  // tablet server.
-  Status AddReplica(const TabletId& tablet_id, const TabletServerId& to_ts)
-      REQUIRES_SHARED(catalog_manager_->mutex_);
+  // Issue the change config and modify the in-memory state for adding or moving a replica on the
+  // specified tablet server.
+  // from_ts may be empty for adds and is only used for logging. The remove replica for moves
+  // happens in a later cluster balancer iteration (once the tablet is over-replicated).
+  Status AddOrMoveReplica(
+      const TabletId& tablet_id, const TabletServerId& from_ts, const TabletServerId& to_ts,
+      const std::string& reason);
 
   // Issue the change config and modify the in-memory state for removing a replica on the specified
   // tablet server.
   Status RemoveReplica(
-      const TabletId& tablet_id, const TabletServerId& ts_uuid)
-      REQUIRES_SHARED(catalog_manager_->mutex_);
+      const TabletId& tablet_id, const TabletServerId& ts_uuid, const std::string& reason);
+
+  // Select the best leader from the tablet's replicas based on leader affinity / preferred zones.
+  // Returns the TabletServerId of the preferred leader, or empty string if no preferred leader
+  // could be determined.
+  TabletServerId SelectBestLeaderAfterStepdown(
+      const TabletId& tablet_id, const TabletServerId& ts_to_exclude);
 
   // Issue the change config and modify the in-memory state for moving a tablet leader on the
   // specified tablet server to the other specified tablet server.
-  Status MoveLeader(const TabletId& tablet_id,
-                    const TabletServerId& from_ts,
-                    const TabletServerId& to_ts,
-                    const std::string& to_ts_path)
-      REQUIRES_SHARED(catalog_manager_->mutex_);
-
-  // Methods called for returning tablet id sets, for figuring out tablets to move around.
-
-  const PlacementInfoPB& GetPlacementByTablet(const TabletId& tablet_id) const
-      REQUIRES_SHARED(catalog_manager_->mutex_);
-
-  // Get access to all the tablets for the given table.
-  Result<TabletInfos> GetTabletsForTable(const TableId& table_uuid) const
-      REQUIRES_SHARED(catalog_manager_->mutex_);
+  Status MoveLeader(const LeaderMoveDetails& move_details);
 
   // Populates pb with the replication_info in tablet's config at cluster placement_uuid_.
   Status PopulateReplicationInfo(
@@ -348,6 +323,7 @@ class ClusterLoadBalancer {
   int get_total_running_tablets() const;
 
   size_t get_total_wrong_placement() const;
+  size_t get_badly_placed_leaders() const;
   size_t get_total_blacklisted_servers() const;
   size_t get_total_leader_blacklisted_servers() const;
 
@@ -357,61 +333,68 @@ class ClusterLoadBalancer {
   PerTableLoadState* state_ = nullptr;
 
   std::unique_ptr<GlobalLoadState> global_state_;
+  std::unique_ptr<PerRunState> per_run_state_;
 
   // The catalog manager of the Master that actually has the Tablet and TS state. The object is not
   // managed by this class, but by the Master's unique_ptr.
   CatalogManager* catalog_manager_;
 
-  // Info about if load balancing is enabled in the cluster.
   scoped_refptr<AtomicGauge<int64_t>> is_load_balancing_enabled_metric_;
+  scoped_refptr<AtomicGauge<uint32_t>> tablets_in_wrong_placement_metric_;
+  scoped_refptr<AtomicGauge<uint32_t>> blacklisted_leaders_metric_;
+  scoped_refptr<AtomicGauge<uint32_t>> total_table_load_difference_metric_;
+  scoped_refptr<AtomicGauge<uint64_t>> estimated_data_to_balance_bytes_metric_;
 
   std::shared_ptr<YsqlTablespaceManager> tablespace_manager_;
 
-  template <class ClusterLoadBalancerClass> friend class TestLoadBalancerBase;
+  friend class LoadBalancerMockedBase;
 
  private:
   // Returns true if at least one member in the tablet's configuration is transitioning into a
   // VOTER, but it's not a VOTER yet.
-  Result<bool> IsConfigMemberInTransitionMode(const TabletId& tablet_id) const
-      REQUIRES_SHARED(catalog_manager_->mutex_);
+  Result<bool> IsConfigMemberInTransitionMode(const TabletId& tablet_id) const;
 
-  // Dump the sorted load on tservers (it is usually per table).
-  void DumpSortedLoad() const;
+  std::string GetSortedLoad() const;
+  std::string GetSortedLeaderLoad() const;
 
-  // Report unusual state at the beginning of an LB run which may prevent LB from making moves.
-  void ReportUnusualLoadBalancerState() const;
+  // Report unusual state at the beginning of a cluster balancer run which may prevent it from
+  // making moves.
+  void ReportUnusualClusterBalancerState() const;
 
-  Result<bool> GetLeaderToMove(
-      const std::vector<TabletServerId>& sorted_leader_load,
-      TabletId* moving_tablet_id,
-      TabletServerId* from_ts,
-      TabletServerId* to_ts,
-      std::string* to_ts_path);
+  Result<std::optional<LeaderMoveDetails>> GetLeaderToMove(
+      const std::vector<TabletServerId>& sorted_leader_load);
 
   virtual void SetBlacklistAndPendingDeleteTS();
+
+  void TrackTask(const std::shared_ptr<RetryingRpcTask>& task);
+
+  struct UnderReplicatedTabletInfo {
+    TabletId tablet_id;
+    int tablet_count;
+    PerTableLoadState* table_state;
+
+    UnderReplicatedTabletInfo(TabletId tablet_id, int tablet_count, PerTableLoadState* table_state)
+        : tablet_id(tablet_id), tablet_count(tablet_count), table_state(table_state) {}
+
+    bool operator<(const UnderReplicatedTabletInfo& other) const {
+      return (tablet_count < other.tablet_count);
+    }
+  };
+
+  // Goes over all table states and returns a priority-sorted list of under-replicated tablets.
+  std::vector<UnderReplicatedTabletInfo> CollectUnderReplicatedTablets();
+
+  // Checks if we are at our RBS or overreplicated tablets limit.
+  Status CanAddReplicas();
 
   // Random number generator for picking items at random from sets, using ReservoirSample.
   ThreadSafeRandom random_;
 
-  // Controls whether to run the load balancing algorithm or not.
+  // Controls whether to run the cluster balancing algorithm or not.
   std::atomic<bool> is_enabled_;
 
-  // Information representing activity of load balancer.
-  struct ActivityInfo {
-    uint32_t table_tasks = 0;
-    uint32_t master_errors = 0;
-
-    bool IsIdle() const {
-      return table_tasks == 0 && master_errors == 0;
-    }
-  };
-
-  // Circular buffer of load balancer activity.
-  boost::circular_buffer<ActivityInfo> cbuf_activities_;
-
-  // Summary of circular buffer of load balancer activity.
-  size_t num_idle_runs_ = 0;
-  std::atomic<bool> is_idle_ {true};
+  // Circular buffer of cluster balancer activity.
+  ClusterBalancerActivityBuffer activity_buffer_;
 
   // Check if we are able to balance global load. With the current algorithm, we only allow for
   // global load balancing once all tables are themselves balanced.
@@ -419,25 +402,23 @@ class ClusterLoadBalancer {
   // once we perform a non-global move.
   bool can_perform_global_operations_ = false;
 
-  // Record load balancer activity for tables and tservers.
-  void RecordActivity(bool tasks_added_in_this_run, uint32_t master_errors)
-      REQUIRES_SHARED(catalog_manager_->mutex_);
-
   typedef rw_spinlock LockType;
   mutable LockType mutex_;
 
-  // Maintains a list of all tables for whom LB has been skipped.
-  // Currently for consumption by components outside the LB.
-  // Protected by a readers-writers lock. Only the LB writes to it.
+  // Maintains a list of all tables for whom cluster balancing has been skipped.
+  // Currently for consumption by components outside the cluster balancer.
+  // Protected by a readers-writers lock. Only the cluster balancer writes to it.
   // Other components such as test, admin UI, etc. should
   // ideally read from it using a shared_lock<>.
   std::vector<scoped_refptr<TableInfo>> skipped_tables_ GUARDED_BY(mutex_);
-  // Internal to LB structure to keep track of skipped tables.
-  // skipped_tables_ is set at the end of each LB run using
+  // Internal to cluster balancer structure to keep track of skipped tables.
+  // skipped_tables_ is set at the end of each cluster balancer run using
   // skipped_tables_per_run_.
   std::vector<scoped_refptr<TableInfo>> skipped_tables_per_run_;
 
-  std::atomic<MonoTime> last_load_balance_run_;
+  void UpdatePerRunMetrics();
+
+  LeaderEpoch epoch_;
 
   DISALLOW_COPY_AND_ASSIGN(ClusterLoadBalancer);
 };

@@ -1,33 +1,55 @@
-// Copyright (c) YugaByte, Inc.
+// Copyright (c) YugabyteDB, Inc.
 package com.yugabyte.yw.common;
 
 import static com.google.common.base.Preconditions.checkArgument;
 import static com.yugabyte.yw.common.PlacementInfoUtil.getNumMasters;
 import static play.mvc.Http.Status.BAD_REQUEST;
+import static play.mvc.Http.Status.INTERNAL_SERVER_ERROR;
 
 import com.fasterxml.jackson.core.JsonProcessingException;
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
+import com.fasterxml.jackson.databind.node.ArrayNode;
+import com.fasterxml.jackson.databind.node.ObjectNode;
 import com.google.common.annotations.VisibleForTesting;
+import com.google.common.collect.ImmutableList;
 import com.google.common.collect.ImmutableMap;
-import com.google.common.net.HostAndPort;
+import com.google.common.collect.ImmutableSet;
+import com.typesafe.config.Config;
 import com.yugabyte.yw.cloud.PublicCloudConstants.Architecture;
 import com.yugabyte.yw.cloud.PublicCloudConstants.OsType;
 import com.yugabyte.yw.commissioner.Common;
 import com.yugabyte.yw.commissioner.Common.CloudType;
+import com.yugabyte.yw.common.config.GlobalConfKeys;
+import com.yugabyte.yw.common.config.ProviderConfKeys;
+import com.yugabyte.yw.common.config.RuntimeConfGetter;
+import com.yugabyte.yw.common.gflags.GFlagsUtil;
+import com.yugabyte.yw.common.logging.LogUtil;
 import com.yugabyte.yw.common.utils.Pair;
+import com.yugabyte.yw.controllers.RequestContext;
+import com.yugabyte.yw.controllers.TokenAuthenticator;
 import com.yugabyte.yw.forms.UniverseDefinitionTaskParams;
 import com.yugabyte.yw.forms.UniverseDefinitionTaskParams.Cluster;
 import com.yugabyte.yw.forms.UniverseDefinitionTaskParams.ClusterType;
 import com.yugabyte.yw.forms.UniverseDefinitionTaskParams.UserIntent;
+import com.yugabyte.yw.models.AttachDetachSpec;
 import com.yugabyte.yw.models.Customer;
+import com.yugabyte.yw.models.CustomerTask;
+import com.yugabyte.yw.models.ImageBundle;
+import com.yugabyte.yw.models.InstanceType;
+import com.yugabyte.yw.models.InstanceType.VolumeDetails;
+import com.yugabyte.yw.models.Provider;
+import com.yugabyte.yw.models.TaskInfo;
+import com.yugabyte.yw.models.Universe;
+import com.yugabyte.yw.models.Universe.UniverseUpdater;
+import com.yugabyte.yw.models.Users;
 import com.yugabyte.yw.models.extended.UserWithFeatures;
 import com.yugabyte.yw.models.helpers.NodeDetails;
-import com.yugabyte.yw.models.Provider;
-import com.yugabyte.yw.models.Universe;
-import com.yugabyte.yw.models.Users;
+import io.ebean.DB;
 import io.swagger.annotations.ApiModel;
+import jakarta.persistence.PersistenceException;
 import java.io.BufferedInputStream;
+import java.io.BufferedOutputStream;
 import java.io.File;
 import java.io.FileInputStream;
 import java.io.FileOutputStream;
@@ -36,9 +58,11 @@ import java.math.BigDecimal;
 import java.net.InetAddress;
 import java.net.InetSocketAddress;
 import java.net.MalformedURLException;
+import java.net.Socket;
 import java.net.URL;
 import java.net.UnknownHostException;
 import java.nio.ByteBuffer;
+import java.nio.charset.Charset;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.Paths;
@@ -53,34 +77,48 @@ import java.util.Collection;
 import java.util.Date;
 import java.util.HashMap;
 import java.util.HashSet;
+import java.util.Iterator;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
+import java.util.Random;
 import java.util.Set;
 import java.util.TimeZone;
 import java.util.UUID;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.TimeUnit;
+import java.util.function.Function;
+import java.util.function.Predicate;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
+import java.util.stream.Collectors;
 import java.util.zip.GZIPInputStream;
-import lombok.Getter;
+import java.util.zip.GZIPOutputStream;
+import javax.annotation.Nullable;
+import lombok.AllArgsConstructor;
+import lombok.Builder;
+import lombok.Value;
+import lombok.extern.jackson.Jacksonized;
+import lombok.extern.slf4j.Slf4j;
 import org.apache.commons.codec.binary.Hex;
 import org.apache.commons.collections4.CollectionUtils;
+import org.apache.commons.collections4.MapUtils;
 import org.apache.commons.compress.archivers.tar.TarArchiveEntry;
 import org.apache.commons.compress.archivers.tar.TarArchiveInputStream;
 import org.apache.commons.compress.archivers.tar.TarArchiveOutputStream;
+import org.apache.commons.io.FileUtils;
 import org.apache.commons.io.IOUtils;
+import org.apache.commons.lang3.RandomStringUtils;
 import org.apache.commons.lang3.StringUtils;
-import org.slf4j.Logger;
-import org.slf4j.LoggerFactory;
+import org.apache.commons.validator.routines.InetAddressValidator;
+import org.slf4j.MDC;
 import play.libs.Json;
-import play.mvc.Http.Context;
 
+@Slf4j
 public class Util {
-  public static final Logger LOG = LoggerFactory.getLogger(Util.class);
   private static final Map<UUID, Process> processMap = new ConcurrentHashMap<>();
 
+  public static final UUID NULL_UUID = UUID.fromString("00000000-0000-0000-0000-000000000000");
   public static final String YSQL_PASSWORD_KEYWORD = "PASSWORD";
   public static final String DEFAULT_YSQL_USERNAME = "yugabyte";
   public static final String DEFAULT_YSQL_PASSWORD = "yugabyte";
@@ -88,10 +126,13 @@ public class Util {
   public static final String DEFAULT_YCQL_USERNAME = "cassandra";
   public static final String DEFAULT_YCQL_PASSWORD = "cassandra";
   public static final String YUGABYTE_DB = "yugabyte";
+  public static final String CONSISTENCY_CHECK_TABLE_NAME = "yba_consistency_check";
+  public static final String SLOW_QUERIES_AGGREGATATION_TABLE = "slow_queries_data";
   public static final int MIN_NUM_BACKUPS_TO_RETAIN = 3;
   public static final String REDACT = "REDACTED";
   public static final String KEY_LOCATION_SUFFIX = "/backup_keys.json";
   public static final String SYSTEM_PLATFORM_DB = "system_platform";
+  public static final String WRITE_READ_TABLE = "write_read_test";
   public static final int YB_SCHEDULER_INTERVAL = 2;
   public static final String DEFAULT_YB_SSH_USER = "yugabyte";
   public static final String DEFAULT_SUDO_SSH_USER = "centos";
@@ -100,18 +141,52 @@ public class Util {
   public static final String GCS = "GCS";
   public static final String S3 = "S3";
   public static final String NFS = "NFS";
+  public static final String HTTP = "HTTP";
 
-  public static final String BLACKLIST_LEADERS = "yb.upgrade.blacklist_leaders";
-  public static final String BLACKLIST_LEADER_WAIT_TIME_MS =
-      "yb.upgrade.blacklist_leader_wait_time_ms";
+  public static final String CUSTOMERS = "customers";
+  public static final String UNIVERSES = "universes";
+  public static final String USERS = "users";
+  public static final String ROLE = "role";
+  public static final String UNIVERSE_UUID = "universeUUID";
 
   public static final String AVAILABLE_MEMORY = "MemAvailable";
 
   public static final String UNIVERSE_NAME_REGEX = "^[a-zA-Z0-9]([-a-zA-Z0-9]*[a-zA-Z0-9])?$";
 
+  /**
+   * Conservative safe-set for string values that are interpolated directly into shell or sed
+   * command fragments. Matches only ASCII letters, digits, dot, underscore, and hyphen. This is a
+   * security check (preventing shell-quote escape, command injection, and sed metacharacters), not
+   * a schema rule -- it must not be relaxed without auditing every interpolation site.
+   */
+  public static final Pattern SHELL_SAFE_IDENTIFIER = Pattern.compile("[A-Za-z0-9._-]+");
+
   public static final double EPSILON = 0.000001d;
 
-  public static final String YBC_COMPATIBLE_DB_VERSION = "2.15.0.0-b1";
+  public static final String K8S_YBC_COMPATIBLE_DB_VERSION = "2.17.3.0-b62";
+
+  public static final String YBDB_ROLLBACK_DB_VERSION = "2.20.2.0-b1";
+
+  public static final String GFLAG_GROUPS_STABLE_VERSION = "2024.1.0.0-b129";
+
+  public static final String GFLAG_GROUPS_PREVIEW_VERSION = "2.23.0.0-b416";
+
+  public static final String CONNECTION_POOLING_PREVIEW_VERSION = "2.25.0.0";
+  public static final String CONNECTION_POOLING_STABLE_VERSION = "2024.2.0.0";
+
+  // This is when the DB side removed the need for "enable_ysql_conn_mgr" flag in
+  // "allowed_preview_flags_csv".
+  public static final String CONNECTION_POOLING_DB_PREVIEW_FLAG_PREVIEW_VERSION = "2.25.1.0-b184";
+  public static final String CONNECTION_POOLING_DB_PREVIEW_FLAG_STABLE_VERSION = "2024.2.1.0-b185";
+
+  public static final String MULTITENANCY_SUPPORTED_DB_VERSION_PREVIEW = "2.29.0.0-b650";
+  public static final String MULTITENANCY_SUPPORTED_DB_VERSION_STABLE = "2026.1.0.0-b0";
+
+  public static final String AUTO_FLAG_FILENAME = "auto_flags.json";
+
+  public static final String GFLAG_GROUPS_FILENAME = "gflag_groups.json";
+
+  public static final String DB_VERSION_METADATA_FILENAME = "version_metadata.json";
 
   public static final String LIVE_QUERY_TIMEOUTS = "yb.query_stats.live_queries.ws";
 
@@ -123,6 +198,17 @@ public class Util {
       "{pod_name}.{service_name}.{namespace}.svc.{cluster_domain}";
 
   public static final String YBA_VERSION_REGEX = "^(\\d+.\\d+.\\d+.\\d+)(-(b(\\d+)|(\\w+)))?$";
+
+  /* The following DBs are reserved for system activity */
+  public static final List<String> RESERVED_DBS =
+      List.of("template0", "template1", "system_platform");
+
+  public static final List<String> SPECIAL_CHARACTERS_STRING_LIST =
+      ImmutableList.of("!", "@", "#", "$", "%", "^", "&", "*");
+
+  public static final String PATTERN_FOR_UUID =
+      "[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}";
+  public static final String PATTERN_FOR_HOST = ".+:[0-9]{4,5}";
 
   private static final Map<String, Long> GO_DURATION_UNITS_TO_NANOS =
       ImmutableMap.<String, Long>builder()
@@ -138,6 +224,36 @@ public class Util {
 
   private static final Pattern GO_DURATION_REGEX =
       Pattern.compile("(\\d+)(ms|us|\\u00b5s|ns|s|m|h|d)");
+
+  private static final Set<String> FILTERED_INSTANCE_KEYS_FOR_LOGGING =
+      ImmutableSet.of("name", "id", "private_ip", "private_dns", "is_running", "region", "zone");
+
+  public static final String HTTP_SCHEME = "http://";
+
+  public static final String HTTPS_SCHEME = "https://";
+
+  public static final String RESTORE_BACKUP_TASK_FILE = "RestoreBackupTaskInfo.json";
+
+  public static final String RESTORE_BACKUP_CUSTOMER_TASK_FILE =
+      "RestoreBackupCustomerTaskInfo.json";
+
+  public static volatile String YBA_VERSION;
+
+  static volatile boolean YBA_SHUTDOWN_STARTED = false;
+
+  public static String getYbaVersion() {
+    return YBA_VERSION;
+  }
+
+  public static void setYbaVersion(String version) {
+    YBA_VERSION = version;
+  }
+
+  @VisibleForTesting
+  public static void resetYbaShutdownStarted() {
+    YBA_SHUTDOWN_STARTED = false;
+  }
+
   /**
    * Returns a list of Inet address objects in the proxy tier. This is needed by Cassandra clients.
    */
@@ -151,13 +267,6 @@ public class Util {
       inetAddrs.add(new InetSocketAddress(privateIp, yqlRPCPort));
     }
     return inetAddrs;
-  }
-
-  public static String redactString(String input) {
-    String length = ((Integer) input.length()).toString();
-    String regex = "(.)" + "{" + length + "}";
-    String output = input.replaceAll(regex, REDACT);
-    return output;
   }
 
   public static String redactYsqlQuery(String input) {
@@ -177,6 +286,13 @@ public class Util {
           id.replaceAll("(\\w{8})(\\w{4})(\\w{4})(\\w{4})(\\w{12})", "$1-$2-$3-$4-$5");
       return UUID.fromString(uuidWithHyphens);
     }
+  }
+
+  public static String getIdRepresentation(UUID uuid) {
+    if (uuid == null) {
+      return null;
+    }
+    return uuid.toString().replace("-", "");
   }
 
   /**
@@ -212,7 +328,7 @@ public class Util {
     if (c == null) {
       throw new RuntimeException("Invalid Customer Id: " + custId);
     }
-    return String.format("yb-%s-%s", c.code, univName);
+    return String.format("yb-%s-%s", c.getCode(), univName);
   }
 
   /**
@@ -231,7 +347,7 @@ public class Util {
         mastersToAZMap.putIfAbsent(currentNode.azUuid, 0);
       }
     }
-    LOG.info("Masters to AZ :" + mastersToAZMap);
+    log.info("Masters to AZ :" + mastersToAZMap);
     return mastersToAZMap;
   }
 
@@ -284,7 +400,7 @@ public class Util {
         numStoppedMasters++;
       }
     }
-    LOG.info("Masters: numStopped {}, numToBeAdded {}", numStoppedMasters, numMastersToBeAdded);
+    log.info("Masters: numStopped {}, numToBeAdded {}", numStoppedMasters, numMastersToBeAdded);
 
     return numStoppedMasters < numMastersToBeAdded;
   }
@@ -305,7 +421,7 @@ public class Util {
             currentNode.azUuid, azToNumStoppedNodesMap.getOrDefault(currentNode.azUuid, 0) + 1);
       }
     }
-    LOG.info("AZ to stopped count {}", azToNumStoppedNodesMap);
+    log.info("AZ to stopped count {}", azToNumStoppedNodesMap);
     return azToNumStoppedNodesMap;
   }
 
@@ -326,7 +442,7 @@ public class Util {
     Set<NodeDetails> nodes = universeDetails.nodeDetailsSet;
     long numMasters = getNumMasters(nodes);
     int replFactor = universeDetails.getPrimaryCluster().userIntent.replicationFactor;
-    LOG.info("RF = {} , numMasters = {}", replFactor, numMasters);
+    log.info("RF = {} , numMasters = {}", replFactor, numMasters);
 
     return replFactor > numMasters
         && needMasterQuorumRestore(currentNode, nodes, replFactor - numMasters);
@@ -341,6 +457,15 @@ public class Util {
     return univName.matches(UNIVERSE_NAME_REGEX);
   }
 
+  /**
+   * Whether the given value is safe to interpolate verbatim into a shell or sed command fragment
+   * (e.g., a single-quoted s-command separator). Returns false for null. Tighter than any product
+   * schema rule by design -- see {@link #SHELL_SAFE_IDENTIFIER}.
+   */
+  public static boolean isShellSafeIdentifier(String value) {
+    return value != null && SHELL_SAFE_IDENTIFIER.matcher(value).matches();
+  }
+
   // Helper API to create a CSV of any keys present in existing map but not in new
   // map.
   public static String getKeysNotPresent(Map<String, String> existing, Map<String, String> newMap) {
@@ -352,7 +477,7 @@ public class Util {
         keysNotPresent.add(key);
       }
     }
-    LOG.info("KeysNotPresent  = " + keysNotPresent);
+    log.info("KeysNotPresent  = " + keysNotPresent);
 
     return String.join(",", keysNotPresent);
   }
@@ -370,7 +495,7 @@ public class Util {
     try {
       return new URL("https", host, endpoint).toString();
     } catch (MalformedURLException e) {
-      LOG.error("Error building request URL", e);
+      log.error("Error building request URL", e);
 
       return null;
     }
@@ -409,22 +534,25 @@ public class Util {
   }
 
   @ApiModel(value = "UniverseDetailSubset", description = "A small subset of universe information")
-  @Getter
+  @Value
+  @Jacksonized
+  @Builder
+  @AllArgsConstructor
   public static class UniverseDetailSubset {
-    final UUID uuid;
-    final String name;
-    final boolean updateInProgress;
-    final boolean updateSucceeded;
-    final long creationDate;
-    final boolean universePaused;
+    UUID uuid;
+    String name;
+    boolean updateInProgress;
+    boolean updateSucceeded;
+    long creationDate;
+    boolean universePaused;
 
     public UniverseDetailSubset(Universe universe) {
       UniverseDefinitionTaskParams universeDetails = universe.getUniverseDetails();
-      uuid = universe.universeUUID;
-      name = universe.name;
+      uuid = universe.getUniverseUUID();
+      name = universe.getName();
       updateInProgress = universeDetails.updateInProgress;
       updateSucceeded = universeDetails.updateSucceeded;
-      creationDate = universe.creationDate.getTime();
+      creationDate = universe.getCreationDate().getTime();
       universePaused = universeDetails.universePaused;
     }
   }
@@ -437,16 +565,88 @@ public class Util {
     return details;
   }
 
-  // Wrapper on the existing compareYbVersions() method (to specify if format error
-  // should be suppressed)
+  /**
+   * This function checks if a given version string is on stable track or not. Eg: 2024.1.0.0-b1 for
+   * stable and 2.23.0.0-b1 for preview.
+   *
+   * @param currentVersion
+   * @param suppressFormatError
+   * @return boolean true if stable, else false.
+   */
+  public static boolean isStableVersion(String currentVersion, boolean suppressFormatError) {
+    String[] versionParts = currentVersion.split("-", 3);
+    if (versionParts.length > 2) {
+      currentVersion = versionParts[0] + "-" + versionParts[1];
+    }
+
+    Pattern versionPattern = Pattern.compile(YBA_VERSION_REGEX);
+    Matcher versionMatcher = versionPattern.matcher(currentVersion);
+
+    if (versionMatcher.find()) {
+      String[] v1Numbers = versionMatcher.group(1).split("\\.");
+      int minorVersion = Integer.parseInt(v1Numbers[1]);
+      if (v1Numbers[0].length() == 4 || (minorVersion % 2) == 0) {
+        return true;
+      }
+    }
+    return false;
+  }
+
+  /**
+   * This is a new wrapper method on top of existing compareYbVersions() to compare YBA or YBDB
+   * version strings. Use this method instead of other compareYbVersions() when you want to compare
+   * if a feature exists across both preview and stable tracks. Must specify both a preview and a
+   * stable version from when the feature exists. New versioning scheme is like: 2024.1.0.0-b1 for
+   * stable and 2.23.0.0-b1 for preview. Use this method to compare any features after 2.21 or
+   * 2024.1.
+   *
+   * @param currentVersion
+   * @param stableVersion
+   * @param previewVersion
+   * @param suppressFormatError
+   * @return
+   */
+  public static int compareYBVersions(
+      String currentVersion,
+      String stableVersion,
+      String previewVersion,
+      boolean suppressFormatError) {
+    boolean isCurrentVersionStable = isStableVersion(currentVersion, suppressFormatError);
+    return compareYbVersions(
+        currentVersion,
+        isCurrentVersionStable ? stableVersion : previewVersion,
+        suppressFormatError);
+  }
+
+  public static boolean areYbVersionsEqual(String v1, String v2, boolean suppressFormatError) {
+    return compareYbVersions(v1, v2, suppressFormatError) == 0;
+  }
+
+  /**
+   * This method compares 2 version strings. Make sure to only compare stable with stable and
+   * preview with preview if using this function. If you are not sure of either, use method {@link
+   * com.yugabyte.yw.common.Util#compareYBVersions}.
+   *
+   * @param v1
+   * @param v2
+   * @return
+   */
   public static int compareYbVersions(String v1, String v2) {
 
     return compareYbVersions(v1, v2, false);
   }
 
-  // Compare v1 and v2 Strings. Returns 0 if the versions are equal, a
-  // positive integer if v1 is newer than v2, a negative integer if v1
-  // is older than v2.
+  /**
+   * Compare v1 and v2 Strings. Returns 0 if the versions are equal, a positive integer if v1 is
+   * newer than v2, a negative integer if v1 is older than v2. Make sure to only compare stable with
+   * stable and preview with preview if using this function. If you are not sure of either, use
+   * method {@link com.yugabyte.yw.common.Util#compareYBVersions}.
+   *
+   * @param v1
+   * @param v2
+   * @param suppressFormatError
+   * @return
+   */
   public static int compareYbVersions(String v1, String v2, boolean suppressFormatError) {
     // After the second dash, a user can add anything, and it will be ignored.
     String[] v1Parts = v1.split("-", 3);
@@ -502,7 +702,7 @@ public class Util {
                   + " suppressFormatError is set to true.",
               v1, v2);
 
-      LOG.info(msg);
+      log.info(msg);
 
       return 0;
     }
@@ -526,6 +726,40 @@ public class Util {
 
   public static String escapeSingleQuotesOnly(String src) {
     return src.replaceAll("'", "''");
+  }
+
+  public static void shutdownYbaProcess(int seconds) {
+    // Background thread to exit YBA process
+    Thread shutdownThread =
+        new Thread(
+            () -> {
+              try {
+                Thread.sleep(seconds * 1000 /* ms */);
+                log.info("Shutting down via system exit.");
+                System.exit(0);
+              } catch (InterruptedException e) {
+                log.warn("Interrupted during system exit.");
+              }
+            });
+    // Watcher thread to forcibly halt JVM if exit hangs
+    Thread haltThread =
+        new Thread(
+            () -> {
+              try {
+                shutdownThread.join((seconds * 1000) + 30000 /* add 30 seconds */);
+                log.info("Shutting down via halt.");
+                Runtime.getRuntime().halt(0);
+              } catch (InterruptedException e) {
+                log.warn("Interrupted during wait for exit.");
+              }
+            });
+    YBA_SHUTDOWN_STARTED = true;
+    shutdownThread.start();
+    haltThread.start();
+  }
+
+  public static boolean hasYBAShutdownStarted() {
+    return YBA_SHUTDOWN_STARTED;
   }
 
   @VisibleForTesting
@@ -596,7 +830,7 @@ public class Util {
     try {
       return InetAddress.getLocalHost().getHostName();
     } catch (UnknownHostException e) {
-      LOG.error("Could not determine the hostname", e);
+      log.error("Could not determine the hostname", e);
       return "";
     }
   }
@@ -605,9 +839,22 @@ public class Util {
     try {
       return InetAddress.getLocalHost().getHostAddress().toString();
     } catch (UnknownHostException e) {
-      LOG.error("Could not determine the host IP", e);
+      log.error("Could not determine the host IP", e);
       return "";
     }
+  }
+
+  public static String getYwHostnameOrIP() {
+    String host = getHostname();
+    // ignore localhost as this method is intended for producing an identifying label of YBA
+    if (StringUtils.isNotBlank(host) && !host.equalsIgnoreCase("localhost")) {
+      return host;
+    }
+    String ip = getHostIP();
+    if (!ip.equalsIgnoreCase("127.0.0.1")) {
+      return ip;
+    }
+    return "";
   }
 
   public static String getNodeIp(Universe universe, NodeDetails node) {
@@ -619,6 +866,24 @@ public class Util {
       ip = node.cloudInfo.private_ip;
     }
     return ip;
+  }
+
+  public static String getIpToUse(Universe universe, String nodeName, boolean cloudEnabled) {
+    // For K8s the NodeDetails are only populated with nodeName, so need to fetch details
+    // from Universe, which works for both K8s and VMs.
+    NodeDetails nodeInUniverse = universe.getNode(nodeName);
+    if (nodeInUniverse == null) {
+      return null;
+    }
+    return getIpToUse(universe, nodeInUniverse, cloudEnabled);
+  }
+
+  public static String getIpToUse(
+      Universe universe, NodeDetails nodeInUniverse, boolean cloudEnabled) {
+    if (GFlagsUtil.isUseSecondaryIP(universe, nodeInUniverse, cloudEnabled)) {
+      return nodeInUniverse.cloudInfo.secondary_private_ip;
+    }
+    return nodeInUniverse.cloudInfo.private_ip;
   }
 
   // Generate a deterministic node UUID from the universe UUID and the node name.
@@ -672,16 +937,16 @@ public class Util {
     checkArgument(firstPartLength > 0, "Invalid suffix length");
     if (sanitizedName.length() > firstPartLength) {
       sanitizedName = sanitizedName.substring(0, firstPartLength);
-      LOG.warn("Name {} is longer than {}, truncated to {}.", name, firstPartLength, sanitizedName);
+      log.warn("Name {} is longer than {}, truncated to {}.", name, firstPartLength, sanitizedName);
     }
     return String.format("%s-%s", sanitizedName, hashString(name));
   }
 
   public static boolean canConvertJsonNode(JsonNode jsonNode, Class<?> toValueType) {
     try {
-      new ObjectMapper().treeToValue(jsonNode, toValueType);
+      Json.mapper().treeToValue(jsonNode, toValueType);
     } catch (JsonProcessingException e) {
-      LOG.info(e.getMessage());
+      log.info(e.getMessage());
       return false;
     }
     return true;
@@ -691,9 +956,12 @@ public class Util {
     return Math.abs(d1 - d2) < Util.EPSILON;
   }
 
-  /** Checks if the given date is past the current time or not. */
   public static boolean isTimeExpired(Date date) {
-    Date currentTime = new Date();
+    return isTimeExpired(date, new Date());
+  }
+
+  /** Checks if the given date is past the current time or not. */
+  public static boolean isTimeExpired(Date date, Date currentTime) {
     return currentTime.compareTo(date) >= 0 ? true : false;
   }
 
@@ -706,18 +974,70 @@ public class Util {
     return dirPath;
   }
 
-  public static String getNodeHomeDir(UUID universeUUID, String nodeName) {
+  public static String getNodeHomeDir(UUID universeUUID, NodeDetails node) {
     Universe universe = Universe.getOrBadRequest(universeUUID);
-    String providerUUID = Universe.getCluster(universe, nodeName).userIntent.provider;
+    String providerUUID = universe.getCluster(node.placementUuid).userIntent.provider;
     Provider provider = Provider.getOrBadRequest(UUID.fromString(providerUUID));
+    if (provider.getCloudCode().equals(CloudType.kubernetes)) {
+      return "/root";
+    }
     return provider.getYbHome();
   }
 
   public static boolean isOnPremManualProvisioning(Universe universe) {
-    UserIntent userIntent = universe.getUniverseDetails().getPrimaryCluster().userIntent;
+    return isOnPremManualProvisioning(universe.getUniverseDetails());
+  }
+
+  public static boolean isOnPremManualProvisioning(UniverseDefinitionTaskParams params) {
+    UserIntent userIntent = params.getPrimaryCluster().userIntent;
     if (userIntent.providerType == Common.CloudType.onprem) {
       Provider provider = Provider.getOrBadRequest(UUID.fromString(userIntent.provider));
-      return provider.details.skipProvisioning;
+      return provider.getDetails().skipProvisioning;
+    }
+    return false;
+  }
+
+  /**
+   * Validates that a custom linux_user is not specified for manual on-prem provisioned universes.
+   * Manual on-prem node agents run as yugabyte user and cannot switch to other users.
+   *
+   * @param linuxUser The linux user specified in the request
+   * @param universe The target universe
+   * @throws PlatformServiceException if validation fails
+   */
+  public static void validateLinuxUserForOnPrem(String linuxUser, Universe universe) {
+    if (StringUtils.isNotBlank(linuxUser)
+        && !NodeManager.YUGABYTE_USER.equals(linuxUser)
+        && isOnPremManualProvisioning(universe)) {
+      throw new PlatformServiceException(
+          BAD_REQUEST,
+          "Cannot specify custom linux_user for manual on-prem provisioned universes. "
+              + "Node agent runs as yugabyte user and cannot switch users.");
+    }
+  }
+
+  public static boolean configureCgroup(
+      Provider provider, boolean isForProvision, RuntimeConfGetter confGetter) {
+    return configureCgroup(null, provider, isForProvision, confGetter);
+  }
+
+  public static boolean configureCgroup(
+      @Nullable UserIntent userIntent,
+      Provider provider,
+      boolean isForProvision,
+      RuntimeConfGetter confGetter) {
+    if (userIntent != null && userIntent.isCpuCgroupConfigured()) {
+      return true;
+    }
+    if (provider.getCloudCode().equals(CloudType.onprem)
+        && provider.getDetails().getCloudInfo().onprem.enableMultiTenancy) {
+      return true;
+    }
+    if (provider.getCloudCode().equals(CloudType.kubernetes)) {
+      return false;
+    }
+    if (isForProvision && !(provider.getCloudCode().equals(CloudType.onprem))) {
+      return confGetter.getConfForScope(provider, ProviderConfKeys.enableCgroupConfiguration);
     }
     return false;
   }
@@ -734,6 +1054,7 @@ public class Util {
     } else if (ybServerPackage.contains(Architecture.aarch64.name().toLowerCase())) {
       archType = Architecture.aarch64.name();
     } else {
+      log.warn("Could not parse {} to x86_64 or aarch64", ybServerPackage);
       throw new RuntimeException(
           "Cannot install ybc on machines of arch types other than x86_64, aarch64");
     }
@@ -804,6 +1125,38 @@ public class Util {
   }
 
   /**
+   * Compress a given directory to .tar.gz and delete the original directory.
+   *
+   * @param dirPath path to the directory to compress
+   * @return the path to the gzip.
+   * @throws Exception
+   */
+  public static Path zipAndDeleteDir(Path dirPath) throws Exception {
+    Path gzipPath = Paths.get(dirPath.toAbsolutePath().toString().concat(".tar.gz"));
+    log.info(
+        "Compressing the following directory: {} to {}",
+        dirPath.toAbsolutePath().toString(),
+        gzipPath.toAbsolutePath().toString());
+    // Tar the directory and delete the original folder
+    try (FileOutputStream fos = new FileOutputStream(gzipPath.toString());
+        GZIPOutputStream gos = new GZIPOutputStream(new BufferedOutputStream(fos));
+        TarArchiveOutputStream tarOS = new TarArchiveOutputStream(gos)) {
+
+      tarOS.setLongFileMode(TarArchiveOutputStream.LONGFILE_POSIX);
+      tarOS.setBigNumberMode(TarArchiveOutputStream.BIGNUMBER_POSIX);
+      addFilesToTarGZ(dirPath.toString(), "", tarOS);
+      log.info("Deleting directory: " + dirPath.toAbsolutePath().toString());
+      FileUtils.deleteDirectory(new File(dirPath.toAbsolutePath().toString()));
+    } catch (Exception e) {
+      log.error(
+          "Error while compressing the following directory: {}",
+          dirPath.toAbsolutePath().toString());
+      throw e;
+    }
+    return gzipPath;
+  }
+
+  /**
    * Adds the the file archive tarArchive in fileName
    *
    * @param file the file we want to add to the archive
@@ -826,14 +1179,14 @@ public class Util {
    * @param tarFile the archive we want to sasve to folderPath
    * @param folderPath the directory where we want to extract the archive to
    */
-  public static void extractFilesFromTarGZ(File tarFile, String folderPath) throws IOException {
+  public static void extractFilesFromTarGZ(Path tarFile, String folderPath) throws IOException {
     TarArchiveEntry currentEntry;
     Files.createDirectories(Paths.get(folderPath));
 
-    try (FileInputStream fis = new FileInputStream(tarFile);
+    try (FileInputStream fis = new FileInputStream(tarFile.toFile());
         GZIPInputStream gis = new GZIPInputStream(new BufferedInputStream(fis));
         TarArchiveInputStream tis = new TarArchiveInputStream(gis)) {
-      while ((currentEntry = tis.getNextTarEntry()) != null) {
+      while ((currentEntry = tis.getNextEntry()) != null) {
         File destPath = new File(folderPath, currentEntry.getName());
         if (currentEntry.isDirectory()) {
           destPath.mkdirs();
@@ -848,30 +1201,101 @@ public class Util {
   }
 
   public static boolean isKubernetesBasedUniverse(Universe universe) {
-    boolean isKubernetesUniverse =
-        universe
-            .getUniverseDetails()
-            .getPrimaryCluster()
-            .userIntent
-            .providerType
-            .equals(CloudType.kubernetes);
-    for (Cluster cluster : universe.getUniverseDetails().getReadOnlyClusters()) {
+    return isKubernetesBasedUniverse(universe.getUniverseDetails());
+  }
+
+  public static boolean isKubernetesBasedUniverse(UniverseDefinitionTaskParams params) {
+    boolean isKubernetesUniverse = false;
+    if (params.getPrimaryCluster() != null) {
+      isKubernetesUniverse =
+          params.getPrimaryCluster().userIntent.providerType.equals(CloudType.kubernetes);
+    }
+    for (Cluster cluster : params.getReadOnlyClusters()) {
       isKubernetesUniverse =
           isKubernetesUniverse || cluster.userIntent.providerType.equals(CloudType.kubernetes);
     }
     return isKubernetesUniverse;
   }
 
+  public static UUID getSingleProviderUUID(Cluster cluster) {
+    return getSingleProviderUUID(cluster.userIntent);
+  }
+
+  public static UUID getSingleProviderUUID(UserIntent userIntent) {
+    return UUID.fromString(userIntent.provider);
+  }
+
+  public static Provider getSingleProvider(Cluster cluster) {
+    return getSingleProvider(cluster.userIntent);
+  }
+
+  public static Provider getSingleProvider(UserIntent userIntent) {
+    return Provider.getOrBadRequest(getSingleProviderUUID(userIntent));
+  }
+
+  public static Set<NodeDetails> filterByProviderType(
+      Collection<NodeDetails> nodes, Collection<Cluster> clusters, CloudType expectedType) {
+    Map<UUID, Cluster> clusterMap =
+        clusters.stream().collect(Collectors.toMap(c -> c.uuid, c -> c));
+    return nodes.stream()
+        .filter(
+            n -> {
+              Cluster cluster = clusterMap.get(n.placementUuid);
+              return cluster.getProviderCloudType(n) == expectedType;
+            })
+        .collect(Collectors.toSet());
+  }
+
+  public static Function<NodeDetails, Provider> getProviderGetter(Universe universe) {
+    return getProviderGetter(universe.getUniverseDetails());
+  }
+
+  public static Function<NodeDetails, Provider> getProviderGetter(
+      UniverseDefinitionTaskParams params) {
+    // Caching by AZ.
+    Map<UUID, Provider> providerMap = new HashMap<>();
+    return (n) ->
+        providerMap.computeIfAbsent(
+            n.azUuid, uuid -> getProviderForNode(n, params.getClusterByUuid(n.placementUuid)));
+  }
+
+  public static Function<NodeDetails, Provider> getProviderGetter(
+      UniverseDefinitionTaskParams.Cluster cluster) {
+    // Caching by AZ.
+    Map<UUID, Provider> providerMap = new HashMap<>();
+    return (n) -> providerMap.computeIfAbsent(n.azUuid, uuid -> getProviderForNode(n, cluster));
+  }
+
+  public static Set<UUID> getAllProviderUUIDs(Universe universe) {
+    return universe.getUniverseDetails().clusters.stream()
+        .flatMap(c -> c.userIntent.getAllProviderUUIDs().stream())
+        .collect(Collectors.toSet());
+  }
+
+  public static Provider getProviderForNode(NodeDetails nodeDetails, Universe universe) {
+    return getProviderForNode(nodeDetails, universe.getCluster(nodeDetails.placementUuid));
+  }
+
+  public static Provider getProviderForNode(NodeDetails nodeDetails, Cluster cluster) {
+    return getSingleProvider(cluster);
+  }
+
+  public static boolean checkAnyProviderType(
+      UserIntent userIntent, Predicate<CloudType> predicate) {
+    return userIntent.getAllCloudTypes().stream().filter(predicate).findFirst().isPresent();
+  }
+
+  public static CloudType getSingleProviderType(Cluster cluster) {
+    return getSingleProviderType(cluster.userIntent);
+  }
+
+  public static CloudType getSingleProviderType(UserIntent userIntent) {
+    return userIntent.providerType;
+  }
+
   public static String getYbcNodeIp(Universe universe) {
-    HostAndPort hostPort = universe.getMasterLeader();
-    String nodeIp = hostPort.getHost();
-    if (universe.getUniverseDetails().getPrimaryCluster().userIntent.dedicatedNodes) {
-      List<NodeDetails> nodeList = universe.getLiveTServersInPrimaryCluster();
-      if (CollectionUtils.isNotEmpty(nodeList)) {
-        nodeIp = nodeList.get(0).cloudInfo.private_ip;
-      }
-    }
-    return nodeIp;
+    List<NodeDetails> nodeList = universe.getRunningTserversInPrimaryCluster();
+    return nodeList.get(0).cloudInfo.private_ip;
   }
 
   public static String computeFileChecksum(Path filePath, String checksumAlgorithm)
@@ -884,8 +1308,10 @@ public class Util {
     }
     MessageDigest md = MessageDigest.getInstance(checksumAlgorithm);
     try (DigestInputStream dis =
-        new DigestInputStream(new FileInputStream(filePath.toFile()), md)) {
-      while (dis.read() != -1) ; // Empty loop to clear the data
+        new DigestInputStream(
+            new BufferedInputStream(new FileInputStream(filePath.toFile())), md)) {
+      while (dis.read() != -1)
+        ; // Empty loop to clear the data
       md = dis.getMessageDigest();
       // Convert the digest to String.
       StringBuilder result = new StringBuilder();
@@ -896,14 +1322,554 @@ public class Util {
     }
   }
 
-  public static String maybeGetEmailFromContext(Context context) {
-    String userEmail =
-        Optional.ofNullable(context)
-            .map(context1 -> (UserWithFeatures) context1.args.get("user"))
-            .map(UserWithFeatures::getUser)
-            .map(Users::getEmail)
-            .map(Object::toString)
-            .orElse("Unknown");
-    return userEmail;
+  public static String maybeGetEmailFromContext() {
+    return Optional.ofNullable(RequestContext.getIfPresent(TokenAuthenticator.USER))
+        .map(UserWithFeatures::getUser)
+        .map(Users::getEmail)
+        .map(Object::toString)
+        .orElse("Unknown");
+  }
+
+  public static Universe lockUniverse(Universe universe) {
+    UniverseUpdater updater =
+        u -> {
+          UniverseDefinitionTaskParams universeDetails = u.getUniverseDetails();
+          universeDetails.updateInProgress = true;
+          universeDetails.updateSucceeded = false;
+          u.setUniverseDetails(universeDetails);
+        };
+    return Universe.saveDetails(universe.getUniverseUUID(), updater, false);
+  }
+
+  public static Universe unlockUniverse(Universe universe) {
+    UniverseUpdater updater =
+        u -> {
+          UniverseDefinitionTaskParams universeDetails = u.getUniverseDetails();
+          universeDetails.updateInProgress = false;
+          universeDetails.updateSucceeded = true;
+          u.setUniverseDetails(universeDetails);
+        };
+    return Universe.saveDetails(universe.getUniverseUUID(), updater, false);
+  }
+
+  public static void validateUniverseOwnershipAndNotDetached(
+      Universe universe,
+      ConfigHelper configHelper,
+      YsqlQueryExecutor ysqlQueryExecutor,
+      RuntimeConfGetter confGetter) {
+    // Skip ownership validation if attach/detach feature is not enabled
+    boolean attachDetachEnabled = confGetter.getGlobalConf(GlobalConfKeys.attachDetachEnabled);
+    if (!attachDetachEnabled) {
+      log.debug(
+          "Skipping ownership validation for universe {} (attach/detach feature not enabled)",
+          universe.getName());
+      return;
+    }
+
+    UniverseDefinitionTaskParams.Cluster primaryCluster =
+        universe.getUniverseDetails().getPrimaryCluster();
+    if (primaryCluster == null || primaryCluster.userIntent == null) {
+      log.warn(
+          "Skipping ownership validation for universe {} due to missing primary cluster or user"
+              + " intent",
+          universe.getName());
+      return;
+    }
+
+    UniverseDefinitionTaskParams.UserIntent primaryIntent = primaryCluster.userIntent;
+
+    // Skip ownership validation for older DB versions that don't support attach/detach
+    String dbVersion = primaryIntent.ybSoftwareVersion;
+    if (dbVersion == null
+        || compareYBVersions(
+                dbVersion, "2024.2.0.0-b1", "2.23.1.0-b29", true /* suppressFormatError */)
+            < 0) {
+      log.debug(
+          "Skipping ownership validation for universe {} with DB version {} (older than minimum"
+              + " required for attach/detach)",
+          universe.getName(),
+          dbVersion);
+      return;
+    }
+
+    if (universe.getUniverseDetails().universeDetached) {
+      throw new PlatformServiceException(
+          BAD_REQUEST,
+          String.format(
+              "Universe %s is detached. Operations are not allowed on detached universes.",
+              universe.getName()));
+    }
+
+    if (!isUniverseOwner(universe, configHelper, ysqlQueryExecutor, confGetter)) {
+      throw new PlatformServiceException(
+          BAD_REQUEST,
+          String.format(
+              "Universe belongs to different YugabyteDB Anywhere instance. "
+                  + "Please delete the metadata from this YBA instance."));
+    }
+  }
+
+  public static boolean isUniverseOwner(
+      Universe universe,
+      ConfigHelper configHelper,
+      YsqlQueryExecutor ysqlQueryExecutor,
+      RuntimeConfGetter confGetter) {
+
+    UUID currentYwUuid = configHelper.getYugawareUUID();
+
+    if (currentYwUuid == null) {
+      throw new PlatformServiceException(
+          INTERNAL_SERVER_ERROR, "Current YugabyteDB Anywhere UUID not found");
+    }
+
+    UUID storedYwUuid = getStoredYwUuid(universe, ysqlQueryExecutor, confGetter);
+
+    // If we cannot retrieve ownership info (e.g., YCQL-only universe), skip validation
+    if (storedYwUuid == null) {
+      log.debug(
+          "Cannot determine ownership for universe {} (YSQL not available), assuming owned",
+          universe.getName());
+      return true;
+    }
+
+    // If stored YW UUID is DETACHED_UNIVERSE_UUID, the universe is orphaned and operations should
+    // not be allowed
+    if (storedYwUuid.equals(AttachDetachSpec.DETACHED_UNIVERSE_UUID)) {
+      throw new PlatformServiceException(
+          BAD_REQUEST,
+          String.format(
+              "Universe %s has no owner. Operations are not allowed on orphaned universes.",
+              universe.getName()));
+    }
+    return currentYwUuid.equals(storedYwUuid);
+  }
+
+  public static UUID getStoredYwUuid(
+      Universe universe, YsqlQueryExecutor ysqlQueryExecutor, RuntimeConfGetter confGetter) {
+    try {
+      YsqlQueryExecutor.ConsistencyInfoResp consistencyInfo =
+          ysqlQueryExecutor.getConsistencyInfo(universe);
+      // Return null if consistency info could not be retrieved (e.g., YCQL-only universe)
+      if (consistencyInfo == null) {
+        log.debug(
+            "Could not retrieve consistency info for universe {} (likely YSQL is not enabled)",
+            universe.getName());
+        return null;
+      }
+      return consistencyInfo.getYwUUID();
+    } catch (Exception e) {
+      log.error("Failed to query YW UUID for universe {}: {}", universe.getName(), e);
+      throw new PlatformServiceException(
+          INTERNAL_SERVER_ERROR,
+          String.format(
+              "Error querying YW UUID for universe %s: %s", universe.getName(), e.getMessage()));
+    }
+  }
+
+  public static boolean isAddressReachable(String host, int port) {
+    try (Socket socket = new Socket()) {
+      socket.connect(new InetSocketAddress(host, port), 3000);
+      return true;
+    } catch (IOException e) {
+    }
+    return false;
+  }
+
+  public static long getExponentialBackoffDelayMs(
+      long initialDelayMs, long maxDelayMs, int iterationNumber) {
+    double multiplier = 2.0;
+    long delay =
+        (long) (initialDelayMs * Math.pow(multiplier, iterationNumber) + Math.random() * 1000);
+    if (delay > maxDelayMs) {
+      delay = maxDelayMs;
+    }
+    return delay;
+  }
+
+  /**
+   * Gets the path to "yb-data/" folder on the node (Ex: "/mnt/d0", "/mnt/disk0")
+   *
+   * @param universe
+   * @param node
+   * @param config
+   * @return the path to "yb-data/" folder on the node
+   */
+  public static String getDataDirectoryPath(Universe universe, NodeDetails node, Config config) {
+    String dataDirPath = config.getString("yb.support_bundle.default_mount_point_prefix") + "0";
+    UserIntent userIntent = universe.getCluster(node.placementUuid).userIntent;
+    CloudType cloudType = userIntent.providerType;
+
+    if (cloudType == CloudType.onprem) {
+      // On prem universes:
+      // Onprem universes have to specify the mount points for the volumes at the time of provider
+      // creation itself.
+      // This is stored at universe.cluster.userIntent.deviceInfo.mountPoints
+      try {
+        String mountPoints = userIntent.deviceInfo.mountPoints;
+        dataDirPath = mountPoints.split(",")[0];
+      } catch (Exception e) {
+        log.error(String.format("On prem invalid mount points. Defaulting to %s", dataDirPath), e);
+      }
+    } else if (cloudType == CloudType.kubernetes) {
+      // Kubernetes universes:
+      // K8s universes have a default mount path "/mnt/diskX" with X = {0, 1, 2...} based on number
+      // of volumes
+      // This is specified in the charts repo:
+      // https://github.com/yugabyte/charts/blob/master/stable/yugabyte/templates/service.yaml
+      String mountPoint = config.getString("yb.support_bundle.k8s_mount_point_prefix");
+      dataDirPath = mountPoint + "0";
+    } else {
+      // Other provider based universes:
+      // Providers like GCP, AWS have the mountPath stored in the instance types for the most part.
+      // Some instance types don't have mountPath initialized. In such cases, we default to
+      // "/mnt/d0"
+      try {
+        String nodeInstanceType = node.cloudInfo.instance_type;
+        String providerUUID = userIntent.provider;
+        InstanceType instanceType =
+            InstanceType.getOrBadRequest(UUID.fromString(providerUUID), nodeInstanceType);
+        List<VolumeDetails> volumeDetailsList =
+            instanceType.getInstanceTypeDetails().volumeDetailsList;
+        if (CollectionUtils.isNotEmpty(volumeDetailsList)) {
+          dataDirPath = volumeDetailsList.get(0).mountPath;
+        } else {
+          log.info("Mount point is not defined. Defaulting to {}", dataDirPath);
+        }
+      } catch (Exception e) {
+        log.error(String.format("Could not get mount points. Defaulting to %s", dataDirPath), e);
+      }
+    }
+    return dataDirPath;
+  }
+
+  public static String extractRegexValue(String input, String patternStr) {
+    Pattern pattern = Pattern.compile(patternStr);
+    Matcher matcher = pattern.matcher(input);
+    if (matcher.find()) {
+      return matcher.group(1);
+    }
+    return null;
+  }
+
+  public static boolean isIpAddress(String maybeIp) {
+    InetAddressValidator ipValidator = InetAddressValidator.getInstance();
+    return ipValidator.isValidInet4Address(maybeIp) || ipValidator.isValidInet6Address(maybeIp);
+  }
+
+  /** Get randomly generated password inline with YB's password policy */
+  public static String getRandomPassword() {
+    byte[] password = new byte[16];
+    new Random().nextBytes(password);
+    String generatedPassword = new String(password, Charset.forName("UTF-8"));
+    // To be consistent with password policy
+    Integer randomInt = new Random().nextInt(26);
+    String lowercaseLetter = String.valueOf((char) (randomInt + 'a'));
+    String uppercaseLetter = lowercaseLetter.toUpperCase();
+    generatedPassword +=
+        (SPECIAL_CHARACTERS_STRING_LIST.get(
+                new Random().nextInt(SPECIAL_CHARACTERS_STRING_LIST.size()))
+            + lowercaseLetter
+            + uppercaseLetter
+            + String.valueOf(randomInt));
+    return generatedPassword;
+  }
+
+  /**
+   * Validate url string and get URL object
+   *
+   * @param url
+   * @param defaultHttpScheme
+   * @return
+   */
+  public static URL validateAndGetURL(String url, boolean defaultHttpScheme) {
+    String urlString = url;
+    if (!urlString.startsWith(HTTP_SCHEME) && !urlString.startsWith(HTTPS_SCHEME)) {
+      urlString = (defaultHttpScheme ? HTTP_SCHEME : HTTPS_SCHEME) + urlString;
+    }
+    try {
+      URL urlInstance = new URL(urlString);
+      if (StringUtils.isBlank(urlInstance.getHost())) {
+        throw new RuntimeException("Malformed URL: " + urlString);
+      }
+      return urlInstance;
+    } catch (MalformedURLException e) {
+      throw new RuntimeException("Malformed URL: " + urlString);
+    }
+  }
+
+  public static UUID retreiveImageBundleUUID(
+      Architecture arch, UserIntent userIntent, Provider provider) {
+    UUID imageBundleUUID = null;
+    if (userIntent.imageBundleUUID != null) {
+      imageBundleUUID = userIntent.imageBundleUUID;
+    } else if (provider.getUuid() != null) {
+      List<ImageBundle> bundles = ImageBundle.getDefaultForProvider(provider.getUuid());
+      if (bundles.size() > 0) {
+        ImageBundle bundle = ImageBundleUtil.getDefaultBundleForUniverse(arch, bundles);
+        if (bundle != null) {
+          imageBundleUUID = bundle.getUuid();
+        }
+      }
+    }
+
+    return imageBundleUUID;
+  }
+
+  /**
+   * Get a new JsonNode where each leaf node's value is replaced with an object containing jsonPath
+   * to that node and its value.
+   *
+   * <p>Example:
+   *
+   * <pre>
+   * {
+   *   "zones": ["az-1"]
+   * }
+   * </pre>
+   *
+   * Gets modified to:
+   *
+   * <pre>
+   * {
+   *   "zones": [
+   *     {
+   *       "jsonPath": "$.zones[0]",
+   *       "value": "az-1"
+   *     }
+   *   ]
+   * }
+   * </pre>
+   *
+   * @param node The JsonNode to be processed.
+   * @return A new JsonNode with original JsonNode's leaf nodes replaced.
+   */
+  public static JsonNode addJsonPathToLeafNodes(JsonNode node) {
+    return addJsonPathToLeafNodesInternal("$", node.deepCopy());
+  }
+
+  private static JsonNode addJsonPathToLeafNodesInternal(String path, JsonNode node) {
+    if (node.isValueNode()) {
+      return Json.newObject().put("jsonPath", path).set("value", node);
+    }
+    if (node.isArray()) {
+      for (int index = 0; index < node.size(); index++) {
+        String elementPath = path + "[" + index + "]";
+        ((ArrayNode) node).set(index, addJsonPathToLeafNodesInternal(elementPath, node.get(index)));
+      }
+    }
+    if (node.isObject()) {
+      for (Iterator<Map.Entry<String, JsonNode>> it = node.fields(); it.hasNext(); ) {
+        Map.Entry<String, JsonNode> field = it.next();
+        String fieldPath = path + "." + field.getKey();
+        ((ObjectNode) node)
+            .set(field.getKey(), addJsonPathToLeafNodesInternal(fieldPath, field.getValue()));
+      }
+    }
+    return node;
+  }
+
+  /**
+   * Transforms the values (non-map, non-collection) in a nested map of string to objects.
+   *
+   * @param map the given map.
+   * @param valueTransformer the transformer for a value.
+   * @return the transformed map.
+   */
+  @SuppressWarnings("unchecked")
+  public static Map<String, ?> transformMap(
+      Map<String, ?> map, Function<Object, Object> valueTransformer) {
+    Map<String, Object> clone = new HashMap<>();
+    for (Map.Entry<String, ?> entry : map.entrySet()) {
+      if (entry.getValue() instanceof Map) {
+        clone.put(
+            entry.getKey(), transformMap((Map<String, ?>) entry.getValue(), valueTransformer));
+      } else if (entry.getValue() instanceof Collection) {
+        clone.put(
+            entry.getKey(),
+            transformCollection((Collection<?>) entry.getValue(), valueTransformer));
+      } else {
+        Object out = valueTransformer.apply(entry.getValue());
+        if (out != null) {
+          clone.put(entry.getKey(), out);
+        }
+      }
+    }
+    return clone;
+  }
+
+  /**
+   * Transforms the values (non-map, non-collection) in a nested collection of objects.
+   *
+   * @param collection the given collection.
+   * @param valueTransformer the transformer for a value.
+   * @return the transformed collection.
+   */
+  @SuppressWarnings("unchecked")
+  public static Collection<?> transformCollection(
+      Collection<?> collection, Function<Object, Object> valueTransformer) {
+    Collection<Object> clone =
+        (collection instanceof Set)
+            ? new HashSet<>(collection.size())
+            : new ArrayList<>(collection.size());
+    for (Object elem : collection) {
+      if (elem instanceof Map) {
+        clone.add(transformMap((Map<String, ?>) elem, valueTransformer));
+      } else if (elem instanceof Collection) {
+        clone.add(transformCollection((List<?>) elem, valueTransformer));
+      } else {
+        Object out = valueTransformer.apply(elem);
+        if (out != null) {
+          clone.add(out);
+        }
+      }
+    }
+    return clone;
+  }
+
+  public static <T> Predicate<T> not(Predicate<T> t) {
+    return t.negate();
+  }
+
+  public static <T> T doWithCorrelationId(
+      @Nullable String correlationId, Function<String, T> function) {
+    Map<String, String> originalContext = MDC.getCopyOfContextMap();
+    try {
+      String corrId = correlationId;
+      if (StringUtils.isEmpty(corrId)) {
+        corrId = UUID.randomUUID().toString();
+      }
+      Map<String, String> context = MDC.getCopyOfContextMap();
+      if (context == null) {
+        context = new HashMap<>();
+      }
+      context.put(LogUtil.CORRELATION_ID, corrId);
+      MDC.setContextMap(context);
+      return function.apply(corrId);
+    } finally {
+      if (MapUtils.isEmpty(originalContext)) {
+        MDC.clear();
+      } else {
+        MDC.setContextMap(originalContext);
+      }
+    }
+  }
+
+  public static <T> T doWithCorrelationId(Function<String, T> function) {
+    return doWithCorrelationId(null, function);
+  }
+
+  public static String getPostgresCompatiblePassword() {
+    String allowedCharsInPassword =
+        "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz!@$^*0123456789";
+    return RandomStringUtils.secureStrong().next(20, allowedCharsInPassword);
+  }
+
+  public static void writeRestoreTaskInfo(CustomerTask customerTask, TaskInfo taskInfo) {
+    try {
+      Path restoreTaskInfoPath =
+          Paths.get(AppConfigHelper.getStoragePath(), RESTORE_BACKUP_TASK_FILE);
+      Path restoreCustomerTaskPath =
+          Paths.get(AppConfigHelper.getStoragePath(), RESTORE_BACKUP_CUSTOMER_TASK_FILE);
+      Files.deleteIfExists(restoreTaskInfoPath);
+      Files.deleteIfExists(restoreCustomerTaskPath);
+      Json.mapper().writeValue(restoreTaskInfoPath.toFile(), taskInfo);
+      Json.mapper().writeValue(restoreCustomerTaskPath.toFile(), customerTask);
+    } catch (IOException e) {
+      log.warn("Could not write restore task info, will not show up in task info.");
+    }
+  }
+
+  // Helper method to throw unchecked exception.
+  public static URL toURL(String addr) {
+    try {
+      return new URL(addr);
+    } catch (MalformedURLException e) {
+      log.error("URL is malformed: {}", e.getMessage());
+      throw new IllegalArgumentException(e);
+    }
+  }
+
+  // Waits for DB connection to be established with retry mechanism.
+  public static void waitForDBConnection(int retryLimit) {
+    int count = 1;
+    while (true) {
+      try {
+        DB.sqlQuery("SELECT 1").findOneOrEmpty();
+        log.info("DB connection is established after {} attempts", count);
+        break;
+      } catch (PersistenceException pe) {
+        if (count > retryLimit) {
+          log.error("DB connection could not be established after {} attempts", count, pe);
+          throw pe;
+        }
+        String errMsg = pe.getMessage();
+        if (errMsg == null || !errMsg.contains("Connection is closed")) {
+          log.error("DB connection could not be established due to unexpected error", pe);
+          throw pe;
+        }
+        count++;
+        log.info("Waiting for DB to connection - {} attempts...", count);
+        try {
+          Thread.sleep(100);
+        } catch (InterruptedException ignored) {
+          Thread.currentThread().interrupt();
+        }
+      }
+    }
+  }
+
+  public static List<String> getCheckProcessStatusCommand(String user, String processName) {
+    return ImmutableList.<String>builder()
+        .add("pgrep")
+        .add("-xlu")
+        .add(user)
+        .add(processName)
+        .add("2>/dev/null")
+        .add("||")
+        .add("systemctl")
+        .add("--user")
+        .add("is-enabled")
+        .add(processName)
+        .add("2>/dev/null")
+        .add("||")
+        .add("systemctl")
+        .add("is-enabled")
+        .add(processName)
+        .add("2>/dev/null")
+        .add("||")
+        .add("true")
+        .build();
+  }
+
+  /**
+   * Return a minimal instance details for logging.
+   *
+   * @param instances
+   * @return the filtered instance details.
+   */
+  public static List<Map<String, JsonNode>> filterInstanceDetailsForLogging(
+      List<Map<String, JsonNode>> instances) {
+    return instances.stream()
+        .map(
+            m ->
+                m.entrySet().stream()
+                    .filter(e -> e.getValue() != null && !e.getValue().isNull())
+                    .filter(e -> FILTERED_INSTANCE_KEYS_FOR_LOGGING.contains(e.getKey()))
+                    .collect(Collectors.toMap(Map.Entry::getKey, Map.Entry::getValue)))
+        .collect(Collectors.toList());
+  }
+
+  /**
+   * Check if childPath is the same as parentPath or a descendant of parentPath.
+   *
+   * @param parentPath the parent path
+   * @param childPath the child path
+   * @return
+   */
+  public static boolean isPathSameOrDescendant(String parentPath, String childPath) {
+    // Normalize to remove redundant elements like "." and ".."
+    Path normalizedParent = Paths.get(parentPath).toAbsolutePath().normalize();
+    Path normalizedChild = Paths.get(childPath).toAbsolutePath().normalize();
+    return normalizedChild.startsWith(normalizedParent) || normalizedChild.equals(normalizedParent);
   }
 }

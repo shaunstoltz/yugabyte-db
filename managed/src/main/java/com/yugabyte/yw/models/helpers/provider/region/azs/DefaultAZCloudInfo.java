@@ -1,10 +1,9 @@
 package com.yugabyte.yw.models.helpers.provider.region.azs;
 
-import java.util.HashMap;
-import java.util.Map;
-
 import com.fasterxml.jackson.annotation.JsonIgnore;
 import com.yugabyte.yw.models.helpers.CloudInfoInterface;
+import java.util.HashMap;
+import java.util.Map;
 
 public class DefaultAZCloudInfo implements CloudInfoInterface {
 
@@ -21,6 +20,11 @@ public class DefaultAZCloudInfo implements CloudInfoInterface {
 
   @JsonIgnore
   public void withSensitiveDataMasked() {
+    // Pass
+  }
+
+  @JsonIgnore
+  public void mergeMaskedFields(CloudInfoInterface providerCloudInfo) {
     // Pass
   }
 }

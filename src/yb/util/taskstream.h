@@ -1,4 +1,4 @@
-// Copyright (c) YugaByte, Inc.
+// Copyright (c) YugabyteDB, Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License"); you may not use this file except
 // in compliance with the License.  You may obtain a copy of the License at
@@ -19,11 +19,11 @@
 #include <memory>
 #include <vector>
 
-#include "yb/util/flags.h"
-
-#include "yb/util/status_fwd.h"
 #include "yb/util/blocking_queue.h"
+#include "yb/util/callsite_profiling.h"
+#include "yb/util/flags.h"
 #include "yb/util/status_format.h"
+#include "yb/util/status_fwd.h"
 #include "yb/util/thread.h"
 #include "yb/util/threadpool.h"
 
@@ -31,6 +31,7 @@ using namespace std::chrono_literals;
 
 
 namespace yb {
+class Cgroup;
 class ThreadPool;
 class ThreadPoolToken;
 
@@ -73,6 +74,12 @@ class TaskStream {
 
   std::string ToString() const {
     return YB_CLASS_TO_STRING(queue, run_state, stopped, stop_requested);
+  }
+
+  void SetTaskCgroup(Cgroup* cgroup) {
+    if (taskstream_pool_token_) {
+      taskstream_pool_token_->SetTaskCgroup(cgroup);
+    }
   }
 
  private:
@@ -217,7 +224,7 @@ void TaskStream<T>::Run() {
     }
     if (stop_requested_.load(std::memory_order_acquire)) {
       VLOG(1) << "TaskStream task's Run() function is returning because stop is requested.";
-      stop_cond_.notify_all();
+      YB_PROFILE(stop_cond_.notify_all());
       return;
     }
     VLOG(1) << "Returning from TaskStream task after inactivity:" << this;

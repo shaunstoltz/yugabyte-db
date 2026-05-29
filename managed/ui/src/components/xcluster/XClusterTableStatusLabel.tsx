@@ -1,119 +1,137 @@
-import React from 'react';
-import { useQuery } from 'react-query';
 import clsx from 'clsx';
+import { Typography, makeStyles } from '@material-ui/core';
+import { useTranslation } from 'react-i18next';
+import { YBTooltip } from '../../redesign/components';
 
-import { REPLICATION_LAG_ALERT_NAME, XClusterTableStatus } from './constants';
-import { assertUnreachableCase } from '../../utils/ErrorUtils';
-import { queryLagMetricsForTable } from '../../actions/xClusterReplication';
-import { getAlertConfigurations } from '../../actions/universe';
-import { getLatestMaxNodeLag } from './ReplicationUtils';
-import { YBLoadingCircleIcon } from '../common/indicators';
+import { I18N_KEY_PREFIX_XCLUSTER_TERMS, XClusterTableStatus } from './constants';
+import { assertUnreachableCase } from '../../utils/errorHandlingUtils';
 
-import styles from './XClusterTableStatusLabel.module.scss';
+import { usePillStyles } from '../../redesign/styles/styles';
 
 interface XClusterTableStatusProps {
   status: XClusterTableStatus;
-  tableUUID: string;
-  nodePrefix: string;
-  universeUUID: string;
+  errors: string[];
+  isDrInterface: boolean;
 }
 
-const OPERATIONAL_LABEL = (
-  <span className={clsx(styles.label, styles.ready)}>
-    Operational
-    <i className="fa fa-check" />
-  </span>
-);
-const WARNING_LABEL = (
-  <span className={clsx(styles.label, styles.warning)}>
-    Warning
-    <i className="fa fa-exclamation-triangle" />
-  </span>
-);
-const FAILED_LABEL = (
-  <span className={clsx(styles.label, styles.error)}>
-    Failed
-    <i className="fa fa-exclamation-circle" />
-  </span>
-);
-const ERROR_LABEL = (
-  <span className={clsx(styles.label, styles.error)}>
-    Error
-    <i className="fa fa-exclamation-circle" />
-  </span>
-);
-const IN_PROGRESS_LABEL = (
-  <span className={clsx(styles.label, styles.inProgress)}>
-    In Progress
-    <i className="fa fa-spinner fa-spin" />
-  </span>
-);
-const VALIDATED_LABEL = (
-  <span className={clsx(styles.label, styles.inProgress)}>
-    Validated
-    <i className="fa fa-spinner fa-spin" />
-  </span>
-);
-const BOOTSTRAPPING_LABEL = (
-  <span className={clsx(styles.label, styles.inProgress)}>
-    Bootstrapping
-    <i className="fa fa-spinner fa-spin" />
-  </span>
-);
+const useSelectStyles = makeStyles((theme) => ({
+  pillContainer: {
+    marginTop: theme.spacing(0.5)
+  }
+}));
 
+const TRANSLATION_KEY_PREFIX = 'clusterDetail.xCluster.config.tableStatus';
 export const XClusterTableStatusLabel = ({
   status,
-  tableUUID,
-  nodePrefix,
-  universeUUID
+  errors,
+  isDrInterface
 }: XClusterTableStatusProps) => {
-  const alertConfigFilter = {
-    name: REPLICATION_LAG_ALERT_NAME,
-    targetUuid: universeUUID
-  };
-  const maxAcceptableLagQuery = useQuery(['alert', 'configurations', alertConfigFilter], () =>
-    getAlertConfigurations(alertConfigFilter)
-  );
-  const tableLagQuery = useQuery(['xcluster-metric', nodePrefix, tableUUID, 'metric'], () =>
-    queryLagMetricsForTable(tableUUID, nodePrefix)
-  );
+  const classes = usePillStyles();
+  const selectClasses = useSelectStyles();
+  const { t } = useTranslation('translation', { keyPrefix: TRANSLATION_KEY_PREFIX });
 
   switch (status) {
-    case XClusterTableStatus.RUNNING: {
-      if (
-        tableLagQuery.isLoading ||
-        tableLagQuery.isIdle ||
-        maxAcceptableLagQuery.isLoading ||
-        maxAcceptableLagQuery.isIdle
-      ) {
-        return <YBLoadingCircleIcon />;
-      }
-      if (tableLagQuery.isError || maxAcceptableLagQuery.isError) {
-        return <span>-</span>;
-      }
-
-      const maxAcceptableLag = Math.min(
-        ...maxAcceptableLagQuery.data.map(
-          (alertConfig: any): number => alertConfig.thresholds.SEVERE.threshold
-        )
+    case XClusterTableStatus.RUNNING:
+      return (
+        <Typography variant="body2" className={clsx(classes.pill, classes.ready)}>
+          {t(status)}
+          <i className="fa fa-check" />
+        </Typography>
       );
-      const maxNodeLag = getLatestMaxNodeLag(tableLagQuery.data);
-      return maxNodeLag === undefined || maxNodeLag > maxAcceptableLag
-        ? WARNING_LABEL
-        : OPERATIONAL_LABEL;
-    }
     case XClusterTableStatus.WARNING:
-      return WARNING_LABEL;
+      return (
+        <Typography variant="body2" className={clsx(classes.pill, classes.warning)}>
+          {t(status)}
+          <i className="fa fa-exclamation-triangle" />
+        </Typography>
+      );
     case XClusterTableStatus.FAILED:
-      return FAILED_LABEL;
+      return (
+        <Typography variant="body2" className={clsx(classes.pill, classes.danger)}>
+          {t(status)}
+          <i className="fa fa-exclamation-circle" />
+        </Typography>
+      );
     case XClusterTableStatus.ERROR:
-      return ERROR_LABEL;
+      return (
+        <span>
+          {errors.map((error, i) => {
+            return (
+              <Typography
+                variant="body2"
+                className={clsx(classes.pill, classes.danger, selectClasses.pillContainer)}
+              >
+                {error}
+                <i className="fa fa-exclamation-circle" />
+              </Typography>
+            );
+          })}
+        </span>
+      );
     case XClusterTableStatus.UPDATING:
-      return IN_PROGRESS_LABEL;
+      return (
+        <Typography variant="body2" className={clsx(classes.pill, classes.inProgress)}>
+          {t(status)}
+          <i className="fa fa-spinner fa-spin" />
+        </Typography>
+      );
     case XClusterTableStatus.VALIDATED:
-      return VALIDATED_LABEL;
+      return (
+        <Typography variant="body2" className={clsx(classes.pill, classes.inProgress)}>
+          {t(status)}
+          <i className="fa fa-spinner fa-spin" />
+        </Typography>
+      );
     case XClusterTableStatus.BOOTSTRAPPING:
-      return BOOTSTRAPPING_LABEL;
+      return (
+        <Typography variant="body2" className={clsx(classes.pill, classes.inProgress)}>
+          {t(status)}
+          <i className="fa fa-spinner fa-spin" />
+        </Typography>
+      );
+    case XClusterTableStatus.UNABLE_TO_FETCH:
+      return (
+        <Typography variant="body2" className={clsx(classes.pill, classes.warning)}>
+          {t(status)}
+          <i className="fa fa-exclamation-triangle" />
+        </Typography>
+      );
+    case XClusterTableStatus.DROPPED_FROM_SOURCE:
+    case XClusterTableStatus.DROPPED_FROM_TARGET:
+    case XClusterTableStatus.EXTRA_TABLE_ON_TARGET:
+    case XClusterTableStatus.EXTRA_TABLE_ON_SOURCE:
+      return (
+        <YBTooltip
+          title={
+            <Typography variant="body2">
+              {t(`${status}.tooltip`, {
+                sourceUniverseTerm: t(`source.${isDrInterface ? 'dr' : 'xClusterReplication'}`, {
+                  keyPrefix: I18N_KEY_PREFIX_XCLUSTER_TERMS
+                }),
+                targetUniverseTerm: t(`target.${isDrInterface ? 'dr' : 'xClusterReplication'}`, {
+                  keyPrefix: I18N_KEY_PREFIX_XCLUSTER_TERMS
+                }),
+                xClusterOffering: t(`offering.${isDrInterface ? 'dr' : 'xClusterReplication'}`, {
+                  keyPrefix: I18N_KEY_PREFIX_XCLUSTER_TERMS
+                })
+              })}
+            </Typography>
+          }
+        >
+          <Typography variant="body2" className={clsx(classes.pill, classes.danger)}>
+            {t(`${status}.label`)}
+            <i className="fa fa-exclamation-circle" />
+          </Typography>
+        </YBTooltip>
+      );
+    case XClusterTableStatus.TABLE_INFO_MISSING:
+    case XClusterTableStatus.DROPPED:
+      return (
+        <Typography variant="body2" className={clsx(classes.pill, classes.danger)}>
+          {t(status)}
+          <i className="fa fa-exclamation-circle" />
+        </Typography>
+      );
     default:
       return assertUnreachableCase(status);
   }

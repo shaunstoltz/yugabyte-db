@@ -1,6 +1,6 @@
 #!/usr/bin/env python
 #
-# Copyright 2019 YugaByte, Inc. and Contributors
+# Copyright 2019 YugabyteDB, Inc. and Contributors
 #
 # Licensed under the Polyform Free Trial License 1.0.0 (the "License"); you
 # may not use this file except in compliance with the License. You
@@ -13,13 +13,15 @@ import logging
 
 from ybops.cloud.common.method import (AbstractInstancesMethod, AbstractAccessMethod,
                                        AbstractMethod, UpdateMountedDisksMethod,
+                                       UpdateDiskMethod,
                                        ChangeInstanceTypeMethod, CreateInstancesMethod,
                                        CreateRootVolumesMethod, DestroyInstancesMethod,
                                        ProvisionInstancesMethod, ReplaceRootVolumeMethod,
-                                       DeleteRootVolumesMethod)
-from ybops.cloud.gcp.utils import GCP_PERSISTENT, GCP_SCRATCH
+                                       DeleteRootVolumesMethod, HardRebootInstancesMethod)
+from ybops.cloud.gcp.utils import GCP_PERSISTENT, GCP_SCRATCH, GCP_HYPERDISK_BALANCED, \
+    GCP_HYPERDISK_EXTREME
 from ybops.common.exceptions import YBOpsRuntimeError, get_exception_message
-from ybops.utils.ssh import format_rsa_key, validated_key_file, get_ssh_host_port, DEFAULT_SSH_PORT
+from ybops.utils.ssh import format_rsa_key, validated_key_file
 
 
 class GcpReplaceRootVolumeMethod(ReplaceRootVolumeMethod):
@@ -48,12 +50,22 @@ class GcpCreateInstancesMethod(CreateInstancesMethod):
 
     def add_extra_args(self):
         super(GcpCreateInstancesMethod, self).add_extra_args()
-        self.parser.add_argument("--use_preemptible", action="store_true",
-                                 help="If to use preemptible instances.")
-        self.parser.add_argument("--volume_type", choices=[GCP_SCRATCH, GCP_PERSISTENT],
+        self.parser.add_argument("--volume_type", choices=[GCP_SCRATCH, GCP_PERSISTENT,
+                                                           GCP_HYPERDISK_BALANCED,
+                                                           GCP_HYPERDISK_EXTREME],
                                  default="scratch", help="Storage type for GCP instances.")
+        self.parser.add_argument("--instance_template",
+                                 help="Instance type template for GCP instances")
+        self.parser.add_argument("--disk_iops", type=int, default=None,
+                                 help="Desired iops for instance volumes.")
+        self.parser.add_argument("--disk_throughput", type=int, default=None,
+                                 help="Desired throughput for instance volumes.")
+        self.parser.add_argument("--capacity_reservation", default=None,
+                                 help="Capacity reservation to use.")
 
-    def run_ansible_create(self, args):
+    def run_create_instance(self, args):
+        if args.ssh_user is not None:
+            self.SSH_USER = args.ssh_user
         server_type = args.type
 
         can_ip_forward = (
@@ -82,11 +94,13 @@ class GcpProvisionInstancesMethod(ProvisionInstancesMethod):
 
     def add_extra_args(self):
         super(GcpProvisionInstancesMethod, self).add_extra_args()
-        self.parser.add_argument("--volume_type", choices=[GCP_SCRATCH, GCP_PERSISTENT],
+        self.parser.add_argument("--volume_type", choices=[GCP_SCRATCH, GCP_PERSISTENT,
+                                                           GCP_HYPERDISK_BALANCED,
+                                                           GCP_HYPERDISK_EXTREME],
                                  default="scratch", help="Storage type for GCP instances.")
 
-    def update_ansible_vars_with_args(self, args):
-        super(GcpProvisionInstancesMethod, self).update_ansible_vars_with_args(args)
+    def update_extra_vars_with_args(self, args):
+        super(GcpProvisionInstancesMethod, self).update_extra_vars_with_args(args)
         self.extra_vars["device_names"] = self.cloud.get_device_names(args)
         self.extra_vars["mount_points"] = self.cloud.get_mount_points_csv(args)
 
@@ -99,14 +113,19 @@ class GcpCreateRootVolumesMethod(CreateRootVolumesMethod):
         self.create_method = GcpCreateInstancesMethod(base_command)
 
     def create_master_volume(self, args):
+        if args.instance_type is None:
+            raise YBOpsRuntimeError("instance_type is required for boot disk type selection."
+                                    " Please define it using --instance_type argument.")
         name = args.search_pattern[:63] if len(args.search_pattern) > 63 else args.search_pattern
+        deviceType = self.cloud.get_admin()._get_boot_disk_type(args.zone, args.instance_type)
         res = self.cloud.get_admin().create_disk(args.zone, args.instance_tags, body={
             "name": name,
             "sizeGb": args.boot_disk_size_gb,
+            "type": deviceType,
             "sourceImage": args.machine_image})
         return res["targetLink"]
 
-    # Not invoked. Just keeping if for consistency.
+    # Not invoked. Just keeping it for consistency.
     def delete_instance(self, args):
         name = args.search_pattern[:63] if len(args.search_pattern) > 63 else args.search_pattern
         self.cloud.get_admin().delete_instance(
@@ -124,7 +143,7 @@ class GcpDeleteRootVolumesMethod(DeleteRootVolumesMethod):
 
 
 class GcpDestroyInstancesMethod(DestroyInstancesMethod):
-    """Subclass for deleting instances in GCP. Uses the API to delete instance bypassing Ansible.
+    """Subclass for deleting instances in GCP. Uses the API to delete instance.
     """
 
     def __init__(self, base_command):
@@ -293,8 +312,13 @@ class GcpChangeInstanceTypeMethod(ChangeInstanceTypeMethod):
     def __init__(self, base_command):
         super(GcpChangeInstanceTypeMethod, self).__init__(base_command)
 
+    def add_extra_args(self):
+        super(GcpChangeInstanceTypeMethod, self).add_extra_args()
+        self.parser.add_argument("--capacity_reservation", default=None,
+                                 help="Capacity reservation group to use.")
+
     def _change_instance_type(self, args, host_info):
-        self.cloud.change_instance_type(host_info, args.instance_type)
+        self.cloud.change_instance_type(host_info, args.instance_type, args.capacity_reservation)
 
     def _host_info(self, args, host_info):
         args.private_ip = host_info["private_ip"]
@@ -311,9 +335,15 @@ class GcpResumeInstancesMethod(AbstractInstancesMethod):
         super(GcpResumeInstancesMethod, self).add_extra_args()
         self.parser.add_argument("--node_ip", default=None,
                                  help="The ip of the instance to resume.")
+        self.parser.add_argument("--capacity_reservation", default=None,
+                                 help="Capacity reservation group to use.")
 
     def callback(self, args):
-        self.cloud.start_instance(vars(args), [args.custom_ssh_port])
+        self.update_extra_vars_with_args(args)
+        if args.boot_script is not None:
+            self.cloud.update_user_data(args)
+        server_ports = self.get_server_ports_to_check(args)
+        self.cloud.start_instance(vars(args), server_ports, args.capacity_reservation)
 
 
 class GcpPauseInstancesMethod(AbstractInstancesMethod):
@@ -329,30 +359,11 @@ class GcpPauseInstancesMethod(AbstractInstancesMethod):
         self.cloud.stop_instance(vars(args))
 
 
-class GcpHardRebootInstancesMethod(AbstractInstancesMethod):
+class GcpHardRebootInstancesMethod(HardRebootInstancesMethod):
     def __init__(self, base_command):
-        super(GcpHardRebootInstancesMethod, self).__init__(base_command, "hard_reboot")
-
-    def add_extra_args(self):
-        super(GcpHardRebootInstancesMethod, self).add_extra_args()
-
-    def callback(self, args):
-        instance = self.cloud.get_host_info(args)
-        if not instance:
-            raise YBOpsRuntimeError("Could not find host {} to hard reboot".format(
-                args.search_pattern))
-        host_info = vars(args)
-        host_info.update(instance)
-        instance_state = host_info['instance_state']
-        if instance_state not in ('RUNNING', 'STOPPING', 'TERMINATED', 'PROVISIONING', 'STAGING'):
-            raise YBOpsRuntimeError("Instance is in invalid state '{}' for attempting a hard reboot"
-                                    .format(instance_state))
-        if instance_state in ('RUNNING', 'STOPPING'):
-            logging.info("Stopping instance {}".format(args.search_pattern))
-            self.cloud.stop_instance(host_info)
-        logging.info("Starting instance {}".format(args.search_pattern))
-        extra_vars = get_ssh_host_port(host_info, args.custom_ssh_port)
-        self.cloud.start_instance(host_info, [DEFAULT_SSH_PORT, extra_vars["ssh_port"]])
+        super(GcpHardRebootInstancesMethod, self).__init__(base_command)
+        self.valid_states = ('RUNNING', 'STOPPING', 'TERMINATED', 'PROVISIONING', 'STAGING')
+        self.valid_stoppable_states = ('RUNNING', 'STOPPING')
 
 
 class GcpUpdateMountedDisksMethod(UpdateMountedDisksMethod):
@@ -361,7 +372,9 @@ class GcpUpdateMountedDisksMethod(UpdateMountedDisksMethod):
 
     def add_extra_args(self):
         super(GcpUpdateMountedDisksMethod, self).add_extra_args()
-        self.parser.add_argument("--volume_type", choices=[GCP_SCRATCH, GCP_PERSISTENT],
+        self.parser.add_argument("--volume_type", choices=[GCP_SCRATCH, GCP_PERSISTENT,
+                                                           GCP_HYPERDISK_BALANCED,
+                                                           GCP_HYPERDISK_EXTREME],
                                  default="scratch", help="Storage type for GCP instances.")
 
 
@@ -376,3 +389,35 @@ class GcpTagsMethod(AbstractInstancesMethod):
 
     def callback(self, args):
         self.cloud.modify_tags(args)
+
+
+class GcpQueryDeviceNames(AbstractMethod):
+    def __init__(self, base_command):
+        super(GcpQueryDeviceNames, self).__init__(base_command, "device_names")
+
+    def add_extra_args(self):
+        super(GcpQueryDeviceNames, self).add_extra_args()
+        self.parser.add_argument("--volume_type", choices=[GCP_SCRATCH, GCP_PERSISTENT,
+                                                           GCP_HYPERDISK_BALANCED,
+                                                           GCP_HYPERDISK_EXTREME],
+                                 default="scratch", help="Storage type for GCP instances.")
+        self.parser.add_argument("--instance_type",
+                                 required=False,
+                                 help="The instance type to act on")
+        self.parser.add_argument("--num_volumes", type=int, default=0,
+                                 help="number of volumes to mount at the default path (/mnt/d#)")
+
+    def callback(self, args):
+        print(json.dumps(self.cloud.get_device_names(args)))
+
+
+class GcpUpdateDiskMethod(UpdateDiskMethod):
+    def __init__(self, base_command):
+        super(GcpUpdateDiskMethod, self).__init__(base_command)
+
+    def add_extra_args(self):
+        super(GcpUpdateDiskMethod, self).add_extra_args()
+        self.parser.add_argument("--disk_iops", type=int, default=None,
+                                 help="Disk IOPS to provision.")
+        self.parser.add_argument("--disk_throughput", type=int, default=None,
+                                 help="Disk throughput to provision.")

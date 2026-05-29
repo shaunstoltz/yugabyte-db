@@ -1,4 +1,4 @@
-// Copyright (c) YugaByte, Inc.
+// Copyright (c) YugabyteDB, Inc.
 
 package com.yugabyte.yw.commissioner;
 
@@ -7,6 +7,7 @@ import static org.hamcrest.CoreMatchers.containsString;
 import static org.hamcrest.MatcherAssert.assertThat;
 import static org.hamcrest.Matchers.lessThanOrEqualTo;
 import static org.junit.Assert.assertEquals;
+import static org.junit.Assert.assertNotNull;
 import static org.junit.Assert.assertThrows;
 import static org.junit.Assert.assertTrue;
 import static org.junit.Assert.fail;
@@ -24,7 +25,8 @@ import static play.inject.Bindings.bind;
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.fasterxml.jackson.databind.node.ObjectNode;
-import com.google.common.collect.ImmutableSet;
+import com.google.common.base.Stopwatch;
+import com.google.common.collect.ImmutableSortedSet;
 import com.google.common.util.concurrent.MoreExecutors;
 import com.typesafe.config.Config;
 import com.yugabyte.yw.commissioner.ITask.Abortable;
@@ -35,19 +37,27 @@ import com.yugabyte.yw.commissioner.TaskExecutor.TaskExecutionListener;
 import com.yugabyte.yw.common.CustomWsClientFactory;
 import com.yugabyte.yw.common.CustomWsClientFactoryProvider;
 import com.yugabyte.yw.common.PlatformGuiceApplicationBaseTest;
+import com.yugabyte.yw.common.PlatformServiceException;
+import com.yugabyte.yw.common.RedactingService;
+import com.yugabyte.yw.common.RedactingService.RedactionTarget;
+import com.yugabyte.yw.common.TaskExecutionException;
+import com.yugabyte.yw.common.Util;
 import com.yugabyte.yw.common.config.DummyRuntimeConfigFactoryImpl;
 import com.yugabyte.yw.common.config.RuntimeConfigFactory;
 import com.yugabyte.yw.common.ha.PlatformReplicationManager;
-import com.yugabyte.yw.common.password.RedactingService;
 import com.yugabyte.yw.models.TaskInfo;
 import com.yugabyte.yw.models.helpers.TaskType;
+import com.yugabyte.yw.models.helpers.YBAError;
+import com.yugabyte.yw.models.helpers.YBAError.Code;
 import java.time.Duration;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
+import java.util.TreeSet;
 import java.util.UUID;
 import java.util.concurrent.CancellationException;
 import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
@@ -76,10 +86,19 @@ public class TaskExecutorTest extends PlatformGuiceApplicationBaseTest {
   private Config mockConfig;
 
   private final Set<TaskType> RETRYABLE_TASKS =
-      ImmutableSet.of(
+      ImmutableSortedSet.of(
+          TaskType.ReadOnlyKubernetesClusterCreate,
+          TaskType.ReadOnlyKubernetesClusterDelete,
+          TaskType.CreateKubernetesUniverse,
+          TaskType.InstallYbcSoftwareOnK8s,
+          TaskType.DestroyKubernetesUniverse,
+          TaskType.UpdateKubernetesDiskSize,
           TaskType.CreateUniverse,
           TaskType.EditUniverse,
+          TaskType.ReplaceNodeInUniverse,
+          TaskType.EditKubernetesUniverse,
           TaskType.ReadOnlyClusterCreate,
+          TaskType.ReadOnlyClusterDelete,
           TaskType.AddNodeToUniverse,
           TaskType.RemoveNodeFromUniverse,
           TaskType.DeleteNodeFromUniverse,
@@ -89,7 +108,71 @@ public class TaskExecutorTest extends PlatformGuiceApplicationBaseTest {
           TaskType.BackupUniverse,
           TaskType.ResizeNode,
           TaskType.StartNodeInUniverse,
-          TaskType.StopNodeInUniverse);
+          TaskType.StopNodeInUniverse,
+          TaskType.CloudProviderDelete,
+          TaskType.CloudBootstrap,
+          TaskType.KubernetesOverridesUpgrade,
+          TaskType.GFlagsKubernetesUpgrade,
+          TaskType.SoftwareKubernetesUpgrade,
+          TaskType.SoftwareKubernetesUpgradeYB,
+          TaskType.FinalizeUpgrade,
+          TaskType.FinalizeKubernetesUpgrade,
+          TaskType.RollbackUpgrade,
+          TaskType.RollbackKubernetesUpgrade,
+          TaskType.SoftwareUpgrade,
+          TaskType.SoftwareUpgradeYB,
+          TaskType.VMImageUpgrade,
+          TaskType.GFlagsUpgrade,
+          TaskType.RebootUniverse,
+          TaskType.RestartUniverse,
+          TaskType.RestartUniverseKubernetesUpgrade,
+          TaskType.ThirdpartySoftwareUpgrade,
+          TaskType.CertsRotate,
+          TaskType.CertsRotateKubernetesUpgrade,
+          TaskType.TlsToggle,
+          TaskType.TlsToggleKubernetes,
+          TaskType.SystemdUpgrade,
+          TaskType.ModifyAuditLoggingConfig,
+          TaskType.ModifyQueryLoggingConfig,
+          TaskType.ModifyMetricsExportConfig,
+          TaskType.ConfigureExportTelemetryConfig,
+          TaskType.StartMasterOnNode,
+          TaskType.MasterFailover,
+          TaskType.SyncMasterAddresses,
+          TaskType.ReprovisionNode,
+          TaskType.CloudProviderEdit,
+          TaskType.SwitchoverDrConfig,
+          TaskType.SwitchoverDrConfigRollback,
+          TaskType.FailoverDrConfig,
+          TaskType.ResumeKubernetesUniverse,
+          TaskType.PauseKubernetesUniverse,
+          TaskType.FailoverDrConfig,
+          TaskType.DeleteDrConfig,
+          TaskType.DeleteXClusterConfig,
+          TaskType.DecommissionNode,
+          TaskType.EditBackupScheduleKubernetes,
+          TaskType.CreateBackupScheduleKubernetes,
+          TaskType.CreateXClusterConfig,
+          TaskType.EditXClusterConfig,
+          TaskType.CreateDrConfig,
+          TaskType.EditDrConfig,
+          TaskType.SetDatabasesDrConfig,
+          TaskType.SetTablesDrConfig,
+          TaskType.DecommissionNode,
+          TaskType.PauseUniverse,
+          TaskType.ResumeUniverse,
+          TaskType.UpgradeYbcGFlags,
+          TaskType.UpgradeKubernetesYbcGFlags,
+          TaskType.UpdateYbcThrottleFlags,
+          TaskType.UpdateK8sYbcThrottleFlags,
+          TaskType.KubernetesToggleImmutableYbc,
+          TaskType.OperatorImportUniverse,
+          TaskType.CreatePitrConfig,
+          TaskType.UpdatePitrConfig,
+          TaskType.DeletePitrConfig,
+          TaskType.RestoreSnapshotSchedule,
+          TaskType.ProvisionUniverseNodes,
+          TaskType.ProvisionUniverseNodes);
 
   @Override
   protected Application provideApplication() {
@@ -113,13 +196,16 @@ public class TaskExecutorTest extends PlatformGuiceApplicationBaseTest {
   }
 
   private TaskInfo waitForTask(UUID taskUUID) {
-    long elapsedTimeMs = 0;
-    while (taskExecutor.isTaskRunning(taskUUID) && elapsedTimeMs < 20000) {
+    return waitForTask(taskUUID, Duration.ofSeconds(10));
+  }
+
+  private TaskInfo waitForTask(UUID taskUUID, Duration waitTime) {
+    Stopwatch watch = Stopwatch.createStarted();
+    while (taskExecutor.isTaskRunning(taskUUID) && watch.elapsed().compareTo(waitTime) < 0) {
       try {
         Thread.sleep(100);
       } catch (InterruptedException e) {
       }
-      elapsedTimeMs += 100;
     }
     if (taskExecutor.isTaskRunning(taskUUID)) {
       fail("Task " + taskUUID + " did not complete in time");
@@ -132,7 +218,7 @@ public class TaskExecutorTest extends PlatformGuiceApplicationBaseTest {
     Class<? extends ITask> taskClass = abortable ? AbortableTask.class : NonAbortableTask.class;
     ITask task = spy(app.injector().instanceOf(taskClass));
     doReturn("TestTask").when(task).getName();
-    doReturn(node).when(task).getTaskDetails();
+    doReturn(node).when(task).getTaskParams();
     return task;
   }
 
@@ -166,19 +252,21 @@ public class TaskExecutorTest extends PlatformGuiceApplicationBaseTest {
               Object[] objects = inv.getArguments();
               ITask task = (ITask) objects[0];
               // Create a new task info object.
-              TaskInfo taskInfo = new TaskInfo(TaskType.BackupUniverse);
-              taskInfo.setTaskDetails(RedactingService.filterSecretFields(task.getTaskDetails()));
+              TaskInfo taskInfo = new TaskInfo(TaskType.BackupUniverse, null);
+              taskInfo.setTaskParams(
+                  RedactingService.filterSecretFields(task.getTaskParams(), RedactionTarget.APIS));
               taskInfo.setOwner("test-owner");
+              taskInfo.setYbaVersion(Util.getYbaVersion());
               return taskInfo;
             })
         .when(taskExecutor)
-        .createTaskInfo(any());
+        .createTaskInfo(any(), any(), any());
   }
 
   @Test
   public void testTaskSubmission() {
     ITask task = mockTaskCommon(false);
-    RunnableTask taskRunner = taskExecutor.createRunnableTask(task);
+    RunnableTask taskRunner = taskExecutor.createRunnableTask(task, null);
     UUID taskUUID = taskExecutor.submit(taskRunner, Executors.newFixedThreadPool(1));
     TaskInfo taskInfo = waitForTask(taskUUID);
     List<TaskInfo> subTaskInfos = taskInfo.getSubTasks();
@@ -190,14 +278,16 @@ public class TaskExecutorTest extends PlatformGuiceApplicationBaseTest {
   public void testTaskFailure() {
     ITask task = mockTaskCommon(false);
     doThrow(new RuntimeException("Error occurred in task")).when(task).run();
-    RunnableTask taskRunner = taskExecutor.createRunnableTask(task);
+    RunnableTask taskRunner = taskExecutor.createRunnableTask(task, null);
     UUID outTaskUUID = taskExecutor.submit(taskRunner, Executors.newFixedThreadPool(1));
     TaskInfo taskInfo = waitForTask(outTaskUUID);
     List<TaskInfo> subTaskInfos = taskInfo.getSubTasks();
     assertEquals(0, subTaskInfos.size());
     assertEquals(TaskInfo.State.Failure, taskInfo.getTaskState());
-    String errMsg = taskInfo.getTaskDetails().get("errorString").asText();
+    String errMsg = taskInfo.getTaskError().getMessage();
     assertTrue("Found " + errMsg, errMsg.contains("Error occurred in task"));
+    assertNotNull(taskInfo.getYbaVersion());
+    assertEquals(Util.getYbaVersion(), taskInfo.getYbaVersion());
   }
 
   @Test
@@ -218,7 +308,7 @@ public class TaskExecutorTest extends PlatformGuiceApplicationBaseTest {
         .when(task)
         .run();
 
-    RunnableTask taskRunner = taskExecutor.createRunnableTask(task);
+    RunnableTask taskRunner = taskExecutor.createRunnableTask(task, null);
     taskUUIDRef.set(taskRunner.getTaskUUID());
     UUID taskUUID = taskExecutor.submit(taskRunner, Executors.newFixedThreadPool(1));
     TaskInfo taskInfo = waitForTask(taskUUID);
@@ -250,7 +340,7 @@ public class TaskExecutorTest extends PlatformGuiceApplicationBaseTest {
         .run();
 
     doThrow(new RuntimeException("Error occurred in subtask")).when(subTask).run();
-    RunnableTask taskRunner = taskExecutor.createRunnableTask(task);
+    RunnableTask taskRunner = taskExecutor.createRunnableTask(task, null);
     taskUUIDRef.set(taskRunner.getTaskUUID());
     UUID taskUUID = taskExecutor.submit(taskRunner, Executors.newFixedThreadPool(1));
     TaskInfo taskInfo = waitForTask(taskUUID);
@@ -261,11 +351,11 @@ public class TaskExecutorTest extends PlatformGuiceApplicationBaseTest {
     assertEquals(1, subTasksByPosition.size());
     assertEquals(TaskInfo.State.Failure, taskInfo.getTaskState());
 
-    String errMsg = taskInfo.getTaskDetails().get("errorString").asText();
+    String errMsg = taskInfo.getTaskError().getMessage();
     assertTrue("Found " + errMsg, errMsg.contains("Failed to execute task"));
 
     assertEquals(TaskInfo.State.Failure, subTaskInfos.get(0).getTaskState());
-    errMsg = subTaskInfos.get(0).getTaskDetails().get("errorString").asText();
+    errMsg = subTaskInfos.get(0).getTaskError().getMessage();
     assertTrue("Found " + errMsg, errMsg.contains("Error occurred in subtask"));
   }
 
@@ -281,10 +371,10 @@ public class TaskExecutorTest extends PlatformGuiceApplicationBaseTest {
         .when(task)
         .run();
 
-    RunnableTask taskRunner = taskExecutor.createRunnableTask(task);
+    RunnableTask taskRunner = taskExecutor.createRunnableTask(task, null);
     UUID taskUUID = taskExecutor.submit(taskRunner, Executors.newFixedThreadPool(1));
     try {
-      assertThrows(RuntimeException.class, () -> taskExecutor.abort(taskUUID));
+      assertThrows(RuntimeException.class, () -> taskExecutor.abort(taskUUID, false));
     } finally {
       latch.countDown();
     }
@@ -325,7 +415,7 @@ public class TaskExecutorTest extends PlatformGuiceApplicationBaseTest {
         .when(subTask1)
         .run();
 
-    RunnableTask taskRunner = taskExecutor.createRunnableTask(task);
+    RunnableTask taskRunner = taskExecutor.createRunnableTask(task, null);
     taskUUIDRef.set(taskRunner.getTaskUUID());
     UUID taskUUID = taskExecutor.submit(taskRunner, Executors.newFixedThreadPool(1));
     if (!latch1.await(200, TimeUnit.SECONDS)) {
@@ -334,7 +424,7 @@ public class TaskExecutorTest extends PlatformGuiceApplicationBaseTest {
     TaskInfo taskInfo = TaskInfo.getOrBadRequest(taskUUID);
     assertEquals(TaskInfo.State.Running, taskInfo.getTaskState());
     // Stop the task
-    taskExecutor.abort(taskUUID);
+    taskExecutor.abort(taskUUID, false);
     latch2.countDown();
 
     taskInfo = waitForTask(taskUUID);
@@ -350,6 +440,8 @@ public class TaskExecutorTest extends PlatformGuiceApplicationBaseTest {
     assertEquals(TaskInfo.State.Aborted, taskInfo.getTaskState());
     assertEquals(TaskInfo.State.Success, subTaskInfos.get(0).getTaskState());
     assertEquals(TaskInfo.State.Aborted, subTaskInfos.get(1).getTaskState());
+    assertNotNull(taskInfo.getYbaVersion());
+    assertEquals(Util.getYbaVersion(), taskInfo.getYbaVersion());
   }
 
   @Test
@@ -375,7 +467,7 @@ public class TaskExecutorTest extends PlatformGuiceApplicationBaseTest {
         .run();
 
     AtomicInteger test = new AtomicInteger(0);
-    RunnableTask taskRunner = taskExecutor.createRunnableTask(task);
+    RunnableTask taskRunner = taskExecutor.createRunnableTask(task, null);
     taskUUIDRef.set(taskRunner.getTaskUUID());
     taskRunner.setTaskExecutionListener(
         new TaskExecutionListener() {
@@ -430,7 +522,7 @@ public class TaskExecutorTest extends PlatformGuiceApplicationBaseTest {
             })
         .when(task)
         .run();
-    RunnableTask taskRunner = taskExecutor.createRunnableTask(task);
+    RunnableTask taskRunner = taskExecutor.createRunnableTask(task, null);
     taskUUIDRef.set(taskRunner.getTaskUUID());
     UUID taskUUID = taskExecutor.submit(taskRunner, Executors.newFixedThreadPool(1));
     TaskInfo taskInfo = waitForTask(taskUUID);
@@ -473,7 +565,7 @@ public class TaskExecutorTest extends PlatformGuiceApplicationBaseTest {
         .run();
 
     // CompletableFuture.supplyAsync(() -> TaskExecutor.this.shutdown(Duration.ofMinutes(5))));
-    RunnableTask taskRunner1 = taskExecutor.createRunnableTask(task);
+    RunnableTask taskRunner1 = taskExecutor.createRunnableTask(task, null);
     UUID taskUUID = taskExecutor.submit(taskRunner1, executor);
     // Wait for the task to be running.
     latch1.await();
@@ -487,17 +579,19 @@ public class TaskExecutorTest extends PlatformGuiceApplicationBaseTest {
     TaskInfo taskInfo = TaskInfo.getOrBadRequest(taskUUID);
     // Aborted due to shutdown.
     assertEquals(TaskInfo.State.Aborted, taskInfo.getTaskState());
-    RunnableTask taskRunner2 = taskExecutor.createRunnableTask(task);
+    RunnableTask taskRunner2 = taskExecutor.createRunnableTask(task, null);
     // This should get rejected as the executor is already shutdown.
     assertThrows(
-        IllegalStateException.class,
+        PlatformServiceException.class,
         () -> taskExecutor.submit(taskRunner2, Executors.newFixedThreadPool(1)));
+    taskInfo = TaskInfo.getOrBadRequest(taskRunner2.getTaskUUID());
+    assertEquals(TaskInfo.State.Failure, taskInfo.getTaskState());
   }
 
   @Test
   public void testRunnableTaskCallstack() {
     ITask task = mockTaskCommon(false);
-    RunnableTask taskRunner = taskExecutor.createRunnableTask(task);
+    RunnableTask taskRunner = taskExecutor.createRunnableTask(task, null);
     String[] callstack = taskRunner.getCreatorCallstack();
     assertThat(
         callstack[0],
@@ -516,7 +610,7 @@ public class TaskExecutorTest extends PlatformGuiceApplicationBaseTest {
             inv -> {
               latch.countDown();
               while (true) {
-                taskExecutor.getRunnableTask(taskUUIDRef.get()).waitFor(Duration.ofMillis(200));
+                taskExecutor.getRunnableTask(taskUUIDRef.get()).waitFor(Duration.ofSeconds(1));
               }
             })
         .when(subTask)
@@ -535,26 +629,25 @@ public class TaskExecutorTest extends PlatformGuiceApplicationBaseTest {
         .when(task)
         .run();
 
-    RunnableTask taskRunner = taskExecutor.createRunnableTask(task);
+    RunnableTask taskRunner = taskExecutor.createRunnableTask(task, null);
     UUID taskUUID = taskExecutor.submit(taskRunner, Executors.newFixedThreadPool(1));
     taskUUIDRef.set(taskUUID);
     latch.await();
-    taskExecutor.abort(taskUUID);
+    taskExecutor.abort(taskUUID, false);
     TaskInfo taskInfo = waitForTask(taskUUID);
     verify(subTask).setUserTaskUUID(eq(taskUUID));
     assertEquals(TaskInfo.State.Aborted, taskInfo.getTaskState());
-    JsonNode errNode = taskInfo.getSubTasks().get(0).getTaskDetails().get("errorString");
-    assertThat(errNode.toString(), containsString("is aborted while waiting"));
+    String errMsg = taskInfo.getSubTasks().get(0).getTaskError().getMessage();
+    assertThat(errMsg, containsString("is aborted while waiting"));
   }
 
   @Test
   public void testRetryableAnnotation() {
     // Iterate through allowed Task Types by Commissioner only
     Set<TaskType> retryableTaskTypes =
-        TaskType.filteredValues()
-            .stream()
+        TaskType.filteredValues().stream()
             .filter(taskType -> TaskExecutor.isTaskRetryable(taskType.getTaskClass()))
-            .collect(Collectors.toSet());
+            .collect(Collectors.toCollection(TreeSet::new));
     assertEquals(RETRYABLE_TASKS, retryableTaskTypes);
   }
 
@@ -576,7 +669,7 @@ public class TaskExecutorTest extends PlatformGuiceApplicationBaseTest {
             })
         .when(subTask)
         .run();
-    RunnableTask taskRunner = taskExecutor.createRunnableTask(task);
+    RunnableTask taskRunner = taskExecutor.createRunnableTask(task, null);
     doAnswer(
             inv -> {
               RunnableTask runnable = taskExecutor.getRunnableTask(taskUUIDRef.get());
@@ -608,5 +701,356 @@ public class TaskExecutorTest extends PlatformGuiceApplicationBaseTest {
     verify(subTask, times(1)).setTaskUUID(any());
     assertEquals(TaskInfo.State.Success, taskInfo.getTaskState());
     assertEquals(TaskInfo.State.Success, subTaskInfos.get(0).getTaskState());
+  }
+
+  @Test
+  public void testTaskValidationFailure() {
+    ITask task = mockTaskCommon(false);
+    doThrow(new RuntimeException("Validation failed")).when(task).validateParams(true);
+    RunnableTask taskRunner = taskExecutor.createRunnableTask(task, null);
+    assertThrows(
+        PlatformServiceException.class,
+        () -> taskExecutor.submit(taskRunner, Executors.newFixedThreadPool(1)));
+    TaskInfo taskInfo = TaskInfo.getOrBadRequest(taskRunner.getTaskUUID());
+    assertEquals(TaskInfo.State.Failure, taskInfo.getTaskState());
+  }
+
+  @Test
+  public void testShoudRunPredicate() {
+    ITask task = mockTaskCommon(false);
+    ITask subTask1 = mockTaskCommon(false);
+    ITask subTask2 = mockTaskCommon(false);
+    AtomicReference<UUID> taskUUIDRef = new AtomicReference<>();
+    doAnswer(
+            inv -> {
+              RunnableTask runnable = taskExecutor.getRunnableTask(taskUUIDRef.get());
+              // Invoke subTask from the parent task.
+              SubTaskGroup subTasksGroup1 = taskExecutor.createSubTaskGroup("test");
+              subTasksGroup1.addSubTask(subTask1);
+              runnable.addSubTaskGroup(subTasksGroup1);
+              SubTaskGroup subTasksGroup2 = taskExecutor.createSubTaskGroup("test");
+              subTasksGroup2.addSubTask(subTask2);
+              runnable.addSubTaskGroup(subTasksGroup2);
+              // Do not run it.
+              subTasksGroup2.setShouldRunPredicate(t -> false);
+              runnable.runSubTasks();
+              return null;
+            })
+        .when(task)
+        .run();
+    RunnableTask taskRunner = taskExecutor.createRunnableTask(task, null);
+    taskUUIDRef.set(taskRunner.getTaskUUID());
+    UUID taskUUID = taskExecutor.submit(taskRunner, Executors.newFixedThreadPool(1));
+    TaskInfo taskInfo = waitForTask(taskUUID);
+    List<TaskInfo> subTaskInfos = taskInfo.getSubTasks();
+    verify(subTask1, times(1)).run();
+    verify(subTask2, times(0)).run();
+    assertEquals(TaskInfo.State.Success, taskInfo.getTaskState());
+    Map<Integer, List<TaskInfo>> subTasksByPosition =
+        subTaskInfos.stream().collect(Collectors.groupingBy(TaskInfo::getPosition));
+    assertEquals(2, subTasksByPosition.size());
+    List<TaskInfo.State> subTaskStates =
+        subTasksByPosition.get(0).stream().map(TaskInfo::getTaskState).collect(Collectors.toList());
+    assertEquals(1, subTaskStates.size());
+    assertEquals(TaskInfo.State.Success, subTaskStates.get(0));
+    subTaskStates =
+        subTasksByPosition.get(1).stream().map(TaskInfo::getTaskState).collect(Collectors.toList());
+    assertEquals(1, subTaskStates.size());
+    assertTrue(subTaskStates.contains(TaskInfo.State.Success));
+  }
+
+  @Test
+  public void testTaskExecutionException() {
+    ITask task = mockTaskCommon(false);
+    ObjectNode params = Json.newObject();
+    params.put("param1", "value1");
+    doAnswer(
+            inv -> {
+              throw new TaskExecutionException(Code.PLATFORM_RESTARTED, "Platform restarted");
+            })
+        .when(task)
+        .run();
+    doReturn(params).when(task).getTaskParams();
+    RunnableTask taskRunner = taskExecutor.createRunnableTask(task, null);
+    UUID taskUUID = taskExecutor.submit(taskRunner, Executors.newFixedThreadPool(1));
+    waitForTask(taskUUID);
+    TaskInfo taskInfo = TaskInfo.getOrBadRequest(taskUUID);
+    YBAError taskError = taskInfo.getTaskError();
+    assertEquals(Code.PLATFORM_RESTARTED, taskError.getCode());
+    assertEquals("Platform restarted", taskError.getMessage());
+    JsonNode taskParams = taskInfo.getTaskParams();
+    assertEquals(params, taskParams);
+  }
+
+  @Test
+  public void testHandleCompletionFailure() {
+    ITask task = mockTaskCommon(false);
+    ITask subTask1 = mockTaskCommon(false);
+    ITask subTask2 = mockTaskCommon(false);
+    doThrow(RuntimeException.class).when(subTask1).run();
+    AtomicReference<UUID> taskUUIDRef = new AtomicReference<>();
+    doAnswer(
+            inv -> {
+              RunnableTask runnable = taskExecutor.getRunnableTask(taskUUIDRef.get());
+              // Invoke subTask from the parent task.
+              SubTaskGroup subTasksGroup1 = taskExecutor.createSubTaskGroup("test");
+              subTasksGroup1.addSubTask(subTask1);
+              runnable.addSubTaskGroup(subTasksGroup1);
+              subTasksGroup1.setAfterTaskRunHandler(
+                  (t, th) -> {
+                    assertTrue(t != null);
+                    assertTrue(th != null);
+                    // Propagate the error to fail the task.
+                    return th;
+                  });
+              SubTaskGroup subTasksGroup2 = taskExecutor.createSubTaskGroup("test");
+              subTasksGroup2.addSubTask(subTask2);
+              runnable.addSubTaskGroup(subTasksGroup2);
+              subTasksGroup2.setAfterTaskRunHandler(
+                  (t, th) -> {
+                    assertTrue(t != null);
+                    assertTrue(th != null);
+                    // Ignore error by returning null.
+                    return null;
+                  });
+              runnable.runSubTasks();
+              return null;
+            })
+        .when(task)
+        .run();
+    RunnableTask taskRunner = taskExecutor.createRunnableTask(task, null);
+    taskUUIDRef.set(taskRunner.getTaskUUID());
+    UUID taskUUID = taskExecutor.submit(taskRunner, Executors.newFixedThreadPool(1));
+    TaskInfo taskInfo = waitForTask(taskUUID);
+    List<TaskInfo> subTaskInfos = taskInfo.getSubTasks();
+    verify(subTask1, times(1)).run();
+    verify(subTask2, times(0)).run();
+    assertEquals(TaskInfo.State.Failure, taskInfo.getTaskState());
+    Map<Integer, List<TaskInfo>> subTasksByPosition =
+        subTaskInfos.stream().collect(Collectors.groupingBy(TaskInfo::getPosition));
+    assertEquals(2, subTasksByPosition.size());
+    List<TaskInfo.State> subTaskStates =
+        subTasksByPosition.get(0).stream().map(TaskInfo::getTaskState).collect(Collectors.toList());
+    assertEquals(1, subTaskStates.size());
+    assertEquals(TaskInfo.State.Failure, subTaskStates.get(0));
+    subTaskStates =
+        subTasksByPosition.get(1).stream().map(TaskInfo::getTaskState).collect(Collectors.toList());
+    assertEquals(1, subTaskStates.size());
+    assertTrue(subTaskStates.contains(TaskInfo.State.Created));
+  }
+
+  @Test
+  public void testHandleCompletionSuccess() {
+    ITask task = mockTaskCommon(false);
+    ITask subTask1 = mockTaskCommon(false);
+    ITask subTask2 = mockTaskCommon(false);
+    doThrow(RuntimeException.class).when(subTask1).run();
+    doThrow(RuntimeException.class).when(subTask2).run();
+    AtomicReference<UUID> taskUUIDRef = new AtomicReference<>();
+    doAnswer(
+            inv -> {
+              RunnableTask runnable = taskExecutor.getRunnableTask(taskUUIDRef.get());
+              // Invoke subTask from the parent task.
+              SubTaskGroup subTasksGroup1 = taskExecutor.createSubTaskGroup("test");
+              subTasksGroup1.addSubTask(subTask1);
+              runnable.addSubTaskGroup(subTasksGroup1);
+              subTasksGroup1.setAfterTaskRunHandler(
+                  (t, th) -> {
+                    assertTrue(t != null);
+                    assertTrue(th != null);
+                    // Ignore error by returning null.
+                    return null;
+                  });
+              SubTaskGroup subTasksGroup2 = taskExecutor.createSubTaskGroup("test");
+              subTasksGroup2.addSubTask(subTask2);
+              runnable.addSubTaskGroup(subTasksGroup2);
+              // Do not run it.
+              subTasksGroup2.setAfterTaskRunHandler(
+                  (t, th) -> {
+                    assertTrue(t != null);
+                    assertTrue(th != null);
+                    // Ignore error by returning null.
+                    return null;
+                  });
+              runnable.runSubTasks();
+              return null;
+            })
+        .when(task)
+        .run();
+    RunnableTask taskRunner = taskExecutor.createRunnableTask(task, null);
+    taskUUIDRef.set(taskRunner.getTaskUUID());
+    UUID taskUUID = taskExecutor.submit(taskRunner, Executors.newFixedThreadPool(1));
+    TaskInfo taskInfo = waitForTask(taskUUID);
+    List<TaskInfo> subTaskInfos = taskInfo.getSubTasks();
+    verify(subTask1, times(1)).run();
+    verify(subTask2, times(1)).run();
+    assertEquals(TaskInfo.State.Success, taskInfo.getTaskState());
+    Map<Integer, List<TaskInfo>> subTasksByPosition =
+        subTaskInfos.stream().collect(Collectors.groupingBy(TaskInfo::getPosition));
+    assertEquals(2, subTasksByPosition.size());
+    List<TaskInfo.State> subTaskStates =
+        subTasksByPosition.get(0).stream().map(TaskInfo::getTaskState).collect(Collectors.toList());
+    assertEquals(1, subTaskStates.size());
+    assertEquals(TaskInfo.State.Success, subTaskStates.get(0));
+    subTaskStates =
+        subTasksByPosition.get(1).stream().map(TaskInfo::getTaskState).collect(Collectors.toList());
+    assertEquals(1, subTaskStates.size());
+    assertTrue(subTaskStates.contains(TaskInfo.State.Success));
+    assertNotNull(taskInfo.getYbaVersion());
+    assertEquals(Util.getYbaVersion(), taskInfo.getYbaVersion());
+  }
+
+  @Test
+  public void testAfterTaskCallback() {
+    ITask task = mockTaskCommon(false);
+    ITask subTask1 = mockTaskCommon(false);
+    ITask subTask2 = mockTaskCommon(false);
+    AtomicReference<UUID> taskUUIDRef = new AtomicReference<>();
+    doAnswer(
+            inv -> {
+              RunnableTask runnable = taskExecutor.getRunnableTask(taskUUIDRef.get());
+              // Invoke subTask from the parent task.
+              SubTaskGroup subTasksGroup1 = taskExecutor.createSubTaskGroup("test");
+              subTasksGroup1.addSubTask(subTask1);
+              runnable.addSubTaskGroup(subTasksGroup1);
+              SubTaskGroup subTasksGroup2 = taskExecutor.createSubTaskGroup("test");
+              subTasksGroup2.addSubTask(subTask2);
+              runnable.addSubTaskGroup(subTasksGroup2);
+              runnable.runSubTasks();
+              return null;
+            })
+        .when(task)
+        .run();
+    RunnableTask taskRunner = taskExecutor.createRunnableTask(task, null);
+    taskUUIDRef.set(taskRunner.getTaskUUID());
+    Map<UUID, Integer> beforeTaskCallbackCounter = new ConcurrentHashMap<>();
+    Map<UUID, Integer> afterTaskCallbackCounter = new ConcurrentHashMap<>();
+    taskRunner.setTaskExecutionListener(
+        new TaskExecutionListener() {
+          @Override
+          public void beforeTask(TaskInfo tf) {
+            beforeTaskCallbackCounter.compute(tf.getUuid(), (k, v) -> v == null ? 1 : v + 1);
+          }
+
+          @Override
+          public void afterTask(TaskInfo tf, Throwable t) {
+            afterTaskCallbackCounter.compute(tf.getUuid(), (k, v) -> v == null ? 1 : v + 1);
+          }
+        });
+    UUID taskUUID = taskExecutor.submit(taskRunner, Executors.newFixedThreadPool(1));
+    TaskInfo taskInfo = waitForTask(taskUUID);
+    assertEquals(TaskInfo.State.Success, taskInfo.getTaskState());
+    verify(subTask1, times(1)).run();
+    verify(subTask2, times(1)).run();
+    // 1 parent and 2 subtasks.
+    assertEquals(3, beforeTaskCallbackCounter.size());
+    assertEquals(3, afterTaskCallbackCounter.size());
+    beforeTaskCallbackCounter.forEach(
+        (k, v) -> {
+          assertEquals(1, v.intValue());
+        });
+    afterTaskCallbackCounter.forEach(
+        (k, v) -> {
+          assertEquals(1, v.intValue());
+        });
+  }
+
+  @Test
+  public void testAfterGroupListener() {
+    ITask task = mockTaskCommon(false);
+    ITask subTask1 = mockTaskCommon(false);
+    ITask subTask2 = mockTaskCommon(false);
+    doThrow(RuntimeException.class).when(subTask2).run();
+    AtomicReference<UUID> taskUUIDRef = new AtomicReference<>();
+    AtomicInteger listenerCounter1 = new AtomicInteger();
+    AtomicInteger listenerCounter2 = new AtomicInteger();
+    doAnswer(
+            inv -> {
+              RunnableTask runnable = taskExecutor.getRunnableTask(taskUUIDRef.get());
+              // Invoke subTask from the parent task.
+              SubTaskGroup subTasksGroup1 = taskExecutor.createSubTaskGroup("test");
+              subTasksGroup1.addSubTask(subTask1);
+              subTasksGroup1.setAfterGroupRunListener(g -> listenerCounter1.incrementAndGet());
+              runnable.addSubTaskGroup(subTasksGroup1);
+              SubTaskGroup subTasksGroup2 = taskExecutor.createSubTaskGroup("test");
+              subTasksGroup2.addSubTask(subTask2);
+              subTasksGroup2.setAfterGroupRunListener(g -> listenerCounter2.incrementAndGet());
+              runnable.addSubTaskGroup(subTasksGroup2);
+              runnable.runSubTasks();
+              return null;
+            })
+        .when(task)
+        .run();
+    RunnableTask taskRunner = taskExecutor.createRunnableTask(task, null);
+    taskUUIDRef.set(taskRunner.getTaskUUID());
+    UUID taskUUID = taskExecutor.submit(taskRunner, Executors.newFixedThreadPool(1));
+    TaskInfo taskInfo = waitForTask(taskUUID);
+    assertEquals(TaskInfo.State.Failure, taskInfo.getTaskState());
+    verify(subTask1, times(1)).run();
+    verify(subTask2, times(1)).run();
+    assertEquals(1, listenerCounter1.get());
+    assertEquals(0, listenerCounter2.get());
+  }
+
+  @Test
+  public void testSubTaskPause() throws InterruptedException {
+    ITask task = mockTaskCommon(true);
+    ITask subTask1 = mockTaskCommon(true);
+    ITask subTask2 = mockTaskCommon(true);
+    AtomicReference<UUID> taskUUIDRef = new AtomicReference<>();
+
+    doAnswer(
+            inv -> {
+              RunnableTask runnable = taskExecutor.getRunnableTask(taskUUIDRef.get());
+              // Invoke subTask from the parent task.
+              SubTaskGroup subTasksGroup1 = taskExecutor.createSubTaskGroup("test1");
+              subTasksGroup1.setPausedAfter(true);
+              subTasksGroup1.addSubTask(subTask1);
+              runnable.addSubTaskGroup(subTasksGroup1);
+              SubTaskGroup subTasksGroup2 = taskExecutor.createSubTaskGroup("test2");
+              subTasksGroup2.addSubTask(subTask2);
+              runnable.addSubTaskGroup(subTasksGroup2);
+              runnable.runSubTasks();
+              return null;
+            })
+        .when(task)
+        .run();
+
+    CountDownLatch latch1 = new CountDownLatch(1);
+    CountDownLatch latch2 = new CountDownLatch(1);
+    doAnswer(
+            inv -> {
+              latch1.countDown();
+              latch2.await();
+              return null;
+            })
+        .when(subTask1)
+        .run();
+
+    RunnableTask taskRunner = taskExecutor.createRunnableTask(task, null);
+    taskUUIDRef.set(taskRunner.getTaskUUID());
+    UUID taskUUID = taskExecutor.submit(taskRunner, Executors.newFixedThreadPool(1));
+    if (!latch1.await(200, TimeUnit.SECONDS)) {
+      fail();
+    }
+    TaskInfo taskInfo = TaskInfo.getOrBadRequest(taskUUID);
+    assertEquals(TaskInfo.State.Running, taskInfo.getTaskState());
+    latch2.countDown();
+
+    taskInfo = waitForTask(taskUUID);
+
+    verify(subTask1, times(1)).run();
+    verify(subTask2, times(0)).run();
+
+    List<TaskInfo> subTaskInfos = taskInfo.getSubTasks();
+    Map<Integer, List<TaskInfo>> subTasksByPosition =
+        subTaskInfos.stream().collect(Collectors.groupingBy(TaskInfo::getPosition));
+
+    assertEquals(2, subTasksByPosition.size());
+    assertEquals(TaskInfo.State.Paused, taskInfo.getTaskState());
+    assertEquals(TaskInfo.State.Success, subTaskInfos.get(0).getTaskState());
+    assertEquals(TaskInfo.State.Created, subTaskInfos.get(1).getTaskState());
+    assertNotNull(taskInfo.getYbaVersion());
+    assertEquals(Util.getYbaVersion(), taskInfo.getYbaVersion());
   }
 }

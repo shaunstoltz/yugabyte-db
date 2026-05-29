@@ -1,4 +1,4 @@
-// Copyright (c) YugaByte, Inc.
+// Copyright (c) YugabyteDB, Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License"); you may not use this file except
 // in compliance with the License.  You may obtain a copy of the License at
@@ -20,6 +20,10 @@
 #include "yb/client/client.h"
 
 namespace yb {
+
+namespace tserver {
+class DumpTabletDataResponsePB;
+}  // namespace tserver
 
 namespace test {
 
@@ -63,7 +67,17 @@ class MiniClusterTestWithClient : public YBMiniClusterTestBase<T> {
 
  protected:
   virtual Status CreateClient();
+
+  // Creates the client only if it has not been created before.
+  virtual Status EnsureClientCreated();
+
   void DoTearDown() override;
+
+  Result<tserver::DumpTabletDataResponsePB> DumpTabletData(
+      size_t tserver_idx, const TabletId& tablet_id,
+      const HybridTime& read_ht = HybridTime::kInvalid, const std::string& dest_path = "");
+
+  Status ValidateTabletDataAcrossReplicas(const TabletId& tablet_id);
 
   std::unique_ptr<client::YBClient> client_;
 };

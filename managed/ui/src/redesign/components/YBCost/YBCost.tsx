@@ -1,4 +1,4 @@
-import React, { FC } from 'react';
+import { FC } from 'react';
 import moment from 'moment';
 import { YBFormattedNumber } from '../../../components/common/descriptors'; //TODO : Migrate react-intl to new version
 
@@ -45,7 +45,7 @@ export const YBCost: FC<YBCostProps> = ({
     <YBFormattedNumber
       value={finalCost}
       maximumFractionDigits={2}
-      formattedNumberStyle="currency"
+      formatStyle="currency"
       currency="USD"
       multiplier={multiplier}
     />

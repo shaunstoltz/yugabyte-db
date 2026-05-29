@@ -1,5 +1,5 @@
 /*
- * Copyright 2021 YugaByte, Inc. and Contributors
+ * Copyright 2021 YugabyteDB, Inc. and Contributors
  *
  * Licensed under the Polyform Free Trial License 1.0.0 (the "License"); you
  * may not use this file except in compliance with the License. You
@@ -13,7 +13,12 @@ package com.yugabyte.yw.commissioner.tasks.subtasks;
 import com.yugabyte.yw.commissioner.BaseTaskDependencies;
 import com.yugabyte.yw.commissioner.tasks.params.NodeTaskParams;
 import com.yugabyte.yw.common.NodeManager;
+import com.yugabyte.yw.common.Util;
+import com.yugabyte.yw.common.utils.CapacityReservationUtil;
+import com.yugabyte.yw.models.Provider;
+import com.yugabyte.yw.models.TaskInfo;
 import com.yugabyte.yw.models.Universe;
+import com.yugabyte.yw.models.helpers.NodeDetails;
 import javax.inject.Inject;
 import lombok.extern.slf4j.Slf4j;
 
@@ -21,13 +26,14 @@ import lombok.extern.slf4j.Slf4j;
 public class ResumeServer extends NodeTaskBase {
 
   @Inject
-  protected ResumeServer(BaseTaskDependencies baseTaskDependencies, NodeManager nodeManager) {
-    super(baseTaskDependencies, nodeManager);
+  protected ResumeServer(BaseTaskDependencies baseTaskDependencies) {
+    super(baseTaskDependencies);
   }
 
   public static class Params extends NodeTaskParams {
     // IP of node to be resumed.
     public String nodeIP = null;
+    public String capacityReservation;
   }
 
   @Override
@@ -36,23 +42,39 @@ public class ResumeServer extends NodeTaskBase {
   }
 
   private void resumeUniverse(final String nodeName) {
-    Universe u = Universe.getOrBadRequest(taskParams().universeUUID);
+    Universe u = Universe.getOrBadRequest(taskParams().getUniverseUUID());
     if (u.getNode(nodeName) == null) {
       log.error("No node in universe with name " + nodeName);
       return;
     }
-    log.info("Resumed the node " + nodeName + " from universe " + taskParams().universeUUID);
+    log.info("Resumed the node " + nodeName + " from universe " + taskParams().getUniverseUUID());
   }
 
   @Override
   public void run() {
-    try {
-      getNodeManager()
-          .nodeCommand(NodeManager.NodeCommandType.Resume, taskParams())
-          .processErrors();
-      resumeUniverse(taskParams().nodeName);
-    } catch (Exception e) {
-      throw e;
+    Universe universe = Universe.getOrBadRequest(taskParams().getUniverseUUID());
+    NodeDetails nodeDetails = universe.getNode(taskParams().nodeName);
+    Provider provider = Util.getProviderForNode(nodeDetails, universe);
+    taskParams().capacityReservation =
+        CapacityReservationUtil.getReservationIfPresent(
+            getTaskCache(), provider, taskParams().nodeName);
+    getNodeManager().nodeCommand(NodeManager.NodeCommandType.Resume, taskParams()).processErrors();
+    resumeUniverse(taskParams().nodeName);
+  }
+
+  @Override
+  public int getRetryLimit() {
+    return 2;
+  }
+
+  @Override
+  public boolean onFailure(TaskInfo taskInfo, Throwable cause) {
+    // reboot unless this is an InsufficientInstanceCapacity error from AWS
+    if (cause.getMessage() != null
+        && !cause.getMessage().contains("InsufficientInstanceCapacity")) {
+      return super.onFailure(taskInfo, cause);
     }
+
+    return false;
   }
 }

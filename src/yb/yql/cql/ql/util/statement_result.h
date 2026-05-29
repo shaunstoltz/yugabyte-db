@@ -1,5 +1,5 @@
 //--------------------------------------------------------------------------------------------------
-// Copyright (c) YugaByte, Inc.
+// Copyright (c) YugabyteDB, Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License"); you may not use this file except
 // in compliance with the License.  You may obtain a copy of the License at
@@ -24,6 +24,8 @@
 #include "yb/common/value.pb.h"
 
 #include "yb/gutil/callback_forward.h"
+
+#include "yb/qlexpr/qlexpr_fwd.h"
 
 #include "yb/util/ref_cnt_buffer.h"
 
@@ -146,6 +148,7 @@ class RowsResult : public ExecutedResult {
 
   void SetPagingState(client::YBqlOp *op);
   void SetPagingState(const QLPagingStatePB& paging_state);
+  void SetPagingState(const LWQLPagingStatePB& paging_state);
   void SetPagingState(RowsResult&& other);
   // Override the schema version in the paging state. This is needed to support sending the schema
   // version of the main table in the response while keeping the rest of the state from the index.
@@ -155,7 +158,7 @@ class RowsResult : public ExecutedResult {
 
   // Parse the rows data and return it as a row block. It is the caller's responsibility to free
   // the row block after use.
-  std::unique_ptr<QLRowBlock> GetRowBlock() const;
+  std::unique_ptr<qlexpr::QLRowBlock> GetRowBlock() const;
 
  private:
   const client::YBTableName table_name_;

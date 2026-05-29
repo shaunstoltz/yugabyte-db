@@ -15,9 +15,9 @@
 // specific language governing permissions and limitations
 // under the License.
 //
-// The following only applies to changes made to this file as part of YugaByte development.
+// The following only applies to changes made to this file as part of YugabyteDB development.
 //
-// Portions Copyright (c) YugaByte, Inc.
+// Portions Copyright (c) YugabyteDB, Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License"); you may not use this file except
 // in compliance with the License.  You may obtain a copy of the License at
@@ -32,8 +32,9 @@
 #pragma once
 
 #include <unordered_map>
-#include <unordered_set>
 #include <vector>
+
+#include "yb/ash/ash_fwd.h"
 
 #include "yb/client/async_rpc.h"
 #include "yb/client/error_collector.h"
@@ -47,10 +48,10 @@
 #include "yb/gutil/ref_counted.h"
 
 #include "yb/util/async_util.h"
-#include "yb/util/atomic.h"
-#include "yb/util/locks.h"
 #include "yb/util/status_fwd.h"
 #include "yb/util/threadpool.h"
+
+#include "yb/server/clock.h"
 
 namespace yb {
 namespace client {
@@ -69,7 +70,16 @@ struct InFlightOpsGroup {
 
 struct InFlightOpsTransactionMetadata {
   TransactionMetadata transaction;
-  boost::optional<SubTransactionMetadata> subtransaction;
+  std::optional<SubTransactionMetadataPB> subtransaction_pb;
+  // This field is only relevant when dealing with session/transaction advisory lock requests.
+  // It's used to prevent conflicts between session and transaction level advisory locks
+  // within the same session.
+  std::optional<TransactionMetadata> background_transaction_meta;
+  // When acquiring a session advisory lock, we need the below to release waiting requests
+  // involved in a deadlock.
+  std::optional<PgSessionRequestVersion> pg_session_req_version;
+  // Used to detect potential deadlocks spanning fast path transactions with DDLs.
+  std::optional<TransactionMetadata> object_locking_txn_meta;
 };
 
 struct InFlightOpsGroupsWithMetadata {
@@ -79,6 +89,15 @@ struct InFlightOpsGroupsWithMetadata {
   InFlightOpsTransactionMetadata metadata;
 };
 
+struct RequestDetails {
+  RetryableRequestId min_running_request_id;
+
+  explicit RequestDetails(RetryableRequestId min_running_request_id_) :
+      min_running_request_id(min_running_request_id_) {}
+};
+
+using BatcherRequestsMap = std::unordered_map<RetryableRequestId, RequestDetails>;
+
 class TxnBatcherIf {
  public:
   // Ask transaction to expect `count` operations in future. I.e. Prepare will be called with such
@@ -87,8 +106,9 @@ class TxnBatcherIf {
 
   // Notifies transaction that specified ops were flushed with some status.
   virtual void Flushed(
-      const internal::InFlightOps& ops, const ReadHybridTime& used_read_time,
-      const Status& status) = 0;
+      const internal::InFlightOps& ops,
+      const std::optional<SubTransactionMetadataPB>& subtransaction_pb,
+      const ReadHybridTime& used_read_time, const Status& status) = 0;
 
   // This function is used to init metadata of Write/Read request.
   // If we don't have enough information, then the function returns false and stores
@@ -105,8 +125,7 @@ class TxnBatcherIf {
 
 // Batcher state changes sequentially in the order listed below, with the exception that kAborted
 // could be reached from any state.
-YB_DEFINE_ENUM(
-    BatcherState,
+YB_DEFINE_ENUM(BatcherState,
     (kGatheringOps)       // Initial state, while we adding operations to the batcher.
     (kResolvingTablets)   // Flush was invoked on batcher, waiting until tablets for all operations
                           // are resolved and move to the next state.
@@ -149,11 +168,14 @@ class Batcher : public Runnable, public std::enable_shared_from_this<Batcher> {
   // Create a new batcher associated with the given session.
   //
   // Creates a weak_ptr to 'session'.
-  Batcher(YBClient* client,
-          const YBSessionPtr& session,
-          YBTransactionPtr transaction,
-          ConsistentReadPoint* read_point,
-          bool force_consistent_read);
+  Batcher(
+      YBClient* client,
+      const YBSessionPtr& session,
+      YBTransactionPtr transaction,
+      ConsistentReadPoint* read_point,
+      bool force_consistent_read,
+      int64_t leader_term,
+      ThreadSafeArenaPtr arena);
   ~Batcher();
 
   // Set the timeout for this batcher.
@@ -163,14 +185,16 @@ class Batcher : public Runnable, public std::enable_shared_from_this<Batcher> {
   // may time out before even sending an op). TODO: implement that
   void SetDeadline(CoarseTimePoint deadline);
 
+  void SetPoolTag(rpc::ThreadPoolTag tag);
+
   // Add a new operation to the batch. Requires that the batch has not yet been flushed.
   // TODO: in other flush modes, this may not be the case -- need to
   // update this when they're implemented.
   //
   // NOTE: If this returns not-OK, does not take ownership of 'write_op'.
-  void Add(std::shared_ptr<YBOperation> yb_op);
+  void Add(YBOperationPtr yb_op);
 
-  bool Has(const std::shared_ptr<YBOperation>& yb_op) const;
+  bool Has(const YBOperationPtr& yb_op) const;
 
   // Return true if any operations are still pending. An operation is no longer considered
   // pending once it has either errored or succeeded.  Operations are considering pending
@@ -223,16 +247,27 @@ class Batcher : public Runnable, public std::enable_shared_from_this<Batcher> {
 
   const ClientId& client_id() const;
 
+  MicrosTime rpcs_start_time_micros() const { return rpcs_start_time_micros_; }
+
+  server::Clock* Clock() const;
+
   std::pair<RetryableRequestId, RetryableRequestId> NextRequestIdAndMinRunningRequestId();
 
   void RequestsFinished();
 
-  void RegisterRequest(RetryableRequestId id) {
-    retryable_request_ids_.insert(id);
+  void RegisterRequest(
+      RetryableRequestId id, RetryableRequestId min_running_id) {
+    retryable_requests_.emplace(id, RequestDetails(min_running_id));
   }
 
-  void RemoveRequest(RetryableRequestId id) {
-    retryable_request_ids_.erase(id);
+  void MoveRequestDetailsFrom(const BatcherPtr& other, RetryableRequestId id);
+
+  const RequestDetails& GetRequestDetails(RetryableRequestId id) {
+    const auto it = retryable_requests_.find(id);
+    if (PREDICT_FALSE(it == retryable_requests_.end())) {
+      LOG(FATAL) << "Cannot find retryable request detail of id " << id;
+    }
+    return it->second;
   }
 
   void SetRejectionScoreSource(RejectionScoreSourcePtr rejection_score_source) {
@@ -247,24 +282,56 @@ class Batcher : public Runnable, public std::enable_shared_from_this<Batcher> {
 
   std::string LogPrefix() const;
 
+  int64_t GetLeaderTerm() const { return leader_term_; }
+
   // This is a status error string used when there are multiple errors that need to be fetched
   // from the error collector.
   static const std::string kErrorReachingOutToTServersMsg;
+
+  void SetRpcStartTime(MicrosTime rpcs_start_time_micros);
+
+  // When there are retryable failures for a set of ops in a batcher, a 'retry_batcher' is created.
+  // InitFromFailedBatcher is called on the retry batcher to initialize the retry batcher before
+  // executing ::FlushAsync.
+  void InitFromFailedBatcher(const BatcherPtr& failed_batcher, const CollectedErrors& errors);
+
+  void SetSubTransactionMetadataPB(
+      const std::optional<SubTransactionMetadataPB>& subtransaction_pb) {
+    ops_info_.metadata.subtransaction_pb = subtransaction_pb;
+  }
+
+  const std::optional<SubTransactionMetadataPB>& GetSubTransactionMetadataPB() const {
+    return ops_info_.metadata.subtransaction_pb;
+  }
+
+  void SetBackgroundTransactionMeta(const TransactionMetadata& background_transaction_meta) {
+    background_transaction_meta_ = background_transaction_meta;
+  }
+
+  void SetObjectLockingTxnMeta(const TransactionMetadata& object_locking_txn_meta) {
+    object_locking_txn_meta_ = object_locking_txn_meta;
+  }
 
  private:
   friend class RefCountedThreadSafe<Batcher>;
   friend class AsyncRpc;
   friend class WriteRpc;
+  friend class WaitForAsyncWriteRpc;
   friend class ReadRpc;
 
   void Flushed(const InFlightOps& ops, const Status& status, FlushExtraResult flush_extra_result);
+
+  void RecordAsyncWriteCompletion(
+      const TabletId& tablet_id, const OpId& op_id, const Status& status);
+
+  void WaitForAsyncWrites(const TabletId& tablet_id, StdStatusCallback&& callback);
 
   // Combines new error to existing ones. I.e. updates combined error with new status.
   void CombineError(const InFlightOp& in_flight_op);
 
   void FlushFinished();
   void AllLookupsDone();
-  std::shared_ptr<AsyncRpc> CreateRpc(
+  Result<std::shared_ptr<AsyncRpc>> CreateRpc(
       const BatcherPtr& self, RemoteTablet* tablet, const InFlightOpsGroup& group,
       bool allow_local_calls_in_curr_thread, bool need_consistent_read);
 
@@ -286,7 +353,7 @@ class Batcher : public Runnable, public std::enable_shared_from_this<Batcher> {
   void LookupTabletFor(InFlightOp* op);
   void TabletLookupFinished(InFlightOp* op, Result<internal::RemoteTabletPtr> result);
 
-  void TransactionReady(const Status& status);
+  void TransactionReady(ash::WaitStateInfoPtr wait_state, const Status& status);
 
   // initial - whether this method is called first time for this batch.
   void ExecuteOperations(Initial initial);
@@ -297,6 +364,10 @@ class Batcher : public Runnable, public std::enable_shared_from_this<Batcher> {
 
   std::pair<std::map<PartitionKey, Status>, std::map<RetryableRequestId, Status>>
       CollectOpsErrors();
+
+  void HandleAsyncWriteResponse(
+      const LWOpIdPB& async_write_op_id, const RemoteTablet& tablet,
+      const std::shared_ptr<const YBTable>& table);
 
   BatcherState state_ = BatcherState::kGatheringOps;
 
@@ -315,12 +386,14 @@ class Batcher : public Runnable, public std::enable_shared_from_this<Batcher> {
 
   // All buffered or in-flight ops.
   // Added to this set during apply, removed during Finished of AsyncRpc.
-  std::vector<std::shared_ptr<YBOperation>> ops_;
+  std::vector<YBOperationPtr> ops_;
   std::vector<InFlightOp> ops_queue_;
   InFlightOpsGroupsWithMetadata ops_info_;
 
   // The absolute deadline for all in-flight ops.
   CoarseTimePoint deadline_;
+
+  rpc::ThreadPoolTag pool_tag_ = 0;
 
   // Number of outstanding lookups across all in-flight ops.
   std::atomic<size_t> outstanding_lookups_{0};
@@ -341,13 +414,35 @@ class Batcher : public Runnable, public std::enable_shared_from_this<Batcher> {
 
   RejectionScoreSourcePtr rejection_score_source_;
 
-  // Set of retryable request ids used in current batcher.
-  // When creating WriteRpc, new ids will be registered into this set.
+  // Map to store retryable request ids used in current batcher.
+  // retryable_request_id => { min_running_request_id }
+  // When creating WriteRpc, new ids will be registered into this map.
   // If the batcher has requests to be retried, request id is removed from current batcher
   // and transmit to the retry batcher.
-  // At destruction of the batcher, all request ids in the set will be removed from the client
+  // At destruction of the batcher, all request ids in the map will be removed from the client
   // running requests.
-  std::set<RetryableRequestId> retryable_request_ids_;
+  BatcherRequestsMap retryable_requests_;
+
+  // Stores the time at which the read/write rpcs of this batcher are created. 'start_time_micros'
+  // of launched WriteRpc/ReadRpc requests is set to this batcher's 'rpcs_start_time_micros_'.
+  // If the batcher has requests to be retried, this field is copied to the retry batcher, hence
+  // preserving rpc start times across retries.
+  MicrosTime rpcs_start_time_micros_ = 0;
+
+  const int64_t leader_term_;
+
+  ThreadSafeArenaPtr arena_;
+
+  // - For a session advisory lock request: the below points to
+  //   the in-progress DocDB transaction, if any.
+  // - For a transaction advisory lock request: the below points to
+  //   the session-level transaction, if exists.
+  std::optional<TransactionMetadata> background_transaction_meta_ = std::nullopt;
+
+  std::optional<TransactionMetadata> object_locking_txn_meta_;
+
+  // True if all the ops are PG read/write that skips intents db.
+  bool skip_intents_ = false;
 
   DISALLOW_COPY_AND_ASSIGN(Batcher);
 };

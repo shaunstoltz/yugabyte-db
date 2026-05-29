@@ -1,5 +1,5 @@
 //
-// Copyright (c) YugaByte, Inc.
+// Copyright (c) YugabyteDB, Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License"); you may not use this file except
 // in compliance with the License.  You may obtain a copy of the License at
@@ -49,7 +49,7 @@ DECLARE_string(time_source);
 DECLARE_int32(intents_flush_max_delay_ms);
 DECLARE_int32(load_balancer_max_concurrent_adds);
 DECLARE_bool(TEST_combine_batcher_errors);
-DECLARE_bool(TEST_export_intentdb_metrics);
+DECLARE_bool(export_intentdb_metrics);
 
 namespace yb {
 namespace client {
@@ -79,11 +79,11 @@ int32_t ValueForTransactionAndIndex(size_t transaction, size_t index, const Writ
 }
 
 void SetIgnoreApplyingProbability(double value) {
-  SetAtomicFlag(value, &FLAGS_TEST_transaction_ignore_applying_probability);
+  ANNOTATE_UNPROTECTED_WRITE(FLAGS_TEST_transaction_ignore_applying_probability) = value;
 }
 
 void SetDisableHeartbeatInTests(bool value) {
-  SetAtomicFlag(value, &FLAGS_transaction_disable_heartbeat_in_tests);
+  ANNOTATE_UNPROTECTED_WRITE(FLAGS_transaction_disable_heartbeat_in_tests) = value;
 }
 
 void DisableApplyingIntents() {
@@ -101,21 +101,22 @@ void CommitAndResetSync(YBTransactionPtr *txn) {
 }
 
 void DisableTransactionTimeout() {
-  SetAtomicFlag(std::numeric_limits<double>::max(),
-                &FLAGS_transaction_max_missed_heartbeat_periods);
+  ANNOTATE_UNPROTECTED_WRITE(FLAGS_transaction_max_missed_heartbeat_periods) =
+      std::numeric_limits<double>::max();
 }
 
 template <class MiniClusterType>
 void TransactionTestBase<MiniClusterType>::SetUp() {
-  FLAGS_TEST_combine_batcher_errors = true;
-  FLAGS_transaction_status_tablet_log_segment_size_bytes = log_segment_size_bytes();
-  FLAGS_log_min_seconds_to_retain = 5;
-  FLAGS_intents_flush_max_delay_ms = 250;
-  FLAGS_TEST_export_intentdb_metrics = true;
+  ANNOTATE_UNPROTECTED_WRITE(FLAGS_TEST_combine_batcher_errors) = true;
+  ANNOTATE_UNPROTECTED_WRITE(
+      FLAGS_transaction_status_tablet_log_segment_size_bytes) = log_segment_size_bytes();
+  ANNOTATE_UNPROTECTED_WRITE(FLAGS_log_min_seconds_to_retain) = 5;
+  ANNOTATE_UNPROTECTED_WRITE(FLAGS_intents_flush_max_delay_ms) = 250;
+  ANNOTATE_UNPROTECTED_WRITE(FLAGS_export_intentdb_metrics) = true;
 
   server::SkewedClock::Register();
-  FLAGS_time_source = server::SkewedClock::kName;
-  FLAGS_load_balancer_max_concurrent_adds = 100;
+  ANNOTATE_UNPROTECTED_WRITE(FLAGS_time_source) = server::SkewedClock::kName;
+  ANNOTATE_UNPROTECTED_WRITE(FLAGS_load_balancer_max_concurrent_adds) = 100;
   ASSERT_NO_FATALS(KeyValueTableTest<MiniClusterType>::SetUp());
 
   if (create_table_) {
@@ -223,15 +224,14 @@ YBTransactionPtr CreateTransactionHelper(
 template <class MiniClusterType>
 YBTransactionPtr TransactionTestBase<MiniClusterType>::CreateTransaction(
     SetReadTime set_read_time) {
-  return CreateTransactionHelper(
-      transaction_manager_.get_ptr(), set_read_time, GetIsolationLevel());
+  return CreateTransactionHelper(&transaction_manager_.value(), set_read_time, GetIsolationLevel());
 }
 
 template <class MiniClusterType>
 YBTransactionPtr TransactionTestBase<MiniClusterType>::CreateTransaction2(
     SetReadTime set_read_time) {
   return CreateTransactionHelper(
-      transaction_manager2_.get_ptr(), set_read_time, GetIsolationLevel());
+      &transaction_manager2_.value(), set_read_time, GetIsolationLevel());
 }
 
 template <class MiniClusterType>
@@ -259,7 +259,7 @@ void TransactionTestBase<MiniClusterType>::VerifyRows(
 template <class MiniClusterType>
 YBqlReadOpPtr TransactionTestBase<MiniClusterType>::ReadRow(
     const YBSessionPtr& session, int32_t key, const std::string& column) {
-  auto op = table_.NewReadOp();
+  auto op = table_.NewReadOp(session->arena());
   auto* const req = op->mutable_request();
   QLAddInt32HashValue(req, key);
   table_.AddColumns({column}, req);
@@ -283,13 +283,17 @@ bool TransactionTestBase<MiniCluster>::HasTransactions() {
     auto* tablet_manager = cluster_->mini_tablet_server(i)->server()->tablet_manager();
     auto peers = tablet_manager->GetTabletPeers();
     for (const auto& peer : peers) {
-      if (!peer->consensus()) {
-        return true; // Report true, since we could have transactions on this non ready peer.
+      auto consensus_result = peer->GetConsensus();
+      if (!consensus_result) {
+        return true;  // Report true, since we could have transactions on this non ready peer.
       }
-      if (peer->consensus()->GetLeaderStatus() !=
-              consensus::LeaderStatus::NOT_LEADER &&
-          peer->tablet()->transaction_coordinator() &&
-          peer->tablet()->transaction_coordinator()->test_count_transactions()) {
+      auto tablet = peer->shared_tablet_maybe_null();
+      if (!tablet) {
+        continue;
+      }
+      if (consensus_result.get()->GetLeaderStatus() != consensus::LeaderStatus::NOT_LEADER &&
+          tablet->transaction_coordinator() &&
+          tablet->transaction_coordinator()->test_count_transactions()) {
         return true;
       }
     }

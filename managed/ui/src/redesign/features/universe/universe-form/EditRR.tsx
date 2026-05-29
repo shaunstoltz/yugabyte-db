@@ -1,14 +1,23 @@
-import React, { FC, useContext, useState } from 'react';
+import { FC, useContext, useState } from 'react';
+import { useDispatch } from 'react-redux';
 import _ from 'lodash';
 import { useQuery } from 'react-query';
+import { useSelector } from 'react-redux';
 import { browserHistory } from 'react-router';
 import { toast } from 'react-toastify';
 import { UniverseFormContext } from './UniverseFormContainer';
 import { UniverseForm } from './form/UniverseForm';
-import { DeleteClusterModal } from './action-modals';
+import {
+  DeleteClusterModal,
+  FullMoveModal,
+  KubernetesPlacementModal,
+  PlacementModal,
+  SmartResizeModal
+} from './action-modals';
 import { YBLoading } from '../../../../components/common/indicators';
 import { api, QUERY_KEY } from './utils/api';
 import { getPlacements } from './form/fields/PlacementsField/PlacementsFieldHelper';
+import { useIsTaskNewUIEnabled } from '../../tasks/TaskUtils';
 import {
   editReadReplica,
   getAsyncCluster,
@@ -17,17 +26,37 @@ import {
   createErrorMessage,
   transitToUniverse
 } from './utils/helpers';
-import { CloudType, ClusterModes, ClusterType, UniverseFormData } from './utils/dto';
-import { TOAST_AUTO_DISMISS_INTERVAL } from './utils/constants';
+import {
+  CloudType,
+  ClusterModes,
+  ClusterType,
+  UpdateActions,
+  UniverseDetails,
+  UniverseFormData
+} from './utils/dto';
+import { PROVIDER_FIELD, TOAST_AUTO_DISMISS_INTERVAL } from './utils/constants';
+import { providerQueryKey, api as helperApi } from '../../../helpers/api';
 
 interface EditReadReplicaProps {
   uuid: string;
+  isViewMode: boolean;
 }
 
-export const EditReadReplica: FC<EditReadReplicaProps> = ({ uuid }) => {
+export const EditReadReplica: FC<EditReadReplicaProps> = ({ uuid, isViewMode }) => {
+  const featureFlags = useSelector((state: any) => state.featureFlags);
   const [contextState, contextMethods]: any = useContext(UniverseFormContext);
+  const dispatch = useDispatch();
   const { initializeForm, setUniverseResourceTemplate } = contextMethods;
+
+  //Local states
+  const [showFMModal, setFMModal] = useState(false); //FM -> Full Move
+  const [showSRModal, setSRModal] = useState(false); //SR -> Smart Resize or Resize Nodes
+  const [showPlacementModal, setPlacementModal] = useState(false);
+  const [showK8Modal, setK8Modal] = useState(false);
   const [showDeleteRRModal, setShowDeleteRRModal] = useState(false);
+  const [universePayload, setUniversePayload] = useState<UniverseDetails | null>(null);
+
+  const isNewTaskUIEnabled = useIsTaskNewUIEnabled();
 
   const { isLoading, data: universe } = useQuery(
     [QUERY_KEY.fetchUniverse, uuid],
@@ -37,6 +66,7 @@ export const EditReadReplica: FC<EditReadReplicaProps> = ({ uuid }) => {
         initializeForm({
           clusterType: ClusterType.ASYNC,
           mode: ClusterModes.EDIT,
+          isViewMode,
           universeConfigureTemplate: _.cloneDeep(resp.universeDetails)
         });
         try {
@@ -48,15 +78,29 @@ export const EditReadReplica: FC<EditReadReplicaProps> = ({ uuid }) => {
         }
       },
       onError: (error) => {
-        console.log(error);
+        console.error(error);
         transitToUniverse(); //redirect to /universes if universe with uuid doesnot exists
       }
     }
   );
 
-  const onCancel = () => browserHistory.goBack();
+  const asyncProviderUuid = universe?.universeDetails
+    ? getAsyncCluster(universe?.universeDetails)?.userIntent?.provider ?? ''
+    : '';
+  const providerConfigQuery = useQuery(
+    providerQueryKey.detail(asyncProviderUuid),
+    () => helperApi.fetchProvider(asyncProviderUuid),
+    { enabled: !!asyncProviderUuid }
+  );
 
-  const onSubmit = (formData: UniverseFormData) => {
+  const onCancel = () => browserHistory.push(`/universes/${uuid}`);
+
+  const onSubmit = async (formData: UniverseFormData) => {
+    const asyncCluster = getAsyncCluster(contextState.universeConfigureTemplate);
+    const asyncUserIntent = {
+      ...asyncCluster?.userIntent,
+      ...getUserIntent({ formData }, ClusterType.ASYNC, featureFlags)
+    };
     const configurePayload = {
       ...contextState.universeConfigureTemplate,
       clusterOperation: ClusterModes.EDIT,
@@ -65,7 +109,7 @@ export const EditReadReplica: FC<EditReadReplicaProps> = ({ uuid }) => {
       clusters: [
         {
           ...getAsyncCluster(contextState.universeConfigureTemplate),
-          userIntent: getUserIntent({ formData }),
+          userIntent: asyncUserIntent,
           placementInfo: {
             cloudList: [
               {
@@ -79,15 +123,30 @@ export const EditReadReplica: FC<EditReadReplicaProps> = ({ uuid }) => {
       ]
     };
 
-    editReadReplica(configurePayload);
+    const finalPayload = await api.universeConfigure(configurePayload);
+    setUniversePayload(finalPayload);
+    const isK8sUniverse = _.get(formData, PROVIDER_FIELD).code === CloudType.kubernetes;
+    const { updateOptions } = finalPayload;
+
+    if (!isK8sUniverse) {
+      if (
+        updateOptions.includes(UpdateActions.SMART_RESIZE) ||
+        updateOptions.includes(UpdateActions.SMART_RESIZE_NON_RESTART)
+      )
+        setSRModal(true);
+      else if (updateOptions.includes(UpdateActions.FULL_MOVE)) setFMModal(true);
+      else setPlacementModal(true);
+    } else setK8Modal(true);
   };
 
-  if (isLoading || contextState.isLoading) return <YBLoading />;
+  if (isLoading || contextState.isLoading || providerConfigQuery.isLoading) {
+    return <YBLoading />;
+  }
 
   if (!universe?.universeDetails) return null;
 
   //get async form data and intitalize the form
-  const initialFormData = getAsyncFormData(universe.universeDetails);
+  const initialFormData = getAsyncFormData(universe.universeDetails, providerConfigQuery.data);
 
   return (
     <>
@@ -103,7 +162,62 @@ export const EditReadReplica: FC<EditReadReplicaProps> = ({ uuid }) => {
         onFormSubmit={(data: UniverseFormData) => onSubmit(data)}
         onCancel={onCancel}
         onDeleteRR={() => setShowDeleteRRModal(true)} //Deleting existing RR (API)
+        universeUUID={uuid}
+        isViewMode={isViewMode}
       />
+      {universePayload && (
+        <>
+          {showSRModal && (
+            <SmartResizeModal
+              open={showSRModal}
+              isPrimary={false}
+              oldConfigData={universe.universeDetails}
+              newConfigData={universePayload}
+              onClose={() => setSRModal(false)}
+              handlePrechecks={(runOnlyPrechecks: boolean) =>
+                // Just runs prechecks, does not submit the form if prechecks is true
+                editReadReplica(universePayload, dispatch, isNewTaskUIEnabled, runOnlyPrechecks)
+              }
+            />
+          )}
+          {showFMModal && (
+            <FullMoveModal
+              open={showFMModal}
+              isPrimary={false}
+              oldConfigData={universe.universeDetails}
+              newConfigData={universePayload}
+              onClose={() => setFMModal(false)}
+              onSubmit={(runOnlyPrechecks: boolean) =>
+                editReadReplica(universePayload, dispatch, isNewTaskUIEnabled, runOnlyPrechecks)
+              }
+            />
+          )}
+          {showPlacementModal && (
+            <PlacementModal
+              open={showPlacementModal}
+              isPrimary={false}
+              oldConfigData={universe.universeDetails}
+              newConfigData={universePayload}
+              onClose={() => setPlacementModal(false)}
+              onSubmit={(runOnlyPrechecks: boolean) =>
+                editReadReplica(universePayload, dispatch, isNewTaskUIEnabled, runOnlyPrechecks)
+              }
+            />
+          )}
+          {showK8Modal && (
+            <KubernetesPlacementModal
+              open={showK8Modal}
+              isPrimary={false}
+              oldConfigData={universe.universeDetails}
+              newConfigData={universePayload}
+              onClose={() => setK8Modal(false)}
+              onSubmit={(runOnlyPrechecks: boolean) =>
+                editReadReplica(universePayload, dispatch, isNewTaskUIEnabled, runOnlyPrechecks)
+              }
+            />
+          )}
+        </>
+      )}
     </>
   );
 };

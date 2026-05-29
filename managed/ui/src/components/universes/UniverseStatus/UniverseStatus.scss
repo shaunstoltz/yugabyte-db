@@ -2,31 +2,31 @@
 
 .universe-status {
   display: inline-block;
-  font-size: 16px;
-  font-weight: 500;
+  font-size: 13px;
+  font-weight: 600;
   margin-left: 24px;
   line-height: 42px;
 
   &.good {
-    color: colors.$YB_SUCCESS_COLOR;
+    color: #097345;
   }
 
   &.paused {
-    color: colors.$YB_WARNING_COLOR;
+    color: #6d7c88;
   }
 
   &.pending {
     margin-top: 0 !important;
     margin-bottom: 0;
-    color: colors.$YB_PENDING_COLOR;
+    color: #1a44a5;
   }
 
   &.bad {
-    color: colors.$YB_FAIL_COLOR;
+    color: #da1515;
   }
 
   &.warning {
-    color: colors.$YB_WARNING_COLOR;
+    color: #c88900;
   }
 
   &.unknown {
@@ -108,7 +108,6 @@
 .status-pending-display-container {
   display: inline-block;
   color: colors.$YB_ORANGE;
-  float: right;
 
   .yb-loader-circle {
     margin: 0;
@@ -120,13 +119,6 @@
 .status-pending-display-container .fa-spin {
   font-weight: 500;
   font-size: 16px;
-}
-
-.status-pending-name {
-  display: inline-block;
-  font-size: 15px;
-  font-weight: 500;
-  padding-left: 6px;
 }
 
 .pending-action-progress {
@@ -159,8 +151,46 @@
     overflow: hidden;
     white-space: nowrap;
   }
+
+  &__noHideText {
+    width: 'auto';
+    white-space: nowrap;
+  }
 }
 
 .universe-pending-spinner {
   display: inline;
+}
+
+.pre-finalize-pending {
+  display: flex;
+  align-items: center;
+  font-size: 14px;
+  color: #c88900;
+}
+
+.blue-loader {
+  color: #44518b;
+}
+
+.status-container {
+  display: flex;
+  align-items: center;
+
+  font-size: 13px;
+  font-style: normal;
+  font-weight: 600;
+
+  &.paused {
+    color: #6d7c88;
+  }
+  &.pending {
+    color: #1a44a5;
+  }
+  &.warning {
+    color: #c88900;
+  }
+  &.error {
+    color: #da1515;
+  }
 }

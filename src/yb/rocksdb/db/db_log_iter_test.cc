@@ -3,9 +3,9 @@
 //  LICENSE file in the root directory of this source tree. An additional grant
 //  of patent rights can be found in the PATENTS file in the same directory.
 //
-// The following only applies to changes made to this file as part of YugaByte development.
+// The following only applies to changes made to this file as part of YugabyteDB development.
 //
-// Portions Copyright (c) YugaByte, Inc.
+// Portions Copyright (c) YugabyteDB, Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License"); you may not use this file except
 // in compliance with the License.  You may obtain a copy of the License at
@@ -115,14 +115,14 @@ TEST_F(DBTestXactLogIterator, TransactionLogIteratorRace) {
   for (int test = 0; test < LOG_ITERATOR_RACE_TEST_COUNT; ++test) {
     // Setup sync point dependency to reproduce the race condition of
     // a log file moved to archived dir, in the middle of GetSortedWalFiles
-    rocksdb::SyncPoint::GetInstance()->LoadDependency(
+    yb::SyncPoint::GetInstance()->LoadDependency(
       { { sync_points[test][0], sync_points[test][1] },
         { sync_points[test][2], sync_points[test][3] },
       });
 
     do {
-      rocksdb::SyncPoint::GetInstance()->ClearTrace();
-      rocksdb::SyncPoint::GetInstance()->DisableProcessing();
+      yb::SyncPoint::GetInstance()->ClearTrace();
+      yb::SyncPoint::GetInstance()->DisableProcessing();
       Options options = OptionsForLogIterTest();
       DestroyAndReopen(options);
       ASSERT_OK(Put("key1", DummyString(1024)));
@@ -139,7 +139,7 @@ TEST_F(DBTestXactLogIterator, TransactionLogIteratorRace) {
         ExpectRecords(4, iter);
       }
 
-      rocksdb::SyncPoint::GetInstance()->EnableProcessing();
+      yb::SyncPoint::GetInstance()->EnableProcessing();
       // trigger async flush, and log move. Well, log move will
       // wait until the GetSortedWalFiles:1 to reproduce the race
       // condition

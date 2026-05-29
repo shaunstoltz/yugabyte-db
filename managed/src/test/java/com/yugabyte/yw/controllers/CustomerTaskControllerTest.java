@@ -1,4 +1,4 @@
-// Copyright (c) YugaByte, Inc.
+// Copyright (c) YugabyteDB, Inc.
 
 package com.yugabyte.yw.controllers;
 
@@ -11,28 +11,28 @@ import static com.yugabyte.yw.models.CustomerTask.TaskType.Create;
 import static com.yugabyte.yw.models.CustomerTask.TaskType.GFlagsUpgrade;
 import static com.yugabyte.yw.models.CustomerTask.TaskType.TlsToggle;
 import static com.yugabyte.yw.models.CustomerTask.TaskType.Update;
-import static com.yugabyte.yw.models.CustomerTask.TaskType.UpgradeSoftware;
 import static org.hamcrest.CoreMatchers.allOf;
 import static org.hamcrest.CoreMatchers.containsString;
 import static org.hamcrest.CoreMatchers.equalTo;
 import static org.hamcrest.CoreMatchers.is;
 import static org.hamcrest.CoreMatchers.notNullValue;
 import static org.hamcrest.MatcherAssert.assertThat;
+import static org.junit.Assert.assertEquals;
 import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.ArgumentMatchers.eq;
 import static org.mockito.Mockito.when;
 import static play.mvc.Http.Status.BAD_REQUEST;
-import static play.mvc.Http.Status.FORBIDDEN;
 import static play.mvc.Http.Status.OK;
+import static play.mvc.Http.Status.UNAUTHORIZED;
 import static play.test.Helpers.contentAsString;
 import static play.test.Helpers.fakeRequest;
-import static play.test.Helpers.route;
 
 import com.fasterxml.jackson.databind.JsonNode;
+import com.fasterxml.jackson.databind.ObjectMapper;
+import com.fasterxml.jackson.databind.node.ArrayNode;
 import com.fasterxml.jackson.databind.node.ObjectNode;
 import com.google.common.collect.ImmutableList;
 import com.yugabyte.yw.commissioner.UserTaskDetails;
-import com.yugabyte.yw.common.FakeApiHelper;
 import com.yugabyte.yw.common.FakeDBApplication;
 import com.yugabyte.yw.common.ModelFactory;
 import com.yugabyte.yw.common.TestUtils;
@@ -47,12 +47,12 @@ import com.yugabyte.yw.models.Universe;
 import com.yugabyte.yw.models.Users;
 import com.yugabyte.yw.models.helpers.TaskType;
 import io.ebean.Model;
-
 import java.util.Calendar;
-import java.util.concurrent.TimeUnit;
+import java.util.Collections;
 import java.util.Optional;
-import java.util.stream.IntStream;
 import java.util.UUID;
+import java.util.concurrent.TimeUnit;
+import java.util.stream.IntStream;
 import org.junit.Before;
 import org.junit.Test;
 import org.junit.runner.RunWith;
@@ -80,7 +80,7 @@ public class CustomerTaskControllerTest extends FakeDBApplication {
   public void setUp() {
     customer = ModelFactory.testCustomer();
     user = ModelFactory.testUser(customer);
-    universe = createUniverse(customer.getCustomerId());
+    universe = createUniverse(customer.getId());
   }
 
   @Test
@@ -88,7 +88,7 @@ public class CustomerTaskControllerTest extends FakeDBApplication {
     String authToken = user.createAuthToken();
     Result result =
         route(
-            fakeRequest("GET", "/api/customers/" + customer.uuid + "/tasks")
+            fakeRequest("GET", "/api/customers/" + customer.getUuid() + "/tasks")
                 .header("X-AUTH-TOKEN", authToken));
 
     assertThat(result.status(), is(OK));
@@ -96,7 +96,7 @@ public class CustomerTaskControllerTest extends FakeDBApplication {
     JsonNode json = Json.parse(contentAsString(result));
     assertThat(json.isObject(), is(true));
     assertThat(json.size(), is(0));
-    assertAuditEntry(0, customer.uuid);
+    assertAuditEntry(0, customer.getUuid());
   }
 
   private UUID createTaskWithStatus(
@@ -118,8 +118,10 @@ public class CustomerTaskControllerTest extends FakeDBApplication {
             status,
             percentComplete,
             responseJson);
-    TaskInfo taskInfo = TaskInfo.getOrBadRequest(task.getTaskUUID());
-    when(mockCommissioner.buildTaskStatus(task, taskInfo)).thenReturn(Optional.of(responseJson));
+    when(mockCommissioner.buildTaskStatus(eq(task), any(), any(), any()))
+        .thenReturn(Optional.of(responseJson));
+    when(mockCommissioner.getUpdatingTaskUUIDsForTargets(any(), any()))
+        .thenReturn(Collections.emptyMap());
     return task.getTaskUUID();
   }
 
@@ -157,9 +159,9 @@ public class CustomerTaskControllerTest extends FakeDBApplication {
     UUID taskUUID = UUID.randomUUID();
     // Set http context
     TestUtils.setFakeHttpContext(user);
-    TaskInfo taskInfo = new TaskInfo(taskInfoType);
-    taskInfo.setTaskUUID(taskUUID);
-    taskInfo.setTaskDetails(Json.newObject());
+    TaskInfo taskInfo = new TaskInfo(taskInfoType, null);
+    taskInfo.setUuid(taskUUID);
+    taskInfo.setTaskParams(Json.newObject());
     taskInfo.setOwner("");
     taskInfo.save();
     CustomerTask task =
@@ -175,6 +177,7 @@ public class CustomerTaskControllerTest extends FakeDBApplication {
     responseJson.put("typeName", taskType.getFriendlyName());
     responseJson.put("abortable", false);
     responseJson.put("retryable", false);
+    responseJson.put("canRollback", false);
     if (percentComplete == 100.0) {
       // Sleep 3 seconds so that the completed time is greater than
       // creation time.
@@ -201,14 +204,14 @@ public class CustomerTaskControllerTest extends FakeDBApplication {
       ObjectNode responseJson) {
     // Persist subtask
     UserTaskDetails.SubTaskGroupType groupType = UserTaskDetails.SubTaskGroupType.ConfigureUniverse;
-    TaskInfo subTask = new TaskInfo(taskType);
+    TaskInfo subTask = new TaskInfo(taskType, null);
     subTask.setParentUuid(parentUUID);
     subTask.setPosition(position);
     subTask.setSubTaskGroupType(groupType);
     subTask.setTaskState(taskState);
     ObjectNode taskDetailsJson = Json.newObject();
     taskDetailsJson.put("errorString", taskState.equals(TaskInfo.State.Failure) ? "foobaz" : null);
-    subTask.setTaskDetails(taskDetailsJson);
+    subTask.setTaskParams(taskDetailsJson);
     subTask.setOwner("foobar");
     subTask.save();
 
@@ -225,7 +228,7 @@ public class CustomerTaskControllerTest extends FakeDBApplication {
       responseJson.set("details", Json.toJson(details));
     }
 
-    return subTask.getTaskUUID();
+    return subTask.getUuid();
   }
 
   @Test
@@ -241,28 +244,36 @@ public class CustomerTaskControllerTest extends FakeDBApplication {
         createTaskWithStatus(
             universeUUID,
             CustomerTask.TargetType.Universe,
-            UpgradeSoftware,
+            CustomerTask.TaskType.SoftwareUpgradeYB,
             TaskType.SoftwareUpgrade,
             "Foo",
             "Success",
             100.0);
-    String url = "/api/customers/" + customer.uuid + "/tasks";
-    Result result = FakeApiHelper.doRequestWithAuthToken("GET", url, authToken);
-    //    assertEquals(OK, result.status());
+
+    // update task details with version numbers
+    ObjectMapper objectMapper = new ObjectMapper();
+    ObjectNode objectNode = objectMapper.createObjectNode();
+    TaskInfo taskInfo = TaskInfo.get(upgradeUUID);
+    JsonNode taskParams = taskInfo.getTaskParams();
+    objectNode.setAll((ObjectNode) taskParams);
+    objectNode.put(YB_SOFTWARE_VERSION, "{Previous Version}");
+    objectNode.put(YB_PREV_SOFTWARE_VERSION, "{Current Version}");
+    taskInfo.setTaskParams(objectNode);
+    taskInfo.save();
+
+    String url = "/api/customers/" + customer.getUuid() + "/tasks";
+    Result result = doRequestWithAuthToken("GET", url, authToken);
     JsonNode json = Json.parse(contentAsString(result));
     assertThat(result.status(), is(OK));
     assertThat(json.isObject(), is(true));
     JsonNode universeTasks = json.get(universeUUID.toString());
     JsonNode upgradeTask = universeTasks.get(0);
-
-    TaskInfo taskInfo = TaskInfo.get(upgradeUUID);
-    taskInfo.setTaskDetails(versionNumbers);
-    JsonNode taskDetails = taskInfo.getTaskDetails();
+    taskParams = taskInfo.getTaskParams();
     assertThat(
-        ((upgradeTask.get("type").asText().equals("UpgradeSoftware")
-                && taskDetails.has(YB_PREV_SOFTWARE_VERSION)))
-            || (!upgradeTask.get("type").asText().equals("UpgradeSoftware")
-                && !taskDetails.has(YB_SOFTWARE_VERSION)),
+        ((upgradeTask.get("type").asText().equals("SoftwareUpgradeYB")
+                && taskParams.has(YB_PREV_SOFTWARE_VERSION)))
+            || (!upgradeTask.get("type").asText().equals("SoftwareUpgradeYB")
+                && !taskParams.has(YB_SOFTWARE_VERSION)),
         is(true));
   }
 
@@ -282,8 +293,8 @@ public class CustomerTaskControllerTest extends FakeDBApplication {
     UUID subTaskUUID =
         createSubTask(taskUUID, 0, TaskType.AnsibleSetupServer, TaskInfo.State.Failure);
 
-    String url = "/api/customers/" + customer.uuid + "/tasks/" + taskUUID + "/failed";
-    Result result = FakeApiHelper.doRequestWithAuthToken("GET", url, authToken);
+    String url = "/api/customers/" + customer.getUuid() + "/tasks/" + taskUUID + "/failed";
+    Result result = doRequestWithAuthToken("GET", url, authToken);
     assertThat(result.status(), is(OK));
     JsonNode json = Json.parse(contentAsString(result));
     assertThat(json.isObject(), is(true));
@@ -302,7 +313,7 @@ public class CustomerTaskControllerTest extends FakeDBApplication {
         task.get("subTaskGroupType").asText(),
         allOf(notNullValue(), equalTo(UserTaskDetails.SubTaskGroupType.ConfigureUniverse.name())));
     assertThat(task.get("creationTime").asText(), is(notNullValue()));
-    assertAuditEntry(0, customer.uuid);
+    assertAuditEntry(0, customer.getUuid());
   }
 
   @Test
@@ -339,8 +350,8 @@ public class CustomerTaskControllerTest extends FakeDBApplication {
             "Running",
             10.0);
 
-    String url = "/api/customers/" + customer.uuid + "/tasks";
-    Result result = FakeApiHelper.doRequestWithAuthToken("GET", url, authToken);
+    String url = "/api/customers/" + customer.getUuid() + "/tasks";
+    Result result = doRequestWithAuthToken("GET", url, authToken);
     assertThat(result.status(), is(OK));
     JsonNode json = Json.parse(contentAsString(result));
     assertThat(json.isObject(), is(true));
@@ -367,7 +378,7 @@ public class CustomerTaskControllerTest extends FakeDBApplication {
         providerTasks,
         "id",
         ImmutableList.of(providerTaskUUID1.toString(), providerTaskUUID2.toString()));
-    assertAuditEntry(0, customer.uuid);
+    assertAuditEntry(0, customer.getUuid());
   }
 
   @Test
@@ -384,8 +395,8 @@ public class CustomerTaskControllerTest extends FakeDBApplication {
         "Running",
         10.0);
 
-    String url = "/api/customers/" + customer.uuid + "/tasks_list";
-    Result result = FakeApiHelper.doRequestWithAuthToken("GET", url, authToken);
+    String url = "/api/customers/" + customer.getUuid() + "/tasks_list";
+    Result result = doRequestWithAuthToken("GET", url, authToken);
     assertThat(result.status(), is(OK));
     JsonNode universeTasks = Json.parse(contentAsString(result));
 
@@ -402,17 +413,17 @@ public class CustomerTaskControllerTest extends FakeDBApplication {
     assertThat(task.get("target").asText(), allOf(notNullValue(), equalTo("Provider")));
     assertThat(
         task.get("targetUUID").asText(), allOf(notNullValue(), equalTo(providerUUID.toString())));
-    assertAuditEntry(0, customer.uuid);
+    assertAuditEntry(0, customer.getUuid());
   }
 
   @Test
   public void testTaskListWithUniverseUUID() {
     String authToken = user.createAuthToken();
-    Universe universe1 = createUniverse("Universe 2", customer.getCustomerId());
+    Universe universe1 = createUniverse("Universe 2", customer.getId());
 
     UUID taskUUID1 =
         createTaskWithStatus(
-            universe.universeUUID,
+            universe.getUniverseUUID(),
             CustomerTask.TargetType.Universe,
             Create,
             TaskType.CreateUniverse,
@@ -420,22 +431,119 @@ public class CustomerTaskControllerTest extends FakeDBApplication {
             "Running",
             50.0);
     createTaskWithStatus(
-        universe1.universeUUID,
+        universe1.getUniverseUUID(),
         CustomerTask.TargetType.Universe,
         Create,
         TaskType.CreateUniverse,
         "Bar",
         "Running",
         90.0);
-    String url = "/api/customers/" + customer.uuid + "/tasks_list?uUUID=" + universe.universeUUID;
-    Result result = FakeApiHelper.doRequestWithAuthToken("GET", url, authToken);
+    String url =
+        "/api/customers/" + customer.getUuid() + "/tasks_list?uUUID=" + universe.getUniverseUUID();
+    Result result = doRequestWithAuthToken("GET", url, authToken);
     assertThat(result.status(), is(OK));
     JsonNode universeTasks = Json.parse(contentAsString(result));
 
     assertThat(universeTasks.isArray(), is(true));
     assertThat(universeTasks.size(), is(1));
     assertValues(universeTasks, "id", ImmutableList.of(taskUUID1.toString()));
-    assertAuditEntry(0, customer.uuid);
+    assertAuditEntry(0, customer.getUuid());
+  }
+
+  @Test
+  public void testTasksListPagedHistory() {
+    String authToken = user.createAuthToken();
+
+    UUID providerUUID = UUID.randomUUID();
+    createTaskWithStatus(
+        providerUUID,
+        CustomerTask.TargetType.Provider,
+        Update,
+        TaskType.UpgradeUniverse,
+        "Foo",
+        "Running",
+        10.0);
+
+    String url = "/api/customers/" + customer.getUuid() + "/tasks_list/page";
+    ObjectNode bodyJson = Json.newObject();
+    bodyJson.put("direction", "DESC");
+    bodyJson.put("sortBy", "createTime");
+    bodyJson.put("offset", 0);
+    bodyJson.set("filter", Json.newObject());
+    Result result = doRequestWithAuthTokenAndBody("POST", url, authToken, bodyJson);
+    assertThat(result.status(), is(OK));
+    JsonNode tasks = Json.parse(contentAsString(result));
+
+    ArrayNode response = (ArrayNode) tasks.get("entities");
+    assertEquals(1, response.size());
+    assertThat(response.isArray(), is(true));
+    JsonNode task = response.get(0);
+    assertThat(
+        task.get("title").asText(), allOf(notNullValue(), equalTo("Updating Provider : Foo")));
+    assertThat(task.get("percentComplete").asDouble(), allOf(notNullValue(), equalTo(10.0)));
+    assertThat(task.get("status").asText(), allOf(notNullValue(), equalTo("Running")));
+    assertThat(
+        task.get("createTime").asLong() < Calendar.getInstance().getTimeInMillis(), is(true));
+    assertThat(task.has("completionTime"), is(false));
+    assertThat(task.get("target").asText(), allOf(notNullValue(), equalTo("Provider")));
+    assertThat(
+        task.get("targetUUID").asText(), allOf(notNullValue(), equalTo(providerUUID.toString())));
+    assertAuditEntry(0, customer.getUuid());
+  }
+
+  @Test
+  public void testTasksListPagedHistoryWithTargetUUIDFilter() {
+    String authToken = user.createAuthToken();
+
+    UUID providerUUID = UUID.randomUUID();
+    createTaskWithStatus(
+        providerUUID,
+        CustomerTask.TargetType.Provider,
+        Update,
+        TaskType.UpgradeUniverse,
+        "Foo",
+        "Running",
+        10.0);
+
+    String url = "/api/customers/" + customer.getUuid() + "/tasks_list/page";
+    ObjectNode bodyJson = Json.newObject();
+    bodyJson.put("direction", "DESC");
+    bodyJson.put("sortBy", "createTime");
+    bodyJson.put("offset", 0);
+    bodyJson.set(
+        "filter",
+        Json.newObject().set("targetUUIDList", Json.newArray().add(providerUUID.toString())));
+    Result result = doRequestWithAuthTokenAndBody("POST", url, authToken, bodyJson);
+    assertThat(result.status(), is(OK));
+    JsonNode tasks = Json.parse(contentAsString(result));
+
+    ArrayNode response = (ArrayNode) tasks.get("entities");
+    assertEquals(1, response.size());
+    assertThat(response.isArray(), is(true));
+    JsonNode task = response.get(0);
+    assertThat(
+        task.get("title").asText(), allOf(notNullValue(), equalTo("Updating Provider : Foo")));
+    assertThat(task.get("percentComplete").asDouble(), allOf(notNullValue(), equalTo(10.0)));
+    assertThat(task.get("status").asText(), allOf(notNullValue(), equalTo("Running")));
+    assertThat(
+        task.get("createTime").asLong() < Calendar.getInstance().getTimeInMillis(), is(true));
+    assertThat(task.has("completionTime"), is(false));
+    assertThat(task.get("target").asText(), allOf(notNullValue(), equalTo("Provider")));
+    assertThat(
+        task.get("targetUUID").asText(), allOf(notNullValue(), equalTo(providerUUID.toString())));
+    assertAuditEntry(0, customer.getUuid());
+
+    bodyJson.set(
+        "filter",
+        Json.newObject().set("targetUUIDList", Json.newArray().add(UUID.randomUUID().toString())));
+    result = doRequestWithAuthTokenAndBody("POST", url, authToken, bodyJson);
+    assertThat(result.status(), is(OK));
+    tasks = Json.parse(contentAsString(result));
+
+    response = (ArrayNode) tasks.get("entities");
+    assertEquals(0, response.size());
+    assertThat(response.isArray(), is(true));
+    assertAuditEntry(0, customer.getUuid());
   }
 
   @Test
@@ -443,7 +551,7 @@ public class CustomerTaskControllerTest extends FakeDBApplication {
     String authToken = user.createAuthToken();
     UUID taskUUID =
         createTaskWithStatus(
-            universe.universeUUID,
+            universe.getUniverseUUID(),
             CustomerTask.TargetType.Universe,
             GFlagsUpgrade,
             TaskType.GFlagsUpgrade,
@@ -451,12 +559,11 @@ public class CustomerTaskControllerTest extends FakeDBApplication {
             "Success",
             100.0);
     Result result =
-        FakeApiHelper.doRequestWithAuthToken(
-            "GET", "/api/customers/" + customer.uuid + "/tasks", authToken);
+        doRequestWithAuthToken("GET", "/api/customers/" + customer.getUuid() + "/tasks", authToken);
     CustomerTask.find.query().where().eq("task_uuid", taskUUID.toString()).findOne();
     assertThat(result.status(), is(OK));
     JsonNode json = Json.parse(contentAsString(result));
-    JsonNode universeTasks = json.get(universe.universeUUID.toString());
+    JsonNode universeTasks = json.get(universe.getUniverseUUID().toString());
     assertThat(universeTasks.isArray(), is(true));
     JsonNode task = universeTasks.get(0);
     assertThat(task.get("typeName").asText(), equalTo("GFlags Upgrade"));
@@ -466,7 +573,7 @@ public class CustomerTaskControllerTest extends FakeDBApplication {
   public void testTaskCompletionTime() {
     String authToken = user.createAuthToken();
     createTaskWithStatus(
-        universe.universeUUID,
+        universe.getUniverseUUID(),
         CustomerTask.TargetType.Universe,
         Create,
         TaskType.CreateUniverse,
@@ -476,12 +583,12 @@ public class CustomerTaskControllerTest extends FakeDBApplication {
 
     String markedCompletionTime = null;
     for (int idx = 0; idx < 2; idx++) {
-      String url = "/api/customers/" + customer.uuid + "/tasks";
-      Result result = FakeApiHelper.doRequestWithAuthToken("GET", url, authToken);
+      String url = "/api/customers/" + customer.getUuid() + "/tasks";
+      Result result = doRequestWithAuthToken("GET", url, authToken);
       assertThat(result.status(), is(OK));
-      assertAuditEntry(0, customer.uuid);
+      assertAuditEntry(0, customer.getUuid());
       JsonNode tasksJson = Json.parse(contentAsString(result));
-      JsonNode universeTasks = tasksJson.get(universe.universeUUID.toString());
+      JsonNode universeTasks = tasksJson.get(universe.getUniverseUUID().toString());
       if (idx == 0) {
         markedCompletionTime = universeTasks.get(0).get("completionTime").asText();
         try {
@@ -498,11 +605,11 @@ public class CustomerTaskControllerTest extends FakeDBApplication {
   @Test
   public void testTaskHistoryUniverseList() {
     String authToken = user.createAuthToken();
-    Universe universe1 = createUniverse("Universe 2", customer.getCustomerId());
+    Universe universe1 = createUniverse("Universe 2", customer.getId());
 
     UUID taskUUID1 =
         createTaskWithStatus(
-            universe.universeUUID,
+            universe.getUniverseUUID(),
             CustomerTask.TargetType.Universe,
             Create,
             TaskType.CreateUniverse,
@@ -510,7 +617,7 @@ public class CustomerTaskControllerTest extends FakeDBApplication {
             "Running",
             50.0);
     createTaskWithStatus(
-        universe1.universeUUID,
+        universe1.getUniverseUUID(),
         CustomerTask.TargetType.Universe,
         Create,
         TaskType.CreateUniverse,
@@ -518,43 +625,50 @@ public class CustomerTaskControllerTest extends FakeDBApplication {
         "Running",
         90.0);
     Result result =
-        FakeApiHelper.doRequestWithAuthToken(
+        doRequestWithAuthToken(
             "GET",
-            "/api/customers/" + customer.uuid + "/universes/" + universe.universeUUID + "/tasks",
+            "/api/customers/"
+                + customer.getUuid()
+                + "/universes/"
+                + universe.getUniverseUUID()
+                + "/tasks",
             authToken);
     assertThat(result.status(), is(OK));
     JsonNode json = Json.parse(contentAsString(result));
     assertThat(json.isObject(), is(true));
-    JsonNode universeTasks = json.get(universe.universeUUID.toString());
+    JsonNode universeTasks = json.get(universe.getUniverseUUID().toString());
     assertThat(universeTasks.isArray(), is(true));
     assertThat(universeTasks.size(), is(1));
     assertValues(universeTasks, "id", ImmutableList.of(taskUUID1.toString()));
-    assertAuditEntry(0, customer.uuid);
+    assertAuditEntry(0, customer.getUuid());
   }
 
   @Test
   public void testTaskHistoryLimit() {
     when(mockConfGetter.getConfForScope(any(Customer.class), eq(CustomerConfKeys.taskDbQueryLimit)))
         .thenReturn(25);
+    when(mockConfGetter.getConfForScope(
+            any(Customer.class), eq(CustomerConfKeys.taskInfoDbQueryBatchSize)))
+        .thenReturn(10);
     IntStream.range(0, 100)
         .forEach(
             i ->
                 createTaskWithStatus(
-                    universe.universeUUID,
+                    universe.getUniverseUUID(),
                     CustomerTask.TargetType.Universe,
                     Create,
                     TaskType.CreateUniverse,
                     "Foo",
                     "Running",
                     50.0));
-    Result result = controller.list(customer.uuid);
+    Result result = controller.list(customer.getUuid());
     assertThat(result.status(), is(OK));
     JsonNode json = Json.parse(contentAsString(result));
     assertThat(json.isObject(), is(true));
-    JsonNode universeTasks = json.get(universe.universeUUID.toString());
+    JsonNode universeTasks = json.get(universe.getUniverseUUID().toString());
     assertThat(universeTasks.isArray(), is(true));
     assertThat(universeTasks.size(), is(25));
-    assertAuditEntry(0, customer.uuid);
+    assertAuditEntry(0, customer.getUuid());
   }
 
   @Test
@@ -562,7 +676,7 @@ public class CustomerTaskControllerTest extends FakeDBApplication {
     String authToken = user.createAuthToken();
     UUID taskUUID =
         createTaskWithStatus(
-            universe.universeUUID,
+            universe.getUniverseUUID(),
             CustomerTask.TargetType.Universe,
             Create,
             TaskType.CreateUniverse,
@@ -570,15 +684,14 @@ public class CustomerTaskControllerTest extends FakeDBApplication {
             "Success",
             100.0);
     Result result =
-        FakeApiHelper.doRequestWithAuthToken(
-            "GET", "/api/customers/" + customer.uuid + "/tasks", authToken);
+        doRequestWithAuthToken("GET", "/api/customers/" + customer.getUuid() + "/tasks", authToken);
     CustomerTask ct =
         CustomerTask.find.query().where().eq("task_uuid", taskUUID.toString()).findOne();
     assertThat(result.status(), is(OK));
     assertThat(
         contentAsString(result), allOf(notNullValue(), containsString("Created Universe : Foo")));
     assertThat(ct.getCreateTime().before(ct.getCompletionTime()), is(true));
-    assertAuditEntry(0, customer.uuid);
+    assertAuditEntry(0, customer.getUuid());
   }
 
   @Test
@@ -587,7 +700,7 @@ public class CustomerTaskControllerTest extends FakeDBApplication {
     ObjectNode responseJson = Json.newObject();
     CustomerTask task =
         createTaskWithStatusAndResponse(
-            universe.universeUUID,
+            universe.getUniverseUUID(),
             CustomerTask.TargetType.Universe,
             Create,
             TaskType.CreateUniverse,
@@ -600,8 +713,8 @@ public class CustomerTaskControllerTest extends FakeDBApplication {
         taskUUID, 0, TaskType.AnsibleSetupServer, TaskInfo.State.Success, responseJson);
     when(mockCommissioner.getStatusOrBadRequest(taskUUID)).thenReturn(responseJson);
     Result result =
-        FakeApiHelper.doRequestWithAuthToken(
-            "GET", "/api/customers/" + customer.uuid + "/tasks/" + taskUUID, authToken);
+        doRequestWithAuthToken(
+            "GET", "/api/customers/" + customer.getUuid() + "/tasks/" + taskUUID, authToken);
 
     assertThat(result.status(), is(OK));
     JsonNode json = Json.parse(contentAsString(result));
@@ -611,7 +724,7 @@ public class CustomerTaskControllerTest extends FakeDBApplication {
     assertThat(json.get("createTime").asText(), is(notNullValue()));
     assertThat(json.get("target").asText(), allOf(notNullValue(), equalTo("Foo")));
     assertThat(json.get("type").asText(), allOf(notNullValue(), equalTo("Create")));
-    assertValue(json, "targetUUID", universe.universeUUID.toString());
+    assertValue(json, "targetUUID", universe.getUniverseUUID().toString());
     assertThat(json.get("details"), is(notNullValue()));
     JsonNode taskDetailsJson = json.get("details").get("taskDetails");
     assertThat(taskDetailsJson, is(notNullValue()));
@@ -621,7 +734,7 @@ public class CustomerTaskControllerTest extends FakeDBApplication {
         allOf(notNullValue(), equalTo("Configuring the universe")));
     assertThat(
         taskDetailsJson.get(0).get("state").asText(), allOf(notNullValue(), equalTo("Success")));
-    assertAuditEntry(0, customer.uuid);
+    assertAuditEntry(0, customer.getUuid());
   }
 
   @Test
@@ -631,15 +744,17 @@ public class CustomerTaskControllerTest extends FakeDBApplication {
     Result result =
         assertPlatformException(
             () ->
-                FakeApiHelper.doRequestWithAuthToken(
-                    "GET", "/api/customers/" + customer.uuid + "/tasks/" + taskUUID, authToken));
+                doRequestWithAuthToken(
+                    "GET",
+                    "/api/customers/" + customer.getUuid() + "/tasks/" + taskUUID,
+                    authToken));
 
     assertThat(result.status(), is(BAD_REQUEST));
     JsonNode json = Json.parse(contentAsString(result));
     assertThat(
         json.get("error").asText(),
         allOf(notNullValue(), equalTo("Invalid Customer Task UUID: " + taskUUID)));
-    assertAuditEntry(0, customer.uuid);
+    assertAuditEntry(0, customer.getUuid());
   }
 
   @Test
@@ -648,14 +763,14 @@ public class CustomerTaskControllerTest extends FakeDBApplication {
     UUID taskUUID = UUID.randomUUID();
     UUID customerUUID = UUID.randomUUID();
     Result result =
-        FakeApiHelper.doRequestWithAuthToken(
+        doRequestWithAuthToken(
             "GET", "/api/customers/" + customerUUID + "/tasks/" + taskUUID, authToken);
 
-    assertThat(result.status(), is(FORBIDDEN));
+    assertThat(result.status(), is(UNAUTHORIZED));
 
     String resultString = contentAsString(result);
     assertThat(resultString, allOf(notNullValue(), equalTo("Unable To Authenticate User")));
-    assertAuditEntry(0, customer.uuid);
+    assertAuditEntry(0, customer.getUuid());
   }
 
   @Test
@@ -663,7 +778,7 @@ public class CustomerTaskControllerTest extends FakeDBApplication {
     String authToken = user.createAuthToken();
     ObjectNode responseJson = Json.newObject();
     createTaskWithStatusAndResponse(
-        universe.universeUUID,
+        universe.getUniverseUUID(),
         CustomerTask.TargetType.Universe,
         TlsToggle,
         TaskType.TlsToggle,
@@ -672,15 +787,61 @@ public class CustomerTaskControllerTest extends FakeDBApplication {
         99.0,
         "TLS Toggle ON",
         responseJson);
-    when(mockCommissioner.buildTaskStatus(any(), any())).thenReturn(Optional.of(responseJson));
+    when(mockCommissioner.buildTaskStatus(any(), any(), any(), any()))
+        .thenReturn(Optional.of(responseJson));
     Result result =
-        FakeApiHelper.doRequestWithAuthToken(
-            "GET", "/api/customers/" + customer.uuid + "/tasks", authToken);
+        doRequestWithAuthToken("GET", "/api/customers/" + customer.getUuid() + "/tasks", authToken);
     assertThat(result.status(), is(OK));
     JsonNode json = Json.parse(contentAsString(result));
-    JsonNode universeTasks = json.get(universe.universeUUID.toString());
+    JsonNode universeTasks = json.get(universe.getUniverseUUID().toString());
     assertThat(universeTasks.isArray(), is(true));
     JsonNode task = universeTasks.get(0);
     assertThat(task.get("typeName").asText(), equalTo("TLS Toggle ON"));
+  }
+
+  @Test
+  public void testKubernetesOperatorTaskUsesBackgroundUserInResponse() {
+    String authToken = user.createAuthToken();
+    UUID taskUUID = UUID.randomUUID();
+    TaskInfo taskInfo = new TaskInfo(TaskType.CreateKubernetesUniverse, null);
+    taskInfo.setUuid(taskUUID);
+    ObjectNode taskParams = Json.newObject();
+    taskParams.set("kubernetesResourceDetails", Json.newObject());
+    taskInfo.setTaskParams(taskParams);
+    taskInfo.setOwner("");
+    taskInfo.save();
+
+    CustomerTask task =
+        CustomerTask.create(
+            customer,
+            universe.getUniverseUUID(),
+            taskUUID,
+            CustomerTask.TargetType.Universe,
+            Create,
+            universe.getName(),
+            null,
+            "Unknown");
+
+    ObjectNode responseJson = Json.newObject();
+    responseJson.put("status", "Running");
+    responseJson.put("percent", 10.0);
+    responseJson.put("abortable", false);
+    responseJson.put("retryable", false);
+    responseJson.put("canRollback", false);
+
+    when(mockCommissioner.buildTaskStatus(eq(task), any(), any(), any()))
+        .thenReturn(Optional.of(responseJson));
+    when(mockCommissioner.getUpdatingTaskUUIDsForTargets(any(), any()))
+        .thenReturn(Collections.emptyMap());
+
+    Result result =
+        doRequestWithAuthToken("GET", "/api/customers/" + customer.getUuid() + "/tasks", authToken);
+
+    assertThat(result.status(), is(OK));
+    JsonNode json = Json.parse(contentAsString(result));
+    JsonNode universeTasks = json.get(universe.getUniverseUUID().toString());
+    assertThat(universeTasks.isArray(), is(true));
+    JsonNode taskJson = universeTasks.get(0);
+    assertThat(taskJson.get("userEmail").asText(), equalTo(CustomerTask.BACKGROUND_TASK_USER));
   }
 }

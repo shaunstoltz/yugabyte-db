@@ -1,4 +1,4 @@
-// Copyright (c) YugaByte, Inc.
+// Copyright (c) YugabyteDB, Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License"); you may not use this file except
 // in compliance with the License.  You may obtain a copy of the License at
@@ -18,8 +18,7 @@
 #include "yb/integration-tests/cql_test_base.h"
 #include "yb/integration-tests/mini_cluster_utils.h"
 
-#include "yb/master/catalog_entity_info.pb.h"
-#include "yb/master/catalog_manager.h"
+#include "yb/master/master_defaults.h"
 
 #include "yb/tserver/mini_tablet_server.h"
 #include "yb/tserver/tablet_server.h"
@@ -68,7 +67,7 @@ class CqlGeoTransactionsTest: public CqlTestBase<MiniCluster> {
     ANNOTATE_UNPROTECTED_WRITE(FLAGS_TEST_track_last_transaction) = true;
     // These don't get set in automatically in tests.
     ANNOTATE_UNPROTECTED_WRITE(FLAGS_placement_cloud) = "cloud0";
-    ANNOTATE_UNPROTECTED_WRITE(FLAGS_placement_region) = "rack1";
+    ANNOTATE_UNPROTECTED_WRITE(FLAGS_placement_region) = "region1";
     ANNOTATE_UNPROTECTED_WRITE(FLAGS_placement_zone) = "zone";
     // Put everything in the same cloud.
     ANNOTATE_UNPROTECTED_WRITE(FLAGS_TEST_nodes_per_cloud) = 5;
@@ -94,11 +93,11 @@ class CqlGeoTransactionsTest: public CqlTestBase<MiniCluster> {
     return transaction_manager_->GetLoadedStatusTabletsVersion();
   }
 
-  void MakePlacementInfo(master::PlacementInfoPB* placement_info, int region) {
+  void MakePlacementInfo(PlacementInfoPB* placement_info, int region) {
     placement_info->set_num_replicas(1);
     auto pb = placement_info->add_placement_blocks();
     pb->mutable_cloud_info()->set_placement_cloud("cloud0");
-    pb->mutable_cloud_info()->set_placement_region(strings::Substitute("rack$0", region));
+    pb->mutable_cloud_info()->set_placement_region(strings::Substitute("region$0", region));
     pb->mutable_cloud_info()->set_placement_zone("zone");
     pb->set_min_num_replicas(1);
   }
@@ -107,7 +106,7 @@ class CqlGeoTransactionsTest: public CqlTestBase<MiniCluster> {
     auto current_version = GetCurrentVersion();
 
     std::string name = strings::Substitute("transactions_region$0", region);
-    master::ReplicationInfoPB replication_info;
+    ReplicationInfoPB replication_info;
     MakePlacementInfo(replication_info.mutable_live_replicas(), region);
     ASSERT_OK(client_->CreateTransactionsStatusTable(name, &replication_info));
 
@@ -121,13 +120,13 @@ class CqlGeoTransactionsTest: public CqlTestBase<MiniCluster> {
     for (int i = 1; i <= num_tablet_servers(); ++i) {
       YBTableName table_name{YQL_DATABASE_CQL, kNamespace,
                              strings::Substitute("$0$1", kTablePrefix, i)};
-      auto* placement_info = new master::PlacementInfoPB;
-      MakePlacementInfo(placement_info, i);
+      PlacementInfoPB placement_info;
+      MakePlacementInfo(&placement_info, i);
 
       ASSERT_OK(session.ExecuteQuery(strings::Substitute(
           "CREATE TABLE $0(value int, PRIMARY KEY (value)) WITH transactions = { 'enabled': true }",
           table_name.table_name())));
-      ASSERT_OK(client_->ModifyTablePlacementInfo(table_name, placement_info));
+      ASSERT_OK(client_->ModifyTablePlacementInfo(table_name, std::move(placement_info)));
       WaitForLoadBalanceCompletion();
     }
 
@@ -227,6 +226,17 @@ TEST_F(CqlGeoTransactionsTest, TestTransactionTabletSelection) {
 
   ANNOTATE_UNPROTECTED_WRITE(FLAGS_auto_promote_nonlocal_transactions_to_global) = true;
   CheckInsert(kLocalRegion, ExpectedResult::kLocal);
+  CheckInsert(kOtherRegion, ExpectedResult::kGlobal);
+}
+
+TEST_F(CqlGeoTransactionsTest, TestInitialGlobalOp) {
+  SetupTables();
+  CreateTransactionTable(kLocalRegion);
+
+  ANNOTATE_UNPROTECTED_WRITE(FLAGS_auto_promote_nonlocal_transactions_to_global) = true;
+  // Not using the transaction pool.
+  CheckInsert(kOtherRegion, ExpectedResult::kGlobal);
+  // Using the transaction pool.
   CheckInsert(kOtherRegion, ExpectedResult::kGlobal);
 }
 

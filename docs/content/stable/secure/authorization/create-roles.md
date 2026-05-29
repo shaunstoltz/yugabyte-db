@@ -1,14 +1,16 @@
 ---
-title: Manage users and roles
+title: Manage users and roles - YSQL
+headerTitle: Manage users and roles
 linkTitle: Manage users and roles
 description: Manage users and roles in YSQL
 headcontent: Manage users and roles
-image: /images/section_icons/secure/create-roles.png
 menu:
   stable:
     identifier: create-roles
     parent: authorization
     weight: 717
+aliases:
+  - /stable/secure/authorization/ysql-create-roles/
 type: docs
 ---
 
@@ -56,7 +58,7 @@ Roles that have `LOGIN` privileges are users. For example, create a user `john` 
 yugabyte=# CREATE ROLE john LOGIN PASSWORD 'PasswdForJohn';
 ```
 
-Read about [how to create users in YugabyteDB](../../enable-authentication/ysql/) in the Authentication section.
+Read about [how to create users in YugabyteDB](../../enable-authentication/authentication-ysql/) in the Authentication section.
 
 ## Grant roles
 
@@ -93,18 +95,18 @@ yugabyte=# GRANT engineering TO developer;
 You can list all the roles by running the following statement:
 
 ```sql
-yugabyte=# SELECT rolname, rolcanlogin, rolsuper, memberof FROM pg_roles;
+yugabyte=# SELECT rolname, rolcanlogin, rolsuper FROM pg_roles;
 ```
 
 You should see the following output:
 
 ```output
- rolname     | rolcanlogin | rolsuper | memberof
--------------+-------------+----------+-----------------
- john        | t           | f        | {engineering}
- developer   | f           | f        | {engineering}
- engineering | f           | f        | {}
- yugabyte    | t           | t        | {}
+ rolname     | rolcanlogin | rolsuper |
+-------------+-------------+----------+
+ john        | t           | f        |
+ developer   | f           | f        |
+ engineering | f           | f        |
+ yugabyte    | t           | t        |
 
 (4 rows)
 ```
@@ -112,9 +114,26 @@ You should see the following output:
 In the table, note the following:
 
 * The `yugabyte` role is the built-in superuser.
-* The role `john` can login, and hence is a user. Note that `john` is not a superuser.
-* The roles `engineering` and `developer` cannot login.
-* Both `john` and `developer` inherit the role `engineering`.
+* The role `john` can log in, and hence is a user. Note that `john` is not a superuser.
+* The roles `engineering` and `developer` cannot log in.
+
+You can also list roles using the [du meta-command](../../../api/ysqlsh-meta-commands/#du-s-pattern):
+
+```sql
+yugabyte=# \du
+```
+
+```output
+                                       List of roles
+  Role name   |                         Attributes                         |   Member of
+--------------+------------------------------------------------------------+---------------
+ developer    | Cannot login                                               | {engineering}
+ engineering  | Cannot login                                               | {}
+ john         |                                                            | {engineering}
+ yugabyte     | Superuser, Create role, Create DB, Replication, Bypass RLS | {}
+```
+
+Note how both `john` and `developer` inherit the role `engineering`.
 
 ## Revoke roles
 
@@ -129,18 +148,17 @@ yugabyte=# REVOKE engineering FROM john;
 Listing all the roles now shows that `john` no longer inherits from the `engineering` role:
 
 ```sql
-yugabyte=# SELECT rolname, rolcanlogin, rolsuperuser, memberof FROM pg_roles;
+yugabyte=# \du
 ```
 
 ```output
- rolname     | rolcanlogin | rolsuper | memberof
--------------+-------------+----------+-----------------
-john         | t           | f        | {}
-developer    | f           | f        | {engineering}
-engineering  | f           | f        | {}
-yugabyte     | t           | t        | {}
-
-(4 rows)
+                                       List of roles
+  Role name   |                         Attributes                         |   Member of
+--------------+------------------------------------------------------------+---------------
+ developer    | Cannot login                                               | {engineering}
+ engineering  | Cannot login                                               | {}
+ john         |                                                            | {}
+ yugabyte     | Superuser, Create role, Create DB, Replication, Bypass RLS | {}
 ```
 
 ## Drop roles
@@ -153,18 +171,17 @@ For example, you can drop the `developer` role with the following statement:
 yugabyte=# DROP ROLE developer;
 ```
 
-The `developer` role is no longer present when listing all the roles:
+The `developer` role is no longer present when listing the roles:
 
 ```sql
-yugabyte=# SELECT rolname, rolcanlogin, rolsuper, memberof FROM pg_roles;
+yugabyte=# \du
 ```
 
 ```output
- rolname     | rolcanlogin | rolsuper | memberof
--------------+-------------+----------+-----------
- john        | t           | f        | {}
- engineering | f           | f        | {}
- yugabyte    | t           | t        | {}
-
-(3 rows)
+                                       List of roles
+  Role name   |                         Attributes                         |   Member of
+--------------+------------------------------------------------------------+---------------
+ engineering  | Cannot login                                               | {}
+ john         |                                                            | {}
+ yugabyte     | Superuser, Create role, Create DB, Replication, Bypass RLS | {}
 ```

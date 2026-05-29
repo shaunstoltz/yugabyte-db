@@ -1,4 +1,4 @@
-// Copyright (c) YugaByte, Inc.
+// Copyright (c) YugabyteDB, Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License"); you may not use this file except
 // in compliance with the License.  You may obtain a copy of the License at
@@ -13,7 +13,7 @@
 
 #include "yb/tablet/operations/truncate_operation.h"
 
-#include <glog/logging.h>
+#include "yb/util/logging.h"
 
 #include "yb/consensus/consensus_round.h"
 #include "yb/consensus/consensus.messages.h"
@@ -21,6 +21,10 @@
 #include "yb/tablet/tablet.h"
 
 #include "yb/util/trace.h"
+
+DEFINE_test_flag(bool, skip_applying_truncate, false,
+                 "If true, the test will skip applying tablet truncate operation."
+                 "Note that other operations will still be applied.");
 
 namespace yb {
 namespace tablet {
@@ -42,6 +46,11 @@ Status TruncateOperation::DoAborted(const Status& status) {
 
 Status TruncateOperation::DoReplicated(int64_t leader_term, Status* complete_status) {
   TRACE("APPLY TRUNCATE: started");
+
+  if (FLAGS_TEST_skip_applying_truncate) {
+    TRACE("APPLY TRUNCATE: skipped");
+    return Status::OK();
+  }
 
   RETURN_NOT_OK(VERIFY_RESULT(tablet_safe())->Truncate(this));
 

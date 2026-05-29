@@ -3,7 +3,7 @@
  * yb_scan.h
  *	  prototypes for yb_access/yb_scan.c
  *
- * Copyright (c) YugaByte, Inc.
+ * Copyright (c) YugabyteDB, Inc.
  *
  * Licensed under the Apache License, Version 2.0 (the "License"); you may not use this file except
  * in compliance with the License.  You may obtain a copy of the License at
@@ -24,19 +24,111 @@
 
 #include "postgres.h"
 
-#include "skey.h"
 #include "access/genam.h"
 #include "access/heapam.h"
 #include "access/itup.h"
-#include "nodes/relation.h"
+#include "access/relation.h"
+#include "executor/ybExpr.h"
+#include "nodes/pathnodes.h"
+#include "pg_yb_utils.h"
+#include "skey.h"
 #include "utils/catcache.h"
 #include "utils/resowner.h"
 #include "utils/sampling.h"
 #include "utils/snapshot.h"
-
 #include "yb/yql/pggate/ybc_pggate.h"
-#include "pg_yb_utils.h"
-#include "executor/ybcExpr.h"
+
+extern PGDLLIMPORT int yb_parallel_range_rows;
+extern bool yb_test_skip_binding_scan_keys;
+extern bool yb_enable_advanced_index_cond_fold;
+
+/*
+ * In fact, only initial fetch uses the default size, we estimate the number
+ * based on average key length so far. In future we may be able to estimate
+ * key length before fetch starts and always use estimated value.
+ */
+#define YB_PARTITION_KEYS_DEFAULT_FETCH_SIZE 100
+
+/*
+ * Size of the buffer (in bytes) to store the parallel keys.
+ * Ideally it should be adjustable to specific relation, since different
+ * relations has different key sizes. Moreover, key sizes may vary within a
+ * relation.
+ */
+#define YB_PARTITION_KEY_DATA_CAPACITY 16384
+
+/*
+ * State of the parallel key fetch. We only allow one fetching backend at a
+ * time, so FETCH_STATUS_WORKING indicates that one of the backends is actively
+ * performing the fetch.
+ * FETCH_STATUS_IDLE means that DocDB has more keys to return, a worker should
+ * request them.
+ * FETCH_STATUS_DONE means that all the keys has been fetched, no more fetch is
+ * needed.
+ */
+typedef enum
+{
+	FETCH_STATUS_IDLE,
+	FETCH_STATUS_WORKING,
+	FETCH_STATUS_DONE
+} YbFetchStatus;
+
+/*
+ * The parallel scan state structure
+ * Most important data stored in the structure is the buffer of parallel key,
+ * representing bounds of the blocks to scan by the parallel workers.
+ * The keys are ordered, and parallel workers take one at a time in their
+ * order as the lower bound of the scan range, and peek at the next key to use
+ * as the higher bound. The key is essentially a byte array of variable length,
+ * its actual length is stored as the prefixes to the actual data. The keys are
+ * stored without gaps, so the end of the key is the beginning of the next. Keys
+ * are stored continuously, so if the next key does not fit into the space
+ * between the end of the last key and the end of the buffer, it is written from
+ * the beginning of the buffer (referred as buffer wraparound).
+ *
+ * The low_offset and high_offset indicate two "active" keys in the buffer. The
+ * low_offset is the key to be used and removed by the worker, grabbing next
+ * scan range, and the high_offset points to key used by fetching worker: it is
+ * the lower bound when making a request, and the point to append keys from the
+ * response. In fact, the keys in the buffer form a FIFO queue. As it was
+ * mentioned above, there may be unused space at the end of the buffer, because
+ * of the key continuity. The key_data_size variable points to the beginning of
+ * that space.
+ *
+ * The keys are fetched from the DocDB by a random worker when number of the
+ * keys available in the buffer goes low. The fetch_status indicates current
+ * fetch state. The last key in the buffer (highest key) is used as a fetch
+ * starting point. For that reason we do not allow to take the last remaining
+ * key from the buffer, until DocDB fetch is done.
+ *
+ * Purpose of other fields of the structure:
+ *  - mutex to synchronize access to other fields
+ *  - cv_empty is the conditional variable to wait while buffer has keys
+ *    available to take
+ *  - total_key_size, total_key_count key stats, also used to estimate number
+ *    of keys to fetch (provides average key length).
+ */
+typedef struct YBParallelPartitionKeysData
+{
+	slock_t		mutex;			/* to synchronize access from the workers */
+	ConditionVariable cv_empty; /* to wait until buffer has more entries */
+	Oid			database_oid;	/* database of the target relation */
+	Oid			table_relfilenode_oid;	/* relfilenode_oid of the target
+										 * relation */
+	bool		is_forward;		/* scan direction */
+	YbFetchStatus fetch_status; /* if fetch is in progress or completed */
+	int			low_offset;		/* offset of the lowest key in the buffer */
+	int			high_offset;	/* offset of the highest key in the buffer */
+	int			key_count;		/* number of keys in the buffer */
+	double		total_key_size; /* combined length of the keys fetched so far */
+	double		total_key_count;	/* number of keys fetched so far */
+	int			key_data_size;	/* end of the last entry in the wraparound
+								 * key_data */
+	int			key_data_capacity;	/* YB_PARTITION_KEY_DATA_CAPACITY now, but
+									 * may change */
+	char		key_data[FLEXIBLE_ARRAY_MEMBER];	/* the buffer */
+} YBParallelPartitionKeysData;
+typedef YBParallelPartitionKeysData *YBParallelPartitionKeys;
 
 /*
  * SCAN PLAN - Two structures.
@@ -59,39 +151,53 @@
  */
 typedef struct YbScanDescData
 {
-#define YB_MAX_SCAN_KEYS (INDEX_MAX_KEYS * 2) /* A pair of lower/upper bounds per column max */
+#define YB_MAX_SCAN_KEYS (INDEX_MAX_KEYS * 2)	/* A pair of lower/upper
+												 * bounds per column max */
 
 	/* The handle for the internal YB Select statement. */
-	YBCPgStatement handle;
-	bool is_exec_done;
-
-	Relation relation;
-	Relation index;
+	YbcPgStatement handle;
+	bool		is_exec_done;
 
 	/*
-	 * In YB ScanKey could be one of two types:
-	 *  - key for regular column
-	 *  - key which represents the yb_hash_code function.
-	 * The keys array holds keys of both types.
-	 * All regular keys go before keys for yb_hash_code.
-	 * Keys in range [0, nkeys) are regular keys.
-	 * Keys in range [nkeys, nkeys + nhash_keys) are keys for yb_hash_code
-	 * Such separation allows to process regular and non-regular keys independently.
+	 * These fields are constant and initialized during YbBeginScan.
+	 * "table" is the table (not index).  It is set even for Index Only Scan.
+	 * "index" is the index, if applicable.  NULL otherwise.
 	 */
-	ScanKey keys[YB_MAX_SCAN_KEYS];
-	/* number of regular keys */
-	int nkeys;
-	/* number of keys which represents the yb_hash_code function */
-	int nhash_keys;
+	Relation	table;
+	Relation	index;
 
-	/* True if all the conditions for this index were bound to pggate. */
-	bool is_full_cond_bound;
+	/*
+	 * ScanKey could be one of two types:
+	 *  - key searching on DocDB hash code (aka yb_hash_code pushdown).
+	 *  - otherwise
+	 * hash_code_keys holds the first type; keys holds the second.
+	 */
+	ScanKey		keys[YB_MAX_SCAN_KEYS];
+	/* Number of elements in the above array. */
+	int			nkeys;
+	/*
+	 * List of ScanKey for keys with YB_SK_SEARCHHASHCODE (yb_hash_code
+	 * pushdown).  Remember, YB_SK_SEARCHHASHCODE is not set for all
+	 * yb_hash_code expressions!
+	 *
+	 * Prefer List over array because this is likely to have zero or a few
+	 * elements in most cases.
+	 */
+	List	   *hash_code_keys;
 
-	TupleDesc target_desc;
-	AttrNumber target_key_attnums[YB_MAX_SCAN_KEYS];
+	/*
+	 * True if any type of recheck (YB or PG) is needed because not all scan
+	 * keys are bound.  There could be false positives: it could say true when
+	 * recheck is actually not needed.
+	 */
+	bool		needs_recheck;
+
+	/* Destination for queried data from Yugabyte database */
+	TupleDesc	target_desc;
+	AttrNumber	target_key_attnums[YB_MAX_SCAN_KEYS];
 
 	/* Kept query-plan control to pass it to PgGate during preparation */
-	YBCPgPrepareParameters prepare_params;
+	YbcPgPrepareParameters prepare_params;
 
 	/*
 	 * Kept execution control to pass it to PgGate.
@@ -101,7 +207,7 @@ typedef struct YbScanDescData
 	 * - YBC-index-scan in-turn will passes this attribute to PgGate to control the index-scan
 	 *   execution in YB tablet server.
 	 */
-	YBCPgExecParameters *exec_params;
+	YbcPgExecParameters *exec_params;
 
 	/*
 	 * Flag used for bailing out from scan early. Currently used to bail out
@@ -116,10 +222,10 @@ typedef struct YbScanDescData
 	 * Hence when, such condition is detected, we bail out from creating and
 	 * sending a request to docDB.
 	 */
-	bool quit_scan;
-} YbScanDescData;
+	bool		quit_scan;
 
-typedef struct YbScanDescData *YbScanDesc;
+	YBParallelPartitionKeys pscan;
+} YbScanDescData;
 
 extern void ybc_free_ybscan(YbScanDesc ybscan);
 
@@ -134,43 +240,101 @@ extern SysScanDesc ybc_systable_beginscan(Relation relation,
 										  Snapshot snapshot,
 										  int nkeys,
 										  ScanKey key);
-extern HeapTuple ybc_systable_getnext(SysScanDesc scanDesc);
-extern void ybc_systable_endscan(SysScanDesc scan_desc);
+extern SysScanDesc ybc_systable_begin_default_scan(Relation relation,
+												   Oid indexId,
+												   bool indexOK,
+												   Snapshot snapshot,
+												   int nkeys,
+												   ScanKey key);
 
 /*
  * Access to YB-stored system catalogs (mirroring API from heapam.c)
  * We will do a YugaByte scan instead of a heap scan.
  */
-extern HeapScanDesc ybc_heap_beginscan(Relation relation,
-                                       Snapshot snapshot,
-                                       int nkeys,
-                                       ScanKey key,
-									   bool temp_snap);
-extern HeapTuple ybc_heap_getnext(HeapScanDesc scanDesc);
-extern void ybc_heap_endscan(HeapScanDesc scanDesc);
-extern HeapScanDesc ybc_remote_beginscan(Relation relation,
-										 Snapshot snapshot,
-										 Scan *pg_scan_plan,
-										 PushdownExprs *remote);
+extern TableScanDesc ybc_heap_beginscan(Relation relation,
+										Snapshot snapshot,
+										int nkeys,
+										ScanKey key,
+										uint32 flags);
+extern HeapTuple ybc_heap_getnext(TableScanDesc scanDesc);
+extern void ybc_heap_endscan(TableScanDesc scanDesc);
 
 /*
- * The ybc_idx API is used to process the following SELECT.
- *   SELECT data FROM heapRelation WHERE rowid IN
- *     ( SELECT rowid FROM indexRelation WHERE key = given_value )
+ * Begin a heap scan for index build/backfill that only fetches columns
+ * needed by the index (as defined in IndexInfo).
  */
-extern YbScanDesc ybcBeginScan(Relation relation,
-							   Relation index,
-							   bool xs_want_itup,
-							   int nkeys,
-							   ScanKey key,
-							   Scan *pg_scan_plan,
-							   PushdownExprs *rel_remote,
-							   PushdownExprs *idx_remote);
+extern TableScanDesc ybc_heap_beginscan_for_index_build(Relation relation,
+														Snapshot snapshot,
+														struct IndexInfo *indexInfo,
+														YbPushdownExprs *yb_pushdown);
 
-HeapTuple ybc_getnext_heaptuple(YbScanDesc ybScan, bool is_forward_scan, bool *recheck);
-IndexTuple ybc_getnext_indextuple(YbScanDesc ybScan, bool is_forward_scan, bool *recheck);
 
-Oid ybc_get_attcollation(TupleDesc bind_desc, AttrNumber attnum);
+extern void YbBindDatumToColumn(YbcPgStatement stmt,
+								int attr_num,
+								Oid type_id,
+								Oid collation_id,
+								Datum datum,
+								bool is_null,
+								const YbcPgTypeEntity *null_type_entity);
+
+/* Add targets to the given statement. */
+extern void YbDmlAppendTargetSystem(AttrNumber attnum, YbcPgStatement handle);
+extern void YbDmlAppendTargetRegular(TupleDesc tupdesc, AttrNumber attnum,
+									 YbcPgStatement handle);
+extern void YbDmlAppendTargetRegularAttr(const FormData_pg_attribute *attr,
+										 YbcPgStatement handle);
+
+extern void YbDmlAppendTargetsAggregate(List *aggrefs, Scan *outer_plan,
+										TupleDesc tupdesc, Relation index,
+										bool xs_want_itup, YbcPgStatement handle);
+extern void YbDmlAppendTargets(List *colrefs, YbcPgStatement handle);
+
+extern void YbAppendPrimaryColumnRef(YbcPgStatement dml, YbcPgExpr colref);
+
+extern void YbAppendPrimaryColumnRefs(YbcPgStatement dml, List *colrefs);
+
+extern void YbApplyPrimaryPushdown(YbcPgStatement dml,
+								   const YbPushdownExprs *pushdown);
+
+extern void YbApplySecondaryIndexPushdown(YbcPgStatement dml,
+										  const YbPushdownExprs *pushdown);
+
+extern YbScanDesc YbBeginScan(Relation table,
+							  Relation index,
+							  bool xs_want_itup,
+							  int nkeys,
+							  ScanKey keys,
+							  Scan *pg_scan_plan,
+							  YbPushdownExprs *rel_pushdown,
+							  YbPushdownExprs *idx_pushdown,
+							  List *aggrefs,
+							  int distinct_prefixlen,
+							  YbcPgExecParameters *exec_params,
+							  bool is_internal_scan,
+							  bool fetch_ybctids_only);
+
+/* Returns whether the given populated ybScan needs PG recheck. */
+extern bool YbNeedsPgRecheck(YbScanDesc ybScan);
+
+extern bool YbIsScanningEmbeddedIdx(Relation table, Relation index);
+
+/*
+ * Used in Agg node init phase to determine whether YB recheck or PG recheck
+ * may be needed.
+ */
+extern bool YbPredetermineNeedsRecheck(Scan *scan,
+									   Relation relation,
+									   Relation index,
+									   bool xs_want_itup,
+									   ScanKey keys,
+									   int nkeys);
+
+extern HeapTuple ybc_getnext_heaptuple(YbScanDesc ybScan, ScanDirection dir);
+extern IndexTuple ybc_getnext_indextuple(YbScanDesc ybScan, ScanDirection dir);
+extern bool ybc_getnext_aggslot(IndexScanDesc scan, YbcPgStatement handle,
+								bool index_only_scan);
+
+extern Oid	ybc_get_attcollation(TupleDesc bind_desc, AttrNumber attnum);
 
 /* Number of rows assumed for a YB table if no size estimates exist */
 #define YBC_DEFAULT_NUM_ROWS  1000
@@ -198,18 +362,30 @@ Oid ybc_get_attcollation(TupleDesc bind_desc, AttrNumber attnum);
  */
 #define YBC_UNCOVERED_INDEX_COST_FACTOR 1.1
 
+extern void ybcGetForeignRelSize(PlannerInfo *root, RelOptInfo *baserel,
+								 Oid foreigntableid);
 extern void ybcCostEstimate(RelOptInfo *baserel, Selectivity selectivity,
-							bool is_backwards_scan, bool is_seq_scan, bool is_uncovered_idx_scan,
-							Cost *startup_cost, Cost *total_cost, Oid index_tablespace_oid);
+							bool is_backwards_scan, bool is_seq_scan,
+							bool is_uncovered_idx_scan, Cost *startup_cost,
+							Cost *total_cost, Oid index_tablespace_oid);
 extern void ybcIndexCostEstimate(struct PlannerInfo *root, IndexPath *path,
-								 Selectivity *selectivity, Cost *startup_cost, Cost *total_cost);
+								 Selectivity *selectivity, Cost *startup_cost,
+								 Cost *total_cost);
 
 /*
- * Fetch a single tuple by the ybctid.
+ * Fetch a single row for given ybctid into a slot.
+ * This API is needed for reading data via index.
  */
-extern HeapTuple YBCFetchTuple(Relation relation, Datum ybctid);
-extern HTSU_Result YBCLockTuple(Relation relation, Datum ybctid, RowMarkType mode,
-												 LockWaitPolicy wait_policy, EState* estate);
+extern TM_Result YBCLockTuple(Relation relation, Datum ybctid, RowMarkType mode,
+							  LockWaitPolicy wait_policy, EState *estate);
+
+/*
+ * Fetch a single row for given ybctid into a heap-tuple.
+ * This API is needed for reading data from a catalog (system table).
+ */
+extern bool YbFetchHeapTuple(Relation relation, Datum ybctid, HeapTuple *tuple);
+extern void YBCFlushTupleLocks();
+extern void YBCHandleConflictError(Relation rel, LockWaitPolicy wait_policy);
 
 /*
  * ANALYZE support: sampling of table data
@@ -217,18 +393,31 @@ extern HTSU_Result YBCLockTuple(Relation relation, Datum ybctid, RowMarkType mod
 typedef struct YbSampleData
 {
 	/* The handle for the internal YB Sample statement. */
-	YBCPgStatement handle;
+	YbcPgStatement handle;
+	YbcPgExecParameters exec_params;
 
 	Relation	relation;
-	int			targrows;	/* # of rows to collect */
-	double		liverows;	/* # live rows seen */
-	double		deadrows;	/* # dead rows seen */
+	int			targrows;		/* # of rows to collect */
+	double		liverows;		/* # live rows seen */
+	double		deadrows;		/* # dead rows seen */
 } YbSampleData;
 
 typedef struct YbSampleData *YbSample;
 
-YbSample ybBeginSample(Relation rel, int targrows);
-bool ybSampleNextBlock(YbSample ybSample);
-int ybFetchSample(YbSample ybSample, HeapTuple *rows);
-TupleTableSlot *ybFetchNext(YBCPgStatement handle,
-			TupleTableSlot *slot, Oid relid);
+extern YbSample ybBeginSample(Relation rel, int targrows);
+extern bool ybSampleNextBlock(YbSample ybSample);
+extern int	ybFetchSample(YbSample ybSample, HeapTuple *rows);
+extern void ybFetchNext(YbcPgStatement handle, TupleTableSlot *slot, Oid relid);
+
+extern int	ybParallelWorkers(double numrows);
+
+extern Size yb_estimate_parallel_size(void);
+extern void yb_init_partition_key_data(void *data);
+extern void yb_rescan_partition_key_data(void *data);
+extern void ybParallelPrepare(YBParallelPartitionKeys ppk, Relation relation,
+							  YbcPgExecParameters *exec_params,
+							  bool is_forward);
+extern bool ybParallelNextRange(YBParallelPartitionKeys ppk,
+								const char **low_bound, size_t *low_bound_size,
+								const char **high_bound,
+								size_t *high_bound_size);

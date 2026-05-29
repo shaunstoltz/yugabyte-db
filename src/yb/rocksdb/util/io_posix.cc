@@ -3,9 +3,9 @@
 //  LICENSE file in the root directory of this source tree. An additional grant
 //  of patent rights can be found in the PATENTS file in the same directory.
 //
-// The following only applies to changes made to this file as part of YugaByte development.
+// The following only applies to changes made to this file as part of YugabyteDB development.
 //
-// Portions Copyright (c) YugaByte, Inc.
+// Portions Copyright (c) YugabyteDB, Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License"); you may not use this file except
 // in compliance with the License.  You may obtain a copy of the License at
@@ -41,7 +41,6 @@
 #include "yb/rocksdb/port/port.h"
 #include "yb/rocksdb/util/coding.h"
 #include "yb/rocksdb/util/posix_logger.h"
-#include "yb/rocksdb/util/sync_point.h"
 
 #include "yb/util/file_system_posix.h"
 #include "yb/util/malloc.h"
@@ -51,6 +50,7 @@
 #include "yb/util/status_log.h"
 #include "yb/util/std_util.h"
 #include "yb/util/string_util.h"
+#include "yb/util/sync_point.h"
 #include "yb/util/test_kill.h"
 
 DECLARE_bool(never_fsync);
@@ -299,7 +299,7 @@ Status PosixMmapFile::Close() {
   return s;
 }
 
-Status PosixMmapFile::Flush() { return Status::OK(); }
+Status PosixMmapFile::Flush(FlushMode mode) { return Status::OK(); }
 
 Status PosixMmapFile::Sync() {
   if (FLAGS_never_fsync) {
@@ -331,7 +331,7 @@ Status PosixMmapFile::Fsync() {
  * size that is returned from the filesystem because we use mmap
  * to extend file by map_size every time.
  */
-uint64_t PosixMmapFile::GetFileSize() {
+uint64_t PosixMmapFile::Size() const {
   size_t used = dst_ - base_;
   return file_offset_ + used;
 }
@@ -351,8 +351,8 @@ Status PosixMmapFile::InvalidateCache(size_t offset, size_t length) {
 
 #ifdef ROCKSDB_FALLOCATE_PRESENT
 Status PosixMmapFile::Allocate(uint64_t offset, uint64_t len) {
-  assert(yb::std_util::cmp_less_equal(offset, std::numeric_limits<off_t>::max()));
-  assert(yb::std_util::cmp_less_equal(len, std::numeric_limits<off_t>::max()));
+  assert(std::cmp_less_equal(offset, std::numeric_limits<off_t>::max()));
+  assert(std::cmp_less_equal(len, std::numeric_limits<off_t>::max()));
   TEST_KILL_RANDOM("PosixMmapFile::Allocate:0", test_kill_odds);
   int alloc_status = 0;
   if (allow_fallocate_) {

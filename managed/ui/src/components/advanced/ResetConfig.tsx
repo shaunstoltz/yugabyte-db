@@ -1,17 +1,18 @@
-
-import React, { FC } from 'react';
+import { FC } from 'react';
 import { Row, Col } from 'react-bootstrap';
 import { useTranslation } from 'react-i18next';
 import { Field } from 'formik';
 
-import { RunTimeConfigData, RunTimeConfigScope } from '../../redesign/helpers/dtos';
+import { RunTimeConfigData, RunTimeConfigScope } from '../../redesign/utils/dtos';
 import { DEFAULT_RUNTIME_GLOBAL_SCOPE } from '../../actions/customers';
 import { YBModalForm } from '../common/forms';
 import { YBFormInput } from '../common/forms/fields';
+import { RuntimeConfigKey } from '../../redesign/helpers/constants';
 
 interface ResetConfigData {
   configData: RunTimeConfigData;
   onHide: () => void;
+  fetchUiTagFilter: () => void;
   deleteRunTimeConfig: (key: string, scope?: string) => void;
   scope?: string;
   universeUUID?: string;
@@ -22,6 +23,7 @@ interface ResetConfigData {
 export const ResetConfig: FC<ResetConfigData> = ({
   configData,
   onHide,
+  fetchUiTagFilter,
   deleteRunTimeConfig,
   scope,
   universeUUID,
@@ -42,10 +44,11 @@ export const ResetConfig: FC<ResetConfigData> = ({
     } else if (scope === RunTimeConfigScope.CUSTOMER) {
       scopeValue = customerUUID!;
     }
-    await deleteRunTimeConfig(
-      configData.configKey,
-      scopeValue
-    );
+    await deleteRunTimeConfig(configData.configKey, scopeValue);
+    // Refetch the conf tags to filter runtime config flags accordingly
+    if (configData.configKey === RuntimeConfigKey.UI_TAG_FILTER) {
+      fetchUiTagFilter();
+    }
     onHide();
   };
   return (

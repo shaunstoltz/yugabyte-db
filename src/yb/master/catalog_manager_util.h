@@ -1,4 +1,4 @@
-// Copyright (c) YugaByte, Inc.
+// Copyright (c) YugabyteDB, Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License"); you may not use this file except
 // in compliance with the License.  You may obtain a copy of the License at
@@ -16,24 +16,40 @@
 #include <unordered_map>
 #include <vector>
 
-#include <glog/logging.h>
+#include "yb/common/entity_ids.h"
 
-#include "yb/consensus/consensus_fwd.h"
-#include "yb/master/catalog_entity_info.h"
 #include "yb/master/master_error.h"
 #include "yb/master/master_fwd.h"
 #include "yb/master/ts_descriptor.h"
 
+#include "yb/util/status_callback.h"
+
 // Utility functions that can be shared between test and code for catalog manager.
 namespace yb {
+
+class Schema;
+
+namespace dockv {
+class PartitionSchema;
+}  // namespace dockv
+
+namespace tablet {
+class TableInfoPB;
+}  // namespace tablet
+
 namespace master {
 
 using ZoneToDescMap = std::unordered_map<std::string, TSDescriptorVector>;
 
 struct Comparator;
 class SetPreferredZonesRequestPB;
+class IsTruncateTableDoneResponsePB;
 
+static std::once_flag sequences_data_table_filter_once_flag_;
 static google::protobuf::RepeatedPtrField<TableIdentifierPB> sequences_data_table_filter_;
+
+const int kUseBackupRowEntryFormatVersion = 2;
+const int kUseRelfilenodeFormatVersion = 3;
 
 class CatalogManagerUtil {
  public:
@@ -41,34 +57,24 @@ class CatalogManagerUtil {
   // multi AZ setup, else checks load distribution across tservers (single AZ).
   static Status IsLoadBalanced(const TSDescriptorVector& ts_descs);
 
-  // For the given set of descriptors, checks if every tserver that shouldn't have leader load
-  // actually has no leader load.
-  // If transaction_tables_use_preferred_zones = false, then we also check if txn status tablet
-  // leaders are spread evenly based on the information in `tables`.
+  static Result<ReplicationInfoPB> GetTableReplicationInfo(
+      const scoped_refptr<const TableInfo>& table,
+      const std::shared_ptr<const YsqlTablespaceManager>
+          tablespace_manager,
+      const ReplicationInfoPB& cluster_replication_info);
+
+  // For the given set of descriptors, checks if every tserver does not have an excess tablet leader
+  // load given the preferred zones.
   static Status AreLeadersOnPreferredOnly(
       const TSDescriptorVector& ts_descs,
-      const ReplicationInfoPB& replication_info,
-      const std::vector<scoped_refptr<TableInfo>>& tables = {});
-
-  // Creates a mapping from tserver uuid to the number of transaction leaders present.
-  static void CalculateTxnLeaderMap(std::map<std::string, int>* txn_map,
-                                    int* num_txn_tablets,
-                                    std::vector<scoped_refptr<TableInfo>> tables);
+      const ReplicationInfoPB& cluster_replication_info,
+      const std::shared_ptr<const YsqlTablespaceManager> tablespace_manager,
+      const std::vector<scoped_refptr<TableInfo>>& tables);
 
   // For the given set of descriptors, returns the map from each placement AZ to list of tservers
   // running in that zone.
   static Status GetPerZoneTSDesc(const TSDescriptorVector& ts_descs,
                                          ZoneToDescMap* zone_to_ts);
-
-  // Checks whether two given cloud infos are identical.
-  static bool IsCloudInfoEqual(const CloudInfoPB& lhs, const CloudInfoPB& rhs);
-
-  // For the given placement info, checks whether a given cloud info is contained within it.
-  static bool DoesPlacementInfoContainCloudInfo(const PlacementInfoPB& placement_info,
-                                                const CloudInfoPB& cloud_info);
-
-  // Checks whether the given placement info spans more than one region.
-  static bool DoesPlacementInfoSpanMultipleRegions(const PlacementInfoPB& placement_info);
 
   // Called when registering a ts from raft, deduce a tservers placement from the peer's role
   // and cloud info.
@@ -76,7 +82,7 @@ class CatalogManagerUtil {
       const ReplicationInfoPB& replication_info, const consensus::RaftPeerPB& peer);
 
   // Returns error if tablet partition is not covered by running inner tablets partitions.
-  static Status CheckIfCanDeleteSingleTablet(const scoped_refptr<TabletInfo>& tablet);
+  static Status CheckIfCanDeleteSingleTablet(const TabletInfoPtr& tablet);
 
   enum CloudInfoSimilarity {
     NO_MATCH = 0,
@@ -109,39 +115,20 @@ class CatalogManagerUtil {
       const SetPreferredZonesRequestPB* req, ReplicationInfoPB* replication_info);
 
   static void GetAllAffinitizedZones(
-      const ReplicationInfoPB& replication_info, std::vector<AffinitizedZonesSet>* affinitized_zones);
+      const ReplicationInfoPB& replication_info,
+      std::vector<AffinitizedZonesSet>* affinitized_zones);
 
   static Status CheckValidLeaderAffinity(const ReplicationInfoPB& replication_info);
 
   template<class LoadState>
-  static void FillTableLoadState(const scoped_refptr<TableInfo>& table_info, LoadState* state) {
-    auto tablets = table_info->GetTablets(IncludeInactive::kTrue);
-
-    for (const auto& tablet : tablets) {
-      // Ignore if tablet is not running.
-      {
-        auto tablet_lock = tablet->LockForRead();
-        if (!tablet_lock->is_running()) {
-          continue;
-        }
-      }
-      auto replica_locs = tablet->GetReplicaLocations();
-
-      for (const auto& loc : *replica_locs) {
-        // Ignore replica if not present in the tserver list passed.
-        if (state->per_ts_replica_load_.count(loc.first) == 0) {
-          continue;
-        }
-        // Account for this load.
-        state->per_ts_replica_load_[loc.first]++;
-      }
-    }
-  }
+  static Status FillTableLoadState(
+      const scoped_refptr<TableInfo>& table_info, LoadState* state);
 
   static const google::protobuf::RepeatedPtrField<TableIdentifierPB>& SequenceDataFilter() {
-    if (sequences_data_table_filter_.empty()) {
+    std::call_once(sequences_data_table_filter_once_flag_, []() {
       *sequences_data_table_filter_.Add()->mutable_table_id() = kPgSequencesDataTableId;
-    }
+    });
+
     return sequences_data_table_filter_;
   }
 
@@ -170,10 +157,20 @@ class CatalogManagerUtil {
     return Status::OK();
   }
 
+  static Result<bool> GetIsTruncateTableDone(
+      const TableInfoPtr& table, IsTruncateTableDoneResponsePB* resp);
+
   static void FillTableInfoPB(
       const TableId& table_id, const std::string& table_name, const TableType& table_type,
-      const Schema& schema, uint32_t schema_version, const PartitionSchema& partition_schema,
+      const Schema& schema, uint32_t schema_version, const dockv::PartitionSchema& partition_schema,
       tablet::TableInfoPB* pb);
+
+  static void FillTableInfoPB(
+      const TableId& table_id, const std::string& table_name, const TableType& table_type,
+      const SchemaPB& schema, uint32_t schema_version, const PartitionSchemaPB& partition_schema,
+      tablet::TableInfoPB* pb);
+
+  static size_t GetReplicationFactor(const ReplicationInfoPB& replication_info);
 
  private:
   CatalogManagerUtil();
@@ -228,6 +225,28 @@ struct Comparator {
 
   CMPerTableLoadState* state_;
 };
+
+template <class PB>
+bool IsIndex(const PB& pb) {
+  return pb.has_index_info() || !pb.indexed_table_id().empty();
+}
+
+inline bool IsTable(const SysTablesEntryPB& pb) {
+  return !IsIndex(pb);
+}
+
+// Gets the number of tablet replicas for the placement specified in the PlacementInfoPB.  If the
+// PlacementInfoPB does not set the number of tablet replicas to create for the placement, default
+// to the replication_factor flag.
+int32_t GetNumReplicasOrGlobalReplicationFactor(const PlacementInfoPB& placement_info);
+
+const BlacklistPB& GetBlacklist(const SysClusterConfigEntryPB& pb, bool blacklist_leader);
+
+Status ExecutePgsqlStatements(
+    const std::string& database_name, const std::vector<std::string>& statements,
+    CatalogManagerIf& catalog_manager, CoarseTimePoint deadline, StdStatusCallback callback);
+
+bool UseRelfilenodeForTableMatch(const SnapshotInfoPB& snapshot_pb);
 
 } // namespace master
 } // namespace yb

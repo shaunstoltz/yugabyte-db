@@ -1,15 +1,21 @@
 package com.yugabyte.yw.common.supportbundle;
 
-import com.yugabyte.yw.controllers.handlers.UniverseInfoHandler;
-import com.yugabyte.yw.models.Customer;
 import com.google.inject.Inject;
 import com.google.inject.Singleton;
+import com.yugabyte.yw.commissioner.tasks.params.SupportBundleTaskParams;
 import com.yugabyte.yw.common.NodeUniverseManager;
 import com.yugabyte.yw.common.SupportBundleUtil;
-import com.yugabyte.yw.models.helpers.NodeDetails;
+import com.yugabyte.yw.controllers.handlers.UniverseInfoHandler;
+import com.yugabyte.yw.forms.SupportBundleFormData;
+import com.yugabyte.yw.models.Customer;
 import com.yugabyte.yw.models.Universe;
+import com.yugabyte.yw.models.helpers.NodeDetails;
 import java.nio.file.Path;
+import java.util.Arrays;
 import java.util.Date;
+import java.util.HashMap;
+import java.util.List;
+import java.util.Map;
 import lombok.extern.slf4j.Slf4j;
 
 @Slf4j
@@ -19,7 +25,8 @@ class OutputFilesComponent implements SupportBundleComponent {
   private final UniverseInfoHandler universeInfoHandler;
   private final NodeUniverseManager nodeUniverseManager;
   private final SupportBundleUtil supportBundleUtil;
-  public static final String sourceNodeFiles = "master/master.out;tserver/tserver.out";
+  public static final List<String> sourceNodeFiles =
+      Arrays.asList("master/master.out", "tserver/tserver.out");
 
   @Inject
   OutputFilesComponent(
@@ -33,7 +40,12 @@ class OutputFilesComponent implements SupportBundleComponent {
 
   @Override
   public void downloadComponent(
-      Customer customer, Universe universe, Path bundlePath, NodeDetails node) throws Exception {
+      SupportBundleTaskParams supportBundleTaskParams,
+      Customer customer,
+      Universe universe,
+      Path bundlePath,
+      NodeDetails node)
+      throws Exception {
     String nodeHomeDir = nodeUniverseManager.getYbHomeDir(node, universe);
     supportBundleUtil.downloadNodeLevelComponent(
         universeInfoHandler,
@@ -43,11 +55,13 @@ class OutputFilesComponent implements SupportBundleComponent {
         node,
         nodeHomeDir,
         sourceNodeFiles,
-        this.getClass().getSimpleName());
+        this.getClass().getSimpleName(),
+        false /* skipUntar */);
   }
 
   @Override
   public void downloadComponentBetweenDates(
+      SupportBundleTaskParams supportBundleTaskParams,
       Customer customer,
       Universe universe,
       Path bundlePath,
@@ -55,6 +69,23 @@ class OutputFilesComponent implements SupportBundleComponent {
       Date endDate,
       NodeDetails node)
       throws Exception {
-    this.downloadComponent(customer, universe, bundlePath, node);
+    this.downloadComponent(supportBundleTaskParams, customer, universe, bundlePath, node);
+  }
+
+  // This component collects two files only, so instead of getting the actual file
+  // sizes from db nodes just adding 5KB for each file. Shouldn't affect end
+  // result too much.
+  public Map<String, Long> getFilesListWithSizes(
+      Customer customer,
+      SupportBundleFormData bundleData,
+      Universe universe,
+      Date startDate,
+      Date endDate,
+      NodeDetails node)
+      throws Exception {
+
+    Map<String, Long> res = new HashMap<>();
+    res.put("Sample File", 10000L);
+    return res;
   }
 }

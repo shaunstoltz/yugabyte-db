@@ -1,39 +1,26 @@
 ---
 title: Strings and text in YSQL
 headerTitle: Strings and text
-linkTitle: 8. Strings and text
+linkTitle: Strings and text
 description: Learn how to work with string and text data types in YSQL.
+aliases:
+  - /develop/learn/strings-and-text/
+  - /stable/develop/learn/strings-and-text/
 menu:
-  stable:
+  stable_develop:
     identifier: strings-and-text-1-ysql
     parent: learn
     weight: 570
 type: docs
 ---
 
-<ul class="nav nav-tabs-alt nav-tabs-yb">
-
-  <li >
-    <a href="{{< relref "./strings-and-text-ysql.md" >}}" class="nav-link active">
-      <i class="icon-postgres" aria-hidden="true"></i>
-      YSQL
-    </a>
-  </li>
-
-  <li >
-    <a href="{{< relref "./strings-and-text-ycql.md" >}}" class="nav-link">
-      <i class="icon-cassandra" aria-hidden="true"></i>
-      YCQL
-    </a>
-  </li>
-
-</ul>
+{{<api-tabs list="ysql">}}
 
 ## Introduction
 
 Strings, character data types, or text are part of every conceivable system. Manipulating and outputting text is a very important topic that is required for many different types of systems that you work with. This section provides an overview of the YugabyteDB SQL API's extensive text capabilities.
 
-The examples use the [Retail Analytics sample dataset](../../../sample-data/retail-analytics/).
+The examples use the [Retail Analytics sample dataset](/stable/develop/sample-data/retail-analytics/).
 
 ## Character data types
 
@@ -41,7 +28,7 @@ With PostgreSQL, the use of different character data types has a historical aspe
 
 If you use char(n), character(n), or varchar(n), then the limitation will be the number you assign, which cannot exceed 10,485,760. For unlimited length, use a character data type without a length description, such as 'text'. However, if you have specific requirements to ignore trailing spaces, then you may wish to consider using char(n).
 
-For more information on character data types, refer to [Data types](/preview/api/ysql/datatypes/). Note that YugabyteDB implements the data type aliases and that is what is used here.
+For more information on character data types, refer to [Data types](/stable/api/ysql/datatypes/). Note that YugabyteDB implements the data type aliases and that is what is used here.
 
 The following example shows a few ways to work with different data types:
 
@@ -50,7 +37,7 @@ The following example shows a few ways to work with different data types:
 ```
 
 ```output
-ysqlsh (11.2)
+ysqlsh (15.2-YB-{{<yb-version version="stable">}}-b0)
 Type "help" for help.
 ```
 
@@ -153,7 +140,7 @@ Many functions can be applied to text. In the examples that follow, the function
 
 The focus here is to quickly show how each of the functions can be used, along with some examples.
 
-The example assumes that you have created and connected to the `yb_demo` database with the [Retail Analytics sample dataset](../../../sample-data/retail-analytics/).
+The example assumes that you have created and connected to the `yb_demo` database with the [Retail Analytics sample dataset](/stable/develop/sample-data/retail-analytics/).
 
 ### Altering the appearance of text
 

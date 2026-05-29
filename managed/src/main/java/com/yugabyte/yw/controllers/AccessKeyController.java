@@ -1,41 +1,42 @@
-// Copyright (c) YugaByte, Inc.
+// Copyright (c) YugabyteDB, Inc.
 
 package com.yugabyte.yw.controllers;
 
-import static com.yugabyte.yw.commissioner.Common.CloudType.onprem;
 import static com.yugabyte.yw.forms.PlatformResults.YBPSuccess.withMessage;
 
+import com.fasterxml.jackson.databind.JsonNode;
 import com.google.inject.Inject;
-import com.yugabyte.yw.common.AccessManager;
 import com.yugabyte.yw.common.PlatformServiceException;
-import com.yugabyte.yw.common.ProviderEditRestrictionManager;
-import com.yugabyte.yw.common.TemplateManager;
+import com.yugabyte.yw.common.Util;
+import com.yugabyte.yw.common.rbac.PermissionInfo.Action;
+import com.yugabyte.yw.common.rbac.PermissionInfo.ResourceType;
+import com.yugabyte.yw.controllers.handlers.AccessKeyHandler;
 import com.yugabyte.yw.forms.AccessKeyFormData;
 import com.yugabyte.yw.forms.PlatformResults;
 import com.yugabyte.yw.forms.PlatformResults.YBPSuccess;
 import com.yugabyte.yw.models.AccessKey;
-import com.yugabyte.yw.models.AccessKey.KeyInfo;
 import com.yugabyte.yw.models.Audit;
 import com.yugabyte.yw.models.Customer;
 import com.yugabyte.yw.models.Provider;
-import com.yugabyte.yw.models.Region;
+import com.yugabyte.yw.models.common.YbaApi;
+import com.yugabyte.yw.models.common.YbaApi.YbaApiVisibility;
+import com.yugabyte.yw.rbac.annotations.AuthzPath;
+import com.yugabyte.yw.rbac.annotations.PermissionAttribute;
+import com.yugabyte.yw.rbac.annotations.RequiredPermissionOnResource;
+import com.yugabyte.yw.rbac.annotations.Resource;
+import com.yugabyte.yw.rbac.enums.SourceType;
 import io.swagger.annotations.Api;
 import io.swagger.annotations.ApiImplicitParam;
 import io.swagger.annotations.ApiImplicitParams;
 import io.swagger.annotations.ApiOperation;
 import io.swagger.annotations.Authorization;
-import java.io.File;
-import java.io.IOException;
-import java.nio.file.Files;
-import java.nio.file.Path;
 import java.util.List;
 import java.util.Objects;
 import java.util.UUID;
 import java.util.stream.Collectors;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
-import play.mvc.Http.MultipartFormData;
-import play.mvc.Http.MultipartFormData.FilePart;
+import play.mvc.Http;
 import play.mvc.Result;
 
 @Api(
@@ -43,15 +44,17 @@ import play.mvc.Result;
     authorizations = @Authorization(AbstractPlatformController.API_KEY_AUTH))
 public class AccessKeyController extends AuthenticatedController {
 
-  @Inject AccessManager accessManager;
-
-  @Inject TemplateManager templateManager;
-
-  @Inject ProviderEditRestrictionManager providerEditRestrictionManager;
+  @Inject AccessKeyHandler accessKeyHandler;
 
   public static final Logger LOG = LoggerFactory.getLogger(AccessKeyController.class);
 
   @ApiOperation(value = "Get an access key", response = AccessKey.class)
+  @AuthzPath({
+    @RequiredPermissionOnResource(
+        requiredPermission =
+            @PermissionAttribute(resourceType = ResourceType.OTHER, action = Action.READ),
+        resourceLocation = @Resource(path = Util.CUSTOMERS, sourceType = SourceType.ENDPOINT))
+  })
   public Result index(UUID customerUUID, UUID providerUUID, String keyCode) {
     Customer.getOrBadRequest(customerUUID);
     Provider.getOrBadRequest(customerUUID, providerUUID);
@@ -65,6 +68,12 @@ public class AccessKeyController extends AuthenticatedController {
       value = "List access keys for a specific provider",
       response = AccessKey.class,
       responseContainer = "List")
+  @AuthzPath({
+    @RequiredPermissionOnResource(
+        requiredPermission =
+            @PermissionAttribute(resourceType = ResourceType.OTHER, action = Action.READ),
+        resourceLocation = @Resource(path = Util.CUSTOMERS, sourceType = SourceType.ENDPOINT))
+  })
   public Result list(UUID customerUUID, UUID providerUUID) {
     Customer.getOrBadRequest(customerUUID);
     Provider.getOrBadRequest(customerUUID, providerUUID);
@@ -79,12 +88,17 @@ public class AccessKeyController extends AuthenticatedController {
       value = "List access keys for all providers of a customer",
       response = AccessKey.class,
       responseContainer = "List")
+  @AuthzPath({
+    @RequiredPermissionOnResource(
+        requiredPermission =
+            @PermissionAttribute(resourceType = ResourceType.OTHER, action = Action.READ),
+        resourceLocation = @Resource(path = Util.CUSTOMERS, sourceType = SourceType.ENDPOINT))
+  })
   public Result listAllForCustomer(UUID customerUUID) {
     Customer.getOrBadRequest(customerUUID);
     List<UUID> providerUUIDs =
-        Provider.getAll(customerUUID)
-            .stream()
-            .map(provider -> provider.uuid)
+        Provider.getAll(customerUUID).stream()
+            .map(provider -> provider.getUuid())
             .collect(Collectors.toList());
     List<AccessKey> accessKeys = AccessKey.getByProviderUuids(providerUUIDs);
     accessKeys.forEach(AccessKey::mergeProviderDetails);
@@ -94,8 +108,11 @@ public class AccessKeyController extends AuthenticatedController {
   // TODO: Move this endpoint under region since this api is per region
   @ApiOperation(
       nickname = "createAccesskey",
-      value = "Create/Upload an access key for onprem Provider region",
-      notes = "UNSTABLE - This API will undergo changes in future.",
+      value = "Create/Upload Access Key for onprem provider region - deprecated",
+      notes =
+          "<b style=\"color:#ff0000\">Deprecated since YBA version 2.20.0.0.</b></p>"
+              + "Use /api/v1/customers/{cUUID}/provider/{pUUID}/edit instead"
+              + " for adding the key",
       response = AccessKey.class)
   @ApiImplicitParams(
       @ApiImplicitParam(
@@ -103,162 +120,98 @@ public class AccessKeyController extends AuthenticatedController {
           paramType = "body",
           dataType = "com.yugabyte.yw.forms.AccessKeyFormData",
           required = true))
-  public Result create(UUID customerUUID, UUID providerUUID) {
+  @AuthzPath({
+    @RequiredPermissionOnResource(
+        requiredPermission =
+            @PermissionAttribute(resourceType = ResourceType.OTHER, action = Action.CREATE),
+        resourceLocation = @Resource(path = Util.CUSTOMERS, sourceType = SourceType.ENDPOINT))
+  })
+  @Deprecated
+  @YbaApi(visibility = YbaApiVisibility.DEPRECATED, sinceYBAVersion = "2.20.0.0")
+  public Result create(UUID customerUUID, UUID providerUUID, Http.Request request) {
     final Provider provider = Provider.getOrBadRequest(providerUUID);
     AccessKeyFormData formData =
         formFactory
-            .getFormDataOrBadRequest(AccessKeyFormData.class)
+            .getFormDataOrBadRequest(request, AccessKeyFormData.class)
             .get()
             .setOrValidateRequestDataWithExistingKey(provider);
-    AccessKey accessKey =
-        providerEditRestrictionManager.tryEditProvider(
-            providerUUID,
-            () -> {
-              try {
-                return create(customerUUID, provider, formData);
-              } catch (IOException e) {
-                LOG.error("Failed to create access key", e);
-                throw new PlatformServiceException(
-                    INTERNAL_SERVER_ERROR,
-                    "Failed to create access key: " + e.getLocalizedMessage());
-              }
-            });
+    AccessKey accessKey = accessKeyHandler.create(customerUUID, provider, formData, request.body());
     auditService()
         .createAuditEntryWithReqBody(
-            ctx(),
+            request,
             Audit.TargetType.AccessKey,
-            Objects.toString(accessKey.idKey, null),
-            Audit.ActionType.Create,
-            request().body().asJson());
+            Objects.toString(accessKey.getIdKey(), null),
+            Audit.ActionType.Create);
     return PlatformResults.withData(accessKey);
   }
 
-  private AccessKey create(UUID customerUUID, Provider provider, AccessKeyFormData formData)
-      throws IOException {
-    LOG.info(
-        "Creating access key {} for customer {}, provider {}.",
-        formData.keyCode,
-        customerUUID,
-        provider.uuid);
-    List<Region> regionList = provider.regions;
-    if (regionList.isEmpty()) {
-      throw new PlatformServiceException(
-          INTERNAL_SERVER_ERROR, "Provider is in invalid state. No regions.");
-    }
-    Region region = regionList.get(0);
+  @ApiOperation(
+      nickname = "editAccesskey",
+      notes = "WARNING: This is a preview API that could change.",
+      value = "Modify the existing access Key",
+      response = AccessKey.class)
+  @ApiImplicitParams(
+      @ApiImplicitParam(
+          name = "accesskey",
+          value = "access key edit form data",
+          paramType = "body",
+          dataType = "com.yugabyte.yw.models.AccessKey",
+          required = true))
+  @AuthzPath({
+    @RequiredPermissionOnResource(
+        requiredPermission =
+            @PermissionAttribute(resourceType = ResourceType.OTHER, action = Action.UPDATE),
+        resourceLocation = @Resource(path = Util.CUSTOMERS, sourceType = SourceType.ENDPOINT))
+  })
+  @YbaApi(visibility = YbaApiVisibility.PREVIEW, sinceYBAVersion = "2.20.0.0")
+  public Result edit(UUID customerUUID, UUID providerUUID, String keyCode, Http.Request request) {
+    // As part of access key edit we will be creating a new access key
+    // so that if the old key is associated with some universes remains
+    // functional by the time we shift completely to start using new generated keys.
 
-    if (formData.setUpChrony
-        && region.provider.code.equals(onprem.name())
-        && (formData.ntpServers == null || formData.ntpServers.isEmpty())) {
-      throw new PlatformServiceException(
-          BAD_REQUEST,
-          "NTP servers not provided for on-premises provider for which chrony setup is desired");
-    }
+    final Provider provider = Provider.getOrBadRequest(providerUUID);
+    JsonNode requestBody = request.body().asJson();
+    AccessKey accessKey = formFactory.getFormDataOrBadRequest(requestBody, AccessKey.class);
 
-    if (region.provider.code.equals(onprem.name()) && formData.sshUser == null) {
-      throw new PlatformServiceException(
-          BAD_REQUEST, "sshUser cannot be null for onprem providers.");
-    }
-
-    // Check if a public/private key was uploaded as part of the request
-    MultipartFormData<File> multiPartBody = request().body().asMultipartFormData();
-    AccessKey accessKey;
-    if (multiPartBody != null) {
-      FilePart<File> filePart = multiPartBody.getFile("keyFile");
-      File uploadedFile = filePart.getFile();
-      if (formData.keyType == null || uploadedFile == null) {
-        throw new PlatformServiceException(BAD_REQUEST, "keyType and keyFile params required.");
-      }
-      accessKey =
-          accessManager.uploadKeyFile(
-              region.uuid,
-              uploadedFile,
-              formData.keyCode,
-              formData.keyType,
-              formData.sshUser,
-              formData.sshPort,
-              formData.airGapInstall,
-              formData.skipProvisioning,
-              formData.setUpChrony,
-              formData.ntpServers,
-              formData.showSetUpChrony);
-    } else if (formData.keyContent != null && !formData.keyContent.isEmpty()) {
-      if (formData.keyType == null) {
-        throw new PlatformServiceException(BAD_REQUEST, "keyType params required.");
-      }
-      // Create temp file and fill with content
-      Path tempFile = Files.createTempFile(formData.keyCode, formData.keyType.getExtension());
-      Files.write(tempFile, formData.keyContent.getBytes());
-
-      // Upload temp file to create the access key and return success/failure
-      accessKey =
-          accessManager.uploadKeyFile(
-              region.uuid,
-              tempFile.toFile(),
-              formData.keyCode,
-              formData.keyType,
-              formData.sshUser,
-              formData.sshPort,
-              formData.airGapInstall,
-              formData.skipProvisioning,
-              formData.setUpChrony,
-              formData.ntpServers,
-              formData.showSetUpChrony);
-    } else {
-      accessKey =
-          accessManager.addKey(
-              region.uuid,
-              formData.keyCode,
-              null,
-              formData.sshUser,
-              formData.sshPort,
-              formData.airGapInstall,
-              formData.skipProvisioning,
-              formData.setUpChrony,
-              formData.ntpServers,
-              formData.showSetUpChrony);
-    }
-
-    // In case of onprem provider, we add a couple of additional attributes like passwordlessSudo
-    // and create a pre-provision script
-    if (region.provider.code.equals(onprem.name())) {
-      templateManager.createProvisionTemplate(
-          accessKey,
-          formData.airGapInstall,
-          formData.passwordlessSudoAccess,
-          formData.installNodeExporter,
-          formData.nodeExporterPort,
-          formData.nodeExporterUser,
-          formData.setUpChrony,
-          formData.ntpServers);
-    }
-
-    if (formData.expirationThresholdDays != null) {
-      accessKey.updateExpirationDate(formData.expirationThresholdDays);
-    }
-
-    KeyInfo keyInfo = accessKey.getKeyInfo();
-    keyInfo.mergeFrom(provider.details);
-    return accessKey;
+    AccessKey newAccessKey = accessKeyHandler.edit(customerUUID, provider, accessKey, keyCode);
+    auditService()
+        .createAuditEntryWithReqBody(
+            request,
+            Audit.TargetType.AccessKey,
+            Objects.toString(newAccessKey.getIdKey(), null),
+            Audit.ActionType.Edit);
+    return PlatformResults.withData(newAccessKey);
   }
 
   @ApiOperation(
       nickname = "delete_accesskey",
       value = "Delete an access key",
       response = YBPSuccess.class)
-  public Result delete(UUID customerUUID, UUID providerUUID, String keyCode) {
+  @AuthzPath({
+    @RequiredPermissionOnResource(
+        requiredPermission =
+            @PermissionAttribute(resourceType = ResourceType.OTHER, action = Action.DELETE),
+        resourceLocation = @Resource(path = Util.CUSTOMERS, sourceType = SourceType.ENDPOINT))
+  })
+  public Result delete(UUID customerUUID, UUID providerUUID, String keyCode, Http.Request request) {
     Customer.getOrBadRequest(customerUUID);
-    Provider.getOrBadRequest(customerUUID, providerUUID);
+    Provider provider = Provider.getOrBadRequest(customerUUID, providerUUID);
+    long universesCount = provider.getUniverseCount();
+    if (universesCount > 0) {
+      throw new PlatformServiceException(
+          FORBIDDEN, "Cannot delete the access key for the provider in use!");
+    }
+
     AccessKey accessKey = AccessKey.getOrBadRequest(providerUUID, keyCode);
     LOG.info(
         "Deleting access key {} for customer {}, provider {}", keyCode, customerUUID, providerUUID);
 
-    accessKey.deleteOrThrow();
+    accessKeyHandler.delete(accessKey);
     auditService()
-        .createAuditEntryWithReqBody(
-            ctx(),
+        .createAuditEntry(
+            request,
             Audit.TargetType.AccessKey,
-            Objects.toString(accessKey.idKey, null),
+            Objects.toString(accessKey.getIdKey(), null),
             Audit.ActionType.Delete);
     return withMessage("Deleted KeyCode: " + keyCode);
   }

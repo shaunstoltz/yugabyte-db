@@ -1,4 +1,4 @@
-// Copyright (c) YugaByte, Inc.
+// Copyright (c) YugabyteDB, Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License"); you may not use this file except
 // in compliance with the License.  You may obtain a copy of the License at
@@ -17,7 +17,7 @@ import org.junit.Test;
 import org.junit.runner.RunWith;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
-import org.yb.util.YBTestRunnerNonTsanOnly;
+import org.yb.YBTestRunner;
 
 import java.sql.Connection;
 import java.sql.ResultSet;
@@ -44,7 +44,7 @@ import static org.yb.AssertionWrappers.assertGreaterThan;
  * more tests of that kind, and need more test suites, we can (and should) refactor them into a
  * separate package.
  */
-@RunWith(value = YBTestRunnerNonTsanOnly.class)
+@RunWith(value = YBTestRunner.class)
 public class TestPgConcurrency extends BasePgSQLTest {
   private static final Logger LOG = LoggerFactory.getLogger(TestPgConcurrency.class);
 

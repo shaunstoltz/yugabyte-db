@@ -1,8 +1,8 @@
 ---
-title: Manually deploy on Amazon Web Services
+title: Manual deployment on Amazon Web Services (AWS)
 headerTitle: Amazon Web Services
 linkTitle: Amazon Web Services
-description: Manually deploy a YugabyteDB cluster on Amazon Web Services.
+description: How to manually deploy a YugabyteDB cluster on Amazon Web Services (AWS)
 menu:
   stable:
     identifier: deploy-in-aws-3-manual-deployment
@@ -18,12 +18,6 @@ type: docs
       CloudFormation
     </a>
   </li>
-  <li >
-    <a href="../terraform/" class="nav-link">
-      <i class="icon-shell"></i>
-      Terraform
-    </a>
-  </li>
   <li>
     <a href="../manual-deployment/" class="nav-link active">
       <i class="icon-shell"></i>
@@ -32,7 +26,7 @@ type: docs
   </li>
 </ul>
 
-This page documents the manual deployment of YugabyteDB on six AWS EC2 instances with `c5d.4xlarge` as the instance type and CentOS 7 as the instance operating system. The deployment is configured for multiple availability zones (multi-AZ), with three AZs, and has a replication factor (RF) of `3`. The configuration can be changed to handle single-AZ as well as multi-region deployments.
+This page documents the manual deployment of YugabyteDB on six AWS EC2 instances with `c5d.4xlarge` as the instance type and CentOS 7 as the instance operating system. The deployment is configured for multiple availability zones (multi-AZ), with three AZs, and has a replication factor (RF) of 3. The configuration can be changed to handle single-AZ as well as multi-region deployments.
 
 ## 1. Prerequisites
 
@@ -50,7 +44,7 @@ This results in 2 VMs each in Availability Zones `us-west-2a`, `us-west-2b`, and
 
 ### Set environment variables
 
-With six nodes prepared, the yb-master process is run on three of these nodes (because RF=3) and yb-tserver is run on all six nodes. To learn more about YugabyteDB's server architecture, see [Universe](../../../../architecture/concepts/universe/).
+With six nodes prepared, the yb-master process is run on three of these nodes (because RF=3) and yb-tserver is run on all six nodes. To learn more about YugabyteDB's server architecture, see [Architecture](../../../../architecture/).
 
 These install steps are written in a way that assumes that you are running the install steps from another node from which you can access the above six VMs over `ssh`.
 
@@ -64,7 +58,8 @@ export AZ2_NODES="<ip2> <ip2> ..."
 export AZ3_NODES="<ip1> <ip2> ..."
 
 # Version of YugabyteDB you plan to install.
-export YB_VERSION=2.3.3.0
+export YB_VERSION={{<yb-version version="stable" format="version">}}
+export YB_VERSION_BUILD={{<yb-version version="stable" format="build">}}
 
 # Comma separated list of directories available for YB on each node
 # In this example, it is just 1. But if you have two then the RHS
@@ -118,7 +113,7 @@ The following steps are a guide to help use the additional volumes (install a fi
 
 #### Locate drives
 
-On each of the nodes, locate the SSD devices to be used as the data directories for YugabyteDB to store data on (such as RAFT/txn logs, SSTable files, logs, and so on).
+On each of the nodes, locate the SSD devices to be used as the data directories for YugabyteDB to store data on (such as Raft/txn logs, SSTable files, logs, and so on).
 
 ```sh
 $ lsblk
@@ -316,10 +311,11 @@ for ip in $ALL_NODES; do \
    echo =======$ip=======; \
    ssh -i $PEM $ADMIN_USER@$ip \
       "cd ~/yb-software; \
-       curl -k -o yugabyte-${YB_VERSION}-linux.tar.gz \
-         https://downloads.yugabyte.com/yugabyte-${YB_VERSION}-linux.tar.gz"; \
+       curl -Lo yugabyte-${YB_VERSION}-linux.tar.gz \
+         https://software.yugabyte.com/releases/${YB_VERSION}/yugabyte-${YB_VERSION_BUILD}-linux-x86_64.tar.gz"; \
    ssh -i $PEM $ADMIN_USER@$ip \
       "cd ~/yb-software; \
+       echo \"\$(curl -L https://software.yugabyte.com/releases/\${YB_VERSION}/yugabyte-\${YB_VERSION_BUILD}-linux-x86_64-tar.gz.sha) *yugabyte-\${YB_VERSION}-linux.tar.gz\" | shasum --check && \
        tar xvfz yugabyte-${YB_VERSION}-linux.tar.gz"; \
    ssh -i $PEM $ADMIN_USER@$ip \
        "cd ~/yb-software/yugabyte-${YB_VERSION}; \
@@ -427,7 +423,6 @@ done
       echo --fs_data_dirs=$DATA_DIRS                          >> $CONFIG_FILE
       echo --rpc_bind_addresses=$ip:9100                      >> $CONFIG_FILE
       echo --cql_proxy_bind_address=$ip:9042                  >> $CONFIG_FILE
-      echo --redis_proxy_bind_address=$ip:6379                >> $CONFIG_FILE
       echo --webserver_interface=$ip                          >> $CONFIG_FILE
       echo --placement_cloud=$CLOUD                           >> $CONFIG_FILE
       echo --placement_region=$REGION                         >> $CONFIG_FILE
@@ -449,7 +444,6 @@ done
       echo --fs_data_dirs=$DATA_DIRS                          >> $CONFIG_FILE
       echo --rpc_bind_addresses=$ip:9100                      >> $CONFIG_FILE
       echo --cql_proxy_bind_address=$ip:9042                  >> $CONFIG_FILE
-      echo --redis_proxy_bind_address=$ip:6379                >> $CONFIG_FILE
       echo --webserver_interface=$ip                          >> $CONFIG_FILE
       echo --placement_cloud=$CLOUD                           >> $CONFIG_FILE
       echo --placement_region=$REGION                         >> $CONFIG_FILE
@@ -471,7 +465,6 @@ done
       echo --fs_data_dirs=$DATA_DIRS                          >> $CONFIG_FILE
       echo --rpc_bind_addresses=$ip:9100                      >> $CONFIG_FILE
       echo --cql_proxy_bind_address=$ip:9042                  >> $CONFIG_FILE
-      echo --redis_proxy_bind_address=$ip:6379                >> $CONFIG_FILE
       echo --webserver_interface=$ip                          >> $CONFIG_FILE
       echo --placement_cloud=$CLOUD                           >> $CONFIG_FILE
       echo --placement_region=$REGION                         >> $CONFIG_FILE
@@ -576,7 +569,7 @@ $ curl -s http://<any-master-ip>:7000/cluster-config
 
 And confirm that the output looks similar to what is shown below with `min_num_replicas` set to 1 for each AZ.
 
-```json
+```yaml
 replication_info {
   live_replicas {
     num_replicas: 3
@@ -662,14 +655,14 @@ replication_info {
 
 ### PostgreSQL-compatible YSQL API
 
-Connect to the cluster using the YSQL shell (`ysqlsh`) that is installed in the `bin` directory.
-If you want to use `ysqlsh` from a different node, follow the steps on the [ysqlsh](../../../../admin/ysqlsh/) page.
+Connect to the cluster using the YSQL shell (ysqlsh) that is installed in the `bin` directory.
+If you want to use ysqlsh from a different node, follow the steps on the [ysqlsh](../../../../api/ysqlsh/) page.
 
 From any node, execute the following command.
 
 ```sh
 $ cd ~/tserver
-$ ./bin/ysqlsh <any-node-ip>
+$ ./bin/ysqlsh -h <any-node-ip>
 ```
 
 ```sql
@@ -699,7 +692,7 @@ Output should be the following:
 
 ### Cassandra-compatible YCQL API
 
-Connect to the cluster using the YCQL shell (`ycqlsh`) that comes installed in the `bin` directory. If you want to use `ycqlsh` from a different node, follow the steps found on the [ycqlsh](../../../../admin/cqlsh/) page.
+Connect to the cluster using the YCQL shell (ycqlsh) that comes installed in the `bin` directory. If you want to use ycqlsh from a different node, follow the steps found on the [ycqlsh](../../../../api/ycqlsh/) page.
 
 From any node, execute the following command.
 
@@ -777,43 +770,10 @@ When workload is running, verify activity across various tablet-servers in the M
 http://<master-ip>:7000/tablet-servers
 ```
 
-When workload is running, verify active YCQL or YEDIS RPC calls from the following link on the `utilz` page.
+When workload is running, verify active YCQL RPC calls from the following link on the `utilz` page.
 
 ```sh
 http://<any-tserver-ip>:9000/utilz
-```
-
-### Redis-compatible YEDIS API
-
-Create the YugabyteDB `system_redis.redis` (which is the default Redis database `0`) table using `yb-admin` or using `redis-cli`.
-
-- Using `yb-admin`
-
-    ```sh
-    $ cd ~/tserver
-    $ ./bin/yb-admin --master_addresses $MASTER_RPC_ADDRS setup_redis_table
-    ```
-
-- Using `redis-cli` (which comes pre-bundled in the `bin` directory)
-
-    ```sh
-    $ cd ~/tserver
-    $ ./bin/redis-cli -h <any-node-ip>
-    ```
-
-    ```sql
-    > CREATEDB 0
-    ```
-
-#### Test API
-
-```sh
-$ ./bin/redis-cli -h <any-node-ip>
-```
-
-```sql
-> SET key1 hello_world
-> GET key1
 ```
 
 ## 9. Stop cluster and delete data

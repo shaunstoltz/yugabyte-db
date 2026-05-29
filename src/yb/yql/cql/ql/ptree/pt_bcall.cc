@@ -1,5 +1,5 @@
 //--------------------------------------------------------------------------------------------------
-// Copyright (c) YugaByte, Inc.
+// Copyright (c) YugabyteDB, Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License"); you may not use this file except
 // in compliance with the License.  You may obtain a copy of the License at
@@ -24,16 +24,18 @@
 
 #include "yb/common/types.h"
 
+#include "yb/util/metrics.h"
 #include "yb/yql/cql/ql/ptree/column_desc.h"
 #include "yb/yql/cql/ql/ptree/pt_dml.h"
 #include "yb/yql/cql/ql/ptree/sem_context.h"
+#include "yb/yql/cql/ql/ql_processor.h"
+
+DECLARE_bool(cql_revert_to_partial_microsecond_support);
 
 namespace yb {
 namespace ql {
 
 using std::vector;
-using std::shared_ptr;
-using std::make_shared;
 using std::string;
 using strings::Substitute;
 
@@ -70,7 +72,7 @@ void PTBcall::CollectReferencedIndexColnames(MCSet<string> *col_names) const {
   }
 }
 
-string PTBcall::QLName(QLNameOption option) const {
+string PTBcall::QLName(qlexpr::QLNameOption option) const {
   // cql_cast() is displayed as "cast(<col> as <type>)".
   if (strcmp(name_->c_str(), bfql::kCqlCastFuncName) == 0) {
     CHECK_GE(args_->size(), 2);
@@ -117,7 +119,8 @@ Status PTBcall::Analyze(SemContext *sem_context) {
   // - If the datatype of an argument (such as bind variable) is not determined, and the overloaded
   //   function call cannot be resolved by the rest of the arguments, the parser should raised
   //   error for multiple matches.
-  SemState sem_state(sem_context, QLType::Create(UNKNOWN_DATA), InternalType::VALUE_NOT_SET);
+  SemState sem_state(
+      sem_context, QLType::Create(DataType::UNKNOWN_DATA), InternalType::VALUE_NOT_SET);
 
   int pindex = 0;
   const MCList<PTExpr::SharedPtr>& exprs = args_->node_list();
@@ -161,6 +164,11 @@ Status PTBcall::Analyze(SemContext *sem_context) {
     // Use the builtin-function opcode since this is a regular builtin call.
     bfopcode_ = static_cast<int32_t>(bfopcode);
 
+    if (FLAGS_cql_revert_to_partial_microsecond_support && (*name_ == "currenttimestamp")) {
+      if (sem_context->ql_metrics_) {
+        IncrementCounter(sem_context->ql_metrics_->microseconds_timestamps_used_);
+      }
+    }
     if (*name_ == "cql_cast" || *name_ == "tojson") {
       // Argument must be of primitive type for these operators.
       for (const PTExpr::SharedPtr &expr : exprs) {
@@ -410,13 +418,13 @@ Status PTBcall::CheckOperatorAfterArgAnalyze(SemContext *sem_context) {
     const QLType::SharedPtr type = args_->element(0)->ql_type();
     DCHECK(!type->IsUnknown());
 
-    if (type->main() == TUPLE) {
+    if (type->main() == DataType::TUPLE) {
       // https://github.com/YugaByte/yugabyte-db/issues/936
       return sem_context->Error(args_->element(0),
           "Tuple type not implemented yet", ErrorCode::FEATURE_NOT_YET_IMPLEMENTED);
     }
 
-    if (type->Contains(FROZEN) || type->Contains(USER_DEFINED_TYPE)) {
+    if (type->Contains(DataType::FROZEN) || type->Contains(DataType::USER_DEFINED_TYPE)) {
       // Only the server side implementation allows complex types unwrapping based on the schema.
       name_->insert(0, "server_");
     }
@@ -425,11 +433,11 @@ Status PTBcall::CheckOperatorAfterArgAnalyze(SemContext *sem_context) {
   return Status::OK();
 }
 
-void PTBcall::rscol_type_PB(QLTypePB *pb_type) const {
+void PTBcall::rscol_type_PB(QLTypeMsg *pb_type) const {
   if (aggregate_opcode() == bfql::TSOpcode::kAvg) {
     // Tablets return a map of (count, sum),
     // so that the average can be calculated across all tablets.
-    QLType::CreateTypeMap(INT64, args_->node_list().front()->ql_type()->main())
+    QLType::CreateTypeMap(DataType::INT64, args_->node_list().front()->ql_type()->main())
         ->ToQLTypePB(pb_type);
     return;
   }

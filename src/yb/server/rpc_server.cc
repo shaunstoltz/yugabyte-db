@@ -15,9 +15,9 @@
 // specific language governing permissions and limitations
 // under the License.
 //
-// The following only applies to changes made to this file as part of YugaByte development.
+// The following only applies to changes made to this file as part of YugabyteDB development.
 //
-// Portions Copyright (c) YugaByte, Inc.
+// Portions Copyright (c) YugabyteDB, Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License"); you may not use this file except
 // in compliance with the License.  You may obtain a copy of the License at
@@ -53,13 +53,7 @@
 #include "yb/util/status.h"
 
 using yb::rpc::Messenger;
-using yb::rpc::ServiceIf;
-using std::shared_ptr;
 using std::string;
-using std::vector;
-using strings::Substitute;
-using std::unique_ptr;
-using std::make_unique;
 
 DEFINE_UNKNOWN_string(rpc_bind_addresses, "0.0.0.0",
               "Comma-separated list of addresses to bind to for RPC connections. "
@@ -136,10 +130,21 @@ Status RpcServer::RegisterService(size_t queue_limit,
   const scoped_refptr<MetricEntity>& metric_entity = messenger_->metric_entity();
   string service_name = service->service_name();
 
-  rpc::ThreadPool& thread_pool = messenger_->ThreadPool(priority);
-
   scoped_refptr<rpc::ServicePool> service_pool(new rpc::ServicePool(
-      queue_limit, &thread_pool, &messenger_->scheduler(), std::move(service), metric_entity));
+      queue_limit,
+      [this, priority](rpc::ThreadPoolTag tag) {
+        if (priority == rpc::ServicePriority::kNormal) {
+          auto result = messenger_->TaggedThreadPool(tag);
+          if (result.ok()) {
+            return *result;
+          } else {
+            // Could be shutting down.
+            LOG(WARNING) << "Failed to get thread pool with tag " << tag << ": " << result.status();
+          }
+        }
+        return messenger_->ThreadPoolPtr(priority);
+      },
+      &messenger_->scheduler(), std::move(service), metric_entity));
   RETURN_NOT_OK(messenger_->RegisterService(service_name, service_pool));
   return Status::OK();
 }

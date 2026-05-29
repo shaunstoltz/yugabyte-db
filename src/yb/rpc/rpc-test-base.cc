@@ -1,5 +1,5 @@
 //
-// Copyright (c) YugaByte, Inc.
+// Copyright (c) YugabyteDB, Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License"); you may not use this file except
 // in compliance with the License.  You may obtain a copy of the License at
@@ -16,6 +16,8 @@
 #include "yb/rpc/rpc-test-base.h"
 
 #include <thread>
+
+#include "yb/ash/rpc_wait_state.h"
 
 #include "yb/rpc/proxy.h"
 #include "yb/rpc/rpc_controller.h"
@@ -48,6 +50,8 @@ using yb::rpc_test::AddRequestPB;
 using yb::rpc_test::AddResponsePB;
 using yb::rpc_test::EchoRequestPB;
 using yb::rpc_test::EchoResponsePB;
+using yb::rpc_test::RepeatedEchoRequestPB;
+using yb::rpc_test::RepeatedEchoResponsePB;
 using yb::rpc_test::ForwardRequestPB;
 using yb::rpc_test::ForwardResponsePB;
 using yb::rpc_test::PanicRequestPB;
@@ -113,6 +117,13 @@ constexpr std::chrono::milliseconds kDefaultKeepAlive = 15s;
 constexpr std::chrono::milliseconds kDefaultKeepAlive = 1s;
 #endif
 
+template <class PB>
+void CurrentMetadataToPB(PB* pb) {
+  if (const auto& wait_state = ash::WaitStateInfo::CurrentWaitState()) {
+    wait_state->MetadataToPB(pb);
+  }
+}
+
 } // namespace
 
 const MessengerOptions kDefaultClientMessengerOptions = {1, kDefaultKeepAlive};
@@ -175,17 +186,25 @@ void GenericCalculatorService::DoSendStrings(InboundCall* incoming) {
 }
 
 void GenericCalculatorService::DoSleep(InboundCall* incoming) {
-  Slice param(incoming->serialized_request());
   SleepRequestPB req;
-  if (!req.ParseFromArray(param.data(), narrow_cast<int>(param.size()))) {
-    incoming->RespondFailure(ErrorStatusPB::ERROR_INVALID_REQUEST,
-        STATUS(InvalidArgument, "Couldn't parse pb",
-            req.InitializationErrorString()));
-    return;
+  if (incoming->IsLocalCall()) {
+    auto* local = down_cast<LocalYBInboundCall*>(incoming);
+    if (auto outbound_call = local->outbound_call()) {
+      req = yb::down_cast<const SleepRequestPB&>(*outbound_call->request().protobuf());
+    }
+  } else {
+    Slice param(incoming->serialized_request());
+    if (!req.ParseFromArray(param.data(), narrow_cast<int>(param.size()))) {
+      incoming->RespondFailure(
+          ErrorStatusPB::ERROR_INVALID_REQUEST,
+          STATUS(InvalidArgument, "Couldn't parse pb", req.InitializationErrorString()));
+      return;
+    }
   }
 
   LOG(INFO) << "got call: " << req.ShortDebugString();
   SleepFor(MonoDelta::FromMicroseconds(req.sleep_micros()));
+  LOG(INFO) << "done sleeping";
   SleepResponsePB resp;
   down_cast<YBInboundCall*>(incoming)->RespondSuccess(AnyMessageConstPtr(&resp));
 }
@@ -202,6 +221,21 @@ void GenericCalculatorService::DoEcho(InboundCall* incoming) {
 
   EchoResponsePB resp;
   resp.set_data(std::move(*req.mutable_data()));
+  down_cast<YBInboundCall*>(incoming)->RespondSuccess(AnyMessageConstPtr(&resp));
+}
+
+void GenericCalculatorService::DoRepeatedEcho(InboundCall* incoming) {
+  Slice param(incoming->serialized_request());
+  RepeatedEchoRequestPB req;
+  if (!req.ParseFromArray(param.data(), narrow_cast<int>(param.size()))) {
+    incoming->RespondFailure(
+        ErrorStatusPB::ERROR_INVALID_REQUEST,
+        STATUS(InvalidArgument, "Couldn't parse pb", req.InitializationErrorString()));
+    return;
+  }
+
+  RepeatedEchoResponsePB resp;
+  resp.set_data(std::string(req.count(), static_cast<char>(req.character())));
   down_cast<YBInboundCall*>(incoming)->RespondSuccess(AnyMessageConstPtr(&resp));
 }
 
@@ -259,6 +293,12 @@ class CalculatorService: public CalculatorServiceIf {
   void Echo(const EchoRequestPB* req, EchoResponsePB* resp, RpcContext context) override {
     TEST_PAUSE_IF_FLAG(TEST_pause_calculator_echo_request);
     resp->set_data(req->data());
+    context.RespondSuccess();
+  }
+
+  void RepeatedEcho(const RepeatedEchoRequestPB* req, RepeatedEchoResponsePB* resp,
+                    RpcContext context) override {
+    resp->set_data(std::string(req->count(), static_cast<char>(req->character())));
     context.RespondSuccess();
   }
 
@@ -393,6 +433,35 @@ class CalculatorService: public CalculatorServiceIf {
     return resp;
   }
 
+  void Sidecar(
+      const rpc_test::SidecarRequestPB* req, rpc_test::SidecarResponsePB* resp,
+      RpcContext context) override {
+    auto num_sidecars = req->num_sidecars();
+    for (size_t i = 0; i != num_sidecars; ++i) {
+      auto& buffer = context.sidecars().Start();
+      buffer.Append(CHECK_RESULT(context.ExtractSidecar(num_sidecars - i - 1)).AsSlice());
+    }
+    resp->set_num_sidecars(num_sidecars);
+    context.RespondSuccess();
+  }
+
+  void Ash(
+      const rpc_test::AshRequestPB* req, rpc_test::AshResponsePB* resp,
+      RpcContext context) override {
+    CurrentMetadataToPB(resp->mutable_ash_metadata());
+    resp->set_value(req->value());
+    context.RespondSuccess();
+  }
+
+  void AshLightweight(
+      const rpc_test::LWAshLightweightRequestPB* req,
+      rpc_test::LWAshLightweightResponsePB* resp,
+      RpcContext context) override {
+    CurrentMetadataToPB(resp->mutable_ash_metadata());
+    resp->set_value(req->value());
+    context.RespondSuccess();
+  }
+
  private:
   void DoSleep(const SleepRequestPB* req, RpcContext context) {
     SleepFor(MonoDelta::FromMicroseconds(req->sleep_micros()));
@@ -401,6 +470,38 @@ class CalculatorService: public CalculatorServiceIf {
 
   std::string name_;
   Messenger* messenger_ = nullptr;
+};
+
+class AshTestService: public rpc_test::AshTestServiceIf {
+ public:
+  explicit AshTestService(const scoped_refptr<MetricEntity>& entity)
+      : AshTestServiceIf(entity) {
+  }
+
+  void Ash(
+      const rpc_test::AshRequestPB* req, rpc_test::AshResponsePB* resp,
+      RpcContext context) override {
+    CurrentMetadataToPB(resp->mutable_ash_metadata());
+    resp->set_value(req->value());
+    context.RespondSuccess();
+  }
+
+  void AshLightweight(
+      const rpc_test::LWAshLightweightRequestPB* req,
+      rpc_test::LWAshLightweightResponsePB* resp,
+      RpcContext context) override {
+    CurrentMetadataToPB(resp->mutable_ash_metadata());
+    resp->set_value(req->value());
+    context.RespondSuccess();
+  }
+
+  void NoAsh(
+      const rpc_test::NoAshRequestPB* req, rpc_test::NoAshResponsePB* resp,
+      RpcContext context) override {
+    CurrentMetadataToPB(resp->mutable_ash_metadata());
+    resp->set_value(req->value());
+    context.RespondSuccess();
+  }
 };
 
 std::unique_ptr<CalculatorService> CreateCalculatorService(
@@ -426,7 +527,7 @@ class AbacusService: public rpc_test::AbacusServiceIf {
 TestServer::TestServer(std::unique_ptr<Messenger>&& messenger,
                        const TestServerOptions& options)
     : messenger_(std::move(messenger)),
-      thread_pool_(std::make_unique<ThreadPool>(ThreadPoolOptions {
+      thread_pool_(std::make_shared<ThreadPool>(ThreadPoolOptions {
         .name = "rpc-test",
         .max_workers = options.n_worker_threads,
       })) {
@@ -443,11 +544,9 @@ Status TestServer::Start() {
 Status TestServer::RegisterService(std::unique_ptr<ServiceIf> service) {
   const std::string& service_name = service->service_name();
 
-  auto service_pool = make_scoped_refptr<ServicePool>(kQueueLength,
-                                                      thread_pool_.get(),
-                                                      &messenger_->scheduler(),
-                                                      std::move(service),
-                                                      messenger_->metric_entity());
+  auto service_pool = make_scoped_refptr<ServicePool>(
+      kQueueLength, [pool = thread_pool_](auto) { return pool; },
+      &messenger_->scheduler(), std::move(service), messenger_->metric_entity());
   if (!service_pool_) {
     service_pool_ = service_pool;
   }
@@ -576,11 +675,15 @@ TestServer RpcTestBase::StartTestServer(
   if (!messenger) {
     messenger = CreateMessenger("TestServer", options.messenger_options);
   }
+  if (FLAGS_ysql_yb_enable_ash) {
+    messenger->SetCallStateListenerFactory(std::make_unique<ash::CallStateListenerFactory>());
+  }
   TestServer result(std::move(messenger), options);
   auto service = CreateCalculatorService(metric_entity(), name);
   service->SetMessenger(result.messenger());
   EXPECT_OK(result.RegisterService(std::move(service)));
   EXPECT_OK(result.RegisterService(std::make_unique<AbacusService>(metric_entity())));
+  EXPECT_OK(result.RegisterService(std::make_unique<AshTestService>(metric_entity())));
   EXPECT_OK(result.Start());
   return result;
 }

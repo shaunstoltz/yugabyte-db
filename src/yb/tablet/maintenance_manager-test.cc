@@ -15,9 +15,9 @@
 // specific language governing permissions and limitations
 // under the License.
 //
-// The following only applies to changes made to this file as part of YugaByte development.
+// The following only applies to changes made to this file as part of YugabyteDB development.
 //
-// Portions Copyright (c) YugaByte, Inc.
+// Portions Copyright (c) YugabyteDB, Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License"); you may not use this file except
 // in compliance with the License.  You may obtain a copy of the License at
@@ -46,7 +46,6 @@
 
 using yb::tablet::MaintenanceManagerStatusPB;
 using std::shared_ptr;
-using std::vector;
 using std::string;
 using strings::Substitute;
 
@@ -55,7 +54,7 @@ METRIC_DEFINE_gauge_uint32(test, maintenance_ops_running,
                            "Number of Maintenance Operations Running",
                            yb::MetricUnit::kMaintenanceOperations,
                            "The number of background maintenance operations currently running.");
-METRIC_DEFINE_coarse_histogram(test, maintenance_op_duration,
+METRIC_DEFINE_event_stats(test, maintenance_op_duration,
                         "Maintenance Operation Duration",
                         yb::MetricUnit::kSeconds, "");
 
@@ -96,27 +95,28 @@ enum TestMaintenanceOpState {
   OP_FINISHED,
 };
 
+enum TestOpCategory { TEST_LogGCOp, TEST_ResetStaleRetentionBarriersOp, Test_NumOpCategory };
+
 class TestMaintenanceOp : public MaintenanceOp {
  public:
-  TestMaintenanceOp(const std::string& name,
-                    IOUsage io_usage,
-                    TestMaintenanceOpState state,
-                    const shared_ptr<MemTracker>& tracker)
-    : MaintenanceOp(name, io_usage),
-      state_change_cond_(&lock_),
-      state_(state),
-      consumption_(tracker, 500),
-      logs_retained_bytes_(0),
-      perf_improvement_(0),
-      metric_entity_(METRIC_ENTITY_test.Instantiate(&metric_registry_, "test")),
-      maintenance_op_duration_(METRIC_maintenance_op_duration.Instantiate(metric_entity_)),
-      maintenance_ops_running_(METRIC_maintenance_ops_running.Instantiate(metric_entity_, 0)) {
-  }
+  TestMaintenanceOp(
+      const std::string& name, IOUsage io_usage, TestMaintenanceOpState state,
+      const shared_ptr<MemTracker>& tracker)
+      : MaintenanceOp(name, io_usage),
+        state_change_cond_(&lock_),
+        state_(state),
+        consumption_(tracker, 500),
+        logs_retained_bytes_(0),
+        perf_improvement_(0),
+        cdcsdk_reset_stale_retention_barrier_(false),
+        metric_entity_(METRIC_ENTITY_test.Instantiate(&metric_registry_, "test")),
+        maintenance_op_duration_(METRIC_maintenance_op_duration.Instantiate(metric_entity_)),
+        maintenance_ops_running_(METRIC_maintenance_ops_running.Instantiate(metric_entity_, 0)) {}
 
   virtual ~TestMaintenanceOp() {}
 
   bool Prepare() override {
-    std::lock_guard<Mutex> guard(lock_);
+    std::lock_guard guard(lock_);
     if (state_ != OP_RUNNABLE) {
       return false;
     }
@@ -128,29 +128,30 @@ class TestMaintenanceOp : public MaintenanceOp {
 
   void Perform() override {
     DLOG(INFO) << "Performing op " << name();
-    std::lock_guard<Mutex> guard(lock_);
+    std::lock_guard guard(lock_);
     CHECK_EQ(OP_RUNNING, state_);
     state_ = OP_FINISHED;
     state_change_cond_.Broadcast();
   }
 
   void UpdateStats(MaintenanceOpStats* stats) override {
-    std::lock_guard<Mutex> guard(lock_);
+    std::lock_guard guard(lock_);
     stats->set_runnable(state_ == OP_RUNNABLE);
     stats->set_ram_anchored(consumption_.consumption());
     stats->set_logs_retained_bytes(logs_retained_bytes_);
     stats->set_perf_improvement(perf_improvement_);
+    stats->set_cdcsdk_reset_stale_retention_barrier(cdcsdk_reset_stale_retention_barrier_);
   }
 
   void Enable() {
-    std::lock_guard<Mutex> guard(lock_);
+    std::lock_guard guard(lock_);
     DCHECK((state_ == OP_DISABLED) || (state_ == OP_FINISHED));
     state_ = OP_RUNNABLE;
     state_change_cond_.Broadcast();
   }
 
   void WaitForState(TestMaintenanceOpState state) {
-    std::lock_guard<Mutex> guard(lock_);
+    std::lock_guard guard(lock_);
     while (true) {
       if (state_ == state) {
         return;
@@ -161,7 +162,7 @@ class TestMaintenanceOp : public MaintenanceOp {
 
   bool WaitForStateWithTimeout(TestMaintenanceOpState state, int ms) {
     MonoDelta to_wait = MonoDelta::FromMilliseconds(ms);
-    std::lock_guard<Mutex> guard(lock_);
+    std::lock_guard guard(lock_);
     while (true) {
       if (state_ == state) {
         return true;
@@ -173,21 +174,26 @@ class TestMaintenanceOp : public MaintenanceOp {
   }
 
   void set_ram_anchored(uint64_t ram_anchored) {
-    std::lock_guard<Mutex> guard(lock_);
+    std::lock_guard guard(lock_);
     consumption_.Reset(ram_anchored);
   }
 
   void set_logs_retained_bytes(uint64_t logs_retained_bytes) {
-    std::lock_guard<Mutex> guard(lock_);
+    std::lock_guard guard(lock_);
     logs_retained_bytes_ = logs_retained_bytes;
   }
 
   void set_perf_improvement(uint64_t perf_improvement) {
-    std::lock_guard<Mutex> guard(lock_);
+    std::lock_guard guard(lock_);
     perf_improvement_ = perf_improvement;
   }
 
-  scoped_refptr<Histogram> DurationHistogram() const override {
+  void set_cdcsdk_reset_stale_retention_barrier(bool cdcsdk_reset_stale_retention_barrier) {
+    std::lock_guard guard(lock_);
+    cdcsdk_reset_stale_retention_barrier_ = cdcsdk_reset_stale_retention_barrier;
+  }
+
+  scoped_refptr<EventStats> DurationHistogram() const override {
     return maintenance_op_duration_;
   }
 
@@ -202,9 +208,10 @@ class TestMaintenanceOp : public MaintenanceOp {
   ScopedTrackedConsumption consumption_;
   uint64_t logs_retained_bytes_;
   uint64_t perf_improvement_;
+  bool cdcsdk_reset_stale_retention_barrier_;
   MetricRegistry metric_registry_;
   scoped_refptr<MetricEntity> metric_entity_;
-  scoped_refptr<Histogram> maintenance_op_duration_;
+  scoped_refptr<EventStats> maintenance_op_duration_;
   scoped_refptr<AtomicGauge<uint32_t> > maintenance_ops_running_;
 };
 
@@ -212,8 +219,15 @@ class TestMaintenanceOp : public MaintenanceOp {
 // running and verify that UnregisterOp waits for it to finish before
 // proceeding.
 TEST_F(MaintenanceManagerTest, TestRegisterUnregister) {
+  unsigned int seed = SeedRandom();
+  auto op_category =
+      static_cast<TestOpCategory>(rand_r(&seed) % TestOpCategory::Test_NumOpCategory);
   TestMaintenanceOp op1("1", MaintenanceOp::HIGH_IO_USAGE, OP_DISABLED, test_tracker_);
-  op1.set_ram_anchored(1001);
+  if (op_category == TestOpCategory::TEST_ResetStaleRetentionBarriersOp) {
+    op1.set_cdcsdk_reset_stale_retention_barrier(true);
+  } else {
+    op1.set_ram_anchored(1001);
+  }
   manager_->RegisterOp(&op1);
   scoped_refptr<yb::Thread> thread;
   CHECK_OK(Thread::Create(
@@ -268,7 +282,7 @@ TEST_F(MaintenanceManagerTest, TestLogRetentionPrioritization) {
   // Then we find the op clears the most log retention and ram, i.e. - op3
   for (auto* op : { &op1, &op3, &op2 }) {
     {
-      std::lock_guard<std::mutex> lock(manager_->mutex_);
+      std::lock_guard lock(manager_->mutex_);
 
       ASSERT_EQ(op, manager_->FindBestOp());
     }
@@ -280,11 +294,18 @@ TEST_F(MaintenanceManagerTest, TestLogRetentionPrioritization) {
 // Test adding operations and make sure that the history of recently completed operations
 // is correct in that it wraps around and doesn't grow.
 TEST_F(MaintenanceManagerTest, TestCompletedOpsHistory) {
+  unsigned int seed = SeedRandom();
   for (int i = 0; i < 5; i++) {
     string name = Substitute("op$0", i);
     TestMaintenanceOp op(name, MaintenanceOp::HIGH_IO_USAGE, OP_RUNNABLE, test_tracker_);
-    op.set_perf_improvement(1);
-    op.set_ram_anchored(100);
+    auto op_category =
+        static_cast<TestOpCategory>(rand_r(&seed) % TestOpCategory::Test_NumOpCategory);
+    if (op_category == TestOpCategory::TEST_ResetStaleRetentionBarriersOp) {
+      op.set_cdcsdk_reset_stale_retention_barrier(true);
+    } else {
+      op.set_perf_improvement(1);
+      op.set_ram_anchored(100);
+    }
     manager_->RegisterOp(&op);
 
     ASSERT_TRUE(op.WaitForStateWithTimeout(OP_FINISHED, 200));

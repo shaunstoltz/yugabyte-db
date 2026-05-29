@@ -2,9 +2,9 @@
 // Use of this source code is governed by a BSD-style license that can be
 // found in the LICENSE file. See the AUTHORS file for names of contributors.
 //
-// The following only applies to changes made to this file as part of YugaByte development.
+// The following only applies to changes made to this file as part of YugabyteDB development.
 //
-// Portions Copyright (c) YugaByte, Inc.
+// Portions Copyright (c) YugabyteDB, Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License"); you may not use this file except
 // in compliance with the License.  You may obtain a copy of the License at
@@ -26,9 +26,15 @@
 
 #pragma once
 
+#include <atomic>
+#include <functional>
+#include <mutex>
 #include <string>
+#include <string_view>
 
 #include <boost/intrusive_ptr.hpp>
+
+#include "yb/gutil/thread_annotations.h"
 
 #include "yb/util/slice.h"
 #include "yb/util/status_fwd.h"
@@ -64,9 +70,13 @@
 #define RETURN_NOT_OK_RET       YB_RETURN_NOT_OK_RET
 #define RETURN_NOT_OK_SET_CODE  YB_RETURN_NOT_OK_SET_CODE
 
+// Return the given status if it is not OK, but first clone it and prepend the caller name.
+// This macro helps to identify the exact place of failure for the widely used expression.
+#define RETURN_NOT_OK_PREPEND_FUNC(s) RETURN_NOT_OK_PREPEND((s), __func__)
+
 extern "C" {
 
-struct YBCStatusStruct;
+struct YbcStatusStruct;
 
 }
 
@@ -77,9 +87,27 @@ class Slice;
 YB_STRONGLY_TYPED_BOOL(AddRef);
 
 class StatusErrorCode;
-struct StatusCategoryDescription;
 
-class NODISCARD_CLASS Status {
+class NODISCARD_CLASS Status;
+
+// This class is unsafe version of Status that could be used in low level performance critical
+// libraries to transfer status to the caller.
+// Each single call to Status::UnsafeRelease should end up with single Status instantiation from
+// UnsafeStatus.
+class UnsafeStatus {
+ private:
+  friend class Status;
+  void* state_ = nullptr;
+};
+
+struct StatusCategoryDescription {
+  uint8_t id{0};
+  std::string_view name;
+  std::function<size_t(const uint8_t*)> decode_size;
+  std::function<std::string(const uint8_t*)> to_string;
+};
+
+class Status {
  public:
   // Wrapper class for OK status to forbid creation of Result from Status::OK in compile time
   class OK {
@@ -90,6 +118,15 @@ class NODISCARD_CLASS Status {
   };
   // Create a success status.
   Status() {}
+
+  explicit Status(UnsafeStatus source)
+      : state_(static_cast<State*>(source.state_), false) {}
+
+  UnsafeStatus UnsafeRelease() {
+    UnsafeStatus result;
+    result.state_ = state_.detach();
+    return result;
+  }
 
   // Returns true if the status indicates success.
   MUST_USE_RESULT bool ok() const { return state_ == nullptr; }
@@ -207,16 +244,16 @@ class NODISCARD_CLASS Status {
 
   static void RegisterCategory(const StatusCategoryDescription& description);
 
-  static const std::string& CategoryName(uint8_t category);
+  static std::string_view CategoryName(uint8_t category);
 
   // Adopt status that was previously exported to C interface.
-  explicit Status(YBCStatusStruct* state, AddRef add_ref);
+  explicit Status(YbcStatusStruct* state, AddRef add_ref);
 
   // Increments state ref count and returns pointer that could be used in C interface.
-  YBCStatusStruct* RetainStruct() const;
+  YbcStatusStruct* RetainStruct() const;
 
   // Reset state w/o touching ref count. Return detached pointer that could be used in C interface.
-  YBCStatusStruct* DetachStruct();
+  YbcStatusStruct* DetachStruct();
 
  private:
   struct State;
@@ -252,6 +289,18 @@ inline std::string StatusToString(const Status& status) {
 inline std::ostream& operator<<(std::ostream& out, const Status& status) {
   return out << status.ToString();
 }
+
+class StatusHolder {
+ public:
+  Status GetStatus() const;
+  void SetError(const Status& status);
+  void Reset();
+
+ private:
+  std::atomic<bool> is_ok_{true};
+  mutable std::mutex mutex_;
+  Status status_ GUARDED_BY(mutex_);
+};
 
 }  // namespace yb
 

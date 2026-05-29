@@ -1,4 +1,4 @@
-// Copyright (c) YugaByte, Inc.
+// Copyright (c) YugabyteDB, Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License"); you may not use this file except
 // in compliance with the License.  You may obtain a copy of the License at
@@ -10,8 +10,14 @@
 // or implied.  See the License for the specific language governing permissions and limitations
 // under the License.
 
+#include "yb/integration-tests/external_mini_cluster.h"
+
 #include "yb/yql/pgwrapper/libpq_test_base.h"
 #include "yb/yql/pgwrapper/libpq_utils.h"
+#include "yb/yql/pgwrapper/pg_test_utils.h"
+
+#include "yb/util/range.h"
+#include "yb/util/test_thread_holder.h"
 
 using std::string;
 
@@ -21,7 +27,7 @@ namespace pgwrapper {
 class PgLibPqErrTest : public LibPqTestBase {
 };
 
-TEST_F(PgLibPqErrTest, YB_DISABLE_TEST_IN_TSAN(BeginWithoutCommit)) {
+TEST_F(PgLibPqErrTest, BeginWithoutCommit) {
   constexpr auto kIterations = 10;
 
   // Create table and insert some rows.
@@ -67,7 +73,7 @@ TEST_F(PgLibPqErrTest, YB_DISABLE_TEST_IN_TSAN(BeginWithoutCommit)) {
   }
 }
 
-TEST_F(PgLibPqErrTest, YB_DISABLE_TEST_IN_TSAN(InsertWithoutCommit)) {
+TEST_F(PgLibPqErrTest, InsertWithoutCommit) {
   constexpr auto kRetryCount = 3;
   constexpr auto kIterations = 10;
   constexpr auto kRowPerSeed = 100;
@@ -101,7 +107,7 @@ TEST_F(PgLibPqErrTest, YB_DISABLE_TEST_IN_TSAN(InsertWithoutCommit)) {
               return;
             }
             // Run the statement again as "Try again" was reported.
-            ASSERT_TRUE(HasTryAgain(status)) << status;
+            ASSERT_TRUE(HasTransactionError(status)) << status;
             continue;
           }
 
@@ -113,18 +119,13 @@ TEST_F(PgLibPqErrTest, YB_DISABLE_TEST_IN_TSAN(InsertWithoutCommit)) {
 
       // SELECT: Retry number of times or until success.
       for (int rt = 0; rt < kRetryCount; rt++) {
-        auto res = connection.Fetch("SELECT * FROM terr");
+        auto res = connection.FetchMatrix("SELECT * FROM terr", row_count, 2);
         if (!res.ok()) {
-          ASSERT_TRUE(HasTryAgain(res.status())) << res.status();
+          ASSERT_TRUE(HasTransactionError(res.status())) << res.status();
           continue;
         }
 
         // SELECT succeeded.
-        auto columns = PQnfields(res->get());
-        ASSERT_EQ(2, columns);
-
-        auto lines = PQntuples(res->get());
-        ASSERT_EQ(row_count, lines);
         break;
       }
 
@@ -140,16 +141,11 @@ TEST_F(PgLibPqErrTest, YB_DISABLE_TEST_IN_TSAN(InsertWithoutCommit)) {
     }
 
     // Table should have no data as transactions were not committed.
-    auto res = ASSERT_RESULT(conn.Fetch("SELECT * FROM terr"));
-    auto columns = PQnfields(res.get());
-    ASSERT_EQ(2, columns);
-
-    auto lines = PQntuples(res.get());
-    ASSERT_EQ(0, lines);
+    ASSERT_OK(conn.FetchMatrix("SELECT * FROM terr", 0, 2));
   }
 }
 
-TEST_F(PgLibPqErrTest, YB_DISABLE_TEST_IN_TSAN(InsertDuplicateWithoutCommit)) {
+TEST_F(PgLibPqErrTest, InsertDuplicateWithoutCommit) {
   constexpr auto kRetryCount = 3;
   constexpr auto kIterations = 10;
   constexpr auto kRowPerSeed = 100;
@@ -182,7 +178,7 @@ TEST_F(PgLibPqErrTest, YB_DISABLE_TEST_IN_TSAN(InsertDuplicateWithoutCommit)) {
               return;
             }
             // Run the statement again as "Try again" was reported.
-            ASSERT_TRUE(HasTryAgain(status)) << status;
+            ASSERT_TRUE(HasTransactionError(status)) << status;
             continue;
           }
 
@@ -194,18 +190,13 @@ TEST_F(PgLibPqErrTest, YB_DISABLE_TEST_IN_TSAN(InsertDuplicateWithoutCommit)) {
 
       // SELECT: Retry number of times or until success.
       for (int rt = 0; rt < kRetryCount; rt++) {
-        auto res = connection.Fetch("SELECT * FROM terr");
+        auto res = connection.FetchMatrix("SELECT * FROM terr", row_count, 2);
         if (!res.ok()) {
-          ASSERT_TRUE(HasTryAgain(res.status())) << res.status();
+          ASSERT_TRUE(HasTransactionError(res.status())) << res.status();
           continue;
         }
 
         // SELECT succeeded.
-        auto columns = PQnfields(res->get());
-        ASSERT_EQ(2, columns);
-
-        auto lines = PQntuples(res->get());
-        ASSERT_EQ(row_count, lines);
         break;
       }
 
@@ -221,16 +212,11 @@ TEST_F(PgLibPqErrTest, YB_DISABLE_TEST_IN_TSAN(InsertDuplicateWithoutCommit)) {
     }
 
     // Table should have no data as transactions were not committed.
-    auto res = ASSERT_RESULT(conn.Fetch("SELECT * FROM terr"));
-    auto columns = PQnfields(res.get());
-    ASSERT_EQ(2, columns);
-
-    auto lines = PQntuples(res.get());
-    ASSERT_EQ(0, lines);
+    ASSERT_OK(conn.FetchMatrix("SELECT * FROM terr", 0, 2));
   }
 }
 
-TEST_F(PgLibPqErrTest, YB_DISABLE_TEST_IN_TSAN(UpdateWithoutCommit)) {
+TEST_F(PgLibPqErrTest, UpdateWithoutCommit) {
   constexpr auto kRetryCount = 3;
   constexpr auto kIterations = 10;
   constexpr auto kRowCount = 100;
@@ -266,7 +252,7 @@ TEST_F(PgLibPqErrTest, YB_DISABLE_TEST_IN_TSAN(UpdateWithoutCommit)) {
               return;
             }
             // Run the statement again as "Try again" was reported.
-            ASSERT_TRUE(HasTryAgain(status)) << status;
+            ASSERT_TRUE(HasTransactionError(status)) << status;
             continue;
           }
         }
@@ -274,23 +260,17 @@ TEST_F(PgLibPqErrTest, YB_DISABLE_TEST_IN_TSAN(UpdateWithoutCommit)) {
 
       // SELECT: Retry number of times or until success.
       for (int rt = 0; rt < kRetryCount; rt++) {
-        auto res = connection.Fetch("SELECT * FROM terr");
-        if (!res.ok()) {
-          ASSERT_TRUE(HasTryAgain(res.status())) << res.status();
+        auto rows_res = connection.FetchRows<int32_t, int32_t>("SELECT * FROM terr");
+        if (!rows_res.ok()) {
+          ASSERT_TRUE(HasTransactionError(rows_res.status())) << rows_res.status();
           continue;
         }
 
         // Done selecting. Retry not needed.
-        auto columns = PQnfields(res->get());
-        ASSERT_EQ(2, columns);
-
-        auto lines = PQntuples(res->get());
-        ASSERT_EQ(kRowCount, lines);
-
+        ASSERT_EQ(rows_res->size(), kRowCount);
         // Check column 'v' vs 'seed'.
-        for (int i = 0; i != lines; ++i) {
-          int32_t v = ASSERT_RESULT(GetInt32(res->get(), i, 1));
-          ASSERT_EQ(v, seed);
+        for (const auto& [_, row_seed] : *rows_res) {
+          ASSERT_EQ(row_seed, seed);
         }
         break;
       }
@@ -307,22 +287,16 @@ TEST_F(PgLibPqErrTest, YB_DISABLE_TEST_IN_TSAN(UpdateWithoutCommit)) {
     }
 
     // Table should have no updates as transactions were not committed.
-    auto res = ASSERT_RESULT(conn.Fetch("SELECT * FROM terr"));
-    auto columns = PQnfields(res.get());
-    ASSERT_EQ(2, columns);
-
-    auto lines = PQntuples(res.get());
-    ASSERT_EQ(kRowCount, lines);
-
+    auto rows = ASSERT_RESULT((conn.FetchRows<int32_t, int32_t>("SELECT * FROM terr")));
+    ASSERT_EQ(rows.size(), kRowCount);
     // Check column 'v' vs original value 'kSeed'.
-    for (int i = 0; i != lines; ++i) {
-      int32_t v = ASSERT_RESULT(GetInt32(res.get(), i, 1));
-      ASSERT_EQ(v, kSeed);
+    for (const auto& [_, row_seed] : rows) {
+      ASSERT_EQ(row_seed, kSeed);
     }
   }
 }
 
-TEST_F(PgLibPqErrTest, YB_DISABLE_TEST_IN_TSAN(DeleteWithoutCommit)) {
+TEST_F(PgLibPqErrTest, DeleteWithoutCommit) {
   constexpr auto kRetryCount = 3;
   constexpr auto kIterations = 10;
   constexpr auto kRowCount = 100;
@@ -358,7 +332,7 @@ TEST_F(PgLibPqErrTest, YB_DISABLE_TEST_IN_TSAN(DeleteWithoutCommit)) {
               return;
             }
             // Run the statement again as "Try again" was reported.
-            ASSERT_TRUE(HasTryAgain(status)) << status;
+            ASSERT_TRUE(HasTransactionError(status)) << status;
             continue;
           }
 
@@ -370,19 +344,13 @@ TEST_F(PgLibPqErrTest, YB_DISABLE_TEST_IN_TSAN(DeleteWithoutCommit)) {
 
       // SELECT: Retry number of times or until success.
       for (int rt = 0; rt < kRetryCount; rt++) {
-        auto res = connection.Fetch("SELECT * FROM terr");
+        auto res = connection.FetchMatrix("SELECT * FROM terr", kRowCount - delete_count, 2);
         if (!res.ok()) {
-          ASSERT_TRUE(HasTryAgain(res.status())) << res.status();
+          ASSERT_TRUE(HasTransactionError(res.status())) << res.status();
           continue;
         }
 
         // SELECT succeeded.
-        auto columns = PQnfields(res->get());
-        ASSERT_EQ(2, columns);
-
-        auto lines = PQntuples(res->get());
-        ASSERT_EQ(kRowCount - delete_count, lines);
-
         break;
       }
 
@@ -398,16 +366,11 @@ TEST_F(PgLibPqErrTest, YB_DISABLE_TEST_IN_TSAN(DeleteWithoutCommit)) {
     }
 
     // Table should still have all the rows as transactions were not committed.
-    auto res = ASSERT_RESULT(conn.Fetch("SELECT * FROM terr"));
-    auto columns = PQnfields(res.get());
-    ASSERT_EQ(2, columns);
-
-    auto lines = PQntuples(res.get());
-    ASSERT_EQ(kRowCount, lines);
+    ASSERT_OK(conn.FetchMatrix("SELECT * FROM terr", kRowCount, 2));
   }
 }
 
-TEST_F(PgLibPqErrTest, YB_DISABLE_TEST_IN_TSAN(InsertTransactionAborted)) {
+TEST_F(PgLibPqErrTest, InsertTransactionAborted) {
   constexpr auto kIterations = 10;
   constexpr auto kRowPerSeed = 100;
 
@@ -453,6 +416,91 @@ TEST_F(PgLibPqErrTest, YB_DISABLE_TEST_IN_TSAN(InsertTransactionAborted)) {
       continue;
     }
   }
+}
+
+TEST_F(PgLibPqErrTest, InsertPerf) {
+  const int kNumRowsPerBatch = 200;
+  const int kNumThreads = 200;
+  const int kNumBatches = RegularBuildVsDebugVsSanitizers(2000, 200, 20);
+  const int kPayloadSize = 200;
+
+  {
+    auto conn = ASSERT_RESULT(Connect());
+    ASSERT_OK(conn.Execute("CREATE TABLE t (k INT PRIMARY KEY, v TEXT)"));
+  }
+
+  TestThreadHolder threads;
+  std::atomic<int> idx;
+  CountDownLatch start_latch(kNumThreads);
+  CountDownLatch finish_latch(kNumThreads);
+  CountDownLatch run_latch(1);
+  auto insert_fmt = Format(
+      "INSERT INTO t VALUES (generate_series($$0, $$1), CONCAT('$0', random()))",
+      RandomHumanReadableString(kPayloadSize));
+  for (int i = 0; i != kNumThreads; ++i) {
+    threads.AddThread([&]() {
+      auto conn = ASSERT_RESULT(Connect());
+      start_latch.CountDown();
+      run_latch.Wait();
+      for (;;) {
+        int batch_idx = idx++;
+        if (batch_idx >= kNumBatches) {
+          break;
+        }
+        ASSERT_OK(conn.ExecuteFormat(
+            insert_fmt, batch_idx * kNumRowsPerBatch + 1, (batch_idx + 1) * kNumRowsPerBatch));
+        if (batch_idx % 100 == 99) {
+          LOG_WITH_FUNC(INFO) << "Inserted " << batch_idx + 1 << " batches";
+        }
+      }
+      finish_latch.CountDown();
+    });
+  }
+  start_latch.Wait();
+  run_latch.CountDown();
+  auto start = MonoTime::Now();
+  finish_latch.Wait();
+  auto finish = MonoTime::Now();
+  LOG(INFO) << "Insert time: " << (finish - start);
+  threads.JoinAll();
+}
+
+// Test that backtrace is printed to logs on FATAL and PANIC errors.
+TEST_F(PgLibPqErrTest, YbTestBacktraceOnFatal) {
+  auto conn = ASSERT_RESULT(Connect());
+
+  ASSERT_OK(conn.Execute("CREATE TABLE test_fail_ddl (k INT PRIMARY KEY, v INT)"));
+
+  // Test ERROR
+  ASSERT_OK(conn.Execute("SET yb_test_fail_next_ddl = 1"));
+  auto status = conn.Execute("ALTER TABLE test_fail_ddl ADD COLUMN v2 INT");
+  ASSERT_NOK(status);
+  ASSERT_STR_CONTAINS(status.ToString(), "Failed DDL operation as requested");
+  // Connection should still be good after ERROR
+  ASSERT_RESULT(conn.FetchRow<int32_t>("SELECT 1"));
+
+  auto* ts = cluster_->tablet_server(0);
+  {
+    // Verify backtrace is printed to logs on FATAL
+    LogWaiter log_waiter(ts, "BACKTRACE");
+    ASSERT_OK(conn.Execute("SET yb_test_fail_next_ddl = 2"));
+    status = conn.Execute("ALTER TABLE test_fail_ddl ADD COLUMN v3 INT");
+    ASSERT_NOK(status);
+    ASSERT_OK(log_waiter.WaitFor(MonoDelta::FromSeconds(10 * kTimeMultiplier)));
+  }
+  ASSERT_EQ(conn.ConnStatus(), CONNECTION_BAD);
+
+  conn = ASSERT_RESULT(Connect());
+  {
+    // Verify backtrace is printed to logs on PANIC
+    LogWaiter log_waiter(ts, "BACKTRACE");
+    ASSERT_OK(conn.Execute("SET yb_test_fail_next_ddl = 3"));
+    status = conn.Execute("ALTER TABLE test_fail_ddl ADD COLUMN v4 INT");
+    ASSERT_NOK(status);
+    ASSERT_OK(log_waiter.WaitFor(MonoDelta::FromSeconds(10 * kTimeMultiplier)));
+  }
+  ASSERT_EQ(conn.ConnStatus(), CONNECTION_BAD);
+
 }
 
 } // namespace pgwrapper

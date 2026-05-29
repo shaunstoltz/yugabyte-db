@@ -1,4 +1,4 @@
-# Copyright (c) YugaByte, Inc.
+# Copyright (c) YugabyteDB, Inc.
 #
 # Licensed under the Apache License, Version 2.0 (the "License"); you may not use this file except
 # in compliance with the License.  You may obtain a copy of the License at
@@ -14,7 +14,7 @@
 # RocksDB build.
 
 set(YB_PCH_PREFIX rocksdb)
-set(YB_PCH_DEP_LIBS opid_proto yb_test_util)
+set(YB_PCH_DEP_LIBS yb_test_util)
 
 PROTOBUF_GENERATE_CPP(
   ROCKSDB_PROTO_SRCS ROCKSDB_PROTO_HDRS ROCKSDB_PROTO_TGTS
@@ -98,6 +98,7 @@ set(ROCKSDB_SRCS
     table/full_filter_block.cc
     table/get_context.cc
     table/index_builder.cc
+    table/index_iterator.cc
     table/index_reader.cc
     table/iterator.cc
     table/merger.cc
@@ -136,7 +137,6 @@ set(ROCKSDB_SRCS
     utilities/convenience/info_log_finder.cc
     utilities/checkpoint/checkpoint.cc
     utilities/compaction_filters/remove_emptyvalue_compactionfilter.cc
-    utilities/env_mirror.cc
     utilities/leveldb_options/leveldb_options.cc
     utilities/memory/memory_util.cc
     utilities/merge_operators/put.cc
@@ -163,7 +163,6 @@ set(ROCKSDB_SRCS
     util/rate_limiter.cc
     util/slice_transform.cc
     util/statistics.cc
-    util/sync_point.cc
     util/thread_local.cc
     util/xxhash.cc
     ${ROCKSDB_PROTO_SRCS}
@@ -178,19 +177,19 @@ if (NOT APPLE)
   set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -DROCKSDB_FALLOCATE_PRESENT")
 endif()
 
-if ("${YB_BUILD_TYPE}" STREQUAL "asan")
+if (IS_ASAN)
   set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -DROCKSDB_MALLOC_USABLE_SIZE")
 endif()
 
 ADD_YB_LIBRARY(rocksdb
                SRCS ${ROCKSDB_SRCS}
-               DEPS gflags gutil snappy z lz4 yb_common yb_util opid_proto)
+               DEPS gflags gutil snappy z lz4 yb_common yb_storage yb_util)
 
 add_library(rocksdb_tools
   tools/ldb_cmd.cc
   tools/ldb_tool.cc
   tools/sst_dump_tool.cc)
-target_link_libraries(rocksdb_tools docdb_proto rocksdb yb_rocksutil)
+target_link_libraries(rocksdb_tools docdb_proto rocksdb yb_rocksutil yb_storage)
 
 macro(ADD_YB_ROCKSDB_TOOL tool)
   add_executable(${tool} tools/${tool}.cc)
@@ -198,21 +197,18 @@ macro(ADD_YB_ROCKSDB_TOOL tool)
 endmacro()
 
 set(ROCKSDB_TEST_UTIL_SRCS
+  db/db_test_util.cc
   table/mock_table.cc
   util/mock_env.cc
   util/testharness.cc
   util/testutil.cc
 )
 
-if (NOT "${CMAKE_BUILD_TYPE}" STREQUAL "RELEASE")
-  set(ROCKSDB_TEST_UTIL_SRCS ${ROCKSDB_TEST_UTIL_SRCS} db/db_test_util.cc)
-endif()
-
 add_library(rocksdb_test_util ${ROCKSDB_TEST_UTIL_SRCS})
-target_link_libraries(rocksdb_test_util gmock gtest rocksdb yb_rocksutil)
+target_link_libraries(rocksdb_test_util gmock gtest rocksdb yb_rocksutil yb_storage_test_util)
 
 add_executable(db_bench tools/db_bench.cc tools/db_bench_tool.cc)
-target_link_libraries(db_bench rocksdb)
+target_link_libraries(db_bench rocksdb yb_ash)
 ADD_YB_ROCKSDB_TOOL(db_sanity_test)
 ADD_YB_ROCKSDB_TOOL(db_stress)
 ADD_YB_ROCKSDB_TOOL(write_stress)
@@ -226,6 +222,7 @@ set(YB_TEST_LINK_LIBS rocksdb_test_util rocksdb ${YB_MIN_TEST_LIBS} rocksdb_tool
 ADD_YB_TEST(db/compaction_job_test)
 ADD_YB_TEST(db/compaction_picker_test)
 ADD_YB_TEST(db/comparator_db_test)
+ADD_YB_TEST(db/db_perf_test)
 ADD_YB_TEST(db/dbformat_test)
 ADD_YB_TEST(db/file_indexer_test)
 ADD_YB_TEST(db/filename_test)
@@ -237,6 +234,7 @@ ADD_YB_TEST(db/merge_test)
 ADD_YB_TEST(db/options_file_test)
 ADD_YB_TEST(db/perf_context_test)
 ADD_YB_TEST(db/prefix_test)
+ADD_YB_TEST(db/readahead_test)
 ADD_YB_TEST(db/skiplist_test)
 ADD_YB_TEST(db/table_properties_collector_test)
 ADD_YB_TEST(db/user_op_id_test)
@@ -270,8 +268,9 @@ ADD_YB_TEST(util/memenv_test)
 ADD_YB_TEST(util/mock_env_test)
 ADD_YB_TEST(util/options_test)
 ADD_YB_TEST(util/rate_limiter_test)
-
+ADD_YB_TEST(util/file_reader_writer_test)
 ADD_YB_TEST(util/slice_transform_test)
+
 if (BUILD_TESTS AND
     COMPILER_FAMILY STREQUAL "gcc" AND
     "${COMPILER_VERSION}" MATCHES "^(10|11)[.].*$")
@@ -321,3 +320,6 @@ ADD_YB_TEST(utilities/checkpoint/checkpoint_test)
 ADD_YB_TEST(utilities/memory/memory_test)
 
 endif()
+
+set(YB_FUZZ_TARGET_LINK_LIBS rocksdb_test_util rocksdb ${YB_MIN_TEST_LIBS} rocksdb_tools)
+ADD_YB_FUZZ_TARGET(util/fuzz-targets/coding_fuzz_target)

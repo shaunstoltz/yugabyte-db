@@ -1,5 +1,5 @@
 /*
- * Copyright 2021 YugaByte, Inc. and Contributors
+ * Copyright 2021 YugabyteDB, Inc. and Contributors
  *
  * Licensed under the Polyform Free Trial License 1.0.0 (the "License"); you
  * may not use this file except in compliance with the License. You
@@ -50,11 +50,25 @@ public enum Unit {
           .metricName("sec")
           .integer(true)
           .thresholdConditionReadOnly(true)),
+  MINUTE(
+      new UnitBuilder()
+          .measure(Measure.TIME)
+          .displayName("min")
+          .metricName("min")
+          .integer(true)
+          .thresholdConditionReadOnly(true)),
   DAY(
       new UnitBuilder()
           .measure(Measure.TIME)
           .displayName("day(s)")
           .metricName("day")
+          .integer(true)
+          .thresholdConditionReadOnly(true)),
+  MEGABYTE(
+      new UnitBuilder()
+          .measure(Measure.SIZE)
+          .displayName("MB(s)")
+          .metricName("MB")
           .integer(true)
           .thresholdConditionReadOnly(true));
 

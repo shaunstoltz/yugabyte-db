@@ -1,4 +1,4 @@
-// Copyright (c) YugaByte, Inc.
+// Copyright (c) YugabyteDB, Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License"); you may not use this file except
 // in compliance with the License.  You may obtain a copy of the License at
@@ -12,22 +12,28 @@
 //
 #pragma once
 
-#include "yb/master/async_rpc_tasks.h"
+#include "yb/master/async_rpc_tasks_base.h"
+
+#include "yb/tserver/tserver_admin.pb.h"
 
 namespace yb {
 namespace master {
 
 // Send the "Flush Tablets" request to the specified Tablet Server.
 // Keeps retrying until we get an "ok" response.
-class AsyncFlushTablets : public RetrySpecificTSRpcTask {
+class AsyncFlushTablets final : public RetrySpecificTSRpcTaskWithTable {
  public:
-  AsyncFlushTablets(Master* master,
-                    ThreadPool* callback_pool,
-                    const TabletServerId& ts_uuid,
-                    const scoped_refptr<TableInfo>& table,
-                    const std::vector<TabletId>& tablet_ids,
-                    const FlushRequestId& flush_id,
-                    bool is_compaction);
+  AsyncFlushTablets(
+      Master* master,
+      ThreadPool* callback_pool,
+      const TabletServerId& ts_uuid,
+      const scoped_refptr<TableInfo>& table,
+      const std::vector<TabletId>& tablet_ids,
+      const FlushRequestId& flush_id,
+      bool is_compaction,
+      tablet::FlushCompactFlags flags,
+      LeaderEpoch epoch,
+      MonoTime deadline);
 
   server::MonitoredTaskType type() const override {
     return server::MonitoredTaskType::kFlushTablets;
@@ -43,11 +49,18 @@ class AsyncFlushTablets : public RetrySpecificTSRpcTask {
 
   void HandleResponse(int attempt) override;
   bool SendRequest(int attempt) override;
+  void Finished(const Status& status) override;
+
+  MonoTime ComputeDeadline() const override {
+    return deadline_; // The deadline is explicitly set in constructor, no need to compute.
+  }
 
   const std::vector<TabletId> tablet_ids_;
   const FlushRequestId flush_id_;
   tserver::FlushTabletsResponsePB resp_;
-  bool is_compaction_ = false;
+  const bool is_compaction_ = false;
+  const tablet::FlushCompactFlags flags_ = tablet::FLUSH_COMPACT_DEFAULT;
+  bool response_handling_ = false;
 };
 
 } // namespace master

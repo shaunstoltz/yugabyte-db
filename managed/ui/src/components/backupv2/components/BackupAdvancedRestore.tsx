@@ -1,7 +1,7 @@
 /*
  * Created on Mon May 09 2022
  *
- * Copyright 2021 YugaByte, Inc. and Contributors
+ * Copyright 2021 YugabyteDB, Inc. and Contributors
  * Licensed under the Polyform Free Trial License 1.0.0 (the "License")
  * You may not use this file except in compliance with the License. You may obtain a copy of the License at
  * http://github.com/YugaByte/yugabyte-db/blob/master/licenses/POLYFORM-FREE-TRIAL-LICENSE-1.0.0.txt
@@ -15,6 +15,10 @@ import React, { FC, useMemo, useState } from 'react';
 import { Col, Row } from 'react-bootstrap';
 import { useMutation, useQuery } from 'react-query';
 import { useSelector } from 'react-redux';
+import { toast } from 'react-toastify';
+import clsx from 'clsx';
+import * as Yup from 'yup';
+
 import { Badge_Types, StatusBadge } from '../../common/badge/StatusBadge';
 import { YBModalForm } from '../../common/forms';
 import {
@@ -25,20 +29,20 @@ import {
   YBFormSelect,
   YBInputField
 } from '../../common/forms/fields';
-import * as Yup from 'yup';
+
 import { getKMSConfigs, restoreEntireBackup } from '../common/BackupAPI';
-import { BACKUP_API_TYPES, IBackup, IStorageConfig } from '../common/IBackup';
-import { TableType } from '../../../redesign/helpers/dtos';
-
-import { KEYSPACE_VALIDATION_REGEX, PARALLEL_THREADS_RANGE } from '../common/BackupUtils';
-
-import { toast } from 'react-toastify';
+import { BACKUP_API_TYPES, IBackup, CustomerConfig, StorageConfig } from '../common/IBackup';
+import { KEYSPACE_VALIDATION_REGEX, ParallelThreads } from '../common/BackupUtils';
 import { fetchTablesInUniverse } from '../../../actions/xClusterReplication';
 import { YBLoading } from '../../common/indicators';
-import clsx from 'clsx';
-
+import { handleCACertErrMsg } from '../../customCACerts';
+import { isActionFrozen } from '../../../redesign/helpers/utils';
 import { isDefinedNotNull } from '../../../utils/ObjectUtils';
+import { useInterceptBackupTaskLinks } from '../../../redesign/features/tasks/TaskUtils';
 import { isYbcEnabledUniverse } from '../../../utils/UniverseUtils';
+import { AllowedTasks, TableType } from '../../../redesign/helpers/dtos';
+import { UNIVERSE_TASKS } from '../../../redesign/helpers/constants';
+
 import './BackupAdvancedRestore.scss';
 
 const TEXT_RESTORE = 'Restore';
@@ -69,6 +73,7 @@ interface RestoreModalProps {
   onHide: Function;
   visible: boolean;
   currentUniverseUUID?: string;
+  allowedTasks: AllowedTasks;
 }
 
 const initialValues = {
@@ -86,6 +91,7 @@ const initialValues = {
 export const BackupAdvancedRestore: FC<RestoreModalProps> = ({
   onHide,
   visible,
+  allowedTasks,
   currentUniverseUUID
 }) => {
   const [currentStep, setCurrentStep] = useState(0);
@@ -108,6 +114,8 @@ export const BackupAdvancedRestore: FC<RestoreModalProps> = ({
 
   let isYbcEnabledinCurrentUniverse = false;
 
+  const interceptBackupLink = useInterceptBackupTaskLinks();
+
   if (isDefinedNotNull(currentUniverseUUID)) {
     isYbcEnabledinCurrentUniverse = isYbcEnabledUniverse(universeDetails);
   }
@@ -126,9 +134,9 @@ export const BackupAdvancedRestore: FC<RestoreModalProps> = ({
         toast.success(
           <span>
             Success. Click &nbsp;
-            <a href={`/tasks/${resp.data.taskUUID}`} target="_blank" rel="noopener noreferrer">
+            {interceptBackupLink(<a href={`/tasks/${resp.data.taskUUID}`} target="_blank" rel="noopener noreferrer">
               here
-            </a>
+            </a>)}
             &nbsp; for task details
           </span>
         );
@@ -136,7 +144,7 @@ export const BackupAdvancedRestore: FC<RestoreModalProps> = ({
       onError: (resp: any) => {
         onHide();
         setCurrentStep(0);
-        toast.error(resp.response.data.error);
+        !handleCACertErrMsg(resp) && toast.error(resp.response.data.error);
       }
     }
   );
@@ -144,8 +152,7 @@ export const BackupAdvancedRestore: FC<RestoreModalProps> = ({
   const primaryCluster = find(universeDetails?.clusters, { clusterType: 'PRIMARY' });
 
   initialValues['parallelThreads'] =
-    Math.min(primaryCluster?.userIntent?.numNodes, PARALLEL_THREADS_RANGE.MAX) ||
-    PARALLEL_THREADS_RANGE.MIN;
+    Math.min(primaryCluster?.userIntent?.numNodes, ParallelThreads.MAX) || ParallelThreads.MIN;
 
   const kmsConfigList = kmsConfigs
     ? kmsConfigs.map((config: any) => {
@@ -156,22 +163,20 @@ export const BackupAdvancedRestore: FC<RestoreModalProps> = ({
 
   const groupedStorageConfigs = useMemo(() => {
     // if user has only one storage config, select it by default
-    if (storageConfigs.data.length === 1) {
+    if (storageConfigs?.data?.length === 1) {
       const { configUUID, configName, name } = storageConfigs.data[0];
       initialValues['storage_config'] = { value: configUUID, label: configName, name: name };
     }
 
-    const configs = storageConfigs.data
-      .filter((c: IStorageConfig) => c.type === 'STORAGE')
-      .map((c: IStorageConfig) => {
-        return { value: c.configUUID, label: c.configName, name: c.name };
+    const configs = storageConfigs?.data
+      ?.filter((config: CustomerConfig) => config.type === 'STORAGE')
+      .map((config: StorageConfig) => {
+        return { value: config.configUUID, label: config.configName, name: config.name };
       });
 
-    return Object.entries(groupBy(configs, (c: IStorageConfig) => c.name)).map(
-      ([label, options]) => {
-        return { label, options };
-      }
-    );
+    return Object.entries(groupBy(configs, (config) => config.name)).map(([label, options]) => {
+      return { label, options };
+    });
   }, [storageConfigs]);
 
   const validationSchema = Yup.object().shape({
@@ -192,12 +197,12 @@ export const BackupAdvancedRestore: FC<RestoreModalProps> = ({
         : Yup.array(Yup.string()),
     parallelThreads: Yup.number()
       .min(
-        PARALLEL_THREADS_RANGE.MIN,
-        `Parallel threads should be greater than or equal to ${PARALLEL_THREADS_RANGE.MIN}`
+        ParallelThreads.MIN,
+        `Parallel threads should be greater than or equal to ${ParallelThreads.MIN}`
       )
       .max(
-        PARALLEL_THREADS_RANGE.MAX,
-        `Parallel threads should be less than or equal to ${PARALLEL_THREADS_RANGE.MAX}`
+        ParallelThreads.MAX,
+        `Parallel threads should be less than or equal to ${ParallelThreads.MAX}`
       ),
     new_keyspace_name: Yup.string().when('should_rename_keyspace', {
       is: (should_rename_keyspace) => currentStep === STEPS.length - 1 && should_rename_keyspace,
@@ -205,7 +210,10 @@ export const BackupAdvancedRestore: FC<RestoreModalProps> = ({
     })
   });
 
-  const doRestore = (values: typeof initialValues) => {
+  const doRestore = (
+    values: typeof initialValues,
+    setSubmitting: (isSubmitting: boolean) => void
+  ) => {
     values['keyspaces'] = [
       values['should_rename_keyspace'] ? values['new_keyspace_name'] : values['keyspace_name']
     ];
@@ -228,10 +236,15 @@ export const BackupAdvancedRestore: FC<RestoreModalProps> = ({
         ]
       } as any
     };
-    restore.mutateAsync({ backup_details: backup as any, values });
+    restore.mutate(
+      { backup_details: backup as any, values },
+      { onSettled: () => setSubmitting(false) }
+    );
   };
 
   if (!visible) return null;
+
+  const isRestoreBackupTaskDisabled = isActionFrozen(allowedTasks, UNIVERSE_TASKS.RESTORE_BACKUP);
 
   return (
     <YBModalForm
@@ -240,18 +253,22 @@ export const BackupAdvancedRestore: FC<RestoreModalProps> = ({
         setCurrentStep(0);
         onHide();
       }}
+      isButtonDisabled={currentStep === 1 && isRestoreBackupTaskDisabled}
       className="backup-modal"
       title={'Advanced Restore'}
       initialValues={initialValues}
       validationSchema={validationSchema}
       dialogClassName="advanced-restore-modal"
       submitLabel={overrideSubmitLabel ?? STEPS[currentStep].submitLabel}
-      onFormSubmit={(values: any, { setSubmitting }: { setSubmitting: Function }) => {
-        setSubmitting(false);
+      onFormSubmit={(
+        values: any,
+        { setSubmitting }: { setSubmitting: (isSubmitting: boolean) => void }
+      ) => {
         if (values['should_rename_keyspace'] && currentStep < STEPS.length - 1) {
           setCurrentStep(currentStep + 1);
+          setSubmitting(false);
         } else {
-          doRestore(values);
+          doRestore(values, setSubmitting);
         }
       }}
       headerClassName={clsx({
@@ -303,7 +320,7 @@ function RestoreForm({
     label: string;
     value: {
       label: string;
-      value: Partial<IStorageConfig>;
+      value: Partial<CustomerConfig>;
     };
   };
   isYbcEnabledinCurrentUniverse: boolean;
@@ -443,6 +460,11 @@ function RestoreForm({
               options={kmsConfigList}
               isClearable
             />
+            <span className="kms-helper-text">
+              For a successful restore, the KMS configuration used for restore should be the same{' '}
+              <br />
+              KMS configuration used during backup creation.
+            </span>
           </Col>
         </Row>
       </div>

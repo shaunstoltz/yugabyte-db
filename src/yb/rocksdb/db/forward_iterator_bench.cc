@@ -3,9 +3,9 @@
 //  LICENSE file in the root directory of this source tree. An additional grant
 //  of patent rights can be found in the PATENTS file in the same directory.
 //
-// The following only applies to changes made to this file as part of YugaByte development.
+// The following only applies to changes made to this file as part of YugabyteDB development.
 //
-// Portions Copyright (c) YugaByte, Inc.
+// Portions Copyright (c) YugabyteDB, Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License"); you may not use this file except
 // in compliance with the License.  You may obtain a copy of the License at
@@ -33,6 +33,8 @@
 #include <queue>
 #include <random>
 #include <thread>
+
+#include "yb/util/callsite_profiling.h"
 #include "yb/util/flags.h"
 
 #include "yb/rocksdb/cache.h"
@@ -111,7 +113,7 @@ struct Reader {
 
       uint64_t shard;
       {
-        std::lock_guard<std::mutex> guard(queue_mutex_);
+        std::lock_guard guard(queue_mutex_);
         assert(!shards_pending_queue_.empty());
         shard = shards_pending_queue_.front();
         shards_pending_queue_.pop();
@@ -179,7 +181,7 @@ struct Reader {
 
   void onWrite(uint64_t shard) {
     {
-      std::lock_guard<std::mutex> guard(queue_mutex_);
+      std::lock_guard guard(queue_mutex_);
       if (!shards_pending_set_.test(shard)) {
         shards_pending_queue_.push(shard);
         shards_pending_set_.set(shard);
@@ -307,10 +309,10 @@ struct StatsThread {
 
   ~StatsThread() {
     {
-      std::lock_guard<std::mutex> guard(cvm_);
+      std::lock_guard guard(cvm_);
       done_.store(true);
     }
-    cv_.notify_all();
+    YB_PROFILE(cv_.notify_all());
     thread_.join();
   }
 
